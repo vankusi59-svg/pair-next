@@ -12,6 +12,9 @@ const DEFAULT_RESERVE_TOKENS = 4_096;
 const COMPRESSION_HEADROOM_RATIO = 0.1;
 const MAX_EVENT_CONTENT_CHARS = 220;
 const MAX_TOOL_RESULT_CHARS = 10_000;
+// Beyond this many chars the pure-JS tokenizer is disproportionately slow;
+// use the conservative character heuristic instead.
+const MAX_TOKENIZE_CHARS = 8_192;
 
 export interface ContextBudget {
   totalTokens: number;
@@ -150,13 +153,16 @@ export function createTokenCounter(): TokenCounter {
     }
 
     let count: number;
-    if (encoder) {
+    if (encoder && normalizedText.length <= MAX_TOKENIZE_CHARS) {
       try {
         count = encoder.encode(normalizedText).length;
       } catch {
         count = Math.ceil(normalizedText.length / 3.5);
       }
     } else {
+      // js-tiktoken degrades severely on very large inputs; the heuristic
+      // estimate is conservative (it over-counts vs real BPE merges), which
+      // is the safe direction for context-budget enforcement.
       count = Math.ceil(normalizedText.length / 3.5);
     }
 
