@@ -31,6 +31,10 @@ export class MissionRouter {
   constructor(
     private readonly service: PairControlPlane,
     private readonly gate: GovernedTaskGate,
+    /** P7 advisory re-rank — optional; runs strictly inside the
+     *  hard-eligible set produced by CapabilityRouter. */
+    private readonly routingAdvisor?: import("./experience-advisors.js").VerifiedExperienceRoutingAdvisor,
+    private readonly environment?: Record<string, unknown>,
   ) {
     this.capabilityRouter = new CapabilityRouter(service);
     this.routeSelector = new RouteSelector(service);
@@ -101,6 +105,8 @@ export class MissionRouter {
       requiredPermissions: new Set(
         ((request.permissions as string[]) ?? []).map((p) => String(p).toUpperCase()),
       ),
+      routingAdvisor: this.routingAdvisor,
+      environment: this.environment,
     });
     const selectedExecutor = routingDecision.selected_executor;
     if (!selectedExecutor) {

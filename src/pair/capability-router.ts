@@ -21,6 +21,7 @@
 
 import { digest, newId, utcnow } from "./canonical.js";
 import type { ExecutorAdapter } from "./adapter.js";
+import type { VerifiedExperienceRoutingAdvisor } from "./experience-advisors.js";
 import { IntegrityError } from "./errors.js";
 import { ExecutorRegistry, QUALIFIED_TRANSPORTS, TRANSPORT_AUTOMATON_WORKER_POOL, TRANSPORT_SUBPROCESS_WORKER, TRANSPORT_UNKNOWN, CANONICAL_IDENTITIES } from "./executor-registry.js";
 import type { PairControlPlane } from "./service.js";
@@ -188,6 +189,8 @@ export class CapabilityRouter {
       correlationId?: string;
       persist?: boolean;
       actor?: string;
+      routingAdvisor?: VerifiedExperienceRoutingAdvisor;
+      environment?: Record<string, unknown>;
     } = {},
   ): Record<string, unknown> {
     const mode = opts.mode ?? "PLAN";
@@ -230,7 +233,26 @@ export class CapabilityRouter {
         (Number(a.routing_priority) || 100) - (Number(b.routing_priority) || 100) ||
         String(a.executor_id).localeCompare(String(b.executor_id)),
     );
-    const selected = eligible.length ? String(eligible[0].executor_id) : null;
+    // P7: advisory re-rank runs strictly INSIDE the hard-eligible set — it can
+    // never add, remove, or resurrect a candidate, only reorder by bounded
+    // verified-experience adjustment. No advisor → identical P6 baseline.
+    let selected = eligible.length ? String(eligible[0].executor_id) : null;
+    let advisorReceipt: Record<string, unknown> | null = null;
+    if (opts.routingAdvisor && eligible.length >= 1) {
+      advisorReceipt = opts.routingAdvisor.advise({
+        eligible,
+        task,
+        environment: opts.environment,
+        correlation_id: opts.correlationId,
+        persist: opts.persist !== false,
+      });
+      const advised = String(advisorReceipt.selected ?? "");
+      if (advised && eligible.some((d) => String(d.executor_id) === advised)) {
+        selected = advised;
+      } else {
+        selected = eligible.length ? String(eligible[0].executor_id) : null;
+      }
+    }
 
     const decision: Record<string, unknown> = {
       routing_decision_id: newId("RTE"),
@@ -247,6 +269,13 @@ export class CapabilityRouter {
       policy_version: ROUTING_POLICY_VERSION,
       timestamp: utcnow(),
       correlation_id: opts.correlationId ?? null,
+      advisor_decision_id: advisorReceipt
+        ? String(advisorReceipt.advisor_decision_id)
+        : null,
+      adaptive_mode: advisorReceipt ? String(advisorReceipt.mode) : null,
+      score_version: advisorReceipt
+        ? String(advisorReceipt.score_version)
+        : null,
     };
     const digestBody: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(decision)) {

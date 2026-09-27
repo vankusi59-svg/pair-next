@@ -20,7 +20,7 @@
  * inherit canonical serialization, payload hashing, and verify-on-read.
  */
 
-import { newId, utcnow } from "./canonical.js";
+import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -46,14 +46,56 @@ export const EXPERIENCE_STATUSES = new Set([
   "SUPERSEDED",
 ]);
 
+export const EVIDENCE_ORIGINS = new Set([
+  "REAL_EXECUTION",
+  "DETERMINISTIC_TEST",
+  "LIVE_PROBE",
+  "SIMULATED_FIXTURE",
+  "OPERATOR_ASSERTION",
+  "MODEL_GENERATED",
+]);
+
 const TRANSITIONS: Record<string, string[]> = {
   CANDIDATE: ["QUARANTINED", "QUALIFIED", "REVOKED", "SUPERSEDED"],
   QUARANTINED: ["QUALIFIED", "REVOKED", "SUPERSEDED"],
   QUALIFIED: ["ACTIVE", "REVOKED", "SUPERSEDED"],
-  ACTIVE: ["REVOKED", "SUPERSEDED"],
+  ACTIVE: ["REVOKED", "SUPERSEDED", "QUARANTINED"],
   REVOKED: [],
   SUPERSEDED: [],
 };
+
+/** Stable content digest — tamper check + semantic identity, excludes volatile fields. */
+export function experienceDigest(exp: Record<string, unknown>): string {
+  const body: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(exp)) {
+    // Content digest: semantic fields only — lifecycle bookkeeping (status,
+    // verifier identity/result, transition timestamps, transition reasons)
+    // changes on every promotion and must not invalidate the digest.
+    if (
+      [
+        "experience_digest",
+        "version",
+        "entity_type",
+        "entity_id",
+        "status",
+        "created_at",
+        "qualified_at",
+        "activated_at",
+        "last_observed_at",
+        "verifier_id",
+        "verifier_identity",
+        "verifier_result",
+        "quarantine_reason",
+        "revoke_reason",
+        "superseded_by",
+      ].includes(k)
+    ) {
+      continue;
+    }
+    body[k] = v;
+  }
+  return digest(body);
+}
 
 export class ExperienceService {
   constructor(private readonly service: PairControlPlane) {}
@@ -114,7 +156,21 @@ export class ExperienceService {
     trust_metadata?: Record<string, unknown>;
     payload?: Record<string, unknown>;
     permission_effect?: string;
+    series_key?: string;
+    evidence_origin?: string;
+    extracted_by?: string;
+    min_support?: number;
+    stale_after?: string;
+    outcome?: string;
+    observed_environments?: string[];
+    observed_executors?: string[];
+    observed_providers?: string[];
+    observed_models?: string[];
   }): Record<string, unknown> {
+    const origin = fields.evidence_origin ?? "OPERATOR_ASSERTION";
+    if (!EVIDENCE_ORIGINS.has(origin)) {
+      throw new PolicyError("FAIL_CLOSED_EXPERIENCE_ORIGIN", origin);
+    }
     const exp: Record<string, unknown> = {
       schema: "pair.os.vnext.experience.v1",
       experience_id: newId("EXP"),
@@ -131,20 +187,174 @@ export class ExperienceService {
       verifier_result: null,
       qualified_at: null,
       supersedes: null,
+      series_key: fields.series_key ?? null,
+      evidence_origin: origin,
+      extracted_by: fields.extracted_by ?? "EXPERIENCE_EXTRACTION",
+      min_support: fields.min_support ?? null,
+      stale_after: fields.stale_after ?? null,
+      stale: false,
+      outcome: fields.outcome ?? null,
+      observation_count: 1,
+      success_count: fields.outcome === "SUCCESS" ? 1 : 0,
+      failure_count: fields.outcome === "FAILURE" ? 1 : 0,
+      last_observed_at: utcnow(),
+      observed_environments: [...new Set(fields.observed_environments ?? [])].sort(),
+      observed_executors: [...new Set(fields.observed_executors ?? [])].sort(),
+      observed_providers: [...new Set(fields.observed_providers ?? [])].sort(),
+      observed_models: [...new Set(fields.observed_models ?? [])].sort(),
+      contradictions: [],
       created_at: utcnow(),
     };
     this.assertFields(exp);
     // A candidate must be grounded in at least one resolvable Layer-B ref.
     this.assertEvidenceRefs(exp.source_evidence_refs as string[]);
+    exp.experience_digest = experienceDigest(exp);
     this.store.put("experience", String(exp.experience_id), exp, 0);
     this.store.event({
       entity_type: "experience",
       entity_id: String(exp.experience_id),
       event_type: "EXPERIENCE_CANDIDATE",
       new_state: "CANDIDATE",
-      actor: "EXPERIENCE_SERVICE",
+      actor: String(exp.extracted_by),
+      metadata: { type: exp.type, evidence_origin: origin, series_key: fields.series_key ?? null },
     });
-    return exp;
+    // Poisoning defense: model output may never seed trusted experience
+    // directly — the claim is preserved for audit but quarantined.
+    if (origin === "MODEL_GENERATED") {
+      return this.quarantine(
+        String(exp.experience_id),
+        "UNVERIFIED_MODEL_OUTPUT",
+      );
+    }
+    return this.load(String(exp.experience_id));
+  }
+
+  /** Locate the open (non-terminal) series member for aggregation. */
+  findBySeriesKey(seriesKey: string): Record<string, unknown> | null {
+    return (
+      this.store
+        .list("experience")
+        .find(
+          (e) =>
+            e.series_key === seriesKey &&
+            !["REVOKED", "SUPERSEDED"].includes(String(e.status)),
+        ) ?? null
+    );
+  }
+
+  /**
+   * Fold a repeated observation into an existing series member. Dedup is by
+   * canonical evidence identity: a ref already recorded is a semantic no-op —
+   * replayed/re-read evidence never double-counts.
+   */
+  foldObservation(
+    expId: string,
+    obs: {
+      evidence_ref: string;
+      outcome?: string;
+      environments?: string[];
+      executors?: string[];
+      providers?: string[];
+      models?: string[];
+    },
+  ): Record<string, unknown> {
+    const exp = this.load(expId);
+    const refs = new Set(exp.source_evidence_refs as string[]);
+    if (refs.has(obs.evidence_ref)) {
+      return exp; // already counted — canonical dedup
+    }
+    const merge = (key: string, vals?: string[]) =>
+      [...new Set([...((exp[key] as string[]) ?? []), ...(vals ?? [])])].sort();
+    const updated: Record<string, unknown> = {
+      ...exp,
+      source_evidence_refs: [...refs, obs.evidence_ref].sort(),
+      observation_count: Number(exp.observation_count ?? 1) + 1,
+      success_count:
+        Number(exp.success_count ?? 0) + (obs.outcome === "SUCCESS" ? 1 : 0),
+      failure_count:
+        Number(exp.failure_count ?? 0) + (obs.outcome === "FAILURE" ? 1 : 0),
+      last_observed_at: utcnow(),
+      observed_environments: merge("observed_environments", obs.environments),
+      observed_executors: merge("observed_executors", obs.executors),
+      observed_providers: merge("observed_providers", obs.providers),
+      observed_models: merge("observed_models", obs.models),
+    };
+    updated.experience_digest = experienceDigest(updated);
+    return this.store.put(
+      "experience",
+      expId,
+      updated,
+      Number(exp.version),
+    );
+  }
+
+  /**
+   * Record conflicting verified evidence. `resolution` is a deterministic
+   * policy outcome: RETAIN (history only), QUARANTINE, or SUPERSEDE.
+   */
+  recordContradiction(
+    expId: string,
+    contradiction: {
+      conflicting_evidence_ref: string;
+      summary: string;
+      compatibility_delta?: Record<string, unknown>;
+      resolution?: "RETAIN" | "QUARANTINE" | "SUPERSEDE";
+      superseded_by?: string;
+    },
+  ): Record<string, unknown> {
+    const exp = this.load(expId);
+    const contradictions = [
+      ...((exp.contradictions as Array<Record<string, unknown>>) ?? []),
+      {
+        conflicting_evidence_ref: contradiction.conflicting_evidence_ref,
+        summary: contradiction.summary,
+        compatibility_delta: contradiction.compatibility_delta ?? {},
+        recorded_at: utcnow(),
+      },
+    ];
+    const body: Record<string, unknown> = { ...exp, contradictions };
+    body.experience_digest = experienceDigest(body);
+    this.store.put("experience", expId, body, Number(exp.version));
+    this.store.event({
+      entity_type: "experience",
+      entity_id: expId,
+      event_type: "EXPERIENCE_CONTRADICTION",
+      new_state: String(exp.status),
+      actor: "EXPERIENCE_SERVICE",
+      metadata: {
+        conflicting_evidence_ref: contradiction.conflicting_evidence_ref,
+        resolution: contradiction.resolution ?? "RETAIN",
+      },
+    });
+    const resolution = contradiction.resolution ?? "RETAIN";
+    if (resolution === "QUARANTINE") {
+      return this.transition(this.load(expId), "QUARANTINED", {
+        quarantine_reason: `CONTRADICTION:${contradiction.summary}`,
+      });
+    }
+    if (resolution === "SUPERSEDE") {
+      return this.transition(this.load(expId), "SUPERSEDED", {
+        superseded_by: contradiction.superseded_by ?? null,
+      });
+    }
+    return this.load(expId);
+  }
+
+  /** Mark an experience stale — filtered from retrieval, history preserved. */
+  markStale(expId: string, reason: string): Record<string, unknown> {
+    const exp = this.load(expId);
+    const body: Record<string, unknown> = { ...exp, stale: true, stale_reason: reason };
+    body.experience_digest = experienceDigest(body);
+    this.store.put("experience", expId, body, Number(exp.version));
+    this.store.event({
+      entity_type: "experience",
+      entity_id: expId,
+      event_type: "EXPERIENCE_STALE",
+      new_state: String(exp.status),
+      actor: "EXPERIENCE_SERVICE",
+      metadata: { reason },
+    });
+    return this.load(expId);
   }
 
   /** All evidence refs must resolve against canonical state — no dangling claims. */
@@ -280,7 +490,9 @@ export class ExperienceService {
       )
         return false; // 2
       if (!compatible(e)) return false; // 3+4+5
-      const stale = (e.trust_metadata as Record<string, unknown>)?.stale_after;
+      if (e.stale === true) return false; // 6
+      const stale =
+        e.stale_after ?? (e.trust_metadata as Record<string, unknown>)?.stale_after;
       if (stale && String(stale) < now) return false; // 6
       if (String(e.permission_effect ?? "NONE") !== "NONE") return false; // 7
       return true;
