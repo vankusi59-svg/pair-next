@@ -362,11 +362,23 @@ describe("P10 §15 — concurrency stress", () => {
   });
 
   it("approval isolation: pending approval on mission A never blocks mission B", () => {
-    const ctx = makeCtx("conc-iso");
+    // distinct capabilities make executor selection deterministic:
+    // iso-A always lands on failing EX_A, iso-B always lands on healthy EX_B
+    const ctx = makeCtx("conc-iso", {
+      planner: (input) => ({
+        tasks: [{
+          task_key: "T1", title: "t",
+          required_capabilities: String(input.mission.goal).includes("iso-A")
+            ? ["FILE_OPERATIONS"]
+            : ["AUTOMATON_TASK_EXECUTION"],
+          depends_on: [],
+        }],
+      }),
+    });
     const exA = new ScriptedAdapter("EX_A", [{ status: "FAILED", error_class: "TIMEOUT" }]);
     const exB = new ScriptedAdapter("EX_B");
     registerScripted(ctx, exA, { caps: ["FILE_OPERATIONS"], priority: 10 });
-    registerScripted(ctx, exB, { caps: ["FILE_OPERATIONS"], priority: 60 });
+    registerScripted(ctx, exB, { caps: ["AUTOMATON_TASK_EXECUTION"], priority: 60 });
     const m1 = startMission(ctx, "iso-A");
     const m2 = startMission(ctx, "iso-B");
     for (let i = 0; i < 20; i++) ctx.supervisor.tick();
