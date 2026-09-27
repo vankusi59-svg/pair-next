@@ -28,26 +28,66 @@ export class SemanticMemoryManager {
     confidence?: number;
     source: string;
     embeddingKey?: string | null;
+    /** Layer-A trust classification. Model-written facts are hypotheses, never canonical truth. */
+    trustClass?: string;
+    sourceKind?: string;
+    /** Canonical Layer-B evidence IDs backing this fact (empty for model output). */
+    evidenceRefs?: string[];
   }): string {
     const id = ulid();
+    const trustClass = entry.trustClass ?? "MODEL_HYPOTHESIS";
+    const sourceKind = entry.sourceKind ?? "MODEL";
+    const evidenceRefs = JSON.stringify(entry.evidenceRefs ?? []);
+    // Trust columns arrive via MIGRATION_V12; tolerate legacy schemas
+    // (e.g. minimal test fixtures) that lack them.
+    const cols = new Set(
+      (this.db.prepare("PRAGMA table_info(semantic_memory)").all() as Array<{ name: string }>).map(
+        (c) => c.name,
+      ),
+    );
+    const hasTrust = cols.has("trust_class");
     try {
+      const columnList = hasTrust
+        ? "id, category, key, value, confidence, source, embedding_key, trust_class, source_kind, evidence_refs"
+        : "id, category, key, value, confidence, source, embedding_key";
+      const updateTail = hasTrust
+        ? `,
+           trust_class = excluded.trust_class,
+           source_kind = excluded.source_kind,
+           evidence_refs = excluded.evidence_refs`
+        : "";
       this.db.prepare(
-        `INSERT INTO semantic_memory (id, category, key, value, confidence, source, embedding_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO semantic_memory (${columnList})
+         VALUES (${columnList.split(",").map(() => "?").join(", ")})
          ON CONFLICT(category, key) DO UPDATE SET
            value = excluded.value,
            confidence = excluded.confidence,
            source = excluded.source,
-           embedding_key = excluded.embedding_key,
+           embedding_key = excluded.embedding_key${updateTail},
            updated_at = datetime('now')`,
       ).run(
-        id,
-        entry.category,
-        entry.key,
-        entry.value,
-        entry.confidence ?? 1.0,
-        entry.source,
-        entry.embeddingKey ?? null,
+        ...(hasTrust
+          ? [
+              id,
+              entry.category,
+              entry.key,
+              entry.value,
+              entry.confidence ?? 1.0,
+              entry.source,
+              entry.embeddingKey ?? null,
+              trustClass,
+              sourceKind,
+              evidenceRefs,
+            ]
+          : [
+              id,
+              entry.category,
+              entry.key,
+              entry.value,
+              entry.confidence ?? 1.0,
+              entry.source,
+              entry.embeddingKey ?? null,
+            ]),
       );
 
       // On upsert conflict, the DB keeps the original row's id, not the new one.

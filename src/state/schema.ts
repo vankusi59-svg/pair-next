@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -678,4 +678,27 @@ export const MIGRATION_V10 = `
 
   CREATE INDEX idx_knowledge_category ON knowledge_store(category);
   CREATE INDEX idx_knowledge_key ON knowledge_store(key);
+`;
+
+// === P4 trust-layer columns on model-writable memory tables ===
+// Layer A (cognitive) rows are NON_AUTHORITATIVE: every model-writable fact
+// carries an explicit trust classification. Canonical evidence (Layer B)
+// never reads these columns.
+export const MIGRATION_V12_SEMANTIC_TRUST = `
+  ALTER TABLE semantic_memory ADD COLUMN trust_class TEXT NOT NULL DEFAULT 'MODEL_HYPOTHESIS';
+`;
+export const MIGRATION_V12_SEMANTIC_SOURCE_KIND = `
+  ALTER TABLE semantic_memory ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'MODEL';
+`;
+export const MIGRATION_V12_SEMANTIC_EVIDENCE_REFS = `
+  ALTER TABLE semantic_memory ADD COLUMN evidence_refs TEXT NOT NULL DEFAULT '[]';
+`;
+export const MIGRATION_V12_KNOWLEDGE_TRUST = `
+  ALTER TABLE knowledge_store ADD COLUMN trust_class TEXT NOT NULL DEFAULT 'MODEL_HYPOTHESIS';
+`;
+export const MIGRATION_V12_KNOWLEDGE_SOURCE_KIND = `
+  ALTER TABLE knowledge_store ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'MODEL';
+`;
+export const MIGRATION_V12_KNOWLEDGE_EVIDENCE_REFS = `
+  ALTER TABLE knowledge_store ADD COLUMN evidence_refs TEXT NOT NULL DEFAULT '[]';
 `;

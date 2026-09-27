@@ -46,6 +46,12 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11,
+  MIGRATION_V12_SEMANTIC_TRUST,
+  MIGRATION_V12_SEMANTIC_SOURCE_KIND,
+  MIGRATION_V12_SEMANTIC_EVIDENCE_REFS,
+  MIGRATION_V12_KNOWLEDGE_TRUST,
+  MIGRATION_V12_KNOWLEDGE_SOURCE_KIND,
+  MIGRATION_V12_KNOWLEDGE_EVIDENCE_REFS,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -625,6 +631,26 @@ function applyMigrations(db: DatabaseType): void {
         try { db.exec(MIGRATION_V11); } catch { /* column may already exist */ }
       },
     },
+    {
+      // P4: Layer-A trust metadata on model-writable memory tables.
+      version: 12,
+      apply: () => {
+        for (const stmt of [
+          MIGRATION_V12_SEMANTIC_TRUST,
+          MIGRATION_V12_SEMANTIC_SOURCE_KIND,
+          MIGRATION_V12_SEMANTIC_EVIDENCE_REFS,
+          MIGRATION_V12_KNOWLEDGE_TRUST,
+          MIGRATION_V12_KNOWLEDGE_SOURCE_KIND,
+          MIGRATION_V12_KNOWLEDGE_EVIDENCE_REFS,
+        ]) {
+          try {
+            db.exec(stmt);
+          } catch {
+            /* column may already exist */
+          }
+        }
+      },
+    },
   ];
 
   for (const m of migrations) {
@@ -1087,27 +1113,59 @@ export function insertKnowledge(
     accessCount?: number;
     tokenCount: number;
     expiresAt?: string | null;
+    /** Layer-A trust classification — model-written knowledge is a hypothesis, never canonical. */
+    trustClass?: string;
+    sourceKind?: string;
+    /** Canonical Layer-B evidence IDs backing this entry (empty for model output). */
+    evidenceRefs?: string[];
   },
 ): string {
   const id = ulid();
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO knowledge_store
-     (id, category, key, content, source, confidence, last_verified, access_count, token_count, created_at, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    row.category,
-    row.key,
-    row.content,
-    row.source,
-    row.confidence ?? 1.0,
-    row.lastVerified ?? now,
-    row.accessCount ?? 0,
-    row.tokenCount,
-    now,
-    row.expiresAt ?? null,
+  // Trust columns arrive via MIGRATION_V12; tolerate legacy schemas that lack them.
+  const ksCols = new Set(
+    (db.prepare("PRAGMA table_info(knowledge_store)").all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    ),
   );
+  const hasTrust = ksCols.has("trust_class");
+  const columnList = hasTrust
+    ? "id, category, key, content, source, confidence, last_verified, access_count, token_count, created_at, expires_at, trust_class, source_kind, evidence_refs"
+    : "id, category, key, content, source, confidence, last_verified, access_count, token_count, created_at, expires_at";
+  const values: unknown[] = hasTrust
+    ? [
+        id,
+        row.category,
+        row.key,
+        row.content,
+        row.source,
+        row.confidence ?? 1.0,
+        row.lastVerified ?? now,
+        row.accessCount ?? 0,
+        row.tokenCount,
+        now,
+        row.expiresAt ?? null,
+        row.trustClass ?? "MODEL_HYPOTHESIS",
+        row.sourceKind ?? "MODEL",
+        JSON.stringify(row.evidenceRefs ?? []),
+      ]
+    : [
+        id,
+        row.category,
+        row.key,
+        row.content,
+        row.source,
+        row.confidence ?? 1.0,
+        row.lastVerified ?? now,
+        row.accessCount ?? 0,
+        row.tokenCount,
+        now,
+        row.expiresAt ?? null,
+      ];
+  db.prepare(
+    `INSERT INTO knowledge_store (${columnList})
+     VALUES (${columnList.split(",").map(() => "?").join(", ")})`,
+  ).run(...values);
   return id;
 }
 
