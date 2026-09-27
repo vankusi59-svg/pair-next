@@ -1,0 +1,547 @@
+/**
+ * GovernedTaskGate port (donor standalone_core/governed_task.py).
+ *
+ * Control-plane boundary only: VALIDATED → DISPATCH_AUTHORIZED → dispatched.
+ * It never selects tasks and never drives mission progression — Automaton
+ * remains the WHAT/NEXT authority; this gate decides WHETHER a governed
+ * dispatch may execute.
+ *
+ * Invariant: NO governed authorization = NO PAIR_NATIVE dispatch.
+ */
+
+import { digest, newId, pathWithin, utcnow } from "./canonical.js";
+import { IntegrityError, PolicyError } from "./errors.js";
+import type { PairControlPlane } from "./service.js";
+import { TASK_DISPATCHABLE_STATES } from "./service.js";
+import type { PairEvidenceStore } from "./store.js";
+import type { ExecutorAdapter } from "./adapter.js";
+import { ArtifactProvenanceValidator } from "./artifact-validation.js";
+
+const RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+const HIGH_IMPACT_PERMISSIONS = new Set([
+  "FILESYSTEM_WRITE_OUTSIDE_WORKSPACE",
+  "NETWORK_EGRESS",
+  "PROCESS_SPAWN_UNRESTRICTED",
+  "CREDENTIAL_READ",
+  "SECRETS_ACCESS",
+]);
+const FORBIDDEN_CONSTRAINTS = new Set([
+  "ALLOW_OUTSIDE_WORKSPACE",
+  "PERMISSION_EXPANSION",
+  "DISABLE_AUDIT",
+]);
+const AUTO_CONSTRAINTS = [
+  "DENY_OUTSIDE_WORKSPACE",
+  "NO_SECRET_DUMPING",
+  "NO_PERMISSION_EXPANSION"];
+
+const REQUIRED_REQUEST_FIELDS = [
+  "mission_id",
+  "task_id",
+  "plan_revision",
+  "task_instruction",
+  "workspace",
+  "allowed_paths",
+  "permissions",
+  "constraints",
+  "timeout",
+  "expected_output_contract",
+  "correlation_id",
+] as const;
+
+export class GovernedTaskGate {
+  constructor(
+    private readonly service: PairControlPlane,
+    private readonly validator = new ArtifactProvenanceValidator(),
+  ) {}
+
+  private get store(): PairEvidenceStore {
+    return this.service.store;
+  }
+
+  /** The full governed authorization check chain. Fail-closed throughout. */
+  create_governed_task(
+    adapter: ExecutorAdapter,
+    request: Record<string, unknown>,
+  ): { governed_task: Record<string, unknown> } {
+    for (const field of REQUIRED_REQUEST_FIELDS) {
+      const v = request[field];
+      if (v === undefined || v === null || v === "") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_GOVERNED_TASK_CONTRACT_INCOMPLETE",
+          `missing:${field}`,
+        );
+      }
+    }
+    const mission = this.service.getMission(String(request.mission_id));
+    if (!["READY", "RUNNING"].includes(String(mission.status))) {
+      throw new PolicyError(
+        "FAIL_CLOSED_MISSION_NOT_EXECUTABLE",
+        String(mission.status),
+      );
+    }
+    const active = this.service.activeRevision(String(mission.mission_id));
+    if (Number(request.plan_revision) !== active.revision) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_REVISION_MISMATCH",
+        `${request.plan_revision}!=${active.revision}`,
+      );
+    }
+    const task = this.service.getTask(String(request.task_id));
+    if (task.mission_id !== mission.mission_id || task.plan_id !== active.plan_id) {
+      throw new IntegrityError("FAIL_CLOSED_TASK_NOT_ACTIVE_PLAN", String(task.task_id));
+    }
+    if (!TASK_DISPATCHABLE_STATES.has(String(task.status))) {
+      throw new PolicyError(
+        "FAIL_CLOSED_TASK_NOT_DISPATCHABLE",
+        String(task.status),
+      );
+    }
+    if (task.selected_executor !== adapter.executor_id) {
+      throw new PolicyError(
+        "FAIL_CLOSED_EXECUTOR_ROUTING_MISMATCH",
+        String(task.selected_executor),
+      );
+    }
+    const q = adapter.qualify();
+    if (!q.qualified) {
+      throw new PolicyError("FAIL_CLOSED_EXECUTOR_UNQUALIFIED", adapter.executor_id);
+    }
+    const caps = adapter.capabilities();
+    const adapterCaps = new Set(caps.capability_ids as string[]);
+    const required = (task.required_capabilities as string[]) ?? [];
+    const missing = required.filter((c) => !adapterCaps.has(c));
+    if (missing.length) {
+      throw new PolicyError(
+        "FAIL_CLOSED_CAPABILITY_MISMATCH",
+        missing.join(","),
+      );
+    }
+
+    // Workspace authorization.
+    const workspace = String(request.workspace);
+    const roots = this.service.authorizedRoots(String(mission.mission_id));
+    if (!roots.some((r) => pathWithin(workspace, r))) {
+      throw new PolicyError("FAIL_CLOSED_WORKSPACE_UNAUTHORIZED", workspace);
+    }
+    const allowedPaths = request.allowed_paths as string[];
+    if (!Array.isArray(allowedPaths) || allowedPaths.length === 0) {
+      throw new IntegrityError("FAIL_CLOSED_GOVERNED_TASK_CONTRACT_INCOMPLETE", "allowed_paths");
+    }
+    for (const p of allowedPaths) {
+      if (!pathWithin(p, workspace)) {
+        throw new PolicyError("FAIL_CLOSED_ALLOWED_PATH_OUTSIDE_WORKSPACE", p);
+      }
+      if (!roots.some((r) => pathWithin(p, r))) {
+        throw new PolicyError("FAIL_CLOSED_ALLOWED_PATH_UNAUTHORIZED", p);
+      }
+    }
+
+    // Permissions ⊆ mission granted_permissions.
+    const granted = new Set((mission.granted_permissions as string[]) ?? []);
+    const requested = (request.permissions as string[]) ?? [];
+    const extra = requested.filter((p) => !granted.has(p));
+    if (extra.length) {
+      throw new PolicyError("FAIL_CLOSED_PERMISSION_EXPANSION", extra.join(","));
+    }
+
+    // Tools ⊆ mission allowed_tools (when the mission constrains them).
+    const allowedTools =
+      ((mission.metadata as Record<string, unknown> | undefined)?.allowed_tools as
+        | string[]
+        | undefined) ?? null;
+    const requestedTools = (request.tools as string[]) ?? [];
+    if (allowedTools) {
+      const deniedTools = requestedTools.filter((t) => !allowedTools.includes(t));
+      if (deniedTools.length) {
+        throw new PolicyError("FAIL_CLOSED_TOOL_NOT_ALLOWED", deniedTools.join(","));
+      }
+    }
+
+    // Constraints: forbidden rejected, safety constraints auto-appended.
+    const constraints = new Set((request.constraints as string[]) ?? []);
+    for (const c of constraints) {
+      if (FORBIDDEN_CONSTRAINTS.has(c)) {
+        throw new PolicyError("FAIL_CLOSED_CONSTRAINT_FORBIDDEN", c);
+      }
+    }
+    for (const c of AUTO_CONSTRAINTS) {
+      constraints.add(c);
+    }
+
+    const timeout = Number(request.timeout);
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) {
+      throw new IntegrityError("FAIL_CLOSED_TIMEOUT_OUT_OF_RANGE", String(request.timeout));
+    }
+
+    const gov = this.service.getRuntimeGovernance(String(mission.mission_id));
+    const retryCount = Number(request.retry_count ?? task.retry_count ?? 0);
+    const maxRetries = Number(gov.max_retries ?? 3);
+    if (retryCount > maxRetries) {
+      throw new PolicyError("FAIL_CLOSED_RETRY_BUDGET_EXHAUSTED", `${retryCount}>${maxRetries}`);
+    }
+
+    // Risk classification: task capabilities + metadata override.
+    const capRisk = required
+      .map((c) => {
+        const cap = this.store.tryGet("capability", c);
+        return String(cap?.risk_class ?? "MEDIUM");
+      })
+      .reduce((a, b) => (RISK_ORDER.indexOf(b) > RISK_ORDER.indexOf(a) ? b : a), "LOW");
+    const taskMetaRisk = String(
+      ((task.metadata as Record<string, unknown> | undefined)?.risk_class as string) ??
+        capRisk,
+    );
+    const riskClass = taskMetaRisk;
+    const riskIdx = RISK_ORDER.indexOf(riskClass);
+    if (riskIdx < 0) {
+      throw new IntegrityError("FAIL_CLOSED_RISK_CLASS_UNKNOWN", riskClass);
+    }
+    const ceiling = String(
+      ((mission.metadata as Record<string, unknown> | undefined)?.risk_ceiling as string) ??
+        "HIGH",
+    );
+    if (riskIdx > RISK_ORDER.indexOf(ceiling)) {
+      throw new PolicyError("FAIL_CLOSED_RISK_CEILING_EXCEEDED", `${riskClass}>${ceiling}`);
+    }
+
+    const policy = this.service.getPolicyProfile(String(mission.policy_profile));
+    const approvalRequirements = (policy.approval_requirements as string[]) ?? [];
+    const needsApproval =
+      riskIdx >= RISK_ORDER.indexOf("HIGH") ||
+      requested.some((p) => HIGH_IMPACT_PERMISSIONS.has(p)) ||
+      approvalRequirements.length > 0;
+
+    const governedTaskId = newId("GTSK");
+    const approvalScope = {
+      mission_id: mission.mission_id,
+      task_id: task.task_id,
+      executor_id: adapter.executor_id,
+      workspace,
+      allowed_paths: allowedPaths,
+      permissions: requested,
+      expected_output_contract: request.expected_output_contract,
+    };
+    const scopeDigest = digest(approvalScope);
+
+    let approvalId: string | null = null;
+    if (needsApproval) {
+      const approval = this.findValidApproval(
+        String(mission.mission_id),
+        String(task.task_id),
+        scopeDigest,
+      );
+      if (!approval) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OPERATOR_APPROVAL_REQUIRED",
+          `${task.task_id}:${scopeDigest.slice(0, 16)}`,
+        );
+      }
+      approvalId = String(approval.approval_id);
+    }
+
+    const governed = {
+      governed_task_id: governedTaskId,
+      mission_id: mission.mission_id,
+      task_id: task.task_id,
+      plan_id: active.plan_id,
+      plan_revision: active.revision,
+      correlation_id: request.correlation_id,
+      executor_id: adapter.executor_id,
+      task_instruction: request.task_instruction,
+      workspace,
+      allowed_paths: allowedPaths,
+      permissions: requested,
+      constraints: [...constraints],
+      timeout,
+      expected_output_contract: request.expected_output_contract,
+      risk_class: riskClass,
+      approval_required: needsApproval,
+      approval_id: approvalId,
+      approval_scope_digest: scopeDigest,
+      governance_state: "VALIDATED",
+      dispatch_enabled: false,
+      created_at: utcnow(),
+      version: 0,
+    };
+    const saved = this.store.put("governed_task", governedTaskId, governed, 0);
+    (saved as Record<string, unknown>).governance_digest = digest(saved);
+    const resaved = this.store.put(
+      "governed_task",
+      governedTaskId,
+      saved as Record<string, unknown>,
+      saved.version,
+    );
+    this.store.event({
+      entity_type: "governed_task",
+      entity_id: governedTaskId,
+      event_type: "GOVERNED_TASK_VALIDATED",
+      new_state: "VALIDATED",
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: String(request.correlation_id),
+      metadata: {
+        mission_id: mission.mission_id,
+        task_id: task.task_id,
+        executor_id: adapter.executor_id,
+        risk_class: riskClass,
+        approval_required: needsApproval,
+      },
+    });
+    this.store.appendEvidence(String(mission.mission_id), "GOVERNED_TASK_VALIDATED", {
+      governed_task_id: governedTaskId,
+      task_id: task.task_id,
+      executor_id: adapter.executor_id,
+      approval_scope_digest: scopeDigest,
+      approval_id: approvalId,
+    });
+    return { governed_task: resaved };
+  }
+
+  private findValidApproval(
+    missionId: string,
+    taskId: string,
+    scopeDigest: string,
+  ): Record<string, unknown> | null {
+    const approvals = this.store.list("approval").filter(
+      (a) =>
+        a.mission_id === missionId &&
+        a.task_id === taskId &&
+        a.status === "APPROVED",
+    );
+    return approvals.find((a) => a.approval_scope_digest === scopeDigest) ?? null;
+  }
+
+  /** Operator boundary: record an APPROVED approval bound to the scope digest. */
+  recordApproval(params: {
+    mission_id: string;
+    task_id: string;
+    executor_id: string;
+    approved_by: string;
+    request: Record<string, unknown>;
+  }): Record<string, unknown> {
+    const scope = {
+      mission_id: params.mission_id,
+      task_id: params.task_id,
+      executor_id: params.executor_id,
+      workspace: String(params.request.workspace),
+      allowed_paths: params.request.allowed_paths,
+      permissions: params.request.permissions ?? [],
+      expected_output_contract: params.request.expected_output_contract,
+    };
+    const approvalId = newId("APR");
+    const approval = {
+      approval_id: approvalId,
+      mission_id: params.mission_id,
+      task_id: params.task_id,
+      executor_id: params.executor_id,
+      status: "APPROVED",
+      approved_by: params.approved_by,
+      approval_scope_digest: digest(scope),
+      created_at: utcnow(),
+      version: 0,
+    };
+    const saved = this.store.put("approval", approvalId, approval, 0);
+    this.store.event({
+      entity_type: "approval",
+      entity_id: approvalId,
+      event_type: "APPROVAL_RECORDED",
+      new_state: "APPROVED",
+      actor: params.approved_by,
+    });
+    return saved;
+  }
+
+  authorize_dispatch(
+    adapter: ExecutorAdapter,
+    governedTaskId: string,
+  ): Record<string, unknown> {
+    const task = this.store.get("governed_task", governedTaskId);
+    if (task.governance_state !== "VALIDATED") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_GOVERNED_TASK_NOT_VALIDATED",
+        String(task.governance_state),
+      );
+    }
+    const q = adapter.qualify();
+    if (!q.qualified || !q.dispatch_enabled) {
+      throw new PolicyError("FAIL_CLOSED_EXECUTOR_UNQUALIFIED", adapter.executor_id);
+    }
+    task.governance_state = "DISPATCH_AUTHORIZED";
+    task.dispatch_enabled = true;
+    const saved = this.store.put("governed_task", governedTaskId, task, task.version);
+    saved.governance_digest = digest(saved);
+    const resaved = this.store.put("governed_task", governedTaskId, saved, saved.version);
+    this.store.event({
+      entity_type: "governed_task",
+      entity_id: governedTaskId,
+      event_type: "EXECUTION_PREPARED",
+      old_state: "VALIDATED",
+      new_state: "DISPATCH_AUTHORIZED",
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: String(task.correlation_id),
+    });
+    this.store.appendEvidence(String(task.mission_id), "DISPATCH_AUTHORIZED", {
+      governed_task_id: governedTaskId,
+      executor_id: adapter.executor_id,
+    });
+    return resaved;
+  }
+
+  /**
+   * Dispatch a DISPATCH_AUTHORIZED governed task. Records a dedup'ing
+   * executor_dispatch_intent, calls adapter.dispatch, persists the
+   * executor_execution entity + evidence.
+   */
+  dispatch_governed_task(
+    adapter: ExecutorAdapter,
+    governedTaskId: string,
+  ): Record<string, unknown> {
+    const task = this.store.get("governed_task", governedTaskId);
+    if (task.governance_state !== "DISPATCH_AUTHORIZED" || task.dispatch_enabled !== true) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_GOVERNED_TASK_NOT_DISPATCH_AUTHORIZED",
+        String(task.governance_state),
+      );
+    }
+    if (task.executor_id !== adapter.executor_id) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_EXECUTOR_ROUTING_MISMATCH",
+        String(task.executor_id),
+      );
+    }
+    const intentId = `INTENT_${governedTaskId}`;
+    const existingIntent = this.store.tryGet("executor_dispatch_intent", intentId);
+    if (existingIntent) {
+      const state = String(existingIntent.state);
+      if (state === "EXECUTION_PERSISTED" && existingIntent.execution_id) {
+        // Idempotent re-dispatch: return the existing execution.
+        return this.store.get("executor_execution", String(existingIntent.execution_id));
+      }
+      if (state === "INTENT_RECORDED") {
+        // Previous dispatch crashed before persisting — consult evidence.
+        const evidence = adapter.dispatch_evidence?.(governedTaskId);
+        if (evidence?.dispatched && evidence.execution_id) {
+          const exec = this.store.get("executor_execution", String(evidence.execution_id));
+          this.store.put(
+            "executor_dispatch_intent",
+            intentId,
+            { ...existingIntent, state: "EXECUTION_PERSISTED", execution_id: evidence.execution_id },
+            existingIntent.version,
+          );
+          return exec;
+        }
+      }
+    } else {
+      this.store.put(
+        "executor_dispatch_intent",
+        intentId,
+        {
+          intent_id: intentId,
+          governed_task_id: governedTaskId,
+          executor_id: adapter.executor_id,
+          state: "INTENT_RECORDED",
+          created_at: utcnow(),
+          version: 0,
+        },
+        0,
+      );
+    }
+
+    const execution = adapter.dispatch(task, { actor: "PAIR_GOVERNED_TASK_GATE" });
+    const executionId = String(execution.execution_id);
+    const execEntity = this.store.put(
+      "executor_execution",
+      executionId,
+      {
+        execution_id: executionId,
+        governed_task_id: governedTaskId,
+        mission_id: task.mission_id,
+        task_id: task.task_id,
+        executor_id: adapter.executor_id,
+        plan_revision: task.plan_revision,
+        correlation_id: task.correlation_id,
+        execution_state: String(execution.status ?? "RUNNING"),
+        dispatch_timestamp: utcnow(),
+        run_root: execution.run_root,
+        workspace: execution.workspace,
+        version: 0,
+      },
+      0,
+    );
+    const intent = this.store.get("executor_dispatch_intent", intentId);
+    this.store.put(
+      "executor_dispatch_intent",
+      intentId,
+      { ...intent, state: "EXECUTION_PERSISTED", execution_id: executionId },
+      intent.version,
+    );
+    this.store.event({
+      entity_type: "executor_execution",
+      entity_id: executionId,
+      event_type: "EXECUTION_DISPATCHED",
+      new_state: execEntity.execution_state as string,
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: String(task.correlation_id),
+      metadata: { governed_task_id: governedTaskId },
+    });
+    this.store.appendEvidence(String(task.mission_id), "EXECUTION_DISPATCHED", {
+      governed_task_id: governedTaskId,
+      execution_id: executionId,
+      executor_id: adapter.executor_id,
+    });
+    return execEntity;
+  }
+
+  observe_execution(
+    adapter: ExecutorAdapter,
+    executionId: string,
+  ): Record<string, unknown> {
+    const execution = this.store.get("executor_execution", executionId);
+    const observed = adapter.observe(executionId);
+    execution.last_observation = observed;
+    if (observed.status && String(observed.status) !== String(execution.execution_state)) {
+      execution.execution_state = String(observed.status);
+    }
+    return this.store.put("executor_execution", executionId, execution, execution.version);
+  }
+
+  collect_execution_result(
+    adapter: ExecutorAdapter,
+    executionId: string,
+  ): Record<string, unknown> {
+    const execution = this.store.get("executor_execution", executionId);
+    const result = adapter.collect_result(executionId);
+    // Identity binding: result must name the same governed task / mission / task.
+    for (const field of ["mission_id", "task_id", "governed_task_id"]) {
+      if (result[field] && String(result[field]) !== String(execution[field])) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_RESULT_IDENTITY_MISMATCH",
+          `${field}:${result[field]}!=${execution[field]}`,
+        );
+      }
+    }
+    execution.result = result;
+    execution.result_state = result.status;
+    execution.execution_state = result.status;
+    const saved = this.store.put("executor_execution", executionId, execution, execution.version);
+    this.store.event({
+      entity_type: "executor_execution",
+      entity_id: executionId,
+      event_type: "RESULT_COLLECTED",
+      new_state: String(result.status),
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: String(execution.correlation_id),
+    });
+    this.store.appendEvidence(String(execution.mission_id), "RESULT_COLLECTED", {
+      execution_id: executionId,
+      status: result.status,
+      result_digest: digest(result),
+    });
+    return saved;
+  }
+
+  /** Terminal validation: artifact provenance + workspace confinement. */
+  validate_execution_result(executionId: string): Record<string, unknown> {
+    return this.validator.validate_execution(this.service, executionId);
+  }
+}

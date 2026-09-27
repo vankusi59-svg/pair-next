@@ -90,6 +90,23 @@ export class LocalWorkerPool {
     return this.activeWorkers.has(id);
   }
 
+  /** Bounded cancellation: abort a live worker's AbortSignal. */
+  cancel(workerId: string): boolean {
+    const id = workerId.replace("local://", "");
+    const worker = this.activeWorkers.get(id);
+    if (!worker) {
+      return false;
+    }
+    worker.abortController.abort();
+    return true;
+  }
+
+  /** Completion handle for a live worker, or null once it exits. */
+  waitFor(workerId: string): Promise<void> | null {
+    const id = workerId.replace("local://", "");
+    return this.activeWorkers.get(id)?.promise ?? null;
+  }
+
   async shutdown(): Promise<void> {
     for (const [, worker] of this.activeWorkers) {
       worker.abortController.abort();
