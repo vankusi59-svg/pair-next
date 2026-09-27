@@ -274,7 +274,7 @@ describe("path protection policy rules", () => {
 
     it("does not apply to write_file (remote sandbox)", () => {
       const request = makeMockRequest("write_file", {
-        path: "/home/conway/app.py",
+        path: "/home/compute/app.py",
       });
       // The rule's appliesTo only includes edit_own_file,
       // so it should not match write_file at all.

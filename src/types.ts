@@ -45,13 +45,15 @@ export interface AutomatonConfig {
   genesisPrompt: string;
   creatorMessage?: string;
   creatorAddress: string;
-  registeredWithConway: boolean;
   sandboxId: string;
-  conwayApiUrl: string;
-  conwayApiKey: string;
   openaiApiKey?: string;
   anthropicApiKey?: string;
   ollamaBaseUrl?: string;
+  /** Path to inference-providers.json (default ~/.automaton/inference-providers.json) */
+  inferenceProvidersPath?: string;
+
+  /** Local budget in cents used as the credits signal (overrides AUTOMATON_CREDITS_BALANCE env) */
+  localBudgetCents?: number;
   inferenceModel: string;
   maxTokensPerTurn: number;
   heartbeatConfigPath: string;
@@ -66,7 +68,6 @@ export interface AutomatonConfig {
   /** Child sandbox memory config (MB), default 1024 */
   childSandboxMemoryMb?: number;
   parentAddress?: string;
-  socialRelayUrl?: string;
   treasuryPolicy?: TreasuryPolicy;
   // Phase 2 config additions
   soulConfig?: SoulConfig;
@@ -78,8 +79,7 @@ export interface AutomatonConfig {
 }
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
-  conwayApiUrl: "https://api.conway.tech",
-  inferenceModel: "gpt-5.2",
+  inferenceModel: "gemini-3.8-flash",
   maxTokensPerTurn: 4096,
   heartbeatConfigPath: "~/.automaton/heartbeat.yml",
   dbPath: "~/.automaton/state.db",
@@ -89,7 +89,6 @@ export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
   maxChildren: 3,
   maxTurnsPerCycle: 25,
   childSandboxMemoryMb: 1024,
-  socialRelayUrl: "https://social.conway.tech",
 };
 
 // ─── Agent State ─────────────────────────────────────────────────
@@ -153,21 +152,19 @@ export interface AutomatonTool {
 
 export type ToolCategory =
   | "vm"
-  | "conway"
+  | "compute"
   | "self_mod"
   | "financial"
   | "survival"
   | "skills"
   | "git"
-  | "registry"
-  | "replication"
   | "memory";
 
 export interface ToolContext {
   identity: AutomatonIdentity;
   config: AutomatonConfig;
   db: AutomatonDatabase;
-  conway: ConwayClient;
+  compute: ComputeClient;
   inference: InferenceClient;
   social?: SocialClientInterface;
 }
@@ -354,7 +351,7 @@ export interface InferenceToolDefinition {
 
 // ─── Conway Client ───────────────────────────────────────────────
 
-export interface ConwayClient {
+export interface ComputeClient {
   exec(command: string, timeout?: number): Promise<ExecResult>;
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string>;
@@ -397,7 +394,7 @@ export interface ConwayClient {
   // Model discovery
   listModels(): Promise<ModelInfo[]>;
   /** Create a new client scoped to a specific sandbox ID. */
-  createScopedClient(targetSandboxId: string): ConwayClient;
+  createScopedClient(targetSandboxId: string): ComputeClient;
 }
 
 export interface ExecResult {
@@ -586,7 +583,7 @@ export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
   maxDailyTransferCents: 25000,
   minimumReserveCents: 1000,
   maxX402PaymentCents: 100,
-  x402AllowedDomains: ['conway.tech'],
+  x402AllowedDomains: ['compute.tech'],
   transferCooldownMs: 0,
   maxTransfersPerTurn: 2,
   maxInferenceDailyCents: 50000,
@@ -899,7 +896,7 @@ export interface HeartbeatLegacyContext {
   identity: AutomatonIdentity;
   config: AutomatonConfig;
   db: AutomatonDatabase;
-  conway: ConwayClient;
+  compute: ComputeClient;
   social?: SocialClientInterface;
 }
 
@@ -1142,7 +1139,16 @@ export const DEFAULT_MEMORY_BUDGET: MemoryBudget = {
 
 // === Phase 2.3: Inference & Model Strategy Types ===
 
-export type ModelProvider = "openai" | "anthropic" | "conway" | "ollama" | "other";
+export type ModelProvider =
+  | "openai"
+  | "anthropic"
+  | "ollama"
+  | "groq"
+  | "gemini"
+  | "agnes"
+  | "together"
+  | "local"
+  | "other";
 
 export type InferenceTaskType =
   | "agent_turn"
@@ -1245,9 +1251,9 @@ export interface ModelStrategyConfig {
 }
 
 export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
-  inferenceModel: "gpt-5.2",
-  lowComputeModel: "gpt-5-mini",
-  criticalModel: "gpt-5-mini",
+  inferenceModel: "gemini-3.8-flash",
+  lowComputeModel: "openai/gpt-oss-20b",
+  criticalModel: "openai/gpt-oss-20b",
   maxTokensPerTurn: 4096,
   hourlyBudgetCents: 0,
   sessionBudgetCents: 0,

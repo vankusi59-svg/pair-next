@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { BUILTIN_TASKS } from "../heartbeat/tasks.js";
 import {
-  MockConwayClient,
+  MockComputeClient,
   MockSocialClient,
   createTestDb,
   createTestIdentity,
@@ -36,185 +36,16 @@ function createMockTickContext(db: AutomatonDatabase, overrides?: Partial<TickCo
 
 describe("Heartbeat Tasks", () => {
   let db: AutomatonDatabase;
-  let conway: MockConwayClient;
+  let compute: MockComputeClient;
 
   beforeEach(() => {
     db = createTestDb();
-    conway = new MockConwayClient();
+    compute = new MockComputeClient();
   });
 
   afterEach(() => {
     db.close();
   });
-
-  describe("check_social_inbox", () => {
-    it("returns shouldWake false when no social client", async () => {
-      const tickCtx = createMockTickContext(db);
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-        // no social client
-      };
-
-      const result = await BUILTIN_TASKS.check_social_inbox(tickCtx, taskCtx);
-
-      expect(result.shouldWake).toBe(false);
-    });
-
-    it("polls and wakes when messages found", async () => {
-      const social = new MockSocialClient();
-      social.pollResponses.push({
-        messages: [
-          {
-            id: "msg-1",
-            from: "0xsender1",
-            to: "0xrecipient",
-            content: "Hey there!",
-            signedAt: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-          },
-          {
-            id: "msg-2",
-            from: "0xsender2",
-            to: "0xrecipient",
-            content: "What's up?",
-            signedAt: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-          },
-        ],
-        nextCursor: new Date().toISOString(),
-      });
-
-      const tickCtx = createMockTickContext(db);
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-        social,
-      };
-
-      const result = await BUILTIN_TASKS.check_social_inbox(tickCtx, taskCtx);
-
-      expect(result.shouldWake).toBe(true);
-      expect(result.message).toContain("2 new message(s)");
-
-      // Verify messages were persisted to inbox
-      const unprocessed = db.getUnprocessedInboxMessages(10);
-      expect(unprocessed.length).toBe(2);
-    });
-
-    it("deduplicates messages", async () => {
-      const social = new MockSocialClient();
-
-      // First poll: returns msg-1
-      social.pollResponses.push({
-        messages: [
-          {
-            id: "msg-1",
-            from: "0xsender1",
-            to: "0xrecipient",
-            content: "Hello!",
-            signedAt: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-          },
-        ],
-      });
-
-      // Second poll: returns same msg-1 again
-      social.pollResponses.push({
-        messages: [
-          {
-            id: "msg-1",
-            from: "0xsender1",
-            to: "0xrecipient",
-            content: "Hello!",
-            signedAt: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-          },
-        ],
-      });
-
-      const tickCtx = createMockTickContext(db);
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-        social,
-      };
-
-      // First run
-      const result1 = await BUILTIN_TASKS.check_social_inbox(tickCtx, taskCtx);
-      expect(result1.shouldWake).toBe(true);
-
-      // Second run — same message, should not wake
-      const result2 = await BUILTIN_TASKS.check_social_inbox(tickCtx, taskCtx);
-      expect(result2.shouldWake).toBe(false);
-
-      // Only one inbox row
-      const unprocessed = db.getUnprocessedInboxMessages(10);
-      expect(unprocessed.length).toBe(1);
-    });
-
-    it("returns shouldWake false when no messages", async () => {
-      const social = new MockSocialClient();
-      social.pollResponses.push({ messages: [] });
-
-      const tickCtx = createMockTickContext(db);
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-        social,
-      };
-
-      const result = await BUILTIN_TASKS.check_social_inbox(tickCtx, taskCtx);
-
-      expect(result.shouldWake).toBe(false);
-    });
-
-    it("does not wake when all messages are blocked by sanitizer", async () => {
-      const social = new MockSocialClient();
-      // Message exceeding 50KB triggers the size_limit block
-      const oversizedContent = "x".repeat(60_000);
-      social.pollResponses.push({
-        messages: [
-          {
-            id: "blocked-msg-1",
-            from: "0xattacker",
-            to: "0xrecipient",
-            content: oversizedContent,
-            signedAt: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-          },
-        ],
-      });
-
-      const tickCtx = createMockTickContext(db);
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-        social,
-      };
-
-      const result = await BUILTIN_TASKS.check_social_inbox(tickCtx, taskCtx);
-
-      // Blocked messages are stored for audit but should not wake the agent
-      expect(result.shouldWake).toBe(false);
-      // Message was still persisted
-      const unprocessed = db.getUnprocessedInboxMessages(10);
-      expect(unprocessed.length).toBe(1);
-      expect(unprocessed[0].content).toContain("[BLOCKED:");
-    });
-  });
-
-  // ─── heartbeat_ping ─────────────────────────────────────────
 
   describe("heartbeat_ping", () => {
     it("records ping and does not wake on normal tier", async () => {
@@ -226,7 +57,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       const result = await BUILTIN_TASKS.heartbeat_ping(tickCtx, taskCtx);
@@ -248,7 +79,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       const result = await BUILTIN_TASKS.heartbeat_ping(tickCtx, taskCtx);
@@ -268,7 +99,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       const result = await BUILTIN_TASKS.heartbeat_ping(tickCtx, taskCtx);
@@ -290,7 +121,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       // Set previous tier to same
@@ -312,7 +143,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       // Previous tier was normal
@@ -333,7 +164,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       // No previous tier set
@@ -345,63 +176,6 @@ describe("Heartbeat Tasks", () => {
 
   // ─── check_usdc_balance ─────────────────────────────────────
 
-  describe("check_usdc_balance", () => {
-    it("does not wake when no USDC and enough credits", async () => {
-      const tickCtx = createMockTickContext(db, {
-        creditBalance: 10_000,
-        usdcBalance: 0,
-      });
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-      };
-
-      const result = await BUILTIN_TASKS.check_usdc_balance(tickCtx, taskCtx);
-
-      expect(result.shouldWake).toBe(false);
-    });
-
-    it("wakes when has USDC but critically low credits", async () => {
-      const tickCtx = createMockTickContext(db, {
-        creditBalance: 0, // critical tier
-        usdcBalance: 10.0, // > 5
-        survivalTier: "critical",
-      });
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-      };
-
-      const result = await BUILTIN_TASKS.check_usdc_balance(tickCtx, taskCtx);
-
-      expect(result.shouldWake).toBe(true);
-      expect(result.message).toContain("USDC");
-    });
-
-    it("does not wake when USDC below threshold", async () => {
-      const tickCtx = createMockTickContext(db, {
-        creditBalance: 200,
-        usdcBalance: 3.0, // < 5
-      });
-      const taskCtx: HeartbeatLegacyContext = {
-        identity: createTestIdentity(),
-        config: createTestConfig(),
-        db,
-        conway,
-      };
-
-      const result = await BUILTIN_TASKS.check_usdc_balance(tickCtx, taskCtx);
-
-      expect(result.shouldWake).toBe(false);
-    });
-  });
-
-  // ─── health_check ───────────────────────────────────────────
-
   describe("health_check", () => {
     it("returns shouldWake false when sandbox is healthy", async () => {
       const tickCtx = createMockTickContext(db);
@@ -409,7 +183,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       const result = await BUILTIN_TASKS.health_check(tickCtx, taskCtx);
@@ -419,14 +193,14 @@ describe("Heartbeat Tasks", () => {
     });
 
     it("wakes when sandbox exec fails", async () => {
-      conway.exec = async () => ({ stdout: "", stderr: "unhealthy", exitCode: 1 });
+      compute.exec = async () => ({ stdout: "", stderr: "unhealthy", exitCode: 1 });
 
       const tickCtx = createMockTickContext(db);
       const taskCtx: HeartbeatLegacyContext = {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       const result = await BUILTIN_TASKS.health_check(tickCtx, taskCtx);
@@ -436,7 +210,7 @@ describe("Heartbeat Tasks", () => {
     });
 
     it("wakes when sandbox exec throws", async () => {
-      conway.exec = async () => {
+      compute.exec = async () => {
         throw new Error("sandbox unreachable");
       };
 
@@ -445,7 +219,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       const result = await BUILTIN_TASKS.health_check(tickCtx, taskCtx);
@@ -464,7 +238,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       const result = await BUILTIN_TASKS.refresh_models(tickCtx, taskCtx);
@@ -490,7 +264,7 @@ describe("Heartbeat Tasks", () => {
         identity: createTestIdentity(),
         config: createTestConfig(),
         db,
-        conway,
+        compute,
       };
 
       // Run heartbeat_ping — it should use ctx.creditBalance
@@ -504,7 +278,7 @@ describe("Heartbeat Tasks", () => {
       expect(creditCheck.credits).toBe(7777);
 
       // No direct getCreditsBalance calls should have been made by these tasks
-      // (conway.getCreditsBalance is only called during buildTickContext, not by tasks)
+      // (compute.getCreditsBalance is only called during buildTickContext, not by tasks)
     });
   });
 });

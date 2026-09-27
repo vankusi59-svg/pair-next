@@ -5,7 +5,7 @@
  * - Authority rules: external input blocked from dangerous tools
  * - Authority rules: self-mod from external blocked on protected paths
  * - Rate limit rules: genesis prompt, self-mod, spawn
- * - Financial Phase 1 rules: inference daily cap, require confirmation
+ * - Financial Phase 1 rules: inference daily cap
  * - Treasury config loading and validation
  * - promptWithDefault behavior
  */
@@ -113,7 +113,7 @@ function createMockContext(rawDb?: Database.Database): ToolContext {
     identity: {} as any,
     config: {} as any,
     db: rawDb ? { raw: rawDb } as any : {} as any,
-    conway: {} as any,
+    compute: {} as any,
     inference: {} as any,
   };
 }
@@ -158,7 +158,7 @@ describe("Authority Rules", () => {
       const tool = createMockTool({
         name: "delete_sandbox",
         riskLevel: "dangerous",
-        category: "conway",
+        category: "compute",
       });
       const request = createRequest(tool, {}, undefined);
 
@@ -267,7 +267,7 @@ describe("Authority Rules", () => {
       const tool = createMockTool({
         name: "delete_sandbox",
         riskLevel: "dangerous",
-        category: "conway",
+        category: "compute",
       });
       const request = createRequest(tool, {}, "agent");
 
@@ -577,7 +577,7 @@ describe("Financial Phase 1 Rules", () => {
       const tool = createMockTool({
         name: "chat",
         riskLevel: "safe",
-        category: "conway",
+        category: "compute",
       });
       const spendTracker = createMockSpendTracker({
         getDailySpend: (category: SpendCategory) =>
@@ -596,7 +596,7 @@ describe("Financial Phase 1 Rules", () => {
       const tool = createMockTool({
         name: "chat",
         riskLevel: "safe",
-        category: "conway",
+        category: "compute",
       });
       const spendTracker = createMockSpendTracker({
         getDailySpend: (category: SpendCategory) =>
@@ -610,64 +610,6 @@ describe("Financial Phase 1 Rules", () => {
     });
   });
 
-  describe("financial.require_confirmation", () => {
-    it("allows transfers under confirmation threshold", () => {
-      const rules = createFinancialRules(DEFAULT_TREASURY_POLICY);
-      const engine = new PolicyEngine(db, rules);
-
-      const tool = createMockTool({
-        name: "transfer_credits",
-        riskLevel: "dangerous",
-        category: "financial",
-      });
-      const request = createRequest(tool, { amount_cents: 500 }, "agent");
-
-      const decision = engine.evaluate(request);
-      // Should not be quarantined (500 < 1000 threshold)
-      expect(decision.action).not.toBe("quarantine");
-    });
-
-    it("quarantines transfers above confirmation threshold", () => {
-      const rules = createFinancialRules(DEFAULT_TREASURY_POLICY);
-      const engine = new PolicyEngine(db, rules);
-
-      const tool = createMockTool({
-        name: "transfer_credits",
-        riskLevel: "dangerous",
-        category: "financial",
-      });
-      const request = createRequest(tool, { amount_cents: 2000 }, "agent");
-
-      const decision = engine.evaluate(request);
-      // Should be quarantined (2000 > 1000 threshold), but may also be denied
-      // by transfer_max_single if over that limit. 2000 < 5000 so it won't be denied.
-      expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
-    });
-
-    it("returns quarantine, not deny, for confirmation threshold", () => {
-      // Use a custom policy with very high transfer limits so only confirmation triggers
-      const policy: TreasuryPolicy = {
-        ...DEFAULT_TREASURY_POLICY,
-        maxSingleTransferCents: 100000,
-        requireConfirmationAboveCents: 500,
-      };
-      const rules = createFinancialRules(policy);
-      const engine = new PolicyEngine(db, rules);
-
-      const tool = createMockTool({
-        name: "transfer_credits",
-        riskLevel: "dangerous",
-        category: "financial",
-      });
-      const request = createRequest(tool, { amount_cents: 1000 }, "agent");
-
-      const decision = engine.evaluate(request);
-      expect(decision.action).toBe("quarantine");
-      expect(decision.reasonCode).toBe("CONFIRMATION_REQUIRED");
-    });
-  });
-});
 
 // ─── Treasury Config Tests ──────────────────────────────────────
 
@@ -678,7 +620,7 @@ describe("Treasury Config", () => {
     expect(DEFAULT_TREASURY_POLICY.maxDailyTransferCents).toBe(25000);
     expect(DEFAULT_TREASURY_POLICY.minimumReserveCents).toBe(1000);
     expect(DEFAULT_TREASURY_POLICY.maxX402PaymentCents).toBe(100);
-    expect(DEFAULT_TREASURY_POLICY.x402AllowedDomains).toEqual(["conway.tech"]);
+    expect(DEFAULT_TREASURY_POLICY.x402AllowedDomains).toEqual(["compute.tech"]);
     expect(DEFAULT_TREASURY_POLICY.transferCooldownMs).toBe(0);
     expect(DEFAULT_TREASURY_POLICY.maxTransfersPerTurn).toBe(2);
     expect(DEFAULT_TREASURY_POLICY.maxInferenceDailyCents).toBe(50000);
@@ -707,7 +649,6 @@ describe("createDefaultRules", () => {
     expect(ruleIds).toContain("rate.self_mod_hourly");
     expect(ruleIds).toContain("rate.spawn_daily");
     expect(ruleIds).toContain("financial.inference_daily_cap");
-    expect(ruleIds).toContain("financial.require_confirmation");
   });
 
   it("authority rules have priority 400", () => {
@@ -729,7 +670,7 @@ describe("createDefaultRules", () => {
   it("financial phase 1 rules have priority 500", () => {
     const rules = createDefaultRules();
     const financialRules = rules.filter(
-      (r) => r.id === "financial.inference_daily_cap" || r.id === "financial.require_confirmation",
+      (r) => r.id === "financial.inference_daily_cap",
     );
     for (const rule of financialRules) {
       expect(rule.priority).toBe(500);
@@ -757,4 +698,5 @@ describe("promptWithDefault", () => {
     const prompts = await import("../setup/prompts.js");
     expect(typeof prompts.promptWithDefault).toBe("function");
   });
+});
 });

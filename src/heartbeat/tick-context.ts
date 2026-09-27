@@ -9,12 +9,11 @@
 import type BetterSqlite3 from "better-sqlite3";
 
 import type {
-  ConwayClient,
+  ComputeClient,
   HeartbeatConfig,
   TickContext,
 } from "../types.js";
-import { getSurvivalTier } from "../conway/credits.js";
-import { getUsdcBalance } from "../conway/x402.js";
+import { getSurvivalTier } from "../survival/tiers.js";
 import { createLogger } from "../observability/logger.js";
 
 type DatabaseType = BetterSqlite3.Database;
@@ -32,14 +31,14 @@ function generateTickId(): string {
  * Build a TickContext for the current tick.
  *
  * - Generates a unique tickId
- * - Fetches credit balance ONCE via conway.getCreditsBalance()
+ * - Fetches credit balance ONCE via compute.getCreditsBalance()
  * - Fetches USDC balance ONCE via getUsdcBalance()
  * - Derives survivalTier from credit balance
  * - Reads lowComputeMultiplier from config
  */
 export async function buildTickContext(
   db: DatabaseType,
-  conway: ConwayClient,
+  compute: ComputeClient,
   config: HeartbeatConfig,
   walletAddress?: string,
   chainType?: string,
@@ -50,20 +49,15 @@ export async function buildTickContext(
   // Fetch balances ONCE
   let creditBalance = 0;
   try {
-    creditBalance = await conway.getCreditsBalance();
+    creditBalance = await compute.getCreditsBalance();
   } catch (err: any) {
     logger.error("Failed to fetch credit balance", err instanceof Error ? err : undefined);
   }
 
-  let usdcBalance = 0;
-  if (walletAddress) {
-    try {
-      const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-      usdcBalance = await getUsdcBalance(walletAddress, network, chainType as any);
-    } catch (err: any) {
-      logger.error("Failed to fetch USDC balance", err instanceof Error ? err : undefined);
-    }
-  }
+  // automaton-pair fork: no on-chain USDC lookup — local budget only.
+  const usdcBalance = 0;
+  void walletAddress;
+  void chainType;
 
   const survivalTier = getSurvivalTier(creditBalance);
   const lowComputeMultiplier = config.lowComputeMultiplier ?? 4;

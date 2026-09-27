@@ -8,7 +8,7 @@ import type {
   InferenceResponse,
   InferenceOptions,
   ChatMessage,
-  ConwayClient,
+  ComputeClient,
   ExecResult,
   PortInfo,
   SandboxInfo,
@@ -112,7 +112,7 @@ export function toolCallResponse(
 
 // ─── Mock Conway Client ─────────────────────────────────────────
 
-export class MockConwayClient implements ConwayClient {
+export class MockComputeClient implements ComputeClient {
   execCalls: { command: string; timeout?: number }[] = [];
   creditsCents = 10_000; // $100 default
   files: Record<string, string> = {};
@@ -133,7 +133,7 @@ export class MockConwayClient implements ConwayClient {
   async exposePort(port: number): Promise<PortInfo> {
     return {
       port,
-      publicUrl: `https://test-${port}.conway.tech`,
+      publicUrl: `https://test-${port}.compute.tech`,
       sandboxId: "test-sandbox",
     };
   }
@@ -225,7 +225,7 @@ export class MockConwayClient implements ConwayClient {
     return { automaton: {} };
   }
 
-  createScopedClient(_targetSandboxId: string): ConwayClient {
+  createScopedClient(_targetSandboxId: string): ComputeClient {
     // Return self so spies on exec/writeFile propagate to scoped clients
     return this;
   }
@@ -344,7 +344,7 @@ export function createTestConfig(
     creatorAddress: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd" as `0x${string}`,
     registeredWithConway: true,
     sandboxId: "test-sandbox-id",
-    conwayApiUrl: "https://api.conway.tech",
+    conwayApiUrl: "https://api.compute.tech",
     conwayApiKey: "test-api-key",
     inferenceModel: "mock-model",
     maxTokensPerTurn: 4096,
@@ -356,7 +356,7 @@ export function createTestConfig(
     skillsDir: "/tmp/test-skills",
     maxChildren: 3,
     maxTurnsPerCycle: 25,
-    socialRelayUrl: "https://social.conway.tech",
+    socialRelayUrl: "https://social.compute.tech",
     ...overrides,
   };
 }

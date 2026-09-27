@@ -1,39 +1,20 @@
 /**
- * Conway Credits Management
+ * Survival Tiers
  *
- * Monitors the automaton's compute credit balance and triggers
- * survival mode transitions.
+ * Tier thresholds and helpers. In the PAIR fork, the "credit balance"
+ * signal is a locally configured budget (AUTOMATON_CREDITS_BALANCE env
+ * or config value, in cents) rather than a remote Conway balance.
  */
 
-import type {
-  ConwayClient,
-  FinancialState,
-  SurvivalTier,
-} from "../types.js";
+import type { SurvivalTier } from "../types.js";
 import { SURVIVAL_THRESHOLDS } from "../types.js";
-
-/**
- * Check the current financial state of the automaton.
- */
-export async function checkFinancialState(
-  conway: ConwayClient,
-  usdcBalance: number,
-): Promise<FinancialState> {
-  const creditsCents = await conway.getCreditsBalance();
-
-  return {
-    creditsCents,
-    usdcBalance,
-    lastChecked: new Date().toISOString(),
-  };
-}
 
 /**
  * Determine the survival tier based on current credits.
  * Thresholds are checked in descending order: high > normal > low_compute > critical > dead.
  *
  * Zero credits = "critical" (broke but alive — can still accept funding, send distress).
- * Only negative balance (API-confirmed debt) = "dead".
+ * Only negative balance = "dead".
  */
 export function getSurvivalTier(creditsCents: number): SurvivalTier {
   if (creditsCents > SURVIVAL_THRESHOLDS.high) return "high";

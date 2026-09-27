@@ -3,7 +3,7 @@ import type {
   AutomatonDatabase,
   AutomatonIdentity,
   ChildStatus,
-  ConwayClient,
+  ComputeClient,
 } from "../types.js";
 import type { AgentTracker, FundingProtocol } from "./types.js";
 
@@ -80,7 +80,7 @@ export class SimpleAgentTracker implements AgentTracker {
 
 export class SimpleFundingProtocol implements FundingProtocol {
   constructor(
-    private readonly conway: ConwayClient,
+    private readonly compute: ComputeClient,
     private readonly identity: AutomatonIdentity,
     private readonly db: AutomatonDatabase,
   ) {}
@@ -92,7 +92,7 @@ export class SimpleFundingProtocol implements FundingProtocol {
     }
 
     try {
-      const result = await this.conway.transferCredits(
+      const result = await this.compute.transferCredits(
         childAddress,
         transferAmount,
         "Task funding from orchestrator",
@@ -120,7 +120,7 @@ export class SimpleFundingProtocol implements FundingProtocol {
     }
 
     try {
-      const result = await this.conway.transferCredits(
+      const result = await this.compute.transferCredits(
         this.identity.address,
         amountCents,
         `Recall credits from ${childAddress}`,

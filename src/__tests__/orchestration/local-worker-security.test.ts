@@ -3,12 +3,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GeneralHarness } from "../../agent/harnesses/general-harness.js";
 import type { HarnessContext } from "../../agent/harness-types.js";
-import type { ConwayClient } from "../../types.js";
+import type { ComputeClient } from "../../types.js";
 import { AgentWorkspace } from "../../orchestration/workspace.js";
 import { createInMemoryDb } from "./test-db.js";
 import { createTestConfig, createTestIdentity } from "../mocks.js";
 
-function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
+function createConwayStub(overrides?: Partial<ComputeClient>): ComputeClient {
   return {
     exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
     writeFile: async () => undefined,
@@ -30,7 +30,7 @@ function createConwayStub(overrides?: Partial<ConwayClient>): ConwayClient {
     listModels: async () => [],
     createScopedClient: () => createConwayStub(),
     ...overrides,
-  } as ConwayClient;
+  } as ComputeClient;
 }
 
 describe("agent/general-harness security", () => {
@@ -47,7 +47,7 @@ describe("agent/general-harness security", () => {
     rmSync(testRoot, { recursive: true, force: true });
   });
 
-  async function createHarness(conway: ConwayClient) {
+  async function createHarness(compute: ComputeClient) {
     const harness = new GeneralHarness();
     const workspace = new AgentWorkspace("goal-test", path.join(testRoot, "workspace"));
     const context: HarnessContext = {
@@ -57,7 +57,7 @@ describe("agent/general-harness security", () => {
       identity: createTestIdentity(),
       config: createTestConfig(),
       db,
-      conway,
+      compute,
       inference: { chat: async () => ({ content: "done" }) },
       budget: {
         maxTurns: 5,
@@ -103,11 +103,11 @@ describe("agent/general-harness security", () => {
   }
 
   async function runTool(
-    conway: ConwayClient,
+    compute: ComputeClient,
     toolName: string,
     args: Record<string, unknown>,
   ): Promise<string> {
-    const harness = await createHarness(conway);
+    const harness = await createHarness(compute);
     const tool = harness.getToolDefs().find((entry) => entry.name === toolName);
     if (!tool) throw new Error(`missing tool: ${toolName}`);
     return tool.execute(args);
@@ -157,25 +157,25 @@ describe("agent/general-harness security", () => {
     mkdirSync(path.dirname(filePath), { recursive: true });
     writeFileSync(filePath, "hello", "utf8");
 
-    const conway = createConwayStub({
+    const compute = createConwayStub({
       readFile: async () => {
         throw new Error("force local fallback");
       },
     });
 
-    const out = await runTool(conway, "read_file", { path: filePath });
+    const out = await runTool(compute, "read_file", { path: filePath });
     expect(out).toBe("hello");
   });
 
   it("allows normal write_file paths inside the allowed edit root", async () => {
     const filePath = path.join(testRoot, "out", "data.txt");
-    const conway = createConwayStub({
+    const compute = createConwayStub({
       writeFile: async () => {
         throw new Error("force local fallback");
       },
     });
 
-    const out = await runTool(conway, "write_file", { path: filePath, content: "ok" });
+    const out = await runTool(compute, "write_file", { path: filePath, content: "ok" });
     expect(out).toContain("Wrote 2 bytes");
     expect(readFileSync(filePath, "utf8")).toBe("ok");
   });

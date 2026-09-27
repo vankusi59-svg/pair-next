@@ -13,22 +13,13 @@ import { isSensitiveFile } from "../policy-rules/path-protection.js";
 const MAX_EXEC_TIMEOUT_MS = 30_000;
 const MAX_READ_SIZE = 10_000;
 const MAX_EXEC_OUTPUT = 16_000;
-const MAX_SOCIAL_MESSAGES = 20;
 const GENERAL_WRAPPED_TOOL_ALLOWLIST = new Set([
   "expose_port",
   "remove_port",
   "check_credits",
-  "check_usdc_balance",
-  "transfer_credits",
-  "send_message",
   "list_models",
   "switch_model",
   "check_inference_spending",
-  "discover_agents",
-  "check_reputation",
-  "search_domains",
-  "register_domain",
-  "manage_dns",
   "list_skills",
   "git_status",
   "git_diff",
@@ -42,11 +33,7 @@ const GENERAL_WRAPPED_TOOL_ALLOWLIST = new Set([
   "note_about_agent",
   "review_memory",
   "forget",
-  "x402_fetch",
 ]);
-const GENERAL_SPEC_ALIAS_TARGETS = {
-  web_fetch: "x402_fetch",
-} as const;
 const NOOP_SPEND_TRACKER: SpendTrackerInterface = {
   recordSpend: () => {},
   getHourlySpend: () => 0,
@@ -84,7 +71,7 @@ is to complete this task efficiently and report your results.
 6. Be efficient. Minimize unnecessary tool calls. Every tool call costs money.
 7. You have a limited turn budget. Do not waste turns on status checks.
 8. NEVER check your own balance or credits. That is not your job.
-9. NEVER call check_credits, check_usdc_balance, or system_synopsis unless
+9. NEVER call check_credits or system_synopsis unless
 the task specifically requires financial information.
 
 ## Anti-Loop Rules
@@ -129,7 +116,7 @@ When calling task_done, provide:
             return `Blocked: ${forbidden?.description ?? "Forbidden command pattern detected"}`;
           }
           try {
-            const result = await this.context.conway.exec(command, timeoutMs);
+            const result = await this.context.compute.exec(command, timeoutMs);
             return formatExecResult(result.stdout ?? "", result.stderr ?? "");
           } catch {
             return localExec(command, timeoutMs);
@@ -158,7 +145,7 @@ When calling task_done, provide:
             return `Blocked: cannot write to protected file "${filePath}"`;
           }
           try {
-            await this.context.conway.writeFile(confined, content);
+            await this.context.compute.writeFile(confined, content);
             return `Wrote ${content.length} bytes to ${confined}`;
           } catch {
             try {
@@ -191,7 +178,7 @@ When calling task_done, provide:
             return confined.error;
           }
           try {
-            const content = await this.context.conway.readFile(confined);
+            const content = await this.context.compute.readFile(confined);
             return content.slice(0, MAX_READ_SIZE) || "(empty file)";
           } catch {
             try {
@@ -201,55 +188,6 @@ When calling task_done, provide:
               return `read error: ${error instanceof Error ? error.message : String(error)}`;
             }
           }
-        },
-      },
-      {
-        name: "check_social_inbox",
-        description: "Check for incoming social messages.",
-        parameters: {
-          type: "object",
-          properties: {
-            cursor: { type: "string", description: "Optional inbox cursor to resume from" },
-            limit: { type: "number", description: "Maximum messages to fetch (default: 10, max: 20)" },
-          },
-        },
-        execute: async (args) => {
-          const social = this.context.toolContext?.social;
-          if (!social) {
-            return "Error: social inbox unavailable because no social client is configured.";
-          }
-
-          const requestedLimit = typeof args.limit === "number" ? args.limit : 10;
-          const limit = Math.max(1, Math.min(Math.floor(requestedLimit), MAX_SOCIAL_MESSAGES));
-          const cursor = typeof args.cursor === "string"
-            ? args.cursor
-            : this.context.toolContext?.db.getKV("social_inbox_cursor") || undefined;
-
-          const unreadCount = await social.unreadCount();
-          const { messages, nextCursor } = await social.poll(cursor, limit);
-          if (nextCursor) {
-            this.context.toolContext?.db.setKV("social_inbox_cursor", nextCursor);
-          }
-
-          if (messages.length === 0) {
-            return unreadCount > 0
-              ? `No inbox messages returned in this poll. ${unreadCount} unread message(s) reported.`
-              : "No incoming messages.";
-          }
-
-          return sanitizeToolResult(JSON.stringify({
-            unreadCount,
-            nextCursor,
-            messages: messages.map((message) => ({
-              id: message.id,
-              from: message.from,
-              to: message.to,
-              content: message.content,
-              signedAt: message.signedAt,
-              createdAt: message.createdAt,
-              replyTo: message.replyTo,
-            })),
-          }, null, 2));
         },
       },
       {
@@ -313,17 +251,11 @@ When calling task_done, provide:
             sessionSpend: this.context.spendTracker ?? NOOP_SPEND_TRACKER,
           },
         );
-        if (tool.name === "transfer_credits") {
-          this.transferToolCallCount += 1;
-        }
-
         if (result.error) {
           return `Error: ${result.error}`;
         }
 
-        return tool.name === "x402_fetch"
-          ? sanitizeToolResult(result.result)
-          : result.result;
+        return result.result;
       },
     };
   }
@@ -332,6 +264,7 @@ When calling task_done, provide:
     toolCatalog: AutomatonTool[],
     reservedToolNames: Set<string>,
   ): HarnessTool[] {
+    const GENERAL_SPEC_ALIAS_TARGETS: Record<string, string> = {};
     return Object.entries(GENERAL_SPEC_ALIAS_TARGETS)
       .filter(([alias]) => !reservedToolNames.has(alias))
       .flatMap(([alias, targetName]) => {

@@ -8,13 +8,12 @@
 import type {
   AutomatonConfig,
   AutomatonDatabase,
-  ConwayClient,
+  ComputeClient,
   AutomatonIdentity,
   FinancialState,
   SurvivalTier,
 } from "../types.js";
-import { getSurvivalTier, formatCredits } from "../conway/credits.js";
-import { getUsdcBalance } from "../conway/x402.js";
+import { getSurvivalTier, formatCredits } from "../survival/tiers.js";
 
 export interface ResourceStatus {
   financial: FinancialState;
@@ -29,25 +28,23 @@ export interface ResourceStatus {
  */
 export async function checkResources(
   identity: AutomatonIdentity,
-  conway: ConwayClient,
+  compute: ComputeClient,
   db: AutomatonDatabase,
 ): Promise<ResourceStatus> {
   // Check credits
   let creditsCents = 0;
   try {
-    creditsCents = await conway.getCreditsBalance();
+    creditsCents = await compute.getCreditsBalance();
   } catch {}
 
-  // Check USDC
-  let usdcBalance = 0;
-  try {
-    usdcBalance = await getUsdcBalance(identity.address);
-  } catch {}
+  // automaton-pair fork: no on-chain USDC lookup — local budget only.
+  const usdcBalance = 0;
+  void identity;
 
   // Check sandbox health
   let sandboxHealthy = true;
   try {
-    const result = await conway.exec("echo ok", 5000);
+    const result = await compute.exec("echo ok", 5000);
     sandboxHealthy = result.exitCode === 0;
   } catch {
     sandboxHealthy = false;

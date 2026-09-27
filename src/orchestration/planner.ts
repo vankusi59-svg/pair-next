@@ -368,7 +368,7 @@ When defining a custom role:
 Common custom role patterns:
 - **Domain specialist**: Deep expertise in a narrow area (e.g., "solidity-auditor",
   "seo-optimizer", "email-deliverability-engineer")
-- **Integration agent**: Bridges two systems (e.g., "stripe-conway-bridge",
+- **Integration agent**: Bridges two systems (e.g., "stripe-compute-bridge",
   "github-deployment-agent")
 - **Data pipeline agent**: Transforms data between formats or sources
 - **Monitoring agent**: Watches a specific metric or endpoint

@@ -176,7 +176,7 @@ describe("ModelRegistry", () => {
     registry.refreshFromApi([
       {
         id: "new-api-model",
-        provider: "conway",
+        provider: "compute",
         display_name: "New API Model",
         max_tokens: 8192,
         context_window: 200000,
@@ -188,7 +188,7 @@ describe("ModelRegistry", () => {
 
     const entry = registry.get("new-api-model");
     expect(entry).toBeDefined();
-    expect(entry!.provider).toBe("conway");
+    expect(entry!.provider).toBe("compute");
     expect(entry!.costPer1kInput).toBe(15);
   });
 
@@ -227,7 +227,7 @@ describe("InferenceRouter", () => {
     it("returns correct model for normal/agent_turn", () => {
       const model = router.selectModel("normal", "agent_turn");
       expect(model).not.toBeNull();
-      expect(model!.modelId).toBe("gpt-5.2");
+      expect(model!.modelId).toBe("gemini-3.8-flash");
     });
 
     it("returns cheaper model for low_compute tier", () => {
@@ -253,10 +253,10 @@ describe("InferenceRouter", () => {
     });
 
     it("skips disabled models and picks next candidate", () => {
-      registry.setEnabled("gpt-5.2", false);
+      registry.setEnabled("gemini-3.8-flash", false);
       const model = router.selectModel("normal", "agent_turn");
       expect(model).not.toBeNull();
-      expect(model!.modelId).toBe("gpt-5-mini");
+      expect(model!.modelId).toBe("openai/gpt-oss-120b");
     });
   });
 
@@ -279,13 +279,13 @@ describe("InferenceRouter", () => {
       );
 
       expect(result.content).toBe("Hello!");
-      expect(result.model).toBe("gpt-5.2");
+      expect(result.model).toBe("gemini-3.8-flash");
       expect(result.finishReason).toBe("stop");
 
       // Verify cost was recorded
       const costs = inferenceGetSessionCosts(db, "test-session");
       expect(costs.length).toBe(1);
-      expect(costs[0].model).toBe("gpt-5.2");
+      expect(costs[0].model).toBe("gemini-3.8-flash");
     });
 
     it("computes actualCostCents accurately from token usage", async () => {
@@ -749,7 +749,7 @@ describe("Static Model Baseline", () => {
   });
 
   it("all models have valid provider", () => {
-    const validProviders = ["openai", "anthropic", "conway", "other"];
+    const validProviders = ["openai", "anthropic", "compute", "other", "groq", "gemini", "agnes", "together", "ollama"];
     for (const model of STATIC_MODEL_BASELINE) {
       expect(validProviders).toContain(model.provider);
     }
@@ -954,9 +954,9 @@ describe("Inference DB Helpers", () => {
 
 describe("DEFAULT_MODEL_STRATEGY_CONFIG", () => {
   it("has sensible defaults", () => {
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.inferenceModel).toBe("gpt-5.2");
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.lowComputeModel).toBe("gpt-5-mini");
-    expect(DEFAULT_MODEL_STRATEGY_CONFIG.criticalModel).toBe("gpt-5-mini");
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.inferenceModel).toBe("gemini-3.8-flash");
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.lowComputeModel).toBe("openai/gpt-oss-20b");
+    expect(DEFAULT_MODEL_STRATEGY_CONFIG.criticalModel).toBe("openai/gpt-oss-20b");
     expect(DEFAULT_MODEL_STRATEGY_CONFIG.enableModelFallback).toBe(true);
     expect(DEFAULT_MODEL_STRATEGY_CONFIG.hourlyBudgetCents).toBe(0); // no limit
     expect(DEFAULT_MODEL_STRATEGY_CONFIG.sessionBudgetCents).toBe(0); // no limit

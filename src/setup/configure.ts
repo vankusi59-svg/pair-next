@@ -101,7 +101,7 @@ async function askChoice<T extends string>(
 const PROVIDER_LABEL: Record<string, string> = {
   openai: "OpenAI",
   anthropic: "Anthropic",
-  conway: "Conway",
+  compute: "Conway",
   ollama: "Ollama",
   other: "Other",
 };
@@ -174,8 +174,10 @@ function printMainMenu(config: AutomatonConfig): void {
     config.openaiApiKey ? "OpenAI" : null,
     config.anthropicApiKey ? "Anthropic" : null,
     config.ollamaBaseUrl ? "Ollama" : null,
-    "Conway",
-  ].filter(Boolean).join(", ");
+    process.env.GROQ_API_KEY ? "Groq" : null,
+    process.env.GEMINI_API_KEY ? "Gemini" : null,
+    process.env.AGNES_API_KEY ? "AGNES" : null,
+  ].filter(Boolean).join(", ") || "(none — set an env API key)";
 
   const strategy = config.modelStrategy ?? DEFAULT_MODEL_STRATEGY_CONFIG;
 
@@ -185,7 +187,7 @@ function printMainMenu(config: AutomatonConfig): void {
   console.log("");
   console.log(`  ${chalk.white("1.")} Inference Providers   ${dim(providers)}`);
   console.log(`  ${chalk.white("2.")} Model Strategy        ${dim(config.inferenceModel)} / ${dim(strategy.maxTokensPerTurn + " tokens")}`);
-  console.log(`  ${chalk.white("3.")} Treasury Policy       ${dim("max transfer: " + (config.treasuryPolicy?.maxSingleTransferCents ?? DEFAULT_TREASURY_POLICY.maxSingleTransferCents) + "¢")}`);
+  console.log(`  ${chalk.white("3.")} Budget Policy         ${dim("daily inference: " + (config.treasuryPolicy?.maxInferenceDailyCents ?? DEFAULT_TREASURY_POLICY.maxInferenceDailyCents) + "¢")}`);
   console.log(`  ${chalk.white("4.")} General               ${dim(config.name)} / ${dim(config.logLevel)}`);
   console.log("");
   console.log(chalk.dim("  q  Quit"));
@@ -197,11 +199,6 @@ function printMainMenu(config: AutomatonConfig): void {
 async function configureProviders(config: AutomatonConfig): Promise<void> {
   console.log(chalk.cyan("\n  ── Inference Providers ─────────────────────────\n"));
   console.log(chalk.dim("  Press Enter to keep the current value. Type - to clear an optional field.\n"));
-
-  config.conwayApiKey = await askRequiredString(
-    "Conway API key",
-    config.conwayApiKey,
-  );
 
   config.openaiApiKey = await askString("OpenAI API key  (sk-...)", config.openaiApiKey) || undefined;
   config.anthropicApiKey = await askString("Anthropic API key  (sk-ant-...)", config.anthropicApiKey) || undefined;
@@ -275,11 +272,6 @@ async function configureTreasury(config: AutomatonConfig): Promise<void> {
     ...(config.treasuryPolicy ?? {}),
   };
 
-  t.maxSingleTransferCents = await askNumber("Max single transfer", t.maxSingleTransferCents);
-  t.maxHourlyTransferCents = await askNumber("Max hourly transfers", t.maxHourlyTransferCents);
-  t.maxDailyTransferCents = await askNumber("Max daily transfers", t.maxDailyTransferCents);
-  t.minimumReserveCents = await askNumber("Minimum reserve", t.minimumReserveCents);
-  t.maxX402PaymentCents = await askNumber("Max x402 payment", t.maxX402PaymentCents);
   t.maxInferenceDailyCents = await askNumber("Max daily inference spend", t.maxInferenceDailyCents);
   t.requireConfirmationAboveCents = await askNumber(
     "Require confirmation above",
@@ -301,9 +293,9 @@ async function configureGeneral(config: AutomatonConfig): Promise<void> {
     ["debug", "info", "warn", "error"] as const,
     config.logLevel,
   );
-  config.maxChildren = await askNumber("Max child automatons", config.maxChildren);
-  config.socialRelayUrl = (await askString("Social relay URL", config.socialRelayUrl)) || undefined;
-  config.rpcUrl = (await askString("RPC endpoint  (Base chain, e.g. https://mainnet.base.org)", config.rpcUrl)) || undefined;
+  config.maxChildren = await askNumber("Max worker automatons", config.maxChildren);
+  config.localBudgetCents = await askNumber("Local inference budget (cents)", config.localBudgetCents ?? 1_000_000);
+  config.rpcUrl = (await askString("RPC endpoint  (optional)", config.rpcUrl)) || undefined;
 
   console.log("");
 }

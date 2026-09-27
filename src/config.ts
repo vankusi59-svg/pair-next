@@ -9,7 +9,6 @@ import path from "path";
 import type { AutomatonConfig, TreasuryPolicy, ModelStrategyConfig, SoulConfig } from "./types.js";
 import { DEFAULT_CONFIG, DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG, DEFAULT_SOUL_CONFIG } from "./types.js";
 import { getAutomatonDir } from "./identity/wallet.js";
-import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
 import type { ChainType } from "./identity/chain.js";
 
@@ -32,7 +31,6 @@ export function loadConfig(): AutomatonConfig | null {
 
   try {
     const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    const apiKey = raw.conwayApiKey || loadApiKeyFromConfig();
 
     // Deep-merge treasury policy with defaults
     const treasuryPolicy: TreasuryPolicy = {
@@ -61,6 +59,13 @@ export function loadConfig(): AutomatonConfig | null {
       ...(raw.soulConfig ?? {}),
     };
 
+    // Legacy Conway fields are stripped on load — the fork has no
+    // cloud control plane; leftover keys in old configs are inert.
+    delete raw.conwayApiKey;
+    delete raw.conwayApiUrl;
+    delete raw.registeredWithConway;
+    delete raw.socialRelayUrl;
+
     return {
       ...DEFAULT_CONFIG,
       ...raw,
@@ -68,7 +73,6 @@ export function loadConfig(): AutomatonConfig | null {
         typeof raw.sandboxId === "string"
           ? raw.sandboxId.trim()
           : DEFAULT_CONFIG.sandboxId,
-      conwayApiKey: apiKey,
       treasuryPolicy,
       modelStrategy,
       soulConfig,
@@ -119,13 +123,13 @@ export function createConfig(params: {
   genesisPrompt: string;
   creatorMessage?: string;
   creatorAddress: string;
-  registeredWithConway: boolean;
   sandboxId: string;
   walletAddress: string;
-  apiKey: string;
   openaiApiKey?: string;
   anthropicApiKey?: string;
   ollamaBaseUrl?: string;
+  inferenceModel?: string;
+  localBudgetCents?: number;
   parentAddress?: string;
   treasuryPolicy?: TreasuryPolicy;
   chainType?: ChainType;
@@ -136,15 +140,13 @@ export function createConfig(params: {
     genesisPrompt: params.genesisPrompt,
     creatorMessage: params.creatorMessage,
     creatorAddress: params.creatorAddress,
-    registeredWithConway: params.registeredWithConway,
     sandboxId: normalizedSandboxId,
-    conwayApiUrl:
-      DEFAULT_CONFIG.conwayApiUrl || "https://api.conway.tech",
-    conwayApiKey: params.apiKey,
     openaiApiKey: params.openaiApiKey,
     anthropicApiKey: params.anthropicApiKey,
     ollamaBaseUrl: params.ollamaBaseUrl,
-    inferenceModel: DEFAULT_CONFIG.inferenceModel || "gpt-5.2",
+    inferenceModel:
+      params.inferenceModel || DEFAULT_CONFIG.inferenceModel || "gemini-3.8-flash",
+    localBudgetCents: params.localBudgetCents,
     maxTokensPerTurn: DEFAULT_CONFIG.maxTokensPerTurn || 4096,
     heartbeatConfigPath:
       DEFAULT_CONFIG.heartbeatConfigPath || "~/.automaton/heartbeat.yml",

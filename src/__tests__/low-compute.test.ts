@@ -4,7 +4,7 @@ import {
   getModelForTier,
   applyTierRestrictions,
 } from "../survival/low-compute.js";
-import { createInferenceClient } from "../conway/inference.js";
+import { createInferenceClient } from "../compute/inference.js";
 import type { SurvivalTier } from "../types.js";
 
 describe("canRunInference", () => {
@@ -122,7 +122,7 @@ describe("applyTierRestrictions", () => {
 
 describe("createInferenceClient setLowComputeMode", () => {
   const baseOptions = {
-    apiUrl: "https://api.conway.tech",
+    apiUrl: "https://api.compute.tech",
     apiKey: "test-key",
     defaultModel: "gpt-5.2",
     maxTokens: 4096,

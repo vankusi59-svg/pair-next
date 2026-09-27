@@ -132,6 +132,63 @@ export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | 
     parameterStyle: "max_completion_tokens",
     enabled: true,
   },
+  // ─── PAIR fork providers ─────────────────────────────────────
+  {
+    modelId: "openai/gpt-oss-120b",
+    provider: "groq",
+    displayName: "GPT-OSS 120B (Groq)",
+    tierMinimum: "normal",
+    costPer1kInput: 3,     // ~$0.25/M
+    costPer1kOutput: 6,    // ~$0.60/M
+    maxTokens: 8192,
+    contextWindow: 131072,
+    supportsTools: true,
+    supportsVision: false,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "openai/gpt-oss-20b",
+    provider: "groq",
+    displayName: "GPT-OSS 20B (Groq)",
+    tierMinimum: "low_compute",
+    costPer1kInput: 1,     // ~$0.10/M
+    costPer1kOutput: 1,    // ~$0.15/M
+    maxTokens: 4096,
+    contextWindow: 131072,
+    supportsTools: true,
+    supportsVision: false,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gemini-pro-latest",
+    provider: "gemini",
+    displayName: "Gemini Pro (latest)",
+    tierMinimum: "normal",
+    costPer1kInput: 13,    // ~$1.25/M
+    costPer1kOutput: 100,  // ~$10.00/M
+    maxTokens: 65536,
+    contextWindow: 1048576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "gemini-3.8-flash",
+    provider: "gemini",
+    displayName: "Gemini 3.8 Flash",
+    tierMinimum: "low_compute",
+    costPer1kInput: 3,     // ~$0.30/M
+    costPer1kOutput: 25,   // ~$2.50/M
+    maxTokens: 65536,
+    contextWindow: 1048576,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
 ];
 
 // === Default Routing Matrix ===
@@ -139,30 +196,30 @@ export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | 
 
 export const DEFAULT_ROUTING_MATRIX: RoutingMatrix = {
   high: {
-    agent_turn: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    safety_check: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 4096, ceilingCents: 20 },
-    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 15 },
-    planning: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
+    agent_turn: { candidates: ["gpt-5.2", "gpt-5.3", "gemini-3.8-flash", "openai/gpt-oss-120b"], maxTokens: 8192, ceilingCents: -1 },
+    heartbeat_triage: { candidates: ["gpt-5-mini", "gemini-3.8-flash", "openai/gpt-oss-20b"], maxTokens: 2048, ceilingCents: 5 },
+    safety_check: { candidates: ["gpt-5.2", "gpt-5.3", "gemini-pro-latest", "gemini-3.8-flash"], maxTokens: 4096, ceilingCents: 20 },
+    summarization: { candidates: ["gpt-5.2", "gpt-5-mini", "gemini-3.8-flash"], maxTokens: 4096, ceilingCents: 15 },
+    planning: { candidates: ["gpt-5.2", "gpt-5.3", "gemini-3.8-flash", "openai/gpt-oss-120b"], maxTokens: 8192, ceilingCents: -1 },
   },
   normal: {
-    agent_turn: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    safety_check: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    planning: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
+    agent_turn: { candidates: ["gemini-3.8-flash", "openai/gpt-oss-120b", "gpt-5.2"], maxTokens: 4096, ceilingCents: -1 },
+    heartbeat_triage: { candidates: ["gpt-5-mini", "gemini-3.8-flash", "openai/gpt-oss-20b"], maxTokens: 2048, ceilingCents: 5 },
+    safety_check: { candidates: ["gpt-5.2", "gemini-3.8-flash", "openai/gpt-oss-120b"], maxTokens: 4096, ceilingCents: 10 },
+    summarization: { candidates: ["gpt-5.2", "gpt-5-mini", "gemini-3.8-flash"], maxTokens: 4096, ceilingCents: 10 },
+    planning: { candidates: ["gemini-3.8-flash", "gpt-5.2", "openai/gpt-oss-120b"], maxTokens: 4096, ceilingCents: -1 },
   },
   low_compute: {
-    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
-    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    summarization: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    planning: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    agent_turn: { candidates: ["gpt-5-mini", "gemini-3.8-flash", "openai/gpt-oss-20b"], maxTokens: 4096, ceilingCents: 10 },
+    heartbeat_triage: { candidates: ["gpt-5-mini", "openai/gpt-oss-20b"], maxTokens: 1024, ceilingCents: 2 },
+    safety_check: { candidates: ["gpt-5-mini", "gemini-3.8-flash"], maxTokens: 2048, ceilingCents: 5 },
+    summarization: { candidates: ["gpt-5-mini", "gemini-3.8-flash"], maxTokens: 2048, ceilingCents: 5 },
+    planning: { candidates: ["gpt-5-mini", "gemini-3.8-flash"], maxTokens: 2048, ceilingCents: 5 },
   },
   critical: {
-    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 3 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 512, ceilingCents: 1 },
-    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
+    agent_turn: { candidates: ["gpt-5-mini", "openai/gpt-oss-20b"], maxTokens: 2048, ceilingCents: 3 },
+    heartbeat_triage: { candidates: ["gpt-5-mini", "openai/gpt-oss-20b"], maxTokens: 512, ceilingCents: 1 },
+    safety_check: { candidates: ["gpt-5-mini", "openai/gpt-oss-20b"], maxTokens: 1024, ceilingCents: 2 },
     summarization: { candidates: [], maxTokens: 0, ceilingCents: 0 },
     planning: { candidates: [], maxTokens: 0, ceilingCents: 0 },
   },
@@ -178,9 +235,9 @@ export const DEFAULT_ROUTING_MATRIX: RoutingMatrix = {
 // === Default Model Strategy Config ===
 
 export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
-  inferenceModel: "gpt-5.2",
-  lowComputeModel: "gpt-5-mini",
-  criticalModel: "gpt-5-mini",
+  inferenceModel: "gemini-3.8-flash",
+  lowComputeModel: "openai/gpt-oss-20b",
+  criticalModel: "openai/gpt-oss-20b",
   maxTokensPerTurn: 4096,
   hourlyBudgetCents: 0,
   sessionBudgetCents: 0,

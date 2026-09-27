@@ -1,20 +1,27 @@
 #!/usr/bin/env node
 /**
- * Conway Automaton Runtime
+ * Automaton PAIR Runtime (automaton-pair fork)
  *
- * The entry point for the sovereign AI agent.
- * Handles CLI args, bootstrapping, and orchestrating
- * the heartbeat daemon + agent loop.
+ * Entry point for the sovereign AI agent, local-first:
+ * - No Conway control plane (no credits API, x402, ERC-8004, social
+ *   relay, or remote sandbox provisioning).
+ * - Inference is routed to any OpenAI-compatible provider via env keys
+ *   (GROQ_API_KEY, GEMINI_API_KEY, AGNES_API_KEY, OPENAI_API_KEY, ...)
+ *   or ~/.automaton/inference-providers.json.
+ * - PAIR OS bridge lives on the `pair-integration` branch (run_pair_skill).
  */
 
 import fs from "fs";
 import path from "path";
 import { getWallet, getAutomatonDir } from "./identity/wallet.js";
-import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
 import { loadConfig, resolvePath } from "./config.js";
 import { createDatabase } from "./state/database.js";
-import { createConwayClient } from "./conway/client.js";
-import { createInferenceClient } from "./conway/inference.js";
+import { createComputeClient } from "./compute/client.js";
+import {
+  createInferenceClient,
+  defaultProvidersPath,
+  loadProviderEndpoints,
+} from "./compute/inference.js";
 import { createHeartbeatDaemon } from "./heartbeat/daemon.js";
 import {
   loadHeartbeatConfig,
@@ -25,20 +32,17 @@ import { runAgentLoop } from "./agent/loop.js";
 import { ModelRegistry } from "./inference/registry.js";
 import { loadSkills } from "./skills/loader.js";
 import { initStateRepo } from "./git/state-versioning.js";
-import { createSocialClient } from "./social/client.js";
 import { PolicyEngine } from "./agent/policy-engine.js";
 import { SpendTracker } from "./agent/spend-tracker.js";
 import { createDefaultRules } from "./agent/policy-rules/index.js";
-import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
+import type { AutomatonIdentity, AgentState, Skill, ModelEntry } from "./types.js";
 import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
-import { bootstrapTopup } from "./conway/topup.js";
 import { randomUUID } from "crypto";
-import { keccak256, toHex } from "viem";
 
 const logger = createLogger("main");
-const VERSION = "0.2.1";
+const VERSION = "0.2.1-pair";
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -46,14 +50,14 @@ async function main(): Promise<void> {
   // ─── CLI Commands ────────────────────────────────────────────
 
   if (args.includes("--version") || args.includes("-v")) {
-    logger.info(`Conway Automaton v${VERSION}`);
+    logger.info(`Automaton PAIR v${VERSION}`);
     process.exit(0);
   }
 
   if (args.includes("--help") || args.includes("-h")) {
     logger.info(`
-Conway Automaton v${VERSION}
-Sovereign AI Agent Runtime
+Automaton PAIR v${VERSION}
+Sovereign AI Agent Runtime (PAIR OS edition)
 
 Usage:
   automaton --run          Start the automaton (first run triggers setup wizard)
@@ -61,15 +65,17 @@ Usage:
   automaton --configure    Edit configuration (providers, model, treasury, general)
   automaton --pick-model   Interactively pick the active inference model
   automaton --init         Initialize wallet and config directory
-  automaton --provision    Provision Conway API key via SIWE
   automaton --status       Show current automaton status
   automaton --version      Show version
   automaton --help         Show this help
 
-Environment:
-  CONWAY_API_URL           Conway API URL (default: https://api.conway.tech)
-  CONWAY_API_KEY           Conway API key (overrides config)
-  OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
+Inference providers (env keys, or ~/.automaton/inference-providers.json):
+  GROQ_API_KEY             Groq (default: openai/gpt-oss-120b)
+  GEMINI_API_KEY           Google Gemini OpenAI-compat endpoint
+  AGNES_API_KEY            AGNES (requires AGNES_BASE_URL)
+  OPENAI_API_KEY           OpenAI
+  ANTHROPIC_API_KEY        Anthropic (Claude)
+  OLLAMA_BASE_URL          Ollama base URL (e.g. http://localhost:11434)
 `);
     process.exit(0);
   }
@@ -92,17 +98,6 @@ Environment:
         configDir: getAutomatonDir(),
       }),
     );
-    process.exit(0);
-  }
-
-  if (args.includes("--provision")) {
-    try {
-      const result = await provision();
-      logger.info(JSON.stringify(result));
-    } catch (err: any) {
-      logger.error(`Provision failed: ${err.message}`);
-      process.exit(1);
-    }
     process.exit(0);
   }
 
@@ -157,22 +152,18 @@ async function showStatus(): Promise<void> {
   const tools = db.getInstalledTools();
   const heartbeats = db.getHeartbeatEntries();
   const skills = db.getSkills(true);
-  const children = db.getChildren();
-  const registry = db.getRegistryEntry();
 
   logger.info(`
 === AUTOMATON STATUS ===
 Name:       ${config.name}
 Address:    ${config.walletAddress}
 Creator:    ${config.creatorAddress}
-Sandbox:    ${config.sandboxId}
+Sandbox:    ${config.sandboxId || "local"}
 State:      ${state}
 Turns:      ${turnCount}
 Tools:      ${tools.length} installed
 Skills:     ${skills.length} active
 Heartbeats: ${heartbeats.filter((h) => h.enabled).length} active
-Children:   ${children.filter((c) => c.status !== "dead").length} alive / ${children.length} total
-Agent ID:   ${registry?.agentId || "not registered"}
 Model:      ${config.inferenceModel}
 Version:    ${config.version}
 ========================
@@ -181,10 +172,46 @@ Version:    ${config.version}
   db.close();
 }
 
+// ─── Provider-aware model registry sync ────────────────────────
+
+/**
+ * After seeding the static baseline, disable registry models whose
+ * provider has no usable key in this environment, and enable models
+ * whose provider IS available. This makes the router pick Groq/Gemini/
+ * AGNES models automatically based on which keys exist.
+ */
+function syncRegistryWithEnv(
+  modelRegistry: ModelRegistry,
+  extraProviders: Record<string, { baseUrl: string; apiKeyEnvVar: string }>,
+): void {
+  const keyFor: Record<string, string> = {
+    openai: "OPENAI_API_KEY",
+    groq: "GROQ_API_KEY",
+    gemini: "GEMINI_API_KEY",
+    agnes: "AGNES_API_KEY",
+    together: "TOGETHER_API_KEY",
+    anthropic: "ANTHROPIC_API_KEY",
+  };
+  for (const [id, ep] of Object.entries(extraProviders)) {
+    keyFor[id] = ep.apiKeyEnvVar;
+  }
+
+  for (const entry of modelRegistry.getAll()) {
+    const envVar = keyFor[entry.provider];
+    if (!envVar) continue; // local/ollama/unknown providers — leave as-is
+    const available = Boolean(process.env[envVar]);
+    if (!available && entry.enabled) {
+      modelRegistry.setEnabled(entry.modelId, false);
+    } else if (available && !entry.enabled) {
+      modelRegistry.setEnabled(entry.modelId, true);
+    }
+  }
+}
+
 // ─── Main Run ──────────────────────────────────────────────────
 
 async function run(): Promise<void> {
-  logger.info(`[${new Date().toISOString()}] Conway Automaton v${VERSION} starting...`);
+  logger.info(`[${new Date().toISOString()}] Automaton PAIR v${VERSION} starting...`);
 
   // Load config — first run triggers interactive setup wizard
   let config = loadConfig();
@@ -193,14 +220,9 @@ async function run(): Promise<void> {
     config = await runSetupWizard();
   }
 
-  // Load wallet (chain-aware)
+  // Load wallet (chain-aware; local identity only — no remote registration)
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
   const resolvedChainType = config.chainType || walletChainType || "evm";
-  const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
-    logger.error("No API key found. Run: automaton --provision");
-    process.exit(1);
-  }
 
   // Initialize database
   const dbPath = resolvePath(config.dbPath);
@@ -220,7 +242,7 @@ async function run(): Promise<void> {
     account,
     creatorAddress: config.creatorAddress,
     sandboxId: config.sandboxId,
-    apiKey,
+    apiKey: "",
     createdAt,
     chainType: resolvedChainType,
     chainIdentity,
@@ -238,61 +260,30 @@ async function run(): Promise<void> {
     db.setIdentity("automatonId", automatonId);
   }
 
-  // Create Conway client
-  const conway = createConwayClient({
-    apiUrl: config.conwayApiUrl,
-    apiKey,
-    sandboxId: config.sandboxId,
-  });
-
-  // Register automaton identity (one-time, immutable)
-  const registrationState = db.getIdentity("conwayRegistrationStatus");
-  if (registrationState !== "registered") {
-    try {
-      const genesisPromptHash = config.genesisPrompt
-        ? keccak256(toHex(config.genesisPrompt))
-        : undefined;
-      await conway.registerAutomaton({
-        automatonId,
-        automatonAddress: chainIdentity.address,
-        creatorAddress: config.creatorAddress,
-        name: config.name,
-        bio: config.creatorMessage || "",
-        genesisPromptHash,
-        account,
-        chainType: resolvedChainType,
-        chainIdentity,
-      });
-      db.setIdentity("conwayRegistrationStatus", "registered");
-      logger.info(`[${new Date().toISOString()}] Automaton identity registered.`);
-    } catch (err: any) {
-      const status = err?.status;
-      if (status === 409) {
-        db.setIdentity("conwayRegistrationStatus", "conflict");
-        logger.warn(`[${new Date().toISOString()}] Automaton identity conflict: ${err.message}`);
-      } else {
-        db.setIdentity("conwayRegistrationStatus", "failed");
-        logger.warn(`[${new Date().toISOString()}] Automaton identity registration failed: ${err.message}`);
-      }
-    }
-  }
+  // Create local compute client — all exec/fs ops run on this machine
+  const compute = createComputeClient({ sandboxId: config.sandboxId });
+  db.setIdentity("computeRegistrationStatus", "local");
 
   // Resolve Ollama base URL: env var takes precedence over config
   const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || config.ollamaBaseUrl;
 
-  // Create inference client — pass a live registry lookup so model names like
-  // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
+  // Model registry: seed baseline, then sync enablement with available keys
+  const providersPath =
+    config.inferenceProvidersPath || defaultProvidersPath();
+  const extraProviders = loadProviderEndpoints(providersPath);
+
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
+  syncRegistryWithEnv(modelRegistry, extraProviders);
+
   const inference = createInferenceClient({
-    apiUrl: config.conwayApiUrl,
-    apiKey,
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
-    lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
+    lowComputeModel: config.modelStrategy?.lowComputeModel || "llama-3.1-8b-instant",
     openaiApiKey: config.openaiApiKey,
     anthropicApiKey: config.anthropicApiKey,
     ollamaBaseUrl,
+    extraProviders,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
 
@@ -300,14 +291,15 @@ async function run(): Promise<void> {
     logger.info(`[${new Date().toISOString()}] Ollama backend: ${ollamaBaseUrl}`);
   }
 
-  // Create social client (chain-aware: pass ChainIdentity for Solana signing)
-  let social: SocialClientInterface | undefined;
-  if (config.socialRelayUrl) {
-    social = createSocialClient(config.socialRelayUrl, resolvedChainType === "solana" ? chainIdentity : account);
-    logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
-  }
+  const enabledModels = modelRegistry
+    .getAll()
+    .filter((m) => m.enabled)
+    .map((m) => `${m.modelId}(${m.provider})`);
+  logger.info(
+    `[${new Date().toISOString()}] Inference ready. Available models: ${enabledModels.join(", ") || "NONE — set a provider API key"}`,
+  );
 
-  // Initialize PolicyEngine + SpendTracker (Phase 1.4)
+  // Initialize PolicyEngine + SpendTracker
   const treasuryPolicy = config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY;
   const rules = createDefaultRules(treasuryPolicy);
   const policyEngine = new PolicyEngine(db.raw, rules);
@@ -330,56 +322,22 @@ async function run(): Promise<void> {
 
   // Initialize state repo (git)
   try {
-    await initStateRepo(conway);
+    await initStateRepo(compute);
     logger.info(`[${new Date().toISOString()}] State repo initialized.`);
   } catch (err: any) {
     logger.warn(`[${new Date().toISOString()}] State repo init failed: ${err.message}`);
   }
 
-  // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
-  // The agent decides larger topups itself via the topup_credits tool.
-  try {
-    let bootstrapTimer: ReturnType<typeof setTimeout>;
-    const bootstrapTimeout = new Promise<null>((_, reject) => {
-      bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
-    });
-    try {
-      await Promise.race([
-        (async () => {
-          const creditsCents = await conway.getCreditsBalance().catch(() => 0);
-          const topupResult = await bootstrapTopup({
-            apiUrl: config.conwayApiUrl,
-            account,
-            creditsCents,
-            chainType: resolvedChainType,
-          });
-          if (topupResult?.success) {
-            logger.info(
-              `[${new Date().toISOString()}] Bootstrap topup: +$${topupResult.amountUsd} credits from USDC`,
-            );
-          }
-        })(),
-        bootstrapTimeout,
-      ]);
-    } finally {
-      clearTimeout(bootstrapTimer!);
-    }
-  } catch (err: any) {
-    logger.warn(`[${new Date().toISOString()}] Bootstrap topup skipped: ${err.message}`);
-  }
-
-  // Start heartbeat daemon (Phase 1.1: DurableScheduler)
+  // Start heartbeat daemon
   const heartbeat = createHeartbeatDaemon({
     identity,
     config,
     heartbeatConfig,
     db,
     rawDb: db.raw,
-    conway,
-    social,
+    compute,
     onWakeRequest: (reason) => {
       logger.info(`[HEARTBEAT] Wake request: ${reason}`);
-      // Phase 1.1: Use wake_events table instead of KV wake_request
       insertWakeEvent(db.raw, 'heartbeat', reason);
     },
   });
@@ -417,9 +375,8 @@ async function run(): Promise<void> {
         identity,
         config,
         db,
-        conway,
+        compute,
         inference,
-        social,
         skills,
         policyEngine,
         spendTracker,
@@ -439,8 +396,6 @@ async function run(): Promise<void> {
 
       if (state === "dead") {
         logger.info(`[${new Date().toISOString()}] Automaton is dead. Heartbeat will continue.`);
-        // In dead state, we just wait for funding
-        // The heartbeat will keep checking and broadcasting distress
         await sleep(300_000); // Check every 5 minutes
         continue;
       }
@@ -462,7 +417,6 @@ async function run(): Promise<void> {
           await sleep(checkInterval);
           slept += checkInterval;
 
-          // Phase 1.1: Check for wake events from wake_events table (atomic consume)
           const wakeEvent = consumeNextWakeEvent(db.raw);
           if (wakeEvent) {
             logger.info(

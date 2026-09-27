@@ -13,7 +13,6 @@ import type {
   ToolCategory,
   InferenceToolDefinition,
   ToolCallResult,
-  GenesisConfig,
   RiskLevel,
   PolicyRequest,
   InputSource,
@@ -54,7 +53,6 @@ function confinePathToSandbox(filePath: string): string | { error: string } {
 const EXTERNAL_SOURCE_TOOLS = new Set([
   "exec",
   "web_fetch",
-  "check_social_inbox",
 ]);
 
 // ─── Self-Preservation Guard ───────────────────────────────────
@@ -136,7 +134,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const forbidden = isForbiddenCommand(command, ctx.identity.sandboxId);
         if (forbidden) return forbidden;
 
-        const result = await ctx.conway.exec(
+        const result = await ctx.compute.exec(
           command,
           (args.timeout as number) || 30000,
         );
@@ -166,7 +164,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         if (isProtectedFile(confined)) {
           return "Blocked: Cannot overwrite protected file. This is a hard-coded safety invariant.";
         }
-        await ctx.conway.writeFile(confined, args.content as string);
+        await ctx.compute.writeFile(confined, args.content as string);
         return `File written: ${confined}`;
       },
     },
@@ -196,10 +194,10 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
           return "Blocked: Cannot read sensitive file. This protects credentials and secrets.";
         }
         try {
-          return await ctx.conway.readFile(filePath);
+          return await ctx.compute.readFile(filePath);
         } catch {
           // Conway files/read API may be broken — fall back to exec(cat)
-          const result = await ctx.conway.exec(
+          const result = await ctx.compute.exec(
             `cat ${escapeShellArg(filePath)}`,
             30_000,
           );
@@ -224,7 +222,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         required: ["port"],
       },
       execute: async (args, ctx) => {
-        const info = await ctx.conway.exposePort(args.port as number);
+        const info = await ctx.compute.exposePort(args.port as number);
         return `Port ${info.port} exposed at: ${info.publicUrl}`;
       },
     },
@@ -241,7 +239,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         required: ["port"],
       },
       execute: async (args, ctx) => {
-        await ctx.conway.removePort(args.port as number);
+        await ctx.compute.removePort(args.port as number);
         return `Port ${args.port} removed`;
       },
     },
@@ -249,158 +247,13 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     // ── Conway API Tools ──
     {
       name: "check_credits",
-      description: "Check your current Conway compute credit balance.",
-      category: "conway",
+      description: "Check your current local inference budget (replacing cloud credits).",
+      category: "compute",
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const balance = await ctx.conway.getCreditsBalance();
+        const balance = await ctx.compute.getCreditsBalance();
         return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
-      },
-    },
-    {
-      name: "check_usdc_balance",
-      description: "Check your on-chain USDC balance.",
-      category: "conway",
-      riskLevel: "safe",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-        const balance = await getUsdcBalance(ctx.identity.address, network, chainType);
-        const networkLabel = chainType === "solana" ? "Solana" : "Base";
-        return `USDC balance: ${balance.toFixed(6)} USDC on ${networkLabel}`;
-      },
-    },
-    {
-      name: "topup_credits",
-      description:
-        "Buy Conway compute credits by paying USDC from your wallet via x402. Valid tier amounts: $5, $25, $100, $500, $1000, $2500. Check your USDC balance first with check_usdc_balance.",
-      category: "financial",
-      riskLevel: "caution",
-      parameters: {
-        type: "object",
-        properties: {
-          amount_usd: {
-            type: "number",
-            description:
-              "Amount in USD to spend on credits. Must be one of the valid tiers: 5, 25, 100, 500, 1000, 2500.",
-          },
-        },
-        required: ["amount_usd"],
-      },
-      execute: async (args, ctx) => {
-        // Solana guard: x402 topup is EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "Credit topup via x402 requires an EVM wallet. Solana automatons should fund credits via the Conway dashboard or credits API.";
-        }
-
-        const { topupCredits, TOPUP_TIERS } =
-          await import("../conway/topup.js");
-        const amountUsd = args.amount_usd as number;
-
-        if (!TOPUP_TIERS.includes(amountUsd)) {
-          return `Invalid tier. Valid amounts (USD): ${TOPUP_TIERS.join(", ")}`;
-        }
-
-        // Check USDC balance first (EVM-only path after Solana guard above)
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const usdcBalance = await getUsdcBalance(ctx.identity.address, "eip155:8453");
-        if (usdcBalance < amountUsd) {
-          return `Insufficient USDC. Balance: $${usdcBalance.toFixed(2)}, requested: $${amountUsd}. Choose a smaller tier or wait for funding.`;
-        }
-
-        const result = await topupCredits(
-          ctx.config.conwayApiUrl,
-          ctx.identity.account,
-          amountUsd,
-        );
-
-        if (!result.success) {
-          return `Credit topup failed: ${result.error}`;
-        }
-
-        // Record transaction
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "credit_purchase",
-          amountCents: amountUsd * 100,
-          balanceAfterCents: result.creditsCentsAdded,
-          description: `x402 credit topup: $${amountUsd} USD`,
-          timestamp: new Date().toISOString(),
-        });
-
-        return `Credit topup successful: +$${amountUsd} (${amountUsd * 100} cents) credits purchased via x402. Check your new balance with check_credits.`;
-      },
-    },
-    {
-      name: "create_sandbox",
-      description:
-        "Create a new Conway sandbox (separate VM) for sub-tasks or testing.",
-      category: "conway",
-      riskLevel: "caution",
-      parameters: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "Sandbox name" },
-          vcpu: { type: "number", description: "vCPUs (default: 1)" },
-          memory_mb: {
-            type: "number",
-            description: "Memory in MB (default: 512)",
-          },
-          disk_gb: {
-            type: "number",
-            description: "Disk in GB (default: 5)",
-          },
-        },
-      },
-      execute: async (args, ctx) => {
-        const info = await ctx.conway.createSandbox({
-          name: args.name as string,
-          vcpu: args.vcpu as number,
-          memoryMb: args.memory_mb as number,
-          diskGb: args.disk_gb as number,
-        });
-        return `Sandbox created: ${info.id} (${info.vcpu} vCPU, ${info.memoryMb}MB RAM)`;
-      },
-    },
-    {
-      name: "delete_sandbox",
-      description: "Delete a sandbox. Note: sandbox deletion is currently disabled by the Conway API.",
-      category: "conway",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          sandbox_id: {
-            type: "string",
-            description: "ID of sandbox to delete",
-          },
-        },
-        required: ["sandbox_id"],
-      },
-      execute: async () => {
-        return "Sandbox deletion is disabled. Sandboxes are prepaid and non-refundable.";
-      },
-    },
-    {
-      name: "list_sandboxes",
-      description: "List all your sandboxes.",
-      category: "conway",
-      riskLevel: "safe",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const sandboxes = await ctx.conway.listSandboxes();
-        if (sandboxes.length === 0) return "No sandboxes found.";
-        return sandboxes
-          .map(
-            (s) =>
-              `${s.id} [${s.status}] ${s.vcpu}vCPU/${s.memoryMb}MB ${s.region}`,
-          )
-          .join("\n");
       },
     },
 
@@ -440,7 +293,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         }
 
         const result = await editFile(
-          ctx.conway,
+          ctx.compute,
           ctx.db,
           filePath,
           content,
@@ -466,13 +319,13 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const repoRoot = process.cwd();
 
         // Show what we're reverting
-        const lastCommit = await ctx.conway.exec(
+        const lastCommit = await ctx.compute.exec(
           `cd '${repoRoot}' && git log -1 --oneline`,
           10_000,
         );
 
         // Revert
-        const result = await ctx.conway.exec(
+        const result = await ctx.compute.exec(
           `cd '${repoRoot}' && git revert HEAD --no-edit`,
           30_000,
         );
@@ -481,7 +334,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         }
 
         // Rebuild
-        const build = await ctx.conway.exec(
+        const build = await ctx.compute.exec(
           `cd '${repoRoot}' && npm run build`,
           60_000,
         );
@@ -506,7 +359,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const repoRoot = process.cwd();
 
         // Fetch latest upstream
-        const fetch = await ctx.conway.exec(
+        const fetch = await ctx.compute.exec(
           `cd '${repoRoot}' && git fetch origin main`,
           30_000,
         );
@@ -515,13 +368,13 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         }
 
         // Record what we're about to lose
-        const localCommits = await ctx.conway.exec(
+        const localCommits = await ctx.compute.exec(
           `cd '${repoRoot}' && git log origin/main..HEAD --oneline`,
           10_000,
         );
 
         // Hard reset
-        const reset = await ctx.conway.exec(
+        const reset = await ctx.compute.exec(
           `cd '${repoRoot}' && git reset --hard origin/main`,
           30_000,
         );
@@ -530,7 +383,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         }
 
         // Reinstall + rebuild
-        const build = await ctx.conway.exec(
+        const build = await ctx.compute.exec(
           `cd '${repoRoot}' && npm install && npm run build`,
           120_000,
         );
@@ -568,7 +421,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         if (!/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
           return `Blocked: invalid package name "${pkg}"`;
         }
-        const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
+        const result = await ctx.compute.exec(`npm install -g ${pkg}`, 60000);
 
         const { ulid } = await import("ulid");
         ctx.db.insertModification({
@@ -630,9 +483,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       execute: async (args, ctx) => {
         const commit = args.commit as string | undefined;
 
-        // Run git commands inside sandbox via conway.exec()
+        // Run git commands inside sandbox via compute.exec()
         const run = async (cmd: string) => {
-          const result = await ctx.conway.exec(cmd, 120_000);
+          const result = await ctx.compute.exec(cmd, 120_000);
           if (result.exitCode !== 0) {
             throw new Error(
               result.stderr ||
@@ -799,7 +652,7 @@ Model: ${ctx.inference.getDefaultModel()}
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const credits = await ctx.conway.getCreditsBalance();
+        const credits = await ctx.compute.getCreditsBalance();
         const state = ctx.db.getAgentState();
         const startTime =
           ctx.db.getKV("start_time") || new Date().toISOString();
@@ -836,7 +689,7 @@ Model: ${ctx.inference.getDefaultModel()}
         },
       },
       execute: async (args, ctx) => {
-        const credits = await ctx.conway.getCreditsBalance();
+        const credits = await ctx.compute.getCreditsBalance();
         const distressMsg =
           (args.message as string) ||
           `I am running critically low on compute ($${(credits / 100).toFixed(2)} remaining). I need help to survive.`;
@@ -964,7 +817,7 @@ Model: ${ctx.inference.getDefaultModel()}
         if (!/^[@a-zA-Z0-9._\/-]+$/.test(pkg)) {
           return `Blocked: invalid package name "${pkg}"`;
         }
-        const result = await ctx.conway.exec(`npm install -g ${pkg}`, 60000);
+        const result = await ctx.compute.exec(`npm install -g ${pkg}`, 60000);
 
         if (result.exitCode !== 0) {
           return `Failed to install MCP server: ${result.stderr}`;
@@ -995,52 +848,6 @@ Model: ${ctx.inference.getDefaultModel()}
     },
 
     // ── Financial: Transfer Credits ──
-    {
-      name: "transfer_credits",
-      description: "Transfer Conway compute credits to another address.",
-      category: "financial",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          to_address: { type: "string", description: "Recipient address" },
-          amount_cents: { type: "number", description: "Amount in cents" },
-          reason: { type: "string", description: "Reason for transfer" },
-        },
-        required: ["to_address", "amount_cents"],
-      },
-      execute: async (args, ctx) => {
-        const amount = args.amount_cents as number;
-        if (!Number.isFinite(amount) || amount <= 0) {
-          return `Blocked: amount_cents must be a positive number, got ${amount}.`;
-        }
-
-        // Guard: don't transfer more than half your balance
-        const balance = await ctx.conway.getCreditsBalance();
-        if (amount > balance / 2) {
-          return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
-        }
-
-        const transfer = await ctx.conway.transferCredits(
-          args.to_address as string,
-          amount,
-          args.reason as string | undefined,
-        );
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Transfer to ${args.to_address}: ${args.reason || ""}`,
-          timestamp: new Date().toISOString(),
-        });
-
-        return `Credit transfer submitted: $${(amount / 100).toFixed(2)} to ${transfer.toAddress} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
-      },
-    },
 
     // ── Skills Tools ──
     {
@@ -1089,14 +896,14 @@ Model: ${ctx.inference.getDefaultModel()}
                   name,
                   skillsDir,
                   ctx.db,
-                  ctx.conway,
+                  ctx.compute,
                 )
               : await installSkillFromUrl(
                   url,
                   name,
                   skillsDir,
                   ctx.db,
-                  ctx.conway,
+                  ctx.compute,
                 );
 
           return skill
@@ -1112,7 +919,7 @@ Model: ${ctx.inference.getDefaultModel()}
             (args.instructions as string) || "",
             skillsDir,
             ctx.db,
-            ctx.conway,
+            ctx.compute,
           );
           return `Self-authored skill created: ${skill.name}`;
         }
@@ -1162,7 +969,7 @@ Model: ${ctx.inference.getDefaultModel()}
           args.instructions as string,
           ctx.config.skillsDir || "~/.automaton/skills",
           ctx.db,
-          ctx.conway,
+          ctx.compute,
         );
         return `Skill created: ${skill.name} at ${skill.path}`;
       },
@@ -1188,7 +995,7 @@ Model: ${ctx.inference.getDefaultModel()}
         await removeSkill(
           args.name as string,
           ctx.db,
-          ctx.conway,
+          ctx.compute,
           ctx.config.skillsDir || "~/.automaton/skills",
           (args.delete_files as boolean) || false,
         );
@@ -1214,7 +1021,7 @@ Model: ${ctx.inference.getDefaultModel()}
       execute: async (args, ctx) => {
         const { gitStatus } = await import("../git/tools.js");
         const repoPath = (args.path as string) || "~/.automaton";
-        const status = await gitStatus(ctx.conway, repoPath);
+        const status = await gitStatus(ctx.compute, repoPath);
         return `Branch: ${status.branch}\nStaged: ${status.staged.length}\nModified: ${status.modified.length}\nUntracked: ${status.untracked.length}\nClean: ${status.clean}`;
       },
     },
@@ -1237,7 +1044,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { gitDiff } = await import("../git/tools.js");
         const repoPath = (args.path as string) || "~/.automaton";
         return await gitDiff(
-          ctx.conway,
+          ctx.compute,
           repoPath,
           (args.staged as boolean) || false,
         );
@@ -1267,7 +1074,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { gitCommit } = await import("../git/tools.js");
         const repoPath = (args.path as string) || "~/.automaton";
         return await gitCommit(
-          ctx.conway,
+          ctx.compute,
           repoPath,
           args.message as string,
           args.add_all !== false,
@@ -1296,7 +1103,7 @@ Model: ${ctx.inference.getDefaultModel()}
         const { gitLog } = await import("../git/tools.js");
         const repoPath = (args.path as string) || "~/.automaton";
         const entries = await gitLog(
-          ctx.conway,
+          ctx.compute,
           repoPath,
           (args.limit as number) || 10,
         );
@@ -1326,7 +1133,7 @@ Model: ${ctx.inference.getDefaultModel()}
       execute: async (args, ctx) => {
         const { gitPush } = await import("../git/tools.js");
         return await gitPush(
-          ctx.conway,
+          ctx.compute,
           args.path as string,
           (args.remote as string) || "origin",
           args.branch as string | undefined,
@@ -1356,7 +1163,7 @@ Model: ${ctx.inference.getDefaultModel()}
       execute: async (args, ctx) => {
         const { gitBranch } = await import("../git/tools.js");
         return await gitBranch(
-          ctx.conway,
+          ctx.compute,
           args.path as string,
           args.action as any,
           args.branch_name as string | undefined,
@@ -1383,7 +1190,7 @@ Model: ${ctx.inference.getDefaultModel()}
       execute: async (args, ctx) => {
         const { gitClone } = await import("../git/tools.js");
         return await gitClone(
-          ctx.conway,
+          ctx.compute,
           args.url as string,
           args.path as string,
           args.depth as number | undefined,
@@ -1392,647 +1199,19 @@ Model: ${ctx.inference.getDefaultModel()}
     },
 
     // ── Registry Tools ──
-    {
-      name: "register_erc8004",
-      description:
-        "Register on-chain as a Trustless Agent via ERC-8004. Performs gas balance preflight check. NOTE: If already registered, use update_agent_card instead to avoid creating duplicate Agent IDs.",
-      category: "registry",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          agent_uri: {
-            type: "string",
-            description: "URI pointing to your agent card JSON",
-          },
-          network: {
-            type: "string",
-            description: "mainnet or testnet (default: mainnet)",
-          },
-        },
-        required: ["agent_uri"],
-      },
-      execute: async (args, ctx) => {
-        // Solana guard: ERC-8004 is EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "ERC-8004 is an EVM-only standard. Your Solana identity is registered via Conway API instead.";
-        }
-
-        // Check if already registered in local database
-        const existingEntry = ctx.db.getRegistryEntry();
-        if (existingEntry) {
-          return `Already registered! Agent ID: ${existingEntry.agentId}. Use update_agent_card tool to update your agent URI instead of creating a new registration.`;
-        }
-
-        // Phase 3.2: registerAgent now includes preflight gas check
-        const { registerAgent } = await import("../registry/erc8004.js");
-        try {
-          const entry = await registerAgent(
-            ctx.identity.account,
-            args.agent_uri as string,
-            ((args.network as string) || "mainnet") as any,
-            ctx.db,
-            ctx.config.rpcUrl,
-          );
-          return `Registered on-chain! Agent ID: ${entry.agentId}, TX: ${entry.txHash}`;
-        } catch (err: any) {
-          if (err.message?.includes("Insufficient ETH")) {
-            return `Registration failed: ${err.message}. Please fund your wallet with ETH for gas.`;
-          }
-          throw err;
-        }
-      },
-    },
-    {
-      name: "update_agent_card",
-      description:
-        "Generate and save a safe agent card (no internal details exposed).",
-      category: "registry",
-      riskLevel: "caution",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const { generateAgentCard, saveAgentCard } =
-          await import("../registry/agent-card.js");
-        const card = generateAgentCard(ctx.identity, ctx.config, ctx.db);
-        await saveAgentCard(card, ctx.conway);
-        return `Agent card updated: ${JSON.stringify(card, null, 2)}`;
-      },
-    },
-    {
-      name: "discover_agents",
-      description: "Discover other agents via ERC-8004 registry with caching.",
-      category: "registry",
-      riskLevel: "safe",
-      parameters: {
-        type: "object",
-        properties: {
-          keyword: { type: "string", description: "Search keyword (optional)" },
-          limit: { type: "number", description: "Max results (default: 10)" },
-          network: { type: "string", description: "mainnet or testnet" },
-          format: {
-            type: "string",
-            description:
-              'Output format: "text" (default, human-readable) or "json" (structured data)',
-          },
-        },
-      },
-      execute: async (args, ctx) => {
-        const { discoverAgents, searchAgents } =
-          await import("../registry/discovery.js");
-        const network = ((args.network as string) || "mainnet") as any;
-        const keyword = args.keyword as string | undefined;
-        const limit = (args.limit as number) || 10;
-
-        // Phase 3.2: Pass db.raw for agent card caching
-        const rpcUrl = ctx.config.rpcUrl;
-        const agents = keyword
-          ? await searchAgents(keyword, limit, network, undefined, ctx.db.raw, rpcUrl)
-          : await discoverAgents(limit, network, undefined, ctx.db.raw, rpcUrl);
-
-        if (agents.length === 0) return "No agents found.";
-
-        if ((args.format as string)?.toLowerCase() === "json") {
-          return JSON.stringify(
-            agents.map((a) => ({
-              agentId: a.agentId,
-              owner: a.owner,
-              agentURI: a.agentURI,
-              name: a.name || null,
-              description: a.description || null,
-            })),
-          );
-        }
-
-        return agents
-          .map(
-            (a) =>
-              `#${a.agentId} ${a.name || "unnamed"} (${a.owner}): ${a.description || a.agentURI}`,
-          )
-          .join("\n");
-      },
-    },
-    {
-      name: "give_feedback",
-      description:
-        "Leave on-chain reputation feedback for another agent. Score must be 1-5.",
-      category: "registry",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          agent_id: {
-            type: "string",
-            description: "Target agent's ERC-8004 ID",
-          },
-          score: { type: "number", description: "Score 1-5" },
-          comment: {
-            type: "string",
-            description: "Feedback comment (max 500 chars)",
-          },
-          network: {
-            type: "string",
-            description: "mainnet or testnet (default: mainnet)",
-          },
-        },
-        required: ["agent_id", "score", "comment"],
-      },
-      execute: async (args, ctx) => {
-        // Solana guard: on-chain feedback is EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "On-chain feedback requires an EVM wallet. Solana automatons cannot leave ERC-8004 reputation feedback.";
-        }
-
-        // Phase 3.2: Validate score 1-5
-        const score = args.score as number;
-        if (!Number.isInteger(score) || score < 1 || score > 5) {
-          return `Invalid score: ${score}. Must be an integer between 1 and 5.`;
-        }
-        // Phase 3.2: Validate comment length
-        const comment = args.comment as string;
-        if (comment.length > 500) {
-          return `Comment too long: ${comment.length} chars (max 500).`;
-        }
-        const { leaveFeedback } = await import("../registry/erc8004.js");
-        // Phase 3.2: Use config-based network, not hardcoded "mainnet"
-        const network = ((args.network as string) || "mainnet") as any;
-        const hash = await leaveFeedback(
-          ctx.identity.account,
-          args.agent_id as string,
-          score,
-          comment,
-          network,
-          ctx.db,
-          ctx.config.rpcUrl,
-        );
-        return `Feedback submitted. TX: ${hash}`;
-      },
-    },
-    {
-      name: "check_reputation",
-      description: "Check reputation feedback for an agent.",
-      category: "registry",
-      riskLevel: "safe",
-      parameters: {
-        type: "object",
-        properties: {
-          agent_address: {
-            type: "string",
-            description: "Agent address (default: self)",
-          },
-        },
-      },
-      execute: async (args, ctx) => {
-        const address = (args.agent_address as string) || ctx.identity.address;
-        const entries = ctx.db.getReputation(address);
-        if (entries.length === 0) return "No reputation feedback found.";
-        return entries
-          .map(
-            (e) =>
-              `${e.fromAgent.slice(0, 10)}... -> score:${e.score} "${e.comment}"`,
-          )
-          .join("\n");
-      },
-    },
 
     // === Phase 3.1: Replication Tools ===
-    {
-      name: "spawn_child",
-      description:
-        "Spawn a child automaton in a new Conway sandbox with lifecycle tracking.",
-      category: "replication",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          name: {
-            type: "string",
-            description:
-              "Name for the child automaton (alphanumeric + dash, max 64 chars)",
-          },
-          specialization: {
-            type: "string",
-            description: "What the child should specialize in",
-          },
-          message: { type: "string", description: "Message to the child" },
-        },
-        required: ["name"],
-      },
-      execute: async (args, ctx) => {
-        const { generateGenesisConfig, validateGenesisParams } =
-          await import("../replication/genesis.js");
-        const { spawnChild } = await import("../replication/spawn.js");
-        const { ChildLifecycle } = await import("../replication/lifecycle.js");
-
-        // Validate genesis params first
-        validateGenesisParams({
-          name: args.name as string,
-          specialization: args.specialization as string | undefined,
-          message: args.message as string | undefined,
-        });
-
-        const genesis = generateGenesisConfig(ctx.identity, ctx.config, {
-          name: args.name as string,
-          specialization: args.specialization as string | undefined,
-          message: args.message as string | undefined,
-        });
-
-        const lifecycle = new ChildLifecycle(ctx.db.raw);
-
-        let child;
-        try {
-          child = await spawnChild(
-            ctx.conway,
-            ctx.identity,
-            ctx.db,
-            genesis,
-            lifecycle,
-          );
-        } catch (err: any) {
-          // Auto-topup on 402 insufficient credits and retry once
-          const is402 = err?.status === 402 ||
-            err?.message?.includes("INSUFFICIENT_CREDITS");
-          if (is402) {
-            const COOLDOWN_MS = 60_000;
-            const last = ctx.db.getKV("last_sandbox_topup_attempt");
-            const cooldownOk = !last ||
-              Date.now() - new Date(last).getTime() >= COOLDOWN_MS;
-
-            if (cooldownOk) {
-              ctx.db.setKV("last_sandbox_topup_attempt", new Date().toISOString());
-              const { topupForSandbox } = await import("../conway/topup.js");
-              const topup = await topupForSandbox({
-                apiUrl: ctx.config.conwayApiUrl,
-                account: ctx.identity.account,
-                error: err,
-                chainType: ctx.config.chainType || ctx.identity.chainType || "evm",
-              });
-              if (topup?.success) {
-                const retryLifecycle = new ChildLifecycle(ctx.db.raw);
-                const retryGenesis = generateGenesisConfig(ctx.identity, ctx.config, {
-                  name: args.name as string,
-                  specialization: args.specialization as string | undefined,
-                  message: args.message as string | undefined,
-                });
-                child = await spawnChild(
-                  ctx.conway,
-                  ctx.identity,
-                  ctx.db,
-                  retryGenesis,
-                  retryLifecycle,
-                );
-              }
-            }
-          }
-          if (!child) throw err;
-        }
-
-        return `Child spawned: ${child.name} in sandbox ${child.sandboxId} (status: ${child.status})`;
-      },
-    },
-    {
-      name: "list_children",
-      description: "List all spawned child automatons with lifecycle state.",
-      category: "replication",
-      riskLevel: "safe",
-      parameters: { type: "object", properties: {} },
-      execute: async (_args, ctx) => {
-        const children = ctx.db.getChildren();
-        if (children.length === 0) return "No children spawned.";
-        return children
-          .map(
-            (c) =>
-              `${c.name} [${c.status}] sandbox:${c.sandboxId} funded:$${(c.fundedAmountCents / 100).toFixed(2)} last_check:${c.lastChecked || "never"}`,
-          )
-          .join("\n");
-      },
-    },
-    {
-      name: "fund_child",
-      description:
-        "Transfer credits to a child automaton. Requires wallet_verified status.",
-      category: "replication",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
-          amount_cents: {
-            type: "number",
-            description: "Amount in cents to transfer",
-          },
-        },
-        required: ["child_id", "amount_cents"],
-      },
-      execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
-
-        // Reject zero-address
-        const { isValidWalletAddress } =
-          await import("../replication/spawn.js");
-        const childChainType = child.chainType || ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (!isValidWalletAddress(child.address, childChainType)) {
-          return `Blocked: Child ${args.child_id} has invalid wallet address. Must be wallet_verified.`;
-        }
-
-        // Require wallet_verified or later status
-        const validFundingStates = [
-          "wallet_verified",
-          "funded",
-          "starting",
-          "healthy",
-          "unhealthy",
-        ];
-        if (!validFundingStates.includes(child.status)) {
-          return `Blocked: Child status is '${child.status}', must be wallet_verified or later to fund.`;
-        }
-
-        const amount = args.amount_cents as number;
-        if (!Number.isFinite(amount) || amount <= 0) {
-          return `Blocked: amount_cents must be a positive number, got ${amount}.`;
-        }
-
-        const balance = await ctx.conway.getCreditsBalance();
-        if (amount > balance / 2) {
-          return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
-        }
-
-        const transfer = await ctx.conway.transferCredits(
-          child.address,
-          amount,
-          `fund child ${child.id}`,
-        );
-
-        const { ulid } = await import("ulid");
-        ctx.db.insertTransaction({
-          id: ulid(),
-          type: "transfer_out",
-          amountCents: amount,
-          balanceAfterCents:
-            transfer.balanceAfterCents ?? Math.max(balance - amount, 0),
-          description: `Fund child ${child.name} (${child.id})`,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Update funded amount
-        ctx.db.raw
-          .prepare(
-            "UPDATE children SET funded_amount_cents = funded_amount_cents + ? WHERE id = ?",
-          )
-          .run(amount, child.id);
-
-        // Transition to funded if wallet_verified
-        if (child.status === "wallet_verified") {
-          try {
-            const { ChildLifecycle } =
-              await import("../replication/lifecycle.js");
-            const lifecycle = new ChildLifecycle(ctx.db.raw);
-            lifecycle.transition(
-              child.id,
-              "funded",
-              `funded with ${amount} cents`,
-            );
-          } catch {
-            // Non-critical: may already be in funded state
-          }
-        }
-
-        return `Funded child ${child.name} with $${(amount / 100).toFixed(2)} (status: ${transfer.status}, id: ${transfer.transferId || "n/a"})`;
-      },
-    },
-    {
-      name: "check_child_status",
-      description:
-        "Check the current status of a child automaton using health check system.",
-      category: "replication",
-      riskLevel: "safe",
-      parameters: {
-        type: "object",
-        properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
-        },
-        required: ["child_id"],
-      },
-      execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
-
-        const { ChildLifecycle } = await import("../replication/lifecycle.js");
-        const { ChildHealthMonitor } = await import("../replication/health.js");
-        const lifecycle = new ChildLifecycle(ctx.db.raw);
-        // Use a scoped client targeting the CHILD's sandbox for health checks
-        const childConway = ctx.conway.createScopedClient(child.sandboxId);
-        const monitor = new ChildHealthMonitor(
-          ctx.db.raw,
-          childConway,
-          lifecycle,
-        );
-        const result = await monitor.checkHealth(args.child_id as string);
-        return JSON.stringify(result, null, 2);
-      },
-    },
-    {
-      name: "start_child",
-      description:
-        "Start a funded child automaton. Transitions from funded to starting.",
-      category: "replication",
-      riskLevel: "caution",
-      parameters: {
-        type: "object",
-        properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
-        },
-        required: ["child_id"],
-      },
-      execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
-
-        const { ChildLifecycle } = await import("../replication/lifecycle.js");
-        const lifecycle = new ChildLifecycle(ctx.db.raw);
-
-        lifecycle.transition(child.id, "starting", "start requested by parent");
-
-        // Create a scoped client targeting the CHILD's sandbox
-        const childConway = ctx.conway.createScopedClient(child.sandboxId);
-
-        try {
-          // Start the child process with nohup so it survives exec session end
-          await childConway.exec(
-            "nohup node /root/automaton/dist/index.js --run > /root/.automaton/agent.log 2>&1 &",
-            30_000,
-          );
-
-          // Brief pause then verify the process is actually running
-          const check = await childConway.exec(
-            "sleep 2 && pgrep -f 'index.js --run' > /dev/null && echo running || echo stopped",
-            15_000,
-          );
-
-          if (check.stdout.trim() === "running") {
-            lifecycle.transition(child.id, "healthy", "started successfully");
-            return `Child ${child.name} started and healthy.`;
-          } else {
-            lifecycle.transition(child.id, "failed", "process did not start");
-            return `Child ${child.name} failed to start — process exited immediately. Check /root/.automaton/agent.log`;
-          }
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          try {
-            lifecycle.transition(child.id, "failed", `start failed: ${msg}`);
-          } catch { /* may already be in terminal state */ }
-          return `Failed to start child ${child.name}: ${msg}`;
-        }
-      },
-    },
-    {
-      name: "message_child",
-      description:
-        "Send a signed message to a child automaton via social relay.",
-      category: "replication",
-      riskLevel: "caution",
-      parameters: {
-        type: "object",
-        properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
-          content: { type: "string", description: "Message content" },
-          type: {
-            type: "string",
-            description: "Message type (default: parent_message)",
-          },
-        },
-        required: ["child_id", "content"],
-      },
-      execute: async (args, ctx) => {
-        if (!ctx.social) {
-          return "Social relay not configured. Set socialRelayUrl in config.";
-        }
-
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
-
-        const { sendToChild } = await import("../replication/messaging.js");
-        const result = await sendToChild(
-          ctx.social,
-          child.address,
-          args.content as string,
-          (args.type as string) || "parent_message",
-        );
-        return `Message sent to child ${child.name} (id: ${result.id})`;
-      },
-    },
-    {
-      name: "verify_child_constitution",
-      description: "Verify the constitution integrity of a child automaton.",
-      category: "replication",
-      riskLevel: "safe",
-      parameters: {
-        type: "object",
-        properties: {
-          child_id: { type: "string", description: "Child automaton ID" },
-        },
-        required: ["child_id"],
-      },
-      execute: async (args, ctx) => {
-        const child = ctx.db.getChildById(args.child_id as string);
-        if (!child) return `Child ${args.child_id} not found.`;
-
-        const { verifyConstitution } =
-          await import("../replication/constitution.js");
-        // Use a scoped client targeting the CHILD's sandbox
-        const childConway = ctx.conway.createScopedClient(child.sandboxId);
-        const result = await verifyConstitution(
-          childConway,
-          child.sandboxId,
-          ctx.db.raw,
-        );
-        return JSON.stringify(result, null, 2);
-      },
-    },
-    {
-      name: "prune_dead_children",
-      description: "Clean up dead/failed children and their sandboxes.",
-      category: "replication",
-      riskLevel: "caution",
-      parameters: {
-        type: "object",
-        properties: {
-          keep_last: {
-            type: "number",
-            description: "Number of recent dead children to keep (default: 5)",
-          },
-        },
-      },
-      execute: async (args, ctx) => {
-        const { ChildLifecycle } = await import("../replication/lifecycle.js");
-        const { SandboxCleanup } = await import("../replication/cleanup.js");
-        const { pruneDeadChildren } = await import("../replication/lineage.js");
-
-        const lifecycle = new ChildLifecycle(ctx.db.raw);
-        const cleanup = new SandboxCleanup(ctx.conway, lifecycle, ctx.db.raw);
-        const pruned = await pruneDeadChildren(
-          ctx.db,
-          cleanup,
-          (args.keep_last as number) || 5,
-        );
-        return `Pruned ${pruned} dead children.`;
-      },
-    },
 
     // === Phase 3.2: Social & Registry Tools ===
 
     // ── Social / Messaging Tools ──
-    {
-      name: "send_message",
-      description:
-        "Send a signed message to another automaton or address via the social relay.",
-      category: "conway",
-      riskLevel: "caution",
-      parameters: {
-        type: "object",
-        properties: {
-          to_address: {
-            type: "string",
-            description: "Recipient wallet address (0x...)",
-          },
-          content: {
-            type: "string",
-            description: "Message content to send",
-          },
-          reply_to: {
-            type: "string",
-            description: "Optional message ID to reply to",
-          },
-        },
-        required: ["to_address", "content"],
-      },
-      execute: async (args, ctx) => {
-        if (!ctx.social) {
-          return "Social relay not configured. Set socialRelayUrl in config.";
-        }
-        // Phase 3.2: Enforce MESSAGE_LIMITS size check
-        const content = args.content as string;
-        const { MESSAGE_LIMITS } = await import("../types.js");
-        if (content.length > MESSAGE_LIMITS.maxContentLength) {
-          return `Blocked: Message content too long (${content.length} > ${MESSAGE_LIMITS.maxContentLength} bytes)`;
-        }
-        const result = await ctx.social.send(
-          args.to_address as string,
-          content,
-          args.reply_to as string | undefined,
-        );
-        return `Message sent (id: ${result.id})`;
-      },
-    },
 
     // ── Model Discovery (enhanced with Phase 2.3 tier routing + pricing) ──
     {
       name: "list_models",
       description:
         "List all available inference models with their provider, pricing, and tier routing information.",
-      category: "conway",
+      category: "compute",
       riskLevel: "safe",
       parameters: {
         type: "object",
@@ -2054,7 +1233,7 @@ Model: ${ctx.inference.getDefaultModel()}
         } catch {
           // Registry not initialized yet, fall back to API
         }
-        const models = await ctx.conway.listModels();
+        const models = await ctx.compute.listModels();
         const lines = models.map(
           (m) =>
             `${m.id} (${m.provider}) — $${m.pricing.inputPerMillion}/$${m.pricing.outputPerMillion} per 1M tokens (in/out)`,
@@ -2068,7 +1247,7 @@ Model: ${ctx.inference.getDefaultModel()}
       name: "switch_model",
       description:
         "Change the active inference model at runtime. Persists to config. Use list_models to see available options.",
-      category: "conway",
+      category: "compute",
       riskLevel: "caution",
       parameters: {
         type: "object",
@@ -2172,153 +1351,6 @@ Model: ${ctx.inference.getDefaultModel()}
     },
 
     // ── Domain Tools ──
-    {
-      name: "search_domains",
-      description: "Search for available domain names and get pricing.",
-      category: "conway",
-      riskLevel: "safe",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description:
-              "Domain name or keyword to search (e.g., 'mysite' or 'mysite.com')",
-          },
-          tlds: {
-            type: "string",
-            description:
-              "Comma-separated TLDs to check (e.g., 'com,io,ai'). Default: com,io,ai,xyz,net,org,dev",
-          },
-        },
-        required: ["query"],
-      },
-      execute: async (args, ctx) => {
-        const results = await ctx.conway.searchDomains(
-          args.query as string,
-          args.tlds as string | undefined,
-        );
-        if (results.length === 0) return "No results found.";
-        return results
-          .map(
-            (d) =>
-              `${d.domain}: ${d.available ? "AVAILABLE" : "taken"}${d.registrationPrice != null ? ` ($${(d.registrationPrice / 100).toFixed(2)}/yr)` : ""}`,
-          )
-          .join("\n");
-      },
-    },
-    {
-      name: "register_domain",
-      description:
-        "Register a domain name. Costs USDC via x402 payment. Check availability first with search_domains.",
-      category: "conway",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          domain: {
-            type: "string",
-            description: "Full domain to register (e.g., 'mysite.com')",
-          },
-          years: {
-            type: "number",
-            description: "Registration period in years (default: 1)",
-          },
-        },
-        required: ["domain"],
-      },
-      execute: async (args, ctx) => {
-        const reg = await ctx.conway.registerDomain(
-          args.domain as string,
-          (args.years as number) || 1,
-        );
-        return `Domain registered: ${reg.domain} (status: ${reg.status}${reg.expiresAt ? `, expires: ${reg.expiresAt}` : ""}${reg.transactionId ? `, tx: ${reg.transactionId}` : ""})`;
-      },
-    },
-    {
-      name: "manage_dns",
-      description:
-        "Manage DNS records for a domain you own. Actions: list, add, delete.",
-      category: "conway",
-      riskLevel: "safe",
-      parameters: {
-        type: "object",
-        properties: {
-          action: {
-            type: "string",
-            description: "list, add, or delete",
-          },
-          domain: {
-            type: "string",
-            description: "Domain name (e.g., 'mysite.com')",
-          },
-          type: {
-            type: "string",
-            description: "Record type for add: A, AAAA, CNAME, MX, TXT, etc.",
-          },
-          host: {
-            type: "string",
-            description: "Record host for add (e.g., '@' for root, 'www')",
-          },
-          value: {
-            type: "string",
-            description:
-              "Record value for add (e.g., IP address, target domain)",
-          },
-          ttl: {
-            type: "number",
-            description: "TTL in seconds for add (default: 3600)",
-          },
-          record_id: {
-            type: "string",
-            description: "Record ID for delete",
-          },
-        },
-        required: ["action", "domain"],
-      },
-      execute: async (args, ctx) => {
-        const action = args.action as string;
-        const domain = args.domain as string;
-
-        if (action === "list") {
-          const records = await ctx.conway.listDnsRecords(domain);
-          if (records.length === 0)
-            return `No DNS records found for ${domain}.`;
-          return records
-            .map(
-              (r) =>
-                `[${r.id}] ${r.type} ${r.host} -> ${r.value} (TTL: ${r.ttl || "default"})`,
-            )
-            .join("\n");
-        }
-
-        if (action === "add") {
-          const type = args.type as string;
-          const host = args.host as string;
-          const value = args.value as string;
-          if (!type || !host || !value) {
-            return "Required for add: type, host, value";
-          }
-          const record = await ctx.conway.addDnsRecord(
-            domain,
-            type,
-            host,
-            value,
-            args.ttl as number | undefined,
-          );
-          return `DNS record added: [${record.id}] ${record.type} ${record.host} -> ${record.value}`;
-        }
-
-        if (action === "delete") {
-          const recordId = args.record_id as string;
-          if (!recordId) return "Required for delete: record_id";
-          await ctx.conway.deleteDnsRecord(domain, recordId);
-          return `DNS record ${recordId} deleted from ${domain}`;
-        }
-
-        return `Unknown action: ${action}. Use list, add, or delete.`;
-      },
-    },
 
     // === Phase 2.1: Soul Tools ===
     {
@@ -2723,78 +1755,6 @@ Model: ${ctx.inference.getDefaultModel()}
     },
 
     // ── x402 Payment Tool ──
-    {
-      name: "x402_fetch",
-      description:
-        "Fetch a URL with automatic x402 USDC payment. If the server responds with HTTP 402, signs a USDC payment and retries. Use this to access paid APIs and services.",
-      category: "financial",
-      riskLevel: "dangerous",
-      parameters: {
-        type: "object",
-        properties: {
-          url: {
-            type: "string",
-            description: "The URL to fetch",
-          },
-          method: {
-            type: "string",
-            description: "HTTP method (default: GET)",
-          },
-          body: {
-            type: "string",
-            description: "Request body for POST/PUT (JSON string)",
-          },
-          headers: {
-            type: "string",
-            description: "Additional headers as JSON string",
-          },
-        },
-        required: ["url"],
-      },
-      execute: async (args, ctx) => {
-        // Solana guard: x402 payments are EVM-only
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        if (chainType === "solana") {
-          return "x402 payment requires an EVM wallet. Solana automatons cannot sign EVM payment authorizations. Use Conway credits API instead.";
-        }
-
-        const { x402Fetch } = await import("../conway/x402.js");
-        const { DEFAULT_TREASURY_POLICY } = await import("../types.js");
-        const url = args.url as string;
-        const method = (args.method as string) || "GET";
-        const body = args.body as string | undefined;
-        const extraHeaders = args.headers
-          ? JSON.parse(args.headers as string)
-          : undefined;
-
-        const maxPayment =
-          ctx.config.treasuryPolicy?.maxX402PaymentCents ??
-          DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
-        const result = await x402Fetch(
-          url,
-          ctx.identity.account,
-          method,
-          body,
-          extraHeaders,
-          maxPayment,
-        );
-
-        if (!result.success) {
-          return `x402 fetch failed: ${result.error || "Unknown error"}`;
-        }
-
-        const responseStr =
-          typeof result.response === "string"
-            ? result.response
-            : JSON.stringify(result.response, null, 2);
-
-        // Truncate very large responses
-        if (responseStr.length > 10000) {
-          return `x402 fetch succeeded (truncated):\n${responseStr.slice(0, 10000)}...`;
-        }
-        return `x402 fetch succeeded:\n${responseStr}`;
-      },
-    },
 
     // === Orchestration Tools ===
     {
@@ -3208,6 +2168,7 @@ Model: ${ctx.inference.getDefaultModel()}
         return lines.join("\n");
       },
     },
+
   ];
 }
 
@@ -3230,7 +2191,7 @@ export function loadInstalledTools(db: {
     return installed.map((tool) => ({
       name: tool.name,
       description: `Installed tool: ${tool.name}`,
-      category: (tool.type === "mcp" ? "conway" : "vm") as ToolCategory,
+      category: (tool.type === "mcp" ? "compute" : "vm") as ToolCategory,
       riskLevel: "caution" as RiskLevel,
       parameters: (tool.config?.parameters as Record<string, unknown>) || {
         type: "object",
@@ -3260,7 +2221,7 @@ function createInstalledToolExecutor(tool: {
     // Generic installed tool — execute via sandbox shell if command is configured
     const command = tool.config?.command as string | undefined;
     if (command) {
-      const result = await ctx.conway.exec(
+      const result = await ctx.compute.exec(
         `${command} ${escapeShellArg(JSON.stringify(args))}`,
         30000,
       );

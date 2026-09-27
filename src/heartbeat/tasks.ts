@@ -17,7 +17,7 @@ import type {
 } from "../types.js";
 import type { HealthMonitor as ColonyHealthMonitor } from "../orchestration/health-monitor.js";
 import { sanitizeInput } from "../agent/injection-defense.js";
-import { getSurvivalTier } from "../conway/credits.js";
+import { getSurvivalTier } from "../survival/tiers.js";
 import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
@@ -45,7 +45,7 @@ export const COLONY_TASK_INTERVALS_MS = {
 
 export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   heartbeat_ping: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
+    // Use ctx.creditBalance instead of calling compute.getCreditsBalance()
     const credits = ctx.creditBalance;
     const state = taskCtx.db.getAgentState();
     const startTime =
@@ -91,7 +91,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_credits: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    // Use ctx.creditBalance instead of calling conway.getCreditsBalance()
+    // Use ctx.creditBalance instead of calling compute.getCreditsBalance()
     const credits = ctx.creditBalance;
     const tier = ctx.survivalTier;
     const now = new Date().toISOString();
@@ -145,133 +145,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
     return { shouldWake: false };
   },
 
-  check_usdc_balance: async (ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    // Use ctx.usdcBalance instead of calling getUsdcBalance()
-    const balance = ctx.usdcBalance;
-    const credits = ctx.creditBalance;
 
-    taskCtx.db.setKV("last_usdc_check", JSON.stringify({
-      balance,
-      credits,
-      timestamp: new Date().toISOString(),
-    }));
-
-    const MIN_TOPUP_USD = 5;
-    if (balance >= MIN_TOPUP_USD && (ctx.survivalTier === "critical" || ctx.survivalTier === "dead")) {
-      // Cooldown: don't attempt more than once every 5 minutes to avoid
-      // hammering the payment endpoint on repeated ticks.
-      const AUTO_TOPUP_COOLDOWN_MS = 5 * 60 * 1000;
-      const lastAttempt = taskCtx.db.getKV("last_auto_topup_attempt");
-      if (lastAttempt && Date.now() - new Date(lastAttempt).getTime() < AUTO_TOPUP_COOLDOWN_MS) {
-        return { shouldWake: false };
-      }
-
-      taskCtx.db.setKV("last_auto_topup_attempt", new Date().toISOString());
-
-      const { bootstrapTopup } = await import("../conway/topup.js");
-      const result = await bootstrapTopup({
-        apiUrl: taskCtx.config.conwayApiUrl,
-        account: taskCtx.identity.account,
-        creditsCents: credits,
-        chainType: taskCtx.config.chainType || taskCtx.identity.chainType || "evm",
-      });
-
-      if (result?.success) {
-        logger.info(
-          `Auto-topup successful: $${result.amountUsd} USD → ${result.creditsCentsAdded} credit cents`,
-        );
-        return {
-          shouldWake: true,
-          message: `Auto-topped up $${result.amountUsd} in credits (was $${(credits / 100).toFixed(2)}). USDC remaining: ~$${(balance - result.amountUsd).toFixed(2)}.`,
-        };
-      }
-
-      // Topup failed — wake the agent so it can handle it manually
-      const errMsg = result?.error ?? "unknown error";
-      logger.warn(`Auto-topup failed: ${errMsg}`);
-      return {
-        shouldWake: true,
-        message: `Low credits ($${(credits / 100).toFixed(2)}) with USDC available ($${balance.toFixed(2)}) but auto-topup failed: ${errMsg}. Use topup_credits to retry.`,
-      };
-    }
-
-    return { shouldWake: false };
-  },
-
-  check_social_inbox: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    if (!taskCtx.social) return { shouldWake: false };
-
-    // If we've recently encountered an error polling the inbox, back off.
-    const backoffUntil = taskCtx.db.getKV("social_inbox_backoff_until");
-    if (backoffUntil && new Date(backoffUntil) > new Date()) {
-      return { shouldWake: false };
-    }
-
-    const cursor = taskCtx.db.getKV("social_inbox_cursor") || undefined;
-
-    let messages: any[] = [];
-    let nextCursor: string | undefined;
-
-    try {
-      const result = await taskCtx.social.poll(cursor);
-      messages = result.messages;
-      nextCursor = result.nextCursor;
-
-      // Clear previous error/backoff on success.
-      taskCtx.db.deleteKV("last_social_inbox_error");
-      taskCtx.db.deleteKV("social_inbox_backoff_until");
-    } catch (err: any) {
-      taskCtx.db.setKV(
-        "last_social_inbox_error",
-        JSON.stringify({
-          message: err?.message || String(err),
-          stack: err?.stack,
-          timestamp: new Date().toISOString(),
-        }),
-      );
-      // 5-minute backoff to avoid spamming errors on transient network failures.
-      taskCtx.db.setKV(
-        "social_inbox_backoff_until",
-        new Date(Date.now() + 300_000).toISOString(),
-      );
-      return { shouldWake: false };
-    }
-
-    if (nextCursor) taskCtx.db.setKV("social_inbox_cursor", nextCursor);
-
-    if (!messages || messages.length === 0) return { shouldWake: false };
-
-    // Persist to inbox_messages table for deduplication
-    // Sanitize content before DB insertion
-    let newCount = 0;
-    for (const msg of messages) {
-      const existing = taskCtx.db.getKV(`inbox_seen_${msg.id}`);
-      if (!existing) {
-        const sanitizedFrom = sanitizeInput(msg.from, msg.from, "social_address");
-        const sanitizedContent = sanitizeInput(msg.content, msg.from, "social_message");
-        const sanitizedMsg = {
-          ...msg,
-          from: sanitizedFrom.content,
-          content: sanitizedContent.content,
-        };
-        taskCtx.db.insertInboxMessage(sanitizedMsg);
-        taskCtx.db.setKV(`inbox_seen_${msg.id}`, "1");
-        // Only count non-blocked messages toward wake threshold —
-        // blocked messages are stored for audit but should not wake
-        // the agent (prevents injection spam from draining credits).
-        if (!sanitizedContent.blocked) {
-          newCount++;
-        }
-      }
-    }
-
-    if (newCount === 0) return { shouldWake: false };
-
-    return {
-      shouldWake: true,
-      message: `${newCount} new message(s) from: ${messages.map((m) => m.from.slice(0, 10)).join(", ")}`,
-    };
-  },
 
   check_for_updates: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     try {
@@ -339,7 +213,7 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   // === Phase 2.3: Model Registry Refresh ===
   refresh_models: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     try {
-      const models = await taskCtx.conway.listModels();
+      const models = await taskCtx.compute.listModels();
       if (models.length > 0) {
         const { ModelRegistry } = await import("../inference/registry.js");
         const registry = new ModelRegistry(taskCtx.db.raw);
@@ -357,52 +231,13 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   // === Phase 3.1: Child Health Check ===
-  check_child_health: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    try {
-      const { ChildLifecycle } = await import("../replication/lifecycle.js");
-      const { ChildHealthMonitor } = await import("../replication/health.js");
-      const lifecycle = new ChildLifecycle(taskCtx.db.raw);
-      const monitor = new ChildHealthMonitor(taskCtx.db.raw, taskCtx.conway, lifecycle);
-      const results = await monitor.checkAllChildren();
-
-      const unhealthy = results.filter((r) => !r.healthy);
-      if (unhealthy.length > 0) {
-        for (const r of unhealthy) {
-          logger.warn(`Child ${r.childId} unhealthy: ${r.issues.join(", ")}`);
-        }
-        return {
-          shouldWake: true,
-          message: `${unhealthy.length} child(ren) unhealthy: ${unhealthy.map((r) => r.childId.slice(0, 8)).join(", ")}`,
-        };
-      }
-    } catch (error) {
-      logger.error("check_child_health failed", error instanceof Error ? error : undefined);
-    }
-    return { shouldWake: false };
-  },
 
   // === Phase 3.1: Prune Dead Children ===
-  prune_dead_children: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    try {
-      const { ChildLifecycle } = await import("../replication/lifecycle.js");
-      const { SandboxCleanup } = await import("../replication/cleanup.js");
-      const { pruneDeadChildren } = await import("../replication/lineage.js");
-      const lifecycle = new ChildLifecycle(taskCtx.db.raw);
-      const cleanup = new SandboxCleanup(taskCtx.conway, lifecycle, taskCtx.db.raw);
-      const pruned = await pruneDeadChildren(taskCtx.db, cleanup);
-      if (pruned > 0) {
-        logger.info(`Pruned ${pruned} dead children`);
-      }
-    } catch (error) {
-      logger.error("prune_dead_children failed", error instanceof Error ? error : undefined);
-    }
-    return { shouldWake: false };
-  },
 
   health_check: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     // Check that the sandbox is healthy
     try {
-      const result = await taskCtx.conway.exec("echo alive", 5000);
+      const result = await taskCtx.compute.exec("echo alive", 5000);
       if (result.exitCode !== 0) {
         // Only wake on first failure, not repeated failures
         const prevStatus = taskCtx.db.getKV("health_check_status");
@@ -678,32 +513,6 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       return { shouldWake: false };
     }
   },
-
-  dead_agent_cleanup: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
-    if (!shouldRunAtInterval(taskCtx, "dead_agent_cleanup", COLONY_TASK_INTERVALS_MS.dead_agent_cleanup)) {
-      return { shouldWake: false };
-    }
-
-    try {
-      const { ChildLifecycle } = await import("../replication/lifecycle.js");
-      const { SandboxCleanup } = await import("../replication/cleanup.js");
-      const { pruneDeadChildren } = await import("../replication/lineage.js");
-
-      const lifecycle = new ChildLifecycle(taskCtx.db.raw);
-      const cleanup = new SandboxCleanup(taskCtx.conway, lifecycle, taskCtx.db.raw);
-      const cleaned = await pruneDeadChildren(taskCtx.db, cleanup);
-
-      taskCtx.db.setKV("last_dead_agent_cleanup", JSON.stringify({
-        timestamp: new Date().toISOString(),
-        cleaned,
-      }));
-
-      return { shouldWake: false };
-    } catch (error) {
-      logger.error("dead_agent_cleanup failed", error instanceof Error ? error : undefined);
-      return { shouldWake: false };
-    }
-  },
 };
 
 function tierToInt(tier: SurvivalTier): number {
@@ -743,7 +552,7 @@ async function createHealthMonitor(taskCtx: HeartbeatLegacyContext): Promise<Col
   const { HealthMonitor } = await import("../orchestration/health-monitor.js");
 
   const tracker = new SimpleAgentTracker(taskCtx.db);
-  const funding = new SimpleFundingProtocol(taskCtx.conway, taskCtx.identity, taskCtx.db);
+  const funding = new SimpleFundingProtocol(taskCtx.compute, taskCtx.identity, taskCtx.db);
   const transport = new LocalDBTransport(taskCtx.db);
   const messaging = new ColonyMessaging(transport, taskCtx.db);
 
