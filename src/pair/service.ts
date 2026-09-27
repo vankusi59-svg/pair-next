@@ -10,7 +10,8 @@
 
 import path from "node:path";
 import { newId, pathWithin, utcnow } from "./canonical.js";
-import { IntegrityError } from "./errors.js";
+import { IntegrityError, NotFoundError } from "./errors.js";
+import { RouteRegistry } from "./route-registry.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const MISSION_STATUS_TRANSITIONS: Record<string, string[]> = {
@@ -26,7 +27,15 @@ export const MISSION_STATUS_TRANSITIONS: Record<string, string[]> = {
 export const TASK_DISPATCHABLE_STATES = new Set(["READY", "ROUTED"]);
 
 export class PairControlPlane {
+  private _routes: RouteRegistry | null = null;
+
   constructor(public readonly store: PairEvidenceStore) {}
+
+  /** Lazy canonical route registry (routes + executor_supply_bindings). */
+  get routes(): RouteRegistry {
+    this._routes ??= new RouteRegistry(this);
+    return this._routes;
+  }
 
   createProject(params: { name: string; root_location: string }): Record<string, unknown> {
     const projectId = newId("PRJ");
@@ -190,6 +199,48 @@ export class PairControlPlane {
 
   getTask(taskId: string): Record<string, unknown> {
     return this.store.get("task", taskId);
+  }
+
+  /** Bind the router-selected executor onto the task entity (routing evidence). */
+  updateTask(taskId: string, patch: Record<string, unknown>): Record<string, unknown> {
+    const task = this.store.get("task", taskId);
+    const updated = { ...task, ...patch };
+    return this.store.put("task", taskId, updated, Number(task.version));
+  }
+
+  registerExecutor(record: Record<string, unknown>, actor = "PAIR_EXECUTOR_REGISTRY"): Record<string, unknown> {
+    const executorId = String(record.executor_id ?? "");
+    if (!executorId) {
+      throw new IntegrityError("FAIL_CLOSED_EXECUTOR_DESCRIPTOR_INCOMPLETE", "executor_id");
+    }
+    let existing: Record<string, unknown> | null = null;
+    try {
+      existing = this.store.get("executor", executorId);
+    } catch (error) {
+      if (!(error instanceof NotFoundError)) throw error;
+    }
+    const saved = this.store.put(
+      "executor",
+      executorId,
+      { ...record, executor_id: executorId },
+      existing ? Number(existing.version) : 0,
+    );
+    this.store.event({
+      entity_type: "executor",
+      entity_id: executorId,
+      event_type: existing ? "EXECUTOR_UPDATED" : "EXECUTOR_REGISTERED",
+      new_state: String(record.health_state ?? "UNKNOWN"),
+      actor,
+    });
+    return saved;
+  }
+
+  getExecutor(executorId: string): Record<string, unknown> {
+    return this.store.get("executor", executorId);
+  }
+
+  listExecutors(): Array<Record<string, unknown>> {
+    return this.store.list("executor");
   }
 
   listTasks(missionId: string): Array<Record<string, unknown>> {
