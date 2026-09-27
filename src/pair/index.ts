@@ -34,3 +34,6 @@ export * from "./model-routable.js";
 export * from "./experience-extraction.js";
 export * from "./experience-verifier.js";
 export * from "./experience-advisors.js";
+export * from "./recovery-controller.js";
+export * from "./reconciliation.js";
+export * from "./self-improvement.js";

@@ -51,7 +51,12 @@ export class MissionRouter {
         .list("governed_task")
         .find(
           (g) =>
-            g.task_id === taskId && Number(g.plan_revision) === planRevision,
+            g.task_id === taskId &&
+            Number(g.plan_revision) === planRevision &&
+            // P8: a governed task superseded by a recovery decision is dead;
+            // re-routing must create a fresh governed task (fresh intent,
+            // fresh dispatch) — never adopt the dead binding.
+            g.governance_state !== "SUPERSEDED_BY_RECOVERY",
         ) ?? null
     );
   }
