@@ -110,8 +110,11 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
         encoding: "utf8",
         timeout: 10_000,
       }).trim() || null;
-    } catch {
-      /* version probe is best-effort; real handshake happens in dispatch */
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+        limitations.push(`DSH_EXECUTABLE_NOT_FOUND:${launch.command}`);
+      }
+      /* other failures are best-effort; real handshake happens in dispatch */
     }
     const credentialEnv = this.credentialEnvNames()[0];
     const authenticated = Boolean(this.envOf(credentialEnv));
@@ -133,7 +136,7 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
     _task: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     const [provider, model] = modelRoute(this.envOf.bind(this));
-    const value = `${provider}/${model}`;
+    const value = JSON.stringify([provider, model]);
     const resp = await proc.setConfigOption(sessionId, DSH_MODEL_CONFIG_ID, value, 30);
     return { model_route: [provider, model], model_config: { config_id: DSH_MODEL_CONFIG_ID, response: resp } };
   }

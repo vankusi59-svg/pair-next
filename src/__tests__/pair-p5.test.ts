@@ -325,11 +325,20 @@ describe("P5 registration & routing", () => {
     expect(record).toBeTruthy();
     expect(ctx.service.routes.getRoute(ROUTE_IDS[DSH_EXECUTOR_ID])).toBeTruthy();
     expect(ctx.service.routes.bindingFor(DSH_EXECUTOR_ID, ROUTE_IDS[DSH_EXECUTOR_ID])).toBeTruthy();
-    // Environment truth: no real dsh binary → stock adapter reports blocked.
-    const stock = new DshExecutorAdapter({ journalRoot: path.join(ctx.dir, "journal") });
-    const stockProbe = stock.probe();
-    expect(stockProbe.available).toBe(false);
-    expect(String(stockProbe.limitations)).toContain("EXECUTABLE_NOT_FOUND");
+    // Absent-runtime truth: mask vendor bin dirs from PATH → stock adapter reports blocked.
+    const realPath = process.env.PATH ?? "";
+    process.env.PATH = realPath
+      .split(path.delimiter)
+      .filter((p) => !p.includes(".local"))
+      .join(path.delimiter);
+    try {
+      const stock = new DshExecutorAdapter({ journalRoot: path.join(ctx.dir, "journal") });
+      const stockProbe = stock.probe();
+      expect(stockProbe.available).toBe(false);
+      expect(String(stockProbe.limitations)).toContain("EXECUTABLE_NOT_FOUND");
+    } finally {
+      process.env.PATH = realPath;
+    }
   });
 
   it("3: CODEX registration + qualification + route seeding", () => {
@@ -341,10 +350,19 @@ describe("P5 registration & routing", () => {
     const q = ctx.codex!.qualify();
     expect(q.qualified).toBe(true);
     expect(ctx.service.routes.getRoute(ROUTE_IDS[CODEX_EXECUTOR_ID])).toBeTruthy();
-    const stock = new CodexCliExecutorAdapter({ journalRoot: path.join(ctx.dir, "journal") });
-    const stockProbe = stock.probe();
-    expect(stockProbe.available).toBe(false);
-    expect(String(stockProbe.limitations)).toContain("CODEX_EXECUTABLE_NOT_FOUND");
+    const realPath = process.env.PATH ?? "";
+    process.env.PATH = realPath
+      .split(path.delimiter)
+      .filter((p) => !p.includes(".local"))
+      .join(path.delimiter);
+    try {
+      const stock = new CodexCliExecutorAdapter({ journalRoot: path.join(ctx.dir, "journal") });
+      const stockProbe = stock.probe();
+      expect(stockProbe.available).toBe(false);
+      expect(String(stockProbe.limitations)).toContain("CODEX_EXECUTABLE_NOT_FOUND");
+    } finally {
+      process.env.PATH = realPath;
+    }
   });
 });
 

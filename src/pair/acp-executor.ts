@@ -394,8 +394,12 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
       this.finish(rec, task, before, stopReason === "cancelled" ? "CANCELLED" : "COMPLETED", null);
     } catch (error) {
       const code = (error as { code?: string }).code ?? String(error);
+      const detail =
+        typeof (error as { detail?: string }).detail === "string"
+          ? (error as { detail: string }).detail
+          : code;
       const status = code === "ACP_REQUEST_TIMEOUT" ? "TIMEOUT" : "FAILED";
-      this.finish(rec, task, before, status, code);
+      this.finish(rec, task, before, status, code, detail);
     } finally {
       proc.close();
     }
@@ -407,6 +411,7 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
     before: Record<string, unknown>,
     status: string,
     errorCode: string | null,
+    errorDetail?: string,
   ): void {
     const runRoot = rec.run_root;
     const after = snapshotWorkspace(String(task.workspace), runRoot);
@@ -436,7 +441,7 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
       task_id: rec.task_id,
       correlation_id: rec.correlation_id,
       status,
-      error: errorCode ? { class: errorCode, message: errorCode } : null,
+      error: errorCode ? { class: errorCode, message: errorDetail ?? errorCode } : null,
       summary: status === "COMPLETED" ? "acp session completed" : `acp ${status.toLowerCase()}`,
       artifacts,
       started_at: rec.started_at,

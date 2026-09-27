@@ -206,21 +206,16 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     const allowedRoots = ((task.allowed_paths as string[]) ?? [workspace])
       .map((p) => path.resolve(p));
     const grants = allowedRoots
-      .filter((r) => r !== workspace)
       .map((r) => `'${r}'='${writeAllowed ? "write" : "read"}'`)
       .join(",");
     const filesystem =
-      "{':minimal'='read',':workspace_roots'={'.'='" +
-      (writeAllowed ? "write" : "read") +
-      "'}" +
-      (grants ? "," + grants : "") +
-      "}";
+      "{':minimal'='read'" + (grants ? "," + grants : "") + "}";
     return [
       "--config", `default_permissions=${profile}`,
       "--config", `permissions.${profile}.extends=:workspace`,
       "--config", `permissions.${profile}.filesystem=${filesystem}`,
       "--config", `permissions.${profile}.network.enabled=false`,
-      "--config", `permissions.${profile}.workspace_roots.'${workspace}'=true`,
+      "--config", `permissions.${profile}.workspace_roots={'${workspace}'=true}`,
     ];
   }
 
@@ -268,12 +263,21 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     const finalPath = path.join(runRoot, "final.json");
     atomicWriteJson(schemaPath, {
       type: "object",
+      additionalProperties: false,
       properties: {
         status: { type: "string", enum: ["COMPLETED", "FAILED", "CANCELLED"] },
         summary: { type: "string" },
-        artifacts: { type: "array", items: { type: "object", properties: { path: { type: "string" } } } },
+        artifacts: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: { path: { type: "string" } },
+            required: ["path"],
+          },
+        },
       },
-      required: ["status"],
+      required: ["status", "summary", "artifacts"],
     });
     const args = [
       ...exe.prefixArgs,
