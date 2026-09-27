@@ -1,0 +1,57 @@
+{
+  "schema": "pair.os.vnext.release.v1",
+  "release_name": "PAIR OS vNext V1.0.0",
+  "version": "1.0.0",
+  "release_tag": "v1.0.0-pair-next-official-final",
+  "classification": "P10_OFFICIAL_FINAL_PASS_WITH_OPTIONAL_EXTERNAL_BLOCKERS",
+  "release_commit": "self \u2014 resolved as the commit this file is read from; the release tag v1.0.0-pair-next-official-final points to it (verify: git rev-parse v1.0.0-pair-next-official-final)",
+  "parent_commit": "23e4d5799301a5d02336212370f934ac699ca2ef",
+  "p9_baseline_commit": "3e2d4999b92da301ebe77006d2371bc04a9ecac1",
+  "automaton_parent": "d8f8168",
+  "pair_donor": "a557df2",
+  "architecture_authority": "PAIR_NEXT_SINGLE_MISSION_ROUTING_AUTHORITY",
+  "build_environment": {
+    "node": "v22.23.3",
+    "pnpm": "10.28.1",
+    "platform": "linux",
+    "arch": "x64",
+    "lockfile_sha256": "1bcff8137b5eee5f92d21a29ee29b1e675425698f3ed9be10b0a28efcc204588",
+    "lockfile_version": "9.0"
+  },
+  "test_summary": {
+    "deterministic": {
+      "files": 66,
+      "tests": 1645,
+      "failures": 0,
+      "status": "PASS"
+    },
+    "live": {
+      "tests": 25,
+      "failures": 0,
+      "status": "PASS"
+    },
+    "p10_suite": {
+      "tests": 31,
+      "runs": 3,
+      "failures": 0,
+      "status": "PASS"
+    },
+    "cleanroom_build": "PASS"
+  },
+  "live_executor_summary": {
+    "PAIR_NATIVE": "LIVE_QUALIFIED",
+    "DEEPSEEK_HARNESS": "LIVE_QUALIFIED",
+    "CODEX": "LIVE_QUALIFIED",
+    "DEVIN": "BLOCKED_EXTERNAL_NO_CREDENTIAL"
+  },
+  "known_waivers": [],
+  "known_limitations": [
+    "DEVIN executor unqualified \u2014 PAIR_DEVIN_API_KEY absent (fail-closed, non-routable)",
+    "Provider family coverage limited to Groq + Codex-observed",
+    "Mission Control UI functional, not polished",
+    "No browser/Windows executors, account/pool scheduling, or autonomous production promotion"
+  ],
+  "package_sha256": "44b2e14afd71e66ea1d69fbd4524172f37a4b84eaf7aa66da54a7eeb411594c1",
+  "package_sha256_scope": "Deterministic member-content digest: sha256 over sorted per-member sha256 lines of all tracked package files EXCLUDING RELEASE.json and PAIR_OS_VNEXT_V1_RELEASE_MANIFEST.md (self-referential members). Byte-level zip SHA-256 is recorded in the release tag annotation and the P10 report.",
+  "created_at": "2026-09-27T23:14:29Z"
+}
