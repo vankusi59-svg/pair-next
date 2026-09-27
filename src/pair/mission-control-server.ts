@@ -9,7 +9,7 @@
  */
 
 import http from "node:http";
-import { PolicyError } from "./errors.js";
+import { IntegrityError, PolicyError } from "./errors.js";
 import type { MissionControl } from "./mission-control.js";
 
 export interface MissionControlServerDeps {
@@ -140,6 +140,9 @@ export function createMissionControlServer(
       if (method === "GET" && p === "/api/selfmod") return void json(res, 200, c.selfImprovement());
 
       // ---- mutations (operator authority required) -------------------------
+      if (method === "POST" && !operator) {
+        throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+      }
       if (method === "POST" && p === "/api/missions") {
         return void json(res, 200, c.startMission({ ...(body as Record<string, string>), goal: String(body.goal ?? ""), project_id: String(body.project_id ?? ""), operator_id: operator } as never));
       }

@@ -633,7 +633,12 @@ export class RecoveryController {
       const unsettled = execs.filter((e) => !TERMINAL_EXEC.has(String(e.execution_state)));
       const receipts = unsettled.map((e) => reconcile(String(e.execution_id)));
       const attempts = this.store.list("recovery_attempt").filter((a) => a.mission_id === missionId);
-      const active = this.service.activeRevision(missionId);
+      // A mission that never committed a plan (created but never ticked)
+      // must not crash restart rehydration.
+      const revisions = this.store.planRevisions(missionId);
+      const active = revisions.length
+        ? this.service.activeRevision(missionId)
+        : { revision: 0, plan_id: "" };
       const checkpointId = `MRCP_${missionId}`;
       const existing = this.store.tryGet("mission_recovery_checkpoint", checkpointId);
       const checkpoint = {

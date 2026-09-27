@@ -150,7 +150,7 @@ export class GovernedTaskGate {
       ((mission.metadata as Record<string, unknown> | undefined)?.allowed_tools as
         | string[]
         | undefined) ?? null;
-    const requestedTools = (request.tools as string[]) ?? [];
+    const requestedTools = (request.requested_tools as string[]) ?? [];
     if (allowedTools) {
       const deniedTools = requestedTools.filter((t) => !allowedTools.includes(t));
       if (deniedTools.length) {
