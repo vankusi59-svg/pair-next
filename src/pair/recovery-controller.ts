@@ -246,10 +246,24 @@ export class RecoveryController {
     evidence_refs?: string[];
     correlation_id?: string;
     now?: string;
+    /**
+     * P9: operator-approved budget extensions. An APPROVED RECOVERY_APPROVAL
+     * grants a bounded one-off extension recorded by the runtime; the grant
+     * itself lives in the approval ledger — this only widens ceilings the
+     * operator explicitly approved. Never widens the matrix.
+     */
+    budget_extension?: { attempts_per_task?: number; attempts_per_mission?: number };
   }): Record<string, unknown> {
     if (!this.enabled()) {
       throw new PolicyError("FAIL_CLOSED_RECOVERY_DISABLED", input.mission_id);
     }
+    const policy: RecoveryPolicy = {
+      ...this.policy,
+      max_attempts_per_task:
+        this.policy.max_attempts_per_task + (input.budget_extension?.attempts_per_task ?? 0),
+      max_attempts_per_mission:
+        this.policy.max_attempts_per_mission + (input.budget_extension?.attempts_per_mission ?? 0),
+    };
     const taskId = input.task_id ?? "";
     const failureClass =
       input.failure_class ??
@@ -270,14 +284,15 @@ export class RecoveryController {
       for (const a of candidates) if (a !== selected) rejected.push({ action: a, reason });
     };
 
-    // Loop/escalation guards run BEFORE the matrix — hard ceilings.
-    if (counts.attempts_task >= this.policy.max_attempts_per_task) {
+    // Loop/escalation guards run BEFORE the matrix — hard ceilings
+    // (ceilings include any operator-approved budget extension).
+    if (counts.attempts_task >= policy.max_attempts_per_task) {
       selected = "HUMAN_APPROVAL_REQUIRED";
       rejectRest("MAX_RECOVERY_ATTEMPTS_PER_TASK");
-    } else if (counts.attempts_mission >= this.policy.max_attempts_per_mission) {
+    } else if (counts.attempts_mission >= policy.max_attempts_per_mission) {
       selected = "ABORT";
       rejectRest("MAX_RECOVERY_ATTEMPTS_PER_MISSION");
-    } else if (counts.consecutive_identical >= this.policy.max_consecutive_identical) {
+    } else if (counts.consecutive_identical >= policy.max_consecutive_identical) {
       selected = "HUMAN_APPROVAL_REQUIRED";
       rejectRest("MAX_CONSECUTIVE_IDENTICAL_FAILURES");
     } else {
@@ -290,7 +305,7 @@ export class RecoveryController {
           case "RETRY_SAME_ROUTE": {
             if (!RECOVERY_MATRIX[failureClass].retry_allowed) {
               rejected.push({ action, reason: "RETRY_NOT_ALLOWED_FOR_CLASS" });
-            } else if (counts.attempts_task >= this.policy.max_attempts_per_task) {
+            } else if (counts.attempts_task >= policy.max_attempts_per_task) {
               rejected.push({ action, reason: "RETRY_BUDGET_EXHAUSTED" });
             } else {
               selected = action;
@@ -308,7 +323,7 @@ export class RecoveryController {
             break;
           }
           case "REPLAN": {
-            if (counts.replans_mission >= this.policy.max_replans_per_mission) {
+            if (counts.replans_mission >= policy.max_replans_per_mission) {
               rejected.push({ action, reason: "MAX_REPLANS_PER_MISSION" });
             } else {
               selected = action;
@@ -318,7 +333,7 @@ export class RecoveryController {
           case "APPLY_VERIFIED_REMEDIATION": {
             if (!input.verified_remediation_ids?.length) {
               rejected.push({ action, reason: "NO_ACTIVE_COMPATIBLE_REMEDIATION" });
-            } else if (counts.remediations_signature >= this.policy.max_remediations_per_signature) {
+            } else if (counts.remediations_signature >= policy.max_remediations_per_signature) {
               rejected.push({ action, reason: "MAX_REMEDIATIONS_PER_FAILURE_SIGNATURE" });
             } else {
               selected = action;
@@ -336,8 +351,8 @@ export class RecoveryController {
     const backoffMs =
       selected === "RETRY_SAME_ROUTE"
         ? Math.min(
-            this.policy.retry_backoff_base_ms * 2 ** counts.attempts_task,
-            this.policy.retry_backoff_max_ms,
+            policy.retry_backoff_base_ms * 2 ** counts.attempts_task,
+            policy.retry_backoff_max_ms,
           )
         : 0;
 
@@ -354,7 +369,7 @@ export class RecoveryController {
       failure_signature: signature,
       policy_version: RECOVERY_MATRIX_VERSION,
       attempt_no: attemptNo,
-      retry_budget_remaining: Math.max(0, this.policy.max_attempts_per_task - attemptNo),
+      retry_budget_remaining: Math.max(0, policy.max_attempts_per_task - attemptNo),
       backoff_ms: backoffMs,
       candidate_actions: candidates,
       selected_action: selected,

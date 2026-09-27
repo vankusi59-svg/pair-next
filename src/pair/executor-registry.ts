@@ -24,6 +24,8 @@ export const TRANSPORT_IN_PROCESS = "IN_PROCESS";
 export const TRANSPORT_SUBPROCESS_WORKER = "SUBPROCESS_WORKER";
 /** vNext: the Automaton LocalWorkerPool in-process harness transport. */
 export const TRANSPORT_AUTOMATON_WORKER_POOL = "AUTOMATON_LOCAL_WORKER_POOL";
+/** P9: remote REST API executor transport (DEVIN). */
+export const TRANSPORT_REMOTE_API = "REMOTE_API";
 export const TRANSPORT_UNKNOWN = "UNKNOWN";
 
 /** Transports that may serve governed traffic (donor-qualified set + vNext pool). */
@@ -33,6 +35,7 @@ export const QUALIFIED_TRANSPORTS = new Set([
   TRANSPORT_IN_PROCESS,
   TRANSPORT_SUBPROCESS_WORKER,
   TRANSPORT_AUTOMATON_WORKER_POOL,
+  TRANSPORT_REMOTE_API,
 ]);
 
 /**
@@ -85,6 +88,13 @@ export const CANONICAL_IDENTITIES: Record<
     transport_type: TRANSPORT_ACP_STDIO,
     protocol_name: "ACP",
     protocol_version: 1,
+  },
+  DEVIN: {
+    logical_provider: "DEVIN",
+    adapter_id: "devin_api",
+    transport_type: TRANSPORT_REMOTE_API,
+    protocol_name: "DEVIN_REST_API",
+    protocol_version: "v3",
   },
 };
 

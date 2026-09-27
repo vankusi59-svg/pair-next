@@ -16,18 +16,21 @@ export const ROUTE_IDS: Record<string, string> = {
   DEEPSEEK_HARNESS: "RTE_DSH_ACP",
   CODEX: "RTE_CODEX_CLI",
   CODEX_ACP: "RTE_CODEX_ACP",
+  DEVIN: "RTE_DEVIN_API",
 };
 
 const ROUTE_KINDS_BY_EXECUTOR: Record<string, string> = {
   DEEPSEEK_HARNESS: "REMOTE_GATEWAY_API",
   CODEX: "REMOTE_GATEWAY_API",
   CODEX_ACP: "REMOTE_GATEWAY_API",
+  DEVIN: "REMOTE_GATEWAY_API",
 };
 
 const BINDING_MECHANISM_BY_EXECUTOR: Record<string, string> = {
   DEEPSEEK_HARNESS: "SPAWN_ENV",
   CODEX: "SPAWN_ENV",
   CODEX_ACP: "SPAWN_ENV",
+  DEVIN: "AMBIENT_FIXED",
 };
 
 export interface RegisteredExecutors {
@@ -104,9 +107,11 @@ export function registerGovernedExecutors(
           executor_hint: executorId,
           metadata: {
             executor_kind: String((adapter as { runtime_type?: string }).runtime_type ?? "EXTERNAL"),
-            transport: String((probe as { runtime_type?: string }).runtime_type ?? "").includes("ACP")
-              ? "ACP_STDIO"
-              : "NATIVE_CLI",
+            transport: executorId === "DEVIN"
+              ? "REMOTE_API"
+              : String((probe as { runtime_type?: string }).runtime_type ?? "").includes("ACP")
+                ? "ACP_STDIO"
+                : "NATIVE_CLI",
           },
         },
         actor,

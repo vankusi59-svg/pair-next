@@ -103,8 +103,32 @@ export class MissionRouter {
     }
 
     // 1. Executor eligibility — DISPATCH mode (all 12 gates, live qualify).
+    // P9: recovery actions may constrain the candidate set — RETRY_SAME_ROUTE
+    // pins executor_constraint; RE_ROUTE may exclude the failed executor via
+    // exclude_executors. Constraints never weaken the 12 gates: the filtered
+    // set still must pass every gate.
+    let candidates = adapters;
+    const constrain = request.executor_constraint
+      ? String(request.executor_constraint)
+      : null;
+    const excluded = new Set(
+      ((request.exclude_executors as string[]) ?? []).map(String),
+    );
+    if (constrain || excluded.size) {
+      candidates = new Map(
+        [...adapters].filter(
+          ([id]) => (constrain ? id === constrain : true) && !excluded.has(id),
+        ),
+      );
+      if (constrain && !candidates.has(constrain)) {
+        throw new PolicyError(
+          "FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR",
+          `executor_constraint:${constrain}:adapter_not_bound`,
+        );
+      }
+    }
     const routingDecision = this.capabilityRouter.route(task, {
-      adapters,
+      adapters: candidates,
       mode: "DISPATCH",
       correlationId,
       requiredPermissions: new Set(
@@ -118,6 +142,8 @@ export class MissionRouter {
       this.service.store.appendEvidence(missionId, "ROUTING_FAILED", {
         routing_decision_id: routingDecision.routing_decision_id,
         rejected: routingDecision.rejected_executors,
+        executor_constraint: constrain,
+        exclude_executors: [...excluded],
       });
       throw new PolicyError(
         "FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR",
