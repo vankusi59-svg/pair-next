@@ -253,6 +253,8 @@ export class GovernedTaskGate {
       allowed_paths: allowedPaths,
       permissions: requested,
       constraints: [...constraints],
+      requested_tools: (request.requested_tools as string[] | undefined) ?? [],
+      dependency_outputs: (request.dependency_outputs as unknown[] | undefined) ?? [],
       timeout,
       expected_output_contract: request.expected_output_contract,
       risk_class: riskClass,
