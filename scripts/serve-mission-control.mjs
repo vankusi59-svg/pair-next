@@ -88,15 +88,13 @@ const selfmod = new SelfImprovementController(service, {
   repoRoot: root,
   selfmodRoot: path.join(dir, "selfmod"),
 });
-const runtime = new MissionRuntime({
-  service, gate, router, adapters, scheduler, approvals, reconciliation: recon, recovery,
-  // UI-1 default planner: bounded PAIR_NATIVE file-write task. A real
-  // planner/plan-preview flow is UI-2 backend scope.
-  planner: (mission) => ({
+// UI-1/2 default planner: bounded PAIR_NATIVE file-write task. A real
+// planner is integration scope beyond the UI phases.
+const planner = (input) => ({
     tasks: [{
       task_key: "T1",
       title: "record mission goal",
-      task_instruction: String(mission.goal),
+      task_instruction: String(input.mission.goal),
       required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
       depends_on: [],
       metadata: {
@@ -104,7 +102,7 @@ const runtime = new MissionRuntime({
           type: "TASK_RESULT",
           worker_spec: {
             ops: [
-              { op: "write_text_file", path: "mission_goal.txt", content: String(mission.goal), idempotency_class: "WRITE", risk_class: "MEDIUM" },
+              { op: "write_text_file", path: "mission_goal.txt", content: String(input.mission.goal), idempotency_class: "WRITE", risk_class: "MEDIUM" },
               { op: "finish", result: { summary: "goal recorded" }, idempotency_class: "READ_ONLY", risk_class: "LOW" },
             ],
             limits: { max_ops: 4, timeout_seconds: 30 },
@@ -113,12 +111,15 @@ const runtime = new MissionRuntime({
         },
       },
     }],
-  }),
+});
+const runtime = new MissionRuntime({
+  service, gate, router, adapters, scheduler, approvals, reconciliation: recon, recovery,
+  planner,
 });
 const sup = new MissionSupervisor(service, runtime, recovery, recon);
 const control = new MissionControl({
   service, runtime, supervisor: sup, scheduler, approvals, reconciliation: recon,
-  observability: new MissionObservability(service), selfmod,
+  observability: new MissionObservability(service), selfmod, planner,
 });
 
 registry.register({

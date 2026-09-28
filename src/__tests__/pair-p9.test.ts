@@ -226,7 +226,7 @@ function makeCtx(name: string, opts: { planner?: PlannerFn; maxConcurrency?: num
   const observability = new MissionObservability(service);
   const control = new MissionControl({
     service, runtime, supervisor, scheduler, approvals,
-    reconciliation: recon, observability,
+    reconciliation: recon, observability, planner,
   });
   for (const c of ALL_CAPS) service.registerCapability(c, { risk_class: "LOW" });
   const project = service.createProject({ name: name, root_location: workspace });
@@ -1137,5 +1137,54 @@ describe("P9 §40 — Mission Control HTTP E2E", () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
+  it("preview runs planner + validator without creating canonical state", () => {
+    const ctx = makeCtx("pv1");
+    const preview = ctx.control.previewMission({ project_id: ctx.projectId, goal: "pv" });
+    expect(preview.plan.tasks).toHaveLength(1);
+    expect(preview.plan_digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("confirm_plan with matching digest dispatches; mismatch rejects before create", () => {
+    const ctx = makeCtx("pv2");
+    const input = {
+      project_id: ctx.projectId, goal: "ok",
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+    };
+    const preview = ctx.control.previewMission(input);
+    const m = ctx.control.startMission({
+      ...input,
+      confirm_plan: { digest: preview.plan_digest },
+      operator_id: "op",
+    });
+    expect(m.mission_id).toBeTruthy();
+    // same goal but different submitted input → preview digest won't match
+    const drifted = ctx.control.previewMission({ project_id: ctx.projectId, goal: "ok" });
+    expect(drifted.plan_digest).not.toBe(preview.plan_digest);
+    // mismatched digest → fail-closed reject, no mission persisted
+    const p2 = ctx.control.previewMission({ project_id: ctx.projectId, goal: "other" });
+    expect(() =>
+      ctx.control.startMission({
+        project_id: ctx.projectId, goal: "other",
+        confirm_plan: { digest: "0".repeat(64) },
+        operator_id: "op",
+      }),
+    ).toThrowError(/PLAN_DIGEST_MISMATCH/);
+    expect(ctx.store.list("mission")).toHaveLength(1);
+    expect(p2.plan_digest).not.toBe("0".repeat(64));
+  });
+
+  it("preview enforces validatePlanProposal fail-closed on bad plans", () => {
+    const ctx = makeCtx("pv3", {
+      planner: () => ({ tasks: [{ task_key: "T1", title: "x", required_capabilities: ["NOPE_CAP"], depends_on: [] }] }),
+    });
+    expect(() => ctx.control.previewMission({ project_id: ctx.projectId, goal: "bad" }))
+      .toThrowError(/FAIL_CLOSED/);
+    expect(ctx.store.list("mission")).toHaveLength(0);
   });
 });

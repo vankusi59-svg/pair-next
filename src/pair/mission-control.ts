@@ -17,10 +17,17 @@ import type { ReconciliationService } from "./reconciliation.js";
 import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
+import { digest } from "./canonical.js";
+import { validatePlanProposal } from "./proposal.js";
+import type { RuntimePlanner } from "./mission-runtime.js";
 
 export interface MissionControlDeps {
   service: PairControlPlane;
   runtime: MissionRuntime;
+  /** Same planner the runtime uses — required for §4.3 plan preview. */
+  planner?: RuntimePlanner;
+  /** Advisory retrieval only, mirrors runtime (never authoritative). */
+  plannerAdvisor?: { advise(opts: Record<string, unknown>): Record<string, unknown> };
   supervisor: MissionSupervisor;
   scheduler: MissionScheduler;
   approvals: ApprovalQueue;
@@ -137,6 +144,49 @@ export class MissionControl {
 
   /* ---------------- operator actions -------------------------------------- */
 
+  /**
+   * §4.3 plan preview — runs the injected planner + validator on a
+   * fabricated mission-shaped input and returns the validated task list
+   * with a sha256 digest. Creates NO canonical state.
+   */
+  previewMission(input: {
+    project_id: string;
+    goal: string;
+    metadata?: Record<string, unknown>;
+    granted_permissions?: string[];
+    authorized_workspaces?: string[];
+    risk_ceiling?: string;
+  }): { plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string } {
+    if (!this.deps.planner) {
+      throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "mission_control.preview");
+    }
+    // Planner sees only the mission fields it legitimately reads — the same
+    // record shape the runtime will later build from the created entity.
+    const pseudoMission: Record<string, unknown> = {
+      mission_id: "__preview__",
+      project_id: input.project_id,
+      goal: input.goal,
+      metadata: input.metadata ?? {},
+      granted_permissions: input.granted_permissions ?? [],
+      authorized_workspaces: input.authorized_workspaces ?? [],
+      risk_ceiling: input.risk_ceiling ?? null,
+    };
+    const proposal = this.deps.planner({ mission: pseudoMission, advice: null, reason: "initial" });
+    const knownCaps = new Set(
+      this.store.list("capability").map((c) => String(c.capability_id)),
+    );
+    const tasks = validatePlanProposal(proposal, knownCaps);
+    const plan_digest = digest({
+      project_id: input.project_id,
+      goal: input.goal,
+      granted_permissions: input.granted_permissions ?? [],
+      authorized_workspaces: input.authorized_workspaces ?? [],
+      risk_ceiling: input.risk_ceiling ?? null,
+      tasks,
+    });
+    return { plan: { tasks: tasks as unknown as Array<Record<string, unknown>> }, plan_digest };
+  }
+
   /** Create + queue a mission for orchestration. */
   startMission(input: {
     project_id: string;
@@ -146,7 +196,15 @@ export class MissionControl {
     authorized_workspaces?: string[];
     risk_ceiling?: string;
     operator_id?: string;
+    /** §4.3 two-step submit: the plan digest returned by previewMission. */
+    confirm_plan?: { digest: string };
   }): Record<string, unknown> {
+    if (input.confirm_plan?.digest) {
+      const preview = this.previewMission(input);
+      if (preview.plan_digest !== input.confirm_plan.digest) {
+        throw new PolicyError("FAIL_CLOSED_PLAN_DIGEST_MISMATCH", String(input.confirm_plan.digest).slice(0, 16));
+      }
+    }
     const mission = this.deps.service.createMission({
       project_id: input.project_id,
       goal: input.goal,

@@ -176,6 +176,11 @@ export function createMissionControlServer(
       if (method === "POST" && !operator) {
         throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
       }
+      // §4.3 two-step submit: preview creates no state; confirm must carry
+      // the exact plan digest the operator saw.
+      if (method === "POST" && p === "/api/missions/preview") {
+        return void json(res, 200, c.previewMission(body as Parameters<typeof c.previewMission>[0]));
+      }
       if (method === "POST" && p === "/api/missions") {
         return void json(res, 200, c.startMission({ ...(body as Record<string, string>), goal: String(body.goal ?? ""), project_id: String(body.project_id ?? ""), operator_id: operator } as never));
       }

@@ -49,10 +49,15 @@ export const api = {
   routing: () => req<import("./types").RoutingProjection>("/routing"),
   recovery: () => req<Record<string, unknown>>("/recovery"),
   approvals: () => req<Array<Record<string, unknown>>>("/approvals"),
-  startMission: (goal: string, projectId: string, opts: { granted_permissions?: string[]; authorized_workspaces?: string[] } = {}) =>
+  previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string }) =>
+    req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string }>("/missions/preview", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  startMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; confirm_plan?: { digest: string } }) =>
     req<Record<string, unknown>>("/missions", {
       method: "POST",
-      body: JSON.stringify({ goal, project_id: projectId, ...opts }),
+      body: JSON.stringify(input),
     }),
   missionAction: (id: string, action: "pause" | "resume" | "cancel" | "acknowledge") =>
     req<Record<string, unknown>>(`/missions/${id}/${action}`, { method: "POST", body: "{}" }),
