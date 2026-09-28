@@ -77,6 +77,20 @@ export class MissionControl {
     return this.deps.observability.missionSummary(missionId);
   }
 
+  /** Resolves the project outbox dir for a mission — remote executors push
+   *  binary deliverables (charts/screenshots) here via POST /api/outbox so
+   *  the delivery pipeline (Telegram bridge) can reach them. Unknown mission
+   *  → null (fail-closed: no upload lands outside a known project). */
+  missionOutboxDir(missionId: string): string | null {
+    const m = this.store.tryGet("mission", missionId) as Record<string, unknown> | null;
+    if (!m) return null;
+    const prj = this.store.tryGet("project", String(m.project_id ?? "")) as
+      | Record<string, unknown>
+      | null;
+    const root = String(prj?.root_location ?? "");
+    return root ? path.join(root, "outbox") : null;
+  }
+
   missionDag(missionId: string) {
     const tasks = this.deps.service.listTasks(missionId);
     return {

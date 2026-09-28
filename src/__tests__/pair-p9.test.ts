@@ -1421,6 +1421,52 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
       server.close();
     }
   });
+
+  it("POST /api/outbox accepts binary deliverables via narrow token only", async () => {
+    const ctx = makeCtx("obx1");
+    const server = createMissionControlServer({
+      control: ctx.control,
+      authToken: "mc-secret",
+      outboxToken: "outbox-secret",
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const mres = await fetch(`http://127.0.0.1:${port}/api/missions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-operator-id": "op",
+          authorization: "Bearer mc-secret",
+        },
+        body: JSON.stringify({ project_id: ctx.projectId, goal: "chart test" }),
+      });
+      const mission = (await mres.json()) as Record<string, unknown>;
+      const upload = (hdrs: Record<string, string>, body: Record<string, unknown>) =>
+        fetch(`http://127.0.0.1:${port}/api/outbox`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...hdrs },
+          body: JSON.stringify({ mission_id: mission.mission_id, task_id: "T2", ...body }),
+        });
+      // MC bearer does NOT open the outbox endpoint — only the narrow token does
+      expect((await upload({ authorization: "Bearer mc-secret" }, { filename: "a.png", data_base64: "aGk=" })).status).toBe(403);
+      // wrong/missing token rejected
+      expect((await upload({}, { filename: "a.png", data_base64: "aGk=" })).status).toBe(403);
+      // disallowed extension rejected
+      expect((await upload({ "x-outbox-token": "outbox-secret" }, { filename: "evil.sh", data_base64: "aGk=" })).status).toBe(400);
+      // valid png lands in the project outbox
+      const ok = await upload(
+        { "x-outbox-token": "outbox-secret" },
+        { filename: "chart.png", data_base64: Buffer.from("fakepng").toString("base64") },
+      );
+      expect(ok.status).toBe(200);
+      const written = path.join(ctx.workspace, "outbox", "T2-chart.png");
+      expect(fs.existsSync(written)).toBe(true);
+      expect(fs.readFileSync(written, "utf8")).toBe("fakepng");
+    } finally {
+      server.close();
+    }
+  });
 });
 
 describe("UI-3 §4.2 — provider/model/route read projections", () => {

@@ -415,6 +415,10 @@ const server = createMissionControlServer({
   // SSE). Unset = open local mode; always set it when the port is reachable
   // by anyone but you (e.g. a public preview URL).
   authToken: process.env.PAIR_MC_TOKEN || undefined,
+  // Narrow-scope upload token for remote executor file deliverables
+  // (POST /api/outbox). Separate from PAIR_MC_TOKEN on purpose — remote
+  // agents see this value in their prompt, so it must not grant API access.
+  outboxToken: process.env.PAIR_OUTBOX_TOKEN || undefined,
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

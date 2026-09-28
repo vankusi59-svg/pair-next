@@ -34,6 +34,13 @@ export interface MissionControlServerDeps {
    * and ask for the token. Unset → no gate (local dev default).
    */
   authToken?: string;
+  /**
+   * Narrow-scope token for `POST /api/outbox` — remote executors push binary
+   * deliverables (chart screenshots, report files) with
+   * `x-outbox-token: <token>`. Separate from authToken so remote agents never
+   * hold full API access; unset → the endpoint stays disabled.
+   */
+  outboxToken?: string;
 }
 
 const MIME: Record<string, string> = {
@@ -152,7 +159,9 @@ export function createMissionControlServer(
     const p = url.pathname;
     const method = req.method ?? "GET";
     const body = method === "POST" ? await readBody(req) : {};
-    if (deps.authToken && p.startsWith("/api/")) {
+    // POST /api/outbox has its own narrow token — exempt from the MC gate.
+    const isOutboxUpload = method === "POST" && p === "/api/outbox";
+    if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload) {
       const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
       const q = url.searchParams.get("token") ?? "";
       if (bearer !== deps.authToken && q !== deps.authToken) {
@@ -211,6 +220,37 @@ export function createMissionControlServer(
         });
         return;
       }
+      // Executor outbox ingress: remote sessions upload deliverable files
+      // (screenshots, reports) base64-encoded; stored in the mission's
+      // project outbox for the delivery pipeline to pick up.
+      if (isOutboxUpload) {
+        if (!deps.outboxToken || String(req.headers["x-outbox-token"] ?? "") !== deps.outboxToken) {
+          return void json(res, 403, { error: "UNAUTHORIZED_OUTBOX_TOKEN" });
+        }
+        const missionId = String(body.mission_id ?? "");
+        const outboxDir = c.missionOutboxDir(missionId);
+        if (!outboxDir) return void json(res, 404, { error: "unknown mission_id" });
+        const filename = path.basename(String(body.filename ?? "file")).replace(/[^\w.\-]/g, "_");
+        const ext = path.extname(filename).toLowerCase();
+        if (![".png", ".jpg", ".jpeg", ".webp", ".gif", ".md", ".txt"].includes(ext)) {
+          return void json(res, 400, { error: "file type not allowed" });
+        }
+        let buf: Buffer;
+        try {
+          buf = Buffer.from(String(body.data_base64 ?? ""), "base64");
+        } catch {
+          return void json(res, 400, { error: "invalid base64" });
+        }
+        if (!buf.length || buf.length > 8 * 1024 * 1024) {
+          return void json(res, 400, { error: "empty or oversize (>8MB)" });
+        }
+        fs.mkdirSync(outboxDir, { recursive: true });
+        const taskPrefix = String(body.task_id ?? "remote").replace(/[^\w.\-]/g, "_").slice(-40);
+        const dest = path.join(outboxDir, `${taskPrefix}-${filename}`);
+        fs.writeFileSync(dest, buf);
+        return void json(res, 200, { ok: true, path: dest, bytes: buf.length });
+      }
+
       if (method === "GET" && p === "/api/health") return void json(res, 200, c.health());
       if (method === "GET" && p === "/api/metrics") return void json(res, 200, c.metrics());
       if (method === "GET" && p === "/api/missions") {

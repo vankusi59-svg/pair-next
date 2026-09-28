@@ -287,13 +287,25 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
 
   private buildPrompt(task: Record<string, unknown>): string {
     const allowed = (task.allowed_paths as string[]) ?? [task.workspace];
-    return [
+    const lines = [
       `PAIR governed task ${String(task.task_id)} of mission ${String(task.mission_id)}.`,
       `Instruction: ${String(task.task_instruction ?? task.title ?? "")}`,
       `Workspace confinement: operate only inside ${String(task.workspace)}; allowed paths: ${allowed.join(", ")}.`,
       "Do not access unrelated credentials, environment variables, or paths outside the authorized scope.",
       `Correlation: ${String(task.correlation_id)}`,
-    ].join("\n");
+    ];
+    // File-deliverable return path: when the operator configured an outbox
+    // endpoint, remote artifacts (chart screenshots, report files) are pushed
+    // back over it — files written to the remote workspace stay remote and
+    // would otherwise be unreachable. The token is upload-only by design.
+    const outboxUrl = process.env.PAIR_OUTBOX_URL;
+    const outboxToken = process.env.PAIR_OUTBOX_TOKEN;
+    if (outboxUrl && outboxToken) {
+      lines.push(
+        `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${outboxToken}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE replying DONE.`,
+      );
+    }
+    return lines.join("\n");
   }
 
   dispatch(

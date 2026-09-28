@@ -59,6 +59,25 @@ function send(chatId, text) {
   );
 }
 
+const IMG_EXT = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+
+// Binary deliverable: photos go through sendPhoto (visible inline), other
+// allowed files through sendDocument. Multipart upload via FormData.
+async function sendFile(chatId, filePath) {
+  const name = path.basename(filePath);
+  const ext = path.extname(name).toLowerCase();
+  const method = IMG_EXT.has(ext) ? "sendPhoto" : "sendDocument";
+  const field = IMG_EXT.has(ext) ? "photo" : "document";
+  const fd = new FormData();
+  fd.append("chat_id", String(chatId));
+  fd.append(field, new Blob([fs.readFileSync(filePath)]), name);
+  fd.append("caption", `📎 ${name}`);
+  const res = await fetch(`${TG_API}/${method}`, { method: "POST", body: fd });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(`tg ${method}: ${res.status} ${String(data.description ?? "").slice(0, 150)}`);
+  return data.result;
+}
+
 // ---- Mission Control client ------------------------------------------------
 async function mc(method, p, body, operator) {
   const headers = { "content-type": "application/json" };
@@ -257,11 +276,17 @@ async function notifyLoop(allowList) {
       const outbox = path.join(String(prj.root_location ?? ""), "outbox");
       if (!outbox || !fs.existsSync(outbox)) continue;
       for (const f of fs.readdirSync(outbox)) {
-        if (!f.endsWith(".txt")) continue;
+        if (f.endsWith(".sent")) continue;
+        const ext = path.extname(f).toLowerCase();
+        if (![".txt", ".md", ".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext)) continue;
         const fp = path.join(outbox, f);
         try {
-          const content = fs.readFileSync(fp, "utf8").trim();
-          if (content) for (const c of allowList) await send(c, `📨 ${f}:\n\n${content}`);
+          if (ext === ".txt" || ext === ".md") {
+            const content = fs.readFileSync(fp, "utf8").trim();
+            if (content) for (const c of allowList) await send(c, `📨 ${f}:\n\n${content}`);
+          } else {
+            for (const c of allowList) await sendFile(c, fp);
+          }
           fs.renameSync(fp, fp + ".sent");
         } catch (e) {
           console.error("outbox send", fp, String(e).slice(0, 120));
