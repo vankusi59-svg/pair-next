@@ -97,30 +97,57 @@ const selfmod = new SelfImprovementController(service, {
   repoRoot: root,
   selfmodRoot: path.join(dir, "selfmod"),
 });
-// UI-1/2 default planner: bounded PAIR_NATIVE file-write task. A real
-// planner is integration scope beyond the UI phases.
-const planner = (input) => ({
-    tasks: [{
-      task_key: "T1",
-      title: "record mission goal",
-      task_instruction: String(input.mission.goal),
-      required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
-      depends_on: [],
-      metadata: {
-        expected_output_contract: {
-          type: "TASK_RESULT",
-          worker_spec: {
-            ops: [
-              { op: "write_text_file", path: "mission_goal.txt", content: String(input.mission.goal), idempotency_class: "WRITE", risk_class: "MEDIUM" },
-              { op: "finish", result: { summary: "goal recorded" }, idempotency_class: "READ_ONLY", risk_class: "LOW" },
-            ],
-            limits: { max_ops: 4, timeout_seconds: 30 },
-            allowed_ops: ["write_text_file", "finish"],
-          },
+// Demo planner: T1 records the goal via PAIR_NATIVE (guaranteed artifact),
+// T2 asks DSH (Gemini by default) to read it and produce analysis.txt — a
+// real governed LLM call routed by capability (REASONING is DSH-only).
+// Optional T3 Codex step when the goal mentions code/script/python.
+// Falls back to T1-only when governed executors are absent.
+const planner = (input) => {
+  const goal = String(input.mission.goal);
+  const tasks = [{
+    task_key: "T1",
+    title: "record mission goal",
+    task_instruction: goal,
+    required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+    depends_on: [],
+    metadata: {
+      expected_output_contract: {
+        type: "TASK_RESULT",
+        worker_spec: {
+          ops: [
+            { op: "write_text_file", path: "mission_goal.txt", content: goal, idempotency_class: "WRITE", risk_class: "MEDIUM" },
+            { op: "finish", result: { summary: "goal recorded" }, idempotency_class: "READ_ONLY", risk_class: "LOW" },
+          ],
+          limits: { max_ops: 4, timeout_seconds: 30 },
+          allowed_ops: ["write_text_file", "finish"],
         },
       },
-    }],
-});
+    },
+  }];
+  if (governed.has(DSH_EXECUTOR_ID)) {
+    tasks.push({
+      task_key: "T2",
+      title: "llm analysis (dsh)",
+      task_instruction:
+        "The workspace contains mission_goal.txt with the mission goal. Read it and create analysis.txt containing a short analysis of the goal, then reply DONE.",
+      required_capabilities: ["REASONING"],
+      depends_on: ["T1"],
+      metadata: {},
+    });
+  }
+  if (governed.has(CODEX_EXECUTOR_ID) && /codex|python|script|code/i.test(goal)) {
+    tasks.push({
+      task_key: "T3",
+      title: "codex step",
+      task_instruction:
+        "Create codex_out.txt in the workspace containing a short note implementing or summarizing the mission goal, then reply DONE.",
+      required_capabilities: ["PYTHON_EXECUTION"],
+      depends_on: ["T2"].filter((k) => tasks.some((t) => t.task_key === k)),
+      metadata: {},
+    });
+  }
+  return { tasks };
+};
 const runtime = new MissionRuntime({
   service, gate, router, adapters, scheduler, approvals, reconciliation: recon, recovery,
   planner,
@@ -144,7 +171,7 @@ registry.register({
   },
 });
 service.routes.seedPairNativeRoute();
-for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION"])
+for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION"])
   service.registerCapability(c, { risk_class: "LOW" });
 if (governed.size) {
   const reg = registerGovernedExecutors(service, governed, "PAIR_MC");
