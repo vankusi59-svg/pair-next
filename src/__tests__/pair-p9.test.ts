@@ -802,24 +802,75 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     expect((result.remote_refs as Record<string, unknown>).session_id).toBe("devin-s1");
   });
 
-  it("37b. Devin blocked session settles FAILED + REMOTE_INPUT_REQUIRED (immediate escalation)", () => {
+  it("37b. blocked persists past grace → FAILED + REMOTE_INPUT_REQUIRED; transient blocked stays RUNNING", () => {
     const ctx = makeCtx("t37b");
     const fetchFn: DevinFetch = (m) => ({
       status: 200,
       data: m === "GET" ? { status_enum: "blocked", url: "u-blocked" } : { session_id: "s1", url: "u-blocked" },
     });
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn });
+    let nowMs = 1_000_000;
+    const adapter = new DevinExecutorAdapter({
+      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn,
+      blockedGraceMs: 60_000, nowMs: () => nowMs,
+      now: () => new Date(nowMs).toISOString(),
+    });
     const disp = adapter.dispatch({
       executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
       task_id: "t", mission_id: "m", governed_task_id: "GT1",
       workspace: ctx.workspace, correlation_id: "c", allowed_paths: [ctx.workspace],
     });
+    // First blocked sighting → still RUNNING (transient turn-end protection)
+    const first = adapter.observe(String(disp.execution_id));
+    expect(first.status).toBe("RUNNING");
+    expect(first.remote_status_enum).toBe("blocked");
+    // Still blocked inside grace → still RUNNING
+    nowMs += 30_000;
+    expect(adapter.observe(String(disp.execution_id)).status).toBe("RUNNING");
+    // Past grace → terminal FAILED, never polls forever
+    nowMs += 31_000;
     const observed = adapter.observe(String(disp.execution_id));
-    expect(observed.status).toBe("FAILED"); // terminal — never polls forever
+    expect(observed.status).toBe("FAILED");
     const result = adapter.collect_result(String(disp.execution_id));
     expect(result.status).toBe("FAILED");
     expect((result.error as Record<string, unknown>).class).toBe("REMOTE_INPUT_REQUIRED");
     expect(String((result.error as Record<string, unknown>).detail)).toContain("u-blocked");
+  });
+
+  it("37bb. transient blocked → finished → COMPLETED with last devin_message as output", () => {
+    const ctx = makeCtx("t37bb");
+    let statusEnum = "blocked";
+    const fetchFn: DevinFetch = (m) => ({
+      status: 200,
+      data: m === "GET"
+        ? {
+            status_enum: statusEnum,
+            url: "u-x",
+            messages: [
+              { type: "initial_user_message", message: "do the thing" },
+              { type: "devin_message", message: "working…" },
+              { type: "devin_message", message: "final report text\n\nDONE" },
+            ],
+          }
+        : { session_id: "s1", url: "u-x" },
+    });
+    let nowMs = 2_000_000;
+    const adapter = new DevinExecutorAdapter({
+      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn,
+      blockedGraceMs: 60_000, nowMs: () => nowMs,
+      now: () => new Date(nowMs).toISOString(),
+    });
+    const disp = adapter.dispatch({
+      executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      task_id: "t", mission_id: "m", governed_task_id: "GT1",
+      workspace: ctx.workspace, correlation_id: "c", allowed_paths: [ctx.workspace],
+    });
+    expect(adapter.observe(String(disp.execution_id)).status).toBe("RUNNING");
+    statusEnum = "finished"; // session settles after the transient blocked
+    expect(adapter.observe(String(disp.execution_id)).status).toBe("COMPLETED");
+    const result = adapter.collect_result(String(disp.execution_id));
+    expect(result.status).toBe("COMPLETED");
+    // deliverable is the agent's reply text, not a bare enum
+    expect(String(result.output)).toContain("final report text");
   });
 
   it("37c. blocked → recovery escalates HUMAN_APPROVAL_REQUIRED, no retry", () => {

@@ -85,14 +85,21 @@ export interface DevinAdapterDeps {
    * BUDGET_EXCEEDED — recovery escalates to the operator instead of spending.
    */
   costGuard?: () => { allowed: boolean; reason?: string };
+  /** Grace window before a `blocked` remote session counts as
+   *  REMOTE_INPUT_REQUIRED. `blocked` is also emitted transiently when a
+   *  session's turn ends (waiting-for-user before `finished` flips) — failing
+   *  instantly kills completed-in-substance work. Defaults: env
+   *  PAIR_DEVIN_BLOCKED_GRACE_MS → 120000. */
+  blockedGraceMs?: number;
 }
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 
-/** Devin session status_enum → canonical execution state. `blocked` means the
- *  remote agent is waiting on operator input — it settles FAILED with error
- *  class REMOTE_INPUT_REQUIRED so recovery escalates to the operator
- *  immediately instead of polling a stalled session until TIMEOUT. */
+/** Devin session status_enum → canonical execution state. `blocked` is
+ *  handled in observe() with a grace window (see blockedGraceMs) — it is both
+ *  "agent needs operator input" and a transient state at turn end before the
+ *  enum settles to `finished`. Past the grace it settles FAILED with error
+ *  class REMOTE_INPUT_REQUIRED so recovery escalates to the operator. */
 function mapStatus(statusEnum: string): string {
   const s = statusEnum.toLowerCase();
   if (s === "finished") return "COMPLETED";
@@ -145,6 +152,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
   private readonly devinMode: string;
   private readonly fetchFn: DevinFetch;
   private readonly taskTimeoutMs: number;
+  private readonly blockedGraceMs: number;
   private readonly now: () => string;
   private readonly nowMs: () => number;
   private readonly journalRoot: string;
@@ -158,6 +166,8 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     this.fetchFn = deps.fetchFn ?? curlFetch;
     this.taskTimeoutMs =
       deps.taskTimeoutMs ?? (Number(process.env.PAIR_DEVIN_TASK_TIMEOUT_MS ?? 0) || DEFAULT_TASK_TIMEOUT_MS);
+    this.blockedGraceMs =
+      deps.blockedGraceMs ?? (Number(process.env.PAIR_DEVIN_BLOCKED_GRACE_MS ?? 0) || 120_000);
     this.now = deps.now ?? utcnow;
     this.nowMs = deps.nowMs ?? Date.now;
     this.journalRoot = deps.journalRoot;
@@ -402,7 +412,20 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       rec.finished_at = this.now();
     } else if (res.status < 400) {
       const statusEnum = String(res.data.status_enum ?? res.data.status ?? "");
-      if (statusEnum) {
+      if (statusEnum === "blocked") {
+        // `blocked` fires both when the agent truly needs operator input AND
+        // transiently at turn end (waiting-for-user before the enum settles
+        // to `finished`). Keep RUNNING inside the grace window; only escalate
+        // to REMOTE_INPUT_REQUIRED if it persists.
+        rec.remote_status_enum = "blocked";
+        if (!rec.blocked_since) rec.blocked_since = this.now();
+        const blockedMs = this.nowMs() - Date.parse(String(rec.blocked_since));
+        if (Number.isFinite(blockedMs) && blockedMs > this.blockedGraceMs) {
+          rec.status = "FAILED";
+          rec.finished_at = this.now();
+        }
+      } else if (statusEnum) {
+        delete rec.blocked_since;
         rec.status = mapStatus(statusEnum);
         rec.remote_status_enum = statusEnum;
         if (TERMINAL.has(String(rec.status))) rec.finished_at = this.now();
@@ -451,7 +474,22 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       correlation_id: rec.correlation_id,
       started_at: rec.started_at,
       completed_at: rec.finished_at ?? this.now(),
-      output: remoteDetail.structured_output ?? remoteDetail.status_enum ?? null,
+      // The deliverable for remote tasks is the agent's reply text — prefer
+      // structured_output, else the last devin_message (v1 returns messages
+      // inline; the standalone /messages endpoint does not exist), else the
+      // status enum.
+      output:
+        remoteDetail.structured_output ??
+        (Array.isArray(remoteDetail.messages)
+          ? (() => {
+              const last = [...(remoteDetail.messages as Array<Record<string, unknown>>)]
+                .reverse()
+                .find((m) => String(m.type) === "devin_message");
+              return last ? String(last.message ?? "") || null : null;
+            })()
+          : null) ??
+        remoteDetail.status_enum ??
+        null,
       artifacts: [],
       remote_refs: {
         session_id: remoteId || null,
