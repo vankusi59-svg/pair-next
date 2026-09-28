@@ -37,6 +37,9 @@ export function MissionNew() {
   } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [autoConfirm, setAutoConfirm] = useState<boolean>(
+    () => localStorage.getItem("pair.auto_confirm") === "1",
+  );
   const nav = useNavigate();
 
   const submitPayload = () => {
@@ -58,12 +61,24 @@ export function MissionNew() {
     setErr(null);
     try {
       const r = await api.previewMission(submitPayload());
-      setPreview({
+      const pv = {
         tasks: r.plan.tasks as unknown as PlanTask[],
         digest: r.plan_digest,
         source: r.plan_source,
         model: r.plan_model,
-      });
+      };
+      if (autoConfirm) {
+        // Auto-confirm: submit the previewed plan immediately — the digest
+        // check still runs server-side (fail-closed is preserved).
+        const m = await api.startMission({
+          ...submitPayload(),
+          confirm_plan: { digest: pv.digest },
+          metadata: pv.source ? { llm_plan: pv.tasks, plan_source: pv.source, plan_model: pv.model } : {},
+        });
+        nav(`/missions/${String(m.mission_id)}`);
+        return;
+      }
+      setPreview(pv);
     } catch (e) {
       setErr(String(e));
       setPreview(null);
@@ -110,12 +125,23 @@ export function MissionNew() {
           </option>
         ))}
       </select>
+      <label className="row" style={{ gap: 6, alignItems: "center" }}>
+        <input
+          type="checkbox"
+          checked={autoConfirm}
+          onChange={(e) => {
+            setAutoConfirm(e.target.checked);
+            localStorage.setItem("pair.auto_confirm", e.target.checked ? "1" : "0");
+          }}
+        />
+        auto-confirm — plan &amp; run in one click (digest check still enforced)
+      </label>
       {err && <div className="state err">{err}</div>}
 
       {!preview ? (
         <div className="row">
           <button disabled={busy || !goal.trim() || !projectId} onClick={doPreview}>
-            {busy ? "Planning…" : "Preview plan"}
+            {busy ? "Planning…" : autoConfirm ? "Plan & run" : "Preview plan"}
           </button>
         </div>
       ) : (
