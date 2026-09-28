@@ -423,7 +423,7 @@ describe("P5 selection", () => {
     );
     expect(journal.acp_session_id).toMatch(/^sess-/);
     expect(journal.resume_mechanism).toBe("resume"); // fixture advertises resume
-    expect(journal.post_session_setup.model_route).toEqual(["deepseek-official", "deepseek-v4-flash"]);
+    expect(journal.post_session_setup.model_route).toEqual(["gemini", "gemini-3.1-flash-lite"]);
   }, 40_000);
 
   it("6: CODEX selected for PYTHON_EXECUTION; real CLI dispatch completes", async () => {
@@ -865,6 +865,6 @@ describe("P5 handoff, normalization, evidence (18–22)", () => {
     expect(blob).not.toContain(FAKE_SECRET);
     expect(blob).not.toContain("P5_TEST_SECRET_VALUE");
     // env var NAMES may appear (credential_env), values may not.
-    expect(blob).toContain("DEEPSEEK_API_KEY");
+    expect(blob).toContain("GEMINI_API_KEY");
   }, 40_000);
 });

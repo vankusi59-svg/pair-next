@@ -20,8 +20,8 @@ export const FROZEN_DSH_PACKAGE_VERSION = "0.1.5-rc.3";
 export const DSH_ACP_AGENT_NAME = "deepseek-harness-acp";
 export const DSH_MODEL_CONFIG_ID = "model";
 export const DSH_DEFAULT_MODEL_ROUTE: readonly [string, string] = [
-  "deepseek-official",
-  "deepseek-v4-flash",
+  "gemini",
+  "gemini-3.1-flash-lite",
 ];
 export const DSH_OFFICIAL_CREDENTIAL_ENV = "DEEPSEEK_API_KEY";
 
