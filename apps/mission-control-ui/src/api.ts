@@ -1,0 +1,69 @@
+const BASE = "/api";
+
+export function getOperatorId(): string {
+  return localStorage.getItem("pair.operator_id") ?? "";
+}
+
+export function setOperatorId(id: string) {
+  localStorage.setItem("pair.operator_id", id.trim());
+}
+
+async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const op = getOperatorId();
+  if (op) headers["x-operator-id"] = op;
+  const r = await fetch(`${BASE}${path}`, { ...init, headers });
+  const text = await r.text();
+  let body: unknown = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = { error: "BAD_JSON", detail: text.slice(0, 300) };
+  }
+  if (!r.ok) {
+    const e = body as { error?: string; detail?: string };
+    throw new ApiError(r.status, e.error ?? "ERROR", e.detail ?? "");
+  }
+  return body as T;
+}
+
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    public detail: string,
+  ) {
+    super(`${code}: ${detail}`);
+  }
+}
+
+export const api = {
+  health: () => req<Record<string, unknown>>("/health"),
+  metrics: () => req<Record<string, unknown>>("/metrics"),
+  projects: () => req<Array<Record<string, unknown>>>("/projects"),
+  missions: () => req<{ missions: import("./types").Mission[] }>("/missions"),
+  missionDetail: (id: string) => req<import("./types").MissionDetail>(`/missions/${id}`),
+  missionDag: (id: string) => req<import("./types").Dag>(`/missions/${id}/dag`),
+  timeline: (id: string) => req<import("./types").TimelineEntry[]>(`/missions/${id}/timeline`),
+  evidence: (id: string) => req<Array<Record<string, unknown>>>(`/missions/${id}/evidence`),
+  routing: () => req<import("./types").RoutingProjection>("/routing"),
+  recovery: () => req<Record<string, unknown>>("/recovery"),
+  approvals: () => req<Array<Record<string, unknown>>>("/approvals"),
+  startMission: (goal: string, projectId: string, opts: { granted_permissions?: string[]; authorized_workspaces?: string[] } = {}) =>
+    req<Record<string, unknown>>("/missions", {
+      method: "POST",
+      body: JSON.stringify({ goal, project_id: projectId, ...opts }),
+    }),
+  missionAction: (id: string, action: "pause" | "resume" | "cancel" | "acknowledge") =>
+    req<Record<string, unknown>>(`/missions/${id}/${action}`, { method: "POST", body: "{}" }),
+  approve: (id: string, scope: Record<string, unknown>, reason?: string) =>
+    req<Record<string, unknown>>(`/approvals/${id}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ?? "", scope }),
+    }),
+  deny: (id: string, scope: Record<string, unknown>, reason?: string) =>
+    req<Record<string, unknown>>(`/approvals/${id}/deny`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ?? "", scope }),
+    }),
+};

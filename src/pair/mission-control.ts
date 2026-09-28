@@ -45,6 +45,10 @@ export class MissionControl {
 
   /* ---------------- read models ------------------------------------------ */
 
+  projects(): Array<Record<string, unknown>> {
+    return this.store.list("project");
+  }
+
   missions(): Array<Record<string, unknown>> {
     return this.store.list("mission").map((m) => {
       const rt = this.store.tryGet("mission_runtime", `MRT_${String(m.mission_id)}`);

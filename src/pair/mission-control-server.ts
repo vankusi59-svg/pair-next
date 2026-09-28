@@ -9,11 +9,38 @@
  */
 
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { MissionControl } from "./mission-control.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
+  /** Serve a built SPA (e.g. apps/mission-control-ui/dist) for non-/api GETs. */
+  staticDir?: string;
+}
+
+const MIME: Record<string, string> = {
+  ".html": "text/html",
+  ".js": "text/javascript",
+  ".css": "text/css",
+  ".json": "application/json",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+};
+
+function tryStatic(staticDir: string | undefined, pathname: string, res: http.ServerResponse): boolean {
+  if (!staticDir) return false;
+  const rel = pathname === "/" ? "index.html" : pathname.replace(/^\//, "");
+  const file = path.resolve(staticDir, rel);
+  if (!file.startsWith(path.resolve(staticDir))) return false;
+  const target = fs.existsSync(file) && fs.statSync(file).isFile() ? file : path.join(staticDir, "index.html");
+  if (!fs.existsSync(target)) return false;
+  res.writeHead(200, { "content-type": MIME[path.extname(target)] ?? "application/octet-stream" });
+  res.end(fs.readFileSync(target));
+  return true;
 }
 
 const UI_HTML = String.raw`<!doctype html>
@@ -116,9 +143,14 @@ export function createMissionControlServer(
     try {
       // ---- read models ----------------------------------------------------
       if (method === "GET" && (p === "/" || p === "/ui")) {
+        if (tryStatic(deps.staticDir, p, res)) return;
         res.writeHead(200, { "content-type": "text/html" });
         res.end(UI_HTML);
         return;
+      }
+      // SPA deep-link fallback for non-API GETs (e.g. /missions/xxx).
+      if (method === "GET" && !p.startsWith("/api/") && deps.staticDir) {
+        if (tryStatic(deps.staticDir, p, res)) return;
       }
       if (method === "GET" && p === "/api/health") return void json(res, 200, c.health());
       if (method === "GET" && p === "/api/metrics") return void json(res, 200, c.metrics());
@@ -133,6 +165,7 @@ export function createMissionControlServer(
       if (method === "GET" && m) return void json(res, 200, c.timeline(m[1]));
       m = p.match(/^\/api\/missions\/([^/]+)\/evidence$/);
       if (method === "GET" && m) return void json(res, 200, c.evidence(m[1]));
+      if (method === "GET" && p === "/api/projects") return void json(res, 200, c.projects());
       if (method === "GET" && p === "/api/routing") return void json(res, 200, c.routing());
       if (method === "GET" && p === "/api/recovery") return void json(res, 200, c.recovery());
       if (method === "GET" && p === "/api/approvals") return void json(res, 200, c.approvals());
