@@ -82,6 +82,13 @@ export class BusinessLayer {
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "business.create");
+    if (!String(input.name ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_BUSINESS_NAME", "business name required");
+    }
+    const projOk = this.deps.control.projects().some((p) => String(p.project_id) === input.project_id);
+    if (!projOk) {
+      throw new IntegrityError("FAIL_CLOSED_BUSINESS_PROJECT", `unknown project_id: ${input.project_id}`);
+    }
     const id = newId("BIZ");
     const row = {
       business_id: id,
@@ -122,6 +129,9 @@ export class BusinessLayer {
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "org_agent.create");
+    if (!String(input.title ?? "").trim() || !String(input.department ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_ORG_AGENT_FIELDS", "title and department required");
+    }
     this.getBusiness(input.business_id); // fail-closed: agent needs a real business
     if (input.reports_to) {
       const mgr = this.store.get("org_agent", input.reports_to);
@@ -185,6 +195,9 @@ export class BusinessLayer {
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.create");
+    if (!String(input.title ?? "").trim() || !String(input.goal ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_FIELDS", "title and goal required");
+    }
     this.getBusiness(input.business_id);
     let department = input.department ?? "";
     if (input.assignee_agent_id) {
@@ -456,6 +469,9 @@ export class BusinessLayer {
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "routine.create");
+    if (!String(input.name ?? "").trim() || !String(input.goal_template ?? "").trim() || !String(input.cron ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_ROUTINE_FIELDS", "name, goal_template and cron required");
+    }
     const business = this.getBusiness(input.business_id);
     let department = input.department ?? "";
     if (input.assignee_agent_id) {
