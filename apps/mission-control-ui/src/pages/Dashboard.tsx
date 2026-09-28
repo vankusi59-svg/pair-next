@@ -9,6 +9,7 @@ export function Dashboard() {
   const health = useApi(() => api.health());
   const missions = useApi(() => api.missions());
   const routing = useApi(() => api.routing());
+  const cost = useApi(() => api.cost());
   useLiveRefresh(missions.reload);
   useLiveRefresh(routing.reload);
   const [q, setQ] = useState("");
@@ -50,6 +51,13 @@ export function Dashboard() {
         <div className="card"><div className="k">Missions finished</div><div className="v">{finished.length}</div></div>
         <div className="card"><div className="k">Routable executors</div><div className="v">{(routing.data?.routable ?? []).length}</div></div>
         <div className="card"><div className="k">Approvals pending</div><div className="v">{String((health.data as Record<string, unknown>)?.approvals_pending ?? "—")}</div></div>
+        <div className="card" title="Remote Devin dispatches today vs the PAIR_MAX_REMOTE_TASKS_PER_DAY cap">
+          <div className="k">Remote spend (today)</div>
+          <div className="v">
+            {cost.data ? `${cost.data.remote_dispatches_today}/${cost.data.remote_daily_limit}` : "—"}
+            {cost.data?.cost_halt && <span className="badge st-failed" style={{ marginLeft: 6 }}>HALT</span>}
+          </div>
+        </div>
       </section>
 
       <section>

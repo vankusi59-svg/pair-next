@@ -91,6 +91,7 @@ export const api = {
       `/missions/${id}/files?path=${encodeURIComponent(p)}`,
     ),
   schedules: () => req<{ schedules: Array<Record<string, unknown>> }>("/schedules"),
+  cost: () => req<{ remote_dispatches_today: number; remote_daily_limit: number; cost_halt: boolean; schedules_active: number }>("/cost"),
   createSchedule: (input: { goal: string; cron: string; name?: string; project_id?: string }) =>
     req<Record<string, unknown>>("/schedules", { method: "POST", body: JSON.stringify(input) }),
   scheduleAction: (id: string, action: "enable" | "disable" | "delete") =>

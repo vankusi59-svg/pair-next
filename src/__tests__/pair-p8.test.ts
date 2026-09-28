@@ -350,8 +350,8 @@ describe("P8 §36 — failure classification + matrix", () => {
     })).toBe("ENVIRONMENT_INCOMPATIBLE");
   });
 
-  it("2. matrix covers all 25 failure classes with stable semantic fields", () => {
-    expect(Object.keys(RECOVERY_MATRIX).sort()).toHaveLength(25);
+  it("2. matrix covers all 26 failure classes with stable semantic fields", () => {
+    expect(Object.keys(RECOVERY_MATRIX).sort()).toHaveLength(26);
     for (const row of Object.values(RECOVERY_MATRIX)) {
       expect(row.actions.length).toBeGreaterThan(0);
       expect(typeof row.retry_allowed).toBe("boolean");

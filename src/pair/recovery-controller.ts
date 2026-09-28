@@ -42,6 +42,7 @@ export const FAILURE_CLASSES = [
   "PLAN_INVALIDATED",
   "ENVIRONMENT_INCOMPATIBLE",
   "REMOTE_INPUT_REQUIRED",
+  "BUDGET_EXCEEDED",
   "INTERNAL_RUNTIME_DEFECT",
   "UNKNOWN",
 ] as const;
@@ -93,6 +94,9 @@ export const RECOVERY_MATRIX: Record<FailureClass, MatrixRow> = {
   // unblock it (answer the session, supply a credential), so escalate
   // immediately; retrying just respawns a session that blocks again.
   REMOTE_INPUT_REQUIRED: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false },
+  // Operator-set spend cap hit — never auto-retry spending; the human either
+  // raises the budget (approve) or stops the mission (abort).
+  BUDGET_EXCEEDED: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false },
   INTERNAL_RUNTIME_DEFECT: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false, may_create_selfmod_candidate: true },
   UNKNOWN: { actions: ["RECONCILIATION_REQUIRED", "ABORT"], retry_allowed: false },
 };
@@ -119,6 +123,7 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = {
 
 const CLASS_RULES: Array<[RegExp, FailureClass]> = [
   [/REMOTE_INPUT_REQUIRED|AWAITING_INPUT|BLOCKED_AWAITING/i, "REMOTE_INPUT_REQUIRED"],
+  [/BUDGET_EXCEEDED|COST_HALT|SPEND_LIMIT/i, "BUDGET_EXCEEDED"],
   [/RATE_LIMIT|429|TPD|TPM|QUOTA/i, "RATE_LIMITED"],
   [/AUTH(ENTICATION)?_|CREDENTIAL|UNAUTHORIZED_401|LOGIN/i, "AUTHENTICATION_FAILURE"],
   [/AUTHORIZATION|FORBIDDEN|DENY_BY|403/i, "AUTHORIZATION_FAILURE"],

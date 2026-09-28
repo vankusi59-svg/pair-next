@@ -245,6 +245,8 @@ export function createMissionControlServer(
       if (method === "GET" && p === "/api/selfmod") return void json(res, 200, c.selfImprovement());
       // Recurring mission triggers (mission_schedule entities).
       if (method === "GET" && p === "/api/schedules") return void json(res, 200, { schedules: c.schedules() });
+      // Cost guard read model — remote spend usage vs the daily cap.
+      if (method === "GET" && p === "/api/cost") return void json(res, 200, c.cost());
 
       // ---- mutations (operator authority required) -------------------------
       if (method === "POST" && !operator) {

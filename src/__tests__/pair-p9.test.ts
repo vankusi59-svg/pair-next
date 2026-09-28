@@ -34,6 +34,7 @@ import {
   PromotionService,
   ReconciliationService,
   RecoveryController,
+  RECOVERY_MATRIX,
   SelfmodBootstrap,
   TRANSPORT_IN_PROCESS,
   TRANSPORT_REMOTE_API,
@@ -831,6 +832,69 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     });
     expect(decision.selected_action).toBe("HUMAN_APPROVAL_REQUIRED");
     expect(classifyFailure({ error_class: "REMOTE_INPUT_REQUIRED" })).toBe("REMOTE_INPUT_REQUIRED");
+  });
+
+  it("37d. cost guard reject → no remote session created, FAILED + BUDGET_EXCEEDED", () => {
+    const ctx = makeCtx("t37d");
+    let remoteCalls = 0;
+    const fetchFn: DevinFetch = () => {
+      remoteCalls++;
+      return { status: 200, data: { session_id: "should-never-happen" } };
+    };
+    const adapter = new DevinExecutorAdapter({
+      journalRoot: path.join(ctx.dir, "devin-j"),
+      apiKey: "cog_test",
+      fetchFn,
+      costGuard: () => ({ allowed: false, reason: "BUDGET_EXCEEDED: remote dispatch budget 10/10 reached" }),
+    });
+    const disp = adapter.dispatch({
+      executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      task_id: "t", mission_id: "m", governed_task_id: "GT1",
+      workspace: ctx.workspace, correlation_id: "c", allowed_paths: [ctx.workspace],
+    });
+    expect(disp.status).toBe("FAILED");
+    expect(remoteCalls).toBe(0); // fail-closed: no remote session was created
+    const result = adapter.collect_result(String(disp.execution_id));
+    expect(result.status).toBe("FAILED");
+    expect((result.error as Record<string, unknown>).class).toBe("BUDGET_EXCEEDED");
+    expect(String((result.error as Record<string, unknown>).detail)).toContain("budget");
+    // Idempotent: a second dispatch of the same task still creates no session.
+    const disp2 = adapter.dispatch({
+      executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      task_id: "t", mission_id: "m", governed_task_id: "GT1",
+      workspace: ctx.workspace, correlation_id: "c", allowed_paths: [ctx.workspace],
+    });
+    expect(disp2.status).toBe("FAILED");
+    expect(remoteCalls).toBe(0);
+  });
+
+  it("37e. BUDGET_EXCEEDED classify → HUMAN_APPROVAL_REQUIRED (never auto-retry spend)", () => {
+    const ctx = makeCtx("t37e");
+    expect(classifyFailure({ error_class: "BUDGET_EXCEEDED" })).toBe("BUDGET_EXCEEDED");
+    const decision = ctx.recovery.decide({
+      mission_id: "m",
+      task_id: "t",
+      failure_class: "BUDGET_EXCEEDED",
+      eligible_executors: ["DEVIN", "EX_B"],
+    });
+    expect(decision.selected_action).toBe("HUMAN_APPROVAL_REQUIRED");
+    // retry_allowed=false on the matrix row — no auto-retry of spending.
+    expect(RECOVERY_MATRIX.BUDGET_EXCEEDED.retry_allowed).toBe(false);
+    expect(RECOVERY_MATRIX.BUDGET_EXCEEDED.actions).toEqual(["HUMAN_APPROVAL_REQUIRED", "ABORT"]);
+    // Guard open again → dispatch proceeds normally.
+    const adapter = new DevinExecutorAdapter({
+      journalRoot: path.join(ctx.dir, "devin-j"),
+      apiKey: "cog_test",
+      fetchFn: () => ({ status: 200, data: { session_id: "s-ok", status_enum: "finished" } }),
+      costGuard: () => ({ allowed: true }),
+    });
+    const disp = adapter.dispatch({
+      executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      task_id: "t2", mission_id: "m", governed_task_id: "GT2",
+      workspace: ctx.workspace, correlation_id: "c", allowed_paths: [ctx.workspace],
+    });
+    expect(disp.status).not.toBe("FAILED");
+    expect(disp.remote_session_id).toBe("devin-s-ok");
   });
 });
 

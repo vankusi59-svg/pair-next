@@ -58,6 +58,7 @@ import {
   DEVIN_EXECUTOR_ID,
   DSH_EXECUTOR_ID,
   PAIR_NATIVE_EXECUTOR_ID,
+  utcnow,
 } from "../dist/pair/index.js";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -99,7 +100,31 @@ if (process.env.PAIR_DSH_HOME) governed.set(DSH_EXECUTOR_ID, new DshExecutorAdap
 if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
-governed.set(DEVIN_EXECUTOR_ID, new DevinExecutorAdapter({ journalRoot }));
+// Cost guard — caps remote Devin dispatches per UTC day (ACU spend) and the
+// PAIR_COST_HALT=1 kill-switch. Rejections settle FAILED/BUDGET_EXCEEDED →
+// recovery escalates to the operator instead of silently spending.
+const MAX_REMOTE_PER_DAY = Number(process.env.PAIR_MAX_REMOTE_TASKS_PER_DAY ?? 10);
+const remoteDispatchesToday = () => {
+  const today = utcnow().slice(0, 10);
+  return service.store
+    .list("executor_execution")
+    .filter((e) => String(e.executor_id) === DEVIN_EXECUTOR_ID && String(e.created_at ?? "").startsWith(today))
+    .length;
+};
+governed.set(
+  DEVIN_EXECUTOR_ID,
+  new DevinExecutorAdapter({
+    journalRoot,
+    costGuard: () => {
+      if (process.env.PAIR_COST_HALT === "1")
+        return { allowed: false, reason: "COST_HALT: PAIR_COST_HALT=1 set — all remote dispatch blocked" };
+      const n = remoteDispatchesToday();
+      if (n >= MAX_REMOTE_PER_DAY)
+        return { allowed: false, reason: `BUDGET_EXCEEDED: remote dispatch budget ${n}/${MAX_REMOTE_PER_DAY} per day reached` };
+      return { allowed: true };
+    },
+  }),
+);
 for (const [id, a] of governed) adapters.set(id, a);
 
 const gate = new GovernedTaskGate(service);

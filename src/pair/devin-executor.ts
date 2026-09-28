@@ -79,6 +79,12 @@ export interface DevinAdapterDeps {
   now?: () => string;
   /** Injectable epoch-ms clock for timeout checks — defaults Date.now. */
   nowMs?: () => number;
+  /**
+   * Cost guard evaluated before any remote session is created. Returning
+   * `{allowed:false}` settles the dispatch FAILED with error class
+   * BUDGET_EXCEEDED — recovery escalates to the operator instead of spending.
+   */
+  costGuard?: () => { allowed: boolean; reason?: string };
 }
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
@@ -142,6 +148,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
   private readonly now: () => string;
   private readonly nowMs: () => number;
   private readonly journalRoot: string;
+  private readonly costGuard?: () => { allowed: boolean; reason?: string };
 
   constructor(deps: DevinAdapterDeps) {
     this.apiKey = deps.apiKey ?? process.env.PAIR_DEVIN_API_KEY ?? null;
@@ -154,6 +161,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     this.now = deps.now ?? utcnow;
     this.nowMs = deps.nowMs ?? Date.now;
     this.journalRoot = deps.journalRoot;
+    this.costGuard = deps.costGuard;
     fs.mkdirSync(deps.journalRoot, { recursive: true });
   }
 
@@ -296,6 +304,34 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       const { result: _omit, ...out } = existing;
       return { ...out };
     }
+    // Cost guard: no remote session is created when the operator-configured
+    // budget/halt check rejects — the dispatch settles FAILED immediately.
+    const guard = this.costGuard?.();
+    if (guard && !guard.allowed) {
+      const runRoot0 = path.join(this.journalRoot, executionId);
+      fs.mkdirSync(runRoot0, { recursive: true });
+      const record: Record<string, unknown> = {
+        executor_id: this.executor_id,
+        execution_id: executionId,
+        mission_id: task.mission_id,
+        task_id: task.task_id,
+        governed_task_id: task.governed_task_id,
+        correlation_id: task.correlation_id,
+        workspace: task.workspace,
+        status: "FAILED",
+        started_at: this.now(),
+        finished_at: this.now(),
+        remote_session_id: null,
+        remote_url: null,
+        budget_rejection: guard.reason ?? "cost guard rejected dispatch",
+      };
+      this.executions.set(executionId, record);
+      atomicWriteJson(path.join(runRoot0, "devin-dispatch.json"), {
+        record,
+        remote_session_id: null,
+      });
+      return { ...record };
+    }
     const body = (mode: string): Record<string, unknown> => ({
       prompt: this.buildPrompt(task),
       idempotent: true,
@@ -425,6 +461,8 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       error:
         status === "COMPLETED"
           ? null
+          : rec.budget_rejection
+            ? { class: "BUDGET_EXCEEDED", detail: String(rec.budget_rejection) }
           : rec.remote_status_enum === "blocked"
             ? {
                 class: "REMOTE_INPUT_REQUIRED",

@@ -21,7 +21,7 @@ import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { projectRoutableModels } from "./model-routable.js";
-import { digest, sha256Hex } from "./canonical.js";
+import { digest, sha256Hex, utcnow } from "./canonical.js";
 import { validatePlanProposal } from "./proposal.js";
 import type { RuntimePlanner } from "./mission-runtime.js";
 
@@ -430,6 +430,25 @@ export class MissionControl {
         }),
       now,
     );
+  }
+
+  /** Cost-guard read model — remote dispatch usage vs the daily cap. */
+  cost(): Record<string, unknown> {
+    const today = utcnow().slice(0, 10);
+    const todayRemote = this.store
+      .list("executor_execution")
+      .filter(
+        (e) =>
+          String(e.executor_id ?? "") === "DEVIN" &&
+          String(e.created_at ?? "").startsWith(today),
+      );
+    const limit = Number(process.env.PAIR_MAX_REMOTE_TASKS_PER_DAY ?? 10);
+    return {
+      remote_dispatches_today: todayRemote.length,
+      remote_daily_limit: limit,
+      cost_halt: process.env.PAIR_COST_HALT === "1",
+      schedules_active: this.deps.schedules?.list().filter((s) => s.enabled && !s.deleted).length ?? 0,
+    };
   }
 
   requestReconciliation(missionId: string, operatorId?: string, executionId?: string) {
