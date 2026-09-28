@@ -413,6 +413,13 @@ const planExpander = async (input) => {
     allowedCapabilities: LLM_PLANNER_CAPS,
     capabilitySets: executorCapSets(),
   });
+  if (!res.tasks.length) {
+    // Degenerate/unusable plan — fail closed: a T1-only plan would run and
+    // report COMPLETED having done nothing. FAIL_CLOSED_* code → HTTP 409.
+    const e = new Error(`planner produced no usable task plan (${res.warnings.join(",") || "none"})`);
+    e.code = "FAIL_CLOSED_PLAN_DEGENERATE";
+    throw e;
+  }
   return {
     ...input,
     metadata: {

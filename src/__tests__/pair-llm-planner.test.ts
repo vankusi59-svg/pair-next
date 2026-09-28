@@ -62,23 +62,25 @@ describe("P-UI-6 llm-planner", () => {
     expect(r.tasks).toHaveLength(2);
   });
 
-  it("falls back on non-JSON output", async () => {
+  it("rejects (empty tasks) on non-JSON output — fail closed, no vacuous T1 plan", async () => {
     const r = await llmPlan("goal", { ...CFG, fetchFn: okFetch("sorry, I cannot") });
     expect(r.source).toBe("FALLBACK");
+    expect(r.tasks).toHaveLength(0);
     expect(r.warnings).toContain("LLM_PLAN_NO_JSON");
-    expect(r.tasks[0].task_key).toBe("T1");
+    expect(r.warnings).toContain("LLM_PLAN_DEGENERATE");
   });
 
-  it("falls back on HTTP error", async () => {
+  it("rejects (empty tasks) on HTTP error", async () => {
     const r = await llmPlan("goal", {
       ...CFG,
       fetchFn: (async () => new Response("nope", { status: 500 })) as typeof fetch,
     });
     expect(r.source).toBe("FALLBACK");
+    expect(r.tasks).toHaveLength(0);
     expect(r.warnings[0]).toBe("LLM_PLANNER_HTTP_500");
   });
 
-  it("falls back on request failure/timeout", async () => {
+  it("rejects (empty tasks) on request failure/timeout", async () => {
     const r = await llmPlan("goal", {
       ...CFG,
       fetchFn: (async () => {
@@ -86,12 +88,73 @@ describe("P-UI-6 llm-planner", () => {
       }) as typeof fetch,
     });
     expect(r.source).toBe("FALLBACK");
+    expect(r.tasks).toHaveLength(0);
   });
 
-  it("falls back when the credential env var is unset", async () => {
+  it("rejects (empty tasks) when the credential env var is unset", async () => {
     const r = await llmPlan("goal", { ...CFG, env: {} as NodeJS.ProcessEnv, fetchFn: okFetch(VALID_PLAN) });
     expect(r.source).toBe("FALLBACK");
+    expect(r.tasks).toHaveLength(0);
     expect(r.warnings).toContain("LLM_PLANNER_NO_CREDENTIAL");
+  });
+
+  it("rejects a degenerate plan that only contains the T1 bookkeeping task", async () => {
+    const T1_ONLY = JSON.stringify({
+      tasks: [
+        {
+          task_key: "T1",
+          title: "record mission goal",
+          task_instruction: "write goal to mission_goal.txt, then reply DONE.",
+          required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+          depends_on: [],
+        },
+      ],
+    });
+    let calls = 0;
+    const r = await llmPlan("goal", {
+      ...CFG,
+      fetchFn: (async () => {
+        calls++;
+        return new Response(JSON.stringify({ choices: [{ message: { content: T1_ONLY } }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+    });
+    expect(calls).toBe(2); // replanned once, still degenerate
+    expect(r.source).toBe("FALLBACK");
+    expect(r.tasks).toHaveLength(0);
+    expect(r.warnings).toContain("LLM_PLAN_DEGENERATE");
+  });
+
+  it("replans once and accepts the second plan when the first is degenerate", async () => {
+    const T1_ONLY = JSON.stringify({
+      tasks: [
+        {
+          task_key: "T1",
+          title: "record mission goal",
+          task_instruction: "write goal to mission_goal.txt, then reply DONE.",
+          required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+          depends_on: [],
+        },
+      ],
+    });
+    let calls = 0;
+    const r = await llmPlan("goal", {
+      ...CFG,
+      fetchFn: (async () => {
+        calls++;
+        const content = calls === 1 ? T1_ONLY : VALID_PLAN;
+        return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch,
+    });
+    expect(calls).toBe(2);
+    expect(r.source).toBe("LLM");
+    expect(r.tasks).toHaveLength(2);
+    expect(r.warnings).toContain("LLM_PLAN_DEGENERATE");
   });
 
   it("drops capabilities outside the whitelist and drops tasks left with none", () => {

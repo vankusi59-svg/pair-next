@@ -14,6 +14,8 @@ import { PolicyError } from "./errors.js";
 export const LLM_PLANNER_MAX_INSTRUCTION = 2000;
 export const LLM_PLANNER_DEFAULT_MAX_TASKS = 5;
 export const LLM_PLANNER_DEFAULT_TIMEOUT_MS = 20000;
+/** A usable plan always has >=2 tasks: T1 only records the goal. */
+export const LLM_PLANNER_MIN_TASKS = 2;
 
 export interface LlmPlannerConfig {
   /** Provider chat/completions URL (P6 endpoint_reference). */
@@ -228,15 +230,18 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
   const apiKey = envGet(cfg.env, cfg.credentialEnv);
   const fetchImpl = cfg.fetchFn ?? fetch;
 
-  const fallback = (warnings: string[]): LlmPlanResult => ({
-    tasks: fallbackTasks(goal),
+  // Fail closed on unusable plans: tasks=[] signals "no plan" — the caller
+  // must reject submission rather than silently run the T1-only bookkeeping
+  // plan, which would execute nothing yet report COMPLETED (seen live).
+  const reject = (warnings: string[]): LlmPlanResult => ({
+    tasks: [],
     source: "FALLBACK",
     model: cfg.model,
     warnings,
   });
 
-  if (!apiKey) return fallback(["LLM_PLANNER_NO_CREDENTIAL"]);
-  if (!cfg.allowedCapabilities.length) return fallback(["LLM_PLANNER_NO_CAPS"]);
+  if (!apiKey) return reject(["LLM_PLANNER_NO_CREDENTIAL"]);
+  if (!cfg.allowedCapabilities.length) return reject(["LLM_PLANNER_NO_CAPS"]);
 
   const userPrompt =
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +
@@ -246,45 +251,60 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
       : "") +
     `\nMISSION GOAL:\n${goal}`;
 
-  let text: string;
-  try {
-    const resp = await fetchImpl(cfg.endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0.2,
-        max_tokens: 2048,
-      }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!resp.ok) return fallback([`LLM_PLANNER_HTTP_${resp.status}`]);
-    const data = (await resp.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    text = String(data.choices?.[0]?.message?.content ?? "");
-  } catch (e) {
-    const name = e instanceof Error ? e.name : "UNKNOWN";
-    return fallback([`LLM_PLANNER_REQUEST_${name === "TimeoutError" || name === "AbortError" ? "TIMEOUT" : "ERROR"}`]);
-  }
+  // One attempt: fetch + parse + sanitize into a task DAG (or warnings).
+  const attempt = async (): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }> => {
+    let text: string;
+    try {
+      const resp = await fetchImpl(cfg.endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: cfg.model,
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: userPrompt },
+          ],
+          temperature: 0.2,
+          max_tokens: 2048,
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) return { tasks: [], warnings: [`LLM_PLANNER_HTTP_${resp.status}`] };
+      const data = (await resp.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      text = String(data.choices?.[0]?.message?.content ?? "");
+    } catch (e) {
+      const name = e instanceof Error ? e.name : "UNKNOWN";
+      return { tasks: [], warnings: [`LLM_PLANNER_REQUEST_${name === "TimeoutError" || name === "AbortError" ? "TIMEOUT" : "ERROR"}`] };
+    }
 
-  let parsed: unknown;
-  try {
-    parsed = extractJson(text);
-  } catch {
-    return fallback(["LLM_PLAN_NO_JSON"]);
-  }
-  const rawTasks = (parsed as { tasks?: unknown })?.tasks;
-  if (!Array.isArray(rawTasks) || !rawTasks.length) return fallback(["LLM_PLAN_NO_TASKS"]);
+    let parsed: unknown;
+    try {
+      parsed = extractJson(text);
+    } catch {
+      return { tasks: [], warnings: ["LLM_PLAN_NO_JSON"] };
+    }
+    const rawTasks = (parsed as { tasks?: unknown })?.tasks;
+    if (!Array.isArray(rawTasks) || !rawTasks.length) return { tasks: [], warnings: ["LLM_PLAN_NO_TASKS"] };
 
-  const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], cfg.allowedCapabilities, maxTasks, cfg.capabilitySets);
-  if (!tasks.length) return fallback(["LLM_PLAN_ALL_INVALID", ...warnings]);
-  return { tasks, source: "LLM", model: cfg.model, warnings };
+    const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], cfg.allowedCapabilities, maxTasks, cfg.capabilitySets);
+    if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
+    return { tasks, warnings };
+  };
+
+  // Degenerate output (fewer than MIN_TASKS usable tasks — a T1-only plan
+  // only records the goal and performs no work) replans once, then rejects.
+  const warnings: string[] = [];
+  for (let i = 0; i < 2; i++) {
+    const a = await attempt();
+    if (a.tasks.length >= LLM_PLANNER_MIN_TASKS) {
+      return { tasks: a.tasks, source: "LLM", model: cfg.model, warnings: [...warnings, ...a.warnings] };
+    }
+    warnings.push(...a.warnings, "LLM_PLAN_DEGENERATE");
+  }
+  return reject(warnings);
 }
