@@ -37,8 +37,9 @@ export function MissionNew() {
   } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Default ON — only an explicit stored "0" turns auto-confirm off.
   const [autoConfirm, setAutoConfirm] = useState<boolean>(
-    () => localStorage.getItem("pair.auto_confirm") === "1",
+    () => localStorage.getItem("pair.auto_confirm") !== "0",
   );
   const nav = useNavigate();
 
