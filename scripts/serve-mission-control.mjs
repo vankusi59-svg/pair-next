@@ -62,7 +62,12 @@ import {
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const dir = process.env.PAIR_MC_DIR ?? path.join(root, ".pair-mc");
 fs.mkdirSync(dir, { recursive: true });
-const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+// Reuse an existing project's workspace on restart — durable state survives
+// reboots; only mint a new ws-* dir when no project exists yet.
+const persistedProjects = new PairEvidenceStore(path.join(dir, "pair.db")).list("project");
+const workspace = persistedProjects[0]?.root_location
+  ? String(persistedProjects[0].root_location)
+  : fs.mkdtempSync(path.join(dir, "ws-"));
 const journalRoot = path.join(dir, "journal");
 fs.mkdirSync(journalRoot, { recursive: true });
 
@@ -237,7 +242,9 @@ if (governed.size) {
   });
   console.log("ROUTABLE:", reg.routable.join(", "));
 }
-service.createProject({ name: "default", root_location: workspace });
+if (!persistedProjects.length) {
+  service.createProject({ name: "default", root_location: workspace });
+}
 
 // §4.2 — populate provider/model catalogs from canonical discovery sources
 // (dsh settings, executor-advertised observations). Read-only projections.
@@ -370,6 +377,10 @@ const server = createMissionControlServer({
   control,
   staticDir: fs.existsSync(path.join(uiDir, "index.html")) ? uiDir : undefined,
   planExpander,
+  // PAIR_MC_TOKEN gates every /api/* request (Bearer header or ?token= for
+  // SSE). Unset = open local mode; always set it when the port is reachable
+  // by anyone but you (e.g. a public preview URL).
+  authToken: process.env.PAIR_MC_TOKEN || undefined,
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

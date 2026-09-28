@@ -2,6 +2,7 @@
 // canonical entity events. Buffers the last N events for the observability
 // stream and notifies subscribers so pages can reload their projections.
 import { useEffect, useRef, useState } from "react";
+import { withTokenQuery } from "../api";
 
 export interface EntityEvent {
   seq?: number;
@@ -24,7 +25,7 @@ let status: "open" | "closed" = "closed";
 
 function ensure() {
   if (es) return;
-  es = new EventSource("/api/events");
+  es = new EventSource(withTokenQuery("/api/events"));
   es.onopen = () => {
     status = "open";
     onStatus?.(status);

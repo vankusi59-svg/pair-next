@@ -222,7 +222,7 @@ export class PairControlPlane {
     const saved = this.store.put(
       "executor",
       executorId,
-      { ...record, executor_id: executorId },
+      { ...record, executor_id: executorId, version: existing ? Number(existing.version) : 0 },
       existing ? Number(existing.version) : 0,
     );
     this.store.event({
@@ -260,6 +260,7 @@ export class PairControlPlane {
   }
 
   registerCapability(capabilityId: string, params: { risk_class?: string; metadata?: Record<string, unknown> } = {}): Record<string, unknown> {
+    const existingVersion = this.store.tryGet("capability", capabilityId)?.version ?? 0;
     return this.store.put(
       "capability",
       capabilityId,
@@ -267,9 +268,9 @@ export class PairControlPlane {
         capability_id: capabilityId,
         risk_class: params.risk_class ?? "LOW",
         metadata: params.metadata ?? {},
-        version: 0,
+        version: existingVersion,
       },
-      this.store.tryGet("capability", capabilityId)?.version ?? 0,
+      existingVersion,
     );
   }
 

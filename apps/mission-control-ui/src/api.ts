@@ -8,10 +8,26 @@ export function setOperatorId(id: string) {
   localStorage.setItem("pair.operator_id", id.trim());
 }
 
+export function getAuthToken(): string {
+  return localStorage.getItem("pair.mc_token") ?? "";
+}
+
+export function setAuthToken(tok: string) {
+  localStorage.setItem("pair.mc_token", tok.trim());
+}
+
+export function withTokenQuery(url: string): string {
+  const tok = getAuthToken();
+  if (!tok) return url;
+  return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(tok);
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   const op = getOperatorId();
   if (op) headers["x-operator-id"] = op;
+  const tok = getAuthToken();
+  if (tok) headers["authorization"] = `Bearer ${tok}`;
   const r = await fetch(`${BASE}${path}`, { ...init, headers });
   const text = await r.text();
   let body: unknown = {};
@@ -22,6 +38,10 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!r.ok) {
     const e = body as { error?: string; detail?: string };
+    if (r.status === 401) {
+      const t = window.prompt("Mission Control access token:");
+      if (t !== null) { setAuthToken(t); window.location.reload(); }
+    }
     throw new ApiError(r.status, e.error ?? "ERROR", e.detail ?? "");
   }
   return body as T;

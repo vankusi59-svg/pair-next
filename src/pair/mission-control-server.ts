@@ -27,6 +27,13 @@ export interface MissionControlServerDeps {
   planExpander?: (
     input: Record<string, unknown>,
   ) => Promise<Record<string, unknown>>;
+  /**
+   * Optional bearer token gate: when set, every `/api/*` request must carry
+   * `Authorization: Bearer <token>` (or `?token=` for SSE EventSource, which
+   * cannot send headers). Static SPA assets stay public so the UI can load
+   * and ask for the token. Unset → no gate (local dev default).
+   */
+  authToken?: string;
 }
 
 const MIME: Record<string, string> = {
@@ -145,6 +152,15 @@ export function createMissionControlServer(
     const p = url.pathname;
     const method = req.method ?? "GET";
     const body = method === "POST" ? await readBody(req) : {};
+    if (deps.authToken && p.startsWith("/api/")) {
+      const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+      const q = url.searchParams.get("token") ?? "";
+      if (bearer !== deps.authToken && q !== deps.authToken) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "UNAUTHORIZED_MC_TOKEN" }));
+        return;
+      }
+    }
     const operator =
       String(req.headers["x-operator-id"] ?? "") ||
       String(body.operator_id ?? "") ||

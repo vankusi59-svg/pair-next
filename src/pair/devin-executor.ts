@@ -40,6 +40,10 @@ const DEFAULT_BASE_URL = "https://api.devin.ai";
 const DEFAULT_ORG_ID = "org-95faaf8c42dc4b2eb6d9e17a5fc5fe90";
 const DEFAULT_DEVIN_MODE = "swe-2-max";
 const DEVIN_MODE_FALLBACK = "swe-2-high";
+/** Remote sessions mapped to non-terminal states (e.g. `blocked` awaiting
+ *  input) cannot hold a mission task open forever — past this deadline the
+ *  execution is reported TIMEOUT and recovery takes over. */
+const DEFAULT_TASK_TIMEOUT_MS = 15 * 60_000;
 
 export interface DevinResponse {
   status: number;
@@ -68,7 +72,13 @@ export interface DevinAdapterDeps {
   baseUrl?: string;
   /** Injectable synchronous transport — omit to use the curl transport. */
   fetchFn?: DevinFetch;
+  /** Max wall-clock a remote session may stay non-terminal before the
+   *  execution reports TIMEOUT. Defaults: env PAIR_DEVIN_TASK_TIMEOUT_MS
+   *  → 15 minutes. */
+  taskTimeoutMs?: number;
   now?: () => string;
+  /** Injectable epoch-ms clock for timeout checks — defaults Date.now. */
+  nowMs?: () => number;
 }
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
@@ -124,7 +134,9 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
   private readonly baseUrl: string;
   private readonly devinMode: string;
   private readonly fetchFn: DevinFetch;
+  private readonly taskTimeoutMs: number;
   private readonly now: () => string;
+  private readonly nowMs: () => number;
   private readonly journalRoot: string;
 
   constructor(deps: DevinAdapterDeps) {
@@ -133,7 +145,10 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     this.baseUrl = deps.baseUrl ?? DEFAULT_BASE_URL;
     this.devinMode = deps.devinMode ?? process.env.PAIR_DEVIN_MODE ?? DEFAULT_DEVIN_MODE;
     this.fetchFn = deps.fetchFn ?? curlFetch;
+    this.taskTimeoutMs =
+      deps.taskTimeoutMs ?? (Number(process.env.PAIR_DEVIN_TASK_TIMEOUT_MS ?? 0) || DEFAULT_TASK_TIMEOUT_MS);
     this.now = deps.now ?? utcnow;
+    this.nowMs = deps.nowMs ?? Date.now;
     this.journalRoot = deps.journalRoot;
     fs.mkdirSync(deps.journalRoot, { recursive: true });
   }
@@ -332,6 +347,15 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     }
     const remoteId = String(rec.remote_session_id ?? "");
     if (!remoteId) return { ...rec };
+    const startedMs = Date.parse(String(rec.started_at ?? ""));
+    if (Number.isFinite(startedMs) && this.nowMs() - startedMs > this.taskTimeoutMs) {
+      rec.status = "TIMEOUT";
+      rec.finished_at = this.now();
+      rec.remote_timeout_ms = this.taskTimeoutMs;
+      this.executions.set(executionId, rec);
+      const { result: _t, ...out } = rec;
+      return { ...out };
+    }
     const res = this.api("GET", `/v1/sessions/${remoteId}`);
     if (res.status === 404) {
       rec.status = "UNKNOWN";
