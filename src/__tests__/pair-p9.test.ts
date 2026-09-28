@@ -25,7 +25,9 @@ import {
   MissionRouter,
   MissionRuntime,
   MissionScheduler,
+  MissionScheduleService,
   MissionSupervisor,
+  nextRunAfter,
   PairControlPlane,
   PairEvidenceStore,
   PolicyError,
@@ -1263,5 +1265,80 @@ describe("UI-4 §4.1 — canonical event stream projection", () => {
     const none = ctx.control.eventsSince(after.latest_seq);
     expect(none.events).toHaveLength(0);
     expect(none.latest_seq).toBe(after.latest_seq);
+  });
+});
+
+describe("Schedules — recurring mission triggers", () => {
+  it("cron parser: nextRunAfter computes correct fire times", () => {
+    expect(nextRunAfter("0 7 * * *", "2026-09-27T08:00:00.000Z")).toBe("2026-09-28T07:00:00.000Z");
+    expect(nextRunAfter("0 7 * * *", "2026-09-27T06:59:00.000Z")).toBe("2026-09-27T07:00:00.000Z");
+    expect(nextRunAfter("*/30 * * * *", "2026-09-27T08:05:00.000Z")).toBe("2026-09-27T08:30:00.000Z");
+    expect(nextRunAfter("0 8 * * 1", "2026-09-27T08:00:00.000Z")).toBe("2026-09-28T08:00:00.000Z"); // Mon
+    expect(() => nextRunAfter("bogus", "2026-09-27T08:00:00.000Z")).toThrow();
+    expect(() => nextRunAfter("99 * * * *", "2026-09-27T08:00:00.000Z")).toThrow();
+  });
+
+  it("create → due → fire submits canonical mission with schedule provenance", () => {
+    const ctx = makeCtx("sched1");
+    const svc = new MissionScheduleService(ctx.service);
+    const proj = ctx.control.projects()[0];
+    const s = svc.create({
+      goal: "scheduled goal",
+      cron: "*/1 * * * *",
+      project_id: String(proj.project_id),
+      operator_id: "op-sched",
+      name: "test-sched",
+    });
+    expect(s.enabled).toBe(true);
+    const before = ctx.service.store.list("mission").length;
+    const submitted: Array<Record<string, unknown>> = [];
+    const res = svc.fireDue(
+      (input) => {
+        submitted.push(input);
+        return ctx.control.startMission({
+          project_id: input.project_id ?? "",
+          goal: input.goal,
+          operator_id: input.operator_id,
+          metadata: input.metadata,
+        });
+      },
+      "2099-01-01T00:00:00.000Z",
+    );
+    expect(res.fired).toEqual([String(s.schedule_id)]);
+    expect(submitted).toHaveLength(1);
+    expect(submitted[0].goal).toBe("scheduled goal");
+    expect((submitted[0].metadata as Record<string, unknown>).plan_source).toBe("schedule");
+    expect(ctx.service.store.list("mission").length).toBe(before + 1);
+    const after = svc.get(String(s.schedule_id));
+    expect(after.last_mission_id).toBeTruthy();
+    expect(Number(after.run_count)).toBe(1);
+    expect(String(after.next_due_at) > "2099-01-01").toBe(true); // advanced past fire time
+  });
+
+  it("not due → no fire; disabled/deleted never fire", () => {
+    const ctx = makeCtx("sched2");
+    const svc = new MissionScheduleService(ctx.service);
+    const s = svc.create({ goal: "g", cron: "0 7 * * *", operator_id: "op" });
+    const res = svc.fireDue(
+      () => { throw new Error("must not run"); },
+      "2026-01-01T00:00:00.000Z", // before next_due_at
+    );
+    expect(res.fired).toHaveLength(0);
+    svc.setEnabled(String(s.schedule_id), false, "op");
+    const s2 = svc.create({ goal: "g2", cron: "* * * * *", operator_id: "op" });
+    svc.remove(String(s2.schedule_id), "op");
+    const res2 = svc.fireDue(() => ({ mission_id: "x" }), "2099-01-01T00:00:00.000Z");
+    expect(res2.fired).toHaveLength(0); // disabled + deleted both skipped
+  });
+
+  it("schedule persists in pair.db (survives service restart)", () => {
+    const ctx = makeCtx("sched3");
+    const svc = new MissionScheduleService(ctx.service);
+    const s = svc.create({ goal: "persist me", cron: "0 9 * * 1-5", operator_id: "op" });
+    // fresh service instance on the same store = simulated restart
+    const svc2 = new MissionScheduleService(ctx.service);
+    const found = svc2.get(String(s.schedule_id));
+    expect(found.goal).toBe("persist me");
+    expect(found.enabled).toBe(true);
   });
 });

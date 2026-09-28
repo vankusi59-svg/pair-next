@@ -39,6 +39,7 @@ export * from "./reconciliation.js";
 export * from "./self-improvement.js";
 export * from "./approval-queue.js";
 export * from "./mission-scheduler.js";
+export * from "./mission-schedule.js";
 export * from "./mission-runtime.js";
 export * from "./mission-supervisor.js";
 export * from "./mission-observability.js";

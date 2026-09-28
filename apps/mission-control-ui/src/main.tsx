@@ -6,6 +6,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { MissionDetail } from "./pages/MissionDetail";
 import { MissionNew } from "./pages/MissionNew";
 import { Approvals } from "./pages/Approvals";
+import { Schedules } from "./pages/Schedules";
 import { Providers } from "./pages/Providers";
 import { Observability } from "./pages/Observability";
 import "./styles/app.css";
@@ -18,6 +19,7 @@ const router = createBrowserRouter([
       { path: "/missions/new", element: <MissionNew /> },
       { path: "/missions/:id", element: <MissionDetail /> },
       { path: "/approvals", element: <Approvals /> },
+      { path: "/schedules", element: <Schedules /> },
       { path: "/providers", element: <Providers /> },
       { path: "/observability", element: <Observability /> },
     ],

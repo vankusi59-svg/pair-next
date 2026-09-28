@@ -243,6 +243,8 @@ export function createMissionControlServer(
       if (method === "GET" && p === "/api/approvals") return void json(res, 200, c.approvals());
       if (method === "GET" && p === "/api/experience") return void json(res, 200, c.experience());
       if (method === "GET" && p === "/api/selfmod") return void json(res, 200, c.selfImprovement());
+      // Recurring mission triggers (mission_schedule entities).
+      if (method === "GET" && p === "/api/schedules") return void json(res, 200, { schedules: c.schedules() });
 
       // ---- mutations (operator authority required) -------------------------
       if (method === "POST" && !operator) {
@@ -285,6 +287,28 @@ export function createMissionControlServer(
           m[2] === "approve"
             ? c.approvePromotion(m[1], operator)
             : c.rejectPromotion(m[1], operator, String(body.reason ?? "rejected via control"));
+        return void json(res, 200, out);
+      }
+      if (method === "POST" && p === "/api/schedules") {
+        return void json(
+          res,
+          200,
+          c.createSchedule({
+            goal: String(body.goal ?? ""),
+            cron: String(body.cron ?? ""),
+            project_id: String(body.project_id ?? "") || undefined,
+            name: String(body.name ?? "") || undefined,
+            metadata: (body.metadata as Record<string, unknown>) ?? {},
+            operator_id: operator,
+          }),
+        );
+      }
+      m = p.match(/^\/api\/schedules\/([^/]+)\/(enable|disable|delete)$/);
+      if (method === "POST" && m) {
+        const out =
+          m[2] === "delete"
+            ? c.deleteSchedule(m[1], operator)
+            : c.setScheduleEnabled(m[1], m[2] === "enable", operator);
         return void json(res, 200, out);
       }
       if (method === "POST" && p === "/api/tick") {

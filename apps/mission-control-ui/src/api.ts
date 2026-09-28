@@ -90,6 +90,11 @@ export const api = {
     req<{ path: string; content: string; size: number; truncated: boolean; sha256: string }>(
       `/missions/${id}/files?path=${encodeURIComponent(p)}`,
     ),
+  schedules: () => req<{ schedules: Array<Record<string, unknown>> }>("/schedules"),
+  createSchedule: (input: { goal: string; cron: string; name?: string; project_id?: string }) =>
+    req<Record<string, unknown>>("/schedules", { method: "POST", body: JSON.stringify(input) }),
+  scheduleAction: (id: string, action: "enable" | "disable" | "delete") =>
+    req<Record<string, unknown>>(`/schedules/${id}/${action}`, { method: "POST", body: "{}" }),
   approve: (id: string, scope: Record<string, unknown>, reason?: string) =>
     req<Record<string, unknown>>(`/approvals/${id}/approve`, {
       method: "POST",

@@ -14,6 +14,7 @@ import type { PairControlPlane } from "./service.js";
 import type { MissionRuntime } from "./mission-runtime.js";
 import type { MissionSupervisor, WakeReason } from "./mission-supervisor.js";
 import type { MissionScheduler } from "./mission-scheduler.js";
+import type { MissionScheduleService } from "./mission-schedule.js";
 import type { ApprovalQueue } from "./approval-queue.js";
 import type { ReconciliationService } from "./reconciliation.js";
 import type { MissionObservability } from "./mission-observability.js";
@@ -37,6 +38,8 @@ export interface MissionControlDeps {
   reconciliation: ReconciliationService;
   observability: MissionObservability;
   selfmod?: SelfImprovementController;
+  /** Recurring mission triggers — cron schedules persisted in pair.db. */
+  schedules?: MissionScheduleService;
 }
 
 function requireOperator(operatorId: string | undefined): string {
@@ -382,6 +385,51 @@ export class MissionControl {
   deny(approvalId: string, operatorId: string | undefined, scope: Record<string, unknown>, reason?: string) {
     const op = requireOperator(operatorId);
     return this.deps.approvals.decide(approvalId, op, "DENIED", scope, reason);
+  }
+
+  /* ---------------- mission schedules ------------------------------------ */
+
+  schedules(): Array<Record<string, unknown>> {
+    return this.deps.schedules?.list() ?? [];
+  }
+
+  createSchedule(input: {
+    goal: string;
+    cron: string;
+    project_id?: string;
+    name?: string;
+    metadata?: Record<string, unknown>;
+    operator_id?: string;
+  }): Record<string, unknown> {
+    if (!this.deps.schedules) throw new PolicyError("FAIL_CLOSED_NO_SCHEDULER", "mission_control.schedules");
+    const op = requireOperator(input.operator_id);
+    return this.deps.schedules.create({ ...input, operator_id: op });
+  }
+
+  setScheduleEnabled(id: string, enabled: boolean, operatorId?: string) {
+    if (!this.deps.schedules) throw new PolicyError("FAIL_CLOSED_NO_SCHEDULER", "mission_control.schedules");
+    const op = requireOperator(operatorId);
+    return this.deps.schedules.setEnabled(id, enabled, op);
+  }
+
+  deleteSchedule(id: string, operatorId?: string) {
+    if (!this.deps.schedules) throw new PolicyError("FAIL_CLOSED_NO_SCHEDULER", "mission_control.schedules");
+    const op = requireOperator(operatorId);
+    return this.deps.schedules.remove(id, op);
+  }
+
+  /** Fire every due schedule through the canonical startMission path. */
+  tickSchedules(now?: string): { fired: string[]; errors: string[] } {
+    if (!this.deps.schedules) return { fired: [], errors: [] };
+    const defaultProject = String(this.store.list("project")[0]?.project_id ?? "");
+    return this.deps.schedules.fireDue(
+      (input) =>
+        this.startMission({
+          ...input,
+          project_id: input.project_id || defaultProject,
+        }),
+      now,
+    );
   }
 
   requestReconciliation(missionId: string, operatorId?: string, executionId?: string) {

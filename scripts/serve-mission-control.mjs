@@ -34,6 +34,7 @@ import {
   MissionRouter,
   MissionRuntime,
   MissionScheduler,
+  MissionScheduleService,
   MissionSupervisor,
   PairControlPlane,
   PairEvidenceStore,
@@ -219,6 +220,7 @@ const sup = new MissionSupervisor(service, runtime, recovery, recon);
 const control = new MissionControl({
   service, runtime, supervisor: sup, scheduler, approvals, reconciliation: recon,
   observability: new MissionObservability(service), selfmod, planner,
+  schedules: new MissionScheduleService(service),
 });
 
 registry.register({
@@ -386,4 +388,7 @@ const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {
   console.log(`PAIR Mission Control on http://localhost:${port} (ui=${fs.existsSync(path.join(uiDir, "index.html")) ? uiDir : "legacy"})`);
 });
-setInterval(() => sup.tick(), 1000).unref();
+setInterval(() => {
+  sup.tick();
+  control.tickSchedules(); // fire due cron schedules through canonical submit
+}, 1000).unref();
