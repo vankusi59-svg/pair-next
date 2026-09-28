@@ -7,7 +7,9 @@
  * exposes credentials or env dumps — only entity projections.
  */
 
-import { PolicyError } from "./errors.js";
+import fs from "node:fs";
+import path from "node:path";
+import { IntegrityError, NotFoundError, PolicyError } from "./errors.js";
 import type { PairControlPlane } from "./service.js";
 import type { MissionRuntime } from "./mission-runtime.js";
 import type { MissionSupervisor, WakeReason } from "./mission-supervisor.js";
@@ -18,7 +20,7 @@ import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { projectRoutableModels } from "./model-routable.js";
-import { digest } from "./canonical.js";
+import { digest, sha256Hex } from "./canonical.js";
 import { validatePlanProposal } from "./proposal.js";
 import type { RuntimePlanner } from "./mission-runtime.js";
 
@@ -87,6 +89,73 @@ export class MissionControl {
         }),
       ),
     };
+  }
+
+  /* ---- mission workspace files (read-only, path-clamped) ---------------- */
+
+  private missionWorkspaces(missionId: string): string[] {
+    const m = this.store.tryGet("mission", missionId) as Record<string, unknown> | null;
+    if (!m) throw new NotFoundError(`mission:${missionId}`);
+    const ws = ((m.metadata as Record<string, unknown> | undefined)?.authorized_workspaces ??
+      m.authorized_workspaces ??
+      []) as string[];
+    return ws.map(String).map((w) => path.resolve(w));
+  }
+
+  /** List files under the mission's authorized workspaces (recursive). */
+  workspaceFiles(missionId: string): { files: Array<Record<string, unknown>> } {
+    const out: Array<Record<string, unknown>> = [];
+    for (const root of this.missionWorkspaces(missionId)) {
+      if (!fs.existsSync(root)) continue;
+      const walk = (dir: string) => {
+        for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+          const p = path.join(dir, ent.name);
+          if (ent.isDirectory()) walk(p);
+          else if (ent.isFile()) {
+            const st = fs.statSync(p);
+            out.push({
+              path: path.relative(root, p),
+              workspace: root,
+              size: st.size,
+              modified_at: st.mtime.toISOString(),
+            });
+          }
+        }
+      };
+      walk(root);
+    }
+    return { files: out.sort((a, b) => String(a.path).localeCompare(String(b.path))) };
+  }
+
+  /**
+   * Read one file inside the mission's authorized workspaces. Fail-closed:
+   * rejects `..`/absolute escapes, anything outside a workspace, and non-UTF8
+   * content; caps output at 256 KB.
+   */
+  workspaceFile(missionId: string, relPath: string): Record<string, unknown> {
+    if (!relPath || relPath.includes("\0") || path.isAbsolute(relPath)) {
+      throw new IntegrityError("FAIL_CLOSED_BAD_PATH", String(relPath).slice(0, 80));
+    }
+    for (const root of this.missionWorkspaces(missionId)) {
+      const resolved = path.resolve(root, relPath);
+      if (!resolved.startsWith(root + path.sep) && resolved !== root) continue;
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) continue;
+      const buf = fs.readFileSync(resolved);
+      const MAX = 256 * 1024;
+      const content = buf.slice(0, MAX).toString("utf8");
+      if (buf.indexOf(0) !== -1) {
+        throw new IntegrityError("FAIL_CLOSED_BINARY_FILE", relPath.slice(0, 80));
+      }
+      return {
+        path: relPath,
+        workspace: root,
+        size: buf.length,
+        sha256: sha256Hex(buf),
+        truncated: buf.length > MAX,
+        content,
+      };
+    }
+    throw new NotFoundError(`workspace_file:${relPath}`);
   }
 
   /** §4.1 — canonical entity events after `sinceSeq` (hash-verified on read).

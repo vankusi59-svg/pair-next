@@ -208,6 +208,13 @@ export function createMissionControlServer(
       if (method === "GET" && m) return void json(res, 200, c.timeline(m[1]));
       m = p.match(/^\/api\/missions\/([^/]+)\/evidence$/);
       if (method === "GET" && m) return void json(res, 200, c.evidence(m[1]));
+      // Workspace file viewer — list all, or read one via ?path=<relpath>.
+      // Read-only, clamped to the mission's authorized workspaces.
+      m = p.match(/^\/api\/missions\/([^/]+)\/files$/);
+      if (method === "GET" && m) {
+        const rel = url.searchParams.get("path");
+        return void json(res, 200, rel ? c.workspaceFile(m[1], rel) : c.workspaceFiles(m[1]));
+      }
       if (method === "GET" && p === "/api/projects") return void json(res, 200, c.projects());
       // §4.2 — provider/model/route read projections (read-only).
       if (method === "GET" && p === "/api/providers") return void json(res, 200, c.providers());

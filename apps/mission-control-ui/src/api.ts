@@ -65,6 +65,11 @@ export const api = {
   missionAction: (id: string, action: "pause" | "resume" | "cancel" | "acknowledge") =>
     req<Record<string, unknown>>(`/missions/${id}/${action}`, { method: "POST", body: "{}" }),
   modelRoutable: (id: string) => req<{ model: Record<string, unknown> | null; bindings: Array<Record<string, unknown>> }>(`/models/${id}/routable`),
+  missionFiles: (id: string) => req<{ files: Array<Record<string, unknown>> }>(`/missions/${id}/files`),
+  missionFile: (id: string, p: string) =>
+    req<{ path: string; content: string; size: number; truncated: boolean; sha256: string }>(
+      `/missions/${id}/files?path=${encodeURIComponent(p)}`,
+    ),
   approve: (id: string, scope: Record<string, unknown>, reason?: string) =>
     req<Record<string, unknown>>(`/approvals/${id}/approve`, {
       method: "POST",
