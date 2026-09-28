@@ -67,7 +67,7 @@ const noopCompute = {
 } as unknown as ComputeClient;
 
 const secretEnv = (n: string) =>
-  ["DEEPSEEK_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"].includes(n)
+  ["DEEPSEEK_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"].includes(n)
     ? FAKE_SECRET
     : process.env[n];
 
