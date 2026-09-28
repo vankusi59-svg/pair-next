@@ -44,6 +44,9 @@ import {
   ModelEvidenceCatalog,
   ensureBinding,
   qualifyBinding,
+  ProviderValidator,
+  probeModel,
+  qualifyModel,
   CODEX_EXECUTOR_ID,
   DSH_EXECUTOR_ID,
   PAIR_NATIVE_EXECUTOR_ID,
@@ -169,40 +172,75 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   console.log("DISCOVERY: providers", JSON.stringify({ created: dres.created, updated: dres.updated, errors: dres.errors }));
   console.log("DISCOVERY: models", JSON.stringify({ created: mres.created, updated: mres.updated, errors: mres.errors }));
 
-  // Bind the live-qualified DSH model route (executor already qualified by
-  // real probe above) so the routable projection reflects the active route.
-  const [routeProvider, routeModel] = String(process.env.PAIR_DSH_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite").split(":");
+  // Canonical qualification (P6): real provider probe + tier-1 model probe +
+  // qualifyModel gates — nothing is marked QUALIFIED without live evidence.
+  const validator = new ProviderValidator(store);
   const mcat = new ModelEvidenceCatalog(store);
-  const me = mcat.getModelByIds(routeProvider, routeModel);
-  if (me && governed.has(DSH_EXECUTOR_ID)) {
-    const b = ensureBinding(service, {
-      executor_id: DSH_EXECUTOR_ID,
-      provider_id: routeProvider,
-      model_entry_id: String(me.model_entry_id),
-      transport_compat: "OPENAI_COMPLETIONS",
-    });
-    pc.setLifecycle(routeProvider, "QUALIFIED");
-    mcat.issueQualificationReceipt(String(me.model_entry_id), {
-      capability_scope: ["text_inference"],
-      verifier: "DSH_LIVE_QUALIFICATION",
-      evidence_refs: [],
-    });
-    qualifyBinding(service, String(b.binding_id));
-    console.log("MODEL_ROUTE:", routeProvider + ":" + routeModel, "bound to", DSH_EXECUTOR_ID);
-  }
-  // Other discovered models reachable via DSH get DISCOVERED bindings —
-  // the routes page shows them as unqualified fallbacks with failing gates.
+  const endpointOf = (p) => String(p.endpoint_reference ?? p.configured_endpoint_identity ?? "");
+  const httpProbe = (provider, modelId) => async () => {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(`${endpointOf(provider)}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${process.env[String(provider.credential_reference_name)] ?? ""}`,
+        },
+        body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
+        signal: AbortSignal.timeout(8000),
+      });
+      return { outcome: r.ok ? "AUTH_OK" : r.status === 401 || r.status === 403 ? "AUTH_FAILED" : "UNREACHABLE", latency_ms: Date.now() - t0, detail: `http_${r.status}` };
+    } catch (err) {
+      return { outcome: "UNREACHABLE", latency_ms: Date.now() - t0, detail: String(err).slice(0, 120) };
+    }
+  };
+
   if (governed.has(DSH_EXECUTOR_ID)) {
-    for (const m of mcat.listModels()) {
+    const wanted = [
+      String(process.env.PAIR_DSH_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite"),
+      String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "groq:openai/gpt-oss-20b"),
+    ];
+    for (const route of wanted) {
+      const [pid, mid] = route.split(":");
+      const prov = pc.getProvider(pid);
+      const me = mcat.getModelByIds(pid, mid);
+      if (!prov || !me) { console.log("MODEL_ROUTE: skip", route, "(not discovered)"); continue; }
+      // Provider-level: real access probe then canonical qualify() gates.
+      await validator.validateAccess(pid, { probe: httpProbe(prov, mid), actor: "PAIR_MC" });
+      const pq = validator.qualify(pid, { actor: "PAIR_MC" });
+      if (!pq.qualified) { console.log("MODEL_ROUTE:", route, "provider NOT qualified", JSON.stringify(pq.gates)); continue; }
+      pc.setLifecycle(pid, "QUALIFIED");
+      // Model-level: tier-1 liveness probe proves text_inference, then
+      // qualifyModel gates on probe receipts.
+      const prb = await probeModel(store, String(me.model_entry_id), 1, {
+        probeFn: async () => {
+          const r = await httpProbe(prov, mid)();
+          return { result: r.outcome === "AUTH_OK" ? "PASS" : r.outcome === "RATE_LIMITED" ? "RATE_LIMITED" : "FAIL", latency_ms: r.latency_ms, capability_evidence: r.outcome === "AUTH_OK" ? { text_inference: "PASS" } : {}, requests_used: 1, tokens_used: 1 };
+        },
+        capability: "text_inference",
+        executorId: DSH_EXECUTOR_ID,
+        actor: "PAIR_MC",
+      });
+      const mq = qualifyModel(store, String(me.model_entry_id), { capability_scope: ["text_inference"], actor: "PAIR_MC" });
+      if (!mq.qualified) { console.log("MODEL_ROUTE:", route, "model NOT qualified", JSON.stringify(mq.gates), "probe:", prb.result); continue; }
       const b = ensureBinding(service, {
+        executor_id: DSH_EXECUTOR_ID,
+        provider_id: pid,
+        model_entry_id: String(me.model_entry_id),
+        transport_compat: "OPENAI_COMPLETIONS",
+      });
+      qualifyBinding(service, String(b.binding_id));
+      console.log("MODEL_ROUTE:", route, "QUALIFIED (probe", prb.result + ") bound to", DSH_EXECUTOR_ID);
+    }
+    // Other discovered models get DISCOVERED bindings — the routes page shows
+    // them as unqualified fallbacks with their failing gate.
+    for (const m of mcat.listModels()) {
+      ensureBinding(service, {
         executor_id: DSH_EXECUTOR_ID,
         provider_id: String(m.provider_family),
         model_entry_id: String(m.model_entry_id),
         transport_compat: "OPENAI_COMPLETIONS",
       });
-      if (b.qualification_state === "DISCOVERED") {
-        // leave unqualified — honest fallback visualization
-      }
     }
   }
 }
