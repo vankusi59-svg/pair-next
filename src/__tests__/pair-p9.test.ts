@@ -714,7 +714,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
 
   it("32. DEVIN unavailable → not routable (no credential)", () => {
     const ctx = makeCtx("t32");
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: null });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "" });
     const probe = adapter.probe();
     expect(probe.available).toBe(false);
     expect(probe.reason).toBe("DEVIN_CREDENTIAL_NOT_RESOLVABLE");
@@ -725,7 +725,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
 
   it("33. DEVIN unqualified → not routable", () => {
     const ctx = makeCtx("t33");
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: null });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "" });
     expect(adapter.qualify().qualified).toBe(false);
     const res = registerDevin(ctx, adapter);
     expect(res.routable).not.toContain("DEVIN");

@@ -1,5 +1,5 @@
 /**
- * P9 DEVIN executor — Devin REST API (v3 sessions + v1 session inspect)
+ * P9 DEVIN executor — Devin REST API (v1 sessions create/inspect/message)
  * behind the canonical ExecutorAdapter contract.
  *
  * In this environment Devin is only programmatically reachable via
@@ -268,7 +268,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       const { result: _omit, ...out } = existing;
       return { ...out };
     }
-    const res = this.api("POST", `/v3/organizations/${this.orgId}/sessions`, {
+    const res = this.api("POST", `/v1/sessions`, {
       prompt: this.buildPrompt(task),
       idempotent: true,
       tags: ["pair-os", String(task.mission_id)],
@@ -282,7 +282,8 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     }
     const runRoot = path.join(this.journalRoot, executionId);
     fs.mkdirSync(runRoot, { recursive: true });
-    const sessionId = String(res.data.session_id ?? res.data.devin_id ?? "");
+    const rawId = String(res.data.session_id ?? res.data.devin_id ?? "");
+    const sessionId = rawId.startsWith("devin-") ? rawId.slice(6) : rawId;
     const record: Record<string, unknown> = {
       executor_id: this.executor_id,
       execution_id: executionId,
