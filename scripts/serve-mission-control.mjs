@@ -99,9 +99,9 @@ const selfmod = new SelfImprovementController(service, {
 });
 // Demo planner: T1 records the goal via PAIR_NATIVE (guaranteed artifact),
 // T2 asks DSH (Gemini by default) to read it and produce analysis.txt — a
-// real governed LLM call routed by capability (REASONING is DSH-only).
-// Optional T3 Codex step when the goal mentions code/script/python.
-// Falls back to T1-only when governed executors are absent.
+// real governed LLM call routed by capability; DSH wins REASONING via
+// routing_priority. Optional T3 Codex step when the goal mentions
+// code/script/python. Falls back to T1-only when executors are absent.
 const planner = (input) => {
   const goal = String(input.mission.goal);
   const tasks = [{
@@ -174,7 +174,9 @@ service.routes.seedPairNativeRoute();
 for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION"])
   service.registerCapability(c, { risk_class: "LOW" });
 if (governed.size) {
-  const reg = registerGovernedExecutors(service, governed, "PAIR_MC");
+  const reg = registerGovernedExecutors(service, governed, "PAIR_MC", {
+    priorities: { DEEPSEEK_HARNESS: 40, CODEX: 60 },
+  });
   console.log("ROUTABLE:", reg.routable.join(", "));
 }
 service.createProject({ name: "default", root_location: workspace });
