@@ -87,7 +87,7 @@ export const RECOVERY_MATRIX: Record<FailureClass, MatrixRow> = {
   AMBIGUOUS_DISPATCH: { actions: ["RECONCILIATION_REQUIRED"], retry_allowed: false },
   UNKNOWN_SIDE_EFFECT_STATE: { actions: ["RECONCILIATION_REQUIRED", "HUMAN_APPROVAL_REQUIRED"], retry_allowed: false },
   PLAN_INVALIDATED: { actions: ["REPLAN"], retry_allowed: false },
-  ENVIRONMENT_INCOMPATIBLE: { actions: ["RE_ROUTE", "ABORT"], retry_allowed: false },
+  ENVIRONMENT_INCOMPATIBLE: { actions: ["RE_ROUTE", "REPLAN", "ABORT"], retry_allowed: false },
   INTERNAL_RUNTIME_DEFECT: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false, may_create_selfmod_candidate: true },
   UNKNOWN: { actions: ["RECONCILIATION_REQUIRED", "ABORT"], retry_allowed: false },
 };
@@ -138,6 +138,10 @@ const CLASS_RULES: Array<[RegExp, FailureClass]> = [
   [/TRANSPORT|ACP_|ECONN|SOCKET|STDIO|RPC|NETWORK/i, "TRANSIENT_TRANSPORT"],
 ];
 
+/** Executor-environment mismatch signals: the executor ran but its sandbox cannot serve the task (e.g. network blocked). These reroute immediately — retrying the same route cannot help. */
+const ENVIRONMENT_INCOMPATIBLE_SIGNAL =
+  /ENOTFOUND|EAI_AGAIN|DNS resolution|name resolution|could not resolve|network (is )?(unreachable|blocked|disabled|not allowed|restricted)|ERR_INTERNET|NETWORK_SANDBOX|no route to host/i;
+
 /** Map a raw failure (execution entity, adapter error, or thrown PairError) to a stable class. */
 export function classifyFailure(input: {
   execution_state?: string;
@@ -151,6 +155,12 @@ export function classifyFailure(input: {
       (input.result?.error as Record<string, unknown> | undefined)?.class ??
       "",
   );
+  const resultObj = input.result as Record<string, unknown> | null | undefined;
+  const errorObj = resultObj?.error as Record<string, unknown> | undefined;
+  const haystack = [errClass, errorObj?.message, resultObj?.summary, resultObj?.stderr]
+    .map((v) => String(v ?? ""))
+    .join("\n");
+  if (ENVIRONMENT_INCOMPATIBLE_SIGNAL.test(haystack)) return "ENVIRONMENT_INCOMPATIBLE";
   for (const [re, cls] of CLASS_RULES) {
     if (re.test(errClass)) return cls;
   }

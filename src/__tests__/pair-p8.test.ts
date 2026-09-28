@@ -339,6 +339,15 @@ describe("P8 §36 — failure classification + matrix", () => {
     expect(classifyFailure({ execution_state: "FAILED", error_class: "CODEX_EXIT_1" })).toBe("PROCESS_EXIT");
     expect(classifyFailure({ execution_state: "FAILED" })).toBe("UNKNOWN");
     expect(classifyFailure({ error_class: "SOMETHING_NEVER_SEEN" })).toBe("UNKNOWN");
+
+    expect(classifyFailure({
+      execution_state: "FAILED",
+      result: { status: "FAILED", error: { class: "CODEX_AGENT_REPORTED_FAILURE" }, summary: "Created the scraper, but DNS resolution for www.mql5.com failed." },
+    })).toBe("ENVIRONMENT_INCOMPATIBLE");
+    expect(classifyFailure({
+      execution_state: "FAILED",
+      result: { status: "FAILED", error: { class: "AGENT_FAIL", message: "curl: (6) Could not resolve host: x" }, summary: "" },
+    })).toBe("ENVIRONMENT_INCOMPATIBLE");
   });
 
   it("2. matrix covers all 24 failure classes with stable semantic fields", () => {
