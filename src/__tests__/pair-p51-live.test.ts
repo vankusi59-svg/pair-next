@@ -55,6 +55,16 @@ const noopCompute = {
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p51-live-"));
 let counter = 0;
+
+// Live suite requires real vendor runtimes + credentials; skip (not fail) on CI.
+const liveRoute = process.env.PAIR_DSH_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite";
+const liveCredEnv = `${liveRoute.split(":")[0].toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`;
+const liveEnv =
+  Boolean(process.env.PAIR_DSH_HOME) &&
+  fs.existsSync(path.join(process.env.PAIR_DSH_HOME, "settings.yaml")) &&
+  Boolean(process.env[liveCredEnv]) &&
+  Boolean(process.env.CODEX_HOME);
+const describeLive = liveEnv ? describe : describe.skip;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);
   fs.mkdirSync(p, { recursive: true });
@@ -292,13 +302,12 @@ function evidenceWalk(dir: string): string[] {
   return out;
 }
 
-describe("P5.1 live qualification — real vendor runtimes", () => {
+describeLive("P5.1 live qualification — real vendor runtimes", () => {
   beforeAll(() => {
     expect(process.env.PATH ?? "").toContain(".local/bin");
-    expect(Boolean(process.env.GROQ_API_KEY)).toBe(true);
+    expect(Boolean(process.env[liveCredEnv])).toBe(true);
     expect(Boolean(process.env.CODEX_HOME)).toBe(true);
     expect(process.env.PAIR_DSH_HOME).toBe("/home/ubuntu/.pair-dsh-home");
-    expect(process.env.PAIR_DSH_MODEL_ROUTE).toBeTruthy();
   });
 
   it("L1: DEEPSEEK_HARNESS probe+qualify+auth+capabilities+route/binding QUALIFIED+routable", () => {

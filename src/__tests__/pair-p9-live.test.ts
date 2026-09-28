@@ -66,14 +66,20 @@ const noopCompute = {
 } as unknown as ComputeClient;
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p9-live-"));
+
+// Live suite requires real vendor runtimes + credentials; skip (not fail) on CI.
+const liveEnv =
+  Boolean(process.env.PAIR_DSH_HOME) &&
+  fs.existsSync(path.join(process.env.PAIR_DSH_HOME, "settings.yaml")) &&
+  Boolean(process.env.CODEX_HOME);
+const describeLive = liveEnv ? describe : describe.skip;
 const TERMINAL_RT = new Set(["COMPLETED", "FAILED", "CANCELLED", "ABORTED"]);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe("P9 §38 — real multi-executor mission over the runtime loop", () => {
+describeLive("P9 §38 — real multi-executor mission over the runtime loop", () => {
   beforeAll(() => {
     expect(Boolean(process.env.PAIR_DSH_HOME)).toBe(true);
-    expect(Boolean(process.env.PAIR_DSH_MODEL_ROUTE)).toBe(true);
     expect(Boolean(process.env.CODEX_HOME)).toBe(true);
   });
 
