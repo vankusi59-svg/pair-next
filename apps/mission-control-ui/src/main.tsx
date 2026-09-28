@@ -6,6 +6,7 @@ import { Dashboard } from "./pages/Dashboard";
 import { MissionDetail } from "./pages/MissionDetail";
 import { MissionNew } from "./pages/MissionNew";
 import { Approvals } from "./pages/Approvals";
+import { Providers } from "./pages/Providers";
 import "./styles/app.css";
 
 const router = createBrowserRouter([
@@ -16,6 +17,7 @@ const router = createBrowserRouter([
       { path: "/missions/new", element: <MissionNew /> },
       { path: "/missions/:id", element: <MissionDetail /> },
       { path: "/approvals", element: <Approvals /> },
+      { path: "/providers", element: <Providers /> },
     ],
   },
 ]);

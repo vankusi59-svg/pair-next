@@ -1188,3 +1188,26 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
     expect(ctx.store.list("mission")).toHaveLength(0);
   });
 });
+
+describe("UI-3 §4.2 — provider/model/route read projections", () => {
+  it("exposes providers/models/routes + model routable gates; read-only, no secrets", () => {
+    const ctx = makeCtx("ui3");
+    const p = ctx.control.providers();
+    const m = ctx.control.models();
+    const r = ctx.control.routes();
+    expect(p).toHaveProperty("providers");
+    expect(m).toHaveProperty("models");
+    expect(r).toHaveProperty("routes");
+    expect(r).toHaveProperty("routable_models");
+    // provider entries expose credential status flag only — never values
+    for (const prov of p.providers) {
+      expect(["configured", "unavailable"]).toContain(String(prov.credential_status));
+      expect(prov).not.toHaveProperty("api_key");
+      expect(prov).not.toHaveProperty("credential_value");
+    }
+    // per-model gate detail
+    const some = ctx.control.modelRoutable("ME_DOES_NOT_EXIST");
+    expect(some.model).toBeNull();
+    expect(some.bindings).toHaveLength(0);
+  });
+});

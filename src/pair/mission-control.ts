@@ -17,6 +17,7 @@ import type { ReconciliationService } from "./reconciliation.js";
 import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
+import { projectRoutableModels } from "./model-routable.js";
 import { digest } from "./canonical.js";
 import { validatePlanProposal } from "./proposal.js";
 import type { RuntimePlanner } from "./mission-runtime.js";
@@ -107,6 +108,46 @@ export class MissionControl {
       attempts: this.store.list("recovery_attempt"),
       scheduled: this.store.list("scheduled_action"),
     };
+  }
+
+  /** §4.2 — provider projection; credential status is a flag, never a secret. */
+  providers() {
+    return {
+      providers: this.store.list("provider").map((p) => ({
+        ...p,
+        credential_status: String(p.auth_state) === "AUTH_OK" ? "configured" : "unavailable",
+      })),
+      qualifications: this.store.list("provider_qualification"),
+    };
+  }
+
+  /** §4.2 — model evidence catalog projection. */
+  models() {
+    return {
+      models: this.store.list("model_entry"),
+      bindings: this.store.list("model_binding"),
+      qualifications: this.store.list("model_qualification"),
+    };
+  }
+
+  /** §4.2 — routes + bindings + per-binding 13-gate routable projection. */
+  routes() {
+    return {
+      routes: this.store.list("route"),
+      model_bindings: this.store.list("model_binding"),
+      routable_models: projectRoutableModels(this.deps.service),
+      route_decisions: this.store.list("route_decision"),
+      routing_decisions: this.store.list("routing_decision"),
+    };
+  }
+
+  /** §4.2 — 13-gate routable projection for one model entry id. */
+  modelRoutable(modelEntryId: string) {
+    const model = this.store.tryGet("model_entry", modelEntryId);
+    const rows = projectRoutableModels(this.deps.service).filter(
+      (r) => r.model_entry_id === modelEntryId,
+    );
+    return { model, bindings: rows };
   }
 
   approvals() {

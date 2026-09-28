@@ -75,3 +75,12 @@ label { font-size: 12px; color: var(--muted); display: block; }
 .tl-evidence .tl-kind { color: #a78bfa; }
 .tl-body { flex: 1; word-break: break-word; }
 a { color: var(--accent); }
+.gates { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
+.gate { font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line); }
+.gate.pass { color: #4ade80; border-color: #14532d; }
+.gate.fail { color: #fca5a5; border-color: #7f1d1d; }
+.badge.b-ok { background: #14532d; color: #bbf7d0; }
+.badge.b-bad { background: #7f1d1d; color: #fecaca; }
+.cred.ok { color: #4ade80; }
+.cred.no { color: #fca5a5; }
+select { padding: 7px 10px; }

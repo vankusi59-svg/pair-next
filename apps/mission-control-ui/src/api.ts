@@ -47,6 +47,9 @@ export const api = {
   timeline: (id: string) => req<import("./types").TimelineEntry[]>(`/missions/${id}/timeline`),
   evidence: (id: string) => req<Array<Record<string, unknown>>>(`/missions/${id}/evidence`),
   routing: () => req<import("./types").RoutingProjection>("/routing"),
+  providers: () => req<{ providers: Array<Record<string, unknown>>; qualifications: Array<Record<string, unknown>> }>("/providers"),
+  models: () => req<{ models: Array<Record<string, unknown>>; bindings: Array<Record<string, unknown>>; qualifications: Array<Record<string, unknown>> }>("/models"),
+  routes: () => req<{ routes: Array<Record<string, unknown>>; model_bindings: Array<Record<string, unknown>>; routable_models: Array<Record<string, unknown>>; route_decisions: Array<Record<string, unknown>>; routing_decisions: Array<Record<string, unknown>> }>("/routes"),
   recovery: () => req<Record<string, unknown>>("/recovery"),
   approvals: () => req<Array<Record<string, unknown>>>("/approvals"),
   previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string }) =>
@@ -61,6 +64,7 @@ export const api = {
     }),
   missionAction: (id: string, action: "pause" | "resume" | "cancel" | "acknowledge") =>
     req<Record<string, unknown>>(`/missions/${id}/${action}`, { method: "POST", body: "{}" }),
+  modelRoutable: (id: string) => req<{ model: Record<string, unknown> | null; bindings: Array<Record<string, unknown>> }>(`/models/${id}/routable`),
   approve: (id: string, scope: Record<string, unknown>, reason?: string) =>
     req<Record<string, unknown>>(`/approvals/${id}/approve`, {
       method: "POST",

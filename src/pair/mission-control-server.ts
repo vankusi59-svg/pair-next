@@ -166,6 +166,12 @@ export function createMissionControlServer(
       m = p.match(/^\/api\/missions\/([^/]+)\/evidence$/);
       if (method === "GET" && m) return void json(res, 200, c.evidence(m[1]));
       if (method === "GET" && p === "/api/projects") return void json(res, 200, c.projects());
+      // §4.2 — provider/model/route read projections (read-only).
+      if (method === "GET" && p === "/api/providers") return void json(res, 200, c.providers());
+      if (method === "GET" && p === "/api/models") return void json(res, 200, c.models());
+      if (method === "GET" && p === "/api/routes") return void json(res, 200, c.routes());
+      m = p.match(/^\/api\/models\/([^/]+)\/routable$/);
+      if (method === "GET" && m) return void json(res, 200, c.modelRoutable(m[1]));
       if (method === "GET" && p === "/api/routing") return void json(res, 200, c.routing());
       if (method === "GET" && p === "/api/recovery") return void json(res, 200, c.recovery());
       if (method === "GET" && p === "/api/approvals") return void json(res, 200, c.approvals());
