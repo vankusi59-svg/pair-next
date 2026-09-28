@@ -118,13 +118,27 @@ const LLM_PLANNER_CAPS = [
   "CODE_GENERATION", "CODE_EDITING", "SHELL_EXECUTION", "PYTHON_EXECUTION",
   "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION",
 ];
+// Capability sets of the currently-qualified executors — sanitizePlan drops
+// any task whose required_capabilities no single executor can serve.
+const executorCapSets = () =>
+  [...adapters.values()]
+    .map((a) => {
+      try {
+        const c = a.capabilities();
+        if (c.qualified === false) return [];
+        return c.capability_ids ?? c.capabilities ?? [];
+      } catch {
+        return [];
+      }
+    })
+    .filter((s) => s.length);
 const planner = (input) => {
   const goal = String(input.mission.goal);
   const llm = input.mission?.metadata?.llm_plan;
   if (Array.isArray(llm) && llm.length) {
     // Safety re-check at the seam: sanitize again (defense in depth — the
     // API edge already sanitized; validatePlanProposal validates next).
-    const { tasks } = sanitizePlan(llm, LLM_PLANNER_CAPS, 5);
+    const { tasks } = sanitizePlan(llm, LLM_PLANNER_CAPS, 5, executorCapSets());
     if (tasks.length) {
       // PAIR_NATIVE tasks need an expected_output_contract worker_spec —
       // the LLM cannot emit one, so inject the canonical write-file
@@ -338,6 +352,7 @@ const planExpander = async (input) => {
     credentialEnv: planProvider.credentialEnv,
     model: planProvider.model,
     allowedCapabilities: LLM_PLANNER_CAPS,
+    capabilitySets: executorCapSets(),
   });
   return {
     ...input,

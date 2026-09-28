@@ -154,4 +154,52 @@ describe("P-UI-6 llm-planner", () => {
       .expected_output_contract.worker_spec;
     expect(spec.allowed_ops).toEqual(["write_text_file", "finish"]);
   });
+
+  it("drops tasks whose capability combo no single executor serves", () => {
+    const sets = [
+      ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
+      ["REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION"],
+    ];
+    const caps = ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION"];
+    const { tasks, warnings } = sanitizePlan(
+      [
+        { task_key: "T1", title: "a", task_instruction: "x", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
+        { task_key: "T2", title: "b", task_instruction: "x", required_capabilities: ["FILE_OPERATIONS", "REMOTE_CLOUD_TASK_EXECUTION"], depends_on: [] },
+        { task_key: "T3", title: "c", task_instruction: "x", required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION"], depends_on: [] },
+      ],
+      caps,
+      5,
+      sets,
+    );
+    expect(tasks.map((t) => t.task_key)).toEqual(["T1", "T3"]);
+    expect(warnings).toContain("DROP_UNSERVABLE_CAPS:T2");
+  });
+
+  it("drops tasks that depend on a remote-capability task (remote outputs are not local files)", () => {
+    const caps = ["AUTOMATON_TASK_EXECUTION", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION"];
+    const sets = [["AUTOMATON_TASK_EXECUTION"], ["REASONING"], ["REMOTE_CLOUD_TASK_EXECUTION"]];
+    const { tasks, warnings } = sanitizePlan(
+      [
+        { task_key: "T1", title: "a", task_instruction: "x", required_capabilities: ["AUTOMATON_TASK_EXECUTION"], depends_on: [] },
+        { task_key: "T2", title: "b", task_instruction: "x", required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION"], depends_on: ["T1"] },
+        { task_key: "T3", title: "c", task_instruction: "x", required_capabilities: ["REASONING"], depends_on: ["T2"] },
+        { task_key: "T4", title: "d", task_instruction: "x", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+      ],
+      caps,
+      5,
+      sets,
+    );
+    expect(tasks.map((t) => t.task_key)).toEqual(["T1", "T2", "T4"]);
+    expect(warnings).toContain("DROP_REMOTE_DEPENDENT:T3");
+  });
+
+  it("no capabilitySets → no servability check (backwards compatible)", () => {
+    const { tasks, warnings } = sanitizePlan(
+      [{ task_key: "T1", title: "a", task_instruction: "x", required_capabilities: ["REASONING"], depends_on: [] }],
+      CAPS,
+      5,
+    );
+    expect(tasks).toHaveLength(1);
+    expect(warnings).toEqual([]);
+  });
 });

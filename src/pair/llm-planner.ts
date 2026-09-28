@@ -24,6 +24,9 @@ export interface LlmPlannerConfig {
   maxTasks?: number;
   /** Whitelist of capabilities the LLM may request (non-empty per task). */
   allowedCapabilities: string[];
+  /** Each entry = one executor's capability list; a task whose caps are not
+   *  jointly servable by a single entry is dropped (DROP_UNSERVABLE_CAPS). */
+  capabilitySets?: string[][];
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv | ((name: string) => string | undefined);
   /** Injectable for tests — defaults to global fetch. */
@@ -104,20 +107,35 @@ function extractJson(text: string): unknown {
 }
 
 /**
+ * Capabilities served by remote executors whose outputs live on the remote
+ * side (returned as refs, not local workspace files). A remote task must be a
+ * DAG leaf: a downstream local task cannot consume a remote artifact.
+ */
+const REMOTE_CAPS = new Set([
+  "REMOTE_CLOUD_TASK_EXECUTION",
+  "AUTONOMOUS_CODE_EXECUTION",
+]);
+
+/**
  * Validate + clamp raw LLM tasks into a safe proposal. Rules (spec §2.1):
  * task_key T\d+ unique; depends_on only references earlier keys (acyclic);
  * required_capabilities ⊆ whitelist, non-empty; instruction ≤ cap;
  * count ≤ maxTasks; invalid tasks dropped (later deps re-pointed or dropped).
+ * + every task's capability set must be jointly servable by ≥1 executor
+ * (capabilitySets param, each entry = one executor's capability list); and
+ * remote-capability tasks must be leaves — no later task may depend on them.
  */
 export function sanitizePlan(
   raw: RawTask[],
   allowedCapabilities: string[],
   maxTasks: number,
+  capabilitySets?: string[][],
 ): { tasks: Array<Record<string, unknown>>; warnings: string[] } {
   const capSet = new Set(allowedCapabilities);
   const warnings: string[] = [];
   const tasks: Array<Record<string, unknown>> = [];
   const seen = new Set<string>();
+  const remoteKeys = new Set<string>();
   for (const t of raw) {
     if (tasks.length >= maxTasks) {
       warnings.push("MAX_TASKS_TRUNCATED");
@@ -135,18 +153,33 @@ export function sanitizePlan(
       warnings.push(`DROP_NO_ALLOWED_CAPS:${key}`);
       continue;
     }
+    // The capability set must be jointly servable by a single executor —
+    // routing picks one executor per task; an unservable combo is dead work.
+    if (
+      capabilitySets?.length &&
+      !capabilitySets.some((set) => caps.every((c) => set.includes(c)))
+    ) {
+      warnings.push(`DROP_UNSERVABLE_CAPS:${key}`);
+      continue;
+    }
     const instruction = String(t.task_instruction ?? "").slice(0, LLM_PLANNER_MAX_INSTRUCTION);
     if (!instruction.trim()) {
       warnings.push(`DROP_EMPTY_INSTRUCTION:${key}`);
       continue;
     }
-    // depends_on may only point at tasks already accepted → acyclic.
+    // Remote tasks are leaves — drop the task rather than prune the edge when
+    // a later task tries to depend on remote output that can never be local.
     const deps = Array.isArray(t.depends_on)
       ? [...new Set(t.depends_on.map((d) => String(d)).filter((d) => seen.has(d)))]
       : [];
+    if (deps.some((d) => remoteKeys.has(d))) {
+      warnings.push(`DROP_REMOTE_DEPENDENT:${key}`);
+      continue;
+    }
     if (Array.isArray(t.depends_on) && deps.length !== new Set(t.depends_on.map((d) => String(d))).size) {
       warnings.push(`DEP_FORWARD_OR_UNKNOWN_PRUNED:${key}`);
     }
+    if (caps.some((c) => REMOTE_CAPS.has(c))) remoteKeys.add(key);
     seen.add(key);
     const metadata =
       t.metadata && typeof t.metadata === "object" && !Array.isArray(t.metadata)
@@ -176,6 +209,7 @@ Output ONLY a JSON object: {"tasks": [...]}. Each task:
 Rules:
 - Always include a first task T1 that records the goal into mission_goal.txt via capability AUTOMATON_TASK_EXECUTION.
 - 2 to MAX_TASKS tasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS/AUTOMATON_TASK_EXECUTION for pure file writes.
+- REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION run on a REMOTE executor: their outputs stay remote (returned as refs, never local files). Such a task must be a DAG leaf — no other task may depend on it.
 - Keep task instructions concrete and verifiable; end with "then reply DONE."
 - No prose, no markdown — JSON only.`;
 
@@ -197,7 +231,11 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
 
   const userPrompt =
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +
-    `MAX_TASKS: ${maxTasks}\n\nMISSION GOAL:\n${goal}`;
+    `MAX_TASKS: ${maxTasks}\n` +
+    (cfg.capabilitySets?.length
+      ? `EXECUTOR_CAPABILITY_SETS (one executor can serve a task only when its set covers ALL the task's required_capabilities): ${cfg.capabilitySets.map((s) => `[${s.join(", ")}]`).join(" ")}\n`
+      : "") +
+    `\nMISSION GOAL:\n${goal}`;
 
   let text: string;
   try {
@@ -237,7 +275,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
   const rawTasks = (parsed as { tasks?: unknown })?.tasks;
   if (!Array.isArray(rawTasks) || !rawTasks.length) return fallback(["LLM_PLAN_NO_TASKS"]);
 
-  const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], cfg.allowedCapabilities, maxTasks);
+  const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], cfg.allowedCapabilities, maxTasks, cfg.capabilitySets);
   if (!tasks.length) return fallback(["LLM_PLAN_ALL_INVALID", ...warnings]);
   return { tasks, source: "LLM", model: cfg.model, warnings };
 }
