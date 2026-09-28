@@ -89,6 +89,14 @@ export class MissionControl {
     };
   }
 
+  /** §4.1 — canonical entity events after `sinceSeq` (hash-verified on read).
+   *  Drives the SSE stream; returns latest_seq so cursors don't regress. */
+  eventsSince(sinceSeq = 0): { events: Array<Record<string, unknown>>; latest_seq: number } {
+    const all = this.store.listEvents();
+    const latest = all.length ? Number(all[all.length - 1].seq ?? 0) : sinceSeq;
+    return { events: all.filter((e) => Number(e.seq ?? 0) > sinceSeq), latest_seq: latest };
+  }
+
   timeline(missionId: string) {
     return this.deps.observability.missionTimeline(missionId);
   }

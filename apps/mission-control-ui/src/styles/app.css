@@ -84,3 +84,9 @@ a { color: var(--accent); }
 .cred.ok { color: #4ade80; }
 .cred.no { color: #fca5a5; }
 select { padding: 7px 10px; }
+.tabs { display: flex; gap: 6px; margin: 10px 0 16px; }
+.tabs button { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; font-weight: 500; }
+.tabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+.filter { max-width: 340px; }
+.badge.b-fail { background: #7f1d1d; color: #fecaca; }
+section h2 { font-size: 15px; margin: 18px 0 8px; }

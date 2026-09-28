@@ -152,6 +152,40 @@ export function createMissionControlServer(
       if (method === "GET" && !p.startsWith("/api/") && deps.staticDir) {
         if (tryStatic(deps.staticDir, p, res)) return;
       }
+      // §4.1 — canonical event stream (SSE). Cursor = events.seq; EventSource
+      // resumes via Last-Event-ID. Emits the hash-verified journal projection
+      // only — read-only, never credentials or secret material.
+      if (method === "GET" && p === "/api/events") {
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+        });
+        let cursor = Number(
+          url.searchParams.get("last_seq") ?? req.headers["last-event-id"] ?? 0,
+        ) || 0;
+        const flush = () => {
+          try {
+            const { events, latest_seq } = c.eventsSince(cursor);
+            for (const e of events) {
+              res.write(`id: ${String(e.seq ?? 0)}\ndata: ${JSON.stringify(e)}\n\n`);
+            }
+            cursor = latest_seq;
+          } catch {
+            // hash mismatch / store error — tell clients to resync
+            res.write("event: resync\ndata: {}\n\n");
+          }
+        };
+        flush();
+        const iv = setInterval(flush, 400);
+        const hb = setInterval(() => res.write(":ping\n\n"), 15000);
+        req.on("close", () => {
+          clearInterval(iv);
+          clearInterval(hb);
+          res.end();
+        });
+        return;
+      }
       if (method === "GET" && p === "/api/health") return void json(res, 200, c.health());
       if (method === "GET" && p === "/api/metrics") return void json(res, 200, c.metrics());
       if (method === "GET" && p === "/api/missions") {

@@ -1,6 +1,7 @@
 import { useParams } from "react-router-dom";
 import { api } from "../api";
 import { useApi } from "../hooks/useApi";
+import { useLiveRefresh } from "../hooks/eventBus";
 import { StateBadge, TaskBadge } from "../components/Badge";
 import { DagView } from "../components/Dag";
 import { Timeline } from "../components/Timeline";
@@ -11,6 +12,8 @@ export function MissionDetail() {
   const dag = useApi(() => api.missionDag(id), [id], 3000);
   const timeline = useApi(() => api.timeline(id), [id], 3000);
   const evidence = useApi(() => api.evidence(id), [id], 5000);
+  useLiveRefresh(detail.reload);
+  useLiveRefresh(timeline.reload);
 
   if (detail.loading && !detail.data) return <div className="state">Loading mission…</div>;
   if (detail.error) return <div className="state err">{String(detail.error)}</div>;

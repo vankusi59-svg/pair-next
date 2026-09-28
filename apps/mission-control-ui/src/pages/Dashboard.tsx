@@ -1,12 +1,15 @@
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import { useApi } from "../hooks/useApi";
+import { useLiveRefresh } from "../hooks/eventBus";
 import { StateBadge } from "../components/Badge";
 
 export function Dashboard() {
   const health = useApi(() => api.health());
   const missions = useApi(() => api.missions());
   const routing = useApi(() => api.routing());
+  useLiveRefresh(missions.reload);
+  useLiveRefresh(routing.reload);
 
   if (missions.loading && !missions.data) return <div className="state">Loading…</div>;
   if (missions.error) return <div className="state err">{String(missions.error)}</div>;

@@ -1211,3 +1211,24 @@ describe("UI-3 §4.2 — provider/model/route read projections", () => {
     expect(some.bindings).toHaveLength(0);
   });
 });
+
+describe("UI-4 §4.1 — canonical event stream projection", () => {
+  it("eventsSince returns hash-verified events after cursor with monotonic latest_seq", () => {
+    const ctx = makeCtx("ui4");
+    const before = ctx.control.eventsSince(0);
+    startMission(ctx, "ui4 stream");
+    const after = ctx.control.eventsSince(before.latest_seq);
+    expect(after.latest_seq).toBeGreaterThan(before.latest_seq);
+    expect(after.events.length).toBeGreaterThan(0);
+    for (const e of after.events) {
+      expect(Number(e.seq)).toBeGreaterThan(before.latest_seq);
+      expect(e).toHaveProperty("entity_type");
+      expect(e).toHaveProperty("event_type");
+      expect(e).toHaveProperty("event_hash"); // verified on read by store
+    }
+    // cursor at latest → empty delta, seq does not regress
+    const none = ctx.control.eventsSince(after.latest_seq);
+    expect(none.events).toHaveLength(0);
+    expect(none.latest_seq).toBe(after.latest_seq);
+  });
+});
