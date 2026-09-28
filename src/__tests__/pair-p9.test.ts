@@ -15,6 +15,7 @@ import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
   DevinExecutorAdapter,
+  classifyFailure,
   ExecutorRegistry,
   ExperienceService,
   GovernedTaskGate,
@@ -796,6 +797,38 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     expect(result.governed_task_id).toBe("GT1");
     expect(result.status).toBe("COMPLETED");
     expect((result.remote_refs as Record<string, unknown>).session_id).toBe("devin-s1");
+  });
+
+  it("37b. Devin blocked session settles FAILED + REMOTE_INPUT_REQUIRED (immediate escalation)", () => {
+    const ctx = makeCtx("t37b");
+    const fetchFn: DevinFetch = (m) => ({
+      status: 200,
+      data: m === "GET" ? { status_enum: "blocked", url: "u-blocked" } : { session_id: "s1", url: "u-blocked" },
+    });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn });
+    const disp = adapter.dispatch({
+      executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      task_id: "t", mission_id: "m", governed_task_id: "GT1",
+      workspace: ctx.workspace, correlation_id: "c", allowed_paths: [ctx.workspace],
+    });
+    const observed = adapter.observe(String(disp.execution_id));
+    expect(observed.status).toBe("FAILED"); // terminal — never polls forever
+    const result = adapter.collect_result(String(disp.execution_id));
+    expect(result.status).toBe("FAILED");
+    expect((result.error as Record<string, unknown>).class).toBe("REMOTE_INPUT_REQUIRED");
+    expect(String((result.error as Record<string, unknown>).detail)).toContain("u-blocked");
+  });
+
+  it("37c. blocked → recovery escalates HUMAN_APPROVAL_REQUIRED, no retry", () => {
+    const ctx = makeCtx("t37c");
+    const decision = ctx.recovery.decide({
+      mission_id: "m",
+      task_id: "t",
+      failure_class: "REMOTE_INPUT_REQUIRED",
+      eligible_executors: ["DEVIN"],
+    });
+    expect(decision.selected_action).toBe("HUMAN_APPROVAL_REQUIRED");
+    expect(classifyFailure({ error_class: "REMOTE_INPUT_REQUIRED" })).toBe("REMOTE_INPUT_REQUIRED");
   });
 });
 

@@ -83,11 +83,15 @@ export interface DevinAdapterDeps {
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 
-/** Devin session status_enum → canonical execution state. */
+/** Devin session status_enum → canonical execution state. `blocked` means the
+ *  remote agent is waiting on operator input — it settles FAILED with error
+ *  class REMOTE_INPUT_REQUIRED so recovery escalates to the operator
+ *  immediately instead of polling a stalled session until TIMEOUT. */
 function mapStatus(statusEnum: string): string {
   const s = statusEnum.toLowerCase();
   if (s === "finished") return "COMPLETED";
-  if (s === "working" || s === "blocked" || s === "resumed") return "RUNNING";
+  if (s === "blocked") return "FAILED";
+  if (s === "working" || s === "resumed") return "RUNNING";
   if (s === "expired" || s.startsWith("suspend")) return "FAILED";
   return "RUNNING";
 }
@@ -421,7 +425,12 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       error:
         status === "COMPLETED"
           ? null
-          : { class: "DEVIN_REMOTE", detail: String(remoteDetail.status_enum ?? rec.status) },
+          : rec.remote_status_enum === "blocked"
+            ? {
+                class: "REMOTE_INPUT_REQUIRED",
+                detail: `remote session blocked awaiting operator input: ${remoteDetail.url ?? rec.remote_url ?? remoteId}`,
+              }
+            : { class: "DEVIN_REMOTE", detail: String(remoteDetail.status_enum ?? rec.status) },
       provenance: {
         producer: this.executor_id,
         transport: DEVIN_TRANSPORT,

@@ -41,6 +41,7 @@ export const FAILURE_CLASSES = [
   "UNKNOWN_SIDE_EFFECT_STATE",
   "PLAN_INVALIDATED",
   "ENVIRONMENT_INCOMPATIBLE",
+  "REMOTE_INPUT_REQUIRED",
   "INTERNAL_RUNTIME_DEFECT",
   "UNKNOWN",
 ] as const;
@@ -88,6 +89,10 @@ export const RECOVERY_MATRIX: Record<FailureClass, MatrixRow> = {
   UNKNOWN_SIDE_EFFECT_STATE: { actions: ["RECONCILIATION_REQUIRED", "HUMAN_APPROVAL_REQUIRED"], retry_allowed: false },
   PLAN_INVALIDATED: { actions: ["REPLAN"], retry_allowed: false },
   ENVIRONMENT_INCOMPATIBLE: { actions: ["RE_ROUTE", "REPLAN", "ABORT"], retry_allowed: false },
+  // Remote agent settled while waiting on operator input — only a human can
+  // unblock it (answer the session, supply a credential), so escalate
+  // immediately; retrying just respawns a session that blocks again.
+  REMOTE_INPUT_REQUIRED: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false },
   INTERNAL_RUNTIME_DEFECT: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false, may_create_selfmod_candidate: true },
   UNKNOWN: { actions: ["RECONCILIATION_REQUIRED", "ABORT"], retry_allowed: false },
 };
@@ -113,6 +118,7 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = {
 };
 
 const CLASS_RULES: Array<[RegExp, FailureClass]> = [
+  [/REMOTE_INPUT_REQUIRED|AWAITING_INPUT|BLOCKED_AWAITING/i, "REMOTE_INPUT_REQUIRED"],
   [/RATE_LIMIT|429|TPD|TPM|QUOTA/i, "RATE_LIMITED"],
   [/AUTH(ENTICATION)?_|CREDENTIAL|UNAUTHORIZED_401|LOGIN/i, "AUTHENTICATION_FAILURE"],
   [/AUTHORIZATION|FORBIDDEN|DENY_BY|403/i, "AUTHORIZATION_FAILURE"],
