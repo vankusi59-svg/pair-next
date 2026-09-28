@@ -40,6 +40,7 @@ import {
   PairEvidenceStore,
   PairNativeExecutorAdapter,
   PairNativeWorkerRunner,
+  BusinessLayer,
   CredentialBroker,
   ReconciliationService,
   RecoveryController,
@@ -263,12 +264,14 @@ const broker = new CredentialBroker({
       metadata: { credential_name: e.credential_name, task_id: e.task_id, granted: e.granted },
     }),
 });
+const schedules = new MissionScheduleService(service);
 const control = new MissionControl({
   service, runtime, supervisor: sup, scheduler, approvals, reconciliation: recon,
   observability: new MissionObservability(service), selfmod, planner,
-  schedules: new MissionScheduleService(service),
+  schedules,
   costHaltFile: COST_HALT_FILE,
 });
+const business = new BusinessLayer({ store, control, schedules });
 
 registry.register({
   executor_id: PAIR_NATIVE_EXECUTOR_ID,
@@ -439,6 +442,9 @@ const server = createMissionControlServer({
   // the normal MC-token routes /api/credentials.
   broker,
   brokerToken: process.env.PAIR_BROKER_TOKEN || undefined,
+  // Business layer: companies/org-agents/work-items/routines/budgets —
+  // always on; entities live in the canonical store alongside missions.
+  business,
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

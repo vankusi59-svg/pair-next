@@ -14,6 +14,7 @@ import path from "node:path";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
+import type { BusinessLayer } from "./business.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -50,6 +51,9 @@ export interface MissionControlServerDeps {
    */
   broker?: CredentialBroker;
   brokerToken?: string;
+  /** Optional business layer: companies → org agents → work items →
+   *  routines → budgets, all dispatching through startMission. */
+  business?: BusinessLayer;
 }
 
 const MIME: Record<string, string> = {
@@ -94,7 +98,8 @@ table{border-collapse:collapse;font-size:12px}td,th{border:1px solid #26303f;pad
 const VIEWS={
  "Missions":"/api/missions","Health":"/api/health","Metrics":"/api/metrics",
  "Routing":"/api/routing","Recovery":"/api/recovery","Approvals":"/api/approvals",
- "Experience":"/api/experience","Self-Improvement":"/api/selfmod"};
+ "Experience":"/api/experience","Self-Improvement":"/api/selfmod",
+ "Business":"/api/businesses"};
 const nav=document.getElementById("tabs"),view=document.getElementById("view"),op=document.getElementById("op");
 let cur="Missions";
 for(const name of Object.keys(VIEWS)){
@@ -125,8 +130,50 @@ async function load(){
     '<td><button onclick="decide(\\''+a.approval_id+'\\',\\'approve\\')">approve</button>'+
     '<button onclick="decide(\\''+a.approval_id+'\\',\\'deny\\')">deny</button></td></tr>').join("")+"</table>"+html;
  }
+ if(cur==="Business"){
+  html='<div><input id="bizName" placeholder="business name"> <input id="bizPrj" placeholder="project_id">'+
+   ' <button onclick="mkBiz()">create business</button></div>'+
+   '<div id="bizList"></div><div id="bizBoard"></div>'+html;
+  view.innerHTML=html;renderBiz(r.data);return;
+ }
  view.innerHTML=html;
 }
+async function renderBiz(data){
+ const list=(data.businesses||[]);
+ document.getElementById("bizList").innerHTML="<h2>businesses</h2>"+
+  list.map(b=>'<button onclick="bizDetail(\\''+b.business_id+'\\')">'+esc(b.name)+'</button> ').join("")+
+  (list.length?"":"none yet");
+}
+async function mkBiz(){
+ const r=await api("/api/businesses","POST",{name:document.getElementById("bizName").value,
+  project_id:document.getElementById("bizPrj").value});
+ if(r.status!==200)alert(JSON.stringify(r.data));load();
+}
+async function bizDetail(id){
+ const r=await api("/api/businesses/"+id);
+ const d=r.data,bb=document.getElementById("bizBoard");
+ if(!d.business){bb.innerHTML="<pre>"+esc(JSON.stringify(d,null,1))+"</pre>";return}
+ const cols=d.board||{};
+ let h="<h2>"+esc(d.business.name)+"</h2>"+
+  '<div><input id="wiTitle" placeholder="work item title"> <input id="wiGoal" placeholder="goal">'+
+  ' <button onclick="mkWi(\\''+id+'\\')">+ work item</button>'+
+  ' <input id="rtName" placeholder="routine name"> <input id="rtCron" placeholder="cron * * * * *">'+
+  ' <input id="rtGoal" placeholder="goal template"> <button onclick="mkRt(\\''+id+'\\')">+ routine</button></div>';
+ for(const s of Object.keys(cols)){
+  h+="<h3>"+s+" ("+cols[s].length+")</h3><table>"+cols[s].map(w=>
+   "<tr><td>"+esc(w.work_item_id)+"</td><td>"+esc(w.title)+"</td><td>"+esc(w.department||"-")+"</td>"+
+   "<td>"+(s==="READY"||s==="BLOCKED"||s==="BACKLOG"?'<button onclick="openWi(\\''+w.work_item_id+'\\')">open</button>':"")+"</td></tr>").join("")+"</table>";
+ }
+ h+="<h3>agents</h3><table>"+(d.agents||[]).map(a=>"<tr><td>"+esc(a.agent_id)+"</td><td>"+esc(a.title)+"</td><td>"+esc(a.department)+"</td><td>"+esc(a.status)+"</td></tr>").join("")+"</table>";
+ h+='<div><input id="agTitle" placeholder="agent title"> <input id="agDept" placeholder="dept"> <button onclick="mkAg(\\''+id+'\\')">+ agent</button></div>';
+ h+="<h3>routines</h3><table>"+(d.routines||[]).map(rt=>"<tr><td>"+esc(rt.name)+"</td><td>"+esc(rt.cron)+"</td><td>"+esc(rt.enabled?"on":"off")+"</td><td><button onclick=\"rtTog('"+rt.routine_id+"',"+(!rt.enabled)+")\">toggle</button></td></tr>").join("")+"</table>";
+ bb.innerHTML=h;
+}
+async function mkAg(bid){const r=await api("/api/org-agents","POST",{business_id:bid,title:document.getElementById("agTitle").value,department:document.getElementById("agDept").value});if(r.status!==200)alert(JSON.stringify(r.data));bizDetail(bid)}
+async function mkWi(bid){const r=await api("/api/work-items","POST",{business_id:bid,title:document.getElementById("wiTitle").value,goal:document.getElementById("wiGoal").value});if(r.status!==200)alert(JSON.stringify(r.data));bizDetail(bid)}
+async function mkRt(bid){const r=await api("/api/routines","POST",{business_id:bid,name:document.getElementById("rtName").value,goal_template:document.getElementById("rtGoal").value,cron:document.getElementById("rtCron").value});if(r.status!==200)alert(JSON.stringify(r.data));bizDetail(bid)}
+async function openWi(id){const r=await api("/api/work-items/"+id+"/open","POST",{});if(r.status!==200)alert(JSON.stringify(r.data));load()}
+async function rtTog(id,en){const r=await api("/api/routines/"+id+"/"+(en?"enable":"disable"),"POST",{});if(r.status!==200)alert(JSON.stringify(r.data));load()}
 async function act(id,a){await api("/api/missions/"+id+"/"+a,"POST",{});load()}
 async function decide(id,a){
  const aData=(await api("/api/approvals")).data.find(x=>x.approval_id===id);
@@ -426,6 +473,102 @@ export function createMissionControlServer(
       }
       if (method === "POST" && p === "/api/tick") {
         return void json(res, 200, c.tick());
+      }
+      // ---------- business layer ----------
+      const biz = deps.business;
+      if (method === "GET" && p === "/api/businesses") {
+        return void json(res, 200, { businesses: biz ? biz.listBusinesses() : [] });
+      }
+      if (method === "POST" && p === "/api/businesses") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.createBusiness({
+          name: String(body.name ?? ""), project_id: String(body.project_id ?? ""),
+          description: String(body.description ?? "") || undefined,
+          currency: String(body.currency ?? "") || undefined, operator_id: String(operator),
+        }));
+      }
+      m = p.match(/^\/api\/businesses\/([^/]+)$/);
+      if (method === "GET" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.detail(m[1]));
+      }
+      if (method === "GET" && p === "/api/org-agents") {
+        return void json(res, 200, { agents: biz ? biz.listOrgAgents() : [] });
+      }
+      if (method === "POST" && p === "/api/org-agents") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.createOrgAgent({
+          business_id: String(body.business_id ?? ""), title: String(body.title ?? ""),
+          department: String(body.department ?? ""), role: String(body.role ?? "") || undefined,
+          reports_to: String(body.reports_to ?? "") || undefined,
+          executor_binding: String(body.executor_binding ?? "") || undefined,
+          operator_id: String(operator),
+        }));
+      }
+      m = p.match(/^\/api\/org-agents\/([^/]+)\/(pause|resume|terminate)$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const st = m[2] === "pause" ? "PAUSED" : m[2] === "resume" ? "ACTIVE" : "TERMINATED";
+        return void json(res, 200, biz.setOrgAgentStatus(m[1], st, String(operator)));
+      }
+      if (method === "GET" && p === "/api/work-items") {
+        const bid = url.searchParams.get("business_id") ?? undefined;
+        return void json(res, 200, { work_items: biz ? biz.listWorkItems(bid) : [] });
+      }
+      if (method === "POST" && p === "/api/work-items") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.createWorkItem({
+          business_id: String(body.business_id ?? ""), title: String(body.title ?? ""),
+          goal: String(body.goal ?? ""), department: String(body.department ?? "") || undefined,
+          assignee_agent_id: String(body.assignee_agent_id ?? "") || undefined,
+          priority: typeof body.priority === "number" ? body.priority : undefined,
+          operator_id: String(operator),
+        }));
+      }
+      m = p.match(/^\/api\/work-items\/([^/]+)\/(open|assign|cancel)$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const [, wid, wact] = m;
+        const out =
+          wact === "open" ? biz.openWorkItem(wid, String(operator))
+          : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), String(operator))
+          : biz.syncWorkItem(wid); // cancel → resync (mission cancel stays a mission-level action)
+        return void json(res, 200, out);
+      }
+      if (method === "GET" && p === "/api/routines") {
+        const bid = url.searchParams.get("business_id") ?? undefined;
+        return void json(res, 200, { routines: biz ? biz.listRoutines(bid) : [] });
+      }
+      if (method === "POST" && p === "/api/routines") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.createRoutine({
+          business_id: String(body.business_id ?? ""), name: String(body.name ?? ""),
+          goal_template: String(body.goal_template ?? ""), cron: String(body.cron ?? ""),
+          department: String(body.department ?? "") || undefined,
+          assignee_agent_id: String(body.assignee_agent_id ?? "") || undefined,
+          operator_id: String(operator),
+        }));
+      }
+      m = p.match(/^\/api\/routines\/([^/]+)\/(enable|disable)$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.setRoutineEnabled(m[1], m[2] === "enable", String(operator)));
+      }
+      if (method === "GET" && p === "/api/budgets") {
+        const bid = url.searchParams.get("business_id") ?? undefined;
+        return void json(res, 200, { budgets: biz ? biz.listBudgetPolicies(bid) : [] });
+      }
+      if (method === "POST" && p === "/api/budgets") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.createBudgetPolicy({
+          business_id: String(body.business_id ?? ""),
+          scope_type: String(body.scope_type ?? "") as never,
+          scope_id: String(body.scope_id ?? "") || undefined,
+          period: String(body.period ?? "DAY") as never,
+          max_missions: Number(body.max_missions ?? 0),
+          hard_stop: body.hard_stop !== false,
+          operator_id: String(operator),
+        }));
       }
       json(res, 404, { error: "NOT_FOUND", path: p });
     } catch (error) {

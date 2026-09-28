@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
+  BusinessLayer,
   DevinExecutorAdapter,
   classifyFailure,
   ExecutorRegistry,
@@ -1705,5 +1706,128 @@ describe("Schedules — recurring mission triggers", () => {
     const found = svc2.get(String(s.schedule_id));
     expect(found.goal).toBe("persist me");
     expect(found.enabled).toBe(true);
+  });
+});
+
+/* ------------------------------ business layer ------------------------------ */
+
+function makeBizCtx(name: string) {
+  const ctx = makeCtx(name);
+  const schedules = new MissionScheduleService(ctx.service);
+  const biz = new BusinessLayer({ store: ctx.store, control: ctx.control, schedules });
+  return { ctx, biz, schedules };
+}
+
+describe("business layer (one-person-business skeleton)", () => {
+  it("business → agent → work_item → open dispatches governed mission", () => {
+    const { ctx, biz } = makeBizCtx("b1");
+    const b = biz.createBusiness({ name: "IndicatorCo", project_id: ctx.projectId, operator_id: "op" });
+    const a = biz.createOrgAgent({ business_id: String(b.business_id), title: "Marketer", department: "marketing", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: String(b.business_id), title: "daily post", goal: "write post", assignee_agent_id: String(a.agent_id), operator_id: "op" });
+    expect(String(w.status)).toBe("READY");
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    expect(String(opened.status)).toBe("IN_PROGRESS");
+    const mid = (opened.mission_ids as string[])[0];
+    const mission = ctx.store.get("mission", mid);
+    const md = mission.metadata as Record<string, unknown>;
+    expect(String(md.business_id)).toBe(String(b.business_id));
+    expect(String(md.work_item_id)).toBe(String(w.work_item_id));
+    expect(String(mission.goal)).toContain("[BUSINESS IndicatorCo | DEPT marketing | AGENT Marketer");
+    expect(String(mission.goal)).toContain("write post");
+    const evs = ctx.store.listEvents("work_item", String(w.work_item_id)).filter((e) => String(e.event_type) === "WORK_ITEM_OPENED");
+    expect(evs).toHaveLength(1);
+  });
+
+  it("fail-closed: assignee from another business rejected", () => {
+    const { ctx, biz } = makeBizCtx("b2");
+    const b1 = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const b2 = biz.createBusiness({ name: "B", project_id: ctx.projectId, operator_id: "op" });
+    const a = biz.createOrgAgent({ business_id: String(b2.business_id), title: "X", department: "sales", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: String(b1.business_id), title: "t", goal: "g", operator_id: "op" });
+    expect(() => biz.assignWorkItem(String(w.work_item_id), String(a.agent_id), "op"))
+      .toThrowError(/FAIL_CLOSED_WORK_ITEM_SCOPE/);
+  });
+
+  it("fail-closed: paused agent cannot receive work", () => {
+    const { ctx, biz } = makeBizCtx("b3");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const a = biz.createOrgAgent({ business_id: String(b.business_id), title: "X", department: "sales", operator_id: "op" });
+    biz.setOrgAgentStatus(String(a.agent_id), "PAUSED", "op");
+    const w = biz.createWorkItem({ business_id: String(b.business_id), title: "t", goal: "g", operator_id: "op" });
+    expect(() => biz.assignWorkItem(String(w.work_item_id), String(a.agent_id), "op"))
+      .toThrowError(/FAIL_CLOSED_AGENT_INACTIVE/);
+  });
+
+  it("budget hard-stop blocks open and records BUDGET_EXCEEDED", () => {
+    const { ctx, biz } = makeBizCtx("b4");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    biz.createBudgetPolicy({ business_id: String(b.business_id), scope_type: "business", period: "DAY", max_missions: 1, operator_id: "op" });
+    const w1 = biz.createWorkItem({ business_id: String(b.business_id), title: "t1", goal: "g", operator_id: "op" });
+    const w2 = biz.createWorkItem({ business_id: String(b.business_id), title: "t2", goal: "g", operator_id: "op" });
+    biz.openWorkItem(String(w1.work_item_id), "op");
+    expect(() => biz.openWorkItem(String(w2.work_item_id), "op"))
+      .toThrowError(/FAIL_CLOSED_BUDGET_EXCEEDED/);
+    const evs = ctx.store.listEvents("budget_policy").filter((e) => String(e.event_type) === "BUDGET_EXCEEDED");
+    expect(evs).toHaveLength(1);
+    // second item never dispatched — still BACKLOG (unassigned → no agent)
+    expect(biz.board(String(b.business_id)).BACKLOG).toHaveLength(1);
+    expect(biz.board(String(b.business_id)).IN_PROGRESS).toHaveLength(1);
+  });
+
+  it("routine compiles to mission_schedule and toggles it", () => {
+    const { ctx, biz } = makeBizCtx("b5");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const r = biz.createRoutine({ business_id: String(b.business_id), name: "morning post", goal_template: "post analysis", cron: "0 7 * * *", operator_id: "op" });
+    const sched = ctx.store.get("mission_schedule", String(r.schedule_id));
+    expect(sched.enabled).toBe(true);
+    expect(String(sched.goal)).toContain("[ROUTINE morning post | BUSINESS A | DEPT -]");
+    biz.setRoutineEnabled(String(r.routine_id), false, "op");
+    expect(ctx.store.get("mission_schedule", String(r.schedule_id)).enabled).toBe(false);
+    expect(ctx.store.get("routine", String(r.routine_id)).enabled).toBe(false);
+  });
+
+  it("board syncs terminal mission → DONE", () => {
+    const { ctx, biz } = makeBizCtx("b6");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: String(b.business_id), title: "t", goal: "g", operator_id: "op" });
+    biz.openWorkItem(String(w.work_item_id), "op");
+    const mid = (biz.listWorkItems(String(b.business_id))[0].mission_ids as string[])[0];
+    const mission = ctx.store.get("mission", mid);
+    mission.status = "COMPLETED";
+    ctx.store.put("mission", mid, mission, Number(mission.version));
+    const cols = biz.board(String(b.business_id));
+    expect(cols.DONE).toHaveLength(1);
+    expect(cols.IN_PROGRESS).toHaveLength(0);
+  });
+
+  it("server exposes business routes end-to-end", async () => {
+    const ctx = makeCtx("b7");
+    const schedules = new MissionScheduleService(ctx.service);
+    const biz = new BusinessLayer({ store: ctx.store, control: ctx.control, schedules });
+    const server = createMissionControlServer({ control: ctx.control, business: biz });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    const headers = { "content-type": "application/json", "x-operator-id": "op" };
+    try {
+      const rb = await fetch(`${base}/api/businesses`, { method: "POST", headers, body: JSON.stringify({ name: "NetCo", project_id: ctx.projectId }) });
+      expect(rb.status).toBe(200);
+      const bizRow = (await rb.json()) as Record<string, unknown>;
+      const ra = await fetch(`${base}/api/org-agents`, { method: "POST", headers, body: JSON.stringify({ business_id: bizRow.business_id, title: "Seller", department: "sales" }) });
+      expect(ra.status).toBe(200);
+      const ag = (await ra.json()) as Record<string, unknown>;
+      const rw = await fetch(`${base}/api/work-items`, { method: "POST", headers, body: JSON.stringify({ business_id: bizRow.business_id, title: "pitch", goal: "draft pitch", assignee_agent_id: ag.agent_id }) });
+      const wi = (await rw.json()) as Record<string, unknown>;
+      const ro = await fetch(`${base}/api/work-items/${wi.work_item_id}/open`, { method: "POST", headers, body: "{}" });
+      expect(ro.status).toBe(200);
+      const rd = await fetch(`${base}/api/businesses/${bizRow.business_id}`);
+      const detail = (await rd.json()) as Record<string, unknown>;
+      expect(((detail.board as Record<string, unknown[]>).IN_PROGRESS ?? []).length).toBe(1);
+      // operator gate: POST without x-operator-id → 403
+      const rno = await fetch(`${base}/api/businesses`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      expect(rno.status).toBe(403);
+    } finally {
+      server.close();
+    }
   });
 });
