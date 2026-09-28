@@ -83,10 +83,10 @@ export function MissionNew() {
         Submit is two steps: the governed planner proposes a plan, you review it, then confirm —
         the server rejects the submit if the plan digest changed since preview.
       </p>
-      <label>Goal</label>
-      <textarea rows={5} value={goal} onChange={(e) => { setGoal(e.target.value); setPreview(null); }} placeholder="e.g. record this objective in the workspace" />
-      <label>Project</label>
-      <select value={projectId} onChange={(e) => { setProjectId(e.target.value); setPreview(null); }}>
+      <label htmlFor="goal">Goal</label>
+      <textarea id="goal" rows={5} value={goal} onChange={(e) => { setGoal(e.target.value); setPreview(null); }} placeholder="e.g. record this objective in the workspace" />
+      <label htmlFor="project">Project</label>
+      <select id="project" value={projectId} onChange={(e) => { setProjectId(e.target.value); setPreview(null); }}>
         <option value="">— pick a project —</option>
         {(projects.data ?? []).map((p) => (
           <option key={String(p.project_id)} value={String(p.project_id)}>

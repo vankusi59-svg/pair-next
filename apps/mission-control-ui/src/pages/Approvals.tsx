@@ -1,8 +1,11 @@
 import { api } from "../api";
 import { useApi } from "../hooks/useApi";
+import { useLiveRefresh } from "../hooks/eventBus";
+import { toast } from "../components/Toast";
 
 export function Approvals() {
   const q = useApi(() => api.approvals(), [], 4000);
+  useLiveRefresh(q.reload);
   const list = (q.data ?? []) as Array<Record<string, unknown>>;
 
   const act = async (a: Record<string, unknown>, kind: "approve" | "deny") => {
@@ -10,9 +13,10 @@ export function Approvals() {
     const scope = (a.scope ?? {}) as Record<string, unknown>;
     try {
       await (kind === "approve" ? api.approve(id, scope) : api.deny(id, scope));
+      toast(`${kind} recorded`, "ok");
       q.reload();
     } catch (e) {
-      alert(String(e));
+      toast(String(e), "err");
     }
   };
 

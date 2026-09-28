@@ -5,6 +5,7 @@ import { useLiveRefresh } from "../hooks/eventBus";
 import { StateBadge, TaskBadge } from "../components/Badge";
 import { DagView } from "../components/Dag";
 import { Timeline } from "../components/Timeline";
+import { toast } from "../components/Toast";
 
 export function MissionDetail() {
   const { id = "" } = useParams();
@@ -27,9 +28,10 @@ export function MissionDetail() {
   const act = async (a: "pause" | "resume" | "cancel" | "acknowledge") => {
     try {
       await api.missionAction(id, a);
+      toast(`${a} accepted`, "ok");
       detail.reload();
     } catch (e) {
-      alert(String(e));
+      toast(String(e), "err");
     }
   };
 
