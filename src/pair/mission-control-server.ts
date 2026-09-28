@@ -161,10 +161,16 @@ async function bizDetail(id){
   ' <input id="rtGoal" placeholder="goal template"> <button onclick="mkRt(\\''+id+'\\')">+ routine</button></div>';
  for(const s of Object.keys(cols)){
   h+="<h3>"+s+" ("+cols[s].length+")</h3><table>"+cols[s].map(w=>
-   "<tr><td>"+esc(w.work_item_id)+"</td><td>"+esc(w.title)+"</td><td>"+esc(w.department||"-")+"</td>"+
-   "<td>"+(s==="READY"||s==="BLOCKED"||s==="BACKLOG"?'<button onclick="openWi(\\''+w.work_item_id+'\\')">open</button>':"")+"</td></tr>").join("")+"</table>";
+   "<tr><td>"+esc(w.work_item_id)+"</td><td>"+esc(w.title)+(w.routine_id?" [routine]":"")+(w.claimed_by?" <b>held:"+esc(String(w.claimed_by).slice(0,14))+"</b>":"")+"</td><td>"+esc(w.department||"-")+"</td>"+
+   "<td>"+esc(((w.blockers||[]).length?"blk:"+(w.blockers||[]).length+" ":"")+((w.comments||[]).length?"cmts:"+(w.comments||[]).length+" ":"")+((w.artifacts||[]).length?"art:"+(w.artifacts||[]).length:""))+"</td>"+
+   "<td>"+(s==="READY"||s==="BLOCKED"||s==="BACKLOG"?'<button onclick="openWi(\\''+w.work_item_id+'\\')">open</button>':"")+"</td>"+
+   "<td>"+(s!=="DONE"&&s!=="CANCELLED"?'<button onclick="wiBlock(\\''+w.work_item_id+'\\')">block</button>':"")+"</td>"+
+   "<td>"+(s==="BLOCKED"?'<button onclick="wiUnblock(\\''+w.work_item_id+'\\')">unblock</button>':"")+"</td>"+
+   "<td>"+(s!=="DONE"&&s!=="CANCELLED"?'<button onclick="wiCmt(\\''+w.work_item_id+'\\')">comment</button>':"")+"</td></tr>").join("")+"</table>";
  }
- h+="<h3>agents</h3><table>"+(d.agents||[]).map(a=>"<tr><td>"+esc(a.agent_id)+"</td><td>"+esc(a.title)+"</td><td>"+esc(a.department)+"</td><td>"+esc(a.status)+"</td></tr>").join("")+"</table>";
+ h+="<h3>objectives</h3><table>"+(d.objectives||[]).map(o=>"<tr><td>"+esc(o.objective_id)+"</td><td>"+esc(o.title)+"</td><td>"+esc(o.metric||"-")+"</td><td>"+esc(o.target||"-")+"</td></tr>").join("")+"</table>";
+ h+='<div><input id="objTitle" placeholder="objective title"> <input id="objMetric" placeholder="metric"> <input id="objTarget" placeholder="target"> <button onclick="mkObj(\\''+id+'\\')">+ objective</button></div>';
+ h+="<h3>agents</h3><table>"+(d.agents||[]).map(a=>"<tr><td>"+esc(a.agent_id)+"</td><td>"+esc(a.title)+"</td><td>"+esc(a.department)+"</td><td>"+esc(a.status)+"</td><td>"+esc(((a.context_notes||[]).length)+" notes")+"</td></tr>").join("")+"</table>";
  h+='<div><input id="agTitle" placeholder="agent title"> <input id="agDept" placeholder="dept"> <button onclick="mkAg(\\''+id+'\\')">+ agent</button></div>';
  h+="<h3>routines</h3><table>"+(d.routines||[]).map(rt=>"<tr><td>"+esc(rt.name)+"</td><td>"+esc(rt.cron)+"</td><td>"+esc(rt.enabled?"on":"off")+"</td><td><button onclick=\"rtTog('"+rt.routine_id+"',"+(!rt.enabled)+")\">toggle</button></td></tr>").join("")+"</table>";
  bb.innerHTML=h;
@@ -173,6 +179,10 @@ async function mkAg(bid){const r=await api("/api/org-agents","POST",{business_id
 async function mkWi(bid){const r=await api("/api/work-items","POST",{business_id:bid,title:document.getElementById("wiTitle").value,goal:document.getElementById("wiGoal").value});if(r.status!==200)alert(JSON.stringify(r.data));bizDetail(bid)}
 async function mkRt(bid){const r=await api("/api/routines","POST",{business_id:bid,name:document.getElementById("rtName").value,goal_template:document.getElementById("rtGoal").value,cron:document.getElementById("rtCron").value});if(r.status!==200)alert(JSON.stringify(r.data));bizDetail(bid)}
 async function openWi(id){const r=await api("/api/work-items/"+id+"/open","POST",{});if(r.status!==200)alert(JSON.stringify(r.data));load()}
+async function wiBlock(id){const reason=prompt("block reason");if(!reason)return;const r=await api("/api/work-items/"+id+"/block","POST",{reason});if(r.status!==200)alert(JSON.stringify(r.data));load()}
+async function wiUnblock(id){const r=await api("/api/work-items/"+id+"/unblock","POST",{});if(r.status!==200)alert(JSON.stringify(r.data));load()}
+async function wiCmt(id){const body=prompt("comment");if(!body)return;const r=await api("/api/work-items/"+id+"/comment","POST",{body});if(r.status!==200)alert(JSON.stringify(r.data));load()}
+async function mkObj(bid){const r=await api("/api/objectives","POST",{business_id:bid,title:document.getElementById("objTitle").value,metric:document.getElementById("objMetric").value,target:document.getElementById("objTarget").value});if(r.status!==200)alert(JSON.stringify(r.data));bizDetail(bid)}
 async function rtTog(id,en){const r=await api("/api/routines/"+id+"/"+(en?"enable":"disable"),"POST",{});if(r.status!==200)alert(JSON.stringify(r.data));load()}
 async function act(id,a){await api("/api/missions/"+id+"/"+a,"POST",{});load()}
 async function decide(id,a){
@@ -521,9 +531,26 @@ export function createMissionControlServer(
           business_id: String(body.business_id ?? ""), title: String(body.title ?? ""),
           goal: String(body.goal ?? ""), department: String(body.department ?? "") || undefined,
           assignee_agent_id: String(body.assignee_agent_id ?? "") || undefined,
+          objective_id: String(body.objective_id ?? "") || undefined,
           priority: typeof body.priority === "number" ? body.priority : undefined,
           operator_id: String(operator),
         }));
+      }
+      m = p.match(/^\/api\/work-items\/([^/]+)\/(claim|release|comment|block|unblock|artifacts)$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const [, wid, wact] = m;
+        const out =
+          wact === "claim" ? biz.claimWorkItem(wid, String(body.agent_id ?? ""), String(operator))
+          : wact === "release" ? biz.releaseClaim(wid, String(operator))
+          : wact === "comment" ? biz.commentOnWorkItem(wid, String(body.author ?? operator), String(body.body ?? ""))
+          : wact === "block" ? biz.blockWorkItem(wid, String(body.reason ?? ""), String(operator))
+          : wact === "unblock" ? biz.unblockWorkItem(wid, String(operator))
+          : biz.attachWorkItemArtifact(wid, {
+              name: String(body.name ?? ""), uri: String(body.uri ?? ""),
+              content_type: String(body.content_type ?? "") || undefined,
+            }, String(operator));
+        return void json(res, 200, out);
       }
       m = p.match(/^\/api\/work-items\/([^/]+)\/(open|assign|cancel)$/);
       if (method === "POST" && m) {
@@ -553,6 +580,21 @@ export function createMissionControlServer(
       if (method === "POST" && m) {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
         return void json(res, 200, biz.setRoutineEnabled(m[1], m[2] === "enable", String(operator)));
+      }
+      if (method === "GET" && p === "/api/objectives") {
+        const bid = url.searchParams.get("business_id") ?? undefined;
+        return void json(res, 200, { objectives: biz ? biz.listObjectives(bid) : [] });
+      }
+      if (method === "POST" && p === "/api/objectives") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.createObjective({
+          business_id: String(body.business_id ?? ""), title: String(body.title ?? ""),
+          description: String(body.description ?? "") || undefined,
+          parent_objective_id: String(body.parent_objective_id ?? "") || undefined,
+          metric: String(body.metric ?? "") || undefined,
+          target: String(body.target ?? "") || undefined,
+          operator_id: String(operator),
+        }));
       }
       if (method === "GET" && p === "/api/budgets") {
         const bid = url.searchParams.get("business_id") ?? undefined;

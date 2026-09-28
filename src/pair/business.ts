@@ -43,6 +43,18 @@ export type BudgetPeriod = (typeof BUDGET_PERIODS)[number];
 export const BUDGET_SCOPES = ["business", "department", "agent"] as const;
 export type BudgetScope = (typeof BUDGET_SCOPES)[number];
 
+/** How long a work-item claim stays valid before another agent may take over. */
+const CLAIM_TTL_MS = Number(process.env.PAIR_WORK_ITEM_CLAIM_MS ?? 30 * 60 * 1000);
+/** Context notes kept per org_agent; newest kept, oldest trimmed. */
+const AGENT_CONTEXT_CAP = 30;
+/** How many agent context notes are injected into a new mission goal. */
+const AGENT_CONTEXT_INJECT = 5;
+const COMMENT_CAP = 200;
+
+function isClaimActive(row: Row, nowIso: string): boolean {
+  return Boolean(row.claimed_by) && String(row.claim_expires_at ?? "") > nowIso;
+}
+
 export interface BusinessLayerDeps {
   store: PairEvidenceStore;
   control: MissionControl;
@@ -149,6 +161,7 @@ export class BusinessLayer {
       reports_to: input.reports_to ?? null,
       executor_binding: input.executor_binding ?? null,
       status: "ACTIVE" as OrgAgentStatus,
+      context_notes: [] as Array<Record<string, unknown>>,
       created_at: utcnow(),
       version: 0,
     };
@@ -190,6 +203,7 @@ export class BusinessLayer {
     goal: string;
     department?: string;
     assignee_agent_id?: string;
+    objective_id?: string;
     priority?: number;
     source?: string;
     operator_id: string;
@@ -210,6 +224,12 @@ export class BusinessLayer {
       }
       department = department || String(agent.department ?? "");
     }
+    if (input.objective_id) {
+      const obj = this.store.get("objective", input.objective_id);
+      if (String(obj.business_id) !== input.business_id) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `objective outside business ${input.business_id}`);
+      }
+    }
     const id = newId("WI");
     const row = {
       work_item_id: id,
@@ -218,10 +238,18 @@ export class BusinessLayer {
       goal: input.goal,
       department,
       assignee_agent_id: input.assignee_agent_id ?? null,
+      objective_id: input.objective_id ?? null,
+      routine_id: null as string | null,
       priority: input.priority ?? 50,
       source: input.source ?? "manual",
       status: (input.assignee_agent_id ? "READY" : "BACKLOG") as WorkItemStatus,
       mission_ids: [] as string[],
+      claimed_by: null as string | null,
+      claim_token: null as string | null,
+      claim_expires_at: null as string | null,
+      comments: [] as Array<Record<string, unknown>>,
+      blockers: [] as Array<Record<string, unknown>>,
+      artifacts: [] as Array<Record<string, unknown>>,
       result_summary: null,
       created_at: utcnow(),
       updated_at: utcnow(),
@@ -282,6 +310,13 @@ export class BusinessLayer {
     }
     const business = this.getBusiness(String(row.business_id));
     const agentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+    const nowIso = utcnow();
+    if (isClaimActive(row, nowIso) && String(row.claimed_by) !== agentId) {
+      throw new PolicyError(
+        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
+        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
+      );
+    }
     let agent: Row | null = null;
     if (agentId) {
       agent = this.store.get("org_agent", agentId);
@@ -291,10 +326,14 @@ export class BusinessLayer {
     }
     this.enforceBudgets(String(row.business_id), String(row.department ?? ""), agentId);
 
+    const notes = ((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
+      .slice(-AGENT_CONTEXT_INJECT)
+      .map((n) => `- ${String(n.note)}`);
     const goal =
       `[BUSINESS ${String(business.name)} | DEPT ${String(row.department ?? "-")}` +
       (agent ? ` | AGENT ${String(agent.title)} (${String(agent.role ?? "")})` : "") +
-      `]\n${String(row.goal)}`;
+      `]\n${String(row.goal)}` +
+      (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "");
 
     const mission = this.deps.control.startMission({
       project_id: String(business.project_id),
@@ -311,6 +350,11 @@ export class BusinessLayer {
     const missionId = String(mission.mission_id);
     row.status = "IN_PROGRESS";
     (row.mission_ids as string[]).push(missionId);
+    if (agentId) {
+      row.claimed_by = agentId;
+      row.claim_token = newId("CLM");
+      row.claim_expires_at = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
+    }
     row.updated_at = utcnow();
     const saved = this.store.put("work_item", workItemId, row, Number(row.version));
     this.store.event({
@@ -346,7 +390,29 @@ export class BusinessLayer {
     if (next === "DONE" || next === "BLOCKED") {
       row.result_summary = String(mission.result ?? mission.result_summary ?? "") || null;
     }
+    // Terminal state releases the claim so the item can be picked up again.
+    row.claimed_by = null;
+    row.claim_token = null;
+    row.claim_expires_at = null;
     const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    // Feed the outcome back into the assignee's persistent context — the
+    // agent "remembers" what it did across missions.
+    const assignee = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+    if (assignee) {
+      try {
+        const agentRow = this.store.get("org_agent", assignee);
+        const notes = (agentRow.context_notes as Array<Record<string, unknown>> | undefined) ?? [];
+        notes.push({
+          at: utcnow(),
+          work_item_id: workItemId,
+          mission_id: missionIds[missionIds.length - 1],
+          outcome: next,
+          note: String(row.result_summary ?? row.title ?? "").slice(0, 300),
+        });
+        agentRow.context_notes = notes.slice(-AGENT_CONTEXT_CAP);
+        this.store.put("org_agent", assignee, agentRow, Number(agentRow.version));
+      } catch { /* agent removed — context drop is non-fatal */ }
+    }
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_SYNCED",
       old_state: status, new_state: next, actor: "PAIR_BUSINESS_LAYER",
@@ -355,8 +421,148 @@ export class BusinessLayer {
     return saved;
   }
 
+  // ---------- work_item collaboration (claim / comment / blocker / artifact) ----------
+
+  /**
+   * Atomic checkout: an agent takes the item off the board so no second
+   * agent works it concurrently. Fail-closed while another claim is live.
+   */
+  claimWorkItem(workItemId: string, agentId: string, actor: string): Row & { claim_token: string } {
+    const row = this.store.get("work_item", workItemId);
+    const agent = this.store.get("org_agent", agentId);
+    if (String(agent.business_id) !== String(row.business_id)) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `claimer outside business ${row.business_id}`);
+    }
+    if (String(agent.status) !== "ACTIVE") {
+      throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
+    }
+    const status = String(row.status);
+    if (status === "DONE" || status === "CANCELLED") {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${status} cannot be claimed`);
+    }
+    const nowIso = utcnow();
+    if (isClaimActive(row, nowIso) && String(row.claimed_by) !== agentId) {
+      throw new PolicyError(
+        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
+        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
+      );
+    }
+    const token = newId("CLM");
+    row.claimed_by = agentId;
+    row.claim_token = token;
+    row.claim_expires_at = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
+    row.updated_at = nowIso;
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_CLAIMED",
+      actor: `operator:${actor}`, metadata: { claimed_by: agentId },
+    });
+    return { ...saved, claim_token: token };
+  }
+
+  releaseClaim(workItemId: string, actor: string): Row {
+    const row = this.store.get("work_item", workItemId);
+    const heldBy = row.claimed_by ? String(row.claimed_by) : null;
+    row.claimed_by = null;
+    row.claim_token = null;
+    row.claim_expires_at = null;
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    if (heldBy) {
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_CLAIM_RELEASED",
+        actor: `operator:${actor}`, metadata: { released_from: heldBy },
+      });
+    }
+    return saved;
+  }
+
+  commentOnWorkItem(workItemId: string, author: string, body: string): Row {
+    if (!String(body ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_COMMENT", "comment body required");
+    }
+    const row = this.store.get("work_item", workItemId);
+    const comments = (row.comments as Array<Record<string, unknown>> | undefined) ?? [];
+    comments.push({ author, body: String(body).slice(0, 4000), at: utcnow() });
+    row.comments = comments.slice(-COMMENT_CAP);
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_COMMENT",
+      actor: `operator:${author}`, metadata: { author },
+    });
+    return saved;
+  }
+
+  blockWorkItem(workItemId: string, reason: string, actor: string): Row {
+    if (!String(reason ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_BLOCKER", "blocker reason required");
+    }
+    const row = this.store.get("work_item", workItemId);
+    const from = String(row.status);
+    if (from === "DONE" || from === "CANCELLED") {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${from} cannot be blocked`);
+    }
+    const blockers = (row.blockers as Array<Record<string, unknown>> | undefined) ?? [];
+    blockers.push({ reason: String(reason).slice(0, 2000), at: utcnow(), by: actor });
+    row.blockers = blockers;
+    row.status = "BLOCKED";
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_BLOCKED",
+      old_state: from, new_state: "BLOCKED", actor: `operator:${actor}`,
+      metadata: { reason: String(reason).slice(0, 300) },
+    });
+    return saved;
+  }
+
+  unblockWorkItem(workItemId: string, actor: string): Row {
+    const row = this.store.get("work_item", workItemId);
+    if (String(row.status) !== "BLOCKED") {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(row.status)} is not blocked`);
+    }
+    row.blockers = [];
+    row.status = "READY";
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_UNBLOCKED",
+      old_state: "BLOCKED", new_state: "READY", actor: `operator:${actor}`,
+    });
+    return saved;
+  }
+
+  attachWorkItemArtifact(
+    workItemId: string,
+    artifact: { name: string; uri: string; content_type?: string },
+    actor: string,
+  ): Row {
+    if (!String(artifact.name ?? "").trim() || !String(artifact.uri ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_ARTIFACT", "artifact name and uri required");
+    }
+    const row = this.store.get("work_item", workItemId);
+    const artifacts = (row.artifacts as Array<Record<string, unknown>> | undefined) ?? [];
+    artifacts.push({
+      name: String(artifact.name).slice(0, 300),
+      uri: String(artifact.uri).slice(0, 2000),
+      content_type: artifact.content_type ?? null,
+      at: utcnow(),
+      by: actor,
+    });
+    row.artifacts = artifacts;
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_ARTIFACT",
+      actor: `operator:${actor}`, metadata: { name: artifact.name },
+    });
+    return saved;
+  }
+
   board(businessId: string): Record<string, Row[]> {
     this.getBusiness(businessId);
+    this.syncRoutineWorkItems(businessId);
     const items = this.listWorkItems(businessId);
     for (const w of items) {
       if (String(w.status) === "IN_PROGRESS") this.syncWorkItem(String(w.work_item_id));
@@ -534,12 +740,125 @@ export class BusinessLayer {
     return saved;
   }
 
+  /**
+   * Project every schedule-fired routine mission onto the board as a
+   * work_item (source=routine) so recurring work is visible and auditable
+   * alongside manual work. Missions carry metadata.schedule_id; each gets
+   * at most one work_item (deduped by mission membership in mission_ids).
+   */
+  private syncRoutineWorkItems(businessId: string): void {
+    const routines = this.listRoutines(businessId);
+    if (routines.length === 0) return;
+    const bySchedule = new Map<string, Row>();
+    for (const r of routines) bySchedule.set(String(r.schedule_id), r);
+    const covered = new Set<string>();
+    for (const w of this.store.list("work_item")) {
+      for (const mid of (w.mission_ids as string[] | undefined) ?? []) covered.add(String(mid));
+    }
+    for (const m of this.store.list("mission")) {
+      const md = m.metadata as Record<string, unknown> | undefined;
+      const schedId = String(md?.schedule_id ?? "");
+      const routine = bySchedule.get(schedId);
+      const missionId = String(m.mission_id);
+      if (!routine || covered.has(missionId)) continue;
+      const ms = String(m.status);
+      const status: WorkItemStatus =
+        ms === "COMPLETED" ? "DONE" :
+        ms === "FAILED" ? "BLOCKED" :
+        ms === "CANCELLED" ? "CANCELLED" :
+        ms === "PAUSED" ? "BLOCKED" : "IN_PROGRESS";
+      const id = newId("WI");
+      const row = {
+        work_item_id: id,
+        business_id: businessId,
+        title: `${String(routine.name)} run ${String(m.created_at).slice(0, 10)}`,
+        goal: String(routine.goal_template),
+        department: String(routine.department ?? ""),
+        assignee_agent_id: routine.assignee_agent_id ?? null,
+        objective_id: null,
+        routine_id: String(routine.routine_id),
+        priority: 50,
+        source: "routine",
+        status,
+        mission_ids: [missionId],
+        claimed_by: null,
+        claim_token: null,
+        claim_expires_at: null,
+        comments: [],
+        blockers: [],
+        artifacts: [],
+        result_summary: String(m.result ?? m.result_summary ?? "") || null,
+        created_at: String(m.created_at ?? utcnow()),
+        updated_at: utcnow(),
+        version: 0,
+      };
+      this.store.put("work_item", id, row, 0);
+      this.store.event({
+        entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_CREATED",
+        new_state: status, actor: "PAIR_BUSINESS_LAYER",
+        metadata: { routine_id: routine.routine_id, mission_id: missionId, source: "routine" },
+      });
+      covered.add(missionId);
+    }
+  }
+
+  // ---------- objective (goal tree) ----------
+
+  createObjective(input: {
+    business_id: string;
+    title: string;
+    description?: string;
+    parent_objective_id?: string;
+    metric?: string;
+    target?: string;
+    operator_id: string;
+  }): Row {
+    if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "objective.create");
+    if (!String(input.title ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_TITLE", "objective title required");
+    }
+    this.getBusiness(input.business_id);
+    if (input.parent_objective_id) {
+      const parent = this.store.get("objective", input.parent_objective_id);
+      if (String(parent.business_id) !== input.business_id) {
+        throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_SCOPE", `parent outside business ${input.business_id}`);
+      }
+    }
+    const id = newId("OBJ");
+    const row = {
+      objective_id: id,
+      business_id: input.business_id,
+      title: input.title,
+      description: input.description ?? "",
+      parent_objective_id: input.parent_objective_id ?? null,
+      metric: input.metric ?? "",
+      target: input.target ?? "",
+      status: "ACTIVE",
+      created_at: utcnow(),
+      version: 0,
+    };
+    const saved = this.store.put("objective", id, row, 0);
+    this.store.event({
+      entity_type: "objective", entity_id: id, event_type: "OBJECTIVE_CREATED",
+      new_state: "ACTIVE", actor: `operator:${input.operator_id}`,
+      metadata: { business_id: input.business_id, title: input.title },
+    });
+    return saved;
+  }
+
+  listObjectives(businessId?: string): Row[] {
+    const all = this.store.list("objective");
+    return (businessId ? all.filter((o) => String(o.business_id) === businessId) : all)
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  }
+
   // ---------- aggregate read ----------
 
   detail(businessId: string): Record<string, unknown> {
     return {
       business: this.getBusiness(businessId),
       agents: this.listOrgAgents(businessId),
+      objectives: this.listObjectives(businessId),
       board: this.board(businessId),
       routines: this.listRoutines(businessId),
       budgets: this.listBudgetPolicies(businessId),

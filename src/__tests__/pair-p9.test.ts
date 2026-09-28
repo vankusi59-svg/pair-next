@@ -1830,4 +1830,122 @@ describe("business layer (one-person-business skeleton)", () => {
       server.close();
     }
   });
+
+  it("claim: second agent rejected while claim live; release frees it", () => {
+    const { ctx, biz } = makeBizCtx("b8");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const bid = String(b.business_id);
+    const a1 = biz.createOrgAgent({ business_id: bid, title: "A1", department: "d", operator_id: "op" });
+    const a2 = biz.createOrgAgent({ business_id: bid, title: "A2", department: "d", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: bid, title: "t", goal: "g", operator_id: "op" });
+    const wid = String(w.work_item_id);
+    const c1 = biz.claimWorkItem(wid, String(a1.agent_id), "op");
+    expect(c1.claim_token).toBeTruthy();
+    expect(() => biz.claimWorkItem(wid, String(a2.agent_id), "op"))
+      .toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIMED/);
+    // expired claim can be taken over
+    const row = ctx.store.get("work_item", wid);
+    row.claim_expires_at = "2000-01-01T00:00:00.000Z";
+    ctx.store.put("work_item", wid, row, Number(row.version));
+    const c2 = biz.claimWorkItem(wid, String(a2.agent_id), "op");
+    expect(String(c2.claimed_by)).toBe(String(a2.agent_id));
+    biz.releaseClaim(wid, "op");
+    expect(ctx.store.get("work_item", wid).claimed_by).toBeNull();
+  });
+
+  it("open is blocked while another agent holds the claim", () => {
+    const { ctx, biz } = makeBizCtx("b9");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const bid = String(b.business_id);
+    const a1 = biz.createOrgAgent({ business_id: bid, title: "A1", department: "d", operator_id: "op" });
+    const a2 = biz.createOrgAgent({ business_id: bid, title: "A2", department: "d", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: bid, title: "t", goal: "g", assignee_agent_id: String(a2.agent_id), operator_id: "op" });
+    const wid = String(w.work_item_id);
+    biz.claimWorkItem(wid, String(a1.agent_id), "op"); // held by someone else
+    expect(() => biz.openWorkItem(wid, "op")).toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIMED/);
+  });
+
+  it("comment + block + unblock record events and move status", () => {
+    const { ctx, biz } = makeBizCtx("b10");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: String(b.business_id), title: "t", goal: "g", operator_id: "op" });
+    const wid = String(w.work_item_id);
+    biz.commentOnWorkItem(wid, "op", "waiting on asset");
+    biz.blockWorkItem(wid, "missing file", "op");
+    let row = ctx.store.get("work_item", wid);
+    expect(String(row.status)).toBe("BLOCKED");
+    expect((row.blockers as unknown[]).length).toBe(1);
+    biz.unblockWorkItem(wid, "op");
+    row = ctx.store.get("work_item", wid);
+    expect(String(row.status)).toBe("READY");
+    expect((row.blockers as unknown[]).length).toBe(0);
+    const types = ctx.store.listEvents("work_item", wid).map((e) => String(e.event_type));
+    expect(types).toContain("WORK_ITEM_COMMENT");
+    expect(types).toContain("WORK_ITEM_BLOCKED");
+    expect(types).toContain("WORK_ITEM_UNBLOCKED");
+  });
+
+  it("agent context: completed mission feeds context_notes, injected into next goal", () => {
+    const { ctx, biz } = makeBizCtx("b11");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const bid = String(b.business_id);
+    const a = biz.createOrgAgent({ business_id: bid, title: "Marketer", department: "mkt", operator_id: "op" });
+    const aid = String(a.agent_id);
+    const w1 = biz.createWorkItem({ business_id: bid, title: "post 1", goal: "g", assignee_agent_id: aid, operator_id: "op" });
+    biz.openWorkItem(String(w1.work_item_id), "op");
+    const mid = (biz.listWorkItems(bid)[0].mission_ids as string[])[0];
+    const mission = ctx.store.get("mission", mid);
+    mission.status = "COMPLETED";
+    mission.result = "posted gold analysis, 120 views";
+    ctx.store.put("mission", mid, mission, Number(mission.version));
+    biz.board(bid); // triggers sync → context note
+    const agent = ctx.store.get("org_agent", aid);
+    const notes = agent.context_notes as Array<Record<string, unknown>>;
+    expect(notes).toHaveLength(1);
+    expect(String(notes[0].note)).toContain("posted gold analysis");
+    const w2 = biz.createWorkItem({ business_id: bid, title: "post 2", goal: "g2", assignee_agent_id: aid, operator_id: "op" });
+    const opened = biz.openWorkItem(String(w2.work_item_id), "op");
+    const m2 = ctx.store.get("mission", (opened.mission_ids as string[])[0]);
+    expect(String(m2.goal)).toContain("[AGENT CONTEXT");
+    expect(String(m2.goal)).toContain("posted gold analysis");
+  });
+
+  it("routine-fired mission projects onto board as work_item", () => {
+    const { ctx, biz } = makeBizCtx("b12");
+    const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const bid = String(b.business_id);
+    const r = biz.createRoutine({ business_id: bid, name: "daily", goal_template: "analyze", cron: "0 7 * * *", operator_id: "op" });
+    // simulate the schedule having fired: a mission carrying metadata.schedule_id
+    ctx.store.put("mission", "MSN_routinerun", {
+      mission_id: "MSN_routinerun", status: "COMPLETED", goal: "x",
+      created_at: "2026-09-28T07:00:00.000Z",
+      metadata: { schedule_id: String(r.schedule_id), plan_source: "schedule" },
+      result: "analysis done",
+    }, 0);
+    const cols = biz.board(bid);
+    expect(cols.DONE).toHaveLength(1);
+    const wi = cols.DONE[0];
+    expect(String(wi.source)).toBe("routine");
+    expect(String(wi.routine_id)).toBe(String(r.routine_id));
+    // idempotent — a second board call does not duplicate the item
+    expect(biz.board(bid).DONE).toHaveLength(1);
+  });
+
+  it("objective tree links work items; cross-business objective rejected", () => {
+    const { ctx, biz } = makeBizCtx("b13");
+    const b1 = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
+    const b2 = biz.createBusiness({ name: "B", project_id: ctx.projectId, operator_id: "op" });
+    const o = biz.createObjective({ business_id: String(b1.business_id), title: "grow group", metric: "members", target: "1000", operator_id: "op" });
+    const child = biz.createObjective({ business_id: String(b1.business_id), title: "daily content", parent_objective_id: String(o.objective_id), operator_id: "op" });
+    expect(String(child.parent_objective_id)).toBe(String(o.objective_id));
+    const w = biz.createWorkItem({ business_id: String(b1.business_id), title: "t", goal: "g", objective_id: String(child.objective_id), operator_id: "op" });
+    expect(String(w.objective_id)).toBe(String(child.objective_id));
+    expect(() => biz.createWorkItem({ business_id: String(b1.business_id), title: "t", goal: "g", objective_id: "OBJ_missing", operator_id: "op" }))
+      .toThrowError(/FAIL_CLOSED|NOT_FOUND/);
+    const oB = biz.createObjective({ business_id: String(b2.business_id), title: "b2 obj", operator_id: "op" });
+    expect(() => biz.createWorkItem({ business_id: String(b1.business_id), title: "t", goal: "g", objective_id: String(oB.objective_id), operator_id: "op" }))
+      .toThrowError(/FAIL_CLOSED_WORK_ITEM_SCOPE/);
+    const d = biz.detail(String(b1.business_id));
+    expect((d.objectives as unknown[]).length).toBe(2);
+  });
 });
