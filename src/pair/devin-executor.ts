@@ -305,6 +305,16 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
         `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${outboxToken}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE replying DONE.`,
       );
     }
+    // Credential broker: when a service needs a login/token, the agent pulls
+    // the named credential from the broker instead of asking the operator.
+    // The token is release-only; the value must never be echoed in replies.
+    const brokerUrl = process.env.PAIR_BROKER_URL ?? process.env.PAIR_OUTBOX_URL;
+    const brokerToken = process.env.PAIR_BROKER_TOKEN;
+    if (brokerUrl && brokerToken) {
+      lines.push(
+        `Credentials: if the task needs a login/API key for a service, fetch it via: curl -X POST "${brokerUrl}/api/broker/fetch" -H "x-broker-token: ${brokerToken}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","credential_name":"<service-name>"}'. Use the returned "value" directly in your API calls or login flow — NEVER print, save to a file, or include it in your reply text. If the fetch returns 404 the credential is not installed: report which credential you need in your reply instead of stopping.`,
+      );
+    }
     return lines.join("\n");
   }
 

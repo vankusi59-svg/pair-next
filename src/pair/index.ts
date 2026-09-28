@@ -45,6 +45,7 @@ export * from "./mission-supervisor.js";
 export * from "./mission-observability.js";
 export * from "./mission-control.js";
 export * from "./mission-control-server.js";
+export * from "./credential-broker.js";
 export * from "./devin-executor.js";
 export * from "./llm-planner.js";
 export * from "./selfmod-bootstrap.js";

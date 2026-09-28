@@ -20,6 +20,7 @@ import {
   ExperienceService,
   GovernedTaskGate,
   IntegrityError,
+  CredentialBroker,
   MissionControl,
   MissionObservability,
   MissionRouter,
@@ -1463,6 +1464,79 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
       const written = path.join(ctx.workspace, "outbox", "T2-chart.png");
       expect(fs.existsSync(written)).toBe(true);
       expect(fs.readFileSync(written, "utf8")).toBe("fakepng");
+    } finally {
+      server.close();
+    }
+  });
+
+  it("credential broker: operator-managed vault, narrow-token release, audited", async () => {
+    const ctx = makeCtx("brk1");
+    const audit: Array<Record<string, unknown>> = [];
+    const broker = new CredentialBroker({
+      vaultPath: path.join(ctx.dir, "vault.json"),
+      audit: (e) => audit.push(e as Record<string, unknown>),
+    });
+    const server = createMissionControlServer({
+      control: ctx.control,
+      authToken: "mc-secret",
+      broker,
+      brokerToken: "broker-secret",
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const mcHdr = {
+      "content-type": "application/json",
+      "x-operator-id": "op",
+      authorization: "Bearer mc-secret",
+    };
+    try {
+      const mres = await fetch(`http://127.0.0.1:${port}/api/missions`, {
+        method: "POST", headers: mcHdr,
+        body: JSON.stringify({ project_id: ctx.projectId, goal: "cred test" }),
+      });
+      const mission = (await mres.json()) as Record<string, unknown>;
+
+      // operator installs a credential — response carries metadata only
+      const up = await fetch(`http://127.0.0.1:${port}/api/credentials`, {
+        method: "POST", headers: mcHdr,
+        body: JSON.stringify({ name: "github", value: "ghp_SUPERSECRET", domains: ["github.com"], kind: "token" }),
+      });
+      const meta = (await up.json()) as Record<string, unknown>;
+      expect(up.status).toBe(200);
+      expect(meta.name).toBe("github");
+      expect(JSON.stringify(meta)).not.toContain("ghp_SUPERSECRET");
+
+      // listing never leaks values
+      const list = (await (await fetch(`http://127.0.0.1:${port}/api/credentials`, { headers: mcHdr })).json()) as {
+        credentials: Array<Record<string, unknown>>;
+      };
+      expect(list.credentials.map((x) => x.name)).toContain("github");
+      expect(JSON.stringify(list)).not.toContain("ghp_SUPERSECRET");
+
+      const fetchCred = (hdrs: Record<string, string>, body: Record<string, unknown>) =>
+        fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...hdrs },
+          body: JSON.stringify({ mission_id: mission.mission_id, task_id: "T2", ...body }),
+        });
+      // MC bearer does not open the broker; wrong token rejected
+      expect((await fetchCred({ authorization: "Bearer mc-secret" }, { credential_name: "github" })).status).toBe(403);
+      // unknown mission rejected even with the right token
+      expect(
+        (await fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-broker-token": "broker-secret" },
+          body: JSON.stringify({ mission_id: "MSN_NOPE", credential_name: "github" }),
+        })).status,
+      ).toBe(404);
+      // unknown credential → 404 + denied audit
+      expect((await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "nope" })).status).toBe(404);
+      // legit release → value + audit
+      const rel = (await (await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "github" })).json()) as Record<string, unknown>;
+      expect(rel.value).toBe("ghp_SUPERSECRET");
+      expect(rel.domains).toEqual(["github.com"]);
+      expect(audit.some((e) => e.event_type === "CREDENTIAL_RELEASED" && e.credential_name === "github")).toBe(true);
+      expect(audit.some((e) => e.event_type === "CREDENTIAL_DENIED" && e.credential_name === "nope")).toBe(true);
     } finally {
       server.close();
     }

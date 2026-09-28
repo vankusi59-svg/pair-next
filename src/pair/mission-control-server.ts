@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { MissionControl } from "./mission-control.js";
+import type { CredentialBroker } from "./credential-broker.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -41,6 +42,14 @@ export interface MissionControlServerDeps {
    * hold full API access; unset → the endpoint stays disabled.
    */
   outboxToken?: string;
+  /**
+   * Credential broker: operator manages the vault via MC-token routes
+   * (POST/GET /api/credentials); remote executors release a named credential
+   * via POST /api/broker/fetch with `x-broker-token` — a narrow token separate
+   * from authToken. Unset brokerToken → fetch endpoint disabled.
+   */
+  broker?: CredentialBroker;
+  brokerToken?: string;
 }
 
 const MIME: Record<string, string> = {
@@ -159,9 +168,11 @@ export function createMissionControlServer(
     const p = url.pathname;
     const method = req.method ?? "GET";
     const body = method === "POST" ? await readBody(req) : {};
-    // POST /api/outbox has its own narrow token — exempt from the MC gate.
+    // POST /api/outbox and /api/broker/fetch carry their own narrow tokens —
+    // exempt from the MC gate.
     const isOutboxUpload = method === "POST" && p === "/api/outbox";
-    if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload) {
+    const isBrokerFetch = method === "POST" && p === "/api/broker/fetch";
+    if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch) {
       const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
       const q = url.searchParams.get("token") ?? "";
       if (bearer !== deps.authToken && q !== deps.authToken) {
@@ -251,6 +262,31 @@ export function createMissionControlServer(
         return void json(res, 200, { ok: true, path: dest, bytes: buf.length });
       }
 
+      // Broker fetch: remote executor releases a named credential. Narrow
+      // token auth; the credential must exist AND the mission must be known
+      // (fail-closed — no anonymous vault reads). Release is audited in the
+      // canonical event log; the value travels only in this response.
+      if (isBrokerFetch) {
+        if (!deps.broker || !deps.brokerToken || String(req.headers["x-broker-token"] ?? "") !== deps.brokerToken) {
+          return void json(res, 403, { error: "UNAUTHORIZED_BROKER_TOKEN" });
+        }
+        const missionId = String(body.mission_id ?? "");
+        if (!c.missionOutboxDir(missionId)) {
+          return void json(res, 404, { error: "unknown mission_id" });
+        }
+        const cred = deps.broker.release(String(body.credential_name ?? ""), {
+          mission_id: missionId,
+          task_id: String(body.task_id ?? "") || null,
+        });
+        if (!cred) return void json(res, 404, { error: "unknown credential" });
+        return void json(res, 200, {
+          name: cred.name,
+          kind: cred.kind,
+          domains: cred.domains,
+          value: cred.value,
+        });
+      }
+
       if (method === "GET" && p === "/api/health") return void json(res, 200, c.health());
       if (method === "GET" && p === "/api/metrics") return void json(res, 200, c.metrics());
       if (method === "GET" && p === "/api/missions") {
@@ -287,10 +323,33 @@ export function createMissionControlServer(
       if (method === "GET" && p === "/api/schedules") return void json(res, 200, { schedules: c.schedules() });
       // Cost guard read model — remote spend usage vs the daily cap.
       if (method === "GET" && p === "/api/cost") return void json(res, 200, c.cost());
+      // Operator credential management — MC-token gated (the gate above).
+      // Values are write-only: list/upsert return metadata, never the secret.
+      if (method === "GET" && p === "/api/credentials") {
+        return void json(res, 200, { credentials: deps.broker?.list() ?? [] });
+      }
 
       // ---- mutations (operator authority required) -------------------------
       if (method === "POST" && !operator) {
         throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+      }
+      if (method === "POST" && p === "/api/credentials") {
+        if (!deps.broker) return void json(res, 404, { error: "broker not configured" });
+        try {
+          const meta = deps.broker.upsert({
+            name: String(body.name ?? ""),
+            value: String(body.value ?? ""),
+            domains: Array.isArray(body.domains) ? (body.domains as string[]).map(String) : [],
+            kind: String(body.kind ?? "token"),
+          });
+          return void json(res, 200, meta);
+        } catch (e) {
+          return void json(res, 400, { error: String((e as Error).message) });
+        }
+      }
+      if (method === "POST" && p === "/api/credentials/delete") {
+        if (!deps.broker) return void json(res, 404, { error: "broker not configured" });
+        return void json(res, 200, { removed: deps.broker.remove(String(body.name ?? "")) });
       }
       // §4.3 two-step submit: preview creates no state; confirm must carry
       // the exact plan digest the operator saw.

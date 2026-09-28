@@ -40,6 +40,7 @@ import {
   PairEvidenceStore,
   PairNativeExecutorAdapter,
   PairNativeWorkerRunner,
+  CredentialBroker,
   ReconciliationService,
   RecoveryController,
   SelfImprovementController,
@@ -248,6 +249,20 @@ const runtime = new MissionRuntime({
   planner,
 });
 const sup = new MissionSupervisor(service, runtime, recovery, recon);
+// Credential broker: local vault (chmod 600, outside the canonical store
+// since entities must stay secret-free) + every release audited as a
+// canonical event keyed to the requesting mission.
+const broker = new CredentialBroker({
+  vaultPath: path.join(dir, "vault.json"),
+  audit: (e) =>
+    store.event({
+      entity_type: "mission",
+      entity_id: e.mission_id ?? "unknown",
+      event_type: e.event_type,
+      actor: "credential-broker",
+      metadata: { credential_name: e.credential_name, task_id: e.task_id, granted: e.granted },
+    }),
+});
 const control = new MissionControl({
   service, runtime, supervisor: sup, scheduler, approvals, reconciliation: recon,
   observability: new MissionObservability(service), selfmod, planner,
@@ -419,6 +434,11 @@ const server = createMissionControlServer({
   // (POST /api/outbox). Separate from PAIR_MC_TOKEN on purpose — remote
   // agents see this value in their prompt, so it must not grant API access.
   outboxToken: process.env.PAIR_OUTBOX_TOKEN || undefined,
+  // Credential broker: PAIR_BROKER_TOKEN gates POST /api/broker/fetch (the
+  // token remote agents carry in their prompt). Operator management rides
+  // the normal MC-token routes /api/credentials.
+  broker,
+  brokerToken: process.env.PAIR_BROKER_TOKEN || undefined,
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {
