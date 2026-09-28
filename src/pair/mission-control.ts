@@ -40,6 +40,10 @@ export interface MissionControlDeps {
   selfmod?: SelfImprovementController;
   /** Recurring mission triggers — cron schedules persisted in pair.db. */
   schedules?: MissionScheduleService;
+  /** Runtime-controlled cost halt lever: when this file exists, remote
+   *  dispatch is blocked (same effect as PAIR_COST_HALT=1, but flippable
+   *  without a restart). */
+  costHaltFile?: string;
 }
 
 function requireOperator(operatorId: string | undefined): string {
@@ -446,7 +450,9 @@ export class MissionControl {
     return {
       remote_dispatches_today: todayRemote.length,
       remote_daily_limit: limit,
-      cost_halt: process.env.PAIR_COST_HALT === "1",
+      cost_halt:
+        process.env.PAIR_COST_HALT === "1" ||
+        (this.deps.costHaltFile ? fs.existsSync(this.deps.costHaltFile) : false),
       schedules_active: this.deps.schedules?.list().filter((s) => s.enabled && !s.deleted).length ?? 0,
     };
   }

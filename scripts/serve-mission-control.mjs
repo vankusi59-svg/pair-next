@@ -104,6 +104,11 @@ if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutor
 // PAIR_COST_HALT=1 kill-switch. Rejections settle FAILED/BUDGET_EXCEEDED →
 // recovery escalates to the operator instead of silently spending.
 const MAX_REMOTE_PER_DAY = Number(process.env.PAIR_MAX_REMOTE_TASKS_PER_DAY ?? 10);
+// Runtime-flippable halt: bridges/ops drop this file to stop remote spend
+// without restarting the server (same effect as PAIR_COST_HALT=1).
+const COST_HALT_FILE = process.env.PAIR_COST_HALT_FILE ?? path.join(dir, "COST_HALT");
+const isCostHalted = () =>
+  process.env.PAIR_COST_HALT === "1" || fs.existsSync(COST_HALT_FILE);
 const remoteDispatchesToday = () => {
   const today = utcnow().slice(0, 10);
   return service.store
@@ -116,8 +121,8 @@ governed.set(
   new DevinExecutorAdapter({
     journalRoot,
     costGuard: () => {
-      if (process.env.PAIR_COST_HALT === "1")
-        return { allowed: false, reason: "COST_HALT: PAIR_COST_HALT=1 set — all remote dispatch blocked" };
+      if (isCostHalted())
+        return { allowed: false, reason: "COST_HALT: cost halt active (env or halt file) — all remote dispatch blocked" };
       const n = remoteDispatchesToday();
       if (n >= MAX_REMOTE_PER_DAY)
         return { allowed: false, reason: `BUDGET_EXCEEDED: remote dispatch budget ${n}/${MAX_REMOTE_PER_DAY} per day reached` };
@@ -246,6 +251,7 @@ const control = new MissionControl({
   service, runtime, supervisor: sup, scheduler, approvals, reconciliation: recon,
   observability: new MissionObservability(service), selfmod, planner,
   schedules: new MissionScheduleService(service),
+  costHaltFile: COST_HALT_FILE,
 });
 
 registry.register({
