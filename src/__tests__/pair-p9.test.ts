@@ -1286,6 +1286,53 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
       .toThrowError(/FAIL_CLOSED/);
     expect(ctx.store.list("mission")).toHaveLength(0);
   });
+
+  it("direct POST /api/missions auto-expands via planExpander (telegram/API parity with UI)", async () => {
+    const expandedTasks = [
+      { task_key: "T1", title: "llm t1", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] as string[] },
+      { task_key: "T2", title: "llm t2", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+    ];
+    // Mimic the serve seam: the injected planner consumes metadata.llm_plan.
+    const llmPlanner = (input: { mission: unknown }) => {
+      const meta = (input.mission as Record<string, unknown>).metadata as Record<string, unknown> | undefined;
+      const plan = meta?.llm_plan;
+      return {
+        tasks: (Array.isArray(plan) && plan.length ? plan : [
+          { task_key: "T1", title: "t", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
+        ]) as never[],
+      };
+    };
+    const ctx = makeCtx("pv4", { planner: llmPlanner });
+    const server = createMissionControlServer({
+      control: ctx.control,
+      planExpander: async (b) => ({
+        ...(b as Record<string, unknown>),
+        metadata: {
+          ...((b as Record<string, unknown>).metadata as Record<string, unknown> | undefined),
+          llm_plan: expandedTasks,
+          plan_source: "llm-test",
+        },
+      }),
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/missions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-operator-id": "op" },
+        body: JSON.stringify({ project_id: ctx.projectId, goal: "direct submit gets llm plan" }),
+      });
+      expect(res.status).toBe(200);
+      const m = (await res.json()) as Record<string, unknown>;
+      const meta = ctx.service.getMission(String(m.mission_id)).metadata as Record<string, unknown>;
+      // Expanded plan landed on the mission — not the minimal template.
+      expect(meta.plan_source).toBe("llm-test");
+      expect(Array.isArray(meta.llm_plan)).toBe(true);
+      expect((meta.llm_plan as unknown[]).length).toBe(2);
+    } finally {
+      server.close();
+    }
+  });
 });
 
 describe("UI-3 §4.2 — provider/model/route read projections", () => {
@@ -1342,7 +1389,7 @@ describe("Schedules — recurring mission triggers", () => {
     expect(() => nextRunAfter("99 * * * *", "2026-09-27T08:00:00.000Z")).toThrow();
   });
 
-  it("create → due → fire submits canonical mission with schedule provenance", () => {
+  it("create → due → fire submits canonical mission with schedule provenance", async () => {
     const ctx = makeCtx("sched1");
     const svc = new MissionScheduleService(ctx.service);
     const proj = ctx.control.projects()[0];
@@ -1356,7 +1403,7 @@ describe("Schedules — recurring mission triggers", () => {
     expect(s.enabled).toBe(true);
     const before = ctx.service.store.list("mission").length;
     const submitted: Array<Record<string, unknown>> = [];
-    const res = svc.fireDue(
+    const res = await svc.fireDue(
       (input) => {
         submitted.push(input);
         return ctx.control.startMission({
@@ -1379,11 +1426,11 @@ describe("Schedules — recurring mission triggers", () => {
     expect(String(after.next_due_at) > "2099-01-01").toBe(true); // advanced past fire time
   });
 
-  it("not due → no fire; disabled/deleted never fire", () => {
+  it("not due → no fire; disabled/deleted never fire", async () => {
     const ctx = makeCtx("sched2");
     const svc = new MissionScheduleService(ctx.service);
     const s = svc.create({ goal: "g", cron: "0 7 * * *", operator_id: "op" });
-    const res = svc.fireDue(
+    const res = await svc.fireDue(
       () => { throw new Error("must not run"); },
       "2026-01-01T00:00:00.000Z", // before next_due_at
     );
@@ -1391,8 +1438,54 @@ describe("Schedules — recurring mission triggers", () => {
     svc.setEnabled(String(s.schedule_id), false, "op");
     const s2 = svc.create({ goal: "g2", cron: "* * * * *", operator_id: "op" });
     svc.remove(String(s2.schedule_id), "op");
-    const res2 = svc.fireDue(() => ({ mission_id: "x" }), "2099-01-01T00:00:00.000Z");
+    const res2 = await svc.fireDue(() => ({ mission_id: "x" }), "2099-01-01T00:00:00.000Z");
     expect(res2.fired).toHaveLength(0); // disabled + deleted both skipped
+  });
+
+  it("tickSchedules routes each due goal through the expander → llm_plan submitted", async () => {
+    const llmPlanner = (input: { mission: unknown }) => {
+      const meta = (input.mission as Record<string, unknown>).metadata as Record<string, unknown> | undefined;
+      const plan = meta?.llm_plan;
+      return {
+        tasks: (Array.isArray(plan) && plan.length ? plan : [
+          { task_key: "T1", title: "t", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
+        ]) as never[],
+      };
+    };
+    const ctx = makeCtx("schedExp", { planner: llmPlanner });
+    const svc = new MissionScheduleService(ctx.service);
+    const proj = ctx.control.projects()[0];
+    const control = new MissionControl({
+      service: ctx.service, runtime: ctx.runtime, supervisor: ctx.supervisor,
+      scheduler: ctx.scheduler, approvals: ctx.approvals,
+      reconciliation: ctx.recon, observability: ctx.observability,
+      schedules: svc,
+      planner: llmPlanner as never,
+    });
+    svc.create({
+      goal: "expand me",
+      cron: "* * * * *",
+      project_id: String(proj.project_id),
+      operator_id: "op",
+    });
+    const res = await control.tickSchedules("2099-01-01T00:00:00.000Z", async (input) => ({
+      ...input,
+      metadata: {
+        ...(input.metadata ?? {}),
+        llm_plan: [
+          { task_key: "T1", title: "one", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
+          { task_key: "T2", title: "two", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+        ],
+        plan_source: "llm-exp",
+      },
+    }));
+    expect(res.fired).toHaveLength(1);
+    const mission = ctx.store.list("mission").at(-1) as Record<string, unknown>;
+    const meta = mission.metadata as Record<string, unknown>;
+    expect(String(meta.plan_source)).toBe("llm-exp");
+    expect((meta.llm_plan as unknown[]).length).toBe(2);
+    // schedule provenance preserved alongside the expanded plan
+    expect(meta.schedule_id).toBeTruthy();
   });
 
   it("schedule persists in pair.db (survives service restart)", () => {

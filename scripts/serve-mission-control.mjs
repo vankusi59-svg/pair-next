@@ -224,7 +224,7 @@ const planner = (input) => {
       task_key: "T2",
       title: "llm analysis (dsh)",
       task_instruction:
-        "The workspace contains mission_goal.txt with the mission goal. Read it and create analysis.txt containing a short analysis of the goal, then reply DONE.",
+        `The workspace contains mission_goal.txt holding the operator's goal: "${goal}". Produce a genuine deliverable for that goal's subject matter — analyze the topic itself (never just restate or describe the goal) — write findings to analysis.txt, then reply DONE.`,
       required_capabilities: ["REASONING"],
       depends_on: ["T1"],
       metadata: {},
@@ -422,5 +422,8 @@ server.listen(port, () => {
 });
 setInterval(() => {
   sup.tick();
-  control.tickSchedules(); // fire due cron schedules through canonical submit
+  // fire due cron schedules through canonical submit, expanding each goal
+  // through the same LLM plan seam the API edge uses
+  control.tickSchedules(undefined, planExpander).catch((e) =>
+    console.error("tickSchedules:", String(e).slice(0, 200)));
 }, 1000).unref();

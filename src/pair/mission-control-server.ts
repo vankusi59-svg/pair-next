@@ -259,10 +259,22 @@ export function createMissionControlServer(
         return void json(res, 200, c.previewMission(expanded as Parameters<typeof c.previewMission>[0]));
       }
       if (method === "POST" && p === "/api/missions") {
-        // Submit does not re-expand — the operator confirms the previewed
-        // plan verbatim via metadata.llm_plan + confirm_plan.digest; the
-        // digest mismatch check rejects anything altered since preview.
-        return void json(res, 200, c.startMission({ ...(body as Record<string, string>), goal: String(body.goal ?? ""), project_id: String(body.project_id ?? ""), operator_id: operator } as never));
+        // Direct submitters (Telegram bridge, API clients, scripts) never
+        // call /preview — expand the goal into an LLM plan here so every
+        // submit path gets the same plan quality as the UI's Plan & run.
+        // When the caller already supplies metadata.llm_plan (UI two-step)
+        // we keep it verbatim; a caller-supplied confirm_plan.digest is still
+        // validated by startMission, otherwise we pin the plan we just
+        // computed.
+        const bodyMeta = (body as Record<string, unknown>).metadata as Record<string, unknown> | undefined;
+        const expanded =
+          deps.planExpander && !bodyMeta?.llm_plan
+            ? await deps.planExpander(body as Parameters<typeof deps.planExpander>[0])
+            : (body as Record<string, unknown>);
+        const digestPinned =
+          (expanded.confirm_plan as { digest?: string } | undefined)?.digest ??
+          c.previewMission(expanded as Parameters<typeof c.previewMission>[0]).plan_digest;
+        return void json(res, 200, c.startMission({ ...expanded, goal: String(expanded.goal ?? ""), project_id: String(expanded.project_id ?? ""), operator_id: operator, confirm_plan: { digest: digestPinned } } as never));
       }
       m = p.match(/^\/api\/missions\/([^/]+)\/(pause|resume|cancel|acknowledge|reconcile)$/);
       if (method === "POST" && m) {

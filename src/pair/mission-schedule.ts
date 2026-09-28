@@ -211,9 +211,21 @@ export class MissionScheduleService {
       project_id?: string;
       operator_id?: string;
       metadata?: Record<string, unknown>;
-    }) => Record<string, unknown>,
+    }) => Promise<Record<string, unknown>> | Record<string, unknown>,
     now = utcnow(),
-  ): { fired: string[]; errors: string[] } {
+  ): Promise<{ fired: string[]; errors: string[] }> {
+    return this._fireDue(submit, now);
+  }
+
+  private async _fireDue(
+    submit: (input: {
+      goal: string;
+      project_id?: string;
+      operator_id?: string;
+      metadata?: Record<string, unknown>;
+    }) => Promise<Record<string, unknown>> | Record<string, unknown>,
+    now: string,
+  ): Promise<{ fired: string[]; errors: string[] }> {
     const fired: string[] = [];
     const errors: string[] = [];
     for (const s of this.due(now)) {
@@ -221,7 +233,7 @@ export class MissionScheduleService {
       const row = this.store.get("mission_schedule", id);
       row.last_fired_at = now;
       try {
-        const mission = submit({
+        const mission = await submit({
           goal: String(s.goal),
           project_id: s.project_id ? String(s.project_id) : undefined,
           operator_id: String(s.operator_id),

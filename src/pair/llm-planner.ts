@@ -169,10 +169,14 @@ export function sanitizePlan(
     }
     // Remote tasks are leaves — drop the task rather than prune the edge when
     // a later task tries to depend on remote output that can never be local.
+    // Exception: TELEGRAM_DELIVERY — it consumes the remote task's returned
+    // result text via dependency_outputs (not remote files), so that edge is
+    // safe and is how remote-produced reports reach the operator.
+    const isTelegramDelivery = caps.includes("TELEGRAM_DELIVERY");
     const deps = Array.isArray(t.depends_on)
       ? [...new Set(t.depends_on.map((d) => String(d)).filter((d) => seen.has(d)))]
       : [];
-    if (deps.some((d) => remoteKeys.has(d))) {
+    if (!isTelegramDelivery && deps.some((d) => remoteKeys.has(d))) {
       warnings.push(`DROP_REMOTE_DEPENDENT:${key}`);
       continue;
     }
@@ -209,9 +213,9 @@ Output ONLY a JSON object: {"tasks": [...]}. Each task:
 Rules:
 - Always include a first task T1 that records the goal into mission_goal.txt via capability AUTOMATON_TASK_EXECUTION.
 - 2 to MAX_TASKS tasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS/AUTOMATON_TASK_EXECUTION for pure file writes.
-- LIVE DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price") that local executors cannot fetch — local executors have NO internet — the data-gathering task MUST use REMOTE_CLOUD_TASK_EXECUTION (the remote executor has a real browser/network). Its downstream file/report task then reads what the remote agent returned... NOTE remote outputs are refs, so when the goal needs live data AND a local file report, prefer letting the remote task produce the full deliverable text remotely and keep the local task to recording the goal.
-- REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION run on a REMOTE executor: their outputs stay remote (returned as refs, never local files). Such a task must be a DAG leaf — no other task may depend on it.
-- TELEGRAM_DELIVERY (when ALLOWED): when the goal asks to send/deliver results to Telegram (gửi tele/telegram, báo qua telegram, send to telegram), add a DAG-leaf task with capability TELEGRAM_DELIVERY whose instruction is: "Write the final user-facing deliverable — in the goal's language — to outbox/report.txt (a plain-text message ready to send to the operator), then reply DONE." It must depend_on every task that produces content for the report.
+- LIVE DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price") that local executors cannot fetch — local executors have NO internet — the data-gathering task MUST use REMOTE_CLOUD_TASK_EXECUTION (the remote executor has a real browser/network). Instruct it to RETURN the full findings as its final result text — files it writes stay remote and are invisible locally.
+- REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION run on a REMOTE executor: their files stay remote (only the returned result text comes back). Such a task must be a DAG leaf — the ONLY dependent allowed is a TELEGRAM_DELIVERY task, which receives the remote result text through dependency_outputs.
+- TELEGRAM_DELIVERY (when ALLOWED): when the goal asks to send/deliver results to Telegram (gửi tele/telegram, báo qua telegram, send to telegram), add a DAG-leaf task with capability TELEGRAM_DELIVERY. Instruction: "Read the upstream tasks' returned results in dependency_outputs, compose the final operator-facing report in the goal's language as plain text, write it to outbox/report.txt, then reply DONE." It must depend_on every task that produces content for the report — INCLUDING remote tasks (their result text is delivered via dependency_outputs).
 - Keep task instructions concrete and verifiable; end with "then reply DONE."
 - No prose, no markdown — JSON only.`;
 

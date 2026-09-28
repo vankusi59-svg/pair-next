@@ -422,16 +422,33 @@ export class MissionControl {
     return this.deps.schedules.remove(id, op);
   }
 
-  /** Fire every due schedule through the canonical startMission path. */
-  tickSchedules(now?: string): { fired: string[]; errors: string[] } {
+  /**
+   * Fire every due schedule through the canonical startMission path. When an
+   * expander is supplied (the serve script's LLM planner seam) each due goal
+   * is expanded into a real plan first — scheduled missions get the same plan
+   * quality as the UI's Plan & run instead of the minimal template fallback.
+   */
+  async tickSchedules(
+    now?: string,
+    expander?: (input: Record<string, unknown>) => Promise<Record<string, unknown>>,
+  ): Promise<{ fired: string[]; errors: string[] }> {
     if (!this.deps.schedules) return { fired: [], errors: [] };
     const defaultProject = String(this.store.list("project")[0]?.project_id ?? "");
     return this.deps.schedules.fireDue(
-      (input) =>
-        this.startMission({
-          ...input,
-          project_id: input.project_id || defaultProject,
-        }),
+      async (input) => {
+        const expanded = expander ? await expander(input as Record<string, unknown>) : input;
+        const preview = this.previewMission({
+          project_id: (expanded.project_id as string | undefined) || defaultProject,
+          goal: String(expanded.goal ?? input.goal),
+          metadata: (expanded.metadata ?? input.metadata) as Record<string, unknown> | undefined,
+        });
+        return this.startMission({
+          ...expanded,
+          project_id: (expanded.project_id as string | undefined) || defaultProject,
+          goal: String(expanded.goal ?? input.goal),
+          confirm_plan: { digest: preview.plan_digest },
+        });
+      },
       now,
     );
   }
