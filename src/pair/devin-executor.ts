@@ -95,11 +95,24 @@ export interface DevinAdapterDeps {
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 
-/** Devin session status_enum → canonical execution state. `blocked` is
- *  handled in observe() with a grace window (see blockedGraceMs) — it is both
- *  "agent needs operator input" and a transient state at turn end before the
- *  enum settles to `finished`. Past the grace it settles FAILED with error
- *  class REMOTE_INPUT_REQUIRED so recovery escalates to the operator. */
+/** Completion sentinel the governed prompt requires the remote agent to
+ *  reply with ("…then reply DONE"). observe() treats a `blocked` session
+ *  whose last devin_message ends in this sentinel as COMPLETED — the enum
+ *  stays `blocked` while the finished session idles waiting for the next
+ *  user message, which can outlast any grace window. Checked as a
+ *  standalone line in the message tail (attachments may follow it). */
+const DONE_RE = /^\s*DONE\s*$/m;
+
+function lastDevinMessage(data: Record<string, unknown>): string | null {
+  const msgs = data.messages;
+  if (!Array.isArray(msgs)) return null;
+  const last = [...(msgs as Array<Record<string, unknown>>)]
+    .reverse()
+    .find((m) => String(m.type) === "devin_message");
+  const text = last ? String(last.message ?? "") : "";
+  return text || null;
+}
+
 function mapStatus(statusEnum: string): string {
   const s = statusEnum.toLowerCase();
   if (s === "finished") return "COMPLETED";
@@ -413,16 +426,25 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     } else if (res.status < 400) {
       const statusEnum = String(res.data.status_enum ?? res.data.status ?? "");
       if (statusEnum === "blocked") {
-        // `blocked` fires both when the agent truly needs operator input AND
-        // transiently at turn end (waiting-for-user before the enum settles
-        // to `finished`). Keep RUNNING inside the grace window; only escalate
-        // to REMOTE_INPUT_REQUIRED if it persists.
+        // `blocked` covers both "agent needs operator input" and "agent's
+        // turn ended; session sits waiting for the next user message" — the
+        // enum may stay `blocked` for minutes after the deliverable lands.
+        // Disambiguate by the DONE sentinel the governed prompt requires:
+        // a completed reply means COMPLETED regardless of enum lag; anything
+        // else gets a grace window before REMOTE_INPUT_REQUIRED escalation.
         rec.remote_status_enum = "blocked";
-        if (!rec.blocked_since) rec.blocked_since = this.now();
-        const blockedMs = this.nowMs() - Date.parse(String(rec.blocked_since));
-        if (Number.isFinite(blockedMs) && blockedMs > this.blockedGraceMs) {
-          rec.status = "FAILED";
+        const lastMsg = lastDevinMessage(res.data);
+        if (lastMsg && DONE_RE.test(lastMsg.slice(-2000))) {
+          rec.status = "COMPLETED";
+          rec.remote_status_enum = "blocked(done)";
           rec.finished_at = this.now();
+        } else {
+          if (!rec.blocked_since) rec.blocked_since = this.now();
+          const blockedMs = this.nowMs() - Date.parse(String(rec.blocked_since));
+          if (Number.isFinite(blockedMs) && blockedMs > this.blockedGraceMs) {
+            rec.status = "FAILED";
+            rec.finished_at = this.now();
+          }
         }
       } else if (statusEnum) {
         delete rec.blocked_since;
@@ -480,14 +502,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       // status enum.
       output:
         remoteDetail.structured_output ??
-        (Array.isArray(remoteDetail.messages)
-          ? (() => {
-              const last = [...(remoteDetail.messages as Array<Record<string, unknown>>)]
-                .reverse()
-                .find((m) => String(m.type) === "devin_message");
-              return last ? String(last.message ?? "") || null : null;
-            })()
-          : null) ??
+        lastDevinMessage(remoteDetail) ??
         remoteDetail.status_enum ??
         null,
       artifacts: [],

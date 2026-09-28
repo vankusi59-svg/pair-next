@@ -848,7 +848,11 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
             messages: [
               { type: "initial_user_message", message: "do the thing" },
               { type: "devin_message", message: "working…" },
-              { type: "devin_message", message: "final report text\n\nDONE" },
+              // report only exists once the enum settles — while blocked the
+              // agent was still mid-question, so no DONE sentinel
+              ...(statusEnum === "finished"
+                ? [{ type: "devin_message", message: "final report text\n\nDONE" }]
+                : []),
             ],
           }
         : { session_id: "s1", url: "u-x" },
@@ -871,6 +875,39 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     expect(result.status).toBe("COMPLETED");
     // deliverable is the agent's reply text, not a bare enum
     expect(String(result.output)).toContain("final report text");
+  });
+
+  it("37bc. blocked + DONE sentinel in last message → COMPLETED without grace wait", () => {
+    const ctx = makeCtx("t37bc");
+    const fetchFn: DevinFetch = (m) => ({
+      status: 200,
+      data: m === "GET"
+        ? {
+            status_enum: "blocked", // enum idles at blocked after the turn ends
+            url: "u-done",
+            messages: [
+              { type: "initial_user_message", message: "…reply DONE." },
+              { type: "devin_message", message: "report body\n\nDONE\n\nATTACHMENT:{…}" },
+            ],
+          }
+        : { session_id: "s1", url: "u-done" },
+    });
+    let nowMs = 3_000_000;
+    const adapter = new DevinExecutorAdapter({
+      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn,
+      blockedGraceMs: 60_000, nowMs: () => nowMs,
+      now: () => new Date(nowMs).toISOString(),
+    });
+    const disp = adapter.dispatch({
+      executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      task_id: "t", mission_id: "m", governed_task_id: "GT1",
+      workspace: ctx.workspace, correlation_id: "c", allowed_paths: [ctx.workspace],
+    });
+    const observed = adapter.observe(String(disp.execution_id));
+    expect(observed.status).toBe("COMPLETED"); // DONE wins over the idle-blocked enum
+    const result = adapter.collect_result(String(disp.execution_id));
+    expect(result.status).toBe("COMPLETED");
+    expect(String(result.output)).toContain("report body");
   });
 
   it("37c. blocked → recovery escalates HUMAN_APPROVAL_REQUIRED, no retry", () => {
