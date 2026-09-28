@@ -18,6 +18,15 @@ export interface MissionControlServerDeps {
   control: MissionControl;
   /** Serve a built SPA (e.g. apps/mission-control-ui/dist) for non-/api GETs. */
   staticDir?: string;
+  /**
+   * Optional plan-expansion seam (P-UI-6): runs at the API edge before
+   * previewMission/startMission, e.g. an LLM planner that fills
+   * metadata.llm_plan. Proposal-only — the injected planner still validates
+   * and the confirm digest still gates submission. Absent → no expansion.
+   */
+  planExpander?: (
+    input: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
 }
 
 const MIME: Record<string, string> = {
@@ -219,9 +228,13 @@ export function createMissionControlServer(
       // §4.3 two-step submit: preview creates no state; confirm must carry
       // the exact plan digest the operator saw.
       if (method === "POST" && p === "/api/missions/preview") {
-        return void json(res, 200, c.previewMission(body as Parameters<typeof c.previewMission>[0]));
+        const expanded = deps.planExpander ? await deps.planExpander(body) : body;
+        return void json(res, 200, c.previewMission(expanded as Parameters<typeof c.previewMission>[0]));
       }
       if (method === "POST" && p === "/api/missions") {
+        // Submit does not re-expand — the operator confirms the previewed
+        // plan verbatim via metadata.llm_plan + confirm_plan.digest; the
+        // digest mismatch check rejects anything altered since preview.
         return void json(res, 200, c.startMission({ ...(body as Record<string, string>), goal: String(body.goal ?? ""), project_id: String(body.project_id ?? ""), operator_id: operator } as never));
       }
       m = p.match(/^\/api\/missions\/([^/]+)\/(pause|resume|cancel|acknowledge|reconcile)$/);

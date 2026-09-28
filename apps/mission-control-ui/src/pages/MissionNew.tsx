@@ -29,7 +29,12 @@ export function MissionNew() {
   const projects = useApi(() => api.projects());
   const [goal, setGoal] = useState("");
   const [projectId, setProjectId] = useState("");
-  const [preview, setPreview] = useState<{ tasks: PlanTask[]; digest: string } | null>(null);
+  const [preview, setPreview] = useState<{
+    tasks: PlanTask[];
+    digest: string;
+    source: string | null;
+    model: string | null;
+  } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const nav = useNavigate();
@@ -53,7 +58,12 @@ export function MissionNew() {
     setErr(null);
     try {
       const r = await api.previewMission(submitPayload());
-      setPreview({ tasks: r.plan.tasks as unknown as PlanTask[], digest: r.plan_digest });
+      setPreview({
+        tasks: r.plan.tasks as unknown as PlanTask[],
+        digest: r.plan_digest,
+        source: r.plan_source,
+        model: r.plan_model,
+      });
     } catch (e) {
       setErr(String(e));
       setPreview(null);
@@ -67,7 +77,13 @@ export function MissionNew() {
     setBusy(true);
     setErr(null);
     try {
-      const m = await api.startMission({ ...submitPayload(), confirm_plan: { digest: preview.digest } });
+      // Echo the exact previewed tasks back in metadata.llm_plan — the
+      // digest check proves to the server this is the plan the operator saw.
+      const m = await api.startMission({
+        ...submitPayload(),
+        confirm_plan: { digest: preview.digest },
+        metadata: preview.source ? { llm_plan: preview.tasks, plan_source: preview.source, plan_model: preview.model } : {},
+      });
       nav(`/missions/${String(m.mission_id)}`);
     } catch (e) {
       setErr(String(e));
@@ -104,7 +120,14 @@ export function MissionNew() {
         </div>
       ) : (
         <section>
-          <h2>Proposed plan — review before it runs</h2>
+          <h2>
+            Proposed plan — review before it runs
+            {preview.source && (
+              <span className={`badge st-${preview.source === "LLM" ? "completed" : "waiting"}`} style={{ marginLeft: 8 }}>
+                {preview.source === "LLM" ? `LLM plan${preview.model ? ` · ${preview.model}` : ""}` : "template fallback"}
+              </span>
+            )}
+          </h2>
           <table className="tbl">
             <thead><tr><th>Task</th><th>Instruction</th><th>Capabilities</th><th>Depends on</th></tr></thead>
             <tbody>

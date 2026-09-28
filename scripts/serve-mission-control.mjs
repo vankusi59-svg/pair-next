@@ -18,6 +18,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDatabase } from "../dist/state/database.js";
 import {
+  llmPlan,
+  sanitizePlan,
   ApprovalQueue,
   CodexCliExecutorAdapter,
   DshExecutorAdapter,
@@ -97,13 +99,46 @@ const selfmod = new SelfImprovementController(service, {
   repoRoot: root,
   selfmodRoot: path.join(dir, "selfmod"),
 });
-// Demo planner: T1 records the goal via PAIR_NATIVE (guaranteed artifact),
-// T2 asks DSH (Gemini by default) to read it and produce analysis.txt — a
-// real governed LLM call routed by capability; DSH wins REASONING via
-// routing_priority. Optional T3 Codex step when the goal mentions
-// code/script/python. Falls back to T1-only when executors are absent.
+// Planner (P-UI-6): when the mission carries metadata.llm_plan — a
+// sanitized task list produced by llmPlan() at the API edge — the planner
+// returns it verbatim (re-validated by validatePlanProposal downstream,
+// and pinned by the confirm digest). Without it, the template planner
+// below runs: T1 PAIR_NATIVE records the goal, T2 DSH/Gemini analysis,
+// optional T3 Codex when the goal mentions code/script/python.
+const LLM_PLANNER_CAPS = [
+  "AUTOMATON_TASK_EXECUTION", "FILE_OPERATIONS", "REASONING",
+  "CODE_GENERATION", "CODE_EDITING", "SHELL_EXECUTION", "PYTHON_EXECUTION",
+];
 const planner = (input) => {
   const goal = String(input.mission.goal);
+  const llm = input.mission?.metadata?.llm_plan;
+  if (Array.isArray(llm) && llm.length) {
+    // Safety re-check at the seam: sanitize again (defense in depth — the
+    // API edge already sanitized; validatePlanProposal validates next).
+    const { tasks } = sanitizePlan(llm, LLM_PLANNER_CAPS, 5);
+    if (tasks.length) {
+      // PAIR_NATIVE tasks need an expected_output_contract worker_spec —
+      // the LLM cannot emit one, so inject the canonical write-file
+      // contract for any native-capability task that lacks it.
+      for (const t of tasks) {
+        if (!t.required_capabilities.includes("AUTOMATON_TASK_EXECUTION")) continue;
+        t.metadata ??= {};
+        if (t.metadata.expected_output_contract) continue;
+        t.metadata.expected_output_contract = {
+          type: "TASK_RESULT",
+          worker_spec: {
+            ops: [
+              { op: "write_text_file", path: "mission_goal.txt", content: goal, idempotency_class: "WRITE", risk_class: "MEDIUM" },
+              { op: "finish", result: { summary: "goal recorded" }, idempotency_class: "READ_ONLY", risk_class: "LOW" },
+            ],
+            limits: { max_ops: 4, timeout_seconds: 30 },
+            allowed_ops: ["write_text_file", "finish"],
+          },
+        };
+      }
+      return { tasks };
+    }
+  }
   const tasks = [{
     task_key: "T1",
     title: "record mission goal",
@@ -183,6 +218,7 @@ service.createProject({ name: "default", root_location: workspace });
 
 // §4.2 — populate provider/model catalogs from canonical discovery sources
 // (dsh settings, executor-advertised observations). Read-only projections.
+let planProvider = null;
 if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   const dres = runProviderDiscovery(store, {
     context: { env: process.env, dshHome: process.env.PAIR_DSH_HOME, codexHome: process.env.CODEX_HOME },
@@ -260,6 +296,14 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
       });
       qualifyBinding(service, String(b.binding_id));
       console.log("MODEL_ROUTE:", route, "QUALIFIED (probe", prb.result + ") bound to", DSH_EXECUTOR_ID);
+      // First qualified route doubles as the LLM planner's model+endpoint.
+      if (!planProvider) {
+        planProvider = {
+          endpoint: endpointOf(prov),
+          credentialEnv: String(prov.credential_reference_name ?? ""),
+          model: mid,
+        };
+      }
     }
     // Other discovered models get DISCOVERED bindings — the routes page shows
     // them as unqualified fallbacks with their failing gate.
@@ -275,10 +319,33 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
 }
 sup.resume();
 
+// P-UI-6 plan expander: LLM-proposes a task DAG for the goal at the API
+// edge (preview only). Runs only when a provider route qualified at boot;
+// any failure → llmPlan falls back to the minimal T1 plan itself.
+const planExpander = async (input) => {
+  if (!planProvider || typeof input.goal !== "string" || !input.goal.trim()) return input;
+  const res = await llmPlan(String(input.goal), {
+    endpoint: `${planProvider.endpoint}/chat/completions`,
+    credentialEnv: planProvider.credentialEnv,
+    model: planProvider.model,
+    allowedCapabilities: LLM_PLANNER_CAPS,
+  });
+  return {
+    ...input,
+    metadata: {
+      ...(typeof input.metadata === "object" && input.metadata ? input.metadata : {}),
+      llm_plan: res.tasks,
+      plan_source: res.source,
+      plan_model: res.model,
+      plan_warnings: res.warnings,
+    },
+  };
+};
 const uiDir = process.env.PAIR_MC_UI_DIR ?? path.join(root, "apps/mission-control-ui/dist");
 const server = createMissionControlServer({
   control,
   staticDir: fs.existsSync(path.join(uiDir, "index.html")) ? uiDir : undefined,
+  planExpander,
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

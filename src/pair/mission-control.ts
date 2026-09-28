@@ -205,7 +205,12 @@ export class MissionControl {
     granted_permissions?: string[];
     authorized_workspaces?: string[];
     risk_ceiling?: string;
-  }): { plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string } {
+  }): {
+    plan: { tasks: Array<Record<string, unknown>> };
+    plan_digest: string;
+    plan_source: string | null;
+    plan_model: string | null;
+  } {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "mission_control.preview");
     }
@@ -233,7 +238,14 @@ export class MissionControl {
       risk_ceiling: input.risk_ceiling ?? null,
       tasks,
     });
-    return { plan: { tasks: tasks as unknown as Array<Record<string, unknown>> }, plan_digest };
+    return {
+      plan: { tasks: tasks as unknown as Array<Record<string, unknown>> },
+      plan_digest,
+      // Operator-visible provenance of the proposed plan (metadata is
+      // operator-supplied; the digest — not this field — is what pins it).
+      plan_source: (input.metadata?.plan_source as string | undefined) ?? null,
+      plan_model: (input.metadata?.plan_model as string | undefined) ?? null,
+    };
   }
 
   /** Create + queue a mission for orchestration. */
