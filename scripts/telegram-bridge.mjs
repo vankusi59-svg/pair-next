@@ -257,6 +257,20 @@ async function notifyLoop(allowList) {
 // ---- main loop -----------------------------------------------------------------
 async function main() {
   const me = await tg("getMe");
+  // Register the slash-command menu so "/" shows available commands.
+  await tg("setMyCommands", {
+    commands: [
+      { command: "help", description: "danh sách lệnh" },
+      { command: "status", description: "tổng quan hệ thống + spend" },
+      { command: "missions", description: "5 mission gần nhất" },
+      { command: "approvals", description: "yêu cầu chờ duyệt" },
+      { command: "approve", description: "duyệt approval" },
+      { command: "deny", description: "từ chối approval" },
+      { command: "halt", description: "chặn remote dispatch" },
+      { command: "unhalt", description: "mở lại remote dispatch" },
+      { command: "id", description: "chat id của bạn" },
+    ],
+  }).catch((e) => console.error("setMyCommands:", String(e)));
   console.log(`telegram-bridge: bot @${me.username} (${me.id}) → ${MC_URL}`);
   console.log(`telegram-bridge: allow file ${ALLOW_FILE}; halt lever ${HALT_FILE}`);
 
