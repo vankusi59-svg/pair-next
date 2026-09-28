@@ -31,6 +31,9 @@ export const DSH_CAPABILITY_IDS = [
   "FILE_OPERATIONS",
   "SHELL_EXECUTION",
   "REASONING",
+  // Compose the user-facing deliverable file (outbox/report.txt) that the
+  // Telegram bridge forwards to the operator.
+  "TELEGRAM_DELIVERY",
 ] as const;
 
 function modelRoute(env: (n: string) => string | undefined): [string, string] {

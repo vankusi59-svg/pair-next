@@ -202,14 +202,16 @@ const SYSTEM_PROMPT = `You are the PAIR OS mission planner. Convert the operator
 Output ONLY a JSON object: {"tasks": [...]}. Each task:
 - "task_key": "T1", "T2", ... sequential
 - "title": short label
-- "task_instruction": self-contained instruction for an autonomous executor agent. Mention workspace-relative file paths when files must be read/written (e.g. "read mission_goal.txt", "write result to out.txt"). The executor runs inside the mission workspace.
+- "task_instruction": self-contained instruction for an autonomous executor agent. It must name the REAL WORK the operator asked for — carry the goal's subject matter verbatim into the instruction (e.g. goal "phân tích giá vàng hôm nay" → instruction "analyze today's gold price using ICT concepts — market structure, liquidity, order blocks — and write findings to analysis.txt"). NEVER emit meta-instructions like "analyze the goal" or "summarize the mission". Mention workspace-relative file paths when files must be read/written (e.g. "read mission_goal.txt", "write result to out.txt"). The executor runs inside the mission workspace.
 - "required_capabilities": subset of the ALLOWED_CAPABILITIES list — pick the minimum needed. The router maps capabilities to executors; you never name an executor.
 - "depends_on": earlier task_keys only (DAG, acyclic).
 
 Rules:
 - Always include a first task T1 that records the goal into mission_goal.txt via capability AUTOMATON_TASK_EXECUTION.
 - 2 to MAX_TASKS tasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS/AUTOMATON_TASK_EXECUTION for pure file writes.
+- LIVE DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price") that local executors cannot fetch — local executors have NO internet — the data-gathering task MUST use REMOTE_CLOUD_TASK_EXECUTION (the remote executor has a real browser/network). Its downstream file/report task then reads what the remote agent returned... NOTE remote outputs are refs, so when the goal needs live data AND a local file report, prefer letting the remote task produce the full deliverable text remotely and keep the local task to recording the goal.
 - REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION run on a REMOTE executor: their outputs stay remote (returned as refs, never local files). Such a task must be a DAG leaf — no other task may depend on it.
+- TELEGRAM_DELIVERY (when ALLOWED): when the goal asks to send/deliver results to Telegram (gửi tele/telegram, báo qua telegram, send to telegram), add a DAG-leaf task with capability TELEGRAM_DELIVERY whose instruction is: "Write the final user-facing deliverable — in the goal's language — to outbox/report.txt (a plain-text message ready to send to the operator), then reply DONE." It must depend_on every task that produces content for the report.
 - Keep task instructions concrete and verifiable; end with "then reply DONE."
 - No prose, no markdown — JSON only.`;
 

@@ -249,6 +249,25 @@ async function notifyLoop(allowList) {
           `⏸ Cần duyệt: ${id}\n${trunc(x?.requested_action ?? x?.type ?? "", 40)} — ${trunc(x?.reason ?? x?.detail ?? "", 90)}\n/approve ${id}  |  /deny ${id}`,
         );
     }
+
+    // TELEGRAM_DELIVERY outbox: mission tasks write workspace outbox/*.txt —
+    // forward each to every allowed chat, then mark .sent.
+    const projects = await mc("GET", "/api/projects").catch(() => []);
+    for (const prj of Array.isArray(projects) ? projects : projects?.projects ?? []) {
+      const outbox = path.join(String(prj.root_location ?? ""), "outbox");
+      if (!outbox || !fs.existsSync(outbox)) continue;
+      for (const f of fs.readdirSync(outbox)) {
+        if (!f.endsWith(".txt")) continue;
+        const fp = path.join(outbox, f);
+        try {
+          const content = fs.readFileSync(fp, "utf8").trim();
+          if (content) for (const c of allowList) await send(c, `📨 ${f}:\n\n${content}`);
+          fs.renameSync(fp, fp + ".sent");
+        } catch (e) {
+          console.error("outbox send", fp, String(e).slice(0, 120));
+        }
+      }
+    }
   } catch (e) {
     console.error("notify loop:", String(e).slice(0, 200));
   }

@@ -153,6 +153,7 @@ const LLM_PLANNER_CAPS = [
   "AUTOMATON_TASK_EXECUTION", "FILE_OPERATIONS", "REASONING",
   "CODE_GENERATION", "CODE_EDITING", "SHELL_EXECUTION", "PYTHON_EXECUTION",
   "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION",
+  "TELEGRAM_DELIVERY",
 ];
 // Capability sets of the currently-qualified executors — sanitizePlan drops
 // any task whose required_capabilities no single executor can serve.
@@ -267,7 +268,7 @@ registry.register({
   },
 });
 service.routes.seedPairNativeRoute();
-for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION"])
+for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION", "TELEGRAM_DELIVERY"])
   service.registerCapability(c, { risk_class: "LOW" });
 if (governed.size) {
   const reg = registerGovernedExecutors(service, governed, "PAIR_MC", {
