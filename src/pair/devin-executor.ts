@@ -38,6 +38,8 @@ export const DEVIN_BINDING_MECHANISM = "AMBIENT_FIXED";
 
 const DEFAULT_BASE_URL = "https://api.devin.ai";
 const DEFAULT_ORG_ID = "org-95faaf8c42dc4b2eb6d9e17a5fc5fe90";
+const DEFAULT_DEVIN_MODE = "swe-2-max";
+const DEVIN_MODE_FALLBACK = "swe-2-high";
 
 export interface DevinResponse {
   status: number;
@@ -57,6 +59,11 @@ export interface DevinAdapterDeps {
   apiKey?: string | null;
   /** Defaults: env PAIR_DEVIN_ORG_ID → DEFAULT_ORG_ID. */
   orgId?: string;
+  /** Devin agent mode pinned on dispatched sessions. Defaults: env
+   *  PAIR_DEVIN_MODE → "swe-2-max". If the API rejects the mode
+   *  (not enabled for the org), dispatch retries once with the
+   *  fallback mode "swe-2-high". */
+  devinMode?: string;
   /** Defaults: https://api.devin.ai */
   baseUrl?: string;
   /** Injectable synchronous transport — omit to use the curl transport. */
@@ -115,6 +122,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
   private readonly apiKey: string | null;
   private readonly orgId: string;
   private readonly baseUrl: string;
+  private readonly devinMode: string;
   private readonly fetchFn: DevinFetch;
   private readonly now: () => string;
   private readonly journalRoot: string;
@@ -123,6 +131,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     this.apiKey = deps.apiKey ?? process.env.PAIR_DEVIN_API_KEY ?? null;
     this.orgId = deps.orgId ?? process.env.PAIR_DEVIN_ORG_ID ?? DEFAULT_ORG_ID;
     this.baseUrl = deps.baseUrl ?? DEFAULT_BASE_URL;
+    this.devinMode = deps.devinMode ?? process.env.PAIR_DEVIN_MODE ?? DEFAULT_DEVIN_MODE;
     this.fetchFn = deps.fetchFn ?? curlFetch;
     this.now = deps.now ?? utcnow;
     this.journalRoot = deps.journalRoot;
@@ -268,12 +277,19 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       const { result: _omit, ...out } = existing;
       return { ...out };
     }
-    const res = this.api("POST", `/v1/sessions`, {
+    const body = (mode: string): Record<string, unknown> => ({
       prompt: this.buildPrompt(task),
       idempotent: true,
       tags: ["pair-os", String(task.mission_id)],
       title: `PAIR ${String(task.task_key ?? task.task_id)}`,
+      devin_mode: mode,
     });
+    let res = this.api("POST", `/v1/sessions`, body(this.devinMode));
+    let usedMode = this.devinMode;
+    if (res.status === 400 && this.devinMode !== DEVIN_MODE_FALLBACK) {
+      res = this.api("POST", `/v1/sessions`, body(DEVIN_MODE_FALLBACK));
+      usedMode = DEVIN_MODE_FALLBACK;
+    }
     if (res.status === 401 || res.status === 403) {
       throw new PolicyError("DEVIN_CREDENTIAL_NOT_RESOLVABLE", `http_${res.status}`);
     }
@@ -298,6 +314,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       finished_at: null,
       remote_session_id: sessionId ? `devin-${sessionId}` : null,
       remote_url: res.data.url ?? null,
+      remote_devin_mode: usedMode,
     };
     this.executions.set(executionId, record);
     atomicWriteJson(path.join(runRoot, "devin-dispatch.json"), {
