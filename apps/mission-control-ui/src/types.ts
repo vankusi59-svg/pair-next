@@ -1,7 +1,8 @@
 export interface Mission {
   mission_id: string;
   goal: string;
-  state: string;
+  state?: string;
+  status?: string;
   runtime_state: string | null;
   created_at?: string;
   project_id?: string;

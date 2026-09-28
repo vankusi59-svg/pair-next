@@ -6,10 +6,10 @@ import { useLiveRefresh } from "../hooks/eventBus";
 import { StateBadge } from "../components/Badge";
 
 export function Dashboard() {
-  const health = useApi(() => api.health());
   const missions = useApi(() => api.missions());
   const routing = useApi(() => api.routing());
   const cost = useApi(() => api.cost());
+  const approvals = useApi(() => api.approvals());
   useLiveRefresh(missions.reload);
   useLiveRefresh(routing.reload);
   const [q, setQ] = useState("");
@@ -49,8 +49,8 @@ export function Dashboard() {
       <section className="cards">
         <div className="card"><div className="k">Missions running</div><div className="v">{running.length}</div></div>
         <div className="card"><div className="k">Missions finished</div><div className="v">{finished.length}</div></div>
-        <div className="card"><div className="k">Routable executors</div><div className="v">{(routing.data?.routable ?? []).length}</div></div>
-        <div className="card"><div className="k">Approvals pending</div><div className="v">{String((health.data as Record<string, unknown>)?.approvals_pending ?? "—")}</div></div>
+        <div className="card"><div className="k">Routable executors</div><div className="v">{(routing.data?.routable ?? []).filter((r) => r.routable === true).length}</div></div>
+        <div className="card"><div className="k">Approvals pending</div><div className="v">{approvals.data ? approvals.data.length : "—"}</div></div>
         <div className="card" title="Remote Devin dispatches today vs the PAIR_MAX_REMOTE_TASKS_PER_DAY cap">
           <div className="k">Remote spend (today)</div>
           <div className="v">
@@ -84,7 +84,7 @@ export function Dashboard() {
                 <tr key={String(m.mission_id)}>
                   <td><Link to={`/missions/${String(m.mission_id)}`} className="mono">{String(m.mission_id).slice(0, 18)}…</Link></td>
                   <td className="goal">{String(m.goal)}</td>
-                  <td><StateBadge state={String(m.state ?? "")} /></td>
+                  <td><StateBadge state={String(m.state ?? m.status ?? "")} /></td>
                   <td><StateBadge state={String(m.runtime_state ?? "")} /></td>
                   <td className="muted">{String(m.created_at ?? "").replace("T", " ").slice(0, 19)}</td>
                 </tr>
@@ -99,14 +99,20 @@ export function Dashboard() {
         <table className="tbl">
           <thead><tr><th>Executor</th><th>Type</th><th>Health</th><th>Qualification</th></tr></thead>
           <tbody>
-            {(routing.data?.executors ?? []).map((e) => (
-              <tr key={String(e.executor_id ?? e.entity_id)}>
-                <td className="mono">{String(e.executor_id ?? e.entity_id)}</td>
-                <td>{String(e.executor_type ?? "")}</td>
-                <td>{String(e.health_state ?? "—")}</td>
-                <td>{String((e.qualification_state as string) ?? "—")}</td>
-              </tr>
-            ))}
+            {(routing.data?.executors ?? []).map((e) => {
+              const desc = (e.descriptor ?? {}) as Record<string, unknown>;
+              const meta = (e.metadata ?? {}) as Record<string, unknown>;
+              const qual = e.qualification_state ?? desc.qualification_state ?? meta.qualification_state;
+              const reasons = ((meta.qualification ?? {}) as Record<string, unknown>).reasons;
+              return (
+                <tr key={String(e.executor_id ?? e.entity_id)}>
+                  <td className="mono">{String(e.executor_id ?? e.entity_id)}</td>
+                  <td>{String(e.executor_type ?? "")}</td>
+                  <td>{String(e.health_state ?? "—")}</td>
+                  <td title={Array.isArray(reasons) ? reasons.join("; ") : undefined}>{String(qual ?? "—")}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </section>
