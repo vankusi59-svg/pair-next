@@ -100,5 +100,7 @@ tasks to Codex.
 | `PAIR_DSH_FALLBACK_ROUTE` | secondary route to qualify | `groq:openai/gpt-oss-20b` |
 | `PAIR_MC_UI_DIR` | built UI dir | `apps/mission-control-ui/dist` |
 | `GEMINI_API_KEY` / `GROQ_API_KEY` | provider credentials | unset |
+| `PAIR_DEVIN_API_KEY` | Devin API key (`cog_...`) — enables the DEVIN executor (REMOTE_CLOUD_TASK_EXECUTION). Unset = registered but UNQUALIFIED | unset |
+| `PAIR_DEVIN_ORG_ID` | Devin org id for session dispatch | built-in default |
 
 Never commit real keys — reference env vars only.

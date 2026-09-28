@@ -11,6 +11,9 @@
  *                       falls back to legacy inline UI when absent)
  *   PAIR_DSH_HOME       dsh settings home (enables DSH executor when set)
  *   CODEX_HOME          codex auth home (enables CODEX executor when set)
+ *   PAIR_DEVIN_API_KEY  Devin API key (cog_...); without it DEVIN registers
+ *                       UNQUALIFIED (fail-closed, shown in UI with reason)
+ *   PAIR_DEVIN_ORG_ID   optional Devin org override
  *   PAIR_DSH_MODEL_ROUTE  optional provider:model override
  */
 import fs from "node:fs";
@@ -22,6 +25,7 @@ import {
   sanitizePlan,
   ApprovalQueue,
   CodexCliExecutorAdapter,
+  DevinExecutorAdapter,
   DshExecutorAdapter,
   ExecutorRegistry,
   GovernedTaskGate,
@@ -50,6 +54,7 @@ import {
   probeModel,
   qualifyModel,
   CODEX_EXECUTOR_ID,
+  DEVIN_EXECUTOR_ID,
   DSH_EXECUTOR_ID,
   PAIR_NATIVE_EXECUTOR_ID,
 } from "../dist/pair/index.js";
@@ -86,6 +91,9 @@ const adapters = new Map([[PAIR_NATIVE_EXECUTOR_ID, native]]);
 const governed = new Map();
 if (process.env.PAIR_DSH_HOME) governed.set(DSH_EXECUTOR_ID, new DshExecutorAdapter({ journalRoot }));
 if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
+// DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
+// UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
+governed.set(DEVIN_EXECUTOR_ID, new DevinExecutorAdapter({ journalRoot }));
 for (const [id, a] of governed) adapters.set(id, a);
 
 const gate = new GovernedTaskGate(service);
@@ -108,6 +116,7 @@ const selfmod = new SelfImprovementController(service, {
 const LLM_PLANNER_CAPS = [
   "AUTOMATON_TASK_EXECUTION", "FILE_OPERATIONS", "REASONING",
   "CODE_GENERATION", "CODE_EDITING", "SHELL_EXECUTION", "PYTHON_EXECUTION",
+  "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION",
 ];
 const planner = (input) => {
   const goal = String(input.mission.goal);
@@ -206,11 +215,11 @@ registry.register({
   },
 });
 service.routes.seedPairNativeRoute();
-for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION"])
+for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION"])
   service.registerCapability(c, { risk_class: "LOW" });
 if (governed.size) {
   const reg = registerGovernedExecutors(service, governed, "PAIR_MC", {
-    priorities: { DEEPSEEK_HARNESS: 40, CODEX: 60 },
+    priorities: { DEEPSEEK_HARNESS: 40, CODEX: 60, DEVIN: 80 },
   });
   console.log("ROUTABLE:", reg.routable.join(", "));
 }
