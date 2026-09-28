@@ -281,6 +281,7 @@ async function main() {
       try {
         if (!allow.size) {
           // Discovery mode — fail-closed: echo the chat id, execute nothing.
+          console.log(`discovery: chat_id=${chatId} text=${trunc(text, 60)}`);
           await send(chatId, `PAIR bridge chưa có allowlist.\nchat_id của bạn: ${chatId}\nGửi id này cho admin để được cấp quyền.`);
         } else if (!allow.has(String(chatId))) {
           await send(chatId, "Bạn không có quyền điều khiển PAIR (chat_id không trong allowlist).");
