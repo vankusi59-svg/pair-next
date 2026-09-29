@@ -434,7 +434,12 @@ export class MissionScheduleService {
         fresh.last_fired_at = row.last_fired_at;
         if (row.last_mission_id) fresh.last_mission_id = row.last_mission_id;
         if (row.last_error) fresh.last_error = row.last_error;
-        fresh.run_count = Number(row.run_count ?? fresh.run_count);
+        // run_count is monotonic — a losing writer must never roll it back
+        // (a local 0 is not nullish, so ?? cannot merge here).
+        fresh.run_count = Math.max(
+          Number(row.run_count ?? 0),
+          Number(fresh.run_count ?? 0),
+        );
         this.store.put("mission_schedule", id, fresh, Number(fresh.version));
       }
     }
