@@ -34,6 +34,7 @@ export const WORK_ITEM_STATUSES = [
   "READY",
   "IN_PROGRESS",
   "BLOCKED",
+  "REVIEW_REQUIRED",
   "DONE",
   "CANCELLED",
 ] as const;
@@ -58,8 +59,11 @@ const WORK_ITEM_TRANSITIONS: Record<WorkItemStatus, readonly WorkItemStatus[]> =
   // READY→READY is the reassign/refresh path; every other self-transition
   // (e.g. IN_PROGRESS→IN_PROGRESS, a duplicate open) is illegal.
   READY: ["READY", "IN_PROGRESS", "BLOCKED", "BACKLOG", "CANCELLED"],
-  IN_PROGRESS: ["BLOCKED", "DONE", "CANCELLED"],
+  IN_PROGRESS: ["BLOCKED", "REVIEW_REQUIRED", "DONE", "CANCELLED"],
   BLOCKED: ["READY", "IN_PROGRESS", "CANCELLED"],
+  // P14: an accepted review completes the node; a rework request returns
+  // it to READY for another governed open; cancelled is terminal.
+  REVIEW_REQUIRED: ["DONE", "READY", "BLOCKED", "CANCELLED"],
   DONE: [],
   CANCELLED: [],
 };
@@ -69,6 +73,14 @@ function assertWorkItemTransition(from: string, to: WorkItemStatus): void {
     throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_TRANSITION", `${from} → ${to}`);
   }
 }
+
+/** Terminal work-item states — a terminal node can never silently reopen. */
+export const TERMINAL_WORK_ITEM_STATUSES = new Set(["DONE", "CANCELLED"]);
+/** Work-graph bounds (P14 §6/§7): delegation depth, business-graph size,
+ *  children per decomposition — fail closed when exceeded. */
+export const WORK_DELEGATION_DEPTH_CAP = Number(process.env.PAIR_WORK_DELEGATION_DEPTH_CAP ?? 5);
+export const WORK_GRAPH_NODE_CAP = Number(process.env.PAIR_WORK_GRAPH_NODE_CAP ?? 64);
+export const WORK_DECOMPOSE_CHILD_CAP = Number(process.env.PAIR_WORK_DECOMPOSE_CHILD_CAP ?? 16);
 
 /** How long a work-item claim stays valid before another agent may take over. */
 const CLAIM_TTL_MS = Number(process.env.PAIR_WORK_ITEM_CLAIM_MS ?? 30 * 60 * 1000);
@@ -202,6 +214,9 @@ export class BusinessLayer {
     role?: string;
     reports_to?: string;
     executor_binding?: string;
+    /** P14: declared capabilities matched against work_item
+     *  required_capability at assign/claim/heartbeat. */
+    capabilities?: string[];
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "org_agent.create");
@@ -224,6 +239,7 @@ export class BusinessLayer {
       role: input.role ?? "",
       reports_to: input.reports_to ?? null,
       executor_binding: input.executor_binding ?? null,
+      capabilities: (input.capabilities ?? []).map(String),
       status: "ACTIVE" as OrgAgentStatus,
       context_notes: [] as Array<Record<string, unknown>>,
       created_at: utcnow(),
@@ -327,6 +343,25 @@ export class BusinessLayer {
     objective_id?: string;
     priority?: number;
     source?: string;
+    /** P14 work graph: parent node + dependency edges (same business,
+     *  acyclic) — canonical, not caller-fabricated context. */
+    parent_work_item_id?: string;
+    depends_on?: string[];
+    /** Capability an assignee/claimer must declare to work the node. */
+    required_capability?: string;
+    /** Completion requires a governed review before DONE. */
+    requires_review?: boolean;
+    reviewer_agent_id?: string;
+    /** Delegation provenance (set by WorkforceService only). */
+    delegated_from_work_item_id?: string;
+    delegated_by_agent_id?: string;
+    delegation_reason?: string;
+    delegation_depth?: number;
+    decomposition_id?: string;
+    /** Deterministic id — used only by governed delegation/decomposition
+     *  so racing materializers collide on the version-0 INSERT instead of
+     *  silently duplicating a node. Callers must not set it otherwise. */
+    work_item_id?: string;
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.create");
@@ -351,7 +386,28 @@ export class BusinessLayer {
         throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `objective outside business ${input.business_id}`);
       }
     }
-    const id = newId("WI");
+    // P14 work graph: parent + dependency edges are canonical — every
+    // reference must resolve inside THIS business and the resulting graph
+    // must stay acyclic.
+    const dependsOn = [...new Set((input.depends_on ?? []).map(String))];
+    if (input.parent_work_item_id) {
+      const parent = this.store.get("work_item", input.parent_work_item_id);
+      if (String(parent.business_id) !== input.business_id) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_SCOPE", `parent outside business ${input.business_id}`);
+      }
+    }
+    const id = input.work_item_id ?? newId("WI");
+    this.assertGraphEdgesLegal(input.business_id, id, dependsOn);
+    if (this.listWorkItems(input.business_id).length + 1 > WORK_GRAPH_NODE_CAP) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_BOUND", `business graph exceeds ${WORK_GRAPH_NODE_CAP} nodes`);
+    }
+    if (input.reviewer_agent_id) {
+      const reviewer = this.store.get("org_agent", input.reviewer_agent_id);
+      if (String(reviewer.business_id) !== input.business_id) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `reviewer outside business ${input.business_id}`);
+      }
+    }
+    const depsSatisfied = this.depsSatisfiedDeps(input.business_id, dependsOn);
     const row = {
       work_item_id: id,
       business_id: input.business_id,
@@ -363,7 +419,23 @@ export class BusinessLayer {
       routine_id: null as string | null,
       priority: input.priority ?? 50,
       source: input.source ?? "manual",
-      status: (input.assignee_agent_id ? "READY" : "BACKLOG") as WorkItemStatus,
+      // P14 graph fields — edges point at prerequisites; readiness is
+      // reconstructed from canonical dep state, never trusted blindly.
+      parent_work_item_id: input.parent_work_item_id ?? null,
+      depends_on: dependsOn,
+      required_capability: input.required_capability ?? null,
+      requires_review: input.requires_review === true,
+      reviewer_agent_id: input.reviewer_agent_id ?? null,
+      delegated_from_work_item_id: input.delegated_from_work_item_id ?? null,
+      delegated_by_agent_id: input.delegated_by_agent_id ?? null,
+      delegation_reason: input.delegation_reason ?? null,
+      delegation_depth: input.delegation_depth ?? 0,
+      decomposition_id: input.decomposition_id ?? null,
+      blocked_code: null as string | null,
+      // READY only when an assignee exists AND prerequisites are already
+      // satisfied; otherwise the node waits in BACKLOG (inbox projects
+      // WAITING_DEPENDENCY for assigned-but-unsatisfied nodes).
+      status: (input.assignee_agent_id && depsSatisfied ? "READY" : "BACKLOG") as WorkItemStatus,
       mission_ids: [] as string[],
       claimed_by: null as string | null,
       claim_token: null as string | null,
@@ -391,6 +463,182 @@ export class BusinessLayer {
       .sort((a, b) => Number(b.priority ?? 0) - Number(a.priority ?? 0) || String(a.created_at).localeCompare(String(b.created_at)));
   }
 
+  /* ---------------- work graph (P14) ---------------- */
+
+  /**
+   * Validate dependency edges for a node about to be created/mutated:
+   * every referenced node exists in the SAME business, no self-edge, and
+   * adding the edges cannot create a cycle. Dependencies point from a node
+   * to its prerequisites — a cycle exists iff a prerequisite's ancestor
+   * chain reaches back to the new node.
+   */
+  assertGraphEdgesLegal(businessId: string, nodeId: string, dependsOn: string[]): void {
+    if (dependsOn.includes(nodeId)) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_CYCLE", `${nodeId} depends on itself`);
+    }
+    for (const depId of dependsOn) {
+      const dep = this.store.tryGet("work_item", depId);
+      if (!dep) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_NODE", `unknown dependency ${depId}`);
+      }
+      if (String(dep.business_id) !== businessId) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_SCOPE", `dependency ${depId} outside business ${businessId}`);
+      }
+      // Walk the dep's ancestor chain; reaching nodeId closes a cycle.
+      const seen = new Set<string>();
+      const queue = [depId];
+      while (queue.length) {
+        const curId = queue.pop() as string;
+        if (curId === nodeId) {
+          throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_CYCLE", `${nodeId} → ${depId} closes a cycle`);
+        }
+        if (seen.has(curId)) continue;
+        seen.add(curId);
+        const cur = this.store.tryGet("work_item", curId);
+        for (const next of (cur?.depends_on as string[] | undefined) ?? []) queue.push(String(next));
+        if (cur?.parent_work_item_id) queue.push(String(cur.parent_work_item_id));
+      }
+    }
+  }
+
+  /** All prerequisites DONE? Missing/foreign dep ids count as unsatisfied
+   *  (they cannot exist legally, but never assume). */
+  depsSatisfiedDeps(businessId: string, dependsOn: string[]): boolean {
+    for (const depId of dependsOn) {
+      const dep = this.store.tryGet("work_item", depId);
+      if (!dep || String(dep.business_id) !== businessId || String(dep.status) !== "DONE") return false;
+    }
+    return true;
+  }
+
+  depsSatisfied(row: Row): boolean {
+    return this.depsSatisfiedDeps(String(row.business_id), (row.depends_on as string[] | undefined) ?? []);
+  }
+
+  /**
+   * Canonical dependency mutation (P14 §2): the only path that can change a
+   * node's edges. Requires the caller's expected_version — versionless
+   * mutation is impossible at the storage boundary — and re-validates
+   * scope/acyclicity on every write.
+   */
+  updateWorkItemDeps(
+    workItemId: string,
+    dependsOn: string[],
+    expectedVersion: number | undefined,
+    actor: string,
+  ): Row {
+    if (!actor) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.deps");
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    if (TERMINAL_WORK_ITEM_STATUSES.has(String(row.status))) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(row.status)} cannot be mutated`);
+    }
+    const deps = [...new Set(dependsOn.map(String))];
+    this.assertGraphEdgesLegal(String(row.business_id), workItemId, deps);
+    row.depends_on = deps;
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, expectedVersion as number);
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_DEPS_UPDATED",
+      actor: `operator:${actor}`, metadata: { depends_on: deps },
+    });
+    this.propagateDependents(workItemId);
+    return saved;
+  }
+
+  /**
+   * Dependency propagation (P14 §10): when a node reaches a terminal
+   * state, update its dependents deterministically —
+   *   prereq DONE              → dependents whose deps are now ALL done
+   *                            promote BACKLOG→READY (assignee present);
+   *   prereq CANCELLED/failed  → dependents BLOCKED with
+   *                            DEPENDENCY_FAILED — never executable.
+   * Runs recursively so multi-level chains settle in one sweep.
+   */
+  private propagateDependents(nodeId: string): void {
+    const node = this.store.tryGet("work_item", nodeId);
+    if (!node) return;
+    const businessId = String(node.business_id);
+    const nodeDone = String(node.status) === "DONE";
+    const nodeFailed = TERMINAL_WORK_ITEM_STATUSES.has(String(node.status)) && !nodeDone;
+    for (const dep of this.store.list("work_item")) {
+      if (String(dep.business_id) !== businessId) continue;
+      const deps = (dep.depends_on as string[] | undefined) ?? [];
+      if (!deps.includes(nodeId)) continue;
+      if (TERMINAL_WORK_ITEM_STATUSES.has(String(dep.status))) continue;
+      if (nodeDone) {
+        if (String(dep.status) === "BACKLOG" && this.depsSatisfied(dep) && dep.assignee_agent_id) {
+          dep.status = "READY";
+          dep.updated_at = utcnow();
+          const saved = this.store.put("work_item", String(dep.work_item_id), dep, Number(dep.version));
+          this.store.event({
+            entity_type: "work_item", entity_id: String(dep.work_item_id), event_type: "WORK_READY",
+            old_state: "BACKLOG", new_state: "READY", actor: "PAIR_BUSINESS_LAYER",
+            metadata: { prerequisite_done: nodeId },
+          });
+          this.propagateDependents(String(saved.work_item_id));
+        }
+      } else if (nodeFailed && String(dep.status) !== "BLOCKED") {
+        const from = String(dep.status);
+        assertWorkItemTransition(from, "BLOCKED");
+        dep.status = "BLOCKED";
+        dep.blocked_code = "DEPENDENCY_FAILED";
+        dep.updated_at = utcnow();
+        const saved = this.store.put("work_item", String(dep.work_item_id), dep, Number(dep.version));
+        this.store.event({
+          entity_type: "work_item", entity_id: String(dep.work_item_id), event_type: "WORK_BLOCKED",
+          old_state: from, new_state: "BLOCKED", actor: "PAIR_BUSINESS_LAYER",
+          metadata: { blocked_code: "DEPENDENCY_FAILED", prerequisite_failed: nodeId },
+        });
+        this.propagateDependents(String(saved.work_item_id));
+      }
+    }
+  }
+
+  /**
+   * Restart reconstruction (P14 §10/§11): rebuild every node's readiness
+   * from canonical dep state — promotes satisfied assigned nodes to READY
+   * and re-blocks nodes under failed prerequisites. Idempotent; safe to
+   * run on every board/heartbeat sweep.
+   */
+  rebuildReadiness(businessId: string): void {
+    for (const w of this.listWorkItems(businessId)) {
+      if (TERMINAL_WORK_ITEM_STATUSES.has(String(w.status))) continue;
+      const deps = (w.depends_on as string[] | undefined) ?? [];
+      if (deps.length === 0) continue;
+      if (!this.depsSatisfied(w)) {
+        // Any prerequisite irrecoverably dead → this node is deterministically
+        // blocked; otherwise it just keeps waiting.
+        const failed = deps.some((depId) => {
+          const dep = this.store.tryGet("work_item", depId);
+          return dep && String(dep.business_id) === businessId &&
+            TERMINAL_WORK_ITEM_STATUSES.has(String(dep.status)) && String(dep.status) !== "DONE";
+        });
+        if (failed && String(w.status) !== "BLOCKED") {
+          const from = String(w.status);
+          assertWorkItemTransition(from, "BLOCKED");
+          w.status = "BLOCKED";
+          w.blocked_code = "DEPENDENCY_FAILED";
+          w.updated_at = utcnow();
+          this.store.put("work_item", String(w.work_item_id), w, Number(w.version));
+          this.store.event({
+            entity_type: "work_item", entity_id: String(w.work_item_id), event_type: "WORK_BLOCKED",
+            old_state: from, new_state: "BLOCKED", actor: "PAIR_BUSINESS_LAYER",
+            metadata: { blocked_code: "DEPENDENCY_FAILED", rebuilt: true },
+          });
+        }
+      } else if (String(w.status) === "BACKLOG" && w.assignee_agent_id) {
+        w.status = "READY";
+        w.updated_at = utcnow();
+        this.store.put("work_item", String(w.work_item_id), w, Number(w.version));
+        this.store.event({
+          entity_type: "work_item", entity_id: String(w.work_item_id), event_type: "WORK_READY",
+          old_state: "BACKLOG", new_state: "READY", actor: "PAIR_BUSINESS_LAYER",
+          metadata: { rebuilt: true },
+        });
+      }
+    }
+  }
+
   assignWorkItem(workItemId: string, agentId: string, actor: string): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     const agent = this.store.get("org_agent", agentId);
@@ -402,6 +650,14 @@ export class BusinessLayer {
     }
     const from = String(row.status);
     assertWorkItemTransition(from, "READY");
+    // P14 §8: the assignee must declare the capability the node requires.
+    const reqCap = row.required_capability ? String(row.required_capability) : null;
+    if (reqCap && !((agent.capabilities as string[] | undefined) ?? []).includes(reqCap)) {
+      throw new PolicyError(
+        "FAIL_CLOSED_WORK_CAPABILITY",
+        `agent lacks required capability ${reqCap}`,
+      );
+    }
     // Reassigning an item actively claimed by someone else would strand the
     // new assignee behind a foreign claim — fail closed instead.
     if (isClaimActive(row, utcnow()) && String(row.claimed_by) !== agentId) {
@@ -445,6 +701,14 @@ export class BusinessLayer {
     }
     const from = String(row.status);
     assertWorkItemTransition(from, "IN_PROGRESS");
+    // P14 §3: executable only when every dependency is DONE — readiness is
+    // canonical state, never caller assertion.
+    if (!this.depsSatisfied(row)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_ITEM_DEPENDENCY",
+        `unsatisfied prerequisites: ${((row.depends_on as string[] | undefined) ?? []).join(",")}`,
+      );
+    }
     const business = this.getBusiness(String(row.business_id));
     const agentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
     const nowIso = utcnow();
@@ -738,6 +1002,56 @@ export class BusinessLayer {
       old_state: from, new_state: "CANCELLED", actor: `operator:${actor}`,
       metadata: { mission_id: cancelledMission },
     });
+    // P14 §10: a cancelled prerequisite deterministically blocks dependents.
+    this.propagateDependents(workItemId);
+    return saved;
+  }
+
+  /**
+   * Governed review (P14 §9): REVIEW_REQUIRED → DONE (accept) or → READY
+   * (rework). The reviewer must be an ACTIVE agent of the same business,
+   * and when the node requires review it can never be self-approved by the
+   * assignee that produced the unverified result. Review grants the
+   * reviewer no execution authority.
+   */
+  reviewWorkItem(
+    workItemId: string,
+    input: { reviewer_agent_id: string; decision: "ACCEPT" | "REWORK"; note?: string },
+    actor: string,
+  ): Row {
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    if (String(row.status) !== "REVIEW_REQUIRED") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_REVIEW_STATE",
+        `${String(row.status)} is not awaiting review`,
+      );
+    }
+    const reviewer = this.store.get("org_agent", input.reviewer_agent_id);
+    if (String(reviewer.business_id) !== String(row.business_id)) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_REVIEW_SCOPE", `reviewer outside business ${String(row.business_id)}`);
+    }
+    if (String(reviewer.status) !== "ACTIVE") {
+      throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", input.reviewer_agent_id);
+    }
+    if (input.reviewer_agent_id === String(row.assignee_agent_id ?? "")) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_REVIEW_SELF", "assignee cannot approve its own result");
+    }
+    const to: WorkItemStatus = input.decision === "ACCEPT" ? "DONE" : "READY";
+    row.status = to;
+    row.updated_at = utcnow();
+    if (input.decision === "REWORK") {
+      const blockers = (row.blockers as Array<Record<string, unknown>> | undefined) ?? [];
+      blockers.push({ reason: `REWORK: ${String(input.note ?? "").slice(0, 300)}`, at: utcnow(), by: input.reviewer_agent_id });
+      row.blockers = blockers;
+    }
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId,
+      event_type: input.decision === "ACCEPT" ? "WORK_REVIEW_ACCEPTED" : "WORK_REWORK_REQUESTED",
+      old_state: "REVIEW_REQUIRED", new_state: to, actor: `operator:${actor}`,
+      metadata: { reviewer_agent_id: input.reviewer_agent_id, note: String(input.note ?? "").slice(0, 300) },
+    });
+    if (input.decision === "ACCEPT") this.propagateDependents(workItemId);
     return saved;
   }
 
@@ -755,8 +1069,10 @@ export class BusinessLayer {
       return row; // mission not persisted yet — leave IN_PROGRESS
     }
     const ms = String(mission.status);
+    // P14 §9: when the node requires review, a completed mission parks the
+    // work in REVIEW_REQUIRED — DONE only follows governed acceptance.
     const next: WorkItemStatus | null =
-      ms === "COMPLETED" ? "DONE" :
+      ms === "COMPLETED" ? (row.requires_review === true ? "REVIEW_REQUIRED" : "DONE") :
       ms === "FAILED" ? "BLOCKED" :
       ms === "CANCELLED" ? "CANCELLED" :
       ms === "PAUSED" ? "BLOCKED" : null;
@@ -764,7 +1080,7 @@ export class BusinessLayer {
     assertWorkItemTransition(status, next);
     row.status = next;
     row.updated_at = utcnow();
-    if (next === "DONE" || next === "BLOCKED") {
+    if (next === "DONE" || next === "BLOCKED" || next === "REVIEW_REQUIRED") {
       row.result_summary = String(mission.result ?? mission.result_summary ?? "") || null;
     }
     // Terminal state releases the claim so the item can be picked up again.
@@ -772,6 +1088,8 @@ export class BusinessLayer {
     row.claim_token = null;
     row.claim_expires_at = null;
     const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    // P14 §10: terminal state propagates readiness/blocked downstream.
+    this.propagateDependents(workItemId);
     // Feed the outcome back into the assignee's persistent context — the
     // agent "remembers" what it did across missions.
     const assignee = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
@@ -816,6 +1134,13 @@ export class BusinessLayer {
     const status = String(row.status);
     if (status === "DONE" || status === "CANCELLED") {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${status} cannot be claimed`);
+    }
+    const reqCapClaim = row.required_capability ? String(row.required_capability) : null;
+    if (reqCapClaim && !((agent.capabilities as string[] | undefined) ?? []).includes(reqCapClaim)) {
+      throw new PolicyError(
+        "FAIL_CLOSED_WORK_CAPABILITY",
+        `agent lacks required capability ${reqCapClaim}`,
+      );
     }
     const nowIso = utcnow();
     if (isClaimActive(row, nowIso) && String(row.claimed_by) !== agentId) {
@@ -959,6 +1284,9 @@ export class BusinessLayer {
   board(businessId: string): Record<string, Row[]> {
     this.getBusiness(businessId);
     this.reconcileOpenIntents(businessId);
+    // P14 §10/§11: readiness is always reconstructed from canonical dep
+    // state — a restart never resurrects stale queue memory.
+    this.rebuildReadiness(businessId);
     this.syncRoutineWorkItems(businessId);
     const items = this.listWorkItems(businessId);
     for (const w of items) {

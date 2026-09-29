@@ -45,6 +45,7 @@ import {
   PairNativeExecutorAdapter,
   PairNativeWorkerRunner,
   BusinessLayer,
+  WorkforceService,
   CredentialBroker,
   ReconciliationService,
   RecoveryController,
@@ -325,6 +326,7 @@ const control = new MissionControl({
   costHaltFile: COST_HALT_FILE,
 });
 const business = new BusinessLayer({ store, control, schedules });
+const workforce = new WorkforceService({ store, business });
 
 registry.register({
   executor_id: PAIR_NATIVE_EXECUTOR_ID,
@@ -511,6 +513,7 @@ const server = createMissionControlServer({
   // Business layer: companies/org-agents/work-items/routines/budgets —
   // always on; entities live in the canonical store alongside missions.
   business,
+  workforce,
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

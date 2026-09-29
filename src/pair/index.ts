@@ -49,6 +49,7 @@ export * from "./credential-broker.js";
 export * from "./broker-capability.js";
 export * from "./sanitizer.js";
 export * from "./business.js";
+export * from "./workforce.js";
 export * from "./agent-contract.js";
 export * from "./cost.js";
 export * from "./secret-policy.js";

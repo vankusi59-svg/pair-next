@@ -15,6 +15,7 @@ import { IntegrityError, PolicyError } from "./errors.js";
 import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
 import type { BusinessLayer } from "./business.js";
+import type { WorkforceService } from "./workforce.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -54,6 +55,10 @@ export interface MissionControlServerDeps {
   /** Optional business layer: companies → org agents → work items →
    *  routines → budgets, all dispatching through startMission. */
   business?: BusinessLayer;
+  /** P14 workforce coordination: governed work graph, agent inbox,
+   *  heartbeat, delegation/decomposition, review — coordination only,
+   *  never a second execution path. */
+  workforce?: WorkforceService;
 }
 
 const MIME: Record<string, string> = {
@@ -616,6 +621,7 @@ export function createMissionControlServer(
           department: String(body.department ?? ""), role: String(body.role ?? "") || undefined,
           reports_to: String(body.reports_to ?? "") || undefined,
           executor_binding: String(body.executor_binding ?? "") || undefined,
+          capabilities: Array.isArray(body.capabilities) ? body.capabilities.map(String) : undefined,
           operator_id: String(operator),
         }));
       }
@@ -664,6 +670,11 @@ export function createMissionControlServer(
           assignee_agent_id: String(body.assignee_agent_id ?? "") || undefined,
           objective_id: String(body.objective_id ?? "") || undefined,
           priority: typeof body.priority === "number" ? body.priority : undefined,
+          parent_work_item_id: String(body.parent_work_item_id ?? "") || undefined,
+          depends_on: Array.isArray(body.depends_on) ? body.depends_on.map(String) : undefined,
+          required_capability: String(body.required_capability ?? "") || undefined,
+          requires_review: body.requires_review === true,
+          reviewer_agent_id: String(body.reviewer_agent_id ?? "") || undefined,
           operator_id: String(operator),
         }));
       }
@@ -691,6 +702,64 @@ export function createMissionControlServer(
           wact === "open" ? biz.openWorkItem(wid, String(operator))
           : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), String(operator))
           : biz.cancelWorkItem(wid, String(operator)); // governed cancel: live mission cancelled first, then CANCELLED
+        return void json(res, 200, out);
+      }
+      // P14 workforce: graph inspection, delegation, decomposition, review —
+      // all canonical work_item ops; operator identity required (POST gate).
+      const wf = deps.workforce;
+      if (method === "GET" && p === "/api/workforce/graph") {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, wf.workGraph(String(url.searchParams.get("business_id") ?? "")));
+      }
+      if (method === "GET" && p === "/api/workforce/inbox") {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, wf.agentInbox(String(url.searchParams.get("agent_id") ?? "")));
+      }
+      if (method === "POST" && p === "/api/workforce/heartbeat") {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, wf.heartbeat(String(body.agent_id ?? ""), String(operator)));
+      }
+      m = p.match(/^\/api\/work-items\/([^/]+)\/children$/);
+      if (method === "GET" && m) {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, { children: wf.childrenOf(m[1]) });
+      }
+      m = p.match(/^\/api\/work-items\/([^/]+)\/(delegate|decompose|review|auto-assign)$/);
+      if (method === "POST" && m) {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        const [, wid, wact] = m;
+        const out =
+          wact === "delegate"
+            ? wf.delegateWorkItem(
+                {
+                  work_item_id: wid,
+                  delegated_by_agent_id: String(body.delegated_by_agent_id ?? ""),
+                  delegated_to_agent_id: String(body.delegated_to_agent_id ?? ""),
+                  reason: String(body.reason ?? "") || undefined,
+                  delegation_key: String(body.delegation_key ?? "") || undefined,
+                },
+                String(operator),
+              )
+            : wact === "decompose"
+              ? wf.decomposeWorkItem(
+                  wid,
+                  {
+                    decomposition_id: String(body.decomposition_id ?? ""),
+                    children: (body.children as never[]) ?? [],
+                  },
+                  String(operator),
+                )
+              : wact === "review"
+                ? biz!.reviewWorkItem(
+                    wid,
+                    {
+                      reviewer_agent_id: String(body.reviewer_agent_id ?? ""),
+                      decision: String(body.decision ?? "ACCEPT") === "REWORK" ? "REWORK" : "ACCEPT",
+                      note: String(body.note ?? "") || undefined,
+                    },
+                    String(operator),
+                  )
+                : wf.autoAssign(wid, String(operator));
         return void json(res, 200, out);
       }
       if (method === "GET" && p === "/api/routines") {

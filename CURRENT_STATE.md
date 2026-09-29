@@ -162,10 +162,49 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   typecheck+build PASS, audit 0 high, worker races PASS, verifyIntegrity
   clean.
 
+### P14 — autonomous workforce + governed work graph
+
+- **Canonical work graph on `work_item`** (no second execution path):
+  `parent_work_item_id`, `depends_on[]`, `required_capability`,
+  `requires_review`, `reviewer_agent_id`, delegation provenance
+  (`delegated_from_*`, `delegated_by_agent_id`, `delegation_reason`,
+  `delegation_depth`, `delegation_key`), `decomposition_id`,
+  `blocked_code`. Edges are scope-validated + acyclic at write
+  (`FAIL_CLOSED_WORK_GRAPH_{CYCLE,NODE,SCOPE,BOUND}`); dep mutation only
+  via CAS `updateWorkItemDeps`.
+- **Lifecycle**: `REVIEW_REQUIRED` state; `openWorkItem` gates on
+  `FAIL_CLOSED_WORK_ITEM_DEPENDENCY` until every prerequisite is DONE.
+  Terminal prereq → dependents `WORK_BLOCKED`/`DEPENDENCY_FAILED`;
+  prereq DONE → dependents promote `WORK_READY`. `rebuildReadiness`
+  reconstructs from canonical state on board/inbox/heartbeat.
+- **WorkforceService** (`src/pair/workforce.ts`) — coordination only:
+  `workGraph`, `agentInbox` (READY/IN_PROGRESS/BLOCKED/
+  WAITING_DEPENDENCY/REVIEW_REQUIRED/recently-completed projections),
+  `assignWork`/`autoAssign` (`BLOCKED_CAPABILITY` when no eligible
+  agent), `delegateWorkItem` (same-business ACTIVE agents, depth cap 5,
+  capability narrowing, deterministic `WI_DL_*` ids → exactly-once),
+  `decomposeWorkItem` (proposal validated + materialized, deterministic
+  `WI_DC_*` ids, ≤16 children, canonical business context),
+  `heartbeat` (claim CAS → `openWorkItem` seam → sync sweep).
+- **Review**: `reviewWorkItem` ACCEPT → DONE / REWORK → READY; reviewer
+  must be ACTIVE same-business and never the producing assignee
+  (`FAIL_CLOSED_WORK_REVIEW_SELF`).
+- **APIs**: `GET /api/workforce/(graph|inbox)`, `GET
+  /api/work-items/:id/children`, `POST /api/workforce/heartbeat`,
+  `POST /api/work-items/:id/(delegate|decompose|review|auto-assign)`,
+  `POST /api/work-items` + `POST /api/org-agents` extended with graph
+  fields / `capabilities`.
+- Classification: **`P14_IMPLEMENTED_PENDING_AUDIT`** — branch
+  `devin/1790682872-p14-autonomous-workforce`, DO NOT MERGE. Evidence in
+  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md`: P14
+  31/31 (3 worker_threads races), P13 67/67, P12 71/71, P11 103/103,
+  P9 79/79, N22 1954/2env, N20 1956/0, typecheck+build PASS, audit
+  0 high/0 critical, verifyIntegrity clean.
+
 ## Not yet
 
-- Autonomous heartbeat/inbox/delegation (P14), CEO agent / KPI gap
-  analysis (P15). Intentionally deferred.
+- CEO agent / KPI gap analysis (P15), always-on heartbeat daemon.
+  Intentionally deferred.
 
 ## Release governance (current policy)
 
