@@ -398,8 +398,12 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   if (governed.has(DSH_EXECUTOR_ID)) {
     const wanted = [
       String(process.env.PAIR_DSH_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite"),
-      String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "groq:openai/gpt-oss-20b"),
+      String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "cloudflare:@cf/zai-org/glm-4.7-flash"),
     ];
+    for (const extra of String(process.env.PAIR_DSH_EXTRA_ROUTES ?? "groq:openai/gpt-oss-20b").split(",")) {
+      const r = extra.trim();
+      if (r && !wanted.includes(r)) wanted.push(r);
+    }
     for (const route of wanted) {
       const [pid, mid] = route.split(":");
       const prov = pc.getProvider(pid);
