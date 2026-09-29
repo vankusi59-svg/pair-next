@@ -206,9 +206,22 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `FAIL_CLOSED_PARENT_INCOMPLETE` on early ACCEPT); `agentInbox` strictly
   read-only (reconciliation on heartbeat/board seams); capability
   admission enforced at create/decompose/rebuild.
-- Classification: **`P14_REMEDIATED_R4_PENDING_AUDIT`** — branch
+- Classification: **`P14_REMEDIATED_R5_PENDING_AUDIT`** — branch
   `devin/1790682872-p14-autonomous-workforce`, DO NOT MERGE. Evidence in
-  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md` §R1+§R2+§R3+§R4.
+  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md` §R1–§R5.
+  R5 closures: `TERMINAL_PROVENANCE_CORRUPT` is a hard quarantine — the
+  centralized `assertWorkItemNotQuarantined` guard fails
+  `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` at open/claim/assign/review
+  (ACCEPT+REWORK)/deps mutation/delegation/decomposition; corrupt rows
+  surface as blocked in the inbox, are never re-promoted by
+  `rebuildReadiness`, fold nothing via `syncWorkItem`, and propagate
+  nothing. Mission proof is strongly bound (`metadata.work_item_id` +
+  `business_id` + `source=business_layer` + `work_item_open_id`); a
+  reviewed DONE requires a bound COMPLETED mission AND exactly one
+  provenance-validated `WORK_REVIEW_ACCEPTED` (states, reviewer scope,
+  non-self, named-reviewer match — duplicates/malformed quarantine);
+  a legacy valid ACCEPT repairs only its derived effects under a named
+  recovery marker.
   R3 closures: delegation completeness now requires row provenance AND the
   canonical WORK_DELEGATED audit — `ensureDelegationEvent` repairs a
   missing event / fails `FAIL_CLOSED_WORK_DELEGATE_CONFLICT` on conflict,
@@ -217,7 +230,7 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   + context + event) in one `store.immediate()` — crash → rollback, retry
   converges; `reconcileTerminalConsistency` at the head of
   `rebuildReadiness` idempotently repairs legacy partial terminal state.
-  R4 closures: recovery is grounded-proof only — status alone is never
+  R4 closures (superseded by R5 where tightened): recovery is grounded-proof only — status alone is never
   evidence; per-state canonical proofs (completed mission / stored
   WORK_REVIEW_ACCEPTED / cancel vs mission-cancel / blocker evidence);
   ungrounded terminal rows quarantine as `TERMINAL_PROVENANCE_CORRUPT` +
@@ -228,8 +241,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   WORK_REVIEW_ACCEPTED is never reconstructed; `WORK_DELEGATED` audit is
   indexed globally by `child_work_item_id` — entity_id/key/from/to
   mismatch or duplicate events fail closed at both replay and restart.
-  Totals: P14 66/66 (10 R4 tests), P13 67/67, P12 71/71,
-  P11 103/103, P9 79/79, N22 1989/2env, N20 1991/0, typecheck+build PASS,
+  Totals: P14 75/75 (9 R5 tests), P13 67/67, P12 71/71,
+  P11 103/103, P9 79/79, N22 1998/2env, N20 2000/0, typecheck+build PASS,
   audit 0 high/0 critical, verifyIntegrity clean.
 
 ## Not yet

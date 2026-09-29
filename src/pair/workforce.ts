@@ -26,6 +26,7 @@ import {
   WORK_DELEGATION_DEPTH_CAP,
   WORK_GRAPH_NODE_CAP,
   TERMINAL_WORK_ITEM_STATUSES,
+  assertWorkItemNotQuarantined,
   type BusinessLayer,
 } from "./business.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -123,6 +124,11 @@ export class WorkforceService {
     const done: Row[] = [];
     for (const w of mine) {
       const st = String(w.status);
+      // R5 §1: quarantined work surfaces as blocked/corrupt — never READY.
+      if (String(w.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT") {
+        blocked.push(w);
+        continue;
+      }
       if (st === "READY") {
         (this.business.depsSatisfied(w) ? ready : waiting).push(w);
       } else if (st === "IN_PROGRESS") inProgress.push(w);
@@ -213,6 +219,9 @@ export class WorkforceService {
     // back everything: no orphan child, no partial provenance, no event.
     return this.store.immediate(() => {
       const parent = this.node(input.work_item_id);
+      // R5 §1: a quarantined parent cannot delegate — delegation cannot
+      // launder corrupt provenance into fresh authority.
+      assertWorkItemNotQuarantined(parent, "delegate");
       const businessId = String(parent.business_id);
       const by = this.agent(input.delegated_by_agent_id);
       const to = this.agent(input.delegated_to_agent_id);
@@ -404,6 +413,8 @@ export class WorkforceService {
     // code, and the same decomposition_id replays idempotently.
     return this.store.immediate(() => {
       const parent = this.node(workItemId);
+      // R5 §1: a quarantined parent cannot decompose either.
+      assertWorkItemNotQuarantined(parent, "decompose");
       const businessId = String(parent.business_id);
       // Idempotent: this decomposition already materialized → return it.
       if (String(parent.decomposition_id ?? "") === decompId) {

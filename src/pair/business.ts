@@ -74,6 +74,24 @@ function assertWorkItemTransition(from: string, to: WorkItemStatus): void {
   }
 }
 
+/** Quarantine marker for terminal rows whose provenance failed audit (R4 §3). */
+export const WORK_CORRUPT_CODE = "TERMINAL_PROVENANCE_CORRUPT";
+
+/**
+ * R5 §1 hard quarantine: a row carrying TERMINAL_PROVENANCE_CORRUPT is
+ * non-executable and non-progressable until an explicit governed repair
+ * clears the corruption. Every authority-bearing operation funnels
+ * through this guard — REWORK and reassignment cannot escape it either.
+ */
+export function assertWorkItemNotQuarantined(row: Row, op: string): void {
+  if (String(row.blocked_code ?? "") === WORK_CORRUPT_CODE) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+      `${op}: ${String(row.work_item_id)} is quarantined (terminal provenance corrupt)`,
+    );
+  }
+}
+
 /** Terminal work-item states — a terminal node can never silently reopen. */
 export const TERMINAL_WORK_ITEM_STATUSES = new Set(["DONE", "CANCELLED"]);
 /** Work-graph bounds (P14 §6/§7): delegation depth, business-graph size,
@@ -552,6 +570,7 @@ export class BusinessLayer {
     // validation to form a canonical cycle.
     return this.store.immediate(() => {
       const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+      assertWorkItemNotQuarantined(row, "deps.update");
       if (TERMINAL_WORK_ITEM_STATUSES.has(String(row.status))) {
         throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(row.status)} cannot be mutated`);
       }
@@ -581,6 +600,9 @@ export class BusinessLayer {
   private propagateDependents(nodeId: string): void {
     const node = this.store.tryGet("work_item", nodeId);
     if (!node) return;
+    // R5 §6: a quarantined node never propagates success — its DONE was
+    // never proven, so nothing downstream may proceed on it.
+    if (String(node.blocked_code ?? "") === WORK_CORRUPT_CODE) return;
     const businessId = String(node.business_id);
     const nodeDone = String(node.status) === "DONE";
     const nodeFailed = TERMINAL_WORK_ITEM_STATUSES.has(String(node.status)) && !nodeDone;
@@ -651,10 +673,13 @@ export class BusinessLayer {
         events.filter((e) => e.event_type === "WORK_ITEM_SYNCED")
           .map((e) => `${String(e.entity_id)}|${String(e.new_state)}`),
       );
-      const reviewed = new Set(
-        events.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED")
-          .map((e) => String(e.entity_id)),
-      );
+      // R5 §5: review proof inspects the actual ACCEPT events —
+      // presence in a Set is not provenance.
+      const acceptByItem = new Map<string, Array<Record<string, unknown>>>();
+      for (const e of events.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED")) {
+        const iid = String(e.entity_id);
+        acceptByItem.set(iid, [...(acceptByItem.get(iid) ?? []), e]);
+      }
       const cancelled = new Set(
         events.filter((e) => e.event_type === "WORK_ITEM_CANCELLED")
           .map((e) => String(e.entity_id)),
@@ -687,8 +712,8 @@ export class BusinessLayer {
           });
           inconsistent.add(id);
         }
-        if (String(w.blocked_code ?? "") !== "TERMINAL_PROVENANCE_CORRUPT") {
-          w.blocked_code = "TERMINAL_PROVENANCE_CORRUPT";
+        if (String(w.blocked_code ?? "") !== WORK_CORRUPT_CODE) {
+          w.blocked_code = WORK_CORRUPT_CODE;
           w.updated_at = utcnow();
           this.store.put("work_item", id, w, Number(w.version));
         }
@@ -737,41 +762,100 @@ export class BusinessLayer {
         }
       }
 
-      // R4 §1-§7 — terminal proof: status alone is never evidence.
-      // Grounded repair restores ONLY proven missing effects; ungrounded
-      // terminal state is quarantined fail-closed, never normalized.
+      // R4 §1-§7 / R5 §3-§6 — terminal proof: status alone is never
+      // evidence, and a mission proves a transition only when it is
+      // canonically bound to this work item (R5 §3). Grounded repair
+      // restores ONLY proven missing effects; ungrounded terminal state
+      // is quarantined fail-closed, never normalized.
       const missionFor = (w: Row): Row | null => {
         const mids = (w.mission_ids as string[] | undefined) ?? [];
         return mids.length ? this.store.tryGet("mission", String(mids[mids.length - 1])) : null;
       };
+      // R5 §3: the proof mission must be canonically bound — created
+      // through the business open seam for THIS work item in THIS
+      // business. A foreign COMPLETED mission id planted in the row can
+      // never ground a terminal state.
+      const missionBound = (w: Row, m: Row | null): boolean => {
+        if (!m) return false;
+        const md = (m.metadata as Record<string, unknown> | undefined) ?? {};
+        if (String(md.work_item_id ?? "") !== String(w.work_item_id)) return false;
+        if (String(md.business_id ?? "") !== String(w.business_id)) return false;
+        if (String(md.source ?? "") !== "business_layer") return false;
+        if (!md.work_item_open_id) return false; // canonical seam always stamps an open id
+        return true;
+      };
+      // R5 §5: exactly one authoritative ACCEPT event, fully validated —
+      // states, reviewer presence, business scope, non-self, named
+      // reviewer match. Duplicate/malformed audit → conflict, never
+      // another synthesized ACCEPT.
+      const acceptProof = (w: Row): "valid" | "none" | "invalid" => {
+        const evs = acceptByItem.get(String(w.work_item_id)) ?? [];
+        if (evs.length === 0) return "none";
+        if (evs.length > 1) return "invalid";
+        const e = evs[0];
+        const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+        if (String(e.old_state ?? "") !== "REVIEW_REQUIRED") return "invalid";
+        if (String(e.new_state ?? "") !== "DONE") return "invalid";
+        const rev = String(md.reviewer_agent_id ?? "");
+        if (!rev) return "invalid";
+        const revRow = this.store.tryGet("org_agent", rev);
+        if (!revRow || String(revRow.business_id) !== String(w.business_id)) return "invalid";
+        if (rev === String(w.assignee_agent_id ?? "")) return "invalid";
+        if (w.reviewer_agent_id && rev !== String(w.reviewer_agent_id)) return "invalid";
+        return "valid";
+      };
+      // R5 §6: a proven transition whose DERIVED effects were lost is
+      // still repairable — detect them canonically (context note, parked
+      // parent, unpromoted dependent) rather than assuming presence.
+      const derivedEffectsMissing = (w: Row): boolean => {
+        const id = String(w.work_item_id);
+        const assignee = w.assignee_agent_id ? String(w.assignee_agent_id) : null;
+        if (assignee) {
+          const ag = this.store.tryGet("org_agent", assignee);
+          const notes = (ag?.context_notes as Array<Record<string, unknown>> | undefined) ?? [];
+          if (!notes.some((n) => String(n.work_item_id) === id && String(n.outcome) === "DONE")) return true;
+        }
+        const pid = w.parent_work_item_id ? String(w.parent_work_item_id) : null;
+        if (pid) {
+          const p = byId.get(pid);
+          if (p && String(p.status) === "IN_PROGRESS" && String(p.blocked_code ?? "") === "CHILD_INCOMPLETE") return true;
+        }
+        for (const dep of items) {
+          const depDeps = (dep.depends_on as string[] | undefined) ?? [];
+          if (depDeps.includes(id) && String(dep.status) === "BACKLOG" && this.depsSatisfied(dep)) return true;
+        }
+        return false;
+      };
       for (const w of items) {
         const id = String(w.work_item_id);
         const st = String(w.status);
-        if (String(w.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT") continue;
+        if (String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) continue;
         const terminalish = TERMINAL_WORK_ITEM_STATUSES.has(st) || st === "REVIEW_REQUIRED";
         if (!terminalish) continue;
         const mission = missionFor(w);
-        const ms = mission ? String(mission.status) : null;
+        const bound = missionBound(w, mission);
+        const ms = bound && mission ? String(mission.status) : null;
         let proof: string | null = null;
         if (st === "DONE") {
           if (w.requires_review === true) {
-            // §4: DONE on a requires_review item needs an actual stored
-            // WORK_REVIEW_ACCEPTED — reviewer identity is never inferred.
-            proof = reviewed.has(id) ? "review_accepted" : null;
+            // §4+§5: DONE on a requires_review item needs BOTH a bound
+            // COMPLETED mission AND exactly one valid WORK_REVIEW_ACCEPTED.
+            proof = bound && ms === "COMPLETED" && acceptProof(w) === "valid"
+              ? "review_accepted" : null;
           } else {
-            proof = mission && ms === "COMPLETED" ? "mission_completed" : null;
+            proof = bound && ms === "COMPLETED" ? "mission_completed" : null;
           }
         } else if (st === "REVIEW_REQUIRED") {
-          proof = w.requires_review === true && mission && ms === "COMPLETED"
+          proof = w.requires_review === true && bound && ms === "COMPLETED"
             ? "mission_completed_review" : null;
         } else if (st === "CANCELLED") {
           proof = cancelled.has(id) ? "cancelled" :
-            mission && ms === "CANCELLED" ? "mission_cancelled" : null;
+            bound && ms === "CANCELLED" ? "mission_cancelled" : null;
         } else if (st === "BLOCKED") {
           const bc = String(w.blocked_code ?? "");
           proof =
             bc === "DEPENDENCY_FAILED" || bc === "BLOCKED_CAPABILITY" ||
-            (mission && (ms === "FAILED" || ms === "PAUSED" || ms === "CANCELLED"))
+            (bound && (ms === "FAILED" || ms === "PAUSED" || ms === "CANCELLED"))
               ? "blocked_terminal" : null;
         }
         if (!proof) {
@@ -794,13 +878,19 @@ export class BusinessLayer {
         // Missing evidence for a PROVEN transition → reconstruct the
         // effects under a clearly-named recovery marker (§5 — never
         // impersonate the original transition event).
-        const hasEvidence =
-          syncedStates.has(`${id}|${st}`) ||
-          repaired.has(id) ||
-          (proof === "review_accepted") || // the ACCEPT event is the proof
-          (proof === "cancelled" && cancelled.has(id)) ||
-          (proof === "blocked_terminal" && blocked.has(id));
-        if (hasEvidence) continue;
+        // R5 §6: a valid ACCEPT is audit proof of the transition itself,
+        // but its derived effects (propagation, parent release, outcome
+        // note) may still be missing from a legacy crash — repair them
+        // idempotently WITHOUT creating another WORK_REVIEW_ACCEPTED.
+        const effectsMissing = proof === "review_accepted"
+          ? !repaired.has(id) && derivedEffectsMissing(w)
+          : !(
+            syncedStates.has(`${id}|${st}`) ||
+            repaired.has(id) ||
+            (proof === "cancelled" && cancelled.has(id)) ||
+            (proof === "blocked_terminal" && blocked.has(id))
+          );
+        if (!effectsMissing) continue;
         if (st === "DONE") {
           // §6: only proven DONE may propagate success downstream/up.
           this.propagateDependents(id);
@@ -846,6 +936,9 @@ export class BusinessLayer {
     this.reconcileTerminalConsistency(businessId);
     for (const w of this.listWorkItems(businessId)) {
       if (TERMINAL_WORK_ITEM_STATUSES.has(String(w.status))) continue;
+      // R5 §2: quarantine survives rebuild — a corrupt row is never
+      // re-promoted to READY just because deps/capabilities are satisfied.
+      if (String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) continue;
       const deps = (w.depends_on as string[] | undefined) ?? [];
       // R1 §7: capability admission applies to every non-terminal node —
       // an incapable assignment is never promoted to (or parked at) READY;
@@ -910,6 +1003,7 @@ export class BusinessLayer {
 
   assignWorkItem(workItemId: string, agentId: string, actor: string): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    assertWorkItemNotQuarantined(row, "assign");
     const agent = this.store.get("org_agent", agentId);
     if (String(agent.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `assignee outside business ${row.business_id}`);
@@ -956,6 +1050,7 @@ export class BusinessLayer {
   openWorkItem(workItemId: string, operatorId: string): Row {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
     const row = this.resolvePendingOpenBeforeMutation(workItemId, operatorId);
+    assertWorkItemNotQuarantined(row, "open");
     // A previous linked mission still live forbids a replacement — the
     // governed path is pause/cancel/resume/reconcile, not a second dispatch.
     const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
@@ -1297,6 +1392,8 @@ export class BusinessLayer {
       );
     }
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    // R5 §7: quarantine cannot be escaped — neither ACCEPT nor REWORK.
+    assertWorkItemNotQuarantined(row, "review");
     if (String(row.status) !== "REVIEW_REQUIRED") {
       throw new IntegrityError(
         "FAIL_CLOSED_WORK_REVIEW_STATE",
@@ -1357,6 +1454,8 @@ export class BusinessLayer {
   /** Fold the linked mission's terminal state back into the work item. */
   syncWorkItem(workItemId: string): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, "sync");
+    // R5 §1: a quarantined row never folds further state — hard stop.
+    if (String(row.blocked_code ?? "") === WORK_CORRUPT_CODE) return row;
     const status = String(row.status);
     if (status !== "IN_PROGRESS") return row;
     const missionIds = (row.mission_ids as string[]) ?? [];
@@ -1520,6 +1619,7 @@ export class BusinessLayer {
    */
   claimWorkItem(workItemId: string, agentId: string, actor: string): Row & { claim_token: string } {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    assertWorkItemNotQuarantined(row, "claim");
     const agent = this.store.get("org_agent", agentId);
     if (String(agent.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `claimer outside business ${row.business_id}`);

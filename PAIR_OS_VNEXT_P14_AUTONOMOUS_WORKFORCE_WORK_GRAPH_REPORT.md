@@ -695,3 +695,97 @@ All R1/R2/R3 closures unchanged; `PairEvidenceStore.immediate()` remains
 the single transaction authority; no second store/router/dispatcher.
 
 Classification: **`P14_REMEDIATED_R4_PENDING_AUDIT`** — DO NOT MERGE.
+
+---
+
+# P14 REMEDIATION R5 — HARD QUARANTINE + STRONGLY-BOUND TERMINAL PROOF
+
+Mandate: `TERMINAL_PROVENANCE_CORRUPT` must be a hard quarantine (not just
+a marker), recovery proof must be strongly bound to the work item, and a
+reviewed DONE requires BOTH execution proof and a validated ACCEPT event —
+while a legacy valid ACCEPT still repairs its derived effects.
+
+## R5.1 — Hard quarantine (§1–§2, §7)
+
+One centralized guard: `assertWorkItemNotQuarantined(row, op)` →
+`FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`. Wired into every authority-bearing
+path:
+
+| path | enforcement |
+|---|---|
+| `openWorkItem` | guard after resolve — corrupt never opens |
+| `claimWorkItem` | guard — corrupt never claimable |
+| `assignWorkItem` / `autoAssign` | guard — reassignment cannot launder quarantine back to READY |
+| `reviewWorkItem` ACCEPT + REWORK | guard before state check — neither escapes |
+| `updateWorkItemDeps` | guard — no dependency mutation on corrupt rows |
+| `syncWorkItem` | corrupt row is a no-op fold (sweep-safe) |
+| `propagateDependents` | corrupt node propagates nothing |
+| `delegateWorkItem` / `decomposeWorkItem` | quarantined parent cannot mint fresh authority |
+| `agentInbox` | corrupt rows surface in `blocked`, never `ready` |
+| `rebuildReadiness` | corrupt rows are skipped — never re-promoted |
+| `heartbeat` | inherits claim/open guards + inbox exclusion → zero claim, zero mission, zero dispatch |
+
+## R5.2 — Strongly-bound mission proof (§3)
+
+`missionBound(w, m)` requires ALL of: `m.metadata.work_item_id ===
+w.work_item_id`, `m.metadata.business_id === w.business_id`,
+`m.metadata.source === "business_layer"`, and a non-empty
+`work_item_open_id` (the canonical open seam always stamps one). A foreign
+`COMPLETED` mission id planted in `mission_ids` grounds nothing — the row
+quarantines and propagates no success.
+
+## R5.3 — Review proof = execution ∧ validated ACCEPT (§4–§6)
+
+For `requires_review` DONE: proof requires BOTH a bound `COMPLETED`
+mission AND `acceptProof(w) === "valid"` — exactly one
+`WORK_REVIEW_ACCEPTED` with `old_state=REVIEW_REQUIRED`,
+`new_state=DONE`, a present `reviewer_agent_id` whose canonical agent
+belongs to the same business, is not the assignee, and matches a named
+`reviewer_agent_id` when configured. Zero events → ungrounded; >1 events
+or any field mismatch → quarantine. No ACCEPT is ever synthesized.
+
+A valid ACCEPT repairs missing derived effects — propagation, parked
+parent evaluation, assignee outcome note — under one `WORK_TERMINAL_REPAIRED`
+marker; `derivedEffectsMissing` detects the gap canonically (no note /
+parent still `CHILD_INCOMPLETE` / promotable dependent still `BACKLOG`)
+so a healthy post-R3 ACCEPT is a no-op and repeats add nothing.
+
+## R5 evidence — 9 new tests (P14: 75/75)
+
+- **QUAR-R5-READY**: READY delegated child + injected conflicting
+  `WORK_DELEGATED` → rebuild quarantines → heartbeat opens/claims/dispatches
+  nothing; inbox shows blocked, not ready.
+- **QUAR-R5-OPEN / QUAR-R5-CLAIM** (one test): open, claim, and assign on
+  a quarantined row all throw `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`.
+- **QUAR-R5-REVIEW**: quarantined `REVIEW_REQUIRED` — ACCEPT and REWORK
+  both fail closed; zero review events added.
+- **MISSION-R5-WRONG-WORK**: A's real `COMPLETED` mission id planted in B
+  → B quarantined; dependent never promoted.
+- **MISSION-R5-WRONG-BUSINESS**: cross-business mission id planted →
+  quarantined.
+- **REVIEW-R5-PROOF**: self-reviewer ACCEPT event (also violating the
+  named-reviewer binding) → quarantined, no synthesized replacement.
+- **REVIEW-R5-DUP**: real ACCEPT + injected second ACCEPT → conflicting
+  audit → quarantined.
+- **REVIEW-R5-LEGACY-PROPAGATION**: bound mission + valid seeded ACCEPT +
+  `DONE` child + parked parent → fresh-process rebuild releases parent
+  exactly once, one marker, still one ACCEPT.
+- **REVIEW-R5-IDEMPOTENT**: normal ACCEPT → 3 sweeps → one ACCEPT, one
+  READY event on the dependent, clean row.
+
+## R5 validation
+
+| gate | result |
+|---|---|
+| P14 suite | **75/75 PASS** (9 new R5 tests) |
+| P13 | 67/67 · P12 71/71 · P11 103/103 · P9 79/79 |
+| typecheck | clean · build PASS |
+| audit | 0 high / 0 critical |
+| Node 22 full | 1998 pass / 2 env P5 probe (CodexCli executable absent — documented env gap) |
+| Node 20 full | **2000/0** |
+| verifyIntegrity | clean in every quarantine/crash/restart/race test |
+
+All R1–R4 closures unchanged; `PairEvidenceStore.immediate()` remains the
+single transaction authority; no second store/router/dispatcher.
+
+Classification: **`P14_REMEDIATED_R5_PENDING_AUDIT`** — DO NOT MERGE.

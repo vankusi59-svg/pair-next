@@ -2335,3 +2335,299 @@ describe("P14 R4 remediations", () => {
     ctx.store.verifyIntegrity();
   });
 });
+
+/* ------------------------------ R5 REMEDIATIONS -------------------------- */
+
+describe("P14 R5 remediations", () => {
+  /** Inject a second, conflicting WORK_DELEGATED audit for a child. */
+  const injectConflictingDelegEvent = (ctx: Ctx, parentId: string, childId: string, key: string) => {
+    ctx.store.event({
+      entity_type: "work_item", entity_id: parentId, event_type: "WORK_DELEGATED",
+      actor: "seed", metadata: {
+        delegated_from: "AG_FOREIGN", delegated_to: "AG_FOREIGN",
+        child_work_item_id: childId, delegation_key: `${key}-WRONG`,
+      },
+    });
+  };
+
+  it("QUAR-R5-READY: corrupt READY child never reaches heartbeat dispatch", () => {
+    const { ctx, biz, workforce } = makeBizCtx("quar-r5-ready");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "KQ5",
+    }, "op");
+    expect(String(child.status)).toBe("READY");
+    injectConflictingDelegEvent(ctx, String(parent.work_item_id), String(child.work_item_id), "KQ5");
+    biz.rebuildReadiness(bid);
+    const q = ctx.store.get("work_item", String(child.work_item_id));
+    expect(String(q.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // Heartbeat must claim nothing and open nothing for it.
+    const out = workforce.heartbeat(String(worker.agent_id), "hb");
+    expect(out.opened.length).toBe(0);
+    const after = ctx.store.get("work_item", String(child.work_item_id));
+    expect((after.mission_ids as string[]).length).toBe(0);
+    expect(after.claimed_by).toBeNull();
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // Inbox surfaces it as blocked/corrupt, never READY.
+    const inbox = workforce.agentInbox(String(worker.agent_id));
+    expect(inbox.ready.map((r) => String(r.work_item_id))).not.toContain(String(child.work_item_id));
+    expect(inbox.blocked.map((r) => String(r.work_item_id))).toContain(String(child.work_item_id));
+    ctx.store.verifyIntegrity();
+  });
+
+  it("QUAR-R5-OPEN + QUAR-R5-CLAIM: open/claim fail closed on quarantined work", () => {
+    const { ctx, biz, workforce } = makeBizCtx("quar-r5-oc");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const item = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const row = ctx.store.get("work_item", String(item.work_item_id));
+    row.status = "DONE"; // ungrounded → quarantined
+    ctx.store.put("work_item", String(item.work_item_id), row, Number(row.version));
+    biz.rebuildReadiness(bid);
+    expect(errCode(() => biz.openWorkItem(String(item.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expect(errCode(() => biz.claimWorkItem(String(item.work_item_id), String(lead.agent_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    // Reassignment cannot launder the row back to READY either.
+    expect(errCode(() => biz.assignWorkItem(String(item.work_item_id), String(lead.agent_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expect(String(ctx.store.get("work_item", String(item.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("QUAR-R5-REVIEW: quarantined REVIEW_REQUIRED — ACCEPT and REWORK both fail, no events", () => {
+    const { ctx, biz } = makeBizCtx("quar-r5-rev");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const rev = makeAgent(biz, bid, "rev");
+    const item = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    const row = ctx.store.get("work_item", String(item.work_item_id));
+    row.status = "REVIEW_REQUIRED"; // ungrounded — no mission
+    ctx.store.put("work_item", String(item.work_item_id), row, Number(row.version));
+    biz.rebuildReadiness(bid);
+    expect(String(ctx.store.get("work_item", String(item.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(errCode(() => biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expect(errCode(() => biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "REWORK", note: "x",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    const evs = ctx.store.listEvents().filter((e) => e.entity_id === String(item.work_item_id));
+    expect(evs.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED").length).toBe(0);
+    expect(evs.filter((e) => e.event_type === "WORK_REWORK_REQUESTED").length).toBe(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("MISSION-R5-WRONG-WORK: a foreign COMPLETED mission id never grounds DONE", () => {
+    const { ctx, biz } = makeBizCtx("mis-r5-work");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const itemA = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const itemB = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const depC = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), depends_on: [String(itemB.work_item_id)],
+    });
+    // A's mission genuinely completes.
+    biz.openWorkItem(String(itemA.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(itemA.work_item_id));
+    const aMission = String((ctx.store.get("work_item", String(itemA.work_item_id)).mission_ids as string[]).at(-1));
+    // Plant A's mission id into B and mark B DONE — binding must reject it.
+    const brow = ctx.store.get("work_item", String(itemB.work_item_id));
+    brow.status = "DONE";
+    brow.mission_ids = [aMission];
+    ctx.store.put("work_item", String(itemB.work_item_id), brow, Number(brow.version));
+    biz.rebuildReadiness(bid);
+    expect(String(ctx.store.get("work_item", String(itemB.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // No propagation: C stays unready.
+    expect(String(ctx.store.get("work_item", String(depC.work_item_id)).status)).toBe("BACKLOG");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("MISSION-R5-WRONG-BUSINESS: foreign-business mission cannot ground terminal state", () => {
+    const { ctx, biz } = makeBizCtx("mis-r5-biz");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b1 = makeBiz(biz, ctx.projectId);
+    const b2 = makeBiz(biz, ctx.projectId);
+    const lead1 = makeAgent(biz, String(b1.business_id), "lead");
+    const lead2 = makeAgent(biz, String(b2.business_id), "lead");
+    const itemA = wi(biz, String(b1.business_id), { assignee_agent_id: String(lead1.agent_id) });
+    const itemB = wi(biz, String(b2.business_id), { assignee_agent_id: String(lead2.agent_id) });
+    biz.openWorkItem(String(itemA.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(itemA.work_item_id));
+    const aMission = String((ctx.store.get("work_item", String(itemA.work_item_id)).mission_ids as string[]).at(-1));
+    const brow = ctx.store.get("work_item", String(itemB.work_item_id));
+    brow.status = "DONE";
+    brow.mission_ids = [aMission];
+    ctx.store.put("work_item", String(itemB.work_item_id), brow, Number(brow.version));
+    biz.rebuildReadiness(String(b2.business_id));
+    expect(String(ctx.store.get("work_item", String(itemB.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R5-PROOF: malformed ACCEPT provenance quarantines a reviewed DONE", () => {
+    const { ctx, biz } = makeBizCtx("rev-r5-proof");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const rev = makeAgent(biz, bid, "rev");
+    const item = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id), false);
+    const row = ctx.store.get("work_item", String(item.work_item_id));
+    row.status = "DONE";
+    ctx.store.put("work_item", String(item.work_item_id), row, Number(row.version));
+    // Malformed audit: reviewer is the assignee itself (self-accept), and
+    // it also violates the named-reviewer binding.
+    ctx.store.event({
+      entity_type: "work_item", entity_id: String(item.work_item_id),
+      event_type: "WORK_REVIEW_ACCEPTED", old_state: "REVIEW_REQUIRED", new_state: "DONE",
+      actor: "seed", metadata: { reviewer_agent_id: String(lead.agent_id) },
+    });
+    biz.rebuildReadiness(bid);
+    expect(String(ctx.store.get("work_item", String(item.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // No second ACCEPT synthesized.
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED").length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R5-DUP: duplicate ACCEPT events fail closed", () => {
+    const { ctx, biz } = makeBizCtx("rev-r5-dup");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const rev = makeAgent(biz, bid, "rev");
+    const item = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id));
+    biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op");
+    // A second ACCEPT audit for the same item → conflicting provenance.
+    ctx.store.event({
+      entity_type: "work_item", entity_id: String(item.work_item_id),
+      event_type: "WORK_REVIEW_ACCEPTED", old_state: "REVIEW_REQUIRED", new_state: "DONE",
+      actor: "seed", metadata: { reviewer_agent_id: String(rev.agent_id) },
+    });
+    biz.rebuildReadiness(bid);
+    expect(String(ctx.store.get("work_item", String(item.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R5-LEGACY-PROPAGATION: valid ACCEPT repairs derived effects — parent releases once", () => {
+    const { ctx, biz } = makeBizCtx("rev-r5-legacy");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const rev = makeAgent(biz, bid, "rev");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = wi(biz, bid, {
+      assignee_agent_id: String(worker.agent_id),
+      parent_work_item_id: String(parent.work_item_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code))
+      .toBe("CHILD_INCOMPLETE");
+    // Legacy crash window: child's mission COMPLETED, a valid ACCEPT was
+    // recorded, the row carries DONE — but propagation/parent eval and
+    // the outcome note never ran.
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id), false);
+    const crow = ctx.store.get("work_item", String(child.work_item_id));
+    crow.status = "DONE";
+    ctx.store.put("work_item", String(child.work_item_id), crow, Number(crow.version));
+    ctx.store.event({
+      entity_type: "work_item", entity_id: String(child.work_item_id),
+      event_type: "WORK_REVIEW_ACCEPTED", old_state: "REVIEW_REQUIRED", new_state: "DONE",
+      actor: "seed", metadata: { reviewer_agent_id: String(rev.agent_id) },
+    });
+    const re = makeBizCtx("rev-r5-legacy-re", reopenCtx(ctx.dir, "re"));
+    re.ctx.workspace = ctx.workspace;
+    re.biz.rebuildReadiness(bid);
+    expect(String(re.ctx.store.get("work_item", String(parent.work_item_id)).status)).toBe("DONE");
+    // Exactly one ACCEPT (the real one) and one recovery marker — never
+    // a fabricated review event.
+    const evs = re.ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED").length).toBe(1);
+    expect(evs.filter((e) => e.event_type === "WORK_TERMINAL_REPAIRED"
+      && e.entity_id === String(child.work_item_id)).length).toBe(1);
+    // Idempotent: repeated sweeps add nothing.
+    re.biz.rebuildReadiness(bid);
+    re.biz.rebuildReadiness(bid);
+    const evs2 = re.ctx.store.listEvents();
+    expect(evs2.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED").length).toBe(1);
+    expect(evs2.filter((e) => e.event_type === "WORK_TERMINAL_REPAIRED"
+      && e.entity_id === String(child.work_item_id)).length).toBe(1);
+    expect(evs2.filter((e) => e.event_type === "WORK_ITEM_SYNCED"
+      && e.entity_id === String(parent.work_item_id)).length).toBe(1);
+    re.ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R5-IDEMPOTENT: normal valid ACCEPT stays clean across repeated recovery", () => {
+    const { ctx, biz } = makeBizCtx("rev-r5-idem");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const rev = makeAgent(biz, bid, "rev");
+    const dep = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    const next = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), depends_on: [String(dep.work_item_id)],
+    });
+    biz.openWorkItem(String(dep.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(dep.work_item_id));
+    biz.reviewWorkItem(String(dep.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op");
+    const readyEvents0 = ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_READY" && e.entity_id === String(next.work_item_id)).length;
+    biz.rebuildReadiness(bid);
+    biz.rebuildReadiness(bid);
+    const evs = ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED").length).toBe(1);
+    expect(evs.filter((e) => e.event_type === "WORK_READY"
+      && e.entity_id === String(next.work_item_id)).length).toBe(readyEvents0);
+    expect(ctx.store.get("work_item", String(dep.work_item_id)).blocked_code).toBeNull();
+    ctx.store.verifyIntegrity();
+  });
+});
