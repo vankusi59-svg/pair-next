@@ -543,14 +543,46 @@ export class GovernedTaskGate {
       if (state === "INTENT_RECORDED") {
         // Previous dispatch crashed before persisting — consult evidence.
         const evidence = adapter.dispatch_evidence?.(governedTaskId);
-        if (evidence?.dispatched && evidence.execution_id) {
-          const exec = this.store.get("executor_execution", String(evidence.execution_id));
-          this.store.put(
-            "executor_dispatch_intent",
-            intentId,
-            { ...existingIntent, state: "EXECUTION_PERSISTED", execution_id: evidence.execution_id },
-            existingIntent.version,
+        if (evidence?.dispatched) {
+          // R3 §3: dispatched proven but no usable execution_id —
+          // redispatch could duplicate real side effects. Fail closed;
+          // the intent stays INTENT_RECORDED for recovery.
+          if (!evidence.execution_id) {
+            this.store.appendEvidence(String(task.mission_id), "DISPATCH_EVIDENCE_INCOMPLETE", {
+              governed_task_id: governedTaskId,
+              executor_id: adapter.executor_id,
+            });
+            throw new IntegrityError(
+              "FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE",
+              governedTaskId,
+            );
+          }
+          const evidenceExecId = String(evidence.execution_id);
+          const exec = this.reconcileProvenExecution(
+            task,
+            adapter,
+            evidenceExecId,
+            governedTaskId,
           );
+          // Persist the intent only after local execution evidence is
+          // durable; a racing reconciler may already have — adopt its
+          // outcome when it names the same execution.
+          try {
+            this.store.put(
+              "executor_dispatch_intent",
+              intentId,
+              { ...existingIntent, state: "EXECUTION_PERSISTED", execution_id: evidenceExecId },
+              existingIntent.version,
+            );
+          } catch (e) {
+            const cur = this.store.get("executor_dispatch_intent", intentId);
+            if (
+              String(cur.state) !== "EXECUTION_PERSISTED" ||
+              String(cur.execution_id) !== evidenceExecId
+            ) {
+              throw e;
+            }
+          }
           return exec;
         }
       }
@@ -626,6 +658,67 @@ export class GovernedTaskGate {
       executor_id: adapter.executor_id,
     });
     return execEntity;
+  }
+
+  /**
+   * R3 §2/§6: reconstruct the canonical local executor_execution for a
+   * proven external dispatch when the local row is absent (crash between
+   * external dispatch and persistence). Insert-only CAS — a racing
+   * reconciler's row wins and is adopted verbatim. No fabricated
+   * dispatch_timestamp: `reconciled_at` records recovery time only.
+   */
+  private reconcileProvenExecution(
+    task: Record<string, unknown>,
+    adapter: ExecutorAdapter,
+    executionId: string,
+    governedTaskId: string,
+  ): Record<string, unknown> {
+    const existing = this.store.tryGet("executor_execution", executionId);
+    if (existing) return existing;
+    let observed: string | null = null;
+    try {
+      const ob = adapter.observe?.(executionId);
+      if (ob?.status) observed = String(ob.status);
+    } catch {
+      /* observation unprovable — keep null */
+    }
+    const entity = {
+      execution_id: executionId,
+      governed_task_id: String(task.governed_task_id),
+      mission_id: task.mission_id,
+      task_id: task.task_id,
+      executor_id: adapter.executor_id,
+      plan_revision: task.plan_revision,
+      correlation_id: task.correlation_id,
+      execution_state: observed ?? "RUNNING",
+      reconciled_from_dispatch_evidence: true,
+      reconciled_at: utcnow(),
+      workspace: task.workspace,
+      version: 0,
+    };
+    try {
+      const saved = this.store.put("executor_execution", executionId, entity, 0);
+      this.store.event({
+        entity_type: "executor_execution",
+        entity_id: executionId,
+        event_type: "EXECUTION_RECONCILED",
+        new_state: String(saved.execution_state),
+        actor: "PAIR_GOVERNED_TASK_GATE",
+        correlation_id: String(task.correlation_id),
+        metadata: { governed_task_id: governedTaskId },
+      });
+      this.store.appendEvidence(String(task.mission_id), "EXECUTION_RECONCILED", {
+        governed_task_id: governedTaskId,
+        execution_id: executionId,
+        executor_id: adapter.executor_id,
+      });
+      return saved;
+    } catch {
+      // Insert CAS lost to a concurrent reconciler — adopt the canonical row.
+      const row = this.store.tryGet("executor_execution", executionId);
+      if (row) return row;
+      throw new IntegrityError("FAIL_CLOSED_EXECUTION_RECONCILE_CONFLICT", executionId);
+    }
   }
 
   observe_execution(

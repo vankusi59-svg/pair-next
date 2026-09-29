@@ -41,7 +41,12 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   tasks cannot bypass tightening; already-dispatched executions stay
   historical (EXECUTION_PERSISTED / evidence-reconciled intents return
   untouched); bound route revalidated from the canonical task; pin
-  schema/version hardened.
+  schema/version hardened. R3: adoption/idempotency checked BEFORE
+  contract resolution in the router (proven history bypasses current
+  contract state); missing-local-row crash reconstructs the canonical
+  executor_execution from proven evidence (insert-CAS, reconciled_at —
+  never a fabricated dispatch_timestamp); `dispatched=true` without id
+  fails `FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE`.
 - **Enforcement**: pin at `MissionControl.startMission` (contract id +
   version + digest in mission metadata), authoritative checks in
   `GovernedTaskGate.create_governed_task`, executor/route filtering in
@@ -53,8 +58,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - **API**: `GET|POST /api/org-agents/:id/contract`,
   `POST /api/org-agents/:id/contract/(enable|disable)`,
   `GET /api/org-agents/:id/effective-policy`.
-- Classification: `P12_REMEDIATED_R2_PENDING_AUDIT` — not merged; see
-  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1–R2.
+- Classification: `P12_REMEDIATED_R3_PENDING_AUDIT` — not merged; see
+  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1–R3.
 
 ## Not yet
 

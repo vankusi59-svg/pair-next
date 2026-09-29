@@ -467,3 +467,114 @@ digest. Order: schema → version → digest → contract/provenance binding.
 
 `P12_REMEDIATED_R2_PENDING_AUDIT` — DO NOT MERGE; independent audit
 required. No P13/P14/P15 work performed or implied.
+
+---
+
+# R3 — True dispatch crash recovery + historical idempotency closure
+
+Audit classification at R2 head `b8ff2b2`: `P12_BLOCKED`. Scope: the real
+dispatch crash window (external dispatch proven, local row absent) and
+historical-idempotency ordering. R1/R2 fixes unchanged.
+
+## R3.1 Why R2.G was not the true crash reproduction
+
+R2.G dispatched fully first — the `executor_execution` row existed —
+then rewound the intent to INTENT_RECORDED. The real boundary:
+
+```
+INTENT_RECORDED persisted
+  → adapter.dispatch() succeeded externally
+  → CRASH before executor_execution persistence
+  → restart: dispatch_evidence.dispatched=true + execution_id
+  → local executor_execution ABSENT
+```
+
+`store.get("executor_execution", id)` threw in that state — no safe
+reconcile.
+
+## R3.2 Local execution reconstruction (§2/§6)
+
+`reconcileProvenExecution(governed_task, adapter, execution_id)`:
+
+- row exists → adopt verbatim;
+- absent → insert-only CAS (put v0) of the canonical entity bound to the
+  governed task: execution_id, governed_task_id, mission_id, task_id,
+  executor_id, plan_revision, correlation_id, workspace,
+  `execution_state` = `adapter.observe(id).status` when provable else
+  `RUNNING`, plus `reconciled_from_dispatch_evidence=true` +
+  `reconciled_at`. **No fabricated `dispatch_timestamp`** — recovery
+  time is never passed off as dispatch time;
+- CAS loser → adopt the canonical row (event `EXECUTION_RECONCILED` +
+  mission evidence emitted by the winner only);
+- intent flips to `EXECUTION_PERSISTED` only **after** local execution
+  evidence is durable; a racing reconciler's persisted intent for the
+  same execution_id is adopted rather than double-written.
+
+## R3.3 Incomplete positive evidence → fail closed
+
+`dispatch_evidence` may legally return `{dispatched:true}` without an
+execution_id. That state must never license another external dispatch:
+`DISPATCH_EVIDENCE_INCOMPLETE` evidence entry +
+`FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE` throw. Intent stays
+INTENT_RECORDED (recoverable, auditable); zero adapter.dispatch calls;
+no fabricated row.
+
+## R3.4 Historical-idempotency ordering
+
+MissionRouter previously ran `effectiveForMission` BEFORE the adoption
+check — an already-dispatched execution could fail to return after the
+agent paused / contract disabled / row corrupted. Reordered:
+
+```
+existing governed_task?
+  YES → adopt → dispatch_governed_task:
+          EXECUTION_PERSISTED        → return existing (no revalidation)
+          INTENT_RECORDED + proven   → reconcile/adopt (no revalidation)
+          else → assertAgentExecutionAllowed() → NEW adapter.dispatch
+  NO  → effectiveForMission → normal routing (unchanged authority)
+```
+
+`assertAgentExecutionAllowed` remains at the final boundary and is the
+ONLY contract check that can stop a NEW dispatch; proven historical work
+bypasses it entirely. New work keeps full routing enforcement (test G is
+the control: disabled contract + no prior dispatch → FAIL CLOSED).
+
+## R3.5 Tests (7 new — describe P12.R3)
+
+- **A** missing-local-row crash → router adoption reconciles: 1 exec row
+  w/ canonical identity, `reconciled_from_dispatch_evidence`, intent
+  EXECUTION_PERSISTED, 0 dispatches, integrity clean.
+- **B** concurrent recovery — two worker_threads stacks on the same db,
+  SharedArrayBuffer barrier → both converge to EXEC_EXTERNAL_2, exactly
+  1 row, 1 persisted intent, `dispatch()` throws if ever called.
+- **C** `{dispatched:true}` sans id → FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE,
+  0 dispatches, 0 rows, intent recoverable.
+- **D/E** EXECUTION_PERSISTED + contract DISABLED / agent PAUSED → same
+  execution returned, still 1 dispatch.
+- **F** INTENT_RECORDED + proven dispatch + contract disabled →
+  reconciled history, no second dispatch.
+- **G** control: disabled contract, no prior dispatch → FAIL CLOSED,
+  0 dispatches.
+
+## R3.6 Validation evidence
+
+- `tsc --noEmit` PASS · `pnpm build` PASS
+- P12 suite: **66/66** (59 + 7 R3) · P11 regression: **103/103**
+- Full suite Node 22.23.3: **1851 pass** / 2 pre-existing env-dependent
+  p5 probe failures / 24 skipped
+- Full suite Node 20.20.2: **1853 pass / 0 fail** / 24 skipped
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**
+- Dispatch-recovery race (worker_threads): PASS — converged, 1 row
+- P12 CAS race + P11 worker races: PASS · `verifyIntegrity`: clean
+
+## R3.7 Final invariant
+
+```
+PROVEN HISTORICAL DISPATCH → reconcile/adopt
+NO PROVEN DISPATCH         → current contract revalidation → NEW dispatch only if allowed
+```
+
+## R3.8 Classification
+
+`P12_REMEDIATED_R3_PENDING_AUDIT` — DO NOT MERGE; independent audit
+required. No P13/P14/P15 work performed or implied.

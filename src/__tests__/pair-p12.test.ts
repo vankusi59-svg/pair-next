@@ -950,6 +950,29 @@ try {
     Atomics.wait(barrier, 0, 0);
     const row = svc.update(args.agentId, args.patch, args.expectedVersion, "worker");
     parentPort.postMessage({ ok: true, out: { contract_version: Number(row.contract_version) } });
+  } else if (op === "dispatchRecover") {
+    // Independent stack on the same db: proven-external-dispatch recovery.
+    const store = new PAIR.PairEvidenceStore(dbPath);
+    const service = new PAIR.PairControlPlane(store);
+    const gate = new PAIR.GovernedTaskGate(service);
+    const adapter = {
+      executor_id: args.executorId,
+      probe() { return { executor_id: args.executorId, available: true, state: "READY" }; },
+      qualify() { return { qualified: true, dispatch_enabled: true }; },
+      capabilities() { return { capability_ids: [] }; },
+      prepare_task(t) { return t; },
+      dispatch() { throw new Error("MUST_NOT_DISPATCH_AGAIN"); },
+      observe() { return { status: "RUNNING" }; },
+      cancel() { return { status: "CANCELLED" }; },
+      collect_result() { return { status: "COMPLETED" }; },
+      collect_artifacts() { return []; },
+      health() { return { state: "READY" }; },
+      dispatch_evidence() { return { dispatched: true, execution_id: args.evidenceExecId }; },
+    };
+    parentPort.postMessage({ ready: true });
+    Atomics.wait(barrier, 0, 0);
+    const exec = gate.dispatch_governed_task(adapter, args.governedTaskId);
+    parentPort.postMessage({ ok: true, out: { execution_id: String(exec.execution_id) } });
   } else {
     throw new Error("unknown op " + op);
   }
@@ -977,7 +1000,7 @@ function ensureWorkerBundle() {
 }
 
 type RaceOutcome =
-  | { ok: true; out: { contract_version: number } }
+  | { ok: true; out: { contract_version?: number; execution_id?: string } }
   | { ok: false; code: string; message: string };
 
 async function runRace(
@@ -1623,6 +1646,206 @@ describe("P12.R2.6 pinned provenance hardening", () => {
     tamperPin(ctx.store, String(mission.mission_id), (pin) => {
       pin.contract_version = -1;
     });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+});
+
+/* ============ R3 — true dispatch crash recovery + historical idempotency ============ */
+
+/**
+ * Persist the real crash window: governed_task DISPATCH_AUTHORIZED +
+ * intent INTENT_RECORDED + NO executor_execution row — the adapter's
+ * external dispatch happened, the local write never did.
+ */
+function persistCrashState(
+  ctx: Ctx,
+  mission: Record<string, unknown>,
+  adapter: ScriptedAdapter,
+) {
+  const gov = persistValidated(ctx, mission, adapter);
+  const gtid = String(gov.governed_task_id);
+  ctx.gate.authorize_dispatch(adapter, gtid);
+  const intentId = `INTENT_${gtid}`;
+  ctx.store.put(
+    "executor_dispatch_intent",
+    intentId,
+    {
+      intent_id: intentId,
+      governed_task_id: gtid,
+      executor_id: adapter.executor_id,
+      state: "INTENT_RECORDED",
+      created_at: utcnow(),
+      version: 0,
+    },
+    0,
+  );
+  return gtid;
+}
+
+describe("P12.R3 dispatch crash recovery", () => {
+  it("A. missing-local-row crash → proven external dispatch reconciled, zero new dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r3a");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const gtid = persistCrashState(ctx, mission, a);
+    a.evidence[gtid] = { dispatched: true, execution_id: "EXEC_EXTERNAL_1" };
+    expect(ctx.store.list("executor_execution").length).toBe(0);
+
+    const routed = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(a.dispatched.length).toBe(0); // no second external dispatch
+    const execs = ctx.store.list("executor_execution");
+    expect(execs.length).toBe(1);
+    const exec = execs[0];
+    expect(String(exec.execution_id)).toBe("EXEC_EXTERNAL_1");
+    expect(String(routed.execution.execution_id)).toBe("EXEC_EXTERNAL_1");
+    // canonical identity bound to the governed task
+    expect(String(exec.governed_task_id)).toBe(gtid);
+    expect(String(exec.mission_id)).toBe(String(mission.mission_id));
+    expect(String(exec.executor_id)).toBe("EXEC_A");
+    expect(exec.reconciled_from_dispatch_evidence).toBe(true);
+    expect(exec.dispatch_timestamp ?? null).toBeNull(); // recovery time is NOT dispatch time
+    const intent = ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`);
+    expect(String(intent.state)).toBe("EXECUTION_PERSISTED");
+    expect(String(intent.execution_id)).toBe("EXEC_EXTERNAL_1");
+    const integrity = ctx.store.verifyIntegrity() as Record<string, number>;
+    expect(integrity.errors ?? 0).toBe(0);
+  });
+
+  it("B. concurrent recovery — two independent stacks converge on ONE execution row", async () => {
+    const { ctx, biz } = makeBizCtx("r3b");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const gtid = persistCrashState(ctx, mission, a);
+    const dbPath = path.join(ctx.dir, "pair.db");
+    const [r1, r2] = await runRace([
+      { op: "dispatchRecover", dir: ctx.dir, dbPath, args: { executorId: "EXEC_A", governedTaskId: gtid, evidenceExecId: "EXEC_EXTERNAL_2" } },
+      { op: "dispatchRecover", dir: ctx.dir, dbPath, args: { executorId: "EXEC_A", governedTaskId: gtid, evidenceExecId: "EXEC_EXTERNAL_2" } },
+    ]);
+    expect(r1.ok && r2.ok).toBe(true);
+    const outs = [r1, r2].map((r) => String((r as { out: { execution_id: string } }).out.execution_id));
+    expect(outs[0]).toBe("EXEC_EXTERNAL_2");
+    expect(outs[1]).toBe("EXEC_EXTERNAL_2");
+    // exactly one canonical row, one persisted intent outcome, zero dispatches
+    const execs = ctx.store.list("executor_execution");
+    expect(execs.length).toBe(1);
+    expect(String(execs[0].execution_id)).toBe("EXEC_EXTERNAL_2");
+    const intent = ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`);
+    expect(String(intent.state)).toBe("EXECUTION_PERSISTED");
+    expect(a.dispatched.length).toBe(0);
+    const integrity = ctx.store.verifyIntegrity() as Record<string, number>;
+    expect(integrity.errors ?? 0).toBe(0);
+  }, 60_000);
+
+  it("C. dispatched=true without execution_id → FAIL CLOSED, no dispatch, intent recoverable", () => {
+    const { ctx, biz } = makeBizCtx("r3c");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const gtid = persistCrashState(ctx, mission, a);
+    a.evidence[gtid] = { dispatched: true }; // positive but incomplete
+    expect(() => ctx.gate.dispatch_governed_task(a, gtid)).toThrowError(
+      /FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE/,
+    );
+    expect(a.dispatched.length).toBe(0);
+    expect(ctx.store.list("executor_execution").length).toBe(0); // no fabricated row
+    const intent = ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`);
+    expect(String(intent.state)).toBe("INTENT_RECORDED"); // still recoverable
+  });
+
+  it("D. EXECUTION_PERSISTED + contract disabled afterward → historical execution still returned", () => {
+    const { ctx, biz } = makeBizCtx("r3d");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const first = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    const eid = String(first.execution.execution_id);
+    biz.setAgentContractStatus(aid, "DISABLED", "op");
+    const second = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(String(second.execution.execution_id)).toBe(eid);
+    expect(a.dispatched.length).toBe(1);
+    expect(ctx.store.list("executor_execution").length).toBe(1);
+  });
+
+  it("E. EXECUTION_PERSISTED + agent PAUSED afterward → historical execution still returned", () => {
+    const { ctx, biz } = makeBizCtx("r3e");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const first = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    const eid = String(first.execution.execution_id);
+    biz.setOrgAgentStatus(aid, "PAUSED", "op");
+    const second = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(String(second.execution.execution_id)).toBe(eid);
+    expect(a.dispatched.length).toBe(1);
+  });
+
+  it("F. INTENT_RECORDED + proven dispatch + contract disabled → reconcile history, no second dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r3f");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const gtid = persistCrashState(ctx, mission, a);
+    a.evidence[gtid] = { dispatched: true, execution_id: "EXEC_EXTERNAL_3" };
+    biz.setAgentContractStatus(aid, "DISABLED", "op");
+    const routed = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(String(routed.execution.execution_id)).toBe("EXEC_EXTERNAL_3");
+    expect(a.dispatched.length).toBe(0);
+    expect(ctx.store.list("executor_execution").length).toBe(1);
+  });
+
+  it("G. control — NEW dispatch with disabled contract still fails closed", () => {
+    const { ctx, biz } = makeBizCtx("r3g");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    biz.setAgentContractStatus(aid, "DISABLED", "op");
     expect(() =>
       ctx.router.routeGovernedTask(
         govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,

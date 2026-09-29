@@ -77,6 +77,35 @@ export class MissionRouter {
     const mission = this.service.getMission(missionId);
     const active = this.service.activeRevision(missionId);
 
+    // R3 §4: adoption/idempotency FIRST — a governed task whose external
+    // dispatch already happened is a historical fact and returns without
+    // re-resolving the current contract (a since-paused agent or disabled
+    // contract must not erase proven history). The final authority check
+    // inside dispatch_governed_task still gates any NEW dispatch.
+    const existing = this.existingGovernedTask(taskId, active.revision);
+    if (existing) {
+      const executorId = String(existing.executor_id);
+      const adapter = adapters.get(executorId);
+      if (!adapter) {
+        throw new PolicyError("FAIL_CLOSED_ADAPTER_NOT_BOUND", executorId);
+      }
+      const authorized =
+        existing.governance_state === "DISPATCH_AUTHORIZED"
+          ? existing
+          : this.gate.authorize_dispatch(adapter, String(existing.governed_task_id));
+      const execution = this.gate.dispatch_governed_task(
+        adapter,
+        String(authorized.governed_task_id),
+      );
+      return {
+        adopted: true,
+        routing_decision: null,
+        route_decision: null,
+        governed_task: authorized,
+        execution,
+      };
+    }
+
     // P12: agent execution contract — resolve effective executor/route policy
     // (mission-pinned ∩ current ∩ PAIR) once per routing pass. Resolution is
     // fail-closed; contract only narrows the canonical candidate set.
@@ -101,30 +130,6 @@ export class MissionRouter {
         }
         throw e;
       }
-    }
-    // adopted, not duplicated — dispatch dedup then yields the same execution.
-    const existing = this.existingGovernedTask(taskId, active.revision);
-    if (existing) {
-      const executorId = String(existing.executor_id);
-      const adapter = adapters.get(executorId);
-      if (!adapter) {
-        throw new PolicyError("FAIL_CLOSED_ADAPTER_NOT_BOUND", executorId);
-      }
-      const authorized =
-        existing.governance_state === "DISPATCH_AUTHORIZED"
-          ? existing
-          : this.gate.authorize_dispatch(adapter, String(existing.governed_task_id));
-      const execution = this.gate.dispatch_governed_task(
-        adapter,
-        String(authorized.governed_task_id),
-      );
-      return {
-        adopted: true,
-        routing_decision: null,
-        route_decision: null,
-        governed_task: authorized,
-        execution,
-      };
     }
 
     // 1. Executor eligibility — DISPATCH mode (all 12 gates, live qualify).
