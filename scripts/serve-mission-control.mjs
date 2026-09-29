@@ -28,6 +28,10 @@ import {
   DevinExecutorAdapter,
   DshExecutorAdapter,
   ExecutorRegistry,
+  ExperienceExtractor,
+  ExperienceService,
+  ExperienceVerifier,
+  VerifiedExperienceRoutingAdvisor,
   GovernedTaskGate,
   MissionControl,
   MissionObservability,
@@ -136,7 +140,22 @@ for (const [id, a] of governed) adapters.set(id, a);
 
 const gate = new GovernedTaskGate(service);
 const registry = new ExecutorRegistry(service);
-const router = new MissionRouter(service, gate);
+// Layer C — verified experience (advisory only): the extraction sweep folds
+// terminal executions into CANDIDATE experience, the verifier checklist
+// promotes what survives, and the routing advisor re-ranks *already-eligible*
+// executors. Nothing here grants permissions, bypasses qualification, or
+// opens a gate — the experience firewall stays fail-closed by construction.
+const experience = new ExperienceService(service);
+const experienceExtractor = new ExperienceExtractor(service, experience);
+const experienceVerifier = new ExperienceVerifier(service, experience);
+const routingAdvisor = new VerifiedExperienceRoutingAdvisor(service, experience);
+const PAIR_ENV = {
+  os: process.platform,
+  arch: process.arch,
+  node: process.version,
+  policy_version: "v1",
+};
+const router = new MissionRouter(service, gate, routingAdvisor, PAIR_ENV);
 const recovery = new RecoveryController(service);
 const recon = new ReconciliationService(service, adapters);
 const approvals = new ApprovalQueue(service);
@@ -250,6 +269,40 @@ const runtime = new MissionRuntime({
   planner,
 });
 const sup = new MissionSupervisor(service, runtime, recovery, recon);
+// Extraction sweep: every executor_execution whose result was collected folds
+// into experience candidates (dedup is by canonical evidence ref, so a repeat
+// scan is a semantic no-op), then each candidate runs the deterministic
+// verifier checklist. Verification failures just leave the row
+// CANDIDATE/QUALIFIED — experience is advisory and never opens gates itself.
+const EXPERIENCE_VERIFIER_ID = "PAIR_EXPERIENCE_VERIFIER";
+const experienceSweep = () => {
+  for (const e of store.list("executor_execution")) {
+    if (!e.result_state) continue;
+    try {
+      for (const cand of experienceExtractor.fromExecution(String(e.execution_id), {
+        origin: "REAL_EXECUTION",
+        environment: PAIR_ENV,
+      })) {
+        try {
+          let row = cand;
+          const id = String(row.experience_id);
+          if (String(row.status) === "CANDIDATE") {
+            row = experienceVerifier.verifyAndQualify(id, EXPERIENCE_VERIFIER_ID);
+          }
+          if (String(row.status) === "QUALIFIED") {
+            experienceVerifier.verifyAndActivate(id, EXPERIENCE_VERIFIER_ID);
+          }
+        } catch {
+          // stays CANDIDATE/QUALIFIED — retried on the next sweep
+        }
+      }
+    } catch {
+      // execution not extractable — skip
+    }
+  }
+};
+experienceSweep();
+setInterval(experienceSweep, 15_000).unref();
 // Credential broker: local vault (chmod 600, outside the canonical store
 // since entities must stay secret-free) + every release audited as a
 // canonical event keyed to the requesting mission.
@@ -345,8 +398,12 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   if (governed.has(DSH_EXECUTOR_ID)) {
     const wanted = [
       String(process.env.PAIR_DSH_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite"),
-      String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "groq:openai/gpt-oss-20b"),
+      String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "cloudflare:@cf/zai-org/glm-4.7-flash"),
     ];
+    for (const extra of String(process.env.PAIR_DSH_EXTRA_ROUTES ?? "groq:openai/gpt-oss-20b").split(",")) {
+      const r = extra.trim();
+      if (r && !wanted.includes(r)) wanted.push(r);
+    }
     for (const route of wanted) {
       const [pid, mid] = route.split(":");
       const prov = pc.getProvider(pid);
