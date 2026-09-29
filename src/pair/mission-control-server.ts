@@ -527,6 +527,33 @@ export function createMissionControlServer(
         const st = m[2] === "pause" ? "PAUSED" : m[2] === "resume" ? "ACTIVE" : "TERMINATED";
         return void json(res, 200, biz.setOrgAgentStatus(m[1], st, String(operator)));
       }
+      // P12: agent execution contract management — canonical business-layer
+      // ops only; CAS-protected, audited, business-isolated.
+      m = p.match(/^\/api\/org-agents\/([^/]+)\/contract$/);
+      if (m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        if (method === "GET") {
+          return void json(res, 200, { contract: biz.getAgentContract(m[1]) });
+        }
+        if (method === "POST" || method === "PUT") {
+          return void json(res, 200, biz.upsertAgentContract(
+            m[1], String(operator),
+            body.policy as Record<string, unknown> | undefined,
+            typeof body.expected_version === "number" ? body.expected_version : undefined,
+          ));
+        }
+      }
+      m = p.match(/^\/api\/org-agents\/([^/]+)\/contract\/(enable|disable)$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.setAgentContractStatus(
+          m[1], m[2] === "disable" ? "DISABLED" : "ACTIVE", String(operator)));
+      }
+      m = p.match(/^\/api\/org-agents\/([^/]+)\/effective-policy$/);
+      if (method === "GET" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.inspectAgentPolicy(m[1]));
+      }
       if (method === "GET" && p === "/api/work-items") {
         const bid = url.searchParams.get("business_id") ?? undefined;
         return void json(res, 200, { work_items: biz ? biz.listWorkItems(bid) : [] });

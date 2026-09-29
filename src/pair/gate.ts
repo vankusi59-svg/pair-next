@@ -103,6 +103,87 @@ export class GovernedTaskGate {
         String(task.selected_executor),
       );
     }
+
+    // P12: agent execution contract — the authoritative enforcement point.
+    // effective = mission-pinned policy ∩ current contract ∩ PAIR policy.
+    // Explicit deny always wins; a contract only ever narrows authority.
+    const boundAgentId = (
+      (mission.metadata as Record<string, unknown> | undefined)?.org_agent_id
+    );
+    if (boundAgentId) {
+      let agentPolicy;
+      try {
+        agentPolicy = this.service.agentContracts.effectiveForMission(mission);
+      } catch (e) {
+        // Resolution itself failed closed (status/disabled/digest/provenance)
+        // — still emit the §17 denial audit before re-throwing.
+        if (e instanceof PolicyError || e instanceof IntegrityError) {
+          this.service.agentContracts.auditDenial(
+            (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+            (e as Error).message,
+            { missionId: String(mission.mission_id), agentId: String(boundAgentId), taskId: String(task.task_id) },
+          );
+        }
+        throw e;
+      }
+      const denyCtx = {
+        missionId: String(mission.mission_id),
+        agentId: String(boundAgentId),
+        taskId: String(task.task_id),
+        contractVersion: agentPolicy.contract_version,
+      };
+      // Explicit deny is checked first — deny always wins over allow,
+      // and the audit names it directly.
+      const requiredCaps = (task.required_capabilities as string[]) ?? [];
+      const explicitlyDenied = requiredCaps.filter((c) =>
+        agentPolicy.denied_capabilities.has(c),
+      );
+      if (explicitlyDenied.length) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_CAPABILITY_DENIED",
+          `explicit-deny:${explicitlyDenied.sort().join(",")}`,
+          denyCtx,
+        );
+      }
+      // required capabilities ⊆ effective agent capabilities.
+      if (agentPolicy.allowed_capabilities) {
+        const deniedCaps = requiredCaps.filter(
+          (c) => !agentPolicy.allowed_capabilities!.has(c),
+        );
+        if (deniedCaps.length) {
+          this.service.agentContracts.deny(
+            "FAIL_CLOSED_AGENT_CAPABILITY_DENIED",
+            deniedCaps.sort().join(","),
+            denyCtx,
+          );
+        }
+      }
+      // executor ∈ allowed ∧ ∉ denied (pinned ∩ current).
+      const executorId = adapter.executor_id;
+      const execDenied =
+        agentPolicy.denied_executor_ids.has(executorId) ||
+        (agentPolicy.allowed_executor_ids !== null &&
+          !agentPolicy.allowed_executor_ids.has(executorId));
+      if (execDenied) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_EXECUTOR_DENIED",
+          String(executorId),
+          denyCtx,
+        );
+      }
+      // project ∈ allowed scope (pinned ∩ current).
+      const projectId = String(mission.project_id);
+      if (
+        agentPolicy.allowed_project_ids !== null &&
+        !agentPolicy.allowed_project_ids.has(projectId)
+      ) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_PROJECT_DENIED",
+          projectId,
+          denyCtx,
+        );
+      }
+    }
     const q = adapter.qualify();
     if (!q.qualified) {
       throw new PolicyError("FAIL_CLOSED_EXECUTOR_UNQUALIFIED", adapter.executor_id);

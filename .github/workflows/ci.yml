@@ -36,7 +36,7 @@ jobs:
         timeout-minutes: 10
         run: |
           set +e
-          timeout 300 npx vitest run src/__tests__/pair-p11.test.ts src/__tests__/pair-p11-r1.test.ts src/__tests__/pair-p11-r2.test.ts src/__tests__/pair-p11-r3.test.ts src/__tests__/pair-p11-r4.test.ts src/__tests__/pair-p11-r5.test.ts src/__tests__/pair-p11-r6.test.ts
+          timeout 300 npx vitest run src/__tests__/pair-p11.test.ts src/__tests__/pair-p11-r1.test.ts src/__tests__/pair-p11-r2.test.ts src/__tests__/pair-p11-r3.test.ts src/__tests__/pair-p11-r4.test.ts src/__tests__/pair-p11-r5.test.ts src/__tests__/pair-p11-r6.test.ts src/__tests__/pair-p12.test.ts
           RC=$?
           set -e
           if [ $RC -eq 124 ]; then echo "::error::P11 tests exceeded the 300s timeout"; fi

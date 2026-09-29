@@ -24,11 +24,33 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   broker denial auditing, honest CI (no timeout→PASS), new `pair-p11.test.ts`
   regression suite.
 
+## P12 candidate state (on branch, pending audit)
+
+- **Agent Execution Contract** (`src/pair/agent-contract.ts`, table
+  `agent_execution_contract`): exactly one versioned contract per
+  `org_agent` — capability allow/deny, executor allow/deny/prefer +
+  fallback, provider/model route prefer/deny/restrict, project scope,
+  context scopes. Contracts only NARROW existing PAIR authority; explicit
+  deny wins; unknown capability fails closed.
+- **Enforcement**: pin at `MissionControl.startMission` (contract id +
+  version + digest in mission metadata), authoritative checks in
+  `GovernedTaskGate.create_governed_task`, executor/route filtering in
+  `MissionRouter` + `RouteSelector`. `effective = pinned ∩ current ∩ PAIR`
+  — tightening revokes in-flight authority; expansion never retro-broadens
+  a pinned mission. Denials audited as `AGENT_EXECUTION_DENIED`.
+- **Legacy compat**: pre-P12 agents materialize a baseline contract on
+  first bound mission (audited `AGENT_EXECUTION_CONTRACT_MATERIALIZED`).
+- **API**: `GET|POST /api/org-agents/:id/contract`,
+  `POST /api/org-agents/:id/contract/(enable|disable)`,
+  `GET /api/org-agents/:id/effective-policy`.
+- Classification: `P12_IMPLEMENTED_PENDING_AUDIT` — not merged; see
+  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md`.
+
 ## Not yet
 
-- Per-agent executor/permission policy (P12), token/USD cost ledger + scoped
-  credential capabilities (P13), autonomous heartbeat/inbox/delegation (P14),
-  CEO agent / KPI gap analysis (P15). Intentionally deferred.
+- Token/USD cost ledger + scoped credential capabilities (P13),
+  autonomous heartbeat/inbox/delegation (P14), CEO agent / KPI gap
+  analysis (P15). Intentionally deferred.
 
 ## Release governance (current policy)
 

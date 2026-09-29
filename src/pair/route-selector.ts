@@ -31,6 +31,12 @@ export interface RouteSelectRequest {
   operator_pin?: string;
   require_qualified?: boolean;
   preferred_route_id?: string;
+  /** P12 agent-contract route policy: ordered preferences (supersedes
+   *  preferred_route_id), hard denies, and an allow-restrict set used when
+   *  the contract forbids fallback off its preferred routes. */
+  preferred_route_ids?: string[];
+  denied_route_ids?: string[];
+  restricted_route_ids?: string[] | null;
   mission_id?: string;
   task_id?: string;
   governed_task_id?: string;
@@ -73,6 +79,16 @@ export class RouteSelector {
 
     const pin = request.operator_pin as string | undefined;
     if (pin && rid !== pin) reasons.push("OPERATOR_PIN_EXCLUDED");
+
+    // P12: contract-level route denies and no-fallback restriction are hard
+    // rejections — they narrow, never widen, the canonical eligible set.
+    if ((request.denied_route_ids as string[] | undefined)?.includes(rid)) {
+      reasons.push("AGENT_CONTRACT_ROUTE_DENIED");
+    }
+    const restricted = request.restricted_route_ids as string[] | null | undefined;
+    if (restricted && restricted.length && !restricted.includes(rid)) {
+      reasons.push("AGENT_CONTRACT_ROUTE_RESTRICTED");
+    }
 
     const capability = request.capability as string | undefined;
     const caps = (route.capabilities as string[] | undefined) ?? [];
@@ -118,6 +134,9 @@ export class RouteSelector {
       operator_pin: request.operator_pin ?? null,
       require_qualified: request.require_qualified !== false,
       preferred_route_id: request.preferred_route_id ?? null,
+      preferred_route_ids: request.preferred_route_ids ?? [],
+      denied_route_ids: request.denied_route_ids ?? [],
+      restricted_route_ids: request.restricted_route_ids ?? null,
     };
     const requestFingerprint = digest({ request: req, schema: ROUTE_DECISION_SCHEMA });
 
@@ -143,6 +162,12 @@ export class RouteSelector {
     if (eligible.length) {
       if (req.preferred_route_id) {
         const idx = eligible.findIndex((e) => e.route.route_id === req.preferred_route_id);
+        if (idx >= 0) eligible.unshift(...eligible.splice(idx, 1));
+      }
+      // P12: ordered contract preferences promote the first eligible
+      // preferred route — advisory reordering inside the eligible set only.
+      for (const rid of [...req.preferred_route_ids].reverse()) {
+        const idx = eligible.findIndex((e) => e.route.route_id === rid);
         if (idx >= 0) eligible.unshift(...eligible.splice(idx, 1));
       }
       selected = eligible[0];
@@ -179,6 +204,15 @@ export class RouteSelector {
       governed_task_id: request.governed_task_id ?? null,
       parent_decision_id: request.parent_decision_id ?? null,
       correlation_id: request.correlation_id ?? null,
+      // P12: contract route policy applied to this decision (null = none).
+      agent_route_policy:
+        req.preferred_route_ids.length || req.denied_route_ids.length || req.restricted_route_ids
+          ? {
+              preferred: req.preferred_route_ids,
+              denied: req.denied_route_ids,
+              restricted: req.restricted_route_ids !== null,
+            }
+          : null,
       shadow: Boolean(request.shadow),
       created_at: utcnow(),
       actor: request.actor ?? "PAIR_ROUTE_SELECTOR",

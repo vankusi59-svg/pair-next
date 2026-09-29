@@ -74,9 +74,34 @@ export class MissionRouter {
     const missionId = String(request.mission_id);
     const correlationId = String(request.correlation_id ?? "");
     const task = this.service.getTask(taskId);
+    const mission = this.service.getMission(missionId);
     const active = this.service.activeRevision(missionId);
 
-    // Idempotency: a governed task already bound for this plan revision is
+    // P12: agent execution contract — resolve effective executor/route policy
+    // (mission-pinned ∩ current ∩ PAIR) once per routing pass. Resolution is
+    // fail-closed; contract only narrows the canonical candidate set.
+    const boundAgentId = (
+      (mission.metadata as Record<string, unknown> | undefined)?.org_agent_id
+    );
+    let agentPolicy = null;
+    if (boundAgentId) {
+      try {
+        agentPolicy = this.service.agentContracts.effectiveForMission(mission);
+      } catch (e) {
+        if (e instanceof PolicyError || e instanceof IntegrityError) {
+          this.service.agentContracts.auditDenial(
+            (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+            (e as Error).message,
+            {
+              missionId: String(missionId),
+              agentId: String(boundAgentId),
+              taskId: String(taskId),
+            },
+          );
+        }
+        throw e;
+      }
+    }
     // adopted, not duplicated — dispatch dedup then yields the same execution.
     const existing = this.existingGovernedTask(taskId, active.revision);
     if (existing) {
@@ -127,6 +152,30 @@ export class MissionRouter {
         );
       }
     }
+    // P12: intersect candidates with the contract's effective executor set.
+    // The gate re-checks authoritatively at create_governed_task — this filter
+    // keeps routing honest before selection so a forbidden executor is never
+    // even eligible.
+    if (agentPolicy) {
+      candidates = new Map(
+        [...candidates].filter(([id]) =>
+          (agentPolicy.allowed_executor_ids === null || agentPolicy.allowed_executor_ids.has(id)) &&
+          !agentPolicy.denied_executor_ids.has(id),
+        ),
+      );
+      if (!candidates.size) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR",
+          "agent_contract:executor_set_empty",
+          {
+            missionId,
+            agentId: String(boundAgentId),
+            taskId,
+            contractVersion: agentPolicy.contract_version,
+          },
+        );
+      }
+    }
     const routingDecision = this.capabilityRouter.route(task, {
       adapters: candidates,
       mode: "DISPATCH",
@@ -136,6 +185,7 @@ export class MissionRouter {
       ),
       routingAdvisor: this.routingAdvisor,
       environment: this.environment,
+      preferredExecutors: agentPolicy?.preferred_executor_ids ?? [],
     });
     const selectedExecutor = routingDecision.selected_executor;
     if (!selectedExecutor) {
@@ -164,6 +214,14 @@ export class MissionRouter {
       mission_id: missionId,
       task_id: taskId,
       correlation_id: correlationId,
+      preferred_route_ids: agentPolicy?.preferred_route_ids ?? [],
+      denied_route_ids: agentPolicy ? [...agentPolicy.denied_route_ids] : [],
+      // A contract may forbid falling back off its preferred routes — then
+      // only those routes may be selected; nothing else is eligible.
+      restricted_route_ids:
+        agentPolicy && agentPolicy.preferred_route_ids.length && !agentPolicy.route_fallback_allowed
+          ? agentPolicy.preferred_route_ids
+          : null,
     });
     if (!routeDecision.selected_route_id) {
       this.service.store.appendEvidence(missionId, "ROUTING_FAILED", {
