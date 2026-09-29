@@ -24,6 +24,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError, NotFoundError, PolicyError } from "./errors.js";
 import { atomicWriteJson, utcnow, workerExecutionId } from "./canonical.js";
+import { mintBrokerCapability } from "./broker-capability.js";
 import type { ExecutorAdapter } from "./adapter.js";
 
 export const DEVIN_EXECUTOR_ID = "DEVIN";
@@ -307,12 +308,22 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     }
     // Credential broker: when a service needs a login/token, the agent pulls
     // the named credential from the broker instead of asking the operator.
-    // The token is release-only; the value must never be echoed in replies.
+    // R3 §2: the worker receives a TASK-SCOPED capability minted server-side
+    // from the master PAIR_BROKER_TOKEN — the raw master token never leaves
+    // this process. The capability is bound to this exact
+    // mission/task/governed-task/executor and verifies against the
+    // canonical task binding at fetch time.
     const brokerUrl = process.env.PAIR_BROKER_URL ?? process.env.PAIR_OUTBOX_URL;
-    const brokerToken = process.env.PAIR_BROKER_TOKEN;
-    if (brokerUrl && brokerToken) {
+    const brokerMaster = process.env.PAIR_BROKER_TOKEN;
+    if (brokerUrl && brokerMaster) {
+      const capability = mintBrokerCapability(brokerMaster, {
+        mission_id: String(task.mission_id),
+        task_id: String(task.task_id),
+        governed_task_id: task.governed_task_id != null ? String(task.governed_task_id) : null,
+        executor_id: this.executor_id,
+      });
       lines.push(
-        `Credentials: if the task needs a login/API key for a service, fetch it via: curl -X POST "${brokerUrl}/api/broker/fetch" -H "x-broker-token: ${brokerToken}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","credential_name":"<service-name>"}'. Use the returned "value" directly in your API calls or login flow — NEVER print, save to a file, or include it in your reply text. If the fetch returns 404 the credential is not installed: report which credential you need in your reply instead of stopping.`,
+        `Credentials: if the task needs a login/API key for a service, fetch it via: curl -X POST "${brokerUrl}/api/broker/fetch" -H "x-broker-capability: ${capability}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","credential_name":"<service-name>"}'. Use the returned "value" directly in your API calls or login flow — NEVER print, save to a file, or include it in your reply text. If the fetch returns 404 the credential is not installed: report which credential you need in your reply instead of stopping.`,
       );
     }
     return lines.join("\n");

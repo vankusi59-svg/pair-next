@@ -8,6 +8,7 @@
  */
 
 import fs from "node:fs";
+import { verifyBrokerCapability } from "./broker-capability.js";
 import path from "node:path";
 import { IntegrityError, NotFoundError, PolicyError } from "./errors.js";
 import type { PairControlPlane } from "./service.js";
@@ -383,6 +384,43 @@ export class MissionControl {
         throw e;
       }
     }
+    // P13-R3 §1: canonical business context. When the mission is bound to
+    // an org_agent, that agent row is the ONLY authority for
+    // business/department scope — caller-supplied business_id/department
+    // must match it exactly (mismatch fails closed), and a missing
+    // business_id inherits the agent's business so a bound mission can
+    // never escape its monetary/secret scope. The resolved context is
+    // pinned immutably; downstream governance consumes the pin, not
+    // arbitrary caller metadata.
+    let canonicalBizId: string | null = null;
+    if (boundAgentId) {
+      const agent = this.deps.service.store.tryGet("org_agent", boundAgentId) as
+        | Record<string, unknown>
+        | null;
+      if (!agent) {
+        throw new IntegrityError("FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH", `agent:${boundAgentId} unknown`);
+      }
+      canonicalBizId = String(agent.business_id);
+      const canonicalDept = agent.department == null ? null : String(agent.department);
+      if (metadata.business_id != null && String(metadata.business_id) !== canonicalBizId) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH",
+          `business_id:${String(metadata.business_id)}!=${canonicalBizId}`,
+        );
+      }
+      if (
+        metadata.department != null &&
+        canonicalDept != null &&
+        String(metadata.department) !== canonicalDept
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH",
+          `department:${String(metadata.department)}!=${canonicalDept}`,
+        );
+      }
+      metadata.business_id = canonicalBizId;
+      if (canonicalDept != null) metadata.department = canonicalDept;
+    }
     // P13: pin the mission's credential grant set — a snapshot of every
     // ACTIVE secret_policy of its business (refs + allow-sets + policy
     // provenance, never values). Later expansion never retro-broadens;
@@ -401,15 +439,18 @@ export class MissionControl {
       if (String(biz.project_id) !== String(input.project_id)) {
         throw new IntegrityError("FAIL_CLOSED_SECRET_CROSS_BUSINESS", `${bizId}:${String(input.project_id)}`);
       }
-      if (boundAgentId) {
-        const agent = this.deps.service.store.tryGet("org_agent", boundAgentId) as
-          | Record<string, unknown>
-          | null;
-        if (!agent || String(agent.business_id) !== bizId) {
-          throw new IntegrityError("FAIL_CLOSED_SECRET_AGENT_REF", boundAgentId);
-        }
+      if (boundAgentId && canonicalBizId !== bizId) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_AGENT_REF", boundAgentId);
       }
     }
+    metadata.business_context = {
+      business_id: metadata.business_id != null ? String(metadata.business_id) : null,
+      org_agent_id: boundAgentId,
+      department: metadata.department != null ? String(metadata.department) : null,
+      project_id: String(input.project_id),
+      provenance: boundAgentId ? "org_agent" : "caller",
+      pinned_at: utcnow(),
+    };
     metadata.secret_grants = this.deps.service.secretPolicies.pinForMission({
       businessId: metadata.business_id ? String(metadata.business_id) : null,
     });
@@ -514,6 +555,56 @@ export class MissionControl {
       executor_id: executorId,
     });
     return { granted: true, reason: "GRANTED" };
+  }
+
+  /**
+   * R3 §2: /api/broker/fetch entry — the worker credential is a
+   * task-scoped HMAC capability, not the master token. Verify the
+   * signature server-side, then bind the claims to canonical facts:
+   * body identity, the task's selected executor, and — when a governed
+   * task exists — its exact governed_task_id. Only then does the normal
+   * P13 policy chain (authorizeCredentialFetch) run; a capability never
+   * expands policy or P12 authority.
+   */
+  authorizeBrokerFetch(
+    missionId: string,
+    taskId: string,
+    credentialRef: string,
+    capability: string,
+    masterSecret: string,
+  ): { granted: boolean; reason: string } {
+    const claims = verifyBrokerCapability(masterSecret, capability);
+    if (!claims) {
+      this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_BROKER_CAPABILITY");
+      return { granted: false, reason: "FAIL_CLOSED_BROKER_CAPABILITY" };
+    }
+    if (claims.mission_id !== missionId || claims.task_id !== taskId) {
+      this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH");
+      return { granted: false, reason: "FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH" };
+    }
+    const task = this.deps.service.store.tryGet("task", taskId);
+    if (task) {
+      const boundExecutor = task.selected_executor ? String(task.selected_executor) : null;
+      if (boundExecutor && claims.executor_id !== boundExecutor) {
+        this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_BROKER_CAPABILITY_EXECUTOR");
+        return { granted: false, reason: "FAIL_CLOSED_BROKER_CAPABILITY_EXECUTOR" };
+      }
+      const governed = this.deps.service.store
+        .list("governed_task")
+        .filter((g) => String(g.task_id) === taskId);
+      if (governed.length > 0) {
+        const match = governed.some((g) => String(g.governed_task_id) === claims.governed_task_id);
+        if (!match) {
+          this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH");
+          return { granted: false, reason: "FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH" };
+        }
+      } else if (claims.governed_task_id != null) {
+        // The claim names a governed task that does not exist canonically.
+        this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH");
+        return { granted: false, reason: "FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH" };
+      }
+    }
+    return this.authorizeCredentialFetch(missionId, taskId, credentialRef);
   }
 
   private auditSecretDeny(
@@ -638,6 +729,16 @@ export class MissionControl {
 
   secretPolicies(): Array<Record<string, unknown>> {
     return this.deps.service.secretPolicies.listPolicies();
+  }
+
+  /** R3 §3: create-only — colliding identity fails closed, never a
+   *  silent authority rewrite. */
+  createCostPolicy(body: Record<string, unknown>, actor: string) {
+    return this.deps.service.cost.createCostPolicy(body, actor);
+  }
+
+  createCostProfile(body: Record<string, unknown>, actor: string) {
+    return this.deps.service.cost.createCostProfile(body, actor);
   }
 
   upsertCostPolicy(body: Record<string, unknown>, actor: string, expectedVersion?: number) {

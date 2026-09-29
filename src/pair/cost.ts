@@ -207,6 +207,20 @@ export class CostService {
     return saved;
   }
 
+  /** R3 §3: create-only — a colliding canonical identity is a hard
+   *  conflict, never a silent authority rewrite. Use the CAS
+   *  updateCostPolicy path to change an existing policy. */
+  createCostPolicy(input: Record<string, unknown>, actor: string): Record<string, unknown> {
+    const supplied = input.cost_policy_id != null ? String(input.cost_policy_id) : "";
+    if (supplied && this.store.tryGet("cost_policy", supplied)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_COST_POLICY_EXISTS",
+        `${supplied} — use /api/cost-policies/update with expected_version`,
+      );
+    }
+    return this.upsertCostPolicy(input, actor);
+  }
+
   /** R1 §6: an update must never silently create — the id is required
    *  and must resolve to the canonical row. */
   updateCostPolicy(
@@ -298,6 +312,21 @@ export class CostService {
       metadata: { ref_type: refType, ref_id: refId, billing_mode: billingMode },
     });
     return saved;
+  }
+
+  /** R3 §3: create-only — posting an existing (ref_type, ref_id)
+   *  identity must fail closed; the CAS update path owns changes. */
+  createCostProfile(input: Record<string, unknown>, actor: string): Record<string, unknown> {
+    const refType = String(input.ref_type ?? "");
+    const refId = String(input.ref_id ?? "");
+    const id = `CPRO_${refType}_${digest(`${refType}:${refId}`).slice(0, 20)}`;
+    if (this.store.tryGet("cost_profile", id)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_COST_PROFILE_EXISTS",
+        `${refType}:${refId} — use /api/cost-profiles/update with expected_version`,
+      );
+    }
+    return this.upsertCostProfile(input, actor);
   }
 
   /** R1 §6: update resolves the ref identity — it must already exist. */
@@ -427,9 +456,14 @@ export class CostService {
     const mission = params.mission;
     const missionId = String(mission.mission_id);
     const md = (mission.metadata ?? {}) as Record<string, unknown>;
-    const businessId = String(md.business_id ?? "");
-    const department = String(md.department ?? "");
-    const agentId = md.org_agent_id ? String(md.org_agent_id) : "";
+    // R3 §1: the pinned business_context (resolved from the canonical
+    // org_agent at mission start) is the monetary scope authority —
+    // caller-writable business_id/department fields are never trusted.
+    // Missions created before pinning fall back to the legacy fields.
+    const bc = (md.business_context ?? null) as Record<string, unknown> | null;
+    const businessId = String(bc?.business_id ?? md.business_id ?? "");
+    const department = String(bc?.department ?? md.department ?? "");
+    const agentId = bc?.org_agent_id != null ? String(bc.org_agent_id) : md.org_agent_id ? String(md.org_agent_id) : "";
     const routeId = params.task.selected_route_id ? String(params.task.selected_route_id) : null;
     // R1 §1: a PROVEN historical charge (COMMITTED/SETTLED) is idempotently
     // adopted — it is never a new dispatch, so it needs no new authority.

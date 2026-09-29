@@ -319,20 +319,28 @@ export function createMissionControlServer(
         return void json(res, 200, { ok: true, path: dest, bytes: buf.length });
       }
 
-      // Broker fetch: remote executor releases a named credential. The
-      // broker token is TRANSPORT auth only — P13 §25 additionally requires
-      // a valid mission+task binding, a mission-pinned grant, the current
-      // secret_policy, business isolation, scope, P12 executor check, and
-      // a vault value. Every denial audits with its reason; the value
-      // travels only in this response.
+      // Broker fetch: remote executor releases a named credential. R3 §2:
+      // the worker credential is a TASK-SCOPED capability (x-broker-capability)
+      // minted server-side from PAIR_BROKER_TOKEN — the master token itself
+      // is NEVER a valid worker credential. After HMAC verification the
+      // claims must match the body ids and the canonical task binding; then
+      // P13 §25 (mission+task binding, mission pin, current secret_policy,
+      // business isolation, P12 executor check, vault value) still applies.
       if (isBrokerFetch) {
-        if (!deps.broker || !deps.brokerToken || String(req.headers["x-broker-token"] ?? "") !== deps.brokerToken) {
-          return void json(res, 403, { error: "UNAUTHORIZED_BROKER_TOKEN" });
+        const capability = String(req.headers["x-broker-capability"] ?? "");
+        if (!deps.broker || !deps.brokerToken || !capability) {
+          return void json(res, 403, { error: "UNAUTHORIZED_BROKER_CAPABILITY" });
         }
         const missionId = String(body.mission_id ?? "");
         const taskId = String(body.task_id ?? "");
         const credentialName = String(body.credential_name ?? "");
-        const authz = c.authorizeCredentialFetch(missionId, taskId, credentialName);
+        const authz = c.authorizeBrokerFetch(
+          missionId,
+          taskId,
+          credentialName,
+          capability,
+          deps.brokerToken,
+        );
         if (!authz.granted) {
           deps.broker.deny(credentialName, {
             mission_id: missionId || null,
@@ -437,7 +445,9 @@ export function createMissionControlServer(
       }
       // P13 governance mutations — operator + CAS + audited, metadata only.
       if (method === "POST" && p === "/api/cost-policies") {
-        return void json(res, 200, c.upsertCostPolicy(body, `operator:${operator}`));
+        // R3 §3: create-only — an existing identity fails closed; callers
+        // must use the CAS /update path to change authority.
+        return void json(res, 200, c.createCostPolicy(body, `operator:${operator}`));
       }
       if (method === "POST" && p === "/api/cost-policies/update") {
         // R1 §6: split API control fields from the strict policy payload —
@@ -457,7 +467,9 @@ export function createMissionControlServer(
         );
       }
       if (method === "POST" && p === "/api/cost-profiles") {
-        return void json(res, 200, c.upsertCostProfile(body, `operator:${operator}`));
+        // R3 §3: create-only — an existing (ref_type, ref_id) identity
+        // fails closed; callers must use the CAS /update path.
+        return void json(res, 200, c.createCostProfile(body, `operator:${operator}`));
       }
       if (method === "POST" && p === "/api/cost-profiles/update") {
         // R1 §6: `expected_version` is an API control field — never part

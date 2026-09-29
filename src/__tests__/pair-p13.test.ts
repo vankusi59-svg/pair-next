@@ -32,6 +32,7 @@ import {
   MissionScheduler,
   MissionScheduleService,
   MissionSupervisor,
+  mintBrokerCapability,
   PairControlPlane,
   PairEvidenceStore,
   ReconciliationService,
@@ -1613,4 +1614,271 @@ describe("P13-R1.purpose + API control fields", () => {
 
 afterEach(() => {
   delete process.env.PAIR_COST_HALT;
+});
+
+describe("P13-R3.cost: canonical business context", () => {
+  it("COST-R3-A: agent-bound mission without business_id still applies the business hard cap", () => {
+    const { ctx, biz } = makeBizCtx("r3a");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    meteredProfile(ctx, "EXEC_A", 50);
+    ctx.service.cost.upsertCostPolicy(
+      { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "MISSION_LIFETIME", max_microusd: 40, hard_stop: true },
+      "op",
+    );
+    // No caller business_id at all — the canonical agent business must win.
+    const mission = ctx.control.startMission({
+      goal: "g",
+      project_id: ctx.projectId,
+      operator_id: "op",
+      metadata: { org_agent_id: String(ag.agent_id) },
+    });
+    const m2 = ctx.service.getMission(String(mission.mission_id));
+    const bc = (m2.metadata as Record<string, unknown>).business_context as Record<string, unknown>;
+    expect(String(bc.business_id)).toBe(String(b.business_id));
+    ctx.service.transitionMission(String(mission.mission_id), "READY");
+    ctx.service.commitPlan({
+      mission_id: String(mission.mission_id),
+      source: "test",
+      tasks: [{ task_key: "T1", title: "t1", task_instruction: "do", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+      proposal: { tasks: [] },
+    });
+    const m3 = ctx.service.getMission(String(mission.mission_id));
+    expect(() => dispatchOne(ctx, m3)).toThrowError(/FAIL_CLOSED_COST_BUDGET_EXCEEDED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("COST-R3-B: caller department contradicting the canonical agent department fails closed", () => {
+    const { ctx, biz } = makeBizCtx("r3b");
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "engineering", operator_id: "op" });
+    expect(() =>
+      ctx.control.startMission({
+        goal: "g",
+        project_id: ctx.projectId,
+        operator_id: "op",
+        metadata: { org_agent_id: String(ag.agent_id), department: "marketing" },
+      }),
+    ).toThrowError(/FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH/);
+    // A matching department is accepted and canonicalized into the pin.
+    const ok = ctx.control.startMission({
+      goal: "g",
+      project_id: ctx.projectId,
+      operator_id: "op",
+      metadata: { org_agent_id: String(ag.agent_id), department: "engineering" },
+    });
+    const bc = ((ok.metadata as Record<string, unknown>).business_context ?? {}) as Record<string, unknown>;
+    expect(String(bc.department)).toBe("engineering");
+    expect(String(bc.business_id)).toBe(String(b.business_id));
+  });
+
+  it("COST-R3-C: agent/business/project mismatches fail closed at mission start", () => {
+    const { ctx, biz } = makeBizCtx("r3c");
+    const b1 = makeBiz(biz, ctx.projectId, "B1");
+    const b2 = makeBiz(biz, ctx.projectId, "B2");
+    const ag = biz.createOrgAgent({ business_id: String(b1.business_id), title: "eng", department: "eng", operator_id: "op" });
+    // Supplied business_id ≠ agent's canonical business → fail closed.
+    expect(() =>
+      ctx.control.startMission({
+        goal: "g",
+        project_id: ctx.projectId,
+        operator_id: "op",
+        metadata: { org_agent_id: String(ag.agent_id), business_id: String(b2.business_id) },
+      }),
+    ).toThrowError(/FAIL_CLOSED_(BUSINESS_CONTEXT_MISMATCH|AGENT_BUSINESS_MISMATCH|AGENT_CONTRACT_SCOPE)/);
+    // Agent's canonical business project ≠ mission project → fail closed.
+    const otherProject = ctx.service.createProject({ name: "other", root_location: ctx.workspace });
+    expect(() =>
+      ctx.control.startMission({
+        goal: "g",
+        project_id: String(otherProject.project_id),
+        operator_id: "op",
+        metadata: { org_agent_id: String(ag.agent_id) },
+      }),
+    ).toThrowError(/FAIL_CLOSED_(SECRET_CROSS_BUSINESS|AGENT_CONTRACT_SCOPE|BUSINESS_CONTEXT_MISMATCH|AGENT_PROJECT_DENIED)/);
+    // A non-business mission with no binding still works.
+    const free = ctx.control.startMission({ goal: "g", project_id: ctx.projectId, operator_id: "op" });
+    expect(free.mission_id).toBeTruthy();
+  });
+});
+
+describe("P13-R3.broker: task-scoped capability", () => {
+  async function brokerServerCtx(name: string) {
+    const { ctx, biz } = makeBizCtx(name);
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    secretPolicy(ctx, String(b.business_id), "openai");
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
+    const broker = makeBroker(ctx);
+    broker.upsert({ name: "openai", value: SENTINEL, domains: ["api.openai.com"], kind: "token" });
+    const server = createMissionControlServer({ control: ctx.control, broker, brokerToken: "master-secret" });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const cap = (over: Partial<{ mission: string; task: string; exec: string }> = {}) =>
+      mintBrokerCapability("master-secret", {
+        mission_id: over.mission ?? String(mission.mission_id),
+        task_id: over.task ?? String(task.task_id),
+        governed_task_id: null,
+        executor_id: over.exec ?? "EXEC_A",
+      });
+    const fetchCred = (hdrs: Record<string, string>, body: Record<string, unknown>) =>
+      fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...hdrs },
+        body: JSON.stringify({ mission_id: mission.mission_id, task_id: task.task_id, ...body }),
+      });
+    return { ctx, mission, task, server, cap, fetchCred };
+  }
+
+  it("SECRET-R3-A/B/C/D: scoped capability binds exactly; master token and tampering denied", async () => {
+    const { ctx, mission, task, server, cap, fetchCred } = await brokerServerCtx("r3s");
+    try {
+      // A. Task-scoped token + matching ids → released when policy permits.
+      const ok = await fetchCred({ "x-broker-capability": cap() }, { credential_name: "openai" });
+      expect(ok.status).toBe(200);
+      expect(((await ok.json()) as Record<string, unknown>).value).toBe(SENTINEL);
+
+      // B1. Capability minted for different ids + this task's ids → deny.
+      const other = await fetchCred(
+        { "x-broker-capability": cap({ task: "TSK_other" }) },
+        { credential_name: "openai" },
+      );
+      expect(other.status).toBe(403);
+      expect(JSON.stringify(await other.json())).toContain("FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH");
+
+      // B2. Capability for a different executor than the canonically bound one → deny.
+      const wrongExec = await fetchCred(
+        { "x-broker-capability": cap({ exec: "EXEC_B" }) },
+        { credential_name: "openai" },
+      );
+      expect(wrongExec.status).toBe(403);
+      expect(JSON.stringify(await wrongExec.json())).toContain("FAIL_CLOSED_BROKER_CAPABILITY_EXECUTOR");
+
+      // C. Tampered capability → deny.
+      const forged = await fetchCred(
+        { "x-broker-capability": `${cap().slice(0, -4)}AAAA` },
+        { credential_name: "openai" },
+      );
+      expect(forged.status).toBe(403);
+      expect(JSON.stringify(await forged.json())).toContain("FAIL_CLOSED_BROKER_CAPABILITY");
+
+      // D. The master token alone is not a worker credential.
+      const master = await fetchCred({ "x-broker-token": "master-secret" }, { credential_name: "openai" });
+      expect(master.status).toBe(403);
+      expect(JSON.stringify(await master.json())).toContain("UNAUTHORIZED_BROKER_CAPABILITY");
+
+      // Every denial above was audited.
+      const denials = ctx.store
+        .listEvidence(String(mission.mission_id))
+        .filter((e) => (e.payload as Record<string, unknown>).kind === "CREDENTIAL_RELEASE_DENIED");
+      expect(denials.length).toBeGreaterThanOrEqual(3);
+      void task;
+    } finally {
+      server.close();
+    }
+  });
+
+  it("SECRET-R3-E: capability + master secret never leak into canonical state", async () => {
+    const { ctx, mission, server, cap, fetchCred } = await brokerServerCtx("r3leak");
+    const capability = cap();
+    try {
+      const ok = await fetchCred({ "x-broker-capability": capability }, { credential_name: "openai" });
+      expect(ok.status).toBe(200);
+      const dump = JSON.stringify({
+        entities: ctx.store.list("cost_reservation"),
+        tasks: ctx.store.list("task"),
+        missions: ctx.store.list("mission"),
+        evidence: ctx.store.listEvidence(String(mission.mission_id)),
+        events: ctx.store.listEvents(),
+      });
+      for (const needle of [SENTINEL, "master-secret", capability]) {
+        expect(dump).not.toContain(needle);
+      }
+      expect(() => ctx.store.verifyIntegrity()).not.toThrow();
+    } finally {
+      server.close();
+    }
+  });
+});
+
+describe("P13-R3.api: create-only endpoints + CAS update", () => {
+  it("API-R3: create fails closed on existing identity; update keeps CAS", async () => {
+    const { ctx, biz } = makeBizCtx("r3api");
+    const b = makeBiz(biz, ctx.projectId);
+    const server = createMissionControlServer({ control: ctx.control });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const hdr = { "content-type": "application/json", "x-operator-id": "op" };
+    const post = (p: string, body: Record<string, unknown>) =>
+      fetch(`http://127.0.0.1:${port}${p}`, { method: "POST", headers: hdr, body: JSON.stringify(body) });
+    try {
+      // A. Create new profile succeeds.
+      const created = await post("/api/cost-profiles", {
+        ref_type: "route", ref_id: "RTE_R3", billing_mode: "METERED_API", reserve_microusd: 25, source: "op",
+      });
+      expect(created.status).toBe(200);
+      const prof = (await created.json()) as Record<string, unknown>;
+
+      // B. Same identity again → EXISTS fail closed; row unchanged.
+      const dupe = await post("/api/cost-profiles", {
+        ref_type: "route", ref_id: "RTE_R3", billing_mode: "FREE", source: "op",
+      });
+      expect(dupe.status).toBe(409);
+      expect(JSON.stringify(await dupe.json())).toContain("FAIL_CLOSED_COST_PROFILE_EXISTS");
+      const still = ctx.store.get("cost_profile", String(prof.cost_profile_id));
+      expect(String(still.billing_mode)).toBe("METERED_API");
+      expect(Number(still.reserve_microusd)).toBe(25);
+
+      // C. Create policy carrying an existing cost_policy_id → fail closed.
+      const pol = ctx.service.cost.upsertCostPolicy(
+        { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 100, hard_stop: true },
+        "op",
+      );
+      const polDupe = await post("/api/cost-policies", {
+        cost_policy_id: String(pol.cost_policy_id),
+        business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id),
+        period: "DAY", max_microusd: 1, hard_stop: true,
+      });
+      expect(polDupe.status).toBe(409);
+      expect(JSON.stringify(await polDupe.json())).toContain("FAIL_CLOSED_COST_POLICY_EXISTS");
+      expect(Number(ctx.store.get("cost_policy", String(pol.cost_policy_id)).max_microusd)).toBe(100);
+
+      // Fresh policy create (no id) still works.
+      const newPol = await post("/api/cost-policies", {
+        business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id),
+        period: "WEEK", max_microusd: 500, hard_stop: true,
+      });
+      expect(newPol.status).toBe(200);
+
+      // D. CAS update with the correct expected_version succeeds.
+      const profNow = ctx.store.get("cost_profile", String(prof.cost_profile_id));
+      const upd = await post("/api/cost-profiles/update", {
+        ref_type: "route", ref_id: "RTE_R3", billing_mode: "METERED_API", reserve_microusd: 30,
+        expected_version: Number(profNow.version),
+      });
+      expect(upd.status).toBe(200);
+      expect(Number(ctx.store.get("cost_profile", String(prof.cost_profile_id)).reserve_microusd)).toBe(30);
+
+      // E. A stale concurrent update loses: first writer wins, second gets
+      // VERSION_CONFLICT — one-winner CAS preserved.
+      const vNow = Number(ctx.store.get("cost_profile", String(prof.cost_profile_id)).version);
+      const w1 = await post("/api/cost-profiles/update", {
+        ref_type: "route", ref_id: "RTE_R3", billing_mode: "METERED_API", reserve_microusd: 31, expected_version: vNow,
+      });
+      const w2 = await post("/api/cost-profiles/update", {
+        ref_type: "route", ref_id: "RTE_R3", billing_mode: "METERED_API", reserve_microusd: 32, expected_version: vNow,
+      });
+      expect(w1.status).toBe(200);
+      expect(w2.status).toBe(409);
+      expect(JSON.stringify(await w2.json())).toContain("FAIL_CLOSED_VERSION_CONFLICT");
+      expect(Number(ctx.store.get("cost_profile", String(prof.cost_profile_id)).reserve_microusd)).toBe(31);
+    } finally {
+      server.close();
+    }
+  });
 });

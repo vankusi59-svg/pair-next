@@ -26,6 +26,7 @@ import {
   ReconciliationService,
   RecoveryController,
   createMissionControlServer,
+  mintBrokerCapability,
 } from "../pair/index.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11-"));
@@ -381,10 +382,18 @@ describe("P11 §4 credential broker", () => {
     await new Promise<void>((r) => server.listen(0, r));
     const port = (server.address() as { port: number }).port;
     try {
+      // R3 §2: worker credential is a task-scoped capability, not the
+      // master token — mint one bound to the phantom mission.
+      const cap = mintBrokerCapability("btok", {
+        mission_id: "MSN_phantom",
+        task_id: "TSK_phantom",
+        governed_task_id: null,
+        executor_id: "EXEC_A",
+      });
       const res = await fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-broker-token": "btok" },
-        body: JSON.stringify({ credential_name: "k", mission_id: "MSN_phantom" }),
+        headers: { "content-type": "application/json", "x-broker-capability": cap },
+        body: JSON.stringify({ credential_name: "k", mission_id: "MSN_phantom", task_id: "TSK_phantom" }),
       });
       expect(res.status).toBe(404);
       const denied = ctx.store.listEvents().filter((e) => e.event_type === "CREDENTIAL_DENIED");

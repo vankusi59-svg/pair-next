@@ -123,11 +123,22 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `FAIL_CLOSED_COST_UNKNOWN` (soft-policy UNKNOWN stays unpriced).
   METERED_API boundedness now requires positive reserve OR positive fixed
   with no rates — `fixed=0` no longer fake-bounds.
-- Classification: **`P13_REMEDIATED_R2_PENDING_AUDIT`** on the P13
+- **R3 remediation** (same PR): `startMission` pins a canonical
+  `business_context` from the resolved org_agent (business/department
+  must match or fail closed; omitted business_id inherits the agent's);
+  CostService consumes the pin. Broker token is no longer a cross-task
+  bearer — workers carry `bcap1.<payload>.<hmac>` capabilities minted
+  server-side, bound to mission/task/governed_task/executor, verified at
+  `/api/broker/fetch` (`x-broker-capability`; master alone → 403).
+  `POST /api/cost-policies|cost-profiles` are now create-only
+  (`FAIL_CLOSED_COST_POLICY_EXISTS` / `FAIL_CLOSED_COST_PROFILE_EXISTS`);
+  CAS `/update` + `expected_version` unchanged.
+- Classification: **`P13_REMEDIATED_R3_PENDING_AUDIT`** on the P13
   branch/PR; evidence in
-  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 52/52,
-  P12 71/71, P11 103/103, N20 1910/0, N22 1908/2env, typecheck+build PASS,
-  audit 0 high, worker races PASS, verifyIntegrity clean. NOT merged.
+  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 58/58,
+  P12 71/71, P11 103/103, P9 79/79, N20 1916/0, N22 1914/2env,
+  typecheck+build PASS, audit 0 high, worker races PASS, verifyIntegrity
+  clean. NOT merged.
 
 ## Not yet
 

@@ -525,3 +525,106 @@ FREE/UNMETERED.
 
 **`P13_REMEDIATED_R2_PENDING_AUDIT`** — pushed to the existing P13 PR;
 DO NOT MERGE; DO NOT START P14/P15.
+
+---
+
+# REMEDIATION R3 — canonical business context + task-scoped broker capability + create/update CAS closure
+
+R3 closes three findings on the existing PR: caller-influenced business
+scope, the cross-task bearer broker token, and upsert semantics on the
+create endpoints.
+
+## R3.1 §1 — canonical business context
+
+**Defect.** CostService derived business_id/department/org_agent_id from
+caller-writable `mission.metadata`. An agent-bound mission could omit
+business_id (escaping every business-scoped cap) or forge department
+(escaping department caps).
+
+**Fix.** `startMission` resolves the canonical `org_agent` row first:
+`business_id` and `department` are taken from the agent, supplied values
+must match exactly (`FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH`), and a
+missing business_id inherits the agent's business — never "no business
+budget". The resolved context is pinned immutably as
+`mission.metadata.business_context = {business_id, org_agent_id,
+department, project_id, provenance, pinned_at}`, and the pre-existing
+business-exists + project-match + agent-membership checks run against it.
+`CostService.assertAndReserve` consumes the pinned `business_context`
+(falling back to legacy metadata fields only for pre-pin missions);
+non-business missions without any binding are preserved.
+
+## R3.2 §2 — task-scoped broker capability
+
+**Defect.** `DevinExecutor` injected the global `PAIR_BROKER_TOKEN` into
+every task prompt; `/api/broker/fetch` verified the token but not that the
+caller owned the supplied mission/task ids — mission/task ids are not
+secrets.
+
+**Fix.** New `broker-capability.ts`: `mintBrokerCapability` /
+`verifyBrokerCapability` issue `bcap1.<payload>.<hmac-sha256>` claims
+bound to `{mission_id, task_id, governed_task_id, executor_id,
+issued_at}`, keyed on the master `PAIR_BROKER_TOKEN`. The executor mints
+server-side at prompt-build time; only the capability reaches the remote
+worker. `/api/broker/fetch` now requires `x-broker-capability`;
+`MissionControl.authorizeBrokerFetch` verifies the signature, binds
+claims to body ids + the canonical `selected_executor` + (when one
+exists) the exact `governed_task_id`, then runs the unchanged
+authorizeCredentialFetch policy chain — a capability never expands secret
+policy or P12 authority. Master token alone → 403
+`UNAUTHORIZED_BROKER_CAPABILITY`. The capability is never persisted in
+the PairEvidenceStore (sentinel scan covers it). No expiry claim —
+restart/recovery semantics stay deterministic; revocation rides the
+existing policy checks.
+
+## R3.3 §3 — create endpoints are create-only
+
+`POST /api/cost-policies` → `createCostPolicy`
+(`FAIL_CLOSED_COST_POLICY_EXISTS` when `cost_policy_id` collides) and
+`POST /api/cost-profiles` → `createCostProfile`
+(`FAIL_CLOSED_COST_PROFILE_EXISTS` when the deterministic
+`(ref_type, ref_id)` identity exists, pointing callers at the CAS
+`/update` path). Updates still require `expected_version` →
+`FAIL_CLOSED_VERSION_CONFLICT` on stale writes; strict field validation
+unchanged.
+
+## R3.4 R3 test matrix (6 new tests, P13 now 58)
+
+- COST-R3-A: agent-bound mission without `business_id` → pinned
+  `business_context.business_id` = agent's business; the business hard
+  cap applies and denies dispatch.
+- COST-R3-B: `department: "marketing"` vs agent `engineering` →
+  `FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH`; matching dept accepted and
+  canonicalized.
+- COST-R3-C: supplied business ≠ agent business, and canonical-business
+  project ≠ mission project → fail closed; unbound mission still works.
+- SECRET-R3-A..D: scoped capability release PASS; cross-task capability
+  → `FAIL_CLOSED_BROKER_CAPABILITY_MISMATCH`; wrong executor →
+  `FAIL_CLOSED_BROKER_CAPABILITY_EXECUTOR`; tampered token →
+  `FAIL_CLOSED_BROKER_CAPABILITY`; master token alone → 403.
+- SECRET-R3-E: sentinel/capability/master scan of entities + evidence +
+  events — nothing leaks; `verifyIntegrity` clean.
+- API-R3: profile create PASS → duplicate identity 409
+  `FAIL_CLOSED_COST_PROFILE_EXISTS` (row unchanged); policy create with
+  existing `cost_policy_id` → `FAIL_CLOSED_COST_POLICY_EXISTS`; CAS
+  update PASS; stale second writer → `FAIL_CLOSED_VERSION_CONFLICT`.
+- Existing p9/p11 broker-fetch tests updated to mint capabilities (the
+  auth model changed intentionally; coverage preserved: unknown mission
+  → 404, MC bearer/master token → 403, legit release → 200).
+
+## R3.5 Validation evidence
+
+- `pnpm run typecheck` PASS · `pnpm run build` PASS
+- P13 **58/58** · P12 **71/71** · P11 **103/103** · P9 **79/79**
+- Node 22.23.3 `pnpm test`: **1914 pass / 2 fail / 24 skip** — same two
+  documented env-dependent p5 executor probes.
+- Node 20.20.2 `npx vitest run`: **1916 pass / 0 fail / 24 skip**
+  (better-sqlite3@11.10.0 ABI rebuilt per Node both ways).
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**.
+- Worker races PASS: cost last-cap, cost recovery convergence, secret
+  CAS, all P11/P12 concurrency tests.
+- `verifyIntegrity` clean (asserted inside SECRET-R3-E).
+
+## R3.6 Classification
+
+**`P13_REMEDIATED_R3_PENDING_AUDIT`** — pushed to the existing P13 PR;
+DO NOT MERGE; DO NOT START P14/P15.

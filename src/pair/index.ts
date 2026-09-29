@@ -46,6 +46,7 @@ export * from "./mission-observability.js";
 export * from "./mission-control.js";
 export * from "./mission-control-server.js";
 export * from "./credential-broker.js";
+export * from "./broker-capability.js";
 export * from "./business.js";
 export * from "./agent-contract.js";
 export * from "./cost.js";
