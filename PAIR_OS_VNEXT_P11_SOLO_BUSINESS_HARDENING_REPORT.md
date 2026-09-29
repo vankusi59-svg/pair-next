@@ -1,158 +1,180 @@
-# PAIR OS vNext — P11 SOLO BUSINESS HARDENING V1 REPORT
+# PAIR OS vNext — P11 SOLO BUSINESS HARDENING V1 REPORT (REMEDIATION R1)
 
-## §10.1 Starting HEAD
+## §10.0 Classification history
 
-`73c44b7865e5041f7a127dc24ac38f113138abc9` — exact match with the mandated
-baseline (post-PR#3 main: business layer v0.5 + experience wiring).
+| Round | PR head | Result |
+|---|---|---|
+| P11 initial | `ce57e9c7cf54f7af3bc8a87004ff92029a14ce25` | Classified `P11_OFFICIAL_FINAL_PASS` by the implementing session — **overturned by independent audit → `P11_BLOCKED`**. That classification was wrong: the audit's concurrency/crash-path findings were real. This report replaces it. |
+| P11 REMEDIATION R1 | `fd470fa690fabce6c0977875bb5a897ea0d326e5` | See §13 completion contract below. |
 
-## §10.2 Files changed
+Starting baseline for the phase: `73c44b7865e5041f7a127dc24ac38f113138abc9`
+(post-PR#3 main). The R1 work landed on the existing PR #4 — no merge, no
+new PR, no P12+ work.
+
+## §10.1 Independent audit findings and root causes
+
+1. **Crash window in work-item→mission linkage.** Root cause: the
+   IN_PROGRESS write and the mission creation were two independent writes
+   with no durable intent between them. A crash after `startMission` but
+   before the backlink left a canonical mission with no board reference;
+   the catch-all rollback could also return an item to an openable state
+   while its mission was alive — and nothing tied a retry to the original
+   intent, so re-opens could mint duplicates. (R1 §1)
+2. **`store.put` was not a real CAS.** Root cause: SELECT version →
+   compare → UPSERT across two round-trips; two connections could both
+   pass the check and both write. (R1 §2)
+3. **Budget gate was count-then-create.** Root cause: `enforceBudgets`
+   counted missions, then `openWorkItem` created one — no atomicity, and
+   nothing reserved capacity between check and create. Concurrent opens at
+   max-1 could both pass. (R1 §3)
+4. **Block/reopen semantics allowed overlapping missions.** Root cause:
+   `blockWorkItem` was a pure status flag — it never paused or cancelled
+   the linked mission — and `openWorkItem` on a reopened item simply
+   appended another mission while the first was still live. (R1 §4)
+5. **`/api/work-items/:id/cancel` returned 200 without cancelling
+   anything** — it called `syncWorkItem`, which is read-only when the
+   item is IN_PROGRESS with no terminal mission. (R1 §5)
+6. **Routine projection lacked business isolation.** Root cause: the
+   dedup/projection matched missions on `metadata.schedule_id` only — and
+   `fireDue` never propagated schedule metadata (incl. `business_id`)
+   into the mission at all, so a foreign-business or corrupted mission
+   referencing the schedule could project. (R1 §6)
+7. **Routine projection dedup was not atomic.** Root cause: random
+   work-item ids + a covered-set scan — two projectors on two connections
+   could both project the same mission. (R1 §7)
+8. **Routines bypassed business budgets.** Root cause: schedule fires went
+   straight through `startMission` with no business-context metadata and
+   no budget gate. (R1 §8)
+9. **CI gaps**: no `pnpm run build` step, no focused P11 step. (R1 §9)
+10. **The previous report's classification was premature** — documented
+    here rather than deleted. (R1 §10)
+
+## §10.2 Remediation — files changed in this round
 
 | File | Change |
 |---|---|
-| `src/pair/business.ts` | `WORK_ITEM_TRANSITIONS` legal-transition map + `assertWorkItemTransition`; `openWorkItem` reordered (IN_PROGRESS+claim write under version lock **before** `startMission`, with rollback on failure); `releaseClaim` requires `claim_token` on live claims; `assignWorkItem` rejects items actively claimed by another agent; `createBudgetPolicy` validates `scope_id` (agent exists-in-business / department has agents); `createRoutine` requires assignee ACTIVE. |
-| `src/pair/credential-broker.ts` | New `deny()` — audits rejected fetch attempts (e.g. unknown mission_id) as `CREDENTIAL_DENIED`. |
-| `src/pair/mission-control-server.ts` | `/api/work-items/:id/release` passes `claim_token`; `/api/broker/fetch` audits the unknown-mission 404 path via `broker.deny()`. |
-| `src/__tests__/pair-p11.test.ts` | **New** — 22 regression tests (see §7). |
-| `src/__tests__/pair-p9.test.ts` | Claim-release test updated to the hardened contract (release requires `claim_token`); adds the negative assertion. Not weakened — strengthened. |
-| `README.md` | Rewritten: PAIR Next identity, canonical flow, release status, live-stack quick start. No longer presents the repo as Conway Automaton. |
-| `ARCHITECTURE.md` | Rewritten to describe the actual PAIR Next control plane (modules, live stack, P11 invariants). |
-| `DOCUMENTATION.md` | Banner marking it upstream Conway Automaton reference. |
-| `CURRENT_STATE.md` | **New** — official-release vs current-main distinction + post-V1 delta. |
-| `.github/workflows/ci.yml` | Test timeout (exit 124) now fails honestly (was `exit 0` = fake PASS); `pnpm audit --audit-level=high` is a real gate (was `|| true`). |
-| `package.json` / `apps/mission-control-ui/package.json` / `pnpm-lock.yaml` | `simple-git ^3.36.0`, `vitest ^3.2.6`, `@playwright/test ^1.55.1`, pnpm overrides pinning patched `js-yaml/nanoid/postcss/rollup/ws/vite` (audit 38→9 vulns, 0 high/critical). |
-| `.agents/skills/testing-pair-mission-control/SKILL.md` | Live-stack testing skill (previously authored, now tracked). |
+| `src/pair/store.ts` | `put()` rewritten as **atomic CAS**: one conditional `UPDATE … WHERE version=?` (predicate evaluated under the SQLite writer lock against the latest committed row), and create via `INSERT … ON CONFLICT DO NOTHING` — a lost create-race deterministically becomes `FAIL_CLOSED_VERSION_CONFLICT`. `busy_timeout=5000` so a racing writer waits for the winner's commit instead of erroring. New `store.immediate(fn)` = `BEGIN IMMEDIATE … COMMIT/ROLLBACK` for cross-statement atomicity. Hash verification, append-only events and canonical-payload semantics preserved. |
+| `src/pair/business.ts` | (a) `openWorkItem` commits a **durable open intent** (`pending_open_id`/`pending_open_at`) before `startMission`; missions carry `metadata.work_item_open_id` + `work_item_id`. Catch path **reconciles**: finds the intent's mission and links it (`WORK_ITEM_OPEN_RECONCILED`) instead of rolling back over a live mission; rollback to the pre-open state happens only when provably no mission exists (`WORK_ITEM_OPEN_ROLLED_BACK`, audited). Rejects reopen while the last linked mission is non-terminal (`FAIL_CLOSED_MISSION_ACTIVE`). (b) New `reconcileOpenIntent`/`reconcileOpenIntents` — board() sweeps stale pending intents (>60 s grace) and either links the orphan mission or rolls the item back to READY. (c) **`reserveBudget`** — `BEGIN IMMEDIATE` txn: expire stale HELD reservations, count missions + HELD per scope/period, insert one HELD `budget_reservation` in the same commit; `consume`/`release` settle on outcome; `BUDGET_EXCEEDED` is emitted *outside* the txn so refused opens stay audited (in-txn events rolled back — caught by tests). (d) `blockWorkItem` pauses the live linked mission via `MissionControl.pauseMission` first. (e) New `cancelWorkItem` — real governed cancel via `MissionControl.cancelMission` + CANCELLED sync. (f) Routine schedule metadata now carries `business_id`/`department`/`org_agent_id`; `BusinessLayer` installs `schedules.preflight` so business-originated fires pass the same atomic budget gate. (g) Routine projection requires `schedule_id` **and** `business_id` match, and uses deterministic ids `WI_RT_<sha256(...)[:24]>` — concurrent projectors compute the same id and the loser's create conflicts atomically. |
+| `src/pair/mission-schedule.ts` | `fireDue` now merges `s.metadata` into the fired mission's metadata (was dropped entirely) and exposes `preflight` — a veto hook returning a settle token consumed on mission creation / released on error. |
+| `src/pair/mission-control-server.ts` | `/api/work-items/:id/cancel` → `biz.cancelWorkItem` (was `syncWorkItem` — a no-op that returned 200). |
+| `src/__tests__/pair-p11-r1.test.ts` | **New** — 25 tests, below. |
+| `src/__tests__/pair-p9.test.ts` | Two fixtures aligned to the now-required invariants (crafted routine-fired mission must carry `business_id`; nothing weakened — the invariant the fixtures now satisfy is the audit's demand). |
+| `.github/workflows/ci.yml` | `pnpm run build` step added; focused step `vitest run src/__tests__/pair-p11*.test.ts` added on both Node 20 and 22; all timeouts remain real failures. |
+| `src/pair/credential-broker.ts` | (unchanged from initial round — `deny()` audit already in place) |
 
-## §10.3 Defects found and root causes
+Earlier-round hardening retained: transition map, claim-token release,
+budget scope validation, routine-assignee ACTIVE check, broker deny audit,
+honest CI timeout/audit gates, dependency remediation to 0 high/critical,
+README/ARCHITECTURE/CURRENT_STATE rewrite.
 
-1. **Duplicate dispatch window in `openWorkItem` (P11 §2.D).** Root cause:
-   check-then-act ordering — the mission was minted *before* the work item
-   transitioned to IN_PROGRESS, so a second concurrent open (double-click,
-   retry, crash replay) passed the state gate and created a second governed
-   mission. Fixed by writing IN_PROGRESS+claim under the optimistic version
-   lock *first*; the second opener now hits `FAIL_CLOSED_WORK_ITEM_TRANSITION`
-   and cannot mint a mission. Budget refusal/startMission failure roll the
-   marker back.
-2. **Claim release unauthenticated.** `releaseClaim` dropped any live claim
-   without a token — any caller could strip ownership. Fixed: live claims
-   require the matching `claim_token`; expired claims stay releasable
-   (reclaim semantics). Server route forwards `body.claim_token`.
-3. **`createBudgetPolicy` accepted dangling/cross-business `scope_id`.**
-   Agent scope now must resolve to an org_agent *of that business*;
-   department scope must have ≥1 agent in the business. Fail closed.
-4. **`createRoutine` skipped the assignee ACTIVE check** (work items had it,
-   routines didn't). Fixed.
-5. **`assignWorkItem` on an actively-claimed item** left the new assignee
-   stranded behind a foreign 30-min claim. Now `FAIL_CLOSED_WORK_ITEM_CLAIMED`.
-6. **Broker fetch probed with a fake `mission_id` left no audit trace** —
-   the 404 short-circuited before `release()`'s audit. Fixed via `deny()`.
-7. **CI fake-PASS**: `timeout` exit 124 was converted to `exit 0` (masked
-   hangs); `pnpm audit --audit-level=high || true` could never fail. Both
-   fixed; audit debt remediated to zero high/critical.
-8. **Docs drift**: README/ARCHITECTURE/DOCUMENTATION described upstream
-   Conway Automaton only; nothing described the PAIR Next control plane.
-   Rewritten; RELEASE.json preserved untouched.
+## §10.3 Test evidence (local, Node 22, `pnpm test`)
 
-## §10.4 Invariants verified
+- `src/__tests__/pair-p11-r1.test.ts` — **25/25 PASS**:
+  - §2 atomic CAS ×5 — same-entity concurrent update (two connections:
+    exactly one wins, loser gets `FAIL_CLOSED_VERSION_CONFLICT`);
+    concurrent create of same id; stale writer after first wins;
+    simultaneous claims across connections; integrity verification clean.
+  - §1 crash-safe linkage ×7 — fault injection **before** mission creation
+    (rolls back, no mission, audited); **immediately after** mission
+    creation (reconciles + links, `WORK_ITEM_OPEN_RECONCILED`, no
+    duplicate, no rollback-over-live); **at the backlink write** (repair
+    links mission); **after** the backlink write (no rollback over linked
+    mission); **restart sweep** links an orphaned mission by
+    `work_item_open_id`; **restart sweep** rolls back a pending intent
+    when provably no mission exists; double-open on two connections mints
+    exactly one mission.
+  - §3 budget reservation ×4 — two opens at business max=1 (one mission;
+    loser `FAIL_CLOSED_BUDGET_EXCEEDED` + item rolled back + event
+    audited); HELD reservation on one connection blocks an open on the
+    other; failed open releases capacity (exactly one unit consumed);
+    stale HELD reservation expires and frees the slot.
+  - §4–§5 block/reopen/cancel ×5 — IN_PROGRESS block then reopen cannot
+    create a second mission while the first is live; terminal last mission
+    → legitimate reopen appends exactly one new mission; `cancelWorkItem`
+    cancels the live mission through MissionControl and drops the item to
+    CANCELLED; READY-item cancel without a mission; **E2E** `POST
+    /api/work-items/:id/cancel` over a real server — 200 only when the
+    mission + item are actually CANCELLED.
+  - §6–§8 routines ×4 — foreign `business_id` mission referencing the
+    routine's schedule does not project; one fired mission → exactly one
+    projected item across repeated + cross-connection `board()` calls
+    (deterministic `WI_RT_*` id); routine fire vetoed when business budget
+    consumed; routine fire under budget creates a business-scoped mission
+    carrying schedule metadata with the reservation consumed exactly once.
+- `src/__tests__/pair-p11.test.ts` — **22/22 PASS**.
+- `src/__tests__/pair-p9.test.ts` — **79/79 PASS**.
+- Full suite: **1729 passed, 24 skipped, 2 failed** — the 2 failures are
+  `pair-p5.test.ts` DSH/CODEX "stock probe must be unavailable" tests;
+  they fail only on this dev box (dsh/codex binaries present in
+  `~/.nvm/bin`; the test strips only `.local` from PATH). Pre-existing and
+  environment-dependent — they pass on CI runners.
+- `pnpm run typecheck` — clean. `pnpm run build` — clean.
 
-- **A. Scope integrity** — cross-business `reports_to`, objective parent,
-  work-item objective/assignee, budget scope, routine assignee all rejected
-  fail-closed (tests: `scope1–scope4`). `reports_to`/`parent_objective_id`
-  cycles are impossible by construction — there is no reparent/mutate
-  endpoint; parentage is set only at create.
-- **B. Lifecycle** — explicit `WORK_ITEM_TRANSITIONS`; open from
-  IN_PROGRESS/DONE/CANCELLED rejected; governed reopen only via `openWorkItem`
-  from BLOCKED/READY/BACKLOG (tests: `life1–life2`).
-- **C. Claim integrity** — single live owner; expired reclaim; live claim
-  release requires token; claim released on terminal sync; assigning a
-  claimed item rejected (tests: `claim1–claim3`).
-- **D. Single dispatch** — double-open mints exactly one mission; budget
-  refusal rolls back to prior status with zero missions leaked
-  (tests: `dup1–dup2`).
-- **E. Routine projection** — ≤1 work item per fired mission, deduped by
-  `mission_id`, stable across re-sync and across a fresh BusinessLayer on
-  the same store (tests: `rt1–rt2`).
+## §10.4 Security audit
 
-## §10.5 Tests
+`pnpm audit --audit-level=high` → **9 vulnerabilities: 1 low, 8 moderate,
+0 high, 0 critical** (exit 0, real gate). Same count as the
+pre-remediation report — the R1 work touched no dependencies. Not claimed
+as zero — 9 moderate/low advisories remain (dev/build toolchain paths).
 
-`src/__tests__/pair-p11.test.ts` — 22 tests covering: cross-business
-rejection, invalid hierarchy, legal/illegal transitions, claim
-contention/expiry/stale-token, duplicate-open, mission↔work-item linkage,
-routine dedup + restart, budget boundary/concurrent hard-stop, credential
-vault perms + leak + unknown-mission audit, evidence integrity, docs
-consistency.
+## §10.5 Authority preservation (R1 §12)
 
-Results: **22/22 PASS**.
+MissionControl remains the canonical mission-action authority
+(`startMission`/`pauseMission`/`cancelMission`); MissionRouter,
+GovernedTaskGate, ApprovalQueue, RecoveryController, ReconciliationService
+and Verified-Experience-advisory-only are unchanged. BusinessLayer still
+never dispatches DSH/Codex/Devin directly — it only calls
+`control.startMission`. No P12–P15 scope touched (no token/USD accounting,
+no exchange connectors, no autopilot executor, no public intake).
 
-## §10.6 Suite / typecheck / build / audit / smoke results
+## §10.6 Limitations
 
-- `pnpm test` (vitest 3.2.7): **1704 passed / 2 failed / 24 skipped**
-  (71 files). The 2 failures are `pair-p5.test.ts` DSH/CODEX "stock probe
-  must be unavailable" tests — environment-dependent: this dev box has
-  `dsh`/`codex` binaries on PATH outside `.local` (the test only strips
-  `.local`), so stock adapters probe as available. They pass on CI
-  (GitHub runner lacks those binaries). Not weakened, not caused by P11.
-- `pnpm run typecheck`: clean (tsc --noEmit, 0 errors).
-- `pnpm run build`: clean (tsc + all workspace builds incl. UI).
-- `pnpm audit --audit-level=high`: **0 high/critical** (was 17 high +
-  2 critical; remaining 9 are moderate/low dev-tooling advisories).
-- Smoke: HTTP server end-to-end exercised by `createMissionControlServer`
-  tests (business routes + broker fetch incl. denial audit). Live stack
-  on this box runs the pre-change code; restart smoke deferred to deploy.
+- Reservation expiry uses a 10-minute TTL (`PAIR_BUDGET_RESERVATION_MS`);
+  a crash between reserve and create frees the slot on the next reserve —
+  bounded, audited, never permanent.
+- Open-intent reconcile uses a 60 s grace (`PAIR_OPEN_RECONCILE_GRACE_MS`)
+  before the sweep repairs a pending marker; in-flight opens complete far
+  faster, and the in-process catch path reconciles immediately without the
+  grace wait.
+- `openWorkItem`'s success path is fully sequential per item — the pending
+  intent + version lock makes concurrent opens of the *same* item
+  impossible across connections (the second opener loses the CAS on the
+  transition write).
+- The reconcile sweep keys on `metadata.work_item_open_id` first, then
+  `metadata.work_item_id` not already owned — sufficient because every
+  mission this layer creates carries both fields.
 
-## §10.7 Branch protection state
+## §10.7 Operator action required (unchanged)
 
-**OPERATOR ACTION REQUIRED.** `GET /repos/vankusi59-svg/pair-next/branches/main`
-returns `"protected": false`; Devin's GitHub App token receives
-`403 Resource not accessible by integration` on both read and write of
-protection settings — it cannot change them.
+Branch protection on `main` is still **NOT enabled** — the GitHub
+integration token returns `403 Resource not accessible by integration` on
+both read and write of branch protection. Operator must enable it:
+Settings → Branches → add rule for `main` → require pull request +
+require status checks `build-and-test (20)`, `build-and-test (22)`,
+`security-audit`. Not claimed as done.
 
-Owner steps (GitHub → repo → Settings → Branches → Add branch ruleset/classic rule for `main`):
-1. Require a pull request before merging (approvals: 0–1).
-2. Require status checks to pass: `build-and-test`, `security-audit` (strict/up-to-date on).
-3. Disallow force pushes; disallow deletions.
-4. (Optional) enforce for admins.
+## §13 Completion contract — self-assessment
 
-## §10.8 Limitations / remaining hard debt
+| # | Requirement | Evidence |
+|---|---|---|
+| 1 | Real atomic CAS | `store.put` conditional UPDATE/INSERT; tests `cas1–cas3` |
+| 2 | Multi-connection concurrency tests | `cas1–cas5`, `bud1–bud2`, `fi7`, `rt2` — two stores on one DB |
+| 3 | Crash/fault injection cannot duplicate missions | `fi1–fi4` at every boundary |
+| 4 | Restart reconciliation repairs partially-linked opens | `fi5–fi6` sweep tests |
+| 5 | Concurrent claims: one winner | `cas4` |
+| 6 | Concurrent budget opens cannot overshoot | `bud1–bud2` |
+| 7 | Block/reopen cannot overlap active missions | `blk1–blk2` + `FAIL_CLOSED_MISSION_ACTIVE` |
+| 8 | Cancel API no false success | `blk3–blk5` incl. real-server E2E |
+| 9 | Routine projection business-scoped | `rt1` (foreign business rejected) |
+| 10 | Routine projection atomically deduplicated | `rt2` deterministic id + CAS |
+| 11 | Routine missions obey business budget | `rt3–rt4` preflight veto + consume |
+| 12 | Build runs in PR CI | `pnpm run build` step added |
+| 13 | Full Node 20 + Node 22 regression in CI | matrix unchanged + focused step |
+| 14 | `pnpm audit` 0 high/critical | 9 advisories: 1 low, 8 moderate |
+| 15 | Evidence integrity clean | `verifyIntegrity` exercised in `cas5`; all tests hash-verify on read |
+| 16 | No authority bypassed | §10.5 |
+| 17 | No P12–P15 scope creep | §10.5 |
 
-- Cross-route executor failover on 429 (RE_ROUTE) is still unproven —
-  next hardening item; not part of P11.
-- `openWorkItem` residual: if `startMission` succeeded but the link-put
-  crashed (version conflict — unreachable single-threaded), a mission
-  could exist without `work_item_id` back-link. Mitigated by metadata
-  on the mission itself; crash window is sub-millisecond.
-- Broker: credentials still release to *any* verified-mission caller with
-  the broker token (documented boundary); per-agent scoped capability
-  binding is explicitly P13 — not half-built here.
-- 2 env-dependent P5 tests fail on dev boxes where `dsh`/`codex` are on
-  PATH outside `~/.local` (see §10.6).
-- Quick tunnel URL changes per boot (named tunnel deferred by operator).
-
-## §10.9 What is deferred to P12
-
-P12 agent execution contract (per-org_agent executor/provider/permission
-policy); P13 token/USD cost ledger + scoped credential capabilities +
-secret binding hierarchy; P14 autonomous heartbeat/inbox/delegation/work
-graph/IN_REVIEW; P15 CEO agent/KPI gap analysis/objective-driven generation.
-None pre-implemented.
-
-## §11 Rollback
-
-`git revert <merge-commit>` — all changes are additive guards + docs + CI
-honesty; the only behavior contract change is `releaseClaim` now requiring
-`claim_token` on live claims (API accepts `claim_token` in body).
-
-## §12 Classification
-
-**P11_OFFICIAL_FINAL_PASS** — all invariants implemented + regression-
-tested, suite/typecheck/build/audit verified, docs drift closed, CI
-honest; the single open item is branch protection, which requires owner
-action on GitHub (§10.7) and is explicitly classified OPERATOR ACTION
-REQUIRED rather than claimed enabled.
-
-## Provenance
-
-- Commit SHA / PR URL: see PR.
-- `git status` at write time: clean except this report + diff files listed.
-- **No secrets** were written to any file (vault/broker unchanged in this
-  respect; `CLOUDFLARE_API_TOKEN` remains an org secret referenced by env
-  name only).
+**Classification submitted for independent audit: `P11_REMEDIATED_PENDING_AUDIT`.**
+Final `P11_OFFICIAL_FINAL_PASS` requires the independent re-audit to agree —
+this report does not self-certify.
