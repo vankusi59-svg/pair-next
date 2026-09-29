@@ -35,7 +35,13 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   non-empty preferred set is a HARD restriction per snapshot (executor
   AND route, pinned ∩ current, deny-minus); unknown policy keys rejected;
   live contract row digest revalidated at every resolution; agent-bound
-  mission without a pin fails `PIN_MISSING`.
+  mission without a pin fails `PIN_MISSING`. R2: canonical
+  `assertAgentExecutionAllowed` re-runs at the final pre-dispatch
+  boundary (before every NEW `adapter.dispatch`) — adopted governed
+  tasks cannot bypass tightening; already-dispatched executions stay
+  historical (EXECUTION_PERSISTED / evidence-reconciled intents return
+  untouched); bound route revalidated from the canonical task; pin
+  schema/version hardened.
 - **Enforcement**: pin at `MissionControl.startMission` (contract id +
   version + digest in mission metadata), authoritative checks in
   `GovernedTaskGate.create_governed_task`, executor/route filtering in
@@ -47,8 +53,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - **API**: `GET|POST /api/org-agents/:id/contract`,
   `POST /api/org-agents/:id/contract/(enable|disable)`,
   `GET /api/org-agents/:id/effective-policy`.
-- Classification: `P12_REMEDIATED_R1_PENDING_AUDIT` — not merged; see
-  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1.
+- Classification: `P12_REMEDIATED_R2_PENDING_AUDIT` — not merged; see
+  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1–R2.
 
 ## Not yet
 

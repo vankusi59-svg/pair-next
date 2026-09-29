@@ -498,6 +498,22 @@ export class AgentContractService {
     const md = mission.metadata as Record<string, unknown> | undefined;
     const pin = md?.agent_contract as AgentContractPin | undefined;
     if (!pin) return null;
+    // R2 §6: schema + version are provenance fields — the digest alone does
+    // not bind them (the digest function injects the canonical schema), so
+    // they are checked explicitly before the digest.
+    if (String(pin.schema_version ?? "") !== AGENT_CONTRACT_SCHEMA) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_AGENT_CONTRACT_PROVENANCE",
+        String(pin.schema_version ?? "missing"),
+      );
+    }
+    const pinVersion = Number(pin.contract_version);
+    if (!Number.isInteger(pinVersion) || pinVersion < 1) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_AGENT_CONTRACT_PROVENANCE",
+        String(pin.contract_version),
+      );
+    }
     if (
       contractDigest({
         contract_id: String(pin.contract_id),

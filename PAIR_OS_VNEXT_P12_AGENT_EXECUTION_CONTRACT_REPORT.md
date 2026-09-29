@@ -364,3 +364,106 @@ advisory order         = current.preferred filtered to the effective set; prefer
 
 `P12_REMEDIATED_R1_PENDING_AUDIT` — DO NOT MERGE; independent audit
 required. No P13/P14/P15 work performed or implied.
+
+---
+
+# R2 — Final pre-dispatch authority revalidation + pin hardening
+
+Audit classification at R1 head `10bd894`: `P12_BLOCKED` — one remaining
+crash/restart execution-authority gap plus pinned-provenance hardening.
+All fixes preserve the canonical path; GovernedTaskGate remains the
+authoritative enforcement boundary.
+
+## R2.1 Defect — adopted governed task could bypass later revocation
+
+**Gap:** `MissionRouter.routeGovernedTask` resolved
+`effectiveForMission` for routing, but when a `governed_task` already
+existed (`existingGovernedTask`) it was adopted → `authorize_dispatch` →
+`dispatch_governed_task` — and the P12 checks embedded in
+`create_governed_task` were never re-run. Sequence: V1 allows →
+VALIDATED task persisted → crash → V2 revokes → restart → adopted task
+dispatched under dead authority.
+
+## R2.2 Fix — canonical `assertAgentExecutionAllowed`
+
+`GovernedTaskGate.assertAgentExecutionAllowed(mission, task, executorId)`
+extracts the P12 contract block verbatim and is now invoked at **two**
+boundaries so the paths cannot drift:
+
+1. `create_governed_task` (unchanged authority at validation time);
+2. `dispatch_governed_task` — the final authoritative boundary,
+   immediately before a NEW `adapter.dispatch` call.
+
+It validates: bound-mission pin (required, digest, schema, version,
+provenance vs current), agent ACTIVE, contract ACTIVE + row integrity
+(`resolve → validateContractRow`), business identity, project scope,
+`required_capabilities` (explicit deny first, then allow-list),
+executor (denied ∪, allowed ∩, restricted ∩), and the bound route
+(`task.selected_route_id` vs denied/restricted — FAIL_CLOSED_AGENT_ROUTE_DENIED
+/ FAIL_CLOSED_AGENT_ROUTE_RESTRICTED). Denials audit
+`AGENT_EXECUTION_DENIED` exactly once at the point of failure.
+
+## R2.3 Idempotency — already-dispatched work is historical fact
+
+The check sits **after** the intent early-returns, so:
+
+- `EXECUTION_PERSISTED` + `execution_id` → return the existing
+  execution; never re-validated retroactively, never re-dispatched.
+- `INTENT_RECORDED` + `adapter.dispatch_evidence.dispatched` →
+  reconcile intent to EXECUTION_PERSISTED and return that execution.
+- **Only** when a fresh `adapter.dispatch` is imminent does the current
+  effective contract get re-validated — tightening revokes the future
+  action: FAIL CLOSED, zero dispatch, denial audited.
+
+Recovery/reroute is untouched — a denied adopted task can still be
+reworked through the canonical recovery path.
+
+## R2.4 Route revalidation
+
+The canonical `task.selected_route_id` (bound at ROUTE_BOUND, persisted
+on the task row) is checked at pre-dispatch against the effective route
+policy — denied union ∪ and non-null restricted set ∩ — with the same
+fail-closed semantics as route selection. A bound-but-never-dispatched
+task on a since-revoked route cannot execute; no silent rerouting.
+
+## R2.5 Pinned provenance hardening
+
+`pinnedPolicy` now also requires `pin.schema_version ===
+AGENT_CONTRACT_SCHEMA` and `pin.contract_version` integer ≥ 1 —
+explicitly, because `contractDigest` injects the canonical schema
+internally so a tampered schema field alone would not disturb the
+digest. Order: schema → version → digest → contract/provenance binding.
+
+## R2.6 Tests (10 new — describe P12.R2 + P12.R2.6)
+
+- **A–E (crash/restart, real persisted state):** governed task
+  persisted VALIDATED (executor+route bound, no dispatch) → contract
+  tightened → router adoption → FAIL CLOSED + 0 adapter dispatches:
+  capability deny (`FAIL_CLOSED_AGENT_CAPABILITY_DENIED`), executor
+  deny (`FAIL_CLOSED_AGENT_EXECUTOR_DENIED`), hard executor restriction
+  switch (same code), route deny (`FAIL_CLOSED_AGENT_ROUTE_DENIED`),
+  hard route restriction switch (`FAIL_CLOSED_AGENT_ROUTE_RESTRICTED`).
+- **F:** completed dispatch + EXECUTION_PERSISTED → tighten → re-route
+  returns the SAME execution; `dispatched` stays 1; 1 execution row.
+- **G:** INTENT_RECORDED + `dispatch_evidence.dispatched` → tighten →
+  reconcile returns existing execution; still 1 dispatch / 1 row.
+- **R2.6 A–C (pin hardening):** tampered `pin.schema_version` with
+  still-valid digest → `FAIL_CLOSED_AGENT_CONTRACT_PROVENANCE`;
+  `contract_version` 0 and −1 with recomputed digest → FAIL CLOSED.
+
+## R2.7 Validation evidence
+
+- `tsc --noEmit` PASS · `pnpm build` PASS
+- P12 suite: **59/59** (49 + 10 R2) · P11 regression: **103/103**
+- Full suite Node 22.23.3: **1844 pass** / 2 pre-existing env-dependent
+  p5 probe failures (dsh/codex binaries on PATH of this dev box —
+  documented since P11) / 24 skipped
+- Full suite Node 20.20.2: **1846 pass / 0 fail** / 24 skipped
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**
+- P12 worker_threads CAS race: PASS (inside suite) · P11 worker races:
+  unchanged, PASS · `verifyIntegrity`: clean
+
+## R2.8 Classification
+
+`P12_REMEDIATED_R2_PENDING_AUDIT` — DO NOT MERGE; independent audit
+required. No P13/P14/P15 work performed or implied.

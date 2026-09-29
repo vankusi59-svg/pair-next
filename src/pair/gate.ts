@@ -104,89 +104,126 @@ export class GovernedTaskGate {
       );
     }
 
-    // P12: agent execution contract — the authoritative enforcement point.
-    // effective = mission-pinned policy ∩ current contract ∩ PAIR policy.
-    // Explicit deny always wins; a contract only ever narrows authority.
+    // P12/R2: canonical agent-execution validation — same helper the
+    // pre-dispatch boundary re-runs, so the two paths cannot drift.
+    this.assertAgentExecutionAllowed(mission, task, adapter.executor_id);
+    return this.createGovernedTaskContinuation(adapter, request, mission, task, active);
+  }
+
+  /**
+   * R2: canonical P12 agent-execution validation — reused by
+   * create_governed_task AND the final pre-dispatch boundary so the two
+   * enforcement paths cannot drift. Resolution itself fails closed
+   * (pin, agent/contract ACTIVE, business, integrity) inside
+   * effectiveForMission.
+   */
+  private assertAgentExecutionAllowed(
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+    executorId: string,
+  ): void {
     const boundAgentId = (
       (mission.metadata as Record<string, unknown> | undefined)?.org_agent_id
     );
-    if (boundAgentId) {
-      let agentPolicy;
-      try {
-        agentPolicy = this.service.agentContracts.effectiveForMission(mission);
-      } catch (e) {
-        // Resolution itself failed closed (status/disabled/digest/provenance)
-        // — still emit the §17 denial audit before re-throwing.
-        if (e instanceof PolicyError || e instanceof IntegrityError) {
-          this.service.agentContracts.auditDenial(
-            (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
-            (e as Error).message,
-            { missionId: String(mission.mission_id), agentId: String(boundAgentId), taskId: String(task.task_id) },
-          );
-        }
-        throw e;
+    if (!boundAgentId) return;
+    let agentPolicy;
+    try {
+      agentPolicy = this.service.agentContracts.effectiveForMission(mission);
+    } catch (e) {
+      if (e instanceof PolicyError || e instanceof IntegrityError) {
+        this.service.agentContracts.auditDenial(
+          (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+          (e as Error).message,
+          { missionId: String(mission.mission_id), agentId: String(boundAgentId), taskId: String(task.task_id) },
+        );
       }
-      const denyCtx = {
-        missionId: String(mission.mission_id),
-        agentId: String(boundAgentId),
-        taskId: String(task.task_id),
-        contractVersion: agentPolicy.contract_version,
-      };
-      // Explicit deny is checked first — deny always wins over allow,
-      // and the audit names it directly.
-      const requiredCaps = (task.required_capabilities as string[]) ?? [];
-      const explicitlyDenied = requiredCaps.filter((c) =>
-        agentPolicy.denied_capabilities.has(c),
+      throw e;
+    }
+    const denyCtx = {
+      missionId: String(mission.mission_id),
+      agentId: String(boundAgentId),
+      taskId: String(task.task_id),
+      contractVersion: agentPolicy.contract_version,
+    };
+    const requiredCaps = (task.required_capabilities as string[]) ?? [];
+    const explicitlyDenied = requiredCaps.filter((c) =>
+      agentPolicy.denied_capabilities.has(c),
+    );
+    if (explicitlyDenied.length) {
+      this.service.agentContracts.deny(
+        "FAIL_CLOSED_AGENT_CAPABILITY_DENIED",
+        `explicit-deny:${explicitlyDenied.sort().join(",")}`,
+        denyCtx,
       );
-      if (explicitlyDenied.length) {
+    }
+    if (agentPolicy.allowed_capabilities) {
+      const deniedCaps = requiredCaps.filter(
+        (c) => !agentPolicy.allowed_capabilities!.has(c),
+      );
+      if (deniedCaps.length) {
         this.service.agentContracts.deny(
           "FAIL_CLOSED_AGENT_CAPABILITY_DENIED",
-          `explicit-deny:${explicitlyDenied.sort().join(",")}`,
-          denyCtx,
-        );
-      }
-      // required capabilities ⊆ effective agent capabilities.
-      if (agentPolicy.allowed_capabilities) {
-        const deniedCaps = requiredCaps.filter(
-          (c) => !agentPolicy.allowed_capabilities!.has(c),
-        );
-        if (deniedCaps.length) {
-          this.service.agentContracts.deny(
-            "FAIL_CLOSED_AGENT_CAPABILITY_DENIED",
-            deniedCaps.sort().join(","),
-            denyCtx,
-          );
-        }
-      }
-      // executor ∈ allowed ∧ ∉ denied ∧ ∈ restricted set when the contract
-      // disables fallback (pinned ∩ current).
-      const executorId = adapter.executor_id;
-      const execDenied =
-        agentPolicy.denied_executor_ids.has(executorId) ||
-        (agentPolicy.allowed_executor_ids !== null &&
-          !agentPolicy.allowed_executor_ids.has(executorId)) ||
-        (agentPolicy.restricted_executor_ids !== null &&
-          !agentPolicy.restricted_executor_ids.has(executorId));
-      if (execDenied) {
-        this.service.agentContracts.deny(
-          "FAIL_CLOSED_AGENT_EXECUTOR_DENIED",
-          String(executorId),
-          denyCtx,
-        );
-      }
-      // project ∈ allowed scope (pinned ∩ current).
-      const projectId = String(mission.project_id);
-      if (
-        agentPolicy.allowed_project_ids !== null &&
-        !agentPolicy.allowed_project_ids.has(projectId)
-      ) {
-        this.service.agentContracts.deny(
-          "FAIL_CLOSED_AGENT_PROJECT_DENIED",
-          projectId,
+          deniedCaps.sort().join(","),
           denyCtx,
         );
       }
     }
+    const execDenied =
+      agentPolicy.denied_executor_ids.has(executorId) ||
+      (agentPolicy.allowed_executor_ids !== null &&
+        !agentPolicy.allowed_executor_ids.has(executorId)) ||
+      (agentPolicy.restricted_executor_ids !== null &&
+        !agentPolicy.restricted_executor_ids.has(executorId));
+    if (execDenied) {
+      this.service.agentContracts.deny(
+        "FAIL_CLOSED_AGENT_EXECUTOR_DENIED",
+        String(executorId),
+        denyCtx,
+      );
+    }
+    const projectId = String(mission.project_id);
+    if (
+      agentPolicy.allowed_project_ids !== null &&
+      !agentPolicy.allowed_project_ids.has(projectId)
+    ) {
+      this.service.agentContracts.deny(
+        "FAIL_CLOSED_AGENT_PROJECT_DENIED",
+        projectId,
+        denyCtx,
+      );
+    }
+    // Route revalidation: the canonical task carries the bound
+    // selected_route_id; a now-denied or out-of-restriction route fails
+    // closed. An unbound route has nothing to enforce here.
+    const routeId = task.selected_route_id ? String(task.selected_route_id) : null;
+    if (routeId) {
+      if (agentPolicy.denied_route_ids.has(routeId)) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_ROUTE_DENIED",
+          String(routeId),
+          denyCtx,
+        );
+      }
+      if (
+        agentPolicy.restricted_route_ids !== null &&
+        !agentPolicy.restricted_route_ids.has(routeId)
+      ) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_ROUTE_RESTRICTED",
+          String(routeId),
+          denyCtx,
+        );
+      }
+    }
+  }
+
+  private createGovernedTaskContinuation(
+    adapter: ExecutorAdapter,
+    request: Record<string, unknown>,
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+    active: Record<string, unknown>,
+  ) {
     const q = adapter.qualify();
     if (!q.qualified) {
       throw new PolicyError("FAIL_CLOSED_EXECUTOR_UNQUALIFIED", adapter.executor_id);
@@ -532,6 +569,19 @@ export class GovernedTaskGate {
         0,
       );
     }
+
+    // R2: final pre-dispatch authority revalidation — only reached when a
+    // NEW adapter.dispatch is about to happen (EXECUTION_PERSISTED and
+    // evidence-reconciled intents returned above). Contract tightening
+    // since validation/adoption revokes the dispatch here; an already-
+    // dispatched execution is a historical fact and never re-checked.
+    const predispatchMission = this.service.getMission(String(task.mission_id));
+    const predispatchTask = this.service.getTask(String(task.task_id));
+    this.assertAgentExecutionAllowed(
+      predispatchMission,
+      predispatchTask,
+      adapter.executor_id,
+    );
 
     const execution = adapter.dispatch(task, { actor: "PAIR_GOVERNED_TASK_GATE" });
     const executionId = String(execution.execution_id);

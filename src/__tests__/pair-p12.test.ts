@@ -46,7 +46,9 @@ import {
   ReconciliationService,
   RecoveryController,
   TRANSPORT_IN_PROCESS,
+  contractDigest,
   digest,
+  normalizeContractPolicy,
   utcnow,
 } from "../pair/index.js";
 
@@ -117,8 +119,9 @@ class ScriptedAdapter implements ExecutorAdapter {
   health() {
     return { state: this.available ? "READY" : "DEGRADED" };
   }
-  dispatch_evidence() {
-    return undefined;
+  evidence: Record<string, { dispatched: boolean; execution_id?: string }> = {};
+  dispatch_evidence(governedTaskId: string) {
+    return this.evidence[governedTaskId];
   }
 }
 
@@ -1349,5 +1352,283 @@ describe("P12.R1.6 pin-time denial audit", () => {
     const denials = denialEvents(ctx.store, aid);
     expect(denials.length).toBe(1);
     expect(String(denials[0].metadata?.reason)).toBe("FAIL_CLOSED_AGENT_PROJECT_DENIED");
+  });
+});
+
+/* ============ R2 — crash/restart pre-dispatch authority ============ */
+
+/** Persist a governed task in VALIDATED state — bound executor+route, no dispatch. */
+function persistValidated(
+  ctx: Ctx,
+  mission: Record<string, unknown>,
+  adapter: ScriptedAdapter,
+  opts: { routeId?: string } = {},
+) {
+  const task = ctx.service.listTasks(String(mission.mission_id))[0];
+  ctx.service.updateTask(String(task.task_id), {
+    selected_executor: adapter.executor_id,
+    selected_route_id: opts.routeId ?? `RTE_${adapter.executor_id}`,
+    status: "ROUTED",
+  });
+  const { governed_task } = ctx.gate.create_governed_task(
+    adapter,
+    govRequest(ctx, ctx.service.getMission(String(mission.mission_id))),
+  );
+  return governed_task;
+}
+
+describe("P12.R2 crash/restart — final pre-dispatch authority", () => {
+  it("A. capability revoked after VALIDATED → adopted task cannot dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r2a");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id), ["SHELL_EXECUTION"]);
+    persistValidated(ctx, mission, a);
+    // V2 revokes the capability — restart + adoption must fail closed.
+    biz.upsertAgentContract(aid, "op", { denied_capabilities: ["SHELL_EXECUTION"] });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED_AGENT_CAPABILITY_DENIED/);
+    expect(a.dispatched.length).toBe(0);
+    expect(
+      denialEvents(ctx.store, aid).some((e) => String(e.metadata?.reason) === "FAIL_CLOSED_AGENT_CAPABILITY_DENIED"),
+    ).toBe(true);
+  });
+
+  it("B. executor revoked after VALIDATED → adopted task cannot dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r2b");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    persistValidated(ctx, mission, a);
+    biz.upsertAgentContract(aid, "op", { denied_executor_ids: ["EXEC_A"] });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED_AGENT_EXECUTOR_DENIED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("C. hard executor restriction switched to EXEC_B → old EXEC_A-bound task cannot dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r2c");
+    const a = new ScriptedAdapter("EXEC_A");
+    const b = new ScriptedAdapter("EXEC_B");
+    registerScripted(ctx, a);
+    registerScripted(ctx, b);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    persistValidated(ctx, mission, a);
+    biz.upsertAgentContract(aid, "op", {
+      preferred_executor_ids: ["EXEC_B"],
+      executor_fallback_allowed: false,
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED_AGENT_EXECUTOR_DENIED/);
+    expect(a.dispatched.length).toBe(0);
+    expect(b.dispatched.length).toBe(0);
+  });
+
+  it("D. route revoked after VALIDATED → adopted task cannot dispatch on denied route", () => {
+    const { ctx, biz } = makeBizCtx("r2d");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    persistValidated(ctx, mission, a, { routeId: "RTE_EXEC_A" });
+    biz.upsertAgentContract(aid, "op", { denied_route_ids: ["RTE_EXEC_A"] });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED_AGENT_ROUTE_DENIED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("E. hard route restriction switched to RTE_ALT → RTE_A-bound task cannot dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r2e");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    addRoute(ctx, "RTE_A_ALT", "EXEC_A", 90);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    persistValidated(ctx, mission, a, { routeId: "RTE_EXEC_A" });
+    biz.upsertAgentContract(aid, "op", {
+      preferred_route_ids: ["RTE_A_ALT"],
+      route_fallback_allowed: false,
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED_AGENT_ROUTE_RESTRICTED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("F. already-dispatched execution is a historical fact — tighten, re-route, returns same execution", () => {
+    const { ctx, biz } = makeBizCtx("r2f");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const first = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(a.dispatched.length).toBe(1);
+    const firstExec = String(first.execution.execution_id);
+    // tighten after the fact — historical execution must NOT be re-dispatched
+    biz.upsertAgentContract(aid, "op", { denied_executor_ids: ["EXEC_A"] });
+    const second = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(second.adopted).toBe(true);
+    expect(String(second.execution.execution_id)).toBe(firstExec);
+    expect(a.dispatched.length).toBe(1); // no second external dispatch
+    expect(ctx.store.list("executor_execution").length).toBe(1);
+  });
+
+  it("G. INTENT_RECORDED + dispatch evidence → reconcile, no second dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r2g");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const first = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(a.dispatched.length).toBe(1);
+    const gtid = String(first.governed_task.governed_task_id);
+    const eid = String(first.execution.execution_id);
+    // crash between intent write and execution persist: flip back to
+    // INTENT_RECORDED while adapter evidence proves the dispatch happened
+    const intentId = `INTENT_${gtid}`;
+    const intent = ctx.store.get("executor_dispatch_intent", intentId);
+    ctx.store.put(
+      "executor_dispatch_intent",
+      intentId,
+      { ...intent, state: "INTENT_RECORDED", execution_id: undefined },
+      Number(intent.version),
+    );
+    a.evidence[gtid] = { dispatched: true, execution_id: eid };
+    biz.upsertAgentContract(aid, "op", { denied_executor_ids: ["EXEC_A"] });
+    const second = ctx.router.routeGovernedTask(
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+      ctx.adapters,
+    );
+    expect(String(second.execution.execution_id)).toBe(eid);
+    expect(a.dispatched.length).toBe(1);
+    expect(ctx.store.list("executor_execution").length).toBe(1);
+  });
+});
+
+describe("P12.R2.6 pinned provenance hardening", () => {
+  function tamperPin(
+    store: PairEvidenceStore,
+    missionId: string,
+    mutate: (pin: Record<string, unknown>) => void,
+  ) {
+    const row = store.get("mission", missionId);
+    const md = row.metadata as Record<string, unknown>;
+    const pin = md.agent_contract as Record<string, unknown>;
+    mutate(pin);
+    // recompute the digest so the tampered field — not a digest mismatch —
+    // is what triggers the failure.
+    pin.contract_digest = contractDigest({
+      contract_id: String(pin.contract_id),
+      org_agent_id: String(pin.org_agent_id),
+      business_id: String(pin.business_id),
+      contract_version: Number(pin.contract_version),
+      policy: normalizeContractPolicy(pin.policy),
+    });
+    store.put("mission", missionId, row, Number(row.version));
+  }
+
+  it("A. tampered pin.schema_version with valid digest → FAIL CLOSED", () => {
+    const { ctx, biz } = makeBizCtx("r2h");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    tamperPin(ctx.store, String(mission.mission_id), (pin) => {
+      pin.schema_version = "evil.schema.v9";
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED_AGENT_CONTRACT_PROVENANCE/);
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("B. pin.contract_version = 0 with recomputed digest → FAIL CLOSED", () => {
+    const { ctx, biz } = makeBizCtx("r2i");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    tamperPin(ctx.store, String(mission.mission_id), (pin) => {
+      pin.contract_version = 0;
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("C. pin.contract_version = -1 → FAIL CLOSED", () => {
+    const { ctx, biz } = makeBizCtx("r2j");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    tamperPin(ctx.store, String(mission.mission_id), (pin) => {
+      pin.contract_version = -1;
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(
+        govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never,
+        ctx.adapters,
+      ),
+    ).toThrowError(/FAIL_CLOSED/);
+    expect(a.dispatched.length).toBe(0);
   });
 });
