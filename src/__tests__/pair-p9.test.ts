@@ -1516,6 +1516,12 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
         proposal: { tasks: [] },
       });
       const fetchTaskId = String(commit.task_ids[0]);
+      // R1 §3: a fetchable task is canonically bound (routed + executor).
+      ctx.service.updateTask(fetchTaskId, {
+        selected_executor: "EXEC_A",
+        selected_route_id: "RTE_A",
+        status: "ROUTED",
+      });
 
       // operator installs a credential — response carries metadata only
       const up = await fetch(`http://127.0.0.1:${port}/api/credentials`, {

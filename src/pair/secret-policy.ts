@@ -94,7 +94,14 @@ export class SecretPolicyService {
         throw new IntegrityError("FAIL_CLOSED_SECRET_POLICY_FIELDS", k);
       }
     }
+    // R1 §7: allowed_purpose has no canonical enforceable subject yet —
+    // keeping a field that looks restrictive but never denies is worse
+    // than rejecting it outright.
+    if (input.allowed_purpose != null) {
+      throw new IntegrityError("FAIL_CLOSED_SECRET_PURPOSE_UNSUPPORTED", "allowed_purpose");
+    }
     for (const f of ALLOW_SETS) normalizeAllowList(input[f], f);
+    this.assertAllowSetRefs(input, businessId);
     const id = secretPolicyIdFor(businessId, ref);
     if (this.store.tryGet("secret_policy", id)) {
       // One canonical policy per (business, credential ref) — use update.
@@ -156,6 +163,11 @@ export class SecretPolicyService {
     ) {
       throw new IntegrityError("FAIL_CLOSED_SECRET_REF_IMMUTABLE", policyId);
     }
+    // R1 §7: same purpose rule on update — non-null is rejected.
+    if (patch.allowed_purpose != null) {
+      throw new IntegrityError("FAIL_CLOSED_SECRET_PURPOSE_UNSUPPORTED", "allowed_purpose");
+    }
+    this.assertAllowSetRefs(patch, String(cur.business_id));
     const next: Record<string, unknown> = {
       ...cur,
       allowed_agent_ids:
@@ -205,6 +217,40 @@ export class SecretPolicyService {
   setPolicyStatus(policyId: string, status: SecretPolicyStatus, actor: string): Record<string, unknown> {
     const cur = this.store.get("secret_policy", policyId);
     return this.updatePolicy(policyId, { status }, Number(cur.version), actor);
+  }
+
+  /** R1 §8: allow-set references must resolve to canonical entities in
+   *  the policy's own business — a cross-business or dangling id is never
+   *  valid secret authority. */
+  private assertAllowSetRefs(input: Record<string, unknown>, businessId: string): void {
+    const business = this.store.get("business", businessId);
+    for (const raw of (input.allowed_agent_ids as string[] | null | undefined) ?? []) {
+      const agent = this.store.tryGet("org_agent", String(raw));
+      if (!agent || String(agent.business_id) !== businessId) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_AGENT_REF", String(raw));
+      }
+    }
+    for (const raw of (input.allowed_project_ids as string[] | null | undefined) ?? []) {
+      const project = this.store.tryGet("project", String(raw));
+      if (!project || String(business.project_id) !== String(raw)) {
+        // A secret scoped to a business can only admit that business's own
+        // canonical project — anything else is cross-business leakage.
+        throw new IntegrityError("FAIL_CLOSED_SECRET_PROJECT_REF", String(raw));
+      }
+    }
+    for (const raw of (input.allowed_executor_ids as string[] | null | undefined) ?? []) {
+      // Executors registered canonically must resolve; unknown ids are
+      // malformed authority. PAIR_NATIVE is the built-in executor id.
+      if (raw === "PAIR_NATIVE") continue;
+      if (!this.store.tryGet("executor", String(raw))) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_EXECUTOR_REF", String(raw));
+      }
+    }
+    for (const raw of (input.allowed_route_ids as string[] | null | undefined) ?? []) {
+      if (!this.store.tryGet("route", String(raw))) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_ROUTE_REF", String(raw));
+      }
+    }
   }
 
   getPolicy(policyId: string): Record<string, unknown> | null {
@@ -306,6 +352,14 @@ export class SecretPolicyService {
     const agentId = md.org_agent_id ? String(md.org_agent_id) : null;
     const projectId = String(mission.project_id ?? "");
     const routeId = task.selected_route_id ? String(task.selected_route_id) : null;
+    // R1 §3: a route-scoped release requires a canonical route binding —
+    // caller input never supplies it.
+    if (
+      routeId == null &&
+      (grant.allowed_route_ids != null || policy.allowed_route_ids != null)
+    ) {
+      return { granted: false, reason: "FAIL_CLOSED_SECRET_ROUTE_UNBOUND" };
+    }
     // Intersect: pinned ∩ current — both must admit each axis.
     const REASON: Record<string, string> = {
       allowed_agent_ids: "FAIL_CLOSED_SECRET_AGENT_DENIED",
@@ -328,17 +382,49 @@ export class SecretPolicyService {
         return { granted: false, reason: REASON[field] };
       }
     }
-    // §31: a secret grant never expands P12 — if the bound executor is
-    // denied by the agent execution contract, release is denied.
-    if (agentId && executorId) {
-      let effective: { denied_executor_ids: Set<string> };
+    // §31 + R1 §4: a secret grant never expands P12 — a NEW release is a
+    // CURRENT authority decision, so the complete effective executor/route
+    // authority applies at fetch time:
+    //   allowed_executor_ids ∩ restricted_executor_ids − denied_executor_ids
+    //   restricted_route_ids − denied_route_ids (when a route is bound)
+    if (agentId) {
+      let effective: {
+        allowed_executor_ids: Set<string> | null;
+        denied_executor_ids: Set<string>;
+        restricted_executor_ids: Set<string> | null;
+        denied_route_ids: Set<string>;
+        restricted_route_ids: Set<string> | null;
+      };
       try {
         effective = this.service.agentContracts.effectiveForMission(mission);
       } catch {
         return { granted: false, reason: "FAIL_CLOSED_SECRET_AGENT_POLICY" };
       }
-      if ((effective.denied_executor_ids as Set<string>).has(executorId)) {
-        return { granted: false, reason: "FAIL_CLOSED_SECRET_EXECUTOR_DENIED" };
+      if (executorId) {
+        if (effective.allowed_executor_ids != null && !effective.allowed_executor_ids.has(executorId)) {
+          return { granted: false, reason: "FAIL_CLOSED_SECRET_EXECUTOR_DENIED" };
+        }
+        if (
+          effective.restricted_executor_ids != null &&
+          !effective.restricted_executor_ids.has(executorId)
+        ) {
+          return { granted: false, reason: "FAIL_CLOSED_SECRET_EXECUTOR_DENIED" };
+        }
+        if (effective.denied_executor_ids.has(executorId)) {
+          return { granted: false, reason: "FAIL_CLOSED_SECRET_EXECUTOR_DENIED" };
+        }
+      }
+      if (routeId) {
+        if (effective.denied_route_ids.has(routeId)) {
+          return { granted: false, reason: "FAIL_CLOSED_SECRET_ROUTE_DENIED" };
+        }
+        if (effective.restricted_route_ids != null && !effective.restricted_route_ids.has(routeId)) {
+          return { granted: false, reason: "FAIL_CLOSED_SECRET_ROUTE_DENIED" };
+        }
+      } else if (effective.restricted_route_ids != null) {
+        // The contract hard-restricts routes but this task has no
+        // canonical route binding — a route-scoped release can't stand.
+        return { granted: false, reason: "FAIL_CLOSED_SECRET_ROUTE_UNBOUND" };
       }
     }
     return { granted: true, reason: "GRANTED", policy, grant };

@@ -102,10 +102,22 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   HELD/COMMITTED, settled, billing breakdown, unpriced, halt, warnings);
   `GET|POST /api/cost-policies`, `GET|POST /api/cost-profiles`,
   `GET|POST /api/secret-policies` (+`update`/`revoke`).
-- Classification: **`P13_IMPLEMENTED_PENDING_AUDIT`** on the NEW P13
+- **R1 remediation** (same PR): retry authority — RELEASED re-hold re-runs the
+  full current decision (halt→billing→caps) in one txn; HELD → audited
+  FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS. Pricing pinned into the
+  reservation (profile id+version+digest+rates+source); settlement uses the
+  pin only, digest-verified; zero-supplied metered bounds stay unbounded.
+  Secret release requires canonical `selected_executor` + ROUTED/RUNNING +
+  route binding where scoped, and re-evaluates the full P12 effective
+  executor/route narrowing at fetch time. `startMission` enforces
+  business/project isolation + org_agent membership. `/api/*/update` splits
+  control fields; updates never silently create. `allowed_purpose`
+  fail-closed until an enforceable subject exists; allow-set reference
+  validation added.
+- Classification: **`P13_REMEDIATED_R1_PENDING_AUDIT`** on the P13
   branch/PR; evidence in
-  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 36/36,
-  P12 71/71, P11 103/103, N20 1894/0, N22 1892/2env, typecheck+build PASS,
+  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 48/48,
+  P12 71/71, P11 103/103, N20 1906/0, N22 1904/2env, typecheck+build PASS,
   audit 0 high, worker races PASS, verifyIntegrity clean. NOT merged.
 
 ## Not yet

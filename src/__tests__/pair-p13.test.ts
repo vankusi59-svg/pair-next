@@ -21,6 +21,7 @@ import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
   BusinessLayer,
+  createMissionControlServer,
   CredentialBroker,
   ExecutorRegistry,
   GovernedTaskGate,
@@ -266,6 +267,15 @@ function dispatchOne(ctx: Ctx, mission: Record<string, unknown>) {
 
 function taskOf(ctx: Ctx, mission: Record<string, unknown>) {
   return ctx.service.listTasks(String(mission.mission_id))[0];
+}
+
+/** R1 §3: a fetchable task is canonically bound — executor + route + routed state. */
+function bindTask(ctx: Ctx, task: Record<string, unknown>, executorId = "EXEC_A", routeId = `RTE_${executorId}`) {
+  ctx.service.updateTask(String(task.task_id), {
+    selected_executor: executorId,
+    selected_route_id: routeId,
+    status: "ROUTED",
+  });
 }
 
 function meteredProfile(ctx: Ctx, executorId: string, reserveMicrousd: number) {
@@ -647,6 +657,7 @@ function secretPolicy(ctx: Ctx, businessId: string, ref: string, extra: Record<s
 describe("P13.secret A/B/C/D/E: release + early denials", () => {
   it("A. fully authorized release → broker returns value, audited granted", () => {
     const { ctx, biz } = makeBizCtx("sa1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     secretPolicy(ctx, String(b.business_id), "openai", {
@@ -656,7 +667,7 @@ describe("P13.secret A/B/C/D/E: release + early denials", () => {
     });
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
-    ctx.service.updateTask(String(task.task_id), { selected_executor: "EXEC_A", status: "ROUTED" });
+    bindTask(ctx, task);
     const broker = makeBroker(ctx);
     broker.upsert({ name: "openai", value: SENTINEL, domains: ["api.openai.com"], kind: "token" });
     const authz = ctx.control.authorizeCredentialFetch(
@@ -675,10 +686,12 @@ describe("P13.secret A/B/C/D/E: release + early denials", () => {
 
   it("B. token alone is insufficient — no pin → FAIL_CLOSED_SECRET_NOT_PINNED", () => {
     const { ctx, biz } = makeBizCtx("sb1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
     const authz = ctx.control.authorizeCredentialFetch(
       String(mission.mission_id),
       String(task.task_id),
@@ -734,17 +747,20 @@ describe("P13.secret F–J: scope + revocation", () => {
     secretPolicy(ctx, String(b2.business_id), "openai");
     const { mission } = boundMission(ctx, String(ag1.agent_id), String(b1.business_id));
     const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
     const authz = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai");
     expect(authz.reason).toBe("FAIL_CLOSED_SECRET_NOT_PINNED");
   });
 
   it("G. pinned agent allow-list excludes this mission's agent → denied", () => {
     const { ctx, biz } = makeBizCtx("sg1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag1 = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     const ag2 = biz.createOrgAgent({ business_id: String(b.business_id), title: "ops", department: "eng", operator_id: "op" });
     secretPolicy(ctx, String(b.business_id), "openai", { allowed_agent_ids: [String(ag2.agent_id)] });
     const { mission } = boundMission(ctx, String(ag1.agent_id), String(b.business_id));
+    bindTask(ctx, taskOf(ctx, mission));
     const authz = ctx.control.authorizeCredentialFetch(
       String(mission.mission_id),
       String(taskOf(ctx, mission).task_id),
@@ -755,23 +771,27 @@ describe("P13.secret F–J: scope + revocation", () => {
 
   it("H. denied executor in policy allow-set → FAIL_CLOSED_SECRET_EXECUTOR_DENIED", () => {
     const { ctx, biz } = makeBizCtx("sh1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
+    registerScripted(ctx, new ScriptedAdapter("EXEC_B"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     secretPolicy(ctx, String(b.business_id), "openai", { allowed_executor_ids: ["EXEC_B"] });
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
-    ctx.service.updateTask(String(task.task_id), { selected_executor: "EXEC_A", status: "ROUTED" });
+    bindTask(ctx, task);
     const authz = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai");
     expect(authz.reason).toBe("FAIL_CLOSED_SECRET_EXECUTOR_DENIED");
   });
 
   it("J. revocation narrows future releases; audit events emitted", () => {
     const { ctx, biz } = makeBizCtx("sj1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     const pol = secretPolicy(ctx, String(b.business_id), "openai");
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
     expect(
       ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai").granted,
     ).toBe(true);
@@ -790,6 +810,7 @@ describe("P13.secret K/L/M: pin semantics + vault", () => {
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    bindTask(ctx, taskOf(ctx, mission));
     // policy created AFTER mission creation
     secretPolicy(ctx, String(b.business_id), "openai");
     const authz = ctx.control.authorizeCredentialFetch(
@@ -802,6 +823,8 @@ describe("P13.secret K/L/M: pin semantics + vault", () => {
 
   it("K2. pinned allow-set snapshot wins — later widening does not expand the pinned grant", () => {
     const { ctx, biz } = makeBizCtx("sk2");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
+    registerScripted(ctx, new ScriptedAdapter("EXEC_B"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     const pol = secretPolicy(ctx, String(b.business_id), "openai", {
@@ -809,15 +832,15 @@ describe("P13.secret K/L/M: pin semantics + vault", () => {
     });
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
-    ctx.service.updateTask(String(task.task_id), { selected_executor: "EXEC_A", status: "ROUTED" });
+    bindTask(ctx, task);
     // policy widens later — pinned grant only allows EXEC_A anyway
     ctx.service.secretPolicies.updatePolicy(String(pol.policy_id), { allowed_executor_ids: ["EXEC_A", "EXEC_B"] }, Number(pol.version), "op");
     expect(
       ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai").granted,
     ).toBe(true);
     // and if the task were bound to EXEC_B, pinned snapshot still denies it
-    ctx.service.updateTask(String(task.task_id), { selected_executor: "EXEC_B" });
-    const denied = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai");
+    bindTask(ctx, taskOf(ctx, mission), "EXEC_B");
+    const denied = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(taskOf(ctx, mission).task_id), "openai");
     expect(denied.reason).toBe("FAIL_CLOSED_SECRET_EXECUTOR_DENIED");
   });
 
@@ -834,11 +857,13 @@ describe("P13.secret K/L/M: pin semantics + vault", () => {
 
   it("M. authorized fetch but vault value absent → 404 path, audited", () => {
     const { ctx, biz } = makeBizCtx("sm1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     secretPolicy(ctx, String(b.business_id), "openai");
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
     const authz = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai");
     expect(authz.granted).toBe(true);
     const broker = makeBroker(ctx); // vault empty — credential never installed
@@ -849,11 +874,13 @@ describe("P13.secret K/L/M: pin semantics + vault", () => {
 describe("P13.secret O/P: sentinel + P12 boundary", () => {
   it("O. sentinel value lives only in vault + release response — never in canonical state", () => {
     const { ctx, biz } = makeBizCtx("so1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     secretPolicy(ctx, String(b.business_id), "openai");
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
     const broker = makeBroker(ctx);
     broker.upsert({ name: "openai", value: SENTINEL, domains: ["api.openai.com"], kind: "token" });
     const authz = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai");
@@ -888,7 +915,7 @@ describe("P13.secret O/P: sentinel + P12 boundary", () => {
     secretPolicy(ctx, String(b.business_id), "openai", { allowed_executor_ids: ["EXEC_A"] });
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     const task = taskOf(ctx, mission);
-    ctx.service.updateTask(String(task.task_id), { selected_executor: "EXEC_A", status: "ROUTED" });
+    bindTask(ctx, task);
     // P12 contract now denies EXEC_A — release must fail closed.
     biz.upsertAgentContract(String(ag.agent_id), "op", { denied_executor_ids: ["EXEC_A"] });
     const authz = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(task.task_id), "openai");
@@ -899,10 +926,12 @@ describe("P13.secret O/P: sentinel + P12 boundary", () => {
 describe("P13.secret policy integrity", () => {
   it("tampered pin digest → FAIL_CLOSED_SECRET_PIN_PROVENANCE", () => {
     const { ctx, biz } = makeBizCtx("sq1");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
     secretPolicy(ctx, String(b.business_id), "openai");
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    bindTask(ctx, taskOf(ctx, mission));
     const row = ctx.store.get("mission", String(mission.mission_id));
     const md = row.metadata as Record<string, unknown>;
     const grants = md.secret_grants as Array<Record<string, unknown>>;
@@ -916,20 +945,28 @@ describe("P13.secret policy integrity", () => {
     const { ctx, biz } = makeBizCtx("sq2");
     const b = makeBiz(biz, ctx.projectId);
     const pol = secretPolicy(ctx, String(b.business_id), "openai");
-    ctx.service.secretPolicies.updatePolicy(String(pol.policy_id), { allowed_purpose: "x" }, Number(pol.version), "op");
+    ctx.service.secretPolicies.updatePolicy(String(pol.policy_id), { status: "DISABLED" }, Number(pol.version), "op");
     expect(() =>
-      ctx.service.secretPolicies.updatePolicy(String(pol.policy_id), { allowed_purpose: "y" }, 0, "op"),
+      ctx.service.secretPolicies.updatePolicy(String(pol.policy_id), { status: "ACTIVE" }, 0, "op"),
     ).toThrowError(/FAIL_CLOSED_VERSION_CONFLICT/);
   });
 
-  it("project scope narrowing denies out-of-scope missions", () => {
+  it("project allow-set must reference the business' own canonical project (§8)", () => {
     const { ctx, biz } = makeBizCtx("sq3");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
-    secretPolicy(ctx, String(b.business_id), "openai", { allowed_project_ids: ["PRJ_OTHER"] });
+    const other = ctx.service.createProject({ name: "other", root_location: ctx.workspace });
+    // A foreign/unknown project id can never be allow-listed for this business.
+    expect(() =>
+      secretPolicy(ctx, String(b.business_id), "openai", { allowed_project_ids: [String(other.project_id)] }),
+    ).toThrowError(/FAIL_CLOSED_SECRET_PROJECT_REF/);
+    // A policy scoped to the business' own project admits the mission.
+    secretPolicy(ctx, String(b.business_id), "openai", { allowed_project_ids: [ctx.projectId] });
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    bindTask(ctx, taskOf(ctx, mission));
     const authz = ctx.control.authorizeCredentialFetch(String(mission.mission_id), String(taskOf(ctx, mission).task_id), "openai");
-    expect(authz.reason).toBe("FAIL_CLOSED_SECRET_PROJECT_DENIED");
+    expect(authz.granted).toBe(true);
   });
 });
 
@@ -1133,8 +1170,8 @@ describe("P13 races — genuine worker_threads", () => {
     const pol = secretPolicy(ctx, String(b.business_id), "openai");
     const dbPath = path.join(ctx.dir, "pair.db");
     const [r1, r2] = await runRace([
-      { op: "secretPolicyUpdate", dbPath, args: { policyId: pol.policy_id, patch: { allowed_purpose: "a" }, expectedVersion: Number(pol.version) } },
-      { op: "secretPolicyUpdate", dbPath, args: { policyId: pol.policy_id, patch: { allowed_purpose: "b" }, expectedVersion: Number(pol.version) } },
+      { op: "secretPolicyUpdate", dbPath, args: { policyId: pol.policy_id, patch: { status: "DISABLED" }, expectedVersion: Number(pol.version) } },
+      { op: "secretPolicyUpdate", dbPath, args: { policyId: pol.policy_id, patch: { status: "DISABLED" }, expectedVersion: Number(pol.version) } },
     ]);
     const oks = [r1, r2].filter((r) => r.ok);
     const fails = [r1, r2].filter((r) => !r.ok);
@@ -1144,6 +1181,313 @@ describe("P13 races — genuine worker_threads", () => {
     const row = ctx.store.get("secret_policy", String(pol.policy_id));
     expect(Number(row.policy_version)).toBe(2);
   }, 60_000);
+});
+
+/* =========================== R1 audit remediations ======================== */
+
+describe("P13-R1.cost: retry must re-run the full CURRENT authority", () => {
+  /** Governed task authorized + reservation HELD, intent recorded. */
+  function heldReservation(ctx: Ctx, mission: Record<string, unknown>, a: ScriptedAdapter) {
+    const task = taskOf(ctx, mission);
+    bindTask(ctx, task, a.executor_id);
+    const { governed_task } = ctx.gate.create_governed_task(
+      a,
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))),
+    );
+    const gtid = String(governed_task.governed_task_id);
+    ctx.gate.authorize_dispatch(a, gtid);
+    ctx.service.cost.assertAndReserve({
+      mission: ctx.service.getMission(String(mission.mission_id)),
+      task: ctx.service.getTask(String(task.task_id)),
+      governedTask: ctx.store.get("governed_task", gtid),
+      executorId: a.executor_id,
+    });
+    ctx.store.put(
+      "executor_dispatch_intent",
+      `INTENT_${gtid}`,
+      { intent_id: `INTENT_${gtid}`, governed_task_id: gtid, executor_id: a.executor_id, state: "INTENT_RECORDED", created_at: utcnow(), version: 0 },
+      0,
+    );
+    return gtid;
+  }
+
+  it("COST-R1-A: RELEASED + cost halt → retry FAIL_CLOSED_COST_HALT, zero dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r1ca");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    meteredProfile(ctx, "EXEC_A", 50);
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const gtid = heldReservation(ctx, mission, a);
+    a.evidence[gtid] = { dispatched: false };
+    ctx.service.cost.reconcileForTask(gtid, a);
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("RELEASED");
+    process.env.PAIR_COST_HALT = "1";
+    expect(() => ctx.gate.dispatch_governed_task(a, gtid)).toThrowError(/FAIL_CLOSED_COST_HALT/);
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("COST-R1-B: RELEASED + tightened cap → retry FAIL_CLOSED_COST_BUDGET_EXCEEDED", () => {
+    const { ctx, biz } = makeBizCtx("r1cb");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    meteredProfile(ctx, "EXEC_A", 50);
+    const pol = ctx.service.cost.upsertCostPolicy(
+      { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 100, hard_stop: true },
+      "test",
+    );
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const gtid = heldReservation(ctx, mission, a);
+    a.evidence[gtid] = { dispatched: false };
+    ctx.service.cost.reconcileForTask(gtid, a);
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("RELEASED");
+    // Tighten the cap AFTER the failed attempt — the retry must obey it.
+    ctx.service.cost.updateCostPolicy(
+      { cost_policy_id: String(pol.cost_policy_id), business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 40, hard_stop: true },
+      "test",
+      Number(pol.version),
+    );
+    expect(() => ctx.gate.dispatch_governed_task(a, gtid)).toThrowError(/FAIL_CLOSED_COST_BUDGET_EXCEEDED/);
+    expect(a.dispatched.length).toBe(0);
+    // the RELEASED row is never re-held under a denied retry
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("RELEASED");
+  });
+
+  it("COST-R1-C: ambiguous HELD → retry fails closed, never silently adopts", () => {
+    const { ctx, biz } = makeBizCtx("r1cc");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    meteredProfile(ctx, "EXEC_A", 50);
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const gtid = heldReservation(ctx, mission, a);
+    // intent INTENT_RECORDED + no adapter evidence → outcome ambiguous.
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("HELD");
+    expect(() => ctx.gate.dispatch_governed_task(a, gtid)).toThrowError(/FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS/);
+    expect(a.dispatched.length).toBe(0);
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("HELD");
+  });
+
+  it("COST-R1-D: settlement prices the V1 pin, not a later V2 profile", () => {
+    const { ctx, biz } = makeBizCtx("r1cd");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const v1 = ctx.service.cost.upsertCostProfile(
+      { ref_type: "route", ref_id: "RTE_EXEC_A", billing_mode: "METERED_API", reserve_microusd: 100, input_microusd_per_mtok: 1000, source: "operator" },
+      "test",
+    );
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    a.resultPayload = { status: "COMPLETED", input_tokens: 2000, output_tokens: 0 };
+    const routed = dispatchOne(ctx, mission);
+    const gtid = String(routed.governed_task.governed_task_id);
+    const res = reservationOf(ctx, gtid)!;
+    expect(Number(res.cost_profile_version)).toBe(Number(v1.version));
+    expect(res.cost_profile_digest).toBeTruthy();
+    // V2 doubles the input rate — settlement must ignore it.
+    ctx.service.cost.updateCostProfile(
+      { ref_type: "route", ref_id: "RTE_EXEC_A", billing_mode: "METERED_API", reserve_microusd: 100, input_microusd_per_mtok: 2000, source: "operator" },
+      "test",
+      Number(v1.version),
+    );
+    ctx.gate.collect_execution_result(a, String(routed.execution.execution_id));
+    const settled = ctx.store.get("cost_reservation", `CRSV_${gtid}`);
+    expect(String(settled.status)).toBe("SETTLED");
+    // V1: ceil(2000 * 1000 / 1e6) = 2 — V2 would give 4.
+    expect(Number(settled.settled_microusd)).toBe(2);
+  });
+
+  it("COST-R1-E: METERED_API zero-supplied bounds cannot fake-bound a hard policy", () => {
+    const { ctx, biz } = makeBizCtx("r1ce");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    ctx.service.cost.upsertCostProfile(
+      { ref_type: "route", ref_id: "RTE_EXEC_A", billing_mode: "METERED_API", reserve_microusd: 0, fixed_microusd: 0, input_microusd_per_mtok: 500, source: "operator" },
+      "test",
+    );
+    ctx.service.cost.upsertCostPolicy(
+      { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 100, hard_stop: true },
+      "test",
+    );
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    expect(() => dispatchOne(ctx, mission)).toThrowError(/FAIL_CLOSED_COST_UNBOUNDED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+});
+
+describe("P13-R1.secret: canonical binding + full P12 narrowing at release", () => {
+  function secretCtx(name: string) {
+    const { ctx, biz } = makeBizCtx(name);
+    registerScripted(ctx, new ScriptedAdapter("EXEC_A"));
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    secretPolicy(ctx, String(b.business_id), "openai");
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    return { ctx, biz, b, ag, mission };
+  }
+  const fetchFor = (ctx: Ctx, mission: Record<string, unknown>) =>
+    ctx.control.authorizeCredentialFetch(
+      String(mission.mission_id),
+      String(taskOf(ctx, mission).task_id),
+      "openai",
+    );
+
+  it("SECRET-R1-A: unrouted/unbound task → FAIL_CLOSED_SECRET_EXECUTOR_UNBOUND + audited", () => {
+    const { ctx, mission } = secretCtx("r1sa");
+    const authz = fetchFor(ctx, mission);
+    expect(authz.reason).toBe("FAIL_CLOSED_SECRET_EXECUTOR_UNBOUND");
+    const denials = ctx.store
+      .listEvidence(String(mission.mission_id))
+      .filter((e) => (e.payload as Record<string, unknown>).kind === "CREDENTIAL_RELEASE_DENIED");
+    expect(denials.length).toBe(1);
+  });
+
+  it("SECRET-R1-B: contract allowed_executor_ids excludes the bound executor → denied", () => {
+    const { ctx, biz, ag, mission } = secretCtx("r1sb");
+    bindTask(ctx, taskOf(ctx, mission));
+    biz.upsertAgentContract(String(ag.agent_id), "op", { allowed_executor_ids: ["EXEC_B"] });
+    expect(fetchFor(ctx, mission).reason).toBe("FAIL_CLOSED_SECRET_EXECUTOR_DENIED");
+  });
+
+  it("SECRET-R1-C: hard executor restriction excludes the bound executor → denied", () => {
+    const { ctx, biz, ag, mission } = secretCtx("r1sc");
+    registerScripted(ctx, new ScriptedAdapter("EXEC_B"));
+    bindTask(ctx, taskOf(ctx, mission));
+    biz.upsertAgentContract(String(ag.agent_id), "op", {
+      preferred_executor_ids: ["EXEC_B"],
+      executor_fallback_allowed: false,
+    });
+    expect(fetchFor(ctx, mission).reason).toBe("FAIL_CLOSED_SECRET_EXECUTOR_DENIED");
+  });
+
+  it("SECRET-R1-D: denied route / route restriction without binding → denied", () => {
+    const { ctx, biz, ag, mission } = secretCtx("r1sd");
+    bindTask(ctx, taskOf(ctx, mission));
+    biz.upsertAgentContract(String(ag.agent_id), "op", { denied_route_ids: ["RTE_EXEC_A"] });
+    expect(fetchFor(ctx, mission).reason).toBe("FAIL_CLOSED_SECRET_ROUTE_DENIED");
+    // route-scoped release on an unbound task fails closed too
+    const { ctx: ctx2, biz: biz2 } = makeBizCtx("r1sd2");
+    registerScripted(ctx2, new ScriptedAdapter("EXEC_A"));
+    const b2 = makeBiz(biz2, ctx2.projectId);
+    const ag2 = biz2.createOrgAgent({ business_id: String(b2.business_id), title: "eng", department: "eng", operator_id: "op" });
+    secretPolicy(ctx2, String(b2.business_id), "openai", { allowed_route_ids: ["RTE_EXEC_A"] });
+    const { mission: m2 } = boundMission(ctx2, String(ag2.agent_id), String(b2.business_id));
+    bindTask(ctx2, taskOf(ctx2, m2));
+    expect(fetchFor(ctx2, m2).granted).toBe(true);
+    bindTask(ctx2, taskOf(ctx2, m2), "EXEC_A", "RTE_OTHER");
+    expect(fetchFor(ctx2, m2).reason).toBe("FAIL_CLOSED_SECRET_ROUTE_DENIED");
+  });
+
+  it("SECRET-R1-E: forged metadata.business_id on another project mints nothing", () => {
+    const { ctx, biz } = makeBizCtx("r1se");
+    const b = makeBiz(biz, ctx.projectId);
+    const other = ctx.service.createProject({ name: "other", root_location: ctx.workspace });
+    secretPolicy(ctx, String(b.business_id), "openai");
+    // Mission on PRJ_other carrying B1's business_id → fail closed at start.
+    expect(() =>
+      ctx.control.startMission({
+        goal: "g",
+        project_id: String(other.project_id),
+        operator_id: "op",
+        metadata: { business_id: String(b.business_id) },
+      }),
+    ).toThrowError(/FAIL_CLOSED_SECRET_CROSS_BUSINESS/);
+    // Unknown business_id also fails closed.
+    expect(() =>
+      ctx.control.startMission({
+        goal: "g",
+        project_id: ctx.projectId,
+        operator_id: "op",
+        metadata: { business_id: "BIZ_FORGED" },
+      }),
+    ).toThrowError(/FAIL_CLOSED_SECRET_BUSINESS_UNKNOWN/);
+  });
+});
+
+describe("P13-R1.purpose + API control fields", () => {
+  it("PURPOSE-R1: non-null allowed_purpose rejected until an enforceable subject exists", () => {
+    const { ctx, biz } = makeBizCtx("r1pu");
+    const b = makeBiz(biz, ctx.projectId);
+    expect(() =>
+      secretPolicy(ctx, String(b.business_id), "openai", { allowed_purpose: "read" }),
+    ).toThrowError(/FAIL_CLOSED_SECRET_PURPOSE_UNSUPPORTED/);
+    const pol = secretPolicy(ctx, String(b.business_id), "openai");
+    expect(() =>
+      ctx.service.secretPolicies.updatePolicy(String(pol.policy_id), { allowed_purpose: "x" }, Number(pol.version), "op"),
+    ).toThrowError(/FAIL_CLOSED_SECRET_PURPOSE_UNSUPPORTED/);
+  });
+
+  it("API-R1: update endpoints split control fields; stale CAS + unknown fields fail; no silent create", async () => {
+    const { ctx, biz } = makeBizCtx("r1api");
+    const b = makeBiz(biz, ctx.projectId);
+    const server = createMissionControlServer({ control: ctx.control });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const hdr = { "content-type": "application/json", "x-operator-id": "op" };
+    const post = (p: string, body: Record<string, unknown>) =>
+      fetch(`http://127.0.0.1:${port}${p}`, { method: "POST", headers: hdr, body: JSON.stringify(body) });
+    try {
+      const pol = ctx.service.cost.upsertCostPolicy(
+        { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 100, hard_stop: true },
+        "op",
+      );
+      const prof = ctx.service.cost.upsertCostProfile(
+        { ref_type: "route", ref_id: "RTE_X", billing_mode: "METERED_API", reserve_microusd: 10, source: "op" },
+        "op",
+      );
+      const sp = secretPolicy(ctx, String(b.business_id), "openai");
+
+      // valid updates with expected_version → 200
+      expect((await post("/api/cost-policies/update", {
+        cost_policy_id: pol.cost_policy_id, expected_version: pol.version,
+        business_id: b.business_id, scope_type: "business", scope_id: b.business_id, period: "DAY", max_microusd: 90,
+      })).status).toBe(200);
+      expect((await post("/api/cost-profiles/update", {
+        ref_type: "route", ref_id: "RTE_X", billing_mode: "METERED_API", reserve_microusd: 20, expected_version: prof.version,
+      })).status).toBe(200);
+      expect((await post("/api/secret-policies/update", {
+        policy_id: sp.policy_id, expected_version: sp.version, status: "DISABLED",
+      })).status).toBe(200);
+
+      // stale expected_version → 409 FAIL_CLOSED_VERSION_CONFLICT
+      const stale = await post("/api/cost-policies/update", {
+        cost_policy_id: pol.cost_policy_id, expected_version: 0,
+        business_id: b.business_id, scope_type: "business", scope_id: b.business_id, period: "DAY", max_microusd: 80,
+      });
+      expect(stale.status).toBe(409);
+      expect(JSON.stringify(await stale.json())).toContain("FAIL_CLOSED_VERSION_CONFLICT");
+
+      // unknown payload field → strict validator still rejects (409)
+      const badField = await post("/api/cost-policies/update", {
+        cost_policy_id: pol.cost_policy_id, expected_version: 1, bogus_field: 1,
+        business_id: b.business_id, scope_type: "business", scope_id: b.business_id, period: "DAY", max_microusd: 70,
+      });
+      expect(badField.status).toBe(409);
+
+      // update must never silently create
+      const noCreate = await post("/api/cost-policies/update", {
+        cost_policy_id: "CPO_NOPE", expected_version: 0,
+        business_id: b.business_id, scope_type: "business", scope_id: b.business_id, period: "DAY", max_microusd: 60,
+      });
+      expect(noCreate.status).toBe(409);
+      expect(JSON.stringify(await noCreate.json())).toContain("FAIL_CLOSED_COST_POLICY_NOT_FOUND");
+      const noCreateProfile = await post("/api/cost-profiles/update", {
+        ref_type: "route", ref_id: "RTE_GHOST", billing_mode: "METERED_API", reserve_microusd: 1, expected_version: 0,
+      });
+      expect(noCreateProfile.status).toBe(409);
+      expect(ctx.store.list("cost_policy").length).toBe(1);
+      expect(ctx.store.list("cost_profile").length).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
 });
 
 afterEach(() => {

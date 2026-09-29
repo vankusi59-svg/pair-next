@@ -387,6 +387,29 @@ export class MissionControl {
     // ACTIVE secret_policy of its business (refs + allow-sets + policy
     // provenance, never values). Later expansion never retro-broadens;
     // revocation narrows via the live-policy check at fetch time.
+    // R1 §5: business_id must resolve to a REAL business whose canonical
+    // project matches the mission's project — a caller cannot mint
+    // another business's grants by forging metadata.business_id.
+    if (metadata.business_id) {
+      const bizId = String(metadata.business_id);
+      const biz = this.deps.service.store.tryGet("business", bizId) as
+        | Record<string, unknown>
+        | null;
+      if (!biz) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_BUSINESS_UNKNOWN", bizId);
+      }
+      if (String(biz.project_id) !== String(input.project_id)) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_CROSS_BUSINESS", `${bizId}:${String(input.project_id)}`);
+      }
+      if (boundAgentId) {
+        const agent = this.deps.service.store.tryGet("org_agent", boundAgentId) as
+          | Record<string, unknown>
+          | null;
+        if (!agent || String(agent.business_id) !== bizId) {
+          throw new IntegrityError("FAIL_CLOSED_SECRET_AGENT_REF", boundAgentId);
+        }
+      }
+    }
     metadata.secret_grants = this.deps.service.secretPolicies.pinForMission({
       businessId: metadata.business_id ? String(metadata.business_id) : null,
     });
@@ -464,7 +487,15 @@ export class MissionControl {
       this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_TASK_NOT_IN_MISSION");
       return { granted: false, reason: "FAIL_CLOSED_TASK_NOT_IN_MISSION" };
     }
+    // R1 §3: release is bound to the EXACT canonical task/executor context
+    // — the broker request carries only ids; it can never invent routing
+    // identity. An unrouted/unbound task cannot receive a secret.
     const executorId = task.selected_executor ? String(task.selected_executor) : null;
+    const boundStates = new Set(["ROUTED", "RUNNING"]);
+    if (!executorId || !boundStates.has(String(task.status))) {
+      this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_SECRET_EXECUTOR_UNBOUND");
+      return { granted: false, reason: "FAIL_CLOSED_SECRET_EXECUTOR_UNBOUND" };
+    }
     const decision = this.deps.service.secretPolicies.authorizeRelease({
       mission,
       task,
@@ -613,8 +644,16 @@ export class MissionControl {
     return this.deps.service.cost.upsertCostPolicy(body, actor, expectedVersion);
   }
 
+  updateCostPolicy(body: Record<string, unknown>, actor: string, expectedVersion: number) {
+    return this.deps.service.cost.updateCostPolicy(body, actor, expectedVersion);
+  }
+
   upsertCostProfile(body: Record<string, unknown>, actor: string, expectedVersion?: number) {
     return this.deps.service.cost.upsertCostProfile(body, actor, expectedVersion);
+  }
+
+  updateCostProfile(body: Record<string, unknown>, actor: string, expectedVersion: number) {
+    return this.deps.service.cost.updateCostProfile(body, actor, expectedVersion);
   }
 
   createSecretPolicy(body: Record<string, unknown>, actor: string) {

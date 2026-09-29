@@ -440,33 +440,55 @@ export function createMissionControlServer(
         return void json(res, 200, c.upsertCostPolicy(body, `operator:${operator}`));
       }
       if (method === "POST" && p === "/api/cost-policies/update") {
+        // R1 §6: split API control fields from the strict policy payload —
+        // `cost_policy_id` + `expected_version` are control, not fields.
+        const { expected_version, cost_policy_id, ...policyPayload } = body;
+        if (expected_version == null || !Number.isInteger(Number(expected_version))) {
+          return void json(res, 400, { error: "FAIL_CLOSED_COST_POLICY_VERSION_REQUIRED" });
+        }
         return void json(
           res,
           200,
-          c.upsertCostPolicy(body, `operator:${operator}`, Number(body.expected_version ?? 0)),
+          c.updateCostPolicy(
+            { ...policyPayload, cost_policy_id: String(cost_policy_id ?? "") },
+            `operator:${operator}`,
+            Number(expected_version),
+          ),
         );
       }
       if (method === "POST" && p === "/api/cost-profiles") {
         return void json(res, 200, c.upsertCostProfile(body, `operator:${operator}`));
       }
       if (method === "POST" && p === "/api/cost-profiles/update") {
+        // R1 §6: `expected_version` is an API control field — never part
+        // of the strict profile payload.
+        const { expected_version, ...profilePayload } = body;
+        if (expected_version == null || !Number.isInteger(Number(expected_version))) {
+          return void json(res, 400, { error: "FAIL_CLOSED_COST_PROFILE_VERSION_REQUIRED" });
+        }
         return void json(
           res,
           200,
-          c.upsertCostProfile(body, `operator:${operator}`, Number(body.expected_version ?? 0)),
+          c.updateCostProfile(profilePayload, `operator:${operator}`, Number(expected_version)),
         );
       }
       if (method === "POST" && p === "/api/secret-policies") {
         return void json(res, 200, c.createSecretPolicy(body, `operator:${operator}`));
       }
       if (method === "POST" && p === "/api/secret-policies/update") {
+        // R1 §6: `policy_id`/`expected_version` are control fields; the
+        // strict secret-policy payload validator never sees them.
+        const { policy_id, expected_version, ...secretPayload } = body;
+        if (expected_version == null || !Number.isInteger(Number(expected_version))) {
+          return void json(res, 400, { error: "FAIL_CLOSED_SECRET_POLICY_VERSION_REQUIRED" });
+        }
         return void json(
           res,
           200,
           c.updateSecretPolicy(
-            String(body.policy_id ?? ""),
-            body,
-            Number(body.expected_version ?? 0),
+            String(policy_id ?? ""),
+            secretPayload,
+            Number(expected_version),
             `operator:${operator}`,
           ),
         );

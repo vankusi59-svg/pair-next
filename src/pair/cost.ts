@@ -207,6 +207,20 @@ export class CostService {
     return saved;
   }
 
+  /** R1 §6: an update must never silently create — the id is required
+   *  and must resolve to the canonical row. */
+  updateCostPolicy(
+    input: Record<string, unknown>,
+    actor: string,
+    expectedVersion: number,
+  ): Record<string, unknown> {
+    const id = String(input.cost_policy_id ?? "");
+    if (!id || !this.store.tryGet("cost_policy", id)) {
+      throw new IntegrityError("FAIL_CLOSED_COST_POLICY_NOT_FOUND", id);
+    }
+    return this.upsertCostPolicy({ ...input, cost_policy_id: id }, actor, expectedVersion);
+  }
+
   listCostPolicies(businessId?: string): Array<Record<string, unknown>> {
     const all = this.store.list("cost_policy");
     return businessId ? all.filter((p) => String(p.business_id) === businessId) : all;
@@ -286,6 +300,21 @@ export class CostService {
     return saved;
   }
 
+  /** R1 §6: update resolves the ref identity — it must already exist. */
+  updateCostProfile(
+    input: Record<string, unknown>,
+    actor: string,
+    expectedVersion: number,
+  ): Record<string, unknown> {
+    const refType = String(input.ref_type ?? "");
+    const refId = String(input.ref_id ?? "");
+    const id = `CPRO_${refType}_${digest(`${refType}:${refId}`).slice(0, 20)}`;
+    if (!this.store.tryGet("cost_profile", id)) {
+      throw new IntegrityError("FAIL_CLOSED_COST_PROFILE_NOT_FOUND", id);
+    }
+    return this.upsertCostProfile(input, actor, expectedVersion);
+  }
+
   listCostProfiles(): Array<Record<string, unknown>> {
     return this.store.list("cost_profile");
   }
@@ -316,7 +345,17 @@ export class CostService {
     }
     const mode = String(profile.billing_mode) as BillingMode;
     if (mode !== "METERED_API") return { mode, profile, unbounded: false };
-    const bounded = profile.reserve_microusd != null || profile.fixed_microusd != null;
+    // R1 §2 boundedness: a positive reserve_microusd is the only ceiling;
+    // an explicitly stated fixed fee with no metered rates is a bounded
+    // charge. "0 supplied" (reserve 0/absent on a metered profile) is NOT
+    // a conservative bound — nor is a profile with no charge schedule at
+    // all: those stay unbounded and fail closed under a hard policy.
+    const reserve = Number(profile.reserve_microusd ?? 0);
+    const hasRates =
+      Number(profile.input_microusd_per_mtok ?? 0) > 0 ||
+      Number(profile.output_microusd_per_mtok ?? 0) > 0;
+    const statedFixed = profile.fixed_microusd != null;
+    const bounded = reserve > 0 || (!hasRates && statedFixed);
     return { mode, profile, unbounded: !bounded };
   }
 
@@ -328,9 +367,27 @@ export class CostService {
 
   private reserveAmount(profile: Record<string, unknown> | null): number {
     if (!profile) return 0;
-    if (profile.reserve_microusd != null) return Number(profile.reserve_microusd);
-    if (profile.fixed_microusd != null) return Number(profile.fixed_microusd);
-    return 0;
+    const reserve = Number(profile.reserve_microusd ?? 0);
+    if (reserve > 0) return reserve;
+    return Number(profile.fixed_microusd ?? 0);
+  }
+
+  /** Canonical digest of the pricing fields pinned into a reservation. */
+  private profilePinDigest(
+    profile: Record<string, unknown>,
+    reservationFields: Record<string, unknown>,
+  ): string {
+    return digest({
+      cost_profile_id: profile.cost_profile_id,
+      version: Number(profile.version),
+      billing_mode: profile.billing_mode,
+      fixed_microusd: reservationFields.profile_fixed_microusd ?? null,
+      input_microusd_per_mtok: reservationFields.profile_input_microusd_per_mtok ?? null,
+      output_microusd_per_mtok: reservationFields.profile_output_microusd_per_mtok ?? null,
+      reserve_microusd: reservationFields.profile_reserve_microusd ?? null,
+      currency: "USD",
+      effective_at: reservationFields.pricing_effective_at ?? null,
+    });
   }
 
   /** Cost halt: PAIR_COST_HALT=1 or the runtime halt file. */
@@ -366,23 +423,33 @@ export class CostService {
     const governedTaskId = String(params.governedTask.governed_task_id);
     const resId = `CRSV_${governedTaskId}`;
     const existing = this.store.tryGet("cost_reservation", resId);
-    if (existing && String(existing.status) !== "RELEASED") {
-      return existing; // same governed dispatch → same canonical reservation
-    }
-    if (existing && String(existing.status) === "RELEASED") {
-      // Retry after a proven no-dispatch release: re-hold the same
-      // canonical reservation rather than minting a second charge.
-      return this.transitionIfCurrent(resId, ["RELEASED"], "HELD", {
-        updated_at: utcnow(),
-      }) as Record<string, unknown>;
-    }
     const mission = params.mission;
+    const missionId = String(mission.mission_id);
     const md = (mission.metadata ?? {}) as Record<string, unknown>;
     const businessId = String(md.business_id ?? "");
     const department = String(md.department ?? "");
     const agentId = md.org_agent_id ? String(md.org_agent_id) : "";
-    const missionId = String(mission.mission_id);
     const routeId = params.task.selected_route_id ? String(params.task.selected_route_id) : null;
+    // R1 §1: a PROVEN historical charge (COMMITTED/SETTLED) is idempotently
+    // adopted — it is never a new dispatch, so it needs no new authority.
+    if (existing && (String(existing.status) === "COMMITTED" || String(existing.status) === "SETTLED")) {
+      return existing;
+    }
+    // A leftover HELD row means the previous attempt's outcome is
+    // ambiguous — reconcile derives truth from canonical evidence; it is
+    // NEVER authority for a new dispatch. Fail closed until resolved.
+    if (existing && String(existing.status) === "HELD") {
+      this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
+        reason: "FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS",
+        governed_task_id: governedTaskId,
+      });
+      throw new PolicyError("FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS", governedTaskId);
+    }
+    // From here: no reservation, or a RELEASED one (proven no-dispatch).
+    // A RELEASED reservation reused for a NEW dispatch must pass the
+    // complete CURRENT cost decision again — halt, billing, policy caps
+    // and re-pricing all apply at retry time.
+    const reusingReleased = existing && String(existing.status) === "RELEASED";
     const billing = this.billingFor(params.executorId, routeId);
 
     // §18: halt blocks cost-bearing NEW dispatch (METERED_API and UNKNOWN —
@@ -482,6 +549,10 @@ export class CostService {
         }
       }
       if (violations.length) return { violations, warnings, saved: null };
+      // R1 §2: pin the authoritative pricing evidence into the
+      // reservation at authorization time — settlement later uses THIS
+      // snapshot, never a mutable later profile row.
+      const profile = billing.profile;
       const row = {
         schema: COST_SCHEMA,
         reservation_id: resId,
@@ -494,7 +565,16 @@ export class CostService {
         department: department || null,
         agent_id: agentId || null,
         billing_mode: billing.mode,
-        cost_profile_id: billing.profile ? String(billing.profile.cost_profile_id) : null,
+        cost_profile_id: profile ? String(profile.cost_profile_id) : null,
+        cost_profile_version: profile ? Number(profile.version) : null,
+        cost_profile_digest: null as string | null,
+        profile_fixed_microusd: profile?.fixed_microusd ?? null,
+        profile_input_microusd_per_mtok: profile?.input_microusd_per_mtok ?? null,
+        profile_output_microusd_per_mtok: profile?.output_microusd_per_mtok ?? null,
+        profile_reserve_microusd: profile?.reserve_microusd ?? null,
+        pricing_source: profile ? String(profile.source ?? "") : null,
+        pricing_effective_at: profile ? String(profile.effective_at ?? "") : null,
+        currency: "USD",
         reserved_microusd: requested,
         settled_microusd: null,
         usage_state: null,
@@ -504,6 +584,24 @@ export class CostService {
         updated_at: utcnow(),
         version: 0,
       };
+      row.cost_profile_digest = profile ? this.profilePinDigest(profile, row) : null;
+      // Re-hold of a RELEASED row happens inside the same txn: CAS on the
+      // in-txn row's version — a concurrent mutation loses and aborts.
+      if (reusingReleased) {
+        const fresh = this.store.tryGet("cost_reservation", resId);
+        if (fresh && String(fresh.status) === "RELEASED") {
+          const rehold = { ...row, version: Number(fresh.version) };
+          return {
+            violations: [],
+            warnings,
+            saved: this.store.put("cost_reservation", resId, rehold, Number(fresh.version)),
+          };
+        }
+        if (fresh && (String(fresh.status) === "COMMITTED" || String(fresh.status) === "SETTLED")) {
+          return { violations: [], warnings, saved: fresh }; // proven charge — adopt
+        }
+        return { violations: [], warnings, saved: null, ambiguous: true };
+      }
       const saved = this.store.put("cost_reservation", resId, row, 0);
       return { violations: [], warnings, saved };
     });
@@ -546,7 +644,15 @@ export class CostService {
         `${String(v.scope_type)}:${String(v.scope_id)} ${String(v.used_microusd)}+${String(v.requested_microusd)}>${String(v.max_microusd)}`,
       );
     }
-    return outcome.saved as Record<string, unknown>;
+    if (!outcome.saved) {
+      // The RELEASED row raced into a non-adoptable state mid-txn.
+      this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
+        reason: "FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS",
+        governed_task_id: governedTaskId,
+      });
+      throw new PolicyError("FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS", governedTaskId);
+    }
+    return outcome.saved;
   }
 
   /* ---------------- lifecycle -------------------------------------------- */
@@ -649,15 +755,27 @@ export class CostService {
       Number.isInteger(Number(result.input_tokens)) &&
       Number.isInteger(Number(result.output_tokens))
     ) {
-      const profile = this.store.tryGet("cost_profile", String(r.cost_profile_id));
-      if (
-        profile &&
-        (profile.input_microusd_per_mtok != null || profile.output_microusd_per_mtok != null)
-      ) {
+      // R1 §2: settle from the pricing snapshot PINNED in the reservation —
+      // never a mutable later cost_profile row. If the pinned digest no
+      // longer verifies against the stored fields, degrade to unknown
+      // usage (COMMITTED at reserved max — never under-count).
+      const pinOk =
+        !r.cost_profile_digest ||
+        this.profilePinDigest(
+          {
+            cost_profile_id: r.cost_profile_id,
+            version: r.cost_profile_version,
+            billing_mode: r.billing_mode,
+          },
+          r,
+        ) === String(r.cost_profile_digest);
+      const inRate = pinOk ? Number(r.profile_input_microusd_per_mtok ?? 0) : 0;
+      const outRate = pinOk ? Number(r.profile_output_microusd_per_mtok ?? 0) : 0;
+      if (pinOk && (inRate > 0 || outRate > 0)) {
         actual =
-          Number(profile.fixed_microusd ?? 0) +
-          Math.ceil((Number(result.input_tokens) * Number(profile.input_microusd_per_mtok ?? 0)) / 1_000_000) +
-          Math.ceil((Number(result.output_tokens) * Number(profile.output_microusd_per_mtok ?? 0)) / 1_000_000);
+          Number(r.profile_fixed_microusd ?? 0) +
+          Math.ceil((Number(result.input_tokens) * inRate) / 1_000_000) +
+          Math.ceil((Number(result.output_tokens) * outRate) / 1_000_000);
       }
     }
     this.settle(governedTaskId, actual);

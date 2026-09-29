@@ -297,3 +297,139 @@ existing CredentialBroker vault reused.
 
 **`P13_IMPLEMENTED_PENDING_AUDIT`** — pushed to the NEW P13 branch/PR;
 DO NOT MERGE; DO NOT START P14/P15.
+
+---
+
+# REMEDIATION R1 — independent-audit hardening
+
+Audited head `1b51e18` was classified **P13_BLOCKED** with six blockers and two
+hardening requirements. R1 remediates all of them on the same PR; every
+remediation is fail-closed and preserves P11/P12 PASS semantics.
+
+## R1.1 §1 blocker — cost retry authority gap
+
+**Defect.** `assertAndReserve` adopted a RELEASED (proven no-dispatch) row and
+even a HELD row by idempotency BEFORE running halt/billing/policy checks — a
+retry after failure bypassed the current authority entirely.
+
+**Fix.** The reservation row is now classified up front:
+
+- COMMITTED/SETTLED → proven historical charge → adopted (no new authority —
+  it is not a new dispatch).
+- HELD → ambiguous leftover → audited
+  `FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS`; it is never authority.
+- absent or RELEASED → the FULL current decision re-runs: halt check →
+  billing resolution → hard-policy unbounded check → atomic cap
+  evaluation inside `store.immediate()`. A RELEASED row is re-held in the
+  SAME transaction (CAS on the in-txn version); a concurrent commit races
+  to COMMITTED/SETTLED → adopted; anything else → ambiguous → audited
+  fail-closed throw.
+
+Consequences: a halt raised after a failed attempt blocks the retry
+(FAIL_CLOSED_COST_HALT, 0 dispatches); a tightened cap blocks it
+(FAIL_CLOSED_COST_BUDGET_EXCEEDED); re-pricing always reads the CURRENT
+profile; an ambiguous HELD can never mint authority.
+
+## R1.2 §2 blocker — pricing pinned into the reservation
+
+**Defect.** The reservation stored only `cost_profile_id`; settlement read the
+CURRENT mutable profile row — a later price change rewrote history.
+
+**Fix.** At authorization time the reservation now pins:
+`cost_profile_id` + `cost_profile_version` + `cost_profile_digest` +
+`billing_mode` + `profile_fixed/input/output/reserve_microusd` +
+`currency=USD` + `pricing_source` + `pricing_effective_at`.
+`settleFromResult` settles token-metered usage from the PINNED snapshot only,
+after re-verifying the pinned digest — a digest mismatch degrades to
+COMMITTED/ACTUAL_USAGE_UNKNOWN (never under-count), never to the mutable
+profile. Also `reserve_microusd=0`/`fixed_microusd=0` no longer fake-bound a
+metered call: bounded requires `reserve>0` OR an explicitly stated fixed fee
+with no positive rates; an all-null/zero-supplied metered schedule stays
+UNBOUNDED and fails closed under a hard policy.
+
+## R1.3 §3 blocker — executor/route binding required at release
+
+**Fix.** `authorizeCredentialFetch` now requires canonical
+`task.selected_executor` and task status ROUTED|RUNNING —
+missing → audited `FAIL_CLOSED_SECRET_EXECUTOR_UNBOUND`. Inside
+`authorizeRelease`, a route-scoped release on an unbound route →
+`FAIL_CLOSED_SECRET_ROUTE_UNBOUND`; a contract hard route restriction with
+no route binding → the same. The broker request carries ids only and can
+never supply routing identity.
+
+## R1.4 §4 blocker — full P12 narrowing at release
+
+**Fix.** A release is a NEW authority decision: the complete effective
+executor authority is re-evaluated at fetch time —
+`allowed_executor_ids ∩ restricted_executor_ids − denied_executor_ids` and
+`denied_route_ids` / `restricted_route_ids` (when a route is bound) from
+`agentContracts.effectiveForMission` (pinned ∩ current). Contract tightening
+after routing now revokes future releases.
+
+## R1.5 §5 blocker — business/project isolation at pin
+
+**Fix.** `startMission` resolves `metadata.business_id` to the canonical
+`business` row (`FAIL_CLOSED_SECRET_BUSINESS_UNKNOWN`), requires
+`business.project_id === mission.project_id`
+(`FAIL_CLOSED_SECRET_CROSS_BUSINESS`), and requires the bound org_agent to
+belong to that business (`FAIL_CLOSED_SECRET_AGENT_REF`). A forged
+`metadata.business_id` can no longer mint BUSINESS_A grants on a BUSINESS_B
+project.
+
+## R1.6 §6 blocker — API control fields split from strict payloads
+
+**Fix.** The `/api/*/update` endpoints now destructure control fields
+(`policy_id`, `cost_policy_id`, `expected_version`) away from the payload
+before strict validation; `expected_version` is required (400 otherwise).
+New service-level `updateCostPolicy` / `updateCostProfile` resolve the
+canonical identity and fail `FAIL_CLOSED_COST_*_NOT_FOUND` when it doesn't
+exist — an update can never silently create.
+
+## R1.7 §7+§8 — purpose + reference validation
+
+- `allowed_purpose`: no canonical purpose subject exists → non-null rejected
+  at create AND update with `FAIL_CLOSED_SECRET_PURPOSE_UNSUPPORTED`
+  (mandate option B).
+- `assertAllowSetRefs`: every allowed_agent_ids id must exist and belong to
+  the business (`FAIL_CLOSED_SECRET_AGENT_REF`); allowed_project_ids must be
+  the business' canonical `project_id` (`FAIL_CLOSED_SECRET_PROJECT_REF`);
+  executor ids must be `PAIR_NATIVE` or a real executor
+  (`FAIL_CLOSED_SECRET_EXECUTOR_REF`); route ids must exist
+  (`FAIL_CLOSED_SECRET_ROUTE_REF`).
+
+## R1.8 R1 test matrix (12 new tests, 48 total)
+
+- COST-R1-A: RELEASED + halt → retry FAIL_CLOSED_COST_HALT, 0 dispatch.
+- COST-R1-B: RELEASED + tightened cap → FAIL_CLOSED_COST_BUDGET_EXCEEDED.
+- COST-R1-C: ambiguous HELD → FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS.
+- COST-R1-D: V1 dispatch → V2 profile update → settlement prices the V1 pin.
+- COST-R1-E: METERED_API zero-supplied bound + hard policy → UNBOUNDED.
+- SECRET-R1-A: unbound task → EXECUTOR_UNBOUND + audited.
+- SECRET-R1-B: contract allowed_executor_ids tightened → denied.
+- SECRET-R1-C: hard executor restriction excludes bound executor → denied.
+- SECRET-R1-D: denied route / route allow-set on unbound route → denied.
+- SECRET-R1-E: forged business_id on another project + unknown business →
+  fail closed at startMission.
+- PURPOSE-R1: create + update reject non-null allowed_purpose.
+- API-R1: valid updates with expected_version pass; stale CAS → 409;
+  unknown payload field → 409; nonexistent id → no silent create.
+
+## R1.9 Validation evidence
+
+- `pnpm run typecheck` PASS · `pnpm run build` PASS
+- P13 suite **48/48** · P12 **71/71** · P11 **103/103** · P9 **79/79**
+- Node 22.23.3 full `pnpm test`: **1904 pass / 2 fail / 24 skip** — the 2
+  fails are the same documented env-dependent p5 executor probes.
+- Node 20.20.2 `npx vitest run`: **1906 pass / 0 fail / 24 skip**
+  (better-sqlite3@11.10.0 ABI rebuilt both ways).
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**.
+- Worker races PASS: last-cap reservation, crash-reconcile convergence,
+  secret-policy CAS (all rerun under R1 code).
+- `verifyIntegrity` clean; no test weakened — two pre-existing P9/P11 tests
+  updated only to encode the stricter fail-closed semantics (bound task for
+  release; forged business_id now throws at start).
+
+## R1.10 Classification
+
+**`P13_REMEDIATED_R1_PENDING_AUDIT`** — pushed to the existing P13 PR;
+DO NOT MERGE; DO NOT START P14/P15.
