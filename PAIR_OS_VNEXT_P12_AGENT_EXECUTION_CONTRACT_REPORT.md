@@ -690,3 +690,39 @@ NO PROVEN DISPATCH           → assertAgentExecutionAllowed
 
 `P12_REMEDIATED_R4_PENDING_AUDIT` — DO NOT MERGE; independent audit
 required. No P13/P14/P15 work performed or implied.
+
+---
+
+# FINAL GOVERNANCE CLOSURE
+
+Independent audit was completed against exact runtime head
+`bced1b2db6726cea695bd32a5e39e128cffd166a` (PR #5) and returned
+**`P12_OFFICIAL_FINAL_PASS`**.
+
+All R1/R2/R3/R4 remediation evidence above is preserved as historical
+record. This closure changes classification only — no runtime, test, CI,
+or dependency content is modified.
+
+## Recorded validation evidence (at audited head `bced1b2`)
+
+- P12 suite: **71/71 PASS**
+- P11 regression: **103/103 PASS**
+- Node 20.20.2 full suite: **1858 pass / 0 fail** / 24 skipped
+- Node 22.23.3 full suite: **1856 pass** / **2 documented pre-existing
+  environment-dependent p5 executor-probe failures** (dsh/codex binaries
+  present in the dev-box PATH; pass on a clean env/Node 20) / 24 skipped
+- `tsc --noEmit`: **PASS** · `pnpm build`: **PASS**
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**
+- Contract CAS worker race: **PASS** · dispatch-recovery concurrency
+  race (worker_threads): **PASS**
+- `PairEvidenceStore.verifyIntegrity`: **clean**
+- GitHub Actions: **OPTIONAL** under existing release governance —
+  Devin/local required validation + independent audit + manual PR merge
+  discipline remain the release gate.
+
+## Final classification
+
+**`P12_OFFICIAL_FINAL_PASS`** — the Agent Execution Contract is the
+canonical enforceable execution identity for `org_agent`. DO NOT MERGE
+yet per release governance: merge happens manually only after this
+recorded closure. No P13/P14/P15 work is implied.

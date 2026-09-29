@@ -65,8 +65,13 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - **API**: `GET|POST /api/org-agents/:id/contract`,
   `POST /api/org-agents/:id/contract/(enable|disable)`,
   `GET /api/org-agents/:id/effective-policy`.
-- Classification: `P12_REMEDIATED_R4_PENDING_AUDIT` — not merged; see
-  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1–R4.
+- Classification: **`P12_OFFICIAL_FINAL_PASS`** — independent audit
+  passed at runtime head `bced1b2db6726cea695bd32a5e39e128cffd166a`
+  (PR #5); validation recorded in
+  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` (final
+  governance closure): P12 71/71, P11 103/103, N20 1858/0, N22
+  1856/2env, typecheck+build PASS, audit 0 high, races PASS, integrity
+  clean. Still unmerged per manual-merge governance.
 
 ## Not yet
 
