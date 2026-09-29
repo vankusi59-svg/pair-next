@@ -524,8 +524,13 @@ try {
 
 function ensureWorkerBundle() {
   fs.mkdirSync(CACHE, { recursive: true });
+  // fs.globSync is Node 22+ — CI runs this on Node 20 too, so scan .pnpm
+  // by hand for the newest esbuild binary.
   const esbuild = fs
-    .globSync("node_modules/.pnpm/esbuild@*/node_modules/esbuild/bin/esbuild")
+    .readdirSync("node_modules/.pnpm")
+    .filter((d) => d.startsWith("esbuild@"))
+    .map((d) => path.join("node_modules/.pnpm", d, "node_modules/esbuild/bin/esbuild"))
+    .filter((p) => fs.existsSync(p))
     .sort()
     .at(-1);
   if (!esbuild) throw new Error("esbuild binary not found under node_modules/.pnpm");
