@@ -358,3 +358,129 @@ checks `build-and-test` + `security-audit`).
 **Classification submitted for independent audit:
 `P11_REMEDIATED_R3_PENDING_AUDIT`.** This report does not self-certify;
 `P11_OFFICIAL_FINAL_PASS` requires the independent re-audit to agree.
+
+---
+
+## §10.10 P11 REMEDIATION R4 — FINAL RESTART ACCOUNTING CLOSURE
+
+Independent audit of head `a011d553640379e1874c2cdbe230be2742524067`
+(§10.9) found one remaining crash window: after a schedule occurrence +
+mission become canonical but BEFORE the `mission_schedule` accounting
+row is durably updated, a restart left `run_count`/`last_mission_id`/
+`last_fired_at`/`next_due_at` stale and could leave a HELD budget
+reservation double-counting the mission. This round closes it on the
+same PR (#4).
+
+### §10.10.1 Root cause → fix
+
+`reconcileOccurrences()` repaired occurrence state but never projected
+canonical evidence back into `mission_schedule` accounting or the
+budget ledger. Canonical truth order now enforced: **(1) mission
+existence → (2) occurrence binding → (3) schedule accounting →
+(4) budget reservation** — the latter two are derived/reconcilable only.
+
+New `MissionScheduleService.reconcileScheduleAccounting()` runs at the
+top of every `fireDue` (before any `due()` snapshot — §9 restart order):
+
+1. **`reconcileOccurrences()`** — binds CLAIMED/RELEASED→FIRED by
+   canonical mission; now fail-closed on multi-claim (was `.find` —
+   silently picked the first claimant; two missions claiming one
+   occurrence is now an audited `SCHEDULE_OCCURRENCE_INTEGRITY`, no
+   binding chosen). Same fix applied to the `_fireDue` post-create
+   catch path.
+2. **`reconcileScheduleReservations()`** — settles HELD schedule
+   reservations by canonical evidence:
+   `mission exists → CONSUMED` (exactly once — a fired occurrence can no
+   longer count as mission + HELD); `occurrence RELEASED + no mission →
+   RELEASED`; `CLAIMED + no mission → untouched` (claimant inside TTL);
+   `FIRED + no mission / missing occurrence / multi-claim →
+   BUDGET_RESERVATION_INTEGRITY`, left HELD (fail closed, TTL bounds it).
+   Legacy pre-R4 `schedule:<id>` refs repair only when the schedule has
+   exactly one occurrence to attribute — otherwise audited ambiguous.
+3. **`reconcileScheduleRows()`** — projects `mission_schedule`
+   accounting from valid FIRED occurrences. **run_count is DERIVED, not
+   incremented**: = #valid FIRED occurrences + legacy schedule missions
+   (`metadata.schedule_id` set, no `schedule_occurrence_id` — the
+   pre-occurrence-era format). With zero derivable evidence the stored
+   count is untouched. `last_mission_id`/`last_fired_at` come from the
+   latest FIRED occurrence (canonical `fired_at`; documented fallback —
+   mission `created_at`, never restart wall-clock). `next_due_at`
+   advances only when it still names an already-fired occurrence →
+   `nextRunAfter(cron, latestFired.due_at)` — a *missed tick* between
+   X and now is then fired legitimately by fireDue (catch-up), never
+   skipped; anything already past is fireDue's normal advance.
+
+   Occurrence validity is strict: bound mission exists AND claims the
+   occurrence (`schedule_occurrence_id` match) AND `schedule_id` matches
+   AND `scheduled_for === due_at`, exactly one claimant. Any conflict
+   taints the schedule — `SCHEDULE_ACCOUNTING_INTEGRITY` event, row
+   untouched (§14 fail-closed: missing bound mission, wrong-schedule
+   claim, multi-claim, bound≠canonical, missing occurrence row, missing
+   schedule row). Successful repair emits `SCHEDULE_ACCOUNTING_RECONCILED`
+   with old/new field values.
+
+   Idempotent: a healthy row derives zero diff → no write, no event.
+   CAS-conflict retry ×3, then audited `accounting_write_unproven`.
+
+### §10.10.2 Reservation identity (§8)
+
+`BusinessLayer` schedule preflight now reserves with
+`ref_id = schedule-occurrence:<occurrence_id>` (was `schedule:<id>`) —
+a reservation for occurrence X can never settle Y's accounting.
+
+### §10.10.3 Consistency fix discovered by tests
+
+`_fireDue` wrote `last_fired_at = now` (tick param) while the occurrence
+carries `fired_at` (bind time) — every restart reconcile would rewrite
+the row once. `_fireDue` now mirrors the occurrence's canonical
+`fired_at`, so a healthy row is a zero-diff no-op.
+
+### §10.10.4 Files changed / tests
+
+- `src/pair/mission-schedule.ts` — `reconcileScheduleAccounting()` +
+  `reconcileScheduleReservations()` + `reconcileScheduleRows()`;
+  `_fireDue` calls it before `due()`; multi-claim fail-closed in
+  `reconcileOccurrences` and the `_fireDue` catch; `last_fired_at` ←
+  canonical `occ.fired_at`.
+- `src/pair/business.ts` — preflight ref → `schedule-occurrence:<id>`.
+- `src/__tests__/pair-p11-r2.test.ts` — occurrence replay test pinned
+  `now = dueAt` for determinism (comment documents that a missed tick
+  between X and a later `now` legitimately fires — mandated catch-up,
+  not a regression).
+- `src/__tests__/pair-p11-r4.test.ts` — **12 tests**: A–G crash
+  boundaries (CLAIMED+mission+HELD repair; FIRED+stale schedule; HELD→
+  CONSUMED once; RELEASED→reservation released + not counted; idempotent
+  ×3 reconcile; two-occurrence derivation; four conflicting-evidence
+  fail-closed cases incl. multi-claim and missing mission); §11 genuine
+  restart (close store, fresh PairEvidenceStore+stack on same db,
+  reconcile, `verifyIntegrity` clean); ref-identity test.
+- `.github/workflows/ci.yml` — focused P11 step includes r4 file.
+
+### §10.10.5 Verification
+
+- P11 suites: **90/90** (22+25+19+12+12) on **Node 22 and Node 20**
+  (better-sqlite3 rebuilt per ABI for each run).
+- Full suite: 1772 pass / 24 skipped / 2 pre-existing env-dependent
+  `pair-p5.test.ts` probe fails (green on CI — unchanged since R1).
+- `pnpm run typecheck` clean; `pnpm run build` clean.
+- `pnpm audit --audit-level=high`: **0 high, 0 critical** (9 moderate/low
+  as expected posture).
+- `PairEvidenceStore.verifyIntegrity` clean after restart repair.
+- All worker_threads contention races (R2 §2 A–F) unweakened and green.
+
+### §10.10.6 Remaining limitations
+
+- Legacy `schedule:<id>` HELD rows on schedules with >1 occurrence stay
+  HELD (audited ambiguous) until TTL expiry — deliberate fail-closed.
+- A mission claiming a *missing* occurrence row taints its schedule
+  (integrity event) — repair requires operator action.
+- Reconcile runs per fireDue tick — fine at current scale.
+
+### §10.10.7 Branch protection
+
+Unchanged: **OPERATOR ACTION REQUIRED** — integration token 403; NOT
+enabled. Enable after R4 audit passes, before merge.
+
+**Classification submitted for independent audit:
+`P11_REMEDIATED_R4_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
+requires the independent re-audit — this report does not self-certify.

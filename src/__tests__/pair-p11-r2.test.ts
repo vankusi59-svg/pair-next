@@ -296,7 +296,11 @@ describe("R2 §3 schedule occurrence exactly-once", () => {
     const sch2 = new MissionScheduleService(ctx2.service);
     const s = makeDueSchedule(sch1);
     const dueAt = String(s.next_due_at);
-    const now = utcnow();
+    // `now` pinned to dueAt: the reconciled next_due_at (nextRunAfter
+    // strictly after dueAt) can then never itself be due in this test —
+    // keeping the assertion deterministic. (R4 folds a missed tick
+    // between X and a later `now` into a legitimate extra fire.)
+    const now = dueAt;
 
     let submits = 0;
     const submit = (input: Record<string, unknown>) => {

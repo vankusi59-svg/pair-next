@@ -116,11 +116,18 @@ export class BusinessLayer {
       const md = (input.metadata ?? {}) as Record<string, unknown>;
       const businessId = String(md.business_id ?? "");
       if (!businessId) return null;
+      // Ref identity is the specific OCCURRENCE, not the schedule — a
+      // reservation for SCHED:X must never settle SCHED:Y's accounting
+      // (R4 §8). Legacy `schedule:<id>` rows are repaired/flagged by
+      // MissionScheduleService.reconcileScheduleReservations.
+      const refId = md.schedule_occurrence_id
+        ? `schedule-occurrence:${String(md.schedule_occurrence_id)}`
+        : `schedule:${String(md.schedule_id ?? "")}`;
       const rid = this.reserveBudget(
         businessId,
         String(md.department ?? ""),
         md.org_agent_id ? String(md.org_agent_id) : null,
-        `schedule:${String(md.schedule_id ?? "")}`,
+        refId,
       );
       if (!rid) return null;
       return {
