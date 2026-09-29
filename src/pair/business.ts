@@ -435,9 +435,12 @@ export class BusinessLayer {
       });
       const missionId = String(mission.mission_id);
       const linked = this.store.get("work_item", workItemId);
-      (linked.mission_ids as string[]).push(missionId);
-      linked.pending_open_id = null;
-      linked.pending_open_at = null;
+      const linkedIds = linked.mission_ids as string[];
+      if (!linkedIds.includes(missionId)) linkedIds.push(missionId);
+      if (String(linked.pending_open_id ?? "") === openId) {
+        linked.pending_open_id = null;
+        linked.pending_open_at = null;
+      }
       linked.updated_at = utcnow();
       const saved = this.store.put("work_item", workItemId, linked, Number(linked.version));
       if (reservationId) this.consumeBudgetReservation(reservationId);
@@ -457,6 +460,29 @@ export class BusinessLayer {
       if (repaired) {
         if (reservationId) this.consumeBudgetReservation(reservationId);
         return repaired;
+      }
+      // A concurrent reconciler may already have linked this intent's mission
+      // and cleared the marker — then the open DID land exactly once and a
+      // lost CAS race is not a failed open. Any other error still propagates.
+      const curRow = this.store.tryGet("work_item", workItemId);
+      if (
+        curRow &&
+        (err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT"
+      ) {
+        const owned = new Set((curRow.mission_ids as string[] | undefined) ?? []);
+        const mine = this.store
+          .list("mission")
+          .some(
+            (m) =>
+              owned.has(String(m.mission_id)) &&
+              String(
+                (m.metadata as Record<string, unknown> | undefined)?.work_item_open_id ?? "",
+              ) === openId,
+          );
+        if (mine) {
+          if (reservationId) this.consumeBudgetReservation(reservationId);
+          return curRow;
+        }
       }
       if (reservationId) this.releaseBudgetReservation(reservationId);
       const cur = this.store.tryGet("work_item", workItemId);
@@ -559,7 +585,18 @@ export class BusinessLayer {
     row.pending_open_id = null;
     row.pending_open_at = null;
     row.updated_at = utcnow();
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    let saved: Row;
+    try {
+      saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    } catch (err) {
+      // A racing reconciler may have linked the same mission first — the
+      // outcome is identical; return the fresh row instead of throwing.
+      const fresh = this.store.get("work_item", workItemId);
+      if ((fresh.mission_ids as string[]).includes(String(orphan.mission_id))) {
+        return fresh;
+      }
+      throw err;
+    }
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_RECONCILED",
       new_state: String(row.status), actor: `pair_reconcile:${actor}`,
