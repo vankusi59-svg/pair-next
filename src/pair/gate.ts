@@ -16,6 +16,7 @@ import { TASK_DISPATCHABLE_STATES } from "./service.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ExecutorAdapter } from "./adapter.js";
 import { ArtifactProvenanceValidator } from "./artifact-validation.js";
+import { sanitizeUntrustedRemote } from "./sanitizer.js";
 
 const RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
 const HIGH_IMPACT_PERMISSIONS = new Set([
@@ -938,7 +939,12 @@ export class GovernedTaskGate {
     executionId: string,
   ): Record<string, unknown> {
     const execution = this.store.get("executor_execution", executionId);
-    const observed = adapter.observe(executionId);
+    // Remote observation text is untrusted — scrub broker material before
+    // it becomes canonical (P13-R4 §1).
+    const observed = sanitizeUntrustedRemote(adapter.observe(executionId)).value as Record<
+      string,
+      unknown
+    >;
     execution.last_observation = observed;
     if (observed.status && String(observed.status) !== String(execution.execution_state)) {
       execution.execution_state = String(observed.status);
@@ -951,7 +957,7 @@ export class GovernedTaskGate {
     executionId: string,
   ): Record<string, unknown> {
     const execution = this.store.get("executor_execution", executionId);
-    const result = adapter.collect_result(executionId);
+    let result = adapter.collect_result(executionId);
     // Identity binding: result must name the same governed task / mission / task.
     for (const field of ["mission_id", "task_id", "governed_task_id"]) {
       if (result[field] && String(result[field]) !== String(execution[field])) {
@@ -960,6 +966,20 @@ export class GovernedTaskGate {
           `${field}:${result[field]}!=${execution[field]}`,
         );
       }
+    }
+    // P13-R4 §1: untrusted remote output is sanitized BEFORE it becomes
+    // canonical — broker capabilities, the master token and released
+    // credential values are redacted here; the store layer additionally
+    // fails closed on any raw bcap1.* that still reaches it. The redaction
+    // audit records counts only, never the value.
+    const sanitized = sanitizeUntrustedRemote(result);
+    result = sanitized.value as Record<string, unknown>;
+    if (sanitized.capability_redactions > 0 || sanitized.secret_redactions > 0) {
+      this.store.appendEvidence(String(execution.mission_id), "REMOTE_RESULT_REDACTED", {
+        execution_id: executionId,
+        capability_redactions: sanitized.capability_redactions,
+        secret_redactions: sanitized.secret_redactions,
+      });
     }
     execution.result = result;
     // P13 §16: settle the reservation — adapter-proven figures settle

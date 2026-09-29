@@ -20,6 +20,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { utcnow } from "./canonical.js";
+import { registerSensitiveMaterial } from "./sanitizer.js";
 
 export interface BrokerCredential {
   name: string;
@@ -90,6 +91,9 @@ export class CredentialBroker {
       updated_at: utcnow(),
     };
     this.save(creds);
+    // R4 §1: vault values are never-canonical material — an echo in remote
+    // output is redacted before persistence.
+    registerSensitiveMaterial(creds[name].value);
     const { value: _v, ...meta } = creds[name];
     return meta;
   }
@@ -126,6 +130,7 @@ export class CredentialBroker {
     ctx: { mission_id?: string | null; task_id?: string | null },
   ): BrokerCredential | null {
     const cred = this.load()[String(name)] ?? null;
+    if (cred) registerSensitiveMaterial(cred.value);
     this.audit?.({
       event_type: cred ? "CREDENTIAL_RELEASED" : "CREDENTIAL_DENIED",
       credential_name: String(name),

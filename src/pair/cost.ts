@@ -164,10 +164,9 @@ export class CostService {
     if (warn != null && (!(warn > 0) || warn > 100)) {
       throw new IntegrityError("FAIL_CLOSED_COST_WARNING_THRESHOLD", String(warn));
     }
-    const id =
-      input.cost_policy_id && this.store.tryGet("cost_policy", String(input.cost_policy_id))
-        ? String(input.cost_policy_id)
-        : newId("CPO");
+    // R4 §2: a caller-supplied cost_policy_id is THE create identity —
+    // honored exactly, never silently replaced by a generated id.
+    const id = input.cost_policy_id ? String(input.cost_policy_id) : newId("CPO");
     const existing = this.store.tryGet("cost_policy", id);
     const row = {
       schema: COST_SCHEMA,
@@ -207,18 +206,23 @@ export class CostService {
     return saved;
   }
 
-  /** R3 §3: create-only — a colliding canonical identity is a hard
-   *  conflict, never a silent authority rewrite. Use the CAS
-   *  updateCostPolicy path to change an existing policy. */
+  /** R3 §3 + R4 §2: create is INSERT-ONLY, enforced atomically at the
+   *  storage CAS boundary — the check+insert run inside one BEGIN
+   *  IMMEDIATE transaction and the write itself expects version 0, so a
+   *  racing creator's commit turns into FAIL_CLOSED_COST_POLICY_EXISTS
+   *  and can never silently update the winner's row. */
   createCostPolicy(input: Record<string, unknown>, actor: string): Record<string, unknown> {
-    const supplied = input.cost_policy_id != null ? String(input.cost_policy_id) : "";
-    if (supplied && this.store.tryGet("cost_policy", supplied)) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_COST_POLICY_EXISTS",
-        `${supplied} — use /api/cost-policies/update with expected_version`,
-      );
+    try {
+      return this.store.immediate(() => this.upsertCostPolicy(input, actor, 0));
+    } catch (e) {
+      if (e instanceof IntegrityError && e.code === "FAIL_CLOSED_VERSION_CONFLICT") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_COST_POLICY_EXISTS",
+          `${String(input.cost_policy_id ?? "")} — use /api/cost-policies/update with expected_version`,
+        );
+      }
+      throw e;
     }
-    return this.upsertCostPolicy(input, actor);
   }
 
   /** R1 §6: an update must never silently create — the id is required
@@ -314,19 +318,24 @@ export class CostService {
     return saved;
   }
 
-  /** R3 §3: create-only — posting an existing (ref_type, ref_id)
-   *  identity must fail closed; the CAS update path owns changes. */
+  /** R3 §3 + R4 §2: create is INSERT-ONLY, enforced atomically at the
+   *  storage CAS boundary — the deterministic (ref_type, ref_id) identity
+   *  either inserts fresh or fails FAIL_CLOSED_COST_PROFILE_EXISTS; a
+   *  concurrent create can never become an update of the winner's row. */
   createCostProfile(input: Record<string, unknown>, actor: string): Record<string, unknown> {
-    const refType = String(input.ref_type ?? "");
-    const refId = String(input.ref_id ?? "");
-    const id = `CPRO_${refType}_${digest(`${refType}:${refId}`).slice(0, 20)}`;
-    if (this.store.tryGet("cost_profile", id)) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_COST_PROFILE_EXISTS",
-        `${refType}:${refId} — use /api/cost-profiles/update with expected_version`,
-      );
+    try {
+      return this.store.immediate(() => this.upsertCostProfile(input, actor, 0));
+    } catch (e) {
+      if (e instanceof IntegrityError && e.code === "FAIL_CLOSED_VERSION_CONFLICT") {
+        const refType = String(input.ref_type ?? "");
+        const refId = String(input.ref_id ?? "");
+        throw new IntegrityError(
+          "FAIL_CLOSED_COST_PROFILE_EXISTS",
+          `${refType}:${refId} — use /api/cost-profiles/update with expected_version`,
+        );
+      }
+      throw e;
     }
-    return this.upsertCostProfile(input, actor);
   }
 
   /** R1 §6: update resolves the ref identity — it must already exist. */

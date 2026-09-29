@@ -628,3 +628,90 @@ unchanged.
 
 **`P13_REMEDIATED_R3_PENDING_AUDIT`** — pushed to the existing P13 PR;
 DO NOT MERGE; DO NOT START P14/P15.
+
+---
+
+# REMEDIATION R4 — canonical secret non-persistence + atomic create-only closure
+
+R4 closes the two remaining findings on the existing PR.
+
+## R4.1 §1 — untrusted remote output can no longer persist broker material
+
+**Defect.** `adapter.collect_result()` output (and `observe()` text) flowed
+into `executor_execution.result` / `last_observation` verbatim. A remote
+worker echoing its scoped `bcap1.*` capability, the master token, or a
+broker-released credential value could plant that material into canonical
+entities/evidence/events — prompt instructions were the only guard.
+
+**Fix — deterministic sanitization boundary + defense-in-depth.**
+
+- New `src/pair/sanitizer.ts`: `sanitizeUntrustedRemote` deep-walks
+  untrusted values and rewrites `bcap1.<payload>.<sig>` →
+  `[REDACTED:BROKER_CAPABILITY]` and any registered sensitive string →
+  `[REDACTED:SECRET_MATERIAL]`; `registerSensitiveMaterial` (a runtime,
+  never-persisted set) is fed at the producing boundaries:
+  `mintBrokerCapability` registers the minted token AND the master
+  secret; `CredentialBroker.upsert`/`release` register vault/released
+  values; `authorizeBrokerFetch` re-registers the master secret.
+- `GovernedTaskGate.collect_execution_result` sanitizes the adapter
+  result before `execution.result` — settlement uses the sanitized value
+  (usage figures are numbers, unaffected); `observe_execution` sanitizes
+  `last_observation`. When redactions occur, `REMOTE_RESULT_REDACTED`
+  evidence is appended carrying counts only — never the value.
+- Store layer: `PairEvidenceStore.assertSecretFree` now also hard-fails
+  any raw `bcap1.*` string in payloads (`FAIL_CLOSED_SENSITIVE_MATERIAL`)
+  — entities AND evidence were already covered; `store.event()` now scans
+  metadata + state fields too. Nothing canonical legitimately contains a
+  capability, so this is a strict fail-closed backstop.
+
+## R4.2 §2 — create-only cost authority is atomic
+
+**Defect.** `createCostProfile()` did `tryGet(identity)` →
+`upsertCostProfile()`: a racing second creator could pass the existence
+check, then its upsert read the winner's committed version and updated
+the winner's row — a create race became an unchecked update.
+
+**Fix.** Both `createCostProfile` and `createCostPolicy` now run inside
+`store.immediate()` and write with `expectedVersion = 0` — INSERT-only
+enforced at the CAS boundary (`INSERT ... ON CONFLICT DO NOTHING` plus
+the serialized transaction). A racer's commit surfaces as
+`FAIL_CLOSED_VERSION_CONFLICT` → rethrown as
+`FAIL_CLOSED_COST_{PROFILE,POLICY}_EXISTS`; a losing create can never
+mutate the winner's row. A caller-supplied `cost_policy_id` is now THE
+create identity, honored exactly (previously a novel supplied id was
+silently replaced by a generated `CPO_*`); UPDATE remains the separate
+CAS path (`/update` + `expected_version` → `FAIL_CLOSED_VERSION_CONFLICT`).
+
+## R4.3 R4 test matrix (4 new tests, P13 now 62)
+
+- SANITIZE-R4-A: legit scoped fetch PASS; worker result echoing
+  capability + `master-secret` + released `SENTINEL` through the real
+  collect path → canonical dump (missions/tasks/governed/executions/
+  intents/reservations/evidence/events) contains none of them;
+  `[REDACTED:*]` markers present; `REMOTE_RESULT_REDACTED` audited with
+  counts only; post-dispatch capability reminted with the real
+  governed_task_id still authorizes; `verifyIntegrity` clean.
+- SANITIZE-R4-B: direct `store.put` / `appendEvidence` / `store.event`
+  carrying a raw `bcap1.*` → `FAIL_CLOSED_SENSITIVE_MATERIAL`.
+- CREATE-R4-A: 4-connection worker race on `createCostProfile` — exactly
+  one winner, 3 × `FAIL_CLOSED_COST_PROFILE_EXISTS`, winner row unchanged
+  (version 1, payload intact); sequential dup create also fails closed.
+- CREATE-R4-B: 3-connection worker race on a supplied `cost_policy_id` —
+  exactly one winner at that exact id; a fresh supplied id is honored.
+
+## R4.4 Validation evidence
+
+- `pnpm run typecheck` PASS · `pnpm run build` PASS
+- P13 **62/62** · P12 **71/71** · P11 **103/103** · P9 **79/79**
+- Node 22.23.3 `pnpm test`: **1918 pass / 2 fail / 24 skip** — same two
+  documented env-dependent p5 executor probes.
+- Node 20.20.2 `npx vitest run`: **1920 pass / 0 fail / 24 skip**.
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**.
+- Worker races PASS: cost last-cap, recovery, secret CAS, P11/P12 races,
+  + new create-only races (profile ×4, policy ×3).
+- `verifyIntegrity` clean.
+
+## R4.5 Classification
+
+**`P13_REMEDIATED_R4_PENDING_AUDIT`** — pushed to the existing P13 PR;
+DO NOT MERGE; DO NOT START P14/P15.

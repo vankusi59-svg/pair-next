@@ -15,6 +15,7 @@
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { utcnow } from "./canonical.js";
+import { registerSensitiveMaterial } from "./sanitizer.js";
 
 export interface BrokerCapabilityClaims {
   mission_id: string;
@@ -48,7 +49,13 @@ export function mintBrokerCapability(
     issued_at: claims.issued_at ?? utcnow(),
   };
   const payloadB64 = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  return `bcap1.${payloadB64}.${sign(masterSecret, payloadB64)}`;
+  const token = `bcap1.${payloadB64}.${sign(masterSecret, payloadB64)}`;
+  // R4 §1: both the minted capability and the master secret are registered
+  // as never-canonical material — a remote worker echoing either sees it
+  // redacted before persistence.
+  registerSensitiveMaterial(token);
+  registerSensitiveMaterial(masterSecret);
+  return token;
 }
 
 export function verifyBrokerCapability(

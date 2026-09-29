@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import { verifyBrokerCapability } from "./broker-capability.js";
+import { registerSensitiveMaterial } from "./sanitizer.js";
 import path from "node:path";
 import { IntegrityError, NotFoundError, PolicyError } from "./errors.js";
 import type { PairControlPlane } from "./service.js";
@@ -573,6 +574,10 @@ export class MissionControl {
     capability: string,
     masterSecret: string,
   ): { granted: boolean; reason: string } {
+    // R4 §1: the master secret is registered at the verification boundary
+    // too, so an echo from a hostile worker is redacted even when minting
+    // happened on a different path.
+    registerSensitiveMaterial(masterSecret);
     const claims = verifyBrokerCapability(masterSecret, capability);
     if (!claims) {
       this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_BROKER_CAPABILITY");

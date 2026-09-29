@@ -1025,6 +1025,20 @@ try {
     });
     const res = store.get("cost_reservation", "CRSV_" + args.governedTaskId);
     parentPort.postMessage({ ok: true, out: { status: String(res.status) } });
+  } else if (op === "costProfileCreate") {
+    const store = new PAIR.PairEvidenceStore(dbPath);
+    const service = new PAIR.PairControlPlane(store);
+    parentPort.postMessage({ ready: true });
+    Atomics.wait(barrier, 0, 0);
+    const row = service.cost.createCostProfile(args.input, "worker");
+    parentPort.postMessage({ ok: true, out: { reservation_id: String(row.cost_profile_id), status: "CREATED" } });
+  } else if (op === "costPolicyCreate") {
+    const store = new PAIR.PairEvidenceStore(dbPath);
+    const service = new PAIR.PairControlPlane(store);
+    parentPort.postMessage({ ready: true });
+    Atomics.wait(barrier, 0, 0);
+    const row = service.cost.createCostPolicy(args.input, "worker");
+    parentPort.postMessage({ ok: true, out: { reservation_id: String(row.cost_policy_id), status: "CREATED" } });
   } else {
     throw new Error("unknown op " + op);
   }
@@ -1880,5 +1894,174 @@ describe("P13-R3.api: create-only endpoints + CAS update", () => {
     } finally {
       server.close();
     }
+  });
+});
+
+describe("P13-R4.ingress: hostile remote output cannot persist broker material", () => {
+  function dumpCanonical(ctx: Ctx, missionId: string) {
+    return JSON.stringify({
+      missions: ctx.store.list("mission"),
+      tasks: ctx.store.list("task"),
+      governed: ctx.store.list("governed_task"),
+      executions: ctx.store.list("executor_execution"),
+      intents: ctx.store.list("executor_dispatch_intent"),
+      reservations: ctx.store.list("cost_reservation"),
+      evidence: ctx.store.listEvidence(missionId),
+      events: ctx.store.listEvents(),
+    });
+  }
+
+  it("SANITIZE-R4-A: echoed capability + master + released credential are redacted, audited without the value", () => {
+    const { ctx, biz } = makeBizCtx("r4san");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    secretPolicy(ctx, String(b.business_id), "openai");
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
+    const mid = String(mission.mission_id);
+    const tid = String(task.task_id);
+    const broker = makeBroker(ctx);
+    broker.upsert({ name: "openai", value: SENTINEL, domains: ["api.openai.com"], kind: "token" });
+
+    // Legitimate scoped-capability fetch still works pre-dispatch.
+    const cap = mintBrokerCapability("master-secret", {
+      mission_id: mid, task_id: tid, governed_task_id: null, executor_id: "EXEC_A",
+    });
+    expect(ctx.control.authorizeBrokerFetch(mid, tid, "openai", cap, "master-secret").granted).toBe(true);
+    const cred = broker.release("openai", { mission_id: mid, task_id: tid });
+    expect(cred?.value).toBe(SENTINEL);
+
+    // Hostile worker echoes everything it ever saw.
+    a.resultPayload = {
+      status: "COMPLETED",
+      output: `cap=${cap} master=master-secret cred=${SENTINEL}`,
+      detail: { echoed: [cap, SENTINEL] },
+    };
+    const routed = dispatchOne(ctx, mission);
+    ctx.gate.collect_execution_result(a, String(routed.execution.execution_id));
+
+    const dump = dumpCanonical(ctx, mid);
+    expect(dump).not.toContain("bcap1.");
+    expect(dump).not.toContain("master-secret");
+    expect(dump).not.toContain(SENTINEL);
+    const exec = ctx.store.get("executor_execution", String(routed.execution.execution_id));
+    expect(JSON.stringify(exec.result)).toContain("[REDACTED:BROKER_CAPABILITY]");
+    expect(JSON.stringify(exec.result)).toContain("[REDACTED:SECRET_MATERIAL]");
+
+    // Redaction audit: counts only — never the raw material.
+    const redacted = ctx.store
+      .listEvidence(mid)
+      .filter((e) => (e.payload as Record<string, unknown>).kind === "REMOTE_RESULT_REDACTED");
+    expect(redacted.length).toBe(1);
+    const payload = (redacted[0].payload as Record<string, unknown>).payload as Record<string, unknown>;
+    expect(Number(payload.capability_redactions)).toBeGreaterThanOrEqual(2);
+    expect(Number(payload.secret_redactions)).toBeGreaterThanOrEqual(2);
+    expect(JSON.stringify(payload)).not.toContain(SENTINEL);
+
+    // Capability remains functional and bound post-dispatch (governed id
+    // now exists → remint with the real binding).
+    const cap2 = mintBrokerCapability("master-secret", {
+      mission_id: mid, task_id: tid,
+      governed_task_id: String(routed.governed_task.governed_task_id),
+      executor_id: "EXEC_A",
+    });
+    expect(ctx.control.authorizeBrokerFetch(mid, tid, "openai", cap2, "master-secret").granted).toBe(true);
+
+    expect(() => ctx.store.verifyIntegrity()).not.toThrow();
+  });
+
+  it("SANITIZE-R4-B: defense-in-depth — a raw bcap reaching the store/event/evidence plane fails closed", () => {
+    const { ctx, biz } = makeBizCtx("r4deep");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const cap = mintBrokerCapability("master-secret", {
+      mission_id: String(mission.mission_id), task_id: "TSK_x", governed_task_id: null, executor_id: "EXEC_A",
+    });
+    // Entities.
+    expect(() =>
+      ctx.store.put("mission", "MSN_forge", { goal: "x", note: cap }),
+    ).toThrowError(/FAIL_CLOSED_SENSITIVE_MATERIAL/);
+    // Evidence plane.
+    expect(() =>
+      ctx.store.appendEvidence(String(mission.mission_id), "X", { leaked: cap }),
+    ).toThrowError(/FAIL_CLOSED_SENSITIVE_MATERIAL/);
+    // Events plane.
+    expect(() =>
+      ctx.store.event({
+        entity_type: "mission", entity_id: String(mission.mission_id),
+        event_type: "X", actor: "t", metadata: { leaked: cap },
+      }),
+    ).toThrowError(/FAIL_CLOSED_SENSITIVE_MATERIAL/);
+    expect(() => ctx.store.verifyIntegrity()).not.toThrow();
+  });
+});
+
+describe("P13-R4.create: atomic insert-only authority creation", () => {
+  it("CREATE-R4-A: racing createCostProfile — exactly one winner, losers FAIL_CLOSED_COST_PROFILE_EXISTS, row untouched", async () => {
+    const { ctx, biz } = makeBizCtx("r4cp");
+    makeBiz(biz, ctx.projectId);
+    const input = {
+      ref_type: "route", ref_id: "RTE_RACE", billing_mode: "METERED_API",
+      reserve_microusd: 42, source: "race",
+    };
+    const workers = 4;
+    const res = await runRace(
+      Array.from({ length: workers }, () => ({
+        op: "costProfileCreate", dbPath: path.join(ctx.dir, "pair.db"), args: { input },
+      })),
+    );
+    const wins = res.filter((r) => r.ok);
+    const losses = res.filter((r) => !r.ok);
+    expect(wins.length).toBe(1);
+    expect(losses.length).toBe(workers - 1);
+    for (const l of losses) {
+      expect((l as { code: string }).code).toBe("FAIL_CLOSED_COST_PROFILE_EXISTS");
+    }
+    const stored = ctx.store.tryGet("cost_profile", String((wins[0] as { out: { reservation_id: string } }).out.reservation_id));
+    expect(stored).toBeTruthy();
+    expect(Number(stored!.reserve_microusd)).toBe(42);
+    expect(Number(stored!.version)).toBe(1);
+    // Sequential dup create also fails closed without mutating the row.
+    expect(() =>
+      ctx.service.cost.createCostProfile({ ...input, reserve_microusd: 999 }, "op"),
+    ).toThrowError(/FAIL_CLOSED_COST_PROFILE_EXISTS/);
+    expect(Number(ctx.store.get("cost_profile", String(stored!.cost_profile_id)).reserve_microusd)).toBe(42);
+    expect(() => ctx.store.verifyIntegrity()).not.toThrow();
+  });
+
+  it("CREATE-R4-B: racing createCostPolicy on a supplied identity — one winner at that exact id", async () => {
+    const { ctx, biz } = makeBizCtx("r4pol");
+    const b = makeBiz(biz, ctx.projectId);
+    const input = {
+      cost_policy_id: "CPO_SUPPLIED_RACE",
+      business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id),
+      period: "DAY", max_microusd: 100, hard_stop: true,
+    };
+    const workers = 3;
+    const res = await runRace(
+      Array.from({ length: workers }, () => ({
+        op: "costPolicyCreate", dbPath: path.join(ctx.dir, "pair.db"), args: { input },
+      })),
+    );
+    const wins = res.filter((r) => r.ok);
+    const losses = res.filter((r) => !r.ok);
+    expect(wins.length).toBe(1);
+    expect((wins[0] as { out: { reservation_id: string } }).out.reservation_id).toBe("CPO_SUPPLIED_RACE");
+    for (const l of losses) {
+      expect((l as { code: string }).code).toBe("FAIL_CLOSED_COST_POLICY_EXISTS");
+    }
+    const stored = ctx.store.get("cost_policy", "CPO_SUPPLIED_RACE");
+    expect(Number(stored.max_microusd)).toBe(100);
+    expect(Number(stored.version)).toBe(1);
+    // A fresh supplied id is honored exactly — never silently replaced.
+    const p2 = ctx.service.cost.createCostPolicy({ ...input, cost_policy_id: "CPO_OTHER_OK" }, "op");
+    expect(String(p2.cost_policy_id)).toBe("CPO_OTHER_OK");
+    expect(() => ctx.store.verifyIntegrity()).not.toThrow();
   });
 });
