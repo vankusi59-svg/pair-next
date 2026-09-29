@@ -30,7 +30,7 @@ fi
 
 # --- 1. stop old stack --------------------------------------------------------
 pkill -f "telegram-bridge.mjs" 2>/dev/null || true
-OLD_PID=$(ss -tlnp 2>/dev/null | grep ":$PORT" | grep -oP 'pid=\K[0-9]+' | head -1)
+OLD_PID=$(ss -tlnp 2>/dev/null | grep ":$PORT" | grep -oP 'pid=\K[0-9]+' | head -1 || true)
 [ -n "${OLD_PID:-}" ] && kill -9 "$OLD_PID" 2>/dev/null || true
 pkill -f "cloudflared tunnel" 2>/dev/null || true
 sleep 1
