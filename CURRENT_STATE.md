@@ -29,3 +29,17 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - Per-agent executor/permission policy (P12), token/USD cost ledger + scoped
   credential capabilities (P13), autonomous heartbeat/inbox/delegation (P14),
   CEO agent / KPI gap analysis (P15). Intentionally deferred.
+
+## Release governance (current policy)
+
+- **Independent source/code audit + required validation in the Devin/local
+  environment is the release gate.** Required: typecheck, build, focused
+  phase tests, full regression, concurrency/race tests where applicable,
+  `pnpm audit --audit-level=high`, evidence integrity.
+- **GitHub Actions is OPTIONAL** — never a release blocker. The CI workflow
+  (`.github/workflows/ci.yml`) has no automatic trigger; it is runnable
+  manually via `workflow_dispatch`. An Actions billing/account failure is an
+  external state, not a code failure.
+- Intended `main` branch protection: require a pull request before merge;
+  **no** GitHub Actions status checks. Enabling it remains an operator
+  action (see the P11 hardening report §10.13).

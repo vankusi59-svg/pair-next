@@ -1,5 +1,12 @@
 name: CI
-on: [push, pull_request]
+# GitHub Actions is OPTIONAL in PAIR NEXT's release governance — the
+# canonical gate is independent source/code audit + required validation
+# run in the Devin/local environment (typecheck, build, focused phase
+# tests, full regression, concurrency races, security audit, evidence
+# integrity). Automatic push/pull_request triggers are disabled; this
+# workflow remains runnable manually (workflow_dispatch) only.
+# See PAIR_OS_VNEXT_P11_SOLO_BUSINESS_HARDENING_REPORT.md §10.13.
+on: [workflow_dispatch]
 jobs:
   build-and-test:
     runs-on: ubuntu-latest

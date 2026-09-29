@@ -678,3 +678,85 @@ enabled. Enable after R6 audit passes, before merge.
 **Classification submitted for independent audit:
 `P11_REMEDIATED_R6_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
 requires the independent re-audit — this report does not self-certify.
+
+## §10.13 P11 GOVERNANCE-ONLY FINAL CLOSURE — release-gate policy
+
+Governance/documentation-only change at audited code head
+`f1d8d1946978a2324c78ff8eead6c61645462033` (R6 code audit passed
+independently at that head). **No runtime, business, or scheduler code
+was changed by this section's commit.**
+
+### §10.13.1 Decision
+
+**GitHub Actions is no longer a mandatory PAIR NEXT release gate.**
+
+Canonical validation policy going forward:
+
+1. The Devin/local execution environment is the primary test
+   environment.
+2. Required validation remains: `typecheck`, `build`, focused phase
+   tests, full regression tests, concurrency/race tests where
+   applicable, `pnpm audit --audit-level=high`, and
+   `PairEvidenceStore.verifyIntegrity` evidence-integrity checks.
+3. **Independent source/code audit is the final release gate.**
+4. GitHub is used for source control, PR review/history, and
+   commit/release authority.
+5. GitHub Actions is OPTIONAL and must not block release.
+6. A GitHub Actions billing/account failure is not a code failure and
+   is not a release blocker when the equivalent required validation has
+   completed successfully in the canonical Devin/local environment.
+
+### §10.13.2 R6-head validation status (what passed locally)
+
+At head `f1d8d19` all required validation completed in the canonical
+Devin/local environment:
+
+- P11 focused suites: **103/103 PASS** (Node 22 and Node 20)
+- Full suite Node 22: **1785 pass** / 24 skipped / 2 pre-existing
+  env-dependent `pair-p5.test.ts` probe fails (pass where dsh/codex
+  binaries are absent)
+- Full suite Node 20: **1787 pass, 0 fail**
+- `pnpm run typecheck`: PASS · `pnpm run build`: PASS
+- `pnpm audit --audit-level=high`: **0 high, 0 critical**
+  (1 low, 8 moderate)
+- worker_threads concurrency tests: PASS (single mission per
+  occurrence; canonical schedule row after concurrent `fireDue`)
+- `PairEvidenceStore.verifyIntegrity`: clean after the concurrent race
+
+The final GitHub Actions run on `f1d8d19` was blocked **before runner
+allocation** by external account/billing state ("recent account
+payments have failed or your spending limit needs to be increased") —
+zero job steps executed. Under this policy that is an external state,
+not a code result; it does not block release once the required local
+validation above has passed.
+
+### §10.13.3 GitHub Actions disposition
+
+`.github/workflows/ci.yml` — automatic `push`/`pull_request` triggers
+removed; the workflow now triggers only on `workflow_dispatch` (manual).
+The workflow file is retained for optional manual verification runs; it
+is not wired into any gate. The repository is fully usable with no
+Actions runs at all. No replacement paid workflow was added.
+
+### §10.13.4 Intended `main` branch protection (final policy)
+
+- Require a pull request before merge. **Do NOT require GitHub Actions
+  status checks** (supersedes the earlier §10.7 recommendation, which
+  was written when CI was still a required gate).
+- Branch protection remains **OPERATOR ACTION REQUIRED** — the
+  integration token receives HTTP 403 on protection APIs; it is NOT
+  enabled and this report does not claim otherwise.
+
+### §10.13.5 Docs updated
+
+- `CURRENT_STATE.md` — new "Release governance (current policy)"
+  section recording the gate = independent audit + required local
+  validation, Actions = optional/manual, and the intended protection.
+- `README.md`, `ARCHITECTURE.md`, `DOCUMENTATION.md` — audited; no
+  mandatory-CI claims existed there, so no changes were required.
+- Historical report sections (§10.7 etc.) intentionally unchanged:
+  they describe the policy in force at their time.
+
+**Classification submitted for independent audit:
+`P11_GOVERNANCE_CLOSURE_PENDING_AUDIT`.** This report does not
+self-certify `P11_OFFICIAL_FINAL_PASS`.
