@@ -24,6 +24,7 @@ import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { projectRoutableModels } from "./model-routable.js";
 import { digest, sha256Hex, utcnow } from "./canonical.js";
+import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
 import type { RuntimePlanner } from "./mission-runtime.js";
 
@@ -352,6 +353,145 @@ export class MissionControl {
     /** §4.3 two-step submit: the plan digest returned by previewMission. */
     confirm_plan?: { digest: string };
   }): Record<string, unknown> {
+    // Foundation V2 §1/§8: the generic Mission Control API must never
+    // accept a caller-pinned mission identity — bound identity is minted
+    // only by the internal startBoundMission seam. Reject fail-closed so
+    // a smuggled field can never reserve or occupy a work-bound id.
+    if ((input as { mission_id?: unknown }).mission_id != null) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_MISSION_ID_PUBLIC",
+        "mission_id pinning is internal-only — public mission creation mints its own id",
+      );
+    }
+    return this.startMissionInternal(input, undefined);
+  }
+
+  /*
+   * INTERNAL bound-mission seam — BusinessLayer only. Identical pipeline
+   * to startMission except the mission identity is DERIVED from the
+   * canonical `work_open_binding` (`binding_open_id`) — never from an
+   * arbitrary caller-supplied pin. The seam loads the binding itself,
+   * validates the full canonical chain (INTENT state, work item,
+   * business, project, org-agent scope), and stamps the non-forgeable
+   * internal origin proof `bound_open_id` on the mission it creates.
+   * Not reachable through /api/missions or any generic caller path.
+   */
+  startBoundMission(input: {
+    binding_open_id: string;
+    project_id: string;
+    goal: string;
+    metadata?: Record<string, unknown>;
+    granted_permissions?: string[];
+    authorized_workspaces?: string[];
+    risk_ceiling?: string;
+    operator_id?: string;
+    confirm_plan?: { digest: string };
+  }): Record<string, unknown> {
+    const openId = String(input.binding_open_id);
+    // Step 1 — the binding itself must be canonically valid (identity,
+    // state, work item, business, project, scope). PROVENANCE mode here:
+    // this check only proves the binding — the agent-ACTIVE requirement
+    // is enforced separately below, and ONLY for new-mission creation.
+    const { binding, ok: bound, reason } = validateWorkOpenBindingById(
+      this.deps.service.store,
+      openId,
+      {
+        requireState: "INTENT",
+        expectedProjectId: String(input.project_id),
+        mode: "PROVENANCE",
+      },
+    );
+    if (!bound || !binding) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BINDING_INVALID",
+        `${openId}: ${reason ?? "canonical binding invalid"}`,
+      );
+    }
+    const reservedId = String(binding.mission_id);
+    const existing = this.deps.service.store.tryGet("mission", reservedId) as
+      | StoreRow
+      | null;
+    if (existing) {
+      // R2 §3 + R3 §6: crash-retry adoption requires the FULL canonical
+      // validation — origin proof alone is not sufficient — but in
+      // PROVENANCE mode: the mission already exists, so only its origin
+      // is being proven; a later-PAUSED/TERMINATED agent must not veto
+      // history. Any mismatch → no adoption, no BOUND.
+      const check = validateWorkOpenBindingById(this.deps.service.store, openId, {
+        requireState: "INTENT",
+        expectedProjectId: String(input.project_id),
+        forMission: existing,
+        mode: "PROVENANCE",
+      });
+      if (!check.ok) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MISSION_ORIGIN_CONFLICT",
+          `${reservedId} fails canonical binding validation: ${check.reason}`,
+        );
+      }
+      return existing;
+    }
+    // Step 2 — a NEW mission is about to be created: ADMISSION mode now
+    // requires the bound agent to be currently ACTIVE (R3 §2). A paused
+    // or terminated agent fails closed here — no mission is minted.
+    const admission = validateWorkOpenBindingById(this.deps.service.store, openId, {
+      requireState: "INTENT",
+      expectedProjectId: String(input.project_id),
+      mode: "ADMISSION",
+    });
+    if (!admission.ok) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BINDING_INVALID",
+        `${openId}: ${admission.reason ?? "canonical binding invalid"}`,
+      );
+    }
+    // R2 §1: canonical context is DERIVED from the binding + its
+    // canonical records — caller metadata may mirror it but never
+    // defines it. Omitted authoritative fields are filled; conflicting
+    // ones fail closed.
+    const workItem = this.deps.service.store.get(
+      "work_item",
+      String(binding.work_item_id),
+    ) as Record<string, unknown>;
+    const canonicalFields: Array<[string, unknown]> = [
+      ["business_id", binding.business_id],
+      ["work_item_id", binding.work_item_id],
+      ["work_item_open_id", openId],
+      ["org_agent_id", binding.org_agent_id ?? null],
+      ["department", workItem.department ?? null],
+      ["source", "business_layer"],
+    ];
+    const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    for (const [key, canonical] of canonicalFields) {
+      const supplied = metadata[key];
+      if (
+        supplied != null &&
+        canonical != null &&
+        String(supplied) !== String(canonical)
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BINDING_CONTEXT_MISMATCH",
+          `metadata.${key} conflicts with canonical binding context`,
+        );
+      }
+      metadata[key] = canonical;
+    }
+    return this.startMissionInternal({ ...input, metadata }, binding);
+  }
+
+  private startMissionInternal(
+    input: {
+      project_id: string;
+      goal: string;
+      metadata?: Record<string, unknown>;
+      granted_permissions?: string[];
+      authorized_workspaces?: string[];
+      risk_ceiling?: string;
+      operator_id?: string;
+      confirm_plan?: { digest: string };
+    },
+    binding: Record<string, unknown> | undefined,
+  ): Record<string, unknown> {
     if (input.confirm_plan?.digest) {
       const preview = this.previewMission(input);
       if (preview.plan_digest !== input.confirm_plan.digest) {
@@ -455,14 +595,23 @@ export class MissionControl {
     metadata.secret_grants = this.deps.service.secretPolicies.pinForMission({
       businessId: metadata.business_id ? String(metadata.business_id) : null,
     });
-    const mission = this.deps.service.createMission({
-      project_id: input.project_id,
-      goal: input.goal,
-      metadata,
-      granted_permissions: input.granted_permissions ?? [],
-      authorized_workspaces: input.authorized_workspaces,
-      risk_ceiling: input.risk_ceiling,
-    });
+    const mission = binding
+      ? this.deps.service.createBoundMission(binding, {
+          project_id: input.project_id,
+          goal: input.goal,
+          metadata,
+          granted_permissions: input.granted_permissions ?? [],
+          authorized_workspaces: input.authorized_workspaces,
+          risk_ceiling: input.risk_ceiling,
+        })
+      : this.deps.service.createMission({
+          project_id: input.project_id,
+          goal: input.goal,
+          metadata,
+          granted_permissions: input.granted_permissions ?? [],
+          authorized_workspaces: input.authorized_workspaces,
+          risk_ceiling: input.risk_ceiling,
+        });
     this.deps.runtime.runtimeEntity(String(mission.mission_id));
     this.deps.supervisor.wake(String(mission.mission_id), "MISSION_CREATED");
     return mission;

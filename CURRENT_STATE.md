@@ -162,10 +162,72 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   typecheck+build PASS, audit 0 high, worker races PASS, verifyIntegrity
   clean.
 
+### P14 FOUNDATION V2 — canonical work-open provenance (NEW branch, pending audit)
+
+> **PR #8 (`P14_PROVENANCE_REBASELINED_PENDING_AUDIT`) is reference-only:
+> not merged and not the base of this work.** The V2 foundation is a
+> fresh build from canonical base `a38be24b8bb240570d0cce322766ece1bccceab9`
+> on a new branch. It is **not** the full P14 workforce — no work graph,
+> delegation, heartbeat, or inbox — and **no P15/P16 work has started.**
+
+- **`work_open_binding`** — durable open-authority row created by
+  `BusinessLayer.openWorkItem` **before** mission creation:
+  `open_id | work_item_id | business_id | project_id | org_agent_id |
+  created_by | mission_id | state INTENT|BOUND|ROLLED_BACK | CAS`.
+  The link write + `INTENT→BOUND` flip commit in one `store.immediate()`,
+  and rollback (row restore + pending/claim clear + `ROLLED_BACK` +
+  audit event) commits atomically in one txn too (R1 §1).
+- **Public/internal split**: `POST /api/missions` → `startMission`
+  hard-rejects any caller `mission_id` (`FAIL_CLOSED_MISSION_ID_PUBLIC`,
+  409); the internal `startBoundMission({binding_open_id})` seam
+  (BusinessLayer only) loads the binding, validates the full canonical
+  chain, and derives the mission_id FROM it — no arbitrary pin accepted;
+  missions it creates carry the non-forgeable `bound_open_id` origin
+  proof (R1 §2-3). A foreign occupant at a reserved id fails closed
+  (`FAIL_CLOSED_MISSION_ORIGIN_CONFLICT`) — R2 §3 requires the FULL
+  canonical validator (`forMission`) to pass before any crash-retry
+  adoption, origin string alone is not enough. The seam derives the
+  mission's canonical context (business/work/agent/department/source)
+  from the binding itself — caller metadata conflicts fail closed
+  (`FAIL_CLOSED_BINDING_CONTEXT_MISMATCH`), omissions are filled (R2 §1).
+  `bound_open_id` is minted ONLY by `createBoundMission(binding, ...)`
+  which derives both ids from the binding — generic `createMission`
+  accepts no `mission_id`/`bound_open_id` and always stamps null
+  (R2 §2). Version-0 CAS still fails closed on collision
+  (`FAIL_CLOSED_MISSION_PIN` guard on the returned id).
+  `src/pair/work-open-binding.ts` is the single canonical binding
+  validator used by every provenance seam (R1 §5) — R2 §4 adds
+  non-empty mission_id, lifecycle state ∈ INTENT|BOUND|ROLLED_BACK
+  (unknown state can never reconcile into BOUND), payload-key identity,
+  and bidirectional assignee↔org_agent equality. R3 §1 splits the
+  validator into explicit `mode: "ADMISSION"` (new-mission minting —
+  bound agent must currently be ACTIVE) vs `mode: "PROVENANCE"`
+  (proving an already-created mission — agent must resolve + same
+  business but PAUSED/TERMINATED cannot erase provenance); safety
+  actions, completion fold, review grounding and crash-adopt all run
+  PROVENANCE (R3 §3-§6).
+- **Proof derives from the binding, never metadata**:
+  `missionBoundToWorkItem` requires BOUND binding + mission/work_item/
+  business/project agreement; `syncWorkItem`, `blockWorkItem`,
+  `cancelWorkItem`, `reviewWorkItem`, `reconcileOpenIntent` all consume
+  the same predicate — forged metadata and foreign missions carry zero
+  authority and quarantine (`TERMINAL_PROVENANCE_CORRUPT`) instead.
+- **Crash boundaries**: no-mission intent → rollback + `ROLLED_BACK`;
+  post-mission crash → adopt ONLY the pinned mission (link+BOUND in one
+  txn); post-BOUND → idempotent; restart-safe, no dup missions/events.
+- **Minimal review grounding**: `REVIEW_REQUIRED` (new status) acts only
+  when grounded in the item's own bound COMPLETED mission; ungrounded
+  review state fails ACCEPT+REWORK closed with no decision evidence.
+- Evidence: `PAIR_OS_VNEXT_P14_FOUNDATION_V2_REPORT.md`; suite
+  `pair-p14-foundation.test.ts` (FOUND-V2-* ×10 + FOUND-R1-* ×10 +
+  FOUND-R2-* ×8 + FOUND-R3-* ×7).
+  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R3_FINAL_PENDING_AUDIT`**.
+
 ## Not yet
 
-- Autonomous heartbeat/inbox/delegation (P14), CEO agent / KPI gap
-  analysis (P15). Intentionally deferred.
+- Autonomous heartbeat/inbox/delegation/work-graph (P14 workforce —
+  beyond the V2 foundation), CEO agent / KPI gap analysis (P15).
+  Intentionally deferred.
 
 ## Release governance (current policy)
 

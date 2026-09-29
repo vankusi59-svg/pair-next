@@ -36,6 +36,7 @@ import {
   ReconciliationService,
   RecoveryController,
   digest,
+  newId,
   nextRunAfter,
   utcnow,
 } from "../pair/index.js";
@@ -122,11 +123,29 @@ function makeOrphanPending(
   cur.pending_open_at = utcnow();
   cur.updated_at = utcnow();
   store.put("work_item", workItemId, cur, Number(cur.version));
-  const mission = control.startMission({
+  // V2: a real crash orphan always carries its canonical binding INTENT
+  // with the mission_id pinned before the mission was created.
+  const orphanMissionId = newId("MSN");
+  store.put("work_open_binding", openId, {
+    open_id: openId, work_item_id: workItemId,
+    business_id: String(cur.business_id), project_id: projectId,
+    org_agent_id: cur.assignee_agent_id ?? null, created_by: "op",
+    mission_id: orphanMissionId, state: "INTENT",
+    created_at: utcnow(), bound_at: null, rolled_back_at: null,
+    updated_at: utcnow(), version: 0,
+  } as never, 0);
+  const mission = control.startBoundMission({
     goal: "orphan",
     project_id: projectId,
     operator_id: "op",
-    metadata: { work_item_id: workItemId, work_item_open_id: openId },
+    binding_open_id: openId,
+    metadata: {
+      business_id: String(cur.business_id),
+      work_item_id: workItemId,
+      work_item_open_id: openId,
+      org_agent_id: cur.assignee_agent_id ?? null,
+      source: "business_layer",
+    },
   });
   return { openId, mission };
 }

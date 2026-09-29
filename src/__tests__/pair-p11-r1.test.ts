@@ -30,6 +30,7 @@ import {
   ReconciliationService,
   RecoveryController,
   createMissionControlServer,
+  newId,
   utcnow,
 } from "../pair/index.js";
 
@@ -185,13 +186,15 @@ describe("R1 §2 atomic CAS — two connections, same DB", () => {
 
 function faultingControl(control: MissionControl, mode: "pre" | "post"): MissionControl {
   const stub = Object.create(control) as MissionControl;
+  // V2: openWorkItem dispatches through the internal bound-mission seam —
+  // faults land on startBoundMission, not the public startMission path.
   if (mode === "pre") {
-    stub.startMission = () => {
+    stub.startBoundMission = () => {
       throw new PolicyError("INJECT_FAIL", "before mission creation");
     };
   } else {
-    const real = control.startMission.bind(control);
-    stub.startMission = (input) => {
+    const real = control.startBoundMission.bind(control);
+    stub.startBoundMission = (input) => {
       real(input);
       throw new PolicyError("INJECT_FAIL", "after mission creation");
     };
@@ -277,19 +280,31 @@ describe("R1 §1 crash-safe linkage — fault injection at each boundary", () =>
     const { ctx, biz, schedules } = makeBizCtx("fi5");
     const b = setupBusiness(biz, ctx.projectId);
     const w = makeWorkItem(biz, String(b.business_id));
-    // Simulate a crashed open: marker persisted, mission exists, no backlink.
+    // Simulate a crashed open: marker persisted, mission exists, no
+    // backlink. V2: a real crash orphan always carries its canonical
+    // binding INTENT with the mission_id pinned up front.
     const openId = "OPI_crash_test";
-    const mission = ctx.control.startMission({
-      project_id: ctx.projectId,
-      goal: "crashed open",
-      metadata: { business_id: String(b.business_id), work_item_id: String(w.work_item_id), work_item_open_id: openId },
-      operator_id: "op",
-    });
+    const orphanMissionId = newId("MSN");
     const row = ctx.store.get("work_item", String(w.work_item_id));
     row.status = "IN_PROGRESS";
     row.pending_open_id = openId;
     row.pending_open_at = new Date(Date.now() - 120_000).toISOString(); // past grace
     ctx.store.put("work_item", String(w.work_item_id), row, Number(row.version));
+    ctx.store.put("work_open_binding", openId, {
+      open_id: openId, work_item_id: String(w.work_item_id),
+      business_id: String(b.business_id), project_id: ctx.projectId,
+      org_agent_id: row.assignee_agent_id ?? null, created_by: "op",
+      mission_id: orphanMissionId, state: "INTENT",
+      created_at: new Date().toISOString(), bound_at: null, rolled_back_at: null,
+      updated_at: new Date().toISOString(), version: 0,
+    } as never, 0);
+    const mission = ctx.control.startBoundMission({
+      project_id: ctx.projectId,
+      goal: "crashed open",
+      binding_open_id: openId,
+      metadata: { business_id: String(b.business_id), work_item_id: String(w.work_item_id), work_item_open_id: openId },
+      operator_id: "op",
+    });
     const board = biz.board(String(b.business_id));
     const found = board.IN_PROGRESS.find((x) => String(x.work_item_id) === String(w.work_item_id));
     expect(found).toBeTruthy();
