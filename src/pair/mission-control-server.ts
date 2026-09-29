@@ -329,6 +329,12 @@ export function createMissionControlServer(
         }
         const missionId = String(body.mission_id ?? "");
         if (!c.missionOutboxDir(missionId)) {
+          // Audit the rejected fetch too — probing with a fake mission_id
+          // must leave the same trace as a denied credential name.
+          deps.broker.deny(String(body.credential_name ?? ""), {
+            mission_id: missionId || null,
+            task_id: String(body.task_id ?? "") || null,
+          });
           return void json(res, 404, { error: "unknown mission_id" });
         }
         const cred = deps.broker.release(String(body.credential_name ?? ""), {
@@ -542,7 +548,7 @@ export function createMissionControlServer(
         const [, wid, wact] = m;
         const out =
           wact === "claim" ? biz.claimWorkItem(wid, String(body.agent_id ?? ""), String(operator))
-          : wact === "release" ? biz.releaseClaim(wid, String(operator))
+          : wact === "release" ? biz.releaseClaim(wid, String(operator), String(body.claim_token ?? "") || undefined)
           : wact === "comment" ? biz.commentOnWorkItem(wid, String(body.author ?? operator), String(body.body ?? ""))
           : wact === "block" ? biz.blockWorkItem(wid, String(body.reason ?? ""), String(operator))
           : wact === "unblock" ? biz.unblockWorkItem(wid, String(operator))

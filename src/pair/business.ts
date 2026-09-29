@@ -43,6 +43,28 @@ export type BudgetPeriod = (typeof BUDGET_PERIODS)[number];
 export const BUDGET_SCOPES = ["business", "department", "agent"] as const;
 export type BudgetScope = (typeof BUDGET_SCOPES)[number];
 
+/**
+ * Legal work-item transitions. DONE/CANCELLED are terminal — there is no
+ * way back into execution except the governed reopen path (openWorkItem
+ * from BLOCKED/READY/BACKLOG → IN_PROGRESS).
+ */
+const WORK_ITEM_TRANSITIONS: Record<WorkItemStatus, readonly WorkItemStatus[]> = {
+  BACKLOG: ["READY", "IN_PROGRESS", "BLOCKED", "CANCELLED"],
+  // READY→READY is the reassign/refresh path; every other self-transition
+  // (e.g. IN_PROGRESS→IN_PROGRESS, a duplicate open) is illegal.
+  READY: ["READY", "IN_PROGRESS", "BLOCKED", "BACKLOG", "CANCELLED"],
+  IN_PROGRESS: ["BLOCKED", "DONE", "CANCELLED"],
+  BLOCKED: ["READY", "IN_PROGRESS", "CANCELLED"],
+  DONE: [],
+  CANCELLED: [],
+};
+
+function assertWorkItemTransition(from: string, to: WorkItemStatus): void {
+  if (!(WORK_ITEM_TRANSITIONS[from as WorkItemStatus] ?? []).includes(to)) {
+    throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_TRANSITION", `${from} → ${to}`);
+  }
+}
+
 /** How long a work-item claim stays valid before another agent may take over. */
 const CLAIM_TTL_MS = Number(process.env.PAIR_WORK_ITEM_CLAIM_MS ?? 30 * 60 * 1000);
 /** Context notes kept per org_agent; newest kept, oldest trimmed. */
@@ -280,8 +302,14 @@ export class BusinessLayer {
       throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
     }
     const from = String(row.status);
-    if (from !== "BACKLOG" && from !== "READY" && from !== "BLOCKED") {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${from} cannot be assigned`);
+    assertWorkItemTransition(from, "READY");
+    // Reassigning an item actively claimed by someone else would strand the
+    // new assignee behind a foreign claim — fail closed instead.
+    if (isClaimActive(row, utcnow()) && String(row.claimed_by) !== agentId) {
+      throw new PolicyError(
+        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
+        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
+      );
     }
     row.assignee_agent_id = agentId;
     row.department = row.department || String(agent.department ?? "");
@@ -305,9 +333,7 @@ export class BusinessLayer {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
     const row = this.store.get("work_item", workItemId);
     const from = String(row.status);
-    if (from !== "READY" && from !== "BLOCKED" && from !== "BACKLOG") {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${from} cannot be opened`);
-    }
+    assertWorkItemTransition(from, "IN_PROGRESS");
     const business = this.getBusiness(String(row.business_id));
     const agentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
     const nowIso = utcnow();
@@ -324,45 +350,69 @@ export class BusinessLayer {
         throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
       }
     }
-    this.enforceBudgets(String(row.business_id), String(row.department ?? ""), agentId);
-
-    const notes = ((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
-      .slice(-AGENT_CONTEXT_INJECT)
-      .map((n) => `- ${String(n.note)}`);
-    const goal =
-      `[BUSINESS ${String(business.name)} | DEPT ${String(row.department ?? "-")}` +
-      (agent ? ` | AGENT ${String(agent.title)} (${String(agent.role ?? "")})` : "") +
-      `]\n${String(row.goal)}` +
-      (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "");
-
-    const mission = this.deps.control.startMission({
-      project_id: String(business.project_id),
-      goal,
-      metadata: {
-        business_id: String(row.business_id),
-        work_item_id: workItemId,
-        org_agent_id: agentId,
-        department: row.department ?? null,
-        source: "business_layer",
-      },
-      operator_id: operatorId,
-    });
-    const missionId = String(mission.mission_id);
+    // Take ownership BEFORE creating the mission: the IN_PROGRESS write (with
+    // optimistic version lock) is the dedup point — a retry, double-click,
+    // concurrent request, or post-crash replay hits the transition guard and
+    // cannot mint a second governed mission for the same open.
     row.status = "IN_PROGRESS";
-    (row.mission_ids as string[]).push(missionId);
     if (agentId) {
       row.claimed_by = agentId;
       row.claim_token = newId("CLM");
       row.claim_expires_at = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
     }
     row.updated_at = utcnow();
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPENED",
-      old_state: from, new_state: "IN_PROGRESS", actor: `operator:${operatorId}`,
-      metadata: { mission_id: missionId, assignee_agent_id: agentId },
-    });
-    return saved;
+    this.store.put("work_item", workItemId, row, Number(row.version));
+
+    try {
+      this.enforceBudgets(String(row.business_id), String(row.department ?? ""), agentId);
+
+      const notes = ((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
+        .slice(-AGENT_CONTEXT_INJECT)
+        .map((n) => `- ${String(n.note)}`);
+      const goal =
+        `[BUSINESS ${String(business.name)} | DEPT ${String(row.department ?? "-")}` +
+        (agent ? ` | AGENT ${String(agent.title)} (${String(agent.role ?? "")})` : "") +
+        `]\n${String(row.goal)}` +
+        (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "");
+
+      const mission = this.deps.control.startMission({
+        project_id: String(business.project_id),
+        goal,
+        metadata: {
+          business_id: String(row.business_id),
+          work_item_id: workItemId,
+          org_agent_id: agentId,
+          department: row.department ?? null,
+          source: "business_layer",
+        },
+        operator_id: operatorId,
+      });
+      const missionId = String(mission.mission_id);
+      const linked = this.store.get("work_item", workItemId);
+      (linked.mission_ids as string[]).push(missionId);
+      linked.updated_at = utcnow();
+      const saved = this.store.put("work_item", workItemId, linked, Number(linked.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPENED",
+        old_state: from, new_state: "IN_PROGRESS", actor: `operator:${operatorId}`,
+        metadata: { mission_id: missionId, assignee_agent_id: agentId },
+      });
+      return saved;
+    } catch (err) {
+      // Roll the claim/IN_PROGRESS marker back so the item is openable again
+      // (budget refusal or planner failure must not strand it IN_PROGRESS
+      // with no mission).
+      const cur = this.store.tryGet("work_item", workItemId);
+      if (cur && String(cur.status) === "IN_PROGRESS" && (cur.mission_ids as string[]).length === 0) {
+        cur.status = from as WorkItemStatus;
+        cur.claimed_by = null;
+        cur.claim_token = null;
+        cur.claim_expires_at = null;
+        cur.updated_at = utcnow();
+        this.store.put("work_item", workItemId, cur, Number(cur.version));
+      }
+      throw err;
+    }
   }
 
   /** Fold the linked mission's terminal state back into the work item. */
@@ -385,6 +435,7 @@ export class BusinessLayer {
       ms === "CANCELLED" ? "CANCELLED" :
       ms === "PAUSED" ? "BLOCKED" : null;
     if (!next) return row;
+    assertWorkItemTransition(status, next);
     row.status = next;
     row.updated_at = utcnow();
     if (next === "DONE" || next === "BLOCKED") {
@@ -460,9 +511,18 @@ export class BusinessLayer {
     return { ...saved, claim_token: token };
   }
 
-  releaseClaim(workItemId: string, actor: string): Row {
+  releaseClaim(workItemId: string, actor: string, claimToken?: string): Row {
     const row = this.store.get("work_item", workItemId);
     const heldBy = row.claimed_by ? String(row.claimed_by) : null;
+    // A live claim can only be released with its claim_token — a stale or
+    // absent token cannot strip another agent's ownership. Expired claims
+    // are releasable without a token (reclaim semantics).
+    if (isClaimActive(row, utcnow()) && claimToken !== String(row.claim_token ?? "")) {
+      throw new PolicyError(
+        "FAIL_CLOSED_CLAIM_TOKEN",
+        `live claim held by ${heldBy} — matching claim_token required`,
+      );
+    }
     row.claimed_by = null;
     row.claim_token = null;
     row.claim_expires_at = null;
@@ -500,9 +560,7 @@ export class BusinessLayer {
     }
     const row = this.store.get("work_item", workItemId);
     const from = String(row.status);
-    if (from === "DONE" || from === "CANCELLED") {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${from} cannot be blocked`);
-    }
+    assertWorkItemTransition(from, "BLOCKED");
     const blockers = (row.blockers as Array<Record<string, unknown>> | undefined) ?? [];
     blockers.push({ reason: String(reason).slice(0, 2000), at: utcnow(), by: actor });
     row.blockers = blockers;
@@ -519,9 +577,7 @@ export class BusinessLayer {
 
   unblockWorkItem(workItemId: string, actor: string): Row {
     const row = this.store.get("work_item", workItemId);
-    if (String(row.status) !== "BLOCKED") {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(row.status)} is not blocked`);
-    }
+    assertWorkItemTransition(String(row.status), "READY");
     row.blockers = [];
     row.status = "READY";
     row.updated_at = utcnow();
@@ -600,6 +656,21 @@ export class BusinessLayer {
     const scopeId =
       input.scope_type === "business" ? input.business_id : String(input.scope_id ?? "");
     if (!scopeId) throw new IntegrityError("FAIL_CLOSED_BUDGET_SCOPE_ID", "scope_id required");
+    // Scope must resolve inside this business: agent scopes reference a real
+    // org_agent of the business; department scopes must exist among its
+    // agents. Fail closed on cross-business or dangling references.
+    if (input.scope_type === "agent") {
+      const ag = this.store.get("org_agent", scopeId);
+      if (String(ag.business_id) !== input.business_id) {
+        throw new IntegrityError("FAIL_CLOSED_BUDGET_SCOPE", `agent scope ${scopeId} outside business ${input.business_id}`);
+      }
+    }
+    if (input.scope_type === "department") {
+      const ok = this.listOrgAgents(input.business_id).some((a) => String(a.department) === scopeId);
+      if (!ok) {
+        throw new IntegrityError("FAIL_CLOSED_BUDGET_SCOPE", `department ${scopeId} has no agents in business ${input.business_id}`);
+      }
+    }
     const id = newId("BDG");
     const row = {
       budget_policy_id: id,
@@ -684,6 +755,9 @@ export class BusinessLayer {
       const agent = this.store.get("org_agent", input.assignee_agent_id);
       if (String(agent.business_id) !== input.business_id) {
         throw new IntegrityError("FAIL_CLOSED_ROUTINE_SCOPE", `assignee outside business ${input.business_id}`);
+      }
+      if (String(agent.status) !== "ACTIVE") {
+        throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", String(agent.agent_id));
       }
       department = department || String(agent.department ?? "");
     }

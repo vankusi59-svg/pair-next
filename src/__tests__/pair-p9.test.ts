@@ -1849,7 +1849,10 @@ describe("business layer (one-person-business skeleton)", () => {
     ctx.store.put("work_item", wid, row, Number(row.version));
     const c2 = biz.claimWorkItem(wid, String(a2.agent_id), "op");
     expect(String(c2.claimed_by)).toBe(String(a2.agent_id));
-    biz.releaseClaim(wid, "op");
+    // P11: a live claim is released only with its claim_token — a stale or
+    // absent token cannot strip ownership.
+    expect(() => biz.releaseClaim(wid, "op")).toThrowError(/FAIL_CLOSED_CLAIM_TOKEN/);
+    biz.releaseClaim(wid, "op", String(c2.claim_token));
     expect(ctx.store.get("work_item", wid).claimed_by).toBeNull();
   });
 
