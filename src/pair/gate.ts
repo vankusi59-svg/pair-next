@@ -16,6 +16,7 @@ import { TASK_DISPATCHABLE_STATES } from "./service.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ExecutorAdapter } from "./adapter.js";
 import { ArtifactProvenanceValidator } from "./artifact-validation.js";
+import { sanitizeUntrustedRemote } from "./sanitizer.js";
 
 const RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
 const HIGH_IMPACT_PERMISSIONS = new Set([
@@ -555,6 +556,9 @@ export class GovernedTaskGate {
           String(existingIntent.execution_id),
           governedTaskId,
         );
+        // P13: a proven historical execution reconciles its reservation
+        // to COMMITTED — never a new reservation, never a new dispatch.
+        this.service.cost.reconcileForTask(governedTaskId, adapter);
         return exec;
       }
       if (state === "INTENT_RECORDED") {
@@ -603,6 +607,8 @@ export class GovernedTaskGate {
               throw e;
             }
           }
+          // P13: proven historical dispatch → COMMIT the reservation.
+          this.service.cost.reconcileForTask(governedTaskId, adapter);
           return exec;
         }
       }
@@ -622,6 +628,28 @@ export class GovernedTaskGate {
       );
     }
 
+    // P13-R2 §1: reaching here means a NEW adapter.dispatch is being
+    // prepared. A COMMITTED/SETTLED cost reservation proves external
+    // (monetary) action may already exist, but carries no execution_id
+    // to reconstruct — that is an ambiguous historical dispatch and can
+    // NEVER authorize another adapter.dispatch. Fail closed.
+    const crashGapRes = this.store.tryGet("cost_reservation", `CRSV_${governedTaskId}`);
+    if (
+      crashGapRes &&
+      (String(crashGapRes.status) === "COMMITTED" ||
+        String(crashGapRes.status) === "SETTLED")
+    ) {
+      this.store.appendEvidence(String(task.mission_id), "DISPATCH_EVIDENCE_INCOMPLETE", {
+        governed_task_id: governedTaskId,
+        executor_id: adapter.executor_id,
+        reservation_status: String(crashGapRes.status),
+      });
+      throw new IntegrityError(
+        "FAIL_CLOSED_COST_COMMITTED_EXECUTION_UNRESOLVED",
+        governedTaskId,
+      );
+    }
+
     // R2: final pre-dispatch authority revalidation — only reached when a
     // NEW adapter.dispatch is about to happen (EXECUTION_PERSISTED and
     // evidence-reconciled intents returned above). Contract tightening
@@ -635,7 +663,30 @@ export class GovernedTaskGate {
       adapter.executor_id,
     );
 
-    const execution = adapter.dispatch(task, { actor: "PAIR_GOVERNED_TASK_GATE" });
+    // P13: atomic monetary authority — check + HELD reservation inside
+    // one transaction, after contract authority and before dispatch.
+    this.service.cost.assertAndReserve({
+      mission: predispatchMission,
+      task: predispatchTask,
+      governedTask: task,
+      executorId: adapter.executor_id,
+    });
+
+    let execution: Record<string, unknown>;
+    try {
+      execution = adapter.dispatch(task, { actor: "PAIR_GOVERNED_TASK_GATE" });
+    } catch (e) {
+      // Dispatch outcome is ambiguous unless adapter evidence proves it:
+      // proven dispatch → COMMITTED, proven no-dispatch → RELEASED,
+      // unknown → stays conservatively HELD for later reconciliation.
+      this.service.cost.reconcileForTask(governedTaskId, adapter);
+      throw e;
+    }
+    // P13-R2 §1 durable ordering: canonical executor_execution FIRST,
+    // intent EXECUTION_PERSISTED SECOND, evidence THIRD, and only THEN is
+    // the money committed. A crash after adapter.dispatch but before the
+    // commit below leaves reservation HELD + intent INTENT_RECORDED —
+    // ambiguous, recoverable, and never a license to redispatch.
     const executionId = String(execution.execution_id);
     const execEntity = this.store.put(
       "executor_execution",
@@ -677,6 +728,7 @@ export class GovernedTaskGate {
       execution_id: executionId,
       executor_id: adapter.executor_id,
     });
+    this.service.cost.markCommitted(governedTaskId);
     return execEntity;
   }
 
@@ -887,7 +939,12 @@ export class GovernedTaskGate {
     executionId: string,
   ): Record<string, unknown> {
     const execution = this.store.get("executor_execution", executionId);
-    const observed = adapter.observe(executionId);
+    // Remote observation text is untrusted — scrub broker material before
+    // it becomes canonical (P13-R4 §1).
+    const observed = sanitizeUntrustedRemote(adapter.observe(executionId)).value as Record<
+      string,
+      unknown
+    >;
     execution.last_observation = observed;
     if (observed.status && String(observed.status) !== String(execution.execution_state)) {
       execution.execution_state = String(observed.status);
@@ -900,7 +957,7 @@ export class GovernedTaskGate {
     executionId: string,
   ): Record<string, unknown> {
     const execution = this.store.get("executor_execution", executionId);
-    const result = adapter.collect_result(executionId);
+    let result = adapter.collect_result(executionId);
     // Identity binding: result must name the same governed task / mission / task.
     for (const field of ["mission_id", "task_id", "governed_task_id"]) {
       if (result[field] && String(result[field]) !== String(execution[field])) {
@@ -910,7 +967,24 @@ export class GovernedTaskGate {
         );
       }
     }
+    // P13-R4 §1: untrusted remote output is sanitized BEFORE it becomes
+    // canonical — broker capabilities, the master token and released
+    // credential values are redacted here; the store layer additionally
+    // fails closed on any raw bcap1.* that still reaches it. The redaction
+    // audit records counts only, never the value.
+    const sanitized = sanitizeUntrustedRemote(result);
+    result = sanitized.value as Record<string, unknown>;
+    if (sanitized.capability_redactions > 0 || sanitized.secret_redactions > 0) {
+      this.store.appendEvidence(String(execution.mission_id), "REMOTE_RESULT_REDACTED", {
+        execution_id: executionId,
+        capability_redactions: sanitized.capability_redactions,
+        secret_redactions: sanitized.secret_redactions,
+      });
+    }
     execution.result = result;
+    // P13 §16: settle the reservation — adapter-proven figures settle
+    // exactly; unprovable usage stays COMMITTED at reserved maximum.
+    this.service.cost.settleFromResult(String(execution.governed_task_id), result);
     execution.result_state = result.status;
     execution.execution_state = result.status;
     const saved = this.store.put("executor_execution", executionId, execution, execution.version);

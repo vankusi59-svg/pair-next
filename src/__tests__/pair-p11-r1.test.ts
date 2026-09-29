@@ -512,7 +512,11 @@ describe("R1 §6-§8 routines: isolation, atomic dedup, budgets", () => {
     const bA = setupBusiness(biz, ctx.projectId, "A");
     setupBusiness(biz, ctx.projectId, "B");
     const rA = makeRoutine(biz, String(bA.business_id));
-    firedMission(ctx, "BIZ_other", String(rA.schedule_id));
+    // P13-R1 §5: a forged/unknown business_id now fails closed at mission
+    // start — isolation is enforced even earlier than the board check.
+    expect(() => firedMission(ctx, "BIZ_other", String(rA.schedule_id))).toThrowError(
+      /FAIL_CLOSED_SECRET_BUSINESS_UNKNOWN/,
+    );
     const board = biz.board(String(bA.business_id));
     const projected = Object.values(board).flat().filter((w) => String(w.source) === "routine");
     expect(projected).toHaveLength(0);

@@ -41,6 +41,7 @@ import {
   TRANSPORT_IN_PROCESS,
   TRANSPORT_REMOTE_API,
   createMissionControlServer,
+  mintBrokerCapability,
   registerGovernedExecutors,
   digest,
   newId,
@@ -1491,11 +1492,37 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
       authorization: "Bearer mc-secret",
     };
     try {
+      // P13: a release needs a business-scoped secret_policy pinned to the
+      // mission + a canonical task inside it — a valid token alone denies.
+      const bizLayer = new BusinessLayer({
+        store: ctx.store,
+        control: ctx.control,
+        schedules: new MissionScheduleService(ctx.service),
+      });
+      const biz = bizLayer.createBusiness({ name: "B", project_id: ctx.projectId, operator_id: "op" });
+      ctx.service.secretPolicies.createPolicy(
+        { credential_reference_name: "github", business_id: String(biz.business_id) },
+        "op",
+      );
       const mres = await fetch(`http://127.0.0.1:${port}/api/missions`, {
         method: "POST", headers: mcHdr,
-        body: JSON.stringify({ project_id: ctx.projectId, goal: "cred test" }),
+        body: JSON.stringify({ project_id: ctx.projectId, goal: "cred test", metadata: { business_id: String(biz.business_id) } }),
       });
       const mission = (await mres.json()) as Record<string, unknown>;
+      // canonical task inside the mission — broker fetch requires task∈mission
+      const commit = ctx.service.commitPlan({
+        mission_id: String(mission.mission_id),
+        source: "test",
+        tasks: [{ task_key: "T2", title: "t2", task_instruction: "x", required_capabilities: [], depends_on: [] }],
+        proposal: { tasks: [] },
+      });
+      const fetchTaskId = String(commit.task_ids[0]);
+      // R1 §3: a fetchable task is canonically bound (routed + executor).
+      ctx.service.updateTask(fetchTaskId, {
+        selected_executor: "EXEC_A",
+        selected_route_id: "RTE_A",
+        status: "ROUTED",
+      });
 
       // operator installs a credential — response carries metadata only
       const up = await fetch(`http://127.0.0.1:${port}/api/credentials`, {
@@ -1514,26 +1541,44 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
       expect(list.credentials.map((x) => x.name)).toContain("github");
       expect(JSON.stringify(list)).not.toContain("ghp_SUPERSECRET");
 
+      // R3 §2: the worker credential is a task-scoped capability minted
+      // from the master token — the master token itself is not accepted.
+      const cap = (missionId: string, taskId: string) =>
+        mintBrokerCapability("broker-secret", {
+          mission_id: missionId,
+          task_id: taskId,
+          governed_task_id: null,
+          executor_id: "EXEC_A",
+        });
       const fetchCred = (hdrs: Record<string, string>, body: Record<string, unknown>) =>
         fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
           method: "POST",
           headers: { "content-type": "application/json", ...hdrs },
-          body: JSON.stringify({ mission_id: mission.mission_id, task_id: "T2", ...body }),
+          body: JSON.stringify({ mission_id: mission.mission_id, task_id: fetchTaskId, ...body }),
         });
-      // MC bearer does not open the broker; wrong token rejected
+      // MC bearer does not open the broker; master token alone rejected
       expect((await fetchCred({ authorization: "Bearer mc-secret" }, { credential_name: "github" })).status).toBe(403);
-      // unknown mission rejected even with the right token
+      expect((await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "github" })).status).toBe(403);
+      // unknown mission rejected even with a valid capability
       expect(
         (await fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-broker-token": "broker-secret" },
-          body: JSON.stringify({ mission_id: "MSN_NOPE", credential_name: "github" }),
+          headers: { "content-type": "application/json", "x-broker-capability": cap("MSN_NOPE", "TSK_NOPE") },
+          body: JSON.stringify({ mission_id: "MSN_NOPE", task_id: "TSK_NOPE", credential_name: "github" }),
         })).status,
       ).toBe(404);
-      // unknown credential → 404 + denied audit
-      expect((await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "nope" })).status).toBe(404);
+      // credential never pinned to this mission → denied + audited
+      expect(
+        (await fetchCred(
+          { "x-broker-capability": cap(String(mission.mission_id), fetchTaskId) },
+          { credential_name: "nope" },
+        )).status,
+      ).toBe(403);
       // legit release → value + audit
-      const rel = (await (await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "github" })).json()) as Record<string, unknown>;
+      const rel = (await (await fetchCred(
+        { "x-broker-capability": cap(String(mission.mission_id), fetchTaskId) },
+        { credential_name: "github" },
+      )).json()) as Record<string, unknown>;
       expect(rel.value).toBe("ghp_SUPERSECRET");
       expect(rel.domains).toEqual(["github.com"]);
       expect(audit.some((e) => e.event_type === "CREDENTIAL_RELEASED" && e.credential_name === "github")).toBe(true);

@@ -15,6 +15,7 @@
 import Database from "better-sqlite3";
 import { canonicalJson, digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { BROKER_CAPABILITY_SOURCE } from "./sanitizer.js";
 
 const SECRET_MARKER_KEYS = new Set([
   "api_key",
@@ -27,6 +28,12 @@ const SECRET_MARKER_KEYS = new Set([
   "authorization",
   "private_key",
 ]);
+
+// P13-R4 §1 defense-in-depth: a raw task-scoped broker capability is
+// secret material — it must never persist as an arbitrary string value in
+// canonical entities, evidence or events. Non-global regex: .test() stays
+// stateless.
+const BROKER_CAPABILITY_TEST = new RegExp(BROKER_CAPABILITY_SOURCE);
 
 export interface StoredEntity {
   entity_type: string;
@@ -106,6 +113,12 @@ export class PairEvidenceStore {
   }
 
   private static assertSecretFree(value: unknown, pathLabel = ""): void {
+    if (typeof value === "string") {
+      if (BROKER_CAPABILITY_TEST.test(value)) {
+        throw new IntegrityError("FAIL_CLOSED_SENSITIVE_MATERIAL", `${pathLabel}bcap1`);
+      }
+      return;
+    }
     if (Array.isArray(value)) {
       for (const item of value) {
         PairEvidenceStore.assertSecretFree(item, pathLabel);
@@ -246,6 +259,13 @@ export class PairEvidenceStore {
     correlation_id?: string | null;
     metadata?: Record<string, unknown> | null;
   }): string {
+    // R4 §1: events are canonical too — no secret material in metadata or
+    // state fields.
+    PairEvidenceStore.assertSecretFree({
+      metadata: params.metadata ?? null,
+      old_state: params.old_state ?? null,
+      new_state: params.new_state ?? null,
+    });
     const eventId = newId("EVT");
     const body = {
       event_id: eventId,

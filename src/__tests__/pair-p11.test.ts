@@ -26,6 +26,7 @@ import {
   ReconciliationService,
   RecoveryController,
   createMissionControlServer,
+  mintBrokerCapability,
 } from "../pair/index.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11-"));
@@ -345,13 +346,13 @@ describe("P11 §4 credential broker", () => {
       vaultPath: path.join(dir, "vault.json"),
       audit: (e) => events.push(e as unknown as Record<string, unknown>),
     });
-    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v123", created_by: "op" });
+    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v123_cred", created_by: "op" });
     broker.release("k", { mission_id: "MSN_1", task_id: "T1" });
     broker.deny("k", { mission_id: "MSN_fake", task_id: null });
     expect(events).toHaveLength(2);
     expect(String(events[0].event_type)).toBe("CREDENTIAL_RELEASED");
     expect(String(events[1].event_type)).toBe("CREDENTIAL_DENIED");
-    expect(JSON.stringify(events)).not.toContain("v123");
+    expect(JSON.stringify(events)).not.toContain("v123_cred");
   });
 
   it("secrets never enter the canonical store: assertSecretFree blocks writes", () => {
@@ -376,15 +377,23 @@ describe("P11 §4 credential broker", () => {
           metadata: { credential_name: e.credential_name, task_id: e.task_id, granted: e.granted },
         }),
     });
-    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v999", created_by: "op" });
+    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v999_cred", created_by: "op" });
     const server = createMissionControlServer({ control: ctx.control, business: biz, broker, brokerToken: "btok" });
     await new Promise<void>((r) => server.listen(0, r));
     const port = (server.address() as { port: number }).port;
     try {
+      // R3 §2: worker credential is a task-scoped capability, not the
+      // master token — mint one bound to the phantom mission.
+      const cap = mintBrokerCapability("btok", {
+        mission_id: "MSN_phantom",
+        task_id: "TSK_phantom",
+        governed_task_id: null,
+        executor_id: "EXEC_A",
+      });
       const res = await fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-broker-token": "btok" },
-        body: JSON.stringify({ credential_name: "k", mission_id: "MSN_phantom" }),
+        headers: { "content-type": "application/json", "x-broker-capability": cap },
+        body: JSON.stringify({ credential_name: "k", mission_id: "MSN_phantom", task_id: "TSK_phantom" }),
       });
       expect(res.status).toBe(404);
       const denied = ctx.store.listEvents().filter((e) => e.event_type === "CREDENTIAL_DENIED");

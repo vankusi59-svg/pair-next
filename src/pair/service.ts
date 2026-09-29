@@ -12,6 +12,8 @@ import path from "node:path";
 import { newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { AgentContractService } from "./agent-contract.js";
+import { CostService } from "./cost.js";
+import { SecretPolicyService } from "./secret-policy.js";
 import { RouteRegistry } from "./route-registry.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -30,6 +32,8 @@ export const TASK_DISPATCHABLE_STATES = new Set(["READY", "ROUTED"]);
 export class PairControlPlane {
   private _routes: RouteRegistry | null = null;
   private _agentContracts: AgentContractService | null = null;
+  private _cost: CostService | null = null;
+  private _secretPolicies: SecretPolicyService | null = null;
 
   constructor(public readonly store: PairEvidenceStore) {}
 
@@ -43,6 +47,22 @@ export class PairControlPlane {
   get agentContracts(): AgentContractService {
     this._agentContracts ??= new AgentContractService(this.store);
     return this._agentContracts;
+  }
+
+  /** Lazy canonical P13 cost authority (atomic monetary reservations). */
+  get cost(): CostService {
+    this._cost ??= new CostService(this, {
+      costHaltFile:
+        process.env.PAIR_COST_HALT_FILE ??
+        path.join(process.env.PAIR_MC_DIR ?? path.join(process.cwd(), ".pair-mc"), "COST_HALT"),
+    });
+    return this._cost;
+  }
+
+  /** Lazy canonical P13 secret-release authority. */
+  get secretPolicies(): SecretPolicyService {
+    this._secretPolicies ??= new SecretPolicyService(this);
+    return this._secretPolicies;
   }
 
   createProject(params: { name: string; root_location: string }): Record<string, unknown> {

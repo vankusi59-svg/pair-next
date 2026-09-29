@@ -501,9 +501,11 @@ const server = createMissionControlServer({
   // (POST /api/outbox). Separate from PAIR_MC_TOKEN on purpose — remote
   // agents see this value in their prompt, so it must not grant API access.
   outboxToken: process.env.PAIR_OUTBOX_TOKEN || undefined,
-  // Credential broker: PAIR_BROKER_TOKEN gates POST /api/broker/fetch (the
-  // token remote agents carry in their prompt). Operator management rides
-  // the normal MC-token routes /api/credentials.
+  // Credential broker: PAIR_BROKER_TOKEN is the server-side master secret
+  // that mints/verifies task-scoped capabilities for POST /api/broker/fetch.
+  // Remote agents carry ONLY a minted x-broker-capability bound to their
+  // mission/task/governed-task/executor — never the master token. Operator
+  // management rides the normal MC-token routes /api/credentials.
   broker,
   brokerToken: process.env.PAIR_BROKER_TOKEN || undefined,
   // Business layer: companies/org-agents/work-items/routines/budgets —
