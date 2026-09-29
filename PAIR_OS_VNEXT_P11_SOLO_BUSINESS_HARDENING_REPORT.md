@@ -760,3 +760,55 @@ Actions runs at all. No replacement paid workflow was added.
 **Classification submitted for independent audit:
 `P11_GOVERNANCE_CLOSURE_PENDING_AUDIT`.** This report does not
 self-certify `P11_OFFICIAL_FINAL_PASS`.
+
+## §10.14 P11 FINAL GOVERNANCE AMENDMENT — branch protection optionalization
+
+Documentation/governance-only amendment at head
+`931212dd472dbb3be00203ba10aa4f3a9ad51b73`. **No runtime, business,
+scheduler, or test code changed by this section's commit.** Independent
+P11 code audit passed at `f1d8d19`; §10.13 remains in force.
+
+### §10.14.1 Amendment
+
+The current private-repository GitHub account indicates the configured
+Ruleset would not be enforced under the present plan. Therefore branch
+protection is no longer a mandatory P11 release condition. This section
+**supersedes** every earlier "branch protection required before merge"
+statement (§10.7, §10.13.4's enablement framing) while leaving the
+historical text untouched.
+
+Final effective P11 release policy:
+
+```
+LOCAL/DEVIN VALIDATION
+        +
+INDEPENDENT AUDIT
+        +
+MANUAL PR DISCIPLINE
+        ↓
+RELEASE / MERGE
+```
+
+- Branch protection / GitHub Rulesets = **OPTIONAL platform
+  hardening**. Lack of an enforceable ruleset on the current private
+  repo does NOT block release.
+- The canonical control for this repository is: changes through a
+  dedicated branch / PR; required Devin/local validation; independent
+  audit before merge; explicit manual merge only after audit pass.
+- GitHub Actions remains OPTIONAL (§10.13).
+- No paid GitHub plan is required for PAIR NEXT release governance.
+- `main` is **NOT** protected and this report does not claim it is.
+  If the account/plan ever gains enforceable rulesets, enabling
+  "require pull request before merge" (no status checks) remains a
+  recommended operator action — as hardening, never as a gate.
+
+### §10.14.2 State confirmation
+
+- `main` branch protection: **disabled / not enforced** (operator
+  action optional, not required).
+- No paid GitHub features are depended upon anywhere in the release
+  process.
+
+**Classification submitted for independent audit:
+`P11_FINAL_GOVERNANCE_AMENDMENT_PENDING_AUDIT`.** This report does not
+self-certify `P11_OFFICIAL_FINAL_PASS`.

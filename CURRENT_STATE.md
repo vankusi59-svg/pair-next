@@ -40,6 +40,10 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   (`.github/workflows/ci.yml`) has no automatic trigger; it is runnable
   manually via `workflow_dispatch`. An Actions billing/account failure is an
   external state, not a code failure.
-- Intended `main` branch protection: require a pull request before merge;
-  **no** GitHub Actions status checks. Enabling it remains an operator
-  action (see the P11 hardening report §10.13).
+- Branch protection / GitHub Rulesets are **optional platform
+  hardening** — not a release condition (the current private repo's
+  plan does not enforce them). The canonical control is: dedicated
+  branch + PR, required local validation, independent audit before
+  merge, explicit manual merge only after audit pass. `main` is NOT
+  currently protected; this file does not claim otherwise (see the
+  P11 hardening report §10.14).
