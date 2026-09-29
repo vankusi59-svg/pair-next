@@ -715,3 +715,62 @@ CAS path (`/update` + `expected_version` → `FAIL_CLOSED_VERSION_CONFLICT`).
 
 **`P13_REMEDIATED_R4_PENDING_AUDIT`** — pushed to the existing P13 PR;
 DO NOT MERGE; DO NOT START P14/P15.
+
+---
+
+# REMEDIATION R5 — restart-durable secret non-persistence + minimum credential length
+
+## R5.1 §1 — restart-durable registration
+
+**Defect.** The sensitive-material registry was process-memory only.
+`upsert()`/`release()` registered values, but a restart left the Set
+empty — a credential released before the crash could then be echoed by
+a stale remote worker straight into `executor_execution.result`.
+
+**Fix.** `CredentialBroker`'s constructor now `load()`s the existing
+vault and registers every installed credential value at startup —
+restart-durable by construction, before any new release/upsert. Vault
+file remains the only persistence; values still never enter canonical
+state, events, evidence, logs or audit metadata.
+
+## R5.2 §2 — short-credential gap closed (policy B)
+
+The broker now owns a documented minimum value length:
+`MIN_CREDENTIAL_VALUE_LENGTH = 8` — the sanitizer protection threshold.
+`upsert()` rejects shorter values
+(`FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT`); `load()` validates installed
+values and fails closed the same way, so a legacy short credential can
+never slip under sanitizer coverage. An accepted credential can never
+be one the non-persistence layer ignores. Existing test fixtures using
+4-char values were updated to >= 8 (intentional semantic change).
+
+## R5.3 R5 test matrix (2 new tests, P13 now 64)
+
+- RESTART-R5 (real worker_threads isolation): vault written directly to
+  disk simulating a previous process; a FRESH worker (empty module
+  registry → empty Set) constructs `CredentialBroker` on that vault —
+  no upsert/release — then drives the real `collect_execution_result`
+  path with hostile output echoing the credential. Canonical dump
+  (executor_execution/mission/task/governed/evidence/events) contains
+  no raw value, carries `[REDACTED:SECRET_MATERIAL]` and the
+  count-only `REMOTE_RESULT_REDACTED` audit; `verifyIntegrity` clean.
+- SHORT-R5: install of a 7-char value →
+  `FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT`; an exactly-8-char value is
+  accepted and sanitizer-redacted on echo; a legacy vault with a
+  sub-minimum value fails closed at `load()`/ctor.
+
+## R5.4 Validation evidence
+
+- `pnpm run typecheck` PASS · `pnpm run build` PASS
+- P13 **64/64** · P12 **71/71** · P11 **103/103** · P9 **79/79**
+- Node 22.23.3 `pnpm test`: **1920 pass / 2 fail / 24 skip** — same two
+  documented env-dependent p5 executor probes.
+- Node 20.20.2 `npx vitest run`: **1922 pass / 0 fail / 24 skip**.
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**.
+- Worker races PASS: all prior races incl. R4 create-only races.
+- `verifyIntegrity` clean.
+
+## R5.5 Classification
+
+**`P13_REMEDIATED_R5_PENDING_AUDIT`** — pushed to the existing P13 PR;
+DO NOT MERGE; DO NOT START P14/P15.

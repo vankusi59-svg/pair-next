@@ -346,13 +346,13 @@ describe("P11 §4 credential broker", () => {
       vaultPath: path.join(dir, "vault.json"),
       audit: (e) => events.push(e as unknown as Record<string, unknown>),
     });
-    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v123", created_by: "op" });
+    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v123_cred", created_by: "op" });
     broker.release("k", { mission_id: "MSN_1", task_id: "T1" });
     broker.deny("k", { mission_id: "MSN_fake", task_id: null });
     expect(events).toHaveLength(2);
     expect(String(events[0].event_type)).toBe("CREDENTIAL_RELEASED");
     expect(String(events[1].event_type)).toBe("CREDENTIAL_DENIED");
-    expect(JSON.stringify(events)).not.toContain("v123");
+    expect(JSON.stringify(events)).not.toContain("v123_cred");
   });
 
   it("secrets never enter the canonical store: assertSecretFree blocks writes", () => {
@@ -377,7 +377,7 @@ describe("P11 §4 credential broker", () => {
           metadata: { credential_name: e.credential_name, task_id: e.task_id, granted: e.granted },
         }),
     });
-    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v999", created_by: "op" });
+    broker.upsert({ name: "k", kind: "api_key", domains: [], value: "v999_cred", created_by: "op" });
     const server = createMissionControlServer({ control: ctx.control, business: biz, broker, brokerToken: "btok" });
     await new Promise<void>((r) => server.listen(0, r));
     const port = (server.address() as { port: number }).port;

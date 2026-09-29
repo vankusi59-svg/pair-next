@@ -142,12 +142,18 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   are INSERT-only atomics (immediate txn + version-0 CAS →
   `FAIL_CLOSED_COST_*_EXISTS`); supplied `cost_policy_id` is the exact
   create identity.
-- Classification: **`P13_REMEDIATED_R4_PENDING_AUDIT`** on the P13
+- **R5 remediation** (same PR): sanitizer protection is now
+  restart-durable — `CredentialBroker` registers every installed vault
+  credential at construction; `MIN_CREDENTIAL_VALUE_LENGTH=8` enforced
+  at `upsert` and `load` (`FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT`), so
+  no accepted credential can fall under sanitizer coverage. Restart
+  isolation proven with a fresh-worker collect path.
+- Classification: **`P13_REMEDIATED_R5_PENDING_AUDIT`** on the P13
   branch/PR; evidence in
-  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 62/62,
-  P12 71/71, P11 103/103, P9 79/79, N20 1920/0, N22 1918/2env,
-  typecheck+build PASS, audit 0 high, worker races PASS (incl. new
-  create-only races), verifyIntegrity clean. NOT merged.
+  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 64/64,
+  P12 71/71, P11 103/103, P9 79/79, N20 1922/0, N22 1920/2env,
+  typecheck+build PASS, audit 0 high, worker races PASS, verifyIntegrity
+  clean. NOT merged.
 
 ## Not yet
 

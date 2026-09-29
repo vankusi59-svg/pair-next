@@ -46,6 +46,11 @@ export interface BrokerDeps {
   }) => void;
 }
 
+/** R5 §2: minimum credential value length — the sanitizer protection
+ *  threshold. The broker enforces it at install AND at load, so an
+ *  accepted credential can never fall below non-persistence coverage. */
+export const MIN_CREDENTIAL_VALUE_LENGTH = 8;
+
 export class CredentialBroker {
   private readonly vaultPath: string;
   private readonly audit?: BrokerDeps["audit"];
@@ -59,6 +64,14 @@ export class CredentialBroker {
     } else {
       fs.chmodSync(this.vaultPath, 0o600);
     }
+    // R5 §1 restart durability: register every credential ALREADY in the
+    // vault immediately at startup — no release/upsert needed — so a
+    // post-restart echo from an old remote session is still redacted.
+    // load() validates the minimum length, so a legacy short value fails
+    // closed here rather than slipping under sanitizer coverage.
+    for (const cred of Object.values(this.load())) {
+      registerSensitiveMaterial(cred.value);
+    }
   }
 
   private load(): Record<string, BrokerCredential> {
@@ -66,8 +79,15 @@ export class CredentialBroker {
       const raw = JSON.parse(fs.readFileSync(this.vaultPath, "utf8")) as {
         credentials?: Record<string, BrokerCredential>;
       };
-      return raw.credentials ?? {};
-    } catch {
+      const creds = raw.credentials ?? {};
+      for (const [name, cred] of Object.entries(creds)) {
+        if (typeof cred.value !== "string" || cred.value.length < MIN_CREDENTIAL_VALUE_LENGTH) {
+          throw new Error(`FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT:${name}`);
+        }
+      }
+      return creds;
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("FAIL_CLOSED_")) throw e;
       return {};
     }
   }
@@ -82,6 +102,10 @@ export class CredentialBroker {
   upsert(input: { name: string; value: string; domains?: string[]; kind?: string }): Omit<BrokerCredential, "value"> {
     const name = String(input.name).trim();
     if (!name || !input.value) throw new Error("credential name and value are required");
+    const value = String(input.value);
+    if (value.length < MIN_CREDENTIAL_VALUE_LENGTH) {
+      throw new Error(`FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT:${name}`);
+    }
     const creds = this.load();
     creds[name] = {
       name,

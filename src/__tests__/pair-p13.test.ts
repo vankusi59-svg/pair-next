@@ -33,6 +33,7 @@ import {
   MissionScheduleService,
   MissionSupervisor,
   mintBrokerCapability,
+  sanitizeUntrustedRemote,
   PairControlPlane,
   PairEvidenceStore,
   ReconciliationService,
@@ -1039,6 +1040,42 @@ try {
     Atomics.wait(barrier, 0, 0);
     const row = service.cost.createCostPolicy(args.input, "worker");
     parentPort.postMessage({ ok: true, out: { reservation_id: String(row.cost_policy_id), status: "CREATED" } });
+  } else if (op === "restartSanitize") {
+    // R5 §3: fresh worker = fresh module registry = EMPTY sensitive-
+    // material Set. Constructing the broker from the EXISTING vault must
+    // re-register every installed credential — no upsert/release here.
+    const store = new PAIR.PairEvidenceStore(dbPath);
+    const service = new PAIR.PairControlPlane(store);
+    const gate = new PAIR.GovernedTaskGate(service);
+    new PAIR.CredentialBroker({ vaultPath: args.vaultPath });
+    parentPort.postMessage({ ready: true });
+    Atomics.wait(barrier, 0, 0);
+    store.put("executor_execution", args.executionId, {
+      execution_id: args.executionId,
+      governed_task_id: "GTSK_restart",
+      mission_id: "MSN_restart",
+      task_id: "TSK_restart",
+      executor_id: "EXEC_A",
+      plan_revision: 1,
+      correlation_id: "corr-restart",
+      workspace: null,
+      version: 0,
+    });
+    const adapter = {
+      executor_id: "EXEC_A",
+      collect_result: () => ({ status: "COMPLETED", output: args.hostile }),
+    };
+    gate.collect_execution_result(adapter, args.executionId);
+    const dump = JSON.stringify({
+      execution: store.get("executor_execution", args.executionId),
+      missions: store.list("mission"),
+      tasks: store.list("task"),
+      governed: store.list("governed_task"),
+      evidence: store.listEvidence("MSN_restart"),
+      events: store.listEvents(),
+    });
+    store.verifyIntegrity();
+    parentPort.postMessage({ ok: true, out: { status: "COLLECTED", dump } });
   } else {
     throw new Error("unknown op " + op);
   }
@@ -2063,5 +2100,65 @@ describe("P13-R4.create: atomic insert-only authority creation", () => {
     const p2 = ctx.service.cost.createCostPolicy({ ...input, cost_policy_id: "CPO_OTHER_OK" }, "op");
     expect(String(p2.cost_policy_id)).toBe("CPO_OTHER_OK");
     expect(() => ctx.store.verifyIntegrity()).not.toThrow();
+  });
+});
+
+describe("P13-R5.restart: sanitizer protection survives process restart", () => {
+  const RESTART_CRED = "restart-vault-secret-7d2f";
+
+  it("RESTART-R5: fresh process loads existing vault at broker ctor and redacts an echoed credential", async () => {
+    const { ctx } = makeBizCtx("r5rs");
+    const vaultPath = path.join(ctx.dir, "vault.json");
+    // Simulate a previous process's vault: write it directly — the test
+    // process never touches the value through any broker call, and the
+    // worker below starts with an EMPTY sensitive-material Set (fresh
+    // module registry), proving restart re-registration at ctor.
+    fs.writeFileSync(
+      vaultPath,
+      JSON.stringify({
+        credentials: {
+          api: { name: "api", value: RESTART_CRED, domains: ["api.x"], kind: "token", updated_at: "t" },
+        },
+      }),
+      { mode: 0o600 },
+    );
+    const hostile = `echo ${RESTART_CRED} tail`;
+    const res = await runRace([
+      {
+        op: "restartSanitize",
+        dbPath: path.join(ctx.dir, "pair.db"),
+        args: { vaultPath, executionId: "EXEC_restart_1", hostile },
+      },
+    ]);
+    expect(res[0].ok).toBe(true);
+    const dump = (res[0] as { out: { dump: string } }).out.dump;
+    expect(dump).not.toContain(RESTART_CRED);
+    expect(dump).toContain("[REDACTED:SECRET_MATERIAL]");
+    expect(dump).toContain("REMOTE_RESULT_REDACTED");
+  });
+
+  it("SHORT-R5: broker enforces the documented minimum credential length at install and load", () => {
+    const { ctx } = makeBizCtx("r5short");
+    const vaultPath = path.join(ctx.dir, "vault.json");
+    const broker = new CredentialBroker({ vaultPath });
+    // Below the minimum → rejected at install, never silently accepted.
+    expect(() =>
+      broker.upsert({ name: "short", value: "abc1234", domains: [], kind: "token" }),
+    ).toThrowError(/FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT/);
+    // Exactly at the minimum → accepted, protected by the sanitizer.
+    broker.upsert({ name: "ok", value: "cv8chars", domains: [], kind: "token" });
+    const out = sanitizeUntrustedRemote({ output: "leak cv8chars end" });
+    expect(JSON.stringify(out.value)).not.toContain("cv8chars");
+    expect(JSON.stringify(out.value)).toContain("[REDACTED:SECRET_MATERIAL]");
+    // A legacy vault holding a sub-minimum value fails closed at load —
+    // it can never slip under sanitizer coverage.
+    fs.writeFileSync(
+      vaultPath,
+      JSON.stringify({
+        credentials: { old: { name: "old", value: "tiny", domains: [], kind: "token", updated_at: "t" } },
+      }),
+    );
+    expect(() => broker.list()).toThrowError(/FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT/);
+    expect(() => new CredentialBroker({ vaultPath })).toThrowError(/FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT/);
   });
 });
