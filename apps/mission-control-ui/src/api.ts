@@ -22,6 +22,8 @@ export function withTokenQuery(url: string): string {
   return url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(tok);
 }
 
+let lastTokenPromptAt = 0;
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   const op = getOperatorId();
@@ -38,7 +40,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!r.ok) {
     const e = body as { error?: string; detail?: string };
-    if (r.status === 401) {
+    if (r.status === 401 && Date.now() - lastTokenPromptAt > 5000) {
+      lastTokenPromptAt = Date.now();
       const t = window.prompt("Mission Control access token:");
       if (t !== null) { setAuthToken(t); window.location.reload(); }
     }

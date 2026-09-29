@@ -39,7 +39,7 @@ export function MissionDetail() {
 
   const mission = (d.mission ?? {}) as Record<string, unknown>;
   const runtime = d.runtime as Record<string, unknown> | null;
-  const st = String(runtime?.state ?? mission.state ?? "");
+  const st = String(runtime?.state ?? mission.state ?? mission.status ?? "");
 
   const act = async (a: "pause" | "resume" | "cancel" | "acknowledge") => {
     try {
