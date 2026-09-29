@@ -713,52 +713,86 @@ export class MissionScheduleService {
         });
       }
     }
-    for (const scheduleId of new Set([...validFired.keys(), ...tainted])) {
+    // Schedules carrying ANY occurrence row — accounting repair needs the
+    // full row set, not only the valid-FIRED ones (a released occurrence
+    // also advances next_due_at, and a gap between rows is what lets a
+    // skipped legacy next_due_at be proven wrong).
+    const allBySchedule = new Map<string, Array<Record<string, unknown>>>();
+    for (const o of occurrences) {
+      const k = String(o.schedule_id);
+      const list = allBySchedule.get(k) ?? [];
+      list.push(o);
+      allBySchedule.set(k, list);
+    }
+    for (const scheduleId of new Set([...allBySchedule.keys(), ...tainted])) {
       if (tainted.has(scheduleId)) continue; // conflicting evidence — no repair
-      const fired = [...(validFired.get(scheduleId) ?? [])].sort((a, b) =>
-        String(b.due_at).localeCompare(String(a.due_at)),
-      );
       const row = this.store.tryGet("mission_schedule", scheduleId);
       if (!row) {
         integrity("mission_schedule", scheduleId, "fired_occurrence_missing_schedule", {
-          occurrence_ids: fired.map((o) => o.occurrence_id),
+          occurrence_ids: (allBySchedule.get(scheduleId) ?? []).map((o) => o.occurrence_id),
         });
         continue;
       }
-      if (fired.length === 0) continue;
-      const latest = fired[0];
-      const latestMissionId = String(latest.mission_id);
-      const latestMission = this.store.tryGet("mission", latestMissionId);
-      // Canonical fire timestamp: the occurrence's own fired_at; fall back
-      // to the mission's created_at when no fire timestamp exists
-      // (documented — never the restart's wall clock).
-      const latestFiredAt = String(
-        latest.fired_at ?? latestMission?.created_at ?? latest.due_at,
+      const fired = [...(validFired.get(scheduleId) ?? [])].sort((a, b) =>
+        String(b.due_at).localeCompare(String(a.due_at)),
       );
-      // Legacy fires (pre-occurrence era) have metadata.schedule_id but no
-      // schedule_occurrence_id — they count once each alongside valid
-      // FIRED occurrences.
-      const legacyCount = missions.filter((m) => {
-        const mmd = m.metadata as Record<string, unknown> | undefined;
-        return (
-          String(mmd?.schedule_id ?? "") === scheduleId &&
-          !mmd?.schedule_occurrence_id
-        );
-      }).length;
-      const derivedRunCount = fired.length + legacyCount;
+      // next_due_at derives from the latest CONTIGUOUS accounted
+      // occurrence: walk this schedule's rows in due_at order while each
+      // row is terminal (FIRED or RELEASED — both are accounted) AND each
+      // due_at is exactly the next cron tick. A non-terminal row or a
+      // missing tick (never attempted) ends the chain; the expected
+      // next_due_at is then the first cron occurrence after the chain's
+      // end. A stored value that skips un-attempted ticks is repaired
+      // DOWN to it; a stale one pointing at accounted work is repaired
+      // UP to it. `anchor === null` → no terminal evidence → leave it.
+      const sorted = [...(allBySchedule.get(scheduleId) ?? [])].sort((a, b) =>
+        String(a.due_at).localeCompare(String(b.due_at)),
+      );
+      let anchor: string | null = null;
+      for (const o of sorted) {
+        const status = String(o.status);
+        if (status !== "FIRED" && status !== "RELEASED") break;
+        if (anchor === null || String(o.due_at) === nextRunAfter(String(row.cron), anchor)) {
+          anchor = String(o.due_at);
+          continue;
+        }
+        break;
+      }
       const desiredNextDue =
-        String(row.next_due_at) <= String(latest.due_at)
-          ? nextRunAfter(String(row.cron), String(latest.due_at))
+        anchor !== null
+          ? nextRunAfter(String(row.cron), anchor)
           : String(row.next_due_at);
       const changes: Record<string, { old: unknown; new: unknown }> = {};
-      if (Number(row.run_count ?? 0) !== derivedRunCount) {
-        changes.run_count = { old: row.run_count ?? 0, new: derivedRunCount };
-      }
-      if (String(row.last_mission_id ?? "") !== latestMissionId) {
-        changes.last_mission_id = { old: row.last_mission_id ?? null, new: latestMissionId };
-      }
-      if (String(row.last_fired_at ?? "") !== latestFiredAt) {
-        changes.last_fired_at = { old: row.last_fired_at ?? null, new: latestFiredAt };
+      if (fired.length > 0) {
+        const latest = fired[0];
+        const latestMissionId = String(latest.mission_id);
+        const latestMission = this.store.tryGet("mission", latestMissionId);
+        // Canonical fire timestamp: the occurrence's own fired_at; fall
+        // back to the mission's created_at when none exists (documented —
+        // never the restart's wall clock).
+        const latestFiredAt = String(
+          latest.fired_at ?? latestMission?.created_at ?? latest.due_at,
+        );
+        // Legacy fires (pre-occurrence era) carry metadata.schedule_id but
+        // no schedule_occurrence_id — each counts once alongside valid
+        // FIRED occurrences.
+        const legacyCount = missions.filter((m) => {
+          const mmd = m.metadata as Record<string, unknown> | undefined;
+          return (
+            String(mmd?.schedule_id ?? "") === scheduleId &&
+            !mmd?.schedule_occurrence_id
+          );
+        }).length;
+        const derivedRunCount = fired.length + legacyCount;
+        if (Number(row.run_count ?? 0) !== derivedRunCount) {
+          changes.run_count = { old: row.run_count ?? 0, new: derivedRunCount };
+        }
+        if (String(row.last_mission_id ?? "") !== latestMissionId) {
+          changes.last_mission_id = { old: row.last_mission_id ?? null, new: latestMissionId };
+        }
+        if (String(row.last_fired_at ?? "") !== latestFiredAt) {
+          changes.last_fired_at = { old: row.last_fired_at ?? null, new: latestFiredAt };
+        }
       }
       if (String(row.next_due_at) !== desiredNextDue) {
         changes.next_due_at = { old: row.next_due_at, new: desiredNextDue };
@@ -767,10 +801,7 @@ export class MissionScheduleService {
       let applied = false;
       for (let attempt = 0; attempt < 3 && !applied; attempt++) {
         const fresh = this.store.get("mission_schedule", scheduleId);
-        fresh.run_count = derivedRunCount;
-        fresh.last_mission_id = latestMissionId;
-        fresh.last_fired_at = latestFiredAt;
-        fresh.next_due_at = desiredNextDue;
+        for (const [k, v] of Object.entries(changes)) fresh[k] = v.new;
         try {
           this.store.put("mission_schedule", scheduleId, fresh, Number(fresh.version));
           applied = true;
@@ -780,10 +811,11 @@ export class MissionScheduleService {
       }
       if (!applied) {
         integrity("mission_schedule", scheduleId, "accounting_write_unproven", {
-          occurrence_id: latest.occurrence_id,
+          anchor_due_at: anchor,
         });
         continue;
       }
+      const latestFired = fired[0];
       this.store.event({
         entity_type: "mission_schedule",
         entity_id: scheduleId,
@@ -791,8 +823,9 @@ export class MissionScheduleService {
         actor: "PAIR_MISSION_SCHEDULE",
         metadata: {
           schedule_id: scheduleId,
-          occurrence_id: latest.occurrence_id,
-          mission_id: latestMissionId,
+          occurrence_id: latestFired?.occurrence_id ?? null,
+          mission_id: latestFired ? String(latestFired.mission_id) : null,
+          anchor_due_at: anchor,
           changes,
           repair_reason: "canonical_occurrence_mission_evidence",
         },
@@ -968,7 +1001,13 @@ export class MissionScheduleService {
           }
         }
       }
-      row.next_due_at = nextRunAfter(String(s.cron), now);
+      // Canonical advance: the next occurrence after the one just
+      // accounted — NOT after `now`. Missed ticks between dueAt and now
+      // are due occurrences in their own right and fire on the next
+      // pass (catch-up), never skipped. Applies uniformly: success,
+      // post-create reconcile, released failure, and lost-claim paths
+      // all advance past THIS occurrence only.
+      row.next_due_at = nextRunAfter(String(s.cron), dueAt);
       try {
         this.store.put("mission_schedule", id, row, Number(row.version));
       } catch (err) {

@@ -1632,7 +1632,12 @@ describe("Schedules — recurring mission triggers", () => {
     const after = svc.get(String(s.schedule_id));
     expect(after.last_mission_id).toBeTruthy();
     expect(Number(after.run_count)).toBe(1);
-    expect(String(after.next_due_at) > "2099-01-01").toBe(true); // advanced past fire time
+    // R5: the schedule advances to the next cron tick after the FIRED
+    // occurrence's canonical due_at — not past the wall clock. Missed
+    // ticks between due_at and `now` remain due for the next pass.
+    expect(String(after.next_due_at)).toBe(
+      nextRunAfter("*/1 * * * *", String(s.next_due_at)),
+    );
   });
 
   it("not due → no fire; disabled/deleted never fire", async () => {

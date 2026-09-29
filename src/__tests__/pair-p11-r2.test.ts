@@ -711,9 +711,13 @@ describe("R2 §2 genuine worker_threads contention", () => {
     const s = sch.create({ goal: "tick", cron: "*/5 * * * *", operator_id: "op" });
     const id = String(s.schedule_id);
     const row = sch.get(id);
-    row.next_due_at = new Date(Date.now() - 60_000).toISOString();
+    const dueAt = new Date(Date.now() - 60_000).toISOString();
+    row.next_due_at = dueAt;
     ctx.store.put("mission_schedule", id, row, Number(row.version));
-    const now = utcnow();
+    // `now` pinned to dueAt: nextRunAfter(dueAt) > now, so the loser can
+    // never legitimately catch up a second (missed) occurrence — the
+    // exactly-one-mission assertion stays deterministic under R5.
+    const now = dueAt;
     const [r1, r2] = await runRace([
       { op: "fire", dir, dbPath, args: { projectId: ctx.projectId, now } },
       { op: "fire", dir, dbPath, args: { projectId: ctx.projectId, now } },

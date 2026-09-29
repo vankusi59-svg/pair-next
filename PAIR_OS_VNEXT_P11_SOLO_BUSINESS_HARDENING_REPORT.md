@@ -484,3 +484,102 @@ enabled. Enable after R4 audit passes, before merge.
 **Classification submitted for independent audit:
 `P11_REMEDIATED_R4_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
 requires the independent re-audit — this report does not self-certify.
+
+---
+
+## §10.11 P11 REMEDIATION R5 — NEXT_DUE FINAL SEMANTICS
+
+- **Previous head audited:** `0bdf66ab7c86e65917d2380177fc00221ef0151c`
+- **Audit classification:** `P11_BLOCKED` — R4 closed restart accounting,
+  but `_fireDue` still advanced `next_due_at` from the wall clock.
+
+### §10.11.1 Root cause → fix
+
+`_fireDue` computed `next_due_at = nextRunAfter(cron, now)` after each
+accounted occurrence. When `now` was minutes/hours past the occurrence's
+`dueAt`, every missed cron tick between them was silently skipped —
+they never existed as occurrences and were never attempted.
+
+R5 anchors advancement to the occurrence that was actually accounted:
+
+- `_fireDue`: `next_due_at = nextRunAfter(cron, dueAt)` where `dueAt` is
+  the pinned snapshot occurrence — applied uniformly to the success path,
+  the post-create-exception reconciliation success path, the released-
+  failure path, and the claim-lost path. Missed ticks remain due and are
+  caught up one occurrence per pass by normal `due()` processing.
+- `reconcileScheduleRows`: `next_due_at` now derives from the latest
+  **contiguous accounted** occurrence. Rows for a schedule are walked in
+  `due_at` order while each is terminal (FIRED or RELEASED — both are
+  accounted) AND each `due_at` is exactly the next cron tick. The chain
+  stops at a non-terminal row or a missing tick. `next_due_at` is repaired
+  to `nextRunAfter(cron, anchor)` in BOTH directions: a stale value
+  pointing at accounted work advances; a pre-R5 skipped value rewinds so
+  un-attempted ticks fire. `anchor === null` → no terminal evidence →
+  left alone (never guessed).
+
+`dueAt` is canonical because it is the occurrence's identity: occurrence
+rows, claim ids, `mission.metadata.scheduled_for`, and binding all key
+off it. `now` is only the processing instant — deriving durable schedule
+state from it made advancement depend on when the scheduler happened to
+run, which is exactly the defect the audit caught.
+
+### §10.11.2 Migration / restart repair
+
+A persisted pre-R5 state (FIRED 10:00, stored `next_due_at` 10:25, no
+occurrence rows for 10:05–10:20) is proven wrong at restart: the
+contiguous chain ends at 10:00, so `next_due_at` rewinds to 10:05 and the
+missed ticks fire on subsequent passes — audited via
+`SCHEDULE_ACCOUNTING_RECONCILED` with `anchor_due_at`. Later FIRED
+occurrences still dominate `last_*`/run_count derivation; released
+occurrences extend the anchor but never count toward `run_count`.
+
+### §10.11.3 Files changed / tests
+
+- `src/pair/mission-schedule.ts` — `nextRunAfter(cron, dueAt)` in
+  `_fireDue`; contiguous-anchor `next_due_at` derivation in
+  `reconcileScheduleRows` (loop now covers every schedule carrying any
+  occurrence row, not only valid-FIRED).
+- `src/__tests__/pair-p11-r5.test.ts` — **9 tests**: §6.A missed-tick
+  fire, §6.B post-create exception, §6.C legacy skip repair, §6.D
+  multiple historical, §6.E idempotency + genuine restart (closed store,
+  fresh stack), contiguity proofs (gap / RELEASED extends / in-flight
+  CLAIMED ends chain).
+- `src/__tests__/pair-p11-r2.test.ts` — worker `fire` race `now` pinned
+  to `dueAt` so a missed tick can't legitimately fire under the loser
+  (deterministic, no assertion weakened).
+- `src/__tests__/pair-p9.test.ts` — one assertion updated: it encoded
+  the pre-R5 skip (`next_due_at > "2099-01-01"` after firing with
+  `now=2099`); now asserts the exact canonical value
+  `nextRunAfter(cron, dueAt)`. Strengthened, not weakened.
+- `.github/workflows/ci.yml` — focused P11 step includes r5 file.
+
+### §10.11.4 Verification
+
+- P11 suites: **99/99** (22+25+19+12+12+9) on Node 22 and Node 20.
+- Full suite Node 22: **1781 pass** / 24 skipped / 2 pre-existing
+  env-dependent `pair-p5.test.ts` probe fails (dsh/codex binaries on the
+  dev box — green on CI, unchanged). Node 20: **1783 pass, 0 fail**.
+- `pnpm run typecheck` clean; `pnpm run build` clean.
+- `pnpm audit --audit-level=high`: **0 high, 0 critical** (1 low,
+  8 moderate — expected posture).
+- `PairEvidenceStore.verifyIntegrity` clean after restart repair
+  (hash check would throw).
+- R2 worker_threads contention races unweakened and green.
+
+### §10.11.5 Remaining limitations
+
+- Catch-up is one occurrence per `fireDue` pass — a schedule days behind
+  converges over multiple ticks (deliberate: firing all missed
+  occurrences at once could flood a restarted system).
+- A fresh in-flight CLAIMED row ends the contiguous chain; if its owner
+  died inside the TTL window the schedule waits out the TTL before the
+  tick becomes re-firable (existing grace semantics, unchanged).
+
+### §10.11.6 Branch protection
+
+Unchanged: **OPERATOR ACTION REQUIRED** — integration token 403; NOT
+enabled. Enable after R5 audit passes, before merge.
+
+**Classification submitted for independent audit:
+`P11_REMEDIATED_R5_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
+requires the independent re-audit — this report does not self-certify.
