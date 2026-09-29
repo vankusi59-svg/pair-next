@@ -148,10 +148,15 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   at `upsert` and `load` (`FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT`), so
   no accepted credential can fall under sanitizer coverage. Restart
   isolation proven with a fresh-worker collect path.
-- Classification: **`P13_REMEDIATED_R5_PENDING_AUDIT`** on the P13
+- **R6 remediation** (same PR): rotated/deleted credential values are
+  retired inside the same vault as redaction-only material — registered
+  at startup alongside active values, never releasable or listed; vault
+  `load()` is fail-closed (`FAIL_CLOSED_CREDENTIAL_VAULT_INVALID`) on
+  malformed JSON/records instead of silently loading `{}`.
+- Classification: **`P13_REMEDIATED_R6_PENDING_AUDIT`** on the P13
   branch/PR; evidence in
-  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 64/64,
-  P12 71/71, P11 103/103, P9 79/79, N20 1922/0, N22 1920/2env,
+  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 67/67,
+  P12 71/71, P11 103/103, P9 79/79, N20 1925/0, N22 1923/2env,
   typecheck+build PASS, audit 0 high, worker races PASS, verifyIntegrity
   clean. NOT merged.
 

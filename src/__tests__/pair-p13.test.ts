@@ -1040,14 +1040,28 @@ try {
     Atomics.wait(barrier, 0, 0);
     const row = service.cost.createCostPolicy(args.input, "worker");
     parentPort.postMessage({ ok: true, out: { reservation_id: String(row.cost_policy_id), status: "CREATED" } });
+  } else if (op === "vaultSetup") {
+    // R6 "process A": install a credential, then rotate or delete it —
+    // retiring the old value as redaction-only material in the same vault.
+    const broker = new PAIR.CredentialBroker({ vaultPath: args.vaultPath });
+    broker.upsert({ name: args.name, value: args.oldValue, domains: ["api.x"], kind: "token" });
+    if (args.mode === "rotate") {
+      broker.upsert({ name: args.name, value: args.newValue, domains: ["api.x"], kind: "token" });
+    } else {
+      broker.remove(args.name);
+    }
+    parentPort.postMessage({ ready: true });
+    Atomics.wait(barrier, 0, 0);
+    parentPort.postMessage({ ok: true, out: { status: "VAULTED" } });
   } else if (op === "restartSanitize") {
-    // R5 §3: fresh worker = fresh module registry = EMPTY sensitive-
-    // material Set. Constructing the broker from the EXISTING vault must
-    // re-register every installed credential — no upsert/release here.
+    // R5 §3 + R6 §3: fresh worker = fresh module registry = EMPTY
+    // sensitive-material Set. Constructing the broker from the EXISTING
+    // vault must re-register every installed (and retired) credential —
+    // no upsert/release needed for redaction.
     const store = new PAIR.PairEvidenceStore(dbPath);
     const service = new PAIR.PairControlPlane(store);
     const gate = new PAIR.GovernedTaskGate(service);
-    new PAIR.CredentialBroker({ vaultPath: args.vaultPath });
+    const broker = new PAIR.CredentialBroker({ vaultPath: args.vaultPath });
     parentPort.postMessage({ ready: true });
     Atomics.wait(barrier, 0, 0);
     store.put("executor_execution", args.executionId, {
@@ -1074,8 +1088,16 @@ try {
       evidence: store.listEvidence("MSN_restart"),
       events: store.listEvents(),
     });
+    // R6 §3: current credential stays releasable, retired value never does.
+    let release_ok = null;
+    if (args.releaseName) {
+      const rel = broker.release(args.releaseName, { mission_id: "MSN_restart", task_id: "TSK_restart" });
+      release_ok = args.expectRelease
+        ? !!rel && rel.value === args.newValue && rel.value !== args.retiredValue
+        : rel === null;
+    }
     store.verifyIntegrity();
-    parentPort.postMessage({ ok: true, out: { status: "COLLECTED", dump } });
+    parentPort.postMessage({ ok: true, out: { status: "COLLECTED", dump, release_ok } });
   } else {
     throw new Error("unknown op " + op);
   }
@@ -2160,5 +2182,95 @@ describe("P13-R5.restart: sanitizer protection survives process restart", () => 
     );
     expect(() => broker.list()).toThrowError(/FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT/);
     expect(() => new CredentialBroker({ vaultPath })).toThrowError(/FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT/);
+  });
+});
+
+describe("P13-R6.lifecycle: retired credentials stay redaction-protected across restart", () => {
+  const OLD = "secret-old-a1b2c3";
+  const NEW = "secret-new-x9y8z7";
+  const DEL = "secret-del-q5w6e7";
+
+  const collect = async (
+    tag: string,
+    args: Record<string, unknown>,
+  ): Promise<{ dump: string; release_ok: boolean | null }> => {
+    const { ctx } = makeBizCtx(tag);
+    const res = await runRace([
+      { op: "restartSanitize", dbPath: path.join(ctx.dir, "pair.db"), args },
+    ]);
+    expect(res[0].ok).toBe(true);
+    return res[0].out as { dump: string; release_ok: boolean | null };
+  };
+
+  it("ROTATE-R6: fresh process redacts a retired value echoed by a stale execution; new value stays releasable", async () => {
+    const { ctx } = makeBizCtx("r6rot");
+    const vaultPath = path.join(ctx.dir, "vault.json");
+    // Process A: install + rotate — the old value is retired in the vault.
+    const setup = await runRace([
+      {
+        op: "vaultSetup",
+        dbPath: path.join(ctx.dir, "pair.db"),
+        args: { vaultPath, name: "api", oldValue: OLD, newValue: NEW, mode: "rotate" },
+      },
+    ]);
+    expect(setup[0].ok).toBe(true);
+    // Process B (fresh registry): NO upsert/release before the hostile echo.
+    const { dump, release_ok } = await collect("r6rot2", {
+      vaultPath,
+      executionId: "EXEC_rot_1",
+      hostile: `tail ${OLD} end`,
+      releaseName: "api",
+      expectRelease: true,
+      newValue: NEW,
+      retiredValue: OLD,
+    });
+    expect(dump).not.toContain(OLD);
+    expect(dump).not.toContain(NEW);
+    expect(dump).toContain("[REDACTED:SECRET_MATERIAL]");
+    expect(release_ok).toBe(true); // NEW releasable, OLD unreachable
+  });
+
+  it("DELETE-R6: fresh process redacts a deleted value; deleted credential is not releasable", async () => {
+    const { ctx } = makeBizCtx("r6del");
+    const vaultPath = path.join(ctx.dir, "vault.json");
+    const setup = await runRace([
+      {
+        op: "vaultSetup",
+        dbPath: path.join(ctx.dir, "pair.db"),
+        args: { vaultPath, name: "api", oldValue: DEL, mode: "delete" },
+      },
+    ]);
+    expect(setup[0].ok).toBe(true);
+    const { dump, release_ok } = await collect("r6del2", {
+      vaultPath,
+      executionId: "EXEC_del_1",
+      hostile: `tail ${DEL} end`,
+      releaseName: "api",
+      expectRelease: false,
+    });
+    expect(dump).not.toContain(DEL);
+    expect(dump).toContain("[REDACTED:SECRET_MATERIAL]");
+    expect(release_ok).toBe(true); // release("api") === null
+  });
+
+  it("VAULT-INVALID-R6: malformed or inconsistent vault fails closed at construction", () => {
+    const { ctx } = makeBizCtx("r6bad");
+    const vaultPath = path.join(ctx.dir, "vault.json");
+    // Malformed JSON.
+    fs.writeFileSync(vaultPath, "{not json!!", { mode: 0o600 });
+    expect(() => new CredentialBroker({ vaultPath })).toThrowError(/FAIL_CLOSED_CREDENTIAL_VAULT_INVALID/);
+    // Malformed credential record (missing value).
+    fs.writeFileSync(vaultPath, JSON.stringify({ credentials: { a: { name: "a" } } }), { mode: 0o600 });
+    expect(() => new CredentialBroker({ vaultPath })).toThrowError(/FAIL_CLOSED_CREDENTIAL_VAULT_INVALID/);
+    // Invalid retired record.
+    fs.writeFileSync(
+      vaultPath,
+      JSON.stringify({ credentials: {}, retired: [{ name: "r", value: "long-enough-value" }] }),
+      { mode: 0o600 },
+    );
+    expect(() => new CredentialBroker({ vaultPath })).toThrowError(/FAIL_CLOSED_CREDENTIAL_VAULT_INVALID/);
+    // Wrong top-level shape.
+    fs.writeFileSync(vaultPath, JSON.stringify([1, 2, 3]), { mode: 0o600 });
+    expect(() => new CredentialBroker({ vaultPath })).toThrowError(/FAIL_CLOSED_CREDENTIAL_VAULT_INVALID/);
   });
 });

@@ -774,3 +774,65 @@ be one the non-persistence layer ignores. Existing test fixtures using
 
 **`P13_REMEDIATED_R5_PENDING_AUDIT`** — pushed to the existing P13 PR;
 DO NOT MERGE; DO NOT START P14/P15.
+
+---
+
+# REMEDIATION R6 — durable historical redaction + fail-closed vault load
+
+## R6.1 §1 — retired credentials remain redaction-protected
+
+**Defect.** R5 registered only values currently in `vault.json`. Rotate or
+delete a credential and its old value vanished from the vault — a stale
+remote session echoing it after a PAIR restart would then land raw in
+`executor_execution.result`.
+
+**Fix.** The vault schema is now `{ credentials: {...}, retired: [...] }`.
+`upsert()` over an existing name and `remove()` both retire the old value
+into `retired` — redaction-only material inside the SAME non-canonical
+vault boundary (no second secret store). The constructor registers
+**active + retired** values at startup, so every credential that may
+still exist in an outstanding remote execution keeps sanitizer
+protection across rotation, deletion, and restart. Retired values are
+never returned by `release()` or `list()` — the current credential stays
+normally releasable.
+
+## R6.2 §2 — vault load fails closed
+
+`load()` previously returned `{}` on any generic read/parse failure —
+fail-open: startup could proceed with an empty sanitizer registry. Now a
+missing vault is still created fresh, but malformed JSON, a malformed
+credential record, an invalid `retired` record, or any inconsistent
+shape throws `FAIL_CLOSED_CREDENTIAL_VAULT_INVALID` (names only in error
+detail, never values). `FAIL_CLOSED_CREDENTIAL_VALUE_TOO_SHORT`
+semantics for sub-8 values are preserved for active and retired records.
+
+## R6.3 R6 test matrix (3 new tests, P13 now 67)
+
+- ROTATE-R6 (worker_threads isolation): worker A installs SECRET_OLD and
+  rotates to SECRET_NEW, exits; fresh worker B (empty module registry)
+  constructs `CredentialBroker` on the resulting vault — no
+  upsert/release — collects a hostile echo of SECRET_OLD through
+  `collect_execution_result`. Canonical dump contains no raw value,
+  shows `[REDACTED:SECRET_MATERIAL]`; `release("api")` returns SECRET_NEW
+  (never SECRET_OLD); `verifyIntegrity` clean.
+- DELETE-R6: same flow with `remove()`; echo of SECRET_DELETE is
+  redacted; `release("api") === null`.
+- VAULT-INVALID-R6: malformed JSON, malformed credential record, invalid
+  retired record, wrong top-level shape → `FAIL_CLOSED_CREDENTIAL_VAULT_INVALID`
+  at construction.
+
+## R6.4 Validation evidence
+
+- `pnpm run typecheck` PASS · `pnpm run build` PASS
+- P13 **67/67** · P12 **71/71** · P11 **103/103** · P9 **79/79**
+- Node 22.23.3 `pnpm test`: **1923 pass / 2 fail / 24 skip** — same two
+  documented env-dependent p5 executor probes.
+- Node 20.20.2 `npx vitest run`: **1925 pass / 0 fail / 24 skip**.
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**.
+- Worker races PASS incl. R4 create-only + R5/R6 restart races.
+- `verifyIntegrity` clean.
+
+## R6.5 Classification
+
+**`P13_REMEDIATED_R6_PENDING_AUDIT`** — pushed to the existing P13 PR;
+DO NOT MERGE; DO NOT START P14/P15.
