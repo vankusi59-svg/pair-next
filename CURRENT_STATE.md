@@ -31,7 +31,11 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `org_agent` — capability allow/deny, executor allow/deny/prefer +
   fallback, provider/model route prefer/deny/restrict, project scope,
   context scopes. Contracts only NARROW existing PAIR authority; explicit
-  deny wins; unknown capability fails closed.
+  deny wins; unknown capability fails closed. R1: `fallback=false` +
+  non-empty preferred set is a HARD restriction per snapshot (executor
+  AND route, pinned ∩ current, deny-minus); unknown policy keys rejected;
+  live contract row digest revalidated at every resolution; agent-bound
+  mission without a pin fails `PIN_MISSING`.
 - **Enforcement**: pin at `MissionControl.startMission` (contract id +
   version + digest in mission metadata), authoritative checks in
   `GovernedTaskGate.create_governed_task`, executor/route filtering in
@@ -43,8 +47,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - **API**: `GET|POST /api/org-agents/:id/contract`,
   `POST /api/org-agents/:id/contract/(enable|disable)`,
   `GET /api/org-agents/:id/effective-policy`.
-- Classification: `P12_IMPLEMENTED_PENDING_AUDIT` — not merged; see
-  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md`.
+- Classification: `P12_REMEDIATED_R1_PENDING_AUDIT` — not merged; see
+  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1.
 
 ## Not yet
 

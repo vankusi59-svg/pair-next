@@ -1040,3 +1040,314 @@ describe("P12.L genuine worker_threads CAS race", () => {
     expect(integrity.errors ?? 0).toBe(0);
   }, 60_000);
 });
+
+/* ============ R1 — audit defect closures ============ */
+
+describe("P12.R1.1 executor_fallback_allowed=false is a hard restriction", () => {
+  it("A. fallback=false + preferred unavailable → no eligible executor", () => {
+    const { ctx, biz } = makeBizCtx("r1a");
+    const a = new ScriptedAdapter("EXEC_A");
+    const b = new ScriptedAdapter("EXEC_B");
+    registerScripted(ctx, a);
+    registerScripted(ctx, b);
+    a.available = false;
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    biz.upsertAgentContract(String(ag.agent_id), "op", {
+      preferred_executor_ids: ["EXEC_A"],
+      executor_fallback_allowed: false,
+    });
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(bz.business_id));
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR|FAIL_CLOSED/);
+    expect(b.dispatched.length).toBe(0); // fallback NOT taken
+  });
+
+  it("B. fallback=false + preferred eligible → preferred executes", () => {
+    const { ctx, biz } = makeBizCtx("r1b");
+    const a = new ScriptedAdapter("EXEC_A");
+    const b = new ScriptedAdapter("EXEC_B");
+    registerScripted(ctx, a, { priority: 90 });
+    registerScripted(ctx, b, { priority: 10 });
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    biz.upsertAgentContract(String(ag.agent_id), "op", {
+      preferred_executor_ids: ["EXEC_A"],
+      executor_fallback_allowed: false,
+    });
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(bz.business_id));
+    const routed = ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters);
+    expect(String(routed.route_decision.executor_id)).toBe("EXEC_A");
+  });
+
+  it("C. pinned no-fallback EXEC_A + current switched to EXEC_B → old mission gains nothing", () => {
+    const { ctx, biz } = makeBizCtx("r1c");
+    const a = new ScriptedAdapter("EXEC_A");
+    const b = new ScriptedAdapter("EXEC_B");
+    registerScripted(ctx, a);
+    registerScripted(ctx, b);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    biz.upsertAgentContract(aid, "op", {
+      preferred_executor_ids: ["EXEC_A"],
+      executor_fallback_allowed: false,
+    });
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    // V3: operator switches the hard restriction to B — the pinned V2
+    // restriction intersects to empty: the old mission acquires neither.
+    biz.upsertAgentContract(aid, "op", {
+      preferred_executor_ids: ["EXEC_B"],
+      executor_fallback_allowed: false,
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED/);
+    expect(a.dispatched.length).toBe(0);
+    expect(b.dispatched.length).toBe(0);
+  });
+
+  it("D. current tightening still revokes pinned no-fallback authority", () => {
+    const { ctx, biz } = makeBizCtx("r1d");
+    const a = new ScriptedAdapter("EXEC_A");
+    const b = new ScriptedAdapter("EXEC_B");
+    registerScripted(ctx, a);
+    registerScripted(ctx, b);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    biz.upsertAgentContract(aid, "op", {
+      preferred_executor_ids: ["EXEC_A"],
+      executor_fallback_allowed: false,
+    });
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    // tighten: deny A outright — pinned ∩ current restriction stays {A}
+    // but denied union wins → fail closed.
+    biz.upsertAgentContract(aid, "op", { denied_executor_ids: ["EXEC_A"] });
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED/);
+    expect(a.dispatched.length).toBe(0);
+  });
+});
+
+describe("P12.R1.2 agent-bound mission without pin fails closed", () => {
+  it("org_agent_id present + stripped agent_contract pin → denied, audited, no dispatch", () => {
+    const { ctx, biz } = makeBizCtx("r1e");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    // strip the pin — simulates a pre-P12 in-flight agent-bound mission
+    const row = ctx.store.get("mission", String(mission.mission_id));
+    const md = row.metadata as Record<string, unknown>;
+    delete md.agent_contract;
+    ctx.store.put("mission", String(mission.mission_id), row, Number(row.version));
+    const stripped = ctx.service.getMission(String(mission.mission_id));
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, stripped) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED_AGENT_CONTRACT_PIN_MISSING/);
+    const denials = denialEvents(ctx.store, aid);
+    expect(denials.length).toBe(1);
+    expect(String(denials[0].metadata?.reason)).toBe("FAIL_CLOSED_AGENT_CONTRACT_PIN_MISSING");
+    expect(a.dispatched.length).toBe(0);
+  });
+});
+
+describe("P12.R1.3 pinned route restriction cannot be retro-broadened", () => {
+  function twoRoutes(ctx: Ctx) {
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a, { priority: 10 });
+    addRoute(ctx, "RTE_A_ALT", "EXEC_A", 90);
+    return a;
+  }
+
+  it("A. pinned no-fallback [RTE_A] + current prefers [RTE_ALT] → old mission keeps RTE_A only", () => {
+    const { ctx, biz } = makeBizCtx("r1f");
+    twoRoutes(ctx);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    biz.upsertAgentContract(aid, "op", {
+      preferred_route_ids: ["RTE_EXEC_A"],
+      route_fallback_allowed: false,
+    });
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    // current switches preference (fallback allowed → advisory only, no new hard set)
+    biz.upsertAgentContract(aid, "op", {
+      preferred_route_ids: ["RTE_A_ALT"],
+      route_fallback_allowed: true,
+    });
+    ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters);
+    const dec = ctx.store.list("route_decision").at(-1)!;
+    // pinned hard set {RTE_EXEC_A} stands — B-preference cannot broaden it
+    expect(String(dec.selected_route_id)).toBe("RTE_EXEC_A");
+  });
+
+  it("B. pinned no-fallback A + current no-fallback ALT → empty intersection → NO_ELIGIBLE_ROUTE", () => {
+    const { ctx, biz } = makeBizCtx("r1g");
+    twoRoutes(ctx);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    biz.upsertAgentContract(aid, "op", {
+      preferred_route_ids: ["RTE_EXEC_A"],
+      route_fallback_allowed: false,
+    });
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    biz.upsertAgentContract(aid, "op", {
+      preferred_route_ids: ["RTE_A_ALT"],
+      route_fallback_allowed: false,
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED_NO_ELIGIBLE_ROUTE/);
+  });
+
+  it("C. fallback=true on both snapshots → preference is advisory reorder inside eligibility", () => {
+    const { ctx, biz } = makeBizCtx("r1h");
+    twoRoutes(ctx);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    biz.upsertAgentContract(aid, "op", { preferred_route_ids: ["RTE_EXEC_A"] });
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    biz.upsertAgentContract(aid, "op", { preferred_route_ids: ["RTE_A_ALT"] });
+    ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters);
+    const dec = ctx.store.list("route_decision").at(-1)!;
+    // advisory current preference wins ordering — but ALT was eligible anyway
+    expect(String(dec.selected_route_id)).toBe("RTE_A_ALT");
+  });
+
+  it("D. denied route still wins over any preference", () => {
+    const { ctx, biz } = makeBizCtx("r1i");
+    twoRoutes(ctx);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    biz.upsertAgentContract(aid, "op", {
+      preferred_route_ids: ["RTE_A_ALT"],
+      route_fallback_allowed: false,
+      denied_route_ids: ["RTE_A_ALT"],
+    });
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED_NO_ELIGIBLE_ROUTE/);
+  });
+});
+
+describe("P12.R1.4 current contract row revalidation", () => {
+  function tamper(store: PairEvidenceStore, agentId: string, mutate: (row: Record<string, unknown>) => void) {
+    const svc = new AgentContractService(store);
+    const row = svc.get(agentId)!;
+    mutate(row);
+    store.put("agent_execution_contract", String(row.contract_id), row, Number(row.version));
+  }
+
+  it("A. tampered policy + stale digest → fail closed at gate", () => {
+    const { ctx, biz } = makeBizCtx("r1j");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    tamper(ctx.store, aid, (row) => {
+      (row.policy as Record<string, unknown>).allowed_capabilities = ["SHELL_EXECUTION"];
+      // digest left stale → no longer self-consistent
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED_AGENT_CONTRACT_DIGEST|FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY/);
+  });
+
+  it("B. tampered digest → fail closed", () => {
+    const { ctx, biz } = makeBizCtx("r1k");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    tamper(ctx.store, aid, (row) => {
+      row.contract_digest = "f".repeat(64);
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED/);
+  });
+
+  it("C. wrong schema_version → fail closed", () => {
+    const { ctx, biz } = makeBizCtx("r1l");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    tamper(ctx.store, aid, (row) => {
+      row.schema_version = "evil.v0";
+    });
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, ctx.service.getMission(String(mission.mission_id))) as never, ctx.adapters),
+    ).toThrowError(/FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY|FAIL_CLOSED/);
+  });
+});
+
+describe("P12.R1.5 unknown policy fields fail closed", () => {
+  it("typo field allowed_executor_id is rejected, not silently unrestricted", () => {
+    const { ctx, biz } = makeBizCtx("r1m");
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    expect(() =>
+      biz.upsertAgentContract(String(ag.agent_id), "op", { allowed_executor_id: ["EXEC_A"] } as never),
+    ).toThrowError(/FAIL_CLOSED_AGENT_CONTRACT_FIELDS/);
+    expect(() =>
+      biz.upsertAgentContract(String(ag.agent_id), "op", { typo: 1 } as never),
+    ).toThrowError(/FAIL_CLOSED_AGENT_CONTRACT_FIELDS/);
+  });
+});
+
+describe("P12.R1.6 pin-time denial audit", () => {
+  it("inactive agent at startMission → denial audited", () => {
+    const { ctx, biz } = makeBizCtx("r1n");
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    biz.setOrgAgentStatus(aid, "PAUSED", "op");
+    expect(() =>
+      ctx.control.startMission({
+        goal: "g",
+        project_id: ctx.projectId,
+        operator_id: "op",
+        metadata: { business_id: String(bz.business_id), org_agent_id: aid },
+      }),
+    ).toThrowError(/FAIL_CLOSED_AGENT_INACTIVE/);
+    const denials = denialEvents(ctx.store, aid);
+    expect(denials.length).toBe(1);
+    expect(String(denials[0].metadata?.reason)).toBe("FAIL_CLOSED_AGENT_INACTIVE");
+  });
+
+  it("project denied at startMission → denial audited", () => {
+    const { ctx, biz } = makeBizCtx("r1o");
+    const other = ctx.service.createProject({ name: "o", root_location: fs.mkdtempSync(path.join(ctx.dir, "ws2-")) });
+    const bz = makeBiz(biz, String(other.project_id));
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    expect(() =>
+      ctx.control.startMission({
+        goal: "g",
+        project_id: ctx.projectId, // not the business project → out of scope
+        operator_id: "op",
+        metadata: { business_id: String(bz.business_id), org_agent_id: aid },
+      }),
+    ).toThrowError(/FAIL_CLOSED_AGENT_PROJECT_DENIED/);
+    const denials = denialEvents(ctx.store, aid);
+    expect(denials.length).toBe(1);
+    expect(String(denials[0].metadata?.reason)).toBe("FAIL_CLOSED_AGENT_PROJECT_DENIED");
+  });
+});

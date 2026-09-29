@@ -160,6 +160,7 @@ export class MissionRouter {
       candidates = new Map(
         [...candidates].filter(([id]) =>
           (agentPolicy.allowed_executor_ids === null || agentPolicy.allowed_executor_ids.has(id)) &&
+          (agentPolicy.restricted_executor_ids === null || agentPolicy.restricted_executor_ids.has(id)) &&
           !agentPolicy.denied_executor_ids.has(id),
         ),
       );
@@ -216,12 +217,10 @@ export class MissionRouter {
       correlation_id: correlationId,
       preferred_route_ids: agentPolicy?.preferred_route_ids ?? [],
       denied_route_ids: agentPolicy ? [...agentPolicy.denied_route_ids] : [],
-      // A contract may forbid falling back off its preferred routes — then
-      // only those routes may be selected; nothing else is eligible.
+      // Effective hard route restriction (pinned ∩ current, minus denied)
+      // — when any snapshot disables fallback, only these may be selected.
       restricted_route_ids:
-        agentPolicy && agentPolicy.preferred_route_ids.length && !agentPolicy.route_fallback_allowed
-          ? agentPolicy.preferred_route_ids
-          : null,
+        agentPolicy?.restricted_route_ids ? [...agentPolicy.restricted_route_ids] : null,
     });
     if (!routeDecision.selected_route_id) {
       this.service.store.appendEvidence(missionId, "ROUTING_FAILED", {

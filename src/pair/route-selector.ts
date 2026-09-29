@@ -85,8 +85,10 @@ export class RouteSelector {
     if ((request.denied_route_ids as string[] | undefined)?.includes(rid)) {
       reasons.push("AGENT_CONTRACT_ROUTE_DENIED");
     }
+    // R1 §3: a non-null restricted set is a hard allow-set — an EMPTY one
+    // (pinned ∩ current collapsed) rejects every route, never falls back.
     const restricted = request.restricted_route_ids as string[] | null | undefined;
-    if (restricted && restricted.length && !restricted.includes(rid)) {
+    if (restricted && !restricted.includes(rid)) {
       reasons.push("AGENT_CONTRACT_ROUTE_RESTRICTED");
     }
 

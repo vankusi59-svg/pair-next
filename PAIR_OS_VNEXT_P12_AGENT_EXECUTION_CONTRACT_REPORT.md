@@ -214,3 +214,153 @@ before re-throw — there is no silent deny path.
 - `executor_binding` on org_agent maps to baseline
   `preferred_executor_ids[0]` when it names a registered executor;
   it is a preference, not a bypass.
+
+---
+
+# R1 — Independent-audit remediation (authority/provenance closure)
+
+Audit classification: `P12_BLOCKED` at head `289c285`.
+Six defects found and closed. All changes preserve the canonical
+execution path (Business → MissionControl → Planner → MissionRouter →
+GovernedTaskGate → Executor) — no second engine, no bypass.
+
+## R1.1 `executor_fallback_allowed=false` was advisory-only — FIXED
+
+**Defect:** the flag was computed but MissionRouter never used it;
+`preferred_executor_ids` never became a hard restriction, so EXEC_B
+could be selected when preferred EXEC_A was unavailable.
+
+**Fix:** `effectiveForMission` now derives `restricted_executor_ids`:
+
+- per snapshot: `fallback_allowed=false` + non-empty
+  `preferred_executor_ids` → the preferred set is a **hard restriction**;
+- effective restriction = `pinned ∩ current` (absent = unconstrained);
+- effective executor allow = `allowed_executor_ids` (pinned∩current,
+  null=unrestricted) ∩ `restricted` − `denied_executor_ids` (union);
+- preference only *orders* within the effective set — it can never make
+  an executor eligible (`preferred_executor_ids` filtered through the
+  same predicate).
+
+Enforced at **two** layers: MissionRouter candidate filter (prevents
+selection) and GovernedTaskGate's authoritative executor check (prevents
+dispatch). Empty result → `FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR` + audited
+denial.
+
+**Tests A–D:** fallback=false+preferred down → no dispatch; eligible
+preferred executes; pinned no-fallback A ∩ switched current no-fallback
+B → empty → fail closed; deny-union tightening still revokes.
+
+## R1.2 Missing contract pin silently substituted current contract — FIXED
+
+**Defect:** `metadata.org_agent_id` present without
+`metadata.agent_contract` → `pinnedPolicy` returned null and the
+*current* contract became sole authority — provenance not immutable.
+
+**Fix:** any `org_agent_id`-bound mission reaching governed execution
+**must** carry a valid pin. Missing → `FAIL_CLOSED_AGENT_CONTRACT_PIN_MISSING`,
+audited `AGENT_EXECUTION_DENIED`, no dispatch. Pre-P12 in-flight
+missions fail closed (explicit remediation/re-issue; no invented
+provenance). Pin-vs-current checks kept: contract_id/org_agent match,
+business match, `pinned_version ≤ current_version`.
+
+**Test:** pin stripped → PIN_MISSING + denial event + zero dispatch.
+
+## R1.3 Pinned route restriction could be retro-broadened — FIXED
+
+**Defect:** route selection used *current* `preferred_route_ids` only —
+a pinned `route_fallback_allowed=false` snapshot's hard set was ignored.
+
+**Fix:** `restricted_route_ids` derived identically to §R1.1:
+`route_fallback_allowed=false` + non-empty preferred → hard set per
+snapshot; effective = `pinned ∩ current`, minus denied union (deny wins).
+Empty → selector rejects every route
+(`AGENT_CONTRACT_ROUTE_RESTRICTED`) → `FAIL_CLOSED_NO_ELIGIBLE_ROUTE`.
+Advisory `preferred_route_ids` (fallback=true snapshots) only reorders
+inside canonical eligibility.
+
+**Selector fix:** `restricted_route_ids` non-null is now an active
+allow-set even when empty (was `restricted.length` truthy-gated —
+an empty set meant "unrestricted").
+
+**Tests A–D:** pinned no-fallback A + current prefers ALT → selects A
+(B never authorized); A∩ALT both no-fallback → empty → NO_ELIGIBLE_ROUTE;
+both advisory → current preference reorders legitimately; denied-in-
+preference → NO_ELIGIBLE_ROUTE.
+
+## R1.4 Current contract integrity not revalidated — FIXED
+
+**Defect:** only the *pinned* digest was verified; the live contract row
+used for revocation/effective policy was trusted blindly.
+
+**Fix:** canonical `validateContractRow(agent, contract)` helper invoked
+in `resolve()` — the choke point of pin, assertExecutable,
+effectiveForMission, update, setStatus, inspect. Validates:
+`contract_id == contractIdFor(org_agent_id)`, org_agent/business
+binding, `schema_version == AGENT_CONTRACT_SCHEMA`, status ∈
+{ACTIVE,DISABLED}, `contract_version` positive int, policy normalizes,
+recomputed `contractDigest == stored digest`. Tamper → fail closed.
+
+**Tests A–D:** tampered policy + stale digest, tampered digest, wrong
+schema_version all fail closed; valid contract unaffected (the whole
+suite is the control).
+
+## R1.5 Unknown policy fields silently ignored — FIXED
+
+**Defect:** `normalizeContractPolicy` dropped unknown keys — a typo
+(`allowed_executor_id`) silently produced unrestricted semantics.
+
+**Fix:** canonical `POLICY_KEYS` allow-list (11 fields); any extra key →
+`FAIL_CLOSED_AGENT_CONTRACT_FIELDS`. Applies at write (upsert) and at
+every resolution (validateContractRow re-normalizes stored policy).
+
+**Test:** typo/extra fields rejected at upsert.
+
+## R1.6 Pin-time denial unaudited — FIXED
+
+**Defect:** `startMission → pin()` failures propagated without an
+`AGENT_EXECUTION_DENIED` record.
+
+**Fix:** `startMission` wraps `pin()` — PolicyError/IntegrityError →
+`auditDenial(code, message, {agentId})` then rethrow. Downstream
+(gate/router) catches still audit resolution-time denials; each failure
+audits exactly once at its own choke point — no double-audit.
+
+**Tests:** inactive agent, project-denied → one denial event each with
+matching `reason`.
+
+## R1.7 Semantics recap (final)
+
+```
+restricted_exec(snapshot)  = !executor_fallback_allowed ∧ preferred ≠ ∅ → preferred | null
+restricted_route(snapshot) = !route_fallback_allowed    ∧ preferred ≠ ∅ → preferred | null
+
+effective_executor_set = allowed_exec(pinned∩current, null=*) ∩ restricted_exec(pinned) ∩ restricted_exec(current) − denied_exec(∪)
+effective_route_set    = restricted_route(pinned) ∩ restricted_route(current) − denied_route(∪)   [hard only]
+advisory order         = current.preferred filtered to the effective set; preference never qualifies
+```
+
+- Missing pin on agent-bound mission → `FAIL_CLOSED_AGENT_CONTRACT_PIN_MISSING`.
+- Every contract row resolved for authority passes
+  `validateContractRow` (id/agent/business/schema/status/version/policy/digest).
+- Unknown policy keys → `FAIL_CLOSED_AGENT_CONTRACT_FIELDS` at write
+  and at read.
+- Denials audit `AGENT_EXECUTION_DENIED` (org_agent entity,
+  `metadata.reason`) at pin-time and at every governed choke point.
+
+## R1.8 Validation evidence (Node 22.23.3, pnpm)
+
+- `tsc --noEmit` — PASS
+- `pnpm build` — PASS
+- P12 suite: **49/49** (34 baseline + 15 new R1)
+- P11 regression: **103/103**
+- Full suite, Node 20 + Node 22 — see §10 report-back / test evidence
+- `pnpm audit --audit-level=high` — 0 high / 0 critical
+- `PairEvidenceStore.verifyIntegrity` — clean after R1 suites
+- P12 worker_threads CAS race — PASS (1 winner / 1
+  FAIL_CLOSED_VERSION_CONFLICT, single row, version bumped once)
+- P11 worker races — unchanged, PASS
+
+## R1.9 Classification
+
+`P12_REMEDIATED_R1_PENDING_AUDIT` — DO NOT MERGE; independent audit
+required. No P13/P14/P15 work performed or implied.

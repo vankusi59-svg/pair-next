@@ -363,11 +363,25 @@ export class MissionControl {
       // contract (id/version/digest/policy snapshot) into immutable mission
       // metadata. assertExecutable fails closed on inactive agent,
       // disabled contract, business mismatch, or out-of-scope project.
-      metadata.agent_contract = this.deps.service.agentContracts.pin(boundAgentId, {
-        businessId: metadata.business_id ? String(metadata.business_id) : null,
-        projectId: input.project_id,
-        actor: `operator:${input.operator_id ?? "system"}`,
-      });
+      try {
+        metadata.agent_contract = this.deps.service.agentContracts.pin(boundAgentId, {
+          businessId: metadata.business_id ? String(metadata.business_id) : null,
+          projectId: input.project_id,
+          actor: `operator:${input.operator_id ?? "system"}`,
+        });
+      } catch (e) {
+        // R1 §6: pin-time contract failures are audited as denials before
+        // they propagate — inactive agent, disabled contract, business
+        // mismatch, project denial, integrity/provenance all land here.
+        if (e instanceof PolicyError || e instanceof IntegrityError) {
+          this.deps.service.agentContracts.auditDenial(
+            (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+            (e as Error).message,
+            { agentId: boundAgentId },
+          );
+        }
+        throw e;
+      }
     }
     const mission = this.deps.service.createMission({
       project_id: input.project_id,

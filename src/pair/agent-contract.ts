@@ -85,6 +85,18 @@ export interface EffectiveAgentPolicy {
   preferred_route_ids: string[];
   denied_route_ids: Set<string>;
   route_fallback_allowed: boolean;
+  /**
+   * Hard executor restriction: when any snapshot (pinned/current) sets
+   * `executor_fallback_allowed=false` with a non-empty preferred set, the
+   * preferred ids become a hard allow-set — intersection across snapshots
+   * (R1 §1). null = no hard restriction.
+   */
+  restricted_executor_ids: Set<string> | null;
+  /**
+   * Hard route restriction under `route_fallback_allowed=false`,
+   * intersected across snapshots minus the denied union (R1 §3).
+   */
+  restricted_route_ids: Set<string> | null;
   allowed_project_ids: Set<string> | null;
   allowed_context_scopes: Set<string>;
 }
@@ -110,11 +122,31 @@ function normalizeBoolean(value: unknown, field: string, fallback: boolean): boo
   return value;
 }
 
+/** Canonical policy keys — anything else fails closed (R1 §5). */
+const POLICY_KEYS = new Set([
+  "allowed_capabilities",
+  "denied_capabilities",
+  "allowed_executor_ids",
+  "denied_executor_ids",
+  "preferred_executor_ids",
+  "executor_fallback_allowed",
+  "preferred_route_ids",
+  "denied_route_ids",
+  "route_fallback_allowed",
+  "allowed_project_ids",
+  "allowed_context_scopes",
+]);
+
 /** Fail-closed policy normalization + canonical shape. */
 export function normalizeContractPolicy(input: unknown): AgentContractPolicy {
   const src = (input ?? {}) as Record<string, unknown>;
   if (typeof src !== "object" || Array.isArray(src)) {
     throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_FIELDS", "policy must be an object");
+  }
+  for (const key of Object.keys(src)) {
+    if (!POLICY_KEYS.has(key)) {
+      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_FIELDS", `unknown policy field ${key}`);
+    }
   }
   const policy: AgentContractPolicy = {
     allowed_capabilities: normalizeOptionalStringList(src.allowed_capabilities, "allowed_capabilities"),
@@ -296,8 +328,22 @@ export class AgentContractService {
       }
       contract = this.materialize(agentId, opts.actor ?? "PAIR_AGENT_CONTRACT");
     }
+    this.validateContractRow(agent, contract);
+    return { agent, contract };
+  }
+
+  /**
+   * Canonical contract-row validation (R1 §4) — invoked wherever a
+   * contract is resolved for authority: deterministic id, agent/business
+   * binding, schema, status, version, policy normalization, and
+   * self-consistent digest. Any mismatch fails closed.
+   */
+  private validateContractRow(agent: Row, contract: Row): void {
+    if (String(contract.contract_id) !== this.contractIdFor(String(agent.agent_id))) {
+      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY", String(contract.contract_id));
+    }
     if (String(contract.org_agent_id) !== String(agent.agent_id)) {
-      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_PROVENANCE", agentId);
+      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_PROVENANCE", String(agent.agent_id));
     }
     // Business isolation: the contract's business identity is bound to the
     // agent's business at materialization and cannot cross later.
@@ -307,7 +353,32 @@ export class AgentContractService {
         `contract business ${String(contract.business_id)} != agent business ${String(agent.business_id)}`,
       );
     }
-    return { agent, contract };
+    if (String(contract.schema_version) !== AGENT_CONTRACT_SCHEMA) {
+      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY", String(contract.schema_version));
+    }
+    if (!(AGENT_CONTRACT_STATUSES as readonly string[]).includes(String(contract.status))) {
+      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY", String(contract.status));
+    }
+    const cv = Number(contract.contract_version);
+    if (!Number.isInteger(cv) || cv < 1) {
+      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY", String(contract.contract_version));
+    }
+    const policy = normalizeContractPolicy(contract.policy); // throws on malformed/unknown fields
+    const recomputed = contractDigest({
+      contract_id: String(contract.contract_id),
+      org_agent_id: String(contract.org_agent_id),
+      business_id: String(contract.business_id),
+      contract_version: cv,
+      policy,
+    });
+    if (recomputed !== String(contract.contract_digest)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_AGENT_CONTRACT_DIGEST",
+        `${String(contract.contract_id)}@${String(contract.contract_version)}`,
+      );
+    }
+    // Normalized view is what downstream consumers must see.
+    contract.policy = policy;
   }
 
   /** Full executability assertion used at mission-binding time. */
@@ -469,7 +540,13 @@ export class AgentContractService {
       );
     }
     const pin = this.pinnedPolicy(mission);
-    if (pin) {
+    // R1 §2: an agent-bound mission reaching governed execution MUST carry
+    // its pinned contract provenance — the current contract is never a
+    // substitute for immutable pinned evidence.
+    if (!pin) {
+      throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_PIN_MISSING", String(mission.mission_id));
+    }
+    {
       if (String(pin.contract_id) !== String(contract.contract_id) || String(pin.org_agent_id) !== agentId) {
         throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_PROVENANCE", String(pin.contract_id));
       }
@@ -485,7 +562,7 @@ export class AgentContractService {
         );
       }
     }
-    const pinned = pin?.policy ?? null;
+    const pinned = pin.policy;
     const current = contract.policy as AgentContractPolicy;
 
     const mergeAllow = (a: string[] | null | undefined, b: string[] | null | undefined): Set<string> | null => {
@@ -498,8 +575,8 @@ export class AgentContractService {
       new Set([...(a ?? []), ...(b ?? [])]);
 
     const registered = this.registeredCapabilities();
-    let allowedCaps = mergeAllow(pinned?.allowed_capabilities, current.allowed_capabilities);
-    const deniedCaps = union(pinned?.denied_capabilities, current.denied_capabilities);
+    let allowedCaps = mergeAllow(pinned.allowed_capabilities, current.allowed_capabilities);
+    const deniedCaps = union(pinned.denied_capabilities, current.denied_capabilities);
     // A contract allow-list can never name what PAIR doesn't register —
     // intersect with the global registry so unknown ids are dead authority.
     if (allowedCaps) {
@@ -507,37 +584,53 @@ export class AgentContractService {
       for (const c of deniedCaps) allowedCaps.delete(c);
     }
 
-    const allowedExecs = mergeAllow(pinned?.allowed_executor_ids, current.allowed_executor_ids);
-    const deniedExecs = union(pinned?.denied_executor_ids, current.denied_executor_ids);
-    const allowedProjects = mergeAllow(pinned?.allowed_project_ids, current.allowed_project_ids);
-    const ctxPinned = pinned?.allowed_context_scopes ?? null;
+    const allowedExecs = mergeAllow(pinned.allowed_executor_ids, current.allowed_executor_ids);
+    const deniedExecs = union(pinned.denied_executor_ids, current.denied_executor_ids);
+    const allowedProjects = mergeAllow(pinned.allowed_project_ids, current.allowed_project_ids);
     const ctxScopes = new Set(
-      (ctxPinned ?? current.allowed_context_scopes).filter((s) =>
-        current.allowed_context_scopes.includes(s),
-      ),
+      pinned.allowed_context_scopes.filter((s) => current.allowed_context_scopes.includes(s)),
     );
 
+    // R1 §1: executor_fallback_allowed=false turns the preferred set into a
+    // HARD restriction for that snapshot; effective restriction = pinned ∩
+    // current (either may be absent = unconstrained for that snapshot).
+    const hardExecSet = (p: AgentContractPolicy): string[] | null =>
+      !p.executor_fallback_allowed && p.preferred_executor_ids.length ? p.preferred_executor_ids : null;
+    const restrictedExecs = mergeAllow(hardExecSet(pinned), hardExecSet(current));
+
     const effectiveExecAllow = (id: string): boolean =>
-      (allowedExecs === null || allowedExecs.has(id)) && !deniedExecs.has(id);
+      (allowedExecs === null || allowedExecs.has(id)) &&
+      (restrictedExecs === null || restrictedExecs.has(id)) &&
+      !deniedExecs.has(id);
     const preferredExecs = current.preferred_executor_ids.filter((id) => effectiveExecAllow(id));
-    const deniedRoutes = union(pinned?.denied_route_ids, current.denied_route_ids);
+
+    // R1 §3: route_fallback_allowed=false likewise makes preferred routes a
+    // hard restriction per snapshot — intersect pinned ∩ current, then
+    // subtract the union of denied routes.
+    const hardRouteSet = (p: AgentContractPolicy): string[] | null =>
+      !p.route_fallback_allowed && p.preferred_route_ids.length ? p.preferred_route_ids : null;
+    const deniedRoutes = union(pinned.denied_route_ids, current.denied_route_ids);
+    const restrictedRoutes = mergeAllow(hardRouteSet(pinned), hardRouteSet(current));
+    if (restrictedRoutes) for (const r of deniedRoutes) restrictedRoutes.delete(r);
     const preferredRoutes = current.preferred_route_ids.filter((r) => !deniedRoutes.has(r));
 
     return {
       org_agent_id: agentId,
       contract_id: String(contract.contract_id),
       contract_version: Number(contract.contract_version),
-      pinned_version: pin ? Number(pin.contract_version) : Number(contract.contract_version),
+      pinned_version: Number(pin.contract_version),
       contract_digest: String(contract.contract_digest),
       allowed_capabilities: allowedCaps,
       denied_capabilities: deniedCaps,
       allowed_executor_ids: allowedExecs,
       denied_executor_ids: deniedExecs,
       preferred_executor_ids: preferredExecs,
-      executor_fallback_allowed: (pinned?.executor_fallback_allowed ?? true) && current.executor_fallback_allowed,
+      executor_fallback_allowed: pinned.executor_fallback_allowed && current.executor_fallback_allowed,
+      restricted_executor_ids: restrictedExecs,
       preferred_route_ids: preferredRoutes,
       denied_route_ids: deniedRoutes,
-      route_fallback_allowed: (pinned?.route_fallback_allowed ?? true) && current.route_fallback_allowed,
+      route_fallback_allowed: pinned.route_fallback_allowed && current.route_fallback_allowed,
+      restricted_route_ids: restrictedRoutes,
       allowed_project_ids: allowedProjects,
       allowed_context_scopes: ctxScopes,
     };

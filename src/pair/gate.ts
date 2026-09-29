@@ -158,12 +158,15 @@ export class GovernedTaskGate {
           );
         }
       }
-      // executor ∈ allowed ∧ ∉ denied (pinned ∩ current).
+      // executor ∈ allowed ∧ ∉ denied ∧ ∈ restricted set when the contract
+      // disables fallback (pinned ∩ current).
       const executorId = adapter.executor_id;
       const execDenied =
         agentPolicy.denied_executor_ids.has(executorId) ||
         (agentPolicy.allowed_executor_ids !== null &&
-          !agentPolicy.allowed_executor_ids.has(executorId));
+          !agentPolicy.allowed_executor_ids.has(executorId)) ||
+        (agentPolicy.restricted_executor_ids !== null &&
+          !agentPolicy.restricted_executor_ids.has(executorId));
       if (execDenied) {
         this.service.agentContracts.deny(
           "FAIL_CLOSED_AGENT_EXECUTOR_DENIED",
