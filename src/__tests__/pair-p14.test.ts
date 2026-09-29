@@ -1710,3 +1710,316 @@ describe("P14 R2 remediations", () => {
     store2.verifyIntegrity();
   });
 });
+
+/* ------------------------------ R3 REMEDIATIONS -------------------------- */
+
+describe("P14 R3 remediations", () => {
+  const seedDelegatedChild = (
+    ctx: Ctx, biz: BusinessLayer,
+    opts: { idKey: string; key: string | null; parentId: string; businessId: string; by: string; to: string; emitEvent: boolean },
+  ) => {
+    // The deterministic id hashes the caller's key — a legacy partial row
+    // may exist under that id while its delegation_key field is still null.
+    const id = `WI_DL_${createHash("sha256")
+      .update(`${opts.parentId}|${opts.idKey}`)
+      .digest("hex").slice(0, 20).toUpperCase()}`;
+    ctx.store.put("work_item", id, {
+      work_item_id: id, business_id: opts.businessId, title: "legacy child", goal: "g",
+      status: "READY", assignee_agent_id: opts.to,
+      parent_work_item_id: opts.parentId,
+      delegated_from_work_item_id: opts.parentId,
+      delegated_by_agent_id: opts.by,
+      delegation_depth: 1, delegation_reason: null, delegation_key: opts.key,
+      required_capability: null, decomposition_id: null,
+      depends_on: [], mission_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 0,
+    } as never, 0);
+    if (opts.emitEvent) {
+      ctx.store.event({
+        entity_type: "work_item", entity_id: opts.parentId, event_type: "WORK_DELEGATED",
+        actor: "seed", metadata: {
+          delegated_from: opts.by, delegated_to: opts.to,
+          child_work_item_id: id, delegation_key: opts.key,
+        },
+      });
+    }
+    return id;
+  };
+
+  it("DELEG-R3-MISSING-EVENT: replay restores exactly one WORK_DELEGATED for a proven child", () => {
+    const { ctx, biz, workforce } = makeBizCtx("deleg-r3-mev");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const childId = seedDelegatedChild(ctx, biz, {
+      idKey: "K-MEV", key: "K-MEV", parentId: String(parent.work_item_id), businessId: bid,
+      by: String(lead.agent_id), to: String(worker.agent_id), emitEvent: false,
+    });
+    const row = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "K-MEV",
+    }, "op");
+    expect(String(row.work_item_id)).toBe(childId);
+    const evs = ctx.store.listEvents().filter((e) =>
+      e.event_type === "WORK_DELEGATED"
+      && (e.metadata as Record<string, unknown>).child_work_item_id === childId);
+    expect(evs.length).toBe(1);
+    expect(String((evs[0].metadata as Record<string, unknown>).delegation_key)).toBe("K-MEV");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-R3-MISSING-KEY-EVENT: key + event repaired atomically on replay", () => {
+    const { ctx, biz, workforce } = makeBizCtx("deleg-r3-mkev");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    // Keyless legacy child — deterministic id still derived from the key.
+    const childId = seedDelegatedChild(ctx, biz, {
+      idKey: "K-MKEV", key: null, parentId: String(parent.work_item_id), businessId: bid,
+      by: String(lead.agent_id), to: String(worker.agent_id), emitEvent: false,
+    });
+    const row = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "K-MKEV",
+    }, "op");
+    expect(String(row.work_item_id)).toBe(childId);
+    expect(String(row.delegation_key)).toBe("K-MKEV");
+    const evs = ctx.store.listEvents().filter((e) => e.event_type === "WORK_DELEGATED");
+    expect(evs.length).toBe(1);
+    expect(String((evs[0].metadata as Record<string, unknown>).delegation_key)).toBe("K-MKEV");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-R3-CONFLICT-EVENT: conflicting delegation audit fails closed", () => {
+    const { ctx, biz, workforce } = makeBizCtx("deleg-r3-conf");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const childId = seedDelegatedChild(ctx, biz, {
+      idKey: "K-CONF", key: "K-CONF", parentId: String(parent.work_item_id), businessId: bid,
+      by: String(lead.agent_id), to: String(worker.agent_id), emitEvent: false,
+    });
+    // Pre-existing event for this child but with corrupted provenance.
+    ctx.store.event({
+      entity_type: "work_item", entity_id: String(parent.work_item_id),
+      event_type: "WORK_DELEGATED", actor: "seed",
+      metadata: {
+        delegated_from: String(lead.agent_id), delegated_to: String(worker.agent_id),
+        child_work_item_id: childId, delegation_key: "WRONG-KEY",
+      },
+    });
+    expect(errCode(() => workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "K-CONF",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_DELEGATE_CONFLICT");
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_DELEGATED").length).toBe(1);
+  });
+
+  it("FINALIZE-R3-CRASH: fault before WORK_ITEM_SYNCED rolls the whole fold back", () => {
+    const { ctx, biz } = makeBizCtx("fin-r3-crash");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const dep = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const item = wi(biz, bid, { assignee_agent_id: String(lead.agent_id), depends_on: [String(dep.work_item_id)] });
+    // Make dep DONE first so propagation effect would be observable.
+    biz.openWorkItem(String(dep.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(dep.work_item_id));
+    // Now item runs its mission to COMPLETED (still IN_PROGRESS).
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id), false);
+    const origEvent = ctx.store.event.bind(ctx.store);
+    ctx.store.event = ((p: Parameters<typeof ctx.store.event>[0]) => {
+      if (p.event_type === "WORK_ITEM_SYNCED") {
+        throw Object.assign(new Error("crash before sync event"), { code: "FAIL_CLOSED_TEST_INJECTED" });
+      }
+      return origEvent(p);
+    }) as typeof ctx.store.event;
+    expect(errCode(() => biz.syncWorkItem(String(item.work_item_id)))).toBe("FAIL_CLOSED_TEST_INJECTED");
+    ctx.store.event = origEvent;
+    // Full rollback — no terminal state without its provenance.
+    const stale = ctx.store.get("work_item", String(item.work_item_id));
+    expect(String(stale.status)).toBe("IN_PROGRESS");
+    expect(stale.claimed_by).not.toBeNull();
+    // Retry finalizes completely.
+    const done = biz.syncWorkItem(String(item.work_item_id));
+    expect(String(done.status)).toBe("DONE");
+    expect(done.claimed_by).toBeNull();
+    expect(ctx.store.listEvents().filter((e) =>
+      e.event_type === "WORK_ITEM_SYNCED" && e.entity_id === String(item.work_item_id)).length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R3-CRASH: fault between review write and its event rolls back cleanly", () => {
+    const { ctx, biz, workforce } = makeBizCtx("rev-r3-crash");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const rev = makeAgent(biz, bid, "rev");
+    const parent = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "KR3",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id));
+    expect(String(ctx.store.get("work_item", String(child.work_item_id)).status)).toBe("REVIEW_REQUIRED");
+    const origEvent = ctx.store.event.bind(ctx.store);
+    ctx.store.event = ((p: Parameters<typeof ctx.store.event>[0]) => {
+      if (p.event_type === "WORK_REVIEW_ACCEPTED") {
+        throw Object.assign(new Error("crash inside review"), { code: "FAIL_CLOSED_TEST_INJECTED" });
+      }
+      return origEvent(p);
+    }) as typeof ctx.store.event;
+    expect(errCode(() => biz.reviewWorkItem(String(child.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_TEST_INJECTED");
+    ctx.store.event = origEvent;
+    // Rollback — child still awaiting review, parent still parked.
+    expect(String(ctx.store.get("work_item", String(child.work_item_id)).status)).toBe("REVIEW_REQUIRED");
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    // Retry converges: child DONE, single review event, parent released.
+    biz.reviewWorkItem(String(child.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op");
+    expect(String(ctx.store.get("work_item", String(child.work_item_id)).status)).toBe("DONE");
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).status)).toBe("REVIEW_REQUIRED");
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED").length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("PARENT-R3-RESTART: fresh process reconciliation releases a parked parent", () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-r3-restart");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "KRS",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    // Legacy-style partial state: child canonical DONE but its sync event
+    // and the parent evaluation never ran.
+    const crow = ctx.store.get("work_item", String(child.work_item_id));
+    crow.status = "DONE";
+    ctx.store.put("work_item", String(child.work_item_id), crow, Number(crow.version));
+    const re = makeBizCtx("par-r3-re", reopenCtx(ctx.dir, "re"));
+    re.ctx.workspace = ctx.workspace;
+    re.biz.rebuildReadiness(bid);
+    const released = re.ctx.store.get("work_item", String(parent.work_item_id));
+    expect(String(released.status)).toBe("DONE");
+    // Child's missing sync provenance + the parent's completion both
+    // landed as audit events.
+    const evs = re.ctx.store.listEvents().filter((e) => e.event_type === "WORK_ITEM_SYNCED");
+    expect(evs.filter((e) => e.entity_id === String(child.work_item_id)).length).toBe(1);
+    expect(evs.filter((e) => e.entity_id === String(parent.work_item_id)).length).toBe(1);
+    re.ctx.store.verifyIntegrity();
+  });
+
+  it("FINALIZE-R3-IDEMPOTENT: repeated reconciliation emits no duplicate provenance", () => {
+    const { ctx, biz } = makeBizCtx("fin-r3-idem");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const item = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    // Terminal row with a stale claim and no sync evidence.
+    const row = ctx.store.get("work_item", String(item.work_item_id));
+    row.status = "DONE";
+    row.claimed_by = String(lead.agent_id);
+    row.claim_token = "tok";
+    row.claim_expires_at = new Date(Date.now() + 60000).toISOString();
+    ctx.store.put("work_item", String(item.work_item_id), row, Number(row.version));
+    biz.rebuildReadiness(bid);
+    biz.rebuildReadiness(bid);
+    biz.rebuildReadiness(bid);
+    const fixed = ctx.store.get("work_item", String(item.work_item_id));
+    expect(fixed.claimed_by).toBeNull();
+    expect(fixed.claim_token).toBeNull();
+    expect(fixed.claim_expires_at).toBeNull();
+    const evs = ctx.store.listEvents().filter((e) =>
+      e.event_type === "WORK_ITEM_SYNCED" && e.entity_id === String(item.work_item_id));
+    expect(evs.length).toBe(1);
+    const agentRow = ctx.store.get("org_agent", String(lead.agent_id));
+    const notes = (agentRow.context_notes as Array<Record<string, unknown>>)
+      .filter((n) => String(n.work_item_id) === String(item.work_item_id));
+    expect(notes.length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("RACE-R3: concurrent review ACCEPT + parked-parent finalize converge — one event each", async () => {
+    const { ctx, biz, workforce } = makeBizCtx("race-r3");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const rev = makeAgent(biz, bid, "rev");
+    const parent = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "KRACE",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id));
+    expect(String(ctx.store.get("work_item", String(child.work_item_id)).status)).toBe("REVIEW_REQUIRED");
+    // Two workers race the ACCEPT — plus one racing a rebuild sweep.
+    const results = await runRace([
+      { op: "review", dbPath: ctx.dbPath, args: { workItemId: String(child.work_item_id), reviewer: String(rev.agent_id), decision: "ACCEPT" } },
+      { op: "review", dbPath: ctx.dbPath, args: { workItemId: String(child.work_item_id), reviewer: String(rev.agent_id), decision: "ACCEPT" } },
+      { op: "sync", dbPath: ctx.dbPath, args: { workItemId: String(parent.work_item_id) } },
+    ]);
+    expect(results.filter((r) => r.ok).length >= 1).toBe(true);
+    const store2 = new PairEvidenceStore(ctx.dbPath);
+    const crow = store2.get("work_item", String(child.work_item_id));
+    const prow = store2.get("work_item", String(parent.work_item_id));
+    expect(String(crow.status)).toBe("DONE");
+    expect(String(prow.status)).toBe("REVIEW_REQUIRED");
+    const evs = store2.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED"
+      && e.entity_id === String(child.work_item_id)).length).toBe(1);
+    expect(evs.filter((e) => e.event_type === "WORK_ITEM_SYNCED"
+      && e.entity_id === String(parent.work_item_id)
+      && String(e.new_state) === "REVIEW_REQUIRED").length).toBe(1);
+    store2.verifyIntegrity();
+  });
+});

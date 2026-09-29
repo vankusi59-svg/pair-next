@@ -624,12 +624,126 @@ export class BusinessLayer {
   }
 
   /**
+   * R3 §4: restart reconciliation for partial terminal/legacy states.
+   * Post-R3 a crash cannot leave half-committed finalization (the whole
+   * fold is one transaction), but rows materialized by earlier versions —
+   * or a DB restored mid-flight — may carry terminal status without its
+   * audit provenance. This sweep repairs, idempotently:
+   *   - terminal/REVIEW_REQUIRED item missing its WORK_ITEM_SYNCED event
+   *     → runs propagation + context note (dedup-checked) and emits the
+   *       missing event with cause=restart_reconcile;
+   *   - terminal row still holding claim material → cleared;
+   *   - DONE requires_review item missing WORK_REVIEW_ACCEPTED → emits
+   *       the reconcile audit marker;
+   *   - delegated child missing WORK_DELEGATED → emits it (repair only
+   *       when no conflicting audit exists);
+   *   - DONE child whose parent sits CHILD_INCOMPLETE → the
+   *       propagateDependents hook re-evaluates the parent.
+   * The whole repair runs inside one serialized transaction; repeated
+   * runs produce no duplicate events, context entries or transitions.
+   */
+  private reconcileTerminalConsistency(businessId: string): void {
+    this.store.immediate(() => {
+      const events = this.store.listEvents();
+      const syncedStates = new Set(
+        events.filter((e) => e.event_type === "WORK_ITEM_SYNCED")
+          .map((e) => `${String(e.entity_id)}|${String(e.new_state)}`),
+      );
+      const reviewed = new Set(
+        events.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED")
+          .map((e) => String(e.entity_id)),
+      );
+      const delegated = new Set(
+        events.filter((e) => e.event_type === "WORK_DELEGATED")
+          .map((e) => String((e.metadata as Record<string, unknown> | undefined)?.child_work_item_id ?? "")),
+      );
+      for (const w of this.listWorkItems(businessId)) {
+        const st = String(w.status);
+        const terminalish = TERMINAL_WORK_ITEM_STATUSES.has(st) || st === "REVIEW_REQUIRED";
+        const id = String(w.work_item_id);
+        // Delegated child without audit: repaired here ONLY when the row
+        // already carries its delegation_key. A keyless legacy row is
+        // left for the replay path, which repairs key + event atomically —
+        // emitting a keyless event here would conflict-block that replay.
+        if (w.delegated_from_work_item_id && w.delegation_key && !delegated.has(id)) {
+          this.store.event({
+            entity_type: "work_item", entity_id: String(w.delegated_from_work_item_id),
+            event_type: "WORK_DELEGATED", actor: "PAIR_RECONCILE",
+            metadata: {
+              cause: "restart_reconcile",
+              delegated_from: w.delegated_by_agent_id ?? null,
+              delegated_to: w.assignee_agent_id ?? null,
+              child_work_item_id: id,
+              delegation_key: w.delegation_key,
+            },
+          });
+          delegated.add(id);
+        }
+        if (!terminalish) continue;
+        let dirty = false;
+        if (w.claimed_by || w.claim_token || w.claim_expires_at) {
+          w.claimed_by = null;
+          w.claim_token = null;
+          w.claim_expires_at = null;
+          dirty = true;
+        }
+        if (w.blocked_code && st !== "BLOCKED") {
+          w.blocked_code = null;
+          dirty = true;
+        }
+        if (dirty) {
+          w.updated_at = utcnow();
+          this.store.put("work_item", id, w, Number(w.version));
+        }
+        if (st === "DONE" && w.requires_review === true && !reviewed.has(id)) {
+          this.store.event({
+            entity_type: "work_item", entity_id: id, event_type: "WORK_REVIEW_ACCEPTED",
+            actor: "PAIR_RECONCILE",
+            metadata: { cause: "restart_reconcile", reviewer_agent_id: w.reviewer_agent_id ?? null },
+          });
+          reviewed.add(id);
+        }
+        if (!syncedStates.has(`${id}|${st}`)) {
+          // Missing sync provenance: re-run effects (propagation is
+          // state-gated → idempotent) then emit the reconcile audit.
+          this.propagateDependents(id);
+          const assignee = w.assignee_agent_id ? String(w.assignee_agent_id) : null;
+          if (assignee) {
+            try {
+              const agentRow = this.store.get("org_agent", assignee);
+              const notes = (agentRow.context_notes as Array<Record<string, unknown>> | undefined) ?? [];
+              if (!notes.some((n) => String(n.work_item_id) === id && String(n.outcome) === st)) {
+                notes.push({
+                  at: utcnow(), work_item_id: id,
+                  mission_id: String((w.mission_ids as string[] | undefined)?.at(-1) ?? "") || null,
+                  outcome: st,
+                  note: String(w.result_summary ?? w.title ?? "").slice(0, 300),
+                });
+                agentRow.context_notes = notes.slice(-AGENT_CONTEXT_CAP);
+                this.store.put("org_agent", assignee, agentRow, Number(agentRow.version));
+              }
+            } catch { /* agent removed — non-fatal */ }
+          }
+          this.store.event({
+            entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_SYNCED",
+            old_state: st, new_state: st, actor: "PAIR_RECONCILE",
+            metadata: { cause: "restart_reconcile" },
+          });
+          syncedStates.add(`${id}|${st}`);
+        }
+      }
+    });
+  }
+
+  /**
    * Restart reconstruction (P14 §10/§11): rebuild every node's readiness
    * from canonical dep state — promotes satisfied assigned nodes to READY
-   * and re-blocks nodes under failed prerequisites. Idempotent; safe to
-   * run on every board/heartbeat sweep.
+   * and re-blocks nodes under failed prerequisites. The terminal-
+   * consistency sweep runs first so partial states close before readiness
+   * is evaluated. Idempotent; safe to run on every board/heartbeat sweep.
    */
   rebuildReadiness(businessId: string): void {
+    this.reconcileTerminalConsistency(businessId);
     for (const w of this.listWorkItems(businessId)) {
       if (TERMINAL_WORK_ITEM_STATUSES.has(String(w.status))) continue;
       const deps = (w.depends_on as string[] | undefined) ?? [];
@@ -1116,22 +1230,28 @@ export class BusinessLayer {
       );
     }
     const to: WorkItemStatus = input.decision === "ACCEPT" ? "DONE" : "READY";
-    row.status = to;
-    row.updated_at = utcnow();
-    if (input.decision === "REWORK") {
-      const blockers = (row.blockers as Array<Record<string, unknown>> | undefined) ?? [];
-      blockers.push({ reason: `REWORK: ${String(input.note ?? "").slice(0, 300)}`, at: utcnow(), by: input.reviewer_agent_id });
-      row.blockers = blockers;
-    }
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId,
-      event_type: input.decision === "ACCEPT" ? "WORK_REVIEW_ACCEPTED" : "WORK_REWORK_REQUESTED",
-      old_state: "REVIEW_REQUIRED", new_state: to, actor: `operator:${actor}`,
-      metadata: { reviewer_agent_id: input.reviewer_agent_id, note: String(input.note ?? "").slice(0, 300) },
+    // R3 §3: the decision, its audit event and all dependent effects
+    // commit inside one serialized transaction — a fault anywhere rolls
+    // back the whole review (child stays REVIEW_REQUIRED, nothing
+    // propagates) instead of leaving DONE-without-evidence split-brain.
+    return this.store.immediate(() => {
+      row.status = to;
+      row.updated_at = utcnow();
+      if (input.decision === "REWORK") {
+        const blockers = (row.blockers as Array<Record<string, unknown>> | undefined) ?? [];
+        blockers.push({ reason: `REWORK: ${String(input.note ?? "").slice(0, 300)}`, at: utcnow(), by: input.reviewer_agent_id });
+        row.blockers = blockers;
+      }
+      const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId,
+        event_type: input.decision === "ACCEPT" ? "WORK_REVIEW_ACCEPTED" : "WORK_REWORK_REQUESTED",
+        old_state: "REVIEW_REQUIRED", new_state: to, actor: `operator:${actor}`,
+        metadata: { reviewer_agent_id: input.reviewer_agent_id, note: String(input.note ?? "").slice(0, 300) },
+      });
+      if (input.decision === "ACCEPT") this.propagateDependents(workItemId);
+      return saved;
     });
-    if (input.decision === "ACCEPT") this.propagateDependents(workItemId);
-    return saved;
   }
 
   /** Fold the linked mission's terminal state back into the work item. */
@@ -1192,22 +1312,52 @@ export class BusinessLayer {
     meta: Record<string, unknown>,
   ): Row {
     const workItemId = String(row.work_item_id);
-    assertWorkItemTransition(from, next);
-    row.status = next;
-    row.blocked_code = null;
-    row.updated_at = utcnow();
-    if (next === "DONE" || next === "BLOCKED" || next === "REVIEW_REQUIRED") {
-      const grounded = mission
-        ? String(mission.result ?? mission.result_summary ?? "") || null
-        : null;
-      if (grounded !== null) row.result_summary = grounded;
-    }
-    row.claimed_by = null;
-    row.claim_token = null;
-    row.claim_expires_at = null;
-    let saved: Row;
     try {
-      saved = this.store.put("work_item", workItemId, row, Number(row.version));
+      // R3 §2: every authoritative finalization effect — status/result/
+      // claim write, dependency propagation (including parent completion
+      // evaluation), agent outcome bookkeeping and the WORK_ITEM_SYNCED
+      // audit event — commits inside ONE serialized transaction. A fault
+      // anywhere rolls back the whole fold; nothing reaches canonical
+      // terminal state with missing provenance.
+      return this.store.immediate(() => {
+        assertWorkItemTransition(from, next);
+        row.status = next;
+        row.blocked_code = null;
+        row.updated_at = utcnow();
+        if (next === "DONE" || next === "BLOCKED" || next === "REVIEW_REQUIRED") {
+          const grounded = mission
+            ? String(mission.result ?? mission.result_summary ?? "") || null
+            : null;
+          if (grounded !== null) row.result_summary = grounded;
+        }
+        row.claimed_by = null;
+        row.claim_token = null;
+        row.claim_expires_at = null;
+        const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+        this.propagateDependents(workItemId);
+        const assignee = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+        if (assignee) {
+          try {
+            const agentRow = this.store.get("org_agent", assignee);
+            const notes = (agentRow.context_notes as Array<Record<string, unknown>> | undefined) ?? [];
+            notes.push({
+              at: utcnow(),
+              work_item_id: workItemId,
+              mission_id: mission ? String(mission.mission_id) : null,
+              outcome: next,
+              note: String(row.result_summary ?? row.title ?? "").slice(0, 300),
+            });
+            agentRow.context_notes = notes.slice(-AGENT_CONTEXT_CAP);
+            this.store.put("org_agent", assignee, agentRow, Number(agentRow.version));
+          } catch { /* agent removed — context drop is non-fatal */ }
+        }
+        this.store.event({
+          entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_SYNCED",
+          old_state: from, new_state: next, actor: "PAIR_BUSINESS_LAYER",
+          metadata: meta,
+        });
+        return saved;
+      });
     } catch (err) {
       if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") {
         const fresh = this.store.get("work_item", workItemId);
@@ -1215,29 +1365,6 @@ export class BusinessLayer {
       }
       throw err;
     }
-    this.propagateDependents(workItemId);
-    const assignee = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
-    if (assignee) {
-      try {
-        const agentRow = this.store.get("org_agent", assignee);
-        const notes = (agentRow.context_notes as Array<Record<string, unknown>> | undefined) ?? [];
-        notes.push({
-          at: utcnow(),
-          work_item_id: workItemId,
-          mission_id: mission ? String(mission.mission_id) : null,
-          outcome: next,
-          note: String(row.result_summary ?? row.title ?? "").slice(0, 300),
-        });
-        agentRow.context_notes = notes.slice(-AGENT_CONTEXT_CAP);
-        this.store.put("org_agent", assignee, agentRow, Number(agentRow.version));
-      } catch { /* agent removed — context drop is non-fatal */ }
-    }
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_SYNCED",
-      old_state: from, new_state: next, actor: "PAIR_BUSINESS_LAYER",
-      metadata: meta,
-    });
-    return saved;
   }
 
   /**

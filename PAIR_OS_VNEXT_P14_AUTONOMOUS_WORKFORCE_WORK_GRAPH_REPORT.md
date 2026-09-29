@@ -474,3 +474,111 @@ named reviewer, strict decisions, parent gate, read-only inbox, capability
 admission). No second store, router, dispatcher or execution engine.
 
 Classification: **`P14_REMEDIATED_R2_PENDING_AUDIT`** — DO NOT MERGE.
+
+---
+
+# REMEDIATION R3 — audit-provenance replay + crash-atomic terminal transitions
+
+Audited head `9c022a3e`, base `a38be24`. Five requirement groups, all closed
+on the same PR #8. DO NOT MERGE — audit pending.
+
+## R3.1 — Delegation completeness = row ∧ event (§1)
+
+`ensureDelegationEvent(parent, childId, key, by, to)` now runs inside the
+delegation transaction on BOTH the replay-repair and the fresh-create
+paths. It admits exactly-one matching `WORK_DELEGATED` for the child:
+zero events → the audit is emitted (repair); one event whose metadata
+(`delegation_key`, `delegated_from`, `delegated_to`) matches → accepted;
+a metadata conflict or a duplicate audit →
+`FAIL_CLOSED_WORK_DELEGATE_CONFLICT`. Replay therefore validates row
+provenance AND audit provenance, restoring a missing event atomically in
+the same transaction that repairs a missing `delegation_key`.
+
+**Evidence — DELEG-R3-MISSING-EVENT**: seeded child, key present, no event
+→ replay returns the child and restores exactly one correct event.
+**DELEG-R3-MISSING-KEY-EVENT**: keyless legacy child, no event → replay
+repairs `delegation_key` AND emits the event in one transaction.
+**DELEG-R3-CONFLICT-EVENT**: a pre-existing `WORK_DELEGATED` carrying a
+different key → `FAIL_CLOSED_WORK_DELEGATE_CONFLICT`, no new event.
+
+## R3.2 — Finalization is one atomic transaction (§2, option A)
+
+`finalizeWorkItem` now wraps the ENTIRE authoritative fold in
+`store.immediate()`: transition assert, status/`blocked_code`/claim write,
+CAS put, `propagateDependents` (which itself carries the parent-eval hook
+and the cascade), agent outcome note, `WORK_ITEM_SYNCED`. A fault anywhere
+rolls back the whole fold — no canonical terminal state without
+provenance can exist post-R3. Concurrent finishers still converge through
+the CAS-conflict re-read outside the transaction.
+
+**Evidence — FINALIZE-R3-CRASH**: `store.event` patched to throw on
+`WORK_ITEM_SYNCED` after the row write → `syncWorkItem` fails, row stays
+`IN_PROGRESS` with its claim intact, zero sync events; retry completes
+(DONE, claim cleared, exactly one event).
+
+## R3.3 — Review decision is crash-atomic (§3)
+
+`reviewWorkItem`'s mutation + `WORK_REVIEW_ACCEPTED`/`WORK_REWORK_REQUESTED`
+event + `propagateDependents` (incl. the parent-eval cascade) now commit in
+one `store.immediate()`. A fault between the state write and the event
+leaves the child `REVIEW_REQUIRED` — a retry converges.
+
+**Evidence — REVIEW-R3-CRASH**: injected fault on `WORK_REVIEW_ACCEPTED`
+→ throw, child stays `REVIEW_REQUIRED`, parent stays `CHILD_INCOMPLETE`;
+unpatched retry → child DONE, one review event, parent released to
+`REVIEW_REQUIRED` in the same call.
+
+## R3.4 — Restart reconciliation closes partial states (§4)
+
+New `reconcileTerminalConsistency(businessId)` runs at the head of
+`rebuildReadiness` (the existing heartbeat/board mutation seam), inside one
+transaction, and is idempotent:
+- terminal/REVIEW_REQUIRED row missing `WORK_ITEM_SYNCED` → re-runs
+  propagation (state-gated → no dup) + dedup-checked context note + emits
+  `WORK_ITEM_SYNCED{cause:"restart_reconcile"}`;
+- terminal row holding claim/token/expiry → cleared;
+- DONE `requires_review` row missing `WORK_REVIEW_ACCEPTED` → reconcile
+  audit marker emitted;
+- delegated child carrying `delegation_key` but no `WORK_DELEGATED` →
+  event repaired (keyless rows are left for the replay path, which repairs
+  key+event atomically — a keyless repair event would conflict-block it);
+- DONE child under a `CHILD_INCOMPLETE` parent → the propagation hook
+  releases the parent.
+
+**Evidence — PARENT-R3-RESTART**: child `DONE` + parked parent persisted,
+fresh `PairEvidenceStore`/business layer over the same DB →
+`rebuildReadiness` releases the parent (`DONE`), emits the child's missing
+sync event and the parent's `children_complete` event; verifyIntegrity
+clean. **FINALIZE-R3-IDEMPOTENT**: three rebuildReadiness sweeps over a
+DONE row with stale claim + no sync event → claim cleared once, exactly
+one `WORK_ITEM_SYNCED`, exactly one context note.
+
+## R3.5 — Concurrency preserved (§5)
+
+`finalizeWorkItem`'s CAS loser re-reads and converges; `reviewWorkItem`'s
+txn serializes competing decisions (loser fails `VERSION_CONFLICT` or
+`WORK_REVIEW_STATE`); `ensureDelegationEvent` only runs inside the
+serialized delegation transaction — a racing replay sees committed state.
+
+**Evidence — RACE-R3** (real worker_threads): two workers `ACCEPT` the
+same `REVIEW_REQUIRED` child while a third syncs the parked parent → child
+DONE once, one `WORK_REVIEW_ACCEPTED`, parent `REVIEW_REQUIRED` once, one
+`children_complete` sync event, verifyIntegrity clean.
+
+## R3 validation
+
+| gate | result |
+|---|---|
+| P14 suite | **56/56 PASS** (8 new R3 tests incl. 1 three-way worker race) |
+| P13 | 67/67 · P12 71/71 · P11 103/103 · P9 79/79 |
+| typecheck | clean · build PASS |
+| audit | 0 high / 0 critical |
+| Node 22 full | 1979 pass / 2 env P5 probe (CodexCli executable absent — documented env gap) |
+| Node 20 full | **1981/0** |
+| verifyIntegrity | clean in every race/crash/restart test |
+
+All R1 + R2 closures unchanged. No second store, router, dispatcher or
+execution engine; no new locking — `PairEvidenceStore.immediate()` is the
+single transaction authority.
+
+Classification: **`P14_REMEDIATED_R3_PENDING_AUDIT`** — DO NOT MERGE.

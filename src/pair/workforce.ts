@@ -268,17 +268,21 @@ export class WorkforceService {
             `deterministic child ${childId} has mismatched provenance`,
           );
         }
-        if (prior.delegation_key == null) {
-          const repaired = { ...prior, delegation_key: key, updated_at: utcnow() };
-          return this.store.put("work_item", childId, repaired, Number(prior.version));
-        }
-        if (String(prior.delegation_key) !== key) {
+        if (prior.delegation_key != null && String(prior.delegation_key) !== key) {
           throw new IntegrityError(
             "FAIL_CLOSED_WORK_DELEGATE_CONFLICT",
             `deterministic child ${childId} carries a different delegation_key`,
           );
         }
-        return prior;
+        const repaired = prior.delegation_key == null
+          ? this.store.put("work_item", childId,
+              { ...prior, delegation_key: key, updated_at: utcnow() }, Number(prior.version))
+          : prior;
+        // R3 §1: a canonical delegation requires the audit event too —
+        // restore it if missing, fail closed on conflicting provenance.
+        this.ensureDelegationEvent(input.work_item_id, childId, key,
+          input.delegated_by_agent_id, input.delegated_to_agent_id, actor);
+        return repaired;
       }
       let child: Row;
       try {
@@ -306,17 +310,56 @@ export class WorkforceService {
         }
         throw err;
       }
-      this.store.event({
-        entity_type: "work_item", entity_id: input.work_item_id, event_type: "WORK_DELEGATED",
-        actor: `operator:${actor}`,
-        metadata: {
-          delegated_from: input.delegated_by_agent_id,
-          delegated_to: input.delegated_to_agent_id,
-          child_work_item_id: childId,
-          delegation_key: key,
-        },
-      });
+      this.ensureDelegationEvent(input.work_item_id, childId, key,
+        input.delegated_by_agent_id, input.delegated_to_agent_id, actor);
       return child;
+    });
+  }
+
+  /**
+   * R3 §1: canonical WORK_DELEGATED audit for (parent, child). Exactly one
+   * matching event may exist — zero events are repaired by emitting the
+   * provenance, one matching event must carry identical provenance
+   * (conflict → FAIL_CLOSED_WORK_DELEGATE_CONFLICT), and >1 is corrupt
+   * duplicate provenance, also fail-closed. Never duplicates the event.
+   */
+  private ensureDelegationEvent(
+    parentId: string, childId: string, key: string,
+    byId: string, toId: string, actor: string,
+  ): void {
+    const matches = this.store.listEvents().filter((e) =>
+      e.event_type === "WORK_DELEGATED" && String(e.entity_id) === parentId &&
+      String((e.metadata as Record<string, unknown> | undefined)?.child_work_item_id ?? "") === childId,
+    );
+    if (matches.length > 1) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_DELEGATE_CONFLICT",
+        `duplicate WORK_DELEGATED audit for child ${childId}`,
+      );
+    }
+    if (matches.length === 1) {
+      const md = (matches[0].metadata as Record<string, unknown> | undefined) ?? {};
+      const conflict =
+        String(md.delegation_key ?? "") !== key ||
+        String(md.delegated_from ?? "") !== byId ||
+        String(md.delegated_to ?? "") !== toId;
+      if (conflict) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_DELEGATE_CONFLICT",
+          `WORK_DELEGATED audit for child ${childId} has mismatched provenance`,
+        );
+      }
+      return; // audit already canonical
+    }
+    this.store.event({
+      entity_type: "work_item", entity_id: parentId, event_type: "WORK_DELEGATED",
+      actor: `operator:${actor}`,
+      metadata: {
+        delegated_from: byId,
+        delegated_to: toId,
+        child_work_item_id: childId,
+        delegation_key: key,
+      },
     });
   }
 
