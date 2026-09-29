@@ -583,3 +583,98 @@ enabled. Enable after R5 audit passes, before merge.
 **Classification submitted for independent audit:
 `P11_REMEDIATED_R5_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
 requires the independent re-audit — this report does not self-certify.
+
+---
+
+## §10.12 P11 REMEDIATION R6 — CONCURRENT SCHEDULE ROW MERGE CLOSURE
+
+- **Previous audited head:** `7d4e4b496aee877685909eddc0c4d57916a6617b`
+- **Audit classification:** `P11_BLOCKED` — R5 NEXT_DUE semantics passed;
+  the `_fireDue` CAS-conflict recovery could still overwrite the winning
+  scheduler's canonical outcome with stale snapshot fields.
+
+### §10.12.1 Root cause → fix
+
+The `_fireDue` row write ended in a CAS try/catch. On
+`FAIL_CLOSED_VERSION_CONFLICT` it refreshed `fresh` and then copied
+`last_fired_at`, `last_mission_id`, `last_error` from the STALE local
+`row` plus `max(run_count)` — so a losing scheduler could overwrite the
+winner's `MSN_X`/`OCC_X.fired_at` with its old `MSN_PREVIOUS`/null until
+the next reconcile repaired it.
+
+R6 removes stale-field merging entirely:
+
+- **Claim loser (`claimOccurrence → null`)** — owns no execution outcome.
+  It no longer writes the schedule row at all: it runs
+  `reconcileScheduleAccounting()` (canonical evidence only) and
+  `continue`s. No mission, no mutation, no fabricated advance.
+- **Owner CAS conflict** — never replays the local snapshot. It runs
+  `reconcileScheduleAccounting()`; the owner's own FIRED/RELEASED
+  occurrence + bound mission are already durable canonical evidence, so
+  reconcile reproduces exactly this outcome (`run_count`, `last_mission_id`,
+  `last_fired_at`, R5 contiguous `next_due_at`).
+- **`last_error` (§5)** — now deterministic: `reconcileScheduleRows`
+  derives it from the contiguous anchor — a FIRED anchor clears stale
+  errors, a RELEASED anchor preserves the owner's recorded message.
+  `recordOwnedFailureError()` re-records a genuine owner failure after a
+  conflict ONLY while that occurrence is still the latest terminal
+  occurrence for the schedule (a newer outcome always wins); an unproven
+  write emits `SCHEDULE_ACCOUNTING_INTEGRITY` (`last_error_write_unproven`)
+  instead of returning silent success.
+
+### §10.12.2 Concurrency evidence (worker_threads, same db, one barrier)
+
+- **r2 F (extended §6):** two stacks race one occurrence → exactly 1
+  mission, 1 FIRED occurrence, `run_count=1`, `last_mission_id` = winner
+  mission, `last_fired_at` = winner `occ.fired_at`, `next_due_at` =
+  `nextRunAfter(cron, dueAt)`, `last_error` null — immediately after both
+  `fireDue` calls, no second reconcile pass.
+- **r2 G (new §7):** canonical previous state (`run_count=1`,
+  `last_mission_id=MSN_PREVIOUS`) + two workers race on the next
+  occurrence → `run_count=2`, `last_mission_id=MSN_X` (NOT previous),
+  `last_fired_at=OCC_X.fired_at`, `next_due_at` canonical, missions=2,
+  `verifyIntegrity` clean.
+- **r6 file:** loser-path proof (fresh CLAIMED → zero mutation, version
+  unchanged, no mission) + last_error derivation (FIRED clears /
+  RELEASED preserves).
+
+### §10.12.3 Files changed / tests
+
+- `src/pair/mission-schedule.ts` — loser `continue`+reconcile, owner
+  conflict → canonical reconcile (no stale merge), `anchorOcc` tracking +
+  `last_error` derivation in `reconcileScheduleRows`, new
+  `recordOwnedFailureError()`.
+- `src/__tests__/pair-p11-r2.test.ts` — F assertions strengthened (§6),
+  new G previous-occurrence race (§7).
+- `src/__tests__/pair-p11-r6.test.ts` — **3 tests** (loser never writes;
+  last_error clear/preserve).
+- `.github/workflows/ci.yml` — focused P11 step includes r6 file.
+
+### §10.12.4 Verification
+
+- P11 suites: **103/103** (22+25+20+12+12+9+3) on Node 22 **and** Node 20.
+- Full suite Node 22: **1785 pass** / 24 skipped / 2 pre-existing
+  env-dependent `pair-p5.test.ts` probe fails (green on CI). Node 20:
+  **1787 pass, 0 fail**.
+- `pnpm run typecheck` clean; `pnpm run build` clean.
+- `pnpm audit --audit-level=high`: **0 high, 0 critical** (1 low,
+  8 moderate — expected posture).
+- `PairEvidenceStore.verifyIntegrity` clean after the concurrent race.
+
+### §10.12.5 Remaining limitations
+
+- Reconcile inside `_fireDue` is a full scan per pass — fine at current
+  scale; a narrower per-schedule primitive could be added later if the
+  occurrence table grows.
+- `recordOwnedFailureError` keeps only the released occurrence's
+  top-level error message; `release_cause` on the occurrence row remains
+  the canonical short cause.
+
+### §10.12.6 Branch protection
+
+Unchanged: **OPERATOR ACTION REQUIRED** — integration token 403; NOT
+enabled. Enable after R6 audit passes, before merge.
+
+**Classification submitted for independent audit:
+`P11_REMEDIATED_R6_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
+requires the independent re-audit — this report does not self-certify.

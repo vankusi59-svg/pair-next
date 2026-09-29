@@ -749,11 +749,13 @@ export class MissionScheduleService {
         String(a.due_at).localeCompare(String(b.due_at)),
       );
       let anchor: string | null = null;
+      let anchorOcc: Record<string, unknown> | null = null;
       for (const o of sorted) {
         const status = String(o.status);
         if (status !== "FIRED" && status !== "RELEASED") break;
         if (anchor === null || String(o.due_at) === nextRunAfter(String(row.cron), anchor)) {
           anchor = String(o.due_at);
+          anchorOcc = o;
           continue;
         }
         break;
@@ -793,6 +795,13 @@ export class MissionScheduleService {
         if (String(row.last_fired_at ?? "") !== latestFiredAt) {
           changes.last_fired_at = { old: row.last_fired_at ?? null, new: latestFiredAt };
         }
+      }
+      // last_error follows the latest accounted outcome deterministically
+      // (R6 §5): a FIRED anchor clears stale errors; a RELEASED anchor
+      // preserves whatever the owning process recorded — reconcile never
+      // fabricates an error message.
+      if (anchorOcc && String(anchorOcc.status) === "FIRED" && row.last_error != null) {
+        changes.last_error = { old: row.last_error, new: null };
       }
       if (String(row.next_due_at) !== desiredNextDue) {
         changes.next_due_at = { old: row.next_due_at, new: desiredNextDue };
@@ -887,6 +896,10 @@ export class MissionScheduleService {
       const dueAt = snapshotDueAt;
       const occ = this.claimOccurrence(id, dueAt, md_businessId(s));
       let token: { settle: (consumed: boolean) => void } | null = null;
+      // The only last_error this process may re-record after a CAS
+      // conflict — a genuine failure on an occurrence IT owned and
+      // released (R6 §5). Losers and integrity paths never set it.
+      let ownedFailure: string | null = null;
       if (occ) {
         const occurrenceId = String(occ.occurrence_id);
         try {
@@ -996,37 +1009,90 @@ export class MissionScheduleService {
           } else {
             token?.settle(false);
             this.releaseOccurrence(occurrenceId, "submit_failed");
-            row.last_error = String((err as { message?: string })?.message ?? err);
+            ownedFailure = String((err as { message?: string })?.message ?? err);
+            row.last_error = ownedFailure;
             errors.push(id);
           }
         }
       }
+      if (occ === null) {
+        // Claim loser (R6 §3): this process owns NO execution outcome for
+        // this occurrence — it must not merge last_mission_id /
+        // last_fired_at / last_error / run_count from its stale snapshot
+        // into winner-owned state, nor fabricate an advance. Canonical
+        // reconcile converges next_due_at and accounting instead; the
+        // winner's durable evidence is the only authority.
+        this.reconcileScheduleAccounting();
+        continue;
+      }
       // Canonical advance: the next occurrence after the one just
       // accounted — NOT after `now`. Missed ticks between dueAt and now
       // are due occurrences in their own right and fire on the next
-      // pass (catch-up), never skipped. Applies uniformly: success,
-      // post-create reconcile, released failure, and lost-claim paths
-      // all advance past THIS occurrence only.
+      // pass (catch-up), never skipped.
       row.next_due_at = nextRunAfter(String(s.cron), dueAt);
       try {
         this.store.put("mission_schedule", id, row, Number(row.version));
       } catch (err) {
-        // Another process advanced this schedule — refresh and record our
-        // result under the new version so the fire outcome is not lost.
         if ((err as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") throw err;
-        const fresh = this.store.get("mission_schedule", id);
-        fresh.last_fired_at = row.last_fired_at;
-        if (row.last_mission_id) fresh.last_mission_id = row.last_mission_id;
-        if (row.last_error) fresh.last_error = row.last_error;
-        // run_count is monotonic — a losing writer must never roll it back
-        // (a local 0 is not nullish, so ?? cannot merge here).
-        fresh.run_count = Math.max(
-          Number(row.run_count ?? 0),
-          Number(fresh.run_count ?? 0),
-        );
-        this.store.put("mission_schedule", id, fresh, Number(fresh.version));
+        // Another writer raced this row. NEVER merge stale snapshot
+        // fields onto the fresher row (R6 §2): re-derive every accounted
+        // field from canonical occurrence+mission evidence — our own
+        // FIRED/RELEASED occurrence is already durable, so reconcile
+        // reproduces exactly this outcome. Only a genuine failure we
+        // owned may additionally re-record last_error (§5).
+        this.reconcileScheduleAccounting();
+        if (ownedFailure !== null) {
+          this.recordOwnedFailureError(id, dueAt, ownedFailure);
+        }
       }
     }
     return { fired, errors };
+  }
+
+  /**
+   * Re-record `last_error` after a CAS conflict — ONLY while the
+   * occurrence this process owned and released is still the latest
+   * terminal (FIRED|RELEASED) occurrence for the schedule. A newer
+   * accounted outcome from another writer always wins; a stale error
+   * must never overwrite it (R6 §5). Retries are bounded; an unproven
+   * write is an audited integrity event, not silent success (§8).
+   */
+  private recordOwnedFailureError(
+    scheduleId: string,
+    dueAt: string,
+    error: string,
+  ): void {
+    const latestTerminal = this.store
+      .list("schedule_occurrence")
+      .filter(
+        (o) =>
+          String(o.schedule_id) === scheduleId &&
+          (String(o.status) === "FIRED" || String(o.status) === "RELEASED"),
+      )
+      .map((o) => String(o.due_at))
+      .sort()
+      .at(-1);
+    if (latestTerminal !== dueAt) return; // a newer outcome exists — skip
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const fresh = this.store.get("mission_schedule", scheduleId);
+      if (String(fresh.last_error ?? "") === error) return;
+      fresh.last_error = error;
+      try {
+        this.store.put("mission_schedule", scheduleId, fresh, Number(fresh.version));
+        return;
+      } catch (err) {
+        if ((err as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") throw err;
+      }
+    }
+    this.store.event({
+      entity_type: "mission_schedule",
+      entity_id: scheduleId,
+      event_type: "SCHEDULE_ACCOUNTING_INTEGRITY",
+      actor: "PAIR_MISSION_SCHEDULE",
+      metadata: {
+        repair_reason: "last_error_write_unproven",
+        occurrence_due_at: dueAt,
+      },
+    });
   }
 }

@@ -35,6 +35,8 @@ import {
   PolicyError,
   ReconciliationService,
   RecoveryController,
+  digest,
+  nextRunAfter,
   utcnow,
 } from "../pair/index.js";
 
@@ -736,5 +738,81 @@ describe("R2 §2 genuine worker_threads contention", () => {
     expect(String(occs[0].mission_id)).toBe(String(missions[0].mission_id));
     const after = sch.get(id);
     expect(Number(after.run_count)).toBe(1);
+    // R6 §6: state must be canonical IMMEDIATELY after both fireDue calls —
+    // no second reconcile pass may be needed. The loser only ever
+    // reconciles; it never merges stale outcome fields.
+    expect(String(after.last_mission_id)).toBe(String(missions[0].mission_id));
+    expect(String(after.last_fired_at)).toBe(String(occs[0].fired_at));
+    expect(String(after.next_due_at)).toBe(
+      nextRunAfter("*/5 * * * *", String(occs[0].due_at)),
+    );
+    expect(after.last_error ?? null).toBeNull();
+  }, 90_000);
+
+  it("G. R6 §7 previous-occurrence race: winner's outcome must not be clobbered by the loser's stale row", async () => {
+    const { dir, ctx } = makeBizCtx("ra-fire-prev");
+    const dbPath = path.join(dir, "pair.db");
+    const sch = new MissionScheduleService(ctx.service);
+    const s = sch.create({ goal: "tick", cron: "*/5 * * * *", operator_id: "op" });
+    const id = String(s.schedule_id);
+    // Canonical previous state: one FIRED occurrence + its mission, and the
+    // schedule row already advanced by it.
+    const prevDue = "2026-01-01T10:00:00.000Z";
+    const prevOccId = `OCC_${digest(`schedule-occurrence:${id}:${prevDue}`).slice(0, 24)}`;
+    const prevMission = ctx.control.startMission({
+      goal: "prev",
+      project_id: ctx.projectId,
+      operator_id: "op",
+      metadata: {
+        plan_source: "schedule",
+        schedule_id: id,
+        schedule_occurrence_id: prevOccId,
+        scheduled_for: prevDue,
+      },
+    });
+    ctx.store.put(
+      "schedule_occurrence",
+      prevOccId,
+      {
+        occurrence_id: prevOccId, schedule_id: id, due_at: prevDue,
+        business_id: null, status: "FIRED",
+        mission_id: String(prevMission.mission_id),
+        fired_at: prevDue, created_at: prevDue, version: 0,
+      },
+      0,
+    );
+    const dueAt = "2026-01-01T10:05:00.000Z";
+    const row = sch.get(id);
+    row.next_due_at = dueAt;
+    row.run_count = 1;
+    row.last_mission_id = String(prevMission.mission_id);
+    row.last_fired_at = prevDue;
+    ctx.store.put("mission_schedule", id, row, Number(row.version));
+    const [r1, r2] = await runRace([
+      { op: "fire", dir, dbPath, args: { projectId: ctx.projectId, now: dueAt } },
+      { op: "fire", dir, dbPath, args: { projectId: ctx.projectId, now: dueAt } },
+    ]);
+    expect([r1, r2].filter((r) => r.ok).length).toBe(2);
+    // Exactly one new mission — never a replay of MSN_PREVIOUS's slot.
+    const missions = ctx.store.list("mission");
+    expect(missions.length).toBe(2);
+    const xOccs = ctx.store
+      .list("schedule_occurrence")
+      .filter((o) => String(o.due_at) === dueAt);
+    expect(xOccs.length).toBe(1);
+    expect(String(xOccs[0].status)).toBe("FIRED");
+    const xMissionId = String(xOccs[0].mission_id);
+    expect(xMissionId).not.toBe(String(prevMission.mission_id));
+    const after = sch.get(id);
+    // The loser's stale snapshot (run_count=1, last=MSN_PREVIOUS) must NOT
+    // survive: canonical evidence wins immediately.
+    expect(Number(after.run_count)).toBe(2);
+    expect(String(after.last_mission_id)).toBe(xMissionId);
+    expect(String(after.last_fired_at)).toBe(String(xOccs[0].fired_at));
+    expect(String(after.next_due_at)).toBe(
+      nextRunAfter("*/5 * * * *", dueAt),
+    );
+    expect(after.last_error ?? null).toBeNull();
+    expect(ctx.store.verifyIntegrity().entities).toBeGreaterThan(0);
   }, 90_000);
 });
