@@ -2631,3 +2631,298 @@ describe("P14 R5 remediations", () => {
     ctx.store.verifyIntegrity();
   });
 });
+
+describe("P14 R6 remediations", () => {
+  /** Seed a delegated-looking child row (provenance may be faked). */
+  const seedDelegatedChild = (
+    ctx: Ctx,
+    opts: {
+      idKey: string; key: string | null; parentId: string; businessId: string;
+      by: string; to: string; emitEvent?: boolean;
+    },
+  ): string => {
+    const id = `WI_DL_${createHash("sha256")
+      .update(`${opts.parentId}|${opts.idKey}`)
+      .digest("hex").slice(0, 20).toUpperCase()}`;
+    ctx.store.put("work_item", id, {
+      work_item_id: id, business_id: opts.businessId, title: "delegated row", goal: "g",
+      status: "READY", assignee_agent_id: opts.to,
+      parent_work_item_id: opts.parentId,
+      delegated_from_work_item_id: opts.parentId,
+      delegated_by_agent_id: opts.by,
+      delegation_depth: 1, delegation_reason: null, delegation_key: opts.key,
+      required_capability: null, decomposition_id: null,
+      depends_on: [], mission_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 0,
+    } as never, 0);
+    if (opts.emitEvent) {
+      ctx.store.event({
+        entity_type: "work_item", entity_id: opts.parentId, event_type: "WORK_DELEGATED",
+        actor: "seed", metadata: {
+          delegated_from: opts.by, delegated_to: opts.to,
+          child_work_item_id: id, delegation_key: opts.key,
+        },
+      });
+    }
+    return id;
+  };
+
+  const quarantineViaConflictingAudit = (ctx: Ctx, biz: BusinessLayer, childId: string, parentId: string, key: string) => {
+    ctx.store.event({
+      entity_type: "work_item", entity_id: parentId, event_type: "WORK_DELEGATED",
+      actor: "seed", metadata: {
+        delegated_from: "AG_FOREIGN", delegated_to: "AG_FOREIGN",
+        child_work_item_id: childId, delegation_key: `${key}-WRONG`,
+      },
+    });
+    biz.rebuildReadiness(String(ctx.store.get("work_item", childId).business_id));
+  };
+
+  it("QUAR-R6-AUTOASSIGN: autoAssign never launders quarantine into BLOCKED_CAPABILITY", () => {
+    const { ctx, biz, workforce } = makeBizCtx("quar-r6-auto");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "R6Q",
+    }, "op");
+    quarantineViaConflictingAudit(ctx, biz, String(child.work_item_id), String(parent.work_item_id), "R6Q");
+    const q = ctx.store.get("work_item", String(child.work_item_id));
+    expect(String(q.status)).toBe("READY");
+    expect(String(q.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // autoAssign must fail closed BEFORE the no-eligible/mutation branch.
+    const eventsBefore = ctx.store.listEvents()
+      .filter((e) => e.entity_id === String(child.work_item_id)).length;
+    expect(errCode(() => workforce.autoAssign(String(child.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    const after = ctx.store.get("work_item", String(child.work_item_id));
+    expect(String(after.status)).toBe("READY");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(ctx.store.listEvents()
+      .filter((e) => e.entity_id === String(child.work_item_id)).length).toBe(eventsBefore);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("SYNC-R6-WRONG-WORK: a foreign COMPLETED mission cannot fold into this item", () => {
+    const { ctx, biz } = makeBizCtx("sync-r6-ww");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const wA = wi(biz, bid, { assignee_agent_id: String(lead.agent_id), title: "A" });
+    const wB = wi(biz, bid, { assignee_agent_id: String(lead.agent_id), title: "B" });
+    const dep = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), title: "dep",
+      depends_on: [String(wB.work_item_id)],
+    });
+    biz.openWorkItem(String(wA.work_item_id), "op");
+    biz.openWorkItem(String(wB.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(wA.work_item_id));
+    const aMissionId = String(ctx.store.get("work_item", String(wA.work_item_id)).mission_ids[0]);
+    // Plant A's COMPLETED mission as B's last mission.
+    const bRow = ctx.store.get("work_item", String(wB.work_item_id));
+    bRow.mission_ids = [aMissionId];
+    ctx.store.put("work_item", String(wB.work_item_id), bRow, Number(bRow.version));
+    biz.syncWorkItem(String(wB.work_item_id));
+    const after = ctx.store.get("work_item", String(wB.work_item_id));
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(String(ctx.store.get("work_item", String(dep.work_item_id)).status)).toBe("BACKLOG");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("SYNC-R6-WRONG-BUSINESS: a foreign-business mission cannot ground state", () => {
+    const { ctx, biz } = makeBizCtx("sync-r6-wb");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b1 = makeBiz(biz, ctx.projectId, "B1");
+    const b2 = makeBiz(biz, ctx.projectId, "B2");
+    const a1 = makeAgent(biz, String(b1.business_id), "lead1");
+    const a2 = makeAgent(biz, String(b2.business_id), "lead2");
+    const w1 = wi(biz, String(b1.business_id), { assignee_agent_id: String(a1.agent_id) });
+    const w2 = wi(biz, String(b2.business_id), { assignee_agent_id: String(a2.agent_id) });
+    biz.openWorkItem(String(w1.work_item_id), "op");
+    biz.openWorkItem(String(w2.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(w1.work_item_id));
+    const m1 = String(ctx.store.get("work_item", String(w1.work_item_id)).mission_ids[0]);
+    const w2Row = ctx.store.get("work_item", String(w2.work_item_id));
+    w2Row.mission_ids = [m1];
+    ctx.store.put("work_item", String(w2.work_item_id), w2Row, Number(w2Row.version));
+    biz.syncWorkItem(String(w2.work_item_id));
+    const after = ctx.store.get("work_item", String(w2.work_item_id));
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("PARENT-R6-UNBOUND-MISSION: parked parent never finalizes on a foreign mission", () => {
+    const { ctx, biz } = makeBizCtx("parent-r6-unbound");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const foreign = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const c1 = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), parent_work_item_id: String(parent.work_item_id),
+    });
+    const c2 = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), parent_work_item_id: String(parent.work_item_id),
+    });
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code))
+      .toBe("CHILD_INCOMPLETE");
+    // Parent's own mission is replaced by the foreign item's mission.
+    biz.openWorkItem(String(foreign.work_item_id), "op");
+    const foreignMission = String(ctx.store.get("work_item", String(foreign.work_item_id)).mission_ids[0]);
+    const pRow = ctx.store.get("work_item", String(parent.work_item_id));
+    pRow.mission_ids = [foreignMission];
+    ctx.store.put("work_item", String(parent.work_item_id), pRow, Number(pRow.version));
+    // Children complete legitimately — propagation re-evaluates parent.
+    biz.openWorkItem(String(c1.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(c1.work_item_id));
+    biz.openWorkItem(String(c2.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(c2.work_item_id));
+    const pAfter = ctx.store.get("work_item", String(parent.work_item_id));
+    expect(String(pAfter.status)).toBe("IN_PROGRESS");
+    expect(String(pAfter.blocked_code)).toBe("CHILD_INCOMPLETE");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DEP-R6-UNGROUNDED-DONE-NO-SWEEP: unproven DONE never satisfies a dep before any sweep", () => {
+    const { ctx, biz } = makeBizCtx("dep-r6-nosweep");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const wA = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const wB = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), depends_on: [String(wA.work_item_id)],
+    });
+    const row = ctx.store.get("work_item", String(wA.work_item_id));
+    row.status = "DONE"; // forced, ungrounded — no sweep will run
+    ctx.store.put("work_item", String(wA.work_item_id), row, Number(row.version));
+    // Direct authority path: depsSatisfied must require proof, not status.
+    expect(biz.depsSatisfied(ctx.store.get("work_item", String(wB.work_item_id)))).toBe(false);
+    expect(errCode(() => biz.openWorkItem(String(wB.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_ITEM_DEPENDENCY");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("PARENT-R6-UNGROUNDED-CHILD-NO-SWEEP: parent stays parked while a child DONE is unproven", () => {
+    const { ctx, biz } = makeBizCtx("parent-r6-nosweep");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const c1 = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), parent_work_item_id: String(parent.work_item_id),
+    });
+    const c2 = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), parent_work_item_id: String(parent.work_item_id),
+    });
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code))
+      .toBe("CHILD_INCOMPLETE");
+    // c2 reaches DONE only by force — never grounded in a mission.
+    const c2Row = ctx.store.get("work_item", String(c2.work_item_id));
+    c2Row.status = "DONE";
+    ctx.store.put("work_item", String(c2.work_item_id), c2Row, Number(c2Row.version));
+    // c1 completes legitimately → propagation must NOT release parent.
+    biz.openWorkItem(String(c1.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(c1.work_item_id));
+    const pAfter = ctx.store.get("work_item", String(parent.work_item_id));
+    expect(String(pAfter.status)).toBe("IN_PROGRESS");
+    expect(String(pAfter.blocked_code)).toBe("CHILD_INCOMPLETE");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-R6-FAKE-ROW: restart never manufactures audit for a semantically invalid delegation row", () => {
+    const { ctx, biz } = makeBizCtx("deleg-r6-fake");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    // Parent id resolves to nothing — the row's strings look right but
+    // the parent does not exist in this business at all.
+    const childId = seedDelegatedChild(ctx, {
+      idKey: "FK", key: "FK", parentId: "WI_GHOST_PARENT",
+      businessId: bid, by: String(lead.agent_id), to: String(worker.agent_id),
+    });
+    const re = makeBizCtx("deleg-r6-fake-re", reopenCtx(ctx.dir, "re"));
+    re.ctx.workspace = ctx.workspace;
+    re.biz.rebuildReadiness(bid);
+    const row = re.ctx.store.get("work_item", childId);
+    expect(String(row.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const deleg = re.ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_DELEGATED"
+        && String((e.metadata as Record<string, unknown>).child_work_item_id) === childId);
+    expect(deleg.length).toBe(0);
+    re.ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-R6-BAD-DETERMINISTIC-ID: id != WI_DL(parent,key) quarantines, no event repair", () => {
+    const { ctx, biz } = makeBizCtx("deleg-r6-badid");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    // Row fields look valid, but the deterministic id hashes the WRONG key.
+    const childId = seedDelegatedChild(ctx, {
+      idKey: "WRONG-KEY", key: "REAL-KEY", parentId: String(parent.work_item_id),
+      businessId: bid, by: String(lead.agent_id), to: String(worker.agent_id),
+    });
+    biz.rebuildReadiness(bid);
+    const row = ctx.store.get("work_item", childId);
+    expect(String(row.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const deleg = ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_DELEGATED"
+        && String((e.metadata as Record<string, unknown>).child_work_item_id) === childId);
+    expect(deleg.length).toBe(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("CONTROL-R6-FOREIGN-MISSION: block/cancel never touch a foreign live mission", () => {
+    const { ctx, biz } = makeBizCtx("control-r6-foreign");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const wA = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const wB = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const wC = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    biz.openWorkItem(String(wA.work_item_id), "op");
+    biz.openWorkItem(String(wB.work_item_id), "op");
+    biz.openWorkItem(String(wC.work_item_id), "op");
+    const aMissionId = String(ctx.store.get("work_item", String(wA.work_item_id)).mission_ids[0]);
+    const aMissionStatus = String(ctx.store.get("mission", aMissionId).status);
+    // Corrupt B's linkage to point at A's live mission.
+    const bRow = ctx.store.get("work_item", String(wB.work_item_id));
+    bRow.mission_ids = [aMissionId];
+    ctx.store.put("work_item", String(wB.work_item_id), bRow, Number(bRow.version));
+    biz.blockWorkItem(String(wB.work_item_id), "triage", "op");
+    // A's mission untouched — still its prior non-terminal state.
+    expect(String(ctx.store.get("mission", aMissionId).status)).toBe(aMissionStatus);
+    expect(String(ctx.store.get("work_item", String(wB.work_item_id)).status)).toBe("BLOCKED");
+    // Same for cancel on C.
+    const cRow = ctx.store.get("work_item", String(wC.work_item_id));
+    cRow.mission_ids = [aMissionId];
+    ctx.store.put("work_item", String(wC.work_item_id), cRow, Number(cRow.version));
+    biz.cancelWorkItem(String(wC.work_item_id), "op");
+    expect(String(ctx.store.get("mission", aMissionId).status)).toBe(aMissionStatus);
+    expect(String(ctx.store.get("work_item", String(wC.work_item_id)).status)).toBe("CANCELLED");
+    ctx.store.verifyIntegrity();
+  });
+});

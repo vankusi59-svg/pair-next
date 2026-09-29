@@ -18,6 +18,7 @@
  * - Money/outbound boundaries stay in the approval queue — business layer
  *   only decides WHICH mission runs, never bypasses approvals.
  */
+import { createHash } from "node:crypto";
 import { IntegrityError, PolicyError } from "./errors.js";
 import { digest, newId, utcnow } from "./canonical.js";
 import {
@@ -76,6 +77,11 @@ function assertWorkItemTransition(from: string, to: WorkItemStatus): void {
 
 /** Quarantine marker for terminal rows whose provenance failed audit (R4 §3). */
 export const WORK_CORRUPT_CODE = "TERMINAL_PROVENANCE_CORRUPT";
+
+/** Deterministic work-graph child id (delegation DL / decomposition DC). */
+export function childNodeId(prefix: "DL" | "DC", parentId: string, key: string): string {
+  return `WI_${prefix}_${createHash("sha256").update(`${parentId}|${key}`).digest("hex").slice(0, 20).toUpperCase()}`;
+}
 
 /**
  * R5 §1 hard quarantine: a row carrying TERMINAL_PROVENANCE_CORRUPT is
@@ -536,14 +542,89 @@ export class BusinessLayer {
     }
   }
 
-  /** All prerequisites DONE? Missing/foreign dep ids count as unsatisfied
-   *  (they cannot exist legally, but never assume). */
+  /**
+   * R6 §1 canonical proof helpers — ONE definition of "grounded" used by
+   * every authority seam (sync fold, parent completion, dep satisfaction,
+   * child gate, restart reconcile), not just the recovery sweep. None of
+   * them depend on reconciliation having run first.
+   */
+
+  /** Is mission `m` canonically bound to work item `row`? */
+  missionBoundToWorkItem(row: Row, m: Row): boolean {
+    const md = (m.metadata as Record<string, unknown> | undefined) ?? {};
+    return (
+      String(md.work_item_id ?? "") === String(row.work_item_id) &&
+      String(md.business_id ?? "") === String(row.business_id) &&
+      String(md.source ?? "") === "business_layer" &&
+      Boolean(md.work_item_open_id)
+    );
+  }
+
+  /** The row's last mission when it is canonically bound, else null. */
+  boundMissionForWorkItem(row: Row): Row | null {
+    const mids = (row.mission_ids as string[] | undefined) ?? [];
+    if (!mids.length) return null;
+    const m = this.store.tryGet("mission", String(mids[mids.length - 1]));
+    return m && this.missionBoundToWorkItem(row, m) ? m : null;
+  }
+
+  /** Exactly one provenance-valid WORK_REVIEW_ACCEPTED for this row. */
+  proveReviewAcceptance(row: Row): boolean {
+    const evs = this.store.listEvents().filter((e) =>
+      e.event_type === "WORK_REVIEW_ACCEPTED" &&
+      String(e.entity_id) === String(row.work_item_id));
+    if (evs.length !== 1) return false;
+    const e = evs[0];
+    const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+    if (String(e.old_state ?? "") !== "REVIEW_REQUIRED") return false;
+    if (String(e.new_state ?? "") !== "DONE") return false;
+    const rev = String(md.reviewer_agent_id ?? "");
+    if (!rev) return false;
+    const revRow = this.store.tryGet("org_agent", rev);
+    if (!revRow || String(revRow.business_id) !== String(row.business_id)) return false;
+    if (rev === String(row.assignee_agent_id ?? "")) return false;
+    if (row.reviewer_agent_id && rev !== String(row.reviewer_agent_id)) return false;
+    return true;
+  }
+
+  /** Is this row's DONE canonically proven? Status alone never counts. */
+  proveWorkItemDone(row: Row): boolean {
+    if (String(row.status) !== "DONE") return false;
+    const m = this.boundMissionForWorkItem(row);
+    if (!m || String(m.status) !== "COMPLETED") return false;
+    return row.requires_review === true ? this.proveReviewAcceptance(row) : true;
+  }
+
+  /** Quarantine a row live (same marker/event as the reconcile sweep). */
+  private quarantineWorkItem(row: Row, detail: string): void {
+    const id = String(row.work_item_id);
+    const marked = this.store.listEvents().some((e) =>
+      e.event_type === "WORK_PROVENANCE_INCONSISTENT" && String(e.entity_id) === id);
+    if (!marked) {
+      this.store.event({
+        entity_type: "work_item", entity_id: id, event_type: "WORK_PROVENANCE_INCONSISTENT",
+        old_state: String(row.status), new_state: String(row.status), actor: "PAIR_RECONCILE",
+        metadata: { cause: "ungrounded_terminal_or_audit", detail },
+      });
+    }
+    if (String(row.blocked_code ?? "") !== WORK_CORRUPT_CODE) {
+      row.blocked_code = WORK_CORRUPT_CODE;
+      row.updated_at = utcnow();
+      this.store.put("work_item", id, row, Number(row.version));
+    }
+  }
+
+  /** All prerequisites DONE — and each DONE canonically proven (R6 §4).
+   *  Missing/foreign dep ids count as unsatisfied (they cannot exist
+   *  legally, but never assume). */
   depsSatisfiedDeps(businessId: string, dependsOn: string[]): boolean {
     for (const depId of dependsOn) {
       const dep = this.store.tryGet("work_item", depId);
       if (!dep || String(dep.business_id) !== businessId || String(dep.status) !== "DONE") return false;
-      // R4 §6: a quarantined/unproven DONE never satisfies a dependency.
-      if (String(dep.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT") return false;
+      // A quarantined or unproven DONE never satisfies a dependency —
+      // even before any reconciliation sweep has run.
+      if (String(dep.blocked_code ?? "") === WORK_CORRUPT_CODE) return false;
+      if (!this.proveWorkItemDone(dep)) return false;
     }
     return true;
   }
@@ -673,13 +754,9 @@ export class BusinessLayer {
         events.filter((e) => e.event_type === "WORK_ITEM_SYNCED")
           .map((e) => `${String(e.entity_id)}|${String(e.new_state)}`),
       );
-      // R5 §5: review proof inspects the actual ACCEPT events —
-      // presence in a Set is not provenance.
-      const acceptByItem = new Map<string, Array<Record<string, unknown>>>();
-      for (const e of events.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED")) {
-        const iid = String(e.entity_id);
-        acceptByItem.set(iid, [...(acceptByItem.get(iid) ?? []), e]);
-      }
+      // R6 §1: review/mission proofs now live in ONE canonical helper
+      // set shared with every live authority seam — the reconcile sweep
+      // validates provenance the same way sync/open/finalize do.
       const cancelled = new Set(
         events.filter((e) => e.event_type === "WORK_ITEM_CANCELLED")
           .map((e) => String(e.entity_id)),
@@ -747,18 +824,35 @@ export class BusinessLayer {
           }
           continue; // audit proven
         }
-        // 0 events: repair only when row provenance is complete — a
-        // keyless legacy row is left for the replay path, which repairs
-        // key + event atomically.
+        // 0 events: repair only when the row's full provenance checks
+        // out (R6 §6) — a keyless legacy row is left for the replay
+        // path, which repairs key + event atomically; a row that fails
+        // any check can never have an audit event manufactured for it.
         if (key && by && to) {
-          this.store.event({
-            entity_type: "work_item", entity_id: String(w.delegated_from_work_item_id),
-            event_type: "WORK_DELEGATED", actor: "PAIR_RECONCILE",
-            metadata: {
-              cause: "restart_reconcile", delegated_from: by, delegated_to: to,
-              child_work_item_id: id, delegation_key: key,
-            },
-          });
+          const parent = byId.get(String(w.delegated_from_work_item_id));
+          const byAgent = this.store.tryGet("org_agent", by);
+          const toAgent = this.store.tryGet("org_agent", to);
+          const provenanceOk =
+            parent !== undefined &&
+            String(parent.business_id) === String(w.business_id) &&
+            String(w.parent_work_item_id ?? "") === String(parent.work_item_id) &&
+            byAgent !== null && String(byAgent.business_id) === String(w.business_id) &&
+            toAgent !== null && String(toAgent.business_id) === String(w.business_id) &&
+            Number(w.delegation_depth ?? -1) === Number(parent.delegation_depth ?? 0) + 1 &&
+            Number(w.delegation_depth) <= WORK_DELEGATION_DEPTH_CAP &&
+            id === childNodeId("DL", String(parent.work_item_id), key);
+          if (provenanceOk) {
+            this.store.event({
+              entity_type: "work_item", entity_id: String(w.delegated_from_work_item_id),
+              event_type: "WORK_DELEGATED", actor: "PAIR_RECONCILE",
+              metadata: {
+                cause: "restart_reconcile", delegated_from: by, delegated_to: to,
+                child_work_item_id: id, delegation_key: key,
+              },
+            });
+          } else {
+            markInconsistent(w, `delegation row provenance invalid for child ${id}`);
+          }
         }
       }
 
@@ -770,39 +864,6 @@ export class BusinessLayer {
       const missionFor = (w: Row): Row | null => {
         const mids = (w.mission_ids as string[] | undefined) ?? [];
         return mids.length ? this.store.tryGet("mission", String(mids[mids.length - 1])) : null;
-      };
-      // R5 §3: the proof mission must be canonically bound — created
-      // through the business open seam for THIS work item in THIS
-      // business. A foreign COMPLETED mission id planted in the row can
-      // never ground a terminal state.
-      const missionBound = (w: Row, m: Row | null): boolean => {
-        if (!m) return false;
-        const md = (m.metadata as Record<string, unknown> | undefined) ?? {};
-        if (String(md.work_item_id ?? "") !== String(w.work_item_id)) return false;
-        if (String(md.business_id ?? "") !== String(w.business_id)) return false;
-        if (String(md.source ?? "") !== "business_layer") return false;
-        if (!md.work_item_open_id) return false; // canonical seam always stamps an open id
-        return true;
-      };
-      // R5 §5: exactly one authoritative ACCEPT event, fully validated —
-      // states, reviewer presence, business scope, non-self, named
-      // reviewer match. Duplicate/malformed audit → conflict, never
-      // another synthesized ACCEPT.
-      const acceptProof = (w: Row): "valid" | "none" | "invalid" => {
-        const evs = acceptByItem.get(String(w.work_item_id)) ?? [];
-        if (evs.length === 0) return "none";
-        if (evs.length > 1) return "invalid";
-        const e = evs[0];
-        const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
-        if (String(e.old_state ?? "") !== "REVIEW_REQUIRED") return "invalid";
-        if (String(e.new_state ?? "") !== "DONE") return "invalid";
-        const rev = String(md.reviewer_agent_id ?? "");
-        if (!rev) return "invalid";
-        const revRow = this.store.tryGet("org_agent", rev);
-        if (!revRow || String(revRow.business_id) !== String(w.business_id)) return "invalid";
-        if (rev === String(w.assignee_agent_id ?? "")) return "invalid";
-        if (w.reviewer_agent_id && rev !== String(w.reviewer_agent_id)) return "invalid";
-        return "valid";
       };
       // R5 §6: a proven transition whose DERIVED effects were lost is
       // still repairable — detect them canonically (context note, parked
@@ -833,14 +894,14 @@ export class BusinessLayer {
         const terminalish = TERMINAL_WORK_ITEM_STATUSES.has(st) || st === "REVIEW_REQUIRED";
         if (!terminalish) continue;
         const mission = missionFor(w);
-        const bound = missionBound(w, mission);
+        const bound = mission !== null && this.missionBoundToWorkItem(w, mission);
         const ms = bound && mission ? String(mission.status) : null;
         let proof: string | null = null;
         if (st === "DONE") {
           if (w.requires_review === true) {
             // §4+§5: DONE on a requires_review item needs BOTH a bound
             // COMPLETED mission AND exactly one valid WORK_REVIEW_ACCEPTED.
-            proof = bound && ms === "COMPLETED" && acceptProof(w) === "valid"
+            proof = bound && ms === "COMPLETED" && this.proveReviewAcceptance(w)
               ? "review_accepted" : null;
           } else {
             proof = bound && ms === "COMPLETED" ? "mission_completed" : null;
@@ -1348,7 +1409,10 @@ export class BusinessLayer {
     let cancelledMission: string | null = null;
     if (missionIds.length > 0) {
       const last = this.store.tryGet("mission", missionIds[missionIds.length - 1]);
-      if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
+      // R6 §7: cancellation stays a legal safety op on the item, but it
+      // may cancel an external mission only when that mission is
+      // canonically bound to this work item.
+      if (last && this.missionBoundToWorkItem(row, last) && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
         this.deps.control.cancelMission(String(last.mission_id), actor);
         cancelledMission = String(last.mission_id);
       }
@@ -1466,6 +1530,16 @@ export class BusinessLayer {
     } catch {
       return row; // mission not persisted yet — leave IN_PROGRESS
     }
+    // R6 §2: a live fold only ever follows a canonically bound mission.
+    // A foreign/mismatched mission can mark nothing, enter no review,
+    // block/cancel nothing, propagate nothing — it quarantines the row.
+    if (!this.missionBoundToWorkItem(row, mission)) {
+      this.quarantineWorkItem(
+        row,
+        `sync: mission ${String(mission.mission_id)} is not canonically bound to ${workItemId}`,
+      );
+      return row;
+    }
     const ms = String(mission.status);
     // P14 §9: when the node requires review, a completed mission parks the
     // work in REVIEW_REQUIRED — DONE only follows governed acceptance.
@@ -1579,10 +1653,11 @@ export class BusinessLayer {
       .list("work_item")
       .filter((c) => String(c.parent_work_item_id) === pid)
       .every((c) =>
+        // R6 §4: a child counts only when its DONE is canonically proven
+        // — flag-clean status alone never releases a parent.
         String(c.status) === "DONE" &&
-        // R4 §6: an ungrounded/quarantined DONE never counts as proven
-        // completion — it cannot release a parent.
-        String(c.blocked_code ?? "") !== "TERMINAL_PROVENANCE_CORRUPT");
+        String(c.blocked_code ?? "") !== WORK_CORRUPT_CODE &&
+        this.proveWorkItemDone(c));
   }
 
   /**
@@ -1600,9 +1675,11 @@ export class BusinessLayer {
     if (!parent) return;
     if (String(parent.status) !== "IN_PROGRESS" || String(parent.blocked_code ?? "") !== "CHILD_INCOMPLETE") return;
     if (!this.mandatoryChildrenComplete(parent)) return;
-    const mids = (parent.mission_ids as string[] | undefined) ?? [];
-    const mission = mids.length ? this.store.tryGet("mission", mids[mids.length - 1]) : null;
-    if (!mission) return;
+    // R6 §3: the parent may finalize only when ITS OWN bound mission is
+    // COMPLETED — a foreign, unbound, missing or non-terminal mission
+    // never fabricates completion; the parent simply stays parked.
+    const mission = this.boundMissionForWorkItem(parent);
+    if (!mission || String(mission.status) !== "COMPLETED") return;
     const next: WorkItemStatus = parent.requires_review === true ? "REVIEW_REQUIRED" : "DONE";
     this.finalizeWorkItem(parent, "IN_PROGRESS", next, mission, {
       cause: "children_complete",
@@ -1716,7 +1793,9 @@ export class BusinessLayer {
       const missionIds = (row.mission_ids as string[] | undefined) ?? [];
       if (missionIds.length > 0) {
         const last = this.store.tryGet("mission", missionIds[missionIds.length - 1]);
-        if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
+        // R6 §7: never touch a foreign mission — only a canonically
+        // bound one may be paused through this item.
+        if (last && this.missionBoundToWorkItem(row, last) && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
           this.deps.control.pauseMission(String(last.mission_id), actor);
           pausedMission = String(last.mission_id);
         }

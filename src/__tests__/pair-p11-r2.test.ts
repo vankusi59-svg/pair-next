@@ -126,7 +126,15 @@ function makeOrphanPending(
     goal: "orphan",
     project_id: projectId,
     operator_id: "op",
-    metadata: { work_item_id: workItemId, work_item_open_id: openId },
+    // Same canonical seam metadata openWorkItem stamps — a real crash
+    // orphan always carries business_id + source + open id.
+    metadata: {
+      business_id: String(cur.business_id),
+      work_item_id: workItemId,
+      work_item_open_id: openId,
+      org_agent_id: cur.assignee_agent_id ?? null,
+      source: "business_layer",
+    },
   });
   return { openId, mission };
 }

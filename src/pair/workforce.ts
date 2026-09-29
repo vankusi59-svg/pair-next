@@ -18,7 +18,6 @@
  * projections only: seeing work grants no authority; every existing gate
  * (P12 contract, P13 cost/secret, approvals, budget) still applies at open.
  */
-import { createHash } from "node:crypto";
 import { IntegrityError, PolicyError } from "./errors.js";
 import { utcnow } from "./canonical.js";
 import {
@@ -27,18 +26,12 @@ import {
   WORK_GRAPH_NODE_CAP,
   TERMINAL_WORK_ITEM_STATUSES,
   assertWorkItemNotQuarantined,
+  childNodeId,
   type BusinessLayer,
 } from "./business.js";
 import type { PairEvidenceStore } from "./store.js";
 
 type Row = Record<string, unknown> & { version: number };
-
-/** Deterministic node ids: racing materializers collide on the version-0
- *  INSERT — one winner, loser returns the canonical row. Exactly-once
- *  child materialization survives concurrent workers and replays. */
-function childNodeId(prefix: "DL" | "DC", parentId: string, key: string): string {
-  return `WI_${prefix}_${createHash("sha256").update(`${parentId}|${key}`).digest("hex").slice(0, 20).toUpperCase()}`;
-}
 
 export interface WorkforceDeps {
   store: PairEvidenceStore;
@@ -163,6 +156,11 @@ export class WorkforceService {
   /** Pick the least-loaded eligible agent; none → explicit BLOCKED. */
   autoAssign(workItemId: string, actor: string): Row {
     const row = this.node(workItemId);
+    // R6 §5: the quarantine guard runs before ANY mutation path — the
+    // no-eligible-agent branch below would otherwise overwrite
+    // TERMINAL_PROVENANCE_CORRUPT with BLOCKED_CAPABILITY and launder
+    // the quarantine.
+    assertWorkItemNotQuarantined(row, "autoAssign");
     const businessId = String(row.business_id);
     if (TERMINAL_WORK_ITEM_STATUSES.has(String(row.status))) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(row.status)} cannot be assigned`);

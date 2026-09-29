@@ -789,3 +789,121 @@ All R1–R4 closures unchanged; `PairEvidenceStore.immediate()` remains the
 single transaction authority; no second store/router/dispatcher.
 
 Classification: **`P14_REMEDIATED_R5_PENDING_AUDIT`** — DO NOT MERGE.
+
+---
+
+# §R6 — CANONICAL PROOF AT AUTHORITY SEAMS + QUARANTINE CLOSURE
+
+Audit verdict on `ab0a2fe`: R1–R5 closed; P14 BLOCKED on the recovery
+proof living only inside `reconcileTerminalConsistency` — live authority
+paths still trusted status/flag-clean rows and foreign mission linkage.
+
+## Design — one canonical proof, every seam (§1)
+
+The proof helpers are now `BusinessLayer` methods shared by the live
+paths AND the restart sweep — no dependency on reconciliation having run
+first:
+
+- `missionBoundToWorkItem(row, m)` — `metadata.work_item_id` + `business_id`
+  match the row, `source === "business_layer"`, `work_item_open_id`
+  present. THE definition of a canonically linked mission.
+- `boundMissionForWorkItem(row)` — the row's last mission iff bound.
+- `proveReviewAcceptance(row)` — exactly one `WORK_REVIEW_ACCEPTED` with
+  `old_state=REVIEW_REQUIRED`, `new_state=DONE`, `reviewer_agent_id`
+  present, same-business, non-assignee, named-reviewer match.
+- `proveWorkItemDone(row)` — `DONE` only counts when the bound mission is
+  `COMPLETED` (plus a valid ACCEPT for `requires_review` rows).
+- `quarantineWorkItem(row, detail)` — live equivalent of the sweep's
+  quarantine: one `WORK_PROVENANCE_INCONSISTENT` event + `blocked_code=
+  TERMINAL_PROVENANCE_CORRUPT`, idempotent.
+
+## §2 live sync mission binding
+
+`syncWorkItem` validates `missionBoundToWorkItem` on the mission it is
+about to fold. A foreign/mismatched mission can never: mark DONE, enter
+REVIEW_REQUIRED, BLOCK/CANCEL on foreign state, propagate dependencies,
+or write success context — the row is quarantined and stays
+`IN_PROGRESS` (SYNC-R6-WRONG-WORK, SYNC-R6-WRONG-BUSINESS).
+
+## §3 parent completion proof
+
+`evaluateParentCompletion` requires `boundMissionForWorkItem(parent)`
+with status `COMPLETED` before any finalize — foreign, unbound, missing,
+RUNNING/FAILED/CANCELLED/PAUSED missions leave the parent parked
+(PARENT-R6-UNBOUND-MISSION).
+
+## §4 dependencies/children must be PROVEN, not flag-clean
+
+`depsSatisfiedDeps` and `mandatoryChildrenComplete` now require
+`proveWorkItemDone(dep)` in addition to `DONE` + non-corrupt flag. An
+ungrounded DONE never satisfies a dependency, never permits a dependent
+open, never releases a `CHILD_INCOMPLETE` parent, never contributes to a
+cascade — even before any rebuild sweep ran (DEP-R6-UNGROUNDED-DONE-
+NO-SWEEP, PARENT-R6-UNGROUNDED-CHILD-NO-SWEEP).
+
+## §5 autoAssign quarantine laundering closed
+
+`WorkforceService.autoAssign` calls `assertWorkItemNotQuarantined` at the
+very start — before the no-eligible-agent branch that previously called
+`blockWorkItem` and overwrote `blocked_code` with `BLOCKED_CAPABILITY`,
+silently clearing `TERMINAL_PROVENANCE_CORRUPT`
+(QUAR-R6-AUTOASSIGN: code, status, and event set all unchanged).
+
+## §6 delegation restart repair validates the full row
+
+Before synthesizing a missing `WORK_DELEGATED`, the sweep now requires
+ALL of: `delegated_from_work_item_id` resolves to a real parent in the
+same business; `delegated_by_agent_id` and `assignee` resolve to agents
+of the same business; `delegation_depth = parent.depth + 1 ≤ cap`; the
+child id equals the deterministic `WI_DL(parent,key)`; the child's
+`parent_work_item_id` agrees. Any failure → quarantine, never an
+event manufactured from an invalid row (DELEG-R6-FAKE-ROW,
+DELEG-R6-BAD-DETERMINISTIC-ID).
+
+## §7 mission-control actions never touch foreign missions
+
+`blockWorkItem → pauseMission` and `cancelWorkItem → cancelMission` both
+gate on `missionBoundToWorkItem`. A corrupted `mission_ids` value can
+never pause/cancel mission B through item A (CONTROL-R6-FOREIGN-MISSION).
+
+## R6 focused evidence — 9 new tests (P14: 84/84)
+
+- **QUAR-R6-AUTOASSIGN**: corrupt READY child + autoAssign →
+  `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`, code unchanged, no
+  `WORK_ITEM_BLOCKED` laundering.
+- **SYNC-R6-WRONG-WORK**: A's COMPLETED mission planted as B's last id →
+  sync quarantines B, stays IN_PROGRESS, dep stays BACKLOG.
+- **SYNC-R6-WRONG-BUSINESS**: cross-business mission → same fail-closed.
+- **PARENT-R6-UNBOUND-MISSION**: parked parent + foreign last mission +
+  all children DONE legitimately → parent stays `IN_PROGRESS/
+  CHILD_INCOMPLETE`.
+- **DEP-R6-UNGROUNDED-DONE-NO-SWEEP**: forced DONE without mission →
+  `depsSatisfied` false and `openWorkItem` throws
+  `FAIL_CLOSED_WORK_ITEM_DEPENDENCY` — no sweep required.
+- **PARENT-R6-UNGROUNDED-CHILD-NO-SWEEP**: sibling completes legit while
+  another child is forced-DONE → parent stays parked.
+- **DELEG-R6-FAKE-ROW**: key/by/to strings but nonexistent parent →
+  restart quarantines, zero `WORK_DELEGATED` emitted.
+- **DELEG-R6-BAD-DETERMINISTIC-ID**: valid-looking fields but
+  `id != WI_DL(parent,key)` → quarantined, no event repair.
+- **CONTROL-R6-FOREIGN-MISSION**: planted foreign live mission → block
+  does not pause it, cancel does not cancel it; both item transitions
+  still complete.
+
+## R6 validation
+
+| gate | result |
+|---|---|
+| P14 suite | **84/84 PASS** (9 new R6 tests) |
+| P13 | 67/67 · P12 71/71 · P11 103/103 · P9 79/79 |
+| typecheck | clean · build PASS |
+| audit | 0 high / 0 critical |
+| Node 22 full | 2007 pass / 2 env P5 probe (CodexCli executable absent — documented env gap) |
+| Node 20 full | **2009/0** |
+| verifyIntegrity | clean in every quarantine/sync/race/restart test |
+| concurrency | all worker_threads races still green (heartbeat one-owner, delegation/review convergence, finalize single-winner) |
+
+All R1–R5 closures unchanged; `PairEvidenceStore.immediate()` remains the
+single transaction authority; no second store/router/dispatcher.
+
+Classification: **`P14_REMEDIATED_R6_PENDING_AUDIT`** — DO NOT MERGE.
