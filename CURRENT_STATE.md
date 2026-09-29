@@ -199,7 +199,13 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   validator used by every provenance seam (R1 §5) — R2 §4 adds
   non-empty mission_id, lifecycle state ∈ INTENT|BOUND|ROLLED_BACK
   (unknown state can never reconcile into BOUND), payload-key identity,
-  and bidirectional assignee↔org_agent equality.
+  and bidirectional assignee↔org_agent equality. R3 §1 splits the
+  validator into explicit `mode: "ADMISSION"` (new-mission minting —
+  bound agent must currently be ACTIVE) vs `mode: "PROVENANCE"`
+  (proving an already-created mission — agent must resolve + same
+  business but PAUSED/TERMINATED cannot erase provenance); safety
+  actions, completion fold, review grounding and crash-adopt all run
+  PROVENANCE (R3 §3-§6).
 - **Proof derives from the binding, never metadata**:
   `missionBoundToWorkItem` requires BOUND binding + mission/work_item/
   business/project agreement; `syncWorkItem`, `blockWorkItem`,
@@ -214,8 +220,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   review state fails ACCEPT+REWORK closed with no decision evidence.
 - Evidence: `PAIR_OS_VNEXT_P14_FOUNDATION_V2_REPORT.md`; suite
   `pair-p14-foundation.test.ts` (FOUND-V2-* ×10 + FOUND-R1-* ×10 +
-  FOUND-R2-* ×8).
-  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R2_PENDING_AUDIT`**.
+  FOUND-R2-* ×8 + FOUND-R3-* ×7).
+  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R3_FINAL_PENDING_AUDIT`**.
 
 ## Not yet
 

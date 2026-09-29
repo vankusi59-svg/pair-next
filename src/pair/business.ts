@@ -436,6 +436,9 @@ export class BusinessLayer {
       forWorkItem: row,
       forMission: m,
       requireState: "BOUND",
+      // PROVENANCE: a mission validly bound earlier stays bound even if
+      // its agent is PAUSED/TERMINATED later (R3 §3).
+      mode: "PROVENANCE",
     }).ok;
   }
 
@@ -889,6 +892,10 @@ export class BusinessLayer {
       !validateWorkOpenBinding(this.store, binding, {
         forWorkItem: row,
         forMission: mission,
+        // PROVENANCE: crash-after-create adoption may land while the
+        // agent is already PAUSED — the mission was created under a
+        // valid admission; only provenance is being proven (R3 §6).
+        mode: "PROVENANCE",
       }).ok
     ) {
       this.quarantineWorkItem(row, `binding ${openId} failed canonical validation during reconcile`);

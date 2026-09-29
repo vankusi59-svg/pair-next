@@ -309,3 +309,51 @@ The canonical validator now additionally enforces:
 | Typecheck / build / audit | clean / PASS / 0 high |
 | `verifyIntegrity()` | clean on every suite entry |
 | Fresh-server E2E (PR #9 head) | pending — see PR comment |
+
+## 13. R3 remediation — ADMISSION vs PROVENANCE validation modes
+
+### §1 Two explicit modes on the canonical validator
+`validateWorkOpenBinding` now takes a required `mode`:
+
+- **`ADMISSION`** — minting a NEW bound mission. Requires the bound org
+  agent to be currently `ACTIVE`, in addition to every existing check
+  (identity, state, work item, business, project, scope, origin).
+- **`PROVENANCE`** — proving the origin/binding of an ALREADY-CREATED
+  mission. Requires the agent to still resolve and remain in the same
+  business, but **not** current `ACTIVE` status — a mission validly
+  created stays canonically bound when its agent is later PAUSED or
+  TERMINATED. Mutable status can never erase provenance.
+
+### §2 `startBoundMission` ordering
+1. PROVENANCE binding check (identity/state/scope).
+2. If the reserved mission exists → FULL validator `forMission` in
+   PROVENANCE mode → adopt the exact mission (R3 §6 crash-adopt works
+   even when the agent paused after create).
+3. Only when minting a NEW mission → ADMISSION check → PAUSED or
+   TERMINATED agent fails closed (`FAIL_CLOSED_BINDING_INVALID`), zero
+   mission created, binding remains INTENT (recoverable).
+
+### §3 PROVENANCE consumers
+`missionBoundToWorkItem`, `boundMissionForWorkItem` (hence
+`syncWorkItem`, `reviewWorkItem`, `blockWorkItem`, `cancelWorkItem`),
+and `reconcileOpenIntent` adoption all run PROVENANCE mode — safety
+actions still reach the real mission after an agent pause/terminate
+(R3 §4), and a completed mission still folds DONE (R3 §5).
+
+### §5 R3 tests — `pair-p14-foundation.test.ts` (+7, now 35)
+`FOUND-R3-PAUSED-PROOF`, `FOUND-R3-TERMINATED-PROOF`,
+`FOUND-R3-CANCEL-PAUSED`, `FOUND-R3-COMPLETE-PAUSED`,
+`FOUND-R3-ADMISSION-PAUSED` (board-level `FAIL_CLOSED_AGENT_INACTIVE` +
+seam-level `FAIL_CLOSED_BINDING_INVALID`, zero mission),
+`FOUND-R3-CRASH-ADOPT-PAUSED`, `FOUND-R3-HAPPY`.
+
+## 14. R3 validation
+
+| Surface | Result |
+|---|---|
+| Foundation V2 suite | **35/35** |
+| P13 / P12 / P11 / P9 | see CURRENT_STATE |
+| Full suite — Node 22 / Node 20 | see CURRENT_STATE |
+| Typecheck / build / audit | clean / PASS / 0 high |
+| `verifyIntegrity()` | clean on every suite entry |
+| Fresh-server E2E (PR #9 head) | pending — see PR comment |

@@ -966,3 +966,141 @@ describe("P14 FOUNDATION V2 R2 — sealed bound-mission authority", () => {
     ctx.store.verifyIntegrity();
   });
 });
+
+/* ----------------- P14 FOUNDATION V2 — R3 remediation ------------------
+ * ADMISSION vs PROVENANCE separation: mutable agent status is required
+ * only when minting a NEW bound mission; it can never erase the
+ * provenance of a mission that was validly created.
+ */
+
+describe("P14 FOUNDATION V2 R3 — admission vs provenance", () => {
+  it("FOUND-R3-PAUSED-PROOF: agent PAUSED after valid bind — provenance stays true", () => {
+    const { ctx, biz } = makeBizCtx("r3-pausedproof");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const mission = ctx.store.get("mission", String((opened.mission_ids as string[])[0]));
+    biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
+    const row = ctx.store.get("work_item", String(w.work_item_id));
+    expect(biz.missionBoundToWorkItem(row, mission)).toBe(true);
+    expect(row.blocked_code ?? null).toBeNull();
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R3-TERMINATED-PROOF: agent TERMINATED after valid bind — historical binding stays valid", () => {
+    const { ctx, biz } = makeBizCtx("r3-termproof");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const mission = ctx.store.get("mission", String((opened.mission_ids as string[])[0]));
+    biz.setOrgAgentStatus(String(lead.agent_id), "TERMINATED", "op");
+    const row = ctx.store.get("work_item", String(w.work_item_id));
+    expect(biz.missionBoundToWorkItem(row, mission)).toBe(true);
+    expect(row.blocked_code ?? null).toBeNull();
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R3-CANCEL-PAUSED: cancelWorkItem still reaches the real mission after agent pause", () => {
+    const { ctx, biz } = makeBizCtx("r3-cancelpaused");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const mid = String((opened.mission_ids as string[])[0]);
+    biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
+    const cancelled = biz.cancelWorkItem(String(w.work_item_id), "op");
+    expect(String(cancelled.status)).toBe("CANCELLED");
+    // The bound mission was actually cancelled — no live orphan left
+    // behind just because the agent's status changed.
+    expect(String(ctx.store.get("mission", mid).status)).toBe("CANCELLED");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R3-COMPLETE-PAUSED: completed mission folds after agent pause — no quarantine", () => {
+    const { ctx, biz } = makeBizCtx("r3-completepaused");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const mid = String((opened.mission_ids as string[])[0]);
+    const mRow = ctx.store.get("mission", mid);
+    mRow.status = "COMPLETED";
+    ctx.store.put("mission", mid, mRow, Number(mRow.version));
+    biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
+    const synced = biz.syncWorkItem(String(w.work_item_id));
+    expect(String(synced.status)).toBe("DONE");
+    expect(synced.blocked_code ?? null).toBeNull();
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R3-ADMISSION-PAUSED: PAUSED agent cannot mint a new bound mission", () => {
+    const { ctx, biz } = makeBizCtx("r3-admitpaused");
+    const b = makeBiz(biz, ctx.projectId);
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(agent.agent_id) });
+    // Layer 1 — the board-level open itself refuses an inactive agent
+    // before any binding is minted (P12 admission semantics preserved).
+    biz.setOrgAgentStatus(String(agent.agent_id), "PAUSED", "op");
+    expect(errCode(() => biz.openWorkItem(String(w.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_AGENT_INACTIVE");
+    expect(ctx.store.list("mission")).toHaveLength(0);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(0);
+    const row = ctx.store.get("work_item", String(w.work_item_id));
+    expect(row.pending_open_id ?? null).toBeNull();
+    // Layer 2 — seam-level ADMISSION: a binding created while ACTIVE,
+    // then the agent paused before the seam runs, still fails closed at
+    // startBoundMission — no mission minted; binding stays recoverable.
+    biz.setOrgAgentStatus(String(agent.agent_id), "ACTIVE", "op");
+    seedIntent(ctx, String(w.work_item_id), "OPI_admit", "MSN_admit");
+    biz.setOrgAgentStatus(String(agent.agent_id), "PAUSED", "op");
+    expect(errCode(() => ctx.control.startBoundMission({
+      binding_open_id: "OPI_admit", project_id: ctx.projectId,
+      goal: "x", operator_id: "op",
+    }))).toBe("FAIL_CLOSED_BINDING_INVALID");
+    expect(ctx.store.tryGet("mission", "MSN_admit")).toBeNull();
+    expect(String(ctx.store.get("work_open_binding", "OPI_admit").state)).toBe("INTENT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R3-CRASH-ADOPT-PAUSED: restart adopts the already-created mission despite later pause", () => {
+    const { dir, ctx, biz } = makeBizCtx("r3-crashadopt");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    const wid = String(w.work_item_id);
+    // Mission created while agent ACTIVE (origin proof stamped), crash
+    // hits before the link+BOUND landing.
+    const created = seedIntent(ctx, wid, "OPI_crashpause", "MSN_crashpause", { createMission: true });
+    expect(String(created!.bound_open_id)).toBe("OPI_crashpause");
+    biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
+    // Restart on the same DB — reconcile must adopt the exact existing
+    // mission; no duplicate may be minted.
+    const re = reopenBiz(dir);
+    re.biz.board(String(b.business_id));
+    const row = re.ctx.store.get("work_item", wid);
+    expect((row.mission_ids as string[])).toEqual(["MSN_crashpause"]);
+    expect(String(re.ctx.store.get("work_open_binding", "OPI_crashpause").state)).toBe("BOUND");
+    expect(re.ctx.store.list("mission")).toHaveLength(1);
+    expect(row.blocked_code ?? null).toBeNull();
+    re.ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R3-HAPPY: ACTIVE admission path unchanged — open, BOUND, fold", () => {
+    const { ctx, biz } = makeBizCtx("r3-happy");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const mid = String((opened.mission_ids as string[])[0]);
+    const mRow = ctx.store.get("mission", mid);
+    mRow.status = "COMPLETED";
+    ctx.store.put("mission", mid, mRow, Number(mRow.version));
+    const synced = biz.syncWorkItem(String(w.work_item_id));
+    expect(String(synced.status)).toBe("DONE");
+    const binding = ctx.store.list("work_open_binding")[0];
+    expect(String(binding.state)).toBe("BOUND");
+    ctx.store.verifyIntegrity();
+  });
+});

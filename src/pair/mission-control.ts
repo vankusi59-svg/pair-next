@@ -388,15 +388,61 @@ export class MissionControl {
     confirm_plan?: { digest: string };
   }): Record<string, unknown> {
     const openId = String(input.binding_open_id);
+    // Step 1 — the binding itself must be canonically valid (identity,
+    // state, work item, business, project, scope). PROVENANCE mode here:
+    // this check only proves the binding — the agent-ACTIVE requirement
+    // is enforced separately below, and ONLY for new-mission creation.
     const { binding, ok: bound, reason } = validateWorkOpenBindingById(
       this.deps.service.store,
       openId,
-      { requireState: "INTENT", expectedProjectId: String(input.project_id) },
+      {
+        requireState: "INTENT",
+        expectedProjectId: String(input.project_id),
+        mode: "PROVENANCE",
+      },
     );
     if (!bound || !binding) {
       throw new IntegrityError(
         "FAIL_CLOSED_BINDING_INVALID",
         `${openId}: ${reason ?? "canonical binding invalid"}`,
+      );
+    }
+    const reservedId = String(binding.mission_id);
+    const existing = this.deps.service.store.tryGet("mission", reservedId) as
+      | StoreRow
+      | null;
+    if (existing) {
+      // R2 §3 + R3 §6: crash-retry adoption requires the FULL canonical
+      // validation — origin proof alone is not sufficient — but in
+      // PROVENANCE mode: the mission already exists, so only its origin
+      // is being proven; a later-PAUSED/TERMINATED agent must not veto
+      // history. Any mismatch → no adoption, no BOUND.
+      const check = validateWorkOpenBindingById(this.deps.service.store, openId, {
+        requireState: "INTENT",
+        expectedProjectId: String(input.project_id),
+        forMission: existing,
+        mode: "PROVENANCE",
+      });
+      if (!check.ok) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MISSION_ORIGIN_CONFLICT",
+          `${reservedId} fails canonical binding validation: ${check.reason}`,
+        );
+      }
+      return existing;
+    }
+    // Step 2 — a NEW mission is about to be created: ADMISSION mode now
+    // requires the bound agent to be currently ACTIVE (R3 §2). A paused
+    // or terminated agent fails closed here — no mission is minted.
+    const admission = validateWorkOpenBindingById(this.deps.service.store, openId, {
+      requireState: "INTENT",
+      expectedProjectId: String(input.project_id),
+      mode: "ADMISSION",
+    });
+    if (!admission.ok) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BINDING_INVALID",
+        `${openId}: ${admission.reason ?? "canonical binding invalid"}`,
       );
     }
     // R2 §1: canonical context is DERIVED from the binding + its
@@ -429,27 +475,6 @@ export class MissionControl {
         );
       }
       metadata[key] = canonical;
-    }
-    const reservedId = String(binding.mission_id);
-    const existing = this.deps.service.store.tryGet("mission", reservedId) as
-      | StoreRow
-      | null;
-    if (existing) {
-      // R2 §3: crash-retry adoption requires the FULL canonical
-      // validation — origin proof alone is not sufficient. Only a
-      // mission provably created by THIS binding may be returned.
-      const check = validateWorkOpenBindingById(this.deps.service.store, openId, {
-        requireState: "INTENT",
-        expectedProjectId: String(input.project_id),
-        forMission: existing,
-      });
-      if (!check.ok) {
-        throw new IntegrityError(
-          "FAIL_CLOSED_MISSION_ORIGIN_CONFLICT",
-          `${reservedId} fails canonical binding validation: ${check.reason}`,
-        );
-      }
-      return existing;
     }
     return this.startMissionInternal({ ...input, metadata }, binding);
   }

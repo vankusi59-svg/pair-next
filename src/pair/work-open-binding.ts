@@ -38,8 +38,17 @@ const fail = (reason: string): OpenBindingCheck => ({ ok: false, reason });
  *                    top-level field).
  *   `expectedProjectId` — assert binding.project_id equals it.
  *   `requireState` — assert binding.state equals INTENT or BOUND.
+ *   `mode` — REQUIRED. `ADMISSION`: a NEW mission is being created —
+ *     the bound org agent must currently be ACTIVE (P12 admission
+ *     semantics). `PROVENANCE`: proving the historical origin/binding of
+ *     an already-created mission — the agent must still resolve and stay
+ *     in the same business, but its CURRENT status may be PAUSED or
+ *     TERMINATED; mutable status must never erase valid provenance
+ *     (R3 §1).
  */
 const BINDING_STATES = new Set(["INTENT", "BOUND", "ROLLED_BACK"]);
+
+type ValidationMode = "ADMISSION" | "PROVENANCE";
 
 export function validateWorkOpenBinding(
   store: PairEvidenceStore,
@@ -49,7 +58,8 @@ export function validateWorkOpenBinding(
     forMission?: StoreRow;
     expectedProjectId?: string;
     requireState?: "INTENT" | "BOUND";
-  } = {},
+    mode: ValidationMode;
+  },
 ): OpenBindingCheck {
   // Canonical identity must be well-formed (R2 §4): non-empty open_id,
   // non-empty reserved mission_id, a known lifecycle state — an unknown
@@ -94,7 +104,11 @@ export function validateWorkOpenBinding(
     if (String(agent.business_id) !== String(binding.business_id)) {
       return fail("org_agent outside binding business");
     }
-    if (String(agent.status) !== "ACTIVE") return fail("org_agent not ACTIVE");
+    // ACTIVE is an ADMISSION-only requirement — PAUSED/TERMINATED later
+    // must not unbind a mission that was validly created (R3 §1/§3).
+    if (opts.mode === "ADMISSION" && String(agent.status) !== "ACTIVE") {
+      return fail("org_agent not ACTIVE");
+    }
   }
   if (opts.forMission) {
     const m = opts.forMission;
@@ -118,7 +132,7 @@ export function validateWorkOpenBinding(
 export function validateWorkOpenBindingById(
   store: PairEvidenceStore,
   openId: string,
-  opts: Parameters<typeof validateWorkOpenBinding>[2] = {},
+  opts: Parameters<typeof validateWorkOpenBinding>[2],
 ): { binding: StoreRow | null } & OpenBindingCheck {
   const binding = store.tryGet("work_open_binding", openId) as StoreRow | null;
   if (!binding) return { binding: null, ...fail(`binding ${openId} does not exist`) };
