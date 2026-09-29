@@ -578,3 +578,115 @@ NO PROVEN DISPATCH         → current contract revalidation → NEW dispatch on
 
 `P12_REMEDIATED_R3_PENDING_AUDIT` — DO NOT MERGE; independent audit
 required. No P13/P14/P15 work performed or implied.
+
+---
+
+# R4 — Execution reconciliation identity + evidence durability closure
+
+Audit classification at R3 head `15ef68b`: `P12_BLOCKED`. R1–R3 accepted;
+R4 hardens reconciliation identity binding and audit durability ordering.
+
+## R4.1 Broad-catch defect (§1)
+
+R3's `reconcileProvenExecution` wrapped insert + event + evidence in one
+`catch { adopt-if-row-exists }` — ANY downstream failure (event/evidence
+persist, process crash) was misread as a CAS race, so the intent could
+promote to EXECUTION_PERSISTED with required reconciliation audit
+missing.
+
+Fixed shape:
+
+```
+try { insert executor_execution (put v0) }
+catch (e) {
+  if (e.code !== FAIL_CLOSED_VERSION_CONFLICT) throw   // real failures propagate
+  row = get(execution_id); assertExecutionIdentity(row)
+  ensureReconciliationEvidence(row); return row
+}
+emitReconciliationEvent(saved); emitReconciliationEvidence(saved)
+return saved
+```
+
+Event/evidence persistence is OUTSIDE the CAS catch. Its failure
+propagates: intent stays INTENT_RECORDED (recoverable) and the next pass
+repairs via the adoption branch. Test D injects a store.event failure
+after insert — propagates, intent unpromoted, retry succeeds without a
+second dispatch.
+
+## R4.2 Identity binding (§2/§4)
+
+`assertExecutionIdentity(exec, governed_task, executorId, executionId,
+governedTaskId)` compares: execution_id, governed_task_id, mission_id,
+task_id, executor_id, plan_revision, correlation_id — workspace only
+when both sides carry a value. Mismatch → audited
+`EXECUTION_RECONCILE_IDENTITY_MISMATCH` (mission evidence, field name
+only — no secrets) + `FAIL_CLOSED_EXECUTION_RECONCILE_IDENTITY_MISMATCH`.
+Applied to: pre-existing row under an evidence-provided id (§4), CAS
+loser adoption, and the EXECUTION_PERSISTED early return (§3). Stale
+adapter evidence, id collisions, and cross-task/cross-mission adoption
+all fail closed.
+
+## R4.3 Intent identity (§3/§6C)
+
+`assertIntentIdentity(intent, task, adapter, governedTaskId)` runs before
+any branch on intent state: the row keyed `INTENT_<gtid>` must carry the
+same governed_task_id and the dispatching executor_id. Mismatch → audited
+`FAIL_CLOSED_DISPATCH_INTENT_IDENTITY_MISMATCH` before adoption or any
+new dispatch.
+
+## R4.4 Evidence durability ordering (§5)
+
+```
+proven external execution
+  → canonical executor_execution durable
+  → EXECUTION_RECONCILED event + mission evidence durable
+  → ONLY THEN intent = EXECUTION_PERSISTED
+```
+
+`ensureReconciliationEvidence` detects each piece independently
+(listEvents/listEvidence) and emits only what is missing — at-least-once
+per append-only PairEvidenceStore conventions. Crash between row insert
+and evidence → next recovery adopts the row (identity-checked) and
+repairs audit before intent promotion (test E). Rows from a normal
+dispatch keep original canonical facts (no reconcile flags invented).
+
+## R4.5 Tests (5 new — describe P12.R4)
+
+- **A** evidence id collision: EXEC_X bound to GTASK_B, evidence claims
+  it for GTASK_A → IDENTITY_MISMATCH, 0 dispatch, intent INTENT_RECORDED,
+  EXEC_X untouched.
+- **B** EXECUTION_PERSISTED intent pointing at foreign EXEC_X → fail
+  closed; GTASK_B history never returned as GTASK_A's.
+- **C** intent key/payload mismatch → FAIL_CLOSED_DISPATCH_INTENT_
+  IDENTITY_MISMATCH before anything else.
+- **D** injected event-persist failure after insert → propagates; intent
+  stays INTENT_RECORDED; retry adopts + repairs + promotes; 0 dispatch.
+- **E** row present, reconcile audit absent → restart validates identity,
+  repairs event+evidence, promotes intent; integrity clean.
+- R3.A missing-local-row recovery and R3.B concurrent recovery re-run
+  and remain PASS (mandate §6F/G).
+
+## R4.6 Validation evidence
+
+- `tsc --noEmit` PASS · `pnpm build` PASS
+- P12 suite: **71/71** (66 + 5 R4) · P11 regression: **103/103**
+- Full suite Node 22.23.3: **1856 pass** / 2 pre-existing env-dependent
+  p5 probe failures / 24 skipped
+- Full suite Node 20.20.2: **1858 pass / 0 fail** / 24 skipped
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**
+- Contract CAS race + dispatch-recovery race (worker_threads): PASS
+- `verifyIntegrity`: clean
+
+## R4.7 Invariant preserved (§7)
+
+```
+PROVEN HISTORICAL DISPATCH → identity validate → reconcile/adopt
+                             → no current contract revalidation
+NO PROVEN DISPATCH           → assertAgentExecutionAllowed
+                             → adapter.dispatch only if authorized
+```
+
+## R4.8 Classification
+
+`P12_REMEDIATED_R4_PENDING_AUDIT` — DO NOT MERGE; independent audit
+required. No P13/P14/P15 work performed or implied.

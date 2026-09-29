@@ -46,7 +46,14 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   contract state); missing-local-row crash reconstructs the canonical
   executor_execution from proven evidence (insert-CAS, reconciled_at —
   never a fabricated dispatch_timestamp); `dispatched=true` without id
-  fails `FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE`.
+  fails `FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE`. R4: adoption now
+  identity-validates intent + execution rows (canonical binding:
+  task/mission/executor/plan_revision/correlation/workspace — mismatch
+  fails `FAIL_CLOSED_EXECUTION_RECONCILE_IDENTITY_MISMATCH` /
+  `FAIL_CLOSED_DISPATCH_INTENT_IDENTITY_MISMATCH`); insert CAS-conflict
+  is the ONLY adoptable race — event/evidence failures propagate and
+  leave the intent recoverable; reconciliation audit is durable before
+  intent promotion and self-repairs after a crash gap (at-least-once).
 - **Enforcement**: pin at `MissionControl.startMission` (contract id +
   version + digest in mission metadata), authoritative checks in
   `GovernedTaskGate.create_governed_task`, executor/route filtering in
@@ -58,8 +65,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - **API**: `GET|POST /api/org-agents/:id/contract`,
   `POST /api/org-agents/:id/contract/(enable|disable)`,
   `GET /api/org-agents/:id/effective-policy`.
-- Classification: `P12_REMEDIATED_R3_PENDING_AUDIT` — not merged; see
-  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1–R3.
+- Classification: `P12_REMEDIATED_R4_PENDING_AUDIT` — not merged; see
+  `PAIR_OS_VNEXT_P12_AGENT_EXECUTION_CONTRACT_REPORT.md` §R1–R4.
 
 ## Not yet
 

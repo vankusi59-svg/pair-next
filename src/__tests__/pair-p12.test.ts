@@ -1855,3 +1855,189 @@ describe("P12.R3 dispatch crash recovery", () => {
     expect(a.dispatched.length).toBe(0);
   });
 });
+
+/* ====== R4 — reconciliation identity + evidence durability ====== */
+
+/** Persist a foreign executor_execution row bound to another governed task. */
+function persistForeignExec(
+  ctx: Ctx,
+  mission: Record<string, unknown>,
+  adapter: ScriptedAdapter,
+  executionId: string,
+) {
+  const gov = persistValidated(ctx, mission, adapter);
+  const gtid = String(gov.governed_task_id);
+  ctx.store.put(
+    "executor_execution",
+    executionId,
+    {
+      execution_id: executionId,
+      governed_task_id: gtid,
+      mission_id: gov.mission_id,
+      task_id: gov.task_id,
+      executor_id: adapter.executor_id,
+      plan_revision: gov.plan_revision,
+      correlation_id: gov.correlation_id,
+      execution_state: "RUNNING",
+      dispatch_timestamp: utcnow(),
+      workspace: gov.workspace,
+      version: 0,
+    },
+    0,
+  );
+  return gtid;
+}
+
+describe("P12.R4 reconciliation identity + evidence durability", () => {
+  it("A. evidence id collision — EXEC bound to GTASK_B cannot be adopted for GTASK_A", () => {
+    const { ctx, biz } = makeBizCtx("r4a");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission: mA } = boundMission(ctx, aid, String(bz.business_id));
+    const { mission: mB } = boundMission(ctx, aid, String(bz.business_id));
+    const gtidA = persistCrashState(ctx, mA, a);
+    const gtidB = persistForeignExec(ctx, mB, a, "EXEC_X");
+    expect(gtidA).not.toBe(gtidB);
+    a.evidence[gtidA] = { dispatched: true, execution_id: "EXEC_X" };
+    expect(() => ctx.gate.dispatch_governed_task(a, gtidA)).toThrowError(
+      /FAIL_CLOSED_EXECUTION_RECONCILE_IDENTITY_MISMATCH/,
+    );
+    expect(a.dispatched.length).toBe(0);
+    const intent = ctx.store.get("executor_dispatch_intent", `INTENT_${gtidA}`);
+    expect(String(intent.state)).toBe("INTENT_RECORDED");
+    const execX = ctx.store.get("executor_execution", "EXEC_X");
+    expect(String(execX.governed_task_id)).toBe(gtidB); // unchanged
+  });
+
+  it("B. EXECUTION_PERSISTED intent pointing at a foreign execution fails closed", () => {
+    const { ctx, biz } = makeBizCtx("r4b");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission: mA } = boundMission(ctx, aid, String(bz.business_id));
+    const { mission: mB } = boundMission(ctx, aid, String(bz.business_id));
+    const gtidA = persistCrashState(ctx, mA, a);
+    persistForeignExec(ctx, mB, a, "EXEC_X");
+    const intentRow = ctx.store.get("executor_dispatch_intent", `INTENT_${gtidA}`);
+    ctx.store.put(
+      "executor_dispatch_intent",
+      `INTENT_${gtidA}`,
+      { ...intentRow, state: "EXECUTION_PERSISTED", execution_id: "EXEC_X" },
+      intentRow.version,
+    );
+    expect(() => ctx.gate.dispatch_governed_task(a, gtidA)).toThrowError(
+      /FAIL_CLOSED_EXECUTION_RECONCILE_IDENTITY_MISMATCH/,
+    );
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("C. intent payload mismatch (key GTASK_A, payload GTASK_B) fails closed first", () => {
+    const { ctx, biz } = makeBizCtx("r4c");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission: mA } = boundMission(ctx, aid, String(bz.business_id));
+    const { mission: mB } = boundMission(ctx, aid, String(bz.business_id));
+    const gtidA = persistCrashState(ctx, mA, a);
+    const gtidB = String(persistValidated(ctx, mB, a).governed_task_id);
+    const row = ctx.store.get("executor_dispatch_intent", `INTENT_${gtidA}`);
+    ctx.store.put(
+      "executor_dispatch_intent",
+      `INTENT_${gtidA}`,
+      { ...row, governed_task_id: gtidB },
+      row.version,
+    );
+    a.evidence[gtidA] = { dispatched: true, execution_id: "EXEC_Y" };
+    expect(() => ctx.gate.dispatch_governed_task(a, gtidA)).toThrowError(
+      /FAIL_CLOSED_DISPATCH_INTENT_IDENTITY_MISMATCH/,
+    );
+    expect(a.dispatched.length).toBe(0);
+  });
+
+  it("D. non-CAS failure after insert propagates; intent stays INTENT_RECORDED; retry repairs", () => {
+    const { ctx, biz } = makeBizCtx("r4d");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const gtid = persistCrashState(ctx, mission, a);
+    a.evidence[gtid] = { dispatched: true, execution_id: "EXEC_Z" };
+    const origEvent = ctx.store.event.bind(ctx.store);
+    ctx.store.event = () => { throw new Error("INJECTED_EVENT_FAILURE"); };
+    expect(() => ctx.gate.dispatch_governed_task(a, gtid)).toThrowError(
+      /INJECTED_EVENT_FAILURE/,
+    );
+    ctx.store.event = origEvent;
+    // row durable, intent NOT promoted
+    expect(ctx.store.tryGet("executor_execution", "EXEC_Z")).toBeTruthy();
+    const intent1 = ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`);
+    expect(String(intent1.state)).toBe("INTENT_RECORDED");
+    // retry: adopts + repairs missing audit, then promotes
+    const exec = ctx.gate.dispatch_governed_task(a, gtid);
+    expect(String(exec.execution_id)).toBe("EXEC_Z");
+    expect(a.dispatched.length).toBe(0);
+    const intent2 = ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`);
+    expect(String(intent2.state)).toBe("EXECUTION_PERSISTED");
+  });
+
+  it("E. crash after row insert, before reconcile evidence → restart repairs audit, no redispatch", () => {
+    const { ctx, biz } = makeBizCtx("r4e");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const bz = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(bz.business_id), title: "eng", department: "eng", operator_id: "op" });
+    const aid = String(ag.agent_id);
+    const { mission } = boundMission(ctx, aid, String(bz.business_id));
+    const gtid = persistCrashState(ctx, mission, a);
+    const gov = ctx.store.get("governed_task", gtid);
+    // canonical reconciled row present; event/evidence intentionally absent
+    ctx.store.put(
+      "executor_execution",
+      "EXEC_CRASH",
+      {
+        execution_id: "EXEC_CRASH",
+        governed_task_id: gtid,
+        mission_id: gov.mission_id,
+        task_id: gov.task_id,
+        executor_id: "EXEC_A",
+        plan_revision: gov.plan_revision,
+        correlation_id: gov.correlation_id,
+        execution_state: "RUNNING",
+        reconciled_from_dispatch_evidence: true,
+        reconciled_at: utcnow(),
+        workspace: gov.workspace,
+        version: 0,
+      },
+      0,
+    );
+    a.evidence[gtid] = { dispatched: true, execution_id: "EXEC_CRASH" };
+    const exec = ctx.gate.dispatch_governed_task(a, gtid);
+    expect(String(exec.execution_id)).toBe("EXEC_CRASH");
+    expect(a.dispatched.length).toBe(0);
+    expect(
+      ctx.store.listEvents("executor_execution", "EXEC_CRASH")
+        .some((e) => String(e.event_type) === "EXECUTION_RECONCILED"),
+    ).toBe(true);
+    const mid = String(mission.mission_id);
+    expect(
+      ctx.store.listEvidence(mid).some(
+        (e) =>
+          String(e.kind) === "EXECUTION_RECONCILED" &&
+          String((e.payload as Record<string, Record<string, unknown>>).payload.governed_task_id) === gtid,
+      ),
+    ).toBe(true);
+    const intent = ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`);
+    expect(String(intent.state)).toBe("EXECUTION_PERSISTED");
+    const integrity = ctx.store.verifyIntegrity() as Record<string, number>;
+    expect(integrity.errors ?? 0).toBe(0);
+  });
+});

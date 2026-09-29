@@ -536,9 +536,26 @@ export class GovernedTaskGate {
     const existingIntent = this.store.tryGet("executor_dispatch_intent", intentId);
     if (existingIntent) {
       const state = String(existingIntent.state);
+      // R4 §3/§6C: the persisted intent's own payload must match this
+      // governed task — a stale/tampered intent fails closed before any
+      // adoption or new dispatch. Historical execution bypasses CURRENT
+      // contract checks but never identity/provenance checks.
+      this.assertIntentIdentity(existingIntent, task, adapter, governedTaskId);
       if (state === "EXECUTION_PERSISTED" && existingIntent.execution_id) {
-        // Idempotent re-dispatch: return the existing execution.
-        return this.store.get("executor_execution", String(existingIntent.execution_id));
+        // Idempotent re-dispatch: return the existing execution — only
+        // after its canonical identity binds to this governed task.
+        const exec = this.store.get(
+          "executor_execution",
+          String(existingIntent.execution_id),
+        );
+        this.assertExecutionIdentity(
+          exec,
+          task,
+          adapter.executor_id,
+          String(existingIntent.execution_id),
+          governedTaskId,
+        );
+        return exec;
       }
       if (state === "INTENT_RECORDED") {
         // Previous dispatch crashed before persisting — consult evidence.
@@ -558,6 +575,9 @@ export class GovernedTaskGate {
             );
           }
           const evidenceExecId = String(evidence.execution_id);
+          // R4 §4: any pre-existing row under this id is identity-checked
+          // before adoption — stale/buggy adapter evidence or an id
+          // collision fails closed rather than adopting foreign history.
           const exec = this.reconcileProvenExecution(
             task,
             adapter,
@@ -661,11 +681,138 @@ export class GovernedTaskGate {
   }
 
   /**
-   * R3 §2/§6: reconstruct the canonical local executor_execution for a
-   * proven external dispatch when the local row is absent (crash between
-   * external dispatch and persistence). Insert-only CAS — a racing
-   * reconciler's row wins and is adopted verbatim. No fabricated
-   * dispatch_timestamp: `reconciled_at` records recovery time only.
+   * R4 §3/§6C: the intent entity keyed INTENT_<governedTaskId> must
+   * carry a matching governed_task_id and the dispatching executor.
+   * Anything else is malformed persisted state — fail closed.
+   */
+  private assertIntentIdentity(
+    intent: Record<string, unknown>,
+    task: Record<string, unknown>,
+    adapter: ExecutorAdapter,
+    governedTaskId: string,
+  ): void {
+    if (
+      String(intent.governed_task_id) === governedTaskId &&
+      String(intent.executor_id) === String(adapter.executor_id)
+    ) {
+      return;
+    }
+    this.store.appendEvidence(String(task.mission_id), "DISPATCH_INTENT_IDENTITY_MISMATCH", {
+      governed_task_id: governedTaskId,
+      intent_governed_task_id: String(intent.governed_task_id ?? ""),
+      intent_executor_id: String(intent.executor_id ?? ""),
+    });
+    throw new IntegrityError(
+      "FAIL_CLOSED_DISPATCH_INTENT_IDENTITY_MISMATCH",
+      governedTaskId,
+    );
+  }
+
+  /**
+   * R4 §2: an executor_execution row is only adoptable when its
+   * canonical identity binds to the governed task being recovered.
+   * Never trust an execution_id alone (stale adapter evidence, id
+   * collisions, malformed local state).
+   */
+  private assertExecutionIdentity(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    executorId: string,
+    executionId: string,
+    governedTaskId: string,
+  ): void {
+    const pairs: Array<[string, unknown, unknown]> = [
+      ["execution_id", exec.execution_id, executionId],
+      ["governed_task_id", exec.governed_task_id, governedTaskId],
+      ["mission_id", exec.mission_id, task.mission_id],
+      ["task_id", exec.task_id, task.task_id],
+      ["executor_id", exec.executor_id, executorId],
+      ["plan_revision", exec.plan_revision, task.plan_revision],
+      ["correlation_id", exec.correlation_id, task.correlation_id],
+    ];
+    const mismatch = pairs.find(
+      ([, actual, expected]) => String(actual ?? null) !== String(expected ?? null),
+    );
+    // Workspace only when both sides carry a meaningful value.
+    const wsMismatch =
+      exec.workspace != null &&
+      task.workspace != null &&
+      String(exec.workspace) !== String(task.workspace);
+    if (!mismatch && !wsMismatch) return;
+    const field = mismatch ? mismatch[0] : "workspace";
+    this.store.appendEvidence(
+      String(task.mission_id),
+      "EXECUTION_RECONCILE_IDENTITY_MISMATCH",
+      { governed_task_id: governedTaskId, execution_id: executionId, field },
+    );
+    throw new IntegrityError(
+      "FAIL_CLOSED_EXECUTION_RECONCILE_IDENTITY_MISMATCH",
+      `${governedTaskId}:${field}`,
+    );
+  }
+
+  private emitReconciliationEvent(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    governedTaskId: string,
+  ): void {
+    this.store.event({
+      entity_type: "executor_execution",
+      entity_id: String(exec.execution_id),
+      event_type: "EXECUTION_RECONCILED",
+      new_state: String(exec.execution_state),
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: String(task.correlation_id),
+      metadata: { governed_task_id: governedTaskId },
+    });
+  }
+
+  private emitReconciliationEvidence(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    governedTaskId: string,
+  ): void {
+    this.store.appendEvidence(String(task.mission_id), "EXECUTION_RECONCILED", {
+      governed_task_id: governedTaskId,
+      execution_id: String(exec.execution_id),
+      executor_id: String(exec.executor_id),
+    });
+  }
+
+  /**
+   * R4 §5: at-least-once repair for a canonical row whose reconciliation
+   * audit was lost to a crash. Missing pieces are emitted independently;
+   * append-only store conventions make re-emission safe.
+   */
+  private ensureReconciliationEvidence(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    governedTaskId: string,
+  ): void {
+    const eid = String(exec.execution_id);
+    const hasEvent = this.store
+      .listEvents("executor_execution", eid)
+      .some((e) => String(e.event_type) === "EXECUTION_RECONCILED");
+    if (!hasEvent) this.emitReconciliationEvent(exec, task, governedTaskId);
+    const hasEvidence = this.store.listEvidence(String(task.mission_id)).some((e) => {
+      if (String(e.kind) !== "EXECUTION_RECONCILED") return false;
+      const inner = (e.payload as Record<string, unknown> | undefined)?.payload as
+        | Record<string, unknown>
+        | undefined;
+      return String(inner?.governed_task_id) === governedTaskId;
+    });
+    if (!hasEvidence) this.emitReconciliationEvidence(exec, task, governedTaskId);
+  }
+
+  /**
+   * R3 §2/§6 + R4 §1/§5: reconstruct the canonical local
+   * executor_execution for a proven external dispatch when the local row
+   * is absent (crash between external dispatch and persistence).
+   * Insert-only CAS — ONLY FAIL_CLOSED_VERSION_CONFLICT adopts the
+   * winner's row (after identity validation); every other failure
+   * propagates so the intent stays INTENT_RECORDED and recoverable.
+   * No fabricated dispatch_timestamp: `reconciled_at` records recovery
+   * time only.
    */
   private reconcileProvenExecution(
     task: Record<string, unknown>,
@@ -674,7 +821,17 @@ export class GovernedTaskGate {
     governedTaskId: string,
   ): Record<string, unknown> {
     const existing = this.store.tryGet("executor_execution", executionId);
-    if (existing) return existing;
+    if (existing) {
+      this.assertExecutionIdentity(
+        existing,
+        task,
+        adapter.executor_id,
+        executionId,
+        governedTaskId,
+      );
+      this.ensureReconciliationEvidence(existing, task, governedTaskId);
+      return existing;
+    }
     let observed: string | null = null;
     try {
       const ob = adapter.observe?.(executionId);
@@ -696,29 +853,33 @@ export class GovernedTaskGate {
       workspace: task.workspace,
       version: 0,
     };
+    let saved: Record<string, unknown>;
     try {
-      const saved = this.store.put("executor_execution", executionId, entity, 0);
-      this.store.event({
-        entity_type: "executor_execution",
-        entity_id: executionId,
-        event_type: "EXECUTION_RECONCILED",
-        new_state: String(saved.execution_state),
-        actor: "PAIR_GOVERNED_TASK_GATE",
-        correlation_id: String(task.correlation_id),
-        metadata: { governed_task_id: governedTaskId },
-      });
-      this.store.appendEvidence(String(task.mission_id), "EXECUTION_RECONCILED", {
-        governed_task_id: governedTaskId,
-        execution_id: executionId,
-        executor_id: adapter.executor_id,
-      });
-      return saved;
-    } catch {
-      // Insert CAS lost to a concurrent reconciler — adopt the canonical row.
-      const row = this.store.tryGet("executor_execution", executionId);
-      if (row) return row;
-      throw new IntegrityError("FAIL_CLOSED_EXECUTION_RECONCILE_CONFLICT", executionId);
+      saved = this.store.put("executor_execution", executionId, entity, 0);
+    } catch (e) {
+      // R4 §1: only the insert CAS conflict means "someone else
+      // reconciled first". Every other failure propagates — the intent
+      // must NOT promote while local state is undefined.
+      if ((e as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") {
+        throw e;
+      }
+      const row = this.store.get("executor_execution", executionId);
+      this.assertExecutionIdentity(
+        row,
+        task,
+        adapter.executor_id,
+        executionId,
+        governedTaskId,
+      );
+      this.ensureReconciliationEvidence(row, task, governedTaskId);
+      return row;
     }
+    // Canonical row durable — now the reconciliation audit MUST persist
+    // before the caller promotes the intent. A failure here propagates;
+    // the next recovery pass repairs via the adoption branch above.
+    this.emitReconciliationEvent(saved, task, governedTaskId);
+    this.emitReconciliationEvidence(saved, task, governedTaskId);
+    return saved;
   }
 
   observe_execution(
