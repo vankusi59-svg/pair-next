@@ -383,6 +383,13 @@ export class MissionControl {
         throw e;
       }
     }
+    // P13: pin the mission's credential grant set — a snapshot of every
+    // ACTIVE secret_policy of its business (refs + allow-sets + policy
+    // provenance, never values). Later expansion never retro-broadens;
+    // revocation narrows via the live-policy check at fetch time.
+    metadata.secret_grants = this.deps.service.secretPolicies.pinForMission({
+      businessId: metadata.business_id ? String(metadata.business_id) : null,
+    });
     const mission = this.deps.service.createMission({
       project_id: input.project_id,
       goal: input.goal,
@@ -430,6 +437,76 @@ export class MissionControl {
   deny(approvalId: string, operatorId: string | undefined, scope: Record<string, unknown>, reason?: string) {
     const op = requireOperator(operatorId);
     return this.deps.approvals.decide(approvalId, op, "DENIED", scope, reason);
+  }
+
+  /**
+   * P13 broker-fetch authority: ordered fail-closed checks for a
+   * credential release. Missions, tasks and their binding are canonical
+   * facts; the secret_policy + mission pin + current policy intersect
+   * decides, and every denial is audited with its reason.
+   */
+  authorizeCredentialFetch(
+    missionId: string,
+    taskId: string,
+    credentialRef: string,
+  ): { granted: boolean; reason: string } {
+    const mission = this.deps.service.store.tryGet("mission", missionId);
+    if (!mission) {
+      this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_MISSION_NOT_FOUND");
+      return { granted: false, reason: "FAIL_CLOSED_MISSION_NOT_FOUND" };
+    }
+    const task = this.deps.service.store.tryGet("task", taskId);
+    if (!task) {
+      this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_TASK_NOT_FOUND");
+      return { granted: false, reason: "FAIL_CLOSED_TASK_NOT_FOUND" };
+    }
+    if (String(task.mission_id) !== missionId) {
+      this.auditSecretDeny(missionId, taskId, credentialRef, "FAIL_CLOSED_TASK_NOT_IN_MISSION");
+      return { granted: false, reason: "FAIL_CLOSED_TASK_NOT_IN_MISSION" };
+    }
+    const executorId = task.selected_executor ? String(task.selected_executor) : null;
+    const decision = this.deps.service.secretPolicies.authorizeRelease({
+      mission,
+      task,
+      credentialRef,
+      executorId,
+    });
+    if (!decision.granted) {
+      this.auditSecretDeny(missionId, taskId, credentialRef, decision.reason);
+      return { granted: false, reason: decision.reason };
+    }
+    this.deps.service.store.appendEvidence(missionId, "CREDENTIAL_RELEASE_GRANTED", {
+      credential_name: credentialRef,
+      task_id: taskId,
+      policy_id: decision.policy?.policy_id,
+      policy_version: decision.policy?.policy_version,
+      executor_id: executorId,
+    });
+    return { granted: true, reason: "GRANTED" };
+  }
+
+  private auditSecretDeny(
+    missionId: string,
+    taskId: string,
+    credentialRef: string,
+    reason: string,
+  ): void {
+    try {
+      this.deps.service.store.appendEvidence(missionId, "CREDENTIAL_RELEASE_DENIED", {
+        credential_name: credentialRef,
+        task_id: taskId,
+        reason,
+      });
+    } catch {
+      // mission may not exist — audit on the task axis instead
+      this.deps.service.store.event({
+        entity_type: "task",
+        entity_id: taskId,
+        event_type: "CREDENTIAL_RELEASE_DENIED",
+        actor: "PAIR_SECRET_GOVERNANCE",
+        metadata: { credential_name: credentialRef, reason },
+      });
+    }
   }
 
   /* ---------------- mission schedules ------------------------------------ */
@@ -512,7 +589,44 @@ export class MissionControl {
         process.env.PAIR_COST_HALT === "1" ||
         (this.deps.costHaltFile ? fs.existsSync(this.deps.costHaltFile) : false),
       schedules_active: this.deps.schedules?.list().filter((s) => s.enabled && !s.deleted).length ?? 0,
+      // P13 read model: monetary policies, usage by scope, live
+      // reservations, billing-mode breakdown, unpriced dispatches.
+      monetary: this.deps.service.cost.position(),
     };
+  }
+
+  /* ---------------- P13 cost + secret governance -------------------------- */
+
+  costPolicies(): Array<Record<string, unknown>> {
+    return this.deps.service.cost.listCostPolicies();
+  }
+
+  costProfiles(): Array<Record<string, unknown>> {
+    return this.deps.service.cost.listCostProfiles();
+  }
+
+  secretPolicies(): Array<Record<string, unknown>> {
+    return this.deps.service.secretPolicies.listPolicies();
+  }
+
+  upsertCostPolicy(body: Record<string, unknown>, actor: string, expectedVersion?: number) {
+    return this.deps.service.cost.upsertCostPolicy(body, actor, expectedVersion);
+  }
+
+  upsertCostProfile(body: Record<string, unknown>, actor: string, expectedVersion?: number) {
+    return this.deps.service.cost.upsertCostProfile(body, actor, expectedVersion);
+  }
+
+  createSecretPolicy(body: Record<string, unknown>, actor: string) {
+    return this.deps.service.secretPolicies.createPolicy(body, actor);
+  }
+
+  updateSecretPolicy(policyId: string, body: Record<string, unknown>, expectedVersion: number, actor: string) {
+    return this.deps.service.secretPolicies.updatePolicy(policyId, body, expectedVersion, actor);
+  }
+
+  revokeSecretPolicy(policyId: string, actor: string) {
+    return this.deps.service.secretPolicies.setPolicyStatus(policyId, "REVOKED", actor);
   }
 
   requestReconciliation(missionId: string, operatorId?: string, executionId?: string) {

@@ -319,29 +319,39 @@ export function createMissionControlServer(
         return void json(res, 200, { ok: true, path: dest, bytes: buf.length });
       }
 
-      // Broker fetch: remote executor releases a named credential. Narrow
-      // token auth; the credential must exist AND the mission must be known
-      // (fail-closed — no anonymous vault reads). Release is audited in the
-      // canonical event log; the value travels only in this response.
+      // Broker fetch: remote executor releases a named credential. The
+      // broker token is TRANSPORT auth only — P13 §25 additionally requires
+      // a valid mission+task binding, a mission-pinned grant, the current
+      // secret_policy, business isolation, scope, P12 executor check, and
+      // a vault value. Every denial audits with its reason; the value
+      // travels only in this response.
       if (isBrokerFetch) {
         if (!deps.broker || !deps.brokerToken || String(req.headers["x-broker-token"] ?? "") !== deps.brokerToken) {
           return void json(res, 403, { error: "UNAUTHORIZED_BROKER_TOKEN" });
         }
         const missionId = String(body.mission_id ?? "");
-        if (!c.missionOutboxDir(missionId)) {
-          // Audit the rejected fetch too — probing with a fake mission_id
-          // must leave the same trace as a denied credential name.
-          deps.broker.deny(String(body.credential_name ?? ""), {
+        const taskId = String(body.task_id ?? "");
+        const credentialName = String(body.credential_name ?? "");
+        const authz = c.authorizeCredentialFetch(missionId, taskId, credentialName);
+        if (!authz.granted) {
+          deps.broker.deny(credentialName, {
             mission_id: missionId || null,
-            task_id: String(body.task_id ?? "") || null,
+            task_id: taskId || null,
           });
-          return void json(res, 404, { error: "unknown mission_id" });
+          const notFound = /^FAIL_CLOSED_(MISSION|TASK)_/.test(authz.reason);
+          return void json(res, notFound ? 404 : 403, { error: authz.reason });
         }
-        const cred = deps.broker.release(String(body.credential_name ?? ""), {
+        const cred = deps.broker.release(credentialName, {
           mission_id: missionId,
-          task_id: String(body.task_id ?? "") || null,
+          task_id: taskId || null,
         });
-        if (!cred) return void json(res, 404, { error: "unknown credential" });
+        if (!cred) {
+          deps.broker.deny(credentialName, {
+            mission_id: missionId,
+            task_id: taskId || null,
+          });
+          return void json(res, 404, { error: "FAIL_CLOSED_CREDENTIAL_NOT_INSTALLED" });
+        }
         return void json(res, 200, {
           name: cred.name,
           kind: cred.kind,
@@ -386,6 +396,17 @@ export function createMissionControlServer(
       if (method === "GET" && p === "/api/schedules") return void json(res, 200, { schedules: c.schedules() });
       // Cost guard read model — remote spend usage vs the daily cap.
       if (method === "GET" && p === "/api/cost") return void json(res, 200, c.cost());
+      // P13 monetary + secret governance read models (metadata only —
+      // never credential values).
+      if (method === "GET" && p === "/api/cost-policies") {
+        return void json(res, 200, { cost_policies: c.costPolicies() });
+      }
+      if (method === "GET" && p === "/api/cost-profiles") {
+        return void json(res, 200, { cost_profiles: c.costProfiles() });
+      }
+      if (method === "GET" && p === "/api/secret-policies") {
+        return void json(res, 200, { secret_policies: c.secretPolicies() });
+      }
       // Operator credential management — MC-token gated (the gate above).
       // Values are write-only: list/upsert return metadata, never the secret.
       if (method === "GET" && p === "/api/credentials") {
@@ -413,6 +434,49 @@ export function createMissionControlServer(
       if (method === "POST" && p === "/api/credentials/delete") {
         if (!deps.broker) return void json(res, 404, { error: "broker not configured" });
         return void json(res, 200, { removed: deps.broker.remove(String(body.name ?? "")) });
+      }
+      // P13 governance mutations — operator + CAS + audited, metadata only.
+      if (method === "POST" && p === "/api/cost-policies") {
+        return void json(res, 200, c.upsertCostPolicy(body, `operator:${operator}`));
+      }
+      if (method === "POST" && p === "/api/cost-policies/update") {
+        return void json(
+          res,
+          200,
+          c.upsertCostPolicy(body, `operator:${operator}`, Number(body.expected_version ?? 0)),
+        );
+      }
+      if (method === "POST" && p === "/api/cost-profiles") {
+        return void json(res, 200, c.upsertCostProfile(body, `operator:${operator}`));
+      }
+      if (method === "POST" && p === "/api/cost-profiles/update") {
+        return void json(
+          res,
+          200,
+          c.upsertCostProfile(body, `operator:${operator}`, Number(body.expected_version ?? 0)),
+        );
+      }
+      if (method === "POST" && p === "/api/secret-policies") {
+        return void json(res, 200, c.createSecretPolicy(body, `operator:${operator}`));
+      }
+      if (method === "POST" && p === "/api/secret-policies/update") {
+        return void json(
+          res,
+          200,
+          c.updateSecretPolicy(
+            String(body.policy_id ?? ""),
+            body,
+            Number(body.expected_version ?? 0),
+            `operator:${operator}`,
+          ),
+        );
+      }
+      if (method === "POST" && p === "/api/secret-policies/revoke") {
+        return void json(
+          res,
+          200,
+          c.revokeSecretPolicy(String(body.policy_id ?? ""), `operator:${operator}`),
+        );
       }
       // §4.3 two-step submit: preview creates no state; confirm must carry
       // the exact plan digest the operator saw.

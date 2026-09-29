@@ -1,0 +1,299 @@
+# PAIR OS vNext — P13 COST + SECRETS GOVERNANCE REPORT
+
+## 1. Canonical starting SHA
+
+`f45837ee9fa538a91b70898c9fec858f9c8a4316` — the merge commit of P12 PR #5 on
+`main`, confirmed by `git rev-parse HEAD` before the first edit. All P13 work
+lives on the new branch `devin/1790669906-p13-cost-secrets-governance` against
+new PR. No merge performed.
+
+## 2. Current architecture discovered
+
+- `PairEvidenceStore` (better-sqlite3): all canonical entities, events,
+  governed evidence; `store.put` enforces CAS (`expectedVersion` → conditional
+  UPDATE / INSERT ON CONFLICT DO NOTHING → `FAIL_CLOSED_VERSION_CONFLICT`);
+  `store.immediate(fn)` = `BEGIN IMMEDIATE` transaction; `assertSecretFree`
+  already blocks raw secrets in canonical rows (P11).
+- `GovernedTaskGate` is the sole external-dispatch authority:
+  `create_governed_task` → `dispatch_governed_task` with the R2 pre-dispatch
+  `assertAgentExecutionAllowed` boundary and R3/R4 intent + reconciliation
+  identity semantics.
+- `MissionRouter` routes, `MissionControl` orchestrates,
+  `MissionScheduleService` + `BusinessLayer` sit on top.
+- `CredentialBroker`: local vault file (`<mc_dir>/vault.json`, chmod 600),
+  narrow `x-broker-token` transport auth on `POST /api/broker/fetch`, audited
+  grant/deny events. Before P13 the token alone released values — there was no
+  secret *authorization* layer.
+- P11 `budget_policy`/`budget_reservation` count *missions* (not USD).
+- `/api/cost` returned token-bucket telemetry only; no money semantics.
+
+## 3. Existing systems reused
+
+- `PairEvidenceStore` CAS + `store.immediate` atomic transactions.
+- `GovernedTaskGate` dispatch/intent/reconciliation machinery (unchanged).
+- `assertAgentExecutionAllowed` P12 final pre-dispatch boundary (cost checks
+  run *after* it and *before* `adapter.dispatch`).
+- `CredentialBroker` vault + transport token (unchanged as a vault/transport;
+  authorization layered on top, per §47 — no new vault, no KMS clone).
+- `effectiveForMission` P12 effective policy (secret release re-checks it —
+  grant never expands P12).
+- Mission `metadata` provenance pinning pattern (same mechanism as
+  `agent_contract` pin in P12).
+- `costHaltFile`/`PAIR_COST_HALT` P9 halt plumbing (preserved verbatim).
+
+## 4. Cost governance architecture
+
+`CostService` (`src/pair/cost.ts`), instantiated inside
+`PairControlPlane` (`service.cost`) so every caller shares one authority:
+
+- `upsertCostPolicy` / `upsertCostProfile` — validated, allow-listed fields,
+  CAS, audited (`COST_POLICY_CREATED`/`UPDATED`, profile events).
+- `assertAndReserve` — called by `dispatch_governed_task` after
+  `assertAgentExecutionAllowed`, immediately before `adapter.dispatch`.
+- `markCommitted` / `markReleased` / `settle` / `settleFromResult` —
+  lifecycle transitions driven by canonical outcomes.
+- `reconcileForTask` / `reconcileAll` — crash/restart accounting derived only
+  from canonical evidence (dispatch intent state, `executor_execution`,
+  `dispatch_evidence`); never TTL, never memory.
+- `position()` — read model for `/api/cost`.
+
+New canonical entities (`COST_SCHEMA = "pair.os.vnext.cost.v1"`):
+
+- `cost_policy` `CPO_<ulid>`: business_id, scope_type
+  (business|department|agent|mission), scope_id, period
+  (DAY|WEEK|MONTH|MISSION_LIFETIME), max_microusd, hard_stop,
+  warning_threshold_pct, enabled, actor, created/updated, version.
+- `cost_profile` `CPRO_<refType>_<digest>`: ref_type (route|model|executor),
+  ref_id, provider_id, model_entry_id, route_id, billing_mode, currency,
+  fixed/reserve/input/output microusd, provenance, effective_at, status.
+- `cost_reservation` `CRSV_<governedTaskId>` (deterministic per dispatch):
+  business/department/agent/route ids, billing_mode, cost_profile_id,
+  reserved_microusd, actual_microusd, state HELD|COMMITTED|SETTLED|RELEASED,
+  unbounded flag, version.
+
+## 5. Monetary representation
+
+Integer `microusd` only — `assertMicrousd` rejects non-integers and negatives
+at every write path. No floats anywhere in cost code. Currency is USD only;
+any other `currency` value on a profile → `FAIL_CLOSED_COST_CURRENCY`.
+
+## 6. Cost profile / pricing provenance
+
+Profiles are operator/adapter-supplied *metadata* (`provenance` free-text +
+`effective_at` + `status`); no live vendor fetch ever happens in the stack.
+`billingFor(executorId, routeId)` resolves route→model→executor profile;
+`PAIR_NATIVE` executors default UNMETERED; missing profile → billing_mode
+UNKNOWN. METERED_API with neither `reserve_microusd` nor `fixed_microusd`
+is "unbounded" (no ceiling known).
+
+## 7. Cost reservation lifecycle
+
+`HELD` (created atomically inside the budget check txn) → `COMMITTED`
+(durable adapter dispatch) → `SETTLED` (authoritative actual usage known) or
+`RELEASED` (dispatch proven not to have happened / reconcile).
+`RELEASED`→`HELD` re-hold supports retry of the same governed task. Every
+transition is a CAS `transitionIfCurrent`; a CAS loser adopts the winner's
+row — same governed dispatch always lands on `CRSV_<gtid>` (§13 idempotency).
+Historical paths (`EXECUTION_PERSISTED`, proven INTENT_RECORDED) call
+`reconcileForTask` only — they never create a second reservation.
+
+## 8. Crash/restart accounting
+
+- Crash after reservation, before/during dispatch: row stays HELD; on the
+  next dispatch attempt `reconcileForTask` derives truth from intent +
+  `executor_execution` + `dispatch_evidence` (intent absent → RELEASED;
+  EXECUTION_PERSISTED or evidence dispatched → COMMITTED; evidence
+  dispatched=false → RELEASED; ambiguous → stays HELD — never guessed).
+- Crash after COMMITTED, before settle: `collect_execution_result` settles
+  on the next pass; unknown actual → stays COMMITTED with
+  `actual_state=ACTUAL_USAGE_UNKNOWN` (settle from reserved max or stay —
+  never under-count).
+- A proven external dispatch is never redispatched because cost accounting
+  crashed: R3/R4 idempotency still decides dispatch; cost reconcile only
+  accounts it.
+
+## 9. Billing mode semantics
+
+METERED_API (charged per use), SUBSCRIPTION (flat — tracked, never priced),
+FREE, UNMETERED (e.g. PAIR_NATIVE), UNKNOWN (never coerced to FREE; counted
+as `unpriced` in `/api/cost`). Under a hard policy, METERED_API-unbounded or
+UNKNOWN billing → fail closed (`FAIL_CLOSED_COST_UNBOUNDED`,
+`FAIL_CLOSED_COST_UNKNOWN`). SUBSCRIPTION/FREE/UNMETERED consume no USD and
+still get a reservation row for observability.
+
+## 10. Secret governance architecture
+
+`SecretPolicyService` (`src/pair/secret-policy.ts`) inside
+`PairControlPlane` (`service.secretPolicies`):
+
+- `secret_policy` `SPOL_<digest24(business:ref)>` — business-scoped, one per
+  (business, credential_reference_name); allow-sets
+  (agent/executor/project/route ids), allowed_purpose, status
+  ACTIVE|REVOKED, policy_version, actor, CAS version, digest over authority
+  fields.
+- `createPolicy` (dup → `FAIL_CLOSED_SECRET_POLICY_EXISTS`),
+  `updatePolicy`/`setPolicyStatus` — immutables business_id + ref;
+  `policy_version` increments; `SECRET_POLICY_CREATED/UPDATED/REVOKED`
+  events carry metadata only.
+- `authorizeRelease({mission, task, credentialRef, executorId})` — the
+  ordered fail-closed chain of §25.
+
+## 11. Mission secret pinning
+
+`MissionControl.startMission` pins `metadata.secret_grants` — a sorted
+snapshot `{credential_reference_name, policy_id, policy_version,
+policy_digest, allowed_*_ids, allowed_purpose}` for every ACTIVE policy of
+the mission's business (same provenance pattern as the P12 agent contract
+pin). Pin is fixed at mission creation: a policy created later is never
+visible to an old mission (K), and a widened policy later does not expand the
+pinned snapshot (K2) — effective grant = pinned ∩ current policy.
+
+## 12. Broker authorization flow
+
+`POST /api/broker/fetch` still requires `x-broker-token` (transport auth
+only). It now calls `MissionControl.authorizeCredentialFetch(missionId,
+taskId, ref)` which runs §25's chain: mission exists → task exists →
+task∈mission → pinned grant exists → policy exists → digest recomputed from
+pin fields == pin digest (`FAIL_CLOSED_SECRET_PIN_PROVENANCE`) → policy
+business == mission business (cross-business deny) → policy ACTIVE →
+pinned∩current allow-sets (agent/executor/project/route/purpose) → P12
+`effectiveForMission` (throws → `FAIL_CLOSED_SECRET_AGENT_POLICY`;
+`denied_executor_ids.has()` → `FAIL_CLOSED_SECRET_EXECUTOR_DENIED`).
+Grant → `CREDENTIAL_RELEASE_GRANTED` evidence + `broker.release`;
+deny → `CREDENTIAL_RELEASE_DENIED` evidence + `broker.deny` + 403
+(`FAIL_CLOSED_MISSION_*/TASK_*` map to 404 to preserve P11 API semantics).
+`broker.release` returning null (vault absent) → audited 404
+`FAIL_CLOSED_CREDENTIAL_NOT_INSTALLED`.
+
+## 13. Revocation semantics
+
+`setPolicyStatus(REVOKED)` / `updatePolicy` are CAS + audited; revocation
+narrows future releases immediately (J). Post-commit revoke cannot alter a
+release already granted — historical events preserved. `policy_version`
+increments on every mutation so a stale pin digest check and CAS both catch
+tamper (integrity tests: pin tamper → PIN_PROVENANCE; stale version →
+`FAIL_CLOSED_VERSION_CONFLICT`).
+
+## 14. P12 interaction
+
+Release re-runs `effectiveForMission` at fetch time, so a revoked agent
+contract or denied executor fails closed — a secret grant *never* expands
+P12 authority (I1, test P). Conversely cost/secret governance can only deny —
+they never make an unroutable executor/model/provider routable (I12; routing
+and `assertAgentExecutionAllowed` unchanged).
+
+## 15. Provider/model/route interaction
+
+`model_entry.cost_metadata` was not overloaded into a ledger; a dedicated
+`cost_profile` entity references route/model/executor refs. Profiles are
+data, not authority — they price or leave billing UNKNOWN; they never promote
+routes or models (I12, §32).
+
+## 16. Fail-closed matrix (§35)
+
+| Situation | Result |
+|---|---|
+| hard policy + METERED_API unbounded | `FAIL_CLOSED_COST_UNBOUNDED` |
+| hard policy + UNKNOWN billing | `FAIL_CLOSED_COST_UNKNOWN` |
+| usage ≥ hard cap | `FAIL_CLOSED_COST_BUDGET_EXCEEDED` (+event+evidence) |
+| PAIR_COST_HALT set/file present, cost-bearing dispatch | `FAIL_CLOSED_COST_HALT` |
+| non-USD currency | `FAIL_CLOSED_COST_CURRENCY` |
+| reservation CAS conflict | loser adopts canonical row |
+| unknown mission/task/cross-mission fetch | `FAIL_CLOSED_*` + audit |
+| ref not pinned / pin tampered / digest mismatch | deny + audit |
+| policy revoked / narrowed | deny + audit |
+| secret policy CAS conflict | `FAIL_CLOSED_VERSION_CONFLICT` |
+| unknown/ambiguous state | DENY/HELD, never proceed |
+
+## 17. Concurrency model
+
+- Budget check+reserve runs inside `store.immediate()` (`BEGIN IMMEDIATE`):
+  settled+COMMITTED+HELD+requested ≤ hard cap in one txn; loser throws —
+  overspend impossible even under workers (R1: two workers race the last
+  capacity — exactly one wins, one `FAIL_CLOSED_COST_BUDGET_EXCEEDED`, one
+  reservation row).
+- Reservation transitions are single-row CAS (`transitionIfCurrent`);
+  concurrent settle/reconcile converge on one row (R2).
+- Secret policy update is CAS (R3: two workers → one OK, one
+  `FAIL_CLOSED_VERSION_CONFLICT`).
+- Recovery derives from canonical evidence only — workers' reconcile stacks
+  all converge without a second external dispatch.
+
+## 18. Secret leakage test (§30)
+
+Sentinel `P13_SENTINEL_DO_NOT_LEAK_<random>` is installed in the vault and
+released once via the full authorized path. Assertions: the string appears
+only in `vault.json` and the release response; it appears in **no** canonical
+entity, event, governed evidence row, reservation, or `/api/cost` JSON
+(test O scans all of them). `assertSecretFree` in `store.put` additionally
+hard-blocks any entity payload containing a vault value.
+
+## 19. Test evidence
+
+`src/__tests__/pair-p13.test.ts` — **36 tests**, covering:
+
+- Cost: A lifecycle HELD→COMMITTED→SETTLED via collect_execution_result
+  actual_microusd; B business isolation; C stacked scopes
+  business/department/agent/mission; D hard cap deny; F warning threshold
+  evidence; G unbounded+hard → UNBOUNDED; G2 UNKNOWN+hard → UNKNOWN;
+  H subscription unpriced; I historical EXECUTION_PERSISTED reconcile only;
+  J crash-HELD recovery; K proven-no-dispatch RELEASED; L ambiguous stays
+  HELD; M unknown actual → COMMITTED/ACTUAL_USAGE_UNKNOWN; N committed
+  counts reserved; §18 halt env/file blocks cost-bearing only.
+- Secret: A grant; B NOT_PINNED; C/D/E mission/task/membership denials;
+  F cross-business; G pinned agent allow-list; H executor allow-set;
+  J revocation; K late policy unpinned; K2 pinned snapshot vs later widening;
+  L new mission pin; M vault absent → 404+audit; O sentinel scan; P P12 deny
+  boundary; integrity: pin tamper, stale CAS, project scope.
+- Worker races: R1 last-capacity reservation, R2 crash-reconcile convergence,
+  R3 secret-policy CAS — genuine `worker_threads` on a shared sqlite file via
+  an esbuilt bundle + SharedArrayBuffer barrier.
+
+## 20. Node 20 / Node 22 results
+
+- Node 22.23.3 `pnpm test`: **1892 pass / 2 fail / 24 skip** — the 2 failures
+  are the documented pre-existing environment-dependent p5 executor probes
+  (dsh/codex binaries present on this dev box); unchanged from the P12
+  baseline shape (baseline 1856+36 new).
+- Node 20.20.2 `npx vitest run`: **1894 pass / 0 fail / 24 skip** (after an
+  ABI rebuild of better-sqlite3@11.10.0; the .node binary was rebuilt per
+  Node ABI both ways).
+
+## 21. Security/audit results
+
+`pnpm audit --audit-level=high`: **0 high / 0 critical** (9 vulnerabilities
+remain at low/moderate — unchanged dependency posture). No secrets committed;
+sentinel only exists in test-local vault + response. `/api/cost` and policy
+endpoints expose metadata only — no secret material.
+
+## 22. Integrity results
+
+`PairEvidenceStore.verifyIntegrity` clean after every suite block (asserted
+in test O and across P11/P12 suites). No row is mutated without CAS; all
+entities carry schema + version.
+
+## 23. Known limitations
+
+- USD pricing accuracy depends entirely on operator-supplied `cost_profile`
+  provenance — there is deliberately no live vendor pricing fetch.
+- COMMITTED reservations with truly unknowable actual usage hold reserved_max
+  against the budget (never under-count) until `settle` is called.
+- FREE/UNMETERED dispatches proceed during cost halt; METERED_API/UNKNOWN are
+  blocked (documented §18 scope of the halt).
+- Department-scope policy requires ≥1 org_agent carrying the department tag
+  in that business.
+- The 2 pre-existing p5 probe env failures persist (environment binaries, not
+  code).
+
+## 24. Explicit P14/P15 non-scope
+
+No workforce scheduler, agent inbox/heartbeat, self-claim, peer delegation,
+task graph, reviewer workforce (P14). No CEO agent, objective generation, KPI
+loop, strategy/planning loop (P15). No Brain layer, ReasoningBrief, Brain
+Model Router, strategic memory. No payments/crypto. No Vault/KMS clone —
+existing CredentialBroker vault reused.
+
+## 25. Final classification
+
+**`P13_IMPLEMENTED_PENDING_AUDIT`** — pushed to the NEW P13 branch/PR;
+DO NOT MERGE; DO NOT START P14/P15.

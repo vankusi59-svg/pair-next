@@ -555,6 +555,9 @@ export class GovernedTaskGate {
           String(existingIntent.execution_id),
           governedTaskId,
         );
+        // P13: a proven historical execution reconciles its reservation
+        // to COMMITTED — never a new reservation, never a new dispatch.
+        this.service.cost.reconcileForTask(governedTaskId, adapter);
         return exec;
       }
       if (state === "INTENT_RECORDED") {
@@ -603,6 +606,8 @@ export class GovernedTaskGate {
               throw e;
             }
           }
+          // P13: proven historical dispatch → COMMIT the reservation.
+          this.service.cost.reconcileForTask(governedTaskId, adapter);
           return exec;
         }
       }
@@ -635,7 +640,26 @@ export class GovernedTaskGate {
       adapter.executor_id,
     );
 
-    const execution = adapter.dispatch(task, { actor: "PAIR_GOVERNED_TASK_GATE" });
+    // P13: atomic monetary authority — check + HELD reservation inside
+    // one transaction, after contract authority and before dispatch.
+    this.service.cost.assertAndReserve({
+      mission: predispatchMission,
+      task: predispatchTask,
+      governedTask: task,
+      executorId: adapter.executor_id,
+    });
+
+    let execution: Record<string, unknown>;
+    try {
+      execution = adapter.dispatch(task, { actor: "PAIR_GOVERNED_TASK_GATE" });
+    } catch (e) {
+      // Dispatch outcome is ambiguous unless adapter evidence proves it:
+      // proven dispatch → COMMITTED, proven no-dispatch → RELEASED,
+      // unknown → stays conservatively HELD for later reconciliation.
+      this.service.cost.reconcileForTask(governedTaskId, adapter);
+      throw e;
+    }
+    this.service.cost.markCommitted(governedTaskId);
     const executionId = String(execution.execution_id);
     const execEntity = this.store.put(
       "executor_execution",
@@ -911,6 +935,9 @@ export class GovernedTaskGate {
       }
     }
     execution.result = result;
+    // P13 §16: settle the reservation — adapter-proven figures settle
+    // exactly; unprovable usage stays COMMITTED at reserved maximum.
+    this.service.cost.settleFromResult(String(execution.governed_task_id), result);
     execution.result_state = result.status;
     execution.execution_state = result.status;
     const saved = this.store.put("executor_execution", executionId, execution, execution.version);

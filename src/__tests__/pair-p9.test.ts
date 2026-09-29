@@ -1491,11 +1491,31 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
       authorization: "Bearer mc-secret",
     };
     try {
+      // P13: a release needs a business-scoped secret_policy pinned to the
+      // mission + a canonical task inside it — a valid token alone denies.
+      const bizLayer = new BusinessLayer({
+        store: ctx.store,
+        control: ctx.control,
+        schedules: new MissionScheduleService(ctx.service),
+      });
+      const biz = bizLayer.createBusiness({ name: "B", project_id: ctx.projectId, operator_id: "op" });
+      ctx.service.secretPolicies.createPolicy(
+        { credential_reference_name: "github", business_id: String(biz.business_id) },
+        "op",
+      );
       const mres = await fetch(`http://127.0.0.1:${port}/api/missions`, {
         method: "POST", headers: mcHdr,
-        body: JSON.stringify({ project_id: ctx.projectId, goal: "cred test" }),
+        body: JSON.stringify({ project_id: ctx.projectId, goal: "cred test", metadata: { business_id: String(biz.business_id) } }),
       });
       const mission = (await mres.json()) as Record<string, unknown>;
+      // canonical task inside the mission — broker fetch requires task∈mission
+      const commit = ctx.service.commitPlan({
+        mission_id: String(mission.mission_id),
+        source: "test",
+        tasks: [{ task_key: "T2", title: "t2", task_instruction: "x", required_capabilities: [], depends_on: [] }],
+        proposal: { tasks: [] },
+      });
+      const fetchTaskId = String(commit.task_ids[0]);
 
       // operator installs a credential — response carries metadata only
       const up = await fetch(`http://127.0.0.1:${port}/api/credentials`, {
@@ -1518,7 +1538,7 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
         fetch(`http://127.0.0.1:${port}/api/broker/fetch`, {
           method: "POST",
           headers: { "content-type": "application/json", ...hdrs },
-          body: JSON.stringify({ mission_id: mission.mission_id, task_id: "T2", ...body }),
+          body: JSON.stringify({ mission_id: mission.mission_id, task_id: fetchTaskId, ...body }),
         });
       // MC bearer does not open the broker; wrong token rejected
       expect((await fetchCred({ authorization: "Bearer mc-secret" }, { credential_name: "github" })).status).toBe(403);
@@ -1530,8 +1550,8 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
           body: JSON.stringify({ mission_id: "MSN_NOPE", credential_name: "github" }),
         })).status,
       ).toBe(404);
-      // unknown credential → 404 + denied audit
-      expect((await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "nope" })).status).toBe(404);
+      // credential never pinned to this mission → denied + audited
+      expect((await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "nope" })).status).toBe(403);
       // legit release → value + audit
       const rel = (await (await fetchCred({ "x-broker-token": "broker-secret" }, { credential_name: "github" })).json()) as Record<string, unknown>;
       expect(rel.value).toBe("ghp_SUPERSECRET");

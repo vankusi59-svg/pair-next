@@ -73,10 +73,44 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   1856/2env, typecheck+build PASS, audit 0 high, races PASS, integrity
   clean. Still unmerged per manual-merge governance.
 
+### P13 — cost + secrets governance
+
+- **Cost authority** (`src/pair/cost.ts`, `CostService` in
+  `PairControlPlane`): `cost_policy` (business/department/agent/mission
+  scope; DAY/WEEK/MONTH/MISSION_LIFETIME period; max_microusd + hard_stop +
+  warning_threshold), `cost_profile` (versioned pricing refs to
+  route/model/executor; billing modes METERED_API/SUBSCRIPTION/FREE/
+  UNMETERED/UNKNOWN; USD integer microusd only), `cost_reservation`
+  `CRSV_<governedTaskId>` with lifecycle HELD→COMMITTED→SETTLED|RELEASED.
+  Atomic check+reserve inside `store.immediate()` (settled+committed+held
+  +requested ≤ hard cap in one txn); reconcile derives only from canonical
+  dispatch intent + executor_execution + dispatch_evidence — proven
+  dispatches are re-accounted, never redispatched; historical execution is
+  never double-charged. Hard policy + unbounded METERED_API or UNKNOWN
+  billing → fail closed. `PAIR_COST_HALT`/`costHaltFile` preserved — blocks
+  new cost-bearing dispatch only.
+- **Secret authority** (`src/pair/secret-policy.ts`): `secret_policy`
+  per (business, credential_reference_name) with allow-sets
+  (agent/executor/project/route) + purpose; missions pin a snapshot
+  (`metadata.secret_grants`) at `startMission` — pinned ∩ current policy
+  governs every fetch. `POST /api/broker/fetch` now requires
+  `authorizeCredentialFetch` (mission/task/ownership → pin → digest
+  provenance → business isolation → ACTIVE + narrowed allow-sets → P12
+  `effectiveForMission`) before `broker.release`; denials audited with
+  metadata only. Broker token remains transport auth, never authorization.
+- **API**: `/api/cost` position adds `monetary` (usage by scope,
+  HELD/COMMITTED, settled, billing breakdown, unpriced, halt, warnings);
+  `GET|POST /api/cost-policies`, `GET|POST /api/cost-profiles`,
+  `GET|POST /api/secret-policies` (+`update`/`revoke`).
+- Classification: **`P13_IMPLEMENTED_PENDING_AUDIT`** on the NEW P13
+  branch/PR; evidence in
+  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 36/36,
+  P12 71/71, P11 103/103, N20 1894/0, N22 1892/2env, typecheck+build PASS,
+  audit 0 high, worker races PASS, verifyIntegrity clean. NOT merged.
+
 ## Not yet
 
-- Token/USD cost ledger + scoped credential capabilities (P13),
-  autonomous heartbeat/inbox/delegation (P14), CEO agent / KPI gap
+- Autonomous heartbeat/inbox/delegation (P14), CEO agent / KPI gap
   analysis (P15). Intentionally deferred.
 
 ## Release governance (current policy)
