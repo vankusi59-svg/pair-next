@@ -834,5 +834,9 @@ semantics for sub-8 values are preserved for active and retired records.
 
 ## R6.5 Classification
 
-**`P13_REMEDIATED_R6_PENDING_AUDIT`** — pushed to the existing P13 PR;
-DO NOT MERGE; DO NOT START P14/P15.
+**`P13_OFFICIAL_FINAL_PASS`**
+
+- Merged PR: `#6`
+- Independently audited R6 head: `6e01b061439cba16ae78b775a464713a9152728a`
+- Canonical P13 merge / `main` authority: `916a0b92b2e8e122eb7e4e7e76ae36962add21d1`
+- Independent audit result: `P13_R6_INDEPENDENT_AUDIT_PASS`

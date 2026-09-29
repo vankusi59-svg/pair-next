@@ -153,12 +153,14 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   at startup alongside active values, never releasable or listed; vault
   `load()` is fail-closed (`FAIL_CLOSED_CREDENTIAL_VAULT_INVALID`) on
   malformed JSON/records instead of silently loading `{}`.
-- Classification: **`P13_REMEDIATED_R6_PENDING_AUDIT`** on the P13
-  branch/PR; evidence in
+- Classification: **`P13_OFFICIAL_FINAL_PASS`**. PR #6 merged into
+  `main` at `916a0b92b2e8e122eb7e4e7e76ae36962add21d1`; independently
+  audited R6 head `6e01b061439cba16ae78b775a464713a9152728a`;
+  independent audit result `P13_R6_INDEPENDENT_AUDIT_PASS`. Evidence in
   `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 67/67,
   P12 71/71, P11 103/103, P9 79/79, N20 1925/0, N22 1923/2env,
   typecheck+build PASS, audit 0 high, worker races PASS, verifyIntegrity
-  clean. NOT merged.
+  clean.
 
 ## Not yet
 
