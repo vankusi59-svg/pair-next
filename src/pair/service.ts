@@ -90,9 +90,12 @@ export class PairControlPlane {
     risk_ceiling?: string;
     execution_mode?: string;
     metadata?: Record<string, unknown>;
+    /** P14-RB: a canonical binding may pin the mission id pre-creation —
+     *  a collision fails closed on the version-0 insert, never overwrites. */
+    mission_id?: string;
   }): Record<string, unknown> {
     const project = this.getProject(params.project_id);
-    const missionId = newId("MSN");
+    const missionId = params.mission_id ?? newId("MSN");
     const authorized = (params.authorized_workspaces ?? [String(project.root_location)]).map(
       (p) => path.resolve(p),
     );

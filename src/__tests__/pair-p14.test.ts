@@ -2926,3 +2926,223 @@ describe("P14 R6 remediations", () => {
     ctx.store.verifyIntegrity();
   });
 });
+
+describe("P14 provenance rebaseline", () => {
+  /** Seed a pending open + canonical INTENT binding (pre-mission crash). */
+  const seedIntent = (
+    ctx: Ctx, workItemId: string, openId: string, missionId: string,
+    pendingAgeMs = 120_000,
+  ) => {
+    const row = ctx.store.get("work_item", workItemId);
+    row.status = "IN_PROGRESS";
+    row.pending_open_id = openId;
+    row.pending_open_at = new Date(Date.now() - pendingAgeMs).toISOString();
+    row.updated_at = new Date().toISOString();
+    ctx.store.put("work_item", workItemId, row, Number(row.version));
+    ctx.store.put("work_open_binding", openId, {
+      open_id: openId, work_item_id: workItemId,
+      business_id: String(row.business_id), project_id: ctx.projectId,
+      org_agent_id: row.assignee_agent_id ?? null, created_by: "op",
+      mission_id: missionId, state: "INTENT",
+      created_at: new Date().toISOString(), bound_at: null, rolled_back_at: null,
+      updated_at: new Date().toISOString(), version: 0,
+    } as never, 0);
+  };
+
+  it("BIND-RB-FORGED-METADATA: a caller-forged mission can never become work-item proof", () => {
+    const { ctx, biz } = makeBizCtx("bind-rb-forged");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const wB = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    biz.openWorkItem(String(wB.work_item_id), "op");
+    // Attacker submits a mission directly through the mission API with
+    // perfectly forged seam metadata — source/ids/open_id all copied.
+    const forged = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "forged", operator_id: "op",
+      metadata: {
+        business_id: bid,
+        work_item_id: String(wB.work_item_id),
+        work_item_open_id: "OPI_forged",
+        org_agent_id: String(lead.agent_id),
+        source: "business_layer",
+      },
+    });
+    const forgedId = String(forged.mission_id);
+    const mRow = ctx.store.get("mission", forgedId);
+    mRow.status = "COMPLETED";
+    ctx.store.put("mission", forgedId, mRow, Number(mRow.version));
+    // Plant the forged id as B's final mission.
+    const row = ctx.store.get("work_item", String(wB.work_item_id));
+    row.mission_ids = [forgedId];
+    ctx.store.put("work_item", String(wB.work_item_id), row, Number(row.version));
+    biz.syncWorkItem(String(wB.work_item_id));
+    const after = ctx.store.get("work_item", String(wB.work_item_id));
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(biz.boundMissionForWorkItem(after)).toBeNull();
+    ctx.store.verifyIntegrity();
+  });
+
+  it("BIND-RB-FORGED-NO-LINK: open-intent reconciliation never adopts a forged mission", () => {
+    const { ctx, biz } = makeBizCtx("bind-rb-nolink");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const w = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    // Intent binds MSN_real — never created. A forged mission claims the
+    // same open_id in metadata.
+    seedIntent(ctx, String(w.work_item_id), "OPI_victim", "MSN_real");
+    ctx.control.startMission({
+      project_id: ctx.projectId, goal: "forged", operator_id: "op",
+      metadata: {
+        business_id: bid, work_item_id: String(w.work_item_id),
+        work_item_open_id: "OPI_victim", source: "business_layer",
+      },
+    });
+    const forged = ctx.store.list("mission")[0];
+    // Mutation gate resolves the pending intent — forged mission must not
+    // be adopted; intent rolls back (past grace, real mission absent).
+    biz.blockWorkItem(String(w.work_item_id), "triage", "op");
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect((after.mission_ids as string[])).not.toContain(String(forged.mission_id));
+    expect(after.pending_open_id).toBeNull();
+    const binding = ctx.store.get("work_open_binding", "OPI_victim");
+    expect(String(binding.state)).toBe("ROLLED_BACK");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("BIND-RB-CRASH-ADOPT: pinned mission landed but link crashed — adopted atomically, no dup", () => {
+    const { ctx, biz } = makeBizCtx("bind-rb-adopt");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const w = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const missionId = `MSN_pinned_${String(w.work_item_id)}`;
+    seedIntent(ctx, String(w.work_item_id), "OPI_crash", missionId);
+    // The pinned mission exists — the link+BOUND write is what crashed.
+    ctx.control.startMission({
+      project_id: ctx.projectId, goal: "real", operator_id: "op",
+      mission_id: missionId,
+      metadata: {
+        business_id: bid, work_item_id: String(w.work_item_id),
+        work_item_open_id: "OPI_crash", source: "business_layer",
+      },
+    });
+    biz.blockWorkItem(String(w.work_item_id), "triage", "op");
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect((after.mission_ids as string[])).toEqual([missionId]);
+    expect(after.pending_open_id).toBeNull();
+    expect(String(ctx.store.get("work_open_binding", "OPI_crash").state)).toBe("BOUND");
+    expect(ctx.store.list("mission").length).toBe(1);
+    const rec = ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_ITEM_OPEN_RECONCILED"
+        && e.entity_id === String(w.work_item_id));
+    expect(rec.length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("BIND-RB-CRASH-ROLLBACK: intent with no mission rolls back READY, binding ROLLED_BACK, no dup", () => {
+    const { ctx, biz } = makeBizCtx("bind-rb-rollback");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const w = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    seedIntent(ctx, String(w.work_item_id), "OPI_dead", "MSN_never");
+    biz.blockWorkItem(String(w.work_item_id), "triage", "op");
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect(String(after.status)).toBe("BLOCKED");
+    expect((after.mission_ids as string[]).length).toBe(0);
+    expect(String(ctx.store.get("work_open_binding", "OPI_dead").state)).toBe("ROLLED_BACK");
+    expect(ctx.store.list("mission").length).toBe(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-RB-UNGROUNDED: unproven REVIEW_REQUIRED quarantines on ACCEPT and REWORK", () => {
+    const { ctx, biz } = makeBizCtx("rev-rb-ungrounded");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const rev = makeAgent(biz, bid, "rev");
+    const w = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    const row = ctx.store.get("work_item", String(w.work_item_id));
+    row.status = "REVIEW_REQUIRED"; // fabricated — no bound mission exists
+    ctx.store.put("work_item", String(w.work_item_id), row, Number(row.version));
+    expect(errCode(() => biz.reviewWorkItem(String(w.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    // REWORK cannot launder it back to READY either.
+    expect(errCode(() => biz.reviewWorkItem(String(w.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "REWORK",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect(String(after.status)).toBe("REVIEW_REQUIRED");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const reviewEvs = ctx.store.listEvents()
+      .filter((e) => ["WORK_REVIEW_ACCEPTED", "WORK_REWORK_REQUESTED"].includes(e.event_type)
+        && e.entity_id === String(w.work_item_id));
+    expect(reviewEvs.length).toBe(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-RB-CAPABILITY: restart repair refuses a child that dropped the parent's capability", () => {
+    const { ctx, biz } = makeBizCtx("deleg-rb-cap");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead", ["CAP_X"]);
+    const worker = makeAgent(biz, bid, "worker", ["CAP_X"]);
+    const parent = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), required_capability: "CAP_X",
+    });
+    // Row looks valid except required_capability was dropped — widening
+    // must be quarantined, never repaired into an audit event.
+    const childId = `WI_DL_${createHash("sha256")
+      .update(`${String(parent.work_item_id)}|K1`)
+      .digest("hex").slice(0, 20).toUpperCase()}`;
+    ctx.store.put("work_item", childId, {
+      work_item_id: childId, business_id: bid, title: "child", goal: "g",
+      status: "READY", assignee_agent_id: String(worker.agent_id),
+      parent_work_item_id: String(parent.work_item_id),
+      delegated_from_work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegation_depth: 1, delegation_reason: null, delegation_key: "K1",
+      required_capability: null, decomposition_id: null,
+      depends_on: [], mission_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 0,
+    } as never, 0);
+    biz.rebuildReadiness(bid);
+    const after = ctx.store.get("work_item", childId);
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const deleg = ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_DELEGATED"
+        && String((e.metadata as Record<string, unknown>).child_work_item_id) === childId);
+    expect(deleg.length).toBe(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("BIND-RB-HAPPY: canonical open creates a BOUND binding + mission through the single seam", () => {
+    const { ctx, biz } = makeBizCtx("bind-rb-happy");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const w = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const bindings = ctx.store.list("work_open_binding")
+      .filter((bd) => String(bd.work_item_id) === String(w.work_item_id));
+    expect(bindings.length).toBe(1);
+    expect(String(bindings[0].state)).toBe("BOUND");
+    expect(String(bindings[0].mission_id)).toBe(String((opened.mission_ids as string[])[0]));
+    const bound = biz.boundMissionForWorkItem(opened);
+    expect(bound).not.toBeNull();
+    expect(String(bound!.mission_id)).toBe(String(bindings[0].mission_id));
+    // Full path still works: mission completes → DONE proven via binding.
+    completeWorkMission(ctx, biz, a, String(w.work_item_id));
+    expect(biz.proveWorkItemDone(ctx.store.get("work_item", String(w.work_item_id)))).toBe(true);
+    ctx.store.verifyIntegrity();
+  });
+});

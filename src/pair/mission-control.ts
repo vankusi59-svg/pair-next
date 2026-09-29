@@ -349,6 +349,8 @@ export class MissionControl {
     authorized_workspaces?: string[];
     risk_ceiling?: string;
     operator_id?: string;
+    /** P14-RB: canonical binding-pinned mission id (business open seam). */
+    mission_id?: string;
     /** §4.3 two-step submit: the plan digest returned by previewMission. */
     confirm_plan?: { digest: string };
   }): Record<string, unknown> {
@@ -462,6 +464,7 @@ export class MissionControl {
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: input.authorized_workspaces,
       risk_ceiling: input.risk_ceiling,
+      mission_id: input.mission_id,
     });
     this.deps.runtime.runtimeEntity(String(mission.mission_id));
     this.deps.supervisor.wake(String(mission.mission_id), "MISSION_CREATED");

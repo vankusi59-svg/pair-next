@@ -549,15 +549,19 @@ export class BusinessLayer {
    * them depend on reconciliation having run first.
    */
 
-  /** Is mission `m` canonically bound to work item `row`? */
+  /** Is mission `m` canonically bound to work item `row`?
+   *  Rebaseline: proof derives ONLY from the durable `work_open_binding`
+   *  record the business layer created before the mission existed —
+   *  caller/model-supplied mission metadata is observability, never
+   *  authority, so a perfectly forged metadata block proves nothing. */
   missionBoundToWorkItem(row: Row, m: Row): boolean {
-    const md = (m.metadata as Record<string, unknown> | undefined) ?? {};
-    return (
-      String(md.work_item_id ?? "") === String(row.work_item_id) &&
-      String(md.business_id ?? "") === String(row.business_id) &&
-      String(md.source ?? "") === "business_layer" &&
-      Boolean(md.work_item_open_id)
-    );
+    const mids = (row.mission_ids as string[] | undefined) ?? [];
+    if (!mids.includes(String(m.mission_id))) return false;
+    return this.store.list("work_open_binding").some((b) =>
+      String(b.mission_id ?? "") === String(m.mission_id) &&
+      String(b.work_item_id) === String(row.work_item_id) &&
+      String(b.business_id) === String(row.business_id) &&
+      String(b.state) === "BOUND");
   }
 
   /** The row's last mission when it is canonically bound, else null. */
@@ -840,6 +844,9 @@ export class BusinessLayer {
             toAgent !== null && String(toAgent.business_id) === String(w.business_id) &&
             Number(w.delegation_depth ?? -1) === Number(parent.delegation_depth ?? 0) + 1 &&
             Number(w.delegation_depth) <= WORK_DELEGATION_DEPTH_CAP &&
+            // Rebaseline: repair never widens authority — the child must
+            // still carry the parent's required capability.
+            String(w.required_capability ?? "") === String(parent.required_capability ?? "") &&
             id === childNodeId("DL", String(parent.work_item_id), key);
           if (provenanceOk) {
             this.store.event({
@@ -1151,11 +1158,12 @@ export class BusinessLayer {
       }
     }
     // Durable open intent committed BEFORE mission creation: the transition
-    // write is the dedup point, and pending_open_id ties this intent to the
-    // mission it creates (metadata.work_item_open_id) so a crash at any
-    // boundary can be reconciled instead of silently duplicated or rolled
-    // back over a live mission.
+    // write is the dedup point, and the canonical `work_open_binding`
+    // record ties this intent to the mission it will create — the binding
+    // PINS the mission_id up front, so mission metadata can remain pure
+    // observability and can never itself constitute authority (rebaseline).
     const openId = newId("OPI");
+    const missionId = newId("MSN");
     row.status = "IN_PROGRESS";
     row.pending_open_id = openId;
     row.pending_open_at = utcnow();
@@ -1169,6 +1177,19 @@ export class BusinessLayer {
 
     let reservationId: string | null = null;
     try {
+      this.store.put("work_open_binding", openId, {
+        open_id: openId,
+        work_item_id: workItemId,
+        business_id: String(row.business_id),
+        project_id: String(business.project_id),
+        org_agent_id: agentId,
+        created_by: operatorId,
+        mission_id: missionId,
+        state: "INTENT",
+        created_at: utcnow(), bound_at: null, rolled_back_at: null,
+        updated_at: utcnow(),
+        version: 0,
+      } as Row, 0);
       reservationId = this.reserveBudget(String(row.business_id), String(row.department ?? ""), agentId, openId);
 
       // P12 §15: context injection respects the contract's
@@ -1200,6 +1221,7 @@ export class BusinessLayer {
       const mission = this.deps.control.startMission({
         project_id: String(business.project_id),
         goal,
+        mission_id: missionId,
         metadata: {
           business_id: String(row.business_id),
           work_item_id: workItemId,
@@ -1210,16 +1232,30 @@ export class BusinessLayer {
         },
         operator_id: operatorId,
       });
-      const missionId = String(mission.mission_id);
-      const linked = this.store.get("work_item", workItemId);
-      const linkedIds = linked.mission_ids as string[];
-      if (!linkedIds.includes(missionId)) linkedIds.push(missionId);
-      if (String(linked.pending_open_id ?? "") === openId) {
-        linked.pending_open_id = null;
-        linked.pending_open_at = null;
+      if (String(mission.mission_id) !== missionId) {
+        // Defensive: a startMission that ignored the pinned id would
+        // orphan this binding — fail the whole intent rather than drift.
+        throw new IntegrityError("FAIL_CLOSED_MISSION_PIN", "startMission did not honor the bound mission_id");
       }
-      linked.updated_at = utcnow();
-      const saved = this.store.put("work_item", workItemId, linked, Number(linked.version));
+      // Atomically link the row AND flip the binding to BOUND — the two
+      // are never allowed to disagree across a crash window.
+      const saved = this.store.immediate(() => {
+        const linked = this.store.get("work_item", workItemId);
+        const linkedIds = linked.mission_ids as string[];
+        if (!linkedIds.includes(missionId)) linkedIds.push(missionId);
+        if (String(linked.pending_open_id ?? "") === openId) {
+          linked.pending_open_id = null;
+          linked.pending_open_at = null;
+        }
+        linked.updated_at = utcnow();
+        const linkedSaved = this.store.put("work_item", workItemId, linked, Number(linked.version));
+        const binding = this.store.get("work_open_binding", openId);
+        binding.state = "BOUND";
+        binding.bound_at = utcnow();
+        binding.updated_at = utcnow();
+        this.store.put("work_open_binding", openId, binding, Number(binding.version));
+        return linkedSaved;
+      });
       if (reservationId) this.consumeBudgetReservation(reservationId);
       this.store.event({
         entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPENED",
@@ -1246,16 +1282,9 @@ export class BusinessLayer {
         curRow &&
         (err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT"
       ) {
-        const owned = new Set((curRow.mission_ids as string[] | undefined) ?? []);
-        const mine = this.store
-          .list("mission")
-          .some(
-            (m) =>
-              owned.has(String(m.mission_id)) &&
-              String(
-                (m.metadata as Record<string, unknown> | undefined)?.work_item_open_id ?? "",
-              ) === openId,
-          );
+        // Rebaseline: ownership is proven by the binding-pinned id, never
+        // by scanning mission metadata a caller could have forged.
+        const mine = ((curRow.mission_ids as string[] | undefined) ?? []).includes(missionId);
         if (mine) {
           if (reservationId) this.consumeBudgetReservation(reservationId);
           return curRow;
@@ -1327,6 +1356,15 @@ export class BusinessLayer {
     cur.pending_open_at = null;
     cur.updated_at = utcnow();
     this.store.put("work_item", workItemId, cur, Number(cur.version));
+    // Rebaseline: the binding records the intent never dispatched —
+    // ROLLED_BACK is durable, idempotent evidence of the decision.
+    const binding = this.store.tryGet("work_open_binding", openId);
+    if (binding && String(binding.state) === "INTENT") {
+      binding.state = "ROLLED_BACK";
+      binding.rolled_back_at = utcnow();
+      binding.updated_at = utcnow();
+      this.store.put("work_open_binding", openId, binding, Number(binding.version));
+    }
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
       old_state: "IN_PROGRESS", new_state: "READY", actor: `pair_reconcile:${actor}`,
@@ -1338,46 +1376,76 @@ export class BusinessLayer {
 
   /**
    * Link the mission belonging to an open intent back onto its work item.
-   * Deterministic and idempotent: returns the repaired row when a mission
-   * exists, null when provably none does. Used by the open catch path and
-   * by the restart sweep in reconcileOpenIntents.
+   * Rebaseline: mission discovery is driven ONLY by the canonical
+   * `work_open_binding` record — its pinned `mission_id` is the single
+   * authority for what this intent was allowed to create. Mission
+   * metadata is never scanned for linkage, so a forged mission claiming
+   * an open_id is never adopted. Deterministic and idempotent.
    */
   private reconcileOpenIntent(workItemId: string, openId: string, actor: string): Row | null {
     const row = this.store.tryGet("work_item", workItemId);
     if (!row) return null;
-    const owned = new Set((row.mission_ids as string[] | undefined) ?? []);
-    const orphan = this.store
-      .list("mission")
-      .filter((m) => {
-        const md = m.metadata as Record<string, unknown> | undefined;
-        if (owned.has(String(m.mission_id))) return false;
-        return (
-          String(md?.work_item_open_id ?? "") === openId ||
-          String(md?.work_item_id ?? "") === workItemId
-        );
-      })
-      .at(-1);
-    if (!orphan) return null;
-    (row.mission_ids as string[]).push(String(orphan.mission_id));
-    row.pending_open_id = null;
-    row.pending_open_at = null;
-    row.updated_at = utcnow();
+    const binding = this.store.tryGet("work_open_binding", openId);
+    if (!binding || String(binding.work_item_id) !== workItemId) {
+      // No canonical binding (a legacy pre-rebaseline intent, or a forged
+      // open id) → nothing may be linked for this intent.
+      return null;
+    }
+    if (String(binding.state) === "ROLLED_BACK") return null;
+    const missionId = String(binding.mission_id ?? "");
+    const mission = missionId ? this.store.tryGet("mission", missionId) : null;
+    if (!mission) {
+      if (String(binding.state) === "BOUND") {
+        // BOUND but the mission row is gone — the record itself is
+        // corrupt; fail closed, never guess a replacement.
+        this.quarantineWorkItem(row, `binding ${openId} BOUND but mission ${missionId} missing`);
+        return row;
+      }
+      return null; // INTENT, mission never landed — caller decides grace/rollback
+    }
+    // Fully landed already (BOUND + linked + marker cleared): nothing to
+    // repair — a null keeps the open catch path honest about whether the
+    // failure was inside the landing window or after it.
+    if (
+      String(binding.state) === "BOUND" &&
+      ((row.mission_ids as string[] | undefined) ?? []).includes(missionId) &&
+      !row.pending_open_id
+    ) {
+      return null;
+    }
+    // The pinned mission exists: link the row and flip INTENT→BOUND
+    // atomically (a crash between mission creation and the bound write is
+    // the only window this repairs — never a metadata guess).
     let saved: Row;
     try {
-      saved = this.store.put("work_item", workItemId, row, Number(row.version));
+      saved = this.store.immediate(() => {
+        const fresh = this.store.get("work_item", workItemId);
+        const ids = fresh.mission_ids as string[];
+        if (!ids.includes(missionId)) ids.push(missionId);
+        fresh.pending_open_id = null;
+        fresh.pending_open_at = null;
+        fresh.updated_at = utcnow();
+        const linked = this.store.put("work_item", workItemId, fresh, Number(fresh.version));
+        const b = this.store.get("work_open_binding", openId);
+        if (String(b.state) !== "BOUND") {
+          b.state = "BOUND";
+          b.bound_at = utcnow();
+          b.updated_at = utcnow();
+          this.store.put("work_open_binding", openId, b, Number(b.version));
+        }
+        return linked;
+      });
     } catch (err) {
       // A racing reconciler may have linked the same mission first — the
       // outcome is identical; return the fresh row instead of throwing.
       const fresh = this.store.get("work_item", workItemId);
-      if ((fresh.mission_ids as string[]).includes(String(orphan.mission_id))) {
-        return fresh;
-      }
+      if ((fresh.mission_ids as string[]).includes(missionId)) return fresh;
       throw err;
     }
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_RECONCILED",
-      new_state: String(row.status), actor: `pair_reconcile:${actor}`,
-      metadata: { open_id: openId, mission_id: String(orphan.mission_id) },
+      new_state: String(saved.status), actor: `pair_reconcile:${actor}`,
+      metadata: { open_id: openId, mission_id: missionId },
     });
     return saved;
   }
@@ -1462,6 +1530,18 @@ export class BusinessLayer {
       throw new IntegrityError(
         "FAIL_CLOSED_WORK_REVIEW_STATE",
         `${String(row.status)} is not awaiting review`,
+      );
+    }
+    // Rebaseline: a review may only decide on a REVIEW_REQUIRED produced
+    // by this item's own bound COMPLETED mission. An ungrounded
+    // REVIEW_REQUIRED quarantines instead of letting ACCEPT or REWORK
+    // act on fabricated state.
+    const boundMission = this.boundMissionForWorkItem(row);
+    if (!boundMission || String(boundMission.status) !== "COMPLETED") {
+      this.quarantineWorkItem(row, `review attempted on ungrounded REVIEW_REQUIRED for ${workItemId}`);
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+        `review requires a bound COMPLETED mission for ${workItemId}`,
       );
     }
     const reviewer = this.store.get("org_agent", input.reviewer_agent_id);

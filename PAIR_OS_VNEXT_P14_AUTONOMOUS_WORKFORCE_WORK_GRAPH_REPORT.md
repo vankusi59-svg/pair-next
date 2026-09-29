@@ -907,3 +907,104 @@ All R1–R5 closures unchanged; `PairEvidenceStore.immediate()` remains the
 single transaction authority; no second store/router/dispatcher.
 
 Classification: **`P14_REMEDIATED_R6_PENDING_AUDIT`** — DO NOT MERGE.
+
+---
+
+## PROVENANCE REBASELINE — durable canonical binding replaces metadata-as-authority
+
+Independent classification going in:
+`P14_R6_INDEPENDENT_AUDIT_BLOCKED` / `STOP_PATCHING` /
+`P14_PROVENANCE_REBASELINE_REQUIRED`. This is a foundation rebaseline, not
+an R7 hotfix: caller/model-supplied mission metadata may never itself
+constitute authority.
+
+### Canonical binding entity: `work_open_binding`
+
+A durable record created by `BusinessLayer` BEFORE `startMission` runs.
+One per open intent (`open_id` = PK):
+
+```
+{ open_id, work_item_id, business_id, project_id, org_agent_id,
+  created_by, mission_id, state, created_at, bound_at, rolled_back_at,
+  updated_at, version }
+```
+
+- `openWorkItem` mints `missionId = newId("MSN")` up front, writes the
+  binding in state `INTENT`, and passes `mission_id` down through
+  `startMission` → `createMission` (both now accept an optional pinned
+  id; the CAS version-0 insert fails closed on any collision, so a forged
+  or pre-existing mission can never claim a binding).
+- `startMission` honoring anything else throws `FAIL_CLOSED_MISSION_PIN`.
+- The work-item link AND `INTENT → BOUND` flip commit in ONE
+  `store.immediate()` — they cannot disagree across a crash window.
+- `mission_id` pinning means adoption needs zero metadata scanning: the
+  binding IS the authority for which mission this intent was allowed to
+  create.
+
+### Binding-driven proof
+
+- `missionBoundToWorkItem(row, m)`: `m.mission_id ∈ row.mission_ids` AND a
+  `work_open_binding` exists with `mission_id = m.mission_id`,
+  `work_item_id`, `business_id` matching, `state = BOUND`. Mission
+  metadata fields are no longer consulted — forged
+  `source=business_layer` + copied ids prove nothing.
+- `boundMissionForWorkItem`, `proveWorkItemDone`, `proveReviewAcceptance`
+  inherit the binding predicate unchanged (same canonical helpers every
+  authority seam already calls).
+- `reconcileOpenIntent`: binding-only discovery. `BOUND+linked` →
+  nothing to repair; `INTENT` + pinned mission exists → adopt atomically
+  (link + BOUND + `WORK_ITEM_OPEN_RECONCILED`); `INTENT` + no mission →
+  caller grace/rollback path; `BOUND` + mission row missing → quarantine;
+  NO binding → nothing may link (legacy intents roll back).
+- `resolvePendingOpenBeforeMutation` rollback marks the binding
+  `ROLLED_BACK` durably — the decision is idempotent evidence.
+- `reviewWorkItem`: after the REVIEW_REQUIRED status check, requires the
+  item's bound mission COMPLETED — an ungrounded REVIEW_REQUIRED
+  quarantines and fails `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` for both
+  ACCEPT and REWORK.
+- Restart delegation repair additionally requires
+  `child.required_capability === parent.required_capability` — repair can
+  never widen authority.
+
+### Adversarial coverage (7 new tests)
+
+- **BIND-RB-FORGED-METADATA**: direct mission API submission with fully
+  forged seam metadata + planted id → `syncWorkItem` quarantines, no fold.
+- **BIND-RB-FORGED-NO-LINK**: forged mission claiming the victim open_id
+  is never adopted by open-intent reconciliation.
+- **BIND-RB-CRASH-ADOPT**: pinned mission exists, link crashed → adopted
+  atomically, BOUND, one `WORK_ITEM_OPEN_RECONCILED`, zero dup missions.
+- **BIND-RB-CRASH-ROLLBACK**: intent without mission → READY rollback,
+  binding ROLLED_BACK, no mission row.
+- **REVIEW-RB-UNGROUNDED**: fabricated REVIEW_REQUIRED → ACCEPT + REWORK
+  both fail closed, quarantined, no review events.
+- **DELEG-RB-CAPABILITY**: delegated child dropping
+  `required_capability` → quarantined, no repaired `WORK_DELEGATED`.
+- **BIND-RB-HAPPY**: canonical open produces exactly one BOUND binding
+  whose mission_id is the row's linked mission; full happy path
+  (open → complete → proven DONE) unchanged.
+
+Fixtures updated to stamp the canonical seam shape a real crash always
+carries: `makeOrphanPending` (P11-R2) and the fi5 crash-open fixture
+(P11-R1) now create the `work_open_binding` INTENT row and pass the
+pinned `mission_id` to `startMission`.
+
+### Rebaseline validation
+
+| gate | result |
+|---|---|
+| P14 suite | **91/91 PASS** (7 new rebaseline tests) |
+| P13 | 67/67 · P12 71/71 · P11 103/103 · P9 79/79 |
+| typecheck | clean · build PASS |
+| audit | 0 high / 0 critical |
+| Node 22 full | 2014 pass / 2 env P5 probe (CodexCli executable absent — documented env gap) |
+| Node 20 full | **2016/0** |
+| verifyIntegrity | clean in every quarantine/sync/race/restart test |
+| concurrency | all worker_threads races still green |
+
+All R1–R6 closures unchanged; `PairEvidenceStore.immediate()` remains the
+single transaction authority; one canonical MissionRouter/GovernedTaskGate
+path; no second store or dispatcher.
+
+Classification: **`P14_PROVENANCE_REBASELINED_PENDING_AUDIT`** —
+DO NOT MERGE.

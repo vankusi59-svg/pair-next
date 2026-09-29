@@ -36,6 +36,7 @@ import {
   ReconciliationService,
   RecoveryController,
   digest,
+  newId,
   nextRunAfter,
   utcnow,
 } from "../pair/index.js";
@@ -122,10 +123,23 @@ function makeOrphanPending(
   cur.pending_open_at = utcnow();
   cur.updated_at = utcnow();
   store.put("work_item", workItemId, cur, Number(cur.version));
+  // Provenance rebaseline: a real crash orphan always has its canonical
+  // binding INTENT with the mission_id pinned before creation — the
+  // business layer establishes identity before startMission runs.
+  const orphanMissionId = newId("MSN");
+  store.put("work_open_binding", openId, {
+    open_id: openId, work_item_id: workItemId,
+    business_id: String(cur.business_id), project_id: projectId,
+    org_agent_id: cur.assignee_agent_id ?? null, created_by: "op",
+    mission_id: orphanMissionId, state: "INTENT",
+    created_at: utcnow(), bound_at: null, rolled_back_at: null,
+    updated_at: utcnow(), version: 0,
+  } as never, 0);
   const mission = control.startMission({
     goal: "orphan",
     project_id: projectId,
     operator_id: "op",
+    mission_id: orphanMissionId,
     // Same canonical seam metadata openWorkItem stamps — a real crash
     // orphan always carries business_id + source + open id.
     metadata: {

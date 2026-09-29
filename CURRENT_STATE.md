@@ -206,9 +206,23 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `FAIL_CLOSED_PARENT_INCOMPLETE` on early ACCEPT); `agentInbox` strictly
   read-only (reconciliation on heartbeat/board seams); capability
   admission enforced at create/decompose/rebuild.
-- Classification: **`P14_REMEDIATED_R6_PENDING_AUDIT`** — branch
+- Classification: **`P14_PROVENANCE_REBASELINED_PENDING_AUDIT`** — branch
   `devin/1790682872-p14-autonomous-workforce`, DO NOT MERGE. Evidence in
-  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md` §R1–§R6.
+  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md` §R1–§RB.
+  Rebaseline: `work_open_binding` is the durable canonical authority —
+  `BusinessLayer` creates it BEFORE mission creation and pins
+  `mission_id` up front (`createMission`/`startMission` accept a pinned
+  id, CAS fails closed on collision, `FAIL_CLOSED_MISSION_PIN` guards the
+  pin); the row link and `INTENT → BOUND` flip commit in one
+  `store.immediate()`. All proof helpers (`missionBoundToWorkItem`,
+  `boundMissionForWorkItem`, `proveWorkItemDone`,
+  `proveReviewAcceptance`) derive from the binding — mission metadata is
+  observability only and can never constitute authority.
+  `reconcileOpenIntent` adopts only the binding-pinned mission (forged
+  metadata never links); rollbacks mark the binding `ROLLED_BACK`;
+  `reviewWorkItem` requires a bound COMPLETED mission before ACCEPT or
+  REWORK; delegation restart repair requires the child's
+  `required_capability` to equal the parent's (no authority widening).
   R6 closures: grounded proof is now a canonical predicate —
   `missionBoundToWorkItem` / `boundMissionForWorkItem` /
   `proveReviewAcceptance` / `proveWorkItemDone` are shared
@@ -224,7 +238,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   deterministic id) before emitting; `blockWorkItem`/`cancelWorkItem`
   never touch a foreign mission. `childNodeId` exported from
   `business.ts` as the single deterministic-id definition.
-  R5 closures: `TERMINAL_PROVENANCE_CORRUPT` is a hard quarantine — the
+  R5 closures (metadata-bound proof superseded by the RB `work_open_binding`
+  authority): `TERMINAL_PROVENANCE_CORRUPT` is a hard quarantine — the
   centralized `assertWorkItemNotQuarantined` guard fails
   `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` at open/claim/assign/review
   (ACCEPT+REWORK)/deps mutation/delegation/decomposition; corrupt rows
@@ -256,8 +271,8 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   WORK_REVIEW_ACCEPTED is never reconstructed; `WORK_DELEGATED` audit is
   indexed globally by `child_work_item_id` — entity_id/key/from/to
   mismatch or duplicate events fail closed at both replay and restart.
-  Totals: P14 84/84 (9 R6 tests), P13 67/67, P12 71/71,
-  P11 103/103, P9 79/79, N22 2007/2env, N20 2009/0, typecheck+build PASS,
+  Totals: P14 91/91 (7 rebaseline tests), P13 67/67, P12 71/71,
+  P11 103/103, P9 79/79, N22 2014/2env, N20 2016/0, typecheck+build PASS,
   audit 0 high/0 critical, verifyIntegrity clean.
 
 ## Not yet
