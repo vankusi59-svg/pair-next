@@ -754,7 +754,10 @@ export function createMissionControlServer(
                     wid,
                     {
                       reviewer_agent_id: String(body.reviewer_agent_id ?? ""),
-                      decision: String(body.decision ?? "ACCEPT") === "REWORK" ? "REWORK" : "ACCEPT",
+                      // R1 §4: pass the raw decision through — the service
+                      // enforces the exact ACCEPT|REWORK enum and fails
+                      // closed; the API never defaults to ACCEPT.
+                      decision: String(body.decision ?? "") as "ACCEPT" | "REWORK",
                       note: String(body.note ?? "") || undefined,
                     },
                     String(operator),

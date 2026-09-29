@@ -109,7 +109,9 @@ export class WorkforceService {
   } {
     const agent = this.agent(agentId);
     const businessId = String(agent.business_id);
-    this.business.rebuildReadiness(businessId);
+    // R1 §6: strictly read-only — readiness reconciliation lives on
+    // mutation seams (heartbeat/board/recovery); inbox computes against
+    // canonical state and must never write or emit events.
     const mine = this.business
       .listWorkItems(businessId)
       .filter((w) => String(w.assignee_agent_id ?? "") === agentId);
@@ -308,8 +310,6 @@ export class WorkforceService {
     },
     actor: string,
   ): { parent: Row; children: Row[] } {
-    const parent = this.node(workItemId);
-    const businessId = String(parent.business_id);
     const decompId = String(input.decomposition_id ?? "").trim();
     if (!decompId) throw new IntegrityError("FAIL_CLOSED_WORK_DECOMPOSE", "decomposition_id required");
     if (!Array.isArray(input.children) || input.children.length === 0) {
@@ -318,80 +318,100 @@ export class WorkforceService {
     if (input.children.length > WORK_DECOMPOSE_CHILD_CAP) {
       throw new IntegrityError("FAIL_CLOSED_WORK_DECOMPOSE", `>${WORK_DECOMPOSE_CHILD_CAP} children`);
     }
-    // Idempotent: this decomposition already materialized → return it.
-    if (String(parent.decomposition_id ?? "") === decompId) {
-      return { parent, children: this.childrenOf(workItemId) };
-    }
-    if (parent.decomposition_id) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_DECOMPOSE", `already decomposed as ${String(parent.decomposition_id)}`);
-    }
-    if (TERMINAL_WORK_ITEM_STATUSES.has(String(parent.status))) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(parent.status)} cannot decompose`);
-    }
-    if (this.business.listWorkItems(businessId).length + input.children.length > WORK_GRAPH_NODE_CAP) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_BOUND", `business graph exceeds ${WORK_GRAPH_NODE_CAP} nodes`);
-    }
-    // Validate proposal deterministically before any write: sibling dep
-    // indices in range, acyclic by construction (indices point at earlier
-    // siblings only), assignees valid ACTIVE agents of the business.
-    for (const [i, c] of input.children.entries()) {
-      for (const depIdx of c.depends_on_indices ?? []) {
-        if (!Number.isInteger(depIdx) || depIdx < 0 || depIdx >= input.children.length) {
-          throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_NODE", `child ${i} dep index ${depIdx}`);
+    // R1 §2: claim of the decomposition authority + proposal validation
+    // + child materialization + parent binding + evidence are ONE
+    // serialized transaction — a crash mid-way rolls back cleanly, a
+    // racing different decomposition fails closed with a stable conflict
+    // code, and the same decomposition_id replays idempotently.
+    return this.store.immediate(() => {
+      const parent = this.node(workItemId);
+      const businessId = String(parent.business_id);
+      // Idempotent: this decomposition already materialized → return it.
+      if (String(parent.decomposition_id ?? "") === decompId) {
+        return { parent, children: this.childrenOf(workItemId) };
+      }
+      if (parent.decomposition_id) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT",
+          `already decomposed as ${String(parent.decomposition_id)}`,
+        );
+      }
+      if (TERMINAL_WORK_ITEM_STATUSES.has(String(parent.status))) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(parent.status)} cannot decompose`);
+      }
+      if (this.business.listWorkItems(businessId).length + input.children.length > WORK_GRAPH_NODE_CAP) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_BOUND", `business graph exceeds ${WORK_GRAPH_NODE_CAP} nodes`);
+      }
+      const reqCap = parent.required_capability ? String(parent.required_capability) : undefined;
+      // Validate proposal deterministically before any write: sibling dep
+      // indices in range, acyclic by construction (indices point at
+      // earlier siblings only), assignees valid ACTIVE agents of the
+      // business, and (R1 §7) able to satisfy the inherited capability.
+      for (const [i, c] of input.children.entries()) {
+        for (const depIdx of c.depends_on_indices ?? []) {
+          if (!Number.isInteger(depIdx) || depIdx < 0 || depIdx >= input.children.length) {
+            throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_NODE", `child ${i} dep index ${depIdx}`);
+          }
+          if (depIdx >= i) {
+            throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_CYCLE", `child ${i} depends on later sibling ${depIdx}`);
+          }
         }
-        if (depIdx >= i) {
-          throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_CYCLE", `child ${i} depends on later sibling ${depIdx}`);
+        if (c.assignee_agent_id) {
+          const ag = this.agent(c.assignee_agent_id);
+          if (String(ag.business_id) !== businessId) {
+            throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `child ${i} assignee outside business`);
+          }
+          if (String(ag.status) !== "ACTIVE") {
+            throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", c.assignee_agent_id);
+          }
+          if (reqCap && !((ag.capabilities as string[] | undefined) ?? []).includes(reqCap)) {
+            throw new PolicyError(
+              "FAIL_CLOSED_WORK_CAPABILITY",
+              `child ${i} assignee lacks required capability ${reqCap}`,
+            );
+          }
         }
       }
-      if (c.assignee_agent_id) {
-        const ag = this.agent(c.assignee_agent_id);
-        if (String(ag.business_id) !== businessId) {
-          throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `child ${i} assignee outside business`);
+      // Deterministic child ids — a retried/raced decomposition
+      // materializes the same nodes; the version-0 INSERT makes each
+      // write exactly-once.
+      const childIds = input.children.map((_, i) => childNodeId("DC", workItemId, `${decompId}|${i}`));
+      const children: Row[] = [];
+      for (const [i, c] of input.children.entries()) {
+        const depIds = (c.depends_on_indices ?? []).map((j) => childIds[j]);
+        const existing = this.store.tryGet("work_item", childIds[i]);
+        if (existing) {
+          children.push(existing);
+          continue;
         }
-        if (String(ag.status) !== "ACTIVE") {
-          throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", c.assignee_agent_id);
-        }
+        children.push(
+          this.business.createWorkItem({
+            business_id: businessId, // canonical context from the parent row
+            title: String(c.title),
+            goal: String(c.goal),
+            assignee_agent_id: c.assignee_agent_id,
+            parent_work_item_id: workItemId,
+            depends_on: depIds,
+            required_capability: reqCap,
+            requires_review: c.requires_review === true,
+            decomposition_id: decompId,
+            source: "decomposition",
+            work_item_id: childIds[i],
+            operator_id: actor,
+          }),
+        );
       }
-    }
-    const reqCap = parent.required_capability ? String(parent.required_capability) : undefined;
-    // Deterministic child ids — a retried/raced decomposition materializes
-    // the same nodes; the version-0 INSERT makes each write exactly-once.
-    const childIds = input.children.map((_, i) => childNodeId("DC", workItemId, `${decompId}|${i}`));
-    const children: Row[] = [];
-    for (const [i, c] of input.children.entries()) {
-      const depIds = (c.depends_on_indices ?? []).map((j) => childIds[j]);
-      const existing = this.store.tryGet("work_item", childIds[i]);
-      if (existing) {
-        children.push(existing);
-        continue;
-      }
-      children.push(
-        this.business.createWorkItem({
-          business_id: businessId, // canonical context from the parent row
-          title: String(c.title),
-          goal: String(c.goal),
-          assignee_agent_id: c.assignee_agent_id,
-          parent_work_item_id: workItemId,
-          depends_on: depIds,
-          required_capability: reqCap,
-          requires_review: c.requires_review === true,
-          decomposition_id: decompId,
-          source: "decomposition",
-          work_item_id: childIds[i],
-          operator_id: actor,
-        }),
-      );
-    }
-    const cur = this.node(workItemId);
-    cur.decomposition_id = decompId;
-    cur.updated_at = utcnow();
-    const saved = this.store.put("work_item", workItemId, cur, Number(cur.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_DECOMPOSED",
-      actor: `operator:${actor}`,
-      metadata: { decomposition_id: decompId, child_ids: children.map((c) => String(c.work_item_id)) },
+      const cur = this.node(workItemId);
+      cur.decomposition_id = decompId;
+      cur.updated_at = utcnow();
+      const saved = this.store.put("work_item", workItemId, cur, Number(cur.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_DECOMPOSED",
+        actor: `operator:${actor}`,
+        metadata: { decomposition_id: decompId, child_ids: children.map((c) => String(c.work_item_id)) },
+      });
+      return { parent: saved, children };
     });
-    return { parent: saved, children };
   }
 
   /**
@@ -409,6 +429,9 @@ export class WorkforceService {
       throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
     }
     const businessId = String(agent.business_id);
+    // R1 §6: the heartbeat is the mutation seam — reconcile canonical
+    // readiness before reading the (read-only) inbox.
+    this.business.rebuildReadiness(businessId);
     const outcome: HeartbeatOutcome = { agent_id: agentId, opened: [], skipped: [] };
     const inbox = this.agentInbox(agentId);
     for (const w of inbox.ready) {

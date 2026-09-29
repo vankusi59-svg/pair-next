@@ -194,11 +194,23 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `POST /api/work-items/:id/(delegate|decompose|review|auto-assign)`,
   `POST /api/work-items` + `POST /api/org-agents` extended with graph
   fields / `capabilities`.
-- Classification: **`P14_IMPLEMENTED_PENDING_AUDIT`** — branch
+- **R1 remediations (post-audit)**: graph dep mutation + node cap +
+  create run inside `store.immediate()` — concurrent reciprocal edge
+  writes cannot form a cycle; `decomposeWorkItem` is one serialized txn
+  (bind + validate + children + evidence) — same-id replay idempotent,
+  different-id loser `FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT`, crash rolls
+  back clean; named `reviewer_agent_id` enforced
+  (`FAIL_CLOSED_WORK_REVIEWER_MISMATCH`); review decision strict enum
+  (`FAIL_CLOSED_WORK_REVIEW_DECISION`); parent completion gated on
+  mandatory children (`CHILD_INCOMPLETE` park → auto-release at all-DONE,
+  `FAIL_CLOSED_PARENT_INCOMPLETE` on early ACCEPT); `agentInbox` strictly
+  read-only (reconciliation on heartbeat/board seams); capability
+  admission enforced at create/decompose/rebuild.
+- Classification: **`P14_REMEDIATED_R1_PENDING_AUDIT`** — branch
   `devin/1790682872-p14-autonomous-workforce`, DO NOT MERGE. Evidence in
-  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md`: P14
-  31/31 (3 worker_threads races), P13 67/67, P12 71/71, P11 103/103,
-  P9 79/79, N22 1954/2env, N20 1956/0, typecheck+build PASS, audit
+  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md` §R1: P14
+  41/41 (10 R1 tests, 3 worker races), P13 67/67, P12 71/71, P11 103/103,
+  P9 79/79, N22 1964/2env, N20 1966/0, typecheck+build PASS, audit
   0 high/0 critical, verifyIntegrity clean.
 
 ## Not yet

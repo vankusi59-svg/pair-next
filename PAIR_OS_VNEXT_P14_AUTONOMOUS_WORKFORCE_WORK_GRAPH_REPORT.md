@@ -246,3 +246,114 @@ New error codes: `FAIL_CLOSED_WORK_GRAPH_CYCLE`,
 - UI modernization intentionally out of scope.
 
 Classification: **`P14_IMPLEMENTED_PENDING_AUDIT`** — DO NOT MERGE.
+
+---
+
+# REMEDIATION R1 — audit-block closure
+
+Audited head: `59a2e572f50f148c195df998f77d26eea3eee634`
+Result: `P14_INITIAL_INDEPENDENT_AUDIT_BLOCKED — R1 REQUIRED`
+
+## R1.1 Graph acyclicity is concurrency-safe
+
+`updateWorkItemDeps()` now runs validation + CAS write + event +
+propagation inside **one `store.immediate()` transaction** (BEGIN
+IMMEDIATE — single-writer serialization on the existing
+PairEvidenceStore; no second store or lock service). `createWorkItem()`
+similarly runs edge validation + node-cap check + version-0 INSERT inside
+`store.immediate()`, so the graph node cap cannot be outraced.
+
+GRAPH-R1-RACE (real `worker_threads`, two DB connections): worker1 sets
+`A.depends_on=[B]` while worker2 sets `B.depends_on=[A]` — serialized
+writers mean the second transaction validates against the first's
+committed edge, detects the cycle, and fails closed (`FAIL_CLOSED_*`).
+Exactly one legal mutation succeeded; the final graph is acyclic;
+`verifyIntegrity()` clean.
+
+## R1.2 Decomposition is atomic and single-authority
+
+`decomposeWorkItem()` now performs parent-decomposition binding + proposal
+validation + child materialization + parent state + `WORK_DECOMPOSED`
+evidence inside **one `store.immediate()` transaction**:
+
+- same `decomposition_id` raced → both callers converge to the canonical
+  child set, one event (DECOMP-R1-SAME-RACE);
+- two different `decomposition_id`s raced → exactly one winner; the loser
+  fails closed `FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT` and materializes zero
+  children (DECOMP-R1-CONFLICT-RACE);
+- crash/fault mid-materialization → transaction rollback: no orphan
+  children, no parent binding; a retry materializes cleanly
+  (DECOMP-R1-CRASH, injected fault at child #2 write);
+- sequential different-id decomposition → `FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT`.
+
+## R1.3 Named reviewer authority
+
+`reviewWorkItem()`: when `work_item.reviewer_agent_id` is configured, only
+that exact canonical agent may decide — any other reviewer fails
+`FAIL_CLOSED_WORK_REVIEWER_MISMATCH` (checked before scope checks).
+The configured reviewer must still be same-business, ACTIVE, and not the
+producing assignee. With no configured reviewer the documented fallback
+remains: any ACTIVE same-business non-assignee agent (REVIEW-R1-NAMED
+covers exact/other/foreign/inactive/self cases).
+
+## R1.4 Strict review decision
+
+The decision enum is enforced inside the service: anything other than the
+exact strings `ACCEPT` or `REWORK` fails `FAIL_CLOSED_WORK_REVIEW_DECISION`.
+The API now passes the raw `decision` through instead of mapping
+"not REWORK → ACCEPT". REVIEW-R1-API: `accept`, ``, `MAYBE`, `DONE`,
+`REWORKED`, `ACCEPT ` all fail closed; the item stays `REVIEW_REQUIRED`.
+
+## R1.5 Parent completion respects the child graph
+
+All materialized children (delegated/decomposed) are mandatory: a parent
+can reach `DONE`/`REVIEW_REQUIRED` only when every child is `DONE`.
+
+- `syncWorkItem`: mission completed while children are incomplete →
+  parent parks `IN_PROGRESS` with `blocked_code=CHILD_INCOMPLETE`
+  (idempotent, no version churn).
+- `evaluateParentCompletion`: when the last child reaches DONE, the
+  parked parent resumes to `DONE` (or `REVIEW_REQUIRED` when
+  `requires_review`) and propagates downstream.
+- `reviewWorkItem` ACCEPT with incomplete children →
+  `FAIL_CLOSED_PARENT_INCOMPLETE`.
+- CANCELLED children do **not** count as complete — documented
+  fail-closed policy: the parent must be cancelled explicitly or the
+  cancelled child reworked/replaced.
+
+PARENT-R1: parent mission completes while child open → parent stays
+`IN_PROGRESS`/`CHILD_INCOMPLETE`; review ACCEPT on a parent with an open
+child fails closed; child DONE → parent `DONE`. PARENT-R1-RESTART: a
+reopened context enforces the same gate.
+
+## R1.6 Inbox is a true read-only projection
+
+`agentInbox()` no longer calls `rebuildReadiness` — it computes bucket
+membership against canonical state without writing. Reconciliation moved
+to the mutation seam: `heartbeat()` calls `rebuildReadiness` before
+reading its inbox; `board()` already reconciles. INBOX-R1: three
+consecutive inbox reads leave entities, versions, statuses, and the event
+count byte-identical.
+
+## R1.7 Capability admission is consistent
+
+`createWorkItem` fails `FAIL_CLOSED_WORK_CAPABILITY` when the assignee
+cannot declare `required_capability`; `decomposeWorkItem` fails the same
+way for any incapable child assignee before any child materializes;
+`rebuildReadiness` demotes incapable BACKLOG/READY assignments to
+`BLOCKED`/`BLOCKED_CAPABILITY` (never promotes them). CAP-R1 covers
+direct create, decomposition, and injected legacy rows.
+
+## R1 validation
+
+| gate | result |
+|---|---|
+| P14 suite | **41/41 PASS** (10 new R1 tests incl. 3 worker races) |
+| P13 | 67/67 · P12 71/71 · P11 103/103 · P9 79/79 |
+| typecheck | clean · build PASS |
+| audit | 0 high / 0 critical |
+| Node 22 full | 1964 pass / 2 env P5 probe (CodexCli executable absent — same documented env gap) |
+| Node 20 full | **1966/0** |
+| verifyIntegrity | clean in every race/restart test |
+
+Classification: **`P14_REMEDIATED_R1_PENDING_AUDIT`** — DO NOT MERGE.

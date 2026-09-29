@@ -369,6 +369,10 @@ export class BusinessLayer {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_FIELDS", "title and goal required");
     }
     this.getBusiness(input.business_id);
+    // R1 §1: graph validation + node-cap + insert are one serialized
+    // boundary — concurrent creators cannot outrace the cap or validate
+    // against a stale graph.
+    return this.store.immediate(() => {
     let department = input.department ?? "";
     if (input.assignee_agent_id) {
       const agent = this.store.get("org_agent", input.assignee_agent_id);
@@ -377,6 +381,16 @@ export class BusinessLayer {
       }
       if (String(agent.status) !== "ACTIVE") {
         throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", String(agent.agent_id));
+      }
+      // R1 §7: an item never enters READY/BACKLOG assigned to an agent
+      // that cannot declare its required capability — admission fails
+      // closed here instead of leaving silently-unclaimable work.
+      const reqCap0 = input.required_capability ? String(input.required_capability) : null;
+      if (reqCap0 && !((agent.capabilities as string[] | undefined) ?? []).includes(reqCap0)) {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_CAPABILITY",
+          `assignee lacks required capability ${reqCap0}`,
+        );
       }
       department = department || String(agent.department ?? "");
     }
@@ -455,6 +469,7 @@ export class BusinessLayer {
       metadata: { business_id: input.business_id, title: input.title, source: row.source },
     });
     return saved;
+    });
   }
 
   listWorkItems(businessId?: string): Row[] {
@@ -528,21 +543,26 @@ export class BusinessLayer {
     actor: string,
   ): Row {
     if (!actor) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.deps");
-    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
-    if (TERMINAL_WORK_ITEM_STATUSES.has(String(row.status))) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(row.status)} cannot be mutated`);
-    }
-    const deps = [...new Set(dependsOn.map(String))];
-    this.assertGraphEdgesLegal(String(row.business_id), workItemId, deps);
-    row.depends_on = deps;
-    row.updated_at = utcnow();
-    const saved = this.store.put("work_item", workItemId, row, expectedVersion as number);
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_DEPS_UPDATED",
-      actor: `operator:${actor}`, metadata: { depends_on: deps },
+    // R1 §1: validation + mutation serialize inside one BEGIN IMMEDIATE
+    // transaction — two reciprocal edge writes can never interleave past
+    // validation to form a canonical cycle.
+    return this.store.immediate(() => {
+      const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+      if (TERMINAL_WORK_ITEM_STATUSES.has(String(row.status))) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(row.status)} cannot be mutated`);
+      }
+      const deps = [...new Set(dependsOn.map(String))];
+      this.assertGraphEdgesLegal(String(row.business_id), workItemId, deps);
+      row.depends_on = deps;
+      row.updated_at = utcnow();
+      const saved = this.store.put("work_item", workItemId, row, expectedVersion as number);
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_DEPS_UPDATED",
+        actor: `operator:${actor}`, metadata: { depends_on: deps },
+      });
+      this.propagateDependents(workItemId);
+      return saved;
     });
-    this.propagateDependents(workItemId);
-    return saved;
   }
 
   /**
@@ -604,6 +624,32 @@ export class BusinessLayer {
     for (const w of this.listWorkItems(businessId)) {
       if (TERMINAL_WORK_ITEM_STATUSES.has(String(w.status))) continue;
       const deps = (w.depends_on as string[] | undefined) ?? [];
+      // R1 §7: capability admission applies to every non-terminal node —
+      // an incapable assignment is never promoted to (or parked at) READY;
+      // it lands in explicit BLOCKED_CAPABILITY.
+      const reqCapW = w.required_capability ? String(w.required_capability) : null;
+      if (
+        reqCapW && w.assignee_agent_id &&
+        (String(w.status) === "BACKLOG" || String(w.status) === "READY")
+      ) {
+        const assigneeW = this.store.tryGet("org_agent", String(w.assignee_agent_id));
+        const capableW =
+          assigneeW && String(assigneeW.status) === "ACTIVE" &&
+          ((assigneeW.capabilities as string[] | undefined) ?? []).includes(reqCapW);
+        if (!capableW) {
+          const fromW = String(w.status);
+          w.status = "BLOCKED";
+          w.blocked_code = "BLOCKED_CAPABILITY";
+          w.updated_at = utcnow();
+          this.store.put("work_item", String(w.work_item_id), w, Number(w.version));
+          this.store.event({
+            entity_type: "work_item", entity_id: String(w.work_item_id), event_type: "WORK_BLOCKED",
+            old_state: fromW, new_state: "BLOCKED", actor: "PAIR_BUSINESS_LAYER",
+            metadata: { blocked_code: "BLOCKED_CAPABILITY", required_capability: reqCapW, rebuilt: true },
+          });
+          continue;
+        }
+      }
       if (deps.length === 0) continue;
       if (!this.depsSatisfied(w)) {
         // Any prerequisite irrecoverably dead → this node is deterministically
@@ -1019,6 +1065,14 @@ export class BusinessLayer {
     input: { reviewer_agent_id: string; decision: "ACCEPT" | "REWORK"; note?: string },
     actor: string,
   ): Row {
+    // R1 §4: the decision is an exact enum — missing/unknown values fail
+    // closed rather than defaulting to ACCEPT.
+    if (input.decision !== "ACCEPT" && input.decision !== "REWORK") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_REVIEW_DECISION",
+        `decision must be exactly ACCEPT or REWORK (got ${JSON.stringify(input.decision)})`,
+      );
+    }
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     if (String(row.status) !== "REVIEW_REQUIRED") {
       throw new IntegrityError(
@@ -1027,6 +1081,14 @@ export class BusinessLayer {
       );
     }
     const reviewer = this.store.get("org_agent", input.reviewer_agent_id);
+    // R1 §3: a named reviewer binds the decision to that exact canonical
+    // agent — any other ACTIVE same-business reviewer is rejected.
+    if (row.reviewer_agent_id && String(row.reviewer_agent_id) !== input.reviewer_agent_id) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_REVIEWER_MISMATCH",
+        `item is configured for reviewer ${String(row.reviewer_agent_id)}`,
+      );
+    }
     if (String(reviewer.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_REVIEW_SCOPE", `reviewer outside business ${String(row.business_id)}`);
     }
@@ -1035,6 +1097,14 @@ export class BusinessLayer {
     }
     if (input.reviewer_agent_id === String(row.assignee_agent_id ?? "")) {
       throw new IntegrityError("FAIL_CLOSED_WORK_REVIEW_SELF", "assignee cannot approve its own result");
+    }
+    // R1 §5: acceptance cannot fabricate completion while mandatory
+    // children are unfinished.
+    if (input.decision === "ACCEPT" && !this.mandatoryChildrenComplete(row)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PARENT_INCOMPLETE",
+        "mandatory child work is not DONE — parent cannot complete",
+      );
     }
     const to: WorkItemStatus = input.decision === "ACCEPT" ? "DONE" : "READY";
     row.status = to;
@@ -1077,6 +1147,18 @@ export class BusinessLayer {
       ms === "CANCELLED" ? "CANCELLED" :
       ms === "PAUSED" ? "BLOCKED" : null;
     if (!next) return row;
+    // R1 §5: mandatory children are only complete at DONE — a CANCELLED
+    // child does not count (the parent must be cancelled explicitly or the
+    // child reworked), so a parent never fabricates completion while
+    // materialized child work is outstanding.
+    if ((next === "DONE" || next === "REVIEW_REQUIRED") && !this.mandatoryChildrenComplete(row)) {
+      // Idempotent park: no version churn on repeated sync sweeps.
+      if (String(row.blocked_code ?? "") === "CHILD_INCOMPLETE") return row;
+      row.blocked_code = "CHILD_INCOMPLETE";
+      row.updated_at = utcnow();
+      return this.store.put("work_item", workItemId, row, Number(row.version));
+    }
+    if (row.blocked_code) row.blocked_code = null;
     assertWorkItemTransition(status, next);
     row.status = next;
     row.updated_at = utcnow();
@@ -1113,7 +1195,50 @@ export class BusinessLayer {
       old_state: status, new_state: next, actor: "PAIR_BUSINESS_LAYER",
       metadata: { mission_id: missionIds[missionIds.length - 1], mission_status: ms },
     });
+    // R1 §5: this node reaching DONE may release a parent that was parked
+    // on CHILD_INCOMPLETE.
+    this.evaluateParentCompletion(String(row.parent_work_item_id ?? ""));
     return saved;
+  }
+
+  /**
+   * R1 §5: every materialized child (delegation/decomposition) of this
+   * node must be DONE before the node itself may complete. CANCELLED
+   * children do NOT count as complete — documented fail-closed policy:
+   * completion is never fabricated; the parent must be cancelled
+   * explicitly or the cancelled child reworked/replaced.
+   */
+  mandatoryChildrenComplete(parentRow: Row): boolean {
+    const pid = String(parentRow.work_item_id);
+    return this.store
+      .list("work_item")
+      .filter((c) => String(c.parent_work_item_id) === pid)
+      .every((c) => String(c.status) === "DONE");
+  }
+
+  /**
+   * R1 §5: when the last child goes DONE, a parent parked at
+   * CHILD_INCOMPLETE resumes its own completion — the same terminal it
+   * would have reached in syncWorkItem (DONE, or REVIEW_REQUIRED when
+   * requires_review).
+   */
+  private evaluateParentCompletion(parentId: string): void {
+    if (!parentId) return;
+    const parent = this.store.tryGet("work_item", parentId);
+    if (!parent) return;
+    if (String(parent.status) !== "IN_PROGRESS" || String(parent.blocked_code ?? "") !== "CHILD_INCOMPLETE") return;
+    if (!this.mandatoryChildrenComplete(parent)) return;
+    const next: WorkItemStatus = parent.requires_review === true ? "REVIEW_REQUIRED" : "DONE";
+    parent.status = next;
+    parent.blocked_code = null;
+    parent.updated_at = utcnow();
+    this.store.put("work_item", parentId, parent, Number(parent.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: parentId, event_type: "WORK_ITEM_SYNCED",
+      old_state: "IN_PROGRESS", new_state: next, actor: "PAIR_BUSINESS_LAYER",
+      metadata: { cause: "children_complete" },
+    });
+    this.propagateDependents(parentId);
   }
 
   // ---------- work_item collaboration (claim / comment / blocker / artifact) ----------

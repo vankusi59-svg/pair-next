@@ -363,6 +363,12 @@ try {
   } else if (op === "claim") {
     const row = business.claimWorkItem(args.workItemId, args.agentId, "worker");
     parentPort.postMessage({ ok: true, out: { claimed_by: String(row.claimed_by) } });
+  } else if (op === "deps") {
+    const row = business.updateWorkItemDeps(args.workItemId, args.deps, args.expectedVersion, "worker");
+    parentPort.postMessage({ ok: true, out: { version: Number(row.version) } });
+  } else if (op === "decompose") {
+    const out = workforce.decomposeWorkItem(args.workItemId, args.input, "worker");
+    parentPort.postMessage({ ok: true, out: { children: out.children.map((c) => String(c.work_item_id)) } });
   } else {
     throw new Error("unknown op " + op);
   }
@@ -705,7 +711,7 @@ describe("P14 decomposition", () => {
     const { ctx, biz, workforce } = makeBizCtx("dec-a");
     const b = makeBiz(biz, ctx.projectId);
     const bid = String(b.business_id);
-    const ag = makeAgent(biz, bid, "w");
+    const ag = makeAgent(biz, bid, "w", ["CODE"]);
     const parent = wi(biz, bid, { title: "epic", required_capability: "CODE" });
     const out = workforce.decomposeWorkItem(String(parent.work_item_id), {
       decomposition_id: "DC1",
@@ -737,7 +743,7 @@ describe("P14 decomposition", () => {
     expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_DECOMPOSED").length).toBe(1);
     expect(errCode(() => workforce.decomposeWorkItem(String(parent.work_item_id), {
       decomposition_id: "DIFFERENT", children: [{ title: "y", goal: "g" }],
-    }, "op"))).toBe("FAIL_CLOSED_WORK_DECOMPOSE");
+    }, "op"))).toBe("FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT");
   });
 
   it("DEC-C: cyclic/out-of-range proposals + foreign assignees fail closed", () => {
@@ -1045,5 +1051,336 @@ describe("P14 races — genuine worker_threads", () => {
     const row = store2.get("work_item", String(item.work_item_id));
     expect([String(a1.agent_id), String(a2.agent_id)]).toContain(String(row.claimed_by));
     store2.verifyIntegrity();
+  });
+});
+
+/* ------------------------------ R1 REMEDIATIONS -------------------------- */
+
+describe("P14 R1 remediations", () => {
+  it("GRAPH-R1-RACE: concurrent reciprocal dep mutation cannot create a cycle", async () => {
+    const { ctx, biz } = makeBizCtx("g-r1-race");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const A = wi(biz, bid, { title: "A" });
+    const B = wi(biz, bid, { title: "B" });
+    const [r1, r2] = await runRace([
+      {
+        op: "deps", dbPath: ctx.dbPath,
+        args: { workItemId: String(A.work_item_id), deps: [String(B.work_item_id)], expectedVersion: Number(A.version) },
+      },
+      {
+        op: "deps", dbPath: ctx.dbPath,
+        args: { workItemId: String(B.work_item_id), deps: [String(A.work_item_id)], expectedVersion: Number(B.version) },
+      },
+    ]);
+    // Exactly one legal mutation may succeed; the loser fails closed and
+    // the final canonical graph is acyclic.
+    expect([r1, r2].filter((r) => r.ok).length).toBe(1);
+    const loser = [r1, r2].find((r) => !r.ok) as { ok: false; code: string };
+    expect(String(loser.code).startsWith("FAIL_CLOSED")).toBe(true);
+    const store2 = new PairEvidenceStore(ctx.dbPath);
+    const aDeps = (store2.get("work_item", String(A.work_item_id)).depends_on as string[]) ?? [];
+    const bDeps = (store2.get("work_item", String(B.work_item_id)).depends_on as string[]) ?? [];
+    expect(
+      aDeps.includes(String(B.work_item_id)) && bDeps.includes(String(A.work_item_id)),
+    ).toBe(false);
+    store2.verifyIntegrity();
+  });
+
+  it("DECOMP-R1-SAME-RACE: same decomposition race → one canonical child set", async () => {
+    const { ctx, biz } = makeBizCtx("dc-same-race");
+    const b = makeBiz(biz, ctx.projectId);
+    const parent = wi(biz, String(b.business_id), {});
+    const spec = {
+      decomposition_id: "SAME",
+      children: [{ title: "c0", goal: "g" }, { title: "c1", goal: "g" }],
+    };
+    const args = { workItemId: String(parent.work_item_id), input: spec };
+    const [r1, r2] = await runRace([
+      { op: "decompose", dbPath: ctx.dbPath, args },
+      { op: "decompose", dbPath: ctx.dbPath, args },
+    ]);
+    const store2 = new PairEvidenceStore(ctx.dbPath);
+    const children = store2
+      .list("work_item")
+      .filter((w) => String(w.parent_work_item_id ?? "") === String(parent.work_item_id));
+    expect(children.length).toBe(2);
+    const canonical = children.map((c) => String(c.work_item_id)).sort();
+    for (const r of [r1, r2]) {
+      expect(r.ok).toBe(true);
+      expect(((r as { ok: true; out: { children: string[] } }).out.children).slice().sort()).toEqual(canonical);
+    }
+    expect(store2.listEvents().filter((e) => e.event_type === "WORK_DECOMPOSED").length).toBe(1);
+    store2.verifyIntegrity();
+  });
+
+  it("DECOMP-R1-CONFLICT-RACE: different decomposition ids → one winner, zero loser children", async () => {
+    const { ctx, biz } = makeBizCtx("dc-conf-race");
+    const b = makeBiz(biz, ctx.projectId);
+    const parent = wi(biz, String(b.business_id), {});
+    const [r1, r2] = await runRace([
+      {
+        op: "decompose", dbPath: ctx.dbPath,
+        args: {
+          workItemId: String(parent.work_item_id),
+          input: { decomposition_id: "PROP-A", children: [{ title: "a0", goal: "g" }, { title: "a1", goal: "g" }] },
+        },
+      },
+      {
+        op: "decompose", dbPath: ctx.dbPath,
+        args: {
+          workItemId: String(parent.work_item_id),
+          input: { decomposition_id: "PROP-B", children: [{ title: "b0", goal: "g" }] },
+        },
+      },
+    ]);
+    const winners = [r1, r2].filter((r) => r.ok);
+    const losers = [r1, r2].filter((r) => !r.ok) as Array<{ ok: false; code: string }>;
+    expect(winners.length).toBe(1);
+    expect(losers.length).toBe(1);
+    expect(losers[0].code).toBe("FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT");
+    const store2 = new PairEvidenceStore(ctx.dbPath);
+    const children = store2
+      .list("work_item")
+      .filter((w) => String(w.parent_work_item_id ?? "") === String(parent.work_item_id));
+    const winnerChildIds = ((winners[0] as { ok: true; out: { children: string[] } }).out.children).slice().sort();
+    expect(children.map((c) => String(c.work_item_id)).sort()).toEqual(winnerChildIds);
+    expect(store2.get("work_item", String(parent.work_item_id)).decomposition_id)
+      .toBeTruthy();
+    store2.verifyIntegrity();
+  });
+
+  it("DECOMP-R1-CRASH: failed materialization rolls back — no partial decomposition", () => {
+    const { ctx, biz, workforce } = makeBizCtx("dc-crash");
+    const b = makeBiz(biz, ctx.projectId);
+    const parent = wi(biz, String(b.business_id), {});
+    // Inject a crash mid-transaction: the second child write throws —
+    // the whole decomposition transaction must roll back, leaving no
+    // orphan children and no parent binding.
+    const original = biz.createWorkItem.bind(biz);
+    let calls = 0;
+    biz.createWorkItem = ((input: Parameters<typeof biz.createWorkItem>[0]) => {
+      calls += 1;
+      if (calls === 2) {
+        throw Object.assign(new Error("crash mid-materialization"), { code: "FAIL_CLOSED_TEST_INJECTED" });
+      }
+      return original(input);
+    }) as typeof biz.createWorkItem;
+    expect(errCode(() => workforce.decomposeWorkItem(String(parent.work_item_id), {
+      decomposition_id: "CRASHY",
+      children: [{ title: "c0", goal: "g" }, { title: "c1", goal: "g" }],
+    }, "op"))).toBe("FAIL_CLOSED_TEST_INJECTED");
+    biz.createWorkItem = original;
+    expect(workforce.childrenOf(String(parent.work_item_id)).length).toBe(0);
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).decomposition_id ?? "")).toBe("");
+    // Recovery converges: a different decomposition materializes cleanly.
+    const ok = workforce.decomposeWorkItem(String(parent.work_item_id), {
+      decomposition_id: "HEALTHY",
+      children: [{ title: "h0", goal: "g" }],
+    }, "op");
+    expect(ok.children.length).toBe(1);
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).decomposition_id)).toBe("HEALTHY");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R1-NAMED: only the configured reviewer may decide", () => {
+    const { ctx, biz } = makeBizCtx("rev-r1");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const doer = makeAgent(biz, bid, "doer");
+    const named = makeAgent(biz, bid, "named");
+    const other = makeAgent(biz, bid, "other");
+    const b2 = makeBiz(biz, ctx.projectId, "B2");
+    const foreign = makeAgent(biz, String(b2.business_id), "f");
+    const item = wi(biz, bid, {
+      assignee_agent_id: String(doer.agent_id), requires_review: true,
+      reviewer_agent_id: String(named.agent_id),
+    });
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id));
+    // Wrong reviewers fail closed — mismatch is checked before scope.
+    expect(errCode(() => biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(other.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_REVIEWER_MISMATCH");
+    expect(errCode(() => biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(foreign.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_REVIEWER_MISMATCH");
+    // Named reviewer inactive → fail closed.
+    biz.setOrgAgentStatus(String(named.agent_id), "PAUSED", "op");
+    expect(errCode(() => biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(named.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_AGENT_INACTIVE");
+    biz.setOrgAgentStatus(String(named.agent_id), "ACTIVE", "op");
+    // Assignee configured as its own reviewer → self-review still denied.
+    const self = wi(biz, bid, {
+      assignee_agent_id: String(doer.agent_id), requires_review: true,
+      reviewer_agent_id: String(doer.agent_id),
+    });
+    biz.openWorkItem(String(self.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(self.work_item_id));
+    expect(errCode(() => biz.reviewWorkItem(String(self.work_item_id), {
+      reviewer_agent_id: String(doer.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_REVIEW_SELF");
+    // The named reviewer succeeds.
+    const accepted = biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(named.agent_id), decision: "ACCEPT",
+    }, "op");
+    expect(String(accepted.status)).toBe("DONE");
+  });
+
+  it("REVIEW-R1-API: invalid/missing decisions fail closed — never default ACCEPT", () => {
+    const { ctx, biz } = makeBizCtx("rev-r1-api");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const doer = makeAgent(biz, bid, "doer");
+    const rev = makeAgent(biz, bid, "rev");
+    const item = wi(biz, bid, { assignee_agent_id: String(doer.agent_id), requires_review: true });
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id));
+    for (const bad of ["accept", "", "MAYBE", "DONE", "REWORKED", "ACCEPT "]) {
+      expect(errCode(() => biz.reviewWorkItem(String(item.work_item_id), {
+        reviewer_agent_id: String(rev.agent_id), decision: bad as never,
+      }, "op"))).toBe("FAIL_CLOSED_WORK_REVIEW_DECISION");
+    }
+    // Nothing silently defaulted — the item is still awaiting review.
+    expect(String(ctx.store.get("work_item", String(item.work_item_id)).status)).toBe("REVIEW_REQUIRED");
+    const accepted = biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op");
+    expect(String(accepted.status)).toBe("DONE");
+  });
+
+  it("PARENT-R1: parent cannot DONE while mandatory children incomplete; all DONE releases it", () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-r1");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      reason: "r",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    const parked = ctx.store.get("work_item", String(parent.work_item_id));
+    expect(String(parked.status)).toBe("IN_PROGRESS");
+    expect(String(parked.blocked_code)).toBe("CHILD_INCOMPLETE");
+    // Review ACCEPT cannot fabricate completion while the child is open —
+    // exercised via a second parent already awaiting review, then
+    // delegated (children materialize onto a REVIEW_REQUIRED parent).
+    const reviewer = makeAgent(biz, bid, "rev");
+    const parent2 = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id), requires_review: true,
+      reviewer_agent_id: String(reviewer.agent_id),
+    });
+    biz.openWorkItem(String(parent2.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent2.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent2.work_item_id)).status)).toBe("REVIEW_REQUIRED");
+    workforce.delegateWorkItem({
+      work_item_id: String(parent2.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      reason: "late child",
+    }, "op");
+    expect(errCode(() => biz.reviewWorkItem(String(parent2.work_item_id), {
+      reviewer_agent_id: String(reviewer.agent_id), decision: "ACCEPT",
+    }, "op"))).toBe("FAIL_CLOSED_PARENT_INCOMPLETE");
+    // Child completes → the parked parent resumes and finishes.
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).status)).toBe("DONE");
+  });
+
+  it("PARENT-R1-RESTART: a reopened context reconstructs the same completion gate", () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-rst");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      reason: "r",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    // Fresh process context — the gate is reconstructed from canonical
+    // state, not memory.
+    const re = makeBizCtx("par-rst-re", reopenCtx(ctx.dir, "re"));
+    // The reopened context keeps the canonical project's workspace.
+    re.ctx.workspace = ctx.workspace;
+    const a2 = new ScriptedAdapter("EXEC_A2");
+    registerScripted(re.ctx, a2);
+    re.biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(re.ctx, re.biz, a2, String(child.work_item_id));
+    const after = re.ctx.store.get("work_item", String(parent.work_item_id));
+    expect(String(after.status)).toBe("DONE");
+    expect(String(after.blocked_code ?? "")).toBe("");
+    re.ctx.store.verifyIntegrity();
+  });
+
+  it("INBOX-R1: inbox is strictly read-only — repeated reads change nothing", () => {
+    const { ctx, biz, workforce } = makeBizCtx("inbox-r1");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const ag = makeAgent(biz, bid, "me");
+    const pre = wi(biz, bid, { assignee_agent_id: String(ag.agent_id) });
+    wi(biz, bid, { assignee_agent_id: String(ag.agent_id), depends_on: [String(pre.work_item_id)] });
+    const blocked = wi(biz, bid, { assignee_agent_id: String(ag.agent_id) });
+    biz.blockWorkItem(String(blocked.work_item_id), "ops", "op");
+    const snapshot = () =>
+      JSON.stringify(ctx.store.list("work_item")) +
+      "|" + JSON.stringify(ctx.store.list("mission")) +
+      "|" + String(ctx.store.listEvents().length);
+    const before = snapshot();
+    workforce.agentInbox(String(ag.agent_id));
+    workforce.agentInbox(String(ag.agent_id));
+    workforce.agentInbox(String(ag.agent_id));
+    expect(snapshot()).toBe(before);
+  });
+
+  it("CAP-R1: incapable assignment never reaches READY at any admission point", () => {
+    const { ctx, biz, workforce } = makeBizCtx("cap-r1");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const runner = makeAgent(biz, bid, "runner", []);
+    // Direct create with an incapable assignee fails closed.
+    expect(errCode(() => wi(biz, bid, {
+      assignee_agent_id: String(runner.agent_id), required_capability: "CODE",
+    }))).toBe("FAIL_CLOSED_WORK_CAPABILITY");
+    // Decomposition to an incapable assignee fails before any child
+    // materializes.
+    const parent = wi(biz, bid, { required_capability: "CODE" });
+    expect(errCode(() => workforce.decomposeWorkItem(String(parent.work_item_id), {
+      decomposition_id: "INCAP",
+      children: [{ title: "c", goal: "g", assignee_agent_id: String(runner.agent_id) }],
+    }, "op"))).toBe("FAIL_CLOSED_WORK_CAPABILITY");
+    expect(workforce.childrenOf(String(parent.work_item_id)).length).toBe(0);
+    // Rebuild never promotes an incapable (e.g. legacy) assignment to
+    // READY — it lands in explicit BLOCKED_CAPABILITY.
+    const legacy = wi(biz, bid, {});
+    const row = ctx.store.get("work_item", String(legacy.work_item_id));
+    row.assignee_agent_id = String(runner.agent_id);
+    row.required_capability = "CODE";
+    row.status = "BACKLOG";
+    ctx.store.put("work_item", String(legacy.work_item_id), row, Number(row.version));
+    biz.rebuildReadiness(bid);
+    const healed = ctx.store.get("work_item", String(legacy.work_item_id));
+    expect(String(healed.status)).toBe("BLOCKED");
+    expect(String(healed.blocked_code)).toBe("BLOCKED_CAPABILITY");
   });
 });
