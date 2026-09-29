@@ -260,3 +260,101 @@ token 403) — to be enabled after R2 independent audit, before final merge.
 `P11_REMEDIATED_R2_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
 requires the independent re-audit to agree — this report does not
 self-certify.
+
+---
+
+## §10.9 P11 REMEDIATION R3 — SCHEDULE FINAL CLOSURE
+
+Independent audit of head `e3de4c25a0f37649b6bdfde30b60466feb6e3b28`
+(§10.8) found three scheduler-closure defects; this round closes them on
+the same PR (#4), branch `devin/1790648747-p11-business-hardening`.
+
+### §10.9.1 Audit findings → root cause → fix
+
+| # | Finding | Root cause | Fix |
+|---|---------|------------|-----|
+| 1 | Stale due snapshot could fire the NEXT occurrence early | `_fireDue` re-read `row.next_due_at` from the FRESH row and claimed whatever it now contained — if a concurrent scheduler had already advanced X→Y, the stale snapshot fired Y early | Snapshot pin: `snapshotDueAt` is captured from the `due()` snapshot; the fresh row must still satisfy `next_due_at === snapshotDueAt && next_due_at <= now && enabled && !deleted`, else `continue` — no claim, no budget, no mission, no mutation (§5 loser-side guarantee) |
+| 2 | Post-create exception could release an occurrence whose mission exists | `startMission` is multi-step (`createMission` → `runtimeEntity` → `supervisor.wake`): `createMission` can succeed while `wake` throws; the catch path unconditionally `releaseOccurrence` + `settle(false)` — mission detached from its occurrence, budget refunded for a mission that exists | On ANY exception after submit was attempted, canonical mission existence is decisive: search `mission` rows for `metadata.schedule_occurrence_id === occurrenceId` — found → `settle(true)`, `bindOccurrenceMission`, record `last_mission_id`/`last_error`/`run_count`, `SCHEDULE_FIRED` event with `reconciled: "post_create_exception"`; not found → `settle(false)` + `releaseOccurrence` as before |
+| 3 | `bindOccurrenceMission` could return silently after retry exhaustion | 3-attempt CAS loop that simply returned when retries ran out — binding unproven | Fail-closed loop: each attempt proves or detects — same-mission+FIRED → return (idempotent); different-mission bound → `FAIL_CLOSED_OCCURRENCE_BINDING_CONFLICT`; CAS conflict → retry. After the loop a final read decides: proven → return, different bound → CONFLICT, else `FAIL_CLOSED_OCCURRENCE_BIND_UNPROVEN` — it never returns on an unproven binding |
+
+### §10.9.2 `reconcileOccurrences` hardening (§4)
+
+Rewritten to consult the canonical mission index for EVERY occurrence:
+
+- `FIRED` + bound mission exists → no-op;
+- `FIRED` + a *different* canonical mission claims the occurrence →
+  `SCHEDULE_OCCURRENCE_INTEGRITY` audit event (binding NOT rewritten —
+  bound value wins, conflict is loud);
+- `CLAIMED` or `RELEASED` + canonical mission exists →
+  `bindOccurrenceMission` + `SCHEDULE_OCCURRENCE_REPAIRED` event
+  (pre-R3 RELEASED+mission partial states are deterministically repaired);
+- `CLAIMED` + no mission + fresh (inside TTL) → untouched (in-flight);
+- `CLAIMED` + no mission + stale → `releaseOccurrence("stale_claim_no_mission")`;
+- `RELEASED` + no mission → terminal, untouched.
+
+All repair actions emit an audit event. CLAIMED+mission now binds
+immediately on reconcile — no TTL wait is needed since mission existence
+is proof the fire completed.
+
+### §10.9.3 Ordering (§6)
+
+`due snapshot → validate snapshot still current/due → claim occurrence →
+budget preflight/reservation → MissionControl.startMission → reconcile
+mission existence on success/error → settle budget → bind occurrence →
+advance schedule`. `last_fired_at` moved to success paths only (a failed
+fire no longer records a fire).
+
+### §10.9.4 Files changed / tests
+
+- `src/pair/mission-schedule.ts` — `_fireDue` snapshot pin +
+  post-create reconcile + success-only `last_fired_at`;
+  `bindOccurrenceMission` fail-closed; `reconcileOccurrences` rewrite.
+- `src/__tests__/pair-p11-r3.test.ts` — **12 new tests**: stale snapshot
+  cannot fire Y (two schedulers, deterministic snapshot inject);
+  disabled-meanwhile skip; pre-create failure releases occurrence+budget;
+  post-create failure binds FIRED + one mission + budget consumed once +
+  `reconciled` audit; restart CLAIMED+mission binds immediately;
+  RELEASED+mission repairs to FIRED; FIRED+other-mission integrity event;
+  fresh CLAIMED untouched; idempotent same-mission bind;
+  different-mission bind fails closed on both same-process and
+  second-connection writers; stale scheduler reserves nothing and mutates
+  nothing (run_count/next_due_at/version unchanged).
+- `.github/workflows/ci.yml` — focused P11 step now includes
+  `pair-p11-r3.test.ts`.
+- All P11 R0/R1/R2 tests kept and unweakened: **78/78 P11 tests pass**
+  (22+25+19+12). Full suite: **1760 pass / 24 skipped / 2 fail** — the 2
+  are pre-existing env-dependent `pair-p5.test.ts` DSH/CODEX probe tests
+  (pass on CI where the binaries are absent; unchanged since R1).
+
+### §10.9.5 Final closure conditions (§9) — self-assessment
+
+| Condition | Evidence |
+|---|---|
+| At most one mission per occurrence | CAS occurrence claim (R2) + canonical-existence reconcile (R3) |
+| Stale snapshot cannot fire early | snapshot pin `===` + `<= now`; tests pin1/pin2 |
+| Post-create exception cannot release | catch path binds by canonical mission before release is considered |
+| Canonical mission existence wins | both success-catch and reconcile paths consult `metadata.schedule_occurrence_id` |
+| Binding cannot silently fail | `FAIL_CLOSED_OCCURRENCE_BIND_UNPROVEN` / `_BINDING_CONFLICT` |
+| No two-mission binding | same-mission idempotent; different-mission throws conflict |
+| Restart reconcile closes partial states | CLAIMED+mission→FIRED, RELEASED+mission→FIRED, stale CLAIMED→RELEASED |
+| run_count advanced once | winner-only write + `Math.max` merge (R2) + pin prevents stale write |
+| next_due_at advanced once | winner-only advance; loser `continue`s before any mutation |
+| last_mission_id correct | written from the bound/returned mission only |
+| Budget exactly-once | loser/stale reserve nothing; pre-create failure releases; post-create consumes one |
+| Multi-process contention green | R2 worker_threads suite (19 tests) + R3 deterministic interleave |
+| R1/R2 invariants green | 66/66 prior P11 tests unchanged and passing |
+| Integrity clean | `SCHEDULE_OCCURRENCE_INTEGRITY` audits the FIRED/different-mission anomaly instead of mutating |
+| Node 20 + 22 + build + security pass | CI matrix; `pnpm audit --audit-level=high` clean (0 high/critical) |
+| No authority bypass | dispatch still only via `MissionControl.startMission` |
+| No P12–P15 scope creep | diff touches scheduler/tests/CI/report only |
+
+### §10.9.6 Branch protection
+
+Unchanged: **OPERATOR ACTION REQUIRED** — GitHub token returns 403 on
+branch-protection APIs; it is NOT enabled. Enable after this R3 audit
+passes, before final merge (Settings → Branches → `main`: require PR +
+checks `build-and-test` + `security-audit`).
+
+**Classification submitted for independent audit:
+`P11_REMEDIATED_R3_PENDING_AUDIT`.** This report does not self-certify;
+`P11_OFFICIAL_FINAL_PASS` requires the independent re-audit to agree.

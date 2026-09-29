@@ -264,14 +264,27 @@ export class MissionScheduleService {
   }
 
   /**
-   * After the mission exists, bind it on the occurrence. Retry once on a CAS
-   * conflict (a reconcile sweep may have touched the row) — the mission id
-   * is durable fact, so rewriting it under the latest version is safe.
+   * After the mission exists, bind it on the occurrence — FAIL CLOSED.
+   * Returns only when the durable state is proven:
+   *   A) this call persisted status=FIRED + mission_id, or
+   *   B) another writer already persisted the SAME binding.
+   * A binding to a DIFFERENT mission is an integrity violation; CAS
+   * contention that cannot prove the binding is an explicit error —
+   * never a silent return.
    */
   private bindOccurrenceMission(occurrenceId: string, missionId: string): void {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const occ = this.store.get("schedule_occurrence", occurrenceId);
-      if (occ.mission_id) return; // already bound — idempotent
+      if (occ.mission_id) {
+        if (String(occ.mission_id) === missionId && occ.status === "FIRED") return;
+        if (String(occ.mission_id) !== missionId) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OCCURRENCE_BINDING_CONFLICT",
+            `${occurrenceId} already bound to ${String(occ.mission_id)} ≠ ${missionId}`,
+          );
+        }
+        // same mission, status not yet FIRED — repair it below
+      }
       occ.mission_id = missionId;
       occ.status = "FIRED";
       occ.fired_at = utcnow();
@@ -282,6 +295,19 @@ export class MissionScheduleService {
         if ((err as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") throw err;
       }
     }
+    // Retries exhausted — the binding must be proven, not assumed.
+    const final = this.store.get("schedule_occurrence", occurrenceId);
+    if (String(final.mission_id ?? "") === missionId && final.status === "FIRED") return;
+    if (final.mission_id && String(final.mission_id) !== missionId) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OCCURRENCE_BINDING_CONFLICT",
+        `${occurrenceId} bound to ${String(final.mission_id)} ≠ ${missionId}`,
+      );
+    }
+    throw new IntegrityError(
+      "FAIL_CLOSED_OCCURRENCE_BIND_UNPROVEN",
+      `${occurrenceId} binding to ${missionId} unproven after CAS retries`,
+    );
   }
 
   /**
@@ -311,25 +337,84 @@ export class MissionScheduleService {
   }
 
   /**
-   * Restart-safe reconcile for claims older than OCCURRENCE_CLAIM_TTL_MS:
-   * a durable mission carrying metadata.schedule_occurrence_id is the
-   * canonical evidence — found → backlink + FIRED; provably absent →
-   * RELEASED. Called at the top of every fireDue (any process) so a crashed
-   * winner never leaves a dangling claim.
+   * Restart-safe reconcile over all non-terminal occurrence states. A
+   * durable mission carrying metadata.schedule_occurrence_id is canonical
+   * evidence and wins over local state:
+   *   CLAIMED + matching mission      → bind FIRED now (no TTL wait —
+   *                                     the mission existence proves the
+   *                                     claimant succeeded post-crash);
+   *   CLAIMED + no mission + stale    → RELEASED (audited);
+   *   CLAIMED + no mission + fresh    → skip (in flight);
+   *   RELEASED + matching mission     → legacy/partial state — repair to
+   *                                     FIRED + bound, audited;
+   *   FIRED + same mission            → no-op;
+   *   FIRED + different canonical one → audited integrity violation.
+   * Called at the top of every fireDue (any process) so a crashed winner
+   * never leaves a dangling claim or a detached canonical mission.
    */
   reconcileOccurrences(): void {
     const cutoff = Date.now() - OCCURRENCE_CLAIM_TTL_MS;
     const missions = this.store.list("mission");
     for (const occ of this.store.list("schedule_occurrence")) {
-      if (occ.status !== "CLAIMED") continue;
-      const created = Date.parse(String(occ.created_at));
-      if (!Number.isFinite(created) || created > cutoff) continue;
       const id = String(occ.occurrence_id);
+      const status = String(occ.status);
       const mission = missions.find(
         (m) => String((m.metadata as Record<string, unknown> | undefined)?.schedule_occurrence_id ?? "") === id,
       );
-      if (mission) this.bindOccurrenceMission(id, String(mission.mission_id));
-      else this.releaseOccurrence(id, "stale_claim_no_mission");
+      if (status === "FIRED") {
+        if (mission && String(occ.mission_id ?? "") !== String(mission.mission_id)) {
+          // The bound mission_id points at a different mission than the
+          // canonical one claiming this occurrence — audited, not repaired.
+          this.store.event({
+            entity_type: "schedule_occurrence",
+            entity_id: id,
+            event_type: "SCHEDULE_OCCURRENCE_INTEGRITY",
+            new_state: "FIRED",
+            actor: "PAIR_MISSION_SCHEDULE",
+            metadata: {
+              bound_mission_id: occ.mission_id ?? null,
+              canonical_mission_id: mission.mission_id,
+            },
+          });
+        }
+        continue;
+      }
+      if (mission) {
+        // CLAIMED or legacy RELEASED with a canonical mission → repair to
+        // FIRED + bound; the mission's existence is the decisive evidence.
+        try {
+          this.bindOccurrenceMission(id, String(mission.mission_id));
+        } catch (err) {
+          if ((err as { code?: string }).code !== "FAIL_CLOSED_OCCURRENCE_BINDING_CONFLICT") throw err;
+          this.store.event({
+            entity_type: "schedule_occurrence",
+            entity_id: id,
+            event_type: "SCHEDULE_OCCURRENCE_INTEGRITY",
+            new_state: status,
+            actor: "PAIR_MISSION_SCHEDULE",
+            metadata: {
+              bound_mission_id: occ.mission_id ?? null,
+              canonical_mission_id: mission.mission_id,
+              error: String((err as { message?: string })?.message ?? err),
+            },
+          });
+          continue;
+        }
+        this.store.event({
+          entity_type: "schedule_occurrence",
+          entity_id: id,
+          event_type: "SCHEDULE_OCCURRENCE_REPAIRED",
+          old_state: status,
+          new_state: "FIRED",
+          actor: "PAIR_MISSION_SCHEDULE",
+          metadata: { mission_id: mission.mission_id },
+        });
+        continue;
+      }
+      if (status !== "CLAIMED") continue; // RELEASED without mission — terminal
+      const created = Date.parse(String(occ.created_at));
+      if (!Number.isFinite(created) || created > cutoff) continue;
+      this.releaseOccurrence(id, "stale_claim_no_mission");
     }
   }
 
@@ -364,15 +449,28 @@ export class MissionScheduleService {
     this.reconcileOccurrences();
     for (const s of this.due(now)) {
       const id = String(s.schedule_id);
+      const snapshotDueAt = String(s.next_due_at);
       const row = this.store.get("mission_schedule", id);
-      row.last_fired_at = now;
+      // Stale-snapshot pin: the snapshot must still name the SAME due
+      // occurrence — if another process already advanced this schedule, the
+      // fresh next_due_at is a different occurrence we were never due to
+      // fire. Skip entirely: no claim, no budget, no mission, no mutation.
+      if (
+        String(row.next_due_at) !== snapshotDueAt ||
+        String(row.next_due_at) > now ||
+        row.enabled !== true ||
+        row.deleted
+      ) {
+        continue;
+      }
       // Exactly-once gate: claim this specific occurrence (schedule_id +
       // due_at) via CAS before any preflight/submit — a losing process must
       // never reserve budget or create a mission for it.
-      const dueAt = String(row.next_due_at);
+      const dueAt = snapshotDueAt;
       const occ = this.claimOccurrence(id, dueAt, md_businessId(s));
       let token: { settle: (consumed: boolean) => void } | null = null;
       if (occ) {
+        const occurrenceId = String(occ.occurrence_id);
         try {
           // Schedule metadata (e.g. routine business_id/department/assignee)
           // propagates into the mission so projection, budgets and audit can
@@ -381,7 +479,7 @@ export class MissionScheduleService {
             ...((s.metadata as Record<string, unknown> | undefined) ?? {}),
             plan_source: "schedule",
             schedule_id: id,
-            schedule_occurrence_id: String(occ.occurrence_id),
+            schedule_occurrence_id: occurrenceId,
             scheduled_for: dueAt,
             schedule_digest: digest({ goal: s.goal, cron: s.cron, schedule_id: id }),
           };
@@ -398,7 +496,8 @@ export class MissionScheduleService {
             metadata,
           });
           token?.settle(true);
-          this.bindOccurrenceMission(String(occ.occurrence_id), String(mission.mission_id));
+          this.bindOccurrenceMission(occurrenceId, String(mission.mission_id));
+          row.last_fired_at = now;
           row.last_mission_id = String(mission.mission_id);
           row.last_error = null;
           row.run_count = Number(row.run_count ?? 0) + 1;
@@ -412,15 +511,52 @@ export class MissionScheduleService {
             correlation_id: String(mission.mission_id),
             metadata: {
               mission_id: mission.mission_id,
-              occurrence_id: occ.occurrence_id,
+              occurrence_id: occurrenceId,
               scheduled_for: dueAt,
             },
           });
         } catch (err) {
-          token?.settle(false);
-          this.releaseOccurrence(String(occ.occurrence_id), "submit_failed");
-          row.last_error = String((err as { message?: string })?.message ?? err);
-          errors.push(id);
+          // Canonical mission existence wins over local exception semantics:
+          // the submit path can throw AFTER the mission row was created
+          // (runtimeEntity/wake inside startMission) — never release an
+          // occurrence whose mission exists, and never retry into a second.
+          const bound = this.store
+            .list("mission")
+            .find(
+              (m) =>
+                String(
+                  (m.metadata as Record<string, unknown> | undefined)?.schedule_occurrence_id ?? "",
+                ) === occurrenceId,
+            );
+          if (bound) {
+            token?.settle(true);
+            this.bindOccurrenceMission(occurrenceId, String(bound.mission_id));
+            row.last_fired_at = now;
+            row.last_mission_id = String(bound.mission_id);
+            row.last_error = String((err as { message?: string })?.message ?? err);
+            row.run_count = Number(row.run_count ?? 0) + 1;
+            fired.push(id);
+            this.store.event({
+              entity_type: "mission_schedule",
+              entity_id: id,
+              event_type: "SCHEDULE_FIRED",
+              new_state: "FIRED",
+              actor: "PAIR_MISSION_SCHEDULE",
+              correlation_id: String(bound.mission_id),
+              metadata: {
+                mission_id: bound.mission_id,
+                occurrence_id: occurrenceId,
+                scheduled_for: dueAt,
+                reconciled: "post_create_exception",
+                submit_error: String((err as { message?: string })?.message ?? err),
+              },
+            });
+          } else {
+            token?.settle(false);
+            this.releaseOccurrence(occurrenceId, "submit_failed");
+            row.last_error = String((err as { message?: string })?.message ?? err);
+            errors.push(id);
+          }
         }
       }
       row.next_due_at = nextRunAfter(String(s.cron), now);
