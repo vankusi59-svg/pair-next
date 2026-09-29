@@ -524,6 +524,8 @@ export class BusinessLayer {
     for (const depId of dependsOn) {
       const dep = this.store.tryGet("work_item", depId);
       if (!dep || String(dep.business_id) !== businessId || String(dep.status) !== "DONE") return false;
+      // R4 §6: a quarantined/unproven DONE never satisfies a dependency.
+      if (String(dep.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT") return false;
     }
     return true;
   }
@@ -653,33 +655,131 @@ export class BusinessLayer {
         events.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED")
           .map((e) => String(e.entity_id)),
       );
-      const delegated = new Set(
-        events.filter((e) => e.event_type === "WORK_DELEGATED")
-          .map((e) => String((e.metadata as Record<string, unknown> | undefined)?.child_work_item_id ?? "")),
+      const cancelled = new Set(
+        events.filter((e) => e.event_type === "WORK_ITEM_CANCELLED")
+          .map((e) => String(e.entity_id)),
       );
-      for (const w of this.listWorkItems(businessId)) {
-        const st = String(w.status);
-        const terminalish = TERMINAL_WORK_ITEM_STATUSES.has(st) || st === "REVIEW_REQUIRED";
+      const blocked = new Set(
+        events.filter((e) => e.event_type === "WORK_BLOCKED")
+          .map((e) => String(e.entity_id)),
+      );
+      const inconsistent = new Set(
+        events.filter((e) => e.event_type === "WORK_PROVENANCE_INCONSISTENT")
+          .map((e) => String(e.entity_id)),
+      );
+      const repaired = new Set(
+        events.filter((e) => e.event_type === "WORK_TERMINAL_REPAIRED")
+          .map((e) => String(e.entity_id)),
+      );
+      const delegEventsByChild = new Map<string, Array<Record<string, unknown>>>();
+      for (const e of events.filter((e) => e.event_type === "WORK_DELEGATED")) {
+        const cid = String((e.metadata as Record<string, unknown> | undefined)?.child_work_item_id ?? "");
+        if (!cid) continue;
+        delegEventsByChild.set(cid, [...(delegEventsByChild.get(cid) ?? []), e]);
+      }
+      const markInconsistent = (w: Row, detail: string): void => {
         const id = String(w.work_item_id);
-        // Delegated child without audit: repaired here ONLY when the row
-        // already carries its delegation_key. A keyless legacy row is
-        // left for the replay path, which repairs key + event atomically —
-        // emitting a keyless event here would conflict-block that replay.
-        if (w.delegated_from_work_item_id && w.delegation_key && !delegated.has(id)) {
+        if (!inconsistent.has(id)) {
+          this.store.event({
+            entity_type: "work_item", entity_id: id, event_type: "WORK_PROVENANCE_INCONSISTENT",
+            old_state: String(w.status), new_state: String(w.status), actor: "PAIR_RECONCILE",
+            metadata: { cause: "ungrounded_terminal_or_audit", detail },
+          });
+          inconsistent.add(id);
+        }
+        if (String(w.blocked_code ?? "") !== "TERMINAL_PROVENANCE_CORRUPT") {
+          w.blocked_code = "TERMINAL_PROVENANCE_CORRUPT";
+          w.updated_at = utcnow();
+          this.store.put("work_item", id, w, Number(w.version));
+        }
+      };
+      const items = this.listWorkItems(businessId);
+      const byId = new Map(items.map((w) => [String(w.work_item_id), w]));
+
+      // R4 §8/§9 — delegation audit: validate provenance of EVERY
+      // WORK_DELEGATED referencing the child, not just presence.
+      for (const w of items) {
+        const id = String(w.work_item_id);
+        if (!w.delegated_from_work_item_id) continue;
+        const evs = delegEventsByChild.get(id) ?? [];
+        const key = w.delegation_key ? String(w.delegation_key) : null;
+        const by = w.delegated_by_agent_id ? String(w.delegated_by_agent_id) : null;
+        const to = w.assignee_agent_id ? String(w.assignee_agent_id) : null;
+        if (evs.length > 1) {
+          markInconsistent(w, `duplicate WORK_DELEGATED audit for child ${id}`);
+          continue;
+        }
+        if (evs.length === 1) {
+          const md = (evs[0].metadata as Record<string, unknown> | undefined) ?? {};
+          const bad =
+            String(evs[0].entity_id) !== String(w.delegated_from_work_item_id) ||
+            String(md.delegation_key ?? "") !== String(key ?? "") ||
+            String(md.delegated_from ?? "") !== String(by ?? "") ||
+            String(md.delegated_to ?? "") !== String(to ?? "");
+          if (bad) {
+            markInconsistent(w, `WORK_DELEGATED audit provenance mismatch for child ${id}`);
+            continue;
+          }
+          continue; // audit proven
+        }
+        // 0 events: repair only when row provenance is complete — a
+        // keyless legacy row is left for the replay path, which repairs
+        // key + event atomically.
+        if (key && by && to) {
           this.store.event({
             entity_type: "work_item", entity_id: String(w.delegated_from_work_item_id),
             event_type: "WORK_DELEGATED", actor: "PAIR_RECONCILE",
             metadata: {
-              cause: "restart_reconcile",
-              delegated_from: w.delegated_by_agent_id ?? null,
-              delegated_to: w.assignee_agent_id ?? null,
-              child_work_item_id: id,
-              delegation_key: w.delegation_key,
+              cause: "restart_reconcile", delegated_from: by, delegated_to: to,
+              child_work_item_id: id, delegation_key: key,
             },
           });
-          delegated.add(id);
         }
+      }
+
+      // R4 §1-§7 — terminal proof: status alone is never evidence.
+      // Grounded repair restores ONLY proven missing effects; ungrounded
+      // terminal state is quarantined fail-closed, never normalized.
+      const missionFor = (w: Row): Row | null => {
+        const mids = (w.mission_ids as string[] | undefined) ?? [];
+        return mids.length ? this.store.tryGet("mission", String(mids[mids.length - 1])) : null;
+      };
+      for (const w of items) {
+        const id = String(w.work_item_id);
+        const st = String(w.status);
+        if (String(w.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT") continue;
+        const terminalish = TERMINAL_WORK_ITEM_STATUSES.has(st) || st === "REVIEW_REQUIRED";
         if (!terminalish) continue;
+        const mission = missionFor(w);
+        const ms = mission ? String(mission.status) : null;
+        let proof: string | null = null;
+        if (st === "DONE") {
+          if (w.requires_review === true) {
+            // §4: DONE on a requires_review item needs an actual stored
+            // WORK_REVIEW_ACCEPTED — reviewer identity is never inferred.
+            proof = reviewed.has(id) ? "review_accepted" : null;
+          } else {
+            proof = mission && ms === "COMPLETED" ? "mission_completed" : null;
+          }
+        } else if (st === "REVIEW_REQUIRED") {
+          proof = w.requires_review === true && mission && ms === "COMPLETED"
+            ? "mission_completed_review" : null;
+        } else if (st === "CANCELLED") {
+          proof = cancelled.has(id) ? "cancelled" :
+            mission && ms === "CANCELLED" ? "mission_cancelled" : null;
+        } else if (st === "BLOCKED") {
+          const bc = String(w.blocked_code ?? "");
+          proof =
+            bc === "DEPENDENCY_FAILED" || bc === "BLOCKED_CAPABILITY" ||
+            (mission && (ms === "FAILED" || ms === "PAUSED" || ms === "CANCELLED"))
+              ? "blocked_terminal" : null;
+        }
+        if (!proof) {
+          // §3: ungrounded terminal — quarantine, no propagation, no
+          // synthetic events, no success context.
+          markInconsistent(w, `${st} lacks canonical completion provenance`);
+          continue;
+        }
         let dirty = false;
         if (w.claimed_by || w.claim_token || w.claim_expires_at) {
           w.claimed_by = null;
@@ -687,50 +787,50 @@ export class BusinessLayer {
           w.claim_expires_at = null;
           dirty = true;
         }
-        if (w.blocked_code && st !== "BLOCKED") {
-          w.blocked_code = null;
-          dirty = true;
-        }
         if (dirty) {
           w.updated_at = utcnow();
           this.store.put("work_item", id, w, Number(w.version));
         }
-        if (st === "DONE" && w.requires_review === true && !reviewed.has(id)) {
-          this.store.event({
-            entity_type: "work_item", entity_id: id, event_type: "WORK_REVIEW_ACCEPTED",
-            actor: "PAIR_RECONCILE",
-            metadata: { cause: "restart_reconcile", reviewer_agent_id: w.reviewer_agent_id ?? null },
-          });
-          reviewed.add(id);
-        }
-        if (!syncedStates.has(`${id}|${st}`)) {
-          // Missing sync provenance: re-run effects (propagation is
-          // state-gated → idempotent) then emit the reconcile audit.
+        // Missing evidence for a PROVEN transition → reconstruct the
+        // effects under a clearly-named recovery marker (§5 — never
+        // impersonate the original transition event).
+        const hasEvidence =
+          syncedStates.has(`${id}|${st}`) ||
+          repaired.has(id) ||
+          (proof === "review_accepted") || // the ACCEPT event is the proof
+          (proof === "cancelled" && cancelled.has(id)) ||
+          (proof === "blocked_terminal" && blocked.has(id));
+        if (hasEvidence) continue;
+        if (st === "DONE") {
+          // §6: only proven DONE may propagate success downstream/up.
           this.propagateDependents(id);
-          const assignee = w.assignee_agent_id ? String(w.assignee_agent_id) : null;
-          if (assignee) {
-            try {
-              const agentRow = this.store.get("org_agent", assignee);
-              const notes = (agentRow.context_notes as Array<Record<string, unknown>> | undefined) ?? [];
-              if (!notes.some((n) => String(n.work_item_id) === id && String(n.outcome) === st)) {
-                notes.push({
-                  at: utcnow(), work_item_id: id,
-                  mission_id: String((w.mission_ids as string[] | undefined)?.at(-1) ?? "") || null,
-                  outcome: st,
-                  note: String(w.result_summary ?? w.title ?? "").slice(0, 300),
-                });
-                agentRow.context_notes = notes.slice(-AGENT_CONTEXT_CAP);
-                this.store.put("org_agent", assignee, agentRow, Number(agentRow.version));
-              }
-            } catch { /* agent removed — non-fatal */ }
-          }
-          this.store.event({
-            entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_SYNCED",
-            old_state: st, new_state: st, actor: "PAIR_RECONCILE",
-            metadata: { cause: "restart_reconcile" },
-          });
-          syncedStates.add(`${id}|${st}`);
         }
+        const assignee = w.assignee_agent_id ? String(w.assignee_agent_id) : null;
+        if (assignee && st === "DONE") {
+          try {
+            const agentRow = this.store.get("org_agent", assignee);
+            const notes = (agentRow.context_notes as Array<Record<string, unknown>> | undefined) ?? [];
+            if (!notes.some((n) => String(n.work_item_id) === id && String(n.outcome) === st)) {
+              notes.push({
+                at: utcnow(), work_item_id: id,
+                mission_id: mission ? String(mission.mission_id) : null,
+                outcome: st,
+                note: String(w.result_summary ?? w.title ?? "").slice(0, 300),
+              });
+              agentRow.context_notes = notes.slice(-AGENT_CONTEXT_CAP);
+              this.store.put("org_agent", assignee, agentRow, Number(agentRow.version));
+            }
+          } catch { /* agent removed — non-fatal */ }
+        }
+        this.store.event({
+          entity_type: "work_item", entity_id: id, event_type: "WORK_TERMINAL_REPAIRED",
+          actor: "PAIR_RECONCILE",
+          metadata: {
+            cause: "restart_reconcile", proven_transition: proof,
+            recovered_state: st,
+            mission_id: mission ? String(mission.mission_id) : null,
+          },
+        });
       }
     });
   }
@@ -1379,7 +1479,11 @@ export class BusinessLayer {
     return this.store
       .list("work_item")
       .filter((c) => String(c.parent_work_item_id) === pid)
-      .every((c) => String(c.status) === "DONE");
+      .every((c) =>
+        String(c.status) === "DONE" &&
+        // R4 §6: an ungrounded/quarantined DONE never counts as proven
+        // completion — it cannot release a parent.
+        String(c.blocked_code ?? "") !== "TERMINAL_PROVENANCE_CORRUPT");
   }
 
   /**

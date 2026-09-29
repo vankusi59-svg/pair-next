@@ -582,3 +582,116 @@ execution engine; no new locking — `PairEvidenceStore.immediate()` is the
 single transaction authority.
 
 Classification: **`P14_REMEDIATED_R3_PENDING_AUDIT`** — DO NOT MERGE.
+
+---
+
+# P14 REMEDIATION R4 — GROUNDED TERMINAL RECOVERY + AUDIT PROVENANCE
+
+Mandate: recovery must never infer a transition from terminal status alone —
+canonical evidence proves the transition, ungrounded terminal state fails
+closed, review acceptance is never fabricated, and the `WORK_DELEGATED`
+audit check is global-by-child.
+
+## R4.1 — Grounded-proof recovery (§1–§2, §5)
+
+`reconcileTerminalConsistency` now classifies every terminal-ish row by a
+canonical proof, never by status:
+
+| row state | canonical proof required |
+|---|---|
+| `DONE` (no review) | linked mission exists, belongs to the item, is `COMPLETED` |
+| `REVIEW_REQUIRED` | `requires_review` + linked mission `COMPLETED` |
+| `DONE` + `requires_review` | an actual stored `WORK_REVIEW_ACCEPTED` for this item — reviewer identity is never inferred from `reviewer_agent_id` |
+| `CANCELLED` | a real `WORK_ITEM_CANCELLED` event (explicit cancel) or a `CANCELLED` linked mission (mission-cancelled fold) — the two causes stay distinguishable |
+| `BLOCKED` | `DEPENDENCY_FAILED` / `BLOCKED_CAPABILITY` code or a terminal (FAILED/PAUSED/CANCELLED) linked mission |
+
+When the proof exists but recorded effects are missing, recovery emits a
+clearly-named `WORK_TERMINAL_REPAIRED` marker (actor `PAIR_RECONCILE`,
+metadata carries `proven_transition` + `mission_id`) and restores only the
+proven effects — dependency propagation, parent completion evaluation, a
+dedup'd agent context outcome. It does **not** require every terminal row
+to carry `WORK_ITEM_SYNCED`, creates no DONE→DONE / CANCELLED→CANCELLED
+markers, and never impersonates the original transition event.
+
+## R4.2 — Ungrounded terminal fails closed (§3, §6, §7)
+
+A terminal row with no canonical proof is quarantined, never normalized:
+`blocked_code = "TERMINAL_PROVENANCE_CORRUPT"` plus exactly one
+`WORK_PROVENANCE_INCONSISTENT` audit event (idempotent — dedup'd by event
+presence). A corrupt row: promotes no dependent (`depsSatisfied` excludes
+it), releases no parked parent (`mandatoryChildrenComplete` excludes it),
+gets no propagation/context/bookkeeping, and stays inspectable for the
+operator.
+
+## R4.3 — No fabricated review acceptance (§4)
+
+The R3 rule that emitted `WORK_REVIEW_ACCEPTED` for `DONE` +
+`requires_review` rows is removed. `proof = reviewed.has(id)` — only a
+real stored acceptance counts; an approval with `reviewer: null` can never
+be created. A `DONE` review item whose mission completed but whose
+acceptance never happened is quarantined as ungrounded.
+
+## R4.4 — Global `WORK_DELEGATED` uniqueness (§8–§9)
+
+`ensureDelegationEvent` and the restart sweep both index every
+`WORK_DELEGATED` by `metadata.child_work_item_id` regardless of
+`entity_id`:
+
+- **0 events** → emit one canonical event, but only when the child row's
+  provenance is complete (key + delegated_from/by + assignee); a keyless
+  legacy row is left for the replay path which repairs key + event
+  atomically — restart never guesses a key.
+- **1 event** → validate `entity_id === delegated_from_work_item_id` AND
+  metadata key/from/to — any mismatch fails closed.
+- **>1 event** → duplicate audit fails closed.
+
+Conflicts quarantine the child (`TERMINAL_PROVENANCE_CORRUPT` +
+`WORK_PROVENANCE_INCONSISTENT`) and replay throws
+`FAIL_CLOSED_WORK_DELEGATE_CONFLICT`; no repair is attempted against
+conflicting evidence.
+
+## R4 evidence — 10 new tests (P14: 66/66)
+
+- **GROUND-R4-UNGROUNDED-DONE**: forced `DONE`, no mission → corrupt
+  marker + one inconsistency event, zero `WORK_ITEM_SYNCED`, zero context
+  notes, idempotent on repeat sweeps.
+- **GROUND-R4-DEPENDENT**: dependent of a corrupt `DONE` stays `BACKLOG`.
+- **GROUND-R4-PARENT**: parked `CHILD_INCOMPLETE` parent is NOT released
+  by an ungrounded `DONE` child.
+- **GROUND-R4-LEGACY-SYNC**: real completed mission + forced `DONE` →
+  one `WORK_TERMINAL_REPAIRED`, dependent promoted `READY`, one context
+  note.
+- **REVIEW-R4-NO-FABRICATION**: `requires_review` `DONE` with completed
+  mission but no ACCEPT → corrupt; zero `WORK_REVIEW_ACCEPTED`.
+- **REVIEW-R4-VALID**: a real ACCEPT survives repeated recovery — still
+  one event, clean row.
+- **CANCEL-R4-SEMANTICS**: explicit cancel keeps its
+  `WORK_ITEM_CANCELLED`, no synthetic sync on repeated sweeps.
+- **DELEG-R4-WRONG-PARENT-EVENT**: audit stored under another entity_id →
+  replay `FAIL_CLOSED_WORK_DELEGATE_CONFLICT`, no new event, no child.
+- **DELEG-R4-DUP-EVENT**: second injected audit → replay fails closed;
+  restart sweep adds nothing and quarantines the child.
+- **DELEG-R4-RECONCILE-CONFLICT**: row vs audit disagreement at restart →
+  child corrupt + inconsistency event, no repair.
+
+Pre-R4 fixtures that seeded `DONE` without a mission (REC-B,
+PARENT-R3-RESTART, FINALIZE-R3-IDEMPOTENT) were updated to ground the
+terminal state through a real completed mission — the scenarios they
+prove are unchanged, but recovery now repairs only canonical proof.
+
+## R4 validation
+
+| gate | result |
+|---|---|
+| P14 suite | **66/66 PASS** (10 new R4 tests) |
+| P13 | 67/67 · P12 71/71 · P11 103/103 · P9 79/79 |
+| typecheck | clean · build PASS |
+| audit | 0 high / 0 critical |
+| Node 22 full | 1989 pass / 2 env P5 probe (CodexCli executable absent — documented env gap) |
+| Node 20 full | **1991/0** |
+| verifyIntegrity | clean in every crash/restart/race/quarantine test |
+
+All R1/R2/R3 closures unchanged; `PairEvidenceStore.immediate()` remains
+the single transaction authority; no second store/router/dispatcher.
+
+Classification: **`P14_REMEDIATED_R4_PENDING_AUDIT`** — DO NOT MERGE.

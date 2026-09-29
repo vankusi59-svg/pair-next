@@ -206,9 +206,9 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `FAIL_CLOSED_PARENT_INCOMPLETE` on early ACCEPT); `agentInbox` strictly
   read-only (reconciliation on heartbeat/board seams); capability
   admission enforced at create/decompose/rebuild.
-- Classification: **`P14_REMEDIATED_R3_PENDING_AUDIT`** — branch
+- Classification: **`P14_REMEDIATED_R4_PENDING_AUDIT`** — branch
   `devin/1790682872-p14-autonomous-workforce`, DO NOT MERGE. Evidence in
-  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md` §R1+§R2+§R3.
+  `PAIR_OS_VNEXT_P14_AUTONOMOUS_WORKFORCE_WORK_GRAPH_REPORT.md` §R1+§R2+§R3+§R4.
   R3 closures: delegation completeness now requires row provenance AND the
   canonical WORK_DELEGATED audit — `ensureDelegationEvent` repairs a
   missing event / fails `FAIL_CLOSED_WORK_DELEGATE_CONFLICT` on conflict,
@@ -216,10 +216,20 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `reviewWorkItem` each commit their full effect set (write + propagation
   + context + event) in one `store.immediate()` — crash → rollback, retry
   converges; `reconcileTerminalConsistency` at the head of
-  `rebuildReadiness` idempotently repairs legacy partial terminal state
-  (missing sync/review/delegation events, stale claims, parked parents).
-  Totals: P14 56/56 (8 R3 tests, 1 three-way race), P13 67/67, P12 71/71,
-  P11 103/103, P9 79/79, N22 1979/2env, N20 1981/0, typecheck+build PASS,
+  `rebuildReadiness` idempotently repairs legacy partial terminal state.
+  R4 closures: recovery is grounded-proof only — status alone is never
+  evidence; per-state canonical proofs (completed mission / stored
+  WORK_REVIEW_ACCEPTED / cancel vs mission-cancel / blocker evidence);
+  ungrounded terminal rows quarantine as `TERMINAL_PROVENANCE_CORRUPT` +
+  one `WORK_PROVENANCE_INCONSISTENT` event — no dependent promotion
+  (`depsSatisfied`), no parent release (`mandatoryChildrenComplete`), no
+  synthetic events or success context; grounded repairs emit a named
+  `WORK_TERMINAL_REPAIRED` marker, never a fabricated transition;
+  WORK_REVIEW_ACCEPTED is never reconstructed; `WORK_DELEGATED` audit is
+  indexed globally by `child_work_item_id` — entity_id/key/from/to
+  mismatch or duplicate events fail closed at both replay and restart.
+  Totals: P14 66/66 (10 R4 tests), P13 67/67, P12 71/71,
+  P11 103/103, P9 79/79, N22 1989/2env, N20 1991/0, typecheck+build PASS,
   audit 0 high/0 critical, verifyIntegrity clean.
 
 ## Not yet

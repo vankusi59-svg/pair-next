@@ -1002,13 +1002,18 @@ describe("P14 crash/recovery", () => {
 
   it("REC-B: readiness reconstructed on restart from canonical dep state", () => {
     const { ctx, biz } = makeBizCtx("rec-b");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
     const b = makeBiz(biz, ctx.projectId);
     const bid = String(b.business_id);
     const ag = makeAgent(biz, bid, "auto");
     const pre = wi(biz, bid, { assignee_agent_id: String(ag.agent_id) });
     const dep = wi(biz, bid, { assignee_agent_id: String(ag.agent_id), depends_on: [String(pre.work_item_id)] });
-    // Force the prerequisite DONE directly via canonical mutation (the
-    // crash window: mission finished, propagation never ran).
+    // Grounded crash window: the mission genuinely COMPLETED, the fold's
+    // effects (sync event, propagation) never ran. R4: recovery repairs
+    // only because canonical mission evidence proves the transition.
+    biz.openWorkItem(String(pre.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(pre.work_item_id), false);
     const row = ctx.store.get("work_item", String(pre.work_item_id));
     row.status = "DONE";
     ctx.store.put("work_item", String(pre.work_item_id), row, Number(row.version));
@@ -1930,8 +1935,11 @@ describe("P14 R3 remediations", () => {
     biz.openWorkItem(String(parent.work_item_id), "op");
     completeWorkMission(ctx, biz, a, String(parent.work_item_id));
     expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
-    // Legacy-style partial state: child canonical DONE but its sync event
-    // and the parent evaluation never ran.
+    // Legacy-style partial state: the child's mission genuinely COMPLETED
+    // (canonical proof) but the fold's effects — sync event and parent
+    // evaluation — never ran (R4: grounded recovery only).
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id), false);
     const crow = ctx.store.get("work_item", String(child.work_item_id));
     crow.status = "DONE";
     ctx.store.put("work_item", String(child.work_item_id), crow, Number(crow.version));
@@ -1940,21 +1948,29 @@ describe("P14 R3 remediations", () => {
     re.biz.rebuildReadiness(bid);
     const released = re.ctx.store.get("work_item", String(parent.work_item_id));
     expect(String(released.status)).toBe("DONE");
-    // Child's missing sync provenance + the parent's completion both
-    // landed as audit events.
-    const evs = re.ctx.store.listEvents().filter((e) => e.event_type === "WORK_ITEM_SYNCED");
-    expect(evs.filter((e) => e.entity_id === String(child.work_item_id)).length).toBe(1);
-    expect(evs.filter((e) => e.entity_id === String(parent.work_item_id)).length).toBe(1);
+    // The child's sync provenance was missing → recovery emits a named
+    // WORK_TERMINAL_REPAIRED marker (mission-grounded); the parent's own
+    // completion is the canonical WORK_ITEM_SYNCED.
+    const evs = re.ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_TERMINAL_REPAIRED"
+      && e.entity_id === String(child.work_item_id)).length).toBe(1);
+    expect(evs.filter((e) => e.event_type === "WORK_ITEM_SYNCED"
+      && e.entity_id === String(parent.work_item_id)).length).toBe(1);
     re.ctx.store.verifyIntegrity();
   });
 
   it("FINALIZE-R3-IDEMPOTENT: repeated reconciliation emits no duplicate provenance", () => {
     const { ctx, biz } = makeBizCtx("fin-r3-idem");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
     const b = makeBiz(biz, ctx.projectId);
     const bid = String(b.business_id);
     const lead = makeAgent(biz, bid, "lead");
     const item = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
-    // Terminal row with a stale claim and no sync evidence.
+    // Grounded-but-unrecorded terminal: mission genuinely COMPLETED,
+    // the row carries DONE (legacy crash gap) — recovery may repair.
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id), false);
     const row = ctx.store.get("work_item", String(item.work_item_id));
     row.status = "DONE";
     row.claimed_by = String(lead.agent_id);
@@ -1968,9 +1984,11 @@ describe("P14 R3 remediations", () => {
     expect(fixed.claimed_by).toBeNull();
     expect(fixed.claim_token).toBeNull();
     expect(fixed.claim_expires_at).toBeNull();
-    const evs = ctx.store.listEvents().filter((e) =>
-      e.event_type === "WORK_ITEM_SYNCED" && e.entity_id === String(item.work_item_id));
-    expect(evs.length).toBe(1);
+    // Exactly one recovery marker — never a synthetic WORK_ITEM_SYNCED.
+    expect(ctx.store.listEvents().filter((e) =>
+      e.event_type === "WORK_TERMINAL_REPAIRED" && e.entity_id === String(item.work_item_id)).length).toBe(1);
+    expect(ctx.store.listEvents().filter((e) =>
+      e.event_type === "WORK_ITEM_SYNCED" && e.entity_id === String(item.work_item_id)).length).toBe(0);
     const agentRow = ctx.store.get("org_agent", String(lead.agent_id));
     const notes = (agentRow.context_notes as Array<Record<string, unknown>>)
       .filter((n) => String(n.work_item_id) === String(item.work_item_id));
@@ -2021,5 +2039,299 @@ describe("P14 R3 remediations", () => {
       && e.entity_id === String(parent.work_item_id)
       && String(e.new_state) === "REVIEW_REQUIRED").length).toBe(1);
     store2.verifyIntegrity();
+  });
+});
+
+/* ------------------------------ R4 REMEDIATIONS -------------------------- */
+
+describe("P14 R4 remediations", () => {
+  it("GROUND-R4-UNGROUNDED-DONE: status alone is never proof — quarantined, nothing synthesized", () => {
+    const { ctx, biz } = makeBizCtx("gr4-ungrounded");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const item = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const row = ctx.store.get("work_item", String(item.work_item_id));
+    row.status = "DONE"; // corrupt — no mission, no evidence
+    ctx.store.put("work_item", String(item.work_item_id), row, Number(row.version));
+    biz.rebuildReadiness(bid);
+    biz.rebuildReadiness(bid); // idempotent
+    const q = ctx.store.get("work_item", String(item.work_item_id));
+    expect(String(q.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const evs = ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_ITEM_SYNCED"
+      && e.entity_id === String(item.work_item_id)).length).toBe(0);
+    expect(evs.filter((e) => e.event_type === "WORK_TERMINAL_REPAIRED"
+      && e.entity_id === String(item.work_item_id)).length).toBe(0);
+    expect(evs.filter((e) => e.event_type === "WORK_PROVENANCE_INCONSISTENT"
+      && e.entity_id === String(item.work_item_id)).length).toBe(1);
+    // No success context was reconstructed from status alone.
+    const agentRow = ctx.store.get("org_agent", String(lead.agent_id));
+    expect(((agentRow.context_notes as unknown[] | undefined) ?? []).length).toBe(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("GROUND-R4-DEPENDENT: unproven DONE never promotes a dependent", () => {
+    const { ctx, biz } = makeBizCtx("gr4-dep");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const a = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const bItem = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      depends_on: [String(a.work_item_id)],
+    });
+    expect(String(ctx.store.get("work_item", String(bItem.work_item_id)).status)).toBe("BACKLOG");
+    const arow = ctx.store.get("work_item", String(a.work_item_id));
+    arow.status = "DONE"; // ungrounded
+    ctx.store.put("work_item", String(a.work_item_id), arow, Number(arow.version));
+    biz.rebuildReadiness(bid);
+    expect(String(ctx.store.get("work_item", String(a.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(String(ctx.store.get("work_item", String(bItem.work_item_id)).status)).toBe("BACKLOG");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("GROUND-R4-PARENT: unproven DONE child never releases a parked parent", () => {
+    const { ctx, biz, workforce } = makeBizCtx("gr4-parent");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "KG4",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code))
+      .toBe("CHILD_INCOMPLETE");
+    // Child forced DONE with no mission/evidence.
+    const crow = ctx.store.get("work_item", String(child.work_item_id));
+    crow.status = "DONE";
+    ctx.store.put("work_item", String(child.work_item_id), crow, Number(crow.version));
+    biz.rebuildReadiness(bid);
+    const pq = ctx.store.get("work_item", String(parent.work_item_id));
+    expect(String(pq.status)).toBe("IN_PROGRESS");
+    expect(String(pq.blocked_code)).toBe("CHILD_INCOMPLETE");
+    expect(String(ctx.store.get("work_item", String(child.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("GROUND-R4-LEGACY-SYNC: grounded DONE missing its evidence is repaired", () => {
+    const { ctx, biz } = makeBizCtx("gr4-legacy");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const item = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const dep = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      depends_on: [String(item.work_item_id)],
+    });
+    // Real completed mission — canonical proof exists; only the fold's
+    // effects were lost (legacy gap).
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id), false);
+    const row = ctx.store.get("work_item", String(item.work_item_id));
+    row.status = "DONE";
+    ctx.store.put("work_item", String(item.work_item_id), row, Number(row.version));
+    biz.rebuildReadiness(bid);
+    const fixed = ctx.store.get("work_item", String(item.work_item_id));
+    expect(String(fixed.status)).toBe("DONE");
+    expect(fixed.blocked_code === null || String(fixed.blocked_code) !== "TERMINAL_PROVENANCE_CORRUPT").toBe(true);
+    // Grounded effects restored: recovery marker + dependent promoted.
+    const evs = ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_TERMINAL_REPAIRED"
+      && e.entity_id === String(item.work_item_id)).length).toBe(1);
+    expect(String(ctx.store.get("work_item", String(dep.work_item_id)).status)).toBe("READY");
+    const agentRow = ctx.store.get("org_agent", String(lead.agent_id));
+    expect(((agentRow.context_notes as unknown[] | undefined) ?? [])
+      .filter((n) => String((n as Record<string, unknown>).work_item_id) === String(item.work_item_id)).length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R4-NO-FABRICATION: DONE requires_review without ACCEPT evidence fails closed", () => {
+    const { ctx, biz } = makeBizCtx("rev-r4-nofab");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const rev = makeAgent(biz, bid, "rev");
+    const item = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    // Even a genuinely completed mission does not prove a reviewer acted.
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id), false);
+    const row = ctx.store.get("work_item", String(item.work_item_id));
+    row.status = "DONE"; // corrupt: review acceptance never happened
+    ctx.store.put("work_item", String(item.work_item_id), row, Number(row.version));
+    biz.rebuildReadiness(bid);
+    const q = ctx.store.get("work_item", String(item.work_item_id));
+    expect(String(q.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const evs = ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED").length).toBe(0);
+    expect(evs.filter((e) => e.event_type === "WORK_PROVENANCE_INCONSISTENT"
+      && e.entity_id === String(item.work_item_id)).length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("REVIEW-R4-VALID: a real ACCEPT stays untouched and idempotent through recovery", () => {
+    const { ctx, biz } = makeBizCtx("rev-r4-valid");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const rev = makeAgent(biz, bid, "rev");
+    const item = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, reviewer_agent_id: String(rev.agent_id),
+    });
+    biz.openWorkItem(String(item.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(item.work_item_id));
+    biz.reviewWorkItem(String(item.work_item_id), {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT",
+    }, "op");
+    biz.rebuildReadiness(bid);
+    biz.rebuildReadiness(bid);
+    const evs = ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED"
+      && e.entity_id === String(item.work_item_id)).length).toBe(1);
+    expect(String(ctx.store.get("work_item", String(item.work_item_id)).status)).toBe("DONE");
+    expect(ctx.store.get("work_item", String(item.work_item_id)).blocked_code).toBeNull();
+    ctx.store.verifyIntegrity();
+  });
+
+  it("CANCEL-R4-SEMANTICS: explicit cancel stays WORK_ITEM_CANCELLED — no synthetic sync", () => {
+    const { ctx, biz } = makeBizCtx("cancel-r4");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const item = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    biz.cancelWorkItem(String(item.work_item_id), "op");
+    biz.rebuildReadiness(bid);
+    biz.rebuildReadiness(bid);
+    const evs = ctx.store.listEvents().filter((e) => e.entity_id === String(item.work_item_id));
+    expect(evs.filter((e) => e.event_type === "WORK_ITEM_SYNCED").length).toBe(0);
+    expect(evs.filter((e) => e.event_type === "WORK_TERMINAL_REPAIRED").length).toBe(0);
+    expect(evs.filter((e) => e.event_type === "WORK_ITEM_CANCELLED").length).toBe(1);
+    expect(String(ctx.store.get("work_item", String(item.work_item_id)).status)).toBe("CANCELLED");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-R4-WRONG-PARENT-EVENT: event under another entity_id fails closed", () => {
+    const { ctx, biz, workforce } = makeBizCtx("deleg-r4-wrong");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const other = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const childId = `WI_DL_${createHash("sha256")
+      .update(`${String(parent.work_item_id)}|K-WP`).digest("hex").slice(0, 20).toUpperCase()}`;
+    // Conflicting audit: same child id but stored under the WRONG parent.
+    ctx.store.event({
+      entity_type: "work_item", entity_id: String(other.work_item_id),
+      event_type: "WORK_DELEGATED", actor: "seed",
+      metadata: {
+        delegated_from: String(lead.agent_id), delegated_to: String(worker.agent_id),
+        child_work_item_id: childId, delegation_key: "K-WP",
+      },
+    });
+    expect(errCode(() => workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "K-WP",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_DELEGATE_CONFLICT");
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_DELEGATED").length).toBe(1);
+    expect(ctx.store.tryGet("work_item", childId)).toBeNull();
+  });
+
+  it("DELEG-R4-DUP-EVENT: duplicate WORK_DELEGATED for one child fails closed", () => {
+    const { ctx, biz, workforce } = makeBizCtx("deleg-r4-dup");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "K-DUP",
+    }, "op");
+    // Inject a second audit for the same child.
+    ctx.store.event({
+      entity_type: "work_item", entity_id: String(parent.work_item_id),
+      event_type: "WORK_DELEGATED", actor: "seed",
+      metadata: {
+        delegated_from: String(lead.agent_id), delegated_to: String(worker.agent_id),
+        child_work_item_id: String(child.work_item_id), delegation_key: "K-DUP",
+      },
+    });
+    expect(errCode(() => workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "K-DUP",
+    }, "op"))).toBe("FAIL_CLOSED_WORK_DELEGATE_CONFLICT");
+    // Restart reconciliation also fails closed — no third event is added.
+    biz.rebuildReadiness(bid);
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_DELEGATED").length).toBe(2);
+    expect(String(ctx.store.get("work_item", String(child.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-R4-RECONCILE-CONFLICT: row vs audit disagreement fails closed at restart", () => {
+    const { ctx, biz } = makeBizCtx("deleg-r4-rc");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const wrongTo = makeAgent(biz, bid, "other");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const childId = `WI_DL_${createHash("sha256")
+      .update(`${String(parent.work_item_id)}|K-RC`).digest("hex").slice(0, 20).toUpperCase()}`;
+    ctx.store.put("work_item", childId, {
+      work_item_id: childId, business_id: bid, title: "c", goal: "g",
+      status: "READY", assignee_agent_id: String(worker.agent_id),
+      parent_work_item_id: String(parent.work_item_id),
+      delegated_from_work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegation_depth: 1, delegation_reason: null, delegation_key: "K-RC",
+      required_capability: null, decomposition_id: null,
+      depends_on: [], mission_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 0,
+    } as never, 0);
+    // Existing event disagrees with the row (different delegatee).
+    ctx.store.event({
+      entity_type: "work_item", entity_id: String(parent.work_item_id),
+      event_type: "WORK_DELEGATED", actor: "seed",
+      metadata: {
+        delegated_from: String(lead.agent_id), delegated_to: String(wrongTo.agent_id),
+        child_work_item_id: childId, delegation_key: "K-RC",
+      },
+    });
+    biz.rebuildReadiness(bid);
+    expect(String(ctx.store.get("work_item", childId).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const evs = ctx.store.listEvents();
+    expect(evs.filter((e) => e.event_type === "WORK_DELEGATED").length).toBe(1);
+    expect(evs.filter((e) => e.event_type === "WORK_PROVENANCE_INCONSISTENT"
+      && e.entity_id === childId).length).toBe(1);
+    ctx.store.verifyIntegrity();
   });
 });

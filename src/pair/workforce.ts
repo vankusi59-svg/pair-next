@@ -327,8 +327,11 @@ export class WorkforceService {
     parentId: string, childId: string, key: string,
     byId: string, toId: string, actor: string,
   ): void {
+    // R4 §8: inspect EVERY WORK_DELEGATED referencing this child — a
+    // conflicting event stored under a different entity_id is still a
+    // conflict, never a license to emit a second event.
     const matches = this.store.listEvents().filter((e) =>
-      e.event_type === "WORK_DELEGATED" && String(e.entity_id) === parentId &&
+      e.event_type === "WORK_DELEGATED" &&
       String((e.metadata as Record<string, unknown> | undefined)?.child_work_item_id ?? "") === childId,
     );
     if (matches.length > 1) {
@@ -340,6 +343,7 @@ export class WorkforceService {
     if (matches.length === 1) {
       const md = (matches[0].metadata as Record<string, unknown> | undefined) ?? {};
       const conflict =
+        String(matches[0].entity_id) !== parentId ||
         String(md.delegation_key ?? "") !== key ||
         String(md.delegated_from ?? "") !== byId ||
         String(md.delegated_to ?? "") !== toId;
