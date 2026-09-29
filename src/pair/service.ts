@@ -90,9 +90,14 @@ export class PairControlPlane {
     risk_ceiling?: string;
     execution_mode?: string;
     metadata?: Record<string, unknown>;
+    /** Foundation V2: pinned identity usable ONLY by the internal
+     *  business/work bound-mission seam — never reachable from the
+     *  generic Mission Control API. A colliding id fails closed on the
+     *  version-0 CAS insert; there is no overwrite/upsert path. */
+    mission_id?: string;
   }): Record<string, unknown> {
     const project = this.getProject(params.project_id);
-    const missionId = newId("MSN");
+    const missionId = params.mission_id ?? newId("MSN");
     const authorized = (params.authorized_workspaces ?? [String(project.root_location)]).map(
       (p) => path.resolve(p),
     );

@@ -33,6 +33,7 @@ export const WORK_ITEM_STATUSES = [
   "BACKLOG",
   "READY",
   "IN_PROGRESS",
+  "REVIEW_REQUIRED",
   "BLOCKED",
   "DONE",
   "CANCELLED",
@@ -58,11 +59,18 @@ const WORK_ITEM_TRANSITIONS: Record<WorkItemStatus, readonly WorkItemStatus[]> =
   // READY→READY is the reassign/refresh path; every other self-transition
   // (e.g. IN_PROGRESS→IN_PROGRESS, a duplicate open) is illegal.
   READY: ["READY", "IN_PROGRESS", "BLOCKED", "BACKLOG", "CANCELLED"],
-  IN_PROGRESS: ["BLOCKED", "DONE", "CANCELLED"],
+  IN_PROGRESS: ["BLOCKED", "DONE", "CANCELLED", "REVIEW_REQUIRED"],
+  // REVIEW_REQUIRED → DONE only via reviewWorkItem ACCEPT, → READY via
+  // REWORK; BLOCKED/CANCELLED remain available as safety operations.
+  REVIEW_REQUIRED: ["DONE", "READY", "BLOCKED", "CANCELLED"],
   BLOCKED: ["READY", "IN_PROGRESS", "CANCELLED"],
   DONE: [],
   CANCELLED: [],
 };
+
+/** Fail-closed marker for a row whose canonical provenance is corrupt —
+ *  hard-quarantines the item out of every authority path. */
+export const WORK_CORRUPT_CODE = "TERMINAL_PROVENANCE_CORRUPT";
 
 function assertWorkItemTransition(from: string, to: WorkItemStatus): void {
   if (!(WORK_ITEM_TRANSITIONS[from as WorkItemStatus] ?? []).includes(to)) {
@@ -327,6 +335,8 @@ export class BusinessLayer {
     objective_id?: string;
     priority?: number;
     source?: string;
+    requires_review?: boolean;
+    reviewer_agent_id?: string;
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.create");
@@ -344,6 +354,15 @@ export class BusinessLayer {
         throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", String(agent.agent_id));
       }
       department = department || String(agent.department ?? "");
+    }
+    if (input.reviewer_agent_id) {
+      const rev = this.store.get("org_agent", input.reviewer_agent_id);
+      if (String(rev.business_id) !== input.business_id) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `reviewer outside business ${input.business_id}`);
+      }
+      if (String(rev.agent_id) === String(input.assignee_agent_id ?? "")) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", "reviewer cannot be the assignee");
+      }
     }
     if (input.objective_id) {
       const obj = this.store.get("objective", input.objective_id);
@@ -363,6 +382,9 @@ export class BusinessLayer {
       routine_id: null as string | null,
       priority: input.priority ?? 50,
       source: input.source ?? "manual",
+      requires_review: input.requires_review === true,
+      reviewer_agent_id: input.reviewer_agent_id ?? null,
+      blocked_code: null as string | null,
       status: (input.assignee_agent_id ? "READY" : "BACKLOG") as WorkItemStatus,
       mission_ids: [] as string[],
       claimed_by: null as string | null,
@@ -385,6 +407,96 @@ export class BusinessLayer {
     return saved;
   }
 
+  // ---------- canonical provenance (Foundation V2) ----------
+  //
+  // `work_open_binding` is the durable canonical authority record the
+  // business layer creates BEFORE the mission it pins exists. It
+  // authoritatively binds open_id / work_item_id / business_id /
+  // project_id / org_agent / created_by / lifecycle state / reserved
+  // mission_id / CAS version. Mission metadata may MIRROR these values
+  // for observability, but proof derives only from the binding — caller
+  // or model supplied metadata can never itself constitute authority.
+
+  /** Is mission `m` canonically bound to work item `row`? Proof requires
+   *  a `work_open_binding` in state BOUND whose mission_id, work_item_id
+   *  and business_id match — and whose pinned project matches the
+   *  mission's project (cross-scope forgery fails closed). */
+  missionBoundToWorkItem(row: Row, m: Row): boolean {
+    const mids = (row.mission_ids as string[] | undefined) ?? [];
+    if (!mids.includes(String(m.mission_id))) return false;
+    return this.store.list("work_open_binding").some((b) =>
+      String(b.mission_id ?? "") === String(m.mission_id) &&
+      String(b.work_item_id) === String(row.work_item_id) &&
+      String(b.business_id) === String(row.business_id) &&
+      String(b.project_id) === String(m.project_id) &&
+      String(b.state) === "BOUND");
+  }
+
+  /** The row's last mission when it is canonically bound, else null. */
+  boundMissionForWorkItem(row: Row): Row | null {
+    const mids = (row.mission_ids as string[] | undefined) ?? [];
+    if (!mids.length) return null;
+    const m = this.store.tryGet("mission", String(mids[mids.length - 1]));
+    return m && this.missionBoundToWorkItem(row, m) ? m : null;
+  }
+
+  /** Exactly one provenance-valid WORK_REVIEW_ACCEPTED for this row. */
+  proveReviewAcceptance(row: Row): boolean {
+    const evs = this.store.listEvents().filter((e) =>
+      e.event_type === "WORK_REVIEW_ACCEPTED" &&
+      String(e.entity_id) === String(row.work_item_id));
+    if (evs.length !== 1) return false;
+    const e = evs[0];
+    const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+    if (String(e.old_state ?? "") !== "REVIEW_REQUIRED") return false;
+    if (String(e.new_state ?? "") !== "DONE") return false;
+    const rev = String(md.reviewer_agent_id ?? "");
+    if (!rev) return false;
+    const revRow = this.store.tryGet("org_agent", rev);
+    if (!revRow || String(revRow.business_id) !== String(row.business_id)) return false;
+    if (rev === String(row.assignee_agent_id ?? "")) return false;
+    if (row.reviewer_agent_id && rev !== String(row.reviewer_agent_id)) return false;
+    return true;
+  }
+
+  /** Is this row's DONE canonically proven? Status alone never counts. */
+  proveWorkItemDone(row: Row): boolean {
+    if (String(row.status) !== "DONE") return false;
+    const m = this.boundMissionForWorkItem(row);
+    if (!m || String(m.status) !== "COMPLETED") return false;
+    return row.requires_review === true ? this.proveReviewAcceptance(row) : true;
+  }
+
+  /** Quarantine a row live — corrupt rows are non-executable and
+   *  non-progressable until explicit governed repair. Idempotent. */
+  private quarantineWorkItem(row: Row, detail: string): void {
+    const id = String(row.work_item_id);
+    const marked = this.store.listEvents().some((e) =>
+      e.event_type === "WORK_PROVENANCE_INCONSISTENT" && String(e.entity_id) === id);
+    if (!marked) {
+      this.store.event({
+        entity_type: "work_item", entity_id: id, event_type: "WORK_PROVENANCE_INCONSISTENT",
+        old_state: String(row.status), new_state: String(row.status), actor: "PAIR_RECONCILE",
+        metadata: { cause: "ungrounded_provenance", detail },
+      });
+    }
+    if (String(row.blocked_code ?? "") !== WORK_CORRUPT_CODE) {
+      row.blocked_code = WORK_CORRUPT_CODE;
+      row.updated_at = utcnow();
+      this.store.put("work_item", id, row, Number(row.version));
+    }
+  }
+
+  /** Centralized hard-quarantine guard for every authority-bearing path. */
+  assertWorkItemNotQuarantined(row: Row): void {
+    if (String(row.blocked_code ?? "") === WORK_CORRUPT_CODE) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+        `work item ${String(row.work_item_id)} quarantined — canonical provenance corrupt`,
+      );
+    }
+  }
+
   listWorkItems(businessId?: string): Row[] {
     const all = this.store.list("work_item");
     return (businessId ? all.filter((w) => String(w.business_id) === businessId) : all)
@@ -393,6 +505,7 @@ export class BusinessLayer {
 
   assignWorkItem(workItemId: string, agentId: string, actor: string): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    this.assertWorkItemNotQuarantined(row);
     const agent = this.store.get("org_agent", agentId);
     if (String(agent.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `assignee outside business ${row.business_id}`);
@@ -431,6 +544,7 @@ export class BusinessLayer {
   openWorkItem(workItemId: string, operatorId: string): Row {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
     const row = this.resolvePendingOpenBeforeMutation(workItemId, operatorId);
+    this.assertWorkItemNotQuarantined(row);
     // A previous linked mission still live forbids a replacement — the
     // governed path is pause/cancel/resume/reconcile, not a second dispatch.
     const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
@@ -462,11 +576,12 @@ export class BusinessLayer {
       }
     }
     // Durable open intent committed BEFORE mission creation: the transition
-    // write is the dedup point, and pending_open_id ties this intent to the
-    // mission it creates (metadata.work_item_open_id) so a crash at any
-    // boundary can be reconciled instead of silently duplicated or rolled
-    // back over a live mission.
+    // write is the dedup point, and the canonical `work_open_binding`
+    // record ties this intent to the mission it will create — the binding
+    // PINS the mission_id up front, so mission metadata remains pure
+    // observability and can never itself constitute authority (V2 §2-3).
     const openId = newId("OPI");
+    const missionId = newId("MSN");
     row.status = "IN_PROGRESS";
     row.pending_open_id = openId;
     row.pending_open_at = utcnow();
@@ -480,6 +595,22 @@ export class BusinessLayer {
 
     let reservationId: string | null = null;
     try {
+      // The canonical open authority record — created BEFORE the mission
+      // it reserves exists. Identity/ownership are established here, not
+      // by anything a caller could submit through mission metadata.
+      this.store.put("work_open_binding", openId, {
+        open_id: openId,
+        work_item_id: workItemId,
+        business_id: String(row.business_id),
+        project_id: String(business.project_id),
+        org_agent_id: agentId,
+        created_by: operatorId,
+        mission_id: missionId,
+        state: "INTENT",
+        created_at: utcnow(), bound_at: null, rolled_back_at: null,
+        updated_at: utcnow(),
+        version: 0,
+      } as Row, 0);
       reservationId = this.reserveBudget(String(row.business_id), String(row.department ?? ""), agentId, openId);
 
       // P12 §15: context injection respects the contract's
@@ -508,9 +639,13 @@ export class BusinessLayer {
         `${String(row.goal)}` +
         (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "");
 
-      const mission = this.deps.control.startMission({
+      // Internal bound-mission seam: the reserved mission_id is created
+      // through a path unreachable from the generic Mission Control API
+      // (V2 §3). Metadata mirrors provenance for observability only.
+      const mission = this.deps.control.startBoundMission({
         project_id: String(business.project_id),
         goal,
+        mission_id: missionId,
         metadata: {
           business_id: String(row.business_id),
           work_item_id: workItemId,
@@ -521,16 +656,30 @@ export class BusinessLayer {
         },
         operator_id: operatorId,
       });
-      const missionId = String(mission.mission_id);
-      const linked = this.store.get("work_item", workItemId);
-      const linkedIds = linked.mission_ids as string[];
-      if (!linkedIds.includes(missionId)) linkedIds.push(missionId);
-      if (String(linked.pending_open_id ?? "") === openId) {
-        linked.pending_open_id = null;
-        linked.pending_open_at = null;
+      if (String(mission.mission_id) !== missionId) {
+        // Defensive: a bound create that ignored the pinned id would
+        // orphan this binding — fail the whole intent rather than drift.
+        throw new IntegrityError("FAIL_CLOSED_MISSION_PIN", "startBoundMission did not honor the pinned mission_id");
       }
-      linked.updated_at = utcnow();
-      const saved = this.store.put("work_item", workItemId, linked, Number(linked.version));
+      // Atomically link the row AND flip the binding to BOUND — the two
+      // can never disagree across a crash boundary (V2 §5).
+      const saved = this.store.immediate(() => {
+        const linked = this.store.get("work_item", workItemId);
+        const linkedIds = linked.mission_ids as string[];
+        if (!linkedIds.includes(missionId)) linkedIds.push(missionId);
+        if (String(linked.pending_open_id ?? "") === openId) {
+          linked.pending_open_id = null;
+          linked.pending_open_at = null;
+        }
+        linked.updated_at = utcnow();
+        const linkedSaved = this.store.put("work_item", workItemId, linked, Number(linked.version));
+        const binding = this.store.get("work_open_binding", openId);
+        binding.state = "BOUND";
+        binding.bound_at = utcnow();
+        binding.updated_at = utcnow();
+        this.store.put("work_open_binding", openId, binding, Number(binding.version));
+        return linkedSaved;
+      });
       if (reservationId) this.consumeBudgetReservation(reservationId);
       this.store.event({
         entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPENED",
@@ -557,16 +706,9 @@ export class BusinessLayer {
         curRow &&
         (err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT"
       ) {
-        const owned = new Set((curRow.mission_ids as string[] | undefined) ?? []);
-        const mine = this.store
-          .list("mission")
-          .some(
-            (m) =>
-              owned.has(String(m.mission_id)) &&
-              String(
-                (m.metadata as Record<string, unknown> | undefined)?.work_item_open_id ?? "",
-              ) === openId,
-          );
+        // V2: ownership is proven by the binding-pinned id, never by
+        // scanning mission metadata a caller could have forged.
+        const mine = ((curRow.mission_ids as string[] | undefined) ?? []).includes(missionId);
         if (mine) {
           if (reservationId) this.consumeBudgetReservation(reservationId);
           return curRow;
@@ -587,6 +729,7 @@ export class BusinessLayer {
         cur.pending_open_at = null;
         cur.updated_at = utcnow();
         this.store.put("work_item", workItemId, cur, Number(cur.version));
+        this.markBindingRolledBack(openId);
         this.store.event({
           entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
           old_state: "IN_PROGRESS", new_state: from, actor: "PAIR_BUSINESS_LAYER",
@@ -638,6 +781,7 @@ export class BusinessLayer {
     cur.pending_open_at = null;
     cur.updated_at = utcnow();
     this.store.put("work_item", workItemId, cur, Number(cur.version));
+    this.markBindingRolledBack(openId);
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
       old_state: "IN_PROGRESS", new_state: "READY", actor: `pair_reconcile:${actor}`,
@@ -647,48 +791,89 @@ export class BusinessLayer {
     return this.store.get("work_item", workItemId);
   }
 
+  /** Mark an INTENT binding ROLLED_BACK — durable, idempotent evidence
+   *  the reserved mission was never allowed to dispatch (V2 §6A). */
+  private markBindingRolledBack(openId: string): void {
+    const binding = this.store.tryGet("work_open_binding", openId);
+    if (binding && String(binding.state) === "INTENT") {
+      binding.state = "ROLLED_BACK";
+      binding.rolled_back_at = utcnow();
+      binding.updated_at = utcnow();
+      this.store.put("work_open_binding", openId, binding, Number(binding.version));
+    }
+  }
+
   /**
    * Link the mission belonging to an open intent back onto its work item.
-   * Deterministic and idempotent: returns the repaired row when a mission
-   * exists, null when provably none does. Used by the open catch path and
-   * by the restart sweep in reconcileOpenIntents.
+   * V2 §6: discovery is driven ONLY by the canonical `work_open_binding`
+   * — its pinned mission_id is the single authority for what this intent
+   * was allowed to create. Mission metadata is never scanned for linkage,
+   * so a forged mission claiming an open_id can never be adopted.
    */
   private reconcileOpenIntent(workItemId: string, openId: string, actor: string): Row | null {
     const row = this.store.tryGet("work_item", workItemId);
     if (!row) return null;
-    const owned = new Set((row.mission_ids as string[] | undefined) ?? []);
-    const orphan = this.store
-      .list("mission")
-      .filter((m) => {
-        const md = m.metadata as Record<string, unknown> | undefined;
-        if (owned.has(String(m.mission_id))) return false;
-        return (
-          String(md?.work_item_open_id ?? "") === openId ||
-          String(md?.work_item_id ?? "") === workItemId
-        );
-      })
-      .at(-1);
-    if (!orphan) return null;
-    (row.mission_ids as string[]).push(String(orphan.mission_id));
-    row.pending_open_id = null;
-    row.pending_open_at = null;
-    row.updated_at = utcnow();
+    const binding = this.store.tryGet("work_open_binding", openId);
+    if (!binding || String(binding.work_item_id) !== workItemId) {
+      // No canonical binding (legacy intent or a forged open id) →
+      // nothing may be linked for this intent.
+      return null;
+    }
+    if (String(binding.state) === "ROLLED_BACK") return null;
+    const missionId = String(binding.mission_id ?? "");
+    const mission = missionId ? this.store.tryGet("mission", missionId) : null;
+    if (!mission) {
+      if (String(binding.state) === "BOUND") {
+        // BOUND but the mission row is gone — the record itself is
+        // corrupt; fail closed, never guess a replacement.
+        this.quarantineWorkItem(row, `binding ${openId} BOUND but mission ${missionId} missing`);
+        return row;
+      }
+      return null; // INTENT, mission never landed — caller decides grace/rollback
+    }
+    // Fully landed already (BOUND + linked + marker cleared): nothing to
+    // repair — a null keeps the open catch path honest about whether the
+    // failure was inside the landing window or after it.
+    if (
+      String(binding.state) === "BOUND" &&
+      ((row.mission_ids as string[] | undefined) ?? []).includes(missionId) &&
+      !row.pending_open_id
+    ) {
+      return null;
+    }
+    // The pinned mission exists: link the row and flip INTENT→BOUND
+    // atomically (a crash between mission creation and the bound write is
+    // the only window this repairs — never a metadata guess).
     let saved: Row;
     try {
-      saved = this.store.put("work_item", workItemId, row, Number(row.version));
+      saved = this.store.immediate(() => {
+        const fresh = this.store.get("work_item", workItemId);
+        const ids = fresh.mission_ids as string[];
+        if (!ids.includes(missionId)) ids.push(missionId);
+        fresh.pending_open_id = null;
+        fresh.pending_open_at = null;
+        fresh.updated_at = utcnow();
+        const linked = this.store.put("work_item", workItemId, fresh, Number(fresh.version));
+        const b = this.store.get("work_open_binding", openId);
+        if (String(b.state) !== "BOUND") {
+          b.state = "BOUND";
+          b.bound_at = utcnow();
+          b.updated_at = utcnow();
+          this.store.put("work_open_binding", openId, b, Number(b.version));
+        }
+        return linked;
+      });
     } catch (err) {
       // A racing reconciler may have linked the same mission first — the
       // outcome is identical; return the fresh row instead of throwing.
       const fresh = this.store.get("work_item", workItemId);
-      if ((fresh.mission_ids as string[]).includes(String(orphan.mission_id))) {
-        return fresh;
-      }
+      if ((fresh.mission_ids as string[]).includes(missionId)) return fresh;
       throw err;
     }
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_RECONCILED",
-      new_state: String(row.status), actor: `pair_reconcile:${actor}`,
-      metadata: { open_id: openId, mission_id: String(orphan.mission_id) },
+      new_state: String(saved.status), actor: `pair_reconcile:${actor}`,
+      metadata: { open_id: openId, mission_id: missionId },
     });
     return saved;
   }
@@ -719,7 +904,10 @@ export class BusinessLayer {
     const missionIds = (row.mission_ids as string[] | undefined) ?? [];
     let cancelledMission: string | null = null;
     if (missionIds.length > 0) {
-      const last = this.store.tryGet("mission", missionIds[missionIds.length - 1]);
+      // V2: mission-control actions may touch only the mission the
+      // canonical binding proves belongs to THIS work item — a corrupt
+      // mission_ids entry can never cancel another item's mission.
+      const last = this.boundMissionForWorkItem(row);
       if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
         this.deps.control.cancelMission(String(last.mission_id), actor);
         cancelledMission = String(last.mission_id);
@@ -741,11 +929,15 @@ export class BusinessLayer {
     return saved;
   }
 
-  /** Fold the linked mission's terminal state back into the work item. */
+  /** Fold the linked mission's terminal state back into the work item.
+   *  V2: only a mission proven by the canonical binding may fold into
+   *  work-item state — a foreign/forged mission id can never mark this
+   *  item DONE, REVIEW_REQUIRED, BLOCKED or CANCELLED (§4/§7). */
   syncWorkItem(workItemId: string): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, "sync");
     const status = String(row.status);
     if (status !== "IN_PROGRESS") return row;
+    if (String(row.blocked_code ?? "") === WORK_CORRUPT_CODE) return row;
     const missionIds = (row.mission_ids as string[]) ?? [];
     if (missionIds.length === 0) return row;
     let mission: Row;
@@ -754,9 +946,15 @@ export class BusinessLayer {
     } catch {
       return row; // mission not persisted yet — leave IN_PROGRESS
     }
+    if (!this.missionBoundToWorkItem(row, mission)) {
+      // The final mission id does not belong to this work item — fold
+      // nothing; quarantine so no authority path treats it as progress.
+      this.quarantineWorkItem(row, `unbound mission ${String(mission.mission_id)} referenced by ${workItemId}`);
+      return this.store.get("work_item", workItemId);
+    }
     const ms = String(mission.status);
     const next: WorkItemStatus | null =
-      ms === "COMPLETED" ? "DONE" :
+      ms === "COMPLETED" ? (row.requires_review === true ? "REVIEW_REQUIRED" : "DONE") :
       ms === "FAILED" ? "BLOCKED" :
       ms === "CANCELLED" ? "CANCELLED" :
       ms === "PAUSED" ? "BLOCKED" : null;
@@ -764,7 +962,7 @@ export class BusinessLayer {
     assertWorkItemTransition(status, next);
     row.status = next;
     row.updated_at = utcnow();
-    if (next === "DONE" || next === "BLOCKED") {
+    if (next === "DONE" || next === "BLOCKED" || next === "REVIEW_REQUIRED") {
       row.result_summary = String(mission.result ?? mission.result_summary ?? "") || null;
     }
     // Terminal state releases the claim so the item can be picked up again.
@@ -806,6 +1004,7 @@ export class BusinessLayer {
    */
   claimWorkItem(workItemId: string, agentId: string, actor: string): Row & { claim_token: string } {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    this.assertWorkItemNotQuarantined(row);
     const agent = this.store.get("org_agent", agentId);
     if (String(agent.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `claimer outside business ${row.business_id}`);
@@ -892,13 +1091,12 @@ export class BusinessLayer {
     // work is still running underneath.
     let pausedMission: string | null = null;
     if (from === "IN_PROGRESS") {
-      const missionIds = (row.mission_ids as string[] | undefined) ?? [];
-      if (missionIds.length > 0) {
-        const last = this.store.tryGet("mission", missionIds[missionIds.length - 1]);
-        if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
-          this.deps.control.pauseMission(String(last.mission_id), actor);
-          pausedMission = String(last.mission_id);
-        }
+      // V2: pause only a canonically bound mission — a corrupt link can
+      // never pause another item's work.
+      const last = this.boundMissionForWorkItem(row);
+      if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
+        this.deps.control.pauseMission(String(last.mission_id), actor);
+        pausedMission = String(last.mission_id);
       }
     }
     const blockers = (row.blockers as Array<Record<string, unknown>> | undefined) ?? [];
@@ -913,6 +1111,86 @@ export class BusinessLayer {
       metadata: { reason: String(reason).slice(0, 300), mission_paused: pausedMission },
     });
     return saved;
+  }
+
+  /**
+   * Foundation V2 §10 — minimal review grounding. A REVIEW_REQUIRED
+   * item may be decided ONLY when its state provably derives from its
+   * own bound COMPLETED mission; a fabricated REVIEW_REQUIRED
+   * quarantines and fails both ACCEPT and REWORK without creating any
+   * review-decision evidence.
+   */
+  reviewWorkItem(
+    workItemId: string,
+    input: { reviewer_agent_id: string; decision: string },
+    actor: string,
+  ): Row {
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
+    this.assertWorkItemNotQuarantined(row);
+    if (String(row.status) !== "REVIEW_REQUIRED") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_REVIEW_STATE",
+        `${String(row.status)} is not awaiting review`,
+      );
+    }
+    // The REVIEW_REQUIRED must originate from this item's bound
+    // COMPLETED mission — an ungrounded state quarantines instead of
+    // letting ACCEPT or REWORK act on fabricated provenance.
+    const boundMission = this.boundMissionForWorkItem(row);
+    if (!boundMission || String(boundMission.status) !== "COMPLETED") {
+      this.quarantineWorkItem(row, `review attempted on ungrounded REVIEW_REQUIRED for ${workItemId}`);
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+        `review requires a bound COMPLETED mission for ${workItemId}`,
+      );
+    }
+    const reviewer = this.store.get("org_agent", input.reviewer_agent_id);
+    if (String(reviewer.business_id) !== String(row.business_id)) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_REVIEWER_SCOPE", "reviewer outside business");
+    }
+    if (String(reviewer.status) !== "ACTIVE") {
+      throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", String(reviewer.agent_id));
+    }
+    if (String(reviewer.agent_id) === String(row.assignee_agent_id ?? "")) {
+      throw new PolicyError("FAIL_CLOSED_WORK_SELF_REVIEW", "reviewer cannot be the assignee");
+    }
+    if (row.reviewer_agent_id && String(row.reviewer_agent_id) !== String(reviewer.agent_id)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_REVIEWER_MISMATCH",
+        `named reviewer is ${String(row.reviewer_agent_id)}`,
+      );
+    }
+    const decision = String(input.decision ?? "");
+    if (decision !== "ACCEPT" && decision !== "REWORK") {
+      throw new IntegrityError("FAIL_CLOSED_WORK_REVIEW_DECISION", `invalid decision ${decision}`);
+    }
+    const from = String(row.status);
+    // Decision + audit event commit atomically — a crash can never split
+    // the reviewed state from its canonical evidence.
+    return this.store.immediate(() => {
+      const cur = this.store.get("work_item", workItemId);
+      if (decision === "ACCEPT") {
+        cur.status = "DONE";
+      } else {
+        cur.status = "READY";
+        cur.blockers = [];
+      }
+      cur.updated_at = utcnow();
+      const saved = this.store.put("work_item", workItemId, cur, Number(cur.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId,
+        event_type: decision === "ACCEPT" ? "WORK_REVIEW_ACCEPTED" : "WORK_REWORK_REQUESTED",
+        old_state: from,
+        new_state: String(saved.status),
+        actor: `operator:${actor}`,
+        metadata: {
+          reviewer_agent_id: String(reviewer.agent_id),
+          decision,
+          mission_id: String(boundMission.mission_id),
+        },
+      });
+      return saved;
+    });
   }
 
   unblockWorkItem(workItemId: string, actor: string): Row {

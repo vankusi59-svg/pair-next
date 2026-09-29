@@ -162,10 +162,47 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   typecheck+build PASS, audit 0 high, worker races PASS, verifyIntegrity
   clean.
 
+### P14 FOUNDATION V2 — canonical work-open provenance (NEW branch, pending audit)
+
+> **PR #8 (`P14_PROVENANCE_REBASELINED_PENDING_AUDIT`) is reference-only:
+> not merged and not the base of this work.** The V2 foundation is a
+> fresh build from canonical base `a38be24b8bb240570d0cce322766ece1bccceab9`
+> on a new branch. It is **not** the full P14 workforce — no work graph,
+> delegation, heartbeat, or inbox — and **no P15/P16 work has started.**
+
+- **`work_open_binding`** — durable open-authority row created by
+  `BusinessLayer.openWorkItem` **before** mission creation:
+  `open_id | work_item_id | business_id | project_id | org_agent_id |
+  created_by | mission_id | state INTENT|BOUND|ROLLED_BACK | CAS`.
+  It **pins the `mission_id` up front**; the link write + `INTENT→BOUND`
+  flip commit in one `store.immediate()`.
+- **Public/internal split**: `POST /api/missions` → `startMission`
+  hard-rejects any caller `mission_id` (`FAIL_CLOSED_MISSION_ID_PUBLIC`,
+  409); the internal `startBoundMission` seam (BusinessLayer only) creates
+  exactly the binding-pinned id through the identical governed pipeline;
+  `createMission`'s version-0 CAS fails closed on collision
+  (`FAIL_CLOSED_MISSION_PIN` guard on the returned id).
+- **Proof derives from the binding, never metadata**:
+  `missionBoundToWorkItem` requires BOUND binding + mission/work_item/
+  business/project agreement; `syncWorkItem`, `blockWorkItem`,
+  `cancelWorkItem`, `reviewWorkItem`, `reconcileOpenIntent` all consume
+  the same predicate — forged metadata and foreign missions carry zero
+  authority and quarantine (`TERMINAL_PROVENANCE_CORRUPT`) instead.
+- **Crash boundaries**: no-mission intent → rollback + `ROLLED_BACK`;
+  post-mission crash → adopt ONLY the pinned mission (link+BOUND in one
+  txn); post-BOUND → idempotent; restart-safe, no dup missions/events.
+- **Minimal review grounding**: `REVIEW_REQUIRED` (new status) acts only
+  when grounded in the item's own bound COMPLETED mission; ungrounded
+  review state fails ACCEPT+REWORK closed with no decision evidence.
+- Evidence: `PAIR_OS_VNEXT_P14_FOUNDATION_V2_REPORT.md`; suite
+  `pair-p14-foundation.test.ts` (FOUND-V2-* ×10). Classification:
+  **`P14_FOUNDATION_V2_PENDING_AUDIT`**.
+
 ## Not yet
 
-- Autonomous heartbeat/inbox/delegation (P14), CEO agent / KPI gap
-  analysis (P15). Intentionally deferred.
+- Autonomous heartbeat/inbox/delegation/work-graph (P14 workforce —
+  beyond the V2 foundation), CEO agent / KPI gap analysis (P15).
+  Intentionally deferred.
 
 ## Release governance (current policy)
 

@@ -352,6 +352,52 @@ export class MissionControl {
     /** §4.3 two-step submit: the plan digest returned by previewMission. */
     confirm_plan?: { digest: string };
   }): Record<string, unknown> {
+    // Foundation V2 §1/§8: the generic Mission Control API must never
+    // accept a caller-pinned mission identity — bound identity is minted
+    // only by the internal startBoundMission seam. Reject fail-closed so
+    // a smuggled field can never reserve or occupy a work-bound id.
+    if ((input as { mission_id?: unknown }).mission_id != null) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_MISSION_ID_PUBLIC",
+        "mission_id pinning is internal-only — public mission creation mints its own id",
+      );
+    }
+    return this.startMissionInternal(input, undefined);
+  }
+
+  /**
+   * INTERNAL bound-mission seam — BusinessLayer only. Identical pipeline
+   * to startMission except the canonical work-open binding's pinned
+   * mission_id is honored. Not reachable through /api/missions or any
+   * generic caller path.
+   */
+  startBoundMission(input: {
+    project_id: string;
+    goal: string;
+    mission_id: string;
+    metadata?: Record<string, unknown>;
+    granted_permissions?: string[];
+    authorized_workspaces?: string[];
+    risk_ceiling?: string;
+    operator_id?: string;
+    confirm_plan?: { digest: string };
+  }): Record<string, unknown> {
+    return this.startMissionInternal(input, input.mission_id);
+  }
+
+  private startMissionInternal(
+    input: {
+      project_id: string;
+      goal: string;
+      metadata?: Record<string, unknown>;
+      granted_permissions?: string[];
+      authorized_workspaces?: string[];
+      risk_ceiling?: string;
+      operator_id?: string;
+      confirm_plan?: { digest: string };
+    },
+    pinnedMissionId: string | undefined,
+  ): Record<string, unknown> {
     if (input.confirm_plan?.digest) {
       const preview = this.previewMission(input);
       if (preview.plan_digest !== input.confirm_plan.digest) {
@@ -462,6 +508,7 @@ export class MissionControl {
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: input.authorized_workspaces,
       risk_ceiling: input.risk_ceiling,
+      mission_id: pinnedMissionId,
     });
     this.deps.runtime.runtimeEntity(String(mission.mission_id));
     this.deps.supervisor.wake(String(mission.mission_id), "MISSION_CREATED");
