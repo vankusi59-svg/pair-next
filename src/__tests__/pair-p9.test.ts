@@ -1632,7 +1632,12 @@ describe("Schedules — recurring mission triggers", () => {
     const after = svc.get(String(s.schedule_id));
     expect(after.last_mission_id).toBeTruthy();
     expect(Number(after.run_count)).toBe(1);
-    expect(String(after.next_due_at) > "2099-01-01").toBe(true); // advanced past fire time
+    // R5: the schedule advances to the next cron tick after the FIRED
+    // occurrence's canonical due_at — not past the wall clock. Missed
+    // ticks between due_at and `now` remain due for the next pass.
+    expect(String(after.next_due_at)).toBe(
+      nextRunAfter("*/1 * * * *", String(s.next_due_at)),
+    );
   });
 
   it("not due → no fire; disabled/deleted never fire", async () => {
@@ -1849,7 +1854,10 @@ describe("business layer (one-person-business skeleton)", () => {
     ctx.store.put("work_item", wid, row, Number(row.version));
     const c2 = biz.claimWorkItem(wid, String(a2.agent_id), "op");
     expect(String(c2.claimed_by)).toBe(String(a2.agent_id));
-    biz.releaseClaim(wid, "op");
+    // P11: a live claim is released only with its claim_token — a stale or
+    // absent token cannot strip ownership.
+    expect(() => biz.releaseClaim(wid, "op")).toThrowError(/FAIL_CLOSED_CLAIM_TOKEN/);
+    biz.releaseClaim(wid, "op", String(c2.claim_token));
     expect(ctx.store.get("work_item", wid).claimed_by).toBeNull();
   });
 
@@ -1919,7 +1927,7 @@ describe("business layer (one-person-business skeleton)", () => {
     ctx.store.put("mission", "MSN_routinerun", {
       mission_id: "MSN_routinerun", status: "COMPLETED", goal: "x",
       created_at: "2026-09-28T07:00:00.000Z",
-      metadata: { schedule_id: String(r.schedule_id), plan_source: "schedule" },
+      metadata: { schedule_id: String(r.schedule_id), business_id: bid, plan_source: "schedule" },
       result: "analysis done",
     }, 0);
     const cols = biz.board(bid);

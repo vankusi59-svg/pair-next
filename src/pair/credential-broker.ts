@@ -107,6 +107,18 @@ export class CredentialBroker {
     return true;
   }
 
+  /** Record a denied fetch attempt (e.g. rejected upstream for an unknown
+   *  mission) so hostile probing is audited even when release() never runs. */
+  deny(name: string, ctx: { mission_id?: string | null; task_id?: string | null }): void {
+    this.audit?.({
+      event_type: "CREDENTIAL_DENIED",
+      credential_name: String(name),
+      mission_id: ctx.mission_id ?? null,
+      task_id: ctx.task_id ?? null,
+      granted: false,
+    });
+  }
+
   /** Remote-facing release. Returns the credential WITH value, or null when
    *  the name is unknown. Every call is audited — granted or denied. */
   release(

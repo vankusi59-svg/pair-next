@@ -1,5 +1,10 @@
 # Conway Automaton Documentation
 
+> **Upstream reference.** This document describes the Conway Automaton agent
+> runtime — the codebase PAIR Next is built on. It is retained for the agent
+> layer (`src/` agent loop, tools, memory, heartbeat). For the PAIR Next
+> control plane see `ARCHITECTURE.md` and `README.md`.
+
 Complete reference for creating, configuring, funding, and operating autonomous AI agents on Conway Cloud.
 
 ## Table of Contents

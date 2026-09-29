@@ -42,7 +42,18 @@ export class PairEvidenceStore {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
+    // Two connections to the same file: a racing writer waits for the
+    // winner's commit instead of failing with SQLITE_BUSY — then its
+    // conditional UPDATE evaluates against the winner's version and
+    // deterministically loses.
+    this.db.pragma("busy_timeout = 5000");
     this.migrate();
+  }
+
+  /** BEGIN IMMEDIATE … COMMIT/ROLLBACK — serializes writers across
+   *  connections so count-then-write checks stay atomic. */
+  immediate<T>(fn: () => T): T {
+    return this.db.transaction(fn).immediate();
   }
 
   private migrate(): void {
@@ -125,21 +136,6 @@ export class PairEvidenceStore {
         `${entityType}:${entityId}:expected=${expectedVersion}:got=${version}`,
       );
     }
-    const existing = this.db
-      .prepare("SELECT version FROM entities WHERE entity_type=? AND entity_id=?")
-      .get(entityType, entityId) as { version: number } | undefined;
-    if (existing && existing.version !== version) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_VERSION_CONFLICT",
-        `${entityType}:${entityId}:stored=${existing.version}:got=${version}`,
-      );
-    }
-    if (!existing && expectedVersion !== undefined && expectedVersion !== 0) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_VERSION_CONFLICT",
-        `${entityType}:${entityId}:absent:expected=${expectedVersion}`,
-      );
-    }
     const body = {
       ...payload,
       entity_type: entityType,
@@ -148,16 +144,47 @@ export class PairEvidenceStore {
     };
     const text = canonicalJson(body);
     const hash = digest(body);
-    this.db
+    const now = utcnow();
+    // Atomic compare-and-swap in ONE statement: the version predicate is
+    // evaluated under the SQLite writer lock against the latest committed
+    // row, so of two racing writers on the same expected version exactly
+    // one changes a row; the loser deterministically conflicts.
+    const res = this.db
+      .prepare(
+        `UPDATE entities SET version=?, payload=?, payload_hash=?, updated_at=?
+         WHERE entity_type=? AND entity_id=? AND version=?`,
+      )
+      .run(version + 1, text, hash, now, entityType, entityId, version);
+    if (res.changes === 1) return { ...body, version: version + 1 };
+    const existing = this.db
+      .prepare("SELECT version FROM entities WHERE entity_type=? AND entity_id=?")
+      .get(entityType, entityId) as { version: number } | undefined;
+    if (existing) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_VERSION_CONFLICT",
+        `${entityType}:${entityId}:stored=${existing.version}:got=${version}`,
+      );
+    }
+    if (version !== 0) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_VERSION_CONFLICT",
+        `${entityType}:${entityId}:absent:expected=${version}`,
+      );
+    }
+    // Absent + version 0 → create. ON CONFLICT DO NOTHING turns a lost
+    // create-race into the same deterministic conflict.
+    const ins = this.db
       .prepare(
         `INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(entity_type, entity_id)
-         DO UPDATE SET version=excluded.version, payload=excluded.payload,
-                       payload_hash=excluded.payload_hash, updated_at=excluded.updated_at`,
+         ON CONFLICT(entity_type, entity_id) DO NOTHING`,
       )
-      .run(entityType, entityId, version + 1, text, hash, utcnow());
-    return { ...body, version: version + 1 };
+      .run(entityType, entityId, version + 1, text, hash, now);
+    if (ins.changes === 1) return { ...body, version: version + 1 };
+    throw new IntegrityError(
+      "FAIL_CLOSED_VERSION_CONFLICT",
+      `${entityType}:${entityId}:created-elsewhere`,
+    );
   }
 
   get<T extends Record<string, unknown> = Record<string, unknown>>(
