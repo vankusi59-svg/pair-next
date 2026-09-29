@@ -142,8 +142,8 @@ describe("P11 §2.B work-item lifecycle", () => {
     const { b } = bizWithAgent(biz, ctx.projectId);
     const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g", operator_id: "op" });
     biz.openWorkItem(wId(w), "op");
-    // already IN_PROGRESS — second open is an illegal transition
-    expect(() => biz.openWorkItem(wId(w), "op")).toThrowError(/FAIL_CLOSED_WORK_ITEM_TRANSITION/);
+    // already IN_PROGRESS with a live linked mission — second open refused
+    expect(() => biz.openWorkItem(wId(w), "op")).toThrowError(/FAIL_CLOSED_MISSION_ACTIVE/);
     // terminal → open
     const mid = (biz.listWorkItems(bId(b))[0].mission_ids as string[])[0];
     const m = ctx.store.get("mission", mid);
@@ -218,7 +218,7 @@ describe("P11 §2.D single dispatch per open", () => {
     const { b, a } = bizWithAgent(biz, ctx.projectId);
     const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g", assignee_agent_id: aId(a), operator_id: "op" });
     biz.openWorkItem(wId(w), "op");
-    expect(() => biz.openWorkItem(wId(w), "op")).toThrowError(/FAIL_CLOSED_WORK_ITEM_TRANSITION/);
+    expect(() => biz.openWorkItem(wId(w), "op")).toThrowError(/FAIL_CLOSED_MISSION_ACTIVE/);
     const row = ctx.store.get("work_item", wId(w));
     expect(row.mission_ids as string[]).toHaveLength(1);
     expect(ctx.store.list("mission")).toHaveLength(1);

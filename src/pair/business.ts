@@ -321,7 +321,7 @@ export class BusinessLayer {
   }
 
   assignWorkItem(workItemId: string, agentId: string, actor: string): Row {
-    const row = this.store.get("work_item", workItemId);
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     const agent = this.store.get("org_agent", agentId);
     if (String(agent.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `assignee outside business ${row.business_id}`);
@@ -359,18 +359,7 @@ export class BusinessLayer {
    */
   openWorkItem(workItemId: string, operatorId: string): Row {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
-    const row = this.store.get("work_item", workItemId);
-    const from = String(row.status);
-    assertWorkItemTransition(from, "IN_PROGRESS");
-    const business = this.getBusiness(String(row.business_id));
-    const agentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
-    const nowIso = utcnow();
-    if (isClaimActive(row, nowIso) && String(row.claimed_by) !== agentId) {
-      throw new PolicyError(
-        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
-        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
-      );
-    }
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, operatorId);
     // A previous linked mission still live forbids a replacement — the
     // governed path is pause/cancel/resume/reconcile, not a second dispatch.
     const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
@@ -382,6 +371,17 @@ export class BusinessLayer {
           `linked mission ${String(last.mission_id)} still ${String(last.status)} — cancel/resume/reconcile first`,
         );
       }
+    }
+    const from = String(row.status);
+    assertWorkItemTransition(from, "IN_PROGRESS");
+    const business = this.getBusiness(String(row.business_id));
+    const agentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+    const nowIso = utcnow();
+    if (isClaimActive(row, nowIso) && String(row.claimed_by) !== agentId) {
+      throw new PolicyError(
+        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
+        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
+      );
     }
     let agent: Row | null = null;
     if (agentId) {
@@ -484,6 +484,56 @@ export class BusinessLayer {
   }
 
   /**
+   * Canonical mutation gate: before ANY business operation that changes
+   * execution-related state, resolve a pending open intent first.
+   *   mission found    → link it atomically; if it is terminal, fold state
+   *                      via syncWorkItem so the caller sees true state;
+   *   no mission,      → deterministic audited rollback to READY;
+   *    beyond grace
+   *   no mission,      → fail closed FAIL_CLOSED_OPEN_INTENT_ACTIVE — the
+   *    within grace      open may still be in flight; mutation must retry.
+   * pending_open_id is never silently erased. Returns the fresh row.
+   */
+  private resolvePendingOpenBeforeMutation(workItemId: string, actor: string): Row {
+    const row = this.store.get("work_item", workItemId);
+    const openId = row.pending_open_id ? String(row.pending_open_id) : null;
+    if (!openId) return row;
+    const linked = this.reconcileOpenIntent(workItemId, openId, actor);
+    if (linked) {
+      const mids = (linked.mission_ids as string[]);
+      const m = this.store.tryGet("mission", mids[mids.length - 1]);
+      if (m && TERMINAL_MISSION_STATUSES.has(String(m.status))) {
+        this.syncWorkItem(workItemId);
+      }
+      return this.store.get("work_item", workItemId);
+    }
+    const openedAt = Date.parse(String(row.pending_open_at ?? row.updated_at));
+    const inFlight = Number.isFinite(openedAt) && Date.now() - openedAt < OPEN_RECONCILE_GRACE_MS;
+    if (inFlight) {
+      throw new PolicyError(
+        "FAIL_CLOSED_OPEN_INTENT_ACTIVE",
+        `pending open intent ${openId} within in-flight window — retry shortly`,
+      );
+    }
+    const cur = this.store.get("work_item", workItemId);
+    cur.status = "READY";
+    cur.claimed_by = null;
+    cur.claim_token = null;
+    cur.claim_expires_at = null;
+    cur.pending_open_id = null;
+    cur.pending_open_at = null;
+    cur.updated_at = utcnow();
+    this.store.put("work_item", workItemId, cur, Number(cur.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
+      old_state: "IN_PROGRESS", new_state: "READY", actor: `pair_reconcile:${actor}`,
+      metadata: { open_id: openId, cause: "mutation_gate" },
+    });
+    this.releaseBudgetReservationForRef(openId);
+    return this.store.get("work_item", workItemId);
+  }
+
+  /**
    * Link the mission belonging to an open intent back onto its work item.
    * Deterministic and idempotent: returns the repaired row when a mission
    * exists, null when provably none does. Used by the open catch path and
@@ -524,29 +574,13 @@ export class BusinessLayer {
    * the intent provably never dispatched (roll back to READY, audited).
    */
   private reconcileOpenIntents(businessId: string): void {
-    const now = Date.now();
     for (const w of this.listWorkItems(businessId)) {
-      if (String(w.status) !== "IN_PROGRESS" || !w.pending_open_id) continue;
-      const openedAt = Date.parse(String(w.pending_open_at ?? w.updated_at));
-      if (Number.isFinite(openedAt) && now - openedAt < OPEN_RECONCILE_GRACE_MS) continue;
-      const openId = String(w.pending_open_id);
-      if (this.reconcileOpenIntent(String(w.work_item_id), openId, "sweep")) continue;
-      // No mission found → intent never dispatched → make it reopenable.
-      const cur = this.store.get("work_item", String(w.work_item_id));
-      cur.status = "READY";
-      cur.claimed_by = null;
-      cur.claim_token = null;
-      cur.claim_expires_at = null;
-      cur.pending_open_id = null;
-      cur.pending_open_at = null;
-      cur.updated_at = utcnow();
-      this.store.put("work_item", String(w.work_item_id), cur, Number(cur.version));
-      this.store.event({
-        entity_type: "work_item", entity_id: String(w.work_item_id),
-        event_type: "WORK_ITEM_OPEN_ROLLED_BACK", old_state: "IN_PROGRESS", new_state: "READY",
-        actor: "pair_reconcile:sweep", metadata: { open_id: openId },
-      });
-      this.releaseBudgetReservationForRef(openId);
+      if (!w.pending_open_id) continue;
+      try {
+        this.resolvePendingOpenBeforeMutation(String(w.work_item_id), "sweep");
+      } catch (err) {
+        if ((err as { code?: string }).code !== "FAIL_CLOSED_OPEN_INTENT_ACTIVE") throw err;
+      }
     }
   }
 
@@ -554,7 +588,7 @@ export class BusinessLayer {
    *  MissionControl, then drop the item to CANCELLED. A BACKLOG/READY/BLOCKED
    *  item has no live mission — it is cancelled directly. */
   cancelWorkItem(workItemId: string, actor: string): Row {
-    const row = this.store.get("work_item", workItemId);
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     const from = String(row.status);
     assertWorkItemTransition(from, "CANCELLED");
     const missionIds = (row.mission_ids as string[] | undefined) ?? [];
@@ -584,7 +618,7 @@ export class BusinessLayer {
 
   /** Fold the linked mission's terminal state back into the work item. */
   syncWorkItem(workItemId: string): Row {
-    const row = this.store.get("work_item", workItemId);
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, "sync");
     const status = String(row.status);
     if (status !== "IN_PROGRESS") return row;
     const missionIds = (row.mission_ids as string[]) ?? [];
@@ -646,7 +680,7 @@ export class BusinessLayer {
    * agent works it concurrently. Fail-closed while another claim is live.
    */
   claimWorkItem(workItemId: string, agentId: string, actor: string): Row & { claim_token: string } {
-    const row = this.store.get("work_item", workItemId);
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     const agent = this.store.get("org_agent", agentId);
     if (String(agent.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `claimer outside business ${row.business_id}`);
@@ -679,7 +713,7 @@ export class BusinessLayer {
   }
 
   releaseClaim(workItemId: string, actor: string, claimToken?: string): Row {
-    const row = this.store.get("work_item", workItemId);
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     const heldBy = row.claimed_by ? String(row.claimed_by) : null;
     // A live claim can only be released with its claim_token — a stale or
     // absent token cannot strip another agent's ownership. Expired claims
@@ -725,7 +759,7 @@ export class BusinessLayer {
     if (!String(reason ?? "").trim()) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_BLOCKER", "blocker reason required");
     }
-    const row = this.store.get("work_item", workItemId);
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     const from = String(row.status);
     assertWorkItemTransition(from, "BLOCKED");
     // Blocking an in-flight item first pauses its mission through the
@@ -757,7 +791,7 @@ export class BusinessLayer {
   }
 
   unblockWorkItem(workItemId: string, actor: string): Row {
-    const row = this.store.get("work_item", workItemId);
+    const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     assertWorkItemTransition(String(row.status), "READY");
     row.blockers = [];
     row.status = "READY";
@@ -803,7 +837,14 @@ export class BusinessLayer {
     this.syncRoutineWorkItems(businessId);
     const items = this.listWorkItems(businessId);
     for (const w of items) {
-      if (String(w.status) === "IN_PROGRESS") this.syncWorkItem(String(w.work_item_id));
+      if (String(w.status) !== "IN_PROGRESS") continue;
+      try {
+        this.syncWorkItem(String(w.work_item_id));
+      } catch (err) {
+        // In-flight pending open intent — skip this tick; the reconcile
+        // sweep or the opener's own catch path resolves it.
+        if ((err as { code?: string }).code !== "FAIL_CLOSED_OPEN_INTENT_ACTIVE") throw err;
+      }
     }
     const cols: Record<string, Row[]> = {};
     for (const s of WORK_ITEM_STATUSES) cols[s] = [];

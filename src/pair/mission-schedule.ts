@@ -16,7 +16,23 @@ import type { PairControlPlane } from "./service.js";
 import type { PairEvidenceStore } from "./store.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 
+function md_businessId(s: Record<string, unknown>): string | null {
+  const md = s.metadata as Record<string, unknown> | undefined;
+  const b = md?.business_id;
+  return typeof b === "string" && b ? b : null;
+}
+
 export const SCHEDULE_SCHEMA = "pair.os.vnext.mission-schedule.v1";
+
+/**
+ * How long a CLAIMED schedule occurrence may sit without a bound mission
+ * before reconcileOccurrences treats the claimant as crashed. Within the
+ * window the claim wins and no other process may fire that occurrence.
+ */
+export const OCCURRENCE_CLAIM_TTL_MS = Math.max(
+  0,
+  Number(process.env.PAIR_OCCURRENCE_CLAIM_MS ?? 10 * 60 * 1000) || 0,
+);
 
 /** Parse one cron field into the set of matching integers. */
 function parseField(field: string, min: number, max: number): Set<number> {
@@ -217,6 +233,107 @@ export class MissionScheduleService {
   }
 
   /**
+   * Exactly-once durable claim for one schedule occurrence. The claim entity
+   * `OCC_<sha256(\"schedule-occurrence:<schedule_id>:<due_at>\")>` is created
+   * via CAS BEFORE any preflight/submit — across processes, connections and
+   * restarts at most one caller wins. Returns null when the occurrence is
+   * already claimed/fired/released.
+   */
+  private claimOccurrence(
+    scheduleId: string,
+    dueAt: string,
+    businessId: string | null,
+  ): Record<string, unknown> | null {
+    const occurrenceId = `OCC_${digest(`schedule-occurrence:${scheduleId}:${dueAt}`).slice(0, 24)}`;
+    const row = {
+      occurrence_id: occurrenceId,
+      schedule_id: scheduleId,
+      due_at: dueAt,
+      business_id: businessId,
+      status: "CLAIMED",
+      mission_id: null,
+      created_at: utcnow(),
+      version: 0,
+    };
+    try {
+      return this.store.put("schedule_occurrence", occurrenceId, row, 0);
+    } catch (err) {
+      if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") return null;
+      throw err;
+    }
+  }
+
+  /**
+   * After the mission exists, bind it on the occurrence. Retry once on a CAS
+   * conflict (a reconcile sweep may have touched the row) — the mission id
+   * is durable fact, so rewriting it under the latest version is safe.
+   */
+  private bindOccurrenceMission(occurrenceId: string, missionId: string): void {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const occ = this.store.get("schedule_occurrence", occurrenceId);
+      if (occ.mission_id) return; // already bound — idempotent
+      occ.mission_id = missionId;
+      occ.status = "FIRED";
+      occ.fired_at = utcnow();
+      try {
+        this.store.put("schedule_occurrence", occurrenceId, occ, Number(occ.version));
+        return;
+      } catch (err) {
+        if ((err as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") throw err;
+      }
+    }
+  }
+
+  /**
+   * Bounded policy for a claim whose submit never completed: the occurrence
+   * is RELEASED (dropped — the schedule row has already advanced, so this
+   * slot is never retried automatically). Audited.
+   */
+  private releaseOccurrence(occurrenceId: string, cause: string): void {
+    try {
+      const occ = this.store.get("schedule_occurrence", occurrenceId);
+      if (occ.mission_id || occ.status !== "CLAIMED") return;
+      occ.status = "RELEASED";
+      occ.released_at = utcnow();
+      occ.release_cause = cause;
+      this.store.put("schedule_occurrence", occurrenceId, occ, Number(occ.version));
+      this.store.event({
+        entity_type: "schedule_occurrence",
+        entity_id: occurrenceId,
+        event_type: "SCHEDULE_OCCURRENCE_RELEASED",
+        new_state: "RELEASED",
+        actor: "PAIR_MISSION_SCHEDULE",
+        metadata: { cause },
+      });
+    } catch (err) {
+      if ((err as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") throw err;
+    }
+  }
+
+  /**
+   * Restart-safe reconcile for claims older than OCCURRENCE_CLAIM_TTL_MS:
+   * a durable mission carrying metadata.schedule_occurrence_id is the
+   * canonical evidence — found → backlink + FIRED; provably absent →
+   * RELEASED. Called at the top of every fireDue (any process) so a crashed
+   * winner never leaves a dangling claim.
+   */
+  reconcileOccurrences(): void {
+    const cutoff = Date.now() - OCCURRENCE_CLAIM_TTL_MS;
+    const missions = this.store.list("mission");
+    for (const occ of this.store.list("schedule_occurrence")) {
+      if (occ.status !== "CLAIMED") continue;
+      const created = Date.parse(String(occ.created_at));
+      if (!Number.isFinite(created) || created > cutoff) continue;
+      const id = String(occ.occurrence_id);
+      const mission = missions.find(
+        (m) => String((m.metadata as Record<string, unknown> | undefined)?.schedule_occurrence_id ?? "") === id,
+      );
+      if (mission) this.bindOccurrenceMission(id, String(mission.mission_id));
+      else this.releaseOccurrence(id, "stale_claim_no_mission");
+    }
+  }
+
+  /**
    * Fire every due schedule through the injected canonical submit path.
    * Each schedule advances its own next_due_at regardless of submit outcome,
    * so a failing schedule cannot hot-loop every tick. Returns fired mission ids.
@@ -244,54 +361,82 @@ export class MissionScheduleService {
   ): Promise<{ fired: string[]; errors: string[] }> {
     const fired: string[] = [];
     const errors: string[] = [];
+    this.reconcileOccurrences();
     for (const s of this.due(now)) {
       const id = String(s.schedule_id);
       const row = this.store.get("mission_schedule", id);
       row.last_fired_at = now;
+      // Exactly-once gate: claim this specific occurrence (schedule_id +
+      // due_at) via CAS before any preflight/submit — a losing process must
+      // never reserve budget or create a mission for it.
+      const dueAt = String(row.next_due_at);
+      const occ = this.claimOccurrence(id, dueAt, md_businessId(s));
       let token: { settle: (consumed: boolean) => void } | null = null;
-      try {
-        // Schedule metadata (e.g. routine business_id/department/assignee)
-        // propagates into the mission so projection, budgets and audit can
-        // attribute the fire to its business scope.
-        const metadata = {
-          ...((s.metadata as Record<string, unknown> | undefined) ?? {}),
-          plan_source: "schedule",
-          schedule_id: id,
-          schedule_digest: digest({ goal: s.goal, cron: s.cron, schedule_id: id }),
-        };
-        token = this.preflight?.({
-          goal: String(s.goal),
-          project_id: s.project_id,
-          operator_id: s.operator_id,
-          metadata,
-        }) ?? null;
-        const mission = await submit({
-          goal: String(s.goal),
-          project_id: s.project_id ? String(s.project_id) : undefined,
-          operator_id: String(s.operator_id),
-          metadata,
-        });
-        token?.settle(true);
-        row.last_mission_id = String(mission.mission_id);
-        row.last_error = null;
-        row.run_count = Number(row.run_count ?? 0) + 1;
-        fired.push(id);
-        this.store.event({
-          entity_type: "mission_schedule",
-          entity_id: id,
-          event_type: "SCHEDULE_FIRED",
-          new_state: "FIRED",
-          actor: "PAIR_MISSION_SCHEDULE",
-          correlation_id: String(mission.mission_id),
-          metadata: { mission_id: mission.mission_id },
-        });
-      } catch (err) {
-        token?.settle(false);
-        row.last_error = String((err as { message?: string })?.message ?? err);
-        errors.push(id);
+      if (occ) {
+        try {
+          // Schedule metadata (e.g. routine business_id/department/assignee)
+          // propagates into the mission so projection, budgets and audit can
+          // attribute the fire to its business scope.
+          const metadata = {
+            ...((s.metadata as Record<string, unknown> | undefined) ?? {}),
+            plan_source: "schedule",
+            schedule_id: id,
+            schedule_occurrence_id: String(occ.occurrence_id),
+            scheduled_for: dueAt,
+            schedule_digest: digest({ goal: s.goal, cron: s.cron, schedule_id: id }),
+          };
+          token = this.preflight?.({
+            goal: String(s.goal),
+            project_id: s.project_id,
+            operator_id: s.operator_id,
+            metadata,
+          }) ?? null;
+          const mission = await submit({
+            goal: String(s.goal),
+            project_id: s.project_id ? String(s.project_id) : undefined,
+            operator_id: String(s.operator_id),
+            metadata,
+          });
+          token?.settle(true);
+          this.bindOccurrenceMission(String(occ.occurrence_id), String(mission.mission_id));
+          row.last_mission_id = String(mission.mission_id);
+          row.last_error = null;
+          row.run_count = Number(row.run_count ?? 0) + 1;
+          fired.push(id);
+          this.store.event({
+            entity_type: "mission_schedule",
+            entity_id: id,
+            event_type: "SCHEDULE_FIRED",
+            new_state: "FIRED",
+            actor: "PAIR_MISSION_SCHEDULE",
+            correlation_id: String(mission.mission_id),
+            metadata: {
+              mission_id: mission.mission_id,
+              occurrence_id: occ.occurrence_id,
+              scheduled_for: dueAt,
+            },
+          });
+        } catch (err) {
+          token?.settle(false);
+          this.releaseOccurrence(String(occ.occurrence_id), "submit_failed");
+          row.last_error = String((err as { message?: string })?.message ?? err);
+          errors.push(id);
+        }
       }
       row.next_due_at = nextRunAfter(String(s.cron), now);
-      this.store.put("mission_schedule", id, row, Number(row.version));
+      try {
+        this.store.put("mission_schedule", id, row, Number(row.version));
+      } catch (err) {
+        // Another process advanced this schedule — refresh and record our
+        // result under the new version so the fire outcome is not lost.
+        if ((err as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") throw err;
+        const fresh = this.store.get("mission_schedule", id);
+        fresh.last_fired_at = row.last_fired_at;
+        if (row.last_mission_id) fresh.last_mission_id = row.last_mission_id;
+        if (row.last_error) fresh.last_error = row.last_error;
+        fresh.run_count = Number(row.run_count ?? fresh.run_count);
+        this.store.put("mission_schedule", id, fresh, Number(fresh.version));
+      }
     }
     return { fired, errors };
   }

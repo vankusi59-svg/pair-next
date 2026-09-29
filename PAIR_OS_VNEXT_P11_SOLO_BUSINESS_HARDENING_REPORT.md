@@ -1,11 +1,12 @@
-# PAIR OS vNext — P11 SOLO BUSINESS HARDENING V1 REPORT (REMEDIATION R1)
+# PAIR OS vNext — P11 SOLO BUSINESS HARDENING V1 REPORT (REMEDIATION R2)
 
 ## §10.0 Classification history
 
 | Round | PR head | Result |
 |---|---|---|
 | P11 initial | `ce57e9c7cf54f7af3bc8a87004ff92029a14ce25` | Classified `P11_OFFICIAL_FINAL_PASS` by the implementing session — **overturned by independent audit → `P11_BLOCKED`**. That classification was wrong: the audit's concurrency/crash-path findings were real. This report replaces it. |
-| P11 REMEDIATION R1 | `fd470fa690fabce6c0977875bb5a897ea0d326e5` | See §13 completion contract below. |
+| P11 REMEDIATION R1 | `fd470fa690fabce6c0977875bb5a897ea0d326e5` (+report `8907b32`) | Fixed the original 10 blockers — **independent audit then found 3 remaining closure blockers → still `P11_BLOCKED`**. See §10.8. |
+| P11 REMEDIATION R2 | *(this commit)* | See §10.8 findings + §13 completion contract. |
 
 Starting baseline for the phase: `73c44b7865e5041f7a127dc24ac38f113138abc9`
 (post-PR#3 main). The R1 work landed on the existing PR #4 — no merge, no
@@ -178,3 +179,84 @@ require status checks `build-and-test (20)`, `build-and-test (22)`,
 **Classification submitted for independent audit: `P11_REMEDIATED_PENDING_AUDIT`.**
 Final `P11_OFFICIAL_FINAL_PASS` requires the independent re-audit to agree —
 this report does not self-certify.
+
+---
+
+## §10.8 P11 REMEDIATION R2 — independent audit findings and closure
+
+Independent audit of `8907b327db8c4e2d1b503e3cb43e4f5cc4ef7d17` (R1 head)
+re-classified P11 as **P11_BLOCKED** with three remaining closure blockers.
+All three were real.
+
+### §10.8.1 Findings and root causes
+
+1. **Pending open intent could be hidden by business state mutation.**
+   Root cause: `blockWorkItem`/`cancelWorkItem`/reopen/`unblock`/assign/claim
+   inspected `mission_ids` only. A crash after `startMission` but before the
+   mission-ids backlink left `status=IN_PROGRESS, pending_open_id=OPI_x,
+   mission_ids=[]` with a live canonical mission —
+   `block`/`cancel` could then flag the item while the orphan kept running,
+   reopen could mint a second mission, and the R1 sweep only looked at
+   IN_PROGRESS items so a status change hid the marker forever.
+2. **No genuine multi-process contention in R1 tests.** Root cause: the
+   two-connection tests still executed operations sequentially (conn A writes,
+   then conn B writes) — verifying stale-writer protection but not true
+   simultaneous contention as the completion contract requires.
+3. **`MissionScheduleService.fireDue` could double-fire one occurrence.**
+   Root cause: routine-projection dedup protects the work-item side, but two
+   scheduler processes could both pass `due()` and both submit — the
+   schedule-row CAS conflict only happens *after* `startMission`, so
+   MSN_A→WI_RT_A and MSN_B→WI_RT_B are two different canonical missions.
+
+### §10.8.2 Remediation — files changed in this round
+
+| File | Change |
+|---|---|
+| `src/pair/business.ts` | New canonical gate **`resolvePendingOpenBeforeMutation(workItemId, actor)`** — invoked at the top of `openWorkItem`, `blockWorkItem`, `cancelWorkItem`, `unblockWorkItem`, `assignWorkItem`, `claimWorkItem`, `releaseClaim`, `syncWorkItem` and the `board()`/`reconcileOpenIntents` sweeps. Semantics: `pending_open_id` set → find the intent's mission by `metadata.work_item_open_id` → **link atomically** (`WORK_ITEM_OPEN_RECONCILED`); if that mission is terminal, fold its outcome via `syncWorkItem` before the mutation proceeds. No mission **and** inside the in-flight grace window → `FAIL_CLOSED_OPEN_INTENT_ACTIVE` (mutation must retry — ambiguity fails closed). No mission **and** provably beyond the window → deterministic audited rollback to READY (`WORK_ITEM_OPEN_ROLLED_BACK`, `cause=mutation_gate`), then the mutation runs. `pending_open_id` is never silently erased. `reconcileOpenIntents` now sweeps pending markers on **any** status, so block/cancel/reopen can no longer hide an orphan. `board()` skips only in-flight-intent sync errors (`FAIL_CLOSED_OPEN_INTENT_ACTIVE`). |
+| `src/pair/mission-schedule.ts` | **Exactly-once occurrence claim.** `claimOccurrence(scheduleId, dueAt)` creates `schedule_occurrence` `OCC_<sha256("schedule-occurrence:<schedule_id>:<due_at>")[:24]>` via CAS **before** preflight/submit — losers return null and must not reserve budget or create a mission. Ordering: due → claim → preflight (budget) → `startMission` → `settle(true)` → `bindOccurrenceMission` (status FIRED + `mission_id`) → advance schedule. Pre-submit failure → `releaseOccurrence` → status RELEASED, audited, bounded (never auto-retried). `reconcileOccurrences()` runs at the top of every `fireDue`: CLAIMED claims older than `OCCURRENCE_CLAIM_TTL_MS` (10 min, env `PAIR_OCCURRENCE_CLAIM_MS`) are either bound to the durable mission carrying `metadata.schedule_occurrence_id` or RELEASED (`stale_claim_no_mission`). Fired missions carry `schedule_id`, `schedule_occurrence_id`, `scheduled_for`, `business_id`. Schedule-row advance now retries once on CAS conflict so a losing process's fire outcome is not lost. |
+| `src/__tests__/pair-p11-r2.test.ts` | **New — 19 tests.** §1: orphan RUNNING mission + block/cancel/reopen/unblock/board, terminal-orphan fold, stale-intent rollback, in-flight fail-closed, fresh-stack restart. §3: same-occurrence double-fire, crash-before-backlink reconcile, stale-claim release, preflight veto ordering, routine metadata propagation. §2: **genuine `worker_threads` contention** — each worker runs its own `PairEvidenceStore` + full stack on the same db file, synchronized on a `SharedArrayBuffer` barrier (`Atomics.wait`/`notify`): CAS update race, create race, claim race, open race (same work item → exactly one canonical mission), budget race (limit 1, two different items → no overshoot), two schedulers firing the same occurrence simultaneously → exactly one mission. The worker bundle is built at test time by esbuild into `node_modules/.cache/pair-r2/`; workers deliberately do NOT re-register capabilities/projects (fixture-owned rows — re-creating them CAS-conflicts by design). |
+| `src/__tests__/pair-p11.test.ts` | Two expectations updated to the more precise `FAIL_CLOSED_MISSION_ACTIVE` (the prior-mission guard now fires before the transition check — mandated R2 §1 case C). Still fail-closed; not weakened. |
+| `.github/workflows/ci.yml` | Focused P11 step now runs `pair-p11.test.ts` + `pair-p11-r1.test.ts` + `pair-p11-r2.test.ts` (timeout 300 s, still a real failure). |
+
+### §10.8.3 Evidence (local)
+
+- `npx vitest run src/__tests__/pair-p11*.test.ts` — **66/66** (22 + 25 + 19).
+- Worker-race outcomes: CAS race 1 win/1 `FAIL_CLOSED_VERSION_CONFLICT`,
+  integrity clean; create race 1 entity; claim race one owner; open race
+  exactly one canonical mission linked; budget race exactly one consumed
+  reservation, loser `FAIL_CLOSED_*`; schedule race `run_count=1`, one
+  FIRED occurrence bound to one mission.
+- Full suite: 1748 pass / **2 pre-existing env-dependent p5 failures**
+  (dsh/codex binaries exist on this dev box — same as R1; green on CI) /
+  24 skipped.
+- `pnpm run typecheck`, `pnpm run build` — clean.
+- `pnpm audit --audit-level=high` — **0 high / 0 critical** (1 low + 8
+  moderate advisories — unchanged from R1).
+- CI: build-and-test (Node 20 + 22), security-audit — pending push.
+
+### §10.8.4 Remaining limitations (honest)
+
+- `resolvePendingOpenBeforeMutation` relies on the same durable-intent
+  scan (`work_item_open_id`) as R1 — a mission created WITHOUT the open
+  metadata (bypassing openWorkItem entirely) is out of scope; direct
+  `startMission` remains operator-path, not business-path.
+- Occurrence retry policy is deliberately bounded: a pre-submit failure
+  RELEASEs the occurrence permanently (the schedule advanced); the next
+  cron occurrence fires fresh. Dropped occurrences are audited, not lost.
+- `OCCURRENCE_CLAIM_TTL_MS`/`OPEN_RECONCILE_GRACE_MS` tune how quickly a
+  crashed claimant's slot is recoverable — within the window, mutations
+  fail closed rather than guess.
+- Worker_threads races verify same-host SQLite contention; they do not
+  emulate two networked machines — by design (SQLite is single-file).
+
+### §10.8.5 Authorities, scope, branch protection
+
+Unchanged from R1 (§10.5): MissionControl remains the only dispatch path;
+no BusinessLayer→executor calls; no P12–P15 functionality. Branch
+protection on `main` is still **OPERATOR ACTION REQUIRED** (integration
+token 403) — to be enabled after R2 independent audit, before final merge.
+
+**Classification submitted for independent audit:
+`P11_REMEDIATED_R2_PENDING_AUDIT`.** Final `P11_OFFICIAL_FINAL_PASS`
+requires the independent re-audit to agree — this report does not
+self-certify.
