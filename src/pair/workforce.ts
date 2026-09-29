@@ -207,85 +207,117 @@ export class WorkforceService {
     },
     actor: string,
   ): Row {
-    const parent = this.node(input.work_item_id);
-    const businessId = String(parent.business_id);
-    const by = this.agent(input.delegated_by_agent_id);
-    const to = this.agent(input.delegated_to_agent_id);
-    if (String(by.business_id) !== businessId) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SCOPE", "delegator outside business");
-    }
-    if (String(to.business_id) !== businessId) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SCOPE", "target outside business");
-    }
-    if (String(by.status) !== "ACTIVE" || String(to.status) !== "ACTIVE") {
-      throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", "delegator or target not ACTIVE");
-    }
-    if (input.delegated_to_agent_id === input.delegated_by_agent_id) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SELF", "cannot delegate to self");
-    }
-    if (TERMINAL_WORK_ITEM_STATUSES.has(String(parent.status))) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(parent.status)} cannot delegate`);
-    }
-    const depth = Number(parent.delegation_depth ?? 0) + 1;
-    if (depth > WORK_DELEGATION_DEPTH_CAP) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATION_BOUND", `depth ${depth} exceeds cap ${WORK_DELEGATION_DEPTH_CAP}`);
-    }
-    if (this.business.listWorkItems(businessId).length + 1 > WORK_GRAPH_NODE_CAP) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_BOUND", `business graph exceeds ${WORK_GRAPH_NODE_CAP} nodes`);
-    }
-    // Required capability: the delegatee must still satisfy it — delegation
-    // narrows, never expands.
-    const reqCap = parent.required_capability ? String(parent.required_capability) : null;
-    if (reqCap && !((to.capabilities as string[] | undefined) ?? []).includes(reqCap)) {
-      throw new PolicyError("FAIL_CLOSED_WORK_CAPABILITY", `delegatee lacks required capability ${reqCap}`);
-    }
-    // Idempotent + racing-safe: the child's id is a deterministic function
-    // of (parent, key) — two workers colliding on the same delegation
-    // serialize at the version-0 INSERT; the loser returns the canonical
-    // child instead of a duplicate node.
-    const key =
-      input.delegation_key ??
-      `${input.work_item_id}:${input.delegated_to_agent_id}:${String(input.reason ?? "")}`;
-    const childId = childNodeId("DL", input.work_item_id, key);
-    const prior = this.store.tryGet("work_item", childId);
-    if (prior) return prior;
-    let child: Row;
-    try {
-      child = this.business.createWorkItem({
-        business_id: businessId,
-        title: `[delegated] ${String(parent.title)}`,
-        goal: String(parent.goal),
-        assignee_agent_id: input.delegated_to_agent_id,
-        parent_work_item_id: input.work_item_id,
-        required_capability: reqCap ?? undefined,
-        requires_review: parent.requires_review === true,
-        reviewer_agent_id: parent.reviewer_agent_id ? String(parent.reviewer_agent_id) : undefined,
-        delegated_from_work_item_id: input.work_item_id,
-        delegated_by_agent_id: input.delegated_by_agent_id,
-        delegation_reason: String(input.reason ?? "").slice(0, 500) || undefined,
-        delegation_depth: depth,
-        source: "delegation",
-        work_item_id: childId,
-        operator_id: actor,
-      });
-    } catch (err) {
-      if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") {
-        return this.node(childId);
+    // R2 §1: the whole delegation — deterministic child identity carrying
+    // full provenance including delegation_key + the WORK_DELEGATED event —
+    // commits inside ONE serialized transaction. A fault anywhere rolls
+    // back everything: no orphan child, no partial provenance, no event.
+    return this.store.immediate(() => {
+      const parent = this.node(input.work_item_id);
+      const businessId = String(parent.business_id);
+      const by = this.agent(input.delegated_by_agent_id);
+      const to = this.agent(input.delegated_to_agent_id);
+      if (String(by.business_id) !== businessId) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SCOPE", "delegator outside business");
       }
-      throw err;
-    }
-    this.store.put("work_item", childId, { ...child, delegation_key: key }, Number(child.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: input.work_item_id, event_type: "WORK_DELEGATED",
-      actor: `operator:${actor}`,
-      metadata: {
-        delegated_from: input.delegated_by_agent_id,
-        delegated_to: input.delegated_to_agent_id,
-        child_work_item_id: childId,
-        delegation_key: key,
-      },
+      if (String(to.business_id) !== businessId) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SCOPE", "target outside business");
+      }
+      if (String(by.status) !== "ACTIVE" || String(to.status) !== "ACTIVE") {
+        throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", "delegator or target not ACTIVE");
+      }
+      if (input.delegated_to_agent_id === input.delegated_by_agent_id) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SELF", "cannot delegate to self");
+      }
+      if (TERMINAL_WORK_ITEM_STATUSES.has(String(parent.status))) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${String(parent.status)} cannot delegate`);
+      }
+      const depth = Number(parent.delegation_depth ?? 0) + 1;
+      if (depth > WORK_DELEGATION_DEPTH_CAP) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATION_BOUND", `depth ${depth} exceeds cap ${WORK_DELEGATION_DEPTH_CAP}`);
+      }
+      if (this.business.listWorkItems(businessId).length + 1 > WORK_GRAPH_NODE_CAP) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_GRAPH_BOUND", `business graph exceeds ${WORK_GRAPH_NODE_CAP} nodes`);
+      }
+      // Required capability: the delegatee must still satisfy it —
+      // delegation narrows, never expands.
+      const reqCap = parent.required_capability ? String(parent.required_capability) : null;
+      if (reqCap && !((to.capabilities as string[] | undefined) ?? []).includes(reqCap)) {
+        throw new PolicyError("FAIL_CLOSED_WORK_CAPABILITY", `delegatee lacks required capability ${reqCap}`);
+      }
+      const key =
+        input.delegation_key ??
+        `${input.work_item_id}:${input.delegated_to_agent_id}:${String(input.reason ?? "")}`;
+      const childId = childNodeId("DL", input.work_item_id, key);
+      const prior = this.store.tryGet("work_item", childId);
+      if (prior) {
+        // R2 §2: an existing deterministic child is a successful replay
+        // only when its full provenance matches THIS delegation. A child
+        // missing only delegation_key (legacy/R1 partial row) is repaired
+        // inside this transaction; any semantic mismatch fails closed.
+        const matches =
+          String(prior.business_id) === businessId &&
+          String(prior.parent_work_item_id ?? "") === input.work_item_id &&
+          String(prior.delegated_from_work_item_id ?? "") === input.work_item_id &&
+          String(prior.delegated_by_agent_id ?? "") === input.delegated_by_agent_id &&
+          String(prior.assignee_agent_id ?? "") === input.delegated_to_agent_id &&
+          Number(prior.delegation_depth ?? 0) === depth &&
+          String(prior.required_capability ?? "") === String(reqCap ?? "");
+        if (!matches) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_WORK_DELEGATE_CONFLICT",
+            `deterministic child ${childId} has mismatched provenance`,
+          );
+        }
+        if (prior.delegation_key == null) {
+          const repaired = { ...prior, delegation_key: key, updated_at: utcnow() };
+          return this.store.put("work_item", childId, repaired, Number(prior.version));
+        }
+        if (String(prior.delegation_key) !== key) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_WORK_DELEGATE_CONFLICT",
+            `deterministic child ${childId} carries a different delegation_key`,
+          );
+        }
+        return prior;
+      }
+      let child: Row;
+      try {
+        child = this.business.createWorkItem({
+          business_id: businessId,
+          title: `[delegated] ${String(parent.title)}`,
+          goal: String(parent.goal),
+          assignee_agent_id: input.delegated_to_agent_id,
+          parent_work_item_id: input.work_item_id,
+          required_capability: reqCap ?? undefined,
+          requires_review: parent.requires_review === true,
+          reviewer_agent_id: parent.reviewer_agent_id ? String(parent.reviewer_agent_id) : undefined,
+          delegated_from_work_item_id: input.work_item_id,
+          delegated_by_agent_id: input.delegated_by_agent_id,
+          delegation_reason: String(input.reason ?? "").slice(0, 500) || undefined,
+          delegation_depth: depth,
+          delegation_key: key,
+          source: "delegation",
+          work_item_id: childId,
+          operator_id: actor,
+        });
+      } catch (err) {
+        if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") {
+          return this.node(childId);
+        }
+        throw err;
+      }
+      this.store.event({
+        entity_type: "work_item", entity_id: input.work_item_id, event_type: "WORK_DELEGATED",
+        actor: `operator:${actor}`,
+        metadata: {
+          delegated_from: input.delegated_by_agent_id,
+          delegated_to: input.delegated_to_agent_id,
+          child_work_item_id: childId,
+          delegation_key: key,
+        },
+      });
+      return child;
     });
-    return child;
   }
 
   /**

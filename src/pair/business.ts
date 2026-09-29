@@ -357,6 +357,7 @@ export class BusinessLayer {
     delegated_by_agent_id?: string;
     delegation_reason?: string;
     delegation_depth?: number;
+    delegation_key?: string;
     decomposition_id?: string;
     /** Deterministic id — used only by governed delegation/decomposition
      *  so racing materializers collide on the version-0 INSERT instead of
@@ -444,6 +445,7 @@ export class BusinessLayer {
       delegated_by_agent_id: input.delegated_by_agent_id ?? null,
       delegation_reason: input.delegation_reason ?? null,
       delegation_depth: input.delegation_depth ?? 0,
+      delegation_key: input.delegation_key ?? null,
       decomposition_id: input.decomposition_id ?? null,
       blocked_code: null as string | null,
       // READY only when an assignee exists AND prerequisites are already
@@ -611,6 +613,13 @@ export class BusinessLayer {
         });
         this.propagateDependents(String(saved.work_item_id));
       }
+    }
+    // R2 §3/§4: EVERY canonical DONE transition — mission fold, review
+    // accept, any future path — re-evaluates a parent parked on
+    // CHILD_INCOMPLETE. The parent's own completion propagates through
+    // this same seam, so multi-level chains cascade deterministically.
+    if (nodeDone && node.parent_work_item_id) {
+      this.evaluateParentCompletion(String(node.parent_work_item_id));
     }
   }
 
@@ -1158,22 +1167,55 @@ export class BusinessLayer {
       row.updated_at = utcnow();
       return this.store.put("work_item", workItemId, row, Number(row.version));
     }
-    if (row.blocked_code) row.blocked_code = null;
     assertWorkItemTransition(status, next);
+    return this.finalizeWorkItem(row, status, next, mission, {
+      mission_id: missionIds[missionIds.length - 1],
+      mission_status: ms,
+    });
+  }
+
+  /**
+   * Canonical completion finalization (R2 §5): ONE implementation of the
+   * DONE/REVIEW_REQUIRED fold — status transition, blocked_code clear,
+   * claim/token/expiry release, result grounding, CAS write, dependent
+   * propagation (which itself re-evaluates a parked parent), assignee
+   * context note, and the WORK_ITEM_SYNCED audit event. Concurrent
+   * completions converge: a loser of the CAS write re-reads the row and
+   * returns the winner's identical terminal state — no duplicate
+   * transition, no duplicate event.
+   */
+  private finalizeWorkItem(
+    row: Row,
+    from: WorkItemStatus,
+    next: WorkItemStatus,
+    mission: Row | null,
+    meta: Record<string, unknown>,
+  ): Row {
+    const workItemId = String(row.work_item_id);
+    assertWorkItemTransition(from, next);
     row.status = next;
+    row.blocked_code = null;
     row.updated_at = utcnow();
     if (next === "DONE" || next === "BLOCKED" || next === "REVIEW_REQUIRED") {
-      row.result_summary = String(mission.result ?? mission.result_summary ?? "") || null;
+      const grounded = mission
+        ? String(mission.result ?? mission.result_summary ?? "") || null
+        : null;
+      if (grounded !== null) row.result_summary = grounded;
     }
-    // Terminal state releases the claim so the item can be picked up again.
     row.claimed_by = null;
     row.claim_token = null;
     row.claim_expires_at = null;
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
-    // P14 §10: terminal state propagates readiness/blocked downstream.
+    let saved: Row;
+    try {
+      saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    } catch (err) {
+      if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") {
+        const fresh = this.store.get("work_item", workItemId);
+        if (String(fresh.status) === next) return fresh; // converged already
+      }
+      throw err;
+    }
     this.propagateDependents(workItemId);
-    // Feed the outcome back into the assignee's persistent context — the
-    // agent "remembers" what it did across missions.
     const assignee = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
     if (assignee) {
       try {
@@ -1182,7 +1224,7 @@ export class BusinessLayer {
         notes.push({
           at: utcnow(),
           work_item_id: workItemId,
-          mission_id: missionIds[missionIds.length - 1],
+          mission_id: mission ? String(mission.mission_id) : null,
           outcome: next,
           note: String(row.result_summary ?? row.title ?? "").slice(0, 300),
         });
@@ -1192,12 +1234,9 @@ export class BusinessLayer {
     }
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_SYNCED",
-      old_state: status, new_state: next, actor: "PAIR_BUSINESS_LAYER",
-      metadata: { mission_id: missionIds[missionIds.length - 1], mission_status: ms },
+      old_state: from, new_state: next, actor: "PAIR_BUSINESS_LAYER",
+      metadata: meta,
     });
-    // R1 §5: this node reaching DONE may release a parent that was parked
-    // on CHILD_INCOMPLETE.
-    this.evaluateParentCompletion(String(row.parent_work_item_id ?? ""));
     return saved;
   }
 
@@ -1217,10 +1256,13 @@ export class BusinessLayer {
   }
 
   /**
-   * R1 §5: when the last child goes DONE, a parent parked at
-   * CHILD_INCOMPLETE resumes its own completion — the same terminal it
-   * would have reached in syncWorkItem (DONE, or REVIEW_REQUIRED when
-   * requires_review).
+   * R1 §5 / R2 §3-5: when the last mandatory child goes DONE, a parent
+   * parked at IN_PROGRESS/CHILD_INCOMPLETE resumes completion through the
+   * SAME canonical finalization as syncWorkItem — grounded in the
+   * parent's already-completed mission (DONE, or REVIEW_REQUIRED when
+   * requires_review). A parked parent always has a completed mission; if
+   * it is somehow absent the parent stays parked — completion is never
+   * fabricated.
    */
   private evaluateParentCompletion(parentId: string): void {
     if (!parentId) return;
@@ -1228,17 +1270,15 @@ export class BusinessLayer {
     if (!parent) return;
     if (String(parent.status) !== "IN_PROGRESS" || String(parent.blocked_code ?? "") !== "CHILD_INCOMPLETE") return;
     if (!this.mandatoryChildrenComplete(parent)) return;
+    const mids = (parent.mission_ids as string[] | undefined) ?? [];
+    const mission = mids.length ? this.store.tryGet("mission", mids[mids.length - 1]) : null;
+    if (!mission) return;
     const next: WorkItemStatus = parent.requires_review === true ? "REVIEW_REQUIRED" : "DONE";
-    parent.status = next;
-    parent.blocked_code = null;
-    parent.updated_at = utcnow();
-    this.store.put("work_item", parentId, parent, Number(parent.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: parentId, event_type: "WORK_ITEM_SYNCED",
-      old_state: "IN_PROGRESS", new_state: next, actor: "PAIR_BUSINESS_LAYER",
-      metadata: { cause: "children_complete" },
+    this.finalizeWorkItem(parent, "IN_PROGRESS", next, mission, {
+      cause: "children_complete",
+      mission_id: String(mission.mission_id),
+      mission_status: String(mission.status),
     });
-    this.propagateDependents(parentId);
   }
 
   // ---------- work_item collaboration (claim / comment / blocker / artifact) ----------

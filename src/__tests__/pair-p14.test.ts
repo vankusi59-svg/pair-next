@@ -28,6 +28,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
@@ -279,7 +280,10 @@ function govRequest(ctx: Ctx, mission: Record<string, unknown>) {
  * transition → commitPlan → routeGovernedTask → collect_execution_result →
  * syncWorkItem folds it back. Returns the mission row.
  */
-function completeWorkMission(ctx: Ctx, biz: BusinessLayer, adapter: ScriptedAdapter, workItemId: string) {
+function completeWorkMission(
+  ctx: Ctx, biz: BusinessLayer, adapter: ScriptedAdapter, workItemId: string,
+  fold = true,
+) {
   const wiRow = biz.listWorkItems().find((w) => String(w.work_item_id) === workItemId)!;
   const missionId = String((wiRow.mission_ids as string[]).at(-1));
   ctx.service.transitionMission(missionId, "READY");
@@ -297,7 +301,9 @@ function completeWorkMission(ctx: Ctx, biz: BusinessLayer, adapter: ScriptedAdap
   const mRow = ctx.store.get("mission", missionId);
   mRow.status = "COMPLETED";
   ctx.store.put("mission", missionId, mRow, Number(mRow.version));
-  return biz.syncWorkItem(workItemId);
+  // fold=false leaves the work item IN_PROGRESS with a completed mission —
+  // a worker call to syncWorkItem performs the fold (races exercise this).
+  return fold ? biz.syncWorkItem(workItemId) : mRow;
 }
 
 function errCode(fn: () => unknown): string {
@@ -369,6 +375,14 @@ try {
   } else if (op === "decompose") {
     const out = workforce.decomposeWorkItem(args.workItemId, args.input, "worker");
     parentPort.postMessage({ ok: true, out: { children: out.children.map((c) => String(c.work_item_id)) } });
+  } else if (op === "sync") {
+    const row = business.syncWorkItem(args.workItemId);
+    parentPort.postMessage({ ok: true, out: { status: String(row.status) } });
+  } else if (op === "review") {
+    const row = business.reviewWorkItem(args.workItemId, {
+      reviewer_agent_id: String(args.reviewer), decision: String(args.decision),
+    }, "worker");
+    parentPort.postMessage({ ok: true, out: { status: String(row.status) } });
   } else {
     throw new Error("unknown op " + op);
   }
@@ -1382,5 +1396,317 @@ describe("P14 R1 remediations", () => {
     const healed = ctx.store.get("work_item", String(legacy.work_item_id));
     expect(String(healed.status)).toBe("BLOCKED");
     expect(String(healed.blocked_code)).toBe("BLOCKED_CAPABILITY");
+  });
+});
+
+/* ------------------------------ R2 REMEDIATIONS -------------------------- */
+
+describe("P14 R2 remediations", () => {
+  it("DELEG-R2-CRASH: fault after child materialization rolls the whole delegation back", () => {
+    const { ctx, biz, workforce } = makeBizCtx("deleg-r2-crash");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const args = {
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "K-CRASH",
+    };
+    // Fault lands AFTER the child is materialized inside the transaction —
+    // the outer delegation transaction rolls back, taking the child row,
+    // its provenance and the event with it.
+    const origEvent = ctx.store.event.bind(ctx.store);
+    ctx.store.event = ((p: Parameters<typeof ctx.store.event>[0]) => {
+      if (p.event_type === "WORK_DELEGATED") {
+        throw Object.assign(new Error("crash before commit"), { code: "FAIL_CLOSED_TEST_INJECTED" });
+      }
+      return origEvent(p);
+    }) as typeof ctx.store.event;
+    expect(errCode(() => workforce.delegateWorkItem(args, "op"))).toBe("FAIL_CLOSED_TEST_INJECTED");
+    ctx.store.event = origEvent;
+    expect(workforce.childrenOf(String(parent.work_item_id)).length).toBe(0);
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_DELEGATED").length).toBe(0);
+    // Retry converges to a complete canonical delegation.
+    const child = workforce.delegateWorkItem(args, "op");
+    expect(String(child.delegation_key)).toBe("K-CRASH");
+    expect(String(child.delegated_from_work_item_id)).toBe(String(parent.work_item_id));
+    expect(String(child.delegated_by_agent_id)).toBe(String(lead.agent_id));
+    expect(String(child.assignee_agent_id)).toBe(String(worker.agent_id));
+    expect(Number(child.delegation_depth)).toBe(1);
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_DELEGATED").length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("DELEG-R2-PROVENANCE + REPLAY: complete provenance, one event, same-key replay and repair", () => {
+    const { ctx, biz, workforce } = makeBizCtx("deleg-r2-replay");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const worker2 = makeAgent(biz, bid, "worker2");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const args = {
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      reason: "scope",
+      delegation_key: "K-REPLAY",
+    };
+    const c1 = workforce.delegateWorkItem(args, "op");
+    // Complete provenance on the child itself — no follow-up patch needed.
+    expect(String(c1.delegation_key)).toBe("K-REPLAY");
+    expect(String(c1.delegated_from_work_item_id)).toBe(String(parent.work_item_id));
+    expect(String(c1.delegated_by_agent_id)).toBe(String(lead.agent_id));
+    expect(String(c1.assignee_agent_id)).toBe(String(worker.agent_id));
+    expect(Number(c1.delegation_depth)).toBe(1);
+    expect(String(c1.delegation_reason)).toBe("scope");
+    // Same-key replays converge to the same complete delegation — exactly
+    // one WORK_DELEGATED event ever.
+    for (let i = 0; i < 3; i++) {
+      const c = workforce.delegateWorkItem(args, "op");
+      expect(String(c.work_item_id)).toBe(String(c1.work_item_id));
+      expect(String(c.delegation_key)).toBe("K-REPLAY");
+    }
+    expect(ctx.store.listEvents().filter((e) => e.event_type === "WORK_DELEGATED").length).toBe(1);
+    // A replay whose provenance would differ fails closed.
+    expect(errCode(() => workforce.delegateWorkItem({
+      ...args, delegated_to_agent_id: String(worker2.agent_id),
+    }, "op"))).toBe("FAIL_CLOSED_WORK_DELEGATE_CONFLICT");
+    // Legacy partial row (all provenance present, delegation_key missing)
+    // is repaired deterministically on replay.
+    const legacyKey = "K-LEGACY";
+    const legacyId = `WI_DL_${createHash("sha256")
+      .update(`${String(parent.work_item_id)}|${legacyKey}`)
+      .digest("hex").slice(0, 20).toUpperCase()}`;
+    ctx.store.put("work_item", legacyId, {
+      work_item_id: legacyId, business_id: bid, title: "legacy", goal: "g",
+      status: "READY", assignee_agent_id: String(worker.agent_id),
+      parent_work_item_id: String(parent.work_item_id),
+      delegated_from_work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegation_depth: 1, delegation_reason: null, delegation_key: null,
+      required_capability: null, decomposition_id: null,
+      depends_on: [], mission_ids: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 0,
+    } as never, 0);
+    const repaired = workforce.delegateWorkItem({ ...args, delegation_key: legacyKey }, "op");
+    expect(String(repaired.delegation_key)).toBe(legacyKey);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("PARENT-R2-REVIEWED-CHILD: review ACCEPT on the last child releases the parent immediately", () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-r2-rev");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const reviewer = makeAgent(biz, bid, "rev");
+    const parent = wi(biz, bid, {
+      assignee_agent_id: String(lead.agent_id),
+      requires_review: true, // children inherit requires_review + reviewer
+      reviewer_agent_id: String(reviewer.agent_id),
+    });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "RK",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id));
+    // The child needs review — parent still parked.
+    expect(String(ctx.store.get("work_item", String(child.work_item_id)).status)).toBe("REVIEW_REQUIRED");
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).status)).toBe("IN_PROGRESS");
+    // Reviewer ACCEPT → child DONE → parent re-evaluated in the same call.
+    biz.reviewWorkItem(String(child.work_item_id), {
+      reviewer_agent_id: String(reviewer.agent_id), decision: "ACCEPT",
+    }, "op");
+    const released = ctx.store.get("work_item", String(parent.work_item_id));
+    // requires_review parent completes into REVIEW_REQUIRED, not DONE.
+    expect(String(released.status)).toBe("REVIEW_REQUIRED");
+    expect(String(released.blocked_code ?? "")).toBe("");
+  });
+
+  it("PARENT-R2-CASCADE: grandparent → parent → child cascades upward", () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-r2-cascade");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const a1 = makeAgent(biz, bid, "a1");
+    const a2 = makeAgent(biz, bid, "a2");
+    const a3 = makeAgent(biz, bid, "a3");
+    const gp = wi(biz, bid, { assignee_agent_id: String(a1.agent_id) });
+    const mid = workforce.delegateWorkItem({
+      work_item_id: String(gp.work_item_id),
+      delegated_by_agent_id: String(a1.agent_id),
+      delegated_to_agent_id: String(a2.agent_id),
+      delegation_key: "D1",
+    }, "op");
+    const leaf = workforce.delegateWorkItem({
+      work_item_id: String(mid.work_item_id),
+      delegated_by_agent_id: String(a2.agent_id),
+      delegated_to_agent_id: String(a3.agent_id),
+      delegation_key: "D2",
+    }, "op");
+    // gp and mid both finish their own missions first — both park.
+    biz.openWorkItem(String(gp.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(gp.work_item_id));
+    biz.openWorkItem(String(mid.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(mid.work_item_id));
+    expect(String(ctx.store.get("work_item", String(gp.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    expect(String(ctx.store.get("work_item", String(mid.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    // The leaf completes — the cascade releases mid, then gp, in one sweep.
+    biz.openWorkItem(String(leaf.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(leaf.work_item_id));
+    expect(String(ctx.store.get("work_item", String(leaf.work_item_id)).status)).toBe("DONE");
+    expect(String(ctx.store.get("work_item", String(mid.work_item_id)).status)).toBe("DONE");
+    expect(String(ctx.store.get("work_item", String(gp.work_item_id)).status)).toBe("DONE");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("PARENT-R2-CANONICAL-FINALIZE: auto-complete clears claim, grounds result, never duplicates", () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-r2-final");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "KF",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    const parked = ctx.store.get("work_item", String(parent.work_item_id));
+    expect(String(parked.blocked_code)).toBe("CHILD_INCOMPLETE");
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id));
+    const done = ctx.store.get("work_item", String(parent.work_item_id));
+    // Canonical finalization semantics — no stale claim material.
+    expect(String(done.status)).toBe("DONE");
+    expect(done.claimed_by).toBeNull();
+    expect(done.claim_token).toBeNull();
+    expect(done.claim_expires_at).toBeNull();
+    // Result stays grounded in the parent's completed mission.
+    const pm = ctx.store.get("mission", String((done.mission_ids as string[]).at(-1)));
+    expect(done.result_summary ?? null).toBe(
+      String(pm.result ?? pm.result_summary ?? "") || null,
+    );
+    const evs = () => ctx.store.listEvents().filter(
+      (e) => e.event_type === "WORK_ITEM_SYNCED" && e.entity_id === String(parent.work_item_id)
+        && (e.metadata as Record<string, unknown> | undefined)?.cause === "children_complete",
+    );
+    expect(evs().length).toBe(1);
+    // Repeated reconciliation is a no-op — no dup event, no version churn.
+    const v = Number(done.version);
+    biz.syncWorkItem(String(parent.work_item_id));
+    biz.rebuildReadiness(bid);
+    workforce.heartbeat(String(lead.agent_id), "op");
+    expect(Number(ctx.store.get("work_item", String(parent.work_item_id)).version)).toBe(v);
+    expect(evs().length).toBe(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("PARENT-R2-RACE: concurrent child completions converge to one canonical parent result", async () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-r2-race");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const w1 = makeAgent(biz, bid, "w1");
+    const w2 = makeAgent(biz, bid, "w2");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const c1 = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(w1.agent_id),
+      delegation_key: "R1",
+    }, "op");
+    const c2 = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(w2.agent_id),
+      delegation_key: "R2",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    // Both children run their missions but stay IN_PROGRESS — the two
+    // workers fold them concurrently, each triggering parent evaluation.
+    biz.openWorkItem(String(c1.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(c1.work_item_id), false);
+    biz.openWorkItem(String(c2.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(c2.work_item_id), false);
+    const [r1, r2] = await runRace([
+      { op: "sync", dbPath: ctx.dbPath, args: { workItemId: String(c1.work_item_id) } },
+      { op: "sync", dbPath: ctx.dbPath, args: { workItemId: String(c2.work_item_id) } },
+    ]);
+    expect(r1.ok && r2.ok).toBe(true);
+    const store2 = new PairEvidenceStore(ctx.dbPath);
+    const p = store2.get("work_item", String(parent.work_item_id));
+    expect(String(p.status)).toBe("DONE");
+    expect(p.claimed_by).toBeNull();
+    expect(p.claim_token).toBeNull();
+    // Exactly one canonical parent completion event.
+    expect(store2.listEvents().filter(
+      (e) => e.event_type === "WORK_ITEM_SYNCED" && e.entity_id === String(parent.work_item_id)
+        && String(e.new_state) === "DONE",
+    ).length).toBe(1);
+    store2.verifyIntegrity();
+  });
+
+  it("PARENT-R2-RACE: two workers finalize the same parked parent — one transition, one event", async () => {
+    const { ctx, biz, workforce } = makeBizCtx("par-r2-race2");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const worker = makeAgent(biz, bid, "worker");
+    const parent = wi(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    const child = workforce.delegateWorkItem({
+      work_item_id: String(parent.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(worker.agent_id),
+      delegation_key: "RC",
+    }, "op");
+    biz.openWorkItem(String(parent.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(parent.work_item_id));
+    // Child's mission completed but its DONE propagation never ran —
+    // simulate the crash window with a direct canonical status write.
+    biz.openWorkItem(String(child.work_item_id), "op");
+    completeWorkMission(ctx, biz, a, String(child.work_item_id), false);
+    const crow = ctx.store.get("work_item", String(child.work_item_id));
+    crow.status = "DONE";
+    ctx.store.put("work_item", String(child.work_item_id), crow, Number(crow.version));
+    expect(String(ctx.store.get("work_item", String(parent.work_item_id)).blocked_code)).toBe("CHILD_INCOMPLETE");
+    // Two workers both fold the parked parent concurrently.
+    const [r1, r2] = await runRace([
+      { op: "sync", dbPath: ctx.dbPath, args: { workItemId: String(parent.work_item_id) } },
+      { op: "sync", dbPath: ctx.dbPath, args: { workItemId: String(parent.work_item_id) } },
+    ]);
+    expect(r1.ok || r2.ok).toBe(true);
+    const store2 = new PairEvidenceStore(ctx.dbPath);
+    const p = store2.get("work_item", String(parent.work_item_id));
+    expect(String(p.status)).toBe("DONE");
+    expect(store2.listEvents().filter(
+      (e) => e.event_type === "WORK_ITEM_SYNCED" && e.entity_id === String(parent.work_item_id)
+        && String(e.new_state) === "DONE",
+    ).length).toBe(1);
+    store2.verifyIntegrity();
   });
 });

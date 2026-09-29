@@ -357,3 +357,120 @@ direct create, decomposition, and injected legacy rows.
 | verifyIntegrity | clean in every race/restart test |
 
 Classification: **`P14_REMEDIATED_R1_PENDING_AUDIT`** — DO NOT MERGE.
+
+---
+
+# REMEDIATION R2 — delegation crash atomicity + recursive parent completion
+
+Audited head `fe27321e`, base `a38be24`. Eight requirements, all closed on
+the same PR #8. DO NOT MERGE — audit pending.
+
+## R2.1 — Delegation is crash-atomic (§1)
+
+`WorkforceService.delegateWorkItem` now performs the ENTIRE delegation
+inside one `PairEvidenceStore.immediate()` transaction: bounds/scope checks,
+deterministic child creation (`WI_DL_<sha256(parent|key)>`), and the
+canonical `WORK_DELEGATED` event. `delegation_key` is written at the
+child's initial canonical creation (`createWorkItem` accepts it — no
+follow-up patch write). A fault anywhere rolls back the child's
+WORK_ITEM_CREATED event, the child row, all provenance and the
+WORK_DELEGATED event together.
+
+**Evidence — DELEG-R2-CRASH**: `store.event` patched to throw
+`FAIL_CLOSED_TEST_INJECTED` on `WORK_DELEGATED` (fault lands AFTER child
+materialization, before commit) → the delegation throws, the store contains
+**zero** children of the parent and **zero** WORK_DELEGATED events; the
+same-key retry then succeeds with full provenance (`delegation_key`,
+`delegated_from_work_item_id`, `delegated_by_agent_id`, `assignee`,
+`delegation_depth=1`) and exactly one event.
+
+## R2.2 — Replay validates provenance; repairs or fails closed (§2)
+
+A deterministic child already present is accepted as a successful replay
+ONLY when business, parent, `delegated_from_work_item_id`,
+`delegated_by_agent_id`, `assignee` (delegated_to), `delegation_depth` and
+`required_capability` all match the call — otherwise
+`FAIL_CLOSED_WORK_DELEGATE_CONFLICT`. A legacy/partial child whose only gap
+is a missing `delegation_key` is repaired deterministically inside the same
+transaction (provably safe: every other provenance field verified first);
+a `delegation_key` mismatch fails closed.
+
+**Evidence — DELEG-R2-PROVENANCE+REPLAY**: all provenance asserted on the
+created child; three same-key replays return the same row with
+`delegation_key` intact and `WORK_DELEGATED` count stays 1; a replay with
+a different delegatee under the same key →
+`FAIL_CLOSED_WORK_DELEGATE_CONFLICT`; a seeded legacy row (full provenance,
+`delegation_key=null`) is repaired to `delegation_key=K-LEGACY`.
+
+## R2.3 — Every DONE transition re-evaluates the parent (§3)
+
+`propagateDependents()` — the single seam every canonical terminal
+transition already funnels through (syncWorkItem fold, reviewWorkItem
+ACCEPT, cancellation, dep mutation) — now ends with: node DONE ∧ parent
+exists → `evaluateParentCompletion(parent)`. A `REVIEW_REQUIRED` child
+accepted to DONE therefore releases a parked parent **in the same call** —
+no heartbeat/board sweep needed.
+
+**Evidence — PARENT-R2-REVIEWED-CHILD**: parent parked
+`IN_PROGRESS+CHILD_INCOMPLETE`, child → `REVIEW_REQUIRED`, reviewer ACCEPT
+→ child DONE → parent immediately `REVIEW_REQUIRED` (it is itself
+`requires_review`) in the same synchronous call.
+
+## R2.4 — Multi-level cascade (§4)
+
+The §3 seam is recursive: when the parent itself finalizes to DONE, its
+own `propagateDependents` call re-evaluates the grandparent — chains
+converge naturally from the DONE transition.
+
+**Evidence — PARENT-R2-CASCADE**: gp → delegated mid → delegated leaf;
+gp and mid complete their missions and both park `CHILD_INCOMPLETE`;
+leaf completes → leaf DONE → mid DONE → gp DONE in one sweep.
+
+## R2.5 — One canonical finalization path (§5)
+
+The syncWorkItem terminal fold was extracted into
+`finalizeWorkItem(row, from, next, mission, meta)` — the ONLY completion
+implementation: `assertWorkItemTransition`, status write,
+`blocked_code` cleared, claim/token/expiry released, result_summary
+grounded in the completed mission, CAS write, dependent propagation,
+assignee context note, `WORK_ITEM_SYNCED` event. `evaluateParentCompletion`
+now calls it — a parked parent's auto-completion is byte-for-byte the same
+finalization as a directly-synced item (requires_review → REVIEW_REQUIRED).
+If the parent's completed mission row is absent (corrupt state) it stays
+parked — completion is never fabricated.
+
+**Evidence — PARENT-R2-CANONICAL-FINALIZE**: released parent has
+`claimed_by/claim_token/claim_expires_at = null`, `result_summary` equal
+to the mission result, exactly one `WORK_ITEM_SYNCED(cause=
+children_complete)` event; repeated `syncWorkItem` + `rebuildReadiness` +
+`heartbeat` afterwards → version unchanged, still one event.
+
+## R2.6 — Concurrency / idempotency (§6)
+
+`finalizeWorkItem` treats `FAIL_CLOSED_VERSION_CONFLICT` as convergence:
+the CAS loser re-reads the row and returns the winner's identical terminal
+state — no duplicate transition, no duplicate event, no stale claim.
+
+**Evidence — PARENT-R2-RACE ×2** (real worker_threads): (a) two workers
+fold the two final children concurrently → parent DONE once, one
+completion event, claim fields null, verifyIntegrity clean; (b) two
+workers `syncWorkItem` the same parked parent → one canonical transition,
+one event, verifyIntegrity clean.
+
+## R2 validation
+
+| gate | result |
+|---|---|
+| P14 suite | **48/48 PASS** (7 new R2 tests incl. 2 worker races) |
+| P13 | 67/67 · P12 71/71 · P11 103/103 · P9 79/79 |
+| typecheck | clean · build PASS |
+| audit | 0 high / 0 critical |
+| Node 22 full | 1971 pass / 2 env P5 probe (CodexCli executable absent — same documented env gap) |
+| Node 20 full | **1973/0** |
+| verifyIntegrity | clean in every race/restart/crash test |
+
+All R1 closures unchanged (atomic graph mutation, atomic decomposition,
+named reviewer, strict decisions, parent gate, read-only inbox, capability
+admission). No second store, router, dispatcher or execution engine.
+
+Classification: **`P14_REMEDIATED_R2_PENDING_AUDIT`** — DO NOT MERGE.
