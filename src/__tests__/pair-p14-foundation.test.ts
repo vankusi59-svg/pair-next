@@ -596,12 +596,14 @@ describe("P14 FOUNDATION V2 R1 — atomic rollback + origin proof", () => {
     const w = makeWorkItem(biz, String(b.business_id));
     const wid = String(w.work_item_id);
     seedIntent(ctx, wid, "OPI_collide", "MSN_reservedX");
-    // A foreign mission at the reserved id — created through the generic
-    // internal create path WITHOUT bound_open_id origin proof.
-    ctx.service.createMission({
-      project_id: ctx.projectId, goal: "foreign occupant",
-      mission_id: "MSN_reservedX", operator_id: "op",
-    } as never);
+    // A foreign mission at the reserved id — raw occupant WITHOUT the
+    // bound_open_id origin proof (the generic create path can no longer
+    // mint a reserved id at all, so we insert the row directly).
+    ctx.store.put("mission", "MSN_reservedX", {
+      mission_id: "MSN_reservedX", project_id: ctx.projectId, goal: "foreign",
+      bound_open_id: null, status: "CREATED", metadata: {},
+      created_at: utcnow(), version: 0,
+    } as never, 0);
     // Recovery must NOT adopt it, NOT flip BOUND — quarantine the item.
     biz.board(String(b.business_id));
     const row = ctx.store.get("work_item", wid);
@@ -754,6 +756,212 @@ describe("P14 FOUNDATION V2 R1 — atomic rollback + origin proof", () => {
     expect(md.agent_contract).toBeTruthy();
     expect(md.secret_grants).toBeTruthy();
     expect((md.business_context as Record<string, unknown>).provenance).toBe("org_agent");
+    expect(biz.missionBoundToWorkItem(opened, mission)).toBe(true);
+    ctx.store.verifyIntegrity();
+  });
+});
+
+/* ----------------- P14 FOUNDATION V2 — R2 remediation ------------------
+ * Sealed bound-mission authority: context derives from the binding,
+ * bound_open_id creation sealed to the canonical seam, existing-mission
+ * retry runs the full validator, null-agent/identity gaps closed.
+ */
+
+describe("P14 FOUNDATION V2 R2 — sealed bound-mission authority", () => {
+  it("FOUND-R2-METADATA-OMITTED: bound mission derives canonical context from the binding, not caller metadata", () => {
+    const { ctx, biz } = makeBizCtx("r2-omit");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), {
+      assignee_agent_id: String(lead.agent_id), department: "ops",
+    });
+    seedIntent(ctx, String(w.work_item_id), "OPI_omit", "MSN_omit");
+    // Caller metadata intentionally empty — canonical context must come
+    // entirely from the binding + its records.
+    const m = ctx.control.startBoundMission({
+      binding_open_id: "OPI_omit", project_id: ctx.projectId,
+      goal: "bound", operator_id: "op",
+    });
+    const md = m.metadata as Record<string, unknown>;
+    expect(String(md.business_id)).toBe(String(b.business_id));
+    expect(String(md.work_item_id)).toBe(String(w.work_item_id));
+    expect(String(md.work_item_open_id)).toBe("OPI_omit");
+    expect(String(md.org_agent_id)).toBe(String(lead.agent_id));
+    expect(String(md.source)).toBe("business_layer");
+    // P12 contract pin + P13 business context still land — no authority
+    // loss from omitted caller metadata.
+    expect(md.agent_contract).toBeTruthy();
+    const bizCtx = md.business_context as Record<string, unknown>;
+    expect(String(bizCtx.business_id)).toBe(String(b.business_id));
+    expect(String(bizCtx.org_agent_id)).toBe(String(lead.agent_id));
+    expect(md.secret_grants).toBeTruthy();
+    expect(String(m.bound_open_id)).toBe("OPI_omit");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R2-METADATA-CONFLICT: caller metadata conflicting with canonical context fails closed", () => {
+    const { ctx, biz } = makeBizCtx("r2-conflict");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    seedIntent(ctx, String(w.work_item_id), "OPI_conflict", "MSN_conflict");
+    for (const [key, val] of [
+      ["business_id", "BIZ_foreign"],
+      ["org_agent_id", "AGT_foreign"],
+      ["work_item_id", "WI_foreign"],
+      ["work_item_open_id", "OPI_other"],
+      ["source", "caller"],
+    ]) {
+      expect(errCode(() => ctx.control.startBoundMission({
+        binding_open_id: "OPI_conflict", project_id: ctx.projectId,
+        goal: "x", operator_id: "op",
+        metadata: { [key]: val },
+      }))).toBe("FAIL_CLOSED_BINDING_CONTEXT_MISMATCH");
+      expect(ctx.store.tryGet("mission", "MSN_conflict")).toBeNull();
+    }
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R2-RAW-ORIGIN-FORGE: generic createMission cannot mint bound authority", () => {
+    const { ctx, biz } = makeBizCtx("r2-rawforge");
+    makeBiz(biz, ctx.projectId);
+    // Even passing forged identity strings, the generic seam mints its
+    // own id and stamps no origin proof.
+    const m = ctx.service.createMission({
+      project_id: ctx.projectId, goal: "forge",
+      mission_id: "MSN_forge_target", bound_open_id: "OPI_forge",
+    } as never);
+    expect(String(m.mission_id)).not.toBe("MSN_forge_target");
+    expect(m.bound_open_id ?? null).toBeNull();
+    expect(ctx.store.tryGet("mission", "MSN_forge_target")).toBeNull();
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R2-EXISTING-WRONG-PROJECT: reserved mission with origin string but wrong project is rejected", () => {
+    const { ctx, biz } = makeBizCtx("r2-wrongproj");
+    const b = makeBiz(biz, ctx.projectId);
+    const w = makeWorkItem(biz, String(b.business_id));
+    seedIntent(ctx, String(w.work_item_id), "OPI_wrongproj", "MSN_wrongproj");
+    // Occupant LOOKS like this binding's mission (bound_open_id matches)
+    // but its project is foreign — full validator must reject.
+    ctx.store.put("mission", "MSN_wrongproj", {
+      mission_id: "MSN_wrongproj", project_id: "PRJ_foreign", goal: "x",
+      bound_open_id: "OPI_wrongproj", status: "CREATED", metadata: {},
+      created_at: utcnow(), version: 0,
+    } as never, 0);
+    expect(errCode(() => ctx.control.startBoundMission({
+      binding_open_id: "OPI_wrongproj", project_id: ctx.projectId,
+      goal: "x", operator_id: "op",
+    }))).toBe("FAIL_CLOSED_MISSION_ORIGIN_CONFLICT");
+    // No adoption, no BOUND.
+    expect(String(ctx.store.get("work_open_binding", "OPI_wrongproj").state)).toBe("INTENT");
+    const row = ctx.store.get("work_item", String(w.work_item_id));
+    expect((row.mission_ids as string[])).toHaveLength(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R2-EXISTING-WRONG-SCOPE: existing reserved mission failing full validation is rejected", () => {
+    const { ctx, biz } = makeBizCtx("r2-wrongscope");
+    const b1 = makeBiz(biz, ctx.projectId, "B1");
+    const b2 = makeBiz(biz, ctx.projectId, "B2");
+    const lead = makeAgent(biz, String(b1.business_id), "lead");
+    const w = makeWorkItem(biz, String(b1.business_id), { assignee_agent_id: String(lead.agent_id) });
+    seedIntent(ctx, String(w.work_item_id), "OPI_scope", "MSN_scope");
+    // Tamper the binding to a foreign business AFTER intent seed; the
+    // existing mission otherwise looks perfectly bound.
+    const binding = ctx.store.get("work_open_binding", "OPI_scope");
+    binding.business_id = String(b2.business_id);
+    ctx.store.put("work_open_binding", "OPI_scope", binding, Number(binding.version));
+    ctx.store.put("mission", "MSN_scope", {
+      mission_id: "MSN_scope", project_id: ctx.projectId, goal: "x",
+      bound_open_id: "OPI_scope", status: "CREATED", metadata: {},
+      created_at: utcnow(), version: 0,
+    } as never, 0);
+    // The seam's INITIAL binding validation already fails — never even
+    // reaches the existing-mission check.
+    expect(errCode(() => ctx.control.startBoundMission({
+      binding_open_id: "OPI_scope", project_id: ctx.projectId,
+      goal: "x", operator_id: "op",
+    }))).toBe("FAIL_CLOSED_BINDING_INVALID");
+    expect(String(ctx.store.get("work_open_binding", "OPI_scope").state)).toBe("INTENT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R2-NULL-AGENT: assigned work item with a null binding agent fails closed", () => {
+    const { ctx, biz } = makeBizCtx("r2-nullagent");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    seedIntent(ctx, String(w.work_item_id), "OPI_nullagent", "MSN_nullagent");
+    // Binding claims no agent while the item IS assigned — malformed.
+    const binding = ctx.store.get("work_open_binding", "OPI_nullagent");
+    binding.org_agent_id = null;
+    ctx.store.put("work_open_binding", "OPI_nullagent", binding, Number(binding.version));
+    // Bound seam rejects at validation.
+    expect(errCode(() => ctx.control.startBoundMission({
+      binding_open_id: "OPI_nullagent", project_id: ctx.projectId,
+      goal: "x", operator_id: "op",
+    }))).toBe("FAIL_CLOSED_BINDING_INVALID");
+    // And reconcile cannot adopt a mission through it either.
+    ctx.store.put("mission", "MSN_nullagent", {
+      mission_id: "MSN_nullagent", project_id: ctx.projectId, goal: "x",
+      bound_open_id: "OPI_nullagent", status: "CREATED", metadata: {},
+      created_at: utcnow(), version: 0,
+    } as never, 0);
+    biz.board(String(b.business_id));
+    const row = ctx.store.get("work_item", String(w.work_item_id));
+    expect((row.mission_ids as string[])).toHaveLength(0);
+    expect(String(ctx.store.get("work_open_binding", "OPI_nullagent").state)).not.toBe("BOUND");
+    expect(String(row.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R2-INVALID-STATE: unknown lifecycle state is never reconciled into BOUND", () => {
+    const { ctx, biz } = makeBizCtx("r2-badstate");
+    const b = makeBiz(biz, ctx.projectId);
+    const w = makeWorkItem(biz, String(b.business_id));
+    seedIntent(ctx, String(w.work_item_id), "OPI_badstate", "MSN_badstate");
+    const binding = ctx.store.get("work_open_binding", "OPI_badstate");
+    binding.state = "WEIRD_UNKNOWN";
+    ctx.store.put("work_open_binding", "OPI_badstate", binding, Number(binding.version));
+    // Even with a perfectly origin-proven mission present, an unknown
+    // lifecycle state must never reconcile into BOUND.
+    ctx.store.put("mission", "MSN_badstate", {
+      mission_id: "MSN_badstate", project_id: ctx.projectId, goal: "x",
+      bound_open_id: "OPI_badstate", status: "CREATED", metadata: {},
+      created_at: utcnow(), version: 0,
+    } as never, 0);
+    biz.board(String(b.business_id));
+    expect(String(ctx.store.get("work_open_binding", "OPI_badstate").state))
+      .toBe("WEIRD_UNKNOWN");
+    const row = ctx.store.get("work_item", String(w.work_item_id));
+    expect((row.mission_ids as string[])).toHaveLength(0);
+    expect(String(row.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R2-HAPPY: canonical open — derived scope, contract+context pins, origin proof, atomic BOUND", () => {
+    const { ctx, biz } = makeBizCtx("r2-happy");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), {
+      assignee_agent_id: String(lead.agent_id), department: "ops",
+    });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const bindings = ctx.store.list("work_open_binding")
+      .filter((bd) => String(bd.work_item_id) === String(w.work_item_id));
+    expect(bindings).toHaveLength(1);
+    expect(String(bindings[0].state)).toBe("BOUND");
+    const mid = String((opened.mission_ids as string[])[0]);
+    const mission = ctx.store.get("mission", mid);
+    expect(String(mission.bound_open_id)).toBe(String(bindings[0].open_id));
+    const md = mission.metadata as Record<string, unknown>;
+    expect(md.agent_contract).toBeTruthy(); // P12 pin
+    const bizCtx = md.business_context as Record<string, unknown>;
+    expect(String(bizCtx.business_id)).toBe(String(b.business_id));
+    expect(String(bizCtx.org_agent_id)).toBe(String(lead.agent_id));
+    expect(md.secret_grants).toBeTruthy(); // P13 pin
+    expect(String(md.department)).toBe("ops");
     expect(biz.missionBoundToWorkItem(opened, mission)).toBe(true);
     ctx.store.verifyIntegrity();
   });

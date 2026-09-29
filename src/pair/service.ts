@@ -90,20 +90,52 @@ export class PairControlPlane {
     risk_ceiling?: string;
     execution_mode?: string;
     metadata?: Record<string, unknown>;
-    /** Foundation V2: pinned identity usable ONLY by the internal
-     *  business/work bound-mission seam — never reachable from the
-     *  generic Mission Control API. A colliding id fails closed on the
-     *  version-0 CAS insert; there is no overwrite/upsert path. */
-    mission_id?: string;
-    /** Foundation V2 R1 §3: internal mission-origin proof — the open_id
-     *  of the work_open_binding that created this mission. Top-level
-     *  field, written only by the internal bound-mission seam; the
-     *  generic mission API can never set it, so "this mission belongs to
-     *  binding X" is derivable from canonical evidence, not metadata. */
-    bound_open_id?: string;
   }): Record<string, unknown> {
+    return this.createMissionInternal(params, null);
+  }
+
+  /**
+   * INTERNAL bound-mission creation — reachable only from
+   * `MissionControl.startBoundMission` (Foundation V2 R2 §2). Identity is
+   * derived FROM the validated `work_open_binding` itself — the reserved
+   * `binding.mission_id` becomes the mission id and `binding.open_id`
+   * becomes the `bound_open_id` origin proof. No caller can supply
+   * either string, so the generic path can never manufacture bound
+   * authority. A colliding reserved id fails closed on the version-0
+   * CAS insert; there is no overwrite/upsert path.
+   */
+  createBoundMission(
+    binding: Record<string, unknown>,
+    params: {
+      project_id: string;
+      goal: string;
+      policy_profile?: string;
+      granted_permissions?: string[];
+      authorized_workspaces?: string[];
+      risk_ceiling?: string;
+      execution_mode?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Record<string, unknown> {
+    return this.createMissionInternal(params, binding);
+  }
+
+  private createMissionInternal(
+    params: {
+      project_id: string;
+      goal: string;
+      policy_profile?: string;
+      granted_permissions?: string[];
+      authorized_workspaces?: string[];
+      risk_ceiling?: string;
+      execution_mode?: string;
+      metadata?: Record<string, unknown>;
+    },
+    binding: Record<string, unknown> | null,
+  ): Record<string, unknown> {
     const project = this.getProject(params.project_id);
-    const missionId = params.mission_id ?? newId("MSN");
+    const missionId = binding ? String(binding.mission_id) : newId("MSN");
+    const boundOpenId = binding ? String(binding.open_id) : null;
     const authorized = (params.authorized_workspaces ?? [String(project.root_location)]).map(
       (p) => path.resolve(p),
     );
@@ -111,7 +143,7 @@ export class PairControlPlane {
       mission_id: missionId,
       project_id: params.project_id,
       goal: params.goal,
-      bound_open_id: params.bound_open_id ?? null,
+      bound_open_id: boundOpenId,
       status: "CREATED",
       plan_id: null,
       plan_state: null,

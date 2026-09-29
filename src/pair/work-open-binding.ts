@@ -39,6 +39,8 @@ const fail = (reason: string): OpenBindingCheck => ({ ok: false, reason });
  *   `expectedProjectId` — assert binding.project_id equals it.
  *   `requireState` — assert binding.state equals INTENT or BOUND.
  */
+const BINDING_STATES = new Set(["INTENT", "BOUND", "ROLLED_BACK"]);
+
 export function validateWorkOpenBinding(
   store: PairEvidenceStore,
   binding: StoreRow,
@@ -49,8 +51,15 @@ export function validateWorkOpenBinding(
     requireState?: "INTENT" | "BOUND";
   } = {},
 ): OpenBindingCheck {
+  // Canonical identity must be well-formed (R2 §4): non-empty open_id,
+  // non-empty reserved mission_id, a known lifecycle state — an unknown
+  // state must never be reconciled into BOUND.
   const openId = String(binding.open_id ?? "");
   if (!openId) return fail("binding missing open_id");
+  if (!String(binding.mission_id ?? "")) return fail("binding missing mission_id");
+  if (!BINDING_STATES.has(String(binding.state))) {
+    return fail(`binding has unknown lifecycle state ${String(binding.state)}`);
+  }
   if (opts.requireState && String(binding.state) !== opts.requireState) {
     return fail(`binding state ${String(binding.state)} != ${opts.requireState}`);
   }
@@ -70,9 +79,15 @@ export function validateWorkOpenBinding(
   if (opts.expectedProjectId && String(binding.project_id) !== opts.expectedProjectId) {
     return fail("binding project != requested project");
   }
-  // Assignee/org-agent linkage — where the binding pins an agent, the
-  // work item's assignee and the agent's business scope must agree.
+  // Assignee/org-agent linkage (R2 §4): the relationship is enforced in
+  // BOTH directions — an assigned work item requires a binding agent
+  // equal to its assignee; an unassigned item forbids a binding that
+  // silently claims an agent.
   const boundAgent = binding.org_agent_id ? String(binding.org_agent_id) : null;
+  const rowAgent = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+  if (boundAgent !== rowAgent) {
+    return fail("work item assignee != binding org_agent_id");
+  }
   if (boundAgent) {
     const agent = store.tryGet("org_agent", boundAgent) as StoreRow | null;
     if (!agent) return fail("binding org_agent does not resolve");
@@ -80,9 +95,6 @@ export function validateWorkOpenBinding(
       return fail("org_agent outside binding business");
     }
     if (String(agent.status) !== "ACTIVE") return fail("org_agent not ACTIVE");
-    if (String(row.assignee_agent_id ?? "") !== boundAgent) {
-      return fail("work item assignee != binding org_agent_id");
-    }
   }
   if (opts.forMission) {
     const m = opts.forMission;
@@ -110,6 +122,11 @@ export function validateWorkOpenBindingById(
 ): { binding: StoreRow | null } & OpenBindingCheck {
   const binding = store.tryGet("work_open_binding", openId) as StoreRow | null;
   if (!binding) return { binding: null, ...fail(`binding ${openId} does not exist`) };
+  // Payload identity must equal the entity key — a row stored under one
+  // open_id claiming another is malformed canonical identity (R2 §4).
+  if (String(binding.open_id ?? "") !== openId) {
+    return { binding, ...fail(`binding open_id ${String(binding.open_id)} != key ${openId}`) };
+  }
   const res = validateWorkOpenBinding(store, binding, opts);
   return { binding, ...res };
 }

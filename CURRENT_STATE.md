@@ -183,12 +183,23 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   (BusinessLayer only) loads the binding, validates the full canonical
   chain, and derives the mission_id FROM it — no arbitrary pin accepted;
   missions it creates carry the non-forgeable `bound_open_id` origin
-  proof (R1 §2-3). A foreign occupant at a reserved id without origin
-  proof fails closed (`FAIL_CLOSED_MISSION_ORIGIN_CONFLICT`) and is
-  never adopted (R1 §4). `createMission`'s version-0 CAS fails closed
-  on collision (`FAIL_CLOSED_MISSION_PIN` guard on the returned id).
+  proof (R1 §2-3). A foreign occupant at a reserved id fails closed
+  (`FAIL_CLOSED_MISSION_ORIGIN_CONFLICT`) — R2 §3 requires the FULL
+  canonical validator (`forMission`) to pass before any crash-retry
+  adoption, origin string alone is not enough. The seam derives the
+  mission's canonical context (business/work/agent/department/source)
+  from the binding itself — caller metadata conflicts fail closed
+  (`FAIL_CLOSED_BINDING_CONTEXT_MISMATCH`), omissions are filled (R2 §1).
+  `bound_open_id` is minted ONLY by `createBoundMission(binding, ...)`
+  which derives both ids from the binding — generic `createMission`
+  accepts no `mission_id`/`bound_open_id` and always stamps null
+  (R2 §2). Version-0 CAS still fails closed on collision
+  (`FAIL_CLOSED_MISSION_PIN` guard on the returned id).
   `src/pair/work-open-binding.ts` is the single canonical binding
-  validator used by every provenance seam (R1 §5).
+  validator used by every provenance seam (R1 §5) — R2 §4 adds
+  non-empty mission_id, lifecycle state ∈ INTENT|BOUND|ROLLED_BACK
+  (unknown state can never reconcile into BOUND), payload-key identity,
+  and bidirectional assignee↔org_agent equality.
 - **Proof derives from the binding, never metadata**:
   `missionBoundToWorkItem` requires BOUND binding + mission/work_item/
   business/project agreement; `syncWorkItem`, `blockWorkItem`,
@@ -202,8 +213,9 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   when grounded in the item's own bound COMPLETED mission; ungrounded
   review state fails ACCEPT+REWORK closed with no decision evidence.
 - Evidence: `PAIR_OS_VNEXT_P14_FOUNDATION_V2_REPORT.md`; suite
-  `pair-p14-foundation.test.ts` (FOUND-V2-* ×10 + FOUND-R1-* ×10).
-  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R1_PENDING_AUDIT`**.
+  `pair-p14-foundation.test.ts` (FOUND-V2-* ×10 + FOUND-R1-* ×10 +
+  FOUND-R2-* ×8).
+  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R2_PENDING_AUDIT`**.
 
 ## Not yet
 

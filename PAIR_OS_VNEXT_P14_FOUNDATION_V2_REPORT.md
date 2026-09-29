@@ -253,3 +253,59 @@ heartbeat/autonomous claim loop, no inbox projection, no dependency
 graph — those remain P14-workforce scope and are **not** implemented
 here. `reviewWorkItem` is the minimal grounding seam required by §10,
 not the full review/acceptance system.
+
+## 11. R2 remediation — sealed bound-mission authority
+
+### §1 Canonical context derived from the binding
+`startBoundMission` no longer trusts caller metadata for provenance.
+After binding validation it loads the canonical `work_item` and derives
+`business_id`, `work_item_id`, `work_item_open_id`, `org_agent_id`,
+`department`, `source` from the binding + its records. Caller metadata
+that *conflicts* fails closed (`FAIL_CLOSED_BINDING_CONTEXT_MISMATCH`);
+omitted fields are filled from canonical context — a bound mission can
+never lose its P12 contract pin / P13 business-context pin because a
+caller omitted metadata.
+
+### §2 `bound_open_id` creation is sealed
+`PairControlPlane.createMission` no longer accepts `mission_id` or
+`bound_open_id` — the generic path mints its own id and always stamps
+`bound_open_id: null`. The new internal `createBoundMission(binding,
+params)` derives BOTH `mission_id` and `bound_open_id` *from the
+validated binding itself* — no caller-supplied strings, so generic code
+cannot manufacture origin proof. Public `/api/missions` behavior is
+unchanged (`FAIL_CLOSED_MISSION_ID_PUBLIC`).
+
+### §3 Existing-mission retry = full validation
+When the reserved mission id is occupied, `bound_open_id === openId`
+alone is no longer sufficient: the seam re-runs the canonical validator
+with `forMission` over the whole chain (binding → work item → business →
+project → org-agent → mission → origin). Any mismatch →
+`FAIL_CLOSED_MISSION_ORIGIN_CONFLICT`; no BOUND transition.
+
+### §4 Identity / null-agent gaps closed
+The canonical validator now additionally enforces:
+- `binding.mission_id` non-empty; `binding.state` ∈
+  `{INTENT, BOUND, ROLLED_BACK}` — an unknown lifecycle state can never
+  reconcile into BOUND (it fails validation → quarantine).
+- Payload `open_id` must equal the entity key when loading by key.
+- Assignee binding is bidirectional: `binding.org_agent_id` must equal
+  the work item's `assignee_agent_id` exactly — an assigned item
+  rejects a null/different binding agent; an unassigned item rejects a
+  binding that silently claims an agent.
+
+### §5 R2 tests — `pair-p14-foundation.test.ts` (+8, now 28)
+`FOUND-R2-METADATA-OMITTED`, `FOUND-R2-METADATA-CONFLICT`,
+`FOUND-R2-RAW-ORIGIN-FORGE`, `FOUND-R2-EXISTING-WRONG-PROJECT`,
+`FOUND-R2-EXISTING-WRONG-SCOPE`, `FOUND-R2-NULL-AGENT`,
+`FOUND-R2-INVALID-STATE`, `FOUND-R2-HAPPY`.
+
+## 12. R2 validation
+
+| Surface | Result |
+|---|---|
+| Foundation V2 suite | **28/28** |
+| P13 / P12 / P11 / P9 | see CURRENT_STATE |
+| Full suite — Node 22 / Node 20 | see CURRENT_STATE |
+| Typecheck / build / audit | clean / PASS / 0 high |
+| `verifyIntegrity()` | clean on every suite entry |
+| Fresh-server E2E (PR #9 head) | pending — see PR comment |
