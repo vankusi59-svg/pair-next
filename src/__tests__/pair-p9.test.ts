@@ -1922,7 +1922,7 @@ describe("business layer (one-person-business skeleton)", () => {
     ctx.store.put("mission", "MSN_routinerun", {
       mission_id: "MSN_routinerun", status: "COMPLETED", goal: "x",
       created_at: "2026-09-28T07:00:00.000Z",
-      metadata: { schedule_id: String(r.schedule_id), plan_source: "schedule" },
+      metadata: { schedule_id: String(r.schedule_id), business_id: bid, plan_source: "schedule" },
       result: "analysis done",
     }, 0);
     const cols = biz.board(bid);

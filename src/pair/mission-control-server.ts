@@ -565,7 +565,7 @@ export function createMissionControlServer(
         const out =
           wact === "open" ? biz.openWorkItem(wid, String(operator))
           : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), String(operator))
-          : biz.syncWorkItem(wid); // cancel → resync (mission cancel stays a mission-level action)
+          : biz.cancelWorkItem(wid, String(operator)); // governed cancel: live mission cancelled first, then CANCELLED
         return void json(res, 200, out);
       }
       if (method === "GET" && p === "/api/routines") {

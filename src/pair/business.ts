@@ -19,7 +19,7 @@
  *   only decides WHICH mission runs, never bypasses approvals.
  */
 import { IntegrityError, PolicyError } from "./errors.js";
-import { newId, utcnow } from "./canonical.js";
+import { digest, newId, utcnow } from "./canonical.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
@@ -67,6 +67,14 @@ function assertWorkItemTransition(from: string, to: WorkItemStatus): void {
 
 /** How long a work-item claim stays valid before another agent may take over. */
 const CLAIM_TTL_MS = Number(process.env.PAIR_WORK_ITEM_CLAIM_MS ?? 30 * 60 * 1000);
+/** Grace before a pending open intent may be reconciled — must exceed the
+ *  longest legitimate in-flight open so a live open is never repaired
+ *  mid-flight. */
+const OPEN_RECONCILE_GRACE_MS = Number(process.env.PAIR_OPEN_RECONCILE_GRACE_MS ?? 60_000);
+/** A HELD budget reservation stops counting after this long — covers the
+ *  crash gap between reserve and mission create. */
+const RESERVATION_TTL_MS = Number(process.env.PAIR_BUDGET_RESERVATION_MS ?? 10 * 60 * 1000);
+const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 /** Context notes kept per org_agent; newest kept, oldest trimmed. */
 const AGENT_CONTEXT_CAP = 30;
 /** How many agent context notes are injected into a new mission goal. */
@@ -100,7 +108,27 @@ function periodStart(period: BudgetPeriod, now: Date): string {
 }
 
 export class BusinessLayer {
-  constructor(private readonly deps: BusinessLayerDeps) {}
+  constructor(private readonly deps: BusinessLayerDeps) {
+    // Routines are business-originated work: a schedule fire carrying
+    // metadata.business_id must pass the same mission-count budget gate as
+    // a manual open, via a durable reservation settled on outcome.
+    this.deps.schedules.preflight = (input) => {
+      const md = (input.metadata ?? {}) as Record<string, unknown>;
+      const businessId = String(md.business_id ?? "");
+      if (!businessId) return null;
+      const rid = this.reserveBudget(
+        businessId,
+        String(md.department ?? ""),
+        md.org_agent_id ? String(md.org_agent_id) : null,
+        `schedule:${String(md.schedule_id ?? "")}`,
+      );
+      if (!rid) return null;
+      return {
+        settle: (consumed: boolean) =>
+          consumed ? this.consumeBudgetReservation(rid) : this.releaseBudgetReservation(rid),
+      };
+    };
+  }
 
   private get store(): PairEvidenceStore {
     return this.deps.store;
@@ -343,6 +371,18 @@ export class BusinessLayer {
         `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
       );
     }
+    // A previous linked mission still live forbids a replacement — the
+    // governed path is pause/cancel/resume/reconcile, not a second dispatch.
+    const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
+    if (priorMissionIds.length > 0) {
+      const last = this.store.tryGet("mission", priorMissionIds[priorMissionIds.length - 1]);
+      if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
+        throw new PolicyError(
+          "FAIL_CLOSED_MISSION_ACTIVE",
+          `linked mission ${String(last.mission_id)} still ${String(last.status)} — cancel/resume/reconcile first`,
+        );
+      }
+    }
     let agent: Row | null = null;
     if (agentId) {
       agent = this.store.get("org_agent", agentId);
@@ -350,11 +390,15 @@ export class BusinessLayer {
         throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
       }
     }
-    // Take ownership BEFORE creating the mission: the IN_PROGRESS write (with
-    // optimistic version lock) is the dedup point — a retry, double-click,
-    // concurrent request, or post-crash replay hits the transition guard and
-    // cannot mint a second governed mission for the same open.
+    // Durable open intent committed BEFORE mission creation: the transition
+    // write is the dedup point, and pending_open_id ties this intent to the
+    // mission it creates (metadata.work_item_open_id) so a crash at any
+    // boundary can be reconciled instead of silently duplicated or rolled
+    // back over a live mission.
+    const openId = newId("OPI");
     row.status = "IN_PROGRESS";
+    row.pending_open_id = openId;
+    row.pending_open_at = utcnow();
     if (agentId) {
       row.claimed_by = agentId;
       row.claim_token = newId("CLM");
@@ -363,8 +407,9 @@ export class BusinessLayer {
     row.updated_at = utcnow();
     this.store.put("work_item", workItemId, row, Number(row.version));
 
+    let reservationId: string | null = null;
     try {
-      this.enforceBudgets(String(row.business_id), String(row.department ?? ""), agentId);
+      reservationId = this.reserveBudget(String(row.business_id), String(row.department ?? ""), agentId, openId);
 
       const notes = ((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
         .slice(-AGENT_CONTEXT_INJECT)
@@ -381,6 +426,7 @@ export class BusinessLayer {
         metadata: {
           business_id: String(row.business_id),
           work_item_id: workItemId,
+          work_item_open_id: openId,
           org_agent_id: agentId,
           department: row.department ?? null,
           source: "business_layer",
@@ -390,29 +436,150 @@ export class BusinessLayer {
       const missionId = String(mission.mission_id);
       const linked = this.store.get("work_item", workItemId);
       (linked.mission_ids as string[]).push(missionId);
+      linked.pending_open_id = null;
+      linked.pending_open_at = null;
       linked.updated_at = utcnow();
       const saved = this.store.put("work_item", workItemId, linked, Number(linked.version));
+      if (reservationId) this.consumeBudgetReservation(reservationId);
       this.store.event({
         entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPENED",
         old_state: from, new_state: "IN_PROGRESS", actor: `operator:${operatorId}`,
-        metadata: { mission_id: missionId, assignee_agent_id: agentId },
+        metadata: { mission_id: missionId, assignee_agent_id: agentId, open_id: openId },
       });
       return saved;
     } catch (err) {
-      // Roll the claim/IN_PROGRESS marker back so the item is openable again
-      // (budget refusal or planner failure must not strand it IN_PROGRESS
-      // with no mission).
+      // Correctness cannot depend on the crash window size: find the mission
+      // this intent created (work_item_open_id). Found → link it and count
+      // the open as successful (the canonical mission exists and is wired).
+      // Not found → the intent never dispatched: release the reservation and
+      // return the item to its pre-open state, audited.
+      const repaired = this.reconcileOpenIntent(workItemId, openId, operatorId);
+      if (repaired) {
+        if (reservationId) this.consumeBudgetReservation(reservationId);
+        return repaired;
+      }
+      if (reservationId) this.releaseBudgetReservation(reservationId);
       const cur = this.store.tryGet("work_item", workItemId);
-      if (cur && String(cur.status) === "IN_PROGRESS" && (cur.mission_ids as string[]).length === 0) {
+      if (
+        cur && String(cur.status) === "IN_PROGRESS" &&
+        String(cur.pending_open_id ?? "") === openId &&
+        (cur.mission_ids as string[]).length === priorMissionIds.length
+      ) {
         cur.status = from as WorkItemStatus;
         cur.claimed_by = null;
         cur.claim_token = null;
         cur.claim_expires_at = null;
+        cur.pending_open_id = null;
+        cur.pending_open_at = null;
         cur.updated_at = utcnow();
         this.store.put("work_item", workItemId, cur, Number(cur.version));
+        this.store.event({
+          entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
+          old_state: "IN_PROGRESS", new_state: from, actor: "PAIR_BUSINESS_LAYER",
+          metadata: { open_id: openId, error: String((err as { message?: string })?.message ?? err) },
+        });
       }
       throw err;
     }
+  }
+
+  /**
+   * Link the mission belonging to an open intent back onto its work item.
+   * Deterministic and idempotent: returns the repaired row when a mission
+   * exists, null when provably none does. Used by the open catch path and
+   * by the restart sweep in reconcileOpenIntents.
+   */
+  private reconcileOpenIntent(workItemId: string, openId: string, actor: string): Row | null {
+    const row = this.store.tryGet("work_item", workItemId);
+    if (!row) return null;
+    const owned = new Set((row.mission_ids as string[] | undefined) ?? []);
+    const orphan = this.store
+      .list("mission")
+      .filter((m) => {
+        const md = m.metadata as Record<string, unknown> | undefined;
+        if (owned.has(String(m.mission_id))) return false;
+        return (
+          String(md?.work_item_open_id ?? "") === openId ||
+          String(md?.work_item_id ?? "") === workItemId
+        );
+      })
+      .at(-1);
+    if (!orphan) return null;
+    (row.mission_ids as string[]).push(String(orphan.mission_id));
+    row.pending_open_id = null;
+    row.pending_open_at = null;
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_RECONCILED",
+      new_state: String(row.status), actor: `pair_reconcile:${actor}`,
+      metadata: { open_id: openId, mission_id: String(orphan.mission_id) },
+    });
+    return saved;
+  }
+
+  /**
+   * Restart sweep: repair IN_PROGRESS items whose pending open intent is
+   * older than the grace window — either the mission exists (link it) or
+   * the intent provably never dispatched (roll back to READY, audited).
+   */
+  private reconcileOpenIntents(businessId: string): void {
+    const now = Date.now();
+    for (const w of this.listWorkItems(businessId)) {
+      if (String(w.status) !== "IN_PROGRESS" || !w.pending_open_id) continue;
+      const openedAt = Date.parse(String(w.pending_open_at ?? w.updated_at));
+      if (Number.isFinite(openedAt) && now - openedAt < OPEN_RECONCILE_GRACE_MS) continue;
+      const openId = String(w.pending_open_id);
+      if (this.reconcileOpenIntent(String(w.work_item_id), openId, "sweep")) continue;
+      // No mission found → intent never dispatched → make it reopenable.
+      const cur = this.store.get("work_item", String(w.work_item_id));
+      cur.status = "READY";
+      cur.claimed_by = null;
+      cur.claim_token = null;
+      cur.claim_expires_at = null;
+      cur.pending_open_id = null;
+      cur.pending_open_at = null;
+      cur.updated_at = utcnow();
+      this.store.put("work_item", String(w.work_item_id), cur, Number(cur.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: String(w.work_item_id),
+        event_type: "WORK_ITEM_OPEN_ROLLED_BACK", old_state: "IN_PROGRESS", new_state: "READY",
+        actor: "pair_reconcile:sweep", metadata: { open_id: openId },
+      });
+      this.releaseBudgetReservationForRef(openId);
+    }
+  }
+
+  /** True governed cancellation: cancel the live linked mission through
+   *  MissionControl, then drop the item to CANCELLED. A BACKLOG/READY/BLOCKED
+   *  item has no live mission — it is cancelled directly. */
+  cancelWorkItem(workItemId: string, actor: string): Row {
+    const row = this.store.get("work_item", workItemId);
+    const from = String(row.status);
+    assertWorkItemTransition(from, "CANCELLED");
+    const missionIds = (row.mission_ids as string[] | undefined) ?? [];
+    let cancelledMission: string | null = null;
+    if (missionIds.length > 0) {
+      const last = this.store.tryGet("mission", missionIds[missionIds.length - 1]);
+      if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
+        this.deps.control.cancelMission(String(last.mission_id), actor);
+        cancelledMission = String(last.mission_id);
+      }
+    }
+    row.status = "CANCELLED";
+    row.claimed_by = null;
+    row.claim_token = null;
+    row.claim_expires_at = null;
+    row.pending_open_id = null;
+    row.pending_open_at = null;
+    row.updated_at = utcnow();
+    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_CANCELLED",
+      old_state: from, new_state: "CANCELLED", actor: `operator:${actor}`,
+      metadata: { mission_id: cancelledMission },
+    });
+    return saved;
   }
 
   /** Fold the linked mission's terminal state back into the work item. */
@@ -561,6 +728,20 @@ export class BusinessLayer {
     const row = this.store.get("work_item", workItemId);
     const from = String(row.status);
     assertWorkItemTransition(from, "BLOCKED");
+    // Blocking an in-flight item first pauses its mission through the
+    // canonical facade — the board never claims "not working" while real
+    // work is still running underneath.
+    let pausedMission: string | null = null;
+    if (from === "IN_PROGRESS") {
+      const missionIds = (row.mission_ids as string[] | undefined) ?? [];
+      if (missionIds.length > 0) {
+        const last = this.store.tryGet("mission", missionIds[missionIds.length - 1]);
+        if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
+          this.deps.control.pauseMission(String(last.mission_id), actor);
+          pausedMission = String(last.mission_id);
+        }
+      }
+    }
     const blockers = (row.blockers as Array<Record<string, unknown>> | undefined) ?? [];
     blockers.push({ reason: String(reason).slice(0, 2000), at: utcnow(), by: actor });
     row.blockers = blockers;
@@ -570,7 +751,7 @@ export class BusinessLayer {
     this.store.event({
       entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_BLOCKED",
       old_state: from, new_state: "BLOCKED", actor: `operator:${actor}`,
-      metadata: { reason: String(reason).slice(0, 300) },
+      metadata: { reason: String(reason).slice(0, 300), mission_paused: pausedMission },
     });
     return saved;
   }
@@ -618,6 +799,7 @@ export class BusinessLayer {
 
   board(businessId: string): Record<string, Row[]> {
     this.getBusiness(businessId);
+    this.reconcileOpenIntents(businessId);
     this.syncRoutineWorkItems(businessId);
     const items = this.listWorkItems(businessId);
     for (const w of items) {
@@ -698,38 +880,136 @@ export class BusinessLayer {
     return businessId ? all.filter((b) => String(b.business_id) === businessId) : all;
   }
 
-  /** Fail-closed budget check before dispatching any business mission. */
-  private enforceBudgets(businessId: string, department: string, agentId: string | null): void {
+  /**
+   * Atomic budget gate: inside one BEGIN IMMEDIATE transaction, count
+   * consumed missions plus HELD reservations for each applicable scope, and
+   * — when under every limit — insert a HELD reservation in the same commit.
+   * Two concurrent opens therefore serialize: the second sees the first's
+   * reservation and fails closed. The reservation is settled on outcome
+   * (consume on mission create / release on failure / TTL on crash), so a
+   * rejected or crashed intent never permanently consumes capacity.
+   * Returns the reservation id, or null when no policies apply.
+   */
+  private reserveBudget(
+    businessId: string,
+    department: string,
+    agentId: string | null,
+    refId: string,
+  ): string | null {
     const policies = this.listBudgetPolicies(businessId).filter((p) => p.enabled !== false);
-    if (policies.length === 0) return;
-    const missions = this.store.list("mission");
-    for (const p of policies) {
-      const scopeType = String(p.scope_type);
-      const scopeId = String(p.scope_id);
-      const applies =
-        (scopeType === "business" && scopeId === businessId) ||
-        (scopeType === "department" && scopeId === department) ||
-        (scopeType === "agent" && scopeId === agentId);
-      if (!applies) continue;
-      const since = periodStart(p.period as BudgetPeriod, new Date());
-      const key =
-        scopeType === "agent" ? "org_agent_id" : scopeType === "department" ? "department" : "business_id";
-      const used = missions.filter((m) => {
-        const md = m.metadata as Record<string, unknown> | undefined;
-        return String(md?.[key] ?? "") === scopeId && String(m.created_at ?? "") >= since;
-      }).length;
-      if (used >= Number(p.max_missions)) {
-        this.store.event({
-          entity_type: "budget_policy", entity_id: String(p.budget_policy_id),
-          event_type: "BUDGET_EXCEEDED", actor: "PAIR_BUSINESS_LAYER",
-          metadata: { scope_type: scopeType, scope_id: scopeId, used, max_missions: p.max_missions, period: p.period },
-        });
-        if (p.hard_stop) {
-          throw new PolicyError(
-            "FAIL_CLOSED_BUDGET_EXCEEDED",
-            `${scopeType}:${scopeId} ${used}/${p.max_missions} per ${p.period}`,
-          );
+    if (policies.length === 0) return null;
+    // The check + reservation insert is atomic inside the transaction; the
+    // BUDGET_EXCEEDED audit event must be written OUTSIDE it — an event
+    // written in the same txn is rolled back with the refusal.
+    const result = this.store.immediate(() => {
+      this.expireBudgetReservations();
+      const missions = this.store.list("mission");
+      const held = this.store.list("budget_reservation").filter((r) => String(r.status) === "HELD");
+      const exceeded: Array<Record<string, unknown>> = [];
+      let hardStop: { meta: Record<string, unknown>; detail: string } | null = null;
+      for (const p of policies) {
+        const scopeType = String(p.scope_type);
+        const scopeId = String(p.scope_id);
+        const applies =
+          (scopeType === "business" && scopeId === businessId) ||
+          (scopeType === "department" && scopeId === department) ||
+          (scopeType === "agent" && scopeId === agentId);
+        if (!applies) continue;
+        const since = periodStart(p.period as BudgetPeriod, new Date());
+        const key =
+          scopeType === "agent" ? "org_agent_id" : scopeType === "department" ? "department" : "business_id";
+        const usedMissions = missions.filter((m) => {
+          const md = m.metadata as Record<string, unknown> | undefined;
+          return String(md?.[key] ?? "") === scopeId && String(m.created_at ?? "") >= since;
+        }).length;
+        const usedHeld = held.filter((r) => {
+          const match =
+            scopeType === "business"
+              ? String(r.business_id) === scopeId
+              : scopeType === "department"
+                ? String(r.business_id) === businessId && String(r.department) === scopeId
+                : String(r.agent_id) === scopeId;
+          return match && String(r.created_at ?? "") >= since;
+        }).length;
+        const used = usedMissions + usedHeld;
+        if (used >= Number(p.max_missions)) {
+          const meta = {
+            budget_policy_id: String(p.budget_policy_id),
+            scope_type: scopeType, scope_id: scopeId, used,
+            max_missions: p.max_missions, period: p.period,
+          };
+          if (p.hard_stop) {
+            hardStop = { meta, detail: `${scopeType}:${scopeId} ${used}/${p.max_missions} per ${p.period}` };
+            break;
+          }
+          exceeded.push(meta);
         }
+      }
+      if (hardStop) return { rid: null, exceeded, hardStop };
+      const rid = newId("BRS");
+      const row = {
+        reservation_id: rid,
+        business_id: businessId,
+        department: department || null,
+        agent_id: agentId,
+        status: "HELD",
+        ref_id: refId,
+        created_at: utcnow(),
+        expires_at: new Date(Date.now() + RESERVATION_TTL_MS).toISOString(),
+        version: 0,
+      };
+      this.store.put("budget_reservation", rid, row, 0);
+      return { rid, exceeded, hardStop: null };
+    });
+    for (const meta of result.exceeded.concat(result.hardStop ? [result.hardStop.meta] : [])) {
+      this.store.event({
+        entity_type: "budget_policy", entity_id: String(meta.budget_policy_id),
+        event_type: "BUDGET_EXCEEDED", actor: "PAIR_BUSINESS_LAYER",
+        metadata: {
+          scope_type: meta.scope_type, scope_id: meta.scope_id, used: meta.used,
+          max_missions: meta.max_missions, period: meta.period,
+        },
+      });
+    }
+    if (result.hardStop) {
+      throw new PolicyError("FAIL_CLOSED_BUDGET_EXCEEDED", result.hardStop.detail);
+    }
+    return result.rid;
+  }
+
+  private consumeBudgetReservation(reservationId: string): void {
+    const row = this.store.tryGet("budget_reservation", reservationId);
+    if (!row || String(row.status) !== "HELD") return;
+    row.status = "CONSUMED";
+    row.updated_at = utcnow();
+    this.store.put("budget_reservation", reservationId, row, Number(row.version));
+  }
+
+  private releaseBudgetReservation(reservationId: string): void {
+    const row = this.store.tryGet("budget_reservation", reservationId);
+    if (!row || String(row.status) !== "HELD") return;
+    row.status = "RELEASED";
+    row.updated_at = utcnow();
+    this.store.put("budget_reservation", reservationId, row, Number(row.version));
+  }
+
+  private releaseBudgetReservationForRef(refId: string): void {
+    for (const r of this.store.list("budget_reservation")) {
+      if (String(r.ref_id) === refId && String(r.status) === "HELD") {
+        this.releaseBudgetReservation(String(r.reservation_id));
+      }
+    }
+  }
+
+  /** Crash-gap repair: a HELD reservation past its TTL never produced a
+   *  mission — release it so capacity isn't permanently consumed. */
+  private expireBudgetReservations(): void {
+    const now = utcnow();
+    for (const r of this.store.list("budget_reservation")) {
+      if (String(r.status) === "HELD" && String(r.expires_at ?? "") <= now) {
+        r.status = "RELEASED";
+        r.updated_at = utcnow();
+        this.store.put("budget_reservation", String(r.reservation_id), r, Number(r.version));
       }
     }
   }
@@ -772,7 +1052,12 @@ export class BusinessLayer {
       project_id: String(business.project_id),
       name: input.name,
       operator_id: input.operator_id,
-      metadata: { business_id: input.business_id, routine_source: true },
+      metadata: {
+        business_id: input.business_id,
+        department,
+        org_agent_id: input.assignee_agent_id ?? null,
+        routine_source: true,
+      },
     });
     const id = newId("RTN");
     const row = {
@@ -835,13 +1120,21 @@ export class BusinessLayer {
       const routine = bySchedule.get(schedId);
       const missionId = String(m.mission_id);
       if (!routine || covered.has(missionId)) continue;
+      // Business isolation: a mission that references this routine's
+      // schedule must also carry this business_id — corrupted or
+      // foreign-business metadata never projects onto this board.
+      if (String(md?.business_id ?? "") !== String(routine.business_id)) continue;
       const ms = String(m.status);
       const status: WorkItemStatus =
         ms === "COMPLETED" ? "DONE" :
         ms === "FAILED" ? "BLOCKED" :
         ms === "CANCELLED" ? "CANCELLED" :
         ms === "PAUSED" ? "BLOCKED" : "IN_PROGRESS";
-      const id = newId("WI");
+      // Deterministic projection identity: the work-item id derives from
+      // the mission id, so two concurrent projectors (restarts, parallel
+      // board() calls, two connections) compute the same id — the loser's
+      // create hits the atomic CAS and is treated as already-covered.
+      const id = `WI_RT_${digest("routine-work-item:" + missionId).slice(0, 24)}`;
       const row = {
         work_item_id: id,
         business_id: businessId,
@@ -866,7 +1159,18 @@ export class BusinessLayer {
         updated_at: utcnow(),
         version: 0,
       };
-      this.store.put("work_item", id, row, 0);
+      try {
+        this.store.put("work_item", id, row, 0);
+      } catch (err) {
+        // Concurrent projector already created this projection — the
+        // deterministic id made the collision deterministic, not a duplicate.
+        if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT" ||
+            String((err as { message?: string })?.message ?? err).includes("FAIL_CLOSED_VERSION_CONFLICT")) {
+          covered.add(missionId);
+          continue;
+        }
+        throw err;
+      }
       this.store.event({
         entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_CREATED",
         new_state: status, actor: "PAIR_BUSINESS_LAYER",

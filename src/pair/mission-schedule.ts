@@ -108,6 +108,22 @@ export function nextRunAfter(expr: string, fromIso: string): string {
 export class MissionScheduleService {
   constructor(private readonly service: PairControlPlane) {}
 
+  /**
+   * Optional fail-closed gate evaluated before each due fire (inside
+   * _fireDue, before submit). Returns a token whose settle(consumed)
+   * resolves the gate's accounting — consumed=true once the mission exists.
+   * Throwing vetoes the fire (recorded as the schedule's last_error).
+   * BusinessLayer installs this so business routines respect business
+   * mission-count budgets; schedules without metadata.business_id pass
+   * through untouched.
+   */
+  preflight?: (input: {
+    goal: string;
+    project_id?: unknown;
+    operator_id?: unknown;
+    metadata?: Record<string, unknown>;
+  }) => { settle: (consumed: boolean) => void } | null;
+
   private get store(): PairEvidenceStore {
     return this.service.store;
   }
@@ -232,17 +248,30 @@ export class MissionScheduleService {
       const id = String(s.schedule_id);
       const row = this.store.get("mission_schedule", id);
       row.last_fired_at = now;
+      let token: { settle: (consumed: boolean) => void } | null = null;
       try {
+        // Schedule metadata (e.g. routine business_id/department/assignee)
+        // propagates into the mission so projection, budgets and audit can
+        // attribute the fire to its business scope.
+        const metadata = {
+          ...((s.metadata as Record<string, unknown> | undefined) ?? {}),
+          plan_source: "schedule",
+          schedule_id: id,
+          schedule_digest: digest({ goal: s.goal, cron: s.cron, schedule_id: id }),
+        };
+        token = this.preflight?.({
+          goal: String(s.goal),
+          project_id: s.project_id,
+          operator_id: s.operator_id,
+          metadata,
+        }) ?? null;
         const mission = await submit({
           goal: String(s.goal),
           project_id: s.project_id ? String(s.project_id) : undefined,
           operator_id: String(s.operator_id),
-          metadata: {
-            plan_source: "schedule",
-            schedule_id: id,
-            schedule_digest: digest({ goal: s.goal, cron: s.cron, schedule_id: id }),
-          },
+          metadata,
         });
+        token?.settle(true);
         row.last_mission_id = String(mission.mission_id);
         row.last_error = null;
         row.run_count = Number(row.run_count ?? 0) + 1;
@@ -257,6 +286,7 @@ export class MissionScheduleService {
           metadata: { mission_id: mission.mission_id },
         });
       } catch (err) {
+        token?.settle(false);
         row.last_error = String((err as { message?: string })?.message ?? err);
         errors.push(id);
       }

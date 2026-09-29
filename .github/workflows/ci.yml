@@ -14,6 +14,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - run: pnpm install --frozen-lockfile
       - run: pnpm run typecheck
+      - run: pnpm run build
       - name: Run tests
         timeout-minutes: 10
         run: |
@@ -23,6 +24,15 @@ jobs:
           set -e
           # 124 = timeout killed vitest — a real failure, never a silent pass.
           if [ $RC -eq 124 ]; then echo "::error::vitest exceeded the 300s timeout"; fi
+          exit $RC
+      - name: Run P11 business hardening tests
+        timeout-minutes: 10
+        run: |
+          set +e
+          timeout 180 npx vitest run src/__tests__/pair-p11.test.ts src/__tests__/pair-p11-r1.test.ts
+          RC=$?
+          set -e
+          if [ $RC -eq 124 ]; then echo "::error::P11 tests exceeded the 180s timeout"; fi
           exit $RC
       - name: Run security tests
         timeout-minutes: 10
