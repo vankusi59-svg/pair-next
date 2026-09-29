@@ -114,10 +114,19 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   control fields; updates never silently create. `allowed_purpose`
   fail-closed until an enforceable subject exists; allow-set reference
   validation added.
-- Classification: **`P13_REMEDIATED_R1_PENDING_AUDIT`** on the P13
+- **R2 remediation** (same PR): crash-gap closed — durable ordering is now
+  `executor_execution` → `EXECUTION_PERSISTED` → evidence →
+  `markCommitted` LAST; a COMMITTED/SETTLED reservation under
+  INTENT_RECORDED with no execution proof fails
+  `FAIL_CLOSED_COST_COMMITTED_EXECUTION_UNRESOLVED` instead of
+  authorizing a new dispatch. UNKNOWN billing + hard policy →
+  `FAIL_CLOSED_COST_UNKNOWN` (soft-policy UNKNOWN stays unpriced).
+  METERED_API boundedness now requires positive reserve OR positive fixed
+  with no rates — `fixed=0` no longer fake-bounds.
+- Classification: **`P13_REMEDIATED_R2_PENDING_AUDIT`** on the P13
   branch/PR; evidence in
-  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 48/48,
-  P12 71/71, P11 103/103, N20 1906/0, N22 1904/2env, typecheck+build PASS,
+  `PAIR_OS_VNEXT_P13_COST_SECRETS_GOVERNANCE_REPORT.md`: P13 52/52,
+  P12 71/71, P11 103/103, N20 1910/0, N22 1908/2env, typecheck+build PASS,
   audit 0 high, worker races PASS, verifyIntegrity clean. NOT merged.
 
 ## Not yet

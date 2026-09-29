@@ -433,3 +433,95 @@ exist — an update can never silently create.
 
 **`P13_REMEDIATED_R1_PENDING_AUDIT`** — pushed to the existing P13 PR;
 DO NOT MERGE; DO NOT START P14/P15.
+
+---
+
+# REMEDIATION R2 — dispatch/cost crash-gap + unknown-cost hard-cap closure
+
+Audited head `a364467` was classified **P13_BLOCKED** with three findings:
+the COMMITTED crash gap, UNKNOWN billing under a hard cap, and the
+`fixed_microusd=0` fake-bound. R2 remediates all three on the same PR.
+
+## R2.1 §1 critical — COMMITTED crash gap must never redispatch
+
+**Defect.** The post-dispatch ordering was:
+
+`adapter.dispatch()` → `cost.markCommitted()` → persist
+`executor_execution` → persist intent `EXECUTION_PERSISTED`
+
+A crash after the commit but before the execution row made durable left
+`INTENT_RECORDED + COMMITTED + no evidence`: the retry fell through to the
+new-dispatch path, `assertAndReserve` adopted the COMMITTED row, and
+`adapter.dispatch` ran a second time — an exactly-once violation.
+
+**Fix (two layers).**
+
+1. **Durable ordering** — `executor_execution` is persisted FIRST, the
+   intent is promoted to `EXECUTION_PERSISTED` SECOND, dispatch
+   event/evidence THIRD, and `cost.markCommitted` runs LAST. A crash after
+   `adapter.dispatch` but before the commit leaves `HELD +
+   INTENT_RECORDED` — ambiguous and recoverable (reconcile only from
+   canonical adapter evidence), never a license to redispatch.
+2. **Defensive gate** — even if a COMMITTED/SETTLED reservation exists
+   under `INTENT_RECORDED` (legacy state, partial write), the new-dispatch
+   path now fails closed with audited
+   `FAIL_CLOSED_COST_COMMITTED_EXECUTION_UNRESOLVED` BEFORE
+   `assertAgentExecutionAllowed`/`assertAndReserve`. A cost reservation is
+   never treated as execution identity: COMMITTED proves possible
+   monetary history, not a reconstructable execution_id.
+
+`assertAndReserve` still returns the existing COMMITTED/SETTLED row
+unchanged — but it is now only reachable after an execution row + intent
+prove history (EXECUTION_PERSISTED early return, evidence-reconciled
+intent), never for a fresh `adapter.dispatch`.
+
+## R2.2 §2 — UNKNOWN billing + hard policy → FAIL_CLOSED_COST_UNKNOWN
+
+**Fix.** When ≥1 applicable HARD monetary policy exists and billing is
+`UNKNOWN`, dispatch fails closed with `FAIL_CLOSED_COST_UNKNOWN` — UNKNOWN
+may be a paid external route, so a hard cap requires a known cost shape.
+Without a hard policy, UNKNOWN remains explicitly unpriced
+(`reserved_microusd=0`, `unbounded=true`) — backward compatible.
+
+## R2.3 §3 — `fixed_microusd=0` is not a bound
+
+**Fix.** For METERED_API, bounded now requires `reserve_microusd>0` OR a
+positive `fixed_microusd` with no positive variable rates. An explicit
+`fixed_microusd=0` (or absent) with no rates stays UNBOUNDED and fails
+closed under a hard policy — a genuinely free route belongs under
+FREE/UNMETERED.
+
+## R2.4 R2 test matrix (4 new tests, P13 now 52)
+
+- COST-R2-A: INTENT_RECORDED + COMMITTED + no execution row + no evidence
+  → `FAIL_CLOSED_COST_COMMITTED_EXECUTION_UNRESOLVED`; 0 retry dispatches;
+  reservation stays COMMITTED; intent stays INTENT_RECORDED; no fake
+  execution row; verifyIntegrity clean.
+- COST-R2-A2: normal dispatch under the new ordering persists
+  execution + EXECUTION_PERSISTED before COMMIT; idempotent redispatch
+  returns the same execution with `dispatched` count 1.
+- COST-R2-B: UNKNOWN + hard business policy → `FAIL_CLOSED_COST_UNKNOWN`;
+  zero dispatch, zero reservations.
+- COST-R2-C: METERED_API `fixed=0`/no reserve/no rates + hard policy →
+  `FAIL_CLOSED_COST_UNBOUNDED`; positive fixed without rates remains
+  bounded (reserve = fixed).
+- Existing G2 updated (not weakened) to the new UNKNOWN semantics:
+  hard → UNKNOWN denied; warning-only → unpriced allowed.
+
+## R2.5 Validation evidence
+
+- `pnpm run typecheck` PASS · `pnpm run build` PASS
+- P13 **52/52** · P12 **71/71** · P11 **103/103** · P9 **79/79**
+- Node 22.23.3 `pnpm test`: **1908 pass / 2 fail / 24 skip** — same two
+  documented env-dependent p5 executor probes.
+- Node 20.20.2 `npx vitest run`: **1910 pass / 0 fail / 24 skip**
+  (better-sqlite3@11.10.0 ABI rebuilt per Node both ways).
+- `pnpm audit --audit-level=high`: **0 high / 0 critical**.
+- Worker races PASS: cost last-cap, cost recovery convergence, secret
+  CAS, plus all P11/P12 concurrency tests.
+- `verifyIntegrity` clean (asserted inside COST-R2-A).
+
+## R2.6 Classification
+
+**`P13_REMEDIATED_R2_PENDING_AUDIT`** — pushed to the existing P13 PR;
+DO NOT MERGE; DO NOT START P14/P15.

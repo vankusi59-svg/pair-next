@@ -627,6 +627,28 @@ export class GovernedTaskGate {
       );
     }
 
+    // P13-R2 §1: reaching here means a NEW adapter.dispatch is being
+    // prepared. A COMMITTED/SETTLED cost reservation proves external
+    // (monetary) action may already exist, but carries no execution_id
+    // to reconstruct — that is an ambiguous historical dispatch and can
+    // NEVER authorize another adapter.dispatch. Fail closed.
+    const crashGapRes = this.store.tryGet("cost_reservation", `CRSV_${governedTaskId}`);
+    if (
+      crashGapRes &&
+      (String(crashGapRes.status) === "COMMITTED" ||
+        String(crashGapRes.status) === "SETTLED")
+    ) {
+      this.store.appendEvidence(String(task.mission_id), "DISPATCH_EVIDENCE_INCOMPLETE", {
+        governed_task_id: governedTaskId,
+        executor_id: adapter.executor_id,
+        reservation_status: String(crashGapRes.status),
+      });
+      throw new IntegrityError(
+        "FAIL_CLOSED_COST_COMMITTED_EXECUTION_UNRESOLVED",
+        governedTaskId,
+      );
+    }
+
     // R2: final pre-dispatch authority revalidation — only reached when a
     // NEW adapter.dispatch is about to happen (EXECUTION_PERSISTED and
     // evidence-reconciled intents returned above). Contract tightening
@@ -659,7 +681,11 @@ export class GovernedTaskGate {
       this.service.cost.reconcileForTask(governedTaskId, adapter);
       throw e;
     }
-    this.service.cost.markCommitted(governedTaskId);
+    // P13-R2 §1 durable ordering: canonical executor_execution FIRST,
+    // intent EXECUTION_PERSISTED SECOND, evidence THIRD, and only THEN is
+    // the money committed. A crash after adapter.dispatch but before the
+    // commit below leaves reservation HELD + intent INTENT_RECORDED —
+    // ambiguous, recoverable, and never a license to redispatch.
     const executionId = String(execution.execution_id);
     const execEntity = this.store.put(
       "executor_execution",
@@ -701,6 +727,7 @@ export class GovernedTaskGate {
       execution_id: executionId,
       executor_id: adapter.executor_id,
     });
+    this.service.cost.markCommitted(governedTaskId);
     return execEntity;
   }
 

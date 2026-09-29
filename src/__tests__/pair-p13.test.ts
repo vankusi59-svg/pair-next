@@ -429,23 +429,35 @@ describe("P13.cost G/H: unbounded + non-metered billing", () => {
     expect(a.dispatched.length).toBe(0);
   });
 
-  it("G2. UNKNOWN profile + hard policy is allowed but counted unbounded-flagged (no fabricated USD)", () => {
+  it("G2. UNKNOWN billing + hard policy → FAIL_CLOSED_COST_UNKNOWN; no hard policy stays unpriced", () => {
     const { ctx, biz } = makeBizCtx("cg2");
     const a = new ScriptedAdapter("EXEC_A");
     registerScripted(ctx, a);
     const b = makeBiz(biz, ctx.projectId);
     const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
-    ctx.service.cost.upsertCostPolicy(
+    // R2 §2: UNKNOWN may be a paid external route — a hard cap requires
+    // knowing the cost shape. Fail closed, never fabricate $0.
+    const pol = ctx.service.cost.upsertCostPolicy(
       { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 10, hard_stop: true },
       "test",
     );
-    // no profile → billing UNKNOWN → reserve 0, marked unbounded
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
-    const routed = dispatchOne(ctx, mission);
+    expect(() => dispatchOne(ctx, mission)).toThrowError(/FAIL_CLOSED_COST_UNKNOWN/);
+    expect(a.dispatched.length).toBe(0);
+    expect(ctx.store.list("cost_reservation").length).toBe(0);
+    // With no hard monetary policy, UNKNOWN stays explicitly unpriced.
+    ctx.service.cost.upsertCostPolicy(
+      { cost_policy_id: pol.cost_policy_id, business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 10, hard_stop: false },
+      "test",
+      Number(pol.version),
+    );
+    const m2 = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const routed = dispatchOne(ctx, m2.mission);
     const res = reservationOf(ctx, String(routed.governed_task.governed_task_id))!;
     expect(String(res.billing_mode)).toBe("UNKNOWN");
     expect(Number(res.reserved_microusd)).toBe(0);
     expect(res.unbounded).toBe(true);
+    expect(a.dispatched.length).toBe(1);
   });
 
   it("H. SUBSCRIPTION/FREE reserve 0 and never fabricate USD", () => {
@@ -1319,6 +1331,115 @@ describe("P13-R1.cost: retry must re-run the full CURRENT authority", () => {
     const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
     expect(() => dispatchOne(ctx, mission)).toThrowError(/FAIL_CLOSED_COST_UNBOUNDED/);
     expect(a.dispatched.length).toBe(0);
+  });
+});
+
+describe("P13-R2.cost: dispatch/cost crash-gap + unknown-cost hard-cap closure", () => {
+  it("COST-R2-A: INTENT_RECORDED + COMMITTED + no execution proof → fail closed, never redispatch", () => {
+    const { ctx, biz } = makeBizCtx("r2ca");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    meteredProfile(ctx, "EXEC_A", 50);
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const task = taskOf(ctx, mission);
+    bindTask(ctx, task);
+    const { governed_task } = ctx.gate.create_governed_task(
+      a,
+      govRequest(ctx, ctx.service.getMission(String(mission.mission_id))),
+    );
+    const gtid = String(governed_task.governed_task_id);
+    ctx.gate.authorize_dispatch(a, gtid);
+    ctx.service.cost.assertAndReserve({
+      mission: ctx.service.getMission(String(mission.mission_id)),
+      task: ctx.service.getTask(String(task.task_id)),
+      governedTask: ctx.store.get("governed_task", gtid),
+      executorId: "EXEC_A",
+    });
+    ctx.store.put(
+      "executor_dispatch_intent",
+      `INTENT_${gtid}`,
+      { intent_id: `INTENT_${gtid}`, governed_task_id: gtid, executor_id: "EXEC_A", state: "INTENT_RECORDED", created_at: utcnow(), version: 0 },
+      0,
+    );
+    // Simulated pre-R2 crash shape: money committed, execution row +
+    // EXECUTION_PERSISTED never became durable, evidence absent.
+    ctx.service.cost.markCommitted(gtid);
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("COMMITTED");
+    expect(() => ctx.gate.dispatch_governed_task(a, gtid)).toThrowError(
+      /FAIL_CLOSED_COST_COMMITTED_EXECUTION_UNRESOLVED/,
+    );
+    expect(a.dispatched.length).toBe(0);
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("COMMITTED");
+    expect(String(ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`).state)).toBe("INTENT_RECORDED");
+    expect(ctx.store.list("executor_execution").length).toBe(0);
+    expect(String(ctx.store.verifyIntegrity().errors ?? 0)).toBe("0");
+  });
+
+  it("COST-R2-A2: normal dispatch after ordering change commits with durable execution", () => {
+    const { ctx, biz } = makeBizCtx("r2ca2");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    meteredProfile(ctx, "EXEC_A", 50);
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    const routed = dispatchOne(ctx, mission);
+    const gtid = String(routed.governed_task.governed_task_id);
+    // evidence durable BEFORE money committed; idempotent redispatch intact
+    const exec = ctx.store.get("executor_execution", String(routed.execution.execution_id));
+    expect(String(exec.governed_task_id)).toBe(gtid);
+    const intent = ctx.store.get("executor_dispatch_intent", `INTENT_${gtid}`);
+    expect(String(intent.state)).toBe("EXECUTION_PERSISTED");
+    expect(String(reservationOf(ctx, gtid)!.status)).toBe("COMMITTED");
+    const again = dispatchOne(ctx, ctx.service.getMission(String(mission.mission_id)));
+    expect(String(again.execution.execution_id)).toBe(String(routed.execution.execution_id));
+    expect(a.dispatched.length).toBe(1);
+  });
+
+  it("COST-R2-B: UNKNOWN billing + hard policy → FAIL_CLOSED_COST_UNKNOWN, zero reservation", () => {
+    const { ctx, biz } = makeBizCtx("r2cb");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    // no cost profile at all → billing UNKNOWN
+    ctx.service.cost.upsertCostPolicy(
+      { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 100, hard_stop: true },
+      "test",
+    );
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    expect(() => dispatchOne(ctx, mission)).toThrowError(/FAIL_CLOSED_COST_UNKNOWN/);
+    expect(a.dispatched.length).toBe(0);
+    expect(ctx.store.list("cost_reservation").length).toBe(0);
+  });
+
+  it("COST-R2-C: METERED_API fixed_microusd=0 with no rates is NOT bounded → UNBOUNDED", () => {
+    const { ctx, biz } = makeBizCtx("r2cc");
+    const a = new ScriptedAdapter("EXEC_A");
+    registerScripted(ctx, a);
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = biz.createOrgAgent({ business_id: String(b.business_id), title: "eng", department: "eng", operator_id: "op" });
+    ctx.service.cost.upsertCostProfile(
+      { ref_type: "route", ref_id: "RTE_EXEC_A", billing_mode: "METERED_API", fixed_microusd: 0, source: "operator" },
+      "test",
+    );
+    ctx.service.cost.upsertCostPolicy(
+      { business_id: String(b.business_id), scope_type: "business", scope_id: String(b.business_id), period: "DAY", max_microusd: 100, hard_stop: true },
+      "test",
+    );
+    const { mission } = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    expect(() => dispatchOne(ctx, mission)).toThrowError(/FAIL_CLOSED_COST_UNBOUNDED/);
+    expect(a.dispatched.length).toBe(0);
+    // a positive stated fixed fee with no rates remains a bounded charge
+    ctx.service.cost.upsertCostProfile(
+      { ref_type: "route", ref_id: "RTE_EXEC_A", billing_mode: "METERED_API", fixed_microusd: 10, source: "operator" },
+      "test",
+    );
+    const m2 = boundMission(ctx, String(ag.agent_id), String(b.business_id));
+    expect(() => dispatchOne(ctx, m2.mission)).not.toThrow();
+    expect(Number(reservationOf(ctx, String(ctx.store.list("cost_reservation")[0].governed_task_id))!.reserved_microusd)).toBe(10);
   });
 });
 

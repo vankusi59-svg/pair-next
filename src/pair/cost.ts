@@ -345,17 +345,18 @@ export class CostService {
     }
     const mode = String(profile.billing_mode) as BillingMode;
     if (mode !== "METERED_API") return { mode, profile, unbounded: false };
-    // R1 §2 boundedness: a positive reserve_microusd is the only ceiling;
-    // an explicitly stated fixed fee with no metered rates is a bounded
-    // charge. "0 supplied" (reserve 0/absent on a metered profile) is NOT
-    // a conservative bound — nor is a profile with no charge schedule at
-    // all: those stay unbounded and fail closed under a hard policy.
+    // R1 §2 + R2 §3 boundedness: a positive reserve_microusd is the only
+    // ceiling; a positive stated fixed fee with no metered rates is a
+    // bounded charge. "0 supplied" — reserve 0/absent, or fixed_microusd=0
+    // with no rates — is NOT a conservative bound for a metered call:
+    // it stays unbounded and fails closed under a hard policy. A truly
+    // free route belongs under FREE/UNMETERED, not METERED_API.
     const reserve = Number(profile.reserve_microusd ?? 0);
     const hasRates =
       Number(profile.input_microusd_per_mtok ?? 0) > 0 ||
       Number(profile.output_microusd_per_mtok ?? 0) > 0;
-    const statedFixed = profile.fixed_microusd != null;
-    const bounded = reserve > 0 || (!hasRates && statedFixed);
+    const statedFixed = Number(profile.fixed_microusd ?? 0);
+    const bounded = reserve > 0 || (!hasRates && statedFixed > 0);
     return { mode, profile, unbounded: !bounded };
   }
 
@@ -474,8 +475,19 @@ export class CostService {
     );
     const hard = applicable.filter((p) => p.hard_stop !== false);
 
-    // §9: a hard policy cannot be enforced against an unbounded METERED
-    // cost — fail closed rather than guess.
+    // §9 + R2 §2: a hard monetary policy cannot be enforced against an
+    // unbounded METERED_API cost, and it cannot be enforced against an
+    // UNKNOWN billing mode at all — UNKNOWN may be a paid external route,
+    // so a hard cap requires knowing the cost shape. Fail closed; never
+    // fabricate $0.
+    if (billing.mode === "UNKNOWN" && hard.length > 0) {
+      this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
+        reason: "FAIL_CLOSED_COST_UNKNOWN",
+        governed_task_id: governedTaskId,
+        policy_ids: hard.map((p) => p.cost_policy_id),
+      });
+      throw new PolicyError("FAIL_CLOSED_COST_UNKNOWN", governedTaskId);
+    }
     if (billing.mode === "METERED_API" && billing.unbounded && hard.length > 0) {
       this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
         reason: "FAIL_CLOSED_COST_UNBOUNDED",
