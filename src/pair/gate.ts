@@ -103,6 +103,127 @@ export class GovernedTaskGate {
         String(task.selected_executor),
       );
     }
+
+    // P12/R2: canonical agent-execution validation — same helper the
+    // pre-dispatch boundary re-runs, so the two paths cannot drift.
+    this.assertAgentExecutionAllowed(mission, task, adapter.executor_id);
+    return this.createGovernedTaskContinuation(adapter, request, mission, task, active);
+  }
+
+  /**
+   * R2: canonical P12 agent-execution validation — reused by
+   * create_governed_task AND the final pre-dispatch boundary so the two
+   * enforcement paths cannot drift. Resolution itself fails closed
+   * (pin, agent/contract ACTIVE, business, integrity) inside
+   * effectiveForMission.
+   */
+  private assertAgentExecutionAllowed(
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+    executorId: string,
+  ): void {
+    const boundAgentId = (
+      (mission.metadata as Record<string, unknown> | undefined)?.org_agent_id
+    );
+    if (!boundAgentId) return;
+    let agentPolicy;
+    try {
+      agentPolicy = this.service.agentContracts.effectiveForMission(mission);
+    } catch (e) {
+      if (e instanceof PolicyError || e instanceof IntegrityError) {
+        this.service.agentContracts.auditDenial(
+          (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+          (e as Error).message,
+          { missionId: String(mission.mission_id), agentId: String(boundAgentId), taskId: String(task.task_id) },
+        );
+      }
+      throw e;
+    }
+    const denyCtx = {
+      missionId: String(mission.mission_id),
+      agentId: String(boundAgentId),
+      taskId: String(task.task_id),
+      contractVersion: agentPolicy.contract_version,
+    };
+    const requiredCaps = (task.required_capabilities as string[]) ?? [];
+    const explicitlyDenied = requiredCaps.filter((c) =>
+      agentPolicy.denied_capabilities.has(c),
+    );
+    if (explicitlyDenied.length) {
+      this.service.agentContracts.deny(
+        "FAIL_CLOSED_AGENT_CAPABILITY_DENIED",
+        `explicit-deny:${explicitlyDenied.sort().join(",")}`,
+        denyCtx,
+      );
+    }
+    if (agentPolicy.allowed_capabilities) {
+      const deniedCaps = requiredCaps.filter(
+        (c) => !agentPolicy.allowed_capabilities!.has(c),
+      );
+      if (deniedCaps.length) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_CAPABILITY_DENIED",
+          deniedCaps.sort().join(","),
+          denyCtx,
+        );
+      }
+    }
+    const execDenied =
+      agentPolicy.denied_executor_ids.has(executorId) ||
+      (agentPolicy.allowed_executor_ids !== null &&
+        !agentPolicy.allowed_executor_ids.has(executorId)) ||
+      (agentPolicy.restricted_executor_ids !== null &&
+        !agentPolicy.restricted_executor_ids.has(executorId));
+    if (execDenied) {
+      this.service.agentContracts.deny(
+        "FAIL_CLOSED_AGENT_EXECUTOR_DENIED",
+        String(executorId),
+        denyCtx,
+      );
+    }
+    const projectId = String(mission.project_id);
+    if (
+      agentPolicy.allowed_project_ids !== null &&
+      !agentPolicy.allowed_project_ids.has(projectId)
+    ) {
+      this.service.agentContracts.deny(
+        "FAIL_CLOSED_AGENT_PROJECT_DENIED",
+        projectId,
+        denyCtx,
+      );
+    }
+    // Route revalidation: the canonical task carries the bound
+    // selected_route_id; a now-denied or out-of-restriction route fails
+    // closed. An unbound route has nothing to enforce here.
+    const routeId = task.selected_route_id ? String(task.selected_route_id) : null;
+    if (routeId) {
+      if (agentPolicy.denied_route_ids.has(routeId)) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_ROUTE_DENIED",
+          String(routeId),
+          denyCtx,
+        );
+      }
+      if (
+        agentPolicy.restricted_route_ids !== null &&
+        !agentPolicy.restricted_route_ids.has(routeId)
+      ) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_AGENT_ROUTE_RESTRICTED",
+          String(routeId),
+          denyCtx,
+        );
+      }
+    }
+  }
+
+  private createGovernedTaskContinuation(
+    adapter: ExecutorAdapter,
+    request: Record<string, unknown>,
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+    active: Record<string, unknown>,
+  ) {
     const q = adapter.qualify();
     if (!q.qualified) {
       throw new PolicyError("FAIL_CLOSED_EXECUTOR_UNQUALIFIED", adapter.executor_id);
@@ -415,21 +536,73 @@ export class GovernedTaskGate {
     const existingIntent = this.store.tryGet("executor_dispatch_intent", intentId);
     if (existingIntent) {
       const state = String(existingIntent.state);
+      // R4 §3/§6C: the persisted intent's own payload must match this
+      // governed task — a stale/tampered intent fails closed before any
+      // adoption or new dispatch. Historical execution bypasses CURRENT
+      // contract checks but never identity/provenance checks.
+      this.assertIntentIdentity(existingIntent, task, adapter, governedTaskId);
       if (state === "EXECUTION_PERSISTED" && existingIntent.execution_id) {
-        // Idempotent re-dispatch: return the existing execution.
-        return this.store.get("executor_execution", String(existingIntent.execution_id));
+        // Idempotent re-dispatch: return the existing execution — only
+        // after its canonical identity binds to this governed task.
+        const exec = this.store.get(
+          "executor_execution",
+          String(existingIntent.execution_id),
+        );
+        this.assertExecutionIdentity(
+          exec,
+          task,
+          adapter.executor_id,
+          String(existingIntent.execution_id),
+          governedTaskId,
+        );
+        return exec;
       }
       if (state === "INTENT_RECORDED") {
         // Previous dispatch crashed before persisting — consult evidence.
         const evidence = adapter.dispatch_evidence?.(governedTaskId);
-        if (evidence?.dispatched && evidence.execution_id) {
-          const exec = this.store.get("executor_execution", String(evidence.execution_id));
-          this.store.put(
-            "executor_dispatch_intent",
-            intentId,
-            { ...existingIntent, state: "EXECUTION_PERSISTED", execution_id: evidence.execution_id },
-            existingIntent.version,
+        if (evidence?.dispatched) {
+          // R3 §3: dispatched proven but no usable execution_id —
+          // redispatch could duplicate real side effects. Fail closed;
+          // the intent stays INTENT_RECORDED for recovery.
+          if (!evidence.execution_id) {
+            this.store.appendEvidence(String(task.mission_id), "DISPATCH_EVIDENCE_INCOMPLETE", {
+              governed_task_id: governedTaskId,
+              executor_id: adapter.executor_id,
+            });
+            throw new IntegrityError(
+              "FAIL_CLOSED_DISPATCH_EVIDENCE_INCOMPLETE",
+              governedTaskId,
+            );
+          }
+          const evidenceExecId = String(evidence.execution_id);
+          // R4 §4: any pre-existing row under this id is identity-checked
+          // before adoption — stale/buggy adapter evidence or an id
+          // collision fails closed rather than adopting foreign history.
+          const exec = this.reconcileProvenExecution(
+            task,
+            adapter,
+            evidenceExecId,
+            governedTaskId,
           );
+          // Persist the intent only after local execution evidence is
+          // durable; a racing reconciler may already have — adopt its
+          // outcome when it names the same execution.
+          try {
+            this.store.put(
+              "executor_dispatch_intent",
+              intentId,
+              { ...existingIntent, state: "EXECUTION_PERSISTED", execution_id: evidenceExecId },
+              existingIntent.version,
+            );
+          } catch (e) {
+            const cur = this.store.get("executor_dispatch_intent", intentId);
+            if (
+              String(cur.state) !== "EXECUTION_PERSISTED" ||
+              String(cur.execution_id) !== evidenceExecId
+            ) {
+              throw e;
+            }
+          }
           return exec;
         }
       }
@@ -448,6 +621,19 @@ export class GovernedTaskGate {
         0,
       );
     }
+
+    // R2: final pre-dispatch authority revalidation — only reached when a
+    // NEW adapter.dispatch is about to happen (EXECUTION_PERSISTED and
+    // evidence-reconciled intents returned above). Contract tightening
+    // since validation/adoption revokes the dispatch here; an already-
+    // dispatched execution is a historical fact and never re-checked.
+    const predispatchMission = this.service.getMission(String(task.mission_id));
+    const predispatchTask = this.service.getTask(String(task.task_id));
+    this.assertAgentExecutionAllowed(
+      predispatchMission,
+      predispatchTask,
+      adapter.executor_id,
+    );
 
     const execution = adapter.dispatch(task, { actor: "PAIR_GOVERNED_TASK_GATE" });
     const executionId = String(execution.execution_id);
@@ -492,6 +678,208 @@ export class GovernedTaskGate {
       executor_id: adapter.executor_id,
     });
     return execEntity;
+  }
+
+  /**
+   * R4 §3/§6C: the intent entity keyed INTENT_<governedTaskId> must
+   * carry a matching governed_task_id and the dispatching executor.
+   * Anything else is malformed persisted state — fail closed.
+   */
+  private assertIntentIdentity(
+    intent: Record<string, unknown>,
+    task: Record<string, unknown>,
+    adapter: ExecutorAdapter,
+    governedTaskId: string,
+  ): void {
+    if (
+      String(intent.governed_task_id) === governedTaskId &&
+      String(intent.executor_id) === String(adapter.executor_id)
+    ) {
+      return;
+    }
+    this.store.appendEvidence(String(task.mission_id), "DISPATCH_INTENT_IDENTITY_MISMATCH", {
+      governed_task_id: governedTaskId,
+      intent_governed_task_id: String(intent.governed_task_id ?? ""),
+      intent_executor_id: String(intent.executor_id ?? ""),
+    });
+    throw new IntegrityError(
+      "FAIL_CLOSED_DISPATCH_INTENT_IDENTITY_MISMATCH",
+      governedTaskId,
+    );
+  }
+
+  /**
+   * R4 §2: an executor_execution row is only adoptable when its
+   * canonical identity binds to the governed task being recovered.
+   * Never trust an execution_id alone (stale adapter evidence, id
+   * collisions, malformed local state).
+   */
+  private assertExecutionIdentity(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    executorId: string,
+    executionId: string,
+    governedTaskId: string,
+  ): void {
+    const pairs: Array<[string, unknown, unknown]> = [
+      ["execution_id", exec.execution_id, executionId],
+      ["governed_task_id", exec.governed_task_id, governedTaskId],
+      ["mission_id", exec.mission_id, task.mission_id],
+      ["task_id", exec.task_id, task.task_id],
+      ["executor_id", exec.executor_id, executorId],
+      ["plan_revision", exec.plan_revision, task.plan_revision],
+      ["correlation_id", exec.correlation_id, task.correlation_id],
+    ];
+    const mismatch = pairs.find(
+      ([, actual, expected]) => String(actual ?? null) !== String(expected ?? null),
+    );
+    // Workspace only when both sides carry a meaningful value.
+    const wsMismatch =
+      exec.workspace != null &&
+      task.workspace != null &&
+      String(exec.workspace) !== String(task.workspace);
+    if (!mismatch && !wsMismatch) return;
+    const field = mismatch ? mismatch[0] : "workspace";
+    this.store.appendEvidence(
+      String(task.mission_id),
+      "EXECUTION_RECONCILE_IDENTITY_MISMATCH",
+      { governed_task_id: governedTaskId, execution_id: executionId, field },
+    );
+    throw new IntegrityError(
+      "FAIL_CLOSED_EXECUTION_RECONCILE_IDENTITY_MISMATCH",
+      `${governedTaskId}:${field}`,
+    );
+  }
+
+  private emitReconciliationEvent(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    governedTaskId: string,
+  ): void {
+    this.store.event({
+      entity_type: "executor_execution",
+      entity_id: String(exec.execution_id),
+      event_type: "EXECUTION_RECONCILED",
+      new_state: String(exec.execution_state),
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: String(task.correlation_id),
+      metadata: { governed_task_id: governedTaskId },
+    });
+  }
+
+  private emitReconciliationEvidence(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    governedTaskId: string,
+  ): void {
+    this.store.appendEvidence(String(task.mission_id), "EXECUTION_RECONCILED", {
+      governed_task_id: governedTaskId,
+      execution_id: String(exec.execution_id),
+      executor_id: String(exec.executor_id),
+    });
+  }
+
+  /**
+   * R4 §5: at-least-once repair for a canonical row whose reconciliation
+   * audit was lost to a crash. Missing pieces are emitted independently;
+   * append-only store conventions make re-emission safe.
+   */
+  private ensureReconciliationEvidence(
+    exec: Record<string, unknown>,
+    task: Record<string, unknown>,
+    governedTaskId: string,
+  ): void {
+    const eid = String(exec.execution_id);
+    const hasEvent = this.store
+      .listEvents("executor_execution", eid)
+      .some((e) => String(e.event_type) === "EXECUTION_RECONCILED");
+    if (!hasEvent) this.emitReconciliationEvent(exec, task, governedTaskId);
+    const hasEvidence = this.store.listEvidence(String(task.mission_id)).some((e) => {
+      if (String(e.kind) !== "EXECUTION_RECONCILED") return false;
+      const inner = (e.payload as Record<string, unknown> | undefined)?.payload as
+        | Record<string, unknown>
+        | undefined;
+      return String(inner?.governed_task_id) === governedTaskId;
+    });
+    if (!hasEvidence) this.emitReconciliationEvidence(exec, task, governedTaskId);
+  }
+
+  /**
+   * R3 §2/§6 + R4 §1/§5: reconstruct the canonical local
+   * executor_execution for a proven external dispatch when the local row
+   * is absent (crash between external dispatch and persistence).
+   * Insert-only CAS — ONLY FAIL_CLOSED_VERSION_CONFLICT adopts the
+   * winner's row (after identity validation); every other failure
+   * propagates so the intent stays INTENT_RECORDED and recoverable.
+   * No fabricated dispatch_timestamp: `reconciled_at` records recovery
+   * time only.
+   */
+  private reconcileProvenExecution(
+    task: Record<string, unknown>,
+    adapter: ExecutorAdapter,
+    executionId: string,
+    governedTaskId: string,
+  ): Record<string, unknown> {
+    const existing = this.store.tryGet("executor_execution", executionId);
+    if (existing) {
+      this.assertExecutionIdentity(
+        existing,
+        task,
+        adapter.executor_id,
+        executionId,
+        governedTaskId,
+      );
+      this.ensureReconciliationEvidence(existing, task, governedTaskId);
+      return existing;
+    }
+    let observed: string | null = null;
+    try {
+      const ob = adapter.observe?.(executionId);
+      if (ob?.status) observed = String(ob.status);
+    } catch {
+      /* observation unprovable — keep null */
+    }
+    const entity = {
+      execution_id: executionId,
+      governed_task_id: String(task.governed_task_id),
+      mission_id: task.mission_id,
+      task_id: task.task_id,
+      executor_id: adapter.executor_id,
+      plan_revision: task.plan_revision,
+      correlation_id: task.correlation_id,
+      execution_state: observed ?? "RUNNING",
+      reconciled_from_dispatch_evidence: true,
+      reconciled_at: utcnow(),
+      workspace: task.workspace,
+      version: 0,
+    };
+    let saved: Record<string, unknown>;
+    try {
+      saved = this.store.put("executor_execution", executionId, entity, 0);
+    } catch (e) {
+      // R4 §1: only the insert CAS conflict means "someone else
+      // reconciled first". Every other failure propagates — the intent
+      // must NOT promote while local state is undefined.
+      if ((e as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") {
+        throw e;
+      }
+      const row = this.store.get("executor_execution", executionId);
+      this.assertExecutionIdentity(
+        row,
+        task,
+        adapter.executor_id,
+        executionId,
+        governedTaskId,
+      );
+      this.ensureReconciliationEvidence(row, task, governedTaskId);
+      return row;
+    }
+    // Canonical row durable — now the reconciliation audit MUST persist
+    // before the caller promotes the intent. A failure here propagates;
+    // the next recovery pass repairs via the adoption branch above.
+    this.emitReconciliationEvent(saved, task, governedTaskId);
+    this.emitReconciliationEvidence(saved, task, governedTaskId);
+    return saved;
   }
 
   observe_execution(

@@ -20,6 +20,11 @@
  */
 import { IntegrityError, PolicyError } from "./errors.js";
 import { digest, newId, utcnow } from "./canonical.js";
+import {
+  AgentContractService,
+  type AgentContractPolicy,
+  type AgentContractStatus,
+} from "./agent-contract.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
@@ -108,6 +113,8 @@ function periodStart(period: BudgetPeriod, now: Date): string {
 }
 
 export class BusinessLayer {
+  private _agentContracts: AgentContractService | null = null;
+
   constructor(private readonly deps: BusinessLayerDeps) {
     // Routines are business-originated work: a schedule fire carrying
     // metadata.business_id must pass the same mission-count budget gate as
@@ -228,7 +235,64 @@ export class BusinessLayer {
       new_state: "ACTIVE", actor: `operator:${input.operator_id}`,
       metadata: { business_id: input.business_id, department: input.department, title: input.title },
     });
+    // P12: every new org_agent receives a baseline execution contract — an
+    // agent without a contract must never mean unrestricted access.
+    this.agentContracts.materialize(id, `operator:${input.operator_id}`);
     return saved;
+  }
+
+  /** P12 canonical agent-execution-contract service (same store). */
+  get agentContracts(): AgentContractService {
+    this._agentContracts ??= new AgentContractService(this.store);
+    return this._agentContracts;
+  }
+
+  // ---------- agent execution contract (P12) ----------
+
+  /** Read the canonical contract (null when not yet materialized). */
+  getAgentContract(agentId: string): Row | null {
+    return this.agentContracts.get(agentId);
+  }
+
+  /**
+   * Create-or-update an agent's contract under CAS. With `policy` the
+   * contract is materialized with that policy (or updated under
+   * `expected_version`); without it the baseline is materialized.
+   */
+  upsertAgentContract(
+    agentId: string,
+    actor: string,
+    policy?: Record<string, unknown>,
+    expectedVersion?: number,
+  ): Row {
+    if (!actor) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "agent_contract.upsert");
+    this.store.get("org_agent", agentId); // fail-closed identity check
+    const existing = this.agentContracts.get(agentId);
+    if (!existing) {
+      return this.agentContracts.materialize(
+        agentId,
+        `operator:${actor}`,
+        policy as Partial<AgentContractPolicy> | undefined,
+      );
+    }
+    if (policy === undefined) return existing;
+    return this.agentContracts.update(
+      agentId,
+      policy as Partial<AgentContractPolicy>,
+      expectedVersion ?? Number(existing.version),
+      `operator:${actor}`,
+    );
+  }
+
+  setAgentContractStatus(agentId: string, status: AgentContractStatus, actor: string): Row {
+    if (!actor) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "agent_contract.status");
+    this.store.get("org_agent", agentId); // fail-closed identity check
+    return this.agentContracts.setStatus(agentId, status, `operator:${actor}`);
+  }
+
+  /** Operator view: resolved contract + agent status (no secrets). */
+  inspectAgentPolicy(agentId: string): Row {
+    return this.agentContracts.inspect(agentId) as Row;
   }
 
   listOrgAgents(businessId?: string): Row[] {
@@ -418,13 +482,30 @@ export class BusinessLayer {
     try {
       reservationId = this.reserveBudget(String(row.business_id), String(row.department ?? ""), agentId, openId);
 
-      const notes = ((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
-        .slice(-AGENT_CONTEXT_INJECT)
-        .map((n) => `- ${String(n.note)}`);
+      // P12 §15: context injection respects the contract's
+      // allowed_context_scopes — "business" gates the org prefix, "agent"
+      // gates agent identity + outcome notes. Baseline grants all scopes,
+      // so unmodified contracts see identical goals.
+      const ctxScopes = agentId
+        ? new Set(
+            (this.agentContracts.resolve(agentId).contract.policy as AgentContractPolicy)
+              .allowed_context_scopes,
+          )
+        : new Set<string>();
+      const notes = ctxScopes.has("agent")
+        ? (((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
+            .slice(-AGENT_CONTEXT_INJECT)
+            .map((n) => `- ${String(n.note)}`))
+        : [];
       const goal =
-        `[BUSINESS ${String(business.name)} | DEPT ${String(row.department ?? "-")}` +
-        (agent ? ` | AGENT ${String(agent.title)} (${String(agent.role ?? "")})` : "") +
-        `]\n${String(row.goal)}` +
+        (ctxScopes.has("business") || !agentId
+          ? `[BUSINESS ${String(business.name)} | DEPT ${String(row.department ?? "-")}` +
+            (agent && ctxScopes.has("agent")
+              ? ` | AGENT ${String(agent.title)} (${String(agent.role ?? "")})`
+              : "") +
+            `]\n`
+          : "") +
+        `${String(row.goal)}` +
         (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "");
 
       const mission = this.deps.control.startMission({

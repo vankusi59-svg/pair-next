@@ -191,6 +191,9 @@ export class CapabilityRouter {
       actor?: string;
       routingAdvisor?: VerifiedExperienceRoutingAdvisor;
       environment?: Record<string, unknown>;
+      /** P12: agent-contract executor preference, ordered — reorders inside
+       *  the hard-eligible set only; it can never make an executor eligible. */
+      preferredExecutors?: string[];
     } = {},
   ): Record<string, unknown> {
     const mode = opts.mode ?? "PLAN";
@@ -233,6 +236,17 @@ export class CapabilityRouter {
         (Number(a.routing_priority) || 100) - (Number(b.routing_priority) || 100) ||
         String(a.executor_id).localeCompare(String(b.executor_id)),
     );
+    // P12: contract executor preference is a deterministic reorder inside
+    // the eligible set (first declared preference that survived all gates
+    // leads). It never admits a rejected executor. Advisors may still
+    // re-rank the reordered set below.
+    const contractPreferred = (opts.preferredExecutors ?? []).filter((id) =>
+      eligible.some((d) => String(d.executor_id) === id),
+    );
+    for (const id of [...contractPreferred].reverse()) {
+      const idx = eligible.findIndex((d) => String(d.executor_id) === id);
+      if (idx >= 0) eligible.unshift(...eligible.splice(idx, 1));
+    }
     // P7: advisory re-rank runs strictly INSIDE the hard-eligible set — it can
     // never add, remove, or resurrect a candidate, only reorder by bounded
     // verified-experience adjustment. No advisor → identical P6 baseline.
@@ -261,6 +275,7 @@ export class CapabilityRouter {
       required_capabilities: [...requiredCapabilities].sort(),
       required_permissions: [...requiredPermissions].sort(),
       executor_exclusions: opts.excludedExecutors ?? {},
+      agent_preferred_executors: contractPreferred,
       evaluation_mode: mode,
       eligible_executors: eligible.map((d) => d.executor_id),
       rejected_executors: rejected,

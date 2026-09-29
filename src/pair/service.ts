@@ -11,6 +11,7 @@
 import path from "node:path";
 import { newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { AgentContractService } from "./agent-contract.js";
 import { RouteRegistry } from "./route-registry.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -28,6 +29,7 @@ export const TASK_DISPATCHABLE_STATES = new Set(["READY", "ROUTED"]);
 
 export class PairControlPlane {
   private _routes: RouteRegistry | null = null;
+  private _agentContracts: AgentContractService | null = null;
 
   constructor(public readonly store: PairEvidenceStore) {}
 
@@ -35,6 +37,12 @@ export class PairControlPlane {
   get routes(): RouteRegistry {
     this._routes ??= new RouteRegistry(this);
     return this._routes;
+  }
+
+  /** Lazy canonical P12 agent-execution-contract resolver/enforcer. */
+  get agentContracts(): AgentContractService {
+    this._agentContracts ??= new AgentContractService(this.store);
+    return this._agentContracts;
   }
 
   createProject(params: { name: string; root_location: string }): Record<string, unknown> {

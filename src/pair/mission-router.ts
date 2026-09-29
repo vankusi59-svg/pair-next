@@ -74,10 +74,14 @@ export class MissionRouter {
     const missionId = String(request.mission_id);
     const correlationId = String(request.correlation_id ?? "");
     const task = this.service.getTask(taskId);
+    const mission = this.service.getMission(missionId);
     const active = this.service.activeRevision(missionId);
 
-    // Idempotency: a governed task already bound for this plan revision is
-    // adopted, not duplicated — dispatch dedup then yields the same execution.
+    // R3 §4: adoption/idempotency FIRST — a governed task whose external
+    // dispatch already happened is a historical fact and returns without
+    // re-resolving the current contract (a since-paused agent or disabled
+    // contract must not erase proven history). The final authority check
+    // inside dispatch_governed_task still gates any NEW dispatch.
     const existing = this.existingGovernedTask(taskId, active.revision);
     if (existing) {
       const executorId = String(existing.executor_id);
@@ -100,6 +104,32 @@ export class MissionRouter {
         governed_task: authorized,
         execution,
       };
+    }
+
+    // P12: agent execution contract — resolve effective executor/route policy
+    // (mission-pinned ∩ current ∩ PAIR) once per routing pass. Resolution is
+    // fail-closed; contract only narrows the canonical candidate set.
+    const boundAgentId = (
+      (mission.metadata as Record<string, unknown> | undefined)?.org_agent_id
+    );
+    let agentPolicy = null;
+    if (boundAgentId) {
+      try {
+        agentPolicy = this.service.agentContracts.effectiveForMission(mission);
+      } catch (e) {
+        if (e instanceof PolicyError || e instanceof IntegrityError) {
+          this.service.agentContracts.auditDenial(
+            (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+            (e as Error).message,
+            {
+              missionId: String(missionId),
+              agentId: String(boundAgentId),
+              taskId: String(taskId),
+            },
+          );
+        }
+        throw e;
+      }
     }
 
     // 1. Executor eligibility — DISPATCH mode (all 12 gates, live qualify).
@@ -127,6 +157,31 @@ export class MissionRouter {
         );
       }
     }
+    // P12: intersect candidates with the contract's effective executor set.
+    // The gate re-checks authoritatively at create_governed_task — this filter
+    // keeps routing honest before selection so a forbidden executor is never
+    // even eligible.
+    if (agentPolicy) {
+      candidates = new Map(
+        [...candidates].filter(([id]) =>
+          (agentPolicy.allowed_executor_ids === null || agentPolicy.allowed_executor_ids.has(id)) &&
+          (agentPolicy.restricted_executor_ids === null || agentPolicy.restricted_executor_ids.has(id)) &&
+          !agentPolicy.denied_executor_ids.has(id),
+        ),
+      );
+      if (!candidates.size) {
+        this.service.agentContracts.deny(
+          "FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR",
+          "agent_contract:executor_set_empty",
+          {
+            missionId,
+            agentId: String(boundAgentId),
+            taskId,
+            contractVersion: agentPolicy.contract_version,
+          },
+        );
+      }
+    }
     const routingDecision = this.capabilityRouter.route(task, {
       adapters: candidates,
       mode: "DISPATCH",
@@ -136,6 +191,7 @@ export class MissionRouter {
       ),
       routingAdvisor: this.routingAdvisor,
       environment: this.environment,
+      preferredExecutors: agentPolicy?.preferred_executor_ids ?? [],
     });
     const selectedExecutor = routingDecision.selected_executor;
     if (!selectedExecutor) {
@@ -164,6 +220,12 @@ export class MissionRouter {
       mission_id: missionId,
       task_id: taskId,
       correlation_id: correlationId,
+      preferred_route_ids: agentPolicy?.preferred_route_ids ?? [],
+      denied_route_ids: agentPolicy ? [...agentPolicy.denied_route_ids] : [],
+      // Effective hard route restriction (pinned ∩ current, minus denied)
+      // — when any snapshot disables fallback, only these may be selected.
+      restricted_route_ids:
+        agentPolicy?.restricted_route_ids ? [...agentPolicy.restricted_route_ids] : null,
     });
     if (!routeDecision.selected_route_id) {
       this.service.store.appendEvidence(missionId, "ROUTING_FAILED", {

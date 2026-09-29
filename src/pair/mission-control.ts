@@ -356,10 +356,37 @@ export class MissionControl {
         throw new PolicyError("FAIL_CLOSED_PLAN_DIGEST_MISMATCH", String(input.confirm_plan.digest).slice(0, 16));
       }
     }
+    const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
+    if (boundAgentId) {
+      // P12: a mission bound to an org_agent pins its agent execution
+      // contract (id/version/digest/policy snapshot) into immutable mission
+      // metadata. assertExecutable fails closed on inactive agent,
+      // disabled contract, business mismatch, or out-of-scope project.
+      try {
+        metadata.agent_contract = this.deps.service.agentContracts.pin(boundAgentId, {
+          businessId: metadata.business_id ? String(metadata.business_id) : null,
+          projectId: input.project_id,
+          actor: `operator:${input.operator_id ?? "system"}`,
+        });
+      } catch (e) {
+        // R1 §6: pin-time contract failures are audited as denials before
+        // they propagate — inactive agent, disabled contract, business
+        // mismatch, project denial, integrity/provenance all land here.
+        if (e instanceof PolicyError || e instanceof IntegrityError) {
+          this.deps.service.agentContracts.auditDenial(
+            (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+            (e as Error).message,
+            { agentId: boundAgentId },
+          );
+        }
+        throw e;
+      }
+    }
     const mission = this.deps.service.createMission({
       project_id: input.project_id,
       goal: input.goal,
-      metadata: input.metadata ?? {},
+      metadata,
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: input.authorized_workspaces,
       risk_ceiling: input.risk_ceiling,
