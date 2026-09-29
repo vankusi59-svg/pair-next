@@ -95,6 +95,12 @@ export class PairControlPlane {
      *  generic Mission Control API. A colliding id fails closed on the
      *  version-0 CAS insert; there is no overwrite/upsert path. */
     mission_id?: string;
+    /** Foundation V2 R1 §3: internal mission-origin proof — the open_id
+     *  of the work_open_binding that created this mission. Top-level
+     *  field, written only by the internal bound-mission seam; the
+     *  generic mission API can never set it, so "this mission belongs to
+     *  binding X" is derivable from canonical evidence, not metadata. */
+    bound_open_id?: string;
   }): Record<string, unknown> {
     const project = this.getProject(params.project_id);
     const missionId = params.mission_id ?? newId("MSN");
@@ -105,6 +111,7 @@ export class PairControlPlane {
       mission_id: missionId,
       project_id: params.project_id,
       goal: params.goal,
+      bound_open_id: params.bound_open_id ?? null,
       status: "CREATED",
       plan_id: null,
       plan_state: null,

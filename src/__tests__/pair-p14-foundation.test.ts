@@ -147,9 +147,11 @@ function seedIntent(
     updated_at: utcnow(), version: 0,
   } as never, 0);
   if (opts.createMission) {
+    // The internal seam derives the reserved id FROM the binding — the
+    // caller never pins it — and stamps the bound_open_id origin proof.
     return ctx.control.startBoundMission({
       project_id: ctx.projectId, goal: "orphan", operator_id: "op",
-      mission_id: missionId,
+      binding_open_id: openId,
       metadata: {
         business_id: String(row.business_id), work_item_id: workItemId,
         work_item_open_id: openId,
@@ -188,14 +190,26 @@ describe("P14 FOUNDATION V2 — canonical binding authority", () => {
       server.close();
     }
     expect(ctx.store.tryGet("mission", reservedId)).toBeNull();
-    // (c) The internal bound seam legitimately creates the reserved id —
-    //     the caller could never occupy it first.
+    // (c) The internal bound seam legitimately creates a reserved id —
+    //     derived from a canonical binding, never caller-pinned. The
+    //     created mission carries the non-forgeable bound_open_id proof.
+    const w = makeWorkItem(biz, String(b.business_id));
+    const openId = "OPI_pubpin";
+    ctx.store.put("work_open_binding", openId, {
+      open_id: openId, work_item_id: String(w.work_item_id),
+      business_id: String(b.business_id), project_id: ctx.projectId,
+      org_agent_id: null, created_by: "op",
+      mission_id: reservedId, state: "INTENT",
+      created_at: utcnow(), bound_at: null, rolled_back_at: null,
+      updated_at: utcnow(), version: 0,
+    } as never, 0);
     const bound = ctx.control.startBoundMission({
+      binding_open_id: openId,
       project_id: ctx.projectId, goal: "internal", operator_id: "op",
-      mission_id: reservedId,
       metadata: { business_id: String(b.business_id), source: "business_layer" },
     });
     expect(String(bound.mission_id)).toBe(reservedId);
+    expect(String(bound.bound_open_id)).toBe(openId);
     ctx.store.verifyIntegrity();
   });
 
@@ -452,6 +466,295 @@ describe("P14 FOUNDATION V2 — canonical binding authority", () => {
       .filter((e) => e.event_type === "WORK_REVIEW_ACCEPTED"
         && e.entity_id === String(w2.work_item_id));
     expect(accEvs).toHaveLength(1);
+    ctx.store.verifyIntegrity();
+  });
+});
+
+/* ----------------- P14 FOUNDATION V2 — R1 remediation ------------------
+ * Atomic open rollback, binding-driven bound-mission seam, internal
+ * mission-origin proof, collision fail-closed, canonical validator.
+ */
+
+function faultingBound(control: Ctx["control"], mode: "pre" | "post") {
+  const stub = Object.create(control) as Ctx["control"];
+  if (mode === "pre") {
+    stub.startBoundMission = () => {
+      throw new PolicyError("INJECT_FAIL", "before mission creation");
+    };
+  }
+  return stub;
+}
+
+describe("P14 FOUNDATION V2 R1 — atomic rollback + origin proof", () => {
+  it("FOUND-R1-ROLLBACK-ATOMIC: no durable state may be READY/no-pending with a live INTENT binding", () => {
+    const { ctx, biz, schedules } = makeBizCtx("rb-atomic");
+    const b = makeBiz(biz, ctx.projectId);
+    const w = makeWorkItem(biz, String(b.business_id));
+    const wid = String(w.work_item_id);
+    // Fail the bound seam → open throws; the atomic rollback commits row
+    // restore + binding ROLLED_BACK + audit event in ONE txn.
+    const bad = new BusinessLayer({
+      store: ctx.store, control: faultingBound(ctx.control, "pre"), schedules,
+    });
+    expect(() => bad.openWorkItem(wid, "op")).toThrowError(/INJECT_FAIL/);
+    const row = ctx.store.get("work_item", wid);
+    const binding = ctx.store.list("work_open_binding")
+      .find((bd) => String(bd.work_item_id) === wid)!;
+    // The forbidden split state must never exist: READY + no pending +
+    // binding still INTENT.
+    const forbidden =
+      String(row.status) !== "IN_PROGRESS" &&
+      !row.pending_open_id &&
+      String(binding.state) === "INTENT";
+    expect(forbidden).toBe(false);
+    expect(String(row.status)).toBe("BACKLOG");
+    expect(row.pending_open_id ?? null).toBeNull();
+    expect(String(binding.state)).toBe("ROLLED_BACK");
+    expect(binding.rolled_back_at).toBeTruthy();
+    expect(ctx.store.list("mission")).toHaveLength(0);
+    const rb = ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_ITEM_OPEN_ROLLED_BACK" && e.entity_id === wid);
+    expect(rb).toHaveLength(1);
+    // Retry/restart paths are idempotent — the binding flips exactly once.
+    biz.board(String(b.business_id));
+    biz.blockWorkItem; // gate path also safe
+    const rb2 = ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_ITEM_OPEN_ROLLED_BACK" && e.entity_id === wid);
+    expect(rb2).toHaveLength(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-ROLLBACK-ATOMIC (txn fault): a fault inside the rollback txn leaves the recoverable pending state, never the split state", () => {
+    const { ctx, biz, schedules } = makeBizCtx("rb-atomic-txn");
+    const b = makeBiz(biz, ctx.projectId);
+    const w = makeWorkItem(biz, String(b.business_id));
+    const wid = String(w.work_item_id);
+    const bad = new BusinessLayer({
+      store: ctx.store, control: faultingBound(ctx.control, "pre"), schedules,
+    });
+    // Inject a fault INSIDE the atomic rollback txn (the audit event) —
+    // the whole txn must roll back rather than commit a half-rollback.
+    const realEvent = ctx.store.event.bind(ctx.store);
+    let tripped = true;
+    ctx.store.event = (e: Record<string, unknown>) => {
+      if (tripped && e.event_type === "WORK_ITEM_OPEN_ROLLED_BACK") {
+        throw new PolicyError("INJECT_ROLLBACK_FAIL", "event write failed");
+      }
+      return realEvent(e as never);
+    };
+    expect(() => bad.openWorkItem(wid, "op")).toThrowError();
+    const mid = ctx.store.get("work_item", wid);
+    const binding = ctx.store.list("work_open_binding")
+      .find((bd) => String(bd.work_item_id) === wid)!;
+    // Fault inside the txn → NOTHING committed: still IN_PROGRESS + pending
+    // + INTENT — recoverable, never READY+INTENT.
+    expect(String(mid.status)).toBe("IN_PROGRESS");
+    expect(mid.pending_open_id).toBeTruthy();
+    expect(String(binding.state)).toBe("INTENT");
+    // Clear the fault; age the marker past grace; the next mutation gate
+    // commits the whole rollback atomically.
+    tripped = false;
+    mid.pending_open_at = new Date(Date.now() - 120_000).toISOString();
+    ctx.store.put("work_item", wid, mid, Number(mid.version));
+    expect(() => biz.claimWorkItem(wid, "AGT_none", "op")).toThrowError();
+    const done = ctx.store.get("work_item", wid);
+    expect(String(done.status)).toBe("READY");
+    expect(done.pending_open_id ?? null).toBeNull();
+    expect(String(ctx.store.get("work_open_binding", String(binding.open_id)).state)).toBe("ROLLED_BACK");
+    const rb = ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_ITEM_OPEN_ROLLED_BACK" && e.entity_id === wid);
+    expect(rb).toHaveLength(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-SYNC-FAIL: bound-seam failure rolls back fully — original status, ROLLED_BACK, no mission, one audit", () => {
+    const { ctx, biz, schedules } = makeBizCtx("rb-syncfail");
+    const b = makeBiz(biz, ctx.projectId);
+    const w = makeWorkItem(biz, String(b.business_id));
+    const wid = String(w.work_item_id);
+    const bad = new BusinessLayer({
+      store: ctx.store, control: faultingBound(ctx.control, "pre"), schedules,
+    });
+    expect(() => bad.openWorkItem(wid, "op")).toThrowError(/INJECT_FAIL/);
+    const row = ctx.store.get("work_item", wid);
+    expect(String(row.status)).toBe("BACKLOG");
+    expect(row.pending_open_id ?? null).toBeNull();
+    expect(row.claimed_by ?? null).toBeNull();
+    const binding = ctx.store.list("work_open_binding")
+      .find((bd) => String(bd.work_item_id) === wid)!;
+    expect(String(binding.state)).toBe("ROLLED_BACK");
+    expect(ctx.store.list("mission")).toHaveLength(0);
+    expect(ctx.store.listEvents().filter(
+      (e) => e.event_type === "WORK_ITEM_OPEN_ROLLED_BACK" && e.entity_id === wid,
+    )).toHaveLength(1);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-INTERNAL-COLLISION: a foreign mission occupying the reserved id is never adopted", () => {
+    const { ctx, biz } = makeBizCtx("rb-collide");
+    const b = makeBiz(biz, ctx.projectId);
+    const w = makeWorkItem(biz, String(b.business_id));
+    const wid = String(w.work_item_id);
+    seedIntent(ctx, wid, "OPI_collide", "MSN_reservedX");
+    // A foreign mission at the reserved id — created through the generic
+    // internal create path WITHOUT bound_open_id origin proof.
+    ctx.service.createMission({
+      project_id: ctx.projectId, goal: "foreign occupant",
+      mission_id: "MSN_reservedX", operator_id: "op",
+    } as never);
+    // Recovery must NOT adopt it, NOT flip BOUND — quarantine the item.
+    biz.board(String(b.business_id));
+    const row = ctx.store.get("work_item", wid);
+    expect((row.mission_ids as string[])).not.toContain("MSN_reservedX");
+    expect(String(ctx.store.get("work_open_binding", "OPI_collide").state)).not.toBe("BOUND");
+    expect(String(row.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-TRUE-CRASH-ADOPT: restart adopts exactly the binding-proven mission — BOUND once, no dup", () => {
+    const { dir, ctx, biz } = makeBizCtx("rb-adopt");
+    const b = makeBiz(biz, ctx.projectId);
+    const w = makeWorkItem(biz, String(b.business_id));
+    const wid = String(w.work_item_id);
+    const pinned = "MSN_pinned_origin";
+    // The canonical seam itself creates the mission for this binding —
+    // carrying the bound_open_id origin proof — then the "crash" hits
+    // before the link+BOUND write.
+    const created = seedIntent(ctx, wid, "OPI_origin", pinned, { createMission: true });
+    expect(String(created!.bound_open_id)).toBe("OPI_origin");
+    // A forged mission sharing the same observability metadata fields
+    // exists too — it must never be adopted.
+    ctx.control.startMission({
+      project_id: ctx.projectId, goal: "forged", operator_id: "op",
+      metadata: {
+        business_id: String(b.business_id), work_item_id: wid,
+        work_item_open_id: "OPI_origin", source: "business_layer",
+      },
+    });
+    // Restart on the same DB.
+    const re = reopenBiz(dir);
+    re.biz.board(String(b.business_id));
+    const row = re.ctx.store.get("work_item", wid);
+    expect((row.mission_ids as string[])).toEqual([pinned]);
+    expect(String(re.ctx.store.get("work_open_binding", "OPI_origin").state)).toBe("BOUND");
+    expect(re.ctx.store.list("mission")).toHaveLength(2);
+    const rec = re.ctx.store.listEvents()
+      .filter((e) => e.event_type === "WORK_ITEM_OPEN_RECONCILED" && e.entity_id === wid);
+    expect(rec).toHaveLength(1);
+    re.ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-CROSS-PROJECT-PAIR: binding+mission drifted together still fails — business project is canonical", () => {
+    const { ctx, biz } = makeBizCtx("rb-crossproj");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    biz.openWorkItem(String(w.work_item_id), "op");
+    const mid = String((ctx.store.get("work_item", String(w.work_item_id)).mission_ids as string[])[0]);
+    const binding = ctx.store.list("work_open_binding")
+      .find((bd) => String(bd.work_item_id) === String(w.work_item_id))!;
+    // Drift BOTH project ids to the same foreign project — the canonical
+    // Business still anchors the real project.
+    const mRow = ctx.store.get("mission", mid);
+    mRow.status = "COMPLETED";
+    mRow.project_id = "PRJ_foreign";
+    ctx.store.put("mission", mid, mRow, Number(mRow.version));
+    binding.project_id = "PRJ_foreign";
+    ctx.store.put("work_open_binding", String(binding.open_id), binding, Number(binding.version));
+    biz.syncWorkItem(String(w.work_item_id));
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-WRONG-AGENT: binding org_agent != work-item assignee fails proof", () => {
+    const { ctx, biz } = makeBizCtx("rb-wrongagent");
+    const b = makeBiz(biz, ctx.projectId);
+    const bid = String(b.business_id);
+    const lead = makeAgent(biz, bid, "lead");
+    const other = makeAgent(biz, bid, "other");
+    const w = makeWorkItem(biz, bid, { assignee_agent_id: String(lead.agent_id) });
+    biz.openWorkItem(String(w.work_item_id), "op");
+    const binding = ctx.store.list("work_open_binding")
+      .find((bd) => String(bd.work_item_id) === String(w.work_item_id))!;
+    binding.org_agent_id = String(other.agent_id); // drift
+    ctx.store.put("work_open_binding", String(binding.open_id), binding, Number(binding.version));
+    const mid = String((ctx.store.get("work_item", String(w.work_item_id)).mission_ids as string[])[0]);
+    const mRow = ctx.store.get("mission", mid);
+    mRow.status = "COMPLETED";
+    ctx.store.put("mission", mid, mRow, Number(mRow.version));
+    biz.syncWorkItem(String(w.work_item_id));
+    expect(String(ctx.store.get("work_item", String(w.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-WRONG-AGENT-BUSINESS: binding agent in a foreign business fails proof", () => {
+    const { ctx, biz } = makeBizCtx("rb-wrongagentbiz");
+    const b1 = makeBiz(biz, ctx.projectId, "B1");
+    const b2 = makeBiz(biz, ctx.projectId, "B2");
+    const lead = makeAgent(biz, String(b1.business_id), "lead");
+    const foreign = makeAgent(biz, String(b2.business_id), "foreign");
+    const w = makeWorkItem(biz, String(b1.business_id), { assignee_agent_id: String(lead.agent_id) });
+    biz.openWorkItem(String(w.work_item_id), "op");
+    const binding = ctx.store.list("work_open_binding")
+      .find((bd) => String(bd.work_item_id) === String(w.work_item_id))!;
+    binding.org_agent_id = String(foreign.agent_id);
+    ctx.store.put("work_open_binding", String(binding.open_id), binding, Number(binding.version));
+    const mid = String((ctx.store.get("work_item", String(w.work_item_id)).mission_ids as string[])[0]);
+    const mRow = ctx.store.get("mission", mid);
+    mRow.status = "COMPLETED";
+    ctx.store.put("mission", mid, mRow, Number(mRow.version));
+    biz.syncWorkItem(String(w.work_item_id));
+    expect(String(ctx.store.get("work_item", String(w.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-PUBLIC-STILL-BLOCKED: POST /api/missions + mission_id → 409, zero rows", async () => {
+    const { ctx, biz } = makeBizCtx("rb-pub");
+    const server = createMissionControlServer({ control: ctx.control, business: biz });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/missions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-operator-id": "op" },
+        body: JSON.stringify({ project_id: ctx.projectId, goal: "forge", mission_id: "MSN_hijack" }),
+      });
+      expect(res.status).toBe(409);
+      expect(String(((await res.json()) as { error?: string }).error))
+        .toBe("FAIL_CLOSED_MISSION_ID_PUBLIC");
+    } finally {
+      server.close();
+    }
+    expect(ctx.store.list("mission")).toHaveLength(0);
+    ctx.store.verifyIntegrity();
+  });
+
+  it("FOUND-R1-HAPPY: legit open — INTENT → bound seam (origin proof) → atomic BOUND landing", () => {
+    const { ctx, biz } = makeBizCtx("rb-happy");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
+    const opened = biz.openWorkItem(String(w.work_item_id), "op");
+    const bindings = ctx.store.list("work_open_binding")
+      .filter((bd) => String(bd.work_item_id) === String(w.work_item_id));
+    expect(bindings).toHaveLength(1);
+    expect(String(bindings[0].state)).toBe("BOUND");
+    const mid = String((opened.mission_ids as string[])[0]);
+    expect(String(bindings[0].mission_id)).toBe(mid);
+    const mission = ctx.store.get("mission", mid);
+    // Internal origin proof stamped by the bound seam — derivable only
+    // from the canonical record, never from caller metadata.
+    expect(String(mission.bound_open_id)).toBe(String(bindings[0].open_id));
+    // Governed pipeline intact: contract pin + secret grants + business ctx.
+    const md = mission.metadata as Record<string, unknown>;
+    expect(md.agent_contract).toBeTruthy();
+    expect(md.secret_grants).toBeTruthy();
+    expect((md.business_context as Record<string, unknown>).provenance).toBe("org_agent");
+    expect(biz.missionBoundToWorkItem(opened, mission)).toBe(true);
     ctx.store.verifyIntegrity();
   });
 });

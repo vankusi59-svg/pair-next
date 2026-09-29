@@ -28,6 +28,7 @@ import {
 import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
+import { validateWorkOpenBinding } from "./work-open-binding.js";
 
 export const WORK_ITEM_STATUSES = [
   "BACKLOG",
@@ -418,18 +419,24 @@ export class BusinessLayer {
   // or model supplied metadata can never itself constitute authority.
 
   /** Is mission `m` canonically bound to work item `row`? Proof requires
-   *  a `work_open_binding` in state BOUND whose mission_id, work_item_id
-   *  and business_id match — and whose pinned project matches the
-   *  mission's project (cross-scope forgery fails closed). */
+   *  the mission to carry the internal origin proof `bound_open_id`
+   *  (writable only by the internal bound-mission seam — never settable
+   *  from caller metadata) whose BOUND `work_open_binding` validates the
+   *  FULL canonical chain: reserved mission_id, work item, business,
+   *  business.project, binding project, mission project, assignee and
+   *  org-agent scope (V2 R1 §5). */
   missionBoundToWorkItem(row: Row, m: Row): boolean {
     const mids = (row.mission_ids as string[] | undefined) ?? [];
     if (!mids.includes(String(m.mission_id))) return false;
-    return this.store.list("work_open_binding").some((b) =>
-      String(b.mission_id ?? "") === String(m.mission_id) &&
-      String(b.work_item_id) === String(row.work_item_id) &&
-      String(b.business_id) === String(row.business_id) &&
-      String(b.project_id) === String(m.project_id) &&
-      String(b.state) === "BOUND");
+    const openId = String(m.bound_open_id ?? "");
+    if (!openId) return false; // no internal origin proof → not bound
+    const binding = this.store.tryGet("work_open_binding", openId) as Row | null;
+    if (!binding) return false;
+    return validateWorkOpenBinding(this.store, binding, {
+      forWorkItem: row,
+      forMission: m,
+      requireState: "BOUND",
+    }).ok;
   }
 
   /** The row's last mission when it is canonically bound, else null. */
@@ -639,13 +646,15 @@ export class BusinessLayer {
         `${String(row.goal)}` +
         (notes.length ? `\n\n[AGENT CONTEXT — last ${notes.length} outcomes]\n${notes.join("\n")}` : "");
 
-      // Internal bound-mission seam: the reserved mission_id is created
-      // through a path unreachable from the generic Mission Control API
-      // (V2 §3). Metadata mirrors provenance for observability only.
+      // Internal bound-mission seam: the mission identity is DERIVED
+      // from the canonical binding (binding_open_id), never accepted as
+      // an arbitrary pin — the seam loads + validates the binding itself
+      // and stamps the non-forgeable `bound_open_id` origin proof on the
+      // mission (V2 R1 §2-§3). Metadata mirrors observability only.
       const mission = this.deps.control.startBoundMission({
+        binding_open_id: openId,
         project_id: String(business.project_id),
         goal,
-        mission_id: missionId,
         metadata: {
           business_id: String(row.business_id),
           work_item_id: workItemId,
@@ -721,18 +730,11 @@ export class BusinessLayer {
         String(cur.pending_open_id ?? "") === openId &&
         (cur.mission_ids as string[]).length === priorMissionIds.length
       ) {
-        cur.status = from as WorkItemStatus;
-        cur.claimed_by = null;
-        cur.claim_token = null;
-        cur.claim_expires_at = null;
-        cur.pending_open_id = null;
-        cur.pending_open_at = null;
-        cur.updated_at = utcnow();
-        this.store.put("work_item", workItemId, cur, Number(cur.version));
-        this.markBindingRolledBack(openId);
-        this.store.event({
-          entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
-          old_state: "IN_PROGRESS", new_state: from, actor: "PAIR_BUSINESS_LAYER",
+        // Atomic rollback (V2 R1 §1): row restore + pending/claim clears +
+        // binding INTENT→ROLLED_BACK + audit event commit in ONE txn — no
+        // crash boundary can leave READY/no-pending work with a live INTENT.
+        this.rollbackOpenIntentAtomic(workItemId, openId, from as WorkItemStatus, {
+          actor: "PAIR_BUSINESS_LAYER",
           metadata: { open_id: openId, error: String((err as { message?: string })?.message ?? err) },
         });
       }
@@ -772,35 +774,64 @@ export class BusinessLayer {
         `pending open intent ${openId} within in-flight window — retry shortly`,
       );
     }
-    const cur = this.store.get("work_item", workItemId);
-    cur.status = "READY";
-    cur.claimed_by = null;
-    cur.claim_token = null;
-    cur.claim_expires_at = null;
-    cur.pending_open_id = null;
-    cur.pending_open_at = null;
-    cur.updated_at = utcnow();
-    this.store.put("work_item", workItemId, cur, Number(cur.version));
-    this.markBindingRolledBack(openId);
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
-      old_state: "IN_PROGRESS", new_state: "READY", actor: `pair_reconcile:${actor}`,
+    this.rollbackOpenIntentAtomic(workItemId, openId, "READY", {
+      actor: `pair_reconcile:${actor}`,
       metadata: { open_id: openId, cause: "mutation_gate" },
     });
     this.releaseBudgetReservationForRef(openId);
     return this.store.get("work_item", workItemId);
   }
 
-  /** Mark an INTENT binding ROLLED_BACK — durable, idempotent evidence
-   *  the reserved mission was never allowed to dispatch (V2 §6A). */
-  private markBindingRolledBack(openId: string): void {
-    const binding = this.store.tryGet("work_open_binding", openId);
-    if (binding && String(binding.state) === "INTENT") {
-      binding.state = "ROLLED_BACK";
-      binding.rolled_back_at = utcnow();
-      binding.updated_at = utcnow();
-      this.store.put("work_open_binding", openId, binding, Number(binding.version));
-    }
+  /**
+   * Atomic open-intent rollback (V2 R1 §1): the work-item restore, the
+   * pending_open clear, claim release, the binding INTENT→ROLLED_BACK
+   * flip and the canonical WORK_ITEM_OPEN_ROLLED_BACK audit event commit
+   * in ONE `store.immediate()` — no crash boundary may leave a
+   * READY/no-pending item with a live INTENT binding. Idempotent: a
+   * second call finds nothing to restore and emits nothing.
+   */
+  private rollbackOpenIntentAtomic(
+    workItemId: string,
+    openId: string,
+    toStatus: WorkItemStatus,
+    audit: { actor: string; metadata: Record<string, unknown> },
+  ): void {
+    this.store.immediate(() => {
+      let changed = false;
+      const cur = this.store.get("work_item", workItemId);
+      if (
+        String(cur.status) === "IN_PROGRESS" &&
+        String(cur.pending_open_id ?? "") === openId
+      ) {
+        cur.status = toStatus;
+        cur.claimed_by = null;
+        cur.claim_token = null;
+        cur.claim_expires_at = null;
+        cur.pending_open_id = null;
+        cur.pending_open_at = null;
+        cur.updated_at = utcnow();
+        this.store.put("work_item", workItemId, cur, Number(cur.version));
+        changed = true;
+      }
+      const binding = this.store.tryGet("work_open_binding", openId);
+      if (binding && String(binding.state) === "INTENT") {
+        binding.state = "ROLLED_BACK";
+        binding.rolled_back_at = utcnow();
+        binding.updated_at = utcnow();
+        this.store.put("work_open_binding", openId, binding, Number(binding.version));
+        changed = true;
+      }
+      if (changed) {
+        this.store.event({
+          entity_type: "work_item", entity_id: workItemId,
+          event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
+          old_state: "IN_PROGRESS", new_state: toStatus,
+          actor: audit.actor,
+          metadata: audit.metadata,
+        });
+      }
+      return changed;
+    });
   }
 
   /**
@@ -831,6 +862,16 @@ export class BusinessLayer {
       }
       return null; // INTENT, mission never landed — caller decides grace/rollback
     }
+    // Collision / origin check (V2 R1 §4): a mission occupying the
+    // reserved id WITHOUT this binding's internal origin proof is a
+    // foreign occupant — never adopt, never flip BOUND; quarantine.
+    if (String(mission.bound_open_id ?? "") !== openId) {
+      this.quarantineWorkItem(
+        row,
+        `binding ${openId} reserved mission ${missionId} but the occupant lacks canonical origin proof`,
+      );
+      return row;
+    }
     // Fully landed already (BOUND + linked + marker cleared): nothing to
     // repair — a null keeps the open catch path honest about whether the
     // failure was inside the landing window or after it.
@@ -841,9 +882,22 @@ export class BusinessLayer {
     ) {
       return null;
     }
-    // The pinned mission exists: link the row and flip INTENT→BOUND
-    // atomically (a crash between mission creation and the bound write is
-    // the only window this repairs — never a metadata guess).
+    // Canonical binding validation before adoption (V2 R1 §5): the whole
+    // chain — work item, business, project pair, org-agent scope — must
+    // hold, in addition to the origin proof above.
+    if (
+      !validateWorkOpenBinding(this.store, binding, {
+        forWorkItem: row,
+        forMission: mission,
+      }).ok
+    ) {
+      this.quarantineWorkItem(row, `binding ${openId} failed canonical validation during reconcile`);
+      return row;
+    }
+    // The binding's own mission exists and is proven: link the row and
+    // flip INTENT→BOUND atomically (a crash between mission creation and
+    // the bound write is the only window this repairs — never a metadata
+    // guess).
     let saved: Row;
     try {
       saved = this.store.immediate(() => {

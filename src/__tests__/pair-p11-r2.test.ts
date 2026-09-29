@@ -138,7 +138,7 @@ function makeOrphanPending(
     goal: "orphan",
     project_id: projectId,
     operator_id: "op",
-    mission_id: orphanMissionId,
+    binding_open_id: openId,
     metadata: {
       business_id: String(cur.business_id),
       work_item_id: workItemId,

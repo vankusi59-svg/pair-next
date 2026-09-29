@@ -2,7 +2,7 @@
 
 ## Classification
 
-**`P14_FOUNDATION_V2_PENDING_AUDIT`**
+**`P14_FOUNDATION_V2_REMEDIATED_R1_PENDING_AUDIT`**
 
 **PR #8 (`8982f17`, `P14_PROVENANCE_REBASELINED_PENDING_AUDIT`) is reference
 material only — it was NOT merged and was NOT used as the implementation
@@ -50,9 +50,11 @@ never consults it.
   identity and can never create a mission that becomes canonical proof
   for a WorkItem.
 - **`MissionControl.startBoundMission(input)`** — internal seam for
-  `BusinessLayer` only. Requires `input.mission_id`; runs the **same**
-  `startMissionInternal` pipeline (plan digest, contract pin, business
-  context, secret grants, supervisor wake) with the pinned id.
+  `BusinessLayer` only (R1: takes `binding_open_id`, loads + validates
+  the canonical binding, derives the reserved mission_id FROM it, stamps
+  `bound_open_id` origin proof); runs the **same** `startMissionInternal`
+  pipeline (plan digest, contract pin, business context, secret grants,
+  supervisor wake).
 - **`PairControlPlane.createMission({ mission_id })`** — internal-only
   optional pin; the version-0 `store.put` CAS insert **fails closed on
   any collision** — a reserved id can never be overwritten or claimed by
@@ -60,14 +62,14 @@ never consults it.
 
 ## 3. Proof model (single authority)
 
-`missionBoundToWorkItem(row, mission)` requires ALL of:
+`missionBoundToWorkItem(row, mission)` requires ALL of (R1 §5 validator):
 
 - `mission.mission_id ∈ row.mission_ids` (canonical link);
-- a `work_open_binding` in state `BOUND` exists whose `mission_id`,
-  `work_item_id`, and `business_id` all match;
-- `binding.project_id === mission.project_id` (cross-project closure);
-- the binding is exactly the one recorded on `pending_open_id`/history
-  for this work item.
+- `mission.bound_open_id` — the non-forgeable internal origin proof —
+  resolves to a `work_open_binding` in state `BOUND`;
+- the binding validates the full canonical chain: reserved `mission_id`,
+  `work_item_id`, `business_id`, business.project, binding.project,
+  mission.project, assignee/org-agent scope.
 
 `boundMissionForWorkItem(row)` resolves the latest linked mission and
 returns it only when the predicate holds; `proveReviewAcceptance(row)`
@@ -159,7 +161,92 @@ second router, dispatcher, or execution engine was introduced; the only
 new authority record is `work_open_binding` inside the existing
 `PairEvidenceStore.immediate()` transaction authority.
 
-## 8. Explicitly out of scope (foundation only)
+## 8. R1 remediation — atomic rollback + origin proof
+
+Independent audit `P14_FOUNDATION_V2_INDEPENDENT_AUDIT_BLOCKED — R1
+REQUIRED`; closed as follows:
+
+### §1 Atomic open rollback
+
+`rollbackOpenIntentAtomic(workItemId, openId, toStatus, audit)` — used by
+BOTH the direct open catch path and the mutation-gate/restart
+reconciliation path — commits in **one** `store.immediate()`:
+
+- work_item status restored + `pending_open_id`/`pending_open_at` cleared
+  + claim fields cleared;
+- binding `INTENT→ROLLED_BACK` + `rolled_back_at`;
+- `WORK_ITEM_OPEN_ROLLED_BACK` audit event.
+
+No crash boundary can leave a READY/no-pending item with a live INTENT
+binding — a fault inside the txn aborts everything (recoverable pending
+state), never a half-rollback. Idempotent: nothing to restore → no event.
+
+### §2 Binding-driven `startBoundMission`
+
+Signature is now `startBoundMission({ binding_open_id, ... })` — the seam
+loads the `work_open_binding` itself and DERIVES the reserved mission_id
+from it; it no longer accepts an arbitrary caller pin. Before mission
+creation it validates via the canonical validator: binding exists +
+state INTENT + work item resolves + business matches + business.project_id
+== binding.project_id == requested project + org_agent resolves / same
+business / ACTIVE / matches work-item assignee. Anything else →
+`FAIL_CLOSED_BINDING_INVALID`.
+
+### §3 Internal mission-origin proof
+
+Missions created through the bound seam carry top-level
+`bound_open_id = <binding open_id>` (set inside `createMission`, writable
+only by that seam — public callers can never set it, and mission
+metadata stays pure observability). "Mission belongs to binding X" is
+derivable from canonical evidence, not from metadata fields.
+
+### §4 Collision fails closed
+
+If the reserved `mission_id` is already occupied by a mission WITHOUT
+this binding's origin proof: `startBoundMission` throws
+`FAIL_CLOSED_MISSION_ORIGIN_CONFLICT` and `reconcileOpenIntent`
+quarantines the work item — never adopts, never flips BOUND. A true
+crash-after-create retry adopts only when `bound_open_id === open_id`.
+
+### §5-6 One canonical validator
+
+`src/pair/work-open-binding.ts` exports `validateWorkOpenBinding` /
+`validateWorkOpenBindingById` — used by `startBoundMission`,
+`reconcileOpenIntent`, and `missionBoundToWorkItem` (hence sync, review,
+block/cancel and every provenance check). Covers open_id, state,
+mission_id, work_item, business, business.project, binding.project,
+mission.project, org_agent/assignee scope, and the origin proof — no
+weaker per-seam variants exist. Tampered business_id, drifted
+project-pairs, wrong-agent and wrong-business bindings all fail closed.
+
+### §7 R1 tests — `pair-p14-foundation.test.ts` (+10, now 20)
+
+| Test | Verdict |
+|---|---|
+| FOUND-R1-ROLLBACK-ATOMIC | open failure → row restored + ROLLED_BACK + 1 audit atomically; forbidden READY+INTENT state never exists; retry emits no second rollback |
+| FOUND-R1-ROLLBACK-ATOMIC (txn fault) | fault inside the rollback txn → nothing commits (recoverable pending+INTENT); clear fault → gate commits whole rollback once |
+| FOUND-R1-SYNC-FAIL | pre-create bound-seam failure → original status, no pending, ROLLED_BACK, 0 missions, 1 audit |
+| FOUND-R1-INTERNAL-COLLISION | foreign mission at reserved id w/o origin proof → never adopted, binding not BOUND, row quarantined |
+| FOUND-R1-TRUE-CRASH-ADOPT | seam-created mission (origin proof) + forged same-open_id mission → restart adopts ONLY the proven one; BOUND once; no dup |
+| FOUND-R1-CROSS-PROJECT-PAIR | binding+mission project drifted together → still fails (canonical Business anchors the project) |
+| FOUND-R1-WRONG-AGENT | binding org_agent ≠ assignee → proof fails, quarantine |
+| FOUND-R1-WRONG-AGENT-BUSINESS | binding agent in foreign business → fails |
+| FOUND-R1-PUBLIC-STILL-BLOCKED | POST /api/missions + mission_id → 409 `FAIL_CLOSED_MISSION_ID_PUBLIC`, 0 rows |
+| FOUND-R1-HAPPY | canonical open → BOUND + `bound_open_id` origin proof + governed pipeline intact |
+
+## 9. R1 validation
+
+| Surface | Result |
+|---|---|
+| Foundation V2 suite | **20/20** |
+| P13 / P12 / P11 / P9 | 67/67 · 71/71 · 103/103 · 79/79 |
+| Full suite — Node 22 | see CURRENT_STATE |
+| Full suite — Node 20 | see CURRENT_STATE |
+| Typecheck / build / audit | clean / PASS / 0 high |
+| `verifyIntegrity()` | clean on every suite entry |
+| Fresh-server E2E (PR #9 head) | verified — see PR comment |
+
+## 10. Explicitly out of scope (foundation only)
 
 No workforce layer: no work-graph decomposition, no agent delegation, no
 heartbeat/autonomous claim loop, no inbox projection, no dependency

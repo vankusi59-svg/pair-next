@@ -301,7 +301,7 @@ describe("R1 §1 crash-safe linkage — fault injection at each boundary", () =>
     const mission = ctx.control.startBoundMission({
       project_id: ctx.projectId,
       goal: "crashed open",
-      mission_id: orphanMissionId,
+      binding_open_id: openId,
       metadata: { business_id: String(b.business_id), work_item_id: String(w.work_item_id), work_item_open_id: openId },
       operator_id: "op",
     });

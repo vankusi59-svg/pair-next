@@ -24,6 +24,7 @@ import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { projectRoutableModels } from "./model-routable.js";
 import { digest, sha256Hex, utcnow } from "./canonical.js";
+import { validateWorkOpenBindingById } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
 import type { RuntimePlanner } from "./mission-runtime.js";
 
@@ -367,14 +368,18 @@ export class MissionControl {
 
   /**
    * INTERNAL bound-mission seam — BusinessLayer only. Identical pipeline
-   * to startMission except the canonical work-open binding's pinned
-   * mission_id is honored. Not reachable through /api/missions or any
-   * generic caller path.
+   * to startMission except the mission identity is DERIVED from the
+   * canonical `work_open_binding` (`binding_open_id`) — never from an
+   * arbitrary caller-supplied pin. The seam loads the binding itself,
+   * validates the full canonical chain (INTENT state, work item,
+   * business, project, org-agent scope), and stamps the non-forgeable
+   * internal origin proof `bound_open_id` on the mission it creates.
+   * Not reachable through /api/missions or any generic caller path.
    */
   startBoundMission(input: {
+    binding_open_id: string;
     project_id: string;
     goal: string;
-    mission_id: string;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -382,7 +387,35 @@ export class MissionControl {
     operator_id?: string;
     confirm_plan?: { digest: string };
   }): Record<string, unknown> {
-    return this.startMissionInternal(input, input.mission_id);
+    const openId = String(input.binding_open_id);
+    const { binding, ok: bound, reason } = validateWorkOpenBindingById(
+      this.deps.service.store,
+      openId,
+      { requireState: "INTENT", expectedProjectId: String(input.project_id) },
+    );
+    if (!bound || !binding) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BINDING_INVALID",
+        `${openId}: ${reason ?? "canonical binding invalid"}`,
+      );
+    }
+    const reservedId = String(binding.mission_id);
+    const existing = this.deps.service.store.tryGet("mission", reservedId) as
+      | Record<string, unknown>
+      | null;
+    if (existing) {
+      // The reserved id is already occupied. A true crash-after-create
+      // retry may adopt ONLY a mission carrying this binding's origin
+      // proof — anything else is a foreign occupant and fails closed.
+      if (String(existing.bound_open_id ?? "") === openId) {
+        return existing;
+      }
+      throw new IntegrityError(
+        "FAIL_CLOSED_MISSION_ORIGIN_CONFLICT",
+        `${reservedId} exists without origin proof for binding ${openId}`,
+      );
+    }
+    return this.startMissionInternal(input, reservedId, openId);
   }
 
   private startMissionInternal(
@@ -397,6 +430,7 @@ export class MissionControl {
       confirm_plan?: { digest: string };
     },
     pinnedMissionId: string | undefined,
+    boundOpenId: string | undefined = undefined,
   ): Record<string, unknown> {
     if (input.confirm_plan?.digest) {
       const preview = this.previewMission(input);
@@ -509,6 +543,7 @@ export class MissionControl {
       authorized_workspaces: input.authorized_workspaces,
       risk_ceiling: input.risk_ceiling,
       mission_id: pinnedMissionId,
+      bound_open_id: boundOpenId,
     });
     this.deps.runtime.runtimeEntity(String(mission.mission_id));
     this.deps.supervisor.wake(String(mission.mission_id), "MISSION_CREATED");
