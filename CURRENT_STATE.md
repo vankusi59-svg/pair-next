@@ -320,8 +320,33 @@ autonomous reassignment / scheduling / parent cascade / CEO / P15/P16.
   R1 also fixed the server only reading request bodies for POST — PUT
   bodies now parse (the dependencies endpoint was unusable via API).
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REPORT.md`; suite
-  `pair-p14-workforce-v2.test.ts` (WFV2-P1-* ×15 + WFV2-P1-R1-* ×9).
-  Classification: **`P14_WORKFORCE_V2_PHASE1_REMEDIATED_R1_PENDING_AUDIT`**.
+  `pair-p14-workforce-v2.test.ts` (WFV2-P1-* ×15 + WFV2-P1-R1-* ×9 +
+  WFV2-P1-R2-* ×11).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_REMEDIATED_R2_PENDING_AUDIT`**.
+- **R2 dependency-set authority** (`work_dependency_set`, `WDS_<id>`):
+  omission-safe manifest — active_edge_ids + dependency_work_item_ids +
+  digest + revision, written atomically with every edge mutation (setDeps,
+  decompose children, empty manifest for delegated children).
+  `assertCanonicalDependencySet` proves the full chain incl. "no ACTIVE
+  edge outside the manifest"; `assertGraphAuthority` +
+  `assertDependenciesSatisfied` consume it — "no WGE rows" never means
+  "no deps". Moved/missing/extra edges all fail closed + quarantine.
+- **R2 persisted authority ceiling**: `authorityCeilingSnapshot` (normalized
+  caps/executors/routes/projects/context_scopes) + digest persisted on WDEL
+  (AGENT delegation) / WDEC proposal (assigned children). At open,
+  `assertChildAuthorityCeiling` requires child CURRENT authority ⊆
+  persisted ceiling ∩ CURRENT parent ceiling agent authority — widened
+  child contract or narrowed parent → `FAIL_CLOSED_WORK_AUTHORITY_WIDEN`
+  before any mission; DISABLED contract → `FAIL_CLOSED_AGENT_CONTRACT_DISABLED`
+  at admission AND open (provenance stays valid; admission is live).
+- **R2 immutable decomposition topology**: `setWorkItemDependencies` on a
+  canonically-proven WDEC child → `FAIL_CLOSED_WORK_DECOMPOSITION_TOPOLOGY_IMMUTABLE`
+  before any write; no quarantine produced. Delegated children keep the
+  mutable path with manifest refresh.
+- **R2 reconcile**: `reconcileWorkGraph` validates every manifest +
+  ceiling digest chain; governed child without manifest or edge rows
+  without manifest quarantine the work item — never rebuilt from live
+  fields.
 
 ## Not yet
 

@@ -30,9 +30,16 @@ import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
 import { validateWorkOpenBinding } from "./work-open-binding.js";
 import {
+  assertAuthoritySubset,
   assertCanonicalDecomposition,
   assertCanonicalDelegation,
+  assertCanonicalDependencySet,
   assertCanonicalEdge,
+  authorityToCeilingSet,
+  dependencySetRowId,
+  effectiveAuthority,
+  type AuthorityCeiling,
+  type GraphAuthorityDeps,
 } from "./graph-authority.js";
 
 export const WORK_ITEM_STATUSES = [
@@ -581,9 +588,20 @@ export class BusinessLayer {
    * Violations quarantine the row and fail closed — a forged row never
    * executes.
    */
+  /** Canonical graph-authority validator context — shared deps for the
+   *  full-chain validators (work graph + contract service for authority
+   *  ceilings). */
+  private graphAuthorityDeps(): GraphAuthorityDeps {
+    return {
+      store: this.store,
+      getBusiness: (b: string) => this.getBusiness(b),
+      agentContracts: this.agentContracts,
+    };
+  }
+
   assertGraphAuthority(row: Row): void {
     const id = String(row.work_item_id);
-    const deps = { store: this.store, getBusiness: (b: string) => this.getBusiness(b) };
+    const deps = this.graphAuthorityDeps();
     const corrupt = (reason: string): never => {
       this.quarantineWorkItem(row, reason);
       throw new IntegrityError("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT", `${reason} on ${id}`);
@@ -631,13 +649,38 @@ export class BusinessLayer {
       corrupt("parent_work_item_id without delegation/decomposition evidence");
     }
     // Dependency edges claiming this node as dependent must each be
-    // canonical — a malformed WGE row quarantines its dependent.
+    // canonical — a malformed WGE row (even REVOKED) quarantines its
+    // dependent; it can never be silently revived.
     for (const e of this.store.list("work_graph_edge")) {
       if (String(e.dependent_work_item_id) !== id) continue;
       try {
         assertCanonicalEdge(deps, e as Row);
       } catch (err) {
         corrupt(`dependency edge invalid: ${(err as Error).message}`);
+      }
+    }
+    // R2 §1/§2 — dependency authority is manifest-driven: the canonical
+    // `work_dependency_set` WDS_<id> is the omission-safe proof of this
+    // node's dependency set. "No matching WGE rows" NEVER proves "no
+    // dependencies" — only the manifest does.
+    const wds = this.store.tryGet("work_dependency_set", dependencySetRowId(id)) as Row | null;
+    if (wds) {
+      try {
+        assertCanonicalDependencySet(deps, wds);
+      } catch (err) {
+        corrupt(`dependency-set manifest invalid: ${(err as Error).message}`);
+      }
+    } else {
+      const claimsEdge = this.store.list("work_graph_edge")
+        .some((e) => String(e.dependent_work_item_id) === id);
+      if (claimsEdge) {
+        corrupt("dependency edges without canonical dependency-set manifest");
+      }
+      // Canonically-governed children (delegation/decomposition) always
+      // carry a manifest — its absence is corrupt, never rebuilt from
+      // mutable live fields (R2 §8).
+      if (row.delegated_from_work_item_id || row.decomposition_id) {
+        corrupt("governed child missing canonical dependency-set manifest");
       }
     }
   }
@@ -659,17 +702,103 @@ export class BusinessLayer {
    * quarantined dependency fails closed.
    */
   assertDependenciesSatisfied(row: Row): void {
-    for (const e of this.dependencyEdgesOf(String(row.work_item_id))) {
-      const dep = this.store.tryGet("work_item", String(e.dependency_work_item_id));
+    const id = String(row.work_item_id);
+    // R2 §2 — the dependency set to satisfy comes from the canonical
+    // manifest, not a WGE scan. A missing manifest with live edge rows
+    // is corrupt (quarantine); a missing manifest on a governed child is
+    // corrupt; a manifest proves the complete set — including empty.
+    const wds = this.store.tryGet("work_dependency_set", dependencySetRowId(id)) as Row | null;
+    let depIds: string[] = [];
+    if (wds) {
+      try {
+        assertCanonicalDependencySet(this.graphAuthorityDeps(), wds);
+      } catch (err) {
+        this.quarantineWorkItem(row, `dependency-set manifest invalid: ${(err as Error).message}`);
+        throw new IntegrityError("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT", `manifest corrupt on ${id}`);
+      }
+      depIds = wds.dependency_work_item_ids as string[];
+    } else {
+      const hasEdges = this.store.list("work_graph_edge")
+        .some((e) => String(e.dependent_work_item_id) === id);
+      if (hasEdges || row.delegated_from_work_item_id || row.decomposition_id) {
+        this.quarantineWorkItem(row, "missing canonical dependency-set manifest");
+        throw new IntegrityError("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT", `manifest missing on ${id}`);
+      }
+    }
+    for (const depId of depIds) {
+      const dep = this.store.tryGet("work_item", String(depId));
       const done = dep !== null &&
         String(dep.blocked_code ?? "") !== WORK_CORRUPT_CODE &&
         this.proveWorkItemDone(dep);
       if (!done) {
         throw new PolicyError(
           "FAIL_CLOSED_WORK_DEPENDENCY_UNMET",
-          `dependency ${String(e.dependency_work_item_id)} of ${String(row.work_item_id)} not proven DONE`,
+          `dependency ${String(depId)} of ${id} not proven DONE`,
         );
       }
+    }
+  }
+
+  /**
+   * R2 §4 — open-time authority-ceiling enforcement for graph-governed
+   * children: the child's CURRENT P12 authority must remain a subset of
+   * the ceiling persisted at delegation/decomposition commit AND of the
+   * CURRENT parent ceiling agent's authority (later revocations narrow,
+   * never broaden). A contract widened after commit fails closed BEFORE
+   * any mission is created. The child's own contract must also be
+   * currently executable — a DISABLED contract is never usable authority
+   * (R2 §5); provenance rows may stay historically valid, admission uses
+   * the live one.
+   */
+  private assertChildAuthorityCeiling(row: Row): void {
+    const childAgentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+    if (!childAgentId) return; // unassigned rows pin no contract authority
+    const business = this.getBusiness(String(row.business_id));
+    // Current executability: agent ACTIVE, contract ACTIVE+integrity,
+    // business/project scope — DISABLED fails closed here.
+    this.agentContracts.assertExecutable(childAgentId, {
+      businessId: String(row.business_id),
+      projectId: String(business.project_id),
+      actor: "PAIR_GRAPH_OPEN",
+    });
+    const deps = this.graphAuthorityDeps();
+    const childAuth = effectiveAuthority(deps, childAgentId);
+    const checkAgainst = (
+      ceiling: AuthorityCeiling | null | undefined,
+      what: string,
+    ) => {
+      if (!ceiling) return;
+      assertAuthoritySubset(childAuth, authorityToCeilingSet(ceiling), what);
+    };
+    const parentNarrowing = (parentId: string | null, what: string) => {
+      if (!parentId) return;
+      const parent = this.store.tryGet("work_item", parentId) as Row | null;
+      const ceilingAgent = parent?.assignee_agent_id ? String(parent.assignee_agent_id) : null;
+      if (ceilingAgent) {
+        assertAuthoritySubset(childAuth, effectiveAuthority(deps, ceilingAgent), what);
+      }
+    };
+    if (row.delegated_from_work_item_id) {
+      const del = this.store.tryGet("work_delegation", `WDEL_${String(row.work_item_id)}`) as Row | null;
+      // assertGraphAuthority already proved the WDEL chain — read the
+      // persisted ceiling + re-apply CURRENT parent narrowing.
+      checkAgainst(
+        del?.authority_ceiling as AuthorityCeiling | null | undefined,
+        `delegated child ${String(row.work_item_id)}`);
+      parentNarrowing(
+        row.parent_work_item_id ? String(row.parent_work_item_id) : null,
+        `delegated child ${String(row.work_item_id)} vs current parent authority`);
+    } else if (row.decomposition_id) {
+      const dec = this.store.tryGet(
+        "work_decomposition",
+        `WDEC_${String(row.parent_work_item_id ?? "")}`) as Row | null;
+      const proposal = (dec?.proposal ?? {}) as { authority_ceiling?: AuthorityCeiling | null };
+      checkAgainst(
+        proposal.authority_ceiling,
+        `decomposition child ${String(row.work_item_id)}`);
+      parentNarrowing(
+        row.parent_work_item_id ? String(row.parent_work_item_id) : null,
+        `decomposition child ${String(row.work_item_id)} vs current parent authority`);
     }
   }
 
@@ -726,6 +855,11 @@ export class BusinessLayer {
     // reach binding/mission creation.
     this.assertGraphAuthority(row);
     this.assertDependenciesSatisfied(row);
+    // R2 §4 — persisted-ceiling ∩ current-parent ∩ current-child
+    // authority must still hold at open, before any binding/mission is
+    // created. A contract widened after delegation/decomposition commit
+    // fails closed here, and a DISABLED contract is never usable.
+    this.assertChildAuthorityCeiling(row);
     // A previous linked mission still live forbids a replacement — the
     // governed path is pause/cancel/resume/reconcile, not a second dispatch.
     const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];

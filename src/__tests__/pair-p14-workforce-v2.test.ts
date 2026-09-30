@@ -765,3 +765,306 @@ describe("P14 WFV2-P1 R1 — delegator identity + authority narrowing", () => {
     expect(String(binding.work_item_id)).toBe(String(child.work_item_id));
   });
 });
+
+// ---------------------------------------------------------------------
+// R2 — dependency-set manifest (WDS) + persisted authority ceiling +
+//      open-time subset enforcement + immutable decomposition topology
+// ---------------------------------------------------------------------
+
+describe("P14 WFV2-P1 R2 — dependency manifest + authority ceiling", () => {
+  const wdsOf = (ctx: Ctx, id: string) =>
+    ctx.store.tryGet("work_dependency_set", `WDS_${id}`) as Record<string, unknown> | null;
+
+  it("WFV2-P1-R2-WGE-MOVED-DEPENDENT: edge dependent moved fails closed at open", () => {
+    const { ctx, biz, wf } = makeStack("r2-moved-dep");
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = makeAgent(biz, String(b.business_id), "lead");
+    const a = makeItem(biz, String(b.business_id), { title: "A", assignee_agent_id: ag.agent_id });
+    const dep = makeItem(biz, String(b.business_id), { title: "dep" });
+    const x = makeItem(biz, String(b.business_id), { title: "X" });
+    wf.setWorkItemDependencies(
+      String(a.work_item_id), [String(dep.work_item_id)], Number(a.version), "op");
+    const edge = ctx.store.list("work_graph_edge")[0];
+    // tamper: move the edge's dependent to a different item — A's manifest
+    // still lists the edge but the edge no longer claims A.
+    ctx.store.put("work_graph_edge", String(edge.edge_id),
+      { ...edge, dependent_work_item_id: String(x.work_item_id) }, Number(edge.version));
+    expect(errCode(() => biz.openWorkItem(String(a.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expect(String(ctx.store.get("work_item", String(a.work_item_id)).blocked_code))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("WFV2-P1-R2-WGE-MISSING-EXPECTED: manifest-listed edge revoked fails closed", () => {
+    const { ctx, biz, wf } = makeStack("r2-missing-edge");
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = makeAgent(biz, String(b.business_id), "lead");
+    const a = makeItem(biz, String(b.business_id), { title: "A", assignee_agent_id: ag.agent_id });
+    const dep = makeItem(biz, String(b.business_id), { title: "dep" });
+    wf.setWorkItemDependencies(
+      String(a.work_item_id), [String(dep.work_item_id)], Number(a.version), "op");
+    const edge = ctx.store.list("work_graph_edge")[0];
+    // silently revoke the edge outside the canonical seam — manifest
+    // still expects it ACTIVE.
+    ctx.store.put("work_graph_edge", String(edge.edge_id),
+      { ...edge, state: "REVOKED" }, Number(edge.version));
+    expect(errCode(() => biz.openWorkItem(String(a.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+  });
+
+  it("WFV2-P1-R2-WGE-EXTRA-ACTIVE: unlisted ACTIVE edge fails closed", () => {
+    const { ctx, biz, wf } = makeStack("r2-extra-edge");
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = makeAgent(biz, String(b.business_id), "lead");
+    const a = makeItem(biz, String(b.business_id), { title: "A", assignee_agent_id: ag.agent_id });
+    const dep1 = makeItem(biz, String(b.business_id), { title: "d1" });
+    const dep2 = makeItem(biz, String(b.business_id), { title: "d2" });
+    wf.setWorkItemDependencies(
+      String(a.work_item_id), [String(dep1.work_item_id)], Number(a.version), "op");
+    const realEdge = ctx.store.list("work_graph_edge")[0];
+    // forge an extra ACTIVE edge A→d2 that the manifest does not list —
+    // canonically valid shape, but not in the dependency-set authority.
+    const extraId = `WGE_${a.work_item_id}_${dep2.work_item_id}`;
+    ctx.store.put("work_graph_edge", extraId, {
+      ...realEdge,
+      edge_id: extraId,
+      dependency_work_item_id: String(dep2.work_item_id),
+      version: 0,
+    } as never, 0);
+    expect(errCode(() => biz.openWorkItem(String(a.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+  });
+
+  it("WFV2-P1-R2-EMPTY-DEPENDENCY-MANIFEST: setDependencies([]) leaves canonical empty set", () => {
+    const { ctx, biz, wf } = makeStack("r2-empty-wds");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeItem(biz, String(b.business_id), { title: "A" });
+    const dep = makeItem(biz, String(b.business_id), { title: "dep" });
+    wf.setWorkItemDependencies(
+      String(a.work_item_id), [String(dep.work_item_id)], Number(a.version), "op");
+    const cur = ctx.store.get("work_item", String(a.work_item_id));
+    wf.setWorkItemDependencies(
+      String(a.work_item_id), [], Number(cur.version), "op");
+    const wds = wdsOf(ctx, String(a.work_item_id))!;
+    expect(wds).not.toBeNull();
+    expect(String(wds.state)).toBe("COMMITTED");
+    expect(wds.active_edge_ids).toEqual([]);
+    expect(wds.dependency_work_item_ids).toEqual([]);
+    expect(Number(wds.revision)).toBe(2);
+    // canonical authority still passes + proves the empty set
+    expect(() => biz.assertGraphAuthority(ctx.store.get("work_item", String(a.work_item_id))))
+      .not.toThrow();
+    expect(() => biz.assertDependenciesSatisfied(ctx.store.get("work_item", String(a.work_item_id))))
+      .not.toThrow();
+  });
+
+  it("WFV2-P1-R2-DELEGATE-CONTRACT-WIDEN-AFTER-COMMIT: open fails when delegatee widened", () => {
+    const { ctx, biz, wf } = makeStack("r2-del-widen-open");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    // ceiling snapshot persisted on the WDEL row
+    const del = ctx.store.get("work_delegation", `WDEL_${child.work_item_id}`);
+    expect(String(del.authority_ceiling_agent)).toBe(String(lead.agent_id));
+    expect(del.authority_ceiling).not.toBeNull();
+    expect(String(del.authority_ceiling_digest ?? "")).not.toBe("");
+    // widening the delegatee's contract AFTER commit must not expand the
+    // stored child ceiling — open fails before any mission is created.
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS", "NETWORK_ACCESS"] });
+    expect(errCode(() => biz.openWorkItem(String(child.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_AUTHORITY_WIDEN");
+    expect((ctx.store.get("work_item", String(child.work_item_id))
+      .mission_ids as string[] | undefined) ?? []).toHaveLength(0);
+  });
+
+  it("WFV2-P1-R2-PARENT-NARROW-AFTER-COMMIT: current parent narrowing applies at open", () => {
+    const { ctx, biz, wf } = makeStack("r2-parent-narrow");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    // parent loses FILE_OPERATIONS later — child must narrow too, never
+    // keep authority the parent no longer holds.
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["SELF_MODIFY_CODE"] });
+    expect(errCode(() => biz.openWorkItem(String(child.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_AUTHORITY_WIDEN");
+  });
+
+  it("WFV2-P1-R2-DECOMPOSE-CONTRACT-WIDEN-AFTER-COMMIT: open fails when assignee widened", () => {
+    const { ctx, biz, wf } = makeStack("r2-dec-widen-open");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const worker = makeAgent(biz, String(b.business_id), "worker");
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.upsertAgentContract(String(worker.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const r = wf.decomposeWorkItem(String(p.work_item_id), {
+      decomposition_id: "DEC-R2",
+      children: [{ title: "c", goal: "g", assignee_agent_id: String(worker.agent_id) }],
+    }, "op");
+    const child = r.children[0];
+    // proposal carries the persisted ceiling + the child has a manifest
+    const dec = ctx.store.get("work_decomposition", `WDEC_${p.work_item_id}`);
+    const proposal = dec.proposal as Record<string, unknown>;
+    expect(String(proposal.authority_ceiling_agent)).toBe(String(lead.agent_id));
+    expect(proposal.authority_ceiling).not.toBeNull();
+    expect(wdsOf(ctx, String(child.work_item_id))).not.toBeNull();
+    biz.upsertAgentContract(String(worker.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS", "BROWSER_USE"] });
+    expect(errCode(() => biz.openWorkItem(String(child.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_AUTHORITY_WIDEN");
+  });
+
+  it("WFV2-P1-R2-DISABLED-CONTRACT-ADMISSION: DISABLED contract usable for nothing new", () => {
+    const { ctx, biz, wf } = makeStack("r2-disabled-contract");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    // provenance stays, but a DISABLED contract can never admit a new
+    // mission — open fails before binding.
+    biz.setAgentContractStatus(String(to.agent_id), "DISABLED", "op");
+    expect(errCode(() => biz.openWorkItem(String(child.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_AGENT_CONTRACT_DISABLED");
+    // new delegation to a disabled-contract agent fails at admission
+    const to2 = makeAgent(biz, String(b.business_id), "intern");
+    biz.upsertAgentContract(String(to2.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.setAgentContractStatus(String(to2.agent_id), "DISABLED", "op");
+    const p2 = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    expect(errCode(() =>
+      wf.delegateWorkItem({
+        work_item_id: String(p2.work_item_id),
+        delegated_by_agent_id: String(lead.agent_id),
+        delegated_to_agent_id: String(to2.agent_id),
+      }, "op"),
+    )).toBe("FAIL_CLOSED_AGENT_CONTRACT_DISABLED");
+    // decomposition direct-assign to a disabled-contract agent also fails
+    const p3 = makeItem(biz, String(b.business_id), { title: "p3" });
+    expect(errCode(() =>
+      wf.decomposeWorkItem(String(p3.work_item_id), {
+        decomposition_id: "DEC-DIS",
+        children: [{ title: "c", goal: "g", assignee_agent_id: String(to2.agent_id) }],
+      }, "op"),
+    )).toBe("FAIL_CLOSED_AGENT_CONTRACT_DISABLED");
+  });
+
+  it("WFV2-P1-R2-DECOMP-DEP-MUTATION-REJECTED: WDEC child topology immutable, no quarantine", () => {
+    const { ctx, biz, wf } = makeStack("r2-immutable");
+    const b = makeBiz(biz, ctx.projectId);
+    const p = makeItem(biz, String(b.business_id), { title: "P" });
+    const other = makeItem(biz, String(b.business_id), { title: "other" });
+    const r = wf.decomposeWorkItem(String(p.work_item_id), {
+      decomposition_id: "DEC-IMM",
+      children: [
+        { title: "c1", goal: "g" },
+        { title: "c2", goal: "g", depends_on_indices: [0] },
+      ],
+    }, "op");
+    const child = r.children[0];
+    const cur = ctx.store.get("work_item", String(child.work_item_id));
+    expect(errCode(() =>
+      wf.setWorkItemDependencies(
+        String(child.work_item_id), [String(other.work_item_id)], Number(cur.version), "op"),
+    )).toBe("FAIL_CLOSED_WORK_DECOMPOSITION_TOPOLOGY_IMMUTABLE");
+    // rejected operation produced NO quarantine and NO partial writes
+    expect(String(
+      ctx.store.get("work_item", String(child.work_item_id)).blocked_code ?? "null",
+    )).toBe("null");
+    const wds = wdsOf(ctx, String(child.work_item_id))!;
+    expect(wds.dependency_work_item_ids).toEqual([]);
+    // the spec's canonical sibling edge is intact on c2
+    const wds2 = wdsOf(ctx, String(r.children[1].work_item_id))!;
+    expect(wds2.dependency_work_item_ids).toEqual([String(child.work_item_id)]);
+  });
+
+  it("WFV2-P1-R2-DELEGATED-DEP-MUTATION-HAPPY: delegated child deps mutable + manifest updates", () => {
+    const { ctx, biz, wf } = makeStack("r2-del-dep-happy");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    // delegated children start with a canonical EMPTY manifest
+    const wds0 = wdsOf(ctx, String(child.work_item_id))!;
+    expect(wds0.dependency_work_item_ids).toEqual([]);
+    const dep = makeItem(biz, String(b.business_id), { title: "dep" });
+    const cur = ctx.store.get("work_item", String(child.work_item_id));
+    wf.setWorkItemDependencies(
+      String(child.work_item_id), [String(dep.work_item_id)], Number(cur.version), "op");
+    const wds = wdsOf(ctx, String(child.work_item_id))!;
+    expect(Number(wds.revision)).toBe(2);
+    expect(wds.dependency_work_item_ids).toEqual([String(dep.work_item_id)]);
+    expect(wf.dependenciesProven(ctx.store.get("work_item", String(child.work_item_id))))
+      .toBe(false);
+    expect(() => biz.assertGraphAuthority(ctx.store.get("work_item", String(child.work_item_id))))
+      .not.toThrow();
+  });
+
+  it("WFV2-P1-R2-RESTART: manifests + ceilings survive restart; tamper quarantines", () => {
+    const { ctx, biz, wf, dir } = makeStack("r2-restart");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    const second = reopenStack(dir);
+    expect(second.wf.reconcileWorkGraph().quarantined).toEqual([]);
+    const wds = second.ctx.store.tryGet(
+      "work_dependency_set", `WDS_${child.work_item_id}`) as Record<string, unknown> | null;
+    expect(wds).not.toBeNull();
+    const del = second.ctx.store.get("work_delegation", `WDEL_${child.work_item_id}`);
+    expect(del.authority_ceiling).not.toBeNull();
+    // tamper the manifest digest on the reopened stack — reconcile must
+    // quarantine the work item, never silently rebuild the manifest.
+    const cur = second.ctx.store.get("work_dependency_set", `WDS_${child.work_item_id}`);
+    second.ctx.store.put("work_dependency_set", `WDS_${child.work_item_id}`,
+      { ...cur, dependency_set_digest: "deadbeef" }, Number(cur.version));
+    expect(second.wf.reconcileWorkGraph().quarantined)
+      .toEqual([String(child.work_item_id)]);
+  });
+});

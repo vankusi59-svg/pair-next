@@ -1,8 +1,8 @@
 # PAIR OS VNext — P14 WORKFORCE V2 PHASE 1 REPORT
 
-**Classification at push:** `P14_WORKFORCE_V2_PHASE1_REMEDIATED_R1_PENDING_AUDIT`
+**Classification at push:** `P14_WORKFORCE_V2_PHASE1_REMEDIATED_R2_PENDING_AUDIT`
 **Base (canonical main):** `ef1fb11b214d7917b6d827efb223ddc22ae19511`
-**Head (R1):** `d3f858b106f1b257076f398ff723baaed3bbb4fb` (Phase 1 original: `cf871040120e54721a6d1ab6586492a3bc3fa9d1`)
+**Head (R2):** `<set at commit>` (R1: `ce1c9ea94518face627e7370f54e7bedfacb3083`; Phase 1 original: `cf871040120e54721a6d1ab6586492a3bc3fa9d1`)
 **Branch:** `devin/1790731419-p14-workforce-v2-p1`
 **Scope:** governed work graph + parent→child decomposition + dependency DAG + delegation core + child missions through the merged Foundation V2 path. Phase 1 only — no heartbeat, inbox, autonomous reassignment, scheduling, parent completion cascade, CEO loop, P15/P16.
 
@@ -300,3 +300,114 @@ Killed all PAIR processes → branch head → rebuilt → fresh server
 - edge-revocation governance beyond setDeps (e.g. dep-cancel policy)
 - workforce scheduling / capacity, CEO loop, P15, P16
 - UI surface for the work graph
+
+---
+
+## 16. R2 — dependency-set authority + persisted authority ceiling (mandate §1–§8)
+
+### 16.1 `work_dependency_set` — the omission-safe dependency manifest (§1)
+
+New canonical entity: `work_dependency_set`, id `WDS_<work_item_id>`:
+
+```
+{ dependency_set_id, work_item_id, business_id, project_id,
+  active_edge_ids[], dependency_work_item_ids[],
+  dependency_set_digest, revision, state: "COMMITTED",
+  created_by, created_at, updated_at, version }
+```
+
+`dependency_set_digest` = canonical digest over `{schema, work_item_id, sorted(active_edge_ids), sorted(dependency_work_item_ids)}` — tamper-evident.
+
+Written **inside the same `immediate()`** as the edge mutations it records:
+
+- `setWorkItemDependencies()` → after revoke/write of edges, `writeDependencySet()` rewrites the manifest (revision+1);
+- `decomposeWorkItem()` → every child gets its manifest in the same txn as its sibling edges;
+- `delegateWorkItem()` → the new child starts with a canonical **empty** manifest — `setDependencies([])` semantics: an empty dependency set is a canonical row, never an inferred absence.
+
+`assertCanonicalDependencySet(deps, set)` proves the full chain: key identity (`WDS_<id>`), node resolves, business/project match, COMMITTED, integer revision ≥ 1, sorted lists, digest recompute; every listed edge resolves + passes `assertCanonicalEdge` + `dependent_work_item_id === id` + ACTIVE; the resolved dep set equals `dependency_work_item_ids`; and **no ACTIVE edge for that dependent may exist outside the manifest**.
+
+### 16.2 Manifest consumption (§2)
+
+- `assertGraphAuthority(row)` — validates all edge rows for the dependent (a malformed REVOKED edge still quarantines), then the manifest: present → `assertCanonicalDependencySet`; absent → corrupt iff any edge claims the dependent or the row is a governed child (`delegated_from_work_item_id` / `decomposition_id`). *"No WGE rows" never means "no deps".*
+- `assertDependenciesSatisfied(row)` — the set to satisfy comes from `manifest.dependency_work_item_ids` after revalidation; missing manifest + edge claims or governed-child status → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` (quarantine).
+- Adversarial coverage: dep edge mutated to another dependent → original dependent's manifest still lists the edge but the edge no longer claims it → closed; and the new dependent sees an extra unlisted ACTIVE edge → closed. Both directions quarantine.
+
+### 16.3 Persisted authority ceiling (§3)
+
+`authorityCeilingSnapshot(agentId)` = normalized sorted arrays `{agent_id, capabilities[], executors[], routes[], projects[]|null, context_scopes[]}` + `authorityCeilingDigest` over the snapshot — computed from the P12 contract **at the moment of the graph mutation**:
+
+- **AGENT delegation** → WDEL row carries `authority_ceiling_agent` (= delegator), `authority_ceiling`, `authority_ceiling_digest`. OPERATOR delegation on an *assigned* parent carries the parent assignee's ceiling (the authority source, not the delegator); on an unassigned parent all three fields are explicit nulls — no fabricated ceiling.
+- **Decomposition** → the committed proposal gains `authority_ceiling_agent` + `authority_ceiling`; `proposal_digest` covers them. Validators enforce self-consistency (ceiling.agent_id === ceiling_agent; digest recompute matches; AGENT ⇒ ceiling_agent === delegated_from).
+
+### 16.4 Open-time subset enforcement (§4)
+
+`assertChildAuthorityCeiling(row)` runs inside `openWorkItem` after dep gating, **before any binding/mission**:
+
+```
+effective child ceiling = persisted snapshot (WDEL ceiling / WDEC proposal ceiling)
+                        ∩ CURRENT parent ceiling agent's authority
+                        ∩ child's CURRENT authority  (⊆ checks)
+                        ∩ existing PAIR policy (assertExecutable + binding pin)
+```
+
+- Widening the child's contract after commit → `FAIL_CLOSED_WORK_AUTHORITY_WIDEN` (child exceeds persisted ceiling).
+- Narrowing the parent's contract later → child fails at open vs current parent authority (later revocations narrow, never broaden).
+- Parent broadening later can never expand the stored child ceiling — the snapshot is the cap.
+- Explicit denies remain denies (deny-free sets cannot reintroduce a denied id).
+
+### 16.5 DISABLED contract admission (§5)
+
+`effectiveAuthority` returns empty sets for a non-ACTIVE contract, and new admission now proves current executability directly: `delegateWorkItem` / `decomposeWorkItem` call `assertExecutable` (agent ACTIVE, contract ACTIVE + integrity, business/project scope) → `FAIL_CLOSED_AGENT_CONTRACT_DISABLED` at admission. `assertChildAuthorityCeiling` re-checks it at open. Provenance rows stay historically valid; admission uses the live contract.
+
+### 16.6 Immutable decomposition topology (§6)
+
+`setWorkItemDependencies` on a row whose `decomposition_id` is canonically proven → `FAIL_CLOSED_WORK_DECOMPOSITION_TOPOLOGY_IMMUTABLE` **before** the version check and any write — no partial revocation, no quarantine generated by the rejected operation. Delegated/non-decomposition items keep the mutable path; every mutation refreshes the manifest atomically.
+
+### 16.7 Reconcile (§8)
+
+`reconcileWorkGraph` additionally: validates every `work_dependency_set` row (malformed → quarantine its work item); quarantines governed children lacking a manifest; quarantines any dependent with edge rows but no manifest; and — via the full WDEC/WDEL validators — persisted authority-ceiling digests. Nothing is silently rebuilt from mutable live fields; restart never fabricates a lost dependency or ceiling.
+
+### 16.8 R2 tests — 11 focused (35 total in suite)
+
+| Test | Covers |
+|---|---|
+| WFV2-P1-R2-WGE-MOVED-DEPENDENT | moved edge fails both dependents |
+| WFV2-P1-R2-WGE-MISSING-EXPECTED | manifest-listed edge revoked → closed |
+| WFV2-P1-R2-WGE-EXTRA-ACTIVE | unlisted ACTIVE edge → closed |
+| WFV2-P1-R2-EMPTY-DEPENDENCY-MANIFEST | canonical empty set (rev 2, digest, open clean) |
+| WFV2-P1-R2-DELEGATE-CONTRACT-WIDEN-AFTER-COMMIT | widened delegatee → open WIDEN, zero missions |
+| WFV2-P1-R2-PARENT-NARROW-AFTER-COMMIT | current parent narrowing applies at open |
+| WFV2-P1-R2-DECOMPOSE-CONTRACT-WIDEN-AFTER-COMMIT | widened decompose assignee → open WIDEN |
+| WFV2-P1-R2-DISABLED-CONTRACT-ADMISSION | disabled → delegate/decompose/open all closed |
+| WFV2-P1-R2-DECOMP-DEP-MUTATION-REJECTED | IMMUTABLE + no quarantine + no partial writes |
+| WFV2-P1-R2-DELEGATED-DEP-MUTATION-HAPPY | delegated child mutable, manifest rev bumps |
+| WFV2-P1-R2-RESTART | manifests/ceilings survive; tampered manifest quarantines |
+
+### 16.9 Changed files (R2)
+
+- `src/pair/graph-authority.ts` — WDS row id + digest + `assertCanonicalDependencySet`; `AuthorityCeiling` + snapshot/digest/`authorityToCeilingSet`; `effectiveAuthority`/`assertAuthoritySubset` moved here (shared); `assertCanonicalDelegation`/`assertCanonicalDecomposition` extended for ceiling fields + child manifests
+- `src/pair/work-graph.ts` — `writeDependencySet`, manifest writes in all three mutation seams, ceiling snapshot on WDEL/proposal, `assertExecutable` admission checks, immutable-topology rejection, reconcile manifest scans, manifest-driven `dependenciesProven`
+- `src/pair/business.ts` — `graphAuthorityDeps` (store + getBusiness + agentContracts), manifest consumption in `assertGraphAuthority`/`assertDependenciesSatisfied`, `assertChildAuthorityCeiling` at open
+- `src/__tests__/pair-p14-workforce-v2.test.ts` — +11 R2 tests
+
+### 16.10 Validation (R2 head)
+
+- Focused: **35/35** (15 Phase-1 + 9 R1 + 11 R2)
+- P14F 35 · RH 11 · P13 67 · P12 71 · P11 103 · P10 31 · P9 79 · P6 36 — all green
+- **Node 22 full: 2004 pass + 2 fail** — same pre-existing P5 env-gap as R1 (executables present where tests expect absent)
+- **Node 20 full: 2006/0**
+- `tsc --noEmit` clean · `pnpm build` PASS · `pnpm audit --audit-level=high`: 0 high / 0 critical
+- `verifyIntegrity` clean on a populated db (graph rows incl. WDS/WDEL/WDEC ceiling fields)
+- CI skipped per project policy (not enabled for this branch).
+
+### 16.11 Fresh-server E2E (§10)
+
+Head `<set at commit>`; `PAIR_MC_DIR=/home/ubuntu/pair-mc-r2`; killed all prior PAIR processes, rebuilt, fresh server:
+
+1. decompose → children + manifests: `WDS_<c2>` lists the sibling edge, `WDS_<c1>` canonical **empty**;
+2. `PUT .../dependencies` on WDEC child → **409 `FAIL_CLOSED_WORK_DECOMPOSITION_TOPOLOGY_IMMUTABLE`**;
+3. delegate (assigned parent) → WDEL carries `authority_ceiling_agent` + snapshot + digest;
+4. widen delegatee contract → `POST .../open` → **409 `FAIL_CLOSED_WORK_AUTHORITY_WIDEN`** (fails before binding — checked before the mission-active guard);
+5. forge: move a dep edge's `dependent_work_item_id` (re-hashed canonically) → open original dependent → **409 `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`** (`dependency-set manifest invalid`) + durable `TERMINAL_PROVENANCE_CORRUPT`; open the edge's new dependent → **409 PROVENANCE_CORRUPT** (`extra edge` not in its manifest);
+6. disable delegatee contract → `open` → **409 `FAIL_CLOSED_AGENT_CONTRACT_DISABLED`**;
+7. restart → boot reconcile reports `quarantined 2 forged node(s)` (the forged-edge parent + sibling decomposition unit quarantined atomically; plain items untouched).
