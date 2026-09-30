@@ -746,7 +746,7 @@ export class MissionRuntime {
     executionId: string | null,
     failureClass: ReturnType<typeof classifyFailure>,
     now?: string,
-    opts: { sideEffectResolved?: boolean } = {},
+    opts: { sideEffectResolved?: boolean; consecutiveOverride?: boolean } = {},
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -792,6 +792,7 @@ export class MissionRuntime {
         attempts_per_mission: Number(ext.attempts_per_mission ?? 0),
       },
       side_effect_resolved: opts.sideEffectResolved,
+      consecutive_override: opts.consecutiveOverride,
       now,
     });
     rt.pending_recovery = {
@@ -992,7 +993,7 @@ export class MissionRuntime {
           pending.execution_id ? String(pending.execution_id) : null,
           String(pending.failure_class ?? "UNKNOWN") as ReturnType<typeof classifyFailure>,
           undefined,
-          { sideEffectResolved: resolved },
+          { sideEffectResolved: resolved, consecutiveOverride: true },
         );
         break;
       }

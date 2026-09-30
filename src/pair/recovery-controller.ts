@@ -101,6 +101,12 @@ export const RECOVERY_MATRIX: Record<FailureClass, MatrixRow> = {
   UNKNOWN: { actions: ["RECONCILIATION_REQUIRED", "ABORT"], retry_allowed: false },
 };
 
+/** Decisions that are escalation/termination bookkeeping, not task
+ * attempts — they must not consume the attempt budget, else a granted
+ * budget override is eaten by the bookkeeping decision itself and the
+ * loop can never advance to real work. Receipts are still written. */
+const NON_ATTEMPT_ACTIONS = new Set(["HUMAN_APPROVAL_REQUIRED", "ABORT"]);
+
 export interface RecoveryPolicy {
   max_attempts_per_task: number;
   max_attempts_per_mission: number;
@@ -249,8 +255,12 @@ export class RecoveryController {
       else break;
     }
     return {
-      attempts_task: attempts.filter((a) => a.task_id === taskId).length,
-      attempts_mission: attempts.filter((a) => a.mission_id === missionId).length,
+      attempts_task: attempts.filter(
+        (a) => a.task_id === taskId && !NON_ATTEMPT_ACTIONS.has(String(a.selected_action)),
+      ).length,
+      attempts_mission: attempts.filter(
+        (a) => a.mission_id === missionId && !NON_ATTEMPT_ACTIONS.has(String(a.selected_action)),
+      ).length,
       replans_mission: inMission.filter((d) => d.selected_action === "REPLAN").length,
       remediations_signature: inMission.filter(
         (d) => d.selected_action === "APPLY_VERIFIED_REMEDIATION" && d.failure_signature === signature,
@@ -292,6 +302,11 @@ export class RecoveryController {
     risk_class?: string;
     evidence_refs?: string[];
     correlation_id?: string;
+    /** Operator-granted budget override: the re-decide after a
+     * RECOVERY_BUDGET_OVERRIDE approval skips the consecutive-identical
+     * loop guard — the human explicitly accepted another identical try.
+     * Attempt ceilings still apply (the extension raises those). */
+    consecutive_override?: boolean;
     now?: string;
     /**
      * P9: operator-approved budget extensions. An APPROVED RECOVERY_APPROVAL
@@ -339,7 +354,10 @@ export class RecoveryController {
     } else if (counts.attempts_mission >= policy.max_attempts_per_mission) {
       selected = "ABORT";
       rejectRest("MAX_RECOVERY_ATTEMPTS_PER_MISSION");
-    } else if (counts.consecutive_identical >= policy.max_consecutive_identical) {
+    } else if (
+      counts.consecutive_identical >= policy.max_consecutive_identical &&
+      !input.consecutive_override
+    ) {
       selected = "HUMAN_APPROVAL_REQUIRED";
       rejectRest("MAX_CONSECUTIVE_IDENTICAL_FAILURES");
     } else {
