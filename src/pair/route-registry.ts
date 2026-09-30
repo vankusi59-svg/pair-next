@@ -120,6 +120,10 @@ export class RouteRegistry {
       direct_callable: Boolean(payload.direct_callable),
       capabilities: Array.isArray(payload.capabilities) ? payload.capabilities : [],
       priority: Number(payload.priority ?? 100) || 100,
+      // Model routes: pin the bound model identity at top level so cost
+      // governance resolves per-model pricing (modelRefForRoute).
+      model_entry_id: payload.model_entry_id ?? null,
+      model_id: payload.model_id ?? null,
       health: {
         state: String((payload.health as Record<string, unknown>)?.state ?? "READY"),
         cooldown_until: (payload.health as Record<string, unknown>)?.cooldown_until ?? null,

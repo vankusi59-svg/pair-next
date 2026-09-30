@@ -370,6 +370,8 @@ export class GovernedTaskGate {
       plan_revision: active.revision,
       correlation_id: request.correlation_id,
       executor_id: adapter.executor_id,
+      selected_route_id: task.selected_route_id ?? null,
+      binding_id: task.binding_id ?? null,
       task_instruction: request.task_instruction,
       workspace,
       allowed_paths: allowedPaths,

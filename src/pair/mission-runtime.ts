@@ -68,6 +68,15 @@ const TERMINAL_RUNTIME = new Set<MissionRuntimeState>([
   "ABORTED",
 ]);
 export const TERMINAL_EXECUTION = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
+
+/** Failure classes whose cause is the executor itself — RE_ROUTE then must
+ * leave the executor entirely. Model/provider failures stay route-scoped:
+ * the next dispatch may reuse the executor on its next model route. */
+const EXECUTOR_SCOPED_FAILURES = new Set([
+  "EXECUTOR_UNAVAILABLE",
+  "EXECUTOR_UNHEALTHY",
+  "ENVIRONMENT_INCOMPATIBLE",
+]);
 const SETTLED_TASK = new Set(["COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "SUPERSEDED"]);
 
 export const RUNTIME_TRANSITIONS: Record<MissionRuntimeState, MissionRuntimeState[]> = {
@@ -341,6 +350,48 @@ export class MissionRuntime {
     };
   }
 
+  /* ---------------- route-level failover helpers ------------------------
+
+   * Model routes are canonical executor routes (e.g. RTE_DSH_<prov>_<model>)
+   * bound to one executor. RE_ROUTE stays executor-neutral: the selector
+   * simply cannot re-pick visited routes, so the next dispatch lands on the
+   * next-best route — usually the same executor's next model. */
+
+  /** Distinct routes this task was ever bound to, oldest first — durable
+   * attempt history from governed_task rows, not from mutable task fields. */
+  private taskRouteHistory(taskId: string): string[] {
+    const ids = this.store
+      .list("governed_task")
+      .filter((g) => String(g.task_id) === taskId && g.selected_route_id)
+      .map((g) => String(g.selected_route_id));
+    return [...new Set(ids)];
+  }
+
+  /** selected_route_id pinned onto a governed_task row, or null. */
+  private routeIdOfGovernedTask(governedTaskId: string): string | null {
+    if (!governedTaskId) return null;
+    const g = this.store.tryGet("governed_task", governedTaskId);
+    return g?.selected_route_id ? String(g.selected_route_id) : null;
+  }
+
+  /** Route ids still usable for the executor: QUALIFIED binding + enabled,
+   * QUALIFIED route, minus routes the task already tried. */
+  private eligibleRoutesFor(executorId: string, visited: string[]): string[] {
+    const seen = new Set(visited);
+    const out: string[] = [];
+    for (const b of this.deps.service.routes.bindingsForExecutor(executorId)) {
+      if (String(b.qualification_state) !== "QUALIFIED") continue;
+      const rid = String(b.route_id);
+      if (seen.has(rid)) continue;
+      const route = this.deps.service.routes.getRoute(rid);
+      if (!route || route.enabled === false) continue;
+      if (String(route.qualification_state) !== "QUALIFIED") continue;
+      if (String(route.eligibility_state) !== "QUALIFIED") continue;
+      out.push(rid);
+    }
+    return out;
+  }
+
   /** Governed dependency handoff: completed dep executions' canonical results. */
   private dependencyOutputs(
     missionId: string,
@@ -414,9 +465,7 @@ export class MissionRuntime {
         break;
       }
       case "WAITING_BACKOFF": {
-        const due = this.deps.scheduler.dueActions(now).filter(
-          (a) => a.mission_id === missionId,
-        );
+        const due = this.dueScheduledActionsFor(missionId, now);
         if (due.length === 0) {
           const pending = this.store
             .list("scheduled_action")
@@ -519,9 +568,7 @@ export class MissionRuntime {
     const rt = this.runtimeEntity(missionId);
 
     // 1. Process due scheduled recovery actions first (durable timers).
-    const due = this.deps.scheduler
-      .dueActions(now)
-      .filter((a) => a.mission_id === missionId);
+    const due = this.dueScheduledActionsFor(missionId, now);
     if (due.length > 0) {
       for (const a of due) {
         this.deps.scheduler.markScheduledAction(String(a.scheduled_action_id), "RUNNING");
@@ -586,6 +633,31 @@ export class MissionRuntime {
 
     // 4. Terminal check.
     this.maybeComplete(missionId);
+  }
+
+  /**
+   * Due recovery actions for this mission. `dueActions` promotes
+   * SCHEDULED → READY globally — another runtime's tick can promote this
+   * mission's action before its own tick sees it (and a crash between
+   * promote and RUNNING leaves the same shape). READY rows for this
+   * mission are therefore also actionable; SCHEDULED rows that are not
+   * yet due are not.
+   */
+  private dueScheduledActionsFor(
+    missionId: string,
+    now?: string,
+  ): Array<Record<string, unknown>> {
+    const due = this.deps.scheduler
+      .dueActions(now)
+      .filter((a) => a.mission_id === missionId);
+    const seen = new Set(due.map((a) => String(a.scheduled_action_id)));
+    for (const a of this.store.list("scheduled_action")) {
+      if (a.mission_id !== missionId || a.status !== "READY") continue;
+      if (seen.has(String(a.scheduled_action_id))) continue;
+      seen.add(String(a.scheduled_action_id));
+      due.push(a);
+    }
+    return due;
   }
 
   private futureScheduledBlock(
@@ -684,6 +756,17 @@ export class MissionRuntime {
       .list("experience")
       .filter((e) => e.type === "REMEDIATION_PAIR" && e.status === "ACTIVE")
       .map((e) => String(e.experience_id ?? e.id));
+    // Route-level failover inputs: every route this task has already been
+    // bound to (durable attempt history from governed_task rows) plus the
+    // still-usable routes on the failed executor — lets RE_ROUTE pick the
+    // next model route within the same executor, not only another executor.
+    const visitedRoutes = this.taskRouteHistory(taskId);
+    const eligibleRoutes = execution
+      ? this.eligibleRoutesFor(String(execution.executor_id), visitedRoutes)
+      : [];
+    const failedRouteId = this.routeIdOfGovernedTask(
+      execution ? String(execution.governed_task_id ?? "") : "",
+    );
     const decision = this.deps.recovery.decide({
       verified_remediation_ids: verifiedRemediation,
       mission_id: missionId,
@@ -693,6 +776,8 @@ export class MissionRuntime {
       executor_id: execution ? String(execution.executor_id) : undefined,
       failure_class: failureClass,
       eligible_executors: eligible,
+      eligible_route_ids: eligibleRoutes,
+      visited_route_ids: visitedRoutes,
       risk_class: String(
         ((this.deps.service.getMission(missionId).metadata as Record<string, unknown>)
           ?.risk_ceiling as string) ?? "HIGH",
@@ -711,6 +796,7 @@ export class MissionRuntime {
       execution_id: executionId,
       governed_task_id: execution ? execution.governed_task_id : null,
       executor_id: execution ? execution.executor_id : null,
+      route_id: failedRouteId,
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
     };
@@ -821,6 +907,9 @@ export class MissionRuntime {
         this.deps.service.updateTask(taskId, { status: "READY" });
         const request = this.requestFor(mission, task);
         request.executor_constraint = pending.executor_id;
+        // Same route literally: pin the failed attempt's route so a
+        // multi-route executor cannot silently retry on a different model.
+        if (pending.route_id) request.operator_pin = pending.route_id;
         const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
         this.deps.service.updateTask(taskId, { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown> | undefined;
@@ -843,7 +932,12 @@ export class MissionRuntime {
         const task = this.deps.service.getTask(taskId);
         this.deps.service.updateTask(taskId, { status: "READY" });
         const request = this.requestFor(mission, task);
-        if (pending.executor_id) {
+        // Every route this task has already attempted is ineligible —
+        // RE_ROUTE then picks the next route, typically another model on
+        // the same executor. Executor-scoped failures additionally exclude
+        // the whole executor.
+        request.visited_route_ids = this.taskRouteHistory(taskId);
+        if (pending.executor_id && EXECUTOR_SCOPED_FAILURES.has(String(pending.failure_class))) {
           request.exclude_executors = [pending.executor_id];
         }
         const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);

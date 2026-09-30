@@ -119,8 +119,11 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
   /* ------------------------------------------------ provider hooks ----- */
   /** Resolve the launch descriptor, or null when the runtime is absent. */
   protected abstract resolveLaunch(): AcpLaunch | null;
-  /** Minimal provider env pins — never the full process env. */
-  protected providerEnv(): Record<string, string> {
+  /** Minimal provider env pins — never the full process env. `task` is the
+   * governed task being dispatched; providers may resolve per-task config
+   * (e.g. route-bound model credential) from it. */
+  protected providerEnv(task?: Record<string, unknown>): Record<string, string> {
+    void task;
     return {};
   }
   /** Provider-specific probe fields (version, model route, auth presence). */
@@ -357,7 +360,7 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
       requested_tools: task.requested_tools ?? [],
       constraints: task.constraints ?? [],
     });
-    const proc = new AcpProcess(launch, this.providerEnv());
+    const proc = new AcpProcess(launch, this.providerEnv(task));
     rec.proc = proc;
     try {
       await proc.start(

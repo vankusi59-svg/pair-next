@@ -103,7 +103,7 @@ const native = new PairNativeExecutorAdapter(runner);
 
 const adapters = new Map([[PAIR_NATIVE_EXECUTOR_ID, native]]);
 const governed = new Map();
-if (process.env.PAIR_DSH_HOME) governed.set(DSH_EXECUTOR_ID, new DshExecutorAdapter({ journalRoot }));
+if (process.env.PAIR_DSH_HOME) governed.set(DSH_EXECUTOR_ID, new DshExecutorAdapter({ journalRoot, routeResolver: (id) => service.routes.getRoute(id) }));
 if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
@@ -364,6 +364,7 @@ if (!persistedProjects.length) {
 // §4.2 — populate provider/model catalogs from canonical discovery sources
 // (dsh settings, executor-advertised observations). Read-only projections.
 let planProviders = [];
+let modelRoutesRegistered = 0;
 if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   const dres = runProviderDiscovery(store, {
     context: { env: process.env, dshHome: process.env.PAIR_DSH_HOME, codexHome: process.env.CODEX_HOME },
@@ -461,6 +462,51 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
         credentialEnv: String(prov.credential_reference_name ?? ""),
         model: mid,
       });
+      // Each qualified model also becomes a canonical executor route so
+      // task dispatch goes through route decisions (RE_ROUTE failover,
+      // decision receipts, per-model cost/telemetry). Priority preserves
+      // boot order; the legacy single RTE_DSH_ACP route is disabled below
+      // whenever at least one model route qualified.
+      const modelRouteId = `RTE_DSH_${pid}_${mid}`.replace(/[^A-Za-z0-9_]+/g, "_").toUpperCase();
+      const dshCaps = (service.routes.getRoute("RTE_DSH_ACP")?.capabilities) ?? [];
+      if (!service.routes.getRoute(modelRouteId)) {
+        service.routes.registerRoute({
+          route_id: modelRouteId,
+          route_kind: "REMOTE_GATEWAY_API",
+          enabled: true,
+          eligibility_state: "QUALIFIED",
+          qualification_state: "QUALIFIED",
+          capabilities: dshCaps,
+          priority: 10 + modelRoutesRegistered * 10,
+          executor_hint: DSH_EXECUTOR_ID,
+          model_entry_id: String(me.model_entry_id),
+          model_id: mid,
+          metadata: {
+            provider_id: pid,
+            model_id: mid,
+            credential_env: String(prov.credential_reference_name ?? ""),
+            model_route: route,
+            transport: "ACP_STDIO",
+          },
+        }, "PAIR_MC");
+      }
+      if (!service.routes.bindingFor(DSH_EXECUTOR_ID, modelRouteId)) {
+        service.routes.registerBinding({
+          executor_id: DSH_EXECUTOR_ID,
+          route_id: modelRouteId,
+          mechanism: "SPAWN_ENV",
+          qualification_state: "QUALIFIED",
+        }, "PAIR_MC");
+      }
+      modelRoutesRegistered++;
+    }
+    // With canonical model routes live, the single env-pinned executor
+    // route is disabled — dispatch must go through a model route decision
+    // (fail-closed rather than silently reverting to the env default). It
+    // stays enabled only when no model route qualified at all.
+    if (modelRoutesRegistered > 0) {
+      service.routes.setRouteEnabled("RTE_DSH_ACP", false, "PAIR_MC");
+      console.log("MODEL_ROUTE: RTE_DSH_ACP disabled —", modelRoutesRegistered, "canonical model route(s) registered");
     }
     // Other discovered models get DISCOVERED bindings — the routes page shows
     // them as unqualified fallbacks with their failing gate.

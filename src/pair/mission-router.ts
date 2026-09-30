@@ -226,6 +226,11 @@ export class MissionRouter {
       // — when any snapshot disables fallback, only these may be selected.
       restricted_route_ids:
         agentPolicy?.restricted_route_ids ? [...agentPolicy.restricted_route_ids] : null,
+      // Recovery: operator_pin pins a RETRY_SAME_ROUTE re-dispatch to the
+      // failed attempt's route; visited_route_ids excludes routes already
+      // tried so RE_ROUTE moves to the next eligible model/executor route.
+      operator_pin: (request.operator_pin as string | undefined) ?? undefined,
+      visited_route_ids: [...((request.visited_route_ids as string[] | undefined) ?? [])],
     });
     if (!routeDecision.selected_route_id) {
       this.service.store.appendEvidence(missionId, "ROUTING_FAILED", {

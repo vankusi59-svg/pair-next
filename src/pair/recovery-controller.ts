@@ -172,9 +172,26 @@ export function classifyFailure(input: {
     .map((v) => String(v ?? ""))
     .join("\n");
   if (ENVIRONMENT_INCOMPATIBLE_SIGNAL.test(haystack)) return "ENVIRONMENT_INCOMPATIBLE";
+  let errClassMatch: FailureClass | null = null;
   for (const [re, cls] of CLASS_RULES) {
-    if (re.test(errClass)) return cls;
+    if (re.test(errClass)) {
+      errClassMatch = cls;
+      break;
+    }
   }
+  // Executor adapters wrap every model-side failure (quota, unknown model,
+  // auth) in a generic transport class like ACP_REQUEST_ERROR. When the
+  // class itself says only "transport" — or nothing — rescan the message
+  // fields so a more specific route-scoped cause wins; otherwise retry
+  // would pin a dead model and RE_ROUTE could never fire.
+  if (errClassMatch !== null && errClassMatch !== "TRANSIENT_TRANSPORT") {
+    return errClassMatch;
+  }
+  for (const [re, cls] of CLASS_RULES) {
+    if (cls === "TRANSIENT_TRANSPORT") continue;
+    if (re.test(haystack)) return cls;
+  }
+  if (errClassMatch) return errClassMatch;
   const state = String(input.execution_state ?? input.result?.status ?? "");
   if (state === "TIMEOUT") return "TIMEOUT";
   if (state === "CANCELLED") return "CANCELLED";
@@ -261,6 +278,11 @@ export class RecoveryController {
     result?: Record<string, unknown> | null;
     /** post-gates eligible executors from the router (re-route feasibility) */
     eligible_executors?: string[];
+    /** still-usable routes on the failed executor (route-level re-route
+     * feasibility — e.g. the next model route after a quota/model failure) */
+    eligible_route_ids?: string[];
+    /** routes this task already attempted — never eligible again */
+    visited_route_ids?: string[];
     /** ACTIVE REMEDIATION_PAIR experience ids, already filtered for compatibility by caller/ExperienceService */
     verified_remediation_ids?: string[];
     risk_class?: string;
@@ -335,8 +357,14 @@ export class RecoveryController {
           }
           case "RE_ROUTE": {
             const eligible = input.eligible_executors ?? [];
-            const alternates = eligible.filter((e) => e !== input.executor_id);
-            if (alternates.length === 0) {
+            const execAlternates = eligible.filter((e) => e !== input.executor_id);
+            const visited = new Set(input.visited_route_ids ?? []);
+            const routeAlternates = (input.eligible_route_ids ?? []).filter(
+              (r) => !visited.has(r),
+            );
+            // Re-route is feasible with an alternate executor OR an
+            // alternate route on the same executor (model-level failover).
+            if (execAlternates.length === 0 && routeAlternates.length === 0) {
               rejected.push({ action, reason: "NO_ALTERNATE_ELIGIBLE_EXECUTOR" });
             } else {
               selected = action;

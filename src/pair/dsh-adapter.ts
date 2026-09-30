@@ -45,6 +45,10 @@ function modelRoute(env: (n: string) => string | undefined): [string, string] {
   return [...DSH_DEFAULT_MODEL_ROUTE];
 }
 
+function credentialEnvName(provider: string): string {
+  return provider === "deepseek-official" ? DSH_OFFICIAL_CREDENTIAL_ENV : `${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`;
+}
+
 export class DshExecutorAdapter extends AcpExecutorAdapterBase {
   readonly executor_id = DSH_EXECUTOR_ID;
   readonly runtime_type = DSH_RUNTIME_TYPE;
@@ -52,13 +56,39 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
   protected override readonly capability_ids = [...DSH_CAPABILITY_IDS];
   private readonly configuredEntry: string | null;
 
+  private readonly routeResolver: ((routeId: string) => Record<string, unknown> | null) | null;
+
   constructor(
     deps: ConstructorParameters<typeof AcpExecutorAdapterBase>[0] & {
       dshEntry?: string;
+      /** Resolve a canonical route entity (route-registry row) by id. When
+       * the dispatched task was bound to a model route at route-decision
+       * time, its metadata pins provider/model/credential env — enabling
+       * route-level failover instead of the env-pinned default. */
+      routeResolver?: (routeId: string) => Record<string, unknown> | null;
     },
   ) {
     super(deps);
     this.configuredEntry = deps.dshEntry ?? null;
+    this.routeResolver = deps.routeResolver ?? null;
+  }
+
+  /** Model route for a dispatch: the route the router bound onto the
+   * governed task when it is a model route, else the env-pinned default. */
+  private resolvedModelRoute(task?: Record<string, unknown>): { provider: string; model: string; credentialEnv: string } {
+    const rid = task ? String(task.selected_route_id ?? "") : "";
+    const route = rid && this.routeResolver ? this.routeResolver(rid) : null;
+    const md = (route?.metadata as Record<string, unknown> | undefined) ?? {};
+    if (md.provider_id && md.model_id) {
+      const provider = String(md.provider_id);
+      return {
+        provider,
+        model: String(md.model_id),
+        credentialEnv: String(md.credential_env ?? credentialEnvName(provider)),
+      };
+    }
+    const [provider, model] = modelRoute(this.envOf.bind(this));
+    return { provider, model, credentialEnv: credentialEnvName(provider) };
   }
 
   private envOf(name: string): string | undefined {
@@ -89,12 +119,12 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
     return null;
   }
 
-  protected override providerEnv(): Record<string, string> {
+  protected override providerEnv(task?: Record<string, unknown>): Record<string, string> {
     const env: Record<string, string> = { DSH_TELEMETRY_DISABLED: "1" };
     const home = this.envOf("PAIR_DSH_HOME");
     if (home) env.DSH_HOME = home;
     // Donor parity: resolved credential pinned into child env; never evidence.
-    const credName = this.credentialEnvNames()[0];
+    const credName = this.resolvedModelRoute(task).credentialEnv;
     const cred = this.envOf(credName);
     if (cred) env[credName] = cred;
     return env;
@@ -102,7 +132,7 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
 
   protected override credentialEnvNames(): string[] {
     const [provider] = modelRoute(this.envOf.bind(this));
-    return provider === "deepseek-official" ? [DSH_OFFICIAL_CREDENTIAL_ENV] : [`${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`];
+    return [credentialEnvName(provider)];
   }
 
   protected override providerProbe(launch: AcpLaunch, limitations: string[]): Record<string, unknown> {
@@ -136,11 +166,11 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
     sessionId: string,
     _session: Record<string, unknown>,
     _features: Record<string, unknown>,
-    _task: Record<string, unknown>,
+    task: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const [provider, model] = modelRoute(this.envOf.bind(this));
+    const { provider, model } = this.resolvedModelRoute(task);
     const value = JSON.stringify([provider, model]);
     const resp = await proc.setConfigOption(sessionId, DSH_MODEL_CONFIG_ID, value, 30);
-    return { model_route: [provider, model], model_config: { config_id: DSH_MODEL_CONFIG_ID, response: resp } };
+    return { model_route: [provider, model], selected_route_id: task.selected_route_id ?? null, model_config: { config_id: DSH_MODEL_CONFIG_ID, response: resp } };
   }
 }
