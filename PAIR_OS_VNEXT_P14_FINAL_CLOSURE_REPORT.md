@@ -827,3 +827,13 @@ stands.
 ## 27. R5 classification
 
 **`P14_WORKFORCE_V2_FINAL_CLOSURE_R5_PENDING_INDEPENDENT_AUDIT`**
+
+## 28. Official final pass
+
+Independent audit of the R5 head `45896d70a25340fa26e64c34fd47e9733848a648`
+passed and PR #15 was merged into `main` at
+`6de10d59194230f6b5c141d522dcde87df096304`. The P14 Workforce V2 stack —
+Phase 1 (PR #12), Phase 2 (PR #13), Phase 3 (PR #14) and this Final
+Closure — is now the official runtime on main.
+
+Classification: **`P14_WORKFORCE_V2_OFFICIAL_FINAL_PASS`**
