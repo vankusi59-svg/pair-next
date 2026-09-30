@@ -977,6 +977,25 @@ export class MissionRuntime {
         );
         break;
       }
+      case "HUMAN_APPROVAL_REQUIRED": {
+        // Reaching here means a RECOVERY_BUDGET_OVERRIDE approval was
+        // granted (denials abort the mission in checkPendingApproval).
+        // Re-decide so the raised ceiling buys a real action. If this
+        // task already reconciled (settled barrier), skip selecting
+        // RECONCILIATION_REQUIRED again — the extension would otherwise
+        // be spent on a redundant reconcile cycle.
+        const barriers = (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
+        const resolved = !!barriers[taskId]?.settled;
+        this.startRecovery(
+          missionId,
+          taskId,
+          pending.execution_id ? String(pending.execution_id) : null,
+          String(pending.failure_class ?? "UNKNOWN") as ReturnType<typeof classifyFailure>,
+          undefined,
+          { sideEffectResolved: resolved },
+        );
+        break;
+      }
       case "APPLY_VERIFIED_REMEDIATION": {
         this.runRemediation(missionId, pending, now);
         break;
