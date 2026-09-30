@@ -258,6 +258,74 @@ P15/P16**:
   suite `pair-runtime-hardening.test.ts` (RH-R1-* ×11).
   Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`**.
 
+## P14 Workforce V2 Phase 1 candidate state (on branch, pending audit)
+
+**Clean rebaseline on `devin/1790741859-p14-wfv2-p1-rebaseline`** — PR #11
+(`devin/1790731419-p14-workforce-v2-p1`, head `44f7166`) was abandoned as
+**reference only** after its final independent audit found a systemic
+inverse-provenance omission (deleting mutable mirror fields could degrade
+a governed work item to "standalone") and an insufficiently anchored
+historical authority ceiling (a caller could swap the persisted snapshot
+and recompute digests). Proven ideas were selectively re-derived —
+deterministic child ids, proposal digest, `work_dependency_set` (WDS)
+manifests, atomic seams, assignee immutability, ADMISSION-vs-PROVENANCE,
+open-time ceiling, graph bounds — around two new canonical designs:
+
+- **`work_graph_membership` (`WGM_<work_item_id>`)** — bidirectional graph
+  authority. Written atomically with every work item (`STANDALONE`) and
+  every canonical governance row (`DELEGATED_CHILD`, `DECOMPOSED_CHILD`,
+  `GRAPH_PARENT`). `assertCanonicalMembership` re-proves the full chain
+  (key, digest, type-dispatched WDEL/WDEC/WDS/WAB validation, mirror-field
+  agreement, universal parent facet). Direction 2: committed canonical
+  rows governing an item without membership — or membership disagreeing
+  with them — fail closed; an item can never become standalone because its
+  mirror fields were deleted or altered.
+- **`work_authority_binding` (`WAB_<work_item_id>`) + `agent_contract_revision`
+  (`ACR_<contract>_<version>`)** — historically anchored execution ceiling.
+  The WAB pins `ceiling_agent_id`, `contract_id`, `contract_version`,
+  `contract_digest`, the normalized snapshot + digest, and a binding
+  digest over all anchors. R1 closure: `assertCanonicalContractRevision`
+  fully re-validates the pinned revision (deterministic key, COMMITTED,
+  normalized policy, `contractDigest` recomputed over the stored policy —
+  a mutated policy with an unchanged digest field fails; journal anchor
+  required). The stored snapshot must be ⊆ the canonical P12 projection
+  (`projectedAuthorityFromPolicy` — the same derivation `effectiveAuthority`
+  uses, so `null` allow + explicit deny = catalog minus denies; routes use
+  `preferred_route_ids`/`denied_route_ids`/`route_fallback_allowed`, no
+  invented allow field). An append-only `WORK_AUTHORITY_BOUND` journal
+  event at binding commit pins every field — a self-consistent rehash of
+  the mutable WAB row (even policy-consistent) still fails the anchor.
+  `ensureCurrentRevision` backfills the exact CURRENT revision under
+  create-only CAS for pre-ACR contracts when the journal already proves
+  the version+digest; conflicting ACRs fail closed, never overwritten;
+  older history is never fabricated.
+- **Dependency authority:** WDS manifests (explicit empty set included)
+  remain the sole proof of a node's dependency list — a WGE scan alone
+  never establishes "no dependencies". **Reconcile** validates WGE/WDEL/
+  WDEC/WDS/WGM/WAB rows and sweeps all work items bidirectionally;
+  corrupt canonical rows poison both endpoints; never rebuilt from
+  mutable mirrors; idempotent across restarts.
+- R2 closure: contract-version commits are crash-atomic —
+  `materialize()`/`update()` write the `agent_execution_contract` row,
+  `ACR_<contract>_<version>` and the canonical contract journal event in
+  ONE `store.immediate()` (rollback leaves the old complete revision or
+  the new complete revision, never a partial). `writeRevision` on an
+  existing ACR runs `assertCanonicalContractRevision` + field-for-field
+  identical match (conflict → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`,
+  never overwritten); CAS semantics preserved (one winner, loser
+  `FAIL_CLOSED_VERSION_CONFLICT`, no orphan ACR/event). Status-only
+  toggles unchanged; R1 `ensureCurrentRevision` legacy backfill kept —
+  new writes never rely on it.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REBASELINE_REPORT.md`
+  (§R1, §R2); suite `pair-p14-workforce-v2.test.ts` (73 — incl. 10
+  `P14RB-R1-*` anchor/deny/backfill + 8 `P14RB-R2-*` crash-atomicity
+  tests) + fresh-server E2E (ACR-policy tamper poisons both bindings,
+  self-consistent WAB rehash fails at the event anchor,
+  restart-quarantine durable) + upgrade E2E (pre-ACR DB → exact current
+  revision backfilled, open succeeds) + restart/crash E2E (injected
+  failure mid-update → old v2 canonical, retry → one complete v3).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_R2_PENDING_FINAL_AUDIT`**.
+
 ## Not yet
 
 - Autonomous heartbeat/inbox/delegation/work-graph (P14 workforce —

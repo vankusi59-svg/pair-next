@@ -27,7 +27,7 @@
  *     candidates and route preferences inside the existing authorities.
  */
 
-import { digest, utcnow } from "./canonical.js";
+import { canonicalJson, digest, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -39,6 +39,18 @@ export type AgentContractStatus = (typeof AGENT_CONTRACT_STATUSES)[number];
 export const CONTEXT_SCOPES = ["business", "project", "agent", "experience"] as const;
 
 export const AGENT_CONTRACT_TABLE = "agent_execution_contract";
+
+/** Append-only canonical revision evidence for P12 contracts: every
+ *  committed contract version writes exactly one deterministic row
+ *  (`ACR_<contract_id>_<version>`) carrying the normalized policy and
+ *  the contract's own digest at that version. Workforce authority
+ *  bindings anchor to these rows — a historical ceiling is only as real
+ *  as the revision that produced it. */
+export const AGENT_CONTRACT_REVISION_TABLE = "agent_contract_revision";
+
+export function contractRevisionRowId(contractId: string, version: number): string {
+  return `ACR_${contractId}_${version}`;
+}
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -289,19 +301,26 @@ export class AgentContractService {
     this.validatePolicy(merged);
     const row = this.buildRow(agent, merged, 1, actor);
     try {
-      const saved = this.store.put(AGENT_CONTRACT_TABLE, String(row.contract_id), row, 0);
-      this.store.event({
-        entity_type: AGENT_CONTRACT_TABLE,
-        entity_id: String(row.contract_id),
-        event_type: policy ? "AGENT_EXECUTION_CONTRACT_CREATED" : "AGENT_EXECUTION_CONTRACT_MATERIALIZED",
-        new_state: "ACTIVE",
-        actor,
-        metadata: {
-          org_agent_id: agentId,
-          business_id: row.business_id,
-          contract_version: 1,
-          contract_digest: row.contract_digest,
-        },
+      // R2 §2 — contract row + ACR + journal event commit atomically:
+      // a crash at any seam leaves either nothing or the complete
+      // canonical revision — never a partial one.
+      const saved = this.store.immediate(() => {
+        const s = this.store.put(AGENT_CONTRACT_TABLE, String(row.contract_id), row, 0);
+        this.writeRevision(s);
+        this.store.event({
+          entity_type: AGENT_CONTRACT_TABLE,
+          entity_id: String(row.contract_id),
+          event_type: policy ? "AGENT_EXECUTION_CONTRACT_CREATED" : "AGENT_EXECUTION_CONTRACT_MATERIALIZED",
+          new_state: "ACTIVE",
+          actor,
+          metadata: {
+            org_agent_id: agentId,
+            business_id: row.business_id,
+            contract_version: 1,
+            contract_digest: row.contract_digest,
+          },
+        });
+        return s;
       });
       return saved;
     } catch (err) {
@@ -459,18 +478,138 @@ export class AgentContractService {
       actor,
       updated_at: utcnow(),
     };
-    const saved = this.store.put(AGENT_CONTRACT_TABLE, String(contract.contract_id), next, Number(contract.version));
-    this.store.event({
-      entity_type: AGENT_CONTRACT_TABLE,
-      entity_id: String(contract.contract_id),
-      event_type: "AGENT_EXECUTION_CONTRACT_UPDATED",
-      actor,
-      metadata: {
-        org_agent_id: agentId,
-        contract_version: nextVersion,
-        contract_digest: next.contract_digest,
-      },
+    // R2 §2 — all three artifacts (contract row, ACR, journal event)
+    // commit in ONE transaction; the CAS on `contract.version` keeps
+    // concurrent writers single-winner, and a crash mid-write rolls
+    // back the whole new revision.
+    const saved = this.store.immediate(() => {
+      const s = this.store.put(AGENT_CONTRACT_TABLE, String(contract.contract_id), next, Number(contract.version));
+      this.writeRevision(s);
+      this.store.event({
+        entity_type: AGENT_CONTRACT_TABLE,
+        entity_id: String(contract.contract_id),
+        event_type: "AGENT_EXECUTION_CONTRACT_UPDATED",
+        actor,
+        metadata: {
+          org_agent_id: agentId,
+          contract_version: nextVersion,
+          contract_digest: next.contract_digest,
+        },
+      });
+      return s;
     });
+    return saved;
+  }
+
+  /** Append-only revision row for one committed contract version — the
+   *  canonical P12 evidence a workforce authority binding anchors to.
+   *  Deterministic id + create-only write keeps it race-safe. An
+   *  already-present row is never silently adopted (R2 §3): it must be
+   *  a fully canonical revision for exactly THIS version — full
+   *  `assertCanonicalContractRevision` + field-for-field match —
+   *  otherwise the write fails closed and nothing is overwritten. */
+  private writeRevision(contract: Row): void {
+    const revisionId = contractRevisionRowId(
+      String(contract.contract_id), Number(contract.contract_version));
+    const existing = this.store.tryGet(
+      AGENT_CONTRACT_REVISION_TABLE, revisionId) as Row | null;
+    if (existing) {
+      assertCanonicalContractRevision(this.store, existing);
+      const identical =
+        String(existing.contract_id) === String(contract.contract_id) &&
+        String(existing.org_agent_id) === String(contract.org_agent_id) &&
+        String(existing.business_id) === String(contract.business_id) &&
+        Number(existing.contract_version) === Number(contract.contract_version) &&
+        String(existing.contract_digest) === String(contract.contract_digest) &&
+        canonicalJson(normalizeContractPolicy(existing.policy)) ===
+          canonicalJson(normalizeContractPolicy(contract.policy));
+      if (!identical) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `${revisionId} conflicts with committed contract revision`,
+        );
+      }
+      return;
+    }
+    this.store.put(AGENT_CONTRACT_REVISION_TABLE, revisionId, {
+      revision_id: revisionId,
+      contract_id: String(contract.contract_id),
+      org_agent_id: String(contract.org_agent_id),
+      business_id: String(contract.business_id),
+      contract_version: Number(contract.contract_version),
+      contract_digest: contract.contract_digest,
+      policy: contract.policy,
+      status: contract.status,
+      state: "COMMITTED",
+      created_at: utcnow(),
+      updated_at: utcnow(),
+      version: 0,
+    }, 0);
+  }
+
+  /**
+   * R1 §5 — legacy upgrade path for the CURRENT contract revision only.
+   * Canonical main can carry a valid contract created before
+   * `agent_contract_revision` existed. The exact ACR is created under
+   * create-only CAS only when the journal already proves exactly this
+   * version+digest — history is never fabricated, and an existing
+   * (possibly conflicting) row is fully validated and never overwritten.
+   */
+  ensureCurrentRevision(contract: Row): Row {
+    const contractId = String(contract.contract_id);
+    const version = Number(contract.contract_version);
+    const revisionId = contractRevisionRowId(contractId, version);
+    const existing = this.store.tryGet(
+      AGENT_CONTRACT_REVISION_TABLE, revisionId) as Row | null;
+    if (existing) {
+      assertCanonicalContractRevision(this.store, existing);
+      const matches =
+        String(existing.org_agent_id) === String(contract.org_agent_id) &&
+        String(existing.business_id) === String(contract.business_id) &&
+        String(existing.contract_digest) === String(contract.contract_digest);
+      if (!matches) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `conflicting agent_contract_revision ${revisionId} for current contract`,
+        );
+      }
+      return existing;
+    }
+    // The append-only journal must already prove exactly this
+    // version+digest — the backfill copies canonical evidence, it never
+    // invents a historical revision.
+    const anchored = this.store.listEvents(AGENT_CONTRACT_TABLE, contractId).some((e) => {
+      const md = (e as { metadata?: Record<string, unknown> | null }).metadata;
+      return (
+        !!md &&
+        Number(md.contract_version) === version &&
+        String(md.contract_digest) === String(contract.contract_digest) &&
+        (md.org_agent_id === undefined || String(md.org_agent_id) === String(contract.org_agent_id)) &&
+        (md.business_id === undefined || String(md.business_id) === String(contract.business_id))
+      );
+    });
+    if (!anchored) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+        `contract ${contractId}@${version} has no journal anchor — cannot backfill revision`,
+      );
+    }
+    const revision = {
+      revision_id: revisionId,
+      contract_id: contractId,
+      org_agent_id: String(contract.org_agent_id),
+      business_id: String(contract.business_id),
+      contract_version: version,
+      contract_digest: contract.contract_digest,
+      policy: contract.policy,
+      status: contract.status,
+      state: "COMMITTED",
+      created_at: utcnow(),
+      updated_at: utcnow(),
+      version: 0,
+    } as unknown as Row;
+    const saved = this.store.put(AGENT_CONTRACT_REVISION_TABLE, revisionId, revision, 0);
+    assertCanonicalContractRevision(this.store, saved);
     return saved;
   }
 
@@ -706,5 +845,70 @@ export class AgentContractService {
       version: contract.version,
       updated_at: contract.updated_at,
     };
+  }
+}
+
+/**
+ * R1 §1 — canonical validator for `agent_contract_revision`: the
+ * deterministic `ACR_<contract>_<version>` key, COMMITTED state, identity
+ * fields, a policy that re-normalizes as canonical P12, and a
+ * self-consistent `contractDigest` recomputed over the STORED policy —
+ * a mutated `revision.policy` with an unchanged stored digest fails at
+ * the recompute, and a recomputed digest fails at the append-only
+ * contract journal (which still pins the original version+digest). */
+export function assertCanonicalContractRevision(
+  store: PairEvidenceStore,
+  revision: Row,
+): void {
+  const fail = (msg: string): never => {
+    throw new IntegrityError(
+      "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT", `agent_contract_revision ${msg}`);
+  };
+  const contractId = String(revision.contract_id ?? "");
+  const version = Number(revision.contract_version);
+  const orgAgentId = String(revision.org_agent_id ?? "");
+  const businessId = String(revision.business_id ?? "");
+  if (!contractId || !Number.isInteger(version) || version < 1) {
+    fail("malformed contract anchor");
+  }
+  if (String(revision.revision_id) !== contractRevisionRowId(contractId, version)) {
+    fail(`${String(revision.revision_id)} != deterministic(${contractId}@${version})`);
+  }
+  if (String(revision.state) !== "COMMITTED") {
+    fail(`${contractId}@${version} uncommitted`);
+  }
+  if (!orgAgentId || !businessId) fail(`${contractId}@${version} missing identity`);
+  let policy: AgentContractPolicy;
+  try {
+    policy = normalizeContractPolicy(revision.policy);
+  } catch (err) {
+    return fail(`${contractId}@${version} policy malformed: ${(err as Error).message}`);
+  }
+  const storedDigest = String(revision.contract_digest ?? "");
+  if (
+    contractDigest({
+      contract_id: contractId,
+      org_agent_id: orgAgentId,
+      business_id: businessId,
+      contract_version: version,
+      policy,
+    }) !== storedDigest
+  ) {
+    fail(`${contractId}@${version} digest mismatch — stored policy is not what the digest covers`);
+  }
+  // Append-only journal anchor: a canonical contract event must already
+  // prove exactly this version + digest (+ identity where recorded).
+  const anchored = store.listEvents(AGENT_CONTRACT_TABLE, contractId).some((e) => {
+    const md = (e as { metadata?: Record<string, unknown> | null }).metadata;
+    return (
+      !!md &&
+      Number(md.contract_version) === version &&
+      String(md.contract_digest) === storedDigest &&
+      (md.org_agent_id === undefined || String(md.org_agent_id) === orgAgentId) &&
+      (md.business_id === undefined || String(md.business_id) === businessId)
+    );
+  });
+  if (!anchored) {
+    fail(`${contractId}@${version} not anchored in contract journal`);
   }
 }
