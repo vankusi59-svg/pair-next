@@ -48,6 +48,23 @@ import {
   type GraphAuthorityDeps,
   type MembershipFields,
 } from "./graph-authority.js";
+import {
+  WORK_CLAIM_LEASE_TABLE,
+  WORKFORCE_MESSAGE_TABLE,
+  WORKFORCE_RECEIPT_TABLE,
+  WORK_MESSAGE_KINDS,
+  assertCanonicalClaimLease,
+  assertCanonicalReceipt,
+  assertCanonicalWorkforceMessage,
+  claimExpiredError,
+  claimLeaseDigest,
+  claimLeaseRowId,
+  claimTokenDigest,
+  leaseLiveExpired,
+  receiptRowId,
+  safeLeaseView,
+  workforceMessageDigest,
+} from "./work-coordination.js";
 
 export const WORK_ITEM_STATUSES = [
   "BACKLOG",
@@ -116,9 +133,8 @@ const AGENT_CONTEXT_CAP = 30;
 const AGENT_CONTEXT_INJECT = 5;
 const COMMENT_CAP = 200;
 
-function isClaimActive(row: Row, nowIso: string): boolean {
-  return Boolean(row.claimed_by) && String(row.claim_expires_at ?? "") > nowIso;
-}
+/** (P2) Mutable work_item claim fields are observability mirrors only —
+ *  never consulted as authority; kept for API/dashboard readability. */
 
 export interface BusinessLayerDeps {
   store: PairEvidenceStore;
@@ -888,14 +904,9 @@ export class BusinessLayer {
     }
     const from = String(row.status);
     assertWorkItemTransition(from, "READY");
-    // Reassigning an item actively claimed by someone else would strand the
-    // new assignee behind a foreign claim — fail closed instead.
-    if (isClaimActive(row, utcnow()) && String(row.claimed_by) !== agentId) {
-      throw new PolicyError(
-        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
-        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
-      );
-    }
+    // P2: canonical lease authority — a live WCL held by a different
+    // agent blocks reassignment; an expired lease is fenced first.
+    this.assertNoForeignLiveLease(row, agentId);
     row.assignee_agent_id = agentId;
     row.department = row.department || String(agent.department ?? "");
     row.status = "READY";
@@ -944,13 +955,11 @@ export class BusinessLayer {
     assertWorkItemTransition(from, "IN_PROGRESS");
     const business = this.getBusiness(String(row.business_id));
     const agentId = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
-    const nowIso = utcnow();
-    if (isClaimActive(row, nowIso) && String(row.claimed_by) !== agentId) {
-      throw new PolicyError(
-        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
-        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
-      );
-    }
+    // P2 §8 — canonical coordination gate: a LIVE lease held by an agent
+    // other than the canonical assignee fails closed; a live lease held
+    // BY the assignee or no claim at all both proceed (open never mints
+    // a hidden bearer token — claim is coordination, not execution).
+    this.assertNoForeignLiveLease(row, agentId);
     let agent: Row | null = null;
     if (agentId) {
       agent = this.store.get("org_agent", agentId);
@@ -968,11 +977,8 @@ export class BusinessLayer {
     row.status = "IN_PROGRESS";
     row.pending_open_id = openId;
     row.pending_open_at = utcnow();
-    if (agentId) {
-      row.claimed_by = agentId;
-      row.claim_token = newId("CLM");
-      row.claim_expires_at = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
-    }
+    // P2 §8 — open mints NO bearer token: claimed_by/claim_expires_at
+    // stay observability mirrors of the canonical lease only.
     row.updated_at = utcnow();
     this.store.put("work_item", workItemId, row, Number(row.version));
 
@@ -1180,9 +1186,14 @@ export class BusinessLayer {
         String(cur.pending_open_id ?? "") === openId
       ) {
         cur.status = toStatus;
-        cur.claimed_by = null;
+        // P2: mirrors track the canonical lease — a live lease keeps its
+        // mirror after rollback; a phantom mirror is cleared.
+        const lease = this.store.tryGet(
+          WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+        const live = lease && String(lease.state) === "ACTIVE";
+        cur.claimed_by = live ? String(lease.claimant_agent_id) : null;
         cur.claim_token = null;
-        cur.claim_expires_at = null;
+        cur.claim_expires_at = live ? String(lease.expires_at) : null;
         cur.pending_open_id = null;
         cur.pending_open_at = null;
         cur.updated_at = utcnow();
@@ -1354,11 +1365,21 @@ export class BusinessLayer {
     row.pending_open_id = null;
     row.pending_open_at = null;
     row.updated_at = utcnow();
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_CANCELLED",
-      old_state: from, new_state: "CANCELLED", actor: `operator:${actor}`,
-      metadata: { mission_id: cancelledMission },
+    // P2: cancel revokes the canonical coordination lease in the same
+    // transaction as the work-item transition + audit event.
+    const saved = this.store.immediate(() => {
+      const lease = this.store.tryGet(
+        WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+      if (lease && String(lease.state) === "ACTIVE") {
+        this.transitionLease(lease, "REVOKED", actor, { work_item_id: workItemId });
+      }
+      const s = this.store.put("work_item", workItemId, row, Number(row.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_CANCELLED",
+        old_state: from, new_state: "CANCELLED", actor: `operator:${actor}`,
+        metadata: { mission_id: cancelledMission },
+      });
+      return s;
     });
     return saved;
   }
@@ -1399,11 +1420,22 @@ export class BusinessLayer {
     if (next === "DONE" || next === "BLOCKED" || next === "REVIEW_REQUIRED") {
       row.result_summary = String(mission.result ?? mission.result_summary ?? "") || null;
     }
-    // Terminal state releases the claim so the item can be picked up again.
-    row.claimed_by = null;
-    row.claim_token = null;
-    row.claim_expires_at = null;
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
+    // P2: terminal fold releases the canonical lease in the same txn;
+    // mirrors track the lease (cleared only when no live lease).
+    const saved = this.store.immediate(() => {
+      const lease = this.store.tryGet(
+        WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+      const leaseActive = lease && String(lease.state) === "ACTIVE";
+      if (leaseActive && (next === "DONE" || next === "CANCELLED")) {
+        this.transitionLease(lease, "RELEASED", "PAIR_BUSINESS_LAYER", { work_item_id: workItemId });
+      }
+      const liveLease = lease && String(lease.state) === "ACTIVE" &&
+        !(next === "DONE" || next === "CANCELLED");
+      row.claimed_by = liveLease ? String(lease.claimant_agent_id) : null;
+      row.claim_token = null;
+      row.claim_expires_at = liveLease ? String(lease.expires_at) : null;
+      return this.store.put("work_item", workItemId, row, Number(row.version));
+    });
     // Feed the outcome back into the assignee's persistent context — the
     // agent "remembers" what it did across missions.
     const assignee = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
@@ -1433,67 +1465,491 @@ export class BusinessLayer {
   // ---------- work_item collaboration (claim / comment / blocker / artifact) ----------
 
   /**
-   * Atomic checkout: an agent takes the item off the board so no second
-   * agent works it concurrently. Fail-closed while another claim is live.
+   * P2 §2-§4 — canonical claim lease. One `work_claim_lease`
+   * (WCL_<work_item_id>) is the ONLY coordination authority; the mutable
+   * work_item claim fields are observability mirrors. The lease row,
+   * mirror update and WORK_CLAIM_ACQUIRED event commit in ONE
+   * store.immediate() — crash leaves old lease or new lease, never
+   * partial. Only the token DIGEST is persisted; the raw token is
+   * returned once here and nowhere else ever.
    */
   claimWorkItem(workItemId: string, agentId: string, actor: string): Row & { claim_token: string } {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     this.assertWorkItemNotQuarantined(row);
+    this.assertGraphAuthority(row);
+    const status = String(row.status);
+    if (TERMINAL_WORK_ITEM_STATUSES.has(status)) {
+      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${status} cannot be claimed`);
+    }
+    // P2 §3 eligibility order: claimant must exist in the same business
+    // and be ACTIVE/executable before assignee matching.
     const agent = this.store.get("org_agent", agentId);
+    const business = this.getBusiness(String(row.business_id));
     if (String(agent.business_id) !== String(row.business_id)) {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `claimer outside business ${row.business_id}`);
+      throw new IntegrityError(
+        "FAIL_CLOSED_AGENT_BUSINESS_MISMATCH",
+        `claimant ${agentId} not in business ${String(row.business_id)}`,
+      );
     }
     if (String(agent.status) !== "ACTIVE") {
       throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
     }
-    const status = String(row.status);
-    if (status === "DONE" || status === "CANCELLED") {
-      throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_STATE", `${status} cannot be claimed`);
-    }
-    const nowIso = utcnow();
-    if (isClaimActive(row, nowIso) && String(row.claimed_by) !== agentId) {
-      throw new PolicyError(
-        "FAIL_CLOSED_WORK_ITEM_CLAIMED",
-        `held by ${String(row.claimed_by)} until ${String(row.claim_expires_at)}`,
+    // A claim never assigns: assigned items may only be claimed by their
+    // canonical assignee; unassigned items need the explicit assign seam
+    // first.
+    const assignee = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
+    if (!assignee) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_ITEM_UNASSIGNED",
+        `${workItemId} has no assignee — assign before claiming`,
       );
     }
-    const token = newId("CLM");
-    row.claimed_by = agentId;
-    row.claim_token = token;
-    row.claim_expires_at = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
-    row.updated_at = nowIso;
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_CLAIMED",
-      actor: `operator:${actor}`, metadata: { claimed_by: agentId },
+    if (assignee !== agentId) {
+      throw new PolicyError(
+        "FAIL_CLOSED_WORK_ITEM_CLAIM_ASSIGNEE_MISMATCH",
+        `${workItemId} is assigned to ${assignee}, not ${agentId}`,
+      );
+    }
+    // P12 executability for claim admission: contract ACTIVE + same
+    // business + allowed project.
+    this.agentContracts.assertExecutable(agentId, {
+      businessId: String(row.business_id),
+      projectId: String(business.project_id),
     });
-    return { ...saved, claim_token: token };
+    const nowIso = utcnow();
+    const leaseId = claimLeaseRowId(workItemId);
+    const out = this.store.immediate(() => {
+      const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, leaseId) as Row | null;
+      if (lease) assertCanonicalClaimLease(this.coordDeps(), lease);
+      if (lease && String(lease.state) === "ACTIVE") {
+        if (!leaseLiveExpired(lease, nowIso)) {
+          if (String(lease.claimant_agent_id) === agentId) {
+            // Never silently rotate a live holder's token — heartbeat is
+            // the renewal path (P2 §4).
+            throw new PolicyError(
+              "FAIL_CLOSED_WORK_ITEM_CLAIM_ALREADY_HELD",
+              `${workItemId} lease ${leaseId} already held by ${agentId} until ${String(lease.expires_at)}`,
+            );
+          }
+          throw new PolicyError(
+            "FAIL_CLOSED_WORK_ITEM_CLAIMED",
+            `${workItemId} held by ${String(lease.claimant_agent_id)} until ${String(lease.expires_at)}`,
+          );
+        }
+        this.transitionLease(lease, "EXPIRED", actor, { work_item_id: workItemId });
+      }
+      const curLease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, leaseId) as Row | null;
+      const epoch = curLease ? Number(curLease.lease_epoch) + 1 : 1;
+      const token = newId("CLM");
+      const expiresAt = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
+      const next: Row = {
+        lease_id: leaseId,
+        work_item_id: workItemId,
+        business_id: String(row.business_id),
+        project_id: String(business.project_id),
+        claimant_agent_id: agentId,
+        lease_epoch: epoch,
+        token_digest: claimTokenDigest(token),
+        issued_at: nowIso,
+        last_heartbeat_at: nowIso,
+        expires_at: expiresAt,
+        state: "ACTIVE",
+        lease_digest: "",
+        created_at: curLease ? String(curLease.created_at) : nowIso,
+        updated_at: nowIso,
+        version: curLease ? Number(curLease.version) : 0,
+      };
+      next.lease_digest = claimLeaseDigest(next);
+      this.store.put(WORK_CLAIM_LEASE_TABLE, leaseId, next, curLease ? Number(curLease.version) : 0);
+      // Observability mirrors only — never authority, never token material.
+      const cur = this.store.get("work_item", workItemId);
+      cur.claimed_by = agentId;
+      cur.claim_token = null;
+      cur.claim_expires_at = expiresAt;
+      cur.updated_at = nowIso;
+      const saved = this.store.put("work_item", workItemId, cur, Number(cur.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_CLAIM_ACQUIRED",
+        actor: `operator:${actor}`,
+        metadata: { lease_id: leaseId, claimant_agent_id: agentId, lease_epoch: epoch, expires_at: expiresAt },
+      });
+      return { saved, token };
+    });
+    return { ...out.saved, claim_token: out.token };
   }
 
+  /**
+   * P2 §5 — heartbeat: "this agent still owns the coordination lease".
+   * Renews expiry by the server-bounded CLAIM_TTL_MS only; never rotates
+   * the token; never implies executor liveness. Validates the canonical
+   * lease, claimant, token digest, epoch, expiry and CURRENT P12
+   * executability — all inside one immediate transaction.
+   */
+  heartbeatWorkItem(workItemId: string, agentId: string, claimToken: string, actor: string): Row {
+    const row = this.store.get("work_item", workItemId);
+    this.assertWorkItemNotQuarantined(row);
+    const business = this.getBusiness(String(row.business_id));
+    const leaseId = claimLeaseRowId(workItemId);
+    const out = this.store.immediate(() => {
+      const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, leaseId) as Row | null;
+      if (!lease) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_NOT_CLAIMED", `${workItemId} has no claim lease`);
+      }
+      assertCanonicalClaimLease(this.coordDeps(), lease);
+      if (String(lease.state) !== "ACTIVE") {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_CLAIM_NOT_ACTIVE",
+          `lease ${leaseId} is ${String(lease.state)}`,
+        );
+      }
+      if (String(lease.claimant_agent_id) !== agentId) {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_CLAIM_CLAIMANT",
+          `lease ${leaseId} held by ${String(lease.claimant_agent_id)}`,
+        );
+      }
+      if (claimTokenDigest(String(claimToken ?? "")) !== String(lease.token_digest)) {
+        throw new PolicyError("FAIL_CLOSED_CLAIM_TOKEN", `lease ${leaseId} token mismatch`);
+      }
+      const nowIso = utcnow();
+      if (leaseLiveExpired(lease, nowIso)) {
+        // Fence first, then report expiry — the transition COMMITS so the
+        // stale holder never sees a nominally ACTIVE row again.
+        this.transitionLease(lease, "EXPIRED", actor, { work_item_id: workItemId });
+        return claimExpiredError(leaseId);
+      }
+      this.agentContracts.assertExecutable(agentId, {
+        businessId: String(row.business_id),
+        projectId: String(business.project_id),
+      });
+      const expiresAt = new Date(Date.now() + CLAIM_TTL_MS).toISOString();
+      const next: Row = {
+        ...lease,
+        last_heartbeat_at: nowIso,
+        expires_at: expiresAt,
+        updated_at: nowIso,
+      };
+      next.lease_digest = claimLeaseDigest(next);
+      const saved = this.store.put(WORK_CLAIM_LEASE_TABLE, leaseId, next, Number(lease.version));
+      const cur = this.store.get("work_item", workItemId);
+      cur.claimed_by = agentId;
+      cur.claim_token = null;
+      cur.claim_expires_at = expiresAt;
+      cur.updated_at = nowIso;
+      this.store.put("work_item", workItemId, cur, Number(cur.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_CLAIM_HEARTBEAT",
+        actor: `operator:${actor}`,
+        metadata: { lease_id: leaseId, claimant_agent_id: agentId, lease_epoch: Number(lease.lease_epoch), expires_at: expiresAt },
+      });
+      return safeLeaseView(saved) as Row;
+    });
+    if (out instanceof PolicyError) throw out;
+    return out;
+  }
+
+  /**
+   * P2 §7 — release on canonical lease authority. A live lease requires
+   * the matching raw token; an expired lease is deterministically EXPIRED;
+   * release is idempotent on terminal/none. Never reassigns anything.
+   */
   releaseClaim(workItemId: string, actor: string, claimToken?: string): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
-    const heldBy = row.claimed_by ? String(row.claimed_by) : null;
-    // A live claim can only be released with its claim_token — a stale or
-    // absent token cannot strip another agent's ownership. Expired claims
-    // are releasable without a token (reclaim semantics).
-    if (isClaimActive(row, utcnow()) && claimToken !== String(row.claim_token ?? "")) {
+    const leaseId = claimLeaseRowId(workItemId);
+    return this.store.immediate(() => {
+      const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, leaseId) as Row | null;
+      if (lease) assertCanonicalClaimLease(this.coordDeps(), lease);
+      const nowIso = utcnow();
+      const hadMirror = Boolean(row.claimed_by);
+      if (lease && String(lease.state) === "ACTIVE" && !leaseLiveExpired(lease, nowIso)) {
+        if (claimTokenDigest(String(claimToken ?? "")) !== String(lease.token_digest)) {
+          throw new PolicyError(
+            "FAIL_CLOSED_CLAIM_TOKEN",
+            `live lease ${leaseId} held by ${String(lease.claimant_agent_id)} — matching claim_token required`,
+          );
+        }
+        this.transitionLease(lease, "RELEASED", actor, { work_item_id: workItemId });
+      } else if (lease && String(lease.state) === "ACTIVE" && leaseLiveExpired(lease, nowIso)) {
+        this.transitionLease(lease, "EXPIRED", actor, { work_item_id: workItemId });
+      }
+      const cur = this.store.get("work_item", workItemId);
+      cur.claimed_by = null;
+      cur.claim_token = null;
+      cur.claim_expires_at = null;
+      cur.updated_at = utcnow();
+      const saved = this.store.put("work_item", workItemId, cur, Number(cur.version));
+      if (!lease && hadMirror) {
+        // Phantom-mirror release (no canonical lease): transitionLease
+        // already journaled the canonical case — this covers the rest.
+        this.store.event({
+          entity_type: "work_item", entity_id: workItemId, event_type: "WORK_CLAIM_RELEASED",
+          actor: `operator:${actor}`,
+          metadata: { lease_id: null, released_from: null },
+        });
+      }
+      return saved;
+    });
+  }
+
+  /** Safe lease metadata for reads — never token material (§13). */
+  getWorkItemClaim(workItemId: string): Record<string, unknown> | null {
+    const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+    return lease ? safeLeaseView(lease) : null;
+  }
+
+  /**
+   * P2 §8 — canonical coordination gate for seams that must not proceed
+   * while a DIFFERENT agent holds a live lease (open/assign). A live
+   * lease held by `agentId` (or no lease) passes; an expired lease is
+   * deterministically fenced EXPIRED before the seam continues; stale
+   * mirrors without a WCL row are legacy phantoms and are invalidated.
+   */
+  private assertNoForeignLiveLease(row: Row, agentId: string | null): void {
+    const lease = this.canonicalClaimLease(String(row.work_item_id));
+    const nowIso = utcnow();
+    this.store.immediate(() => {
+      if (lease && String(lease.state) === "ACTIVE") {
+        if (leaseLiveExpired(lease, nowIso)) {
+          this.transitionLease(lease, "EXPIRED", "PAIR_BUSINESS_LAYER", {
+            work_item_id: String(row.work_item_id),
+          });
+        } else if (String(lease.claimant_agent_id) !== agentId) {
+          throw new PolicyError(
+            "FAIL_CLOSED_WORK_ITEM_CLAIMED",
+            `held by ${String(lease.claimant_agent_id)} until ${String(lease.expires_at)}`,
+          );
+        }
+      }
+      // Legacy/phantom mirrors: mirrors that do not reflect a live
+      // canonical lease are observability noise — never authority (§9).
+      const cur = this.store.get("work_item", String(row.work_item_id));
+      const liveBy = lease && String(lease.state) === "ACTIVE" && !leaseLiveExpired(lease, nowIso)
+        ? String(lease.claimant_agent_id)
+        : null;
+      const wantsBy = liveBy;
+      const wantsExp = liveBy ? String(lease?.expires_at) : null;
+      if (
+        String(cur.claimed_by ?? "") !== String(wantsBy ?? "") ||
+        String(cur.claim_expires_at ?? "") !== String(wantsExp ?? "") ||
+        cur.claim_token !== null && cur.claim_token !== undefined
+      ) {
+        const hadPhantom = Boolean(cur.claimed_by) || cur.claim_token !== null && cur.claim_token !== undefined;
+        cur.claimed_by = wantsBy;
+        cur.claim_expires_at = wantsExp;
+        cur.claim_token = null;
+        cur.updated_at = nowIso;
+        this.store.put("work_item", String(row.work_item_id), cur, Number(cur.version));
+        if (hadPhantom && !liveBy) {
+          this.store.event({
+            entity_type: "work_item", entity_id: String(row.work_item_id),
+            event_type: "WORK_CLAIM_MIRRORS_CLEARED",
+            actor: "PAIR_BUSINESS_LAYER",
+            metadata: { work_item_id: String(row.work_item_id), lease_id: lease ? String(lease.lease_id) : null },
+          });
+        }
+      }
+    });
+    // The gate may have bumped the row (mirror repair / EXPIRED fencing);
+    // keep the caller's reference in sync so its own CAS write lands.
+    Object.assign(row, this.store.get("work_item", String(row.work_item_id)));
+  }
+
+  /** The canonical lease for a work item, validated if present. */
+  private canonicalClaimLease(workItemId: string): Row | null {
+    const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+    if (lease) assertCanonicalClaimLease(this.coordDeps(), lease);
+    return lease;
+  }
+
+  private coordDeps(): GraphAuthorityDeps {
+    return {
+      store: this.store,
+      getBusiness: (id: string) => this.getBusiness(id),
+      agentContracts: this.agentContracts,
+    };
+  }
+
+  /** In-txn lease state transition: digest recompute + CAS + audit event.
+   *  Caller must already be inside store.immediate(). */
+  private transitionLease(
+    lease: Row, to: "RELEASED" | "EXPIRED" | "REVOKED", actor: string,
+    meta: Record<string, unknown>,
+  ): Row {
+    const next: Row = { ...lease, state: to, updated_at: utcnow() };
+    next.lease_digest = claimLeaseDigest(next);
+    const saved = this.store.put(
+      WORK_CLAIM_LEASE_TABLE, String(lease.lease_id), next, Number(lease.version));
+    this.store.event({
+      entity_type: "work_item", entity_id: String(lease.work_item_id),
+      event_type: `WORK_CLAIM_${to}`,
+      actor: `operator:${actor}`,
+      metadata: {
+        lease_id: String(lease.lease_id),
+        claimant_agent_id: String(lease.claimant_agent_id),
+        lease_epoch: Number(lease.lease_epoch),
+        ...meta,
+      },
+    });
+    return saved;
+  }
+
+  // ---------- P2: durable inbox / collaboration (§10-§12) ----------
+
+  /**
+   * Append-only workforce message. Communication only — body is data,
+   * never authority: cannot mutate assignee/WGM/WDEL/WDEC/WDS/WAB/claims,
+   * satisfy dependencies, or execute work. Message + PENDING receipt +
+   * event commit atomically.
+   */
+  sendWorkforceMessage(input: {
+    business_id: string;
+    work_item_id?: string | null;
+    sender_type: "AGENT" | "OPERATOR";
+    sender_agent_id?: string | null;
+    sender_operator_id?: string | null;
+    recipient_agent_id: string;
+    kind: string;
+    body: string;
+    correlation_id?: string | null;
+  }): Row {
+    if (!input.business_id) {
+      throw new IntegrityError("FAIL_CLOSED_MESSAGE_SCOPE", "business_id required");
+    }
+    this.getBusiness(input.business_id);
+    if (!WORK_MESSAGE_KINDS.has(String(input.kind))) {
+      throw new IntegrityError("FAIL_CLOSED_MESSAGE_KIND", String(input.kind));
+    }
+    if (!String(input.body ?? "").trim()) {
+      throw new IntegrityError("FAIL_CLOSED_MESSAGE_BODY", "body required");
+    }
+    const recipient = this.store.get("org_agent", String(input.recipient_agent_id));
+    if (String(recipient.business_id) !== String(input.business_id)) {
+      throw new IntegrityError("FAIL_CLOSED_MESSAGE_SCOPE", "recipient outside business");
+    }
+    let workItem: Row | null = null;
+    if (input.work_item_id) {
+      workItem = this.store.get("work_item", String(input.work_item_id));
+      if (String(workItem.business_id) !== String(input.business_id)) {
+        throw new IntegrityError("FAIL_CLOSED_MESSAGE_SCOPE", "work item outside business");
+      }
+      this.assertWorkItemNotQuarantined(workItem);
+      this.assertGraphAuthority(workItem);
+    }
+    if (input.sender_type === "AGENT") {
+      if (!input.sender_agent_id) {
+        throw new IntegrityError("FAIL_CLOSED_MESSAGE_SENDER", "sender_agent_id required");
+      }
+      const sender = this.store.get("org_agent", String(input.sender_agent_id));
+      if (String(sender.business_id) !== String(input.business_id)) {
+        throw new IntegrityError("FAIL_CLOSED_MESSAGE_SCOPE", "sender outside business");
+      }
+      if (String(sender.status) !== "ACTIVE") {
+        throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", String(input.sender_agent_id));
+      }
+    } else if (input.sender_type === "OPERATOR") {
+      if (!String(input.sender_operator_id ?? "").trim()) {
+        throw new IntegrityError("FAIL_CLOSED_MESSAGE_SENDER", "sender_operator_id required");
+      }
+    } else {
+      throw new IntegrityError("FAIL_CLOSED_MESSAGE_SENDER", String(input.sender_type));
+    }
+    const messageId = newId("WFM");
+    const now = utcnow();
+    const msg: Row = {
+      message_id: messageId,
+      business_id: input.business_id,
+      work_item_id: input.work_item_id ?? null,
+      sender_type: input.sender_type,
+      sender_agent_id: input.sender_agent_id ?? null,
+      sender_operator_id: input.sender_operator_id ?? null,
+      recipient_agent_id: String(input.recipient_agent_id),
+      kind: String(input.kind),
+      body: String(input.body),
+      correlation_id: input.correlation_id ?? null,
+      created_at: now,
+      message_digest: "",
+      state: "COMMITTED",
+      updated_at: now,
+      version: 0,
+    };
+    msg.message_digest = workforceMessageDigest(msg);
+    return this.store.immediate(() => {
+      const saved = this.store.put(WORKFORCE_MESSAGE_TABLE, messageId, msg, 0);
+      const rid = receiptRowId(messageId, String(input.recipient_agent_id));
+      this.store.put(WORKFORCE_RECEIPT_TABLE, rid, {
+        receipt_id: rid,
+        message_id: messageId,
+        recipient_agent_id: String(input.recipient_agent_id),
+        status: "PENDING",
+        acknowledged_at: null,
+        created_at: now,
+        updated_at: now,
+        version: 0,
+      } as Row, 0);
+      this.store.event({
+        entity_type: WORKFORCE_MESSAGE_TABLE, entity_id: messageId,
+        event_type: "WORKFORCE_MESSAGE_SENT",
+        actor: input.sender_type === "AGENT"
+          ? `agent:${String(input.sender_agent_id)}`
+          : `operator:${String(input.sender_operator_id)}`,
+        metadata: {
+          business_id: input.business_id,
+          work_item_id: input.work_item_id ?? null,
+          recipient_agent_id: String(input.recipient_agent_id),
+          kind: String(input.kind),
+        },
+      });
+      return saved;
+    });
+  }
+
+  listWorkItemMessages(workItemId: string): Row[] {
+    this.store.get("work_item", workItemId);
+    return this.store.list(WORKFORCE_MESSAGE_TABLE)
+      .filter((m) => String(m.work_item_id) === workItemId)
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  }
+
+  /** Durable agent inbox: messages + their receipt status. */
+  inboxForAgent(agentId: string): Row[] {
+    this.store.get("org_agent", agentId);
+    return this.store.list(WORKFORCE_MESSAGE_TABLE)
+      .filter((m) => String(m.recipient_agent_id) === agentId)
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+      .map((m) => {
+        const r = this.store.tryGet(
+          WORKFORCE_RECEIPT_TABLE,
+          receiptRowId(String(m.message_id), agentId),
+        ) as Row | null;
+        return { ...m, receipt_status: r ? String(r.status) : "PENDING" };
+      });
+  }
+
+  /** ACK — exact intended recipient only; idempotent; rewrites nothing. */
+  ackWorkforceMessage(messageId: string, agentId: string, actor: string): Row {
+    const msg = this.store.get(WORKFORCE_MESSAGE_TABLE, messageId);
+    assertCanonicalWorkforceMessage(this.coordDeps(), msg);
+    if (String(msg.recipient_agent_id) !== agentId) {
       throw new PolicyError(
-        "FAIL_CLOSED_CLAIM_TOKEN",
-        `live claim held by ${heldBy} — matching claim_token required`,
+        "FAIL_CLOSED_MESSAGE_RECIPIENT_MISMATCH",
+        `message ${messageId} is for ${String(msg.recipient_agent_id)}, not ${agentId}`,
       );
     }
-    row.claimed_by = null;
-    row.claim_token = null;
-    row.claim_expires_at = null;
-    row.updated_at = utcnow();
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
-    if (heldBy) {
+    const rid = receiptRowId(messageId, agentId);
+    return this.store.immediate(() => {
+      const receipt = this.store.get(WORKFORCE_RECEIPT_TABLE, rid);
+      assertCanonicalReceipt(this.coordDeps(), receipt);
+      if (String(receipt.status) === "ACKNOWLEDGED") return receipt; // idempotent
+      const next = { ...receipt, status: "ACKNOWLEDGED", acknowledged_at: utcnow(), updated_at: utcnow() };
+      const saved = this.store.put(WORKFORCE_RECEIPT_TABLE, rid, next, Number(receipt.version));
       this.store.event({
-        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_CLAIM_RELEASED",
-        actor: `operator:${actor}`, metadata: { released_from: heldBy },
+        entity_type: WORKFORCE_MESSAGE_TABLE, entity_id: messageId,
+        event_type: "WORKFORCE_MESSAGE_ACKNOWLEDGED",
+        actor: `agent:${agentId}`,
+        metadata: { recipient_agent_id: agentId, work_item_id: msg.work_item_id ?? null },
       });
-    }
-    return saved;
+      return saved;
+    });
   }
 
   commentOnWorkItem(workItemId: string, author: string, body: string): Row {

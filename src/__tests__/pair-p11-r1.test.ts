@@ -158,13 +158,15 @@ describe("R1 §2 atomic CAS — two connections, same DB", () => {
     const { dir, ctx, biz } = makeBizCtx("cas4");
     const b = setupBusiness(biz, ctx.projectId);
     const a = biz.createOrgAgent({ business_id: String(b.business_id), title: "T", department: "d", operator_id: "op" });
-    const a2 = biz.createOrgAgent({ business_id: String(b.business_id), title: "T2", department: "d", operator_id: "op" });
-    const w = makeWorkItem(biz, String(b.business_id));
+    const w = biz.createWorkItem({ business_id: String(b.business_id), title: "w",
+      goal: "g", assignee_agent_id: String(a.agent_id), operator_id: "op" });
     const biz2 = makeSecondBiz(dir).biz;
     const c1 = biz.claimWorkItem(String(w.work_item_id), String(a.agent_id), "op");
     expect(c1.claim_token).toBeTruthy();
-    expect(() => biz2.claimWorkItem(String(w.work_item_id), String(a2.agent_id), "op"))
-      .toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIMED|FAIL_CLOSED_VERSION_CONFLICT/);
+    // second connection sees the committed lease — already-held, not a
+    // duplicate token mint
+    expect(() => biz2.claimWorkItem(String(w.work_item_id), String(a.agent_id), "op"))
+      .toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIM_ALREADY_HELD|FAIL_CLOSED_VERSION_CONFLICT/);
   });
 
   it("integrity verification stays clean after contended writes", () => {
