@@ -238,16 +238,25 @@ P15/P16**:
   `MODEL_NOT_REMOVED` qualify gate still applies); boot continues; no
   error is caught or swallowed — unrelated `IntegrityError`/`PolicyError`
   still propagate fail-closed.
-- **B — orphan non-terminal mission recovery**: `MissionSupervisor.resume()`
-  scans the canonical `mission` list and reconstructs `mission_runtime`
-  via the existing `MissionRuntime.runtimeEntity` (idempotent, version-0
-  CAS) for any non-terminal mission missing one; terminal missions are
-  never resurrected and existing runtimes never duplicated. Reconstructed
-  missions continue through the standard RESTART_REHYDRATE wake +
-  supervisor tick path — no second scheduler/router/dispatcher.
+- **B — orphan mission recovery (R1: CREATED-only reconstruction)**:
+  `MissionSupervisor.resume()` scans the canonical `mission` list.
+  **`mission.status === CREATED` + missing `mission_runtime` is the only
+  automatically reconstructable state** — the sole status provably inside
+  the original crash window; `runtimeEntity` (idempotent, version-0 CAS)
+  rebuilds it and the mission continues via the standard
+  RESTART_REHYDRATE wake + supervisor tick path. **READY/RUNNING/PAUSED +
+  missing runtime is ambiguous and fails closed**: `restart_blocker`
+  (`FAIL_CLOSED_RUNTIME_AMBIGUOUS` + observed status) stamped on the
+  canonical `mission_recovery_checkpoint` + `MISSION_RUNTIME_AMBIGUOUS`
+  event — no runtime row, no wake, no auto-run, no replay of uncertain
+  in-flight execution; PAUSED authority stays in effect and operator
+  recovery goes through existing governed controls. Unknown/malformed
+  mission status fails closed identically (`UNKNOWN:<status>`). Terminal
+  missions never resurrect; existing runtimes never duplicated. No second
+  scheduler/router/dispatcher/recovery engine.
 - Evidence: `PAIR_OS_VNEXT_PRE_P14_WORKFORCE_RUNTIME_HARDENING_REPORT.md`;
-  suite `pair-runtime-hardening.test.ts` (RUNTIME-HARDENING-* ×7).
-  Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_PENDING_AUDIT`**.
+  suite `pair-runtime-hardening.test.ts` (RH-R1-* ×11).
+  Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`**.
 
 ## Not yet
 

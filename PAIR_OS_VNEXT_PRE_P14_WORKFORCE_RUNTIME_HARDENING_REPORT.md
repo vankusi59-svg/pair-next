@@ -1,12 +1,13 @@
 # PAIR NEXT — PRE-P14-WORKFORCE RUNTIME HARDENING REPORT
 
-Classification: `PRE_P14_WORKFORCE_RUNTIME_HARDENING_PENDING_AUDIT`
+Classification: `PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`
 
 - **Repo**: `vankusi59-svg/pair-next`
 - **Base SHA (canonical main)**: `fff2ee4852231cbabed9c084fae61f8497f2acf8` (post-PR-#9 merge)
 - **Branch**: `devin/1790726448-pre-p14-runtime-hardening`
 - **Head SHA**: recorded in the PR (this file lands on the branch head)
 - **Scope**: ONLY the two inherited runtime defects. No Workforce V2, no P15, no P16.
+- **R1 remediation**: missing-runtime reconstruction narrowed to the provably-safe case — see §2.
 
 ---
 
@@ -60,29 +61,48 @@ mission with **no `mission_runtime` row**. `MissionSupervisor.resume()`,
 `tick()`, and every sweep discover work only by listing `mission_runtime`
 — so the orphan is invisible forever.
 
-### Fix
+### Fix (R1 — safe reconstruction only)
 
-`MissionSupervisor.resume()` now performs an **orphan scan on the
-canonical `mission` list** before waking:
+`MissionSupervisor.resume()` scans the canonical `mission` list before
+waking and applies the **exact safe reconstruction rule**:
 
 ```ts
 for (const m of this.store.list("mission")) {
-  if (TERMINAL_MISSION.has(String(m.status))) continue;   // never resurrect
-  const runtimeId = `MRT_${m.mission_id}`;
-  if (this.store.tryGet("mission_runtime", runtimeId)) continue; // preserve existing
-  this.runtime.runtimeEntity(String(m.mission_id));              // canonical create
-  reconstructed++;
+  const status = String(m.status);
+  if (TERMINAL_MISSION.has(status)) continue;                     // never resurrect
+  if (this.store.tryGet("mission_runtime", `MRT_${m.mission_id}`)) continue;
+  if (status === "CREATED") {
+    this.runtime.runtimeEntity(String(m.mission_id));             // canonical create
+    reconstructed++;
+    continue;
+  }
+  this.persistRuntimeAmbiguity(missionId, status);                // FAIL CLOSED
 }
 ```
 
-- `runtimeEntity` is already idempotent and version-0 CAS — the same code
-  used at mission start, so reconstructed rows are canonical, not a
-  second creation path.
-- Terminal missions (`COMPLETED|FAILED|CANCELLED`) are never resurrected.
-- Existing valid runtimes are never replaced or duplicated.
-- Reconstructed missions join the existing `RESTART_REHYDRATE` wake +
-  supervisor tick path — no direct dispatch, no second scheduler/router/
-  recovery engine.
+- **`CREATED` is the only automatically reconstructable state** — the only
+  status provably inside the original crash window. `runtimeEntity` is
+  idempotent, version-0 CAS, the same canonical factory used at mission
+  start.
+- **READY / RUNNING / PAUSED + missing runtime = ambiguous → fail
+  closed.** The prior runtime state cannot be inferred from mission
+  status (recreating as CREATED could auto-run a mission an operator
+  paused, or replay a RUNNING mission's work). `persistRuntimeAmbiguity`
+  stamps a durable `restart_blocker` on the canonical
+  `mission_recovery_checkpoint` (`MRCP_<id>`, already written by the
+  existing `RecoveryController.planRestartRecovery`) with
+  `code: FAIL_CLOSED_RUNTIME_AMBIGUOUS` + observed status, and emits a
+  `MISSION_RUNTIME_AMBIGUOUS` evidence event. The mission gets **no
+  runtime row and no wake** — it can never be ticked, dispatched, or
+  silently replayed. PAUSED authority stays in effect; RUNNING/READY
+  cannot duplicate work. Operator recovery uses the existing governed
+  controls (cancel/block/review). No second recovery engine, no guessed
+  runtime state, no automatic replay of uncertain in-flight execution.
+- **Unknown/malformed status** (outside the canonical whitelist
+  `CREATED|READY|RUNNING|PAUSED` + terminal set) fails closed identically,
+  recorded as `UNKNOWN:<status>`.
+- **Terminal** (`COMPLETED|FAILED|CANCELLED`): never reconstruct, never
+  wake, never resurrect — unchanged.
 - `resume()` returns `{ missions, checkpoints, reconstructed }` (extra
   field, backward compatible).
 
@@ -101,17 +121,21 @@ canonical row factory used by mission start.
 
 ## 4. Tests
 
-New suite `src/__tests__/pair-runtime-hardening.test.ts` (7):
+Suite `src/__tests__/pair-runtime-hardening.test.ts` (11, R1-expanded):
 
 | Test | Proof |
 |---|---|
-| `RUNTIME-HARDENING-MODEL-REMOVED-BOOT` | Persisted REMOVED entry → route guard skips (`SKIPPED_NOT_ROUTABLE`), `qualifyModel` fails `MODEL_NOT_REMOVED`, direct `probeModel` still throws `FAIL_CLOSED_MODEL_REMOVED` |
-| `RUNTIME-HARDENING-MODEL-REMOVED-INTEGRITY` | Non-REMOVED model without probeFn → unrelated `IntegrityError` (`FAIL_CLOSED_PROBE_NOT_CONFIGURED`) propagates — not swallowed |
-| `RUNTIME-HARDENING-MISSING-RUNTIME` | Orphan non-terminal mission → `resume()` reconstructs `MRT_*` (state CREATED), `RESTART_REHYDRATE` wake + `MISSION_RUNTIME_CREATED` event persisted |
-| `RUNTIME-HARDENING-IDEMPOTENT` | `resume()` ×2 → exactly one runtime row, `reconstructed` 1→0, `MISSION_RUNTIME_CREATED` count stable |
-| `RUNTIME-HARDENING-TERMINAL` | CANCELLED mission with no runtime → no `MRT_*` row created |
-| `RUNTIME-HARDENING-EXISTING-RUNTIME` | Normally-started mission → version unchanged, single runtime row |
-| `RUNTIME-HARDENING-GOVERNED-CONTINUATION` | Reconstructed orphan → `supervisor.runUntilSettled()` → scripted executor dispatched once → mission COMPLETED through the existing governed path |
+| `RH-R1-MODEL-REMOVED-REGRESSION` | Defect A stays closed — REMOVED skipped, `MODEL_NOT_REMOVED` gate fails, direct `probeModel` still throws `FAIL_CLOSED_MODEL_REMOVED` |
+| `RH-R1-MODEL-REMOVED-INTEGRITY` | Unrelated `IntegrityError` (`FAIL_CLOSED_PROBE_NOT_CONFIGURED`) propagates — not swallowed |
+| `RH-R1-CREATED-RECONSTRUCT` | CREATED orphan → canonical `MRT_*` (state CREATED) + `RESTART_REHYDRATE` wake + `MISSION_RUNTIME_CREATED` evidence |
+| `RH-R1-PAUSED-NO-AUTORUN` | PAUSED + missing runtime → no runtime row, no wake, `runUntilSettled()` dispatches nothing, mission stays PAUSED; `restart_blocker` on `MRCP_*` + `MISSION_RUNTIME_AMBIGUOUS` event |
+| `RH-R1-RUNNING-NO-GUESS` | RUNNING + missing runtime → no guessed state, no runtime, no duplicate dispatch, blocker evidence |
+| `RH-R1-READY-NO-GUESS` | READY + missing runtime → fail closed, blocker evidence |
+| `RH-R1-UNKNOWN-STATUS` | Malformed `WIBBLE` status → no reconstruction, blocker records `UNKNOWN:WIBBLE` |
+| `RH-R1-TERMINAL` | COMPLETED + FAILED + CANCELLED without runtime → no `MRT_*`, no ambiguity events |
+| `RH-R1-IDEMPOTENT` | CREATED orphan, `resume()` ×2 → 1 runtime row, `reconstructed` 1→0, `MISSION_RUNTIME_CREATED` count stable |
+| `RH-R1-EXISTING-RUNTIME` | Normally-started mission → version unchanged, single runtime row |
+| `RH-R1-GOVERNED-CONTINUATION` | Reconstructed CREATED orphan → `runUntilSettled()` → dispatched once → COMPLETED via governed path |
 
 ---
 
@@ -119,7 +143,7 @@ New suite `src/__tests__/pair-runtime-hardening.test.ts` (7):
 
 | Suite | Result |
 |---|---|
-| Focused runtime-hardening | **7/7** |
+| Focused runtime-hardening (R1) | **11/11** |
 | P14 Foundation V2 | **35/35** |
 | P13 | **67/67** |
 | P12 | **71/71** |
@@ -127,8 +151,8 @@ New suite `src/__tests__/pair-runtime-hardening.test.ts` (7):
 | P9 | **79/79** |
 | P10 (runtime/supervisor/recovery) | **31/31** |
 | P6 (providers/models) | **36/36** |
-| **Node 22 full** | **1965 pass · 2 fail = P5 DSH+CODEX probe env gap (pre-existing, unchanged)** |
-| **Node 20 full** | **1967 pass · 0 fail** |
+| **Node 22 full** | **1969 pass · 2 fail = P5 DSH+CODEX probe env gap (pre-existing, unchanged)** |
+| **Node 20 full** | **1971 pass · 0 fail** |
 | typecheck (`tsc --noEmit`) | clean |
 | build (`npm run build`) | PASS |
 | `pnpm audit --audit-level=high` | 0 high / 0 critical (1 low, 8 moderate — unchanged baseline) |
@@ -145,5 +169,13 @@ probe → REMOVED-catalog boot continuity + orphan-runtime recovery + E2E).
 - `FAIL_CLOSED_MODEL_REMOVED` still throws on direct `probeModel` calls —
   intended fail-closed behavior, now unreachable from boot because the
   route loop skips REMOVED entries first.
-- PR #8 (legacy P14 workforce branch) remains reference-only; it conflicts
-  with merged main and is not a base for this work.
+- PR #8 (legacy P14 workforce branch) remains reference-only — now closed;
+  it was never a base for this work.
+- A restart-orphaned in-flight execution (live `executor_execution` row,
+  supervisor restart mid-flight) strands as `UNKNOWN` — the mission parks
+  RUNNING and `/reconcile` emits `CONFIRMED_NOT_EXECUTED`/`replay_allowed`
+  but does not re-drive. R1 now also fails closed on this case (RUNNING +
+  missing runtime → `FAIL_CLOSED_RUNTIME_AMBIGUOUS` blocker, no guessed
+  replay). Automatic replay of uncertain in-flight execution is
+  intentionally out of scope — operator recovery via existing governed
+  controls.

@@ -50,6 +50,12 @@ const NON_TERMINAL = new Set([
  *  mission must never gain a runtime row during recovery. */
 const TERMINAL_MISSION = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
+/** Canonical non-terminal mission statuses. Only CREATED is provably in
+ *  the original creation crash window (mission row persisted before
+ *  `runtimeEntity`) — every other status means the mission had already
+ *  progressed, so a missing runtime's prior state cannot be inferred. */
+const CANONICAL_NON_TERMINAL = new Set(["CREATED", "READY", "RUNNING", "PAUSED"]);
+
 export class MissionSupervisor {
   private running = false;
 
@@ -100,21 +106,38 @@ export class MissionSupervisor {
     const checkpoints = this.recovery.planRestartRecovery((executionId) =>
       this.reconciliation.reconcile({ execution_id: executionId }),
     );
-    // Orphaned-mission rehydration (runtime-hardening B): a mission row
-    // can persist before its mission_runtime row — a crash in that
+    // Orphaned-mission rehydration (runtime-hardening B, R1): a mission
+    // row can persist before its mission_runtime row — a crash in that
     // window leaves a live mission invisible to every runtime-scoped
-    // sweep. Scan the canonical mission list; any non-terminal mission
-    // missing a runtime gets the canonical `runtimeEntity`
-    // reconstruction (idempotent — an existing runtime is never
-    // replaced or duplicated). The standard runtime/supervisor path
-    // then picks it up; nothing dispatches directly.
+    // sweep. Scan the canonical mission list and apply the exact safe
+    // reconstruction rule:
+    //   * status CREATED + missing runtime → provably the original
+    //     crash window → canonical `runtimeEntity` reconstruction
+    //     (idempotent — existing runtimes are never replaced or
+    //     duplicated).
+    //   * READY/RUNNING/PAUSED + missing runtime → ambiguous: the prior
+    //     runtime state cannot be inferred from mission status alone →
+    //     fail closed via durable recovery evidence, no runtime, no
+    //     wake, no auto-run — PAUSED authority stays in effect.
+    //   * any non-canonical status → fail closed the same way.
+    // The standard runtime/supervisor path then picks up only the
+    // safely reconstructable missions; nothing dispatches directly.
     let reconstructed = 0;
     for (const m of this.store.list("mission")) {
-      if (TERMINAL_MISSION.has(String(m.status))) continue;
-      const runtimeId = `MRT_${String(m.mission_id)}`;
+      const status = String(m.status);
+      if (TERMINAL_MISSION.has(status)) continue;
+      const missionId = String(m.mission_id);
+      const runtimeId = `MRT_${missionId}`;
       if (this.store.tryGet("mission_runtime", runtimeId)) continue;
-      this.runtime.runtimeEntity(String(m.mission_id));
-      reconstructed++;
+      if (status === "CREATED") {
+        this.runtime.runtimeEntity(missionId);
+        reconstructed++;
+        continue;
+      }
+      this.persistRuntimeAmbiguity(
+        missionId,
+        CANONICAL_NON_TERMINAL.has(status) ? status : `UNKNOWN:${status}`,
+      );
     }
     const missions = this.store
       .list("mission_runtime")
@@ -125,6 +148,48 @@ export class MissionSupervisor {
     }
     this.running = true;
     return { missions, checkpoints: checkpoints.length, reconstructed };
+  }
+
+  /**
+   * Fail-closed evidence for an ambiguous missing-runtime mission: stamp
+   * the durable restart checkpoint (`mission_recovery_checkpoint`, already
+   * written by `planRestartRecovery` for every non-terminal mission) with
+   * a `restart_blocker` and emit a `MISSION_RUNTIME_AMBIGUOUS` event.
+   * Idempotent — repeated restarts rewrite the same marker. The mission
+   * itself is never woken: no guessed runtime state, no auto-run, no
+   * duplicate dispatch; operator recovery uses the existing governed
+   * controls (cancel/block/review).
+   */
+  private persistRuntimeAmbiguity(missionId: string, observed: string): void {
+    const checkpointId = `MRCP_${missionId}`;
+    const existing = this.store.tryGet("mission_recovery_checkpoint", checkpointId) as
+      | Record<string, unknown>
+      | null;
+    const body: Record<string, unknown> = existing ?? {
+      checkpoint_id: checkpointId,
+      mission_id: missionId,
+      version: 0,
+    };
+    body.restart_blocker = {
+      code: "FAIL_CLOSED_RUNTIME_AMBIGUOUS",
+      observed_mission_status: observed,
+      detail:
+        "mission_runtime missing and prior runtime state cannot be inferred — operator recovery required; never auto-reconstructed, never auto-run",
+    };
+    this.store.put(
+      "mission_recovery_checkpoint",
+      checkpointId,
+      body,
+      Number(body.version ?? 0),
+    );
+    this.store.event({
+      entity_type: "mission",
+      entity_id: missionId,
+      event_type: "MISSION_RUNTIME_AMBIGUOUS",
+      new_state: observed,
+      actor: "PAIR_MISSION_SUPERVISOR",
+      metadata: { checkpoint_id: checkpointId, code: "FAIL_CLOSED_RUNTIME_AMBIGUOUS" },
+    });
   }
 
   start(): void {

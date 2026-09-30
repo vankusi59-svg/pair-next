@@ -240,7 +240,7 @@ async function routeProbeAttemptAsync(
 }
 
 describe("PRE-P14 RUNTIME HARDENING — REMOVED model / missing mission_runtime", () => {
-  it("RUNTIME-HARDENING-MODEL-REMOVED-BOOT: persisted REMOVED model is skipped, not routable", async () => {
+  it("RH-R1-MODEL-REMOVED-REGRESSION: persisted REMOVED model is skipped, not routable", async () => {
     const ctx = makeCtx("mrb");
     const mid = seedRemovedModel(ctx.store);
     // Boot path guard: REMOVED → skipped before probeModel (the throw site).
@@ -254,7 +254,7 @@ describe("PRE-P14 RUNTIME HARDENING — REMOVED model / missing mission_runtime"
     await expect(probeModel(ctx.store, mid, 1, {})).rejects.toThrow(/FAIL_CLOSED_MODEL_REMOVED/);
   });
 
-  it("RUNTIME-HARDENING-MODEL-REMOVED-INTEGRITY: unrelated IntegrityError still propagates", async () => {
+  it("RH-R1-MODEL-REMOVED-INTEGRITY: unrelated IntegrityError still propagates", async () => {
     const ctx = makeCtx("mri");
     // Non-REMOVED model with no probeFn configured — probeModel throws a
     // different IntegrityError; the guard does NOT swallow it.
@@ -264,7 +264,7 @@ describe("PRE-P14 RUNTIME HARDENING — REMOVED model / missing mission_runtime"
     await expect(routeProbeAttemptAsync(ctx.store, me)).rejects.toThrow(/FAIL_CLOSED_PROBE_NOT_CONFIGURED/);
   });
 
-  it("RUNTIME-HARDENING-MISSING-RUNTIME: restart reconstructs runtime for orphan mission", () => {
+  it("RH-R1-CREATED-RECONSTRUCT: CREATED orphan mission gets canonical CREATED runtime + restart evidence", () => {
     const ctx = makeCtx("mr");
     const mid = orphanMission(ctx);
     expect(ctx.store.tryGet("mission_runtime", `MRT_${mid}`)).toBeNull();
@@ -282,7 +282,7 @@ describe("PRE-P14 RUNTIME HARDENING — REMOVED model / missing mission_runtime"
     ).toBe(true);
   });
 
-  it("RUNTIME-HARDENING-IDEMPOTENT: second restart reconstructs nothing, no duplicate runtime", () => {
+  it("RH-R1-IDEMPOTENT: second restart reconstructs nothing, no duplicate runtime", () => {
     const ctx = makeCtx("idm");
     const mid = orphanMission(ctx);
     const r1 = ctx.supervisor.resume();
@@ -299,17 +299,117 @@ describe("PRE-P14 RUNTIME HARDENING — REMOVED model / missing mission_runtime"
     expect(created2).toBe(created1);
   });
 
-  it("RUNTIME-HARDENING-TERMINAL: terminal mission without runtime is not resurrected", () => {
+  it("RH-R1-TERMINAL: COMPLETED/FAILED/CANCELLED missions without runtime are never resurrected", () => {
     const ctx = makeCtx("term");
-    const mid = orphanMission(ctx);
-    ctx.service.transitionMission(mid, "CANCELLED", "test");
+    const cancelled = orphanMission(ctx, "cancelled");
+    ctx.service.transitionMission(cancelled, "CANCELLED", "test");
+    const failed = orphanMission(ctx, "failed");
+    ctx.service.transitionMission(failed, "READY", "test");
+    ctx.service.transitionMission(failed, "RUNNING", "test");
+    ctx.service.transitionMission(failed, "FAILED", "test");
+    const completed = orphanMission(ctx, "completed");
+    ctx.service.transitionMission(completed, "READY", "test");
+    ctx.service.transitionMission(completed, "RUNNING", "test");
+    ctx.service.transitionMission(completed, "COMPLETED", "test");
+    const r = ctx.supervisor.resume();
+    expect(r.reconstructed).toBe(0);
+    for (const mid of [cancelled, failed, completed]) {
+      expect(r.missions).not.toContain(mid);
+      expect(ctx.store.tryGet("mission_runtime", `MRT_${mid}`)).toBeNull();
+      expect(
+        ctx.store
+          .listEvents("mission", mid)
+          .some((e) => e.event_type === "MISSION_RUNTIME_AMBIGUOUS"),
+      ).toBe(false);
+    }
+  });
+
+  it("RH-R1-PAUSED-NO-AUTORUN: PAUSED mission + missing runtime fails closed — no runtime, no dispatch", () => {
+    const ctx = makeCtx("paus");
+    const mid = orphanMission(ctx, "paused");
+    ctx.service.transitionMission(mid, "READY", "test");
+    ctx.service.transitionMission(mid, "RUNNING", "test");
+    ctx.service.transitionMission(mid, "PAUSED", "test");
     const r = ctx.supervisor.resume();
     expect(r.reconstructed).toBe(0);
     expect(r.missions).not.toContain(mid);
     expect(ctx.store.tryGet("mission_runtime", `MRT_${mid}`)).toBeNull();
+    // Explicit fail-closed recovery evidence on the canonical checkpoint.
+    const mrcp = ctx.store.get("mission_recovery_checkpoint", `MRCP_${mid}`);
+    const blocker = mrcp.restart_blocker as Record<string, unknown>;
+    expect(blocker.code).toBe("FAIL_CLOSED_RUNTIME_AMBIGUOUS");
+    expect(blocker.observed_mission_status).toBe("PAUSED");
+    expect(
+      ctx.store
+        .listEvents("mission", mid)
+        .some((e) => e.event_type === "MISSION_RUNTIME_AMBIGUOUS"),
+    ).toBe(true);
+    // Supervisor sweeps can never tick it → no dispatch, PAUSE authority
+    // stays in effect (mission status unchanged).
+    const ex = ctx.adapters.get("EX_A") as ScriptedAdapter;
+    ctx.supervisor.runUntilSettled();
+    expect(ex.dispatched).toHaveLength(0);
+    expect(ctx.service.getMission(mid).status).toBe("PAUSED");
   });
 
-  it("RUNTIME-HARDENING-EXISTING-RUNTIME: valid runtime preserved, no duplicate", () => {
+  it("RH-R1-RUNNING-NO-GUESS: RUNNING mission + missing runtime → safe recovery, no guess, no dup dispatch", () => {
+    const ctx = makeCtx("run");
+    const mid = orphanMission(ctx, "running");
+    ctx.service.transitionMission(mid, "READY", "test");
+    ctx.service.transitionMission(mid, "RUNNING", "test");
+    const r = ctx.supervisor.resume();
+    expect(r.reconstructed).toBe(0);
+    expect(r.missions).not.toContain(mid);
+    expect(ctx.store.tryGet("mission_runtime", `MRT_${mid}`)).toBeNull();
+    const blocker = (ctx.store.get("mission_recovery_checkpoint", `MRCP_${mid}`).restart_blocker ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(blocker.code).toBe("FAIL_CLOSED_RUNTIME_AMBIGUOUS");
+    expect(blocker.observed_mission_status).toBe("RUNNING");
+    const ex = ctx.adapters.get("EX_A") as ScriptedAdapter;
+    ctx.supervisor.runUntilSettled();
+    expect(ex.dispatched).toHaveLength(0);
+    expect(ctx.service.getMission(mid).status).toBe("RUNNING");
+  });
+
+  it("RH-R1-READY-NO-GUESS: READY mission + missing runtime fails closed", () => {
+    const ctx = makeCtx("rdy");
+    const mid = orphanMission(ctx, "ready");
+    ctx.service.transitionMission(mid, "READY", "test");
+    const r = ctx.supervisor.resume();
+    expect(r.reconstructed).toBe(0);
+    expect(r.missions).not.toContain(mid);
+    expect(ctx.store.tryGet("mission_runtime", `MRT_${mid}`)).toBeNull();
+    const blocker = (ctx.store.get("mission_recovery_checkpoint", `MRCP_${mid}`).restart_blocker ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(blocker.code).toBe("FAIL_CLOSED_RUNTIME_AMBIGUOUS");
+    expect(blocker.observed_mission_status).toBe("READY");
+  });
+
+  it("RH-R1-UNKNOWN-STATUS: malformed mission status + missing runtime fails closed", () => {
+    const ctx = makeCtx("unk");
+    const mid = orphanMission(ctx, "unknown");
+    // Corrupt the mission status directly (bypass transition map) to
+    // simulate a malformed canonical row — must NOT be reconstructed.
+    const row = ctx.store.get("mission", mid);
+    row.status = "WIBBLE";
+    ctx.store.put("mission", mid, row, Number(row.version));
+    const r = ctx.supervisor.resume();
+    expect(r.reconstructed).toBe(0);
+    expect(r.missions).not.toContain(mid);
+    expect(ctx.store.tryGet("mission_runtime", `MRT_${mid}`)).toBeNull();
+    const blocker = (ctx.store.get("mission_recovery_checkpoint", `MRCP_${mid}`).restart_blocker ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(blocker.code).toBe("FAIL_CLOSED_RUNTIME_AMBIGUOUS");
+    expect(String(blocker.observed_mission_status)).toContain("UNKNOWN");
+  });
+
+  it("RH-R1-EXISTING-RUNTIME: valid runtime preserved, no duplicate", () => {
     const ctx = makeCtx("exr");
     // Start a mission normally → canonical runtime already exists.
     const m = ctx.control.startMission({
@@ -327,7 +427,7 @@ describe("PRE-P14 RUNTIME HARDENING — REMOVED model / missing mission_runtime"
     expect(ctx.store.list("mission_runtime").filter((x) => x.mission_id === mid)).toHaveLength(1);
   });
 
-  it("RUNTIME-HARDENING-GOVERNED-CONTINUATION: reconstructed mission proceeds via runtime/supervisor path", () => {
+  it("RH-R1-GOVERNED-CONTINUATION: reconstructed mission proceeds via runtime/supervisor path", () => {
     const ctx = makeCtx("gc");
     const mid = orphanMission(ctx);
     const r = ctx.supervisor.resume();
