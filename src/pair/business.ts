@@ -73,10 +73,14 @@ import {
   assertCanonicalWorkCompletion,
   canonicalChildIdsOf,
   canonicalParentIdsOf,
+  childBasisDigest,
   childSetDigest,
+  completionBasisDigest,
   completionDigest,
   completionRowId,
+  proveCanonicalMissionCompletion,
   proveWorkItemComplete,
+  rejectedCompletionBases,
 } from "./work-completion.js";
 
 export const WORK_ITEM_STATUSES = [
@@ -600,18 +604,28 @@ export class BusinessLayer {
   /**
    * Completion basis for `row`: which canonical requirements are met.
    *  - missionDone: null = no bound mission (container); true = bound
-   *    mission COMPLETED; false = pending/failed/unbound.
+   *    mission CANONICALLY COMPLETED (transition + runtime + task
+   *    evidence — a bare COMPLETED status is a forgery, not a basis);
+   *    false = pending/failed/unbound/unproven.
    *  - childIds: the canonical child set (WDEC ∪ WDEL), sorted; empty
    *    for a leaf.
    *  - childrenDone: every canonical child has a valid WCP.
    *  - ready: leaf → missionDone; container → childrenDone && children
    *    exist; mixed → missionDone && childrenDone.
+   *  - basisDigest: identity of the authority a review decision would
+   *    be made against (bound mission attempt + each canonical child's
+   *    current completion-record digest).
+   *  - rejected: this exact basis was already rejected by a REWORK —
+   *    it may never ground REVIEW_REQUIRED/DONE again; authority must
+   *    advance to a different basis first.
    * Throws (corrupt canonical child rows) — callers decide quarantine.
    */
   private completionBasis(row: Row): {
     ready: boolean;
     mission: Row | null;
     childIds: string[];
+    basisDigest: string;
+    rejected: boolean;
   } {
     const deps = this.graphAuthorityDeps();
     const wid = String(row.work_item_id);
@@ -623,10 +637,17 @@ export class BusinessLayer {
     }
     const mission = this.boundMissionForWorkItem(row);
     const missionDone = mission === null
-      ? null : String(mission.status) === "COMPLETED";
+      ? null : proveCanonicalMissionCompletion(this.store, mission);
+    const basisDigest = completionBasisDigest({
+      mission_id: mission ? String(mission.mission_id) : null,
+      bound_open_id:
+        mission ? String(mission.bound_open_id ?? "") || null : null,
+      child_basis_digest: childBasisDigest(this.store, childIds),
+    });
+    const rejected = rejectedCompletionBases(this.store, wid).has(basisDigest);
     const ready = childrenDone &&
       (missionDone === true || (missionDone === null && childIds.length > 0));
-    return { ready, mission, childIds };
+    return { ready, mission, childIds, basisDigest, rejected };
   }
 
   /** Basis that never throws — corrupt child rows evaluate unready. */
@@ -634,7 +655,10 @@ export class BusinessLayer {
     try {
       return this.completionBasis(row);
     } catch {
-      return { ready: false, mission: null, childIds: [] };
+      return {
+        ready: false, mission: null, childIds: [],
+        basisDigest: "", rejected: false,
+      };
     }
   }
 
@@ -745,7 +769,7 @@ export class BusinessLayer {
       return cur;
     }
     const basis = this.completionBasis(cur);
-    if (!basis.ready) return null;
+    if (!basis.ready || basis.rejected) return null;
     if (cur.requires_review === true) return null; // review gates finality
     assertWorkItemTransition(String(cur.status), "DONE");
     const from = String(cur.status);
@@ -809,7 +833,10 @@ export class BusinessLayer {
     if (String(parent.blocked_code ?? "") === WORK_CORRUPT_CODE) return false;
     if (this.store.tryGet(WORK_COMPLETION_TABLE, completionRowId(parentId))) return true;
     const basis = this.completionBasisSafe(parent);
-    if (!basis.ready || basis.childIds.length === 0) return false;
+    // A rejected basis is exhausted authority: the parent may re-enter
+    // REVIEW_REQUIRED only after the canonical child set / bound attempt
+    // has advanced to a digest different from the rejected one.
+    if (!basis.ready || basis.rejected || basis.childIds.length === 0) return false;
     if (parent.requires_review === true) {
       if (String(parent.status) === "REVIEW_REQUIRED") return false;
       // Project the review gate — no WCP until a canonical ACCEPT lands.
@@ -923,8 +950,11 @@ export class BusinessLayer {
       const wid = String(w.work_item_id);
       if (String(w.status) === "REVIEW_REQUIRED") {
         const basis = this.completionBasisSafe(w);
-        if (!basis.ready) {
-          this.quarantineWorkItem(w, "ungrounded REVIEW_REQUIRED");
+        if (!basis.ready || basis.rejected) {
+          this.quarantineWorkItem(
+            w, basis.rejected
+              ? "REVIEW_REQUIRED re-entered on rejected basis"
+              : "ungrounded REVIEW_REQUIRED");
           continue;
         }
         // Crash boundary C: a canonical ACCEPT committed its evidence
@@ -984,9 +1014,13 @@ export class BusinessLayer {
       // canonical evidence — nothing is invented.
       const basis = this.completionBasisSafe(w);
       const mission = basis.mission;
-      const missionOk = mission !== null && String(mission.status) === "COMPLETED";
-      if (!basis.ready || (!missionOk && basis.childIds.length === 0)) {
-        this.quarantineWorkItem(w, "DONE without canonical completion basis");
+      const missionOk = mission !== null &&
+        proveCanonicalMissionCompletion(this.store, mission);
+      if (!basis.ready || basis.rejected ||
+          (!missionOk && basis.childIds.length === 0)) {
+        this.quarantineWorkItem(w, basis.rejected
+          ? "DONE materialization on rejected basis"
+          : "DONE without canonical completion basis");
         continue;
       }
       const fields = {
@@ -1899,15 +1933,33 @@ export class BusinessLayer {
     const ms = String(mission.status);
     // P3 §4/§7 — a COMPLETED mission alone never completes the item: the
     // completion basis must be ready (canonical child set proven too).
+    // R1 — mission.status = "COMPLETED" is a mutable claim, not proof:
+    // the fold requires the canonical mission-completion evidence chain
+    // (transition + runtime + per-task execution evidence). A forged
+    // status with no finalization evidence quarantines — it can never
+    // project REVIEW_REQUIRED/DONE, mint a WCP, or satisfy a parent.
     // Review-required items project REVIEW_REQUIRED only once the basis
-    // is fully ready — an early review gate is unreachable authority.
-    let basis: { ready: boolean; mission: Row | null; childIds: string[] } | null = null;
+    // is fully ready AND the exact basis was not already REWORK-rejected.
+    let basis: ReturnType<BusinessLayer["completionBasis"]> | null = null;
     if (ms === "COMPLETED") {
-      basis = this.completionBasisSafe(row);
+      if (!proveCanonicalMissionCompletion(this.store, mission)) {
+        this.quarantineWorkItem(row, `mission ${String(mission.mission_id)} COMPLETED without canonical runtime evidence`);
+        return this.store.get("work_item", workItemId);
+      }
+      try {
+        basis = this.completionBasis(row);
+      } catch (e) {
+        if (e instanceof IntegrityError) {
+          this.quarantineWorkItem(
+            row, `corrupt completion provenance for ${workItemId}: ${(e as Error).message}`);
+          return this.store.get("work_item", workItemId);
+        }
+        throw e;
+      }
     }
     const next: WorkItemStatus | null =
       ms === "COMPLETED"
-        ? (basis!.ready
+        ? (basis!.ready && !basis!.rejected
             ? (row.requires_review === true ? "REVIEW_REQUIRED" : "DONE")
             : null)
       : ms === "FAILED" ? "BLOCKED" :
@@ -2684,8 +2736,10 @@ export class BusinessLayer {
     // quarantines and fails both ACCEPT and REWORK without creating any
     // review-decision evidence.
     const basis = this.completionBasisSafe(row);
-    if (!basis.ready) {
-      this.quarantineWorkItem(row, `review attempted on ungrounded REVIEW_REQUIRED for ${workItemId}`);
+    if (!basis.ready || basis.rejected) {
+      this.quarantineWorkItem(row, basis.rejected
+        ? `review attempted on REWORK-rejected basis for ${workItemId}`
+        : `review attempted on ungrounded REVIEW_REQUIRED for ${workItemId}`);
       throw new IntegrityError(
         "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
         `review requires canonical completion basis for ${workItemId}`,
@@ -2721,13 +2775,38 @@ export class BusinessLayer {
           `${String(cur.status)} is not awaiting review`,
         );
       }
-      // In-txn re-proof: the basis must still hold at commit time.
+      // In-txn re-proof: the basis must still hold at commit time and
+      // must not be one a REWORK already rejected.
       const curBasis = this.completionBasisSafe(cur);
-      if (!curBasis.ready) {
+      if (!curBasis.ready || curBasis.rejected) {
         throw new IntegrityError(
           "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
           `review basis changed under ${workItemId}`,
         );
+      }
+      // R1 §2 — reviewer authority is re-proven inside the commit txn:
+      // the outside checks are fast-path only. A reviewer PAUSED or
+      // TERMINATED between preflight and commit loses the decision.
+      const curReviewer = this.store.tryGet(
+        "org_agent", input.reviewer_agent_id) as Row | null;
+      if (!curReviewer ||
+          String(curReviewer.business_id) !== String(cur.business_id)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_REVIEWER_SCOPE", "reviewer outside business");
+      }
+      if (String(curReviewer.status) !== "ACTIVE") {
+        throw new PolicyError(
+          "FAIL_CLOSED_AGENT_INACTIVE", String(curReviewer.agent_id));
+      }
+      if (String(curReviewer.agent_id) === String(cur.assignee_agent_id ?? "")) {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_SELF_REVIEW", "reviewer cannot be the assignee");
+      }
+      if (cur.reviewer_agent_id &&
+          String(cur.reviewer_agent_id) !== String(curReviewer.agent_id)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_REVIEWER_MISMATCH",
+          `named reviewer is ${String(cur.reviewer_agent_id)}`);
       }
       const mission = curBasis.mission;
       let completionDigestPinned: string | null = null;
@@ -2742,7 +2821,7 @@ export class BusinessLayer {
           bound_open_id:
             mission ? String(mission.bound_open_id ?? "") || null : null,
           child_work_item_ids: childIds,
-          reviewer_agent_id: String(reviewer.agent_id),
+          reviewer_agent_id: String(curReviewer.agent_id),
         };
         const candidateDigest = completionDigest(fields);
         // A committed ACCEPT pinning this exact completion (crash C:
@@ -2754,7 +2833,7 @@ export class BusinessLayer {
                 String(e.old_state ?? "") !== "REVIEW_REQUIRED" ||
                 String(e.new_state ?? "") !== "DONE") return false;
             const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
-            return String(md.reviewer_agent_id ?? "") === String(reviewer.agent_id) &&
+            return String(md.reviewer_agent_id ?? "") === String(curReviewer.agent_id) &&
               String(md.mission_id ?? "") === String(fields.mission_id ?? "") &&
               String(md.bound_open_id ?? "") === String(fields.bound_open_id ?? "") &&
               String(md.child_set_digest ?? "") === childSetDigest(childIds) &&
@@ -2784,12 +2863,21 @@ export class BusinessLayer {
           new_state: String(savedCur.status),
           actor: `operator:${actor}`,
           metadata: {
-            reviewer_agent_id: String(reviewer.agent_id),
+            reviewer_agent_id: String(curReviewer.agent_id),
             decision,
             mission_id: mission ? String(mission.mission_id) : null,
             bound_open_id: mission ? String(mission.bound_open_id ?? "") || null : null,
             child_set_digest: childSetDigest(curBasis.childIds),
             completion_digest: completionDigestPinned,
+            // REWORK fences exactly this basis: the item may re-enter
+            // REVIEW_REQUIRED only after completion authority advances
+            // to a different basis digest — a new bound open/binding/
+            // mission attempt, or a canonical child whose completion
+            // record itself advanced (new WCP under a new attempt).
+            rejected_child_basis_digest: decision === "REWORK"
+              ? childBasisDigest(this.store, curBasis.childIds) : null,
+            rejected_basis_digest:
+              decision === "REWORK" ? curBasis.basisDigest : null,
           },
         });
       }

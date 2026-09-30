@@ -29,6 +29,7 @@ import {
   mintBrokerCapability,
   claimLeaseDigest,
 } from "../pair/index.js";
+import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11-"));
 let counter = 0;
@@ -148,9 +149,7 @@ describe("P11 §2.B work-item lifecycle", () => {
     expect(() => biz.openWorkItem(wId(w), "op")).toThrowError(/FAIL_CLOSED_MISSION_ACTIVE/);
     // terminal → open
     const mid = (biz.listWorkItems(bId(b))[0].mission_ids as string[])[0];
-    const m = ctx.store.get("mission", mid);
-    m.status = "COMPLETED";
-    ctx.store.put("mission", mid, m, Number(m.version));
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
     biz.board(bId(b)); // sync IN_PROGRESS → DONE
     expect(() => biz.openWorkItem(wId(w), "op")).toThrowError(/FAIL_CLOSED_WORK_ITEM_TRANSITION/);
     const w2 = biz.createWorkItem({ business_id: bId(b), title: "t2", goal: "g", operator_id: "op" });

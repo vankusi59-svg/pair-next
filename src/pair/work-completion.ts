@@ -32,6 +32,8 @@ import { digest } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import type { GraphAuthorityDeps } from "./graph-authority.js";
 import type { PairEvidenceStore } from "./store.js";
+import { MISSION_STATUS_TRANSITIONS } from "./service.js";
+import { RUNTIME_TRANSITIONS } from "./mission-runtime.js";
 import {
   assertCanonicalDecomposition,
   assertCanonicalDelegation,
@@ -78,8 +80,210 @@ export function childSetDigest(childIds: string[]): string {
   return digest({ work_completion_children: [...childIds].sort() });
 }
 
+/** Identity of a completion basis — the authority a review decision was
+ *  made against (bound attempt + canonical child set). A REWORK pins
+ *  exactly this digest as rejected; only a DIFFERENT basis (a new bound
+ *  open/binding/mission attempt, or an advanced canonical child set)
+ *  can ever ground a later REVIEW_REQUIRED. */
+export function completionBasisDigest(f: {
+  mission_id: string | null;
+  bound_open_id: string | null;
+  child_basis_digest: string;
+}): string {
+  return digest({
+    work_completion_basis: 1,
+    mission_id: f.mission_id,
+    bound_open_id: f.bound_open_id,
+    child_basis_digest: f.child_basis_digest,
+  });
+}
+
+/** Child-set completion-authority digest: binds each canonical child id
+ *  to the digest of ITS current completion record (WCP). Same children
+ *  with the same WCPs → same digest (a rejected parent basis stays
+ *  rejected); a child that re-completes under a NEW bound attempt mints
+ *  a new WCP → the parent basis advances past the rejection. */
+export function childBasisDigest(
+  store: PairEvidenceStore, childIds: string[],
+): string {
+  const items = [...childIds].sort().map((cid) => {
+    const wcp = store.tryGet(WORK_COMPLETION_TABLE, completionRowId(cid));
+    return `${cid}:${wcp ? String(wcp.completion_digest) : "none"}`;
+  });
+  return digest({ work_child_completion_set: 1, items });
+}
+
+export const WORK_REWORK_EVENT = "WORK_REWORK_REQUESTED";
+
+/** The set of completion-basis identities REWORK has already rejected
+ *  for this item — derived ONLY from the immutable REWORK evidence log.
+ *  Each canonical rework event pins the rejected basis fields
+ *  (mission_id / bound_open_id / rejected_child_basis_digest) plus
+ *  rejected_basis_digest; an event whose fields do not recompute to its
+ *  pinned digest — or whose child-id set does not match its pinned
+ *  child_set_digest — is corrupt provenance and throws. */
+export function rejectedCompletionBases(
+  store: PairEvidenceStore, workItemId: string,
+): Set<string> {
+  const out = new Set<string>();
+  for (const e of store.listEvents("work_item", workItemId)) {
+    if (String(e.event_type) !== WORK_REWORK_EVENT ||
+        String(e.old_state ?? "") !== "REVIEW_REQUIRED" ||
+        String(e.new_state ?? "") !== "READY") continue;
+    const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+    const childIds =
+      [...((md.child_work_item_ids as string[] | undefined) ?? [])].sort();
+    if (String(md.child_set_digest ?? "") !== childSetDigest(childIds)) {
+      fail(`rework event for ${workItemId}: child-set pin mismatch`);
+    }
+    const basis = {
+      mission_id: md.mission_id ? String(md.mission_id) : null,
+      bound_open_id: md.bound_open_id ? String(md.bound_open_id) : null,
+      child_basis_digest: String(md.rejected_child_basis_digest ?? ""),
+    };
+    if (!basis.child_basis_digest) {
+      fail(`rework event for ${workItemId}: missing child-basis pin`);
+    }
+    const d = completionBasisDigest(basis);
+    if (String(md.rejected_basis_digest ?? "") !== d) {
+      fail(`rework event for ${workItemId}: basis pin mismatch`);
+    }
+    out.add(d);
+  }
+  return out;
+}
+
 function fail(detail: string): never {
   throw new IntegrityError("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT", detail);
+}
+
+/* Legal predecessors for a transition into COMPLETED — taken from the
+ * canonical state machines (service / mission-runtime), not redefined
+ * here. Any COMPLETED transition event claiming another predecessor is
+ * forged evidence. */
+const MISSION_COMPLETION_PREDS = new Set(
+  Object.entries(MISSION_STATUS_TRANSITIONS)
+    .filter(([, tos]) => tos.includes("COMPLETED"))
+    .map(([from]) => from),
+);
+const RUNTIME_COMPLETION_PREDS = new Set<string>(
+  (Object.keys(RUNTIME_TRANSITIONS) as Array<keyof typeof RUNTIME_TRANSITIONS>)
+    .filter((from) => RUNTIME_TRANSITIONS[from].includes("COMPLETED")),
+);
+
+/**
+ * The ONE canonical mission-success proof consumed by every Phase-3
+ * completion seam. A mutable `mission.status === "COMPLETED"` alone
+ * proves NOTHING — the proof requires the full governed-runtime
+ * evidence chain:
+ *
+ *   1. mission row status COMPLETED;
+ *   2. exactly one immutable MISSION_TRANSITION event into COMPLETED
+ *      from a legal predecessor state;
+ *   3. the canonical mission_runtime row MRT_<mid> in state COMPLETED
+ *      (no mission/runtime contradiction);
+ *   4. exactly one immutable MISSION_RUNTIME_TRANSITION into COMPLETED
+ *      from a legal predecessor, pinning mission_id and the governed
+ *      finalization reason "all_tasks_completed";
+ *   5. a committed current plan revision whose tasks ALL reached
+ *      COMPLETED — each with an immutable TASK_COMPLETED event that
+ *      correlates to a COMPLETED executor_execution carrying a
+ *      COMPLETED result (the existing execution/result-validation
+ *      authority). The governed runtime only completes a mission when
+ *      every current-plan task is terminal-success — the validator
+ *      enforces exactly that.
+ *
+ * A direct `mission.status` mutation emits no transition events, no
+ * runtime row, no task evidence — it fails closed.
+ */
+export function assertCanonicalMissionCompletion(
+  store: PairEvidenceStore, mission: Row,
+): void {
+  const mid = String(mission.mission_id ?? "");
+  if (!mid) fail("mission: missing mission_id");
+  if (String(mission.status) !== "COMPLETED") {
+    fail(`mission ${mid}: status ${String(mission.status)}`);
+  }
+  // (2) mission-level transition evidence.
+  const missionTransitions = store.listEvents("mission", mid).filter((e) =>
+    String(e.event_type ?? "") === "MISSION_TRANSITION" &&
+    String(e.new_state ?? "") === "COMPLETED");
+  if (missionTransitions.length !== 1) {
+    fail(`mission ${mid}: ${missionTransitions.length} COMPLETED transition events`);
+  }
+  if (!MISSION_COMPLETION_PREDS.has(String(missionTransitions[0]!.old_state ?? ""))) {
+    fail(`mission ${mid}: COMPLETED from ${String(missionTransitions[0]!.old_state)}`);
+  }
+  // (3) canonical runtime row — no mission/runtime contradiction.
+  const rtId = `MRT_${mid}`;
+  const rt = store.tryGet("mission_runtime", rtId) as Row | null;
+  if (!rt) fail(`mission ${mid}: mission_runtime row missing`);
+  if (String(rt.state) !== "COMPLETED") {
+    fail(`mission ${mid}: runtime state ${String(rt.state)}`);
+  }
+  // (4) runtime transition/finalization evidence.
+  const rtTransitions = store.listEvents("mission_runtime", rtId).filter((e) =>
+    String(e.event_type ?? "") === "MISSION_RUNTIME_TRANSITION" &&
+    String(e.new_state ?? "") === "COMPLETED");
+  if (rtTransitions.length !== 1) {
+    fail(`mission ${mid}: ${rtTransitions.length} runtime COMPLETED events`);
+  }
+  const rtEv = rtTransitions[0]!;
+  const rtMd = (rtEv.metadata as Record<string, unknown> | undefined) ?? {};
+  if (!RUNTIME_COMPLETION_PREDS.has(String(rtEv.old_state ?? ""))) {
+    fail(`mission ${mid}: runtime COMPLETED from ${String(rtEv.old_state)}`);
+  }
+  if (String(rtMd.mission_id ?? "") !== mid) {
+    fail(`mission ${mid}: runtime event mission mismatch`);
+  }
+  if (String(rtMd.reason ?? "") !== "all_tasks_completed") {
+    fail(`mission ${mid}: runtime completion reason ${String(rtMd.reason)}`);
+  }
+  // (5) every current-plan task terminal-success under the execution
+  //    authority — executor_execution COMPLETED + correlated immutable
+  //    TASK_COMPLETED event. The governed path can never complete a
+  //    mission on an empty plan, so absence of tasks is not success.
+  const revisions = store.planRevisions(mid);
+  if (!revisions.length) fail(`mission ${mid}: no plan revisions`);
+  const planId = String(revisions[revisions.length - 1]!.plan_id ?? "");
+  const tasks = store.list("task").filter((t) =>
+    String(t.mission_id ?? "") === mid && String(t.plan_id ?? "") === planId);
+  if (!tasks.length) fail(`mission ${mid}: current plan has no tasks`);
+  const executions = store.list("executor_execution");
+  for (const t of tasks) {
+    const tid = String(t.task_id ?? "");
+    if (String(t.status ?? "") !== "COMPLETED") {
+      fail(`mission ${mid}: task ${tid} status ${String(t.status)}`);
+    }
+    const taskEvidence = store.listEvents("task", tid).filter((e) =>
+      String(e.event_type ?? "") === "TASK_COMPLETED" &&
+      String(e.new_state ?? "") === "COMPLETED");
+    const proven = taskEvidence.some((e) => {
+      const corr = String(e.correlation_id ?? "");
+      if (!corr) return false;
+      return executions.some((x) =>
+        String(x.mission_id ?? "") === mid &&
+        String(x.task_id ?? "") === tid &&
+        String(x.execution_state ?? "") === "COMPLETED" &&
+        String(x.correlation_id ?? "") === corr &&
+        String((x.result as Record<string, unknown> | undefined)?.status ?? "") === "COMPLETED");
+    });
+    if (!proven) {
+      fail(`mission ${mid}: task ${tid} lacks execution-cited completion`);
+    }
+  }
+}
+
+/** Non-throwing form of the canonical mission-success proof. */
+export function proveCanonicalMissionCompletion(
+  store: PairEvidenceStore, mission: Row,
+): boolean {
+  try {
+    assertCanonicalMissionCompletion(store, mission);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -141,7 +345,9 @@ function proveBoundMissionCompleted(
   const mids = (item.mission_ids as string[] | undefined) ?? [];
   if (mids[mids.length - 1] !== missionId) return false;
   const m = deps.store.tryGet("mission", missionId) as Row | null;
-  if (!m || String(m.status) !== "COMPLETED") return false;
+  // Status text alone is not authority — R1: the mission must carry the
+  // full canonical runtime-completion evidence chain.
+  if (!m || !proveCanonicalMissionCompletion(deps.store, m)) return false;
   if (String(m.bound_open_id ?? "") !== boundOpenId) return false;
   const binding = deps.store.tryGet("work_open_binding", boundOpenId) as Row | null;
   if (!binding) return false;

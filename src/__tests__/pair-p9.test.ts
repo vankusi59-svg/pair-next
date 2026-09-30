@@ -49,6 +49,7 @@ import {
   claimLeaseDigest,
   validatePlanProposal,
 } from "../pair/index.js";
+import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 import type { DevinFetch } from "../pair/devin-executor.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p9-"));
@@ -1843,9 +1844,7 @@ describe("business layer (one-person-business skeleton)", () => {
     const w = biz.createWorkItem({ business_id: String(b.business_id), title: "t", goal: "g", operator_id: "op" });
     biz.openWorkItem(String(w.work_item_id), "op");
     const mid = (biz.listWorkItems(String(b.business_id))[0].mission_ids as string[])[0];
-    const mission = ctx.store.get("mission", mid);
-    mission.status = "COMPLETED";
-    ctx.store.put("mission", mid, mission, Number(mission.version));
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
     const cols = biz.board(String(b.business_id));
     expect(cols.DONE).toHaveLength(1);
     expect(cols.IN_PROGRESS).toHaveLength(0);
@@ -1977,8 +1976,8 @@ describe("business layer (one-person-business skeleton)", () => {
     const w1 = biz.createWorkItem({ business_id: bid, title: "post 1", goal: "g", assignee_agent_id: aid, operator_id: "op" });
     biz.openWorkItem(String(w1.work_item_id), "op");
     const mid = (biz.listWorkItems(bid)[0].mission_ids as string[])[0];
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
     const mission = ctx.store.get("mission", mid);
-    mission.status = "COMPLETED";
     mission.result = "posted gold analysis, 120 views";
     ctx.store.put("mission", mid, mission, Number(mission.version));
     biz.board(bid); // triggers sync → context note

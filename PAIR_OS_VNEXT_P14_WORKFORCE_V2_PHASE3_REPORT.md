@@ -35,8 +35,26 @@ P14 WFV2 Phase 2 — user-merged).
 - `src/pair/mission-control-server.ts` — `POST /api/work-items/:id/review`
   and `GET /api/work-items/:id/completion`.
 - `src/pair/index.ts` — export work-completion module.
-- `src/__tests__/pair-p14-wfv2-p3.test.ts` — NEW, 28 tests.
+- `src/__tests__/pair-p14-wfv2-p3.test.ts` — NEW, 42 tests (28 + 14 R1).
 - `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE3_REPORT.md`, `CURRENT_STATE.md`.
+
+**R1 (remediation 1, head after audit BLOCKED) additionally changed:**
+- `src/pair/work-completion.ts` — `assertCanonicalMissionCompletion` /
+  `proveCanonicalMissionCompletion` (the ONE canonical mission-success
+  proof), `completionBasisDigest`, `childBasisDigest`,
+  `rejectedCompletionBases`, `WORK_REWORK_EVENT`.
+- `src/pair/business.ts` — canonical-proof wiring on every completion
+  seam; reviewer re-proof INSIDE the ACCEPT/REWORK txn; REWORK pins the
+  rejected basis identity; `syncWorkItem` quarantines corrupt completion
+  provenance.
+- `src/pair/mission-runtime.ts` — `RUNTIME_TRANSITIONS` exported (the
+  validator derives legal predecessors from it, never redefines them).
+- `src/__tests__/canonical-mission-completion.ts` — NEW shared test seam
+  driving the real governed evidence chain (commitPlan → transitions →
+  mission_runtime → per-task executor_execution + TASK_COMPLETED).
+- `src/__tests__/pair-p14-foundation.test.ts`, `pair-p9.test.ts`,
+  `pair-p11.test.ts` — happy-path completion converted to the canonical
+  helper; deliberate forgeries left as raw mutations.
 
 ## 6. Canonical completion design (§4)
 `work_completion` row `WCP_<work_item_id>` — deterministic id, COMMITTED,
@@ -176,7 +194,7 @@ replay all detectable — each fails closed via
   MUST-NOTs hold).
 
 ## 14. Test results
-`src/__tests__/pair-p14-wfv2-p3.test.ts`: **28/28 pass** (27 mandated
+`src/__tests__/pair-p14-wfv2-p3.test.ts`: **42/42 pass** (27 mandated
 names covered: CHILD-COMPLETION-REQUIRES-CANONICAL-BINDING,
 STATUS-ONLY-COMPLETION-REJECTED, WRONG-MISSION-BINDING-REJECTED,
 COMPLETION-TAMPER-REHASH-FAILS, REVIEW-REQUIRED-NOT-AUTO-ACCEPTED,
@@ -197,21 +215,38 @@ GRAPH-ASSIGNEE-IMMUTABILITY-PRESERVED, CORRUPT-PROVENANCE-FAILS-CLOSED —
 plus FINALIZE-VS-RECONCILE, DEP-OPEN-VS-FINALIZE, TWO-PARENT-CASCADES,
 COMPLETION-VS-CANCELLATION races).
 
+**R1 adds 14 mandated cases** — all `P14-P3-R1-*` names present:
+MISSION-STATUS-ONLY-COMPLETION-REJECTED,
+MISSION-COMPLETION-TRANSITION-EVIDENCE-REQUIRED,
+MISSION-RUNTIME-COMPLETION-EVIDENCE-REQUIRED,
+MISSION-RUNTIME-ROW-TAMPER-FAILS, MISSION-CANONICAL-SUCCESS-PROVES-WCP,
+FORGED-MISSION-CANNOT-SATISFY-DEPENDENCY,
+FORGED-MISSION-CANNOT-COMPLETE-PARENT, ACCEPT-VS-REVIEWER-PAUSE-RACE,
+ACCEPT-VS-REVIEWER-TERMINATE-RACE (genuine worker_threads on the same
+DB), PARENT-REWORK-SAME-BASIS-NOT-REVIEWABLE,
+LEAF-REWORK-OLD-MISSION-NOT-REUSED, REWORK-BASIS-PIN-TAMPER-FAILS,
+REWORK-RESTART-PRESERVES-BASIS-FENCE,
+ACCEPT-REWORK-RACE-PRESERVES-BASIS-FENCE.
+
 ## 15. Full regression results
 - P14-P2 suite: 55/55 · P14 WFV2 Phase1: 73/73 · P14 Foundation V2:
   35/35 · Runtime hardening: 11/11 · P13: 67/67 · P12: 71/71 ·
   P11+remediations: 103/103 · P10: 31/31 · P9: 79/79 · P6: 36/36.
-- Node22 full suite: 2125 pass + 2 fail — both are the pre-existing P5
+- Node22 full suite: 2139 pass + 2 fail — both are the pre-existing P5
   environment-gap failures (codex executor availability), identical to
   every prior phase.
-- Node20 full suite: 2127 pass / 0 fail.
+- Node20 full suite: 2141 pass / 0 fail.
 - `tsc --noEmit`: clean. `pnpm build`: PASS. `pnpm audit
   --audit-level=high`: 0 high (1 low + 8 moderate, pre-existing).
   `verifyIntegrity` exercised inside the suites.
 
 ## 16. Fresh E2E evidence
-`PAIR_MC_DIR=<fresh>` real server, real HTTP API, two restarts.
-`e2e-p14-p3.mjs` — 24/24 checks:
+`PAIR_MC_DIR=<fresh>` real server (rebuilt `dist/`), real HTTP API,
+three restarts. `e2e-p14-p3.mjs` — 30/30 checks. R1: mission success is
+produced ONLY through the canonical runtime/finalization evidence chain
+(commitPlan revision → legal mission transitions → mission_runtime
+CREATED→READY→RUNNING→COMPLETED "all_tasks_completed" → per-task
+COMPLETED executor_execution + correlated TASK_COMPLETED).
 - A–D: business + 3 agents; parent decomposed into c1/c2(review)/c3 via
   canonical WDEC; dep item gated `FAIL_CLOSED_WORK_DEPENDENCY_UNMET`
   before c1.
@@ -227,8 +262,17 @@ COMPLETION-VS-CANCELLATION races).
 - N: every completed item has exactly 1 anchor + 1 WCP + 1 mission + 1
   binding; the container parent has a WCP with 0 missions/0 bindings.
 - O: claim+heartbeat+HANDOFF_REQUEST on the IN_PROGRESS dep item prove
-  nothing (no WCP, still IN_PROGRESS); a second restart produces zero
-  duplicate evidence.
+  nothing (no WCP, still IN_PROGRESS).
+- R1-b: reviewer `/pause` → ACCEPT 409 `FAIL_CLOSED_AGENT_INACTIVE`, no
+  WCP, item stays REVIEW_REQUIRED; `/resume` → ACCEPT canonical.
+- R1-c: review-required container REWORK → READY; re-evaluation and
+  restart never re-enter REVIEW_REQUIRED on the unchanged child basis.
+- R1-a: bare `mission.status="COMPLETED"` forgery on the bound mission
+  (server down, runtime row stripped) → restart quarantines the item
+  `TERMINAL_PROVENANCE_CORRUPT`, no WCP, dependent open 409
+  `FAIL_CLOSED_WORK_DEPENDENCY_UNMET`.
+- O(2): second restart preserves all three protections; zero duplicate
+  missions/WCP/ACCEPT/completion anchors.
 
 ## 17. Known limitations
 - Completion cascade is driven by mutation seams + reconcile; there is
@@ -248,4 +292,57 @@ No P15/P16/Phase-4 code was created or modified; no strategic-brain or
 CEO agent surfaces exist. Scope stayed inside the P14 WFV2 Phase-3
 lifecycle mandate.
 
-Classification: **P14_WORKFORCE_V2_PHASE3_PENDING_INDEPENDENT_AUDIT**
+## 20. R1 remediation design
+
+**Canonical mission-completion proof.** `assertCanonicalMissionCompletion`
+(`src/pair/work-completion.ts`) is the ONE proof consumed by every
+Phase-3 completion seam (`proveBoundMissionCompleted`, `completionBasis`
+via `proveCanonicalMissionCompletion`, `syncWorkItem`, review,
+finalize, evaluateParentCompletion, reconcileWorkLifecycle,
+`proveWorkItemDone` → dependency satisfaction). It proves, in order:
+(1) `mission.status === "COMPLETED"`; (2) exactly-one immutable
+`MISSION_TRANSITION`→COMPLETED whose `old_state` is a legal predecessor
+in `MISSION_STATUS_TRANSITIONS` (RUNNING); (3) the `MRT_<mid>` row
+exists AND `state === "COMPLETED"` (no mission/runtime contradiction);
+(4) exactly-one `MISSION_RUNTIME_TRANSITION`→COMPLETED with a legal
+`RUNTIME_TRANSITIONS` predecessor AND `metadata.mission_id === mid` AND
+`metadata.reason === "all_tasks_completed"` — the unique marker the
+governed maybeComplete path emits; (5) ≥1 committed plan revision, the
+current plan has ≥1 task, and EVERY task is COMPLETED with an immutable
+`TASK_COMPLETED` event whose `correlation_id` matches a COMPLETED
+`executor_execution` for that mission+task (result-validation
+authority). A bare `mission.status` write satisfies none of (2)–(5) —
+forgery fails closed at every seam (no REVIEW_REQUIRED, DONE, WCP,
+dependency satisfaction, or parent fold).
+
+**Reviewer in-transaction authority.** `reviewWorkItem` keeps the outer
+reviewer check only as fast-path error reporting; inside the same
+`store.immediate()` that commits the decision it re-reads the work item
+(REVIEW_REQUIRED still, transition legal), re-computes the completion
+basis (ready AND not rejected), then re-reads the CURRENT org_agent row
+and re-proves: exists, same business, ACTIVE (racing PAUSE/TERMINATE
+loses), not the current canonical assignee, equal to the pinned named
+reviewer. Exactly one decision event commits.
+
+**REWORK basis fencing.** Basis identity = `completionBasisDigest` over
+{bound mission_id, bound_open_id, `childBasisDigest`} where
+`childBasisDigest` binds each canonical child id to its current WCP
+`completion_digest`. A REWORK event pins `mission_id` +
+`bound_open_id` + `child_work_item_ids` + `child_set_digest` +
+`rejected_child_basis_digest` + `rejected_basis_digest`;
+`rejectedCompletionBases` recomputes the digest from the pinned fields
+(tampering any field → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`) and every
+readiness seam (`syncWorkItem`, `finalizeWorkItemInTxn`,
+`evaluateParentCompletion`, `reconcileWorkLifecycle`, `reviewWorkItem`)
+requires `!basis.rejected`. Leaf: a new open/binding/mission mints a new
+basis → legitimate re-entry. Container: the basis advances only when a
+child's own completion authority advances (new WCP under a new attempt)
+or the canonical child set changes — unchanged children can never
+re-ground REVIEW_REQUIRED. No graph revisioning, no evidence deletion.
+
+**Helper migration.** `canonicallyCompleteMission` constructs the exact
+governed evidence chain through canonical writers; every happy-path
+completion in P3/P14F/P9/P11 uses it — raw `status` writes remain only
+inside deliberate forgery tests.
+
+Classification: **P14_WORKFORCE_V2_PHASE3_R1_PENDING_FINAL_AUDIT**

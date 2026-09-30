@@ -423,10 +423,26 @@ authority derives only from canonical evidence.
   never fabricates evidence.
 - Endpoints: `POST /api/work-items/:id/review`,
   `GET /api/work-items/:id/completion`.
+- **R1 remediation** (after independent audit BLOCKED):
+  `assertCanonicalMissionCompletion` is the ONE mission-success proof
+  consumed by every completion seam — mission COMPLETED + legal
+  MISSION_TRANSITION event + `MRT_<mid>` COMPLETED + pinned
+  MISSION_RUNTIME_TRANSITION ("all_tasks_completed") + current-plan
+  tasks all COMPLETED with execution-correlated TASK_COMPLETED.
+  Bare `mission.status` forgery fails closed everywhere.
+  `reviewWorkItem` re-reads and re-proves the CURRENT reviewer inside
+  the commit txn (racing pause/terminate loses).
+  REWORK pins the rejected basis identity
+  (`completionBasisDigest` = bound mission + bound_open + per-child WCP
+  digest set); the basis must advance before REVIEW_REQUIRED can
+  re-enter — unchanged children can never re-ground review.
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE3_REPORT.md`; suite
-  `pair-p14-wfv2-p3.test.ts` (28 — 27 mandated names + race matrix)
-  + fresh-dir E2E 24/24 (real server, real restart finalization).
-  Classification: **`P14_WORKFORCE_V2_PHASE3_PENDING_INDEPENDENT_AUDIT`**.
+  `pair-p14-wfv2-p3.test.ts` (42 — 27 base names + 14 `P14-P3-R1-*`
+  incl. genuine worker_thread races) + fresh-dir E2E 30/30 (real
+  server, forge/quarantine, reviewer-pause race, REWORK fence,
+  3 restarts, zero dup anchors).
+  Classification:
+  **`P14_WORKFORCE_V2_PHASE3_R1_PENDING_FINAL_AUDIT`**.
 
 ## Not yet
 
