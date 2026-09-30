@@ -70,7 +70,7 @@ const TERMINAL_RUNTIME = new Set<MissionRuntimeState>([
 export const TERMINAL_EXECUTION = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 const SETTLED_TASK = new Set(["COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "SUPERSEDED"]);
 
-const RUNTIME_TRANSITIONS: Record<MissionRuntimeState, MissionRuntimeState[]> = {
+export const RUNTIME_TRANSITIONS: Record<MissionRuntimeState, MissionRuntimeState[]> = {
   CREATED: ["PLANNING", "READY", "CANCELLED", "ABORTED"],
   PLANNING: ["READY", "FAILED", "WAITING_APPROVAL", "CANCELLED", "ABORTED"],
   READY: ["RUNNING", "PAUSED", "CANCELLED", "ABORTED"],

@@ -358,6 +358,99 @@ autonomous reassignment / scheduling / parent cascade / CEO / P15/P16.
   re-derived from the mutable parent assignee. Validators bind ceiling
   identity to the canonical parent assignee.
 
+## P14 Workforce V2 Phase 3 candidate state (on branch, pending audit)
+
+**Completion lifecycle on `devin/1790756068-p14-wfv2-p3`** (base
+`1add96d` = merged Phase 2) — canonical completion proof + review/
+acceptance + restart-safe finalization. Invariant: no work item becomes
+canonically complete because a mutable status says DONE — completion
+authority derives only from canonical evidence.
+
+- **`work_completion` (`WCP_<work_item_id>`)** — deterministic id,
+  COMMITTED, written only inside the same `immediate()` txn that
+  projects the item DONE; pins `mission_id + bound_open_id +
+  child_work_item_ids + reviewer_agent_id` under `completion_digest`;
+  exactly-one `WORK_ITEM_COMPLETED` event anchors every pin; the
+  canonical validator re-derives digests, proves the bound-mission
+  chain (full `validateWorkOpenBinding` PROVENANCE), recurses the
+  canonical child set, and requires a pinning `WORK_REVIEW_ACCEPTED`
+  for review-gated completions.
+- **Canonical child set** derives from COMMITTED+validated WDEC ∪ WDEL
+  — never mutable mirrors. Parents aggregate only over that set;
+  mixed parents need their own bound mission too.
+- **Review seam**: `requires_review` items fold to REVIEW_REQUIRED
+  (no WCP) until a canonical ACCEPT; ACCEPT/REWORK race collapses to
+  exactly one outcome; replayed ACCEPT is idempotent (no second event);
+  REWORK never reuses the old completion proof.
+- **Dependency satisfaction** consumes `proveWorkItemDone` — only
+  canonical completion satisfies an edge; status text, heartbeats,
+  claim release, message ACKs, review requests satisfy nothing.
+- **Restart-safe**: `reconcileWorkLifecycle` (inside
+  `reconcileWorkGraph`, runs at boot) resumes interrupted finalization
+  at every crash boundary — folds terminal bound missions, resumes the
+  parent cascade, materializes ACCEPT-pinned projections exactly once,
+  quarantines ungrounded REVIEW_REQUIRED/DONE and malformed WCPs, and
+  never fabricates evidence.
+- Endpoints: `POST /api/work-items/:id/review`,
+  `GET /api/work-items/:id/completion`.
+- **R1 remediation** (after independent audit BLOCKED):
+  `assertCanonicalMissionCompletion` is the ONE mission-success proof
+  consumed by every completion seam — mission COMPLETED + legal
+  MISSION_TRANSITION event + `MRT_<mid>` COMPLETED + pinned
+  MISSION_RUNTIME_TRANSITION ("all_tasks_completed") + current-plan
+  tasks all COMPLETED with execution-correlated TASK_COMPLETED.
+  Bare `mission.status` forgery fails closed everywhere.
+  `reviewWorkItem` re-reads and re-proves the CURRENT reviewer inside
+  the commit txn (racing pause/terminate loses).
+  REWORK pins the rejected basis identity
+  (`completionBasisDigest` = bound mission + bound_open + per-child WCP
+  digest set); the basis must advance before REVIEW_REQUIRED can
+  re-enter — unchanged children can never re-ground review.
+- **R2 remediation** (after second independent audit BLOCKED):
+  mission success now proves the governed result-validation chain per
+  task — `executor_execution` (mission+task+plan revision+correlation,
+  COMPLETED result) bound to a `governed_task`
+  (`DISPATCH_AUTHORIZED`, binds mission/task/plan/executor/correlation),
+  `executor_dispatch_intent` EXECUTION_PERSISTED→that execution,
+  `EXECUTION_DISPATCHED` + `GOVERNED_TASK_VALIDATED` events, a canonical
+  `execution_validation` `status: PASS` on that exact execution, and a
+  `RESULT_VALIDATED` event pinning `validation_id` + correlation.
+  Missing/FAIL validation or a foreign governed task fails closed.
+  `WORK_REWORK_REQUESTED` now persists the canonical sorted
+  `child_work_item_ids` — the event self-validates (sorted shape +
+  digest recompute); malformed REWORK evidence fails closed, never
+  silently swallowed. New canonical children legitimately advance a
+  container's basis past a rejected pin (DONE is terminal —
+  `delegateWorkItem` under a new completion authority unfences
+  REVIEW_REQUIRED; same-basis stays fenced).
+- **R3 remediation**: the task authority is the canonical plan
+  manifest — `plan.task_ids` on the exact active `plan` entity
+  (hash-verified `mission_plan_revisions` → plan row exists, claims
+  this mission, PLANNED; mission.plan_id/plan_revision pins; exactly-one
+  `MISSION_PLAN_COMMITTED` anchor pinning plan_id+revision), never a
+  task-table scan. Live tasks claiming mission+plan must equal the
+  declared set exactly: omitted declared task, drifted declared task,
+  injected undeclared task, missing/foreign plan row, forged
+  commit-anchor metadata — all fail closed.
+- **R4 remediation**: the complete task manifest is now pinned
+  immutably inside `MISSION_PLAN_COMMITTED`
+  (`metadata.task_ids` ordered + `plan_manifest_digest` recomputed on
+  every anchor by the validator) — live `plan.task_ids` must equal the
+  committed set exactly; shrink/reorder/expand/digest-tamper fail
+  closed. Revision history is omission-safe: hash-verified
+  `mission_plan_revisions` in exact ordered bijection with commit
+  anchors, contiguous revisions, active = highest committed — a deleted
+  latest row can never roll history back.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE3_REPORT.md`; suite
+  `pair-p14-wfv2-p3.test.ts` (68 total — R1+R2+R3 suites preserved +
+  9 `P14-P3-R4-*`; genuine worker_thread races)
+  + fresh-dir E2E 39/39 (real server: forge/missing+FAIL validation/
+  omitted task/shrunk manifest/deleted revision rollback → quarantine;
+  intact manifest completes; reviewer race; fence/unfence; 3 restarts;
+  zero dup evidence).
+  Classification:
+  **`P14_WORKFORCE_V2_PHASE3_R4_PENDING_FINAL_AUDIT`**.
+
 ## Not yet
 
 - Autonomous heartbeat/inbox/reassignment, parent completion cascade,

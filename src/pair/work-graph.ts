@@ -63,6 +63,10 @@ import {
   claimLeaseRowId,
   leaseLiveExpired,
 } from "./work-coordination.js";
+import {
+  WORK_COMPLETION_TABLE,
+  assertCanonicalWorkCompletion,
+} from "./work-completion.js";
 
 // R1+R2: deterministic helpers + canonical validators live in
 // graph-authority.ts (imported by business.ts too) — re-exported here so
@@ -1154,6 +1158,12 @@ export class WorkforceService {
         }
       }
     }
+    // P3 §10/§15 — lifecycle reconcile: fold authorized terminal
+    // missions, resume interrupted cascades, materialize only provable
+    // completion projections, quarantine fabricated DONE/REVIEW states.
+    // All writes re-derive their basis inside immediate() txns and are
+    // WCP-deduped — repeated reconcile converges, never duplicates.
+    this.business.reconcileWorkLifecycle();
     return { quarantined: [...quarantined] };
   }
 }
