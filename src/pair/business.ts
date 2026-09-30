@@ -66,6 +66,18 @@ import {
   safeLeaseView,
   workforceMessageDigest,
 } from "./work-coordination.js";
+import {
+  WORK_COMPLETED_EVENT,
+  WORK_COMPLETION_TABLE,
+  WORK_REVIEW_ACCEPTED_EVENT,
+  assertCanonicalWorkCompletion,
+  canonicalChildIdsOf,
+  canonicalParentIdsOf,
+  childSetDigest,
+  completionDigest,
+  completionRowId,
+  proveWorkItemComplete,
+} from "./work-completion.js";
 
 export const WORK_ITEM_STATUSES = [
   "BACKLOG",
@@ -93,15 +105,18 @@ export type BudgetScope = (typeof BUDGET_SCOPES)[number];
  * from BLOCKED/READY/BACKLOG → IN_PROGRESS).
  */
 const WORK_ITEM_TRANSITIONS: Record<WorkItemStatus, readonly WorkItemStatus[]> = {
-  BACKLOG: ["READY", "IN_PROGRESS", "BLOCKED", "CANCELLED"],
+  // DONE/REVIEW_REQUIRED on the pre-execution states are reachable ONLY
+  // through the Phase-3 finalize seam (canonical child-set aggregation),
+  // never through any caller-facing transition.
+  BACKLOG: ["READY", "IN_PROGRESS", "BLOCKED", "CANCELLED", "DONE", "REVIEW_REQUIRED"],
   // READY→READY is the reassign/refresh path; every other self-transition
   // (e.g. IN_PROGRESS→IN_PROGRESS, a duplicate open) is illegal.
-  READY: ["READY", "IN_PROGRESS", "BLOCKED", "BACKLOG", "CANCELLED"],
+  READY: ["READY", "IN_PROGRESS", "BLOCKED", "BACKLOG", "CANCELLED", "DONE", "REVIEW_REQUIRED"],
   IN_PROGRESS: ["BLOCKED", "DONE", "CANCELLED", "REVIEW_REQUIRED"],
   // REVIEW_REQUIRED → DONE only via reviewWorkItem ACCEPT, → READY via
   // REWORK; BLOCKED/CANCELLED remain available as safety operations.
   REVIEW_REQUIRED: ["DONE", "READY", "BLOCKED", "CANCELLED"],
-  BLOCKED: ["READY", "IN_PROGRESS", "CANCELLED"],
+  BLOCKED: ["READY", "IN_PROGRESS", "CANCELLED", "DONE", "REVIEW_REQUIRED"],
   DONE: [],
   CANCELLED: [],
 };
@@ -554,31 +569,475 @@ export class BusinessLayer {
     return m && this.missionBoundToWorkItem(row, m) ? m : null;
   }
 
-  /** Exactly one provenance-valid WORK_REVIEW_ACCEPTED for this row. */
-  proveReviewAcceptance(row: Row): boolean {
-    const evs = this.store.listEvents().filter((e) =>
-      e.event_type === "WORK_REVIEW_ACCEPTED" &&
-      String(e.entity_id) === String(row.work_item_id));
-    if (evs.length !== 1) return false;
-    const e = evs[0];
-    const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
-    if (String(e.old_state ?? "") !== "REVIEW_REQUIRED") return false;
-    if (String(e.new_state ?? "") !== "DONE") return false;
-    const rev = String(md.reviewer_agent_id ?? "");
-    if (!rev) return false;
-    const revRow = this.store.tryGet("org_agent", rev);
-    if (!revRow || String(revRow.business_id) !== String(row.business_id)) return false;
-    if (rev === String(row.assignee_agent_id ?? "")) return false;
-    if (row.reviewer_agent_id && rev !== String(row.reviewer_agent_id)) return false;
-    return true;
+  /** Is this row's DONE canonically proven? Status alone NEVER counts —
+   *  P3: proof requires a fully validated `work_completion` record
+   *  (bound COMPLETED mission pin and/or canonical child-set pin,
+   *  review evidence pin, immutable anchor event). A forged DONE, a
+   *  tampered digest, a missing anchor, a foreign child — all fail. */
+  proveWorkItemDone(row: Row): boolean {
+    return proveWorkItemComplete(this.graphAuthorityDeps(), row);
   }
 
-  /** Is this row's DONE canonically proven? Status alone never counts. */
-  proveWorkItemDone(row: Row): boolean {
-    if (String(row.status) !== "DONE") return false;
-    const m = this.boundMissionForWorkItem(row);
-    if (!m || String(m.status) !== "COMPLETED") return false;
-    return row.requires_review === true ? this.proveReviewAcceptance(row) : true;
+  /** Read-only completion view for API seams — the row itself plus its
+   *  canonical completion record when it exists (validated or not — the
+   *  proof bit is always recomputed, never trusted from state). */
+  workCompletionFor(workItemId: string): {
+    work_item: Row;
+    canonically_complete: boolean;
+    completion: Row | null;
+  } {
+    const w = this.store.get("work_item", workItemId);
+    return {
+      work_item: w,
+      canonically_complete: this.proveWorkItemDone(w),
+      completion: this.store.tryGet(
+        WORK_COMPLETION_TABLE, completionRowId(workItemId)) as Row | null,
+    };
+  }
+
+  // ---------- P14 Workforce V2 Phase 3 — completion lifecycle ----------
+
+  /**
+   * Completion basis for `row`: which canonical requirements are met.
+   *  - missionDone: null = no bound mission (container); true = bound
+   *    mission COMPLETED; false = pending/failed/unbound.
+   *  - childIds: the canonical child set (WDEC ∪ WDEL), sorted; empty
+   *    for a leaf.
+   *  - childrenDone: every canonical child has a valid WCP.
+   *  - ready: leaf → missionDone; container → childrenDone && children
+   *    exist; mixed → missionDone && childrenDone.
+   * Throws (corrupt canonical child rows) — callers decide quarantine.
+   */
+  private completionBasis(row: Row): {
+    ready: boolean;
+    mission: Row | null;
+    childIds: string[];
+  } {
+    const deps = this.graphAuthorityDeps();
+    const wid = String(row.work_item_id);
+    const childIds = canonicalChildIdsOf(deps, wid);
+    let childrenDone = true;
+    for (const cid of childIds) {
+      const child = this.store.tryGet("work_item", cid) as Row | null;
+      if (!child || !proveWorkItemComplete(deps, child)) childrenDone = false;
+    }
+    const mission = this.boundMissionForWorkItem(row);
+    const missionDone = mission === null
+      ? null : String(mission.status) === "COMPLETED";
+    const ready = childrenDone &&
+      (missionDone === true || (missionDone === null && childIds.length > 0));
+    return { ready, mission, childIds };
+  }
+
+  /** Basis that never throws — corrupt child rows evaluate unready. */
+  private completionBasisSafe(row: Row): ReturnType<BusinessLayer["completionBasis"]> {
+    try {
+      return this.completionBasis(row);
+    } catch {
+      return { ready: false, mission: null, childIds: [] };
+    }
+  }
+
+  /**
+   * Write the canonical `work_completion` record + its immutable
+   * `WORK_ITEM_COMPLETED` anchor inside the caller's immediate() txn.
+   * Idempotent: an existing WCP must pass the full validator to be
+   * adopted; a conflicting row fails closed.
+   */
+  private writeCompletionRecord(
+    item: Row,
+    pins: {
+      mission_id: string | null;
+      bound_open_id: string | null;
+      child_work_item_ids: string[];
+      reviewer_agent_id: string | null;
+    },
+    actor: string,
+  ): Row {
+    const wid = String(item.work_item_id);
+    const cid = completionRowId(wid);
+    const existing = this.store.tryGet(WORK_COMPLETION_TABLE, cid) as Row | null;
+    if (existing) {
+      // Replay/adopt only when the existing record is fully canonical.
+      assertCanonicalWorkCompletion(this.graphAuthorityDeps(), existing);
+      return existing;
+    }
+    const childIds = [...pins.child_work_item_ids].sort();
+    const fields = {
+      completion_id: cid,
+      work_item_id: wid,
+      business_id: String(item.business_id),
+      mission_id: pins.mission_id,
+      bound_open_id: pins.bound_open_id,
+      child_work_item_ids: childIds,
+      reviewer_agent_id: pins.reviewer_agent_id,
+    };
+    const body = {
+      ...fields,
+      project_id: String(this.getBusiness(String(item.business_id)).project_id),
+      child_set_digest: childSetDigest(childIds),
+      completion_digest: completionDigest(fields),
+      state: "COMMITTED",
+      created_by: actor,
+      created_at: utcnow(),
+      version: 0,
+    } as unknown as Row;
+    this.store.put(WORK_COMPLETION_TABLE, cid, body, 0);
+    // Immutable anchor — pins every completion authority field so a
+    // later row mutation / digest rehash / forged replay still fails.
+    // The event log is append-only: a re-materialized row (restart /
+    // reconcile after row loss) must adopt an identical surviving
+    // anchor rather than emit a second one — the canonical validator
+    // requires exactly one.
+    const anchors = this.store.listEvents(WORK_COMPLETION_TABLE, cid)
+      .filter((e) => String(e.event_type) === WORK_COMPLETED_EVENT);
+    let anchored = false;
+    for (const e of anchors) {
+      const amd = (e.metadata ?? {}) as Record<string, unknown>;
+      if (
+        String(amd.work_item_id ?? "") === wid
+        && String(amd.completion_digest ?? "") === String(body.completion_digest)
+        && String(amd.mission_id ?? "") === String(pins.mission_id ?? "")
+        && String(amd.bound_open_id ?? "") === String(pins.bound_open_id ?? "")
+        && String(amd.child_set_digest ?? "") === String(body.child_set_digest)
+        && String(amd.reviewer_agent_id ?? "") === String(pins.reviewer_agent_id ?? "")
+      ) anchored = true;
+    }
+    if (!anchored) {
+      this.store.event({
+        entity_type: WORK_COMPLETION_TABLE, entity_id: cid,
+        event_type: WORK_COMPLETED_EVENT, actor,
+        metadata: {
+          work_item_id: wid,
+          mission_id: pins.mission_id,
+          bound_open_id: pins.bound_open_id,
+          child_set_digest: String(body.child_set_digest),
+          reviewer_agent_id: pins.reviewer_agent_id,
+          completion_digest: String(body.completion_digest),
+        },
+      });
+    }
+    // Self-validate when the record is complete on its own; a
+    // reviewer-pinned WCP also requires the WORK_REVIEW_ACCEPTED event
+    // the caller is about to append — it validates after that event.
+    if (pins.reviewer_agent_id === null) {
+      assertCanonicalWorkCompletion(this.graphAuthorityDeps(), body);
+    }
+    return body;
+  }
+
+  /**
+   * The single canonical finalization seam. Called inside a caller's
+   * immediate() txn with the row already re-read in-txn. Requires the
+   * completion basis to be ready and non-review (review items finalize
+   * only through reviewWorkItem ACCEPT). Writes WCP + anchor + DONE +
+   * lease release atomically; idempotent across finalize/reconcile
+   * replay — a second caller sees the existing WCP and stands down.
+   */
+  private finalizeWorkItemInTxn(cur: Row, actor: string): Row | null {
+    const wid = String(cur.work_item_id);
+    if (TERMINAL_WORK_ITEM_STATUSES.has(String(cur.status))) return cur;
+    if (String(cur.blocked_code ?? "") === WORK_CORRUPT_CODE) return null;
+    const existing = this.store.tryGet(
+      WORK_COMPLETION_TABLE, completionRowId(wid)) as Row | null;
+    if (existing) {
+      assertCanonicalWorkCompletion(this.graphAuthorityDeps(), existing);
+      return cur;
+    }
+    const basis = this.completionBasis(cur);
+    if (!basis.ready) return null;
+    if (cur.requires_review === true) return null; // review gates finality
+    assertWorkItemTransition(String(cur.status), "DONE");
+    const from = String(cur.status);
+    const mission = basis.mission;
+    const lease = this.store.tryGet(
+      WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(wid)) as Row | null;
+    if (lease && String(lease.state) === "ACTIVE") {
+      this.transitionLease(lease, "RELEASED", actor, { work_item_id: wid });
+    }
+    cur.status = "DONE";
+    cur.claimed_by = null;
+    cur.claim_token = null;
+    cur.claim_expires_at = null;
+    if (mission) {
+      cur.result_summary = String(mission.result ?? mission.result_summary ?? "") || null;
+    }
+    cur.updated_at = utcnow();
+    // The DONE row lands before the WCP so the completion validator
+    // sees the final state inside this same txn.
+    const saved = this.store.put("work_item", wid, cur, Number(cur.version));
+    this.writeCompletionRecord(saved, {
+      mission_id: mission ? String(mission.mission_id) : null,
+      bound_open_id: mission ? String(mission.bound_open_id ?? "") || null : null,
+      child_work_item_ids: basis.childIds,
+      reviewer_agent_id: null,
+    }, actor);
+    this.store.event({
+      entity_type: "work_item", entity_id: wid, event_type: "WORK_ITEM_SYNCED",
+      old_state: from, new_state: "DONE", actor,
+      metadata: { finalized: true },
+    });
+    return saved;
+  }
+
+  /**
+   * Public finalization seam — used by the cascade and by reconcile.
+   * Whole decision re-derived inside one immediate(): idempotent, CAS
+   * serialized, single canonical winner across concurrent finalizers.
+   */
+  finalizeWorkItem(workItemId: string, actor: string): Row {
+    return this.store.immediate(() => {
+      const cur = this.store.get("work_item", workItemId);
+      const done = this.finalizeWorkItemInTxn(cur, actor);
+      if (done && String(done.status) === "DONE") return done;
+      return cur;
+    });
+  }
+
+  /**
+   * Parent aggregation (P3 §7-8): a parent completes only when every
+   * canonical child (WDEC ∪ WDEL — never mutable arrays) has a valid
+   * WCP AND the parent's own bound mission (when it executed) is
+   * COMPLETED. A ready non-review parent finalizes atomically (DONE +
+   * WCP + anchor); a review-required parent projects REVIEW_REQUIRED
+   * and awaits a canonical ACCEPT.
+   */
+  evaluateParentCompletion(parentId: string, actor: string): boolean {
+    const parent = this.store.tryGet("work_item", parentId) as Row | null;
+    if (!parent) return false;
+    if (TERMINAL_WORK_ITEM_STATUSES.has(String(parent.status))) return true;
+    if (String(parent.blocked_code ?? "") === WORK_CORRUPT_CODE) return false;
+    if (this.store.tryGet(WORK_COMPLETION_TABLE, completionRowId(parentId))) return true;
+    const basis = this.completionBasisSafe(parent);
+    if (!basis.ready || basis.childIds.length === 0) return false;
+    if (parent.requires_review === true) {
+      if (String(parent.status) === "REVIEW_REQUIRED") return false;
+      // Project the review gate — no WCP until a canonical ACCEPT lands.
+      this.store.immediate(() => {
+        const cur = this.store.get("work_item", parentId);
+        if (String(cur.status) === "REVIEW_REQUIRED" ||
+            TERMINAL_WORK_ITEM_STATUSES.has(String(cur.status))) return;
+        assertWorkItemTransition(String(cur.status), "REVIEW_REQUIRED");
+        const from = String(cur.status);
+        cur.status = "REVIEW_REQUIRED";
+        cur.updated_at = utcnow();
+        this.store.put("work_item", parentId, cur, Number(cur.version));
+        this.store.event({
+          entity_type: "work_item", entity_id: parentId,
+          event_type: "WORK_ITEM_SYNCED", old_state: from,
+          new_state: "REVIEW_REQUIRED", actor,
+          metadata: { review_basis: "canonical_children_complete" },
+        });
+      });
+      return false;
+    }
+    const done = this.finalizeWorkItem(parentId, actor);
+    return String(done.status) === "DONE";
+  }
+
+  /**
+   * Completion cascade (P3 §8): walk canonical parents upward — each
+   * parent re-derives its own basis inside its own immediate() txn, so
+   * propagation is deterministic, idempotent, crash-safe and bounded
+   * to the acyclic canonical graph (visited-set + depth-bounded queue).
+   */
+  advanceCompletionCascade(workItemId: string, actor = "PAIR_WORKFORCE_CASCADE"): void {
+    const deps = this.graphAuthorityDeps();
+    const seen = new Set<string>([workItemId]);
+    const queue: string[] = [workItemId];
+    while (queue.length) {
+      const wid = queue.shift()!;
+      let parents: string[] = [];
+      try {
+        parents = canonicalParentIdsOf(deps, wid);
+      } catch {
+        continue; // corrupt graph rows — reconcile quarantines
+      }
+      for (const pid of parents) {
+        if (seen.has(pid)) continue;
+        seen.add(pid);
+        let progressed = false;
+        try {
+          progressed = this.evaluateParentCompletion(pid, actor);
+        } catch {
+          continue;
+        }
+        if (progressed) queue.push(pid);
+      }
+    }
+  }
+
+  /**
+   * Restart-safe lifecycle reconcile (P3 §10/§15): continues exactly the
+   * lifecycle work already authorized — nothing fabricated.
+   *  - every WCP row is re-validated; a malformed one quarantines its item
+   *  - IN_PROGRESS items fold a terminal bound mission (syncWorkItem)
+   *  - parents re-evaluate canonical aggregation (resumes interrupted
+   *    cascades exactly once — WCP dedupe)
+   *  - REVIEW_REQUIRED ungrounded → quarantine (fabricated state)
+   *  - DONE without WCP: materialize the authorized derived record when
+   *    the basis + (review) evidence fully prove it; else quarantine —
+   *    a status-only DONE is forged completion.
+   */
+  reconcileWorkLifecycle(): void {
+    const deps = this.graphAuthorityDeps();
+    // 1. canonical completion rows validate; corrupt → quarantine owner
+    for (const wcp of this.store.list(WORK_COMPLETION_TABLE)) {
+      try {
+        assertCanonicalWorkCompletion(deps, wcp as Row);
+      } catch {
+        const w = this.store.tryGet(
+          "work_item", String(wcp.work_item_id ?? "")) as Row | null;
+        if (w) this.quarantineWorkItem(w, "work_completion row malformed");
+      }
+    }
+    // 2. fold pending IN_PROGRESS items (materializes authorized
+    //    completion projections: DONE+WCP or REVIEW_REQUIRED)
+    for (const w of this.store.list("work_item")) {
+      if (String(w.status) !== "IN_PROGRESS") continue;
+      if (String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) continue;
+      try {
+        this.syncWorkItem(String(w.work_item_id));
+      } catch { /* next sweep retries — never forced */ }
+    }
+    // 3. resume interrupted parent aggregation/cascade
+    for (const w of this.store.list("work_item")) {
+      if (TERMINAL_WORK_ITEM_STATUSES.has(String(w.status))) continue;
+      if (String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) continue;
+      let childIds: string[] = [];
+      try {
+        childIds = canonicalChildIdsOf(deps, String(w.work_item_id));
+      } catch {
+        this.quarantineForReconcile(w as Row, "canonical child set corrupt");
+        continue;
+      }
+      if (!childIds.length) continue;
+      try {
+        this.evaluateParentCompletion(String(w.work_item_id), "PAIR_RECONCILE");
+      } catch { /* stays pending — next reconcile retries */ }
+    }
+    // 4. fabricated REVIEW_REQUIRED quarantines; DONE without canonical
+    //    completion is either materialized (provable) or quarantined.
+    for (const w of this.store.list("work_item") as Row[]) {
+      if (String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) continue;
+      const wid = String(w.work_item_id);
+      if (String(w.status) === "REVIEW_REQUIRED") {
+        const basis = this.completionBasisSafe(w);
+        if (!basis.ready) {
+          this.quarantineWorkItem(w, "ungrounded REVIEW_REQUIRED");
+          continue;
+        }
+        // Crash boundary C: a canonical ACCEPT committed its evidence
+        // but the DONE projection (and WCP) never landed. Rebuild the
+        // candidate record and materialize ONLY when an ACCEPT event
+        // pins this exact digest — nothing is fabricated.
+        const mission = basis.mission;
+        for (const e of this.store.listEvents("work_item", wid)) {
+          if (String(e.event_type) !== WORK_REVIEW_ACCEPTED_EVENT ||
+              String(e.old_state ?? "") !== "REVIEW_REQUIRED" ||
+              String(e.new_state ?? "") !== "DONE") continue;
+          const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+          const fields = {
+            completion_id: completionRowId(wid),
+            work_item_id: wid,
+            business_id: String(w.business_id),
+            mission_id: mission ? String(mission.mission_id) : null,
+            bound_open_id:
+              mission ? String(mission.bound_open_id ?? "") || null : null,
+            child_work_item_ids: basis.childIds,
+            reviewer_agent_id: md.reviewer_agent_id
+              ? String(md.reviewer_agent_id) : null,
+          };
+          if (fields.reviewer_agent_id === null) continue;
+          if (String(md.mission_id ?? "") !== String(fields.mission_id ?? "") ||
+              String(md.bound_open_id ?? "") !== String(fields.bound_open_id ?? "") ||
+              String(md.child_set_digest ?? "") !== childSetDigest(basis.childIds) ||
+              String(md.completion_digest ?? "") !== completionDigest(fields)) {
+            continue;
+          }
+          // The event authorizes this exact record — materialize it
+          // plus the DONE projection; validate inside the txn so a
+          // mismatched anchor aborts instead of persisting a bad row.
+          try {
+            this.store.immediate(() => {
+              const cur = this.store.get("work_item", wid);
+              if (String(cur.status) !== "REVIEW_REQUIRED") return;
+              cur.status = "DONE";
+              cur.updated_at = utcnow();
+              const savedRow = this.store.put(
+                "work_item", wid, cur, Number(cur.version));
+              const wcp = this.writeCompletionRecord(
+                savedRow, fields, "PAIR_RECONCILE");
+              assertCanonicalWorkCompletion(this.graphAuthorityDeps(), wcp);
+            });
+          } catch {
+            this.quarantineWorkItem(
+              w, "interrupted review-accept projection failed materialization");
+          }
+          break;
+        }
+        continue;
+      }
+      if (String(w.status) !== "DONE") continue;
+      if (this.store.tryGet(WORK_COMPLETION_TABLE, completionRowId(wid))) continue;
+      // Derive-only materialization: every pin must already exist as
+      // canonical evidence — nothing is invented.
+      const basis = this.completionBasisSafe(w);
+      const mission = basis.mission;
+      const missionOk = mission !== null && String(mission.status) === "COMPLETED";
+      if (!basis.ready || (!missionOk && basis.childIds.length === 0)) {
+        this.quarantineWorkItem(w, "DONE without canonical completion basis");
+        continue;
+      }
+      const fields = {
+        completion_id: completionRowId(wid),
+        work_item_id: wid,
+        business_id: String(w.business_id),
+        mission_id: mission ? String(mission.mission_id) : null,
+        bound_open_id: mission ? String(mission.bound_open_id ?? "") || null : null,
+        child_work_item_ids: basis.childIds,
+        reviewer_agent_id: null as string | null,
+      };
+      if (w.requires_review === true) {
+        // The ACCEPT event must pin this exact completion digest — an
+        // ACCEPT for different authority cannot validate this record.
+        const accepts = this.store.listEvents("work_item", wid).filter((e) => {
+          if (String(e.event_type) !== WORK_REVIEW_ACCEPTED_EVENT ||
+              String(e.old_state ?? "") !== "REVIEW_REQUIRED" ||
+              String(e.new_state ?? "") !== "DONE") return false;
+          const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+          return String(md.mission_id ?? "") === String(fields.mission_id ?? "") &&
+            String(md.bound_open_id ?? "") === String(fields.bound_open_id ?? "") &&
+            String(md.child_set_digest ?? "") === childSetDigest(basis.childIds) &&
+            String(md.reviewer_agent_id ?? "") !== "";
+        });
+        let reviewer: string | null = null;
+        for (const e of accepts) {
+          const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+          fields.reviewer_agent_id = String(md.reviewer_agent_id);
+          if (String(md.completion_digest ?? "") === completionDigest(fields)) {
+            reviewer = String(md.reviewer_agent_id);
+            break;
+          }
+        }
+        fields.reviewer_agent_id = reviewer;
+        if (reviewer === null) {
+          this.quarantineWorkItem(w, "DONE without canonical review acceptance");
+          continue;
+        }
+      }
+      try {
+        this.store.immediate(() => {
+          const cur = this.store.get("work_item", wid);
+          if (this.store.tryGet(WORK_COMPLETION_TABLE, completionRowId(wid))) return;
+          const wcp = this.writeCompletionRecord(cur, fields, "PAIR_RECONCILE");
+          assertCanonicalWorkCompletion(this.graphAuthorityDeps(), wcp);
+        });
+      } catch {
+        this.quarantineWorkItem(
+          w, "interrupted completion projection failed materialization");
+      }
+    }
   }
 
   /** Quarantine a row live — corrupt rows are non-executable and
@@ -1438,9 +1897,20 @@ export class BusinessLayer {
       return this.store.get("work_item", workItemId);
     }
     const ms = String(mission.status);
+    // P3 §4/§7 — a COMPLETED mission alone never completes the item: the
+    // completion basis must be ready (canonical child set proven too).
+    // Review-required items project REVIEW_REQUIRED only once the basis
+    // is fully ready — an early review gate is unreachable authority.
+    let basis: { ready: boolean; mission: Row | null; childIds: string[] } | null = null;
+    if (ms === "COMPLETED") {
+      basis = this.completionBasisSafe(row);
+    }
     const next: WorkItemStatus | null =
-      ms === "COMPLETED" ? (row.requires_review === true ? "REVIEW_REQUIRED" : "DONE") :
-      ms === "FAILED" ? "BLOCKED" :
+      ms === "COMPLETED"
+        ? (basis!.ready
+            ? (row.requires_review === true ? "REVIEW_REQUIRED" : "DONE")
+            : null)
+      : ms === "FAILED" ? "BLOCKED" :
       ms === "CANCELLED" ? "CANCELLED" :
       ms === "PAUSED" ? "BLOCKED" : null;
     if (!next) return row;
@@ -1452,6 +1922,9 @@ export class BusinessLayer {
     }
     // P2: terminal fold releases the canonical lease in the same txn;
     // mirrors track the lease (cleared only when no live lease).
+    // P3: DONE writes the canonical work_completion record + immutable
+    // anchor in the SAME transaction — a crash can never split the
+    // status projection from its completion evidence.
     const saved = this.store.immediate(() => {
       const lease = this.store.tryGet(
         WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
@@ -1464,7 +1937,16 @@ export class BusinessLayer {
       row.claimed_by = liveLease ? String(lease.claimant_agent_id) : null;
       row.claim_token = null;
       row.claim_expires_at = liveLease ? String(lease.expires_at) : null;
-      return this.store.put("work_item", workItemId, row, Number(row.version));
+      const savedRow = this.store.put("work_item", workItemId, row, Number(row.version));
+      if (next === "DONE") {
+        this.writeCompletionRecord(savedRow, {
+          mission_id: String(mission.mission_id),
+          bound_open_id: String(mission.bound_open_id ?? "") || null,
+          child_work_item_ids: basis?.childIds ?? [],
+          reviewer_agent_id: null,
+        }, "PAIR_BUSINESS_LAYER");
+      }
+      return savedRow;
     });
     // Feed the outcome back into the assignee's persistent context — the
     // agent "remembers" what it did across missions.
@@ -1489,6 +1971,9 @@ export class BusinessLayer {
       old_state: status, new_state: next, actor: "PAIR_BUSINESS_LAYER",
       metadata: { mission_id: missionIds[missionIds.length - 1], mission_status: ms },
     });
+    // P3 §8 — a landed final completion propagates upward: canonical
+    // parents re-derive their own basis inside their own txns.
+    if (next === "DONE") this.advanceCompletionCascade(workItemId);
     return saved;
   }
 
@@ -2157,21 +2642,53 @@ export class BusinessLayer {
   ): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     this.assertWorkItemNotQuarantined(row);
+    const decision = String(input.decision ?? "");
+    if (decision !== "ACCEPT" && decision !== "REWORK") {
+      throw new IntegrityError("FAIL_CLOSED_WORK_REVIEW_DECISION", `invalid decision ${decision}`);
+    }
+    // P3 §5 — duplicate ACCEPT replays idempotently ONLY against the
+    // identical canonical completion: same reviewer identity AND a WCP
+    // that still fully validates. Any other ACCEPT on a DONE item —
+    // different reviewer, divergent basis — fails closed; replay after
+    // authority changed can never match the pinned digest.
+    if (String(row.status) === "DONE" && decision === "ACCEPT") {
+      const wcp = this.store.tryGet(
+        WORK_COMPLETION_TABLE, completionRowId(workItemId)) as Row | null;
+      if (wcp) {
+        try {
+          assertCanonicalWorkCompletion(this.graphAuthorityDeps(), wcp);
+        } catch (err) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+            `completion record invalid: ${(err as Error).message}`,
+          );
+        }
+        if (String(wcp.reviewer_agent_id) === String(input.reviewer_agent_id)) {
+          return row; // exact replay — no second decision event
+        }
+      }
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_REVIEW_STATE",
+        `DONE is terminal — ACCEPT cannot replay under changed authority`,
+      );
+    }
     if (String(row.status) !== "REVIEW_REQUIRED") {
       throw new IntegrityError(
         "FAIL_CLOSED_WORK_REVIEW_STATE",
         `${String(row.status)} is not awaiting review`,
       );
     }
-    // The REVIEW_REQUIRED must originate from this item's bound
-    // COMPLETED mission — an ungrounded state quarantines instead of
-    // letting ACCEPT or REWORK act on fabricated provenance.
-    const boundMission = this.boundMissionForWorkItem(row);
-    if (!boundMission || String(boundMission.status) !== "COMPLETED") {
+    // P3 — the REVIEW_REQUIRED must be grounded in the canonical
+    // completion basis (bound COMPLETED mission for a leaf; the full
+    // proven child set ± own mission for a parent). An ungrounded state
+    // quarantines and fails both ACCEPT and REWORK without creating any
+    // review-decision evidence.
+    const basis = this.completionBasisSafe(row);
+    if (!basis.ready) {
       this.quarantineWorkItem(row, `review attempted on ungrounded REVIEW_REQUIRED for ${workItemId}`);
       throw new IntegrityError(
         "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
-        `review requires a bound COMPLETED mission for ${workItemId}`,
+        `review requires canonical completion basis for ${workItemId}`,
       );
     }
     const reviewer = this.store.get("org_agent", input.reviewer_agent_id);
@@ -2190,37 +2707,103 @@ export class BusinessLayer {
         `named reviewer is ${String(row.reviewer_agent_id)}`,
       );
     }
-    const decision = String(input.decision ?? "");
-    if (decision !== "ACCEPT" && decision !== "REWORK") {
-      throw new IntegrityError("FAIL_CLOSED_WORK_REVIEW_DECISION", `invalid decision ${decision}`);
-    }
     const from = String(row.status);
-    // Decision + audit event commit atomically — a crash can never split
-    // the reviewed state from its canonical evidence.
-    return this.store.immediate(() => {
+    // Decision + WCP + anchors commit atomically — a crash can never
+    // split the reviewed state from its canonical evidence.
+    const saved = this.store.immediate(() => {
       const cur = this.store.get("work_item", workItemId);
+      // In-txn re-check: a concurrent ACCEPT/REWORK that already
+      // committed leaves no REVIEW_REQUIRED to decide on (ACCEPT-vs-
+      // REWORK race → exactly one canonical outcome).
+      if (String(cur.status) !== "REVIEW_REQUIRED") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_REVIEW_STATE",
+          `${String(cur.status)} is not awaiting review`,
+        );
+      }
+      // In-txn re-proof: the basis must still hold at commit time.
+      const curBasis = this.completionBasisSafe(cur);
+      if (!curBasis.ready) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `review basis changed under ${workItemId}`,
+        );
+      }
+      const mission = curBasis.mission;
+      let completionDigestPinned: string | null = null;
+      let replayedAccept = false;
       if (decision === "ACCEPT") {
-        cur.status = "DONE";
+        const childIds = curBasis.childIds;
+        const fields = {
+          completion_id: completionRowId(workItemId),
+          work_item_id: workItemId,
+          business_id: String(cur.business_id),
+          mission_id: mission ? String(mission.mission_id) : null,
+          bound_open_id:
+            mission ? String(mission.bound_open_id ?? "") || null : null,
+          child_work_item_ids: childIds,
+          reviewer_agent_id: String(reviewer.agent_id),
+        };
+        const candidateDigest = completionDigest(fields);
+        // A committed ACCEPT pinning this exact completion (crash C:
+        // evidence landed, projection didn't) — replay materializes the
+        // pinned WCP + DONE and appends NO second ACCEPT event.
+        const alreadyAccepted = this.store.listEvents("work_item", workItemId)
+          .some((e) => {
+            if (String(e.event_type) !== WORK_REVIEW_ACCEPTED_EVENT ||
+                String(e.old_state ?? "") !== "REVIEW_REQUIRED" ||
+                String(e.new_state ?? "") !== "DONE") return false;
+            const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+            return String(md.reviewer_agent_id ?? "") === String(reviewer.agent_id) &&
+              String(md.mission_id ?? "") === String(fields.mission_id ?? "") &&
+              String(md.bound_open_id ?? "") === String(fields.bound_open_id ?? "") &&
+              String(md.child_set_digest ?? "") === childSetDigest(childIds) &&
+              String(md.completion_digest ?? "") === candidateDigest;
+          });
+        if (alreadyAccepted) {
+          replayedAccept = true;
+          const wcp = this.writeCompletionRecord(cur, fields, `operator:${actor}`);
+          completionDigestPinned = String(wcp.completion_digest);
+          cur.status = "DONE";
+        } else {
+          const wcp = this.writeCompletionRecord(cur, fields, `operator:${actor}`);
+          completionDigestPinned = String(wcp.completion_digest);
+          cur.status = "DONE";
+        }
       } else {
         cur.status = "READY";
         cur.blockers = [];
       }
       cur.updated_at = utcnow();
-      const saved = this.store.put("work_item", workItemId, cur, Number(cur.version));
-      this.store.event({
-        entity_type: "work_item", entity_id: workItemId,
-        event_type: decision === "ACCEPT" ? "WORK_REVIEW_ACCEPTED" : "WORK_REWORK_REQUESTED",
-        old_state: from,
-        new_state: String(saved.status),
-        actor: `operator:${actor}`,
-        metadata: {
-          reviewer_agent_id: String(reviewer.agent_id),
-          decision,
-          mission_id: String(boundMission.mission_id),
-        },
-      });
-      return saved;
+      const savedCur = this.store.put("work_item", workItemId, cur, Number(cur.version));
+      if (!replayedAccept) {
+        this.store.event({
+          entity_type: "work_item", entity_id: workItemId,
+          event_type: decision === "ACCEPT" ? WORK_REVIEW_ACCEPTED_EVENT : "WORK_REWORK_REQUESTED",
+          old_state: from,
+          new_state: String(savedCur.status),
+          actor: `operator:${actor}`,
+          metadata: {
+            reviewer_agent_id: String(reviewer.agent_id),
+            decision,
+            mission_id: mission ? String(mission.mission_id) : null,
+            bound_open_id: mission ? String(mission.bound_open_id ?? "") || null : null,
+            child_set_digest: childSetDigest(curBasis.childIds),
+            completion_digest: completionDigestPinned,
+          },
+        });
+      }
+      if (decision === "ACCEPT") {
+        // The review-pinned WCP validates only now that its ACCEPT
+        // evidence exists inside the same txn.
+        let wcp = this.store.get(
+          WORK_COMPLETION_TABLE, completionRowId(workItemId));
+        assertCanonicalWorkCompletion(this.graphAuthorityDeps(), wcp);
+      }
+      return savedCur;
     });
+    if (decision === "ACCEPT") this.advanceCompletionCascade(workItemId);
+    return saved;
   }
 
   unblockWorkItem(workItemId: string, actor: string): Row {

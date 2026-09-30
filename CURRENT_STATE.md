@@ -326,9 +326,9 @@ open-time ceiling, graph bounds — around two new canonical designs:
   failure mid-update → old v2 canonical, retry → one complete v3).
   Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_R2_PENDING_FINAL_AUDIT`**.
 
-## P14 Workforce V2 Phase 2 candidate state (on branch, pending audit)
+## P14 Workforce V2 Phase 2 state (MERGED via PR #13 → `1add96d`)
 
-**Coordination layer on `devin/1790749503-p14-wfv2-p2`** (base `41934b2` =
+**Coordination layer** (base `41934b2` =
 merged Phase 1) — canonical claim lease + heartbeat/fencing + durable
 inbox. Coordination only: nothing in this phase creates missions,
 satisfies dependencies, accepts reviews, or bypasses
@@ -388,10 +388,50 @@ GovernedTaskGate → executor`.
   sequences A–E + restart evidence.
   Classification: **`P14_WORKFORCE_V2_PHASE2_R2_PENDING_FINAL_AUDIT`**.
 
+## P14 Workforce V2 Phase 3 candidate state (on branch, pending audit)
+
+**Completion lifecycle on `devin/1790756068-p14-wfv2-p3`** (base
+`1add96d` = merged Phase 2) — canonical completion proof + review/
+acceptance + restart-safe finalization. Invariant: no work item becomes
+canonically complete because a mutable status says DONE — completion
+authority derives only from canonical evidence.
+
+- **`work_completion` (`WCP_<work_item_id>`)** — deterministic id,
+  COMMITTED, written only inside the same `immediate()` txn that
+  projects the item DONE; pins `mission_id + bound_open_id +
+  child_work_item_ids + reviewer_agent_id` under `completion_digest`;
+  exactly-one `WORK_ITEM_COMPLETED` event anchors every pin; the
+  canonical validator re-derives digests, proves the bound-mission
+  chain (full `validateWorkOpenBinding` PROVENANCE), recurses the
+  canonical child set, and requires a pinning `WORK_REVIEW_ACCEPTED`
+  for review-gated completions.
+- **Canonical child set** derives from COMMITTED+validated WDEC ∪ WDEL
+  — never mutable mirrors. Parents aggregate only over that set;
+  mixed parents need their own bound mission too.
+- **Review seam**: `requires_review` items fold to REVIEW_REQUIRED
+  (no WCP) until a canonical ACCEPT; ACCEPT/REWORK race collapses to
+  exactly one outcome; replayed ACCEPT is idempotent (no second event);
+  REWORK never reuses the old completion proof.
+- **Dependency satisfaction** consumes `proveWorkItemDone` — only
+  canonical completion satisfies an edge; status text, heartbeats,
+  claim release, message ACKs, review requests satisfy nothing.
+- **Restart-safe**: `reconcileWorkLifecycle` (inside
+  `reconcileWorkGraph`, runs at boot) resumes interrupted finalization
+  at every crash boundary — folds terminal bound missions, resumes the
+  parent cascade, materializes ACCEPT-pinned projections exactly once,
+  quarantines ungrounded REVIEW_REQUIRED/DONE and malformed WCPs, and
+  never fabricates evidence.
+- Endpoints: `POST /api/work-items/:id/review`,
+  `GET /api/work-items/:id/completion`.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE3_REPORT.md`; suite
+  `pair-p14-wfv2-p3.test.ts` (28 — 27 mandated names + race matrix)
+  + fresh-dir E2E 24/24 (real server, real restart finalization).
+  Classification: **`P14_WORKFORCE_V2_PHASE3_PENDING_INDEPENDENT_AUDIT`**.
+
 ## Not yet
 
-- Autonomous execution admission beyond coordination (Phase 3+), CEO
-  agent / KPI gap analysis (P15). Intentionally deferred.
+- Workforce lifecycle beyond governed completion (Phase 4+), CEO
+  agent / KPI gap analysis (P15/P16). Intentionally deferred.
 
 ## Release governance (current policy)
 

@@ -58,3 +58,4 @@ export * from "./selfmod-bootstrap.js";
 export * from "./promotion-service.js";
 export * from "./work-graph.js";
 export * from "./work-coordination.js";
+export * from "./work-completion.js";
