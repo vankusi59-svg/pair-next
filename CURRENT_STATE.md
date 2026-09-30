@@ -388,10 +388,11 @@ GovernedTaskGate → executor`.
   sequences A–E + restart evidence.
   Classification: **`P14_WORKFORCE_V2_PHASE2_R2_PENDING_FINAL_AUDIT`**.
 
-## P14 Workforce V2 Phase 3 candidate state (on branch, pending audit)
+## P14 Workforce V2 Phase 3 state (MERGED via PR #14 → `6f389c9`)
 
-**Completion lifecycle on `devin/1790756068-p14-wfv2-p3`** (base
-`1add96d` = merged Phase 2) — canonical completion proof + review/
+**Completion lifecycle** (base `1add96d` = merged Phase 2, merge commit
+`6f389c91aabf14768d09912f1efc3d962fb1ec4a` — independently audited R4
+PASS) — canonical completion proof + review/
 acceptance + restart-safe finalization. Invariant: no work item becomes
 canonically complete because a mutable status says DONE — completion
 authority derives only from canonical evidence.
@@ -478,8 +479,61 @@ authority derives only from canonical evidence.
   omitted task/shrunk manifest/deleted revision rollback → quarantine;
   intact manifest completes; reviewer race; fence/unfence; 3 restarts;
   zero dup evidence).
-  Classification:
+  Classification (phase level, superseded by the final closure below):
   **`P14_WORKFORCE_V2_PHASE3_R4_PENDING_FINAL_AUDIT`**.
+
+## P14 Workforce V2 FINAL CLOSURE (on branch, pending independent audit)
+
+Final cross-phase closure audit + hardening over the integrated
+P1+P2+P3 stack — base `6f389c9` (merged R4 PASS), branch
+`devin/1790765918-p14-final-closure`. No new features, no redesign —
+audit + one narrow defect remediation.
+
+- **Execution path verified singular**: work item → `openWorkItem` →
+  `work_open_binding` (INTENT pins mission_id) →
+  `MissionControl.startBoundMission` (binding PROVENANCE then
+  ADMISSION) → `startMissionInternal` → Planner → MissionRouter →
+  GovernedTaskGate → MissionRuntime/executor. No second planner,
+  router, scheduler, runtime, execution or completion authority.
+- **Cross-phase defect found + fixed (routine mirrors)**: P11's
+  `syncRoutineWorkItems` projects schedule-fired missions to
+  `work_item` rows directly — unbound, no membership, no WCP possible
+  by design. The P3 seams quarantined every routine mirror (unbound
+  IN_PROGRESS via `syncWorkItem`; DONE-without-WCP via
+  `reconcileWorkLifecycle`). Fix: mirrors are mission-status mirrors —
+  honest iff they replicate the mission's OWN canonical proof
+  (`proveCanonicalMissionCompletion`); they NEVER mint WCP and carry
+  zero item-level completion authority (dependency oracle, review,
+  parent aggregation untouched). Unproven `COMPLETED` claims project
+  IN_PROGRESS and quarantine on the same-render fold; unbound
+  non-routine links still quarantine on all statuses; reopened
+  mirrors flow through the canonical bound path and CAN mint a real
+  WCP. Five `P14-FC-ROUTINE-*` tests.
+- **Golden E2E 44/44** (real `dist/` server, fresh dir, 6 restarts):
+  parent → decompose A, B(dep A), C(requires_review), D(dep B+C) +
+  delegated E; claims/heartbeat; openWorkItem→binding→bound mission;
+  canonical validated execution per child; A WCP → B eligible; C →
+  REVIEW_REQUIRED → ACCEPT → WCP; D eligible only after B+C; parent
+  aggregates all 5 canonical children (WDEC∪WDEL) → DONE+WCP;
+  exactly-one WCP/anchor/ACCEPT per item. Negatives proven live:
+  heartbeat ≠ dependency, message ACK ≠ completion, HANDOFF_REQUEST ≠
+  authority (non-assignee claim rejected), DONE-without-WCP ≠
+  dependency, forged mission completion → quarantine no WCP,
+  forged DONE quarantined at restart, reopen-DONE fails, concurrent
+  opens mint exactly one mission, routine mirror never quarantined.
+- **Restart boundaries A–E** (after binding / mission-complete /
+  child-WCP / review-ACCEPT / final-child): zero duplicate missions,
+  bindings, dispatches, WCPs, ACCEPTs or WORK_ITEM_COMPLETED anchors;
+  no fabricated review or graph authority.
+- **Regression**: P3 73 · P2 55 · Phase1/WFV2 73 · P14F 35 · RH 11 ·
+  P13 67 · P12 71 · P11+r 91 · P10 31 · P9 79 · P6 36 — all green.
+  Node 22 full 2170 + 2 pre-existing P5 env-gap fails (unchanged,
+  DSH/CODEX executables absent); Node 20 full 2172/0; `tsc --noEmit`
+  clean; `pnpm build` PASS; `pnpm audit` 0 high; `verifyIntegrity`
+  PASS.
+- Report: `PAIR_OS_VNEXT_P14_FINAL_CLOSURE_REPORT.md`.
+  Classification:
+  **`P14_WORKFORCE_V2_FINAL_CLOSURE_PENDING_INDEPENDENT_AUDIT`**.
 
 ## Not yet
 
