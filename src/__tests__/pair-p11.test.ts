@@ -27,6 +27,7 @@ import {
   RecoveryController,
   createMissionControlServer,
   mintBrokerCapability,
+  claimLeaseDigest,
 } from "../pair/index.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11-"));
@@ -177,37 +178,50 @@ describe("P11 §2.B work-item lifecycle", () => {
 });
 
 describe("P11 §2.C claim integrity", () => {
-  it("expired claim can be reclaimed by another agent", () => {
+  it("expired lease is fenced then reclaimed by the canonical assignee", () => {
     const { ctx, biz } = makeBiz("claim1");
     const { b, a } = bizWithAgent(biz, ctx.projectId);
     const a2 = biz.createOrgAgent({ business_id: bId(b), title: "A2", department: "sales", operator_id: "op" });
-    const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g",
+      assignee_agent_id: aId(a), operator_id: "op" });
     biz.claimWorkItem(wId(w), aId(a), "op");
-    // expire the claim by rewinding expiry into the past
-    const row = ctx.store.get("work_item", wId(w));
-    row.claim_expires_at = new Date(Date.now() - 1000).toISOString();
-    ctx.store.put("work_item", wId(w), row, Number(row.version));
-    const reclaimed = biz.claimWorkItem(wId(w), aId(a2), "op");
-    expect(String(reclaimed.claimed_by)).toBe(aId(a2));
+    // expire the canonical lease (window rewound coherently so the
+    // ordering invariant holds; digest recomputed)
+    const lease = ctx.store.get("work_claim_lease", `WCL_${wId(w)}`);
+    lease.issued_at = "2000-01-01T00:00:00.000Z";
+    lease.last_heartbeat_at = "2000-01-01T00:00:01.000Z";
+    lease.expires_at = "2000-01-01T00:00:30.000Z";
+    lease.lease_digest = claimLeaseDigest(lease);
+    ctx.store.put("work_claim_lease", `WCL_${wId(w)}`, lease, Number(lease.version));
+    // only the canonical assignee may reacquire
+    expect(() => biz.claimWorkItem(wId(w), aId(a2), "op"))
+      .toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIM_ASSIGNEE_MISMATCH/);
+    biz.claimWorkItem(wId(w), aId(a), "op");
+    const after = ctx.store.get("work_claim_lease", `WCL_${wId(w)}`);
+    expect(Number(after.lease_epoch)).toBe(2);
+    expect(String(after.state)).toBe("ACTIVE");
   });
 
   it("stale/absent claim_token cannot release a live claim", () => {
     const { ctx, biz } = makeBiz("claim2");
     const { b, a } = bizWithAgent(biz, ctx.projectId);
-    const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g",
+      assignee_agent_id: aId(a), operator_id: "op" });
     const claimed = biz.claimWorkItem(wId(w), aId(a), "op");
     const token = String(claimed.claim_token);
     expect(() => biz.releaseClaim(wId(w), "op")).toThrowError(/FAIL_CLOSED_CLAIM_TOKEN/);
     expect(() => biz.releaseClaim(wId(w), "op", "CLM_wrong")).toThrowError(/FAIL_CLOSED_CLAIM_TOKEN/);
     const released = biz.releaseClaim(wId(w), "op", token);
     expect(released.claimed_by).toBeNull();
+    expect(String(ctx.store.get("work_claim_lease", `WCL_${wId(w)}`).state)).toBe("RELEASED");
   });
 
   it("assign to another agent while claim is live is rejected", () => {
     const { ctx, biz } = makeBiz("claim3");
     const { b, a } = bizWithAgent(biz, ctx.projectId);
     const a2 = biz.createOrgAgent({ business_id: bId(b), title: "A2", department: "sales", operator_id: "op" });
-    const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g",
+      assignee_agent_id: aId(a), operator_id: "op" });
     biz.claimWorkItem(wId(w), aId(a), "op");
     expect(() => biz.assignWorkItem(wId(w), aId(a2), "op")).toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIMED/);
   });
@@ -410,8 +424,8 @@ describe("P11 §7 evidence integrity + docs consistency", () => {
     const { ctx, biz } = makeBiz("int1");
     const { b, a } = bizWithAgent(biz, ctx.projectId);
     const w = biz.createWorkItem({ business_id: bId(b), title: "t", goal: "g", assignee_agent_id: aId(a), operator_id: "op" });
-    biz.openWorkItem(wId(w), "op");
     biz.claimWorkItem(wId(w), aId(a), "op");
+    biz.openWorkItem(wId(w), "op");
     // verifyIntegrity throws on any hash mismatch; clean = returns counts
     expect(() => ctx.store.verifyIntegrity()).not.toThrow();
     expect(Number(ctx.store.verifyIntegrity().entities)).toBeGreaterThan(0);
