@@ -369,3 +369,77 @@ Upgrade E2E (`pair-mc-upgrade`, :8791): valid contract created,
 ACR rows physically deleted (pre-R1 world, journal anchors intact) →
 delegate → exact current ACR backfilled under create-only CAS → WAB
 written → open → `IN_PROGRESS` + bound mission.
+
+# R1 remediation — R2: contract revision crash-atomicity closure
+
+## R2.1 Design
+
+`AgentContractService.materialize()` and `update()` now commit the
+contract row, `ACR_<contract_id>_<version>` and the canonical journal
+event inside ONE `store.immediate()` (better-sqlite3 transaction; nested
+use is SAVEPOINT). A crash at any seam — before the contract put, before
+the ACR put, before the journal event — rolls back the whole revision:
+the DB holds either the OLD complete canonical version or the NEW
+complete version + ACR + event, never a partial.
+
+`writeRevision(contract)` on a pre-existing ACR now runs
+`assertCanonicalContractRevision` then a field-for-field identical match
+(contract_id, org_agent_id, business_id, contract_version,
+contract_digest, canonical-normalized policy). Identical → adopted
+(replay). Conflicting/corrupt → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`
+— never silently adopted, never overwritten, never healed.
+
+CAS semantics preserved: `store.put(..., version)` inside the same
+transaction — two writers at the same expected version yield exactly one
+complete winning revision; the loser gets
+`FAIL_CLOSED_VERSION_CONFLICT` with no orphan ACR/event.
+
+Status-only ACTIVE/DISABLED toggles unchanged (no new ACR — status stays
+live admission authority; contract_version/digest define historical
+authority). R1 `ensureCurrentRevision` legacy backfill preserved; new
+writes are atomic on their own and never need the recovery path.
+
+## R2.2 Tests (8, all `P14RB-R2-*`)
+
+| Test | Proves |
+|---|---|
+| MATERIALIZE-CRASH-BEFORE-ACR | injected throw at revision put inside baseline materialize → reopen: no contract row, no ACR, no contract events; fresh materialize clean |
+| MATERIALIZE-CRASH-BEFORE-EVENT | throw at MATERIALIZED journal event → same: zero partial |
+| UPDATE-CRASH-BEFORE-ACR | throw at revision put in update → old v2 complete (row version 2, ACRs [1,2], no v3 artifacts); retry → single complete v3 |
+| UPDATE-CRASH-BEFORE-EVENT | throw at UPDATED event → same old-version-canonical |
+| ATOMIC-MATERIALIZE-HAPPY | contract + ACR@1 + MATERIALIZED event all exist; validator passes |
+| ATOMIC-UPDATE-HAPPY | ACRs [1,2,3] all canonical; MATERIALIZED + 2×UPDATED events |
+| CONFLICTING-ACR-ON-WRITE | seeded conflicting ACR at next version → PROVENANCE_CORRUPT; row untouched; contract did not advance |
+| CONCURRENT-UPDATE | second writer same expected version → VERSION_CONFLICT; exactly one ACR@N+1 + one UPDATED@N+1; validator passes |
+
+Focused suite: **73/73** (65 + 8).
+
+## R2.3 Full validation
+
+- `tsc --noEmit` clean · `pnpm build` PASS
+- P14F 35 · RH 11 · P13 67 · P12 71 · P11+r1..r6 103 · P10 31 · P9 79 ·
+  P6 36 — all pass
+- Node 22 full: **2042 pass + 2 fail** — same pre-existing `pair-p5`
+  DSH/CODEX probe env-gap as PR #11/R1
+- Node 20 full: **2044 pass / 0 fail**
+- `pnpm audit --audit-level=high`: 0 high/critical (1 low + 8 moderate,
+  unchanged)
+- `verifyIntegrity` clean on the E2E database
+
+## R2.4 Fresh-server + restart/crash E2E (`pair-mc-r2e2e`, :8792)
+
+1. Fresh server → business → lead agent → contract upsert → atomic write
+   confirmed: `ACR_*_1`, `ACR_*_2` + MATERIALIZED@1 + UPDATED@2.
+2. Server stopped; a second process opened the same DB, monkeypatched
+   `store.event` to throw on `AGENT_EXECUTION_CONTRACT_UPDATED`, ran
+   `agentContracts.update(...)` → `INJECTED_CRASH` → after-crash state:
+   `contract_version 2`, ACRs `[1,2]`, UPDATED events `[2]` — zero
+   partial v3.
+3. Server restarted on the SAME DB → retry `PUT /contract` →
+   `contract_version 3` → `ACR_*_3` + UPDATED@3 present — exactly one
+   complete new revision.
+4. Workforce path on the post-crash DB: delegate (parent narrowed to
+   FILE_OPERATIONS → worker contract narrowed first, else canonical
+   `FAIL_CLOSED_WORK_AUTHORITY_WIDEN`) → child open → `IN_PROGRESS` +
+   `work_open_binding`; WGM/WAB/WDEL rows + `WORK_AUTHORITY_BOUND` event
+   persisted.

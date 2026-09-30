@@ -47,7 +47,11 @@ import {
   authorityCeilingDigest,
   membershipDigest,
 } from "../pair/graph-authority.js";
-import { contractDigest, contractRevisionRowId } from "../pair/agent-contract.js";
+import {
+  assertCanonicalContractRevision,
+  contractDigest,
+  contractRevisionRowId,
+} from "../pair/agent-contract.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p14wfv2-"));
 let counter = 0;
@@ -1862,5 +1866,249 @@ describe("P14 WFV2-P1 R1 — historical authority anchors", () => {
     expect(String(after.contract_digest)).toBe(forgedDigest);
     expect(ctx.store.list("work_delegation")).toHaveLength(0);
     expect(ctx.store.list("work_authority_binding")).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------
+
+describe("P14 WFV2-P1 R2 — contract revision crash atomicity", () => {
+  const reopen = (dir: string) =>
+    new PairEvidenceStore(path.join(dir, "pair.db"));
+  const acrRows = (store: PairEvidenceStore, cid?: string) =>
+    store.list("agent_contract_revision")
+      .filter((r) => cid === undefined || String(r.contract_id) === cid);
+  const contractEvents = (store: PairEvidenceStore, cid: string) =>
+    store.listEvents("agent_execution_contract", cid);
+  const contractFor = (store: PairEvidenceStore, agentId: string) =>
+    store.list("agent_execution_contract")
+      .find((c) => String(c.org_agent_id) === agentId);
+
+  it("P14RB-R2-MATERIALIZE-CRASH-BEFORE-ACR: rollback leaves nothing", () => {
+    const { ctx, biz, dir } = makeStack("mat-crash-acr");
+    const b = makeBiz(biz, ctx.projectId);
+    const put = ctx.store.put.bind(ctx.store);
+    (ctx.store as { put: typeof put }).put = (t, id, r, v) => {
+      if (t === "agent_contract_revision") throw new Error("INJECTED_CRASH");
+      return put(t, id, r, v);
+    };
+    // Crash inside createOrgAgent's baseline materialize (ACR seam).
+    expect(errCode(() => makeAgent(biz, String(b.business_id), "lead")))
+      .not.toBe("NO_ERROR");
+    (ctx.store as { put: typeof put }).put = put;
+    // Reopen: the failed revision left nothing — no contract row, no
+    // ACR, no contract journal event. (The org_agent row may remain —
+    // a contract materializes lazily on first resolve, by design.)
+    const s = reopen(dir);
+    expect(s.list("agent_execution_contract")).toHaveLength(0);
+    expect(acrRows(s)).toHaveLength(0);
+    expect(s.listEvents().filter((e) =>
+      String(e.event_type).includes("AGENT_EXECUTION_CONTRACT"))).toHaveLength(0);
+    // After the crash a fresh agent materializes cleanly.
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const c = biz.upsertAgentContract(
+      String(agent.agent_id), "op", { allowed_capabilities: ["FILE_OPERATIONS"] });
+    assertCanonicalContractRevision(ctx.store,
+      ctx.store.get("agent_contract_revision",
+        contractRevisionRowId(String(c.contract_id), Number(c.contract_version))));
+  });
+
+  it("P14RB-R2-MATERIALIZE-CRASH-BEFORE-EVENT: materialize itself rolls back", () => {
+    const { ctx, biz, dir } = makeStack("mat-crash-evt");
+    const b = makeBiz(biz, ctx.projectId);
+    const ev = ctx.store.event.bind(ctx.store);
+    (ctx.store as { event: typeof ev }).event = (p) => {
+      if (String(p.event_type) === "AGENT_EXECUTION_CONTRACT_MATERIALIZED") {
+        throw new Error("INJECTED_CRASH");
+      }
+      return ev(p);
+    };
+    // Crash inside createOrgAgent's baseline materialize seam.
+    expect(errCode(() => makeAgent(biz, String(b.business_id), "lead")))
+      .not.toBe("NO_ERROR");
+    (ctx.store as { event: typeof ev }).event = ev;
+    const s = reopen(dir);
+    expect(s.list("agent_execution_contract")).toHaveLength(0);
+    expect(acrRows(s)).toHaveLength(0);
+    expect(s.listEvents().filter((e) =>
+      String(e.event_type).includes("AGENT_EXECUTION_CONTRACT"))).toHaveLength(0);
+  });
+
+  it("P14RB-R2-UPDATE-CRASH-BEFORE-ACR: old complete revision stays canonical", () => {
+    const { ctx, biz, dir } = makeStack("upd-crash-acr");
+    const b = makeBiz(biz, ctx.projectId);
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const agentId = String(agent.agent_id);
+    const c1 = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: ["FILE_OPERATIONS"] }); // v1→v2
+    const v = Number(c1.version);
+    const cv = Number(c1.contract_version);
+    const put = ctx.store.put.bind(ctx.store);
+    (ctx.store as { put: typeof put }).put = (t, id, r, vv) => {
+      if (t === "agent_contract_revision") throw new Error("INJECTED_CRASH");
+      return put(t, id, r, vv);
+    };
+    expect(errCode(() => biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: null }, v,
+    ))).not.toBe("NO_ERROR");
+    (ctx.store as { put: typeof put }).put = put;
+    const s = reopen(dir);
+    const c = contractFor(s, agentId)!;
+    expect(Number(c.version)).toBe(v);
+    expect(Number(c.contract_version)).toBe(cv);
+    expect(acrRows(s, String(c.contract_id))
+      .map((r) => Number(r.contract_version)).sort((a, z) => a - z))
+      .toEqual([1, 2]);
+    // retry update on the same db commits one complete next revision
+    const c2 = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: null }, v);
+    expect(Number(c2.contract_version)).toBe(cv + 1);
+    const s2 = reopen(dir);
+    expect(acrRows(s2, String(c.contract_id))
+      .map((r) => Number(r.contract_version)).sort((a, z) => a - z))
+      .toEqual([1, 2, 3]);
+    expect(contractEvents(s2, String(c.contract_id)).filter(
+      (e) => Number(e.metadata?.contract_version) === cv + 1 &&
+        String(e.event_type) === "AGENT_EXECUTION_CONTRACT_UPDATED",
+    )).toHaveLength(1);
+  });
+
+  it("P14RB-R2-UPDATE-CRASH-BEFORE-EVENT: old complete revision stays canonical", () => {
+    const { ctx, biz, dir } = makeStack("upd-crash-evt");
+    const b = makeBiz(biz, ctx.projectId);
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const agentId = String(agent.agent_id);
+    const c1 = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const v = Number(c1.version);
+    const ev = ctx.store.event.bind(ctx.store);
+    let injected = false;
+    (ctx.store as { event: typeof ev }).event = (p) => {
+      if (!injected && String(p.event_type) === "AGENT_EXECUTION_CONTRACT_UPDATED") {
+        injected = true;
+        throw new Error("INJECTED_CRASH");
+      }
+      return ev(p);
+    };
+    expect(errCode(() => biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: null }, v,
+    ))).not.toBe("NO_ERROR");
+    (ctx.store as { event: typeof ev }).event = ev;
+    const s = reopen(dir);
+    const c = contractFor(s, agentId)!;
+    expect(Number(c.version)).toBe(v);
+    expect(Number(c.contract_version)).toBe(2);
+    expect(acrRows(s, String(c.contract_id))
+      .map((r) => Number(r.contract_version)).sort((a, z) => a - z))
+      .toEqual([1, 2]);
+    expect(contractEvents(s, String(c.contract_id)).filter(
+      (e) => Number(e.metadata?.contract_version) === 3,
+    )).toHaveLength(0);
+  });
+
+  it("P14RB-R2-ATOMIC-MATERIALIZE-HAPPY: baseline contract + ACR + event all exist", () => {
+    const { ctx, biz } = makeStack("atomic-mat");
+    const b = makeBiz(biz, ctx.projectId);
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const c = biz.getAgentContract(String(agent.agent_id))!;
+    const acr = ctx.store.get("agent_contract_revision",
+      contractRevisionRowId(String(c.contract_id), 1));
+    expect(String(acr.contract_digest)).toBe(String(c.contract_digest));
+    assertCanonicalContractRevision(ctx.store, acr);
+    const evs = contractEvents(ctx.store, String(c.contract_id));
+    expect(evs.some((e) =>
+      String(e.event_type) === "AGENT_EXECUTION_CONTRACT_MATERIALIZED" &&
+      Number(e.metadata?.contract_version) === 1 &&
+      String(e.metadata?.contract_digest) === String(c.contract_digest),
+    )).toBe(true);
+  });
+
+  it("P14RB-R2-ATOMIC-UPDATE-HAPPY: vN+1 commits fully; old ACR append-only", () => {
+    const { ctx, biz } = makeStack("atomic-upd");
+    const b = makeBiz(biz, ctx.projectId);
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const agentId = String(agent.agent_id);
+    const c1 = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const c2 = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: null }, Number(c1.version));
+    expect(Number(c2.contract_version)).toBe(Number(c1.contract_version) + 1);
+    const acrs = acrRows(ctx.store, String(c1.contract_id));
+    expect(acrs.map((r) => Number(r.contract_version)).sort((a, z) => a - z))
+      .toEqual([1, 2, 3]);
+    for (const r of acrs) assertCanonicalContractRevision(ctx.store, r);
+    const evs = contractEvents(ctx.store, String(c1.contract_id));
+    expect(evs.some((e) =>
+      String(e.event_type) === "AGENT_EXECUTION_CONTRACT_MATERIALIZED")).toBe(true);
+    expect(evs.filter((e) =>
+      String(e.event_type) === "AGENT_EXECUTION_CONTRACT_UPDATED")).toHaveLength(2);
+  });
+
+  it("P14RB-R2-CONFLICTING-ACR-ON-WRITE: seeded conflicting ACR fails closed, never overwritten", () => {
+    const { ctx, biz } = makeStack("conflict-write");
+    const b = makeBiz(biz, ctx.projectId);
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const agentId = String(agent.agent_id);
+    const c1 = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const nextV = Number(c1.contract_version) + 1;
+    const key = contractRevisionRowId(String(c1.contract_id), nextV);
+    // Seed a conflicting ACR at the intended next version (self-consistent
+    // digest over a DIFFERENT policy — a genuine conflict row).
+    const pol = { allowed_capabilities: ["SELF_MODIFY_CODE"] };
+    ctx.store.put("agent_contract_revision", key, {
+      revision_id: key,
+      contract_id: String(c1.contract_id),
+      org_agent_id: agentId,
+      business_id: String(c1.business_id),
+      contract_version: nextV,
+      contract_digest: contractDigest({
+        contract_id: String(c1.contract_id),
+        org_agent_id: agentId,
+        business_id: String(c1.business_id),
+        contract_version: nextV,
+        policy: pol as never,
+      }),
+      policy: pol,
+      status: "ACTIVE",
+      state: "COMMITTED",
+      created_at: utcnow(),
+      updated_at: utcnow(),
+      version: 0,
+    }, 0);
+    const v = Number(c1.version);
+    expect(errCode(() => biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: null }, v,
+    ))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    // never overwritten; contract did not partially advance
+    const after = ctx.store.get("agent_contract_revision", key);
+    expect((after.policy as { allowed_capabilities?: string[] })
+      .allowed_capabilities).toEqual(["SELF_MODIFY_CODE"]);
+    const c = ctx.store.get("agent_execution_contract", String(c1.contract_id));
+    expect(Number(c.contract_version)).toBe(Number(c1.contract_version));
+    expect(Number(c.version)).toBe(v);
+  });
+
+  it("P14RB-R2-CONCURRENT-UPDATE: exactly one complete revision wins", () => {
+    const { ctx, biz } = makeStack("conc-update");
+    const b = makeBiz(biz, ctx.projectId);
+    const agent = makeAgent(biz, String(b.business_id), "lead");
+    const agentId = String(agent.agent_id);
+    const c1 = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const v = Number(c1.version);
+    const w = biz.upsertAgentContract(
+      agentId, "op", { allowed_capabilities: null }, v);
+    const loser = errCode(() => biz.upsertAgentContract(
+      agentId, "op", { denied_capabilities: ["NETWORK_ACCESS"] }, v));
+    expect(loser).toBe("FAIL_CLOSED_VERSION_CONFLICT");
+    const c2v = Number(w.contract_version);
+    const acrs = acrRows(ctx.store, String(c1.contract_id))
+      .filter((r) => Number(r.contract_version) === c2v);
+    expect(acrs).toHaveLength(1); // no orphan ACR
+    expect(contractEvents(ctx.store, String(c1.contract_id)).filter(
+      (e) => String(e.event_type) === "AGENT_EXECUTION_CONTRACT_UPDATED" &&
+        Number(e.metadata?.contract_version) === c2v,
+    )).toHaveLength(1); // no orphan event
+    assertCanonicalContractRevision(ctx.store, acrs[0]);
   });
 });

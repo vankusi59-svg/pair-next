@@ -305,13 +305,26 @@ open-time ceiling, graph bounds — around two new canonical designs:
   WDEC/WDS/WGM/WAB rows and sweeps all work items bidirectionally;
   corrupt canonical rows poison both endpoints; never rebuilt from
   mutable mirrors; idempotent across restarts.
+- R2 closure: contract-version commits are crash-atomic —
+  `materialize()`/`update()` write the `agent_execution_contract` row,
+  `ACR_<contract>_<version>` and the canonical contract journal event in
+  ONE `store.immediate()` (rollback leaves the old complete revision or
+  the new complete revision, never a partial). `writeRevision` on an
+  existing ACR runs `assertCanonicalContractRevision` + field-for-field
+  identical match (conflict → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`,
+  never overwritten); CAS semantics preserved (one winner, loser
+  `FAIL_CLOSED_VERSION_CONFLICT`, no orphan ACR/event). Status-only
+  toggles unchanged; R1 `ensureCurrentRevision` legacy backfill kept —
+  new writes never rely on it.
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REBASELINE_REPORT.md`
-  (§R1); suite `pair-p14-workforce-v2.test.ts` (65 — incl. 10 `P14RB-R1-*`
-  anchor/deny/backfill tests) + fresh-server E2E (ACR-policy tamper poisons
-  both bindings, self-consistent WAB rehash fails at the event anchor,
+  (§R1, §R2); suite `pair-p14-workforce-v2.test.ts` (73 — incl. 10
+  `P14RB-R1-*` anchor/deny/backfill + 8 `P14RB-R2-*` crash-atomicity
+  tests) + fresh-server E2E (ACR-policy tamper poisons both bindings,
+  self-consistent WAB rehash fails at the event anchor,
   restart-quarantine durable) + upgrade E2E (pre-ACR DB → exact current
-  revision backfilled, open succeeds).
-  Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_R1_PENDING_AUDIT`**.
+  revision backfilled, open succeeds) + restart/crash E2E (injected
+  failure mid-update → old v2 canonical, retry → one complete v3).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_R2_PENDING_FINAL_AUDIT`**.
 
 ## Not yet
 

@@ -27,7 +27,7 @@
  *     candidates and route preferences inside the existing authorities.
  */
 
-import { digest, utcnow } from "./canonical.js";
+import { canonicalJson, digest, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -301,20 +301,26 @@ export class AgentContractService {
     this.validatePolicy(merged);
     const row = this.buildRow(agent, merged, 1, actor);
     try {
-      const saved = this.store.put(AGENT_CONTRACT_TABLE, String(row.contract_id), row, 0);
-      this.writeRevision(saved);
-      this.store.event({
-        entity_type: AGENT_CONTRACT_TABLE,
-        entity_id: String(row.contract_id),
-        event_type: policy ? "AGENT_EXECUTION_CONTRACT_CREATED" : "AGENT_EXECUTION_CONTRACT_MATERIALIZED",
-        new_state: "ACTIVE",
-        actor,
-        metadata: {
-          org_agent_id: agentId,
-          business_id: row.business_id,
-          contract_version: 1,
-          contract_digest: row.contract_digest,
-        },
+      // R2 §2 — contract row + ACR + journal event commit atomically:
+      // a crash at any seam leaves either nothing or the complete
+      // canonical revision — never a partial one.
+      const saved = this.store.immediate(() => {
+        const s = this.store.put(AGENT_CONTRACT_TABLE, String(row.contract_id), row, 0);
+        this.writeRevision(s);
+        this.store.event({
+          entity_type: AGENT_CONTRACT_TABLE,
+          entity_id: String(row.contract_id),
+          event_type: policy ? "AGENT_EXECUTION_CONTRACT_CREATED" : "AGENT_EXECUTION_CONTRACT_MATERIALIZED",
+          new_state: "ACTIVE",
+          actor,
+          metadata: {
+            org_agent_id: agentId,
+            business_id: row.business_id,
+            contract_version: 1,
+            contract_digest: row.contract_digest,
+          },
+        });
+        return s;
       });
       return saved;
     } catch (err) {
@@ -472,29 +478,59 @@ export class AgentContractService {
       actor,
       updated_at: utcnow(),
     };
-    const saved = this.store.put(AGENT_CONTRACT_TABLE, String(contract.contract_id), next, Number(contract.version));
-    this.writeRevision(saved);
-    this.store.event({
-      entity_type: AGENT_CONTRACT_TABLE,
-      entity_id: String(contract.contract_id),
-      event_type: "AGENT_EXECUTION_CONTRACT_UPDATED",
-      actor,
-      metadata: {
-        org_agent_id: agentId,
-        contract_version: nextVersion,
-        contract_digest: next.contract_digest,
-      },
+    // R2 §2 — all three artifacts (contract row, ACR, journal event)
+    // commit in ONE transaction; the CAS on `contract.version` keeps
+    // concurrent writers single-winner, and a crash mid-write rolls
+    // back the whole new revision.
+    const saved = this.store.immediate(() => {
+      const s = this.store.put(AGENT_CONTRACT_TABLE, String(contract.contract_id), next, Number(contract.version));
+      this.writeRevision(s);
+      this.store.event({
+        entity_type: AGENT_CONTRACT_TABLE,
+        entity_id: String(contract.contract_id),
+        event_type: "AGENT_EXECUTION_CONTRACT_UPDATED",
+        actor,
+        metadata: {
+          org_agent_id: agentId,
+          contract_version: nextVersion,
+          contract_digest: next.contract_digest,
+        },
+      });
+      return s;
     });
     return saved;
   }
 
   /** Append-only revision row for one committed contract version — the
    *  canonical P12 evidence a workforce authority binding anchors to.
-   *  Deterministic id + create-only write keeps it race-safe. */
+   *  Deterministic id + create-only write keeps it race-safe. An
+   *  already-present row is never silently adopted (R2 §3): it must be
+   *  a fully canonical revision for exactly THIS version — full
+   *  `assertCanonicalContractRevision` + field-for-field match —
+   *  otherwise the write fails closed and nothing is overwritten. */
   private writeRevision(contract: Row): void {
     const revisionId = contractRevisionRowId(
       String(contract.contract_id), Number(contract.contract_version));
-    if (this.store.tryGet(AGENT_CONTRACT_REVISION_TABLE, revisionId)) return;
+    const existing = this.store.tryGet(
+      AGENT_CONTRACT_REVISION_TABLE, revisionId) as Row | null;
+    if (existing) {
+      assertCanonicalContractRevision(this.store, existing);
+      const identical =
+        String(existing.contract_id) === String(contract.contract_id) &&
+        String(existing.org_agent_id) === String(contract.org_agent_id) &&
+        String(existing.business_id) === String(contract.business_id) &&
+        Number(existing.contract_version) === Number(contract.contract_version) &&
+        String(existing.contract_digest) === String(contract.contract_digest) &&
+        canonicalJson(normalizeContractPolicy(existing.policy)) ===
+          canonicalJson(normalizeContractPolicy(contract.policy));
+      if (!identical) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `${revisionId} conflicts with committed contract revision`,
+        );
+      }
+      return;
+    }
     this.store.put(AGENT_CONTRACT_REVISION_TABLE, revisionId, {
       revision_id: revisionId,
       contract_id: String(contract.contract_id),
