@@ -30,8 +30,8 @@ import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
 import {
   assertCanonicalRoutineFire,
-  assertCanonicalRoutineMirror,
-  proveCanonicalRoutineMirror,
+  assertCanonicalRoutineLineage,
+  proveCanonicalRoutineLineage,
   routineMirrorRowId,
 } from "./routine-mirror.js";
 import { validateWorkOpenBinding } from "./work-open-binding.js";
@@ -1022,14 +1022,19 @@ export class BusinessLayer {
       // its projected mission is itself canonically complete. Mirrors
       // never mint a WCP by design (no bound attempt exists), so the
       // bound-work basis cannot apply.
-      if (w.routine_id != null && proveCanonicalRoutineMirror(this.store, w)) {
-        const rMids = (w.mission_ids as string[] | undefined) ?? [];
-        const rMission = rMids.length
-          ? this.store.tryGet("mission", String(rMids[0])) as Row | null
-          : null;
-        if (rMission && proveCanonicalMissionCompletion(this.store, rMission)) continue;
-      }
       if (w.routine_id != null) {
+        // R2 — a DONE mirror with no WCP is honest ONLY in the pure
+        // display shape: mission_ids === [projected scheduler mission]
+        // exactly, full fire + lineage proof, and that mission itself
+        // canonically complete. A trailing (bound or foreign) mission
+        // means the item went through the bound path, which always
+        // mints a WCP — DONE-without-WCP is then corrupt.
+        const rMids = (w.mission_ids as string[] | undefined) ?? [];
+        if (rMids.length === 1 && proveCanonicalRoutineLineage(this.store, w)) {
+          const rMission = this.store.tryGet(
+            "mission", String(rMids[0])) as Row | null;
+          if (rMission && proveCanonicalMissionCompletion(this.store, rMission)) continue;
+        }
         this.quarantineWorkItem(
           w, "routine DONE mirror without canonical mission completion/provenance");
         continue;
@@ -1965,8 +1970,22 @@ export class BusinessLayer {
       // + SCHEDULE_FIRED anchor + deterministic WI_RT identity) —
       // `routine_id` alone never authorizes it. Any OTHER unbound link
       // is corrupt provenance.
-      if (row.routine_id != null && proveCanonicalRoutineMirror(this.store, row)) {
-        return this.syncRoutineMirror(row, mission);
+      // R2 — the display exception applies ONLY to the pure projection
+      // shape: mission_ids === [projected scheduler mission] exactly
+      // (the mirror then folds THAT mission, never some foreign last
+      // id). Every trailing mission id must be a canonically bound
+      // attempt of this same item — a bound last mission would have
+      // passed missionBoundToWorkItem above, so reaching here with
+      // trailing ids means an unbound foreign link: quarantine.
+      if (row.routine_id != null) {
+        if (missionIds.length === 1 && proveCanonicalRoutineLineage(this.store, row)) {
+          return this.syncRoutineMirror(row, mission);
+        }
+        this.quarantineWorkItem(
+          row,
+          `routine mission lineage corrupt at ${workItemId} — unbound trailing mission ${String(mission.mission_id)}`,
+        );
+        return this.store.get("work_item", workItemId);
       }
       // The final mission id does not belong to this work item — fold
       // nothing; quarantine so no authority path treats it as progress.
@@ -2089,10 +2108,19 @@ export class BusinessLayer {
     // the whole projection must prove the canonical schedule chain
     // (FIRED occurrence + SCHEDULE_FIRED anchor + WI_RT identity pin).
     try {
-      assertCanonicalRoutineMirror(this.store, row);
+      assertCanonicalRoutineLineage(this.store, row);
     } catch (e) {
       this.quarantineWorkItem(
         row, `routine mirror without canonical provenance: ${(e as Error).message}`);
+      return this.store.get("work_item", workItemId);
+    }
+    // R2 — the display fold is defined ONLY for the projected scheduler
+    // mission (display shape). A trailing id means the item took the
+    // bound path; an unbound trailing id reaching here is corruption.
+    const mids = (row.mission_ids as string[] | undefined) ?? [];
+    if (mids.length !== 1 || String(mission.mission_id) !== String(mids[0])) {
+      this.quarantineWorkItem(
+        row, "routine mirror fold requires the projected scheduler mission as its only link");
       return this.store.get("work_item", workItemId);
     }
     const ms = String(mission.status);
@@ -3462,7 +3490,7 @@ export class BusinessLayer {
    * projection while it displays schedule output — crossing the
    * authority-bearing `openWorkItem` boundary promotes it into normal
    * governed work. Requires the full canonical routine provenance
-   * (`assertCanonicalRoutineMirror`) AND Phase-1 membership: the
+   * (`assertCanonicalRoutineLineage`) AND Phase-1 membership: the
    * deterministic STANDALONE `work_graph_membership` is established
    * atomically before any open intent/binding/mission exists.
    * Concurrent promoters collide deterministically on the same
@@ -3472,7 +3500,11 @@ export class BusinessLayer {
   private promoteRoutineMirror(row: Row): void {
     const id = String(row.work_item_id);
     try {
-      assertCanonicalRoutineMirror(this.store, row);
+      // R2 — promotion requires the FULL mission lineage: mission_ids[0]
+      // canonical fire + every trailing id a canonically bound attempt
+      // of this same item. A foreign terminal mission can never hide an
+      // earlier still-live scheduler/bound mission behind an open.
+      assertCanonicalRoutineLineage(this.store, row);
     } catch (e) {
       this.quarantineWorkItem(
         row, `routine mirror promotion without canonical provenance: ${(e as Error).message}`);

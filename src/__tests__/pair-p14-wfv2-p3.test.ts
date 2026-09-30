@@ -44,6 +44,7 @@ import {
   RecoveryController,
   WorkforceService,
   assertCanonicalMissionCompletion,
+  assertCanonicalRoutineLineage,
   childSetDigest,
   completionDigest,
   completionRowId,
@@ -2618,5 +2619,258 @@ describe("P14-FC-R1 — canonical routine provenance + membership", () => {
     expect(String(wcp.mission_id)).toBe(boundMid);
     expect(String(wcp.business_id)).toBe(String(b.business_id));
     expect(biz.proveWorkItemDone(done)).toBe(true);
+  });
+});
+
+// =====================================================================
+// P14 FC R2 — canonical routine mission lineage.
+// mission_ids[0] is ALWAYS the projected scheduler mission; every
+// trailing id must be a canonically bound attempt of the SAME item
+// (bound_open_id → exact work_open_binding, BOUND, same item/business/
+// project). A foreign mission anywhere in the lineage fails closed —
+// the open gate can never see a foreign terminal tail hiding a live
+// scheduler or bound mission behind it.
+// =====================================================================
+
+describe("P14-FC-R2 — canonical routine mission lineage", () => {
+  async function fireRoutineMission(
+    ctx: ReturnType<typeof makeCtxOn>,
+    schedules: MissionScheduleService, scheduleId: string,
+  ) {
+    const schedRow = ctx.store.get("mission_schedule", scheduleId);
+    schedRow.next_due_at = new Date(Date.now() - 1000).toISOString();
+    ctx.store.put("mission_schedule", scheduleId, schedRow, Number(schedRow.version));
+    const res = await schedules.fireDue(async (input) =>
+      ctx.control.startMission({
+        project_id: ctx.projectId, goal: input.goal,
+        metadata: input.metadata, operator_id: "op",
+      }));
+    expect(res.fired).toContain(scheduleId);
+    const occ = ctx.store.list("schedule_occurrence")
+      .find((o) => String(o.schedule_id) === scheduleId && o.mission_id != null);
+    expect(occ).toBeTruthy();
+    return ctx.store.get("mission", String(occ!.mission_id));
+  }
+  const routineItems = (store: PairEvidenceStore) =>
+    store.list("work_item").filter((w) => w.routine_id != null);
+  const makeRoutine = (biz: BusinessLayer, businessId: string, over: Record<string, unknown> = {}) =>
+    biz.createRoutine({
+      business_id: businessId, name: "daily", goal_template: "g",
+      cron: "0 9 * * *", operator_id: "op", ...over,
+    } as never);
+  const runMissionToFailed = (ctx: ReturnType<typeof makeCtxOn>, mid: string) => {
+    ctx.service.transitionMission(mid, "READY", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(mid, "RUNNING", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(mid, "FAILED", "PAIR_MISSION_RUNTIME");
+  };
+  const appendMission = (ctx: ReturnType<typeof makeCtxOn>, wid: string, mid: string) => {
+    const cur = ctx.store.get("work_item", wid);
+    cur.mission_ids = [...(cur.mission_ids as string[]), mid];
+    ctx.store.put("work_item", wid, cur, Number(cur.version));
+  };
+
+  it("P14-FC-R2-APPENDED-FOREIGN-TERMINAL-MISSION-FAILS-LINEAGE: honest DONE mirror + foreign FAILED appended → quarantine on reconcile", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-append-foreign");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    canonicallyCompleteMission(ctx.store, ctx.service, String(m.mission_id));
+    biz.board(String(b.business_id));
+    const w = routineItems(ctx.store)[0]!;
+    expect(String(w.status)).toBe("DONE");
+    // mission_ids = [ genuine_scheduler_mission, foreign_terminal ]
+    const foreign = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "foreign", operator_id: "op" });
+    runMissionToFailed(ctx, String(foreign.mission_id));
+    appendMission(ctx, String(w.work_item_id), String(foreign.mission_id));
+    biz.reconcileWorkLifecycle(); // lineage must fail → quarantine
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(biz.proveWorkItemDone(after)).toBe(false);
+    expect(wcpOf(ctx.store, String(w.work_item_id))).toBeNull();
+  });
+
+  it("P14-FC-R2-FOREIGN-LAST-MISSION-CANNOT-DRIVE-MIRROR-STATE: live scheduler mission + foreign FAILED appended → no fold from foreign state", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-foreign-fold");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    ctx.service.transitionMission(String(m.mission_id), "READY", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(String(m.mission_id), "RUNNING", "PAIR_MISSION_RUNTIME");
+    biz.board(String(b.business_id));
+    const w = routineItems(ctx.store)[0]!;
+    expect(String(w.status)).toBe("IN_PROGRESS");
+    const foreign = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "foreign", operator_id: "op" });
+    runMissionToFailed(ctx, String(foreign.mission_id));
+    appendMission(ctx, String(w.work_item_id), String(foreign.mission_id));
+    biz.board(String(b.business_id)); // sync → lineage violation → quarantine
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // The foreign mission's state was NEVER folded into the mirror.
+    const synced = ctx.store.listEvents("work_item", String(w.work_item_id))
+      .filter((e) => {
+        if (String(e.event_type) !== "WORK_ITEM_STATUS_SYNCED") return false;
+        const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+        return String(md.mission_id ?? "") === String(foreign.mission_id);
+      });
+    expect(synced).toHaveLength(0);
+  });
+
+  it("P14-FC-R2-FOREIGN-TERMINAL-CANNOT-BYPASS-ACTIVE-MISSION-GATE: openWorkItem over [scheduler RUNNING, foreign FAILED] fails closed — zero new intent/binding/mission", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-open-gate");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    ctx.service.transitionMission(String(m.mission_id), "READY", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(String(m.mission_id), "RUNNING", "PAIR_MISSION_RUNTIME");
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    const foreign = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "foreign", operator_id: "op" });
+    runMissionToFailed(ctx, String(foreign.mission_id));
+    appendMission(ctx, wid, String(foreign.mission_id));
+    const missionsBefore = ctx.store.list("mission").length;
+    const bindingsBefore = ctx.store.list("work_open_binding").length;
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_ROUTINE_PROVENANCE_CORRUPT");
+    const after = ctx.store.get("work_item", wid);
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // Zero new open intent, binding, mission, dispatch.
+    expect(after.pending_open_id ?? null).toBeNull();
+    expect(ctx.store.list("mission")).toHaveLength(missionsBefore);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(bindingsBefore);
+    expect(ctx.store.listEvents("work_item", wid)
+      .filter((e) => String(e.event_type) === "WORK_ITEM_OPENED")).toHaveLength(0);
+  });
+
+  it("P14-FC-R2-FOREIGN-COMPLETED-MISSION-CANNOT-PROJECT-DONE: fully canonical foreign completion still cannot fold the mirror", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-foreign-done");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    // A foreign mission carrying the FULL canonical completion chain —
+    // but zero routine/open provenance — still cannot project DONE.
+    const foreign = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "foreign", operator_id: "op" });
+    canonicallyCompleteMission(ctx.store, ctx.service, String(foreign.mission_id));
+    appendMission(ctx, wid, String(foreign.mission_id));
+    biz.board(String(b.business_id));
+    const after = ctx.store.get("work_item", wid);
+    expect(String(after.status)).not.toBe("DONE");
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(wcpOf(ctx.store, wid)).toBeNull();
+  });
+
+  it("P14-FC-R2-TRAILING-UNBOUND-MISSION-AFTER-PROMOTION-FAILS: promoted item + foreign trailing → quarantine", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-promoted-trailing");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    runMissionToFailed(ctx, String(m.mission_id));
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    biz.openWorkItem(wid, "op"); // promote: mission_ids=[sched, bound]
+    expect((ctx.store.get("work_item", wid).mission_ids as string[]).length).toBe(2);
+    const foreign = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "foreign", operator_id: "op" });
+    runMissionToFailed(ctx, String(foreign.mission_id));
+    appendMission(ctx, wid, String(foreign.mission_id));
+    biz.syncWorkItem(wid);
+    const after = ctx.store.get("work_item", wid);
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-FC-R2-CANONICAL-BOUND-TRAILING-MISSION-PASSES: scheduler terminal → governed reopen → WOB-proven trailing → lineage passes → WCP", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-bound-passes");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    runMissionToFailed(ctx, String(m.mission_id));
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const row = ctx.store.get("work_item", wid);
+    const mids = row.mission_ids as string[];
+    expect(mids).toEqual([String(m.mission_id), expect.any(String)]);
+    const boundMid = String(mids[1]);
+    // The lineage validator itself passes — trailing id is a canonical
+    // bound attempt of the same item (WOB BOUND + bound_open_id pin).
+    assertCanonicalRoutineLineage(ctx.store, row);
+    canonicallyCompleteMission(ctx.store, ctx.service, boundMid);
+    const done = biz.syncWorkItem(wid);
+    expect(String(done.status)).toBe("DONE");
+    const wcp = wcpOf(ctx.store, wid)!;
+    expect(String(wcp.mission_id)).toBe(boundMid);
+    expect(biz.proveWorkItemDone(ctx.store.get("work_item", wid))).toBe(true);
+  });
+
+  it("P14-FC-R2-MULTIPLE-CANONICAL-REOPENS-PRESERVE-LINEAGE: scheduler + bound1 terminal + bound2 — every trailing provenance-checked, no dup execution", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-multi-reopen");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    runMissionToFailed(ctx, String(m.mission_id));
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    // Reopen 1 → bound attempt 1 → FAILED → item BLOCKED.
+    biz.openWorkItem(wid, "op");
+    const mid1 = String((ctx.store.get("work_item", wid).mission_ids as string[]).slice(-1)[0]);
+    runMissionToFailed(ctx, mid1);
+    expect(String(biz.syncWorkItem(wid).status)).toBe("BLOCKED");
+    // Reopen 2 → bound attempt 2 → canonical completion.
+    biz.openWorkItem(wid, "op");
+    const row = ctx.store.get("work_item", wid);
+    const mids = row.mission_ids as string[];
+    const mid2 = String(mids[2]);
+    expect(mids).toEqual([String(m.mission_id), mid1, mid2]);
+    assertCanonicalRoutineLineage(ctx.store, row);
+    // Exactly two canonical bindings — one per open, all pinned to wid.
+    const bindings = ctx.store.list("work_open_binding")
+      .filter((x) => String(x.work_item_id) === wid && String(x.state) === "BOUND");
+    expect(bindings.map((x) => String(x.mission_id)).sort())
+      .toEqual([mid1, mid2].sort());
+    canonicallyCompleteMission(ctx.store, ctx.service, mid2);
+    const done = biz.syncWorkItem(wid);
+    expect(String(done.status)).toBe("DONE");
+    expect(String(wcpOf(ctx.store, wid)!.mission_id)).toBe(mid2);
+    expect(anchorEvents(ctx.store, wid)).toHaveLength(1);
+  });
+
+  it("P14-FC-R2-MISSION-PROJECT-MISMATCH-FAILS: mission.project_id != schedule.project_id → fire proof fails → quarantine", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-proj-mismatch");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    const mission = ctx.store.get("mission", String(m.mission_id));
+    mission.project_id = "PRJ_foreign_project";
+    ctx.store.put("mission", String(m.mission_id), mission, Number(mission.version));
+    biz.syncWorkItem(wid);
+    const after = ctx.store.get("work_item", wid);
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-FC-R2-OCCURRENCE-BUSINESS-SCOPE-MISMATCH-FAILS: occurrence.business_id != routine business → fire proof fails → quarantine", async () => {
+    const { ctx, biz, schedules } = makeStack("r2-occ-biz-mismatch");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    const occ = ctx.store.list("schedule_occurrence")
+      .find((o) => String(o.mission_id) === String(m.mission_id))!;
+    occ.business_id = "BIZ_foreign_scope";
+    ctx.store.put("schedule_occurrence", String(occ.occurrence_id), occ, Number(occ.version));
+    biz.syncWorkItem(wid);
+    const after = ctx.store.get("work_item", wid);
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
   });
 });

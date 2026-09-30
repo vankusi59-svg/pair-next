@@ -546,6 +546,89 @@ ok("FC-R1 restart zero-dup (1 mirror each, 1 WGM, 1 binding, 1 WCP)",
   anchorsOf(rtWid2).length === 1,
   `items=${rtItemsOf().length} status=${rtFinal2.status} anchors=${anchorsOf(rtWid2).length}`);
 
+// ================= FC-R2: routine mission-lineage tamper =================
+// genuine scheduler mission stays LIVE; a foreign terminal mission id is
+// appended to the mirror's mission_ids → restart/board must quarantine;
+// openWorkItem must fail closed — zero new mission/binding/dispatch/WCP.
+// Occurrence 3: fire → mirror IN_PROGRESS (scheduler mission RUNNING).
+await fireRoutine("2999-02-01T00:00:00.000Z");
+const occs3 = rows("schedule_occurrence")
+  .filter((o) => String(o.schedule_id) === schedId && o.mission_id != null &&
+    ![rtMid1, rtMid2].includes(String(o.mission_id)));
+const rtMid3 = String(occs3[occs3.length - 1]?.mission_id ?? "");
+ok("FC-R2 third occurrence fired+bound", !!rtMid3 && rtMid3 !== rtMid2,
+  `mid3=${rtMid3}`);
+svc2.transitionMission(rtMid3, "READY", "PAIR_MISSION_RUNTIME");
+svc2.transitionMission(rtMid3, "RUNNING", "PAIR_MISSION_RUNTIME");
+await board();
+const rtWid3 = String(rtItemsOf().find((w) =>
+  (w.mission_ids ?? []).includes(rtMid3))?.work_item_id ?? "");
+ok("FC-R2 live scheduler mirror projected", !!rtWid3 &&
+  String((await wi(rtWid3)).status) === "IN_PROGRESS",
+  `wid3=${rtWid3} status=${(await wi(rtWid3)).status}`);
+// Inject a FOREIGN terminal mission id into the mirror's lineage.
+const foreign = await api("/api/missions", "POST",
+  { project_id: projectId, goal: "foreign tail" });
+const fMid = String(foreign.data?.mission_id ?? "");
+svc2.transitionMission(fMid, "READY", "PAIR_MISSION_RUNTIME");
+svc2.transitionMission(fMid, "RUNNING", "PAIR_MISSION_RUNTIME");
+svc2.transitionMission(fMid, "FAILED", "PAIR_MISSION_RUNTIME");
+{
+  const s = storeOf();
+  const w = s.get("work_item", rtWid3);
+  w.mission_ids = [rtMid3, fMid];
+  s.put("work_item", rtWid3, w, Number(w.version));
+}
+// RESTART — the corrupted lineage survives a process boundary; board must
+// quarantine, never fold the foreign state, never open a replacement.
+srv = await restart(srv);
+await board(); await board();
+const rtQ = await wi(rtWid3);
+ok("FC-R2 foreign tail quarantined (restart+board, no foreign fold)",
+  String(rtQ.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT" &&
+  (rtQ.mission_ids ?? []).length === 2,
+  `blocked=${rtQ.blocked_code ?? ""} mids=${(rtQ.mission_ids ?? []).length}`);
+const missionsBefore = rows("mission").length;
+const openRes = await openWI(rtWid3);
+const rtQ2 = await wi(rtWid3);
+ok("FC-R2 open gate fail-closed — zero new mission/binding/intent/WCP",
+  openRes.status !== 200 &&
+  rows("mission").length === missionsBefore &&
+  bindingsOf(rtWid3).length === 0 &&
+  (rtQ2.pending_open_id ?? null) === null &&
+  !wcpOf(rtWid3),
+  `open=${openRes.status} missionsΔ=${rows("mission").length - missionsBefore} ` +
+  `bindings=${bindingsOf(rtWid3).length} wcp=${!!wcpOf(rtWid3)}`);
+
+// Legitimate canonical reopen still succeeds: occurrence 4 → FAILED run →
+// BLOCKED mirror → promote → canonical WGM + bound mission → WCP.
+await fireRoutine("2999-03-01T00:00:00.000Z");
+const occs4 = rows("schedule_occurrence")
+  .filter((o) => String(o.schedule_id) === schedId && o.mission_id != null &&
+    ![rtMid1, rtMid2, rtMid3].includes(String(o.mission_id)));
+const rtMid4 = String(occs4[occs4.length - 1]?.mission_id ?? "");
+svc2.transitionMission(rtMid4, "READY", "PAIR_MISSION_RUNTIME");
+svc2.transitionMission(rtMid4, "RUNNING", "PAIR_MISSION_RUNTIME");
+svc2.transitionMission(rtMid4, "FAILED", "PAIR_MISSION_RUNTIME");
+await board();
+const rtWid4 = String(rtItemsOf().find((w) =>
+  (w.mission_ids ?? []).includes(rtMid4))?.work_item_id ?? "");
+const promote4 = await openWI(rtWid4);
+const boundRow4 = await wi(rtWid4);
+const boundMid4 = String((boundRow4.mission_ids ?? []).slice(-1)[0] ?? "");
+ok("FC-R2 legitimate canonical reopen still succeeds",
+  promote4.status === 200 && !!rtWid4 && boundMid4 !== rtMid4 &&
+  (boundRow4.mission_ids ?? []).length === 2 &&
+  bindingsOf(rtWid4).length === 1 &&
+  rows("work_graph_membership").filter((g) => String(g.work_item_id) === rtWid4).length === 1,
+  `promote=${promote4.status} boundMid=${boundMid4} mids=${(boundRow4.mission_ids ?? []).length}`);
+completeMission(boundMid4);
+const rtDone4 = await fold(rtWid4);
+ok("FC-R2 reopened routine completes WGM→binding→WCP",
+  String(rtDone4.status) === "DONE" && !!wcpOf(rtWid4) &&
+  String(wcpOf(rtWid4).mission_id) === boundMid4,
+  `status=${rtDone4.status} wcp=${!!wcpOf(rtWid4)}`);
+
 // ================= exactly-once audit over the whole store =================
 {
   const wcps = rows("work_completion");
@@ -566,12 +649,15 @@ ok("FC-R1 restart zero-dup (1 mirror each, 1 WGM, 1 binding, 1 WCP)",
     .flatMap((w) => acceptOf(String(w.work_item_id)))
     .length;
   ok("FC-XO exactly-one WCP+anchor per DONE item",
-    dupAnchor === 0 && missingWcp === 0 && wcps.length === 5 + 1 + 1, // A..E + parent + promoted routine
+    dupAnchor === 0 && missingWcp === 0 && wcps.length === 5 + 1 + 2, // A..E + parent + 2 promoted routines
     `wcps=${wcps.length} dupAnchors=${dupAnchor} missingWcp=${missingWcp}`);
   ok("FC-XO exactly-one ACCEPT total", acceptTotal === 1, `accepts=${acceptTotal}`);
   const inbox = await api(`/api/org-agents/${rev}/inbox`);
   ok("FC-XO ack receipt delivered", inbox.status === 200 &&
     ((inbox.data?.messages ?? []).length >= 1));
+  const v = storeOf().verifyIntegrity();
+  ok("FC-XO store integrity verified", Number(v.errors ?? 0) === 0,
+    `errors=${v.errors ?? 0}`);
 }
 
 srv.kill("SIGTERM");

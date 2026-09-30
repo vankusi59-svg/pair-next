@@ -23,8 +23,9 @@
 import { digest, utcnow } from "./canonical.js";
 import type { PairEvidenceStore } from "./store.js";
 import { IntegrityError } from "./errors.js";
+import { validateWorkOpenBindingById } from "./work-open-binding.js";
 
-export type Row = Record<string, unknown>;
+export type Row = Record<string, unknown> & { version: number };
 
 const str = (v: unknown): string | null =>
   typeof v === "string" && v.length > 0 ? v : null;
@@ -67,7 +68,18 @@ export function assertCanonicalRoutineFire(
   if (String(schedule.project_id ?? "") !== String(business.project_id)) {
     fail(`schedule ${scheduleId} project mismatch`);
   }
+  // R2 — the mission's own scope is pinned DIRECTLY: project_id is a
+  // top-level mission field, business scope is the control plane's
+  // pinned business_context (never inferred from caller-visible
+  // metadata.business_id alone — that is checked separately below).
+  if (String(mission.project_id ?? "") !== String(schedule.project_id)) {
+    fail(`mission ${str(mission.mission_id)} project != schedule project`);
+  }
   const md = (mission.metadata as Record<string, unknown> | undefined) ?? {};
+  const bizCtx = (md.business_context as Record<string, unknown> | undefined) ?? {};
+  if (String(bizCtx.business_id ?? "") !== String(routine.business_id)) {
+    fail(`mission ${str(mission.mission_id)} business scope mismatch`);
+  }
   const occurrenceId = str(md.schedule_occurrence_id);
   if (!occurrenceId) fail(`mission ${str(mission.mission_id)} has no schedule_occurrence_id`);
   const occ = store.tryGet("schedule_occurrence", occurrenceId!) as Row | null;
@@ -81,6 +93,9 @@ export function assertCanonicalRoutineFire(
   const missionId = str(mission.mission_id);
   if (String(occ.mission_id ?? "") !== missionId) {
     fail(`occurrence ${occurrenceId} bound to ${String(occ.mission_id ?? "null")} ≠ ${missionId}`);
+  }
+  if (String(occ.business_id ?? "") !== String(routine.business_id)) {
+    fail(`occurrence ${occurrenceId} business scope mismatch`);
   }
   if (String(md.schedule_id ?? "") !== scheduleId) {
     fail(`mission ${missionId} schedule_id claim mismatch`);
@@ -167,6 +182,87 @@ export function proveCanonicalRoutineMirror(
 ): boolean {
   try {
     assertCanonicalRoutineMirror(store, item);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Canonical routine mission-lineage proof (P14 FC R2).
+ *
+ * `assertCanonicalRoutineMirror` alone proves mission_ids[0] — but the
+ * authority seams fold the LAST id. The lineage closes that gap:
+ *
+ *   A. DISPLAY-ONLY MIRROR — mission_ids === [projected scheduler
+ *      mission] exactly; no trailing id is ever permitted.
+ *   B. PROMOTED/REOPENED ITEM — mission_ids[0] stays the projected
+ *      scheduler mission forever; every trailing id must be a
+ *      canonical bound attempt of THE SAME work item: mission row
+ *      exists, carries the internal origin proof `bound_open_id`, the
+ *      exact `work_open_binding` resolves and validates the FULL chain
+ *      (work item, business, project pair, reserved mission_id, agent
+ *      scope) in BOUND state, and bound_at order is non-decreasing
+ *      with the open history. A foreign or unbound id anywhere in
+ *      trailing history fails closed.
+ *
+ * Callers that require the zero-authority display shape additionally
+ * check `mission_ids.length === 1`.
+ */
+export function assertCanonicalRoutineLineage(
+  store: PairEvidenceStore,
+  item: Row,
+): RoutineMirrorProof {
+  const fail = (r: string): never => {
+    throw new IntegrityError("FAIL_CLOSED_ROUTINE_PROVENANCE_CORRUPT", r);
+  };
+  const proof = assertCanonicalRoutineMirror(store, item);
+  const wid = str(item.work_item_id);
+  const mids = (item.mission_ids as string[] | undefined) ?? [];
+  if (new Set(mids.map((m) => String(m))).size !== mids.length) {
+    fail(`item ${wid} mission history contains duplicate ids`);
+  }
+  let lastBoundAt = "";
+  for (let i = 1; i < mids.length; i++) {
+    const mid = String(mids[i]);
+    const mission = store.tryGet("mission", mid) as Row | null;
+    if (mission === null) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ROUTINE_PROVENANCE_CORRUPT",
+        `item ${wid} trailing mission ${mid} missing`,
+      );
+    }
+    const openId = str(mission.bound_open_id);
+    if (!openId) {
+      fail(`item ${wid} trailing mission ${mid} is not a canonical bound attempt`);
+    }
+    const res = validateWorkOpenBindingById(store, openId!, {
+      forWorkItem: item,
+      forMission: mission,
+      requireState: "BOUND",
+      // PROVENANCE: a validly bound mission stays bound even if the
+      // agent is PAUSED/TERMINATED afterwards.
+      mode: "PROVENANCE",
+    });
+    if (!res.ok) {
+      fail(`item ${wid} trailing mission ${mid} binding ${openId}: ${res.reason}`);
+    }
+    const boundAt = str(res.binding?.bound_at) ?? "";
+    if (lastBoundAt && boundAt && boundAt < lastBoundAt) {
+      fail(`item ${wid} mission history order inconsistent with canonical open history`);
+    }
+    if (boundAt) lastBoundAt = boundAt;
+  }
+  return proof;
+}
+
+/** Boolean form — false on any lineage gap. */
+export function proveCanonicalRoutineLineage(
+  store: PairEvidenceStore,
+  item: Row,
+): boolean {
+  try {
+    assertCanonicalRoutineLineage(store, item);
     return true;
   } catch {
     return false;

@@ -572,6 +572,38 @@ Two routine-boundary defects remediated narrowly (zero redesign):
 - Regression re-run all green (N22 2185+2 pre-existing P5 env-gap /
   N20 2187/0); report §18-19.
 
+#### FC R2 remediation (independent-audit BLOCKED → closed, same PR)
+
+One mission-lineage gap remediated narrowly (zero redesign): the R1
+validator proved `mission_ids[0]` while authority seams consumed
+`mission_ids[last]` — an appended foreign terminal mission could fold
+mirror state and hide a live scheduler mission from the open gate.
+
+- **Canonical routine mission-lineage proof**
+  (`assertCanonicalRoutineLineage`): display-only mirror ⇒
+  `mission_ids` exactly `[projected_scheduler_mission]`; promoted ⇒
+  `mids[0]` stays projected + every trailing id is a canonical bound
+  attempt of the SAME item (mission row + `bound_open_id` +
+  `validateWorkOpenBindingById` BOUND/PROVENANCE for exact
+  item/mission/business/project + non-decreasing `bound_at` history
+  order; WORK_ITEM_OPENED not required — reconcile path doesn't write
+  it, binding is the authority). Any violation → quarantine, no
+  fold/open/binding/mission/WCP.
+- **All seams consume it**: `syncWorkItem` routine exception only when
+  `mids.length===1` AND lineage proof (last==projected);
+  `syncRoutineMirror` asserts lineage + `mids.length===1`;
+  `reconcileWorkLifecycle` routine-DONE same; `promoteRoutineMirror`
+  re-asserts before WGM. Foreign tail hiding a live mission → open
+  fails closed (zero intent/binding/mission/dispatch).
+- **Direct project pin**: `mission.project_id === schedule.project_id
+  === business.project_id` + `business_context.business_id` +
+  `occurrence.business_id === routine.business_id`.
+- **9 `P14-FC-R2-*` tests**; Golden E2E **60/60** (foreign tail →
+  restart quarantine → open fail-closed zero mints → legitimate reopen
+  still succeeds → `verifyIntegrity` 0 errors).
+- Regression **658/658**; N22 2194+2 pre-existing P5 env-gap / N20
+  2196/0; report §20-21.
+
 ## Not yet
 
 - Workforce lifecycle beyond governed completion (Phase 4+), CEO

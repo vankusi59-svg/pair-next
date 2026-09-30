@@ -379,3 +379,116 @@ membership model. Convergence declaration stands.
 ## 19. R1 classification
 
 **`P14_WORKFORCE_V2_FINAL_CLOSURE_R1_PENDING_INDEPENDENT_AUDIT`**
+
+## 20. Remediation R2 — routine mission-lineage closure
+
+Independent audit of R1 classified
+`P14_WORKFORCE_V2_FINAL_CLOSURE_R1_FINAL_INDEPENDENT_AUDIT_BLOCKED`:
+the routine validator proved `mission_ids[0]` while authority seams
+consumed `mission_ids[last]` — a foreign terminal mission id appended
+to a mirror could (a) drive `syncRoutineMirror` state folds and
+(b) hide a still-live scheduler/bound mission from `openWorkItem`'s
+active-mission gate, violating "no replacement execution while linked
+canonical work is live".
+
+### 20.1 Design — ONE canonical routine mission-lineage proof
+
+`routine-mirror.ts: assertCanonicalRoutineLineage(store, item)`
+consumes the R1 mirror proof for `mission_ids[0]` and then enforces
+exactly two legal shapes:
+
+- **A. Display-only mirror** — `mission_ids` is exactly
+  `[projected_scheduler_mission]`; every exception seam that honours
+  the routine path additionally requires `last == mids[0]` (and
+  `mids.length === 1`), so a trailing foreign id can never reach
+  `syncRoutineMirror` or the DONE-fold in `reconcileWorkLifecycle`.
+- **B. Promoted/reopened item** — `mids[0]` stays the projected
+  mission; every trailing id must be a canonical bound attempt of the
+  SAME item: mission row exists, `mission.bound_open_id` resolves to
+  a `work_open_binding` that validates under
+  `validateWorkOpenBindingById(..., {forWorkItem, forMission,
+  requireState:"BOUND", mode:"PROVENANCE"})` — exact work item /
+  exact mission / same business / same project, BOUND state,
+  `bound_open_id` origin — and `bound_at` order is non-decreasing
+  (history order consistent with canonical open history). A
+  `WORK_ITEM_OPENED` event is NOT required for trailing missions:
+  `reconcileOpenIntent` links bound missions without writing that
+  event — the binding row is the authority.
+
+Any violation → `FAIL_CLOSED_ROUTINE_PROVENANCE_CORRUPT` → quarantine
+→ no fold, no open, no new binding, no new mission, no WCP.
+
+### 20.2 Seam consumption
+
+- `syncWorkItem` (unbound branch): routine exception only when
+  `mission_ids.length === 1` AND `proveCanonicalRoutineLineage`
+  succeeds — i.e. last == projected AND the full fire proof. Any
+  other shape → quarantine (routine items can never fall into the
+  generic unbound path).
+- `syncRoutineMirror`: `assertCanonicalRoutineLineage` (catch →
+  quarantine) AND `mids.length === 1 && mission_id === mids[0]` —
+  foreign tail can never be folded.
+- `reconcileWorkLifecycle` (routine DONE branch):
+  `mids.length === 1 && proveCanonicalRoutineLineage` before the
+  mission-completion proof; otherwise quarantine.
+- `promoteRoutineMirror` / `openWorkItem`: the item must already
+  carry `blocked_code === null` (quarantined rows fail there) and
+  `promoteRoutineMirror` re-runs `assertCanonicalRoutineLineage`
+  before WGM validation — a foreign tail hiding a live mission makes
+  open fail closed with zero new intent/binding/mission/dispatch.
+
+### 20.3 Project pin closure
+
+`assertCanonicalRoutineFire` now pins scope DIRECTLY:
+`mission.project_id === schedule.project_id === business.project_id`
+(top-level mission field — not inferred from `metadata.business_id`),
+mission `metadata.business_context.business_id === routine.business_id`
+(control-plane pinned scope; `metadata.business_id` pin retained from
+R1), plus `occurrence.business_id === routine.business_id` — the
+canonical occurrence scope field written by `claimOccurrence` from the
+schedule's pinned business.
+
+### 20.4 R2 tests — `P14-FC-R2-*` (9)
+
+`-APPENDED-FOREIGN-TERMINAL-MISSION-FAILS-LINEAGE`,
+`-FOREIGN-LAST-MISSION-CANNOT-DRIVE-MIRROR-STATE`,
+`-FOREIGN-TERMINAL-CANNOT-BYPASS-ACTIVE-MISSION-GATE`,
+`-FOREIGN-COMPLETED-MISSION-CANNOT-PROJECT-DONE`,
+`-TRAILING-UNBOUND-MISSION-AFTER-PROMOTION-FAILS`,
+`-CANONICAL-BOUND-TRAILING-MISSION-PASSES`,
+`-MULTIPLE-CANONICAL-REOPENS-PRESERVE-LINEAGE`,
+`-MISSION-PROJECT-MISMATCH-FAILS`,
+`-OCCURRENCE-BUSINESS-SCOPE-MISMATCH-FAILS`.
+
+### 20.5 R2 E2E additions (Golden FC E2E now 60/60)
+
+Occurrence 3 fired + bound → live RUNNING scheduler mirror → foreign
+FAILED mission id appended via direct store write → RESTART → board
+quarantines (`TERMINAL_PROVENANCE_CORRUPT`, mids preserved at 2, no
+foreign fold) → `openWorkItem` → **409, Δmissions=0, bindings=0,
+pending_open_id=null, no WCP** → separately: occurrence 4 → FAILED →
+BLOCKED mirror → legitimate canonical reopen still succeeds (promote
+→ WGM + bound mission → WCP → DONE). Store `verifyIntegrity` = 0
+errors as a final audit check.
+
+### 20.6 R2 regression / platform matrix
+
+- Focused: P14-P3 suite **97/97** (R1 15 + R2 9 + prior preserved).
+- Regression: P3 97 · P2 55 · Phase1 73 · P14F 35 · RH 11 · P13 67 ·
+  P12 71 · P11+r 103 · P10 31 · P9 79 · P6 36 = **658/658**.
+- **Node22: 2194 pass + 2 fail** — the same two pre-existing P5 env-gap
+  failures (executor probes expecting absent DSH/CODEX binaries;
+  unchanged, unrelated to this diff).
+- **Node20: 2196/0**. tsc clean · `pnpm build` PASS ·
+  `pnpm audit` 0 high (1 low + 8 moderate transitive, pre-existing).
+
+### 20.7 R2 convergence reassessment
+
+Closed by strengthening the existing routine provenance validator and
+consuming it at the existing seams — no second runtime/planner/router/
+completion authority and no routine execution authority introduced.
+Convergence declaration stands.
+
+## 21. R2 classification
+
+**`P14_WORKFORCE_V2_FINAL_CLOSURE_R2_PENDING_INDEPENDENT_AUDIT`**
