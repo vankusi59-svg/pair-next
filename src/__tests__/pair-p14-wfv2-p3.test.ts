@@ -1823,3 +1823,127 @@ describe("P14-P3 R2 — REWORK event self-consistency + advanced basis", () => {
     expect(acceptEvents(re.ctx.store, pid)).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// P14-P3 R3 — canonical plan manifest omission safety (audited R2 gaps).
+// The task authority is the active plan's own `task_ids` manifest — never
+// a task-table scan: missing declared tasks (omission), drifted declared
+// tasks (mission_id / plan_id), and injected undeclared tasks all fail
+// closed; so do a missing/foreign active plan row and forged plan-commit
+// evidence.
+// ---------------------------------------------------------------------------
+
+/** A leaf whose bound mission completed canonically over a 2-task plan. */
+function twoTaskCompletedLeaf(label: string) {
+  const { ctx, biz } = makeStack(label);
+  const b = makeBiz(biz, ctx.projectId);
+  const a = makeAgent(biz, String(b.business_id), "lead");
+  const w = makeItem(biz, String(b.business_id), {
+    title: label, assignee_agent_id: String(a.agent_id) });
+  const wid = String(w.work_item_id);
+  biz.openWorkItem(wid, "op");
+  const mid = String(
+    (ctx.store.get("work_item", wid).mission_ids as string[]).at(-1));
+  canonicallyCompleteMission(ctx.store, ctx.service, mid, { tasks: 2 });
+  const planId = String(ctx.service.activeRevision(mid).plan_id);
+  const declared = (ctx.store.get("plan", planId).task_ids as string[])
+    .map(String);
+  const dbPath = path.join(ctx.dir, "pair.db");
+  return { ctx, biz, wid, mid, planId, declared, dbPath };
+}
+
+/** The completion proof fails AND no work surface advances (no
+ *  REVIEW_REQUIRED / DONE / WCP — the item quarantines). */
+function expectMissionProofFailsClosed(
+  ctx: ReturnType<typeof makeCtxOn>,
+  biz: ReturnType<typeof makeStack>["biz"],
+  wid: string, mid: string,
+) {
+  expect(proveCanonicalMissionCompletion(
+    ctx.store, ctx.store.get("mission", mid))).toBe(false);
+  biz.syncWorkItem(wid);
+  const row = ctx.store.get("work_item", wid);
+  expect(["REVIEW_REQUIRED", "DONE"]).not.toContain(String(row.status));
+  expect(String(row.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+  expect(wcpOf(ctx.store, wid)).toBeNull();
+}
+
+describe("P14-P3 R3 — canonical plan manifest omission safety", () => {
+  it("P14-P3-R3-MISSING-DECLARED-PLAN-TASK-FAILS: a hard-deleted declared task voids mission completion", () => {
+    const { ctx, biz, wid, mid, declared, dbPath } =
+      twoTaskCompletedLeaf("r3-omit");
+    deleteRow(dbPath, "task", declared[1]!);
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R3-DECLARED-TASK-PLAN-DRIFT-FAILS: a declared task claiming a foreign plan fails closed", () => {
+    const { ctx, biz, wid, mid, declared } =
+      twoTaskCompletedLeaf("r3-plandrift");
+    const t = ctx.store.get("task", declared[0]!);
+    t.plan_id = "PLN_FOREIGN";
+    ctx.store.put("task", declared[0]!, t, Number(t.version));
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R3-DECLARED-TASK-MISSION-DRIFT-FAILS: a declared task claiming a foreign mission fails closed", () => {
+    const { ctx, biz, wid, mid, declared } =
+      twoTaskCompletedLeaf("r3-missiondrift");
+    const t = ctx.store.get("task", declared[1]!);
+    t.mission_id = "MSN_FOREIGN";
+    ctx.store.put("task", declared[1]!, t, Number(t.version));
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R3-UNDECLARED-EXTRA-TASK-FAILS: an injected task claiming the active mission+plan fails closed", () => {
+    const { ctx, biz, wid, mid, planId } =
+      twoTaskCompletedLeaf("r3-inject");
+    ctx.store.put("task", "TSK_INJECTED", {
+      task_id: "TSK_INJECTED", task_key: "TX",
+      mission_id: mid, plan_id: planId, order: 2,
+      title: "injected", task_instruction: "i",
+      status: "COMPLETED", created_at: utcnow(), version: 0 }, 0);
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R3-MISSING-ACTIVE-PLAN-ROW-FAILS: deleting the active plan row fails closed", () => {
+    const { ctx, biz, wid, mid, planId, dbPath } =
+      twoTaskCompletedLeaf("r3-noplan");
+    deleteRow(dbPath, "plan", planId);
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R3-FOREIGN-ACTIVE-PLAN-ROW-FAILS: a plan row claiming a foreign mission fails closed", () => {
+    const { ctx, biz, wid, mid, planId } =
+      twoTaskCompletedLeaf("r3-foreignplan");
+    const plan = ctx.store.get("plan", planId);
+    plan.mission_id = "MSN_FOREIGN";
+    ctx.store.put("plan", planId, plan, Number(plan.version));
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R3-PLAN-COMMIT-EVIDENCE-MISMATCH-FAILS: forged commit-anchor metadata fails closed", () => {
+    const { ctx, biz, wid, mid, dbPath } =
+      twoTaskCompletedLeaf("r3-commitforge");
+    const anchor = ctx.store.listEvents("mission", mid)
+      .find((e) => String(e.event_type) === "MISSION_PLAN_COMMITTED")!;
+    tamperEventMetadata(dbPath, String(anchor.event_id),
+      (m) => { m.revision = 999; });
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R3-PLAN-TASK-MANIFEST-COMPLETE-PASSES: an intact multi-task manifest completes and mints WCP", () => {
+    const { ctx, biz, wid, mid, declared } =
+      twoTaskCompletedLeaf("r3-complete");
+    expect(declared.length).toBe(2);
+    expect(proveCanonicalMissionCompletion(
+      ctx.store, ctx.store.get("mission", mid))).toBe(true);
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("DONE");
+    const wcp = wcpOf(ctx.store, wid);
+    expect(wcp).not.toBeNull();
+    expect(String(wcp!.mission_id)).toBe(mid);
+    // Re-validation stays clean — the manifest resolves identically.
+    biz.reconcileWorkLifecycle();
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("DONE");
+  });
+});

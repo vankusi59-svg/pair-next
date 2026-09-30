@@ -453,14 +453,24 @@ authority derives only from canonical evidence.
   container's basis past a rejected pin (DONE is terminal —
   `delegateWorkItem` under a new completion authority unfences
   REVIEW_REQUIRED; same-basis stays fenced).
+- **R3 remediation**: the task authority is the canonical plan
+  manifest — `plan.task_ids` on the exact active `plan` entity
+  (hash-verified `mission_plan_revisions` → plan row exists, claims
+  this mission, PLANNED; mission.plan_id/plan_revision pins; exactly-one
+  `MISSION_PLAN_COMMITTED` anchor pinning plan_id+revision), never a
+  task-table scan. Live tasks claiming mission+plan must equal the
+  declared set exactly: omitted declared task, drifted declared task,
+  injected undeclared task, missing/foreign plan row, forged
+  commit-anchor metadata — all fail closed.
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE3_REPORT.md`; suite
-  `pair-p14-wfv2-p3.test.ts` (51 — 27 base + 14 `P14-P3-R1-*` +
-  9 `P14-P3-R2-*` + self-consistency; genuine worker_thread races)
-  + fresh-dir E2E 35/35 (real server, forge/quarantine, missing+FAIL
+  `pair-p14-wfv2-p3.test.ts` (59 total — R1+R2 suites preserved +
+  8 `P14-P3-R3-*`; genuine worker_thread races)
+  + fresh-dir E2E 37/37 (real server, forge/quarantine, missing+FAIL
   validation quarantine, reviewer-pause race, REWORK fence +
-  advanced-basis unfence, 3 restarts, zero dup anchors).
+  advanced-basis unfence, intact 2-task manifest completes, deleted
+  declared task quarantines, 3 restarts, zero dup anchors).
   Classification:
-  **`P14_WORKFORCE_V2_PHASE3_R2_PENDING_FINAL_AUDIT`**.
+  **`P14_WORKFORCE_V2_PHASE3_R3_PENDING_FINAL_AUDIT`**.
 
 ## Not yet
 

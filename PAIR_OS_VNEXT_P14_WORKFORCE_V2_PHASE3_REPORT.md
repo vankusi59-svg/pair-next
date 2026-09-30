@@ -394,4 +394,31 @@ REVIEW_REQUIRED → restart preserves → ACCEPT → DONE with exactly-one
 WCP/anchor. Both directions now pass: same basis fenced, advanced basis
 unfenced.
 
-Classification: **P14_WORKFORCE_V2_PHASE3_R2_PENDING_FINAL_AUDIT**
+## 22. R3 remediation design — omission-safe plan manifest
+
+**Task authority = canonical plan manifest.** Step (5) of
+`assertCanonicalMissionCompletion` no longer scans `store.list("task")`
+for "whatever tasks still claim the plan" — the complete declared task
+set is `plan.task_ids` on the exact active `plan` entity, resolved
+through the hash-verified `mission_plan_revisions` log. Plan provenance
+binding: the latest revision row must pin this `mission_id`; the `plan`
+entity must exist with `plan_id`/`mission_id`/`state === "PLANNED"`;
+`mission.plan_id`/`mission.plan_revision` must equal the active pair;
+exactly one `MISSION_PLAN_COMMITTED` anchor event must pin
+`new_state === plan_id` and `metadata.revision === revision`.
+
+**Manifest shape + set equality.** `plan.task_ids` must be a non-empty
+array with unique ids. The LIVE task set (tasks claiming this
+`mission_id` + `plan_id`) must equal the declared set exactly:
+- **omission** — a declared id with no live row →
+  `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` (a hard-deleted task voids the
+  mission — it cannot be silently dropped from the proof);
+- **drift** — a declared task whose `mission_id`/`plan_id`/`order`
+  moved → fail closed;
+- **injection** — a live task claiming the pair but absent from
+  `task_ids` → fail closed.
+
+Only after the manifest is proven does each declared task's full R2
+governed validated-execution chain get required.
+
+Classification: **P14_WORKFORCE_V2_PHASE3_R3_PENDING_FINAL_AUDIT**

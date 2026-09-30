@@ -269,22 +269,83 @@ export function assertCanonicalMissionCompletion(
   //      is that validated execution's.
   //    A handcrafted executor_execution — or a FAIL/missing validation
   //    — can never establish mission success.
+  //
+  //  R3: the task authority is the canonical PLAN MANIFEST, never a
+  //  task-table scan. The active plan revision resolves through the
+  //  hash-verified mission_plan_revisions log, the exact `plan` entity
+  //  (which must exist, claim this mission, and be PLANNED), the
+  //  mission's own plan_id/plan_revision pins, and the immutable
+  //  MISSION_PLAN_COMMITTED anchor event. `plan.task_ids` is the
+  //  complete declared task set — the LIVE task set claiming this
+  //  mission+plan must equal it exactly: a missing declared task is
+  //  omission-corruption, a declared task whose mission_id/plan_id
+  //  drifted is drift-corruption, and an extra task claiming the pair
+  //  is injection — all fail closed.
   const revisions = store.planRevisions(mid);
   if (!revisions.length) fail(`mission ${mid}: no plan revisions`);
   const active = revisions[revisions.length - 1]!;
   const planId = String(active.plan_id ?? "");
   const planRevision = Number(active.revision ?? 0);
+  if (String(active.mission_id ?? "") !== mid) {
+    fail(`mission ${mid}: active revision mission ${String(active.mission_id)}`);
+  }
   if (String(mission.plan_id ?? "") !== planId ||
       Number(mission.plan_revision ?? NaN) !== planRevision) {
     fail(`mission ${mid}: plan pin ${String(mission.plan_id)}/${String(mission.plan_revision)} != active ${planId}/${planRevision}`);
   }
-  const tasks = store.list("task").filter((t) =>
-    String(t.mission_id ?? "") === mid && String(t.plan_id ?? "") === planId);
-  if (!tasks.length) fail(`mission ${mid}: current plan has no tasks`);
+  const plan = store.tryGet("plan", planId) as Row | null;
+  if (!plan) fail(`mission ${mid}: active plan row ${planId} missing`);
+  if (String(plan.plan_id ?? "") !== planId ||
+      String(plan.mission_id ?? "") !== mid ||
+      String(plan.state ?? "") !== "PLANNED") {
+    fail(`mission ${mid}: plan ${planId} provenance mismatch`);
+  }
+  // The canonical immutable anchor for the active plan revision.
+  const commitEvidence = store.listEvents("mission", mid).filter((e) =>
+    String(e.event_type ?? "") === "MISSION_PLAN_COMMITTED" &&
+    String(e.new_state ?? "") === planId &&
+    Number((e.metadata as Record<string, unknown> | undefined)
+      ?.revision ?? NaN) === planRevision);
+  if (commitEvidence.length !== 1) {
+    fail(`mission ${mid}: ${commitEvidence.length} plan-commit anchors for ${planId}@${planRevision}`);
+  }
+  const declared = plan.task_ids;
+  if (!Array.isArray(declared) || declared.length === 0) {
+    fail(`mission ${mid}: plan ${planId} has no task manifest`);
+  }
+  const declaredIds = declared.map(String);
+  const declaredSet = new Set(declaredIds);
+  if (declaredSet.size !== declaredIds.length) {
+    fail(`mission ${mid}: plan ${planId} manifest has duplicate ids`);
+  }
+  const live = new Set(
+    store.list("task")
+      .filter((t) =>
+        String(t.mission_id ?? "") === mid &&
+        String(t.plan_id ?? "") === planId)
+      .map((t) => String(t.task_id ?? "")),
+  );
+  for (const tid of declaredIds) {
+    if (!live.has(tid)) fail(`mission ${mid}: declared task ${tid} missing`);
+  }
+  for (const tid of live) {
+    if (!declaredSet.has(tid)) {
+      fail(`mission ${mid}: undeclared task ${tid} claims active plan`);
+    }
+  }
   const executions = store.list("executor_execution");
   const validations = store.list("execution_validation");
-  for (const t of tasks) {
-    const tid = String(t.task_id ?? "");
+  for (const [index, tid] of declaredIds.entries()) {
+    const t = store.tryGet("task", tid) as Row | null;
+    if (!t) fail(`mission ${mid}: declared task ${tid} missing`);
+    if (String(t.task_id ?? "") !== tid ||
+        String(t.mission_id ?? "") !== mid ||
+        String(t.plan_id ?? "") !== planId) {
+      fail(`mission ${mid}: declared task ${tid} drifted from plan`);
+    }
+    if (Number(t.order ?? NaN) !== index) {
+      fail(`mission ${mid}: declared task ${tid} order ${String(t.order)}`);
+    }
     if (String(t.status ?? "") !== "COMPLETED") {
       fail(`mission ${mid}: task ${tid} status ${String(t.status)}`);
     }
