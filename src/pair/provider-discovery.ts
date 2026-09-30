@@ -12,6 +12,17 @@ import YAML from "yaml";
 import { ProviderCatalog } from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 
+/**
+ * DSH consumes settings.yaml on first launch (renames it settings.yaml.imported).
+ * Discovery still needs the catalog, so fall back to the consumed copy.
+ */
+export function dshSettingsPath(home: string): string | null {
+  const live = path.join(home, "settings.yaml");
+  if (fs.existsSync(live)) return live;
+  const imported = path.join(home, "settings.yaml.imported");
+  return fs.existsSync(imported) ? imported : null;
+}
+
 export interface DiscoveryContext {
   env: Record<string, string | undefined>;
   dshHome?: string;
@@ -85,11 +96,11 @@ export class DshConfigSource implements ProviderDiscoverySource {
   readonly sourceId = "DSH_PROVIDER_CATALOG";
   supports(context: DiscoveryContext): boolean {
     const home = context.dshHome;
-    return !!home && fs.existsSync(path.join(home, "settings.yaml"));
+    return !!home && dshSettingsPath(home) !== null;
   }
   discover(context: DiscoveryContext): ProviderCandidate[] {
     const home = context.dshHome!;
-    const raw = YAML.parse(fs.readFileSync(path.join(home, "settings.yaml"), "utf8")) as Record<string, unknown>;
+    const raw = YAML.parse(fs.readFileSync(dshSettingsPath(home)!, "utf8")) as Record<string, unknown>;
     const providers = ((raw["llm-pi-ai"] ?? {}) as Record<string, unknown>).providers as Record<string, Record<string, unknown>> | undefined;
     const out: ProviderCandidate[] = [];
     for (const [pid, cfg] of Object.entries(providers ?? {})) {

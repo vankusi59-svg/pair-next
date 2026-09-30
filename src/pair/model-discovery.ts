@@ -18,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { IntegrityError } from "./errors.js";
+import { dshSettingsPath } from "./provider-discovery.js";
 import type { ModelClaim } from "./model-catalog.js";
 import { ModelEvidenceCatalog } from "./model-catalog.js";
 import { utcnow } from "./canonical.js";
@@ -146,8 +147,8 @@ export class DshConfigModelAdapter extends ModelDiscoveryAdapter {
   async listModels(entry: Record<string, unknown>, context: DiscoveryRunContext): Promise<ModelClaim[]> {
     const home = context.dshHome ?? this.dshHome;
     if (!home) return [];
-    const settingsPath = path.join(home, "settings.yaml");
-    if (!fs.existsSync(settingsPath)) return [];
+    const settingsPath = dshSettingsPath(home);
+    if (!settingsPath) return [];
     const raw = YAML.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
     const providers = ((raw["llm-pi-ai"] ?? {}) as Record<string, unknown>).providers as
       | Record<string, Record<string, unknown>>

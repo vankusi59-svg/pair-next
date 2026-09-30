@@ -64,6 +64,13 @@ OBX=$(cat "$PAIR_HOME/pair-obx-token")
 BRK=$(cat "$PAIR_HOME/pair-brk-token")
 
 # --- 5. mission-control server -------------------------------------------------
+# DSH consumes settings.yaml on first launch (renames it .imported); discovery
+# still needs the catalog, so restore it before boot.
+DSH_HOME="${PAIR_DSH_HOME:-$HOME/.pair-dsh-home}"
+if [ ! -f "$DSH_HOME/settings.yaml" ] && [ -f "$DSH_HOME/settings.yaml.imported" ]; then
+  cp "$DSH_HOME/settings.yaml.imported" "$DSH_HOME/settings.yaml"
+  echo "==> restored $DSH_HOME/settings.yaml from .imported"
+fi
 MC_LOG="$LOG_DIR/mc-serve.log"
 (
   cd "$ROOT"
