@@ -33,6 +33,7 @@ import {
   newId,
   utcnow,
 } from "../pair/index.js";
+import { fireRoutineMission } from "./canonical-mission-completion.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11r1-"));
 let counter = 0;
@@ -539,11 +540,13 @@ describe("R1 §6-§8 routines: isolation, atomic dedup, budgets", () => {
     expect(projected).toHaveLength(0);
   });
 
-  it("one routine-fired mission → exactly one projected work item, across repeated and cross-connection board() calls", () => {
-    const { dir, ctx, biz } = makeBizCtx("rt2");
+  it("one routine-fired mission → exactly one projected work item, across repeated and cross-connection board() calls", async () => {
+    const { dir, ctx, biz, schedules } = makeBizCtx("rt2");
     const b = setupBusiness(biz, ctx.projectId);
     const r = makeRoutine(biz, String(b.business_id));
-    const m = firedMission(ctx, String(b.business_id), String(r.schedule_id));
+    // P14-FC-R1: only a genuine canonical scheduler fire projects —
+    // caller metadata alone no longer mints a routine mirror.
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
     biz.board(String(b.business_id));
     biz.board(String(b.business_id));
     const biz2 = makeSecondBiz(dir).biz;

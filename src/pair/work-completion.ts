@@ -33,13 +33,13 @@ import { IntegrityError } from "./errors.js";
 import type { GraphAuthorityDeps } from "./graph-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import { MISSION_STATUS_TRANSITIONS } from "./service.js";
-import { RUNTIME_TRANSITIONS } from "./mission-runtime.js";
+import { RUNTIME_TRANSITIONS, TERMINAL_EXECUTION } from "./mission-runtime.js";
 import {
   assertCanonicalDecomposition,
   assertCanonicalDelegation,
   decompositionRowId,
 } from "./graph-authority.js";
-import { validateWorkOpenBinding } from "./work-open-binding.js";
+import { validateWorkOpenBinding, validateWorkOpenBindingById } from "./work-open-binding.js";
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -476,6 +476,176 @@ export function proveCanonicalMissionCompletion(
   }
 }
 
+/* ---------- R3 — canonical mission lifecycle proof ------------------
+ *
+ * A mutable `mission.status` field is a CLAIM, never authority: the
+ * open-gate, sync folds and routine mirrors must prove the claimed
+ * lifecycle state through the immutable evidence chain.
+ *
+ * Canonical terminal pairings (surveyed from the writers):
+ *   COMPLETED ↔ runtime COMPLETED   (assertCanonicalMissionCompletion)
+ *   FAILED    ↔ runtime FAILED      (maybeFinalize: tasks_incomplete)
+ *   FAILED    ↔ runtime ABORTED     (abortMission — the one canonical
+ *                                    path that may legitimately leave
+ *                                    executor executions unresolved)
+ *   CANCELLED ↔ runtime CANCELLED   (operator cancel)
+ *   CANCELLED ↔ runtime ABORTED     (cancel then abort)
+ *   PAUSED    ↔ runtime PAUSED      (non-terminal — NEVER replacement
+ *                                    authority; proof only for the
+ *                                   PAUSED→BLOCKED projection fold)
+ *   PAUSED    ↔ runtime CREATED     (operator pause of a mission whose
+ *                                    runtime never started — pause()
+ *                                    mints the MRT row at CREATED and
+ *                                    cannot transition it to PAUSED)
+ */
+const LIFECYCLE_PAIRINGS: Record<string, ReadonlySet<string>> = {
+  FAILED: new Set(["FAILED", "ABORTED"]),
+  CANCELLED: new Set(["CANCELLED", "ABORTED"]),
+  PAUSED: new Set(["PAUSED", "CREATED"]),
+};
+
+/** States that may legally transition into `to` — derived from the
+ *  canonical mission table, never redefined here. */
+const missionPredsOf = (to: string) => new Set(
+  Object.entries(MISSION_STATUS_TRANSITIONS)
+    .filter(([, tos]) => tos.includes(to))
+    .map(([from]) => from),
+);
+const runtimePredsOf = (to: string) => new Set<string>(
+  (Object.keys(RUNTIME_TRANSITIONS) as Array<keyof typeof RUNTIME_TRANSITIONS>)
+    .filter((from) => RUNTIME_TRANSITIONS[from]
+      .includes(to as keyof typeof RUNTIME_TRANSITIONS)),
+);
+
+/**
+ * Prove one mission reached lifecycle state `claimed` canonically:
+ * mission row + exactly-one legal MISSION_TRANSITION into it + the
+ * MRT_<id> row in a compatible terminal state + exactly-one legal
+ * MISSION_RUNTIME_TRANSITION into it (mission_id-pinned) + no
+ * contradictory later lifecycle evidence on either entity + (for
+ * terminal claims) no live executor_execution except the explicitly
+ * marked `cancel_requested` side-effect state, or the ABORTED pairing
+ * where abortMission legitimately leaves executions in flight.
+ * COMPLETED delegates to the existing completion proof unchanged.
+ */
+export function assertCanonicalMissionLifecycle(
+  store: PairEvidenceStore, mission: Row, claimed: string,
+): void {
+  const mid = String(mission.mission_id ?? "");
+  if (!mid) fail("mission: missing mission_id");
+  if (claimed === "COMPLETED") {
+    assertCanonicalMissionCompletion(store, mission);
+    return;
+  }
+  const pairings = LIFECYCLE_PAIRINGS[claimed];
+  if (!pairings) fail(`mission ${mid}: unproven lifecycle state ${claimed}`);
+  if (String(mission.status) !== claimed) {
+    fail(`mission ${mid}: status ${String(mission.status)} != ${claimed}`);
+  }
+  // Immutable mission transition evidence into the claimed state —
+  // exactly one, from a legal predecessor, and no event ever LEAVES
+  // the claimed state (a later transition would contradict the row).
+  const mEvs = store.listEvents("mission", mid).filter((e) =>
+    String(e.event_type ?? "") === "MISSION_TRANSITION");
+  const into = mEvs.filter((e) => String(e.new_state ?? "") === claimed);
+  if (into.length !== 1) {
+    fail(`mission ${mid}: ${into.length} ${claimed} transition events`);
+  }
+  if (!missionPredsOf(claimed).has(String(into[0]!.old_state ?? ""))) {
+    fail(`mission ${mid}: ${claimed} from ${String(into[0]!.old_state)}`);
+  }
+  if (mEvs.some((e) => String(e.old_state ?? "") === claimed)) {
+    fail(`mission ${mid}: contradictory post-${claimed} transition`);
+  }
+  // Canonical runtime row — identity must match exactly.
+  const rtId = `MRT_${mid}`;
+  const rt = store.tryGet("mission_runtime", rtId) as Row | null;
+  if (!rt) fail(`mission ${mid}: mission_runtime row missing`);
+  if (String(rt.mission_id ?? "") !== mid) {
+    fail(`mission ${mid}: runtime identity mismatch`);
+  }
+  const rtState = String(rt.state ?? "");
+  if (!pairings.has(rtState)) {
+    fail(`mission ${mid}: runtime state ${rtState} incompatible with ${claimed}`);
+  }
+  // Immutable runtime transition evidence — exactly one into the
+  // terminal/paused runtime state, from a legal predecessor, pinned to
+  // this mission, with nothing leaving it afterwards. The CREATED
+  // pairing (mission paused before its runtime ever started) has no
+  // transition INTO it — the MISSION_RUNTIME_CREATED anchor is the
+  // evidence, and any transition event contradicts it.
+  const rtEvs = store.listEvents("mission_runtime", rtId).filter((e) =>
+    String(e.event_type ?? "") === "MISSION_RUNTIME_TRANSITION");
+  if (rtState === "CREATED") {
+    if (rtEvs.length !== 0) {
+      fail(`mission ${mid}: runtime CREATED with ${rtEvs.length} transition events`);
+    }
+    const createdEvs = store.listEvents("mission_runtime", rtId).filter((e) =>
+      String(e.event_type ?? "") === "MISSION_RUNTIME_CREATED" &&
+      String((e.metadata as Record<string, unknown> | undefined)
+        ?.mission_id ?? "") === mid);
+    if (createdEvs.length !== 1) {
+      fail(`mission ${mid}: runtime creation anchor missing`);
+    }
+  } else {
+    const rtInto = rtEvs.filter((e) => String(e.new_state ?? "") === rtState);
+    if (rtInto.length !== 1) {
+      fail(`mission ${mid}: ${rtInto.length} runtime ${rtState} events`);
+    }
+    if (!runtimePredsOf(rtState).has(String(rtInto[0]!.old_state ?? ""))) {
+      fail(`mission ${mid}: runtime ${rtState} from ${String(rtInto[0]!.old_state)}`);
+    }
+    const rtMd = (rtInto[0]!.metadata as Record<string, unknown> | undefined) ?? {};
+    if (String(rtMd.mission_id ?? "") !== mid) {
+      fail(`mission ${mid}: runtime event mission mismatch`);
+    }
+    if (rtEvs.some((e) => String(e.old_state ?? "") === rtState)) {
+      fail(`mission ${mid}: contradictory post-${rtState} runtime transition`);
+    }
+  }
+  // No live execution may remain for a claimed terminal state UNLESS
+  // the canonical writer marked it (`cancel_requested`) or the pairing
+  // is ABORTED — abortMission is the one writer that legitimately
+  // leaves in-flight side effects unresolved.
+  if (claimed !== "PAUSED" && rtState !== "ABORTED") {
+    const live = store.list("executor_execution").filter((e) =>
+      String(e.mission_id ?? "") === mid &&
+      !TERMINAL_EXECUTION.has(String(e.execution_state ?? "")) &&
+      e.cancel_requested !== true);
+    if (live.length > 0) {
+      fail(`mission ${mid}: ${live.length} live executions contradict ${claimed}`);
+    }
+  }
+}
+
+/** Non-throwing lifecycle proof for one claimed state. */
+export function proveCanonicalMissionLifecycle(
+  store: PairEvidenceStore, mission: Row, claimed: string,
+): boolean {
+  try {
+    assertCanonicalMissionLifecycle(store, mission, claimed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Replacement authority: the ONLY proof that lets a prior linked
+ * mission make room for a new bound attempt. PAUSED and every
+ * non-terminal status return false — PAUSED is live, never terminal.
+ */
+export function proveCanonicalMissionTerminalForReplacement(
+  store: PairEvidenceStore, mission: Row,
+): boolean {
+  const ms = String(mission.status ?? "");
+  if (ms === "COMPLETED") return proveCanonicalMissionCompletion(store, mission);
+  if (ms === "FAILED" || ms === "CANCELLED") {
+    return proveCanonicalMissionLifecycle(store, mission, ms);
+  }
+  return false;
+}
+
 /**
  * The canonical child set of a parent — derived ONLY from committed
  * `work_decomposition` / `work_delegation` rows, never from mutable
@@ -682,6 +852,113 @@ export function assertCanonicalWorkCompletion(
     }
   } else if (reviewer) {
     fail(`work_completion ${cid}: reviewer on non-review item`);
+  }
+}
+
+// =====================================================================
+// P14 FC R4 — omission-safe canonical attempt history.
+// `work_item.mission_ids` is a mutable projection: attempt authority is
+// derived ONLY from durable `work_open_binding` evidence (BOUND state,
+// ULID open_id order = canonical open-history order). A truncated,
+// reordered, injected or duplicated projection must AGREE with the WOB
+// history or the whole lineage is corrupt — missing evidence never
+// creates permission to execute again.
+// =====================================================================
+
+/** Canonical bound attempts of a work item, in canonical open order
+ *  (open_id is a ULID — lexicographic sort IS creation order; ties are
+ *  impossible). INTENT/ROLLED_BACK bindings are opens-in-flight or
+ *  rolled back, never attempts. */
+export function canonicalBoundAttemptsForWorkItem(
+  store: PairEvidenceStore, workItemId: string,
+): Row[] {
+  return store.list("work_open_binding")
+    .filter((b) => String(b.work_item_id ?? "") === workItemId &&
+      String(b.state ?? "") === "BOUND")
+    .sort((a, b) => String(a.open_id).localeCompare(String(b.open_id)));
+}
+
+function lineageFail(detail: string): never {
+  throw new IntegrityError("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT", detail);
+}
+
+/**
+ * Prove `row`'s mission attempt history canonically:
+ *   - every BOUND `work_open_binding` for this item validates the full
+ *     provenance chain (exact work item/business/project/assignee,
+ *     reserved mission id, `mission.bound_open_id` origin pin);
+ *   - every canonical attempt's mission ROW exists — a missing row is
+ *     never "attempt never existed";
+ *   - no two bindings claim the same mission;
+ *   - `mission_ids` agrees exactly: for non-routine items it must equal
+ *     the canonical attempt list (in canonical ULID order — a reorder
+ *     that would make an older attempt look current is caught by the
+ *     order comparison); for routine items `mids[0]` is the projected
+ *     scheduler mission (proven by the routine-lineage validator) and
+ *     `mids[1..]` must equal the WOB-ordered reopen attempts.
+ * Omission of a canonical attempt, injection of a boundless id,
+ * duplicates, reorders, foreign bound attempts and missing mission
+ * rows all fail here.
+ */
+export function assertCanonicalWorkMissionLineage(
+  store: PairEvidenceStore, row: Row,
+): void {
+  const wid = String(row.work_item_id ?? "");
+  const mids = ((row.mission_ids as string[] | undefined) ?? []).map(String);
+  if (new Set(mids).size !== mids.length) {
+    lineageFail(`work item ${wid}: duplicate mission id in mission_ids`);
+  }
+  const wobs = canonicalBoundAttemptsForWorkItem(store, wid);
+  const attemptIds: string[] = [];
+  const seen = new Set<string>();
+  for (const b of wobs) {
+    const openId = String(b.open_id ?? "");
+    const v = validateWorkOpenBindingById(store, openId, {
+      forWorkItem: row, requireState: "BOUND",
+      // HISTORICAL (FC R5): each WOB pins the assignee AT THAT attempt
+      // — a later legal STANDALONE reassignment must not invalidate
+      // it; the pinned agent still resolves in-business.
+      mode: "PROVENANCE_HISTORICAL",
+    });
+    if (!v.ok) {
+      lineageFail(`work item ${wid}: binding ${openId} invalid: ${v.reason}`);
+    }
+    const mid = String(b.mission_id ?? "");
+    if (seen.has(mid)) {
+      lineageFail(`work item ${wid}: duplicate binding for mission ${mid}`);
+    }
+    seen.add(mid);
+    const m = store.tryGet("mission", mid) as Row | null;
+    if (!m) {
+      lineageFail(`work item ${wid}: bound mission ${mid} row missing`);
+    }
+    const mv = validateWorkOpenBindingById(store, openId, {
+      forWorkItem: row, forMission: m, requireState: "BOUND",
+      mode: "PROVENANCE_HISTORICAL",
+    });
+    if (!mv.ok) {
+      lineageFail(`work item ${wid}: mission ${mid} binding proof: ${mv.reason}`);
+    }
+    attemptIds.push(mid);
+  }
+  if (row.routine_id != null) {
+    // Routine model (R1–R3): mids[0] is the canonical scheduler-fire
+    // mission (its own provenance validator); every tail id must equal
+    // the WOB-ordered bound attempts — an omitted bound attempt must
+    // not erase a live/terminal attempt from authority.
+    if (mids.length === 0) {
+      lineageFail(`routine mirror ${wid}: projected mission missing`);
+    }
+    const tails = mids.slice(1);
+    if (tails.length !== attemptIds.length ||
+        tails.some((t, i) => t !== attemptIds[i])) {
+      lineageFail(`routine item ${wid}: mission_ids tails != canonical bound-attempt history`);
+    }
+  } else {
+    if (mids.length !== attemptIds.length ||
+        mids.some((t, i) => t !== attemptIds[i])) {
+      lineageFail(`work item ${wid}: mission_ids != canonical bound-attempt history`);
+    }
   }
 }
 

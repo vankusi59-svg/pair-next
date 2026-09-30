@@ -388,10 +388,11 @@ GovernedTaskGate → executor`.
   sequences A–E + restart evidence.
   Classification: **`P14_WORKFORCE_V2_PHASE2_R2_PENDING_FINAL_AUDIT`**.
 
-## P14 Workforce V2 Phase 3 candidate state (on branch, pending audit)
+## P14 Workforce V2 Phase 3 state (MERGED via PR #14 → `6f389c9`)
 
-**Completion lifecycle on `devin/1790756068-p14-wfv2-p3`** (base
-`1add96d` = merged Phase 2) — canonical completion proof + review/
+**Completion lifecycle** (base `1add96d` = merged Phase 2, merge commit
+`6f389c91aabf14768d09912f1efc3d962fb1ec4a` — independently audited R4
+PASS) — canonical completion proof + review/
 acceptance + restart-safe finalization. Invariant: no work item becomes
 canonically complete because a mutable status says DONE — completion
 authority derives only from canonical evidence.
@@ -478,8 +479,235 @@ authority derives only from canonical evidence.
   omitted task/shrunk manifest/deleted revision rollback → quarantine;
   intact manifest completes; reviewer race; fence/unfence; 3 restarts;
   zero dup evidence).
-  Classification:
+  Classification (phase level, superseded by the final closure below):
   **`P14_WORKFORCE_V2_PHASE3_R4_PENDING_FINAL_AUDIT`**.
+
+## P14 Workforce V2 FINAL CLOSURE (on branch, pending independent audit)
+
+Final cross-phase closure audit + hardening over the integrated
+P1+P2+P3 stack — base `6f389c9` (merged R4 PASS), branch
+`devin/1790765918-p14-final-closure`. No new features, no redesign —
+audit + one narrow defect remediation.
+
+- **Execution path verified singular**: work item → `openWorkItem` →
+  `work_open_binding` (INTENT pins mission_id) →
+  `MissionControl.startBoundMission` (binding PROVENANCE then
+  ADMISSION) → `startMissionInternal` → Planner → MissionRouter →
+  GovernedTaskGate → MissionRuntime/executor. No second planner,
+  router, scheduler, runtime, execution or completion authority.
+- **Cross-phase defect found + fixed (routine mirrors)**: P11's
+  `syncRoutineWorkItems` projects schedule-fired missions to
+  `work_item` rows directly — unbound, no membership, no WCP possible
+  by design. The P3 seams quarantined every routine mirror (unbound
+  IN_PROGRESS via `syncWorkItem`; DONE-without-WCP via
+  `reconcileWorkLifecycle`). Fix: mirrors are mission-status mirrors —
+  honest iff they replicate the mission's OWN canonical proof
+  (`proveCanonicalMissionCompletion`); they NEVER mint WCP and carry
+  zero item-level completion authority (dependency oracle, review,
+  parent aggregation untouched). Unproven `COMPLETED` claims project
+  IN_PROGRESS and quarantine on the same-render fold; unbound
+  non-routine links still quarantine on all statuses; reopened
+  mirrors flow through the canonical bound path and CAN mint a real
+  WCP. Five `P14-FC-ROUTINE-*` tests.
+- **Golden E2E 44/44** (real `dist/` server, fresh dir, 6 restarts):
+  parent → decompose A, B(dep A), C(requires_review), D(dep B+C) +
+  delegated E; claims/heartbeat; openWorkItem→binding→bound mission;
+  canonical validated execution per child; A WCP → B eligible; C →
+  REVIEW_REQUIRED → ACCEPT → WCP; D eligible only after B+C; parent
+  aggregates all 5 canonical children (WDEC∪WDEL) → DONE+WCP;
+  exactly-one WCP/anchor/ACCEPT per item. Negatives proven live:
+  heartbeat ≠ dependency, message ACK ≠ completion, HANDOFF_REQUEST ≠
+  authority (non-assignee claim rejected), DONE-without-WCP ≠
+  dependency, forged mission completion → quarantine no WCP,
+  forged DONE quarantined at restart, reopen-DONE fails, concurrent
+  opens mint exactly one mission, routine mirror never quarantined.
+- **Restart boundaries A–E** (after binding / mission-complete /
+  child-WCP / review-ACCEPT / final-child): zero duplicate missions,
+  bindings, dispatches, WCPs, ACCEPTs or WORK_ITEM_COMPLETED anchors;
+  no fabricated review or graph authority.
+- **Regression**: P3 73 · P2 55 · Phase1/WFV2 73 · P14F 35 · RH 11 ·
+  P13 67 · P12 71 · P11+r 91 · P10 31 · P9 79 · P6 36 — all green.
+  Node 22 full 2170 + 2 pre-existing P5 env-gap fails (unchanged,
+  DSH/CODEX executables absent); Node 20 full 2172/0; `tsc --noEmit`
+  clean; `pnpm build` PASS; `pnpm audit` 0 high; `verifyIntegrity`
+  PASS.
+- Report: `PAIR_OS_VNEXT_P14_FINAL_CLOSURE_REPORT.md`.
+  Classification:
+  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R5_PENDING_INDEPENDENT_AUDIT`**.
+
+#### FC R1 remediation (independent-audit BLOCKED → closed, same PR)
+
+Two routine-boundary defects remediated narrowly (zero redesign):
+
+- **Routine identity ← canonical schedule evidence only**: caller-set
+  `metadata.schedule_id`/`business_id` was the projection trigger — a
+  forgeable label. Now ONE validator (`routine-mirror.ts`:
+  `assertCanonicalRoutineMirror`/`assertCanonicalRoutineFire`) proves
+  the full chain: routine row → mission_schedule →
+  `schedule_occurrence` FIRED + `mission_id` binding → mission
+  metadata 4-pin (`schedule_id`, `schedule_occurrence_id`,
+  `scheduled_for==due_at`, business scope) → recomputable
+  `schedule_digest` → exactly-one `SCHEDULE_FIRED` anchor →
+  deterministic `WI_RT_<digest(mission)>` id → `WORK_ITEM_CREATED`
+  agreement. Every exception seam consumes it (`syncWorkItem`,
+  `syncRoutineMirror`, `reconcileWorkLifecycle`, projection,
+  promotion); invalid provenance → quarantine. Non-canonical claimant
+  missions simply never project. All routine test fixtures now drive
+  genuine `fireDue` (no caller-metadata fires anywhere).
+- **Promotion enters Phase-1 authority**: projection now commits the
+  mirror + deterministic STANDALONE `work_graph_membership` atomically;
+  `openWorkItem` runs `promoteRoutineMirror` BEFORE any open
+  intent/binding/mission — re-proves provenance + validates the
+  existing WGM via `assertCanonicalMembership` inside the txn (CAS-
+  loser adopts the winner row; tampered/fabricated rows fail closed;
+  legacy mirrors get the deterministic WGM written). Exactly-one
+  canonical membership, restart idempotent, cross-connection safe, no
+  fabricated WDEL/WDEC/WDS/WAB, `assertGraphAuthority` unweakened.
+  Mirror still zero completion authority until promoted via the normal
+  bound path.
+- **15 `P14-FC-R1-*` tests** (9 provenance + 6 membership); Golden E2E
+  extended to **53/53** (caller-metadata forgery negative + genuine
+  two-occurrence lifecycle: fire→mirror→DONE zero-WCP→restart honest
+  →fire2→FAIL→BLOCKED→promote→WGM+binding→WCP→restart zero-dup).
+- Regression re-run all green (N22 2185+2 pre-existing P5 env-gap /
+  N20 2187/0); report §18-19.
+
+#### FC R2 remediation (independent-audit BLOCKED → closed, same PR)
+
+One mission-lineage gap remediated narrowly (zero redesign): the R1
+validator proved `mission_ids[0]` while authority seams consumed
+`mission_ids[last]` — an appended foreign terminal mission could fold
+mirror state and hide a live scheduler mission from the open gate.
+
+- **Canonical routine mission-lineage proof**
+  (`assertCanonicalRoutineLineage`): display-only mirror ⇒
+  `mission_ids` exactly `[projected_scheduler_mission]`; promoted ⇒
+  `mids[0]` stays projected + every trailing id is a canonical bound
+  attempt of the SAME item (mission row + `bound_open_id` +
+  `validateWorkOpenBindingById` BOUND/PROVENANCE for exact
+  item/mission/business/project + non-decreasing `bound_at` history
+  order; WORK_ITEM_OPENED not required — reconcile path doesn't write
+  it, binding is the authority). Any violation → quarantine, no
+  fold/open/binding/mission/WCP.
+- **All seams consume it**: `syncWorkItem` routine exception only when
+  `mids.length===1` AND lineage proof (last==projected);
+  `syncRoutineMirror` asserts lineage + `mids.length===1`;
+  `reconcileWorkLifecycle` routine-DONE same; `promoteRoutineMirror`
+  re-asserts before WGM. Foreign tail hiding a live mission → open
+  fails closed (zero intent/binding/mission/dispatch).
+- **Direct project pin**: `mission.project_id === schedule.project_id
+  === business.project_id` + `business_context.business_id` +
+  `occurrence.business_id === routine.business_id`.
+- **9 `P14-FC-R2-*` tests**; Golden E2E **60/60** (foreign tail →
+  restart quarantine → open fail-closed zero mints → legitimate reopen
+  still succeeds → `verifyIntegrity` 0 errors).
+- Regression **658/658**; N22 2194+2 pre-existing P5 env-gap / N20
+  2196/0; report §20-21.
+
+#### FC R3 remediation (independent-audit BLOCKED → closed, same PR)
+
+Core mission lifecycle / replacement-authority defect remediated: the
+mutable `mission.status` field was terminal authority at the open
+gate and at the FAILED/CANCELLED/PAUSED sync folds — a bound or
+scheduler mission RUNNING + runtime RUNNING could be replaced by
+mutating one field, and routine seriality trusted `bound_at`
+ordering alone.
+
+- **One canonical lifecycle proof** (`assertCanonicalMissionLifecycle`
+  / `proveCanonicalMissionTerminalForReplacement` in work-completion):
+  status claim + exactly-one legal `MISSION_TRANSITION` into it +
+  `MRT_<mid>` row (identity pinned) in a canonical pairing + exactly-one
+  legal `MISSION_RUNTIME_TRANSITION` (mission_id-pinned) + no
+  contradictory later evidence + no live `executor_execution` where
+  semantics forbid (exempt: the ABORTED pairing and
+  `cancel_requested`-marked side-effects). Pairings surveyed from the
+  canonical writers: COMPLETED↔COMPLETED (delegates to the unchanged
+  completion proof), FAILED↔{FAILED,ABORTED},
+  CANCELLED↔{CANCELLED,ABORTED}, PAUSED↔{PAUSED,CREATED} (pause-before-
+  runtime-start mints MRT at CREATED — creation anchor required,
+  transitions forbidden).
+- **Open gate**: every linked mission must be canonically terminal or
+  canonically live before ANY authority write — claims-terminal-
+  unproven → `FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT`; live →
+  `FAIL_CLOSED_MISSION_ACTIVE`; zero intent/reservation/WOB/mission/
+  dispatch on failure.
+- **Folds**: `syncWorkItem`, `syncRoutineMirror` and the projection
+  path all consume the same proof — status-only FAILED/CANCELLED/
+  PAUSED → `TERMINAL_PROVENANCE_CORRUPT` quarantine, never a fold,
+  never fabricated evidence; unproven claims project IN_PROGRESS.
+- **Seriality**: `assertCanonicalRoutineLineage` requires every
+  mission before the final attempt canonically terminal — scheduler
+  before bound1, bound1 before bound2 — independent of `bound_at`.
+- **§9 helpers migrated**: `canonicallyTerminateMission` drives BOTH
+  state machines (legal mission transitions + MRT mint + legal runtime
+  hops to the canonical pairing); all status-only fixtures converted.
+- **12 `P14-FC-R3-*` tests**; Golden E2E **65/65** (forge-on-live-bound
+  → quarantine + fail-closed open zero mints; forged scheduler FAILED →
+  quarantined mirror never BLOCKED/no reopen; real canonical failure →
+  reopen exactly once → second open denied).
+- Regression **670/670**; N22 2206+2 pre-existing P5 env-gap / N20
+  2208/0; report §22-23.
+
+#### FC R4 remediation (independent-audit BLOCKED → closed, same PR)
+
+Omission-safe attempt-history closure: a missing linked mission row
+was silently skipped at the open gate (`if (!pm) continue`), and the
+mutable `work_item.mission_ids` projection was the attempt-history
+authority at open/sync/completion seams.
+
+- **Canonical attempt history** (`canonicalBoundAttemptsForWorkItem` +
+  `assertCanonicalWorkMissionLineage` in work-completion): attempts
+  derive ONLY from BOUND `work_open_binding` rows ordered by ULID
+  `open_id` (canonical open order); each validates the full WOB
+  provenance chain; every attempt's mission row must exist (missing
+  row is never "terminal"); `mission_ids` must AGREE exactly —
+  omission, injection, duplicates, reorders, foreign attempts all
+  fail as `FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT`. Routine items keep
+  the R1–R3 model (`mids[0]` scheduler mission, `mids[1..]` = WOB
+  tails).
+- **Open gate**: lineage proof BEFORE any authority write; then every
+  canonical attempt — R3-terminal → continue; live → `MISSION_ACTIVE`;
+  missing/corrupt → `MISSION_LIFECYCLE_CORRUPT`; zero intent/
+  reservation/WOB/mission/dispatch.
+- **Sync + current attempt**: `syncWorkItem` checks lineage before any
+  fold (violation → quarantine); `boundMissionForWorkItem` returns the
+  canonically-latest WOB attempt — array order can never select an
+  older attempt as current (completion basis, cancel, block).
+- **10 `P14-FC-R4-*` tests**; Golden E2E **68/68** (deleted mission
+  row / truncated mission_ids → open fail-closed zero mints; canonical
+  terminal → legitimate ordered reopen).
+- Regression all-green; N22 2216+2 pre-existing P5 env-gap / N20
+  2218/0; report §24-25.
+
+#### FC R5 remediation (independent-audit BLOCKED → closed, same PR)
+
+Historical assignee provenance closure: R4's lineage validator
+revalidated every BOUND WOB against the CURRENT assignee — but a WOB
+pins the assignee AT THAT ATTEMPT, and a STANDALONE item may legally
+be reassigned between attempts; reassigning A→B falsely corrupted
+WOB1(A) and refused a legitimate retry.
+
+- **Three-way binding-validation mode**
+  (`validateWorkOpenBinding`): `ADMISSION` — new-mission minting
+  requires agent == current assignee + ACTIVE; `PROVENANCE` —
+  current-attempt origin proof keeps agent == current assignee;
+  `PROVENANCE_HISTORICAL` (new) — past attempts skip ONLY the
+  current-assignee equality while still requiring the pinned
+  org_agent to resolve and belong to the binding's business (all
+  other pins unchanged: open_id, BOUND, work_item/business/project,
+  reserved mission id, bound_open_id, mission project).
+- **Consumption**: `assertCanonicalWorkMissionLineage` + routine tail
+  validation → `PROVENANCE_HISTORICAL`; `missionBoundToWorkItem`,
+  `reconcileOpenIntent`, `startBoundMission` unchanged
+  (`PROVENANCE`/`ADMISSION`) — no global weakening; graph-bound
+  assignee immutability untouched (delegated/decomposition child
+  reassign → `FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE`).
+- **8 `P14-FC-R5-*` tests** (P3 suite 127/127); Golden E2E **70/70**
+  (A→fail→BLOCKED→reassign B→open: WOB1(A) historical-valid, WOB2(B)
+  current, exactly one new mission; delegated child reassign → 409).
+- Regression **688/688**; N22 2224+2 pre-existing P5 env-gap / N20
+  2226/0; tsc clean; build PASS; audit 0 high; verifyIntegrity PASS;
+  report §26-27.
 
 ## Not yet
 

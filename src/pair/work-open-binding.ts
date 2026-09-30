@@ -38,17 +38,25 @@ const fail = (reason: string): OpenBindingCheck => ({ ok: false, reason });
  *                    top-level field).
  *   `expectedProjectId` — assert binding.project_id equals it.
  *   `requireState` — assert binding.state equals INTENT or BOUND.
- *   `mode` — REQUIRED. `ADMISSION`: a NEW mission is being created —
- *     the bound org agent must currently be ACTIVE (P12 admission
- *     semantics). `PROVENANCE`: proving the historical origin/binding of
- *     an already-created mission — the agent must still resolve and stay
- *     in the same business, but its CURRENT status may be PAUSED or
- *     TERMINATED; mutable status must never erase valid provenance
- *     (R3 §1).
+ *   `mode` — REQUIRED.
+ *     `ADMISSION`: a NEW mission is being created — the bound org
+ *       agent must equal the CURRENT item assignee and be currently
+ *       ACTIVE (P12 admission semantics).
+ *     `PROVENANCE` (current): proving the origin/binding of the
+ *       item's CURRENT attempt — the binding agent must still equal
+ *       the current assignee, but its CURRENT status may be PAUSED or
+ *       TERMINATED (mutable status never erases valid provenance).
+ *     `PROVENANCE_HISTORICAL` (FC R5): proving a PAST attempt whose
+ *       binding `org_agent_id` records the assignee AT THAT ATTEMPT —
+ *       a later legal STANDALONE reassignment must not invalidate it.
+ *       The pinned agent must still resolve and belong to the binding
+ *       business; it is NOT compared to the current assignee. Every
+ *       other pin (open_id identity, BOUND state, work_item/business/
+ *       project/mission agreement, `bound_open_id`) is unchanged.
  */
 const BINDING_STATES = new Set(["INTENT", "BOUND", "ROLLED_BACK"]);
 
-type ValidationMode = "ADMISSION" | "PROVENANCE";
+type ValidationMode = "ADMISSION" | "PROVENANCE" | "PROVENANCE_HISTORICAL";
 
 export function validateWorkOpenBinding(
   store: PairEvidenceStore,
@@ -89,13 +97,15 @@ export function validateWorkOpenBinding(
   if (opts.expectedProjectId && String(binding.project_id) !== opts.expectedProjectId) {
     return fail("binding project != requested project");
   }
-  // Assignee/org-agent linkage (R2 §4): the relationship is enforced in
-  // BOTH directions — an assigned work item requires a binding agent
-  // equal to its assignee; an unassigned item forbids a binding that
-  // silently claims an agent.
+  // Assignee/org-agent linkage (R2 §4): for admission/current
+  // provenance the relationship is enforced in BOTH directions — an
+  // assigned work item requires a binding agent equal to its assignee;
+  // an unassigned item forbids a binding that silently claims an
+  // agent. HISTORICAL provenance (FC R5) skips only this equality —
+  // the pinned snapshot belongs to the attempt, not the present.
   const boundAgent = binding.org_agent_id ? String(binding.org_agent_id) : null;
   const rowAgent = row.assignee_agent_id ? String(row.assignee_agent_id) : null;
-  if (boundAgent !== rowAgent) {
+  if (opts.mode !== "PROVENANCE_HISTORICAL" && boundAgent !== rowAgent) {
     return fail("work item assignee != binding org_agent_id");
   }
   if (boundAgent) {

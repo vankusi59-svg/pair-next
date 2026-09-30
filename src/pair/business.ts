@@ -19,7 +19,7 @@
  *   only decides WHICH mission runs, never bypasses approvals.
  */
 import { IntegrityError, PolicyError } from "./errors.js";
-import { digest, newId, utcnow } from "./canonical.js";
+import { newId, utcnow } from "./canonical.js";
 import {
   AgentContractService,
   type AgentContractPolicy,
@@ -28,6 +28,12 @@ import {
 import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
+import {
+  assertCanonicalRoutineFire,
+  assertCanonicalRoutineLineage,
+  proveCanonicalRoutineLineage,
+  routineMirrorRowId,
+} from "./routine-mirror.js";
 import { validateWorkOpenBinding } from "./work-open-binding.js";
 import {
   assertAuthoritySubset,
@@ -78,7 +84,11 @@ import {
   completionBasisDigest,
   completionDigest,
   completionRowId,
+  assertCanonicalMissionLifecycle,
+  assertCanonicalWorkMissionLineage,
+  canonicalBoundAttemptsForWorkItem,
   proveCanonicalMissionCompletion,
+  proveCanonicalMissionLifecycle,
   proveWorkItemComplete,
   rejectedCompletionBases,
 } from "./work-completion.js";
@@ -565,11 +575,16 @@ export class BusinessLayer {
     }).ok;
   }
 
-  /** The row's last mission when it is canonically bound, else null. */
+  /** The CURRENT bound mission = the canonically-LATEST attempt proven
+   *  by `work_open_binding` open history (R4: ULID open_id order),
+   *  never the mutable `mission_ids` array order — a reordered or
+   *  truncated projection cannot select an older attempt as current. */
   boundMissionForWorkItem(row: Row): Row | null {
-    const mids = (row.mission_ids as string[] | undefined) ?? [];
-    if (!mids.length) return null;
-    const m = this.store.tryGet("mission", String(mids[mids.length - 1]));
+    const wobs = canonicalBoundAttemptsForWorkItem(
+      this.store, String(row.work_item_id));
+    if (!wobs.length) return null;
+    const m = this.store.tryGet(
+      "mission", String(wobs[wobs.length - 1]!.mission_id)) as Row | null;
     return m && this.missionBoundToWorkItem(row, m) ? m : null;
   }
 
@@ -1010,6 +1025,29 @@ export class BusinessLayer {
       }
       if (String(w.status) !== "DONE") continue;
       if (this.store.tryGet(WORK_COMPLETION_TABLE, completionRowId(wid))) continue;
+      // P11 routine mirror — a DONE projection is honest iff (a) the
+      // whole mirror proves canonical routine provenance (FIRED
+      // occurrence + SCHEDULE_FIRED anchor + WI_RT identity) and (b)
+      // its projected mission is itself canonically complete. Mirrors
+      // never mint a WCP by design (no bound attempt exists), so the
+      // bound-work basis cannot apply.
+      if (w.routine_id != null) {
+        // R2 — a DONE mirror with no WCP is honest ONLY in the pure
+        // display shape: mission_ids === [projected scheduler mission]
+        // exactly, full fire + lineage proof, and that mission itself
+        // canonically complete. A trailing (bound or foreign) mission
+        // means the item went through the bound path, which always
+        // mints a WCP — DONE-without-WCP is then corrupt.
+        const rMids = (w.mission_ids as string[] | undefined) ?? [];
+        if (rMids.length === 1 && proveCanonicalRoutineLineage(this.store, w)) {
+          const rMission = this.store.tryGet(
+            "mission", String(rMids[0])) as Row | null;
+          if (rMission && proveCanonicalMissionCompletion(this.store, rMission)) continue;
+        }
+        this.quarantineWorkItem(
+          w, "routine DONE mirror without canonical mission completion/provenance");
+        continue;
+      }
       // Derive-only materialization: every pin must already exist as
       // canonical evidence — nothing is invented.
       const basis = this.completionBasisSafe(w);
@@ -1462,17 +1500,66 @@ export class BusinessLayer {
     // created. A contract widened after delegation/decomposition commit
     // fails closed here, and a DISABLED contract is never usable.
     this.assertChildAuthorityCeiling(row);
+    // P14 FC R1 — a routine mirror is a zero-authority projection until
+    // promoted: crossing the open boundary requires canonical routine
+    // provenance + Phase-1 membership. The deterministic STANDALONE WGM
+    // is established atomically BEFORE any open intent/binding/mission
+    // is created; forged mirrors are quarantined, never promoted.
+    if (row.routine_id != null) {
+      this.promoteRoutineMirror(row);
+    }
     // A previous linked mission still live forbids a replacement — the
-    // governed path is pause/cancel/resume/reconcile, not a second dispatch.
-    const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
-    if (priorMissionIds.length > 0) {
-      const last = this.store.tryGet("mission", priorMissionIds[priorMissionIds.length - 1]);
-      if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
-        throw new PolicyError(
-          "FAIL_CLOSED_MISSION_ACTIVE",
-          `linked mission ${String(last.mission_id)} still ${String(last.status)} — cancel/resume/reconcile first`,
+    // governed path is pause/cancel/resume/reconcile, not a second
+    // dispatch. R3: a mutable `mission.status` terminal CLAIM is not
+    // terminal authority — every linked mission must be proven
+    // canonically terminal (mission + runtime transition evidence,
+    // compatible pairing, no live executions) or canonically live.
+    // A status-only FAILED/CANCELLED claim over a live runtime is
+    // corrupt provenance: fail closed before ANY authority-bearing
+    // write — no open intent, no reservation, no binding, no mission.
+    // R4 — the canonical attempt history derives ONLY from durable
+    // `work_open_binding` evidence (ULID open_id order); the mutable
+    // `mission_ids` projection must AGREE with it. Omitted bound
+    // attempts, injected boundless ids, duplicates, reorders and —
+    // critically — a MISSING mission row all fail closed here, BEFORE
+    // any authority-bearing write (zero intent/reservation/WOB/
+    // mission/dispatch). A missing linked mission is never "terminal".
+    assertCanonicalWorkMissionLineage(this.store, row);
+    const canonicalAttempts = canonicalBoundAttemptsForWorkItem(
+      this.store, workItemId).map((b) => String(b.mission_id));
+    const priorMissionIds = row.routine_id != null
+      // routine: mids[0] scheduler mission (fire-proven via
+      // promoteRoutineMirror above) + WOB-ordered bound attempts
+      ? [String(((row.mission_ids as string[] | undefined) ?? [])[0] ?? "")]
+          .filter((x) => x.length > 0)
+          .concat(canonicalAttempts)
+      : canonicalAttempts;
+    for (const pmid of priorMissionIds) {
+      // The lineage proof guarantees the row exists for WOB attempts;
+      // the routine scheduler id is re-proven defensively.
+      const pm = this.store.tryGet("mission", String(pmid));
+      if (!pm) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT",
+          `linked mission ${String(pmid)} row missing — missing evidence is never terminal`,
         );
       }
+      const pms = String(pm.status);
+      if (TERMINAL_MISSION_STATUSES.has(pms)) {
+        try {
+          assertCanonicalMissionLifecycle(this.store, pm, pms);
+        } catch (e) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT",
+            `linked mission ${String(pmid)} claims ${pms} without canonical lifecycle evidence: ${(e as Error).message}`,
+          );
+        }
+        continue;
+      }
+      throw new PolicyError(
+        "FAIL_CLOSED_MISSION_ACTIVE",
+        `linked mission ${String(pmid)} still ${pms} — cancel/resume/reconcile first`,
+      );
     }
     const from = String(row.status);
     assertWorkItemTransition(from, "IN_PROGRESS");
@@ -1917,14 +2004,63 @@ export class BusinessLayer {
     if (status !== "IN_PROGRESS") return row;
     if (String(row.blocked_code ?? "") === WORK_CORRUPT_CODE) return row;
     const missionIds = (row.mission_ids as string[]) ?? [];
+    // R4 — `mission_ids` is a mutable projection: the canonical attempt
+    // history derived from `work_open_binding` (ULID open_id order) must
+    // agree with it before it may select the current attempt. An omitted
+    // bound attempt (including total truncation to []), injected id,
+    // duplicate, reorder or missing mission row is corrupt provenance →
+    // quarantine, never guess-repair.
+    try {
+      assertCanonicalWorkMissionLineage(this.store, row);
+    } catch (e) {
+      this.quarantineWorkItem(
+        row, `mission attempt lineage corrupt at ${workItemId}: ${(e as Error).message}`);
+      return this.store.get("work_item", workItemId);
+    }
     if (missionIds.length === 0) return row;
+    // The current attempt is the canonically-LATEST bound attempt, not
+    // the mutable array's last element. A display-only routine mirror
+    // (no WOB yet) falls back to its projected scheduler mission.
+    const canonWobs = canonicalBoundAttemptsForWorkItem(this.store, workItemId);
+    const currentId = canonWobs.length > 0
+      ? String(canonWobs[canonWobs.length - 1]!.mission_id)
+      : String(missionIds[0]);
     let mission: Row;
     try {
-      mission = this.store.get("mission", missionIds[missionIds.length - 1]);
+      mission = this.store.get("mission", currentId);
     } catch {
-      return row; // mission not persisted yet — leave IN_PROGRESS
+      // Linked evidence without a mission row is corrupt provenance —
+      // the row existed at link time (atomic binding txn).
+      this.quarantineWorkItem(
+        row, `linked mission ${currentId} row missing at ${workItemId}`);
+      return this.store.get("work_item", workItemId);
     }
     if (!this.missionBoundToWorkItem(row, mission)) {
+      // Routine-source items are mission-status mirrors (P11): the
+      // schedule path mints their missions without an open binding, so
+      // the bound-work chain can never apply — the mirror folds
+      // honestly instead. The exception applies only to mirrors whose
+      // routine provenance is fully canonical (FIRED schedule_occurrence
+      // + SCHEDULE_FIRED anchor + deterministic WI_RT identity) —
+      // `routine_id` alone never authorizes it. Any OTHER unbound link
+      // is corrupt provenance.
+      // R2 — the display exception applies ONLY to the pure projection
+      // shape: mission_ids === [projected scheduler mission] exactly
+      // (the mirror then folds THAT mission, never some foreign last
+      // id). Every trailing mission id must be a canonically bound
+      // attempt of this same item — a bound last mission would have
+      // passed missionBoundToWorkItem above, so reaching here with
+      // trailing ids means an unbound foreign link: quarantine.
+      if (row.routine_id != null) {
+        if (missionIds.length === 1 && proveCanonicalRoutineLineage(this.store, row)) {
+          return this.syncRoutineMirror(row, mission);
+        }
+        this.quarantineWorkItem(
+          row,
+          `routine mission lineage corrupt at ${workItemId} — unbound trailing mission ${String(mission.mission_id)}`,
+        );
+        return this.store.get("work_item", workItemId);
+      }
       // The final mission id does not belong to this work item — fold
       // nothing; quarantine so no authority path treats it as progress.
       this.quarantineWorkItem(row, `unbound mission ${String(mission.mission_id)} referenced by ${workItemId}`);
@@ -1955,6 +2091,22 @@ export class BusinessLayer {
           return this.store.get("work_item", workItemId);
         }
         throw e;
+      }
+    }
+    // R3 — FAILED/CANCELLED/PAUSED are mutable status claims too: the
+    // fold requires the canonical lifecycle evidence chain (mission
+    // transition + MRT_<mid> row + runtime transition, compatible
+    // pairing, no contradictory live evidence). A status-only
+    // mutation carries no business lifecycle authority → quarantine.
+    if (ms === "FAILED" || ms === "CANCELLED" || ms === "PAUSED") {
+      try {
+        assertCanonicalMissionLifecycle(this.store, mission, ms);
+      } catch (e) {
+        this.quarantineWorkItem(
+          row,
+          `mission ${String(mission.mission_id)} ${ms} without canonical lifecycle evidence: ${(e as Error).message}`,
+        );
+        return this.store.get("work_item", workItemId);
       }
     }
     const next: WorkItemStatus | null =
@@ -2026,6 +2178,90 @@ export class BusinessLayer {
     // P3 §8 — a landed final completion propagates upward: canonical
     // parents re-derive their own basis inside their own txns.
     if (next === "DONE") this.advanceCompletionCascade(workItemId);
+    return saved;
+  }
+
+  /**
+   * Routine-source mirror fold (P11 projections): a routine work item's
+   * linked mission is minted by the schedule path — never bound to the
+   * item — so the bound-work completion chain can never apply. The
+   * mirror is honest iff it replicates the mission's OWN canonical
+   * state: DONE requires the mission's full governed runtime-completion
+   * proof; a forged or mid-flight COMPLETED claim quarantines the
+   * mirror. Mirrors never mint work_completion records — they carry
+   * zero work-item completion authority (the dependency oracle, review
+   * seam and parent aggregation all require a canonical WCP).
+   */
+  private syncRoutineMirror(row: Row, mission: Row): Row {
+    const workItemId = String(row.work_item_id);
+    // The routine exception is never authorized by `routine_id` alone —
+    // the whole projection must prove the canonical schedule chain
+    // (FIRED occurrence + SCHEDULE_FIRED anchor + WI_RT identity pin).
+    try {
+      assertCanonicalRoutineLineage(this.store, row);
+    } catch (e) {
+      this.quarantineWorkItem(
+        row, `routine mirror without canonical provenance: ${(e as Error).message}`);
+      return this.store.get("work_item", workItemId);
+    }
+    // R2 — the display fold is defined ONLY for the projected scheduler
+    // mission (display shape). A trailing id means the item took the
+    // bound path; an unbound trailing id reaching here is corruption.
+    const mids = (row.mission_ids as string[] | undefined) ?? [];
+    if (mids.length !== 1 || String(mission.mission_id) !== String(mids[0])) {
+      this.quarantineWorkItem(
+        row, "routine mirror fold requires the projected scheduler mission as its only link");
+      return this.store.get("work_item", workItemId);
+    }
+    const ms = String(mission.status);
+    const next: WorkItemStatus | null =
+      ms === "COMPLETED" ? "DONE" :
+      ms === "FAILED" || ms === "PAUSED" ? "BLOCKED" :
+      ms === "CANCELLED" ? "CANCELLED" : null;
+    if (next === "DONE" && !proveCanonicalMissionCompletion(this.store, mission)) {
+      this.quarantineWorkItem(
+        row, `routine mirror DONE without canonical mission completion for ${String(mission.mission_id)}`);
+      return this.store.get("work_item", workItemId);
+    }
+    // R3 — the routine provenance validator proves WHERE the mission came
+    // from, not WHAT its lifecycle really is: a status-only FAILED/
+    // CANCELLED/PAUSED claim carries no fold authority either. Consume
+    // the same canonical lifecycle proof as the bound-work fold.
+    if ((next === "BLOCKED" || next === "CANCELLED") &&
+        ms !== "COMPLETED") {
+      try {
+        assertCanonicalMissionLifecycle(this.store, mission, ms);
+      } catch (e) {
+        this.quarantineWorkItem(
+          row, `routine mirror ${ms} without canonical lifecycle evidence ` +
+            `for ${String(mission.mission_id)}: ${(e as Error).message}`);
+        return this.store.get("work_item", workItemId);
+      }
+    }
+    if (next === null) return row; // mission still in flight — honest IN_PROGRESS mirror
+    const saved = this.store.immediate(() => {
+      const lease = this.store.tryGet(
+        WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+      const leaseActive = lease && String(lease.state) === "ACTIVE";
+      if (leaseActive && (next === "DONE" || next === "CANCELLED")) {
+        this.transitionLease(lease, "RELEASED", "PAIR_BUSINESS_LAYER", { work_item_id: workItemId });
+      }
+      const liveLease = lease && String(lease.state) === "ACTIVE" &&
+        !(next === "DONE" || next === "CANCELLED");
+      row.status = next;
+      row.result_summary = String(mission.result ?? mission.result_summary ?? "") || row.result_summary;
+      row.claimed_by = liveLease ? String(lease.claimant_agent_id) : null;
+      row.claim_token = null;
+      row.claim_expires_at = liveLease ? String(lease.expires_at) : null;
+      row.updated_at = utcnow();
+      return this.store.put("work_item", workItemId, row, Number(row.version));
+    });
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId,
+      event_type: "WORK_ITEM_STATUS_SYNCED",
+      old_state: "IN_PROGRESS", new_state: next, actor: "PAIR_BUSINESS_LAYER",
+      metadata: { mission_id: String(mission.mission_id), mission_status: ms, routine_mirror: true },
+    });
     return saved;
   }
 
@@ -3270,17 +3506,36 @@ export class BusinessLayer {
       // schedule must also carry this business_id — corrupted or
       // foreign-business metadata never projects onto this board.
       if (String(md?.business_id ?? "") !== String(routine.business_id)) continue;
+      // R1: only a canonical scheduler fire may project — caller-supplied
+      // schedule metadata alone never mints a routine mirror. The full
+      // occurrence↔mission↔SCHEDULE_FIRED chain must hold at projection
+      // time; anything else is just a mission carrying a label.
+      try {
+        assertCanonicalRoutineFire(this.store, routine, m);
+      } catch {
+        continue;
+      }
       const ms = String(m.status);
+      // DONE mirrors require the mission's own canonical completion
+      // proof at projection time — an unproven COMPLETED claim projects
+      // IN_PROGRESS, and the same-render syncRoutineMirror fold then
+      // quarantines the forged mirror. R3: the same discipline applies
+      // to FAILED/CANCELLED/PAUSED claims — a mutable status without
+      // the canonical lifecycle chain projects IN_PROGRESS (honest),
+      // and the same-render fold quarantines the corrupt mirror.
       const status: WorkItemStatus =
-        ms === "COMPLETED" ? "DONE" :
-        ms === "FAILED" ? "BLOCKED" :
-        ms === "CANCELLED" ? "CANCELLED" :
-        ms === "PAUSED" ? "BLOCKED" : "IN_PROGRESS";
+        ms === "COMPLETED"
+          ? (proveCanonicalMissionCompletion(this.store, m) ? "DONE" : "IN_PROGRESS")
+        : ms === "FAILED" || ms === "CANCELLED" || ms === "PAUSED"
+          ? (proveCanonicalMissionLifecycle(this.store, m, ms)
+            ? (ms === "CANCELLED" ? "CANCELLED" : "BLOCKED")
+            : "IN_PROGRESS")
+        : "IN_PROGRESS";
       // Deterministic projection identity: the work-item id derives from
       // the mission id, so two concurrent projectors (restarts, parallel
       // board() calls, two connections) compute the same id — the loser's
       // create hits the atomic CAS and is treated as already-covered.
-      const id = `WI_RT_${digest("routine-work-item:" + missionId).slice(0, 24)}`;
+      const id = routineMirrorRowId(missionId);
       const row = {
         work_item_id: id,
         business_id: businessId,
@@ -3306,7 +3561,25 @@ export class BusinessLayer {
         version: 0,
       };
       try {
-        this.store.put("work_item", id, row, 0);
+        // Mirror + its canonical STANDALONE membership commit atomically —
+        // a mirror never exists without Phase-1 graph authority, though
+        // it still carries zero work-item completion authority.
+        this.store.immediate(() => {
+          this.store.put("work_item", id, row, 0);
+          this.writeGraphMembership(row, {
+            membership_type: "STANDALONE",
+            parent_work_item_id: null,
+            delegation_id: null,
+            decomposition_row_id: null,
+            dependency_set_id: null,
+            authority_binding_id: null,
+          });
+          this.store.event({
+            entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_CREATED",
+            new_state: status, actor: "PAIR_BUSINESS_LAYER",
+            metadata: { routine_id: routine.routine_id, mission_id: missionId, source: "routine" },
+          });
+        });
       } catch (err) {
         // Concurrent projector already created this projection — the
         // deterministic id made the collision deterministic, not a duplicate.
@@ -3317,13 +3590,63 @@ export class BusinessLayer {
         }
         throw err;
       }
-      this.store.event({
-        entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_CREATED",
-        new_state: status, actor: "PAIR_BUSINESS_LAYER",
-        metadata: { routine_id: routine.routine_id, mission_id: missionId, source: "routine" },
-      });
       covered.add(missionId);
     }
+  }
+
+  /**
+   * Routine-mirror promotion (P14 FC R1): a mirror is a zero-authority
+   * projection while it displays schedule output — crossing the
+   * authority-bearing `openWorkItem` boundary promotes it into normal
+   * governed work. Requires the full canonical routine provenance
+   * (`assertCanonicalRoutineLineage`) AND Phase-1 membership: the
+   * deterministic STANDALONE `work_graph_membership` is established
+   * atomically before any open intent/binding/mission exists.
+   * Concurrent promoters collide deterministically on the same
+   * `WGM_<id>` — the winner's row is re-validated, never duplicated.
+   * No WDEL/WDEC/WDS/WAB is ever fabricated here.
+   */
+  private promoteRoutineMirror(row: Row): void {
+    const id = String(row.work_item_id);
+    try {
+      // R2 — promotion requires the FULL mission lineage: mission_ids[0]
+      // canonical fire + every trailing id a canonically bound attempt
+      // of this same item. A foreign terminal mission can never hide an
+      // earlier still-live scheduler/bound mission behind an open.
+      assertCanonicalRoutineLineage(this.store, row);
+    } catch (e) {
+      this.quarantineWorkItem(
+        row, `routine mirror promotion without canonical provenance: ${(e as Error).message}`);
+      throw e;
+    }
+    this.store.immediate(() => {
+      const existing = this.store.tryGet(
+        "work_graph_membership", membershipRowId(id)) as Row | null;
+      if (existing) {
+        // Exactly one canonical membership — a tampered/fabricated row
+        // fails closed here (assertGraphAuthority fences it at read
+        // seams; promotion re-proves it inside the txn).
+        assertCanonicalMembership(this.graphAuthorityDeps(), existing);
+        return;
+      }
+      try {
+        this.writeGraphMembership(this.store.get("work_item", id), {
+          membership_type: "STANDALONE",
+          parent_work_item_id: null,
+          delegation_id: null,
+          decomposition_row_id: null,
+          dependency_set_id: null,
+          authority_binding_id: null,
+        });
+      } catch (err) {
+        if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") {
+          const winner = this.store.get("work_graph_membership", membershipRowId(id));
+          assertCanonicalMembership(this.graphAuthorityDeps(), winner);
+          return;
+        }
+        throw err;
+      }
+    });
   }
 
   // ---------- objective (goal tree) ----------
