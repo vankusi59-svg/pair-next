@@ -258,7 +258,7 @@ P15/P16**:
   suite `pair-runtime-hardening.test.ts` (RH-R1-* ×11).
   Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`**.
 
-## P14 Workforce V2 Phase 1 candidate state (on branch, pending audit)
+## P14 Workforce V2 Phase 1 state (MERGED via PR #12 → `41934b2`)
 
 **Clean rebaseline on `devin/1790741859-p14-wfv2-p1-rebaseline`** — PR #11
 (`devin/1790731419-p14-workforce-v2-p1`, head `44f7166`) was abandoned as
@@ -326,11 +326,72 @@ open-time ceiling, graph bounds — around two new canonical designs:
   failure mid-update → old v2 canonical, retry → one complete v3).
   Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_R2_PENDING_FINAL_AUDIT`**.
 
+## P14 Workforce V2 Phase 2 candidate state (on branch, pending audit)
+
+**Coordination layer on `devin/1790749503-p14-wfv2-p2`** (base `41934b2` =
+merged Phase 1) — canonical claim lease + heartbeat/fencing + durable
+inbox. Coordination only: nothing in this phase creates missions,
+satisfies dependencies, accepts reviews, or bypasses
+`openWorkItem → work_open_binding → Planner → MissionRouter →
+GovernedTaskGate → executor`.
+
+- **`work_claim_lease` (`WCL_<work_item_id>`)** — one lease per item;
+  `lease_epoch` +1 on every reclaim; only `token_digest`
+  (`digest("work-claim-token:"+token)`) is persisted — the raw token is
+  returned once at claim and stripped recursively from every other
+  response. `assertCanonicalClaimLease` re-proves id, state enum,
+  business/project, claimant, ACTIVE⇒claimant==assignee, epoch,
+  `issued≤hb`, `exp>issued`, digest, ACTIVE+mirror agreement — consumed
+  at claim/heartbeat/release/open/assign/cancel/sync/reconcile.
+- **Heartbeat/renewal:** `POST /api/work-items/:id/heartbeat` validates
+  claimant + token digest + epoch + liveness, renews a server-bounded TTL
+  (`PAIR_WORK_ITEM_CLAIM_MS`, default 30 min; no caller TTL, no
+  rotation). Expired ACTIVE leases fence to EXPIRED inside the commit
+  (marker thrown after commit so the fence persists).
+- **Release/reclaim:** token-matched release → RELEASED + mirror clear;
+  expired/RELEASED → reclaim mints epoch+1 and a fresh token — stale
+  tokens die at the digest+epoch fence. `cancelWorkItem` revokes;
+  `syncWorkItem` releases terminal-item leases in the same txn.
+- **openWorkItem:** no hidden token mint. `assertNoForeignLiveLease`
+  blocks live foreign claims (`FAIL_CLOSED_WORK_ITEM_CLAIMED`), fences
+  expired ones, clears phantom mirrors — legacy mirror fields are never
+  authority and never fabricate a WCL.
+- **Durable inbox:** `workforce_message` (`WFM_<id>`, append-only
+  COMMITTED, kinds NOTE/REQUEST/STATUS/BLOCKER_NOTICE/HANDOFF_REQUEST) +
+  `workforce_message_receipt` (`WIR_<msg>_<recipient>`, exact-recipient
+  idempotent ACK). HANDOFF_REQUEST mutates nothing.
+- **Reconcile:** WCL validation (corrupt → quarantine), deterministic
+  expiry fencing, mirror repair, message/receipt validation —
+  idempotent, never fabricates, never terminates missions.
+- **R1 — atomic admission + immutable provenance:**
+  - `claimWorkItem`: the decisive admission proof (work_item, business,
+    WGM/graph authority, status, assignee, org_agent ACTIVE,
+    `assertExecutable`, existing WCL) is re-run **inside** the
+    `immediate()` that writes the lease — preflight outside is fast-path
+    only, not authority (TOCTOU closed).
+  - `assignWorkItem`: re-read + quarantine + graph authority + assignee
+    immutability + agent + transition + `leaseGateInTxn` + assignee CAS
+    in ONE `immediate()` — `assignee=B ∧ ACTIVE WCL(A)` unreachable.
+  - Lease validator requires `issued <= hb < expires_at` strictly.
+  - `WORKFORCE_MESSAGE_SENT` pins the full message identity +
+    `message_digest` + receipt anchor; `WORKFORCE_MESSAGE_ACKNOWLEDGED`
+    pins `message_id + recipient + acknowledged_at` — tamper-and-rehash
+    fails at the event anchor; direct row ACK without event fails.
+  - Read seams (`listWorkItemMessages`, `inboxForAgent`,
+    `getWorkItemClaim`) validate before returning — corrupt rows surface
+    as explicit CORRUPT markers, never as valid content.
+  - `reconcileWorkGraph` appends `WORK_COORDINATION_CORRUPT` at most once
+    per row — repeated passes are no-ops.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE2_REPORT.md` (§R1);
+  suite `pair-p14-wfv2-p2.test.ts` (50 — 40 `P14-P2-*` + 10
+  `P14-P2-R1-*` incl. genuine worker_threads races) + fresh-server E2E
+  sequences A–E + restart evidence.
+  Classification: **`P14_WORKFORCE_V2_PHASE2_R2_PENDING_FINAL_AUDIT`**.
+
 ## Not yet
 
-- Autonomous heartbeat/inbox/delegation/work-graph (P14 workforce —
-  beyond the V2 foundation), CEO agent / KPI gap analysis (P15).
-  Intentionally deferred.
+- Autonomous execution admission beyond coordination (Phase 3+), CEO
+  agent / KPI gap analysis (P15). Intentionally deferred.
 
 ## Release governance (current policy)
 
@@ -349,3 +410,4 @@ open-time ceiling, graph bounds — around two new canonical designs:
   merge, explicit manual merge only after audit pass. `main` is NOT
   currently protected; this file does not claim otherwise (see the
   P11 hardening report §10.14).
+- **P14 WFV2 Phase 2 R2 (collaboration provenance completeness)**: missing `workforce_message_receipt` now fails closed everywhere — `assertCanonicalCollaborationBundle` derives `WIR_<mid>_<recip>` from the canonical message and requires the exact validated receipt; `inboxForAgent`/`listWorkItemMessages` return only the `CORRUPT` projection (no body, never synthesized `PENDING`); `reconcileWorkGraph` detects missing/corrupt receipts and appends one deterministic `WORK_COORDINATION_CORRUPT` per message (idempotent, never fabricates); ACK event must pin `message_id`+`recipient_agent_id`+`acknowledged_at`. `P14-P2-R1-ASSIGN-CLAIM-RACE-INVERSE` is now a genuine 2-worker race (assign vs in-txn heartbeat); added `CLAIM-PROJECT-REVOKE` race. Focused 55/55; live E2E verified delete→CORRUPT→restart→1 corrupt event, receipt never recreated.

@@ -46,6 +46,7 @@ import {
   digest,
   newId,
   utcnow,
+  claimLeaseDigest,
   validatePlanProposal,
 } from "../pair/index.js";
 import type { DevinFetch } from "../pair/devin-executor.js";
@@ -1881,32 +1882,46 @@ describe("business layer (one-person-business skeleton)", () => {
     }
   });
 
-  it("claim: second agent rejected while claim live; release frees it", () => {
+  it("claim: canonical lease — expiry fenced, reclaim epochs forward, release frees", () => {
     const { ctx, biz } = makeBizCtx("b8");
     const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
     const bid = String(b.business_id);
     const a1 = biz.createOrgAgent({ business_id: bid, title: "A1", department: "d", operator_id: "op" });
     const a2 = biz.createOrgAgent({ business_id: bid, title: "A2", department: "d", operator_id: "op" });
-    const w = biz.createWorkItem({ business_id: bid, title: "t", goal: "g", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: bid, title: "t", goal: "g",
+      assignee_agent_id: String(a1.agent_id), operator_id: "op" });
     const wid = String(w.work_item_id);
     const c1 = biz.claimWorkItem(wid, String(a1.agent_id), "op");
     expect(c1.claim_token).toBeTruthy();
+    // a non-assignee can never claim an assigned item (P2 eligibility)
     expect(() => biz.claimWorkItem(wid, String(a2.agent_id), "op"))
-      .toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIMED/);
-    // expired claim can be taken over
-    const row = ctx.store.get("work_item", wid);
-    row.claim_expires_at = "2000-01-01T00:00:00.000Z";
-    ctx.store.put("work_item", wid, row, Number(row.version));
-    const c2 = biz.claimWorkItem(wid, String(a2.agent_id), "op");
-    expect(String(c2.claimed_by)).toBe(String(a2.agent_id));
-    // P11: a live claim is released only with its claim_token — a stale or
+      .toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIM_ASSIGNEE_MISMATCH/);
+    // re-claim while live → already-held, never a second lease
+    expect(() => biz.claimWorkItem(wid, String(a1.agent_id), "op"))
+      .toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIM_ALREADY_HELD/);
+    // expire the canonical lease → fenced EXPIRED → reclaim at epoch+1
+    // (window rewound coherently: issued/heartbeat/expires stay ordered,
+    // digest recomputed — simulates a lease whose TTL has elapsed)
+    const lease = ctx.store.get("work_claim_lease", `WCL_${wid}`);
+    lease.issued_at = "2000-01-01T00:00:00.000Z";
+    lease.last_heartbeat_at = "2000-01-01T00:00:01.000Z";
+    lease.expires_at = "2000-01-01T00:00:30.000Z";
+    lease.lease_digest = claimLeaseDigest(lease);
+    ctx.store.put("work_claim_lease", `WCL_${wid}`, lease, Number(lease.version));
+    const c2 = biz.claimWorkItem(wid, String(a1.agent_id), "op");
+    expect(String(ctx.store.get("work_item", wid).claimed_by)).toBe(String(a1.agent_id));
+    expect(Number(ctx.store.get("work_claim_lease", `WCL_${wid}`).lease_epoch)).toBe(2);
+    expect(c2.claim_token).not.toBe(String(c1.claim_token));
+    // P11/P2: a live claim is released only with its claim_token — a stale or
     // absent token cannot strip ownership.
     expect(() => biz.releaseClaim(wid, "op")).toThrowError(/FAIL_CLOSED_CLAIM_TOKEN/);
+    expect(() => biz.releaseClaim(wid, "op", String(c1.claim_token))).toThrowError(/FAIL_CLOSED_CLAIM_TOKEN/);
     biz.releaseClaim(wid, "op", String(c2.claim_token));
     expect(ctx.store.get("work_item", wid).claimed_by).toBeNull();
+    expect(String(ctx.store.get("work_claim_lease", `WCL_${wid}`).state)).toBe("RELEASED");
   });
 
-  it("open is blocked while another agent holds the claim", () => {
+  it("open proceeds when the assignee holds the claim; phantom mirrors cleared", () => {
     const { ctx, biz } = makeBizCtx("b9");
     const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
     const bid = String(b.business_id);
@@ -1914,8 +1929,23 @@ describe("business layer (one-person-business skeleton)", () => {
     const a2 = biz.createOrgAgent({ business_id: bid, title: "A2", department: "d", operator_id: "op" });
     const w = biz.createWorkItem({ business_id: bid, title: "t", goal: "g", assignee_agent_id: String(a2.agent_id), operator_id: "op" });
     const wid = String(w.work_item_id);
-    biz.claimWorkItem(wid, String(a1.agent_id), "op"); // held by someone else
-    expect(() => biz.openWorkItem(wid, "op")).toThrowError(/FAIL_CLOSED_WORK_ITEM_CLAIMED/);
+    // claim is coordination only — the canonical assignee claiming does
+    // NOT block open; a phantom mirror pointing at another agent is
+    // invalidated rather than adopted.
+    biz.claimWorkItem(wid, String(a2.agent_id), "op");
+    const open = biz.openWorkItem(wid, "op");
+    expect(String(open.status)).toBe("IN_PROGRESS");
+    const w2 = biz.createWorkItem({ business_id: bid, title: "t2", goal: "g", assignee_agent_id: String(a2.agent_id), operator_id: "op" });
+    const wid2 = String(w2.work_item_id);
+    const row2 = ctx.store.get("work_item", wid2);
+    row2.claimed_by = String(a1.agent_id);
+    row2.claim_token = "CLM_forged";
+    row2.claim_expires_at = "2999-01-01T00:00:00.000Z";
+    ctx.store.put("work_item", wid2, row2, Number(row2.version));
+    const open2 = biz.openWorkItem(wid2, "op");
+    expect(String(open2.status)).toBe("IN_PROGRESS");
+    expect(ctx.store.get("work_item", wid2).claimed_by).toBeNull();
+    expect(ctx.store.get("work_item", wid2).claim_token).toBeNull();
   });
 
   it("comment + block + unblock record events and move status", () => {

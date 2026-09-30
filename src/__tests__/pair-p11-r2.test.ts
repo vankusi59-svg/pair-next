@@ -649,18 +649,18 @@ describe("R2 §2 genuine worker_threads contention", () => {
     s.close();
   }, 60_000);
 
-  it("C. claim race: two agents claim the same work item — one owner only", async () => {
+  it("C. claim race: two connections claim the same work item — one lease only", async () => {
     const { dir, ctx, biz } = makeBizCtx("ra-claim");
     const dbPath = path.join(dir, "pair.db");
     const b = setupBusiness(biz, ctx.projectId);
     const bid = String(b.business_id);
-    const w = makeWorkItem(biz, bid, "claimme");
-    const wid = String(w.work_item_id);
     const a1 = biz.createOrgAgent({ business_id: bid, title: "a1", department: "ops", operator_id: "op" });
-    const a2 = biz.createOrgAgent({ business_id: bid, title: "a2", department: "ops", operator_id: "op" });
+    const w = biz.createWorkItem({ business_id: bid, title: "claimme", goal: "g",
+      assignee_agent_id: String(a1.agent_id), operator_id: "op" });
+    const wid = String(w.work_item_id);
     const [r1, r2] = await runRace([
       { op: "claim", dir, dbPath, args: { wid, agent: String(a1.agent_id) } },
-      { op: "claim", dir, dbPath, args: { wid, agent: String(a2.agent_id) } },
+      { op: "claim", dir, dbPath, args: { wid, agent: String(a1.agent_id) } },
     ]);
     const oks = [r1, r2].filter((r) => r.ok);
     const fails = [r1, r2].filter((r) => !r.ok);
@@ -668,7 +668,11 @@ describe("R2 §2 genuine worker_threads contention", () => {
     expect(fails.length).toBe(1);
     expect((fails[0] as { code: string }).code).toMatch(/FAIL_CLOSED/);
     const final = ctx.store.get("work_item", wid);
-    expect([String(a1.agent_id), String(a2.agent_id)]).toContain(String(final.claimed_by));
+    expect(String(final.claimed_by)).toBe(String(a1.agent_id));
+    // exactly one canonical lease row exists — no duplicate mint
+    const leases = ctx.store.list("work_claim_lease").filter((l) =>
+      String(l.work_item_id) === wid);
+    expect(leases.length).toBe(1);
   }, 60_000);
 
   it("D. open race: two workers openWorkItem the same item — exactly one canonical mission", async () => {

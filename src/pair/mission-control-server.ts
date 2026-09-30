@@ -205,6 +205,21 @@ async function detail(id){
 load();setInterval(load,10000);
 </script></body></html>`;
 
+/** P2 §2: raw claim tokens never leave the server except inside the
+ *  claim-creation response — strip the mirror field from any payload. */
+function stripClaimToken(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripClaimToken);
+  if (value && typeof value === "object") {
+    const o = { ...(value as Record<string, unknown>) };
+    for (const k of Object.keys(o)) {
+      if (k === "claim_token") delete o[k];
+      else o[k] = stripClaimToken(o[k]);
+    }
+    return o;
+  }
+  return value;
+}
+
 function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
@@ -659,7 +674,8 @@ export function createMissionControlServer(
       }
       if (method === "GET" && p === "/api/work-items") {
         const bid = url.searchParams.get("business_id") ?? undefined;
-        return void json(res, 200, { work_items: biz ? biz.listWorkItems(bid) : [] });
+        return void json(res, 200,
+          { work_items: biz ? stripClaimToken(biz.listWorkItems(bid)) : [] });
       }
       if (method === "POST" && p === "/api/work-items") {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
@@ -672,13 +688,28 @@ export function createMissionControlServer(
           operator_id: String(operator),
         }));
       }
-      m = p.match(/^\/api\/work-items\/([^/]+)\/(claim|release|comment|block|unblock|artifacts)$/);
+      m = p.match(/^\/api\/work-items\/([^/]+)\/(claim|release|heartbeat|comment|block|unblock|artifacts|messages)$/);
       if (method === "POST" && m) {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
         const [, wid, wact] = m;
+        if (wact === "messages") {
+          return void json(res, 200, biz.sendWorkforceMessage({
+            business_id: String(body.business_id ?? ""),
+            work_item_id: wid,
+            sender_type: (String(body.sender_type ?? "OPERATOR") as "AGENT" | "OPERATOR"),
+            sender_agent_id: String(body.sender_agent_id ?? "") || null,
+            sender_operator_id: String(body.sender_operator_id ?? operator) || null,
+            recipient_agent_id: String(body.recipient_agent_id ?? ""),
+            kind: String(body.kind ?? "NOTE"),
+            body: String(body.body ?? ""),
+            correlation_id: String(body.correlation_id ?? "") || null,
+          }));
+        }
         const out =
           wact === "claim" ? biz.claimWorkItem(wid, String(body.agent_id ?? ""), String(operator))
           : wact === "release" ? biz.releaseClaim(wid, String(operator), String(body.claim_token ?? "") || undefined)
+          : wact === "heartbeat" ? biz.heartbeatWorkItem(
+              wid, String(body.agent_id ?? ""), String(body.claim_token ?? ""), String(operator))
           : wact === "comment" ? biz.commentOnWorkItem(wid, String(body.author ?? operator), String(body.body ?? ""))
           : wact === "block" ? biz.blockWorkItem(wid, String(body.reason ?? ""), String(operator))
           : wact === "unblock" ? biz.unblockWorkItem(wid, String(operator))
@@ -686,7 +717,31 @@ export function createMissionControlServer(
               name: String(body.name ?? ""), uri: String(body.uri ?? ""),
               content_type: String(body.content_type ?? "") || undefined,
             }, String(operator));
-        return void json(res, 200, out);
+        // The raw token is returned ONLY by the claim creation response;
+        // every other work-item payload has it stripped (P2 §2).
+        return void json(res, 200, wact === "claim" ? out : stripClaimToken(out));
+      }
+      // P2: GET claim → safe lease metadata only (never token material);
+      // GET messages → the item's collaboration thread; inbox + ack.
+      m = p.match(/^\/api\/work-items\/([^/]+)\/(claim|messages)$/);
+      if (method === "GET" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const [, wid, wact] = m;
+        const out = wact === "claim"
+          ? (biz.getWorkItemClaim(wid) ?? { work_item_id: wid, state: "NONE" })
+          : { messages: biz.listWorkItemMessages(wid) };
+        return void json(res, 200, stripClaimToken(out));
+      }
+      m = p.match(/^\/api\/org-agents\/([^/]+)\/inbox$/);
+      if (method === "GET" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, { messages: biz.inboxForAgent(m[1]) });
+      }
+      m = p.match(/^\/api\/workforce\/messages\/([^/]+)\/ack$/);
+      if (method === "POST" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.ackWorkforceMessage(
+          m[1], String(body.agent_id ?? ""), String(operator)));
       }
       m = p.match(/^\/api\/work-items\/([^/]+)\/(open|assign|cancel)$/);
       if (method === "POST" && m) {

@@ -58,6 +58,18 @@ import {
   type MembershipFields,
   type ResolvedChildSpec,
 } from "./graph-authority.js";
+import {
+  WORK_CLAIM_LEASE_TABLE,
+  WORKFORCE_MESSAGE_TABLE,
+  WORKFORCE_RECEIPT_TABLE,
+  assertCanonicalClaimLease,
+  assertCanonicalCollaborationBundle,
+  assertCanonicalReceipt,
+  assertCanonicalWorkforceMessage,
+  claimLeaseDigest,
+  claimLeaseRowId,
+  leaseLiveExpired,
+} from "./work-coordination.js";
 
 // R1+R2: deterministic helpers + canonical validators live in
 // graph-authority.ts (imported by business.ts too) — re-exported here so
@@ -1216,6 +1228,130 @@ export class WorkforceService {
         this.business.assertGraphAuthority(w);
       } catch {
         quarantined.add(String(w.work_item_id));
+      }
+    }
+    // P2 §15 — coordination authority reconcile. A malformed WCL
+    // quarantines its work item (corrupt coordination authority fails
+    // closed for new claim/heartbeat/open decisions). A live lease whose
+    // clock has passed is deterministically fenced EXPIRED; safe
+    // observability mirrors are repaired FROM the canonical lease —
+    // never rebuilt from mutable mirrors alone. A work item's claim
+    // mirrors with no lease are legacy phantoms and are cleared.
+    const nowIso = utcnow();
+    for (const l of this.store.list(WORK_CLAIM_LEASE_TABLE)) {
+      try {
+        assertCanonicalClaimLease(this.graphDeps, l as Row);
+      } catch {
+        mark(String(l.work_item_id ?? ""));
+        continue;
+      }
+      const wid = String(l.work_item_id);
+      const w = this.store.tryGet("work_item", wid) as Row | null;
+      if (!w || String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) continue;
+      const live = String(l.state) === "ACTIVE" && !leaseLiveExpired(l as Row, nowIso);
+      const expired = String(l.state) === "ACTIVE" && leaseLiveExpired(l as Row, nowIso);
+      const wantBy = live ? String(l.claimant_agent_id) : null;
+      const wantExp = live ? String(l.expires_at) : null;
+      const mirrorDrift =
+        String(w.claimed_by ?? "") !== String(wantBy ?? "") ||
+        String(w.claim_expires_at ?? "") !== String(wantExp ?? "") ||
+        (w.claim_token !== null && w.claim_token !== undefined);
+      if (!expired && !mirrorDrift) continue;
+      this.store.immediate(() => {
+        const cur = this.store.get(WORK_CLAIM_LEASE_TABLE, String(l.lease_id));
+        if (expired && String(cur.state) === "ACTIVE") {
+          const next: Row = { ...cur, state: "EXPIRED", updated_at: utcnow() };
+          next.lease_digest = claimLeaseDigest(next);
+          this.store.put(WORK_CLAIM_LEASE_TABLE, String(cur.lease_id), next, Number(cur.version));
+          this.store.event({
+            entity_type: "work_item", entity_id: wid,
+            event_type: "WORK_CLAIM_EXPIRED",
+            actor: "PAIR_WORKFORCE_RECONCILE",
+            metadata: {
+              lease_id: String(cur.lease_id),
+              claimant_agent_id: String(cur.claimant_agent_id),
+              lease_epoch: Number(cur.lease_epoch),
+            },
+          });
+        }
+        const cw = this.store.get("work_item", wid);
+        if (
+          String(cw.claimed_by ?? "") !== String(wantBy ?? "") ||
+          String(cw.claim_expires_at ?? "") !== String(wantExp ?? "") ||
+          (cw.claim_token !== null && cw.claim_token !== undefined)
+        ) {
+          cw.claimed_by = wantBy;
+          cw.claim_expires_at = wantExp;
+          cw.claim_token = null;
+          cw.updated_at = utcnow();
+          this.store.put("work_item", wid, cw, Number(cw.version));
+        }
+      });
+    }
+    // Mirrors without a canonical lease are phantom coordination state
+    // (legacy claims that cannot be proven, or forged mirrors) — they
+    // invalidate safely: cleared, never adopted as authority (§9).
+    for (const w of this.store.list("work_item")) {
+      const hasMirror =
+        Boolean(w.claimed_by) ||
+        Boolean(w.claim_expires_at) ||
+        (w.claim_token !== null && w.claim_token !== undefined);
+      if (!hasMirror) continue;
+      if (this.store.tryGet(WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(String(w.work_item_id)))) continue;
+      this.store.immediate(() => {
+        const cw = this.store.get("work_item", String(w.work_item_id));
+        cw.claimed_by = null;
+        cw.claim_expires_at = null;
+        cw.claim_token = null;
+        cw.updated_at = utcnow();
+        this.store.put("work_item", String(w.work_item_id), cw, Number(cw.version));
+        this.store.event({
+          entity_type: "work_item", entity_id: String(w.work_item_id),
+          event_type: "WORK_CLAIM_MIRRORS_CLEARED",
+          actor: "PAIR_WORKFORCE_RECONCILE",
+          metadata: { work_item_id: String(w.work_item_id) },
+        });
+      });
+    }
+    // Durable inbox evidence is validated — never fabricated/rebuilt; a
+    // malformed message or receipt poisons only coordination audit (the
+    // event log), never an existing mission or claim lease. R1 §8 —
+    // corruption evidence is appended at most once per row so repeated
+    // reconciles are a strict no-op on already-flagged rows.
+    const alreadyFlagged = (etype: string, eid: string) =>
+      this.store.listEvents(etype, eid).some(
+        (e) => String(e.event_type) === "WORK_COORDINATION_CORRUPT");
+    for (const m of this.store.list(WORKFORCE_MESSAGE_TABLE)) {
+      try {
+        // R2 §3 — validate the whole collaboration bundle: a deleted or
+        //  corrupt receipt is invisible to a receipts-only sweep, so the
+        //  message's deterministic expected receipt must exist and pass.
+        assertCanonicalCollaborationBundle(this.graphDeps, m as Row);
+      } catch {
+        if (!alreadyFlagged(WORKFORCE_MESSAGE_TABLE, String(m.message_id ?? "unknown"))) {
+          this.store.event({
+            entity_type: WORKFORCE_MESSAGE_TABLE,
+            entity_id: String(m.message_id ?? "unknown"),
+            event_type: "WORK_COORDINATION_CORRUPT",
+            actor: "PAIR_WORKFORCE_RECONCILE",
+            metadata: { message_id: String(m.message_id ?? "") },
+          });
+        }
+      }
+    }
+    for (const r of this.store.list(WORKFORCE_RECEIPT_TABLE)) {
+      try {
+        assertCanonicalReceipt(this.graphDeps, r as Row);
+      } catch {
+        if (!alreadyFlagged(WORKFORCE_RECEIPT_TABLE, String(r.receipt_id ?? "unknown"))) {
+          this.store.event({
+            entity_type: WORKFORCE_RECEIPT_TABLE,
+            entity_id: String(r.receipt_id ?? "unknown"),
+            event_type: "WORK_COORDINATION_CORRUPT",
+            actor: "PAIR_WORKFORCE_RECONCILE",
+            metadata: { receipt_id: String(r.receipt_id ?? ""), message_id: String(r.message_id ?? "") },
+          });
+        }
       }
     }
     return { quarantined: [...quarantined] };
