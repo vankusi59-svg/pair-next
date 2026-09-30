@@ -258,6 +258,49 @@ P15/P16**:
   suite `pair-runtime-hardening.test.ts` (RH-R1-* ×11).
   Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`**.
 
+## P14 Workforce V2 Phase 1 candidate state (on branch, pending audit)
+
+**Clean rebaseline on `devin/1790741859-p14-wfv2-p1-rebaseline`** — PR #11
+(`devin/1790731419-p14-workforce-v2-p1`, head `44f7166`) was abandoned as
+**reference only** after its final independent audit found a systemic
+inverse-provenance omission (deleting mutable mirror fields could degrade
+a governed work item to "standalone") and an insufficiently anchored
+historical authority ceiling (a caller could swap the persisted snapshot
+and recompute digests). Proven ideas were selectively re-derived —
+deterministic child ids, proposal digest, `work_dependency_set` (WDS)
+manifests, atomic seams, assignee immutability, ADMISSION-vs-PROVENANCE,
+open-time ceiling, graph bounds — around two new canonical designs:
+
+- **`work_graph_membership` (`WGM_<work_item_id>`)** — bidirectional graph
+  authority. Written atomically with every work item (`STANDALONE`) and
+  every canonical governance row (`DELEGATED_CHILD`, `DECOMPOSED_CHILD`,
+  `GRAPH_PARENT`). `assertCanonicalMembership` re-proves the full chain
+  (key, digest, type-dispatched WDEL/WDEC/WDS/WAB validation, mirror-field
+  agreement, universal parent facet). Direction 2: committed canonical
+  rows governing an item without membership — or membership disagreeing
+  with them — fail closed; an item can never become standalone because its
+  mirror fields were deleted or altered.
+- **`work_authority_binding` (`WAB_<work_item_id>`) + `agent_contract_revision`
+  (`ACR_<contract>_<version>`)** — historically anchored execution ceiling.
+  The WAB pins `ceiling_agent_id`, `contract_id`, `contract_version`,
+  `contract_digest`, the normalized snapshot + digest, and a binding
+  digest over all anchors. Validation anchors the pin to durable revision
+  evidence (ACR row) AND to the append-only contract event journal, and
+  requires the stored snapshot ⊆ `policyAuthoritySnapshot(ACR.policy)` —
+  replace-and-rehash, foreign-contract, nonexistent-version, and
+  real-earlier-version rewind all fail closed.
+- **Dependency authority:** WDS manifests (explicit empty set included)
+  remain the sole proof of a node's dependency list — a WGE scan alone
+  never establishes "no dependencies". **Reconcile** validates WGE/WDEL/
+  WDEC/WDS/WGM/WAB rows and sweeps all work items bidirectionally;
+  corrupt canonical rows poison both endpoints; never rebuilt from
+  mutable mirrors; idempotent across restarts.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REBASELINE_REPORT.md`;
+  suite `pair-p14-workforce-v2.test.ts` (55 — incl. 11 `P14RB-P1-*`
+  inverse-provenance/anchor tests) + fresh-server E2E (tamper → 409
+  PROVENANCE_CORRUPT ×3, restart-quarantine durable).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_PENDING_AUDIT`**.
+
 ## Not yet
 
 - Autonomous heartbeat/inbox/delegation/work-graph (P14 workforce —

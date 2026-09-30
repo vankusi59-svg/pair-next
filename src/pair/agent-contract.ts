@@ -40,6 +40,18 @@ export const CONTEXT_SCOPES = ["business", "project", "agent", "experience"] as 
 
 export const AGENT_CONTRACT_TABLE = "agent_execution_contract";
 
+/** Append-only canonical revision evidence for P12 contracts: every
+ *  committed contract version writes exactly one deterministic row
+ *  (`ACR_<contract_id>_<version>`) carrying the normalized policy and
+ *  the contract's own digest at that version. Workforce authority
+ *  bindings anchor to these rows — a historical ceiling is only as real
+ *  as the revision that produced it. */
+export const AGENT_CONTRACT_REVISION_TABLE = "agent_contract_revision";
+
+export function contractRevisionRowId(contractId: string, version: number): string {
+  return `ACR_${contractId}_${version}`;
+}
+
 type Row = Record<string, unknown> & { version: number };
 
 export interface AgentContractPolicy {
@@ -290,6 +302,7 @@ export class AgentContractService {
     const row = this.buildRow(agent, merged, 1, actor);
     try {
       const saved = this.store.put(AGENT_CONTRACT_TABLE, String(row.contract_id), row, 0);
+      this.writeRevision(saved);
       this.store.event({
         entity_type: AGENT_CONTRACT_TABLE,
         entity_id: String(row.contract_id),
@@ -460,6 +473,7 @@ export class AgentContractService {
       updated_at: utcnow(),
     };
     const saved = this.store.put(AGENT_CONTRACT_TABLE, String(contract.contract_id), next, Number(contract.version));
+    this.writeRevision(saved);
     this.store.event({
       entity_type: AGENT_CONTRACT_TABLE,
       entity_id: String(contract.contract_id),
@@ -472,6 +486,29 @@ export class AgentContractService {
       },
     });
     return saved;
+  }
+
+  /** Append-only revision row for one committed contract version — the
+   *  canonical P12 evidence a workforce authority binding anchors to.
+   *  Deterministic id + create-only write keeps it race-safe. */
+  private writeRevision(contract: Row): void {
+    const revisionId = contractRevisionRowId(
+      String(contract.contract_id), Number(contract.contract_version));
+    if (this.store.tryGet(AGENT_CONTRACT_REVISION_TABLE, revisionId)) return;
+    this.store.put(AGENT_CONTRACT_REVISION_TABLE, revisionId, {
+      revision_id: revisionId,
+      contract_id: String(contract.contract_id),
+      org_agent_id: String(contract.org_agent_id),
+      business_id: String(contract.business_id),
+      contract_version: Number(contract.contract_version),
+      contract_digest: contract.contract_digest,
+      policy: contract.policy,
+      status: contract.status,
+      state: "COMMITTED",
+      created_at: utcnow(),
+      updated_at: utcnow(),
+      version: 0,
+    }, 0);
   }
 
   setStatus(agentId: string, status: AgentContractStatus, actor: string): Row {
