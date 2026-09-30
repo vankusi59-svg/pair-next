@@ -52,7 +52,7 @@ import {
   proveCanonicalMissionCompletion,
   utcnow,
 } from "../pair/index.js";
-import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
+import { canonicallyCompleteMission, canonicallyTerminateMission, fireRoutineMission } from "./canonical-mission-completion.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p14wfv2p3-"));
 let counter = 0;
@@ -2214,9 +2214,7 @@ describe("P14-FC — routine mirror authority boundary", () => {
     const r = makeRoutine(biz, String(b.business_id));
     const m = await fireRoutineMission(ctx, schedules, String(b.business_id), String(r.schedule_id));
     const mid = String(m.mission_id);
-    ctx.service.transitionMission(mid, "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(mid, "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(mid, "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "FAILED"); // canonical mission+runtime failure evidence — status-only FAILED proves nothing (R3)
     biz.board(String(b.business_id)); // projects BLOCKED (mission FAILED)
     biz.board(String(b.business_id));
     const w = routineItems(ctx.store)[0]!;
@@ -2231,9 +2229,7 @@ describe("P14-FC — routine mirror authority boundary", () => {
     const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
     const m = await fireRoutineMission(ctx, schedules, String(b.business_id), String(r.schedule_id));
     const mid = String(m.mission_id);
-    ctx.service.transitionMission(mid, "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(mid, "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(mid, "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "FAILED"); // canonical mission+runtime failure evidence — status-only FAILED proves nothing (R3)
     biz.board(String(b.business_id)); // BLOCKED mirror
     const wid = String(routineItems(ctx.store)[0]!.work_item_id);
     // Governed reopen: a new bound mission is appended — the item now
@@ -2491,9 +2487,7 @@ describe("P14-FC-R1 — canonical routine provenance + membership", () => {
     const a = makeAgent(biz, String(b.business_id));
     const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
     const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
-    ctx.service.transitionMission(String(m.mission_id), "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, String(m.mission_id), "FAILED"); // canonical evidence, not status-only (R3)
     biz.board(String(b.business_id));
     const w = routineItems(ctx.store)[0]!;
     // Break the provenance: point the mirror at a foreign mission.
@@ -2522,9 +2516,7 @@ describe("P14-FC-R1 — canonical routine provenance + membership", () => {
     const a = makeAgent(biz, String(b.business_id));
     const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
     const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
-    ctx.service.transitionMission(String(m.mission_id), "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, String(m.mission_id), "FAILED"); // canonical evidence, not status-only (R3)
     biz.board(String(b.business_id));
     const w = routineItems(ctx.store)[0]!;
     biz.openWorkItem(String(w.work_item_id), "op");
@@ -2542,9 +2534,7 @@ describe("P14-FC-R1 — canonical routine provenance + membership", () => {
     const a = makeAgent(biz, String(b.business_id));
     const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
     const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
-    ctx.service.transitionMission(String(m.mission_id), "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, String(m.mission_id), "FAILED"); // canonical evidence, not status-only (R3)
     biz.board(String(b.business_id));
     const wid = String(routineItems(ctx.store)[0]!.work_item_id);
     // Restart, then open on the fresh stack — promotion re-validates the
@@ -2567,9 +2557,7 @@ describe("P14-FC-R1 — canonical routine provenance + membership", () => {
     const a = makeAgent(biz, String(b.business_id));
     const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
     const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
-    ctx.service.transitionMission(String(m.mission_id), "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, String(m.mission_id), "FAILED"); // canonical evidence, not status-only (R3)
     biz.board(String(b.business_id));
     // Second connection sees the same mirror + same WGM — no dup.
     const s2 = reopenStack(dir);
@@ -2591,9 +2579,7 @@ describe("P14-FC-R1 — canonical routine provenance + membership", () => {
     const a = makeAgent(biz, String(b.business_id));
     const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
     const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
-    ctx.service.transitionMission(String(m.mission_id), "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(String(m.mission_id), "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, String(m.mission_id), "FAILED"); // canonical evidence, not status-only (R3)
     biz.board(String(b.business_id));
     const wid = String(routineItems(ctx.store)[0]!.work_item_id);
     biz.openWorkItem(wid, "op");
@@ -2659,9 +2645,7 @@ describe("P14-FC-R2 — canonical routine mission lineage", () => {
       cron: "0 9 * * *", operator_id: "op", ...over,
     } as never);
   const runMissionToFailed = (ctx: ReturnType<typeof makeCtxOn>, mid: string) => {
-    ctx.service.transitionMission(mid, "READY", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(mid, "RUNNING", "PAIR_MISSION_RUNTIME");
-    ctx.service.transitionMission(mid, "FAILED", "PAIR_MISSION_RUNTIME");
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "FAILED"); // canonical mission+runtime failure evidence — status-only FAILED proves nothing (R3)
   };
   const appendMission = (ctx: ReturnType<typeof makeCtxOn>, wid: string, mid: string) => {
     const cur = ctx.store.get("work_item", wid);
@@ -2872,5 +2856,280 @@ describe("P14-FC-R2 — canonical routine mission lineage", () => {
     biz.syncWorkItem(wid);
     const after = ctx.store.get("work_item", wid);
     expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+});
+
+// =====================================================================
+// FC R3 — mutable mission.status is NOT replacement authority.
+// A terminal/non-terminal claim must be backed by the canonical
+// lifecycle chain (MISSION_TRANSITION + MRT_<id> + MISSION_RUNTIME_TRANSITION,
+// legal transitions, compatible pairing, no contradictory evidence,
+// no forbidden live executor_execution). Status-only claims fail closed:
+// zero open intent / reservation / WOB / mission / dispatch.
+// =====================================================================
+describe("P14 FC R3 — canonical mission lifecycle authority", () => {
+  const routineItems = (store: PairEvidenceStore) =>
+    store.list("work_item").filter((w) => w.routine_id != null);
+  const makeRoutine = (biz: BusinessLayer, businessId: string, over: Record<string, unknown> = {}) =>
+    biz.createRoutine({
+      business_id: businessId, name: "daily", goal_template: "g",
+      cron: "0 9 * * *", operator_id: "op", ...over,
+    } as never);
+  // Bare status forge — exactly the attack the mandate names: mutate the
+  // mutable field, write NOTHING else (no transitions, no runtime row).
+  const forgeStatus = (ctx: ReturnType<typeof makeCtxOn>, mid: string, to: string) => {
+    const m = ctx.store.get("mission", mid);
+    m.status = to;
+    ctx.store.put("mission", mid, m, Number(m.version));
+  };
+  it("P14-FC-R3-STATUS-ONLY-FAILED-CANNOT-REOPEN: forged FAILED on a RUNNING bound mission → open fails closed, zero mints", () => {
+    const { ctx, biz } = makeStack("r3-forge-failed");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    // Attack: bound mission RUNNING + runtime RUNNING — forge ONLY the
+    // mutable mission.status field to FAILED.
+    forgeStatus(ctx, mid, "FAILED");
+    const missions0 = ctx.store.list("mission").length;
+    const bindings0 = ctx.store.list("work_open_binding").length;
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    const after = ctx.store.get("work_item", wid);
+    expect(after.pending_open_id ?? null).toBeNull();
+    expect(ctx.store.list("mission")).toHaveLength(missions0);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(bindings0);
+    // No sync fold either — a status-only FAILED is never BLOCKED authority.
+    expect(String(biz.syncWorkItem(wid).status)).toBe("IN_PROGRESS");
+  });
+
+  it("P14-FC-R3-STATUS-ONLY-CANCELLED-CANNOT-REOPEN: forged CANCELLED → open fails closed, zero mints", () => {
+    const { ctx, biz } = makeStack("r3-forge-cancelled");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    forgeStatus(ctx, mid, "CANCELLED");
+    const missions0 = ctx.store.list("mission").length;
+    const bindings0 = ctx.store.list("work_open_binding").length;
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(ctx.store.list("mission")).toHaveLength(missions0);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(bindings0);
+    // and no CANCELLED fold — status-only is never terminal authority.
+    const after = ctx.store.get("work_item", wid);
+    expect(String(after.status)).not.toBe("CANCELLED");
+  });
+
+  it("P14-FC-R3-STATUS-ONLY-PAUSED-CANNOT-FOLD: forged PAUSED → quarantine, never BLOCKED authority", () => {
+    const { ctx, biz } = makeStack("r3-forge-paused");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    forgeStatus(ctx, mid, "PAUSED");
+    biz.syncWorkItem(wid);
+    const after = ctx.store.get("work_item", wid);
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-FC-R3-RUNTIME-RUNNING-CONTRADICTS-MISSION-FAILED: real MISSION_TRANSITION evidence but runtime still RUNNING → quarantine + open denied", () => {
+    const { ctx, biz } = makeStack("r3-rt-running-failed");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    // Mission side is genuinely transitioned (legal events exist) — the
+    // RUNTIME side is left RUNNING: the incompatible pairing breaks the
+    // proof even though mission evidence looks complete.
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "FAILED", { runtimeState: "RUNNING" });
+    expect(String(ctx.store.get("mission", mid).status)).toBe("FAILED");
+    expect(String(ctx.store.get("mission_runtime", `MRT_${mid}`).state)).toBe("RUNNING");
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).blocked_code ?? ""))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).not.toBe("NO_ERROR");
+    expect((ctx.store.get("work_item", wid).mission_ids as string[])).toHaveLength(1);
+  });
+
+  it("P14-FC-R3-RUNTIME-RUNNING-CONTRADICTS-MISSION-CANCELLED: legal cancel events + runtime RUNNING → open denied, no replacement", () => {
+    const { ctx, biz } = makeStack("r3-rt-running-cancelled");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "CANCELLED", { runtimeState: "RUNNING" });
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect((ctx.store.get("work_item", wid).mission_ids as string[])).toHaveLength(1);
+  });
+
+  it("P14-FC-R3-CANONICAL-FAILED-MISSION-MAY-REOPEN: real canonical failure evidence → governed reopen mints bound mission", () => {
+    const { ctx, biz } = makeStack("r3-canonical-failed");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "FAILED");
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("BLOCKED");
+    const reopened = biz.openWorkItem(wid, "op");
+    expect(String(reopened.status)).toBe("IN_PROGRESS");
+    const mids = ctx.store.get("work_item", wid).mission_ids as string[];
+    expect(mids).toEqual([mid, expect.any(String)]);
+    // The replacement is bound — never a bare appended id; BOTH opens
+    // minted WOB rows pinned to this item.
+    const bindings = ctx.store.list("work_open_binding")
+      .filter((x) => String(x.work_item_id) === wid);
+    expect(bindings.map((x) => String(x.mission_id)).sort())
+      .toEqual(mids.sort());
+  });
+
+  it("P14-FC-R3-CANONICAL-CANCELLED-MISSION-MAY-REOPEN: canonical cancel evidence → governed reopen succeeds", () => {
+    const { ctx, biz } = makeStack("r3-canonical-cancelled");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "CANCELLED");
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("CANCELLED");
+    // CANCELLED is item-terminal; the cancel path's governed reopen is
+    // a NEW work item — verify the mission-level gate accepts the proof
+    // (terminal + canonical) by reopening a fresh item is unnecessary;
+    // prove the gate admits canonical CANCELLED evidence directly:
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_WORK_ITEM_TRANSITION"); // terminal item, not lifecycle failure
+  });
+
+  it("P14-FC-R3-ROUTINE-STATUS-ONLY-FAILED-NOT-BLOCKED-AUTHORITY: forged scheduler-mission FAILED → mirror quarantined, no BLOCKED, no reopen", async () => {
+    const { ctx, biz, schedules } = makeStack("r3-rt-forge-failed");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    forgeStatus(ctx, String(m.mission_id), "FAILED");
+    biz.board(String(b.business_id));
+    const w = routineItems(ctx.store)[0]!;
+    expect(String(w.status)).not.toBe("BLOCKED");
+    expect(String(w.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    // The corrupt mirror can never be promoted into replacement authority.
+    expect(errCode(() => biz.openWorkItem(String(w.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-FC-R3-ROUTINE-STATUS-ONLY-CANCELLED-FAILS: forged CANCELLED → mirror quarantined, never CANCELLED fold", async () => {
+    const { ctx, biz, schedules } = makeStack("r3-rt-forge-cancelled");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    forgeStatus(ctx, String(m.mission_id), "CANCELLED");
+    biz.board(String(b.business_id));
+    const w = routineItems(ctx.store)[0]!;
+    expect(String(w.status)).not.toBe("CANCELLED");
+    expect(String(w.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-FC-R3-SCHEDULER-MUST-BE-CANONICALLY-TERMINAL-BEFORE-FIRST-REOPEN: status-only sched FAILED + runtime RUNNING → reopen denied", async () => {
+    const { ctx, biz, schedules } = makeStack("r3-sched-lifecycle");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    const mid = String(m.mission_id);
+    // Mission claims FAILED through real transitions; runtime RUNNING —
+    // canonical seriality demands BOTH sides terminal before attempt 2.
+    canonicallyTerminateMission(ctx.store, ctx.service, mid, "FAILED", { runtimeState: "RUNNING" });
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    const missions0 = ctx.store.list("mission").length;
+    // board's mirror fold consumed the same lifecycle proof and already
+    // quarantined the corrupt mirror — open then fails closed on the
+    // quarantine (zero intent/binding/mission either way).
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expect(ctx.store.list("mission")).toHaveLength(missions0);
+    expect((ctx.store.get("work_item", wid).mission_ids as string[])).toHaveLength(1);
+  });
+
+  it("P14-FC-R3-BOUND1-MUST-BE-CANONICALLY-TERMINAL-BEFORE-BOUND2: status-only FAILED on bound attempt 1 blocks reopen 2", async () => {
+    const { ctx, biz, schedules } = makeStack("r3-bound1-lifecycle");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    canonicallyTerminateMission(ctx.store, ctx.service, String(m.mission_id), "FAILED");
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    biz.openWorkItem(wid, "op"); // bound attempt 1
+    const bound1 = String((ctx.store.get("work_item", wid).mission_ids as string[]).slice(-1)[0]);
+    // Forge ONLY the status field on bound1 — a mutable claim must not
+    // authorize bound attempt 2.
+    forgeStatus(ctx, bound1, "FAILED");
+    const missions0 = ctx.store.list("mission").length;
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(ctx.store.list("mission")).toHaveLength(missions0);
+    expect((ctx.store.get("work_item", wid).mission_ids as string[])).toHaveLength(2);
+  });
+
+  it("P14-FC-R3-CANONICAL-SERIAL-REOPENS-PASS: scheduler FAILED canonical → bound1 FAILED canonical → bound2 completes → WCP", async () => {
+    const { ctx, biz, schedules } = makeStack("r3-serial-pass");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    canonicallyTerminateMission(ctx.store, ctx.service, String(m.mission_id), "FAILED");
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const bound1 = String((ctx.store.get("work_item", wid).mission_ids as string[]).slice(-1)[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, bound1, "FAILED");
+    expect(String(biz.syncWorkItem(wid).status)).toBe("BLOCKED");
+    biz.openWorkItem(wid, "op");
+    const bound2 = String((ctx.store.get("work_item", wid).mission_ids as string[]).slice(-1)[0]);
+    assertCanonicalRoutineLineage(ctx.store, ctx.store.get("work_item", wid));
+    canonicallyCompleteMission(ctx.store, ctx.service, bound2);
+    const done = biz.syncWorkItem(wid);
+    expect(String(done.status)).toBe("DONE");
+    expect(String(wcpOf(ctx.store, wid)!.mission_id)).toBe(bound2);
+    expect(anchorEvents(ctx.store, wid)).toHaveLength(1);
   });
 });

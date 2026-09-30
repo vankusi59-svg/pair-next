@@ -492,3 +492,132 @@ Convergence declaration stands.
 ## 21. R2 classification
 
 **`P14_WORKFORCE_V2_FINAL_CLOSURE_R2_PENDING_INDEPENDENT_AUDIT`**
+
+## 22. Remediation R3 — canonical mission lifecycle / replacement authority
+
+**Classification basis:** `P14_WORKFORCE_V2_FINAL_CLOSURE_R2_FINAL_INDEPENDENT_AUDIT_BLOCKED — R3 REQUIRED` (core mission lifecycle / replacement-authority closure on the same PR).
+
+### 22.1 Root defect
+
+`TERMINAL_MISSION_STATUSES.has(mission.status)` trusted the **mutable
+status field** as terminal authority at two seams:
+
+- `openWorkItem` — a bound/scheduler mission RUNNING + runtime RUNNING
+  could be replaced by mutating only `mission.status = "FAILED"`: the
+  sync fold projected BLOCKED and the open gate minted a replacement
+  while the old runtime was still live.
+- `syncWorkItem` / `syncRoutineMirror` — status-only FAILED/CANCELLED/
+  PAUSED claims folded to BLOCKED/CANCELLED with no proof that the
+  mission/runtime lifecycle actually reached that state.
+- Routine lineage seriality relied on `bound_at` ordering only — a
+  status-only-terminal predecessor (scheduler before bound1, bound1
+  before bound2) still authorized the next attempt.
+
+### 22.2 Canonical lifecycle proof (one validator, consumed at every seam)
+
+`assertCanonicalMissionLifecycle(store, mission, claimed)` /
+`proveCanonicalMissionLifecycle` / `proveCanonicalMissionTerminalForReplacement`
+in `work-completion.ts`. For `claimed ∈ {FAILED, CANCELLED, PAUSED}`:
+
+1. mission row exists; identity `mission_id` matches;
+2. `mission.status === claimed`;
+3. exactly one `MISSION_TRANSITION` into `claimed` from a legal
+   predecessor (preds derived from `MISSION_STATUS_TRANSITIONS`,
+   never redeclared); no event ever leaves `claimed`;
+4. `MRT_<mid>` row exists; `rt.mission_id === mid`;
+5. `rt.state` ∈ canonical pairing:
+   FAILED↔{FAILED, ABORTED}, CANCELLED↔{CANCELLED, ABORTED},
+   PAUSED↔{PAUSED, CREATED} (the CREATED pairing = operator pause of a
+   mission whose runtime never started — `pause()` mints the MRT row
+   at CREATED and CREATED→PAUSED is not a legal runtime hop);
+6. runtime-state evidence: for PAUSED↔CREATED, exactly one
+   `MISSION_RUNTIME_CREATED` anchor and zero transition events;
+   otherwise exactly one `MISSION_RUNTIME_TRANSITION` into `rt.state`
+   from a legal predecessor (`runtimePredsOf` derived from
+   `RUNTIME_TRANSITIONS`), `metadata.mission_id` pinned, none leaving;
+7. no contradictory later evidence on either entity;
+8. for terminal claims (non-PAUSED) with `rt.state !== "ABORTED"`: no
+   live `executor_execution` (`!TERMINAL_EXECUTION.has(state) &&
+   !cancel_requested`) — ABORTED is the one canonical path that
+   legitimately leaves executions unresolved (abortMission).
+
+`COMPLETED` delegates to `proveCanonicalMissionCompletion` unchanged —
+not weakened. Pairings were surveyed from the actual canonical writers
+(`maybeFinalize`, `abortMission`, `cancel`, `pause`), not invented.
+
+### 22.3 Consumption
+
+- **Open gate** (`openWorkItem`): iterates ALL `priorMissionIds` —
+  non-terminal claim → `FAIL_CLOSED_MISSION_ACTIVE`; terminal claim →
+  `assertCanonicalMissionLifecycle`, violation →
+  `FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT` — before ANY authority write
+  (zero intent/reservation/WOB/mission/dispatch). A foreign terminal
+  tail can no longer hide a still-live mission.
+- **`syncWorkItem`**: FAILED/CANCELLED/PAUSED folds assert the proof
+  first — violation → `quarantineWorkItem(TERMINAL_PROVENANCE_CORRUPT)`,
+  no fold, no fabricated evidence.
+- **`syncRoutineMirror`**: same assertion before BLOCKED/CANCELLED fold.
+- **Projection** (`syncRoutineWorkItems`): unproven FAILED/CANCELLED/
+  PAUSED claims project IN_PROGRESS; the same-render fold quarantines.
+- **Routine seriality** (`assertCanonicalRoutineLineage`): every
+  mission before the final attempt must be
+  `proveCanonicalMissionTerminalForReplacement` — scheduler terminal
+  before bound1, bound1 before bound2 — independent of `bound_at`.
+- **`reconcileWorkLifecycle`**: DONE-materialization path unchanged
+  (completion proof already required).
+
+### 22.4 R3 tests (12)
+
+7 core: STATUS-ONLY-FAILED-CANNOT-REOPEN, STATUS-ONLY-CANCELLED-
+CANNOT-REOPEN, STATUS-ONLY-PAUSED-CANNOT-FOLD, RUNTIME-RUNNING-
+CONTRADICTS-MISSION-FAILED, RUNTIME-RUNNING-CONTRADICTS-MISSION-
+CANCELLED, CANONICAL-FAILED-MISSION-MAY-REOPEN, CANONICAL-CANCELLED-
+MISSION-MAY-REOPEN; 5 routine: ROUTINE-STATUS-ONLY-FAILED-NOT-BLOCKED-
+AUTHORITY, ROUTINE-STATUS-ONLY-CANCELLED-FAILS, SCHEDULER-MUST-BE-
+CANONICALLY-TERMINAL-BEFORE-FIRST-REOPEN, BOUND1-MUST-BE-CANONICALLY-
+TERMINAL-BEFORE-BOUND2, CANONICAL-SERIAL-REOPENS-PASS.
+
+§9 helper migration: `canonicallyTerminateMission(store, service, mid,
+target, {runtimeState?})` in the shared helper drives BOTH canonical
+state machines (legal mission transitions + MRT_<mid> mint + legal
+runtime hops to the canonical pairing, incl. the ABORTED pairing);
+every status-only fixture migrated (p3 ×9, p11 §2.B cancelled item,
+e2e rtMid2/rtMid4). The runtime contradiction tests drive the mission
+side through real transitions and leave the runtime RUNNING —
+isolating the pairing check.
+
+### 22.5 R3 E2E (65/65)
+
+- **A:** bound mission + runtime RUNNING → forge `mission.status=FAILED`
+  → board folds nothing, item quarantines (status stays IN_PROGRESS) →
+  open → 409, Δmissions=0, Δbindings=0, no intent, no WCP.
+- **B:** genuine scheduler mission RUNNING + runtime RUNNING → same
+  forge → mirror quarantined, never BLOCKED, promotion denied.
+- **C:** real canonical failure → BLOCKED → governed reopen exactly
+  once (2 missions, 2 bindings) → second reopen while attempt 2 live →
+  409. Store integrity: 0 errors.
+
+### 22.6 R3 regression / platform matrix
+
+- Focused: P14-P3 suite **109/109** (R1 15 + R2 9 + R3 12 + prior).
+- Regression: P3 109 · P2 55 · Phase1 73 · P14F 35 · RH 11 · P13 67 ·
+  P12 71 · P11+r 103 · P10 31 · P9 79 · P6 36 = **670/670**.
+- **Node22: 2206 pass + 2 fail** — same pre-existing P5 env-gap
+  failures (DSH/CODEX probes; unchanged).
+- **Node20: 2208/0**. tsc clean · `pnpm build` PASS ·
+  `pnpm audit` 0 high (1 low + 8 moderate transitive, pre-existing) ·
+  store `verifyIntegrity` 0 errors.
+
+### 22.7 R3 convergence reassessment
+
+Runtime terminal authority is provable WITHOUT redesigning the runtime
+state machine: the proof reads `MRT_<id>` rows +
+`MISSION_RUNTIME_TRANSITION` evidence written by the existing
+canonical writers, with pairings surveyed from those writers. No new
+state machine, no second completion/replacement authority, no
+scheduler/router/runtime/planner change — the existing validator is
+strengthened and consumed at the existing seams. Convergence stands.
+
+## 23. R3 classification
+
+**`P14_WORKFORCE_V2_FINAL_CLOSURE_R3_PENDING_INDEPENDENT_AUDIT`**

@@ -29,7 +29,7 @@ import {
   mintBrokerCapability,
   claimLeaseDigest,
 } from "../pair/index.js";
-import { canonicallyCompleteMission, fireRoutineMission } from "./canonical-mission-completion.js";
+import { canonicallyCompleteMission, canonicallyTerminateMission, fireRoutineMission } from "./canonical-mission-completion.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11-"));
 let counter = 0;
@@ -158,9 +158,10 @@ describe("P11 §2.B work-item lifecycle", () => {
     const w3 = biz.createWorkItem({ business_id: bId(b), title: "t3", goal: "g", operator_id: "op" });
     biz.openWorkItem(wId(w3), "op");
     const mid3 = (biz.listWorkItems(bId(b)).find((x) => x.work_item_id === w3.work_item_id)!.mission_ids as string[])[0];
-    const m3 = ctx.store.get("mission", mid3);
-    m3.status = "CANCELLED";
-    ctx.store.put("mission", mid3, m3, Number(m3.version));
+    // R3 — status-only CANCELLED proves nothing; a canonical cancel
+    // (mission + runtime terminal evidence) folds → CANCELLED → open
+    // denied by the work-item terminal transition table.
+    canonicallyTerminateMission(ctx.store, ctx.service, mid3, "CANCELLED");
     biz.board(bId(b));
     expect(() => biz.openWorkItem(wId(w3), "op")).toThrowError(/FAIL_CLOSED_WORK_ITEM_TRANSITION/);
   });

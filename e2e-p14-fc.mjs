@@ -45,6 +45,78 @@ const transitionRuntimeLike = (store, mid, to, reason) => {
     metadata: { mission_id: mid, reason } });
 };
 
+// R3 — legal per-hop mirrors of service.MISSION_STATUS_TRANSITIONS and
+// mission-runtime RUNTIME_TRANSITIONS: a bare `status = "FAILED"` write
+// is a mutable claim; the canonical lifecycle proof requires legal
+// transition evidence on BOTH state machines.
+const M_STEPS = {
+  CREATED: ["READY", "CANCELLED"],
+  READY: ["RUNNING", "PAUSED", "CANCELLED"],
+  RUNNING: ["PAUSED", "COMPLETED", "FAILED", "CANCELLED"],
+  PAUSED: ["RUNNING", "CANCELLED", "FAILED"],
+  COMPLETED: [], FAILED: [], CANCELLED: [],
+};
+const RT_STEPS = {
+  CREATED: ["PLANNING", "READY", "CANCELLED", "ABORTED"],
+  PLANNING: ["READY", "FAILED", "WAITING_APPROVAL", "CANCELLED", "ABORTED"],
+  READY: ["RUNNING", "PAUSED", "CANCELLED", "ABORTED"],
+  RUNNING: ["WAITING", "WAITING_BACKOFF", "WAITING_APPROVAL", "RECONCILING",
+    "REPLANNING", "RECOVERING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED", "ABORTED"],
+  WAITING: ["RUNNING", "PAUSED", "CANCELLED", "ABORTED", "FAILED"],
+  WAITING_BACKOFF: ["RUNNING", "RECOVERING", "CANCELLED", "ABORTED", "WAITING_APPROVAL"],
+  WAITING_APPROVAL: ["RUNNING", "RECOVERING", "REPLANNING", "RECONCILING", "CANCELLED", "ABORTED", "FAILED"],
+  RECONCILING: ["RUNNING", "RECOVERING", "WAITING_APPROVAL", "FAILED", "CANCELLED", "ABORTED"],
+  REPLANNING: ["READY", "RUNNING", "FAILED", "CANCELLED", "ABORTED", "WAITING_APPROVAL"],
+  RECOVERING: ["RUNNING", "WAITING_BACKOFF", "WAITING_APPROVAL", "RECONCILING",
+    "REPLANNING", "FAILED", "CANCELLED", "ABORTED"],
+  PAUSED: ["READY", "RUNNING", "CANCELLED", "ABORTED"],
+  COMPLETED: [], FAILED: [], CANCELLED: [], ABORTED: [],
+};
+const pathTo = (table, from, to) => {
+  if (from === to) return [];
+  const q = [[from]], seen = new Set([from]);
+  while (q.length) {
+    const p = q.shift(), cur = p[p.length - 1];
+    for (const nxt of table[cur] ?? []) {
+      if (seen.has(nxt)) continue;
+      if (nxt === to) return [...p.slice(1), to];
+      seen.add(nxt); q.push([...p, nxt]);
+    }
+  }
+  return null;
+};
+
+// Drive a mission to a canonically-provable FAILED/CANCELLED/PAUSED
+// lifecycle state: legal mission transitions + MRT_<mid> row + legal
+// runtime transitions to the canonical pairing.
+const terminateMission = (mid, target, { rt = null } = {}) => {
+  const store = storeOf();
+  const service = new PAIR.PairControlPlane(store);
+  const mPath = pathTo(M_STEPS, String(store.get("mission", mid).status), target);
+  if (mPath === null) throw new Error(`no mission path to ${target}`);
+  for (const to of mPath) service.transitionMission(mid, to, RUNTIME_ACTOR);
+  const rtId = `MRT_${mid}`;
+  if (!store.tryGet("mission_runtime", rtId)) {
+    store.put("mission_runtime", rtId, {
+      mission_runtime_id: rtId, mission_id: mid, state: "CREATED",
+      entered_at: PAIR.utcnow(), reason: "mission_runtime_created",
+      barriers: {}, pending_recovery: null, pending_approval_id: null,
+      pending_remediation: null,
+      budget_extension: { attempts_per_task: 0, attempts_per_mission: 0 },
+      version: 0 }, 0);
+    store.event({ entity_type: "mission_runtime", entity_id: rtId,
+      event_type: "MISSION_RUNTIME_CREATED", new_state: "CREATED",
+      actor: RUNTIME_ACTOR, metadata: { mission_id: mid } });
+  }
+  const rtTarget = rt ?? (target === "PAUSED" ? "PAUSED" : target);
+  const reasons = { READY: "plan_committed", RUNNING: "tasks_dispatched",
+    PAUSED: "operator_pause:e2e", FAILED: "tasks_incomplete:T1",
+    CANCELLED: "operator_cancel:e2e", ABORTED: "aborted:e2e" };
+  const rPath = pathTo(RT_STEPS, String(store.get("mission_runtime", rtId).state), rtTarget);
+  if (rPath === null) throw new Error(`no runtime path to ${rtTarget}`);
+  for (const to of rPath) transitionRuntimeLike(store, mid, to, reasons[to] ?? `to_${to.toLowerCase()}`);
+};
+
 // Canonical governed-runtime completion evidence — identical persisted
 // shape to GovernedTaskGate + ArtifactProvenanceValidator output.
 const completeMission = (mid, { tasks = 1 } = {}) => {
@@ -508,9 +580,8 @@ const rtMid2 = String(occ2?.mission_id ?? "");
 ok("FC-R1 second occurrence fired+bound", !!occ2 && rtMid2 !== rtMid1,
   `occ2=${occ2?.occurrence_id} mid2=${rtMid2}`);
 // run the scheduler mission to FAILED — mirror folds BLOCKED
-svc2.transitionMission(rtMid2, "READY", "PAIR_MISSION_RUNTIME");
-svc2.transitionMission(rtMid2, "RUNNING", "PAIR_MISSION_RUNTIME");
-svc2.transitionMission(rtMid2, "FAILED", "PAIR_MISSION_RUNTIME");
+// R3 — canonical failure: mission + runtime transition evidence.
+terminateMission(rtMid2, "FAILED");
 await board();
 const rtItems2 = rtItemsOf();
 const rtWid2 = String(rtItems2.find((w) => String(w.work_item_id) !== rtWid1)?.work_item_id ?? "");
@@ -607,9 +678,8 @@ const occs4 = rows("schedule_occurrence")
   .filter((o) => String(o.schedule_id) === schedId && o.mission_id != null &&
     ![rtMid1, rtMid2, rtMid3].includes(String(o.mission_id)));
 const rtMid4 = String(occs4[occs4.length - 1]?.mission_id ?? "");
-svc2.transitionMission(rtMid4, "READY", "PAIR_MISSION_RUNTIME");
-svc2.transitionMission(rtMid4, "RUNNING", "PAIR_MISSION_RUNTIME");
-svc2.transitionMission(rtMid4, "FAILED", "PAIR_MISSION_RUNTIME");
+// R3 — canonical failure evidence on both state machines.
+terminateMission(rtMid4, "FAILED");
 await board();
 const rtWid4 = String(rtItemsOf().find((w) =>
   (w.mission_ids ?? []).includes(rtMid4))?.work_item_id ?? "");
@@ -628,6 +698,87 @@ ok("FC-R2 reopened routine completes WGM→binding→WCP",
   String(rtDone4.status) === "DONE" && !!wcpOf(rtWid4) &&
   String(wcpOf(rtWid4).mission_id) === boundMid4,
   `status=${rtDone4.status} wcp=${!!wcpOf(rtWid4)}`);
+
+// ================= FC-R3: mutable mission.status ≠ replacement authority =================
+// (A) bound mission + runtime RUNNING → forge mission.status=FAILED →
+// board/sync folds nothing and quarantines; openWorkItem fails closed —
+// zero new intent/binding/mission/dispatch/WCP.
+{
+  const r3a = await api("/api/work-items", "POST", {
+    business_id: bid, title: "r3a", goal: "g", assignee_agent_id: lead });
+  const widA = String(r3a.data.work_item_id);
+  await openWI(widA);
+  const midA = String((await wi(widA)).mission_ids[0]);
+  // Attack: mutate ONLY the mutable field — no transitions, no runtime.
+  { const s = storeOf(); const m = s.get("mission", midA);
+    m.status = "FAILED"; s.put("mission", midA, m, Number(m.version)); }
+  await board();
+  const wA = await wi(widA);
+  const m0 = rows("mission").length, b0 = rows("work_open_binding").length;
+  const openA = await openWI(widA);
+  const wA2 = await wi(widA);
+  ok("FC-R3-A forged FAILED on live bound mission → quarantine + fail-closed open, zero mints",
+    String(wA.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT" &&
+    String(wA.status) === "IN_PROGRESS" &&
+    openA.status !== 200 &&
+    rows("mission").length === m0 && rows("work_open_binding").length === b0 &&
+    (wA2.pending_open_id ?? null) === null && !wcpOf(widA),
+    `blocked=${wA.blocked_code ?? ""} status=${wA.status} open=${openA.status}`);
+}
+
+// (B) genuine scheduler routine mission RUNNING + runtime RUNNING →
+// forge mission.status=FAILED → mirror quarantines, never BLOCKED, and
+// the corrupt mirror can never be promoted into a replacement mission.
+{
+  await fireRoutine("2999-04-01T00:00:00.000Z");
+  const occs5 = rows("schedule_occurrence")
+    .filter((o) => String(o.schedule_id) === schedId && o.mission_id != null &&
+      ![rtMid1, rtMid2, rtMid3, rtMid4].includes(String(o.mission_id)));
+  const rtMid5 = String(occs5[occs5.length - 1]?.mission_id ?? "");
+  ok("FC-R3-B fifth occurrence fired", !!rtMid5, `mid5=${rtMid5}`);
+  // Mission + runtime BOTH RUNNING — then forge ONLY mission.status.
+  terminateMission(rtMid5, "RUNNING");
+  { const s = storeOf(); const m = s.get("mission", rtMid5);
+    m.status = "FAILED"; s.put("mission", rtMid5, m, Number(m.version)); }
+  await board();
+  const rtWid5 = String(rtItemsOf().find((w) =>
+    (w.mission_ids ?? []).includes(rtMid5))?.work_item_id ?? "");
+  const w5 = await wi(rtWid5);
+  const m0 = rows("mission").length, b0 = rows("work_open_binding").length;
+  const open5 = await openWI(rtWid5);
+  ok("FC-R3-B forged scheduler FAILED → mirror quarantined, no BLOCKED, no reopen",
+    !!rtWid5 && String(w5.blocked_code ?? "") === "TERMINAL_PROVENANCE_CORRUPT" &&
+    String(w5.status) !== "BLOCKED" &&
+    open5.status !== 200 &&
+    rows("mission").length === m0 && rows("work_open_binding").length === b0,
+    `wid5=${rtWid5} status=${w5.status} blocked=${w5.blocked_code ?? ""} open=${open5.status}`);
+}
+
+// (C) a separate mission through REAL canonical failure → governed
+// reopen mints exactly one bound attempt — a second open while the
+// replacement is still live fails closed.
+{
+  const r3c = await api("/api/work-items", "POST", {
+    business_id: bid, title: "r3c", goal: "g", assignee_agent_id: lead });
+  const widC = String(r3c.data.work_item_id);
+  await openWI(widC);
+  const midC = String((await wi(widC)).mission_ids[0]);
+  terminateMission(midC, "FAILED");
+  const wC = await fold(widC);
+  const openC = await openWI(widC);
+  const wC2 = await wi(widC);
+  const midsC = wC2.mission_ids ?? [];
+  ok("FC-R3-C canonical failure → BLOCKED → governed reopen exactly once",
+    String(wC.status) === "BLOCKED" && openC.status === 200 &&
+    midsC.length === 2 && String(midsC[1]) !== midC &&
+    bindingsOf(widC).length === 2,
+    `status=${wC.status} open=${openC.status} mids=${midsC.length} bindings=${bindingsOf(widC).length}`);
+  const openC2 = await openWI(widC);
+  ok("FC-R3-C second reopen while replacement live denied",
+    openC2.status !== 200 &&
+    (await wi(widC)).mission_ids.length === 2,
+    `open2=${openC2.status}`);
+}
 
 // ================= exactly-once audit over the whole store =================
 {

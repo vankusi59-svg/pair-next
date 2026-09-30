@@ -24,6 +24,7 @@ import { digest, utcnow } from "./canonical.js";
 import type { PairEvidenceStore } from "./store.js";
 import { IntegrityError } from "./errors.js";
 import { validateWorkOpenBindingById } from "./work-open-binding.js";
+import { proveCanonicalMissionTerminalForReplacement } from "./work-completion.js";
 
 export type Row = Record<string, unknown> & { version: number };
 
@@ -206,6 +207,14 @@ export function proveCanonicalRoutineMirror(
  *      with the open history. A foreign or unbound id anywhere in
  *      trailing history fails closed.
  *
+ *   C. SERIALITY (R3) — every mission BEFORE the last must be
+ *      canonically terminal (immutable mission+runtime transition
+ *      evidence, compatible pairing): a bound attempt can only ever
+ *      exist because the prior mission's canonical lifecycle was
+ *      finished — a still-live predecessor means the history itself
+ *      is forged. A mutable `status` field alone never authorizes a
+ *      successor attempt.
+ *
  * Callers that require the zero-authority display shape additionally
  * check `mission_ids.length === 1`.
  */
@@ -221,6 +230,23 @@ export function assertCanonicalRoutineLineage(
   const mids = (item.mission_ids as string[] | undefined) ?? [];
   if (new Set(mids.map((m) => String(m))).size !== mids.length) {
     fail(`item ${wid} mission history contains duplicate ids`);
+  }
+  // R3 seriality — every mission except the current (last) attempt
+  // must be canonically terminal on its own evidence: the projected
+  // scheduler mission before bound attempt 1, bound i before bound
+  // i+1. A live predecessor means the appended successor could never
+  // have been opened legally — the lineage itself is forged.
+  for (let i = 0; i + 1 < mids.length; i++) {
+    const prev = store.tryGet("mission", String(mids[i])) as Row | null;
+    if (prev === null) {
+      fail(`item ${wid} mission ${String(mids[i])} missing from history`);
+    }
+    if (!proveCanonicalMissionTerminalForReplacement(store, prev!)) {
+      fail(
+        `item ${wid} mission ${String(mids[i])} is not canonically terminal ` +
+        `yet attempt ${i + 2} exists — forged mission history`,
+      );
+    }
   }
   let lastBoundAt = "";
   for (let i = 1; i < mids.length; i++) {

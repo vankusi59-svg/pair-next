@@ -84,7 +84,9 @@ import {
   completionBasisDigest,
   completionDigest,
   completionRowId,
+  assertCanonicalMissionLifecycle,
   proveCanonicalMissionCompletion,
+  proveCanonicalMissionLifecycle,
   proveWorkItemComplete,
   rejectedCompletionBases,
 } from "./work-completion.js";
@@ -1500,16 +1502,34 @@ export class BusinessLayer {
       this.promoteRoutineMirror(row);
     }
     // A previous linked mission still live forbids a replacement — the
-    // governed path is pause/cancel/resume/reconcile, not a second dispatch.
+    // governed path is pause/cancel/resume/reconcile, not a second
+    // dispatch. R3: a mutable `mission.status` terminal CLAIM is not
+    // terminal authority — every linked mission must be proven
+    // canonically terminal (mission + runtime transition evidence,
+    // compatible pairing, no live executions) or canonically live.
+    // A status-only FAILED/CANCELLED claim over a live runtime is
+    // corrupt provenance: fail closed before ANY authority-bearing
+    // write — no open intent, no reservation, no binding, no mission.
     const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
-    if (priorMissionIds.length > 0) {
-      const last = this.store.tryGet("mission", priorMissionIds[priorMissionIds.length - 1]);
-      if (last && !TERMINAL_MISSION_STATUSES.has(String(last.status))) {
-        throw new PolicyError(
-          "FAIL_CLOSED_MISSION_ACTIVE",
-          `linked mission ${String(last.mission_id)} still ${String(last.status)} — cancel/resume/reconcile first`,
-        );
+    for (const pmid of priorMissionIds) {
+      const pm = this.store.tryGet("mission", String(pmid));
+      if (!pm) continue;
+      const pms = String(pm.status);
+      if (TERMINAL_MISSION_STATUSES.has(pms)) {
+        try {
+          assertCanonicalMissionLifecycle(this.store, pm, pms);
+        } catch (e) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT",
+            `linked mission ${String(pmid)} claims ${pms} without canonical lifecycle evidence: ${(e as Error).message}`,
+          );
+        }
+        continue;
       }
+      throw new PolicyError(
+        "FAIL_CLOSED_MISSION_ACTIVE",
+        `linked mission ${String(pmid)} still ${pms} — cancel/resume/reconcile first`,
+      );
     }
     const from = String(row.status);
     assertWorkItemTransition(from, "IN_PROGRESS");
@@ -2019,6 +2039,22 @@ export class BusinessLayer {
         throw e;
       }
     }
+    // R3 — FAILED/CANCELLED/PAUSED are mutable status claims too: the
+    // fold requires the canonical lifecycle evidence chain (mission
+    // transition + MRT_<mid> row + runtime transition, compatible
+    // pairing, no contradictory live evidence). A status-only
+    // mutation carries no business lifecycle authority → quarantine.
+    if (ms === "FAILED" || ms === "CANCELLED" || ms === "PAUSED") {
+      try {
+        assertCanonicalMissionLifecycle(this.store, mission, ms);
+      } catch (e) {
+        this.quarantineWorkItem(
+          row,
+          `mission ${String(mission.mission_id)} ${ms} without canonical lifecycle evidence: ${(e as Error).message}`,
+        );
+        return this.store.get("work_item", workItemId);
+      }
+    }
     const next: WorkItemStatus | null =
       ms === "COMPLETED"
         ? (basis!.ready && !basis!.rejected
@@ -2132,6 +2168,21 @@ export class BusinessLayer {
       this.quarantineWorkItem(
         row, `routine mirror DONE without canonical mission completion for ${String(mission.mission_id)}`);
       return this.store.get("work_item", workItemId);
+    }
+    // R3 — the routine provenance validator proves WHERE the mission came
+    // from, not WHAT its lifecycle really is: a status-only FAILED/
+    // CANCELLED/PAUSED claim carries no fold authority either. Consume
+    // the same canonical lifecycle proof as the bound-work fold.
+    if ((next === "BLOCKED" || next === "CANCELLED") &&
+        ms !== "COMPLETED") {
+      try {
+        assertCanonicalMissionLifecycle(this.store, mission, ms);
+      } catch (e) {
+        this.quarantineWorkItem(
+          row, `routine mirror ${ms} without canonical lifecycle evidence ` +
+            `for ${String(mission.mission_id)}: ${(e as Error).message}`);
+        return this.store.get("work_item", workItemId);
+      }
     }
     if (next === null) return row; // mission still in flight — honest IN_PROGRESS mirror
     const saved = this.store.immediate(() => {
@@ -3414,14 +3465,18 @@ export class BusinessLayer {
       // DONE mirrors require the mission's own canonical completion
       // proof at projection time — an unproven COMPLETED claim projects
       // IN_PROGRESS, and the same-render syncRoutineMirror fold then
-      // quarantines the forged mirror. Other terminal states mirror
-      // directly (they carry no completion authority).
+      // quarantines the forged mirror. R3: the same discipline applies
+      // to FAILED/CANCELLED/PAUSED claims — a mutable status without
+      // the canonical lifecycle chain projects IN_PROGRESS (honest),
+      // and the same-render fold quarantines the corrupt mirror.
       const status: WorkItemStatus =
         ms === "COMPLETED"
           ? (proveCanonicalMissionCompletion(this.store, m) ? "DONE" : "IN_PROGRESS")
-        : ms === "FAILED" ? "BLOCKED" :
-        ms === "CANCELLED" ? "CANCELLED" :
-        ms === "PAUSED" ? "BLOCKED" : "IN_PROGRESS";
+        : ms === "FAILED" || ms === "CANCELLED" || ms === "PAUSED"
+          ? (proveCanonicalMissionLifecycle(this.store, m, ms)
+            ? (ms === "CANCELLED" ? "CANCELLED" : "BLOCKED")
+            : "IN_PROGRESS")
+        : "IN_PROGRESS";
       // Deterministic projection identity: the work-item id derives from
       // the mission id, so two concurrent projectors (restarts, parallel
       // board() calls, two connections) compute the same id — the loser's

@@ -533,7 +533,7 @@ audit + one narrow defect remediation.
   PASS.
 - Report: `PAIR_OS_VNEXT_P14_FINAL_CLOSURE_REPORT.md`.
   Classification:
-  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R1_PENDING_INDEPENDENT_AUDIT`**.
+  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R3_PENDING_INDEPENDENT_AUDIT`**.
 
 #### FC R1 remediation (independent-audit BLOCKED → closed, same PR)
 
@@ -603,6 +603,50 @@ mirror state and hide a live scheduler mission from the open gate.
   still succeeds → `verifyIntegrity` 0 errors).
 - Regression **658/658**; N22 2194+2 pre-existing P5 env-gap / N20
   2196/0; report §20-21.
+
+#### FC R3 remediation (independent-audit BLOCKED → closed, same PR)
+
+Core mission lifecycle / replacement-authority defect remediated: the
+mutable `mission.status` field was terminal authority at the open
+gate and at the FAILED/CANCELLED/PAUSED sync folds — a bound or
+scheduler mission RUNNING + runtime RUNNING could be replaced by
+mutating one field, and routine seriality trusted `bound_at`
+ordering alone.
+
+- **One canonical lifecycle proof** (`assertCanonicalMissionLifecycle`
+  / `proveCanonicalMissionTerminalForReplacement` in work-completion):
+  status claim + exactly-one legal `MISSION_TRANSITION` into it +
+  `MRT_<mid>` row (identity pinned) in a canonical pairing + exactly-one
+  legal `MISSION_RUNTIME_TRANSITION` (mission_id-pinned) + no
+  contradictory later evidence + no live `executor_execution` where
+  semantics forbid (exempt: the ABORTED pairing and
+  `cancel_requested`-marked side-effects). Pairings surveyed from the
+  canonical writers: COMPLETED↔COMPLETED (delegates to the unchanged
+  completion proof), FAILED↔{FAILED,ABORTED},
+  CANCELLED↔{CANCELLED,ABORTED}, PAUSED↔{PAUSED,CREATED} (pause-before-
+  runtime-start mints MRT at CREATED — creation anchor required,
+  transitions forbidden).
+- **Open gate**: every linked mission must be canonically terminal or
+  canonically live before ANY authority write — claims-terminal-
+  unproven → `FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT`; live →
+  `FAIL_CLOSED_MISSION_ACTIVE`; zero intent/reservation/WOB/mission/
+  dispatch on failure.
+- **Folds**: `syncWorkItem`, `syncRoutineMirror` and the projection
+  path all consume the same proof — status-only FAILED/CANCELLED/
+  PAUSED → `TERMINAL_PROVENANCE_CORRUPT` quarantine, never a fold,
+  never fabricated evidence; unproven claims project IN_PROGRESS.
+- **Seriality**: `assertCanonicalRoutineLineage` requires every
+  mission before the final attempt canonically terminal — scheduler
+  before bound1, bound1 before bound2 — independent of `bound_at`.
+- **§9 helpers migrated**: `canonicallyTerminateMission` drives BOTH
+  state machines (legal mission transitions + MRT mint + legal runtime
+  hops to the canonical pairing); all status-only fixtures converted.
+- **12 `P14-FC-R3-*` tests**; Golden E2E **65/65** (forge-on-live-bound
+  → quarantine + fail-closed open zero mints; forged scheduler FAILED →
+  quarantined mirror never BLOCKED/no reopen; real canonical failure →
+  reopen exactly once → second open denied).
+- Regression **670/670**; N22 2206+2 pre-existing P5 env-gap / N20
+  2208/0; report §22-23.
 
 ## Not yet
 
