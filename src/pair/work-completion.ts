@@ -39,7 +39,7 @@ import {
   assertCanonicalDelegation,
   decompositionRowId,
 } from "./graph-authority.js";
-import { validateWorkOpenBinding } from "./work-open-binding.js";
+import { validateWorkOpenBinding, validateWorkOpenBindingById } from "./work-open-binding.js";
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -852,6 +852,109 @@ export function assertCanonicalWorkCompletion(
     }
   } else if (reviewer) {
     fail(`work_completion ${cid}: reviewer on non-review item`);
+  }
+}
+
+// =====================================================================
+// P14 FC R4 — omission-safe canonical attempt history.
+// `work_item.mission_ids` is a mutable projection: attempt authority is
+// derived ONLY from durable `work_open_binding` evidence (BOUND state,
+// ULID open_id order = canonical open-history order). A truncated,
+// reordered, injected or duplicated projection must AGREE with the WOB
+// history or the whole lineage is corrupt — missing evidence never
+// creates permission to execute again.
+// =====================================================================
+
+/** Canonical bound attempts of a work item, in canonical open order
+ *  (open_id is a ULID — lexicographic sort IS creation order; ties are
+ *  impossible). INTENT/ROLLED_BACK bindings are opens-in-flight or
+ *  rolled back, never attempts. */
+export function canonicalBoundAttemptsForWorkItem(
+  store: PairEvidenceStore, workItemId: string,
+): Row[] {
+  return store.list("work_open_binding")
+    .filter((b) => String(b.work_item_id ?? "") === workItemId &&
+      String(b.state ?? "") === "BOUND")
+    .sort((a, b) => String(a.open_id).localeCompare(String(b.open_id)));
+}
+
+function lineageFail(detail: string): never {
+  throw new IntegrityError("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT", detail);
+}
+
+/**
+ * Prove `row`'s mission attempt history canonically:
+ *   - every BOUND `work_open_binding` for this item validates the full
+ *     provenance chain (exact work item/business/project/assignee,
+ *     reserved mission id, `mission.bound_open_id` origin pin);
+ *   - every canonical attempt's mission ROW exists — a missing row is
+ *     never "attempt never existed";
+ *   - no two bindings claim the same mission;
+ *   - `mission_ids` agrees exactly: for non-routine items it must equal
+ *     the canonical attempt list (in canonical ULID order — a reorder
+ *     that would make an older attempt look current is caught by the
+ *     order comparison); for routine items `mids[0]` is the projected
+ *     scheduler mission (proven by the routine-lineage validator) and
+ *     `mids[1..]` must equal the WOB-ordered reopen attempts.
+ * Omission of a canonical attempt, injection of a boundless id,
+ * duplicates, reorders, foreign bound attempts and missing mission
+ * rows all fail here.
+ */
+export function assertCanonicalWorkMissionLineage(
+  store: PairEvidenceStore, row: Row,
+): void {
+  const wid = String(row.work_item_id ?? "");
+  const mids = ((row.mission_ids as string[] | undefined) ?? []).map(String);
+  if (new Set(mids).size !== mids.length) {
+    lineageFail(`work item ${wid}: duplicate mission id in mission_ids`);
+  }
+  const wobs = canonicalBoundAttemptsForWorkItem(store, wid);
+  const attemptIds: string[] = [];
+  const seen = new Set<string>();
+  for (const b of wobs) {
+    const openId = String(b.open_id ?? "");
+    const v = validateWorkOpenBindingById(store, openId, {
+      forWorkItem: row, requireState: "BOUND", mode: "PROVENANCE",
+    });
+    if (!v.ok) {
+      lineageFail(`work item ${wid}: binding ${openId} invalid: ${v.reason}`);
+    }
+    const mid = String(b.mission_id ?? "");
+    if (seen.has(mid)) {
+      lineageFail(`work item ${wid}: duplicate binding for mission ${mid}`);
+    }
+    seen.add(mid);
+    const m = store.tryGet("mission", mid) as Row | null;
+    if (!m) {
+      lineageFail(`work item ${wid}: bound mission ${mid} row missing`);
+    }
+    const mv = validateWorkOpenBindingById(store, openId, {
+      forWorkItem: row, forMission: m, requireState: "BOUND",
+      mode: "PROVENANCE",
+    });
+    if (!mv.ok) {
+      lineageFail(`work item ${wid}: mission ${mid} binding proof: ${mv.reason}`);
+    }
+    attemptIds.push(mid);
+  }
+  if (row.routine_id != null) {
+    // Routine model (R1–R3): mids[0] is the canonical scheduler-fire
+    // mission (its own provenance validator); every tail id must equal
+    // the WOB-ordered bound attempts — an omitted bound attempt must
+    // not erase a live/terminal attempt from authority.
+    if (mids.length === 0) {
+      lineageFail(`routine mirror ${wid}: projected mission missing`);
+    }
+    const tails = mids.slice(1);
+    if (tails.length !== attemptIds.length ||
+        tails.some((t, i) => t !== attemptIds[i])) {
+      lineageFail(`routine item ${wid}: mission_ids tails != canonical bound-attempt history`);
+    }
+  } else {
+    if (mids.length !== attemptIds.length ||
+        mids.some((t, i) => t !== attemptIds[i])) {
+      lineageFail(`work item ${wid}: mission_ids != canonical bound-attempt history`);
+    }
   }
 }
 

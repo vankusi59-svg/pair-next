@@ -780,6 +780,79 @@ ok("FC-R2 reopened routine completes WGM→binding→WCP",
     `open2=${openC2.status}`);
 }
 
+// ================= FC-R4: omission-safe attempt history =================
+// (A) bound Mission1 + item BLOCKED (mission PAUSED, non-terminal) →
+// delete the Mission1 ROW while WOB/runtime remain → open fails closed:
+// Δmission=0, ΔWOB=0, zero dispatch.
+{
+  const r4a = await api("/api/work-items", "POST", {
+    business_id: bid, title: "r4a", goal: "g", assignee_agent_id: lead });
+  const widA = String(r4a.data.work_item_id);
+  await openWI(widA);
+  const midA = String((await wi(widA)).mission_ids[0]);
+  const blk = await api(`/api/work-items/${widA}/block`, "POST", { reason: "hold" });
+  const wPre = await wi(widA);
+  const mPre = rows("mission"), bPre = rows("work_open_binding");
+  // Attack: remove ONLY the mission row — WOB + runtime evidence intact.
+  { const s = storeOf();
+    s.db.prepare("DELETE FROM entities WHERE entity_type='mission' AND entity_id=?").run(midA); }
+  const openA = await api(`/api/work-items/${widA}/open`, "POST", {});
+  const wA = await wi(widA);
+  ok("FC-R4-A deleted bound mission row → open fails closed, zero mints",
+    blk.status === 200 && String(wPre.status) === "BLOCKED" &&
+    openA.status !== 200 &&
+    rows("mission").length === mPre.length - 1 &&
+    rows("work_open_binding").length === bPre.length &&
+    String((wA.mission_ids ?? [])[0] ?? "") === midA &&
+    (wA.pending_open_id ?? null) === null,
+    `blk=${blk.status} status=${wPre.status} open=${openA.status}`);
+}
+
+// (B) same setup but TRUNCATE work_item.mission_ids — WOB still proves
+// Mission1 existed → identical fail-closed result.
+{
+  const r4b = await api("/api/work-items", "POST", {
+    business_id: bid, title: "r4b", goal: "g", assignee_agent_id: lead });
+  const widB = String(r4b.data.work_item_id);
+  await openWI(widB);
+  const midB = String((await wi(widB)).mission_ids[0]);
+  await api(`/api/work-items/${widB}/block`, "POST", { reason: "hold" });
+  { const s = storeOf(); const w = s.get("work_item", widB);
+    w.mission_ids = []; s.put("work_item", widB, w, Number(w.version)); }
+  const m0 = rows("mission").length, b0 = rows("work_open_binding").length;
+  const openB = await api(`/api/work-items/${widB}/open`, "POST", {});
+  ok("FC-R4-B mission_ids truncation cannot erase WOB-proven live attempt → fail closed",
+    openB.status !== 200 &&
+    rows("mission").length === m0 && rows("work_open_binding").length === b0,
+    `open=${openB.status} missions=${rows("mission").length}/${m0}`);
+  // restore the projection so integrity verification stays clean
+  { const s = storeOf(); const w = s.get("work_item", widB);
+    w.mission_ids = [midB]; s.put("work_item", widB, w, Number(w.version)); }
+}
+
+// (C) canonical terminal M1 → legitimate M2 reopen → canonical attempt
+// history validates → normal execution proceeds.
+{
+  const r4c = await api("/api/work-items", "POST", {
+    business_id: bid, title: "r4c", goal: "g", assignee_agent_id: lead });
+  const widC = String(r4c.data.work_item_id);
+  await openWI(widC);
+  const midC1 = String((await wi(widC)).mission_ids[0]);
+  terminateMission(midC1, "FAILED");
+  const wC = await fold(widC);
+  const openC = await api(`/api/work-items/${widC}/open`, "POST", {});
+  const wC2 = await wi(widC);
+  const midsC = wC2.mission_ids ?? [];
+  const wobs = bindingsOf(widC).filter((x) => String(x.state) === "BOUND");
+  ok("FC-R4-C canonical terminal → legitimate reopen → ordered WOB history validates",
+    String(wC.status) === "BLOCKED" && openC.status === 200 &&
+    midsC.length === 2 && String(midsC[1]) !== midC1 &&
+    wobs.length === 2 &&
+    String(wobs[0].mission_id) === midC1 && String(wobs[1].mission_id) === String(midsC[1]) &&
+    String(wobs[0].open_id) < String(wobs[1].open_id),
+    `status=${wC.status} open=${openC.status} mids=${midsC.length} wobs=${wobs.length}`);
+}
+
 // ================= exactly-once audit over the whole store =================
 {
   const wcps = rows("work_completion");

@@ -533,7 +533,7 @@ audit + one narrow defect remediation.
   PASS.
 - Report: `PAIR_OS_VNEXT_P14_FINAL_CLOSURE_REPORT.md`.
   Classification:
-  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R3_PENDING_INDEPENDENT_AUDIT`**.
+  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R4_PENDING_INDEPENDENT_AUDIT`**.
 
 #### FC R1 remediation (independent-audit BLOCKED → closed, same PR)
 
@@ -647,6 +647,37 @@ ordering alone.
   reopen exactly once → second open denied).
 - Regression **670/670**; N22 2206+2 pre-existing P5 env-gap / N20
   2208/0; report §22-23.
+
+#### FC R4 remediation (independent-audit BLOCKED → closed, same PR)
+
+Omission-safe attempt-history closure: a missing linked mission row
+was silently skipped at the open gate (`if (!pm) continue`), and the
+mutable `work_item.mission_ids` projection was the attempt-history
+authority at open/sync/completion seams.
+
+- **Canonical attempt history** (`canonicalBoundAttemptsForWorkItem` +
+  `assertCanonicalWorkMissionLineage` in work-completion): attempts
+  derive ONLY from BOUND `work_open_binding` rows ordered by ULID
+  `open_id` (canonical open order); each validates the full WOB
+  provenance chain; every attempt's mission row must exist (missing
+  row is never "terminal"); `mission_ids` must AGREE exactly —
+  omission, injection, duplicates, reorders, foreign attempts all
+  fail as `FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT`. Routine items keep
+  the R1–R3 model (`mids[0]` scheduler mission, `mids[1..]` = WOB
+  tails).
+- **Open gate**: lineage proof BEFORE any authority write; then every
+  canonical attempt — R3-terminal → continue; live → `MISSION_ACTIVE`;
+  missing/corrupt → `MISSION_LIFECYCLE_CORRUPT`; zero intent/
+  reservation/WOB/mission/dispatch.
+- **Sync + current attempt**: `syncWorkItem` checks lineage before any
+  fold (violation → quarantine); `boundMissionForWorkItem` returns the
+  canonically-latest WOB attempt — array order can never select an
+  older attempt as current (completion basis, cancel, block).
+- **10 `P14-FC-R4-*` tests**; Golden E2E **68/68** (deleted mission
+  row / truncated mission_ids → open fail-closed zero mints; canonical
+  terminal → legitimate ordered reopen).
+- Regression all-green; N22 2216+2 pre-existing P5 env-gap / N20
+  2218/0; report §24-25.
 
 ## Not yet
 

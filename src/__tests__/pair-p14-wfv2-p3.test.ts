@@ -3133,3 +3133,235 @@ describe("P14 FC R3 — canonical mission lifecycle authority", () => {
     expect(anchorEvents(ctx.store, wid)).toHaveLength(1);
   });
 });
+
+// =====================================================================
+// FC R4 — omission-safe WORK-ITEM ATTEMPT HISTORY.
+// `work_item.mission_ids` is a mutable projection: canonical attempt
+// authority derives ONLY from `work_open_binding` evidence (BOUND state,
+// ULID open_id order). Omission / injection / duplicate / reorder /
+// missing mission row all fail closed — missing evidence never grants
+// permission to execute again.
+// =====================================================================
+describe("P14 FC R4 — omission-safe attempt history", () => {
+  const routineItems = (store: PairEvidenceStore) =>
+    store.list("work_item").filter((w) => w.routine_id != null);
+  const makeRoutine = (biz: BusinessLayer, businessId: string, over: Record<string, unknown> = {}) =>
+    biz.createRoutine({
+      business_id: businessId, name: "daily", goal_template: "g",
+      cron: "0 9 * * *", operator_id: "op", ...over,
+    } as never);
+  const setupItem = (biz: BusinessLayer, ctx: ReturnType<typeof makeStack>["ctx"], tag = "i") => {
+    const b = makeBiz(biz, ctx.projectId, `B-${tag}`);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    return { b, a, wid: String(w.work_item_id) };
+  };
+  const writeMids = (ctx: ReturnType<typeof makeStack>["ctx"], wid: string, mids: string[]) => {
+    const w = ctx.store.get("work_item", wid);
+    w.mission_ids = mids;
+    ctx.store.put("work_item", wid, w, Number(w.version));
+  };
+  const mintsOf = (ctx: ReturnType<typeof makeStack>["ctx"]) => ({
+    missions: ctx.store.list("mission").length,
+    wobs: ctx.store.list("work_open_binding").length,
+    intents: ctx.store.list("work_item")
+      .filter((x) => x.pending_open_id != null).length,
+  });
+  const deleteMissionRow = (ctx: ReturnType<typeof makeStack>["ctx"], mid: string) => {
+    ctx.store.db.prepare(
+      "DELETE FROM entities WHERE entity_type='mission' AND entity_id=?").run(mid);
+  };
+
+  it("P14-FC-R4-LINKED-MISSION-ROW-MISSING-FAILS-OPEN: deleted bound-mission row → open fails closed, zero new attempt", () => {
+    const { ctx, biz } = makeStack("r4-missing-row");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    // Canonical pause/block → item BLOCKED, mission PAUSED (non-terminal),
+    // WOB + runtime evidence all canonical.
+    biz.blockWorkItem(wid, "hold", "op");
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("BLOCKED");
+    // Attack: delete ONLY the mission row — WOB/runtime provenance remains.
+    deleteMissionRow(ctx, mid);
+    const before = mintsOf(ctx);
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    const after = mintsOf(ctx);
+    expect(after).toEqual(before);
+    expect(ctx.store.get("work_item", wid).pending_open_id ?? null).toBeNull();
+  });
+
+  it("P14-FC-R4-MISSION-IDS-TRUNCATION-CANNOT-ERASE-ACTIVE-ATTEMPT: truncate mission_ids → WOB still proves live attempt → fail closed", () => {
+    const { ctx, biz } = makeStack("r4-truncate");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    biz.blockWorkItem(wid, "hold", "op"); // mission PAUSED — LIVE, non-terminal
+    writeMids(ctx, wid, []); // erase the attempt from the mutable projection
+    const before = mintsOf(ctx);
+    // WOB evidence still proves the bound attempt exists and is live →
+    // the open gate refuses before any authority write.
+    const code = errCode(() => biz.openWorkItem(wid, "op"));
+    expect(code).toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+    // A live item with the same truncation quarantines on sync too.
+    const { wid: wid2 } = setupItem(biz, ctx, "i2");
+    biz.openWorkItem(wid2, "op");
+    writeMids(ctx, wid2, []);
+    biz.syncWorkItem(wid2);
+    expect(String(ctx.store.get("work_item", wid2).blocked_code ?? ""))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-FC-R4-MISSION-IDS-OMITS-OLD-BOUND-ATTEMPT-FAILS: omitting an old terminal attempt breaks agreement → fail closed", () => {
+    const { ctx, biz } = makeStack("r4-omit-old");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.openWorkItem(wid, "op"); // canonical reopen → m2
+    const m2 = String((ctx.store.get("work_item", wid).mission_ids as string[])[1]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m2, "FAILED");
+    biz.syncWorkItem(wid);
+    writeMids(ctx, wid, [m2]); // erase m1 — WOB still proves it existed
+    const before = mintsOf(ctx);
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+  });
+
+  it("P14-FC-R4-MISSION-IDS-INJECTED-BOUNDLESS-ID-FAILS: appended id with no WOB → fail closed", () => {
+    const { ctx, biz } = makeStack("r4-inject");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    // Inject a boundless foreign id (a REAL mission row elsewhere, but no
+    // binding to this item) — injection is as forbidden as omission.
+    const foreign = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "foreign",
+      metadata: {}, operator_id: "op",
+    });
+    writeMids(ctx, wid, [m1, String(foreign.mission_id)]);
+    const before = mintsOf(ctx);
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+  });
+
+  it("P14-FC-R4-MISSION-IDS-DUPLICATE-FAILS: duplicated id → fail closed", () => {
+    const { ctx, biz } = makeStack("r4-dup");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    writeMids(ctx, wid, [m1, m1]);
+    const before = mintsOf(ctx);
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+  });
+
+  it("P14-FC-R4-MISSION-IDS-REORDER-CANNOT-SELECT-OLDER-CURRENT: reordered array → lineage fails + sync quarantines", () => {
+    const { ctx, biz } = makeStack("r4-reorder");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.openWorkItem(wid, "op");
+    const mids = ctx.store.get("work_item", wid).mission_ids as string[];
+    writeMids(ctx, wid, [...mids].reverse()); // m2 first, m1 last
+    // sync must not accept the older attempt as current — quarantine.
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).blocked_code ?? ""))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+    const before = mintsOf(ctx);
+    // quarantined → open denied; zero mints either way.
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+  });
+
+  it("P14-FC-R4-CANONICAL-BOUND-ATTEMPT-HISTORY-PASSES: honest single attempt validates + syncs", () => {
+    const { ctx, biz } = makeStack("r4-honest");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    const folded = biz.syncWorkItem(wid);
+    expect(String(folded.status)).toBe("BLOCKED");
+    // legitimate reopen still works — full history is terminal→successor.
+    biz.openWorkItem(wid, "op");
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("IN_PROGRESS");
+  });
+
+  it("P14-FC-R4-MULTI-REOPEN-CANONICAL-HISTORY-PASSES: two canonical reopens preserve ordered history", () => {
+    const { ctx, biz } = makeStack("r4-multi");
+    const { wid } = setupItem(biz, ctx);
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.openWorkItem(wid, "op");
+    const m2 = String((ctx.store.get("work_item", wid).mission_ids as string[])[1]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m2, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.openWorkItem(wid, "op"); // attempt 3 — all predecessors canonical terminal
+    const mids = ctx.store.get("work_item", wid).mission_ids as string[];
+    expect(mids).toHaveLength(3);
+    expect(ctx.store.list("work_open_binding")
+      .filter((b) => String(b.work_item_id) === wid && b.state === "BOUND"))
+      .toHaveLength(3);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("IN_PROGRESS");
+  });
+
+  it("P14-FC-R4-ROUTINE-SCHEDULER-PLUS-BOUND-HISTORY-STILL-PASSES: routine [sched, bound] lineage validates", async () => {
+    const { ctx, biz, schedules } = makeStack("r4-routine-pass");
+    const b = makeBiz(biz, ctx.projectId, "R4R");
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const mSched = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    // Canonical terminal scheduler mission → mirror folds BLOCKED.
+    canonicallyTerminateMission(ctx.store, ctx.service, String(mSched.mission_id), "FAILED");
+    biz.board(String(b.business_id));
+    expect(routineItems(ctx.store)).toHaveLength(1);
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("BLOCKED");
+    // Legitimate bound reopen through promotion.
+    biz.openWorkItem(wid, "op");
+    const mids = ctx.store.get("work_item", wid).mission_ids as string[];
+    expect(mids).toHaveLength(2); // [scheduler, bound]
+    const wobs = ctx.store.list("work_open_binding")
+      .filter((x) => String(x.work_item_id) === wid && x.state === "BOUND");
+    expect(wobs).toHaveLength(1);
+    expect(String(mids[1])).toBe(String(wobs[0]!.mission_id));
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("IN_PROGRESS");
+  });
+
+  it("P14-FC-R4-ROUTINE-BOUND-ATTEMPT-OMISSION-FAILS: truncating routine tails → WOB proves attempt → fail closed", async () => {
+    const { ctx, biz, schedules } = makeStack("r4-routine-omit");
+    const b = makeBiz(biz, ctx.projectId, "R4O");
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const mSched = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
+    canonicallyTerminateMission(ctx.store, ctx.service, String(mSched.mission_id), "FAILED");
+    biz.board(String(b.business_id));
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    biz.openWorkItem(wid, "op"); // bound attempt 2
+    const bound2 = String((ctx.store.get("work_item", wid).mission_ids as string[])[1]);
+    canonicallyTerminateMission(ctx.store, ctx.service, bound2, "FAILED");
+    biz.syncWorkItem(wid);
+    // Erase the bound attempt from the projection — WOB still proves it.
+    writeMids(ctx, wid, [String(mSched.mission_id)]);
+    const before = mintsOf(ctx);
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+  });
+});

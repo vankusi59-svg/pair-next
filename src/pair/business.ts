@@ -85,6 +85,8 @@ import {
   completionDigest,
   completionRowId,
   assertCanonicalMissionLifecycle,
+  assertCanonicalWorkMissionLineage,
+  canonicalBoundAttemptsForWorkItem,
   proveCanonicalMissionCompletion,
   proveCanonicalMissionLifecycle,
   proveWorkItemComplete,
@@ -573,11 +575,16 @@ export class BusinessLayer {
     }).ok;
   }
 
-  /** The row's last mission when it is canonically bound, else null. */
+  /** The CURRENT bound mission = the canonically-LATEST attempt proven
+   *  by `work_open_binding` open history (R4: ULID open_id order),
+   *  never the mutable `mission_ids` array order — a reordered or
+   *  truncated projection cannot select an older attempt as current. */
   boundMissionForWorkItem(row: Row): Row | null {
-    const mids = (row.mission_ids as string[] | undefined) ?? [];
-    if (!mids.length) return null;
-    const m = this.store.tryGet("mission", String(mids[mids.length - 1]));
+    const wobs = canonicalBoundAttemptsForWorkItem(
+      this.store, String(row.work_item_id));
+    if (!wobs.length) return null;
+    const m = this.store.tryGet(
+      "mission", String(wobs[wobs.length - 1]!.mission_id)) as Row | null;
     return m && this.missionBoundToWorkItem(row, m) ? m : null;
   }
 
@@ -1510,10 +1517,33 @@ export class BusinessLayer {
     // A status-only FAILED/CANCELLED claim over a live runtime is
     // corrupt provenance: fail closed before ANY authority-bearing
     // write — no open intent, no reservation, no binding, no mission.
-    const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
+    // R4 — the canonical attempt history derives ONLY from durable
+    // `work_open_binding` evidence (ULID open_id order); the mutable
+    // `mission_ids` projection must AGREE with it. Omitted bound
+    // attempts, injected boundless ids, duplicates, reorders and —
+    // critically — a MISSING mission row all fail closed here, BEFORE
+    // any authority-bearing write (zero intent/reservation/WOB/
+    // mission/dispatch). A missing linked mission is never "terminal".
+    assertCanonicalWorkMissionLineage(this.store, row);
+    const canonicalAttempts = canonicalBoundAttemptsForWorkItem(
+      this.store, workItemId).map((b) => String(b.mission_id));
+    const priorMissionIds = row.routine_id != null
+      // routine: mids[0] scheduler mission (fire-proven via
+      // promoteRoutineMirror above) + WOB-ordered bound attempts
+      ? [String(((row.mission_ids as string[] | undefined) ?? [])[0] ?? "")]
+          .filter((x) => x.length > 0)
+          .concat(canonicalAttempts)
+      : canonicalAttempts;
     for (const pmid of priorMissionIds) {
+      // The lineage proof guarantees the row exists for WOB attempts;
+      // the routine scheduler id is re-proven defensively.
       const pm = this.store.tryGet("mission", String(pmid));
-      if (!pm) continue;
+      if (!pm) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT",
+          `linked mission ${String(pmid)} row missing — missing evidence is never terminal`,
+        );
+      }
       const pms = String(pm.status);
       if (TERMINAL_MISSION_STATUSES.has(pms)) {
         try {
@@ -1974,12 +2004,36 @@ export class BusinessLayer {
     if (status !== "IN_PROGRESS") return row;
     if (String(row.blocked_code ?? "") === WORK_CORRUPT_CODE) return row;
     const missionIds = (row.mission_ids as string[]) ?? [];
+    // R4 — `mission_ids` is a mutable projection: the canonical attempt
+    // history derived from `work_open_binding` (ULID open_id order) must
+    // agree with it before it may select the current attempt. An omitted
+    // bound attempt (including total truncation to []), injected id,
+    // duplicate, reorder or missing mission row is corrupt provenance →
+    // quarantine, never guess-repair.
+    try {
+      assertCanonicalWorkMissionLineage(this.store, row);
+    } catch (e) {
+      this.quarantineWorkItem(
+        row, `mission attempt lineage corrupt at ${workItemId}: ${(e as Error).message}`);
+      return this.store.get("work_item", workItemId);
+    }
     if (missionIds.length === 0) return row;
+    // The current attempt is the canonically-LATEST bound attempt, not
+    // the mutable array's last element. A display-only routine mirror
+    // (no WOB yet) falls back to its projected scheduler mission.
+    const canonWobs = canonicalBoundAttemptsForWorkItem(this.store, workItemId);
+    const currentId = canonWobs.length > 0
+      ? String(canonWobs[canonWobs.length - 1]!.mission_id)
+      : String(missionIds[0]);
     let mission: Row;
     try {
-      mission = this.store.get("mission", missionIds[missionIds.length - 1]);
+      mission = this.store.get("mission", currentId);
     } catch {
-      return row; // mission not persisted yet — leave IN_PROGRESS
+      // Linked evidence without a mission row is corrupt provenance —
+      // the row existed at link time (atomic binding txn).
+      this.quarantineWorkItem(
+        row, `linked mission ${currentId} row missing at ${workItemId}`);
+      return this.store.get("work_item", workItemId);
     }
     if (!this.missionBoundToWorkItem(row, mission)) {
       // Routine-source items are mission-status mirrors (P11): the

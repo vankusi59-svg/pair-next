@@ -621,3 +621,127 @@ strengthened and consumed at the existing seams. Convergence stands.
 ## 23. R3 classification
 
 **`P14_WORKFORCE_V2_FINAL_CLOSURE_R3_PENDING_INDEPENDENT_AUDIT`**
+
+## 24. FC R4 — omission-safe work-item attempt history
+
+### 24.1 Root defects
+
+1. **Missing linked mission ignored.** `openWorkItem` iterated
+   `mission_ids` with `if (!pm) continue` — a deleted mission row was
+   silently skipped, so a missing row could never block a new attempt.
+   Missing evidence was implicitly terminal.
+2. **`mission_ids` was attempt authority.** The open gate, current-
+   attempt selection, and sync/completion seams all derived history
+   from the mutable `work_item.mission_ids` array. A truncated,
+   reordered, injected or duplicated array could erase an old attempt
+   or make an older attempt look current.
+
+### 24.2 Canonical attempt-history derivation
+
+Attempt authority is now derived ONLY from durable
+`work_open_binding` evidence — the same table the canonical open path
+writes atomically when a bound mission is minted:
+
+- `canonicalBoundAttemptsForWorkItem(store, wid)` (work-completion.ts):
+  all `work_open_binding` rows for the item in `BOUND` state, sorted by
+  `open_id`. `open_id` is a ULID minted at open-intent creation —
+  lexicographic order IS canonical open-history order (entropy makes
+  ties impossible). INTENT/ROLLED_BACK bindings are opens-in-flight or
+  rolled back — never attempts.
+- `assertCanonicalWorkMissionLineage(store, row)`: for every canonical
+  BOUND binding — full `validateWorkOpenBindingById` PROVENANCE chain
+  (exact work item / business / project / assignee-org-agent,
+  non-empty reserved mission id, `mission.bound_open_id` origin pin);
+  the exact mission row MUST exist; no two bindings may claim the same
+  mission; `mission_ids` must AGREE exactly — for non-routine items it
+  must equal the canonical attempt list (order included: a reorder
+  that would make an older attempt look current fails the order
+  comparison); for routine items `mids[0]` is the projected scheduler
+  mission (proven by the R1–R3 routine validators) and `mids[1..]`
+  must equal the WOB-ordered reopen attempts. Any violation →
+  `FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT` (IntegrityError).
+
+### 24.3 Omission / injection / order rules
+
+- no canonical WOB mission omitted from `mission_ids` (including total
+  truncation to `[]`);
+- no `mission_ids` bound-attempt entry absent from WOB evidence;
+- no duplicates anywhere in `mission_ids`;
+- no foreign bound attempt (a binding for another item is filtered out
+  of the canonical set — then fails agreement as an injected id);
+- no missing mission row — a missing row is NEVER terminal;
+- attempt order = ULID `open_id` order, not array order; the current
+  attempt = the canonically-latest bound attempt.
+
+### 24.4 Seam consumption
+
+- **Open gate**: `assertCanonicalWorkMissionLineage` runs BEFORE any
+  authority-bearing write; then every canonical attempt (routine:
+  scheduler + WOB tails; non-routine: WOB set) is checked — canonical
+  terminal (R3 lifecycle proof) → continue; live →
+  `FAIL_CLOSED_MISSION_ACTIVE`; missing/corrupt →
+  `FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT`. The `if (!pm) continue`
+  behavior is removed — a `tryGet`-miss now throws the same code.
+- **Sync**: `syncWorkItem` runs the lineage check before any fold;
+  failure → `TERMINAL_PROVENANCE_CORRUPT` quarantine, no state fold,
+  no silent repair. Current mission = last WOB-ordered attempt
+  (display-only routine mirror → its scheduler mission).
+- **Current-attempt selector**: `boundMissionForWorkItem` returns the
+  canonically-latest bound attempt from WOB evidence, never
+  `mission_ids[last]` — flows into `completionBasis`,
+  `cancelWorkItem`, `blockWorkItem` (pause/cancel only the latest
+  bound attempt).
+- **Routine path preserved**: `mids[0]` scheduler mission keeps its
+  R1–R3 provenance (fire anchor + seriality); R4 governs only the
+  bound tails — no second routine authority.
+
+### 24.5 R4 tests (10)
+
+`P14-FC-R4-LINKED-MISSION-ROW-MISSING-FAILS-OPEN` (deleted bound-mission
+row → open 409-equivalent, zero mints) ·
+`MISSION-IDS-TRUNCATION-CANNOT-ERASE-ACTIVE-ATTEMPT` (truncate `[]` on
+a live PAUSED attempt → open fails; live IN_PROGRESS truncation →
+sync quarantine) · `MISSION-IDS-OMITS-OLD-BOUND-ATTEMPT-FAILS` ·
+`MISSION-IDS-INJECTED-BOUNDLESS-ID-FAILS` (real foreign mission row,
+no binding) · `MISSION-IDS-DUPLICATE-FAILS` ·
+`MISSION-IDS-REORDER-CANNOT-SELECT-OLDER-CURRENT` (reversed array →
+sync quarantine + open denied) ·
+`CANONICAL-BOUND-ATTEMPT-HISTORY-PASSES` ·
+`MULTI-REOPEN-CANONICAL-HISTORY-PASSES` (3 ordered attempts) ·
+`ROUTINE-SCHEDULER-PLUS-BOUND-HISTORY-STILL-PASSES` ·
+`ROUTINE-BOUND-ATTEMPT-OMISSION-FAILS`.
+P14-P3 suite: **119/119**.
+
+### 24.6 R4 E2E (68/68)
+
+- **A:** item → open Mission1 → canonical block → BLOCKED + Mission1
+  PAUSED (non-terminal) → DELETE the mission row only (WOB/runtime
+  remain) → open → 409, Δmissions=0, ΔWOB=0, no intent.
+- **B:** same setup, truncate `mission_ids` to `[]` → open → 409,
+  Δmissions=0, ΔWOB=0 — the WOB still proves the attempt existed.
+- **C:** canonical FAILED M1 → BLOCKED → legitimate reopen mints M2 →
+  2 BOUND bindings ordered by `open_id` ULID — history validates,
+  execution proceeds. Store integrity: 0 errors.
+
+### 24.7 R4 regression / platform matrix
+
+- Regression: P3 119 · P2 55 · Phase1 73 · P14F 35 · RH 11 · P13 67 ·
+  P12 71 · P11+r 103 · P10 31 · P9 79 · P6 36 — all green.
+- **Node22: 2216 pass + 2 fail** — same pre-existing P5 env-gap
+  (DSH/CODEX probes; unchanged). **Node20: 2218/0**.
+- tsc clean · `pnpm build` PASS · `pnpm audit` 0 high (6 moderate
+  transitive advisories, no direct-dep changes) · `verifyIntegrity` 0
+  errors · Golden E2E 68/68 fresh-dir on real `dist/`.
+
+### 24.8 R4 convergence reassessment
+
+Closed as a narrow provenance remediation: existing WOB authority +
+the R3 lifecycle proof + omission-safe agreement checks. No second
+runtime/planner/router/completion authority, no new execution ledger —
+canonical order comes from ULID `open_id` ordering already persisted
+by the canonical open path. `mission_ids` remains a projection that
+must agree, never an authority. Convergence stands.
+
+## 25. R4 classification
+
+**`P14_WORKFORCE_V2_FINAL_CLOSURE_R4_PENDING_INDEPENDENT_AUDIT`**
