@@ -284,22 +284,34 @@ open-time ceiling, graph bounds — around two new canonical designs:
   (`ACR_<contract>_<version>`)** — historically anchored execution ceiling.
   The WAB pins `ceiling_agent_id`, `contract_id`, `contract_version`,
   `contract_digest`, the normalized snapshot + digest, and a binding
-  digest over all anchors. Validation anchors the pin to durable revision
-  evidence (ACR row) AND to the append-only contract event journal, and
-  requires the stored snapshot ⊆ `policyAuthoritySnapshot(ACR.policy)` —
-  replace-and-rehash, foreign-contract, nonexistent-version, and
-  real-earlier-version rewind all fail closed.
+  digest over all anchors. R1 closure: `assertCanonicalContractRevision`
+  fully re-validates the pinned revision (deterministic key, COMMITTED,
+  normalized policy, `contractDigest` recomputed over the stored policy —
+  a mutated policy with an unchanged digest field fails; journal anchor
+  required). The stored snapshot must be ⊆ the canonical P12 projection
+  (`projectedAuthorityFromPolicy` — the same derivation `effectiveAuthority`
+  uses, so `null` allow + explicit deny = catalog minus denies; routes use
+  `preferred_route_ids`/`denied_route_ids`/`route_fallback_allowed`, no
+  invented allow field). An append-only `WORK_AUTHORITY_BOUND` journal
+  event at binding commit pins every field — a self-consistent rehash of
+  the mutable WAB row (even policy-consistent) still fails the anchor.
+  `ensureCurrentRevision` backfills the exact CURRENT revision under
+  create-only CAS for pre-ACR contracts when the journal already proves
+  the version+digest; conflicting ACRs fail closed, never overwritten;
+  older history is never fabricated.
 - **Dependency authority:** WDS manifests (explicit empty set included)
   remain the sole proof of a node's dependency list — a WGE scan alone
   never establishes "no dependencies". **Reconcile** validates WGE/WDEL/
   WDEC/WDS/WGM/WAB rows and sweeps all work items bidirectionally;
   corrupt canonical rows poison both endpoints; never rebuilt from
   mutable mirrors; idempotent across restarts.
-- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REBASELINE_REPORT.md`;
-  suite `pair-p14-workforce-v2.test.ts` (55 — incl. 11 `P14RB-P1-*`
-  inverse-provenance/anchor tests) + fresh-server E2E (tamper → 409
-  PROVENANCE_CORRUPT ×3, restart-quarantine durable).
-  Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_PENDING_AUDIT`**.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REBASELINE_REPORT.md`
+  (§R1); suite `pair-p14-workforce-v2.test.ts` (65 — incl. 10 `P14RB-R1-*`
+  anchor/deny/backfill tests) + fresh-server E2E (ACR-policy tamper poisons
+  both bindings, self-consistent WAB rehash fails at the event anchor,
+  restart-quarantine durable) + upgrade E2E (pre-ACR DB → exact current
+  revision backfilled, open succeeds).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_R1_PENDING_AUDIT`**.
 
 ## Not yet
 

@@ -47,6 +47,7 @@ import {
   authorityCeilingDigest,
   membershipDigest,
 } from "../pair/graph-authority.js";
+import { contractDigest, contractRevisionRowId } from "../pair/agent-contract.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p14wfv2-"));
 let counter = 0;
@@ -1268,9 +1269,6 @@ describe("P14 WFV2-P1 R3 — assignee immutability + ceiling executability", () 
   });
 });
 
-// ---------------------------------------------------------------------
-
-describe("P14 WFV2-P1 REBASELINE — bidirectional membership + anchored ceiling", () => {
   const wgmId = (id: string) => `WGM_${id}`;
   const expectCorrupt = (ctx: Ctx, id: string) =>
     expect(String(ctx.store.get("work_item", id).blocked_code ?? ""))
@@ -1300,6 +1298,10 @@ describe("P14 WFV2-P1 REBASELINE — bidirectional membership + anchored ceiling
     }, "op");
     return { p, child };
   };
+
+// ---------------------------------------------------------------------
+
+describe("P14 WFV2-P1 REBASELINE — bidirectional membership + anchored ceiling", () => {
 
   it("P14RB-P1-DELEGATED-MARKERS-REMOVED: deleted mirrors never degrade a governed child to standalone", () => {
     const { ctx, biz, wf } = makeStack("rb-del-markers");
@@ -1605,5 +1607,260 @@ describe("P14 WFV2-P1 REBASELINE — bidirectional membership + anchored ceiling
     expect(errCode(() => biz.openWorkItem(childId, "op")))
       .toBe("FAIL_CLOSED_WORK_AUTHORITY_WIDEN");
     expect(ctx.store.list("work_open_binding")).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------
+
+describe("P14 WFV2-P1 R1 — historical authority anchors", () => {
+  /** Recompute both WAB local digests after a snapshot tamper — the
+   *  sophisticated forger that self-consistent hashing alone cannot
+   *  catch; only the WORK_AUTHORITY_BOUND event anchor does. */
+  const forgeWab = (
+    ctx: Ctx,
+    workItemId: string,
+    mutate: (snap: Record<string, unknown>) => void,
+  ) => {
+    const key = wabId(workItemId);
+    const cur = ctx.store.get("work_authority_binding", key);
+    const forged = JSON.parse(JSON.stringify(cur)) as Record<string, unknown>;
+    const snap = forged.authority_snapshot as Record<string, unknown>;
+    mutate(snap);
+    for (const k of ["capabilities", "executors", "routes", "projects", "context_scopes"]) {
+      if (Array.isArray(snap[k])) (snap[k] as string[]).sort();
+    }
+    forged.authority_snapshot_digest = authorityCeilingDigest(snap as never);
+    forged.binding_digest = authorityBindingDigest({
+      work_item_id: String(forged.work_item_id),
+      ceiling_agent_id: String(forged.ceiling_agent_id),
+      agent_business_id: String(forged.agent_business_id),
+      contract_id: String(forged.contract_id),
+      contract_version: Number(forged.contract_version),
+      contract_digest: String(forged.contract_digest),
+      authority_snapshot_digest: String(forged.authority_snapshot_digest),
+    });
+    ctx.store.put(
+      "work_authority_binding", key,
+      { ...forged, version: cur.version }, cur.version,
+    );
+  };
+
+  it("P14RB-R1-ACR-POLICY-TAMPER: mutated revision.policy with unchanged digest fails open", () => {
+    const { ctx, biz, wf } = makeStack("acr-pol-tamper");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    const contract = biz.getAgentContract(String(lead.agent_id));
+    const key = contractRevisionRowId(
+      String(contract!.contract_id), Number(contract!.contract_version));
+    const acr = ctx.store.get("agent_contract_revision", key);
+    // Tamper ONLY the policy payload; leave contract_digest untouched —
+    // the recomputed digest can never match a policy it no longer covers.
+    const pol = JSON.parse(JSON.stringify(acr.policy)) as Record<string, unknown>;
+    pol.allowed_capabilities = ["SELF_MODIFY_CODE"];
+    putVersioned(ctx, "agent_contract_revision", key, { ...acr, policy: pol });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expectCorrupt(ctx, childId);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(0);
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("P14RB-R1-UNBOUNDED-CAP-DENY-TAMPER: null allow + deny closes over forged snapshot", () => {
+    const { ctx, biz, wf } = makeStack("cap-deny");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: null, denied_capabilities: ["NETWORK_ACCESS"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: null, denied_capabilities: ["NETWORK_ACCESS"] });
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    const wab = ctx.store.get("work_authority_binding", wabId(childId));
+    const snap = wab.authority_snapshot as { capabilities: string[] };
+    expect(snap.capabilities).not.toContain("NETWORK_ACCESS");
+    forgeWab(ctx, childId, (s) => {
+      (s.capabilities as string[]).push("NETWORK_ACCESS");
+    });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expectCorrupt(ctx, childId);
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("P14RB-R1-UNBOUNDED-EXECUTOR-DENY-TAMPER: denied executor never re-enters snapshot", () => {
+    const { ctx, biz, wf } = makeStack("exec-deny");
+    const b = makeBiz(biz, ctx.projectId);
+    ctx.service.registerExecutor({
+      executor_id: "EX_DENIED", executor_kind: "IN_PROCESS", health_state: "HEALTHY",
+    });
+    const { lead, to } = makeTwo(ctx, biz, b);
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_executor_ids: null, denied_executor_ids: ["EX_DENIED"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_executor_ids: null, denied_executor_ids: ["EX_DENIED"] });
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    const wab = ctx.store.get("work_authority_binding", wabId(childId));
+    expect((wab.authority_snapshot as { executors: string[] }).executors)
+      .not.toContain("EX_DENIED");
+    forgeWab(ctx, childId, (s) => {
+      (s.executors as string[]).push("EX_DENIED");
+    });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expectCorrupt(ctx, childId);
+  });
+
+  it("P14RB-R1-ROUTE-DENY-TAMPER: canonical preferred/denied/fallback only", () => {
+    const { ctx, biz, wf } = makeStack("route-deny");
+    const b = makeBiz(biz, ctx.projectId);
+    ctx.service.routes.registerRoute({
+      route_id: "RTE_DENIED", route_kind: "IN_PROCESS_RUNTIME", enabled: true,
+      eligibility_state: "QUALIFIED", qualification_state: "QUALIFIED",
+      direct_callable: true, capabilities: ["FILE_OPERATIONS"], priority: 10,
+    });
+    const { lead, to } = makeTwo(ctx, biz, b);
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { denied_route_ids: ["RTE_DENIED"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { denied_route_ids: ["RTE_DENIED"] });
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    const wab = ctx.store.get("work_authority_binding", wabId(childId));
+    expect((wab.authority_snapshot as { routes: string[] }).routes)
+      .not.toContain("RTE_DENIED");
+    forgeWab(ctx, childId, (s) => {
+      (s.routes as string[]).push("RTE_DENIED");
+    });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expectCorrupt(ctx, childId);
+  });
+
+  it("P14RB-R1-DYNAMIC-CAPABILITY-AFTER-COMMIT: late capability never retro-expands", () => {
+    const { ctx, biz, wf } = makeStack("dyn-cap");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    biz.upsertAgentContract(String(lead.agent_id), "op", { allowed_capabilities: null });
+    biz.upsertAgentContract(String(to.agent_id), "op", { allowed_capabilities: null });
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    ctx.service.registerCapability("LATE_CAP_X", { risk_class: "LOW" });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_AUTHORITY_WIDEN");
+    // Policy failure, not corruption — no quarantine.
+    expect(String(ctx.store.get("work_item", childId).blocked_code ?? ""))
+      .not.toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("P14RB-R1-DYNAMIC-EXECUTOR-AFTER-COMMIT: late executor never retro-expands", () => {
+    const { ctx, biz, wf } = makeStack("dyn-exec");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    ctx.service.registerExecutor({
+      executor_id: "EX_LATE", executor_kind: "IN_PROCESS", health_state: "HEALTHY",
+    });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_AUTHORITY_WIDEN");
+    expect(String(ctx.store.get("work_item", childId).blocked_code ?? ""))
+      .not.toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14RB-R1-DYNAMIC-ROUTE-AFTER-COMMIT: late route never retro-expands", () => {
+    const { ctx, biz, wf } = makeStack("dyn-route");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    ctx.service.routes.registerRoute({
+      route_id: "RTE_LATE", route_kind: "IN_PROCESS_RUNTIME", enabled: true,
+      eligibility_state: "QUALIFIED", qualification_state: "QUALIFIED",
+      direct_callable: true, capabilities: ["FILE_OPERATIONS"], priority: 10,
+    });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_AUTHORITY_WIDEN");
+    expect(String(ctx.store.get("work_item", childId).blocked_code ?? ""))
+      .not.toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14RB-R1-WAB-REHASH-HISTORICAL-EVENT: policy-consistent rehash still fails at the anchor", () => {
+    const { ctx, biz, wf } = makeStack("wab-rehash");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    biz.upsertAgentContract(String(lead.agent_id), "op", { allowed_capabilities: null });
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const childId = String(child.work_item_id);
+    // Forge a NARROWER snapshot — still ⊆ the pinned policy, so the
+    // pre-R1 self-hash checks would have passed it; only the immutable
+    // WORK_AUTHORITY_BOUND event keeps the original digests.
+    forgeWab(ctx, childId, (s) => {
+      s.capabilities = (s.capabilities as string[]).filter((c) => c !== "NETWORK_ACCESS");
+    });
+    expect(errCode(() => biz.openWorkItem(childId, "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expectCorrupt(ctx, childId);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(0);
+  });
+
+  it("P14RB-R1-LEGACY-CURRENT-CONTRACT-BACKFILL: pre-ACR contract backfills exact current revision", () => {
+    const { ctx, biz, wf } = makeStack("legacy-backfill");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    const contract = biz.getAgentContract(String(lead.agent_id));
+    // Simulate the pre-R1 world: valid contract + journal, no ACR rows.
+    ctx.store.db.prepare(
+      "DELETE FROM entities WHERE entity_type = 'agent_contract_revision'",
+    ).run();
+    expect(ctx.store.list("agent_contract_revision")).toHaveLength(0);
+    const { child } = delegatedChild(ctx, biz, wf, b, lead, to);
+    const backfilled = ctx.store.get("agent_contract_revision",
+      contractRevisionRowId(String(contract!.contract_id),
+        Number(contract!.contract_version)));
+    expect(String(backfilled.contract_digest)).toBe(String(contract!.contract_digest));
+    expect(String(backfilled.state)).toBe("COMMITTED");
+    const childId = String(child.work_item_id);
+    const opened = biz.openWorkItem(childId, "op");
+    expect(String(opened.status)).toBe("IN_PROGRESS");
+    expect((opened.mission_ids as string[]).length).toBe(1);
+    expect(ctx.store.list("work_authority_binding")).toHaveLength(1);
+  });
+
+  it("P14RB-R1-LEGACY-CONFLICTING-ACR: conflicting revision fails closed, never overwritten", () => {
+    const { ctx, biz, wf } = makeStack("legacy-conflict");
+    const b = makeBiz(biz, ctx.projectId);
+    const { lead, to } = makeTwo(ctx, biz, b);
+    const contract = biz.getAgentContract(String(lead.agent_id));
+    const key = contractRevisionRowId(
+      String(contract!.contract_id), Number(contract!.contract_version));
+    const acr = ctx.store.get("agent_contract_revision", key);
+    // A self-consistent row over a DIFFERENT policy — its own digest is
+    // honest but is not the contract's pinned digest.
+    const pol = JSON.parse(JSON.stringify(acr.policy)) as Record<string, unknown>;
+    pol.denied_capabilities = ["NETWORK_ACCESS"];
+    const forgedDigest = contractDigest({
+      contract_id: String(acr.contract_id),
+      org_agent_id: String(acr.org_agent_id),
+      business_id: String(acr.business_id),
+      contract_version: Number(acr.contract_version),
+      policy: pol as never,
+    });
+    putVersioned(ctx, "agent_contract_revision", key,
+      { ...acr, policy: pol, contract_digest: forgedDigest });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    expect(errCode(() => wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op"))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    // Never overwritten, never rebuilt.
+    const after = ctx.store.get("agent_contract_revision", key);
+    expect(String(after.contract_digest)).toBe(forgedDigest);
+    expect(ctx.store.list("work_delegation")).toHaveLength(0);
+    expect(ctx.store.list("work_authority_binding")).toHaveLength(0);
   });
 });

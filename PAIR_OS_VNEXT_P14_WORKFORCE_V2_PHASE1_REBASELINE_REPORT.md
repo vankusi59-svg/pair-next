@@ -217,3 +217,155 @@ real sqlite:
 
 Classification: **`P14_WORKFORCE_V2_PHASE1_REBASELINED_PENDING_AUDIT`** —
 STOP. Not merged. No Phase 2, no P15/P16.
+
+---
+
+# R1 — HISTORICAL AUTHORITY ANCHOR CLOSURE (remediation on PR #12)
+
+Audit classification before R1:
+`P14_WORKFORCE_V2_PHASE1_REBASELINE_INDEPENDENT_AUDIT_BLOCKED`. After
+R1: `P14_WORKFORCE_V2_PHASE1_REBASELINED_R1_PENDING_AUDIT`.
+
+## R1.1 Canonical ACR validator (§1)
+
+`assertCanonicalContractRevision(store, revision)` in
+`agent-contract.ts` proves, for any `ACR_<contract>_<version>` row:
+
+- deterministic `revision_id` == `contractRevisionRowId(contract_id,
+  contract_version)`
+- `contract_id` / `org_agent_id` / `business_id` /
+  `contract_version` present and consistent
+- `state == COMMITTED`
+- `policy` re-normalizes through canonical `normalizeContractPolicy`
+- `contract_digest` **recomputed** via `contractDigest(...)` over the
+  STORED policy — a mutated `revision.policy` with an unchanged digest
+  field can never pass: either the digest recompute fails, or a
+  recomputed digest fails the journal anchor
+- append-only journal anchor: `listEvents(agent_execution_contract,
+  contract_id)` must contain an event whose metadata pins exactly this
+  `contract_version` + `contract_digest` (+ `org_agent_id`/`business_id`
+  where recorded)
+
+`assertCanonicalAuthorityBinding` now runs the FULL validator on the
+pinned revision (in addition to the WAB pin match) — a foreign or
+doctored revision cannot satisfy a binding merely by carrying the right
+digest field.
+
+## R1.2 Immutable WORK_AUTHORITY_BOUND anchor (§2/§4)
+
+`writeAuthorityBinding` appends an append-only journal event
+`WORK_AUTHORITY_BOUND` on entity `work_authority_binding/<binding_id>`
+at commit time with: `work_item_id`, `binding_id`, `ceiling_agent_id`,
+`contract_id`, `contract_version`, `contract_digest`,
+`authority_snapshot_digest`, `binding_digest`.
+
+`assertCanonicalAuthorityBinding` requires an event matching EVERY
+pinned field. Self-consistent rehashing of the mutable WAB row can
+never move the anchor — the journal still holds the originals (the
+same mechanism that already anchors contract revisions). The replay
+path in `writeAuthorityBinding` also re-validates (including the
+anchor) before adopting an existing row, so a forged WAB written
+out-of-band is never silently adopted.
+
+Because the snapshot is anchored, it is an EXACT commit-time snapshot:
+parent widening cannot expand the child (the stored snapshot is bound),
+and a narrower-but-policy-consistent forged snapshot fails at the
+anchor even though it still passes `snapshot ⊆ policy`.
+
+## R1.3 Deny-semantics closure (§3)
+
+`projectedAuthorityFromPolicy(deps, pol)` extracted from
+`effectiveAuthority` — THE canonical P12 derivation, now shared by
+both effective-authority computation and historical validation (one
+permission model, no subtle divergence):
+
+- capabilities: `registeredCapabilities()` ∩ allow(null→all) − deny
+- executors: `store.list("executor")` ∩ allow(null→all), narrowed to
+  `preferred_executor_ids` when `executor_fallback_allowed === false`
+  and preferred non-empty, − `denied_executor_ids`
+- routes: `store.list("route")` narrowed to `preferred_route_ids` when
+  `route_fallback_allowed === false` and preferred non-empty, −
+  `denied_route_ids` (canonical P12 fields only — no invented
+  `allowed_route_ids`)
+- `null` allow ⇒ catalog MINUS explicit denies — deny semantics can
+  never silently disappear
+
+`snapshot ⊆ projected(revision.policy)` replaces the old
+`policyAuthoritySnapshot` projection, which lost denies whenever an
+allow dimension was `null` and referenced the non-existent
+`allowed_route_ids` field.
+
+## R1.4 Dynamic registration after commit (§4)
+
+Because the persisted ceiling is an exact snapshot and
+`assertChildAuthorityCeiling` compares child CURRENT ⊆ persisted
+ceiling, a capability/executor/route registered AFTER delegation
+commit grows the child's current authority but never the snapshot —
+open fails `FAIL_CLOSED_WORK_AUTHORITY_WIDEN` (policy failure, no
+quarantine, no row mutation).
+
+## R1.5 Legacy current-revision backfill (§5)
+
+`AgentContractService.ensureCurrentRevision(contract)` runs inside the
+`writeAuthorityBinding` transaction before the WAB write:
+
+- existing ACR at `ACR_<contract>_<current_version>` →
+  `assertCanonicalContractRevision` full validation + org/business/
+  digest match vs the contract row; ANY conflict →
+  `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`, never overwritten or rebuilt
+- absent → require a journal event already anchoring exactly this
+  `contract_version` + `contract_digest` (+ identity where recorded);
+  only then create the exact ACR via `store.put(..., 0)` create-only
+  CAS and immediately re-validate
+- older historical revisions are never fabricated — only the exact
+  CURRENT revision a NEW binding actually pins
+
+## R1.6 Focused tests (10 new)
+
+`P14RB-R1-ACR-POLICY-TAMPER` — mutate `revision.policy`, keep stored
+digest → open fails `PROVENANCE_CORRUPT` + quarantine.
+`P14RB-R1-UNBOUNDED-CAP-DENY-TAMPER` — null allow + `denied: [NETWORK_ACCESS]`;
+valid WAB excludes it; forged snapshot adding it + rehashed → corrupt.
+`P14RB-R1-UNBOUNDED-EXECUTOR-DENY-TAMPER` — same on executor dimension.
+`P14RB-R1-ROUTE-DENY-TAMPER` — `denied_route_ids` (canonical fields only).
+`P14RB-R1-DYNAMIC-CAPABILITY-AFTER-COMMIT` /
+`-DYNAMIC-EXECUTOR-AFTER-COMMIT` / `-DYNAMIC-ROUTE-AFTER-COMMIT` — late
+registration → open `AUTHORITY_WIDEN`, no quarantine.
+`P14RB-R1-WAB-REHASH-HISTORICAL-EVENT` — narrower self-consistent
+rehash → corrupt only via the immutable anchor.
+`P14RB-R1-LEGACY-CURRENT-CONTRACT-BACKFILL` — ACR rows deleted →
+delegate recreates exact current ACR → WAB + open succeed.
+`P14RB-R1-LEGACY-CONFLICTING-ACR` — self-consistent conflicting ACR →
+delegate fails closed; row never overwritten; zero graph rows written.
+
+## R1.7 Validation
+
+- Focused: **65/65** (55 rebaseline + 10 R1)
+- P14 Foundation V2: 35 · runtime hardening: 11 · P13: 67 · P12: 71 ·
+  P11+r1..r6: 103 · P10: 31 · P9: 79 · P6: 36 — all pass
+- **Node 22 full: 2034 pass + 2 fail** — `pair-p5` DSH/CODEX probe
+  tests; pre-existing environment gap (executables installed on this
+  box), identical to PR #11 state
+- **Node 20 full: 2036 pass / 0 fail**
+- `tsc --noEmit` clean · `pnpm build` PASS · `pnpm audit
+  --audit-level=high`: 0 high/critical
+- `verifyIntegrity` clean on both E2E databases
+
+## R1.8 Fresh-server + upgrade E2E
+
+Fresh server (`pair-mc-r1`, :8790, R1 head):
+
+- delegate → open → bound mission OK; `WORK_AUTHORITY_BOUND` events
+  verified in journal with pinned digests
+- lead ACR policy mutated (digest kept) → open on BOTH children →
+  `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` (one corrupted canonical
+  revision poisons every WAB anchored to it) +
+  `TERMINAL_PROVENANCE_CORRUPT` durable across restart
+- WAB forged to a NARROWER self-consistent snapshot (digests
+  recomputed) → open → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT: binding
+  ... not anchored by WORK_AUTHORITY_BOUND event`
+
+Upgrade E2E (`pair-mc-upgrade`, :8791): valid contract created,
+ACR rows physically deleted (pre-R1 world, journal anchors intact) →
+delegate → exact current ACR backfilled under create-only CAS → WAB
+written → open → `IN_PROGRESS` + bound mission.

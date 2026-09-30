@@ -283,6 +283,11 @@ export class WorkforceService {
     const workItemId = String(item.work_item_id);
     const { contract } = this.business.agentContracts.resolve(
       ceilingAgentId, { actor: `operator:${actor}` });
+    // R1 §5 — canonical main can hold a pre-revision contract: the exact
+    // CURRENT revision is backfilled under create-only CAS when the
+    // journal already proves this version+digest. Runs inside the
+    // caller's immediate txn so the ACR + WAB + anchor event are atomic.
+    this.business.agentContracts.ensureCurrentRevision(contract);
     const bindingId = authorityBindingRowId(workItemId);
     const snapshotDigest = authorityCeilingDigest(ceilingSnapshot);
     const anchor = {
@@ -320,9 +325,31 @@ export class WorkforceService {
           `work_authority_binding ${bindingId} has mismatched provenance`,
         );
       }
+      // Replay adopts the existing row only when it is still fully
+      // canonical — including its WORK_AUTHORITY_BOUND anchor event.
+      assertCanonicalAuthorityBinding(this.graphDeps, existing);
       return existing;
     }
     this.store.put("work_authority_binding", bindingId, body, 0);
+    // R1 §2 — immutable historical anchor: the append-only journal gets
+    // the exact pinned digests at commit time. Rehashing the mutable WAB
+    // row later can never move this anchor.
+    this.store.event({
+      entity_type: "work_authority_binding",
+      entity_id: bindingId,
+      event_type: "WORK_AUTHORITY_BOUND",
+      actor: `operator:${actor}`,
+      metadata: {
+        work_item_id: workItemId,
+        binding_id: bindingId,
+        ceiling_agent_id: ceilingAgentId,
+        contract_id: String(contract.contract_id),
+        contract_version: Number(contract.contract_version),
+        contract_digest: String(contract.contract_digest),
+        authority_snapshot_digest: snapshotDigest,
+        binding_digest: String(body.binding_digest),
+      },
+    });
     assertCanonicalAuthorityBinding(this.graphDeps, body);
     return body;
   }

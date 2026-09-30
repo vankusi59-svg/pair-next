@@ -20,7 +20,10 @@ import { canonicalJson, digest } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { AgentContractService } from "./agent-contract.js";
-import { contractRevisionRowId } from "./agent-contract.js";
+import {
+  assertCanonicalContractRevision,
+  contractRevisionRowId,
+} from "./agent-contract.js";
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -529,6 +532,34 @@ export function effectiveAuthority(deps: GraphAuthorityDeps, agentId: string): E
     projects: new Set(), contextScopes: new Set(),
   };
   if (String(contract.status) !== "ACTIVE") return empty;
+  return projectedAuthorityFromPolicy(deps, pol);
+}
+
+/** THE canonical P12 authority derivation (one derivation, no second
+ *  permission model — R1 §3): given any policy payload, project the
+ *  concrete authority it grants over the CURRENT canonical catalogs
+ *  (registered capabilities, executor rows, route rows). `null` allow is
+ *  "all canonically known items EXCEPT explicit denies" — deny semantics
+ *  can never disappear when an allow dimension is unbounded. Routes have
+ *  no `allowed_route_ids` field in P12: eligible routes = preferred when
+ *  `route_fallback_allowed=false` and preferred is non-empty, otherwise
+ *  the whole catalog — always minus `denied_route_ids`. */
+export function projectedAuthorityFromPolicy(
+  deps: GraphAuthorityDeps,
+  pol: {
+    allowed_capabilities?: string[] | null;
+    denied_capabilities?: string[];
+    allowed_executor_ids?: string[] | null;
+    denied_executor_ids?: string[];
+    preferred_executor_ids?: string[];
+    executor_fallback_allowed?: boolean;
+    preferred_route_ids?: string[];
+    denied_route_ids?: string[];
+    route_fallback_allowed?: boolean;
+    allowed_project_ids?: string[] | null;
+    allowed_context_scopes?: string[];
+  },
+): EffectiveAuthority {
   const registered = deps.agentContracts.registeredCapabilities();
   const capabilities = new Set(
     [...registered].filter((c) =>
@@ -692,57 +723,21 @@ export function authorityBindingRowId(workItemId: string): string {
 /** Pure derivation of a ceiling from a stored contract policy — a
  *  function of the revision row only, reproducible forever. `null` on a
  *  dimension means the policy left it unbounded. */
-export interface PolicyCeiling {
-  capabilities: string[] | null;
-  executors: string[] | null;
-  routes: string[] | null;
-  projects: string[] | null;
-  context_scopes: string[] | null;
-}
-
-export function policyAuthoritySnapshot(pol: Record<string, unknown>): PolicyCeiling {
-  const deny = (allow: string[] | null, denied: string[]): string[] | null =>
-    allow === null ? null : allow.filter((x) => !denied.includes(x)).sort();
-  const deniedCaps = (pol.denied_capabilities as string[] | undefined) ?? [];
-  const deniedExec = (pol.denied_executor_ids as string[] | undefined) ?? [];
-  const deniedRoutes = (pol.denied_route_ids as string[] | undefined) ?? [];
-  const preferredExec = (pol.preferred_executor_ids as string[] | undefined) ?? [];
-  const preferredRoutes = (pol.preferred_route_ids as string[] | undefined) ?? [];
-  const caps = deny((pol.allowed_capabilities as string[] | null | undefined) ?? null, deniedCaps);
-  const execAllow = (pol.allowed_executor_ids as string[] | null | undefined) ?? null;
-  const routeAllow = (pol.allowed_route_ids as string[] | null | undefined) ?? null;
-  const executors =
-    pol.executor_fallback_allowed === false && preferredExec.length
-      ? preferredExec.filter((x) => !deniedExec.includes(x)).sort()
-      : deny(execAllow, deniedExec);
-  const routes =
-    pol.route_fallback_allowed === false && preferredRoutes.length
-      ? preferredRoutes.filter((x) => !deniedRoutes.includes(x)).sort()
-      : deny(routeAllow, deniedRoutes);
-  const projects = (pol.allowed_project_ids as string[] | null | undefined) ?? null;
-  const scopes = ((pol.allowed_context_scopes as string[] | undefined) ?? []).slice().sort();
-  return {
-    capabilities: caps,
-    executors,
-    routes,
-    projects: projects === null ? null : [...projects].sort(),
-    context_scopes: scopes,
-  };
-}
-
-/** snapshot ⊆ policyCeiling — per-dimension (null dim = unbounded). */
+/** snapshot ⊆ projected — per-dimension over the canonical P12
+ *  projection (projectedAuthorityFromPolicy). Deny semantics are closed:
+ *  an unbounded allow means "catalog minus denies", never "anything". */
 export function authorityWithinPolicyCeiling(
   snapshot: AuthorityCeiling,
-  ceiling: PolicyCeiling,
+  projected: EffectiveAuthority,
 ): boolean {
-  const within = (a: string[], b: string[] | null): boolean =>
-    b === null || a.every((x) => b.includes(x));
+  const within = (a: string[], b: Set<string> | null): boolean =>
+    b === null || a.every((x) => b.has(x));
   return (
-    within(snapshot.capabilities, ceiling.capabilities) &&
-    within(snapshot.executors, ceiling.executors) &&
-    within(snapshot.routes, ceiling.routes) &&
-    within(snapshot.projects ?? [], ceiling.projects) &&
-    within(snapshot.context_scopes, ceiling.context_scopes)
+    within(snapshot.capabilities, projected.capabilities) &&
+    within(snapshot.executors, projected.executors) &&
+    within(snapshot.routes, projected.routes) &&
+    within(snapshot.projects ?? [], projected.projects) &&
+    within(snapshot.context_scopes, projected.contextScopes)
   );
 }
 
@@ -796,8 +791,12 @@ export function assertCanonicalAuthorityBinding(
   if (!contractId || !Number.isInteger(contractVersion) || contractVersion < 1 || !contractDig) {
     fail(`binding ${workItemId} malformed contract anchor`);
   }
-  // Canonical P12 revision evidence — the exact pinned version must exist
-  // and carry the exact pinned digest.
+  // Canonical P12 revision evidence — the exact pinned version must
+  // exist, carry the exact pinned digest, and pass the FULL canonical
+  // revision validator (deterministic key, normalized policy, recomputed
+  // contractDigest over the stored policy, journal anchor). A mutated
+  // revision.policy can never pass merely because the stored digest field
+  // was left unchanged.
   const revision = deps.store.tryGet(
     "agent_contract_revision",
     contractRevisionRowId(contractId, contractVersion),
@@ -805,6 +804,7 @@ export function assertCanonicalAuthorityBinding(
   if (!revision) {
     fail(`binding ${workItemId} contract revision ${contractId}@${contractVersion} absent`);
   }
+  assertCanonicalContractRevision(deps.store, revision);
   if (
     String(revision.contract_id) !== contractId ||
     Number(revision.contract_version) !== contractVersion ||
@@ -813,19 +813,6 @@ export function assertCanonicalAuthorityBinding(
     String(revision.business_id) !== businessId
   ) {
     fail(`binding ${workItemId} contract revision anchor mismatch`);
-  }
-  // Journal anchor — a canonical contract event at exactly this version +
-  // digest must exist (revisions are never silently replaced).
-  const journal = deps.store.listEvents("agent_execution_contract", contractId).some((e) => {
-    const md = (e as { metadata?: Record<string, unknown> | null }).metadata;
-    return (
-      !!md &&
-      Number(md.contract_version) === contractVersion &&
-      String(md.contract_digest) === contractDig
-    );
-  });
-  if (!journal) {
-    fail(`binding ${workItemId} contract revision not anchored in journal`);
   }
   // Snapshot integrity: self-consistent digest + the persisted snapshot
   // can never exceed the authority the anchored revision actually granted.
@@ -840,10 +827,9 @@ export function assertCanonicalAuthorityBinding(
   if (snapshot.agent_id !== ceilingAgentId) {
     fail(`binding ${workItemId} snapshot agent mismatch`);
   }
-  const policyCeiling = policyAuthoritySnapshot(
-    revision.policy as Record<string, unknown>,
-  );
-  if (!authorityWithinPolicyCeiling(snapshot, policyCeiling)) {
+  const projected = projectedAuthorityFromPolicy(
+    deps, revision.policy as Record<string, unknown>);
+  if (!authorityWithinPolicyCeiling(snapshot, projected)) {
     fail(`binding ${workItemId} snapshot exceeds anchored revision policy`);
   }
   const expected = authorityBindingDigest({
@@ -857,6 +843,29 @@ export function assertCanonicalAuthorityBinding(
   });
   if (str(b, "binding_digest") !== expected) {
     fail(`binding ${workItemId} digest mismatch`);
+  }
+  // Immutable historical anchor (R1 §2/§4): the exact WORK_AUTHORITY_BOUND
+  // event must exist in the append-only journal with every pinned field.
+  // A caller that swaps the snapshot and recomputes both local digests
+  // still fails — the immutable event keeps the originals, and events are
+  // never silently replaced.
+  const bound = deps.store.listEvents("work_authority_binding", String(b.binding_id)).some((e) => {
+    const md = (e as { metadata?: Record<string, unknown> | null }).metadata;
+    return (
+      String(e.event_type) === "WORK_AUTHORITY_BOUND" &&
+      !!md &&
+      String(md.work_item_id) === workItemId &&
+      String(md.binding_id) === String(b.binding_id) &&
+      String(md.ceiling_agent_id) === ceilingAgentId &&
+      String(md.contract_id) === contractId &&
+      Number(md.contract_version) === contractVersion &&
+      String(md.contract_digest) === contractDig &&
+      String(md.authority_snapshot_digest) === snapshotDigest &&
+      String(md.binding_digest) === String(b.binding_digest)
+    );
+  });
+  if (!bound) {
+    fail(`binding ${workItemId} not anchored by WORK_AUTHORITY_BOUND event`);
   }
   void business;
 }

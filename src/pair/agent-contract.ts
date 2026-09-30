@@ -511,6 +511,72 @@ export class AgentContractService {
     }, 0);
   }
 
+  /**
+   * R1 §5 — legacy upgrade path for the CURRENT contract revision only.
+   * Canonical main can carry a valid contract created before
+   * `agent_contract_revision` existed. The exact ACR is created under
+   * create-only CAS only when the journal already proves exactly this
+   * version+digest — history is never fabricated, and an existing
+   * (possibly conflicting) row is fully validated and never overwritten.
+   */
+  ensureCurrentRevision(contract: Row): Row {
+    const contractId = String(contract.contract_id);
+    const version = Number(contract.contract_version);
+    const revisionId = contractRevisionRowId(contractId, version);
+    const existing = this.store.tryGet(
+      AGENT_CONTRACT_REVISION_TABLE, revisionId) as Row | null;
+    if (existing) {
+      assertCanonicalContractRevision(this.store, existing);
+      const matches =
+        String(existing.org_agent_id) === String(contract.org_agent_id) &&
+        String(existing.business_id) === String(contract.business_id) &&
+        String(existing.contract_digest) === String(contract.contract_digest);
+      if (!matches) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `conflicting agent_contract_revision ${revisionId} for current contract`,
+        );
+      }
+      return existing;
+    }
+    // The append-only journal must already prove exactly this
+    // version+digest — the backfill copies canonical evidence, it never
+    // invents a historical revision.
+    const anchored = this.store.listEvents(AGENT_CONTRACT_TABLE, contractId).some((e) => {
+      const md = (e as { metadata?: Record<string, unknown> | null }).metadata;
+      return (
+        !!md &&
+        Number(md.contract_version) === version &&
+        String(md.contract_digest) === String(contract.contract_digest) &&
+        (md.org_agent_id === undefined || String(md.org_agent_id) === String(contract.org_agent_id)) &&
+        (md.business_id === undefined || String(md.business_id) === String(contract.business_id))
+      );
+    });
+    if (!anchored) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+        `contract ${contractId}@${version} has no journal anchor — cannot backfill revision`,
+      );
+    }
+    const revision = {
+      revision_id: revisionId,
+      contract_id: contractId,
+      org_agent_id: String(contract.org_agent_id),
+      business_id: String(contract.business_id),
+      contract_version: version,
+      contract_digest: contract.contract_digest,
+      policy: contract.policy,
+      status: contract.status,
+      state: "COMMITTED",
+      created_at: utcnow(),
+      updated_at: utcnow(),
+      version: 0,
+    } as unknown as Row;
+    const saved = this.store.put(AGENT_CONTRACT_REVISION_TABLE, revisionId, revision, 0);
+    assertCanonicalContractRevision(this.store, saved);
+    return saved;
+  }
+
   setStatus(agentId: string, status: AgentContractStatus, actor: string): Row {
     if (!AGENT_CONTRACT_STATUSES.includes(status)) {
       throw new IntegrityError("FAIL_CLOSED_AGENT_CONTRACT_STATUS", status);
@@ -743,5 +809,70 @@ export class AgentContractService {
       version: contract.version,
       updated_at: contract.updated_at,
     };
+  }
+}
+
+/**
+ * R1 §1 — canonical validator for `agent_contract_revision`: the
+ * deterministic `ACR_<contract>_<version>` key, COMMITTED state, identity
+ * fields, a policy that re-normalizes as canonical P12, and a
+ * self-consistent `contractDigest` recomputed over the STORED policy —
+ * a mutated `revision.policy` with an unchanged stored digest fails at
+ * the recompute, and a recomputed digest fails at the append-only
+ * contract journal (which still pins the original version+digest). */
+export function assertCanonicalContractRevision(
+  store: PairEvidenceStore,
+  revision: Row,
+): void {
+  const fail = (msg: string): never => {
+    throw new IntegrityError(
+      "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT", `agent_contract_revision ${msg}`);
+  };
+  const contractId = String(revision.contract_id ?? "");
+  const version = Number(revision.contract_version);
+  const orgAgentId = String(revision.org_agent_id ?? "");
+  const businessId = String(revision.business_id ?? "");
+  if (!contractId || !Number.isInteger(version) || version < 1) {
+    fail("malformed contract anchor");
+  }
+  if (String(revision.revision_id) !== contractRevisionRowId(contractId, version)) {
+    fail(`${String(revision.revision_id)} != deterministic(${contractId}@${version})`);
+  }
+  if (String(revision.state) !== "COMMITTED") {
+    fail(`${contractId}@${version} uncommitted`);
+  }
+  if (!orgAgentId || !businessId) fail(`${contractId}@${version} missing identity`);
+  let policy: AgentContractPolicy;
+  try {
+    policy = normalizeContractPolicy(revision.policy);
+  } catch (err) {
+    return fail(`${contractId}@${version} policy malformed: ${(err as Error).message}`);
+  }
+  const storedDigest = String(revision.contract_digest ?? "");
+  if (
+    contractDigest({
+      contract_id: contractId,
+      org_agent_id: orgAgentId,
+      business_id: businessId,
+      contract_version: version,
+      policy,
+    }) !== storedDigest
+  ) {
+    fail(`${contractId}@${version} digest mismatch — stored policy is not what the digest covers`);
+  }
+  // Append-only journal anchor: a canonical contract event must already
+  // prove exactly this version + digest (+ identity where recorded).
+  const anchored = store.listEvents(AGENT_CONTRACT_TABLE, contractId).some((e) => {
+    const md = (e as { metadata?: Record<string, unknown> | null }).metadata;
+    return (
+      !!md &&
+      Number(md.contract_version) === version &&
+      String(md.contract_digest) === storedDigest &&
+      (md.org_agent_id === undefined || String(md.org_agent_id) === orgAgentId) &&
+      (md.business_id === undefined || String(md.business_id) === businessId)
+    );
+  });
+  if (!anchored) {
+    fail(`${contractId}@${version} not anchored in contract journal`);
   }
 }
