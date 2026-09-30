@@ -533,7 +533,7 @@ audit + one narrow defect remediation.
   PASS.
 - Report: `PAIR_OS_VNEXT_P14_FINAL_CLOSURE_REPORT.md`.
   Classification:
-  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R4_PENDING_INDEPENDENT_AUDIT`**.
+  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R5_PENDING_INDEPENDENT_AUDIT`**.
 
 #### FC R1 remediation (independent-audit BLOCKED → closed, same PR)
 
@@ -678,6 +678,36 @@ authority at open/sync/completion seams.
   terminal → legitimate ordered reopen).
 - Regression all-green; N22 2216+2 pre-existing P5 env-gap / N20
   2218/0; report §24-25.
+
+#### FC R5 remediation (independent-audit BLOCKED → closed, same PR)
+
+Historical assignee provenance closure: R4's lineage validator
+revalidated every BOUND WOB against the CURRENT assignee — but a WOB
+pins the assignee AT THAT ATTEMPT, and a STANDALONE item may legally
+be reassigned between attempts; reassigning A→B falsely corrupted
+WOB1(A) and refused a legitimate retry.
+
+- **Three-way binding-validation mode**
+  (`validateWorkOpenBinding`): `ADMISSION` — new-mission minting
+  requires agent == current assignee + ACTIVE; `PROVENANCE` —
+  current-attempt origin proof keeps agent == current assignee;
+  `PROVENANCE_HISTORICAL` (new) — past attempts skip ONLY the
+  current-assignee equality while still requiring the pinned
+  org_agent to resolve and belong to the binding's business (all
+  other pins unchanged: open_id, BOUND, work_item/business/project,
+  reserved mission id, bound_open_id, mission project).
+- **Consumption**: `assertCanonicalWorkMissionLineage` + routine tail
+  validation → `PROVENANCE_HISTORICAL`; `missionBoundToWorkItem`,
+  `reconcileOpenIntent`, `startBoundMission` unchanged
+  (`PROVENANCE`/`ADMISSION`) — no global weakening; graph-bound
+  assignee immutability untouched (delegated/decomposition child
+  reassign → `FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE`).
+- **8 `P14-FC-R5-*` tests** (P3 suite 127/127); Golden E2E **70/70**
+  (A→fail→BLOCKED→reassign B→open: WOB1(A) historical-valid, WOB2(B)
+  current, exactly one new mission; delegated child reassign → 409).
+- Regression **688/688**; N22 2224+2 pre-existing P5 env-gap / N20
+  2226/0; tsc clean; build PASS; audit 0 high; verifyIntegrity PASS;
+  report §26-27.
 
 ## Not yet
 

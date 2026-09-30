@@ -266,9 +266,10 @@ export function assertCanonicalRoutineLineage(
       forWorkItem: item,
       forMission: mission,
       requireState: "BOUND",
-      // PROVENANCE: a validly bound mission stays bound even if the
-      // agent is PAUSED/TERMINATED afterwards.
-      mode: "PROVENANCE",
+      // HISTORICAL (FC R5): each tail records the assignee AT THAT
+      // attempt — a later legal STANDALONE reassignment must not
+      // invalidate it; the pinned agent still resolves in-business.
+      mode: "PROVENANCE_HISTORICAL",
     });
     if (!res.ok) {
       fail(`item ${wid} trailing mission ${mid} binding ${openId}: ${res.reason}`);

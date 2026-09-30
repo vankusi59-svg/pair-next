@@ -914,7 +914,11 @@ export function assertCanonicalWorkMissionLineage(
   for (const b of wobs) {
     const openId = String(b.open_id ?? "");
     const v = validateWorkOpenBindingById(store, openId, {
-      forWorkItem: row, requireState: "BOUND", mode: "PROVENANCE",
+      forWorkItem: row, requireState: "BOUND",
+      // HISTORICAL (FC R5): each WOB pins the assignee AT THAT attempt
+      // — a later legal STANDALONE reassignment must not invalidate
+      // it; the pinned agent still resolves in-business.
+      mode: "PROVENANCE_HISTORICAL",
     });
     if (!v.ok) {
       lineageFail(`work item ${wid}: binding ${openId} invalid: ${v.reason}`);
@@ -930,7 +934,7 @@ export function assertCanonicalWorkMissionLineage(
     }
     const mv = validateWorkOpenBindingById(store, openId, {
       forWorkItem: row, forMission: m, requireState: "BOUND",
-      mode: "PROVENANCE",
+      mode: "PROVENANCE_HISTORICAL",
     });
     if (!mv.ok) {
       lineageFail(`work item ${wid}: mission ${mid} binding proof: ${mv.reason}`);

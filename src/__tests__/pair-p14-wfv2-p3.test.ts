@@ -3365,3 +3365,196 @@ describe("P14 FC R4 — omission-safe attempt history", () => {
     expect(mintsOf(ctx)).toEqual(before);
   });
 });
+
+// =====================================================================
+// FC R5 — admission vs historical assignee provenance.
+// A WOB pins the assignee AT THAT ATTEMPT; a later legal STANDALONE
+// reassignment must not invalidate historical bindings. Current
+// admission/current-attempt provenance still requires the current
+// assignee exactly. Graph-bound assignees stay immutable.
+// =====================================================================
+describe("P14 FC R5 — historical assignee provenance", () => {
+  const setupItem = (biz: BusinessLayer, ctx: ReturnType<typeof makeStack>["ctx"], tag = "i") => {
+    const b = makeBiz(biz, ctx.projectId, `B-${tag}`);
+    const a = makeAgent(biz, String(b.business_id), `lead-${tag}`);
+    const w = biz.createWorkItem({
+      business_id: String(b.business_id), title: "w", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    return { b, a, wid: String(w.work_item_id) };
+  };
+  const wobsOf = (ctx: ReturnType<typeof makeStack>["ctx"], wid: string) =>
+    ctx.store.list("work_open_binding")
+      .filter((x) => String(x.work_item_id) === wid && x.state === "BOUND");
+  const mintsOf = (ctx: ReturnType<typeof makeStack>["ctx"]) => ({
+    missions: ctx.store.list("mission").length,
+    wobs: ctx.store.list("work_open_binding").length,
+  });
+
+  it("P14-FC-R5-STANDALONE-REASSIGN-AFTER-FAILED-ATTEMPT-PASSES: A→fail→BLOCKED→assign B→open → WOB2(B), exactly once", () => {
+    const { ctx, biz } = makeStack("r5-reassign");
+    const { b, a, wid } = setupItem(biz, ctx);
+    const aB = makeAgent(biz, String(b.business_id), "lead-B");
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("BLOCKED");
+    // Legal STANDALONE reassign — historical WOB must stay valid.
+    biz.assignWorkItem(wid, String(aB.agent_id), "op");
+    const missions0 = mintsOf(ctx);
+    biz.openWorkItem(wid, "op");
+    const mids = ctx.store.get("work_item", wid).mission_ids as string[];
+    expect(mids).toHaveLength(2);
+    expect(wobsOf(ctx, wid)).toHaveLength(2);
+    expect(mintsOf(ctx).missions).toBe(missions0.missions + 1);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("IN_PROGRESS");
+  });
+
+  it("P14-FC-R5-HISTORICAL-WOB-RETAINS-ORIGINAL-AGENT: WOB1(A) + WOB2(B) both validate as historical provenance", () => {
+    const { ctx, biz } = makeStack("r5-pinned-agent");
+    const { a, wid } = setupItem(biz, ctx);
+    const aB = makeAgent(biz, String((ctx.store.get("work_item", wid)).business_id), "lead-B");
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.assignWorkItem(wid, String(aB.agent_id), "op");
+    biz.openWorkItem(wid, "op");
+    const wobs = wobsOf(ctx, wid);
+    expect(wobs).toHaveLength(2);
+    expect(String(wobs[0]!.org_agent_id)).toBe(String(a.agent_id));
+    expect(String(wobs[1]!.org_agent_id)).toBe(String(aB.agent_id));
+    // historical pins survive a further legal reassignment
+    const aC = makeAgent(biz, String((ctx.store.get("work_item", wid)).business_id), "lead-C");
+    const m2 = String((ctx.store.get("work_item", wid).mission_ids as string[])[1]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m2, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.assignWorkItem(wid, String(aC.agent_id), "op");
+    const after = wobsOf(ctx, wid);
+    expect(String(after[0]!.org_agent_id)).toBe(String(a.agent_id));
+    expect(String(after[1]!.org_agent_id)).toBe(String(aB.agent_id));
+  });
+
+  it("P14-FC-R5-HISTORICAL-AGENT-STATUS-DRIFT-DOES-NOT-ERASE-PROVENANCE: PAUSED/TERMINATED historical agent stays valid", () => {
+    const { ctx, biz } = makeStack("r5-agent-drift");
+    const { a, wid } = setupItem(biz, ctx);
+    const aB = makeAgent(biz, String((ctx.store.get("work_item", wid)).business_id), "lead-B");
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.assignWorkItem(wid, String(aB.agent_id), "op");
+    // Drift the HISTORICAL agent's mutable status — provenance must hold.
+    const ag = ctx.store.get("org_agent", String(a.agent_id));
+    ag.status = "TERMINATED";
+    ctx.store.put("org_agent", String(a.agent_id), ag, Number(ag.version));
+    biz.openWorkItem(wid, "op"); // historical WOB(A,TERMINATED) stays valid → WOB2(B) minted
+    expect((ctx.store.get("work_item", wid).mission_ids as string[])).toHaveLength(2);
+    expect(wobsOf(ctx, wid)).toHaveLength(2);
+  });
+
+  it("P14-FC-R5-HISTORICAL-AGENT-CROSS-BUSINESS-TAMPER-FAILS: moving pinned agent out of business corrupts lineage", () => {
+    const { ctx, biz } = makeStack("r5-cross-biz");
+    const { b, a, wid } = setupItem(biz, ctx);
+    const aB = makeAgent(biz, String(b.business_id), "lead-B");
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.assignWorkItem(wid, String(aB.agent_id), "op");
+    // Tamper: repoint WOB1's pinned agent at a FOREIGN-business agent —
+    // historical provenance still requires same-business scope.
+    const b2 = makeBiz(biz, ctx.projectId, "Other");
+    const foreign = makeAgent(biz, String(b2.business_id), "outsider");
+    const w1 = wobsOf(ctx, wid)[0]!;
+    w1.org_agent_id = String(foreign.agent_id);
+    ctx.store.put("work_open_binding", String(w1.open_id), w1, Number(w1.version));
+    const before = mintsOf(ctx);
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+  });
+
+  it("P14-FC-R5-HISTORICAL-BINDING-MISSION-PIN-TAMPER-FAILS: bound_open_id repoint breaks origin proof", () => {
+    const { ctx, biz } = makeStack("r5-pin-tamper");
+    const { b, a, wid } = setupItem(biz, ctx);
+    const aB = makeAgent(biz, String(b.business_id), "lead-B");
+    biz.openWorkItem(wid, "op");
+    const m1 = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyTerminateMission(ctx.store, ctx.service, m1, "FAILED");
+    biz.syncWorkItem(wid);
+    biz.assignWorkItem(wid, String(aB.agent_id), "op");
+    // Tamper the historical mission's origin pin — even with a legal
+    // reassignment the attempt chain must still pin exactly.
+    const m = ctx.store.get("mission", m1);
+    m.bound_open_id = "OPI_FORGED";
+    ctx.store.put("mission", m1, m, Number(m.version));
+    const before = mintsOf(ctx);
+    expect(errCode(() => biz.openWorkItem(wid, "op")))
+      .toBe("FAIL_CLOSED_MISSION_LIFECYCLE_CORRUPT");
+    expect(mintsOf(ctx)).toEqual(before);
+  });
+
+  it("P14-FC-R5-CURRENT-ADMISSION-STILL-REQUIRES-CURRENT-ASSIGNEE: tampered current binding agent → quarantine", () => {
+    const { ctx, biz } = makeStack("r5-current-admission");
+    const { b, wid } = setupItem(biz, ctx);
+    const aB = makeAgent(biz, String(b.business_id), "lead-B");
+    biz.openWorkItem(wid, "op");
+    const wob = wobsOf(ctx, wid)[0]!;
+    // Tamper the LIVE attempt's binding agent to another in-business
+    // agent — current-attempt provenance must still demand the current
+    // assignee exactly.
+    wob.org_agent_id = String(aB.agent_id);
+    ctx.store.put("work_open_binding", String(wob.open_id), wob, Number(wob.version));
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).blocked_code ?? ""))
+      .toBe("TERMINAL_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-FC-R5-GRAPH-BOUND-REASSIGN-STILL-FAILS: delegated child assignee stays immutable", () => {
+    const { ctx, biz, wf } = makeStack("r5-graph-bound");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const aB = makeAgent(biz, String(b.business_id), "lead-B");
+    const p = biz.createWorkItem({
+      business_id: String(b.business_id), title: "p", goal: "g",
+      assignee_agent_id: a.agent_id, operator_id: "op",
+    } as never);
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_to_agent_id: String(a.agent_id),
+    }, "op");
+    expect(errCode(() =>
+      biz.assignWorkItem(String(child.work_item_id), String(aB.agent_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE");
+  });
+
+  it("P14-FC-R5-MULTI-AGENT-SERIAL-REOPENS-PRESERVE-ATTEMPT-HISTORY: A→fail→B→fail→C→open — ordered multi-agent history", () => {
+    const { ctx, biz } = makeStack("r5-multi-agent");
+    const { b, a, wid } = setupItem(biz, ctx);
+    const aB = makeAgent(biz, String(b.business_id), "lead-B");
+    const aC = makeAgent(biz, String(b.business_id), "lead-C");
+    biz.openWorkItem(wid, "op");
+    canonicallyTerminateMission(ctx.store, ctx.service,
+      String((ctx.store.get("work_item", wid).mission_ids as string[])[0]), "FAILED");
+    biz.syncWorkItem(wid);
+    biz.assignWorkItem(wid, String(aB.agent_id), "op");
+    biz.openWorkItem(wid, "op");
+    canonicallyTerminateMission(ctx.store, ctx.service,
+      String((ctx.store.get("work_item", wid).mission_ids as string[])[1]), "FAILED");
+    biz.syncWorkItem(wid);
+    biz.assignWorkItem(wid, String(aC.agent_id), "op");
+    biz.openWorkItem(wid, "op");
+    const mids = ctx.store.get("work_item", wid).mission_ids as string[];
+    const wobs = wobsOf(ctx, wid);
+    expect(mids).toHaveLength(3);
+    expect(wobs).toHaveLength(3);
+    expect([String(a.agent_id), String(aB.agent_id), String(aC.agent_id)])
+      .toEqual(wobs.map((w) => String(w.org_agent_id)));
+    // exactly one canonical current attempt — the latest WOB (C)
+    expect(String(biz.boundMissionForWorkItem(ctx.store.get("work_item", wid))!.mission_id))
+      .toBe(String(mids[2]));
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("IN_PROGRESS");
+  });
+});

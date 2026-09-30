@@ -853,6 +853,45 @@ ok("FC-R2 reopened routine completes WGM→binding→WCP",
     `status=${wC.status} open=${openC.status} mids=${midsC.length} wobs=${wobs.length}`);
 }
 
+// ================= FC-R5: admission vs historical assignee provenance =================
+// STANDALONE item → Agent A → open M1 → canonical FAIL → BLOCKED →
+// reassign B → open M2 → WOB1(A) stays valid historical provenance,
+// WOB2(B) is the canonical current attempt, exactly one new mission.
+{
+  const r5 = await api("/api/work-items", "POST", {
+    business_id: bid, title: "r5", goal: "g", assignee_agent_id: lead });
+  const wid5 = String(r5.data.work_item_id);
+  await openWI(wid5);
+  const m1 = String((await wi(wid5)).mission_ids[0]);
+  terminateMission(m1, "FAILED");
+  const w5a = await fold(wid5);
+  const asg = await api(`/api/work-items/${wid5}/assign`, "POST", { assignee_agent_id: w2 });
+  const w5b = await wi(wid5);
+  const missions0 = rows("mission").length;
+  const open5 = await openWI(wid5);
+  const w5c = await wi(wid5);
+  const wobs5 = bindingsOf(wid5).filter((x) => String(x.state) === "BOUND");
+  ok("FC-R5 STANDALONE reassign → historical WOB(A) valid + WOB(B) current, exactly one new mission",
+    String(w5a.status) === "BLOCKED" && asg.status === 200 &&
+    String(w5b.assignee_agent_id) === w2 && open5.status === 200 &&
+    wobs5.length === 2 &&
+    String(wobs5[0].org_agent_id) === lead && String(wobs5[1].org_agent_id) === w2 &&
+    (w5c.mission_ids ?? []).length === 2 &&
+    rows("mission").length === missions0 + 1 &&
+    String(w5c.status) === "IN_PROGRESS",
+    `asg=${asg.status} open=${open5.status} wobs=${wobs5.length} mids=${(w5c.mission_ids ?? []).length}`);
+  // graph-bound reassign stays immutable — fresh delegated child.
+  const p5 = await api("/api/work-items", "POST", {
+    business_id: bid, title: "r5-parent", goal: "g", assignee_agent_id: lead });
+  const d5 = await api(`/api/work-items/${String(p5.data.work_item_id)}/delegate`, "POST", {
+    delegated_by_agent_id: lead, delegated_to_agent_id: w2 });
+  const cid5 = String(d5.data?.work_item_id ?? d5.data?.child?.work_item_id ?? "");
+  const reassign5 = await api(`/api/work-items/${cid5}/assign`, "POST", { assignee_agent_id: lead });
+  ok("FC-R5 graph-bound child reassign still fails",
+    d5.status === 200 && !!cid5 && reassign5.status !== 200,
+    `delegate=${d5.status} cid=${cid5} reassign=${reassign5.status}`);
+}
+
 // ================= exactly-once audit over the whole store =================
 {
   const wcps = rows("work_completion");

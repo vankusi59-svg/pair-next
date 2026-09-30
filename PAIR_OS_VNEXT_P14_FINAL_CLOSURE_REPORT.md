@@ -745,3 +745,85 @@ must agree, never an authority. Convergence stands.
 ## 25. R4 classification
 
 **`P14_WORKFORCE_V2_FINAL_CLOSURE_R4_PENDING_INDEPENDENT_AUDIT`**
+
+## 26. FC R5 — admission vs historical assignee provenance
+
+### 26.1 Root defect
+
+R4's historical lineage revalidated every BOUND `work_open_binding`
+against the CURRENT `work_item` row — `validateWorkOpenBinding`
+requires `binding.org_agent_id === row.assignee_agent_id`. That is
+correct for current admission and current-attempt provenance, but
+wrong for PAST attempts: a WOB pins the assignee AT THAT ATTEMPT, and
+PAIR explicitly allows a STANDALONE item to be reassigned after a
+terminal attempt. Reassigning A→B between attempts made the lineage
+validator declare WOB1(A) corrupt — a legitimate governed retry was
+refused.
+
+### 26.2 Semantic split
+
+`validateWorkOpenBinding` now takes an explicit three-way `mode`:
+
+- `ADMISSION` — minting a NEW mission: binding agent must equal the
+  current assignee AND be currently ACTIVE (unchanged).
+- `PROVENANCE` (current) — origin proof of the item's CURRENT attempt:
+  binding agent must still equal the current assignee; mutable agent
+  status (PAUSED/TERMINATED) never erases provenance (unchanged).
+- `PROVENANCE_HISTORICAL` (new) — PAST attempts: skips ONLY the
+  current-assignee equality; the pinned `org_agent_id` must still
+  resolve and belong to the binding's business. Every other pin is
+  unchanged: open_id identity, BOUND state, work_item/business/
+  project agreement, reserved mission id, `mission.bound_open_id`,
+  `mission.project_id`.
+
+Consumed: `assertCanonicalWorkMissionLineage` and the routine
+tail-validation use `PROVENANCE_HISTORICAL`; `missionBoundToWorkItem`,
+`reconcileOpenIntent` and the bound-mission seam keep
+`PROVENANCE`/`ADMISSION` exactly as before — no global weakening.
+Graph-bound assignee immutability
+(`FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE`) is untouched: delegated/
+decomposition children still cannot be reassigned.
+
+### 26.3 R5 tests (8)
+
+`STANDALONE-REASSIGN-AFTER-FAILED-ATTEMPT-PASSES` ·
+`HISTORICAL-WOB-RETAINS-ORIGINAL-AGENT` (WOB1(A),WOB2(B) pins survive
+further reassignment) · `HISTORICAL-AGENT-STATUS-DRIFT-DOES-NOT-ERASE-
+PROVENANCE` (TERMINATED historical agent) ·
+`HISTORICAL-AGENT-CROSS-BUSINESS-TAMPER-FAILS` ·
+`HISTORICAL-BINDING-MISSION-PIN-TAMPER-FAILS` ·
+`CURRENT-ADMISSION-STILL-REQUIRES-CURRENT-ASSIGNEE` (tampered live
+binding → quarantine) · `GRAPH-BOUND-REASSIGN-STILL-FAILS` ·
+`MULTI-AGENT-SERIAL-REOPENS-PRESERVE-ATTEMPT-HISTORY` (A→B→C ordered
+three-attempt history, latest = canonical current).
+P14-P3 suite: **127/127**.
+
+### 26.4 R5 E2E (70/70)
+
+STANDALONE → open M1 → canonical FAIL → BLOCKED → reassign B → open →
+2 BOUND WOBs (A then B), exactly one new mission, item IN_PROGRESS;
+a fresh delegated child's reassign → 409 (graph-bound immutable).
+Store integrity: 0 errors.
+
+### 26.5 R5 regression / platform matrix
+
+- Regression: P3 127 · P2 55 · Phase1 73 · P14F 35 · RH 11 · P13 67 ·
+  P12 71 · P11+r 103 · P10 31 · P9 79 · P6 36 — **688/688** green.
+- **Node22: 2224 pass + 2 fail** — same pre-existing P5 env-gap
+  (DSH/CODEX probes; unchanged). **Node20: 2226/0**.
+- tsc clean · `pnpm build` PASS · `pnpm audit` 0 high (1 low + 8
+  moderate transitive advisories, no dep changes, pre-existing) ·
+  `verifyIntegrity` 0 errors
+  · Golden E2E 70/70 fresh-dir on real `dist/`.
+
+### 26.6 R5 convergence reassessment
+
+A narrow semantic split inside the EXISTING binding validator —
+current admission/current provenance vs historical provenance — reusing
+the same WOB history. No new runtime/planner/router/completion
+authority/attempt ledger, no graph-assignment redesign. Convergence
+stands.
+
+## 27. R5 classification
+
+**`P14_WORKFORCE_V2_FINAL_CLOSURE_R5_PENDING_INDEPENDENT_AUDIT`**
