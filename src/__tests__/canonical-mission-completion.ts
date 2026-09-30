@@ -7,21 +7,28 @@
  *
  *   legal mission transitions → mission_runtime row driven
  *   CREATED→READY→RUNNING→COMPLETED (reason "all_tasks_completed") → a
- *   committed current-plan revision whose tasks each carry a COMPLETED
- *   executor_execution (COMPLETED result) + a correlated immutable
+ *   committed current-plan revision whose tasks each carry the FULL
+ *   governed chain (R2): governed_task VALIDATED→DISPATCH_AUTHORIZED →
+ *   persisted executor_dispatch_intent EXECUTION_PERSISTED →
+ *   executor_execution COMPLETED + EXECUTION_DISPATCHED evidence →
+ *   PASS execution_validation written by the REAL
+ *   ArtifactProvenanceValidator (same writer the GovernedTaskGate
+ *   uses) + its RESULT_VALIDATED anchor → correlated immutable
  *   TASK_COMPLETED event.
  *
  * Everything here goes through the app's own canonical writers
  * (service.transitionMission, service.commitPlan, service.updateTask,
- * store.put/store.event) — the same rows and event shapes
- * MissionRuntime/MissionSupervisor produce, so the completion seams
- * accept it as genuine governed-runtime evidence.
+ * store.put/store.event, ArtifactProvenanceValidator) — the same rows
+ * and event shapes MissionRuntime/GovernedTaskGate produce, so the
+ * completion seams accept it as genuine governed-runtime evidence.
  */
 
 import type { PairControlPlane, PairEvidenceStore } from "../pair/index.js";
-import { utcnow } from "../pair/index.js";
+import { ArtifactProvenanceValidator, utcnow } from "../pair/index.js";
 
 const RUNTIME_ACTOR = "PAIR_MISSION_RUNTIME";
+const GATE_ACTOR = "PAIR_GOVERNED_TASK_GATE";
+const TEST_EXECUTOR = "EX_TEST_CANONICAL";
 
 function transitionRuntimeLike(
   store: PairEvidenceStore, missionId: string, to: string, reason: string,
@@ -108,25 +115,103 @@ export function canonicallyCompleteMission(
   if (String(store.get("mission_runtime", rtId).state) === "READY") {
     transitionRuntimeLike(store, mid, "RUNNING", "tasks_dispatched");
   }
-  // Per-task execution evidence: a COMPLETED executor_execution whose
-  // result says COMPLETED + a correlated TASK_COMPLETED event — the
-  // same pair settleExecution writes after validate_execution_result.
-  for (const tid of plan.task_ids) {
+  // Per-task governed evidence — the exact shape Gate.settleExecution
+  // leaves behind: governed_task (VALIDATED → DISPATCH_AUTHORIZED) →
+  // intent EXECUTION_PERSISTED → executor_execution COMPLETED +
+  // EXECUTION_DISPATCHED/RESULT_COLLECTED events → REAL
+  // ArtifactProvenanceValidator PASS + RESULT_VALIDATED anchor →
+  // TASK_COMPLETED on the execution's correlation.
+  const taskRows = plan.task_ids.map((tid) =>
+    store.get("task", tid) as Record<string, unknown>);
+  for (const t of taskRows) {
+    const tid = String(t.task_id);
+    const gtId = `GT_${tid}`;
     const eid = `EXEC_${tid}`;
     const corr = `COR_${tid}`;
-    store.put("executor_execution", eid, {
-      execution_id: eid,
-      governed_task_id: `GT_${tid}`,
+    const workspace = `/tmp/pair-canonical-ws/${mid}`;
+    store.put("governed_task", gtId, {
+      governed_task_id: gtId,
       mission_id: mid,
       task_id: tid,
-      executor_id: "EX_TEST_CANONICAL",
+      plan_id: plan.plan_id,
+      plan_revision: plan.revision,
+      correlation_id: corr,
+      executor_id: TEST_EXECUTOR,
+      task_instruction: String(t.task_instruction ?? t.title ?? tid),
+      workspace,
+      allowed_paths: [workspace],
+      permissions: [],
+      constraints: [],
+      requested_tools: [],
+      dependency_outputs: [],
+      timeout: 60000,
+      expected_output_contract: null,
+      risk_class: "LOW",
+      approval_required: false,
+      approval_id: null,
+      approval_scope_digest: null,
+      governance_state: "DISPATCH_AUTHORIZED",
+      dispatch_enabled: true,
+      created_at: utcnow(),
+      version: 0,
+    }, 0);
+    store.event({
+      entity_type: "governed_task", entity_id: gtId,
+      event_type: "GOVERNED_TASK_VALIDATED", new_state: "VALIDATED",
+      actor: GATE_ACTOR, correlation_id: corr,
+      metadata: {
+        mission_id: mid, task_id: tid, executor_id: TEST_EXECUTOR,
+        risk_class: "LOW", approval_required: false,
+      },
+    });
+    store.event({
+      entity_type: "governed_task", entity_id: gtId,
+      event_type: "EXECUTION_PREPARED", old_state: "VALIDATED",
+      new_state: "DISPATCH_AUTHORIZED", actor: GATE_ACTOR,
+      correlation_id: corr,
+    });
+    store.put("executor_dispatch_intent", `INTENT_${gtId}`, {
+      intent_id: `INTENT_${gtId}`,
+      governed_task_id: gtId,
+      executor_id: TEST_EXECUTOR,
+      state: "EXECUTION_PERSISTED",
+      execution_id: eid,
+      created_at: utcnow(),
+      version: 0,
+    }, 0);
+    store.put("executor_execution", eid, {
+      execution_id: eid,
+      governed_task_id: gtId,
+      mission_id: mid,
+      task_id: tid,
+      executor_id: TEST_EXECUTOR,
       plan_revision: plan.revision,
       correlation_id: corr,
       execution_state: "COMPLETED",
       dispatch_timestamp: utcnow(),
+      run_root: `${workspace}/run`,
+      workspace,
       result: { status: "COMPLETED", output: "done" },
       version: 0,
     }, 0);
+    store.event({
+      entity_type: "executor_execution", entity_id: eid,
+      event_type: "EXECUTION_DISPATCHED", new_state: "COMPLETED",
+      actor: GATE_ACTOR, correlation_id: corr,
+      metadata: { governed_task_id: gtId },
+    });
+    store.event({
+      entity_type: "executor_execution", entity_id: eid,
+      event_type: "RESULT_COLLECTED", new_state: "COMPLETED",
+      actor: GATE_ACTOR, correlation_id: corr,
+    });
+    // The REAL validation authority — writes the PASS execution_validation
+    // row + the immutable RESULT_VALIDATED event pinning its id.
+    const validation = new ArtifactProvenanceValidator()
+      .validate_execution(service, eid) as Record<string, unknown>;
+    if (String(validation.status) !== "PASS") {
+      throw new Error(`canonical helper validation failed: ${String(validation.status)}`);
+    }
     service.updateTask(tid, { status: "COMPLETED", completed_at: utcnow() });
     store.event({
       entity_type: "task", entity_id: tid,

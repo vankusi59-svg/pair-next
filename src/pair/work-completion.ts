@@ -131,8 +131,15 @@ export function rejectedCompletionBases(
         String(e.old_state ?? "") !== "REVIEW_REQUIRED" ||
         String(e.new_state ?? "") !== "READY") continue;
     const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
-    const childIds =
-      [...((md.child_work_item_ids as string[] | undefined) ?? [])].sort();
+    const rawIds = md.child_work_item_ids;
+    if (!Array.isArray(rawIds)) {
+      fail(`rework event for ${workItemId}: missing child-id pin`);
+    }
+    const childIds = rawIds.map(String);
+    const sortedIds = [...childIds].sort();
+    if (childIds.some((v, i) => v !== sortedIds[i])) {
+      fail(`rework event for ${workItemId}: non-canonical child-id shape`);
+    }
     if (String(md.child_set_digest ?? "") !== childSetDigest(childIds)) {
       fail(`rework event for ${workItemId}: child-set pin mismatch`);
     }
@@ -239,17 +246,43 @@ export function assertCanonicalMissionCompletion(
   if (String(rtMd.reason ?? "") !== "all_tasks_completed") {
     fail(`mission ${mid}: runtime completion reason ${String(rtMd.reason)}`);
   }
-  // (5) every current-plan task terminal-success under the execution
-  //    authority — executor_execution COMPLETED + correlated immutable
-  //    TASK_COMPLETED event. The governed path can never complete a
-  //    mission on an empty plan, so absence of tasks is not success.
+  // (5) every current-plan task terminal-success under the governed
+  //    execution/result-validation authority (R2). The real runtime
+  //    only completes a task after
+  //    GovernedTaskGate.validate_execution_result →
+  //    ArtifactProvenanceValidator writes a PASS execution_validation
+  //    anchored by an immutable RESULT_VALIDATED event. For EACH task
+  //    in the exact current canonical plan revision the proof binds:
+  //      executor_execution → (mission, task, plan revision,
+  //      correlation, COMPLETED execution + COMPLETED result)
+  //      governed_task      → (mission, task, plan id+revision,
+  //      executor, correlation, DISPATCH_AUTHORIZED)
+  //      dispatch identity  → executor_dispatch_intent INTENT_<gt>
+  //      EXECUTION_PERSISTED naming this execution + an
+  //      EXECUTION_DISPATCHED event pinning the governed task + a
+  //      GOVERNED_TASK_VALIDATED event pinning mission/task/executor;
+  //      validation         → a PASS execution_validation bound to
+  //      THIS execution + governed task + mission, anchored by a
+  //      RESULT_VALIDATED event pinning that exact validation_id and
+  //      the execution's correlation_id;
+  //      TASK_COMPLETED     → an immutable event whose correlation_id
+  //      is that validated execution's.
+  //    A handcrafted executor_execution — or a FAIL/missing validation
+  //    — can never establish mission success.
   const revisions = store.planRevisions(mid);
   if (!revisions.length) fail(`mission ${mid}: no plan revisions`);
-  const planId = String(revisions[revisions.length - 1]!.plan_id ?? "");
+  const active = revisions[revisions.length - 1]!;
+  const planId = String(active.plan_id ?? "");
+  const planRevision = Number(active.revision ?? 0);
+  if (String(mission.plan_id ?? "") !== planId ||
+      Number(mission.plan_revision ?? NaN) !== planRevision) {
+    fail(`mission ${mid}: plan pin ${String(mission.plan_id)}/${String(mission.plan_revision)} != active ${planId}/${planRevision}`);
+  }
   const tasks = store.list("task").filter((t) =>
     String(t.mission_id ?? "") === mid && String(t.plan_id ?? "") === planId);
   if (!tasks.length) fail(`mission ${mid}: current plan has no tasks`);
   const executions = store.list("executor_execution");
+  const validations = store.list("execution_validation");
   for (const t of tasks) {
     const tid = String(t.task_id ?? "");
     if (String(t.status ?? "") !== "COMPLETED") {
@@ -258,18 +291,72 @@ export function assertCanonicalMissionCompletion(
     const taskEvidence = store.listEvents("task", tid).filter((e) =>
       String(e.event_type ?? "") === "TASK_COMPLETED" &&
       String(e.new_state ?? "") === "COMPLETED");
-    const proven = taskEvidence.some((e) => {
-      const corr = String(e.correlation_id ?? "");
-      if (!corr) return false;
-      return executions.some((x) =>
-        String(x.mission_id ?? "") === mid &&
-        String(x.task_id ?? "") === tid &&
-        String(x.execution_state ?? "") === "COMPLETED" &&
-        String(x.correlation_id ?? "") === corr &&
-        String((x.result as Record<string, unknown> | undefined)?.status ?? "") === "COMPLETED");
+    const proven = executions.some((x) => {
+      if (String(x.mission_id ?? "") !== mid ||
+          String(x.task_id ?? "") !== tid ||
+          Number(x.plan_revision ?? NaN) !== planRevision ||
+          String(x.execution_state ?? "") !== "COMPLETED" ||
+          String((x.result as Record<string, unknown> | undefined)?.status ?? "") !==
+            "COMPLETED") return false;
+      const corr = String(x.correlation_id ?? "");
+      if (!corr ||
+          !taskEvidence.some((e) => String(e.correlation_id ?? "") === corr)) {
+        return false;
+      }
+      const gtId = String(x.governed_task_id ?? "");
+      const g = store.tryGet("governed_task", gtId) as Row | null;
+      if (!g) return false;
+      if (String(g.mission_id ?? "") !== mid ||
+          String(g.task_id ?? "") !== tid ||
+          String(g.plan_id ?? "") !== planId ||
+          Number(g.plan_revision ?? NaN) !== planRevision ||
+          String(g.executor_id ?? "") !== String(x.executor_id ?? "") ||
+          String(g.correlation_id ?? "") !== corr ||
+          String(g.governance_state ?? "") !== "DISPATCH_AUTHORIZED") {
+        return false;
+      }
+      // Governed dispatch identity — the persisted intent names THIS
+      // execution for THIS governed task.
+      const intent = store.tryGet(
+        "executor_dispatch_intent", `INTENT_${gtId}`) as Row | null;
+      if (!intent ||
+          String(intent.governed_task_id ?? "") !== gtId ||
+          String(intent.executor_id ?? "") !== String(x.executor_id ?? "") ||
+          String(intent.execution_id ?? "") !== String(x.execution_id ?? "") ||
+          String(intent.state ?? "") !== "EXECUTION_PERSISTED") return false;
+      const execEvents = store.listEvents(
+        "executor_execution", String(x.execution_id));
+      if (!execEvents.some((e) =>
+          String(e.event_type ?? "") === "EXECUTION_DISPATCHED" &&
+          String(e.correlation_id ?? "") === corr &&
+          String((e.metadata as Record<string, unknown> | undefined)
+            ?.governed_task_id ?? "") === gtId)) return false;
+      if (!store.listEvents("governed_task", gtId).some((e) => {
+        const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+        return String(e.event_type ?? "") === "GOVERNED_TASK_VALIDATED" &&
+          String(e.correlation_id ?? "") === corr &&
+          String(md.mission_id ?? "") === mid &&
+          String(md.task_id ?? "") === tid &&
+          String(md.executor_id ?? "") === String(x.executor_id ?? "");
+      })) return false;
+      // Result-validation authority — the PASS row must bind to this
+      // exact execution/governed-task/mission, and the immutable
+      // RESULT_VALIDATED event must pin that exact validation_id.
+      const pass = validations.find((v) =>
+        String(v.execution_id ?? "") === String(x.execution_id ?? "") &&
+        String(v.governed_task_id ?? "") === gtId &&
+        String(v.mission_id ?? "") === mid &&
+        String(v.status ?? "") === "PASS");
+      if (!pass) return false;
+      return execEvents.some((e) =>
+        String(e.event_type ?? "") === "RESULT_VALIDATED" &&
+        String(e.new_state ?? "") === "PASS" &&
+        String(e.correlation_id ?? "") === corr &&
+        String((e.metadata as Record<string, unknown> | undefined)
+          ?.validation_id ?? "") === String(pass.validation_id ?? ""));
     });
     if (!proven) {
-      fail(`mission ${mid}: task ${tid} lacks execution-cited completion`);
+      fail(`mission ${mid}: task ${tid} lacks governed validated execution`);
     }
   }
 }

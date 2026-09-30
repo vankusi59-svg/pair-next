@@ -43,10 +43,12 @@ import {
   ReconciliationService,
   RecoveryController,
   WorkforceService,
+  assertCanonicalMissionCompletion,
   childSetDigest,
   completionDigest,
   completionRowId,
   digest,
+  proveCanonicalMissionCompletion,
   utcnow,
 } from "../pair/index.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
@@ -1525,4 +1527,299 @@ describe("P14-P3 R1 — REWORK basis fencing", () => {
     }
     fs2.close();
   }, 90_000);
+});
+
+// =====================================================================
+// P14-P3 R2 — result-validation authority + REWORK event self-consistency
+// =====================================================================
+
+/** Direct test seam: hard-delete an entity row. */
+function deleteRow(dbPath: string, entityType: string, entityId: string) {
+  const db = new Database(dbPath);
+  db.prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+    .run(entityType, entityId);
+  db.close();
+}
+
+/** The single canonical execution of mission mid's task tid. */
+function executionOf(ctx: ReturnType<typeof makeCtxOn>, mid: string, tid: string) {
+  return ctx.store.list("executor_execution").find((x) =>
+    String(x.mission_id) === mid && String(x.task_id) === tid)!;
+}
+
+describe("P14-P3 R2 — result-validation authority", () => {
+  it("P14-P3-R2-MISSING-EXECUTION-VALIDATION-FAILS: execution COMPLETED but no execution_validation PASS → quarantine, no WCP", () => {
+    const { ctx, biz } = makeStack("r2-missing-validation");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    // Strip the result-validation authority: XVLD row + its RESULT_VALIDATED anchor.
+    const exec = ctx.store.list("executor_execution")
+      .find((x) => String(x.mission_id) === mid)!;
+    const eid = String(exec.execution_id);
+    for (const v of ctx.store.list("execution_validation")
+        .filter((v) => String(v.execution_id) === eid)) {
+      deleteRow(path.join(ctx.dir, "pair.db"), "execution_validation", String(v.validation_id));
+    }
+    deleteEvents(path.join(ctx.dir, "pair.db"),
+      "executor_execution", eid, "RESULT_VALIDATED");
+    const after = biz.syncWorkItem(wid);
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(wcpOf(ctx.store, wid)).toBeNull();
+  });
+
+  it("P14-P3-R2-FAILED-EXECUTION-VALIDATION-FAILS: validation status FAIL can never establish mission success", () => {
+    const { ctx, biz } = makeStack("r2-failed-validation");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    const exec = ctx.store.list("executor_execution")
+      .find((x) => String(x.mission_id) === mid)!;
+    const v = ctx.store.list("execution_validation")
+      .find((v) => String(v.execution_id) === String(exec.execution_id))!;
+    ctx.store.put("execution_validation", String(v.validation_id),
+      { ...v, status: "FAIL" }, Number(v.version));
+    const after = biz.syncWorkItem(wid);
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(wcpOf(ctx.store, wid)).toBeNull();
+  });
+
+  it("P14-P3-R2-FOREIGN-VALIDATION-ID-FAILS: RESULT_VALIDATED pinning a foreign validation_id → quarantine", () => {
+    const { ctx, biz } = makeStack("r2-foreign-validation");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    const exec = ctx.store.list("executor_execution")
+      .find((x) => String(x.mission_id) === mid)!;
+    const ev = ctx.store.listEvents("executor_execution", String(exec.execution_id))
+      .find((e) => String(e.event_type) === "RESULT_VALIDATED")!;
+    // Rehash-valid forged event — pins a validation id that is not this
+    // execution's canonical PASS row.
+    tamperEventMetadata(path.join(ctx.dir, "pair.db"), String(ev.event_id),
+      (md) => { md.validation_id = "XVLD_FOREIGN"; });
+    const after = biz.syncWorkItem(wid);
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(wcpOf(ctx.store, wid)).toBeNull();
+  });
+
+  it("P14-P3-R2-FOREIGN-GOVERNED-TASK-FAILS: execution bound to a governed task of a foreign mission → quarantine", () => {
+    const { ctx, biz } = makeStack("r2-foreign-gt");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    const exec = ctx.store.list("executor_execution")
+      .find((x) => String(x.mission_id) === mid)!;
+    const gt = ctx.store.get("governed_task", String(exec.governed_task_id));
+    ctx.store.put("governed_task", String(gt.governed_task_id),
+      { ...gt, mission_id: "MSN_FOREIGN" }, Number(gt.version));
+    const after = biz.syncWorkItem(wid);
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(wcpOf(ctx.store, wid)).toBeNull();
+  });
+
+  it("P14-P3-R2-FORGED-TASK-COMPLETED-EVENT-FAILS: TASK_COMPLETED with a correlation bound to no validated execution → quarantine", () => {
+    const { ctx, biz } = makeStack("r2-forged-task-ev");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    const tid = String(ctx.store.list("task")
+      .find((t) => String(t.mission_id) === mid)!.task_id);
+    deleteEvents(path.join(ctx.dir, "pair.db"), "task", tid, "TASK_COMPLETED");
+    // Forge a well-formed TASK_COMPLETED whose correlation matches no
+    // governed validated execution.
+    ctx.store.event({
+      entity_type: "task", entity_id: tid,
+      event_type: "TASK_COMPLETED", new_state: "COMPLETED",
+      actor: "PAIR_MISSION_RUNTIME", correlation_id: "COR_FORGED",
+    });
+    const after = biz.syncWorkItem(wid);
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code)).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(wcpOf(ctx.store, wid)).toBeNull();
+  });
+
+  it("P14-P3-R2-VALIDATED-GOVERNED-EXECUTION-PROVES-MISSION: full governed chain passes the canonical mission proof", () => {
+    const { ctx, biz } = makeStack("r2-canonical-proven");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    biz.openWorkItem(wid, "op");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    const m = ctx.store.get("mission", mid);
+    // The governed chain itself is the proof — every pin bound to the
+    // exact mission/task/plan/execution/validation identities.
+    expect(proveCanonicalMissionCompletion(ctx.store, m)).toBe(true);
+    expect(() => assertCanonicalMissionCompletion(ctx.store, m)).not.toThrow();
+    const after = biz.syncWorkItem(wid);
+    expect(String(after.status)).toBe("DONE");
+  });
+
+  it("P14-P3-R2-VALIDATED-MISSION-PROVES-WCP: governed validated mission mints the canonical WCP", () => {
+    const { ctx, biz } = makeStack("r2-canonical-wcp");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    const done = completeLeaf(ctx, biz, wid);
+    expect(String(done.status)).toBe("DONE");
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    const wcp = wcpOf(ctx.store, wid)!;
+    expect(String(wcp.mission_id)).toBe(mid);
+    expect(anchorEvents(ctx.store, wid)).toHaveLength(1);
+    expect(biz.proveWorkItemDone(ctx.store.get("work_item", wid))).toBe(true);
+  });
+});
+
+describe("P14-P3 R2 — REWORK event self-consistency + advanced basis", () => {
+  it("P14-P3-R2-REWORK-EVENT-PINS-CANONICAL-CHILD-SET: the immutable REWORK event self-validates (child ids + digests)", () => {
+    const { ctx, biz, wf } = makeStack("r2-rework-selfcontained");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const rev = makeAgent(biz, String(b.business_id), "reviewer");
+    const p = makeItem(biz, String(b.business_id), {
+      assignee_agent_id: a.agent_id, requires_review: true,
+      reviewer_agent_id: String(rev.agent_id),
+    });
+    const pid = String(p.work_item_id);
+    const r = wf.decomposeWorkItem(pid, {
+      decomposition_id: `DEC-R2SC-${counter}`,
+      children: [
+        { title: "c1", goal: "g1", assignee_agent_id: String(a.agent_id) },
+        { title: "c2", goal: "g2", assignee_agent_id: String(a.agent_id) },
+      ],
+    }, "op");
+    const childIds = r.children.map((c) => String(c.work_item_id)).sort();
+    for (const c of childIds) completeLeaf(ctx, biz, c);
+    biz.evaluateParentCompletion(pid, "op");
+    biz.reviewWorkItem(pid, {
+      reviewer_agent_id: String(rev.agent_id), decision: "REWORK" }, "op");
+    // The canonical REWORK event is self-contained AND self-validating:
+    // canonical-sorted child ids, matching set digest, present basis pins.
+    const evs = ctx.store.listEvents("work_item", pid)
+      .filter((e) => String(e.event_type) === "WORK_REWORK_REQUESTED");
+    expect(evs).toHaveLength(1);
+    const md = evs[0]!.metadata as Record<string, unknown>;
+    expect(md.child_work_item_ids).toEqual(childIds);
+    expect(String(md.child_set_digest)).toBe(childSetDigest(childIds));
+    expect(typeof md.rejected_child_basis_digest).toBe("string");
+    expect(typeof md.rejected_basis_digest).toBe("string");
+    // A malformed REWORK event (missing child-id pin) fails closed —
+    // never silently ignored: the canonical basis evaluator throws on
+    // the corrupt pin, and every downstream seam refuses to re-ground
+    // review or completion on it.
+    tamperEventMetadata(path.join(ctx.dir, "pair.db"), String(evs[0]!.event_id),
+      (m) => { delete m.child_work_item_ids; });
+    expect(errCode(() =>
+      (biz as unknown as { completionBasis: (r: unknown) => unknown })
+        .completionBasis(ctx.store.get("work_item", pid))))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    biz.reconcileWorkLifecycle();
+    biz.evaluateParentCompletion(pid, "op");
+    expect(String(ctx.store.get("work_item", pid).status)).toBe("READY");
+    expect(wcpOf(ctx.store, pid)).toBeNull();
+  });
+
+  it("P14-P3-R2-PARENT-REWORK-ADVANCED-CHILD-BASIS-REVIEWABLE: a new canonical child completion unfences the parent — both directions hold", () => {
+    const { ctx, biz, wf, dir } = makeStack("r2-advanced-basis");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const a2 = makeAgent(biz, String(b.business_id), "delegatee");
+    const rev = makeAgent(biz, String(b.business_id), "reviewer");
+    const p = makeItem(biz, String(b.business_id), {
+      assignee_agent_id: a.agent_id, requires_review: true,
+      reviewer_agent_id: String(rev.agent_id),
+    });
+    const pid = String(p.work_item_id);
+    const r = wf.decomposeWorkItem(pid, {
+      decomposition_id: `DEC-ADV-${counter}`,
+      children: [
+        { title: "c1", goal: "g1", assignee_agent_id: String(a.agent_id) },
+        { title: "c2", goal: "g2", assignee_agent_id: String(a.agent_id) },
+      ],
+    }, "op");
+    const c1 = String(r.children[0].work_item_id);
+    const c2 = String(r.children[1].work_item_id);
+    completeLeaf(ctx, biz, c1);
+    completeLeaf(ctx, biz, c2);
+    biz.evaluateParentCompletion(pid, "op");
+    expect(String(ctx.store.get("work_item", pid).status)).toBe("REVIEW_REQUIRED");
+    biz.reviewWorkItem(pid, {
+      reviewer_agent_id: String(rev.agent_id), decision: "REWORK" }, "op");
+    const reworkEvents = () => ctx.store.listEvents("work_item", pid)
+      .filter((e) => String(e.event_type) === "WORK_REWORK_REQUESTED");
+    expect(reworkEvents()).toHaveLength(1);
+    const rejectedBasis = String(
+      (reworkEvents()[0]!.metadata as Record<string, unknown>).rejected_basis_digest);
+    // Same unchanged child basis stays fenced.
+    biz.evaluateParentCompletion(pid, "op");
+    biz.syncWorkItem(pid);
+    expect(String(ctx.store.get("work_item", pid).status)).toBe("READY");
+    expect(wcpOf(ctx.store, pid)).toBeNull();
+    // A NEW canonical child (delegation — the supported additive edge,
+    // no graph revision) completes under its own fresh authority: the
+    // child basis digest advances past the rejected basis.
+    const c3 = wf.delegateWorkItem({
+      work_item_id: pid,
+      delegated_to_agent_id: String(a2.agent_id),
+      delegation_key: `DL-ADV-${counter}`,
+      reason: "rework-followup",
+    }, "op");
+    const c3id = String(c3.work_item_id);
+    const c3folded = completeLeaf(ctx, biz, c3id);
+    // A delegated child inherits the parent's review policy — it is
+    // legitimately complete only after the canonical review seam.
+    expect(String(c3folded.status)).toBe("REVIEW_REQUIRED");
+    biz.reviewWorkItem(c3id, {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT" }, "op");
+    expect(String(ctx.store.get("work_item", c3id).status)).toBe("DONE");
+    expect(wcpOf(ctx.store, c3id)).not.toBeNull();
+    biz.evaluateParentCompletion(pid, "op");
+    const advanced = ctx.store.get("work_item", pid);
+    expect(String(advanced.status)).toBe("REVIEW_REQUIRED");
+    // Reaching REVIEW_REQUIRED is itself the proof the live basis
+    // digest differs from the pinned rejected basis — basis.rejected
+    // would have fenced every evaluation above.
+    expect(rejectedBasis).not.toBe("");
+    // Restart preserves the unfence semantics — no dup evidence.
+    const re = reopenStack(dir);
+    re.biz.reconcileWorkLifecycle();
+    const afterRestart = re.ctx.store.get("work_item", pid);
+    expect(String(afterRestart.status)).toBe("REVIEW_REQUIRED");
+    for (const cid of [c1, c2, c3id]) {
+      expect(anchorEvents(re.ctx.store, cid)).toHaveLength(1);
+    }
+    expect(reworkEvents()).toHaveLength(1);
+    // And the advanced basis accepts review canonically — exactly once.
+    re.biz.reviewWorkItem(pid, {
+      reviewer_agent_id: String(rev.agent_id), decision: "ACCEPT" }, "op");
+    expect(String(re.ctx.store.get("work_item", pid).status)).toBe("DONE");
+    expect(anchorEvents(re.ctx.store, pid)).toHaveLength(1);
+    expect(acceptEvents(re.ctx.store, pid)).toHaveLength(1);
+  });
 });

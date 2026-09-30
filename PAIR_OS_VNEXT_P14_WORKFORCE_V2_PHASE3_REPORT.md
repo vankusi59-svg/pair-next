@@ -345,4 +345,53 @@ governed evidence chain through canonical writers; every happy-path
 completion in P3/P14F/P9/P11 uses it — raw `status` writes remain only
 inside deliberate forgery tests.
 
-Classification: **P14_WORKFORCE_V2_PHASE3_R1_PENDING_FINAL_AUDIT**
+## 21. R2 remediation design
+
+**Result-validation authority (Blocker 1).** `assertCanonicalMissionCompletion`
+step (5) now proves, per current-plan task, the full governed chain —
+candidate `executor_execution`s must satisfy ALL of: `mission_id === mid`,
+`task_id === tid`, `plan_revision === currentRevision`,
+`execution_state === "COMPLETED"`, `result.status === "COMPLETED"`, and a
+`TASK_COMPLETED` event pinning that execution's `correlation_id`. For each
+candidate the `governed_task` (GT_<...>) row is loaded and bound to
+`mission_id + task_id + plan_id + plan_revision + executor_id +
+correlation_id` with `governance_state === "DISPATCH_AUTHORIZED"`; the
+`executor_dispatch_intent` `INTENT_<gt>` must pin
+`state === "EXECUTION_PERSISTED" && execution_id === x.execution_id`; the
+`EXECUTION_DISPATCHED` event must pin `metadata.governed_task_id` and the
+`GOVERNED_TASK_VALIDATED` event must pin `mission_id/task_id/executor_id`
+under the same correlation. A canonical `execution_validation` row must
+exist bound to that exact execution (`execution_id`, `governed_task_id`,
+`mission_id`, `status === "PASS"`), and a `RESULT_VALIDATED` event must pin
+`new_state === "PASS"`, the same `correlation_id`, and
+`metadata.validation_id === pass.validation_id`. FAIL-only or missing
+validation can never establish mission success. The helper now emits the
+identical persisted shape (`governed_task`, dispatch intent, dispatch +
+validation events) and calls the REAL `ArtifactProvenanceValidator`
+writer — no second validation system, no unvalidated handcrafted
+executions count as canonical.
+
+**REWORK event self-consistency (Blocker 2).** `WORK_REWORK_REQUESTED`
+metadata now persists `child_work_item_ids` = the canonical sorted child
+set at decision time (previously the event pinned only digests — the
+validator itself could never re-derive the set, so `completionBasisSafe`
+swallowed it: the fence "worked" while the REWORK provenance was
+permanently unusable). `rejectedCompletionBases` now requires the pinned
+id array to be in canonical sorted shape, `child_set_digest` to match
+those exact ids, `rejected_child_basis_digest` present, and
+`rejected_basis_digest` to recompute exactly — any malformed REWORK event
+fails closed, never silently ignored.
+
+**Advanced-basis unfencing.** DONE is terminal (`WORK_ITEM_TRANSITIONS`
+`.DONE: []`), so a DONE child can never re-attempt: a container parent's
+basis advances only through a NEW canonical child
+(`delegateWorkItem` — dedup-safe via fresh `delegation_key`) whose own
+WCP mints a new `childBasisDigest` ≠ `rejected_child_basis_digest`.
+`P14-P3-R2-PARENT-REWORK-ADVANCED-CHILD-BASIS-REVIEWABLE` drives exactly
+this: REWORK → READY → unchanged children stay fenced → delegated child
+completes under new completion authority → parent re-enters
+REVIEW_REQUIRED → restart preserves → ACCEPT → DONE with exactly-one
+WCP/anchor. Both directions now pass: same basis fenced, advanced basis
+unfenced.
+
+Classification: **P14_WORKFORCE_V2_PHASE3_R2_PENDING_FINAL_AUDIT**

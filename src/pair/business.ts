@@ -2867,6 +2867,7 @@ export class BusinessLayer {
             decision,
             mission_id: mission ? String(mission.mission_id) : null,
             bound_open_id: mission ? String(mission.bound_open_id ?? "") || null : null,
+            child_work_item_ids: curBasis.childIds,
             child_set_digest: childSetDigest(curBasis.childIds),
             completion_digest: completionDigestPinned,
             // REWORK fences exactly this basis: the item may re-enter

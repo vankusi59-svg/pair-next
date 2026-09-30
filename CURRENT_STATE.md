@@ -436,13 +436,31 @@ authority derives only from canonical evidence.
   (`completionBasisDigest` = bound mission + bound_open + per-child WCP
   digest set); the basis must advance before REVIEW_REQUIRED can
   re-enter — unchanged children can never re-ground review.
+- **R2 remediation** (after second independent audit BLOCKED):
+  mission success now proves the governed result-validation chain per
+  task — `executor_execution` (mission+task+plan revision+correlation,
+  COMPLETED result) bound to a `governed_task`
+  (`DISPATCH_AUTHORIZED`, binds mission/task/plan/executor/correlation),
+  `executor_dispatch_intent` EXECUTION_PERSISTED→that execution,
+  `EXECUTION_DISPATCHED` + `GOVERNED_TASK_VALIDATED` events, a canonical
+  `execution_validation` `status: PASS` on that exact execution, and a
+  `RESULT_VALIDATED` event pinning `validation_id` + correlation.
+  Missing/FAIL validation or a foreign governed task fails closed.
+  `WORK_REWORK_REQUESTED` now persists the canonical sorted
+  `child_work_item_ids` — the event self-validates (sorted shape +
+  digest recompute); malformed REWORK evidence fails closed, never
+  silently swallowed. New canonical children legitimately advance a
+  container's basis past a rejected pin (DONE is terminal —
+  `delegateWorkItem` under a new completion authority unfences
+  REVIEW_REQUIRED; same-basis stays fenced).
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE3_REPORT.md`; suite
-  `pair-p14-wfv2-p3.test.ts` (42 — 27 base names + 14 `P14-P3-R1-*`
-  incl. genuine worker_thread races) + fresh-dir E2E 30/30 (real
-  server, forge/quarantine, reviewer-pause race, REWORK fence,
-  3 restarts, zero dup anchors).
+  `pair-p14-wfv2-p3.test.ts` (51 — 27 base + 14 `P14-P3-R1-*` +
+  9 `P14-P3-R2-*` + self-consistency; genuine worker_thread races)
+  + fresh-dir E2E 35/35 (real server, forge/quarantine, missing+FAIL
+  validation quarantine, reviewer-pause race, REWORK fence +
+  advanced-basis unfence, 3 restarts, zero dup anchors).
   Classification:
-  **`P14_WORKFORCE_V2_PHASE3_R1_PENDING_FINAL_AUDIT`**.
+  **`P14_WORKFORCE_V2_PHASE3_R2_PENDING_FINAL_AUDIT`**.
 
 ## Not yet
 
