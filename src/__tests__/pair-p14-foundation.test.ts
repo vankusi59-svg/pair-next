@@ -37,6 +37,7 @@ import {
   newId,
   utcnow,
 } from "../pair/index.js";
+import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p14f-"));
 let counter = 0;
@@ -439,9 +440,7 @@ describe("P14 FOUNDATION V2 — canonical binding authority", () => {
     const md = bound!.metadata as Record<string, unknown>;
     expect(md.agent_contract).toBeTruthy();
     expect(md.secret_grants).toBeTruthy();
-    const mRow = ctx.store.get("mission", String(bound!.mission_id));
-    mRow.status = "COMPLETED";
-    ctx.store.put("mission", String(bound!.mission_id), mRow, Number(mRow.version));
+    canonicallyCompleteMission(ctx.store, ctx.service, String(bound!.mission_id));
     const done = biz.syncWorkItem(String(w1.work_item_id));
     expect(String(done.status)).toBe("DONE");
     expect(biz.proveWorkItemDone(ctx.store.get("work_item", String(w1.work_item_id)))).toBe(true);
@@ -452,9 +451,7 @@ describe("P14 FOUNDATION V2 — canonical binding authority", () => {
     });
     biz.openWorkItem(String(w2.work_item_id), "op");
     const m2 = String((ctx.store.get("work_item", String(w2.work_item_id)).mission_ids as string[])[0]);
-    const m2Row = ctx.store.get("mission", m2);
-    m2Row.status = "COMPLETED";
-    ctx.store.put("mission", m2, m2Row, Number(m2Row.version));
+    canonicallyCompleteMission(ctx.store, ctx.service, m2);
     const rv = biz.syncWorkItem(String(w2.work_item_id));
     expect(String(rv.status)).toBe("REVIEW_REQUIRED");
     const accepted = biz.reviewWorkItem(String(w2.work_item_id), {
@@ -1025,9 +1022,7 @@ describe("P14 FOUNDATION V2 R3 — admission vs provenance", () => {
     const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
     const opened = biz.openWorkItem(String(w.work_item_id), "op");
     const mid = String((opened.mission_ids as string[])[0]);
-    const mRow = ctx.store.get("mission", mid);
-    mRow.status = "COMPLETED";
-    ctx.store.put("mission", mid, mRow, Number(mRow.version));
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
     biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
     const synced = biz.syncWorkItem(String(w.work_item_id));
     expect(String(synced.status)).toBe("DONE");
@@ -1094,9 +1089,7 @@ describe("P14 FOUNDATION V2 R3 — admission vs provenance", () => {
     const w = makeWorkItem(biz, String(b.business_id), { assignee_agent_id: String(lead.agent_id) });
     const opened = biz.openWorkItem(String(w.work_item_id), "op");
     const mid = String((opened.mission_ids as string[])[0]);
-    const mRow = ctx.store.get("mission", mid);
-    mRow.status = "COMPLETED";
-    ctx.store.put("mission", mid, mRow, Number(mRow.version));
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
     const synced = biz.syncWorkItem(String(w.work_item_id));
     expect(String(synced.status)).toBe("DONE");
     const binding = ctx.store.list("work_open_binding")[0];

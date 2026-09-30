@@ -743,13 +743,17 @@ export function createMissionControlServer(
         return void json(res, 200, biz.ackWorkforceMessage(
           m[1], String(body.agent_id ?? ""), String(operator)));
       }
-      m = p.match(/^\/api\/work-items\/([^/]+)\/(open|assign|cancel)$/);
+      m = p.match(/^\/api\/work-items\/([^/]+)\/(open|assign|cancel|review)$/);
       if (method === "POST" && m) {
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
         const [, wid, wact] = m;
         const out =
           wact === "open" ? biz.openWorkItem(wid, String(operator))
           : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), String(operator))
+          : wact === "review" ? biz.reviewWorkItem(wid, {
+              reviewer_agent_id: String(body.reviewer_agent_id ?? ""),
+              decision: String(body.decision ?? ""),
+            }, String(operator))
           : biz.cancelWorkItem(wid, String(operator)); // governed cancel: live mission cancelled first, then CANCELLED
         return void json(res, 200, out);
       }
@@ -783,6 +787,17 @@ export function createMissionControlServer(
           typeof body.expected_version === "number" ? body.expected_version : -1,
           String(operator),
         ));
+      }
+      m = p.match(/^\/api\/work-items\/([^/]+)\/completion$/);
+      if (method === "GET" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const v = biz.workCompletionFor(m[1]);
+        return void json(res, 200, {
+          work_item_id: m[1],
+          status: String(v.work_item.status),
+          canonically_complete: v.canonically_complete,
+          completion: v.completion,
+        });
       }
       m = p.match(/^\/api\/businesses\/([^/]+)\/work-graph$/);
       if (method === "GET" && m) {
