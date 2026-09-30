@@ -221,7 +221,42 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - Evidence: `PAIR_OS_VNEXT_P14_FOUNDATION_V2_REPORT.md`; suite
   `pair-p14-foundation.test.ts` (FOUND-V2-* ×10 + FOUND-R1-* ×10 +
   FOUND-R2-* ×8 + FOUND-R3-* ×7).
-  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R3_FINAL_PENDING_AUDIT`**.
+  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R3_FINAL_PENDING_AUDIT`**
+  — MERGED into `main` (`fff2ee4`).
+
+### PRE-P14-WORKFORCE RUNTIME HARDENING (branch, pending audit)
+
+Two inherited runtime defects fixed on
+`devin/1790726448-pre-p14-runtime-hardening` from canonical base
+`fff2ee4852231cbabed9c084fae61f8497f2acf8` — **no Workforce V2, no
+P15/P16**:
+
+- **A — `FAIL_CLOSED_MODEL_REMOVED` boot crash-loop closed**: the
+  serve-script route loop skips catalog entries whose `conditions`
+  include `REMOVED` *before* `probeModel` (which correctly fail-closes on
+  them for direct callers). REMOVED = NOT ROUTABLE (the
+  `MODEL_NOT_REMOVED` qualify gate still applies); boot continues; no
+  error is caught or swallowed — unrelated `IntegrityError`/`PolicyError`
+  still propagate fail-closed.
+- **B — orphan mission recovery (R1: CREATED-only reconstruction)**:
+  `MissionSupervisor.resume()` scans the canonical `mission` list.
+  **`mission.status === CREATED` + missing `mission_runtime` is the only
+  automatically reconstructable state** — the sole status provably inside
+  the original crash window; `runtimeEntity` (idempotent, version-0 CAS)
+  rebuilds it and the mission continues via the standard
+  RESTART_REHYDRATE wake + supervisor tick path. **READY/RUNNING/PAUSED +
+  missing runtime is ambiguous and fails closed**: `restart_blocker`
+  (`FAIL_CLOSED_RUNTIME_AMBIGUOUS` + observed status) stamped on the
+  canonical `mission_recovery_checkpoint` + `MISSION_RUNTIME_AMBIGUOUS`
+  event — no runtime row, no wake, no auto-run, no replay of uncertain
+  in-flight execution; PAUSED authority stays in effect and operator
+  recovery goes through existing governed controls. Unknown/malformed
+  mission status fails closed identically (`UNKNOWN:<status>`). Terminal
+  missions never resurrect; existing runtimes never duplicated. No second
+  scheduler/router/dispatcher/recovery engine.
+- Evidence: `PAIR_OS_VNEXT_PRE_P14_WORKFORCE_RUNTIME_HARDENING_REPORT.md`;
+  suite `pair-runtime-hardening.test.ts` (RH-R1-* ×11).
+  Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`**.
 
 ## Not yet
 
