@@ -2,7 +2,7 @@
 
 **Classification at push:** `P14_WORKFORCE_V2_PHASE1_REMEDIATED_R2_PENDING_AUDIT`
 **Base (canonical main):** `ef1fb11b214d7917b6d827efb223ddc22ae19511`
-**Head (R2):** `<set at commit>` (R1: `ce1c9ea94518face627e7370f54e7bedfacb3083`; Phase 1 original: `cf871040120e54721a6d1ab6586492a3bc3fa9d1`)
+**Head (R2):** `5aeaeb50fb529ca35cc1060bc411cc41b6f3845c` (R1: `ce1c9ea94518face627e7370f54e7bedfacb3083`; Phase 1 original: `cf871040120e54721a6d1ab6586492a3bc3fa9d1`)
 **Branch:** `devin/1790731419-p14-workforce-v2-p1`
 **Scope:** governed work graph + parent→child decomposition + dependency DAG + delegation core + child missions through the merged Foundation V2 path. Phase 1 only — no heartbeat, inbox, autonomous reassignment, scheduling, parent completion cascade, CEO loop, P15/P16.
 
@@ -402,7 +402,7 @@ effective child ceiling = persisted snapshot (WDEL ceiling / WDEC proposal ceili
 
 ### 16.11 Fresh-server E2E (§10)
 
-Head `<set at commit>`; `PAIR_MC_DIR=/home/ubuntu/pair-mc-r2`; killed all prior PAIR processes, rebuilt, fresh server:
+Head `5aeaeb50fb529ca35cc1060bc411cc41b6f3845c`; `PAIR_MC_DIR=/home/ubuntu/pair-mc-r2`; killed all prior PAIR processes, rebuilt, fresh server:
 
 1. decompose → children + manifests: `WDS_<c2>` lists the sibling edge, `WDS_<c1>` canonical **empty**;
 2. `PUT .../dependencies` on WDEC child → **409 `FAIL_CLOSED_WORK_DECOMPOSITION_TOPOLOGY_IMMUTABLE`**;
