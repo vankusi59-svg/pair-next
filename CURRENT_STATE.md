@@ -221,7 +221,33 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
 - Evidence: `PAIR_OS_VNEXT_P14_FOUNDATION_V2_REPORT.md`; suite
   `pair-p14-foundation.test.ts` (FOUND-V2-* ×10 + FOUND-R1-* ×10 +
   FOUND-R2-* ×8 + FOUND-R3-* ×7).
-  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R3_FINAL_PENDING_AUDIT`**.
+  Classification: **`P14_FOUNDATION_V2_REMEDIATED_R3_FINAL_PENDING_AUDIT`**
+  — MERGED into `main` (`fff2ee4`).
+
+### PRE-P14-WORKFORCE RUNTIME HARDENING (branch, pending audit)
+
+Two inherited runtime defects fixed on
+`devin/1790726448-pre-p14-runtime-hardening` from canonical base
+`fff2ee4852231cbabed9c084fae61f8497f2acf8` — **no Workforce V2, no
+P15/P16**:
+
+- **A — `FAIL_CLOSED_MODEL_REMOVED` boot crash-loop closed**: the
+  serve-script route loop skips catalog entries whose `conditions`
+  include `REMOVED` *before* `probeModel` (which correctly fail-closes on
+  them for direct callers). REMOVED = NOT ROUTABLE (the
+  `MODEL_NOT_REMOVED` qualify gate still applies); boot continues; no
+  error is caught or swallowed — unrelated `IntegrityError`/`PolicyError`
+  still propagate fail-closed.
+- **B — orphan non-terminal mission recovery**: `MissionSupervisor.resume()`
+  scans the canonical `mission` list and reconstructs `mission_runtime`
+  via the existing `MissionRuntime.runtimeEntity` (idempotent, version-0
+  CAS) for any non-terminal mission missing one; terminal missions are
+  never resurrected and existing runtimes never duplicated. Reconstructed
+  missions continue through the standard RESTART_REHYDRATE wake +
+  supervisor tick path — no second scheduler/router/dispatcher.
+- Evidence: `PAIR_OS_VNEXT_PRE_P14_WORKFORCE_RUNTIME_HARDENING_REPORT.md`;
+  suite `pair-runtime-hardening.test.ts` (RUNTIME-HARDENING-* ×7).
+  Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_PENDING_AUDIT`**.
 
 ## Not yet
 

@@ -46,6 +46,10 @@ const NON_TERMINAL = new Set([
   "RECOVERING",
 ]);
 
+/** Mission statuses beyond any further runtime activity — a terminal
+ *  mission must never gain a runtime row during recovery. */
+const TERMINAL_MISSION = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+
 export class MissionSupervisor {
   private running = false;
 
@@ -92,10 +96,26 @@ export class MissionSupervisor {
    * (reconcile unsettled executions, rebuild budgets) and wake each one.
    * Idempotent — safe to call on every boot.
    */
-  resume(): { missions: string[]; checkpoints: number } {
+  resume(): { missions: string[]; checkpoints: number; reconstructed: number } {
     const checkpoints = this.recovery.planRestartRecovery((executionId) =>
       this.reconciliation.reconcile({ execution_id: executionId }),
     );
+    // Orphaned-mission rehydration (runtime-hardening B): a mission row
+    // can persist before its mission_runtime row — a crash in that
+    // window leaves a live mission invisible to every runtime-scoped
+    // sweep. Scan the canonical mission list; any non-terminal mission
+    // missing a runtime gets the canonical `runtimeEntity`
+    // reconstruction (idempotent — an existing runtime is never
+    // replaced or duplicated). The standard runtime/supervisor path
+    // then picks it up; nothing dispatches directly.
+    let reconstructed = 0;
+    for (const m of this.store.list("mission")) {
+      if (TERMINAL_MISSION.has(String(m.status))) continue;
+      const runtimeId = `MRT_${String(m.mission_id)}`;
+      if (this.store.tryGet("mission_runtime", runtimeId)) continue;
+      this.runtime.runtimeEntity(String(m.mission_id));
+      reconstructed++;
+    }
     const missions = this.store
       .list("mission_runtime")
       .filter((rt) => NON_TERMINAL.has(String(rt.state)))
@@ -104,7 +124,7 @@ export class MissionSupervisor {
       this.wake(missionId, "RESTART_REHYDRATE", { checkpoint: `MRCP_${missionId}` });
     }
     this.running = true;
-    return { missions, checkpoints: checkpoints.length };
+    return { missions, checkpoints: checkpoints.length, reconstructed };
   }
 
   start(): void {

@@ -414,6 +414,14 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
       const pq = validator.qualify(pid, { actor: "PAIR_MC" });
       if (!pq.qualified) { console.log("MODEL_ROUTE:", route, "provider NOT qualified", JSON.stringify(pq.gates)); continue; }
       pc.setLifecycle(pid, "QUALIFIED");
+      // REMOVED catalog entries are simply NOT ROUTABLE — skip them
+      // before the probe path (probeModel fail-closes on REMOVED, which
+      // would crash boot). qualifyModel's MODEL_NOT_REMOVED gate keeps
+      // them unqualified everywhere else too.
+      if ((me.conditions ?? []).includes("REMOVED")) {
+        console.log("MODEL_ROUTE:", route, "model REMOVED — skipped");
+        continue;
+      }
       // Model-level: tier-1 liveness probe proves text_inference, then
       // qualifyModel gates on probe receipts.
       const prb = await probeModel(store, String(me.model_entry_id), 1, {
