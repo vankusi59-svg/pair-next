@@ -15,6 +15,7 @@ import { IntegrityError, PolicyError } from "./errors.js";
 import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
 import type { BusinessLayer } from "./business.js";
+import type { WorkforceService } from "./work-graph.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -54,6 +55,10 @@ export interface MissionControlServerDeps {
   /** Optional business layer: companies → org agents → work items →
    *  routines → budgets, all dispatching through startMission. */
   business?: BusinessLayer;
+  /** Optional workforce graph: decompose/delegate/dependency edges on
+   *  work items (P14 Workforce V2 Phase 1). Coordinates only — never
+   *  dispatches. */
+  workforce?: WorkforceService;
 }
 
 const MIME: Record<string, string> = {
@@ -692,6 +697,42 @@ export function createMissionControlServer(
           : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), String(operator))
           : biz.cancelWorkItem(wid, String(operator)); // governed cancel: live mission cancelled first, then CANCELLED
         return void json(res, 200, out);
+      }
+      // ----- P14 Workforce V2 Phase 1: governed work graph -----
+      const wf = deps.workforce;
+      m = p.match(/^\/api\/work-items\/([^/]+)\/decompose$/);
+      if (method === "POST" && m) {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, wf.decomposeWorkItem(m[1], {
+          decomposition_id: String(body.decomposition_id ?? ""),
+          children: Array.isArray(body.children) ? body.children : [],
+        }, String(operator)));
+      }
+      m = p.match(/^\/api\/work-items\/([^/]+)\/delegate$/);
+      if (method === "POST" && m) {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, wf.delegateWorkItem({
+          work_item_id: m[1],
+          delegated_by_agent_id: String(body.delegated_by_agent_id ?? ""),
+          delegated_to_agent_id: String(body.delegated_to_agent_id ?? ""),
+          reason: body.reason === undefined ? undefined : String(body.reason),
+          delegation_key: body.delegation_key === undefined ? undefined : String(body.delegation_key),
+        }, String(operator)));
+      }
+      m = p.match(/^\/api\/work-items\/([^/]+)\/dependencies$/);
+      if (method === "PUT" && m) {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, wf.setWorkItemDependencies(
+          m[1],
+          Array.isArray(body.depends_on) ? body.depends_on.map(String) : [],
+          typeof body.expected_version === "number" ? body.expected_version : -1,
+          String(operator),
+        ));
+      }
+      m = p.match(/^\/api\/businesses\/([^/]+)\/work-graph$/);
+      if (method === "GET" && m) {
+        if (!wf) return void json(res, 404, { error: "WORKFORCE_DISABLED" });
+        return void json(res, 200, wf.workGraph(m[1]));
       }
       if (method === "GET" && p === "/api/routines") {
         const bid = url.searchParams.get("business_id") ?? undefined;

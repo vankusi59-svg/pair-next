@@ -56,3 +56,4 @@ export * from "./devin-executor.js";
 export * from "./llm-planner.js";
 export * from "./selfmod-bootstrap.js";
 export * from "./promotion-service.js";
+export * from "./work-graph.js";

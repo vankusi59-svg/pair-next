@@ -89,6 +89,8 @@ const OPEN_RECONCILE_GRACE_MS = Number(process.env.PAIR_OPEN_RECONCILE_GRACE_MS 
  *  crash gap between reserve and mission create. */
 const RESERVATION_TTL_MS = Number(process.env.PAIR_BUDGET_RESERVATION_MS ?? 10 * 60 * 1000);
 const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+/** Terminal work-item statuses — no transition out exists. */
+export const TERMINAL_WORK_ITEM_STATUSES: ReadonlySet<string> = new Set(["DONE", "CANCELLED"]);
 /** Context notes kept per org_agent; newest kept, oldest trimmed. */
 const AGENT_CONTEXT_CAP = 30;
 /** How many agent context notes are injected into a new mission goal. */
@@ -211,6 +213,9 @@ export class BusinessLayer {
     role?: string;
     reports_to?: string;
     executor_binding?: string;
+    /** Declared capabilities this agent can take (work-graph admission
+     *  narrows against them and the agent's execution contract). */
+    capabilities?: string[];
     operator_id: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "org_agent.create");
@@ -233,6 +238,7 @@ export class BusinessLayer {
       role: input.role ?? "",
       reports_to: input.reports_to ?? null,
       executor_binding: input.executor_binding ?? null,
+      capabilities: input.capabilities ?? [],
       status: "ACTIVE" as OrgAgentStatus,
       context_notes: [] as Array<Record<string, unknown>>,
       created_at: utcnow(),
@@ -339,6 +345,20 @@ export class BusinessLayer {
     requires_review?: boolean;
     reviewer_agent_id?: string;
     operator_id: string;
+    /* Internal work-graph fields (P14 Workforce V2 Phase 1): written only
+     * by the WorkforceService graph seams (decompose/delegate) — never
+     * accepted from the public work-item API handler. A row carrying
+     * graph fields is authoritative ONLY when backed by the canonical
+     * work_delegation / work_decomposition row (assertGraphAuthority). */
+    work_item_id?: string;
+    parent_work_item_id?: string;
+    required_capability?: string;
+    delegated_from_work_item_id?: string;
+    delegated_by_agent_id?: string;
+    delegation_reason?: string;
+    delegation_depth?: number;
+    delegation_key?: string;
+    decomposition_id?: string;
   }): Row {
     if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.create");
     if (!String(input.title ?? "").trim() || !String(input.goal ?? "").trim()) {
@@ -371,7 +391,7 @@ export class BusinessLayer {
         throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `objective outside business ${input.business_id}`);
       }
     }
-    const id = newId("WI");
+    const id = input.work_item_id ?? newId("WI");
     const row = {
       work_item_id: id,
       business_id: input.business_id,
@@ -383,6 +403,15 @@ export class BusinessLayer {
       routine_id: null as string | null,
       priority: input.priority ?? 50,
       source: input.source ?? "manual",
+      required_capability: input.required_capability ?? null,
+      parent_work_item_id: input.parent_work_item_id ?? null,
+      decomposed_as: null,
+      delegated_from_work_item_id: input.delegated_from_work_item_id ?? null,
+      delegated_by_agent_id: input.delegated_by_agent_id ?? null,
+      delegation_reason: input.delegation_reason ?? null,
+      delegation_depth: input.delegation_depth ?? 0,
+      delegation_key: input.delegation_key ?? null,
+      decomposition_id: input.decomposition_id ?? null,
       requires_review: input.requires_review === true,
       reviewer_agent_id: input.reviewer_agent_id ?? null,
       blocked_code: null as string | null,
@@ -507,6 +536,127 @@ export class BusinessLayer {
     }
   }
 
+  // ---------- work graph authority (P14 Workforce V2 Phase 1) ----------
+  //
+  // Graph relationships are canonical durable rows: `work_graph_edge`
+  // (dependency), `work_delegation` (delegation provenance) and
+  // `work_decomposition` (committed child set) entities written only by
+  // the WorkforceService seams inside a single immediate() transaction.
+  // Graph fields mirrored on a work_item row are observability — they
+  // prove nothing without the matching canonical row. A row asserting
+  // graph membership without that backing is forged → quarantined.
+
+  /** Canonical ACTIVE `work_graph_edge` rows pointing at this node's
+   *  prerequisites (dependent_work_item_id === this row). Revoked edges
+   *  never gate. */
+  dependencyEdgesOf(workItemId: string): Row[] {
+    return this.store.list("work_graph_edge").filter((e) =>
+      String(e.dependent_work_item_id) === String(workItemId) &&
+      String(e.state ?? "ACTIVE") === "ACTIVE");
+  }
+
+  /** Does the row carry work-graph provenance fields at all? */
+  hasGraphFields(row: Row): boolean {
+    return Boolean(
+      row.parent_work_item_id || row.delegated_from_work_item_id ||
+      row.delegated_by_agent_id || row.delegation_key ||
+      row.decomposition_id || row.decomposed_as ||
+      Number(row.delegation_depth ?? 0) > 0,
+    );
+  }
+
+  /**
+   * Graph-field authority check: every graph membership claimed on the
+   * row must be backed by its canonical row.
+   *  - delegated_from_work_item_id ⇒ `work_delegation` WDEL_<child> with
+   *    matching parent / from / to / key / business;
+   *  - decomposition_id ⇒ `work_decomposition` WDEC_<parent> listing this
+   *    row under the same decomposition_id / business;
+   *  - a bare parent_work_item_id with neither → forged.
+   * Violations quarantine the row and fail closed — a forged row never
+   * executes.
+   */
+  assertGraphAuthority(row: Row): void {
+    const id = String(row.work_item_id);
+    if (row.delegated_from_work_item_id || row.delegated_by_agent_id || row.delegation_key) {
+      const del = this.store.tryGet("work_delegation", `WDEL_${id}`) as Row | null;
+      const ok = del !== null &&
+        String(del.parent_work_item_id) === String(row.delegated_from_work_item_id ?? "") &&
+        String(del.delegated_to_agent_id) === String(row.assignee_agent_id ?? "") &&
+        String(del.delegated_from_agent_id) === String(row.delegated_by_agent_id ?? "") &&
+        String(del.delegation_key) === String(row.delegation_key ?? "") &&
+        String(del.business_id) === String(row.business_id) &&
+        String(del.state) === "COMMITTED";
+      if (!ok) {
+        this.quarantineWorkItem(row, "delegation fields lack matching canonical work_delegation row");
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `forged delegation provenance on ${id}`,
+        );
+      }
+    }
+    if (row.decomposed_as) {
+      // Decomposed PARENT marker: the committed WDEC_<self> row must
+      // exist with matching id/business — the marker alone proves nothing.
+      const dec = this.store.tryGet("work_decomposition", `WDEC_${id}`) as Row | null;
+      const ok = dec !== null &&
+        String(dec.decomposition_id) === String(row.decomposed_as) &&
+        String(dec.business_id) === String(row.business_id) &&
+        String(dec.state) === "COMMITTED";
+      if (!ok) {
+        this.quarantineWorkItem(row, "decomposed marker lacks canonical work_decomposition row");
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `forged decomposed marker on ${id}`,
+        );
+      }
+    } else if (row.decomposition_id) {
+      // Decomposed CHILD: the parent's committed WDEC row must list it.
+      const dec = this.store.tryGet(
+        "work_decomposition", `WDEC_${String(row.parent_work_item_id ?? "")}`) as Row | null;
+      const ok = dec !== null &&
+        String(dec.decomposition_id) === String(row.decomposition_id) &&
+        String(dec.business_id) === String(row.business_id) &&
+        String(dec.state) === "COMMITTED" &&
+        ((dec.child_work_item_ids as string[] | undefined) ?? []).includes(id);
+      if (!ok) {
+        this.quarantineWorkItem(row, "decomposition_id lacks matching canonical work_decomposition row");
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+          `forged decomposition provenance on ${id}`,
+        );
+      }
+    } else if (row.parent_work_item_id && !row.delegated_from_work_item_id) {
+      this.quarantineWorkItem(row, "parent_work_item_id without delegation/decomposition evidence");
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
+        `bare parent_work_item_id on ${id}`,
+      );
+    }
+  }
+
+  /**
+   * Dependency gate (WFV2 §7): every canonical `work_graph_edge`
+   * prerequisite of this row must be proven DONE — bound mission
+   * COMPLETED (+ review acceptance when required), never status alone.
+   * A forged DONE (status flipped without mission evidence) or a
+   * quarantined dependency fails closed.
+   */
+  assertDependenciesSatisfied(row: Row): void {
+    for (const e of this.dependencyEdgesOf(String(row.work_item_id))) {
+      const dep = this.store.tryGet("work_item", String(e.dependency_work_item_id));
+      const done = dep !== null &&
+        String(dep.blocked_code ?? "") !== WORK_CORRUPT_CODE &&
+        this.proveWorkItemDone(dep);
+      if (!done) {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_DEPENDENCY_UNMET",
+          `dependency ${String(e.dependency_work_item_id)} of ${String(row.work_item_id)} not proven DONE`,
+        );
+      }
+    }
+  }
+
   listWorkItems(businessId?: string): Row[] {
     const all = this.store.list("work_item");
     return (businessId ? all.filter((w) => String(w.business_id) === businessId) : all)
@@ -555,6 +705,11 @@ export class BusinessLayer {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
     const row = this.resolvePendingOpenBeforeMutation(workItemId, operatorId);
     this.assertWorkItemNotQuarantined(row);
+    // WFV2 §5/§7: graph provenance + dependency gating at the single
+    // canonical open seam — forged rows and unmet dependencies never
+    // reach binding/mission creation.
+    this.assertGraphAuthority(row);
+    this.assertDependenciesSatisfied(row);
     // A previous linked mission still live forbids a replacement — the
     // governed path is pause/cancel/resume/reconcile, not a second dispatch.
     const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
