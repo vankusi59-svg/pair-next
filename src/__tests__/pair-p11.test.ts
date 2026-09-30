@@ -29,7 +29,7 @@ import {
   mintBrokerCapability,
   claimLeaseDigest,
 } from "../pair/index.js";
-import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
+import { canonicallyCompleteMission, fireRoutineMission } from "./canonical-mission-completion.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p11-"));
 let counter = 0;
@@ -255,17 +255,14 @@ describe("P11 §2.D single dispatch per open", () => {
 
 describe("P11 §2.E routine projection", () => {
   it("projects ≤1 work_item per fired mission and dedups on re-sync", async () => {
-    const { ctx, biz } = makeBiz("rt1");
+    const { ctx, biz, schedules } = makeBiz("rt1");
     const { b } = bizWithAgent(biz, ctx.projectId, "content");
     const r = biz.createRoutine({
       business_id: bId(b), name: "daily", goal_template: "post", cron: "0 7 * * *", operator_id: "op",
     });
     const schedId = String(r.schedule_id);
-    // Simulate one fired mission carrying this schedule's metadata
-    const m = ctx.control.startMission({
-      project_id: ctx.projectId, goal: "post", operator_id: "op",
-      metadata: { business_id: bId(b), schedule_id: schedId, plan_source: "schedule" },
-    });
+    // P14-FC-R1: genuine canonical scheduler fire (occurrence + anchor).
+    const m = await fireRoutineMission(ctx, schedules, schedId);
     biz.board(bId(b)); // projection pass 1
     let items = biz.listWorkItems(bId(b));
     expect(items).toHaveLength(1);
@@ -273,23 +270,17 @@ describe("P11 §2.E routine projection", () => {
     biz.board(bId(b)); // pass 2 — must not duplicate
     items = biz.listWorkItems(bId(b));
     expect(items).toHaveLength(1);
-    // a second mission → exactly one more work item
-    ctx.control.startMission({
-      project_id: ctx.projectId, goal: "post2", operator_id: "op",
-      metadata: { business_id: bId(b), schedule_id: schedId, plan_source: "schedule" },
-    });
+    // a second fired occurrence → exactly one more work item
+    await fireRoutineMission(ctx, schedules, schedId, "2999-01-01T00:00:00Z");
     biz.board(bId(b));
     expect(biz.listWorkItems(bId(b))).toHaveLength(2);
   });
 
   it("restart-safe: fresh BusinessLayer on same store keeps the projection deduped", async () => {
-    const { ctx, biz } = makeBiz("rt2");
+    const { ctx, biz, schedules } = makeBiz("rt2");
     const { b } = bizWithAgent(biz, ctx.projectId);
     const r = biz.createRoutine({ business_id: bId(b), name: "r", goal_template: "g", cron: "0 7 * * *", operator_id: "op" });
-    ctx.control.startMission({
-      project_id: ctx.projectId, goal: "g", operator_id: "op",
-      metadata: { business_id: bId(b), schedule_id: String(r.schedule_id), plan_source: "schedule" },
-    });
+    await fireRoutineMission(ctx, schedules, String(r.schedule_id));
     biz.board(bId(b));
     // "restart": new layer + schedule service over the same store
     const schedules2 = new MissionScheduleService(ctx.service);

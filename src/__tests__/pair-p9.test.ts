@@ -49,7 +49,7 @@ import {
   claimLeaseDigest,
   validatePlanProposal,
 } from "../pair/index.js";
-import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
+import { canonicallyCompleteMission, fireRoutineMission } from "./canonical-mission-completion.js";
 import type { DevinFetch } from "../pair/devin-executor.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p9-"));
@@ -1992,15 +1992,14 @@ describe("business layer (one-person-business skeleton)", () => {
     expect(String(m2.goal)).toContain("posted gold analysis");
   });
 
-  it("routine-fired mission projects onto board as work_item", () => {
-    const { ctx, biz } = makeBizCtx("b12");
+  it("routine-fired mission projects onto board as work_item", async () => {
+    const { ctx, biz, schedules } = makeBizCtx("b12");
     const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
     const bid = String(b.business_id);
     const r = biz.createRoutine({ business_id: bid, name: "daily", goal_template: "analyze", cron: "0 7 * * *", operator_id: "op" });
-    // simulate the schedule having fired: a mission carrying metadata.schedule_id,
-    // completed canonically (post-P3 a raw status write is a forgery)
-    const rm = ctx.control.startMission({ project_id: ctx.projectId, goal: "analyze",
-      metadata: { schedule_id: String(r.schedule_id), business_id: bid, plan_source: "schedule" } });
+    // P14-FC-R1: genuine canonical scheduler fire — occurrence claim →
+    // governed startMission → FIRED binding → SCHEDULE_FIRED anchor.
+    const rm = await fireRoutineMission(ctx, schedules, String(r.schedule_id));
     const rmid = String(rm.mission_id);
     canonicallyCompleteMission(ctx.store, ctx.service, rmid);
     const rmr = ctx.store.get("mission", rmid);

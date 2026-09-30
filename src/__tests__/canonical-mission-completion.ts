@@ -23,7 +23,9 @@
  * completion seams accept it as genuine governed-runtime evidence.
  */
 
-import type { PairControlPlane, PairEvidenceStore } from "../pair/index.js";
+import type {
+  MissionControl, MissionScheduleService, PairControlPlane, PairEvidenceStore,
+} from "../pair/index.js";
 import { ArtifactProvenanceValidator, utcnow } from "../pair/index.js";
 
 const RUNTIME_ACTOR = "PAIR_MISSION_RUNTIME";
@@ -225,4 +227,47 @@ export function canonicallyCompleteMission(
     service.transitionMission(mid, "COMPLETED", RUNTIME_ACTOR);
   }
   transitionRuntimeLike(store, mid, "COMPLETED", "all_tasks_completed");
+}
+
+// =====================================================================
+// P14 FC R1 — genuine canonical routine fire.
+// A routine-run mission is canonical ONLY when minted by
+// MissionScheduleService.fireDue: due-occurrence claim → governed
+// startMission → occurrence FIRED→mission binding → SCHEDULE_FIRED
+// anchor. Caller-supplied `metadata.schedule_id` alone is a label, never
+// authority — tests must drive the real scheduler path.
+// =====================================================================
+
+export async function fireRoutineMission(
+  ctx: {
+    store: PairEvidenceStore;
+    service: PairControlPlane;
+    control: MissionControl;
+    projectId: string;
+  },
+  schedules: MissionScheduleService,
+  scheduleId: string,
+  now?: string,
+): Promise<Record<string, unknown>> {
+  if (!now) {
+    // Make the next occurrence due at wall-clock now; the due_at recorded
+    // is that rewound value — the canonical claim/binding path is real.
+    const schedRow = ctx.store.get("mission_schedule", scheduleId);
+    schedRow.next_due_at = new Date(Date.now() - 1000).toISOString();
+    ctx.store.put("mission_schedule", scheduleId, schedRow, Number(schedRow.version));
+  }
+  const res = await schedules.fireDue(async (input) =>
+    ctx.control.startMission({
+      project_id: ctx.projectId, goal: input.goal,
+      metadata: input.metadata, operator_id: "op",
+    }), now);
+  if (!res.fired.includes(scheduleId)) {
+    throw new Error(`routine fire failed for ${scheduleId}: ${JSON.stringify(res)}`);
+  }
+  // The latest bound occurrence for this schedule is this fire's.
+  const occs = ctx.store.list("schedule_occurrence")
+    .filter((o) => String(o.schedule_id) === scheduleId && o.mission_id != null)
+    .sort((a, b) => String(b.due_at).localeCompare(String(a.due_at)));
+  if (occs.length === 0) throw new Error(`no bound occurrence for ${scheduleId}`);
+  return ctx.store.get("mission", String(occs[0]!.mission_id));
 }

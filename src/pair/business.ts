@@ -19,7 +19,7 @@
  *   only decides WHICH mission runs, never bypasses approvals.
  */
 import { IntegrityError, PolicyError } from "./errors.js";
-import { digest, newId, utcnow } from "./canonical.js";
+import { newId, utcnow } from "./canonical.js";
 import {
   AgentContractService,
   type AgentContractPolicy,
@@ -28,6 +28,12 @@ import {
 import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
+import {
+  assertCanonicalRoutineFire,
+  assertCanonicalRoutineMirror,
+  proveCanonicalRoutineMirror,
+  routineMirrorRowId,
+} from "./routine-mirror.js";
 import { validateWorkOpenBinding } from "./work-open-binding.js";
 import {
   assertAuthoritySubset,
@@ -1010,19 +1016,22 @@ export class BusinessLayer {
       }
       if (String(w.status) !== "DONE") continue;
       if (this.store.tryGet(WORK_COMPLETION_TABLE, completionRowId(wid))) continue;
-      // P11 routine mirror — a DONE projection is honest iff the pinned
-      // mission is itself canonically complete. Mirrors never mint a
-      // WCP by design (no bound attempt exists), so the bound-work basis
-      // cannot apply: validate the mirror against the mission's own
-      // governed-completion proof instead.
-      if (w.routine_id != null) {
+      // P11 routine mirror — a DONE projection is honest iff (a) the
+      // whole mirror proves canonical routine provenance (FIRED
+      // occurrence + SCHEDULE_FIRED anchor + WI_RT identity) and (b)
+      // its projected mission is itself canonically complete. Mirrors
+      // never mint a WCP by design (no bound attempt exists), so the
+      // bound-work basis cannot apply.
+      if (w.routine_id != null && proveCanonicalRoutineMirror(this.store, w)) {
         const rMids = (w.mission_ids as string[] | undefined) ?? [];
         const rMission = rMids.length
-          ? this.store.tryGet("mission", String(rMids[rMids.length - 1])) as Row | null
+          ? this.store.tryGet("mission", String(rMids[0])) as Row | null
           : null;
         if (rMission && proveCanonicalMissionCompletion(this.store, rMission)) continue;
+      }
+      if (w.routine_id != null) {
         this.quarantineWorkItem(
-          w, "routine DONE mirror without canonical mission completion");
+          w, "routine DONE mirror without canonical mission completion/provenance");
         continue;
       }
       // Derive-only materialization: every pin must already exist as
@@ -1477,6 +1486,14 @@ export class BusinessLayer {
     // created. A contract widened after delegation/decomposition commit
     // fails closed here, and a DISABLED contract is never usable.
     this.assertChildAuthorityCeiling(row);
+    // P14 FC R1 — a routine mirror is a zero-authority projection until
+    // promoted: crossing the open boundary requires canonical routine
+    // provenance + Phase-1 membership. The deterministic STANDALONE WGM
+    // is established atomically BEFORE any open intent/binding/mission
+    // is created; forged mirrors are quarantined, never promoted.
+    if (row.routine_id != null) {
+      this.promoteRoutineMirror(row);
+    }
     // A previous linked mission still live forbids a replacement — the
     // governed path is pause/cancel/resume/reconcile, not a second dispatch.
     const priorMissionIds = (row.mission_ids as string[] | undefined) ?? [];
@@ -1943,8 +1960,12 @@ export class BusinessLayer {
       // Routine-source items are mission-status mirrors (P11): the
       // schedule path mints their missions without an open binding, so
       // the bound-work chain can never apply — the mirror folds
-      // honestly instead. Any OTHER unbound link is corrupt provenance.
-      if (row.routine_id != null) {
+      // honestly instead. The exception applies only to mirrors whose
+      // routine provenance is fully canonical (FIRED schedule_occurrence
+      // + SCHEDULE_FIRED anchor + deterministic WI_RT identity) —
+      // `routine_id` alone never authorizes it. Any OTHER unbound link
+      // is corrupt provenance.
+      if (row.routine_id != null && proveCanonicalRoutineMirror(this.store, row)) {
         return this.syncRoutineMirror(row, mission);
       }
       // The final mission id does not belong to this work item — fold
@@ -2064,6 +2085,16 @@ export class BusinessLayer {
    */
   private syncRoutineMirror(row: Row, mission: Row): Row {
     const workItemId = String(row.work_item_id);
+    // The routine exception is never authorized by `routine_id` alone —
+    // the whole projection must prove the canonical schedule chain
+    // (FIRED occurrence + SCHEDULE_FIRED anchor + WI_RT identity pin).
+    try {
+      assertCanonicalRoutineMirror(this.store, row);
+    } catch (e) {
+      this.quarantineWorkItem(
+        row, `routine mirror without canonical provenance: ${(e as Error).message}`);
+      return this.store.get("work_item", workItemId);
+    }
     const ms = String(mission.status);
     const next: WorkItemStatus | null =
       ms === "COMPLETED" ? "DONE" :
@@ -3342,6 +3373,15 @@ export class BusinessLayer {
       // schedule must also carry this business_id — corrupted or
       // foreign-business metadata never projects onto this board.
       if (String(md?.business_id ?? "") !== String(routine.business_id)) continue;
+      // R1: only a canonical scheduler fire may project — caller-supplied
+      // schedule metadata alone never mints a routine mirror. The full
+      // occurrence↔mission↔SCHEDULE_FIRED chain must hold at projection
+      // time; anything else is just a mission carrying a label.
+      try {
+        assertCanonicalRoutineFire(this.store, routine, m);
+      } catch {
+        continue;
+      }
       const ms = String(m.status);
       // DONE mirrors require the mission's own canonical completion
       // proof at projection time — an unproven COMPLETED claim projects
@@ -3358,7 +3398,7 @@ export class BusinessLayer {
       // the mission id, so two concurrent projectors (restarts, parallel
       // board() calls, two connections) compute the same id — the loser's
       // create hits the atomic CAS and is treated as already-covered.
-      const id = `WI_RT_${digest("routine-work-item:" + missionId).slice(0, 24)}`;
+      const id = routineMirrorRowId(missionId);
       const row = {
         work_item_id: id,
         business_id: businessId,
@@ -3384,7 +3424,25 @@ export class BusinessLayer {
         version: 0,
       };
       try {
-        this.store.put("work_item", id, row, 0);
+        // Mirror + its canonical STANDALONE membership commit atomically —
+        // a mirror never exists without Phase-1 graph authority, though
+        // it still carries zero work-item completion authority.
+        this.store.immediate(() => {
+          this.store.put("work_item", id, row, 0);
+          this.writeGraphMembership(row, {
+            membership_type: "STANDALONE",
+            parent_work_item_id: null,
+            delegation_id: null,
+            decomposition_row_id: null,
+            dependency_set_id: null,
+            authority_binding_id: null,
+          });
+          this.store.event({
+            entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_CREATED",
+            new_state: status, actor: "PAIR_BUSINESS_LAYER",
+            metadata: { routine_id: routine.routine_id, mission_id: missionId, source: "routine" },
+          });
+        });
       } catch (err) {
         // Concurrent projector already created this projection — the
         // deterministic id made the collision deterministic, not a duplicate.
@@ -3395,13 +3453,59 @@ export class BusinessLayer {
         }
         throw err;
       }
-      this.store.event({
-        entity_type: "work_item", entity_id: id, event_type: "WORK_ITEM_CREATED",
-        new_state: status, actor: "PAIR_BUSINESS_LAYER",
-        metadata: { routine_id: routine.routine_id, mission_id: missionId, source: "routine" },
-      });
       covered.add(missionId);
     }
+  }
+
+  /**
+   * Routine-mirror promotion (P14 FC R1): a mirror is a zero-authority
+   * projection while it displays schedule output — crossing the
+   * authority-bearing `openWorkItem` boundary promotes it into normal
+   * governed work. Requires the full canonical routine provenance
+   * (`assertCanonicalRoutineMirror`) AND Phase-1 membership: the
+   * deterministic STANDALONE `work_graph_membership` is established
+   * atomically before any open intent/binding/mission exists.
+   * Concurrent promoters collide deterministically on the same
+   * `WGM_<id>` — the winner's row is re-validated, never duplicated.
+   * No WDEL/WDEC/WDS/WAB is ever fabricated here.
+   */
+  private promoteRoutineMirror(row: Row): void {
+    const id = String(row.work_item_id);
+    try {
+      assertCanonicalRoutineMirror(this.store, row);
+    } catch (e) {
+      this.quarantineWorkItem(
+        row, `routine mirror promotion without canonical provenance: ${(e as Error).message}`);
+      throw e;
+    }
+    this.store.immediate(() => {
+      const existing = this.store.tryGet(
+        "work_graph_membership", membershipRowId(id)) as Row | null;
+      if (existing) {
+        // Exactly one canonical membership — a tampered/fabricated row
+        // fails closed here (assertGraphAuthority fences it at read
+        // seams; promotion re-proves it inside the txn).
+        assertCanonicalMembership(this.graphAuthorityDeps(), existing);
+        return;
+      }
+      try {
+        this.writeGraphMembership(this.store.get("work_item", id), {
+          membership_type: "STANDALONE",
+          parent_work_item_id: null,
+          delegation_id: null,
+          decomposition_row_id: null,
+          dependency_set_id: null,
+          authority_binding_id: null,
+        });
+      } catch (err) {
+        if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") {
+          const winner = this.store.get("work_graph_membership", membershipRowId(id));
+          assertCanonicalMembership(this.graphAuthorityDeps(), winner);
+          return;
+        }
+        throw err;
+      }
+    });
   }
 
   // ---------- objective (goal tree) ----------

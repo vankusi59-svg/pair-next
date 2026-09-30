@@ -533,7 +533,44 @@ audit + one narrow defect remediation.
   PASS.
 - Report: `PAIR_OS_VNEXT_P14_FINAL_CLOSURE_REPORT.md`.
   Classification:
-  **`P14_WORKFORCE_V2_FINAL_CLOSURE_PENDING_INDEPENDENT_AUDIT`**.
+  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R1_PENDING_INDEPENDENT_AUDIT`**.
+
+#### FC R1 remediation (independent-audit BLOCKED → closed, same PR)
+
+Two routine-boundary defects remediated narrowly (zero redesign):
+
+- **Routine identity ← canonical schedule evidence only**: caller-set
+  `metadata.schedule_id`/`business_id` was the projection trigger — a
+  forgeable label. Now ONE validator (`routine-mirror.ts`:
+  `assertCanonicalRoutineMirror`/`assertCanonicalRoutineFire`) proves
+  the full chain: routine row → mission_schedule →
+  `schedule_occurrence` FIRED + `mission_id` binding → mission
+  metadata 4-pin (`schedule_id`, `schedule_occurrence_id`,
+  `scheduled_for==due_at`, business scope) → recomputable
+  `schedule_digest` → exactly-one `SCHEDULE_FIRED` anchor →
+  deterministic `WI_RT_<digest(mission)>` id → `WORK_ITEM_CREATED`
+  agreement. Every exception seam consumes it (`syncWorkItem`,
+  `syncRoutineMirror`, `reconcileWorkLifecycle`, projection,
+  promotion); invalid provenance → quarantine. Non-canonical claimant
+  missions simply never project. All routine test fixtures now drive
+  genuine `fireDue` (no caller-metadata fires anywhere).
+- **Promotion enters Phase-1 authority**: projection now commits the
+  mirror + deterministic STANDALONE `work_graph_membership` atomically;
+  `openWorkItem` runs `promoteRoutineMirror` BEFORE any open
+  intent/binding/mission — re-proves provenance + validates the
+  existing WGM via `assertCanonicalMembership` inside the txn (CAS-
+  loser adopts the winner row; tampered/fabricated rows fail closed;
+  legacy mirrors get the deterministic WGM written). Exactly-one
+  canonical membership, restart idempotent, cross-connection safe, no
+  fabricated WDEL/WDEC/WDS/WAB, `assertGraphAuthority` unweakened.
+  Mirror still zero completion authority until promoted via the normal
+  bound path.
+- **15 `P14-FC-R1-*` tests** (9 provenance + 6 membership); Golden E2E
+  extended to **53/53** (caller-metadata forgery negative + genuine
+  two-occurrence lifecycle: fire→mirror→DONE zero-WCP→restart honest
+  →fire2→FAIL→BLOCKED→promote→WGM+binding→WCP→restart zero-dup).
+- Regression re-run all green (N22 2185+2 pre-existing P5 env-gap /
+  N20 2187/0); report §18-19.
 
 ## Not yet
 

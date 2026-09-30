@@ -266,3 +266,116 @@ P14 has CONVERGED:
 **`P14_WORKFORCE_V2_FINAL_CLOSURE_PENDING_INDEPENDENT_AUDIT`**
 
 Not OFFICIAL_FINAL — that requires the independent audit of this PR.
+
+## 18. FC R1 remediation — canonical routine provenance + promotion membership
+
+Independent audit of this PR classified BLOCKED — R1 REQUIRED on two
+routine-boundary defects. Both closed narrowly; zero redesign of
+Planner/Router/Gate/Runtime/WCP/graph authority.
+
+### 18.1 BLOCKER 1 — routine identity now comes ONLY from canonical
+schedule evidence
+
+**Defect**: `syncRoutineWorkItems` discovered routine runs from caller-
+settable mission metadata (`metadata.schedule_id`/`business_id`) — an
+ordinary `startMission` could claim a routine's schedule_id and project
+a mirror. Tests manufactured exactly that forgery.
+
+**Fix**: one validator — `assertCanonicalRoutineMirror` /
+`assertCanonicalRoutineFire` (new `src/pair/routine-mirror.ts`) — proves
+the FULL canonical chain and nothing else:
+
+```
+routine row (exact, business match)
+→ mission_schedule row (routine.schedule_id, project/business scope)
+→ mission metadata.schedule_occurrence_id
+→ schedule_occurrence row: schedule_id match, status=FIRED,
+  mission_id == exact mission
+→ mission metadata 4-pin: schedule_id, schedule_occurrence_id,
+  scheduled_for == occurrence.due_at, business scope
+→ schedule_digest recomputable (goal/cron immutable post-create)
+→ exactly-one SCHEDULE_FIRED anchor: entity=schedule_id,
+  correlation=mission_id, metadata {mission_id, occurrence_id,
+  scheduled_for} all pinned
+→ mirror identity: source="routine", WI_RT_<digest(mission)>
+  deterministic id, mission_ids[0] == projected fire mission,
+  WORK_ITEM_CREATED event agrees
+```
+
+Every routine-exception seam consumes the same validator:
+`syncWorkItem` (unbound branch), `syncRoutineMirror` (entry),
+`reconcileWorkLifecycle` (routine-DONE branch), `openWorkItem`
+promotion path, `syncRoutineWorkItems` projection itself
+(`assertCanonicalRoutineFire` gate — a non-canonical claimant simply
+does not project). Invalid provenance → `TERMINAL_PROVENANCE_CORRUPT`
+quarantine, never silent.
+
+**Forgeable test path removed**: all happy-path routine fixtures drive
+the real `createRoutine → next_due_at due → MissionScheduleService.
+fireDue → schedule_occurrence claim → governed startMission → FIRED
+binding → SCHEDULE_FIRED anchor` chain (shared
+`fireRoutineMission` in `canonical-mission-completion.ts`). Four legacy
+fixtures that simulated fires via caller metadata were upgraded
+(p9, p11, p11-r1, p11 §2.E ×2).
+
+### 18.2 BLOCKER 2 — reopened mirrors enter Phase-1 graph authority
+
+**Defect**: mirror rows had no `work_graph_membership`; a mirror could
+cross `openWorkItem` → binding → WCP with zero Phase-1 authority.
+
+**Fix (projection-time membership, mandate's alternative-B)**: mirror
+row + deterministic STANDALONE `work_graph_membership` (`WGM_<digest>`)
+commit atomically in the same `immediate()` at projection. PLUS a
+promotion gate inside `openWorkItem` (before any open intent/binding/
+mission exists): `promoteRoutineMirror` — proves
+`assertCanonicalRoutineMirror`, then re-validates the existing WGM via
+`assertCanonicalMembership` inside the txn (a tampered/fabricated row
+fails closed); missing membership (legacy mirror) is written
+deterministically; a CAS-loser re-reads + validates the winner row.
+Exactly one canonical membership ever exists; restart idempotent;
+cross-connection safe; no WDEL/WDEC/WDS/WAB is ever fabricated. A
+provenance-broken mirror is quarantined by the same path, never
+promoted. `assertGraphAuthority` was NOT weakened — the WGM is a
+normal canonical membership.
+
+A DONE mirror stays display-only (zero WCP forever); a mirror whose
+scheduler run FAILED/BLOCKED may reopen via the normal bound path —
+promotion → openWorkItem → work_open_binding → governed mission → real
+WCP — all pinning the same work item/business/project.
+
+### 18.3 R1 tests (15 new, P3 suite 88/88)
+
+Provenance: `P14-FC-R1-CALLER-SCHEDULE-METADATA-CANNOT-FORGE-ROUTINE`,
+`-ROUTINE-REQUIRES-FIRED-OCCURRENCE`, `-OCCURRENCE-MISSION-MISMATCH-
+FAILS`, `-ROUTINE-SCHEDULE-MISMATCH-FAILS`, `-SCHEDULE-FIRED-EVIDENCE-
+MISMATCH-FAILS`, `-ROUTINE-WORK-ITEM-ID-PIN-FAILS`, `-MUTABLE-ROUTINE-
+ID-CANNOT-BYPASS-UNBOUND-QUARANTINE`, `-MISSION-ID-SWAP-CANNOT-BYPASS-
+ROUTINE-PROVENANCE`, `-GENUINE-SCHEDULE-FIRE-PROJECTS-HONEST-MIRROR`.
+Membership: `-ROUTINE-MIRROR-ZERO-AUTHORITY-BEFORE-PROMOTION`,
+`-ROUTINE-REOPEN-REQUIRES-CANONICAL-MEMBERSHIP`, `-ROUTINE-PROMOTION-
+CREATES-EXACTLY-ONE-WGM`, `-ROUTINE-PROMOTION-RESTART-IDEMPOTENT`,
+`-ROUTINE-PROMOTION-CONCURRENT-SINGLE-MEMBERSHIP`, `-REOPENED-ROUTINE-
+COMPLETES-WITH-WGM-BINDING-WCP`.
+
+### 18.4 R1 E2E additions (Golden FC E2E now 53/53)
+
+`FC-R1 caller-metadata forgery does not project` (mission created, zero
+mirrors) → `genuine fire binds occurrence FIRED` → `canonical mirror
+projected (WI_RT + STANDALONE WGM)` → `DONE mirror zero WCP` → restart
+→ `mirror honest` → `second occurrence fired+bound` → `failed run
+mirrors BLOCKED` → `promotion → canonical WGM + bound mission` →
+`reopened routine completes with WGM→binding→WCP` → restart →
+`zero-dup (1 mirror each, 1 WGM, 1 binding, 1 WCP)`. Prior 44 checks
+preserved verbatim.
+
+### 18.5 R1 convergence reassessment
+
+Both defects closed WITHOUT redesigning Planner, MissionRouter,
+GovernedTaskGate, MissionRuntime, WCP, or graph authority: routine
+identity is now a projection-consuming read of ALREADY-canonical
+schedule evidence, and promotion reuses the existing Phase-1
+membership model. Convergence declaration stands.
+
+## 19. R1 classification
+
+**`P14_WORKFORCE_V2_FINAL_CLOSURE_R1_PENDING_INDEPENDENT_AUDIT`**
