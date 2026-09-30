@@ -77,6 +77,7 @@ export class ApprovalQueue {
       mission_id: input.mission_id ?? null,
       task_id: input.task_id ?? null,
       change_id: input.change_id ?? null,
+      scope: input.scope ?? {},
       scope_digest: digest(input.scope),
       reason: input.reason,
       risk_class: input.risk_class ?? "MEDIUM",

@@ -636,9 +636,9 @@ export class MissionControl {
     return this.deps.runtime.cancel(missionId, op);
   }
 
-  approve(approvalId: string, operatorId: string | undefined, scope: Record<string, unknown>, reason?: string) {
+  approve(approvalId: string, operatorId: string | undefined, scope?: Record<string, unknown>, reason?: string) {
     const op = requireOperator(operatorId);
-    const decision = this.deps.approvals.decide(approvalId, op, "APPROVED", scope, reason);
+    const decision = this.deps.approvals.decide(approvalId, op, "APPROVED", this.resolveApprovalScope(approvalId, scope), reason);
     const a = this.deps.approvals.get(approvalId);
     if (a.mission_id) {
       this.deps.supervisor.wake(String(a.mission_id), "APPROVAL_GRANTED", {
@@ -648,9 +648,54 @@ export class MissionControl {
     return decision;
   }
 
-  deny(approvalId: string, operatorId: string | undefined, scope: Record<string, unknown>, reason?: string) {
+  deny(approvalId: string, operatorId: string | undefined, scope?: Record<string, unknown>, reason?: string) {
     const op = requireOperator(operatorId);
-    return this.deps.approvals.decide(approvalId, op, "DENIED", scope, reason);
+    return this.deps.approvals.decide(approvalId, op, "DENIED", this.resolveApprovalScope(approvalId, scope), reason);
+  }
+
+  /**
+   * The scope an approval decision binds to, in priority order:
+   * a non-empty caller-presented scope (echoed from the API record, or
+   * independently verified by the digest check in decide()); the scope
+   * stored on the approval record; or, for RECOVERY_APPROVAL rows written
+   * before scope was persisted, a reconstruction from the mission
+   * runtime's pending_recovery. decide() re-digests whichever scope wins,
+   * so a wrong reconstruction still fails closed.
+   */
+  private resolveApprovalScope(
+    approvalId: string,
+    presented?: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (presented && Object.keys(presented).length > 0) return presented;
+    const record = this.deps.approvals.get(approvalId);
+    if (record.scope && typeof record.scope === "object") {
+      return record.scope as Record<string, unknown>;
+    }
+    if (record.approval_type === "RECOVERY_APPROVAL" && record.mission_id) {
+      const rt = this.store.tryGet("mission_runtime", `MRT_${String(record.mission_id)}`);
+      const pending = rt?.pending_recovery as Record<string, unknown> | null | undefined;
+      if (pending) {
+        const action = String(record.requested_action ?? "");
+        if (action === "RECOVERY_BUDGET_OVERRIDE") {
+          return {
+            requested_action: action,
+            mission_id: record.mission_id,
+            task_id: record.task_id ?? null,
+            failure_class: pending.failure_class,
+            recovery_decision_id: pending.recovery_id,
+          };
+        }
+        if (action === "RECONCILE_UNKNOWN_SIDE_EFFECT") {
+          return {
+            requested_action: action,
+            mission_id: record.mission_id,
+            task_id: record.task_id ?? null,
+            execution_id: pending.execution_id ?? null,
+          };
+        }
+      }
+    }
+    return presented ?? {};
   }
 
   /**

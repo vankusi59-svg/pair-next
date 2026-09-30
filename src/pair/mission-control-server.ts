@@ -571,8 +571,8 @@ export function createMissionControlServer(
       if (method === "POST" && m) {
         const out =
           m[2] === "approve"
-            ? c.approve(m[1], operator, (body.scope as Record<string, unknown>) ?? {}, String(body.reason ?? "") || undefined)
-            : c.deny(m[1], operator, (body.scope as Record<string, unknown>) ?? {}, String(body.reason ?? "") || undefined);
+            ? c.approve(m[1], operator, body.scope as Record<string, unknown> | undefined, String(body.reason ?? "") || undefined)
+            : c.deny(m[1], operator, body.scope as Record<string, unknown> | undefined, String(body.reason ?? "") || undefined);
         return void json(res, 200, out);
       }
       m = p.match(/^\/api\/promotions\/([^/]+)\/(approve|reject)$/);
