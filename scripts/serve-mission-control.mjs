@@ -363,7 +363,7 @@ if (!persistedProjects.length) {
 
 // §4.2 — populate provider/model catalogs from canonical discovery sources
 // (dsh settings, executor-advertised observations). Read-only projections.
-let planProvider = null;
+let planProviders = [];
 if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   const dres = runProviderDiscovery(store, {
     context: { env: process.env, dshHome: process.env.PAIR_DSH_HOME, codexHome: process.env.CODEX_HOME },
@@ -453,14 +453,14 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
       });
       qualifyBinding(service, String(b.binding_id));
       console.log("MODEL_ROUTE:", route, "QUALIFIED (probe", prb.result + ") bound to", DSH_EXECUTOR_ID);
-      // First qualified route doubles as the LLM planner's model+endpoint.
-      if (!planProvider) {
-        planProvider = {
-          endpoint: endpointOf(prov),
-          credentialEnv: String(prov.credential_reference_name ?? ""),
-          model: mid,
-        };
-      }
+      // Qualified routes double as the LLM planner's failover chain, in
+      // boot priority order — quota/timeout/errors on one fall to the next.
+      planProviders.push({
+        route,
+        endpoint: endpointOf(prov),
+        credentialEnv: String(prov.credential_reference_name ?? ""),
+        model: mid,
+      });
     }
     // Other discovered models get DISCOVERED bindings — the routes page shows
     // them as unqualified fallbacks with their failing gate.
@@ -480,19 +480,28 @@ sup.resume();
 // edge (preview only). Runs only when a provider route qualified at boot;
 // any failure → llmPlan falls back to the minimal T1 plan itself.
 const planExpander = async (input) => {
-  if (!planProvider || typeof input.goal !== "string" || !input.goal.trim()) return input;
-  const res = await llmPlan(String(input.goal), {
-    endpoint: `${planProvider.endpoint}/chat/completions`,
-    credentialEnv: planProvider.credentialEnv,
-    model: planProvider.model,
-    allowedCapabilities: LLM_PLANNER_CAPS,
-    capabilitySets: executorCapSets(),
-    timeoutMs: Number(process.env.PAIR_LLM_PLANNER_TIMEOUT_MS ?? 20000),
-  });
-  if (!res.tasks.length) {
+  if (!planProviders.length || typeof input.goal !== "string" || !input.goal.trim()) return input;
+  // Failover: try each qualified route in boot priority order; a quota/
+  // timeout/http/parse failure on one model falls through to the next.
+  const planTimeoutMs = Number(process.env.PAIR_LLM_PLANNER_TIMEOUT_MS ?? 20000);
+  const failedRoutes = [];
+  let res = null;
+  for (const p of planProviders) {
+    const r = await llmPlan(String(input.goal), {
+      endpoint: `${p.endpoint}/chat/completions`,
+      credentialEnv: p.credentialEnv,
+      model: p.model,
+      allowedCapabilities: LLM_PLANNER_CAPS,
+      capabilitySets: executorCapSets(),
+      timeoutMs: planTimeoutMs,
+    });
+    if (r.tasks.length) { res = r; break; }
+    failedRoutes.push(`${p.route}[${r.warnings.join(",") || "NO_TASKS"}]`);
+  }
+  if (!res) {
     // Degenerate/unusable plan — fail closed: a T1-only plan would run and
     // report COMPLETED having done nothing. FAIL_CLOSED_* code → HTTP 409.
-    const e = new Error(`planner produced no usable task plan (${res.warnings.join(",") || "none"})`);
+    const e = new Error(`planner produced no usable task plan across ${planProviders.length} route(s) (${failedRoutes.join(" | ") || "none"})`);
     e.code = "FAIL_CLOSED_PLAN_DEGENERATE";
     throw e;
   }
@@ -503,7 +512,9 @@ const planExpander = async (input) => {
       llm_plan: res.tasks,
       plan_source: res.source,
       plan_model: res.model,
-      plan_warnings: res.warnings,
+      plan_warnings: failedRoutes.length
+        ? [...res.warnings, `LLM_PLANNER_FAILOVER ${failedRoutes.join(" | ")}`]
+        : res.warnings,
     },
   };
 };
