@@ -411,3 +411,65 @@ Head `5aeaeb50fb529ca35cc1060bc411cc41b6f3845c`; `PAIR_MC_DIR=/home/ubuntu/pair-
 5. forge: move a dep edge's `dependent_work_item_id` (re-hashed canonically) → open original dependent → **409 `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`** (`dependency-set manifest invalid`) + durable `TERMINAL_PROVENANCE_CORRUPT`; open the edge's new dependent → **409 PROVENANCE_CORRUPT** (`extra edge` not in its manifest);
 6. disable delegatee contract → `open` → **409 `FAIL_CLOSED_AGENT_CONTRACT_DISABLED`**;
 7. restart → boot reconcile reports `quarantined 2 forged node(s)` (the forged-edge parent + sibling decomposition unit quarantined atomically; plain items untouched).
+
+## 17. Live-executor E2E (human-like run, post-R2 evidence)
+
+Environment-only work — **no PR code change**; verifies the governed stack end-to-end
+with real executors instead of stub/template paths.
+
+Stack: head `27b36d8`, `PAIR_MC_DIR=/home/ubuntu/pair-mc-real`, server boot with
+`CODEX_HOME=$HOME/.codex`, `PAIR_DSH_HOME=/home/ubuntu/.dsh` (settings.yaml:
+gemini + groq providers), `PAIR_DEVIN_API_KEY` org secret. Boot log:
+`ROUTABLE: DEEPSEEK_HARNESS, CODEX, DEVIN` (+ PAIR_NATIVE); model routes
+`gemini:gemini-3.1-flash-lite QUALIFIED` and `groq:openai/gpt-oss-20b QUALIFIED`,
+both bound to DEEPSEEK_HARNESS (real `/chat/completions` probes, not config claims).
+
+### 17.1 Workforce-path run (proves P14 delegation → binding → real executor)
+
+business `Live Workforce Co` → org_agent `coder` (P12 contract ACTIVE,
+caps PYTHON_EXECUTION/FILE_OPERATIONS/REASONING/AUTOMATON_TASK_EXECUTION,
+executors CODEX+PAIR_NATIVE) → work_item → `delegate` → child `DL_*` + canonical
+`WDEL_*` (OPERATOR) + `WDS_*` empty manifest → `openWorkItem` →
+`work_open_binding OPI_01M3R42EPKS2PD7VXV1K28ZMPY` → bound mission
+`MSN_01M3R42EPKQ5WP987F5DGPPQCT` (goal carries
+`[BUSINESS | DEPT eng | AGENT coder]` context) → **real CODEX** (`codex exec --json`,
+journal `EXE_1a050531*` shows agent_message + command_execution events) →
+workspace `codex_out.txt` → COMPLETED; parent DONE, child READY.
+
+### 17.2 LLM-planner run (real Gemini, Vietnamese goal)
+
+Goal (vi): business plan for a one-person AI company — analyze 3 revenue models,
+write `tinh_chi_phi.py`, write `bao_cao_kinh_doanh.txt`.
+- `metadata.llm_plan` = **4-task DAG produced by Gemini** (T1 record → T2 analyze
+  → T3 write script → T4 report), all COMPLETED.
+- T2/T3/T4 routed to **DEEPSEEK_HARNESS** (real dsh ACP sessions,
+  `journal/acp/EXE_*`); T1 to PAIR_NATIVE.
+- Real artifacts: `phan_tich_doanh_thu.txt` (vi analysis), `tinh_chi_phi.py`
+  (real script), `chi_phi_output.txt` (**script actually executed**, $2100/mo
+  table), `bao_cao_kinh_doanh.txt` (vi report choosing Consulting model).
+- Mission `MSN_01M3R5A2BXC0WW7J37M3MXBQRJ` COMPLETED through governed path.
+
+### 17.3 DEVIN remote executor run
+
+Task with `REMOTE_CLOUD_TASK_EXECUTION` → PAIR created real remote session
+`devin-dd293d2f61db4abbb5c7c05fb8c63496` (swe-2-max, tagged pair-os + mission id);
+session replied `DONE` on its own line → mission `MSN_01M3R5RYPHCQ9YMA18K0AQXPR8`
+COMPLETED. Executor dispatch + observe + collect_result verified against the live
+Devin API.
+
+### 17.4 Finding (out-of-scope, informational)
+
+`devin-executor.ts` completion sentinel `DONE_RE = /^\s*DONE\s*$/m` requires a
+standalone `DONE` line; a remote reply of `"...status: DONE."` inline was
+misclassified as blocked → FAILED on first dispatch (re-run with explicit
+sentinel → COMPLETED). Dispatch/remote work itself was real — detection is
+stricter than the prompt template implies. Candidate for a small follow-up
+(prompt template or sentinel tolerance); not fixed here (no mandate).
+
+### 17.5 Environment setup persisted (not in repo)
+
+`~/.dsh/settings.yaml` (gemini: 3.1-flash-lite + 3.8-flash; groq:
+openai/gpt-oss-20b), `GEMINI_API_KEY` org secret, dsh `0.2.0-rc.2` + pi-ai gemini
+thought_signature patch. Restart: `PAIR_DSH_HOME=$HOME/.dsh CODEX_HOME=$HOME/.codex
+node scripts/serve-mission-control.mjs`. `gemini-3.8-flash` remains DISCOVERED
+(Google 503 high-demand); auto-qualifies when the endpoint recovers.

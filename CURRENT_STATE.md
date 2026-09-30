@@ -371,3 +371,14 @@ autonomous reassignment / scheduling / parent cascade / CEO / P15/P16.
   merge, explicit manual merge only after audit pass. `main` is NOT
   currently protected; this file does not claim otherwise (see the
   P11 hardening report §10.14).
+
+## Live-executor E2E (post-R2 evidence, no code change)
+
+Governed stack verified end-to-end with REAL executors on head `27b36d8`
+(`PAIR_MC_DIR=/home/ubuntu/pair-mc-real`): workforce path
+(delegate→WDEL/WDS→openWorkItem→OPI binding→bound mission→real CODEX), LLM
+planner (gemini-3.1-flash-lite QUALIFIED → 4-task vi DAG → DSH sessions →
+artifacts incl. executed `tinh_chi_phi.py` output), DEVIN remote session
+(`devin-dd293d2f61db4abbb5c7c05fb8c63496` replied DONE → COMPLETED).
+Routes: `gemini:gemini-3.1-flash-lite` + `groq:openai/gpt-oss-20b` QUALIFIED.
+Finding: DEVIN `DONE_RE` sentinel requires standalone DONE line (see report §17.4).
