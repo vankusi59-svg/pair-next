@@ -268,6 +268,9 @@ const planner = (input) => {
 const runtime = new MissionRuntime({
   service, gate, router, adapters, scheduler, approvals, reconciliation: recon, recovery,
   planner,
+  // Per-task execution cap; slow planner-route models (nvidia glm-5.3) need
+  // more than the 120s default for multi-step tasks.
+  taskTimeoutS: Number(process.env.PAIR_TASK_TIMEOUT_S ?? 120),
 });
 const sup = new MissionSupervisor(service, runtime, recovery, recon);
 // Extraction sweep: every executor_execution whose result was collected folds

@@ -144,6 +144,9 @@ export interface MissionRuntimeDeps {
   plannerAdvisor?: { advise(opts: Record<string, unknown>): Record<string, unknown> };
   environment?: Record<string, unknown>;
   actor?: string;
+  /** Default per-task execution timeout (seconds) when the plan does not
+   * pin one. Defaults to 120 — raise for slow planner-route models. */
+  taskTimeoutS?: number;
 }
 
 const DEFAULT_TASK_TIMEOUT = 120;
@@ -338,7 +341,7 @@ export class MissionRuntime {
       allowed_paths: (tmd.allowed_paths as string[]) ?? [workspace],
       permissions: (mission.granted_permissions as string[]) ?? [],
       constraints: (md.constraints as string[]) ?? [],
-      timeout: Number(tmd.timeout ?? DEFAULT_TASK_TIMEOUT),
+      timeout: Number(tmd.timeout ?? this.deps.taskTimeoutS ?? DEFAULT_TASK_TIMEOUT),
       expected_output_contract:
         tmd.expected_output_contract ?? { type: "TASK_RESULT" },
       requested_tools:
