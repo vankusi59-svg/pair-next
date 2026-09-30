@@ -222,6 +222,7 @@ The official release record is `RELEASE.json` (`v1.0.0-pair-next-official-final`
   `pair-p14-foundation.test.ts` (FOUND-V2-* ×10 + FOUND-R1-* ×10 +
   FOUND-R2-* ×8 + FOUND-R3-* ×7).
   Classification: **`P14_FOUNDATION_V2_REMEDIATED_R3_FINAL_PENDING_AUDIT`**
+  — **merged** (PR #9).
   — MERGED into `main` (`fff2ee4`).
 
 ### PRE-P14-WORKFORCE RUNTIME HARDENING (branch, pending audit)
@@ -256,12 +257,50 @@ P15/P16**:
   scheduler/router/dispatcher/recovery engine.
 - Evidence: `PAIR_OS_VNEXT_PRE_P14_WORKFORCE_RUNTIME_HARDENING_REPORT.md`;
   suite `pair-runtime-hardening.test.ts` (RH-R1-* ×11).
-  Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`**.
+  Classification: **`PRE_P14_WORKFORCE_RUNTIME_HARDENING_REMEDIATED_R1_PENDING_AUDIT`**
+  — **merged** (PR #10).
+
+### P14 WORKFORCE V2 PHASE 1 — governed work graph + delegation (branch, pending audit)
+
+`devin/1790731419-p14-workforce-v2-p1` from canonical base
+`ef1fb11b214d7917b6d827efb223ddc22ae19511` — **Phase 1 only**: work
+graph, decomposition, dependency DAG, delegation core, child missions
+through the merged Foundation V2 path. No heartbeat / inbox /
+autonomous reassignment / scheduling / parent cascade / CEO / P15/P16.
+
+- **Canonical graph rows are the only authority** — `work_graph_edge`
+  (`WGE_*`, ACTIVE/REVOKED, append-only), `work_delegation` (`WDEL_<child>`),
+  `work_decomposition` (`WDEC_<parent>`), all written by WorkforceService
+  seams inside one `immediate()` transaction. Graph fields mirrored on
+  work_item rows are observability; `assertGraphAuthority` (wired into
+  `openWorkItem` + boot `reconcileWorkGraph`) quarantines any row
+  claiming membership without its COMMITTED canonical row —
+  `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`.
+- **Decomposition** is atomic all-or-nothing (children + sibling edges +
+  WDEC COMMITTED + parent `decomposed_as` in one txn); deterministic
+  `DC_*` ids; same `decomposition_id` replays idempotently, different id
+  conflicts closed.
+- **Delegation** requires ACTIVE same-business agents and narrows
+  capability (declared caps ∩ contract allow ∩ ¬deny) — never expands;
+  deterministic `DL_*` child per delegation_key; proof is bidirectional
+  (row fields must match WDEL row; forged either way quarantines).
+- **Dependency gate**: `openWorkItem` fails
+  `FAIL_CLOSED_WORK_DEPENDENCY_UNMET` unless every ACTIVE edge resolves
+  to a proven-DONE prerequisite (bound COMPLETED mission + review
+  acceptance — forged DONE status never unlocks). Edges mutate only via
+  `setWorkItemDependencies` under expected_version CAS with cycle/scope
+  checks.
+- Endpoints: `POST /api/work-items/:id/decompose|delegate`,
+  `PUT /api/work-items/:id/dependencies`,
+  `GET /api/businesses/:id/work-graph`. Boot runs `reconcileWorkGraph`.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REPORT.md`; suite
+  `pair-p14-workforce-v2.test.ts` (WFV2-P1-* ×15).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_PENDING_AUDIT`**.
 
 ## Not yet
 
-- Autonomous heartbeat/inbox/delegation/work-graph (P14 workforce —
-  beyond the V2 foundation), CEO agent / KPI gap analysis (P15).
+- Autonomous heartbeat/inbox/reassignment, parent completion cascade,
+  workforce scheduling, CEO agent / KPI gap analysis (P15+).
   Intentionally deferred.
 
 ## Release governance (current policy)
