@@ -54,6 +54,7 @@ import {
   WORKFORCE_RECEIPT_TABLE,
   WORK_MESSAGE_KINDS,
   assertCanonicalClaimLease,
+  assertCanonicalCollaborationBundle,
   assertCanonicalReceipt,
   assertCanonicalWorkforceMessage,
   claimExpiredError,
@@ -2013,7 +2014,10 @@ export class BusinessLayer {
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
       .map((m) => {
         try {
-          assertCanonicalWorkforceMessage(deps, m);
+          // R2 §2 — validate the whole bundle: message + its canonical
+          //  receipt must both exist and pass. Absence of the receipt is
+          //  corruption, never a synthesized PENDING.
+          assertCanonicalCollaborationBundle(deps, m);
           return m;
         } catch {
           return {
@@ -2034,7 +2038,11 @@ export class BusinessLayer {
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
       .map((m) => {
         try {
-          assertCanonicalWorkforceMessage(deps, m);
+          // R2 §1-§2 — a canonical message REQUIRES its exact canonical
+          //  receipt. Missing/corrupt receipt → explicit CORRUPT
+          //  projection; a missing receipt is never read as PENDING.
+          const receipt = assertCanonicalCollaborationBundle(deps, m);
+          return { ...m, receipt_status: String(receipt.status) };
         } catch {
           return {
             message_id: m.message_id, state: "CORRUPT",
@@ -2042,24 +2050,6 @@ export class BusinessLayer {
             version: Number(m.version ?? 0),
           } as Row;
         }
-        const r = this.store.tryGet(
-          WORKFORCE_RECEIPT_TABLE,
-          receiptRowId(String(m.message_id), agentId),
-        ) as Row | null;
-        let status = "PENDING";
-        if (r) {
-          try {
-            assertCanonicalReceipt(deps, r);
-            status = String(r.status);
-          } catch {
-            return {
-              message_id: m.message_id, state: "COMMITTED",
-              receipt_status: "CORRUPT", corrupt: true,
-              version: Number(r.version ?? 0),
-            } as Row;
-          }
-        }
-        return { ...m, receipt_status: status };
       });
   }
 

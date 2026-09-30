@@ -63,6 +63,7 @@ import {
   WORKFORCE_MESSAGE_TABLE,
   WORKFORCE_RECEIPT_TABLE,
   assertCanonicalClaimLease,
+  assertCanonicalCollaborationBundle,
   assertCanonicalReceipt,
   assertCanonicalWorkforceMessage,
   claimLeaseDigest,
@@ -1322,7 +1323,10 @@ export class WorkforceService {
         (e) => String(e.event_type) === "WORK_COORDINATION_CORRUPT");
     for (const m of this.store.list(WORKFORCE_MESSAGE_TABLE)) {
       try {
-        assertCanonicalWorkforceMessage(this.graphDeps, m as Row);
+        // R2 §3 — validate the whole collaboration bundle: a deleted or
+        //  corrupt receipt is invisible to a receipts-only sweep, so the
+        //  message's deterministic expected receipt must exist and pass.
+        assertCanonicalCollaborationBundle(this.graphDeps, m as Row);
       } catch {
         if (!alreadyFlagged(WORKFORCE_MESSAGE_TABLE, String(m.message_id ?? "unknown"))) {
           this.store.event({

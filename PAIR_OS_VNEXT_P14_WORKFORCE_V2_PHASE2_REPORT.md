@@ -269,3 +269,62 @@ Coordination ≠ execution; heartbeat ≠ executor liveness; no auto
 redispatch/reassign; HANDOFF is data-only; no graph revisioning; no Phase-3
 cascade; unclaimed open fast path unchanged; raw token returned once at claim,
 never persisted.
+
+## §R2 — Collaboration Provenance Completeness (R2 remediation)
+
+### R2.1 Missing receipt fails closed (§1)
+Every committed `workforce_message` has a canonical receipt identity pinned by its
+immutable `WORKFORCE_MESSAGE_SENT` event (`receipt_id`, `receipt_created_at`). The
+prior defect — `inboxForAgent` defaulting `receipt_status = "PENDING"` when the
+receipt row was absent — fabricated valid-looking state from missing evidence.
+Removed. For every canonical message, `expected_receipt_id = WIR_<mid>_<recip>`
+must exist and pass `assertCanonicalReceipt`; missing/corrupt → `CORRUPT`, fail
+closed. The missing receipt is never recreated.
+
+### R2.2 Collaboration-bundle validation at all read seams (§2)
+New helper `assertCanonicalCollaborationBundle(deps, msg)` in `work-coordination.ts`:
+validates the message, derives the expected receipt id, requires the exact row,
+validates it, and returns the receipt Row. Non-recursive — the bundle calls both
+validators once (the receipt validator already consumes the message validator in
+one direction). `listWorkItemMessages()` and `inboxForAgent()` now surface only the
+explicit `CORRUPT` projection (`corrupt: true`, no body, `receipt_status: CORRUPT`)
+for any bundle failure — forged content is never returned as valid data, PENDING is
+never synthesized. `getWorkItemClaim()` unchanged.
+
+### R2.3 Reconcile detects missing receipts (§3)
+`reconcileWorkGraph()` sweeps `workforce_message` rows through
+`assertCanonicalCollaborationBundle` — a deleted/corrupt receipt is now detected by
+its derived expected identity. Deterministic `WORK_COORDINATION_CORRUPT` evidence
+pins the **message entity** (`entity_id = WFM_<mid>`) and is appended at most once
+per row (existing `alreadyFlagged` dedupe), so repeated reconcile/restart passes
+emit no duplicates and never fabricate the receipt.
+
+### R2.4 ACK event pins all required fields (§4)
+`assertCanonicalReceipt` now requires the canonical `WORKFORCE_MESSAGE_ACKNOWLEDGED`
+event metadata to match **all** of `message_id`, `recipient_agent_id`, and
+`acknowledged_at` — a forged/malformed ACK event with the wrong `message_id` pin
+fails closed even when `entity_id`, recipient, and timestamp otherwise match.
+Exactly one matching ACK event is still required for `ACKNOWLEDGED`; duplicate
+legitimate ACK remains idempotent with one event.
+
+### R2.5 Race evidence correction (§5)
+`P14-P2-R1-ASSIGN-CLAIM-RACE-INVERSE` rewritten as a genuine two-worker
+`worker_threads` race on the existing Atomics barrier — `assign(B)` vs in-txn
+`heartbeat(A, claim_token)`: assign loses deterministically
+(`FAIL_CLOSED_WORK_ITEM_CLAIMED`), heartbeat wins; `assignee=B ∧ ACTIVE WCL(A)`
+asserted unreachable (`assertNoClaimAssignSplit`). No report/test claims a race
+that wasn't executed. Added `P14-P2-R1-CLAIM-PROJECT-REVOKE-RACE`: `claim(A)` vs
+contract `allowed_project_ids` revocation — the in-transaction
+`assertExecutable()` project-scope closure is exercised genuinely; winner
+whichever commits first, loser fails closed, lease/CLAIM_ACQUIRED consistent.
+
+### R2.6 Validation
+- Focused P2: **55/55** (50 R1 + 5 R2, incl. genuine races)
+- Regression: Phase1 73 · P14F 35 · RH 11 · P13 67 · P12 71 · P11+r 103 · P10 31 ·
+  P9 79 · P6 36 · N22: 2097 + 2 fail (P5 env-gap, pre-existing) · N20: 2099/0 ·
+  tsc clean · build PASS · `pnpm audit --audit-level=high` clean
+- Fresh-server E2E: operator→business→agent→work-item→message over the real API;
+  receipt deleted via direct sqlite → `inbox`/`list` return `CORRUPT` (no body,
+  `corrupt: true`, never `PENDING`); server restart → reconcile appends exactly
+  one `WORK_COORDINATION_CORRUPT` on the message entity; receipt never recreated;
+  inbox still `CORRUPT` after restart.

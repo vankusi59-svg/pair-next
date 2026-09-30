@@ -304,7 +304,12 @@ export function assertCanonicalReceipt(
   const acks = evs.filter((e) => String(e.event_type) === "WORKFORCE_MESSAGE_ACKNOWLEDGED");
   const matchingAcks = acks.filter((e) => {
     const m = ((e.metadata ?? {}) as Row);
-    return String(m.recipient_agent_id ?? "") === recip &&
+    // R2 §4 — the immutable ACK event must pin ALL required fields, not
+    //  just recipient+timestamp: a malformed event metadata.message_id
+    //  that does not equal the receipt's message fails even when the
+    //  event row's entity_id otherwise matches.
+    return String(m.message_id ?? "") === mid &&
+      String(m.recipient_agent_id ?? "") === recip &&
       String(m.acknowledged_at ?? "") === String(r.acknowledged_at ?? "");
   });
   if (st === "ACKNOWLEDGED" && matchingAcks.length !== 1) {
@@ -316,6 +321,29 @@ export function assertCanonicalReceipt(
   })) {
     fail(`receipt ${rid}: PENDING with committed ACK event`);
   }
+}
+
+/**
+ * R2 §1-§2 — the canonical collaboration bundle for a message: the
+ *  message AND its deterministic receipt must BOTH exist and BOTH
+ *  validate. A missing receipt is absence of canonical evidence — it
+ *  must never be interpreted as PENDING (that would fabricate valid-
+ *  looking state). Non-recursive: message and receipt validators are
+ *  each called once.
+ */
+export function assertCanonicalCollaborationBundle(
+  deps: GraphAuthorityDeps, msg: Row,
+): Row {
+  assertCanonicalWorkforceMessage(deps, msg);
+  const mid = String(msg.message_id ?? "");
+  const recip = String(msg.recipient_agent_id ?? "");
+  const rid = receiptRowId(mid, recip);
+  const receipt = deps.store.tryGet(WORKFORCE_RECEIPT_TABLE, rid) as Row | null;
+  if (!receipt) {
+    fail(`message ${mid}: canonical receipt ${rid} missing`);
+  }
+  assertCanonicalReceipt(deps, receipt);
+  return receipt;
 }
 
 /** A lease whose expiry clock has passed. State flips to EXPIRED at the

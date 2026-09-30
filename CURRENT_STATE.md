@@ -386,7 +386,7 @@ GovernedTaskGate → executor`.
   suite `pair-p14-wfv2-p2.test.ts` (50 — 40 `P14-P2-*` + 10
   `P14-P2-R1-*` incl. genuine worker_threads races) + fresh-server E2E
   sequences A–E + restart evidence.
-  Classification: **`P14_WORKFORCE_V2_PHASE2_R1_PENDING_FINAL_AUDIT`**.
+  Classification: **`P14_WORKFORCE_V2_PHASE2_R2_PENDING_FINAL_AUDIT`**.
 
 ## Not yet
 
@@ -410,3 +410,4 @@ GovernedTaskGate → executor`.
   merge, explicit manual merge only after audit pass. `main` is NOT
   currently protected; this file does not claim otherwise (see the
   P11 hardening report §10.14).
+- **P14 WFV2 Phase 2 R2 (collaboration provenance completeness)**: missing `workforce_message_receipt` now fails closed everywhere — `assertCanonicalCollaborationBundle` derives `WIR_<mid>_<recip>` from the canonical message and requires the exact validated receipt; `inboxForAgent`/`listWorkItemMessages` return only the `CORRUPT` projection (no body, never synthesized `PENDING`); `reconcileWorkGraph` detects missing/corrupt receipts and appends one deterministic `WORK_COORDINATION_CORRUPT` per message (idempotent, never fabricates); ACK event must pin `message_id`+`recipient_agent_id`+`acknowledged_at`. `P14-P2-R1-ASSIGN-CLAIM-RACE-INVERSE` is now a genuine 2-worker race (assign vs in-txn heartbeat); added `CLAIM-PROJECT-REVOKE` race. Focused 55/55; live E2E verified delete→CORRUPT→restart→1 corrupt event, receipt never recreated.

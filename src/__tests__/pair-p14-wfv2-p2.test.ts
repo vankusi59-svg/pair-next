@@ -951,6 +951,15 @@ async function run() {
   if (op === "disable_contract") {
     return { disabled: args.agent, out: ctx.biz.setAgentContractStatus(args.agent, "DISABLED", "op") };
   }
+  if (op === "heartbeat") {
+    return { hb: args.agent, out: ctx.biz.heartbeatWorkItem(args.wid, args.agent, args.token, "op") };
+  }
+  if (op === "deny_project") {
+    return {
+      denied: args.agent,
+      out: ctx.biz.upsertAgentContract(args.agent, "op", { allowed_project_ids: [args.otherProject] }),
+    };
+  }
   throw new Error("unknown op " + op);
 }
 
@@ -1061,28 +1070,62 @@ describe("P14-P2 R1 §1-3 — genuine multi-process claim races", () => {
     finalStore.close();
   }, 90_000);
 
-  it("P14-P2-R1-ASSIGN-CLAIM-RACE-INVERSE: seeded live lease — racing assign(B) always fenced", async () => {
+  it("P14-P2-R1-ASSIGN-CLAIM-RACE-INVERSE: seeded live lease — concurrent assign(B) vs heartbeat(A)", async () => {
     const { ctx, biz } = makeStack("r1-assign-claim-inverse");
     const b = makeBiz(biz, ctx.projectId);
     const a = makeAgent(biz, String(b.business_id), "lead");
     const agentB = makeAgent(biz, String(b.business_id), "other");
     const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
     const wid = String(w.work_item_id);
-    biz.claimWorkItem(wid, String(a.agent_id), "op"); // lease committed first
+    const c = biz.claimWorkItem(wid, String(a.agent_id), "op"); // lease committed first
     const dbPath = path.join(ctx.dir, "pair.db");
 
-    // Now race assign(B) against a same-agent heartbeat — assign must lose
-    const [rAssign] = await r1Race([
+    // Genuine two-process race on one barrier: assign(B) must always lose
+    // to the seeded live lease; the claimant's heartbeat stays legal.
+    const [rAssign, rHb] = await r1Race([
       { op: "assign", dir: ctx.dir, dbPath, args: { wid, agent: String(agentB.agent_id) } },
+      { op: "heartbeat", dir: ctx.dir, dbPath, args: { wid, agent: String(a.agent_id), token: String(c.claim_token) } },
     ]);
     expect(rAssign.ok).toBe(false);
     expect(String((rAssign as { code: string }).code)).toBe("FAIL_CLOSED_WORK_ITEM_CLAIMED");
+    expect(rHb.ok).toBe(true);
 
     const finalStore = new PairEvidenceStore(dbPath);
     assertNoClaimAssignSplit(finalStore, wid);
     const row = finalStore.get("work_item", wid) as Record<string, unknown>;
     expect(String(row.assignee_agent_id)).toBe(String(a.agent_id));
     expect(String(tryLease(finalStore, wid)!.state)).toBe("ACTIVE");
+    finalStore.close();
+  }, 90_000);
+
+  it("P14-P2-R1-CLAIM-PROJECT-REVOKE-RACE: claim(A) vs project-scope denial — in-txn executability closes it", async () => {
+    const { ctx, biz } = makeStack("r1-claim-revoke-race");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    const dbPath = path.join(ctx.dir, "pair.db");
+
+    // claim(A) racing a contract update that removes project access:
+    // whichever wins first decides — never a lease minted on a revoked
+    // scope (assertExecutable is inside the claim txn).
+    const [rClaim, rDeny] = await r1Race([
+      { op: "claim", dir: ctx.dir, dbPath, args: { wid, agent: String(a.agent_id) } },
+      { op: "deny_project", dir: ctx.dir, dbPath, args: { agent: String(a.agent_id), otherProject: "PRJ_other" } },
+    ]);
+
+    const finalStore = new PairEvidenceStore(dbPath);
+    const lease = tryLease(finalStore, wid);
+    if (rClaim.ok) {
+      // claim landed before the revoke committed → whole canonical lease
+      expect(String(lease!.state)).toBe("ACTIVE");
+      expect(leaseEvents(finalStore, "WORK_CLAIM_ACQUIRED", wid)).toHaveLength(1);
+    } else {
+      // revoke committed first → claim failed closed, nothing minted
+      expect(String(rClaim.code)).toMatch(/AGENT_PROJECT_DENIED|CONTRACT|SQLITE_BUSY|FAIL_CLOSED/);
+      expect(lease).toBeNull();
+    }
+    expect(rDeny.ok).toBe(true);
     finalStore.close();
   }, 90_000);
 
@@ -1279,10 +1322,11 @@ describe("P14-P2 R1 §4-8 — provenance anchors + read seams + reconcile", () =
     const listed = biz.listWorkItemMessages(String(w.work_item_id));
     expect(String(listed.find((x) => String(x.message_id) === mid1)!.state)).toBe("CORRUPT");
     expect(listed.find((x) => String(x.message_id) === mid1)!.body).toBeUndefined();
-    // valid message still listed normally
-    expect(String(listed.find((x) => String(x.message_id) === mid2)!.body)).toBe("msg2");
+    // R2 §2: the message row itself is valid but its receipt is corrupt →
+    // the whole bundle fails closed (never surfaced as valid data)
+    expect(String(listed.find((x) => String(x.message_id) === mid2)!.state)).toBe("CORRUPT");
 
-    // inboxForAgent: corrupt receipt appears as CORRUPT marker
+    // inboxForAgent: corrupt receipt appears as CORRUPT marker on both
     const inbox = biz.inboxForAgent(String(a.agent_id));
     expect(String(inbox.find((x) => String(x.message_id) === mid1)!.receipt_status)).toBe("CORRUPT");
     expect(String(inbox.find((x) => String(x.message_id) === mid2)!.receipt_status)).toBe("CORRUPT");
@@ -1318,5 +1362,156 @@ describe("P14-P2 R1 §4-8 — provenance anchors + read seams + reconcile", () =
     wf.reconcileWorkGraph();
     wf.reconcileWorkGraph();
     expect(count()).toBe(2); // strictly idempotent — no unbounded duplicates
+  });
+});
+
+/* ========================================================================
+ * P14-P2 REMEDIATION R2 — COLLABORATION PROVENANCE COMPLETENESS
+ * ======================================================================== */
+
+import Database from "better-sqlite3";
+
+/** Direct test seam: hard-delete a receipt row (simulates evidence loss). */
+function deleteReceiptRow(dbPath: string, receiptId: string) {
+  const db = new Database(dbPath);
+  db.prepare("DELETE FROM entities WHERE entity_type='workforce_message_receipt' AND entity_id=?")
+    .run(receiptId);
+  db.close();
+}
+
+describe("P14-P2 R2 §1-4 — receipt completeness + ACK pin", () => {
+  it("P14-P2-R2-MISSING-RECEIPT-INBOX-CORRUPT: deleted receipt → CORRUPT, never PENDING", () => {
+    const { ctx, biz } = makeStack("r2-miss-rcpt-inbox");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "hi", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+    // sanity: canonical state shows PENDING
+    expect(String(biz.inboxForAgent(String(a.agent_id))[0].receipt_status)).toBe("PENDING");
+
+    deleteReceiptRow(path.join(ctx.dir, "pair.db"), `WIR_${mid}_${a.agent_id}`);
+
+    const inbox = biz.inboxForAgent(String(a.agent_id));
+    const view = inbox.find((x) => String(x.message_id) === mid)!;
+    expect(String(view.receipt_status)).toBe("CORRUPT");
+    expect(view.corrupt).toBe(true);
+    expect(view.body).toBeUndefined(); // never surface the message as valid data
+    // ack fails closed — no fabricated receipt
+    expect(errCode(() => biz.ackWorkforceMessage(mid, String(a.agent_id), "op")))
+      .toMatch(/NOT_FOUND|CORRUPT/);
+    // the receipt was NOT recreated
+    expect(ctx.store.tryGet("workforce_message_receipt", `WIR_${mid}_${a.agent_id}`)).toBeNull();
+  });
+
+  it("P14-P2-R2-MISSING-RECEIPT-MESSAGE-LIST-CORRUPT: list seam also fails closed", () => {
+    const { ctx, biz } = makeStack("r2-miss-rcpt-list");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "hi", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+    deleteReceiptRow(path.join(ctx.dir, "pair.db"), `WIR_${mid}_${a.agent_id}`);
+
+    const listed = biz.listWorkItemMessages(String(w.work_item_id));
+    const view = listed.find((x) => String(x.message_id) === mid)!;
+    expect(String(view.state)).toBe("CORRUPT");
+    expect(view.body).toBeUndefined();
+  });
+
+  it("P14-P2-R2-MISSING-RECEIPT-RECONCILE-IDEMPOTENT: one evidence, no dup, no fabrication", () => {
+    const { ctx, biz, wf } = makeStack("r2-miss-rcpt-recon");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "hi", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+    const rid = `WIR_${mid}_${a.agent_id}`;
+    deleteReceiptRow(path.join(ctx.dir, "pair.db"), rid);
+
+    const corrupt = () => ctx.store.listEvents()
+      .filter((e) => String(e.event_type) === "WORK_COORDINATION_CORRUPT");
+
+    wf.reconcileWorkGraph();
+    expect(corrupt().length).toBe(1); // deterministic evidence on the message
+    expect(String(corrupt()[0].entity_id)).toBe(mid);
+
+    wf.reconcileWorkGraph();
+    wf.reconcileWorkGraph();
+    expect(corrupt().length).toBe(1); // strictly idempotent
+    // receipt never fabricated by reconcile
+    expect(ctx.store.tryGet("workforce_message_receipt", rid)).toBeNull();
+
+    // restart: reconcile on the reopened stack still emits nothing new
+    const second = reopenStack(ctx.dir);
+    second.wf.reconcileWorkGraph();
+    const corrupt2 = second.ctx.store.listEvents()
+      .filter((e) => String(e.event_type) === "WORK_COORDINATION_CORRUPT");
+    expect(corrupt2.length).toBe(1);
+    expect(second.ctx.store.tryGet("workforce_message_receipt", rid)).toBeNull();
+  });
+
+  it("P14-P2-R2-ACK-WRONG-MESSAGE-ID-EVENT-FAILS: malformed ACK event metadata fails", () => {
+    const { ctx, biz } = makeStack("r2-ack-wrong-mid");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "hi", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+    const legitAck = biz.ackWorkforceMessage(mid, String(a.agent_id), "op");
+    const legitTs = String(legitAck.acknowledged_at);
+
+    // Forge a correctly-hashed second ACK event whose metadata pins a
+    // FOREIGN message_id (entity_id still `mid` so it collides on the
+    // surface), then point the receipt at the forged timestamp — only the
+    // message_id pin in assertCanonicalReceipt can distinguish them.
+    ctx.store.event({
+      entity_type: "workforce_message", entity_id: mid,
+      event_type: "WORKFORCE_MESSAGE_ACKNOWLEDGED",
+      actor: `agent:${a.agent_id}`,
+      metadata: {
+        message_id: "WFM_foreign", // forged pin
+        recipient_agent_id: String(a.agent_id),
+        acknowledged_at: "2030-01-01T00:00:00.000Z",
+        receipt_id: `WIR_${mid}_${a.agent_id}`,
+        work_item_id: String(w.work_item_id),
+      },
+    });
+    const rid = `WIR_${mid}_${a.agent_id}`;
+    const r = ctx.store.get("workforce_message_receipt", rid) as Record<string, unknown>;
+    r.acknowledged_at = "2030-01-01T00:00:00.000Z"; // matches forged event only
+    ctx.store.put("workforce_message_receipt", rid, r, Number(r.version));
+
+    // Read seam: receipt fails validation → CORRUPT projection
+    const inbox = biz.inboxForAgent(String(a.agent_id));
+    const view = inbox.find((x) => String(x.message_id) === mid)!;
+    expect(String(view.receipt_status)).toBe("CORRUPT");
+    // ack seam: fail closed — no matching canonical ACK event exists
+    expect(errCode(() => biz.ackWorkforceMessage(mid, String(a.agent_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+
+    // restore the real ts → the legit ACK event validates again
+    const r2 = ctx.store.get("workforce_message_receipt", rid) as Record<string, unknown>;
+    r2.acknowledged_at = legitTs;
+    ctx.store.put("workforce_message_receipt", rid, r2, Number(r2.version));
+    expect(String(biz.inboxForAgent(String(a.agent_id))
+      .find((x) => String(x.message_id) === mid)!.receipt_status))
+      .toBe("ACKNOWLEDGED");
   });
 });
