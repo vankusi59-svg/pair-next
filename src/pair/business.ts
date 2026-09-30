@@ -904,20 +904,49 @@ export class BusinessLayer {
     }
     const from = String(row.status);
     assertWorkItemTransition(from, "READY");
-    // P2: canonical lease authority — a live WCL held by a different
-    // agent blocks reassignment; an expired lease is fenced first.
-    this.assertNoForeignLiveLease(row, agentId);
-    row.assignee_agent_id = agentId;
-    row.department = row.department || String(agent.department ?? "");
-    row.status = "READY";
-    row.updated_at = utcnow();
-    const saved = this.store.put("work_item", workItemId, row, Number(row.version));
-    this.store.event({
-      entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_ASSIGNED",
-      old_state: from, new_state: "READY", actor: `operator:${actor}`,
-      metadata: { assignee_agent_id: agentId },
+    // P2 R1 §2 — ONE canonical assignment transaction: the work item,
+    //  the assignee-immutability rule, the agent, the transition and the
+    //  live-lease gate are all re-proved on current rows inside this
+    //  immediate() and the assignment CAS is committed together — no
+    //  interleaving can produce ACTIVE WCL(A) with assignee B.
+    return this.store.immediate(() => {
+      const cur = this.store.get("work_item", workItemId);
+      this.assertWorkItemNotQuarantined(cur);
+      this.assertGraphAuthority(cur);
+      if (String(cur.assignee_agent_id ?? "") !== agentId) {
+        const membership = this.store.tryGet(
+          "work_graph_membership", membershipRowId(workItemId)) as Row | null;
+        const graphBound =
+          membership !== null && String(membership.membership_type) !== "STANDALONE";
+        if (graphBound) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE",
+            `graph-bound assignee on ${workItemId} — committed delegation/decomposition authority`,
+          );
+        }
+      }
+      const curAgent = this.store.get("org_agent", agentId);
+      if (String(curAgent.business_id) !== String(cur.business_id)) {
+        throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `assignee outside business ${String(cur.business_id)}`);
+      }
+      if (String(curAgent.status) !== "ACTIVE") {
+        throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
+      }
+      const curFrom = String(cur.status);
+      assertWorkItemTransition(curFrom, "READY");
+      this.leaseGateInTxn(cur, agentId, "PAIR_BUSINESS_LAYER");
+      cur.assignee_agent_id = agentId;
+      cur.department = cur.department || String(curAgent.department ?? "");
+      cur.status = "READY";
+      cur.updated_at = utcnow();
+      const saved = this.store.put("work_item", workItemId, cur, Number(cur.version));
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId, event_type: "WORK_ITEM_ASSIGNED",
+        old_state: curFrom, new_state: "READY", actor: `operator:${actor}`,
+        metadata: { assignee_agent_id: agentId },
+      });
+      return saved;
     });
-    return saved;
   }
 
   /**
@@ -1519,6 +1548,46 @@ export class BusinessLayer {
     const nowIso = utcnow();
     const leaseId = claimLeaseRowId(workItemId);
     const out = this.store.immediate(() => {
+      // R1 §1/§3 — decisive claim admission is re-proved on the CURRENT
+      //  rows inside this write transaction: the preflight above is fast
+      //  error reporting only, never authority. A concurrent assign /
+      //  pause / terminate / contract-disable / project revocation can
+      //  never race through this gate.
+      const cur0 = this.store.get("work_item", workItemId);
+      this.assertWorkItemNotQuarantined(cur0);
+      this.assertGraphAuthority(cur0);
+      if (TERMINAL_WORK_ITEM_STATUSES.has(String(cur0.status))) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_ITEM_STATE", `${String(cur0.status)} cannot be claimed`);
+      }
+      const curAgent = this.store.get("org_agent", agentId);
+      const curBusiness = this.getBusiness(String(cur0.business_id));
+      if (String(curAgent.business_id) !== String(cur0.business_id)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_AGENT_BUSINESS_MISMATCH",
+          `claimant ${agentId} not in business ${String(cur0.business_id)}`,
+        );
+      }
+      if (String(curAgent.status) !== "ACTIVE") {
+        throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
+      }
+      const curAssignee = cur0.assignee_agent_id ? String(cur0.assignee_agent_id) : null;
+      if (!curAssignee) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_ITEM_UNASSIGNED",
+          `${workItemId} has no assignee — assign before claiming`,
+        );
+      }
+      if (curAssignee !== agentId) {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_ITEM_CLAIM_ASSIGNEE_MISMATCH",
+          `${workItemId} is assigned to ${curAssignee}, not ${agentId}`,
+        );
+      }
+      this.agentContracts.assertExecutable(agentId, {
+        businessId: String(cur0.business_id),
+        projectId: String(curBusiness.project_id),
+      });
       const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, leaseId) as Row | null;
       if (lease) assertCanonicalClaimLease(this.coordDeps(), lease);
       if (lease && String(lease.state) === "ACTIVE") {
@@ -1545,8 +1614,8 @@ export class BusinessLayer {
       const next: Row = {
         lease_id: leaseId,
         work_item_id: workItemId,
-        business_id: String(row.business_id),
-        project_id: String(business.project_id),
+        business_id: String(cur0.business_id),
+        project_id: String(curBusiness.project_id),
         claimant_agent_id: agentId,
         lease_epoch: epoch,
         token_digest: claimTokenDigest(token),
@@ -1591,6 +1660,8 @@ export class BusinessLayer {
     const business = this.getBusiness(String(row.business_id));
     const leaseId = claimLeaseRowId(workItemId);
     const out = this.store.immediate(() => {
+      // R1 §3 — quarantine + lease state re-proved inside the write txn.
+      this.assertWorkItemNotQuarantined(this.store.get("work_item", workItemId));
       const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, leaseId) as Row | null;
       if (!lease) {
         throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_NOT_CLAIMED", `${workItemId} has no claim lease`);
@@ -1691,9 +1762,12 @@ export class BusinessLayer {
     });
   }
 
-  /** Safe lease metadata for reads — never token material (§13). */
+  /** Safe lease metadata for reads — never token material (§13). R1 §7:
+   *  the canonical lease is validated before any metadata is returned —
+   *  a corrupt WCL is never surfaced as valid claim state. */
   getWorkItemClaim(workItemId: string): Record<string, unknown> | null {
     const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+    if (lease) assertCanonicalClaimLease(this.coordDeps(), lease);
     return lease ? safeLeaseView(lease) : null;
   }
 
@@ -1705,60 +1779,67 @@ export class BusinessLayer {
    * mirrors without a WCL row are legacy phantoms and are invalidated.
    */
   private assertNoForeignLiveLease(row: Row, agentId: string | null): void {
-    const lease = this.canonicalClaimLease(String(row.work_item_id));
-    const nowIso = utcnow();
+    const workItemId = String(row.work_item_id);
     this.store.immediate(() => {
-      if (lease && String(lease.state) === "ACTIVE") {
-        if (leaseLiveExpired(lease, nowIso)) {
-          this.transitionLease(lease, "EXPIRED", "PAIR_BUSINESS_LAYER", {
-            work_item_id: String(row.work_item_id),
-          });
-        } else if (String(lease.claimant_agent_id) !== agentId) {
-          throw new PolicyError(
-            "FAIL_CLOSED_WORK_ITEM_CLAIMED",
-            `held by ${String(lease.claimant_agent_id)} until ${String(lease.expires_at)}`,
-          );
-        }
-      }
-      // Legacy/phantom mirrors: mirrors that do not reflect a live
-      // canonical lease are observability noise — never authority (§9).
-      const cur = this.store.get("work_item", String(row.work_item_id));
-      const liveBy = lease && String(lease.state) === "ACTIVE" && !leaseLiveExpired(lease, nowIso)
-        ? String(lease.claimant_agent_id)
-        : null;
-      const wantsBy = liveBy;
-      const wantsExp = liveBy ? String(lease?.expires_at) : null;
-      if (
-        String(cur.claimed_by ?? "") !== String(wantsBy ?? "") ||
-        String(cur.claim_expires_at ?? "") !== String(wantsExp ?? "") ||
-        cur.claim_token !== null && cur.claim_token !== undefined
-      ) {
-        const hadPhantom = Boolean(cur.claimed_by) || cur.claim_token !== null && cur.claim_token !== undefined;
-        cur.claimed_by = wantsBy;
-        cur.claim_expires_at = wantsExp;
-        cur.claim_token = null;
-        cur.updated_at = nowIso;
-        this.store.put("work_item", String(row.work_item_id), cur, Number(cur.version));
-        if (hadPhantom && !liveBy) {
-          this.store.event({
-            entity_type: "work_item", entity_id: String(row.work_item_id),
-            event_type: "WORK_CLAIM_MIRRORS_CLEARED",
-            actor: "PAIR_BUSINESS_LAYER",
-            metadata: { work_item_id: String(row.work_item_id), lease_id: lease ? String(lease.lease_id) : null },
-          });
-        }
+      // R1 §2 — the lease is read + validated INSIDE this txn; no stale
+      //  snapshot is ever carried across the commit boundary.
+      const cur = this.store.get("work_item", workItemId);
+      const mirrorChanged = this.leaseGateInTxn(cur, agentId, "PAIR_BUSINESS_LAYER");
+      if (mirrorChanged) {
+        this.store.put("work_item", workItemId, cur, Number(cur.version));
       }
     });
     // The gate may have bumped the row (mirror repair / EXPIRED fencing);
     // keep the caller's reference in sync so its own CAS write lands.
-    Object.assign(row, this.store.get("work_item", String(row.work_item_id)));
+    Object.assign(row, this.store.get("work_item", workItemId));
   }
 
-  /** The canonical lease for a work item, validated if present. */
-  private canonicalClaimLease(workItemId: string): Row | null {
-    const lease = this.store.tryGet(WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+  /**
+   * In-txn lease gate (R1 §2): reads + validates the CURRENT WCL on
+   *  `cur`, fences a lapsed ACTIVE lease to EXPIRED, rejects a live
+   *  foreign claimant, and repairs `cur`'s mirror fields in place (the
+   *  caller owns the work_item write). Returns true when mirrors changed.
+   *  Caller must already be inside store.immediate().
+   */
+  private leaseGateInTxn(cur: Row, agentId: string | null, actor: string): boolean {
+    const workItemId = String(cur.work_item_id);
+    const lease = this.store.tryGet(
+      WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
     if (lease) assertCanonicalClaimLease(this.coordDeps(), lease);
-    return lease;
+    const nowIso = utcnow();
+    if (lease && String(lease.state) === "ACTIVE") {
+      if (leaseLiveExpired(lease, nowIso)) {
+        this.transitionLease(lease, "EXPIRED", actor, { work_item_id: workItemId });
+      } else if (String(lease.claimant_agent_id) !== String(agentId ?? "")) {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_ITEM_CLAIMED",
+          `held by ${String(lease.claimant_agent_id)} until ${String(lease.expires_at)}`,
+        );
+      }
+    }
+    const live = lease && String(lease.state) === "ACTIVE" && !leaseLiveExpired(lease, nowIso);
+    const wantsBy = live ? String(lease!.claimant_agent_id) : null;
+    const wantsExp = live ? String(lease!.expires_at) : null;
+    const drift =
+      String(cur.claimed_by ?? "") !== String(wantsBy ?? "") ||
+      String(cur.claim_expires_at ?? "") !== String(wantsExp ?? "") ||
+      (cur.claim_token !== null && cur.claim_token !== undefined);
+    if (!drift) return false;
+    const hadPhantom =
+      Boolean(cur.claimed_by) || (cur.claim_token !== null && cur.claim_token !== undefined);
+    cur.claimed_by = wantsBy;
+    cur.claim_expires_at = wantsExp;
+    cur.claim_token = null;
+    cur.updated_at = nowIso;
+    if (hadPhantom && !live) {
+      this.store.event({
+        entity_type: "work_item", entity_id: workItemId,
+        event_type: "WORK_CLAIM_MIRRORS_CLEARED",
+        actor: `PAIR_${actor.startsWith("PAIR_") ? actor.slice(5) : actor}`,
+        metadata: { work_item_id: workItemId, lease_id: lease ? String(lease.lease_id) : null },
+      });
+    }
+    return true;
   }
 
   private coordDeps(): GraphAuthorityDeps {
@@ -1886,6 +1967,9 @@ export class BusinessLayer {
         updated_at: now,
         version: 0,
       } as Row, 0);
+      // R1 §5 — the append-only SENT event pins every canonical field +
+      //  the message digest (never the body): a later tamper that even
+      //  recomputes the row digest still fails against this anchor.
       this.store.event({
         entity_type: WORKFORCE_MESSAGE_TABLE, entity_id: messageId,
         event_type: "WORKFORCE_MESSAGE_SENT",
@@ -1893,10 +1977,18 @@ export class BusinessLayer {
           ? `agent:${String(input.sender_agent_id)}`
           : `operator:${String(input.sender_operator_id)}`,
         metadata: {
+          message_id: messageId,
           business_id: input.business_id,
           work_item_id: input.work_item_id ?? null,
+          sender_type: String(input.sender_type),
+          sender_agent_id: input.sender_agent_id ?? null,
+          sender_operator_id: input.sender_operator_id ?? null,
           recipient_agent_id: String(input.recipient_agent_id),
           kind: String(input.kind),
+          correlation_id: input.correlation_id ?? null,
+          message_digest: msg.message_digest,
+          receipt_id: rid,
+          receipt_created_at: now,
         },
       });
       return saved;
@@ -1905,23 +1997,61 @@ export class BusinessLayer {
 
   listWorkItemMessages(workItemId: string): Row[] {
     this.store.get("work_item", workItemId);
+    const deps = this.coordDeps();
+    // R1 §7 — a corrupt row is never surfaced as valid inbox data: it is
+    //  replaced by an explicit corruption projection (no body content).
     return this.store.list(WORKFORCE_MESSAGE_TABLE)
       .filter((m) => String(m.work_item_id) === workItemId)
-      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
+      .map((m) => {
+        try {
+          assertCanonicalWorkforceMessage(deps, m);
+          return m;
+        } catch {
+          return {
+            message_id: m.message_id, work_item_id: m.work_item_id,
+            state: "CORRUPT", corrupt: true,
+            version: Number(m.version ?? 0),
+          } as Row;
+        }
+      });
   }
 
   /** Durable agent inbox: messages + their receipt status. */
   inboxForAgent(agentId: string): Row[] {
     this.store.get("org_agent", agentId);
+    const deps = this.coordDeps();
     return this.store.list(WORKFORCE_MESSAGE_TABLE)
       .filter((m) => String(m.recipient_agent_id) === agentId)
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
       .map((m) => {
+        try {
+          assertCanonicalWorkforceMessage(deps, m);
+        } catch {
+          return {
+            message_id: m.message_id, state: "CORRUPT",
+            receipt_status: "CORRUPT", corrupt: true,
+            version: Number(m.version ?? 0),
+          } as Row;
+        }
         const r = this.store.tryGet(
           WORKFORCE_RECEIPT_TABLE,
           receiptRowId(String(m.message_id), agentId),
         ) as Row | null;
-        return { ...m, receipt_status: r ? String(r.status) : "PENDING" };
+        let status = "PENDING";
+        if (r) {
+          try {
+            assertCanonicalReceipt(deps, r);
+            status = String(r.status);
+          } catch {
+            return {
+              message_id: m.message_id, state: "COMMITTED",
+              receipt_status: "CORRUPT", corrupt: true,
+              version: Number(r.version ?? 0),
+            } as Row;
+          }
+        }
+        return { ...m, receipt_status: status };
       });
   }
 
@@ -1940,13 +2070,25 @@ export class BusinessLayer {
       const receipt = this.store.get(WORKFORCE_RECEIPT_TABLE, rid);
       assertCanonicalReceipt(this.coordDeps(), receipt);
       if (String(receipt.status) === "ACKNOWLEDGED") return receipt; // idempotent
-      const next = { ...receipt, status: "ACKNOWLEDGED", acknowledged_at: utcnow(), updated_at: utcnow() };
+      const ackedAt = utcnow();
+      const next = {
+        ...receipt, status: "ACKNOWLEDGED",
+        acknowledged_at: ackedAt, updated_at: ackedAt,
+      };
       const saved = this.store.put(WORKFORCE_RECEIPT_TABLE, rid, next, Number(receipt.version));
+      // R1 §6 — the ACK event pins the exact acked fields; a forged
+      //  ACKNOWLEDGED row without this anchor is provenance-corrupt.
       this.store.event({
         entity_type: WORKFORCE_MESSAGE_TABLE, entity_id: messageId,
         event_type: "WORKFORCE_MESSAGE_ACKNOWLEDGED",
         actor: `agent:${agentId}`,
-        metadata: { recipient_agent_id: agentId, work_item_id: msg.work_item_id ?? null },
+        metadata: {
+          message_id: messageId,
+          recipient_agent_id: agentId,
+          acknowledged_at: ackedAt,
+          receipt_id: rid,
+          work_item_id: msg.work_item_id ?? null,
+        },
       });
       return saved;
     });

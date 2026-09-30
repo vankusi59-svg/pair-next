@@ -363,10 +363,30 @@ GovernedTaskGate → executor`.
 - **Reconcile:** WCL validation (corrupt → quarantine), deterministic
   expiry fencing, mirror repair, message/receipt validation —
   idempotent, never fabricates, never terminates missions.
-- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE2_REPORT.md`; suite
-  `pair-p14-wfv2-p2.test.ts` (40 `P14-P2-*`) + fresh-server E2E
+- **R1 — atomic admission + immutable provenance:**
+  - `claimWorkItem`: the decisive admission proof (work_item, business,
+    WGM/graph authority, status, assignee, org_agent ACTIVE,
+    `assertExecutable`, existing WCL) is re-run **inside** the
+    `immediate()` that writes the lease — preflight outside is fast-path
+    only, not authority (TOCTOU closed).
+  - `assignWorkItem`: re-read + quarantine + graph authority + assignee
+    immutability + agent + transition + `leaseGateInTxn` + assignee CAS
+    in ONE `immediate()` — `assignee=B ∧ ACTIVE WCL(A)` unreachable.
+  - Lease validator requires `issued <= hb < expires_at` strictly.
+  - `WORKFORCE_MESSAGE_SENT` pins the full message identity +
+    `message_digest` + receipt anchor; `WORKFORCE_MESSAGE_ACKNOWLEDGED`
+    pins `message_id + recipient + acknowledged_at` — tamper-and-rehash
+    fails at the event anchor; direct row ACK without event fails.
+  - Read seams (`listWorkItemMessages`, `inboxForAgent`,
+    `getWorkItemClaim`) validate before returning — corrupt rows surface
+    as explicit CORRUPT markers, never as valid content.
+  - `reconcileWorkGraph` appends `WORK_COORDINATION_CORRUPT` at most once
+    per row — repeated passes are no-ops.
+- Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE2_REPORT.md` (§R1);
+  suite `pair-p14-wfv2-p2.test.ts` (50 — 40 `P14-P2-*` + 10
+  `P14-P2-R1-*` incl. genuine worker_threads races) + fresh-server E2E
   sequences A–E + restart evidence.
-  Classification: **`P14_WORKFORCE_V2_PHASE2_PENDING_INDEPENDENT_AUDIT`**.
+  Classification: **`P14_WORKFORCE_V2_PHASE2_R1_PENDING_FINAL_AUDIT`**.
 
 ## Not yet
 

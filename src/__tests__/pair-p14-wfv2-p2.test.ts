@@ -29,6 +29,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
@@ -49,8 +51,10 @@ import {
   RecoveryController,
   WorkforceService,
   claimLeaseDigest,
+  claimTokenDigest,
   createMissionControlServer,
   utcnow,
+  workforceMessageDigest,
 } from "../pair/index.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p14wfv2p2-"));
@@ -885,5 +889,434 @@ describe("P14-P2 API surface (§13)", () => {
     } finally {
       server.close();
     }
+  });
+});
+
+/* ========================================================================
+ * P14-P2 REMEDIATION R1 — ATOMIC CLAIM ADMISSION + IMMUTABLE PROVENANCE
+ * ======================================================================== */
+
+const R1_CACHE = path.join(process.cwd(), "node_modules", ".cache", "pair-p2-r1");
+const R1_BUNDLE = path.join(R1_CACHE, "pair-bundle.mjs");
+const R1_WORKER = path.join(R1_CACHE, "r1-worker.mjs");
+
+const R1_WORKER_SOURCE = `
+import { workerData, parentPort } from "node:worker_threads";
+import fs from "node:fs";
+import path from "node:path";
+import * as PAIR from "./pair-bundle.mjs";
+
+const { op, dbPath, dir, barrier, args } = workerData;
+
+function makeCtx() {
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const store = new PAIR.PairEvidenceStore(dbPath);
+  const service = new PAIR.PairControlPlane(store);
+  const gate = new PAIR.GovernedTaskGate(service);
+  const router = new PAIR.MissionRouter(service, gate);
+  const recovery = new PAIR.RecoveryController(service);
+  const recon = new PAIR.ReconciliationService(service, new Map());
+  const approvals = new PAIR.ApprovalQueue(service);
+  const scheduler = new PAIR.MissionScheduler(service, { mission_concurrency: 2 });
+  const adapters = new Map();
+  const planner = () => ({ tasks: [{ task_key: "T1", title: "t1", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }] });
+  const runtime = new PAIR.MissionRuntime({
+    service, gate, router, adapters, scheduler, approvals,
+    reconciliation: recon, recovery, planner,
+  });
+  const supervisor = new PAIR.MissionSupervisor(service, runtime, recovery, recon);
+  const observability = new PAIR.MissionObservability(service);
+  const control = new PAIR.MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability, planner,
+  });
+  const schedules = new PAIR.MissionScheduleService(service);
+  const biz = new PAIR.BusinessLayer({ store, control, schedules });
+  return { store, service, control, schedules, biz };
+}
+
+async function run() {
+  const ctx = makeCtx();
+  parentPort.postMessage({ ready: true });
+  Atomics.wait(barrier, 0, 0);
+  if (op === "claim") {
+    return { claimed: args.agent, out: ctx.biz.claimWorkItem(args.wid, args.agent, "op") };
+  }
+  if (op === "assign") {
+    return { assigned: args.agent, out: ctx.biz.assignWorkItem(args.wid, args.agent, "op") };
+  }
+  if (op === "pause") {
+    return { paused: args.agent, out: ctx.biz.setOrgAgentStatus(args.agent, "PAUSED", "op") };
+  }
+  if (op === "disable_contract") {
+    return { disabled: args.agent, out: ctx.biz.setAgentContractStatus(args.agent, "DISABLED", "op") };
+  }
+  throw new Error("unknown op " + op);
+}
+
+run()
+  .then((out) => parentPort.postMessage({ ok: true, out }))
+  .catch((e) => parentPort.postMessage({
+    ok: false, code: (e && e.code) || String(e), message: e && e.message,
+  }));
+`;
+
+function ensureR1Worker() {
+  fs.mkdirSync(R1_CACHE, { recursive: true });
+  const esbuild = fs
+    .readdirSync("node_modules/.pnpm")
+    .filter((d) => d.startsWith("esbuild@"))
+    .map((d) => path.join("node_modules/.pnpm", d, "node_modules/esbuild/bin/esbuild"))
+    .filter((p) => fs.existsSync(p))
+    .sort()
+    .at(-1);
+  if (!esbuild) throw new Error("esbuild binary not found under node_modules/.pnpm");
+  execFileSync(esbuild, [
+    "src/pair/index.ts", "--bundle", "--format=esm", "--platform=node",
+    "--external:better-sqlite3", "--external:ulid", "--external:yaml",
+    `--outfile=${R1_BUNDLE}`,
+  ], { cwd: process.cwd(), stdio: "pipe" });
+  fs.writeFileSync(R1_WORKER, R1_WORKER_SOURCE);
+}
+
+type R1Outcome =
+  | { ok: true; out: Record<string, unknown> }
+  | { ok: false; code: string; message: string };
+
+/** Genuine multi-process race: N workers on the SAME db file, all
+ *  released on one shared Atomics barrier. */
+async function r1Race(
+  ops: Array<{ op: string; dir: string; dbPath: string; args: Record<string, unknown> }>,
+): Promise<R1Outcome[]> {
+  ensureR1Worker();
+  const sab = new SharedArrayBuffer(4);
+  const gate = new Int32Array(sab);
+  let ready = 0;
+  return Promise.all(ops.map((o) => new Promise<R1Outcome>((resolve, reject) => {
+    const w = new Worker(R1_WORKER, {
+      workerData: { op: o.op, dbPath: o.dbPath, dir: o.dir, barrier: gate, args: o.args },
+    });
+    let settled = false;
+    w.on("message", (msg: Record<string, unknown>) => {
+      if (msg.ready === true) {
+        ready += 1;
+        if (ready === ops.length) {
+          Atomics.store(gate, 0, 1);
+          Atomics.notify(gate, 0);
+        }
+        return;
+      }
+      settled = true;
+      resolve(msg as unknown as R1Outcome);
+    });
+    w.on("error", reject);
+    w.on("exit", (code) => {
+      if (!settled) reject(new Error(`worker exited code=${code}`));
+    });
+  })));
+}
+
+/** Final invariant from §2: never ACTIVE lease held by A while assignee is B. */
+function assertNoClaimAssignSplit(store: PairEvidenceStore, wid: string) {
+  const lease = tryLease(store, wid);
+  const row = store.get("work_item", wid) as Record<string, unknown>;
+  if (lease && String(lease.state) === "ACTIVE") {
+    expect(String(row.assignee_agent_id)).toBe(String(lease.claimant_agent_id));
+  }
+}
+
+describe("P14-P2 R1 §1-3 — genuine multi-process claim races", () => {
+  it("P14-P2-R1-CLAIM-ASSIGN-RACE: claim(A) vs assign(B) — never ACTIVE WCL(A) + assignee B", async () => {
+    const { ctx, biz } = makeStack("r1-claim-assign-race");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const agentB = makeAgent(biz, String(b.business_id), "other");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    const dbPath = path.join(ctx.dir, "pair.db");
+
+    const [r1, r2] = await r1Race([
+      { op: "claim", dir: ctx.dir, dbPath, args: { wid, agent: String(a.agent_id) } },
+      { op: "assign", dir: ctx.dir, dbPath, args: { wid, agent: String(agentB.agent_id) } },
+    ]);
+    // exactly one outcome wins the admission race; the loser fails closed
+    const ok = [r1, r2].filter((r) => r.ok);
+    expect(ok.length).toBe(1);
+    const fail = [r1, r2].find((r) => !r.ok) as R1Outcome;
+    expect(String(fail.code)).toMatch(/^FAIL_CLOSED_|SQLITE_BUSY/);
+
+    const finalStore = new PairEvidenceStore(dbPath);
+    assertNoClaimAssignSplit(finalStore, wid);
+    const lease = tryLease(finalStore, wid);
+    const row = finalStore.get("work_item", wid) as Record<string, unknown>;
+    // whichever op won, its effects are complete and canonical
+    if (r1.ok) {
+      expect(String(lease!.state)).toBe("ACTIVE");
+      expect(String(lease!.claimant_agent_id)).toBe(String(a.agent_id));
+      expect(String(row.assignee_agent_id)).toBe(String(a.agent_id));
+    } else {
+      expect(String(row.assignee_agent_id)).toBe(String(agentB.agent_id));
+      expect(lease === null || String(lease.state) !== "ACTIVE").toBe(true);
+    }
+    finalStore.close();
+  }, 90_000);
+
+  it("P14-P2-R1-ASSIGN-CLAIM-RACE-INVERSE: seeded live lease — racing assign(B) always fenced", async () => {
+    const { ctx, biz } = makeStack("r1-assign-claim-inverse");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const agentB = makeAgent(biz, String(b.business_id), "other");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    biz.claimWorkItem(wid, String(a.agent_id), "op"); // lease committed first
+    const dbPath = path.join(ctx.dir, "pair.db");
+
+    // Now race assign(B) against a same-agent heartbeat — assign must lose
+    const [rAssign] = await r1Race([
+      { op: "assign", dir: ctx.dir, dbPath, args: { wid, agent: String(agentB.agent_id) } },
+    ]);
+    expect(rAssign.ok).toBe(false);
+    expect(String((rAssign as { code: string }).code)).toBe("FAIL_CLOSED_WORK_ITEM_CLAIMED");
+
+    const finalStore = new PairEvidenceStore(dbPath);
+    assertNoClaimAssignSplit(finalStore, wid);
+    const row = finalStore.get("work_item", wid) as Record<string, unknown>;
+    expect(String(row.assignee_agent_id)).toBe(String(a.agent_id));
+    expect(String(tryLease(finalStore, wid)!.state)).toBe("ACTIVE");
+    finalStore.close();
+  }, 90_000);
+
+  it("P14-P2-R1-CLAIM-PAUSE-RACE: claim(A) vs pause(A) — committed lease only if agent was ACTIVE at write", async () => {
+    const { ctx, biz } = makeStack("r1-claim-pause-race");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    const dbPath = path.join(ctx.dir, "pair.db");
+
+    const [rClaim, rPause] = await r1Race([
+      { op: "claim", dir: ctx.dir, dbPath, args: { wid, agent: String(a.agent_id) } },
+      { op: "pause", dir: ctx.dir, dbPath, args: { agent: String(a.agent_id) } },
+    ]);
+
+    const finalStore = new PairEvidenceStore(dbPath);
+    const lease = tryLease(finalStore, wid);
+    const agent = finalStore.get("org_agent", String(a.agent_id)) as Record<string, unknown>;
+    expect(String(agent.status)).toBe("PAUSED");
+    if (rClaim.ok) {
+      // claim won the txn before the pause committed → lease is whole + canonical
+      expect(String(lease!.state)).toBe("ACTIVE");
+      expect(leaseEvents(finalStore, "WORK_CLAIM_ACQUIRED", wid)).toHaveLength(1);
+    } else {
+      // pause committed first → claim failed closed, no lease minted
+      expect(String(rClaim.code)).toMatch(/AGENT_INACTIVE|CONTRACT|SQLITE_BUSY/);
+      expect(lease).toBeNull();
+    }
+    expect(rPause.ok).toBe(true);
+    finalStore.close();
+  }, 90_000);
+
+  it("P14-P2-R1-CLAIM-CONTRACT-DISABLE-RACE: claim(A) vs contract DISABLED — same atomic semantics", async () => {
+    const { ctx, biz } = makeStack("r1-claim-disable-race");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    const dbPath = path.join(ctx.dir, "pair.db");
+
+    const [rClaim, rDis] = await r1Race([
+      { op: "claim", dir: ctx.dir, dbPath, args: { wid, agent: String(a.agent_id) } },
+      { op: "disable_contract", dir: ctx.dir, dbPath, args: { agent: String(a.agent_id) } },
+    ]);
+
+    const finalStore = new PairEvidenceStore(dbPath);
+    const lease = tryLease(finalStore, wid);
+    const contract = finalStore.list("agent_execution_contract")
+      .find((x) => String((x as Record<string, unknown>).org_agent_id) === String(a.agent_id)) as Record<string, unknown>;
+    expect(String(contract.status)).toBe("DISABLED");
+    if (rClaim.ok) {
+      expect(String(lease!.state)).toBe("ACTIVE");
+      expect(leaseEvents(finalStore, "WORK_CLAIM_ACQUIRED", wid)).toHaveLength(1);
+    } else {
+      expect(String(rClaim.code)).toMatch(/CONTRACT_DISABLED|AGENT_CONTRACT|SQLITE_BUSY/);
+      expect(lease).toBeNull();
+    }
+    expect(rDis.ok).toBe(true);
+    finalStore.close();
+  }, 90_000);
+});
+
+describe("P14-P2 R1 §4-8 — provenance anchors + read seams + reconcile", () => {
+  it("P14-P2-R1-LEASE-TIME-ORDER: hb >= expires_at → PROVENANCE_CORRUPT", () => {
+    const { ctx, biz } = makeStack("r1-lease-time-order");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const wid = String(w.work_item_id);
+    const c = biz.claimWorkItem(wid, String(a.agent_id), "op");
+
+    // Forge: heartbeat == expiry (violates hb < exp), digest recomputed
+    const l = ctx.store.get("work_claim_lease", `WCL_${wid}`) as Record<string, unknown>;
+    l.last_heartbeat_at = String(l.expires_at);
+    l.lease_digest = claimLeaseDigest(l);
+    ctx.store.put("work_claim_lease", `WCL_${wid}`, l, Number(l.version));
+
+    expect(errCode(() => biz.getWorkItemClaim(wid))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+    expect(errCode(() =>
+      biz.heartbeatWorkItem(wid, String(a.agent_id), String(c.claim_token), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+
+    // malformed (unparseable) timestamp also fails closed
+    const l2 = ctx.store.get("work_claim_lease", `WCL_${wid}`) as Record<string, unknown>;
+    l2.last_heartbeat_at = "not-a-timestamp";
+    l2.lease_digest = claimLeaseDigest(l2);
+    ctx.store.put("work_claim_lease", `WCL_${wid}`, l2, Number(l2.version));
+    expect(errCode(() => biz.getWorkItemClaim(wid))).toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-P2-R1-MESSAGE-TAMPER-REHASH: recomputed digest still fails — SENT event pins original", () => {
+    const { ctx, biz } = makeStack("r1-msg-tamper");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "original body", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+
+    // Tamper: new body + CORRECTLY recomputed digest — self-consistent row
+    const m2 = ctx.store.get("workforce_message", mid) as Record<string, unknown>;
+    m2.body = "forged body";
+    m2.message_digest = workforceMessageDigest(m2);
+    ctx.store.put("workforce_message", mid, m2, Number(m2.version));
+
+    // Read seam surfaces explicit corruption, never forged content
+    const listed = biz.listWorkItemMessages(String(w.work_item_id));
+    const corrupt = listed.find((x) => String(x.message_id) === mid)!;
+    expect(String(corrupt.state)).toBe("CORRUPT");
+    expect(corrupt.body).toBeUndefined();
+    expect(errCode(() => biz.ackWorkforceMessage(mid, String(a.agent_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-P2-R1-RECEIPT-FORGED-ACK: row PENDING→ACK without event fails closed", () => {
+    const { ctx, biz } = makeStack("r1-rcpt-forge");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "hi", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+    const rid = `WIR_${mid}_${a.agent_id}`;
+
+    // Forge: direct row mutation to ACKNOWLEDGED — no ACK event exists
+    const r = ctx.store.get("workforce_message_receipt", rid) as Record<string, unknown>;
+    r.status = "ACKNOWLEDGED";
+    r.acknowledged_at = utcnow();
+    ctx.store.put("workforce_message_receipt", rid, r, Number(r.version));
+
+    const inbox = biz.inboxForAgent(String(a.agent_id));
+    const view = inbox.find((x) => String(x.message_id) === mid)!;
+    expect(String(view.receipt_status)).toBe("CORRUPT");
+    expect(errCode(() => biz.ackWorkforceMessage(mid, String(a.agent_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT");
+  });
+
+  it("P14-P2-R1-ACK-EVENT-IDEMPOTENT: duplicate ACK creates exactly one event", () => {
+    const { ctx, biz } = makeStack("r1-ack-idem");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "hi", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+    const r1 = biz.ackWorkforceMessage(mid, String(a.agent_id), "op");
+    const r2 = biz.ackWorkforceMessage(mid, String(a.agent_id), "op");
+    expect(String(r1.acknowledged_at)).toBe(String(r2.acknowledged_at));
+    const acks = ctx.store.listEvents("workforce_message", mid)
+      .filter((e) => String(e.event_type) === "WORKFORCE_MESSAGE_ACKNOWLEDGED");
+    expect(acks).toHaveLength(1);
+  });
+
+  it("P14-P2-R1-CORRUPT-MESSAGE-READ-FAILS + CORRUPT-RECEIPT-READ-FAILS: seams never surface forged rows", () => {
+    const { ctx, biz } = makeStack("r1-corrupt-reads");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m1 = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "msg1", work_item_id: String(w.work_item_id),
+    });
+    const m2 = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "msg2", work_item_id: String(w.work_item_id),
+    });
+    const mid1 = String(m1.message_id);
+    const mid2 = String(m2.message_id);
+
+    // Corrupt message row: digest mismatch (body edited, digest stale)
+    const mm = ctx.store.get("workforce_message", mid1) as Record<string, unknown>;
+    mm.body = "tampered";
+    ctx.store.put("workforce_message", mid1, mm, Number(mm.version));
+
+    // Corrupt receipt row: recipient mismatch vs deterministic id
+    const rid2 = `WIR_${mid2}_${a.agent_id}`;
+    const rr = ctx.store.get("workforce_message_receipt", rid2) as Record<string, unknown>;
+    rr.status = "BOGUS_STATUS";
+    ctx.store.put("workforce_message_receipt", rid2, rr, Number(rr.version));
+
+    // listWorkItemMessages: corrupt message appears only as CORRUPT marker
+    const listed = biz.listWorkItemMessages(String(w.work_item_id));
+    expect(String(listed.find((x) => String(x.message_id) === mid1)!.state)).toBe("CORRUPT");
+    expect(listed.find((x) => String(x.message_id) === mid1)!.body).toBeUndefined();
+    // valid message still listed normally
+    expect(String(listed.find((x) => String(x.message_id) === mid2)!.body)).toBe("msg2");
+
+    // inboxForAgent: corrupt receipt appears as CORRUPT marker
+    const inbox = biz.inboxForAgent(String(a.agent_id));
+    expect(String(inbox.find((x) => String(x.message_id) === mid1)!.receipt_status)).toBe("CORRUPT");
+    expect(String(inbox.find((x) => String(x.message_id) === mid2)!.receipt_status)).toBe("CORRUPT");
+  });
+
+  it("P14-P2-R1-CORRUPT-RECONCILE-IDEMPOTENT: second reconcile adds no duplicate evidence", () => {
+    const { ctx, biz, wf } = makeStack("r1-reconcile-idem");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id), "lead");
+    const w = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = biz.sendWorkforceMessage({
+      business_id: String(b.business_id), sender_type: "OPERATOR",
+      sender_operator_id: "op", recipient_agent_id: String(a.agent_id),
+      kind: "NOTE", body: "hi", work_item_id: String(w.work_item_id),
+    });
+    const mid = String(m.message_id);
+    const rid = `WIR_${mid}_${a.agent_id}`;
+
+    // Corrupt BOTH the message and its receipt
+    const mm = ctx.store.get("workforce_message", mid) as Record<string, unknown>;
+    mm.body = "tampered";
+    ctx.store.put("workforce_message", mid, mm, Number(mm.version));
+    const rr = ctx.store.get("workforce_message_receipt", rid) as Record<string, unknown>;
+    rr.status = "BOGUS";
+    ctx.store.put("workforce_message_receipt", rid, rr, Number(rr.version));
+
+    const count = () => ctx.store.listEvents()
+      .filter((e) => String(e.event_type) === "WORK_COORDINATION_CORRUPT").length;
+
+    wf.reconcileWorkGraph();
+    const after1 = count();
+    expect(after1).toBe(2); // one per corrupt row
+    wf.reconcileWorkGraph();
+    wf.reconcileWorkGraph();
+    expect(count()).toBe(2); // strictly idempotent — no unbounded duplicates
   });
 });

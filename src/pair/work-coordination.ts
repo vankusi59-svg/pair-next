@@ -143,11 +143,17 @@ export function assertCanonicalClaimLease(
   if (!HEX64.test(String(lease.token_digest ?? ""))) {
     fail(`claim lease ${leaseId}: bad token digest shape`);
   }
-  const issued = String(lease.issued_at ?? "");
-  const hb = String(lease.last_heartbeat_at ?? "");
-  const exp = String(lease.expires_at ?? "");
-  if (!issued || !hb || !exp || hb < issued || exp <= issued) {
-    fail(`claim lease ${leaseId}: issued/heartbeat/expiry ordering invalid`);
+  // R1 §4 — strict parseable time ordering: issued_at ≤ last_heartbeat_at
+  //  < expires_at. A heartbeat at/after the expiry instant is never a
+  //  valid window; malformed timestamps are never canonical.
+  const issuedMs = Date.parse(String(lease.issued_at ?? ""));
+  const hbMs = Date.parse(String(lease.last_heartbeat_at ?? ""));
+  const expMs = Date.parse(String(lease.expires_at ?? ""));
+  if (
+    !Number.isFinite(issuedMs) || !Number.isFinite(hbMs) ||
+    !Number.isFinite(expMs) || hbMs < issuedMs || hbMs >= expMs
+  ) {
+    fail(`claim lease ${leaseId}: issued ≤ heartbeat < expiry ordering invalid`);
   }
   if (String(lease.lease_digest ?? "") !== claimLeaseDigest(lease)) {
     fail(`claim lease ${leaseId}: digest mismatch`);
@@ -222,6 +228,34 @@ export function assertCanonicalWorkforceMessage(
   if (String(msg.message_digest ?? "") !== workforceMessageDigest(msg)) {
     fail(`message ${mid}: digest mismatch`);
   }
+  // R1 §5 — append-only immutability anchor: a self-consistent rehash of
+  //  a mutated row is not enough; the immutable hash-chained
+  //  WORKFORCE_MESSAGE_SENT event pins the ORIGINAL digest + identity
+  //  fields at commit time (body is never copied into the event — the
+  //  digest covers it).
+  const sent = deps.store.listEvents(WORKFORCE_MESSAGE_TABLE, mid).filter(
+    (e) => String(e.event_type) === "WORKFORCE_MESSAGE_SENT");
+  if (sent.length !== 1) {
+    fail(`message ${mid}: SENT anchor ${sent.length ? "duplicated" : "missing"}`);
+  }
+  const meta = ((sent[0].metadata ?? {}) as Row);
+  const pinned: Array<[string, unknown]> = [
+    ["message_id", mid],
+    ["business_id", msg.business_id],
+    ["work_item_id", msg.work_item_id ?? null],
+    ["sender_type", msg.sender_type],
+    ["sender_agent_id", msg.sender_agent_id ?? null],
+    ["sender_operator_id", msg.sender_operator_id ?? null],
+    ["recipient_agent_id", msg.recipient_agent_id],
+    ["kind", msg.kind],
+    ["correlation_id", msg.correlation_id ?? null],
+    ["message_digest", msg.message_digest],
+  ];
+  for (const [k, v] of pinned) {
+    if (String(meta[k] ?? null) !== String(v ?? null)) {
+      fail(`message ${mid}: SENT anchor ${k} mismatch`);
+    }
+  }
 }
 
 export function assertCanonicalReceipt(
@@ -251,6 +285,36 @@ export function assertCanonicalReceipt(
   }
   if (st === "PENDING" && r.acknowledged_at !== null && r.acknowledged_at !== undefined) {
     fail(`receipt ${rid}: pending with timestamp`);
+  }
+  // R1 §6 — receipt provenance is independently anchored: creation rides
+  //  on the message's SENT event (receipt_id + created_at pinned), and
+  //  ACKNOWLEDGED requires the immutable WORKFORCE_MESSAGE_ACKNOWLEDGED
+  //  event pinning message_id + recipient + acknowledged_at. A direct
+  //  row mutation has no such event → fail closed.
+  assertCanonicalWorkforceMessage(deps, msg);
+  const evs = deps.store.listEvents(WORKFORCE_MESSAGE_TABLE, mid);
+  const sentMeta = (((evs.find((e) => String(e.event_type) === "WORKFORCE_MESSAGE_SENT")
+    ?.metadata ?? {}) as Row));
+  if (
+    String(sentMeta.receipt_id ?? "") !== rid ||
+    String(sentMeta.receipt_created_at ?? "") !== String(r.created_at ?? "")
+  ) {
+    fail(`receipt ${rid}: creation anchor mismatch`);
+  }
+  const acks = evs.filter((e) => String(e.event_type) === "WORKFORCE_MESSAGE_ACKNOWLEDGED");
+  const matchingAcks = acks.filter((e) => {
+    const m = ((e.metadata ?? {}) as Row);
+    return String(m.recipient_agent_id ?? "") === recip &&
+      String(m.acknowledged_at ?? "") === String(r.acknowledged_at ?? "");
+  });
+  if (st === "ACKNOWLEDGED" && matchingAcks.length !== 1) {
+    fail(`receipt ${rid}: ACK anchor missing`);
+  }
+  if (st === "PENDING" && acks.some((e) => {
+    const m = ((e.metadata ?? {}) as Row);
+    return String(m.recipient_agent_id ?? "") === recip;
+  })) {
+    fail(`receipt ${rid}: PENDING with committed ACK event`);
   }
 }
 

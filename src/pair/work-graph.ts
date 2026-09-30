@@ -1314,31 +1314,40 @@ export class WorkforceService {
     }
     // Durable inbox evidence is validated — never fabricated/rebuilt; a
     // malformed message or receipt poisons only coordination audit (the
-    // event log), never an existing mission or claim lease.
+    // event log), never an existing mission or claim lease. R1 §8 —
+    // corruption evidence is appended at most once per row so repeated
+    // reconciles are a strict no-op on already-flagged rows.
+    const alreadyFlagged = (etype: string, eid: string) =>
+      this.store.listEvents(etype, eid).some(
+        (e) => String(e.event_type) === "WORK_COORDINATION_CORRUPT");
     for (const m of this.store.list(WORKFORCE_MESSAGE_TABLE)) {
       try {
         assertCanonicalWorkforceMessage(this.graphDeps, m as Row);
       } catch {
-        this.store.event({
-          entity_type: WORKFORCE_MESSAGE_TABLE,
-          entity_id: String(m.message_id ?? "unknown"),
-          event_type: "WORK_COORDINATION_CORRUPT",
-          actor: "PAIR_WORKFORCE_RECONCILE",
-          metadata: { message_id: String(m.message_id ?? "") },
-        });
+        if (!alreadyFlagged(WORKFORCE_MESSAGE_TABLE, String(m.message_id ?? "unknown"))) {
+          this.store.event({
+            entity_type: WORKFORCE_MESSAGE_TABLE,
+            entity_id: String(m.message_id ?? "unknown"),
+            event_type: "WORK_COORDINATION_CORRUPT",
+            actor: "PAIR_WORKFORCE_RECONCILE",
+            metadata: { message_id: String(m.message_id ?? "") },
+          });
+        }
       }
     }
     for (const r of this.store.list(WORKFORCE_RECEIPT_TABLE)) {
       try {
         assertCanonicalReceipt(this.graphDeps, r as Row);
       } catch {
-        this.store.event({
-          entity_type: WORKFORCE_RECEIPT_TABLE,
-          entity_id: String(r.receipt_id ?? "unknown"),
-          event_type: "WORK_COORDINATION_CORRUPT",
-          actor: "PAIR_WORKFORCE_RECONCILE",
-          metadata: { receipt_id: String(r.receipt_id ?? ""), message_id: String(r.message_id ?? "") },
-        });
+        if (!alreadyFlagged(WORKFORCE_RECEIPT_TABLE, String(r.receipt_id ?? "unknown"))) {
+          this.store.event({
+            entity_type: WORKFORCE_RECEIPT_TABLE,
+            entity_id: String(r.receipt_id ?? "unknown"),
+            event_type: "WORK_COORDINATION_CORRUPT",
+            actor: "PAIR_WORKFORCE_RECONCILE",
+            metadata: { receipt_id: String(r.receipt_id ?? ""), message_id: String(r.message_id ?? "") },
+          });
+        }
       }
     }
     return { quarantined: [...quarantined] };

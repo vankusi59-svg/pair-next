@@ -152,3 +152,120 @@ planner/router/dispatcher/runtime. `worker-protocol.ts`/LocalWorkerPool/
 WGM/WDEL/WDEC/WDS/WGE/WAB/ACR/WORK_AUTHORITY_BOUND, Foundation V2 binding,
 openWorkItem, Planner, MissionRouter, GovernedTaskGate, MissionRuntime,
 P12/P13 all preserved (regression counts above).
+
+# REMEDIATION R1 — ATOMIC CLAIM ADMISSION + IMMUTABLE COLLABORATION PROVENANCE
+
+Head: `see PR` (R1 commits on `devin/1790749503-p14-wfv2-p2`, base `41934b2`)
+
+## R1.1 Transactional claim design (§1)
+
+`claimWorkItem` now runs its decisive admission proof **inside** the
+`store.immediate()` that writes the WCL:
+
+1. preflight stays (fast errors: row exists, business, ACTIVE, assignee,
+   `assertExecutable`);
+2. `store.immediate(() => …)` re-reads `cur0 = store.get("work_item")` and
+   re-proves — on current rows — quarantine, `assertGraphAuthority`, terminal
+   state, business match, `curAgent` ACTIVE, `curAssignee` UNASSIGNED /
+   ASSIGNEE_MISMATCH, and `agentContracts.assertExecutable(curAgent)`;
+3. only then does the lease CAS/mint occur in the same transaction.
+
+Any interleaved mutation (assign, pause/terminate, contract disable, project
+revocation) lands before BEGIN IMMEDIATE acquires → the in-txn re-read sees it
+and the claim fails closed; or after commit → the lease is canonically
+consistent. TOCTOU closed by construction.
+
+## R1.2 Assign + lease gate atomic (§2)
+
+`assignWorkItem` wraps work-item re-read, quarantine, `assertGraphAuthority`,
+graph assignee-immutability, agent scope/ACTIVE, transition legality, the
+`leaseGateInTxn` foreign-live-lease gate, and the assignee CAS in ONE
+`immediate()`. `leaseGateInTxn` reads the WCL fresh inside the txn, validates,
+fences expiry, and rejects a live foreign claimant with
+`FAIL_CLOSED_WORK_ITEM_CLAIMED` — the stale-snapshot gap where the old code
+read the lease before entering its write txn is removed. The invariant
+`work_item.assignee = B ∧ ACTIVE WCL.claimant = A (A≠B)` is unreachable: the
+two decisive checks are serialized by BEGIN IMMEDIATE.
+
+`assertNoForeignLiveLease` (open/seam callers) now delegates the read+validate
+into the same `leaseGateInTxn` inside its own `immediate()`; mirror repair
+rides the same work-item write and the caller's stale row is re-synced
+(`Object.assign(row, store.get(...))`) so outer code never writes a rolled-back
+image.
+
+## R1.3 Lifecycle interleave (§3)
+
+A claim commits only if the agent/contract/project are executable *at commit
+time* (re-checked in-txn). Post-claim PAUSED/TERMINATED/DISABLED stays
+historical — heartbeat/open apply current admission rules at their own seams;
+no retro-invalidation of a validly minted lease.
+
+## R1.4 Lease time ordering (§4)
+
+`assertCanonicalClaimLease` now requires parseable canonical timestamps AND
+`issued_at <= last_heartbeat_at < expires_at` (strict). `hb >= exp`, malformed,
+or future-inconsistent windows → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`.
+
+## R1.5 Message immutable anchor (§5)
+
+`WORKFORCE_MESSAGE_SENT` (append-only hash-chained event) pins at commit:
+`message_id, business_id, work_item_id, sender_type, sender_agent_id,
+sender_operator_id, recipient_agent_id, kind, correlation_id, message_digest,
+receipt_id, receipt_created_at` — never the body.
+`assertCanonicalWorkforceMessage` requires exactly one matching SENT event and
+compares every pinned field; tampering the row + recomputing
+`message_digest` fails because the event still holds the original digest.
+
+## R1.6 Receipt / ACK provenance (§6)
+
+`assertCanonicalReceipt`: deterministic `WIR_<mid>_<recipient>` id + exact
+message/recipient + creation provenance via the message's SENT event
+(`receipt_id`, `receipt_created_at` pinned). ACKNOWLEDGED additionally requires
+exactly one `WORKFORCE_MESSAGE_ACKNOWLEDGED` event pinning
+`message_id + recipient_agent_id + acknowledged_at` (the event's timestamp is
+the one stored). Direct PENDING→ACKNOWLEDGED row mutation without the event →
+PROVENANCE_CORRUPT; a matching ACK event on a PENDING row → same. Duplicate
+ack stays idempotent (returns existing row, no second event).
+
+## R1.7 Read seams (§7)
+
+`listWorkItemMessages` validates each message before returning — corrupt rows
+are surfaced as explicit `{state:"CORRUPT", corrupt:true}` projections (no
+body). `inboxForAgent` validates message + receipt — corrupt receipt surfaces
+`receipt_status:"CORRUPT"`. `getWorkItemClaim` validates the WCL before
+returning the safe view. Forged content is never presented as valid.
+
+## R1.8 Reconcile idempotency (§8)
+
+The message/receipt sweeps in `reconcileWorkGraph` check
+`listEvents(entity)` for an existing `WORK_COORDINATION_CORRUPT` before
+appending — repeated reconciles on a permanently corrupt row append exactly
+one event. Work-item quarantine already deduped by `blocked_code`. Immutable
+bodies are never "repaired" in place; ACKs are never fabricated.
+
+## R1.9 Focused tests (§9)
+
++10 tests (40 → **50**):
+
+- `P14-P2-R1-CLAIM-ASSIGN-RACE`, `…-ASSIGN-CLAIM-RACE-INVERSE`,
+  `…-CLAIM-PAUSE-RACE`, `…-CLAIM-CONTRACT-DISABLE-RACE` — **genuine
+  worker_threads races**: two processes on the same db file released on a
+  shared Atomics barrier; winner/loser asserted on `FAIL_CLOSED_*` /
+  `SQLITE_BUSY` and the final invariant verified from a fresh connection.
+- `P14-P2-R1-LEASE-TIME-ORDER` — hb==exp and unparseable timestamp both
+  PROVENANCE_CORRUPT (with valid digest).
+- `P14-P2-R1-MESSAGE-TAMPER-REHASH` — body forge + recomputed digest fails
+  at the event anchor.
+- `P14-P2-R1-RECEIPT-FORGED-ACK` — direct row ACK without event fails.
+- `P14-P2-R1-ACK-EVENT-IDEMPOTENT` — one ACK event across duplicate acks.
+- `P14-P2-R1-CORRUPT-MESSAGE-READ-FAILS` + `CORRUPT-RECEIPT-READ-FAILS` —
+  read seams emit CORRUPT markers, never forged content.
+- `P14-P2-R1-CORRUPT-RECONCILE-IDEMPOTENT` — 2 corrupt rows → exactly 2
+  corruption events across 3 reconciles.
+
+## R1.10 Preserved boundaries (§10)
+
+Coordination ≠ execution; heartbeat ≠ executor liveness; no auto
+redispatch/reassign; HANDOFF is data-only; no graph revisioning; no Phase-3
+cascade; unclaimed open fast path unchanged; raw token returned once at claim,
+never persisted.
