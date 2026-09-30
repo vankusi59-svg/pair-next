@@ -1780,18 +1780,26 @@ export class BusinessLayer {
    */
   private assertNoForeignLiveLease(row: Row, agentId: string | null): void {
     const workItemId = String(row.work_item_id);
-    this.store.immediate(() => {
+    const saved = this.store.immediate(() => {
       // R1 §2 — the lease is read + validated INSIDE this txn; no stale
       //  snapshot is ever carried across the commit boundary.
       const cur = this.store.get("work_item", workItemId);
       const mirrorChanged = this.leaseGateInTxn(cur, agentId, "PAIR_BUSINESS_LAYER");
-      if (mirrorChanged) {
-        this.store.put("work_item", workItemId, cur, Number(cur.version));
-      }
+      return mirrorChanged
+        ? this.store.put("work_item", workItemId, cur, Number(cur.version))
+        : null;
     });
-    // The gate may have bumped the row (mirror repair / EXPIRED fencing);
-    // keep the caller's reference in sync so its own CAS write lands.
-    Object.assign(row, this.store.get("work_item", workItemId));
+    // Sync ONLY the mirror fields the gate owns, and only when the gate
+    // itself wrote — a full-row resync would defeat the caller's own
+    // expected-version CAS (a concurrent mutation seen here would then be
+    // silently overwritten instead of conflicting, e.g. two opens both
+    // landing pending_open_id).
+    if (saved) {
+      row.claimed_by = saved.claimed_by;
+      row.claim_expires_at = saved.claim_expires_at;
+      row.claim_token = saved.claim_token;
+      row.version = saved.version;
+    }
   }
 
   /**
