@@ -2,7 +2,7 @@
 
 **Classification at push:** `P14_WORKFORCE_V2_PHASE1_REMEDIATED_R1_PENDING_AUDIT`
 **Base (canonical main):** `ef1fb11b214d7917b6d827efb223ddc22ae19511`
-**Head:** (R1 head — see git log; Phase 1 original head `cf871040120e54721a6d1ab6586492a3bc3fa9d1`)
+**Head (R1):** `d3f858b106f1b257076f398ff723baaed3bbb4fb` (Phase 1 original: `cf871040120e54721a6d1ab6586492a3bc3fa9d1`)
 **Branch:** `devin/1790731419-p14-workforce-v2-p1`
 **Scope:** governed work graph + parent→child decomposition + dependency DAG + delegation core + child missions through the merged Foundation V2 path. Phase 1 only — no heartbeat, inbox, autonomous reassignment, scheduling, parent completion cascade, CEO loop, P15/P16.
 
