@@ -75,6 +75,10 @@ MC_LOG="$LOG_DIR/mc-serve.log"
   PAIR_OUTBOX_URL="$OUTBOX_URL" \
   PAIR_OUTBOX_TOKEN="$OBX" \
   PAIR_BROKER_TOKEN="$BRK" \
+  PAIR_DSH_MODEL_ROUTE="${PAIR_DSH_MODEL_ROUTE:-nvidia:z-ai/glm-5.3-flash}" \
+  PAIR_DSH_EXTRA_ROUTES="${PAIR_DSH_EXTRA_ROUTES:-groq:openai/gpt-oss-20b,gemini:gemini-3.1-flash-lite}" \
+  PAIR_MODEL_PROBE_TIMEOUT_MS="${PAIR_MODEL_PROBE_TIMEOUT_MS:-30000}" \
+  PAIR_LLM_PLANNER_TIMEOUT_MS="${PAIR_LLM_PLANNER_TIMEOUT_MS:-120000}" \
   nohup node scripts/serve-mission-control.mjs > "$MC_LOG" 2>&1 &
 )
 echo "==> server starting (log $MC_LOG)"

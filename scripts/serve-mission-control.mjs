@@ -397,7 +397,7 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
           authorization: `Bearer ${process.env[String(provider.credential_reference_name)] ?? ""}`,
         },
         body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(Number(process.env.PAIR_MODEL_PROBE_TIMEOUT_MS ?? 8000)),
       });
       return { outcome: r.ok ? "AUTH_OK" : r.status === 401 || r.status === 403 ? "AUTH_FAILED" : "UNREACHABLE", latency_ms: Date.now() - t0, detail: `http_${r.status}` };
     } catch (err) {
@@ -487,6 +487,7 @@ const planExpander = async (input) => {
     model: planProvider.model,
     allowedCapabilities: LLM_PLANNER_CAPS,
     capabilitySets: executorCapSets(),
+    timeoutMs: Number(process.env.PAIR_LLM_PLANNER_TIMEOUT_MS ?? 20000),
   });
   if (!res.tasks.length) {
     // Degenerate/unusable plan — fail closed: a T1-only plan would run and
