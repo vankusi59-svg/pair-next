@@ -462,15 +462,24 @@ authority derives only from canonical evidence.
   declared set exactly: omitted declared task, drifted declared task,
   injected undeclared task, missing/foreign plan row, forged
   commit-anchor metadata — all fail closed.
+- **R4 remediation**: the complete task manifest is now pinned
+  immutably inside `MISSION_PLAN_COMMITTED`
+  (`metadata.task_ids` ordered + `plan_manifest_digest` recomputed on
+  every anchor by the validator) — live `plan.task_ids` must equal the
+  committed set exactly; shrink/reorder/expand/digest-tamper fail
+  closed. Revision history is omission-safe: hash-verified
+  `mission_plan_revisions` in exact ordered bijection with commit
+  anchors, contiguous revisions, active = highest committed — a deleted
+  latest row can never roll history back.
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE3_REPORT.md`; suite
-  `pair-p14-wfv2-p3.test.ts` (59 total — R1+R2 suites preserved +
-  8 `P14-P3-R3-*`; genuine worker_thread races)
-  + fresh-dir E2E 37/37 (real server, forge/quarantine, missing+FAIL
-  validation quarantine, reviewer-pause race, REWORK fence +
-  advanced-basis unfence, intact 2-task manifest completes, deleted
-  declared task quarantines, 3 restarts, zero dup anchors).
+  `pair-p14-wfv2-p3.test.ts` (68 total — R1+R2+R3 suites preserved +
+  9 `P14-P3-R4-*`; genuine worker_thread races)
+  + fresh-dir E2E 39/39 (real server: forge/missing+FAIL validation/
+  omitted task/shrunk manifest/deleted revision rollback → quarantine;
+  intact manifest completes; reviewer race; fence/unfence; 3 restarts;
+  zero dup evidence).
   Classification:
-  **`P14_WORKFORCE_V2_PHASE3_R3_PENDING_FINAL_AUDIT`**.
+  **`P14_WORKFORCE_V2_PHASE3_R4_PENDING_FINAL_AUDIT`**.
 
 ## Not yet
 

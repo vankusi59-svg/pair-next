@@ -421,4 +421,27 @@ array with unique ids. The LIVE task set (tasks claiming this
 Only after the manifest is proven does each declared task's full R2
 governed validated-execution chain get required.
 
-Classification: **P14_WORKFORCE_V2_PHASE3_R3_PENDING_FINAL_AUDIT**
+## 23. R4 remediation design — immutable manifest anchor + omission-safe history
+
+**Immutable manifest anchor (Blocker 1).** `commitPlan` now pins the
+complete task manifest inside the immutable `MISSION_PLAN_COMMITTED`
+event: `metadata.task_ids` (ordered — corresponds to `task.order`) plus
+`metadata.plan_manifest_digest = planManifestDigest({mission_id,
+plan_id, revision, task_ids})`. The entity payload is never authority —
+the validator recomputes the digest from the event's own pins on EVERY
+commit anchor, and requires the live `plan.task_ids` to equal the pinned
+committed set exactly: shrink-after-delete, reorder, expand, and
+digest-tamper all fail closed.
+
+**Revision-history omission safety (Blocker 2).** The hash-verified
+`mission_plan_revisions` history must be in exact ordered bijection with
+the `MISSION_PLAN_COMMITTED` anchors: identical `plan_id@revision`
+sequence, contiguous `revision = position` semantics per commitPlan.
+A deleted latest revision row leaves its commit anchor behind —
+`evPairs ≠ histPairs` → fail closed, so history can never silently roll
+back. A revision row without a commit anchor, a commit anchor without a
+revision row, a non-contiguous sequence, or mission pins rolled back to
+an older revision — all fail closed. The active revision is the true
+highest committed; `mission.plan_id`/`plan_revision` must equal it.
+
+Classification: **P14_WORKFORCE_V2_PHASE3_R4_PENDING_FINAL_AUDIT**

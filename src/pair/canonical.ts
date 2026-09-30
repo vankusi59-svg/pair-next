@@ -50,6 +50,24 @@ export function digest(value: unknown): string {
   return sha256Hex(Buffer.from(canonicalJson(value), "utf8"));
 }
 
+/** Immutable identity of an activated plan's complete task manifest —
+ *  pinned inside MISSION_PLAN_COMMITTED at commit time. Task order is
+ *  significant (it corresponds to task.order). */
+export function planManifestDigest(f: {
+  mission_id: string;
+  plan_id: string;
+  revision: number;
+  task_ids: string[];
+}): string {
+  return digest({
+    plan_manifest: 1,
+    mission_id: f.mission_id,
+    plan_id: f.plan_id,
+    revision: f.revision,
+    task_ids: [...f.task_ids],
+  });
+}
+
 export function sha256Hex(data: Buffer | string): string {
   return createHash("sha256").update(data).digest("hex");
 }

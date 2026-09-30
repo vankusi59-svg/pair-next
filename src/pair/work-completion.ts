@@ -28,7 +28,7 @@
  * messages carry ZERO completion authority (Phase 2 boundary preserved).
  */
 
-import { digest } from "./canonical.js";
+import { digest, planManifestDigest } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import type { GraphAuthorityDeps } from "./graph-authority.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -283,12 +283,53 @@ export function assertCanonicalMissionCompletion(
   //  is injection — all fail closed.
   const revisions = store.planRevisions(mid);
   if (!revisions.length) fail(`mission ${mid}: no plan revisions`);
+  // Revision-history omission safety: the hash-verified history must be
+  // monotonic/contiguous (commitPlan semantics: revision = position) and
+  // in exact bijection with the immutable MISSION_PLAN_COMMITTED anchors
+  // — a deleted revision row cannot silently roll history backward
+  // because the later commit event still exists, and a forged history
+  // entry has no commit anchor.
+  const commitEvents = store.listEvents("mission", mid).filter((e) =>
+    String(e.event_type ?? "") === "MISSION_PLAN_COMMITTED");
+  const pairsOf = (rs: Array<Record<string, unknown>>) =>
+    rs.map((r) =>
+      `${String(r.plan_id ?? "")}@${Number(r.revision ?? NaN)}`);
+  const evPairs = commitEvents.map((e) =>
+    `${String(e.new_state ?? "")}@${Number(
+      (e.metadata as Record<string, unknown> | undefined)?.revision ?? NaN)}`);
+  const histPairs = pairsOf(revisions);
+  if (evPairs.length !== histPairs.length ||
+      evPairs.some((p, i) => p !== histPairs[i])) {
+    fail(`mission ${mid}: commit anchors != revision history`);
+  }
+  for (const [i, r] of revisions.entries()) {
+    if (Number(r.revision ?? NaN) !== i + 1) {
+      fail(`mission ${mid}: non-contiguous plan revision ${String(r.revision)}`);
+    }
+    if (String(r.mission_id ?? "") !== mid) {
+      fail(`mission ${mid}: revision ${String(r.revision)} mission mismatch`);
+    }
+    // Every commit anchor must carry a self-consistent immutable
+    // manifest pin — recompute it, never trust the entity payload.
+    const eMd = (commitEvents[i]!.metadata ?? {}) as Record<string, unknown>;
+    const pinnedIds = eMd.task_ids;
+    if (!Array.isArray(pinnedIds) || pinnedIds.length === 0 ||
+        pinnedIds.some((v) => typeof v !== "string")) {
+      fail(`mission ${mid}: commit anchor ${String(r.revision)} missing task pin`);
+    }
+    const expected = planManifestDigest({
+      mission_id: mid,
+      plan_id: String(r.plan_id ?? ""),
+      revision: Number(r.revision),
+      task_ids: pinnedIds.map(String),
+    });
+    if (String(eMd.plan_manifest_digest ?? "") !== expected) {
+      fail(`mission ${mid}: commit anchor ${String(r.revision)} manifest digest mismatch`);
+    }
+  }
   const active = revisions[revisions.length - 1]!;
   const planId = String(active.plan_id ?? "");
   const planRevision = Number(active.revision ?? 0);
-  if (String(active.mission_id ?? "") !== mid) {
-    fail(`mission ${mid}: active revision mission ${String(active.mission_id)}`);
-  }
   if (String(mission.plan_id ?? "") !== planId ||
       Number(mission.plan_revision ?? NaN) !== planRevision) {
     fail(`mission ${mid}: plan pin ${String(mission.plan_id)}/${String(mission.plan_revision)} != active ${planId}/${planRevision}`);
@@ -300,20 +341,21 @@ export function assertCanonicalMissionCompletion(
       String(plan.state ?? "") !== "PLANNED") {
     fail(`mission ${mid}: plan ${planId} provenance mismatch`);
   }
-  // The canonical immutable anchor for the active plan revision.
-  const commitEvidence = store.listEvents("mission", mid).filter((e) =>
-    String(e.event_type ?? "") === "MISSION_PLAN_COMMITTED" &&
-    String(e.new_state ?? "") === planId &&
-    Number((e.metadata as Record<string, unknown> | undefined)
-      ?.revision ?? NaN) === planRevision);
-  if (commitEvidence.length !== 1) {
-    fail(`mission ${mid}: ${commitEvidence.length} plan-commit anchors for ${planId}@${planRevision}`);
-  }
+  // The live plan manifest must equal the task set pinned immutably at
+  // commit time — shrink/reorder/expand after commit all fail closed.
+  const activeMd =
+    (commitEvents[commitEvents.length - 1]!.metadata ?? {}) as
+      Record<string, unknown>;
+  const committedIds = (activeMd.task_ids as string[]).map(String);
   const declared = plan.task_ids;
   if (!Array.isArray(declared) || declared.length === 0) {
     fail(`mission ${mid}: plan ${planId} has no task manifest`);
   }
   const declaredIds = declared.map(String);
+  if (declaredIds.length !== committedIds.length ||
+      declaredIds.some((v, i) => v !== committedIds[i])) {
+    fail(`mission ${mid}: plan ${planId} manifest diverged from commit anchor`);
+  }
   const declaredSet = new Set(declaredIds);
   if (declaredSet.size !== declaredIds.length) {
     fail(`mission ${mid}: plan ${planId} manifest has duplicate ids`);

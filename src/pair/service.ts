@@ -9,7 +9,7 @@
  */
 
 import path from "node:path";
-import { newId, pathWithin, utcnow } from "./canonical.js";
+import { newId, pathWithin, planManifestDigest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { AgentContractService } from "./agent-contract.js";
 import { CostService } from "./cost.js";
@@ -264,7 +264,16 @@ export class PairControlPlane {
       event_type: "MISSION_PLAN_COMMITTED",
       new_state: planId,
       actor: "PAIR_PLAN_VALIDATOR",
-      metadata: { revision },
+      metadata: {
+        revision,
+        task_ids: taskIds,
+        plan_manifest_digest: planManifestDigest({
+          mission_id: params.mission_id,
+          plan_id: planId,
+          revision,
+          task_ids: taskIds,
+        }),
+      },
     });
     return { plan_id: planId, revision, task_ids: taskIds };
   }

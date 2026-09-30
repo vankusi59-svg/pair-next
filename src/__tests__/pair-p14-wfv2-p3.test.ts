@@ -1947,3 +1947,149 @@ describe("P14-P3 R3 — canonical plan manifest omission safety", () => {
     expect(String(ctx.store.get("work_item", wid).status)).toBe("DONE");
   });
 });
+
+// ---------------------------------------------------------------------------
+// P14-P3 R4 — immutable plan-manifest anchor + omission-safe revision
+// history. The complete task manifest is pinned inside the immutable
+// MISSION_PLAN_COMMITTED event (task_ids + recomputed manifest digest);
+// mutating plan.task_ids after commit can never satisfy the pin. The
+// revision history must stay in exact bijection with the commit anchors
+// — deleting the latest revision row cannot roll history backward.
+// ---------------------------------------------------------------------------
+
+/** Direct test seam: hard-delete a mission_plan_revisions row. */
+function deletePlanRevisionRow(dbPath: string, missionId: string, revision: number) {
+  const db = new Database(dbPath);
+  db.prepare(
+    "DELETE FROM mission_plan_revisions WHERE mission_id=? AND revision=?")
+    .run(missionId, revision);
+  db.close();
+}
+
+/** Two-task canonical mission; `extraRevisions` older committed plans. */
+function revisedCompletedLeaf(label: string, extraRevisions = 0) {
+  const { ctx, biz } = makeStack(label);
+  const b = makeBiz(biz, ctx.projectId);
+  const a = makeAgent(biz, String(b.business_id), "lead");
+  const w = makeItem(biz, String(b.business_id), {
+    title: label, assignee_agent_id: String(a.agent_id) });
+  const wid = String(w.work_item_id);
+  biz.openWorkItem(wid, "op");
+  const mid = String(
+    (ctx.store.get("work_item", wid).mission_ids as string[]).at(-1));
+  const priorPlanIds: string[] = [];
+  for (let i = 0; i < extraRevisions; i++) {
+    const pr = ctx.service.commitPlan({
+      mission_id: mid,
+      tasks: [{ task_key: `OLD${i + 1}`, title: "old",
+        task_instruction: "old", required_capabilities: [],
+        depends_on: [] }],
+      source: "TEST_CANONICAL", reason: "prior-revision",
+      proposal: { ok: true } });
+    priorPlanIds.push(pr.plan_id);
+  }
+  canonicallyCompleteMission(ctx.store, ctx.service, mid, { tasks: 2 });
+  const planId = String(ctx.service.activeRevision(mid).plan_id);
+  const declared = (ctx.store.get("plan", planId).task_ids as string[])
+    .map(String);
+  const dbPath = path.join(ctx.dir, "pair.db");
+  return { ctx, biz, wid, mid, planId, declared, dbPath, priorPlanIds };
+}
+
+const mutatePlan = (
+  ctx: ReturnType<typeof makeCtxOn>, planId: string,
+  mutate: (plan: Record<string, unknown>) => void,
+) => {
+  const plan = ctx.store.get("plan", planId);
+  mutate(plan);
+  ctx.store.put("plan", planId, plan, Number(plan.version));
+};
+
+describe("P14-P3 R4 — immutable plan manifest + revision history", () => {
+  it("P14-P3-R4-PLAN-MANIFEST-SHRINK-AFTER-TASK-DELETE-FAILS: shrunk manifest cannot satisfy the committed pin", () => {
+    const { ctx, biz, wid, mid, planId, declared, dbPath } =
+      revisedCompletedLeaf("r4-shrink");
+    deleteRow(dbPath, "task", declared[1]!);
+    mutatePlan(ctx, planId, (p) => { p.task_ids = [declared[0]]; });
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R4-PLAN-MANIFEST-REORDER-FAILS: reordered task_ids diverge from the committed pin", () => {
+    const { ctx, biz, wid, mid, planId, declared } =
+      revisedCompletedLeaf("r4-reorder");
+    mutatePlan(ctx, planId, (p) => {
+      p.task_ids = [declared[1], declared[0]]; });
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R4-PLAN-MANIFEST-EXPAND-FAILS: an added task id diverges from the committed pin", () => {
+    const { ctx, biz, wid, mid, planId, declared } =
+      revisedCompletedLeaf("r4-expand");
+    mutatePlan(ctx, planId, (p) => {
+      p.task_ids = [...declared, "TSK_LATE_ADD"]; });
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R4-PLAN-MANIFEST-DIGEST-TAMPER-FAILS: forged manifest digest fails recompute", () => {
+    const { ctx, biz, wid, mid, dbPath } =
+      revisedCompletedLeaf("r4-digest");
+    const anchor = ctx.store.listEvents("mission", mid)
+      .find((e) => String(e.event_type) === "MISSION_PLAN_COMMITTED")!;
+    tamperEventMetadata(dbPath, String(anchor.event_id),
+      (m) => { m.plan_manifest_digest = "deadbeef".repeat(8); });
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R4-PLAN-MANIFEST-INTACT-PASSES: committed manifest intact → completes + WCP", () => {
+    const { ctx, biz, wid, mid } = revisedCompletedLeaf("r4-intact");
+    expect(proveCanonicalMissionCompletion(
+      ctx.store, ctx.store.get("mission", mid))).toBe(true);
+    biz.syncWorkItem(wid);
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("DONE");
+    expect(wcpOf(ctx.store, wid)).not.toBeNull();
+  });
+
+  it("P14-P3-R4-LATEST-PLAN-REVISION-DELETION-FAILS: deleting the latest revision row cannot roll history back", () => {
+    const { ctx, biz, wid, mid, priorPlanIds, dbPath } =
+      revisedCompletedLeaf("r4-delrev", 1);
+    // Revisions: 1 (prior) + 2 (active). Delete the latest row AND roll
+    // the mission pins back — the surviving rev-2 commit anchor still
+    // proves the later plan existed.
+    deletePlanRevisionRow(dbPath, mid, 2);
+    const m = ctx.store.get("mission", mid);
+    m.plan_id = priorPlanIds[0];
+    m.plan_revision = 1;
+    ctx.store.put("mission", mid, m, Number(m.version));
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R4-REVISION-WITHOUT-COMMIT-EVENT-FAILS: a history entry with no commit anchor fails closed", () => {
+    const { ctx, biz, wid, mid } = revisedCompletedLeaf("r4-norev");
+    ctx.store.recordPlanRevision({
+      mission_id: mid, revision: 3, plan_id: "PLN_NEVER_COMMITTED",
+      source: "FORGED_HISTORY", reason: "forge",
+      proposal: { forged: true } });
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R4-COMMIT-EVENT-WITHOUT-REVISION-FAILS: a commit anchor with no revision row fails closed", () => {
+    const { ctx, biz, wid, mid } = revisedCompletedLeaf("r4-noev");
+    ctx.store.event({
+      entity_type: "mission", entity_id: mid,
+      event_type: "MISSION_PLAN_COMMITTED", new_state: "PLN_GHOST",
+      actor: "PAIR_PLAN_VALIDATOR",
+      metadata: { revision: 9, task_ids: ["TSK_G"],
+        plan_manifest_digest: "deadbeef".repeat(8) } });
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+
+  it("P14-P3-R4-ACTIVE-REVISION-MUST-BE-HIGHEST-COMMITTED: mission pins rolled back to an older revision fail", () => {
+    const { ctx, biz, wid, mid, priorPlanIds } =
+      revisedCompletedLeaf("r4-rollback", 1);
+    const m = ctx.store.get("mission", mid);
+    m.plan_id = priorPlanIds[0];
+    m.plan_revision = 1;
+    ctx.store.put("mission", mid, m, Number(m.version));
+    expectMissionProofFailsClosed(ctx, biz, wid, mid);
+  });
+});
