@@ -2093,3 +2093,146 @@ describe("P14-P3 R4 — immutable plan manifest + revision history", () => {
     expectMissionProofFailsClosed(ctx, biz, wid, mid);
   });
 });
+
+// =====================================================================
+// P14 FINAL CLOSURE — P11 routine mirror vs P3 completion authority.
+// Routine-fired missions are minted by the schedule path WITHOUT an
+// open binding: their projected work items are mission-status mirrors
+// by design. Before the closure fix, the P3 seams quarantined every
+// live routine mirror (unbound mission) and every DONE mirror (no WCP
+// can ever exist). The mirrors are honest iff they replicate the
+// mission's OWN canonical state — and they carry zero work-item
+// completion authority (no WCP, no dependency satisfaction).
+// =====================================================================
+
+describe("P14-FC — routine mirror authority boundary", () => {
+  function fireRoutineMission(
+    ctx: ReturnType<typeof makeCtxOn>, businessId: string, scheduleId: string,
+  ) {
+    return ctx.control.startMission({
+      project_id: ctx.projectId, goal: "routine run",
+      metadata: { business_id: businessId, schedule_id: scheduleId, plan_source: "schedule" },
+      operator_id: "op",
+    });
+  }
+  const routineItems = (store: PairEvidenceStore) =>
+    store.list("work_item").filter((w) => w.routine_id != null);
+  const makeRoutine = (biz: BusinessLayer, businessId: string, over: Record<string, unknown> = {}) =>
+    biz.createRoutine({
+      business_id: businessId, name: "daily", goal_template: "g",
+      cron: "0 9 * * *", operator_id: "op", ...over,
+    } as never);
+
+  it("P14-FC-ROUTINE-INPROGRESS-NOT-QUARANTINED: live routine mirror survives board+reconcile", () => {
+    const { ctx, biz } = makeStack("rt-live");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = fireRoutineMission(ctx, String(b.business_id), String(r.schedule_id));
+    expect((ctx.store.get("mission", String(m.mission_id)).bound_open_id ?? null)).toBeNull();
+    biz.board(String(b.business_id)); // projects IN_PROGRESS
+    biz.board(String(b.business_id)); // folds — pre-fix this quarantined the mirror
+    const items = routineItems(ctx.store);
+    expect(items).toHaveLength(1);
+    const w = items[0]!;
+    expect(String(w.status)).toBe("IN_PROGRESS");
+    expect(String(w.blocked_code ?? "")).toBe("");
+    biz.reconcileWorkLifecycle();
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect(String(after.status)).toBe("IN_PROGRESS");
+    expect(String(after.blocked_code ?? "")).toBe("");
+  });
+
+  it("P14-FC-ROUTINE-COMPLETED-MIRROR-HONEST: canonical routine mission → DONE mirror survives reconcile, zero item authority", () => {
+    const { ctx, biz, wf } = makeStack("rt-done");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = fireRoutineMission(ctx, String(b.business_id), String(r.schedule_id));
+    canonicallyCompleteMission(ctx.store, ctx.service, String(m.mission_id));
+    biz.board(String(b.business_id)); // projects DONE — mission canonically proven
+    const items = routineItems(ctx.store);
+    expect(items).toHaveLength(1);
+    const w = items[0]!;
+    expect(String(w.status)).toBe("DONE");
+    biz.reconcileWorkLifecycle(); // pre-fix: quarantined the honest mirror
+    biz.board(String(b.business_id));
+    const after = ctx.store.get("work_item", String(w.work_item_id));
+    expect(String(after.status)).toBe("DONE");
+    expect(String(after.blocked_code ?? "")).toBe("");
+    // Zero item-level completion authority: no WCP is ever minted for a
+    // mirror, and the dependency oracle never treats it as satisfied.
+    expect(wcpOf(ctx.store, String(w.work_item_id))).toBeNull();
+    expect(biz.proveWorkItemDone(after)).toBe(false);
+    const a = makeAgent(biz, String(b.business_id));
+    const dep = makeItem(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    wf.setWorkItemDependencies(String(dep.work_item_id), [String(w.work_item_id)],
+      Number(ctx.store.get("work_item", String(dep.work_item_id)).version), "op");
+    expect(errCode(() => biz.openWorkItem(String(dep.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_WORK_DEPENDENCY_UNMET");
+  });
+
+  it("P14-FC-ROUTINE-FORGED-DONE-QUARANTINES: unproven COMPLETED mission never projects DONE", () => {
+    const { ctx, biz } = makeStack("rt-forge");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = fireRoutineMission(ctx, String(b.business_id), String(r.schedule_id));
+    // Forge mission.status=COMPLETED — zero governed evidence behind it.
+    const forged = ctx.store.get("mission", String(m.mission_id));
+    ctx.store.put("mission", String(m.mission_id),
+      { ...forged, status: "COMPLETED" }, Number(forged.version));
+    biz.board(String(b.business_id)); // unproven COMPLETED → IN_PROGRESS, then fold quarantines
+    const items = routineItems(ctx.store);
+    expect(items).toHaveLength(1);
+    const w = ctx.store.get("work_item", String(items[0]!.work_item_id));
+    expect(String(w.status)).toBe("IN_PROGRESS"); // the dishonest DONE was never projected
+    expect(String(w.blocked_code ?? "")).toBe("TERMINAL_PROVENANCE_CORRUPT");
+    expect(wcpOf(ctx.store, String(w.work_item_id))).toBeNull();
+    biz.reconcileWorkLifecycle(); // stays quarantined — never materializes DONE
+    expect(String(ctx.store.get("work_item", String(w.work_item_id)).status)).not.toBe("DONE");
+  });
+
+  it("P14-FC-ROUTINE-FAILED-MIRRORS-BLOCKED: terminal non-success mirrors honestly", () => {
+    const { ctx, biz } = makeStack("rt-failed");
+    const b = makeBiz(biz, ctx.projectId);
+    const r = makeRoutine(biz, String(b.business_id));
+    const m = fireRoutineMission(ctx, String(b.business_id), String(r.schedule_id));
+    const mid = String(m.mission_id);
+    ctx.service.transitionMission(mid, "READY", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(mid, "RUNNING", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(mid, "FAILED", "PAIR_MISSION_RUNTIME");
+    biz.board(String(b.business_id)); // projects BLOCKED (mission FAILED)
+    biz.board(String(b.business_id));
+    const w = routineItems(ctx.store)[0]!;
+    expect(String(w.status)).toBe("BLOCKED");
+    expect(String(w.blocked_code ?? "")).toBe("");
+  });
+
+  it("P14-FC-ROUTINE-REOPEN-BOUND-COMPLETES-CANONICALLY: reopened mirror uses the bound path and mints a real WCP", () => {
+    const { ctx, biz } = makeStack("rt-reopen");
+    const b = makeBiz(biz, ctx.projectId);
+    const a = makeAgent(biz, String(b.business_id));
+    const r = makeRoutine(biz, String(b.business_id), { assignee_agent_id: a.agent_id });
+    const m = fireRoutineMission(ctx, String(b.business_id), String(r.schedule_id));
+    const mid = String(m.mission_id);
+    ctx.service.transitionMission(mid, "READY", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(mid, "RUNNING", "PAIR_MISSION_RUNTIME");
+    ctx.service.transitionMission(mid, "FAILED", "PAIR_MISSION_RUNTIME");
+    biz.board(String(b.business_id)); // BLOCKED mirror
+    const wid = String(routineItems(ctx.store)[0]!.work_item_id);
+    // Governed reopen: a new bound mission is appended — the item now
+    // folds through the canonical bound path like any other work item.
+    biz.openWorkItem(wid, "op");
+    const bound = ctx.store.get("work_item", wid);
+    const boundMid = String((bound.mission_ids as string[]).slice(-1)[0]);
+    expect(boundMid).not.toBe(mid);
+    expect(String(ctx.store.get("mission", boundMid).bound_open_id)).not.toBe("");
+    canonicallyCompleteMission(ctx.store, ctx.service, boundMid);
+    const done = biz.syncWorkItem(wid);
+    expect(String(done.status)).toBe("DONE");
+    const wcp = wcpOf(ctx.store, wid)!;
+    expect(String(wcp.mission_id)).toBe(boundMid);
+    expect(anchorEvents(ctx.store, wid)).toHaveLength(1);
+    expect(biz.proveWorkItemDone(ctx.store.get("work_item", wid))).toBe(true);
+    biz.reconcileWorkLifecycle();
+    expect(String(ctx.store.get("work_item", wid).status)).toBe("DONE");
+  });
+});

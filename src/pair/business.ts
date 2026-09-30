@@ -1010,6 +1010,21 @@ export class BusinessLayer {
       }
       if (String(w.status) !== "DONE") continue;
       if (this.store.tryGet(WORK_COMPLETION_TABLE, completionRowId(wid))) continue;
+      // P11 routine mirror — a DONE projection is honest iff the pinned
+      // mission is itself canonically complete. Mirrors never mint a
+      // WCP by design (no bound attempt exists), so the bound-work basis
+      // cannot apply: validate the mirror against the mission's own
+      // governed-completion proof instead.
+      if (w.routine_id != null) {
+        const rMids = (w.mission_ids as string[] | undefined) ?? [];
+        const rMission = rMids.length
+          ? this.store.tryGet("mission", String(rMids[rMids.length - 1])) as Row | null
+          : null;
+        if (rMission && proveCanonicalMissionCompletion(this.store, rMission)) continue;
+        this.quarantineWorkItem(
+          w, "routine DONE mirror without canonical mission completion");
+        continue;
+      }
       // Derive-only materialization: every pin must already exist as
       // canonical evidence — nothing is invented.
       const basis = this.completionBasisSafe(w);
@@ -1925,6 +1940,13 @@ export class BusinessLayer {
       return row; // mission not persisted yet — leave IN_PROGRESS
     }
     if (!this.missionBoundToWorkItem(row, mission)) {
+      // Routine-source items are mission-status mirrors (P11): the
+      // schedule path mints their missions without an open binding, so
+      // the bound-work chain can never apply — the mirror folds
+      // honestly instead. Any OTHER unbound link is corrupt provenance.
+      if (row.routine_id != null) {
+        return this.syncRoutineMirror(row, mission);
+      }
       // The final mission id does not belong to this work item — fold
       // nothing; quarantine so no authority path treats it as progress.
       this.quarantineWorkItem(row, `unbound mission ${String(mission.mission_id)} referenced by ${workItemId}`);
@@ -2026,6 +2048,56 @@ export class BusinessLayer {
     // P3 §8 — a landed final completion propagates upward: canonical
     // parents re-derive their own basis inside their own txns.
     if (next === "DONE") this.advanceCompletionCascade(workItemId);
+    return saved;
+  }
+
+  /**
+   * Routine-source mirror fold (P11 projections): a routine work item's
+   * linked mission is minted by the schedule path — never bound to the
+   * item — so the bound-work completion chain can never apply. The
+   * mirror is honest iff it replicates the mission's OWN canonical
+   * state: DONE requires the mission's full governed runtime-completion
+   * proof; a forged or mid-flight COMPLETED claim quarantines the
+   * mirror. Mirrors never mint work_completion records — they carry
+   * zero work-item completion authority (the dependency oracle, review
+   * seam and parent aggregation all require a canonical WCP).
+   */
+  private syncRoutineMirror(row: Row, mission: Row): Row {
+    const workItemId = String(row.work_item_id);
+    const ms = String(mission.status);
+    const next: WorkItemStatus | null =
+      ms === "COMPLETED" ? "DONE" :
+      ms === "FAILED" || ms === "PAUSED" ? "BLOCKED" :
+      ms === "CANCELLED" ? "CANCELLED" : null;
+    if (next === "DONE" && !proveCanonicalMissionCompletion(this.store, mission)) {
+      this.quarantineWorkItem(
+        row, `routine mirror DONE without canonical mission completion for ${String(mission.mission_id)}`);
+      return this.store.get("work_item", workItemId);
+    }
+    if (next === null) return row; // mission still in flight — honest IN_PROGRESS mirror
+    const saved = this.store.immediate(() => {
+      const lease = this.store.tryGet(
+        WORK_CLAIM_LEASE_TABLE, claimLeaseRowId(workItemId)) as Row | null;
+      const leaseActive = lease && String(lease.state) === "ACTIVE";
+      if (leaseActive && (next === "DONE" || next === "CANCELLED")) {
+        this.transitionLease(lease, "RELEASED", "PAIR_BUSINESS_LAYER", { work_item_id: workItemId });
+      }
+      const liveLease = lease && String(lease.state) === "ACTIVE" &&
+        !(next === "DONE" || next === "CANCELLED");
+      row.status = next;
+      row.result_summary = String(mission.result ?? mission.result_summary ?? "") || row.result_summary;
+      row.claimed_by = liveLease ? String(lease.claimant_agent_id) : null;
+      row.claim_token = null;
+      row.claim_expires_at = liveLease ? String(lease.expires_at) : null;
+      row.updated_at = utcnow();
+      return this.store.put("work_item", workItemId, row, Number(row.version));
+    });
+    this.store.event({
+      entity_type: "work_item", entity_id: workItemId,
+      event_type: "WORK_ITEM_STATUS_SYNCED",
+      old_state: "IN_PROGRESS", new_state: next, actor: "PAIR_BUSINESS_LAYER",
+      metadata: { mission_id: String(mission.mission_id), mission_status: ms, routine_mirror: true },
+    });
     return saved;
   }
 
@@ -3271,9 +3343,15 @@ export class BusinessLayer {
       // foreign-business metadata never projects onto this board.
       if (String(md?.business_id ?? "") !== String(routine.business_id)) continue;
       const ms = String(m.status);
+      // DONE mirrors require the mission's own canonical completion
+      // proof at projection time — an unproven COMPLETED claim projects
+      // IN_PROGRESS, and the same-render syncRoutineMirror fold then
+      // quarantines the forged mirror. Other terminal states mirror
+      // directly (they carry no completion authority).
       const status: WorkItemStatus =
-        ms === "COMPLETED" ? "DONE" :
-        ms === "FAILED" ? "BLOCKED" :
+        ms === "COMPLETED"
+          ? (proveCanonicalMissionCompletion(this.store, m) ? "DONE" : "IN_PROGRESS")
+        : ms === "FAILED" ? "BLOCKED" :
         ms === "CANCELLED" ? "CANCELLED" :
         ms === "PAUSED" ? "BLOCKED" : "IN_PROGRESS";
       // Deterministic projection identity: the work-item id derives from

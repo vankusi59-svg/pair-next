@@ -1997,13 +1997,15 @@ describe("business layer (one-person-business skeleton)", () => {
     const b = biz.createBusiness({ name: "A", project_id: ctx.projectId, operator_id: "op" });
     const bid = String(b.business_id);
     const r = biz.createRoutine({ business_id: bid, name: "daily", goal_template: "analyze", cron: "0 7 * * *", operator_id: "op" });
-    // simulate the schedule having fired: a mission carrying metadata.schedule_id
-    ctx.store.put("mission", "MSN_routinerun", {
-      mission_id: "MSN_routinerun", status: "COMPLETED", goal: "x",
-      created_at: "2026-09-28T07:00:00.000Z",
-      metadata: { schedule_id: String(r.schedule_id), business_id: bid, plan_source: "schedule" },
-      result: "analysis done",
-    }, 0);
+    // simulate the schedule having fired: a mission carrying metadata.schedule_id,
+    // completed canonically (post-P3 a raw status write is a forgery)
+    const rm = ctx.control.startMission({ project_id: ctx.projectId, goal: "analyze",
+      metadata: { schedule_id: String(r.schedule_id), business_id: bid, plan_source: "schedule" } });
+    const rmid = String(rm.mission_id);
+    canonicallyCompleteMission(ctx.store, ctx.service, rmid);
+    const rmr = ctx.store.get("mission", rmid);
+    rmr.result = "analysis done";
+    ctx.store.put("mission", rmid, rmr, Number(rmr.version));
     const cols = biz.board(bid);
     expect(cols.DONE).toHaveLength(1);
     const wi = cols.DONE[0];
