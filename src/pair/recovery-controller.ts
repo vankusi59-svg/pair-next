@@ -281,6 +281,10 @@ export class RecoveryController {
     /** still-usable routes on the failed executor (route-level re-route
      * feasibility — e.g. the next model route after a quota/model failure) */
     eligible_route_ids?: string[];
+    /** reconciliation already resolved the side-effect question for this
+     * failure (e.g. CONFIRMED_FAILED) — RECONCILIATION_REQUIRED is no longer
+     * a candidate, the next matrix action applies */
+    side_effect_resolved?: boolean;
     /** routes this task already attempted — never eligible again */
     visited_route_ids?: string[];
     /** ACTIVE REMEDIATION_PAIR experience ids, already filtered for compatibility by caller/ExperienceService */
@@ -374,6 +378,14 @@ export class RecoveryController {
           case "REPLAN": {
             if (counts.replans_mission >= policy.max_replans_per_mission) {
               rejected.push({ action, reason: "MAX_REPLANS_PER_MISSION" });
+            } else {
+              selected = action;
+            }
+            break;
+          }
+          case "RECONCILIATION_REQUIRED": {
+            if (input.side_effect_resolved) {
+              rejected.push({ action, reason: "SIDE_EFFECT_ALREADY_RESOLVED" });
             } else {
               selected = action;
             }

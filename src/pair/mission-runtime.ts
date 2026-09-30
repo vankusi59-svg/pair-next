@@ -678,7 +678,7 @@ export class MissionRuntime {
 
   /* ---------------- settle + recovery entry ------------------------------- */
 
-  private settleExecution(missionId: string, executionId: string): void {
+  private settleExecution(missionId: string, executionId: string, opts: { sideEffectResolved?: boolean } = {}): void {
     const execution = this.store.get("executor_execution", executionId);
     const adapter = this.deps.adapters.get(String(execution.executor_id));
     if (!adapter) {
@@ -729,7 +729,7 @@ export class MissionRuntime {
       error_class: String(errorObj?.class ?? ""),
       result: (collected.result as Record<string, unknown>) ?? null,
     });
-    this.startRecovery(missionId, taskId, executionId, failureClass);
+    this.startRecovery(missionId, taskId, executionId, failureClass, undefined, { sideEffectResolved: opts.sideEffectResolved });
   }
 
   /**
@@ -743,6 +743,7 @@ export class MissionRuntime {
     executionId: string | null,
     failureClass: ReturnType<typeof classifyFailure>,
     now?: string,
+    opts: { sideEffectResolved?: boolean } = {},
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -787,6 +788,7 @@ export class MissionRuntime {
         attempts_per_task: Number(ext.attempts_per_task ?? 0),
         attempts_per_mission: Number(ext.attempts_per_mission ?? 0),
       },
+      side_effect_resolved: opts.sideEffectResolved,
       now,
     });
     rt.pending_recovery = {
@@ -950,6 +952,26 @@ export class MissionRuntime {
           this.clearPendingRecovery(missionId, "COMPLETED", "reroute_dispatched");
           this.transitionRuntime(missionId, "RUNNING", "reroute_dispatched");
         }
+        break;
+      }
+      case "RECONCILIATION_REQUIRED": {
+        const barriers = (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
+        const barrier = barriers[taskId];
+        if (barrier && !barrier.settled) {
+          this.transitionRuntime(missionId, "RECONCILING", "reconcile_pending");
+          break;
+        }
+        // Barrier settled (or missing): the side-effect question is
+        // resolved — re-decide so the next matrix action drives instead of
+        // looping reconciliation forever.
+        this.startRecovery(
+          missionId,
+          taskId,
+          pending.execution_id ? String(pending.execution_id) : null,
+          String(pending.failure_class ?? "UNKNOWN") as ReturnType<typeof classifyFailure>,
+          undefined,
+          { sideEffectResolved: true },
+        );
         break;
       }
       case "APPLY_VERIFIED_REMEDIATION": {
@@ -1183,8 +1205,16 @@ export class MissionRuntime {
           barrier.settled = true;
           this.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
           const execId = String(barrier.execution_id ?? "");
-          if (execId) this.settleExecution(missionId, execId);
-          this.transitionRuntime(missionId, "RECOVERING", "reconcile_failed");
+          // Side effects are now known (failed) — the follow-up recovery
+          // decision skips RECONCILIATION_REQUIRED and takes the next
+          // matrix action instead of reconciling forever.
+          if (execId) this.settleExecution(missionId, execId, { sideEffectResolved: true });
+          // settleExecution→startRecovery already chose the follow-up
+          // state (WAITING_BACKOFF/RECONCILING/…) — only leave RECONCILING
+          // when it did not.
+          if (String(this.runtimeEntity(missionId).state) === "RECONCILING") {
+            this.transitionRuntime(missionId, "RECOVERING", "reconcile_failed");
+          }
           return;
         }
         case "UNKNOWN_SIDE_EFFECT_STATE":
