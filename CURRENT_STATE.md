@@ -278,24 +278,50 @@ autonomous reassignment / scheduling / parent cascade / CEO / P15/P16.
   `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`.
 - **Decomposition** is atomic all-or-nothing (children + sibling edges +
   WDEC COMMITTED + parent `decomposed_as` in one txn); deterministic
-  `DC_*` ids; same `decomposition_id` replays idempotently, different id
-  conflicts closed.
-- **Delegation** requires ACTIVE same-business agents and narrows
-  capability (declared caps ∩ contract allow ∩ ¬deny) — never expands;
-  deterministic `DL_*` child per delegation_key; proof is bidirectional
-  (row fields must match WDEL row; forged either way quarantines).
+  `DC_*` ids; R1 adds `proposal_digest` (canonical digest of parent +
+  decomp_id + ordered resolved child specs incl. dep topology) — same id
+  + same digest replays idempotently, same id + different digest →
+  `FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT`. A colliding `DC_*` row is
+  adopted only with full provenance+spec proof (exactly one store write,
+  fresh status, zero missions, exact spec match, no delegation
+  provenance); anything else conflicts closed — never repaired.
+- **Delegation** requires ACTIVE same-business agents; R1 splits
+  provenance into `delegation_mode` AGENT | OPERATOR on WDEL: AGENT
+  requires `delegated_by_agent_id === parent.assignee_agent_id`
+  (`FAIL_CLOSED_WORK_DELEGATE_AUTHORITY` otherwise — a caller cannot
+  name an arbitrary ACTIVE agent); OPERATOR records
+  `delegated_by_operator`. Capability narrows (declared ∩ contract
+  allow ∩ ¬deny); deterministic `DL_*` child; bidirectional proof.
+- **R1 authority narrowing**: child/delegatee effective P12 authority
+  must be a subset of the parent's ceiling — `effectiveAuthority()`
+  resolves the current contract to concrete sets (capabilities,
+  executors, routes, projects, context scopes) and
+  `assertAuthoritySubset` throws `FAIL_CLOSED_WORK_AUTHORITY_WIDEN`.
+  Applied at delegation (when parent has an assignee) and at
+  decomposition (assigned children while parent has an authority
+  ceiling). Unassigned parent → explicit operator/decomposition
+  admission rule; no fabricated ceiling. Explicit denies stay denied.
+- **R1 central validators** (`graph-authority.ts`):
+  `assertCanonicalDecomposition` / `assertCanonicalDelegation` /
+  `assertCanonicalEdge` prove the full chain per entity (key identity,
+  ids, business/project, spec + digest match, depth, capability,
+  COMMITTED state, node resolution). `assertGraphAuthority` consumes
+  them — malformed canonical rows quarantine the affected work_item
+  (`FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`), never executable.
 - **Dependency gate**: `openWorkItem` fails
   `FAIL_CLOSED_WORK_DEPENDENCY_UNMET` unless every ACTIVE edge resolves
   to a proven-DONE prerequisite (bound COMPLETED mission + review
   acceptance — forged DONE status never unlocks). Edges mutate only via
   `setWorkItemDependencies` under expected_version CAS with cycle/scope
-  checks.
+  checks; an existing WGE row is validated before reuse/revive.
 - Endpoints: `POST /api/work-items/:id/decompose|delegate`,
   `PUT /api/work-items/:id/dependencies`,
   `GET /api/businesses/:id/work-graph`. Boot runs `reconcileWorkGraph`.
+  R1 also fixed the server only reading request bodies for POST — PUT
+  bodies now parse (the dependencies endpoint was unusable via API).
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REPORT.md`; suite
-  `pair-p14-workforce-v2.test.ts` (WFV2-P1-* ×15).
-  Classification: **`P14_WORKFORCE_V2_PHASE1_PENDING_AUDIT`**.
+  `pair-p14-workforce-v2.test.ts` (WFV2-P1-* ×15 + WFV2-P1-R1-* ×9).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_REMEDIATED_R1_PENDING_AUDIT`**.
 
 ## Not yet
 

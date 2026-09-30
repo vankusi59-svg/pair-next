@@ -229,7 +229,7 @@ export function createMissionControlServer(
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
     const method = req.method ?? "GET";
-    const body = method === "POST" ? await readBody(req) : {};
+    const body = method === "POST" || method === "PUT" ? await readBody(req) : {};
     // POST /api/outbox and /api/broker/fetch carry their own narrow tokens —
     // exempt from the MC gate.
     const isOutboxUpload = method === "POST" && p === "/api/outbox";

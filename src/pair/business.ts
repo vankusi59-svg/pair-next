@@ -29,6 +29,11 @@ import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
 import { validateWorkOpenBinding } from "./work-open-binding.js";
+import {
+  assertCanonicalDecomposition,
+  assertCanonicalDelegation,
+  assertCanonicalEdge,
+} from "./graph-authority.js";
 
 export const WORK_ITEM_STATUSES = [
   "BACKLOG",
@@ -578,61 +583,72 @@ export class BusinessLayer {
    */
   assertGraphAuthority(row: Row): void {
     const id = String(row.work_item_id);
+    const deps = { store: this.store, getBusiness: (b: string) => this.getBusiness(b) };
+    const corrupt = (reason: string): never => {
+      this.quarantineWorkItem(row, reason);
+      throw new IntegrityError("FAIL_CLOSED_WORK_PROVENANCE_CORRUPT", `${reason} on ${id}`);
+    };
+    // R1 §4: full-chain canonical validators — a subset of matching
+    // fields never proves authority; malformed canonical rows quarantine.
     if (row.delegated_from_work_item_id || row.delegated_by_agent_id || row.delegation_key) {
       const del = this.store.tryGet("work_delegation", `WDEL_${id}`) as Row | null;
-      const ok = del !== null &&
-        String(del.parent_work_item_id) === String(row.delegated_from_work_item_id ?? "") &&
-        String(del.delegated_to_agent_id) === String(row.assignee_agent_id ?? "") &&
-        String(del.delegated_from_agent_id) === String(row.delegated_by_agent_id ?? "") &&
-        String(del.delegation_key) === String(row.delegation_key ?? "") &&
-        String(del.business_id) === String(row.business_id) &&
-        String(del.state) === "COMMITTED";
-      if (!ok) {
-        this.quarantineWorkItem(row, "delegation fields lack matching canonical work_delegation row");
-        throw new IntegrityError(
-          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
-          `forged delegation provenance on ${id}`,
-        );
+      if (!del) corrupt("delegation fields lack canonical work_delegation row");
+      try {
+        assertCanonicalDelegation(deps, del!);
+      } catch (err) {
+        corrupt(`delegation provenance invalid: ${(err as Error).message}`);
       }
     }
     if (row.decomposed_as) {
       // Decomposed PARENT marker: the committed WDEC_<self> row must
-      // exist with matching id/business — the marker alone proves nothing.
+      // exist, pass full validation, and agree on decomposition_id.
       const dec = this.store.tryGet("work_decomposition", `WDEC_${id}`) as Row | null;
-      const ok = dec !== null &&
-        String(dec.decomposition_id) === String(row.decomposed_as) &&
-        String(dec.business_id) === String(row.business_id) &&
-        String(dec.state) === "COMMITTED";
-      if (!ok) {
-        this.quarantineWorkItem(row, "decomposed marker lacks canonical work_decomposition row");
-        throw new IntegrityError(
-          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
-          `forged decomposed marker on ${id}`,
-        );
+      if (!dec) corrupt("decomposed marker lacks canonical work_decomposition row");
+      try {
+        assertCanonicalDecomposition(deps, dec!);
+      } catch (err) {
+        corrupt(`decomposition row invalid: ${(err as Error).message}`);
       }
-    } else if (row.decomposition_id) {
-      // Decomposed CHILD: the parent's committed WDEC row must list it.
+      if (String(dec!.decomposition_id) !== String(row.decomposed_as)) {
+        corrupt("decomposed marker disagrees with canonical decomposition_id");
+      }
+    }
+    if (row.decomposition_id) {
+      // Decomposed CHILD: the parent's committed WDEC row must pass full
+      // validation AND list this row.
       const dec = this.store.tryGet(
         "work_decomposition", `WDEC_${String(row.parent_work_item_id ?? "")}`) as Row | null;
-      const ok = dec !== null &&
-        String(dec.decomposition_id) === String(row.decomposition_id) &&
-        String(dec.business_id) === String(row.business_id) &&
-        String(dec.state) === "COMMITTED" &&
-        ((dec.child_work_item_ids as string[] | undefined) ?? []).includes(id);
-      if (!ok) {
-        this.quarantineWorkItem(row, "decomposition_id lacks matching canonical work_decomposition row");
-        throw new IntegrityError(
-          "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
-          `forged decomposition provenance on ${id}`,
-        );
+      if (!dec) corrupt("decomposition_id lacks canonical work_decomposition row");
+      try {
+        assertCanonicalDecomposition(deps, dec!);
+      } catch (err) {
+        corrupt(`decomposition row invalid: ${(err as Error).message}`);
+      }
+      if (!((dec!.child_work_item_ids as string[] | undefined) ?? []).includes(id)) {
+        corrupt("work item not listed in canonical decomposition children");
       }
     } else if (row.parent_work_item_id && !row.delegated_from_work_item_id) {
-      this.quarantineWorkItem(row, "parent_work_item_id without delegation/decomposition evidence");
-      throw new IntegrityError(
-        "FAIL_CLOSED_WORK_PROVENANCE_CORRUPT",
-        `bare parent_work_item_id on ${id}`,
-      );
+      corrupt("parent_work_item_id without delegation/decomposition evidence");
     }
+    // Dependency edges claiming this node as dependent must each be
+    // canonical — a malformed WGE row quarantines its dependent.
+    for (const e of this.store.list("work_graph_edge")) {
+      if (String(e.dependent_work_item_id) !== id) continue;
+      try {
+        assertCanonicalEdge(deps, e as Row);
+      } catch (err) {
+        corrupt(`dependency edge invalid: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  /**
+   * Quarantine entry for canonical-row validation failures discovered by
+   * `WorkforceService.reconcileWorkGraph` (the work item the malformed
+   * canonical row would have authorized).
+   */
+  quarantineForReconcile(row: Row, reason: string): void {
+    this.quarantineWorkItem(row, reason);
   }
 
   /**

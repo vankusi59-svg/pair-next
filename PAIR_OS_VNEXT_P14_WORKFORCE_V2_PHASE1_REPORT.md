@@ -1,8 +1,8 @@
 # PAIR OS VNext — P14 WORKFORCE V2 PHASE 1 REPORT
 
-**Classification at push:** `P14_WORKFORCE_V2_PHASE1_PENDING_AUDIT`
+**Classification at push:** `P14_WORKFORCE_V2_PHASE1_REMEDIATED_R1_PENDING_AUDIT`
 **Base (canonical main):** `ef1fb11b214d7917b6d827efb223ddc22ae19511`
-**Head:** `cf871040120e54721a6d1ab6586492a3bc3fa9d1`
+**Head:** (R1 head — see git log; Phase 1 original head `cf871040120e54721a6d1ab6586492a3bc3fa9d1`)
 **Branch:** `devin/1790731419-p14-workforce-v2-p1`
 **Scope:** governed work graph + parent→child decomposition + dependency DAG + delegation core + child missions through the merged Foundation V2 path. Phase 1 only — no heartbeat, inbox, autonomous reassignment, scheduling, parent completion cascade, CEO loop, P15/P16.
 
@@ -95,7 +95,102 @@ Inspected `devin/1790682872-p14-autonomous-workforce` (reference only, never mer
 
 NOT ported: depends_on-as-row-field edges (replaced by canonical `work_graph_edge` rows for durable per-edge provenance), WORK_DELEGATED-as-proof (replaced by `work_delegation` row + bidirectional field check), heartbeat/inbox/auto-assign/review graph (Phase 2+), quarantine-parent-on-delegate (kept — it was ported), heartbeat machinery.
 
-## 9. Tests — 15 focused (`src/__tests__/pair-p14-workforce-v2.test.ts`)
+## 9. R1 remediation — canonical graph provenance + collision + authority narrowing
+
+Independent-audit mandate (five defects). All closed in this section.
+
+### 9.1 Central canonical validators (`src/pair/graph-authority.ts`, new)
+
+Three validators prove the **full chain** per entity — not field subsets —
+and throw `IntegrityError("FAIL_CLOSED_WORK_GRAPH_ROW")` on any break.
+`BusinessLayer.assertGraphAuthority` wraps every call: a malformed
+canonical row quarantines the affected work_item
+(`FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`) and can never become executable.
+
+- `assertCanonicalEdge(row)` — `edge_id === WGE_<digest(dep,dep)>`
+  recomputed from endpoints; both nodes exist; no self-edge; same
+  business; stored `business_id`/`project_id` equal the canonical
+  relationship's; `state ∈ {ACTIVE, REVOKED}`. `writeEdge` validates an
+  existing deterministic row before adopting/reviving it — a payload-
+  mismatched row is never silently reused.
+- `assertCanonicalDelegation(row)` — `delegation_id === WDEL_<child>`;
+  child + parent resolve; same business; stored project equals canonical
+  business project; mode-consistent provenance (`AGENT` ⇒
+  `delegated_from_agent_id === child.delegated_by_agent_id ===
+  parent.assignee_agent_id`; `OPERATOR` ⇒ from/by null +
+  `delegated_by_operator` present); back-references on the child
+  (delegated_from/by/key/assignee=to); `depth ===
+  child.delegation_depth === parent.delegation_depth + 1`; child
+  `required_capability === parent`'s; child `decomposition_id === null`;
+  COMMITTED.
+- `assertCanonicalDecomposition(row)` — `decomposition_id ===
+  WDEC_<parent>` and `parent.decomposed_as === decomposition_id`;
+  business/project canonical; COMMITTED; persisted proposal recomputes
+  to stored `proposal_digest`; child list order equals the proposal;
+  every child resolves and proves back-references (parent,
+  decomposition_id, business) + spec match (title/goal/assignee/
+  requires_review/required_capability) + no delegation provenance +
+  ACTIVE edges equal `spec.depends_on`.
+
+### 9.2 Proposal digest — replay identity is payload identity
+
+`proposal_digest = digest({schema, parent_work_item_id,
+decomposition_id, business_id, children: ResolvedChildSpec[]})` where
+each resolved spec carries work_item_id/title/goal/assignee/
+requires_review/required_capability/depends_on (resolved child ids —
+dep topology included). Persisted with `proposal` on the WDEC row.
+Rules: same decomposition_id + same digest → idempotent replay through
+`assertCanonicalDecomposition`; same id + different digest →
+`FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT`. Digest check runs inside the
+same `immediate()` txn — race-safe under CAS.
+
+### 9.3 Collision adoption — provenance before adoption
+
+A pre-existing deterministic `DC_*` row is adopted ONLY when it is
+provably this decomposition's own un-committed residue: exactly one
+store write (version 1 — created, never mutated), full spec/business/
+parent/decomposition_id match, no delegation provenance, fresh status
+(`READY` iff assignee else `BACKLOG`), `mission_ids` empty,
+`blocked_code` null, `source === "decomposition"`. Anything else →
+`FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT`. A mismatched child is never
+repaired or adopted.
+
+### 9.4 Delegator identity is canonical (R1 §5)
+
+`delegateWorkItem` splits into `delegation_mode` AGENT | OPERATOR
+(recorded on WDEL + enforced by the validator):
+
+- **AGENT**: `delegated_by_agent_id` MUST equal the parent's canonical
+  `assignee_agent_id`; any other agent — even ACTIVE same-business —
+  fails `FAIL_CLOSED_WORK_DELEGATE_AUTHORITY`. No ceiling ⇒ no AGENT
+  mode.
+- **OPERATOR**: operator-directed delegation; `delegated_by_agent_id`
+  omitted; provenance recorded as `delegated_by_operator`.
+
+### 9.5 Authority narrowing — child ⊆ parent ceiling (R1 §6)
+
+`effectiveAuthority(agentId)` resolves the agent's CURRENT P12 contract
+into concrete sets — capabilities (registered ∩ allowed − denied),
+executors/routes (catalog ∩ allow ∩ hard-restrict − denied), projects,
+context scopes. `assertAuthoritySubset(child, parent)` throws
+`FAIL_CLOSED_WORK_AUTHORITY_WIDEN` on any dimension where the child set
+is not ⊆ the parent's. Enforced at delegation (when the parent has an
+assignee ceiling) and at decomposition (directly-assigned children
+while the parent has a ceiling). Explicit parent denies remain denied
+automatically via effective sets. Unassigned parent → no fabricated
+ceiling: the explicit operator/decomposition admission rule applies
+(ACTIVE same-business + required-capability check), business/project
+scope stays canonical. No second permission system — this consumes the
+same P12 contract semantics.
+
+### 9.6 Server fix
+
+`mission-control-server.ts` only read request bodies for POST — the
+`PUT /api/work-items/:id/dependencies` endpoint always received `{}`
+(always `expected_version=-1`, `depends_on=[]`) and was unusable. Bodies
+now parse for PUT too.
+
+## 10. Tests — 24 focused (`src/__tests__/pair-p14-workforce-v2.test.ts`)
 
 | Test | Result |
 |---|---|
@@ -113,13 +208,22 @@ NOT ported: depends_on-as-row-field edges (replaced by canonical `work_graph_edg
 | FORGED-DELEGATION (fields-only + mismatched WDEL) | PASS |
 | FORGED-DONE-DEPENDENCY (status w/o mission proof) | PASS |
 | CHILD-BOUND-MISSION (bound_open_id + BOUND binding) | PASS |
-| RESTART-IDEMPOTENT | PASS |
+| RESTART-IDEMPOTENT (replays identical spec per R1 digest rule) | PASS |
+| R1-DECOMP-SAME-ID-DIFFERENT-PAYLOAD (same id, changed spec → conflict) | PASS |
+| R1-DECOMP-PREEXISTING-CHILD-COLLISION (forged residue never adopted; exact-match residue proves) | PASS |
+| R1-WDEC-PAYLOAD-MISMATCH (malformed canonical row quarantines) | PASS |
+| R1-WDEL-WRONG-CHILD-ID / WRONG-PROJECT / WRONG-DEPTH (each fails canonical proof) | PASS |
+| R1-WGE-PAYLOAD-MISMATCH (malformed edge never revived; quarantine) | PASS |
+| R1-DELEGATOR-NOT-PARENT-ASSIGNEE (arbitrary ACTIVE agent → FAIL_CLOSED_WORK_DELEGATE_AUTHORITY) | PASS |
+| R1-DELEGATE-AUTHORITY-WIDEN (broader delegatee contract fails closed) | PASS |
+| R1-DECOMPOSE-AUTHORITY-WIDEN (assigned child exceeding parent ceiling fails) | PASS |
+| R1-HAPPY (valid delegation still opens child via Foundation V2) | PASS |
 
-## 10. Validation matrix
+## 11. Validation matrix
 
 | Suite | Result |
 |---|---|
-| Focused WFV2-P1 | 15/15 |
+| Focused WFV2-P1 (+R1) | 24/24 |
 | P14 Foundation V2 | 35/35 |
 | Runtime hardening | 11/11 |
 | P13 | 67/67 |
@@ -128,29 +232,58 @@ NOT ported: depends_on-as-row-field edges (replaced by canonical `work_graph_edg
 | P10 | 31/31 |
 | P9 | 79/79 |
 | P6 | 36/36 |
-| Node 22 full | 1984 pass + 2 fail (P5 DSH/CODEX env-gap, pre-existing) |
-| Node 20 full | 1986 pass / 0 fail |
+| Node 22 full | 1993 pass + 2 fail (P5 DSH/CODEX env-gap, pre-existing) |
+| Node 20 full | 1995 pass / 0 fail |
 | typecheck | clean |
 | build | PASS |
 | `pnpm audit --audit-level=high` | 0 high / 0 critical (8 moderate + 1 low below threshold) |
-| verifyIntegrity | clean on fresh-server db (98 entities / 131 events incl. graph rows) |
+| verifyIntegrity | clean on populated graph db (12 entities incl. WDEC/WDEL/WGE) |
 
-## 11. Fresh-server E2E (mandate §11)
+## 12. Fresh-server E2E (mandate §9)
 
-Killed all PAIR processes → head `cf87104` → rebuilt → fresh server `PAIR_MC_DIR=/home/ubuntu/pair-mc-wfv2` (Node 22, DSH+CODEX env):
+Killed all PAIR processes → branch head → rebuilt → fresh server
+`PAIR_MC_DIR=/home/ubuntu/pair-mc-r1` (Node 22):
 
-1. business + 3 agents (caps `FILE_OPERATIONS`) + parent `WI_*`;
-2. `POST .../delegate` → `DL_*` child, `WDEL` row COMMITTED, `WORK_DELEGATED` event;
-3. `POST .../decompose` `DEC-E2E` → `DC_*` ×2, sibling edge `DC_8d9a→DC_d81d` ACTIVE, parent `decomposed_as=DEC-E2E`;
-4. `POST .../open` on dependent `DC_8d9a` → **409 `FAIL_CLOSED_WORK_DEPENDENCY_UNMET`**;
-5. open `DC_d81d` → `IN_PROGRESS`, bound mission `MSN_*` (`bound_open_id` set, binding BOUND);
-6. mission → COMPLETED → board read folds `DC_d81d` → DONE;
-7. re-open `DC_8d9a` → **IN_PROGRESS, its own bound mission** — dependency unlocked only by proven DONE;
-8. pause `workerB` → delegate → **409 `FAIL_CLOSED_AGENT_INACTIVE`** (zero residue);
-9. replay `decompose DEC-E2E` with different children → returns committed children (idempotent, zero new rows);
-10. kill + restart on same pair.db → `reconcileWorkGraph` clean (no `WORK_GRAPH:` quarantine log), graph intact: 4 nodes / 1 edge / 1 delegation / 1 decomposition.
+1. business + 2 agents + parent assigned to `A`;
+2. `POST .../delegate` with `delegated_by_agent_id = B` (≠ assignee) → **409 `FAIL_CLOSED_WORK_DELEGATE_AUTHORITY`** — arbitrary ACTIVE agent cannot claim delegation;
+3. `delegated_by = A` → `DL_*` child; WDEL row carries `delegation_mode: "AGENT"`, `delegated_from_agent_id = A`, `delegated_by_operator: null`;
+4. `decompose DEC1` → `DC_*` child; WDEC carries `proposal_digest`;
+5. replay `DEC1` with a DIFFERENT spec → **409 `FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT`** (same-spec replay is idempotent);
+6. `PUT .../dependencies` (PUT body fix verified live) → sibling edge ACTIVE;
+7. forged `project_id` on the WGE row (direct sqlite edit) → `POST .../open` on the dependent → **409 `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT`**; dependent durably quarantined (`blocked_code = TERMINAL_PROVENANCE_CORRUPT`); forged edge never revived.
 
-## 12. Changed files
+## 13. Changed files (R1)
+
+- `src/pair/graph-authority.ts` (**new**) — central canonical validators + digest/proposal helpers
+- `src/pair/work-graph.ts` — digest identity, collision adoption, delegation modes, authority narrowing, validated edge reuse; re-exports validators
+- `src/pair/business.ts` — `assertGraphAuthority` consumes full validators (+ edge-chain loop, independent decomposed_as/decomposition_id checks)
+- `src/pair/mission-control-server.ts` — PUT body parsing fix
+- `src/__tests__/pair-p14-workforce-v2.test.ts` — 9 R1 adversarial tests
+- `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REPORT.md`, `CURRENT_STATE.md`
+
+(Phase 1 original file list below.)
+
+## 14. Phase 1 original tests — preserved (all 15 re-run green under R1)
+
+| Test | Result |
+|---|---|
+| GRAPH-HAPPY (canonical edges + projection) | PASS |
+| GRAPH-CYCLE (self + transitive) | PASS |
+| GRAPH-CROSS-BUSINESS | PASS |
+| GRAPH-CROSS-PROJECT / missing-node / stale CAS | PASS |
+| DECOMPOSE-RACE (idempotent replay + conflict) | PASS |
+| DECOMPOSE-CRASH (zero partial state + forged quarantine) | PASS |
+| DELEGATE-HAPPY | PASS |
+| DELEGATE-INACTIVE-AGENT | PASS |
+| DELEGATE-WRONG-BUSINESS | PASS |
+| DELEGATE-CAPABILITY-WIDEN | PASS |
+| DELEGATE-RACE (same key exactly-once) | PASS |
+| FORGED-DELEGATION (fields-only + mismatched WDEL) | PASS |
+| FORGED-DONE-DEPENDENCY (status w/o mission proof) | PASS |
+| CHILD-BOUND-MISSION (bound_open_id + BOUND binding) | PASS |
+| RESTART-IDEMPOTENT (replays identical spec per R1 digest rule) | PASS |
+
+### Phase 1 original file list
 
 - `src/pair/work-graph.ts` (new) — WorkforceService, entities, validators
 - `src/pair/business.ts` — org_agent `capabilities`; internal graph fields on work_item; `assertGraphAuthority` / `assertDependenciesSatisfied` / `dependencyEdgesOf` / `hasGraphFields`; open-seam gates; `TERMINAL_WORK_ITEM_STATUSES` export; `decomposed_as` marker field
@@ -160,7 +293,7 @@ Killed all PAIR processes → head `cf87104` → rebuilt → fresh server `PAIR_
 - `src/__tests__/pair-p14-workforce-v2.test.ts` (new)
 - `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REPORT.md`, `CURRENT_STATE.md`
 
-## 13. Remaining Phase 2+ work (explicitly out of scope)
+## 15. Remaining Phase 2+ work (explicitly out of scope)
 
 - heartbeat / agent inbox / collaboration, autonomous reassignment
 - parent completion cascade (children-DONE → parent progression)

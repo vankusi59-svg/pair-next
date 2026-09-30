@@ -24,36 +24,43 @@
  * quarantined by BusinessLayer.assertGraphAuthority.
  */
 import { IntegrityError, PolicyError } from "./errors.js";
-import { digest, utcnow } from "./canonical.js";
+import { utcnow } from "./canonical.js";
 import type { PairEvidenceStore } from "./store.js";
 import {
   TERMINAL_WORK_ITEM_STATUSES,
   WORK_CORRUPT_CODE,
   type BusinessLayer,
 } from "./business.js";
+import {
+  assertCanonicalDecomposition,
+  assertCanonicalDelegation,
+  assertCanonicalEdge,
+  childNodeId,
+  decompositionProposal,
+  decompositionProposalDigest,
+  decompositionRowId,
+  delegationRowId,
+  edgeId,
+  type GraphAuthorityDeps,
+  type ResolvedChildSpec,
+} from "./graph-authority.js";
+
+// R1: deterministic helpers + canonical validators live in
+// graph-authority.ts (imported by business.ts too) — re-exported here so
+// `index.ts`'s `export * from "./work-graph.js"` keeps them public.
+export {
+  childNodeId,
+  decompositionRowId,
+  delegationRowId,
+  edgeId,
+  decompositionProposal,
+  decompositionProposalDigest,
+  assertCanonicalDecomposition,
+  assertCanonicalDelegation,
+  assertCanonicalEdge,
+};
 
 type Row = Record<string, unknown> & { version: number };
-
-/** Deterministic work-graph child id (delegation DL / decomposition DC). */
-export function childNodeId(prefix: "DL" | "DC", parentId: string, key: string): string {
-  return `${prefix}_${digest(`${prefix}:${parentId}:${key}`).slice(0, 24)}`;
-}
-
-/** Deterministic edge id — exactly one edge can ever exist for
- *  (dependent, dependency); a second insert loses the v0-CAS. */
-function edgeId(dependentId: string, dependencyId: string): string {
-  return `WGE_${digest(`wge:${dependentId}:${dependencyId}`).slice(0, 20)}`;
-}
-
-/** Deterministic decomposition row id — one committed decomposition per
- *  parent. */
-export function decompositionRowId(parentId: string): string {
-  return `WDEC_${parentId}`;
-}
-/** Deterministic delegation row id — keyed by the child it proves. */
-export function delegationRowId(childId: string): string {
-  return `WDEL_${childId}`;
-}
 
 /** Work-graph bounds: delegation depth, nodes per business, children per
  *  decomposition — fail closed when exceeded. */
@@ -75,6 +82,10 @@ export class WorkforceService {
   private get business(): BusinessLayer {
     return this.deps.business;
   }
+  private get graphDeps(): GraphAuthorityDeps {
+    return { store: this.store, getBusiness: (id) => this.business.getBusiness(id) };
+  }
+
   private node(id: string): Row {
     const r = this.store.tryGet("work_item", id) as Row | null;
     if (!r) {
@@ -177,6 +188,99 @@ export class WorkforceService {
   }
 
   /**
+   * R1 §6 — an agent's effective execution authority, resolved from its
+   * canonical P12 contract (same semantics as the gate's pinned∩current
+   * effective policy, evaluated on the single CURRENT snapshot): the
+   * concrete id sets an agent may actually reach. Sets are concrete —
+   * `null` allow-list resolves against the registered/catalog universe,
+   * minus denies, so subset comparison is exact.
+   */
+  private effectiveAuthority(agentId: string): {
+    capabilities: Set<string>;
+    executors: Set<string>;
+    routes: Set<string>;
+    projects: Set<string> | null;
+    contextScopes: Set<string>;
+  } {
+    const { contract } = this.business.agentContracts.resolve(agentId, {
+      actor: "PAIR_WORK_GRAPH",
+    });
+    const pol = contract.policy as {
+      allowed_capabilities?: string[] | null;
+      denied_capabilities?: string[];
+      allowed_executor_ids?: string[] | null;
+      denied_executor_ids?: string[];
+      preferred_executor_ids?: string[];
+      executor_fallback_allowed?: boolean;
+      preferred_route_ids?: string[];
+      denied_route_ids?: string[];
+      route_fallback_allowed?: boolean;
+      allowed_project_ids?: string[] | null;
+      allowed_context_scopes?: string[];
+    };
+    const registered = this.business.agentContracts.registeredCapabilities();
+    const capabilities = new Set(
+      [...registered].filter((c) =>
+        (pol.allowed_capabilities == null || pol.allowed_capabilities.includes(c)) &&
+        !(pol.denied_capabilities ?? []).includes(c)),
+    );
+    const hardExec =
+      pol.executor_fallback_allowed === false && (pol.preferred_executor_ids ?? []).length
+        ? new Set(pol.preferred_executor_ids!) : null;
+    const executors = new Set(
+      this.store.list("executor").map((e) => String(e.executor_id)).filter((id) =>
+        (pol.allowed_executor_ids == null || pol.allowed_executor_ids.includes(id)) &&
+        (hardExec === null || hardExec.has(id)) &&
+        !(pol.denied_executor_ids ?? []).includes(id)),
+    );
+    const hardRoute =
+      pol.route_fallback_allowed === false && (pol.preferred_route_ids ?? []).length
+        ? new Set(pol.preferred_route_ids!) : null;
+    const routes = new Set(
+      this.store.list("route").map((r) => String(r.route_id)).filter((id) =>
+        (hardRoute === null || hardRoute.has(id)) &&
+        !(pol.denied_route_ids ?? []).includes(id)),
+    );
+    return {
+      capabilities,
+      executors,
+      routes,
+      projects: pol.allowed_project_ids == null ? null : new Set(pol.allowed_project_ids),
+      contextScopes: new Set(pol.allowed_context_scopes ?? []),
+    };
+  }
+
+  /**
+   * R1 §6 — child/delegatee effective authority must be a SUBSET of the
+   * ceiling agent's effective authority in every dimension. Because the
+   * sets are already deny-free, a child deny can never widen; an explicit
+   * parent deny is automatically preserved (a denied id is absent from
+   * the parent's set, so it can never appear in the child's).
+   */
+  private assertAuthoritySubset(
+    child: ReturnType<WorkforceService["effectiveAuthority"]>,
+    parent: ReturnType<WorkforceService["effectiveAuthority"]>,
+    what: string,
+  ): void {
+    const subset = (a: Set<string>, b: Set<string>) => [...a].every((x) => b.has(x));
+    const dim = (ok: boolean, name: string) => {
+      if (!ok) {
+        throw new PolicyError(
+          "FAIL_CLOSED_WORK_AUTHORITY_WIDEN",
+          `${what}: child ${name} exceeds parent authority`,
+        );
+      }
+    };
+    dim(subset(child.capabilities, parent.capabilities), "capabilities");
+    dim(subset(child.executors, parent.executors), "executors");
+    dim(subset(child.routes, parent.routes), "routes");
+    if (parent.projects !== null) {
+      dim(child.projects !== null && subset(child.projects, parent.projects), "projects");
+    }
+    dim(subset(child.contextScopes, parent.contextScopes), "context scopes");
+  }
+
+  /**
    * Add edge child→dep inside the caller's transaction: fails on
    * missing node, cross-business, cross-project, self-edge; duplicate
    * edges dedupe deterministically (same canonical id). Does NOT check
@@ -204,8 +308,17 @@ export class WorkforceService {
     const id = edgeId(String(child.work_item_id), depId);
     const prior = this.store.tryGet("work_graph_edge", id) as Row | null;
     if (prior) {
-      // Idempotent revive/keep — the same canonical edge identity can
-      // never carry different endpoints.
+      // R1 §3: a deterministic key can never silently carry a different
+      // payload — the existing row must pass the FULL canonical validator
+      // (endpoints, scope, lifecycle) before it may be reused/revived.
+      try {
+        assertCanonicalEdge(this.graphDeps, prior);
+      } catch (err) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_GRAPH_ROW",
+          `existing edge ${id} is malformed: ${(err as Error).message}`,
+        );
+      }
       if (String(prior.state) === "REVOKED") {
         this.store.put("work_graph_edge", id,
           { ...prior, state: "ACTIVE", updated_at: utcnow() }, Number(prior.version));
@@ -326,7 +439,13 @@ export class WorkforceService {
   delegateWorkItem(
     input: {
       work_item_id: string;
-      delegated_by_agent_id: string;
+      /** AGENT mode: the delegator — MUST equal the parent's canonical
+       *  assignee_agent_id (R1 §5); a caller cannot name an arbitrary
+       *  ACTIVE agent as the delegator of another agent's work.
+       *  Omit for OPERATOR mode: operator-directed delegation recorded
+       *  with operator provenance (`delegated_by_operator`), no agent
+       *  identity is claimed. */
+      delegated_by_agent_id?: string;
       delegated_to_agent_id: string;
       reason?: string;
       delegation_key?: string;
@@ -339,20 +458,39 @@ export class WorkforceService {
       this.business.assertWorkItemNotQuarantined(parent);
       this.business.assertGraphAuthority(parent);
       const businessId = String(parent.business_id);
-      const by = this.agent(input.delegated_by_agent_id);
-      const to = this.agent(input.delegated_to_agent_id);
-      if (String(by.business_id) !== businessId) {
-        throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SCOPE", "delegator outside business");
+      const ceilingAgentId = parent.assignee_agent_id
+        ? String(parent.assignee_agent_id) : null;
+      const mode: "AGENT" | "OPERATOR" = input.delegated_by_agent_id ? "AGENT" : "OPERATOR";
+      let by: Row | null = null;
+      if (mode === "AGENT") {
+        by = this.agent(input.delegated_by_agent_id!);
+        if (String(by.business_id) !== businessId) {
+          throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SCOPE", "delegator outside business");
+        }
+        // Canonical delegator identity (R1 §5): agent-to-agent delegation
+        // is valid only FROM the agent canonically assigned the parent —
+        // a caller can never label an arbitrary same-business ACTIVE
+        // agent as the delegator.
+        if (ceilingAgentId === null || input.delegated_by_agent_id !== ceilingAgentId) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_WORK_DELEGATE_AUTHORITY",
+            "delegated_by must equal the parent's canonical assignee",
+          );
+        }
+        if (String(by.status) !== "ACTIVE") {
+          throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", "delegator not ACTIVE");
+        }
       }
+      const to = this.agent(input.delegated_to_agent_id);
       if (String(to.business_id) !== businessId) {
         throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SCOPE", "target outside business");
       }
-      // ADMISSION semantics: new delegation requires both parties ACTIVE
+      // ADMISSION semantics: new delegation requires the target ACTIVE
       // right now — later PAUSE/TERMINATE cannot retro-forge this proof.
-      if (String(by.status) !== "ACTIVE" || String(to.status) !== "ACTIVE") {
-        throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", "delegator or target not ACTIVE");
+      if (String(to.status) !== "ACTIVE") {
+        throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", "target not ACTIVE");
       }
-      if (input.delegated_to_agent_id === input.delegated_by_agent_id) {
+      if (by && input.delegated_to_agent_id === String(by.agent_id)) {
         throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SELF", "cannot delegate to self");
       }
       if (TERMINAL_WORK_ITEM_STATUSES.has(String(parent.status))) {
@@ -376,9 +514,22 @@ export class WorkforceService {
       }
       const reqCap = parent.required_capability ? String(parent.required_capability) : null;
       this.assertCapability(to, reqCap);
+      // R1 §6 — a child mission pins the DELEGATEE's contract, so the
+      // delegatee's effective P12 authority must be a subset of the
+      // parent assignee's (the authority ceiling). Unassigned parent: no
+      // agent-derived authority exists — the operator-admission rule
+      // (reqCap + ACTIVE + same business/project, enforced above) is the
+      // defined ceiling; none is fabricated.
+      if (ceilingAgentId !== null) {
+        this.assertAuthoritySubset(
+          this.effectiveAuthority(input.delegated_to_agent_id),
+          this.effectiveAuthority(ceilingAgentId),
+          `delegate ${input.delegated_to_agent_id}`,
+        );
+      }
       const key =
         input.delegation_key ??
-        `${input.work_item_id}:${input.delegated_to_agent_id}:${String(input.reason ?? "")}`;
+        `${input.work_item_id}:${input.delegated_to_agent_id}:${mode}:${String(input.reason ?? "")}`;
       const childId = childNodeId("DL", input.work_item_id, key);
       const prior = this.store.tryGet("work_item", childId);
       if (prior) {
@@ -389,7 +540,7 @@ export class WorkforceService {
           String(prior.business_id) === businessId &&
           String(prior.parent_work_item_id ?? "") === input.work_item_id &&
           String(prior.delegated_from_work_item_id ?? "") === input.work_item_id &&
-          String(prior.delegated_by_agent_id ?? "") === input.delegated_by_agent_id &&
+          String(prior.delegated_by_agent_id ?? "") === String(by?.agent_id ?? "") &&
           String(prior.assignee_agent_id ?? "") === input.delegated_to_agent_id &&
           Number(prior.delegation_depth ?? 0) === depth &&
           String(prior.delegation_key ?? "") === key &&
@@ -400,7 +551,7 @@ export class WorkforceService {
             `deterministic child ${childId} has mismatched provenance`,
           );
         }
-        this.writeDelegationRow(parent, childId, key, input, depth, actor);
+        this.writeDelegationRow(parent, childId, key, mode, by, input.delegated_to_agent_id, depth, actor);
         return prior;
       }
       const child = this.business.createWorkItem({
@@ -413,7 +564,7 @@ export class WorkforceService {
         reviewer_agent_id: parent.reviewer_agent_id ? String(parent.reviewer_agent_id) : undefined,
         parent_work_item_id: input.work_item_id,
         delegated_from_work_item_id: input.work_item_id,
-        delegated_by_agent_id: input.delegated_by_agent_id,
+        delegated_by_agent_id: by ? String(by.agent_id) : undefined,
         delegation_reason: String(input.reason ?? "").slice(0, 500) || undefined,
         delegation_depth: depth,
         delegation_key: key,
@@ -421,12 +572,14 @@ export class WorkforceService {
         work_item_id: childId,
         operator_id: actor,
       });
-      this.writeDelegationRow(parent, childId, key, input, depth, actor);
+      this.writeDelegationRow(parent, childId, key, mode, by, input.delegated_to_agent_id, depth, actor);
       this.store.event({
         entity_type: "work_item", entity_id: input.work_item_id,
         event_type: "WORK_DELEGATED", actor: `operator:${actor}`,
         metadata: {
-          delegated_from: input.delegated_by_agent_id,
+          delegation_mode: mode,
+          delegated_from: by ? String(by.agent_id) : null,
+          delegated_by_operator: mode === "OPERATOR" ? actor : null,
           delegated_to: input.delegated_to_agent_id,
           child_work_item_id: childId,
           delegation_key: key,
@@ -441,17 +594,20 @@ export class WorkforceService {
    *  and fails closed. */
   private writeDelegationRow(
     parent: Row, childId: string, key: string,
-    input: { delegated_by_agent_id: string; delegated_to_agent_id: string },
+    mode: "AGENT" | "OPERATOR",
+    by: Row | null, toAgentId: string,
     depth: number, actor: string,
   ): void {
     const rowId = delegationRowId(childId);
     const body = {
       delegation_id: rowId,
       delegation_key: key,
+      delegation_mode: mode,
       parent_work_item_id: String(parent.work_item_id),
       child_work_item_id: childId,
-      delegated_from_agent_id: input.delegated_by_agent_id,
-      delegated_to_agent_id: input.delegated_to_agent_id,
+      delegated_from_agent_id: by ? String(by.agent_id) : null,
+      delegated_by_operator: mode === "OPERATOR" ? actor : null,
+      delegated_to_agent_id: toAgentId,
       depth,
       business_id: String(parent.business_id),
       project_id: String(this.business.getBusiness(String(parent.business_id)).project_id),
@@ -462,12 +618,21 @@ export class WorkforceService {
     };
     const existing = this.store.tryGet("work_delegation", rowId) as Row | null;
     if (existing) {
+      // R1 §3: the FULL payload must match — a deterministic key can
+      // never silently carry different provenance.
       const same =
+        String(existing.delegation_id) === rowId &&
+        String(existing.child_work_item_id) === childId &&
         String(existing.delegation_key) === key &&
+        String(existing.delegation_mode) === mode &&
         String(existing.parent_work_item_id) === body.parent_work_item_id &&
-        String(existing.delegated_from_agent_id) === body.delegated_from_agent_id &&
+        String(existing.delegated_from_agent_id ?? "") === String(by?.agent_id ?? "") &&
+        String(existing.delegated_by_operator ?? "") === String(body.delegated_by_operator ?? "") &&
         String(existing.delegated_to_agent_id) === body.delegated_to_agent_id &&
-        String(existing.business_id) === body.business_id;
+        Number(existing.depth) === depth &&
+        String(existing.business_id) === body.business_id &&
+        String(existing.project_id) === body.project_id &&
+        String(existing.state) === "COMMITTED";
       if (!same) {
         throw new IntegrityError(
           "FAIL_CLOSED_WORK_DELEGATE_CONFLICT",
@@ -523,13 +688,34 @@ export class WorkforceService {
       this.business.assertWorkItemNotQuarantined(parent);
       this.business.assertGraphAuthority(parent);
       const businessId = String(parent.business_id);
+      const reqCap = parent.required_capability ? String(parent.required_capability) : null;
+      const ceilingAgentId = parent.assignee_agent_id
+        ? String(parent.assignee_agent_id) : null;
+      const childIds = input.children.map((_, i) =>
+        childNodeId("DC", workItemId, `${decompId}|${i}`));
+      // R1 §2 — canonical proposal identity: the resolved (id-materialized)
+      // spec INCLUDING resulting dep topology is what replay compares.
+      const resolvedChildren: ResolvedChildSpec[] = input.children.map((c, i) => ({
+        work_item_id: childIds[i]!,
+        title: String(c.title),
+        goal: String(c.goal),
+        assignee_agent_id: c.assignee_agent_id ? String(c.assignee_agent_id) : null,
+        requires_review: c.requires_review === true,
+        required_capability: reqCap,
+        depends_on: (c.depends_on_indices ?? []).map((j) => childIds[j]!),
+      }));
+      const proposal = decompositionProposal(workItemId, decompId, businessId, resolvedChildren);
+      const proposalDigest = decompositionProposalDigest(proposal);
       const rowId = decompositionRowId(workItemId);
       const existingDec = this.store.tryGet("work_decomposition", rowId) as Row | null;
       if (existingDec) {
-        // Idempotent replay ONLY for the identical committed
-        // decomposition; a different proposal on this parent conflicts.
+        // Idempotent replay ONLY for the identical committed proposal —
+        // same decomposition_id carrying a DIFFERENT payload conflicts
+        // deterministically; a malformed canonical row never replays.
         if (String(existingDec.decomposition_id) === decompId &&
-            String(existingDec.state) === "COMMITTED") {
+            String(existingDec.state) === "COMMITTED" &&
+            String(existingDec.proposal_digest ?? "") === proposalDigest) {
+          assertCanonicalDecomposition(this.graphDeps, existingDec);
           const ids = (existingDec.child_work_item_ids as string[]) ?? [];
           const children = ids.map((id) => this.node(String(id)));
           return { parent: this.node(workItemId), children };
@@ -549,11 +735,14 @@ export class WorkforceService {
         throw new IntegrityError(
           "FAIL_CLOSED_WORK_GRAPH_BOUND", `business graph exceeds ${WORK_GRAPH_NODE_CAP} nodes`);
       }
-      const reqCap = parent.required_capability ? String(parent.required_capability) : null;
       // Validate the whole proposal BEFORE any write: sibling dep indices
       // in range and acyclic by construction (earlier siblings only),
       // assignees are ACTIVE same-business agents satisfying the
-      // inherited capability.
+      // inherited capability — and (R1 §6) when the parent carries an
+      // assignee/authority ceiling, each directly-assigned child's
+      // effective authority must be a subset of it.
+      const ceilingAuth = ceilingAgentId === null
+        ? null : this.effectiveAuthority(ceilingAgentId);
       for (const [i, c] of input.children.entries()) {
         for (const depIdx of c.depends_on_indices ?? []) {
           if (!Number.isInteger(depIdx) || depIdx < 0 || depIdx >= input.children.length) {
@@ -574,14 +763,53 @@ export class WorkforceService {
             throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", c.assignee_agent_id);
           }
           this.assertCapability(ag, reqCap);
+          if (ceilingAuth) {
+            this.assertAuthoritySubset(
+              this.effectiveAuthority(c.assignee_agent_id),
+              ceilingAuth,
+              `decompose child ${i} → ${c.assignee_agent_id}`,
+            );
+          }
         }
       }
-      const childIds = input.children.map((_, i) =>
-        childNodeId("DC", workItemId, `${decompId}|${i}`));
       const children: Row[] = [];
       for (const [i, c] of input.children.entries()) {
-        const existing = this.store.tryGet("work_item", childIds[i]);
+        const spec = resolvedChildren[i]!;
+        const existing = this.store.tryGet("work_item", childIds[i]!) as Row | null;
         if (existing) {
+          // R1 §1 — a deterministic-id collision is never authoritative by
+          // the id alone: adopt the existing row ONLY when it is provably
+          // this decomposition's own un-committed residue — exactly one
+          // store write (version 1 = created, never mutated; store.put
+          // stores payload.version+1), fresh status, zero missions/blocks,
+          // full spec match, this decomposition's provenance, and no
+          // delegation provenance. Anything else conflicts closed.
+          const freshStatus = spec.assignee_agent_id ? "READY" : "BACKLOG";
+          const adoptable =
+            Number(existing.version) === 1 &&
+            String(existing.business_id) === businessId &&
+            String(existing.parent_work_item_id ?? "") === workItemId &&
+            String(existing.decomposition_id ?? "") === decompId &&
+            (existing.decomposed_as ?? null) === null &&
+            (existing.delegated_from_work_item_id ?? null) === null &&
+            (existing.delegated_by_agent_id ?? null) === null &&
+            (existing.delegation_key ?? null) === null &&
+            Number(existing.delegation_depth ?? 0) === 0 &&
+            String(existing.assignee_agent_id ?? "") === String(spec.assignee_agent_id ?? "") &&
+            (existing.requires_review === true) === spec.requires_review &&
+            String(existing.required_capability ?? "") === String(spec.required_capability ?? "") &&
+            String(existing.title) === spec.title &&
+            String(existing.goal) === spec.goal &&
+            String(existing.status) === freshStatus &&
+            String(existing.source ?? "") === "decomposition" &&
+            ((existing.mission_ids as string[] | undefined) ?? []).length === 0 &&
+            (existing.blocked_code ?? null) === null;
+          if (!adoptable) {
+            throw new IntegrityError(
+              "FAIL_CLOSED_WORK_DECOMPOSE_CONFLICT",
+              `deterministic child ${childIds[i]} has mismatched provenance`,
+            );
+          }
           children.push(existing);
           continue;
         }
@@ -604,9 +832,8 @@ export class WorkforceService {
       // Sibling dependency edges materialize in the SAME transaction —
       // no window where children exist without their canonical edges.
       const pending = new Map<string, string[]>();
-      for (const [i, c] of input.children.entries()) {
-        const depIds = (c.depends_on_indices ?? []).map((j) => childIds[j]);
-        if (depIds.length) pending.set(childIds[i], depIds);
+      for (const spec of resolvedChildren) {
+        if (spec.depends_on.length) pending.set(spec.work_item_id, spec.depends_on);
       }
       for (const [childId, depIds] of pending) {
         const childRow = this.node(childId);
@@ -619,6 +846,8 @@ export class WorkforceService {
         business_id: businessId,
         project_id: String(this.business.getBusiness(businessId).project_id),
         child_work_item_ids: childIds,
+        proposal,
+        proposal_digest: proposalDigest,
         state: "COMMITTED",
         created_by: actor,
         created_at: utcnow(),
@@ -645,16 +874,47 @@ export class WorkforceService {
    * can never fabricate missing graph evidence.
    */
   reconcileWorkGraph(): { quarantined: string[] } {
-    const quarantined: string[] = [];
+    const quarantined = new Set<string>();
+    const mark = (id: string | null) => {
+      if (!id) return;
+      const w = this.store.tryGet("work_item", id) as Row | null;
+      if (!w || String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) return;
+      this.business.quarantineForReconcile(w, "canonical graph row malformed");
+      quarantined.add(id);
+    };
+    // Canonical rows are themselves proof-checked: a malformed WGE/WDEL/
+    // WDEC quarantines the work item it would have authorized — restart
+    // can never fabricate or accept corrupt graph evidence (R1 §3/§4).
+    for (const e of this.store.list("work_graph_edge")) {
+      try {
+        assertCanonicalEdge(this.graphDeps, e as Row);
+      } catch {
+        mark(String(e.dependent_work_item_id ?? ""));
+      }
+    }
+    for (const d of this.store.list("work_delegation")) {
+      try {
+        assertCanonicalDelegation(this.graphDeps, d as Row);
+      } catch {
+        mark(String(d.child_work_item_id ?? ""));
+      }
+    }
+    for (const d of this.store.list("work_decomposition")) {
+      try {
+        assertCanonicalDecomposition(this.graphDeps, d as Row);
+      } catch {
+        mark(String(d.parent_work_item_id ?? ""));
+      }
+    }
     for (const w of this.store.list("work_item")) {
       if (!this.business.hasGraphFields(w)) continue;
       if (String(w.blocked_code ?? "") === WORK_CORRUPT_CODE) continue;
       try {
         this.business.assertGraphAuthority(w);
       } catch {
-        quarantined.push(String(w.work_item_id));
+        quarantined.add(String(w.work_item_id));
       }
     }
-    return { quarantined };
+    return { quarantined: [...quarantined] };
   }
 }
