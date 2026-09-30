@@ -227,6 +227,15 @@ export function assertCanonicalDelegation(deps: GraphAuthorityDeps, del: Row): v
       fail(`delegation ${str(del, "delegation_id")} AGENT ceiling not from delegator`);
     }
   }
+  // R3 §4 — the ceiling identity is bound to the parent's CANONICAL
+  // assignee captured by this delegation: AGENT mode also equals the
+  // delegator (proven above), OPERATOR mode with an assigned parent
+  // equals that parent's assignee, and an unassigned parent requires
+  // the ceiling to remain null. Graph-bound assignee immutability
+  // (R3 §1) keeps this relation stable.
+  if (ceilingAgent !== str(parent, "assignee_agent_id")) {
+    fail(`delegation ${str(del, "delegation_id")} ceiling agent not canonical parent assignee`);
+  }
   if (str(child, "delegated_from_work_item_id") !== parentId ||
       str(child, "parent_work_item_id") !== parentId) {
     fail(`delegation ${str(del, "delegation_id")} child parent back-reference mismatch`);
@@ -317,6 +326,13 @@ export function assertCanonicalDecomposition(deps: GraphAuthorityDeps, dec: Row)
       }
     } else if (ceiling !== null && ceiling !== undefined) {
       fail(`decomposition ${str(dec, "decomposition_row_id")} ceiling without ceiling agent`);
+    }
+    // R3 §4 — the proposal's ceiling identity must equal the parent's
+    // canonical assignee at committed provenance: an assigned parent
+    // requires its snapshot, an unassigned parent requires explicit
+    // null. Graph-bound assignee immutability keeps this stable.
+    if (ceilingAgent !== str(parent, "assignee_agent_id")) {
+      fail(`decomposition ${str(dec, "decomposition_row_id")} ceiling agent not canonical parent assignee`);
     }
   }
   for (const [i, cidRaw] of (childIds as unknown[]).entries()) {

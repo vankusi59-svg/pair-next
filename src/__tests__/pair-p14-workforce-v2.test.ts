@@ -1068,3 +1068,193 @@ describe("P14 WFV2-P1 R2 — dependency manifest + authority ceiling", () => {
       .toEqual([String(child.work_item_id)]);
   });
 });
+
+// ---------------------------------------------------------------------
+// R3 — graph assignee immutability + ceiling-agent executability
+// ---------------------------------------------------------------------
+
+describe("P14 WFV2-P1 R3 — assignee immutability + ceiling executability", () => {
+  it("WFV2-P1-R3-DELEGATED-CHILD-REASSIGN-REJECT: generic assign cannot rewrite a delegated child", () => {
+    const { ctx, biz, wf } = makeStack("r3-del-child-reassign");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    const other = makeAgent(biz, String(b.business_id), "other");
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    expect(errCode(() =>
+      biz.assignWorkItem(String(child.work_item_id), String(other.agent_id), "op"),
+    )).toBe("FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE");
+    const cur = ctx.store.get("work_item", String(child.work_item_id));
+    expect(String(cur.assignee_agent_id)).toBe(String(to.agent_id));
+    expect(String(cur.blocked_code ?? "")).toBe(""); // rejection, not quarantine
+    expect(() => biz.assertGraphAuthority(cur)).not.toThrow(); // WDEL still valid
+  });
+
+  it("WFV2-P1-R3-DECOMPOSED-CHILD-REASSIGN-REJECT: generic assign cannot rewrite a decomposed child", () => {
+    const { ctx, biz, wf } = makeStack("r3-dec-child-reassign");
+    const b = makeBiz(biz, ctx.projectId);
+    const ag = makeAgent(biz, String(b.business_id), "lead");
+    const other = makeAgent(biz, String(b.business_id), "other");
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: ag.agent_id });
+    const r = wf.decomposeWorkItem(String(p.work_item_id), {
+      decomposition_id: "DEC-R3",
+      children: [
+        { title: "c1", goal: "g1", assignee_agent_id: String(ag.agent_id) },
+        { title: "c2", goal: "g2" },
+      ],
+    }, "op");
+    const childId = String(r.children[0].work_item_id);
+    expect(errCode(() =>
+      biz.assignWorkItem(childId, String(other.agent_id), "op"),
+    )).toBe("FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE");
+    const cur = ctx.store.get("work_item", childId);
+    expect(String(cur.assignee_agent_id)).toBe(String(ag.agent_id));
+    expect(String(cur.blocked_code ?? "")).toBe("");
+    expect(() => biz.assertGraphAuthority(cur)).not.toThrow(); // WDEC still valid
+  });
+
+  it("WFV2-P1-R3-GRAPH-PARENT-REASSIGN-REJECT: committed ceiling source parent cannot change assignee", () => {
+    const { ctx, biz, wf } = makeStack("r3-parent-reassign");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    const other = makeAgent(biz, String(b.business_id), "other");
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    expect(errCode(() =>
+      biz.assignWorkItem(String(p.work_item_id), String(other.agent_id), "op"),
+    )).toBe("FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE");
+    const cur = ctx.store.get("work_item", String(p.work_item_id));
+    expect(String(cur.assignee_agent_id)).toBe(String(lead.agent_id));
+    expect(String(cur.blocked_code ?? "")).toBe("");
+    // child provenance remains provable — the rejected write never landed.
+    expect(() => biz.assertGraphAuthority(ctx.store.get("work_item", String(child.work_item_id))))
+      .not.toThrow();
+  });
+
+  it("WFV2-P1-R3-STANDALONE-ASSIGN-HAPPY: non-graph item assigns and reassigns normally", () => {
+    const { ctx, biz } = makeStack("r3-standalone");
+    const b = makeBiz(biz, ctx.projectId);
+    const a1 = makeAgent(biz, String(b.business_id), "lead");
+    const a2 = makeAgent(biz, String(b.business_id), "worker");
+    const w = makeItem(biz, String(b.business_id));
+    biz.assignWorkItem(String(w.work_item_id), String(a1.agent_id), "op");
+    biz.assignWorkItem(String(w.work_item_id), String(a2.agent_id), "op");
+    expect(String(ctx.store.get("work_item", String(w.work_item_id)).assignee_agent_id))
+      .toBe(String(a2.agent_id));
+  });
+
+  it("WFV2-P1-R3-PAUSED-PARENT-DELEGATE-REJECT: PAUSED ceiling agent fails new delegation admission", () => {
+    const { ctx, biz, wf } = makeStack("r3-paused-delegate");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
+    expect(errCode(() =>
+      wf.delegateWorkItem({
+        work_item_id: String(p.work_item_id),
+        delegated_to_agent_id: String(to.agent_id),
+      }, "op"),
+    )).toBe("FAIL_CLOSED_AGENT_INACTIVE");
+    expect(ctx.store.list("work_delegation")).toHaveLength(0);
+    expect(ctx.store.list("work_item")).toHaveLength(1);
+  });
+
+  it("WFV2-P1-R3-PAUSED-PARENT-DECOMPOSE-REJECT: PAUSED ceiling agent fails new decomposition admission", () => {
+    const { ctx, biz, wf } = makeStack("r3-paused-decompose");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const worker = makeAgent(biz, String(b.business_id), "worker");
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
+    expect(errCode(() =>
+      wf.decomposeWorkItem(String(p.work_item_id), {
+        decomposition_id: "DEC-PAUSED",
+        children: [{ title: "c", goal: "g", assignee_agent_id: String(worker.agent_id) }],
+      }, "op"),
+    )).toBe("FAIL_CLOSED_AGENT_INACTIVE");
+    expect(ctx.store.list("work_decomposition")).toHaveLength(0);
+    expect(ctx.store.list("work_item")).toHaveLength(1);
+  });
+
+  it("WFV2-P1-R3-PARENT-PAUSED-AFTER-COMMIT: ceiling agent paused later fails child open", () => {
+    const { ctx, biz, wf } = makeStack("r3-paused-after-commit");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    biz.setOrgAgentStatus(String(lead.agent_id), "PAUSED", "op");
+    expect(errCode(() => biz.openWorkItem(String(child.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_AGENT_INACTIVE");
+    const cur = ctx.store.get("work_item", String(child.work_item_id));
+    expect(((cur.mission_ids as string[] | undefined) ?? [])).toHaveLength(0);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(0);
+  });
+
+  it("WFV2-P1-R3-PARENT-CONTRACT-DISABLED-AFTER-COMMIT: disabled ceiling contract fails child open", () => {
+    const { ctx, biz, wf } = makeStack("r3-contract-disabled");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    biz.upsertAgentContract(String(lead.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    biz.upsertAgentContract(String(to.agent_id), "op",
+      { allowed_capabilities: ["FILE_OPERATIONS"] });
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_by_agent_id: String(lead.agent_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    biz.setAgentContractStatus(String(lead.agent_id), "DISABLED", "op");
+    expect(errCode(() => biz.openWorkItem(String(child.work_item_id), "op")))
+      .toBe("FAIL_CLOSED_AGENT_CONTRACT_DISABLED");
+    const cur = ctx.store.get("work_item", String(child.work_item_id));
+    expect(((cur.mission_ids as string[] | undefined) ?? [])).toHaveLength(0);
+    expect(ctx.store.list("work_open_binding")).toHaveLength(0);
+  });
+
+  it("WFV2-P1-R3-OPERATOR-ASSIGNED-PARENT-CEILING: OPERATOR delegation binds parent assignee as ceiling", () => {
+    const { ctx, biz, wf } = makeStack("r3-operator-ceiling");
+    const b = makeBiz(biz, ctx.projectId);
+    const lead = makeAgent(biz, String(b.business_id), "lead");
+    const to = makeAgent(biz, String(b.business_id), "worker");
+    const p = makeItem(biz, String(b.business_id), { assignee_agent_id: lead.agent_id });
+    // OPERATOR mode: no delegated_by_agent_id — the parent's canonical
+    // assignee still supplies the persisted ceiling identity.
+    const child = wf.delegateWorkItem({
+      work_item_id: String(p.work_item_id),
+      delegated_to_agent_id: String(to.agent_id),
+    }, "op");
+    const del = ctx.store.get("work_delegation", `WDEL_${child.work_item_id}`);
+    expect(String(del.delegation_mode)).toBe("OPERATOR");
+    expect(String(del.authority_ceiling_agent)).toBe(String(lead.agent_id));
+    expect(del.authority_ceiling).not.toBeNull();
+    // the validator proves the relation, and open applies that exact ceiling
+    expect(() => biz.assertGraphAuthority(ctx.store.get("work_item", String(child.work_item_id))))
+      .not.toThrow();
+    const opened = biz.openWorkItem(String(child.work_item_id), "op");
+    expect(String(opened.status)).toBe("IN_PROGRESS");
+    const mission = ctx.store.get("mission", String(opened.mission_ids[0]));
+    expect(String(mission.bound_open_id ?? "")).not.toBe("");
+  });
+});

@@ -480,14 +480,26 @@ export class WorkforceService {
       if (String(to.status) !== "ACTIVE") {
         throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", "target not ACTIVE");
       }
+      const bizProjectId = String(this.business.getBusiness(businessId).project_id);
       // R2 §5 — a DISABLED P12 contract is never usable authority: new
       // admission resolves CURRENT executability (agent ACTIVE, contract
       // ACTIVE + integrity, business/project scope).
       this.business.agentContracts.assertExecutable(input.delegated_to_agent_id, {
         businessId,
-        projectId: String(this.business.getBusiness(businessId).project_id),
+        projectId: bizProjectId,
         actor: `operator:${actor}`,
       });
+      // R3 §2 — an agent that cannot itself execute cannot supply an
+      // authority ceiling: when the parent's assignee is the ceiling
+      // source (AGENT or OPERATOR mode), it must pass current P12
+      // admission too — a PAUSED/TERMINATED parent assignee fails closed.
+      if (ceilingAgentId !== null) {
+        this.business.agentContracts.assertExecutable(ceilingAgentId, {
+          businessId,
+          projectId: bizProjectId,
+          actor: `operator:${actor}`,
+        });
+      }
       if (by && input.delegated_to_agent_id === String(by.agent_id)) {
         throw new IntegrityError("FAIL_CLOSED_WORK_DELEGATE_SELF", "cannot delegate to self");
       }
@@ -763,6 +775,19 @@ export class WorkforceService {
           "FAIL_CLOSED_WORK_ITEM_STATE",
           `${String(parent.status)} cannot decompose`,
         );
+      }
+      // R3 §2 — an agent that cannot itself execute cannot supply an
+      // authority ceiling: when the parent's assignee is the ceiling
+      // source for directly-assigned children it must pass current P12
+      // admission too — a PAUSED/TERMINATED parent assignee or a
+      // DISABLED contract fails closed on new admission only (a matched
+      // replay returned above is a re-read, not an admission).
+      if (ceilingAgentId !== null) {
+        this.business.agentContracts.assertExecutable(ceilingAgentId, {
+          businessId,
+          projectId: String(this.business.getBusiness(businessId).project_id),
+          actor: `operator:${actor}`,
+        });
       }
       if (this.business.listWorkItems(businessId).length + input.children.length > WORK_GRAPH_NODE_CAP) {
         throw new IntegrityError(

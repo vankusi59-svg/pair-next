@@ -770,35 +770,51 @@ export class BusinessLayer {
       if (!ceiling) return;
       assertAuthoritySubset(childAuth, authorityToCeilingSet(ceiling), what);
     };
-    const parentNarrowing = (parentId: string | null, what: string) => {
-      if (!parentId) return;
-      const parent = this.store.tryGet("work_item", parentId) as Row | null;
-      const ceilingAgent = parent?.assignee_agent_id ? String(parent.assignee_agent_id) : null;
-      if (ceilingAgent) {
-        assertAuthoritySubset(childAuth, effectiveAuthority(deps, ceilingAgent), what);
-      }
+    // R3 §3 — the parent authority identity comes from the PERSISTED
+    // graph authority (WDEL.authority_ceiling_agent /
+    // WDEC.proposal.authority_ceiling_agent), never re-discovered from
+    // the mutable parent.assignee_agent_id. That exact agent must be
+    // executable CURRENTLY (PAUSED/TERMINATED agent or DISABLED contract
+    // fails closed before any binding/mission) and the child's current
+    // authority must remain inside its CURRENT authority — a narrowed
+    // ceiling narrows the child, a widened one cannot retro-expand past
+    // the persisted snapshot.
+    const currentCeilingNarrowing = (
+      ceilingAgent: string | null | undefined,
+      what: string,
+    ) => {
+      if (!ceilingAgent) return;
+      this.agentContracts.assertExecutable(ceilingAgent, {
+        businessId: String(row.business_id),
+        projectId: String(business.project_id),
+        actor: "PAIR_GRAPH_OPEN",
+      });
+      assertAuthoritySubset(childAuth, effectiveAuthority(deps, ceilingAgent), what);
     };
     if (row.delegated_from_work_item_id) {
       const del = this.store.tryGet("work_delegation", `WDEL_${String(row.work_item_id)}`) as Row | null;
       // assertGraphAuthority already proved the WDEL chain — read the
-      // persisted ceiling + re-apply CURRENT parent narrowing.
+      // persisted ceiling + re-apply CURRENT ceiling-agent narrowing.
       checkAgainst(
         del?.authority_ceiling as AuthorityCeiling | null | undefined,
         `delegated child ${String(row.work_item_id)}`);
-      parentNarrowing(
-        row.parent_work_item_id ? String(row.parent_work_item_id) : null,
-        `delegated child ${String(row.work_item_id)} vs current parent authority`);
+      currentCeilingNarrowing(
+        del?.authority_ceiling_agent ? String(del.authority_ceiling_agent) : null,
+        `delegated child ${String(row.work_item_id)} vs current ceiling authority`);
     } else if (row.decomposition_id) {
       const dec = this.store.tryGet(
         "work_decomposition",
         `WDEC_${String(row.parent_work_item_id ?? "")}`) as Row | null;
-      const proposal = (dec?.proposal ?? {}) as { authority_ceiling?: AuthorityCeiling | null };
+      const proposal = (dec?.proposal ?? {}) as {
+        authority_ceiling?: AuthorityCeiling | null;
+        authority_ceiling_agent?: string | null;
+      };
       checkAgainst(
         proposal.authority_ceiling,
         `decomposition child ${String(row.work_item_id)}`);
-      parentNarrowing(
-        row.parent_work_item_id ? String(row.parent_work_item_id) : null,
-        `decomposition child ${String(row.work_item_id)} vs current parent authority`);
+      currentCeilingNarrowing(
+        proposal.authority_ceiling_agent ? String(proposal.authority_ceiling_agent) : null,
+        `decomposition child ${String(row.work_item_id)} vs current ceiling authority`);
     }
   }
 
@@ -811,6 +827,31 @@ export class BusinessLayer {
   assignWorkItem(workItemId: string, agentId: string, actor: string): Row {
     const row = this.resolvePendingOpenBeforeMutation(workItemId, actor);
     this.assertWorkItemNotQuarantined(row);
+    // R3 §1 — canonical graph participation must hold before any
+    // assignment decision; a malformed row quarantines rather than being
+    // silently reassigned over.
+    this.assertGraphAuthority(row);
+    // Once committed graph authority binds an assignee/ceiling identity,
+    // generic assignment can never rewrite it (Phase 1 has no graph
+    // revisioning): delegated children (WDEL binds delegated_to),
+    // decomposition children (WDEC proposal binds the spec), and any
+    // parent captured as a committed ceiling source.
+    if (String(row.assignee_agent_id ?? "") !== agentId) {
+      const graphBound = Boolean(
+        row.delegated_from_work_item_id ||
+        row.decomposition_id ||
+        row.decomposed_as ||
+        this.store.tryGet("work_decomposition", `WDEC_${workItemId}`) !== null ||
+        this.store.list("work_delegation").some((d) =>
+          String(d.parent_work_item_id) === workItemId &&
+          String(d.state) === "COMMITTED"));
+      if (graphBound) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE",
+          `graph-bound assignee on ${workItemId} — committed delegation/decomposition authority`,
+        );
+      }
+    }
     const agent = this.store.get("org_agent", agentId);
     if (String(agent.business_id) !== String(row.business_id)) {
       throw new IntegrityError("FAIL_CLOSED_WORK_ITEM_SCOPE", `assignee outside business ${row.business_id}`);

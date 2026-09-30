@@ -321,8 +321,8 @@ autonomous reassignment / scheduling / parent cascade / CEO / P15/P16.
   bodies now parse (the dependencies endpoint was unusable via API).
 - Evidence: `PAIR_OS_VNEXT_P14_WORKFORCE_V2_PHASE1_REPORT.md`; suite
   `pair-p14-workforce-v2.test.ts` (WFV2-P1-* ×15 + WFV2-P1-R1-* ×9 +
-  WFV2-P1-R2-* ×11).
-  Classification: **`P14_WORKFORCE_V2_PHASE1_REMEDIATED_R2_PENDING_AUDIT`**.
+  WFV2-P1-R2-* ×11 + WFV2-P1-R3-* ×9).
+  Classification: **`P14_WORKFORCE_V2_PHASE1_REMEDIATED_R3_PENDING_FINAL_AUDIT`**.
 - **R2 dependency-set authority** (`work_dependency_set`, `WDS_<id>`):
   omission-safe manifest — active_edge_ids + dependency_work_item_ids +
   digest + revision, written atomically with every edge mutation (setDeps,
@@ -347,6 +347,16 @@ autonomous reassignment / scheduling / parent cascade / CEO / P15/P16.
   ceiling digest chain; governed child without manifest or edge rows
   without manifest quarantine the work item — never rebuilt from live
   fields.
+- **R3 graph assignee immutability**: `assignWorkItem` rejects assignee
+  changes on graph-bound rows (delegated/decomposed children, ceiling
+  source parents) → `FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE`; no write,
+  no quarantine; standalone items unaffected.
+- **R3 ceiling-agent executability**: ceiling agent (persisted
+  `authority_ceiling_agent`) must pass `assertExecutable` at delegation/
+  decomposition admission AND at child open — PAUSED/TERMINATED agent or
+  DISABLED contract fails closed; persisted ceiling identity is never
+  re-derived from the mutable parent assignee. Validators bind ceiling
+  identity to the canonical parent assignee.
 
 ## Not yet
 

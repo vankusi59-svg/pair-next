@@ -473,3 +473,109 @@ openai/gpt-oss-20b), `GEMINI_API_KEY` org secret, dsh `0.2.0-rc.2` + pi-ai gemin
 thought_signature patch. Restart: `PAIR_DSH_HOME=$HOME/.dsh CODEX_HOME=$HOME/.codex
 node scripts/serve-mission-control.mjs`. `gemini-3.8-flash` remains DISCOVERED
 (Google 503 high-demand); auto-qualifies when the endpoint recovers.
+
+## 18. R3 remediation — graph assignee immutability + ceiling-agent executability closure
+
+Independent audit `P14_WORKFORCE_V2_PHASE1_R2_INDEPENDENT_AUDIT_BLOCKED` →
+R3: two self-corruption channels — (a) generic `assignWorkItem()` could
+rewrite an assignee identity that committed WDEL/WDEC provenance already
+binds, turning a valid graph corrupt through a valid API call; (b) the
+ceiling agent was only proven ACTIVE-at-write — a PAUSED/TERMINATED or
+contract-DISABLED ceiling source could still mint new graph authority and
+wasn't re-proven at open through the PERSISTED ceiling identity.
+
+### 18.1 Graph assignee immutability (§1)
+
+`BusinessLayer.assignWorkItem` now: `assertWorkItemNotQuarantined` →
+`assertGraphAuthority` (a malformed row quarantines rather than being
+silently reassigned over) → **graph-participation gate** before any write.
+Assignee CHANGE is rejected with `FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE`
+when the row is: a delegated child (committed `WDEL_<child>` binds
+`delegated_to_agent_id`), a decomposition child (committed WDEC proposal
+binds the spec), a decomposed parent (`decomposed_as`/`WDEC_<id>`), or a
+parent named in any COMMITTED `work_delegation` row (its assignee is the
+persisted ceiling source). Idempotent same-agent assign stays allowed;
+standalone/non-graph items assign and reassign normally. No row write, no
+quarantine, no partial mutation. Phase 1 deliberately has no graph
+revisioning — re-delegation/reassignment belongs to later Workforce phases.
+
+### 18.2 Ceiling-agent admission (§2)
+
+`delegateWorkItem` and `decomposeWorkItem` now run
+`AgentContractService.assertExecutable(ceilingAgentId)` whenever the
+parent's assignee supplies the authority ceiling (AGENT and OPERATOR
+delegation modes; directly-assigned decomposition children). A PAUSED /
+TERMINATED ceiling agent — or a DISABLED contract — fails closed at
+admission (`FAIL_CLOSED_AGENT_INACTIVE` / `FAIL_CLOSED_AGENT_CONTRACT_DISABLED`);
+authority is never derived from a non-executable agent merely because its
+contract row remains ACTIVE. Decompose: the check sits after the idempotent
+replay early-return — a matched replay is a re-read, not a new admission.
+
+### 18.3 Open-time persisted-ceiling narrowing (§3)
+
+`assertChildAuthorityCeiling` no longer re-discovers the ceiling identity
+from the mutable `parent.assignee_agent_id`. It reads the persisted
+`WDEL.authority_ceiling_agent` / `WDEC.proposal.authority_ceiling_agent` and
+requires, before any binding/mission creation: (1) child agent
+`assertExecutable` currently; (2) persisted ceiling snapshot ⊆ child
+current authority (R2); (3) the persisted ceiling agent itself
+`assertExecutable` CURRENTLY (paused/disabled → fail closed); (4) child
+current ⊆ current ceiling-agent authority (parent narrowing narrows the
+child; parent widening can never retro-expand past the snapshot). No
+silent switch of ceiling identity to a later assignee — §1 makes that
+impossible anyway.
+
+### 18.4 Validators bind ceiling identity (§4)
+
+`assertCanonicalDelegation`: `authority_ceiling_agent` must equal the
+canonical `parent.assignee_agent_id` — AGENT mode (also equals
+`delegated_from_agent_id`), OPERATOR + assigned parent (equals that
+assignee), unassigned parent (must remain null; an assigned parent with a
+null ceiling fails too). `assertCanonicalDecomposition`: the proposal's
+`authority_ceiling_agent` must equal the parent's canonical assignee —
+assigned → snapshot required, unassigned → explicit null. Malformed
+relation → `FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` + unit quarantine.
+
+### 18.5 R3 tests — 9 focused (44 total in suite)
+
+WFV2-P1-R3-DELEGATED-CHILD-REASSIGN-REJECT, -DECOMPOSED-CHILD-REASSIGN-REJECT,
+-GRAPH-PARENT-REASSIGN-REJECT, -STANDALONE-ASSIGN-HAPPY,
+-PAUSED-PARENT-DELEGATE-REJECT, -PAUSED-PARENT-DECOMPOSE-REJECT,
+-PARENT-PAUSED-AFTER-COMMIT, -PARENT-CONTRACT-DISABLED-AFTER-COMMIT,
+-OPERATOR-ASSIGNED-PARENT-CEILING. All 35 Phase1+R1+R2 tests preserved.
+
+### 18.6 Changed files (R3)
+
+- `src/pair/business.ts` — assignee immutability gate in `assignWorkItem`;
+  `assertChildAuthorityCeiling` uses persisted ceiling identity +
+  current-executability proof.
+- `src/pair/work-graph.ts` — ceiling-agent `assertExecutable` at
+  delegation + decomposition admission.
+- `src/pair/graph-authority.ts` — WDEL/WDEC validators bind
+  `authority_ceiling_agent` to the canonical parent assignee.
+- `src/__tests__/pair-p14-workforce-v2.test.ts` — +9 R3 tests.
+
+### 18.7 Validation (R3 head)
+
+Focused 44/44 · P14F 35 · RH 11 · P13 67 · P12 71 · P11 103 · P10 31 ·
+P9 79 · P6 36 · Node22 full: 2013 passed + 2 fail (pre-existing P5
+env-gap) · Node20 full: 2015/0 · tsc clean · `pnpm build` PASS ·
+`pnpm audit --audit-level=high` → 0 high/0 critical · `verifyIntegrity`
+clean on populated db.
+
+### 18.8 Fresh-server E2E (R3)
+
+dist server `PAIR_MC_DIR=/home/ubuntu/pair-mc-r3`, port 8789,
+routes `gemini:gemini-3.1-flash-lite` + `groq:openai/gpt-oss-20b`
+QUALIFIED: delegated child reassign → `FAIL_CLOSED_WORK_GRAPH_ASSIGNEE_IMMUTABLE`;
+parent reassign → same code; delegated child open → IN_PROGRESS + bound
+mission (happy path intact); decomposed child reassign → IMMUTABLE;
+standalone assign → works; `PAUSED` ceiling agent → OPERATOR delegate →
+`FAIL_CLOSED_AGENT_INACTIVE` (zero WDEL/child rows); ceiling paused after
+commit → child open → `FAIL_CLOSED_AGENT_INACTIVE`, no binding; forged
+`authority_ceiling_agent` in committed proposal (re-hashed row) → open →
+`FAIL_CLOSED_WORK_PROVENANCE_CORRUPT` + `TERMINAL_PROVENANCE_CORRUPT`
+quarantine on the child only; restart → reconcile keeps quarantine, open
+still fails closed.
+
+Classification: **`P14_WORKFORCE_V2_PHASE1_REMEDIATED_R3_PENDING_FINAL_AUDIT`**.
