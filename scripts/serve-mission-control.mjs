@@ -69,7 +69,10 @@ import {
   modelProbeTimeoutMs,
   llmPlannerTimeoutMs,
   taskTimeoutSeconds,
+  planPreviewTtlSeconds,
   resolveMcToken,
+  runPlannerFailover,
+  dedupePlannerCandidates,
   reconcileModelRoleAssignments,
   resolveConfiguredModelRoleRoute,
   assertCanonicalModelRoleStateDisjoint,
@@ -98,6 +101,7 @@ fs.mkdirSync(journalRoot, { recursive: true });
 const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_MS (ms, 500..120000)
 const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
+const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
 
 // Phase A — MC token: explicit env > persistent file > generated 256-bit
 // (chmod 600). No static defaults anywhere; server + bridge share this seam.
@@ -108,7 +112,18 @@ console.log(`MC_TOKEN: resolved via ${mcToken.source} (file=${mcToken.path})`);
 // planner's model route; PAIR_DSH_* routes name DSH_EXECUTION candidates.
 // The two pools must be canonically disjoint — enforced below via
 // model_entry_id, never route spelling alone.
-const PLANNER_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
+// Phase B — the Planner pool is an ORDERED failover chain: primary route
+// first, then fallback, then extras, in configured order (deduped on the
+// resolved canonical model_entry_id). Planner failover NEVER borrows a
+// DSH_EXECUTION model — pools stay disjoint as canonical authority.
+const PLANNER_PRIMARY_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
+const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "").trim();
+const PLANNER_ROUTES = [PLANNER_PRIMARY_ROUTE];
+if (PLANNER_FALLBACK_ROUTE) PLANNER_ROUTES.push(PLANNER_FALLBACK_ROUTE);
+for (const extra of String(process.env.PAIR_PLANNER_EXTRA_ROUTES ?? "").split(",")) {
+  const r = extra.trim();
+  if (r && !PLANNER_ROUTES.includes(r)) PLANNER_ROUTES.push(r);
+}
 const DSH_PRIMARY_ROUTE = String(process.env.PAIR_DSH_MODEL_ROUTE ?? "cloudflare:@cf/zai-org/glm-4.7-flash").trim();
 const DSH_FALLBACK_ROUTE = String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "groq:openai/gpt-oss-20b").trim();
 const DSH_ROUTES = [DSH_PRIMARY_ROUTE, DSH_FALLBACK_ROUTE];
@@ -118,8 +133,10 @@ for (const extra of String(process.env.PAIR_DSH_EXTRA_ROUTES ?? "").split(",")) 
 }
 // Cheap static pre-check: identical route spelling across pools fails fast;
 // the canonical model_entry_id overlap check runs after discovery.
-if (PLANNER_ROUTE && DSH_ROUTES.includes(PLANNER_ROUTE)) {
-  throw new IntegrityError("FAIL_CLOSED_MODEL_ROLE_OVERLAP", `route ${PLANNER_ROUTE} configured for both PLANNER_COORDINATOR and DSH_EXECUTION`);
+for (const pr of PLANNER_ROUTES) {
+  if (pr && DSH_ROUTES.includes(pr)) {
+    throw new IntegrityError("FAIL_CLOSED_MODEL_ROLE_OVERLAP", `route ${pr} configured for both PLANNER_COORDINATOR and DSH_EXECUTION`);
+  }
 }
 
 const automaton = createDatabase(path.join(dir, "state.db"));
@@ -247,6 +264,14 @@ const executorCapSets = () =>
     .filter((s) => s.length);
 const planner = (input) => {
   const goal = String(input.mission.goal);
+  // Phase B pinned plan: a confirmed preview carries the EXACT persisted
+  // canonical task list — return it verbatim (validatePlanProposal
+  // re-validates; commitPlan pins the manifest). The planner is never
+  // re-invoked for a pinned mission.
+  const pinned = input.mission?.metadata?.pinned_plan_tasks;
+  if (Array.isArray(pinned) && pinned.length) {
+    return { tasks: pinned };
+  }
   const llm = input.mission?.metadata?.llm_plan;
   if (Array.isArray(llm) && llm.length) {
     // Safety re-check at the seam: sanitize again (defense in depth — the
@@ -379,6 +404,7 @@ const control = new MissionControl({
   observability: new MissionObservability(service), selfmod, planner,
   schedules,
   costHaltFile: COST_HALT_FILE,
+  planPreviewTtlSeconds: cfgPreviewTtlS,
 });
 const business = new BusinessLayer({ store, control, schedules });
 const workforce = new WorkforceService({ store, business });
@@ -419,6 +445,8 @@ if (!persistedProjects.length) {
 // §4.2 — populate provider/model catalogs from canonical discovery sources
 // (dsh settings, executor-advertised observations). Read-only projections.
 let planProvider = null;
+// Phase B — ordered planner failover candidates (qualified at boot).
+const plannerCandidates = [];
 if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   const dres = runProviderDiscovery(store, {
     context: { env: process.env, dshHome: process.env.PAIR_DSH_HOME, codexHome: process.env.CODEX_HOME },
@@ -471,7 +499,7 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     // is never silently dropped into a smaller pool.
     const resolveCfg = (route, role) =>
       resolveConfiguredModelRoleRoute((p, m) => mcat.getModelByIds(p, m), { route, role });
-    const plannerRefs = [resolveCfg(PLANNER_ROUTE, MODEL_ROLE.PLANNER_COORDINATOR)];
+    const plannerRefs = PLANNER_ROUTES.map((r) => resolveCfg(r, MODEL_ROLE.PLANNER_COORDINATOR));
     const dshRefs = DSH_ROUTES.map((r) => resolveCfg(r, MODEL_ROLE.DSH_EXECUTION));
     // Dedupe by canonical entry (operator may set fallback=primary for a
     // single-route DSH pool) — dedupe AFTER resolution, never drop.
@@ -536,15 +564,19 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     };
 
     // Planner pool: qualified separately, never bound to DSH_EXECUTOR_ID.
+    // Phase B: collect EVERY qualified route in configured order — the
+    // failover chain walks them deterministically at plan time.
     for (const r of plannerRefs) {
       const q = await qualifyRoute(r, false);
-      if (q && !planProvider) {
-        planProvider = {
+      if (q) {
+        plannerCandidates.push({
+          model_entry_id: r.model_entry_id,
+          ref: r.ref,
+          provider: r.pid,
+          model: r.mid,
           endpoint: endpointOf(q.prov),
           credentialEnv: String(q.prov.credential_reference_name ?? ""),
-          model: r.mid,
-          model_entry_id: r.model_entry_id,
-        };
+        });
       }
     }
     // DSH execution pool.
@@ -565,38 +597,46 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
 }
 sup.resume();
 
-// P-UI-6 plan expander: LLM-proposes a task DAG for the goal at the API
-// edge (preview only). Runs only when a provider route qualified at boot;
-// any failure → llmPlan falls back to the minimal T1 plan itself.
+// Phase B plan proposer: runs the canonical Planner failover chain at the
+// API edge — deterministic order, one whole valid plan wins, every attempt
+// returned as provenance evidence. Empty pool → input unchanged so the
+// deterministic template path still applies (planner NOT configured); a
+// configured-but-exhausted pool throws FAIL_CLOSED_PLANNER_EXHAUSTED.
 const planExpander = async (input) => {
-  if (!planProvider || typeof input.goal !== "string" || !input.goal.trim()) return input;
-  // Runtime role guard at a cheaply-identifiable entry point: the planner
-  // model must still hold PLANNER_COORDINATOR at plan time — a revoked or
-  // reassigned role fails closed rather than silently planning anyway.
-  assertPlannerModelRole(store, planProvider.model_entry_id);
-  const res = await llmPlan(String(input.goal), {
-    endpoint: `${planProvider.endpoint}/chat/completions`,
-    credentialEnv: planProvider.credentialEnv,
-    model: planProvider.model,
-    timeoutMs: cfgPlannerTimeoutMs,
-    allowedCapabilities: LLM_PLANNER_CAPS,
-    capabilitySets: executorCapSets(),
-  });
-  if (!res.tasks.length) {
-    // Degenerate/unusable plan — fail closed: a T1-only plan would run and
-    // report COMPLETED having done nothing. FAIL_CLOSED_* code → HTTP 409.
-    const e = new Error(`planner produced no usable task plan (${res.warnings.join(",") || "none"})`);
-    e.code = "FAIL_CLOSED_PLAN_DEGENERATE";
-    throw e;
+  const candidates = dedupePlannerCandidates(plannerCandidates);
+  if (!candidates.length || typeof input.goal !== "string" || !input.goal.trim()) {
+    return { input };
   }
+  const res = await runPlannerFailover({
+    candidates,
+    assertRole: (c) => assertPlannerModelRole(store, c.model_entry_id),
+    planFn: (c) =>
+      llmPlan(String(input.goal), {
+        endpoint: `${c.endpoint}/chat/completions`,
+        credentialEnv: c.credentialEnv,
+        model: c.model,
+        timeoutMs: cfgPlannerTimeoutMs,
+        allowedCapabilities: LLM_PLANNER_CAPS,
+        capabilitySets: executorCapSets(),
+      }),
+  });
   return {
-    ...input,
-    metadata: {
-      ...(typeof input.metadata === "object" && input.metadata ? input.metadata : {}),
-      llm_plan: res.tasks,
-      plan_source: res.source,
-      plan_model: res.model,
-      plan_warnings: res.warnings,
+    input: {
+      ...input,
+      metadata: {
+        ...(typeof input.metadata === "object" && input.metadata ? input.metadata : {}),
+        llm_plan: res.tasks,
+        plan_source: "LLM",
+        plan_model: res.winner.model,
+        plan_warnings: res.warnings,
+      },
+    },
+    planner: {
+      attempts: res.attempts,
+      winner: res.winner,
+      warnings: res.warnings,
+      allowed_capabilities: LLM_PLANNER_CAPS,
+      capability_sets: executorCapSets(),
     },
   };
 };

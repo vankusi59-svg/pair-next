@@ -84,6 +84,13 @@ export const TASK_TIMEOUT = {
   bounds: { min: 5, max: 7_200, unit: "s" },
 } as const;
 
+/** Plan preview (pinned plan) expiry. Unit: seconds. Bounds 30s–24h. */
+export const PLAN_PREVIEW_TTL = {
+  name: "PAIR_PLAN_PREVIEW_TTL_S",
+  defaultValue: 1_800,
+  bounds: { min: 30, max: 86_400, unit: "s" },
+} as const;
+
 export function modelProbeTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(MODEL_PROBE_TIMEOUT.name, MODEL_PROBE_TIMEOUT.defaultValue, MODEL_PROBE_TIMEOUT.bounds, env);
 }
@@ -94,4 +101,8 @@ export function llmPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): numb
 
 export function taskTimeoutSeconds(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(TASK_TIMEOUT.name, TASK_TIMEOUT.defaultValue, TASK_TIMEOUT.bounds, env);
+}
+
+export function planPreviewTtlSeconds(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(PLAN_PREVIEW_TTL.name, PLAN_PREVIEW_TTL.defaultValue, PLAN_PREVIEW_TTL.bounds, env);
 }
