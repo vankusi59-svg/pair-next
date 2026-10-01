@@ -441,3 +441,30 @@ Settings-level fault injection via `~/.pair-dsh-home/settings.yaml` (new `badq` 
 Known limitation carried unchanged: `.imported` discovery deferred; pre-existing stale data repaired once in the test db. `badq` remains configured in the test instance's `settings.yaml` (pointed at the real groq endpoint) as repro state.
 
 Classification remains: `PAIR_NEXT_POST_P14_PHASE_B_PLANNER_RELIABILITY_PENDING_INDEPENDENT_AUDIT`
+
+## R3 ADDENDUM — LIVE-FOUND SIBLING: model STALE residue (post-push, same class)
+
+After R3 push, the live prod stack hit `FAIL_CLOSED_PLANNER_EXHAUSTED` on a real UI
+mission: the gemini planner model was `QUALIFIED` but still carried the historical
+`STALE` condition left by absence reconciliation → `MODEL_NOT_STALE` gate →
+MODEL_UNAVAILABLE → pool exhausted. Identical invariant violation as §1–§3, on the
+MODEL side of the same authority.
+
+Fix (same canonical-seam pattern):
+`ModelEvidenceCatalog.issueQualificationReceipt` now reconciles conditions on
+successful qualification — `STALE` (transient residue) is removed; `REAPPEARED`
+(informational history) is preserved; REMOVED/DEPRECATED/BLOCKED can never reach
+the receipt path because the qualification gates fail first.
+`src/pair/model-catalog.ts` — single canonical seam, shared by planner +
+routable eligibility. No planner-side "ignore if qualified" logic.
+
+Test 68 (`pair-phase-b.test.ts`): QUALIFIED model + `STALE` → eligibility FAIL →
+`issueQualificationReceipt` → `STALE` cleared, `REAPPEARED` kept, all 8 gates PASS,
+`assertPlannerCandidateEligible` passes.
+
+Live verification on prod :8788 (post-restart):
+- boot: cf/groq/gemini re-QUALIFIED → `STALE` auto-cleared on all three (now
+  `[REAPPEARED]` only); DISCOVERED z-ai models correctly retain `STALE`
+- `POST /api/missions/preview` → gemini planner SUCCESS, preview
+  `MPP_01M3V4GZZETY1KGY06ZX688HRJ`, plan_digest `6b361ade…`, 2 tasks — no manual
+  sqlite cleanup.
