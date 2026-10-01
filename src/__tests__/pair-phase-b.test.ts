@@ -930,11 +930,14 @@ describe("R1 — zero eligible + durable evidence", () => {
 
 /* ============ R1 §9 — runtime eligibility revalidation ================ */
 
+// R2 §6 — fixtures model the INTENDED canonical state: a valid planner
+// candidate is QUALIFIED via the real qualification seam, never merely
+// DISCOVERED by accident.
 const mkModel = (
   store: PairEvidenceStore,
   pid: string,
   mid: string,
-  opts: { conditions?: string[]; aliases?: string[] } = {},
+  opts: { conditions?: string[]; aliases?: string[]; lifecycle?: string } = {},
 ) => {
   const mcat = new ModelEvidenceCatalog(store);
   const { entry } = mcat.upsertModelClaim({
@@ -943,22 +946,42 @@ const mkModel = (
     model_id: mid,
     capability_hints: ["text_inference"],
   });
+  const eid = String(entry.model_entry_id);
+  const lifecycle = opts.lifecycle ?? "QUALIFIED";
+  if (lifecycle === "QUALIFIED") {
+    mcat.issueQualificationReceipt(eid, {
+      capability_scope: ["text_inference"],
+      verifier: "test-probe",
+      evidence_refs: ["fixture"],
+      actor: "t",
+    });
+  } else if (lifecycle !== "DISCOVERED") {
+    const body = store.get("model_entry", eid);
+    store.put("model_entry", eid, { ...body, lifecycle_state: lifecycle }, Number(body.version));
+  }
   if (opts.conditions?.length || opts.aliases?.length) {
-    const body = store.get("model_entry", String(entry.model_entry_id));
-    store.put("model_entry", String(entry.model_entry_id), {
+    const body = store.get("model_entry", eid);
+    store.put("model_entry", eid, {
       ...body,
       conditions: opts.conditions ?? body.conditions,
       model_alias_ids: opts.aliases ?? body.model_alias_ids,
     }, Number(body.version));
   }
-  return String(entry.model_entry_id);
+  return eid;
 };
-const mkProvider = (store: PairEvidenceStore, pid: string, lifecycle = "QUALIFIED") => {
+const mkProvider = (
+  store: PairEvidenceStore,
+  pid: string,
+  opts: { lifecycle?: string; auth_state?: string; health_state?: string; conditions?: string[] } = {},
+) => {
   const id = providerEntryId(pid);
   const existing = store.tryGet("provider", id);
   store.put("provider", id, {
-    ...(existing ?? { provider_id: pid, entry_id: id, conditions: [] }),
-    lifecycle_state: lifecycle,
+    ...(existing ?? { provider_id: pid, entry_id: id }),
+    lifecycle_state: opts.lifecycle ?? "QUALIFIED",
+    auth_state: opts.auth_state ?? "AUTH_OK",
+    health_state: opts.health_state ?? "READY",
+    conditions: opts.conditions ?? [],
   }, existing ? Number(existing.version) : 0);
 };
 
@@ -1010,9 +1033,9 @@ describe("R1 §9 — assertPlannerCandidateEligible", () => {
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
     const me = mkModel(store, "pc", "mc");
     assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
-    mkProvider(store, "pc", "DISCOVERED");
+    mkProvider(store, "pc", { lifecycle: "DISCOVERED" });
     expect(() => assertPlannerCandidateEligible(store, me)).toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
-    mkProvider(store, "pc", "QUALIFIED");
+    mkProvider(store, "pc", { lifecycle: "QUALIFIED" });
     expect(() => assertPlannerCandidateEligible(store, me)).not.toThrow();
   });
 
@@ -1054,5 +1077,178 @@ describe("R1 §9 — assertPlannerCandidateEligible", () => {
     const stored = ctx.store.get("mission_plan_preview", String(pv.preview_id));
     expect(stored.canonical_tasks).toEqual(res.tasks);
     expect(pv.plan.tasks).toEqual(res.tasks);
+  });
+});
+
+/* ============ R2 — model/provider canonical eligibility gates ========== */
+
+/** Candidate built from a mkModel entry. */
+const candOf = (me: string, pid: string, mid: string): PlannerCandidate => ({
+  model_entry_id: me,
+  ref: `${pid}:${mid}`,
+  provider: pid,
+  model: mid,
+  endpoint: "x",
+  credentialEnv: "E",
+});
+
+const setModelLifecycle = (store: PairEvidenceStore, eid: string, s: string) => {
+  const b = store.get("model_entry", eid);
+  store.put("model_entry", eid, { ...b, lifecycle_state: s }, Number(b.version));
+};
+const setModelConditions = (store: PairEvidenceStore, eid: string, c: string[]) => {
+  const b = store.get("model_entry", eid);
+  store.put("model_entry", eid, { ...b, conditions: c }, Number(b.version));
+};
+
+describe("R2 §5 — provider/model eligibility gates", () => {
+  const setup = (tag: string, modelOpts: Parameters<typeof mkModel>[3] = {}, provOpts: Parameters<typeof mkProvider>[2] = {}) => {
+    const dir = freshDir(tag);
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const me = mkModel(store, "pg", "mg", modelOpts);
+    mkProvider(store, "pg", provOpts);
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    return { store, me };
+  };
+
+  it("49A. model DISCOVERED → availability rejection MODEL_UNAVAILABLE", async () => {
+    const { store, me } = setup("p49", { lifecycle: "DISCOVERED" });
+    const elig = assertPlannerCandidateEligible(store, me);
+    expect(elig).toMatchObject({ reject: true, failure_class: "MODEL_UNAVAILABLE" });
+    // Failover-eligible: candidate rejected, next wins.
+    const res = await runPlannerFailover({
+      candidates: [candOf(me, "pg", "mg"), cand("B", "pb:mb")],
+      planFn: async (c) => okPlan(c.model_entry_id),
+      assertEligible: (c) =>
+        c.model_entry_id === me ? assertPlannerCandidateEligible(store, me) : undefined,
+    });
+    expect(res.winner.model_entry_id).toBe("B");
+    expect(res.attempts[0].failure_class).toBe("MODEL_UNAVAILABLE");
+    expect(res.attempts[0].warnings[0]).toContain("ELIGIBILITY_REJECTED");
+  });
+
+  it("50B. model PROBED → not eligible (same MODEL_UNAVAILABLE class)", () => {
+    const { store, me } = setup("p50", { lifecycle: "PROBED" });
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({
+      reject: true,
+      failure_class: "MODEL_UNAVAILABLE",
+    });
+  });
+
+  it("51C. model QUALIFIED + all gates → eligible", () => {
+    const { store, me } = setup("p51");
+    expect(assertPlannerCandidateEligible(store, me)).toBeUndefined();
+  });
+
+  it("52D. qualification downgraded after boot → not invoked", async () => {
+    const { store, me } = setup("p52");
+    expect(assertPlannerCandidateEligible(store, me)).toBeUndefined();
+    setModelLifecycle(store, me, "DISCOVERED"); // downgrade before invocation
+    let invoked = 0;
+    const res = await runPlannerFailover({
+      candidates: [candOf(me, "pg", "mg"), cand("B", "pb:mb")],
+      planFn: async () => {
+        invoked++;
+        return okPlan("t");
+      },
+      assertEligible: (c) =>
+        c.model_entry_id === me ? assertPlannerCandidateEligible(store, me) : undefined,
+    });
+    expect(invoked).toBe(1); // only B invoked
+    expect(res.winner.model_entry_id).toBe("B");
+  });
+
+  it("53E. model STALE → not invoked (MODEL_UNAVAILABLE)", () => {
+    const { store, me } = setup("p53");
+    setModelConditions(store, me, ["STALE"]);
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({
+      reject: true,
+      failure_class: "MODEL_UNAVAILABLE",
+    });
+  });
+
+  it("54F. model UNAVAILABLE → rejected, failover wins on fallback", async () => {
+    const { store, me } = setup("p54");
+    setModelConditions(store, me, ["UNAVAILABLE"]);
+    const res = await runPlannerFailover({
+      candidates: [candOf(me, "pg", "mg"), cand("B", "pb:mb")],
+      planFn: async (c) => okPlan(c.model_entry_id),
+      assertEligible: (c) =>
+        c.model_entry_id === me ? assertPlannerCandidateEligible(store, me) : undefined,
+    });
+    expect(res.winner.model_entry_id).toBe("B");
+    expect(res.attempts[0].failure_class).toBe("MODEL_UNAVAILABLE");
+  });
+
+  it("55G. provider AUTH_FAILED → authority fail-closed (never failover)", async () => {
+    const { store, me } = setup("p55", {}, { auth_state: "AUTH_FAILED" });
+    await expectCode(
+      () =>
+        runPlannerFailover({
+          candidates: [candOf(me, "pg", "mg"), cand("B", "pb:mb")],
+          planFn: async () => okPlan("t"),
+          assertEligible: (c) =>
+            c.model_entry_id === me ? assertPlannerCandidateEligible(store, me) : undefined,
+        }),
+      "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE",
+    );
+  });
+
+  it("56H. provider health DOWN → availability rejection, fallback wins", async () => {
+    const { store, me } = setup("p56", {}, { health_state: "DOWN" });
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({
+      reject: true,
+      failure_class: "PROVIDER_UNAVAILABLE",
+    });
+    const res = await runPlannerFailover({
+      candidates: [candOf(me, "pg", "mg"), cand("B", "pb:mb")],
+      planFn: async (c) => okPlan(c.model_entry_id),
+      assertEligible: (c) =>
+        c.model_entry_id === me ? assertPlannerCandidateEligible(store, me) : undefined,
+    });
+    expect(res.winner.model_entry_id).toBe("B");
+  });
+
+  it("57I. provider DISABLED/UNQUALIFIED → authority fail-closed", () => {
+    const { store, me } = setup("p57", {}, { conditions: ["DISABLED"] });
+    expect(() => assertPlannerCandidateEligible(store, me)).toThrow(
+      /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
+    );
+    const { store: s2, me: me2 } = setup("p57b", {}, { conditions: ["UNQUALIFIED"] });
+    expect(() => assertPlannerCandidateEligible(s2, me2)).toThrow(
+      /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
+    );
+  });
+
+  it("58J. fully healthy QUALIFIED planner → invocation succeeds", async () => {
+    const { store, me } = setup("p58");
+    const res = await runPlannerFailover({
+      candidates: [candOf(me, "pg", "mg")],
+      planFn: async () => okPlan("t"),
+      assertEligible: (c) => assertPlannerCandidateEligible(store, c.model_entry_id),
+    });
+    expect(res.winner.model_entry_id).toBe(me);
+  });
+
+  it("59. §7 zero-eligible after qualification loss → EXHAUSTED + durable evidence, no preview/mission", async () => {
+    const { store, me } = setup("p59");
+    setModelLifecycle(store, me, "DISCOVERED"); // lost QUALIFIED before invocation
+    await expectCode(
+      () =>
+        runDurable(store, {
+          candidates: [candOf(me, "pg", "mg")],
+          planFn: async () => okPlan("t"),
+          assertEligible: (c) => assertPlannerCandidateEligible(store, c.model_entry_id),
+        }),
+      "FAIL_CLOSED_PLANNER_EXHAUSTED",
+    );
+    const run = store.list("planner_run")[0];
+    expect(String(run.state)).toBe("EXHAUSTED");
+    const atts = attemptsOf(store, String(run.planner_run_id));
+    expect(atts).toHaveLength(1);
+    expect(atts[0].outcome).toBe("FAILED");
+    expect(atts[0].failure_class).toBe("MODEL_UNAVAILABLE");
+    expect(store.list("mission_plan_preview")).toHaveLength(0);
+    expect(store.list("mission")).toHaveLength(0);
   });
 });

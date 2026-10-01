@@ -283,3 +283,79 @@ Exhausted path: `planner_run{EXHAUSTED}` → durable FAILED attempts → `FAIL_C
 - `src/__tests__/pair-phase-b.test.ts` — +11 R1 tests (48 total).
 
 Classification remains: `PAIR_NEXT_POST_P14_PHASE_B_PLANNER_RELIABILITY_PENDING_INDEPENDENT_AUDIT`
+
+---
+
+# INDEPENDENT AUDIT — R2 REMEDIATION (audited HEAD `b831dece55b817b0178cfcefde20c8d7056c58b8`)
+
+Audit result: `PHASE B = STILL BLOCKED, R2 REQUIRED` — runtime eligibility did not prove canonical model qualification or provider auth/health gates. Remediated below.
+
+## R2-§2–3 — Shared canonical eligibility authority (no second system)
+
+New shared projection `providerModelEligibility(store, provider_id, model_entry_id)` extracted in `src/pair/model-routable.ts` — the exact provider+model gate subset of `projectRoutableModels` (which now delegates to it), so planner eligibility and routing eligibility evaluate the SAME canonical gates and cannot disagree:
+
+- PROVIDER_QUALIFIED — row exists + lifecycle ∈ PROVIDER_OK_STATES
+- PROVIDER_AUTH_OK — auth_state ∈ {AUTH_OK, AUTH_REQUIRED}
+- PROVIDER_HEALTH_OK — health_state ∉ {UNAVAILABLE, DOWN}
+- PROVIDER_NOT_BLOCKED — conditions lack DISABLED/UNQUALIFIED
+- MODEL_QUALIFIED — `lifecycle_state === "QUALIFIED"` (the `issueQualificationReceipt` authority)
+- MODEL_NOT_STALE — no STALE/REMOVED condition
+- MODEL_NOT_REVOKED — no REMOVED/DEPRECATED/BLOCKED condition
+- MODEL_AVAILABLE — no UNAVAILABLE condition
+
+`assertPlannerCandidateEligible` (unchanged name/signature intent) now: `assertPlannerModelRole` → DSH-overlap (proven aliases included) → `providerModelEligibility` → two verdict channels. Executor/binding-specific gates (EXECUTOR_*, BINDING_QUALIFIED) are NOT applied — planner routes are not DSH bindings.
+
+## R2-§4 — Documented failure classification
+
+**AUTHORITY / GOVERNANCE → IntegrityError, propagates, NEVER failover-eligible:**
+- role missing/revoked/mismatch; model REMOVED/DEPRECATED/BLOCKED (`assertPlannerModelRole`)
+- candidate is or proven-aliases a DSH_EXECUTION model (`FAIL_CLOSED_PLANNER_DSH_OVERLAP`)
+- provider absent / lifecycle not canonically eligible / auth not OK / DISABLED|UNQUALIFIED condition (`FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`)
+
+**TEMPORARY AVAILABILITY → failover-eligible rejection `{reject:true, failure_class, reason}` — model never invoked, next candidate may win:**
+- model lifecycle no longer QUALIFIED → `MODEL_UNAVAILABLE`
+- model condition STALE or UNAVAILABLE → `MODEL_UNAVAILABLE`
+- provider health DOWN/UNAVAILABLE → `PROVIDER_UNAVAILABLE`
+
+`runPlannerFailover` contract widened: `assertEligible` may return void (eligible), `{reject:true,...}` (availability → durable FAILED attempt + `ELIGIBILITY_REJECTED:<gate>` warning → next candidate), or throw (authority → propagate). The STARTED attempt row is now persisted BEFORE eligibility runs, so even eligibility-rejected and authority-aborted invocations are auditable.
+
+## R2-§5 — Tests added (11; 59 total)
+
+49A DISCOVERED→MODEL_UNAVAILABLE reject→fallback wins · 50B PROBED→reject · 51C QUALIFIED all-gates→eligible · 52D post-boot downgrade→not invoked · 53E STALE→reject · 54F UNAVAILABLE→reject+fallback wins · 55G AUTH_FAILED→authority 409 no failover · 56H health DOWN→PROVIDER_UNAVAILABLE+fallback · 57I DISABLED/UNQUALIFIED→authority throw · 58J healthy→invoked · 59 §7 single-candidate qualification-loss→EXHAUSTED+durable FAILED attempt+no preview/mission.
+
+## R2-§6 — Fixtures corrected
+
+`mkModel` now models intended state explicitly: `lifecycle` param — `"QUALIFIED"` goes through the real `issueQualificationReceipt` seam (receipt + MODEL_QUALIFIED event), `"DISCOVERED"`/`"PROBED"` set lifecycle directly. `mkProvider` models `lifecycle/auth_state/health_state/conditions`. Prior tests accidentally accepted DISCOVERED; fixed.
+
+## R2-§8 — R1 invariants preserved
+
+Re-verified: NO_ELIGIBLE zero-candidate fail-closed; durable planner_run; STARTED-before-invocation (now also before eligibility); durable EXHAUSTED; canonical validation inside failover; first-fully-valid-whole-plan; one canonical seam; pinned preview identity/digest/TTL; restart-safe + idempotent confirm; one preview → ≤1 mission.
+
+## R2-§9 — Regression
+
+- Focused **59/59** Phase B; Phase A 60/60.
+- Full Node 22 suite: **2352 pass / 2 fail / 15 skip** — same pre-existing `~/.nvm` environment artifact reproduced on base `2277319`.
+- Typecheck + build clean.
+
+## R2-§10 — Live evidence (isolated `~/pair-mc-b1` :8797; state flipped via canonical-rehash sqlite writes)
+
+| Case | Result |
+|---|---|
+| healthy QUALIFIED pool | `PRN_01M3V15XC5…`: cf `MALFORMED_RESPONSE` → gemini SUCCESS — failover intact |
+| cf QUALIFIED→PROBED pre-invocation | cf `FAILED MODEL_UNAVAILABLE` → gemini SUCCESS (`PRN_01M3V18VP…`) |
+| cf STALE | cf `FAILED MODEL_UNAVAILABLE` → gemini SUCCESS (`PRN_01M3V18XT…`) |
+| cf provider AUTH_FAILED | **409 `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`** — authority fail-closed, no failover |
+| cf provider health DOWN | cf `FAILED PROVIDER_UNAVAILABLE` → gemini SUCCESS (`PRN_01M3V190E…`) |
+| ALL planner models DISCOVERED | **409 `FAIL_CLOSED_PLANNER_EXHAUSTED`**: run EXHAUSTED + 2 durable `FAILED MODEL_UNAVAILABLE` attempts (`ELIGIBILITY_REJECTED:MODEL_QUALIFIED`); no preview/mission/T1 |
+| pinned preview | still confirmable post-changes → `MSN_01M3V1973MS17YZ4KCZCDC1PT2` |
+
+Note: live catalog carried a stale `UNQUALIFIED` provider condition (set by an earlier failed `qualify()`, not cleared by later re-qualification) — the new `PROVIDER_NOT_BLOCKED` gate correctly flagged it as authority-ineligible; residue cleared for the matrix above. Persisted-condition vs. current-qualification semantics is a pre-existing catalog characteristic, documented here as informational, not changed by R2.
+
+## R2 — files changed
+
+- `src/pair/model-routable.ts` — `providerModelEligibility` shared projection; `projectRoutableModels` delegates to it.
+- `src/pair/model-role.ts` — `assertPlannerCandidateEligible` → shared gates + two verdict channels + `PlannerEligibilityRejection` type.
+- `src/pair/planner-pool.ts` — `assertEligible` widened contract; STARTED row before eligibility; availability rejection → durable FAILED attempt.
+- `src/__tests__/pair-phase-b.test.ts` — R2 fixtures (real qualification seam) + tests 49–59.
+
+Classification remains: `PAIR_NEXT_POST_P14_PHASE_B_PLANNER_RELIABILITY_PENDING_INDEPENDENT_AUDIT`

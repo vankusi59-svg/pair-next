@@ -120,8 +120,14 @@ export interface PlannerFailoverResult {
  *
  * `assertEligible(candidate)` re-proves canonical eligibility per attempt
  * (role still held, model usable, provider still eligible, not a DSH
- * model/alias) — failures are authority signals and propagate, never
- * failover-eligible.
+ * model/alias). Two verdict channels (R2 §4):
+ *  - returns void → candidate is eligible, invoke the model.
+ *  - returns {reject:true, failure_class, reason} → TEMPORARY availability
+ *    rejection (model not QUALIFIED / STALE / UNAVAILABLE, provider
+ *    DOWN/UNAVAILABLE) → durable FAILED attempt → next candidate.
+ *  - throws → AUTHORITY failure (role, DSH overlap, provider
+ *    qualification/auth/blocked, model REMOVED/DEPRECATED/BLOCKED) →
+ *    propagates, never failover-eligible.
  *
  * Durable-evidence hooks (§3–§5): `onAttemptStart` fires BEFORE the model
  * is invoked and returns an opaque token the caller uses to persist the
@@ -137,8 +143,12 @@ export interface PlannerFailoverResult {
 export async function runPlannerFailover(opts: {
   candidates: PlannerCandidate[];
   planFn: (c: PlannerCandidate) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
-  /** Canonical per-invocation eligibility proof (role + lifecycle). */
-  assertEligible: (c: PlannerCandidate) => void;
+  /** Canonical per-invocation eligibility proof (role + lifecycle).
+   *  Throw = authority failure (propagates); return {reject:true,...} =
+   *  failover-eligible availability rejection. */
+  assertEligible: (
+    c: PlannerCandidate,
+  ) => void | { reject: true; failure_class: PlannerFailureClass; reason: string };
   /** The one canonical task-preparation seam — returns the exact canonical
    *  task list the preview will pin; any throw → PLAN_INVALID failover. */
   canonicalize?: (tasks: Array<Record<string, unknown>>, c: PlannerCandidate) => Array<Record<string, unknown>>;
@@ -158,9 +168,6 @@ export async function runPlannerFailover(opts: {
   let n = 0;
   for (const c of opts.candidates) {
     n++;
-    // Runtime eligibility: canonical role still held, model still usable.
-    // Integrity/role failures propagate — NOT failover-eligible.
-    opts.assertEligible(c);
     const started = now();
     const t0 = Date.now();
     const base: Omit<PlannerAttemptRecord, "outcome"> = {
@@ -175,12 +182,28 @@ export async function runPlannerFailover(opts: {
       latency_ms: 0,
       warnings: [],
     };
-    // §4 — durable STARTED evidence before the model is invoked.
+    // §4 — durable STARTED evidence before ANY gate runs: even an
+    // eligibility-rejected or authority-aborted invocation is auditable.
     const token = opts.onAttemptStart?.(base);
     const settle = (rec: PlannerAttemptRecord) => {
       attempts.push(rec);
       opts.onAttemptEnd?.(token, rec);
     };
+    // Runtime eligibility re-proof per invocation (§9/R2). Authority
+    // failures throw and propagate — NOT failover-eligible; availability
+    // rejections settle FAILED and move to the next candidate.
+    const elig = opts.assertEligible(c);
+    if (elig && elig.reject) {
+      settle({
+        ...base,
+        completed_at: now(),
+        latency_ms: Date.now() - t0,
+        outcome: "FAILED",
+        failure_class: elig.failure_class,
+        warnings: [`ELIGIBILITY_REJECTED:${elig.reason}`],
+      });
+      continue;
+    }
     try {
       const res = await opts.planFn(c);
       const completed = now();
