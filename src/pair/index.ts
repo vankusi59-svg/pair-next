@@ -31,6 +31,7 @@ export * from "./model-catalog.js";
 export * from "./model-discovery.js";
 export * from "./model-probing.js";
 export * from "./model-routable.js";
+export * from "./model-role.js";
 export * from "./env-config.js";
 export * from "./experience-extraction.js";
 export * from "./experience-verifier.js";
