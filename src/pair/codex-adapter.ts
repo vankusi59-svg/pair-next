@@ -33,6 +33,9 @@ export const CODEX_CAPABILITY_IDS = [
   "SHELL_EXECUTION",
   "REASONING",
   "PYTHON_EXECUTION",
+  // LLM-driven fallback for the user-facing outbox deliverable — same role
+  // DSH plays; keeps TELEGRAM_DELIVERY tasks reroutable when DSH is down.
+  "TELEGRAM_DELIVERY",
 ] as const;
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
