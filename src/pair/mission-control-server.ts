@@ -552,30 +552,34 @@ export function createMissionControlServer(
         return void json(res, 200, preview);
       }
       if (method === "POST" && p === "/api/missions") {
+        // Two-step confirm: the caller supplies the digest of a preview this
+        // server materialized. Resolve it — the pinned plan IS the preview,
+        // so no expansion/re-planning happens here at all.
+        const callerDigest = ((body as Record<string, unknown>).confirm_plan as { digest?: string } | undefined)?.digest;
+        if (callerDigest) {
+          const plan = previewPlans.get(callerDigest);
+          if (!plan) {
+            // The confirmed digest must resolve to a server-materialized
+            // plan — re-planning could never reproduce it. Re-preview.
+            res.writeHead(409, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "FAIL_CLOSED_PLAN_UNKNOWN", detail: callerDigest.slice(0, 16) }));
+            return;
+          }
+          return void json(res, 200, c.startMission({ ...(body as Record<string, unknown>), goal: String((body as Record<string, unknown>).goal ?? ""), project_id: String((body as Record<string, unknown>).project_id ?? ""), operator_id: operator, confirm_plan: { digest: callerDigest }, plan } as never));
+        }
         // Direct submitters (Telegram bridge, API clients, scripts) never
         // call /preview — expand the goal into an LLM plan here so every
         // submit path gets the same plan quality as the UI's Plan & run.
         // When the caller already supplies metadata.llm_plan (UI two-step)
-        // we keep it verbatim; a caller-supplied confirm_plan.digest is still
-        // validated by startMission, otherwise we pin the plan we just
-        // computed.
+        // we keep it verbatim; the plan we materialize is pinned so the
+        // runtime commits it verbatim (no second planner call).
         const bodyMeta = (body as Record<string, unknown>).metadata as Record<string, unknown> | undefined;
         const expanded =
           deps.planExpander && !bodyMeta?.llm_plan
             ? await deps.planExpander(body as Parameters<typeof deps.planExpander>[0])
             : (body as Record<string, unknown>);
-        const callerDigest = (expanded.confirm_plan as { digest?: string } | undefined)?.digest;
-        if (callerDigest && !previewPlans.has(callerDigest)) {
-          // The confirmed digest must resolve to a server-materialized plan
-          // — re-planning could never reproduce it. Caller re-previews.
-          res.writeHead(409, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "FAIL_CLOSED_PLAN_UNKNOWN", detail: callerDigest.slice(0, 16) }));
-          return;
-        }
-        const preview = callerDigest ? null : c.previewMission(expanded as unknown as Parameters<typeof c.previewMission>[0]);
-        const plan = callerDigest ? previewPlans.get(callerDigest)! : preview!.plan;
-        const digestPinned = callerDigest ?? preview!.plan_digest;
-        return void json(res, 200, c.startMission({ ...expanded, goal: String(expanded.goal ?? ""), project_id: String(expanded.project_id ?? ""), operator_id: operator, confirm_plan: { digest: digestPinned }, plan } as never));
+        const preview = c.previewMission(expanded as unknown as Parameters<typeof c.previewMission>[0]);
+        return void json(res, 200, c.startMission({ ...expanded, goal: String(expanded.goal ?? ""), project_id: String(expanded.project_id ?? ""), operator_id: operator, confirm_plan: { digest: preview.plan_digest }, plan: preview.plan } as never));
       }
       m = p.match(/^\/api\/missions\/([^/]+)\/(pause|resume|cancel|acknowledge|reconcile)$/);
       if (method === "POST" && m) {
