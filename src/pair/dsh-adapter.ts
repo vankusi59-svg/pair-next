@@ -51,14 +51,22 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
   override readonly invocation_method = "acp stdio json-rpc (dsh --profile acp)";
   protected override readonly capability_ids = [...DSH_CAPABILITY_IDS];
   private readonly configuredEntry: string | null;
+  private readonly roleAssertion: ((provider: string, model: string) => void) | null;
 
   constructor(
     deps: ConstructorParameters<typeof AcpExecutorAdapterBase>[0] & {
       dshEntry?: string;
+      /**
+       * Phase A role seam: invoked with the resolved (provider, model)
+       * immediately before the route is pinned on a live DSH session — the
+       * caller proves the model holds DSH_EXECUTION role; throw = fail closed.
+       */
+      modelRoleAssertion?: (provider: string, model: string) => void;
     },
   ) {
     super(deps);
     this.configuredEntry = deps.dshEntry ?? null;
+    this.roleAssertion = deps.modelRoleAssertion ?? null;
   }
 
   private envOf(name: string): string | undefined {
@@ -139,6 +147,9 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
     _task: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     const [provider, model] = modelRoute(this.envOf.bind(this));
+    // Runtime role enforcement: the model about to execute DSH work must be
+    // canonically authorized as DSH_EXECUTION (Planner pool is disjoint).
+    this.roleAssertion?.(provider, model);
     const value = JSON.stringify([provider, model]);
     const resp = await proc.setConfigOption(sessionId, DSH_MODEL_CONFIG_ID, value, 30);
     return { model_route: [provider, model], model_config: { config_id: DSH_MODEL_CONFIG_ID, response: resp } };
