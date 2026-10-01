@@ -1926,7 +1926,7 @@ describe("R4 — live-found mission input + recovery limbo closure", () => {
     const eid = effectiveInputDigest({
       project_id: ctx.projectId, goal: "g",
       granted_permissions: undefined, authorized_workspaces: [ctx.workspace],
-      risk_ceiling: undefined, operator_id: undefined,
+      risk_ceiling: "HIGH", operator_id: undefined,
       allowed_capabilities: undefined, capability_sets: undefined,
     });
     expect(String(pv.effective_input_digest)).toBe(eid);
@@ -2257,13 +2257,13 @@ describe("R6 — canonical authority shadowing + workspace canonicalization", ()
     expect(mi.authorized_workspaces).toEqual([canon]); // F: persisted canonical
     const eid = effectiveInputDigest({
       project_id: ctx.projectId, goal: "g", granted_permissions: [],
-      authorized_workspaces: [canon], risk_ceiling: undefined, operator_id: "op",
+      authorized_workspaces: [canon], risk_ceiling: "HIGH", operator_id: "op",
       allowed_capabilities: undefined, capability_sets: undefined,
     });
     expect(String(pv.effective_input_digest)).toBe(eid); // D
     const pd = planDigest({
       project_id: ctx.projectId, effective_input_digest: eid, tasks: [T1],
-      granted_permissions: [], authorized_workspaces: [canon], risk_ceiling: undefined,
+      granted_permissions: [], authorized_workspaces: [canon], risk_ceiling: "HIGH",
     });
     expect(String(pv.plan_digest)).toBe(pd); // E
   });
@@ -2375,8 +2375,9 @@ describe("R6 — canonical authority shadowing + workspace canonicalization", ()
       metadata: { authorized_workspaces: ["/canonical-only"], extra: { authorized_workspaces: ["/etc"] } },
     });
     const roots = ctx.service.authorizedRoots(String(m.mission_id));
-    expect(roots).toContain("/canonical-only");
-    expect(roots).toContain(ctx.workspace);
+    // R7 — roots = the pinned mission snapshot ONLY; the live project root
+    // is no longer hidden extra authority.
+    expect(roots).toEqual(["/canonical-only"]);
     expect(roots).not.toContain("/etc");
   });
 
@@ -2426,5 +2427,168 @@ describe("R6 — canonical authority shadowing + workspace canonicalization", ()
       project_id: ctx.projectId, goal: "g", authorized_workspaces: ["/a/b/c"],
     });
     expect((m.metadata as Record<string, unknown>).authorized_workspaces).toEqual(["/a/b/c"]);
+  });
+});
+
+describe("R7 — effective mission authority closure", () => {
+  it("A/B: omitted risk persists canonical HIGH; explicit LOW persists unchanged", () => {
+    const ctx = makeCtx("r7-ab");
+    const pv1 = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g1", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const mi1 = ctx.store.get("mission_plan_preview", String(pv1.preview_id)).mission_input as Record<string, unknown>;
+    expect(mi1.risk_ceiling).toBe("HIGH");
+    const pv2 = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g2", metadata: { llm_plan: [T1] }, risk_ceiling: "LOW", operator_id: "op",
+    });
+    const mi2 = ctx.store.get("mission_plan_preview", String(pv2.preview_id)).mission_input as Record<string, unknown>;
+    expect(mi2.risk_ceiling).toBe("LOW");
+  });
+
+  it("C/D: both digests cover canonical default risk HIGH", () => {
+    const ctx = makeCtx("r7-cd");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const eid = effectiveInputDigest({
+      project_id: ctx.projectId, goal: "g", granted_permissions: [],
+      authorized_workspaces: [ctx.workspace], risk_ceiling: "HIGH", operator_id: "op",
+      allowed_capabilities: undefined, capability_sets: undefined,
+    });
+    expect(String(pv.effective_input_digest)).toBe(eid);
+    const pd = planDigest({
+      project_id: ctx.projectId, effective_input_digest: eid, tasks: [T1],
+      granted_permissions: [], authorized_workspaces: [ctx.workspace], risk_ceiling: "HIGH",
+    });
+    expect(String(pv.plan_digest)).toBe(pd);
+  });
+
+  it("E: confirm stores byte-for-byte identical risk from persisted preview", () => {
+    const ctx = makeCtx("r7-e");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, risk_ceiling: "MEDIUM", operator_id: "op",
+    });
+    const mi = ctx.store.get("mission_plan_preview", String(pv.preview_id)).mission_input as Record<string, unknown>;
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    expect((m.metadata as Record<string, unknown>).risk_ceiling).toBe(mi.risk_ceiling);
+  });
+
+  it("F: legacy READY preview with risk_ceiling=null (canonical ws) → AUTHORITY_STALE", async () => {
+    const ctx = makeCtx("r7-f");
+    const pv = r5LegacyPreview(ctx, [path.resolve(ctx.workspace)]); // canonical ws, null risk
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" }),
+      "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",
+    );
+    expect(ctx.store.get("mission_plan_preview", String(pv.preview_id)).state).toBe("READY");
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("G: invalid risk fails closed at preview + direct service", async () => {
+    const ctx = makeCtx("r7-g");
+    await expectCode(
+      () => ctx.control.createPlanPreview({
+        project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, risk_ceiling: "BOGUS", operator_id: "op",
+      }),
+      "FAIL_CLOSED_RISK_CEILING_INVALID",
+    );
+    await expectCode(
+      () => ctx.service.createMission({ project_id: ctx.projectId, goal: "g", risk_ceiling: "BOGUS" }),
+      "FAIL_CLOSED_RISK_CEILING_INVALID",
+    );
+  });
+
+  it("I: mission pinned /approved → authorizedRoots is exactly the snapshot", () => {
+    const ctx = makeCtx("r7-i");
+    const m = ctx.service.createMission({
+      project_id: ctx.projectId, goal: "g", authorized_workspaces: ["/approved"],
+    });
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).toEqual(["/approved"]);
+  });
+
+  it("J: project root change between preview and confirm cannot move authority", () => {
+    const ctx = makeCtx("r7-j");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const prj = ctx.store.get("project", ctx.projectId);
+    ctx.store.put("project", ctx.projectId, { ...prj, root_location: "/root-B" }, Number(prj.version));
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    expect((m.metadata as Record<string, unknown>).authorized_workspaces).toEqual([ctx.workspace]);
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).toEqual([ctx.workspace]);
+    expect(ctx.service.isPathAuthorized("/root-B/x.txt", String(m.mission_id))).toBe(false);
+  });
+
+  it("K + §15 mutation test: root-A pinned → mutate root-B → roots stay /root-A only", () => {
+    const ctx = makeCtx("r7-k");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    const prj = ctx.store.get("project", ctx.projectId);
+    ctx.store.put("project", ctx.projectId, { ...prj, root_location: "/root-B" }, Number(prj.version));
+    const md = m.metadata as Record<string, unknown>;
+    expect(md.authorized_workspaces).toEqual([ctx.workspace]);
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).toEqual([ctx.workspace]);
+    expect(ctx.service.isPathAuthorized("/root-B/any", String(m.mission_id))).toBe(false);
+  });
+
+  it("L/M: gate authorizes inside pinned ws, rejects under new project root", () => {
+    const ctx = makeCtx("r7-lm");
+    const { m } = r4Confirm(ctx, "g");
+    const prj = ctx.store.get("project", ctx.projectId);
+    ctx.store.put("project", ctx.projectId, { ...prj, root_location: "/root-B" }, Number(prj.version));
+    expect(ctx.service.isPathAuthorized("/root-B/task-ws", String(m.mission_id))).toBe(false);
+    expect(ctx.service.isPathAuthorized(path.join(ctx.workspace, "inner.txt"), String(m.mission_id))).toBe(true);
+  });
+
+  it("N: multi-workspace snapshot → canonicalized deduplicated roots", () => {
+    const ctx = makeCtx("r7-n");
+    const m = ctx.service.createMission({
+      project_id: ctx.projectId, goal: "g",
+      authorized_workspaces: ["/a", "/b", "/a/.."], // resolves to / , /b? no: "/a/.." → "/"
+    });
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).toEqual(["/a", "/b", "/"]);
+  });
+
+  it("O: legacy mission with empty workspace snapshot → zero roots, fail closed", () => {
+    const ctx = makeCtx("r7-o");
+    const m = ctx.service.createMission({ project_id: ctx.projectId, goal: "g" });
+    const row = ctx.store.get("mission", String(m.mission_id));
+    ctx.store.put("mission", String(m.mission_id), {
+      ...row, metadata: { ...(row.metadata as Record<string, unknown>), authorized_workspaces: [] },
+    }, Number(row.version));
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).toEqual([]);
+    expect(ctx.service.isPathAuthorized(path.join(ctx.workspace, "x"), String(m.mission_id))).toBe(false);
+  });
+
+  it("§16 direct service: explicit ws → roots exactly that list, no hidden project root", () => {
+    const ctx = makeCtx("r7-svc");
+    const m = ctx.service.createMission({
+      project_id: ctx.projectId, goal: "g", authorized_workspaces: ["/explicit"],
+    });
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).toEqual(["/explicit"]);
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).not.toContain(ctx.workspace);
+  });
+
+  it("§17 round-trip: preview ws + risk === mission ws + risk (deep equality)", () => {
+    const ctx = makeCtx("r7-rt");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const mi = ctx.store.get("mission_plan_preview", String(pv.preview_id)).mission_input as Record<string, unknown>;
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    const md = m.metadata as Record<string, unknown>;
+    expect(md.authorized_workspaces).toEqual(mi.authorized_workspaces);
+    expect(md.risk_ceiling).toBe(mi.risk_ceiling);
+    expect(ctx.service.authorizedRoots(String(m.mission_id))).toEqual(mi.authorized_workspaces);
   });
 });

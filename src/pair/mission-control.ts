@@ -23,7 +23,7 @@ import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { projectRoutableModels } from "./model-routable.js";
-import { canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
+import { canonicalRiskCeiling, canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
 import {
@@ -340,7 +340,7 @@ export class MissionControl {
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: workspaces,
-      risk_ceiling: input.risk_ceiling ?? null,
+      risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
     };
     const proposal = this.deps.planner({ mission: pseudoMission, advice: null, reason: "initial" });
     const knownCaps = new Set(
@@ -352,7 +352,7 @@ export class MissionControl {
       goal: input.goal,
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: workspaces,
-      risk_ceiling: input.risk_ceiling ?? null,
+      risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
       tasks,
     });
     return {
@@ -445,6 +445,7 @@ export class MissionControl {
       );
     }
     const workspaces = this.normalizeMissionWorkspaces(input);
+    const risk = canonicalRiskCeiling(input.risk_ceiling);
     const pseudoMission: Record<string, unknown> = {
       mission_id: "__preview__",
       project_id: input.project_id,
@@ -452,7 +453,7 @@ export class MissionControl {
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: workspaces,
-      risk_ceiling: input.risk_ceiling ?? null,
+      risk_ceiling: risk,
     };
     const proposal = this.deps.planner({ mission: pseudoMission, advice: null, reason: "initial" });
     const knownCaps = new Set(
@@ -464,7 +465,7 @@ export class MissionControl {
       goal: input.goal,
       granted_permissions: input.granted_permissions,
       authorized_workspaces: workspaces,
-      risk_ceiling: input.risk_ceiling,
+      risk_ceiling: risk,
       operator_id: input.operator_id,
       allowed_capabilities: plannerEvidence?.allowed_capabilities,
       capability_sets: plannerEvidence?.capability_sets,
@@ -475,7 +476,7 @@ export class MissionControl {
       tasks,
       granted_permissions: input.granted_permissions,
       authorized_workspaces: workspaces,
-      risk_ceiling: input.risk_ceiling,
+      risk_ceiling: risk,
     });
     const row = persistPlanPreview(this.store, {
       missionInput: {
@@ -484,7 +485,7 @@ export class MissionControl {
         metadata: input.metadata ?? {},
         granted_permissions: input.granted_permissions ?? [],
         authorized_workspaces: workspaces,
-        risk_ceiling: input.risk_ceiling ?? null,
+        risk_ceiling: risk,
         operator_id: input.operator_id ?? null,
       },
       effective_input_digest: eid,
@@ -959,7 +960,7 @@ export class MissionControl {
           metadata,
           granted_permissions: input.granted_permissions ?? [],
           authorized_workspaces: workspaces,
-          risk_ceiling: input.risk_ceiling,
+          risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
         })
       : this.deps.service.createMission({
           project_id: input.project_id,
@@ -967,7 +968,7 @@ export class MissionControl {
           metadata,
           granted_permissions: input.granted_permissions ?? [],
           authorized_workspaces: workspaces,
-          risk_ceiling: input.risk_ceiling,
+          risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
         });
     this.deps.runtime.runtimeEntity(String(mission.mission_id));
     this.deps.supervisor.wake(String(mission.mission_id), "MISSION_CREATED");

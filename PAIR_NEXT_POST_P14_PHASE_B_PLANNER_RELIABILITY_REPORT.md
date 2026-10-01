@@ -762,3 +762,51 @@ guard ordering; §15 direct service-level smuggling test.
 Phase B focused 110/110 (+13). Full suite 2394 pass / 2 fail — same
 pre-existing P5 DSH+CODEX env failures as base `2277319`. tsc --noEmit
 clean, pnpm build clean.
+
+## R7 — EFFECTIVE MISSION AUTHORITY CLOSURE
+
+Audited pre-R7 HEAD: `82fc32ff99b61f14cfa2c1c5cb00af8b9e8d73f8`
+
+### Root causes
+- **A — risk default drift**: previews digested `risk_ceiling: null` while
+  `createMissionInternal` later defaulted to `"HIGH"` — previewed authority
+  ≠ committed authority.
+- **B — live project-root expansion**: `authorizedRoots()` prepended the
+  CURRENT `project.root_location` at runtime — a post-approval authority
+  expansion never covered by the pinned preview/digest.
+
+### Fixes
+- **Canonical risk seam** (`canonical.ts`): `CANONICAL_RISK_LEVELS =
+  LOW/MEDIUM/HIGH/CRITICAL`, `CANONICAL_RISK_DEFAULT = "HIGH"`,
+  `canonicalRiskCeiling` (null → HIGH; invalid →
+  `FAIL_CLOSED_RISK_CEILING_INVALID`), `isCanonicalRiskCeiling`. Applied at
+  previewMission, createPlanPreview (pseudoMission + effective_input_digest
+  + plan_digest + persisted mission_input), startMissionInternal and the
+  service itself — null never reaches a digest or a preview row.
+- **`assertPreviewWorkspaceAuthority` extended**: a READY preview must now
+  carry canonical workspace AND canonical risk; `risk_ceiling: null` →
+  `FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE` (same semantics: no mission,
+  READY preserved, digests untouched, regenerate fresh).
+- **Mission authority snapshot**: `authorizedRoots(missionId)` now returns
+  exactly `mission.metadata.authorized_workspaces` (canonicalized,
+  deduplicated) — the pinned snapshot only. The live project root is never
+  consulted for an existing mission; a mission with no valid snapshot gets
+  zero roots → the gate fails closed. New previews/missions still default
+  to the project root pre-digest (unchanged R4/R6 semantics).
+- Confirm stays verbatim: persisted ws + risk are replayed byte-for-byte;
+  service canonicalization is identity on canonical input.
+
+### Focused tests (+13)
+A/B default HIGH + explicit persist; C/D digests cover canonical risk; E
+byte-for-byte risk round-trip; F legacy null-risk → AUTHORITY_STALE; G
+invalid risk fails closed (preview + direct service); I roots = snapshot
+exactly; J pre-confirm root mutation cannot move authority; K post-create
+root mutation cannot move roots; L/M gate rejects new-root task, accepts
+pinned; N multi-ws dedup; O empty snapshot → zero roots fail closed; §15
+root-A→root-B mutation test (mandatory); §16 direct-service roots;
+§17 preview→mission→gate equality.
+
+### Regression
+Phase B focused 123/123 (+13). Full suite 2407 pass / 2 fail — same
+pre-existing P5 DSH+CODEX env failures as base `2277319`. tsc --noEmit
+clean, pnpm build clean.

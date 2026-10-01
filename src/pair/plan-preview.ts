@@ -20,7 +20,7 @@
  * carry sanitized classes/digests only.
  */
 
-import { digest, isCanonicalWorkspacePath, newId, utcnow } from "./canonical.js";
+import { digest, isCanonicalRiskCeiling, isCanonicalWorkspacePath, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PlannerAttemptRecord } from "./planner-pool.js";
@@ -492,6 +492,15 @@ export function assertPreviewWorkspaceAuthority(
     throw new IntegrityError(
       "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",
       "persisted preview lacks canonical workspace authority — regenerate a fresh plan preview",
+    );
+  }
+  // R7 — risk authority must already be canonical too: a legacy preview
+  // pinning `risk_ceiling: null` (digested as null but committed as "HIGH")
+  // is stale evidence — reject, never reinterpret.
+  if (!isCanonicalRiskCeiling(missionInput.risk_ceiling)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",
+      "persisted preview lacks canonical risk authority — regenerate a fresh plan preview",
     );
   }
   return ws.map((w) => String(w));

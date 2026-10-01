@@ -9,7 +9,7 @@
  */
 
 import path from "node:path";
-import { canonicalWorkspacePath, newId, pathWithin, planManifestDigest, utcnow } from "./canonical.js";
+import { canonicalRiskCeiling, canonicalWorkspacePath, newId, pathWithin, planManifestDigest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { AgentContractService } from "./agent-contract.js";
 import { CostService } from "./cost.js";
@@ -139,7 +139,7 @@ export class PairControlPlane {
     const authorized = (params.authorized_workspaces ?? [String(project.root_location)]).map(
       (p) => canonicalWorkspacePath(p),
     );
-    const canonicalRisk = params.risk_ceiling ?? "HIGH";
+    const canonicalRisk = canonicalRiskCeiling(params.risk_ceiling);
     const canonicalConstraints: string[] = [];
     // R6 — reserved canonical authority fields can never be shadowed by
     // caller-controlled metadata: a conflicting duplicate fails closed, a
@@ -404,13 +404,20 @@ export class PairControlPlane {
     return this.store.tryGet("runtime_governance", missionId) ?? { max_retries: 3 };
   }
 
+  /**
+   * R7 — mission authority is a SNAPSHOT: effective roots come only from
+   * the `authorized_workspaces` pinned into the mission at creation
+   * (preview → digest → confirm → mission, byte-for-byte). The live
+   * project root may provide defaults for NEW previews/missions but must
+   * never widen an existing mission. A mission with no valid snapshot gets
+   * zero roots — the gate then denies every workspace (fail closed).
+   */
   authorizedRoots(missionId: string): string[] {
     const mission = this.getMission(missionId);
-    const project = this.getProject(String(mission.project_id));
     const extra =
       (mission.metadata as Record<string, unknown> | undefined)?.authorized_workspaces;
-    const roots = [String(project.root_location), ...((extra as string[]) ?? [])];
-    return [...new Set(roots.map((p) => canonicalWorkspacePath(p)))];
+    const roots = Array.isArray(extra) ? extra.map((p) => canonicalWorkspacePath(p)) : [];
+    return [...new Set(roots)];
   }
 
   isPathAuthorized(candidate: string, missionId: string): boolean {
