@@ -4,6 +4,10 @@ export class PairError extends Error {
   constructor(
     public readonly code: string,
     public readonly detail: string,
+    /** Structured context carried alongside the code for recovery evidence
+     *  (e.g. the executor a route-selection failure was scoped to). Never
+     *  part of the message — classification keys off `code` only. */
+    public readonly meta?: Record<string, unknown>,
   ) {
     super(`${code}:${detail}`);
     this.name = new.target.name;

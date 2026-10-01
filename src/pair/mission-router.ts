@@ -232,9 +232,25 @@ export class MissionRouter {
         route_decision_id: routeDecision.decision_id,
         reason_codes: routeDecision.reason_codes,
       });
+      // Route-local infeasibility (capability/health/binding/qualification on
+      // the SELECTED executor's routes) is not the same class as a genuine
+      // governance prohibition: another governed executor may still serve.
+      // Only when EVERY rejection is an explicit policy/contract denial is
+      // this a terminal POLICY_DENIAL; otherwise it is bounded ROUTE_INFEASIBLE.
+      const POLICY_DENIAL_REASONS = new Set([
+        "AGENT_CONTRACT_ROUTE_DENIED",
+        "AGENT_CONTRACT_ROUTE_RESTRICTED",
+        "OPERATOR_PIN_EXCLUDED",
+      ]);
+      const rejections = (routeDecision.hard_rejections as Array<{ reason_codes?: string[] }>) ?? [];
+      const codes = new Set(rejections.flatMap((r) => (r.reason_codes ?? []).map(String)));
+      const genuinePolicyDenial = codes.size > 0 && [...codes].every((c) => POLICY_DENIAL_REASONS.has(c));
       throw new PolicyError(
-        "FAIL_CLOSED_NO_ELIGIBLE_ROUTE",
+        genuinePolicyDenial
+          ? "FAIL_CLOSED_NO_ELIGIBLE_ROUTE"
+          : "FAIL_CLOSED_ROUTE_INFEASIBLE",
         JSON.stringify(routeDecision.hard_rejections),
+        { executor_id: selectedExecutor, route_decision_id: routeDecision.decision_id },
       );
     }
 

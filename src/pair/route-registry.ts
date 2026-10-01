@@ -36,6 +36,24 @@ export const BINDING_MECHANISMS = new Set([
 ]);
 
 export const QUALIFICATION_STATES = new Set(["DECLARED", "QUALIFIED", "FAIL_CLOSED"]);
+/**
+ * Capability authority: the registered executor/adapter declaration is
+ * canonical. A persisted route's `capabilities` is a derived, reconciled
+ * snapshot of what its bound executor serves — never independent authority.
+ *
+ * `capability_source` records how the snapshot is maintained:
+ *  - EXECUTOR_DECLARED — route inherits the bound executor's full current
+ *    declaration; reconciliation replaces the snapshot wholesale (additions
+ *    AND removals both propagate). All executor-minted routes use this.
+ *  - ROUTE_EXPLICIT — operator-declared intentional subset; reconciliation
+ *    clamps it to `declared ⊆ executor` (fail closed on removals) but never
+ *    auto-widens it with new executor capabilities. The declared set is
+ *    preserved verbatim in `capabilities_declared`.
+ * A persisted route predating the field is executor-minted by construction
+ * (only executor registration mints routes), so reconcile treats it as
+ * EXECUTOR_DECLARED — that is what repairs stale entities across upgrades.
+ */
+export const CAPABILITY_SOURCES = new Set(["EXECUTOR_DECLARED", "ROUTE_EXPLICIT"]);
 export const ELIGIBILITY_STATES = new Set([
   "REGISTERED",
   "QUALIFIED",
@@ -119,6 +137,19 @@ export class RouteRegistry {
       qualification_state: String(payload.qualification_state ?? "DECLARED"),
       direct_callable: Boolean(payload.direct_callable),
       capabilities: Array.isArray(payload.capabilities) ? payload.capabilities : [],
+      // Default ROUTE_EXPLICIT: an explicitly registered capability list is an
+      // operator-declared contract — reconciliation never silently widens it.
+      // Executor-minted routes pass EXECUTOR_DECLARED explicitly.
+      capability_source: CAPABILITY_SOURCES.has(String(payload.capability_source))
+        ? String(payload.capability_source)
+        : "ROUTE_EXPLICIT",
+      // Declared intent is preserved verbatim; effective = declared ⊆ executor
+      // is derived at reconciliation. Default declared = the supplied list.
+      capabilities_declared: Array.isArray(payload.capabilities_declared)
+        ? payload.capabilities_declared
+        : Array.isArray(payload.capabilities)
+          ? payload.capabilities
+          : [],
       priority: Number(payload.priority ?? 100) || 100,
       health: {
         state: String((payload.health as Record<string, unknown>)?.state ?? "READY"),
@@ -167,6 +198,76 @@ export class RouteRegistry {
       actor,
       enabled ? "ROUTE_ENABLED" : "ROUTE_DISABLED",
     );
+  }
+
+  /**
+   * Reconcile a persisted route's capability snapshot with the canonical
+   * executor declaration. Called at registration/catalog-establishment time
+   * (executor (re)registration), never per-task, so a stale entity can never
+   * silently outlive an upgrade:
+   *  - EXECUTOR_DECLARED (incl. pre-field legacy rows) → snapshot replaced by
+   *    the current executor set — additions AND removals propagate.
+   *  - ROUTE_EXPLICIT → effective = declared ⊆ executor (fail closed on
+   *    removals); the declared contract itself is never widened.
+   * Idempotent: no semantic change → no write, no version churn, no event.
+   */
+  syncRouteCapabilities(
+    routeId: string,
+    executorCapabilities: string[],
+    actor = "PAIR_ROUTE_REGISTRY",
+  ): { route: Record<string, unknown>; changed: boolean } | null {
+    const route = this.getRoute(routeId);
+    if (!route) return null;
+    const executorSet = new Set(executorCapabilities.map(String).filter(Boolean));
+    const source = CAPABILITY_SOURCES.has(String(route.capability_source))
+      ? String(route.capability_source)
+      : "EXECUTOR_DECLARED"; // legacy executor-minted row
+    const declared = [
+      ...new Set(
+        (((route.capabilities_declared as string[] | undefined) ??
+          (route.capabilities as string[] | undefined) ??
+          []) as string[])
+          .map(String)
+          .filter(Boolean),
+      ),
+    ].sort();
+    const effective = (
+      source === "ROUTE_EXPLICIT"
+        ? declared.filter((c) => executorSet.has(c))
+        : [...executorSet]
+    ).sort();
+    const prior = ((route.capabilities as string[] | undefined) ?? []).map(String).sort();
+    const declaredUnchanged =
+      source !== "ROUTE_EXPLICIT" ||
+      JSON.stringify(declared) ===
+        JSON.stringify(
+          ([...(((route.capabilities_declared as string[] | undefined) ?? []) as string[])].map(String)).sort(),
+        );
+    if (
+      JSON.stringify(prior) === JSON.stringify(effective) &&
+      String(route.capability_source ?? "EXECUTOR_DECLARED") === source &&
+      declaredUnchanged
+    ) {
+      return { route, changed: false };
+    }
+    const body: Record<string, unknown> = {
+      ...route,
+      capabilities: effective,
+      capability_source: source,
+    };
+    if (source === "ROUTE_EXPLICIT") body.capabilities_declared = declared;
+    const saved = this.store.put("route", routeId, { ...body, updated_at: utcnow() }, Number(route.version));
+    const added = effective.filter((c) => !prior.includes(c));
+    const removed = prior.filter((c) => !effective.includes(c));
+    this.store.event({
+      entity_type: "route",
+      entity_id: routeId,
+      event_type: "ROUTE_CAPABILITIES_RECONCILED",
+      new_state: String(route.eligibility_state ?? route.qualification_state ?? "REGISTERED"),
+      actor,
+      metadata: { capability_source: source, added, removed },
+    });
+    return { route: saved, changed: true };
   }
 
   updateRouteHealth(routeId: string, patch: Record<string, unknown>): Record<string, unknown> | null {
@@ -282,8 +383,25 @@ export class RouteRegistry {
   /**
    * Seed the canonical PAIR_NATIVE route + binding. Idempotent: re-running
    * returns the existing entities without rewriting qualification state.
+   * Capability authority = the registered PAIR_NATIVE executor declaration
+   * (falls back to the canonical seed set when no executor row exists yet);
+   * an existing route is reconciled to it like every executor-minted route.
    */
-  seedPairNativeRoute(actor = "PAIR_ROUTE_REGISTRY"): { route: Record<string, unknown>; binding: Record<string, unknown> } {
+  seedPairNativeRoute(
+    actor = "PAIR_ROUTE_REGISTRY",
+    capabilities?: string[],
+  ): { route: Record<string, unknown>; binding: Record<string, unknown> } {
+    const authority =
+      capabilities ??
+      (() => {
+        try {
+          const exec = this.store.get("executor", "PAIR_NATIVE");
+          const caps = (exec.capabilities as string[] | undefined) ?? [];
+          return caps.length ? caps : ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"];
+        } catch {
+          return ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"];
+        }
+      })();
     let route = this.getRoute(PAIR_NATIVE_ROUTE_ID);
     if (!route) {
       route = this.registerRoute(
@@ -293,13 +411,17 @@ export class RouteRegistry {
           enabled: true,
           eligibility_state: "QUALIFIED",
           qualification_state: "QUALIFIED",
-          capabilities: ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
+          capabilities: authority,
+          capability_source: "EXECUTOR_DECLARED",
           priority: 100,
           executor_hint: "PAIR_NATIVE",
           metadata: { executor_kind: "AUTOMATON_LOCAL_WORKER_POOL" },
         },
         actor,
       );
+    } else {
+      this.syncRouteCapabilities(PAIR_NATIVE_ROUTE_ID, authority, actor);
+      route = this.getRoute(PAIR_NATIVE_ROUTE_ID) ?? route;
     }
     let binding = this.bindingFor("PAIR_NATIVE", PAIR_NATIVE_ROUTE_ID);
     if (!binding) {

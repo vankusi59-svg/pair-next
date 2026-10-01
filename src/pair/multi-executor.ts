@@ -103,6 +103,7 @@ export function registerGovernedExecutors(
           eligibility_state: "QUALIFIED",
           qualification_state: "QUALIFIED",
           capabilities,
+          capability_source: "EXECUTOR_DECLARED",
           priority: 50,
           executor_hint: executorId,
           metadata: {
@@ -116,6 +117,12 @@ export function registerGovernedExecutors(
         },
         actor,
       );
+    } else {
+      // Registration/catalog seam: the adapter declaration re-registered above
+      // is canonical — reconcile the persisted route's capability snapshot so
+      // an entity minted under an older declaration can never stay silently
+      // stale across upgrades (live incident MSN_01M3VSGWVC55YNKHAQY6VVJAXR).
+      service.routes.syncRouteCapabilities(routeId, capabilities, actor);
     }
     if (!service.routes.bindingFor(executorId, routeId)) {
       service.routes.registerBinding(
