@@ -482,7 +482,7 @@ authority derives only from canonical evidence.
   Classification (phase level, superseded by the final closure below):
   **`P14_WORKFORCE_V2_PHASE3_R4_PENDING_FINAL_AUDIT`**.
 
-## P14 Workforce V2 FINAL CLOSURE (on branch, pending independent audit)
+## P14 Workforce V2 FINAL CLOSURE (MERGED via PR #15 — `P14_WORKFORCE_V2_OFFICIAL_FINAL_PASS`)
 
 Final cross-phase closure audit + hardening over the integrated
 P1+P2+P3 stack — base `6f389c9` (merged R4 PASS), branch
@@ -532,8 +532,11 @@ audit + one narrow defect remediation.
   clean; `pnpm build` PASS; `pnpm audit` 0 high; `verifyIntegrity`
   PASS.
 - Report: `PAIR_OS_VNEXT_P14_FINAL_CLOSURE_REPORT.md`.
-  Classification:
-  **`P14_WORKFORCE_V2_FINAL_CLOSURE_R5_PENDING_INDEPENDENT_AUDIT`**.
+  Classification: **`P14_WORKFORCE_V2_OFFICIAL_FINAL_PASS`**. PR #15
+  merged into `main` at `6de10d59194230f6b5c141d522dcde87df096304`;
+  independently audited R5 head `45896d70a25340fa26e64c34fd47e9733848a648`.
+  P14 Workforce V2 (Phase 1 + 2 + 3 + FINAL CLOSURE) is the official
+  runtime on main.
 
 #### FC R1 remediation (independent-audit BLOCKED → closed, same PR)
 

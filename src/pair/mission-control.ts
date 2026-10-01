@@ -260,12 +260,21 @@ export class MissionControl {
     };
   }
 
-  /** §4.2 — model evidence catalog projection. */
+  /** §4.2 — model evidence catalog projection (Phase A: + canonical roles). */
   models() {
+    const roleByModel = new Map(
+      this.store
+        .list("model_role_assignment")
+        .map((r) => [String(r.model_entry_id), r.role ?? null]),
+    );
     return {
-      models: this.store.list("model_entry"),
+      models: this.store.list("model_entry").map((m) => ({
+        ...m,
+        model_role: roleByModel.get(String(m.model_entry_id)) ?? null,
+      })),
       bindings: this.store.list("model_binding"),
       qualifications: this.store.list("model_qualification"),
+      role_assignments: this.store.list("model_role_assignment"),
     };
   }
 

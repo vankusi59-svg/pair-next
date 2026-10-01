@@ -15,17 +15,20 @@
  * Env:
  *   PAIR_TG_BOT_TOKEN   (required) — bot token from @BotFather
  *   PAIR_MC_URL         (default http://localhost:8788)
- *   PAIR_MC_TOKEN       — Mission Control bearer token (if auth enabled)
+ *   PAIR_MC_TOKEN       — Mission Control bearer token. Canonical resolution
+ *                         shared with the server (env > $PAIR_HOME/pair-mc-token
+ *                         > generated 256-bit, chmod 600) — never a default.
  *   PAIR_MC_DIR         — state dir for allow file / COST_HALT lever
  *   PAIR_TG_ALLOW_FILE  — override allowlist path
  *   PAIR_UI_BASE        — optional UI base URL for links in notifications
  */
 import fs from "node:fs";
 import path from "node:path";
+import { resolveMcToken } from "../dist/pair/index.js";
 
 const TG_TOKEN = process.env.PAIR_TG_BOT_TOKEN ?? "";
 const MC_URL = (process.env.PAIR_MC_URL ?? "http://localhost:8788").replace(/\/+$/, "");
-const MC_TOKEN = process.env.PAIR_MC_TOKEN ?? "";
+const MC_TOKEN = resolveMcToken().token;
 const MC_DIR = process.env.PAIR_MC_DIR ?? path.join(process.cwd(), ".pair-mc");
 const ALLOW_FILE = process.env.PAIR_TG_ALLOW_FILE ?? path.join(MC_DIR, "telegram-allow.json");
 const HALT_FILE = process.env.PAIR_COST_HALT_FILE ?? path.join(MC_DIR, "COST_HALT");
