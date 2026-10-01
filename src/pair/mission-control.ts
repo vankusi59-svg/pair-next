@@ -49,6 +49,44 @@ export interface MissionControlDeps {
   costHaltFile?: string;
 }
 
+export interface MissionPlanInput {
+  project_id: string;
+  goal: string;
+  metadata?: Record<string, unknown>;
+  granted_permissions?: string[];
+  authorized_workspaces?: string[];
+  risk_ceiling?: string;
+}
+
+/** Effective mission-shaped plan input: mirrors what createMission
+ * stores (resolved workspace paths, effective risk ceiling) so the digest
+ * covers the authority the mission actually runs with — and matches what
+ * the runtime can recompute from the stored row. */
+export function effectivePlanInput(input: MissionPlanInput, projectRoot: string): MissionPlanInput {
+  return {
+    project_id: input.project_id,
+    goal: input.goal,
+    granted_permissions: input.granted_permissions ?? [],
+    authorized_workspaces: (input.authorized_workspaces ?? [projectRoot]).map((p) =>
+      path.resolve(p),
+    ),
+    risk_ceiling: input.risk_ceiling ?? "HIGH",
+  };
+}
+
+/** Canonical plan digest — same field set at preview, confirm and
+ * commit time, so a drift in any of them fails closed. */
+export function missionPlanDigest(input: MissionPlanInput, tasks: unknown): string {
+  return digest({
+    project_id: input.project_id,
+    goal: input.goal,
+    granted_permissions: input.granted_permissions ?? [],
+    authorized_workspaces: input.authorized_workspaces ?? [],
+    risk_ceiling: input.risk_ceiling ?? null,
+    tasks,
+  });
+}
+
 function requireOperator(operatorId: string | undefined): string {
   if (!operatorId || !operatorId.trim()) {
     throw new PolicyError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "mission_control");
@@ -291,14 +329,7 @@ export class MissionControl {
    * fabricated mission-shaped input and returns the validated task list
    * with a sha256 digest. Creates NO canonical state.
    */
-  previewMission(input: {
-    project_id: string;
-    goal: string;
-    metadata?: Record<string, unknown>;
-    granted_permissions?: string[];
-    authorized_workspaces?: string[];
-    risk_ceiling?: string;
-  }): {
+  previewMission(input: MissionPlanInput): {
     plan: { tasks: Array<Record<string, unknown>> };
     plan_digest: string;
     plan_source: string | null;
@@ -323,14 +354,10 @@ export class MissionControl {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
-    const plan_digest = digest({
-      project_id: input.project_id,
-      goal: input.goal,
-      granted_permissions: input.granted_permissions ?? [],
-      authorized_workspaces: input.authorized_workspaces ?? [],
-      risk_ceiling: input.risk_ceiling ?? null,
+    const plan_digest = missionPlanDigest(
+      effectivePlanInput(input, String(this.deps.service.getProject(input.project_id).root_location)),
       tasks,
-    });
+    );
     return {
       plan: { tasks: tasks as unknown as Array<Record<string, unknown>> },
       plan_digest,
@@ -352,6 +379,9 @@ export class MissionControl {
     operator_id?: string;
     /** §4.3 two-step submit: the plan digest returned by previewMission. */
     confirm_plan?: { digest: string };
+    /** Server-materialized plan — internal callers only (the public POST
+     * /api/missions path pins it from the server's own preview). */
+    plan?: { tasks: Array<Record<string, unknown>> };
   }): Record<string, unknown> {
     // Foundation V2 §1/§8: the generic Mission Control API must never
     // accept a caller-pinned mission identity — bound identity is minted
@@ -386,6 +416,7 @@ export class MissionControl {
     risk_ceiling?: string;
     operator_id?: string;
     confirm_plan?: { digest: string };
+    plan?: { tasks: Array<Record<string, unknown>> };
   }): Record<string, unknown> {
     const openId = String(input.binding_open_id);
     // Step 1 — the binding itself must be canonically valid (identity,
@@ -489,16 +520,34 @@ export class MissionControl {
       risk_ceiling?: string;
       operator_id?: string;
       confirm_plan?: { digest: string };
+      /** Server-materialized plan (from previewMission). Carrying it pins
+       * these tasks as THE plan — LLM planners are non-deterministic, so a
+       * second plan materialization can never reproduce the confirmed
+       * digest. */
+      plan?: { tasks: Array<Record<string, unknown>> };
     },
     binding: Record<string, unknown> | undefined,
   ): Record<string, unknown> {
+    const planInput = input.plan
+      ? effectivePlanInput(input, String(this.deps.service.getProject(input.project_id).root_location))
+      : null;
     if (input.confirm_plan?.digest) {
-      const preview = this.previewMission(input);
-      if (preview.plan_digest !== input.confirm_plan.digest) {
+      const expected = planInput
+        ? missionPlanDigest(planInput, input.plan!.tasks)
+        : this.previewMission(input).plan_digest;
+      if (expected !== input.confirm_plan.digest) {
         throw new PolicyError("FAIL_CLOSED_PLAN_DIGEST_MISMATCH", String(input.confirm_plan.digest).slice(0, 16));
       }
     }
     const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    if (input.plan && planInput) {
+      // The operator confirmed (or the server just produced) this exact plan
+      // — the runtime commits it verbatim instead of re-planning.
+      metadata.pinned_plan = {
+        tasks: input.plan.tasks,
+        digest: missionPlanDigest(planInput, input.plan.tasks),
+      };
+    }
     const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
     if (boundAgentId) {
       // P12: a mission bound to an org_agent pins its agent execution
@@ -886,6 +935,7 @@ export class MissionControl {
           project_id: (expanded.project_id as string | undefined) || defaultProject,
           goal: String(expanded.goal ?? input.goal),
           confirm_plan: { digest: preview.plan_digest },
+          plan: preview.plan,
         });
       },
       now,

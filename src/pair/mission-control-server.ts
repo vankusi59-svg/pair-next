@@ -240,6 +240,17 @@ export function createMissionControlServer(
   deps: MissionControlServerDeps,
 ): http.Server {
   const c = deps.control;
+  // Preview plans keyed by plan_digest — lets a two-step submit resolve the
+  // exact materialized plan the operator confirmed instead of re-planning
+  // (LLM planners are non-deterministic, so re-planning can never
+  // reproduce the confirmed digest). In-memory: a preview outlives a
+  // restart no longer than the operator's session does; a digest without a
+  // cached plan is rejected so the caller re-previews.
+  const previewPlans = new Map<string, { tasks: Array<Record<string, unknown>> }>();
+  const rememberPreview = (digest: string, plan: { tasks: Array<Record<string, unknown>> }) => {
+    if (previewPlans.size >= 64) previewPlans.delete(previewPlans.keys().next().value!);
+    previewPlans.set(digest, plan);
+  };
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
@@ -536,7 +547,9 @@ export function createMissionControlServer(
       // the exact plan digest the operator saw.
       if (method === "POST" && p === "/api/missions/preview") {
         const expanded = deps.planExpander ? await deps.planExpander(body) : body;
-        return void json(res, 200, c.previewMission(expanded as Parameters<typeof c.previewMission>[0]));
+        const preview = c.previewMission(expanded as unknown as Parameters<typeof c.previewMission>[0]);
+        rememberPreview(preview.plan_digest, preview.plan);
+        return void json(res, 200, preview);
       }
       if (method === "POST" && p === "/api/missions") {
         // Direct submitters (Telegram bridge, API clients, scripts) never
@@ -551,10 +564,18 @@ export function createMissionControlServer(
           deps.planExpander && !bodyMeta?.llm_plan
             ? await deps.planExpander(body as Parameters<typeof deps.planExpander>[0])
             : (body as Record<string, unknown>);
-        const digestPinned =
-          (expanded.confirm_plan as { digest?: string } | undefined)?.digest ??
-          c.previewMission(expanded as Parameters<typeof c.previewMission>[0]).plan_digest;
-        return void json(res, 200, c.startMission({ ...expanded, goal: String(expanded.goal ?? ""), project_id: String(expanded.project_id ?? ""), operator_id: operator, confirm_plan: { digest: digestPinned } } as never));
+        const callerDigest = (expanded.confirm_plan as { digest?: string } | undefined)?.digest;
+        if (callerDigest && !previewPlans.has(callerDigest)) {
+          // The confirmed digest must resolve to a server-materialized plan
+          // — re-planning could never reproduce it. Caller re-previews.
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "FAIL_CLOSED_PLAN_UNKNOWN", detail: callerDigest.slice(0, 16) }));
+          return;
+        }
+        const preview = callerDigest ? null : c.previewMission(expanded as unknown as Parameters<typeof c.previewMission>[0]);
+        const plan = callerDigest ? previewPlans.get(callerDigest)! : preview!.plan;
+        const digestPinned = callerDigest ?? preview!.plan_digest;
+        return void json(res, 200, c.startMission({ ...expanded, goal: String(expanded.goal ?? ""), project_id: String(expanded.project_id ?? ""), operator_id: operator, confirm_plan: { digest: digestPinned }, plan } as never));
       }
       m = p.match(/^\/api\/missions\/([^/]+)\/(pause|resume|cancel|acknowledge|reconcile)$/);
       if (method === "POST" && m) {

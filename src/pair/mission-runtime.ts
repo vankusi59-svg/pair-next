@@ -41,6 +41,7 @@ import type { RecoveryController } from "./recovery-controller.js";
 import { classifyFailure } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
+import { missionPlanDigest } from "./mission-control.js";
 
 export const MISSION_RUNTIME_STATES = [
   "CREATED",
@@ -550,10 +551,46 @@ export class MissionRuntime {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", missionId);
     }
-    const proposal = this.deps.planner({ mission, advice, reason: "initial" });
     const knownCaps = new Set(
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
+    // Operator-confirmed plan: the server materialized (and verified) this
+    // task list at submit time — commit it verbatim. LLM planners are not
+    // deterministic, so re-planning here could never reproduce the
+    // confirmed digest and would silently run a different plan.
+    const pinned = (
+      (mission.metadata as Record<string, unknown> | undefined)?.pinned_plan
+    ) as { tasks?: Array<Record<string, unknown>>; digest?: string } | undefined;
+    if (pinned?.tasks && pinned.digest) {
+      // Recompute over the STORED mission-shaped fields (same ones the
+      // submit side digested via effectivePlanInput): authorized_workspaces
+      // + risk_ceiling live under mission.metadata already normalized.
+      const mMeta = (mission.metadata ?? {}) as Record<string, unknown>;
+      const expected = missionPlanDigest(
+        {
+          project_id: String(mission.project_id),
+          goal: String(mission.goal),
+          granted_permissions: mission.granted_permissions as string[] | undefined,
+          authorized_workspaces: mMeta.authorized_workspaces as string[] | undefined,
+          risk_ceiling: mMeta.risk_ceiling as string | undefined,
+        },
+        pinned.tasks,
+      );
+      if (expected !== String(pinned.digest)) {
+        throw new IntegrityError("FAIL_CLOSED_PLAN_DIGEST_MISMATCH", missionId);
+      }
+      const tasks = validatePlanProposal({ tasks: pinned.tasks }, knownCaps);
+      this.deps.service.commitPlan({
+        mission_id: missionId,
+        tasks: tasks as unknown as Array<Record<string, unknown>>,
+        source: "OPERATOR_CONFIRMED_PLAN",
+        reason: "pinned_plan",
+        proposal: { tasks: pinned.tasks },
+      });
+      this.transitionRuntime(missionId, "READY", "pinned_plan_committed");
+      return;
+    }
+    const proposal = this.deps.planner({ mission, advice, reason: "initial" });
     const tasks = validatePlanProposal(proposal, knownCaps);
     this.deps.service.commitPlan({
       mission_id: missionId,

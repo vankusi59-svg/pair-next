@@ -224,7 +224,8 @@ export class MissionSupervisor {
       try {
         this.runtime.tick(missionId, now);
         ticked.push(missionId);
-      } catch {
+      } catch (e) {
+        if (process.env.PAIR_DEBUG_TICK) console.log("TICK_SKIP", missionId, (e as Error).message, (e as Error).stack?.slice(0, 600));
         skipped.push(missionId); // a mission's failure never blocks siblings
       }
     }

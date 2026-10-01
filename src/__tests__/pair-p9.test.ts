@@ -1380,6 +1380,109 @@ describe("UI-2 §4.3 — plan preview + digest-confirmed submit", () => {
     expect(ctx.store.list("mission")).toHaveLength(0);
   });
 
+  it("pinned plan: non-deterministic planner — confirm + runtime commit the previewed tasks verbatim", () => {
+    // A real LLM planner produces a different DAG on every call: the old
+    // re-preview verify can never match. Carrying the materialized plan
+    // makes the confirmed digest describe the plan that actually executes.
+    let calls = 0;
+    const ctx = makeCtx("pin1", {
+      planner: () => ({
+        tasks: [
+          { task_key: `T${++calls}`, title: `t${calls}`, required_capabilities: ["FILE_OPERATIONS"], depends_on: [] as string[] },
+        ],
+      }),
+    });
+    const input = {
+      project_id: ctx.projectId, goal: "pin",
+      authorized_workspaces: [ctx.workspace],
+    };
+    const preview = ctx.control.previewMission(input); // planner call 1 → T1
+    const m = ctx.control.startMission({
+      ...input,
+      confirm_plan: { digest: preview.plan_digest },
+      plan: preview.plan,
+      operator_id: "op",
+    });
+    const mid = String(m.mission_id);
+    expect(calls).toBe(1); // verify did not re-plan
+    const meta = ctx.service.getMission(mid).metadata as Record<string, unknown>;
+    expect(meta.pinned_plan).toBeTruthy();
+    // runtime commits the pinned tasks — planner never invoked again
+    ctx.runtime.tick(mid); // CREATED → PLANNING
+    ctx.runtime.tick(mid); // PLANNING → pinned commit → READY
+    expect(calls).toBe(1);
+    const tasks = ctx.service.listTasks(mid);
+    expect(tasks.map((t) => String(t.task_key))).toEqual(["T1"]);
+    const revisions = ctx.store.planRevisions(mid);
+    expect(revisions).toHaveLength(1);
+    expect(String(revisions[0].source)).toBe("OPERATOR_CONFIRMED_PLAN");
+  });
+
+  it("pinned plan: tampered pinned_plan fails closed at runtime, no plan committed", () => {
+    const ctx = makeCtx("pin2");
+    const preview = ctx.control.previewMission({ project_id: ctx.projectId, goal: "pin" });
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "pin",
+      confirm_plan: { digest: preview.plan_digest },
+      plan: preview.plan,
+      operator_id: "op",
+    });
+    const mid = String(m.mission_id);
+    const row = ctx.service.getMission(mid);
+    const meta = row.metadata as Record<string, unknown>;
+    (meta.pinned_plan as Record<string, unknown>).tasks = [
+      { task_key: "EVIL", title: "x", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
+    ];
+    ctx.store.put("mission", mid, row, Number(row.version));
+    ctx.runtime.tick(mid); // CREATED → PLANNING
+    expect(() => ctx.runtime.tick(mid)).toThrowError(/PLAN_DIGEST_MISMATCH/);
+    expect(ctx.service.listTasks(mid)).toHaveLength(0);
+    expect(ctx.store.planRevisions(mid)).toHaveLength(0);
+  });
+
+  it("two-step server submit pins the previewed plan; unknown digest → FAIL_CLOSED_PLAN_UNKNOWN", async () => {
+    const ctx = makeCtx("pin3", {
+      planner: () => ({
+        tasks: [{ task_key: "T1", title: "t", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] as string[] }],
+      }),
+    });
+    const server = createMissionControlServer({ control: ctx.control });
+    await new Promise<void>((r) => server.listen(0, r));
+    const port = (server.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    const post = (p: string, body: Record<string, unknown>) =>
+      fetch(`${base}${p}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-operator-id": "op" },
+        body: JSON.stringify(body),
+      });
+    try {
+      const pv = await (await post("/api/missions/preview", {
+        project_id: ctx.projectId, goal: "pin",
+        authorized_workspaces: [ctx.workspace],
+      })).json() as Record<string, unknown>;
+      const res = await post("/api/missions", {
+        project_id: ctx.projectId, goal: "pin",
+        authorized_workspaces: [ctx.workspace],
+        confirm_plan: { digest: String(pv.plan_digest) },
+      });
+      expect(res.status).toBe(200);
+      const m = (await res.json()) as Record<string, unknown>;
+      const meta = ctx.service.getMission(String(m.mission_id)).metadata as Record<string, unknown>;
+      const pinned = meta.pinned_plan as Record<string, unknown>;
+      expect(pinned).toBeTruthy();
+      expect(String(pinned.digest)).toBe(String(pv.plan_digest));
+      const bad = await post("/api/missions", {
+        project_id: ctx.projectId, goal: "pin",
+        confirm_plan: { digest: "a".repeat(64) },
+      });
+      expect(bad.status).toBe(409);
+      expect(((await bad.json()) as Record<string, unknown>).error).toBe("FAIL_CLOSED_PLAN_UNKNOWN");
+    } finally {
+      server.close();
+    }
+  });
+
   it("direct POST /api/missions auto-expands via planExpander (telegram/API parity with UI)", async () => {
     const expandedTasks = [
       { task_key: "T1", title: "llm t1", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] as string[] },
