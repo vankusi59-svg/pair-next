@@ -76,11 +76,11 @@ export const api = {
   recovery: () => req<Record<string, unknown>>("/recovery"),
   approvals: () => req<Array<Record<string, unknown>>>("/approvals"),
   previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; metadata?: Record<string, unknown> }) =>
-    req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; plan_source: string | null; plan_model: string | null }>("/missions/preview", {
+    req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null }>("/missions/preview", {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  startMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; confirm_plan?: { digest: string }; metadata?: Record<string, unknown> }) =>
+  startMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; confirm_plan?: { digest: string; preview_id?: string }; metadata?: Record<string, unknown> }) =>
     req<Record<string, unknown>>("/missions", {
       method: "POST",
       body: JSON.stringify(input),

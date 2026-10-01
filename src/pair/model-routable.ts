@@ -12,6 +12,7 @@ import { NotFoundError } from "./errors.js";
 import { ExecutorRegistry } from "./executor-registry.js";
 import { ModelEvidenceCatalog } from "./model-catalog.js";
 import { PROVIDER_OK_STATES, ProviderCatalog } from "./provider-catalog.js";
+import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
 
 export interface ModelBindingRow {
@@ -139,13 +140,58 @@ export interface RoutableModelRow {
   reason_not_routable: string | null;
 }
 
+export interface ProviderModelEligibility {
+  eligible: boolean;
+  gates: Record<string, "PASS" | "FAIL">;
+  reason: string | null;
+}
+
+/**
+ * The provider+model subset of the routable gates — the canonical answer
+ * to "is this provider/model currently usable at all". Shared by the
+ * executor↔binding routable projection and by non-binding callers (e.g.
+ * Planner candidates, which are not DSH bindings and skip the
+ * executor/binding gates). Pure read — derives from durable state only.
+ */
+export function providerModelEligibility(
+  store: PairEvidenceStore,
+  providerId: string,
+  modelEntryId: string,
+): ProviderModelEligibility {
+  const providerCatalog = new ProviderCatalog(store);
+  const modelCatalog = new ModelEvidenceCatalog(store);
+  const gates: Record<string, "PASS" | "FAIL"> = {};
+
+  const provider = providerCatalog.getProvider(providerId);
+  gates.PROVIDER_QUALIFIED =
+    provider && PROVIDER_OK_STATES.has(String(provider.lifecycle_state)) ? "PASS" : "FAIL";
+  gates.PROVIDER_AUTH_OK =
+    provider && ["AUTH_OK", "AUTH_REQUIRED"].includes(String(provider.auth_state)) ? "PASS" : "FAIL";
+  gates.PROVIDER_HEALTH_OK =
+    provider && !["UNAVAILABLE", "DOWN"].includes(String(provider.health_state)) ? "PASS" : "FAIL";
+  gates.PROVIDER_NOT_BLOCKED =
+    provider && !((provider.conditions as string[]) ?? []).some((c) => ["DISABLED", "UNQUALIFIED"].includes(c))
+      ? "PASS"
+      : "FAIL";
+
+  const model = modelCatalog.getModel(modelEntryId);
+  const modelConditions = (model?.conditions ?? []) as string[];
+  gates.MODEL_QUALIFIED = model?.lifecycle_state === "QUALIFIED" ? "PASS" : "FAIL";
+  gates.MODEL_NOT_STALE =
+    model && !modelConditions.includes("STALE") && !modelConditions.includes("REMOVED") ? "PASS" : "FAIL";
+  gates.MODEL_NOT_REVOKED =
+    model && !modelConditions.some((c) => ["REMOVED", "DEPRECATED", "BLOCKED"].includes(c)) ? "PASS" : "FAIL";
+  gates.MODEL_AVAILABLE = model && !modelConditions.includes("UNAVAILABLE") ? "PASS" : "FAIL";
+
+  const reason = Object.keys(gates).find((g) => gates[g] === "FAIL") ?? null;
+  return { eligible: reason === null, gates, reason };
+}
+
 /**
  * Derived routable projection over model bindings. Pure read — writes
  * nothing, persists no computed routability.
  */
 export function projectRoutableModels(service: PairControlPlane): RoutableModelRow[] {
-  const providerCatalog = new ProviderCatalog(service.store);
-  const modelCatalog = new ModelEvidenceCatalog(service.store);
   const executorRegistry = new ExecutorRegistry(service);
   const executorById = new Map<string, Record<string, unknown>>();
   for (const rec of service.listExecutors()) {
@@ -162,25 +208,9 @@ export function projectRoutableModels(service: PairControlPlane): RoutableModelR
     gates.EXECUTOR_QUALIFIED = executor?.qualification_state === "QUALIFIED" ? "PASS" : "FAIL";
     gates.EXECUTOR_HEALTHY = executor?.health_state === "READY" ? "PASS" : "FAIL";
 
-    const provider = providerCatalog.getProvider(binding.provider_id);
-    gates.PROVIDER_QUALIFIED =
-      provider && PROVIDER_OK_STATES.has(String(provider.lifecycle_state)) ? "PASS" : "FAIL";
-    gates.PROVIDER_AUTH_OK =
-      provider && ["AUTH_OK", "AUTH_REQUIRED"].includes(String(provider.auth_state)) ? "PASS" : "FAIL";
-    gates.PROVIDER_HEALTH_OK =
-      provider && !["UNAVAILABLE", "DOWN"].includes(String(provider.health_state)) ? "PASS" : "FAIL";
-    gates.PROVIDER_NOT_BLOCKED =
-      provider && !((provider.conditions as string[]) ?? []).some((c) => ["DISABLED", "UNQUALIFIED"].includes(c))
-        ? "PASS"
-        : "FAIL";
-
-    const model = modelCatalog.getModel(binding.model_entry_id);
-    const modelConditions = (model?.conditions ?? []) as string[];
-    gates.MODEL_QUALIFIED = model?.lifecycle_state === "QUALIFIED" ? "PASS" : "FAIL";
-    gates.MODEL_NOT_STALE = model && !modelConditions.includes("STALE") && !modelConditions.includes("REMOVED") ? "PASS" : "FAIL";
-    gates.MODEL_NOT_REVOKED =
-      model && !modelConditions.some((c) => ["REMOVED", "DEPRECATED", "BLOCKED"].includes(c)) ? "PASS" : "FAIL";
-    gates.MODEL_AVAILABLE = model && !modelConditions.includes("UNAVAILABLE") ? "PASS" : "FAIL";
+    // Provider+model gates come from the shared canonical subset so
+    // routable and planner eligibility can never disagree (R2).
+    Object.assign(gates, providerModelEligibility(service.store, binding.provider_id, binding.model_entry_id).gates);
 
     gates.BINDING_QUALIFIED = binding.qualification_state === "QUALIFIED" ? "PASS" : "FAIL";
 

@@ -84,6 +84,40 @@ export const TASK_TIMEOUT = {
   bounds: { min: 5, max: 7_200, unit: "s" },
 } as const;
 
+/** Plan preview (pinned plan) expiry. Unit: seconds. Bounds 30s–24h. */
+export const PLAN_PREVIEW_TTL = {
+  name: "PAIR_PLAN_PREVIEW_TTL_S",
+  defaultValue: 1_800,
+  bounds: { min: 30, max: 86_400, unit: "s" },
+} as const;
+
+/**
+ * Devin remote-session blocked grace — the window a `blocked` remote status
+ * may persist before it escalates to REMOTE_INPUT_REQUIRED / FAILED. This is
+ * a SEPARATE clock from the task execution budget: `blocked` is also emitted
+ * transiently at turn end, so the grace window must never masquerade as the
+ * total task timeout. Unit: milliseconds. Bounds 5s–1800s.
+ */
+export const DEVIN_BLOCKED_GRACE = {
+  name: "PAIR_DEVIN_BLOCKED_GRACE_MS",
+  defaultValue: 120_000,
+  bounds: { min: 5_000, max: 1_800_000, unit: "ms" },
+} as const;
+
+/**
+ * Devin per-execution fallback budget — COMPATIBILITY OVERRIDE ONLY.
+ * The canonical governed execution budget is `task.timeout` (explicit
+ * metadata.timeout → PAIR_TASK_TIMEOUT_S), persisted per execution at
+ * dispatch. This env value is used solely when a dispatched task carries no
+ * explicit timeout — it must never silently override the canonical budget.
+ * Unit: milliseconds. Bounds 5s–7200s.
+ */
+export const DEVIN_TASK_TIMEOUT = {
+  name: "PAIR_DEVIN_TASK_TIMEOUT_MS",
+  defaultValue: 15 * 60_000,
+  bounds: { min: 5_000, max: 7_200_000, unit: "ms" },
+} as const;
+
 export function modelProbeTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(MODEL_PROBE_TIMEOUT.name, MODEL_PROBE_TIMEOUT.defaultValue, MODEL_PROBE_TIMEOUT.bounds, env);
 }
@@ -94,4 +128,16 @@ export function llmPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): numb
 
 export function taskTimeoutSeconds(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(TASK_TIMEOUT.name, TASK_TIMEOUT.defaultValue, TASK_TIMEOUT.bounds, env);
+}
+
+export function planPreviewTtlSeconds(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(PLAN_PREVIEW_TTL.name, PLAN_PREVIEW_TTL.defaultValue, PLAN_PREVIEW_TTL.bounds, env);
+}
+
+export function devinBlockedGraceMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(DEVIN_BLOCKED_GRACE.name, DEVIN_BLOCKED_GRACE.defaultValue, DEVIN_BLOCKED_GRACE.bounds, env);
+}
+
+export function devinTaskTimeoutMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(DEVIN_TASK_TIMEOUT.name, DEVIN_TASK_TIMEOUT.defaultValue, DEVIN_TASK_TIMEOUT.bounds, env);
 }

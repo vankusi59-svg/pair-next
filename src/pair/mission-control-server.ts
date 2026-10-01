@@ -22,14 +22,20 @@ export interface MissionControlServerDeps {
   /** Serve a built SPA (e.g. apps/mission-control-ui/dist) for non-/api GETs. */
   staticDir?: string;
   /**
-   * Optional plan-expansion seam (P-UI-6): runs at the API edge before
-   * previewMission/startMission, e.g. an LLM planner that fills
-   * metadata.llm_plan. Proposal-only — the injected planner still validates
-   * and the confirm digest still gates submission. Absent → no expansion.
+   * Plan-proposal seam (Phase B): runs the Planner failover chain at the
+   * API edge and returns { input, planner } where `input` carries the
+   * winning sanitized task list (metadata.llm_plan) and `planner` is the
+   * attempt/provenance evidence persisted with the durable preview.
+   * Absent → deterministic template planning only.
    */
   planExpander?: (
     input: Record<string, unknown>,
-  ) => Promise<Record<string, unknown>>;
+  ) => Promise<{ input: Record<string, unknown>; planner?: {
+    attempts: unknown[]; winner: unknown; warnings: string[];
+    allowed_capabilities?: string[]; capability_sets?: string[][];
+  } }>;
+  /** Back-compat shape: older expanders returned the bare input. */
+  planExpanderResult?: never;
   /**
    * Optional bearer token gate: when set, every `/api/*` request must carry
    * `Authorization: Bearer <token>` (or `?token=` for SSE EventSource, which
@@ -532,29 +538,42 @@ export function createMissionControlServer(
           c.revokeSecretPolicy(String(body.policy_id ?? ""), `operator:${operator}`),
         );
       }
-      // §4.3 two-step submit: preview creates no state; confirm must carry
-      // the exact plan digest the operator saw.
+      // Phase B two-step submit: preview persists a durable
+      // mission_plan_preview (READY); confirm consumes exactly it.
       if (method === "POST" && p === "/api/missions/preview") {
-        const expanded = deps.planExpander ? await deps.planExpander(body) : body;
-        return void json(res, 200, c.previewMission(expanded as Parameters<typeof c.previewMission>[0]));
+        const ex = deps.planExpander ? await deps.planExpander(body) : { input: body };
+        const expanded = (ex as { input?: Record<string, unknown> }).input ?? (ex as Record<string, unknown>);
+        const planner = (ex as { planner?: never }).planner;
+        return void json(res, 200, c.createPlanPreview({ ...expanded, operator_id: operator } as never, planner as never));
+      }
+      if (method === "GET" && p.match(/^\/api\/plan-previews\/[^/]+$/)) {
+        const id = p.split("/")[3];
+        return void json(res, 200, c.planPreview(id));
+      }
+      // Explicit confirmation seam: {preview_id, plan_digest} — consumes the
+      // persisted preview and mints the mission, idempotently.
+      if (method === "POST" && p === "/api/missions/confirm") {
+        const confirm = (body.confirm_plan ?? {}) as { preview_id?: string; digest?: string };
+        const previewId = String(body.preview_id ?? confirm.preview_id ?? "");
+        const planDigest = String(body.plan_digest ?? confirm.digest ?? "");
+        return void json(res, 200, c.confirmPlanPreview({ preview_id: previewId, plan_digest: planDigest, operator_id: operator }));
       }
       if (method === "POST" && p === "/api/missions") {
-        // Direct submitters (Telegram bridge, API clients, scripts) never
-        // call /preview — expand the goal into an LLM plan here so every
-        // submit path gets the same plan quality as the UI's Plan & run.
-        // When the caller already supplies metadata.llm_plan (UI two-step)
-        // we keep it verbatim; a caller-supplied confirm_plan.digest is still
-        // validated by startMission, otherwise we pin the plan we just
-        // computed.
-        const bodyMeta = (body as Record<string, unknown>).metadata as Record<string, unknown> | undefined;
-        const expanded =
-          deps.planExpander && !bodyMeta?.llm_plan
-            ? await deps.planExpander(body as Parameters<typeof deps.planExpander>[0])
-            : (body as Record<string, unknown>);
-        const digestPinned =
-          (expanded.confirm_plan as { digest?: string } | undefined)?.digest ??
-          c.previewMission(expanded as Parameters<typeof c.previewMission>[0]).plan_digest;
-        return void json(res, 200, c.startMission({ ...expanded, goal: String(expanded.goal ?? ""), project_id: String(expanded.project_id ?? ""), operator_id: operator, confirm_plan: { digest: digestPinned } } as never));
+        // A confirm payload (preview_id+digest) consumes the persisted
+        // preview — NEVER re-plans. A bare submit plans once through the
+        // failover chain and immediately consumes its own preview, so every
+        // entry point still lands on exactly one pinned plan.
+        const confirm = (body.confirm_plan ?? {}) as { preview_id?: string; digest?: string };
+        if (confirm.preview_id || body.preview_id) {
+          const previewId = String(body.preview_id ?? confirm.preview_id);
+          const planDigest = String(body.plan_digest ?? confirm.digest ?? "");
+          return void json(res, 200, c.confirmPlanPreview({ preview_id: previewId, plan_digest: planDigest, operator_id: operator }));
+        }
+        const ex = deps.planExpander ? await deps.planExpander(body) : { input: body };
+        const expanded = (ex as { input?: Record<string, unknown> }).input ?? (ex as Record<string, unknown>);
+        const planner = (ex as { planner?: never }).planner;
+        const preview = c.createPlanPreview({ ...expanded, operator_id: operator } as never, planner as never);
+        return void json(res, 200, c.confirmPlanPreview({ preview_id: String(preview.preview_id), plan_digest: String(preview.plan_digest), operator_id: operator }));
       }
       m = p.match(/^\/api\/missions\/([^/]+)\/(pause|resume|cancel|acknowledge|reconcile)$/);
       if (method === "POST" && m) {
