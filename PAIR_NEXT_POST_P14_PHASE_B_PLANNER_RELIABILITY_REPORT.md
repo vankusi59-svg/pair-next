@@ -1178,3 +1178,74 @@ contract, executor ordering policy, DSH multi-credential pinning,
 in prod, operator dashboards. Experience score decay NOT modified.
 
 **Classification**: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_AUDIT`
+
+## Audit remediation round 1 (HEAD after `67f9f74`)
+
+Independent audit (REWORK REQUIRED) found four residual issues; all fixed
+on the same branch:
+
+- **Finding M1 — all-bound-route reconciliation**: `registerGovernedExecutors`
+  previously reconciled only `ROUTE_IDS[executorId]`. Now every route with a
+  binding record for the executor is reconciled each boot — including
+  `ROUTE_EXPLICIT` subsets — for canonical executors AND for governed
+  executors without a canonical mint (`!routeId` path). The canonical route
+  is still synced inline before the enumeration so first-boot bindings are
+  covered. Legacy-source semantics: every production route is minted by the
+  two executor paths (`multi-executor.ts`, `seedPairNativeRoute`); there is
+  no operator route-creation endpoint (`/api/routes` is GET-only), so a row
+  missing `capability_source` is provably executor-minted ⇒ `EXECUTOR_DECLARED`
+  — verified against every `registerRoute` callsite in `src/pair` and
+  `scripts/`; declared-subset semantics still preserve operator intent
+  verbatim via `capabilities_declared`.
+- **Finding M2 — failed executor into the FIRST decide()**:
+  `startRecovery` now derives one canonical `failedExecutorId`
+  (`execution ? execution.executor_id : extra?.failedExecutorId`) and feeds
+  it to BOTH `RecoveryController.decide({ executor_id })` and
+  `pending_recovery.executor_id`. On a dispatch-time `ROUTE_INFEASIBLE`
+  (no execution row) the first decision no longer counts the failed
+  executor as its own re-route alternate — `RE_ROUTE` is correctly
+  rejected `NO_ALTERNATE_ELIGIBLE_EXECUTOR` up front instead of burning a
+  recovery attempt to rediscover the same executor is infeasible.
+- **Finding M3 — scoped policy-denial taxonomy**: classification now
+  filters `routeDecision.hard_rejections` to routes that have a binding
+  record for `selectedExecutor` (`RouteRegistry.bindingFor`). Unrelated
+  routes (another executor's routes show `BINDING_ABSENT` in the global
+  list) can no longer contaminate the verdict. **Mixed semantics chosen**:
+  a route is policy-forbidden iff its own rejection set contains a policy
+  code (`AGENT_CONTRACT_ROUTE_DENIED`, `AGENT_CONTRACT_ROUTE_RESTRICTED`,
+  `OPERATOR_PIN_EXCLUDED`); `POLICY_DENIAL` iff EVERY in-scope route is
+  policy-forbidden — i.e. removing all local defects still cannot yield a
+  viable route. Any in-scope route rejected only on local grounds →
+  `ROUTE_INFEASIBLE` (recoverable). No route-id string matching; binding
+  records are the authority.
+- **Finding L1 — capability-aware snapshot digest**:
+  `snapshotDigest()` now binds `capabilities`, `capability_source` and
+  `capabilities_declared` per route (canonical sorted forms), so a route
+  decision receipt cryptographically pins the capability surface it used.
+
+Tests: focused file now **20/20** —
+R3 boot lifecycle (no manual sync; declared `[A,B]` preserved, effective
+`[A]` after `[A,C]` re-registration; no churn on repeat boot; other
+executor's routes untouched), R3b over-declared clamp via the boot path,
+S6 first-decision (`executor_id=EX_A`, `RE_ROUTE` rejected
+`NO_ALTERNATE_ELIGIBLE_EXECUTOR`, never selected), T1–T5 taxonomy
+(scoped POLICY_DENIAL vs ROUTE_INFEASIBLE; mixed → ROUTE_INFEASIBLE; pin
+semantics via `route_fallback_allowed:false`; T5 end-to-end asserts
+POLICY_DENIAL → ABORT and zero dispatches — the policy is never evaded),
+D1/D2 digest (mutation changes digest, reorder does not).
+
+**Counterfactual on `67f9f74`**: same file → 8 fail / 12 pass —
+R3 `[CAP_A,CAP_B]` ≠ `[CAP_A]` (bound explicit route never reconciled);
+S6 `executor_id: null` (failed executor counted as its own alternate);
+T1 throws `FAIL_CLOSED_ROUTE_INFEASIBLE` instead of
+`FAIL_CLOSED_NO_ELIGIBLE_ROUTE` (BINDING_ABSENT contamination); T5
+mislabels POLICY_DENIAL → RE_ROUTE evades the denial; D1/D2 digests
+identical across capability mutations. On HEAD: 20/20 pass.
+
+Results: focused 20/20; full suite **2450 pass / 2 failed** — the same
+two pre-existing P5 env failures; `tsc --noEmit` clean; `pnpm build`
+clean. PR #23 closure mechanisms (recoveryGuard, recoveryFailureBoundary,
+forceAbortRuntime, infeasible_actions) untouched; CODEX/DSH
+TELEGRAM_DELIVERY and DEVIN-without-TD unchanged.
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`

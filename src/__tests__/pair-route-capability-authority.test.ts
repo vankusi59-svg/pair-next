@@ -34,6 +34,7 @@ import { registerGovernedExecutors } from "../pair/multi-executor.js";
 import { RouteSelector } from "../pair/route-selector.js";
 import {
   ApprovalQueue,
+  BusinessLayer,
   ExecutorRegistry,
   GovernedTaskGate,
   MissionControl,
@@ -41,6 +42,7 @@ import {
   MissionRouter,
   MissionRuntime,
   MissionScheduler,
+  MissionScheduleService,
   MissionSupervisor,
   PairControlPlane,
   PairEvidenceStore,
@@ -287,14 +289,15 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     expect(sel.selected_route_id).toBeNull();
   });
 
-  it("R3. ROUTE_EXPLICIT subset is preserved — never auto-widened; over-declared clamps ⊆ executor", () => {
+  it("R3. BOOT LIFECYCLE — every bound route reconciles at registration, never manually", () => {
     const ctx = makeCtx("r3");
+    // Boot N: executor declares [A,B,C]; an operator-declared subset route
+    // RTE_CODEX_SUBSET declares [A,B] and binds CODEX.
     const codex = new ScriptedAdapter("CODEX", [], ["CAP_A", "CAP_B", "CAP_C"]);
-    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
-
-    // Operator-declared subset route for the same executor.
+    const adapters = new Map<string, ExecutorAdapter>([["CODEX", codex]]);
+    registerGovernedExecutors(ctx.service, adapters, "BOOT_N");
     ctx.service.routes.registerRoute({
-      route_id: "RTE_CODEX_RESTRICTED",
+      route_id: "RTE_CODEX_SUBSET",
       route_kind: "REMOTE_GATEWAY_API",
       enabled: true,
       eligibility_state: "QUALIFIED",
@@ -303,13 +306,48 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
       capabilities: ["CAP_A", "CAP_B"],
       executor_hint: "CODEX",
     });
-    ctx.service.routes.syncRouteCapabilities("RTE_CODEX_RESTRICTED", ["CAP_A", "CAP_B", "CAP_C"], "test");
-    const route = ctx.service.routes.getRoute("RTE_CODEX_RESTRICTED")!;
-    // C was NOT auto-added — the subset contract stands.
-    expect([...(route.capabilities as string[])].sort()).toEqual(["CAP_A", "CAP_B"]);
+    ctx.service.routes.registerBinding({
+      executor_id: "CODEX",
+      route_id: "RTE_CODEX_SUBSET",
+      mechanism: "SPAWN_ENV",
+      qualification_state: "QUALIFIED",
+    });
 
-    // Over-declared subset clamps to the executor set (fail closed on the
-    // capability the executor never declared), intent preserved verbatim.
+    // Boot N+1: executor drops CAP_B (now [A,C]). Registration alone must
+    // reconcile every route bound to CODEX — no manual syncRouteCapabilities.
+    codex.caps = ["CAP_A", "CAP_C"];
+    registerGovernedExecutors(ctx.service, adapters, "BOOT_N1");
+    const sub = ctx.service.routes.getRoute("RTE_CODEX_SUBSET")!;
+    expect(sub.capabilities_declared).toEqual(["CAP_A", "CAP_B"]);
+    expect(sub.capabilities).toEqual(["CAP_A"]); // B removed fail-closed, C NOT added
+    const versionAfterHeal = Number(sub.version);
+    const eventsAfterHeal = ctx.store
+      .listEvents("route")
+      .filter((e) => String(e.entity_id) === "RTE_CODEX_SUBSET").length;
+
+    // Boot N+2 same declaration — idempotent: no version churn, no new event.
+    registerGovernedExecutors(ctx.service, adapters, "BOOT_N2");
+    const sub2 = ctx.service.routes.getRoute("RTE_CODEX_SUBSET")!;
+    expect(Number(sub2.version)).toBe(versionAfterHeal);
+    expect(
+      ctx.store.listEvents("route").filter((e) => String(e.entity_id) === "RTE_CODEX_SUBSET").length,
+    ).toBe(eventsAfterHeal);
+
+    // A route bound to a DIFFERENT executor is untouched by CODEX's sync.
+    const exOther = new ScriptedAdapter("EX_OTHER", [], ["CAP_A"]);
+    registerAdapter(ctx, exOther, exOther.caps);
+    const otherBefore = ctx.service.routes.getRoute("RTE_EX_OTHER")!;
+    codex.caps = ["CAP_A", "CAP_B", "CAP_C", "CAP_X"];
+    registerGovernedExecutors(ctx.service, adapters, "BOOT_N3");
+    const otherAfter = ctx.service.routes.getRoute("RTE_EX_OTHER")!;
+    expect(otherAfter.capabilities).toEqual(otherBefore.capabilities);
+    expect(Number(otherAfter.version)).toBe(Number(otherBefore.version));
+  });
+
+  it("R3b. ROUTE_EXPLICIT over-declare clamps ⊆ executor; declared intent preserved verbatim", () => {
+    const ctx = makeCtx("r3b");
+    const codex = new ScriptedAdapter("CODEX", [], ["CAP_A", "CAP_B", "CAP_C"]);
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
     ctx.service.routes.registerRoute({
       route_id: "RTE_CODEX_OVER",
       route_kind: "REMOTE_GATEWAY_API",
@@ -320,7 +358,13 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
       capabilities: ["CAP_A", "CAP_GHOST"],
       executor_hint: "CODEX",
     });
-    ctx.service.routes.syncRouteCapabilities("RTE_CODEX_OVER", ["CAP_A", "CAP_B", "CAP_C"], "test");
+    ctx.service.routes.registerBinding({
+      executor_id: "CODEX",
+      route_id: "RTE_CODEX_OVER",
+      mechanism: "SPAWN_ENV",
+      qualification_state: "QUALIFIED",
+    });
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
     const over = ctx.service.routes.getRoute("RTE_CODEX_OVER")!;
     expect(over.capabilities).toEqual(["CAP_A"]);
     expect(over.capabilities_declared).toEqual(["CAP_A", "CAP_GHOST"]);
@@ -482,6 +526,33 @@ describe("RCA.S — route-local infeasibility vs genuine policy denial", () => {
     expect(String(pending!.failure_class)).toBe("ROUTE_INFEASIBLE");
   });
 
+  it("S6. FIRST decision knows the failed executor — RE_ROUTE rejected NO_ALTERNATE_ELIGIBLE_EXECUTOR, not falsely selected", () => {
+    const ctx = makeCtx("s6");
+    const exA = new ScriptedAdapter("EX_A", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    registerAdapter(ctx, exA, exA.caps);
+    const route = ctx.service.routes.getRoute("RTE_EX_A")!;
+    ctx.store.put("route", "RTE_EX_A", { ...route, eligibility_state: "DISABLED", enabled: false }, Number(route.version));
+
+    const mid = startMission(ctx);
+    const clock = fakeClock();
+    // Tick until the first recovery_decision exists.
+    for (let i = 0; i < 12 && decisions(ctx, mid).length === 0; i++) {
+      ctx.runtime.tick(mid, clock());
+    }
+    const first = decisions(ctx, mid)[0];
+    expect(String(first.failure_class)).toBe("ROUTE_INFEASIBLE");
+    // The decision receipt carries the executor that failed — dispatch-time
+    // routing failure has no execution row, so meta.executor_id must feed it.
+    expect(String(first.executor_id)).toBe("EX_A");
+    // With EX_A the only executor, RE_ROUTE must be rejected up front — the
+    // controller must not pick a useless re-route onto the same executor.
+    const rejected = (first.rejected_actions as Array<{ action: string; reason: string }>) ?? [];
+    expect(
+      rejected.some((r) => r.action === "RE_ROUTE" && r.reason === "NO_ALTERNATE_ELIGIBLE_EXECUTOR"),
+    ).toBe(true);
+    expect(String(first.selected_action)).not.toBe("RE_ROUTE");
+  });
+
   it("S5. recovered RE_ROUTE flow is idempotent across restart — pending evidence survives, no blind retry", () => {
     const ctx = makeCtx("s5");
     const exA = new ScriptedAdapter("EX_A", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
@@ -537,5 +608,239 @@ describe("RCA.I — executor capability invariants", () => {
     expect([...CODEX_CAPABILITY_IDS]).toContain("TELEGRAM_DELIVERY");
     expect([...DSH_CAPABILITY_IDS]).toContain("TELEGRAM_DELIVERY");
     expect([...DEVIN_CAPABILITIES]).not.toContain("TELEGRAM_DELIVERY");
+  });
+});
+
+/* ===== T — policy-denial taxonomy scoped to the selected executor ======== */
+
+function makeBizCtx(name: string) {
+  const ctx = makeCtx(name);
+  const schedules = new MissionScheduleService(ctx.service);
+  const biz = new BusinessLayer({ store: ctx.store, control: ctx.control, schedules });
+  const bz = biz.createBusiness({ name: "Biz", project_id: ctx.projectId, operator_id: "op" });
+  const ag = biz.createOrgAgent({
+    business_id: String(bz.business_id),
+    title: "eng",
+    department: "eng",
+    operator_id: "op",
+  });
+  return { ctx, biz, agentId: String(ag.agent_id), businessId: String(bz.business_id) };
+}
+
+function boundMission(ctx: ReturnType<typeof makeCtx>, agentId: string, businessId: string) {
+  const mission = ctx.control.startMission({
+    goal: "g",
+    project_id: ctx.projectId,
+    operator_id: "op",
+    metadata: { business_id: businessId, org_agent_id: agentId },
+  });
+  const missionId = String(mission.mission_id);
+  ctx.service.transitionMission(missionId, "READY");
+  ctx.service.commitPlan({
+    mission_id: missionId,
+    source: "test",
+    tasks: [
+      {
+        task_key: "T1",
+        title: "t1",
+        task_instruction: "do it",
+        required_capabilities: ["ONLY_EX_A"],
+        depends_on: [],
+      },
+    ],
+    proposal: { tasks: [] },
+  });
+  return ctx.service.getMission(missionId);
+}
+
+function govRequest(ctx: ReturnType<typeof makeCtx>, mission: Record<string, unknown>) {
+  const task = ctx.service.listTasks(String(mission.mission_id))[0];
+  return {
+    mission_id: String(mission.mission_id),
+    task_id: String(task.task_id),
+    plan_revision: Number(mission.plan_revision),
+    task_instruction: String(task.task_instruction),
+    workspace: ctx.workspace,
+    allowed_paths: [ctx.workspace],
+    permissions: (mission.granted_permissions as string[]) ?? [],
+    constraints: [],
+    timeout: 60,
+    expected_output_contract: { type: "TASK_RESULT" },
+    correlation_id: `${String(mission.mission_id)}:${String(task.task_id)}`,
+  } as never;
+}
+
+describe("RCA.T — scoped policy-denial taxonomy", () => {
+  it("T1. selected executor's route policy-denied while another executor's routes BINDING_ABSENT → POLICY_DENIAL, not ROUTE_INFEASIBLE", () => {
+    const { ctx, biz, agentId, businessId } = makeBizCtx("t1");
+    const exA = new ScriptedAdapter("EX_A", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    const exB = new ScriptedAdapter("EX_B", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    registerAdapter(ctx, exA, exA.caps);
+    registerAdapter(ctx, exB, exB.caps);
+    biz.upsertAgentContract(agentId, "op", { denied_route_ids: ["RTE_EX_A"] });
+    const mission = boundMission(ctx, agentId, businessId);
+    // EX_A is selected (alphabetical); RTE_EX_A is contract-denied (in-scope
+    // policy), RTE_EX_B shows BINDING_ABSENT for EX_A — out of scope.
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission), ctx.adapters),
+    ).toThrowError(/^FAIL_CLOSED_NO_ELIGIBLE_ROUTE/);
+  });
+
+  it("T2. selected executor's route locally infeasible → ROUTE_INFEASIBLE", () => {
+    const { ctx, agentId, businessId } = makeBizCtx("t2");
+    const exA = new ScriptedAdapter("EX_A", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    const exB = new ScriptedAdapter("EX_B", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    registerAdapter(ctx, exA, exA.caps);
+    registerAdapter(ctx, exB, exB.caps);
+    const route = ctx.service.routes.getRoute("RTE_EX_A")!;
+    ctx.store.put("route", "RTE_EX_A", { ...route, eligibility_state: "DISABLED", enabled: false }, Number(route.version));
+    const mission = boundMission(ctx, agentId, businessId);
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission), ctx.adapters),
+    ).toThrowError(/^FAIL_CLOSED_ROUTE_INFEASIBLE/);
+  });
+
+  it("T3. mixed — one bound route policy-denied, one bound route capability-infeasible → ROUTE_INFEASIBLE (governance did not forbid every choice)", () => {
+    const { ctx, biz, agentId, businessId } = makeBizCtx("t3");
+    const exA = new ScriptedAdapter("EX_A", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    registerAdapter(ctx, exA, exA.caps);
+    // Second bound route for EX_A lacking ONLY_EX_A — local infeasibility.
+    ctx.service.routes.registerRoute({
+      route_id: "RTE_EX_A_2",
+      route_kind: "IN_PROCESS_RUNTIME",
+      enabled: true,
+      eligibility_state: "QUALIFIED",
+      qualification_state: "QUALIFIED",
+      capability_source: "ROUTE_EXPLICIT",
+      capabilities: ["FILE_OPERATIONS"],
+      executor_hint: "EX_A",
+    });
+    ctx.service.routes.registerBinding({
+      executor_id: "EX_A",
+      route_id: "RTE_EX_A_2",
+      mechanism: "SPAWN_ENV",
+      qualification_state: "QUALIFIED",
+    });
+    // Contract denies the first route; the second is locally infeasible.
+    // Deterministic rule: every in-scope route must carry a policy code for
+    // POLICY_DENIAL — one route rejected only locally → ROUTE_INFEASIBLE.
+    biz.upsertAgentContract(agentId, "op", { denied_route_ids: ["RTE_EX_A"] });
+    const mission = boundMission(ctx, agentId, businessId);
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission), ctx.adapters),
+    ).toThrowError(/^FAIL_CLOSED_ROUTE_INFEASIBLE/);
+  });
+
+  it("T4. contract restriction (no-fallback pin to an unrelated route) excludes every in-scope route → POLICY_DENIAL", () => {
+    const { ctx, biz, agentId, businessId } = makeBizCtx("t4");
+    const exA = new ScriptedAdapter("EX_A", [], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    registerAdapter(ctx, exA, exA.caps);
+    biz.upsertAgentContract(agentId, "op", {
+      preferred_route_ids: ["RTE_GHOST"],
+      route_fallback_allowed: false,
+    });
+    const mission = boundMission(ctx, agentId, businessId);
+    expect(() =>
+      ctx.router.routeGovernedTask(govRequest(ctx, mission), ctx.adapters),
+    ).toThrowError(/^FAIL_CLOSED_NO_ELIGIBLE_ROUTE/);
+  });
+
+  it("T5. genuine POLICY_DENIAL never triggers a governed reroute to evade the policy — bounded ABORT", () => {
+    const { ctx, biz, agentId, businessId } = makeBizCtx("t5");
+    const exA = new ScriptedAdapter("EX_A", [{ status: "COMPLETED" }], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    const exB = new ScriptedAdapter("EX_B", [{ status: "COMPLETED" }], ["ONLY_EX_A", "FILE_OPERATIONS"]);
+    registerAdapter(ctx, exA, exA.caps);
+    registerAdapter(ctx, exB, exB.caps);
+    // Contract denies every route in the registry → genuine policy denial.
+    biz.upsertAgentContract(agentId, "op", {
+      denied_route_ids: ["RTE_EX_A", "RTE_EX_B"],
+    });
+    const mid = String(
+      ctx.control.startMission({
+        goal: "g",
+        project_id: ctx.projectId,
+        operator_id: "op",
+        metadata: { business_id: businessId, org_agent_id: agentId },
+      }).mission_id,
+    );
+    const clock = fakeClock();
+    for (let i = 0; i < 30; i++) {
+      ctx.runtime.tick(mid, clock());
+      const st = String(rt(ctx, mid).state);
+      if (["ABORTED", "FAILED", "COMPLETED", "WAITING_APPROVAL"].includes(st)) break;
+    }
+    const first = decisions(ctx, mid)[0];
+    expect(String(first.failure_class)).toBe("POLICY_DENIAL");
+    expect(String(first.selected_action)).toBe("ABORT");
+    // No re-route ever dispatched — policy was not evaded.
+    expect(exA.dispatched.length + exB.dispatched.length).toBe(0);
+    expect(["ABORTED", "FAILED"]).toContain(String(rt(ctx, mid).state));
+  });
+});
+
+/* ============ D — capability-aware registry snapshot digest ============== */
+
+describe("RCA.D — snapshot digest binds capability semantics", () => {
+  it("D1. capability mutation changes the digest; reorder does not", () => {
+    const ctx = makeCtx("d1");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A", "CAP_B"]);
+    registerAdapter(ctx, exA, exA.caps);
+    const d1 = ctx.service.routes.snapshotDigest();
+
+    // Mutate capabilities on the same route → digest must change.
+    const route = ctx.service.routes.getRoute("RTE_EX_A")!;
+    ctx.store.put(
+      "route",
+      "RTE_EX_A",
+      { ...route, capabilities: ["CAP_A", "CAP_B", "CAP_C"] },
+      Number(route.version),
+    );
+    const d2 = ctx.service.routes.snapshotDigest();
+    expect(d2).not.toBe(d1);
+
+    // Reorder the same set → canonical sorted form → identical digest.
+    const route2 = ctx.service.routes.getRoute("RTE_EX_A")!;
+    ctx.store.put(
+      "route",
+      "RTE_EX_A",
+      { ...route2, capabilities: ["CAP_C", "CAP_B", "CAP_A"] },
+      Number(route2.version),
+    );
+    expect(ctx.service.routes.snapshotDigest()).toBe(d2);
+  });
+
+  it("D2. capabilities_declared participates in the digest", () => {
+    const ctx = makeCtx("d2");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A", "CAP_B"]);
+    registerAdapter(ctx, exA, exA.caps);
+    ctx.service.routes.registerRoute({
+      route_id: "RTE_X",
+      route_kind: "REMOTE_GATEWAY_API",
+      enabled: true,
+      eligibility_state: "QUALIFIED",
+      qualification_state: "QUALIFIED",
+      capability_source: "ROUTE_EXPLICIT",
+      capabilities: ["CAP_A"],
+      capabilities_declared: ["CAP_A", "CAP_B"],
+      executor_hint: "EX_A",
+    });
+    const d1 = ctx.service.routes.snapshotDigest();
+    const route = ctx.service.routes.getRoute("RTE_X")!;
+    ctx.store.put(
+      "route",
+      "RTE_X",
+      { ...route, capabilities_declared: ["CAP_A", "CAP_B", "CAP_C"] },
+      Number(route.version),
+    );
+    expect(ctx.service.routes.snapshotDigest()).not.toBe(d1);
+    // Same declared set, different order → same digest.
+    const route2 = ctx.service.routes.getRoute("RTE_X")!;
+    ctx.store.put(
+      "route",
+      "RTE_X",
+      { ...route2, capabilities_declared: ["CAP_C", "CAP_B", "CAP_A"] },
+      Number(route2.version),
+    );
+    expect(ctx.service.routes.snapshotDigest()).not.toBe(d1);
   });
 });

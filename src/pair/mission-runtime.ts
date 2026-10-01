@@ -740,13 +740,19 @@ export class MissionRuntime {
       .list("experience")
       .filter((e) => e.type === "REMEDIATION_PAIR" && e.status === "ACTIVE")
       .map((e) => String(e.experience_id ?? e.id));
+    // One canonical notion of the failed executor for the whole chain —
+    // the same value feeds decide() (so alternates are computed against it)
+    // and persists onto pending_recovery for the apply path.
+    const failedExecutorId = execution
+      ? String(execution.executor_id)
+      : (extra?.failedExecutorId ?? undefined);
     const decision = this.deps.recovery.decide({
       verified_remediation_ids: verifiedRemediation,
       mission_id: missionId,
       task_id: taskId,
       execution_id: executionId ?? undefined,
       governed_task_id: execution ? String(execution.governed_task_id) : undefined,
-      executor_id: execution ? String(execution.executor_id) : undefined,
+      executor_id: failedExecutorId,
       failure_class: failureClass,
       eligible_executors: eligible,
       risk_class: String(
@@ -768,7 +774,7 @@ export class MissionRuntime {
       task_id: taskId,
       execution_id: executionId,
       governed_task_id: execution ? execution.governed_task_id : null,
-      executor_id: execution ? execution.executor_id : (extra?.failedExecutorId ?? null),
+      executor_id: failedExecutorId ?? null,
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
       infeasible_actions: infeasibleActions ?? [],

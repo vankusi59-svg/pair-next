@@ -92,7 +92,17 @@ export function registerGovernedExecutors(
     }
 
     const routeId = ROUTE_IDS[executorId];
-    if (!routeId) continue;
+    if (!routeId) {
+      // No canonical minted route — still reconcile any routes already
+      // bound to this executor against the fresh declaration.
+      for (const bound of service.routes.bindingsForExecutor(executorId)) {
+        const boundRouteId = String(bound.route_id ?? "");
+        if (boundRouteId) {
+          service.routes.syncRouteCapabilities(boundRouteId, capabilities, actor);
+        }
+      }
+      continue;
+    }
     let route = service.routes.getRoute(routeId);
     if (!route) {
       route = service.routes.registerRoute(
@@ -136,6 +146,18 @@ export function registerGovernedExecutors(
       );
     }
     routable.push(executorId);
+    // Every route bound to this executor reconciles against the same
+    // canonical declaration — not just the canonical minted one. A stale
+    // ROUTE_EXPLICIT or second executor-minted route must converge on the
+    // same boot (fail closed on removals, never auto-widen explicit
+    // subsets). Idempotent: syncRouteCapabilities is a no-op when the
+    // effective set is already correct.
+    for (const bound of service.routes.bindingsForExecutor(executorId)) {
+      const boundRouteId = String(bound.route_id ?? "");
+      if (boundRouteId && boundRouteId !== routeId) {
+        service.routes.syncRouteCapabilities(boundRouteId, capabilities, actor);
+      }
+    }
   }
   return { registered, routable, unavailable };
 }

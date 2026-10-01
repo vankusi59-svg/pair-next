@@ -369,6 +369,11 @@ export class RouteRegistry {
         eligibility_state: r.eligibility_state,
         qualification_state: r.qualification_state,
         priority: r.priority,
+        // Capability authority is part of live routing — the digest must
+        // bind it or two registries with different routability hash equal.
+        capabilities: [...((r.capabilities as string[]) ?? [])].sort(),
+        capability_source: r.capability_source ?? null,
+        capabilities_declared: [...((r.capabilities_declared as string[]) ?? [])].sort(),
       })),
       bindings: this.listBindings().map((b) => ({
         binding_id: b.binding_id,
