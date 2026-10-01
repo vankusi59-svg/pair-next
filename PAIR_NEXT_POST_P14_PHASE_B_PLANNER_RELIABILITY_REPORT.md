@@ -174,9 +174,9 @@ Role isolation (37): planner route whose model is revoked/reassigned to DSH → 
 
 ## 16. Commit list
 
-- `B-phase`: planner pool + failover (`src/pair/planner-pool.ts`), plan preview authority (`src/pair/plan-preview.ts`), mission-control + server wiring, serve-mission-control routes/candidates, env-config TTL, UI preview_id plumbing, 37 focused tests, this report.
+- `331f62f` — Phase B: planner pool + failover (`src/pair/planner-pool.ts`), plan preview authority (`src/pair/plan-preview.ts`), mission-control + server wiring, serve-mission-control routes/candidates, env-config TTL, UI preview_id plumbing, 37 focused tests, this report.
 
-(Exact SHAs recorded at push time — see git log of `devin/post-p14-phase-b-planner-reliability`.)
+Branch HEAD at submission: `331f62f` on `devin/post-p14-phase-b-planner-reliability`.
 
 ## 17. STOP
 
