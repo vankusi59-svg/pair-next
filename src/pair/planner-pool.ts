@@ -191,8 +191,25 @@ export async function runPlannerFailover(opts: {
     };
     // Runtime eligibility re-proof per invocation (§9/R2). Authority
     // failures throw and propagate — NOT failover-eligible; availability
-    // rejections settle FAILED and move to the next candidate.
-    const elig = opts.assertEligible(c);
+    // rejections settle FAILED and move to the next candidate. A handled
+    // authority rejection settles the already-persisted STARTED row to
+    // terminal FAILED before propagating (R3 §5): a governed rejection
+    // must not look like a crashed in-flight invocation.
+    let elig;
+    try {
+      elig = opts.assertEligible(c);
+    } catch (e) {
+      settle({
+        ...base,
+        completed_at: now(),
+        latency_ms: Date.now() - t0,
+        outcome: "FAILED",
+        warnings: [
+          `AUTHORITY_REJECTED:${String((e as { code?: string }).code ?? (e instanceof Error ? e.name : e)).slice(0, 80)}`,
+        ],
+      });
+      throw e;
+    }
     if (elig && elig.reject) {
       settle({
         ...base,
@@ -250,8 +267,18 @@ export async function runPlannerFailover(opts: {
       settle({ ...base, completed_at: completed, latency_ms: Date.now() - t0, outcome: "SUCCESS", warnings: res.warnings.slice(0, 10) });
       return { tasks: canonical, winner: attempts[attempts.length - 1], attempts, warnings: res.warnings };
     } catch (e) {
-      // Integrity/authority failures are not failover-eligible.
-      if (e instanceof IntegrityError) throw e;
+      // Integrity/authority failures are not failover-eligible — settle
+      // the STARTED row to terminal FAILED, then propagate (R3 §5/§6).
+      if (e instanceof IntegrityError) {
+        settle({
+          ...base,
+          completed_at: now(),
+          latency_ms: Date.now() - t0,
+          outcome: "FAILED",
+          warnings: [`AUTHORITY_REJECTED:${String(e.code ?? "IntegrityError").slice(0, 80)}`],
+        });
+        throw e;
+      }
       settle({
         ...base,
         completed_at: now(),

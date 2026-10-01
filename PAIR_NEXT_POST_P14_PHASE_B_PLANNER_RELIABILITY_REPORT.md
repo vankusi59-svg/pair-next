@@ -359,3 +359,85 @@ Note: live catalog carried a stale `UNQUALIFIED` provider condition (set by an e
 - `src/__tests__/pair-phase-b.test.ts` — R2 fixtures (real qualification seam) + tests 49–59.
 
 Classification remains: `PAIR_NEXT_POST_P14_PHASE_B_PLANNER_RELIABILITY_PENDING_INDEPENDENT_AUDIT`
+
+---
+
+# R3 — FINAL CLOSURE (independent audit remediation)
+
+Audited R2 HEAD: `1d6718851ab2030aa16f00a7bdd8371e1969e7b6`
+
+## R3-§1–§3 — Provider UNQUALIFIED recovery at the canonical seam
+
+**Blocker:** a failed `ProviderValidator.qualify()` persisted `conditions += "UNQUALIFIED"`, and a later SUCCESSFUL requalification promoted lifecycle + issued a receipt but never removed the historical marker. The R2 `PROVIDER_NOT_BLOCKED` gate then kept a canonically re-qualified provider permanently runtime-ineligible — R2 live testing required manual sqlite residue cleanup, which is unacceptable.
+
+**Fix location:** `ProviderCatalog.issueQualificationReceipt()` (`src/pair/provider-catalog.ts`) — the canonical qualification transition every successful qualification flows through (`ProviderValidator.qualify`, direct seam users, test/live boot qualification). On a successful receipt the provider body is reconciled:
+
+- `UNQUALIFIED` — **removed** (semantics superseded by a current valid receipt).
+- `DISABLED` — **preserved** (explicit operator/policy authority, never silently cleared by requalification).
+- Every other condition — **preserved**.
+
+No planner-specific "ignore UNQUALIFIED when qualified" logic was added: the authority state itself is now consistent, so the shared `providerModelEligibility` projection (and therefore `projectRoutableModels` and `assertPlannerCandidateEligible`) reads clean authority — planner and routable eligibility cannot disagree.
+
+## R3-§4 — Condition semantics after successful requalification
+
+| Condition | On successful qualification | Reason |
+|---|---|---|
+| `UNQUALIFIED` | cleared | transient residue of a previous failed attempt; superseded by the current receipt |
+| `DISABLED` | kept | operator/policy authority — qualification must not override it |
+| other (`STALE`, custom, …) | kept | not superseded by this transition |
+
+## R3-§5–§6 — Planner attempt authority settlement
+
+R2 persisted the `planner_attempt` STARTED row before eligibility for auditability, but a handled authority rejection propagated before the row settled — leaving `run=FAILED` + `attempt=STARTED`, indistinguishable from a process crash mid-invocation.
+
+`runPlannerFailover` now settles the already-durable attempt to terminal `FAILED` with `warnings=["AUTHORITY_REJECTED:<error.code>"]` BEFORE rethrowing, at both propagation points:
+
+1. `assertEligible` throwing an `IntegrityError` (role / DSH-overlap / provider-authority gates).
+2. `planFn` throwing an `IntegrityError` mid-invocation.
+
+The original error propagates unchanged — never converted to failover-eligible behavior, never retried on another candidate. Crash semantics preserved: a real crash after STARTED without settlement still leaves a durable STARTED row, so `STARTED` = crashed/interrupted, `FAILED + AUTHORITY_REJECTED` = known governance rejection.
+
+## R3-§7 — Focused tests added (59→67, all pass)
+
+- **60 A–E** — provider DOWN → availability reject; `qualify()` fails → `UNQUALIFIED` persisted → candidate authority-blocked; health restored → requalify succeeds → receipt + `MODEL_DISCOVERY_ELIGIBLE` + `UNQUALIFIED` cleared → `providerModelEligibility` all-PASS → planner eligible → `projectRoutableModels` `routable=true` (all gates) — no manual cleanup.
+- **61 F** — `DISABLED` (with `UNQUALIFIED`) survives a successful requalification: `UNQUALIFIED` cleared, `DISABLED` kept, `PROVIDER_NOT_BLOCKED` still FAIL.
+- **62 G** — post-recovery AUTH_FAILED → authority throw; health DOWN → `PROVIDER_UNAVAILABLE` availability reject.
+- **63** — role revoked → attempt STARTED→FAILED (`AUTHORITY_REJECTED:FAIL_CLOSED_MODEL_ROLE_UNASSIGNED`), `IntegrityError` propagates, run FAILED, **no** candidate invoked, no fallback.
+- **64** — provider `AUTH_FAILED` → same terminal-FAILED attempt, `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`, no fallback.
+- **65** — provider `DISABLED`/`UNQUALIFIED` → terminal FAILED, no fallback.
+- **66** — proven DSH alias overlap → `FAIL_CLOSED_PLANNER_DSH_OVERLAP` propagates, terminal FAILED, no fallback.
+- **67** — no authority-rejected attempt remains STARTED; a raw `persistPlannerAttemptStart` row without settlement (simulated crash) stays `STARTED`.
+
+## R3-§8 — R1/R2 invariants re-verified
+
+Shared `providerModelEligibility` projection + `projectRoutableModels` delegation; all 8 provider/model gates; AUTHORITY vs AVAILABILITY channels; durable `planner_run`; STARTED-before-invocation; durable EXHAUSTED; canonical validation inside failover; first-fully-valid-whole-plan; one canonical seam; pinned preview identity/digest/TTL; restart-safe + idempotent confirm; ≤1 mission per preview; Planner/DSH role separation — all unchanged and re-run green.
+
+## R3-§9 — Regression
+
+- Focused **67/67** Phase B tests.
+- Full Node 22 suite: **2360 pass / 2 fail / 15 skip** — same pre-existing `~/.nvm` environment artifact (P5 executor registration), reproduced identically on base `2277319`.
+- `pnpm exec tsc --noEmit` clean; `pnpm build` clean.
+
+## R3-§10 — Live evidence (isolated `~/pair-mc-b1` :8797)
+
+Settings-level fault injection via `~/.pair-dsh-home/settings.yaml` (new `badq` provider — authority stays in config, not db edits); runtime state flips via canonical-rehash sqlite writes (`payload` + `payload_hash` + `version` kept consistent).
+
+| Step | Evidence |
+|---|---|
+| Boot B — `badq` endpoint dead; gemini flaky probe fails | `badq` + `gemini` providers: `probe=PROBE_UNREACHABLE`, `cond=['UNQUALIFIED']`, qualify gates `PROTOCOL_PROBED:FAIL` |
+| Boot C — `badq` `baseURL` fixed to real groq endpoint (config fix only) | `badq` + `gemini` qualify `PASS` → receipts `PQR_01M3V2NWNC`/`PQR_01M3V2NV6M` → `lifecycle=QUALIFIED` → **`conditions` no longer contain `UNQUALIFIED` — auto-cleared by the canonical seam, zero manual cleanup** |
+| Planner uses recovered provider | cf+gemini models flipped `STALE` → `PRN_01M3V2VBF…`: att1 cf `FAILED MODEL_UNAVAILABLE` (`MODEL_NOT_STALE`), att2 gemini `FAILED MODEL_UNAVAILABLE`, att3 **badq `SUCCESS` 910ms** — `MPP_01M3V2VCBSTK6GSYBXXTRJP2H9` |
+| `badq` auth → `AUTH_FAILED` at runtime | `PRN_01M3V2VRD…`: att3 badq **`FAILED` `AUTHORITY_REJECTED:FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`** (terminal, not STARTED) → run `FAILED` → 409 → no fallback, no preview |
+| `cloudflare` health → `DOWN` | `PRN_01M3V2Z19…` att1 cf `FAILED PROVIDER_UNAVAILABLE` (`PROVIDER_HEALTH_OK`) → att2 gemini `SUCCESS` — availability failover per policy |
+| routable projection agrees | `/api/routes` `routable_models`: groq `routable=true`; cf/gemini rows fail **only** `BINDING_QUALIFIED` (planner-only, no DSH binding); **zero** `PROVIDER_*` gate failures — stale `UNQUALIFIED` gone everywhere |
+| pre-restart pinned preview | `MPP_01M3V2TZBK…` created before final reboot → confirm after restart → `MSN_01M3V31CHYXP46MV8T29J1RPTA`; repeat confirm replays same mission idempotently |
+
+## R3 — files changed
+
+- `src/pair/provider-catalog.ts` — `issueQualificationReceipt` strips superseded `UNQUALIFIED`, preserves `DISABLED`/others.
+- `src/pair/planner-pool.ts` — handled authority rejections settle the durable STARTED attempt to terminal `FAILED` (`AUTHORITY_REJECTED:*`) before propagating.
+- `src/__tests__/pair-phase-b.test.ts` — tests 60–67 (recovery matrix + attempt settlement) + shared-projection/routable agreement assertions.
+
+Known limitation carried unchanged: `.imported` discovery deferred; pre-existing stale data repaired once in the test db. `badq` remains configured in the test instance's `settings.yaml` (pointed at the real groq endpoint) as repro state.
+
+Classification remains: `PAIR_NEXT_POST_P14_PHASE_B_PLANNER_RELIABILITY_PENDING_INDEPENDENT_AUDIT`

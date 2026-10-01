@@ -49,6 +49,12 @@ import {
   finishPlannerRun,
   validatePlanProposal,
   providerEntryId,
+  providerModelEligibility,
+  projectRoutableModels,
+  ensureBinding,
+  qualifyBinding,
+  ProviderValidator,
+  ProviderCatalog,
   ModelEvidenceCatalog,
   MODEL_ROLE,
   type PlannerAttemptRecord,
@@ -1250,5 +1256,222 @@ describe("R2 §5 — provider/model eligibility gates", () => {
     expect(atts[0].failure_class).toBe("MODEL_UNAVAILABLE");
     expect(store.list("mission_plan_preview")).toHaveLength(0);
     expect(store.list("mission")).toHaveLength(0);
+  });
+});
+
+describe("R3 §4 — provider UNQUALIFIED recovery at canonical seam", () => {
+  it("60A–E. qualify fail → UNQUALIFIED; requalify clears it; planner + routable agree without manual cleanup", () => {
+    const ctx = makeCtx("p60");
+    const cat = new ProviderCatalog(ctx.store);
+    const pid = "recover-provider";
+    const me = mkModel(ctx.store, pid, "m60");
+    assignModelRole(ctx.store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    mkProvider(ctx.store, pid, { lifecycle: "MODEL_DISCOVERY_ELIGIBLE", health_state: "DOWN" });
+    const v = new ProviderValidator(ctx.store);
+
+    // While only DOWN the candidate is an availability rejection; after the
+    // failed qualification lands UNQUALIFIED it becomes an authority block.
+    expect(assertPlannerCandidateEligible(ctx.store, me)).toMatchObject({
+      reject: true,
+      failure_class: "PROVIDER_UNAVAILABLE",
+    });
+
+    // A — qualification failure leaves the UNQUALIFIED condition
+    const q1 = v.qualify(pid, { env: {}, probed: true });
+    expect(q1.qualified).toBe(false);
+    expect(cat.getProvider(pid)!.conditions as string[]).toContain("UNQUALIFIED");
+    expect(() => assertPlannerCandidateEligible(ctx.store, me)).toThrow(
+      /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
+    );
+
+    // B — provider now satisfies every gate: health recovered, probed via opts
+    const body = ctx.store.get("provider", providerEntryId(pid));
+    ctx.store.put("provider", providerEntryId(pid), { ...body, health_state: "READY" }, Number(body.version));
+    const q2 = v.qualify(pid, { env: {}, probed: true });
+    expect(q2.qualified).toBe(true);
+    expect(q2.receipt).toBeTruthy();
+    const prov = cat.getProvider(pid)!;
+    expect(prov.current_qualification_receipt_id).toBeTruthy();
+    expect(ctx.store.tryGet("provider_qualification", String(prov.current_qualification_receipt_id))).toBeTruthy();
+    expect(String(prov.lifecycle_state)).toBe("MODEL_DISCOVERY_ELIGIBLE");
+    expect(prov.conditions as string[]).not.toContain("UNQUALIFIED");
+
+    // C + E — shared projection and Planner agree; no manual state cleanup
+    expect(Object.values(providerModelEligibility(ctx.store, pid, me).gates).every((g) => g === "PASS")).toBe(true);
+    expect(() => assertPlannerCandidateEligible(ctx.store, me)).not.toThrow();
+
+    // D — routable projection observes the same recovered state
+    ctx.service.registerExecutor({
+      executor_id: "EXEC_R3",
+      executor_type: "EXTERNAL_ACP",
+      capabilities: ["TEXT_INFERENCE"],
+      health_state: "READY",
+      status: "ENABLED",
+      metadata: {
+        adapter_id: "exec_r3",
+        transport_type: "ACP_STDIO",
+        qualification_state: "QUALIFIED",
+        permission_modes: ["READ", "WRITE"],
+        workspace_modes: ["EXPLICIT_WORKSPACE"],
+      },
+    });
+    const binding = ensureBinding(ctx.service, {
+      executor_id: "EXEC_R3",
+      provider_id: pid,
+      model_entry_id: me,
+      transport_compat: "ACP_STDIO",
+    });
+    qualifyBinding(ctx.service, String(binding.binding_id), { evidence_refs: ["ev1"] });
+    const row = projectRoutableModels(ctx.service).find((r) => String(r.provider_id) === pid)!;
+    expect(row.gates.PROVIDER_QUALIFIED).toBe("PASS");
+    expect(row.gates.PROVIDER_NOT_BLOCKED).toBe("PASS");
+    expect(row.routable).toBe(true);
+  });
+
+  it("61F. DISABLED is preserved through successful requalification", () => {
+    const { store } = makeCtx("p61");
+    const cat = new ProviderCatalog(store);
+    const pid = "disabled-provider";
+    mkModel(store, pid, "m61");
+    mkProvider(store, pid, { conditions: ["DISABLED", "UNQUALIFIED"] });
+    const q = new ProviderValidator(store).qualify(pid, { env: {}, probed: true });
+    expect(q.qualified).toBe(true);
+    const conditions = cat.getProvider(pid)!.conditions as string[];
+    expect(conditions).toContain("DISABLED"); // operator authority, not transient residue
+    expect(conditions).not.toContain("UNQUALIFIED");
+    expect(providerModelEligibility(store, pid, mkModel(store, pid, "m61b")).gates.PROVIDER_NOT_BLOCKED).toBe("FAIL");
+  });
+
+  it("62G. AUTH/health gates still behave per policy after recovery", () => {
+    const { store } = makeCtx("p62");
+    const pid = "gate-provider";
+    const me = mkModel(store, pid, "m62");
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    mkProvider(store, pid, { auth_state: "AUTH_FAILED" });
+    expect(providerModelEligibility(store, pid, me).gates.PROVIDER_AUTH_OK).toBe("FAIL");
+    expect(() => assertPlannerCandidateEligible(store, me)).toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    const { store: s2 } = makeCtx("p62b");
+    const me2 = mkModel(s2, pid, "m62b");
+    assignModelRole(s2, me2, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    mkProvider(s2, pid, { health_state: "DOWN" });
+    expect(assertPlannerCandidateEligible(s2, me2)).toMatchObject({ reject: true, failure_class: "PROVIDER_UNAVAILABLE" });
+  });
+});
+
+describe("R3 §5–§7 — planner attempt authority settlement", () => {
+  /** planner-role model + provider; failover where first candidate is gated. */
+  const runAndCollect = async (
+    store: PairEvidenceStore,
+    name: string,
+    provOpts: Parameters<typeof mkProvider>[2],
+    mutate?: (me: string) => void,
+  ) => {
+    const me = mkModel(store, name, `m-${name}`);
+    mkProvider(store, name, provOpts);
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    mutate?.(me);
+    const invoked: string[] = [];
+    let thrown: unknown;
+    try {
+      await runDurable(store, {
+        candidates: [candOf(me, name, `m-${name}`), cand("B", "pb:mb")],
+        planFn: async (c) => {
+          invoked.push(c.model_entry_id);
+          return okPlan("t");
+        },
+        assertEligible: (c) =>
+          c.model_entry_id === me ? assertPlannerCandidateEligible(store, me) : undefined,
+      });
+    } catch (e) {
+      thrown = e;
+    }
+    const run = store.list("planner_run")[0];
+    return { thrown, invoked, run, atts: attemptsOf(store, String(run.planner_run_id)) };
+  };
+
+  it("63. role revoked → attempt STARTED→terminal FAILED, IntegrityError propagates, no fallback", async () => {
+    const { store } = makeCtx("p63");
+    const { thrown, invoked, run, atts } = await runAndCollect(store, "role-p", {}, (me) =>
+      revokeModelRole(store, me, { actor: "t" }),
+    );
+    expect(String((thrown as { code?: string }).code)).toContain("FAIL_CLOSED_MODEL_ROLE");
+    expect(String(run.state)).toBe("FAILED");
+    expect(atts).toHaveLength(1);
+    expect(atts[0].outcome).toBe("FAILED");
+    expect(String(atts[0].warnings?.[0] ?? "")).toContain("AUTHORITY_REJECTED:FAIL_CLOSED_MODEL_ROLE");
+    expect(invoked).toEqual([]); // no candidate invoked, no fallback borrowed
+  });
+
+  it("64. provider AUTH_FAILED → terminal FAILED attempt, no fallback", async () => {
+    const { store } = makeCtx("p64");
+    const { thrown, invoked, run, atts } = await runAndCollect(store, "auth-p", { auth_state: "AUTH_FAILED" });
+    expect(String((thrown as { code?: string }).code)).toBe("FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE");
+    expect(String(run.state)).toBe("FAILED");
+    expect(atts).toHaveLength(1);
+    expect(atts[0].outcome).toBe("FAILED");
+    expect(invoked).toEqual([]);
+  });
+
+  it("65. provider DISABLED/UNQUALIFIED → terminal FAILED attempt, no fallback", async () => {
+    const { store } = makeCtx("p65");
+    const r1 = await runAndCollect(store, "dis-p", { conditions: ["DISABLED"] });
+    expect(String((r1.thrown as { code?: string }).code)).toBe("FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE");
+    expect(r1.atts[0].outcome).toBe("FAILED");
+    expect(r1.invoked).toEqual([]);
+    const { store: s2 } = makeCtx("p65b");
+    const r2 = await runAndCollect(s2, "unq-p", { conditions: ["UNQUALIFIED"] });
+    expect(r2.atts[0].outcome).toBe("FAILED");
+    expect(String(r2.atts[0].warnings?.[0] ?? "")).toContain("AUTHORITY_REJECTED:");
+  });
+
+  it("66. DSH alias overlap → terminal FAILED attempt, no fallback", async () => {
+    const { store } = makeCtx("p66");
+    const dsh = mkModel(store, "p66x", "dshm");
+    assignModelRole(store, dsh, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+    const invoked: string[] = [];
+    const r = await (async () => {
+      // proven alias: same provider_family, planner lists dsh's model_id
+      const me = mkModel(store, "p66x", "m66", { aliases: ["dshm"] });
+      mkProvider(store, "p66x");
+      assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+      expect(() => assertPlannerCandidateEligible(store, me)).toThrow(/FAIL_CLOSED_PLANNER_DSH_OVERLAP/);
+      let thrown: unknown;
+      try {
+        await runDurable(store, {
+          candidates: [candOf(me, "p66p", "m66"), cand("B", "pb:mb")],
+          planFn: async (c) => {
+            invoked.push(c.model_entry_id);
+            return okPlan("t");
+          },
+          assertEligible: (c) =>
+            c.model_entry_id === me ? assertPlannerCandidateEligible(store, c.model_entry_id) : undefined,
+        });
+      } catch (e) {
+        thrown = e;
+      }
+      const run = store.list("planner_run")[0];
+      return { thrown, atts: attemptsOf(store, String(run.planner_run_id)) };
+    })();
+    expect(String((r.thrown as { code?: string }).code)).toBe("FAIL_CLOSED_PLANNER_DSH_OVERLAP");
+    expect(r.atts).toHaveLength(1);
+    expect(r.atts[0].outcome).toBe("FAILED");
+    expect(invoked).toEqual([]);
+  });
+
+  it("67. no authority-rejected attempt remains STARTED; simulated crash may retain STARTED", async () => {
+    const { store } = makeCtx("p67");
+    const { atts } = await runAndCollect(store, "crash-p", { auth_state: "AUTH_FAILED" });
+    expect(atts.every((a) => a.outcome !== "STARTED")).toBe(true);
+    // crash semantics: a STARTED row persisted without settlement stays durable
+    const run = beginPlannerRun(store, { project_id: "P1", operator_id: "op1", routes: ["p:x"] });
+    const a = persistPlannerAttemptStart(store, {
+      planner_run_id: String(run.planner_run_id),
+      project_id: "P1",
+      record: {
+        route: "p:x", provider: "p", model_entry_id: "c", model: "x",
+        role: "PLANNER_COORDINATOR", attempt_no: 1, started_at: "2026-01-01T00:00:00.000Z",
+      } as never,
+    });
+    expect(String(store.get("planner_attempt", String(a.planner_attempt_id)).outcome)).toBe("STARTED");
   });
 });
