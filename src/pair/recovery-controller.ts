@@ -129,7 +129,7 @@ const CLASS_RULES: Array<[RegExp, FailureClass]> = [
   [/AUTHORIZATION|FORBIDDEN|DENY_BY|403/i, "AUTHORIZATION_FAILURE"],
   [/PERMISSION|ALLOWED_PATH|PATH_OUTSIDE|FILE_ACCESS/i, "PERMISSION_DENIAL"],
   [/WORKSPACE/i, "WORKSPACE_DENIAL"],
-  [/POLICY|CAPABILITY_MISMATCH|NOT_DISPATCHABLE|GOVERNANCE/i, "POLICY_DENIAL"],
+  [/POLICY|CAPABILITY_MISMATCH|NOT_DISPATCHABLE|GOVERNANCE|NO_ELIGIBLE|GOVERNED_TASK|MISSION_ID_PUBLIC|BINDING_/i, "POLICY_DENIAL"],
   [/EXECUTOR_UNAVAILABLE|ADAPTER_NOT_BOUND|SPAWN|EXECUTABLE_NOT_FOUND|ENOENT/i, "EXECUTOR_UNAVAILABLE"],
   [/UNHEALTHY|NOT_READY|HEALTH/i, "EXECUTOR_UNHEALTHY"],
   [/PROVIDER/i, "PROVIDER_UNAVAILABLE"],
@@ -160,20 +160,25 @@ export function classifyFailure(input: {
   error_code?: string;
   result?: Record<string, unknown> | null;
 }): FailureClass {
-  const errClass = String(
-    input.error_class ??
-      input.error_code ??
-      (input.result?.error as Record<string, unknown> | undefined)?.class ??
-      "",
-  );
   const resultObj = input.result as Record<string, unknown> | null | undefined;
   const errorObj = resultObj?.error as Record<string, unknown> | undefined;
-  const haystack = [errClass, errorObj?.message, resultObj?.summary, resultObj?.stderr]
+  const errClass = String(
+    input.error_class ?? errorObj?.class ?? "",
+  );
+  const errCode = String(
+    input.error_code ?? errorObj?.code ?? "",
+  );
+  const haystack = [errClass, errCode, errorObj?.message, resultObj?.summary, resultObj?.stderr]
     .map((v) => String(v ?? ""))
     .join("\n");
   if (ENVIRONMENT_INCOMPATIBLE_SIGNAL.test(haystack)) return "ENVIRONMENT_INCOMPATIBLE";
+  // R4 §5 — the specific error code and the transport-stage class BOTH
+  // participate: a generic stage label ("DISPATCH", "EXECUTION") must never
+  // shadow a deterministic contract code like
+  // FAIL_CLOSED_WORKSPACE_UNAUTHORIZED into UNKNOWN.
+  const subject = [errCode, errClass].filter(Boolean).join("\n");
   for (const [re, cls] of CLASS_RULES) {
-    if (re.test(errClass)) return cls;
+    if (re.test(subject)) return cls;
   }
   const state = String(input.execution_state ?? input.result?.status ?? "");
   if (state === "TIMEOUT") return "TIMEOUT";
@@ -261,6 +266,14 @@ export class RecoveryController {
     result?: Record<string, unknown> | null;
     /** post-gates eligible executors from the router (re-route feasibility) */
     eligible_executors?: string[];
+    /**
+     * R4 §8 — post-reconciliation context: a reconciliation that already
+     * settled for THIS failure instance (e.g. CONFIRMED_NOT_EXECUTED,
+     * replay proven safe) is supplied so the settled action can be
+     * rejected and the next valid action evaluated — the same
+     * reconciliation is never re-selected forever.
+     */
+    settled_reconciliation?: { outcome: string; reconciliation_id?: string } | null;
     /** ACTIVE REMEDIATION_PAIR experience ids, already filtered for compatibility by caller/ExperienceService */
     verified_remediation_ids?: string[];
     risk_class?: string;
@@ -361,6 +374,20 @@ export class RecoveryController {
             }
             break;
           }
+          case "RECONCILIATION_REQUIRED": {
+            // R4 §8 — a reconciliation that already settled for THIS
+            // failure instance must not re-select itself; the settled
+            // candidate is rejected and the next valid action evaluated.
+            if (input.settled_reconciliation) {
+              rejected.push({
+                action,
+                reason: `RECONCILIATION_ALREADY_SETTLED:${String(input.settled_reconciliation.outcome)}`,
+              });
+            } else {
+              selected = action;
+            }
+            break;
+          }
           default:
             selected = action;
         }
@@ -399,6 +426,7 @@ export class RecoveryController {
       remediation_experience_id:
         selected === "APPLY_VERIFIED_REMEDIATION" ? input.verified_remediation_ids![0] : null,
       evidence_refs: input.evidence_refs ?? (input.execution_id ? [input.execution_id] : []),
+      settled_reconciliation: input.settled_reconciliation ?? null,
       selfmod_candidate_eligible: RECOVERY_MATRIX[failureClass].may_create_selfmod_candidate === true,
       created_at: now,
       correlation_id: input.correlation_id ?? null,

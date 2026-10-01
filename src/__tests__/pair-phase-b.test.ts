@@ -13,6 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
   DSH_EXECUTOR_ID,
@@ -62,6 +63,8 @@ import {
   CodexCliExecutorAdapter,
   devinBlockedGraceMs,
   devinTaskTimeoutMs,
+  classifyFailure,
+  TRANSPORT_IN_PROCESS,
   type DevinFetch,
   type PlannerAttemptRecord,
   type PlannerCandidate,
@@ -87,7 +90,7 @@ function makeCtx(n: string, opts: { planner?: (i: unknown) => unknown; plannerCa
   const registry = new ExecutorRegistry(service);
   const router = new MissionRouter(service, gate);
   const recovery = new RecoveryController(service);
-  const adapters = new Map<string, never>();
+  const adapters = new Map<string, ExecutorAdapter>();
   const recon = new ReconciliationService(service, adapters as never);
   const approvals = new ApprovalQueue(service);
   const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
@@ -114,7 +117,7 @@ function makeCtx(n: string, opts: { planner?: (i: unknown) => unknown; plannerCa
   });
   service.registerCapability("FILE_OPERATIONS", { risk_class: "LOW" });
   const project = service.createProject({ name: n, root_location: workspace });
-  return { dir, workspace, store, service, control, runtime, plannerCalls, projectId: String(project.project_id), gate, recon, approvals, scheduler, recovery, planner };
+  return { dir, workspace, store, service, control, runtime, plannerCalls, projectId: String(project.project_id), gate, recon, approvals, scheduler, recovery, planner, registry, adapters };
 }
 
 const cand = (id: string, ref = `p:${id}`): PlannerCandidate => ({
@@ -1730,5 +1733,345 @@ describe("PRE-MERGE hotfix — executor timeout governance", () => {
       if (prev === undefined) delete process.env.PAIR_DEVIN_BLOCKED_GRACE_MS;
       else process.env.PAIR_DEVIN_BLOCKED_GRACE_MS = prev;
     }
+  });
+});
+
+/* ============================ R4 — live-found mission input + recovery limbo ============================
+ * Bug A: workspace-less mission input (telegram-style {goal, project_id}) → literal
+ *        "undefined" workspace → FAIL_CLOSED_WORKSPACE_UNAUTHORIZED.
+ * Bug B: RECONCILIATION_REQUIRED fell through applyPendingRecovery's default →
+ *        "unhandled:" limbo — settled barrier still blocked scheduling forever.
+ */
+
+class R4Adapter implements ExecutorAdapter {
+  readonly executor_id: string;
+  readonly dispatched: Array<Record<string, unknown>> = [];
+  callCount = 0;
+  throws: Error[] = [];
+  writeFile = false;
+  dispatchEvidence: { dispatched: boolean; execution_id?: string } | undefined;
+  private execCount = 0;
+  constructor(id = "R4_EXEC") {
+    this.executor_id = id;
+  }
+  probe() {
+    return { executor_id: this.executor_id, available: true, state: "READY" };
+  }
+  qualify() {
+    return { qualified: true, dispatch_enabled: true };
+  }
+  capabilities() {
+    return { capability_ids: ["FILE_OPERATIONS"] };
+  }
+  prepare_task(t: Record<string, unknown>) {
+    return t;
+  }
+  dispatch(task: Record<string, unknown>) {
+    this.callCount += 1;
+    const next = this.throws.shift();
+    if (next) throw next;
+    this.execCount += 1;
+    const eid = `EXEC_${this.executor_id}_${this.execCount}`;
+    this.dispatched.push(task);
+    if (this.writeFile) {
+      fs.writeFileSync(path.join(String(task.workspace), `done-${this.execCount}.txt`), "ok");
+    }
+    return { execution_id: eid, status: "COMPLETED", run_root: null, workspace: task.workspace };
+  }
+  observe() {
+    return { status: "COMPLETED" };
+  }
+  cancel() {
+    return { status: "CANCELLED" };
+  }
+  collect_result() {
+    return { status: "COMPLETED", summary: "ok" };
+  }
+  collect_artifacts() {
+    return [];
+  }
+  health() {
+    return { state: "READY" };
+  }
+  dispatch_evidence() {
+    return this.dispatchEvidence;
+  }
+}
+
+function r4Register(ctx: ReturnType<typeof makeCtx>, adapter: R4Adapter, caps = ["FILE_OPERATIONS"]) {
+  ctx.registry.register({
+    executor_id: adapter.executor_id,
+    executor_type: "EXTERNAL",
+    capabilities: caps,
+    health_state: "READY",
+    status: "ENABLED",
+    metadata: {
+      routing_priority: 50,
+      transport_type: TRANSPORT_IN_PROCESS,
+      qualification_state: "QUALIFIED",
+      permission_modes: ["READ", "WRITE"],
+      workspace_modes: ["EXPLICIT_WORKSPACE"],
+      supports_cancel: true,
+      max_concurrency: 4,
+    },
+  });
+  const routeId = `RTE_${adapter.executor_id}`;
+  if (!ctx.service.routes.getRoute(routeId)) {
+    ctx.service.routes.registerRoute({
+      route_id: routeId,
+      route_kind: "IN_PROCESS_RUNTIME",
+      enabled: true,
+      eligibility_state: "QUALIFIED",
+      qualification_state: "QUALIFIED",
+      direct_callable: true,
+      capabilities: caps,
+      priority: 50,
+      executor_hint: adapter.executor_id,
+    });
+  }
+  if (!ctx.service.routes.bindingFor(adapter.executor_id, routeId)) {
+    ctx.service.routes.registerBinding({
+      executor_id: adapter.executor_id,
+      route_id: routeId,
+      mechanism: "SPAWN_ENV",
+      qualification_state: "QUALIFIED",
+      capabilities: caps,
+    });
+  }
+  ctx.adapters.set(adapter.executor_id, adapter);
+}
+
+const r4Confirm = (ctx: ReturnType<typeof makeCtx>, goal = "g") => {
+  const pv = ctx.control.createPlanPreview({
+    project_id: ctx.projectId, goal, metadata: { llm_plan: [T1] }, operator_id: "op",
+  });
+  const m = ctx.control.confirmPlanPreview({
+    preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+  });
+  return { pv, m };
+};
+
+describe("R4 — live-found mission input + recovery limbo closure", () => {
+  it("A/B: telegram-style {goal, project_id} + explicit [] both default to canonical project root", () => {
+    const ctx = makeCtx("r4-ab");
+    for (const ws of [undefined, [] as string[]]) {
+      const pv = ctx.control.createPlanPreview({
+        project_id: ctx.projectId, goal: `g-${ws === undefined ? "u" : "e"}`,
+        metadata: { llm_plan: [T1] }, authorized_workspaces: ws, operator_id: "op",
+      });
+      const stored = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+      expect((stored.mission_input as Record<string, unknown>).authorized_workspaces).toEqual([ctx.workspace]);
+    }
+  });
+
+  it("C: normalization lands BEFORE planner + digest — planner sees [root], digest covers it", () => {
+    const ctx = makeCtx("r4-c");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] },
+    });
+    const call = ctx.plannerCalls[0] as { mission: Record<string, unknown> };
+    expect(call.mission.authorized_workspaces).toEqual([ctx.workspace]);
+    const eid = effectiveInputDigest({
+      project_id: ctx.projectId, goal: "g",
+      granted_permissions: undefined, authorized_workspaces: [ctx.workspace],
+      risk_ceiling: undefined, operator_id: undefined,
+      allowed_capabilities: undefined, capability_sets: undefined,
+    });
+    expect(String(pv.effective_input_digest)).toBe(eid);
+  });
+
+  it("D/E: confirmed mission AND startMission path both carry the defaulted workspace", () => {
+    const ctx = makeCtx("r4-de");
+    const { m } = r4Confirm(ctx);
+    expect(((m.metadata as Record<string, unknown>).authorized_workspaces as string[])).toEqual([ctx.workspace]);
+    const m2 = ctx.control.startMission({ project_id: ctx.projectId, goal: "g2" });
+    expect(((m2.metadata as Record<string, unknown>).authorized_workspaces as string[])).toEqual([ctx.workspace]);
+  });
+
+  it("F: T1 governed task dispatches with project-root workspace and completes", () => {
+    const ctx = makeCtx("r4-f");
+    const ad = new R4Adapter();
+    ad.writeFile = true;
+    r4Register(ctx, ad);
+    const { m } = r4Confirm(ctx);
+    for (let i = 0; i < 8; i++) ctx.runtime.tick(String(m.mission_id));
+    expect(ad.dispatched).toHaveLength(1);
+    expect(String(ad.dispatched[0].workspace)).toBe(ctx.workspace);
+    expect(fs.existsSync(path.join(ctx.workspace, "done-1.txt"))).toBe(true);
+    expect(String(ctx.service.getMission(String(m.mission_id)).status)).toBe("COMPLETED");
+  });
+
+  it("G/J: task workspace outside authorized list fails closed deterministically — no reconcile loop", () => {
+    const ctx = makeCtx("r4-g");
+    const ad = new R4Adapter();
+    r4Register(ctx, ad);
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g",
+      metadata: { llm_plan: [{ ...T1, metadata: { workspace: "/etc" } }] }, // task workspace escapes [root]
+    });
+    const stored = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    expect((stored.mission_input as Record<string, unknown>).authorized_workspaces).toEqual([ctx.workspace]);
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    for (let i = 0; i < 8; i++) ctx.runtime.tick(String(m.mission_id));
+    expect(ad.dispatched).toHaveLength(0); // gate rejected before adapter dispatch
+    const decisions = ctx.store.list("recovery_decision").filter((d) => d.mission_id === m.mission_id);
+    expect(decisions.length).toBeGreaterThan(0);
+    expect(String(decisions[0].failure_class)).toBe("WORKSPACE_DENIAL");
+    expect(ctx.store.list("reconciliation_receipt").filter((r) => r.mission_id === m.mission_id)).toHaveLength(0);
+    const rt = ctx.store.get("mission_runtime", `MRT_${m.mission_id}`);
+    expect(String(rt.state)).toBe("WAITING_APPROVAL"); // bounded — deterministic governance denial
+    expect(String(rt.reason ?? "")).not.toContain("unhandled");
+  });
+
+  it("G2: explicit caller workspace list is passed through verbatim (not replaced by normalization)", () => {
+    const ctx = makeCtx("r4-g2");
+    const other = fs.mkdtempSync(path.join(ctx.dir, "other-ws-"));
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] },
+      authorized_workspaces: [other],
+    });
+    const stored = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    expect((stored.mission_input as Record<string, unknown>).authorized_workspaces).toEqual([other]);
+  });
+
+  it("H/I: classifyFailure — specific error_code wins over generic stage class", () => {
+    expect(classifyFailure({ error_class: "DISPATCH", error_code: "FAIL_CLOSED_WORKSPACE_UNAUTHORIZED" })).toBe("WORKSPACE_DENIAL");
+    expect(classifyFailure({ error_class: "DISPATCH", error_code: "FAIL_CLOSED_ALLOWED_PATH_UNAUTHORIZED" })).toBe("PERMISSION_DENIAL");
+    expect(classifyFailure({ error_class: "DISPATCH", error_code: "FAIL_CLOSED_CAPABILITY_MISMATCH" })).toBe("POLICY_DENIAL");
+    expect(classifyFailure({ error_class: "DISPATCH", error_code: "FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR" })).toBe("POLICY_DENIAL");
+    expect(classifyFailure({ error_class: "EXECUTION", error_code: "PROCESS_EXIT_1" })).toBe("PROCESS_EXIT");
+    expect(classifyFailure({ error_class: "DISPATCH" })).toBe("UNKNOWN");
+  });
+
+  it("K/L/M/N: RECONCILIATION_REQUIRED→CONFIRMED_NOT_EXECUTED→fresh bounded decision→safe redrive via router+gate, no double dispatch", () => {
+    const ctx = makeCtx("r4-k");
+    const ad = new R4Adapter();
+    ad.throws = [new Error("TIMEOUT: simulated dispatch deadline")];
+    ad.dispatchEvidence = { dispatched: false }; // adapter proves no dispatch → HELD reservation releases
+    r4Register(ctx, ad);
+    const { m } = r4Confirm(ctx);
+    // manual tick loop with advancing clock — run() breaks on WAITING_BACKOFF stalls
+    let now = Date.now();
+    let rt: Record<string, unknown> = {};
+    for (let i = 0; i < 60 && !["COMPLETED", "ABORTED", "FAILED"].includes(String(rt.state ?? "")); i++) {
+      now += 2000;
+      rt = ctx.runtime.tick(String(m.mission_id), new Date(now).toISOString());
+    }
+    expect(String(rt.state)).toBe("COMPLETED");
+    // exactly one safe re-drive through MissionRouter+Gate — no executor bypass, no double dispatch
+    expect(ad.callCount).toBe(2); // dispatch attempted once (threw), retried once (succeeded)
+    expect(ad.dispatched).toHaveLength(1);
+    expect(String(ad.dispatched[0].workspace)).toBe(ctx.workspace);
+    // a fresh governed decision was persisted after the settled reconciliation
+    const decisions = ctx.store
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === m.mission_id);
+    expect(decisions.length).toBeGreaterThanOrEqual(2);
+    const fresh = decisions.find((d) => d.settled_reconciliation != null);
+    expect(fresh).toBeTruthy();
+    expect(String(fresh!.selected_action)).toBe("RETRY_SAME_ROUTE");
+    const rejected = (fresh!.rejected_actions as Array<Record<string, unknown>>) ?? [];
+    expect(rejected.some((r) => String(r.reason).startsWith("RECONCILIATION_ALREADY_SETTLED"))).toBe(true);
+    const receipts = ctx.store.list("reconciliation_receipt").filter((r) => String((r.inputs as Record<string, unknown>)?.mission_id) === String(m.mission_id));
+    expect(String(receipts[0].outcome)).toBe("CONFIRMED_NOT_EXECUTED");
+    expect(String(rt.reason ?? "")).not.toContain("unhandled");
+  });
+
+  it("O: UNKNOWN_SIDE_EFFECT_STATE still requires operator intervention — no blind replay", () => {
+    const ctx = makeCtx("r4-o");
+    const ad = new R4Adapter();
+    ad.dispatchEvidence = { dispatched: true, execution_id: "EXEC_PHANTOM" };
+    r4Register(ctx, ad);
+    const { m } = r4Confirm(ctx);
+    // drive to READY only — task exists but has NOT dispatched yet
+    for (let i = 0; i < 2; i++) ctx.runtime.tick(String(m.mission_id));
+    const task = ctx.service.listTasks(String(m.mission_id))[0];
+    const taskId = String(task.task_id);
+    const gtid = `GTSK_O_${taskId}`;
+    ctx.store.put("governed_task", gtid, {
+      governed_task_id: gtid, mission_id: m.mission_id, task_id: taskId,
+      executor_id: ad.executor_id, state: "DISPATCHED", version: 0,
+    }, 0);
+    ctx.store.put("executor_dispatch_intent", `INTENT_${gtid}`, {
+      intent_id: `INTENT_${gtid}`, governed_task_id: gtid, mission_id: m.mission_id,
+      executor_id: ad.executor_id, state: "INTENT_RECORDED", execution_id: null, version: 0,
+    }, 0);
+    const rtId = `MRT_${m.mission_id}`;
+    const rt = ctx.store.get("mission_runtime", rtId);
+    rt.state = "RECONCILING";
+    rt.reason = "reconcile_required";
+    rt.barriers = {
+      [taskId]: { kind: "RECONCILIATION", governed_task_id: gtid, execution_id: null },
+    };
+    ctx.store.put("mission_runtime", rtId, rt, rt.version);
+    ctx.runtime.tick(String(m.mission_id));
+    ctx.runtime.tick(String(m.mission_id));
+    const rt2 = ctx.store.get("mission_runtime", rtId);
+    expect(String(rt2.state)).toBe("WAITING_APPROVAL");
+    const receipts = ctx.store.list("reconciliation_receipt").filter((r) => String((r.inputs as Record<string, unknown>)?.mission_id) === String(m.mission_id));
+    expect(String(receipts[0].outcome)).toBe("UNKNOWN_SIDE_EFFECT_STATE");
+    expect(ad.dispatched).toHaveLength(0); // never blind replay
+    const approvals = ctx.store.list("approval_request").filter((a) => a.mission_id === m.mission_id);
+    expect(approvals.length).toBeGreaterThan(0);
+  });
+
+  it("Q: legacy RUNNING + unhandled:RECONCILIATION_REQUIRED + settled barrier self-heals on normal ticks", () => {
+    const ctx = makeCtx("r4-q");
+    const ad = new R4Adapter();
+    r4Register(ctx, ad);
+    const { m } = r4Confirm(ctx);
+    for (let i = 0; i < 2; i++) ctx.runtime.tick(String(m.mission_id)); // plan committed, READY
+    const task = ctx.service.listTasks(String(m.mission_id))[0];
+    const taskId = String(task.task_id);
+    const rtId = `MRT_${m.mission_id}`;
+    const rt = ctx.store.get("mission_runtime", rtId);
+    // craft the exact pre-fix stuck shape (fixture setup — the FIX is not DB surgery)
+    rt.state = "RUNNING";
+    rt.reason = "unhandled:RECONCILIATION_REQUIRED";
+    rt.pending_recovery = {
+      recovery_id: "RCV_LEGACY", action: "RECONCILIATION_REQUIRED", task_id: taskId,
+      execution_id: null, governed_task_id: `GTSK_${taskId}`, executor_id: ad.executor_id,
+      failure_class: "UNKNOWN", backoff_ms: 0,
+    };
+    rt.barriers = {
+      [taskId]: {
+        kind: "RECONCILIATION", execution_id: null, settled: true,
+        last_outcome: "CONFIRMED_NOT_EXECUTED", last_receipt_id: "REC_LEGACY",
+      },
+    };
+    ctx.store.put("mission_runtime", rtId, rt, rt.version);
+    let now = Date.now();
+    const final = ctx.runtime.run(String(m.mission_id), {
+      maxTicks: 40,
+      now: () => new Date((now += 1500)).toISOString(),
+    });
+    // UNKNOWN matrix → settled reconcile rejected → ABORT (bounded terminal)
+    expect(["ABORTED", "FAILED"]).toContain(String(final.state));
+    expect(String(final.reason ?? "")).not.toContain("unhandled");
+    const decisions = ctx.store.list("recovery_decision").filter((d) => d.mission_id === m.mission_id);
+    const fresh = decisions.find((d) => d.settled_reconciliation != null);
+    expect(fresh).toBeTruthy();
+    expect(ad.dispatched).toHaveLength(0); // UNKNOWN class → no replay
+  });
+
+  it("R: pinned-plan digest + idempotency still green after normalization", () => {
+    const ctx = makeCtx("r4-r");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const stored = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    expect(pv.plan_digest).toBe(stored.plan_digest);
+    const m1 = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    const m2 = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    expect(String(m1.mission_id)).toBe(String(m2.mission_id)); // one preview → at most one mission
+    for (let i = 0; i < 3; i++) ctx.runtime.tick(String(m1.mission_id)); // → PLANNING → READY
+    const tasks = ctx.service.listTasks(String(m1.mission_id));
+    expect(tasks).toHaveLength(1); // exactly the pinned plan
   });
 });

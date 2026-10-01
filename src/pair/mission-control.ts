@@ -329,6 +329,7 @@ export class MissionControl {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "mission_control.preview");
     }
+    const workspaces = this.normalizeMissionWorkspaces(input);
     // Planner sees only the mission fields it legitimately reads — the same
     // record shape the runtime will later build from the created entity.
     const pseudoMission: Record<string, unknown> = {
@@ -337,7 +338,7 @@ export class MissionControl {
       goal: input.goal,
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
-      authorized_workspaces: input.authorized_workspaces ?? [],
+      authorized_workspaces: workspaces,
       risk_ceiling: input.risk_ceiling ?? null,
     };
     const proposal = this.deps.planner({ mission: pseudoMission, advice: null, reason: "initial" });
@@ -349,7 +350,7 @@ export class MissionControl {
       project_id: input.project_id,
       goal: input.goal,
       granted_permissions: input.granted_permissions ?? [],
-      authorized_workspaces: input.authorized_workspaces ?? [],
+      authorized_workspaces: workspaces,
       risk_ceiling: input.risk_ceiling ?? null,
       tasks,
     });
@@ -364,6 +365,37 @@ export class MissionControl {
   }
 
   /* ---------------- Phase B — durable pinned plan ------------------------- */
+
+  /**
+   * R4 §2/§3 — canonical mission-input normalization seam. A mission input
+   * with no explicit workspace authority inherits its project's canonical
+   * root_location — resolved ONCE here, before planning/digest, so the
+   * effective input is identical across preview, pinned mission_input,
+   * confirm replay, and the created mission. An explicit non-empty caller
+   * list passes through verbatim; a project without a usable root fails
+   * closed (never the literal "undefined"). Explicit values are NOT
+   * re-validated here — GovernedTaskGate authorizes them at dispatch.
+   */
+  private normalizeMissionWorkspaces(input: {
+    project_id: string;
+    authorized_workspaces?: string[];
+  }): string[] {
+    const supplied = input.authorized_workspaces;
+    if (Array.isArray(supplied) && supplied.length > 0) {
+      return supplied.map((w) => String(w));
+    }
+    const project = this.store.tryGet("project", String(input.project_id)) as
+      | Record<string, unknown>
+      | null;
+    const root = project?.root_location;
+    if (typeof root !== "string" || root.trim() === "") {
+      throw new PolicyError(
+        "FAIL_CLOSED_NO_AUTHORIZED_WORKSPACE",
+        `project:${String(input.project_id)}: no canonical root_location and no authorized_workspaces supplied`,
+      );
+    }
+    return [root];
+  }
 
   /**
    * §9/§13 — create a durable canonical `mission_plan_preview`: canonicalize
@@ -408,13 +440,14 @@ export class MissionControl {
         "mission_id pinning is internal-only — public mission creation mints its own id",
       );
     }
+    const workspaces = this.normalizeMissionWorkspaces(input);
     const pseudoMission: Record<string, unknown> = {
       mission_id: "__preview__",
       project_id: input.project_id,
       goal: input.goal,
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
-      authorized_workspaces: input.authorized_workspaces ?? [],
+      authorized_workspaces: workspaces,
       risk_ceiling: input.risk_ceiling ?? null,
     };
     const proposal = this.deps.planner({ mission: pseudoMission, advice: null, reason: "initial" });
@@ -426,7 +459,7 @@ export class MissionControl {
       project_id: input.project_id,
       goal: input.goal,
       granted_permissions: input.granted_permissions,
-      authorized_workspaces: input.authorized_workspaces,
+      authorized_workspaces: workspaces,
       risk_ceiling: input.risk_ceiling,
       operator_id: input.operator_id,
       allowed_capabilities: plannerEvidence?.allowed_capabilities,
@@ -437,7 +470,7 @@ export class MissionControl {
       effective_input_digest: eid,
       tasks,
       granted_permissions: input.granted_permissions,
-      authorized_workspaces: input.authorized_workspaces,
+      authorized_workspaces: workspaces,
       risk_ceiling: input.risk_ceiling,
     });
     const row = persistPlanPreview(this.store, {
@@ -446,7 +479,7 @@ export class MissionControl {
         goal: input.goal,
         metadata: input.metadata ?? {},
         granted_permissions: input.granted_permissions ?? [],
-        authorized_workspaces: input.authorized_workspaces ?? [],
+        authorized_workspaces: workspaces,
         risk_ceiling: input.risk_ceiling ?? null,
         operator_id: input.operator_id ?? null,
       },
@@ -530,7 +563,10 @@ export class MissionControl {
         goal: String(mi.goal),
         metadata,
         granted_permissions: (mi.granted_permissions as string[] | undefined) ?? [],
-        authorized_workspaces: (mi.authorized_workspaces as string[] | undefined) ?? undefined,
+        authorized_workspaces: this.normalizeMissionWorkspaces({
+          project_id: String(mi.project_id),
+          authorized_workspaces: mi.authorized_workspaces as string[] | undefined,
+        }),
         risk_ceiling: (mi.risk_ceiling as string | undefined) ?? undefined,
         operator_id: input.operator_id,
       });
@@ -908,13 +944,14 @@ export class MissionControl {
     metadata.secret_grants = this.deps.service.secretPolicies.pinForMission({
       businessId: metadata.business_id ? String(metadata.business_id) : null,
     });
+    const workspaces = this.normalizeMissionWorkspaces(input);
     const mission = binding
       ? this.deps.service.createBoundMission(binding, {
           project_id: input.project_id,
           goal: input.goal,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
-          authorized_workspaces: input.authorized_workspaces,
+          authorized_workspaces: workspaces,
           risk_ceiling: input.risk_ceiling,
         })
       : this.deps.service.createMission({
@@ -922,7 +959,7 @@ export class MissionControl {
           goal: input.goal,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
-          authorized_workspaces: input.authorized_workspaces,
+          authorized_workspaces: workspaces,
           risk_ceiling: input.risk_ceiling,
         });
     this.deps.runtime.runtimeEntity(String(mission.mission_id));
