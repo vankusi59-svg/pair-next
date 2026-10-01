@@ -135,6 +135,12 @@ export interface MissionRuntimeDeps {
   plannerAdvisor?: { advise(opts: Record<string, unknown>): Record<string, unknown> };
   environment?: Record<string, unknown>;
   actor?: string;
+  /**
+   * Governed task execution budget (seconds) applied when a task carries no
+   * explicit metadata.timeout. Phase A: validated at startup via
+   * taskTimeoutSeconds() — this field must already be a positive int.
+   */
+  taskTimeoutSeconds?: number;
 }
 
 const DEFAULT_TASK_TIMEOUT = 120;
@@ -329,7 +335,7 @@ export class MissionRuntime {
       allowed_paths: (tmd.allowed_paths as string[]) ?? [workspace],
       permissions: (mission.granted_permissions as string[]) ?? [],
       constraints: (md.constraints as string[]) ?? [],
-      timeout: Number(tmd.timeout ?? DEFAULT_TASK_TIMEOUT),
+      timeout: Number(tmd.timeout ?? this.deps.taskTimeoutSeconds ?? DEFAULT_TASK_TIMEOUT),
       expected_output_contract:
         tmd.expected_output_contract ?? { type: "TASK_RESULT" },
       requested_tools:
