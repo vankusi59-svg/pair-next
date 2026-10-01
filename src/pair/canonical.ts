@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ulid } from "ulid";
+import { IntegrityError } from "./errors.js";
 
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortValue(value) as JsonValue, undefined, 0).replace(
@@ -108,6 +109,55 @@ export function readJsonFile<T = unknown>(filePath: string): T | null {
 export function appendJsonl(filePath: string, entry: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.appendFileSync(filePath, canonicalJson(entry) + "\n", "utf8");
+}
+
+/**
+ * R6 — the single canonical workspace representation: an absolute,
+ * resolved, normalized path. Every accepted workspace string flows through
+ * this helper BEFORE digests/persistence so the pinned authority is
+ * byte-for-byte identical at preview, confirm, mission creation, and
+ * authorizedRoots evaluation. Invalid input fails closed — never silently
+ * accepted.
+ */
+export function canonicalWorkspacePath(raw: unknown): string {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new IntegrityError(
+      "FAIL_CLOSED_WORKSPACE_AUTHORITY_INVALID",
+      `workspace authority must be a non-empty string, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return path.resolve(raw);
+}
+
+/** True when `w` is already in canonical form (byte-for-byte). */
+export function isCanonicalWorkspacePath(w: unknown): w is string {
+  return typeof w === "string" && w.trim() !== "" && path.resolve(w) === w;
+}
+
+/**
+ * R7 — the canonical risk vocabulary + the single risk normalization seam.
+ * Omitted/null resolves to the system default "HIGH" BEFORE digests and
+ * persistence, so previewed authority == committed authority. Malformed
+ * values fail closed rather than being silently reinterpreted.
+ */
+export const CANONICAL_RISK_LEVELS = ["LOW", "MEDIUM", "HIGH", "CRITICAL"] as const;
+export const CANONICAL_RISK_DEFAULT = "HIGH";
+
+export function canonicalRiskCeiling(raw: unknown): string {
+  if (raw == null) return CANONICAL_RISK_DEFAULT;
+  const v = String(raw);
+  if (!(CANONICAL_RISK_LEVELS as readonly string[]).includes(v)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_RISK_CEILING_INVALID",
+      `risk_ceiling must be one of ${CANONICAL_RISK_LEVELS.join("/")}, got ${JSON.stringify(raw)}`,
+    );
+  }
+  return v;
+}
+
+/** True when `v` is an explicit canonical risk level (not the defaulted one). */
+export function isCanonicalRiskCeiling(v: unknown): v is string {
+  return typeof v === "string" && (CANONICAL_RISK_LEVELS as readonly string[]).includes(v);
 }
 
 /** True when `candidate` is `root` itself or strictly inside it (resolved). */

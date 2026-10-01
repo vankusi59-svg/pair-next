@@ -16,6 +16,8 @@
 
 import { digest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { providerModelEligibility } from "./model-routable.js";
+import { PLANNER_FAILURE_CLASS, type PlannerFailureClass } from "./planner-pool.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const MODEL_ROLE = {
@@ -171,6 +173,86 @@ export function assertPlannerModelRole(store: PairEvidenceStore, modelEntryId: s
 
 export function assertDshExecutionModelRole(store: PairEvidenceStore, modelEntryId: string): void {
   assertModelRole(store, modelEntryId, MODEL_ROLE.DSH_EXECUTION);
+}
+
+/**
+ * Full canonical eligibility proof for a Planner candidate (Phase B R1 §9).
+ * Runs before EVERY planner model invocation — qualification captured at
+ * startup is never trusted as still-current:
+ *
+ *  1. model_entry exists, still holds PLANNER_COORDINATOR, and is not
+ *     REMOVED/DEPRECATED/BLOCKED (assertModelRole);
+ *  2. its provider is still canonically eligible — lifecycle in
+ *     PROVIDER_OK_STATES (the existing qualification authority; no
+ *     duplicate qualification seam is created here);
+ *  3. the candidate is not canonically a DSH_EXECUTION model/alias —
+ *     sameCanonicalModel against every active DSH assignment.
+ *
+ * Two verdict channels (R2 §4 — documented classification):
+ *
+ * AUTHORITY / GOVERNANCE → IntegrityError thrown, propagates, NEVER
+ * failover-eligible (do not silently borrow another authority):
+ *   - role missing/revoked/mismatch, model REMOVED/DEPRECATED/BLOCKED
+ *     (assertPlannerModelRole), model or its proven alias holds
+ *     DSH_EXECUTION (FAIL_CLOSED_PLANNER_DSH_OVERLAP)
+ *   - provider row absent or lifecycle not canonically eligible,
+ *     provider auth failed, provider DISABLED/UNQUALIFIED
+ *     (FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE)
+ *
+ * TEMPORARY AVAILABILITY → returns {reject:true, failure_class} — a
+ * failover-eligible candidate rejection consistent with Planner failure
+ * policy (the model is never invoked; the next candidate may win):
+ *   - model lifecycle no longer QUALIFIED → MODEL_UNAVAILABLE
+ *   - model condition STALE or UNAVAILABLE → MODEL_UNAVAILABLE
+ *   - provider health DOWN/UNAVAILABLE → PROVIDER_UNAVAILABLE
+ *
+ * The provider/model gates are the shared canonical projection
+ * `providerModelEligibility` (model-routable.ts) — planner and routing
+ * eligibility can never disagree about usability.
+ */
+export interface PlannerEligibilityRejection {
+  reject: true;
+  failure_class: PlannerFailureClass;
+  reason: string;
+}
+export function assertPlannerCandidateEligible(
+  store: PairEvidenceStore,
+  modelEntryId: string,
+): PlannerEligibilityRejection | void {
+  assertPlannerModelRole(store, modelEntryId);
+  const mid = String(modelEntryId);
+  const model = store.get("model_entry", mid);
+  for (const asn of listModelRoleAssignments(store)) {
+    if (asn.role !== MODEL_ROLE.DSH_EXECUTION) continue;
+    const other = store.tryGet("model_entry", String(asn.model_entry_id));
+    if (other && sameCanonicalModel(model, other)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_DSH_OVERLAP",
+        JSON.stringify({ model_entry_id: mid, dsh_model_entry_id: String(asn.model_entry_id) }),
+      );
+    }
+  }
+  const elig = providerModelEligibility(
+    store,
+    String(model.provider_id ?? model.provider_family ?? ""),
+    mid,
+  );
+  if (elig.eligible) return;
+  const failed = Object.keys(elig.gates).filter((g) => elig.gates[g] === "FAIL");
+  const AUTHORITY_GATES = new Set(["PROVIDER_QUALIFIED", "PROVIDER_AUTH_OK", "PROVIDER_NOT_BLOCKED"]);
+  if (failed.some((g) => AUTHORITY_GATES.has(g))) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE",
+      JSON.stringify({ model_entry_id: mid, failed_gates: failed }),
+    );
+  }
+  return {
+    reject: true,
+    failure_class: failed.includes("PROVIDER_HEALTH_OK")
+      ? PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE
+      : PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE,
+    reason: failed.join(","),
+  };
 }
 
 /**

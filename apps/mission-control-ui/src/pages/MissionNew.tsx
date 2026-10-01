@@ -32,6 +32,7 @@ export function MissionNew() {
   const [preview, setPreview] = useState<{
     tasks: PlanTask[];
     digest: string;
+    preview_id: string;
     source: string | null;
     model: string | null;
   } | null>(null);
@@ -65,16 +66,16 @@ export function MissionNew() {
       const pv = {
         tasks: r.plan.tasks as unknown as PlanTask[],
         digest: r.plan_digest,
+        preview_id: r.preview_id,
         source: r.plan_source,
         model: r.plan_model,
       };
       if (autoConfirm) {
-        // Auto-confirm: submit the previewed plan immediately — the digest
-        // check still runs server-side (fail-closed is preserved).
+        // Auto-confirm: consume the persisted preview — the server commits
+        // EXACTLY the plan it stored, never a re-planned variant.
         const m = await api.startMission({
           ...submitPayload(),
-          confirm_plan: { digest: pv.digest },
-          metadata: pv.source ? { llm_plan: pv.tasks, plan_source: pv.source, plan_model: pv.model } : {},
+          confirm_plan: { digest: pv.digest, preview_id: pv.preview_id },
         });
         nav(`/missions/${String(m.mission_id)}`);
         return;
@@ -93,12 +94,11 @@ export function MissionNew() {
     setBusy(true);
     setErr(null);
     try {
-      // Echo the exact previewed tasks back in metadata.llm_plan — the
-      // digest check proves to the server this is the plan the operator saw.
+      // Confirm the persisted preview — the server consumes it and commits
+      // exactly the canonical tasks it stored at preview time.
       const m = await api.startMission({
         ...submitPayload(),
-        confirm_plan: { digest: preview.digest },
-        metadata: preview.source ? { llm_plan: preview.tasks, plan_source: preview.source, plan_model: preview.model } : {},
+        confirm_plan: { digest: preview.digest, preview_id: preview.preview_id },
       });
       nav(`/missions/${String(m.mission_id)}`);
     } catch (e) {

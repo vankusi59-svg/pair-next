@@ -9,7 +9,7 @@
  */
 
 import path from "node:path";
-import { newId, pathWithin, planManifestDigest, utcnow } from "./canonical.js";
+import { canonicalRiskCeiling, canonicalWorkspacePath, newId, pathWithin, planManifestDigest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { AgentContractService } from "./agent-contract.js";
 import { CostService } from "./cost.js";
@@ -70,7 +70,7 @@ export class PairControlPlane {
     const project = {
       project_id: projectId,
       name: params.name,
-      root_location: path.resolve(params.root_location),
+      root_location: canonicalWorkspacePath(params.root_location),
       created_at: utcnow(),
       version: 0,
     };
@@ -137,8 +137,29 @@ export class PairControlPlane {
     const missionId = binding ? String(binding.mission_id) : newId("MSN");
     const boundOpenId = binding ? String(binding.open_id) : null;
     const authorized = (params.authorized_workspaces ?? [String(project.root_location)]).map(
-      (p) => path.resolve(p),
+      (p) => canonicalWorkspacePath(p),
     );
+    const canonicalRisk = canonicalRiskCeiling(params.risk_ceiling);
+    const canonicalConstraints: string[] = [];
+    // R6 — reserved canonical authority fields can never be shadowed by
+    // caller-controlled metadata: a conflicting duplicate fails closed, a
+    // same-value duplicate is stripped to the single authoritative copy.
+    const callerMetadata = { ...(params.metadata ?? {}) } as Record<string, unknown>;
+    const reservedAuthority: Array<[string, unknown]> = [
+      ["authorized_workspaces", authorized],
+      ["risk_ceiling", canonicalRisk],
+      ["constraints", canonicalConstraints],
+    ];
+    for (const [key, canonical] of reservedAuthority) {
+      if (!(key in callerMetadata)) continue;
+      if (JSON.stringify(callerMetadata[key]) !== JSON.stringify(canonical)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_METADATA_AUTHORITY_SHADOWING",
+          `metadata.${key} conflicts with canonical mission authority`,
+        );
+      }
+      delete callerMetadata[key];
+    }
     const mission = {
       mission_id: missionId,
       project_id: params.project_id,
@@ -152,10 +173,10 @@ export class PairControlPlane {
       execution_mode: params.execution_mode ?? "GOVERNED",
       created_at: utcnow(),
       metadata: {
+        ...callerMetadata,
         authorized_workspaces: authorized,
-        risk_ceiling: params.risk_ceiling ?? "HIGH",
-        constraints: [],
-        ...(params.metadata ?? {}),
+        risk_ceiling: canonicalRisk,
+        constraints: canonicalConstraints,
       },
       version: 0,
     };
@@ -383,13 +404,20 @@ export class PairControlPlane {
     return this.store.tryGet("runtime_governance", missionId) ?? { max_retries: 3 };
   }
 
+  /**
+   * R7 — mission authority is a SNAPSHOT: effective roots come only from
+   * the `authorized_workspaces` pinned into the mission at creation
+   * (preview → digest → confirm → mission, byte-for-byte). The live
+   * project root may provide defaults for NEW previews/missions but must
+   * never widen an existing mission. A mission with no valid snapshot gets
+   * zero roots — the gate then denies every workspace (fail closed).
+   */
   authorizedRoots(missionId: string): string[] {
     const mission = this.getMission(missionId);
-    const project = this.getProject(String(mission.project_id));
     const extra =
       (mission.metadata as Record<string, unknown> | undefined)?.authorized_workspaces;
-    const roots = [String(project.root_location), ...((extra as string[]) ?? [])];
-    return [...new Set(roots.map((p) => path.resolve(p)))];
+    const roots = Array.isArray(extra) ? extra.map((p) => canonicalWorkspacePath(p)) : [];
+    return [...new Set(roots)];
   }
 
   isPathAuthorized(candidate: string, missionId: string): boolean {
