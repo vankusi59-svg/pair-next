@@ -999,3 +999,16 @@ DSH/CODEX environment probe failures as base (unchanged, not hidden).
   WAITING_APPROVAL/ABORTED — verified it does not stay RECOVERING.
 - Results after remediation: focused 17/17; full suite 2427 pass / 2
   pre-existing P5 env failures (unchanged); tsc + build clean.
+
+## Re-audit (round 2) — residual recovery paths closed (HEAD 420ee7b)
+
+Re-audit of `7ea418c` found the apply boundary correct but incomplete in coverage: throws inside the OTHER tick arms an actionable `pending_recovery` drives — `WAITING_BACKOFF` (due-marking), `RECONCILING` (`runReconciliation`), `REPLANNING` (`runReplan`), `WAITING_APPROVAL` (`checkPendingApproval`), and the `RUNNING` due-action section — still escaped `tick()` into the supervisor's silent catch, replaying the same `pending_recovery` forever (same limbo mechanism, different state name). Additionally `handleRecoveryApplyFailure` itself could throw (decide() defect / illegal decided transition / store fault) with no fallback.
+
+Remediation on this HEAD:
+- `recoveryGuard(missionId, fn, now)` wraps every recovery-driven tick arm above: a throw with an actionable `pending_recovery` routes through the failure boundary; without one it rethrows (pre-existing non-recovery semantics preserved).
+- `recoveryFailureBoundary` wraps `handleRecoveryApplyFailure`: if the handler cannot land a decision, `abortMission("recovery_boundary_defect:…")` force-writes ABORTED — the only state reachable from every live recovery state — so an unhandleable failure still ends in an operator-visible terminal state.
+- `applyPendingRecovery` routes through the boundary (behavior unchanged on success).
+
+Evidence: `Test Files 1 passed (1)`; `Tests 19 passed (19)` for `pair-live-ops-recovery-closure` including new **A7** (reconcile dep defect inside RECONCILING → bounded `INTERNAL_RUNTIME_DEFECT` → `WAITING_APPROVAL`, stable over repeated ticks) and **A8** (`decide()` defect inside the failure handler → `ABORTED` with `recovery_boundary_defect` reason — never a silent replay). Counterfactual: `Tests 3 failed | 16 passed` on `b72db71` for the same file — A6/A7/A8 throws escape `tick()` into the supervisor's silent catch there. Full suite `2429 passed | 2 failed` — the two P5 env-dependent failures present since base; `tsc --noEmit` clean; `pnpm build` clean.
+
+Residual honest debt (unchanged, deferred): outbox-artifact-as-evidence contract; executor ordering policy; a `pending` recovery entity whose OWN `pending_recovery` payload is missing at tick time still skips the arm (rethrow path) — recovery entities are written by `startRecovery` in one store.put with the decision, so this is a corruption-class input, not a runtime path.
