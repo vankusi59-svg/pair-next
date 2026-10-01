@@ -63,6 +63,12 @@ chmod 600 "$PAIR_HOME"/pair-*-token 2>/dev/null || true
 OBX=$(cat "$PAIR_HOME/pair-obx-token")
 BRK=$(cat "$PAIR_HOME/pair-brk-token")
 
+# Phase A — MC token via the canonical resolver (explicit env >
+# $PAIR_HOME/pair-mc-token > generated 256-bit chmod 600). No static
+# defaults: server, bridge, and this health check all share one value.
+MC_TOK="$(cd "$ROOT" && node --input-type=module -e \
+  "import { resolveMcToken } from './dist/pair/index.js'; process.stdout.write(resolveMcToken().token);")"
+
 # --- 5. mission-control server -------------------------------------------------
 MC_LOG="$LOG_DIR/mc-serve.log"
 (
@@ -70,7 +76,7 @@ MC_LOG="$LOG_DIR/mc-serve.log"
   PAIR_MC_DIR="$MC_DIR" \
   PAIR_DSH_HOME="${PAIR_DSH_HOME:-$HOME/.pair-dsh-home}" \
   CODEX_HOME="${CODEX_HOME:-$HOME/.codex}" \
-  PAIR_MC_TOKEN="${PAIR_MC_TOKEN:-pair-mc-test-token}" \
+  PAIR_MC_TOKEN="$MC_TOK" \
   PAIR_MAX_REMOTE_TASKS_PER_DAY="${PAIR_MAX_REMOTE_TASKS_PER_DAY:-10}" \
   PAIR_OUTBOX_URL="$OUTBOX_URL" \
   PAIR_OUTBOX_TOKEN="$OBX" \
@@ -80,7 +86,7 @@ MC_LOG="$LOG_DIR/mc-serve.log"
 echo "==> server starting (log $MC_LOG)"
 for _ in $(seq 1 30); do
   code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$PORT/api/health" \
-    -H "Authorization: Bearer ${PAIR_MC_TOKEN:-pair-mc-test-token}" || true)
+    -H "Authorization: Bearer $MC_TOK" || true)
   [ "$code" = "200" ] && break
   sleep 1
 done
@@ -105,7 +111,7 @@ if [ -z "$TG_TOKEN" ]; then
   echo "!! PAIR_TG_BOT_TOKEN missing — bridge NOT started."
   echo "   Set env PAIR_TG_BOT_TOKEN or write it to $PAIR_HOME/pair-tg-token then:"
   echo "   PAIR_TG_BOT_TOKEN=... PAIR_MC_URL=http://localhost:$PORT \\"
-  echo "     PAIR_MC_TOKEN=${PAIR_MC_TOKEN:-pair-mc-test-token} PAIR_MC_DIR=$MC_DIR \\"
+  echo "     PAIR_MC_TOKEN=<resolved> PAIR_MC_DIR=$MC_DIR \\"
   echo "     node scripts/telegram-bridge.mjs &"
 else
   TG_LOG="$LOG_DIR/pair-tg.log"
@@ -113,7 +119,7 @@ else
     cd "$ROOT"
     PAIR_TG_BOT_TOKEN="$TG_TOKEN" \
     PAIR_MC_URL="http://localhost:$PORT" \
-    PAIR_MC_TOKEN="${PAIR_MC_TOKEN:-pair-mc-test-token}" \
+    PAIR_MC_TOKEN="$MC_TOK" \
     PAIR_MC_DIR="$MC_DIR" \
     PAIR_TG_ALLOW_FILE="$ALLOW_FILE" \
     nohup node scripts/telegram-bridge.mjs > "$TG_LOG" 2>&1 &

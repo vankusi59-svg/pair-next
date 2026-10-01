@@ -69,6 +69,7 @@ import {
   modelProbeTimeoutMs,
   llmPlannerTimeoutMs,
   taskTimeoutSeconds,
+  resolveMcToken,
   assignModelRole,
   assertNoModelRoleOverlap,
   assertPlannerModelRole,
@@ -96,6 +97,11 @@ fs.mkdirSync(journalRoot, { recursive: true });
 const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_MS (ms, 500..120000)
 const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
+
+// Phase A — MC token: explicit env > persistent file > generated 256-bit
+// (chmod 600). No static defaults anywhere; server + bridge share this seam.
+const mcToken = resolveMcToken();
+console.log(`MC_TOKEN: resolved via ${mcToken.source} (file=${mcToken.path})`);
 
 // Phase A — canonical model-role pools. PAIR_PLANNER_MODEL_ROUTE names the
 // planner's model route; PAIR_DSH_* routes name DSH_EXECUTION candidates.
@@ -592,7 +598,7 @@ const server = createMissionControlServer({
   // PAIR_MC_TOKEN gates every /api/* request (Bearer header or ?token= for
   // SSE). Unset = open local mode; always set it when the port is reachable
   // by anyone but you (e.g. a public preview URL).
-  authToken: process.env.PAIR_MC_TOKEN || undefined,
+  authToken: mcToken.token,
   // Narrow-scope upload token for remote executor file deliverables
   // (POST /api/outbox). Separate from PAIR_MC_TOKEN on purpose — remote
   // agents see this value in their prompt, so it must not grant API access.
