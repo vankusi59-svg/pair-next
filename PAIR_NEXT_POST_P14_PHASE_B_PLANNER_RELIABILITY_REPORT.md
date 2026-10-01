@@ -810,3 +810,167 @@ root-A→root-B mutation test (mandatory); §16 direct-service roots;
 Phase B focused 123/123 (+13). Full suite 2407 pass / 2 fail — same
 pre-existing P5 DSH+CODEX env failures as base `2277319`. tsc --noEmit
 clean, pnpm build clean.
+
+---
+
+## REMEDIATION — Live Ops Recovery Closure (Bug C + Devin completion protocol)
+
+Mandate: `PAIR NEXT — LIVE OPS RECOVERY CLOSURE / BUG C + DEVIN COMPLETION
+PROTOCOL REMEDIATION` (one bounded remediation PR from canonical main;
+DO NOT MERGE).
+
+### Base / HEAD / PR
+- **Base SHA**: `abee212` (main, includes merged PR #22)
+- **HEAD SHA**: `b3b35e4` (`devin/1790855402-live-ops-recovery-closure`)
+- **PR**: see PR header (branch `devin/1790855402-live-ops-recovery-closure`)
+
+### Changed files
+- `src/pair/recovery-controller.ts` — `decide()` accepts `infeasible_actions`;
+  an action proven infeasible by an apply-path throw is rejected with
+  `APPLY_INFEASIBLE:<normalized code>` and persisted in `rejected_actions`
+  (canonical decision evidence; mirrors the `settled_reconciliation` seam).
+- `src/pair/mission-runtime.ts` — all three unwrapped `routeGovernedTask`
+  apply-path call sites (RETRY_SAME_ROUTE, RE_ROUTE, remediation
+  PROPOSED→bind) now funnel throws into `handleRecoveryApplyFailure`;
+  `infeasible_actions` is persisted on `pending_recovery` and forwarded to
+  `startRecovery`/`decide()`; `supersedeGovernedTaskOnce` makes the
+  per-chain supersede idempotent (already-superseded = no-op).
+- `src/pair/devin-executor.ts` — governed completion protocol: dispatch
+  prompt requires `PAIR_EXECUTION_COMPLETE` on its own line; `observe()`
+  applies the evidence hierarchy marker → legacy bare-DONE and lets
+  verified completion win over enum lag; the remote status fetch now
+  happens even after the persisted budget so late-completing work proves
+  completion instead of racing to TIMEOUT/REMOTE_INPUT_REQUIRED.
+- `src/__tests__/pair-live-ops-recovery-closure.test.ts` — +16 tests.
+
+### Root causes
+- **A (Bug C, observed MSN_01M3VHGS6HPA62V6K9JR57MNEK)**: a recovery
+  apply-path `routeGovernedTask` throw (expected fail-closed PolicyError —
+  `FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR` when the only capable executor was
+  excluded) escaped into the per-mission supervisor try/catch and was
+  swallowed silently. `pending_recovery` never cleared or advanced → the
+  same throw replayed every supervisor tick → permanent RECOVERING limbo
+  with no operator signal.
+- **B (observed MSN_01M3VK3EVHS609R7MD1S95GSDY + lauxanh)**: completion
+  detection depended on a bare `DONE` sentinel on its own line. Work that
+  was objectively complete (deliverable uploaded, session finished)
+  produced prose like "DONE. I took a screenshot…" → no sentinel match →
+  `blocked` enum + task-budget expiry raced to
+  `REMOTE_INPUT_REQUIRED`/`TIMEOUT` → spurious HUMAN_APPROVAL escalations.
+
+### Invariants preserved
+- decide() remains the single canonical recovery authority — no
+  hard-coded HUMAN/ABORT bypass; infeasibility feeds back through the
+  existing matrix.
+- CAS/version discipline on `mission_runtime` untouched;
+  `pending_recovery` shape extended additively.
+- Expected governed routing failures (PolicyError) become recovery
+  evidence; unexpected defects (IntegrityError, programmer bugs) are NOT
+  normalized — they re-decide under the existing
+  `INTERNAL_RUNTIME_DEFECT` class (may_create_selfmod_candidate).
+- Authorization model untouched: no capability re-added to DEVIN; broker
+  capability minting unchanged.
+
+### Recovery state-transition design (A)
+1. Apply-path wraps each routing call. PolicyError → capture
+   `{action, normalized error code}` onto `pending_recovery.infeasible_actions`
+   (dedup by action, latest reason wins) → `startRecovery` re-invoked with
+   the same failure class and the accumulated infeasible set.
+2. `decide()` rejects infeasible candidates with
+   `APPLY_INFEASIBLE:<code>` inside the persisted decision — the identical
+   attempt cannot re-select itself; the next matrix action is evaluated
+   (RE_ROUTE → RETRY_SAME_ROUTE → HUMAN_APPROVAL_REQUIRED / ABORT per
+   class) → bounded convergence. Attempt ceilings
+   (`max_attempts_per_task=3`, `max_consecutive_identical=3`) still apply
+   across the whole chain.
+3. `infeasible_actions` persists on `pending_recovery` → restart-safe:
+   a fresh runtime over the same store rejects the dead action without
+   re-throwing.
+4. Non-PolicyError throws → `INTERNAL_RUNTIME_DEFECT` decision
+   (HUMAN_APPROVAL_REQUIRED/ABORT) — operator-visible, never swallowed.
+
+### Completion evidence hierarchy (B)
+1. `PAIR_EXECUTION_COMPLETE` marker on its own line in the last
+   devin_message tail (new governed contract — deterministic, no prose
+   collision, emitted only on genuine completion).
+2. Legacy bare-`DONE` line (fallback for sessions dispatched under the
+   old contract).
+3. Anything else → the enum + blocked-grace path decides (unchanged).
+Marker/sentinel wins over `blocked`, `suspended`, `expired` and even the
+timeout boundary — verified completion can no longer be downgraded.
+Outbox artifacts alone are NOT completion evidence: no per-task
+expected-artifact contract exists yet (B4 limitation, deferred).
+
+### Why false REMOTE_INPUT_REQUIRED is now impossible
+`REMOTE_INPUT_REQUIRED` only materializes through the `blocked`+grace
+path. Verified completion (marker or legacy DONE) short-circuits that
+path to COMPLETED before grace is evaluated — including when the session
+is already past the task budget, because the remote fetch runs first and
+only then does the timeout outcome apply to unproven work.
+
+### Why infinite recovery is now impossible
+Every apply-path throw either advances `pending_recovery` through a new
+bounded decision (infeasible-evidence re-decide) or — for defects —
+lands on `INTERNAL_RUNTIME_DEFECT`. Both write a `recovery_decision`
+row counted by the existing attempt ceilings, so the chain either selects
+a different action or hits `max_attempts_per_task/mission` →
+HUMAN_APPROVAL_REQUIRED/ABORT. A per-tick replay of the identical throw
+can no longer occur: the action is marked infeasible for the chain.
+
+### Routing-order audit result
+Bug C correctness does NOT depend on deterministic executor ordering —
+infeasibility is detected at apply time and fed back as evidence
+regardless of which executor is tried first. Deterministic
+local-before-remote ordering remains a cost optimization only → deferred
+(documented debt; alphabetical tie-break still governs).
+TELEGRAM_DELIVERY was NOT re-added to DEVIN (audit-corrected in PR #22).
+
+### Test matrix (+16, `pair-live-ops-recovery-closure.test.ts`)
+- **A1** single-capability executor fail → RE_ROUTE throws
+  NO_ELIGIBLE_EXECUTOR → APPLY_INFEASIBLE evidence → bounded FAILED
+  (exact live limbo shape; also exercises two adapters where only one
+  holds the capability).
+- **A2** RETRY_SAME_ROUTE pinned to an unbound executor →
+  APPLY_INFEASIBLE:FAIL_CLOSED_* evidence, next action selected.
+- **A3** RE_ROUTE with zero alternates → APPLY_INFEASIBLE:
+  FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR persisted; RETRY_SAME_ROUTE selected.
+- **A4** non-PolicyError defect (IntegrityError) → NOT normalized —
+  INTERNAL_RUNTIME_DEFECT → HUMAN_APPROVAL_REQUIRED → WAITING_APPROVAL.
+- **A5** `infeasible_actions` persists on pending_recovery across a
+  fresh-runtime "restart" — the dead action is rejected without replay.
+- **B1** marker on blocked enum → COMPLETED. **B2** "DONE. I took a
+  screenshot…" prose + marker → COMPLETED. **B3** suspended-after-
+  deliverable + marker → COMPLETED. **B4** blocked, no evidence → grace
+  → FAILED + REMOTE_INPUT_REQUIRED (unchanged). **B5** legacy bare-DONE
+  fallback → COMPLETED. **B6** casual "done" prose → NOT completion.
+  **B7** marker inside prose (not own line) → NOT completion.
+  **B8** remote fail enum → FAILED. **B9** marker arriving past the
+  persisted budget → COMPLETED (XSMN boundary). **B10** timeout without
+  evidence → TIMEOUT (unchanged). **B11** dispatch prompt carries the
+  marker instruction.
+
+### Results
+Focused 16/16; adjacent suites (p9 + phase-b + ops-telegram) 221/221;
+**full suite 2426 pass / 2 fail** — the same two pre-existing P5
+DSH/CODEX environment probe failures as base (unchanged, not hidden).
+`tsc --noEmit` clean; `pnpm build` clean.
+
+### Deferred items
+- Outbox-artifact completion linkage (B4): needs a per-task expected-
+  artifact contract — no canonical seam exists; marker/terminal result is
+  the contract meanwhile.
+- Deterministic executor ordering policy (cost-only, see above).
+- Remote workspace-path mismatch on the remote machine (deliverable lands
+  via outbox regardless; separate issue per B5).
+- Pre-existing: DSH multi-credential provisioning, `.imported` settings
+  rename, planner `worker_spec` validation, nvidia/GLM probe timeout,
+  `badq` prod residue — all out of scope per mandate.
+
+### Deviations
+- `supersedeGovernedTask` made idempotent within a failure chain
+  (implementation detail — required to let a chain advance past the first
+  apply; without it the second apply throws a different IntegrityError
+  and recreates the limbo). Semantics unchanged for genuinely
+  non-supersedeable states (still throws → INTERNAL_RUNTIME_DEFECT).
+
+**Classification**: `LIVE_OPS_RECOVERY_CLOSURE_BUG_C_DEVIN_COMPLETION_PENDING_INDEPENDENT_AUDIT`
