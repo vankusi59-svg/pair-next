@@ -848,6 +848,28 @@ export class MissionRuntime {
     }
     const action = String(pending.action);
     const taskId = String(pending.task_id);
+
+    // Audit R: the WHOLE apply arm runs inside one boundary. Only the router
+    // calls keep their own catch (they convert an expected PolicyError into
+    // infeasible evidence for the attempted action). Every other statement
+    // in the arm — supersede, task fetch/update, remediation internals —
+    // that throws would otherwise escape to the supervisor's silent catch
+    // and replay the unchanged pending_recovery every tick: the same
+    // permanent-RECOVERING limbo this closure exists to remove.
+    try {
+      this.applyRecoveryAction(missionId, pending, action, taskId, now);
+    } catch (err) {
+      this.handleRecoveryApplyFailure(missionId, pending, action, err, now);
+    }
+  }
+
+  private applyRecoveryAction(
+    missionId: string,
+    pending: Record<string, unknown>,
+    action: string,
+    taskId: string,
+    now?: string,
+  ): void {
     const mission = this.deps.service.getMission(missionId);
 
     switch (action) {

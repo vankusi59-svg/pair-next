@@ -974,3 +974,28 @@ DSH/CODEX environment probe failures as base (unchanged, not hidden).
   non-supersedeable states (still throws → INTERNAL_RUNTIME_DEFECT).
 
 **Classification**: `LIVE_OPS_RECOVERY_CLOSURE_BUG_C_DEVIN_COMPLETION_PENDING_INDEPENDENT_AUDIT`
+
+### Independent-audit finding + remediation (round 1)
+
+- **Finding (Medium)**: the first revision wrapped only the
+  `routeGovernedTask` calls. Other statements in the same apply arms —
+  `supersedeGovernedTaskOnce` and `service.updateTask(READY)` before the
+  try blocks, plus unwrapped statements inside `runRemediation`
+  (`store.get`, `proposeRemediationTask`, `activeRevision`) — could still
+  throw into `mission-supervisor.ts`'s silent catch and replay the
+  unchanged `pending_recovery` every tick: the same limbo mechanism on a
+  non-router surface (reachable on corrupt/missing store rows).
+- **Remediation**: `applyPendingRecovery` now runs the whole action arm
+  inside one boundary — `applyRecoveryAction` covers every statement of
+  every arm (RETRY_SAME_ROUTE, RE_ROUTE, APPLY_VERIFIED_REMEDIATION,
+  RECONCILIATION_REQUIRED, default). Router calls keep their inner catch
+  (PolicyError → `infeasible_actions` evidence for the attempted action);
+  every other throw flows through `handleRecoveryApplyFailure` —
+  PolicyError still becomes action-scoped infeasibility, non-PolicyError
+  defects decide under `INTERNAL_RUNTIME_DEFECT` → bounded
+  HUMAN_APPROVAL_REQUIRED/ABORT instead of silent replay.
+- **Test A6** (new): non-router apply-path throw (supersede on a missing
+  governed_task row) → `INTERNAL_RUNTIME_DEFECT` decision →
+  WAITING_APPROVAL/ABORTED — verified it does not stay RECOVERING.
+- Results after remediation: focused 17/17; full suite 2427 pass / 2
+  pre-existing P5 env failures (unchanged); tsc + build clean.

@@ -410,6 +410,38 @@ describe("LORC A — apply-path routing throw → bounded re-decide", () => {
     ).toBe(true);
     expect(String(latest.selected_action)).not.toBe("RE_ROUTE");
   });
+
+  it("A6. non-router apply-path throw (supersede on missing governed_task) → bounded defect decision, not supervisor-swallowed limbo", () => {
+    const ctx = makeCtx("a6");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    const task = ctx.service.listTasks(mid)[0];
+    const rtEnt = rt(ctx, mid);
+    rtEnt.state = "RECOVERING";
+    rtEnt.pending_recovery = {
+      recovery_id: "RCV_seed6",
+      action: "RETRY_SAME_ROUTE",
+      task_id: String(task.task_id),
+      execution_id: null,
+      // governed_task row does not exist — supersedeGovernedTask throws a
+      // non-PolicyError defect OUTSIDE the router call site.
+      governed_task_id: "GTSK_missing",
+      executor_id: null,
+      failure_class: "TRANSIENT_TRANSPORT",
+      backoff_ms: 0,
+      infeasible_actions: [],
+    };
+    ctx.store.put("mission_runtime", `MRT_${mid}`, rtEnt, Number(rtEnt.version));
+    ctx.runtime.tick(mid, FAR);
+    const latest = decisions(ctx, mid).at(-1)!;
+    expect(String(latest.failure_class)).toBe("INTERNAL_RUNTIME_DEFECT");
+    // The throw became a canonical bounded decision — the mission is no
+    // longer replaying an unchanged pending_recovery on every tick.
+    expect(["WAITING_APPROVAL", "ABORTED"]).toContain(String(rt(ctx, mid).state));
+    for (let i = 0; i < 3; i++) ctx.runtime.tick(mid, FAR);
+    expect(String(rt(ctx, mid).state)).not.toBe("RECOVERING");
+  });
 });
 
 /* ------------------------------ Devin observe ------------------------------ */
