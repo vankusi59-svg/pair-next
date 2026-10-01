@@ -374,6 +374,11 @@ export class ProviderCatalog {
     body.current_qualification_receipt_id = receipt.receipt_id;
     body.lifecycle_state = "QUALIFIED";
     body.last_qualified_at = receipt.issued_at;
+    // Successful canonical qualification supersedes a historical
+    // UNQUALIFIED marker — provider state must not stay internally
+    // contradictory. DISABLED and other operator/policy conditions are
+    // preserved (they are explicit authority, not transient residue).
+    body.conditions = ((entry.conditions as string[]) ?? []).filter((c) => c !== "UNQUALIFIED").sort();
     this.put(String(entry.entry_id), body, { actor: opts.actor ?? "PAIR_PROVIDER_CATALOG", eventType: "PROVIDER_QUALIFIED" });
     return receipt;
   }

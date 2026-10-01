@@ -66,15 +66,26 @@ import {
   DSH_EXECUTOR_ID,
   PAIR_NATIVE_EXECUTOR_ID,
   IntegrityError,
+  PolicyError,
   modelProbeTimeoutMs,
   llmPlannerTimeoutMs,
   taskTimeoutSeconds,
+  planPreviewTtlSeconds,
+  devinBlockedGraceMs,
   resolveMcToken,
+  runPlannerFailover,
+  dedupePlannerCandidates,
   reconcileModelRoleAssignments,
   resolveConfiguredModelRoleRoute,
   assertCanonicalModelRoleStateDisjoint,
   assertPlannerModelRole,
+  assertPlannerCandidateEligible,
   assertDshExecutionModelRole,
+  beginPlannerRun,
+  persistPlannerAttemptStart,
+  settlePlannerAttempt,
+  finishPlannerRun,
+  validatePlanProposal,
   modelRoleOf,
   MODEL_ROLE,
   utcnow,
@@ -98,6 +109,9 @@ fs.mkdirSync(journalRoot, { recursive: true });
 const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_MS (ms, 500..120000)
 const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
+const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
+const cfgDevinBlockedGraceMs = devinBlockedGraceMs(); // PAIR_DEVIN_BLOCKED_GRACE_MS (ms, 5000..1800000) — blocked-clock only, never the task budget
+console.log(`EXEC_TIMEOUT: canonical governed budget PAIR_TASK_TIMEOUT_S=${cfgTaskTimeoutS}s → task.timeout (all executors) | Devin blockedGraceMs=${cfgDevinBlockedGraceMs} (separate blocked clock)`);
 
 // Phase A — MC token: explicit env > persistent file > generated 256-bit
 // (chmod 600). No static defaults anywhere; server + bridge share this seam.
@@ -108,11 +122,14 @@ console.log(`MC_TOKEN: resolved via ${mcToken.source} (file=${mcToken.path})`);
 // planner's model route; PAIR_DSH_* routes name DSH_EXECUTION candidates.
 // The two pools must be canonically disjoint — enforced below via
 // model_entry_id, never route spelling alone.
-const PLANNER_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
-// Planner failover chain: PAIR_PLANNER_MODEL_ROUTE first, then any
-// PAIR_PLANNER_EXTRA_ROUTES in order — a quota/timeout/error on one
-// planner model falls through to the next at plan time.
-const PLANNER_ROUTES = [PLANNER_ROUTE];
+// Phase B — the Planner pool is an ORDERED failover chain: primary route
+// first, then fallback, then extras, in configured order (deduped on the
+// resolved canonical model_entry_id). Planner failover NEVER borrows a
+// DSH_EXECUTION model — pools stay disjoint as canonical authority.
+const PLANNER_PRIMARY_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
+const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "").trim();
+const PLANNER_ROUTES = [PLANNER_PRIMARY_ROUTE];
+if (PLANNER_FALLBACK_ROUTE) PLANNER_ROUTES.push(PLANNER_FALLBACK_ROUTE);
 for (const extra of String(process.env.PAIR_PLANNER_EXTRA_ROUTES ?? "").split(",")) {
   const r = extra.trim();
   if (r && !PLANNER_ROUTES.includes(r)) PLANNER_ROUTES.push(r);
@@ -126,9 +143,9 @@ for (const extra of String(process.env.PAIR_DSH_EXTRA_ROUTES ?? "").split(",")) 
 }
 // Cheap static pre-check: identical route spelling across pools fails fast;
 // the canonical model_entry_id overlap check runs after discovery.
-for (const r of PLANNER_ROUTES) {
-  if (r && DSH_ROUTES.includes(r)) {
-    throw new IntegrityError("FAIL_CLOSED_MODEL_ROLE_OVERLAP", `route ${r} configured for both PLANNER_COORDINATOR and DSH_EXECUTION`);
+for (const pr of PLANNER_ROUTES) {
+  if (pr && DSH_ROUTES.includes(pr)) {
+    throw new IntegrityError("FAIL_CLOSED_MODEL_ROLE_OVERLAP", `route ${pr} configured for both PLANNER_COORDINATOR and DSH_EXECUTION`);
   }
 }
 
@@ -194,6 +211,10 @@ governed.set(
   DEVIN_EXECUTOR_ID,
   new DevinExecutorAdapter({
     journalRoot,
+    // Canonical config injected explicitly: the governed task.timeout wins
+    // per dispatch; these are adapter-level fallbacks/blocked-clock only.
+    taskTimeoutMs: cfgTaskTimeoutS * 1000,
+    blockedGraceMs: cfgDevinBlockedGraceMs,
     costGuard: () => {
       if (isCostHalted())
         return { allowed: false, reason: "COST_HALT: cost halt active (env or halt file) — all remote dispatch blocked" };
@@ -258,35 +279,51 @@ const executorCapSets = () =>
       }
     })
     .filter((s) => s.length);
+// THE ONE canonical LLM-plan preparation seam (Phase B R1 §7): sanitize +
+// deterministic PAIR_NATIVE contract enrichment. The failover winner-check
+// and the mission planner both run THIS function — the failover-validated
+// list, the pinned canonical_tasks, and the committed plan are the same
+// list by construction, never two subtly different transformations.
+const canonicalizeLlmTasks = (rawTasks, goal) => {
+  const { tasks } = sanitizePlan(rawTasks, LLM_PLANNER_CAPS, 5, executorCapSets());
+  if (!tasks.length) return [];
+  // PAIR_NATIVE tasks need an expected_output_contract worker_spec —
+  // the LLM cannot emit one, so inject the canonical write-file
+  // contract for any native-capability task that lacks it.
+  for (const t of tasks) {
+    if (!t.required_capabilities.includes("AUTOMATON_TASK_EXECUTION")) continue;
+    t.metadata ??= {};
+    if (t.metadata.expected_output_contract) continue;
+    t.metadata.expected_output_contract = {
+      type: "TASK_RESULT",
+      worker_spec: {
+        ops: [
+          { op: "write_text_file", path: "mission_goal.txt", content: goal, idempotency_class: "WRITE", risk_class: "MEDIUM" },
+          { op: "finish", result: { summary: "goal recorded" }, idempotency_class: "READ_ONLY", risk_class: "LOW" },
+        ],
+        limits: { max_ops: 4, timeout_seconds: 30 },
+        allowed_ops: ["write_text_file", "finish"],
+      },
+    };
+  }
+  return tasks;
+};
 const planner = (input) => {
   const goal = String(input.mission.goal);
+  // Phase B pinned plan: a confirmed preview carries the EXACT persisted
+  // canonical task list — return it verbatim (validatePlanProposal
+  // re-validates; commitPlan pins the manifest). The planner is never
+  // re-invoked for a pinned mission.
+  const pinned = input.mission?.metadata?.pinned_plan_tasks;
+  if (Array.isArray(pinned) && pinned.length) {
+    return { tasks: pinned };
+  }
   const llm = input.mission?.metadata?.llm_plan;
   if (Array.isArray(llm) && llm.length) {
-    // Safety re-check at the seam: sanitize again (defense in depth — the
-    // API edge already sanitized; validatePlanProposal validates next).
-    const { tasks } = sanitizePlan(llm, LLM_PLANNER_CAPS, 5, executorCapSets());
-    if (tasks.length) {
-      // PAIR_NATIVE tasks need an expected_output_contract worker_spec —
-      // the LLM cannot emit one, so inject the canonical write-file
-      // contract for any native-capability task that lacks it.
-      for (const t of tasks) {
-        if (!t.required_capabilities.includes("AUTOMATON_TASK_EXECUTION")) continue;
-        t.metadata ??= {};
-        if (t.metadata.expected_output_contract) continue;
-        t.metadata.expected_output_contract = {
-          type: "TASK_RESULT",
-          worker_spec: {
-            ops: [
-              { op: "write_text_file", path: "mission_goal.txt", content: goal, idempotency_class: "WRITE", risk_class: "MEDIUM" },
-              { op: "finish", result: { summary: "goal recorded" }, idempotency_class: "READ_ONLY", risk_class: "LOW" },
-            ],
-            limits: { max_ops: 4, timeout_seconds: 30 },
-            allowed_ops: ["write_text_file", "finish"],
-          },
-        };
-      }
-      return { tasks };
-    }
+    // Same canonical seam the failover used — sanitize + enrich + the
+    // downstream validatePlanProposal. Idempotent on its own output.
+    const tasks = canonicalizeLlmTasks(llm, goal);
+    if (tasks.length) return { tasks };
   }
   const tasks = [{
     task_key: "T1",
@@ -392,6 +429,7 @@ const control = new MissionControl({
   observability: new MissionObservability(service), selfmod, planner,
   schedules,
   costHaltFile: COST_HALT_FILE,
+  planPreviewTtlSeconds: cfgPreviewTtlS,
 });
 const business = new BusinessLayer({ store, control, schedules });
 const workforce = new WorkforceService({ store, business });
@@ -431,7 +469,11 @@ if (!persistedProjects.length) {
 
 // §4.2 — populate provider/model catalogs from canonical discovery sources
 // (dsh settings, executor-advertised observations). Read-only projections.
-let planProviders = [];
+// Phase B — ordered planner failover candidates (qualified at boot).
+const plannerCandidates = [];
+// DSH route-level failover: canonical model routes are registered for
+// every qualified DSH-pool model so task dispatch goes through route
+// decisions (RE_ROUTE failover between models on the same executor).
 let modelRoutesRegistered = 0;
 if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   const dres = runProviderDiscovery(store, {
@@ -567,17 +609,18 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     };
 
     // Planner pool: qualified separately, never bound to DSH_EXECUTOR_ID.
-    // Every qualified planner route joins the plan-time failover chain in
-    // boot priority order.
-    for (const r of plannerPool) {
+    // Phase B: collect EVERY qualified route in configured order — the
+    // failover chain walks them deterministically at plan time.
+    for (const r of plannerRefs) {
       const q = await qualifyRoute(r, false);
       if (q) {
-        planProviders.push({
-          route: r.ref,
+        plannerCandidates.push({
+          model_entry_id: r.model_entry_id,
+          ref: r.ref,
+          provider: r.pid,
+          model: r.mid,
           endpoint: endpointOf(q.prov),
           credentialEnv: String(q.prov.credential_reference_name ?? ""),
-          model: r.mid,
-          model_entry_id: r.model_entry_id,
         });
       }
     }
@@ -642,58 +685,119 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
 }
 sup.resume();
 
-// P-UI-6 plan expander: LLM-proposes a task DAG for the goal at the API
-// edge (preview only). Runs only when a provider route qualified at boot;
-// any failure → llmPlan falls back to the minimal T1 plan itself.
+// Phase B plan proposer: runs the canonical Planner failover chain at the
+// API edge — deterministic order, one whole canonically-valid plan wins.
+// R1: durable evidence — a `planner_run` row opens before the loop, every
+// attempt is persisted STARTED before the model is invoked and settled
+// after; exhaustion settles the run EXHAUSTED with all failed rows durable.
+// R1: zero eligible candidates with a configured pool →
+// FAIL_CLOSED_PLANNER_NO_ELIGIBLE — never a silent template/T1 fallback.
+const knownCapabilityIds = () =>
+  new Set(store.list("capability").map((c) => String(c.capability_id)));
 const planExpander = async (input) => {
-  if (!planProviders.length || typeof input.goal !== "string" || !input.goal.trim()) return input;
-  // Failover: try each qualified planner-pool route in boot priority order —
-  // a quota/timeout/http/parse failure on one model falls through to the
-  // next. Runtime role guard per attempt: the planner model must still hold
-  // PLANNER_COORDINATOR at plan time — a revoked or reassigned role fails
-  // that route closed rather than silently planning anyway.
-  const failedRoutes = [];
-  let res = null;
-  for (const p of planProviders) {
-    try {
-      assertPlannerModelRole(store, p.model_entry_id);
-    } catch (e) {
-      failedRoutes.push(`${p.route}:ROLE_${e.code ?? "REJECTED"}`);
-      continue;
-    }
-    const r = await llmPlan(String(input.goal), {
-      endpoint: `${p.endpoint}/chat/completions`,
-      credentialEnv: p.credentialEnv,
-      model: p.model,
-      timeoutMs: cfgPlannerTimeoutMs,
-      allowedCapabilities: LLM_PLANNER_CAPS,
-      capabilitySets: executorCapSets(),
-    });
-    if (r.tasks.length) {
-      res = r;
-      break;
-    }
-    failedRoutes.push(`${p.route}:${r.warnings?.[0] ?? "no_tasks"}`);
+  const candidates = dedupePlannerCandidates(plannerCandidates);
+  if (typeof input.goal !== "string" || !input.goal.trim()) {
+    return { input };
   }
-  if (!res) {
-    // Degenerate/unusable plan across the whole chain — fail closed: a
-    // T1-only plan would run and report COMPLETED having done nothing.
-    const e = new Error(`planner produced no usable task plan across ${planProviders.length} route(s) (${failedRoutes.join(" | ") || "none"})`);
-    e.code = "FAIL_CLOSED_PLAN_DEGENERATE";
+  const goal = String(input.goal);
+  // The planner_run row opens before any candidate check so even a
+  // zero-eligible request leaves durable canonical evidence (run FAILED
+  // / FAIL_CLOSED_PLANNER_NO_ELIGIBLE), never a silent template fallback.
+  const run = beginPlannerRun(store, {
+    project_id: input.project_id != null ? String(input.project_id) : undefined,
+    operator_id: input.operator_id,
+    routes: candidates.map((c) => c.ref),
+    actor: "PAIR_PLANNER",
+  });
+  try {
+    if (PLANNER_ROUTES.length && !candidates.length) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_NO_ELIGIBLE",
+        JSON.stringify({ configured_routes: PLANNER_ROUTES }),
+      );
+    }
+    const res = await runPlannerFailover({
+      candidates,
+      // §9 — full canonical eligibility re-proved before EVERY invocation
+      // (role still held, model usable, provider still eligible, never a
+      // DSH_EXECUTION model/alias borrowed into planning).
+      assertEligible: (c) => assertPlannerCandidateEligible(store, c.model_entry_id),
+      // §6/§7 — ONE canonical task-preparation seam: sanitize + native
+      // contract enrichment + the same validatePlanProposal the preview
+      // pins. A non-empty raw plan failing canonical validation is
+      // FAILED/PLAN_INVALID and the next candidate is tried.
+      canonicalize: (tasks) => {
+        const canon = canonicalizeLlmTasks(tasks, goal);
+        validatePlanProposal({ tasks: canon }, knownCapabilityIds());
+        return canon;
+      },
+      planFn: (c) =>
+        llmPlan(goal, {
+          endpoint: `${c.endpoint}/chat/completions`,
+          credentialEnv: c.credentialEnv,
+          model: c.model,
+          timeoutMs: cfgPlannerTimeoutMs,
+          allowedCapabilities: LLM_PLANNER_CAPS,
+          capabilitySets: executorCapSets(),
+        }),
+      onAttemptStart: (base) =>
+        persistPlannerAttemptStart(store, {
+          planner_run_id: String(run.planner_run_id),
+          project_id: input.project_id != null ? String(input.project_id) : undefined,
+          record: base,
+          actor: "PAIR_PLANNER",
+        }).planner_attempt_id,
+      onAttemptEnd: (paid, rec) =>
+        settlePlannerAttempt(store, {
+          planner_attempt_id: String(paid),
+          record: rec,
+          winner: rec.outcome === "SUCCESS",
+          actor: "PAIR_PLANNER",
+        }),
+      onExhausted: () =>
+        finishPlannerRun(store, {
+          planner_run_id: String(run.planner_run_id),
+          outcome: "EXHAUSTED",
+          actor: "PAIR_PLANNER",
+        }),
+    });
+    finishPlannerRun(store, {
+      planner_run_id: String(run.planner_run_id),
+      outcome: "WINNER_SELECTED",
+      winner_attempt_no: res.winner.attempt_no,
+      actor: "PAIR_PLANNER",
+    });
+    return {
+      input: {
+        ...input,
+        metadata: {
+          ...(typeof input.metadata === "object" && input.metadata ? input.metadata : {}),
+          llm_plan: res.tasks,
+          plan_source: "LLM",
+          plan_model: res.winner.model,
+          plan_warnings: res.warnings,
+        },
+      },
+      planner: {
+        planner_run_id: String(run.planner_run_id),
+        attempts: res.attempts,
+        winner: res.winner,
+        warnings: res.warnings,
+        allowed_capabilities: LLM_PLANNER_CAPS,
+        capability_sets: executorCapSets(),
+      },
+    };
+  } catch (e) {
+    if (!(e instanceof IntegrityError && e.code === "FAIL_CLOSED_PLANNER_EXHAUSTED")) {
+      finishPlannerRun(store, {
+        planner_run_id: String(run.planner_run_id),
+        outcome: "FAILED",
+        error_code: e instanceof IntegrityError || e instanceof PolicyError ? e.code : "REQUEST_ERROR",
+        actor: "PAIR_PLANNER",
+      });
+    }
     throw e;
   }
-  return {
-    ...input,
-    metadata: {
-      ...(typeof input.metadata === "object" && input.metadata ? input.metadata : {}),
-      llm_plan: res.tasks,
-      plan_source: res.source,
-      plan_model: res.model,
-      plan_warnings: failedRoutes.length
-        ? [...res.warnings, `LLM_PLANNER_FAILOVER ${failedRoutes.join(" | ")}`]
-        : res.warnings,
-    },
-  };
 };
 const uiDir = process.env.PAIR_MC_UI_DIR ?? path.join(root, "apps/mission-control-ui/dist");
 const server = createMissionControlServer({

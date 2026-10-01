@@ -41,7 +41,6 @@ import type { RecoveryController } from "./recovery-controller.js";
 import { classifyFailure } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
-import { missionPlanDigest } from "./mission-control.js";
 
 export const MISSION_RUNTIME_STATES = [
   "CREATED",
@@ -557,42 +556,6 @@ export class MissionRuntime {
     const knownCaps = new Set(
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
-    // Operator-confirmed plan: the server materialized (and verified) this
-    // task list at submit time — commit it verbatim. LLM planners are not
-    // deterministic, so re-planning here could never reproduce the
-    // confirmed digest and would silently run a different plan.
-    const pinned = (
-      (mission.metadata as Record<string, unknown> | undefined)?.pinned_plan
-    ) as { tasks?: Array<Record<string, unknown>>; digest?: string } | undefined;
-    if (pinned?.tasks && pinned.digest) {
-      // Recompute over the STORED mission-shaped fields (same ones the
-      // submit side digested via effectivePlanInput): authorized_workspaces
-      // + risk_ceiling live under mission.metadata already normalized.
-      const mMeta = (mission.metadata ?? {}) as Record<string, unknown>;
-      const expected = missionPlanDigest(
-        {
-          project_id: String(mission.project_id),
-          goal: String(mission.goal),
-          granted_permissions: mission.granted_permissions as string[] | undefined,
-          authorized_workspaces: mMeta.authorized_workspaces as string[] | undefined,
-          risk_ceiling: mMeta.risk_ceiling as string | undefined,
-        },
-        pinned.tasks,
-      );
-      if (expected !== String(pinned.digest)) {
-        throw new IntegrityError("FAIL_CLOSED_PLAN_DIGEST_MISMATCH", missionId);
-      }
-      const tasks = validatePlanProposal({ tasks: pinned.tasks }, knownCaps);
-      this.deps.service.commitPlan({
-        mission_id: missionId,
-        tasks: tasks as unknown as Array<Record<string, unknown>>,
-        source: "OPERATOR_CONFIRMED_PLAN",
-        reason: "pinned_plan",
-        proposal: { tasks: pinned.tasks },
-      });
-      this.transitionRuntime(missionId, "READY", "pinned_plan_committed");
-      return;
-    }
     const proposal = this.deps.planner({ mission, advice, reason: "initial" });
     const tasks = validatePlanProposal(proposal, knownCaps);
     this.deps.service.commitPlan({
@@ -620,6 +583,24 @@ export class MissionRuntime {
       return;
     }
 
+    // R4 §11 — compatibility repair: a runtime left RUNNING with a
+    // pending_recovery (the pre-fix "unhandled" fallthrough) resumes the
+    // governed recovery path on ordinary ticks — no store surgery needed.
+    // An action already proven unhandled is not re-driven (no transition
+    // spam); RECONCILIATION_REQUIRED is always re-driven — it is handled
+    // now and progresses to a bounded outcome.
+    const pendingRecovery = rt.pending_recovery as Record<string, unknown> | null;
+    if (pendingRecovery) {
+      const pendingAction = String(pendingRecovery.action);
+      if (
+        pendingAction === "RECONCILIATION_REQUIRED" ||
+        String(rt.reason ?? "") !== `unhandled:${pendingAction}`
+      ) {
+        this.applyPendingRecovery(missionId, now);
+        return;
+      }
+    }
+
     // 2. Observe in-flight executions → collect terminals.
     const inFlight = this.store
       .list("executor_execution")
@@ -642,12 +623,17 @@ export class MissionRuntime {
     const mission = this.deps.service.getMission(missionId);
     const barriers = (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
     const runnable = this.deps.scheduler.pickRunnable(missionId, {
-      isBlocked: (t) =>
-        barriers[String(t.task_id)] != null
-          ? `RECONCILIATION_BARRIER:${String(barriers[String(t.task_id)].kind)}`
-          : this.deps.approvals.hasPendingBlock(missionId, String(t.task_id))
-            ? "PENDING_APPROVAL"
-            : this.futureScheduledBlock(missionId, String(t.task_id), now),
+      isBlocked: (t) => {
+        const barrier = barriers[String(t.task_id)];
+        // R4 §9 — only an ACTIVE/unsettled barrier retains scheduling
+        // authority; a settled one is historical evidence, not a block.
+        if (barrier != null && barrier.settled !== true) {
+          return `RECONCILIATION_BARRIER:${String(barrier.kind)}`;
+        }
+        return this.deps.approvals.hasPendingBlock(missionId, String(t.task_id))
+          ? "PENDING_APPROVAL"
+          : this.futureScheduledBlock(missionId, String(t.task_id), now);
+      },
     });
     for (const task of runnable) {
       const request = this.requestFor(mission, task);
@@ -721,7 +707,7 @@ export class MissionRuntime {
 
   /* ---------------- settle + recovery entry ------------------------------- */
 
-  private settleExecution(missionId: string, executionId: string, opts: { sideEffectResolved?: boolean } = {}): void {
+  private settleExecution(missionId: string, executionId: string, settledReconciliation?: { outcome: string; reconciliation_id?: string }): void {
     const execution = this.store.get("executor_execution", executionId);
     const adapter = this.deps.adapters.get(String(execution.executor_id));
     if (!adapter) {
@@ -772,7 +758,7 @@ export class MissionRuntime {
       error_class: String(errorObj?.class ?? ""),
       result: (collected.result as Record<string, unknown>) ?? null,
     });
-    this.startRecovery(missionId, taskId, executionId, failureClass, undefined, { sideEffectResolved: opts.sideEffectResolved });
+    this.startRecovery(missionId, taskId, executionId, failureClass, undefined, settledReconciliation);
   }
 
   /**
@@ -786,7 +772,11 @@ export class MissionRuntime {
     executionId: string | null,
     failureClass: ReturnType<typeof classifyFailure>,
     now?: string,
-    opts: { sideEffectResolved?: boolean; consecutiveOverride?: boolean } = {},
+    /** R4 §8 — supplied when this failure chain already settled a
+     *  reconciliation for the same instance; forwarded to the decision
+     *  so the settled candidate is not re-selected forever. */
+    settledReconciliation?: { outcome: string; reconciliation_id?: string },
+    opts: { consecutiveOverride?: boolean } = {},
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -831,7 +821,7 @@ export class MissionRuntime {
         attempts_per_task: Number(ext.attempts_per_task ?? 0),
         attempts_per_mission: Number(ext.attempts_per_mission ?? 0),
       },
-      side_effect_resolved: opts.sideEffectResolved,
+      settled_reconciliation: settledReconciliation ?? null,
       consecutive_override: opts.consecutiveOverride,
       now,
     });
@@ -998,26 +988,6 @@ export class MissionRuntime {
         }
         break;
       }
-      case "RECONCILIATION_REQUIRED": {
-        const barriers = (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
-        const barrier = barriers[taskId];
-        if (barrier && !barrier.settled) {
-          this.transitionRuntime(missionId, "RECONCILING", "reconcile_pending");
-          break;
-        }
-        // Barrier settled (or missing): the side-effect question is
-        // resolved — re-decide so the next matrix action drives instead of
-        // looping reconciliation forever.
-        this.startRecovery(
-          missionId,
-          taskId,
-          pending.execution_id ? String(pending.execution_id) : null,
-          String(pending.failure_class ?? "UNKNOWN") as ReturnType<typeof classifyFailure>,
-          undefined,
-          { sideEffectResolved: true },
-        );
-        break;
-      }
       case "HUMAN_APPROVAL_REQUIRED": {
         // Reaching here means a RECOVERY_BUDGET_OVERRIDE approval was
         // granted (denials abort the mission in checkPendingApproval).
@@ -1025,20 +995,81 @@ export class MissionRuntime {
         // task already reconciled (settled barrier), skip selecting
         // RECONCILIATION_REQUIRED again — the extension would otherwise
         // be spent on a redundant reconcile cycle.
-        const barriers = (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
-        const resolved = !!barriers[taskId]?.settled;
+        const barrier = (
+          (rt.barriers as Record<string, Record<string, unknown>>) ?? {}
+        )[taskId];
+        const settled = barrier && barrier.settled === true
+          ? {
+              outcome: String(barrier.last_outcome ?? ""),
+              reconciliation_id: String(barrier.last_receipt_id ?? ""),
+            }
+          : undefined;
         this.startRecovery(
           missionId,
           taskId,
           pending.execution_id ? String(pending.execution_id) : null,
           String(pending.failure_class ?? "UNKNOWN") as ReturnType<typeof classifyFailure>,
-          undefined,
-          { sideEffectResolved: resolved, consecutiveOverride: true },
+          now,
+          settled,
+          { consecutiveOverride: true },
         );
         break;
       }
       case "APPLY_VERIFIED_REMEDIATION": {
         this.runRemediation(missionId, pending, now);
+        break;
+      }
+      case "RECONCILIATION_REQUIRED": {
+        // R4 §7 — the reconcile already ran and returned a verdict. When
+        // it proved CONFIRMED_NOT_EXECUTED, replay is safe from the
+        // side-effect perspective: the stale pending action is superseded
+        // and a FRESH governed recovery decision re-evaluates the next
+        // action (the settled candidate can never re-select itself).
+        const rt3 = this.runtimeEntity(missionId);
+        const barrier = (
+          (rt3.barriers as Record<string, Record<string, unknown>>) ?? {}
+        )[taskId];
+        const barrierOutcome = String(barrier?.last_outcome ?? "");
+        const pendingNow = rt3.pending_recovery as Record<string, unknown>;
+        if (
+          barrier &&
+          barrier.settled === true &&
+          barrierOutcome === "CONFIRMED_NOT_EXECUTED"
+        ) {
+          this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_confirmed_not_executed");
+          this.startRecovery(
+            missionId,
+            taskId,
+            pendingNow.execution_id ? String(pendingNow.execution_id) : null,
+            pendingNow.failure_class as ReturnType<typeof classifyFailure>,
+            now,
+            {
+              outcome: barrierOutcome,
+              reconciliation_id: String(barrier.last_receipt_id ?? ""),
+            },
+          );
+        } else if (barrier && barrier.settled === true) {
+          // Settled with any other verdict — the reconcile outcome was
+          // already applied (settle/escalate); the stale pending action
+          // is complete and must not keep re-driving.
+          this.clearPendingRecovery(missionId, "COMPLETED", `reconcile_outcome:${barrierOutcome}`);
+          this.transitionRuntime(missionId, "RUNNING", `reconcile_outcome:${barrierOutcome}`);
+        } else if (!barrier) {
+          // Pending reconciliation with no barrier evidence — a fresh
+          // governed decision re-drives; it may legitimately select
+          // RECONCILIATION_REQUIRED again and rebuild the barrier.
+          this.clearPendingRecovery(missionId, "COMPLETED", "reconcile_barrier_absent");
+          this.startRecovery(
+            missionId,
+            taskId,
+            pendingNow.execution_id ? String(pendingNow.execution_id) : null,
+            pendingNow.failure_class as ReturnType<typeof classifyFailure>,
+            now,
+          );
+        } else {
+          // Barrier still unsettled — let the RECONCILING path settle it.
+          this.transitionRuntime(missionId, "RECONCILING", "reconcile_pending");
+        }
         break;
       }
       default:
@@ -1268,16 +1299,18 @@ export class MissionRuntime {
           barrier.settled = true;
           this.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
           const execId = String(barrier.execution_id ?? "");
+          // RECONCILING must be left BEFORE the follow-up recovery decision:
+          // startRecovery's action scheduling (WAITING_BACKOFF/… targets)
+          // is only legal from RECOVERING.
+          this.transitionRuntime(missionId, "RECOVERING", "reconcile_failed");
           // Side effects are now known (failed) — the follow-up recovery
           // decision skips RECONCILIATION_REQUIRED and takes the next
           // matrix action instead of reconciling forever.
-          if (execId) this.settleExecution(missionId, execId, { sideEffectResolved: true });
-          // settleExecution→startRecovery already chose the follow-up
-          // state (WAITING_BACKOFF/RECONCILING/…) — only leave RECONCILING
-          // when it did not.
-          if (String(this.runtimeEntity(missionId).state) === "RECONCILING") {
-            this.transitionRuntime(missionId, "RECOVERING", "reconcile_failed");
-          }
+          if (execId)
+            this.settleExecution(missionId, execId, {
+              outcome: "CONFIRMED_FAILED",
+              reconciliation_id: String(barrier.last_receipt_id ?? ""),
+            });
           return;
         }
         case "UNKNOWN_SIDE_EFFECT_STATE":

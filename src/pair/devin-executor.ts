@@ -24,6 +24,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError, NotFoundError, PolicyError } from "./errors.js";
 import { atomicWriteJson, utcnow, workerExecutionId } from "./canonical.js";
+import { devinBlockedGraceMs, devinTaskTimeoutMs } from "./env-config.js";
 import { mintBrokerCapability } from "./broker-capability.js";
 import type { ExecutorAdapter } from "./adapter.js";
 
@@ -41,11 +42,6 @@ const DEFAULT_BASE_URL = "https://api.devin.ai";
 const DEFAULT_ORG_ID = "org-95faaf8c42dc4b2eb6d9e17a5fc5fe90";
 const DEFAULT_DEVIN_MODE = "swe-2-max";
 const DEVIN_MODE_FALLBACK = "swe-2-high";
-/** Remote sessions mapped to non-terminal states (e.g. `blocked` awaiting
- *  input) cannot hold a mission task open forever — past this deadline the
- *  execution is reported TIMEOUT and recovery takes over. */
-const DEFAULT_TASK_TIMEOUT_MS = 15 * 60_000;
-
 export interface DevinResponse {
   status: number;
   data: Record<string, unknown>;
@@ -73,9 +69,14 @@ export interface DevinAdapterDeps {
   baseUrl?: string;
   /** Injectable synchronous transport — omit to use the curl transport. */
   fetchFn?: DevinFetch;
-  /** Max wall-clock a remote session may stay non-terminal before the
-   *  execution reports TIMEOUT. Defaults: env PAIR_DEVIN_TASK_TIMEOUT_MS
-   *  → 15 minutes. */
+  /** FALLBACK wall-clock budget (ms) applied only when a dispatched task
+   *  carries no explicit `timeout` (the governed PAIR_TASK_TIMEOUT_S
+   *  contract, seconds). The per-execution effective budget is persisted as
+   *  `task_timeout_ms` at dispatch — observe() reads the persisted value so
+   *  restart/rehydration and later env changes can never move the goalposts
+   *  of an already-running execution. When this dep is omitted the legacy
+   *  env PAIR_DEVIN_TASK_TIMEOUT_MS is used as a validated compatibility
+   *  override (fail-closed bounds 5s–7200s), default 15 minutes. */
   taskTimeoutMs?: number;
   now?: () => string;
   /** Injectable epoch-ms clock for timeout checks — defaults Date.now. */
@@ -89,8 +90,10 @@ export interface DevinAdapterDeps {
   /** Grace window before a `blocked` remote session counts as
    *  REMOTE_INPUT_REQUIRED. `blocked` is also emitted transiently when a
    *  session's turn ends (waiting-for-user before `finished` flips) — failing
-   *  instantly kills completed-in-substance work. Defaults: env
-   *  PAIR_DEVIN_BLOCKED_GRACE_MS → 120000. */
+   *  instantly kills completed-in-substance work. This is a separate clock
+   *  from the task execution budget, never merged into it. When omitted the
+   *  env PAIR_DEVIN_BLOCKED_GRACE_MS is parsed fail-closed via env-config
+   *  (bounds 5s–1800s), default 120000. */
   blockedGraceMs?: number;
 }
 
@@ -178,10 +181,11 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     this.baseUrl = deps.baseUrl ?? DEFAULT_BASE_URL;
     this.devinMode = deps.devinMode ?? process.env.PAIR_DEVIN_MODE ?? DEFAULT_DEVIN_MODE;
     this.fetchFn = deps.fetchFn ?? curlFetch;
-    this.taskTimeoutMs =
-      deps.taskTimeoutMs ?? (Number(process.env.PAIR_DEVIN_TASK_TIMEOUT_MS ?? 0) || DEFAULT_TASK_TIMEOUT_MS);
-    this.blockedGraceMs =
-      deps.blockedGraceMs ?? (Number(process.env.PAIR_DEVIN_BLOCKED_GRACE_MS ?? 0) || 120_000);
+    // Canonical env-config seam (fail-closed validation): the legacy env
+    // knobs remain compatibility overrides only — the governed task.timeout
+    // always wins at dispatch time.
+    this.taskTimeoutMs = deps.taskTimeoutMs ?? devinTaskTimeoutMs();
+    this.blockedGraceMs = deps.blockedGraceMs ?? devinBlockedGraceMs();
     this.now = deps.now ?? utcnow;
     this.nowMs = deps.nowMs ?? Date.now;
     this.journalRoot = deps.journalRoot;
@@ -377,6 +381,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
         status: "FAILED",
         started_at: this.now(),
         finished_at: this.now(),
+        task_timeout_ms: this.effectiveTimeoutMs(task),
         remote_session_id: null,
         remote_url: null,
         budget_rejection: guard.reason ?? "cost guard rejected dispatch",
@@ -423,6 +428,10 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       status: "RUNNING",
       started_at: this.now(),
       finished_at: null,
+      // Governed dispatch contract: the effective execution budget for THIS
+      // execution, persisted so restart/rehydration and later env changes
+      // can never alter an already-running task's deadline.
+      task_timeout_ms: this.effectiveTimeoutMs(task),
       remote_session_id: sessionId ? `devin-${sessionId}` : null,
       remote_url: res.data.url ?? null,
       remote_devin_mode: usedMode,
@@ -444,10 +453,13 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     const remoteId = String(rec.remote_session_id ?? "");
     if (!remoteId) return { ...rec };
     const startedMs = Date.parse(String(rec.started_at ?? ""));
-    if (Number.isFinite(startedMs) && this.nowMs() - startedMs > this.taskTimeoutMs) {
+    // The execution's own persisted budget governs — the constructor fallback
+    // only applies to legacy journals written before task_timeout_ms existed.
+    const effectiveTimeoutMs = Number(rec.task_timeout_ms ?? this.taskTimeoutMs);
+    if (Number.isFinite(startedMs) && this.nowMs() - startedMs > effectiveTimeoutMs) {
       rec.status = "TIMEOUT";
       rec.finished_at = this.now();
-      rec.remote_timeout_ms = this.taskTimeoutMs;
+      rec.remote_timeout_ms = effectiveTimeoutMs;
       this.executions.set(executionId, rec);
       const { result: _t, ...out } = rec;
       return { ...out };
@@ -580,6 +592,15 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       return { dispatched: true, execution_id: executionId };
     }
     return { dispatched: false };
+  }
+
+  /** Effective execution budget for one dispatch: the governed task.timeout
+   *  (seconds, injected by MissionRuntime from metadata.timeout →
+   *  PAIR_TASK_TIMEOUT_S) wins; the constructor/env fallback applies only
+   *  when the task carries no explicit positive timeout. */
+  private effectiveTimeoutMs(task: Record<string, unknown>): number {
+    const s = Number(task.timeout);
+    return Number.isFinite(s) && s > 0 ? s * 1000 : this.taskTimeoutMs;
   }
 
   private requireRecord(executionId: string): Record<string, unknown> {

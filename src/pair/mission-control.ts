@@ -23,9 +23,21 @@ import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { projectRoutableModels } from "./model-routable.js";
-import { digest, sha256Hex, utcnow } from "./canonical.js";
+import { canonicalRiskCeiling, canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
+import {
+  assertPreviewWorkspaceAuthority,
+  createPlanPreview as persistPlanPreview,
+  consumePlanPreview,
+  effectiveInputDigest,
+  planDigest,
+  verifyPlanPreviewForConfirm,
+  PREVIEW_ENTITY,
+  ATTEMPT_ENTITY,
+  RUN_ENTITY,
+} from "./plan-preview.js";
+import type { PlannerAttemptRecord } from "./planner-pool.js";
 import type { RuntimePlanner } from "./mission-runtime.js";
 
 export interface MissionControlDeps {
@@ -47,6 +59,8 @@ export interface MissionControlDeps {
    *  dispatch is blocked (same effect as PAIR_COST_HALT=1, but flippable
    *  without a restart). */
   costHaltFile?: string;
+  /** Phase B: mission_plan_preview TTL in seconds (default 1800). */
+  planPreviewTtlSeconds?: number;
 }
 
 export interface MissionPlanInput {
@@ -56,35 +70,6 @@ export interface MissionPlanInput {
   granted_permissions?: string[];
   authorized_workspaces?: string[];
   risk_ceiling?: string;
-}
-
-/** Effective mission-shaped plan input: mirrors what createMission
- * stores (resolved workspace paths, effective risk ceiling) so the digest
- * covers the authority the mission actually runs with — and matches what
- * the runtime can recompute from the stored row. */
-export function effectivePlanInput(input: MissionPlanInput, projectRoot: string): MissionPlanInput {
-  return {
-    project_id: input.project_id,
-    goal: input.goal,
-    granted_permissions: input.granted_permissions ?? [],
-    authorized_workspaces: (input.authorized_workspaces ?? [projectRoot]).map((p) =>
-      path.resolve(p),
-    ),
-    risk_ceiling: input.risk_ceiling ?? "HIGH",
-  };
-}
-
-/** Canonical plan digest — same field set at preview, confirm and
- * commit time, so a drift in any of them fails closed. */
-export function missionPlanDigest(input: MissionPlanInput, tasks: unknown): string {
-  return digest({
-    project_id: input.project_id,
-    goal: input.goal,
-    granted_permissions: input.granted_permissions ?? [],
-    authorized_workspaces: input.authorized_workspaces ?? [],
-    risk_ceiling: input.risk_ceiling ?? null,
-    tasks,
-  });
 }
 
 function requireOperator(operatorId: string | undefined): string {
@@ -347,6 +332,7 @@ export class MissionControl {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "mission_control.preview");
     }
+    const workspaces = this.normalizeMissionWorkspaces(input);
     // Planner sees only the mission fields it legitimately reads — the same
     // record shape the runtime will later build from the created entity.
     const pseudoMission: Record<string, unknown> = {
@@ -355,18 +341,22 @@ export class MissionControl {
       goal: input.goal,
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
-      authorized_workspaces: input.authorized_workspaces ?? [],
-      risk_ceiling: input.risk_ceiling ?? null,
+      authorized_workspaces: workspaces,
+      risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
     };
     const proposal = this.deps.planner({ mission: pseudoMission, advice: null, reason: "initial" });
     const knownCaps = new Set(
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
-    const plan_digest = missionPlanDigest(
-      effectivePlanInput(input, String(this.deps.service.getProject(input.project_id).root_location)),
+    const plan_digest = digest({
+      project_id: input.project_id,
+      goal: input.goal,
+      granted_permissions: input.granted_permissions ?? [],
+      authorized_workspaces: workspaces,
+      risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
       tasks,
-    );
+    });
     return {
       plan: { tasks: tasks as unknown as Array<Record<string, unknown>> },
       plan_digest,
@@ -375,6 +365,339 @@ export class MissionControl {
       plan_source: (input.metadata?.plan_source as string | undefined) ?? null,
       plan_model: (input.metadata?.plan_model as string | undefined) ?? null,
     };
+  }
+
+  /* ---------------- Phase B — durable pinned plan ------------------------- */
+
+  /**
+   * R4 §2/§3 — canonical mission-input normalization seam. A mission input
+   * with no explicit workspace authority inherits its project's canonical
+   * root_location — resolved ONCE here, before planning/digest, so the
+   * effective input is identical across preview, pinned mission_input,
+   * confirm replay, and the created mission. An explicit non-empty caller
+   * list passes through verbatim; a project without a usable root fails
+   * closed (never the literal "undefined"). Explicit values are NOT
+   * re-validated here — GovernedTaskGate authorizes them at dispatch.
+   */
+  private normalizeMissionWorkspaces(input: {
+    project_id: string;
+    authorized_workspaces?: string[];
+  }): string[] {
+    const supplied = input.authorized_workspaces;
+    if (Array.isArray(supplied) && supplied.length > 0) {
+      // R6 — every entry canonicalized through the single workspace seam so
+      // the digested/persisted authority is byte-for-byte what the mission
+      // will store. Invalid entries fail closed, ordering preserved.
+      return supplied.map((w) => canonicalWorkspacePath(w));
+    }
+    const project = this.store.tryGet("project", String(input.project_id)) as
+      | Record<string, unknown>
+      | null;
+    const root = project?.root_location;
+    if (typeof root !== "string" || root.trim() === "") {
+      throw new PolicyError(
+        "FAIL_CLOSED_NO_AUTHORIZED_WORKSPACE",
+        `project:${String(input.project_id)}: no canonical root_location and no authorized_workspaces supplied`,
+      );
+    }
+    return [canonicalWorkspacePath(root)];
+  }
+
+  /**
+   * §9/§13 — create a durable canonical `mission_plan_preview`: canonicalize
+   * the effective input, run the (already failover-executed) task list
+   * through the canonical validator, pin digests, persist preview + all
+   * planner_attempt evidence in ONE transaction. The RESPONSE is derived
+   * from the persisted row — persist A, return A, never a transformed B.
+   *
+   * `planner` is the failover evidence produced at the API edge
+   * (attempts/winner/warnings/caps). When absent (no planner configured —
+   * deterministic template path), attempts is empty and winner null.
+   */
+  createPlanPreview(
+    input: {
+      project_id: string;
+      goal: string;
+      metadata?: Record<string, unknown>;
+      granted_permissions?: string[];
+      authorized_workspaces?: string[];
+      risk_ceiling?: string;
+      operator_id?: string;
+    },
+    plannerEvidence?: {
+      /** R1 durable-run id — attempts were persisted during failover and
+       *  get linked to the preview here (atomically). */
+      planner_run_id?: string;
+      attempts: PlannerAttemptRecord[];
+      winner: PlannerAttemptRecord | null;
+      warnings: string[];
+      allowed_capabilities?: string[];
+      capability_sets?: string[][];
+    },
+  ): Record<string, unknown> {
+    if (!this.deps.planner) {
+      throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "mission_control.preview");
+    }
+    // Foundation V2 invariant also guards the preview seam: a caller-pinned
+    // mission_id can never flow through a preview into creation.
+    if ((input as { mission_id?: unknown }).mission_id != null) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_MISSION_ID_PUBLIC",
+        "mission_id pinning is internal-only — public mission creation mints its own id",
+      );
+    }
+    const workspaces = this.normalizeMissionWorkspaces(input);
+    const risk = canonicalRiskCeiling(input.risk_ceiling);
+    const pseudoMission: Record<string, unknown> = {
+      mission_id: "__preview__",
+      project_id: input.project_id,
+      goal: input.goal,
+      metadata: input.metadata ?? {},
+      granted_permissions: input.granted_permissions ?? [],
+      authorized_workspaces: workspaces,
+      risk_ceiling: risk,
+    };
+    const proposal = this.deps.planner({ mission: pseudoMission, advice: null, reason: "initial" });
+    const knownCaps = new Set(
+      this.store.list("capability").map((c) => String(c.capability_id)),
+    );
+    const tasks = validatePlanProposal(proposal, knownCaps);
+    const eid = effectiveInputDigest({
+      project_id: input.project_id,
+      goal: input.goal,
+      granted_permissions: input.granted_permissions,
+      authorized_workspaces: workspaces,
+      risk_ceiling: risk,
+      operator_id: input.operator_id,
+      allowed_capabilities: plannerEvidence?.allowed_capabilities,
+      capability_sets: plannerEvidence?.capability_sets,
+    });
+    const pd = planDigest({
+      project_id: input.project_id,
+      effective_input_digest: eid,
+      tasks,
+      granted_permissions: input.granted_permissions,
+      authorized_workspaces: workspaces,
+      risk_ceiling: risk,
+    });
+    const row = persistPlanPreview(this.store, {
+      missionInput: {
+        project_id: input.project_id,
+        goal: input.goal,
+        metadata: input.metadata ?? {},
+        granted_permissions: input.granted_permissions ?? [],
+        authorized_workspaces: workspaces,
+        risk_ceiling: risk,
+        operator_id: input.operator_id ?? null,
+      },
+      effective_input_digest: eid,
+      plan_digest: pd,
+      canonical_tasks: tasks as unknown as Array<Record<string, unknown>>,
+      attempts: plannerEvidence?.attempts ?? [],
+      winner: plannerEvidence?.winner ?? null,
+      planner_run_id: plannerEvidence?.planner_run_id,
+      operator_id: input.operator_id,
+      ttlSeconds: this.deps.planPreviewTtlSeconds,
+    });
+    return {
+      preview_id: row.preview_id,
+      plan_digest: row.plan_digest,
+      effective_input_digest: row.effective_input_digest,
+      plan: { tasks: row.canonical_tasks },
+      planner: row.planner ?? null,
+      planner_attempt_id: row.planner_attempt_id ?? null,
+      planner_run_id: row.planner_run_id ?? null,
+      expires_at: row.expires_at,
+      state: row.state,
+      plan_source: plannerEvidence?.winner ? "LLM" : "TEMPLATE",
+      plan_model: plannerEvidence?.winner?.model ?? null,
+      warnings: plannerEvidence?.warnings ?? [],
+    };
+  }
+
+  /**
+   * §14–§16, §28 — confirm a persisted preview. Loads the canonical row,
+   * verifies digest/expiry/authority, then in ONE store transaction creates
+   * the mission carrying `pinned_plan_tasks` = preview.canonical_tasks and
+   * consumes the preview (CAS READY→CONSUMED + consumed_mission_id). A retry
+   * of an already-consumed preview returns the same mission — ONE preview
+   * → AT MOST ONE mission.
+   */
+  confirmPlanPreview(input: {
+    preview_id: string;
+    plan_digest: string;
+    operator_id?: string;
+  }): Record<string, unknown> {
+    const result = this.store.immediate(() => {
+      const v = verifyPlanPreviewForConfirm(this.store, {
+        preview_id: input.preview_id,
+        plan_digest: input.plan_digest,
+        operator_id: input.operator_id,
+      });
+      if (v.mode === "ALREADY_CONSUMED") {
+        const existing = this.deps.service.getMission(v.mission_id);
+        return { mission: existing, already: true };
+      }
+      const mi = v.preview.mission_input as Record<string, unknown>;
+      // §14.6/§19 — rerun canonical plan validation on the PERSISTED tasks
+      // before committing them: a digest match is not validity.
+      const knownCaps = new Set(
+        this.store.list("capability").map((c) => String(c.capability_id)),
+      );
+      validatePlanProposal(
+        { tasks: v.preview.canonical_tasks },
+        knownCaps,
+      );
+      // R5 — replay persisted authority VERBATIM. Normalization already ran
+      // before the persisted digests at preview creation; confirm may only
+      // validate what was pinned, never widen it. A READY preview without
+      // valid canonical workspace authority fails closed (regenerate a fresh
+      // preview); it is not consumed and nothing is mutated.
+      const authorizedWorkspaces = assertPreviewWorkspaceAuthority(mi);
+      const miMeta = (mi.metadata as Record<string, unknown> | undefined) ?? {};
+      const metadata = {
+        ...((mi.metadata as Record<string, unknown> | undefined) ?? {}),
+        pinned_plan: {
+          preview_id: v.preview.preview_id,
+          plan_digest: v.preview.plan_digest,
+          planner_attempt_id: v.preview.planner_attempt_id ?? null,
+          planner: v.preview.planner ?? null,
+        },
+        // What the serve-side template planner returns verbatim — the exact
+        // persisted canonical tasks, never re-planned.
+        pinned_plan_tasks: v.preview.canonical_tasks,
+        // plan_source records WHO planned it (LLM/expander/template) — the
+        // pinned provenance lives under pinned_plan.
+        plan_source: miMeta.plan_source ?? (v.preview.planner ? "LLM" : "PINNED_PREVIEW"),
+        plan_model: miMeta.plan_model ?? (v.preview.planner as Record<string, unknown> | null)?.model ?? null,
+      };
+      const mission = this.createMissionFromPreview({
+        project_id: String(mi.project_id),
+        goal: String(mi.goal),
+        metadata,
+        granted_permissions: (mi.granted_permissions as string[] | undefined) ?? [],
+        authorized_workspaces: authorizedWorkspaces,
+        risk_ceiling: (mi.risk_ceiling as string | undefined) ?? undefined,
+        operator_id: input.operator_id,
+      });
+      consumePlanPreview(this.store, v.preview, String(mission.mission_id));
+      return { mission, already: false };
+    });
+    if (!result.already) {
+      this.deps.runtime.runtimeEntity(String(result.mission.mission_id));
+      this.deps.supervisor.wake(String(result.mission.mission_id), "MISSION_CREATED");
+    }
+    return result.mission;
+  }
+
+  /**
+   * The mission-create half of startMissionInternal, callable inside an
+   * outer store.immediate() so preview-consume and mission-create commit
+   * atomically. Same P12/P13 pinning as the public path — bound missions
+   * keep using startBoundMission (they never carry a UI preview).
+   */
+  private createMissionFromPreview(input: {
+    project_id: string;
+    goal: string;
+    metadata?: Record<string, unknown>;
+    granted_permissions?: string[];
+    authorized_workspaces?: string[];
+    risk_ceiling?: string;
+    operator_id?: string;
+  }): Record<string, unknown> {
+    if ((input as { mission_id?: unknown }).mission_id != null) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_MISSION_ID_PUBLIC",
+        "mission_id pinning is internal-only",
+      );
+    }
+    const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
+    if (boundAgentId) {
+      try {
+        metadata.agent_contract = this.deps.service.agentContracts.pin(boundAgentId, {
+          businessId: metadata.business_id ? String(metadata.business_id) : null,
+          projectId: input.project_id,
+          actor: `operator:${input.operator_id ?? "system"}`,
+        });
+      } catch (e) {
+        if (e instanceof PolicyError || e instanceof IntegrityError) {
+          this.deps.service.agentContracts.auditDenial(
+            (e as { code?: string }).code ?? "FAIL_CLOSED_AGENT_POLICY",
+            (e as Error).message,
+            { agentId: boundAgentId },
+          );
+        }
+        throw e;
+      }
+    }
+    let canonicalBizId: string | null = null;
+    if (boundAgentId) {
+      const agent = this.deps.service.store.tryGet("org_agent", boundAgentId) as
+        | Record<string, unknown>
+        | null;
+      if (!agent) {
+        throw new IntegrityError("FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH", `agent:${boundAgentId} unknown`);
+      }
+      canonicalBizId = String(agent.business_id);
+      const canonicalDept = agent.department == null ? null : String(agent.department);
+      if (metadata.business_id != null && String(metadata.business_id) !== canonicalBizId) {
+        throw new IntegrityError("FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH", `business_id:${String(metadata.business_id)}!=${canonicalBizId}`);
+      }
+      if (metadata.department != null && canonicalDept != null && String(metadata.department) !== canonicalDept) {
+        throw new IntegrityError("FAIL_CLOSED_BUSINESS_CONTEXT_MISMATCH", `department:${String(metadata.department)}!=${canonicalDept}`);
+      }
+      metadata.business_id = canonicalBizId;
+      if (canonicalDept != null) metadata.department = canonicalDept;
+    }
+    if (metadata.business_id) {
+      const bizId = String(metadata.business_id);
+      const biz = this.deps.service.store.tryGet("business", bizId) as
+        | Record<string, unknown>
+        | null;
+      if (!biz) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_BUSINESS_UNKNOWN", bizId);
+      }
+      if (String(biz.project_id) !== String(input.project_id)) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_CROSS_BUSINESS", `${bizId}:${String(input.project_id)}`);
+      }
+      if (boundAgentId && canonicalBizId !== bizId) {
+        throw new IntegrityError("FAIL_CLOSED_SECRET_AGENT_REF", boundAgentId);
+      }
+    }
+    metadata.business_context = {
+      business_id: metadata.business_id != null ? String(metadata.business_id) : null,
+      org_agent_id: boundAgentId,
+      department: metadata.department != null ? String(metadata.department) : null,
+      project_id: String(input.project_id),
+      provenance: boundAgentId ? "org_agent" : "caller",
+      pinned_at: utcnow(),
+    };
+    metadata.secret_grants = this.deps.service.secretPolicies.pinForMission({
+      businessId: metadata.business_id ? String(metadata.business_id) : null,
+    });
+    return this.deps.service.createMission({
+      project_id: input.project_id,
+      goal: input.goal,
+      metadata,
+      granted_permissions: input.granted_permissions ?? [],
+      authorized_workspaces: input.authorized_workspaces,
+      risk_ceiling: input.risk_ceiling,
+    });
+  }
+
+  /** Safe read model for a persisted preview + its planner attempts. */
+  planPreview(previewId: string): Record<string, unknown> {
+    const row = this.store.tryGet(PREVIEW_ENTITY, String(previewId));
+    if (!row) throw new NotFoundError(`mission_plan_preview:${previewId}`);
+    const attempts = this.store
+      .list(ATTEMPT_ENTITY)
+      .filter((a) => String(a.preview_id) === String(previewId))
+      .sort((a, b) => Number(a.attempt_no) - Number(b.attempt_no));
+    const plannerRun = row.planner_run_id
+      ? this.store.tryGet(RUN_ENTITY, String(row.planner_run_id))
+      : null;
+    return { preview: row, planner_attempts: attempts, planner_run: plannerRun };
   }
 
   /** Create + queue a mission for orchestration. */
@@ -388,9 +711,6 @@ export class MissionControl {
     operator_id?: string;
     /** §4.3 two-step submit: the plan digest returned by previewMission. */
     confirm_plan?: { digest: string };
-    /** Server-materialized plan — internal callers only (the public POST
-     * /api/missions path pins it from the server's own preview). */
-    plan?: { tasks: Array<Record<string, unknown>> };
   }): Record<string, unknown> {
     // Foundation V2 §1/§8: the generic Mission Control API must never
     // accept a caller-pinned mission identity — bound identity is minted
@@ -425,7 +745,6 @@ export class MissionControl {
     risk_ceiling?: string;
     operator_id?: string;
     confirm_plan?: { digest: string };
-    plan?: { tasks: Array<Record<string, unknown>> };
   }): Record<string, unknown> {
     const openId = String(input.binding_open_id);
     // Step 1 — the binding itself must be canonically valid (identity,
@@ -529,34 +848,16 @@ export class MissionControl {
       risk_ceiling?: string;
       operator_id?: string;
       confirm_plan?: { digest: string };
-      /** Server-materialized plan (from previewMission). Carrying it pins
-       * these tasks as THE plan — LLM planners are non-deterministic, so a
-       * second plan materialization can never reproduce the confirmed
-       * digest. */
-      plan?: { tasks: Array<Record<string, unknown>> };
     },
     binding: Record<string, unknown> | undefined,
   ): Record<string, unknown> {
-    const planInput = input.plan
-      ? effectivePlanInput(input, String(this.deps.service.getProject(input.project_id).root_location))
-      : null;
     if (input.confirm_plan?.digest) {
-      const expected = planInput
-        ? missionPlanDigest(planInput, input.plan!.tasks)
-        : this.previewMission(input).plan_digest;
-      if (expected !== input.confirm_plan.digest) {
+      const preview = this.previewMission(input);
+      if (preview.plan_digest !== input.confirm_plan.digest) {
         throw new PolicyError("FAIL_CLOSED_PLAN_DIGEST_MISMATCH", String(input.confirm_plan.digest).slice(0, 16));
       }
     }
     const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
-    if (input.plan && planInput) {
-      // The operator confirmed (or the server just produced) this exact plan
-      // — the runtime commits it verbatim instead of re-planning.
-      metadata.pinned_plan = {
-        tasks: input.plan.tasks,
-        digest: missionPlanDigest(planInput, input.plan.tasks),
-      };
-    }
     const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
     if (boundAgentId) {
       // P12: a mission bound to an org_agent pins its agent execution
@@ -653,22 +954,23 @@ export class MissionControl {
     metadata.secret_grants = this.deps.service.secretPolicies.pinForMission({
       businessId: metadata.business_id ? String(metadata.business_id) : null,
     });
+    const workspaces = this.normalizeMissionWorkspaces(input);
     const mission = binding
       ? this.deps.service.createBoundMission(binding, {
           project_id: input.project_id,
           goal: input.goal,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
-          authorized_workspaces: input.authorized_workspaces,
-          risk_ceiling: input.risk_ceiling,
+          authorized_workspaces: workspaces,
+          risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
         })
       : this.deps.service.createMission({
           project_id: input.project_id,
           goal: input.goal,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
-          authorized_workspaces: input.authorized_workspaces,
-          risk_ceiling: input.risk_ceiling,
+          authorized_workspaces: workspaces,
+          risk_ceiling: canonicalRiskCeiling(input.risk_ceiling),
         });
     this.deps.runtime.runtimeEntity(String(mission.mission_id));
     this.deps.supervisor.wake(String(mission.mission_id), "MISSION_CREATED");
@@ -933,18 +1235,17 @@ export class MissionControl {
     const defaultProject = String(this.store.list("project")[0]?.project_id ?? "");
     return this.deps.schedules.fireDue(
       async (input) => {
-        const expanded = expander ? await expander(input as Record<string, unknown>) : input;
-        const preview = this.previewMission({
-          project_id: (expanded.project_id as string | undefined) || defaultProject,
-          goal: String(expanded.goal ?? input.goal),
-          metadata: (expanded.metadata ?? input.metadata) as Record<string, unknown> | undefined,
-        });
-        return this.startMission({
-          ...expanded,
-          project_id: (expanded.project_id as string | undefined) || defaultProject,
-          goal: String(expanded.goal ?? input.goal),
-          confirm_plan: { digest: preview.plan_digest },
-          plan: preview.plan,
+        const expanded = expander ? await expander(input as Record<string, unknown>) : { input };
+        const exInput = (expanded as { input?: unknown }).input ?? expanded;
+        const plannerEvidence = (expanded as { planner?: never }).planner;
+        const preview = this.createPlanPreview({
+          project_id: String((exInput as Record<string, unknown>).project_id ?? defaultProject),
+          goal: String((exInput as Record<string, unknown>).goal ?? input.goal),
+          metadata: (exInput as Record<string, unknown>).metadata as Record<string, unknown> | undefined,
+        }, plannerEvidence);
+        return this.confirmPlanPreview({
+          preview_id: String(preview.preview_id),
+          plan_digest: String(preview.plan_digest),
         });
       },
       now,

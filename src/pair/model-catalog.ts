@@ -319,6 +319,11 @@ export class ModelEvidenceCatalog {
     body.current_qualification_receipt_id = receipt.receipt_id;
     body.lifecycle_state = "QUALIFIED";
     body.last_qualified_at = receipt.issued_at;
+    // Successful canonical qualification supersedes a historical STALE
+    // marker — model state must not stay internally contradictory.
+    // REMOVED/DEPRECATED/BLOCKED cannot reach here (qualification gates
+    // fail first); REAPPEARED is informational history and is preserved.
+    body.conditions = ((entry.conditions as string[]) ?? []).filter((c) => c !== "STALE").sort();
     this.put(modelEntryId, body, opts.actor ?? "PAIR_MODEL_CATALOG", "MODEL_QUALIFIED");
     return receipt;
   }
