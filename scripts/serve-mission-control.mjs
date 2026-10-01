@@ -71,6 +71,7 @@ import {
   llmPlannerTimeoutMs,
   taskTimeoutSeconds,
   planPreviewTtlSeconds,
+  devinBlockedGraceMs,
   resolveMcToken,
   runPlannerFailover,
   dedupePlannerCandidates,
@@ -109,6 +110,8 @@ const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_M
 const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
 const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
+const cfgDevinBlockedGraceMs = devinBlockedGraceMs(); // PAIR_DEVIN_BLOCKED_GRACE_MS (ms, 5000..1800000) — blocked-clock only, never the task budget
+console.log(`EXEC_TIMEOUT: canonical governed budget PAIR_TASK_TIMEOUT_S=${cfgTaskTimeoutS}s → task.timeout (all executors) | Devin blockedGraceMs=${cfgDevinBlockedGraceMs} (separate blocked clock)`);
 
 // Phase A — MC token: explicit env > persistent file > generated 256-bit
 // (chmod 600). No static defaults anywhere; server + bridge share this seam.
@@ -205,6 +208,10 @@ governed.set(
   DEVIN_EXECUTOR_ID,
   new DevinExecutorAdapter({
     journalRoot,
+    // Canonical config injected explicitly: the governed task.timeout wins
+    // per dispatch; these are adapter-level fallbacks/blocked-clock only.
+    taskTimeoutMs: cfgTaskTimeoutS * 1000,
+    blockedGraceMs: cfgDevinBlockedGraceMs,
     costGuard: () => {
       if (isCostHalted())
         return { allowed: false, reason: "COST_HALT: cost halt active (env or halt file) — all remote dispatch blocked" };

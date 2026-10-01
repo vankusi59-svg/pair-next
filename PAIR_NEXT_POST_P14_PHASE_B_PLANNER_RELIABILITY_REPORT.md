@@ -468,3 +468,79 @@ Live verification on prod :8788 (post-restart):
 - `POST /api/missions/preview` → gemini planner SUCCESS, preview
   `MPP_01M3V4GZZETY1KGY06ZX688HRJ`, plan_digest `6b361ade…`, 2 tasks — no manual
   sqlite cleanup.
+
+## PRE-MERGE EXECUTOR TIMEOUT GOVERNANCE HOTFIX
+
+Audited pre-hotfix HEAD: `57d47830eae6e6d01ec1d9134c535124124a79b8`.
+
+### Previous behavior
+- DSH (`acp-executor.ts`) and Codex (`codex-adapter.ts`) consumed `task.timeout`
+  → canonical `PAIR_TASK_TIMEOUT_S` budget respected.
+- Devin IGNORED `task.timeout`: `observe()` compared elapsed against
+  `this.taskTimeoutMs` — an adapter-construction value from
+  `PAIR_DEVIN_TASK_TIMEOUT_MS` (default 15min) via `Number(env)||default`
+  (unvalidated). Not persisted per execution; env changes after dispatch and
+  restart could silently move the deadline.
+- `PAIR_DEVIN_BLOCKED_GRACE_MS` also parsed via `Number(env)||120_000`.
+
+### New canonical semantics
+- `MissionRuntime.requestFor` injects `timeout = metadata.timeout ??
+  PAIR_TASK_TIMEOUT_S` (explicit governed task metadata > canonical env) into
+  every governed request — unchanged.
+- `DevinExecutorAdapter.effectiveTimeoutMs(task)`: governed `task.timeout`
+  (seconds) wins; falls back to adapter `taskTimeoutMs` only when the task
+  carries no positive timeout. `task_timeout_ms` persisted in
+  `devin-dispatch.json` at dispatch. `observe()` reads `rec.task_timeout_ms`
+  (constructor fallback only for pre-hotfix legacy journals) — restart-safe,
+  immune to later env drift.
+- `PAIR_DEVIN_TASK_TIMEOUT_MS` retained ONLY as validated compatibility
+  override (env-config `DEVIN_TASK_TIMEOUT`, ms, 5000–7200000, default
+  900000): used solely when no task timeout exists — never overrides
+  `task.timeout`.
+- `PAIR_DEVIN_BLOCKED_GRACE_MS` → env-config `DEVIN_BLOCKED_GRACE`
+  (ms, 5000–1800000, default 120000), fail-closed like the other knobs.
+  `serve-mission-control.mjs` injects `blockedGraceMs: devinBlockedGraceMs()`
+  + `taskTimeoutMs: cfgTaskTimeoutS*1000` (canonical fallback, not the
+  task authority). Separate clock: `blocked` status → grace →
+  REMOTE_INPUT_REQUIRED; unrelated to the execution budget.
+- Boot prints `EXEC_TIMEOUT: PAIR_TASK_TIMEOUT_S=Ns → task.timeout (all
+  executors) | Devin blockedGraceMs=M (separate blocked clock)`.
+
+### Tests (pair-phase-b.test.ts — hotfix describe, A–N)
+A/B: spy-router — `taskTimeoutSeconds:1800` → request.timeout=1800; plan task
+`metadata.timeout=999` → request.timeout=999 (precedence).
+C: DSH fake-ACP `HANG_FOREVER` + `task.timeout=2` → TIMEOUT ≈2s (≠300s default).
+D: Codex hang fixture + `task.timeout=2` → TIMEOUT (process-level kill).
+E: dispatch timeout=1800 → record + journal `task_timeout_ms=1_800_000`.
+F/M: remote `working` at +121s → RUNNING (grace never = budget); past 1800s →
+TIMEOUT with `remote_timeout_ms=1_800_000`.
+G/H: fresh adapter with env changed to 600s → persisted 1800s still governs
+(RUNNING at +700s, TIMEOUT at +1900s).
+I/J: `devinBlockedGraceMs` valid/bounds/fail-closed matrix; compat env.
+K: blocked > grace → FAILED + REMOTE_INPUT_REQUIRED, no `remote_timeout_ms`
+(neither status nor evidence masquerades as task timeout).
+L: blocked + DONE sentinel → COMPLETED (unchanged).
+N: constructor reads `PAIR_DEVIN_BLOCKED_GRACE_MS=15000` env → FAILED at 16s.
+
+### Regression
+Phase B focused 78/78 (+10). Full suite 2362 pass / 2 fail — same pre-existing
+P5 executor-registration env failures as base `2277319` (documented). tsc clean,
+pnpm build clean.
+
+### Live evidence (:8799, PAIR_MC_DIR copy of pair-mc-b1)
+- `PAIR_TASK_TIMEOUT_S=600 PAIR_DEVIN_BLOCKED_GRACE_MS=300000` → boot prints
+  `EXEC_TIMEOUT: ... =600s ... blockedGraceMs=300000` → server UP, all routes
+  QUALIFIED.
+- `PAIR_DEVIN_BLOCKED_GRACE_MS=300` → `FAIL_CLOSED_CONFIG_INVALID ... outside
+  bounds 5000..1800000ms` (abort before listen); `=abc` → non-integer fail.
+- Real Devin dispatch (task.timeout=600, one session then cancelled):
+  journal `task_timeout_ms=600000`; fresh adapter rehydrate → RUNNING with
+  persisted budget intact. DSH/Codex consumption proven deterministically by
+  tests C/D (real subprocess fixtures).
+
+### Limitations
+- `blocked_since` is not journaled across restart (pre-existing: observe()
+  never rewrites the dispatch record); the task budget clock itself is
+  restart-exact since started_at + task_timeout_ms persist.
+- `PAIR_DEVIN_BLOCKED_GRACE_MS=300` in the spec's example is below the
+  documented 5s min — flagged, used 300000 for the valid-path smoke.

@@ -57,6 +57,12 @@ import {
   ProviderCatalog,
   ModelEvidenceCatalog,
   MODEL_ROLE,
+  DevinExecutorAdapter,
+  DshExecutorAdapter,
+  CodexCliExecutorAdapter,
+  devinBlockedGraceMs,
+  devinTaskTimeoutMs,
+  type DevinFetch,
   type PlannerAttemptRecord,
   type PlannerCandidate,
 } from "../pair/index.js";
@@ -108,7 +114,7 @@ function makeCtx(n: string, opts: { planner?: (i: unknown) => unknown; plannerCa
   });
   service.registerCapability("FILE_OPERATIONS", { risk_class: "LOW" });
   const project = service.createProject({ name: n, root_location: workspace });
-  return { dir, workspace, store, service, control, runtime, plannerCalls, projectId: String(project.project_id) };
+  return { dir, workspace, store, service, control, runtime, plannerCalls, projectId: String(project.project_id), gate, recon, approvals, scheduler, recovery, planner };
 }
 
 const cand = (id: string, ref = `p:${id}`): PlannerCandidate => ({
@@ -1500,5 +1506,229 @@ describe("R3 live-found — model STALE residue cleared at canonical seam", () =
     const gates = providerModelEligibility(store, pid, me).gates;
     expect(Object.values(gates).every((g) => g === "PASS")).toBe(true);
     expect(() => assertPlannerCandidateEligible(store, me)).not.toThrow();
+  });
+});
+
+/* ===== PRE-MERGE hotfix — canonical executor timeout governance ======== */
+
+const FAKE_ACP = path.resolve(__dirname, "fixtures", "fake-acp-agent.mjs");
+const FAKE_CODEX = path.resolve(__dirname, "fixtures", "fake-codex.mjs");
+const secretEnv = (n: string) =>
+  ["DEEPSEEK_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY"].includes(n)
+    ? "fake-secret"
+    : process.env[n];
+
+const waitTerminal = async (
+  adapter: { observe(id: string): Record<string, unknown> },
+  executionId: string,
+  timeoutMs = 15_000,
+) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const o = adapter.observe(executionId);
+    if (["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "UNKNOWN"].includes(String(o.status))) return o;
+    if (Date.now() > deadline) throw new Error(`execution ${executionId} never reached terminal`);
+    await new Promise((r) => setTimeout(r, 80));
+  }
+};
+
+/** Minimal governed task record as MissionRuntime's requestFor produces it. */
+const governedTask = (dir: string, executorId: string, over: Record<string, unknown> = {}) => ({
+  executor_id: executorId,
+  governance_state: "DISPATCH_AUTHORIZED",
+  dispatch_enabled: true,
+  governance_digest: "gd",
+  governed_task_id: `GTSK_${Math.random().toString(36).slice(2, 10)}`,
+  mission_id: "m", task_id: "t", correlation_id: "c",
+  workspace: dir, allowed_paths: [dir],
+  task_instruction: "do governed work",
+  ...over,
+});
+
+describe("PRE-MERGE hotfix — executor timeout governance", () => {
+  it("A/B. MissionRuntime injects PAIR_TASK_TIMEOUT_S; explicit metadata.timeout wins", () => {
+    const ctx = makeCtx("ht-ab");
+    const reqs: Array<Record<string, unknown>> = [];
+    const spyRouter = {
+      routeGovernedTask: (req: Record<string, unknown>) => {
+        reqs.push(req);
+        return { execution: { execution_id: `EX${reqs.length}`, execution_state: "RUNNING", executor_id: "STUB" } };
+      },
+    };
+    const rt = new MissionRuntime({
+      service: ctx.service, gate: ctx.gate, router: spyRouter as never,
+      adapters: new Map() as never, scheduler: ctx.scheduler, approvals: ctx.approvals,
+      reconciliation: ctx.recon, recovery: ctx.recovery, planner: ctx.planner as never,
+      taskTimeoutSeconds: 1800,
+    });
+    // canonical env → request.timeout = 1800
+    const m1 = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "g",
+      granted_permissions: ["FILE_WRITE"], authorized_workspaces: [ctx.workspace],
+    });
+    for (let i = 0; i < 5 && !reqs.length; i++) rt.tick(String(m1.mission_id)); // PLANNING→READY→RUNNING→dispatch
+    expect(reqs).toHaveLength(1);
+    expect(Number(reqs[0].timeout)).toBe(1800);
+    // explicit governed metadata.timeout supersedes the canonical budget
+    const timed = { ...T1, metadata: { timeout: 999 } };
+    const m2 = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "g2", metadata: { llm_plan: [timed] },
+      granted_permissions: ["FILE_WRITE"], authorized_workspaces: [ctx.workspace],
+    });
+    for (let i = 0; i < 6 && reqs.length < 2; i++) rt.tick(String(m2.mission_id));
+    expect(Number(reqs[1].timeout)).toBe(999);
+  });
+
+  it("C. DSH prompt budget = task.timeout (HANG_FOREVER → TIMEOUT at 2s, not 300s default)", async () => {
+    const { store } = makeCtx("ht-c");
+    void store;
+    const dsh = new DshExecutorAdapter({
+      journalRoot: path.join(freshDir("ht-c-j"), "j"),
+      launchOverride: { command: "node", args: [FAKE_ACP, "--profile", "acp"] },
+      envReader: secretEnv,
+    });
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ht-c-ws-"));
+    const disp = dsh.dispatch(governedTask(ws, "DEEPSEEK_HARNESS", { timeout: 2, task_instruction: "HANG_FOREVER now" }));
+    const t0 = Date.now();
+    const o = await waitTerminal(dsh, String(disp.execution_id));
+    expect(o.status).toBe("TIMEOUT"); // ACP_REQUEST_TIMEOUT at task.timeout=2s
+    expect(Date.now() - t0).toBeLessThan(12_000); // default 300s would never fire here
+  });
+
+  it("D. Codex process timeout = task.timeout (hang fixture → TIMEOUT at 2s)", async () => {
+    const dir = freshDir("ht-d");
+    const hang = path.join(dir, "hang-codex.mjs");
+    fs.writeFileSync(
+      hang,
+      'if(process.argv.includes("--version")){console.log("codex-cli fake");process.exit(0)}setInterval(()=>{},1000)',
+    );
+    const codex = new CodexCliExecutorAdapter({
+      journalRoot: path.join(dir, "j"),
+      executable: "node", executableArgs: [hang], envReader: secretEnv,
+    });
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ht-d-ws-"));
+    const disp = codex.dispatch(governedTask(ws, "CODEX", { timeout: 2 }));
+    const o = await waitTerminal(codex, String(disp.execution_id));
+    expect(o.status).toBe("TIMEOUT");
+  });
+
+  const mkDevin = (dir: string, nowRef: { v: number }, over: Record<string, unknown> = {}) =>
+    new DevinExecutorAdapter({
+      journalRoot: path.join(dir, "j"), apiKey: "cog_test",
+      fetchFn: (m) => ({ status: 200, data: m === "GET" ? { status_enum: "working" } : { session_id: "s1", url: "u" } }) as DevinFetch,
+      nowMs: () => nowRef.v, now: () => new Date(nowRef.v).toISOString(),
+      ...over,
+    });
+
+  it("E. Devin persists task_timeout_ms=1800s*1000 from governed task.timeout", () => {
+    const dir = freshDir("ht-e");
+    const now = { v: 1_000_000 };
+    const devin = mkDevin(dir, now);
+    const disp = devin.dispatch(governedTask(dir, "DEVIN", { timeout: 1800 }));
+    expect(Number(disp.task_timeout_ms)).toBe(1_800_000);
+    const journal = JSON.parse(
+      fs.readFileSync(path.join(dir, "j", String(disp.execution_id), "devin-dispatch.json"), "utf8"),
+    ) as { record: Record<string, unknown> };
+    expect(Number(journal.record.task_timeout_ms)).toBe(1_800_000);
+  });
+
+  it("F/M. running at 121s does NOT timeout (grace ≠ budget); TIMEOUT only past 1800s", () => {
+    const dir = freshDir("ht-f");
+    const now = { v: 1_000_000 };
+    const devin = mkDevin(dir, now, { blockedGraceMs: 5_000 });
+    const disp = devin.dispatch(governedTask(dir, "DEVIN", { timeout: 1800 }));
+    now.v += 121_000; // past the blocked-grace magnitude — still far inside budget
+    expect(devin.observe(String(disp.execution_id)).status).toBe("RUNNING");
+    now.v += 1_800_000; // now beyond the persisted 1800s budget
+    const o = devin.observe(String(disp.execution_id));
+    expect(o.status).toBe("TIMEOUT");
+    expect(Number(o.remote_timeout_ms)).toBe(1_800_000);
+  });
+
+  it("G/H. restart rehydration keeps the dispatched budget — changed env/fallback cannot move it", () => {
+    const dir = freshDir("ht-g");
+    const now = { v: 1_000_000 };
+    const devin = mkDevin(dir, now);
+    const disp = devin.dispatch(governedTask(dir, "DEVIN", { timeout: 1800 }));
+    const execId = String(disp.execution_id);
+    // env "changed" after dispatch + a fresh adapter with a DIFFERENT fallback
+    const prev = process.env.PAIR_DEVIN_TASK_TIMEOUT_MS;
+    process.env.PAIR_DEVIN_TASK_TIMEOUT_MS = "600000";
+    try {
+      const devin2 = mkDevin(dir, now); // fallback now 600s via validated compat env
+      now.v += 700_000; // > 600s fallback but < persisted 1800s
+      expect(devin2.observe(execId).status).toBe("RUNNING"); // persisted budget wins
+      now.v += 1_200_000; // > 1800s persisted
+      expect(devin2.observe(execId).status).toBe("TIMEOUT");
+    } finally {
+      if (prev === undefined) delete process.env.PAIR_DEVIN_TASK_TIMEOUT_MS;
+      else process.env.PAIR_DEVIN_TASK_TIMEOUT_MS = prev;
+    }
+  });
+
+  it("I/J. PAIR_DEVIN_BLOCKED_GRACE_MS validated (bounds, fail-closed); compat env for task budget", () => {
+    expect(devinBlockedGraceMs({ PAIR_DEVIN_BLOCKED_GRACE_MS: "30000" })).toBe(30_000);
+    for (const bad of ["0", "-5", "abc", "Infinity", "1800001", "8.5"]) {
+      expect(() => devinBlockedGraceMs({ PAIR_DEVIN_BLOCKED_GRACE_MS: bad })).toThrowError(/FAIL_CLOSED_CONFIG_INVALID/);
+    }
+    expect(devinBlockedGraceMs({})).toBe(120_000);
+    // compat env applies ONLY when the task carries no explicit timeout
+    expect(devinTaskTimeoutMs({ PAIR_DEVIN_TASK_TIMEOUT_MS: "300000" })).toBe(300_000);
+    expect(() => devinTaskTimeoutMs({ PAIR_DEVIN_TASK_TIMEOUT_MS: "x" })).toThrowError(/FAIL_CLOSED_CONFIG_INVALID/);
+  });
+
+  it("K. blocked past grace → FAILED + REMOTE_INPUT_REQUIRED, never masquerades as task TIMEOUT", () => {
+    const dir = freshDir("ht-k");
+    const now = { v: 5_000_000 };
+    const devin = mkDevin(dir, now, {
+      blockedGraceMs: 30_000,
+      fetchFn: (m) => ({ status: 200, data: m === "GET" ? { status_enum: "blocked", url: "u-b" } : { session_id: "s1", url: "u-b" } }) as DevinFetch,
+    });
+    const disp = devin.dispatch(governedTask(dir, "DEVIN", { timeout: 1800 }));
+    const execId = String(disp.execution_id);
+    expect(devin.observe(execId).status).toBe("RUNNING"); // transient blocked protected
+    now.v += 31_000;
+    const o = devin.observe(execId);
+    expect(o.status).toBe("FAILED"); // grace clock — NOT task timeout
+    expect(o.remote_timeout_ms).toBeUndefined();
+    const result = devin.collect_result(execId);
+    expect((result.error as Record<string, unknown>).class).toBe("REMOTE_INPUT_REQUIRED");
+  });
+
+  it("L. DONE sentinel during blocked grace → COMPLETED as before", () => {
+    const dir = freshDir("ht-l");
+    const now = { v: 6_000_000 };
+    const devin = mkDevin(dir, now, {
+      blockedGraceMs: 30_000,
+      fetchFn: (m) => ({
+        status: 200,
+        data: m === "GET"
+          ? { status_enum: "blocked", url: "u-d", messages: [{ type: "devin_message", message: "report\n\nDONE" }] }
+          : { session_id: "s1", url: "u-d" },
+      }) as DevinFetch,
+    });
+    const disp = devin.dispatch(governedTask(dir, "DEVIN", { timeout: 1800 }));
+    now.v += 10_000;
+    expect(devin.observe(String(disp.execution_id)).status).toBe("COMPLETED");
+  });
+
+  it("N. constructor without dep honors validated compat env for blocked grace", () => {
+    const dir = freshDir("ht-n");
+    const now = { v: 7_000_000 };
+    const prev = process.env.PAIR_DEVIN_BLOCKED_GRACE_MS;
+    process.env.PAIR_DEVIN_BLOCKED_GRACE_MS = "15000";
+    try {
+      const devin = mkDevin(dir, now, {
+        fetchFn: (m) => ({ status: 200, data: m === "GET" ? { status_enum: "blocked" } : { session_id: "s1" } }) as DevinFetch,
+      });
+      const disp = devin.dispatch(governedTask(dir, "DEVIN", { timeout: 1800 }));
+      const execId = String(disp.execution_id);
+      devin.observe(execId); // blocked_since := now
+      now.v += 16_000; // past the configured 15s grace (would still be RUNNING at default 120s)
+      expect(devin.observe(execId).status).toBe("FAILED");
+    } finally {
+      if (prev === undefined) delete process.env.PAIR_DEVIN_BLOCKED_GRACE_MS;
+      else process.env.PAIR_DEVIN_BLOCKED_GRACE_MS = prev;
+    }
   });
 });
