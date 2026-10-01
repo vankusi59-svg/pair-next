@@ -1303,3 +1303,67 @@ forceAbortRuntime, bounded recovery, GovernedTaskGate, CODEX/DSH
 TELEGRAM_DELIVERY, DEVIN-without-TD).
 
 Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`
+
+## Audit remediation round 3 (HEAD after `139c972`)
+
+Independent re-audit (REWORK REQUIRED) found one Medium architecture
+defect: `route.capabilities` was used as the per-executor effective
+snapshot, so a route shared by two executors flipped between their
+declarations — last registration won, and RouteSelector could reject a
+legitimately-supported executor↔route pair. Remediation direction A:
+**binding-level effective capability authority**.
+
+**Final semantics:**
+
+- `route.capabilities` = ROUTE CONSTRAINT only, disambiguated by
+  `capability_source`: `EXECUTOR_DECLARED` → `[]` = unrestricted-by-route
+  (each bound executor inherits its own declaration); `ROUTE_EXPLICIT` →
+  `[]` = supports nothing, otherwise the sorted `capabilities_declared`
+  ceiling. `[]` is never ambiguous — the source field decides.
+- `binding.capabilities` = executor declaration ∩ route ceiling — the
+  effective executor↔route surface, recomputed every registration.
+- `RouteSelector` executor-bound requests now check
+  `bindingFor(executor_id, route_id).capabilities`; unbound
+  direct-callable requests still check the route ceiling.
+
+**Registration order (R2 preserved):** probe → qualify → read declaration
+→ register descriptor → `reconcileExecutorBindings` (covers ALL existing
+bindings, even on an unqualified boot) → unqualified early-exit (no mint)
+→ qualified: canonical route mint (`capabilities: []`, unrestricted) or
+`reconcileRouteConstraint` → binding mint → second reconcile pass for the
+newly-minted binding → routable.
+
+**Migration:** existing persisted state converges in place on first boot —
+`EXECUTOR_DECLARED` routes collapse to `capabilities: []` (route writes
+once, emits `ROUTE_CAPABILITIES_RECONCILED`), explicit routes keep their
+declared ceiling, every binding gains its computed effective set. No DB
+surgery, no dropped rows, no route recreation.
+
+**Events/digest:** new `BINDING_CAPABILITIES_RECONCILED`
+(executor_id, route_id, added, removed) only on semantic change;
+`snapshotDigest` now also binds `binding.capabilities` (canonical sorted
+form) — effective-capability changes move the digest, reorders do not.
+
+New regression blocks: **RCA.SR** (SR1–SR6) — order-independence proven
+by identical snapshotDigest across reversed registration, explicit shared
+ceiling clamps each binding independently, wrong-capability requests fail
+closed per binding (no cross-executor leakage), one executor's removal
+never mutates the other's binding, unqualified boot reconciles the shared
+binding while the sibling stays routable, and RouteSelector reads the
+matching binding's surface even when the route row is deliberately
+poisoned; **D3** — binding caps bind the digest. All R/U assertions moved
+to binding-level effective caps.
+
+**Counterfactual on `139c972`:** 15/32 fail — SR1–SR6 all fail
+(order-dependent route snapshot, cross-executor leakage, poisoned
+route row misjudging a valid pair), binding assertions fail everywhere
+(bindings never carried effective caps), D3 fails (binding caps absent
+from digest). On remediation HEAD: **32/32 pass**.
+
+Results: focused 32/32; full suite **2462 pass / 2 failed** — same
+pre-existing P5 env failures; `tsc --noEmit` clean; `pnpm build` clean.
+All R1/R2 remediations preserved (M1/M2/M3/L1, unqualified-boot
+reconcile, never-qualified no-mint, Bug C closure, bounded recovery,
+GovernedTaskGate, CODEX/DSH TELEGRAM_DELIVERY, DEVIN-without-TD).
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`

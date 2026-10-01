@@ -83,19 +83,14 @@ export function registerGovernedExecutors(
       actor,
     );
     registered.push(executorId);
-    // Capability authority is INDEPENDENT of qualification: the adapter's
-    // declared set is what a persisted route snapshot must converge to.
-    // An unqualified executor stays non-routable through qualification/
-    // health/binding gates — but a stale bound snapshot must not linger
-    // just because qualify() failed this boot, so reconciliation of every
-    // EXISTING bound route runs before the early continue. A never-
-    // qualified executor has no bound routes, so nothing is minted here.
-    for (const bound of service.routes.bindingsForExecutor(executorId)) {
-      const boundRouteId = String(bound.route_id ?? "");
-      if (boundRouteId) {
-        service.routes.syncRouteCapabilities(boundRouteId, capabilities, actor);
-      }
-    }
+    // Capability authority is per-BINDING and independent of qualification:
+    // binding.capabilities = executor declaration ∩ route ceiling. Every
+    // existing binding is recomputed BEFORE the qualification early-exit so
+    // an unqualified boot can never leave a stale effective set (and a
+    // never-qualified executor has no bindings, so nothing is minted).
+    // Order-independent: each binding reconciles against its own route's
+    // ceiling, so shared routes never flip between executors.
+    service.routes.reconcileExecutorBindings(executorId, capabilities, actor);
     if (!qualified) {
       unavailable.push({
         executor_id: executorId,
@@ -115,8 +110,8 @@ export function registerGovernedExecutors(
           enabled: true,
           eligibility_state: "QUALIFIED",
           qualification_state: "QUALIFIED",
-          capabilities,
-          capability_source: "EXECUTOR_DECLARED",
+          capabilities: [],
+          capability_source: "EXECUTOR_DECLARED", // unrestricted-by-route
           priority: 50,
           executor_hint: executorId,
           metadata: {
@@ -131,11 +126,11 @@ export function registerGovernedExecutors(
         actor,
       );
     } else {
-      // Registration/catalog seam: the adapter declaration re-registered above
-      // is canonical — reconcile the persisted route's capability snapshot so
-      // an entity minted under an older declaration can never stay silently
-      // stale across upgrades (live incident MSN_01M3VSGWVC55YNKHAQY6VVJAXR).
-      service.routes.syncRouteCapabilities(routeId, capabilities, actor);
+      // Registration/catalog seam: normalize the persisted route's
+      // constraint (executor-minted ⇒ unrestricted EXECUTOR_DECLARED) so an
+      // entity minted under an older model can never stay silently stale
+      // across upgrades (live incident MSN_01M3VSGWVC55YNKHAQY6VVJAXR).
+      service.routes.reconcileRouteConstraint(routeId, actor);
     }
     if (!service.routes.bindingFor(executorId, routeId)) {
       service.routes.registerBinding(
@@ -148,6 +143,9 @@ export function registerGovernedExecutors(
         actor,
       );
     }
+    // Reconcile once more: a binding minted this cycle wasn't covered by
+    // the pre-exit pass above. Idempotent — no-op when already converged.
+    service.routes.reconcileExecutorBindings(executorId, capabilities, actor);
     routable.push(executorId);
   }
   return { registered, routable, unavailable };

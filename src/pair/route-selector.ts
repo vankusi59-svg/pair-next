@@ -68,8 +68,9 @@ export class RouteSelector {
     }
 
     const executorId = request.executor_id as string | undefined;
+    let binding: Record<string, unknown> | null = null;
     if (executorId) {
-      const binding = this.registry.bindingFor(executorId, rid);
+      binding = this.registry.bindingFor(executorId, rid);
       if (!binding) reasons.push("BINDING_ABSENT");
       else if (binding.mechanism === "UNSUPPORTED") reasons.push("BINDING_UNSUPPORTED");
       else if (binding.qualification_state !== "QUALIFIED") reasons.push("BINDING_NOT_QUALIFIED");
@@ -93,12 +94,19 @@ export class RouteSelector {
     }
 
     const capability = request.capability as string | undefined;
-    const caps = (route.capabilities as string[] | undefined) ?? [];
-    if (capability && !executorId && caps.length && !caps.includes(capability)) {
-      reasons.push("CAPABILITY_MISMATCH");
-    }
-    if (executorId && caps.length && capability && !caps.includes(capability)) {
-      reasons.push("CAPABILITY_MISMATCH");
+    if (executorId) {
+      // Effective capability lives on the executor↔route BINDING — a
+      // shared route has no single per-executor snapshot. A binding whose
+      // reconciled surface excludes the capability fails closed.
+      if (binding && capability) {
+        const bcaps = ((binding.capabilities as string[] | undefined) ?? []).map(String);
+        if (!bcaps.includes(capability)) reasons.push("CAPABILITY_MISMATCH");
+      }
+    } else if (capability) {
+      // Unbound direct-callable request: route.capabilities is the route
+      // ceiling ([] on EXECUTOR_DECLARED means unrestricted-by-route).
+      const caps = ((route.capabilities as string[] | undefined) ?? []).map(String);
+      if (caps.length && !caps.includes(capability)) reasons.push("CAPABILITY_MISMATCH");
     }
 
     if (reasons.length) return reasons;

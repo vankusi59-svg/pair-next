@@ -238,9 +238,12 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     const adapters = new Map<string, ExecutorAdapter>([["CODEX", codex]]);
     const reg1 = registerGovernedExecutors(ctx.service, adapters, "BOOT_1");
     expect(reg1.routable).toContain("CODEX");
-    let route = ctx.service.routes.getRoute("RTE_CODEX_CLI")!;
-    expect(route.capabilities).not.toContain("TELEGRAM_DELIVERY");
-    const versionAfterMint = Number(route.version);
+    // Binding-level authority: effective caps live on BIND_*, the canonical
+    // route itself is unrestricted (EXECUTOR_DECLARED, capabilities=[]).
+    const binding = () =>
+      ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!;
+    expect(binding().capabilities).not.toContain("TELEGRAM_DELIVERY");
+    const versionAfterMint = Number(binding().version);
 
     // Selector rejects the new capability — this is the production failure.
     const selector = new RouteSelector(ctx.service);
@@ -256,10 +259,11 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     codex.caps = ["FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY"];
     const reg2 = registerGovernedExecutors(ctx.service, adapters, "BOOT_2");
     expect(reg2.routable).toContain("CODEX");
-    route = ctx.service.routes.getRoute("RTE_CODEX_CLI")!;
-    expect(route.capabilities).toContain("TELEGRAM_DELIVERY");
+    const route = ctx.service.routes.getRoute("RTE_CODEX_CLI")!;
     expect(route.capability_source).toBe("EXECUTOR_DECLARED");
-    expect(Number(route.version)).toBeGreaterThan(versionAfterMint);
+    expect(route.capabilities).toEqual([]); // unrestricted-by-route
+    expect(binding().capabilities).toContain("TELEGRAM_DELIVERY");
+    expect(Number(binding().version)).toBeGreaterThan(versionAfterMint);
 
     const healed = selector.select({
       executor_id: "CODEX",
@@ -278,12 +282,13 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     const codex = new ScriptedAdapter("CODEX", [], ["CAP_X", "FILE_OPERATIONS"]);
     const adapters = new Map<string, ExecutorAdapter>([["CODEX", codex]]);
     registerGovernedExecutors(ctx.service, adapters, "BOOT_1");
-    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities).toContain("CAP_X");
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!.capabilities)
+      .toContain("CAP_X");
 
     codex.caps = ["FILE_OPERATIONS"];
     registerGovernedExecutors(ctx.service, adapters, "BOOT_2");
-    const route = ctx.service.routes.getRoute("RTE_CODEX_CLI")!;
-    expect(route.capabilities).not.toContain("CAP_X");
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!.capabilities)
+      .not.toContain("CAP_X");
     const sel = new RouteSelector(ctx.service).select({
       executor_id: "CODEX",
       capability: "CAP_X",
@@ -322,18 +327,22 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     registerGovernedExecutors(ctx.service, adapters, "BOOT_N1");
     const sub = ctx.service.routes.getRoute("RTE_CODEX_SUBSET")!;
     expect(sub.capabilities_declared).toEqual(["CAP_A", "CAP_B"]);
-    expect(sub.capabilities).toEqual(["CAP_A"]); // B removed fail-closed, C NOT added
-    const versionAfterHeal = Number(sub.version);
+    expect(sub.capabilities).toEqual(["CAP_A", "CAP_B"]); // route ceiling unchanged
+    // Effective surface lives on the binding: B removed fail-closed, C never added.
+    const subBind = ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_SUBSET")!;
+    expect(subBind.capabilities).toEqual(["CAP_A"]);
+    const versionAfterHeal = Number(subBind.version);
     const eventsAfterHeal = ctx.store
-      .listEvents("route")
-      .filter((e) => String(e.entity_id) === "RTE_CODEX_SUBSET").length;
+      .listEvents("executor_supply_binding")
+      .filter((e) => String(e.entity_id) === "BIND_CODEX__RTE_CODEX_SUBSET").length;
 
     // Boot N+2 same declaration — idempotent: no version churn, no new event.
     registerGovernedExecutors(ctx.service, adapters, "BOOT_N2");
-    const sub2 = ctx.service.routes.getRoute("RTE_CODEX_SUBSET")!;
+    const sub2 = ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_SUBSET")!;
     expect(Number(sub2.version)).toBe(versionAfterHeal);
     expect(
-      ctx.store.listEvents("route").filter((e) => String(e.entity_id) === "RTE_CODEX_SUBSET").length,
+      ctx.store.listEvents("executor_supply_binding")
+        .filter((e) => String(e.entity_id) === "BIND_CODEX__RTE_CODEX_SUBSET").length,
     ).toBe(eventsAfterHeal);
 
     // A route bound to a DIFFERENT executor is untouched by CODEX's sync.
@@ -369,8 +378,12 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     });
     registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
     const over = ctx.service.routes.getRoute("RTE_CODEX_OVER")!;
-    expect(over.capabilities).toEqual(["CAP_A"]);
+    // Route ceiling = declared intent verbatim; the over-declared member is
+    // dropped only from the executor's effective surface (the binding).
+    expect(over.capabilities).toEqual(["CAP_A", "CAP_GHOST"]);
     expect(over.capabilities_declared).toEqual(["CAP_A", "CAP_GHOST"]);
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_OVER")!.capabilities)
+      .toEqual(["CAP_A"]);
   });
 
   it("R4. restart idempotent — second reconcile is a semantic no-op (no version churn, no extra evidence)", () => {
@@ -398,8 +411,8 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     const service2 = new PairControlPlane(ctx.store);
     codex.caps = ["FILE_OPERATIONS", "TELEGRAM_DELIVERY"];
     registerGovernedExecutors(service2, new Map([["CODEX", codex]]), "BOOT_2");
-    const route = service2.routes.getRoute("RTE_CODEX_CLI")!;
-    expect(route.capabilities).toContain("TELEGRAM_DELIVERY");
+    expect(service2.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!.capabilities)
+      .toContain("TELEGRAM_DELIVERY");
   });
 });
 
@@ -414,19 +427,21 @@ describe("RCA.U — unqualified executor capability reconciliation", () => {
     const ctx = makeCtx("u1");
     const codex = new ScriptedAdapter("CODEX", [], ["CAP_A", "CAP_B"]);
 
-    // Boot 1: qualified — canonical route minted with [A, B].
+    // Boot 1: qualified — canonical route minted unrestricted; the
+    // executor's effective surface lives on the binding.
     let res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
     expect(res.routable).toEqual(["CODEX"]);
-    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities)
-      .toEqual(["CAP_A", "CAP_B"]);
+    const binding = () => ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!;
+    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities).toEqual([]);
+    expect(binding().capabilities).toEqual(["CAP_A", "CAP_B"]);
 
     // Boot 2: declaration shrinks to [A] AND qualification fails.
     codex.caps = ["CAP_A"];
     codex.qualified = false;
     res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
 
-    const route = ctx.service.routes.getRoute("RTE_CODEX_CLI")!;
-    expect(route.capabilities).toEqual(["CAP_A"]);          // B cannot stay effective
+    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities).toEqual([]);
+    expect(binding().capabilities).toEqual(["CAP_A"]);      // B cannot stay effective
     expect(res.unavailable.map((u) => u.executor_id)).toEqual(["CODEX"]);
     expect(res.routable).toEqual([]);
     const executor = ctx.store.get("executor", "CODEX")!;
@@ -449,8 +464,11 @@ describe("RCA.U — unqualified executor capability reconciliation", () => {
     const sub = ctx.service.routes.getRoute("RTE_CODEX_SUB")!;
     expect(sub.capability_source).toBe("ROUTE_EXPLICIT");
     expect(sub.capabilities_declared).toEqual(["CAP_A", "CAP_B"]); // intent verbatim
-    expect(sub.capabilities).toEqual(["CAP_A"]);                   // B removed, C not added
-    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities)
+    expect(sub.capabilities).toEqual(["CAP_A", "CAP_B"]);         // ceiling unchanged
+    // Binding: B removed fail-closed, C never auto-added past the ceiling.
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_SUB")!.capabilities)
+      .toEqual(["CAP_A"]);
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!.capabilities)
       .toEqual(["CAP_A", "CAP_C"]);
     expect(res.routable).toEqual([]);
   });
@@ -469,10 +487,12 @@ describe("RCA.U — unqualified executor capability reconciliation", () => {
     codex.qualified = true;
     const res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_3");
     expect(res.routable).toEqual(["CODEX"]);
-    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities).toEqual(["CAP_A"]);
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!.capabilities)
+      .toEqual(["CAP_A"]);
     const sub = ctx.service.routes.getRoute("RTE_CODEX_SUB")!;
     expect(sub.capabilities_declared).toEqual(["CAP_A", "CAP_B"]);
-    expect(sub.capabilities).toEqual(["CAP_A"]); // B stays dead
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_SUB")!.capabilities)
+      .toEqual(["CAP_A"]); // B stays dead
   });
 
   it("U4. never-qualified — no route minted, no binding minted, not routable", () => {
@@ -502,21 +522,27 @@ describe("RCA.U — unqualified executor capability reconciliation", () => {
     registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
     const v1 = ctx.service.routes.getRoute("RTE_CODEX_CLI")!.version;
     const sv1 = ctx.service.routes.getRoute("RTE_CODEX_SUB")!.version;
+    const bv1 = ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!.version;
+    const sbv1 = ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_SUB")!.version;
     const events1 = ctx.store.listEvents()
-      .filter((e) => e.event_type === "ROUTE_CAPABILITIES_RECONCILED").length;
+      .filter((e) => e.event_type === "ROUTE_CAPABILITIES_RECONCILED"
+        || e.event_type === "BINDING_CAPABILITIES_RECONCILED").length;
     const routes1 = ctx.store.list("route").length;
-    const bindings1 = ctx.store.list("route_binding").length;
+    const bindings1 = ctx.store.list("executor_supply_binding").length;
 
     registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_3");
     registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_4");
 
     expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.version).toBe(v1);
     expect(ctx.service.routes.getRoute("RTE_CODEX_SUB")!.version).toBe(sv1);
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")!.version).toBe(bv1);
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_SUB")!.version).toBe(sbv1);
     expect(ctx.store.listEvents()
-      .filter((e) => e.event_type === "ROUTE_CAPABILITIES_RECONCILED").length)
+      .filter((e) => e.event_type === "ROUTE_CAPABILITIES_RECONCILED"
+        || e.event_type === "BINDING_CAPABILITIES_RECONCILED").length)
       .toBe(events1);
     expect(ctx.store.list("route").length).toBe(routes1);
-    expect(ctx.store.list("route_binding").length).toBe(bindings1);
+    expect(ctx.store.list("executor_supply_binding").length).toBe(bindings1);
   });
 });
 
@@ -991,5 +1017,227 @@ describe("RCA.D — snapshot digest binds capability semantics", () => {
       Number(route2.version),
     );
     expect(ctx.service.routes.snapshotDigest()).toBe(changedDigest);
+  });
+
+  it("D3. binding effective capabilities participate in the digest", () => {
+    const ctx = makeCtx("d3");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A", "CAP_B"]);
+    registerAdapter(ctx, exA, exA.caps);
+    const d1 = ctx.service.routes.snapshotDigest();
+
+    // Mutate binding caps → digest must change.
+    const binding = ctx.service.routes.bindingFor("EX_A", "RTE_EX_A")!;
+    ctx.store.put(
+      "executor_supply_binding",
+      String(binding.binding_id),
+      { ...binding, capabilities: ["CAP_A", "CAP_B", "CAP_C"] },
+      Number(binding.version),
+    );
+    const changed = ctx.service.routes.snapshotDigest();
+    expect(changed).not.toBe(d1);
+
+    // Reorder the same set → identical digest.
+    const b2 = ctx.service.routes.bindingFor("EX_A", "RTE_EX_A")!;
+    ctx.store.put(
+      "executor_supply_binding",
+      String(b2.binding_id),
+      { ...b2, capabilities: ["CAP_C", "CAP_B", "CAP_A"] },
+      Number(b2.version),
+    );
+    expect(ctx.service.routes.snapshotDigest()).toBe(changed);
+  });
+});
+
+/* ======== SR — shared-route, binding-level effective authority ========== *
+ * Direction A: a route is a transport/supply class — several executors may
+ * bind it. Effective capability authority lives on each binding
+ * (executor declaration ∩ route ceiling), never on a per-route snapshot. */
+
+function mintSharedRoute(
+  ctx: ReturnType<typeof makeCtx>,
+  routeId: string,
+  explicitCeiling: string[] | null,
+) {
+  ctx.service.routes.registerRoute({
+    route_id: routeId,
+    route_kind: "REMOTE_GATEWAY_API",
+    enabled: true,
+    eligibility_state: "QUALIFIED",
+    qualification_state: "QUALIFIED",
+    capability_source: explicitCeiling === null ? "EXECUTOR_DECLARED" : "ROUTE_EXPLICIT",
+    capabilities: explicitCeiling === null ? [] : [...explicitCeiling],
+    executor_hint: null,
+  });
+  return routeId;
+}
+
+function bind(ctx: ReturnType<typeof makeCtx>, executorId: string, routeId: string) {
+  ctx.service.routes.registerBinding({
+    executor_id: executorId,
+    route_id: routeId,
+    mechanism: "SPAWN_ENV",
+    qualification_state: "QUALIFIED",
+  });
+}
+
+function bindCaps(ctx: ReturnType<typeof makeCtx>, executorId: string, routeId: string) {
+  return [...((ctx.service.routes.bindingFor(executorId, routeId)!
+    .capabilities as string[]) ?? [])].sort();
+}
+
+describe("RCA.SR — shared route binding-level effective capabilities", () => {
+  it("SR1. executor-inherited shared route is registration-order independent", () => {
+    const run = (order: string[]) => {
+      const ctx = makeCtx(`sr1-${order.join("")}`);
+      const exA = new ScriptedAdapter("EX_A", [], ["CAP_A"]);
+      const exB = new ScriptedAdapter("EX_B", [], ["CAP_B"]);
+      mintSharedRoute(ctx, "RTE_SHARED", null); // unrestricted EXECUTOR_DECLARED
+      bind(ctx, "EX_A", "RTE_SHARED");
+      bind(ctx, "EX_B", "RTE_SHARED");
+      const adapters = new Map<string, ExecutorAdapter>(
+        (order.includes("EX_A") && order[0] === "EX_A"
+          ? [["EX_A", exA], ["EX_B", exB]]
+          : [["EX_B", exB], ["EX_A", exA]]) as Array<[string, ExecutorAdapter]>,
+      );
+      const res = registerGovernedExecutors(ctx.service, adapters, "BOOT");
+      return { ctx, res };
+    };
+
+    const fwd = run(["EX_A", "EX_B"]);
+    const rev = run(["EX_B", "EX_A"]);
+
+    for (const { ctx } of [fwd, rev]) {
+      expect(bindCaps(ctx, "EX_A", "RTE_SHARED")).toEqual(["CAP_A"]);
+      expect(bindCaps(ctx, "EX_B", "RTE_SHARED")).toEqual(["CAP_B"]);
+      // Route row is a stable constraint — it must not flip [A] ↔ [B].
+      const route = ctx.service.routes.getRoute("RTE_SHARED")!;
+      expect(route.capabilities).toEqual([]);
+      expect(route.capability_source).toBe("EXECUTOR_DECLARED");
+    }
+    // Final persisted state identical across orders.
+    expect(fwd.ctx.service.routes.snapshotDigest())
+      .toBe(rev.ctx.service.routes.snapshotDigest());
+    expect(fwd.res.routable.sort()).toEqual(rev.res.routable.sort());
+
+    // RouteSelector resolves through each executor's own binding.
+    for (const { ctx } of [fwd, rev]) {
+      const sel = new RouteSelector(ctx.service);
+      expect(String(sel.select({ executor_id: "EX_A", capability: "CAP_A", persist: false })
+        .selected_route_id)).toBe("RTE_SHARED");
+      expect(String(sel.select({ executor_id: "EX_B", capability: "CAP_B", persist: false })
+        .selected_route_id)).toBe("RTE_SHARED");
+    }
+  });
+
+  it("SR2. ROUTE_EXPLICIT shared ceiling clamps each binding independently", () => {
+    const ctx = makeCtx("sr2");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A", "CAP_C"]);
+    const exB = new ScriptedAdapter("EX_B", [], ["CAP_B", "CAP_D"]);
+    mintSharedRoute(ctx, "RTE_SHARED", ["CAP_A", "CAP_B"]);
+    bind(ctx, "EX_A", "RTE_SHARED");
+    bind(ctx, "EX_B", "RTE_SHARED");
+    registerGovernedExecutors(
+      ctx.service, new Map([["EX_A", exA], ["EX_B", exB]]), "BOOT");
+
+    // C and D are excluded by the route ceiling; each binding keeps only
+    // its own executor's share — no cross-executor overwrite.
+    expect(bindCaps(ctx, "EX_A", "RTE_SHARED")).toEqual(["CAP_A"]);
+    expect(bindCaps(ctx, "EX_B", "RTE_SHARED")).toEqual(["CAP_B"]);
+    const route = ctx.service.routes.getRoute("RTE_SHARED")!;
+    expect(route.capabilities).toEqual(["CAP_A", "CAP_B"]);
+    expect(route.capabilities_declared).toEqual(["CAP_A", "CAP_B"]);
+  });
+
+  it("SR3. wrong-capability requests fail closed per binding — no cross-executor leakage", () => {
+    const ctx = makeCtx("sr3");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A"]);
+    const exB = new ScriptedAdapter("EX_B", [], ["CAP_B"]);
+    mintSharedRoute(ctx, "RTE_SHARED", null);
+    bind(ctx, "EX_A", "RTE_SHARED");
+    bind(ctx, "EX_B", "RTE_SHARED");
+    registerGovernedExecutors(
+      ctx.service, new Map([["EX_A", exA], ["EX_B", exB]]), "BOOT");
+
+    const sel = new RouteSelector(ctx.service);
+    const aNeedsB = sel.select({ executor_id: "EX_A", capability: "CAP_B", persist: false });
+    expect(aNeedsB.selected_route_id).toBeNull();
+    const bNeedsA = sel.select({ executor_id: "EX_B", capability: "CAP_A", persist: false });
+    expect(bNeedsA.selected_route_id).toBeNull();
+    const rejections = (aNeedsB.hard_rejections as Array<{ route_id: string; reason_codes: string[] }>)
+      .find((r) => r.route_id === "RTE_SHARED");
+    expect(rejections?.reason_codes).toContain("CAPABILITY_MISMATCH");
+  });
+
+  it("SR4. capability removal on one executor never mutates the other's binding", () => {
+    const ctx = makeCtx("sr4");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A", "CAP_B"]);
+    const exB = new ScriptedAdapter("EX_B", [], ["CAP_B"]);
+    mintSharedRoute(ctx, "RTE_SHARED", null);
+    bind(ctx, "EX_A", "RTE_SHARED");
+    bind(ctx, "EX_B", "RTE_SHARED");
+    registerGovernedExecutors(
+      ctx.service, new Map([["EX_A", exA], ["EX_B", exB]]), "BOOT_1");
+    expect(bindCaps(ctx, "EX_A", "RTE_SHARED")).toEqual(["CAP_A", "CAP_B"]);
+
+    exA.caps = ["CAP_A"];
+    registerGovernedExecutors(
+      ctx.service, new Map([["EX_A", exA], ["EX_B", exB]]), "BOOT_2");
+    expect(bindCaps(ctx, "EX_A", "RTE_SHARED")).toEqual(["CAP_A"]);
+    expect(bindCaps(ctx, "EX_B", "RTE_SHARED")).toEqual(["CAP_B"]);
+  });
+
+  it("SR5. unqualified boot still reconciles the shared binding; sibling untouched", () => {
+    const ctx = makeCtx("sr5");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A", "CAP_B"]);
+    const exB = new ScriptedAdapter("EX_B", [], ["CAP_B"]);
+    mintSharedRoute(ctx, "RTE_SHARED", null);
+    bind(ctx, "EX_A", "RTE_SHARED");
+    bind(ctx, "EX_B", "RTE_SHARED");
+    registerGovernedExecutors(
+      ctx.service, new Map([["EX_A", exA], ["EX_B", exB]]), "BOOT_1");
+
+    exA.caps = ["CAP_A"];
+    exA.qualified = false;
+    const res = registerGovernedExecutors(
+      ctx.service, new Map([["EX_A", exA], ["EX_B", exB]]), "BOOT_2");
+
+    expect(bindCaps(ctx, "EX_A", "RTE_SHARED")).toEqual(["CAP_A"]);
+    expect(bindCaps(ctx, "EX_B", "RTE_SHARED")).toEqual(["CAP_B"]);
+    expect(res.unavailable.map((u) => u.executor_id)).toEqual(["EX_A"]);
+    // Non-canonical executors never enter `routable`; EX_B stays routable in
+    // the real sense — its binding remains QUALIFIED and serves traffic.
+    expect(res.routable).toEqual([]);
+    const bBind = ctx.service.routes.bindingFor("EX_B", "RTE_SHARED")!;
+    expect(bBind.qualification_state).toBe("QUALIFIED");
+    const sel = new RouteSelector(ctx.service);
+    expect(String(sel.select({ executor_id: "EX_B", capability: "CAP_B", persist: false })
+      .selected_route_id)).toBe("RTE_SHARED");
+    expect(ctx.service.routes.getRoute("RTE_SHARED")!.capabilities).toEqual([]);
+  });
+
+  it("SR6. RouteSelector reads the matching binding's surface — a stale route row cannot poison selection", () => {
+    const ctx = makeCtx("sr6");
+    const exA = new ScriptedAdapter("EX_A", [], ["CAP_A"]);
+    const exB = new ScriptedAdapter("EX_B", [], ["CAP_B"]);
+    // Explicit ceiling [A,B]; poison the persisted route row so a reader of
+    // route.capabilities (old model) would see ONLY [CAP_B] — the wrong
+    // answer for EX_A.
+    mintSharedRoute(ctx, "RTE_SHARED", ["CAP_A", "CAP_B"]);
+    bind(ctx, "EX_A", "RTE_SHARED");
+    bind(ctx, "EX_B", "RTE_SHARED");
+    registerGovernedExecutors(
+      ctx.service, new Map([["EX_A", exA], ["EX_B", exB]]), "BOOT");
+    const route = ctx.service.routes.getRoute("RTE_SHARED")!;
+    ctx.store.put(
+      "route", "RTE_SHARED",
+      { ...route, capabilities: ["CAP_B"] }, // simulates last-writer-wins corruption
+      Number(route.version),
+    );
+    const sel = new RouteSelector(ctx.service);
+    // Correct under binding authority despite the poisoned route row.
+    expect(String(sel.select({ executor_id: "EX_A", capability: "CAP_A", persist: false })
+      .selected_route_id)).toBe("RTE_SHARED");
+    expect(String(sel.select({ executor_id: "EX_B", capability: "CAP_B", persist: false })
+      .selected_route_id)).toBe("RTE_SHARED");
   });
 });
