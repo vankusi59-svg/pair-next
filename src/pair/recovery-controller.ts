@@ -274,6 +274,15 @@ export class RecoveryController {
      * reconciliation is never re-selected forever.
      */
     settled_reconciliation?: { outcome: string; reconciliation_id?: string } | null;
+    /**
+     * Live-ops Bug C — actions whose apply-path already threw a governed
+     * routing/policy failure this failure instance (e.g. RE_ROUTE →
+     * FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR). Each entry carries the normalized
+     * error code as evidence; the candidate is rejected with
+     * APPLY_INFEASIBLE:<code> so the identical attempt is never replayed
+     * and the next valid action is evaluated inside the matrix.
+     */
+    infeasible_actions?: Array<{ action: RecoveryAction; reason: string }>;
     /** ACTIVE REMEDIATION_PAIR experience ids, already filtered for compatibility by caller/ExperienceService */
     verified_remediation_ids?: string[];
     risk_class?: string;
@@ -330,9 +339,17 @@ export class RecoveryController {
       selected = "HUMAN_APPROVAL_REQUIRED";
       rejectRest("MAX_CONSECUTIVE_IDENTICAL_FAILURES");
     } else {
+      const infeasible = new Map(
+        (input.infeasible_actions ?? []).map((e) => [e.action, e.reason]),
+      );
       for (const action of candidates) {
         if (selected) {
           rejected.push({ action, reason: "LOWER_PRIORITY_THAN_SELECTED" });
+          continue;
+        }
+        const infeasibleReason = infeasible.get(action);
+        if (infeasibleReason) {
+          rejected.push({ action, reason: `APPLY_INFEASIBLE:${infeasibleReason}` });
           continue;
         }
         switch (action) {

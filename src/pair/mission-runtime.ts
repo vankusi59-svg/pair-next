@@ -39,6 +39,7 @@ import type { ApprovalQueue } from "./approval-queue.js";
 import type { ReconciliationService } from "./reconciliation.js";
 import type { RecoveryController } from "./recovery-controller.js";
 import { classifyFailure } from "./recovery-controller.js";
+import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
 
@@ -704,6 +705,10 @@ export class MissionRuntime {
      *  reconciliation for the same instance; forwarded to the decision
      *  so the settled candidate is not re-selected forever. */
     settledReconciliation?: { outcome: string; reconciliation_id?: string },
+    /** Live-ops Bug C — actions proven infeasible by an apply-path routing
+     *  throw in THIS failure chain; forwarded to decide() so the identical
+     *  attempt is rejected instead of replayed forever. */
+    infeasibleActions?: Array<{ action: RecoveryAction; reason: string }>,
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -736,6 +741,7 @@ export class MissionRuntime {
         attempts_per_mission: Number(ext.attempts_per_mission ?? 0),
       },
       settled_reconciliation: settledReconciliation ?? null,
+      infeasible_actions: infeasibleActions ?? [],
       now,
     });
     rt.pending_recovery = {
@@ -747,6 +753,7 @@ export class MissionRuntime {
       executor_id: execution ? execution.executor_id : null,
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
+      infeasible_actions: infeasibleActions ?? [],
     };
     this.store.put(
       "mission_runtime",
@@ -845,17 +852,18 @@ export class MissionRuntime {
 
     switch (action) {
       case "RETRY_SAME_ROUTE": {
-        if (pending.governed_task_id) {
-          this.deps.recovery.supersedeGovernedTask(
-            String(pending.governed_task_id),
-            String(pending.recovery_id),
-          );
-        }
+        this.supersedeGovernedTaskOnce(pending);
         const task = this.deps.service.getTask(taskId);
         this.deps.service.updateTask(taskId, { status: "READY" });
         const request = this.requestFor(mission, task);
         request.executor_constraint = pending.executor_id;
-        const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        let routed: Record<string, unknown>;
+        try {
+          routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        } catch (err) {
+          this.handleRecoveryApplyFailure(missionId, pending, "RETRY_SAME_ROUTE", err, now);
+          return;
+        }
         this.deps.service.updateTask(taskId, { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown> | undefined;
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
@@ -868,19 +876,20 @@ export class MissionRuntime {
         break;
       }
       case "RE_ROUTE": {
-        if (pending.governed_task_id) {
-          this.deps.recovery.supersedeGovernedTask(
-            String(pending.governed_task_id),
-            String(pending.recovery_id),
-          );
-        }
+        this.supersedeGovernedTaskOnce(pending);
         const task = this.deps.service.getTask(taskId);
         this.deps.service.updateTask(taskId, { status: "READY" });
         const request = this.requestFor(mission, task);
         if (pending.executor_id) {
           request.exclude_executors = [pending.executor_id];
         }
-        const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        let routed: Record<string, unknown>;
+        try {
+          routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        } catch (err) {
+          this.handleRecoveryApplyFailure(missionId, pending, "RE_ROUTE", err, now);
+          return;
+        }
         this.deps.service.updateTask(taskId, { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown> | undefined;
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
@@ -952,6 +961,72 @@ export class MissionRuntime {
       default:
         this.transitionRuntime(missionId, "RUNNING", `unhandled:${action}`);
     }
+  }
+
+  /**
+   * Supersede the failed governed task once per failure chain. Within one
+   * chain the same governed_task_id is carried across re-decisions
+   * (RE_ROUTE → RETRY_SAME_ROUTE), so the second apply sees it already
+   * SUPERSEDED — that is idempotent no-op territory, not corruption, and
+   * re-superseding must not throw the chain into limbo. A genuinely
+   * non-supersedeable state (e.g. mid-execution) still throws through
+   * supersedeGovernedTask and flows into handleRecoveryApplyFailure's
+   * INTERNAL_RUNTIME_DEFECT path.
+   */
+  private supersedeGovernedTaskOnce(pending: Record<string, unknown>): void {
+    if (!pending.governed_task_id) return;
+    const gtId = String(pending.governed_task_id);
+    const gt = this.store.tryGet("governed_task", gtId);
+    if (gt && String(gt.governance_state).startsWith("SUPERSEDED")) return;
+    this.deps.recovery.supersedeGovernedTask(gtId, String(pending.recovery_id));
+  }
+
+  /**
+   * Live-ops Bug C — a governed routing call inside a recovery apply-path
+   * threw before the recovery state was advanced. Feeding the failure back
+   * as `infeasible_actions` marks the attempted action infeasible for this
+   * failure chain, so the fresh canonical decide() evaluates the NEXT
+   * matrix action (typically HUMAN_APPROVAL_REQUIRED or ABORT) instead of
+   * replaying the identical throw every supervisor tick — the observed
+   * permanent-RECOVERING limbo on MSN_01M3VHGS6HPA62V6K9JR57MNEK.
+   *
+   * Expected governed routing/policy failures (PolicyError thrown by the
+   * router) become recovery evidence in the original failure class.
+   * Anything else (IntegrityError, invariant corruption, programmer bugs)
+   * is NOT normalized into routing infeasibility — it re-decides under
+   * INTERNAL_RUNTIME_DEFECT, the existing canonical defect class, keeping
+   * the outcome bounded and operator-visible via the recovery_decision row.
+   */
+  private handleRecoveryApplyFailure(
+    missionId: string,
+    pending: Record<string, unknown>,
+    action: string,
+    err: unknown,
+    now?: string,
+  ): void {
+    const taskId = String(pending.task_id);
+    const prior =
+      (pending.infeasible_actions as Array<{ action: RecoveryAction; reason: string }>) ?? [];
+    const code =
+      err instanceof PolicyError
+        ? String(err.code)
+        : String((err as { code?: string })?.code ?? "INTERNAL_ERROR");
+    const infeasible: Array<{ action: RecoveryAction; reason: string }> = [
+      ...prior.filter((e) => e.action !== action),
+      { action: action as RecoveryAction, reason: code },
+    ];
+    const isExpectedGovernedRouting = err instanceof PolicyError;
+    this.startRecovery(
+      missionId,
+      taskId,
+      pending.execution_id ? String(pending.execution_id) : null,
+      isExpectedGovernedRouting
+        ? (pending.failure_class as ReturnType<typeof classifyFailure>)
+        : "INTERNAL_RUNTIME_DEFECT",
+      now,
+      undefined,
+      infeasible,
+    );
   }
 
   private runRemediation(
@@ -1041,7 +1116,13 @@ export class MissionRuntime {
       if (pending.executor_id) {
         request.executor_constraint = pending.executor_id;
       }
-      const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+      let routed: Record<string, unknown>;
+      try {
+        routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+      } catch (err) {
+        this.handleRecoveryApplyFailure(missionId, pending, "APPLY_VERIFIED_REMEDIATION", err, now);
+        return;
+      }
       this.deps.recovery.bindRemediationExecution(
         String(pr.remediation_execution_id),
         String((routed.governed_task as Record<string, unknown>).governed_task_id),
