@@ -732,6 +732,30 @@ WOB1(A) and refused a legitimate retry.
 - Validation: focused +16; full suite 2426/2 pre-existing env fails;
   tsc + build clean. DO NOT MERGE — pending independent audit.
 
+## Route Capability Authority & Staleness Closure (branch `devin/1790861444-route-capability-authority`, pending independent audit)
+
+- Route `capabilities` is now a derived reconciled snapshot of the
+  executor's declaration: `capability_source` ∈ `EXECUTOR_DECLARED` |
+  `ROUTE_EXPLICIT`, `capabilities_declared` preserves operator intent,
+  effective set is always `⊆ executor.capabilities`.
+  `syncRouteCapabilities()` runs at the registration seam
+  (`registerGovernedExecutors` / `seedPairNativeRoute`) — additions
+  converge `EXECUTOR_DECLARED` routes, removals fail closed, explicit
+  subsets are never auto-widened, CAS + `ROUTE_CAPABILITIES_RECONCILED`
+  event only on semantic change (idempotent, restart-safe).
+- `NO_ELIGIBLE_ROUTE` split: all-policy rejection codes
+  (`AGENT_CONTRACT_ROUTE_DENIED`/`_RESTRICTED`, `OPERATOR_PIN_EXCLUDED`)
+  keep `FAIL_CLOSED_NO_ELIGIBLE_ROUTE` → `POLICY_DENIAL` → ABORT;
+  route-local infeasibility throws `FAIL_CLOSED_ROUTE_INFEASIBLE` → new
+  `ROUTE_INFEASIBLE` class → bounded `RE_ROUTE → RECONCILIATION_REQUIRED
+  → ABORT`. `PairError.meta` carries structured evidence
+  (`executor_id`, `route_decision_id`); dispatch-arm recovery persists
+  the failed executor even without an execution row, so bounded RE_ROUTE
+  excludes it.
+- Validation: focused 11/11; full suite 2441/2 pre-existing env fails;
+  tsc + build clean. Counterfactual on `c06b43b`: 8/11 fail (R1 proves
+  the stale persisted snapshot). DO NOT MERGE — pending audit.
+
 ## Not yet
 
 - Workforce lifecycle beyond governed completion (Phase 4+), CEO

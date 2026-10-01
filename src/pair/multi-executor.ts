@@ -83,6 +83,14 @@ export function registerGovernedExecutors(
       actor,
     );
     registered.push(executorId);
+    // Capability authority is per-BINDING and independent of qualification:
+    // binding.capabilities = executor declaration ∩ route ceiling. Every
+    // existing binding is recomputed BEFORE the qualification early-exit so
+    // an unqualified boot can never leave a stale effective set (and a
+    // never-qualified executor has no bindings, so nothing is minted).
+    // Order-independent: each binding reconciles against its own route's
+    // ceiling, so shared routes never flip between executors.
+    service.routes.reconcileExecutorBindings(executorId, capabilities, actor);
     if (!qualified) {
       unavailable.push({
         executor_id: executorId,
@@ -92,7 +100,7 @@ export function registerGovernedExecutors(
     }
 
     const routeId = ROUTE_IDS[executorId];
-    if (!routeId) continue;
+    if (!routeId) continue; // no canonical mint; bound routes already synced above
     let route = service.routes.getRoute(routeId);
     if (!route) {
       route = service.routes.registerRoute(
@@ -102,7 +110,8 @@ export function registerGovernedExecutors(
           enabled: true,
           eligibility_state: "QUALIFIED",
           qualification_state: "QUALIFIED",
-          capabilities,
+          capabilities: [],
+          capability_source: "EXECUTOR_DECLARED", // unrestricted-by-route
           priority: 50,
           executor_hint: executorId,
           metadata: {
@@ -116,6 +125,12 @@ export function registerGovernedExecutors(
         },
         actor,
       );
+    } else {
+      // Registration/catalog seam: normalize the persisted route's
+      // constraint (executor-minted ⇒ unrestricted EXECUTOR_DECLARED) so an
+      // entity minted under an older model can never stay silently stale
+      // across upgrades (live incident MSN_01M3VSGWVC55YNKHAQY6VVJAXR).
+      service.routes.reconcileRouteConstraint(routeId, actor);
     }
     if (!service.routes.bindingFor(executorId, routeId)) {
       service.routes.registerBinding(
@@ -128,6 +143,9 @@ export function registerGovernedExecutors(
         actor,
       );
     }
+    // Reconcile once more: a binding minted this cycle wasn't covered by
+    // the pre-exit pass above. Idempotent — no-op when already converged.
+    service.routes.reconcileExecutorBindings(executorId, capabilities, actor);
     routable.push(executorId);
   }
   return { registered, routable, unavailable };

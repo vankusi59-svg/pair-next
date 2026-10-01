@@ -350,8 +350,12 @@ describe("P8 §36 — failure classification + matrix", () => {
     })).toBe("ENVIRONMENT_INCOMPATIBLE");
   });
 
-  it("2. matrix covers all 26 failure classes with stable semantic fields", () => {
-    expect(Object.keys(RECOVERY_MATRIX).sort()).toHaveLength(26);
+  it("2. matrix covers all 27 failure classes with stable semantic fields", () => {
+    // 27 = 26 original + ROUTE_INFEASIBLE (route-local infeasibility split
+    // from POLICY_DENIAL — Route Capability Authority & Staleness Closure).
+    expect(Object.keys(RECOVERY_MATRIX).sort()).toHaveLength(27);
+    expect(RECOVERY_MATRIX.ROUTE_INFEASIBLE.retry_allowed).toBe(false);
+    expect(RECOVERY_MATRIX.ROUTE_INFEASIBLE.actions[0]).toBe("RE_ROUTE");
     for (const row of Object.values(RECOVERY_MATRIX)) {
       expect(row.actions.length).toBeGreaterThan(0);
       expect(typeof row.retry_allowed).toBe("boolean");

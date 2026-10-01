@@ -12,6 +12,7 @@
 import { digest, newId, utcnow } from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 import {
+  CAPABILITY_SOURCES,
   REJECTED_ROUTE_HEALTH,
   RouteRegistry,
 } from "./route-registry.js";
@@ -68,8 +69,9 @@ export class RouteSelector {
     }
 
     const executorId = request.executor_id as string | undefined;
+    let binding: Record<string, unknown> | null = null;
     if (executorId) {
-      const binding = this.registry.bindingFor(executorId, rid);
+      binding = this.registry.bindingFor(executorId, rid);
       if (!binding) reasons.push("BINDING_ABSENT");
       else if (binding.mechanism === "UNSUPPORTED") reasons.push("BINDING_UNSUPPORTED");
       else if (binding.qualification_state !== "QUALIFIED") reasons.push("BINDING_NOT_QUALIFIED");
@@ -93,12 +95,27 @@ export class RouteSelector {
     }
 
     const capability = request.capability as string | undefined;
-    const caps = (route.capabilities as string[] | undefined) ?? [];
-    if (capability && !executorId && caps.length && !caps.includes(capability)) {
-      reasons.push("CAPABILITY_MISMATCH");
-    }
-    if (executorId && caps.length && capability && !caps.includes(capability)) {
-      reasons.push("CAPABILITY_MISMATCH");
+    if (executorId) {
+      // Effective capability lives on the executor↔route BINDING — a
+      // shared route has no single per-executor snapshot. A binding whose
+      // reconciled surface excludes the capability fails closed.
+      if (binding && capability) {
+        const bcaps = ((binding.capabilities as string[] | undefined) ?? []).map(String);
+        if (!bcaps.includes(capability)) reasons.push("CAPABILITY_MISMATCH");
+      }
+    } else if (capability) {
+      // Unbound direct-callable request: route-level constraint keyed by
+      // capability_source, never by array length alone —
+      //   ROUTE_EXPLICIT    → capabilities IS the ceiling ([] permits NOTHING)
+      //   EXECUTOR_DECLARED → unrestricted-by-route (also the canonical
+      //                       interpretation of a legacy missing source).
+      const source = CAPABILITY_SOURCES.has(String(route.capability_source))
+        ? String(route.capability_source)
+        : "EXECUTOR_DECLARED";
+      if (source === "ROUTE_EXPLICIT") {
+        const caps = ((route.capabilities as string[] | undefined) ?? []).map(String);
+        if (!caps.includes(capability)) reasons.push("CAPABILITY_MISMATCH");
+      }
     }
 
     if (reasons.length) return reasons;

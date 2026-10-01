@@ -232,9 +232,48 @@ export class MissionRouter {
         route_decision_id: routeDecision.decision_id,
         reason_codes: routeDecision.reason_codes,
       });
+      // Route-local infeasibility (capability/health/binding/qualification on
+      // the SELECTED executor's routes) is not the same class as a genuine
+      // governance prohibition: another governed executor may still serve.
+      // Only when EVERY route actually bound to the selected executor is
+      // policy-forbidden is this a terminal POLICY_DENIAL; otherwise it is
+      // bounded ROUTE_INFEASIBLE.
+      //
+      // Scope: hard_rejections covers EVERY route in the registry, so routes
+      // belonging to other executors show up here as BINDING_ABSENT — they
+      // must not contaminate the classification. In-scope = routes with a
+      // binding record to selectedExecutor (a binding that exists but is
+      // unqualified/unsupported is still in scope: that is a route-local
+      // defect on THIS executor, not someone else's route).
+      //
+      // Mixed semantics: a route is policy-forbidden only when its own
+      // rejection set contains a policy code. If every in-scope route is
+      // policy-forbidden then removing local defects could never produce a
+      // viable route — governance itself prohibits the selection →
+      // POLICY_DENIAL. If at least one in-scope route is rejected only on
+      // local grounds, governance did not forbid every choice →
+      // ROUTE_INFEASIBLE (recoverable through bounded re-route/reconcile).
+      const POLICY_DENIAL_REASONS = new Set([
+        "AGENT_CONTRACT_ROUTE_DENIED",
+        "AGENT_CONTRACT_ROUTE_RESTRICTED",
+        "OPERATOR_PIN_EXCLUDED",
+      ]);
+      const rejections =
+        (routeDecision.hard_rejections as Array<{ route_id?: unknown; reason_codes?: string[] }>) ?? [];
+      const scopedRejections = rejections.filter((r) =>
+        this.service.routes.bindingFor(String(selectedExecutor), String(r.route_id ?? "")),
+      );
+      const genuinePolicyDenial =
+        scopedRejections.length > 0 &&
+        scopedRejections.every((r) =>
+          (r.reason_codes ?? []).some((c) => POLICY_DENIAL_REASONS.has(String(c))),
+        );
       throw new PolicyError(
-        "FAIL_CLOSED_NO_ELIGIBLE_ROUTE",
+        genuinePolicyDenial
+          ? "FAIL_CLOSED_NO_ELIGIBLE_ROUTE"
+          : "FAIL_CLOSED_ROUTE_INFEASIBLE",
         JSON.stringify(routeDecision.hard_rejections),
+        { executor_id: selectedExecutor, route_decision_id: routeDecision.decision_id },
       );
     }
 

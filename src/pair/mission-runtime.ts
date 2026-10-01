@@ -28,7 +28,7 @@
  * no task is silently reset and nothing is re-dispatched twice.
  */
 
-import { IntegrityError, PolicyError } from "./errors.js";
+import { IntegrityError, PairError, PolicyError } from "./errors.js";
 import { newId, utcnow } from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 import type { GovernedTaskGate } from "./gate.js";
@@ -610,10 +610,18 @@ export class MissionRuntime {
           continue; // executor saturated — task stays READY for the next tick
         }
         const failureClass = classifyFailure({
-          error_code: msg,
+          // The typed PairError.code classifies first — the JSON detail may
+          // embed arbitrary reason codes (e.g. HEALTH_*, QUOTA_*) that must
+          // not shadow the contract code that produced them.
+          error_code: err instanceof PairError ? `${err.code}` : msg,
           error_class: "DISPATCH",
         });
-        this.startRecovery(missionId, String(task.task_id), null, failureClass, now);
+        // Dispatch-time routing failures carry no execution row — the executor
+        // the route selection failed on still becomes bounded re-route
+        // evidence so RE_ROUTE excludes it instead of re-selecting it.
+        this.startRecovery(missionId, String(task.task_id), null, failureClass, now, undefined, undefined, {
+          failedExecutorId: String((err as PairError).meta?.executor_id ?? "") || null,
+        });
         return;
       }
       const rtNow = String(this.runtimeEntity(missionId).state);
@@ -715,6 +723,10 @@ export class MissionRuntime {
      *  throw in THIS failure chain; forwarded to decide() so the identical
      *  attempt is rejected instead of replayed forever. */
     infeasibleActions?: Array<{ action: RecoveryAction; reason: string }>,
+    /** Route-authority closure — the executor a dispatch-time routing
+     *  failure was scoped to (no execution row exists yet); carried into
+     *  pending.executor_id so bounded RE_ROUTE excludes it. */
+    extra?: { failedExecutorId?: string | null },
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -728,13 +740,19 @@ export class MissionRuntime {
       .list("experience")
       .filter((e) => e.type === "REMEDIATION_PAIR" && e.status === "ACTIVE")
       .map((e) => String(e.experience_id ?? e.id));
+    // One canonical notion of the failed executor for the whole chain —
+    // the same value feeds decide() (so alternates are computed against it)
+    // and persists onto pending_recovery for the apply path.
+    const failedExecutorId = execution
+      ? String(execution.executor_id)
+      : (extra?.failedExecutorId ?? undefined);
     const decision = this.deps.recovery.decide({
       verified_remediation_ids: verifiedRemediation,
       mission_id: missionId,
       task_id: taskId,
       execution_id: executionId ?? undefined,
       governed_task_id: execution ? String(execution.governed_task_id) : undefined,
-      executor_id: execution ? String(execution.executor_id) : undefined,
+      executor_id: failedExecutorId,
       failure_class: failureClass,
       eligible_executors: eligible,
       risk_class: String(
@@ -756,7 +774,7 @@ export class MissionRuntime {
       task_id: taskId,
       execution_id: executionId,
       governed_task_id: execution ? execution.governed_task_id : null,
-      executor_id: execution ? execution.executor_id : null,
+      executor_id: failedExecutorId ?? null,
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
       infeasible_actions: infeasibleActions ?? [],
@@ -1190,6 +1208,13 @@ export class MissionRuntime {
       now,
       undefined,
       infeasible,
+      {
+        // The executor THIS apply attempt just failed on wins over the chain's
+        // prior executor — the next RE_ROUTE excludes it too.
+        failedExecutorId:
+          String((err as PairError).meta?.executor_id ?? "") ||
+          (pending.executor_id ? String(pending.executor_id) : null),
+      },
     );
   }
 
