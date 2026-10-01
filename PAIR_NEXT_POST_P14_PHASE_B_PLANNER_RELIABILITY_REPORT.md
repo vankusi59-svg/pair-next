@@ -1029,3 +1029,379 @@ Durability guarantee (precise, per audit §4): while the `mission_runtime` row r
 Evidence: `Tests 20 passed (20)` for `pair-live-ops-recovery-closure` — new **A9** reproduces the audit chain (mission entity corrupt → apply fails → `startRecovery` getMission fails → emergency abort): `runtime.tick()` does not escape, `state=ABORTED`, `reason` contains `recovery_boundary_defect`, `pending_recovery=null` with `aborted_recovery` forensic preserved, 3 further ticks + restart over same store stay `ABORTED` with no re-driven decision. Counterfactual on `5fc59df`: `1 failed | 19 passed` — A9's throw escapes `tick()` via `abortMission → service.getMission`, the audited path. Full suite `2430 passed | 2 failed` (same two P5 env-dependent failures); `tsc --noEmit` clean; `pnpm build` clean.
 
 Round-2 coverage preserved: RECOVERING / WAITING_BACKOFF / RECONCILING / REPLANNING / WAITING_APPROVAL / RUNNING due-section all still guarded; PolicyError→infeasible, defect→INTERNAL_RUNTIME_DEFECT, restart safety, attempt ceilings, `supersedeGovernedTaskOnce`, A6/A7/A8, Devin marker protocol untouched.
+
+---
+
+# ROUTE CAPABILITY AUTHORITY & STALENESS CLOSURE (post-merge remediation)
+
+Base: `c06b43b` (canonical main) · Branch: `devin/1790861444-route-capability-authority`
+
+## Root cause
+
+Route entities persist `capabilities` at MINT time only
+(`multi-executor.ts` mints a route `if (!route)`; nothing re-synced it).
+After PR #22 added `TELEGRAM_DELIVERY` to the CODEX declaration, the
+already-persisted `RTE_CODEX_CLI` still carried the pre-PR#22 set. The
+`RouteSelector` hard-gates on the persisted `route.capabilities` →
+`CAPABILITY_MISMATCH` → `NO_ELIGIBLE_ROUTE` → `POLICY_DENIAL` → `[ABORT]`
+— production mission `MSN_01M3VSGWVC55YNKHAQY6VVJAXR` aborted a delivery
+task even though CODEX could actually serve it.
+
+## Design answers (mandate §21)
+
+1. **Canonical authority** — the adapter's live `capabilities()`
+   declaration as re-materialized into the executor record at every
+   registration (`ExecutorRegistry.register` overwrites each boot).
+2. **`route.capabilities` meaning** — a DERIVED, RECONCILED snapshot of
+   what the route is allowed to authorize for its bound executor,
+   constrained `⊆ executor.capabilities`. New `capability_source` field:
+   `EXECUTOR_DECLARED` (inherits the executor set wholesale — all
+   adapter-minted routes) or `ROUTE_EXPLICIT` (operator intent, preserved
+   verbatim in `capabilities_declared`, effective = declared ∩ executor).
+   Legacy rows without the field behave as `EXECUTOR_DECLARED`.
+3. **Why it went stale** — the mint was one-shot (`if (!route)`); the
+   snapshot was written once and never reconciled against later
+   declarations, so upgrades that add/remove capabilities left the
+   persisted set behind.
+4. **Lifecycle seam** — deterministic reconciliation at the
+   registration/catalog seam: `registerGovernedExecutors` re-registers
+   each executor then calls `RouteRegistry.syncRouteCapabilities(routeId,
+   executorCaps, actor)` for every existing route;
+   `seedPairNativeRoute` does the same. Per-task evaluation untouched.
+5. **Additions** — `EXECUTOR_DECLARED` routes adopt the widened set (the
+   stale route can no longer silently pretend the executor lacks the
+   capability); `ROUTE_EXPLICIT` routes keep their declared subset —
+   additions are NOT auto-widened into explicit subsets.
+6. **Removals** — fail closed on both source types: a capability the
+   executor no longer declares is dropped from effective capabilities
+   (explicit-route declared intent is kept for provenance but cannot
+   re-authorize removed caps).
+7. **Intentional subsets** — `capabilities_declared` records the
+   operator's intent unchanged; `effective = declared ⊆ executor`. The
+   subset is preserved verbatim across syncs; only the clamp changes.
+8. **`NO_ELIGIBLE_ROUTE → POLICY_DENIAL`** — changed. `mission-router`
+   now inspects the route decision's `hard_rejections`: when EVERY
+   rejection is an explicit policy/contract code
+   (`AGENT_CONTRACT_ROUTE_DENIED`, `AGENT_CONTRACT_ROUTE_RESTRICTED`,
+   `OPERATOR_PIN_EXCLUDED`) it still throws `FAIL_CLOSED_NO_ELIGIBLE_ROUTE`
+   → `POLICY_DENIAL` → `ABORT` (unchanged). Otherwise it throws the new
+   `FAIL_CLOSED_ROUTE_INFEASIBLE` → new failure class `ROUTE_INFEASIBLE` →
+   bounded `RE_ROUTE → RECONCILIATION_REQUIRED → ABORT`.
+9. **Genuine POLICY_DENIAL stays distinct** — the policy code set is
+   explicit and the check is `every(...)` over rejection codes (a single
+   route-local code mixed in flips to ROUTE_INFEASIBLE); the typed error
+   `code` (not message text) drives `classifyFailure`, so embedded
+   `HEALTH_*`/`QUOTA_*` reason strings cannot shadow the classification.
+10. **No silent over-authorization** — effective capabilities can only
+    ever be `executor-declared` (or `declared ⊆ executor`); a route can
+    never authorize more than the executor currently declares, and any
+    drift is rewritten through `store.put` CAS + `payload_hash` +
+    `ROUTE_CAPABILITIES_RECONCILED` event with `{added, removed}` — audit
+    trail preserved, version bumps only on semantic change.
+
+## Changed files
+
+- `src/pair/route-registry.ts` — `CAPABILITY_SOURCES`,
+  `capability_source`/`capabilities_declared` fields on `registerRoute`,
+  `syncRouteCapabilities()` (idempotent CAS + evidence event),
+  `seedPairNativeRoute` reconciles on every call.
+- `src/pair/multi-executor.ts` — mint stamps `EXECUTOR_DECLARED`;
+  else-branch calls `syncRouteCapabilities` for existing routes.
+- `src/pair/errors.ts` — `PairError.meta` (structured evidence, e.g.
+  `executor_id` + `route_decision_id`).
+- `src/pair/mission-router.ts` — rejection-code split between
+  `FAIL_CLOSED_NO_ELIGIBLE_ROUTE` (policy-only) and
+  `FAIL_CLOSED_ROUTE_INFEASIBLE` (route-local) + meta evidence.
+- `src/pair/recovery-controller.ts` — `ROUTE_INFEASIBLE` class + matrix
+  row (`RE_ROUTE`, `RECONCILIATION_REQUIRED`, `ABORT`; no blind retry) +
+  classification rule placed before the POLICY line.
+- `src/pair/mission-runtime.ts` — dispatch-arm classify uses typed
+  `PairError.code`; `startRecovery` gains `extra.failedExecutorId` so the
+  executor a route selection failed on is persisted into
+  `pending_recovery.executor_id` even with no execution row (RE_ROUTE
+  can then exclude it); apply-path failures refresh the executor
+  evidence identically.
+- `src/__tests__/pair-route-capability-authority.test.ts` (new, 11 tests).
+- `src/__tests__/pair-p3.test.ts` — two regexes updated for the new code.
+- `src/__tests__/pair-p8.test.ts` — matrix count 26 → 27.
+
+## NO_ELIGIBLE_ROUTE conclusion (mandate §7)
+
+The audited chain was a **stale-catalog false rejection**, not a genuine
+policy deny: DSH was excluded by a transient Groq-429 prior, the router
+picked CODEX, and the persisted route (minted pre-PR#22) lacked
+`TELEGRAM_DELIVERY`. Under the new taxonomy that exact selection now
+throws `ROUTE_INFEASIBLE` → bounded RE_ROUTE — and with reconciliation,
+`RTE_CODEX_CLI` simply carries `TELEGRAM_DELIVERY` after any
+re-registration, so the incident shape cannot recur. Genuine contract
+denies still land on `POLICY_DENIAL → ABORT` (unchanged).
+
+## Bounded recovery behavior (mandate §8)
+
+`ROUTE_INFEASIBLE` enters the existing bounded machinery:
+`infeasible_actions` evidence, `attempts_task` ceilings, `decide()`
+re-decision, `RE_ROUTE` excludes the failed executor (via persisted
+`pending.executor_id` — now populated even for dispatch-arm routing
+throws via `PairError.meta.executor_id`), terminal `HUMAN_APPROVAL`/`ABORT`.
+No blind same-route retry; MissionRouter/GovernedTaskGate never bypassed.
+
+## Validation (mandate §22)
+
+- Focused `pair-route-capability-authority.test.ts`: **11/11 pass** —
+  R1 exact live-shape (minted pre-TD → re-register → routable, selector
+  confirms), R2 removal fail-closed, R3 explicit-subset preserved +
+  over-declared clamped, R4 restart idempotent (no version churn, no dup
+  routes/bindings, no extra evidence), R5 fresh-process-over-same-store
+  convergence; S1 route-local → bounded RE_ROUTE to alternate → mission
+  COMPLETED, S2 no-alternate → bounded terminal, S3 taxonomy codes, S4
+  `meta.executor_id` persisted into pending, S5 restart-safe resumed
+  RE_ROUTE; I1 capability invariants (CODEX/DSH have TD, DEVIN does not).
+- Adjacent suites: p3 15/15, p5 (2 env-fail), p8 49/49, p9, p12,
+  live-ops-recovery-closure 20/20, ops-telegram-delivery 3/3, phase-b.
+- **Full suite: 2441 pass / 2 failed** — the two known pre-existing
+  P5 env failures (executables present on this box). Baseline was 2430
+  pass; +11 = new tests. `tsc --noEmit` clean. `pnpm build` clean.
+
+## Counterfactual (mandate §23)
+
+Same test file on worktree at `c06b43b`: **8 failed / 3 passed** —
+R1 fails with `expected ['FILE_OPERATIONS','REASONING'] to include
+'TELEGRAM_DELIVERY'` (the persisted route never converges = the live
+incident), S1/S4/S5 fail for lack of `ROUTE_INFEASIBLE`/`meta`. On HEAD:
+11/11 pass.
+
+## Deferred (mandate §19 / unchanged debt)
+
+Experience-decay semantics for transient priors, outbox-artifact evidence
+contract, executor ordering policy, DSH multi-credential pinning,
+`.imported` rename, planner `worker_spec`, nvidia probe timeout, `badq`
+in prod, operator dashboards. Experience score decay NOT modified.
+
+**Classification**: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_AUDIT`
+
+## Audit remediation round 1 (HEAD after `67f9f74`)
+
+Independent audit (REWORK REQUIRED) found four residual issues; all fixed
+on the same branch:
+
+- **Finding M1 — all-bound-route reconciliation**: `registerGovernedExecutors`
+  previously reconciled only `ROUTE_IDS[executorId]`. Now every route with a
+  binding record for the executor is reconciled each boot — including
+  `ROUTE_EXPLICIT` subsets — for canonical executors AND for governed
+  executors without a canonical mint (`!routeId` path). The canonical route
+  is still synced inline before the enumeration so first-boot bindings are
+  covered. Legacy-source semantics: every production route is minted by the
+  two executor paths (`multi-executor.ts`, `seedPairNativeRoute`); there is
+  no operator route-creation endpoint (`/api/routes` is GET-only), so a row
+  missing `capability_source` is provably executor-minted ⇒ `EXECUTOR_DECLARED`
+  — verified against every `registerRoute` callsite in `src/pair` and
+  `scripts/`; declared-subset semantics still preserve operator intent
+  verbatim via `capabilities_declared`.
+- **Finding M2 — failed executor into the FIRST decide()**:
+  `startRecovery` now derives one canonical `failedExecutorId`
+  (`execution ? execution.executor_id : extra?.failedExecutorId`) and feeds
+  it to BOTH `RecoveryController.decide({ executor_id })` and
+  `pending_recovery.executor_id`. On a dispatch-time `ROUTE_INFEASIBLE`
+  (no execution row) the first decision no longer counts the failed
+  executor as its own re-route alternate — `RE_ROUTE` is correctly
+  rejected `NO_ALTERNATE_ELIGIBLE_EXECUTOR` up front instead of burning a
+  recovery attempt to rediscover the same executor is infeasible.
+- **Finding M3 — scoped policy-denial taxonomy**: classification now
+  filters `routeDecision.hard_rejections` to routes that have a binding
+  record for `selectedExecutor` (`RouteRegistry.bindingFor`). Unrelated
+  routes (another executor's routes show `BINDING_ABSENT` in the global
+  list) can no longer contaminate the verdict. **Mixed semantics chosen**:
+  a route is policy-forbidden iff its own rejection set contains a policy
+  code (`AGENT_CONTRACT_ROUTE_DENIED`, `AGENT_CONTRACT_ROUTE_RESTRICTED`,
+  `OPERATOR_PIN_EXCLUDED`); `POLICY_DENIAL` iff EVERY in-scope route is
+  policy-forbidden — i.e. removing all local defects still cannot yield a
+  viable route. Any in-scope route rejected only on local grounds →
+  `ROUTE_INFEASIBLE` (recoverable). No route-id string matching; binding
+  records are the authority.
+- **Finding L1 — capability-aware snapshot digest**:
+  `snapshotDigest()` now binds `capabilities`, `capability_source` and
+  `capabilities_declared` per route (canonical sorted forms), so a route
+  decision receipt cryptographically pins the capability surface it used.
+
+Tests: focused file now **20/20** —
+R3 boot lifecycle (no manual sync; declared `[A,B]` preserved, effective
+`[A]` after `[A,C]` re-registration; no churn on repeat boot; other
+executor's routes untouched), R3b over-declared clamp via the boot path,
+S6 first-decision (`executor_id=EX_A`, `RE_ROUTE` rejected
+`NO_ALTERNATE_ELIGIBLE_EXECUTOR`, never selected), T1–T5 taxonomy
+(scoped POLICY_DENIAL vs ROUTE_INFEASIBLE; mixed → ROUTE_INFEASIBLE; pin
+semantics via `route_fallback_allowed:false`; T5 end-to-end asserts
+POLICY_DENIAL → ABORT and zero dispatches — the policy is never evaded),
+D1/D2 digest (mutation changes digest, reorder does not).
+
+**Counterfactual on `67f9f74`**: same file → 8 fail / 12 pass —
+R3 `[CAP_A,CAP_B]` ≠ `[CAP_A]` (bound explicit route never reconciled);
+S6 `executor_id: null` (failed executor counted as its own alternate);
+T1 throws `FAIL_CLOSED_ROUTE_INFEASIBLE` instead of
+`FAIL_CLOSED_NO_ELIGIBLE_ROUTE` (BINDING_ABSENT contamination); T5
+mislabels POLICY_DENIAL → RE_ROUTE evades the denial; D1/D2 digests
+identical across capability mutations. On HEAD: 20/20 pass.
+
+Results: focused 20/20; full suite **2450 pass / 2 failed** — the same
+two pre-existing P5 env failures; `tsc --noEmit` clean; `pnpm build`
+clean. PR #23 closure mechanisms (recoveryGuard, recoveryFailureBoundary,
+forceAbortRuntime, infeasible_actions) untouched; CODEX/DSH
+TELEGRAM_DELIVERY and DEVIN-without-TD unchanged.
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`
+
+## Audit remediation round 2 (HEAD after `29a4830`)
+
+Independent re-audit (REWORK REQUIRED) found one Medium residual and one
+Low test-quality gap:
+
+- **Medium — unqualified executor skipped reconciliation**: the early
+  `if (!qualified) continue` ran BEFORE the all-bound-route reconcile, so
+  a boot where `qualify()` fails left every persisted bound snapshot
+  frozen at the previous declaration — silently violating the
+  every-bound-route invariant. Fix: **capability authority is now
+  independent of qualification**. The declared set returned by
+  `adapter.capabilities()` is what a route snapshot must converge to;
+  qualification, health and binding gates decide routability. New
+  registration order: probe → qualify → read declaration → register
+  executor descriptor (`capabilities: []`, `DEGRADED`,
+  `UNQUALIFIED` when not qualified) → **reconcile ALL existing bound
+  routes against the fresh declaration** → early exit when unqualified
+  (no mint, no routable) → else canonical mint/sync + binding + routable.
+  A never-qualified executor has no bound routes so nothing is minted —
+  the P5 no-mint invariant is preserved.
+- **Low — D2 digest reorder assertion**: the previous assertion only
+  re-checked `!= original`. Now `reorderedDigest === changedDigest`
+  explicitly, i.e. `[A,B,C] == [C,B,A]` while `[A,B] != [A,B,C]`.
+
+New regression block **RCA.U** (5 tests):
+- U1 canonical route — unqualified boot converges `[A,B]→[A]`; executor
+  in `unavailable`, not `routable`, descriptor `UNQUALIFIED`,
+  capabilities `[]`.
+- U2 ROUTE_EXPLICIT — `capabilities_declared=[A,B]` preserved verbatim,
+  effective `[A]` (B removed, C never auto-added) while qualification
+  fails.
+- U3 requalification — `[A]` stays `[A]` (B never resurrects); executor
+  routable again through normal gates.
+- U4 never-qualified — registered + unavailable, **zero** routes and
+  **zero** bindings minted.
+- U5 repeat unqualified boots — first convergence writes once, then zero
+  version churn, zero extra `ROUTE_CAPABILITIES_RECONCILED` events, zero
+  duplicate routes/bindings.
+
+**Counterfactual on `29a4830`**: U1 and U2 fail —
+`route.capabilities` stays `['CAP_A','CAP_B']` after an unqualified boot
+whose declaration is `['CAP_A']` (early continue skips reconciliation).
+All other tests pass there, including strengthened D2 (L1 digest fields
+were already bound). On remediation HEAD: **25/25 pass**.
+
+Results: focused 25/25; adjacent suites 254/256 (2 = the same
+pre-existing P5 env failures); full suite **2455 pass / 2 failed** —
+unchanged P5 env failures; `tsc --noEmit` clean; `pnpm build` clean.
+All round-1 remediations preserved (M1/M2/M3/L1, Bug C closure,
+forceAbortRuntime, bounded recovery, GovernedTaskGate, CODEX/DSH
+TELEGRAM_DELIVERY, DEVIN-without-TD).
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`
+
+## Audit remediation round 3 (HEAD after `139c972`)
+
+Independent re-audit (REWORK REQUIRED) found one Medium architecture
+defect: `route.capabilities` was used as the per-executor effective
+snapshot, so a route shared by two executors flipped between their
+declarations — last registration won, and RouteSelector could reject a
+legitimately-supported executor↔route pair. Remediation direction A:
+**binding-level effective capability authority**.
+
+**Final semantics:**
+
+- `route.capabilities` = ROUTE CONSTRAINT only, disambiguated by
+  `capability_source`: `EXECUTOR_DECLARED` → `[]` = unrestricted-by-route
+  (each bound executor inherits its own declaration); `ROUTE_EXPLICIT` →
+  `[]` = supports nothing, otherwise the sorted `capabilities_declared`
+  ceiling. `[]` is never ambiguous — the source field decides.
+- `binding.capabilities` = executor declaration ∩ route ceiling — the
+  effective executor↔route surface, recomputed every registration.
+- `RouteSelector` executor-bound requests now check
+  `bindingFor(executor_id, route_id).capabilities`; unbound
+  direct-callable requests still check the route ceiling.
+
+**Registration order (R2 preserved):** probe → qualify → read declaration
+→ register descriptor → `reconcileExecutorBindings` (covers ALL existing
+bindings, even on an unqualified boot) → unqualified early-exit (no mint)
+→ qualified: canonical route mint (`capabilities: []`, unrestricted) or
+`reconcileRouteConstraint` → binding mint → second reconcile pass for the
+newly-minted binding → routable.
+
+**Migration:** existing persisted state converges in place on first boot —
+`EXECUTOR_DECLARED` routes collapse to `capabilities: []` (route writes
+once, emits `ROUTE_CAPABILITIES_RECONCILED`), explicit routes keep their
+declared ceiling, every binding gains its computed effective set. No DB
+surgery, no dropped rows, no route recreation.
+
+**Events/digest:** new `BINDING_CAPABILITIES_RECONCILED`
+(executor_id, route_id, added, removed) only on semantic change;
+`snapshotDigest` now also binds `binding.capabilities` (canonical sorted
+form) — effective-capability changes move the digest, reorders do not.
+
+New regression blocks: **RCA.SR** (SR1–SR6) — order-independence proven
+by identical snapshotDigest across reversed registration, explicit shared
+ceiling clamps each binding independently, wrong-capability requests fail
+closed per binding (no cross-executor leakage), one executor's removal
+never mutates the other's binding, unqualified boot reconciles the shared
+binding while the sibling stays routable, and RouteSelector reads the
+matching binding's surface even when the route row is deliberately
+poisoned; **D3** — binding caps bind the digest. All R/U assertions moved
+to binding-level effective caps.
+
+**Counterfactual on `139c972`:** 15/32 fail — SR1–SR6 all fail
+(order-dependent route snapshot, cross-executor leakage, poisoned
+route row misjudging a valid pair), binding assertions fail everywhere
+(bindings never carried effective caps), D3 fails (binding caps absent
+from digest). On remediation HEAD: **32/32 pass**.
+
+Results: focused 32/32; full suite **2462 pass / 2 failed** — same
+pre-existing P5 env failures; `tsc --noEmit` clean; `pnpm build` clean.
+All R1/R2 remediations preserved (M1/M2/M3/L1, unqualified-boot
+reconcile, never-qualified no-mint, Bug C closure, bounded recovery,
+GovernedTaskGate, CODEX/DSH TELEGRAM_DELIVERY, DEVIN-without-TD).
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`
+
+## Audit remediation round 4 (HEAD after `e850054`)
+
+Independent re-audit (REWORK REQUIRED) found one Medium residual: on the
+executor-unbound (direct-callable) path `RouteSelector` checked
+`caps.length && !caps.includes(capability)` — so a `ROUTE_EXPLICIT` route
+with an EMPTY ceiling (`capabilities: []`) was silently treated as
+unrestricted, contradicting the R3 semantics.
+
+**Fix:** the unbound branch now keys on the normalized `capability_source`
+(missing → `EXECUTOR_DECLARED`, the approved legacy interpretation),
+never on array length:
+
+- `ROUTE_EXPLICIT` → `capabilities` IS the ceiling; `[]` permits NOTHING
+  → any capability request gets `CAPABILITY_MISMATCH`.
+- `EXECUTOR_DECLARED` → `[]` = unrestricted-by-route; no rejection.
+- Legacy rows without `capability_source` → `EXECUTOR_DECLARED` →
+  unrestricted — no competing interpretation.
+
+Executor-bound behavior (binding.capabilities authority) is untouched.
+
+New regression block **RCA.DC** (4 tests): DC1 explicit-empty denies
+CAP_X with `CAPABILITY_MISMATCH`; DC2 executor-declared-empty permits it;
+DC3 explicit non-empty allows listed/denies unlisted; DC4 legacy
+missing-source row is unrestricted.
+
+**Counterfactual on `e850054`:** exactly DC1 fails — the empty explicit
+ceiling incorrectly permits CAP_X. All other tests pass (DC2/DC3/DC4
+behaviors were already correct or independently covered).
+
+Results: focused 36/36; full suite **2466 pass / 2 failed** — same
+pre-existing P5 env failures; `tsc --noEmit` clean; `pnpm build` clean.
+All R1–R3 remediations preserved (binding-level authority, shared-route
+order independence, unqualified-boot reconcile, scoped POLICY_DENIAL,
+failedExecutorId, Bug C closure, CODEX/DSH TELEGRAM_DELIVERY,
+DEVIN-without-TD).
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`

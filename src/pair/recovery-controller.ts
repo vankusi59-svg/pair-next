@@ -30,6 +30,11 @@ export const FAILURE_CLASSES = [
   "TIMEOUT",
   "CANCELLED",
   "POLICY_DENIAL",
+  /** Selected executor's route set cannot serve the task (capability/health/
+   *  binding/qualification/route-state on its bound routes) — route-local
+   *  infeasibility, NOT a global governance prohibition: another governed
+   *  executor may still serve. Bounded re-route, never blind same-route retry. */
+  "ROUTE_INFEASIBLE",
   "PERMISSION_DENIAL",
   "WORKSPACE_DENIAL",
   "ARTIFACT_VALIDATION_FAILURE",
@@ -79,6 +84,7 @@ export const RECOVERY_MATRIX: Record<FailureClass, MatrixRow> = {
   TIMEOUT: { actions: ["RECONCILIATION_REQUIRED", "RETRY_SAME_ROUTE", "RE_ROUTE"], retry_allowed: true },
   CANCELLED: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false },
   POLICY_DENIAL: { actions: ["ABORT"], retry_allowed: false },
+  ROUTE_INFEASIBLE: { actions: ["RE_ROUTE", "RECONCILIATION_REQUIRED", "ABORT"], retry_allowed: false },
   PERMISSION_DENIAL: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false },
   WORKSPACE_DENIAL: { actions: ["HUMAN_APPROVAL_REQUIRED", "ABORT"], retry_allowed: false },
   ARTIFACT_VALIDATION_FAILURE: { actions: ["APPLY_VERIFIED_REMEDIATION", "REPLAN", "ABORT"], retry_allowed: false },
@@ -135,6 +141,10 @@ const CLASS_RULES: Array<[RegExp, FailureClass]> = [
   [/AUTHORIZATION|FORBIDDEN|DENY_BY|403/i, "AUTHORIZATION_FAILURE"],
   [/PERMISSION|ALLOWED_PATH|PATH_OUTSIDE|FILE_ACCESS/i, "PERMISSION_DENIAL"],
   [/WORKSPACE/i, "WORKSPACE_DENIAL"],
+  // Typed route-local infeasibility wins over the generic NO_ELIGIBLE bucket —
+  // only genuine governance codes (FAIL_CLOSED_NO_ELIGIBLE_ROUTE et al.) fall
+  // through to POLICY_DENIAL.
+  [/ROUTE_INFEASIBLE/i, "ROUTE_INFEASIBLE"],
   [/POLICY|CAPABILITY_MISMATCH|NOT_DISPATCHABLE|GOVERNANCE|NO_ELIGIBLE|GOVERNED_TASK|MISSION_ID_PUBLIC|BINDING_/i, "POLICY_DENIAL"],
   [/EXECUTOR_UNAVAILABLE|ADAPTER_NOT_BOUND|SPAWN|EXECUTABLE_NOT_FOUND|ENOENT/i, "EXECUTOR_UNAVAILABLE"],
   [/UNHEALTHY|NOT_READY|HEALTH/i, "EXECUTOR_UNHEALTHY"],

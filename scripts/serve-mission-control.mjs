@@ -661,6 +661,7 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
           route_id: modelRouteId,
           mechanism: "SPAWN_ENV",
           qualification_state: "QUALIFIED",
+          capabilities: dshCaps,
         }, "PAIR_MC");
       }
       modelRoutesRegistered++;

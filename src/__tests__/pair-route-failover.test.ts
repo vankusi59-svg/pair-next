@@ -183,6 +183,7 @@ function registerWithModelRoutes(ctx: Ctx, adapter: ScriptedAdapter, modelRoutes
         route_id: routeId,
         mechanism: "SPAWN_ENV",
         qualification_state: "QUALIFIED",
+        capabilities: caps,
       });
     }
   }

@@ -36,6 +36,29 @@ export const BINDING_MECHANISMS = new Set([
 ]);
 
 export const QUALIFICATION_STATES = new Set(["DECLARED", "QUALIFIED", "FAIL_CLOSED"]);
+/**
+ * Capability authority is per-binding, never per-route (Direction A):
+ *
+ *   binding.capabilities = executor declaration ∩ route ceiling
+ *
+ *  - Route = transport/supply constraint, independent of any executor.
+ *    `capability_source` records what `route.capabilities` means:
+ *      EXECUTOR_DECLARED — unrestricted-by-route: `capabilities: []` means
+ *        the route imposes NO ceiling; each bound executor inherits its own
+ *        declaration. All executor-minted routes use this.
+ *      ROUTE_EXPLICIT  — operator-declared ceiling: `capabilities` is the
+ *        normalized `capabilities_declared` set; bound executors are
+ *        clamped to it. `[]` here means the route supports nothing.
+ *    Disambiguation is by `capability_source`, never by empty-array alone.
+ *  - Binding = the executor↔route effective capability surface; reconciliation
+ *    recomputes it from the live executor declaration every registration —
+ *    order-independent, fail-closed on removals, never auto-widening an
+ *    explicit route's ceiling.
+ * A persisted route predating `capability_source` is executor-minted by
+ * construction (only executor registration mints routes; /api/routes is
+ * read-only), so reconcile treats it as EXECUTOR_DECLARED.
+ */
+export const CAPABILITY_SOURCES = new Set(["EXECUTOR_DECLARED", "ROUTE_EXPLICIT"]);
 export const ELIGIBILITY_STATES = new Set([
   "REGISTERED",
   "QUALIFIED",
@@ -119,6 +142,19 @@ export class RouteRegistry {
       qualification_state: String(payload.qualification_state ?? "DECLARED"),
       direct_callable: Boolean(payload.direct_callable),
       capabilities: Array.isArray(payload.capabilities) ? payload.capabilities : [],
+      // Default ROUTE_EXPLICIT: an explicitly registered capability list is an
+      // operator-declared contract — reconciliation never silently widens it.
+      // Executor-minted routes pass EXECUTOR_DECLARED explicitly.
+      capability_source: CAPABILITY_SOURCES.has(String(payload.capability_source))
+        ? String(payload.capability_source)
+        : "ROUTE_EXPLICIT",
+      // Declared intent is preserved verbatim; effective = declared ⊆ executor
+      // is derived at reconciliation. Default declared = the supplied list.
+      capabilities_declared: Array.isArray(payload.capabilities_declared)
+        ? payload.capabilities_declared
+        : Array.isArray(payload.capabilities)
+          ? payload.capabilities
+          : [],
       priority: Number(payload.priority ?? 100) || 100,
       // Model routes: pin the bound model identity at top level so cost
       // governance resolves per-model pricing (modelRefForRoute).
@@ -171,6 +207,148 @@ export class RouteRegistry {
       actor,
       enabled ? "ROUTE_ENABLED" : "ROUTE_DISABLED",
     );
+  }
+
+  /**
+   * Normalize a persisted route's capability CONSTRAINT (route-level, not
+   * per-executor). Deterministic representation, disambiguated by
+   * `capability_source`:
+   *  - EXECUTOR_DECLARED (incl. pre-field legacy rows) → `capabilities: []`
+   *    meaning unrestricted-by-route; effective caps live on each binding.
+   *  - ROUTE_EXPLICIT → `capabilities` = the sorted, de-duplicated
+   *    `capabilities_declared` ceiling — the max any binding may serve.
+   * Idempotent: no semantic change → no write, no version churn, no event.
+   */
+  reconcileRouteConstraint(
+    routeId: string,
+    actor = "PAIR_ROUTE_REGISTRY",
+  ): { route: Record<string, unknown>; changed: boolean } | null {
+    const route = this.getRoute(routeId);
+    if (!route) return null;
+    const source = CAPABILITY_SOURCES.has(String(route.capability_source))
+      ? String(route.capability_source)
+      : "EXECUTOR_DECLARED"; // legacy executor-minted row
+    const declared = [
+      ...new Set(
+        (((route.capabilities_declared as string[] | undefined) ??
+          (route.capabilities as string[] | undefined) ??
+          []) as string[])
+          .map(String)
+          .filter(Boolean),
+      ),
+    ].sort();
+    const ceiling = source === "ROUTE_EXPLICIT" ? declared : [];
+    const prior = ((route.capabilities as string[] | undefined) ?? []).map(String).sort();
+    if (
+      JSON.stringify(prior) === JSON.stringify(ceiling) &&
+      String(route.capability_source ?? "EXECUTOR_DECLARED") === source
+    ) {
+      return { route, changed: false };
+    }
+    const body: Record<string, unknown> = {
+      ...route,
+      capabilities: ceiling,
+      capability_source: source,
+      capabilities_declared: source === "ROUTE_EXPLICIT" ? declared : [],
+    };
+    const saved = this.store.put("route", routeId, { ...body, updated_at: utcnow() }, Number(route.version));
+    this.store.event({
+      entity_type: "route",
+      entity_id: routeId,
+      event_type: "ROUTE_CAPABILITIES_RECONCILED",
+      new_state: String(route.eligibility_state ?? route.qualification_state ?? "REGISTERED"),
+      actor,
+      metadata: { capability_source: source, constraint: ceiling },
+    });
+    return { route: saved, changed: true };
+  }
+
+  /** Route capability ceiling: null = unrestricted-by-route. */
+  private routeCeiling(route: Record<string, unknown>): Set<string> | null {
+    const source = CAPABILITY_SOURCES.has(String(route.capability_source))
+      ? String(route.capability_source)
+      : "EXECUTOR_DECLARED";
+    if (source !== "ROUTE_EXPLICIT") return null;
+    return new Set(
+      (((route.capabilities_declared as string[] | undefined) ??
+        (route.capabilities as string[] | undefined) ??
+        []) as string[])
+        .map(String)
+        .filter(Boolean),
+    );
+  }
+
+  /**
+   * Reconcile one binding's effective capabilities:
+   *   binding.capabilities = executor declaration ∩ route ceiling
+   * (unrestricted route → the full executor declaration).
+   * CAS write + BINDING_CAPABILITIES_RECONCILED event only on semantic change.
+   */
+  reconcileBindingCapabilities(
+    executorId: string,
+    routeId: string,
+    executorCapabilities: string[],
+    actor = "PAIR_ROUTE_REGISTRY",
+  ): { binding: Record<string, unknown>; changed: boolean } | null {
+    const binding = this.bindingFor(executorId, routeId);
+    if (!binding) return null;
+    const route = this.getRoute(String(binding.route_id ?? routeId));
+    if (!route) return null;
+    this.reconcileRouteConstraint(String(route.route_id), actor);
+    const ceiling = this.routeCeiling(this.getRoute(String(route.route_id)) ?? route);
+    const executorSet = new Set(executorCapabilities.map(String).filter(Boolean));
+    const effective = (ceiling === null
+      ? [...executorSet]
+      : [...executorSet].filter((c) => ceiling.has(c))
+    ).sort();
+    const prior = ((binding.capabilities as string[] | undefined) ?? []).map(String).sort();
+    if (JSON.stringify(prior) === JSON.stringify(effective)) {
+      return { binding, changed: false };
+    }
+    const saved = this.store.put(
+      "executor_supply_binding",
+      String(binding.binding_id),
+      { ...binding, capabilities: effective, updated_at: utcnow() },
+      Number(binding.version),
+    );
+    this.store.event({
+      entity_type: "executor_supply_binding",
+      entity_id: String(binding.binding_id),
+      event_type: "BINDING_CAPABILITIES_RECONCILED",
+      new_state: String(binding.qualification_state ?? "REGISTERED"),
+      actor,
+      metadata: {
+        executor_id: executorId,
+        route_id: String(binding.route_id),
+        added: effective.filter((c) => !prior.includes(c)),
+        removed: prior.filter((c) => !effective.includes(c)),
+      },
+    });
+    return { binding: saved, changed: true };
+  }
+
+  /**
+   * Reconcile EVERY binding of an executor against its fresh declaration —
+   * the canonical seam called at each (re)registration, qualified or not.
+   * Order-independent: each binding is recomputed from (executor ∩ its own
+   * route's ceiling), so shared routes never flip between executors.
+   */
+  reconcileExecutorBindings(
+    executorId: string,
+    executorCapabilities: string[],
+    actor = "PAIR_ROUTE_REGISTRY",
+  ): number {
+    let changed = 0;
+    for (const binding of this.bindingsForExecutor(executorId)) {
+      const res = this.reconcileBindingCapabilities(
+        executorId,
+        String(binding.route_id),
+        executorCapabilities,
+        actor,
+      );
+      if (res?.changed) changed++;
+    }
+    return changed;
   }
 
   updateRouteHealth(routeId: string, patch: Record<string, unknown>): Record<string, unknown> | null {
@@ -272,12 +450,21 @@ export class RouteRegistry {
         eligibility_state: r.eligibility_state,
         qualification_state: r.qualification_state,
         priority: r.priority,
+        // Capability authority is part of live routing — the digest must
+        // bind it or two registries with different routability hash equal.
+        capabilities: [...((r.capabilities as string[]) ?? [])].sort(),
+        capability_source: r.capability_source ?? null,
+        capabilities_declared: [...((r.capabilities_declared as string[]) ?? [])].sort(),
       })),
       bindings: this.listBindings().map((b) => ({
         binding_id: b.binding_id,
         executor_id: b.executor_id,
         route_id: b.route_id,
         qualification_state: b.qualification_state,
+        // Effective executor↔route capability surface is part of live
+        // routing — the digest must bind it or two registries with
+        // different routability hash equal.
+        capabilities: [...((b.capabilities as string[]) ?? [])].sort(),
       })),
     };
     return digest(JSON.parse(canonicalJson(identity)) as Record<string, unknown>);
@@ -286,8 +473,25 @@ export class RouteRegistry {
   /**
    * Seed the canonical PAIR_NATIVE route + binding. Idempotent: re-running
    * returns the existing entities without rewriting qualification state.
+   * Capability authority = the registered PAIR_NATIVE executor declaration
+   * (falls back to the canonical seed set when no executor row exists yet);
+   * an existing route is reconciled to it like every executor-minted route.
    */
-  seedPairNativeRoute(actor = "PAIR_ROUTE_REGISTRY"): { route: Record<string, unknown>; binding: Record<string, unknown> } {
+  seedPairNativeRoute(
+    actor = "PAIR_ROUTE_REGISTRY",
+    capabilities?: string[],
+  ): { route: Record<string, unknown>; binding: Record<string, unknown> } {
+    const authority =
+      capabilities ??
+      (() => {
+        try {
+          const exec = this.store.get("executor", "PAIR_NATIVE");
+          const caps = (exec.capabilities as string[] | undefined) ?? [];
+          return caps.length ? caps : ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"];
+        } catch {
+          return ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"];
+        }
+      })();
     let route = this.getRoute(PAIR_NATIVE_ROUTE_ID);
     if (!route) {
       route = this.registerRoute(
@@ -297,13 +501,17 @@ export class RouteRegistry {
           enabled: true,
           eligibility_state: "QUALIFIED",
           qualification_state: "QUALIFIED",
-          capabilities: ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
+          capabilities: [],
+          capability_source: "EXECUTOR_DECLARED", // unrestricted-by-route
           priority: 100,
           executor_hint: "PAIR_NATIVE",
           metadata: { executor_kind: "AUTOMATON_LOCAL_WORKER_POOL" },
         },
         actor,
       );
+    } else {
+      this.reconcileRouteConstraint(PAIR_NATIVE_ROUTE_ID, actor);
+      route = this.getRoute(PAIR_NATIVE_ROUTE_ID) ?? route;
     }
     let binding = this.bindingFor("PAIR_NATIVE", PAIR_NATIVE_ROUTE_ID);
     if (!binding) {
@@ -317,6 +525,9 @@ export class RouteRegistry {
         actor,
       );
     }
+    // Binding-level effective caps = executor declaration ∩ route ceiling.
+    this.reconcileExecutorBindings("PAIR_NATIVE", authority, actor);
+    binding = this.bindingFor("PAIR_NATIVE", PAIR_NATIVE_ROUTE_ID) ?? binding;
     return { route, binding };
   }
 }

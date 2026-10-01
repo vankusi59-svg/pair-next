@@ -532,8 +532,10 @@ describe("P3 negative tests — fail-closed eligibility", () => {
       qualification_state: "DECLARED",
     });
     const m = seedMission(ctx);
+    // Route-local infeasibility (unqualified binding) is FAIL_CLOSED_ROUTE_INFEASIBLE;
+    // FAIL_CLOSED_NO_ELIGIBLE_ROUTE is reserved for genuine policy denials.
     expect(() => ctx.router.routeGovernedTask(m.request, adaptersOf(ctx))).toThrowError(
-      /FAIL_CLOSED_NO_ELIGIBLE_ROUTE/,
+      /FAIL_CLOSED_ROUTE_INFEASIBLE/,
     );
     const decisions = ctx.store.list("route_decision");
     const rejections = decisions[0].hard_rejections as Array<Record<string, unknown>>;
@@ -547,7 +549,7 @@ describe("P3 negative tests — fail-closed eligibility", () => {
     ctx.service.routes.setRouteEnabled(PAIR_NATIVE_ROUTE_ID, false);
     const m = seedMission(ctx);
     expect(() => ctx.router.routeGovernedTask(m.request, adaptersOf(ctx))).toThrowError(
-      /FAIL_CLOSED_NO_ELIGIBLE_ROUTE/,
+      /FAIL_CLOSED_ROUTE_INFEASIBLE/,
     );
   });
 
