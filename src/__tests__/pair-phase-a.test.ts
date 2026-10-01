@@ -31,6 +31,7 @@ import {
   modelRoleOf,
   readPositiveIntEnv,
   reconcileModelRoleAssignments,
+  resolveConfiguredModelRoleRoute,
   resolveMcToken,
   revokeModelRole,
   sameCanonicalModel,
@@ -589,6 +590,108 @@ describe("R1 — reconcileModelRoleAssignments", () => {
     );
     // previous topology untouched: A still planner, b still dsh
     expect(activeRoles(ctx)).toEqual([`a=${MODEL_ROLE.PLANNER_COORDINATOR}`, `b=${MODEL_ROLE.DSH_EXECUTION}`]);
+  });
+});
+
+/* ============== R2 — strict configured-route resolution ================== */
+
+describe("R2 — resolveConfiguredModelRoleRoute (startup config seam)", () => {
+  const resolver = (ctx: ReturnType<typeof makeCtx>) => (p: string, m: string) =>
+    ctx.mcat.getModelByIds(p, m);
+  const UNRESOLVED = "FAIL_CLOSED_MODEL_ROLE_ROUTE_UNRESOLVED";
+
+  it("A — unresolved planner route fails closed", () => {
+    const ctx = makeCtx("r2-a");
+    addModel(ctx, "gemini", "a");
+    expectFailClosed(
+      () => resolveConfiguredModelRoleRoute(resolver(ctx), { route: "gemini:missing-model", role: MODEL_ROLE.PLANNER_COORDINATOR }),
+      UNRESOLVED,
+    );
+  });
+
+  it("B — unresolved DSH primary fails closed", () => {
+    const ctx = makeCtx("r2-b");
+    addModel(ctx, "groq", "b");
+    expectFailClosed(
+      () => resolveConfiguredModelRoleRoute(resolver(ctx), { route: "cloudflare:missing", role: MODEL_ROLE.DSH_EXECUTION }),
+      UNRESOLVED,
+    );
+  });
+
+  it("C — unresolved DSH fallback fails closed", () => {
+    const ctx = makeCtx("r2-c");
+    addModel(ctx, "cloudflare", "c");
+    expectFailClosed(
+      () => resolveConfiguredModelRoleRoute(resolver(ctx), { route: "groq:missing", role: MODEL_ROLE.DSH_EXECUTION }),
+      UNRESOLVED,
+    );
+  });
+
+  it("D — one unresolved route among extras rejects the whole resolution", () => {
+    const ctx = makeCtx("r2-d");
+    addModel(ctx, "gemini", "a");
+    addModel(ctx, "cloudflare", "c");
+    addModel(ctx, "groq", "g");
+    const routes = ["cloudflare:c", "groq:g", "nvidia:missing"];
+    expectFailClosed(
+      () => routes.map((r) => resolveConfiguredModelRoleRoute(resolver(ctx), { route: r, role: MODEL_ROLE.DSH_EXECUTION })),
+      UNRESOLVED,
+    );
+  });
+
+  it("E — malformed route (no provider:model separator) fails closed", () => {
+    const ctx = makeCtx("r2-e");
+    addModel(ctx, "gemini", "a");
+    for (const bad of ["nomodel", ":m", "p:", "  "]) {
+      expectFailClosed(
+        () => resolveConfiguredModelRoleRoute(resolver(ctx), { route: bad, role: MODEL_ROLE.DSH_EXECUTION }),
+        UNRESOLVED,
+      );
+    }
+  });
+
+  it("F — empty explicit planner route fails closed", () => {
+    const ctx = makeCtx("r2-f");
+    addModel(ctx, "gemini", "a");
+    expectFailClosed(
+      () => resolveConfiguredModelRoleRoute(resolver(ctx), { route: "", role: MODEL_ROLE.PLANNER_COORDINATOR }),
+      UNRESOLVED,
+    );
+  });
+
+  it("G — all refs valid → resolution returns canonical refs", () => {
+    const ctx = makeCtx("r2-g");
+    const A = addModel(ctx, "gemini", "a");
+    const C = addModel(ctx, "cloudflare", "c");
+    const p = resolveConfiguredModelRoleRoute(resolver(ctx), { route: "gemini:a", role: MODEL_ROLE.PLANNER_COORDINATOR });
+    const d = resolveConfiguredModelRoleRoute(resolver(ctx), { route: "cloudflare:c", role: MODEL_ROLE.DSH_EXECUTION });
+    expect(p.model_entry_id).toBe(String(A.model_entry_id));
+    expect(d.model_entry_id).toBe(String(C.model_entry_id));
+    expect(p.pid).toBe("gemini");
+    expect(p.mid).toBe("a");
+  });
+
+  it("H — failure happens before any assignment/revoke/reassign mutation", () => {
+    const ctx = makeCtx("r2-h");
+    addModel(ctx, "gemini", "a");
+    addModel(ctx, "groq", "b");
+    reconcileModelRoleAssignments(
+      ctx.store,
+      { planner: [{ model_entry_id: String(ctx.mcat.getModelByIds("gemini", "a")!.model_entry_id) }], dsh: [{ model_entry_id: String(ctx.mcat.getModelByIds("groq", "b")!.model_entry_id) }] },
+    );
+    const rolesBefore = JSON.stringify(listModelRoleAssignments(ctx.store));
+    const eventsBefore = ctx.store.listEvents("model_role_assignment").length;
+    // startup-style: resolve ALL configured routes first; one bad ref throws
+    expectFailClosed(
+      () => [
+        resolveConfiguredModelRoleRoute(resolver(ctx), { route: "gemini:a", role: MODEL_ROLE.PLANNER_COORDINATOR }),
+        resolveConfiguredModelRoleRoute(resolver(ctx), { route: "groq:b", role: MODEL_ROLE.DSH_EXECUTION }),
+        resolveConfiguredModelRoleRoute(resolver(ctx), { route: "cloudflare:missing", role: MODEL_ROLE.DSH_EXECUTION }),
+      ],
+      UNRESOLVED,
+    );
+    expect(JSON.stringify(listModelRoleAssignments(ctx.store))).toBe(rolesBefore);
+    expect(ctx.store.listEvents("model_role_assignment")).toHaveLength(eventsBefore);
   });
 });
 

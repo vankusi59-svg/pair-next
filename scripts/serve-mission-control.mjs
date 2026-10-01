@@ -71,6 +71,7 @@ import {
   taskTimeoutSeconds,
   resolveMcToken,
   reconcileModelRoleAssignments,
+  resolveConfiguredModelRoleRoute,
   assertCanonicalModelRoleStateDisjoint,
   assertPlannerModelRole,
   assertDshExecutionModelRole,
@@ -464,18 +465,18 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     // model_entry_ids, enforce Planner∩DSH=∅ BEFORE assigning roles, then
     // record each model's role. Qualification remains a separate gate — a
     // role never substitutes for it.
-    const routeRef = (route) => {
-      const [pid, ...rest] = route.split(":");
-      const mid = rest.join(":");
-      const me = mid ? mcat.getModelByIds(pid, mid) : null;
-      return me ? { model_entry_id: String(me.model_entry_id), ref: route, pid, mid } : null;
-    };
-    const plannerRefs = [routeRef(PLANNER_ROUTE)].filter(Boolean);
-    if (!plannerRefs.length) console.log("MODEL_ROUTE: planner route", PLANNER_ROUTE, "(not discovered)");
-    const dshRefs = DSH_ROUTES.map(routeRef).filter(Boolean);
-    for (const route of DSH_ROUTES) {
-      if (!dshRefs.some((r) => r.ref === route)) console.log("MODEL_ROUTE: skip", route, "(not discovered)");
-    }
+    // R2 — strict configured-route resolution: EVERY configured route must
+    // resolve to a canonical model_entry or boot fails closed BEFORE any
+    // role mutation. No .filter(Boolean) — an unresolved configured route
+    // is never silently dropped into a smaller pool.
+    const resolveCfg = (route, role) =>
+      resolveConfiguredModelRoleRoute((p, m) => mcat.getModelByIds(p, m), { route, role });
+    const plannerRefs = [resolveCfg(PLANNER_ROUTE, MODEL_ROLE.PLANNER_COORDINATOR)];
+    const dshRefs = DSH_ROUTES.map((r) => resolveCfg(r, MODEL_ROLE.DSH_EXECUTION));
+    // Dedupe by canonical entry (operator may set fallback=primary for a
+    // single-route DSH pool) — dedupe AFTER resolution, never drop.
+    const seen = new Set();
+    const dshPool = dshRefs.filter((r) => (seen.has(r.model_entry_id) ? false : (seen.add(r.model_entry_id), true)));
     // R1 — canonical reconciliation: the ACTIVE assignment set converges to
     // exactly the desired pools in one atomic step (stale rows revoked to
     // role=null, changed roles reassigned, all audited — history preserved
@@ -483,7 +484,7 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     // merely the configured refs.
     const roleRes = reconcileModelRoleAssignments(store, {
       planner: plannerRefs,
-      dsh: dshRefs,
+      dsh: dshPool,
       actor: "PAIR_MC",
     });
     console.log("MODEL_ROLE: reconciled", JSON.stringify(roleRes));

@@ -196,6 +196,48 @@ export interface ModelPoolRef {
   ref?: string;
 }
 
+export interface ConfiguredRouteResolution extends ModelPoolRef {
+  pid: string;
+  mid: string;
+}
+
+/**
+ * Strict configured-route resolution (Phase A R2). Every configured role
+ * route — planner, DSH primary/fallback/extra — must resolve to a canonical
+ * catalog model_entry or the whole role topology is rejected BEFORE any
+ * assignment mutation. Callers must NOT filter out unresolved configured
+ * authority: shrinking a pool because a configured route did not resolve
+ * bypasses default-deny and R1 §5F.
+ *
+ * Syntax: "provider:model" — provider is text before the FIRST colon, model
+ * is the remainder (model ids may themselves contain colons). Empty route,
+ * empty provider, or empty model all fail closed. Safe diagnostics only:
+ * role, configured ref, provider id, model id — never credentials.
+ */
+export function resolveConfiguredModelRoleRoute(
+  resolveEntry: (provider: string, model: string) => { model_entry_id?: unknown } | null | undefined,
+  opts: { route: string; role: ModelRole },
+): ConfiguredRouteResolution {
+  const route = String(opts.route ?? "").trim();
+  const sep = route.indexOf(":");
+  const pid = sep < 0 ? "" : route.slice(0, sep).trim();
+  const mid = sep < 0 ? "" : route.slice(sep + 1).trim();
+  if (!route || !pid || !mid) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_ROLE_ROUTE_UNRESOLVED",
+      `role ${opts.role}: malformed configured route ${JSON.stringify({ ref: route, role: opts.role, provider: pid || null, model: mid || null })}`,
+    );
+  }
+  const me = resolveEntry(pid, mid);
+  if (!me || me.model_entry_id === undefined || me.model_entry_id === null) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_ROLE_ROUTE_UNRESOLVED",
+      `role ${opts.role}: configured route did not resolve to a canonical model_entry ${JSON.stringify({ ref: route, role: opts.role, provider: pid, model: mid })}`,
+    );
+  }
+  return { model_entry_id: String(me.model_entry_id), ref: route, pid, mid };
+}
+
 export interface RoleReconcileResult {
   created: string[];
   reassigned: string[];
