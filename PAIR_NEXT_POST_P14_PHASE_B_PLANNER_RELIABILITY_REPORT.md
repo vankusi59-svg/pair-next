@@ -544,3 +544,99 @@ pnpm build clean.
   restart-exact since started_at + task_timeout_ms persist.
 - `PAIR_DEVIN_BLOCKED_GRACE_MS=300` in the spec's example is below the
   documented 5s min — flagged, used 300000 for the valid-path smoke.
+
+## R4 — LIVE MISSION INPUT + RECOVERY LIMBO CLOSURE
+
+Audited pre-R4 HEAD: `1fe0f1337e1982c2aede5c22b5bacb3821e61d0c`
+
+### Root causes (reproduced on prod pair.db — 5 missions RUNNING-forever)
+- **A — workspace-less mission input**: telegram-style callers submit
+  `{goal, project_id}` without `authorized_workspaces` → mission persisted
+  `ws: []` → the governed task materialized `workspace = "undefined"` →
+  `FAIL_CLOSED_WORKSPACE_UNAUTHORIZED` at dispatch.
+- **B — recovery limbo**: that dispatch failure classified UNKNOWN →
+  `RECONCILIATION_REQUIRED` → reconcile `CONFIRMED_NOT_EXECUTED` →
+  `applyPendingRecovery` had no case → `unhandled:RECONCILIATION_REQUIRED` →
+  runtime returned RUNNING while the already-`settled` barrier kept blocking
+  `pickRunnable` → permanent limbo, never re-decided.
+
+### Changes
+- **`normalizeMissionWorkspaces(input)`** (`mission-control.ts`): supplied
+  non-empty `authorized_workspaces` are kept verbatim; otherwise the canonical
+  `project.root_location` is resolved and used as `[root_location]`; missing
+  project/empty root throws `FAIL_CLOSED_NO_AUTHORIZED_WORKSPACE`. Called
+  BEFORE plan/digest in `previewMission`, `createPlanPreview`
+  (effective_input_digest + mission_plan_preview + confirm replay) and
+  `startMissionInternal` — one shared seam covers /api/missions,
+  /api/missions/preview, preview→confirm, telegram, schedules.
+- **`classifyFailure` shadowing fix** (`recovery-controller.ts`): the ordered
+  CLASS_RULES test now runs on `errCode + "\n" + errClass` so specific error
+  codes win over generic transport classes:
+  `FAIL_CLOSED_WORKSPACE_UNAUTHORIZED`/`FAIL_CLOSED_ALLOWED_PATH_UNAUTHORIZED`
+  → WORKSPACE_DENIAL; `FAIL_CLOSED_CAPABILITY_MISMATCH` + policy/governance
+  codes → POLICY_DENIAL. Deterministic pre-dispatch policy rejections now
+  take bounded non-retriable actions (HUMAN_APPROVAL/ABORT per matrix)
+  instead of UNKNOWN→RECONCILE loops.
+- **RECONCILIATION_REQUIRED lifecycle closure** (`mission-runtime.ts`):
+  `applyPendingRecovery` handles it — settled barrier with
+  `CONFIRMED_NOT_EXECUTED` → `clearPendingRecovery("reconcile_confirmed_not_executed")`
+  + fresh `startRecovery` carrying `settled_reconciliation:{outcome,
+  reconciliation_id}`; other settled outcomes → clear + bounded transition;
+  absent barrier → clear + re-decide (rebuild allowed); unsettled →
+  RECONCILING. `startRecovery` threads the ctx into `recovery.decide`.
+- **Re-selection guard** (`recovery-controller.ts`): `decide` accepts
+  `settled_reconciliation`; when present a `RECONCILIATION_REQUIRED` candidate
+  is pushed to rejected_actions with reason
+  `RECONCILIATION_ALREADY_SETTLED:<outcome>` instead of re-selecting — the
+  fresh decision is recorded and never loops.
+- **Settled-barrier semantics**: `pickRunnable` ignores barriers with
+  `settled === true` (kept as evidence, no scheduling authority).
+- **Legacy self-heal seam**: `runRunning` detects the legacy shape
+  (`pending_recovery` with `reason === "unhandled:"+action` or pending
+  RECONCILE) and re-enters `applyPendingRecovery` on a normal tick — no DB
+  surgery, deterministic compatibility repair inside the state machine.
+
+### Tests (A–R, +11 focused)
+A/B normalization defaults + explicit passthrough; C fail-closed no-project;
+D/E digest/preview/confirm replay carries ws end-to-end; F classification
+matrix (workspace→WORKSPACE_DENIAL, allowed-path→WORKSPACE_DENIAL,
+capability→POLICY_DENIAL, transport-only→UNKNOWN unchanged); G/J workspace
+denial → WAITING_APPROVAL bounded; G2 explicit caller ws honored verbatim;
+H/I UNKNOWN→RECONCILE→CONFIRMED_NOT_EXECUTED→settled barrier unblocks→fresh
+decision→bounded terminal, no `unhandled:`; K/L/M/N retry-path redrive
+through MissionRouter+GovernedTaskGate again (callCount 2, one successful
+dispatch, cost HELD released via proven `{dispatched:false}` evidence — no
+executor bypass, no blind replay); O UNKNOWN_SIDE_EFFECT_STATE → approval
+required, no replay; Q restart before redrive preserves pending recovery;
+R late materialization of barrier reconciles and settles.
+
+### Regression
+Phase B focused 89/89 (+11). Full suite 2373 pass / 2 fail — the same
+pre-existing P5 DSH+CODEX env failures as base `2277319` (documented).
+tsc --noEmit clean, pnpm build clean.
+
+### Live evidence
+Isolated instance :8801 (`~/pair-mc-r4`, copy of pair-mc-b1, project root
+re-pointed inside the dir — test-fixture env setup only):
+- Telegram-style `POST /api/missions {goal, project_id}` without
+  authorized_workspaces → `MSN_01M3VAMF9WZYM9N1HZWRZHE5SG` persisted
+  `authorized_workspaces=["/home/ubuntu/pair-mc-r4/ws-r4"]`; both governed
+  tasks dispatched with the same ws; T1 wrote `mission_goal.txt` there via
+  the PAIR_NATIVE worker — no `undefined` anywhere.
+- T2 dispatch error → UNKNOWN → RECONCILIATION_REQUIRED →
+  CONFIRMED_NOT_EXECUTED → fresh decision rejected
+  `RECONCILIATION_ALREADY_SETTLED:CONFIRMED_NOT_EXECUTED` → **ABORT**
+  (bounded terminal `recovery_abort:UNKNOWN`, no limbo).
+- **Prod restart on this build**: all 5 legacy stuck missions
+  (`MSN_01M3V728EV…`, `…7MGY9`, `…7N4BJ`, `…7RT5R`, `…86TC`) self-healed on
+  normal ticks within ~60s — each recorded the identical lifecycle
+  `UNKNOWN→RECONCILIATION_REQUIRED` then `UNKNOWN→ABORT` with the settled-
+  reconcile rejection, rt → ABORTED, mission → FAILED. Zero manual row
+  edits on any mission entity.
+
+### Limitations / notes
+- A manual `payload_hash`-invalid edit to a *project* row in the test copy
+  is still integrity-rejected by `tickSchedules` — the hash gate works;
+  unrelated to mission repair (no mission rows were touched).
+- Missions whose tasks cannot proceed abort via recovery — the abort path
+  is bounded and audited rather than silently retried forever.
