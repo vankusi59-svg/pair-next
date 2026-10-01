@@ -34,6 +34,7 @@ import {
   verifyPlanPreviewForConfirm,
   PREVIEW_ENTITY,
   ATTEMPT_ENTITY,
+  RUN_ENTITY,
 } from "./plan-preview.js";
 import type { PlannerAttemptRecord } from "./planner-pool.js";
 import type { RuntimePlanner } from "./mission-runtime.js";
@@ -386,6 +387,9 @@ export class MissionControl {
       operator_id?: string;
     },
     plannerEvidence?: {
+      /** R1 durable-run id — attempts were persisted during failover and
+       *  get linked to the preview here (atomically). */
+      planner_run_id?: string;
       attempts: PlannerAttemptRecord[];
       winner: PlannerAttemptRecord | null;
       warnings: string[];
@@ -451,6 +455,7 @@ export class MissionControl {
       canonical_tasks: tasks as unknown as Array<Record<string, unknown>>,
       attempts: plannerEvidence?.attempts ?? [],
       winner: plannerEvidence?.winner ?? null,
+      planner_run_id: plannerEvidence?.planner_run_id,
       operator_id: input.operator_id,
       ttlSeconds: this.deps.planPreviewTtlSeconds,
     });
@@ -461,6 +466,7 @@ export class MissionControl {
       plan: { tasks: row.canonical_tasks },
       planner: row.planner ?? null,
       planner_attempt_id: row.planner_attempt_id ?? null,
+      planner_run_id: row.planner_run_id ?? null,
       expires_at: row.expires_at,
       state: row.state,
       plan_source: plannerEvidence?.winner ? "LLM" : "TEMPLATE",
@@ -642,7 +648,10 @@ export class MissionControl {
       .list(ATTEMPT_ENTITY)
       .filter((a) => String(a.preview_id) === String(previewId))
       .sort((a, b) => Number(a.attempt_no) - Number(b.attempt_no));
-    return { preview: row, planner_attempts: attempts };
+    const plannerRun = row.planner_run_id
+      ? this.store.tryGet(RUN_ENTITY, String(row.planner_run_id))
+      : null;
+    return { preview: row, planner_attempts: attempts, planner_run: plannerRun };
   }
 
   /** Create + queue a mission for orchestration. */

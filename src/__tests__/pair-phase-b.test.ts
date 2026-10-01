@@ -42,6 +42,13 @@ import {
   assignModelRole,
   revokeModelRole,
   assertPlannerModelRole,
+  assertPlannerCandidateEligible,
+  beginPlannerRun,
+  persistPlannerAttemptStart,
+  settlePlannerAttempt,
+  finishPlannerRun,
+  validatePlanProposal,
+  providerEntryId,
   ModelEvidenceCatalog,
   MODEL_ROLE,
   type PlannerAttemptRecord,
@@ -135,7 +142,7 @@ describe("planner failover", () => {
     const res = await runPlannerFailover({
       candidates: [cand("A"), cand("B")],
       planFn: async () => okPlan("t"),
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(res.winner.model_entry_id).toBe("A");
     expect(res.attempts).toHaveLength(1);
@@ -150,7 +157,7 @@ describe("planner failover", () => {
         seen.push(c.model_entry_id);
         return c.model_entry_id === "A" ? failPlan("LLM_PLANNER_REQUEST_TIMEOUT") : okPlan("t");
       },
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(seen).toEqual(["A", "B"]);
     expect(res.winner.model_entry_id).toBe("B");
@@ -162,7 +169,7 @@ describe("planner failover", () => {
     const res = await runPlannerFailover({
       candidates: [cand("A"), cand("B"), cand("C")],
       planFn: async (c) => (c.model_entry_id === "C" ? okPlan("t") : failPlan("LLM_PLANNER_HTTP_500")),
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(res.winner.model_entry_id).toBe("C");
     expect(res.attempts).toHaveLength(3);
@@ -174,7 +181,7 @@ describe("planner failover", () => {
       () => runPlannerFailover({
         candidates: [cand("A", "p:a"), cand("B", "p:b")],
         planFn: async () => failPlan("LLM_PLANNER_HTTP_429"),
-        assertRole: () => {},
+        assertEligible: () => {},
       }),
       "FAIL_CLOSED_PLANNER_EXHAUSTED",
     );
@@ -182,7 +189,7 @@ describe("planner failover", () => {
       await runPlannerFailover({
         candidates: [cand("A", "p:a"), cand("B", "p:b")],
         planFn: async () => failPlan("LLM_PLANNER_HTTP_429"),
-        assertRole: () => {},
+        assertEligible: () => {},
       });
     } catch (e) {
       const msg = String((e as Error).message);
@@ -201,7 +208,7 @@ describe("planner failover", () => {
         order.push(c.model_entry_id);
         return okPlan("t");
       },
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(order).toEqual(["P"]);
   });
@@ -236,7 +243,7 @@ describe("planner failover", () => {
         planFn: async () => {
           throw new IntegrityError("FAIL_CLOSED_SECRET_CAP_VIOLATION", "x");
         },
-        assertRole: () => {},
+        assertEligible: () => {},
       }),
       "FAIL_CLOSED_SECRET_CAP_VIOLATION",
     );
@@ -247,7 +254,7 @@ describe("planner failover", () => {
       () => runPlannerFailover({
         candidates: [cand("A"), cand("B")],
         planFn: async () => okPlan("t"),
-        assertRole: (c) => {
+        assertEligible: (c) => {
           if (c.model_entry_id === "A") throw new IntegrityError("FAIL_CLOSED_MODEL_ROLE_MISMATCH", "A");
         },
       }),
@@ -260,7 +267,7 @@ describe("planner failover", () => {
       candidates: [cand("A"), cand("B")],
       planFn: async (c) =>
         c.model_entry_id === "A" ? { tasks: [T1, T2], warnings: ["LLM_PLAN_PARTIAL_DROPS"] } : okPlan("other"),
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(res.winner.model_entry_id).toBe("A");
     expect(res.tasks).toHaveLength(2); // whole plan kept, not merged with B
@@ -270,7 +277,7 @@ describe("planner failover", () => {
     const res = await runPlannerFailover({
       candidates: [cand("A", "gemini:m1")],
       planFn: async () => okPlan("t"),
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     const a = res.attempts[0];
     expect(a.route).toBe("gemini:m1");
@@ -286,7 +293,7 @@ describe("planner failover", () => {
     const res = await runPlannerFailover({
       candidates: [cand("A"), cand("B")],
       planFn: async (c) => (c.model_entry_id === "A" ? failPlan("LLM_PLAN_UNBALANCED_JSON") : okPlan("t")),
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.MALFORMED_RESPONSE);
     expect(res.winner.model_entry_id).toBe("B");
@@ -299,7 +306,7 @@ describe("planner failover", () => {
         if (c.model_entry_id === "A") throw new Error("ENOTFOUND");
         return okPlan("t");
       },
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.NETWORK_ERROR);
     expect(res.winner.model_entry_id).toBe("B");
@@ -310,7 +317,7 @@ describe("planner failover", () => {
       await runPlannerFailover({
         candidates: [cand("A", "gemini:m1")],
         planFn: async () => failPlan("LLM_PLANNER_NO_CREDENTIAL"),
-        assertRole: () => {},
+        assertEligible: () => {},
       });
     } catch (e) {
       const msg = String((e as Error).message);
@@ -324,7 +331,7 @@ describe("planner failover", () => {
     const res = await runPlannerFailover({
       candidates: [cand("A")],
       planFn: async () => ({ tasks: [T1], warnings: ["LLM_PLAN_PARTIAL_DROPS"] }),
-      assertRole: () => {},
+      assertEligible: () => {},
     });
     expect(res.attempts[0].warnings).toEqual(["LLM_PLAN_PARTIAL_DROPS"]);
   });
@@ -334,7 +341,7 @@ describe("planner failover", () => {
     await runPlannerFailover({
       candidates: [cand("A"), cand("B"), cand("C")],
       planFn: async () => okPlan("t"),
-      assertRole: (c) => asserted.push(c.model_entry_id),
+      assertEligible: (c) => asserted.push(c.model_entry_id),
     });
     expect(asserted).toEqual(["A"]); // stops at first success
   });
@@ -697,5 +704,355 @@ describe("planner/DSH pool isolation", () => {
     assignModelRole(store, String(entry.model_entry_id), MODEL_ROLE.PLANNER_COORDINATOR, "test");
     revokeModelRole(store, String(entry.model_entry_id), "test");
     expect(() => assertPlannerModelRole(store, String(entry.model_entry_id))).toThrow(/FAIL_CLOSED/);
+  });
+});
+
+/* ============ R1 — zero-eligible fail-closed + durable run evidence +
+ *            canonical validation inside failover + eligibility =========== */
+
+/** Drive failover with durable-evidence hooks, mirroring the serve seam. */
+const runDurable = async (
+  store: PairEvidenceStore,
+  opts: Parameters<typeof runPlannerFailover>[0],
+  projectId = "P1",
+) => {
+  const run = beginPlannerRun(store, {
+    project_id: projectId,
+    operator_id: "op1",
+    routes: opts.candidates.map((c) => c.ref),
+  });
+  const runId = String(run.planner_run_id);
+  try {
+    const res = await runPlannerFailover({
+      ...opts,
+      onAttemptStart: (b) =>
+        persistPlannerAttemptStart(store, {
+          planner_run_id: runId,
+          project_id: projectId,
+          record: b,
+        }).planner_attempt_id,
+      onAttemptEnd: (tok, rec) =>
+        settlePlannerAttempt(store, {
+          planner_attempt_id: String(tok),
+          record: rec,
+          winner: rec.outcome === "SUCCESS",
+        }),
+      onExhausted: () =>
+        finishPlannerRun(store, { planner_run_id: runId, outcome: "EXHAUSTED" }),
+    });
+    finishPlannerRun(store, {
+      planner_run_id: runId,
+      outcome: "WINNER_SELECTED",
+      winner_attempt_no: res.winner.attempt_no,
+    });
+    return { res, runId };
+  } catch (e) {
+    const r = store.get("planner_run", runId);
+    if (String(r.state) === "RUNNING") {
+      finishPlannerRun(store, {
+        planner_run_id: runId,
+        outcome: "FAILED",
+        error_code: (e as { code?: string }).code ?? "ERR",
+      });
+    }
+    throw e;
+  }
+};
+
+const attemptsOf = (store: PairEvidenceStore, runId: string) =>
+  store
+    .list("planner_attempt")
+    .filter((a) => String(a.planner_run_id) === runId)
+    .sort((a, b) => Number(a.attempt_no) - Number(b.attempt_no));
+
+describe("R1 — zero eligible + durable evidence", () => {
+  it("38. zero candidates → FAIL_CLOSED_PLANNER_NO_ELIGIBLE (planFn never runs)", async () => {
+    let called = 0;
+    await expectCode(
+      () =>
+        runPlannerFailover({
+          candidates: [],
+          planFn: async () => {
+            called++;
+            return okPlan("t");
+          },
+          assertEligible: () => {},
+        }),
+      "FAIL_CLOSED_PLANNER_NO_ELIGIBLE",
+    );
+    expect(called).toBe(0);
+  });
+
+  it("39. zero-candidate failure → no preview/mission/attempt rows, no T1", async () => {
+    const ctx = makeCtx("p39");
+    // Serve-seam order: begin run → runPlannerFailover throws before any
+    // attempt → run settles FAILED → createPlanPreview is never reached.
+    const run = beginPlannerRun(ctx.store, {
+      project_id: ctx.projectId,
+      operator_id: "op1",
+      routes: ["gemini:gone"],
+    });
+    await expectCode(
+      () =>
+        runPlannerFailover({
+          candidates: [],
+          planFn: async () => okPlan("t"),
+          assertEligible: () => {},
+        }),
+      "FAIL_CLOSED_PLANNER_NO_ELIGIBLE",
+    );
+    finishPlannerRun(ctx.store, {
+      planner_run_id: String(run.planner_run_id),
+      outcome: "FAILED",
+      error_code: "FAIL_CLOSED_PLANNER_NO_ELIGIBLE",
+    });
+    expect(ctx.store.list("mission_plan_preview")).toHaveLength(0);
+    expect(ctx.store.list("mission")).toHaveLength(0);
+    expect(ctx.store.list("planner_attempt")).toHaveLength(0);
+    const r = ctx.store.get("planner_run", String(run.planner_run_id));
+    expect(String(r.state)).toBe("FAILED");
+    expect(String(r.error_code)).toBe("FAIL_CLOSED_PLANNER_NO_ELIGIBLE");
+  });
+
+  it("40. exhausted → run EXHAUSTED + every failed attempt durable across reopen", async () => {
+    const dir = freshDir("p40");
+    const db = path.join(dir, "pair.db");
+    const store = new PairEvidenceStore(db);
+    const runId = await (async () => {
+      try {
+        await runDurable(store, {
+          candidates: [cand("A", "p:a"), cand("B", "p:b")],
+          planFn: async (c) =>
+            failPlan(c.model_entry_id === "A" ? "LLM_PLANNER_REQUEST_TIMEOUT" : "LLM_PLANNER_HTTP_500"),
+          assertEligible: () => {},
+        });
+        throw new Error("unreachable");
+      } catch (e) {
+        expect(String((e as Error).message)).toContain("FAIL_CLOSED_PLANNER_EXHAUSTED");
+      }
+      return String(store.list("planner_run")[0].planner_run_id);
+    })();
+    // Reopen a fresh store over the same db — evidence survives restart.
+    const store2 = new PairEvidenceStore(db);
+    const run = store2.get("planner_run", runId);
+    expect(String(run.state)).toBe("EXHAUSTED");
+    const atts = attemptsOf(store2, runId);
+    expect(atts).toHaveLength(2);
+    expect(atts.map((a) => a.outcome)).toEqual(["FAILED", "FAILED"]);
+    expect(atts[0].failure_class).toBe("TIMEOUT");
+    expect(atts[1].failure_class).toBe("PROVIDER_UNAVAILABLE");
+    expect(store2.list("mission_plan_preview")).toHaveLength(0);
+    expect(store2.list("mission")).toHaveLength(0);
+    // Events reconstructable: PLANNER_RUN_EXHAUSTED + per-attempt FAILED.
+    const ev = store2.listEvents().map((x) => String(x.event_type));
+    expect(ev).toContain("PLANNER_RUN_EXHAUSTED");
+    expect(ev.filter((x) => x === "PLANNER_ATTEMPT_FAILED")).toHaveLength(2);
+  });
+
+  it("41. failover success → STARTED→SUCCESS durable + preview links run + winner digest", async () => {
+    const ctx = makeCtx("p41");
+    const { res, runId } = await runDurable(ctx.store, {
+      candidates: [cand("A", "p:a"), cand("B", "p:b")],
+      planFn: async (c) => (c.model_entry_id === "A" ? failPlan("LLM_PLANNER_HTTP_429") : okPlan("t")),
+      assertEligible: () => {},
+    }, ctx.projectId);
+    expect(res.winner.model_entry_id).toBe("B");
+    const atts = attemptsOf(ctx.store, runId);
+    expect(atts.map((a) => a.outcome)).toEqual(["FAILED", "SUCCESS"]);
+    expect(atts[1].winner).toBe(true);
+    // Preview links the run atomically — no duplicate attempt rows.
+    const pv = ctx.control.createPlanPreview(
+      { project_id: ctx.projectId, goal: "g41", metadata: { llm_plan: res.tasks }, operator_id: "op1" },
+      { planner_run_id: runId, attempts: res.attempts, winner: res.winner, warnings: [] },
+    );
+    const stored = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    expect(String(stored.planner_run_id)).toBe(runId);
+    const linked = attemptsOf(ctx.store, runId);
+    expect(linked).toHaveLength(2);
+    for (const a of linked) expect(String(a.preview_id)).toBe(String(pv.preview_id));
+    const winnerRow = linked.find((a) => a.winner === true)!;
+    expect(String(winnerRow.plan_digest)).toBe(String(pv.plan_digest));
+    expect(String(stored.planner_attempt_id)).toBe(String(winnerRow.planner_attempt_id));
+    const run = ctx.store.get("planner_run", runId);
+    expect(String(run.state)).toBe("WINNER_SELECTED");
+    expect(String(run.preview_id)).toBe(String(pv.preview_id));
+    const read = ctx.control.planPreview(String(pv.preview_id)) as {
+      planner_run: Record<string, unknown>;
+      planner_attempts: Array<Record<string, unknown>>;
+    };
+    expect(String(read.planner_run.planner_run_id)).toBe(runId);
+    expect(read.planner_attempts).toHaveLength(2);
+  });
+
+  it("42. canonicalize seam: A non-empty-but-invalid → PLAN_INVALID → B wins", async () => {
+    const caps = new Set(["FILE_OPERATIONS"]);
+    const canon = (tasks: Array<Record<string, unknown>>) =>
+      validatePlanProposal({ tasks }, caps) as unknown as Array<Record<string, unknown>>;
+    const res = await runPlannerFailover({
+      candidates: [cand("A"), cand("B")],
+      // A returns a non-empty sanitized-looking plan that fails the real
+      // canonical validator (unknown capability reference).
+      planFn: async (c) =>
+        c.model_entry_id === "A"
+          ? { tasks: [{ task_key: "T1", title: "bad", required_capabilities: ["NO_SUCH_CAP"], depends_on: [] }], warnings: [] }
+          : okPlan("t"),
+      assertEligible: () => {},
+      canonicalize: canon,
+    });
+    expect(res.winner.model_entry_id).toBe("B");
+    expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.PLAN_INVALID);
+    expect(res.attempts[0].warnings).toContain("CANONICAL_VALIDATION_FAILED");
+  });
+
+  it("43. all canonical-invalid → EXHAUSTED + durable failed attempts", async () => {
+    const dir = freshDir("p43");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const canon = () => {
+      throw new IntegrityError("FAIL_CLOSED_PLAN_PROPOSAL_INVALID", "placeholder");
+    };
+    await expectCode(
+      () =>
+        runDurable(store, {
+          candidates: [cand("A", "p:a"), cand("B", "p:b")],
+          planFn: async () => okPlan("t"),
+          assertEligible: () => {},
+          canonicalize: canon,
+        }),
+      "FAIL_CLOSED_PLANNER_EXHAUSTED",
+    );
+    const run = store.list("planner_run")[0];
+    expect(String(run.state)).toBe("EXHAUSTED");
+    const atts = attemptsOf(store, String(run.planner_run_id));
+    expect(atts).toHaveLength(2);
+    for (const a of atts) expect(a.failure_class).toBe("PLAN_INVALID");
+  });
+});
+
+/* ============ R1 §9 — runtime eligibility revalidation ================ */
+
+const mkModel = (
+  store: PairEvidenceStore,
+  pid: string,
+  mid: string,
+  opts: { conditions?: string[]; aliases?: string[] } = {},
+) => {
+  const mcat = new ModelEvidenceCatalog(store);
+  const { entry } = mcat.upsertModelClaim({
+    provider_id: pid,
+    provider_family: pid,
+    model_id: mid,
+    capability_hints: ["text_inference"],
+  });
+  if (opts.conditions?.length || opts.aliases?.length) {
+    const body = store.get("model_entry", String(entry.model_entry_id));
+    store.put("model_entry", String(entry.model_entry_id), {
+      ...body,
+      conditions: opts.conditions ?? body.conditions,
+      model_alias_ids: opts.aliases ?? body.model_alias_ids,
+    }, Number(body.version));
+  }
+  return String(entry.model_entry_id);
+};
+const mkProvider = (store: PairEvidenceStore, pid: string, lifecycle = "QUALIFIED") => {
+  const id = providerEntryId(pid);
+  const existing = store.tryGet("provider", id);
+  store.put("provider", id, {
+    ...(existing ?? { provider_id: pid, entry_id: id, conditions: [] }),
+    lifecycle_state: lifecycle,
+  }, existing ? Number(existing.version) : 0);
+};
+
+describe("R1 §9 — assertPlannerCandidateEligible", () => {
+  it("44. role revoked before invocation → IntegrityError propagates", () => {
+    const dir = freshDir("p44");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const me = mkModel(store, "gemini", "m1");
+    mkProvider(store, "gemini");
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "test" });
+    expect(() => assertPlannerCandidateEligible(store, me)).not.toThrow();
+    revokeModelRole(store, me, { actor: "test" });
+    expect(() => assertPlannerCandidateEligible(store, me)).toThrow(/FAIL_CLOSED_MODEL_ROLE/);
+  });
+
+  it("45. model REMOVED before invocation → not invoked (fail closed)", async () => {
+    const dir = freshDir("p45");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const meA = mkModel(store, "pa", "ma");
+    mkProvider(store, "pa");
+    const meB = mkModel(store, "pb", "mb");
+    mkProvider(store, "pb");
+    assignModelRole(store, meA, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    assignModelRole(store, meB, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    // A becomes unusable between boot qualification and invocation.
+    const bodyA = store.get("model_entry", meA);
+    store.put("model_entry", meA, { ...bodyA, conditions: ["REMOVED"] }, Number(bodyA.version));
+    let invoked = 0;
+    await expectCode(
+      () =>
+        runPlannerFailover({
+          candidates: [
+            { model_entry_id: meA, ref: "pa:ma", provider: "pa", model: "ma", endpoint: "x", credentialEnv: "E" },
+            { model_entry_id: meB, ref: "pb:mb", provider: "pb", model: "mb", endpoint: "x", credentialEnv: "E" },
+          ],
+          planFn: async () => {
+            invoked++;
+            return okPlan("t");
+          },
+          assertEligible: (c) => assertPlannerCandidateEligible(store, c.model_entry_id),
+        }),
+      "FAIL_CLOSED_MODEL_ROLE_MODEL_NOT_USABLE",
+    );
+    expect(invoked).toBe(0);
+  });
+
+  it("46. provider no longer eligible → not invoked", () => {
+    const dir = freshDir("p46");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const me = mkModel(store, "pc", "mc");
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    mkProvider(store, "pc", "DISCOVERED");
+    expect(() => assertPlannerCandidateEligible(store, me)).toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    mkProvider(store, "pc", "QUALIFIED");
+    expect(() => assertPlannerCandidateEligible(store, me)).not.toThrow();
+  });
+
+  it("47. DSH_EXECUTION model (or proven alias) is never borrowed", () => {
+    const dir = freshDir("p47");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const meA = mkModel(store, "px", "mA");
+    const meB = mkModel(store, "px", "mB", { aliases: ["mA"] }); // proven alias of A
+    mkProvider(store, "px");
+    assignModelRole(store, meA, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    assignModelRole(store, meB, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+    // Candidate B is a DSH model — its own role check fails first.
+    expect(() => assertPlannerCandidateEligible(store, meB)).toThrow(/FAIL_CLOSED_MODEL_ROLE/);
+    // Candidate A holds PLANNER but is a proven alias of the DSH entry →
+    // canonically the same model → the DSH-overlap guard fires.
+    expect(() => assertPlannerCandidateEligible(store, meA)).toThrow(/FAIL_CLOSED_PLANNER_DSH_OVERLAP/);
+    // An unrelated planner model with no proven DSH alias stays clean.
+    const meC = mkModel(store, "py", "mC");
+    mkProvider(store, "py");
+    assignModelRole(store, meC, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    expect(() => assertPlannerCandidateEligible(store, meC)).not.toThrow();
+  });
+
+  it("48. one seam: failover canonical tasks ≡ preview canonical_tasks", async () => {
+    const ctx = makeCtx("p48");
+    const caps = new Set(["FILE_OPERATIONS"]);
+    const canon = (tasks: Array<Record<string, unknown>>) =>
+      validatePlanProposal({ tasks }, caps) as unknown as Array<Record<string, unknown>>;
+    const res = await runPlannerFailover({
+      candidates: [cand("A")],
+      planFn: async () => ({ tasks: [T1, T2], warnings: [] }),
+      assertEligible: () => {},
+      canonicalize: canon,
+    });
+    const pv = ctx.control.createPlanPreview(
+      { project_id: ctx.projectId, goal: "g48", metadata: { llm_plan: res.tasks }, operator_id: "op1" },
+      { attempts: res.attempts, winner: res.winner, warnings: [] },
+    );
+    const stored = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    expect(stored.canonical_tasks).toEqual(res.tasks);
+    expect(pv.plan.tasks).toEqual(res.tasks);
   });
 });

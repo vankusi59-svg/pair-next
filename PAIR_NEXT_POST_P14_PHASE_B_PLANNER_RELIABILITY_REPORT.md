@@ -183,3 +183,103 @@ Branch HEAD at submission: `331f62f` on `devin/post-p14-phase-b-planner-reliabil
 PR opened against `main`. **DO NOT MERGE** — awaiting independent audit.
 
 Classification: `PAIR_NEXT_POST_P14_PHASE_B_PLANNER_RELIABILITY_PENDING_INDEPENDENT_AUDIT`
+
+---
+
+# INDEPENDENT AUDIT — R1 REMEDIATION (audited HEAD `9216510ed665f3926d2312847ee5eb20a30a2606`)
+
+Audit result: `PHASE B = BLOCKED, R1 REMEDIATION REQUIRED`. All three blockers remediated below; no new PR, no merge, no Phase C work.
+
+## R1-§1–2 — Zero-eligible pool now fails closed (was: silent template fallback)
+
+Before R1, `planExpander` computed an empty `candidates` list and fell through to `return { input }` → the mission silently degraded to the deterministic TEMPLATE-T1 path. Now:
+
+- `runPlannerFailover` throws `IntegrityError("FAIL_CLOSED_PLANNER_NO_ELIGIBLE")` when `candidates.length === 0` — the function itself can never produce a zero-candidate result.
+- `planExpander` additionally checks BEFORE invoking failover (`PLANNER_ROUTES.length && !candidates.length` → `FAIL_CLOSED_PLANNER_NO_ELIGIBLE` carrying `configured_routes` diagnostics) so a configured-but-empty pool fails closed even before failover is entered.
+- The `planner_run` row is opened BEFORE the check, so a zero-eligible request still leaves durable canonical evidence: `planner_run {state:FAILED, error_code:FAIL_CLOSED_PLANNER_NO_ELIGIBLE, attempts:0}`.
+- Server error map already maps `FAIL_CLOSED_*` → **409**; both `/api/missions/preview` and `/api/missions` return the same code (live-verified identical). No `mission_plan_preview`, no `mission`, no `canonical_tasks`, no TEMPLATE-T1 is ever written on this path. The scheduled-mission path routes through the same `planExpander` seam and therefore fails identically.
+
+## R1-§3–5 — Every planner invocation has durable canonical attempt evidence
+
+New canonical entity `planner_run` (`PRN_*`): `{planner_run_id, project_id, operator_id, routes[], attempts, state RUNNING→WINNER_SELECTED|EXHAUSTED|FAILED, winner_attempt_no, preview_id, error_code, started_at, completed_at}`.
+
+Lifecycle persistence lives in `src/pair/plan-preview.ts`, each step its own `store.immediate()` transaction:
+
+- `beginPlannerRun` → run row RUNNING + `PLANNER_RUN_STARTED` event.
+- `persistPlannerAttemptStart` → `planner_attempt` (`PA_*`) row with `outcome:"STARTED"` BEFORE the model is invoked + `PLANNER_ATTEMPT_STARTED` + `run.attempts++`. A crash after STARTED still leaves the auditable invocation.
+- `settlePlannerAttempt` → same row updated to `SUCCESS|FAILED` (completed_at, latency_ms, failure_class, sanitized warnings, winner, plan_digest) + `PLANNER_ATTEMPT_SUCCEEDED|FAILED`.
+- `finishPlannerRun` → run `WINNER_SELECTED|EXHAUSTED|FAILED` + matching event. `onExhausted` fires before the `FAIL_CLOSED_PLANNER_EXHAUSTED` throw, so exhaustion persists every failed attempt + the EXHAUSTED event — nothing depends on preview creation anymore.
+- `createPlanPreview` accepts `planner_run_id` and atomically (single immediate): validates the run exists → links `run.preview_id` → attaches `preview_id` to every attempt of that run → stamps `winner:true` + `plan_digest` on the winner. Legacy `attempts[]` arg path retained for in-process callers with no run.
+- `planPreview()` read returns `{preview, planner_attempts, planner_run}` so the audit can reconstruct attempted routes from canonical state alone (verified live + across store reopen in test 40).
+
+## R1-§6–8 — Canonical validation INSIDE failover — first FULLY VALID whole plan wins
+
+`runPlannerFailover` accepts `canonicalize(tasks, candidate)`: candidate raw output → sanitize/deterministic prep → `validatePlanProposal` → only a fully-valid whole list can win. A canonicalize rejection is a model-output failure → `FAILED/PLAN_INVALID` + warning `CANONICAL_VALIDATION_FAILED` (or `_EMPTY` for an all-dropped list) → next candidate. This is NOT an authority signal and never propagates.
+
+ONE canonical task-preparation seam is shared end-to-end: the serve seam `canonicalizeLlmTasks` (sanitize + expected_output_contract injection for AUTOMATON_TASK_EXECUTION tasks) is run inside failover via `canonicalize:` and then `validatePlanProposal` against `knownCapabilityIds()`; the winner returns that exact canonical list; `createPlanPreview` persists it as `canonical_tasks`; confirm revalidates the same list; the mission executes it verbatim. No model re-invocation, no second transformation — `mission.metadata.llm_plan`/`pinned_plan_tasks` ≡ `preview.canonical_tasks` ≡ failover winner tasks (live-verified).
+
+## R1-§9–10 — Per-invocation canonical eligibility revalidation
+
+New `assertPlannerCandidateEligible(store, model_entry_id)` in `model-role.ts` — reuses existing authorities, no duplicate qualification logic:
+
+1. `assertPlannerModelRole` — entry exists, holds active PLANNER_COORDINATOR, not REMOVED/DEPRECATED/BLOCKED.
+2. Provider row `providerEntryId(provider_id)` must exist with `lifecycle_state ∈ PROVIDER_OK_STATES` (QUALIFIED / MODEL_DISCOVERY_ELIGIBLE) else `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`.
+3. Candidate must not be canonically a DSH_EXECUTION model: every active DSH assignment is compared via `sameCanonicalModel` (entry_id OR provider_family+alias match) → `FAIL_CLOSED_PLANNER_DSH_OVERLAP`.
+
+All failures are IntegrityError → propagate, never failover-eligible. Runs before EVERY invocation (revoked role pre-invocation → fail closed; model REMOVED between boot and call → not invoked; provider no longer eligible → not invoked; DSH model/alias can never be borrowed).
+
+## R1-§11 — Pinned-plan invariants preserved
+
+All Phase B §11 semantics unchanged and re-verified live post-R1: READY→CONSUMED, TTL env, digest-before-consumed ordering, restart-safe durable consume, atomic consume+mission transaction, one-preview-one-mission, idempotent retry returns same mission, wrong digest rejected even on CONSUMED previews, no second LLM invocation at confirm.
+
+## R1-§12 — Provenance chain (live-verified)
+
+operator → `planner_run` (PRN_01M3TZ8PBWZ6ET3N00HAKT5611) → attempts (PA_…PBXW deadplan FAILED MALFORMED 6 ms, PA_…PC4P cf SUCCESS 38 984 ms winner) → preview (MPP_01M3TZ9WEEZQJR3AC81QW0C3V6, linked atomically) → plan_digest `ca7e6b11…` → confirm → mission (MSN_01M3TZAJJB62BBXJN718SPDZJW, `metadata.pinned_plan` carries preview_id + planner_attempt_id + digest) → exact committed tasks.
+Exhausted path: `planner_run{EXHAUSTED}` → durable FAILED attempts → `FAIL_CLOSED_PLANNER_EXHAUSTED` 409 → no preview/mission.
+
+## R1-§13 — New focused tests (11 added, 48 total in `pair-phase-b.test.ts`)
+
+- 38: zero candidates → `FAIL_CLOSED_PLANNER_NO_ELIGIBLE`, planFn never invoked.
+- 39: zero-candidate request → no preview/mission/attempt rows; run persisted FAILED + NO_ELIGIBLE.
+- 40: exhaustion → run EXHAUSTED + 2 durable FAILED attempts (TIMEOUT, PROVIDER_UNAVAILABLE) readable after store REOPEN; events reconstructable (RUN_EXHAUSTED + 2×ATTEMPT_FAILED); zero preview/mission.
+- 41: failover success → STARTED→settled durable attempts; preview links run atomically; winner carries digest; detail endpoint returns run+attempts.
+- 42: A non-empty plan failing `validatePlanProposal` (unknown capability) → PLAN_INVALID → B wins; `CANONICAL_VALIDATION_FAILED` warning.
+- 43: all candidates canonical-invalid → EXHAUSTED + every attempt durable.
+- 44: role revoked pre-invocation → IntegrityError propagates (no invocation).
+- 45: model REMOVED pre-invocation → fail closed, zero invocations.
+- 46: provider not in PROVIDER_OK_STATES → `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`; restored → eligible.
+- 47: DSH_EXECUTION model / proven DSH alias → `FAIL_CLOSED_PLANNER_DSH_OVERLAP`; unrelated planner clean.
+- 48: one seam — failover canonical tasks ≡ stored `canonical_tasks` ≡ response plan.
+
+(Existing 37 R0 tests updated only for the `assertRole:`→`assertEligible:` param rename — semantics unchanged.)
+
+## R1-§14 — Regression
+
+- Typecheck clean; `pnpm build` clean.
+- Focused: **48/48** Phase B; Phase A 60/60.
+- Full Node 22 suite: **2341 pass / 2 fail / 15 skip** — the 2 failures remain the pre-existing environment artifact reproduced on base `2277319` (executables under `~/.nvm` invisible to the test's `~/.local` mask).
+
+## R1-§15 — Live validation (isolated `PAIR_MC_DIR=~/pair-mc-b1`, port 8797, `PAIR_LLM_PLANNER_TIMEOUT_MS=90000`)
+
+| Case | Result |
+|---|---|
+| A valid primary/fallback win | `PRN_01M3TZ8PBWZ6ET3N00HAKT5611` WINNER_SELECTED: attempt1 deadplan FAILED `MALFORMED_RESPONSE` 6 ms → attempt2 cf SUCCESS 38 984 ms winner; preview `MPP_01M3TZ9WEEZ…` linked atomically (run.preview_id + attempts.preview_id + winner plan_digest); confirm → `MSN_01M3TZAJJB62BBXJN718SPDZJW`, committed tasks ≡ pinned canonical_tasks |
+| B all fail → EXHAUSTED | `planner_run{EXHAUSTED,attempts:1}` + durable `PA_* FAILED MALFORMED_RESPONSE` (preview_id null); earlier boots also produced 2 TIMEOUT-exhausted runs with durable attempts; 409; no preview/mission rows |
+| C zero-eligible | planner=[deadplan] with endpoint down (probe FAIL at boot) → `/api/missions/preview` **and** `/api/missions` both 409 `FAIL_CLOSED_PLANNER_NO_ELIGIBLE`; run row `{FAILED, error_code:NO_ELIGIBLE, attempts:0}` durable; zero preview/mission/T1 |
+| D canonical-invalid primary | fake provider returns valid-JSON plan that sanitizes to degenerate/dup keys → attempt FAILED `PLAN_INVALID` → cf SUCCESS winner (run `PRN_01M3TZD600…`) |
+| E restart persistence | preview `MPP_01M3TZE8H48TG9VAYS9QAE6KJE` created pre-restart; new process confirmed it post-restart → `MSN_01M3TZMD76BQPGCEAR2VVVQYYE` tasks ≡ canonical_tasks; preview CONSUMED |
+| F duplicate confirm | same `preview_id`+digest retried → 200 same mission_id (idempotent) |
+| G wrong digest after consume | `plan_digest:"deadbeef"` on CONSUMED preview → 409 `FAIL_CLOSED_PLAN_DIGEST_MISMATCH` |
+
+`deadplan` is a deterministic harness provider (local 127.0.0.1:8799 returning either 200-garbage or an invalid plan body) — removed from `settings.yaml` after evidence capture.
+
+## R1 — files changed
+
+- `src/pair/planner-pool.ts` — NO_ELIGIBLE throw; `canonicalize` seam; STARTED→settled lifecycle via `onAttemptStart/onAttemptEnd/onExhausted` hooks; attempt record gains `outcome/planner_run_id/preview_id`.
+- `src/pair/model-role.ts` — `assertPlannerCandidateEligible` (role + provider lifecycle + DSH-alias overlap).
+- `src/pair/plan-preview.ts` — `planner_run` entity + `beginPlannerRun/persistPlannerAttemptStart/settlePlannerAttempt/finishPlannerRun`; `createPlanPreview` run-linking.
+- `src/pair/mission-control.ts` — `planner_run_id` plumbing + `planPreview()` returns run.
+- `scripts/serve-mission-control.mjs` — `canonicalizeLlmTasks` seam; durable-run failover wiring (run before zero-eligible check); NO_ELIGIBLE.
+- `src/__tests__/pair-phase-b.test.ts` — +11 R1 tests (48 total).
+
+Classification remains: `PAIR_NEXT_POST_P14_PHASE_B_PLANNER_RELIABILITY_PENDING_INDEPENDENT_AUDIT`

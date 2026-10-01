@@ -27,10 +27,207 @@ import type { PlannerAttemptRecord } from "./planner-pool.js";
 
 export const PREVIEW_ENTITY = "mission_plan_preview";
 export const ATTEMPT_ENTITY = "planner_attempt";
+export const RUN_ENTITY = "planner_run";
 export const PREVIEW_STATE = {
   READY: "READY",
   CONSUMED: "CONSUMED",
 } as const;
+
+export const RUN_STATE = {
+  RUNNING: "RUNNING",
+  WINNER_SELECTED: "WINNER_SELECTED",
+  EXHAUSTED: "EXHAUSTED",
+  FAILED: "FAILED",
+} as const;
+
+/* ---------- planner_run + durable attempt lifecycle (R1 §3–§5) ----------
+ * Every Planner INVOCATION has canonical evidence — even when no preview is
+ * ever created (pool exhausted, eligibility failure). The run row is opened
+ * before the failover loop; each attempt is persisted STARTED *before* the
+ * model is invoked and settled afterwards; exhaustion settles the run as
+ * EXHAUSTED. A crash between start and settle leaves durable STARTED
+ * evidence instead of pretending the invocation never happened.
+ */
+
+export function beginPlannerRun(
+  store: PairEvidenceStore,
+  args: {
+    project_id?: string;
+    operator_id?: string;
+    routes: string[];
+    actor?: string;
+    now?: () => string;
+  },
+): Record<string, unknown> {
+  return store.immediate(() => {
+    const now = (args.now ?? utcnow)();
+    const row = {
+      planner_run_id: newId("PRN"),
+      state: RUN_STATE.RUNNING,
+      project_id: args.project_id != null ? String(args.project_id) : null,
+      operator_id: args.operator_id ?? null,
+      routes: args.routes,
+      attempts: 0,
+      winner_attempt_no: null,
+      preview_id: null,
+      error_code: null,
+      started_at: now,
+      completed_at: null,
+      created_at: now,
+    };
+    store.put(RUN_ENTITY, String(row.planner_run_id), row, 0);
+    store.event({
+      entity_type: RUN_ENTITY,
+      entity_id: String(row.planner_run_id),
+      event_type: "PLANNER_RUN_STARTED",
+      new_state: RUN_STATE.RUNNING,
+      actor: args.actor ?? "PAIR_PLANNER",
+      metadata: { routes: args.routes, project_id: row.project_id },
+    });
+    return row;
+  });
+}
+
+/** Persist a STARTED attempt row before the model is invoked — durable
+ *  evidence survives a crash mid-call. Returns {planner_attempt_id}. */
+export function persistPlannerAttemptStart(
+  store: PairEvidenceStore,
+  args: {
+    planner_run_id: string;
+    project_id?: string;
+    record: Omit<PlannerAttemptRecord, "outcome">;
+    actor?: string;
+    now?: () => string;
+  },
+): { planner_attempt_id: string } {
+  return store.immediate(() => {
+    const now = (args.now ?? utcnow)();
+    const a = args.record;
+    const row = {
+      planner_attempt_id: newId("PA"),
+      planner_run_id: args.planner_run_id,
+      preview_id: null,
+      project_id: args.project_id ?? null,
+      route: a.route,
+      provider: a.provider,
+      model_entry_id: a.model_entry_id,
+      model: a.model,
+      role: a.role,
+      attempt_no: a.attempt_no,
+      started_at: a.started_at,
+      completed_at: null,
+      latency_ms: null,
+      outcome: "STARTED",
+      failure_class: null,
+      warnings: [],
+      plan_digest: null,
+      winner: false,
+      created_at: now,
+    };
+    store.put(ATTEMPT_ENTITY, String(row.planner_attempt_id), row, 0);
+    store.event({
+      entity_type: ATTEMPT_ENTITY,
+      entity_id: String(row.planner_attempt_id),
+      event_type: "PLANNER_ATTEMPT_STARTED",
+      new_state: "STARTED",
+      actor: args.actor ?? "PAIR_PLANNER",
+      metadata: {
+        planner_run_id: args.planner_run_id,
+        route: a.route,
+        model_entry_id: a.model_entry_id,
+        attempt_no: a.attempt_no,
+      },
+    });
+    const run = store.tryGet(RUN_ENTITY, args.planner_run_id);
+    if (run) {
+      store.put(RUN_ENTITY, args.planner_run_id, { ...run, attempts: Number(run.attempts ?? 0) + 1 }, Number(run.version ?? 0));
+    }
+    return { planner_attempt_id: String(row.planner_attempt_id) };
+  });
+}
+
+/** Settle a STARTED attempt row to its final outcome — same row updated,
+ *  never a duplicate row per invocation. */
+export function settlePlannerAttempt(
+  store: PairEvidenceStore,
+  args: {
+    planner_attempt_id: string;
+    record: PlannerAttemptRecord;
+    winner?: boolean;
+    plan_digest?: string | null;
+    actor?: string;
+  },
+): void {
+  const row = store.tryGet(ATTEMPT_ENTITY, args.planner_attempt_id);
+  if (!row) return;
+  const r = args.record;
+  const body = {
+    ...row,
+    outcome: r.outcome,
+    completed_at: r.completed_at,
+    latency_ms: r.latency_ms,
+    failure_class: r.failure_class ?? null,
+    warnings: r.warnings ?? [],
+    winner: args.winner ?? false,
+    plan_digest: args.plan_digest ?? r.plan_digest ?? null,
+  };
+  store.put(ATTEMPT_ENTITY, args.planner_attempt_id, body, Number(row.version ?? 0));
+  store.event({
+    entity_type: ATTEMPT_ENTITY,
+    entity_id: args.planner_attempt_id,
+    event_type: r.outcome === "SUCCESS" ? "PLANNER_ATTEMPT_SUCCEEDED" : "PLANNER_ATTEMPT_FAILED",
+    old_state: "STARTED",
+    new_state: r.outcome,
+    actor: args.actor ?? "PAIR_PLANNER",
+    metadata: {
+      planner_run_id: row.planner_run_id,
+      route: r.route,
+      model_entry_id: r.model_entry_id,
+      attempt_no: r.attempt_no,
+      latency_ms: r.latency_ms,
+      failure_class: r.failure_class ?? null,
+    },
+  });
+}
+
+/** Close the run row: WINNER_SELECTED / EXHAUSTED / FAILED. */
+export function finishPlannerRun(
+  store: PairEvidenceStore,
+  args: {
+    planner_run_id: string;
+    outcome: string;
+    winner_attempt_no?: number;
+    error_code?: string;
+    actor?: string;
+    now?: () => string;
+  },
+): void {
+  const row = store.tryGet(RUN_ENTITY, args.planner_run_id);
+  if (!row) return;
+  const body = {
+    ...row,
+    state: args.outcome,
+    outcome: args.outcome,
+    winner_attempt_no: args.winner_attempt_no ?? row.winner_attempt_no ?? null,
+    error_code: args.error_code ?? row.error_code ?? null,
+    completed_at: (args.now ?? utcnow)(),
+  };
+  store.put(RUN_ENTITY, args.planner_run_id, body, Number(row.version ?? 0));
+  store.event({
+    entity_type: RUN_ENTITY,
+    entity_id: args.planner_run_id,
+    event_type:
+      args.outcome === RUN_STATE.EXHAUSTED
+        ? "PLANNER_RUN_EXHAUSTED"
+        : args.outcome === RUN_STATE.WINNER_SELECTED
+          ? "PLANNER_RUN_WINNER"
+          : "PLANNER_RUN_FAILED",
+    old_state: String(row.state),
+    new_state: args.outcome,
+    actor: args.actor ?? "PAIR_PLANNER",
+    metadata: { winner_attempt_no: body.winner_attempt_no, error_code: body.error_code },
+  });
+}
 
 export const DEFAULT_PREVIEW_TTL_S = 1800;
 
@@ -97,6 +294,10 @@ export function createPlanPreview(
     canonical_tasks: Array<Record<string, unknown>>;
     attempts: PlannerAttemptRecord[];
     winner: PlannerAttemptRecord | null; // null for deterministic template plans
+    /** R1 — when the failover ran with durable-run hooks, the attempts
+     *  already exist as PA_* rows under this run: link them to the preview
+     *  here (atomically) instead of writing duplicate rows. */
+    planner_run_id?: string;
     operator_id?: string;
     ttlSeconds?: number;
     now?: () => string;
@@ -108,7 +309,28 @@ export function createPlanPreview(
     const created = now();
     const expires = new Date(Date.parse(created) + ttl * 1000).toISOString();
     const previewId = newId("MPP");
-    for (const a of args.attempts) {
+    let linkedAttempts: Array<Record<string, unknown>> = [];
+    if (args.planner_run_id) {
+      // Durable-run path: attempts were persisted during failover — link the
+      // run + its attempt rows to this preview inside the same transaction.
+      const run = store.tryGet(RUN_ENTITY, String(args.planner_run_id));
+      if (!run) throw new NotFoundError(`planner_run:${String(args.planner_run_id)}`);
+      store.put(RUN_ENTITY, String(args.planner_run_id), { ...run, preview_id: previewId }, Number(run.version ?? 0));
+      linkedAttempts = store
+        .list(ATTEMPT_ENTITY)
+        .filter((a) => String(a.planner_run_id) === String(args.planner_run_id))
+        .sort((a, b) => Number(a.attempt_no) - Number(b.attempt_no));
+      for (const a of linkedAttempts) {
+        const isWinner = args.winner != null && Number(a.attempt_no) === Number(args.winner.attempt_no);
+        store.put(
+          ATTEMPT_ENTITY,
+          String(a.planner_attempt_id),
+          { ...a, preview_id: previewId, winner: isWinner, plan_digest: isWinner ? args.plan_digest : a.plan_digest ?? null },
+          Number(a.version ?? 0),
+        );
+      }
+    }
+    for (const a of linkedAttempts.length ? [] : args.attempts) {
       const isWinner =
         args.winner != null &&
         Number(a.attempt_no) === Number(args.winner.attempt_no) &&
@@ -153,8 +375,8 @@ export function createPlanPreview(
     }
     const winnerAttemptId = args.winner
       ? String(
-          (store.list(ATTEMPT_ENTITY).find(
-            (r) => String(r.preview_id) === previewId && Number(r.attempt_no) === Number(args.winner!.attempt_no),
+          ((linkedAttempts.length ? linkedAttempts : store.list(ATTEMPT_ENTITY).filter((r) => String(r.preview_id) === previewId)).find(
+            (r) => Number(r.attempt_no) === Number(args.winner!.attempt_no),
           ) as Record<string, unknown> | undefined)?.planner_attempt_id ?? "",
         )
       : null;
@@ -167,6 +389,7 @@ export function createPlanPreview(
       effective_input_digest: args.effective_input_digest,
       plan_digest: args.plan_digest,
       canonical_tasks: args.canonical_tasks,
+      planner_run_id: args.planner_run_id ?? null,
       planner_attempt_id: winnerAttemptId || null,
       planner: args.winner
         ? {

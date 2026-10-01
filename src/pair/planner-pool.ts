@@ -89,12 +89,16 @@ export interface PlannerAttemptRecord {
   started_at: string;
   completed_at: string;
   latency_ms: number;
-  outcome: "SUCCESS" | "FAILED";
+  outcome: "STARTED" | "SUCCESS" | "FAILED";
   failure_class?: PlannerFailureClass;
   /** Sanitized warning codes only — never raw LLM output. */
   warnings: string[];
   /** digest of the winning task list when this attempt won. */
   plan_digest?: string;
+  /** Canonical grouping identity — every attempt belongs to a planner_run. */
+  planner_run_id?: string;
+  /** Linked once a preview is created from this run (nullable). */
+  preview_id?: string | null;
 }
 
 export interface PlannerFailoverResult {
@@ -106,29 +110,57 @@ export interface PlannerFailoverResult {
 }
 
 /**
- * Run the planner failover chain. `planFn(candidate)` must return the
- * sanitized task list or throw/return-empty on failure — llmPlan already
- * maps transport/contract failures to warning codes; thrown values are
- * re-classified: IntegrityError FAIL_CLOSED_* propagates untouched
- * (non-failover), anything else becomes NETWORK_ERROR.
+ * Run the planner failover chain. `planFn(candidate)` returns the raw
+ * sanitized task list; `canonicalize` (when provided) then applies the ONE
+ * canonical task-preparation seam — deterministic enrichment + the same
+ * validator the preview/confirm path uses — so a candidate can only become
+ * the winner by producing a FULLY VALID whole plan (§6). A canonicalize
+ * rejection is a model-output failure → FAILED / PLAN_INVALID → next
+ * candidate; it is never an authority signal.
  *
- * `assertRole(candidate)` revalidates canonical role authority per attempt
- * (§4.3) — a revoked/reassigned role fails closed, never falls over.
+ * `assertEligible(candidate)` re-proves canonical eligibility per attempt
+ * (role still held, model usable, provider still eligible, not a DSH
+ * model/alias) — failures are authority signals and propagate, never
+ * failover-eligible.
+ *
+ * Durable-evidence hooks (§3–§5): `onAttemptStart` fires BEFORE the model
+ * is invoked and returns an opaque token the caller uses to persist the
+ * STARTED row; `onAttemptEnd` fires after settlement with the final record;
+ * `onExhausted` fires when every candidate failed, before the throw. A
+ * crash between start and settle leaves the durable STARTED row — the
+ * invocation can never be silently absent.
+ *
+ * Zero candidates → FAIL_CLOSED_PLANNER_NO_ELIGIBLE: a configured planner
+ * pool resolving to no eligible candidate must never silently degrade to
+ * the deterministic/template path (§1 R1).
  */
 export async function runPlannerFailover(opts: {
   candidates: PlannerCandidate[];
   planFn: (c: PlannerCandidate) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
-  assertRole: (c: PlannerCandidate) => void;
+  /** Canonical per-invocation eligibility proof (role + lifecycle). */
+  assertEligible: (c: PlannerCandidate) => void;
+  /** The one canonical task-preparation seam — returns the exact canonical
+   *  task list the preview will pin; any throw → PLAN_INVALID failover. */
+  canonicalize?: (tasks: Array<Record<string, unknown>>, c: PlannerCandidate) => Array<Record<string, unknown>>;
+  onAttemptStart?: (base: Omit<PlannerAttemptRecord, "outcome">) => unknown;
+  onAttemptEnd?: (token: unknown, record: PlannerAttemptRecord) => void;
+  onExhausted?: (attempts: PlannerAttemptRecord[]) => void;
   now?: () => string;
 }): Promise<PlannerFailoverResult> {
   const now = opts.now ?? (() => new Date().toISOString());
+  if (!opts.candidates.length) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_NO_ELIGIBLE",
+      "configured planner pool resolved to zero eligible candidates — refusing template fallback",
+    );
+  }
   const attempts: PlannerAttemptRecord[] = [];
   let n = 0;
   for (const c of opts.candidates) {
     n++;
     // Runtime eligibility: canonical role still held, model still usable.
     // Integrity/role failures propagate — NOT failover-eligible.
-    opts.assertRole(c);
+    opts.assertEligible(c);
     const started = now();
     const t0 = Date.now();
     const base: Omit<PlannerAttemptRecord, "outcome"> = {
@@ -143,25 +175,61 @@ export async function runPlannerFailover(opts: {
       latency_ms: 0,
       warnings: [],
     };
+    // §4 — durable STARTED evidence before the model is invoked.
+    const token = opts.onAttemptStart?.(base);
+    const settle = (rec: PlannerAttemptRecord) => {
+      attempts.push(rec);
+      opts.onAttemptEnd?.(token, rec);
+    };
     try {
       const res = await opts.planFn(c);
       const completed = now();
-      if (Array.isArray(res.tasks) && res.tasks.length) {
-        attempts.push({ ...base, completed_at: completed, latency_ms: Date.now() - t0, outcome: "SUCCESS", warnings: res.warnings.slice(0, 10) });
-        return { tasks: res.tasks, winner: attempts[attempts.length - 1], attempts, warnings: res.warnings };
+      if (!Array.isArray(res.tasks) || !res.tasks.length) {
+        settle({
+          ...base,
+          completed_at: completed,
+          latency_ms: Date.now() - t0,
+          outcome: "FAILED",
+          failure_class: classifyPlannerFailure(res.warnings),
+          warnings: res.warnings.slice(0, 10),
+        });
+        continue;
       }
-      attempts.push({
-        ...base,
-        completed_at: completed,
-        latency_ms: Date.now() - t0,
-        outcome: "FAILED",
-        failure_class: classifyPlannerFailure(res.warnings),
-        warnings: res.warnings.slice(0, 10),
-      });
+      // §6/§7 — the canonical seam decides the winner: the exact prepared
+      // task list must pass the same validation the preview will pin.
+      let canonical = res.tasks;
+      if (opts.canonicalize) {
+        try {
+          canonical = opts.canonicalize(res.tasks, c);
+        } catch {
+          settle({
+            ...base,
+            completed_at: now(),
+            latency_ms: Date.now() - t0,
+            outcome: "FAILED",
+            failure_class: PLANNER_FAILURE_CLASS.PLAN_INVALID,
+            warnings: [...res.warnings.slice(0, 9), "CANONICAL_VALIDATION_FAILED"],
+          });
+          continue;
+        }
+        if (!canonical.length) {
+          settle({
+            ...base,
+            completed_at: now(),
+            latency_ms: Date.now() - t0,
+            outcome: "FAILED",
+            failure_class: PLANNER_FAILURE_CLASS.PLAN_INVALID,
+            warnings: [...res.warnings.slice(0, 9), "CANONICAL_VALIDATION_EMPTY"],
+          });
+          continue;
+        }
+      }
+      settle({ ...base, completed_at: completed, latency_ms: Date.now() - t0, outcome: "SUCCESS", warnings: res.warnings.slice(0, 10) });
+      return { tasks: canonical, winner: attempts[attempts.length - 1], attempts, warnings: res.warnings };
     } catch (e) {
       // Integrity/authority failures are not failover-eligible.
       if (e instanceof IntegrityError) throw e;
-      attempts.push({
+      settle({
         ...base,
         completed_at: now(),
         latency_ms: Date.now() - t0,
@@ -171,6 +239,9 @@ export async function runPlannerFailover(opts: {
       });
     }
   }
+  // §5 — durable exhausted provenance: every failed attempt already settled
+  // via the hooks; the caller closes the planner_run before we throw.
+  opts.onExhausted?.(attempts);
   // §7: every eligible planner route failed — fail closed with operator-safe
   // evidence. Never fabricate a minimal/T1-only "success" plan.
   throw new IntegrityError(

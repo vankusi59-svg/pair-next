@@ -16,6 +16,7 @@
 
 import { digest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { PROVIDER_OK_STATES, providerEntryId } from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const MODEL_ROLE = {
@@ -171,6 +172,53 @@ export function assertPlannerModelRole(store: PairEvidenceStore, modelEntryId: s
 
 export function assertDshExecutionModelRole(store: PairEvidenceStore, modelEntryId: string): void {
   assertModelRole(store, modelEntryId, MODEL_ROLE.DSH_EXECUTION);
+}
+
+/**
+ * Full canonical eligibility proof for a Planner candidate (Phase B R1 §9).
+ * Runs before EVERY planner model invocation — qualification captured at
+ * startup is never trusted as still-current:
+ *
+ *  1. model_entry exists, still holds PLANNER_COORDINATOR, and is not
+ *     REMOVED/DEPRECATED/BLOCKED (assertModelRole);
+ *  2. its provider is still canonically eligible — lifecycle in
+ *     PROVIDER_OK_STATES (the existing qualification authority; no
+ *     duplicate qualification seam is created here);
+ *  3. the candidate is not canonically a DSH_EXECUTION model/alias —
+ *     sameCanonicalModel against every active DSH assignment.
+ *
+ * Every rejection is an IntegrityError — an authority failure that
+ * propagates (never failover-eligible, never silently skipped).
+ */
+export function assertPlannerCandidateEligible(
+  store: PairEvidenceStore,
+  modelEntryId: string,
+): void {
+  assertPlannerModelRole(store, modelEntryId);
+  const mid = String(modelEntryId);
+  const model = store.get("model_entry", mid);
+  const pf = String(model.provider_family ?? "");
+  const prov = store.tryGet("provider", providerEntryId(pf));
+  if (!prov || !PROVIDER_OK_STATES.has(String(prov.lifecycle_state ?? ""))) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE",
+      JSON.stringify({
+        model_entry_id: mid,
+        provider: pf,
+        lifecycle_state: prov?.lifecycle_state ?? null,
+      }),
+    );
+  }
+  for (const asn of listModelRoleAssignments(store)) {
+    if (asn.role !== MODEL_ROLE.DSH_EXECUTION) continue;
+    const other = store.tryGet("model_entry", String(asn.model_entry_id));
+    if (other && sameCanonicalModel(model, other)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_DSH_OVERLAP",
+        JSON.stringify({ model_entry_id: mid, dsh_model_entry_id: String(asn.model_entry_id) }),
+      );
+    }
+  }
 }
 
 /**
