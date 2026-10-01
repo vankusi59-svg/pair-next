@@ -27,6 +27,7 @@ import { digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
 import {
+  assertPreviewWorkspaceAuthority,
   createPlanPreview as persistPlanPreview,
   consumePlanPreview,
   effectiveInputDigest,
@@ -541,6 +542,12 @@ export class MissionControl {
         { tasks: v.preview.canonical_tasks },
         knownCaps,
       );
+      // R5 — replay persisted authority VERBATIM. Normalization already ran
+      // before the persisted digests at preview creation; confirm may only
+      // validate what was pinned, never widen it. A READY preview without
+      // valid canonical workspace authority fails closed (regenerate a fresh
+      // preview); it is not consumed and nothing is mutated.
+      const authorizedWorkspaces = assertPreviewWorkspaceAuthority(mi);
       const miMeta = (mi.metadata as Record<string, unknown> | undefined) ?? {};
       const metadata = {
         ...((mi.metadata as Record<string, unknown> | undefined) ?? {}),
@@ -563,10 +570,7 @@ export class MissionControl {
         goal: String(mi.goal),
         metadata,
         granted_permissions: (mi.granted_permissions as string[] | undefined) ?? [],
-        authorized_workspaces: this.normalizeMissionWorkspaces({
-          project_id: String(mi.project_id),
-          authorized_workspaces: mi.authorized_workspaces as string[] | undefined,
-        }),
+        authorized_workspaces: authorizedWorkspaces,
         risk_ceiling: (mi.risk_ceiling as string | undefined) ?? undefined,
         operator_id: input.operator_id,
       });

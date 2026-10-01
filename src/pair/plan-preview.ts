@@ -467,6 +467,34 @@ export function verifyPlanPreviewForConfirm(
 }
 
 /**
+ * R5 — confirm-path authority guard. A READY preview must carry valid
+ * canonical workspace authority persisted by the preview seam (normalization
+ * runs BEFORE effective_input_digest/plan_digest at preview creation — never
+ * at confirm). A legacy READY preview created before that seam can pin
+ * `[]`/missing workspaces under otherwise matching digests; replaying it
+ * verbatim would mint an unworkable mission, while defaulting at confirm
+ * would widen authority the persisted digests never covered. Neither is
+ * allowed: the preview is rejected and must be regenerated through the
+ * normal preview flow. ALREADY_CONSUMED previews never reach this check.
+ */
+export function assertPreviewWorkspaceAuthority(
+  missionInput: Record<string, unknown>,
+): string[] {
+  const ws = missionInput.authorized_workspaces;
+  if (
+    !Array.isArray(ws) ||
+    ws.length === 0 ||
+    ws.some((w) => typeof w !== "string" || w.trim() === "")
+  ) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",
+      "persisted preview lacks canonical workspace authority — regenerate a fresh plan preview",
+    );
+  }
+  return ws.map((w) => String(w));
+}
+
+/**
  * Atomically mark the preview consumed by mission_id — CAS on version so a
  * concurrent confirm can never double-mint a mission. Must run inside the
  * same transaction as the mission creation.

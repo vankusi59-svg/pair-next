@@ -65,6 +65,7 @@ import {
   devinTaskTimeoutMs,
   classifyFailure,
   TRANSPORT_IN_PROCESS,
+  createPlanPreview as persistPlanPreviewRow,
   type DevinFetch,
   type PlannerAttemptRecord,
   type PlannerCandidate,
@@ -1851,6 +1852,57 @@ const r4Confirm = (ctx: ReturnType<typeof makeCtx>, goal = "g") => {
   return { pv, m };
 };
 
+/**
+ * R5 — legacy READY preview fixture: persists mission_input verbatim
+ * (authorized_workspaces [] or missing) under internally matching legacy
+ * digests, exactly what a pre-R4 preview row looks like.
+ */
+const r5LegacyPreview = (
+  ctx: ReturnType<typeof makeCtx>,
+  authorizedWorkspaces: unknown,
+  opts: { goal?: string; operator?: string; ttlSeconds?: number } = {},
+) => {
+  const goal = opts.goal ?? "legacy";
+  const operator = opts.operator ?? "op";
+  const mi: Record<string, unknown> = {
+    project_id: ctx.projectId,
+    goal,
+    metadata: {},
+    granted_permissions: [],
+    risk_ceiling: null,
+    operator_id: operator,
+  };
+  if (authorizedWorkspaces !== undefined) mi.authorized_workspaces = authorizedWorkspaces;
+  const eid = effectiveInputDigest({
+    project_id: ctx.projectId,
+    goal,
+    granted_permissions: [],
+    authorized_workspaces: authorizedWorkspaces as string[] | undefined,
+    risk_ceiling: undefined,
+    operator_id: operator,
+    allowed_capabilities: undefined,
+    capability_sets: undefined,
+  });
+  const pd = planDigest({
+    project_id: ctx.projectId,
+    effective_input_digest: eid,
+    tasks: [T1],
+    granted_permissions: [],
+    authorized_workspaces: authorizedWorkspaces as string[] | undefined,
+    risk_ceiling: undefined,
+  });
+  return persistPlanPreviewRow(ctx.store, {
+    missionInput: mi,
+    effective_input_digest: eid,
+    plan_digest: pd,
+    canonical_tasks: [T1],
+    attempts: [],
+    winner: null,
+    operator_id: operator,
+    ttlSeconds: opts.ttlSeconds,
+  });
+};
+
 describe("R4 — live-found mission input + recovery limbo closure", () => {
   it("A/B: telegram-style {goal, project_id} + explicit [] both default to canonical project root", () => {
     const ctx = makeCtx("r4-ab");
@@ -2075,3 +2127,105 @@ describe("R4 — live-found mission input + recovery limbo closure", () => {
     expect(tasks).toHaveLength(1); // exactly the pinned plan
   });
 });
+
+
+describe("R5 — pinned preview authority closure", () => {
+  it("R5-F: legacy READY preview ws=[] → FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE, untouched", async () => {
+    const ctx = makeCtx("r5-f");
+    const pv = r5LegacyPreview(ctx, []);
+    const before = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" }),
+      "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",
+    );
+    const after = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    expect(after.state).toBe("READY");
+    expect(after.consumed_mission_id).toBeNull();
+    expect(after.mission_input).toEqual(before.mission_input);
+    expect(after.plan_digest).toBe(before.plan_digest);
+    expect(after.effective_input_digest).toBe(before.effective_input_digest);
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("R5-G: legacy READY preview with missing authorized_workspaces → same fail-closed", async () => {
+    const ctx = makeCtx("r5-g");
+    const pv = r5LegacyPreview(ctx, undefined);
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" }),
+      "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",
+    );
+    expect(ctx.store.get("mission_plan_preview", String(pv.preview_id)).state).toBe("READY");
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("R5-H/E: explicit persisted workspace list replayed VERBATIM (no re-normalization)", () => {
+    const ctx = makeCtx("r5-h");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] },
+      authorized_workspaces: ["/custom-explicit"], operator_id: "op",
+    });
+    // Mutate the project's root after preview — verbatim replay must still
+    // return the persisted list, not re-resolve the project root.
+    const prj = ctx.store.get("project", ctx.projectId);
+    ctx.store.put("project", ctx.projectId, { ...prj, root_location: "/other-root" }, Number(prj.version));
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    expect(((m.metadata as Record<string, unknown>).authorized_workspaces as string[])).toEqual(["/custom-explicit"]);
+  });
+
+  it("R5-I: already-CONSUMED legacy preview → idempotent return, no retroactive rejection", () => {
+    const ctx = makeCtx("r5-i");
+    const { m } = r4Confirm(ctx);
+    const pv = r5LegacyPreview(ctx, []);
+    const row = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    ctx.store.put("mission_plan_preview", String(pv.preview_id), {
+      ...row, state: "CONSUMED", consumed_mission_id: String(m.mission_id),
+    }, Number(row.version));
+    const m2 = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    expect(String(m2.mission_id)).toBe(String(m.mission_id));
+    expect(ctx.store.list("mission").filter((x) => x.project_id === ctx.projectId)).toHaveLength(1);
+  });
+
+  it("R5-J: wrong plan_digest wins over authority validation", async () => {
+    const ctx = makeCtx("r5-j");
+    const pv = r5LegacyPreview(ctx, []);
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: "deadbeef", operator_id: "op" }),
+      "FAIL_CLOSED_PLAN_DIGEST_MISMATCH",
+    );
+  });
+
+  it("R5-K: expired legacy preview → FAIL_CLOSED_PLAN_PREVIEW_EXPIRED wins", async () => {
+    const ctx = makeCtx("r5-k");
+    const pv = r5LegacyPreview(ctx, [], { ttlSeconds: -1 });
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" }),
+      "FAIL_CLOSED_PLAN_PREVIEW_EXPIRED",
+    );
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("R5-L: operator mismatch still binds before authority check", async () => {
+    const ctx = makeCtx("r5-l");
+    const pv = r5LegacyPreview(ctx, [], { operator: "op1" });
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op2" }),
+      "FAIL_CLOSED_PLAN_PREVIEW_OPERATOR",
+    );
+  });
+
+  it("R5-M: one preview → at most one mission still holds after guard", () => {
+    const ctx = makeCtx("r5-m");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const m1 = ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" });
+    const m2 = ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" });
+    expect(m2.mission_id).toBe(m1.mission_id);
+    expect(ctx.store.list("mission").filter((x) => x.project_id === ctx.projectId)).toHaveLength(1);
+  });
+});
+

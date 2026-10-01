@@ -640,3 +640,66 @@ re-pointed inside the dir — test-fixture env setup only):
   unrelated to mission repair (no mission rows were touched).
 - Missions whose tasks cannot proceed abort via recovery — the abort path
   is bounded and audited rather than silently retried forever.
+
+## R5 — PINNED PREVIEW AUTHORITY CLOSURE
+
+Audited pre-R5 HEAD: `5af27da9c2879520fcbfde04b887e4dea7b911aa`
+
+### Audit blocker
+R4 normalized workspace authority only at preview creation. Its confirm
+path then RE-RAN `normalizeMissionWorkspaces()` over the persisted
+`mission_input`, which for a legacy READY preview created before R4
+(`authorized_workspaces = []`, digests covering `[]`) silently widened the
+authority to `[project.root_location]` before minting the mission —
+violating `previewed authority == confirmed authority == committed
+authority`. Confirm must never rewrite authority already covered by the
+persisted digests.
+
+### Confirm semantics after fix
+`confirmPlanPreview` no longer calls `normalizeMissionWorkspaces`. New
+helper `assertPreviewWorkspaceAuthority(mission_input)` (plan-preview.ts)
+validates the persisted `authorized_workspaces`: must be a non-empty array
+of non-empty strings, then is replayed VERBATIM into mission creation.
+Invalid → `FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE` (IntegrityError,
+consistent with the other preview errors): no mission, preview stays READY,
+mission_input and both digests untouched — inside the same store.immediate
+transaction, so the rejection is atomic.
+
+Ordering preserved (verify → validate → authority check → create → CAS
+consume): `FAIL_CLOSED_PLAN_DIGEST_MISMATCH` still wins first, then
+consumed-idempotent return, `FAIL_CLOSED_PLAN_PREVIEW_EXPIRED`,
+`FAIL_CLOSED_PLAN_PREVIEW_OPERATOR`, and only then the new authority check.
+`effective_input_digest` / `plan_digest` remain immutable approval evidence
+— never recomputed against modified authority, never migrated in place.
+
+### New previews unchanged
+`createPlanPreview` still runs `normalizeMissionWorkspaces` BEFORE
+effective_input_digest/plan_digest/persisted mission_input: missing or `[]`
+→ `[project.root_location]`; explicit non-empty lists pass through
+verbatim; unusable project root → `FAIL_CLOSED_NO_AUTHORIZED_WORKSPACE`.
+
+### Deferred architectural note (§9)
+The serve-side edge still calls `planExpander(body)` before
+`MissionControl.createPlanPreview()` normalizes workspaces. The planner
+plans from goal/capability context only, so correctness is preserved; the
+cleanup (normalizing once at the edge) is deferred per the mandate.
+
+### Focused tests (+8)
+F: legacy ws=[] → AUTHORITY_STALE, zero missions, READY/inputs/digests
+unchanged. G: missing ws → same. H/E: explicit persisted list replayed
+verbatim even after project root changed post-preview. I: already-CONSUMED
+legacy preview → idempotent return, no retroactive rejection. J: wrong
+digest wins first. K: expiry wins. L: operator binding wins. M: one
+preview → at most one mission.
+
+### Regression
+Phase B focused 97/97 (+8). Full suite 2381 pass / 2 fail — same
+pre-existing P5 DSH+CODEX env failures as base `2277319`. tsc --noEmit
+clean, pnpm build clean.
+
+### Smoke (deterministic, per §13 allowance)
+CASE 1 (new preview): covered by R4 test D/E + R4 live run — no-ws POST →
+persisted `[project.root_location]` → confirm → mission identical.
+CASE 2 (legacy READY ws=[] → AUTHORITY_STALE, READY preserved, zero
+missions): covered deterministically by tests F/G above; no production
+preview was mutated to generate evidence.
