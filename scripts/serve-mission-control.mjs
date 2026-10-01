@@ -70,8 +70,8 @@ import {
   llmPlannerTimeoutMs,
   taskTimeoutSeconds,
   resolveMcToken,
-  assignModelRole,
-  assertNoModelRoleOverlap,
+  reconcileModelRoleAssignments,
+  assertCanonicalModelRoleStateDisjoint,
   assertPlannerModelRole,
   assertDshExecutionModelRole,
   modelRoleOf,
@@ -476,9 +476,18 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     for (const route of DSH_ROUTES) {
       if (!dshRefs.some((r) => r.ref === route)) console.log("MODEL_ROUTE: skip", route, "(not discovered)");
     }
-    assertNoModelRoleOverlap(store, { planner: plannerRefs, dsh: dshRefs });
-    for (const r of plannerRefs) assignModelRole(store, r.model_entry_id, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "PAIR_MC" });
-    for (const r of dshRefs) assignModelRole(store, r.model_entry_id, MODEL_ROLE.DSH_EXECUTION, { actor: "PAIR_MC" });
+    // R1 — canonical reconciliation: the ACTIVE assignment set converges to
+    // exactly the desired pools in one atomic step (stale rows revoked to
+    // role=null, changed roles reassigned, all audited — history preserved
+    // in events). Then assert the resulting STORED state is disjoint, not
+    // merely the configured refs.
+    const roleRes = reconcileModelRoleAssignments(store, {
+      planner: plannerRefs,
+      dsh: dshRefs,
+      actor: "PAIR_MC",
+    });
+    console.log("MODEL_ROLE: reconciled", JSON.stringify(roleRes));
+    assertCanonicalModelRoleStateDisjoint(store);
 
     const qualifyRoute = async ({ ref, pid, mid, model_entry_id }, bindToDsh) => {
       const prov = pc.getProvider(pid);

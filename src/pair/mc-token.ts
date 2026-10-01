@@ -63,6 +63,22 @@ export function resolveMcToken(
   }
 
   if (fs.existsSync(file)) {
+    // Existing persisted token: enforce owner-only mode before trusting it —
+    // a permissive file must not silently stay permissive (POSIX only;
+    // platforms without mode semantics skip enforcement).
+    if (process.platform !== "win32") {
+      const mode = fs.statSync(file).mode & 0o777;
+      if (mode !== 0o600) {
+        try {
+          fs.chmodSync(file, 0o600);
+        } catch (err) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_MC_TOKEN_PERMS",
+            `cannot enforce 0600 on persisted token file (${String(err).slice(0, 120)})`,
+          );
+        }
+      }
+    }
     const stored = fs.readFileSync(file, "utf8");
     return { token: assertTokenShape(stored, "file"), source: "file", path: file };
   }

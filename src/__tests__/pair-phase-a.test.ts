@@ -18,6 +18,7 @@ import {
   PairControlPlane,
   PairEvidenceStore,
   assignModelRole,
+  assertCanonicalModelRoleStateDisjoint,
   assertDshExecutionModelRole,
   assertModelRole,
   assertNoModelRoleOverlap,
@@ -29,6 +30,7 @@ import {
   modelRoleAssignmentId,
   modelRoleOf,
   readPositiveIntEnv,
+  reconcileModelRoleAssignments,
   resolveMcToken,
   revokeModelRole,
   sameCanonicalModel,
@@ -444,5 +446,182 @@ describe("D — MC token hardening", () => {
       evidence: ctx.store.listEvidence(),
     });
     expect(hay).not.toContain(r.token);
+  });
+
+  it("existing permissive file is tightened to 0600 before use (R1)", () => {
+    const dir = freshDir("tok-perms");
+    const fp = path.join(dir, "pair-mc-token");
+    fs.writeFileSync(fp, "good-token-value", { mode: 0o644 });
+    const r = resolveMcToken({ env: {}, homeDir: dir });
+    expect(r.token).toBe("good-token-value");
+    expect(fs.statSync(fp).mode & 0o777).toBe(0o600);
+  });
+
+  it("existing file already 0600 stays unchanged", () => {
+    const dir = freshDir("tok-perms-ok");
+    const fp = path.join(dir, "pair-mc-token");
+    fs.writeFileSync(fp, "ok-token", { mode: 0o600 });
+    const r = resolveMcToken({ env: {}, homeDir: dir });
+    expect(r.token).toBe("ok-token");
+    expect(fs.statSync(fp).mode & 0o777).toBe(0o600);
+  });
+});
+
+/* ================= R1 — canonical role reconciliation ==================== */
+
+describe("R1 — reconcileModelRoleAssignments", () => {
+  const refs = (ctx: ReturnType<typeof makeCtx>, planner: [string, string][], dsh: [string, string][]) => ({
+    planner: planner.map(([p, m]) => ({ model_entry_id: String(ctx.mcat.getModelByIds(p, m)!.model_entry_id), ref: `${p}:${m}` })),
+    dsh: dsh.map(([p, m]) => ({ model_entry_id: String(ctx.mcat.getModelByIds(p, m)!.model_entry_id), ref: `${p}:${m}` })),
+  });
+  const activeRoles = (ctx: ReturnType<typeof makeCtx>) =>
+    listModelRoleAssignments(ctx.store)
+      .filter((r) => r.role !== null)
+      .map((r) => `${String(r.model_id)}=${String(r.role)}`)
+      .sort();
+  const roleEvents = (ctx: ReturnType<typeof makeCtx>) =>
+    ctx.store.listEvents("model_role_assignment").map((e) => e.event_type);
+
+  it("A — remove old planner: stale planner revoked on reconfigure", () => {
+    const ctx = makeCtx("r1-a");
+    const A = addModel(ctx, "gemini", "a");
+    const B = addModel(ctx, "groq", "b");
+    const C = addModel(ctx, "cloudflare", "c");
+    reconcileModelRoleAssignments(ctx.store, refs(ctx, [["gemini", "a"]], [["groq", "b"]]));
+    const res = reconcileModelRoleAssignments(ctx.store, refs(ctx, [["cloudflare", "c"]], [["groq", "b"]]));
+    expect(res.revoked).toEqual([String(A.model_entry_id)]);
+    expect(res.created).toEqual([String(C.model_entry_id)]);
+    expect(res.noop).toEqual([String(B.model_entry_id)]);
+    expect(activeRoles(ctx)).toEqual([`b=${MODEL_ROLE.DSH_EXECUTION}`, `c=${MODEL_ROLE.PLANNER_COORDINATOR}`]);
+    // stale row is inactive (role=null) not deleted — history preserved
+    const stale = ctx.store.tryGet("model_role_assignment", modelRoleAssignmentId(String(A.model_entry_id)))!;
+    expect(stale.role).toBeNull();
+    expect(stale.revoked_from).toBe(MODEL_ROLE.PLANNER_COORDINATOR);
+  });
+
+  it("B — remove old DSH: extra DSH assignment revoked", () => {
+    const ctx = makeCtx("r1-b");
+    addModel(ctx, "gemini", "a");
+    const B = addModel(ctx, "groq", "b");
+    addModel(ctx, "cloudflare", "c");
+    reconcileModelRoleAssignments(ctx.store, refs(ctx, [["gemini", "a"]], [["groq", "b"], ["cloudflare", "c"]]));
+    const res = reconcileModelRoleAssignments(ctx.store, refs(ctx, [["gemini", "a"]], [["cloudflare", "c"]]));
+    expect(res.revoked).toEqual([String(B.model_entry_id)]);
+    expect(activeRoles(ctx)).toEqual([`a=${MODEL_ROLE.PLANNER_COORDINATOR}`, `c=${MODEL_ROLE.DSH_EXECUTION}`]);
+  });
+
+  it("C — swap role: B audited REASSIGNED DSH→PLANNER, A revoked, C created", () => {
+    const ctx = makeCtx("r1-c");
+    const A = addModel(ctx, "gemini", "a");
+    const B = addModel(ctx, "groq", "b");
+    addModel(ctx, "cloudflare", "c");
+    reconcileModelRoleAssignments(ctx.store, refs(ctx, [["gemini", "a"]], [["groq", "b"]]));
+    const before = roleEvents(ctx).length;
+    const res = reconcileModelRoleAssignments(ctx.store, refs(ctx, [["groq", "b"]], [["cloudflare", "c"]]));
+    expect(res.reassigned).toEqual([String(B.model_entry_id)]);
+    expect(res.revoked).toEqual([String(A.model_entry_id)]);
+    expect(res.created).toEqual([String(res.created[0])]);
+    expect(activeRoles(ctx)).toEqual([`b=${MODEL_ROLE.PLANNER_COORDINATOR}`, `c=${MODEL_ROLE.DSH_EXECUTION}`]);
+    const newEvents = roleEvents(ctx).slice(before);
+    expect(newEvents).toContain("MODEL_ROLE_REASSIGNED");
+    expect(newEvents).toContain("MODEL_ROLE_REVOKED");
+    expect(newEvents).toContain("MODEL_ROLE_ASSIGNED");
+  });
+
+  it("D — proven-alias stale overlap: revoked stale planner before final assertion", () => {
+    const ctx = makeCtx("r1-d");
+    const A = addModel(ctx, "gemini", "a", "a-alias"); // A aliases "a-alias"
+    const B = addModel(ctx, "gemini", "a-alias");      // separate entry, proven alias of A
+    addModel(ctx, "groq", "c");
+    // state 1: A is planner
+    reconcileModelRoleAssignments(ctx.store, refs(ctx, [["gemini", "a"]], []));
+    // state 2: C planner, B dsh — A's alias B now sits in the DSH pool
+    const res = reconcileModelRoleAssignments(ctx.store, refs(ctx, [["groq", "c"]], [["gemini", "a-alias"]]));
+    expect(res.revoked).toEqual([String(A.model_entry_id)]);
+    // final stored state must be disjoint — A inactive so B's dsh role is legal
+    expect(() => assertCanonicalModelRoleStateDisjoint(ctx.store)).not.toThrow();
+    expect(activeRoles(ctx)).toEqual([`a-alias=${MODEL_ROLE.DSH_EXECUTION}`, `c=${MODEL_ROLE.PLANNER_COORDINATOR}`]);
+  });
+
+  it("E — idempotent restart: same config twice produces no new events", () => {
+    const ctx = makeCtx("r1-e");
+    addModel(ctx, "gemini", "a");
+    addModel(ctx, "groq", "b");
+    const r = refs(ctx, [["gemini", "a"]], [["groq", "b"]]);
+    reconcileModelRoleAssignments(ctx.store, r);
+    const eventsAfterFirst = roleEvents(ctx).length;
+    const res2 = reconcileModelRoleAssignments(ctx.store, r);
+    expect(res2.noop).toHaveLength(2);
+    expect(res2.created).toHaveLength(0);
+    expect(res2.reassigned).toHaveLength(0);
+    expect(res2.revoked).toHaveLength(0);
+    expect(roleEvents(ctx).length).toBe(eventsAfterFirst); // zero new events
+  });
+
+  it("F — unknown configured ref fails closed (no partial topology)", () => {
+    const ctx = makeCtx("r1-f");
+    addModel(ctx, "gemini", "a");
+    try {
+      reconcileModelRoleAssignments(ctx.store, {
+        planner: [{ model_entry_id: "ME_GHOST", ref: "x:y" }],
+        dsh: [],
+      });
+      throw new Error("expected failure");
+    } catch (e) {
+      expect(String(e)).toContain("model_entry:ME_GHOST");
+    }
+    expect(listModelRoleAssignments(ctx.store)).toHaveLength(0); // nothing applied
+  });
+
+  it("atomicity — desired-pool overlap rolls back ALL mutations", () => {
+    const ctx = makeCtx("r1-atomic");
+    const A = addModel(ctx, "gemini", "a");
+    addModel(ctx, "groq", "b");
+    reconcileModelRoleAssignments(ctx.store, refs(ctx, [["gemini", "a"]], [["groq", "b"]]));
+    // desired overlap: same model in both pools → whole txn must roll back
+    expectFailClosed(
+      () =>
+        reconcileModelRoleAssignments(ctx.store, {
+          planner: [{ model_entry_id: String(A.model_entry_id) }],
+          dsh: [{ model_entry_id: String(A.model_entry_id) }],
+        }),
+      "FAIL_CLOSED_MODEL_ROLE_OVERLAP",
+    );
+    // previous topology untouched: A still planner, b still dsh
+    expect(activeRoles(ctx)).toEqual([`a=${MODEL_ROLE.PLANNER_COORDINATOR}`, `b=${MODEL_ROLE.DSH_EXECUTION}`]);
+  });
+});
+
+describe("R1 — assertCanonicalModelRoleStateDisjoint (final stored state)", () => {
+  it("passes on a disjoint active set", () => {
+    const ctx = makeCtx("fd-ok");
+    const A = addModel(ctx, "gemini", "a");
+    const B = addModel(ctx, "groq", "b");
+    assignModelRole(ctx.store, String(A.model_entry_id), MODEL_ROLE.PLANNER_COORDINATOR);
+    assignModelRole(ctx.store, String(B.model_entry_id), MODEL_ROLE.DSH_EXECUTION);
+    expect(() => assertCanonicalModelRoleStateDisjoint(ctx.store)).not.toThrow();
+  });
+
+  it("fails when active stored roles overlap (stale-config class)", () => {
+    const ctx = makeCtx("fd-bad");
+    // simulate the audit's dangerous state: A planner + alias-B dsh coexist
+    const A = addModel(ctx, "gemini", "a", "a-alias");
+    const B = addModel(ctx, "gemini", "a-alias");
+    assignModelRole(ctx.store, String(A.model_entry_id), MODEL_ROLE.PLANNER_COORDINATOR);
+    assignModelRole(ctx.store, String(B.model_entry_id), MODEL_ROLE.DSH_EXECUTION);
+    expectFailClosed(
+      () => assertCanonicalModelRoleStateDisjoint(ctx.store),
+      "FAIL_CLOSED_MODEL_ROLE_OVERLAP",
+    );
+  });
+
+  it("revoked rows do not participate in the disjoint check", () => {
+    const ctx = makeCtx("fd-revoked");
+    const A = addModel(ctx, "gemini", "a");
+    const B = addModel(ctx, "groq", "b");
+    assignModelRole(ctx.store, String(A.model_entry_id), MODEL_ROLE.PLANNER_COORDINATOR);
+    revokeModelRole(ctx.store, String(A.model_entry_id));
+    assignModelRole(ctx.store, String(B.model_entry_id), MODEL_ROLE.DSH_EXECUTION);
+    expect(() => assertCanonicalModelRoleStateDisjoint(ctx.store)).not.toThrow();
   });
 });

@@ -196,6 +196,102 @@ export interface ModelPoolRef {
   ref?: string;
 }
 
+export interface RoleReconcileResult {
+  created: string[];
+  reassigned: string[];
+  revoked: string[];
+  noop: string[];
+}
+
+/**
+ * Canonical role reconciliation (Phase A R1). One atomic seam that makes the
+ * ACTIVE assignment set exactly equal the desired configured pools:
+ *
+ *   for each active row: desired role same → no-op; different → REASSIGNED;
+ *                        absent → REVOKED (role=null, never deleted)
+ *   for each desired ref without an active row → ASSIGNED
+ *
+ * Runs inside BEGIN IMMEDIATE — a crash or an invariant failure mid-way rolls
+ * back the whole reconciliation rather than leaving a half-applied topology.
+ * Every mutation emits its audited event (MODEL_ROLE_ASSIGNED /
+ * MODEL_ROLE_REASSIGNED / MODEL_ROLE_REVOKED with reason ROLE_RECONCILE);
+ * history is preserved, only active state converges.
+ *
+ * Desired refs must resolve to real catalog model_entry_ids — an unknown ref
+ * fails closed (NotFound) BEFORE any mutation.
+ */
+export function reconcileModelRoleAssignments(
+  store: PairEvidenceStore,
+  opts: { planner: ModelPoolRef[]; dsh: ModelPoolRef[]; actor?: string },
+): RoleReconcileResult {
+  const actor = opts.actor ?? "PAIR_MODEL_ROLE_RECONCILE";
+  return store.immediate(() => {
+    // 1. desired-state validation — all refs must exist before any mutation.
+    const desired = new Map<string, ModelRole>();
+    for (const r of opts.planner) {
+      if (!store.tryGet("model_entry", r.model_entry_id)) {
+        throw new NotFoundError(`model_entry:${r.model_entry_id}`);
+      }
+      desired.set(r.model_entry_id, MODEL_ROLE.PLANNER_COORDINATOR);
+    }
+    for (const r of opts.dsh) {
+      if (!store.tryGet("model_entry", r.model_entry_id)) {
+        throw new NotFoundError(`model_entry:${r.model_entry_id}`);
+      }
+      desired.set(r.model_entry_id, MODEL_ROLE.DSH_EXECUTION);
+    }
+    // 2. desired pools must already be disjoint on canonical identity.
+    assertNoModelRoleOverlap(store, opts);
+
+    // 3. reconcile ACTIVE assignments against desired state.
+    const res: RoleReconcileResult = { created: [], reassigned: [], revoked: [], noop: [] };
+    const active = store
+      .list("model_role_assignment")
+      .filter((r) => typeof r.role === "string" && MODEL_ROLES.has(String(r.role)));
+    const activeByModel = new Map(active.map((r) => [String(r.model_entry_id), r]));
+
+    for (const row of active) {
+      const mid = String(row.model_entry_id);
+      const want = desired.get(mid);
+      if (want === undefined) {
+        revokeModelRole(store, mid, { actor });
+        res.revoked.push(mid);
+      } else if (want !== String(row.role)) {
+        assignModelRole(store, mid, want, { actor });
+        res.reassigned.push(mid);
+      } else {
+        res.noop.push(mid);
+      }
+    }
+    for (const [mid, role] of desired) {
+      if (!activeByModel.has(mid)) {
+        assignModelRole(store, mid, role, { actor });
+        res.created.push(mid);
+      }
+    }
+    return res;
+  });
+}
+
+/**
+ * Final-state invariant (Phase A R1): over the ACTIVE stored assignments —
+ * not the current env refs — every Planner assignment must be canonically
+ * distinct from every DSH assignment. Reusable by startup and later Phase
+ * B/C runtime audits. Safe diagnostics only.
+ */
+export function assertCanonicalModelRoleStateDisjoint(store: PairEvidenceStore): void {
+  const active = store
+    .list("model_role_assignment")
+    .filter((r) => typeof r.role === "string" && MODEL_ROLES.has(String(r.role)));
+  const planner = active
+    .filter((r) => r.role === MODEL_ROLE.PLANNER_COORDINATOR)
+    .map((r) => ({ model_entry_id: String(r.model_entry_id), ref: String(r.model_id ?? r.model_entry_id) }));
+  const dsh = active
+    .filter((r) => r.role === MODEL_ROLE.DSH_EXECUTION)
+    .map((r) => ({ model_entry_id: String(r.model_entry_id), ref: String(r.model_id ?? r.model_entry_id) }));
+  assertNoModelRoleOverlap(store, { planner, dsh });
+}
+
 /**
  * Startup invariant: no canonical model may sit in both pools. Safe
  * diagnostics only — model identity + provider + route refs, never secrets.
