@@ -516,6 +516,73 @@ describe("LORC A — apply-path routing throw → bounded re-decide", () => {
     expect(String(ent.state)).toBe("ABORTED");
     expect(String(ent.reason)).toContain("recovery_boundary_defect");
   });
+
+  it("A9. mission entity unavailable → failure handler fails → emergency runtime abort WITHOUT service path (audit finding)", () => {
+    const ctx = makeCtx("a9");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    const task = ctx.service.listTasks(mid)[0];
+    const rtEnt = rt(ctx, mid);
+    rtEnt.state = "RECOVERING";
+    rtEnt.pending_recovery = {
+      recovery_id: "RCV_seed9",
+      action: "RE_ROUTE",
+      task_id: String(task.task_id),
+      execution_id: null,
+      governed_task_id: null,
+      executor_id: "EX_A",
+      failure_class: "TRANSIENT_TRANSPORT",
+      backoff_ms: 0,
+      infeasible_actions: [],
+    };
+    ctx.store.put("mission_runtime", `MRT_${mid}`, rtEnt, Number(rtEnt.version));
+    // Mission entity corrupt: service.getMission throws persistently. The
+    // apply arm fails (its mission fetch), the failure handler fails
+    // (startRecovery reads mission metadata), and old abortMission would
+    // throw AGAIN on the same getMission — escaping to the supervisor.
+    // The emergency boundary must terminalize the runtime without it.
+    const badService = new Proxy(ctx.service, {
+      get(t, k) {
+        if (k === "getMission") {
+          return () => { throw new IntegrityError("mission_entity_corrupt"); };
+        }
+        const v: unknown = Reflect.get(t, k, t);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    });
+    const decisionsBefore = decisions(ctx, mid).length;
+    const defective = new MissionRuntime({
+      service: badService, gate: ctx.gate, router: ctx.router,
+      adapters: ctx.adapters, scheduler: ctx.scheduler, approvals: ctx.approvals,
+      reconciliation: ctx.recon, recovery: ctx.recovery,
+      planner: (() => ({ tasks: [] })) as never,
+    });
+    defective.tick(mid, FAR); // must NOT escape merely because mission is missing
+    const ent = rt(ctx, mid);
+    expect(String(ent.state)).toBe("ABORTED");
+    expect(String(ent.reason)).toContain("recovery_boundary_defect");
+    // actionable recovery neutralized, forensic evidence preserved
+    expect(ent.pending_recovery).toBeNull();
+    const aborted = ent.aborted_recovery as Record<string, unknown>;
+    expect(String(aborted.action)).toBe("RE_ROUTE");
+    expect(String(aborted.task_id)).toBe(String(task.task_id));
+    // subsequent ticks do not re-drive the recovery action
+    const before = decisions(ctx, mid).length;
+    for (let i = 0; i < 3; i++) defective.tick(mid, FAR);
+    expect(String(rt(ctx, mid).state)).toBe("ABORTED");
+    expect(decisions(ctx, mid).length).toBe(before);
+    // restart over the same store still sees terminal ABORTED
+    const fresh = new MissionRuntime({
+      service: ctx.service, gate: ctx.gate, router: ctx.router,
+      adapters: ctx.adapters, scheduler: ctx.scheduler, approvals: ctx.approvals,
+      reconciliation: ctx.recon, recovery: ctx.recovery,
+      planner: (() => ({ tasks: [] })) as never,
+    });
+    fresh.tick(mid, FAR);
+    expect(String(rt(ctx, mid).state)).toBe("ABORTED");
+    expect(decisions(ctx, mid).length).toBeGreaterThanOrEqual(decisionsBefore);
+  });
 });
 
 /* ------------------------------ Devin observe ------------------------------ */

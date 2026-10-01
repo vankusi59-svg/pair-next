@@ -881,9 +881,22 @@ export class MissionRuntime {
     try {
       fn();
     } catch (err) {
-      const pending = this.runtimeEntity(missionId).pending_recovery as
-        | Record<string, unknown>
-        | null;
+      let pending: Record<string, unknown> | null;
+      try {
+        pending = this.runtimeEntity(missionId).pending_recovery as
+          | Record<string, unknown>
+          | null;
+      } catch {
+        // The pending read itself failed — there may still be an
+        // actionable recovery. Terminalize via the emergency path (its own
+        // read decides whether anything durable is possible) rather than
+        // feeding a stub pending into the decision machinery.
+        const msg = String(
+          (err as { message?: string })?.message ?? err,
+        ).replace(/\s+/g, " ").slice(0, 120);
+        this.forceAbortRuntime(missionId, `recovery_boundary_defect:${msg}`);
+        return;
+      }
       if (!pending) throw err;
       this.recoveryFailureBoundary(
         missionId,
@@ -898,10 +911,12 @@ export class MissionRuntime {
   /**
    * Last boundary for recovery-apply failures. A normal throw becomes an
    * infeasible/defect re-decide via handleRecoveryApplyFailure; if THAT
-   * fails too (illegal decided transition, decide() defect, store fault),
-   * the only state reachable from every live recovery state is ABORTED —
-   * abortMission force-writes it, so an unhandleable failure still ends in
-   * an operator-visible terminal state rather than another silent replay.
+   * fails too (illegal decided transition, decide() defect, mission
+   * entity unavailable, ...), forceAbortRuntime terminalizes the runtime
+   * directly. NOT abortMission: abortMission reads the mission entity
+   * first, and a missing/corrupt mission row is exactly the failure this
+   * fallback exists for — routing through it would recreate the same
+   * silent-replay escape the boundary closes.
    */
   private recoveryFailureBoundary(
     missionId: string,
@@ -913,10 +928,80 @@ export class MissionRuntime {
     try {
       this.handleRecoveryApplyFailure(missionId, pending, action, err, now);
     } catch (inner) {
-      this.abortMission(
-        missionId,
-        `recovery_boundary_defect:${(inner as { message?: string })?.message ?? String(inner)}`,
+      const msg = String(
+        (inner as { message?: string })?.message ?? inner,
+      ).replace(/\s+/g, " ").slice(0, 120);
+      this.forceAbortRuntime(missionId, `recovery_boundary_defect:${msg}`);
+    }
+  }
+
+  /**
+   * Emergency runtime terminalization — the final no-escape step inside the
+   * recovery failure boundary. Terminalizes ONLY the mission_runtime row;
+   * it must not depend on service.getMission / transitionMission / decide /
+   * scheduler / approvals / router / executor / reconciliation, any of
+   * which may be the dependency that is failing.
+   *
+   * Precise durability guarantee: while the mission_runtime row remains
+   * readable and writable, failures elsewhere cannot leave the same
+   * recovery action silently replayable. If the canonical store itself
+   * cannot read/write the row, durable terminalization is impossible from
+   * this layer and the error escapes — an infrastructure failure outside
+   * this boundary's scope, not a hidden recovery path.
+   *
+   * Order is fixed: persist ABORTED + neutralize pending_recovery first;
+   * only afterwards attempt best-effort mission → FAILED sync, whose
+   * failure must never undo or block the runtime terminal state.
+   */
+  private forceAbortRuntime(missionId: string, reason: string): void {
+    const rt = this.runtimeEntity(missionId);
+    const prior = rt.pending_recovery as Record<string, unknown> | null;
+    const from = String(rt.state);
+    if (prior) {
+      // Keep forensic evidence but make the recovery non-actionable:
+      // state ABORTED is terminal (supervisor excludes it) and
+      // pending_recovery is cleared so nothing re-drives it after restart.
+      rt.aborted_recovery = {
+        recovery_id: prior.recovery_id ?? null,
+        action: prior.action ?? null,
+        task_id: prior.task_id ?? null,
+        failure_class: prior.failure_class ?? null,
+        aborted_reason: reason,
+      };
+      rt.pending_recovery = null;
+    }
+    if (from !== "ABORTED") {
+      rt.state = "ABORTED";
+      rt.entered_at = utcnow();
+      rt.reason = reason;
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
       );
+      try {
+        this.store.event({
+          entity_type: "mission_runtime",
+          entity_id: String(rt.mission_runtime_id),
+          event_type: "MISSION_RUNTIME_EMERGENCY_ABORT",
+          old_state: from,
+          new_state: "ABORTED",
+          actor: this.actor,
+          metadata: { mission_id: missionId, reason },
+        });
+      } catch {
+        /* event journal is best-effort; the terminal row is already durable */
+      }
+    }
+    // Best-effort mission sync AFTER runtime is durably terminal.
+    try {
+      const mission = this.deps.service.getMission(missionId);
+      if (["READY", "RUNNING", "PAUSED"].includes(String(mission.status))) {
+        this.deps.service.transitionMission(missionId, "FAILED", this.actor);
+      }
+    } catch {
+      /* mission entity unavailable — runtime ABORTED stands */
     }
   }
 
