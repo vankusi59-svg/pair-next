@@ -442,6 +442,80 @@ describe("LORC A — apply-path routing throw → bounded re-decide", () => {
     for (let i = 0; i < 3; i++) ctx.runtime.tick(mid, FAR);
     expect(String(rt(ctx, mid).state)).not.toBe("RECOVERING");
   });
+
+  it("A7. RECONCILING-state throw (reconcile dep defect) → bounded defect decision, not silent RECONCILING limbo", () => {
+    const ctx = makeCtx("a7");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    const task = ctx.service.listTasks(mid)[0];
+    const rtEnt = rt(ctx, mid);
+    rtEnt.state = "RECONCILING";
+    rtEnt.pending_recovery = {
+      recovery_id: "RCV_seed7",
+      action: "RECONCILIATION_REQUIRED",
+      task_id: String(task.task_id),
+      execution_id: null,
+      governed_task_id: null,
+      executor_id: null,
+      failure_class: "TRANSIENT_TRANSPORT",
+      backoff_ms: 0,
+      infeasible_actions: [],
+    };
+    rtEnt.barriers = {
+      [String(task.task_id)]: { kind: "RECONCILIATION", execution_id: "EXE_x", settled: false },
+    };
+    ctx.store.put("mission_runtime", `MRT_${mid}`, rtEnt, Number(rtEnt.version));
+    const defective = new MissionRuntime({
+      service: ctx.service, gate: ctx.gate, router: ctx.router,
+      adapters: ctx.adapters, scheduler: ctx.scheduler, approvals: ctx.approvals,
+      reconciliation: { reconcile: () => { throw new IntegrityError("recon_corrupt"); } } as never,
+      recovery: ctx.recovery, planner: (() => ({ tasks: [] })) as never,
+    });
+    defective.tick(mid, FAR);
+    const latest = decisions(ctx, mid).at(-1)!;
+    expect(String(latest.failure_class)).toBe("INTERNAL_RUNTIME_DEFECT");
+    expect(["WAITING_APPROVAL", "ABORTED"]).toContain(String(rt(ctx, mid).state));
+    for (let i = 0; i < 3; i++) defective.tick(mid, FAR);
+    expect(String(rt(ctx, mid).state)).not.toBe("RECONCILING");
+  });
+
+  it("A8. failure-handler itself throws (decide defect) → abortMission fallback, never silent replay", () => {
+    const ctx = makeCtx("a8");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    const task = ctx.service.listTasks(mid)[0];
+    const rtEnt = rt(ctx, mid);
+    rtEnt.state = "RECOVERING";
+    rtEnt.pending_recovery = {
+      recovery_id: "RCV_seed8",
+      action: "RE_ROUTE",
+      task_id: String(task.task_id),
+      execution_id: null,
+      governed_task_id: null,
+      executor_id: "EX_A",
+      failure_class: "TRANSIENT_TRANSPORT",
+      backoff_ms: 0,
+      infeasible_actions: [],
+    };
+    ctx.store.put("mission_runtime", `MRT_${mid}`, rtEnt, Number(rtEnt.version));
+    // Router throws PolicyError (normal infeasible path) BUT decide() also
+    // throws — the failure handler cannot land a decision; the boundary must
+    // still end the mission visibly instead of escaping to the supervisor.
+    const defective = new MissionRuntime({
+      service: ctx.service, gate: ctx.gate,
+      router: { routeGovernedTask: () => { throw new PolicyError("FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR", "none"); } } as never,
+      adapters: ctx.adapters, scheduler: ctx.scheduler, approvals: ctx.approvals,
+      reconciliation: ctx.recon,
+      recovery: { ...ctx.recovery, decide: () => { throw new IntegrityError("decide_corrupt"); } } as never,
+      planner: (() => ({ tasks: [] })) as never,
+    });
+    defective.tick(mid, FAR);
+    const ent = rt(ctx, mid);
+    expect(String(ent.state)).toBe("ABORTED");
+    expect(String(ent.reason)).toContain("recovery_boundary_defect");
+  });
 });
 
 /* ------------------------------ Devin observe ------------------------------ */

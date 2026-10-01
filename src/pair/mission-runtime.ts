@@ -421,27 +421,29 @@ export class MissionRuntime {
         break;
       }
       case "WAITING_BACKOFF": {
-        const due = this.deps.scheduler.dueActions(now).filter(
-          (a) => a.mission_id === missionId,
-        );
-        if (due.length === 0) {
-          const pending = this.store
-            .list("scheduled_action")
-            .filter(
-              (a) => a.mission_id === missionId && a.status === "SCHEDULED",
-            );
-          if (pending.length === 0) {
-            this.transitionRuntime(missionId, "RUNNING", "no_pending_backoff");
-          }
-          break;
-        }
-        this.transitionRuntime(missionId, "RECOVERING", "backoff_due");
-        for (const a of due) {
-          this.deps.scheduler.markScheduledAction(
-            String(a.scheduled_action_id),
-            "RUNNING",
+        this.recoveryGuard(missionId, () => {
+          const due = this.deps.scheduler.dueActions(now).filter(
+            (a) => a.mission_id === missionId,
           );
-        }
+          if (due.length === 0) {
+            const pending = this.store
+              .list("scheduled_action")
+              .filter(
+                (a) => a.mission_id === missionId && a.status === "SCHEDULED",
+              );
+            if (pending.length === 0) {
+              this.transitionRuntime(missionId, "RUNNING", "no_pending_backoff");
+            }
+            return;
+          }
+          this.transitionRuntime(missionId, "RECOVERING", "backoff_due");
+          for (const a of due) {
+            this.deps.scheduler.markScheduledAction(
+              String(a.scheduled_action_id),
+              "RUNNING",
+            );
+          }
+        }, now);
         break;
       }
       case "RECOVERING": {
@@ -449,15 +451,15 @@ export class MissionRuntime {
         break;
       }
       case "RECONCILING": {
-        this.runReconciliation(missionId);
+        this.recoveryGuard(missionId, () => this.runReconciliation(missionId), now);
         break;
       }
       case "REPLANNING": {
-        this.runReplan(missionId);
+        this.recoveryGuard(missionId, () => this.runReplan(missionId), now);
         break;
       }
       case "WAITING_APPROVAL": {
-        this.checkPendingApproval(missionId);
+        this.recoveryGuard(missionId, () => this.checkPendingApproval(missionId), now);
         break;
       }
       default:
@@ -526,16 +528,20 @@ export class MissionRuntime {
     const rt = this.runtimeEntity(missionId);
 
     // 1. Process due scheduled recovery actions first (durable timers).
-    const due = this.deps.scheduler
-      .dueActions(now)
-      .filter((a) => a.mission_id === missionId);
-    if (due.length > 0) {
-      for (const a of due) {
-        this.deps.scheduler.markScheduledAction(String(a.scheduled_action_id), "RUNNING");
+    let hasDue = false;
+    this.recoveryGuard(missionId, () => {
+      const due = this.deps.scheduler
+        .dueActions(now)
+        .filter((a) => a.mission_id === missionId);
+      if (due.length > 0) {
+        hasDue = true;
+        for (const a of due) {
+          this.deps.scheduler.markScheduledAction(String(a.scheduled_action_id), "RUNNING");
+        }
+        this.transitionRuntime(missionId, "RECOVERING", "due_recovery_actions");
       }
-      this.transitionRuntime(missionId, "RECOVERING", "due_recovery_actions");
-      return;
-    }
+    }, now);
+    if (hasDue) return;
 
     // R4 §11 — compatibility repair: a runtime left RUNNING with a
     // pending_recovery (the pre-fix "unhandled" fallthrough) resumes the
@@ -859,7 +865,58 @@ export class MissionRuntime {
     try {
       this.applyRecoveryAction(missionId, pending, action, taskId, now);
     } catch (err) {
+      this.recoveryFailureBoundary(missionId, pending, action, err, now);
+    }
+  }
+
+  /**
+   * Runs a recovery-driven tick body under the apply-failure boundary. Any
+   * throw while an actionable pending_recovery exists is converted into a
+   * bounded recovery outcome instead of escaping to the supervisor's silent
+   * catch — covering the non-RECOVERING legs of a recovery chain
+   * (WAITING_BACKOFF, RECONCILING, REPLANNING, WAITING_APPROVAL) where the
+   * same pending_recovery would otherwise replay forever.
+   */
+  private recoveryGuard(missionId: string, fn: () => void, now?: string): void {
+    try {
+      fn();
+    } catch (err) {
+      const pending = this.runtimeEntity(missionId).pending_recovery as
+        | Record<string, unknown>
+        | null;
+      if (!pending) throw err;
+      this.recoveryFailureBoundary(
+        missionId,
+        pending,
+        String(pending.action),
+        err,
+        now,
+      );
+    }
+  }
+
+  /**
+   * Last boundary for recovery-apply failures. A normal throw becomes an
+   * infeasible/defect re-decide via handleRecoveryApplyFailure; if THAT
+   * fails too (illegal decided transition, decide() defect, store fault),
+   * the only state reachable from every live recovery state is ABORTED —
+   * abortMission force-writes it, so an unhandleable failure still ends in
+   * an operator-visible terminal state rather than another silent replay.
+   */
+  private recoveryFailureBoundary(
+    missionId: string,
+    pending: Record<string, unknown>,
+    action: string,
+    err: unknown,
+    now?: string,
+  ): void {
+    try {
       this.handleRecoveryApplyFailure(missionId, pending, action, err, now);
+    } catch (inner) {
+      this.abortMission(
+        missionId,
+        `recovery_boundary_defect:${(inner as { message?: string })?.message ?? String(inner)}`,
+      );
     }
   }
 
