@@ -1367,3 +1367,41 @@ reconcile, never-qualified no-mint, Bug C closure, bounded recovery,
 GovernedTaskGate, CODEX/DSH TELEGRAM_DELIVERY, DEVIN-without-TD).
 
 Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`
+
+## Audit remediation round 4 (HEAD after `e850054`)
+
+Independent re-audit (REWORK REQUIRED) found one Medium residual: on the
+executor-unbound (direct-callable) path `RouteSelector` checked
+`caps.length && !caps.includes(capability)` — so a `ROUTE_EXPLICIT` route
+with an EMPTY ceiling (`capabilities: []`) was silently treated as
+unrestricted, contradicting the R3 semantics.
+
+**Fix:** the unbound branch now keys on the normalized `capability_source`
+(missing → `EXECUTOR_DECLARED`, the approved legacy interpretation),
+never on array length:
+
+- `ROUTE_EXPLICIT` → `capabilities` IS the ceiling; `[]` permits NOTHING
+  → any capability request gets `CAPABILITY_MISMATCH`.
+- `EXECUTOR_DECLARED` → `[]` = unrestricted-by-route; no rejection.
+- Legacy rows without `capability_source` → `EXECUTOR_DECLARED` →
+  unrestricted — no competing interpretation.
+
+Executor-bound behavior (binding.capabilities authority) is untouched.
+
+New regression block **RCA.DC** (4 tests): DC1 explicit-empty denies
+CAP_X with `CAPABILITY_MISMATCH`; DC2 executor-declared-empty permits it;
+DC3 explicit non-empty allows listed/denies unlisted; DC4 legacy
+missing-source row is unrestricted.
+
+**Counterfactual on `e850054`:** exactly DC1 fails — the empty explicit
+ceiling incorrectly permits CAP_X. All other tests pass (DC2/DC3/DC4
+behaviors were already correct or independently covered).
+
+Results: focused 36/36; full suite **2466 pass / 2 failed** — same
+pre-existing P5 env failures; `tsc --noEmit` clean; `pnpm build` clean.
+All R1–R3 remediations preserved (binding-level authority, shared-route
+order independence, unqualified-boot reconcile, scoped POLICY_DENIAL,
+failedExecutorId, Bug C closure, CODEX/DSH TELEGRAM_DELIVERY,
+DEVIN-without-TD).
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`

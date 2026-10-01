@@ -12,6 +12,7 @@
 import { digest, newId, utcnow } from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 import {
+  CAPABILITY_SOURCES,
   REJECTED_ROUTE_HEALTH,
   RouteRegistry,
 } from "./route-registry.js";
@@ -103,10 +104,18 @@ export class RouteSelector {
         if (!bcaps.includes(capability)) reasons.push("CAPABILITY_MISMATCH");
       }
     } else if (capability) {
-      // Unbound direct-callable request: route.capabilities is the route
-      // ceiling ([] on EXECUTOR_DECLARED means unrestricted-by-route).
-      const caps = ((route.capabilities as string[] | undefined) ?? []).map(String);
-      if (caps.length && !caps.includes(capability)) reasons.push("CAPABILITY_MISMATCH");
+      // Unbound direct-callable request: route-level constraint keyed by
+      // capability_source, never by array length alone —
+      //   ROUTE_EXPLICIT    → capabilities IS the ceiling ([] permits NOTHING)
+      //   EXECUTOR_DECLARED → unrestricted-by-route (also the canonical
+      //                       interpretation of a legacy missing source).
+      const source = CAPABILITY_SOURCES.has(String(route.capability_source))
+        ? String(route.capability_source)
+        : "EXECUTOR_DECLARED";
+      if (source === "ROUTE_EXPLICIT") {
+        const caps = ((route.capabilities as string[] | undefined) ?? []).map(String);
+        if (!caps.includes(capability)) reasons.push("CAPABILITY_MISMATCH");
+      }
     }
 
     if (reasons.length) return reasons;

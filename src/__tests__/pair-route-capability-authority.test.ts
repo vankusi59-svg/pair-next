@@ -1241,3 +1241,90 @@ describe("RCA.SR — shared route binding-level effective capabilities", () => {
       .selected_route_id)).toBe("RTE_SHARED");
   });
 });
+
+/* ============== DC — direct-callable empty capability ceiling =========== *
+ * Unbound requests read the route-level CONSTRAINT keyed by
+ * capability_source — never by array length alone:
+ *   ROUTE_EXPLICIT    + [] → permits NOTHING (any capability → mismatch)
+ *   EXECUTOR_DECLARED + [] → unrestricted-by-route
+ *   missing source (legacy) → EXECUTOR_DECLARED → unrestricted */
+
+function mintDirectCallable(
+  ctx: ReturnType<typeof makeCtx>,
+  routeId: string,
+  fields: {
+    capability_source?: string;
+    capabilities?: string[];
+    capabilities_declared?: string[];
+  },
+) {
+  ctx.service.routes.registerRoute({
+    route_id: routeId,
+    route_kind: "REMOTE_GATEWAY_API",
+    enabled: true,
+    eligibility_state: "QUALIFIED",
+    qualification_state: "QUALIFIED",
+    direct_callable: true,
+    ...fields,
+  });
+}
+
+describe("RCA.DC — direct-callable empty ceiling semantics", () => {
+  it("DC1. ROUTE_EXPLICIT + empty ceiling permits NOTHING — CAP_X mismatched, never silently unrestricted", () => {
+    const ctx = makeCtx("dc1");
+    mintDirectCallable(ctx, "RTE_EMPTY", {
+      capability_source: "ROUTE_EXPLICIT",
+      capabilities_declared: [],
+      capabilities: [],
+    });
+    const sel = new RouteSelector(ctx.service);
+    const res = sel.select({ capability: "CAP_X", persist: false });
+    expect(res.selected_route_id).toBeNull();
+    const rej = (res.hard_rejections as Array<{ route_id: string; reason_codes: string[] }>)
+      .find((r) => r.route_id === "RTE_EMPTY");
+    expect(rej?.reason_codes).toContain("CAPABILITY_MISMATCH");
+  });
+
+  it("DC2. EXECUTOR_DECLARED + [] is unrestricted-by-route — CAP_X eligible via the route", () => {
+    const ctx = makeCtx("dc2");
+    mintDirectCallable(ctx, "RTE_FREE", {
+      capability_source: "EXECUTOR_DECLARED",
+      capabilities: [],
+    });
+    const sel = new RouteSelector(ctx.service);
+    const res = sel.select({ capability: "CAP_X", persist: false });
+    expect(String(res.selected_route_id)).toBe("RTE_FREE");
+  });
+
+  it("DC3. ROUTE_EXPLICIT non-empty ceiling allows listed, denies unlisted", () => {
+    const ctx = makeCtx("dc3");
+    mintDirectCallable(ctx, "RTE_AB", {
+      capability_source: "ROUTE_EXPLICIT",
+      capabilities: ["CAP_A", "CAP_B"],
+      capabilities_declared: ["CAP_A", "CAP_B"],
+    });
+    const sel = new RouteSelector(ctx.service);
+    expect(String(sel.select({ capability: "CAP_A", persist: false })
+      .selected_route_id)).toBe("RTE_AB");
+    const denied = sel.select({ capability: "CAP_C", persist: false });
+    expect(denied.selected_route_id).toBeNull();
+    const rej = (denied.hard_rejections as Array<{ route_id: string; reason_codes: string[] }>)
+      .find((r) => r.route_id === "RTE_AB");
+    expect(rej?.reason_codes).toContain("CAPABILITY_MISMATCH");
+  });
+
+  it("DC4. legacy missing capability_source → EXECUTOR_DECLARED → unrestricted", () => {
+    const ctx = makeCtx("dc4");
+    mintDirectCallable(ctx, "RTE_LEGACY", {
+      // No capability_source — pre-field executor-minted row.
+      capabilities: [],
+    });
+    const route = ctx.service.routes.getRoute("RTE_LEGACY")!;
+    // registerRoute persists the field; strip it to simulate the legacy row.
+    const { capability_source: _drop, ...legacy } = route;
+    ctx.store.put("route", "RTE_LEGACY", legacy, Number(route.version));
+    const sel = new RouteSelector(ctx.service);
+    const res = sel.select({ capability: "CAP_X", persist: false });
+    expect(String(res.selected_route_id)).toBe("RTE_LEGACY");
+  });
+});
