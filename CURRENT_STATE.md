@@ -712,6 +712,26 @@ WOB1(A) and refused a legitimate retry.
   2226/0; tsc clean; build PASS; audit 0 high; verifyIntegrity PASS;
   report §26-27.
 
+## Live Ops Recovery Closure (branch `devin/1790855402-live-ops-recovery-closure`, pending independent audit)
+
+- **Bug C — apply-path limbo closed**: all three recovery apply-path
+  `routeGovernedTask` calls (RETRY_SAME_ROUTE, RE_ROUTE, remediation
+  bind) funnel throws into `handleRecoveryApplyFailure`. Expected
+  governed PolicyErrors become `infeasible_actions` evidence persisted on
+  `pending_recovery` and fed into the canonical `decide()` — rejected
+  `APPLY_INFEASIBLE:<code>`, next matrix action evaluated, bounded
+  convergence to HUMAN_APPROVAL_REQUIRED/ABORT/terminal. Defects
+  (IntegrityError etc.) re-decide under INTERNAL_RUNTIME_DEFECT.
+  `supersedeGovernedTask` is idempotent within a failure chain.
+- **Devin completion protocol**: governed `PAIR_EXECUTION_COMPLETE`
+  marker (own line) is the completion contract; legacy bare-DONE is the
+  fallback tier. Verified completion wins over blocked/suspended/timeout
+  enum lag — the remote fetch now runs even past the persisted budget.
+  Outbox artifacts alone are not completion evidence (deferred: needs a
+  per-task expected-artifact contract).
+- Validation: focused +16; full suite 2426/2 pre-existing env fails;
+  tsc + build clean. DO NOT MERGE — pending independent audit.
+
 ## Not yet
 
 - Workforce lifecycle beyond governed completion (Phase 4+), CEO

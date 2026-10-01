@@ -39,6 +39,7 @@ import type { ApprovalQueue } from "./approval-queue.js";
 import type { ReconciliationService } from "./reconciliation.js";
 import type { RecoveryController } from "./recovery-controller.js";
 import { classifyFailure } from "./recovery-controller.js";
+import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
 
@@ -370,6 +371,8 @@ export class MissionRuntime {
       .list("governed_task")
       .filter((g) => String(g.task_id) === taskId && g.selected_route_id)
       .map((g) => String(g.selected_route_id));
+    const task = this.store.tryGet("task", taskId);
+    if (task?.selected_route_id) ids.push(String(task.selected_route_id));
     return [...new Set(ids)];
   }
 
@@ -471,25 +474,27 @@ export class MissionRuntime {
         break;
       }
       case "WAITING_BACKOFF": {
-        const due = this.dueScheduledActionsFor(missionId, now);
-        if (due.length === 0) {
-          const pending = this.store
-            .list("scheduled_action")
-            .filter(
-              (a) => a.mission_id === missionId && a.status === "SCHEDULED",
-            );
-          if (pending.length === 0) {
-            this.transitionRuntime(missionId, "RUNNING", "no_pending_backoff");
+        this.recoveryGuard(missionId, () => {
+          const due = this.dueScheduledActionsFor(missionId, now);
+          if (due.length === 0) {
+            const pending = this.store
+              .list("scheduled_action")
+              .filter(
+                (a) => a.mission_id === missionId && a.status === "SCHEDULED",
+              );
+            if (pending.length === 0) {
+              this.transitionRuntime(missionId, "RUNNING", "no_pending_backoff");
+            }
+            return;
           }
-          break;
-        }
-        this.transitionRuntime(missionId, "RECOVERING", "backoff_due");
-        for (const a of due) {
-          this.deps.scheduler.markScheduledAction(
-            String(a.scheduled_action_id),
-            "RUNNING",
-          );
-        }
+          this.transitionRuntime(missionId, "RECOVERING", "backoff_due");
+          for (const a of due) {
+            this.deps.scheduler.markScheduledAction(
+              String(a.scheduled_action_id),
+              "RUNNING",
+            );
+          }
+        }, now);
         break;
       }
       case "RECOVERING": {
@@ -497,15 +502,15 @@ export class MissionRuntime {
         break;
       }
       case "RECONCILING": {
-        this.runReconciliation(missionId);
+        this.recoveryGuard(missionId, () => this.runReconciliation(missionId), now);
         break;
       }
       case "REPLANNING": {
-        this.runReplan(missionId);
+        this.recoveryGuard(missionId, () => this.runReplan(missionId), now);
         break;
       }
       case "WAITING_APPROVAL": {
-        this.checkPendingApproval(missionId);
+        this.recoveryGuard(missionId, () => this.checkPendingApproval(missionId), now);
         break;
       }
       default:
@@ -574,14 +579,18 @@ export class MissionRuntime {
     const rt = this.runtimeEntity(missionId);
 
     // 1. Process due scheduled recovery actions first (durable timers).
-    const due = this.dueScheduledActionsFor(missionId, now);
-    if (due.length > 0) {
-      for (const a of due) {
-        this.deps.scheduler.markScheduledAction(String(a.scheduled_action_id), "RUNNING");
+    let hasDue = false;
+    this.recoveryGuard(missionId, () => {
+      const due = this.dueScheduledActionsFor(missionId, now);
+      if (due.length > 0) {
+        hasDue = true;
+        for (const a of due) {
+          this.deps.scheduler.markScheduledAction(String(a.scheduled_action_id), "RUNNING");
+        }
+        this.transitionRuntime(missionId, "RECOVERING", "due_recovery_actions");
       }
-      this.transitionRuntime(missionId, "RECOVERING", "due_recovery_actions");
-      return;
-    }
+    }, now);
+    if (hasDue) return;
 
     // R4 §11 — compatibility repair: a runtime left RUNNING with a
     // pending_recovery (the pre-fix "unhandled" fallthrough) resumes the
@@ -777,6 +786,10 @@ export class MissionRuntime {
      *  so the settled candidate is not re-selected forever. */
     settledReconciliation?: { outcome: string; reconciliation_id?: string },
     opts: { consecutiveOverride?: boolean } = {},
+    /** Live-ops Bug C — actions proven infeasible by an apply-path routing
+     *  throw in THIS failure chain; forwarded to decide() so the identical
+     *  attempt is rejected instead of replayed forever. */
+    infeasibleActions?: Array<{ action: RecoveryAction; reason: string }>,
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -823,6 +836,7 @@ export class MissionRuntime {
       },
       settled_reconciliation: settledReconciliation ?? null,
       consecutive_override: opts.consecutiveOverride,
+      infeasible_actions: infeasibleActions ?? [],
       now,
     });
     rt.pending_recovery = {
@@ -833,8 +847,11 @@ export class MissionRuntime {
       governed_task_id: execution ? execution.governed_task_id : null,
       executor_id: execution ? execution.executor_id : null,
       route_id: failedRouteId,
+      visited_route_ids: visitedRoutes,
+      eligible_route_ids: eligibleRoutes,
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
+      infeasible_actions: infeasibleActions ?? [],
     };
     this.store.put(
       "mission_runtime",
@@ -929,16 +946,169 @@ export class MissionRuntime {
     }
     const action = String(pending.action);
     const taskId = String(pending.task_id);
+
+    // Audit R: the WHOLE apply arm runs inside one boundary. Only the router
+    // calls keep their own catch (they convert an expected PolicyError into
+    // infeasible evidence for the attempted action). Every other statement
+    // in the arm — supersede, task fetch/update, remediation internals —
+    // that throws would otherwise escape to the supervisor's silent catch
+    // and replay the unchanged pending_recovery every tick: the same
+    // permanent-RECOVERING limbo this closure exists to remove.
+    try {
+      this.applyRecoveryAction(missionId, pending, action, taskId, now);
+    } catch (err) {
+      this.recoveryFailureBoundary(missionId, pending, action, err, now);
+    }
+  }
+
+  /**
+   * Runs a recovery-driven tick body under the apply-failure boundary. Any
+   * throw while an actionable pending_recovery exists is converted into a
+   * bounded recovery outcome instead of escaping to the supervisor's silent
+   * catch — covering the non-RECOVERING legs of a recovery chain
+   * (WAITING_BACKOFF, RECONCILING, REPLANNING, WAITING_APPROVAL) where the
+   * same pending_recovery would otherwise replay forever.
+   */
+  private recoveryGuard(missionId: string, fn: () => void, now?: string): void {
+    try {
+      fn();
+    } catch (err) {
+      let pending: Record<string, unknown> | null;
+      try {
+        pending = this.runtimeEntity(missionId).pending_recovery as
+          | Record<string, unknown>
+          | null;
+      } catch {
+        // The pending read itself failed — there may still be an
+        // actionable recovery. Terminalize via the emergency path (its own
+        // read decides whether anything durable is possible) rather than
+        // feeding a stub pending into the decision machinery.
+        const msg = String(
+          (err as { message?: string })?.message ?? err,
+        ).replace(/\s+/g, " ").slice(0, 120);
+        this.forceAbortRuntime(missionId, `recovery_boundary_defect:${msg}`);
+        return;
+      }
+      if (!pending) throw err;
+      this.recoveryFailureBoundary(
+        missionId,
+        pending,
+        String(pending.action),
+        err,
+        now,
+      );
+    }
+  }
+
+  /**
+   * Last boundary for recovery-apply failures. A normal throw becomes an
+   * infeasible/defect re-decide via handleRecoveryApplyFailure; if THAT
+   * fails too (illegal decided transition, decide() defect, mission
+   * entity unavailable, ...), forceAbortRuntime terminalizes the runtime
+   * directly. NOT abortMission: abortMission reads the mission entity
+   * first, and a missing/corrupt mission row is exactly the failure this
+   * fallback exists for — routing through it would recreate the same
+   * silent-replay escape the boundary closes.
+   */
+  private recoveryFailureBoundary(
+    missionId: string,
+    pending: Record<string, unknown>,
+    action: string,
+    err: unknown,
+    now?: string,
+  ): void {
+    try {
+      this.handleRecoveryApplyFailure(missionId, pending, action, err, now);
+    } catch (inner) {
+      const msg = String(
+        (inner as { message?: string })?.message ?? inner,
+      ).replace(/\s+/g, " ").slice(0, 120);
+      this.forceAbortRuntime(missionId, `recovery_boundary_defect:${msg}`);
+    }
+  }
+
+  /**
+   * Emergency runtime terminalization — the final no-escape step inside the
+   * recovery failure boundary. Terminalizes ONLY the mission_runtime row;
+   * it must not depend on service.getMission / transitionMission / decide /
+   * scheduler / approvals / router / executor / reconciliation, any of
+   * which may be the dependency that is failing.
+   *
+   * Precise durability guarantee: while the mission_runtime row remains
+   * readable and writable, failures elsewhere cannot leave the same
+   * recovery action silently replayable. If the canonical store itself
+   * cannot read/write the row, durable terminalization is impossible from
+   * this layer and the error escapes — an infrastructure failure outside
+   * this boundary's scope, not a hidden recovery path.
+   *
+   * Order is fixed: persist ABORTED + neutralize pending_recovery first;
+   * only afterwards attempt best-effort mission → FAILED sync, whose
+   * failure must never undo or block the runtime terminal state.
+   */
+  private forceAbortRuntime(missionId: string, reason: string): void {
+    const rt = this.runtimeEntity(missionId);
+    const prior = rt.pending_recovery as Record<string, unknown> | null;
+    const from = String(rt.state);
+    if (prior) {
+      // Keep forensic evidence but make the recovery non-actionable:
+      // state ABORTED is terminal (supervisor excludes it) and
+      // pending_recovery is cleared so nothing re-drives it after restart.
+      rt.aborted_recovery = {
+        recovery_id: prior.recovery_id ?? null,
+        action: prior.action ?? null,
+        task_id: prior.task_id ?? null,
+        failure_class: prior.failure_class ?? null,
+        aborted_reason: reason,
+      };
+      rt.pending_recovery = null;
+    }
+    if (from !== "ABORTED") {
+      rt.state = "ABORTED";
+      rt.entered_at = utcnow();
+      rt.reason = reason;
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
+      );
+      try {
+        this.store.event({
+          entity_type: "mission_runtime",
+          entity_id: String(rt.mission_runtime_id),
+          event_type: "MISSION_RUNTIME_EMERGENCY_ABORT",
+          old_state: from,
+          new_state: "ABORTED",
+          actor: this.actor,
+          metadata: { mission_id: missionId, reason },
+        });
+      } catch {
+        /* event journal is best-effort; the terminal row is already durable */
+      }
+    }
+    // Best-effort mission sync AFTER runtime is durably terminal.
+    try {
+      const mission = this.deps.service.getMission(missionId);
+      if (["READY", "RUNNING", "PAUSED"].includes(String(mission.status))) {
+        this.deps.service.transitionMission(missionId, "FAILED", this.actor);
+      }
+    } catch {
+      /* mission entity unavailable — runtime ABORTED stands */
+    }
+  }
+
+  private applyRecoveryAction(
+    missionId: string,
+    pending: Record<string, unknown>,
+    action: string,
+    taskId: string,
+    now?: string,
+  ): void {
     const mission = this.deps.service.getMission(missionId);
 
     switch (action) {
       case "RETRY_SAME_ROUTE": {
-        if (pending.governed_task_id) {
-          this.deps.recovery.supersedeGovernedTask(
-            String(pending.governed_task_id),
-            String(pending.recovery_id),
-          );
-        }
+        this.supersedeGovernedTaskOnce(pending);
         const task = this.deps.service.getTask(taskId);
         this.deps.service.updateTask(taskId, { status: "READY" });
         const request = this.requestFor(mission, task);
@@ -946,7 +1116,13 @@ export class MissionRuntime {
         // Same route literally: pin the failed attempt's route so a
         // multi-route executor cannot silently retry on a different model.
         if (pending.route_id) request.operator_pin = pending.route_id;
-        const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        let routed: Record<string, unknown>;
+        try {
+          routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        } catch (err) {
+          this.handleRecoveryApplyFailure(missionId, pending, "RETRY_SAME_ROUTE", err, now);
+          return;
+        }
         this.deps.service.updateTask(taskId, { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown> | undefined;
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
@@ -959,24 +1135,49 @@ export class MissionRuntime {
         break;
       }
       case "RE_ROUTE": {
-        if (pending.governed_task_id) {
-          this.deps.recovery.supersedeGovernedTask(
-            String(pending.governed_task_id),
-            String(pending.recovery_id),
-          );
-        }
+        this.supersedeGovernedTaskOnce(pending);
         const task = this.deps.service.getTask(taskId);
         this.deps.service.updateTask(taskId, { status: "READY" });
         const request = this.requestFor(mission, task);
         // Every route this task has already attempted is ineligible —
         // RE_ROUTE then picks the next route, typically another model on
         // the same executor. Executor-scoped failures additionally exclude
-        // the whole executor.
-        request.visited_route_ids = this.taskRouteHistory(taskId);
-        if (pending.executor_id && EXECUTOR_SCOPED_FAILURES.has(String(pending.failure_class))) {
-          request.exclude_executors = [pending.executor_id];
+        // the whole executor; so does an executor with no untried route
+        // left (route failover exhausted → only an executor hop remains).
+        const visitedRoutes = new Set<string>(this.taskRouteHistory(taskId));
+        for (const r of (pending.visited_route_ids as string[] | undefined) ?? []) {
+          visitedRoutes.add(String(r));
         }
-        const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        if (pending.route_id) visitedRoutes.add(String(pending.route_id));
+        // The task's last route binding is attempt evidence too — covers
+        // failure chains where no governed_task row survived to record it.
+        if (task.selected_route_id) visitedRoutes.add(String(task.selected_route_id));
+        // Route failover only applies when evidence proves which route
+        // failed — without it every eligible route is equally (un)tried and
+        // "next route" is undefined → bounded executor hop instead.
+        const hasRouteEvidence = visitedRoutes.size > 0;
+        const executorAlternates =
+          pending.executor_id && hasRouteEvidence
+            ? this.eligibleRoutesFor(String(pending.executor_id), [...visitedRoutes])
+            : [];
+        if (
+          pending.executor_id &&
+          (EXECUTOR_SCOPED_FAILURES.has(String(pending.failure_class)) ||
+            executorAlternates.length === 0)
+        ) {
+          // Route failover exhausted (or the failure is executor-scoped):
+          // hop executor — identical request shape to the pre-failover arm.
+          request.exclude_executors = [pending.executor_id];
+        } else {
+          request.visited_route_ids = [...visitedRoutes];
+        }
+        let routed: Record<string, unknown>;
+        try {
+          routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+        } catch (err) {
+          this.handleRecoveryApplyFailure(missionId, pending, "RE_ROUTE", err, now);
+          return;
+        }
         this.deps.service.updateTask(taskId, { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown> | undefined;
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
@@ -995,8 +1196,9 @@ export class MissionRuntime {
         // task already reconciled (settled barrier), skip selecting
         // RECONCILIATION_REQUIRED again — the extension would otherwise
         // be spent on a redundant reconcile cycle.
+        const rtApprove = this.runtimeEntity(missionId);
         const barrier = (
-          (rt.barriers as Record<string, Record<string, unknown>>) ?? {}
+          (rtApprove.barriers as Record<string, Record<string, unknown>>) ?? {}
         )[taskId];
         const settled = barrier && barrier.settled === true
           ? {
@@ -1075,6 +1277,73 @@ export class MissionRuntime {
       default:
         this.transitionRuntime(missionId, "RUNNING", `unhandled:${action}`);
     }
+  }
+
+  /**
+   * Supersede the failed governed task once per failure chain. Within one
+   * chain the same governed_task_id is carried across re-decisions
+   * (RE_ROUTE → RETRY_SAME_ROUTE), so the second apply sees it already
+   * SUPERSEDED — that is idempotent no-op territory, not corruption, and
+   * re-superseding must not throw the chain into limbo. A genuinely
+   * non-supersedeable state (e.g. mid-execution) still throws through
+   * supersedeGovernedTask and flows into handleRecoveryApplyFailure's
+   * INTERNAL_RUNTIME_DEFECT path.
+   */
+  private supersedeGovernedTaskOnce(pending: Record<string, unknown>): void {
+    if (!pending.governed_task_id) return;
+    const gtId = String(pending.governed_task_id);
+    const gt = this.store.tryGet("governed_task", gtId);
+    if (gt && String(gt.governance_state).startsWith("SUPERSEDED")) return;
+    this.deps.recovery.supersedeGovernedTask(gtId, String(pending.recovery_id));
+  }
+
+  /**
+   * Live-ops Bug C — a governed routing call inside a recovery apply-path
+   * threw before the recovery state was advanced. Feeding the failure back
+   * as `infeasible_actions` marks the attempted action infeasible for this
+   * failure chain, so the fresh canonical decide() evaluates the NEXT
+   * matrix action (typically HUMAN_APPROVAL_REQUIRED or ABORT) instead of
+   * replaying the identical throw every supervisor tick — the observed
+   * permanent-RECOVERING limbo on MSN_01M3VHGS6HPA62V6K9JR57MNEK.
+   *
+   * Expected governed routing/policy failures (PolicyError thrown by the
+   * router) become recovery evidence in the original failure class.
+   * Anything else (IntegrityError, invariant corruption, programmer bugs)
+   * is NOT normalized into routing infeasibility — it re-decides under
+   * INTERNAL_RUNTIME_DEFECT, the existing canonical defect class, keeping
+   * the outcome bounded and operator-visible via the recovery_decision row.
+   */
+  private handleRecoveryApplyFailure(
+    missionId: string,
+    pending: Record<string, unknown>,
+    action: string,
+    err: unknown,
+    now?: string,
+  ): void {
+    const taskId = String(pending.task_id);
+    const prior =
+      (pending.infeasible_actions as Array<{ action: RecoveryAction; reason: string }>) ?? [];
+    const code =
+      err instanceof PolicyError
+        ? String(err.code)
+        : String((err as { code?: string })?.code ?? "INTERNAL_ERROR");
+    const infeasible: Array<{ action: RecoveryAction; reason: string }> = [
+      ...prior.filter((e) => e.action !== action),
+      { action: action as RecoveryAction, reason: code },
+    ];
+    const isExpectedGovernedRouting = err instanceof PolicyError;
+    this.startRecovery(
+      missionId,
+      taskId,
+      pending.execution_id ? String(pending.execution_id) : null,
+      isExpectedGovernedRouting
+        ? (pending.failure_class as ReturnType<typeof classifyFailure>)
+        : "INTERNAL_RUNTIME_DEFECT",
+      now,
+      undefined,
+      {},
+      infeasible,
+    );
   }
 
   private runRemediation(
@@ -1164,7 +1433,13 @@ export class MissionRuntime {
       if (pending.executor_id) {
         request.executor_constraint = pending.executor_id;
       }
-      const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+      let routed: Record<string, unknown>;
+      try {
+        routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
+      } catch (err) {
+        this.handleRecoveryApplyFailure(missionId, pending, "APPLY_VERIFIED_REMEDIATION", err, now);
+        return;
+      }
       this.deps.recovery.bindRemediationExecution(
         String(pr.remediation_execution_id),
         String((routed.governed_task as Record<string, unknown>).governed_task_id),
