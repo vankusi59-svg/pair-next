@@ -20,7 +20,7 @@
  * carry sanitized classes/digests only.
  */
 
-import { digest, newId, utcnow } from "./canonical.js";
+import { digest, isCanonicalWorkspacePath, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PlannerAttemptRecord } from "./planner-pool.js";
@@ -481,10 +481,13 @@ export function assertPreviewWorkspaceAuthority(
   missionInput: Record<string, unknown>,
 ): string[] {
   const ws = missionInput.authorized_workspaces;
+  // R6 — the persisted authority must already be canonical (absolute,
+  // resolved, byte-for-byte). Validation only — never resolve/mutate here:
+  // a relative or otherwise non-canonical entry is stale evidence.
   if (
     !Array.isArray(ws) ||
     ws.length === 0 ||
-    ws.some((w) => typeof w !== "string" || w.trim() === "")
+    ws.some((w) => !isCanonicalWorkspacePath(w))
   ) {
     throw new IntegrityError(
       "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",

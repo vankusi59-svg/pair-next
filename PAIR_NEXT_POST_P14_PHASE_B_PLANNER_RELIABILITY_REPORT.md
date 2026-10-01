@@ -703,3 +703,62 @@ persisted `[project.root_location]` → confirm → mission identical.
 CASE 2 (legacy READY ws=[] → AUTHORITY_STALE, READY preserved, zero
 missions): covered deterministically by tests F/G above; no production
 preview was mutated to generate evidence.
+
+## R6 — CANONICAL AUTHORITY SHADOWING CLOSURE
+
+Audited pre-R6 HEAD: `c86f36802a0214c395a948685b557ea233d53bc1`
+
+### Root causes
+- **A — metadata authority smuggling**: `service.createMissionInternal()`
+  built `metadata: {authorized_workspaces, risk_ceiling, constraints,
+  ...params.metadata}` — caller metadata spread LAST, so
+  `metadata.authorized_workspaces=["/etc"]` overwrote the canonical
+  top-level authority the preview/digest covered.
+- **B — workspace representation drift**: preview could pin
+  `relative/path` while `createMissionInternal` later ran
+  `path.resolve()` → committed workspace differed from previewed authority.
+
+### Fixes
+- **Canonical workspace seam** (`canonical.ts`): `canonicalWorkspacePath`
+  (non-empty string → `path.resolve` → absolute canonical, else
+  `FAIL_CLOSED_WORKSPACE_AUTHORITY_INVALID`) +
+  `isCanonicalWorkspacePath`. One helper, used by:
+  - `normalizeMissionWorkspaces` — EVERY explicit entry AND the
+    `project.root_location` default canonicalize through it before
+    effective_input_digest / plan_digest / persisted mission_input.
+    Ordering preserved.
+  - `service.createMissionInternal` — `authorized` resolves through it
+    (identity for already-canonical input; same as before for others).
+  - `service.createProject` root_location and `authorizedRoots`.
+  - `assertPreviewWorkspaceAuthority` — READY previews are accepted only
+    when every workspace is ALREADY canonical; relative/empty entries →
+    `FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE`. Validation, not mutation.
+- **Reserved-field guard** (`createMissionInternal`): reserved canonical
+  authority fields = `authorized_workspaces`, `risk_ceiling`,
+  `constraints`. A caller-supplied metadata key that CONFLICTS with the
+  canonical value throws `FAIL_CLOSED_METADATA_AUTHORITY_SHADOWING`; a
+  same-value duplicate is stripped to the single authoritative copy.
+  Merge order is now `{...callerMetadata, authorized_workspaces,
+  risk_ceiling, constraints}` — canonical always wins.
+- **Confirm stays verbatim**: persisted preview workspace == mission
+  workspace byte-for-byte (the service canonicalizer is identity on
+  canonical input); cwd changes and post-preview project-root changes
+  cannot move committed authority.
+- **`authorizedRoots`** unchanged semantically — mission metadata ws is
+  now guaranteed the canonical top-level list, so metadata can never
+  inject extra roots; GovernedTaskGate untouched.
+
+### Focused tests (+13)
+A/B default→canonical root; C/D/E/F relative ws canonicalized before both
+digests and persisted; G+§16 byte-for-byte ws + risk equality
+preview→mission; H cwd independence; I post-preview root change cannot
+move authority; J legacy relative → AUTHORITY_STALE; L metadata
+ws=['/etc'] → SHADOWING fail + same-value stripped; M risk_ceiling
+conflict; N exact reserved fields persisted; O authorizedRoots
+unaffected; P gate still rejects outside-root task; Q/R idempotency +
+guard ordering; §15 direct service-level smuggling test.
+
+### Regression
+Phase B focused 110/110 (+13). Full suite 2394 pass / 2 fail — same
+pre-existing P5 DSH+CODEX env failures as base `2277319`. tsc --noEmit
+clean, pnpm build clean.

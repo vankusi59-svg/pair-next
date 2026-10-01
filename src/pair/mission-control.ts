@@ -23,7 +23,7 @@ import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { projectRoutableModels } from "./model-routable.js";
-import { digest, sha256Hex, utcnow } from "./canonical.js";
+import { canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
 import {
@@ -383,7 +383,10 @@ export class MissionControl {
   }): string[] {
     const supplied = input.authorized_workspaces;
     if (Array.isArray(supplied) && supplied.length > 0) {
-      return supplied.map((w) => String(w));
+      // R6 — every entry canonicalized through the single workspace seam so
+      // the digested/persisted authority is byte-for-byte what the mission
+      // will store. Invalid entries fail closed, ordering preserved.
+      return supplied.map((w) => canonicalWorkspacePath(w));
     }
     const project = this.store.tryGet("project", String(input.project_id)) as
       | Record<string, unknown>
@@ -395,7 +398,7 @@ export class MissionControl {
         `project:${String(input.project_id)}: no canonical root_location and no authorized_workspaces supplied`,
       );
     }
-    return [root];
+    return [canonicalWorkspacePath(root)];
   }
 
   /**

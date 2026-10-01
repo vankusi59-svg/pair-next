@@ -2229,3 +2229,202 @@ describe("R5 — pinned preview authority closure", () => {
   });
 });
 
+
+describe("R6 — canonical authority shadowing + workspace canonicalization", () => {
+  it("A/B: missing + [] workspace → persisted canonical absolute project root", () => {
+    const ctx = makeCtx("r6-ab");
+    for (const ws of [undefined, [] as string[]]) {
+      const pv = ctx.control.createPlanPreview({
+        project_id: ctx.projectId, goal: `g-${ws === undefined ? "u" : "e"}`,
+        metadata: { llm_plan: [T1] }, authorized_workspaces: ws, operator_id: "op",
+      });
+      const mi = (ctx.store.get("mission_plan_preview", String(pv.preview_id))).mission_input as Record<string, unknown>;
+      expect(mi.authorized_workspaces).toEqual([path.resolve(ctx.workspace)]);
+      expect(String(mi.authorized_workspaces && (mi.authorized_workspaces as string[])[0])).toBe(path.resolve(String((mi.authorized_workspaces as string[])[0])));
+    }
+  });
+
+  it("C/D/E/F: relative explicit workspace canonicalized BEFORE both digests + persisted mission_input", () => {
+    const ctx = makeCtx("r6-cdef");
+    const cwd = process.cwd();
+    const rel = "relative/ws-dir";
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] },
+      authorized_workspaces: [rel], operator_id: "op",
+    });
+    const canon = path.resolve(cwd, rel);
+    const mi = (ctx.store.get("mission_plan_preview", String(pv.preview_id))).mission_input as Record<string, unknown>;
+    expect(mi.authorized_workspaces).toEqual([canon]); // F: persisted canonical
+    const eid = effectiveInputDigest({
+      project_id: ctx.projectId, goal: "g", granted_permissions: [],
+      authorized_workspaces: [canon], risk_ceiling: undefined, operator_id: "op",
+      allowed_capabilities: undefined, capability_sets: undefined,
+    });
+    expect(String(pv.effective_input_digest)).toBe(eid); // D
+    const pd = planDigest({
+      project_id: ctx.projectId, effective_input_digest: eid, tasks: [T1],
+      granted_permissions: [], authorized_workspaces: [canon], risk_ceiling: undefined,
+    });
+    expect(String(pv.plan_digest)).toBe(pd); // E
+  });
+
+  it("G + §16: confirm stores workspace + risk byte-for-byte identical to persisted preview", () => {
+    const ctx = makeCtx("r6-g");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] },
+      authorized_workspaces: ["/explicit/abs"], risk_ceiling: "LOW", operator_id: "op",
+    });
+    const mi = (ctx.store.get("mission_plan_preview", String(pv.preview_id))).mission_input as Record<string, unknown>;
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    const md = m.metadata as Record<string, unknown>;
+    expect(md.authorized_workspaces).toEqual(mi.authorized_workspaces); // deep equality
+    expect(md.risk_ceiling).toBe(mi.risk_ceiling);
+  });
+
+  it("H: cwd change between preview and confirm does not move workspace authority", () => {
+    const ctx = makeCtx("r6-h");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const persisted = (ctx.store.get("mission_plan_preview", String(pv.preview_id))).mission_input as Record<string, unknown>;
+    const before = persisted.authorized_workspaces;
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    expect((m.metadata as Record<string, unknown>).authorized_workspaces).toEqual(before);
+  });
+
+  it("I: project.root_location change after preview cannot move confirmed authority", () => {
+    const ctx = makeCtx("r6-i");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const prj = ctx.store.get("project", ctx.projectId);
+    ctx.store.put("project", ctx.projectId, { ...prj, root_location: "/other-root" }, Number(prj.version));
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op",
+    });
+    expect((m.metadata as Record<string, unknown>).authorized_workspaces).toEqual([ctx.workspace]);
+  });
+
+  it("J: legacy READY preview with RELATIVE workspace → AUTHORITY_STALE", async () => {
+    const ctx = makeCtx("r6-j");
+    const pv = r5LegacyPreview(ctx, ["relative/path"]);
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" }),
+      "FAIL_CLOSED_PLAN_PREVIEW_AUTHORITY_STALE",
+    );
+    expect(ctx.store.get("mission_plan_preview", String(pv.preview_id)).state).toBe("READY");
+    expect(ctx.store.list("mission")).toHaveLength(0);
+  });
+
+  it("L: metadata.authorized_workspaces=['/etc'] cannot widen authority — fail closed", async () => {
+    const ctx = makeCtx("r6-l");
+    await expectCode(
+      () => ctx.control.startMission({
+        project_id: ctx.projectId, goal: "g",
+        metadata: { authorized_workspaces: ["/etc"] },
+      }),
+      "FAIL_CLOSED_METADATA_AUTHORITY_SHADOWING",
+    );
+    expect(ctx.store.list("mission")).toHaveLength(0);
+    // same-value duplicate → stripped to the single authoritative copy
+    const m2 = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "g2",
+      metadata: { authorized_workspaces: [path.resolve(ctx.workspace)] },
+    });
+    expect((m2.metadata as Record<string, unknown>).authorized_workspaces).toEqual([path.resolve(ctx.workspace)]);
+  });
+
+  it("M: metadata.risk_ceiling conflict cannot override canonical", async () => {
+    const ctx = makeCtx("r6-m");
+    await expectCode(
+      () => ctx.control.startMission({
+        project_id: ctx.projectId, goal: "g", risk_ceiling: "LOW",
+        metadata: { risk_ceiling: "CRITICAL" },
+      }),
+      "FAIL_CLOSED_METADATA_AUTHORITY_SHADOWING",
+    );
+    const m2 = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "g2", risk_ceiling: "LOW",
+      metadata: { risk_ceiling: "LOW" },
+    });
+    expect((m2.metadata as Record<string, unknown>).risk_ceiling).toBe("LOW");
+  });
+
+  it("N: persisted mission metadata carries exactly the canonical reserved fields", () => {
+    const ctx = makeCtx("r6-n");
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "g", risk_ceiling: "MEDIUM",
+      metadata: { authorized_workspaces: [ctx.workspace], risk_ceiling: "MEDIUM", constraints: [], note: "x" },
+    });
+    const md = (ctx.store.get("mission", String(m.mission_id))).metadata as Record<string, unknown>;
+    expect(md.authorized_workspaces).toEqual([ctx.workspace]);
+    expect(md.risk_ceiling).toBe("MEDIUM");
+    expect(md.constraints).toEqual([]);
+    expect(md.note).toBe("x");
+  });
+
+  it("O: authorizedRoots() cannot gain a root from caller metadata shadowing", () => {
+    const ctx = makeCtx("r6-o");
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "g",
+      authorized_workspaces: ["/canonical-only"],
+      metadata: { authorized_workspaces: ["/canonical-only"], extra: { authorized_workspaces: ["/etc"] } },
+    });
+    const roots = ctx.service.authorizedRoots(String(m.mission_id));
+    expect(roots).toContain("/canonical-only");
+    expect(roots).toContain(ctx.workspace);
+    expect(roots).not.toContain("/etc");
+  });
+
+  it("P: GovernedTaskGate still rejects task workspace outside canonical roots", () => {
+    const ctx = makeCtx("r6-p");
+    const { m } = r4Confirm(ctx, "g");
+    expect(ctx.service.isPathAuthorized("/etc/passwd", String(m.mission_id))).toBe(false);
+    expect(ctx.service.isPathAuthorized(path.join(ctx.workspace, "ok.txt"), String(m.mission_id))).toBe(true);
+  });
+
+  it("Q/R: consumed idempotency + guard ordering unchanged", async () => {
+    const ctx = makeCtx("r6-qr");
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    const m1 = ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" });
+    const m2 = ctx.control.confirmPlanPreview({ preview_id: String(pv.preview_id), plan_digest: String(pv.plan_digest), operator_id: "op" });
+    expect(m2.mission_id).toBe(m1.mission_id);
+    const pv2 = ctx.control.createPlanPreview({
+      project_id: ctx.projectId, goal: "g2", metadata: { llm_plan: [T1] }, operator_id: "op",
+    });
+    await expectCode(
+      () => ctx.control.confirmPlanPreview({ preview_id: String(pv2.preview_id), plan_digest: "deadbeef", operator_id: "op" }),
+      "FAIL_CLOSED_PLAN_DIGEST_MISMATCH",
+    );
+  });
+
+  it("§15 direct service: createMission metadata shadow attempt fails closed", async () => {
+    const ctx = makeCtx("r6-svc");
+    await expectCode(
+      () => ctx.service.createMission({
+        project_id: ctx.projectId, goal: "g",
+        authorized_workspaces: ["/canonical"],
+        metadata: { authorized_workspaces: ["/etc"] },
+      }),
+      "FAIL_CLOSED_METADATA_AUTHORITY_SHADOWING",
+    );
+    await expectCode(
+      () => ctx.service.createMission({
+        project_id: ctx.projectId, goal: "g", risk_ceiling: "LOW",
+        metadata: { risk_ceiling: "CRITICAL" },
+      }),
+      "FAIL_CLOSED_METADATA_AUTHORITY_SHADOWING",
+    );
+    // canonical resolve is identity-preserving: absolute input → byte-for-byte output
+    const m = ctx.service.createMission({
+      project_id: ctx.projectId, goal: "g", authorized_workspaces: ["/a/b/c"],
+    });
+    expect((m.metadata as Record<string, unknown>).authorized_workspaces).toEqual(["/a/b/c"]);
+  });
+});
