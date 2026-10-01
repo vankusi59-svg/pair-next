@@ -279,3 +279,43 @@ qualification. Prod `~/pair-mc-live` untouched.
   worktree — see session notes. Prod itself never ran phase-C code.
 
 `DO NOT MERGE`
+
+## Phase C R1 — Deadline + Binding Identity + Authority Provenance + Restart Closure
+
+Independent-audit remediation on the same branch (audited HEAD `745c4ba`, R1 HEAD below). Four findings closed; scope strictly narrow.
+
+### 1. Shared deadline covers the FULL ACP attempt
+- `AcpAttemptContext.deadlineAtMs` (absolute ms epoch) set once in `runAttempts` from the shared task deadline.
+- `attemptStageTimeout(ctx, fallback)` (acp-executor.ts): clamps `initialize`(30s), `newSession`(60s), `setConfigOption`(30s, dsh-adapter pin) to remaining budget; expired budget → `PairError ACP_REQUEST_TIMEOUT` BEFORE the stage runs.
+- RECHECK before dispatch: after `postSessionSetup`, `attemptRemainingMs <= 0` → throw `ACP_REQUEST_TIMEOUT` — `markDispatched` and `proc.prompt` are never reached; DMA row stays `PRE_DISPATCH`, classified `TIMEOUT`, `safe_to_failover` per normal pre-dispatch rule.
+- `prompt` timeout = remaining ms (not a fresh task.timeout).
+- Evidence L1: `hang_setconfig` on both candidates, timeout=3s → status TIMEOUT in ~3s (not 30s), marker file absent, `agent_out.txt` absent, row1 `TIMEOUT`/`PRE_DISPATCH`/`safe_to_failover:true`, row2 `TIMEOUT`.
+
+### 2. Exact model_binding identity
+- `resolveDshModelBinding(service, executorId, modelEntryId, providerId)` now requires `binding.executor_id == DEEPSEEK_HARNESS` AND `binding.model_entry_id == candidate.model_entry_id` AND `binding.provider_id == candidate.pid` AND `qualification_state == QUALIFIED` AND `transport_compat ∈ DSH_VALID_TRANSPORT_COMPAT` (`{"OPENAI_COMPLETIONS"}`). A QUALIFIED binding for the same entry under a different provider is rejected (`FAIL_CLOSED_DSH_MODEL_BINDING` with binding_provider_id detail).
+- Pre-pin drift proof (dsh-adapter `postSessionSetup`): `ModelEvidenceCatalog.getModelByIds(candidate.pid, candidate.mid)` must resolve to `candidate.model_entry_id`, else `FAIL_CLOSED_DSH_MODEL_IDENTITY_DRIFT` (authority → aborts pool).
+- Evidence M1–M4: provider mismatch throws; wrong transport throws; tuple drift → AUTHORITY_REJECTED row; persisted `model_binding_id` matches candidate provider/entry/executor exactly.
+
+### 3. Truthful authority failure provenance
+- New `DSH_FAILURE_CLASS.AUTHORITY_REJECTED`; both authority settle sites in `runAttempts` (eligibility throw + in-attempt `FAIL_CLOSED*`) persist `failure_class=AUTHORITY_REJECTED`, `safe_to_failover=false`, real `error_code` — was `TRANSIENT_TRANSPORT`.
+- DMA rows now distinguish: `AUTHORITY_REJECTED` (governance) vs availability classes (`PROVIDER_UNAVAILABLE` etc.) vs `TRANSIENT_TRANSPORT`. RecoveryController taxonomy untouched.
+- Evidence N1: non-QUALIFIED binding → AUTHORITY_REJECTED, pool aborted. N2: [down-provider, weak-binding, clean] → rows `PROVIDER_UNAVAILABLE`+AUTHORITY_REJECTED, third candidate never ran.
+
+### 4. Restart safety tests
+- O1: `crash_prompt` (mark → process.exit) leaves row `DISPATCHED`/`FAILED`/`safe:false`; store reopen + fresh adapter dispatch of the same governed task → journal rehydrate (recovered record), ZERO new attempts, marker still `["palpha:m0"]` — no auto-resume on another model.
+- O2: after a COMPLETED winner, restart + re-dispatch → rehydrated record, still exactly 1 row, `winner` count stays 1. No fabricated success, no mutated evidence.
+
+### Validation
+- Focused: `pair-phase-c-dsh-model-routing.test.ts` 51/51 (42 + L1 + M1–M4 + N1–N2 + O1–O2).
+- PR #23 regression: `pair-live-ops-recovery-closure.test.ts` pass (in 179-test batch).
+- PR #24 regression: `pair-route-capability-authority.test.ts` pass (same batch).
+- Phase B regression: `pair-phase-b.test.ts` pass (same batch).
+- Full Node 22 suite: **2526 pass / 2 fail / 15 skipped** — the 2 failures are the pre-existing P5 environment probes (real `dsh`/`codex` on PATH); baseline 2517/2 → +9 new tests, zero regressions.
+- `tsc --noEmit`: clean. `pnpm build`: clean.
+
+### Files changed
+`src/pair/acp-executor.ts`, `src/pair/dsh-adapter.ts`, `src/pair/dsh-model-router.ts`, `src/__tests__/pair-phase-c-dsh-model-routing.test.ts`, `src/__tests__/fixtures/fake-acp-agent-phc.mjs`, this report.
+
+### Limitations
+- `attemptStageTimeout` granularity is whole seconds (ceiling) — sub-second expiry lands on the next stage boundary, never past `markDispatched`.
+- `rehydrate` is trusted to prove no-resume (O1/O2); a journal left `RUNNING` maps to UNKNOWN, not a re-run.

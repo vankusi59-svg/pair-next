@@ -66,6 +66,10 @@ export const DSH_FAILURE_CLASS = {
   RATE_LIMITED: "RATE_LIMITED",
   TRANSIENT_TRANSPORT: "TRANSIENT_TRANSPORT",
   TIMEOUT: "TIMEOUT",
+  /** Governance/authority rejection — truthful durable classification for
+   *  throws that are never a failover signal (role, binding, eligibility
+   *  authority, identity drift). Distinct from availability and transport. */
+  AUTHORITY_REJECTED: "AUTHORITY_REJECTED",
 } as const;
 export type DshFailureClass = (typeof DSH_FAILURE_CLASS)[keyof typeof DSH_FAILURE_CLASS];
 
@@ -90,17 +94,28 @@ export interface DshEligibilityRejection {
   reason: string;
 }
 
+/** Transport compatibility DSH accepts on a model_binding (ACP ↔
+ *  OpenAI-completions providers only — anything else fails closed). */
+export const DSH_VALID_TRANSPORT_COMPAT = new Set(["OPENAI_COMPLETIONS"]);
+
 /**
- * The canonical model_binding governing one candidate (executor ↔ model).
- * Returns null when no binding row exists — eligibility then fails closed.
+ * The canonical model_binding governing one candidate — EXACT identity:
+ * executor_id AND model_entry_id AND (when given) provider_id must all
+ * match. Returns null when no binding row exists — eligibility then fails
+ * closed. A QUALIFIED binding for the same model_entry_id but a different
+ * provider is NOT accepted (R1).
  */
 export function resolveDshModelBinding(
   service: PairControlPlane,
   executorId: string,
   modelEntryId: string,
+  providerId?: string,
 ): ModelBindingRow | null {
   const matches = listBindings(service).filter(
-    (b) => b.executor_id === executorId && String(b.model_entry_id) === String(modelEntryId),
+    (b) =>
+      b.executor_id === executorId &&
+      String(b.model_entry_id) === String(modelEntryId) &&
+      (providerId === undefined || String(b.provider_id) === String(providerId)),
   );
   return matches.find((b) => b.qualification_state === "QUALIFIED") ?? matches[0] ?? null;
 }
@@ -206,17 +221,27 @@ export function assertDshCandidateEligible(
       JSON.stringify({ executor_id: executorId, gate: executorGate }),
     );
   }
-  // Canonical model binding — binding absence or non-QUALIFIED is a
-  // governance failure, never silently skipped to the next candidate.
-  const binding = resolveDshModelBinding(service, executorId, mid);
-  if (!binding || binding.qualification_state !== "QUALIFIED") {
+  // Canonical model binding — EXACT identity: the binding must name THIS
+  // candidate's provider AND model_entry for THIS executor, be QUALIFIED,
+  // and carry a DSH-valid transport. Absent, mismatched-provider,
+  // non-qualified, or wrong-transport bindings are governance failures —
+  // never silently skipped to the next candidate.
+  const binding = resolveDshModelBinding(service, executorId, mid, candidate.pid);
+  if (
+    !binding ||
+    binding.qualification_state !== "QUALIFIED" ||
+    !DSH_VALID_TRANSPORT_COMPAT.has(String(binding.transport_compat))
+  ) {
     throw new IntegrityError(
       "FAIL_CLOSED_DSH_MODEL_BINDING",
       JSON.stringify({
         model_entry_id: mid,
+        provider_id: candidate.pid,
         executor_id: executorId,
         binding_id: binding?.binding_id ?? null,
+        binding_provider_id: binding?.provider_id ?? null,
         qualification_state: binding?.qualification_state ?? null,
+        transport_compat: binding?.transport_compat ?? null,
       }),
     );
   }
@@ -305,7 +330,12 @@ export function createDshModelRouter(opts: {
 
     attemptStart(o) {
       const attemptId = dshAttemptId(o.governed_task_id, o.attempt_no);
-      const binding = resolveDshModelBinding(service, executorId, o.candidate.model_entry_id);
+      const binding = resolveDshModelBinding(
+        service,
+        executorId,
+        o.candidate.model_entry_id,
+        o.candidate.pid,
+      );
       const body: Record<string, unknown> = {
         dsh_model_attempt_id: attemptId,
         mission_id: o.mission_id,

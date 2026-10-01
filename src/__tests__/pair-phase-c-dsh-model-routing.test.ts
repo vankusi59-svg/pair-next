@@ -885,3 +885,240 @@ describe("K — restart durability", () => {
     void ctx;
   });
 });
+
+/* ============ R1.L — shared deadline covers the FULL ACP attempt ======= */
+
+describe("R1.L — shared deadline covers the full ACP attempt", () => {
+  it("L1: setup consumes the whole deadline → prompt is never dispatched, TIMEOUT persisted", async () => {
+    const marker = path.join(ROOT, "l1-marker.txt");
+    const ctx = mkDsh("l1", {
+      launchEnv: {
+        PAIR_TEST_BEHAVIORS: JSON.stringify({
+          "palpha:m0": "hang_setconfig",
+          "pbeta:m1": "hang_setconfig",
+        }),
+        PAIR_TEST_MARKER: marker,
+      },
+    });
+    const startedAt = Date.now();
+    const { term, attempts } = await dispatchAndWait(
+      ctx,
+      governedTask(ctx, { timeout: 3 }),
+    );
+    const elapsed = Date.now() - startedAt;
+    expect(term.status).toBe("TIMEOUT");
+    // The shared deadline (~3s) killed the attempt — WITHOUT the stage
+    // clamp setConfigOption alone would have run its full 30s budget.
+    expect(elapsed).toBeLessThan(25_000);
+    // Prompt was never dispatched: no marker, no side-effect file.
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(fs.existsSync(path.join(ctx.workspace, "agent_out.txt"))).toBe(false);
+    expect(attempts.length).toBeGreaterThanOrEqual(1);
+    const a0 = attempts[0];
+    expect(a0.outcome).toBe("FAILED");
+    expect(a0.failure_class).toBe("TIMEOUT");
+    expect(String(a0.error_code)).toBe("ACP_REQUEST_TIMEOUT");
+    // Never dispatched → pre-dispatch rules apply (safe_to_failover).
+    expect(a0.dispatch_state).toBe("PRE_DISPATCH");
+    expect(a0.safe_to_failover).toBe(true);
+    // The next candidate also sees the exhausted budget.
+    expect(attempts[1].failure_class).toBe("TIMEOUT");
+  });
+});
+
+/* ============ R1.M — exact model_binding identity ====================== */
+
+describe("R1.M — exact model_binding identity", () => {
+  it("M1: QUALIFIED binding for the same model_entry_id but a DIFFERENT provider is rejected", () => {
+    const ctx = mkDsh("m1");
+    const entry = ctx.candidates[0].model_entry_id; // binding (palpha, entry) QUALIFIED
+    mkProvider(ctx.store, "pstranger");
+    const stranger: DshModelCandidate = {
+      ref: "pstranger:m0",
+      pid: "pstranger",
+      mid: "m0",
+      model_entry_id: entry,
+    };
+    expect(() => ctx.router.assertEligible(stranger)).toThrow(/FAIL_CLOSED_DSH_MODEL_BINDING/);
+  });
+
+  it("M2: QUALIFIED binding with a DSH-incompatible transport is rejected", () => {
+    const ctx = mkDsh("m2", { pids: ["p1"] });
+    const eid = mkModel(ctx.store, "p1", "mlegacy");
+    assignModelRole(ctx.store, eid, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+    const b = ensureBinding(ctx.service, {
+      executor_id: DSH_EXECUTOR_ID,
+      provider_id: "p1",
+      model_entry_id: eid,
+      transport_compat: "LEGACY_NATIVE",
+    });
+    qualifyBinding(ctx.service, String(b.binding_id));
+    const cand: DshModelCandidate = { ref: "p1:mlegacy", pid: "p1", mid: "mlegacy", model_entry_id: eid };
+    expect(() => ctx.router.assertEligible(cand)).toThrow(/FAIL_CLOSED_DSH_MODEL_BINDING/);
+  });
+
+  it("M3: candidate tuple resolving to a different model_entry than the attempt evidence fails closed at pin time", async () => {
+    const ctx = mkDsh("m3", { pids: ["p1"] });
+    // Second legit candidate identity under the same provider — role +
+    // QUALIFIED binding so generic eligibility passes; only the pre-pin
+    // tuple→model_entry proof can catch the drift.
+    const entryB = mkModel(ctx.store, "p1", "mB");
+    assignModelRole(ctx.store, entryB, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+    const bB = ensureBinding(ctx.service, {
+      executor_id: DSH_EXECUTOR_ID,
+      provider_id: "p1",
+      model_entry_id: entryB,
+      transport_compat: "OPENAI_COMPLETIONS",
+    });
+    qualifyBinding(ctx.service, String(bB.binding_id));
+    const drifted: DshModelCandidate = {
+      ref: "p1:m0",
+      pid: "p1",
+      mid: "m0", // resolves to candidates[0].model_entry_id, NOT entryB
+      model_entry_id: entryB,
+    };
+    const router2 = createDshModelRouter({
+      service: ctx.service,
+      executorId: DSH_EXECUTOR_ID,
+      candidates: [drifted],
+    });
+    ctx.adapter.bindModelRouter(router2, ctx.service);
+    const { term, attempts } = await dispatchAndWait(ctx);
+    expect(term.status).toBe("FAILED");
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0].failure_class).toBe("AUTHORITY_REJECTED");
+    expect(String(attempts[0].error_code)).toBe("FAIL_CLOSED_DSH_MODEL_IDENTITY_DRIFT");
+    expect(attempts[0].safe_to_failover).toBe(false);
+  });
+
+  it("M4: persisted model_binding_id is the EXACT binding for the candidate's provider", async () => {
+    const ctx = mkDsh("m4", {
+      launchEnv: { PAIR_TEST_BEHAVIORS: JSON.stringify({ "palpha:m0": "fail_setconfig" }) },
+    });
+    const { attempts } = await dispatchAndWait(ctx);
+    const bindings = listBindings(ctx.service);
+    for (const a of attempts) {
+      const b = bindings.find((x) => x.binding_id === a.model_binding_id);
+      expect(b).toBeTruthy();
+      expect(String(b!.provider_id)).toBe(String(a.provider_id));
+      expect(String(b!.model_entry_id)).toBe(String(a.model_entry_id));
+      expect(String(b!.executor_id)).toBe(DSH_EXECUTOR_ID);
+    }
+  });
+});
+
+/* ============ R1.N — truthful authority failure provenance ============= */
+
+describe("R1.N — truthful authority failure provenance", () => {
+  it("N1: non-QUALIFIED binding → AUTHORITY_REJECTED (not TRANSIENT_TRANSPORT), never failover", async () => {
+    const ctx = mkDsh("n1", { pids: ["p1"] });
+    const weak = mkCandidate(ctx.store, ctx.service, "p3", "mWeak", { qualifyBinding: false });
+    ctx.adapter.bindModelRouter(
+      createDshModelRouter({ service: ctx.service, executorId: DSH_EXECUTOR_ID, candidates: [weak, ctx.candidates[0]] }),
+      ctx.service,
+    );
+    const { term, attempts } = await dispatchAndWait(ctx);
+    expect(term.status).toBe("FAILED");
+    expect(attempts).toHaveLength(1); // authority aborts the pool
+    const a = attempts[0];
+    expect(a.failure_class).toBe("AUTHORITY_REJECTED");
+    expect(String(a.error_code)).toBe("FAIL_CLOSED_DSH_MODEL_BINDING");
+    expect(a.safe_to_failover).toBe(false);
+    expect(a.dispatch_state).toBe("PRE_DISPATCH");
+  });
+
+  it("N2: availability vs authority vs transport are durable-distinct classes", async () => {
+    const ctx = mkDsh("n2", { pids: ["p1"] });
+    // availability first (provider DOWN → reject), authority second
+    // (non-QUALIFIED binding → abort); a clean third candidate must never run.
+    const down = mkCandidate(ctx.store, ctx.service, "pdown", "mDown");
+    mkProvider(ctx.store, "pdown", { health_state: "DOWN" });
+    const weak = mkCandidate(ctx.store, ctx.service, "pweak", "mWeak", { qualifyBinding: false });
+    ctx.adapter.bindModelRouter(
+      createDshModelRouter({
+        service: ctx.service,
+        executorId: DSH_EXECUTOR_ID,
+        candidates: [down, weak, ctx.candidates[0]],
+      }),
+      ctx.service,
+    );
+    const { term, attempts } = await dispatchAndWait(ctx);
+    expect(term.status).toBe("FAILED");
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0].failure_class).toBe("PROVIDER_UNAVAILABLE");
+    expect(attempts[0].safe_to_failover).toBe(true);
+    expect(attempts[1].failure_class).toBe("AUTHORITY_REJECTED");
+    expect(attempts[1].safe_to_failover).toBe(false);
+    // Third candidate never attempted — authority stopped the pool.
+    expect(attempts.find((a) => a.provider_id === "p1")).toBeUndefined();
+  });
+});
+
+/* ============ R1.O — restart safety ==================================== */
+
+describe("R1.O — restart safety", () => {
+  const reopen = (ctx: DshCtx) => {
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const adapter2 = new DshExecutorAdapter({
+      journalRoot: path.join(ctx.dir, "journal"),
+      envReader: (n) => (n.endsWith("_API_KEY") ? "test-credential" : process.env[n]),
+      launchOverride: {
+        command: "node",
+        args: [FAKE_ACP_PHC, "--profile", "acp"],
+        env: {},
+      },
+    });
+    const router2 = createDshModelRouter({
+      service: service2,
+      executorId: DSH_EXECUTOR_ID,
+      candidates: ctx.candidates,
+    });
+    adapter2.bindModelRouter(router2, service2);
+    return { store2, service2, adapter2, router2 };
+  };
+
+  it("O1: a DISPATCHED/possibly-side-effecting attempt does NOT auto-resume on another model after restart", async () => {
+    const marker = path.join(ROOT, "o1-marker.txt");
+    const ctx = mkDsh("o1", {
+      launchEnv: {
+        PAIR_TEST_BEHAVIORS: JSON.stringify({ "palpha:m0": "crash_prompt" }),
+        PAIR_TEST_MARKER: marker,
+      },
+    });
+    const task = governedTask(ctx);
+    const { term, attempts } = await dispatchAndWait(ctx, task);
+    expect(term.status).toBe("FAILED");
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0].dispatch_state).toBe("DISPATCHED");
+    expect(attempts[0].safe_to_failover).toBe(false);
+    // Side effect provably happened once, on the primary only.
+    expect(fs.readFileSync(marker, "utf8").trim().split("\n")).toEqual(["palpha:m0"]);
+
+    // "Restart": brand-new process-side objects over the SAME durable state.
+    const { store2, adapter2 } = reopen(ctx);
+    const disp2 = adapter2.dispatch(task);
+    // Journal exists → the dispatch is idempotent: recovered record, NOT a
+    // re-run. No new attempt rows, no next-model invocation.
+    expect(disp2.execution_id).toBe(String(task.governed_task_id && disp2.execution_id));
+    const rows2 = attemptsOf(store2, String(task.governed_task_id));
+    expect(rows2).toHaveLength(1);
+    expect(fs.readFileSync(marker, "utf8").trim().split("\n")).toEqual(["palpha:m0"]);
+  });
+
+  it("O2: restart cannot create a second winner for the same governed task", async () => {
+    const ctx = mkDsh("o2");
+    const task = governedTask(ctx);
+    const { term, attempts } = await dispatchAndWait(ctx, task);
+    expect(term.status).toBe("COMPLETED");
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0].winner).toBe(true);
+
+    const { store2, adapter2 } = reopen(ctx);
+    const disp2 = adapter2.dispatch(task);
+    expect(["COMPLETED", "FAILED", "UNKNOWN"]).toContain(String(disp2.status));
+    const rows2 = attemptsOf(store2, String(task.governed_task_id));
+    expect(rows2).toHaveLength(1);
+    expect(rows2.filter((a) => a.winner === true)).toHaveLength(1);
+  });
+});

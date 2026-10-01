@@ -11,7 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { IntegrityError } from "./errors.js";
+import { IntegrityError, PairError } from "./errors.js";
 import {
   atomicWriteJson,
   digest,
@@ -38,7 +38,34 @@ const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 export interface AcpAttemptContext {
   candidate?: Record<string, unknown> | null;
   remainingSeconds?: number;
+  /** Absolute shared task deadline (ms epoch) — every ACP stage clamps to
+   *  it and prompt dispatch is refused once it passes. */
+  deadlineAtMs?: number;
   markDispatch?: () => void;
+}
+
+/** Remaining shared-deadline budget, or null when the attempt is unbounded. */
+export function attemptRemainingMs(attemptCtx: AcpAttemptContext | undefined): number | null {
+  const d = attemptCtx?.deadlineAtMs;
+  return d == null ? null : d - Date.now();
+}
+
+/** Timeout for one ACP setup stage: the caller's normal timeout clamped to
+ *  whatever the shared task deadline still allows. An already-expired
+ *  budget throws ACP_REQUEST_TIMEOUT instead of starting the stage. */
+export function attemptStageTimeout(
+  attemptCtx: AcpAttemptContext | undefined,
+  fallbackSeconds: number,
+): number {
+  const rem = attemptRemainingMs(attemptCtx);
+  if (rem == null) return fallbackSeconds;
+  if (rem <= 0) {
+    throw new PairError(
+      "ACP_REQUEST_TIMEOUT",
+      "shared task deadline exhausted during ACP session setup",
+    );
+  }
+  return Math.min(fallbackSeconds, Math.max(1, Math.ceil(rem / 1000)));
 }
 
 export interface ExecutionRecord {
@@ -436,9 +463,9 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
           fs.appendFileSync(updatesLog, JSON.stringify({ ts: utcnow(), session_id: sessionId, update }) + "\n");
         },
       );
-      const init = await proc.initialize(30);
+      const init = await proc.initialize(attemptStageTimeout(attemptCtx, 30));
       const features = sessionFeatures(init);
-      const session = await proc.newSession(String(task.workspace), 60);
+      const session = await proc.newSession(String(task.workspace), attemptStageTimeout(attemptCtx, 60));
       const sessionId = String(session.sessionId ?? session.session_id ?? "");
       rec.session_id = sessionId;
       const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
@@ -454,7 +481,20 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
         journal.post_session_setup = setup;
         atomicWriteJson(journalPath, journal);
       }
-      const timeout = attemptCtx?.remainingSeconds ?? Number(task.timeout ?? this.deps.timeoutSeconds ?? 300);
+      // Recheck the shared deadline: ACP setup may have consumed it all.
+      // Expired budget → no markDispatch, no prompt — the attempt stays
+      // PRE_DISPATCH so normal pre-dispatch rules classify the failure.
+      const remainingMs = attemptRemainingMs(attemptCtx);
+      if (remainingMs != null && remainingMs <= 0) {
+        throw new PairError(
+          "ACP_REQUEST_TIMEOUT",
+          "shared task deadline exhausted before prompt dispatch",
+        );
+      }
+      const timeout =
+        remainingMs != null
+          ? Math.max(1, Math.ceil(remainingMs / 1000))
+          : attemptCtx?.remainingSeconds ?? Number(task.timeout ?? this.deps.timeoutSeconds ?? 300);
       // Exact dispatch boundary: after this line the task may produce side
       // effects — no automatic failover is ever allowed past this point.
       attemptCtx?.markDispatch?.();

@@ -30,6 +30,7 @@ import path from "node:path";
 import YAML from "yaml";
 import {
   AcpExecutorAdapterBase,
+  attemptStageTimeout,
   type AcpAttemptContext,
   type ExecutionRecord,
 } from "./acp-executor.js";
@@ -42,6 +43,7 @@ import {
   type DshModelCandidate,
   type DshModelRouter,
 } from "./dsh-model-router.js";
+import { ModelEvidenceCatalog } from "./model-catalog.js";
 import type { PairControlPlane } from "./service.js";
 
 export const DSH_EXECUTOR_ID = "DEEPSEEK_HARNESS";
@@ -255,11 +257,37 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
     attemptCtx?: AcpAttemptContext,
   ): Promise<Record<string, unknown>> {
     const sel = this.selectedModel(attemptCtx);
+    // Exact identity proof immediately before pinning (R1): the candidate
+    // (provider, model) tuple must still resolve through the canonical
+    // catalog to the attempt's model_entry_id — drift fails closed.
+    const cand = attemptCtx?.candidate as DshModelCandidate | null | undefined;
+    if (cand?.pid && cand.mid && this.serviceRef) {
+      const resolved = new ModelEvidenceCatalog(this.serviceRef.store).getModelByIds(
+        cand.pid,
+        cand.mid,
+      );
+      if (!resolved || String(resolved.model_entry_id) !== String(cand.model_entry_id)) {
+        throw new PairError(
+          "FAIL_CLOSED_DSH_MODEL_IDENTITY_DRIFT",
+          JSON.stringify({
+            provider_id: cand.pid,
+            model_id: cand.mid,
+            expected_model_entry_id: cand.model_entry_id,
+            resolved_model_entry_id: (resolved?.model_entry_id as string | undefined) ?? null,
+          }),
+        );
+      }
+    }
     // Runtime role enforcement: the model about to execute DSH work must be
     // canonically authorized as DSH_EXECUTION (Planner pool is disjoint).
     this.roleAssertion?.(sel.provider, sel.model);
     const value = JSON.stringify([sel.provider, sel.model]);
-    const resp = await proc.setConfigOption(sessionId, DSH_MODEL_CONFIG_ID, value, 30);
+    const resp = await proc.setConfigOption(
+      sessionId,
+      DSH_MODEL_CONFIG_ID,
+      value,
+      attemptStageTimeout(attemptCtx, 30),
+    );
     return {
       model_route: [sel.provider, sel.model],
       model_governed: sel.governed,
@@ -322,9 +350,11 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
       try {
         eligible = router.assertEligible(candidate);
       } catch (error) {
+        // Authority/governance rejection — truthful durable classification,
+        // never a failover signal (R1).
         router.attemptEnd(token, {
           outcome: "FAILED",
-          failure_class: "TRANSIENT_TRANSPORT",
+          failure_class: "AUTHORITY_REJECTED",
           error_code: String((error as { code?: string })?.code ?? "AUTHORITY"),
           safe_to_failover: false,
         });
@@ -353,6 +383,7 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
       const attemptCtx: AcpAttemptContext = {
         candidate: candidate as unknown as Record<string, unknown>,
         remainingSeconds: Math.max(1, Math.ceil(remainingMs / 1000)),
+        deadlineAtMs: deadlineMs,
         markDispatch: () => router.markDispatched(token),
       };
       try {
@@ -371,7 +402,7 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
         if (error instanceof PairError && /^FAIL_CLOSED/.test(error.code)) {
           router.attemptEnd(token, {
             outcome: "FAILED",
-            failure_class: "TRANSIENT_TRANSPORT",
+            failure_class: "AUTHORITY_REJECTED",
             error_code: error.code,
             safe_to_failover: false,
           });

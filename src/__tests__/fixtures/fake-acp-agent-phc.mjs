@@ -104,6 +104,11 @@ rl.on("line", (line) => {
         err(id, `ACP_SET_CONFIG_REJECTED:${model}`);
         return;
       }
+      if (model && behaviors[model] === "hang_setconfig") {
+        // Setup stage consumes the shared task deadline — never reply so
+        // the adapter-side stage timeout fires before prompt dispatch.
+        return;
+      }
       send({ jsonrpc: "2.0", id, result: {} });
       break;
     }
@@ -150,6 +155,12 @@ rl.on("line", (line) => {
           /* never respond */
         }, waitMs + 60000);
         break;
+      }
+      if (behavior === "crash_prompt") {
+        // Side effect DID happen (dispatch boundary crossed) then the
+        // agent dies mid-turn — simulates a crash after DISPATCHED.
+        mark(model);
+        process.exit(1);
       }
       if (behavior === "fail_prompt") {
         // The task WAS dispatched (session live, prompt received) — record
