@@ -99,12 +99,16 @@ export interface DevinAdapterDeps {
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 
-/** Completion sentinel the governed prompt requires the remote agent to
- *  reply with ("…then reply DONE"). observe() treats a `blocked` session
- *  whose last devin_message ends in this sentinel as COMPLETED — the enum
- *  stays `blocked` while the finished session idles waiting for the next
- *  user message, which can outlast any grace window. Checked as a
- *  standalone line in the message tail (attachments may follow it). */
+/** Completion protocol: the governed dispatch contract requires the
+ *  remote agent to emit `PAIR_EXECUTION_COMPLETE` on its own line when the
+ *  task is fully complete. It is a deterministic machine marker, not
+ *  prose — observe() treats a session whose last devin_message carries it
+ *  as COMPLETED regardless of the trailing status enum (blocked/suspended
+ *  are idle-wait states that can follow finished work).
+ *  Legacy `DONE` on its own line stays accepted as a fallback for
+ *  tasks dispatched before this protocol existed. */
+const COMPLETION_MARKER = "PAIR_EXECUTION_COMPLETE";
+const COMPLETION_MARKER_RE = /^\s*PAIR_EXECUTION_COMPLETE\s*$/m;
 const DONE_RE = /^\s*DONE\s*$/m;
 
 function lastDevinMessage(data: Record<string, unknown>): string | null {
@@ -307,7 +311,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     const outboxToken = process.env.PAIR_OUTBOX_TOKEN;
     if (outboxUrl && outboxToken) {
       lines.push(
-        `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${outboxToken}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE replying DONE.`,
+        `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${outboxToken}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE emitting the completion marker.`,
       );
     }
     // Credential broker: when a service needs a login/token, the agent pulls
@@ -330,6 +334,9 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
         `Credentials: if the task needs a login/API key for a service, fetch it via: curl -X POST "${brokerUrl}/api/broker/fetch" -H "x-broker-capability: ${capability}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","credential_name":"<service-name>"}'. Use the returned "value" directly in your API calls or login flow — NEVER print, save to a file, or include it in your reply text. If the fetch returns 404 the credential is not installed: report which credential you need in your reply instead of stopping.`,
       );
     }
+    lines.push(
+      `Completion protocol: when you have FULLY completed the task (all uploads and deliverables done), end your reply with the exact marker "${COMPLETION_MARKER}" on its own line. Emit it only for genuine task completion — never for partial progress or when you need input.`,
+    );
     return lines.join("\n");
   }
 
@@ -456,40 +463,45 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     // The execution's own persisted budget governs — the constructor fallback
     // only applies to legacy journals written before task_timeout_ms existed.
     const effectiveTimeoutMs = Number(rec.task_timeout_ms ?? this.taskTimeoutMs);
-    if (Number.isFinite(startedMs) && this.nowMs() - startedMs > effectiveTimeoutMs) {
-      rec.status = "TIMEOUT";
-      rec.finished_at = this.now();
-      rec.remote_timeout_ms = effectiveTimeoutMs;
-      this.executions.set(executionId, rec);
-      const { result: _t, ...out } = rec;
-      return { ...out };
-    }
+    const timedOut =
+      Number.isFinite(startedMs) && this.nowMs() - startedMs > effectiveTimeoutMs;
     const res = this.api("GET", `/v1/sessions/${remoteId}`);
     if (res.status === 404) {
       rec.status = "UNKNOWN";
       rec.finished_at = this.now();
     } else if (res.status < 400) {
       const statusEnum = String(res.data.status_enum ?? res.data.status ?? "");
-      if (statusEnum === "blocked") {
+      // Completion evidence hierarchy: the governed completion marker →
+      // legacy bare-DONE fallback. Either in the last devin_message tail
+      // proves the work finished regardless of the trailing status enum —
+      // blocked/suspended are idle-wait states that legitimately follow
+      // delivered work and must not downgrade a completed execution.
+      const lastMsg = lastDevinMessage(res.data);
+      const tail = lastMsg ? lastMsg.slice(-2000) : "";
+      const markerHit = COMPLETION_MARKER_RE.test(tail);
+      const doneHit = DONE_RE.test(tail);
+      if (markerHit || doneHit) {
+        delete rec.blocked_since;
+        rec.status = "COMPLETED";
+        rec.remote_status_enum = `${statusEnum || "unknown"}(${markerHit ? "complete" : "done"})`;
+        rec.finished_at = this.now();
+      } else if (timedOut) {
+        // Budget expired with NO completion evidence — keep the canonical
+        // TIMEOUT outcome.
+        rec.status = "TIMEOUT";
+        rec.finished_at = this.now();
+        rec.remote_timeout_ms = effectiveTimeoutMs;
+      } else if (statusEnum === "blocked") {
         // `blocked` covers both "agent needs operator input" and "agent's
-        // turn ended; session sits waiting for the next user message" — the
-        // enum may stay `blocked` for minutes after the deliverable lands.
-        // Disambiguate by the DONE sentinel the governed prompt requires:
-        // a completed reply means COMPLETED regardless of enum lag; anything
-        // else gets a grace window before REMOTE_INPUT_REQUIRED escalation.
+        // turn ended; session sits waiting for the next user message" —
+        // with no completion marker the grace window separates the two
+        // before REMOTE_INPUT_REQUIRED escalation.
         rec.remote_status_enum = "blocked";
-        const lastMsg = lastDevinMessage(res.data);
-        if (lastMsg && DONE_RE.test(lastMsg.slice(-2000))) {
-          rec.status = "COMPLETED";
-          rec.remote_status_enum = "blocked(done)";
+        if (!rec.blocked_since) rec.blocked_since = this.now();
+        const blockedMs = this.nowMs() - Date.parse(String(rec.blocked_since));
+        if (Number.isFinite(blockedMs) && blockedMs > this.blockedGraceMs) {
+          rec.status = "FAILED";
           rec.finished_at = this.now();
-        } else {
-          if (!rec.blocked_since) rec.blocked_since = this.now();
-          const blockedMs = this.nowMs() - Date.parse(String(rec.blocked_since));
-          if (Number.isFinite(blockedMs) && blockedMs > this.blockedGraceMs) {
-            rec.status = "FAILED";
-            rec.finished_at = this.now();
-          }
         }
       } else if (statusEnum) {
         delete rec.blocked_since;
@@ -497,6 +509,12 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
         rec.remote_status_enum = statusEnum;
         if (TERMINAL.has(String(rec.status))) rec.finished_at = this.now();
       }
+    } else if (timedOut) {
+      // Remote unreachable AND budget expired — timeout is the only
+      // observable outcome.
+      rec.status = "TIMEOUT";
+      rec.finished_at = this.now();
+      rec.remote_timeout_ms = effectiveTimeoutMs;
     }
     this.executions.set(executionId, rec);
     const { result: _omit, ...out } = rec;
