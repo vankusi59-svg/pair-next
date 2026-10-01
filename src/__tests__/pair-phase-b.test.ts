@@ -1475,3 +1475,30 @@ describe("R3 §5–§7 — planner attempt authority settlement", () => {
     expect(String(store.get("planner_attempt", String(a.planner_attempt_id)).outcome)).toBe("STARTED");
   });
 });
+
+describe("R3 live-found — model STALE residue cleared at canonical seam", () => {
+  it("68. STALE marker is cleared by successful model requalification", () => {
+    const { store } = makeCtx("p68");
+    const pid = "stale-provider";
+    const me = mkModel(store, pid, "stale-m");
+    mkProvider(store, pid);
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    // observed live: absence reconciliation leaves STALE on a still-QUALIFIED model
+    setModelConditions(store, me, ["REAPPEARED", "STALE"]);
+    expect(providerModelEligibility(store, pid, me).gates.MODEL_NOT_STALE).toBe("FAIL");
+    // canonical qualification transition reconciles the transient marker
+    new ModelEvidenceCatalog(store).issueQualificationReceipt(me, {
+      capability_scope: ["text_inference"],
+      verifier: "t",
+      evidence_refs: ["e"],
+      actor: "t",
+    });
+    const after = store.get("model_entry", me);
+    expect(after.conditions).not.toContain("STALE");
+    expect(after.conditions).toContain("REAPPEARED"); // informational history preserved
+    expect(after.lifecycle_state).toBe("QUALIFIED");
+    const gates = providerModelEligibility(store, pid, me).gates;
+    expect(Object.values(gates).every((g) => g === "PASS")).toBe(true);
+    expect(() => assertPlannerCandidateEligible(store, me)).not.toThrow();
+  });
+});
