@@ -32,9 +32,6 @@ export const DEVIN_EXECUTOR_ID = "DEVIN";
 export const DEVIN_CAPABILITIES = [
   "REMOTE_CLOUD_TASK_EXECUTION",
   "AUTONOMOUS_CODE_EXECUTION",
-  // Remote last-resort for the outbox deliverable — the remote session
-  // composes the report and uploads it via /api/outbox (costs ACU).
-  "TELEGRAM_DELIVERY",
 ] as const;
 
 export const DEVIN_TRANSPORT = "REMOTE_API";
