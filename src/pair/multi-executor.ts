@@ -83,6 +83,19 @@ export function registerGovernedExecutors(
       actor,
     );
     registered.push(executorId);
+    // Capability authority is INDEPENDENT of qualification: the adapter's
+    // declared set is what a persisted route snapshot must converge to.
+    // An unqualified executor stays non-routable through qualification/
+    // health/binding gates — but a stale bound snapshot must not linger
+    // just because qualify() failed this boot, so reconciliation of every
+    // EXISTING bound route runs before the early continue. A never-
+    // qualified executor has no bound routes, so nothing is minted here.
+    for (const bound of service.routes.bindingsForExecutor(executorId)) {
+      const boundRouteId = String(bound.route_id ?? "");
+      if (boundRouteId) {
+        service.routes.syncRouteCapabilities(boundRouteId, capabilities, actor);
+      }
+    }
     if (!qualified) {
       unavailable.push({
         executor_id: executorId,
@@ -92,17 +105,7 @@ export function registerGovernedExecutors(
     }
 
     const routeId = ROUTE_IDS[executorId];
-    if (!routeId) {
-      // No canonical minted route — still reconcile any routes already
-      // bound to this executor against the fresh declaration.
-      for (const bound of service.routes.bindingsForExecutor(executorId)) {
-        const boundRouteId = String(bound.route_id ?? "");
-        if (boundRouteId) {
-          service.routes.syncRouteCapabilities(boundRouteId, capabilities, actor);
-        }
-      }
-      continue;
-    }
+    if (!routeId) continue; // no canonical mint; bound routes already synced above
     let route = service.routes.getRoute(routeId);
     if (!route) {
       route = service.routes.registerRoute(
@@ -146,18 +149,6 @@ export function registerGovernedExecutors(
       );
     }
     routable.push(executorId);
-    // Every route bound to this executor reconciles against the same
-    // canonical declaration — not just the canonical minted one. A stale
-    // ROUTE_EXPLICIT or second executor-minted route must converge on the
-    // same boot (fail closed on removals, never auto-widen explicit
-    // subsets). Idempotent: syncRouteCapabilities is a no-op when the
-    // effective set is already correct.
-    for (const bound of service.routes.bindingsForExecutor(executorId)) {
-      const boundRouteId = String(bound.route_id ?? "");
-      if (boundRouteId && boundRouteId !== routeId) {
-        service.routes.syncRouteCapabilities(boundRouteId, capabilities, actor);
-      }
-    }
   }
   return { registered, routable, unavailable };
 }

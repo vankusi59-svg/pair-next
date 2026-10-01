@@ -1249,3 +1249,57 @@ forceAbortRuntime, infeasible_actions) untouched; CODEX/DSH
 TELEGRAM_DELIVERY and DEVIN-without-TD unchanged.
 
 Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`
+
+## Audit remediation round 2 (HEAD after `29a4830`)
+
+Independent re-audit (REWORK REQUIRED) found one Medium residual and one
+Low test-quality gap:
+
+- **Medium — unqualified executor skipped reconciliation**: the early
+  `if (!qualified) continue` ran BEFORE the all-bound-route reconcile, so
+  a boot where `qualify()` fails left every persisted bound snapshot
+  frozen at the previous declaration — silently violating the
+  every-bound-route invariant. Fix: **capability authority is now
+  independent of qualification**. The declared set returned by
+  `adapter.capabilities()` is what a route snapshot must converge to;
+  qualification, health and binding gates decide routability. New
+  registration order: probe → qualify → read declaration → register
+  executor descriptor (`capabilities: []`, `DEGRADED`,
+  `UNQUALIFIED` when not qualified) → **reconcile ALL existing bound
+  routes against the fresh declaration** → early exit when unqualified
+  (no mint, no routable) → else canonical mint/sync + binding + routable.
+  A never-qualified executor has no bound routes so nothing is minted —
+  the P5 no-mint invariant is preserved.
+- **Low — D2 digest reorder assertion**: the previous assertion only
+  re-checked `!= original`. Now `reorderedDigest === changedDigest`
+  explicitly, i.e. `[A,B,C] == [C,B,A]` while `[A,B] != [A,B,C]`.
+
+New regression block **RCA.U** (5 tests):
+- U1 canonical route — unqualified boot converges `[A,B]→[A]`; executor
+  in `unavailable`, not `routable`, descriptor `UNQUALIFIED`,
+  capabilities `[]`.
+- U2 ROUTE_EXPLICIT — `capabilities_declared=[A,B]` preserved verbatim,
+  effective `[A]` (B removed, C never auto-added) while qualification
+  fails.
+- U3 requalification — `[A]` stays `[A]` (B never resurrects); executor
+  routable again through normal gates.
+- U4 never-qualified — registered + unavailable, **zero** routes and
+  **zero** bindings minted.
+- U5 repeat unqualified boots — first convergence writes once, then zero
+  version churn, zero extra `ROUTE_CAPABILITIES_RECONCILED` events, zero
+  duplicate routes/bindings.
+
+**Counterfactual on `29a4830`**: U1 and U2 fail —
+`route.capabilities` stays `['CAP_A','CAP_B']` after an unqualified boot
+whose declaration is `['CAP_A']` (early continue skips reconciliation).
+All other tests pass there, including strengthened D2 (L1 digest fields
+were already bound). On remediation HEAD: **25/25 pass**.
+
+Results: focused 25/25; adjacent suites 254/256 (2 = the same
+pre-existing P5 env failures); full suite **2455 pass / 2 failed** —
+unchanged P5 env failures; `tsc --noEmit` clean; `pnpm build` clean.
+All round-1 remediations preserved (M1/M2/M3/L1, Bug C closure,
+forceAbortRuntime, bounded recovery, GovernedTaskGate, CODEX/DSH
+TELEGRAM_DELIVERY, DEVIN-without-TD).
+
+Classification: `ROUTE_CAPABILITY_AUTHORITY_STALENESS_CLOSURE_PENDING_INDEPENDENT_RE_AUDIT`

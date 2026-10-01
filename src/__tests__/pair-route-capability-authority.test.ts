@@ -67,6 +67,7 @@ class ScriptedAdapter implements ExecutorAdapter {
   script: Array<{ status: string; error_class?: string }>;
   caps: string[];
   dispatched: string[] = [];
+  qualified = true;
 
   constructor(
     id: string,
@@ -78,10 +79,12 @@ class ScriptedAdapter implements ExecutorAdapter {
     this.caps = caps;
   }
   probe() {
-    return { executor_id: this.executor_id, available: true, state: "READY" };
+    return { executor_id: this.executor_id, available: this.qualified, state: this.qualified ? "READY" : "DEGRADED" };
   }
   qualify() {
-    return { qualified: true, dispatch_enabled: true };
+    return this.qualified
+      ? { qualified: true, dispatch_enabled: true }
+      : { qualified: false, dispatch_enabled: false, reasons: ["UNQUALIFIED"] };
   }
   capabilities() {
     return { capability_ids: this.caps };
@@ -399,6 +402,150 @@ describe("RCA.R — route capability reconciliation (registration seam)", () => 
     expect(route.capabilities).toContain("TELEGRAM_DELIVERY");
   });
 });
+
+/* ===== U — unqualified boot still reconciles existing bound routes =====
+ *
+ * Capability authority is independent of qualification: a persisted route
+ * snapshot must converge to the fresh DECLARED set even when qualify()
+ * fails this boot. Qualification gates routability, never the snapshot. */
+
+describe("RCA.U — unqualified executor capability reconciliation", () => {
+  it("U1. canonical route — unqualified boot reconciles, no resurrected cap, executor non-routable", () => {
+    const ctx = makeCtx("u1");
+    const codex = new ScriptedAdapter("CODEX", [], ["CAP_A", "CAP_B"]);
+
+    // Boot 1: qualified — canonical route minted with [A, B].
+    let res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
+    expect(res.routable).toEqual(["CODEX"]);
+    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities)
+      .toEqual(["CAP_A", "CAP_B"]);
+
+    // Boot 2: declaration shrinks to [A] AND qualification fails.
+    codex.caps = ["CAP_A"];
+    codex.qualified = false;
+    res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
+
+    const route = ctx.service.routes.getRoute("RTE_CODEX_CLI")!;
+    expect(route.capabilities).toEqual(["CAP_A"]);          // B cannot stay effective
+    expect(res.unavailable.map((u) => u.executor_id)).toEqual(["CODEX"]);
+    expect(res.routable).toEqual([]);
+    const executor = ctx.store.get("executor", "CODEX")!;
+    expect((executor.metadata as { qualification_state?: string }).qualification_state)
+      .toBe("UNQUALIFIED");
+    expect(executor.capabilities).toEqual([]);              // non-routable descriptor
+  });
+
+  it("U2. ROUTE_EXPLICIT subset on unqualified boot — declared preserved, effective clamps, C never auto-added", () => {
+    const ctx = makeCtx("u2");
+    const codex = new ScriptedAdapter("CODEX", [], ["CAP_A", "CAP_B"]);
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
+    mintBoundExplicitRoute(ctx, "RTE_CODEX_SUB", "CODEX", ["CAP_A", "CAP_B"]);
+
+    // Boot 2: declaration [A, C] and qualification fails.
+    codex.caps = ["CAP_A", "CAP_C"];
+    codex.qualified = false;
+    const res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
+
+    const sub = ctx.service.routes.getRoute("RTE_CODEX_SUB")!;
+    expect(sub.capability_source).toBe("ROUTE_EXPLICIT");
+    expect(sub.capabilities_declared).toEqual(["CAP_A", "CAP_B"]); // intent verbatim
+    expect(sub.capabilities).toEqual(["CAP_A"]);                   // B removed, C not added
+    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities)
+      .toEqual(["CAP_A", "CAP_C"]);
+    expect(res.routable).toEqual([]);
+  });
+
+  it("U3. requalification — stale cap never resurrects; executor routable again", () => {
+    const ctx = makeCtx("u3");
+    const codex = new ScriptedAdapter("CODEX", [], ["CAP_A", "CAP_B"]);
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
+    mintBoundExplicitRoute(ctx, "RTE_CODEX_SUB", "CODEX", ["CAP_A", "CAP_B"]);
+
+    codex.caps = ["CAP_A"];
+    codex.qualified = false;
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
+
+    // Boot 3: re-qualified, declaration still [A].
+    codex.qualified = true;
+    const res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_3");
+    expect(res.routable).toEqual(["CODEX"]);
+    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.capabilities).toEqual(["CAP_A"]);
+    const sub = ctx.service.routes.getRoute("RTE_CODEX_SUB")!;
+    expect(sub.capabilities_declared).toEqual(["CAP_A", "CAP_B"]);
+    expect(sub.capabilities).toEqual(["CAP_A"]); // B stays dead
+  });
+
+  it("U4. never-qualified — no route minted, no binding minted, not routable", () => {
+    const ctx = makeCtx("u4");
+    const codex = new ScriptedAdapter("CODEX", [], ["CAP_A"]);
+    codex.qualified = false;
+
+    const res = registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
+    expect(res.registered).toEqual(["CODEX"]);
+    expect(res.unavailable.map((u) => u.executor_id)).toEqual(["CODEX"]);
+    expect(res.routable).toEqual([]);
+    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")).toBeNull();
+    expect(ctx.service.routes.bindingFor("CODEX", "RTE_CODEX_CLI")).toBeNull();
+    // Registry executor record exists but is non-routable.
+    const executor = ctx.store.get("executor", "CODEX")!;
+    expect(executor.capabilities).toEqual([]);
+  });
+
+  it("U5. repeat unqualified boots — converged once, then zero churn", () => {
+    const ctx = makeCtx("u5");
+    const codex = new ScriptedAdapter("CODEX", [], ["CAP_A", "CAP_B"]);
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_1");
+    mintBoundExplicitRoute(ctx, "RTE_CODEX_SUB", "CODEX", ["CAP_A", "CAP_B"]);
+
+    codex.caps = ["CAP_A"];
+    codex.qualified = false;
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_2");
+    const v1 = ctx.service.routes.getRoute("RTE_CODEX_CLI")!.version;
+    const sv1 = ctx.service.routes.getRoute("RTE_CODEX_SUB")!.version;
+    const events1 = ctx.store.listEvents()
+      .filter((e) => e.event_type === "ROUTE_CAPABILITIES_RECONCILED").length;
+    const routes1 = ctx.store.list("route").length;
+    const bindings1 = ctx.store.list("route_binding").length;
+
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_3");
+    registerGovernedExecutors(ctx.service, new Map([["CODEX", codex]]), "BOOT_4");
+
+    expect(ctx.service.routes.getRoute("RTE_CODEX_CLI")!.version).toBe(v1);
+    expect(ctx.service.routes.getRoute("RTE_CODEX_SUB")!.version).toBe(sv1);
+    expect(ctx.store.listEvents()
+      .filter((e) => e.event_type === "ROUTE_CAPABILITIES_RECONCILED").length)
+      .toBe(events1);
+    expect(ctx.store.list("route").length).toBe(routes1);
+    expect(ctx.store.list("route_binding").length).toBe(bindings1);
+  });
+});
+
+/** A second route bound to the same executor, declared as an intentional
+ *  operator subset — same shape the R tests mint inline. */
+function mintBoundExplicitRoute(
+  ctx: ReturnType<typeof makeCtx>,
+  routeId: string,
+  executorId: string,
+  declared: string[],
+) {
+  ctx.service.routes.registerRoute({
+    route_id: routeId,
+    route_kind: "REMOTE_GATEWAY_API",
+    enabled: true,
+    eligibility_state: "QUALIFIED",
+    qualification_state: "QUALIFIED",
+    capability_source: "ROUTE_EXPLICIT",
+    capabilities_declared: [...declared],
+    capabilities: [...declared],
+    executor_hint: executorId,
+  });
+  ctx.service.routes.registerBinding({
+    executor_id: executorId,
+    route_id: routeId,
+    mechanism: "SPAWN_ENV",
+    qualification_state: "QUALIFIED",
+  });
+}
 
 /* ============ S — NO_ELIGIBLE_ROUTE taxonomy / bounded recovery =========== */
 
@@ -832,8 +979,10 @@ describe("RCA.D — snapshot digest binds capability semantics", () => {
       { ...route, capabilities_declared: ["CAP_A", "CAP_B", "CAP_C"] },
       Number(route.version),
     );
-    expect(ctx.service.routes.snapshotDigest()).not.toBe(d1);
-    // Same declared set, different order → same digest.
+    const changedDigest = ctx.service.routes.snapshotDigest();
+    expect(changedDigest).not.toBe(d1);
+    // Same declared set, different order → canonical sorted form → IDENTICAL
+    // digest. [A,B,C] == [C,B,A] while [A,B] != [A,B,C].
     const route2 = ctx.service.routes.getRoute("RTE_X")!;
     ctx.store.put(
       "route",
@@ -841,6 +990,6 @@ describe("RCA.D — snapshot digest binds capability semantics", () => {
       { ...route2, capabilities_declared: ["CAP_C", "CAP_B", "CAP_A"] },
       Number(route2.version),
     );
-    expect(ctx.service.routes.snapshotDigest()).not.toBe(d1);
+    expect(ctx.service.routes.snapshotDigest()).toBe(changedDigest);
   });
 });
