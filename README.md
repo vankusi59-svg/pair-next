@@ -25,7 +25,11 @@ scripts/start-pair-live.sh   # builds, starts server :8788, tunnel, telegram bri
 
 The serve script (`scripts/serve-mission-control.mjs`) wires the full stack: evidence store, governed gate, executor registry, mission router, planner (multi-provider DSH model routes: `PAIR_DSH_MODEL_ROUTE`, `PAIR_DSH_FALLBACK_ROUTE`, `PAIR_DSH_EXTRA_ROUTES`), business layer, credential broker, experience service.
 
-Dashboard auth: `Authorization: Bearer $PAIR_MC_TOKEN`; writes require `x-operator-id`.
+**Phase A — runtime timeouts** (validated at startup, fail closed on malformed input): `PAIR_MODEL_PROBE_TIMEOUT_MS` (default 8000, bounds 500–120000), `PAIR_LLM_PLANNER_TIMEOUT_MS` (default 20000, bounds 2000–900000), `PAIR_TASK_TIMEOUT_S` (default 120s per governed task, bounds 5–7200; a task's own `metadata.timeout` still wins).
+
+**Phase A — canonical model roles.** Models are assigned roles in the canonical store (`model_role_assignment`, keyed by `model_entry_id`): `PLANNER_COORDINATOR` via `PAIR_PLANNER_MODEL_ROUTE` (default `gemini:gemini-3.1-flash-lite`), `DSH_EXECUTION` via the `PAIR_DSH_*_ROUTE*` vars (defaults `cloudflare:@cf/zai-org/glm-4.7-flash`, `groq:openai/gpt-oss-20b`). Hard invariant: the same canonical model may not sit in both pools — startup fails closed (`FAIL_CLOSED_MODEL_ROLE_OVERLAP`), and runtime asserts the role at each planner call and each DSH session pin.
+
+Dashboard auth: `Authorization: Bearer $PAIR_MC_TOKEN`; writes require `x-operator-id`. Token resolution (shared by server + telegram bridge): explicit `PAIR_MC_TOKEN` → `$PAIR_HOME/pair-mc-token` (chmod 600) → generated 256-bit random persisted there. No static default ever ships; to inspect it locally read the file (`cat ~/pair-mc-token`) — it is never logged.
 
 ## Docs
 
