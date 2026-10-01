@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import YAML from "yaml";
 import { AcpExecutorAdapterBase } from "./acp-executor.js";
 import type { AcpLaunch, AcpProcess } from "./acp-transport.js";
 
@@ -51,14 +52,22 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
   override readonly invocation_method = "acp stdio json-rpc (dsh --profile acp)";
   protected override readonly capability_ids = [...DSH_CAPABILITY_IDS];
   private readonly configuredEntry: string | null;
+  private readonly roleAssertion: ((provider: string, model: string) => void) | null;
 
   constructor(
     deps: ConstructorParameters<typeof AcpExecutorAdapterBase>[0] & {
       dshEntry?: string;
+      /**
+       * Phase A role seam: invoked with the resolved (provider, model)
+       * immediately before the route is pinned on a live DSH session — the
+       * caller proves the model holds DSH_EXECUTION role; throw = fail closed.
+       */
+      modelRoleAssertion?: (provider: string, model: string) => void;
     },
   ) {
     super(deps);
     this.configuredEntry = deps.dshEntry ?? null;
+    this.roleAssertion = deps.modelRoleAssertion ?? null;
   }
 
   private envOf(name: string): string | undefined {
@@ -102,7 +111,30 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
 
   protected override credentialEnvNames(): string[] {
     const [provider] = modelRoute(this.envOf.bind(this));
-    return provider === "deepseek-official" ? [DSH_OFFICIAL_CREDENTIAL_ENV] : [`${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`];
+    if (provider === "deepseek-official") return [DSH_OFFICIAL_CREDENTIAL_ENV];
+    // The provider's own config declares its credential env name (e.g.
+    // cloudflare → CLOUDFLARE_API_TOKEN) — authoritative over the
+    // <PROVIDER>_API_KEY convention.
+    const declared = this.providerCredentialEnv(provider);
+    if (declared) return [declared];
+    return [`${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`];
+  }
+
+  private providerCredentialEnv(provider: string): string | null {
+    const home = this.envOf("PAIR_DSH_HOME");
+    if (!home) return null;
+    const settingsPath = path.join(home, "settings.yaml");
+    if (!fs.existsSync(settingsPath)) return null;
+    try {
+      const raw = YAML.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+      const providers = ((raw?.["llm-pi-ai"] ?? {}) as Record<string, unknown>).providers as
+        | Record<string, Record<string, unknown>>
+        | undefined;
+      const apiKeyEnv = providers?.[provider]?.apiKeyEnv;
+      return apiKeyEnv ? String(apiKeyEnv) : null;
+    } catch {
+      return null;
+    }
   }
 
   protected override providerProbe(launch: AcpLaunch, limitations: string[]): Record<string, unknown> {
@@ -139,6 +171,9 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
     _task: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     const [provider, model] = modelRoute(this.envOf.bind(this));
+    // Runtime role enforcement: the model about to execute DSH work must be
+    // canonically authorized as DSH_EXECUTION (Planner pool is disjoint).
+    this.roleAssertion?.(provider, model);
     const value = JSON.stringify([provider, model]);
     const resp = await proc.setConfigOption(sessionId, DSH_MODEL_CONFIG_ID, value, 30);
     return { model_route: [provider, model], model_config: { config_id: DSH_MODEL_CONFIG_ID, response: resp } };
