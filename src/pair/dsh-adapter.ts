@@ -11,6 +11,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import YAML from "yaml";
 import { AcpExecutorAdapterBase } from "./acp-executor.js";
 import type { AcpLaunch, AcpProcess } from "./acp-transport.js";
 
@@ -110,7 +111,30 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
 
   protected override credentialEnvNames(): string[] {
     const [provider] = modelRoute(this.envOf.bind(this));
-    return provider === "deepseek-official" ? [DSH_OFFICIAL_CREDENTIAL_ENV] : [`${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`];
+    if (provider === "deepseek-official") return [DSH_OFFICIAL_CREDENTIAL_ENV];
+    // The provider's own config declares its credential env name (e.g.
+    // cloudflare → CLOUDFLARE_API_TOKEN) — authoritative over the
+    // <PROVIDER>_API_KEY convention.
+    const declared = this.providerCredentialEnv(provider);
+    if (declared) return [declared];
+    return [`${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY`];
+  }
+
+  private providerCredentialEnv(provider: string): string | null {
+    const home = this.envOf("PAIR_DSH_HOME");
+    if (!home) return null;
+    const settingsPath = path.join(home, "settings.yaml");
+    if (!fs.existsSync(settingsPath)) return null;
+    try {
+      const raw = YAML.parse(fs.readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+      const providers = ((raw?.["llm-pi-ai"] ?? {}) as Record<string, unknown>).providers as
+        | Record<string, Record<string, unknown>>
+        | undefined;
+      const apiKeyEnv = providers?.[provider]?.apiKeyEnv;
+      return apiKeyEnv ? String(apiKeyEnv) : null;
+    } catch {
+      return null;
+    }
   }
 
   protected override providerProbe(launch: AcpLaunch, limitations: string[]): Record<string, unknown> {
