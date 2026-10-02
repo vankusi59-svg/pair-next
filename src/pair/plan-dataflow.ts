@@ -143,7 +143,10 @@ export interface TelegramDeliveryIntent {
 // letter boundary for Vietnamese text.
 const TELEGRAM_MENTION_RE = /(?<![\p{L}\p{N}\p{M}_])(?:telegram|tele)(?![\p{L}\p{N}\p{M}_])/giu;
 const DELIVERY_VERB_RE =
-  /(?<![\p{L}\p{N}\p{M}_])(?:send|deliver|forward|share|post|upload|gửi|đẩy|đưa|chuyển|báo|bắn|đăng|đính)(?![\p{L}\p{N}\p{M}_])/giu;
+  // `gui` is the high-confidence unaccented alias of `gửi` (R8-R1 audit
+  // closure); only bare-alias safe verbs are admitted — accents are never
+  // stripped globally (báo→bao would collide with "bao cao" = report).
+  /(?<![\p{L}\p{N}\p{M}_])(?:send|deliver|forward|share|post|upload|gửi|gui|đẩy|đưa|chuyển|báo|bắn|đăng|đính)(?![\p{L}\p{N}\p{M}_])/giu;
 const NEGATION_RE =
   /(?<![\p{L}\p{N}\p{M}_])(?:do\s+not|don't|dont|does\s+not|doesn't|doesnt|never|not|no|đừng|dung|không|khong|không\s+cần|khong\s+can|chớ|đừng\s+có|không\s+phải|không\s+bao\s+giờ)(?![\p{L}\p{N}\p{M}_])/iu;
 const CLAUSE_SPAN = 160;

@@ -132,5 +132,60 @@ M exact prod E2E rejected · N correct E2E→1 TDR, no duplicate, R7 semantics.
 - Legacy persisted plans (pre-R8) that contain send-verb instructions will
   now fail closed at confirm/replan — intended hardening, fail-closed.
 
-**Classification:** `PAIR_NEXT_POST_R7_INCIDENT_R8_PENDING_INDEPENDENT_AUDIT`
+---
+
+## Independent Audit Remediation R1 — unaccented `gui` delivery-intent closure
+
+**Audit blocker:** the exact production goal used unaccented `gui` (gửi) —
+`detectTelegramDeliveryIntent` returned `requested=false`, so §1 presence
+could neither require a delivery task nor accept a correct one for the real
+operator wording.
+
+**Root cause:** `DELIVERY_VERB_RE` carried accented `gửi` but deliberately
+excluded the bare `gui` alias, chosen earlier to keep the grammar bounded.
+
+**Chosen fix (one canonical grammar, no second parser):** `gui` added as an
+explicit bare-word alternative in `DELIVERY_VERB_RE`. All existing bounds stay
+authoritative — letter-boundary lookarounds, Telegram mention required within
+`CLAUSE_SPAN`, `clauseNegated` lookback, artifact clauses unchanged. `gửi`
+never matched at ASCII word boundaries before the Unicode lookaround work;
+`gui` is admitted the same way.
+
+**Why no global diacritic strip:** stripping Vietnamese accents would turn
+`bao cao` (= báo cáo, "report") into the delivery verb `báo` — e.g.
+`"tao bao cao ve telegram"` must stay `requested=false`. Only
+high-confidence bare aliases are admitted; `gui` is unambiguous in this
+grammar (letter-bounded; `guide`/`beguile`/embedded `gui` never match).
+
+**New/changed tests** (`pair-planner-dataflow-incident.test.ts`):
+- M rewritten — the exact prod goal now proves `intent.requested===true`
+  AND zero-delivery plan → `FAIL_CLOSED_DELIVERY_TASK_MISSING` AND the
+  send-verb CODEX task → `FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK`
+  (invariants proven independently, not masked).
+- R1 block (A–O): accented `gửi` `requested=true`; `gui` `requested=true`;
+  exact prod goal `requested=true`; prod goal + clean zero-delivery plan →
+  MISSING; prod goal + one delivery task → PASS + PAIR-owned instruction +
+  stamped manifest; negation wins in both accented and unaccented forms
+  (`khong/dung/không/đừng gui…`, `do not gui…`); bare "telegram"→false;
+  "gui bao cao cho toi" (no mention)→false; `tao bao cao ve telegram`→false.
+
+**Exact production-goal result:** `detectTelegramDeliveryIntent(prodGoal)`
+→ `requested=true` at every boundary (canonicalize/preview/confirm/
+runPlanning/runReplan — same detector, one canonical semantic authority).
+
+**Regression:** focused incident file **99/99** (90 → 99; +9 R1 tests);
+related suites unchanged (ops-telegram-delivery 3/3, llm-planner 16/16,
+p8 49/49, live-ops 20/20); **full suite 2662 pass / 2 fail / 15 skipped** —
+the 2 fails are the known env-only P5 probe tests, identical on base
+`8e1d35b` (DSH/CODEX executables present on this machine). `tsc` clean,
+`pnpm build` clean.
+
+**Residual parser limitations:** other unaccented forms (`ban`/`dang`/`day`/
+`chuyen`/`bao`) remain non-verbs — admitted only as future high-confidence
+aliases with test-backed justification; analysis-vs-request phrasing
+("nghiên cứu cách gui tin nhắn telegram hoạt động") is treated as a delivery
+request when it parses affirmative in the bounded clause — bounded behavior,
+no heuristic NLP added per mandate.
+
+**Classification:** `PAIR_NEXT_POST_R7_INCIDENT_R8_R1_PENDING_INDEPENDENT_REAUDIT`
 STOP. DO NOT MERGE. DO NOT START PHASE E.
