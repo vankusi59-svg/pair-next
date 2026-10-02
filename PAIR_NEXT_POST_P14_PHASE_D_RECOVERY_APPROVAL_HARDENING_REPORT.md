@@ -214,3 +214,83 @@ When several match, the candidate carrying the same `recovery_decision_id` wins;
 `PAIR_NEXT_PHASE_D_R1_PENDING_INDEPENDENT_AUDIT`
 
 **STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R2 — APRE Effect Ownership + Crash Convergence Closure
+
+Base: `7f38d86` (R1 audited HEAD). Scope: close the remaining exact-once gap — an APPLYING APRE now proves ONE durable effect owner via CAS claim, and the APRE lifecycle alone discovers unfinished work on any tick, in any mission state.
+
+## APRE state/claim model
+
+`RESERVED → APPLYING → APPLIED`. The APPLYING row is a real lease record:
+
+```
+approval_exercise_id (deterministic APRE_<id>), approval_id, approval_type,
+requested_action, intent, mission_id, task_id, scope_digest, operator_id,
+effect (deterministic plan, incl. stale_recovery snapshot),
+state: APPLYING | APPLIED,
+owner_id: MRI_* | null, claim_epoch: n, claimed_at, lease_expires_at,
+exercised_at, applied_at
+```
+
+`exercise()` is unchanged in semantics (winner-creates/loser-adopts, deterministic id) — the row now carries the ownership fields. `markExercisedApplied` is CAS-loss safe: version drift between claim and close re-reads and converges instead of surfacing `FAIL_CLOSED_VERSION_CONFLICT`.
+
+## Owner identity + lease/takeover
+
+- Owner id = `MRI_<ulid>` per `MissionRuntime` instance (`private readonly instanceId`) — a restart is a new owner, never impersonates a dead one.
+- `claimExercise(approvalId, ownerId, now, leaseMs=60000)`: pure CAS on the store.
+  - APPLIED → `{applied:true}`; owned by self + live lease → CAS renew → `{owned:true}`.
+  - Foreign live owner → `{owned:false}` (cannot steal — test G).
+  - Unowned or stale lease → CAS takeover `claim_epoch+1`, `claimed_at=now`, `lease_expires_at=now+60s` (test F).
+  - `IntegrityError` mid-CAS → bounded retry (≤3), then re-read + `{owned:false}` — contention never leaks as a runtime defect.
+
+## Concurrent losers + orphan discovery
+
+- Losers re-read the canonical row and converge normally — no apply, no decision, no transition, no defect (test A: separate `PairEvidenceStore` connection, foreign active owner).
+- `convergeApplyingExercises` runs at the TOP of every tick — before the terminal check — iterating `listExercised({mission_id})`. The APRE lifecycle is self-sufficient to find unfinished work; `mission_runtime` state does not gate discovery.
+- `convergeExercise` is the single owned-apply path shared by the WAITING_APPROVAL arm and the sweep: exercise (adopt winner) → claim → applied? bookkeeping only → not-owned? converge → owned? apply effect arms → markExercisedApplied.
+- Transitions only fire when `rt.state === WAITING_APPROVAL` (`waiting` flag) — orphan convergence completes effect writes without stomping a mission that already moved past the approval wait; chain resume is skipped on terminal missions.
+
+## Per-intent idempotency (all keyed by approval_exercise_id)
+
+- **EXTENSION**: grant written as a keyed assignment `budget_extension.tasks[taskId] = {attempts_per_task, baseline_*, approval_exercise_id}` — deterministic values from the persisted plan; re-apply writes identical values (test C: entry count/value frozen).
+- **REVALIDATION**: fresh chain stamped `pending_recovery.approval_exercise_id`; stamped → adopt, no second `recovery_decision` (test D). `stale_recovery` snapshot in the effect plan rebuilds the chain deterministically if the crash hit between clear and mint.
+- **ACK_NO_REPLAY**: stamp-guards on barrier (`approval_exercise_id` equality), task FAILED, exec `terminal_outcome` — re-entry performs zero writes; task never re-dispatched (test E: `dispatched=0` on the peer).
+
+## Crash-convergence evidence (tests A–G)
+
+| # | Scenario | Result |
+|---|----------|--------|
+| A | Foreign live owner + lease-expiry takeover, EXTENSION | 1 APRE / 1 owner-at-a-time / 1 grant / decisions +1 only / no defect |
+| B | Crash after claim, before effect (REVALIDATION) | takeover → single chain → APPLIED |
+| C | Crash after extension persisted | grant never stacks; stamped chain resumed; APPLIED |
+| D | Crash after fresh chain persisted | chain adopted (`recovery_id` unchanged), no 2nd decide; APPLIED |
+| E | Crash after no-replay effect (terminal mission) | zero replay, single settlement/outcome; APPLIED |
+| F | Stale owner after lease expiry | takeover, epoch 2 |
+| G | Live owner cannot be stolen (separate connection) | `owned:false`, row untouched |
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused (`pair-phase-d-recovery-approval-hardening`) | **27/27 pass** |
+| PR #23 (`pair-live-ops-recovery-closure`) | pass |
+| PR #24 (`pair-route-capability-authority`) | pass |
+| Phase C (`pair-phase-c-dsh-model-routing`) | pass |
+| Phase B (`pair-phase-b`) | pass |
+| **Full suite** | **2553 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R1 `7f38d86` 2546/2/15 → +7 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Changed files (R2)
+
+- `src/pair/approval-queue.ts` — APRE owner/lease fields on exercise(), new `claimExercise` CAS loop, CAS-safe `markExercisedApplied`
+- `src/pair/mission-runtime.ts` — `instanceId`, pre-terminal `convergeApplyingExercises` sweep, unified `convergeExercise` (claim → owned-apply → close), `waiting`/`terminal` guards on transitions + chain resume, `stale_recovery` snapshot in `exerciseEffectPlan`, stamp-guarded ACK arm
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +7 tests (A–G)
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R2_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**

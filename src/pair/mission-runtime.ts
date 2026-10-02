@@ -152,6 +152,10 @@ const DEFAULT_TASK_TIMEOUT = 120;
 
 export class MissionRuntime {
   private readonly actor: string;
+  /** R2 — this runtime instance's process identity; used as the durable
+   *  owner id on APRE claims so exactly one writer applies an approval
+   *  effect and a crashed owner's lease can be taken over. */
+  private readonly instanceId = newId("MRI");
 
   constructor(private readonly deps: MissionRuntimeDeps) {
     this.actor = deps.actor ?? "PAIR_MISSION_RUNTIME";
@@ -393,8 +397,16 @@ export class MissionRuntime {
 
   /** One persisted step. Returns the runtime entity after the step. */
   tick(missionId: string, now?: string): Record<string, unknown> {
-    const rt = this.runtimeEntity(missionId);
-    const state = String(rt.state) as MissionRuntimeState;
+    let rt = this.runtimeEntity(missionId);
+    let state = String(rt.state) as MissionRuntimeState;
+    // R2 — the APRE lifecycle itself discovers unfinished work: any
+    // APPLYING exercise converges here regardless of which state the
+    // mission is in — including terminal (a crash can leave APPLYING
+    // behind after the mission already settled; effect writes are
+    // idempotent and state transitions are suppressed there).
+    this.convergeApplyingExercises(missionId, now);
+    rt = this.runtimeEntity(missionId);
+    state = String(rt.state) as MissionRuntimeState;
     if (TERMINAL_RUNTIME.has(state) || state === "PAUSED") return rt;
 
     switch (state) {
@@ -1628,40 +1640,89 @@ export class MissionRuntime {
    * exercise row and the runtime update re-converges cleanly.
    */
   private exerciseApprovedRecovery(missionId: string, approvalId: string, now?: string): void {
+    // WAITING_APPROVAL's APPROVED arm converges through the same owned
+    // apply path the orphan sweep uses — one code path, one lifecycle.
+    this.convergeExercise(missionId, approvalId, now);
+  }
+
+  /** R2 — discover unfinished exercises on EVERY non-terminal tick. The
+   *  APRE lifecycle alone is authoritative: a crash can leave APPLYING
+   *  behind while the runtime already sits in RECOVERING/RUNNING/
+   *  WAITING_BACKOFF/RECONCILING — the mission's current state is not
+   *  evidence about the exercise's completeness. */
+  private convergeApplyingExercises(missionId: string, now?: string): void {
+    for (const row of this.deps.approvals.listExercised({
+      mission_id: missionId,
+    })) {
+      if (String(row.state ?? "APPLIED") === "APPLIED") continue;
+      this.convergeExercise(missionId, String(row.approval_id), now);
+    }
+  }
+
+  /** R2 — claim the exercise, apply its ONE effect idempotently, close
+   *  the lifecycle. Ownership is a durable CAS lease on the APRE row:
+   *  exactly one writer applies; a loser converges on the canonical row
+   *  (never a version-conflict defect); an APPLYING row whose owner died
+   *  is taken over once its bounded lease expires. Effect application is
+   *  driven from the persisted deterministic plan so partial writes from
+   *  a crashed owner re-apply identically, and every effect is keyed to
+   *  `approval_exercise_id` so re-entry never stacks or re-mints. */
+  private convergeExercise(
+    missionId: string,
+    approvalId: string,
+    now?: string,
+  ): void {
+    // Ensure the canonical APRE row exists before claiming: the winner's
+    // deterministic plan is persisted on it, so resumers never recompute
+    // drift-prone baselines.
     const approval = this.deps.approvals.get(approvalId);
     const intent = String(
       (approval.intent as Record<string, unknown> | null)?.kind ??
         approval.requested_action,
     );
     const taskId = String(approval.task_id ?? "");
-    // R1 — the effect plan is deterministic and persisted on the APRE row
-    // by the winning writer; a resumer (or a racing loser) reuses the
-    // stored plan verbatim instead of recomputing drift-prone baselines.
-    const effectPlan = this.exerciseEffectPlan(approval, intent, taskId);
-    const { row: exercise } = this.deps.approvals.exercise(
+    const { row: apre0 } = this.deps.approvals.exercise(
       approvalId,
-      effectPlan,
+      this.exerciseEffectPlan(missionId, approval, intent, taskId),
     );
-    const effect = (exercise.effect ?? effectPlan) as Record<string, unknown>;
-    const exerciseId = String(exercise.approval_exercise_id);
+    const claim = this.deps.approvals.claimExercise(
+      approvalId,
+      this.instanceId,
+      now,
+    );
+    const row = claim.applied || claim.owned ? claim.row : apre0;
+    const exerciseId = String(row.approval_exercise_id);
     const rt = this.runtimeEntity(missionId);
-    if (String(exercise.state ?? "APPLIED") === "APPLIED") {
-      // The effect already landed — converge bookkeeping only. Reaching
-      // here with state APPLIED means a crash split the APPLIED write
-      // from the runtime bookkeeping, never that the effect is missing.
-      rt.pending_approval_id = null;
-      this.store.put(
-        "mission_runtime",
-        String(rt.mission_runtime_id),
-        rt,
-        Number(rt.version),
-      );
+    if (claim.applied) {
+      // Effect already durable — converge bookkeeping only.
+      if (String(rt.pending_approval_id ?? "") === approvalId) {
+        rt.pending_approval_id = null;
+        this.store.put(
+          "mission_runtime",
+          String(rt.mission_runtime_id),
+          rt,
+          Number(rt.version),
+        );
+      }
       if (String(rt.state) === "WAITING_APPROVAL") {
         this.transitionRuntime(missionId, "RUNNING", "approval_already_exercised");
       }
       return;
     }
+    if (!claim.owned) {
+      // Another live writer owns the apply — converge normally; this
+      // instance's next tick re-checks once the owner lands or the lease
+      // expires. Losing a CAS race is never a runtime defect.
+      return;
+    }
+    const effect = (row.effect as Record<string, unknown> | null) ?? {};
     rt.pending_approval_id = null;
+    // State transitions belong to the WAITING_APPROVAL arm only: in the
+    // orphan-converge path the effect's transition already landed (or
+    // the mission moved on), so re-transitioning would stomp live state.
+    const rtState = String(rt.state);
+    const waiting = rtState === "WAITING_APPROVAL";
+    const terminal = TERMINAL_RUNTIME.has(rtState as MissionRuntimeState);
 
     switch (intent) {
       case "RECOVERY_TASK_ATTEMPT_EXTENSION":
@@ -1685,16 +1746,21 @@ export class MissionRuntime {
           rt,
           Number(rt.version),
         );
-        this.transitionRuntime(
-          missionId,
-          "RECOVERING",
-          "approval_exercised_attempt_extension",
-        );
+        if (waiting) {
+          this.transitionRuntime(
+            missionId,
+            "RECOVERING",
+            "approval_exercised_attempt_extension",
+          );
+        }
         // A FRESH governed decide() applies the widened per-task ceiling —
         // replaying the stale pending action would just re-mint the same
         // approval (bounded abort). The new decision replaces the stale
-        // pending_recovery; stale scheduled actions are swept first.
-        this.resumeExercisedChain(missionId, taskId, exerciseId, now);
+        // pending_recovery; stale scheduled actions are swept first. A
+        // terminal mission cannot run a chain — converge only.
+        if (!terminal) {
+          this.resumeExercisedChain(missionId, taskId, exerciseId, now, effect);
+        }
         break;
       }
       case "RECOVERY_OPERATOR_REVALIDATION": {
@@ -1708,12 +1774,16 @@ export class MissionRuntime {
           rt,
           Number(rt.version),
         );
-        this.transitionRuntime(
-          missionId,
-          "RECOVERING",
-          "approval_exercised_revalidation",
-        );
-        this.resumeExercisedChain(missionId, taskId, exerciseId, now);
+        if (waiting) {
+          this.transitionRuntime(
+            missionId,
+            "RECOVERING",
+            "approval_exercised_revalidation",
+          );
+        }
+        if (!terminal) {
+          this.resumeExercisedChain(missionId, taskId, exerciseId, now, effect);
+        }
         break;
       }
       case "ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY": {
@@ -1724,14 +1794,22 @@ export class MissionRuntime {
         const barriers =
           (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
         const barrier = barriers[taskId];
-        if (barrier) {
+        // Stamp-guarded: re-entry after a crash never re-settles — the
+        // settlement is already keyed to THIS approval_exercise_id.
+        if (
+          barrier &&
+          String(barrier.approval_exercise_id ?? "") !== exerciseId
+        ) {
           barrier.settled = true;
           barrier.operator_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
-          barrier.approval_exercise_id = String(exercise.approval_exercise_id);
+          barrier.approval_exercise_id = exerciseId;
           rt.barriers = barriers;
         }
-        if (taskId && this.store.tryGet("task", taskId)) {
-          this.deps.service.updateTask(taskId, { status: "FAILED" });
+        if (taskId) {
+          const task = this.store.tryGet("task", taskId);
+          if (task && String(task.status) !== "FAILED") {
+            this.deps.service.updateTask(taskId, { status: "FAILED" });
+          }
         }
         // Neutralize the execution row: the operator outcome is durable on
         // the execution itself so RUNNING's in-flight sweep can never
@@ -1742,7 +1820,11 @@ export class MissionRuntime {
           : null;
         if (barrierExecId) {
           const exec = this.store.tryGet("executor_execution", barrierExecId);
-          if (exec) {
+          if (
+            exec &&
+            String(exec.terminal_outcome ?? "") !==
+              "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY"
+          ) {
             exec.terminal_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
             this.store.put(
               "executor_execution",
@@ -1767,7 +1849,9 @@ export class MissionRuntime {
           rt3,
           Number(rt3.version),
         );
-        this.transitionRuntime(missionId, "RUNNING", "approval_exercised_no_replay");
+        if (waiting) {
+          this.transitionRuntime(missionId, "RUNNING", "approval_exercised_no_replay");
+        }
         break;
       }
       default: {
@@ -1777,23 +1861,42 @@ export class MissionRuntime {
           rt,
           Number(rt.version),
         );
-        this.transitionRuntime(missionId, "RUNNING", "approval_granted_resume");
+        if (waiting) {
+          this.transitionRuntime(missionId, "RUNNING", "approval_granted_resume");
+        }
       }
     }
     // Lifecycle close — the whole effect is durable. A crash anywhere
-    // above leaves APPLYING; the next exercise() call re-enters and
-    // re-applies the same idempotent writes until this line runs.
+    // above leaves APPLYING owned by this instance; the next claim
+    // (self or a post-lease takeover) re-enters and re-applies the same
+    // idempotent writes until this line runs.
     this.deps.approvals.markExercisedApplied(approvalId);
   }
 
   /** Deterministic effect plan for an approval exercise — persisted on
    *  the APRE row by the winner so a crash-restart resumes the SAME plan
-   *  instead of recomputing baselines that have since drifted. */
+   *  instead of recomputing baselines that have since drifted. The
+   *  `stale_recovery` snapshot is the chain the exercise replaces: a
+   *  crash between clearing it and minting the fresh decide rebuilds
+   *  from this plan verbatim — never recomputes. */
   private exerciseEffectPlan(
+    missionId: string,
     approval: Record<string, unknown>,
     intent: string,
     taskId: string,
   ): Record<string, unknown> {
+    const stale = (this.runtimeEntity(missionId).pending_recovery ??
+      null) as Record<string, unknown> | null;
+    const plan: Record<string, unknown> = {
+      stale_recovery: stale
+        ? {
+            task_id: stale.task_id ?? null,
+            execution_id: stale.execution_id ?? null,
+            failure_class: stale.failure_class ?? null,
+            infeasible_actions: stale.infeasible_actions ?? null,
+          }
+        : null,
+    };
     if (
       intent === "RECOVERY_TASK_ATTEMPT_EXTENSION" ||
       intent === LEGACY_RECOVERY_BUDGET_OVERRIDE
@@ -1822,25 +1925,26 @@ export class MissionRuntime {
         if (String(a.failure_signature ?? "") !== grantSignature) break;
         identical += 1;
       }
-      return {
-        attempts_per_task: grant,
-        baseline_attempts: taskAttempts.length,
-        baseline_identical: identical,
-      };
+      plan.attempts_per_task = grant;
+      plan.baseline_attempts = taskAttempts.length;
+      plan.baseline_identical = identical;
     }
-    return {};
+    return plan;
   }
 
   /** After an exercised approval, replace the stale pending chain with a
    *  fresh governed decide() — stamped with the exercise id so a
    *  restart/re-entry re-finds the already-minted chain and NEVER mints a
    *  second decision for the same exercise (R1: REVALIDATION re-entry
-   *  bound). */
+   *  bound). When the pre-exercise chain was already cleared by a crash
+   *  before the fresh decide, `plan.stale_recovery` (persisted on the
+   *  APRE row) rebuilds the same chain deterministically. */
   private resumeExercisedChain(
     missionId: string,
     taskId: string,
     exerciseId: string,
     now?: string,
+    plan?: Record<string, unknown>,
   ): void {
     const rt = this.runtimeEntity(missionId);
     const pending = rt.pending_recovery as Record<string, unknown> | null;
@@ -1850,7 +1954,9 @@ export class MissionRuntime {
     ) {
       return; // chain for this exercise already minted — resume it
     }
-    const stale = pending;
+    const stale =
+      pending ??
+      ((plan?.stale_recovery as Record<string, unknown> | null) ?? null);
     this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
     if (!stale) return;
     this.startRecovery(

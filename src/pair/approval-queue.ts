@@ -256,6 +256,13 @@ export class ApprovalQueue {
       operator_id: approval.operator_id ?? null,
       effect: effect ?? null,
       state: "APPLYING",
+      // R2 — durable effect ownership: an APPLYING row carries an
+      // explicit owner + bounded lease so exactly ONE writer applies the
+      // effect and a crashed owner's row is discoverable + takable.
+      owner_id: null as string | null,
+      claim_epoch: 0,
+      claimed_at: null as string | null,
+      lease_expires_at: null as string | null,
       exercised_at: utcnow(),
       applied_at: null as string | null,
       version: 0,
@@ -286,20 +293,121 @@ export class ApprovalQueue {
     return { row: saved, created: true };
   }
 
+  /**
+   * R2 — CAS-safe single-owner claim on an APPLYING exercise. Exactly
+   * one writer may actively apply the effect at a time; the claim is a
+   * durable lease, not an in-memory mutex.
+   *
+   * Rules (first row read wins the interpretation, CAS decides ties):
+   * - state APPLIED        → nobody owns; caller converges (applied:true)
+   * - owner == ownerId     → same owner renewing (owned:true, lease bumped)
+   * - owner set + active   → a live writer owns it (owned:false — the
+   *   loser re-reads the canonical row and converges, never surfaces a
+   *   version conflict as a defect)
+   * - owner null/expired   → takeover: CAS put with the row's version;
+   *   a lost race re-reads and re-evaluates instead of throwing
+   *
+   * `claim_epoch` increments per successful (re)claim — durable evidence
+   * of ownership handoffs. A crashed owner's APPLYING row is claimed by
+   * the next writer whose tick discovers it once `lease_expires_at` has
+   * passed — bounded takeover, no permanent APPLYING.
+   */
+  claimExercise(
+    approvalId: string,
+    ownerId: string,
+    now?: string,
+    leaseMs = 60_000,
+  ): { row: Record<string, unknown>; owned: boolean; applied: boolean } {
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const row = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
+      if (!row) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_APPROVAL_EXERCISE_MISSING",
+          approvalId,
+        );
+      }
+      if (String(row.state ?? "APPLIED") === "APPLIED") {
+        return { row, owned: false, applied: true };
+      }
+      const at = now ?? utcnow();
+      const lease = String(row.lease_expires_at ?? "");
+      const active = lease !== "" && lease > at;
+      const owner = String(row.owner_id ?? "");
+      if (owner === ownerId && active) {
+        // Same owner renewing its lease — CAS only to extend the window.
+        const renewed = {
+          ...row,
+          claimed_at: at,
+          lease_expires_at: new Date(Date.parse(at) + leaseMs).toISOString(),
+        };
+        try {
+          const saved = this.store.put(
+            APPROVAL_EXERCISE_ENTITY,
+            exerciseId,
+            renewed,
+            Number(row.version),
+          );
+          return { row: saved, owned: true, applied: false };
+        } catch (error) {
+          if (error instanceof IntegrityError) continue;
+          throw error;
+        }
+      }
+      if (active && owner !== "") {
+        return { row, owned: false, applied: false }; // live other owner
+      }
+      // Unowned or stale owner — CAS takeover.
+      const next = {
+        ...row,
+        owner_id: ownerId,
+        claim_epoch: Number(row.claim_epoch ?? 0) + 1,
+        claimed_at: at,
+        lease_expires_at: new Date(Date.parse(at) + leaseMs).toISOString(),
+      };
+      try {
+        const saved = this.store.put(
+          APPROVAL_EXERCISE_ENTITY,
+          exerciseId,
+          next,
+          Number(row.version),
+        );
+        return { row: saved, owned: true, applied: false };
+      } catch (error) {
+        if (error instanceof IntegrityError) continue; // raced — re-read
+        throw error;
+      }
+    }
+    // Contention resolved elsewhere — converge on the canonical row.
+    const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    return { row, owned: false, applied: false };
+  }
+
   /** Lifecycle close: the caller's effect writes are durable. Idempotent
-   * — a re-entering caller after a crash completes the same transition. */
+   * — a re-entering caller after a crash completes the same transition.
+   * CAS-loss safe: a takeover/renew between claim and close can bump the
+   * version; re-read and either converge (someone else already landed
+   * APPLIED) or retry the close — never surface the race as a defect. */
   markExercisedApplied(approvalId: string): Record<string, unknown> {
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
-    const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
-    if (row.state === "APPLIED") return row;
-    row.state = "APPLIED";
-    row.applied_at = utcnow();
-    return this.store.put(
-      APPROVAL_EXERCISE_ENTITY,
-      exerciseId,
-      row,
-      Number(row.version),
-    );
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+      if (String(row.state) === "APPLIED") return row;
+      row.state = "APPLIED";
+      row.applied_at = utcnow();
+      try {
+        return this.store.put(
+          APPROVAL_EXERCISE_ENTITY,
+          exerciseId,
+          row,
+          Number(row.version),
+        );
+      } catch (error) {
+        if (error instanceof IntegrityError) continue;
+        throw error;
+      }
+    }
+    return this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
   }
 
   /** Exercised approval evidence for a mission/task — the §7 bound that

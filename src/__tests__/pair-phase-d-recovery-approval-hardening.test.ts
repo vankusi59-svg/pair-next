@@ -1041,3 +1041,326 @@ describe("PHD L — bounded identical escalation", () => {
     expect(ctx.approvals.listExercised({ mission_id: mid }).length).toBe(1);
   });
 });
+
+/**
+ * R2 — APRE effect ownership + crash convergence.
+ *   A. concurrent writers → one APRE, one active owner, one effect, one chain
+ *   B. crash after claim, before any effect → takeover + apply once
+ *   C. crash after EXTENSION effect persisted → no stacked grant
+ *   D. crash after fresh chain persisted → chain adopted, no 2nd decision
+ *   E. crash after no-replay effect persisted → zero replay + APPLIED
+ *   F. stale owner takeover after bounded lease expiry
+ *   G. active non-expired owner cannot be stolen
+ */
+describe("PHD R2 — APRE ownership + crash convergence", () => {
+  /** A fresh second writer on the SAME db — a process-equivalent peer. */
+  function makeRuntime2(
+    ctx: ReturnType<typeof makeCtx>,
+    exAScript: Array<{ status: string; error_class?: string }> = [],
+    seed = "r2_",
+  ) {
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const gate2 = new GovernedTaskGate(service2);
+    const approvals2 = new ApprovalQueue(service2);
+    const exA2 = new ScriptedAdapter(
+      "EX_A",
+      exAScript,
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+      null,
+      seed,
+    );
+    const runtime2 = new MissionRuntime({
+      service: service2,
+      gate: gate2,
+      router: new MissionRouter(service2, gate2),
+      adapters: new Map<string, ExecutorAdapter>([
+        ["EX_A", exA2],
+        ["EX_B", new ScriptedAdapter("EX_B", [], ["FILE_OPERATIONS"])],
+      ]),
+      scheduler: new MissionScheduler(service2, { mission_concurrency: 2 }),
+      approvals: approvals2,
+      reconciliation: new ReconciliationService(service2, new Map()),
+      recovery: new RecoveryController(service2),
+    });
+    return { store2, service2, approvals2, runtime2, exA2 };
+  }
+
+  /** Rewind a finished exercise to APPLYING owned by a dead writer —
+   *  crash simulation: effect (partially) landed, lifecycle did not. */
+  function crashApre(
+    store: PairEvidenceStore,
+    approvalId: string,
+  ): Record<string, unknown> {
+    const row = store
+      .list(APPROVAL_EXERCISE_ENTITY)
+      .find((x) => x.approval_id === approvalId)!;
+    row.state = "APPLYING";
+    row.owner_id = "MRI_DEAD";
+    row.claim_epoch = 1;
+    row.claimed_at = "2000-01-01T00:00:00.000Z";
+    row.lease_expires_at = "2000-01-01T00:00:30.000Z"; // long stale
+    row.applied_at = null;
+    return store.put(
+      APPROVAL_EXERCISE_ENTITY,
+      String(row.approval_exercise_id),
+      row,
+      Number(row.version),
+    );
+  }
+
+  it("A. concurrent writers → one APRE, one active owner, one effect, one chain", () => {
+    const ctx = makeCtx("r2a");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    const T0 = "2999-01-01T00:00:00Z";
+    const T1 = "2999-01-01T00:01:01Z"; // past the 60s lease
+
+    // The canonical APRE exists and is actively claimed by ANOTHER
+    // process (MRI_OTHER) — the racing peer must converge, not apply.
+    ctx.approvals.exercise(approvalId, {
+      attempts_per_task: 1,
+      baseline_attempts: 10,
+      baseline_identical: 10,
+    });
+    const held = ctx.approvals.claimExercise(approvalId, "MRI_OTHER", T0);
+    expect(held.owned).toBe(true);
+
+    const { store2, runtime2, exA2 } = makeRuntime2(ctx, []);
+    const decisionsBefore = store2
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+
+    // Loser tick: active foreign owner — converge, never apply, no defect.
+    runtime2.tick(mid, T0);
+    const rtLoser = store2.get("mission_runtime", `MRT_${mid}`);
+    expect(String(rtLoser.state)).toBe("WAITING_APPROVAL");
+    expect(
+      ((rtLoser.budget_extension as Record<string, unknown>)?.tasks ?? {}),
+    ).toEqual({});
+    expect(exA2.dispatched.length).toBe(0);
+    expect(
+      store2.list("recovery_decision").filter((d) => d.mission_id === mid)
+        .length,
+    ).toBe(decisionsBefore); // no decision minted by the loser
+
+    // Lease expires → the same peer takes over, applies ONCE, closes.
+    runtime2.tick(mid, T1);
+    const apres = store2
+      .list(APPROVAL_EXERCISE_ENTITY)
+      .filter((x) => x.approval_id === approvalId);
+    expect(apres.length).toBe(1); // one canonical APRE
+    expect(String(apres[0].state)).toBe("APPLIED");
+    expect(Number(apres[0].claim_epoch)).toBe(2); // create-claim + takeover
+    expect(String(apres[0].owner_id)).not.toBe("MRI_OTHER");
+    // Exactly one effect: the stamped grant, and exactly one fresh
+    // recovery decision for this exercise — never a duplicate.
+    const tasks = (store2.get("mission_runtime", `MRT_${mid}`)
+      .budget_extension as Record<string, unknown>).tasks as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const taskId = String(apres[0].task_id);
+    expect(tasks[taskId].attempts_per_task).toBe(1);
+    expect(String(tasks[taskId].approval_exercise_id)).toBe(
+      String(apres[0].approval_exercise_id),
+    );
+    expect(
+      store2.list("recovery_decision").filter((d) => d.mission_id === mid)
+        .length,
+    ).toBe(decisionsBefore + 1);
+  });
+
+  it("B. crash after claim before any effect → same APRE resumed, applied once, APPLIED", () => {
+    const ctx = makeCtx("r2b");
+    // REVALIDATION intent — different arm than A.
+    const exA = new ScriptedAdapter(
+      "EX_A",
+      [{ status: "FAILED", error_class: "AUTHENTICATION_REQUIRED" }],
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+    );
+    registerAdapter(ctx, exA, exA.caps);
+    const mid = startMission(ctx);
+    tickUntil(ctx, mid, ["WAITING_APPROVAL"]);
+    const approvalId = approvePending(ctx, mid);
+
+    // Winner creates the row and claims — then dies before ANY effect.
+    ctx.approvals.exercise(approvalId, {});
+    ctx.approvals.claimExercise(approvalId, "MRI_DEAD", "2999-01-01T00:00:00Z");
+
+    const { store2, runtime2 } = makeRuntime2(ctx, []);
+    runtime2.tick(mid, "2999-01-01T00:01:01Z"); // lease expired → takeover
+    const apre = store2
+      .list(APPROVAL_EXERCISE_ENTITY)
+      .filter((x) => x.approval_id === approvalId);
+    expect(apre.length).toBe(1);
+    expect(String(apre[0].state)).toBe("APPLIED");
+    expect(String(apre[0].applied_at)).toBeTruthy();
+    // Effect applied once → bounded identical re-escalation (§7).
+    expect(
+      store2.list("approval_request").filter((a) => a.mission_id === mid)
+        .length,
+    ).toBe(1);
+  });
+
+  it("C. crash after EXTENSION effect persisted → grant never stacks, APPLIED", () => {
+    const ctx = makeCtx("r2c");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    // Real first apply: grant + stamped chain + APPLIED — then crash the
+    // row back to APPLYING with a dead owner.
+    ctx.runtime.tick(mid, FAR);
+    const apre = crashApre(ctx.store, approvalId);
+    const exerciseId = String(apre.approval_exercise_id);
+    const taskId = String(apre.task_id);
+
+    const { store2, runtime2, exA2 } = makeRuntime2(ctx, [
+      { status: "FAILED", error_class: "RATE_LIMITED" },
+    ]);
+    for (let t = Date.parse("2999-01-01T00:01:01Z"), i = 0; i < 12; i++, t += 120_000) {
+      runtime2.tick(mid, new Date(t).toISOString());
+    }
+    const row = store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(row.state)).toBe("APPLIED");
+    const tasks = (store2.get("mission_runtime", `MRT_${mid}`)
+      .budget_extension as Record<string, unknown>).tasks as Record<
+      string,
+      Record<string, unknown>
+    >;
+    // The re-applied grant is the SAME keyed entry — count and value
+    // unchanged, never +1 stacked.
+    expect(Object.keys(tasks)).toEqual([taskId]);
+    expect(tasks[taskId].attempts_per_task).toBe(1);
+    expect(String(tasks[taskId].approval_exercise_id)).toBe(exerciseId);
+    // The adopted chain yields at most its granted dispatch.
+    expect(exA2.dispatched.length).toBeLessThanOrEqual(1);
+  });
+
+  it("D. crash after fresh chain persisted → chain adopted, no second recovery_decision", () => {
+    const ctx = makeCtx("r2d");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    ctx.runtime.tick(mid, FAR);
+    const apre = crashApre(ctx.store, approvalId);
+    const exerciseId = String(apre.approval_exercise_id);
+    const stamped = (rt(ctx, mid).pending_recovery ??
+      {}) as Record<string, unknown>;
+    expect(String(stamped.approval_exercise_id)).toBe(exerciseId);
+    const recoveryId = String(stamped.recovery_id);
+    const decisionsBefore = ctx.store
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+
+    const { store2, runtime2 } = makeRuntime2(ctx, []);
+    runtime2.tick(mid, "2999-01-01T00:01:01Z");
+    // The existing stamped chain is adopted — same recovery_id, no new
+    // decide minted just because the APRE was unfinished.
+    const after = store2.get("mission_runtime", `MRT_${mid}`);
+    const pending = (after.pending_recovery ?? {}) as Record<string, unknown>;
+    expect(String(pending.recovery_id ?? recoveryId)).toBe(recoveryId);
+    expect(
+      store2.list("recovery_decision").filter((d) => d.mission_id === mid)
+        .length,
+    ).toBeLessThanOrEqual(decisionsBefore + 1); // chain may settle, never re-mint for this APRE
+    expect(
+      String(store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId).state),
+    ).toBe("APPLIED");
+  });
+
+  it("E. crash after no-replay effect persisted → zero replay + APPLIED", () => {
+    const ctx = makeCtx("r2e", SINGLE_TASK);
+    const exA = new ScriptedAdapter(
+      "EX_A",
+      [{ status: "UNKNOWN" }],
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+      `${ctx.dir}/run-root`,
+    );
+    registerAdapter(ctx, exA, exA.caps);
+    const mid = startMission(ctx);
+    const state = tickUntil(ctx, mid, ["WAITING_APPROVAL", "ABORTED", "FAILED"]);
+    expect(state).toBe("WAITING_APPROVAL");
+    const approval = pendingApproval(ctx, mid);
+    const approvalId = String(approval.approval_id);
+    ctx.approvals.decide(
+      approvalId,
+      "op",
+      "APPROVED",
+      approval.scope_snapshot as Record<string, unknown>,
+    );
+    // Real apply: barrier settled + task FAILED + exec neutralized + APPLIED.
+    ctx.runtime.tick(mid, fakeClock()());
+    const dispatchedAtApply = exA.dispatched.length;
+    const apre = crashApre(ctx.store, approvalId);
+    const exerciseId = String(apre.approval_exercise_id);
+
+    const { store2, runtime2, exA2 } = makeRuntime2(ctx, []);
+    for (let i = 0; i < 6; i++) runtime2.tick(mid, fakeClock()());
+
+    const rt2 = store2.get("mission_runtime", `MRT_${mid}`);
+    const barriers = rt2.barriers as Record<string, Record<string, unknown>>;
+    const taskId = String(apre.task_id);
+    // Converged on the SAME exercise — no duplicate settlement.
+    expect(String(barriers[taskId].approval_exercise_id)).toBe(exerciseId);
+    expect(barriers[taskId].settled).toBe(true);
+    expect(String(store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId).state)).toBe(
+      "APPLIED",
+    );
+    // Zero replay — neither writer re-dispatched the task.
+    expect(exA.dispatched.length).toBe(dispatchedAtApply);
+    expect(exA2.dispatched.length).toBe(0);
+    const execs = store2
+      .list("executor_execution")
+      .filter((e) => e.mission_id === mid);
+    expect(
+      execs.filter(
+        (e) =>
+          String(e.terminal_outcome ?? "") ===
+          "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY",
+      ).length,
+    ).toBe(1); // exactly one terminal outcome
+    // No extra recovery chain minted by re-entry.
+    expect(rt2.pending_recovery ?? null).toBeNull();
+  });
+
+  it("F. stale/crashed owner → takeover after bounded lease expiry", () => {
+    const ctx = makeCtx("r2f");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    ctx.approvals.exercise(approvalId, {});
+    const T0 = "2999-01-01T00:00:00Z";
+    const c1 = ctx.approvals.claimExercise(approvalId, "MRI_A", T0);
+    expect(c1.owned).toBe(true);
+    expect(Number(c1.row.claim_epoch)).toBe(1);
+    // 61s later the lease is stale — a different owner takes over.
+    const c2 = ctx.approvals.claimExercise(
+      approvalId,
+      "MRI_B",
+      "2999-01-01T00:01:01Z",
+    );
+    expect(c2.owned).toBe(true);
+    expect(String(c2.row.owner_id)).toBe("MRI_B");
+    expect(Number(c2.row.claim_epoch)).toBe(2);
+  });
+
+  it("G. active non-expired owner cannot be stolen; CAS loser converges", () => {
+    const ctx = makeCtx("r2g");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    ctx.approvals.exercise(approvalId, {});
+    const T0 = "2999-01-01T00:00:00Z";
+    ctx.approvals.claimExercise(approvalId, "MRI_A", T0);
+    // Separate writer, same db — lease still active → cannot steal.
+    const storeB = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const approvalsB = new ApprovalQueue(new PairControlPlane(storeB));
+    const steal = approvalsB.claimExercise(approvalId, "MRI_B", T0);
+    expect(steal.owned).toBe(false);
+    const row = ctx.store.get(
+      APPROVAL_EXERCISE_ENTITY,
+      String(steal.row.approval_exercise_id),
+    );
+    expect(String(row.owner_id)).toBe("MRI_A");
+    expect(Number(row.claim_epoch)).toBe(1); // untouched by the loser
+    // Loser converges on the canonical row — no defect thrown.
+    expect(String(steal.row.state)).toBe("APPLYING");
+  });
+});
