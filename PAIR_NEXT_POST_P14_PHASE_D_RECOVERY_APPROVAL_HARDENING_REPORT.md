@@ -121,3 +121,96 @@ restart → grant NOT re-applied (exercise still 1, no second approval row)
 `PAIR_NEXT_PHASE_D_RECOVERY_APPROVAL_HARDENING_PENDING_INDEPENDENT_AUDIT`
 
 **STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R1 — Taxonomy + Exact-Once Approval Exercise + Scope Authority Closure
+
+Remediation of 6 findings on HEAD `fb17812c4ff88435a8216a979ae301cb8850e03c`. Same PR #26 / same branch. No redesign of MissionRouter/RouteSelector/DshModelRouter or the PR #23 recovery architecture.
+
+## R1.1 Corrected DSH failure taxonomy
+
+CLASS_RULES order (authority test = first match wins):
+
+| Code | Class | Why |
+|---|---|---|
+| `FAIL_CLOSED_ROUTE_INFEASIBLE` | `ROUTE_INFEASIBLE` | unchanged (PR #24) |
+| `FAIL_CLOSED_DSH_MODEL_EXHAUSTED` | **`TRANSIENT_TRANSPORT`** | NEW rule placed BEFORE the DSH authority blanket. Pool exhaustion aggregates *safe pre-dispatch availability* failures (provider down / model unavailable / credential missing) across every configured candidate — it is an availability outcome, not governance. It keeps recovery semantics (RETRY_SAME_ROUTE → RE_ROUTE → RECONCILIATION_REQUIRED), never an automatic ABORT merely because the code carries the `FAIL_CLOSED_DSH_` prefix. |
+| `AUTHORITY_REJECTED`, `FAIL_CLOSED_DSH_*` (all others), `FAIL_CLOSED_MODEL_ROLE`, `FAIL_CLOSED_MODEL_IDENTITY` | `POLICY_DENIAL` | unchanged — role violations, planner overlap, model-identity drift, invalid model binding, executor/provider authority invalid stay fail-closed bounded ABORT |
+
+Test J split: J1 asserts the authority set → POLICY_DENIAL; J2 asserts `FAIL_CLOSED_DSH_MODEL_EXHAUSTED` → TRANSIENT_TRANSPORT via both `error_code` and `result.error.code`.
+
+## R1.2 APRE lifecycle — deterministic, atomic, resumable
+
+`approval_exercise` row (entity `approval_exercise`, deterministic id `APRE_<approval suffix>`):
+
+```
+RESERVED  →  APPLYING            →  APPLIED
+(exercise() version-0 INSERT)      (markExercisedApplied, last write)
+fields: approval_exercise_id, approval_id, approval_type, requested_action,
+        intent, mission_id, task_id, scope_digest, operator_id,
+        effect (deterministic plan), state, exercised_at, applied_at, version
+```
+
+- **Concurrency**: two writers on *separate store connections* race the same version-0 INSERT → `ON CONFLICT DO NOTHING` → the loser catches `FAIL_CLOSED_VERSION_CONFLICT:created-elsewhere`, re-reads the winner's row, returns `{row: winner, created: false}` — a conflict is never surfaced as a runtime defect (test O: real second `PairEvidenceStore` + `ApprovalQueue` on the same db, loser's stale read forced via one-shot `tryGet` miss).
+- **Effect plan persisted once**: `exerciseApprovedRecovery` computes a deterministic plan (extension grant + `baseline_attempts` + `baseline_identical`) and passes it to `exercise(approvalId, plan)`; a resumer reuses `row.effect` verbatim — baselines can never drift between crash and restart.
+- **Crash window closed**: if the process dies with `state=APPLYING` (APRE durable, effect incomplete), the next `exercise()` call returns the same row and the runtime **re-applies the full idempotent effect** — it does NOT skip because APRE exists. `state=APPLIED` is written only after every effect write landed (`markExercisedApplied` is the final statement of `exerciseApprovedRecovery`).
+- **REVALIDATION re-entry bound**: the fresh post-exercise chain is stamped `pending_recovery.approval_exercise_id = <APRE id>`; `resumeExercisedChain` returns early when the stamped chain already exists — a restart/re-entry can never mint a second fresh recovery decision for the same exercise (tests P1, P2).
+
+## R1.3 Scope authority restored
+
+`ApprovalQueue.decide()` REQUIRES caller-presented scope:
+
+| Presented | Result |
+|---|---|
+| `scope == null` | throws `FAIL_CLOSED_APPROVAL_SCOPE_REQUIRED` — stored `scope_snapshot` is NEVER substituted into the authority check |
+| mutated scope | throws `FAIL_CLOSED_APPROVAL_SCOPE_MISMATCH` (digest ≠ bound `scope_digest`) |
+| canonical scope | PASS |
+
+`scope_snapshot` stays persisted; the API/UI projection (`approvals()` → `scope` alias, `GET /api/approvals`, `POST /api/approvals/:id/{approve,deny}` body, telegram bridge `a.scope`) keeps echoing the exact canonical scope — operator clients fetch it and present it back; they can never silently decide without it. Test M covers all three arms.
+
+## R1.4 Canonical-time expiry
+
+`checkPendingApproval(missionId, now)` now calls `expireSweep(now)` — supplied runtime/test time governs expiry, wall clock is irrelevant. Test N: `expires_at=2999-06-01` (future vs wall clock ~2026) + `tick(mid, "2999-07-01")` → EXPIRED + ABORTED — impossible under the old bare `expireSweep()`.
+
+## R1.5 SUPERSEDED relink — exact equivalent only
+
+Replacement candidates must ALL match the superseded approval:
+
+`mission_id` (listPending filter) ∧ `task_id` ∧ `approval_type` ∧ `requested_action` ∧ `failure_signature` (from `intent` or `scope_snapshot`)
+
+When several match, the candidate carrying the same `recovery_decision_id` wins; a single unambiguous equivalent is adopted; zero → `abortMission("approval_superseded")` (bounded terminal). Task A's approval can never relink to task B's (test Q1 adversarial: foreign-task pending stays PENDING, mission aborts); an equivalent re-minted after the supersede IS adopted (Q2).
+
+## R1.6 Regression — no mandate-scope regressions
+
+| Check | Result |
+|---|---|
+| Focused suite (updated) | **20/20** — J1/J2 taxonomy, M scope, N canonical expiry, O real-concurrency exercise, P1 crash-after-APRE resume, P2 restart chain dedupe, Q1/Q2 superseded adversarial |
+| PR #23 recovery closure (`pair-live-ops-recovery-closure`) | pass |
+| PR #24 route capability (`pair-route-capability-authority`) | pass |
+| Phase C model routing (`pair-phase-c-dsh-model-routing`) | 51/51 |
+| Phase B (`pair-phase-b`) | pass |
+| **Full suite** | **2546 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures (dsh/codex binaries absent); baseline `fb17812` 2538/2/15 → +8 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+### Harness note (not a product change)
+
+`ScriptedAdapter` gained an `idSeed` — a restarted adapter process mints fresh execution ids (real adapters mint UUIDs). Without it, restart tests collided on durable `executor_execution` ids and the gate correctly failed closed (`FAIL_CLOSED_VERSION_CONFLICT` → INTERNAL_RUNTIME_DEFECT). C/P1/P2 restart adapters use seeds `r1_`/`r2_`.
+
+### Preserved (verified by the suites above)
+
+3 intents · task-scoped extension · chain-stomp fix · no-replay UNKNOWN closure · barrier settlement · terminal_outcome · exercised-equivalent bounded chain · PR #23 boundary · PR #24 authority · Phase C routing.
+
+## Changed files (R1)
+
+- `src/pair/approval-queue.ts` — `exercise(id, effect?)` APPLYING lifecycle + loser-adopts-winner, `markExercisedApplied`, scope-required `decide()`
+- `src/pair/mission-runtime.ts` — `exerciseApprovedRecovery` rewrite (effect plan, APPLYING resume, `markExercisedApplied`), `exerciseEffectPlan`, `resumeExercisedChain` stamp, `expireSweep(now)`, SUPERSEDED exact-equivalent relink
+- `src/pair/recovery-controller.ts` — `FAIL_CLOSED_DSH_MODEL_EXHAUSTED → TRANSIENT_TRANSPORT` rule before the DSH authority blanket
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — 20 tests (+8)
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R1_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**

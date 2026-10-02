@@ -1629,13 +1629,38 @@ export class MissionRuntime {
    */
   private exerciseApprovedRecovery(missionId: string, approvalId: string, now?: string): void {
     const approval = this.deps.approvals.get(approvalId);
-    const { row: exercise } = this.deps.approvals.exercise(approvalId);
     const intent = String(
       (approval.intent as Record<string, unknown> | null)?.kind ??
         approval.requested_action,
     );
     const taskId = String(approval.task_id ?? "");
+    // R1 — the effect plan is deterministic and persisted on the APRE row
+    // by the winning writer; a resumer (or a racing loser) reuses the
+    // stored plan verbatim instead of recomputing drift-prone baselines.
+    const effectPlan = this.exerciseEffectPlan(approval, intent, taskId);
+    const { row: exercise } = this.deps.approvals.exercise(
+      approvalId,
+      effectPlan,
+    );
+    const effect = (exercise.effect ?? effectPlan) as Record<string, unknown>;
+    const exerciseId = String(exercise.approval_exercise_id);
     const rt = this.runtimeEntity(missionId);
+    if (String(exercise.state ?? "APPLIED") === "APPLIED") {
+      // The effect already landed — converge bookkeeping only. Reaching
+      // here with state APPLIED means a crash split the APPLIED write
+      // from the runtime bookkeeping, never that the effect is missing.
+      rt.pending_approval_id = null;
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
+      );
+      if (String(rt.state) === "WAITING_APPROVAL") {
+        this.transitionRuntime(missionId, "RUNNING", "approval_already_exercised");
+      }
+      return;
+    }
     rt.pending_approval_id = null;
 
     switch (intent) {
@@ -1644,39 +1669,14 @@ export class MissionRuntime {
         // Task-scoped attempt grant — assignment keyed by the task the
         // approval bound, with the exercise id as provenance. Replays
         // write the same value, so the grant can never stack twice.
-        const intentRow =
-          (approval.intent as Record<string, unknown> | null) ?? {};
-        const grantAmount =
-          Number(
-            ((intentRow.grant as Record<string, unknown> | undefined) ?? {})
-              .attempts_per_task,
-          ) || 1;
         const ext = (rt.budget_extension as Record<string, unknown>) ?? {};
         const tasks =
           (ext.tasks as Record<string, Record<string, unknown>>) ?? {};
-        // Anchor the grant to attempts consumed so far: the escalation
-        // decision that minted this approval is itself a recovery_attempt,
-        // so a relative ceiling would never yield another dispatch.
-        const taskAttempts = this.store
-          .list("recovery_attempt")
-          .filter((a) => String(a.task_id) === taskId);
-        const baselineAttempts = taskAttempts.length;
-        // The grant also re-arms the consecutive-identical ceiling for the
-        // exact signature being extended — otherwise the second guard eats
-        // the granted attempt before any dispatch.
-        const grantSignature = String(intentRow.failure_signature ?? "");
-        let baselineIdentical = 0;
-        for (const a of [...taskAttempts].sort(
-          (x, y) => Number(y.attempt_no ?? 0) - Number(x.attempt_no ?? 0),
-        )) {
-          if (String(a.failure_signature ?? "") !== grantSignature) break;
-          baselineIdentical += 1;
-        }
         tasks[taskId] = {
-          attempts_per_task: grantAmount,
-          baseline_attempts: baselineAttempts,
-          baseline_identical: baselineIdentical,
-          approval_exercise_id: String(exercise.approval_exercise_id),
+          attempts_per_task: Number(effect.attempts_per_task ?? 1),
+          baseline_attempts: Number(effect.baseline_attempts ?? 0),
+          baseline_identical: Number(effect.baseline_identical ?? 0),
+          approval_exercise_id: exerciseId,
         };
         rt.budget_extension = { ...ext, tasks };
         this.store.put(
@@ -1694,21 +1694,7 @@ export class MissionRuntime {
         // replaying the stale pending action would just re-mint the same
         // approval (bounded abort). The new decision replaces the stale
         // pending_recovery; stale scheduled actions are swept first.
-        const stale = rt.pending_recovery as Record<string, unknown> | null;
-        this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
-        if (stale) {
-          this.startRecovery(
-            missionId,
-            taskId || String(stale.task_id),
-            stale.execution_id ? String(stale.execution_id) : null,
-            stale.failure_class as ReturnType<typeof classifyFailure>,
-            now,
-            undefined,
-            stale.infeasible_actions as
-              | Array<{ action: RecoveryAction; reason: string }>
-              | undefined,
-          );
-        }
+        this.resumeExercisedChain(missionId, taskId, exerciseId, now);
         break;
       }
       case "RECOVERY_OPERATOR_REVALIDATION": {
@@ -1727,21 +1713,7 @@ export class MissionRuntime {
           "RECOVERING",
           "approval_exercised_revalidation",
         );
-        const stale = rt.pending_recovery as Record<string, unknown> | null;
-        this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
-        if (stale) {
-          this.startRecovery(
-            missionId,
-            taskId || String(stale.task_id),
-            stale.execution_id ? String(stale.execution_id) : null,
-            stale.failure_class as ReturnType<typeof classifyFailure>,
-            now,
-            undefined,
-            stale.infeasible_actions as
-              | Array<{ action: RecoveryAction; reason: string }>
-              | undefined,
-          );
-        }
+        this.resumeExercisedChain(missionId, taskId, exerciseId, now);
         break;
       }
       case "ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY": {
@@ -1807,6 +1779,101 @@ export class MissionRuntime {
         );
         this.transitionRuntime(missionId, "RUNNING", "approval_granted_resume");
       }
+    }
+    // Lifecycle close — the whole effect is durable. A crash anywhere
+    // above leaves APPLYING; the next exercise() call re-enters and
+    // re-applies the same idempotent writes until this line runs.
+    this.deps.approvals.markExercisedApplied(approvalId);
+  }
+
+  /** Deterministic effect plan for an approval exercise — persisted on
+   *  the APRE row by the winner so a crash-restart resumes the SAME plan
+   *  instead of recomputing baselines that have since drifted. */
+  private exerciseEffectPlan(
+    approval: Record<string, unknown>,
+    intent: string,
+    taskId: string,
+  ): Record<string, unknown> {
+    if (
+      intent === "RECOVERY_TASK_ATTEMPT_EXTENSION" ||
+      intent === LEGACY_RECOVERY_BUDGET_OVERRIDE
+    ) {
+      const intentRow =
+        (approval.intent as Record<string, unknown> | null) ?? {};
+      const grant =
+        Number(
+          ((intentRow.grant as Record<string, unknown> | undefined) ?? {})
+            .attempts_per_task,
+        ) || 1;
+      // Anchor the grant to attempts consumed so far: the escalation
+      // decision that minted this approval is itself a recovery_attempt,
+      // so a relative ceiling would never yield another dispatch.
+      const taskAttempts = this.store
+        .list("recovery_attempt")
+        .filter((a) => String(a.task_id) === taskId);
+      // The grant also re-arms the consecutive-identical ceiling for the
+      // exact signature being extended — otherwise the second guard eats
+      // the granted attempt before any dispatch.
+      const grantSignature = String(intentRow.failure_signature ?? "");
+      let identical = 0;
+      for (const a of [...taskAttempts].sort(
+        (x, y) => Number(y.attempt_no ?? 0) - Number(x.attempt_no ?? 0),
+      )) {
+        if (String(a.failure_signature ?? "") !== grantSignature) break;
+        identical += 1;
+      }
+      return {
+        attempts_per_task: grant,
+        baseline_attempts: taskAttempts.length,
+        baseline_identical: identical,
+      };
+    }
+    return {};
+  }
+
+  /** After an exercised approval, replace the stale pending chain with a
+   *  fresh governed decide() — stamped with the exercise id so a
+   *  restart/re-entry re-finds the already-minted chain and NEVER mints a
+   *  second decision for the same exercise (R1: REVALIDATION re-entry
+   *  bound). */
+  private resumeExercisedChain(
+    missionId: string,
+    taskId: string,
+    exerciseId: string,
+    now?: string,
+  ): void {
+    const rt = this.runtimeEntity(missionId);
+    const pending = rt.pending_recovery as Record<string, unknown> | null;
+    if (
+      pending &&
+      String(pending.approval_exercise_id ?? "") === exerciseId
+    ) {
+      return; // chain for this exercise already minted — resume it
+    }
+    const stale = pending;
+    this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
+    if (!stale) return;
+    this.startRecovery(
+      missionId,
+      taskId || String(stale.task_id),
+      stale.execution_id ? String(stale.execution_id) : null,
+      stale.failure_class as ReturnType<typeof classifyFailure>,
+      now,
+      undefined,
+      stale.infeasible_actions as
+        | Array<{ action: RecoveryAction; reason: string }>
+        | undefined,
+    );
+    const rtAfter = this.runtimeEntity(missionId);
+    const fresh = rtAfter.pending_recovery as Record<string, unknown> | null;
+    if (fresh) {
+      fresh.approval_exercise_id = exerciseId;
+      this.store.put(
+        "mission_runtime",
+        String(rtAfter.mission_runtime_id),
+        rtAfter,
+        Number(rtAfter.version),
+      );
     }
   }
 
@@ -1971,7 +2038,8 @@ export class MissionRuntime {
    * an already-dead request.
    */
   private checkPendingApproval(missionId: string, now?: string): void {
-    this.deps.approvals.expireSweep();
+    // Canonical runtime time drives expiry — never the wall clock.
+    this.deps.approvals.expireSweep(now);
     const rt = this.runtimeEntity(missionId);
     const approvalId = rt.pending_approval_id as string | null;
     if (!approvalId) {
@@ -1982,11 +2050,49 @@ export class MissionRuntime {
     const status = String(approval.status);
     if (status === "PENDING") return; // still waiting
     if (status === "SUPERSEDED") {
+      // R1 — relink only to an approval EQUIVALENT to the superseded
+      // chain: same mission + task + type + action + failure signature.
+      // Prefer a candidate carrying the same recovery-decision identity
+      // when several match. Never relink across tasks or intents; if no
+      // exact equivalent survives, the mission goes bounded terminal.
+      const sigOf = (a: Record<string, unknown>) =>
+        String(
+          (a.intent as Record<string, unknown> | null)?.failure_signature ??
+            (a.scope_snapshot as Record<string, unknown> | null)
+              ?.failure_signature ??
+            "",
+        );
+      const wantSig = sigOf(approval);
+      const wantDecision = String(
+        (approval.intent as Record<string, unknown> | null)
+          ?.recovery_decision_id ??
+          (approval.scope_snapshot as Record<string, unknown> | null)
+            ?.recovery_decision_id ??
+          "",
+      );
+      const equivalents = this.deps.approvals
+        .listPending(missionId)
+        .filter(
+          (a) =>
+            a.approval_type === approval.approval_type &&
+            a.requested_action === approval.requested_action &&
+            String(a.task_id ?? "") === String(approval.task_id ?? "") &&
+            sigOf(a) === wantSig,
+        );
       const replacement =
-        this.deps.approvals
-          .listPending(missionId)
-          .find((a) => a.approval_type === "RECOVERY_APPROVAL") ?? null;
-      rt.pending_approval_id = replacement ? String(replacement.approval_id) : null;
+        equivalents.find(
+          (a) =>
+            String(
+              (a.intent as Record<string, unknown> | null)
+                ?.recovery_decision_id ??
+                (a.scope_snapshot as Record<string, unknown> | null)
+                  ?.recovery_decision_id ??
+                "",
+            ) === wantDecision,
+        ) ?? (equivalents.length === 1 ? equivalents[0] : null);
+      rt.pending_approval_id = replacement
+        ? String(replacement.approval_id)
+        : null;
       this.store.put(
         "mission_runtime",
         String(rt.mission_runtime_id),

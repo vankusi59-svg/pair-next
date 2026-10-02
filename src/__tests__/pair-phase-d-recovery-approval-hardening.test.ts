@@ -56,6 +56,10 @@ class ScriptedAdapter implements ExecutorAdapter {
     script: Array<{ status: string; error_class?: string }> = [],
     caps: string[] = ["FILE_OPERATIONS"],
     private readonly runRoot: string | null = null,
+    /** Restart-unique execution-id seed — a restarted real adapter mints
+     *  fresh ids (UUID); the harness counter would collide with durable
+     *  executor_execution rows from the pre-restart process. */
+    private readonly idSeed = "",
   ) {
     this.executor_id = id;
     this.script = [...script];
@@ -77,7 +81,7 @@ class ScriptedAdapter implements ExecutorAdapter {
     const step = this.script.length
       ? this.script.shift()!
       : { status: "FAILED", error_class: "RATE_LIMITED" };
-    const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
+    const eid = `EXEC_${this.executor_id}_${this.idSeed}${this.dispatched.length}`;
     this.dispatched.push(eid);
     this.collected[eid] =
       step.status === "FAILED"
@@ -420,10 +424,13 @@ describe("PHD B/C/D — exactly-once exercise", () => {
     const recon2 = new ReconciliationService(service2, new Map());
     const approvals2 = new ApprovalQueue(service2);
     const scheduler2 = new MissionScheduler(service2, { mission_concurrency: 2 });
-    const exA2 = new ScriptedAdapter("EX_A", [{ status: "COMPLETED" }], [
-      "ONLY_EX_A",
-      "FILE_OPERATIONS",
-    ]);
+    const exA2 = new ScriptedAdapter(
+      "EX_A",
+      [{ status: "COMPLETED" }],
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+      null,
+      "r2_",
+    );
     const adapters2 = new Map<string, ExecutorAdapter>([
       ["EX_A", exA2],
       ["EX_B", new ScriptedAdapter("EX_B", [], ["FILE_OPERATIONS"])],
@@ -618,7 +625,7 @@ describe("PHD H/I — UNKNOWN_SIDE_EFFECT_STATE closure", () => {
 });
 
 describe("PHD J/K — failure taxonomy", () => {
-  it("J. Phase C DSH authority failures → POLICY_DENIAL, never availability", () => {
+  it("J1. Phase C DSH authority failures → POLICY_DENIAL, never availability", () => {
     for (const code of [
       "AUTHORITY_REJECTED",
       "FAIL_CLOSED_DSH_MODEL_BINDING",
@@ -626,7 +633,7 @@ describe("PHD J/K — failure taxonomy", () => {
       "FAIL_CLOSED_DSH_PROVIDER_INELIGIBLE",
       "FAIL_CLOSED_DSH_EXECUTOR_INELIGIBLE",
       "FAIL_CLOSED_DSH_PLANNER_OVERLAP",
-      "FAIL_CLOSED_DSH_MODEL_EXHAUSTED",
+      "FAIL_CLOSED_DSH_MODEL_ROLE_VIOLATION",
     ]) {
       expect(classifyFailure({ error_code: code })).toBe("POLICY_DENIAL");
       expect(
@@ -637,10 +644,363 @@ describe("PHD J/K — failure taxonomy", () => {
     }
   });
 
+  it("J2. DSH model-pool exhaustion is availability — NOT a policy abort", () => {
+    // FAIL_CLOSED_DSH_MODEL_EXHAUSTED aggregates safe PRE-DISPATCH
+    // availability failures across the configured pool. It must keep
+    // availability/recovery semantics — the FAIL_CLOSED_DSH_ prefix
+    // alone cannot drag it into POLICY_DENIAL.
+    expect(
+      classifyFailure({ error_code: "FAIL_CLOSED_DSH_MODEL_EXHAUSTED" }),
+    ).toBe("TRANSIENT_TRANSPORT");
+    expect(
+      classifyFailure({
+        result: {
+          error: {
+            code: "FAIL_CLOSED_DSH_MODEL_EXHAUSTED",
+            class: "X",
+            message: "pool exhausted",
+          },
+        },
+      }),
+    ).toBe("TRANSIENT_TRANSPORT");
+  });
+
   it("K. ROUTE_INFEASIBLE classification preserved", () => {
     expect(
       classifyFailure({ error_code: "FAIL_CLOSED_ROUTE_INFEASIBLE" }),
     ).toBe("ROUTE_INFEASIBLE");
+  });
+});
+
+describe("PHD M — scope authority (caller-presented scope required)", () => {
+  it("M1. correct presented scope → PASS; missing scope → FAIL CLOSED; mutated → FAIL CLOSED", () => {
+    const ctx = makeCtx("m");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approval = pendingApproval(ctx, mid);
+    const id = String(approval.approval_id);
+    const scope = approval.scope_snapshot as Record<string, unknown>;
+
+    // Missing scope — the stored scope_snapshot may NOT be substituted.
+    expect(() =>
+      ctx.approvals.decide(id, "op", "APPROVED", undefined),
+    ).toThrow(/FAIL_CLOSED_APPROVAL_SCOPE_REQUIRED/);
+    expect(String(ctx.approvals.get(id).status)).toBe("PENDING");
+
+    // Mutated scope — digest mismatch fails closed.
+    expect(() =>
+      ctx.approvals.decide(id, "op", "APPROVED", {
+        ...(scope as object),
+        injected: true,
+      }),
+    ).toThrow(/FAIL_CLOSED_APPROVAL_SCOPE_MISMATCH/);
+    expect(String(ctx.approvals.get(id).status)).toBe("PENDING");
+
+    // Correct canonical scope echoes exactly what request() bound.
+    ctx.approvals.decide(id, "op", "APPROVED", scope);
+    expect(String(ctx.approvals.get(id).status)).toBe("APPROVED");
+  });
+});
+
+describe("PHD N — canonical-time approval expiry", () => {
+  it("N. supplied runtime `now` expires the approval — wall clock irrelevant", () => {
+    const ctx = makeCtx("n");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approval = pendingApproval(ctx, mid);
+    const id = String(approval.approval_id);
+    // expires_at in the FUTURE relative to wall time (real clock ~2026),
+    // but in the PAST relative to the tick's canonical time — only
+    // expireSweep(now) honoring the supplied `now` can expire it.
+    const row = ctx.approvals.get(id);
+    row.expires_at = "2999-06-01T00:00:00.000Z";
+    ctx.store.put("approval_request", id, row, Number(row.version));
+    ctx.runtime.tick(mid, "2999-07-01T00:00:00Z");
+    expect(String(ctx.approvals.get(id).status)).toBe("EXPIRED");
+    expect(String(rt(ctx, mid).state)).toBe("ABORTED");
+    expect(String(ctx.service.getMission(mid).status)).toBe("FAILED");
+  });
+});
+
+describe("PHD O — concurrent exercise, separate writers", () => {
+  it("O. two store connections race exercise() → one canonical winner, loser adopts", () => {
+    const ctx = makeCtx("o");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+
+    // A second physical connection to the SAME database — a genuine
+    // process-equivalent writer, not a sequential double call.
+    const storeB = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const serviceB = new PairControlPlane(storeB);
+    const approvalsB = new ApprovalQueue(serviceB);
+
+    const first = ctx.approvals.exercise(approvalId, { plan: "winner" });
+    expect(first.created).toBe(true);
+    expect(String(first.row.state)).toBe("APPLYING");
+
+    // Force B's stale pre-read to miss the APRE row → B's version-0 INSERT
+    // hits ON CONFLICT DO NOTHING → IntegrityError → B must re-read and
+    // adopt the canonical winner instead of surfacing a version defect.
+    const origTryGet = storeB.tryGet.bind(storeB);
+    let missedOnce = false;
+    (storeB as unknown as { tryGet: typeof storeB.tryGet }).tryGet = (
+      t: string,
+      id: string,
+    ) => {
+      if (!missedOnce && t === APPROVAL_EXERCISE_ENTITY) {
+        missedOnce = true;
+        return null;
+      }
+      return origTryGet(t, id);
+    };
+    const second = approvalsB.exercise(approvalId, { plan: "loser" });
+    expect(second.created).toBe(false);
+    expect(String(second.row.approval_exercise_id)).toBe(
+      String(first.row.approval_exercise_id),
+    );
+    expect(
+      (second.row.effect as Record<string, unknown>).plan,
+    ).toBe("winner"); // winner's persisted plan adopted, never recomputed
+    expect(ctx.approvals.listExercised({ mission_id: mid }).length).toBe(1);
+  });
+});
+
+describe("PHD P — crash after APRE persist, before effect", () => {
+  it("P1. APPLYING row at restart → SAME exercise resumed+converged, then APPLIED", () => {
+    const ctx = makeCtx("p");
+    const exA = new ScriptedAdapter(
+      "EX_A",
+      [{ status: "FAILED", error_class: "AUTHENTICATION_REQUIRED" }],
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+    );
+    registerAdapter(ctx, exA, exA.caps);
+    const mid = startMission(ctx);
+    const state = tickUntil(ctx, mid, ["WAITING_APPROVAL", "ABORTED", "FAILED"]);
+    expect(state).toBe("WAITING_APPROVAL");
+    const approval = pendingApproval(ctx, mid);
+    const approvalId = String(approval.approval_id);
+    expect(String(approval.requested_action)).toBe(
+      "RECOVERY_OPERATOR_REVALIDATION",
+    );
+    ctx.approvals.decide(
+      approvalId,
+      "op",
+      "APPROVED",
+      approval.scope_snapshot as Record<string, unknown>,
+    );
+
+    // Crash window: the APRE row is durable (APPLYING) but NO runtime
+    // effect was applied — simulate by writing it directly.
+    const pre = ctx.approvals.exercise(approvalId, {});
+    expect(pre.created).toBe(true);
+    expect(String(pre.row.state)).toBe("APPLYING");
+
+    // Restart-equivalent re-entry: fresh store connection + runtime must
+    // resume the SAME exercise — never skip the effect, never mint a
+    // second fresh recovery decision after re-entry.
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const gate2 = new GovernedTaskGate(service2);
+    const router2 = new MissionRouter(service2, gate2);
+    const recovery2 = new RecoveryController(service2);
+    const recon2 = new ReconciliationService(service2, new Map());
+    const approvals2 = new ApprovalQueue(service2);
+    const scheduler2 = new MissionScheduler(service2, { mission_concurrency: 2 });
+    const exA2 = new ScriptedAdapter(
+      "EX_A",
+      [],
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+      null,
+      "r1_",
+    );
+    const runtime2 = new MissionRuntime({
+      service: service2,
+      gate: gate2,
+      router: router2,
+      adapters: new Map<string, ExecutorAdapter>([["EX_A", exA2]]),
+      scheduler: scheduler2,
+      approvals: approvals2,
+      reconciliation: recon2,
+      recovery: recovery2,
+    });
+    for (let i = 0; i < 8; i++) runtime2.tick(mid, fakeClock()());
+    const apre = store2
+      .list(APPROVAL_EXERCISE_ENTITY)
+      .filter((x) => x.approval_id === approvalId);
+    expect(apre.length).toBe(1);
+    expect(String(apre[0].state)).toBe("APPLIED");
+    expect(apre[0].applied_at).toBeTruthy();
+    // Effect converged: identical re-escalation hit the exercised-equivalent
+    // bound → bounded terminal, exactly ONE approval total.
+    expect(String(store2.get("mission_runtime", `MRT_${mid}`).state)).toBe(
+      "ABORTED",
+    );
+    expect(
+      store2
+        .list("approval_request")
+        .filter((a) => a.mission_id === mid).length,
+    ).toBe(1);
+    const decisionsBefore = store2
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+    // Re-entry on an APPLIED exercise mints nothing.
+    for (let i = 0; i < 4; i++) runtime2.tick(mid, fakeClock()());
+    expect(
+      store2
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === mid).length,
+    ).toBe(decisionsBefore);
+  });
+
+  it("P2. exercised EXTENSION restart → stamped chain is reused, never re-minted", () => {
+    const ctx = makeCtx("p2");
+    const { mid, exA } = driveToCeilingApproval(ctx);
+    approvePending(ctx, mid);
+    ctx.runtime.tick(mid, FAR);
+    const exercised = ctx.approvals.listExercised({ mission_id: mid });
+    expect(exercised.length).toBe(1);
+    const exerciseId = String(exercised[0].approval_exercise_id);
+    const decisionsAfterExercise = ctx.store
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+
+    // Fresh runtime (restart) — the fresh chain is stamped with the
+    // exercise id, so re-entry can never mint a second chain.
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const gate2 = new GovernedTaskGate(service2);
+    const approvals2 = new ApprovalQueue(service2);
+    const scheduler2 = new MissionScheduler(service2, { mission_concurrency: 2 });
+    const exA2 = new ScriptedAdapter(
+      "EX_A",
+      Array.from({ length: 8 }, () => ({
+        status: "FAILED",
+        error_class: "RATE_LIMITED",
+      })),
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+      null,
+      "r2_",
+    );
+    const runtime2 = new MissionRuntime({
+      service: service2,
+      gate: gate2,
+      router: new MissionRouter(service2, gate2),
+      adapters: new Map<string, ExecutorAdapter>([
+        ["EX_A", exA2],
+        ["EX_B", new ScriptedAdapter("EX_B", [], ["FILE_OPERATIONS"])],
+      ]),
+      scheduler: scheduler2,
+      approvals: approvals2,
+      reconciliation: new ReconciliationService(service2, new Map()),
+      recovery: new RecoveryController(service2),
+    });
+    for (let t = Date.parse(FAR), i = 0; i < 12; i++, t += 120_000) {
+      runtime2.tick(mid, new Date(t).toISOString());
+    }
+    // Grant yields at most its one dispatch — the exercised approval was
+    // never re-applied and no second fresh chain was minted.
+    expect(exA2.dispatched.length).toBeLessThanOrEqual(1);
+    const settledDecisions = store2
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+    // Fresh chain post-exercise (1) + one post-retry escalation bound — a
+    // restart/re-entry multiplying chains would blow past this bound.
+    expect(settledDecisions).toBeLessThanOrEqual(decisionsAfterExercise + 2);
+    for (let t = Date.parse(FAR) + 12 * 120_000, i = 0; i < 6; i++, t += 120_000) {
+      runtime2.tick(mid, new Date(t).toISOString());
+    }
+    expect(
+      store2
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === mid).length,
+    ).toBe(settledDecisions); // stable — no re-mint on repeated re-entry
+    expect(
+      store2
+        .list(APPROVAL_EXERCISE_ENTITY)
+        .filter((x) => x.approval_exercise_id === exerciseId).length,
+    ).toBe(1);
+    expect(String(store2.get("mission_runtime", `MRT_${mid}`).state)).toBe(
+      "ABORTED",
+    );
+  });
+});
+
+describe("PHD Q — SUPERSEDED relink only to an exact equivalent", () => {
+  function mintManual(
+    ctx: ReturnType<typeof makeCtx>,
+    mid: string,
+    taskId: string,
+    sig: string,
+    action = "RECOVERY_OPERATOR_REVALIDATION",
+  ) {
+    return ctx.approvals.request({
+      approval_type: "RECOVERY_APPROVAL",
+      requested_action: action,
+      mission_id: mid,
+      task_id: taskId,
+      intent: {
+        kind: action,
+        mission_id: mid,
+        task_id: taskId,
+        failure_signature: sig,
+      },
+      scope: { mission_id: mid, task_id: taskId, failure_signature: sig },
+      reason: "adversarial",
+    });
+  }
+
+  it("Q1. task A's superseded approval never relinks to task B's", () => {
+    const ctx = makeCtx("q");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approval = pendingApproval(ctx, mid);
+    const taskA = String(approval.task_id);
+    const taskB = ctx.service
+      .listTasks(mid)
+      .map((t) => String(t.task_id))
+      .find((t) => t !== taskA)!;
+    // A foreign pending approval for the OTHER task must not be adopted.
+    mintManual(ctx, mid, taskB, "SIG::other::task");
+    ctx.approvals.supersede(mid, taskA, "test_supersede");
+    ctx.runtime.tick(mid, FAR);
+    const rtEnt = rt(ctx, mid);
+    expect(rtEnt.pending_approval_id ?? null).toBeNull();
+    expect(String(rtEnt.state)).toBe("ABORTED");
+    expect(String(ctx.service.getMission(mid).status)).toBe("FAILED");
+    // Task B's approval is untouched — still PENDING.
+    const bStill = ctx.approvals
+      .listPending(mid)
+      .filter((a) => String(a.task_id) === taskB);
+    expect(bStill.length).toBe(1);
+  });
+
+  it("Q2. equivalent same-task approval IS adopted on relink", () => {
+    const ctx = makeCtx("q2");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approval = pendingApproval(ctx, mid);
+    const taskA = String(approval.task_id);
+    const sig = String(
+      (approval.intent as Record<string, unknown>).failure_signature,
+    );
+    const action = String(approval.requested_action);
+    ctx.approvals.supersede(mid, taskA, "test_supersede");
+    // A NEW equivalent pending minted AFTER the supersede (e.g. a
+    // crash-before-linkage re-request) is the legitimate relink target.
+    const twin = ctx.approvals.request({
+      approval_type: "RECOVERY_APPROVAL",
+      requested_action: action,
+      mission_id: mid,
+      task_id: taskA,
+      intent: {
+        kind: action,
+        mission_id: mid,
+        task_id: taskA,
+        failure_signature: sig,
+      },
+      scope: { mission_id: mid, task_id: taskA, failure_signature: sig },
+      reason: "equivalent",
+    });
+    ctx.runtime.tick(mid, FAR);
+    const rtEnt = rt(ctx, mid);
+    expect(String(rtEnt.pending_approval_id)).toBe(String(twin.approval_id));
+    expect(String(rtEnt.state)).toBe("WAITING_APPROVAL");
   });
 });
 

@@ -139,6 +139,13 @@ const CLASS_RULES: Array<[RegExp, FailureClass]> = [
   // only genuine governance codes (FAIL_CLOSED_NO_ELIGIBLE_ROUTE et al.) fall
   // through to POLICY_DENIAL.
   [/ROUTE_INFEASIBLE/i, "ROUTE_INFEASIBLE"],
+  // R1 — DSH model-pool exhaustion is NOT a policy denial: it aggregates
+  // safe *pre-dispatch availability* failures (provider down, model
+  // unavailable, credential missing) across every configured candidate.
+  // It keeps availability semantics — bounded retry/re-route, never an
+  // automatic ABORT merely because the code carries the FAIL_CLOSED_DSH_
+  // prefix. Must precede the authority blanket below.
+  [/FAIL_CLOSED_DSH_MODEL_EXHAUSTED/i, "TRANSIENT_TRANSPORT"],
   // Phase D §6 — Phase C DSH authority/governance failures are typed: a
   // FAIL_CLOSED_DSH_* code or an AUTHORITY_REJECTED durable class must win
   // over generic availability regexes (PROVIDER/MODEL/BINDING_). They are

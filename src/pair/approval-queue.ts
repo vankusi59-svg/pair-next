@@ -214,13 +214,26 @@ export class ApprovalQueue {
   }
 
   /**
-   * Phase D §2 — durable exactly-once exercise evidence. The exercise id
-   * is deterministic from the approval id, so a restart or concurrent
-   * tick re-finds the same row instead of applying the effect twice.
-   * Returns { row, created } — `created:false` means the effect was
-   * already durably exercised; callers apply the effect only once.
+   * Phase D §2 — durable exactly-once exercise evidence with an explicit
+   * lifecycle: APPLYING (winner persisted, effect maybe incomplete) →
+   * APPLIED (effect fully durable). The exercise id is deterministic from
+   * the approval id, so racing writers mint the same id — the version-0
+   * insert makes exactly one winner; the loser's create races into a
+   * FAIL_CLOSED_VERSION_CONFLICT which is re-read as the canonical
+   * winner, never surfaced as a defect.
+   *
+   * Returns { row, created } — `created:true` only for the writer that
+   * persisted the row. A caller that sees `created:false` MUST inspect
+   * `row.state`: APPLYING means the effect may not be durable yet and
+   * must be (re)applied idempotently; APPLIED means the effect already
+   * landed. `effect` is the deterministic effect plan the caller
+   * persists once — a resumer reuses the winner's plan verbatim instead
+   * of recomputing drift-prone values.
    */
-  exercise(approvalId: string): { row: Record<string, unknown>; created: boolean } {
+  exercise(
+    approvalId: string,
+    effect?: Record<string, unknown>,
+  ): { row: Record<string, unknown>; created: boolean } {
     const approval = this.get(approvalId);
     if (String(approval.status) !== "APPROVED") {
       throw new PolicyError(
@@ -241,10 +254,21 @@ export class ApprovalQueue {
       task_id: approval.task_id ?? null,
       scope_digest: approval.scope_digest,
       operator_id: approval.operator_id ?? null,
+      effect: effect ?? null,
+      state: "APPLYING",
       exercised_at: utcnow(),
+      applied_at: null as string | null,
       version: 0,
     };
-    const saved = this.store.put(APPROVAL_EXERCISE_ENTITY, exerciseId, row, 0);
+    let saved: Record<string, unknown>;
+    try {
+      saved = this.store.put(APPROVAL_EXERCISE_ENTITY, exerciseId, row, 0);
+    } catch (error) {
+      // A concurrent writer won the deterministic id — adopt its row.
+      const winner = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
+      if (winner) return { row: winner, created: false };
+      throw error;
+    }
     this.store.event({
       entity_type: APPROVAL_EXERCISE_ENTITY,
       entity_id: exerciseId,
@@ -260,6 +284,22 @@ export class ApprovalQueue {
       },
     });
     return { row: saved, created: true };
+  }
+
+  /** Lifecycle close: the caller's effect writes are durable. Idempotent
+   * — a re-entering caller after a crash completes the same transition. */
+  markExercisedApplied(approvalId: string): Record<string, unknown> {
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    if (row.state === "APPLIED") return row;
+    row.state = "APPLIED";
+    row.applied_at = utcnow();
+    return this.store.put(
+      APPROVAL_EXERCISE_ENTITY,
+      exerciseId,
+      row,
+      Number(row.version),
+    );
   }
 
   /** Exercised approval evidence for a mission/task — the §7 bound that
@@ -284,15 +324,16 @@ export class ApprovalQueue {
     );
   }
 
-  /** Decide on a pending approval. `scope` must re-digest to the bound digest.
-   *  When omitted, the stored `scope_snapshot` (written at request time) is
-   *  re-presented — digest enforcement is unchanged, and operator clients
-   *  that never saw the scope can still decide. */
+  /** Decide on a pending approval. `scope` is REQUIRED and must re-digest
+   *  to the bound scope_digest — the stored scope_snapshot is persisted
+   *  evidence + API projection only; it is never substituted into the
+   *  authority check. Operator clients fetch and echo the canonical scope
+   *  the API exposes. */
   decide(
     approvalId: string,
     operatorId: string,
     decision: "APPROVED" | "DENIED",
-    scope?: Record<string, unknown>,
+    scope: Record<string, unknown> | undefined,
     reason?: string,
     now?: string,
   ): Record<string, unknown> {
@@ -307,11 +348,17 @@ export class ApprovalQueue {
         `${approvalId}:${String(record.status)}`,
       );
     }
-    const effective =
-      scope ??
-      (record.scope_snapshot as Record<string, unknown> | undefined) ??
-      {};
-    const presented = digest(effective);
+    // R1 — scope authority: the caller MUST present the scope itself.
+    // The stored scope_snapshot is evidence + API projection only; it is
+    // never substituted here — a caller that cannot produce the canonical
+    // scope fails closed.
+    if (scope == null) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_APPROVAL_SCOPE_REQUIRED",
+        approvalId,
+      );
+    }
+    const presented = digest(scope);
     if (presented !== record.scope_digest) {
       throw new IntegrityError(
         "FAIL_CLOSED_APPROVAL_SCOPE_MISMATCH",
