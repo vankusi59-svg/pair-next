@@ -732,17 +732,19 @@ WOB1(A) and refused a legitimate retry.
 - Validation: focused +16; full suite 2426/2 pre-existing env fails;
   tsc + build clean. DO NOT MERGE — pending independent audit.
 
-## Route Capability Authority & Staleness Closure (branch `devin/1790861444-route-capability-authority`, pending independent audit)
+## Route Capability Authority & Staleness Closure (MERGED via PR #24 → `152d8d3`)
 
-- Route `capabilities` is now a derived reconciled snapshot of the
-  executor's declaration: `capability_source` ∈ `EXECUTOR_DECLARED` |
-  `ROUTE_EXPLICIT`, `capabilities_declared` preserves operator intent,
-  effective set is always `⊆ executor.capabilities`.
-  `syncRouteCapabilities()` runs at the registration seam
-  (`registerGovernedExecutors` / `seedPairNativeRoute`) — additions
-  converge `EXECUTOR_DECLARED` routes, removals fail closed, explicit
-  subsets are never auto-widened, CAS + `ROUTE_CAPABILITIES_RECONCILED`
-  event only on semantic change (idempotent, restart-safe).
+- Route `capabilities` is a pure constraint (`EXECUTOR_DECLARED` → `[]`
+  unrestricted / `ROUTE_EXPLICIT` → `capabilities_declared` ceiling);
+  `binding.capabilities` is the effective capability surface
+  (executor declaration ∩ route ceiling), recomputed at every
+  registration — shared routes stay order-independent. Reconcile runs at
+  the registration seam even on unqualified boots (never mints routes or
+  bindings for never-qualified executors); CAS +
+  `BINDING_CAPABILITIES_RECONCILED` event only on semantic change;
+  `RouteSelector` executor-bound reads `binding.capabilities`; explicit
+  empty ceiling (`ROUTE_EXPLICIT` + `[]`) permits nothing on
+  direct-callable routes.
 - `NO_ELIGIBLE_ROUTE` split: all-policy rejection codes
   (`AGENT_CONTRACT_ROUTE_DENIED`/`_RESTRICTED`, `OPERATOR_PIN_EXCLUDED`)
   keep `FAIL_CLOSED_NO_ELIGIBLE_ROUTE` → `POLICY_DENIAL` → ABORT;
@@ -754,7 +756,42 @@ WOB1(A) and refused a legitimate retry.
   excludes it.
 - Validation: focused 11/11; full suite 2441/2 pre-existing env fails;
   tsc + build clean. Counterfactual on `c06b43b`: 8/11 fail (R1 proves
-  the stale persisted snapshot). DO NOT MERGE — pending audit.
+  the stale persisted snapshot). MERGED.
+
+## Phase C — Governed DSH Multi-Model Routing (branch `devin/post-p14-phase-c-dsh-model-routing-v2`, pending independent audit)
+
+- New `src/pair/dsh-model-router.ts`: canonical ordered model pool
+  (`PAIR_DSH_MODEL_ROUTE → PAIR_DSH_FALLBACK_ROUTE → PAIR_DSH_EXTRA_ROUTES`,
+  dedupe AFTER canonical `model_entry_id` resolution, unresolved ref fails
+  closed at boot), per-invocation eligibility re-proof
+  (`assertDshCandidateEligible` — role / planner-overlap / provider /
+  executor / QUALIFIED binding as AUTHORITY throws vs health-availability
+  rejects that may fail over), shared task.timeout deadline across the
+  pool, `classifyError` with the `proc.prompt` markDispatch boundary
+  (dispatched → never failover).
+- `DshExecutorAdapter`: `bindModelRouter` + `runAttempts` loop injects the
+  explicitly selected model `{provider, model, model_entry_id,
+  model_binding_id}` and pins it via `session/set_config_option`
+  (config_id `model`); credential env follows the candidate's provider
+  (never the primary's); `DSH_DEFAULT_MODEL_ROUTE`/`modelRoute(env)` no
+  longer grant runtime model authority (`governed:false` only on the
+  unbound probe path).
+- `dsh_model_attempt` (`DMA_*`) provenance per candidate: 24 fields incl.
+  `generic_route_id`/`executor_supply_binding_id` linkage,
+  `dispatch_state`, `safe_to_failover`, `winner` (≤1 per governed task);
+  events `DSH_MODEL_ATTEMPT_STARTED|FAILED|SUCCEEDED`; crash leaves
+  STARTED. Exhaustion → `FAIL_CLOSED_DSH_MODEL_EXHAUSTED` with safe
+  evidence.
+- `AcpExecutorAdapterBase`: minimal `AcpAttemptContext`/`runAttempts`
+  seam; single-attempt default unchanged for Codex.
+- Zero semantic changes to route-registry / route-selector /
+  multi-executor / mission-router / mission-runtime / recovery-controller.
+- Validation: focused 42/42 (groups A–K); full suite 2517 pass / 2
+  pre-existing env P5 failures (real dsh/codex binaries on PATH); tsc +
+  build clean. Live E2E on isolated `PAIR_MC_DIR` ×4: primary win, safe
+  pre-dispatch failover, post-dispatch no-failover + bounded recovery,
+  generic-gate mismatch with zero model attempts. DO NOT MERGE — pending
+  audit. See `PAIR_NEXT_POST_P14_PHASE_C_DSH_MODEL_ROUTING_REPORT.md`.
 
 ## Not yet
 

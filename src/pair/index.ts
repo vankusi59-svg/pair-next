@@ -22,6 +22,7 @@ export * from "./acp-transport.js";
 export * from "./acp-permissions.js";
 export * from "./acp-executor.js";
 export * from "./dsh-adapter.js";
+export * from "./dsh-model-router.js";
 export * from "./codex-adapter.js";
 export * from "./multi-executor.js";
 export * from "./provider-catalog.js";

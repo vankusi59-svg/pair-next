@@ -304,29 +304,24 @@ describe("route-level failover — recovery decision", () => {
 /* --------------------------- adapter resolution ------------------------- */
 
 describe("route-level failover — DSH adapter model resolution", () => {
-  it("RF-ADAPTER-BINDING-MODEL: bound model route drives provider + credential env", () => {
+  it("RF-ADAPTER-CANDIDATE-MODEL: governed candidate drives provider + credential env", () => {
     const adapter = new DshExecutorAdapter({
       journalRoot: freshDir("adapter-route"),
-      envReader: (n) => (n === "CLOUDFLARE_API_TOKEN" ? "cf-key" : undefined),
-      routeResolver: (id) =>
-        id === "RTE_DSH_CLOUDFLARE"
-          ? { route_id: id, metadata: { provider_id: "cloudflare", model_id: "@cf/zai-org/glm-4.7-flash", credential_env: "CLOUDFLARE_API_TOKEN" } }
-          : null,
+      envReader: (n) => (n === "GROQ_API_KEY" ? "groq-key" : undefined),
     });
-    const env = (adapter as unknown as { providerEnv(t?: Record<string, unknown>): Record<string, string> })
-      .providerEnv({ selected_route_id: "RTE_DSH_CLOUDFLARE" });
-    expect(env.CLOUDFLARE_API_TOKEN).toBe("cf-key");
+    const env = (adapter as unknown as { providerEnv(c?: unknown): Record<string, string> })
+      .providerEnv({ candidate: { pid: "groq", mid: "openai/gpt-oss-20b", model_entry_id: "ME_GROQ", ref: "groq:openai/gpt-oss-20b" } });
+    expect(env.GROQ_API_KEY).toBe("groq-key");
     expect(env.NVIDIA_API_KEY).toBeUndefined();
   });
 
-  it("RF-ADAPTER-ENV-FALLBACK: unbound task falls back to PAIR_DSH_MODEL_ROUTE", () => {
+  it("RF-ADAPTER-ENV-FALLBACK: unbound attempt falls back to PAIR_DSH_MODEL_ROUTE", () => {
     const adapter = new DshExecutorAdapter({
       journalRoot: freshDir("adapter-env"),
       envReader: (n) => (n === "PAIR_DSH_MODEL_ROUTE" ? "groq:openai/gpt-oss-20b" : n === "GROQ_API_KEY" ? "groq-key" : undefined),
-      routeResolver: () => null,
     });
-    const env = (adapter as unknown as { providerEnv(t?: Record<string, unknown>): Record<string, string> })
-      .providerEnv({});
+    const env = (adapter as unknown as { providerEnv(c?: unknown): Record<string, string> })
+      .providerEnv(undefined);
     expect(env.GROQ_API_KEY).toBe("groq-key");
   });
 });
