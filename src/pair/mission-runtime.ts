@@ -35,7 +35,11 @@ import type { GovernedTaskGate } from "./gate.js";
 import type { MissionRouter } from "./mission-router.js";
 import type { ExecutorAdapter } from "./adapter.js";
 import type { MissionScheduler } from "./mission-scheduler.js";
-import type { ApprovalQueue } from "./approval-queue.js";
+import {
+  LEGACY_RECOVERY_BUDGET_OVERRIDE,
+  type ApprovalQueue,
+  type RecoveryApprovalIntent,
+} from "./approval-queue.js";
 import type { ReconciliationService } from "./reconciliation.js";
 import type { RecoveryController } from "./recovery-controller.js";
 import { classifyFailure } from "./recovery-controller.js";
@@ -459,7 +463,7 @@ export class MissionRuntime {
         break;
       }
       case "WAITING_APPROVAL": {
-        this.recoveryGuard(missionId, () => this.checkPendingApproval(missionId), now);
+        this.recoveryGuard(missionId, () => this.checkPendingApproval(missionId, now), now);
         break;
       }
       default:
@@ -562,18 +566,44 @@ export class MissionRuntime {
     }
 
     // 2. Observe in-flight executions → collect terminals.
+    // Executions already under a reconciliation barrier or carried by the
+    // active pending_recovery are NOT re-observed here — their governed
+    // path owns them (re-observing would re-decide every tick).
+    const barrieredExecs = new Set<string>();
+    for (const b of Object.values(
+      (rt.barriers as Record<string, Record<string, unknown>>) ?? {},
+    )) {
+      if (b.settled !== true && b.execution_id) barrieredExecs.add(String(b.execution_id));
+    }
     const inFlight = this.store
       .list("executor_execution")
       .filter(
         (e) =>
           e.mission_id === missionId &&
-          !TERMINAL_EXECUTION.has(String(e.execution_state)),
+          !TERMINAL_EXECUTION.has(String(e.execution_state)) &&
+          !e.terminal_outcome && // Phase D §5 — operator-neutralized
+          !barrieredExecs.has(String(e.execution_id)),
       );
     for (const e of inFlight) {
       const adapter = this.deps.adapters.get(String(e.executor_id));
       if (!adapter) continue;
       const observed = this.deps.gate.observe_execution(adapter, String(e.execution_id));
-      if (!TERMINAL_EXECUTION.has(String(observed.execution_state))) continue;
+      const observedState = String(observed.execution_state);
+      if (observedState === "UNKNOWN" || String(e.execution_state) === "UNKNOWN") {
+        // Phase D §5 — UNKNOWN is not terminal but can never be
+        // auto-settled: drive it through governed recovery (reconcile →
+        // operator no-replay acknowledgment) instead of leaving the task
+        // in-flight forever.
+        this.startRecovery(
+          missionId,
+          String(e.task_id),
+          String(e.execution_id),
+          "UNKNOWN_SIDE_EFFECT_STATE",
+          now,
+        );
+        return;
+      }
+      if (!TERMINAL_EXECUTION.has(observedState)) continue;
       this.settleExecution(missionId, String(observed.execution_id));
       const rtNow = String(this.runtimeEntity(missionId).state);
       if (rtNow !== "RUNNING") return; // recovery/approval/reconcile took over
@@ -732,7 +762,37 @@ export class MissionRuntime {
     const execution = executionId
       ? this.store.tryGet("executor_execution", executionId)
       : null;
-    const ext = (rt.budget_extension as Record<string, number>) ?? {};
+    const ext = (rt.budget_extension as Record<string, unknown>) ?? {};
+    // Phase D §1 — granted attempt extensions are task-scoped: only the
+    // task the approval was minted for sees its ceiling widen; every
+    // other task keeps the canonical budget. Legacy flat fields remain
+    // readable for grants exercised before the scoped shape existed.
+    const extTasks =
+      (ext.tasks as Record<
+        string,
+        {
+          attempts_per_task?: number;
+          baseline_attempts?: number;
+          baseline_identical?: number;
+        }
+      > | undefined) ?? {};
+    const extTaskEntry = extTasks[taskId];
+    // Baseline-anchored extension (Phase D §1): the grant is an absolute
+    // ceiling of baseline+grant — a relative +N would be consumed by the
+    // escalation decision that minted it.
+    const taskCeiling =
+      extTaskEntry?.baseline_attempts != null
+        ? Number(extTaskEntry.baseline_attempts) +
+          Number(extTaskEntry.attempts_per_task ?? 0)
+        : undefined;
+    const identicalCeiling =
+      extTaskEntry?.baseline_identical != null
+        ? Number(extTaskEntry.baseline_identical) +
+          Number(extTaskEntry.attempts_per_task ?? 0)
+        : undefined;
+    const extAttemptsPerTask =
+      (taskCeiling == null ? Number(extTaskEntry?.attempts_per_task ?? 0) : 0) +
+      Number((ext.attempts_per_task as number | undefined) ?? 0);
     const eligible = projectRoutableExecutors(this.deps.service).map((r) =>
       String(r.executor_id),
     );
@@ -761,8 +821,10 @@ export class MissionRuntime {
       ),
       correlation_id: `${missionId}:${taskId}`,
       budget_extension: {
-        attempts_per_task: Number(ext.attempts_per_task ?? 0),
+        attempts_per_task: extAttemptsPerTask,
         attempts_per_mission: Number(ext.attempts_per_mission ?? 0),
+        task_attempt_ceiling: taskCeiling,
+        consecutive_identical_ceiling: identicalCeiling,
       },
       settled_reconciliation: settledReconciliation ?? null,
       infeasible_actions: infeasibleActions ?? [],
@@ -830,27 +892,19 @@ export class MissionRuntime {
         break;
       }
       case "HUMAN_APPROVAL_REQUIRED": {
-        const scope = {
-          requested_action: "RECOVERY_BUDGET_OVERRIDE",
-          mission_id: missionId,
-          task_id: taskId,
-          failure_class: failureClass,
-          recovery_decision_id: String(decision.recovery_id),
-        };
-        const approval = this.deps.approvals.request({
-          approval_type: "RECOVERY_APPROVAL",
-          requested_action: "RECOVERY_BUDGET_OVERRIDE",
-          scope,
-          mission_id: missionId,
-          task_id: taskId,
-          reason: `recovery escalation: ${failureClass}`,
-          risk_class: String(decision.risk_class ?? "MEDIUM"),
-          correlation_id: String(decision.correlation_id ?? ""),
-        });
-        const rt2 = this.runtimeEntity(missionId);
-        rt2.pending_approval_id = String(approval.approval_id);
-        this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
-        this.transitionRuntime(missionId, "WAITING_APPROVAL", action);
+        // Phase D §1 — the approval carries an explicit governed intent
+        // derived from WHY the human was required (read from the decision's
+        // rejection reasons), never a generic budget override.
+        this.mintRecoveryApproval(
+          missionId,
+          taskId,
+          this.approvalIntentFor(
+            decision,
+            failureClass,
+            failedExecutorId,
+            executionId,
+          ),
+        );
         break;
       }
       case "ABORT":
@@ -1051,7 +1105,19 @@ export class MissionRuntime {
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
           this.settleExecution(missionId, String(execution.execution_id));
         }
-        if (String(this.runtimeEntity(missionId).state) === "RECOVERING") {
+        // Only close the apply when THIS chain's pending is still the
+        // active one. A terminal settle inside the arm may have spawned a
+        // fresh recovery decision — clearing that successor's pending
+        // kills the chain and leaves the mission stuck RUNNING.
+        const rtAfterRetry = this.runtimeEntity(missionId);
+        const pendingAfterRetry = rtAfterRetry.pending_recovery as
+          | Record<string, unknown>
+          | null;
+        if (
+          String(rtAfterRetry.state) === "RECOVERING" &&
+          pendingAfterRetry &&
+          String(pendingAfterRetry.recovery_id) === String(pending.recovery_id)
+        ) {
           this.clearPendingRecovery(missionId, "COMPLETED", "retry_dispatched");
           this.transitionRuntime(missionId, "RUNNING", "retry_dispatched");
         }
@@ -1077,7 +1143,15 @@ export class MissionRuntime {
         if (execution && TERMINAL_EXECUTION.has(String(execution.execution_state))) {
           this.settleExecution(missionId, String(execution.execution_id));
         }
-        if (String(this.runtimeEntity(missionId).state) === "RECOVERING") {
+        const rtAfterReroute = this.runtimeEntity(missionId);
+        const pendingAfterReroute = rtAfterReroute.pending_recovery as
+          | Record<string, unknown>
+          | null;
+        if (
+          String(rtAfterReroute.state) === "RECOVERING" &&
+          pendingAfterReroute &&
+          String(pendingAfterReroute.recovery_id) === String(pending.recovery_id)
+        ) {
           this.clearPendingRecovery(missionId, "COMPLETED", "reroute_dispatched");
           this.transitionRuntime(missionId, "RUNNING", "reroute_dispatched");
         }
@@ -1085,6 +1159,28 @@ export class MissionRuntime {
       }
       case "APPLY_VERIFIED_REMEDIATION": {
         this.runRemediation(missionId, pending, now);
+        break;
+      }
+      case "HUMAN_APPROVAL_REQUIRED": {
+        // Phase D §3 — the pending escalation survived a restart before
+        // the runtime link was durable: re-derive the intent and
+        // mint-or-relink (the queue dedupes equivalents) instead of
+        // minting a second identical request.
+        const decision = this.store.tryGet(
+          "recovery_decision",
+          String(pending.recovery_id ?? ""),
+        );
+        this.mintRecoveryApproval(
+          missionId,
+          taskId,
+          this.approvalIntentFor(
+            decision ?? {},
+            String(pending.failure_class) as ReturnType<typeof classifyFailure>,
+            pending.executor_id ? String(pending.executor_id) : undefined,
+            pending.execution_id ? String(pending.execution_id) : null,
+            pending.recovery_id ? String(pending.recovery_id) : null,
+          ),
+        );
         break;
       }
       case "RECONCILIATION_REQUIRED": {
@@ -1370,6 +1466,350 @@ export class MissionRuntime {
     }
   }
 
+  /* ---------------- Phase D approval intent/exercise ------------------ */
+
+  /**
+   * Phase D §1 — derive the explicit governed intent for a decided
+   * HUMAN_APPROVAL_REQUIRED chain from WHY the human was required:
+   * a task-attempt ceiling rejection grants one task-scoped attempt
+   * extension; every other operator-required reason is revalidation
+   * (approve ⇒ one fresh bounded re-decision, no budget widening).
+   */
+  private approvalIntentFor(
+    decision: Record<string, unknown>,
+    failureClass: ReturnType<typeof classifyFailure>,
+    failedExecutorId: string | undefined,
+    executionId: string | null,
+    recoveryId?: string | null,
+  ): {
+    intent: RecoveryApprovalIntent;
+    reason: string;
+    risk_class: string;
+    failure_signature: string;
+    recovery_decision_id: string | null;
+    execution_id: string | null;
+    grant: Record<string, unknown> | null;
+  } {
+    const rejects =
+      (decision.rejected_actions as Array<{ reason?: string }> | undefined) ?? [];
+    const ceilingHit = rejects.some((r) =>
+      /MAX_RECOVERY_ATTEMPTS_PER_TASK|RETRY_BUDGET_EXHAUSTED/.test(
+        String(r.reason ?? ""),
+      ),
+    );
+    return {
+      intent: ceilingHit
+        ? "RECOVERY_TASK_ATTEMPT_EXTENSION"
+        : "RECOVERY_OPERATOR_REVALIDATION",
+      reason: `recovery escalation: ${failureClass}`,
+      risk_class: String(decision.risk_class ?? "MEDIUM"),
+      failure_signature: String(
+        decision.failure_signature ?? `${failureClass}::${failedExecutorId ?? "any"}::any`,
+      ),
+      recovery_decision_id:
+        (decision.recovery_id as string | undefined) ?? recoveryId ?? null,
+      execution_id: executionId,
+      grant: ceilingHit ? { attempts_per_task: 1 } : null,
+    };
+  }
+
+  /**
+   * Phase D §3/§7 — mint OR relink the recovery approval for a decided
+   * chain, bounded:
+   *  - an identical already-EXERCISED grant (same intent + mission + task
+   *    + failure signature) means the same failure returned without
+   *    meaningful state change → bounded abort, never a second
+   *    equivalent approval;
+   *  - an equivalent still-PENDING request (crash-before-linkage,
+   *    restart re-decision) is ADOPTED, not duplicated;
+   *  - otherwise a fresh request is minted carrying the explicit intent
+   *    and the scope it binds (mission/task/decision/signature/grant).
+   */
+  private mintRecoveryApproval(
+    missionId: string,
+    taskId: string,
+    spec: {
+      intent: RecoveryApprovalIntent;
+      reason: string;
+      risk_class?: string;
+      failure_signature?: string | null;
+      recovery_decision_id?: string | null;
+      execution_id?: string | null;
+      grant?: Record<string, unknown> | null;
+    },
+  ): void {
+    const signature = spec.failure_signature ?? null;
+    if (signature) {
+      const alreadyExercised = this.deps.approvals
+        .listExercised({ mission_id: missionId, task_id: taskId })
+        .some(
+          (x) =>
+            String(x.requested_action) === spec.intent &&
+            String(
+              (x.intent as Record<string, unknown> | null)?.failure_signature ??
+                (x.scope_snapshot as Record<string, unknown> | null)?.failure_signature ??
+                "",
+            ) === signature,
+        );
+      if (alreadyExercised) {
+        const rt0 = this.runtimeEntity(missionId);
+        rt0.pending_approval_id = null;
+        this.store.put(
+          "mission_runtime",
+          String(rt0.mission_runtime_id),
+          rt0,
+          Number(rt0.version),
+        );
+        this.abortMission(missionId, `approval_chain_bounded:${signature}`);
+        return;
+      }
+    }
+    const equivalent = this.deps.approvals.findPendingEquivalent({
+      approval_type: "RECOVERY_APPROVAL",
+      requested_action: spec.intent,
+      mission_id: missionId,
+      task_id: taskId,
+      failure_signature: signature,
+    });
+    const rt2 = this.runtimeEntity(missionId);
+    if (equivalent) {
+      rt2.pending_approval_id = String(equivalent.approval_id);
+      this.store.put(
+        "mission_runtime",
+        String(rt2.mission_runtime_id),
+        rt2,
+        Number(rt2.version),
+      );
+      this.transitionRuntime(missionId, "WAITING_APPROVAL", "HUMAN_APPROVAL_REQUIRED");
+      return;
+    }
+    const scope = {
+      requested_action: spec.intent,
+      mission_id: missionId,
+      task_id: taskId,
+      failure_signature: signature,
+      recovery_decision_id: spec.recovery_decision_id ?? null,
+      execution_id: spec.execution_id ?? null,
+      grant: spec.grant ?? null,
+    };
+    const approval = this.deps.approvals.request({
+      approval_type: "RECOVERY_APPROVAL",
+      requested_action: spec.intent,
+      scope,
+      intent: {
+        kind: spec.intent,
+        mission_id: missionId,
+        task_id: taskId,
+        failure_signature: signature,
+        recovery_decision_id: spec.recovery_decision_id ?? null,
+        execution_id: spec.execution_id ?? null,
+        grant: spec.grant ?? null,
+      },
+      mission_id: missionId,
+      task_id: taskId,
+      reason: spec.reason,
+      risk_class: spec.risk_class ?? "MEDIUM",
+      correlation_id: `${missionId}:${taskId}`,
+    });
+    rt2.pending_approval_id = String(approval.approval_id);
+    this.store.put(
+      "mission_runtime",
+      String(rt2.mission_runtime_id),
+      rt2,
+      Number(rt2.version),
+    );
+    this.transitionRuntime(missionId, "WAITING_APPROVAL", "HUMAN_APPROVAL_REQUIRED");
+  }
+
+  /**
+   * Phase D §2/§4/§5 — APPROVED arm: durable exactly-once exercise, then
+   * the ONE effect the explicit intent permits. Every effect write is
+   * idempotent (assignment, never increment) so a crash between the
+   * exercise row and the runtime update re-converges cleanly.
+   */
+  private exerciseApprovedRecovery(missionId: string, approvalId: string, now?: string): void {
+    const approval = this.deps.approvals.get(approvalId);
+    const { row: exercise } = this.deps.approvals.exercise(approvalId);
+    const intent = String(
+      (approval.intent as Record<string, unknown> | null)?.kind ??
+        approval.requested_action,
+    );
+    const taskId = String(approval.task_id ?? "");
+    const rt = this.runtimeEntity(missionId);
+    rt.pending_approval_id = null;
+
+    switch (intent) {
+      case "RECOVERY_TASK_ATTEMPT_EXTENSION":
+      case LEGACY_RECOVERY_BUDGET_OVERRIDE: {
+        // Task-scoped attempt grant — assignment keyed by the task the
+        // approval bound, with the exercise id as provenance. Replays
+        // write the same value, so the grant can never stack twice.
+        const intentRow =
+          (approval.intent as Record<string, unknown> | null) ?? {};
+        const grantAmount =
+          Number(
+            ((intentRow.grant as Record<string, unknown> | undefined) ?? {})
+              .attempts_per_task,
+          ) || 1;
+        const ext = (rt.budget_extension as Record<string, unknown>) ?? {};
+        const tasks =
+          (ext.tasks as Record<string, Record<string, unknown>>) ?? {};
+        // Anchor the grant to attempts consumed so far: the escalation
+        // decision that minted this approval is itself a recovery_attempt,
+        // so a relative ceiling would never yield another dispatch.
+        const taskAttempts = this.store
+          .list("recovery_attempt")
+          .filter((a) => String(a.task_id) === taskId);
+        const baselineAttempts = taskAttempts.length;
+        // The grant also re-arms the consecutive-identical ceiling for the
+        // exact signature being extended — otherwise the second guard eats
+        // the granted attempt before any dispatch.
+        const grantSignature = String(intentRow.failure_signature ?? "");
+        let baselineIdentical = 0;
+        for (const a of [...taskAttempts].sort(
+          (x, y) => Number(y.attempt_no ?? 0) - Number(x.attempt_no ?? 0),
+        )) {
+          if (String(a.failure_signature ?? "") !== grantSignature) break;
+          baselineIdentical += 1;
+        }
+        tasks[taskId] = {
+          attempts_per_task: grantAmount,
+          baseline_attempts: baselineAttempts,
+          baseline_identical: baselineIdentical,
+          approval_exercise_id: String(exercise.approval_exercise_id),
+        };
+        rt.budget_extension = { ...ext, tasks };
+        this.store.put(
+          "mission_runtime",
+          String(rt.mission_runtime_id),
+          rt,
+          Number(rt.version),
+        );
+        this.transitionRuntime(
+          missionId,
+          "RECOVERING",
+          "approval_exercised_attempt_extension",
+        );
+        // A FRESH governed decide() applies the widened per-task ceiling —
+        // replaying the stale pending action would just re-mint the same
+        // approval (bounded abort). The new decision replaces the stale
+        // pending_recovery; stale scheduled actions are swept first.
+        const stale = rt.pending_recovery as Record<string, unknown> | null;
+        this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
+        if (stale) {
+          this.startRecovery(
+            missionId,
+            taskId || String(stale.task_id),
+            stale.execution_id ? String(stale.execution_id) : null,
+            stale.failure_class as ReturnType<typeof classifyFailure>,
+            now,
+            undefined,
+            stale.infeasible_actions as
+              | Array<{ action: RecoveryAction; reason: string }>
+              | undefined,
+          );
+        }
+        break;
+      }
+      case "RECOVERY_OPERATOR_REVALIDATION": {
+        // Approval = "operator reviewed this escalation" — the effect is
+        // a fresh bounded re-decision; the failure itself is unchanged.
+        // If nothing actually changed, the same signature re-escalates
+        // once and is bounded (§7), never an approval loop.
+        this.store.put(
+          "mission_runtime",
+          String(rt.mission_runtime_id),
+          rt,
+          Number(rt.version),
+        );
+        this.transitionRuntime(
+          missionId,
+          "RECOVERING",
+          "approval_exercised_revalidation",
+        );
+        const stale = rt.pending_recovery as Record<string, unknown> | null;
+        this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
+        if (stale) {
+          this.startRecovery(
+            missionId,
+            taskId || String(stale.task_id),
+            stale.execution_id ? String(stale.execution_id) : null,
+            stale.failure_class as ReturnType<typeof classifyFailure>,
+            now,
+            undefined,
+            stale.infeasible_actions as
+              | Array<{ action: RecoveryAction; reason: string }>
+              | undefined,
+          );
+        }
+        break;
+      }
+      case "ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY": {
+        // §5 — explicit no-replay acknowledgment: settle the barrier with
+        // an operator outcome, fail the affected task terminally,
+        // neutralize the stale pending recovery, converge. The task is
+        // NEVER re-dispatched/re-routed on this approval.
+        const barriers =
+          (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
+        const barrier = barriers[taskId];
+        if (barrier) {
+          barrier.settled = true;
+          barrier.operator_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
+          barrier.approval_exercise_id = String(exercise.approval_exercise_id);
+          rt.barriers = barriers;
+        }
+        if (taskId && this.store.tryGet("task", taskId)) {
+          this.deps.service.updateTask(taskId, { status: "FAILED" });
+        }
+        // Neutralize the execution row: the operator outcome is durable on
+        // the execution itself so RUNNING's in-flight sweep can never
+        // re-drive it into recovery after restart — replay is impossible
+        // even though execution_state stays UNKNOWN (receipt preserved).
+        const barrierExecId = barrier?.execution_id
+          ? String(barrier.execution_id)
+          : null;
+        if (barrierExecId) {
+          const exec = this.store.tryGet("executor_execution", barrierExecId);
+          if (exec) {
+            exec.terminal_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
+            this.store.put(
+              "executor_execution",
+              barrierExecId,
+              exec,
+              Number(exec.version),
+            );
+          }
+        }
+        this.store.put(
+          "mission_runtime",
+          String(rt.mission_runtime_id),
+          rt,
+          Number(rt.version),
+        );
+        this.clearPendingRecovery(missionId, "CANCELLED", "operator_no_replay");
+        const rt3 = this.runtimeEntity(missionId);
+        rt3.pending_approval_id = null;
+        this.store.put(
+          "mission_runtime",
+          String(rt3.mission_runtime_id),
+          rt3,
+          Number(rt3.version),
+        );
+        this.transitionRuntime(missionId, "RUNNING", "approval_exercised_no_replay");
+        break;
+      }
+      default: {
+        this.store.put(
+          "mission_runtime",
+          String(rt.mission_runtime_id),
+          rt,
+          Number(rt.version),
+        );
+        this.transitionRuntime(missionId, "RUNNING", "approval_granted_resume");
+      }
+    }
+  }
+
   private clearPendingRecovery(
     missionId: string,
     scheduledStatus: "COMPLETED" | "CANCELLED",
@@ -1452,26 +1892,24 @@ export class MissionRuntime {
         }
         case "UNKNOWN_SIDE_EFFECT_STATE":
         default: {
-          // Never auto-replay: escalate to operator or abort.
-          const scope = {
-            requested_action: "RECONCILE_UNKNOWN_SIDE_EFFECT",
-            mission_id: missionId,
-            task_id: taskId,
-            execution_id: barrier.execution_id ?? null,
-          };
-          const approval = this.deps.approvals.request({
-            approval_type: "RECOVERY_APPROVAL",
-            requested_action: "RECONCILE_UNKNOWN_SIDE_EFFECT",
-            scope,
-            mission_id: missionId,
-            task_id: taskId,
+          // Phase D §5 — never auto-replay. The approval carries the
+          // explicit no-replay acknowledgment intent: APPROVED means
+          // "operator accepts this work cannot be replayed" and settles
+          // the barrier + task terminally — never a retry or re-route.
+          this.mintRecoveryApproval(missionId, taskId, {
+            intent: "ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY",
             reason: "unknown side-effect state — blind replay forbidden",
             risk_class: "HIGH",
+            failure_signature: `UNKNOWN_SIDE_EFFECT_STATE::${String(
+              barrier.executor_id ?? "any",
+            )}::any`,
+            recovery_decision_id:
+              ((rt.pending_recovery as Record<string, unknown> | null)
+                ?.recovery_id as string | undefined) ?? null,
+            execution_id: barrier.execution_id
+              ? String(barrier.execution_id)
+              : null,
           });
-          const rt2 = this.runtimeEntity(missionId);
-          rt2.pending_approval_id = String(approval.approval_id);
-          this.store.put("mission_runtime", String(rt2.mission_runtime_id), rt2, Number(rt2.version));
-          this.transitionRuntime(missionId, "WAITING_APPROVAL", "UNKNOWN_SIDE_EFFECT_STATE");
           return;
         }
       }
@@ -1523,7 +1961,17 @@ export class MissionRuntime {
 
   /* ---------------- WAITING_APPROVAL -------------------------------------- */
 
-  private checkPendingApproval(missionId: string): void {
+  /**
+   * Phase D §4 — every approval status must converge: PENDING waits,
+   * APPROVED applies exactly-once via durable exercise, DENIED/EXPIRED
+   * are bounded terminal, SUPERSEDED relinks to a surviving PENDING
+   * recovery request for this mission or goes bounded terminal. The TTL
+   * sweep runs before the read — `get()` alone never expires a stale
+   * PENDING, so a runtime that polls only `get()` would wait forever on
+   * an already-dead request.
+   */
+  private checkPendingApproval(missionId: string, now?: string): void {
+    this.deps.approvals.expireSweep();
     const rt = this.runtimeEntity(missionId);
     const approvalId = rt.pending_approval_id as string | null;
     if (!approvalId) {
@@ -1533,6 +1981,23 @@ export class MissionRuntime {
     const approval = this.deps.approvals.get(approvalId);
     const status = String(approval.status);
     if (status === "PENDING") return; // still waiting
+    if (status === "SUPERSEDED") {
+      const replacement =
+        this.deps.approvals
+          .listPending(missionId)
+          .find((a) => a.approval_type === "RECOVERY_APPROVAL") ?? null;
+      rt.pending_approval_id = replacement ? String(replacement.approval_id) : null;
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
+      );
+      if (!replacement) {
+        this.abortMission(missionId, "approval_superseded");
+      }
+      return;
+    }
     if (status === "DENIED" || status === "EXPIRED") {
       rt.pending_approval_id = null;
       this.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
@@ -1540,22 +2005,7 @@ export class MissionRuntime {
       return;
     }
     if (status === "APPROVED") {
-      rt.pending_approval_id = null;
-      const requested = String(approval.requested_action);
-      if (requested === "RECOVERY_BUDGET_OVERRIDE") {
-        const ext = (rt.budget_extension as Record<string, number>) ?? {};
-        rt.budget_extension = {
-          attempts_per_task: Number(ext.attempts_per_task ?? 0) + 1,
-          attempts_per_mission: Number(ext.attempts_per_mission ?? 0) + 1,
-        };
-        this.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
-        this.transitionRuntime(missionId, "RECOVERING", "approval_granted_budget_extension");
-      } else {
-        // RECONCILE_UNKNOWN_SIDE_EFFECT approval → operator accepts abort of
-        // the barriered task's redrive; barrier stays, task marked FAILED.
-        this.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
-        this.transitionRuntime(missionId, "RUNNING", "approval_granted_resume");
-      }
+      this.exerciseApprovedRecovery(missionId, approvalId, now);
       return;
     }
   }
@@ -1590,7 +2040,8 @@ export class MissionRuntime {
       .filter(
         (e) =>
           e.mission_id === missionId &&
-          !TERMINAL_EXECUTION.has(String(e.execution_state)),
+          !TERMINAL_EXECUTION.has(String(e.execution_state)) &&
+          !e.terminal_outcome, // Phase D §5 — operator-neutralized
       );
     if (inFlight.length > 0) return;
 

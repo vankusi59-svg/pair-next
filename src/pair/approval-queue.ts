@@ -35,11 +35,42 @@ export const APPROVAL_STATUSES = [
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
+/**
+ * Phase D — explicit governed recovery-approval intents. A recovery
+ * approval is never a generic "budget override": the intent declares the
+ * ONE effect an APPROVED decision may produce, bound to the exact
+ * mission/task/recovery chain it was granted for.
+ */
+export const RECOVERY_APPROVAL_INTENTS = [
+  /** Task-attempt ceiling reached — grant ONE bounded attempt extension
+   *  for that task only (never a mission-wide or unrelated-task grant). */
+  "RECOVERY_TASK_ATTEMPT_EXTENSION",
+  /** UNKNOWN_SIDE_EFFECT_STATE — operator accepts that the work cannot be
+   *  safely replayed. NEVER authorizes a retry/re-route of the same work. */
+  "ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY",
+  /** Other operator-required recovery (auth/authz/permission/workspace/
+   *  remote-input/cost/defect…) — approval = operator revalidated; effect
+   *  is a fresh bounded recovery re-decision, not a budget extension. */
+  "RECOVERY_OPERATOR_REVALIDATION",
+] as const;
+export type RecoveryApprovalIntent = (typeof RECOVERY_APPROVAL_INTENTS)[number];
+
+/** Legacy action kept readable for pre-Phase-D rows: treated as a
+ *  task-attempt extension when encountered. */
+export const LEGACY_RECOVERY_BUDGET_OVERRIDE = "RECOVERY_BUDGET_OVERRIDE";
+
+/** Entity type for durable approval consumption evidence (exactly-once). */
+export const APPROVAL_EXERCISE_ENTITY = "approval_exercise";
+
 export interface ApprovalRequestInput {
   approval_type: ApprovalType;
   requested_action: string;
   /** The exact scope the approval binds to — digested canonically. */
   scope: Record<string, unknown>;
+  /** Explicit governed intent — stored verbatim so the exercise path can
+   *  apply exactly the declared effect (mission/task/decision/signature/
+   *  grant bindings). Never widens workspace/permissions/credentials. */
+  intent?: Record<string, unknown>;
   mission_id?: string;
   task_id?: string;
   change_id?: string;
@@ -64,6 +95,18 @@ export class ApprovalQueue {
         String(input.approval_type),
       );
     }
+    this.expireSweep();
+    // Request-once dedupe: an identical already-PENDING request (same
+    // scope digest) is returned instead of minting a duplicate row —
+    // covers crash-after-request-before-runtime-linkage replays.
+    const scopeDigest = digest(input.scope);
+    const existing = this.list({ status: "PENDING" }).find(
+      (a) =>
+        a.scope_digest === scopeDigest &&
+        a.approval_type === input.approval_type &&
+        a.requested_action === input.requested_action,
+    );
+    if (existing) return existing;
     const approvalId = newId("APR");
     const now = utcnow();
     const expiresAt =
@@ -74,10 +117,12 @@ export class ApprovalQueue {
       approval_id: approvalId,
       approval_type: input.approval_type,
       requested_action: input.requested_action,
+      intent: input.intent ?? null,
       mission_id: input.mission_id ?? null,
       task_id: input.task_id ?? null,
       change_id: input.change_id ?? null,
-      scope_digest: digest(input.scope),
+      scope_digest: scopeDigest,
+      scope_snapshot: input.scope,
       reason: input.reason,
       risk_class: input.risk_class ?? "MEDIUM",
       created_at: now,
@@ -137,6 +182,98 @@ export class ApprovalQueue {
     );
   }
 
+  /**
+   * Phase D §3 — find an equivalent already-PENDING request to RELINK to
+   * (same semantic request: type + action + mission + task + optional
+   * failure signature). Used when a restart re-derived the need for an
+   * approval before the runtime link was durable — the existing request
+   * is adopted, never duplicated.
+   */
+  findPendingEquivalent(input: {
+    approval_type: ApprovalType;
+    requested_action: string;
+    mission_id: string;
+    task_id?: string | null;
+    failure_signature?: string | null;
+  }): Record<string, unknown> | null {
+    this.expireSweep();
+    return (
+      this.list({ status: "PENDING" }).find(
+        (a) =>
+          a.approval_type === input.approval_type &&
+          a.requested_action === input.requested_action &&
+          a.mission_id === input.mission_id &&
+          (input.task_id == null || a.task_id === input.task_id) &&
+          (input.failure_signature == null ||
+            (a.intent as Record<string, unknown> | null)?.failure_signature ===
+              input.failure_signature ||
+            (a.scope_snapshot as Record<string, unknown> | null)?.failure_signature ===
+              input.failure_signature),
+      ) ?? null
+    );
+  }
+
+  /**
+   * Phase D §2 — durable exactly-once exercise evidence. The exercise id
+   * is deterministic from the approval id, so a restart or concurrent
+   * tick re-finds the same row instead of applying the effect twice.
+   * Returns { row, created } — `created:false` means the effect was
+   * already durably exercised; callers apply the effect only once.
+   */
+  exercise(approvalId: string): { row: Record<string, unknown>; created: boolean } {
+    const approval = this.get(approvalId);
+    if (String(approval.status) !== "APPROVED") {
+      throw new PolicyError(
+        "FAIL_CLOSED_APPROVAL_NOT_EXERCISABLE",
+        `${approvalId}:${String(approval.status)}`,
+      );
+    }
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    const existing = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    if (existing) return { row: existing, created: false };
+    const row = {
+      approval_exercise_id: exerciseId,
+      approval_id: approvalId,
+      approval_type: approval.approval_type,
+      requested_action: approval.requested_action,
+      intent: approval.intent ?? null,
+      mission_id: approval.mission_id ?? null,
+      task_id: approval.task_id ?? null,
+      scope_digest: approval.scope_digest,
+      operator_id: approval.operator_id ?? null,
+      exercised_at: utcnow(),
+      version: 0,
+    };
+    const saved = this.store.put(APPROVAL_EXERCISE_ENTITY, exerciseId, row, 0);
+    this.store.event({
+      entity_type: APPROVAL_EXERCISE_ENTITY,
+      entity_id: exerciseId,
+      event_type: "APPROVAL_EXERCISED",
+      new_state: "EXERCISED",
+      actor: "PAIR_APPROVAL_QUEUE",
+      correlation_id: String(approval.correlation_id ?? ""),
+      metadata: {
+        approval_id: approvalId,
+        requested_action: approval.requested_action,
+        mission_id: approval.mission_id ?? null,
+        task_id: approval.task_id ?? null,
+      },
+    });
+    return { row: saved, created: true };
+  }
+
+  /** Exercised approval evidence for a mission/task — the §7 bound that
+   *  stops identical human escalations from minting unlimited approvals. */
+  listExercised(filter: { mission_id?: string; task_id?: string } = {}) {
+    return this.store
+      .list(APPROVAL_EXERCISE_ENTITY)
+      .filter(
+        (x) =>
+          (filter.mission_id === undefined || x.mission_id === filter.mission_id) &&
+          (filter.task_id === undefined || x.task_id === filter.task_id),
+      );
+  }
+
   /** Find an APPROVED approval whose stored scope_digest equals `scopeDigest`. */
   approvedFor(scopeDigest: string, approvalType?: ApprovalType) {
     this.expireSweep();
@@ -147,12 +284,15 @@ export class ApprovalQueue {
     );
   }
 
-  /** Decide on a pending approval. `scope` must re-digest to the bound digest. */
+  /** Decide on a pending approval. `scope` must re-digest to the bound digest.
+   *  When omitted, the stored `scope_snapshot` (written at request time) is
+   *  re-presented — digest enforcement is unchanged, and operator clients
+   *  that never saw the scope can still decide. */
   decide(
     approvalId: string,
     operatorId: string,
     decision: "APPROVED" | "DENIED",
-    scope: Record<string, unknown>,
+    scope?: Record<string, unknown>,
     reason?: string,
     now?: string,
   ): Record<string, unknown> {
@@ -167,7 +307,11 @@ export class ApprovalQueue {
         `${approvalId}:${String(record.status)}`,
       );
     }
-    const presented = digest(scope);
+    const effective =
+      scope ??
+      (record.scope_snapshot as Record<string, unknown> | undefined) ??
+      {};
+    const presented = digest(effective);
     if (presented !== record.scope_digest) {
       throw new IntegrityError(
         "FAIL_CLOSED_APPROVAL_SCOPE_MISMATCH",

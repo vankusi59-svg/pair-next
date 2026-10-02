@@ -139,6 +139,11 @@ const CLASS_RULES: Array<[RegExp, FailureClass]> = [
   // only genuine governance codes (FAIL_CLOSED_NO_ELIGIBLE_ROUTE et al.) fall
   // through to POLICY_DENIAL.
   [/ROUTE_INFEASIBLE/i, "ROUTE_INFEASIBLE"],
+  // Phase D §6 — Phase C DSH authority/governance failures are typed: a
+  // FAIL_CLOSED_DSH_* code or an AUTHORITY_REJECTED durable class must win
+  // over generic availability regexes (PROVIDER/MODEL/BINDING_). They are
+  // policy denials — bounded ABORT, never an availability retry.
+  [/AUTHORITY_REJECTED|FAIL_CLOSED_DSH_|FAIL_CLOSED_MODEL_ROLE|FAIL_CLOSED_MODEL_IDENTITY/i, "POLICY_DENIAL"],
   [/POLICY|CAPABILITY_MISMATCH|NOT_DISPATCHABLE|GOVERNANCE|NO_ELIGIBLE|GOVERNED_TASK|MISSION_ID_PUBLIC|BINDING_/i, "POLICY_DENIAL"],
   [/EXECUTOR_UNAVAILABLE|ADAPTER_NOT_BOUND|SPAWN|EXECUTABLE_NOT_FOUND|ENOENT/i, "EXECUTOR_UNAVAILABLE"],
   [/UNHEALTHY|NOT_READY|HEALTH/i, "EXECUTOR_UNHEALTHY"],
@@ -305,7 +310,19 @@ export class RecoveryController {
      * itself lives in the approval ledger — this only widens ceilings the
      * operator explicitly approved. Never widens the matrix.
      */
-    budget_extension?: { attempts_per_task?: number; attempts_per_mission?: number };
+    budget_extension?: {
+      attempts_per_task?: number;
+      attempts_per_mission?: number;
+      /** Phase D: absolute per-task ceiling minted by an exercised
+       *  RECOVERY_TASK_ATTEMPT_EXTENSION (baseline attempts at grant time +
+       *  granted amount). The extension decision itself burns an attempt
+       *  slot, so a relative "+N" would never yield a dispatch — the grant
+       *  must bind to attempts counted from when it was conferred. */
+      task_attempt_ceiling?: number;
+      /** Absolute consecutive-identical ceiling conferred the same way —
+       *  identical-signature retries are exactly what the grant re-arms. */
+      consecutive_identical_ceiling?: number;
+    };
   }): Record<string, unknown> {
     if (!this.enabled()) {
       throw new PolicyError("FAIL_CLOSED_RECOVERY_DISABLED", input.mission_id);
@@ -313,9 +330,13 @@ export class RecoveryController {
     const policy: RecoveryPolicy = {
       ...this.policy,
       max_attempts_per_task:
+        input.budget_extension?.task_attempt_ceiling ??
         this.policy.max_attempts_per_task + (input.budget_extension?.attempts_per_task ?? 0),
       max_attempts_per_mission:
         this.policy.max_attempts_per_mission + (input.budget_extension?.attempts_per_mission ?? 0),
+      max_consecutive_identical:
+        input.budget_extension?.consecutive_identical_ceiling ??
+        this.policy.max_consecutive_identical,
     };
     const taskId = input.task_id ?? "";
     const failureClass =
@@ -706,7 +727,13 @@ export class RecoveryController {
       const execs = this.store
         .list("executor_execution")
         .filter((e) => e.mission_id === missionId);
-      const unsettled = execs.filter((e) => !TERMINAL_EXEC.has(String(e.execution_state)));
+      const unsettled = execs.filter(
+        (e) =>
+          !TERMINAL_EXEC.has(String(e.execution_state)) &&
+          // Phase D §5 — operator-acknowledged no-replay executions are
+          // durably settled; a restart must not resurrect them.
+          !e.terminal_outcome,
+      );
       const receipts = unsettled.map((e) => reconcile(String(e.execution_id)));
       const attempts = this.store.list("recovery_attempt").filter((a) => a.mission_id === missionId);
       // A mission that never committed a plan (created but never ticked)
