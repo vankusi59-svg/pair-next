@@ -15,9 +15,10 @@
  *  - per artifact / per TEXT payload: QUEUED → SENDING (persisted
  *    BEFORE the network call) → SENT on definite success with
  *    message_id evidence; definite failure → back to QUEUED with
- *    last_error (bounded retry on later polls); ambiguous (thrown or
- *    unknown acceptance) → UNKNOWN_SIDE_EFFECT — never auto-resend,
- *    never claimed SENT.
+ *    attempt_count+1 and bounded next_retry_at backoff (terminal
+ *    FAILED_DELIVERY past the ceiling); ambiguous (thrown, unknown
+ *    acceptance, or `ok` WITHOUT message_id) → UNKNOWN_SIDE_EFFECT —
+ *    never auto-resend, never claimed SENT (R4 §2).
  *  - file content reading (.txt/.md sent as message text; everything
  *    else as document upload) lives here so the bridge and tests share
  *    the exact same decision.
@@ -102,7 +103,19 @@ export async function transportTelegramDelivery(args: {
     r: GovernedSendResult,
   ): Promise<boolean> => {
     if (r.kind === "ok") {
-      await args.backend.sent(artifact, { message_id: r.message_id ?? null });
+      // R4 §2 — definite success REQUIRES real acceptance evidence. A
+      // transport `ok` without message_id is ambiguous: classify
+      // UNKNOWN_SIDE_EFFECT, never SENT.
+      const mid = r.message_id;
+      const valid =
+        typeof mid === "number"
+          ? Number.isFinite(mid)
+          : typeof mid === "string" && mid.trim().length > 0;
+      if (!valid) {
+        await args.backend.unknown(artifact, "acceptance_unproven:no message_id");
+        return false;
+      }
+      await args.backend.sent(artifact, { message_id: mid });
       return true;
     }
     if (r.kind === "fail") {
@@ -129,6 +142,9 @@ export async function transportTelegramDelivery(args: {
   };
 
   if (String(req.mode) === "TEXT") {
+    // R4 §1 — TEXT carries the same durable slot state as FILES; only a
+    // canonically eligible QUEUED text payload may begin.
+    if (String(req.text_state) !== "QUEUED") return { sent, held: false };
     const text = `${prefix}${String(req.text ?? "")}`.trim();
     if (text.length <= prefix.trim().length) return { sent, held: false };
     await args.backend.begin(null);

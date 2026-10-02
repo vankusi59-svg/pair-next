@@ -306,7 +306,11 @@ class ScriptedAdapter implements ExecutorAdapter {
 
 function makeCtx(
   name: string,
-  opts: { planner?: (i: never) => unknown; defaultChatId?: string | null } = {},
+  opts: {
+    planner?: (i: never) => unknown;
+    defaultChatId?: string | null;
+    maxAttempts?: number;
+  } = {},
 ) {
   const dir = freshDir(name);
   const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
@@ -341,6 +345,9 @@ function makeCtx(
     // `null` keeps it unset → delivery requests mint UNSENDABLE.
     telegramDeliveryDefaultChatId:
       "defaultChatId" in opts ? opts.defaultChatId ?? undefined : "111",
+    // R4 §3 — the canonical retry ceiling (PAIR_TG_DELIVERY_MAX_ATTEMPTS
+    // wiring); defaults to 3 via the mint helper when unset.
+    telegramDeliveryMaxAttempts: opts.maxAttempts,
   });
   const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
   const control = new MissionControl({
@@ -837,6 +844,8 @@ interface SendCall {
 function recordingTransport(opts?: {
   fail?: Set<string>;
   explode?: Set<string>;
+  /** R4 §11 — transport claims ok but returns NO message_id. */
+  noMid?: Set<string>;
   onSend?: () => void;
 }): { calls: SendCall[]; transport: GovernedTelegramTransport } {
   const calls: SendCall[] = [];
@@ -849,6 +858,7 @@ function recordingTransport(opts?: {
         const key = a.name ?? "TEXT";
         if (opts?.explode?.has(key)) throw new Error("socket died mid-send");
         if (opts?.fail?.has(key)) return { kind: "fail", error: "400 Bad Request: chat not found" };
+        if (opts?.noMid?.has(key)) return { kind: "ok" };
         return { kind: "ok", message_id: `MID_${key}` };
       },
     },
@@ -857,10 +867,15 @@ function recordingTransport(opts?: {
 
 /** Server-side backend — identical transition semantics to the bridge's
  *  HTTP /api/telegram-deliveries/:id/transition calls. */
-function storeBackend(ctx: ReturnType<typeof makeCtx>, req: Record<string, unknown>) {
+function storeBackend(
+  ctx: ReturnType<typeof makeCtx>,
+  req: Record<string, unknown>,
+  now?: string,
+) {
   const t = (artifact: string | null | undefined, body: Record<string, unknown>) =>
     ctx.control.transitionTelegramDelivery(String(req.delivery_id), {
       artifact,
+      ...(now ? { now } : {}),
       ...body,
     });
   return {
@@ -879,6 +894,9 @@ async function runTransport(
     transport?: GovernedTelegramTransport;
     allowlist?: Set<string>;
     backend?: (req: Record<string, unknown>) => DeliveryBackend;
+    /** R4 — deterministic clock injected into the pending projection
+     *  AND the transition backend so backoff windows are testable. */
+    now?: string;
   },
 ): Promise<{ calls: SendCall[]; sent: string[] }> {
   const recording = recordingTransport();
@@ -887,10 +905,10 @@ async function runTransport(
     ? (c: string) => opts.allowlist!.has(c)
     : () => true;
   const sent: string[] = [];
-  for (const req of pendingTelegramDeliveries(ctx.store) as Array<
+  for (const req of pendingTelegramDeliveries(ctx.store, opts?.now) as Array<
     Record<string, unknown>
   >) {
-    const backend = opts?.backend ? opts.backend(req) : storeBackend(ctx, req);
+    const backend = opts?.backend ? opts.backend(req) : storeBackend(ctx, req, opts?.now);
     const r = await transportTelegramDelivery({
       request: req,
       transport,
@@ -904,8 +922,11 @@ async function runTransport(
   return { calls: recording.calls, sent };
 }
 
-async function bridgeSend(ctx: ReturnType<typeof makeCtx>): Promise<string[]> {
-  return (await runTransport(ctx)).sent;
+async function bridgeSend(
+  ctx: ReturnType<typeof makeCtx>,
+  now?: string,
+): Promise<string[]> {
+  return (await runTransport(ctx, now ? { now } : undefined)).sent;
 }
 
 describe("R2 §13 — default: file/outbox/completion are never send authority", () => {
@@ -1533,8 +1554,15 @@ describe("R3 §14 — governed transport failure semantics", () => {
     expect(after.status).toBe("QUEUED");
     expect(after.message_id).toBeUndefined();
     expect(String(after.last_error)).toContain("chat not found");
-    // Retry on the next poll — bounded retryable state.
-    const { sent: retry } = await runTransport(ctx, { transport: recordingTransport().transport });
+    // R4 §3 — definite failure consumed one attempt and set a bounded
+    // backoff; the retry becomes eligible only after next_retry_at.
+    expect(after.attempt_count).toBe(1);
+    expect(after.text_state).toBe("QUEUED");
+    expect(String(after.next_retry_at) > utcnow()).toBe(true);
+    const { sent: retry } = await runTransport(ctx, {
+      transport: recordingTransport().transport,
+      now: new Date(Date.parse(String(after.next_retry_at)) + 1000).toISOString(),
+    });
     expect(retry).toHaveLength(1);
   });
 
@@ -1676,5 +1704,241 @@ describe("R3 §15 — crash windows", () => {
       (reconciled.artifacts as Array<Record<string, unknown>>)[0].state,
     ).toBe("UNKNOWN_SIDE_EFFECT");
     expect(rec.calls).toHaveLength(1); // exactly one network send ever
+  });
+});
+
+describe("R4 §9-10 — TEXT crash windows are identical to FILES", () => {
+  it("§9. TEXT crash after durable SENDING, before network → reconcile UNKNOWN_SIDE_EFFECT, ZERO sends, never re-projected", async () => {
+    const ctx = makeCtx("r4-text-crash-a");
+    const { request } = await startDeliveryMission(ctx, { intent: TEXT_INTENT });
+    const id = String(request.delivery_id);
+    // Durable SENDING on the TEXT payload, then the "process dies"
+    // before the network call — Telegram may have accepted.
+    ctx.control.transitionTelegramDelivery(id, { artifact: null, to: "SENDING" });
+    const sending = ctx.store.get("telegram_delivery_request", id);
+    expect(sending.text_state).toBe("SENDING");
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0); // ambiguous slot — no blind resend
+    const after = ctx.store.get("telegram_delivery_request", id);
+    expect(after.text_state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(String(after.unknown_reason)).toContain("stale_sending");
+    // Never re-projected as sendable, never claimed SENT.
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
+    expect(after.status).not.toBe("SENT");
+    const { sent: again } = await runTransport(ctx, { transport: rec.transport });
+    expect(again).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  it("§10. TEXT crash after Telegram acceptance, before SENT persistence → UNKNOWN_SIDE_EFFECT, zero resend", async () => {
+    const ctx = makeCtx("r4-text-crash-b");
+    const { request } = await startDeliveryMission(ctx, { intent: TEXT_INTENT });
+    const id = String(request.delivery_id);
+    // Network DID send (ok + message_id) but the SENT transition dies.
+    const flaky = {
+      ...storeBackend(ctx, request),
+      sent: () => {
+        throw new Error("db write lost mid-sent");
+      },
+    };
+    const rec = recordingTransport();
+    await expect(
+      transportTelegramDelivery({
+        request: pendingTelegramDeliveries(ctx.store)[0],
+        transport: rec.transport,
+        isAllowed: () => true,
+        backend: flaky,
+      }),
+    ).rejects.toThrow("db write lost");
+    expect(rec.calls).toHaveLength(1); // the send happened once
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(1); // zero resend
+    const after = ctx.store.get("telegram_delivery_request", id);
+    expect(after.text_state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(after.status).not.toBe("SENT");
+    expect(after.message_id).toBeUndefined(); // never false SENT
+  });
+});
+
+describe("R4 §11 — SENT requires real message_id evidence", () => {
+  for (const [label, opts, key] of [
+    ["TEXT", { intent: TEXT_INTENT }, "TEXT"],
+    ["txt via sendMessage", {}, "report.txt"],
+    ["binary via sendDocument", { file: "chart.png" }, "chart.png"],
+  ] as const) {
+    it(`${label}: ok WITHOUT message_id → UNKNOWN_SIDE_EFFECT, NOT SENT`, async () => {
+      const ctx = makeCtx(`r4-nomid-${label.replace(/[^a-z]/g, "")}`);
+      const { request } = await startDeliveryMission(ctx, opts as { intent?: TelegramDeliveryIntent; file?: string });
+      const id = String(request.delivery_id);
+      const rec = recordingTransport({ noMid: new Set([key]) });
+      const { sent } = await runTransport(ctx, { transport: rec.transport });
+      expect(sent).toEqual([]);
+      expect(rec.calls).toHaveLength(1); // network send happened
+      const after = ctx.store.get("telegram_delivery_request", id);
+      if (String(request.mode) === "TEXT") {
+        expect(after.text_state).toBe("UNKNOWN_SIDE_EFFECT");
+      } else {
+        const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+        expect(art.state).toBe("UNKNOWN_SIDE_EFFECT");
+        expect(art.message_id).toBeUndefined();
+      }
+      expect(after.status).not.toBe("SENT");
+    });
+  }
+
+  it("server transition to=SENT without valid message_id rejects fail-closed", async () => {
+    const ctx = makeCtx("r4-nomid-server");
+    const { request } = await startDeliveryMission(ctx, {});
+    const id = String(request.delivery_id);
+    ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" });
+    for (const mid of [undefined, null, ""]) {
+      expect(() =>
+        ctx.control.transitionTelegramDelivery(id, {
+          artifact: "report.txt", to: "SENT", message_id: mid as string,
+        }),
+      ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_EVIDENCE/);
+    }
+    const after = ctx.store.get("telegram_delivery_request", id);
+    expect((after.artifacts as Array<Record<string, unknown>>)[0].state).toBe("SENDING");
+    // …and a real message_id still lands SENT.
+    ctx.control.transitionTelegramDelivery(id, {
+      artifact: "report.txt", to: "SENT", message_id: "MID_1",
+    });
+    expect(ctx.store.get("telegram_delivery_request", id).status).toBe("SENT");
+  });
+});
+
+describe("R4 §12 — bounded retry: backoff + ceiling + terminal hold", () => {
+  it("repeated definite failure stops at PAIR_TG_DELIVERY_MAX_ATTEMPTS; backoff gates eligibility; zero sends forever", async () => {
+    const ctx = makeCtx("r4-retry", { maxAttempts: 3 });
+    const { request } = await startDeliveryMission(ctx, {});
+    const id = String(request.delivery_id);
+    const art = () =>
+      (ctx.store.get("telegram_delivery_request", id).artifacts as Array<Record<string, unknown>>)[0];
+    const T = "2026-01-02T00:00:00.000Z";
+    const plus = (sec: number) =>
+      new Date(Date.parse(T) + sec * 1000).toISOString();
+    const rec = recordingTransport({ fail: new Set(["report.txt"]) });
+
+    // Attempt 1 → consumed, QUEUED + bounded next_retry_at (5s).
+    await runTransport(ctx, { transport: rec.transport, now: T });
+    expect(rec.calls).toHaveLength(1);
+    expect(art().state).toBe("QUEUED");
+    expect(art().attempt_count).toBe(1);
+    expect(art().next_retry_at).toBe(plus(5));
+
+    // Before the backoff expires: NOT projected, ZERO sends.
+    const early = await runTransport(ctx, { transport: rec.transport, now: plus(2) });
+    expect(early.sent).toEqual([]);
+    expect(rec.calls).toHaveLength(1);
+
+    // Eligible again → attempt 2 → QUEUED + second backoff (10s).
+    await runTransport(ctx, { transport: rec.transport, now: plus(6) });
+    expect(rec.calls).toHaveLength(2);
+    expect(art().state).toBe("QUEUED");
+    expect(art().attempt_count).toBe(2);
+    expect(art().next_retry_at).toBe(plus(16));
+
+    // Attempt 3 exhausts the ceiling → FAILED_DELIVERY terminal hold.
+    await runTransport(ctx, { transport: rec.transport, now: plus(17) });
+    expect(rec.calls).toHaveLength(3);
+    expect(art().state).toBe("FAILED_DELIVERY");
+    expect(ctx.store.get("telegram_delivery_request", id).status).toBe("FAILED_DELIVERY");
+
+    // Forever after: never eligible, zero sends, durable failure evident.
+    for (const later of [plus(60), plus(600), plus(60000)]) {
+      const { sent } = await runTransport(ctx, { transport: rec.transport, now: later });
+      expect(sent).toEqual([]);
+    }
+    expect(rec.calls).toHaveLength(3);
+    expect(pendingTelegramDeliveries(ctx.store, plus(99999))).toHaveLength(0);
+  });
+
+  it("begin before next_retry_at fails closed at the domain layer too", async () => {
+    const ctx = makeCtx("r4-retry-domain");
+    const { request } = await startDeliveryMission(ctx, {});
+    const id = String(request.delivery_id);
+    const T = "2026-01-02T00:00:00.000Z";
+    ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING", now: T });
+    ctx.control.transitionTelegramDelivery(id, {
+      artifact: "report.txt", to: "FAILED", error: "x", now: T,
+    });
+    expect(() =>
+      ctx.control.transitionTelegramDelivery(id, {
+        artifact: "report.txt", to: "SENDING",
+        now: new Date(Date.parse(T) + 1000).toISOString(), // inside backoff
+      }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
+  });
+});
+
+describe("R4 §13-14 — /ack bypass removed + strict transition matrix", () => {
+  it("§13. no /ack path exists: controller has no ackTelegramDelivery; QUEUED→SENT without SENDING fails closed", async () => {
+    const ctx = makeCtx("r4-noack");
+    const { request } = await startDeliveryMission(ctx, {});
+    const id = String(request.delivery_id);
+    // The legacy /ack endpoint and domain function are gone entirely —
+    // the ONLY production mutation path is /transition.
+    expect(
+      (ctx.control as unknown as Record<string, unknown>).ackTelegramDelivery,
+    ).toBeUndefined();
+    // A direct QUEUED→SENT request (what /ack did) is ILLEGAL.
+    expect(() =>
+      ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENT", message_id: "MID_x" }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
+    const after = ctx.store.get("telegram_delivery_request", id);
+    expect((after.artifacts as Array<Record<string, unknown>>)[0].state).toBe("QUEUED");
+  });
+
+  it("§14. illegal matrix fails closed: QUEUED→SENT, SENT→SENDING, UNKNOWN→SENDING, UNSENDABLE→SENT; idempotent begin replays same attempt_id", async () => {
+    const ctx = makeCtx("r4-matrix");
+    const { request } = await startDeliveryMission(ctx, {});
+    const id = String(request.delivery_id);
+    const art = () =>
+      (ctx.store.get("telegram_delivery_request", id).artifacts as Array<Record<string, unknown>>)[0];
+
+    // QUEUED→SENT rejected.
+    expect(() =>
+      ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENT", message_id: "MID_1" }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
+
+    // QUEUED→SENDING: deterministic attempt id (R4 §7).
+    const begun = ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" });
+    const att1 = (begun.artifacts as Array<Record<string, unknown>>)[0].attempt_id;
+    expect(String(att1)).toMatch(/^ATT_[0-9a-f]{16}$/);
+    // Idempotent replay of the same begin returns the existing attempt.
+    const replay = ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" });
+    expect((replay.artifacts as Array<Record<string, unknown>>)[0].attempt_id).toBe(att1);
+
+    // SENDING→UNKNOWN legal; UNKNOWN→SENDING rejected.
+    ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "UNKNOWN", error: "ambiguous" });
+    expect(art().state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(() =>
+      ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
+
+    // UNSENDABLE→SENT rejected (terminal hold, destination binding stays).
+    const ctx2 = makeCtx("r4-matrix-u", { defaultChatId: null });
+    const { request: r2 } = await startDeliveryMission(ctx2, { operatorId: "op1" });
+    expect(r2.status).toBe("UNSENDABLE");
+    expect(() =>
+      ctx2.control.transitionTelegramDelivery(String(r2.delivery_id), {
+        artifact: "report.txt", to: "SENT", message_id: "MID_1",
+      }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY/);
+
+    // SENT→SENDING rejected.
+    const ctx3 = makeCtx("r4-matrix-s");
+    const { request: r3 } = await startDeliveryMission(ctx3, {});
+    const id3 = String(r3.delivery_id);
+    ctx3.control.transitionTelegramDelivery(id3, { artifact: "report.txt", to: "SENDING" });
+    ctx3.control.transitionTelegramDelivery(id3, { artifact: "report.txt", to: "SENT", message_id: "MID_1" });
+    expect(ctx3.store.get("telegram_delivery_request", id3).status).toBe("SENT");
+    expect(() =>
+      ctx3.control.transitionTelegramDelivery(id3, { artifact: "report.txt", to: "SENDING" }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
   });
 });

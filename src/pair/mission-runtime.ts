@@ -155,6 +155,9 @@ export interface MissionRuntimeDeps {
    *  non-Telegram-origin missions. Unset → such delivery requests mint
    *  UNSENDABLE (fail closed, never broadcast). */
   telegramDeliveryDefaultChatId?: string;
+  /** R4 §3 — canonical retry ceiling stamped per payload at mint
+   *  (PAIR_TG_DELIVERY_MAX_ATTEMPTS wiring; bounded, env-driven). */
+  telegramDeliveryMaxAttempts?: number;
 }
 
 const DEFAULT_TASK_TIMEOUT = 120;
@@ -790,6 +793,7 @@ export class MissionRuntime {
             workspace: ws,
             now: utcnow(),
             defaultChatId: this.deps.telegramDeliveryDefaultChatId,
+            maxAttempts: this.deps.telegramDeliveryMaxAttempts,
           });
         }
         return;

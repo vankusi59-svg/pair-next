@@ -129,7 +129,17 @@ async function governedSend({ chatId, text, filePath, name }) {
           text: String(text ?? "").slice(0, 4000),
           disable_web_page_preview: true,
         });
-    return { kind: "ok", message_id: result?.message_id ?? null };
+    // R4 §2 — a claimed success WITHOUT a real message_id is ambiguous:
+    // validate response evidence here, never trust `ok` alone.
+    const mid = result?.message_id;
+    const validId =
+      typeof mid === "number"
+        ? Number.isFinite(mid)
+        : typeof mid === "string" && mid.trim().length > 0;
+    if (!validId) {
+      return { kind: "unknown", error: "acceptance_unproven:no message_id" };
+    }
+    return { kind: "ok", message_id: mid };
   } catch (e) {
     return e?.tgKind === "fail"
       ? { kind: "fail", error: String(e).slice(0, 300) }

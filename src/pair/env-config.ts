@@ -141,3 +141,22 @@ export function devinBlockedGraceMs(env: EnvLike = process.env as EnvLike): numb
 export function devinTaskTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(DEVIN_TASK_TIMEOUT.name, DEVIN_TASK_TIMEOUT.defaultValue, DEVIN_TASK_TIMEOUT.bounds, env);
 }
+
+/** R4 §3 — one canonical ceiling for governed Telegram delivery attempts
+ *  (definite-failure retries). Bounded [1..10], default 3. */
+export const TG_DELIVERY_MAX_ATTEMPTS = {
+  name: "PAIR_TG_DELIVERY_MAX_ATTEMPTS",
+  defaultValue: 3,
+  bounds: { min: 1, max: 10, unit: " attempts" },
+} as const;
+
+export function telegramDeliveryMaxAttempts(
+  env: EnvLike = process.env as EnvLike,
+): number {
+  return readPositiveIntEnv(
+    TG_DELIVERY_MAX_ATTEMPTS.name,
+    TG_DELIVERY_MAX_ATTEMPTS.defaultValue,
+    TG_DELIVERY_MAX_ATTEMPTS.bounds,
+    env,
+  );
+}

@@ -89,6 +89,7 @@ import {
   validatePlanProposal,
   reconcilePlanDataflow,
   detectTelegramDeliveryIntent,
+  telegramDeliveryMaxAttempts,
   modelRoleOf,
   MODEL_ROLE,
   utcnow,
@@ -394,6 +395,8 @@ const runtime = new MissionRuntime({
   // did NOT originate from a Telegram chat. Unset/ambiguous → explicit
   // deliveries mint UNSENDABLE (fail closed, never broadcast).
   telegramDeliveryDefaultChatId: process.env.PAIR_TG_DELIVERY_CHAT_ID || undefined,
+  // R4 §3 — canonical delivery retry ceiling (bounded 1..10, default 3).
+  telegramDeliveryMaxAttempts: telegramDeliveryMaxAttempts(),
 });
 const sup = new MissionSupervisor(service, runtime, recovery, recon);
 // Extraction sweep: every executor_execution whose result was collected folds

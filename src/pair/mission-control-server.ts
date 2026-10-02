@@ -353,14 +353,9 @@ export function createMissionControlServer(
         const state = url.searchParams.get("state") ?? undefined;
         return void json(res, 200, { deliveries: c.telegramDeliveries(state) });
       }
-      const ackMatch = p.match(/^\/api\/telegram-deliveries\/([^/]+)\/ack$/);
-      if (method === "POST" && ackMatch) {
-        const reqEntity = c.ackTelegramDelivery(
-          decodeURIComponent(ackMatch[1]),
-          body.artifact ? String(body.artifact) : undefined,
-        );
-        return void json(res, 200, { delivery: reqEntity });
-      }
+      // R4 §5 — the legacy /ack endpoint is REMOVED: it could flip a
+      // QUEUED payload to SENT with no SENDING and no message_id. The
+      // governed /transition lifecycle is the ONLY mutation path.
       // R3 §7 — explicit transport lifecycle: QUEUED→SENDING→SENT |
       // FAILED | UNKNOWN_SIDE_EFFECT per artifact (or the TEXT request),
       // plus the UNSENDABLE destination hold. Replaces filename-based

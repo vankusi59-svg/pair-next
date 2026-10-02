@@ -349,3 +349,157 @@ this report.
 Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R3_PENDING_INDEPENDENT_AUDIT`
 
 STOP. DO NOT MERGE. DO NOT START PHASE E.
+
+---
+
+# R4 — Transport final state-machine closure (audit `pasted-1790919457093.txt`)
+
+Base: audited R3 HEAD `7c7f9b6` · branch/PR unchanged (incident R4 continues on
+the same PR #27) · `DO NOT` scope: no new PR, no merge, no Phase E, no redesign
+of R1/R2/R3.
+
+## §1 — TEXT stale-SENDING asymmetry (BLOCKER) → closed
+
+**Bug**: TEXT `attempt_state` was removed on reconcile but the request stayed
+`QUEUED` → the next poll re-sent the text Telegram may already have accepted.
+**Fix**: TEXT now carries the identical durable slot as FILES
+(`text_state` + all attempt fields at request level). Stale TEXT `SENDING`
+reconciles to `UNKNOWN_SIDE_EFFECT` with `stale_sending_reconciled:<now>`
+evidence — never re-projected, never auto-resend, never false SENT.
+Test §9: begin→SENDING→crash→pending → `text_state=UNKNOWN_SIDE_EFFECT`,
+zero calls, `pending[]` empty, `status≠SENT`.
+
+## §2 — SENT requires real message_id (BLOCKER) → closed
+
+Two fail-closed layers: (a) `transportTelegramDelivery` classifies
+`{kind:"ok"}` **without** a valid `message_id` as `backend.unknown`
+(`acceptance_unproven:no message_id`) — applied to TEXT, .txt/.md
+sendMessage, and binary sendDocument paths; (b) the server transition
+`resolveDeliveryAttempt(SENT)` independently rejects missing/invalid
+message_id with `FAIL_CLOSED_TELEGRAM_DELIVERY_EVIDENCE` — the bridge is
+never trusted alone. Production `governedSend()` in
+`scripts/telegram-bridge.mjs` validates `result.message_id` (missing →
+`{kind:"unknown"}`). Test §11: 3 payload kinds → `UNKNOWN_SIDE_EFFECT`,
+`message_id` undefined, `status≠SENT`; direct `to=SENT` with
+undefined/null/"" → throw ×3; real message_id still lands SENT.
+
+## §3 — bounded retry governance (BLOCKER) → closed
+
+Every payload slot now persists `attempt_count`, `max_attempts`,
+`next_retry_at`, `last_error`. Canonical ceiling
+`PAIR_TG_DELIVERY_MAX_ATTEMPTS` via `telegramDeliveryMaxAttempts()`
+(env-config bounded parse `[1..10]`, default `3`, fail-closed on
+malformed) wired serve → `MissionRuntimeDeps.telegramDeliveryMaxAttempts`
+→ `mintTelegramDeliveryRequest` (stamped per slot at mint; default
+`TELEGRAM_DELIVERY_DEFAULT_MAX_ATTEMPTS=3` fallback). Definite failure:
+`attempt_count++`; `< ceiling` → `QUEUED` + `next_retry_at =
+now + min(60, 5·attempt_count)s` deterministic backoff; `== ceiling` →
+`FAILED_DELIVERY` durable terminal hold. No human approval for retry
+budget; no infinite retry. Test §12: attempt1→QUEUED+`next_retry_at=+5s`;
+poll inside backoff → **zero sends, not projected**; attempt2→+10s;
+attempt3→`FAILED_DELIVERY`; polls at +60s/+600s/+60000s → zero sends
+forever.
+
+## §4 — pending projection honors lifecycle → closed
+
+`pendingTelegramDeliveries(store, now)` reconciles stale `SENDING`
+(TEXT and FILES) to `UNKNOWN_SIDE_EFFECT` first, then returns ONLY
+requests with ≥1 eligible payload: `state===QUEUED` +
+`attempt_count<max_attempts` + `next_retry_at<=now`. Excluded entirely:
+SENT, UNSENDABLE, FAILED_DELIVERY, UNKNOWN_SIDE_EFFECT, SENDING, and
+QUEUED payloads whose `next_retry_at` is still in the future — a request
+with zero eligible payloads is not projected at all. No bridge-side
+sleep is the authority.
+
+## §5 — legacy /ack bypass removed (BLOCKER) → closed
+
+`POST /api/telegram-deliveries/:id/ack` route DELETED from
+`mission-control-server.ts`; `MissionControl.ackTelegramDelivery` method
+and `ackTelegramDelivery()` domain function DELETED. The ONE production
+mutation path is `POST /api/telegram-deliveries/:id/transition` →
+QUEUED→SENDING→SENT|FAILED|UNKNOWN. `workforce/messages/:id/ack` is a
+different, unrelated endpoint (unchanged). Test §13: controller has no
+`ackTelegramDelivery`; QUEUED→SENT request throws
+`FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION`, slot stays QUEUED.
+
+## §6 — strict legal-transition matrix → closed
+
+Illegal transitions throw `FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION` —
+never silent no-ops: QUEUED→SENT, SENT→SENDING, UNKNOWN→SENDING,
+UNSENDABLE→SENT all reject; SENDING→SENT additionally requires valid
+`message_id` (§2); QUEUED→SENDING rejected when `attempt_count>=max`
+or `next_retry_at>now` (BACKOFF_PENDING/BUDGET_EXHAUSTED reasons).
+Idempotent replay of the same in-flight `SENDING` begin returns the
+existing attempt unchanged.
+
+## §7 — deterministic attempt identity → closed
+
+`Date.now()` removed from the canonical transition. `beginDeliveryAttempt`
+persists `attempt_number = attempt_count+1` and
+`attempt_id = ATT_<digest(delivery_id:slot:attempt_number)>` — same
+inputs → same id, idempotent replay verified in test §14.
+
+## §8 — TEXT ≡ FILES lifecycle → closed
+
+TEXT payload uses request-level slot fields (`text_state`,
+`attempt_count`, `max_attempts`, `next_retry_at`, `attempt_id`,
+`message_id`, `last_error`, `unknown_reason`) flowing through the exact
+same `slots()` view + transition functions as FILES artifacts.
+
+## §15 — R3 proofs preserved
+
+All 48 R1–R3 focused tests pass unchanged (only §14A retry assertion
+extended to assert the new `attempt_count`/`next_retry_at` backoff
+semantics — the retry path now correctly flows through the eligibility
+gate instead of re-sending instantly).
+
+## §16 — regression (Node 22)
+
+| Surface | Result |
+|---|---|
+| Focused incident (R1–R4) | **58/58 PASS** (48 R1–R3 + 10 R4: §9 ×2, §11 ×4, §12 ×2, §13–14 ×2) |
+| pair-ops-telegram-delivery | 3/3 PASS |
+| Phase B / PR#23 / Phase C / Phase D | 123 + 20 + 51 + 37 PASS |
+| **Full suite** | **2621 pass / 2 fail env P5 cũ / 15 skipped** (R3 2611 → +10, zero regression — same 2 pre-existing DSH/CODEX probe env fails since base) |
+| `npx tsc --noEmit` / `pnpm build` | clean / clean |
+
+## §17 — changed files (R4)
+
+- `src/pair/telegram-delivery.ts` — unified slot state machine +
+  retry budget + strict transitions + deterministic attempt_id +
+  eligible-only projection; `ackTelegramDelivery` deleted.
+- `src/pair/telegram-transport.ts` — `ok`-without-message_id →
+  `backend.unknown`; TEXT gated on `text_state===QUEUED`.
+- `src/pair/env-config.ts` — `TG_DELIVERY_MAX_ATTEMPTS` +
+  `telegramDeliveryMaxAttempts()` bounded helper.
+- `src/pair/mission-runtime.ts` — `telegramDeliveryMaxAttempts` dep → mint.
+- `src/pair/mission-control.ts` — `ackTelegramDelivery` deleted;
+  `transitionTelegramDelivery` gains optional deterministic `now`.
+- `src/pair/mission-control-server.ts` — `/ack` route deleted.
+- `scripts/serve-mission-control.mjs` — `PAIR_TG_DELIVERY_MAX_ATTEMPTS` wiring.
+- `scripts/telegram-bridge.mjs` — `governedSend` validates message_id.
+- `src/__tests__/pair-planner-dataflow-incident.test.ts` — +10 R4 tests;
+  runTransport/storeBackend gain injected `now`; recordingTransport
+  `noMid` mode.
+- `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_REPORT.md` — this section.
+
+## §18 — 8 proofs
+
+1. Stale TEXT SENDING → `UNKNOWN_SIDE_EFFECT` → zero resend (§9).
+2. `ok` without message_id → NOT SENT for TEXT, txt, binary; server
+   `to=SENT` without id rejects (§11).
+3. Repeated definite failure stops at ceiling → `FAILED_DELIVERY`
+   terminal, zero sends forever (§12).
+4. Poll before `next_retry_at` → not projected, zero calls (§12).
+5. `/ack` gone — QUEUED→SENT without SENDING fails closed (§13).
+6. Illegal matrix QUEUED→SENT / SENT→SENDING / UNKNOWN→SENDING /
+   UNSENDABLE→SENT all fail closed (§14).
+7. Success persists real `message_id` + `completed_at` (§14D/§11).
+8. All R3 invariants PASS — manifest scope, negation, origin binding,
+   allowlist-not-broadcast, non-telegram-no-default→UNSENDABLE, no
+   outbox scan, completion≠send, DEVIN upload≠send, pre-dispatch
+   missing-input, reserved fields, no `.sent` (48/48 preserved).
+
+Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R4_PENDING_INDEPENDENT_AUDIT`
+
+STOP. DO NOT MERGE. DO NOT START PHASE E.

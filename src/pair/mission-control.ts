@@ -28,7 +28,6 @@ import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.
 import { validatePlanProposal } from "./proposal.js";
 import { assertPlanDataflow } from "./plan-dataflow.js";
 import {
-  ackTelegramDelivery as ackTelegramDeliveryEntity,
   pendingTelegramDeliveries,
   beginDeliveryAttempt as beginDeliveryAttemptEntity,
   resolveDeliveryAttempt as resolveDeliveryAttemptEntity,
@@ -127,22 +126,15 @@ export class MissionControl {
     return state ? pending.filter((r) => r.status === state) : pending;
   }
 
-  /** Bridge ack — idempotent flip of ONE manifested artifact (or the TEXT
-   *  request) to SENT. Only what the manifest authorized may ack. */
-  ackTelegramDelivery(deliveryId: string, artifact?: string) {
-    return ackTelegramDeliveryEntity({
-      store: this.store,
-      deliveryId,
-      artifact,
-      now: utcnow(),
-    });
-  }
-
-  /** R3 §7 — explicit transport lifecycle transition for one artifact
-   *  (or the TEXT request): QUEUED→SENDING (begin), SENDING→SENT |
-   *  QUEUED (definite failure) | UNKNOWN_SIDE_EFFECT (ambiguous), or
-   *  request-level UNSENDABLE hold (destination unresolvable / not
-   *  allowed). Only legal transitions mutate; all others no-op. */
+  /** R3/R4 — the ONE production mutation path for delivery state
+   *  (the legacy /ack bypass was removed): explicit transport lifecycle
+   *  transition for one artifact (or the TEXT request):
+   *  QUEUED→SENDING (begin — deterministic attempt id, budget+backoff
+   *  enforced), SENDING→SENT (requires valid message_id evidence) |
+   *  QUEUED/FAILED_DELIVERY (definite failure — bounded retry) |
+   *  UNKNOWN_SIDE_EFFECT (ambiguous), or request-level UNSENDABLE hold
+   *  (destination unresolvable / not allowed). Illegal transitions
+   *  throw fail-closed — never silent no-ops. */
   transitionTelegramDelivery(
     deliveryId: string,
     input: {
@@ -150,16 +142,18 @@ export class MissionControl {
       to?: string;
       message_id?: string | number;
       error?: string;
+      now?: string;
     },
   ) {
     const artifact = input.artifact === undefined ? undefined : input.artifact;
+    const now = input.now ?? utcnow();
     switch (String(input.to ?? "")) {
       case "SENDING":
         return beginDeliveryAttemptEntity({
           store: this.store,
           deliveryId,
           artifact,
-          now: utcnow(),
+          now,
         });
       case "SENT":
         return resolveDeliveryAttemptEntity({
@@ -168,7 +162,7 @@ export class MissionControl {
           artifact,
           outcome: "SENT",
           messageId: input.message_id,
-          now: utcnow(),
+          now,
         });
       case "FAILED":
         return resolveDeliveryAttemptEntity({
@@ -177,7 +171,7 @@ export class MissionControl {
           artifact,
           outcome: "FAILED",
           error: input.error,
-          now: utcnow(),
+          now,
         });
       case "UNKNOWN":
         return resolveDeliveryAttemptEntity({
@@ -186,14 +180,14 @@ export class MissionControl {
           artifact,
           outcome: "UNKNOWN",
           error: input.error,
-          now: utcnow(),
+          now,
         });
       case "UNSENDABLE":
         return holdTelegramDeliveryEntity({
           store: this.store,
           deliveryId,
           reason: String(input.error ?? "destination_not_allowed"),
-          now: utcnow(),
+          now,
         });
       default:
         throw new PolicyError(
