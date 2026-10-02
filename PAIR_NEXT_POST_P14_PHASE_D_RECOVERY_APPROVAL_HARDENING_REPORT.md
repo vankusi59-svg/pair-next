@@ -1,0 +1,553 @@
+# PAIR NEXT — POST-P14 PHASE D: RECOVERY + APPROVAL HARDENING REPORT
+
+- **Branch:** `devin/post-p14-phase-d-recovery-approval-hardening`
+- **Base:** `0eb2495` (post-#25 merge, Phase C + R1)
+- **Scope:** mandate §1–§13 — explicit approval intents, durable exactly-once exercise, duplicate-request closure, WAITING_APPROVAL convergence, UNKNOWN_SIDE_EFFECT_STATE closure, taxonomy, bounded provenance, boundary preservation
+- **Status:** implementation + tests + 2 live E2E scenarios verified; **PENDING INDEPENDENT AUDIT — DO NOT MERGE**
+
+---
+
+## 1. Mandate → implementation map
+
+| § | Requirement | Where | Evidence |
+|---|---|---|---|
+| §1 | Explicit approval intents (extension / ACK-no-replay / revalidation), never widens authority | `approval-queue.ts` `RECOVERY_APPROVAL_INTENTS`; `mission-runtime.ts` `approvalIntentFor` + `mintRecoveryApproval` | tests A, H; LIVE1, LIVE2 |
+| §2 | Durable `approval_exercise` — one approval ⇒ at most ONE runtime effect | `approval-queue.ts` `exercise()` (deterministic `APRE_<id>` + `APPROVAL_EXERCISED` event); `exerciseApprovedRecovery` | tests B, C, D; LIVE1, LIVE2 |
+| §3 | Duplicate-request closure: dedupe + restart relink, no orphans | `approval-queue.ts` `request()` expireSweep + PENDING dedupe, `findPendingEquivalent`; `mintRecoveryApproval` relink arm | test E |
+| §4 | WAITING_APPROVAL convergence for all statuses | `mission-runtime.ts` `checkPendingApproval` (expireSweep → PENDING wait / APPROVED exercise / DENIED·EXPIRED abort / SUPERSEDED relink-or-abort) | tests F, G |
+| §5 | UNKNOWN closure — approve ⇒ barrier settle + task FAILED + zero replay + converge | `runReconciliation` mint arm (intent `ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY`); `exerciseApprovedRecovery` no-replay arm (barrier settled w/ `operator_outcome`, `terminal_outcome` on execution row, pending recovery neutralized) | tests H, I; LIVE1 |
+| §6 | AUTHORITY_REJECTED / FAIL_CLOSED_DSH_* → POLICY_DENIAL precedence | `recovery-controller.ts` CLASS_RULE before provider/model regexes | tests J, K |
+| §7 | Bounded provenance — identical re-escalation ⇒ abort, no approval loop | `mintRecoveryApproval` exercised-equivalent check → `abortMission("approval_chain_bounded:<signature>")` | test L; LIVE2 |
+| §8 | P23 apply boundary, P24 capability authority, routers, Phase C failover preserved; ApprovalQueue never dispatches | zero edits to gate/router/route-selector/dsh-model-router semantics | regression matrix |
+| §9 | Tests A–L | `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` | 12/12 |
+| §10 | LIVE1 + LIVE2 on isolated dirs, durable IDs | `/tmp/pair-mc-phd-live{1,2}` + `/tmp/pair-dsh-home-phd{1,2}` | §4–§5 below |
+| §11 | Regression vs `0eb2495` baseline + tsc + build | | §6 |
+
+## 2. Additional REAL defects found and closed in this phase
+
+1. **Apply-arm chain-stomp (production limbo mechanism)** — in RETRY_SAME_ROUTE / RE_ROUTE arms, a terminal settle inside the arm spawned a *successor* recovery chain; the arm's unconditional `clearPendingRecovery` then wiped the successor's `pending_recovery` → runtime stuck RUNNING forever (same mechanism that stranded live mission `MSN_01M3W4FW`). Fix: the apply is only closed when `pending_recovery.recovery_id === pending.recovery_id`.
+2. **Extension grant could never yield a dispatch (this session's LIVE2 caught it)** — `recovery_attempt` rows are written per *decision*, so the HUMAN_APPROVAL_REQUIRED decision itself burns an attempt slot: a relative `+N` ceiling is consumed instantly by the next decide, and the `consecutive_identical` guard independently re-escalates identical-signature failures. Fix: the exercised grant records `baseline_attempts` + `baseline_identical` (attempt counts at grant time) and decide() receives absolute ceilings `task_attempt_ceiling` / `consecutive_identical_ceiling` = baseline + grant. Verified: grant +1 ⇒ exactly one dispatch then bounded abort.
+3. **Operator decide unreachable (approval scope round-trip gap)** — `approval_request` persisted only `scope_digest`, never the scope; UI/telegram sent `{scope: a.scope ?? {}}` → digest mismatch → every operator decide failed closed. Fix: record now persists `scope_snapshot`; `approvals()` list aliases `scope`; `decide()` scope param optional — falls back to the stored snapshot (digest enforcement unchanged); server handlers pass `body.scope` verbatim instead of `?? {}` so an omitted scope triggers the fallback instead of overriding it.
+4. **Exercise-path clock hole** — the fresh `startRecovery` after an exercised approval dropped `now`, anchoring the successor chain's dueAt to wall time; threaded `now` through `checkPendingApproval → exerciseApprovedRecovery → startRecovery` so tick-time semantics stay consistent.
+
+## 3. Tests A–L (focused suite — 12/12 pass)
+
+- **A** extension grant binds to the failed task only (scope, intent, exact grant, `baseline_attempts`, mission ceiling untouched) **and yields exactly one more dispatch, then bounded abort — no second approval**
+- **B** one APPROVED ⇒ exactly one durable `APRE_*` row + one grant entry
+- **C** restart (reopened db, fresh runtime) re-tick cannot re-apply the grant — `exercise.created:false`
+- **D** repeated exercise of the same approval ⇒ one durable winner
+- **E** crash after `request()` before linkage ⇒ restart rediscovers + relinks the existing PENDING; no duplicate request
+- **F** TTL-expired PENDING inside WAITING_APPROVAL ⇒ bounded terminal (sweep on poll)
+- **G** SUPERSEDED approval cannot wedge WAITING_APPROVAL (relink or bounded terminal)
+- **H** UNKNOWN no-replay approve ⇒ barrier settled + `OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY` + task FAILED + zero replay + converged
+- **I** denied no-replay ⇒ bounded terminal
+- **J** `AUTHORITY_REJECTED`/`FAIL_CLOSED_DSH_*`/`FAIL_CLOSED_MODEL_*` classify ⇒ POLICY_DENIAL, never availability retry
+- **K** `ROUTE_INFEASIBLE` classification preserved (P24)
+- **L** identical re-escalation after an exercised grant ⇒ bounded abort (`approval_chain_bounded`), not another approval
+
+## 4. LIVE1 — post-dispatch UNKNOWN → reconcile → approve NO-REPLAY
+
+Isolated `PAIR_MC_DIR=/tmp/pair-mc-phd-live1`, `PAIR_DSH_HOME=/tmp/pair-dsh-home-phd1`, port 8899, fixture `fake-acp-agent-phc.mjs` with `hang_after_effect` on both pool models (writes marker + `agent_out.txt`, never replies).
+
+```
+mission MSN_01M3X38SW5FSENMCCZ67Q7FZ6E (pinned single task, REASONING → DSH)
+kill -9 <serve pid> mid-flight → exec EXE_83976ddad7307098d3b358dd78107cb0 = UNKNOWN
+restart → 2× reconciliation_receipt UNKNOWN_SIDE_EFFECT_STATE (REC_01M3X390V8..., REC_01M3X392S...)
+        → APR_01M3X392T007W66W3FQBPDYT7W PENDING, intent=ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY, risk=HIGH
+        → runtime WAITING_APPROVAL
+POST /api/approvals/.../approve {scope:<snapshot>} → APPROVED
+→ APRE_01M3X392T007W66W3FQBPDYT7W (deterministic)
+→ barrier settled, operator_outcome=OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY
+→ exec terminal_outcome=OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY
+→ task TSK_01M3X38VJ18... FAILED, mission FAILED — converged
+marker lines = 1 → ZERO replay
+```
+
+**PASS.**
+
+## 5. LIVE2 — attempt ceiling → EXTENSION approve → exactly one more → restart → grant not reapplied
+
+Isolated `PAIR_MC_DIR=/tmp/pair-mc-phd-live2`, both pool models `fail_prompt` (post-dispatch failure, TRANSIENT_TRANSPORT signature).
+
+```
+mission MSN_01M3X35PPR37N3J3886F3EJ48J → 3× RETRY_SAME_ROUTE (marker=4)
+→ ceiling → RCV_01M3X362XPTK9FKVVJEPVQB7HH sel=HUMAN_APPROVAL_REQUIRED
+→ APR_01M3X362XQESMEAVM7R9NGD8CW PENDING intent=RECOVERY_TASK_ATTEMPT_EXTENSION grant={"attempts_per_task":1}
+approve → APRE_01M3X362XQESMEAVM7R9NGD8CW (exercise rows=1) → kill -9
+restart → grant NOT re-applied (exercise still 1, no second approval row)
+        → budget_extension.tasks[TSK]={attempts_per_task:1, baseline_attempts:4, baseline_identical:4}
+        → fresh decide → RETRY_SAME_ROUTE → dispatch #5 (marker 4→5: exactly one more)
+        → fails → ceiling again → mint → §7 exercised-equivalent → abort
+        → runtime ABORTED reason=approval_chain_bounded:TRANSIENT_TRANSPORT::DEEPSEEK_HARNESS::any
+        → task FAILED, mission bounded — no re-apply, no duplicate approval
+```
+
+**PASS.**
+
+## 6. Regression matrix
+
+| Check | Baseline `0eb2495` | This branch |
+|---|---|---|
+| Focused suite | — | **12/12** |
+| Full suite | 2526 pass / 2 fail / 15 skipped | **2538 pass / 2 fail / 15 skipped** (+12 new, zero regression) |
+| Failing tests | 2× env P5 probes (real dsh/codex binaries absent) | identical 2× env P5 — same tests |
+| `tsc --noEmit` | clean | clean |
+| `pnpm build` | clean | clean |
+
+## 7. Boundary preservation (§8)
+
+- No semantic change in `gate.ts`, `route-registry.ts`, `route-selector.ts`, `multi-executor.ts`, `mission-router.ts`, `dsh-model-router.ts`, `mission-supervisor.ts`.
+- ApprovalQueue never dispatches: it only records intent/digest/exercise evidence; every runtime effect flows through `mission-runtime` chains with the same governed decide/apply boundary.
+- Phase C failover untouched (pre-dispatch boundary + AUTHORITY_REJECTED provenance preserved; the new CLASS_RULE only maps those classes into POLICY_DENIAL for the recovery matrix).
+
+## 8. Changed files
+
+- `src/pair/approval-queue.ts` — intents, scope_snapshot, dedupe/relink, `exercise()`, `listExercised()`, optional-scope `decide()`
+- `src/pair/mission-runtime.ts` — UNKNOWN→recovery on observe, `approvalIntentFor`/`mintRecoveryApproval`/`exerciseApprovedRecovery`, convergence, chain-stomp guard, baseline-anchored ceilings, `now` threading, inFlight filters
+- `src/pair/recovery-controller.ts` — POLICY_DENIAL class rule, absolute-ceiling extension inputs, unsettled filter excludes `terminal_outcome`
+- `src/pair/mission-control.ts` — `scope` alias on approval list; optional-scope approve/deny
+- `src/pair/mission-control-server.ts` — pass `body.scope` verbatim (snapshot fallback)
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — new (12 tests)
+- this report
+
+## 9. Limitations
+
+- `RECOVERY_OPERATOR_REVALIDATION` exercised effect is a bounded re-decision (no new facts ⇒ same signature re-escalates once ⇒ §7 abort) — tested via L; dedicated variant would be an easy add.
+- Legacy flat `budget_extension.attempts_per_task` grants (pre-task-scoped shape) keep relative semantics — no baseline anchor; only new grants get anchored ceilings.
+- LIVE1/LIVE2 drive a single pinned task per mission; multi-task mixed outcomes rely on unit coverage.
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_RECOVERY_APPROVAL_HARDENING_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R1 — Taxonomy + Exact-Once Approval Exercise + Scope Authority Closure
+
+Remediation of 6 findings on HEAD `fb17812c4ff88435a8216a979ae301cb8850e03c`. Same PR #26 / same branch. No redesign of MissionRouter/RouteSelector/DshModelRouter or the PR #23 recovery architecture.
+
+## R1.1 Corrected DSH failure taxonomy
+
+CLASS_RULES order (authority test = first match wins):
+
+| Code | Class | Why |
+|---|---|---|
+| `FAIL_CLOSED_ROUTE_INFEASIBLE` | `ROUTE_INFEASIBLE` | unchanged (PR #24) |
+| `FAIL_CLOSED_DSH_MODEL_EXHAUSTED` | **`TRANSIENT_TRANSPORT`** | NEW rule placed BEFORE the DSH authority blanket. Pool exhaustion aggregates *safe pre-dispatch availability* failures (provider down / model unavailable / credential missing) across every configured candidate — it is an availability outcome, not governance. It keeps recovery semantics (RETRY_SAME_ROUTE → RE_ROUTE → RECONCILIATION_REQUIRED), never an automatic ABORT merely because the code carries the `FAIL_CLOSED_DSH_` prefix. |
+| `AUTHORITY_REJECTED`, `FAIL_CLOSED_DSH_*` (all others), `FAIL_CLOSED_MODEL_ROLE`, `FAIL_CLOSED_MODEL_IDENTITY` | `POLICY_DENIAL` | unchanged — role violations, planner overlap, model-identity drift, invalid model binding, executor/provider authority invalid stay fail-closed bounded ABORT |
+
+Test J split: J1 asserts the authority set → POLICY_DENIAL; J2 asserts `FAIL_CLOSED_DSH_MODEL_EXHAUSTED` → TRANSIENT_TRANSPORT via both `error_code` and `result.error.code`.
+
+## R1.2 APRE lifecycle — deterministic, atomic, resumable
+
+`approval_exercise` row (entity `approval_exercise`, deterministic id `APRE_<approval suffix>`):
+
+```
+RESERVED  →  APPLYING            →  APPLIED
+(exercise() version-0 INSERT)      (markExercisedApplied, last write)
+fields: approval_exercise_id, approval_id, approval_type, requested_action,
+        intent, mission_id, task_id, scope_digest, operator_id,
+        effect (deterministic plan), state, exercised_at, applied_at, version
+```
+
+- **Concurrency**: two writers on *separate store connections* race the same version-0 INSERT → `ON CONFLICT DO NOTHING` → the loser catches `FAIL_CLOSED_VERSION_CONFLICT:created-elsewhere`, re-reads the winner's row, returns `{row: winner, created: false}` — a conflict is never surfaced as a runtime defect (test O: real second `PairEvidenceStore` + `ApprovalQueue` on the same db, loser's stale read forced via one-shot `tryGet` miss).
+- **Effect plan persisted once**: `exerciseApprovedRecovery` computes a deterministic plan (extension grant + `baseline_attempts` + `baseline_identical`) and passes it to `exercise(approvalId, plan)`; a resumer reuses `row.effect` verbatim — baselines can never drift between crash and restart.
+- **Crash window closed**: if the process dies with `state=APPLYING` (APRE durable, effect incomplete), the next `exercise()` call returns the same row and the runtime **re-applies the full idempotent effect** — it does NOT skip because APRE exists. `state=APPLIED` is written only after every effect write landed (`markExercisedApplied` is the final statement of `exerciseApprovedRecovery`).
+- **REVALIDATION re-entry bound**: the fresh post-exercise chain is stamped `pending_recovery.approval_exercise_id = <APRE id>`; `resumeExercisedChain` returns early when the stamped chain already exists — a restart/re-entry can never mint a second fresh recovery decision for the same exercise (tests P1, P2).
+
+## R1.3 Scope authority restored
+
+`ApprovalQueue.decide()` REQUIRES caller-presented scope:
+
+| Presented | Result |
+|---|---|
+| `scope == null` | throws `FAIL_CLOSED_APPROVAL_SCOPE_REQUIRED` — stored `scope_snapshot` is NEVER substituted into the authority check |
+| mutated scope | throws `FAIL_CLOSED_APPROVAL_SCOPE_MISMATCH` (digest ≠ bound `scope_digest`) |
+| canonical scope | PASS |
+
+`scope_snapshot` stays persisted; the API/UI projection (`approvals()` → `scope` alias, `GET /api/approvals`, `POST /api/approvals/:id/{approve,deny}` body, telegram bridge `a.scope`) keeps echoing the exact canonical scope — operator clients fetch it and present it back; they can never silently decide without it. Test M covers all three arms.
+
+## R1.4 Canonical-time expiry
+
+`checkPendingApproval(missionId, now)` now calls `expireSweep(now)` — supplied runtime/test time governs expiry, wall clock is irrelevant. Test N: `expires_at=2999-06-01` (future vs wall clock ~2026) + `tick(mid, "2999-07-01")` → EXPIRED + ABORTED — impossible under the old bare `expireSweep()`.
+
+## R1.5 SUPERSEDED relink — exact equivalent only
+
+Replacement candidates must ALL match the superseded approval:
+
+`mission_id` (listPending filter) ∧ `task_id` ∧ `approval_type` ∧ `requested_action` ∧ `failure_signature` (from `intent` or `scope_snapshot`)
+
+When several match, the candidate carrying the same `recovery_decision_id` wins; a single unambiguous equivalent is adopted; zero → `abortMission("approval_superseded")` (bounded terminal). Task A's approval can never relink to task B's (test Q1 adversarial: foreign-task pending stays PENDING, mission aborts); an equivalent re-minted after the supersede IS adopted (Q2).
+
+## R1.6 Regression — no mandate-scope regressions
+
+| Check | Result |
+|---|---|
+| Focused suite (updated) | **20/20** — J1/J2 taxonomy, M scope, N canonical expiry, O real-concurrency exercise, P1 crash-after-APRE resume, P2 restart chain dedupe, Q1/Q2 superseded adversarial |
+| PR #23 recovery closure (`pair-live-ops-recovery-closure`) | pass |
+| PR #24 route capability (`pair-route-capability-authority`) | pass |
+| Phase C model routing (`pair-phase-c-dsh-model-routing`) | 51/51 |
+| Phase B (`pair-phase-b`) | pass |
+| **Full suite** | **2546 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures (dsh/codex binaries absent); baseline `fb17812` 2538/2/15 → +8 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+### Harness note (not a product change)
+
+`ScriptedAdapter` gained an `idSeed` — a restarted adapter process mints fresh execution ids (real adapters mint UUIDs). Without it, restart tests collided on durable `executor_execution` ids and the gate correctly failed closed (`FAIL_CLOSED_VERSION_CONFLICT` → INTERNAL_RUNTIME_DEFECT). C/P1/P2 restart adapters use seeds `r1_`/`r2_`.
+
+### Preserved (verified by the suites above)
+
+3 intents · task-scoped extension · chain-stomp fix · no-replay UNKNOWN closure · barrier settlement · terminal_outcome · exercised-equivalent bounded chain · PR #23 boundary · PR #24 authority · Phase C routing.
+
+## Changed files (R1)
+
+- `src/pair/approval-queue.ts` — `exercise(id, effect?)` APPLYING lifecycle + loser-adopts-winner, `markExercisedApplied`, scope-required `decide()`
+- `src/pair/mission-runtime.ts` — `exerciseApprovedRecovery` rewrite (effect plan, APPLYING resume, `markExercisedApplied`), `exerciseEffectPlan`, `resumeExercisedChain` stamp, `expireSweep(now)`, SUPERSEDED exact-equivalent relink
+- `src/pair/recovery-controller.ts` — `FAIL_CLOSED_DSH_MODEL_EXHAUSTED → TRANSIENT_TRANSPORT` rule before the DSH authority blanket
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — 20 tests (+8)
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R1_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R2 — APRE Effect Ownership + Crash Convergence Closure
+
+Base: `7f38d86` (R1 audited HEAD). Scope: close the remaining exact-once gap — an APPLYING APRE now proves ONE durable effect owner via CAS claim, and the APRE lifecycle alone discovers unfinished work on any tick, in any mission state.
+
+## APRE state/claim model
+
+`RESERVED → APPLYING → APPLIED`. The APPLYING row is a real lease record:
+
+```
+approval_exercise_id (deterministic APRE_<id>), approval_id, approval_type,
+requested_action, intent, mission_id, task_id, scope_digest, operator_id,
+effect (deterministic plan, incl. stale_recovery snapshot),
+state: APPLYING | APPLIED,
+owner_id: MRI_* | null, claim_epoch: n, claimed_at, lease_expires_at,
+exercised_at, applied_at
+```
+
+`exercise()` is unchanged in semantics (winner-creates/loser-adopts, deterministic id) — the row now carries the ownership fields. `markExercisedApplied` is CAS-loss safe: version drift between claim and close re-reads and converges instead of surfacing `FAIL_CLOSED_VERSION_CONFLICT`.
+
+## Owner identity + lease/takeover
+
+- Owner id = `MRI_<ulid>` per `MissionRuntime` instance (`private readonly instanceId`) — a restart is a new owner, never impersonates a dead one.
+- `claimExercise(approvalId, ownerId, now, leaseMs=60000)`: pure CAS on the store.
+  - APPLIED → `{applied:true}`; owned by self + live lease → CAS renew → `{owned:true}`.
+  - Foreign live owner → `{owned:false}` (cannot steal — test G).
+  - Unowned or stale lease → CAS takeover `claim_epoch+1`, `claimed_at=now`, `lease_expires_at=now+60s` (test F).
+  - `IntegrityError` mid-CAS → bounded retry (≤3), then re-read + `{owned:false}` — contention never leaks as a runtime defect.
+
+## Concurrent losers + orphan discovery
+
+- Losers re-read the canonical row and converge normally — no apply, no decision, no transition, no defect (test A: separate `PairEvidenceStore` connection, foreign active owner).
+- `convergeApplyingExercises` runs at the TOP of every tick — before the terminal check — iterating `listExercised({mission_id})`. The APRE lifecycle is self-sufficient to find unfinished work; `mission_runtime` state does not gate discovery.
+- `convergeExercise` is the single owned-apply path shared by the WAITING_APPROVAL arm and the sweep: exercise (adopt winner) → claim → applied? bookkeeping only → not-owned? converge → owned? apply effect arms → markExercisedApplied.
+- Transitions only fire when `rt.state === WAITING_APPROVAL` (`waiting` flag) — orphan convergence completes effect writes without stomping a mission that already moved past the approval wait; chain resume is skipped on terminal missions.
+
+## Per-intent idempotency (all keyed by approval_exercise_id)
+
+- **EXTENSION**: grant written as a keyed assignment `budget_extension.tasks[taskId] = {attempts_per_task, baseline_*, approval_exercise_id}` — deterministic values from the persisted plan; re-apply writes identical values (test C: entry count/value frozen).
+- **REVALIDATION**: fresh chain stamped `pending_recovery.approval_exercise_id`; stamped → adopt, no second `recovery_decision` (test D). `stale_recovery` snapshot in the effect plan rebuilds the chain deterministically if the crash hit between clear and mint.
+- **ACK_NO_REPLAY**: stamp-guards on barrier (`approval_exercise_id` equality), task FAILED, exec `terminal_outcome` — re-entry performs zero writes; task never re-dispatched (test E: `dispatched=0` on the peer).
+
+## Crash-convergence evidence (tests A–G)
+
+| # | Scenario | Result |
+|---|----------|--------|
+| A | Foreign live owner + lease-expiry takeover, EXTENSION | 1 APRE / 1 owner-at-a-time / 1 grant / decisions +1 only / no defect |
+| B | Crash after claim, before effect (REVALIDATION) | takeover → single chain → APPLIED |
+| C | Crash after extension persisted | grant never stacks; stamped chain resumed; APPLIED |
+| D | Crash after fresh chain persisted | chain adopted (`recovery_id` unchanged), no 2nd decide; APPLIED |
+| E | Crash after no-replay effect (terminal mission) | zero replay, single settlement/outcome; APPLIED |
+| F | Stale owner after lease expiry | takeover, epoch 2 |
+| G | Live owner cannot be stolen (separate connection) | `owned:false`, row untouched |
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused (`pair-phase-d-recovery-approval-hardening`) | **27/27 pass** |
+| PR #23 (`pair-live-ops-recovery-closure`) | pass |
+| PR #24 (`pair-route-capability-authority`) | pass |
+| Phase C (`pair-phase-c-dsh-model-routing`) | pass |
+| Phase B (`pair-phase-b`) | pass |
+| **Full suite** | **2553 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R1 `7f38d86` 2546/2/15 → +7 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Changed files (R2)
+
+- `src/pair/approval-queue.ts` — APRE owner/lease fields on exercise(), new `claimExercise` CAS loop, CAS-safe `markExercisedApplied`
+- `src/pair/mission-runtime.ts` — `instanceId`, pre-terminal `convergeApplyingExercises` sweep, unified `convergeExercise` (claim → owned-apply → close), `waiting`/`terminal` guards on transitions + chain resume, `stale_recovery` snapshot in `exerciseEffectPlan`, stamp-guarded ACK arm
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +7 tests (A–G)
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R2_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R3 — APRE Stale Owner Fencing Closure
+
+Base: `3e11041` (R2 audited HEAD). Scope: `claim_epoch` is now a real fencing token — a stale owner that resumes after takeover has zero authority over the APRE effect.
+
+## Fencing-token design
+
+`claimExercise()` returns `claim: {owner_id, claim_epoch} | null` alongside `{row, owned, applied}`. `convergeExercise` retains that exact token for the whole apply: `token = claim.claim`. Every critical effect stage re-proves the token against the canonical row before mutating via `verifyExerciseClaim(approvalId, token)` — owner_id AND claim_epoch AND state APPLYING must all still match; any mismatch = stale → stop, bounded convergence, never a defect.
+
+## Authority rule + validation points
+
+An effect mutation may run only while `verifyExerciseClaim` returns the canonical row for the retained token. Fenced surfaces (all inside `convergeExercise` / `resumeExercisedChain`):
+
+| Surface | Validation point |
+|---------|------------------|
+| mission_runtime writes (all arms) | `if (!stillOwned()) return` at each case head |
+| budget extension grant | EXTENSION arm head fence |
+| pending_recovery / chain clear+mint+stamp | `resumeExercisedChain` fence at entry AND after `clearPendingRecovery`, before `startRecovery` |
+| barrier settlement | ACK arm head fence |
+| task terminalization | ACK arm head fence |
+| execution terminal_outcome | ACK arm head fence |
+| APRE finalization | `markExercisedApplied(approvalId, owner_id, claim_epoch)` |
+
+`markExercisedApplied` transitions to APPLIED only while the canonical row still matches the exact (owner_id, claim_epoch) in APPLYING — returns `{row, applied, fenced}`; a stale token gets `{fenced:true, applied:false}` and can NEVER land APPLIED, so `APPLIED` proves the fenced owner finished.
+
+## Lease-renew + stale-owner semantics
+
+- Renew is reachable only when the claimant still owns the CURRENT epoch (`owner === ownerId && lease active`); once another owner advanced `claim_epoch`, `owner_id` differs and the renew path is permanently closed — epoch N is fenced forever after epoch N+1.
+- Stale owner behavior: `verifyExerciseClaim` → null, `markExercisedApplied` → fenced, `claimExercise` → `owned:false` while the new owner's lease is live, re-claiming after the new lease ALSO expires is a legitimate fresh claim at a NEW epoch — the old token is never honored.
+- `claim_epoch` increments per successful takeover (1 → 2 → …) — durable handoff evidence.
+
+## Adversarial evidence (tests H + I)
+
+**H — full stale-owner fence** (EXTENSION): A claims epoch 1 → lease expires → B takes epoch 2 on a separate `PairEvidenceStore` connection → A resumes with its in-memory token: `verifyExerciseClaim` → null, `markExercisedApplied` → `{fenced:true}`, `claimExercise` → `owned:false`; A's runtime ticks → claim denied → zero effect writes (grant untouched, stale chain unstomped, decisions frozen). B applies + finalizes: 1 APRE, `state=APPLIED`, `owner=MRI_B`, `claim_epoch=2`, exactly `decisionsBefore+1` recovery decisions, exactly 1 grant entry.
+
+**I — takeover after partial effect** (REVALIDATION): A claims epoch 1, writes a partial effect (`pending_approval_id` cleared), stalls pre-chain-mint → lease expires → B takeover epoch 2 → A resumes fenced on both gates → B converges: adopts the same arm, mints the ONE canonical re-decision chain (via `stale_recovery` snapshot), marks APPLIED. Result: 1 APRE APPLIED by B/epoch2, exactly +1 `recovery_decision` (B's), 1 approval (§7 bound intact) — no duplicate chain, no stomp.
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **29/29 pass** (27 R2 + H/I) |
+| PR #23 (`pair-live-ops-recovery-closure`) | pass |
+| PR #24 (`pair-route-capability-authority`) | pass |
+| Phase C (`pair-phase-c-dsh-model-routing`) | pass |
+| Phase B (`pair-phase-b`) | pass |
+| **Full suite** | **2555 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R2 `3e11041` 2553/2/15 → +2 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+`FAIL_CLOSED_DSH_MODEL_EXHAUSTED` availability semantics · DSH authority → POLICY_DENIAL · ROUTE_INFEASIBLE · caller-presented scope · `expireSweep(now)` · exact SUPERSEDED relink · APRE orphan discovery at tick start · deterministic effect plan + `stale_recovery` · task-scoped extension (no stacking) · UNKNOWN no-replay (zero replay) · PR #23/#24/Phase C.
+
+## Changed files (R3)
+
+- `src/pair/approval-queue.ts` — `claimExercise` returns `claim` token; new `verifyExerciseClaim` fencing check; `markExercisedApplied(approvalId, ownerId, claimEpoch)` → `{row, applied, fenced}`
+- `src/pair/mission-runtime.ts` — fencing token retained in `convergeExercise`; `stillOwned` gate at every arm head; `resumeExercisedChain` fenced at entry + before chain mint; finalization requires token match
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +2 tests (H, I)
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R3_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R4 — Per-Stage APRE Fencing Closure
+
+Base: `17d0c86` (R3 audited HEAD). Scope: fencing now re-verifies the claim token before EVERY meaningful canonical mutation — a mid-apply takeover stops the stale owner at the next stage, and a chain minted-but-unstamped by a fenced owner is adopted, never re-minted.
+
+## Mandatory fencing API
+
+`markExercisedApplied(approvalId, ownerId, claimEpoch)` — both params REQUIRED (no unfenced finalization path remains). Transitions `APPLYING→APPLIED` only while canonical `owner_id`/`claim_epoch`/`state=APPLYING` all match → returns `{row, applied, fenced}`; stale token → `{fenced:true, applied:false}` (test H proves `fenced:true` + row NOT APPLIED).
+
+## Per-stage fencing points
+
+`stillOwned()` = `verifyExerciseClaim(id, token)` — fresh canonical read each call. Fences placed:
+
+| Arm | Sequence |
+|-----|----------|
+| EXTENSION | v→grant assignment+rt put → v→runtime transition → v→chain entry → v→pending clear → v→decision mint (`startRecovery`) → v→chain stamp → token→APPLIED |
+| REVALIDATION | v→rt put → v→transition → chain fences as above → token→APPLIED |
+| ACK_NO_REPLAY | v→barrier settle (in-mem) → v→task FAILED → v→exec terminal_outcome → v→mission_runtime persist → v→pending_recovery clear → v→linkage clear + transition → token→APPLIED |
+| default | v→rt put → v→transition → token→APPLIED |
+
+`resumeExercisedChain` fences at: entry, before `clearPendingRecovery`, before `startRecovery` mint, before the chain-stamp put — plus inside the new adoption path.
+
+## Post-mint adoption (chain uniqueness)
+
+`stale_recovery` snapshot now records `recovery_id`. When `pending_recovery` exists unstamped and its `recovery_id` differs from the snapshot's chain, the pending IS a fresh chain minted by a fenced owner → the resuming owner ADOPTS it (stamp + put), never mints a second `recovery_decision`. Plans lacking the snapshot key fall back to conservative clear+rebuild — no misclassification.
+
+## Mid-apply takeover evidence (tests J/K/L — trap injects takeover inside a `verifyExerciseClaim` call)
+
+- **J (UNKNOWN arm)**: A epochs through stages; takeover injected at the fence before `clearPendingRecovery`. Result: barrier settled+stamped once (durable from A), task FAILED once, exec `terminal_outcome` once, A stopped before clear/transition/finalize; B renews epoch 2 → idempotent skips → neutralizes stale chain → `APPLIED` by B/2. Zero replay (`exA`/`exA2` dispatches frozen).
+- **K (EXTENSION, after mint before stamp)**: A mints the fresh chain unstamped → takeover → A fenced at stamp. B ADOPTS the same `recovery_id` chain — `recovery_decision` count `+1` total (A's mint), APRE `APPLIED` B/2.
+- **L (REVALIDATION, before mint)**: old chain cleared, takeover, A fenced pre-mint (decisions frozen). B rebuilds from `stale_recovery` → exactly `+1` decision, `APPLIED` B/2, §7 bound intact (1 approval).
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **32/32 pass** (29 R3 + J/K/L) |
+| PR #23 / PR #24 / Phase C / Phase B | pass (230 tests) |
+| **Full suite** | **2558 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R3 `17d0c86` 2555/2/15 → +3 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+DSH_EXHAUSTED availability · authority→POLICY_DENIAL · ROUTE_INFEASIBLE · caller-presented scope · `expireSweep(now)` · exact SUPERSEDED relink · orphan discovery at tick start · deterministic effect plan + stale_recovery · lease takeover + epoch token · extension no-stack · revalidation dedupe · UNKNOWN zero-replay · PR #23/#24/Phase C.
+
+## Changed files (R4)
+
+- `src/pair/approval-queue.ts` — `markExercisedApplied` ownerId/claimEpoch now mandatory (unfenced path removed)
+- `src/pair/mission-runtime.ts` — per-stage `stillOwned` fences in every arm; `resumeExercisedChain` 4-point fencing + post-mint adoption via `recovery_id` snapshot
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +3 tests (J/K/L) + takeover-injection trap
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R4_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R5 — Atomic APRE Fence + Mutation Closure
+
+Base: `256883e` (R4 audited HEAD). Scope: every APRE-owned critical stage now re-verifies the claim INSIDE the same `BEGIN IMMEDIATE` transaction as its mutation — the verify→takeover→write TOCTOU window is closed. Takeover can only land between committed stages; the stale owner's next stage is fenced atomically.
+
+## Atomic fencing primitive
+
+`ApprovalQueue.runFencedExerciseStage(approvalId, claimToken, mutation)` — opens `store.immediate(() => …)` (one `BEGIN IMMEDIATE…COMMIT` on the canonical connection), re-reads the APRE inside the transaction, requires `state==APPLYING && owner_id && claim_epoch` match, then runs exactly one bounded mutation. Stale → `{fenced:true}` with ZERO writes. Returns `{fenced, row, result}`.
+
+## Transaction boundaries
+
+Stages stay bounded (`fence + one logical mutation + commit`) — never one giant transaction, preserving crash-resumability, orphan adoption, persisted partial progress and lease takeover. No writer lock is held across executor/network/filesystem calls (pure canonical DB work only). Nested `store.immediate()` inside mutations (e.g. `service.updateTask`) collapse to savepoints — safe by better-sqlite3 semantics. Competing `claimExercise` on a second connection cannot advance `claim_epoch` while a stage holds the write lock (busy_timeout 5000 → SQLITE_BUSY), and `markExercisedApplied` remains the mandatory CAS-atomic finalization.
+
+## Atomic stage sequences
+
+| Arm | Stages |
+|-----|--------|
+| EXTENSION | grant+rt put → transition → [resume: clear → mint+stamp] → CAS APPLIED |
+| REVALIDATION | rt put → transition → [resume: clear → mint+stamp] → CAS APPLIED |
+| ACK_NO_REPLAY | barrier settle+rt put → task FAILED → exec terminal_outcome → pending clear → linkage clear+transition → CAS APPLIED |
+| `resumeExercisedChain` | adopt-stamp, or clear → **mint+stamp in ONE transaction** — the mint is atomically owned; no window for a stale mint followed by a stale stamp |
+
+Post-mint adoption (R4 `recovery_id` snapshot path) is preserved for durable chains minted by earlier code versions; under atomic mint+stamp the "minted-unstamped" state cannot arise from current code.
+
+## TOCTOU evidence (tests J–M, separate connections; busy_timeout makes in-transaction contention raise SQLITE_BUSY)
+
+- **J (UNKNOWN arm)**: takeover injected before stage 4 (pending clear). Barrier settle+rt, task FAILED, exec outcome committed atomically once each; A fenced at clear; B resumes → linkage clear+transition → APPLIED B/2; zero replay, one terminal outcome, pending neutralized.
+- **K (chain-mint TOCTOU)**: inside A's atomic mint+stamp transaction, B's `claimExercise` from a second connection is blocked (~5s SQLITE_BUSY — real evidence the write lock held); A mints+stamps under epoch 1 → commit → B takeover epoch 2 → A's `markExercisedApplied` fenced → B adopts the SAME `recovery_id` chain → exactly +1 `recovery_decision`, no duplicate, APPLIED B/2.
+- **L (REVALIDATION)**: takeover before mint+stamp stage → stale chain cleared, A fenced pre-mint → B rebuilds from `stale_recovery` → exactly +1 decision, APPLIED B/2.
+- **M (true verify→mutation TOCTOU, queue-level)**: inside A's in-transaction verify PASS for stage N, B's takeover attempt fails SQLITE_BUSY (cannot interleave); A's stage commits epoch1-valid; only after commit does B's takeover land epoch2; A's stage N+1 atomically fenced — zero mutation, no defect.
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **33/33 pass** (R4 32 + M) |
+| PR #23 / PR #24 / Phase C / Phase B | pass (230 tests) |
+| **Full suite** | **2559 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R4 `256883e` 2558/2/15 → +1 test, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+All R0–R4 closures: DSH_EXHAUSTED availability · authority→POLICY_DENIAL · ROUTE_INFEASIBLE · caller-presented scope · `expireSweep(now)` · exact SUPERSEDED relink · orphan discovery · deterministic plan + `stale_recovery` · `recovery_id` adoption · lease takeover · owner+epoch token · mandatory `markExercisedApplied` · extension no-stack · revalidation dedupe · UNKNOWN zero-replay · PR #23/#24/Phase C.
+
+## Changed files (R5)
+
+- `src/pair/approval-queue.ts` — new `runFencedExerciseStage` primitive (in-transaction claim verify + one mutation)
+- `src/pair/mission-runtime.ts` — `stillOwned()` replaced by `stage()` atomic runner across all arms; `resumeExercisedChain` mint+stamp unified into one transaction; adoption stamp atomic
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — trapVerify→trapStage migration, J/K/L retargeted, +M true-TOCTOU test
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R5_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R6 — SQLite Contention Convergence Closure
+
+Base: `7f76af4` (R5 audited HEAD). Scope: SQLITE_BUSY/SQLITE_LOCKED — expected lock-contention under R5's `BEGIN IMMEDIATE` fencing — now converges bounded at every APRE surface instead of escaping `tick()` as a defect. busy_timeout unchanged (5000ms); correctness, not timeout tuning.
+
+## Contention detection rule
+
+`isSqliteContentionError(e)` (`store.ts`) — ONLY `SQLITE_BUSY*`/`SQLITE_LOCKED*` codes (better-sqlite3 `code`, message fallback). No broad catch: IntegrityError, hash mismatch, schema/corruption, governance errors all still fail closed.
+
+## Contention semantics
+
+| Surface | Behavior on BUSY/LOCKED |
+|---------|------------------------|
+| `exercise()` ensure-put | re-read → `{created:false, contention:true}` — adopt canonical |
+| `claimExercise()` renew/takeover CAS | re-read → `{owned:false, applied:known, claim:null, contention:true}` — never pretends ownership, never advances epoch |
+| `runFencedExerciseStage()` | `{fenced:false, contended:true}` — mutation NOT run, claim never checked → semantically distinct from `fenced` (stale) |
+| `markExercisedApplied()` CAS | `{applied:false, fenced:false, contended:true}` — bounded retry next tick |
+
+MissionRuntime: `convergeExercise` returns early on `ensure.contention`/`claim.contention`; the stage wrapper collapses `fenced||contended` into `stop` (evidence flag kept distinct) — no effect continuation, no fallback recovery, no abort, no INTERNAL_RUNTIME_DEFECT. Next tick rediscovers the same APPLYING row normally.
+
+## Evidence (tests N/O — REAL lock contention, 2 connections)
+
+- **N (claim + stage + full tick)**: conn A holds `BEGIN IMMEDIATE` → B's `claimExercise` → `contention:true, owned:false, claim:null` (5s busy timeout then bounded result — real); B's `runFencedExerciseStage` → `contended:true`, mutation NOT run, `fenced:false` (claim never checked). Then A holds the lock across B's ENTIRE `tick()` → tick returns cleanly: mission stays `WAITING_APPROVAL`, zero decisions, APRE unowned epoch0 APPLYING. Lock released → B's next tick claims epoch1 → applies once → APPLIED, `recovery_decision` +1.
+- **O (stage contention through tick — legitimate owner)**: B owns epoch1; A's lock wraps each of B's stage calls via a second connection → every stage contends → zero grant write, zero decisions, no abort; APRE stays `MRI_B`/epoch1 APPLYING. Unpatched → B's next tick completes → APPLIED, `+1` decision.
+
+R5 TOCTOU evidence also strengthened: in tests K/M, B's intra-transaction takeover attempt now provably returns `contention:true` — the write lock held through A's commit.
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **35/35 pass** (R5 33 + N + O) |
+| PR #23 / PR #24 / Phase C / Phase B | pass (230 tests) |
+| **Full suite** | **2561 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R5 `7f76af4` 2559/2/15 → +2 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+All R0–R5 closures — R5 atomic fence+mutation intact (verify stays inside the transaction, BEGIN IMMEDIATE untouched, busy_timeout unchanged) · scope authority · expireSweep(now) · SUPERSEDED relink · taxonomy · ROUTE_INFEASIBLE · deterministic APRE/plan · orphan discovery · lease/epoch fencing · mandatory finalization · extension no-stack · revalidation dedupe · stale_recovery · recovery_id adoption · UNKNOWN zero-replay · PR #23/#24/Phase C.
+
+## Changed files (R6)
+
+- `src/pair/store.ts` — `isSqliteContentionError` canonical detection
+- `src/pair/approval-queue.ts` — contention-bounded returns on `exercise`/`claimExercise`/`runFencedExerciseStage`/`markExercisedApplied`
+- `src/pair/mission-runtime.ts` — early-return on `contention`; stage `stop = fenced || contended`
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +N/O contention tests; K/M assert bounded `contention` intra-transaction
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R6_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+## Phase D R7 — Selective SQLite Contention Catch Closure
+
+**Commit:** R7 commit on `devin/post-p14-phase-d-recovery-approval-hardening` (after `91199bd`)
+
+### Broad-catch removal
+`claimExercise.contended()` previously used `try { fresh = tryGet(...) } catch { fresh = null }` — a NON-contention governance error during the canonical re-read was swallowed into a contention result. Now selective: `catch (e) { isSqliteContentionError(e) ? fresh = null : throw }`. All other R6 surfaces (`exercise`, `runFencedExerciseStage`, `markExercisedApplied`) were already selective; no new broad catches added.
+
+### Final detection rule
+`isSqliteContentionError`: `code` startsWith `SQLITE_BUSY`/`SQLITE_LOCKED`, OR message matches `SQLITE_(BUSY|LOCKED)` / "database is locked" / "database table is locked" (better-sqlite3's canonical contention text when re-wrapped without `code`). Positives: SQLITE_BUSY, SQLITE_BUSY_TIMEOUT, SQLITE_BUSY_SNAPSHOT, SQLITE_LOCKED, SQLITE_LOCKED_SHAREDCACHE, plain "database is locked". Negatives: FAIL_CLOSED_VERSION_CONFLICT, FAIL_CLOSED_ENTITY_HASH_MISMATCH, SQLITE_CORRUPT, SQLITE_SCHEMA, generic Error, non-Error objects — all fail closed.
+
+### Evidence
+- **P1**: writer lock held (conn A) → B's `claimExercise` CAS BUSY → re-read throws `FAIL_CLOSED_ENTITY_HASH_MISMATCH` → **propagates** (claimExercise throws; no ownership fabricated; APRE epoch0 ownerless unchanged). Runtime-level: same error inside tick → tick throws through existing fail-closed path — NOT swallowed as contention.
+- **P2**: detector positive/negative matrix (all pass).
+- R6 N/O contention tests still green — semantics unchanged (`fenced` vs `contended` distinct).
+
+### Gates
+- Focused suite: **37/37** · P23/P24/C/B: **230 pass** · Full: **2563 pass / 2 fail (same env P5 probes) / 15 skipped** (R6 2561/2/15 — +2, zero regression) · `tsc --noEmit` clean · `pnpm build` clean.

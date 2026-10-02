@@ -42,6 +42,25 @@ export interface StoredEntity {
   [key: string]: unknown;
 }
 
+/** R6 — canonical SQLite lock-contention detection: ONLY known
+ *  transient writer-lock conditions (`SQLITE_BUSY*`, `SQLITE_LOCKED*`).
+ *  These mean another connection holds the write lock and the call may
+ *  retry on a later tick — bounded convergence, never a defect. Every
+ *  other error (hash mismatch, schema, corruption, governance
+ *  IntegrityError) continues to fail closed. */
+export function isSqliteContentionError(e: unknown): boolean {
+  if (!e || typeof e !== "object") return false;
+  const code = String((e as { code?: unknown }).code ?? "");
+  if (code.startsWith("SQLITE_BUSY") || code.startsWith("SQLITE_LOCKED")) {
+    return true;
+  }
+  const msg = String((e as { message?: unknown }).message ?? "");
+  // better-sqlite3's canonical lock-contention messages also surface
+  // without a `code` (e.g. re-wrapped errors): "database is locked" is
+  // the SQLITE_BUSY text and "database table is locked" SQLITE_LOCKED.
+  return /SQLITE_(BUSY|LOCKED)|database (is|table is) locked/i.test(msg);
+}
+
 export class PairEvidenceStore {
   readonly db: Database.Database;
 

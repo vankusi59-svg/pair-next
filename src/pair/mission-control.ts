@@ -275,7 +275,14 @@ export class MissionControl {
   }
 
   approvals() {
-    return this.store.list("approval_request");
+    // Expose `scope` as an alias of the persisted scope_snapshot so API/UI
+    // clients can echo it back on decide — the digest check still binds.
+    return this.store.list("approval_request").map((a) => ({
+      ...a,
+      scope:
+        (a.scope as Record<string, unknown> | undefined) ??
+        (a.scope_snapshot as Record<string, unknown> | undefined),
+    }));
   }
 
   evidence(missionId: string) {
@@ -994,7 +1001,7 @@ export class MissionControl {
     return this.deps.runtime.cancel(missionId, op);
   }
 
-  approve(approvalId: string, operatorId: string | undefined, scope: Record<string, unknown>, reason?: string) {
+  approve(approvalId: string, operatorId: string | undefined, scope?: Record<string, unknown>, reason?: string) {
     const op = requireOperator(operatorId);
     const decision = this.deps.approvals.decide(approvalId, op, "APPROVED", scope, reason);
     const a = this.deps.approvals.get(approvalId);
@@ -1006,7 +1013,7 @@ export class MissionControl {
     return decision;
   }
 
-  deny(approvalId: string, operatorId: string | undefined, scope: Record<string, unknown>, reason?: string) {
+  deny(approvalId: string, operatorId: string | undefined, scope?: Record<string, unknown>, reason?: string) {
     const op = requireOperator(operatorId);
     return this.deps.approvals.decide(approvalId, op, "DENIED", scope, reason);
   }
