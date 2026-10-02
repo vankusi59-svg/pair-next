@@ -199,11 +199,19 @@ export class ModelEvidenceCatalog {
     // reached STALE/REMOVED regains no new-work authority: lifecycle drops
     // back to DISCOVERED and it must re-run fresh probe + qualifyModel to
     // mint a new/current receipt. Historical evidence stays inspectable.
+    // Phase E R2 §1-§2 — the CURRENT observation epoch resets too: probe
+    // state, current receipt pointer, and the current probe_receipt_ids
+    // window. Historical probe_receipt entities stay persisted and
+    // inspectable but can never be consumed as current authority.
     if (conditions.has("REMOVED") || conditions.has("STALE")) {
       conditions.delete("REMOVED");
       conditions.delete("STALE");
       conditions.add("REAPPEARED");
       body.lifecycle_state = "DISCOVERED";
+      body.probe_state = "UNPROBED";
+      body.last_probe_at = null;
+      body.current_qualification_receipt_id = null;
+      body.probe_receipt_ids = [];
       reappeared = true;
       changed = true;
     }
@@ -327,12 +335,56 @@ export class ModelEvidenceCatalog {
     return receipts.sort((a, b) => String(a.probe_id).localeCompare(String(b.probe_id)));
   }
 
+  /** Phase E R2 §2 — the CURRENT-epoch probe receipts: only the receipts
+   *  referenced by the entry's current probe_receipt_ids window. Older
+   *  probe_receipt entities stay persisted/inspectable via
+   *  listProbeReceipts but are never current authority. */
+  currentProbeReceipts(modelEntryId: string): Array<Record<string, unknown>> {
+    const entry = this.getModel(modelEntryId);
+    const ids = new Set(((entry?.probe_receipt_ids as string[]) ?? []).map(String));
+    if (ids.size === 0) return [];
+    return (this.store.list("probe_receipt") as Record<string, unknown>[]).filter((r) =>
+      ids.has(String(r.probe_id)),
+    );
+  }
+
   issueQualificationReceipt(
     modelEntryId: string,
     opts: { capability_scope: string[]; verifier: string; evidence_refs: string[]; actor?: string },
   ): Record<string, unknown> {
     const entry = this.getModel(modelEntryId);
     if (!entry) throw new NotFoundError(`model_entry:${modelEntryId}`);
+    // Phase E R2 §4 — this seam mints QUALIFIED authority, so it must
+    // validate canonical CURRENT-epoch probe evidence itself rather than
+    // trust caller-provided strings. Every capability in scope must be
+    // covered by a PASS probe_receipt referenced in the entry's CURRENT
+    // probe_receipt_ids; every evidence_ref must point into that same
+    // current window (foreign/historical refs are rejected).
+    const currentIds = new Set((entry.probe_receipt_ids as string[]) ?? []);
+    const currentReceipts = this.currentProbeReceipts(modelEntryId);
+    const passCaps = new Set<string>();
+    for (const r of currentReceipts) {
+      if (r.result !== "PASS") continue;
+      const ce = (r.capability_evidence ?? {}) as Record<string, unknown>;
+      for (const k of Object.keys(ce)) if (ce[k] === "PASS" || ce[k] === true) passCaps.add(k);
+      if (r.probe_type && ce.passed !== false) passCaps.add(String(r.probe_type));
+    }
+    for (const cap of opts.capability_scope) {
+      if (!passCaps.has(cap)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING",
+          JSON.stringify({ model_entry_id: modelEntryId, capability: cap, current_probe_ids: [...currentIds] }),
+        );
+      }
+    }
+    for (const ref of opts.evidence_refs) {
+      if (!currentIds.has(String(ref))) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_FOREIGN",
+          JSON.stringify({ model_entry_id: modelEntryId, evidence_ref: ref }),
+        );
+      }
+    }
     const receipt = {
       receipt_id: newId("MQR"),
       model_entry_id: modelEntryId,

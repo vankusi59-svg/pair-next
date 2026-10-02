@@ -448,3 +448,120 @@ preserved verbatim.
 - this report — R1 section appended (original evidence preserved).
 
 STOP. DO NOT MERGE. Awaiting independent audit of R1.
+
+# PHASE E — R2 REMEDIATION (audited R1 HEAD: `2f2e3a534d2a98f3fb22c3ddcd248f13bdf71288`)
+
+Final evidence-authority closure. R1 semantics preserved verbatim.
+
+## R2.1 Root causes and closed semantics
+
+**§1–§3 Historical probe receipts could requalify a reappeared model.**
+`qualifyModel()` scanned `listProbeReceipts()` = ALL history, so a
+QUALIFIED→STALE→REMOVED→REAPPEARED model could requalify on pre-removal
+evidence. Closure: `model_entry.probe_receipt_ids` is now the CURRENT
+observation epoch — on REAPPEARED the model resets to
+DISCOVERED + `probe_state=UNPROBED` + `last_probe_at=null` +
+`current_qualification_receipt_id=null` + `probe_receipt_ids=[]`;
+`recordProbeReceipt` appends only into the current window;
+`qualifyModel` reads `currentProbeReceipts()` (the window) plus a new
+`CURRENT_PROBE_EVIDENCE` gate; minted `evidence_refs` reference only
+current probes. Historical `probe_receipt` entities stay persisted and
+inspectable — never deleted.
+
+**§4 Direct `issueQualificationReceipt()` could mint QUALIFIED from
+arbitrary strings.** Chose option B (harden the seam itself): every
+capability in scope must be covered by a PASS `probe_receipt` referenced
+in the entry's CURRENT window → else
+`FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING`; every `evidence_ref`
+must point into that same window → else
+`FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_FOREIGN`. All fixtures updated
+to the canonical `recordProbeReceipt` → `qualifyModel` chain (the same
+path production runs).
+
+**§5 Provider `probed:true` caller bypass.** `opts.probed === true` was
+accepted as probe evidence. Removed from the API —
+`PROTOCOL_PROBED = PASS` only when `entry.probe_state === "PROBED"`
+(durable canonical state). Fixtures seed PROBED via
+`validateAccess(probe)` / `recordProbeObservation` like production.
+
+**§6 Provider reappearance kept a stale current receipt pointer.**
+REAPPEARED reset now also clears `current_qualification_receipt_id`
+(historical `provider_qualification` rows preserved).
+
+**§7–§10 Configured route `P:M` did not prove provider ownership.**
+`resolveConfiguredModelRoleRoute` now throws
+`FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH` when the resolved
+entry's canonical `provider_id !== P` — before role assignment, planner
+candidate creation, DSH pool construction, or any invocation. Same seam
+serves planner and DSH (defense in depth with `MODEL_PROVIDER_MATCH`
+and exact `model_binding` linkage).
+
+**§11 `providerRoutableGate` diverged from `PROVIDER_CURRENT`.**
+Now blocks STALE too; documented as the provider-only subset of
+`providerModelEligibility` — the two cannot disagree on currentness.
+
+## R2.2 New tests (§12–§19) — 6 added, focused suite 51/51
+
+- §12+§13 one scenario: QUALIFIED→STALE→REMOVED→REAPPEARED model →
+  `qualifyModel` `qualified=false` (`CURRENT_PROBE_EVIDENCE` +
+  `CAPABILITY_TEXT_INFERENCE` FAIL), old probe row inspectable, no new
+  receipt → fresh `recordProbeReceipt` → `qualified=true`,
+  `evidence_refs=[fresh]` only, routable again.
+- §14 direct `issueQualificationReceipt` on DISCOVERED/UNPROBED with
+  `evidence_refs:["fresh"]` → `..._EVIDENCE_MISSING`; refs pointing at
+  another model's receipt → `..._EVIDENCE_FOREIGN`; no QUALIFIED minted.
+- §15+§16 provider REMOVED→REAPPEARED
+  (DISCOVERY_ELIGIBLE/AUTH_REQUIRED/UNPROBED) → `qualify()` →
+  `PROTOCOL_PROBED` FAIL (AUTH would pass — probe is the blocker), no
+  receipt, pointer stays null → real `validateAccess(probe)` → PROBED →
+  `qualify` → NEW current receipt; old row inspectable; routable.
+- §17 planner route `p2:m` on entry with `provider_id=p1` →
+  `FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH`, zero `model_role`
+  mutation.
+- §18 same malformed entry via DSH route → same fail-closed before pool.
+- §19 first authoritative absence → STALE: `PROVIDER_CURRENT` FAIL and
+  `providerRoutableGate.pass=false` — gates agree.
+
+## R2.3 Regression
+
+- Focused Phase E suite: **51/51 PASS** (34 original + 11 R1 + 6 R2).
+- Related suites: p6 36/36, p7 36/36, p8 49/49, phase-b 123/123,
+  phase-c-dsh 51/51, runtime-hardening 11/11 — all PASS.
+- Full suite: **2720 pass / 2 fail / 15 skip (2737)** — the 2 fails are
+  the same pre-existing env-only P5 assertions documented since baseline
+  (`EXECUTABLE_NOT_FOUND` — real `dsh`/`codex` binaries on PATH;
+  reproduce on base `b08e8a5` and audited HEADs). +6 vs R1 count.
+- `npx tsc --noEmit`: clean. `pnpm build`: clean.
+- Live E2E re-run with R2 code (scratch `PAIR_MC_DIR`, real
+  credentials): boot chain intact — 5 providers discovered
+  (`nvidia,cloudflare,groq,gemini,badq`), 6 models discovered, 3 routes
+  QUALIFIED+bound, DSH pool built. Persisted state confirms the new
+  semantics live: `nvidia`/`badq` sit at
+  `DISCOVERY_ELIGIBLE/AUTH_OK/UNPROBED` with `receipt=null` (no probe →
+  no qualification possible), while qualified models carry
+  `probe_receipt_ids` windows pointing at this boot's fresh `PRB_*`
+  receipts — exactly the current-epoch authority R2 requires.
+
+## R2.4 Files changed in R2
+
+- `src/pair/model-catalog.ts` — reappearance resets the evidence epoch
+  (`probe_state/last_probe_at/current_qualification_receipt_id/
+  probe_receipt_ids`); `currentProbeReceipts()`;
+  `issueQualificationReceipt` fail-closed evidence validation.
+- `src/pair/model-probing.ts` — `qualifyModel` reads current epoch only;
+  `CURRENT_PROBE_EVIDENCE` gate.
+- `src/pair/provider-catalog.ts` — reappearance clears
+  `current_qualification_receipt_id`.
+- `src/pair/provider-validation.ts` — `opts.probed` removed;
+  `providerRoutableGate` blocks STALE.
+- `src/pair/model-role.ts` —
+  `FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH` at configured-route
+  resolution.
+- `src/__tests__/pair-phase-e-provider-model-authority.test.ts` — +6 R2
+  tests; `mkModel`/`qualifyProvider` fixtures now canonical.
+- `src/__tests__/pair-phase-b.test.ts`, `pair-phase-c-dsh-model-routing.test.ts`,
+  `pair-p6.test.ts` — legitimate fixture updates only (canonical
+  probe→qualify chain; no semantics changed).
+- this report — R2 section appended; R1 evidence preserved verbatim.
+
+STOP. DO NOT MERGE. Awaiting independent audit of R2.

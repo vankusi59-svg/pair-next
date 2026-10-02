@@ -840,6 +840,24 @@ WOB1(A) and refused a legitimate retry.
   previously-active → ABSENT snapshot → bounded STALE→REMOVED (no
   indefinite last-known-good). Focused 45/45; full suite 2714 pass / same
   2 env P5 fails; tsc+build clean; live E2E boot chain intact.
+- **R2 remediation** (same branch, pending re-audit): model/probe evidence
+  is epoch-scoped — REAPPEARED resets `probe_state=UNPROBED`,
+  `last_probe_at=null`, `current_qualification_receipt_id=null`,
+  `probe_receipt_ids=[]` (historical receipt rows persist inspectable);
+  `qualifyModel` reads `currentProbeReceipts()` only +
+  `CURRENT_PROBE_EVIDENCE` gate; `issueQualificationReceipt` fails closed
+  (`FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING`/`_FOREIGN`) — a
+  caller can never mint QUALIFIED without current PASS probe receipts;
+  provider `opts.probed` bypass removed (`PROTOCOL_PROBED` = durable
+  `probe_state==="PROBED"` only); provider reappearance clears the
+  current receipt pointer; configured route `P:M` must resolve to a model
+  whose canonical `provider_id === P`
+  (`FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH`, before any
+  role/candidate/invocation — planner and DSH share the seam);
+  `providerRoutableGate` blocks STALE (agrees with `PROVIDER_CURRENT`).
+  Focused 51/51; full suite 2720 pass / same 2 env P5 fails; tsc+build
+  clean; live E2E confirms UNPROBED+receipt=null for enumeration-only
+  providers.
 
 ## Not yet
 

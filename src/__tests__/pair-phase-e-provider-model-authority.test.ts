@@ -45,6 +45,7 @@ import {
   reconcileModelRoleAssignments,
   registerGovernedExecutors,
   registerSensitiveMaterial,
+  qualifyModel,
   resolveConfiguredModelRoleRoute,
   runModelDiscovery,
   runProviderDiscovery,
@@ -117,7 +118,7 @@ const seedDiscovered = (store: PairEvidenceStore, pid: string, sourceId = "OPERA
 /** Canonical qualified provider: real validateAccess(probe) + qualify() chain. */
 const qualifyProvider = (store: PairEvidenceStore, pid: string, env: Record<string, string> = {}) => {
   const v = new ProviderValidator(store);
-  return v.qualify(pid, { env, probed: true, actor: "test" });
+  return v.qualify(pid, { env, actor: "test" });
 };
 
 const mkQualifiedProvider = async (
@@ -134,17 +135,25 @@ const mkQualifiedProvider = async (
   return qualifyProvider(store, pid, { [`${pid.toUpperCase()}_KEY`]: "cred", ...env });
 };
 
+/** R2 — canonical qualification mirrors production: a durable PASS probe
+ *  receipt in the model's CURRENT epoch, then the real qualification
+ *  gates. Fixtures must never mint receipts directly. */
 const mkModel = (store: PairEvidenceStore, pid: string, mid: string, qualified = true) => {
   const mcat = new ModelEvidenceCatalog(store);
   const { entry } = mcat.upsertModelClaim(CLAIM(pid, mid));
   const eid = String(entry.model_entry_id);
   if (qualified) {
-    mcat.issueQualificationReceipt(eid, {
-      capability_scope: ["text_inference"],
-      verifier: "test-probe",
-      evidence_refs: ["fx"],
-      actor: "t",
+    mcat.recordProbeReceipt({
+      probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
+      model_entry_id: eid,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+      detail: "fixture-probe",
     });
+    const q = qualifyModel(store, eid, { capability_scope: ["text_inference"], actor: "t" });
+    if (!q.qualified) throw new Error(`mkModel fixture failed: ${JSON.stringify(q.gates)}`);
   }
   return eid;
 };
@@ -206,7 +215,7 @@ describe("B — auth", () => {
     const v = new ProviderValidator(store);
     const res = await v.validateAccess("pv", { env: {} });
     expect(res.outcome).toBe("CREDENTIAL_MISSING");
-    const q = v.qualify("pv", { env: {}, probed: true });
+    const q = v.qualify("pv", { env: {} });
     expect(q.qualified).toBe(false);
     expect(q.gates.AUTH_ACCEPTABLE).toBe("FAIL");
     const me = mkModel(store, "pv", "m1");
@@ -968,7 +977,7 @@ describe("R1 — §14 provider reappearance = observation only", () => {
       env: { PV_KEY: "cred" },
       probe: async () => ({ outcome: "AUTH_OK", latency_ms: 3 }),
     });
-    v.qualify("pv", { env: { PV_KEY: "cred" }, probed: true, actor: "t" });
+    v.qualify("pv", { env: { PV_KEY: "cred" }, actor: "t" });
     const p2 = cat.getProvider("pv")!;
     expect(p2.lifecycle_state).toBe("MODEL_DISCOVERY_ELIGIBLE"); // qualified lifecycle
     expect(p2.current_qualification_receipt_id).not.toBe(oldReceipt);
@@ -1004,12 +1013,17 @@ describe("R1 — §15 model reappearance = observation only", () => {
     expect(elig.eligible).toBe(false);
 
     // Fresh probe+qualification mints new/current authority → routable.
-    mcat.issueQualificationReceipt(me, {
-      capability_scope: ["text_inference"],
-      verifier: "test-probe",
-      evidence_refs: ["fresh"],
-      actor: "t",
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_r15_fresh",
+      model_entry_id: me,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(
+      true,
+    );
     expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
   });
 });
@@ -1080,12 +1094,15 @@ describe("R1 — §16/§17 provider↔model linkage", () => {
     // Legacy/corrupt entry: no authoritative provider_id on the model.
     const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1", { provider_id: undefined }), "t");
     const me = String(entry.model_entry_id);
-    mcat.issueQualificationReceipt(me, {
-      capability_scope: ["text_inference"],
-      verifier: "t",
-      evidence_refs: [],
-      actor: "t",
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_r17",
+      model_entry_id: me,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" });
     assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
     expect(() => assertPlannerCandidateEligible(store, me)).toThrow(
       /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
@@ -1141,12 +1158,17 @@ describe("R1 — §18/§12 receipt binding", () => {
     expect(elig.eligible).toBe(false);
 
     // Fresh probe+qualification mints a bound receipt → authority restored.
-    mcat.issueQualificationReceipt(me, {
-      capability_scope: ["text_inference"],
-      verifier: "test-probe",
-      evidence_refs: [],
-      actor: "t",
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_r18_fresh",
+      model_entry_id: me,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(
+      true,
+    );
     const fresh = mcat.getModel(me)!;
     const receipt = store.get("model_qualification", String(fresh.current_qualification_receipt_id));
     expect(String(receipt.material_fingerprint)).toBe(modelIdentityDigest(fresh));
@@ -1232,5 +1254,214 @@ describe("R1 — §20 source disappearance", () => {
     const p = new ProviderCatalog(store).getProvider("pv2")!;
     expect(p.conditions ?? []).not.toContain("STALE");
     expect(res.stale).toHaveLength(0);
+  });
+});
+
+/* ================= R2 — fresh evidence + route identity closure ========== */
+
+describe("R2 — §12/§13 historical probe cannot requalify; fresh probe restores", () => {
+  it("STALE→REMOVED→REAPPEARED model: qualifyModel fails closed on no current probe, fresh probe requalifies", async () => {
+    const { store } = makeCtx("r2a");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const me = mkModel(store, "pv", "m1");
+    const oldProbe = (mcat.getModel(me)!.probe_receipt_ids as string[])[0];
+    expect(store.get("probe_receipt", oldProbe).result).toBe("PASS");
+
+    // STALE→REMOVED by authoritative absence → reappearance resets the
+    // current evidence epoch: probe window empty, receipt pointer cleared,
+    // observation only restored.
+    for (let i = 0; i < PROVIDER_REMOVED_ABSENCE_THRESHOLD; i++) {
+      mcat.reconcileAbsence("pv", new Set(), { snapshotStatus: "COMPLETE", actor: "t" });
+    }
+    mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const m = mcat.getModel(me)!;
+    expect(m.conditions).toContain("REAPPEARED");
+    expect(m.lifecycle_state).toBe("DISCOVERED");
+    expect(m.probe_state).toBe("UNPROBED");
+    expect(m.last_probe_at).toBeNull();
+    expect(m.current_qualification_receipt_id).toBeNull();
+    expect(m.probe_receipt_ids).toEqual([]);
+
+    // §12 — historical probe evidence is NOT current authority: no new
+    // qualification minted, but the old probe_receipt entity stays
+    // persisted and inspectable.
+    const q = qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" });
+    expect(q.qualified).toBe(false);
+    expect(q.gates.CURRENT_PROBE_EVIDENCE).toBe("FAIL");
+    expect(q.gates.CAPABILITY_TEXT_INFERENCE).toBe("FAIL");
+    expect(store.get("probe_receipt", oldProbe).probe_id).toBe(oldProbe);
+    expect(mcat.listProbeReceipts(me).map((r) => r.probe_id)).toContain(oldProbe);
+    expect(mcat.getModel(me)!.current_qualification_receipt_id).toBeNull();
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(false);
+
+    // §13 — a fresh canonical probe in the new epoch restores authority;
+    // the minted receipt references only the fresh probe id.
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_r2_fresh",
+      model_entry_id: me,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 2,
+    });
+    const q2 = qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" });
+    expect(q2.qualified).toBe(true);
+    const refs = q2.receipt!.evidence_refs as string[];
+    expect(refs).toContain("PRB_r2_fresh");
+    expect(refs).not.toContain(oldProbe);
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R2 — §14 direct receipt bypass closed", () => {
+  it("issueQualificationReceipt rejects missing capability coverage and foreign/historical evidence refs", () => {
+    const { store } = makeCtx("r2b");
+    const mcat = new ModelEvidenceCatalog(store);
+    // DISCOVERED + UNPROBED model: arbitrary evidence_refs cannot mint
+    // QUALIFIED authority.
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+    expect(() =>
+      mcat.issueQualificationReceipt(me, {
+        capability_scope: ["text_inference"],
+        verifier: "attacker-fixture",
+        evidence_refs: ["fresh"],
+        actor: "t",
+      }),
+    ).toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING/);
+
+    // A real probe receipt owned by ANOTHER model is foreign evidence here.
+    const other = mkModel(store, "pv", "m2");
+    const foreignId = (mcat.getModel(other)!.probe_receipt_ids as string[])[0];
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_mine",
+      model_entry_id: me,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    });
+    expect(() =>
+      mcat.issueQualificationReceipt(me, {
+        capability_scope: ["text_inference"],
+        verifier: "attacker-fixture",
+        evidence_refs: ["PRB_mine", foreignId],
+        actor: "t",
+      }),
+    ).toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_FOREIGN/);
+    expect(mcat.getModel(me)!.lifecycle_state).toBe("PROBED"); // still not QUALIFIED
+    expect(mcat.getModel(me)!.current_qualification_receipt_id).toBeNull();
+  });
+});
+
+describe("R2 — §15/§16 provider reappearance: no boolean bypass, fresh probe restores", () => {
+  it("reappeared provider (DISCOVERY_ELIGIBLE/AUTH_OK-resolvable/UNPROBED) fails PROTOCOL_PROBED until a real probe", async () => {
+    const { store } = makeCtx("r2c");
+    const env = { PV_KEY: "cred" };
+    const srcA = new TogglableSource("SRC_A", ["pv"]);
+    const cat = new ProviderCatalog(store);
+    runProviderDiscovery(store, { context: { env }, sources: [srcA] });
+    await mkQualifiedProvider(store, "pv");
+    const oldReceipt = String(cat.getProvider("pv")!.current_qualification_receipt_id);
+
+    // Authoritative absence → STALE→REMOVED, then reappearance resets the
+    // probe epoch and clears the current receipt pointer (row preserved).
+    const srcEmpty = new TogglableSource("SRC_A", []);
+    for (let i = 0; i < PROVIDER_REMOVED_ABSENCE_THRESHOLD; i++) {
+      runProviderDiscovery(store, { context: { env }, sources: [srcEmpty] });
+    }
+    runProviderDiscovery(store, { context: { env }, sources: [srcA] });
+    const p = cat.getProvider("pv")!;
+    expect(p.conditions).toContain("REAPPEARED");
+    expect(p.lifecycle_state).toBe("DISCOVERY_ELIGIBLE");
+    expect(p.probe_state).toBe("UNPROBED");
+    expect(p.current_qualification_receipt_id).toBeNull();
+
+    // §15 — a caller-provided boolean is gone from the API: durable
+    // probe_state is the only PROTOCOL_PROBED authority. Credential is
+    // resolvable (AUTH_ACCEPTABLE would pass) yet qualification still
+    // fails on the probe gate; no receipt is minted.
+    const v = new ProviderValidator(store);
+    const q = v.qualify("pv", { env });
+    expect(q.qualified).toBe(false);
+    expect(q.gates.AUTH_ACCEPTABLE).toBe("PASS");
+    expect(q.gates.PROTOCOL_PROBED).toBe("FAIL");
+    expect(q.receipt).toBeUndefined();
+    expect(cat.getProvider("pv")!.current_qualification_receipt_id).toBeNull();
+
+    // §16 — fresh canonical probe → qualification installs a NEW current
+    // receipt; the old row stays inspectable.
+    await v.validateAccess("pv", {
+      env,
+      probe: async () => ({ outcome: "AUTH_OK", latency_ms: 4 }),
+    });
+    expect(cat.getProvider("pv")!.probe_state).toBe("PROBED");
+    const q2 = v.qualify("pv", { env });
+    expect(q2.qualified).toBe(true);
+    const p2 = cat.getProvider("pv")!;
+    expect(String(p2.current_qualification_receipt_id)).not.toBe(oldReceipt);
+    expect(store.get("provider_qualification", oldReceipt).receipt_id).toBe(oldReceipt);
+    const me = mkModel(store, "pv", "m1");
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R2 — §17/§18 configured route must prove provider ownership", () => {
+  it("planner route P2:M resolving to provider_id P1 fails closed with zero mutation", async () => {
+    const { store } = makeCtx("r2d");
+    const mcat = new ModelEvidenceCatalog(store);
+    // Malformed/legacy entry: family alias P2 but canonical owner P1.
+    const { entry } = mcat.upsertModelClaim(
+      CLAIM("p2", "m", { provider_id: "p1", provider_family: "p2" }),
+      "t",
+    );
+    expect(String(entry.provider_id)).toBe("p1");
+    const rolesBefore = store.list("model_role").length;
+    expect(() =>
+      resolveConfiguredModelRoleRoute(
+        (p, m) => mcat.getModelByIds(p, m),
+        { route: "p2:m", role: MODEL_ROLE.PLANNER_COORDINATOR },
+      ),
+    ).toThrow(/FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH/);
+    // ZERO role mutation — resolution failed before any role/binding work.
+    expect(store.list("model_role")).toHaveLength(rolesBefore);
+  });
+
+  it("DSH route P2:M uses the same ownership rule (before pool construction)", async () => {
+    const { store } = makeCtx("r2e");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(
+      CLAIM("p2", "m", { provider_id: "p1", provider_family: "p2" }),
+      "t",
+    );
+    expect(String(entry.provider_id)).toBe("p1");
+    const rolesBefore = store.list("model_role").length;
+    expect(() =>
+      resolveConfiguredModelRoleRoute(
+        (p, m) => mcat.getModelByIds(p, m),
+        { route: "p2:m", role: MODEL_ROLE.DSH_EXECUTION },
+      ),
+    ).toThrow(/FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH/);
+    expect(store.list("model_role")).toHaveLength(rolesBefore);
+  });
+});
+
+describe("R2 — §19 provider routable gates agree on STALE", () => {
+  it("STALE provider: PROVIDER_CURRENT FAIL and providerRoutableGate.pass=false", async () => {
+    const { store } = makeCtx("r2f");
+    const env = { PV_KEY: "cred" };
+    const srcA = new TogglableSource("SRC_A", ["pv"]);
+    runProviderDiscovery(store, { context: { env }, sources: [srcA] });
+    await mkQualifiedProvider(store, "pv");
+    const me = mkModel(store, "pv", "m1");
+    const srcEmpty = new TogglableSource("SRC_A", []);
+    runProviderDiscovery(store, { context: { env }, sources: [srcEmpty] });
+    const p = new ProviderCatalog(store).getProvider("pv")!;
+    expect(p.conditions).toContain("STALE");
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.PROVIDER_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    expect(providerRoutableGate(p).pass).toBe(false);
   });
 });

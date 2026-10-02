@@ -156,7 +156,11 @@ export function qualifyModel(
   gates.MODEL_NOT_REMOVED = (entry.conditions as string[]).includes("REMOVED") ? "FAIL" : "PASS";
   gates.MODEL_NOT_DEPRECATED = (entry.conditions as string[]).includes("DEPRECATED") ? "FAIL" : "PASS";
 
-  const receipts = catalog.listProbeReceipts(modelEntryId);
+  // Phase E R2 §1-§3 — qualification consumes CURRENT-epoch probe evidence
+  // only: the receipts referenced by the entry's current probe_receipt_ids
+  // window. Historical receipts from a pre-STALE/REMOVED epoch stay
+  // persisted but are never consulted here.
+  const receipts = catalog.currentProbeReceipts(modelEntryId);
   const passCaps = new Set<string>();
   for (const r of receipts) {
     if (r.result !== "PASS") continue;
@@ -164,6 +168,7 @@ export function qualifyModel(
     for (const k of Object.keys(ce)) if (ce[k] === "PASS" || ce[k] === true) passCaps.add(k);
     if (r.probe_type && ce.passed !== false) passCaps.add(String(r.probe_type));
   }
+  gates.CURRENT_PROBE_EVIDENCE = receipts.some((r) => r.result === "PASS") ? "PASS" : "FAIL";
   for (const cap of opts.capability_scope) {
     gates[`CAPABILITY_${cap.toUpperCase()}`] = passCaps.has(cap) ? "PASS" : "FAIL";
   }

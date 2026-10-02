@@ -81,7 +81,6 @@ export class ProviderValidator {
       env?: Record<string, string | undefined>;
       policyVersion?: string;
       policyDenyList?: string[];
-      probed?: boolean;
       actor?: string;
     } = {},
   ): { qualified: boolean; gates: Record<string, string>; receipt?: Record<string, unknown> } {
@@ -101,7 +100,11 @@ export class ProviderValidator {
       this.credentialResolvable(entry, env) === "AUTH_OK"
         ? "PASS"
         : "FAIL";
-    gates.PROTOCOL_PROBED = entry.probe_state === "PROBED" || opts.probed === true ? "PASS" : "FAIL";
+    // Phase E R2 §5 — PROTOCOL_PROBED reads durable canonical state only.
+    // A caller-provided `probed:true` boolean was an authority bypass:
+    // removed — fixtures must seed PROBED through validateAccess(probe) /
+    // recordProbeObservation like production.
+    gates.PROTOCOL_PROBED = String(entry.probe_state) === "PROBED" ? "PASS" : "FAIL";
     gates.HEALTH_ACCEPTABLE = !["UNAVAILABLE", "DOWN"].includes(String(entry.health_state)) ? "PASS" : "FAIL";
     gates.POLICY_PERMITS = !(opts.policyDenyList ?? []).includes(providerId) ? "PASS" : "FAIL";
 
@@ -134,7 +137,14 @@ export function providerRoutableGate(entry: Record<string, unknown>): { pass: bo
     return { pass: false, reason: `PROVIDER_AUTH_${entry.auth_state}` };
   }
   const conditions = (entry.conditions ?? []) as string[];
-  if (conditions.includes("UNQUALIFIED") || conditions.includes("DISABLED") || conditions.includes("REMOVED")) {
+  // Phase E R2 §11 — provider-only subset of providerModelEligibility:
+  // they must agree on currentness — STALE is not current, not routable.
+  if (
+    conditions.includes("UNQUALIFIED") ||
+    conditions.includes("DISABLED") ||
+    conditions.includes("STALE") ||
+    conditions.includes("REMOVED")
+  ) {
     return { pass: false, reason: "PROVIDER_CONDITION_BLOCKED" };
   }
   return { pass: true };

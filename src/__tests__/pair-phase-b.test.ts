@@ -66,6 +66,7 @@ import {
   classifyFailure,
   TRANSPORT_IN_PROCESS,
   createPlanPreview as persistPlanPreviewRow,
+  qualifyModel,
   type DevinFetch,
   type PlannerAttemptRecord,
   type PlannerCandidate,
@@ -965,12 +966,19 @@ const mkModel = (
   const eid = String(entry.model_entry_id);
   const lifecycle = opts.lifecycle ?? "QUALIFIED";
   if (lifecycle === "QUALIFIED") {
-    mcat.issueQualificationReceipt(eid, {
-      capability_scope: ["text_inference"],
-      verifier: "test-probe",
-      evidence_refs: ["fixture"],
-      actor: "t",
+    // Phase E R2 §4 — fixtures mint qualifications only through the
+    // canonical probe→qualify chain; direct receipt minting is a
+    // fail-closed error now.
+    mcat.recordProbeReceipt({
+      probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
+      model_entry_id: eid,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    const q = qualifyModel(store, eid, { capability_scope: ["text_inference"], actor: "t" });
+    if (!q.qualified) throw new Error(`mkModel fixture failed: ${JSON.stringify(q.gates)}`);
   } else if (lifecycle !== "DISCOVERED") {
     const body = store.get("model_entry", eid);
     store.put("model_entry", eid, { ...body, lifecycle_state: lifecycle }, Number(body.version));
@@ -1316,17 +1324,20 @@ describe("R3 §4 — provider UNQUALIFIED recovery at canonical seam", () => {
     });
 
     // A — qualification failure leaves the UNQUALIFIED condition
-    const q1 = v.qualify(pid, { env: {}, probed: true });
+    const q1 = v.qualify(pid, { env: {} });
     expect(q1.qualified).toBe(false);
     expect(cat.getProvider(pid)!.conditions as string[]).toContain("UNQUALIFIED");
     expect(() => assertPlannerCandidateEligible(ctx.store, me)).toThrow(
       /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
     );
 
-    // B — provider now satisfies every gate: health recovered, probed via opts
+    // B — provider now satisfies every gate: health recovered + a real
+    // recorded probe (R2 §5 — the durable probe_state is the only
+    // PROTOCOL_PROBED authority; no caller-supplied bypass).
     const body = ctx.store.get("provider", providerEntryId(pid));
     ctx.store.put("provider", providerEntryId(pid), { ...body, health_state: "READY" }, Number(body.version));
-    const q2 = v.qualify(pid, { env: {}, probed: true });
+    new ProviderCatalog(ctx.store).recordProbeObservation(pid, "PASS");
+    const q2 = v.qualify(pid, { env: {} });
     expect(q2.qualified).toBe(true);
     expect(q2.receipt).toBeTruthy();
     const prov = cat.getProvider(pid)!;
@@ -1373,7 +1384,7 @@ describe("R3 §4 — provider UNQUALIFIED recovery at canonical seam", () => {
     const pid = "disabled-provider";
     mkModel(store, pid, "m61");
     mkProvider(store, pid, { conditions: ["DISABLED", "UNQUALIFIED"] });
-    const q = new ProviderValidator(store).qualify(pid, { env: {}, probed: true });
+    const q = new ProviderValidator(store).qualify(pid, { env: {} });
     expect(q.qualified).toBe(true);
     const conditions = cat.getProvider(pid)!.conditions as string[];
     expect(conditions).toContain("DISABLED"); // operator authority, not transient residue
@@ -1526,12 +1537,16 @@ describe("R3 live-found — model STALE residue cleared at canonical seam", () =
     setModelConditions(store, me, ["REAPPEARED", "STALE"]);
     expect(providerModelEligibility(store, pid, me).gates.MODEL_NOT_STALE).toBe("FAIL");
     // canonical qualification transition reconciles the transient marker
-    new ModelEvidenceCatalog(store).issueQualificationReceipt(me, {
-      capability_scope: ["text_inference"],
-      verifier: "t",
-      evidence_refs: ["e"],
-      actor: "t",
+    const mcat = new ModelEvidenceCatalog(store);
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_p68",
+      model_entry_id: me,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(true);
     const after = store.get("model_entry", me);
     expect(after.conditions).not.toContain("STALE");
     expect(after.conditions).toContain("REAPPEARED"); // informational history preserved

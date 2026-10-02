@@ -257,6 +257,10 @@ export class ProviderCatalog {
       body.lifecycle_state = "DISCOVERY_ELIGIBLE";
       body.auth_state = "AUTH_REQUIRED";
       body.probe_state = "UNPROBED";
+      // Phase E R2 §6 — the historical receipt row stays inspectable but
+      // is no longer CURRENT authority: clear the pointer so nothing can
+      // lean on a stale current receipt behind the lifecycle demotion.
+      body.current_qualification_receipt_id = null;
     }
     body.conditions = [...conditions].sort();
     body.identity_digest = providerIdentityDigest(body);

@@ -243,8 +243,16 @@ describe("P6 discovery → catalog", () => {
     expect(rows[0].gates.MODEL_QUALIFIED).toBe("FAIL");
     expect(rows[0].gates.BINDING_QUALIFIED).toBe("FAIL");
 
-    // qualify model (evidence) + binding → routable
-    cat.issueQualificationReceipt(mid, { capability_scope: ["text_inference"], verifier: "test", evidence_refs: ["PRB_x"] });
+    // qualify model (canonical probe→qualify chain — R2 §4) + binding → routable
+    cat.recordProbeReceipt({
+      probe_id: "PRB_x",
+      model_entry_id: mid,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    });
+    expect(qualifyModel(ctx.store, mid, { capability_scope: ["text_inference"] }).qualified).toBe(true);
     qualifyBinding(ctx.service, binding.binding_id, { evidence_refs: ["ev1"] });
     rows = projectRoutableModels(ctx.service);
     expect(rows).toHaveLength(1);
@@ -623,7 +631,15 @@ function makeRoutableRow(
   const cat = new ModelEvidenceCatalog(ctx.store);
   const mid = canonicalModelId(providerId, "m1");
   cat.upsertModelClaim(claim(providerId, providerId, "m1"));
-  cat.issueQualificationReceipt(mid, { capability_scope: ["text_inference"], verifier: "test", evidence_refs: [] });
+  cat.recordProbeReceipt({
+    probe_id: `PRB_${providerId}_m1`,
+    model_entry_id: mid,
+    result: "PASS",
+    probe_type: "text_inference",
+    capability_evidence: { text_inference: "PASS" },
+    latency_ms: 1,
+  });
+  qualifyModel(ctx.store, mid, { capability_scope: ["text_inference"] });
   if (opts.modelConditions) cat.setConditions(mid, opts.modelConditions);
   registerExecutor(ctx, "DEEPSEEK_HARNESS", opts.execOpts);
   const b = ensureBinding(ctx.service, {

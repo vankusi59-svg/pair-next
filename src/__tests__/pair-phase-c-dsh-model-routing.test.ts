@@ -40,6 +40,7 @@ import {
   ProviderCatalog,
   providerEntryId,
   qualifyBinding,
+  qualifyModel,
   registerGovernedExecutors,
   resolveConfiguredModelRoleRoute,
   revokeModelRole,
@@ -120,12 +121,18 @@ const mkModel = (
   const eid = String(entry.model_entry_id);
   const lifecycle = opts.lifecycle ?? "QUALIFIED";
   if (lifecycle === "QUALIFIED") {
-    mcat.issueQualificationReceipt(eid, {
-      capability_scope: ["text_inference"],
-      verifier: "test-probe",
-      evidence_refs: ["fixture"],
-      actor: "t",
+    // Phase E R2 §4 — canonical probe→qualify chain only; direct receipt
+    // minting fails closed now.
+    mcat.recordProbeReceipt({
+      probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
+      model_entry_id: eid,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    const q = qualifyModel(store, eid, { capability_scope: ["text_inference"], actor: "t" });
+    if (!q.qualified) throw new Error(`mkModel fixture failed: ${JSON.stringify(q.gates)}`);
   } else if (lifecycle !== "DISCOVERED") {
     const body = store.get("model_entry", eid);
     store.put("model_entry", eid, { ...body, lifecycle_state: lifecycle }, Number(body.version));
