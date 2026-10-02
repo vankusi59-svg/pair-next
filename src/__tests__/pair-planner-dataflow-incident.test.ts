@@ -40,7 +40,9 @@ import {
   ReconciliationService,
   RecoveryController,
   ExecutorRegistry,
+  digest,
   planDigest,
+  sha256File,
   reconcilePlanDataflow,
   assertPlanDataflow,
   assertDeliveryTaskPresence,
@@ -2137,7 +2139,7 @@ describe("R5 — aggregate request status + strict evidence + unresolved converg
 
   it("§13. unresolvable manifested artifact → durable FAILED_DELIVERY + FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED, ZERO network calls", async () => {
     const ctx = makeCtx("r5-unresolved");
-    const req = mintFilesRequest(ctx, ["report.txt"]); // file never produced
+    const req = mintFilesRequest(ctx, ["report.txt"], { create: false }); // file never produced
     const id = String(req.delivery_id);
     const rec = recordingTransport();
     const { sent } = await runTransport(ctx, { transport: rec.transport });
@@ -2162,12 +2164,28 @@ describe("R5 — aggregate request status + strict evidence + unresolved converg
 
 /** Mint a canonical multi-artifact FILES request directly (the same
  *  authority path the runtime uses — task carries the PAIR-stamped
- *  manifest). */
+ *  manifest). R1.2 — the complete verified digest map is MANDATORY, so
+ *  the fixture materializes the artifacts and pins their real SHA-256;
+ *  `create:false` simulates a never-produced artifact with a
+ *  syntactically-valid sentinel digest (mint succeeds, the projection
+ *  then converges UNRESOLVED before any digest compare). */
 function mintFilesRequest(
   ctx: ReturnType<typeof makeCtx>,
   names: string[],
+  opts: { create?: boolean } = {},
 ): Record<string, unknown> {
-  fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
+  const outbox = path.join(ctx.workspace, "outbox");
+  fs.mkdirSync(outbox, { recursive: true });
+  const artifactSha256: Record<string, string> = {};
+  for (const name of names) {
+    if (opts.create === false) {
+      artifactSha256[name] = digest(`unproduced:${name}`);
+      continue;
+    }
+    const content = name === "b.txt" ? "B" : "A";
+    fs.writeFileSync(path.join(outbox, path.basename(name)), content);
+    artifactSha256[name] = sha256File(path.join(outbox, path.basename(name)));
+  }
   const req = mintTelegramDeliveryRequest({
     store: ctx.store,
     mission: { mission_id: "M_R5", metadata: {} },
@@ -2180,10 +2198,11 @@ function mintFilesRequest(
       },
     },
     execution: { execution_id: "E_R5" },
-    outboxDir: path.join(ctx.workspace, "outbox"),
+    outboxDir: outbox,
     workspace: ctx.workspace,
     now: utcnow(),
     defaultChatId: "111",
+    artifactSha256,
   });
   expect(req).toBeTruthy();
   return req as Record<string, unknown>;

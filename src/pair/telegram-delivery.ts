@@ -148,7 +148,20 @@ export interface TelegramDeliveryRequestPayload {
   sent_at?: string;
 }
 
-const MAX_TEXT_BYTES = 3500;
+export const MAX_TEXT_BYTES = 3500;
+/** Canonical artifact-digest shape — shared by the mint check, the
+ *  bridge-side projection, and the settle-time delivery gate. */
+export const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+/** R1.1 — THE one canonical materialization of the wire TEXT payload.
+ *  The delivery-contract gate materializes the payload from the
+ *  canonical source artifact with EXACTLY these rules, validates it,
+ *  and hands the same string to mint — mint never re-reads or
+ *  re-transforms the file (no TOCTOU / trim / truncation drift between
+ *  what was validated and what is sent). */
+export function materializeDeliveryTextPayload(raw: string): string {
+  return raw.trim().slice(0, MAX_TEXT_BYTES);
+}
 /** Canonical default ceiling — overridden by the mint-time
  *  PAIR_TG_DELIVERY_MAX_ATTEMPTS env wiring. */
 export const TELEGRAM_DELIVERY_DEFAULT_MAX_ATTEMPTS = 3;
@@ -206,9 +219,15 @@ export function mintTelegramDeliveryRequest(args: {
   /** Canonical retry ceiling stamped per payload (bounded, env-driven). */
   maxAttempts?: number;
   /** FILES: artifact content identity verified at the delivery-contract
-   *  gate (manifest name → SHA-256 hex). Pinned into each slot so a
-   *  post-mint mutation fails closed at the bridge-side projection. */
+   *  gate (manifest name → SHA-256 hex). R1.2 — MANDATORY: every FILES
+   *  manifest name must map to a valid SHA-256; a missing/incomplete/
+   *  malformed map mints nothing (no hash → no authority). */
   artifactSha256?: Record<string, string>;
+  /** TEXT: the exact wire payload materialized and validated at the
+   *  delivery-contract gate — mint stores it verbatim and NEVER
+   *  re-reads the source file (R1.1: VALIDATED PAYLOAD === TDR
+   *  PAYLOAD). */
+  textPayload?: string;
 }): Record<string, unknown> | null {
   const manifest = deliveryManifest(args.task);
   if (!manifest) return null;
@@ -224,31 +243,52 @@ export function mintTelegramDeliveryRequest(args: {
     Number.isSafeInteger(args.maxAttempts) && (args.maxAttempts as number) > 0
       ? (args.maxAttempts as number)
       : TELEGRAM_DELIVERY_DEFAULT_MAX_ATTEMPTS;
+  if (manifest.mode === "FILES") {
+    // R1.2 — digest authority is mandatory: no hash → no authority.
+    // A FILES mint without the complete verified map, or with any
+    // malformed digest, fails closed before the request exists.
+    const bad = (name: string, why: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST",
+        JSON.stringify({ artifact: name, reason: why }),
+      );
+    };
+    const map = args.artifactSha256;
+    for (const name of manifest.artifacts) {
+      const sha = map?.[name];
+      if (sha === undefined || sha === null) bad(name, "missing_artifact_digest");
+      else if (!SHA256_HEX_RE.test(String(sha))) bad(name, "malformed_digest");
+    }
+  }
   const artifacts: DeliverySlot[] = manifest.artifacts.map((name) => ({
     name,
     state: "QUEUED",
     attempt_count: 0,
     max_attempts: maxAttempts,
-    ...(args.artifactSha256?.[name] ? { sha256: args.artifactSha256[name] } : {}),
+    ...(manifest.mode === "FILES"
+      ? { sha256: String(args.artifactSha256?.[name]) }
+      : {}),
   }));
   let text: string | null = null;
+  let textEvidence: Record<string, unknown> = {};
   if (manifest.mode === "TEXT") {
-    // Canonical TEXT payload source: the composed report artifact the
-    // delivery task was contracted to write — NEVER the execution
-    // result/summary/acknowledgement ("DONE" can never be the operator
-    // deliverable). The settle-time delivery-contract gate has already
-    // proven the artifact exists and satisfies the canonical language;
-    // a missing file here is defense-in-depth null, not a fallback.
-    const p = resolveDeliveryArtifactPath({
-      outboxDir: args.outboxDir,
-      workspace: args.workspace,
-      name: DELIVERY_TEXT_ARTIFACT,
-    });
-    try {
-      text = p ? fs.readFileSync(p, "utf8").trim().slice(0, MAX_TEXT_BYTES) : null;
-    } catch {
-      text = null;
+    // R1.1 — the TDR text is the EXACT payload materialized and
+    // language-validated at the delivery-contract gate. Mint never
+    // re-reads or re-transforms the source artifact: an unbound mint
+    // (caller forgot the gate) fails closed instead of fabricating a
+    // payload from unvalidated bytes.
+    if (typeof args.textPayload !== "string" || !args.textPayload.length) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_UNBOUND",
+        JSON.stringify({ artifact: DELIVERY_TEXT_ARTIFACT }),
+      );
     }
+    text = args.textPayload;
+    textEvidence = {
+      text_sha256: digest(text),
+      text_length: text.length,
+      text_source_artifact: DELIVERY_TEXT_ARTIFACT,
+    };
   }
   const body: Record<string, unknown> = {
     delivery_id: id,
@@ -258,6 +298,7 @@ export function mintTelegramDeliveryRequest(args: {
     mode: manifest.mode,
     artifacts,
     text,
+    ...textEvidence,
     ...(manifest.mode === "TEXT"
       ? {
           text_state: "QUEUED",
@@ -720,6 +761,16 @@ export function pendingTelegramDeliveries(
     const projected: Array<Record<string, unknown>> = [];
     for (const a of (next.artifacts as DeliverySlot[])) {
       if (a.state !== "QUEUED" || a.attempt_count >= a.max_attempts) continue;
+      // R1.2 — a hashless FILES slot has NO send authority: a persisted
+      // request minted before digest authority was mandatory converges
+      // to deterministic terminal failure — never verified, never sent.
+      if (typeof a.sha256 !== "string" || !SHA256_HEX_RE.test(a.sha256)) {
+        a.state = "FAILED_DELIVERY";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+        a.completed_at = ts;
+        dirty = true;
+        continue;
+      }
       const p = resolveDeliveryArtifactPath({
         outboxDir: String(req.outbox_dir),
         workspace: req.workspace ? String(req.workspace) : undefined,
@@ -735,20 +786,18 @@ export function pendingTelegramDeliveries(
       // Canonical artifact identity replayed at send time: a manifested
       // artifact mutated between mint and dispatch never reaches the
       // bridge — durable terminal failure, zero network call burned.
-      if (a.sha256) {
-        let actual: string | null = null;
-        try {
-          actual = sha256File(p);
-        } catch {
-          actual = null;
-        }
-        if (actual !== a.sha256) {
-          a.state = "FAILED_DELIVERY";
-          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
-          a.completed_at = ts;
-          dirty = true;
-          continue;
-        }
+      let actual: string | null = null;
+      try {
+        actual = sha256File(p);
+      } catch {
+        actual = null;
+      }
+      if (actual !== a.sha256) {
+        a.state = "FAILED_DELIVERY";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+        a.completed_at = ts;
+        dirty = true;
+        continue;
       }
       if (a.next_retry_at && a.next_retry_at > ts) continue; // backoff
       projected.push({

@@ -47,13 +47,17 @@ import {
   ReconciliationService,
   RecoveryController,
   TRANSPORT_IN_PROCESS,
+  IntegrityError,
+  assertOutputLanguageAuthority,
   assertPlanDataflow,
   canonicalDeliveryTaskInstruction,
   classifyTextLanguage,
   deliveryManifest,
   detectOutputLanguage,
   detectTelegramDeliveryIntent,
+  digest,
   languagePhrase,
+  materializeDeliveryTextPayload,
   mintTelegramDeliveryRequest,
   pendingTelegramDeliveries,
   reconcilePlanDataflow,
@@ -62,7 +66,10 @@ import {
   utcnow,
   verifyOutputLanguageContent,
   DELIVERY_TEXT_ARTIFACT,
+  MAX_TEXT_BYTES,
   PAIR_OUTPUT_LANGUAGE_KEY,
+  PAIR_PLAN_CONTRACT_KEY,
+  PAIR_PLAN_CONTRACT_VERSION,
 } from "../pair/index.js";
 import type {
   DeliveryBackend,
@@ -935,7 +942,7 @@ describe("D — TEXT mode: exactly one canonical payload source", () => {
       path.join(ctx.workspace, DELIVERY_TEXT_ARTIFACT),
       VI_REPORT,
     );
-    const a = mintTelegramDeliveryRequest({
+    const mintArgs = {
       store: ctx.store,
       mission: { mission_id: "M_D4", metadata: {} },
       task: t3 as Record<string, unknown>,
@@ -944,18 +951,463 @@ describe("D — TEXT mode: exactly one canonical payload source", () => {
       workspace: ctx.workspace,
       now: utcnow(),
       defaultChatId: "111",
-    });
-    const b = mintTelegramDeliveryRequest({
-      store: ctx.store,
-      mission: { mission_id: "M_D4", metadata: {} },
-      task: t3 as Record<string, unknown>,
-      execution: { execution_id: "E1" },
-      outboxDir: path.join(ctx.workspace, "outbox"),
-      workspace: ctx.workspace,
-      now: utcnow(),
-      defaultChatId: "111",
-    });
+      textPayload: VI_REPORT,
+    };
+    const a = mintTelegramDeliveryRequest(mintArgs);
+    const b = mintTelegramDeliveryRequest(mintArgs);
     expect(b).toEqual(a); // idempotent mint on replay
     expect(String(a!.text)).toBe(VI_REPORT);
+  });
+});
+
+/* =================== R1 — independent-audit remediation =================== */
+
+const r1TextPlan = () => [
+  goalTask("T1"),
+  {
+    task_key: "T2",
+    title: "analyze gold",
+    task_instruction: "analyze the gold market and return findings, then reply DONE.",
+    required_capabilities: ["REASONING"],
+    depends_on: ["T1"],
+    metadata: {},
+  },
+  {
+    task_key: "T3",
+    title: "deliver",
+    task_instruction: "compose the report for the operator, then reply DONE.",
+    required_capabilities: ["TELEGRAM_DELIVERY"],
+    depends_on: ["T2"],
+    metadata: {},
+  },
+];
+const R1_TEXT_GOAL = "phân tích giá vàng hôm nay rồi gửi kết quả đến telegram";
+
+describe("R1.1 — TEXT validation binds the exact wire payload", () => {
+  it("T1. English first 3500 chars + Vietnamese tail: file-level gate would pass vi while the wire payload is English — now the PAYLOAD is validated and it fails closed, zero TDR", async () => {
+    const ctx = makeCtx("r11-trunc");
+    const adapter = new ScriptedAdapter("EX_A", [
+      "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    ]);
+    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "WRITE" };
+    const bypass = EN_REPORT.repeat(16) + "\n" + VI_REPORT.repeat(6);
+    // The defect: the old gate validated the WHOLE FILE (→ vi), while the
+    // minted wire payload was the first MAX_TEXT_BYTES (→ en).
+    expect(classifyTextLanguage(bypass)).toBe("vi");
+    expect(materializeDeliveryTextPayload(bypass)).toHaveLength(MAX_TEXT_BYTES);
+    expect(classifyTextLanguage(materializeDeliveryTextPayload(bypass))).toBe("en");
+    adapter.fileContent = { T3: bypass };
+    registerAdapter(ctx, adapter);
+    const plan = reconcilePlanDataflow(r1TextPlan(), {
+      telegramIntent: TEXT_INTENT,
+      outputLanguage: detectOutputLanguage(R1_TEXT_GOAL),
+    }).tasks;
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: R1_TEXT_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: plan },
+    });
+    const mid = String(m.mission_id);
+    expect(drive(ctx, mid)).not.toBe("COMPLETED");
+    expect(deliveries(ctx)).toHaveLength(0);
+    const ev = evidence(ctx, mid, "DELIVERY_CONTRACT_VIOLATED");
+    const payload = JSON.stringify(ev.map((e) => e.payload));
+    expect(payload).toContain("FAIL_CLOSED_OUTPUT_LANGUAGE_MISMATCH");
+    expect(payload).toContain('"detected_language":"en"');
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  it("T2. whitespace normalization cannot diverge: TDR.text === materializeDeliveryTextPayload(raw file), byte-exact", () => {
+    const ctx = makeCtx("r11-normalize");
+    const adapter = new ScriptedAdapter("EX_A", [
+      "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    ]);
+    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "WRITE" };
+    const raw = `\n\n   ${VI_REPORT}\n\n   `;
+    adapter.fileContent = { T3: raw };
+    registerAdapter(ctx, adapter);
+    const plan = reconcilePlanDataflow(r1TextPlan(), {
+      telegramIntent: TEXT_INTENT,
+      outputLanguage: detectOutputLanguage(R1_TEXT_GOAL),
+    }).tasks;
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: R1_TEXT_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: plan },
+    });
+    const mid = String(m.mission_id);
+    expect(drive(ctx, mid)).toBe("COMPLETED");
+    const req = deliveries(ctx)[0];
+    const materialized = materializeDeliveryTextPayload(raw);
+    expect(materialized).toBe(VI_REPORT);
+    // VALIDATED PAYLOAD === TDR PAYLOAD — bound digest/length/source.
+    expect(String(req.text)).toBe(materialized);
+    expect(String(req.text_sha256)).toBe(digest(materialized));
+    expect(Number(req.text_length)).toBe(materialized.length);
+    expect(String(req.text_source_artifact)).toBe(DELIVERY_TEXT_ARTIFACT);
+  });
+
+  it("T3. mint never re-reads the source: file content ≠ bound payload → TDR carries the bound payload; post-mint file mutation cannot alter it", async () => {
+    const ctx = makeCtx("r11-noread");
+    fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
+    fs.writeFileSync(
+      path.join(ctx.workspace, DELIVERY_TEXT_ARTIFACT),
+      "content that must NEVER reach the wire",
+    );
+    const req = mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_R11", metadata: {} },
+      task: {
+        task_id: "T3",
+        metadata: {
+          pair_telegram_delivery: { requested: true, mode: "TEXT", artifacts: [] },
+        },
+      },
+      execution: { execution_id: "E_R11" },
+      outboxDir: path.join(ctx.workspace, "outbox"),
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      textPayload: VI_REPORT,
+    }) as Record<string, unknown>;
+    expect(String(req.text)).toBe(VI_REPORT); // bound payload, not file bytes
+    // Mutation AFTER mint cannot alter the wire payload — the file is
+    // never consulted again.
+    fs.writeFileSync(
+      path.join(ctx.workspace, DELIVERY_TEXT_ARTIFACT),
+      "MUTATED AFTER MINT — must not leak",
+    );
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toHaveLength(1);
+    expect(String(rec.calls[0].text)).toContain(VI_REPORT);
+    expect(String(rec.calls[0].text)).not.toContain("MUTATED");
+  });
+
+  it("T4. unbound TEXT mint (no gate payload) fails closed — mint cannot fabricate a payload", () => {
+    const ctx = makeCtx("r11-unbound");
+    fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
+    fs.writeFileSync(path.join(ctx.workspace, DELIVERY_TEXT_ARTIFACT), VI_REPORT);
+    const base = {
+      store: ctx.store,
+      mission: { mission_id: "M_U", metadata: {} },
+      task: {
+        task_id: "T3",
+        metadata: {
+          pair_telegram_delivery: { requested: true, mode: "TEXT", artifacts: [] },
+        },
+      },
+      execution: { execution_id: "E_U" },
+      outboxDir: path.join(ctx.workspace, "outbox"),
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+    };
+    for (const bad of [undefined, ""] as Array<string | undefined>) {
+      expect(() =>
+        mintTelegramDeliveryRequest({ ...base, textPayload: bad }),
+      ).toThrow(/FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_UNBOUND/);
+    }
+    expect(deliveries(ctx)).toHaveLength(0);
+  });
+});
+
+describe("R1.2 — FILES digest authority is mandatory", () => {
+  const filesMintBase = (ctx: ReturnType<typeof makeCtx>) => ({
+    store: ctx.store,
+    mission: { mission_id: "M_F", metadata: {} },
+    task: {
+      task_id: "T3",
+      metadata: {
+        pair_telegram_delivery: {
+          requested: true, mode: "FILES", artifacts: ["a.txt", "b.txt"],
+        },
+      },
+    },
+    execution: { execution_id: "E_F" },
+    outboxDir: path.join(ctx.workspace, "outbox"),
+    workspace: ctx.workspace,
+    now: utcnow(),
+    defaultChatId: "111",
+  });
+
+  it("F1. direct FILES mint without / with incomplete / malformed digest map → rejected", () => {
+    const ctx = makeCtx("r12-mint-digest");
+    fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
+    const sha = digest("A");
+    // no map at all
+    expect(() => mintTelegramDeliveryRequest(filesMintBase(ctx)))
+      .toThrow(/FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST/);
+    // incomplete map
+    expect(() =>
+      mintTelegramDeliveryRequest({
+        ...filesMintBase(ctx),
+        artifactSha256: { "a.txt": sha },
+      }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST/);
+    // malformed digest
+    expect(() =>
+      mintTelegramDeliveryRequest({
+        ...filesMintBase(ctx),
+        artifactSha256: { "a.txt": sha, "b.txt": "not-a-sha" },
+      }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST/);
+    // null digest
+    expect(() =>
+      mintTelegramDeliveryRequest({
+        ...filesMintBase(ctx),
+        artifactSha256: { "a.txt": sha, "b.txt": null as never },
+      }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST/);
+    expect(deliveries(ctx)).toHaveLength(0);
+    // complete map mints — every slot carries its canonical SHA-256.
+    const ok = mintTelegramDeliveryRequest({
+      ...filesMintBase(ctx),
+      artifactSha256: { "a.txt": sha, "b.txt": digest("B") },
+    }) as Record<string, unknown>;
+    for (const a of ok.artifacts as Array<Record<string, unknown>>) {
+      expect(String(a.sha256)).toMatch(/^[0-9a-f]{64}$/i);
+    }
+  });
+
+  it("F2. persisted hashless FILES TDR (pre-R1 mint) → zero network calls, deterministic FAILED_DELIVERY", async () => {
+    const ctx = makeCtx("r12-hashless-tdr");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    fs.writeFileSync(path.join(outbox, "a.txt"), "A"); // file EXISTS — still no authority
+    ctx.store.put("telegram_delivery_request", "TDR_LEGACY", {
+      delivery_id: "TDR_LEGACY",
+      mission_id: "M_L",
+      task_id: "T_L",
+      execution_id: "E_L",
+      mode: "FILES",
+      artifacts: [{ name: "a.txt", state: "QUEUED", attempt_count: 0, max_attempts: 3 }],
+      text: null,
+      destination: { provider: "TELEGRAM", chat_id: "111" },
+      outbox_dir: outbox,
+      workspace: ctx.workspace,
+      status: "QUEUED",
+      created_at: utcnow(),
+    });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    const req = ctx.store.get("telegram_delivery_request", "TDR_LEGACY");
+    const art = (req.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("FAILED_DELIVERY");
+    expect(String(art.last_error)).toBe("FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST");
+    expect(String(req.status)).toBe("FAILED_DELIVERY");
+  });
+
+  it("F3. pre-upgrade in-flight execution with no dispatch pin → fail closed at settle, never silently re-baselines current bytes", () => {
+    const ctx = makeCtx("r12-nopin");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    fs.writeFileSync(path.join(outbox, "report.txt"), VI_REPORT);
+    const m = {
+      mission_id: "M_NOPIN",
+      project_id: ctx.projectId,
+      goal: PROD_GOAL,
+      metadata: { authorized_workspaces: [ctx.workspace] },
+    };
+    const task = {
+      task_id: "TX",
+      task_key: "T5",
+      required_capabilities: ["TELEGRAM_DELIVERY"],
+      metadata: {
+        workspace: ctx.workspace,
+        pair_telegram_delivery: {
+          requested: true, mode: "FILES", artifacts: ["report.txt"],
+        },
+      },
+    };
+    const gate = (ctx.runtime as unknown as {
+      assertDeliveryDeliverable(
+        mission: Record<string, unknown>,
+        task: Record<string, unknown>,
+      ): { ok: boolean; violation?: Record<string, unknown> };
+    }).assertDeliveryDeliverable.bind(ctx.runtime);
+    // No pin at all → PIN_MISSING — the gate does NOT adopt the current
+    // file hash as the baseline even though the bytes sit right there.
+    const noPin = gate(m, task) as { ok: boolean; violation: Record<string, unknown> };
+    expect(noPin.ok).toBe(false);
+    expect(String(noPin.violation.code)).toBe("FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING");
+    // Pin row exists but the artifact entry is absent → PIN_MISSING.
+    const partial = gate(m, {
+      ...task,
+      metadata: { ...task.metadata, pair_delivery_artifact_digests: {} },
+    }) as { ok: boolean; violation: Record<string, unknown> };
+    expect(partial.ok).toBe(false);
+    expect(String(partial.violation.code)).toBe("FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING");
+    // Pin entry with a null/malformed digest → PIN_MISSING (no authority).
+    const malformed = gate(m, {
+      ...task,
+      metadata: {
+        ...task.metadata,
+        pair_delivery_artifact_digests: {
+          "report.txt": { path: null, sha256: null },
+        },
+      },
+    }) as { ok: boolean; violation: Record<string, unknown> };
+    expect(malformed.ok).toBe(false);
+    expect(String(malformed.violation.code)).toBe("FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING");
+    // Correct pin → gate passes (control case).
+    const good = gate(m, {
+      ...task,
+      metadata: {
+        ...task.metadata,
+        pair_delivery_artifact_digests: {
+          "report.txt": {
+            path: path.join(outbox, "report.txt"),
+            sha256: sha256File(path.join(outbox, "report.txt")),
+          },
+        },
+      },
+    }) as { ok: boolean };
+    expect(good.ok).toBe(true);
+  });
+});
+
+describe("R1.3 — new plans must carry digest-covered language authority", () => {
+  const r1FilesPlan = () =>
+    reconcilePlanDataflow(prodPlan(), {
+      telegramIntent: FILES_INTENT(["report.txt"]),
+      outputLanguage: detectOutputLanguage(PROD_GOAL),
+    }).tasks;
+  const deliveryTask = (tasks: Array<Record<string, unknown>>) =>
+    tasks.find((t) => t.task_key === "T5")!;
+  const expectedLang = () => detectOutputLanguage(PROD_GOAL);
+  const intent = () => detectTelegramDeliveryIntent(PROD_GOAL);
+
+  it("P1. new-contract delivery task carries pair_plan_contract{version} + matching stamp → assert passes", () => {
+    const plan = r1FilesPlan();
+    const md = deliveryTask(plan).metadata as Record<string, unknown>;
+    expect((md[PAIR_PLAN_CONTRACT_KEY] as Record<string, unknown>).version)
+      .toBe(PAIR_PLAN_CONTRACT_VERSION);
+    expect((md[PAIR_OUTPUT_LANGUAGE_KEY] as { code: string }).code).toBe("vi");
+    expect(() =>
+      assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+    ).not.toThrow();
+  });
+
+  it("P2. new-contract plan MISSING the language stamp → FAIL CLOSED", () => {
+    const plan = r1FilesPlan();
+    delete (deliveryTask(plan).metadata as Record<string, unknown>)[PAIR_OUTPUT_LANGUAGE_KEY];
+    expect(() =>
+      assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+    ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
+  });
+
+  it("P3. stamped≠expected on a new-contract plan → FAIL (tampered authority)", () => {
+    const plan = r1FilesPlan();
+    (deliveryTask(plan).metadata as Record<string, unknown>)[PAIR_OUTPUT_LANGUAGE_KEY] =
+      { ...expectedLang(), code: "en" };
+    expect(() =>
+      assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+    ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
+  });
+
+  it("P4. plan-contract marker on a NON-delivery task → forged, FAIL", () => {
+    const plan = r1FilesPlan();
+    (plan[0].metadata as Record<string, unknown>)[PAIR_PLAN_CONTRACT_KEY] = {
+      version: PAIR_PLAN_CONTRACT_VERSION,
+    };
+    expect(() =>
+      assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+    ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
+  });
+
+  it("P5. legacy pre-contract plan (no marker, no stamp) → still tolerated, explicitly version-gated", () => {
+    const plan = r1FilesPlan();
+    const md = deliveryTask(plan).metadata as Record<string, unknown>;
+    delete md[PAIR_OUTPUT_LANGUAGE_KEY];
+    delete md[PAIR_PLAN_CONTRACT_KEY];
+    expect(() =>
+      assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+    ).not.toThrow();
+    // But a legacy plan carrying a WRONG stamp still fails — the gate
+    // tolerates absence, never a lie.
+    md[PAIR_OUTPUT_LANGUAGE_KEY] = { ...expectedLang(), code: "en" };
+    expect(() =>
+      assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+    ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
+  });
+
+  it("P6. unknown/malformed plan-contract version → FAIL CLOSED (no authority)", () => {
+    for (const v of [999, "x", null, -1]) {
+      const plan = r1FilesPlan();
+      (deliveryTask(plan).metadata as Record<string, unknown>)[PAIR_PLAN_CONTRACT_KEY] =
+        { version: v };
+      expect(() =>
+        assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+      ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
+    }
+  });
+
+  it("P7. reconcile strips a planner-forged marker — authority is re-stamped only by PAIR", () => {
+    const forged = prodPlan();
+    (forged[4].metadata as Record<string, unknown>)[PAIR_PLAN_CONTRACT_KEY] = { version: 777 };
+    const plan = reconcilePlanDataflow(forged, {
+      telegramIntent: FILES_INTENT(["report.txt"]),
+      outputLanguage: expectedLang(),
+    }).tasks;
+    const md = deliveryTask(plan).metadata as Record<string, unknown>;
+    expect((md[PAIR_PLAN_CONTRACT_KEY] as Record<string, unknown>).version)
+      .toBe(PAIR_PLAN_CONTRACT_VERSION);
+    // Reloaded through JSON (a restart's reload boundary): still passes.
+    const reloaded = JSON.parse(JSON.stringify(plan));
+    expect(() =>
+      assertPlanDataflow(reloaded, { telegramIntent: intent(), outputLanguage: expectedLang() }),
+    ).not.toThrow();
+  });
+});
+
+describe("R1.4 — language directives are output-scoped", () => {
+  it("L1. 'Read the sources in Vietnamese and write the final report in English.' → en", () => {
+    const ol = detectOutputLanguage(
+      "Read the sources in Vietnamese and write the final report in English.",
+    );
+    expect(ol.code).toBe("en");
+    expect(ol.authority).toBe("GOAL_DIRECTIVE");
+  });
+  it("L2. 'Read English sources and write the final report in Vietnamese.' → vi", () => {
+    const ol = detectOutputLanguage(
+      "Read English sources and write the final report in Vietnamese.",
+    );
+    expect(ol.code).toBe("vi");
+    expect(ol.authority).toBe("GOAL_DIRECTIVE");
+  });
+  it("L3. source-scoped mention mints nothing — dominant goal language decides", () => {
+    const ol = detectOutputLanguage("the sources are in Vietnamese, summarize them");
+    expect(ol.authority).toBe("GOAL_LANGUAGE");
+    expect(ol.code).toBe("en"); // goal is English-dominant
+  });
+  it("L4. vi source + vi output stays vi; source directive cannot become authority", () => {
+    const ol = detectOutputLanguage(
+      "đọc nguồn tiếng anh rồi viết báo cáo bằng tiếng việt",
+    );
+    expect(ol.code).toBe("vi");
+    expect(ol.authority).toBe("GOAL_DIRECTIVE");
+  });
+  it("L5. genuinely conflicting output directives → UNDETERMINED, never a regex-order pick", () => {
+    const ol = detectOutputLanguage(
+      "write the report in English and also write it in Vietnamese",
+    );
+    expect(ol.code).toBeNull();
+    expect(ol.authority).toBe("UNDETERMINED");
+    expect(String(ol.evidence.detector)).toBe("conflicting_output_directives");
+  });
+  it("L6. exact production Vietnamese goal remains vi", () => {
+    const ol = detectOutputLanguage(PROD_GOAL);
+    expect(ol.code).toBe("vi");
+    expect(ol.authority).toBe("GOAL_DIRECTIVE");
   });
 });

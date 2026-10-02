@@ -52,8 +52,10 @@ import {
   missingConsumedArtifact,
 } from "./plan-dataflow.js";
 import {
+  materializeDeliveryTextPayload,
   mintTelegramDeliveryRequest,
   resolveDeliveryArtifactPath,
+  SHA256_HEX_RE,
 } from "./telegram-delivery.js";
 import {
   DELIVERY_TEXT_ARTIFACT,
@@ -453,7 +455,13 @@ export class MissionRuntime {
     mission: Record<string, unknown>,
     task: Record<string, unknown>,
   ):
-    | { ok: true; digests: Record<string, string> }
+    | {
+        ok: true;
+        digests: Record<string, string>;
+        /** R1.1 — the ONE materialized+validated wire TEXT payload;
+         *  mint stores it verbatim (VALIDATED === SENT). */
+        textPayload?: string;
+      }
     | { ok: false; violation: Record<string, unknown> } {
     const manifest = deliveryManifest(task);
     if (!manifest) return { ok: true, digests: {} };
@@ -508,9 +516,9 @@ export class MissionRuntime {
           },
         };
       }
-      let content = "";
+      let raw = "";
       try {
-        content = readBounded(p);
+        raw = readBounded(p);
       } catch {
         return {
           ok: false,
@@ -520,16 +528,55 @@ export class MissionRuntime {
           },
         };
       }
-      const bad = languageViolation(DELIVERY_TEXT_ARTIFACT, content);
+      // R1.1 — ONE materialization: the exact wire payload is derived
+      // once with the canonical rules (trim + MAX_TEXT_BYTES) and the
+      // language gate validates THAT string — never the untruncated
+      // file — then mint stores it verbatim. A 3500-char English
+      // prefix followed by enough Vietnamese to flip the file-level
+      // classifier cannot pass-and-send English.
+      const textPayload = materializeDeliveryTextPayload(raw);
+      if (!textPayload.length) {
+        return {
+          ok: false,
+          violation: {
+            code: "FAIL_CLOSED_DELIVERY_TEXT_PAYLOAD_MISSING",
+            artifact: DELIVERY_TEXT_ARTIFACT,
+            reason: "empty_payload",
+          },
+        };
+      }
+      const bad = languageViolation(DELIVERY_TEXT_ARTIFACT, textPayload);
       if (bad) return { ok: false, violation: bad };
-      return { ok: true, digests: {} };
+      return { ok: true, digests: {}, textPayload };
     }
-    // FILES
+    // FILES — R1.2 mandatory digest authority: dispatch pin exists AND
+    // pin.sha256 is a valid digest AND pre-mint hash == pin. A
+    // pre-contract execution reaching settle with NO pin fails closed
+    // (governed recovery/replan) — it must NEVER silently re-baseline
+    // against current bytes.
     const pinned = md.pair_delivery_artifact_digests as
       | Record<string, { sha256?: string | null }>
       | undefined;
+    const pinMissing = (name: string): Record<string, unknown> => ({
+      code: "FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING",
+      artifact: name,
+    });
+    if (pinned === undefined) {
+      return {
+        ok: false,
+        violation: pinMissing(String(manifest.artifacts[0] ?? "?")),
+      };
+    }
     const digests: Record<string, string> = {};
     for (const name of manifest.artifacts) {
+      const before = pinned[name];
+      if (
+        !before ||
+        typeof before.sha256 !== "string" ||
+        !SHA256_HEX_RE.test(before.sha256)
+      ) {
+        return { ok: false, violation: pinMissing(name) };
+      }
       const p = resolveDeliveryArtifactPath({ outboxDir, workspace, name });
       if (!p) {
         return {
@@ -552,19 +599,16 @@ export class MissionRuntime {
           },
         };
       }
-      if (pinned !== undefined) {
-        const before = pinned[name];
-        if (!before?.sha256 || before.sha256 !== sha) {
-          return {
-            ok: false,
-            violation: {
-              code: "FAIL_CLOSED_DELIVERY_ARTIFACT_MUTATED",
-              artifact: name,
-              expected_sha256: before?.sha256 ?? null,
-              actual_sha256: sha,
-            },
-          };
-        }
+      if (before.sha256 !== sha) {
+        return {
+          ok: false,
+          violation: {
+            code: "FAIL_CLOSED_DELIVERY_ARTIFACT_MUTATED",
+            artifact: name,
+            expected_sha256: before.sha256,
+            actual_sha256: sha,
+          },
+        };
       }
       digests[name] = sha;
       if (expectedLanguage && isTextDeliverableName(name)) {
@@ -983,6 +1027,7 @@ export class MissionRuntime {
         const settledTask = this.store.get("task", taskId);
         const caps = (settledTask.required_capabilities as string[]) ?? [];
         let artifactSha256: Record<string, string> | undefined;
+        let textPayload: string | undefined;
         if (caps.includes("TELEGRAM_DELIVERY")) {
           // Output/delivery contract gate — strictly BEFORE the success
           // mark, i.e. before any telegram_delivery_request (external
@@ -1013,6 +1058,7 @@ export class MissionRuntime {
             return;
           }
           artifactSha256 = check.digests;
+          textPayload = check.textPayload;
         }
         this.deps.service.updateTask(taskId, {
           status: "COMPLETED",
@@ -1053,6 +1099,7 @@ export class MissionRuntime {
             defaultChatId: this.deps.telegramDeliveryDefaultChatId,
             maxAttempts: this.deps.telegramDeliveryMaxAttempts,
             artifactSha256,
+            textPayload,
           });
         }
         return;

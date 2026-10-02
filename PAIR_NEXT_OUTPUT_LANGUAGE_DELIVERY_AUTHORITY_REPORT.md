@@ -177,3 +177,192 @@ Classification:
 `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_CLOSURE_PENDING_INDEPENDENT_AUDIT`
 
 STOP. DO NOT MERGE. Await independent audit.
+
+---
+
+# INDEPENDENT AUDIT R1 REMEDIATION
+
+Audit result on the section above: `BLOCKED — R1 REQUIRED` (4 findings).
+
+- **Audited base:** `a01f1d79a2eb672cc54560018e581597e3755780`
+- **Previous audited HEAD:** `2b552589bb1a702896a425e230496d66817a8841`
+- **New HEAD:** see git log (this section committed on the same PR #30)
+
+## RCA R1.1 — validated TEXT payload ≠ TDR payload (TOCTOU/normalization/truncation)
+
+**Root cause.** The settle gate validated the WHOLE file content read from
+`outbox/report.txt`; `mintTelegramDeliveryRequest()` then independently
+re-read the file and applied `.trim().slice(0, MAX_TEXT_BYTES)`. Validation
+target ≠ wire payload: a 3500-char English prefix + Vietnamese tail
+classified the file `vi` (gate PASS) while the actual Telegram TEXT was the
+first 3500 English chars — a concrete language bypass, plus a TOCTOU window
+and trim/truncation drift.
+
+**Fix — ONE materialization.** New `materializeDeliveryTextPayload(raw)`
+in `src/pair/telegram-delivery.ts` is THE canonical wire derivation
+(`trim` + `MAX_TEXT_BYTES`). `assertDeliveryDeliverable()` (mission-runtime)
+reads the artifact once (bounded fd-read), materializes the payload, fails
+closed on empty (`FAIL_CLOSED_DELIVERY_TEXT_PAYLOAD_MISSING`), validates
+language against THAT string, and returns it as `textPayload`. Settle
+passes it to mint; mint REQUIRES `args.textPayload` — an unbound/empty
+TEXT mint throws `FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_UNBOUND` (IntegrityError)
+instead of re-reading or transforming the file. Mint binds durable
+evidence: `text_sha256` + `text_length` + `text_source_artifact`.
+`VALIDATED TEXT PAYLOAD === TDR TEXT PAYLOAD` by construction.
+
+**Proof.** R1.1-T1 E2E: file = `EN_REPORT×16 + VI_REPORT×6` — whole file
+classifies `vi`, materialized payload classifies `en` → mission does NOT
+complete, `DELIVERY_CONTRACT_VIOLATED`/`FAIL_CLOSED_OUTPUT_LANGUAGE_MISMATCH`
+with `detected_language:"en"`, zero TDR, 0 transport calls. T2: leading/
+trailing whitespace — `TDR.text === materializeDeliveryTextPayload(raw)`
+byte-exact + sha256/length/source evidence bound. T3: file content ≠ bound
+payload → TDR carries the bound payload; post-mint file mutation cannot
+alter it. T4: missing/empty `textPayload` → mint throws, zero TDR rows.
+
+## RCA R1.2 — FILES digest authority was optional (no hash → no authority)
+
+**Root cause.** `artifactSha256` was optional at mint; slots carried a
+digest only when supplied; `pendingTelegramDeliveries` verified only
+`if (a.sha256)`; the settle gate compared against the dispatch pin only
+`if (pinned !== undefined)`. Three permissive seams let a hashless FILES
+artifact reach the bridge unverified, and a pre-upgrade (no-pin)
+execution reaching settle silently re-baselined against current bytes.
+
+**Fix — mandatory chain.** `dispatch pin exists AND pin.sha256 valid AND
+pre-mint hash == pin AND TDR slot sha256 == verified hash AND
+pre-network hash == slot sha256`:
+
+- `assertDeliveryDeliverable` FILES branch: `pinned === undefined` →
+  `FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING`; per-artifact missing entry
+  or missing/malformed `sha256` → PIN_MISSING; mismatch →
+  `FAIL_CLOSED_DELIVERY_ARTIFACT_MUTATED` (kept). A no-pin pre-upgrade
+  execution NEVER silently re-baselines — it fails closed into governed
+  recovery (`DELIVERY_CONTRACT_VIOLATED` + `ARTIFACT_VALIDATION_FAILURE`,
+  replan/abort per recovery semantics).
+- `mintTelegramDeliveryRequest` FILES: absent/incomplete/malformed map →
+  `FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST` before the row exists; every
+  slot is minted with its canonical SHA-256.
+- `pendingTelegramDeliveries` FILES projection: a hashless or malformed
+  slot (e.g. a persisted pre-R1 TDR) converges to deterministic
+  `FAILED_DELIVERY`/`FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST` — never
+  silently skips verification, zero network calls.
+
+**Proof.** F1: mint without map / incomplete map / malformed digest / null
+digest all throw `FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST`, zero TDR rows;
+complete map mints with valid per-slot SHA-256. F2: persisted hashless
+TDR with the file present → `FAILED_DELIVERY`+DIGEST, request
+`FAILED_DELIVERY`, 0 transport calls. F3: gate with no pin / empty pin /
+null-sha entry → `FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING` (file bytes
+are never adopted as baseline); correct pin passes.
+
+## RCA R1.3 — new plans could carry no language authority at all
+
+**Root cause.** `assertOutputLanguageAuthority()` tolerated a delivery
+task with no `pair_output_language` stamp unconditionally — the canonical
+binding stayed optional forever on every plan, new or legacy.
+
+**Fix — version-gated contract.** New reserved key
+`pair_plan_contract = {version: 2}` (PAIR-owned, planner-stripped) is
+stamped on the delivery task at the SAME reconcile seam as the language
+stamp (only when `opts.outputLanguage` is provided — the only seam where
+language authority exists). `assertOutputLanguageAuthority`:
+
+- marker present with `version === 2` → new-contract plan → stamp
+  REQUIRED: absent → `FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY`; mismatched
+  → FAIL (unchanged rule).
+- marker absent → legacy pre-contract plan → absent stamp tolerated
+  (runtime re-derives language from the mission goal at the delivery
+  gate anyway); a PRESENT wrong stamp still fails — tolerance covers
+  absence, never a lie.
+- unknown/malformed version → FAIL CLOSED (no authority).
+- marker or stamp on a non-delivery task → forged → FAIL.
+
+The marker is digest-covered via canonical task JSON and preserved by the
+canonical key-order block so replay produces byte-identical tasks.
+
+**Proof.** P1: new plan marker{2}+stamp → PASS. P2: marker{2}+no stamp →
+FAIL. P3: marker{2}+wrong stamp → FAIL. P4: marker on non-delivery → FAIL.
+P5: legacy (no marker+no stamp) → PASS; legacy+wrong stamp → FAIL. P6:
+version 999/"x"/null/-1 → FAIL. P7: planner-forged marker stripped at
+reconcile + re-stamped canonically; JSON round-trip replay passes.
+
+## RCA R1.4 — directives were not output-scoped (first-language-name-wins)
+
+**Root cause.** `detectOutputLanguage` iterated language families in a
+fixed regex order and returned the first match anywhere in the goal — a
+language naming the SOURCE material could mint output authority
+(`Read the sources in Vietnamese and write the final report in English`
+→ `vi`, wrong).
+
+**Fix — bounded deterministic grammar.** Every directive match is
+collected with its position; in a 160-char lookback window before each
+mention, the marker NEAREST the mention decides its scope: SOURCE
+markers (read/sources/input/materials/documents/references/from/based on
++ đọc/nguồn/tài liệu/tham khảo) strictly closer → the mention describes
+INPUT → skipped; OUTPUT markers (write/compose/summarize/respond/produce/
+answer/translate/convert/reply/deliver/output/final/report + viết/soạn/
+tóm tắt/trả lời/tạo/gửi/báo cáo/kết quả/xuất) closer, or NO markers at
+all (bare directive) → output-scoped candidate. Exactly-one distinct
+candidate code → `GOAL_DIRECTIVE`; ≥2 → explicit `UNDETERMINED`
+(`detector: "conflicting_output_directives"`, evidence lists codes +
+directive texts — never a regex-order pick); 0 → dominant-language
+fallback as before. Overlapping mentions deduped by span (earliest/
+longest wins) so "bằng tiếng việt" counts once.
+
+**Proof.** L1 `Read the sources in Vietnamese and write the final report
+in English.` → `en` GOAL_DIRECTIVE. L2 `Read English sources and write
+the final report in Vietnamese.` → `vi` GOAL_DIRECTIVE. L3 `the sources
+are in Vietnamese, summarize them` → GOAL_LANGUAGE `en` (source mention
+mints nothing). L4 `đọc nguồn tiếng anh rồi viết báo cáo bằng tiếng việt`
+→ `vi`. L5 `write the report in English and also write it in Vietnamese`
+→ UNDETERMINED/conflict. L6: exact production goal → `vi` GOAL_DIRECTIVE
+(regression anchor preserved).
+
+## R1 changed files
+
+- `src/pair/output-language.ts` — output-scoped directive grammar
+  (collect+scope+conflict, dedupe, marker sets).
+- `src/pair/plan-dataflow.ts` — `PAIR_PLAN_CONTRACT_KEY`/VERSION reserved
+  + stamped at reconcile + canonical key-order + version-gated
+  `assertOutputLanguageAuthority`.
+- `src/pair/telegram-delivery.ts` — `materializeDeliveryTextPayload` +
+  `SHA256_HEX_RE` exported; mint: FILES digest map mandatory + TEXT
+  `textPayload` mandatory (+`text_sha256`/`text_length`/
+  `text_source_artifact` evidence); projection: hashless slot →
+  FAILED_DELIVERY DIGEST.
+- `src/pair/mission-runtime.ts` — gate materializes+validates payload
+  once → `textPayload` to mint; FILES pin mandatory
+  (`FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING`), malformed pin digest →
+  PIN_MISSING; settle threads `textPayload`.
+- `src/__tests__/pair-output-delivery-contract.test.ts` — +20 R1 tests
+  (T1–T4, F1–F3, P1–P7, L1–L6); D4 mint fixture passes `textPayload`.
+- `src/__tests__/pair-planner-dataflow-incident.test.ts` —
+  `mintFilesRequest` fixture materializes artifacts + pins real SHA-256
+  (mandatory under R1.2); `create:false` keeps the never-produced case
+  converging `FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED`.
+
+## R1 test results
+
+- New R1 focused tests: **20/20** in the contract suite (42 total).
+- `pair-output-delivery-contract`: **42 passed**
+- `pair-planner-dataflow-incident`: **106 passed**
+- `pair-ops-telegram-delivery`: **3 passed**
+- Full suite: **2784 passed / 2 failed / 15 skipped** (94 files) — the 2
+  failures are the pre-existing env-only `pair-p5` tests 2+3
+  (`stockProbe.available===false` expected; this VM has the binaries
+  installed so probes return `available:true` — unrelated to this change).
+- `tsc --noEmit`: clean. `pnpm build`: clean.
+
+## R1 zero-network proof
+
+Every fail-closed case asserts zero Telegram calls on the recording
+transport: T1 truncation-bypass (0 calls, 0 TDR), T4 unbound mint (0
+rows), F1 rejected mints (0 rows), F2 hashless persisted TDR (0 calls,
+deterministic FAILED_DELIVERY), F3 no-pin settle (gate violation →
+`DELIVERY_CONTRACT_VIOLATED` → recovery, no mint). Pre-existing zero-net
+guards unchanged (C2/C3/C4/D2/D3, incident §13).
+
+Classification:
+`PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R1_PENDING_REAUDIT`
+
+STOP. DO NOT MERGE. Await independent re-audit.

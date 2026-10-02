@@ -78,8 +78,9 @@ export function languagePhrase(code: string | null | undefined): string {
 
 /* ------------------------- directive parsing -------------------------- */
 
-/** Explicit operator language directives — bounded, first match wins.
- *  Order matters: more specific/compound frames first. */
+/** Explicit operator language directives. A mention mints output-language
+ *  authority ONLY when it binds to an output/deliverable clause (R1.4) —
+ *  a language naming the operator's SOURCE material never does. */
 const LANGUAGE_DIRECTIVES: Array<[RegExp, string]> = [
   // Vietnamese frames — "bằng tiếng việt", "báo cáo tiếng việt", "viết tiếng việt".
   [/(?:bằng|bang)\s+tiếng\s+(?:việt|viet)|tiếng\s+việt|tieng\s+viet/iu, "vi"],
@@ -93,6 +94,70 @@ const LANGUAGE_DIRECTIVES: Array<[RegExp, string]> = [
   [/英語/, "en"],
   [/日本語/, "ja"],
 ];
+
+/** R1.4 — bounded deterministic grammar binding a language mention to
+ *  an OUTPUT clause. The markers are scanned inside a fixed lookback
+ *  window before each mention; the marker NEAREST the mention decides
+ *  its scope. Output verbs/deliverable nouns: the language describes
+ *  what the operator RECEIVES. Source verbs/nouns (read/sources/input/
+ *  đọc/nguồn/tài liệu/…): the language describes the INPUT material —
+ *  it mints nothing. A mention with no markers at all is a bare
+ *  directive and counts as output-scoped. Two different output-scoped
+ *  codes → explicit conflict → UNDETERMINED (never regex-order pick). */
+const DIRECTIVE_LOOKBACK = 160;
+const OUTPUT_MARKERS: RegExp[] = [
+  /\b(?:write|writes|writing|compose|composing|summari[sz]e[sd]?|summarizing|respond|response|produce|produces|producing|answers?|translat(?:e|es|ing|ion)|convert(?:s|ed|ing)?|repl(?:y|ies|ied|ying)|deliver(?:able|ables|y|ing)?|outputs?|final|report|reports)\b/giu,
+  /\b(?:viết|viet|soạn|soan|tóm\s+tắt|tom\s+tat|trả\s+lời|tra\s+loi|tạo|tao|gửi|gui|báo\s+cáo|bao\s+cao|kết\s+quả|ket\s+qua|xuất|xuat)\b/iu,
+];
+const SOURCE_MARKERS: RegExp[] = [
+  /\b(?:read|reads|reading|sources?|inputs?|materials?|documents?|references?|from|based\s+on)\b/giu,
+  /\b(?:đọc|doc|nguồn|nguon|tài\s+liệu|tai\s+lieu|tham\s+khảo|tham\s+khao)\b/iu,
+];
+
+const lastMarkerIndex = (text: string, markers: RegExp[]): number => {
+  let best = -1;
+  for (const re of markers) {
+    const g = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+    let m: RegExpExecArray | null;
+    while ((m = g.exec(text))) best = Math.max(best, m.index);
+  }
+  return best;
+};
+
+/** Collect every language mention; for each, decide whether it binds to
+ *  an output clause. Overlapping mentions are deduped by span — the
+ *  earliest (and longest-covering) wins. */
+function collectOutputLanguageMentions(
+  text: string,
+): Array<{ code: string; directive: string; index: number }> {
+  const mentions: Array<{ code: string; directive: string; index: number; end: number }> = [];
+  for (const [re, code] of LANGUAGE_DIRECTIVES) {
+    const g = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+    let m: RegExpExecArray | null;
+    while ((m = g.exec(text))) {
+      mentions.push({ code, directive: m[0].trim(), index: m.index, end: m.index + m[0].length });
+    }
+  }
+  mentions.sort((a, b) => a.index - b.index || b.end - a.end);
+  const deduped: typeof mentions = [];
+  for (const mn of mentions) {
+    // A mention starting inside an earlier one's span is the same
+    // utterance matched twice — keep the earliest/longest.
+    if (deduped.length && mn.index < deduped[deduped.length - 1].end) continue;
+    deduped.push(mn);
+  }
+  const out: Array<{ code: string; directive: string; index: number }> = [];
+  for (const mn of deduped) {
+    const window = text.slice(Math.max(0, mn.index - DIRECTIVE_LOOKBACK), mn.index);
+    const lastOut = lastMarkerIndex(window, OUTPUT_MARKERS);
+    const lastSrc = lastMarkerIndex(window, SOURCE_MARKERS);
+    // Nearest marker wins: a source marker strictly closer to the
+    // mention means the language describes INPUT material — skip it.
+    if (lastSrc >= 0 && lastSrc > lastOut) continue;
+    out.push({ code: mn.code, directive: mn.directive, index: mn.index });
+  }
+  return out;
+}
 
 /* ------------------------- language classifier ------------------------ */
 
@@ -172,15 +237,33 @@ export function classifyTextLanguage(text: unknown): string | null {
  */
 export function detectOutputLanguage(goal: unknown): OutputLanguage {
   const text = String(goal ?? "").normalize("NFC").slice(0, 4096);
-  for (const [re, code] of LANGUAGE_DIRECTIVES) {
-    const m = re.exec(text);
-    if (m) {
-      return {
-        code,
-        authority: "GOAL_DIRECTIVE",
-        evidence: { directive: m[0].trim() },
-      };
-    }
+  // R1.4 — only OUTPUT-SCOPED language mentions mint authority. A
+  // language naming source/input material is skipped; genuinely
+  // conflicting output directives resolve to explicit UNDETERMINED —
+  // never a regex-order pick.
+  const directives = collectOutputLanguageMentions(text);
+  const codes = [...new Set(directives.map((d) => d.code))];
+  if (codes.length === 1) {
+    return {
+      code: codes[0],
+      authority: "GOAL_DIRECTIVE",
+      evidence: {
+        directive: directives[0].directive,
+        scope: "output",
+        ...(directives.length > 1 ? { mentions: directives.length } : {}),
+      },
+    };
+  }
+  if (codes.length > 1) {
+    return {
+      code: null,
+      authority: "UNDETERMINED",
+      evidence: {
+        detector: "conflicting_output_directives",
+        codes,
+        directives: directives.map((d) => d.directive),
+      },
+    };
   }
   const detected = classifyTextLanguage(text);
   if (detected) {
