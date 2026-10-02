@@ -957,3 +957,78 @@ Two remaining fail-open seams:
 - this report — R5 section appended; all prior evidence preserved.
 
 STOP. DO NOT MERGE. Awaiting independent audit of R5.
+
+# R6 remediation — independent-audit CAPABILITY-SCOPED RUNTIME AUTHORITY closure
+
+Audited R5 HEAD: `0e7dcff99bb2921fcb1cb1d9f1dafaaccf2be57d`.
+
+## R6.1 Root cause and fix
+
+One narrow runtime semantic conflict: `providerModelEligibility` still
+carried `MODEL_PROBE_CURRENT = model.probe_state === "PROBED"`.
+`model.probe_state` is a GLOBAL summary — every `recordProbeReceipt`
+overwrites it regardless of capability. An unrelated capability failure
+therefore revoked a healthy qualified capability (vision FAIL →
+probe_state=PROBE_FAIL → whole model ineligible even though latest
+text_inference was PASS), contradicting R4's capability-scoped
+authority model.
+
+Fix (minimal, per §3): `MODEL_PROBE_CURRENT` removed from model runtime
+authority. `model.probe_state` remains as operator observability /
+diagnostic summary only. Authoritative runtime model gates are now:
+`MODEL_QUALIFIED`, `MODEL_RECEIPT_CURRENT`,
+`MODEL_QUALIFICATION_SCOPE_VALID`, `MODEL_CAPABILITY_PROBE_CURRENT`
+(+ provider/currentness/revocation gates). No parallel capability
+state was introduced. Unqualified-model behavior unchanged —
+`MODEL_QUALIFIED` governs; global `PROBED` alone never grants
+authority (§4/§8).
+
+Both directions of the invariant hold: failure of capability B does
+NOT revoke capability A while A's latest canonical probe is PASS;
+PASS of B does NOT revive failed A.
+
+## R6.2 R6 tests (new)
+
+- **r6a** (§5): text qualified + routable on planner AND DSH models;
+  vision FAIL on both → `probe_state=PROBE_FAIL` (summary) but
+  `MODEL_CAPABILITY_PROBE_CURRENT` PASS, `eligible=true`,
+  `assertPlannerCandidateEligible` + `assertDshCandidateEligible` pass.
+- **r6b** (§6): text FAIL → blocked; vision PASS →
+  `probe_state=PROBED` summary but text stays non-routable
+  (scoped gate FAIL, planner rejects).
+- **r6c** (§7): scope [text,tools] + vision FAIL → still routable;
+  tools FAIL → not routable; fresh tools PASS → routable. Only
+  in-scope failures revoke.
+- **r6d** (§8): unqualified model + vision PASS → `probe_state=PROBED`
+  summary, `MODEL_QUALIFIED` FAIL, non-routable — summary state never
+  mints authority.
+- **Fixture updates (legitimate)**: two R3 assertions switched from
+  the removed `MODEL_PROBE_CURRENT` to `MODEL_CAPABILITY_PROBE_CURRENT`
+  (same outcome — the failed capability was the qualified one).
+
+## R6.3 Regression
+
+- Focused Phase E suite: **73/73** (34 + 11 R1 + 6 R2 + 6 R3 + 5 R4 + 7 R5 + 4 R6).
+- Incident invariants (full run): planner-dataflow 106/106,
+  recovery-approval 37/37, ops-telegram-delivery 3/3,
+  live-ops-recovery-closure 20/20, runtime-hardening 11/11 — 177/177.
+- Sibling seam consumers: phase-b 123/123, phase-c-dsh 51/51,
+  p6 36/36.
+- Full suite: **2742 pass / 2 fail / 15 skip (2759)** — the 2 fails are
+  the same pre-existing env-only P5 assertions
+  (`EXECUTABLE_NOT_FOUND` — real `dsh`/`codex` on PATH; identical on
+  base `b08e8a5` and every audited HEAD). +4 vs R5 count.
+- `npx tsc --noEmit`: clean. `pnpm build`: clean.
+- Live E2E: unchanged from R2 (R6 touches the eligibility projection
+  only, not the boot path).
+
+## R6.4 Files changed in R6
+
+- `src/pair/model-routable.ts` — `MODEL_PROBE_CURRENT` removed from
+  `providerModelEligibility`; `probe_state` documented as
+  summary/observability only.
+- `src/__tests__/pair-phase-e-provider-model-authority.test.ts` —
+  +4 R6 tests; two R3 assertions retargeted to the scoped gate.
+- this report — R6 section appended; all prior evidence preserved.
+
+STOP. DO NOT MERGE. Awaiting independent audit of R6.

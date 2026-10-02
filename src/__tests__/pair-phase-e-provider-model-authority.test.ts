@@ -1481,8 +1481,10 @@ describe("R2 — §19 provider routable gates agree on STALE", () => {
 
 /* ==================== R3 — CURRENT PROBE CLOSURE ====================
  * R3 §1–§3 — a newer canonical probe failure revokes model invocation
- * immediately: MODEL_PROBE_CURRENT exact-PROBED in shared eligibility,
- * availability-classified (planner/DSH reject, never authority grant).
+ * immediately: MODEL_CAPABILITY_PROBE_CURRENT (capability-scoped; R6 —
+ * the global probe_state summary gate was removed from runtime
+ * authority), availability-classified (planner/DSH reject, never
+ * authority grant).
  * R3 §5–§7 — the provider qualification commit seam validates durable
  * state itself. R3 §10/§11 — window ownership + derived evidence_refs. */
 
@@ -1540,7 +1542,7 @@ describe("R3 — §8/§9 provider seam: forged receipt fails closed, canonical p
 });
 
 describe("R3 — §12 model probe failure revokes invocation", () => {
-  it("qualified routable model + new FAIL probe → PROBE_FAIL, MODEL_PROBE_CURRENT FAIL, planner+DSH reject, old PASS inspectable", async () => {
+  it("qualified routable model + new FAIL probe on its capability → scoped gate FAIL, planner+DSH reject, old PASS inspectable", async () => {
     const { store, service } = makeCtx("r12");
     await mkQualifiedProvider(store, "pv");
     const mcat = new ModelEvidenceCatalog(store);
@@ -1586,7 +1588,9 @@ describe("R3 — §12 model probe failure revokes invocation", () => {
     });
     expect(mcat.getModel(mePlanner)!.probe_state).toBe("PROBE_FAIL");
     const elig = providerModelEligibility(store, "pv", mePlanner);
-    expect(elig.gates.MODEL_PROBE_CURRENT).toBe("FAIL");
+    // R6 — runtime authority is capability-scoped: the failed capability
+    // is the qualified one (text_inference), so the scoped gate fails.
+    expect(elig.gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
     expect(elig.gates.MODEL_QUALIFIED).toBe("PASS"); // receipt/history kept
     expect(elig.eligible).toBe(false);
     // Availability-channel rejection before any invocation — never an
@@ -1609,7 +1613,7 @@ describe("R3 — §13 fresh PASS probe restores model invocation", () => {
     const mcat = new ModelEvidenceCatalog(store);
     const me = mkModel(store, "pv", "m1");
     mcat.recordProbeReceipt({ probe_id: "PRB_r13_fail", model_entry_id: me, provider_id: "pv", result: "FAIL", probe_type: "text_inference", latency_ms: 1 });
-    expect(providerModelEligibility(store, "pv", me).gates.MODEL_PROBE_CURRENT).toBe("FAIL");
+    expect(providerModelEligibility(store, "pv", me).gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
 
     mcat.recordProbeReceipt({
       probe_id: "PRB_r13_pass",
@@ -2164,5 +2168,131 @@ describe("R5 — §11/§12 provider receipt runtime gate validation", () => {
     const elig = providerModelEligibility(store, "pv", me);
     expect(elig.gates.PROVIDER_RECEIPT_CURRENT).toBe("PASS");
     expect(elig.eligible).toBe(true);
+  });
+});
+
+/* ==================== R6 — CAPABILITY-SCOPED RUNTIME AUTHORITY ====================
+ * R6 §1–§4 — model.probe_state is a GLOBAL summary overwritten by every
+ * recordProbeReceipt regardless of capability. It must NOT independently
+ * override capability-scoped runtime authority: an unrelated capability
+ * FAIL cannot revoke a healthy qualified capability, and an unrelated
+ * PASS cannot revive a failed one. Runtime authority =
+ * MODEL_QUALIFIED + MODEL_RECEIPT_CURRENT + MODEL_QUALIFICATION_SCOPE_VALID
+ * + MODEL_CAPABILITY_PROBE_CURRENT (+ provider/currentness gates). */
+
+const r6Probe = (mcat: ModelEvidenceCatalog, me: string, id: string, type: string, result: string) =>
+  mcat.recordProbeReceipt({
+    probe_id: id,
+    model_entry_id: me,
+    provider_id: "pv",
+    result,
+    probe_type: type,
+    capability_evidence: { [type]: result },
+    latency_ms: 1,
+  });
+
+describe("R6 — §5 healthy text survives unrelated vision failure", () => {
+  it("text qualified+routable; vision FAIL → probe_state=PROBE_FAIL summary but eligible stays true (planner+DSH)", async () => {
+    const { store, service } = makeCtx("r6a");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const mePlanner = mkModel(store, "pv", "mp");
+    assignModelRole(store, mePlanner, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    const meDsh = mkModel(store, "pv", "md");
+    assignModelRole(store, meDsh, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+    registerDsh(service, new DshExecutorAdapter({
+      journalRoot: path.join(freshDir("r6aj"), "j"),
+      envReader: () => "cred",
+      compatEnvRouteFallback: true,
+      launchOverride: { command: "node", args: ["fixture.mjs", "--profile", "acp"] },
+    }));
+    const bind = ensureBinding(service, {
+      executor_id: DSH_EXECUTOR_ID,
+      provider_id: "pv",
+      model_entry_id: meDsh,
+      transport_compat: "OPENAI_COMPLETIONS",
+    });
+    qualifyBinding(service, String(bind.binding_id));
+    const cand = { ref: "pv:md", pid: "pv", mid: "md", model_entry_id: meDsh };
+    expect(assertPlannerCandidateEligible(store, mePlanner)).toBeUndefined();
+    expect(assertDshCandidateEligible(service, cand, DSH_EXECUTOR_ID)).toBeUndefined();
+
+    // An UNRELATED capability fails on both models — global summary
+    // flips to PROBE_FAIL, but latest text_inference is still PASS.
+    r6Probe(mcat, mePlanner, "PRB_6a_vision_fail_p", "vision", "FAIL");
+    r6Probe(mcat, meDsh, "PRB_6a_vision_fail_d", "vision", "FAIL");
+    expect(mcat.getModel(mePlanner)!.probe_state).toBe("PROBE_FAIL");
+    for (const me of [mePlanner, meDsh]) {
+      const elig = providerModelEligibility(store, "pv", me);
+      expect(elig.gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("PASS");
+      expect(elig.eligible).toBe(true);
+    }
+    expect(assertPlannerCandidateEligible(store, mePlanner)).toBeUndefined();
+    expect(assertDshCandidateEligible(service, cand, DSH_EXECUTOR_ID)).toBeUndefined();
+  });
+});
+
+describe("R6 — §6 failed text not revived by unrelated vision PASS", () => {
+  it("text FAIL → blocked; vision PASS → probe_state=PROBED summary but text stays non-routable", async () => {
+    const { store } = makeCtx("r6b");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const me = mkModel(store, "pv", "m1");
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    r6Probe(mcat, me, "PRB_6b_text_fail", "text_inference", "FAIL");
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(false);
+
+    r6Probe(mcat, me, "PRB_6b_vision_pass", "vision", "PASS");
+    expect(mcat.getModel(me)!.probe_state).toBe("PROBED"); // global summary only
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({ reject: true });
+  });
+});
+
+describe("R6 — §7 multi-capability scope: only in-scope failures revoke", () => {
+  it("[text,tools] + vision FAIL → routable; tools FAIL → not routable; fresh tools PASS → routable", async () => {
+    const { store } = makeCtx("r6c");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+    r6Probe(mcat, me, "PRB_6c_text", "text_inference", "PASS");
+    r6Probe(mcat, me, "PRB_6c_tools", "tools", "PASS");
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference", "tools"], actor: "t" }).qualified).toBe(true);
+
+    // Unrelated capability failure does not revoke the [text,tools] scope.
+    r6Probe(mcat, me, "PRB_6c_vision_fail", "vision", "FAIL");
+    expect(mcat.getModel(me)!.probe_state).toBe("PROBE_FAIL");
+    const ok = providerModelEligibility(store, "pv", me);
+    expect(ok.gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("PASS");
+    expect(ok.eligible).toBe(true);
+
+    r6Probe(mcat, me, "PRB_6c_tools_fail", "tools", "FAIL");
+    const blocked = providerModelEligibility(store, "pv", me);
+    expect(blocked.gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
+    expect(blocked.eligible).toBe(false);
+
+    r6Probe(mcat, me, "PRB_6c_tools_pass2", "tools", "PASS");
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference", "tools"], actor: "t" }).qualified).toBe(true);
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R6 — §8 summary PROBED never mints authority", () => {
+  it("unqualified model + vision PASS → probe_state=PROBED summary, still non-routable (MODEL_QUALIFIED FAIL)", async () => {
+    const { store } = makeCtx("r6d");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    r6Probe(mcat, me, "PRB_6d_vision", "vision", "PASS");
+    expect(mcat.getModel(me)!.probe_state).toBe("PROBED");
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_QUALIFIED).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({ reject: true });
   });
 });

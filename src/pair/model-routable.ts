@@ -282,13 +282,14 @@ export function providerModelEligibility(
       ? "PASS"
       : "FAIL";
   gates.MODEL_QUALIFIED = model?.lifecycle_state === "QUALIFIED" ? "PASS" : "FAIL";
-  // Phase E R3 §1–§3 — a newer canonical probe failure revokes model
-  // invocation immediately. The qualification receipt binds model
-  // identity, not probe state, so only an exact PROBED current state
-  // authorizes work (UNPROBED / PROBE_* both fail). Availability
-  // classification: a fresh PASS probe can restore authority.
-  gates.MODEL_PROBE_CURRENT =
-    model && String(model.probe_state ?? "") === "PROBED" ? "PASS" : "FAIL";
+  // Phase E R3 §1–§3 + R6 — a newer canonical probe failure revokes
+  // model invocation immediately, but ONLY at capability scope:
+  // MODEL_CAPABILITY_PROBE_CURRENT (below) is the runtime authority.
+  // model.probe_state is a global summary — every recordProbeReceipt
+  // overwrites it regardless of capability, so it must not independently
+  // override capability-scoped authority (an unrelated capability FAIL
+  // would otherwise revoke a healthy qualified capability). It remains
+  // useful for operator observability/diagnostics only.
   gates.MODEL_NOT_STALE =
     model && !modelConditions.includes("STALE") && !modelConditions.includes("REMOVED") ? "PASS" : "FAIL";
   gates.MODEL_NOT_REVOKED =

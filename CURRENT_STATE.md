@@ -903,6 +903,16 @@ WOB1(A) and refused a legitimate retry.
   complete required gate set PASS inside the current receipt.
   Focused 69/69; full suite 2738 pass / same 2 env P5 fails;
   tsc+build clean.
+- **R6 remediation** (same branch, pending re-audit): capability-scoped
+  runtime authority — `MODEL_PROBE_CURRENT` (global `model.probe_state`
+  summary) removed from `providerModelEligibility`; runtime authority
+  = `MODEL_QUALIFIED` + `MODEL_RECEIPT_CURRENT` +
+  `MODEL_QUALIFICATION_SCOPE_VALID` + `MODEL_CAPABILITY_PROBE_CURRENT`.
+  `model.probe_state` remains observability/diagnostics only — an
+  unrelated capability FAIL can no longer revoke a healthy qualified
+  capability, and an unrelated PASS cannot revive a failed one.
+  Focused 73/73; full suite 2742 pass / same 2 env P5 fails;
+  tsc+build clean.
 
 ## Not yet
 
