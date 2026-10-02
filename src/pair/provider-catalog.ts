@@ -9,10 +9,22 @@
 
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { sanitizeUntrustedRemote } from "./sanitizer.js";
 import type { PairEvidenceStore } from "./store.js";
+
+/** Free-text diagnostics from external providers may echo credential
+ *  material — pass through the canonical sanitizer before persistence. */
+export function sanitizeDiagnostic(text: unknown): string | null {
+  if (text === null || text === undefined) return null;
+  return String(sanitizeUntrustedRemote(String(text).slice(0, 200)).value);
+}
 
 export const PROVIDER_LIFECYCLE_ORDER = [
   "DISCOVERED",
+  // Enumeration-only bootstrap state: the provider may be scanned for model
+  // claims, but carries NO runtime routing authority (not in OK_STATES).
+  // Runtime authority is reachable only through canonical qualification.
+  "DISCOVERY_ELIGIBLE",
   "PROBED",
   "ACCESS_VALIDATED",
   "QUALIFIED",
@@ -20,6 +32,20 @@ export const PROVIDER_LIFECYCLE_ORDER = [
 ] as const;
 
 export const PROVIDER_OK_STATES = new Set(["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"]);
+
+/** Lifecycle states a provider may be enumerated for model claims under —
+ *  canonical MODEL_DISCOVERY_ELIGIBLE (qualified) plus the enumeration-only
+ *  bootstrap state. Discovery eligibility never implies routability. */
+export const PROVIDER_DISCOVERY_SCAN_STATES = new Set([
+  "MODEL_DISCOVERY_ELIGIBLE",
+  "DISCOVERY_ELIGIBLE",
+]);
+
+/** Provider absence reconciliation (Phase E §5): consecutive COMPLETE
+ *  discovery runs in which every authoritative source misses the provider.
+ *  streak >= 1 → STALE condition; >= threshold → REMOVED (non-routable,
+ *  history preserved). */
+export const PROVIDER_REMOVED_ABSENCE_THRESHOLD = 3;
 
 const IDENTITY_FIELDS = [
   "provider_id",
@@ -166,6 +192,7 @@ export class ProviderCatalog {
       health_state: "UNKNOWN",
       conditions: [],
       capabilities: [],
+      absence_streak: 0,
       sources: [],
       evidence_refs: [],
       contradictions: [],
@@ -215,6 +242,18 @@ export class ProviderCatalog {
     sources.add(sourceId);
     body.sources = [...sources].sort();
     body.last_seen_at = now;
+    // Current observation resets absence bookkeeping and revives a removed
+    // entry as REAPPEARED (history kept) — same semantics as model claims.
+    body.absence_streak = 0;
+    const conditions = new Set((body.conditions as string[]) ?? []);
+    if (conditions.has("REMOVED")) {
+      conditions.delete("REMOVED");
+      conditions.delete("STALE");
+      conditions.add("REAPPEARED");
+    } else if (conditions.has("STALE")) {
+      conditions.delete("STALE");
+    }
+    body.conditions = [...conditions].sort();
     body.identity_digest = providerIdentityDigest(body);
     const semanticNoOp = !changed && String(body.identity_digest) === String(existing.identity_digest);
     const entry = this.put(body.entry_id as string, body, {
@@ -334,7 +373,7 @@ export class ProviderCatalog {
       event_type: outcome === "PASS" ? "PROVIDER_PROBED" : "PROVIDER_PROBE_FAILED",
       new_state: outcome,
       actor: opts.actor ?? "PAIR_PROVIDER_CATALOG",
-      metadata: { latency_ms: opts.latency_ms ?? null, detail: opts.detail ?? null },
+      metadata: { latency_ms: opts.latency_ms ?? null, detail: sanitizeDiagnostic(opts.detail) },
     });
     return this.put(String(entry.entry_id), body, { actor: opts.actor ?? "PAIR_PROVIDER_CATALOG" });
   }
@@ -353,6 +392,87 @@ export class ProviderCatalog {
       body.last_qualified_at = utcnow();
     }
     return this.put(String(entry.entry_id), body, { actor: opts.actor ?? "PAIR_PROVIDER_CATALOG" });
+  }
+
+  /**
+   * Phase E §5 — provider absence reconciliation across sources.
+   * `claimedBySource` maps each discovery source that completed a run to
+   * the provider_ids it observed. A provider is absent ONLY when no
+   * authoritative source claims it — absence from ONE source must not
+   * revoke a provider still proven current by another. Streak >= 1 →
+   * STALE condition (inspectable); streak >= PROVIDER_REMOVED_ABSENCE_
+   * THRESHOLD → REMOVED (non-routable, history preserved). Re-observation
+   * clears the streak/condition (handled in upsertCandidate).
+   */
+  reconcileProviderAbsence(
+    claimedBySource: Map<string, Set<string>>,
+    opts: { actor?: string; threshold?: number } = {},
+  ): { stale: string[]; removed: string[]; reappeared: string[] } {
+    const stale: string[] = [];
+    const removed: string[] = [];
+    const reappeared: string[] = [];
+    const threshold = opts.threshold ?? PROVIDER_REMOVED_ABSENCE_THRESHOLD;
+    if (claimedBySource.size === 0) return { stale, removed, reappeared };
+    const allClaimed = new Set<string>();
+    for (const ids of claimedBySource.values()) {
+      for (const id of ids) allClaimed.add(id);
+    }
+    for (const entry of this.listProviders()) {
+      const pid = String(entry.provider_id);
+      const observingSources = (entry.sources as unknown[]) ?? [];
+      // Only providers this discovery surface actually claims are subject
+      // to reconciliation — operator/persisted entities discovered through
+      // other authorities are untouched.
+      const discovered = [...observingSources].some((s) =>
+        claimedBySource.has(String((s as { source_id?: string })?.source_id ?? s)),
+      );
+      if (!discovered) continue;
+      if (allClaimed.has(pid)) continue; // still observed by ≥1 source
+      const body = { ...entry };
+      body.version = Number(entry.version);
+      const streak = Number(entry.absence_streak ?? 0) + 1;
+      body.absence_streak = streak;
+      const conditions = new Set(body.conditions as string[]);
+      if (streak >= threshold) {
+        if (!conditions.has("REMOVED")) {
+          conditions.delete("STALE");
+          conditions.add("REMOVED");
+          removed.push(pid);
+        }
+      } else {
+        conditions.add("STALE");
+        stale.push(pid);
+      }
+      body.conditions = [...conditions].sort();
+      this.put(String(entry.entry_id), body, {
+        actor: opts.actor ?? "PAIR_PROVIDER_DISCOVERY",
+        eventType: conditions.has("REMOVED")
+          ? "PROVIDER_REMOVED"
+          : "PROVIDER_STALE",
+      });
+    }
+    return { stale, removed, reappeared };
+  }
+
+  /** Per-source provider snapshot — the absence-reconciliation evidence
+   *  input. COMPLETE snapshots are the only authoritative "I looked and
+   *  saw/didn't see" claim; FAILED snapshots never remove anything. */
+  recordProviderSnapshot(
+    sourceId: string,
+    status: string,
+    claimedProviderIds: string[],
+    opts: { runId?: string; actor?: string } = {},
+  ): Record<string, unknown> {
+    const rec = {
+      snapshot_id: newId("PSN"),
+      source_id: sourceId,
+      status,
+      claimed_provider_ids: [...claimedProviderIds].sort(),
+      run_id: opts.runId ?? null,
+      recorded_at: utcnow(),
+    };
+    this.store.put("provider_snapshot", rec.snapshot_id, rec);
+    return rec;
   }
 
   issueQualificationReceipt(

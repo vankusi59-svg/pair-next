@@ -793,6 +793,42 @@ WOB1(A) and refused a legitimate retry.
   generic-gate mismatch with zero model attempts. DO NOT MERGE — pending
   audit. See `PAIR_NEXT_POST_P14_PHASE_C_DSH_MODEL_ROUTING_REPORT.md`.
 
+## Phase E — Provider / Model Operational Authority Closure (branch `devin/1790938483-phase-e`, pending independent audit)
+
+- `DISCOVERY_ELIGIBLE` lifecycle state: enumeration-only bootstrap (scanned
+  by `PROVIDER_DISCOVERY_SCAN_STATES`, NOT in `PROVIDER_OK_STATES`). The
+  unconditional `setLifecycle(MODEL_DISCOVERY_ELIGIBLE)` shortcut is gone —
+  `MODEL_DISCOVERY_ELIGIBLE` now requires a canonical `provider_qualification`
+  receipt bound by `material_fingerprint`.
+- Source-aware provider absence reconciliation: per-source COMPLETE/FAILED
+  `provider_snapshot` rows drive `reconcileProviderAbsence` — absent from
+  ALL completed sources → `absence_streak` → STALE≥1 / REMOVED≥3 (history
+  preserved); one source's absence cannot revoke a provider still observed
+  by another; re-observation → REAPPEARED.
+- Receipt validity: provider + model qualification receipts mint
+  `material_fingerprint` = identity digest; `PROVIDER_RECEIPT_CURRENT` /
+  `MODEL_RECEIPT_CURRENT` verify correspondence on authority-claiming
+  states — identity drift invalidates routing, never deletes the receipt.
+- Canonical routability is the ONLY runtime authority: unbound-router
+  governed DSH dispatch throws `FAIL_CLOSED_DSH_MODEL_ROUTER_UNBOUND`
+  unless `compatEnvRouteFallback` is explicitly declared (production MC
+  never sets it); Planner lifecycle is independent of DSH executor
+  registration (§13); bindings + router eligibility use authoritative
+  `provider_id` (§9); `provider_id` claim conflicts record
+  `contradictions[]`, never flip (§8).
+- Secret governance: `sanitizeDiagnostic` on all probe/discovery error
+  persistence; declared credential env values registered with the sanitizer
+  at boot (§15). Single timeout authority `PAIR_MODEL_DISCOVERY_TIMEOUT_MS`
+  (§14).
+- Validation: focused 34/34 (A–K); full suite 2694 pass / 2 pre-existing
+  env P5 fails (real dsh/codex on PATH, reproduced on base); tsc + build
+  clean. Live E2E on scratch `PAIR_MC_DIR` with real credentials: full
+  discover→validate→probe→qualify→reconcile→bind→routable chain, exact
+  failing-gate observability (gemini route refused by
+  CAPABILITY_TEXT_INFERENCE), `DISCOVERY_ELIGIBLE` provider non-routable
+  with no receipt. IMPLEMENTED / PENDING INDEPENDENT AUDIT. See
+  `PAIR_NEXT_PHASE_E_PROVIDER_MODEL_OPERATIONAL_CLOSURE_REPORT.md`.
+
 ## Not yet
 
 - Workforce lifecycle beyond governed completion (Phase 4+), CEO

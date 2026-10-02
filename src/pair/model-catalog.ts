@@ -151,6 +151,24 @@ export class ModelEvidenceCatalog {
         changed = true;
       }
     }
+    // Phase E §8 — the provider_family+model_id identity is intentionally an
+    // aliasing identity; when a second claim for the same entry names a
+    // DIFFERENT provider_id, record a contradiction instead of silently
+    // folding (the entry keeps its first-seen provider link — never flips).
+    if (
+      claim.provider_id &&
+      body.provider_id &&
+      String(claim.provider_id) !== String(body.provider_id)
+    ) {
+      const contradictions = (body.contradictions as unknown[]) ?? [];
+      contradictions.push({
+        field: "provider_id",
+        prior: body.provider_id,
+        candidate: String(claim.provider_id),
+      });
+      body.contradictions = contradictions;
+      changed = true;
+    }
     const claims = { ...(body.capability_claims as Record<string, string>) };
     for (const h of claim.capability_hints ?? []) {
       if (!(h in claims)) {
@@ -311,6 +329,9 @@ export class ModelEvidenceCatalog {
       capability_scope: opts.capability_scope,
       verifier: opts.verifier,
       evidence_refs: opts.evidence_refs,
+      // Phase E §7 — bind the receipt to the model's material identity at
+      // qualification time so later drift cannot reuse stale authority.
+      material_fingerprint: modelIdentityDigest(entry),
       issued_at: utcnow(),
     };
     this.store.put("model_qualification", receipt.receipt_id, receipt);

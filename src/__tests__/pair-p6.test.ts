@@ -76,6 +76,19 @@ function seedProvider(
   if (opts.probe) body.probe_state = opts.probe;
   if (opts.conditions) body.conditions = opts.conditions;
   ctx.store.put("provider", String(entry.entry_id), body, Number(entry.version));
+  // Phase E §7 — routable-authority lifecycles carry a material-bound
+  // qualification receipt (only reachable through qualification in prod).
+  if (["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(String(opts.lifecycle))) {
+    catalog.issueQualificationReceipt(providerId, {
+      policy_version: "test-policy",
+      gates: { fixture: true },
+      actor: "test",
+    });
+    if (opts.lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+      const b = ctx.store.get("provider", String(entry.entry_id));
+      ctx.store.put("provider", String(entry.entry_id), { ...b, lifecycle_state: "MODEL_DISCOVERY_ELIGIBLE" }, Number(b.version));
+    }
+  }
   return catalog.getProvider(providerId)!;
 }
 

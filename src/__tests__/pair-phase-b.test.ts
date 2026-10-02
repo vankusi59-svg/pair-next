@@ -992,13 +992,42 @@ const mkProvider = (
 ) => {
   const id = providerEntryId(pid);
   const existing = store.tryGet("provider", id);
+  const lifecycle = opts.lifecycle ?? "QUALIFIED";
   store.put("provider", id, {
     ...(existing ?? { provider_id: pid, entry_id: id }),
-    lifecycle_state: opts.lifecycle ?? "QUALIFIED",
+    lifecycle_state: lifecycle,
     auth_state: opts.auth_state ?? "AUTH_OK",
     health_state: opts.health_state ?? "READY",
-    conditions: opts.conditions ?? [],
+    conditions: [],
+    // Phase E §6 — a QUALIFIED provider carries current probe evidence;
+    // explicit PROBE_* failures demote routability.
+    probe_state: lifecycle === "QUALIFIED" ? "PROBED" : "UNPROBED",
   }, existing ? Number(existing.version) : 0);
+  // Phase E §7 — any routable-authority lifecycle (QUALIFIED or
+  // MODEL_DISCOVERY_ELIGIBLE, both reachable only through canonical
+  // qualification in production) carries a qualification receipt bound to
+  // the provider's material fingerprint.
+  if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+    new ProviderCatalog(store).issueQualificationReceipt(pid, {
+      policy_version: "test-policy",
+      gates: { fixture: true },
+      actor: "test",
+    });
+    // Canonical post-qualification resting state: the receipt lands on
+    // QUALIFIED, then the lifecycle settles at MODEL_DISCOVERY_ELIGIBLE —
+    // mirror the validator's own end state.
+    if (lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+      const b = store.get("provider", id);
+      store.put("provider", id, { ...b, lifecycle_state: "MODEL_DISCOVERY_ELIGIBLE" }, Number(b.version));
+    }
+  }
+  // Apply requested conditions AFTER the receipt: qualification canonically
+  // clears UNQUALIFIED, so a fixture asking for it must re-apply it — the
+  // same ordering an operator revoke would take in production.
+  if (opts.conditions?.length) {
+    const b = store.get("provider", id);
+    store.put("provider", id, { ...b, conditions: opts.conditions }, Number(b.version));
+  }
 };
 
 describe("R1 §9 — assertPlannerCandidateEligible", () => {
@@ -1590,6 +1619,7 @@ describe("PRE-MERGE hotfix — executor timeout governance", () => {
       journalRoot: path.join(freshDir("ht-c-j"), "j"),
       launchOverride: { command: "node", args: [FAKE_ACP, "--profile", "acp"] },
       envReader: secretEnv,
+      compatEnvRouteFallback: true, // compat dispatch path (Phase E §12)
     });
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ht-c-ws-"));
     const disp = dsh.dispatch(governedTask(ws, "DEEPSEEK_HARNESS", { timeout: 2, task_instruction: "HANG_FOREVER now" }));

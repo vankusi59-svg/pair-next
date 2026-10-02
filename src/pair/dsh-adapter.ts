@@ -96,12 +96,22 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
        * caller proves the model holds DSH_EXECUTION role; throw = fail closed.
        */
       modelRoleAssertion?: (provider: string, model: string) => void;
+      /**
+       * Phase E §12 compat seam: when true and no model router is bound,
+       * governed dispatch falls through to the legacy env-route path.
+       * Non-governed probes and legacy harness tests only — production
+       * mission-control leaves it unset so an unbound router FAILS CLOSED.
+       */
+      compatEnvRouteFallback?: boolean;
     },
   ) {
     super(deps);
     this.configuredEntry = deps.dshEntry ?? null;
     this.roleAssertion = deps.modelRoleAssertion ?? null;
+    this.compatEnvRouteFallback = deps.compatEnvRouteFallback === true;
   }
+
+  private readonly compatEnvRouteFallback: boolean;
 
   /**
    * Phase C: bind the governed DSH model router after model_binding rows
@@ -118,7 +128,7 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
   }
 
   /** The model this attempt pins: router candidate when governed, else the
-   *  legacy env fallback (probe/compat path only). */
+   *  legacy env fallback (compat path only — see compatEnvRouteFallback). */
   private selectedModel(attemptCtx?: AcpAttemptContext): {
     provider: string;
     model: string;
@@ -318,6 +328,17 @@ export class DshExecutorAdapter extends AcpExecutorAdapterBase {
   ): Promise<void> {
     const router = this.dshModelRouter;
     if (!router) {
+      // Phase E §12 — one canonical routability answer: governed dispatch
+      // may not bypass canonical eligibility by falling back to the raw env
+      // route. The legacy env path remains ONLY as an explicit compat
+      // opt-in (non-governed probes/legacy harness tests); production
+      // mission-control never sets it, so an unbound router fails closed.
+      if (!this.compatEnvRouteFallback) {
+        throw new PairError(
+          "FAIL_CLOSED_DSH_MODEL_ROUTER_UNBOUND",
+          "governed DSH dispatch requires a bound canonical model router; env-route fallback is not routability authority",
+        );
+      }
       await this.attemptExecution(rec, task, launch, prompt, before, broker, updatesLog, decisionsLog, undefined);
       return;
     }

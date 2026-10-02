@@ -18,18 +18,22 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import { IntegrityError } from "./errors.js";
+import { modelDiscoveryTimeoutMs } from "./env-config.js";
+import { PROVIDER_DISCOVERY_SCAN_STATES } from "./provider-catalog.js";
 import type { ModelClaim } from "./model-catalog.js";
 import { ModelEvidenceCatalog } from "./model-catalog.js";
 import { utcnow } from "./canonical.js";
 import type { PairEvidenceStore } from "./store.js";
-
-const DEFAULT_TIMEOUT_S = 8;
 
 export interface DiscoveryRunContext {
   env?: Record<string, string | undefined>;
   dshHome?: string;
   httpGet?: (url: string, headers: Record<string, string>) => Promise<{ status: number; body: unknown }>;
   snapshotStatus?: string;
+  /** Bounded catalog-enumeration budget (PAIR_MODEL_DISCOVERY_TIMEOUT_MS).
+   *  Separate named knob from the probe budget — enumeration is a distinct
+   *  operation from tier probing (Phase E §14). */
+  discoveryTimeoutMs?: number;
 }
 
 export abstract class ModelDiscoveryAdapter {
@@ -72,25 +76,27 @@ export abstract class ModelDiscoveryAdapter {
   }
 }
 
-async function defaultHttpGet(url: string, headers: Record<string, string>) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_S * 1000);
-  try {
-    const resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-        Accept: "application/json",
-        ...headers,
-      },
-      signal: controller.signal,
-      redirect: "manual",
-    });
-    return { status: resp.status, body: (await resp.json()) as unknown };
-  } finally {
-    clearTimeout(timer);
-  }
+function makeDefaultHttpGet(timeoutMs: number) {
+  return async function defaultHttpGet(url: string, headers: Record<string, string>) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        method: "GET",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+          Accept: "application/json",
+          ...headers,
+        },
+        signal: controller.signal,
+        redirect: "manual",
+      });
+      return { status: resp.status, body: (await resp.json()) as unknown };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 }
 
 /** GET {endpoint}/models — OpenAI-compatible list-models shape. */
@@ -109,7 +115,7 @@ export class OpenAICompatibleModelAdapter extends ModelDiscoveryAdapter {
     const token = this.credentialValue(entry, env);
     const headers: Record<string, string> = {};
     if (token) headers.Authorization = `Bearer ${token}`;
-    const httpGet = context.httpGet ?? defaultHttpGet;
+    const httpGet = context.httpGet ?? makeDefaultHttpGet(context.discoveryTimeoutMs ?? modelDiscoveryTimeoutMs());
     const { status, body } = await httpGet(`${endpoint}/models`, headers);
     if (status >= 400) {
       const err = new Error(`HTTP_${status}`) as Error & { status: number };
@@ -242,7 +248,9 @@ export async function runModelDiscovery(
 
   for (const entry of providers) {
     const pid = String(entry.provider_id);
-    if (entry.lifecycle_state !== "MODEL_DISCOVERY_ELIGIBLE") {
+    // Phase E §3 — enumeration scans discovery-eligible providers too, but
+    // that state alone grants no runtime authority (not in OK_STATES).
+    if (!PROVIDER_DISCOVERY_SCAN_STATES.has(String(entry.lifecycle_state))) {
       results.skipped.push(`${pid}:${entry.lifecycle_state}`);
       continue;
     }

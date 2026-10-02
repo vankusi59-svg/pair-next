@@ -37,6 +37,7 @@ import {
   MODEL_ROLE,
   PairControlPlane,
   PairEvidenceStore,
+  ProviderCatalog,
   providerEntryId,
   qualifyBinding,
   registerGovernedExecutors,
@@ -69,18 +70,38 @@ const mkProvider = (
 ) => {
   const id = providerEntryId(pid);
   const existing = store.tryGet("provider", id);
+  const lifecycle = opts.lifecycle ?? "QUALIFIED";
   store.put(
     "provider",
     id,
     {
       ...(existing ?? { provider_id: pid, entry_id: id }),
-      lifecycle_state: opts.lifecycle ?? "QUALIFIED",
+      lifecycle_state: lifecycle,
       auth_state: opts.auth_state ?? "AUTH_OK",
       health_state: opts.health_state ?? "READY",
-      conditions: opts.conditions ?? [],
+      conditions: [],
+      probe_state: lifecycle === "QUALIFIED" ? "PROBED" : "UNPROBED",
     },
     existing ? Number(existing.version) : 0,
   );
+  // Phase E §7 — routable-authority lifecycles carry a material-bound
+  // qualification receipt (both reachable only through canonical
+  // qualification in production).
+  if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+    new ProviderCatalog(store).issueQualificationReceipt(pid, {
+      policy_version: "test-policy",
+      gates: { fixture: true },
+      actor: "test",
+    });
+    if (lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+      const b = store.get("provider", id);
+      store.put("provider", id, { ...b, lifecycle_state: "MODEL_DISCOVERY_ELIGIBLE" }, Number(b.version));
+    }
+  }
+  if (opts.conditions?.length) {
+    const b = store.get("provider", id);
+    store.put("provider", id, { ...b, conditions: opts.conditions }, Number(b.version));
+  }
 };
 
 const mkModel = (

@@ -8,7 +8,7 @@
  */
 
 import { IntegrityError, NotFoundError } from "./errors.js";
-import { PROVIDER_OK_STATES, ProviderCatalog } from "./provider-catalog.js";
+import { PROVIDER_OK_STATES, ProviderCatalog, sanitizeDiagnostic } from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const PROVIDER_ACCESS_OUTCOMES = new Set([
@@ -60,7 +60,7 @@ export class ProviderValidator {
       } catch (err) {
         outcome = "UNREACHABLE";
         catalog.recordProbeObservation(providerId, "UNREACHABLE", {
-          detail: err instanceof Error ? err.message.slice(0, 200) : String(err),
+          detail: sanitizeDiagnostic(err instanceof Error ? err.message : err) ?? undefined,
           actor: opts.actor,
         });
       }
@@ -92,8 +92,12 @@ export class ProviderValidator {
 
     const gates: Record<string, string> = {};
     gates.PROVIDER_EXISTS = "PASS";
+    // Phase E §4 — AUTH_REQUIRED is NOT an acceptable authority: a provider
+    // whose declared credential is unresolvable must never qualify/routable
+    // for new governed work. A provider requiring no credential resolves
+    // directly to AUTH_OK through credentialResolvable.
     gates.AUTH_ACCEPTABLE =
-      ["AUTH_OK", "AUTH_REQUIRED"].includes(String(entry.auth_state)) ||
+      String(entry.auth_state) === "AUTH_OK" ||
       this.credentialResolvable(entry, env) === "AUTH_OK"
         ? "PASS"
         : "FAIL";
@@ -123,11 +127,14 @@ export function providerRoutableGate(entry: Record<string, unknown>): { pass: bo
   if (!PROVIDER_OK_STATES.has(String(entry.lifecycle_state))) {
     return { pass: false, reason: `PROVIDER_LIFECYCLE_${entry.lifecycle_state}` };
   }
-  if (entry.auth_state === "AUTH_FAILED" || entry.auth_state === "ACCESS_DENIED") {
+  // Phase E §4/§6 — only proven current AUTH_OK authorizes work: AUTH_REQUIRED
+  // (unresolved credential), UNREACHABLE, CREDENTIAL_MISSING, UNVALIDATED and
+  // AUTH_FAILED/ACCESS_DENIED all fail closed.
+  if (String(entry.auth_state) !== "AUTH_OK") {
     return { pass: false, reason: `PROVIDER_AUTH_${entry.auth_state}` };
   }
   const conditions = (entry.conditions ?? []) as string[];
-  if (conditions.includes("UNQUALIFIED") || conditions.includes("DISABLED")) {
+  if (conditions.includes("UNQUALIFIED") || conditions.includes("DISABLED") || conditions.includes("REMOVED")) {
     return { pass: false, reason: "PROVIDER_CONDITION_BLOCKED" };
   }
   return { pass: true };

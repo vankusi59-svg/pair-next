@@ -70,6 +70,16 @@ export const MODEL_PROBE_TIMEOUT = {
   bounds: { min: 500, max: 120_000, unit: "ms" },
 } as const;
 
+/** Model-catalog enumeration (GET /models discovery) budget — a distinct
+ *  operation from tier probing, so it carries its own named knob rather
+ *  than sharing the probe budget (Phase E §14). Unit: milliseconds.
+ *  Bounds 0.5s–120s. */
+export const MODEL_DISCOVERY_TIMEOUT = {
+  name: "PAIR_MODEL_DISCOVERY_TIMEOUT_MS",
+  defaultValue: 8_000,
+  bounds: { min: 500, max: 120_000, unit: "ms" },
+} as const;
+
 /** LLM planner request budget. Unit: milliseconds. Bounds 2s–900s. */
 export const LLM_PLANNER_TIMEOUT = {
   name: "PAIR_LLM_PLANNER_TIMEOUT_MS",
@@ -120,6 +130,10 @@ export const DEVIN_TASK_TIMEOUT = {
 
 export function modelProbeTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(MODEL_PROBE_TIMEOUT.name, MODEL_PROBE_TIMEOUT.defaultValue, MODEL_PROBE_TIMEOUT.bounds, env);
+}
+
+export function modelDiscoveryTimeoutMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(MODEL_DISCOVERY_TIMEOUT.name, MODEL_DISCOVERY_TIMEOUT.defaultValue, MODEL_DISCOVERY_TIMEOUT.bounds, env);
 }
 
 export function llmPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): number {

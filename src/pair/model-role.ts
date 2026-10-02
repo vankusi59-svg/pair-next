@@ -239,7 +239,16 @@ export function assertPlannerCandidateEligible(
   );
   if (elig.eligible) return;
   const failed = Object.keys(elig.gates).filter((g) => elig.gates[g] === "FAIL");
-  const AUTHORITY_GATES = new Set(["PROVIDER_QUALIFIED", "PROVIDER_AUTH_OK", "PROVIDER_NOT_BLOCKED"]);
+  // Phase E §7 — receipt-validity failures are authority rejections (stale
+  // material evidence), never failover-eligible. Probe-currentness failures
+  // are availability (a retry/next-candidate may still succeed).
+  const AUTHORITY_GATES = new Set([
+    "PROVIDER_QUALIFIED",
+    "PROVIDER_AUTH_OK",
+    "PROVIDER_NOT_BLOCKED",
+    "PROVIDER_RECEIPT_CURRENT",
+    "MODEL_RECEIPT_CURRENT",
+  ]);
   if (failed.some((g) => AUTHORITY_GATES.has(g))) {
     throw new IntegrityError(
       "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE",
