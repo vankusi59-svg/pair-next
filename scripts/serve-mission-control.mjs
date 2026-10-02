@@ -89,6 +89,7 @@ import {
   validatePlanProposal,
   reconcilePlanDataflow,
   detectTelegramDeliveryIntent,
+  CANONICAL_BOOKKEEPING_INSTRUCTION,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
   telegramDeliveryTransportTimeoutMs,
@@ -358,7 +359,10 @@ const planner = (input) => {
   const tasks = [{
     task_key: "T1",
     title: "record mission goal",
-    task_instruction: goal,
+    // R8 §3 — PAIR-owned bookkeeping instruction: the goal text is
+    // payload written by worker_spec, never a task directive (an
+    // operator send request must not leak into the instruction).
+    task_instruction: CANONICAL_BOOKKEEPING_INSTRUCTION,
     required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
     depends_on: [],
     metadata: {

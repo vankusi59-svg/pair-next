@@ -40,6 +40,12 @@ export const FAILURE_CLASSES = [
   "ARTIFACT_VALIDATION_FAILURE",
   "RESULT_SCHEMA_FAILURE",
   "DEPENDENCY_FAILURE",
+  /** R8 §5 — deterministic executor-reported incapacity: the agent itself
+   *  reports the assigned task requests unavailable functionality (a
+   *  required tool/capability does not exist in its environment). The
+   *  TASK is infeasible on its own terms — bounded REPLAN/ABORT, never
+   *  a blind same-route retry. */
+  "TASK_INFEASIBLE",
   "TOOL_FAILURE",
   "PROCESS_EXIT",
   "AMBIGUOUS_DISPATCH",
@@ -90,6 +96,10 @@ export const RECOVERY_MATRIX: Record<FailureClass, MatrixRow> = {
   ARTIFACT_VALIDATION_FAILURE: { actions: ["APPLY_VERIFIED_REMEDIATION", "REPLAN", "ABORT"], retry_allowed: false },
   RESULT_SCHEMA_FAILURE: { actions: ["RETRY_SAME_ROUTE", "REPLAN"], retry_allowed: true },
   DEPENDENCY_FAILURE: { actions: ["REPLAN", "ABORT"], retry_allowed: false },
+  // R8 §5 — the task itself is provably infeasible (deterministic
+  // executor-reported missing capability): favor REPLAN + bounded ABORT,
+  // zero RETRY_SAME_ROUTE.
+  TASK_INFEASIBLE: { actions: ["REPLAN", "ABORT"], retry_allowed: false },
   TOOL_FAILURE: { actions: ["RETRY_SAME_ROUTE", "RE_ROUTE"], retry_allowed: true },
   PROCESS_EXIT: { actions: ["RETRY_SAME_ROUTE", "RE_ROUTE"], retry_allowed: true },
   AMBIGUOUS_DISPATCH: { actions: ["RECONCILIATION_REQUIRED"], retry_allowed: false },
@@ -139,6 +149,11 @@ const CLASS_RULES: Array<[RegExp, FailureClass]> = [
   // only genuine governance codes (FAIL_CLOSED_NO_ELIGIBLE_ROUTE et al.) fall
   // through to POLICY_DENIAL.
   [/ROUTE_INFEASIBLE/i, "ROUTE_INFEASIBLE"],
+  // R8 §5 — stable class re-entry: a persisted/forwarded TASK_INFEASIBLE
+  // code classifies back to itself; a pre-dispatch delivery-semantic
+  // rejection is a plan-shape invalidity (bounded replan, zero retry).
+  [/TASK_INFEASIBLE/i, "TASK_INFEASIBLE"],
+  [/DELIVERY_SEMANTIC_MISMATCH/i, "PLAN_INVALIDATED"],
   // R1 — DSH model-pool exhaustion is NOT a policy denial: it aggregates
   // safe *pre-dispatch availability* failures (provider down, model
   // unavailable, credential missing) across every configured candidate.
@@ -175,6 +190,13 @@ const CLASS_RULES: Array<[RegExp, FailureClass]> = [
 const ENVIRONMENT_INCOMPATIBLE_SIGNAL =
   /ENOTFOUND|EAI_AGAIN|DNS resolution|name resolution|could not resolve|network (is )?(unreachable|blocked|disabled|not allowed|restricted)|ERR_INTERNET|NETWORK_SANDBOX|no route to host/i;
 
+/** R8 §5 — deterministic executor-reported incapacity evidence: the
+ *  agent itself states the assigned task requests unavailable
+ *  functionality (missing tool/capability/environment feature). Bounded
+ *  explicit phrases only — arbitrary FAILED prose never qualifies. */
+const AGENT_INCAPACITY_SIGNAL =
+  /no [\w./ -]{0,40}\btool(?:s)? (?:is|are) (?:unavailable|not available|missing)|required tool(?:s)? (?:is|are) (?:unavailable|not available|missing)|tool(?:s)? (?:is|are) unavailable|cannot perform the requested capability|requested capability (?:is|are) (?:unavailable|not available)|no telegram delivery tool/i;
+
 /** Map a raw failure (execution entity, adapter error, or thrown PairError) to a stable class. */
 export function classifyFailure(input: {
   execution_state?: string;
@@ -193,12 +215,27 @@ export function classifyFailure(input: {
   const haystack = [errClass, errCode, errorObj?.message, resultObj?.summary, resultObj?.stderr]
     .map((v) => String(v ?? ""))
     .join("\n");
-  if (ENVIRONMENT_INCOMPATIBLE_SIGNAL.test(haystack)) return "ENVIRONMENT_INCOMPATIBLE";
   // R4 §5 — the specific error code and the transport-stage class BOTH
   // participate: a generic stage label ("DISPATCH", "EXECUTION") must never
   // shadow a deterministic contract code like
   // FAIL_CLOSED_WORKSPACE_UNAUTHORIZED into UNKNOWN.
   const subject = [errCode, errClass].filter(Boolean).join("\n");
+  // R8 §5 — deterministic executor-reported incapacity: the agent
+  // reports the task itself is infeasible (missing tool/capability).
+  // Requires BOTH the executor-reported marker (in the failure class or
+  // the reported error message, e.g. CODEX_AGENT_REPORTED_FAILURE) AND
+  // the bounded explicit incapacity phrase — an arbitrary FAILED
+  // response never maps here.
+  const reported = [errClass, errCode, errorObj?.class, errorObj?.message]
+    .map((v) => String(v ?? ""))
+    .join("\n");
+  if (
+    /AGENT_REPORTED_FAILURE/i.test(reported) &&
+    AGENT_INCAPACITY_SIGNAL.test(haystack)
+  ) {
+    return "TASK_INFEASIBLE";
+  }
+  if (ENVIRONMENT_INCOMPATIBLE_SIGNAL.test(haystack)) return "ENVIRONMENT_INCOMPATIBLE";
   for (const [re, cls] of CLASS_RULES) {
     if (re.test(subject)) return cls;
   }

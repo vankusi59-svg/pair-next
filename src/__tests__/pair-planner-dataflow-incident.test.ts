@@ -43,6 +43,14 @@ import {
   planDigest,
   reconcilePlanDataflow,
   assertPlanDataflow,
+  assertDeliveryTaskPresence,
+  assertTaskDeliveryHygiene,
+  assertTaskDeliverySemantic,
+  canonicalDeliveryTaskInstruction,
+  CANONICAL_BOOKKEEPING_INSTRUCTION,
+  isPureBookkeepingTask,
+  classifyFailure,
+  RECOVERY_MATRIX,
   normalizeArtifactPath,
   extractTaskDataflow,
   detectTelegramDeliveryIntent,
@@ -153,7 +161,7 @@ class ScriptedAdapter implements ExecutorAdapter {
   /** task_key → behavior; default COMPLETED */
   behavior: Record<
     string,
-    "COMPLETE" | "FAIL" | "WRITE" | "GATED" | "SLOW" | "DELETEFAIL"
+    "COMPLETE" | "FAIL" | "WRITE" | "GATED" | "SLOW" | "DELETEFAIL" | "INCAPACITY"
   > = {};
   workspace = "";
   /** SLOW behavior: executions stay RUNNING for N observe() polls. */
@@ -253,6 +261,16 @@ class ScriptedAdapter implements ExecutorAdapter {
     if (b === "FAIL") {
       status = "FAILED";
       error = { class: "PROCESS_EXIT", message: "CODEX_AGENT_REPORTED_FAILURE" };
+    }
+    if (b === "INCAPACITY") {
+      // R8 §5 — the production incident shape: the agent reports the task
+      // itself is infeasible (a required tool does not exist).
+      status = "FAILED";
+      error = {
+        class: "PROCESS_EXIT",
+        message:
+          "CODEX_AGENT_REPORTED_FAILURE: Telegram delivery could not be completed because no Telegram delivery tool is available",
+      };
     }
     this.collected[eid] = {
       status,
@@ -782,8 +800,10 @@ describe("R1 E2E — incident shape converges through the repaired plan", () => 
     registerAdapter(ctx, adapter);
 
     // Preview path: raw proposal unsound, pinned plan repaired.
+    // R8 §1 — the goal carries the operator's delivery request; the
+    // pinned plan's single delivery task satisfies intent↔presence.
     const pv = ctx.control.createPlanPreview({
-      project_id: ctx.projectId, goal: "g", operator_id: "op1",
+      project_id: ctx.projectId, goal: "send analysis.txt to telegram", operator_id: "op1",
       granted_permissions: ["FILE_WRITE", "FILE_READ"],
       authorized_workspaces: [ctx.workspace],
     });
@@ -1202,7 +1222,7 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
     expect(df.consumes).toEqual([]);
     const m = ctx.control.startMission({
       project_id: ctx.projectId,
-      goal: "research and report results to telegram",
+      goal: "research and send results to telegram",
       granted_permissions: ["FILE_WRITE", "FILE_READ"],
       authorized_workspaces: [ctx.workspace],
       metadata: { pinned_plan_tasks: plan },
@@ -2416,5 +2436,739 @@ describe("incident R7 — exclusive send claim", () => {
     });
     expect(reqOf(ctx, id).status).toBe("SENT");
     expect(reqOf(ctx, id).message_id).toBe(1001);
+  });
+});
+
+/* =================== R8 — delivery plan-shape authority + semantic hygiene ===
+ * Post-R7 incident MSN_01M3XP0ME1GKFHD00H4Z3GWC1H: the planner folded the
+ * operator's "gui bao cao này đến telegram" request into the CODEX task's
+ * instruction — no TELEGRAM_DELIVERY task existed, CODEX (no Telegram tool)
+ * deterministically reported failure → PROCESS_EXIT retried 4× →
+ * WAITING_APPROVAL with zero TDRs minted. Closed here:
+ *   §1 intent↔presence (MISSING/AMBIGUOUS/INTENT)
+ *   §2 instruction hygiene (VERB_IN_NON_DELIVERY_TASK)
+ *   §3 PAIR-owned canonical delivery/bookkeeping instructions
+ *   §4 pre-dispatch semantic check (TASK_DELIVERY_SEMANTIC_MISMATCH)
+ *   §5 TASK_INFEASIBLE for deterministic executor-reported incapacity
+ *   §6 incident repro + correct-path E2E
+ */
+
+describe("R8 §1 — intent↔presence", () => {
+  it("A. operator request + zero delivery tasks → FAIL_CLOSED_DELIVERY_TASK_MISSING", () => {
+    const tasks = [goalTask("T1"), producerTask("T2", "analysis.txt", ["T1"])];
+    expect(() =>
+      reconcilePlanDataflow(JSON.parse(JSON.stringify(tasks)), {
+        telegramIntent: FILES_INTENT(["analysis.txt"]),
+      }),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_MISSING/);
+    // Re-proven at the immutable-plan boundary too.
+    expect(() =>
+      assertPlanDataflow(tasks as never, { telegramIntent: TEXT_INTENT }),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_MISSING/);
+  });
+
+  it("B. two delivery tasks → FAIL_CLOSED_DELIVERY_TASK_AMBIGUOUS", () => {
+    const tasks = [
+      goalTask("T1"),
+      producerTask("T2", "a.txt", ["T1"]),
+      deliveryTask("T3", ["T2"], "a.txt"),
+      deliveryTask("T4", ["T2"], "a.txt"),
+    ];
+    expect(() =>
+      reconcilePlanDataflow(JSON.parse(JSON.stringify(tasks)), {
+        telegramIntent: FILES_INTENT(["a.txt"]),
+      }),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_AMBIGUOUS/);
+    expect(() =>
+      assertPlanDataflow(tasks as never, { telegramIntent: TEXT_INTENT }),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_AMBIGUOUS/);
+  });
+
+  it("C. no intent + a delivery task → unauthorized send authority still fails closed", () => {
+    expect(() =>
+      reconcilePlanDataflow([
+        goalTask("T1"),
+        deliveryTask("T2", [], "a.txt"),
+      ]),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT/);
+    // At the boundary: requested=false + delivery task present → INTENT.
+    const canonical = reconcilePlanDataflow(
+      [goalTask("T1"), producerTask("T2", "a.txt", ["T1"])],
+      { telegramIntent: { requested: false, artifacts: [], mode: "TEXT" } },
+    ).tasks;
+    const withDelivery = [
+      ...canonical,
+      {
+        ...deliveryTask("T3", ["T2"], "a.txt"),
+        metadata: {
+          pair_telegram_delivery: { requested: true, mode: "FILES", artifacts: ["a.txt"] },
+        },
+      },
+    ];
+    expect(() =>
+      assertPlanDataflow(withDelivery as never, {
+        telegramIntent: { requested: false, artifacts: [], mode: "TEXT" },
+      }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT/);
+  });
+});
+
+describe("R8 §2 — instruction hygiene", () => {
+  it("D. 'write report.txt and send it to Telegram' on a non-delivery task → FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK", () => {
+    const bad = {
+      task_key: "T3", title: "compose",
+      task_instruction: "write outbox/report.txt and send it to Telegram, then reply DONE.",
+      required_capabilities: ["PYTHON_EXECUTION"], depends_on: ["T2"], metadata: {},
+    };
+    // A valid plan carrying one delivery task — hygiene still trips.
+    expect(() =>
+      reconcilePlanDataflow(
+        [
+          goalTask("T1"),
+          producerTask("T2", "report.txt", ["T1"]),
+          bad,
+          deliveryTask("T4", ["T3"], "report.txt"),
+        ],
+        { telegramIntent: FILES_INTENT(["report.txt"]) },
+      ),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/);
+    expect(() => assertTaskDeliveryHygiene([bad] as never)).toThrow(
+      /FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/,
+    );
+  });
+
+  it("E. Vietnamese affirmative clause 'gửi báo cáo này đến telegram' → same failure", () => {
+    const bad = {
+      task_key: "T2", title: "compose",
+      task_instruction: "viết báo cáo vào outbox/report.txt rồi gửi báo cáo này đến telegram",
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+    };
+    expect(() => assertTaskDeliveryHygiene([bad] as never)).toThrow(
+      /FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/,
+    );
+  });
+
+  it("F. negated clauses are NOT affirmative — 'do not send to Telegram' / 'không gửi telegram' pass hygiene", () => {
+    const negated = [
+      {
+        task_key: "T1", title: "x",
+        task_instruction: "write report.txt — do not send anything to Telegram",
+        required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+      },
+      {
+        task_key: "T2", title: "y",
+        task_instruction: "viết report.txt và không gửi gì đến telegram",
+        required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+      },
+      {
+        task_key: "T3", title: "z",
+        task_instruction: "tổng hợp số liệu, đừng gửi báo cáo qua telegram",
+        required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+      },
+    ];
+    expect(() => assertTaskDeliveryHygiene(negated as never)).not.toThrow();
+    expect(
+      detectTelegramDeliveryIntent("do not send anything to Telegram").requested,
+    ).toBe(false);
+    expect(
+      detectTelegramDeliveryIntent("không gửi gì đến telegram").requested,
+    ).toBe(false);
+  });
+});
+
+describe("R8 §3 — canonical PAIR-owned instructions", () => {
+  it("G. canonical delivery instruction carries NO affirmative send directive + keeps manifest", () => {
+    const intent = FILES_INTENT(["report.txt"]);
+    const plan = reconcilePlanDataflow(
+      [
+        goalTask("T1"),
+        producerTask("T2", "report.txt", ["T1"]),
+        {
+          task_key: "T3", title: "deliver",
+          task_instruction:
+            "Read upstream results, then send report.txt to Telegram yourself.",
+          required_capabilities: ["TELEGRAM_DELIVERY"], depends_on: ["T2"],
+          metadata: {},
+        },
+      ],
+      { telegramIntent: intent },
+    ).tasks;
+    const t3 = plan.find((t) => t.task_key === "T3")!;
+    // Instruction is overwritten with the PAIR-owned preparation contract —
+    // it must not itself read as an affirmative delivery directive.
+    expect(t3.task_instruction).toBe(canonicalDeliveryTaskInstruction(intent));
+    expect(
+      detectTelegramDeliveryIntent(String(t3.task_instruction)).requested,
+    ).toBe(false);
+    expect(String(t3.task_instruction)).toContain("Do NOT call Telegram");
+    // Manifest survives — PAIR-owned, unstretched.
+    expect(deliveryManifest(t3 as never)).toEqual({
+      mode: "FILES",
+      artifacts: ["report.txt"],
+    });
+  });
+
+  it("H. planner-supplied pair_telegram_delivery metadata is stripped; manifest comes only from operator intent", () => {
+    const plan = reconcilePlanDataflow(
+      [
+        goalTask("T1"),
+        producerTask("T2", "report.txt", ["T1"]),
+        {
+          task_key: "T3", title: "deliver",
+          task_instruction: "prepare the deliverable, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"], depends_on: ["T2"],
+          metadata: {
+            // Planner tries to widen the manifest — never authoritative.
+            pair_telegram_delivery: {
+              requested: true,
+              mode: "FILES",
+              artifacts: ["report.txt", "secrets.env", "wallet.json"],
+            },
+          },
+        },
+      ],
+      { telegramIntent: FILES_INTENT(["report.txt"]) },
+    ).tasks;
+    const t3 = plan.find((t) => t.task_key === "T3")!;
+    expect(deliveryManifest(t3 as never)).toEqual({
+      mode: "FILES",
+      artifacts: ["report.txt"],
+    });
+  });
+
+  it("bookkeeping tasks get the PAIR-owned record instruction (goal text is payload, never directive)", () => {
+    const bk = {
+      task_key: "T1", title: "record goal",
+      task_instruction: "record the goal",
+      required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+      depends_on: [],
+      metadata: {
+        expected_output_contract: {
+          type: "TASK_RESULT",
+          worker_spec: {
+            ops: [
+              { op: "write_text_file", path: "mission_goal.txt", content: "g" },
+              { op: "finish", result: { summary: "ok" } },
+            ],
+          },
+        },
+      },
+    };
+    expect(isPureBookkeepingTask(bk as never)).toBe(true);
+    const plan = reconcilePlanDataflow(
+      [
+        // Planner echoes the goal (with its send request) into the
+        // bookkeeping instruction — canonicalization rewrites it.
+        {
+          ...bk,
+          task_instruction:
+            "đào sâu dữ liệu mql5.com rồi gui bao cao này đến telegram",
+        },
+        producerTask("T2", "a.txt", ["T1"]),
+        deliveryTask("T3", ["T2"], "a.txt"),
+      ],
+      { telegramIntent: FILES_INTENT(["a.txt"]) },
+    ).tasks;
+    const t1 = plan.find((t) => t.task_key === "T1")!;
+    expect(t1.task_instruction).toBe(CANONICAL_BOOKKEEPING_INSTRUCTION);
+  });
+});
+
+describe("R8 §4 — pre-dispatch semantic check", () => {
+  it("I1. domain: affirmative delivery instruction without the capability → FAIL_CLOSED_TASK_DELIVERY_SEMANTIC_MISMATCH", () => {
+    expect(() =>
+      assertTaskDeliverySemantic({
+        task_key: "T2",
+        task_instruction: "compose the report and send it to telegram",
+        required_capabilities: ["REASONING"],
+      } as never),
+    ).toThrow(/FAIL_CLOSED_TASK_DELIVERY_SEMANTIC_MISMATCH/);
+    // A delivery task with the same semantics is its legitimate role.
+    expect(() =>
+      assertTaskDeliverySemantic({
+        task_key: "T3",
+        task_instruction: "send report.txt to telegram",
+        required_capabilities: ["TELEGRAM_DELIVERY"],
+      } as never),
+    ).not.toThrow();
+  });
+
+  it("I2. persisted/bypassed invalid task reaches the dispatch arm → PLAN_INVALIDATED, ZERO executor dispatch", async () => {
+    const ctx = makeCtx("r8-predispatch");
+    const adapter = new ScriptedAdapter("EX_A", ["FILE_OPERATIONS"]);
+    registerAdapter(ctx, adapter);
+    // Commit a valid single-task plan through the normal seam first.
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "write report.txt",
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: {
+        llm_plan: reconcilePlanDataflow([
+          {
+            task_key: "T1", title: "work",
+            task_instruction: "write findings to outbox/report.txt, then reply DONE.",
+            required_capabilities: ["FILE_OPERATIONS"], depends_on: [],
+            metadata: {},
+          },
+        ]).tasks,
+      },
+    });
+    const mid = String(m.mission_id);
+    // Tick until the plan is committed (tasks exist) but before dispatch.
+    let t = Date.parse("2026-01-01T01:00:00Z");
+    for (let i = 0; i < 6 && ctx.service.listTasks(mid).length === 0; i++) {
+      t += 120_000;
+      ctx.runtime.tick(mid, new Date(t).toISOString());
+    }
+    const t1 = ctx.service.listTasks(mid).find((x) => x.task_key === "T1")!;
+    // A persisted/bypassed mutation injects the affirmative directive.
+    ctx.service.updateTask(String(t1.task_id), {
+      task_instruction:
+        "write findings to outbox/report.txt and send the report to Telegram",
+    });
+    // Next tick: the pre-dispatch check rejects BEFORE routeGovernedTask.
+    for (let i = 0; i < 6 && decisionsOf(ctx, mid).length === 0; i++) {
+      t += 120_000;
+      ctx.runtime.tick(mid, new Date(t).toISOString());
+    }
+    expect(adapter.dispatched).toHaveLength(0); // zero executor dispatch
+    const ds = decisionsOf(ctx, mid);
+    expect(ds.some((d) => d.failure_class === "PLAN_INVALIDATED")).toBe(true);
+    expect(
+      ds.every(
+        (d) => !["RETRY_SAME_ROUTE", "RE_ROUTE"].includes(String(d.selected_action)),
+      ),
+    ).toBe(true);
+    // Bounded self-heal: REPLAN commits the same (valid) pinned tasks and
+    // the mission converges — the rejection never burns a retry loop.
+    expect(drive(ctx, mid)).toBe("COMPLETED");
+    expect(adapter.dispatched).toHaveLength(1);
+  });
+});
+
+describe("R8 §5 — TASK_INFEASIBLE classification", () => {
+  it("J. deterministic missing-tool report → TASK_INFEASIBLE, retry_allowed=false, no RETRY_SAME_ROUTE", () => {
+    const cls = classifyFailure({
+      execution_state: "FAILED",
+      error_class: "PROCESS_EXIT",
+      result: {
+        status: "FAILED",
+        error: {
+          class: "PROCESS_EXIT",
+          message:
+            "CODEX_AGENT_REPORTED_FAILURE: Telegram delivery could not be completed because no Telegram delivery tool is available",
+        },
+      },
+    });
+    expect(cls).toBe("TASK_INFEASIBLE");
+    const row = RECOVERY_MATRIX.TASK_INFEASIBLE;
+    expect(row.retry_allowed).toBe(false);
+    expect(row.actions).not.toContain("RETRY_SAME_ROUTE");
+    expect(row.actions).toEqual(["REPLAN", "ABORT"]);
+  });
+
+  it("J2. runtime: incapacity failure produces TASK_INFEASIBLE decision and never retries the same route", async () => {
+    const ctx = makeCtx("r8-infeasible");
+    const adapter = new ScriptedAdapter("EX_A", ["FILE_OPERATIONS"]);
+    adapter.behavior = { T1: "INCAPACITY" };
+    registerAdapter(ctx, adapter);
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId, goal: "write report.txt",
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: {
+        llm_plan: reconcilePlanDataflow([
+          {
+            task_key: "T1", title: "work",
+            task_instruction: "write findings to outbox/report.txt, then reply DONE.",
+            required_capabilities: ["FILE_OPERATIONS"], depends_on: [],
+            metadata: {},
+          },
+        ]).tasks,
+      },
+    });
+    const mid = String(m.mission_id);
+    const state = drive(ctx, mid, 60);
+    expect(["FAILED", "ABORTED", "COMPLETED"]).toContain(state);
+    const ds = decisionsOf(ctx, mid);
+    expect(ds.some((d) => d.failure_class === "TASK_INFEASIBLE")).toBe(true);
+    const ti = ds.filter((d) => d.failure_class === "TASK_INFEASIBLE");
+    expect(
+      ti.every((d) =>
+        ["REPLAN", "ABORT"].includes(String(d.selected_action)),
+      ),
+    ).toBe(true);
+    // The prod incident burned 4 same-route attempts; TASK_INFEASIBLE
+    // spends at most one execution per task revision.
+    expect(ti.some((d) => String(d.selected_action) === "RETRY_SAME_ROUTE")).toBe(false);
+  });
+
+  it("K. a normal crash without the incapacity phrase stays PROCESS_EXIT (retryable)", () => {
+    const cls = classifyFailure({
+      execution_state: "FAILED",
+      error_class: "PROCESS_EXIT",
+      result: {
+        status: "FAILED",
+        error: {
+          class: "PROCESS_EXIT",
+          message: "CODEX_AGENT_REPORTED_FAILURE: output contract violated",
+        },
+      },
+    });
+    expect(cls).toBe("PROCESS_EXIT");
+    expect(RECOVERY_MATRIX.PROCESS_EXIT.retry_allowed).toBe(true);
+  });
+});
+
+describe("R8 §6 — production incident repro + correct path", () => {
+  // Exact production goal from mission MSN_01M3XP0ME1GKFHD00H4Z3GWC1H —
+  // uses unaccented "gui" (R1: recognized as a `gửi` alias).
+  const PROD_GOAL =
+    "đào sâu dữ liệu mql5.com, xem các ea được bán nhiều và các ea mới nhất, và tìm hiểu điểm mạnh về sale để tôi quyết định có nên triển khai bán ea trên mql5 không, rồi gui bao cao này đến telegram";
+
+  it("M. exact prod goal IS delivery intent AND the incident plan shape is rejected (both invariants proven independently)", () => {
+    // 1 — the operator's own wording is recognized as delivery authority.
+    const intent = detectTelegramDeliveryIntent(PROD_GOAL);
+    expect(intent.requested).toBe(true);
+    // 2a — a plan with zero delivery tasks is rejected by presence
+    // (operator intent, not task prose, is the authority).
+    const planNoDelivery = [
+      {
+        task_key: "T1", title: "record goal",
+        task_instruction: "record the mission goal",
+        required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+        depends_on: [], metadata: {},
+      },
+      {
+        task_key: "T2", title: "research",
+        task_instruction: "research mql5 ea data remotely, return findings",
+        required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION"],
+        depends_on: ["T1"], metadata: {},
+      },
+      {
+        task_key: "T3", title: "compose",
+        task_instruction: "read findings and write outbox/report.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: ["T2"], metadata: {},
+      },
+    ];
+    expect(() =>
+      reconcilePlanDataflow(JSON.parse(JSON.stringify(planNoDelivery)), {
+        telegramIntent: intent,
+      }),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_MISSING/);
+    // 2b — the exact incident plan (send-verb folded into a CODEX task)
+    // is independently rejected by instruction hygiene.
+    const t3SendVerb = {
+      task_key: "T3", title: "compose",
+      task_instruction:
+        "read findings, write outbox/report.txt, and send the content to Telegram",
+      required_capabilities: ["FILE_OPERATIONS"],
+      depends_on: ["T2"], metadata: {},
+    };
+    expect(() => assertTaskDeliveryHygiene([t3SendVerb] as never)).toThrow(
+      /FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/,
+    );
+  });
+
+  it("N. correct plan → exactly one TDR minted, no duplicate, canonical instruction on the delivery task", async () => {
+    const ctx = makeCtx("r8-e2e");
+    const adapter = new ScriptedAdapter("EX_A", [
+      "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    ]);
+    adapter.behavior = { T1: "COMPLETE", T2: "WRITE", T3: "COMPLETE" };
+    registerAdapter(ctx, adapter);
+    const intent = FILES_INTENT(["analysis.txt"]);
+    const plan = reconcilePlanDataflow(
+      [
+        goalTask("T1"),
+        producerTask("T2", "analysis.txt", ["T1"]),
+        {
+          task_key: "T3", title: "deliver",
+          task_instruction:
+            "read analysis.txt, then send it to Telegram yourself",
+          required_capabilities: ["TELEGRAM_DELIVERY"], depends_on: [],
+          metadata: {},
+        },
+      ],
+      { telegramIntent: intent },
+    ).tasks;
+    const t3 = plan.find((t) => t.task_key === "T3")!;
+    expect(t3.depends_on).toEqual(["T2"]); // delivery leaf binds the producer
+    expect(t3.task_instruction).toBe(canonicalDeliveryTaskInstruction(intent));
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: "write analysis.txt and send analysis.txt to telegram",
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: plan },
+    });
+    const mid = String(m.mission_id);
+    expect(drive(ctx, mid)).toBe("COMPLETED");
+    const reqs = ctx.store.list("telegram_delivery_request");
+    expect(reqs).toHaveLength(1);
+    expect(await bridgeSend(ctx)).toEqual(["analysis.txt"]);
+    expect(await bridgeSend(ctx)).toEqual([]); // no duplicate
+    // Exactly one execution per task — no incident-shaped retry burn.
+    for (const t of ctx.service.listTasks(mid)) {
+      expect(
+        execsOf(ctx, mid).filter((e) => e.task_id === t.task_id),
+      ).toHaveLength(1);
+    }
+    expect(decisionsOf(ctx, mid)).toHaveLength(0);
+  });
+});
+
+/* =================== R8 audit remediation R1 — unaccented `gui` alias ======
+ * Independent audit blocker: the exact production goal used unaccented
+ * "gui" (gửi) which the canonical verb grammar did not recognize —
+ * intent stayed `requested:false`, defeating §1 in both directions.
+ * `gui` is admitted as a bare-word alias inside the SAME bounded grammar
+ * (verb + Telegram mention + same clause + not negated). Accents are NOT
+ * stripped globally: báo→bao would collide with "bao cao" (= report).
+ */
+
+describe("R8-R1 — unaccented `gui` delivery-verb alias", () => {
+  it("A. accented form still works: 'gửi báo cáo đến telegram' → requested=true", () => {
+    expect(
+      detectTelegramDeliveryIntent("gửi báo cáo đến telegram").requested,
+    ).toBe(true);
+  });
+
+  it("B. unaccented alias: 'gui bao cao den telegram' → requested=true", () => {
+    expect(
+      detectTelegramDeliveryIntent("gui bao cao den telegram").requested,
+    ).toBe(true);
+  });
+
+  it("C. EXACT production goal with 'gui' → requested=true (R1.4)", () => {
+    const goal =
+      "đào sâu dữ liệu mql5.com, mục tiêu tìm lợi thế bán hàng để bám bot ea mt5, tổng hợp thành 1 báo cáo file txt, rồi gui bao cao này đến telegram";
+    const intent = detectTelegramDeliveryIntent(goal);
+    expect(intent.requested).toBe(true);
+  });
+
+  it("D. exact production goal + clean plan with zero delivery tasks → FAIL_CLOSED_DELIVERY_TASK_MISSING (R1.5)", () => {
+    const goal =
+      "đào sâu dữ liệu mql5.com, mục tiêu tìm lợi thế bán hàng để bám bot ea mt5, tổng hợp thành 1 báo cáo file txt, rồi gui bao cao này đến telegram";
+    const intent = detectTelegramDeliveryIntent(goal);
+    expect(intent.requested).toBe(true);
+    const cleanPlan = [
+      {
+        task_key: "T1", title: "record goal",
+        task_instruction: "record the mission goal",
+        required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+        depends_on: [], metadata: {},
+      },
+      {
+        task_key: "T2", title: "research",
+        task_instruction: "research mql5 ea data remotely, return findings",
+        required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION"],
+        depends_on: ["T1"], metadata: {},
+      },
+      {
+        task_key: "T3", title: "compose",
+        task_instruction: "read findings and write outbox/report.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: ["T2"], metadata: {},
+      },
+    ];
+    expect(() =>
+      reconcilePlanDataflow(JSON.parse(JSON.stringify(cleanPlan)), {
+        telegramIntent: intent,
+      }),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_MISSING/);
+  });
+
+  it("E. exact production goal + exactly one TELEGRAM_DELIVERY task → PASSES; PAIR-owned instruction + manifest stamped (R1.6)", async () => {
+    const goal =
+      "đào sâu dữ liệu mql5.com, mục tiêu tìm lợi thế bán hàng để bám bot ea mt5, tổng hợp thành 1 báo cáo file txt, rồi gui bao cao này đến telegram";
+    const intent = detectTelegramDeliveryIntent(goal);
+    expect(intent.requested).toBe(true);
+    const plan = reconcilePlanDataflow(
+      [
+        goalTask("T1"),
+        producerTask("T2", "bao_cao.txt", ["T1"]),
+        {
+          task_key: "T3", title: "deliver",
+          task_instruction:
+            "read findings and write outbox/report.txt, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"], depends_on: [],
+          metadata: {},
+        },
+      ],
+      { telegramIntent: intent },
+    ).tasks;
+    const t3 = plan.find((t) => t.task_key === "T3")!;
+    expect(t3.task_instruction).toBe(canonicalDeliveryTaskInstruction(intent));
+    expect(deliveryManifest(t3 as never)).not.toBeNull();
+    // TEXT-mode intent (no path artifact named in the clause) — the
+    // delivery leaf still binds to the plan's terminal producer.
+    expect(t3.depends_on).toContain("T2");
+  });
+
+  it("F/G/H/I. negation still wins — accented and unaccented forms (R1.3)", () => {
+    for (const g of [
+      "khong gui telegram",
+      "dung gui telegram",
+      "không gui telegram",
+      "đừng gui telegram",
+      "khong can gui bao cao den telegram",
+      "do not gui this report to telegram",
+    ]) {
+      expect(detectTelegramDeliveryIntent(g).requested).toBe(false);
+    }
+  });
+
+  it("J/K. bare mention or verb without Telegram mention → requested=false", () => {
+    expect(detectTelegramDeliveryIntent("telegram").requested).toBe(false);
+    expect(
+      detectTelegramDeliveryIntent("gui bao cao cho toi").requested,
+    ).toBe(false);
+  });
+
+  it("L. diacritic-strip collision stays out: 'tao bao cao ve telegram' → requested=false", () => {
+    // "bao cao" must NOT become the verb `báo` — no global accent strip.
+    expect(
+      detectTelegramDeliveryIntent("tao bao cao ve telegram").requested,
+    ).toBe(false);
+    // Analysis-only phrasing about Telegram is not a delivery request.
+    expect(
+      detectTelegramDeliveryIntent("phân tích telegram và tạo bao cao").requested,
+    ).toBe(false);
+  });
+
+  it("M+. non-delivery task 'write report and send it to telegram' → FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK", () => {
+    expect(() =>
+      assertTaskDeliveryHygiene([
+        {
+          task_key: "T2", title: "compose",
+          task_instruction: "write report and send it to telegram",
+          required_capabilities: ["FILE_OPERATIONS"],
+          depends_on: [], metadata: {},
+        },
+      ] as never),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/);
+  });
+});
+
+/* =================== R8 audit remediation R2 — `GUI` false-positive ======
+ * Re-audit blocker: the `i` flag makes the unaccented `gui` alias match
+ * `GUI` — but all-caps GUI is the technical acronym (Graphical User
+ * Interface), never the Vietnamese verb. A bare acronym must never mint
+ * delivery authority: the detector rejects a verb match whose original
+ * source token is exactly all-caps "GUI"; `gui`/`Gui` stay valid.
+ */
+
+describe("R8-R2 — all-caps `GUI` acronym is not a delivery verb", () => {
+  it("A/B. `gui` and `Gui` remain delivery verbs", () => {
+    expect(
+      detectTelegramDeliveryIntent("gui bao cao den telegram").requested,
+    ).toBe(true);
+    expect(
+      detectTelegramDeliveryIntent("Gui bao cao den telegram").requested,
+    ).toBe(true);
+  });
+
+  it("C–G. all-caps GUI acronym → requested=false in every phrasing", () => {
+    for (const g of [
+      "GUI telegram",
+      "phân tích GUI telegram",
+      "thiết kế GUI cho telegram bot",
+      "review GUI telegram",
+      "GUI của telegram",
+    ]) {
+      expect(detectTelegramDeliveryIntent(g).requested).toBe(false);
+    }
+  });
+
+  it("H/I/J. production `gui` goal still works end to end (no R1 regression)", () => {
+    const goal =
+      "đào sâu dữ liệu mql5.com, mục tiêu tìm lợi thế bán hàng để bám bot ea mt5, tổng hợp thành 1 báo cáo file txt, rồi gui bao cao này đến telegram";
+    const intent = detectTelegramDeliveryIntent(goal);
+    expect(intent.requested).toBe(true);
+    expect(() =>
+      reconcilePlanDataflow(
+        [
+          {
+            task_key: "T1", title: "record",
+            task_instruction: "record the mission goal",
+            required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+            depends_on: [], metadata: {},
+          },
+          producerTask("T2", "bao_cao.txt", ["T1"]),
+        ],
+        { telegramIntent: intent },
+      ),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_MISSING/);
+    const plan = reconcilePlanDataflow(
+      [
+        goalTask("T1"),
+        producerTask("T2", "bao_cao.txt", ["T1"]),
+        {
+          task_key: "T3", title: "deliver",
+          task_instruction: "read findings and write outbox/report.txt, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"], depends_on: [],
+          metadata: {},
+        },
+      ],
+      { telegramIntent: intent },
+    ).tasks;
+    expect(plan.find((t) => t.task_key === "T3")!.task_instruction).toBe(
+      canonicalDeliveryTaskInstruction(intent),
+    );
+  });
+
+  it("K/L/M. negation still wins", () => {
+    for (const g of [
+      "khong gui telegram",
+      "dung gui telegram",
+      "do not gui this to telegram",
+      "never gui report to telegram",
+    ]) {
+      expect(detectTelegramDeliveryIntent(g).requested).toBe(false);
+    }
+  });
+
+  it("N–Q. word-boundary + collision negatives stay out", () => {
+    for (const g of [
+      "guide telegram",
+      "beguile telegram",
+      "mygui telegram",
+      "gui_component telegram",
+      "tao bao cao ve telegram",
+      "telegram",
+    ]) {
+      expect(detectTelegramDeliveryIntent(g).requested).toBe(false);
+    }
+  });
+
+  it("R/S. hygiene: 'send … telegram' trips, 'review GUI telegram' does NOT", () => {
+    const sendVerbTask = {
+      task_key: "T2", title: "x",
+      task_instruction: "write report and send it to telegram",
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+    };
+    expect(() => assertTaskDeliveryHygiene([sendVerbTask] as never)).toThrow(
+      /FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/,
+    );
+    const guiTask = {
+      task_key: "T3", title: "x",
+      task_instruction: "review GUI telegram integration page",
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+    };
+    expect(() => assertTaskDeliveryHygiene([guiTask] as never)).not.toThrow();
+  });
+
+  it("T. canonical delivery instruction still parses as NO direct-send directive", () => {
+    for (const intent of [
+      FILES_INTENT(["a.txt"]),
+      { requested: true, artifacts: [], mode: "TEXT" as const },
+    ]) {
+      expect(
+        detectTelegramDeliveryIntent(canonicalDeliveryTaskInstruction(intent))
+          .requested,
+      ).toBe(false);
+    }
   });
 });

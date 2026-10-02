@@ -143,7 +143,10 @@ export interface TelegramDeliveryIntent {
 // letter boundary for Vietnamese text.
 const TELEGRAM_MENTION_RE = /(?<![\p{L}\p{N}\p{M}_])(?:telegram|tele)(?![\p{L}\p{N}\p{M}_])/giu;
 const DELIVERY_VERB_RE =
-  /(?<![\p{L}\p{N}\p{M}_])(?:send|deliver|forward|share|post|upload|gửi|đẩy|đưa|chuyển|báo|bắn|đăng|đính)(?![\p{L}\p{N}\p{M}_])/giu;
+  // `gui` is the high-confidence unaccented alias of `gửi` (R8-R1 audit
+  // closure); only bare-alias safe verbs are admitted — accents are never
+  // stripped globally (báo→bao would collide with "bao cao" = report).
+  /(?<![\p{L}\p{N}\p{M}_])(?:send|deliver|forward|share|post|upload|gửi|gui|đẩy|đưa|chuyển|báo|bắn|đăng|đính)(?![\p{L}\p{N}\p{M}_])/giu;
 const NEGATION_RE =
   /(?<![\p{L}\p{N}\p{M}_])(?:do\s+not|don't|dont|does\s+not|doesn't|doesnt|never|not|no|đừng|dung|không|khong|không\s+cần|khong\s+can|chớ|đừng\s+có|không\s+phải|không\s+bao\s+giờ)(?![\p{L}\p{N}\p{M}_])/iu;
 const CLAUSE_SPAN = 160;
@@ -231,6 +234,11 @@ export function detectTelegramDeliveryIntent(
   let requested = false;
   DELIVERY_VERB_RE.lastIndex = 0;
   while ((m = DELIVERY_VERB_RE.exec(text)) !== null) {
+    // The `i` flag makes the unaccented `gui` alias also match `GUI` — but
+    // all-caps is the technical acronym (Graphical User Interface), never
+    // the Vietnamese verb. Fail closed toward NO SEND: reject only when
+    // the matched token is exactly all-caps GUI; `gui`/`Gui` stay valid.
+    if (m[0] === "GUI") continue;
     const v = m.index;
     const clause = mentions.some((p) => Math.abs(p - v) <= CLAUSE_SPAN);
     if (!clause || clauseNegated(text, v)) continue;
@@ -428,6 +436,146 @@ export function deliveryManifest(
     ? raw.artifacts.map((a) => String(a))
     : [];
   return { mode, artifacts };
+}
+
+/* ------------- R8 — canonical delivery plan-shape authority ------------- */
+
+/** R8 §3 — PAIR-owned instruction for the goal-bookkeeping task. Its job
+ *  is persisting the goal verbatim via worker_spec — the instruction
+ *  itself must NEVER echo goal text: the operator's own phrasing
+ *  (including a Telegram-delivery request) is payload to be recorded,
+ *  not a task directive. */
+export const CANONICAL_BOOKKEEPING_INSTRUCTION =
+  "Record the mission goal verbatim into mission_goal.txt using the provided worker_spec ops, then reply DONE.";
+
+/** A pure goal-bookkeeping task: its ONLY capability is bookkeeping and
+ *  its worker_spec (when declared) only writes mission_goal.txt /
+ *  finishes. Anything broader is a real work task and stays subject to
+ *  delivery hygiene on its own instruction. */
+export function isPureBookkeepingTask(task: Record<string, unknown>): boolean {
+  const caps = (task.required_capabilities as string[]) ?? [];
+  if (!caps.length || caps.some((c) => String(c) !== BOOKKEEPING_CAP)) return false;
+  const spec = (
+    (task.metadata as Record<string, unknown> | undefined)
+      ?.expected_output_contract as Record<string, unknown> | undefined
+  )?.worker_spec as Record<string, unknown> | undefined;
+  if (!spec) return true;
+  const ops = Array.isArray(spec.ops)
+    ? (spec.ops as Array<Record<string, unknown>>)
+    : [];
+  return ops.every(
+    (op) =>
+      op?.op === "finish" ||
+      (op?.op === "write_text_file" &&
+        normalizeArtifactPath(op?.path) === "mission_goal.txt"),
+  );
+}
+
+/** R8 §3 — PAIR-owned deterministic delivery-preparation contract for
+ *  the canonical TELEGRAM_DELIVERY task: the executor ONLY prepares and
+ *  stages the authorized deliverable — the governed bridge performs the
+ *  external Telegram send after task completion. The instruction never
+ *  widens the manifest and never names a destination. */
+export function canonicalDeliveryTaskInstruction(
+  intent: TelegramDeliveryIntent,
+): string {
+  const stage = intent.artifacts.length
+    ? `- Stage each manifested artifact into outbox/ keeping its filename: ${intent.artifacts.join(", ")}.\n`
+    : "";
+  return (
+    "You are the governed TELEGRAM_DELIVERY preparation step of this PAIR mission. " +
+    "Your job is to PREPARE the deliverable only — PAIR's governed bridge performs " +
+    "the external delivery afterwards.\n" +
+    "- Read the upstream tasks' returned results in dependency_outputs (provided in your prompt).\n" +
+    "- Compose the final operator-facing report as concise plain text in the goal's language " +
+    "and write it to outbox/report.txt — the bridge reads that file afterwards.\n" +
+    stage +
+    "- Do NOT call Telegram, any bot API, or any messaging tool — you have no such authority or tool. " +
+    "The external delivery is NOT your job.\n" +
+    "- Do not widen the deliverable set and do not pick a destination.\n" +
+    "Then reply DONE."
+  );
+}
+
+/** R8 §1 — operator-requested Telegram delivery requires EXACTLY ONE
+ *  canonical delivery task in the plan. 0 → MISSING; >1 → AMBIGUOUS.
+ *  When the operator did NOT request delivery, an emitted delivery task
+ *  is unauthorized send authority (the existing INTENT failure). The
+ *  operator request is the ONLY delivery authority — file presence,
+ *  outbox contents, mission completion, and executor prose never imply
+ *  it. */
+export function assertDeliveryTaskPresence(
+  tasks: Array<Record<string, unknown>>,
+  intent: TelegramDeliveryIntent,
+): void {
+  const count = tasks.filter(isDeliveryTask).length;
+  if (intent.requested) {
+    if (count === 0) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_TASK_MISSING",
+        JSON.stringify({ requested: true, delivery_tasks: 0 }),
+      );
+    }
+    if (count > 1) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_TASK_AMBIGUOUS",
+        JSON.stringify({ requested: true, delivery_tasks: count }),
+      );
+    }
+    return;
+  }
+  if (count > 0) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT",
+      JSON.stringify({
+        task: String(tasks.find(isDeliveryTask)?.task_key ?? "?"),
+      }),
+    );
+  }
+}
+
+/** R8 §2 — instruction hygiene: a task WITHOUT the TELEGRAM_DELIVERY
+ *  capability must never carry an affirmative delivery directive. The
+ *  SAME clause-scoped intent grammar (delivery verb + Telegram mention
+ *  within CLAUSE_SPAN, negation-aware, Unicode/Vietnamese-safe) is
+ *  reused — "do not send to Telegram"/"không gửi telegram" do not
+ *  count as affirmative. */
+export function assertTaskDeliveryHygiene(
+  tasks: Array<Record<string, unknown>>,
+): void {
+  for (const t of tasks) {
+    if (isDeliveryTask(t)) continue;
+    const instruction = String(t.task_instruction ?? "");
+    if (!instruction) continue;
+    if (detectTelegramDeliveryIntent(instruction).requested) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK",
+        JSON.stringify({ task: String(t.task_key ?? "?") }),
+      );
+    }
+  }
+}
+
+/** R8 §4 — pre-dispatch semantic defense: affirmative Telegram delivery
+ *  semantics in task_instruction ⇒ the TASK must require
+ *  TELEGRAM_DELIVERY. This invariant is about the task's ROLE/
+ *  CAPABILITY, never about which executor advertises the capability —
+ *  a persisted, bypassed-canonicalization, or malformed plan that
+ *  reaches dispatch carrying a send directive on a non-delivery task
+ *  fails closed with zero executor dispatch. */
+export function assertTaskDeliverySemantic(
+  task: Record<string, unknown>,
+): void {
+  if (isDeliveryTask(task)) return;
+  const instruction = String(task.task_instruction ?? "");
+  if (instruction && detectTelegramDeliveryIntent(instruction).requested) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_TASK_DELIVERY_SEMANTIC_MISMATCH",
+      JSON.stringify({
+        task: String(task.task_key ?? task.task_id ?? "?"),
+      }),
+    );
+  }
 }
 
 /**
@@ -713,23 +861,36 @@ export function reconcilePlanDataflow(
     artifacts: [],
     mode: "TEXT",
   };
+  // R8 §1 — the intent↔presence invariant at THE canonical seam, before
+  // a planner candidate can become the failover winner: an operator
+  // request for Telegram delivery requires EXACTLY ONE canonical
+  // delivery task; an emitted delivery task without the request is
+  // unauthorized send authority.
+  assertDeliveryTaskPresence(tasks, intent);
+  for (const t of tasks) {
+    // R8 §3 — pure bookkeeping instruction is PAIR-owned so operator
+    // goal phrasing can never be misread as a task directive (the goal
+    // text itself may carry the send request).
+    if (isPureBookkeepingTask(t)) {
+      t.task_instruction = CANONICAL_BOOKKEEPING_INSTRUCTION;
+    }
+  }
   for (const t of tasks) {
     if (!isDeliveryTask(t)) continue;
-    if (!intent.requested) {
-      // A delivery task with no explicit operator intent must never
-      // become send authority — the plan is invalid, failover material.
-      throw new IntegrityError(
-        "FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT",
-        JSON.stringify({ task: String(t.task_key ?? "?") }),
-      );
-    }
     const md = (t.metadata ??= {}) as Record<string, unknown>;
     md[TELEGRAM_MANIFEST_FIELD] = {
       requested: true,
       mode: intent.mode,
       artifacts: [...intent.artifacts],
     };
+    // R8 §3 — PAIR-owned deterministic delivery-preparation contract:
+    // the task stages the deliverable; the governed bridge sends.
+    t.task_instruction = canonicalDeliveryTaskInstruction(intent);
   }
+  // R8 §2 — a non-delivery task carrying an affirmative delivery clause
+  // makes the whole plan invalid at the canonical seam (failover picks
+  // a valid candidate rather than normalizing silently).
+  assertTaskDeliveryHygiene(tasks);
   const models = tasks.map((t) => extractTaskDataflow(t));
   const required = requiredEdges(tasks, models);
   const repairs: DataflowRepair[] = [];
@@ -801,9 +962,30 @@ export function reconcilePlanDataflow(
  * READY preview carrying an unsound DAG therefore rejects at confirm
  * instead of minting a mission.
  */
+export interface AssertPlanDataflowOptions {
+  /** Operator-request authority when the caller can prove it (the
+   *  effective goal) — re-proves the R8 §1 intent↔presence invariant at
+   *  every immutable-plan boundary (preview pin, confirm, runtime plan
+   *  commit, replan). Omitted = presence unprovable; delivery tasks
+   *  still require the PAIR-stamped manifest via the edge rules, and
+   *  instruction hygiene ALWAYS runs. */
+  telegramIntent?: TelegramDeliveryIntent;
+}
+
 export function assertPlanDataflow(
   tasks: Array<Record<string, unknown>>,
+  opts: AssertPlanDataflowOptions = {},
 ): void {
+  // R8 §1 — re-prove intent↔presence at the persisted-plan boundary
+  // when the operator-request authority is known: a READY preview or
+  // persisted plan whose delivery shape no longer matches the request
+  // fails closed instead of being consumed.
+  if (opts.telegramIntent) {
+    assertDeliveryTaskPresence(tasks, opts.telegramIntent);
+  }
+  // R8 §2 — a persisted/bypassed non-delivery task carrying affirmative
+  // delivery semantics fails closed at validation, before dispatch.
+  assertTaskDeliveryHygiene(tasks);
   const models = tasks.map((t) => extractTaskDataflow(t));
   const required = requiredEdges(tasks, models);
   const depsByKey = new Map<string, string[]>();

@@ -26,7 +26,10 @@ import { projectRoutableModels } from "./model-routable.js";
 import { canonicalRiskCeiling, canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
-import { assertPlanDataflow } from "./plan-dataflow.js";
+import {
+  assertPlanDataflow,
+  detectTelegramDeliveryIntent,
+} from "./plan-dataflow.js";
 import {
   pendingTelegramDeliveries,
   beginDeliveryAttempt as beginDeliveryAttemptEntity,
@@ -568,8 +571,12 @@ export class MissionControl {
     // it must already be data-flow sound (consumed artifacts need their
     // producer edge). The serve canonicalize seam repairs before this;
     // an unsound proposal fails closed here rather than entering a
-    // digestible preview.
-    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
+    // digestible preview. R8 — the delivery plan-shape invariant
+    // (intent↔presence + instruction hygiene) is re-proven with the
+    // operator request before the preview is pinned.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
+      telegramIntent: detectTelegramDeliveryIntent(input.goal),
+    });
     const eid = effectiveInputDigest({
       project_id: input.project_id,
       goal: input.goal,
@@ -660,9 +667,12 @@ export class MissionControl {
       // plan; it never repairs. A READY preview pinned before the
       // data-flow authority (or otherwise unsound) fails closed here —
       // it is not consumed, no mission is created, the operator must
-      // request a fresh preview.
+      // request a fresh preview. R8 — same re-proof for the delivery
+      // plan shape (intent↔presence + instruction hygiene), against the
+      // persisted mission_input.goal — the only delivery authority.
       assertPlanDataflow(
         v.preview.canonical_tasks as Array<Record<string, unknown>>,
+        { telegramIntent: detectTelegramDeliveryIntent(mi.goal) },
       );
       // R5 — replay persisted authority VERBATIM. Normalization already ran
       // before the persisted digests at preview creation; confirm may only
