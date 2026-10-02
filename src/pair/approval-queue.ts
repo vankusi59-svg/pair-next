@@ -13,6 +13,7 @@
  */
 
 import { IntegrityError, PolicyError } from "./errors.js";
+import { isSqliteContentionError } from "./store.js";
 import { digest, newId, utcnow } from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -233,7 +234,13 @@ export class ApprovalQueue {
   exercise(
     approvalId: string,
     effect?: Record<string, unknown>,
-  ): { row: Record<string, unknown>; created: boolean } {
+  ): {
+    row: Record<string, unknown>;
+    created: boolean;
+    /** R6 — writer lock stopped the deterministic ensure: bounded
+     *  converge, a later tick retries. Not an error, not a defect. */
+    contention: boolean;
+  } {
     const approval = this.get(approvalId);
     if (String(approval.status) !== "APPROVED") {
       throw new PolicyError(
@@ -243,7 +250,8 @@ export class ApprovalQueue {
     }
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
     const existing = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
-    if (existing) return { row: existing, created: false };
+    if (existing)
+      return { row: existing, created: false, contention: false };
     const row = {
       approval_exercise_id: exerciseId,
       approval_id: approvalId,
@@ -271,9 +279,18 @@ export class ApprovalQueue {
     try {
       saved = this.store.put(APPROVAL_EXERCISE_ENTITY, exerciseId, row, 0);
     } catch (error) {
+      if (isSqliteContentionError(error)) {
+        // R6 — another writer holds the lock: re-read the canonical row
+        // and converge; a later tick retries the deterministic ensure.
+        const fresh = this.store.tryGet(
+          APPROVAL_EXERCISE_ENTITY,
+          exerciseId,
+        );
+        return { row: fresh ?? row, created: false, contention: true };
+      }
       // A concurrent writer won the deterministic id — adopt its row.
       const winner = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
-      if (winner) return { row: winner, created: false };
+      if (winner) return { row: winner, created: false, contention: false };
       throw error;
     }
     this.store.event({
@@ -290,7 +307,7 @@ export class ApprovalQueue {
         task_id: approval.task_id ?? null,
       },
     });
-    return { row: saved, created: true };
+    return { row: saved, created: true, contention: false };
   }
 
   /**
@@ -318,12 +335,40 @@ export class ApprovalQueue {
     now?: string,
     leaseMs = 60_000,
   ): {
-    row: Record<string, unknown>;
+    row: Record<string, unknown> | null;
     owned: boolean;
     applied: boolean;
     claim: { owner_id: string; claim_epoch: number } | null;
+    /** R6 — true iff a writer lock (SQLITE_BUSY/LOCKED) stopped this
+     *  claim: bounded convergence — NOT a defect, NOT stale. The caller
+     *  did not own anything; a later tick retries normally. */
+    contention: boolean;
   } {
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    // On writer-lock contention: re-read the canonical row if possible
+    // and return a bounded non-owner result — never pretend ownership,
+    // never advance claim_epoch, never surface contention as a defect.
+    const contended = (): {
+      row: Record<string, unknown> | null;
+      owned: boolean;
+      applied: boolean;
+      claim: { owner_id: string; claim_epoch: number } | null;
+      contention: boolean;
+    } => {
+      let fresh: Record<string, unknown> | null = null;
+      try {
+        fresh = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
+      } catch {
+        fresh = null; // even the re-read contended — canonical stays
+      }
+      return {
+        row: fresh,
+        owned: false,
+        applied: String(fresh?.state ?? "") === "APPLIED",
+        claim: null,
+        contention: true,
+      };
+    };
     for (let attempt = 0; attempt < 3; attempt++) {
       const row = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
       if (!row) {
@@ -333,7 +378,13 @@ export class ApprovalQueue {
         );
       }
       if (String(row.state ?? "APPLIED") === "APPLIED") {
-        return { row, owned: false, applied: true, claim: null };
+        return {
+          row,
+          owned: false,
+          applied: true,
+          claim: null,
+          contention: false,
+        };
       }
       const at = now ?? utcnow();
       const lease = String(row.lease_expires_at ?? "");
@@ -364,14 +415,22 @@ export class ApprovalQueue {
               owner_id: ownerId,
               claim_epoch: Number(row.claim_epoch ?? 0),
             },
+            contention: false,
           };
         } catch (error) {
           if (error instanceof IntegrityError) continue;
+          if (isSqliteContentionError(error)) return contended();
           throw error;
         }
       }
       if (active && owner !== "") {
-        return { row, owned: false, applied: false, claim: null }; // live other owner
+        return {
+          row,
+          owned: false,
+          applied: false,
+          claim: null,
+          contention: false,
+        }; // live other owner
       }
       // Unowned or stale owner — CAS takeover.
       const next = {
@@ -396,15 +455,23 @@ export class ApprovalQueue {
             owner_id: ownerId,
             claim_epoch: Number(saved.claim_epoch ?? 0),
           },
+          contention: false,
         };
       } catch (error) {
         if (error instanceof IntegrityError) continue; // raced — re-read
+        if (isSqliteContentionError(error)) return contended();
         throw error;
       }
     }
     // Contention resolved elsewhere — converge on the canonical row.
     const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
-    return { row, owned: false, applied: false, claim: null };
+    return {
+      row,
+      owned: false,
+      applied: false,
+      claim: null,
+      contention: false,
+    };
   }
 
   /** R5 — atomic fenced stage: the claim re-verification AND the
@@ -420,26 +487,55 @@ export class ApprovalQueue {
     approvalId: string,
     claim: { owner_id: string; claim_epoch: number } | null | undefined,
     mutation: (row: Record<string, unknown>) => T,
-  ): { fenced: boolean; row: Record<string, unknown> | null; result?: T } {
+  ): {
+    fenced: boolean;
+    /** R6 — true iff the BEGIN IMMEDIATE writer lock could not be
+     *  acquired (SQLITE_BUSY/LOCKED): the mutation callback did NOT run,
+     *  zero stage mutation, zero ownership change. Semantically distinct
+     *  from `fenced` — the canonical claim was never actually checked,
+     *  so the caller must NOT treat this as stale. Bounded convergence;
+     *  a later tick retries. */
+    contended: boolean;
+    row: Record<string, unknown> | null;
+    result?: T;
+  } {
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
-    return this.store.immediate(() => {
-      const row = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
-      const current =
-        row != null &&
-        claim != null &&
-        String(row.state) === "APPLYING" &&
-        String(row.owner_id ?? "") === claim.owner_id &&
-        Number(row.claim_epoch ?? 0) === claim.claim_epoch;
-      if (!current) {
-        return { fenced: true, row: row ?? null, result: undefined };
+    try {
+      return this.store.immediate(() => {
+        const row = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
+        const current =
+          row != null &&
+          claim != null &&
+          String(row.state) === "APPLYING" &&
+          String(row.owner_id ?? "") === claim.owner_id &&
+          Number(row.claim_epoch ?? 0) === claim.claim_epoch;
+        if (!current) {
+          return {
+            fenced: true,
+            contended: false,
+            row: row ?? null,
+            result: undefined,
+          };
+        }
+        const result = mutation(row);
+        return {
+          fenced: false,
+          contended: false,
+          row: this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId),
+          result,
+        };
+      });
+    } catch (error) {
+      if (isSqliteContentionError(error)) {
+        return {
+          fenced: false,
+          contended: true,
+          row: null,
+          result: undefined,
+        };
       }
-      const result = mutation(row);
-      return {
-        fenced: false,
-        row: this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId),
-        result,
-      };
-    });
+      throw error;
+    }
   }
 
   /** R3 fencing check — prove the caller's claim token still owns the
@@ -475,19 +571,26 @@ export class ApprovalQueue {
     approvalId: string,
     ownerId: string,
     claimEpoch: number,
-  ): { row: Record<string, unknown>; applied: boolean; fenced: boolean } {
+  ): {
+    row: Record<string, unknown>;
+    applied: boolean;
+    fenced: boolean;
+    /** R6 — writer lock stopped the finalizing CAS: bounded result,
+     *  NOT stale — a later tick retries the close. */
+    contended: boolean;
+  } {
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
       if (String(row.state) === "APPLIED") {
-        return { row, applied: true, fenced: false };
+        return { row, applied: true, fenced: false, contended: false };
       }
       if (
         String(row.owner_id ?? "") !== ownerId ||
         Number(row.claim_epoch ?? 0) !== Number(claimEpoch)
       ) {
         // Stale token — a different epoch owns the canonical row.
-        return { row, applied: false, fenced: true };
+        return { row, applied: false, fenced: true, contended: false };
       }
       row.state = "APPLIED";
       row.applied_at = utcnow();
@@ -498,9 +601,12 @@ export class ApprovalQueue {
           row,
           Number(row.version),
         );
-        return { row: saved, applied: true, fenced: false };
+        return { row: saved, applied: true, fenced: false, contended: false };
       } catch (error) {
         if (error instanceof IntegrityError) continue;
+        if (isSqliteContentionError(error)) {
+          return { row, applied: false, fenced: false, contended: true };
+        }
         throw error;
       }
     }
@@ -508,6 +614,7 @@ export class ApprovalQueue {
       row: this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId),
       applied: false,
       fenced: false,
+      contended: false,
     };
   }
 

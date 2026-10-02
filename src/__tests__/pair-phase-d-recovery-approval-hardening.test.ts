@@ -1616,18 +1616,18 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     // held until A's commit. After commit, B takes over and A's
     // finalization is fenced.
     let stageCalls = 0;
-    let intraTxnBlocked: unknown = null;
+    let intraTxnBlocked = false;
     const origStage = ctx.approvals.runFencedExerciseStage.bind(ctx.approvals);
     ctx.approvals.runFencedExerciseStage = (id, token, mutation) => {
       stageCalls++;
       const wrapped =
         stageCalls === 4
           ? () => {
-              try {
-                approvals2.claimExercise(id, "MRI_B", T1); // inside A's txn
-              } catch (e) {
-                intraTxnBlocked = e; // SQLITE_BUSY — cannot interleave
-              }
+              // Inside A's BEGIN IMMEDIATE — B's takeover attempt hits
+              // the writer lock and converges as bounded contention
+              // (R6: {contention:true}), never an epoch advance.
+              const b = approvals2.claimExercise(id, "MRI_B", T1);
+              intraTxnBlocked = b.contention === true;
               return mutation();
             }
           : mutation;
@@ -1744,13 +1744,12 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     // Stage N: A verified epoch1 INSIDE BEGIN IMMEDIATE — B's takeover
     // on a separate connection cannot complete before A's commit
     // (busy_timeout → SQLITE_BUSY / blocked write).
-    let intraTxnBlocked: unknown = null;
+    let intraTxnBlocked = false;
     const s1 = ctx.approvals.runFencedExerciseStage(approvalId, tokA, () => {
-      try {
-        approvals2.claimExercise(approvalId, "MRI_B", T1);
-      } catch (e) {
-        intraTxnBlocked = e;
-      }
+      // B's takeover attempt inside A's BEGIN IMMEDIATE — writer lock
+      // held → bounded contention result (R6), never an epoch advance.
+      const b = approvals2.claimExercise(approvalId, "MRI_B", T1);
+      intraTxnBlocked = b.contention === true;
       return "stage1-committed";
     });
     expect(s1.fenced).toBe(false);
@@ -1786,5 +1785,144 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     const row = ctx.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
     expect(String(row.owner_id)).toBe("MRI_B"); // canonical, B's
     expect(Number(row.claim_epoch)).toBe(2);
+  });
+
+  it("N. R6 lock contention — bounded convergence on claim + stage + full tick, then completes on a later tick", () => {
+    const ctx = makeCtx("r6n");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    const T0 = "2999-01-01T00:00:00Z";
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    ctx.approvals.exercise(approvalId, {});
+    const { approvals2, store2, runtime2 } = makeRuntime2(ctx, []);
+    const decisionsBefore = ctx.store
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+
+    // (1) Queue-level contention: connection A holds BEGIN IMMEDIATE —
+    // B's claim + stage get bounded results, NOT stale, NOT defects.
+    let claimRes: ReturnType<ApprovalQueue["claimExercise"]> | null = null;
+    let stageRes: { fenced?: boolean; contended?: boolean } | null = null;
+    let mutationRan = false;
+    ctx.store.immediate(() => {
+      claimRes = approvals2.claimExercise(approvalId, "MRI_B", T0);
+      stageRes = approvals2.runFencedExerciseStage(
+        approvalId,
+        { owner_id: "MRI_B", claim_epoch: 1 },
+        () => {
+          mutationRan = true;
+          return null;
+        },
+      );
+    });
+    expect(claimRes!.contention).toBe(true);
+    expect(claimRes!.owned).toBe(false);
+    expect(claimRes!.claim).toBeNull();
+    expect(stageRes!.contended).toBe(true);
+    expect(stageRes!.fenced).toBe(false); // claim was never checked
+    expect(mutationRan).toBe(false); // callback did NOT run
+    // APRE canonical, untouched: unowned, epoch 0.
+    let apre = ctx.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(Number(apre.claim_epoch)).toBe(0);
+    expect(apre.owner_id ?? null).toBeNull();
+
+    // (2) Full-tick contention through MissionRuntime.tick(): A holds
+    // the writer lock for B's entire tick — tick converges, never throws.
+    let threw: unknown = null;
+    ctx.store.immediate(() => {
+      try {
+        runtime2.tick(mid, T0);
+      } catch (e) {
+        threw = e;
+      }
+    });
+    expect(threw).toBeNull();
+    // Zero defect: no abort, no INTERNAL_RUNTIME_DEFECT surface, no new
+    // recovery_decision, no effect writes, no epoch corruption.
+    expect(String(rt(ctx, mid).state)).toBe("WAITING_APPROVAL");
+    expect(
+      store2
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === mid).length,
+    ).toBe(decisionsBefore);
+    apre = ctx.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(apre.state)).toBe("APPLYING");
+    expect(Number(apre.claim_epoch)).toBe(0);
+    expect(apre.owner_id ?? null).toBeNull();
+
+    // (3) Lock released — next tick claims, applies exactly once.
+    runtime2.tick(mid, T0);
+    apre = store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(apre.state)).toBe("APPLIED");
+    expect(Number(apre.claim_epoch)).toBe(1);
+    expect(
+      store2
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === mid).length,
+    ).toBe(decisionsBefore + 1);
+  });
+
+  it("O. R6 fenced-stage contention through tick — legitimate owner cannot acquire the writer lock → zero mutation, converges, completes next tick", () => {
+    const ctx = makeCtx("r6o");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    const T0 = "2999-01-01T00:00:00Z";
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    const { approvals2, store2, runtime2 } = makeRuntime2(ctx, []);
+    // B legitimately owns the APRE at epoch 1.
+    ctx.approvals.exercise(approvalId, {});
+    expect(approvals2.claimExercise(approvalId, "MRI_B", T0).owned).toBe(
+      true,
+    );
+    (runtime2 as unknown as { instanceId: string }).instanceId = "MRI_B";
+    const decisionsBefore = ctx.store
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+
+    // A's connection holds the writer lock specifically while B's stage
+    // calls attempt BEGIN IMMEDIATE — every fenced stage contends.
+    const origStage = approvals2.runFencedExerciseStage.bind(approvals2);
+    let attempts = 0;
+    approvals2.runFencedExerciseStage = (id, tok, mut) => {
+      attempts++;
+      return ctx.store.immediate(() => origStage(id, tok, mut));
+    };
+    let threw: unknown = null;
+    try {
+      runtime2.tick(mid, T0);
+    } catch (e) {
+      threw = e;
+    }
+    expect(threw).toBeNull();
+    expect(attempts).toBeGreaterThan(0); // stages attempted under the lock
+    // Zero effect: grant absent, no decisions minted, no abort; the APRE
+    // kept its canonical owner/epoch (claim renew was unaffected).
+    const rtO = store2.get("mission_runtime", `MRT_${mid}`);
+    expect(String(rtO.state)).toBe("WAITING_APPROVAL");
+    expect(
+      ((rtO.budget_extension as Record<string, unknown> | undefined)?.tasks ??
+        {}),
+    ).toEqual({});
+    expect(
+      store2
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === mid).length,
+    ).toBe(decisionsBefore);
+    const apreO = store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(apreO.state)).toBe("APPLYING");
+    expect(String(apreO.owner_id)).toBe("MRI_B");
+    expect(Number(apreO.claim_epoch)).toBe(1);
+
+    // Lock released — B retries next tick and completes exactly once.
+    approvals2.runFencedExerciseStage = origStage;
+    runtime2.tick(mid, T0);
+    const row = store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(row.state)).toBe("APPLIED");
+    expect(String(row.owner_id)).toBe("MRI_B");
+    expect(
+      store2
+        .list("recovery_decision")
+        .filter((d) => d.mission_id === mid).length,
+    ).toBe(decisionsBefore + 1); // effect completes exactly once
   });
 });

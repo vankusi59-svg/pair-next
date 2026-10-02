@@ -478,3 +478,58 @@ All R0–R4 closures: DSH_EXHAUSTED availability · authority→POLICY_DENIAL ·
 `PAIR_NEXT_PHASE_D_R5_PENDING_INDEPENDENT_AUDIT`
 
 **STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R6 — SQLite Contention Convergence Closure
+
+Base: `7f76af4` (R5 audited HEAD). Scope: SQLITE_BUSY/SQLITE_LOCKED — expected lock-contention under R5's `BEGIN IMMEDIATE` fencing — now converges bounded at every APRE surface instead of escaping `tick()` as a defect. busy_timeout unchanged (5000ms); correctness, not timeout tuning.
+
+## Contention detection rule
+
+`isSqliteContentionError(e)` (`store.ts`) — ONLY `SQLITE_BUSY*`/`SQLITE_LOCKED*` codes (better-sqlite3 `code`, message fallback). No broad catch: IntegrityError, hash mismatch, schema/corruption, governance errors all still fail closed.
+
+## Contention semantics
+
+| Surface | Behavior on BUSY/LOCKED |
+|---------|------------------------|
+| `exercise()` ensure-put | re-read → `{created:false, contention:true}` — adopt canonical |
+| `claimExercise()` renew/takeover CAS | re-read → `{owned:false, applied:known, claim:null, contention:true}` — never pretends ownership, never advances epoch |
+| `runFencedExerciseStage()` | `{fenced:false, contended:true}` — mutation NOT run, claim never checked → semantically distinct from `fenced` (stale) |
+| `markExercisedApplied()` CAS | `{applied:false, fenced:false, contended:true}` — bounded retry next tick |
+
+MissionRuntime: `convergeExercise` returns early on `ensure.contention`/`claim.contention`; the stage wrapper collapses `fenced||contended` into `stop` (evidence flag kept distinct) — no effect continuation, no fallback recovery, no abort, no INTERNAL_RUNTIME_DEFECT. Next tick rediscovers the same APPLYING row normally.
+
+## Evidence (tests N/O — REAL lock contention, 2 connections)
+
+- **N (claim + stage + full tick)**: conn A holds `BEGIN IMMEDIATE` → B's `claimExercise` → `contention:true, owned:false, claim:null` (5s busy timeout then bounded result — real); B's `runFencedExerciseStage` → `contended:true`, mutation NOT run, `fenced:false` (claim never checked). Then A holds the lock across B's ENTIRE `tick()` → tick returns cleanly: mission stays `WAITING_APPROVAL`, zero decisions, APRE unowned epoch0 APPLYING. Lock released → B's next tick claims epoch1 → applies once → APPLIED, `recovery_decision` +1.
+- **O (stage contention through tick — legitimate owner)**: B owns epoch1; A's lock wraps each of B's stage calls via a second connection → every stage contends → zero grant write, zero decisions, no abort; APRE stays `MRI_B`/epoch1 APPLYING. Unpatched → B's next tick completes → APPLIED, `+1` decision.
+
+R5 TOCTOU evidence also strengthened: in tests K/M, B's intra-transaction takeover attempt now provably returns `contention:true` — the write lock held through A's commit.
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **35/35 pass** (R5 33 + N + O) |
+| PR #23 / PR #24 / Phase C / Phase B | pass (230 tests) |
+| **Full suite** | **2561 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R5 `7f76af4` 2559/2/15 → +2 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+All R0–R5 closures — R5 atomic fence+mutation intact (verify stays inside the transaction, BEGIN IMMEDIATE untouched, busy_timeout unchanged) · scope authority · expireSweep(now) · SUPERSEDED relink · taxonomy · ROUTE_INFEASIBLE · deterministic APRE/plan · orphan discovery · lease/epoch fencing · mandatory finalization · extension no-stack · revalidation dedupe · stale_recovery · recovery_id adoption · UNKNOWN zero-replay · PR #23/#24/Phase C.
+
+## Changed files (R6)
+
+- `src/pair/store.ts` — `isSqliteContentionError` canonical detection
+- `src/pair/approval-queue.ts` — contention-bounded returns on `exercise`/`claimExercise`/`runFencedExerciseStage`/`markExercisedApplied`
+- `src/pair/mission-runtime.ts` — early-return on `contention`; stage `stop = fenced || contended`
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +N/O contention tests; K/M assert bounded `contention` intra-transaction
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R6_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**

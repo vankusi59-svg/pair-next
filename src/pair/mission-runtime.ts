@@ -1681,17 +1681,21 @@ export class MissionRuntime {
         approval.requested_action,
     );
     const taskId = String(approval.task_id ?? "");
-    const { row: apre0 } = this.deps.approvals.exercise(
+    const ensure = this.deps.approvals.exercise(
       approvalId,
       this.exerciseEffectPlan(missionId, approval, intent, taskId),
     );
+    if (ensure.contention) return; // R6: writer lock — retry next tick
+    const apre0 = ensure.row!;
     const claim = this.deps.approvals.claimExercise(
       approvalId,
       this.instanceId,
       now,
     );
-    const row = claim.applied || claim.owned ? claim.row : apre0;
-    const exerciseId = String(row.approval_exercise_id);
+    if (claim.contention) return; // R6: writer lock — converge, retry
+    const row0 = claim.applied || claim.owned ? claim.row : apre0;
+    const exerciseId = String(row0!.approval_exercise_id);
+    const row = row0!;
     const rt = this.runtimeEntity(missionId);
     if (claim.applied) {
       // Effect already durable — converge bookkeeping only.
@@ -1729,12 +1733,18 @@ export class MissionRuntime {
     // between committed stages; the stale owner's next stage is fenced
     // atomically — zero writes, bounded convergence, never a defect.
     const token = claim.claim!;
-    const stage = <T>(mutation: () => T) =>
-      this.deps.approvals.runFencedExerciseStage(
+    const stage = <T>(mutation: () => T) => {
+      const r = this.deps.approvals.runFencedExerciseStage(
         approvalId,
         token,
         mutation,
       );
+      // R6 — `fenced` (canonical claim verified stale) and `contended`
+      // (writer lock never acquired, claim unchecked) both stop this
+      // owner's apply for the current tick; the distinction is kept on
+      // the result for evidence but both paths converge with zero writes.
+      return { ...r, stop: r.fenced || r.contended };
+    };
 
     switch (intent) {
       case "RECOVERY_TASK_ATTEMPT_EXTENSION":
@@ -1763,7 +1773,7 @@ export class MissionRuntime {
               rtS,
               Number(rtS.version),
             );
-          }).fenced
+          }).stop
         ) {
           return;
         }
@@ -1776,7 +1786,7 @@ export class MissionRuntime {
                 "RECOVERING",
                 "approval_exercised_attempt_extension",
               ),
-            ).fenced
+            ).stop
           ) {
             return;
           }
@@ -1810,7 +1820,7 @@ export class MissionRuntime {
               rtS,
               Number(rtS.version),
             );
-          }).fenced
+          }).stop
         ) {
           return;
         }
@@ -1826,7 +1836,7 @@ export class MissionRuntime {
                 "RECOVERING",
                 "approval_exercised_revalidation",
               ),
-            ).fenced
+            ).stop
           ) {
             return;
           }
@@ -1876,7 +1886,7 @@ export class MissionRuntime {
                 Number(rtS.version),
               );
             }
-          }).fenced
+          }).stop
         ) {
           return;
         }
@@ -1888,7 +1898,7 @@ export class MissionRuntime {
             if (task && String(task.status) !== "FAILED") {
               this.deps.service.updateTask(taskId, { status: "FAILED" });
             }
-          }).fenced
+          }).stop
         ) {
           return;
         }
@@ -1916,7 +1926,7 @@ export class MissionRuntime {
                 Number(exec.version),
               );
             }
-          }).fenced
+          }).stop
         ) {
           return;
         }
@@ -1928,7 +1938,7 @@ export class MissionRuntime {
               "CANCELLED",
               "operator_no_replay",
             ),
-          ).fenced
+          ).stop
         ) {
           return;
         }
@@ -1950,7 +1960,7 @@ export class MissionRuntime {
                 "approval_exercised_no_replay",
               );
             }
-          }).fenced
+          }).stop
         ) {
           return;
         }
@@ -1967,7 +1977,7 @@ export class MissionRuntime {
               rtS,
               Number(rtS.version),
             );
-          }).fenced
+          }).stop
         ) {
           return;
         }
@@ -1979,7 +1989,7 @@ export class MissionRuntime {
                 "RUNNING",
                 "approval_granted_resume",
               ),
-            ).fenced
+            ).stop
           ) {
             return;
           }
@@ -1991,6 +2001,7 @@ export class MissionRuntime {
     // (self or a post-lease takeover) re-enters and re-applies the same
     // idempotent writes until this line runs. Fenced by the claim token:
     // a stale owner cannot land APPLIED for a row it no longer owns.
+    // `contended` (writer lock) is bounded — the next tick retries.
     this.deps.approvals.markExercisedApplied(
       approvalId,
       token.owner_id,
@@ -2071,7 +2082,7 @@ export class MissionRuntime {
     exerciseId: string,
     now?: string,
     plan?: Record<string, unknown>,
-    stage?: <T>(mutation: () => T) => { fenced: boolean },
+    stage?: <T>(mutation: () => T) => { fenced: boolean; stop?: boolean },
   ): void {
     const planHasSnapshot =
       plan != null &&
@@ -2122,7 +2133,7 @@ export class MissionRuntime {
     if (
       stage(() =>
         this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised"),
-      ).fenced
+      ).stop
     ) {
       return;
     }
