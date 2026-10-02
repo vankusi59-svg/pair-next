@@ -95,14 +95,24 @@ const IMG_EXT = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 
 // Binary deliverable: photos go through sendPhoto (visible inline), other
 // allowed files through sendDocument. Multipart upload via FormData.
-async function sendFile(chatId, filePath) {
-  const name = path.basename(filePath);
+// R3 — HASHED BYTES === NETWORK BYTES: governed deliveries materialize
+// and digest-verify the payload ONCE upstream; the uploader builds
+// FormData from THOSE bytes and NEVER re-reads filePath (the path
+// stays filename/path evidence only, `name` is the manifested
+// artifact's canonical filename).
+async function sendFile(chatId, filePath, fileBytes, displayName) {
+  const name = displayName ?? path.basename(filePath);
   const ext = path.extname(name).toLowerCase();
   const method = IMG_EXT.has(ext) ? "sendPhoto" : "sendDocument";
   const field = IMG_EXT.has(ext) ? "photo" : "document";
   const fd = new FormData();
   fd.append("chat_id", String(chatId));
-  fd.append(field, new Blob([fs.readFileSync(filePath)]), name);
+  if (!fileBytes) {
+    const e = new Error("FAIL_CLOSED_TELEGRAM_FILE_BYTES_MISSING");
+    e.tgKind = "fail";
+    throw e;
+  }
+  fd.append(field, new Blob([fileBytes]), name);
   fd.append("caption", `📎 ${name}`);
   let res;
   try {
@@ -129,10 +139,10 @@ async function sendFile(chatId, filePath) {
 // R3 §5 — governed transport: PROPAGATES failure classification instead
 // of the best-effort `send()` which swallows it. Definite API failure →
 // {kind:"fail"}; thrown/ambiguous acceptance → {kind:"unknown"}.
-async function governedSend({ chatId, text, filePath, name }) {
+async function governedSend({ chatId, text, filePath, fileBytes, name }) {
   try {
     const result = filePath
-      ? await sendFile(chatId, filePath)
+      ? await sendFile(chatId, filePath, fileBytes, name)
       : await tg("sendMessage", {
           chat_id: chatId,
           text: String(text ?? "").slice(0, 4000),

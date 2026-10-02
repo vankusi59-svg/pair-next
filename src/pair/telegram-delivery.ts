@@ -178,6 +178,70 @@ export function deliveryRequestId(missionId: string, taskId: string): string {
   return `TDR_${digest(`telegram_delivery:${missionId}:${taskId}`).slice(0, 24)}`;
 }
 
+/** R2.3/R3 — request-owned staging namespace for digest-pinned wire
+ *  snapshots: hidden so artifact-name resolution never confuses a
+ *  staged copy for a manifested sibling. */
+export const DELIVERY_SNAPSHOT_DIR = ".delivery-snapshots";
+
+/** Deterministic snapshot path shared by projection, transport, and
+ *  retention cleanup — same name every pass. */
+function deliverySnapshotPath(
+  outboxDir: string,
+  deliveryId: string,
+  name: string,
+): string {
+  return path.join(
+    outboxDir,
+    DELIVERY_SNAPSHOT_DIR,
+    `${deliveryId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
+  );
+}
+
+const TERMINAL_DELIVERY_SLOT = new Set(["SENT", "FAILED_DELIVERY"]);
+const TERMINAL_DELIVERY_REQUEST = new Set([
+  "SENT",
+  "FAILED_DELIVERY",
+  "UNSENDABLE",
+]);
+
+/** R3 — bounded snapshot retention. A pinned snapshot exists only
+ *  while its slot's fate is open (QUEUED retry, in-flight SENDING,
+ *  UNKNOWN_SIDE_EFFECT investigation — the bytes are the evidence of
+ *  what may/must still ship). Once a slot is SENT/FAILED_DELIVERY, or
+ *  the whole request lands terminal, the durable identity evidence is
+ *  the slot's sha256 itself and the staged bytes are removed on the
+ *  next projection pass — no unbounded hidden-file accumulation over
+ *  long-running production. Best-effort: a vanished file is no error. */
+function pruneDeliverySnapshots(req: Record<string, unknown>): void {
+  const outbox = req.outbox_dir;
+  if (typeof outbox !== "string" || !outbox) return;
+  const id = String(req.delivery_id);
+  const requestTerminal = TERMINAL_DELIVERY_REQUEST.has(String(req.status));
+  const artifacts = req.artifacts as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(artifacts)) {
+    for (const a of artifacts) {
+      if (!requestTerminal && !TERMINAL_DELIVERY_SLOT.has(String(a.state))) {
+        continue;
+      }
+      try {
+        fs.rmSync(deliverySnapshotPath(outbox, id, String(a.name)), {
+          force: true,
+        });
+      } catch {
+        /* best effort — a missing snapshot is already pruned */
+      }
+    }
+  }
+  const dir = path.join(outbox, DELIVERY_SNAPSHOT_DIR);
+  try {
+    if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
+      fs.rmdirSync(dir);
+    }
+  } catch {
+    /* best effort */
+  }
+}
+
 /** R3 §3 — bind the one canonical destination. */
 export function resolveDeliveryDestination(
   mission: Record<string, unknown>,
@@ -744,6 +808,15 @@ export function pendingTelegramDeliveries(
   reconcileStaleDeliveryAttempts(store, ts, staleAfterMs);
   const out: Array<Record<string, unknown>> = [];
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
+    // R3 — bounded snapshot retention: a pinned snapshot is transport
+    // staging only while its slot's fate is open (QUEUED retry,
+    // in-flight SENDING, UNKNOWN_SIDE_EFFECT investigation — the bytes
+    // are the evidence of what may/must still ship). Once a slot lands
+    // SENT/FAILED_DELIVERY, or the whole request lands terminal
+    // (SENT/FAILED_DELIVERY/UNSENDABLE), the durable identity evidence
+    // is the slot's sha256 itself and the staged bytes are removed on
+    // this projection pass — no unbounded hidden-file accumulation.
+    pruneDeliverySnapshots(req);
     if (String(req.status) !== "QUEUED") continue;
     if (req.mode === "TEXT") {
       const probe = { ...req } as Record<string, unknown>;
@@ -825,20 +898,29 @@ export function pendingTelegramDeliveries(
       // R2.3 — pin the verified bytes: the wire artifact must be the
       // exact digest-authorized content, not whatever the workspace
       // path holds at send time (TOCTOU between projection and send).
-      // Copy the verified bytes into a request-owned snapshot and
+      // Write the verified bytes into a request-owned snapshot and
       // project THAT path; the snapshot lives in a dedicated hidden
       // subdir so artifact-name resolution never confuses it for a
-      // manifested sibling, and it remains as durable evidence of the
-      // exact bytes that were authorized for transport.
-      const snapDir = path.join(String(req.outbox_dir), ".delivery-snapshots");
-      const snapPath = path.join(
-        snapDir,
-        `${String(req.delivery_id)}-${String(a.name)}`.replace(/[^A-Za-z0-9._-]/g, "_"),
+      // manifested sibling. R3 — durability: the staged file data is
+      // fsynced before the atomic rename so a crash cannot leave a
+      // half-written snapshot masquerading as the authorized bytes.
+      const snapDir = path.join(String(req.outbox_dir), DELIVERY_SNAPSHOT_DIR);
+      const snapPath = deliverySnapshotPath(
+        String(req.outbox_dir),
+        String(req.delivery_id),
+        String(a.name),
       );
       try {
         fs.mkdirSync(snapDir, { recursive: true });
         const tmp = `${snapPath}.tmp`;
-        fs.copyFileSync(p, tmp);
+        const bytes = fs.readFileSync(p);
+        const fd = fs.openSync(tmp, "w");
+        try {
+          fs.writeSync(fd, bytes);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
         fs.renameSync(tmp, snapPath);
         if (sha256File(snapPath) !== a.sha256) throw new Error("snapshot_digest_mismatch");
       } catch {

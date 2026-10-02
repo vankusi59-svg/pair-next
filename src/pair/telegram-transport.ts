@@ -19,18 +19,26 @@
  *    FAILED_DELIVERY past the ceiling); ambiguous (thrown, unknown
  *    acceptance, or `ok` WITHOUT message_id) → UNKNOWN_SIDE_EFFECT —
  *    never auto-resend, never claimed SENT (R4 §2).
- *  - FILES means ARTIFACT transport (R2.3): every manifested artifact —
- *    including .txt/.md — is sent as the digest-pinned file (document/
- *    photo upload), never re-read, trimmed, truncated, or converted to
- *    message text. The path projected by pendingTelegramDeliveries is
- *    a request-owned snapshot of the digest-verified bytes; this module
- *    re-verifies that exact path's digest immediately before claiming
- *    the attempt, so the bytes entering the network call are provably
- *    the bytes whose sha256 was authorized (no TOCTOU, no transform).
+ *  - FILES means ARTIFACT transport (R2.3/R3): every manifested
+ *    artifact — including .txt/.md — is sent as the digest-pinned file
+ *    (document/photo upload), never trimmed, truncated, or converted
+ *    to message text. The path projected by pendingTelegramDeliveries
+ *    is a request-owned snapshot; this module reads it ONCE into a
+ *    bounded byte buffer, hashes THAT buffer, and hands the same
+ *    verified bytes to the sender (`fileBytes`) — the uploader never
+ *    re-reads the path after verification, so
+ *    `sha256(network bytes) === TDR slot sha256` holds at the exact
+ *    point of transmission (no TOCTOU, no transform).
  */
 
-import { digest, sha256File } from "./canonical.js";
+import fs from "node:fs";
+import { digest, sha256Hex } from "./canonical.js";
 import { SHA256_HEX_RE } from "./telegram-delivery.js";
+
+/** R3 — bounded byte materialization: the Telegram Bot API caps bot
+ *  uploads at ~50MB; a pinned artifact beyond this bound can never
+ *  send, so it is skipped before any attempt is claimed. */
+export const MAX_TELEGRAM_FILE_BYTES = 48 * 1024 * 1024;
 
 export type GovernedSendResult =
   | { kind: "ok"; message_id?: string | number }
@@ -44,7 +52,14 @@ export interface GovernedTelegramTransport {
   send(args: {
     chatId: string;
     text?: string;
+    /** Informational only — filename/path evidence. When `fileBytes`
+     *  is present the sender MUST NOT re-read this path: the verified
+     *  buffer is the network payload. */
     filePath?: string;
+    /** R3 — the digest-verified immutable payload: the exact bytes
+     *  whose sha256 was authorized. The uploader builds its network
+     *  body from THIS buffer — never a second filesystem read. */
+    fileBytes?: Uint8Array;
     name?: string;
   }): Promise<GovernedSendResult>;
 }
@@ -169,6 +184,7 @@ export async function transportTelegramDelivery(args: {
   const send = async (a: {
     text?: string;
     filePath?: string;
+    fileBytes?: Uint8Array;
     name?: string;
   }): Promise<GovernedSendResult> => {
     try {
@@ -237,24 +253,35 @@ export async function transportTelegramDelivery(args: {
     if (String(art.state) !== "QUEUED" || !art.path) continue;
     const name = String(art.name);
     const fp = String(art.path);
-    // R2.3 — the slot's authorized sha256 must still match the pinned
-    // path bytes BEFORE any attempt is claimed: a diverging/tampered
-    // snapshot never reaches begin or the network (the next projection
-    // re-verifies the source and converges the slot deterministically).
+    // R3 — HASHED BYTES === CLAIMED BYTES === NETWORK BYTES: the pinned
+    // snapshot is read ONCE into a bounded buffer, the slot's
+    // authorized sha256 is verified against THAT buffer, and the same
+    // verified bytes are handed to the sender. There is no filesystem
+    // read between verification and payload construction — a mutation
+    // landing after the read cannot alter what is transmitted (the
+    // next projection re-verifies the source and converges the slot).
     const wantSha = String(art.sha256 ?? "");
-    let actualSha: string | null = null;
+    let bytes: Buffer | null = null;
     try {
-      actualSha = sha256File(fp);
+      const b = fs.readFileSync(fp);
+      bytes = b.length <= MAX_TELEGRAM_FILE_BYTES ? b : null;
     } catch {
-      actualSha = null;
+      bytes = null;
     }
-    if (!SHA256_HEX_RE.test(wantSha) || actualSha !== wantSha) continue;
+    if (
+      bytes === null ||
+      !SHA256_HEX_RE.test(wantSha) ||
+      sha256Hex(bytes) !== wantSha
+    ) {
+      continue;
+    }
     // R7 — exclusive acquire required before any network call.
     const acq = await args.backend.begin(name);
     if (!acq || acq.acquired !== true) continue;
     // FILES = artifact transport: the digest-pinned file itself, never
-    // a trimmed/truncated text conversion (R2.3).
-    const r = await send({ filePath: fp, name });
+    // a trimmed/truncated text conversion (R2.3). `fileBytes` is the
+    // exact verified buffer — the uploader never re-reads filePath.
+    const r = await send({ filePath: fp, fileBytes: bytes, name });
     if (await resolve(name, r)) sent.push(name);
   }
   return { sent, held: false };

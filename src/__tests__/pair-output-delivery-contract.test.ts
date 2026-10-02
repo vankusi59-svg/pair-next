@@ -62,6 +62,7 @@ import {
   pendingTelegramDeliveries,
   reconcilePlanDataflow,
   sha256File,
+  sha256Hex,
   transportTelegramDelivery,
   utcnow,
   verifyOutputLanguageContent,
@@ -399,6 +400,7 @@ interface SendCall {
   chatId: string;
   text?: string;
   filePath?: string;
+  fileBytes?: Uint8Array;
   name?: string;
 }
 
@@ -704,13 +706,13 @@ describe("C — exact production goal, FILES mode end-to-end", () => {
     expect(rec.calls).toHaveLength(1);
     const call = rec.calls[0];
     expect(call.name).toBe("report.txt");
-    // R2.3 — FILES is artifact transport: the wire payload is the
+    // R2.3/R3 — FILES is artifact transport: the wire payload is the
     // digest-pinned FILE itself (document upload), never text — and
-    // its bytes hash to the TDR slot digest.
+    // the bytes handed to the uploader hash to the TDR slot digest.
     expect(call.text).toBeUndefined();
-    expect(typeof call.filePath).toBe("string");
-    expect(sha256File(String(call.filePath))).toBe(String(arts[0].sha256));
-    expect(fs.readFileSync(String(call.filePath), "utf8")).toContain(VI_REPORT);
+    expect(call.fileBytes).toBeTruthy();
+    expect(sha256Hex(Buffer.from(call.fileBytes!))).toBe(String(arts[0].sha256));
+    expect(Buffer.from(call.fileBytes!).toString("utf8")).toContain(VI_REPORT);
     const again = await runTransport(ctx);
     expect(again.sent).toEqual([]);
     void adapter;
@@ -1660,10 +1662,11 @@ describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
     const call = rec.calls[0];
     expect(call.text).toBeUndefined();
     expect(call.filePath).toBeTruthy();
-    const wireBytes = fs.readFileSync(String(call.filePath));
-    // Leading/trailing whitespace preserved — byte-identical artifact.
-    expect(wireBytes.toString("utf8")).toBe(content);
-    expect(sha256File(String(call.filePath))).toBe(
+    // R3 — the uploader receives the verified BYTES, not a path to
+    // re-read: leading/trailing whitespace preserved, byte-identical.
+    expect(call.fileBytes).toBeTruthy();
+    expect(Buffer.from(call.fileBytes!).toString("utf8")).toBe(content);
+    expect(sha256Hex(Buffer.from(call.fileBytes!))).toBe(
       String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
     );
   });
@@ -1675,7 +1678,7 @@ describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
     const rec = recordingTransport();
     const { sent } = await runTransport(ctx, { transport: rec.transport });
     expect(sent).toEqual(["report.txt"]);
-    const wire = fs.readFileSync(String(rec.calls[0].filePath), "utf8");
+    const wire = Buffer.from(rec.calls[0].fileBytes!).toString("utf8");
     expect(wire).toBe(content);
     expect(wire.length).toBe(content.length);
   });
@@ -1697,9 +1700,9 @@ describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
       backend: storeBackend(ctx, projected[0]),
     });
     expect(r.sent).toEqual(["report.txt"]);
-    const wire = fs.readFileSync(String(rec.calls[0].filePath), "utf8");
+    const wire = Buffer.from(rec.calls[0].fileBytes!).toString("utf8");
     expect(wire).toBe(VI_REPORT); // the pinned snapshot, not the mutation
-    expect(sha256File(String(rec.calls[0].filePath))).toBe(
+    expect(sha256Hex(Buffer.from(rec.calls[0].fileBytes!))).toBe(
       String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
     );
   });
@@ -1734,7 +1737,7 @@ describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
     const rec2 = recordingTransport();
     const { sent } = await runTransport(ctx, { transport: rec2.transport });
     expect(sent).toEqual(["report.txt"]);
-    expect(fs.readFileSync(String(rec2.calls[0].filePath), "utf8")).toBe(VI_REPORT);
+    expect(Buffer.from(rec2.calls[0].fileBytes!).toString("utf8")).toBe(VI_REPORT);
   });
 
   it("W5. binary artifacts still transport as documents — lifecycle unchanged", async () => {
@@ -1769,8 +1772,114 @@ describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
     expect(sent).toEqual(["chart.png"]);
     const call = rec.calls[0];
     expect(call.filePath).toBeTruthy();
-    expect(fs.readFileSync(String(call.filePath))).toEqual(png);
+    expect(Buffer.from(call.fileBytes!)).toEqual(png);
     const req = ctx.store.list("telegram_delivery_request")[0];
     expect(req.status).toBe("SENT");
+  });
+});
+
+describe("R3 — hashed bytes ARE the network bytes (post-verification TOCTOU closed)", () => {
+  const mintFiles2 = (
+    ctx: ReturnType<typeof makeCtx>,
+    file: string,
+    content: string | Buffer,
+  ) => {
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const fp = path.join(outbox, file);
+    fs.writeFileSync(fp, content);
+    const sha = sha256File(fp);
+    return mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_R3", metadata: {} },
+      task: {
+        task_id: "T_R3",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true,
+            mode: "FILES",
+            artifacts: [file],
+          },
+        },
+      },
+      execution: { execution_id: "E_R3" },
+      outboxDir: outbox,
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { [file]: sha },
+    }) as Record<string, unknown>;
+  };
+
+  it("X1. ADVERSARIAL: snapshot mutated AFTER byte materialization+verify — wire bytes are still the authorized original", async () => {
+    const ctx = makeCtx("r3-x1");
+    const req = mintFiles2(ctx, "report.txt", VI_REPORT);
+    const projected = pendingTelegramDeliveries(ctx.store);
+    expect(projected).toHaveLength(1);
+    const snapPath = String(
+      (projected[0].artifacts as Array<Record<string, unknown>>)[0].path,
+    );
+    // The mutation lands in the exact remaining window — AFTER the
+    // transport's read+digest verification, inside the claim itself.
+    // With R3 the sender holds the verified BUFFER, so bytes B on disk
+    // can never replace bytes A on the wire.
+    const inner = storeBackend(ctx, projected[0]);
+    const backend: DeliveryBackend = {
+      ...inner,
+      begin: (a: string | null) => {
+        fs.writeFileSync(snapPath, "MUTATED BETWEEN VERIFY AND SEND");
+        return inner.begin(a);
+      },
+    };
+    const rec = recordingTransport();
+    const r = await transportTelegramDelivery({
+      request: projected[0],
+      transport: rec.transport,
+      isAllowed: () => true,
+      backend,
+    });
+    expect(r.sent).toEqual(["report.txt"]);
+    const call = rec.calls[0];
+    // F/G — the captured upload bytes are the authorized original and
+    // hash to the TDR slot digest.
+    expect(call.fileBytes).toBeTruthy();
+    expect(Buffer.from(call.fileBytes!).toString("utf8")).toBe(VI_REPORT);
+    expect(sha256Hex(Buffer.from(call.fileBytes!))).toBe(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    );
+  });
+
+  it("X2. .md stays a file/document — digest-verified bytes, never text", async () => {
+    const ctx = makeCtx("r3-x2");
+    const md = "# Báo cáo\n\n- điểm 1\n- điểm 2\n";
+    mintFiles2(ctx, "report.md", md);
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["report.md"]);
+    const call = rec.calls[0];
+    expect(call.text).toBeUndefined();
+    expect(call.filePath).toBeTruthy();
+    expect(Buffer.from(call.fileBytes!).toString("utf8")).toBe(md);
+  });
+
+  it("X3. retention: a SENT slot's snapshot is pruned on the next projection pass", async () => {
+    const ctx = makeCtx("r3-x3");
+    mintFiles2(ctx, "report.txt", VI_REPORT);
+    const projected = pendingTelegramDeliveries(ctx.store);
+    const snapPath = String(
+      (projected[0].artifacts as Array<Record<string, unknown>>)[0].path,
+    );
+    expect(fs.existsSync(snapPath)).toBe(true);
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport });
+    // Terminal (SENT) → the staged bytes are removed; the slot sha256
+    // remains the durable identity evidence.
+    pendingTelegramDeliveries(ctx.store);
+    expect(fs.existsSync(snapPath)).toBe(false);
+    const req = ctx.store.list("telegram_delivery_request")[0];
+    expect(req.status).toBe("SENT");
+    expect(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    ).toMatch(/^[0-9a-f]{64}$/i);
   });
 });

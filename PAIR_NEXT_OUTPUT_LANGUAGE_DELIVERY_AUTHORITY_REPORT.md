@@ -514,3 +514,123 @@ Classification:
 `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R2_PENDING_REAUDIT`
 
 STOP. DO NOT MERGE. Await independent re-audit.
+
+---
+
+# INDEPENDENT RE-AUDIT R3 REMEDIATION
+
+- **Previous audited HEAD:** `cd100c4468bfc8126b421b6121d759e99304ce3c`
+- **New HEAD:** see git log (this section committed on the same PR #30)
+- **Scope:** one final TOCTOU — bind the authorized digest to the actual
+  network-upload bytes; snapshot durability claim + retention policy.
+  All R2/R1 invariants preserved.
+
+## R3 — RCA and exact byte-materialization design
+
+**RCA.** R2.3 verified `sha256File(snapshot)` before the attempt claim,
+but the governed uploader (`sendFile`) then performed a SECOND
+`fs.readFileSync(filePath)` to build the FormData payload. A mutation
+landing between verification and that read could alter the bytes
+Telegram actually received — the claim
+`sha256(network bytes) === TDR slot sha256` was not yet guaranteed.
+
+**Design — HASHED BYTES === CLAIMED BYTES === NETWORK BYTES:**
+
+1. `transportTelegramDelivery()` reads the projected snapshot ONCE into
+   a bounded buffer (`MAX_TELEGRAM_FILE_BYTES = 48MB`, under the
+   Telegram Bot ~50MB upload cap — an oversized pin can never send, so
+   it is skipped before any claim).
+2. `sha256Hex(buffer) === art.sha256` is required BEFORE
+   `backend.begin()` — mismatch/malformed → `continue`, no claim, zero
+   network calls.
+3. Only after the buffer verifies may the attempt be claimed
+   (exclusive `begin()` semantics unchanged).
+4. The SAME verified buffer is passed to the sender as `fileBytes`
+   (`GovernedTelegramTransport.send` signature extended);
+   `filePath`/`name` remain filename/path evidence only.
+5. Bridge `governedSend` → `sendFile(chatId, filePath, fileBytes, name)`
+   builds `new Blob([fileBytes])` — the uploader NEVER re-reads
+   `filePath`. A file send arriving without `fileBytes` fails closed
+   (`FAIL_CLOSED_TELEGRAM_FILE_BYTES_MISSING`, definite failure — no
+   bytes touched the network).
+6. `name` (the manifested artifact's canonical filename) now supplies
+   the upload filename — the snapshot's internal staging name no
+   longer leaks to Telegram.
+
+There is no filesystem read between final digest verification and
+network payload construction. No base64 re-encoding; one byte
+representation is hashed and transmitted.
+
+## Adversarial post-verification proof (X1)
+
+- Snapshot holds authorized bytes A → transport reads+hashes A
+- inside `backend.begin()` the adversary overwrites the snapshot
+  path with bytes B
+- sender invoked → captured `fileBytes` are still A and
+  `sha256Hex(fileBytes) === slot sha256`
+- (the same test under the pre-R3 read-at-upload design would have
+  shipped B — the regression catches exactly the removed window)
+
+## Snapshot durability + retention semantics
+
+- **Durability:** staged snapshot writes are
+  `openSync → writeSync → fsyncSync → closeSync → renameSync` — the
+  report's `tmp → fsync → rename` claim now matches the code. A crash
+  cannot leave a half-written snapshot masquerading as authorized
+  bytes (any partial `.tmp` is ignored; re-hash post-rename).
+- **Retention:** snapshots are transport staging, NOT permanent
+  evidence — the durable identity evidence is the slot's `sha256`
+  itself. `pruneDeliverySnapshots()` runs inside every
+  `pendingTelegramDeliveries()` pass: snapshots of SENT/FAILED_DELIVERY
+  slots — and every snapshot of a terminal request
+  (SENT/FAILED_DELIVERY/UNSENDABLE) — are removed deterministically;
+  the `.delivery-snapshots` dir is dropped when empty. QUEUED /
+  in-flight SENDING / UNKNOWN_SIDE_EFFECT slots KEEP their snapshot
+  (the pinned bytes are the evidence of what may/must still ship;
+  UNKNOWN semantics and retry behavior are untouched). Bound: at most
+  the artifacts of non-terminal deliveries occupy the namespace —
+  no unbounded hidden-file accumulation.
+
+## R3 changed files
+
+- `src/pair/telegram-transport.ts` — one-read bounded materialization +
+  `sha256Hex(buffer)` verify + `fileBytes` passthrough + 48MB bound;
+  `filePath` demoted to evidence.
+- `scripts/telegram-bridge.mjs` — `sendFile` builds FormData from
+  verified `fileBytes` (no `readFileSync`); missing bytes →
+  `FAIL_CLOSED_TELEGRAM_FILE_BYTES_MISSING`; upload filename = manifest
+  name.
+- `src/pair/telegram-delivery.ts` — fsynced snapshot writes,
+  `DELIVERY_SNAPSHOT_DIR`/`deliverySnapshotPath` helper,
+  `pruneDeliverySnapshots` retention in the projection pass.
+- `src/__tests__/pair-output-delivery-contract.test.ts` — `SendCall`
+  gains `fileBytes`; W1–W5/C1 assert on wire bytes; +3 R3 tests
+  (X1 adversarial post-verify mutation, X2 `.md` file transport,
+  X3 SENT-slot snapshot pruning).
+
+## R3 test results
+
+- New R3 focused tests: **3/3** (X1–X3).
+- `pair-output-delivery-contract`: **57 passed**
+- `pair-planner-dataflow-incident`: **106 passed**
+- `pair-ops-telegram-delivery`: **3 passed**
+- Full suite: **2799 passed / 2 failed / 15 skipped** (94 files) — the 2
+  failures are the unchanged env-only `pair-p5` tests 2+3
+  (`stockProbe.available===false` expected; this VM has the binaries).
+- `tsc --noEmit`: clean. `pnpm build`: clean.
+
+## R3 zero-network proofs
+
+- X1: post-verification mutation still ships authorized bytes A —
+  `fileBytes` hash == slot sha256.
+- W4 (preserved): pre-materialization tamper → 0 calls, heal path
+  re-pins and sends exactly once.
+- Missing/malformed digest → `continue` before `begin` — 0 calls
+  (R1.2/R2.1 matrices preserved).
+- `begin` exclusivity, definite-failure retry, timeout →
+  UNKNOWN_SIDE_EFFECT, and duplicate-poll dedup unchanged.
+
+Classification:
+`PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R3_PENDING_REAUDIT`
+
+STOP. DO NOT MERGE. Await independent re-audit.
