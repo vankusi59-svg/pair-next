@@ -28,8 +28,9 @@
  * no task is silently reset and nothing is re-dispatched twice.
  */
 
+import fs from "node:fs";
 import { IntegrityError, PairError, PolicyError } from "./errors.js";
-import { newId, utcnow } from "./canonical.js";
+import { newId, sha256File, utcnow } from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 import type { GovernedTaskGate } from "./gate.js";
 import type { MissionRouter } from "./mission-router.js";
@@ -46,10 +47,20 @@ import { classifyFailure } from "./recovery-controller.js";
 import {
   assertPlanDataflow,
   assertTaskDeliverySemantic,
+  deliveryManifest,
   detectTelegramDeliveryIntent,
   missingConsumedArtifact,
 } from "./plan-dataflow.js";
-import { mintTelegramDeliveryRequest } from "./telegram-delivery.js";
+import {
+  mintTelegramDeliveryRequest,
+  resolveDeliveryArtifactPath,
+} from "./telegram-delivery.js";
+import {
+  DELIVERY_TEXT_ARTIFACT,
+  detectOutputLanguage,
+  isTextDeliverableName,
+  verifyOutputLanguageContent,
+} from "./output-language.js";
 import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
@@ -344,6 +355,13 @@ export class MissionRuntime {
     mission: Record<string, unknown>,
     task: Record<string, unknown>,
   ): Record<string, unknown> {
+    // Canonical artifact identity is pinned at every dispatch seam that
+    // reaches requestFor (initial, retry, re-route): the bytes the
+    // delivery-prep task saw at dispatch are what the settle-time gate
+    // compares against — a prep task that clobbers the manifested
+    // artifact fails closed. Idempotent: once pinned, the first pin
+    // stands for this task's lifetime (a replan mints fresh tasks).
+    this.pinDeliveryArtifactDigests(mission, task);
     const md = (mission.metadata as Record<string, unknown>) ?? {};
     const tmd = (task.metadata as Record<string, unknown>) ?? {};
     const workspace = String(
@@ -368,6 +386,199 @@ export class MissionRuntime {
       dependency_outputs: this.dependencyOutputs(String(mission.mission_id), task),
       correlation_id: `${mission.mission_id}:${task.task_id}`,
     };
+  }
+
+  /** FILES-mode artifact identity pinning — durable runtime evidence on
+   *  task.metadata.pair_delivery_artifact_digests (manifest name →
+   *  resolved path + SHA-256 at first dispatch). Pin-once: later
+   *  requestFor calls keep the original pin so a prep task's mutation
+   *  cannot re-baseline itself. */
+  private pinDeliveryArtifactDigests(
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+  ): void {
+    const caps = (task.required_capabilities as string[]) ?? [];
+    if (!caps.includes("TELEGRAM_DELIVERY")) return;
+    const manifest = deliveryManifest(task);
+    if (!manifest || manifest.mode !== "FILES" || !manifest.artifacts.length) {
+      return;
+    }
+    const md = (task.metadata as Record<string, unknown>) ?? {};
+    if (md.pair_delivery_artifact_digests !== undefined) return;
+    const project = this.deps.service.getProject(String(mission.project_id));
+    const outboxDir = `${String(project.root_location)}/outbox`;
+    const workspace = String(
+      md.workspace ??
+        ((mission.metadata as Record<string, unknown>)
+          ?.authorized_workspaces as string[])?.[0] ??
+        String(project.root_location),
+    );
+    const digests: Record<string, { path: string | null; sha256: string | null }> = {};
+    for (const name of manifest.artifacts) {
+      const p = resolveDeliveryArtifactPath({ outboxDir, workspace, name });
+      let sha: string | null = null;
+      if (p) {
+        try {
+          sha = sha256File(p);
+        } catch {
+          sha = null;
+        }
+      }
+      digests[name] = { path: p, sha256: sha };
+    }
+    this.deps.service.updateTask(String(task.task_id), {
+      metadata: { ...md, pair_delivery_artifact_digests: digests },
+    });
+  }
+
+  /**
+   * The output/delivery contract gate — runs BETWEEN result validation
+   * and the TELEGRAM_DELIVERY success mark, strictly before any
+   * telegram_delivery_request (external send authority) is minted.
+   *
+   *   FILES: every manifested artifact must resolve and be byte-identical
+   *   to the identity pinned at dispatch (`pair_delivery_artifact_digests`)
+   *   — a missing, fabricated, or mutated artifact fails closed. Textual
+   *   manifested deliverables additionally satisfy the canonical output
+   *   language (re-derived from the mission goal — never from task
+   *   metadata the executor could have written).
+   *   TEXT: the canonical payload artifact (outbox/report.txt) must
+   *   exist and satisfy the canonical language — the executor's "DONE"
+   *   is never the deliverable.
+   *
+   * Violation → { ok:false, violation } → task FAILED + governed
+   * recovery (ARTIFACT_VALIDATION_FAILURE), zero transport.
+   */
+  private assertDeliveryDeliverable(
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+  ):
+    | { ok: true; digests: Record<string, string> }
+    | { ok: false; violation: Record<string, unknown> } {
+    const manifest = deliveryManifest(task);
+    if (!manifest) return { ok: true, digests: {} };
+    const md = (task.metadata as Record<string, unknown>) ?? {};
+    const project = this.deps.service.getProject(String(mission.project_id));
+    const outboxDir = `${String(project.root_location)}/outbox`;
+    const workspace = String(
+      md.workspace ??
+        ((mission.metadata as Record<string, unknown>)
+          ?.authorized_workspaces as string[])?.[0] ??
+        String(project.root_location),
+    );
+    // Language authority is re-derived from the effective operator goal —
+    // a stamped metadata value can be tampered with, the goal cannot.
+    const expectedLanguage =
+      detectOutputLanguage(mission.goal).code ?? null;
+    const readBounded = (p: string): string => {
+      const fd = fs.openSync(p, "r");
+      try {
+        const buf = Buffer.alloc(256 * 1024);
+        const n = fs.readSync(fd, buf, 0, buf.length, 0);
+        return buf.subarray(0, n).toString("utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+    };
+    const languageViolation = (
+      artifact: string,
+      text: string,
+    ): Record<string, unknown> | null => {
+      const v = verifyOutputLanguageContent(text, expectedLanguage);
+      if (v.ok) return null;
+      return {
+        code: "FAIL_CLOSED_OUTPUT_LANGUAGE_MISMATCH",
+        artifact,
+        expected_language: v.expected,
+        detected_language: v.detected,
+      };
+    };
+    if (manifest.mode === "TEXT") {
+      const p = resolveDeliveryArtifactPath({
+        outboxDir,
+        workspace,
+        name: DELIVERY_TEXT_ARTIFACT,
+      });
+      if (!p) {
+        return {
+          ok: false,
+          violation: {
+            code: "FAIL_CLOSED_DELIVERY_TEXT_PAYLOAD_MISSING",
+            artifact: DELIVERY_TEXT_ARTIFACT,
+          },
+        };
+      }
+      let content = "";
+      try {
+        content = readBounded(p);
+      } catch {
+        return {
+          ok: false,
+          violation: {
+            code: "FAIL_CLOSED_DELIVERY_TEXT_PAYLOAD_MISSING",
+            artifact: DELIVERY_TEXT_ARTIFACT,
+          },
+        };
+      }
+      const bad = languageViolation(DELIVERY_TEXT_ARTIFACT, content);
+      if (bad) return { ok: false, violation: bad };
+      return { ok: true, digests: {} };
+    }
+    // FILES
+    const pinned = md.pair_delivery_artifact_digests as
+      | Record<string, { sha256?: string | null }>
+      | undefined;
+    const digests: Record<string, string> = {};
+    for (const name of manifest.artifacts) {
+      const p = resolveDeliveryArtifactPath({ outboxDir, workspace, name });
+      if (!p) {
+        return {
+          ok: false,
+          violation: {
+            code: "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED",
+            artifact: name,
+          },
+        };
+      }
+      let sha: string;
+      try {
+        sha = sha256File(p);
+      } catch {
+        return {
+          ok: false,
+          violation: {
+            code: "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED",
+            artifact: name,
+          },
+        };
+      }
+      if (pinned !== undefined) {
+        const before = pinned[name];
+        if (!before?.sha256 || before.sha256 !== sha) {
+          return {
+            ok: false,
+            violation: {
+              code: "FAIL_CLOSED_DELIVERY_ARTIFACT_MUTATED",
+              artifact: name,
+              expected_sha256: before?.sha256 ?? null,
+              actual_sha256: sha,
+            },
+          };
+        }
+      }
+      digests[name] = sha;
+      if (expectedLanguage && isTextDeliverableName(name)) {
+        let content = "";
+        try {
+          content = readBounded(p);
+        } catch {
+          content = "";
+        }
+        const bad = languageViolation(name, content);
+        if (bad) return { ok: false, violation: bad };
+      }
+    }
+    return { ok: true, digests };
   }
 
   /** Governed dependency handoff: completed dep executions' canonical results. */
@@ -550,6 +761,7 @@ export class MissionRuntime {
     // only delivery authority.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
       telegramIntent: detectTelegramDeliveryIntent(mission.goal),
+      outputLanguage: detectOutputLanguage(mission.goal),
     });
     this.deps.service.commitPlan({
       mission_id: missionId,
@@ -768,6 +980,40 @@ export class MissionRuntime {
     if (state === "COMPLETED") {
       const validation = this.deps.gate.validate_execution_result(executionId);
       if (String(validation.status) === "PASS") {
+        const settledTask = this.store.get("task", taskId);
+        const caps = (settledTask.required_capabilities as string[]) ?? [];
+        let artifactSha256: Record<string, string> | undefined;
+        if (caps.includes("TELEGRAM_DELIVERY")) {
+          // Output/delivery contract gate — strictly BEFORE the success
+          // mark, i.e. before any telegram_delivery_request (external
+          // send authority) may be minted. FILES: every manifested
+          // artifact must resolve to exactly the bytes pinned at
+          // dispatch; TEXT: the canonical payload artifact must exist.
+          // The canonical output language (re-derived from the mission
+          // goal — never the stamp) must be satisfied by the
+          // operator-facing text. Any violation: task FAILED + durable
+          // evidence + governed recovery, zero send authority.
+          const check = this.assertDeliveryDeliverable(
+            this.deps.service.getMission(missionId),
+            settledTask,
+          );
+          if (!check.ok) {
+            this.store.appendEvidence(
+              missionId,
+              "DELIVERY_CONTRACT_VIOLATED",
+              check.violation,
+            );
+            this.deps.service.updateTask(taskId, { status: "FAILED" });
+            this.startRecovery(
+              missionId,
+              taskId,
+              executionId,
+              "ARTIFACT_VALIDATION_FAILURE",
+            );
+            return;
+          }
+          artifactSha256 = check.digests;
+        }
         this.deps.service.updateTask(taskId, {
           status: "COMPLETED",
           completed_at: utcnow(),
@@ -784,8 +1030,6 @@ export class MissionRuntime {
         // for a task carrying the governed TELEGRAM_DELIVERY capability
         // AND the PAIR-stamped manifest. Everything else — file presence,
         // outbox contents, mission completion — authorizes nothing.
-        const settledTask = this.store.get("task", taskId);
-        const caps = (settledTask.required_capabilities as string[]) ?? [];
         if (caps.includes("TELEGRAM_DELIVERY")) {
           const mission = this.deps.service.getMission(missionId);
           const project = this.deps.service.getProject(
@@ -808,6 +1052,7 @@ export class MissionRuntime {
             now: utcnow(),
             defaultChatId: this.deps.telegramDeliveryDefaultChatId,
             maxAttempts: this.deps.telegramDeliveryMaxAttempts,
+            artifactSha256,
           });
         }
         return;
@@ -2429,6 +2674,7 @@ export class MissionRuntime {
     // instruction hygiene against the operator request).
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
       telegramIntent: detectTelegramDeliveryIntent(mission.goal),
+      outputLanguage: detectOutputLanguage(mission.goal),
     });
     // Old revision stays immutable; unfinished old tasks are settled as
     // CANCELLED (never silently reset), pending approvals/timers superseded.

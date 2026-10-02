@@ -90,6 +90,7 @@ import {
   validatePlanProposal,
   reconcilePlanDataflow,
   detectTelegramDeliveryIntent,
+  detectOutputLanguage,
   CANONICAL_BOOKKEEPING_INSTRUCTION,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
@@ -343,6 +344,7 @@ const canonicalizeLlmTasks = (rawTasks, goal) => {
   // canonical intent says the goal asked for it (R2 §2).
   reconcilePlanDataflow(tasks, {
     telegramIntent: detectTelegramDeliveryIntent(String(goal ?? "")),
+    outputLanguage: detectOutputLanguage(String(goal ?? "")),
   });
   return tasks;
 };

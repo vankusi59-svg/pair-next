@@ -1197,7 +1197,9 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
     ]);
-    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "COMPLETE" };
+    // TEXT mode's canonical payload is the composed report artifact —
+    // T3 must write outbox/report.txt per its delivery instruction.
+    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "WRITE" };
     registerAdapter(ctx, adapter);
     const plan = reconcilePlanDataflow(
       [
@@ -1426,7 +1428,14 @@ const startDeliveryMission = async (
   const adapter = opts.adapter ?? new ScriptedAdapter("EX_A", [
     "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
   ]);
-  adapter.behavior = { T1: "COMPLETE", T2: "WRITE", T3: "COMPLETE" };
+  adapter.behavior = {
+    T1: "COMPLETE",
+    T2: "WRITE",
+    // TEXT mode's canonical payload IS the composed report artifact —
+    // the delivery task must write it (the TDR carries that file's
+    // content, never a "done" acknowledgement).
+    T3: intent.mode === "TEXT" ? "WRITE" : "COMPLETE",
+  };
   registerAdapter(ctx, adapter);
   const planTasks =
     intent.mode === "TEXT"

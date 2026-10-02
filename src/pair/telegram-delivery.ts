@@ -55,8 +55,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalJson, digest } from "./canonical.js";
+import { digest, sha256File } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { DELIVERY_TEXT_ARTIFACT } from "./output-language.js";
 import { deliveryManifest, normalizeArtifactPath } from "./plan-dataflow.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -104,6 +105,11 @@ export interface DeliverySlot {
   completed_at?: string;
   last_error?: string;
   unknown_reason?: string;
+  /** FILES only: canonical artifact identity (SHA-256 of the exact bytes
+   *  verified at the delivery-contract gate). The bridge-side projection
+   *  re-verifies it — a file mutated after minting fails closed with
+   *  FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST, zero network call. */
+  sha256?: string;
 }
 
 export interface TelegramDeliveryRequestPayload {
@@ -199,6 +205,10 @@ export function mintTelegramDeliveryRequest(args: {
   defaultChatId?: string | null;
   /** Canonical retry ceiling stamped per payload (bounded, env-driven). */
   maxAttempts?: number;
+  /** FILES: artifact content identity verified at the delivery-contract
+   *  gate (manifest name → SHA-256 hex). Pinned into each slot so a
+   *  post-mint mutation fails closed at the bridge-side projection. */
+  artifactSha256?: Record<string, string>;
 }): Record<string, unknown> | null {
   const manifest = deliveryManifest(args.task);
   if (!manifest) return null;
@@ -219,15 +229,26 @@ export function mintTelegramDeliveryRequest(args: {
     state: "QUEUED",
     attempt_count: 0,
     max_attempts: maxAttempts,
+    ...(args.artifactSha256?.[name] ? { sha256: args.artifactSha256[name] } : {}),
   }));
   let text: string | null = null;
   if (manifest.mode === "TEXT") {
-    const result = args.execution.result as Record<string, unknown> | undefined;
-    const summary = result?.summary ?? result?.text ?? result;
-    text = (typeof summary === "string" ? summary : canonicalJson(summary ?? {})).slice(
-      0,
-      MAX_TEXT_BYTES,
-    );
+    // Canonical TEXT payload source: the composed report artifact the
+    // delivery task was contracted to write — NEVER the execution
+    // result/summary/acknowledgement ("DONE" can never be the operator
+    // deliverable). The settle-time delivery-contract gate has already
+    // proven the artifact exists and satisfies the canonical language;
+    // a missing file here is defense-in-depth null, not a fallback.
+    const p = resolveDeliveryArtifactPath({
+      outboxDir: args.outboxDir,
+      workspace: args.workspace,
+      name: DELIVERY_TEXT_ARTIFACT,
+    });
+    try {
+      text = p ? fs.readFileSync(p, "utf8").trim().slice(0, MAX_TEXT_BYTES) : null;
+    } catch {
+      text = null;
+    }
   }
   const body: Record<string, unknown> = {
     delivery_id: id,
@@ -710,6 +731,24 @@ export function pendingTelegramDeliveries(
         a.completed_at = ts;
         dirty = true;
         continue;
+      }
+      // Canonical artifact identity replayed at send time: a manifested
+      // artifact mutated between mint and dispatch never reaches the
+      // bridge — durable terminal failure, zero network call burned.
+      if (a.sha256) {
+        let actual: string | null = null;
+        try {
+          actual = sha256File(p);
+        } catch {
+          actual = null;
+        }
+        if (actual !== a.sha256) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
       }
       if (a.next_retry_at && a.next_retry_at > ts) continue; // backoff
       projected.push({
