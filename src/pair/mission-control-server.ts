@@ -345,6 +345,23 @@ export function createMissionControlServer(
         return void json(res, 200, { ok: true, path: dest, bytes: buf.length });
       }
 
+      // Incident R2 — explicit telegram delivery authority. The bridge polls
+      // the QUEUED canonical requests (durable, restart-safe) and acks each
+      // manifested artifact after a successful transport. An outbox file is
+      // storage only — it NEVER appears here without a governed delivery.
+      if (method === "GET" && p === "/api/telegram-deliveries") {
+        const state = url.searchParams.get("state") ?? undefined;
+        return void json(res, 200, { deliveries: c.telegramDeliveries(state) });
+      }
+      const ackMatch = p.match(/^\/api\/telegram-deliveries\/([^/]+)\/ack$/);
+      if (method === "POST" && ackMatch) {
+        const reqEntity = c.ackTelegramDelivery(
+          decodeURIComponent(ackMatch[1]),
+          body.artifact ? String(body.artifact) : undefined,
+        );
+        return void json(res, 200, { delivery: reqEntity });
+      }
+
       // Broker fetch: remote executor releases a named credential. R3 §2:
       // the worker credential is a TASK-SCOPED capability (x-broker-capability)
       // minted server-side from PAIR_BROKER_TOKEN — the master token itself

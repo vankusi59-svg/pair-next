@@ -42,12 +42,12 @@ import {
 } from "./approval-queue.js";
 import type { ReconciliationService } from "./reconciliation.js";
 import type { RecoveryController } from "./recovery-controller.js";
-import { classifyFailure, RECOVERY_MATRIX } from "./recovery-controller.js";
+import { classifyFailure } from "./recovery-controller.js";
 import {
   assertPlanDataflow,
-  provenMissingConsumedArtifact,
+  missingConsumedArtifact,
 } from "./plan-dataflow.js";
-import type { FailureClass } from "./recovery-controller.js";
+import { mintTelegramDeliveryRequest } from "./telegram-delivery.js";
 import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
@@ -647,6 +647,28 @@ export class MissionRuntime {
       },
     });
     for (const task of runnable) {
+      // Incident R2 §9 — pre-dispatch prerequisite evidence: when the
+      // canonical pinned plan says this task consumes a workspace
+      // artifact that is absent NOW, spending an executor attempt is
+      // provably futile — classify DEPENDENCY_FAILURE deterministically
+      // (bounded REPLAN/ABORT, zero dispatch, zero retry burn, zero
+      // approval). Absence checked BEFORE dispatch only — a file
+      // disappearing DURING execution proves nothing about its prior
+      // presence and never reclassifies the real failure.
+      const missing = this.prerequisiteMissing(mission, task);
+      if (missing) {
+        this.startRecovery(
+          missionId,
+          String(task.task_id),
+          null,
+          "DEPENDENCY_FAILURE",
+          now,
+          undefined,
+          undefined,
+          { missing_artifact: missing },
+        );
+        return;
+      }
       const request = this.requestFor(mission, task);
       try {
         const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
@@ -674,7 +696,7 @@ export class MissionRuntime {
           missionId,
           String(task.task_id),
           null,
-          this.classifyWithDependencyEvidence(missionId, String(task.task_id), failureClass),
+          failureClass,
           now,
           undefined,
           undefined,
@@ -737,6 +759,34 @@ export class MissionRuntime {
           actor: this.actor,
           correlation_id: String(collected.correlation_id ?? ""),
         });
+        // Incident R2 §6 — mint the durable canonical send request ONLY
+        // for a task carrying the governed TELEGRAM_DELIVERY capability
+        // AND the PAIR-stamped manifest. Everything else — file presence,
+        // outbox contents, mission completion — authorizes nothing.
+        const settledTask = this.store.get("task", taskId);
+        const caps = (settledTask.required_capabilities as string[]) ?? [];
+        if (caps.includes("TELEGRAM_DELIVERY")) {
+          const mission = this.deps.service.getMission(missionId);
+          const project = this.deps.service.getProject(
+            String(mission.project_id),
+          );
+          const ws = String(
+            (settledTask.metadata as Record<string, unknown> | undefined)
+              ?.workspace ??
+              ((mission.metadata as Record<string, unknown>)
+                ?.authorized_workspaces as string[])?.[0] ??
+              String(project.root_location),
+          );
+          mintTelegramDeliveryRequest({
+            store: this.store,
+            mission,
+            task: settledTask,
+            execution: collected,
+            outboxDir: `${String(project.root_location)}/outbox`,
+            workspace: ws,
+            now: utcnow(),
+          });
+        }
         return;
       }
       // Validation failed — artifact failure, never mark success.
@@ -761,45 +811,35 @@ export class MissionRuntime {
       error_class: String(errorObj?.class ?? ""),
       result: (collected.result as Record<string, unknown>) ?? null,
     });
-    this.startRecovery(
-      missionId,
-      taskId,
-      executionId,
-      this.classifyWithDependencyEvidence(missionId, taskId, failureClass),
-    );
+    this.startRecovery(missionId, taskId, executionId, failureClass);
   }
 
   /**
-   * Incident R1 — deterministic missing-prerequisite evidence. A task that
-   * canonically consumes a workspace artifact which is absent cannot
-   * succeed on retry: classify DEPENDENCY_FAILURE (non-retryable →
-   * REPLAN/ABORT) instead of burning identical attempts as PROCESS_EXIT.
-   * Evidence is the persisted digested `metadata.pair_dataflow` ONLY —
-   * never executor summary/stderr prose — so a task without declared
-   * consumes (or one whose inputs all exist) keeps the base class.
-   * Already-bounded classes are never widened.
+   * Incident R2 §9/§10 — pre-dispatch prerequisite evidence ONLY. The
+   * canonical pinned `metadata.pair_dataflow.consumes` (never executor
+   * prose) is resolved against the governed workspace; a proven-absent
+   * input returns its artifact name so the caller enters deterministic
+   * DEPENDENCY_FAILURE without spending a dispatch. Post-execution
+   * absence is deliberately NOT consulted — a consumed input the task
+   * itself moved/deleted before an unrelated failure must not reclassify
+   * it.
    */
-  private classifyWithDependencyEvidence(
-    missionId: string,
-    taskId: string,
-    base: FailureClass,
-  ): FailureClass {
-    if (!RECOVERY_MATRIX[base]?.retry_allowed) return base;
-    const task = this.store.tryGet("task", taskId);
-    if (!task) return base;
+  private prerequisiteMissing(
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+  ): string | null {
     const df = (task.metadata as Record<string, unknown> | undefined)
       ?.pair_dataflow as Record<string, unknown> | undefined;
-    if (!Array.isArray(df?.consumes) || df.consumes.length === 0) return base;
-    const mission = this.deps.service.getMission(missionId);
+    if (!Array.isArray(df?.consumes) || df.consumes.length === 0) return null;
     const md = (mission.metadata as Record<string, unknown>) ?? {};
     const workspace = String(
       (task.metadata as Record<string, unknown> | undefined)?.workspace ??
         (md.authorized_workspaces as string[])?.[0] ??
         "",
     );
-    if (!workspace) return base;
-    const missing = provenMissingConsumedArtifact({ task, workspace });
-    return missing ? "DEPENDENCY_FAILURE" : base;
+    if (!workspace) return null;
+    const missing = missingConsumedArtifact({ task, workspace });
+    return missing ? missing.artifact : null;
   }
 
   /**
@@ -823,8 +863,13 @@ export class MissionRuntime {
     infeasibleActions?: Array<{ action: RecoveryAction; reason: string }>,
     /** Route-authority closure — the executor a dispatch-time routing
      *  failure was scoped to (no execution row exists yet); carried into
-     *  pending.executor_id so bounded RE_ROUTE excludes it. */
-    extra?: { failedExecutorId?: string | null },
+     *  pending.executor_id so bounded RE_ROUTE excludes it.
+     *  `missing_artifact` records the pre-dispatch prerequisite evidence
+     *  (R2 §9) that produced a DEPENDENCY_FAILURE. */
+    extra?: {
+      failedExecutorId?: string | null;
+      missing_artifact?: string | null;
+    },
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -908,6 +953,9 @@ export class MissionRuntime {
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
       infeasible_actions: infeasibleActions ?? [],
+      ...(extra?.missing_artifact
+        ? { missing_artifact: extra.missing_artifact }
+        : {}),
     };
     this.store.put(
       "mission_runtime",

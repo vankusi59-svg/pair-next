@@ -28,6 +28,10 @@ import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.
 import { validatePlanProposal } from "./proposal.js";
 import { assertPlanDataflow } from "./plan-dataflow.js";
 import {
+  ackTelegramDelivery as ackTelegramDeliveryEntity,
+  pendingTelegramDeliveries,
+} from "./telegram-delivery.js";
+import {
   assertPreviewWorkspaceAuthority,
   createPlanPreview as persistPlanPreview,
   consumePlanPreview,
@@ -107,6 +111,28 @@ export class MissionControl {
       | null;
     const root = String(prj?.root_location ?? "");
     return root ? path.join(root, "outbox") : null;
+  }
+
+  /** Incident R2 §6 — the ONLY telegram file-delivery authority: canonical
+   *  `telegram_delivery_request` rows minted when a governed
+   *  TELEGRAM_DELIVERY task completes, projected for the bridge with
+   *  resolved absolute artifact paths inside the project outbox. The
+   *  bridge never scans the outbox itself — a file in outbox/ is storage,
+   *  never a send instruction. */
+  telegramDeliveries(state?: string): Array<Record<string, unknown>> {
+    const pending = pendingTelegramDeliveries(this.store);
+    return state ? pending.filter((r) => r.status === state) : pending;
+  }
+
+  /** Bridge ack — idempotent flip of ONE manifested artifact (or the TEXT
+   *  request) to SENT. Only what the manifest authorized may ack. */
+  ackTelegramDelivery(deliveryId: string, artifact?: string) {
+    return ackTelegramDeliveryEntity({
+      store: this.store,
+      deliveryId,
+      artifact,
+      now: utcnow(),
+    });
   }
 
   missionDag(missionId: string) {

@@ -21,22 +21,35 @@
  *       replan boundaries so a persisted unsound DAG fails closed instead
  *       of being consumed into a mission.
  *
- *   provenMissingConsumedArtifact(...)
- *     - evidence-based recovery seam: a FAILED task whose canonical
- *       `consumes` artifact is absent from the workspace is a
- *       deterministic prerequisite failure (DEPENDENCY_FAILURE), never
- *       inferred from executor summary text.
+ *   provenMissingConsumedArtifact(...) / missingConsumedArtifact(...)
+ *     - evidence-based prerequisite seam: a task whose canonical
+ *       `consumes` artifact is absent from the workspace BEFORE dispatch
+ *       is a deterministic prerequisite failure (DEPENDENCY_FAILURE),
+ *       never inferred from executor summary text and never inferred
+ *       from post-execution absence.
+ *
+ *   detectTelegramDeliveryIntent(goal)
+ *     - bounded deterministic contract on the effective operator
+ *       request: explicit Telegram-delivery phrasing pins the canonical
+ *       manifest (`pair_telegram_delivery`) the delivery task may send.
+ *
+ * R2 reserved fields — `pair_dataflow`, `pair_dataflow_repairs`,
+ * `pair_telegram_delivery`, `telegram_delivery`, `telegram_delivery_requested`,
+ * `telegram_intent` are PAIR-reserved: they are stripped from raw planner
+ * output before reconciliation so an untrusted plan cannot mint artifact,
+ * repair, or delivery authority. PAIR recomputes and stamps them itself.
  *
  * Artifact evidence is derived only from authoritative/explicit task
  * material — structured worker_spec ops (read_text_file/write_text_file/
  * append_text_file/delete_file paths), explicit workspace-relative file
- * paths in the canonical instruction attributed by a bounded verb grammar,
- * declared `metadata.pair_dataflow`, and the known delivery contract
- * (TELEGRAM_DELIVERY is the terminal report step — it consumes every
- * upstream result via dependency_outputs and must depend on all other
- * tasks). Remote-capability tasks produce/consume NO workspace artifacts:
- * their files stay remote and only the returned result text flows through
- * dependency_outputs, which the declared edge already covers.
+ * paths in the canonical instruction attributed by a bounded nearest-verb
+ * grammar, declared `metadata.pair_dataflow` (PAIR-stamped only), and the
+ * explicit delivery contract (a TELEGRAM_DELIVERY task consumes only the
+ * manifest artifacts + required upstream result text — it is a DAG leaf
+ * and never gains forward dependencies). Remote-capability tasks
+ * produce/consume NO workspace artifacts: their files stay remote; a
+ * governed /api/outbox upload is separately modeled as a PAIR_OUTBOX_UPLOAD
+ * edge for delivery manifest resolution.
  */
 
 import fs from "node:fs";
@@ -70,6 +83,87 @@ export interface DataflowRepair {
 
 const MAX_ARTIFACTS_PER_TASK = 32;
 const MAX_PATH_LEN = 240;
+const MAX_MANIFEST_ARTIFACTS = 16;
+
+/** PAIR-reserved task metadata keys — raw planner output must never mint
+ *  artifact, repair, or Telegram-delivery authority. Stripped at the top
+ *  of reconcilePlanDataflow before any extraction runs; PAIR recomputes
+ *  and re-stamps them on the canonical list itself. */
+/** First-pass declared depends_on, stamped once and preserved across
+ *  replays so the repair ledger recomputes byte-identically. Not a
+ *  reserved key — a forged value only mutates evidence, never edges. */
+export const PAIR_DATAFLOW_ORIGINAL_DEPS = "pair_dataflow_original_deps";
+
+export const RESERVED_TASK_METADATA_KEYS = [
+  "pair_dataflow",
+  "pair_dataflow_repairs",
+  "pair_telegram_delivery",
+  "telegram_delivery",
+  "telegram_delivery_requested",
+  "telegram_intent",
+] as const;
+
+function stripReservedTaskMetadata(
+  tasks: Array<Record<string, unknown>>,
+): void {
+  for (const t of tasks) {
+    const md = t?.metadata;
+    if (!md || typeof md !== "object" || Array.isArray(md)) continue;
+    for (const k of RESERVED_TASK_METADATA_KEYS) {
+      delete (md as Record<string, unknown>)[k];
+    }
+  }
+}
+
+/* ---------------- Telegram delivery intent (operator-request authority) */
+
+export interface TelegramDeliveryIntent {
+  /** True only when the operator's own goal text explicitly asks to send
+   *  something to Telegram — file presence, mission completion, or an
+   *  outbox artifact never imply it. */
+  requested: boolean;
+  /** Exact file names the goal mentions (normalized, bounded). */
+  artifacts: string[];
+  /** FILES = send the manifested artifacts; TEXT = send the composed
+   *  result text only (no implicit attachment of workspace files). */
+  mode: "FILES" | "TEXT";
+}
+
+// The operator must BOTH name Telegram AND use a delivery verb — a bare
+// "telegram" mention (e.g. asking about the app) is not delivery intent.
+const TELEGRAM_MENTION = /\btelegram\b|\btele\b/i;
+const DELIVERY_VERB =
+  /\b(?:send|deliver|forward|share|post|upload|gửi|đẩy|đưa|chuyển|báo|bắn|đăng|đính)\b/i;
+
+/**
+ * Bounded deterministic intent contract over the effective operator
+ * request (the mission goal). Deliberately conservative: unknown
+ * phrasings resolve to NOT requested — the safe direction is no send.
+ */
+export function detectTelegramDeliveryIntent(
+  goal: unknown,
+): TelegramDeliveryIntent {
+  const text = String(goal ?? "").slice(0, 4096);
+  if (!TELEGRAM_MENTION.test(text) || !DELIVERY_VERB.test(text)) {
+    return { requested: false, artifacts: [], mode: "TEXT" };
+  }
+  const artifacts: string[] = [];
+  let m: RegExpExecArray | null;
+  PATH_TOKEN.lastIndex = 0;
+  while ((m = PATH_TOKEN.exec(text)) !== null) {
+    const p = normalizeArtifactPath(m[1]);
+    if (p && !artifacts.includes(p)) artifacts.push(p);
+    if (artifacts.length >= MAX_MANIFEST_ARTIFACTS) break;
+  }
+  return {
+    requested: true,
+    artifacts,
+    mode: artifacts.length ? "FILES" : "TEXT",
+  };
+}
+
+/** The PAIR-stamped manifest field name on a canonical delivery task. */
+export const TELEGRAM_MANIFEST_FIELD = "pair_telegram_delivery";
 
 // A path token: workspace-relative segments ending in a filename — either
 // `name.ext` or an `outbox/` path. The token must not be preceded by a path
@@ -80,12 +174,30 @@ const PATH_TOKEN =
 
 // Verbs attributing a read/consume role to the following path.
 const CONSUME_VERB =
-  /\b(?:read|reads|reading|load|loads|cat|consume|consumes|review|summarize|summarise|inspect|check|open|opens|use|uses|using|copy|copies|copying|move|moves|attach|includes?|including|contains|from)\b/i;
+  /\b(?:read|reads|reading|load|loads|cat|consume|consumes|review|summarize|summarise|inspect|check|open|opens|use|uses|using|copy|copies|copying|move|moves|attach|includes?|including|contains|from)\b/gi;
 // Verbs attributing a write/produce role to the following path.
 const PRODUCE_VERB =
-  /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads)\b/i;
+  /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads)\b/gi;
 // Destination marker immediately before the path: "to X", "into outbox/X".
 const DESTINATION = /\b(?:to|into|onto|inside|in)\s*$/i;
+
+/** Nearest governing verb before a path mention: the LAST consume/produce
+ *  verb inside the bounded lookback window wins — "read input.txt then
+ *  generate report.txt" attributes `report.txt` to `generate` (produce),
+ *  never to the earlier `read`. Returns null when unattributed. */
+function nearestVerbRole(before: string): "consume" | "produce" | null {
+  let role: "consume" | "produce" | null = null;
+  let m: RegExpExecArray | null;
+  CONSUME_VERB.lastIndex = 0;
+  let consumeAt = -1;
+  while ((m = CONSUME_VERB.exec(before)) !== null) consumeAt = m.index;
+  PRODUCE_VERB.lastIndex = 0;
+  let produceAt = -1;
+  while ((m = PRODUCE_VERB.exec(before)) !== null) produceAt = m.index;
+  if (consumeAt < 0 && produceAt < 0) return null;
+  role = consumeAt > produceAt ? "consume" : "produce";
+  return role;
+}
 
 /**
  * Normalize a workspace-relative artifact path. Returns null for anything
@@ -131,11 +243,12 @@ function contractArtifacts(task: Record<string, unknown>): TaskDataflow {
 }
 
 /**
- * Bounded instruction-text grammar: a path mention counts only when a
- * sentence verb attributes a role to it. A destination marker immediately
- * before the path (`to`, `into`, `onto`, `in`) wins over read-verbs —
- * "copy X into outbox/Y" consumes X and produces Y. Mentions with no
- * attributed verb are ignored (bounded grammar never guesses).
+ * Bounded instruction-text grammar: a path mention counts only when the
+ * NEAREST governing verb attributes a role to it (deterministic local
+ * attribution, bounded 120-char lookback). A destination marker
+ * immediately before the path (`to`, `into`, `onto`, `in`) wins over
+ * verbs — "copy X into outbox/Y" consumes X and produces Y. Mentions
+ * with no attributed verb are ignored (bounded grammar never guesses).
  */
 function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
   const produces = new Set<string>();
@@ -155,12 +268,13 @@ function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
       produces.add(p);
       continue;
     }
-    if (CONSUME_VERB.test(before)) {
+    const role = nearestVerbRole(before);
+    if (role === "consume") {
       consumes.add(p);
       continue;
     }
-    if (PRODUCE_VERB.test(before) || p.startsWith("outbox/")) {
-      // Explicit write verbs, or the known outbox contract.
+    if (role === "produce" || p.startsWith("outbox/")) {
+      // Nearest write verb, or the known outbox contract.
       produces.add(p);
       continue;
     }
@@ -198,6 +312,39 @@ const isRemoteTask = (task: Record<string, unknown>): boolean =>
 const isDeliveryTask = (task: Record<string, unknown>): boolean =>
   ((task.required_capabilities as string[]) ?? []).includes(DELIVERY_CAPABILITY);
 
+/** A pure bookkeeping task (goal record) is not content the operator
+ *  asked to receive — TEXT-mode delivery never depends on it. */
+const BOOKKEEPING_CAP = "AUTOMATON_TASK_EXECUTION";
+const isContentBearing = (task: Record<string, unknown>): boolean =>
+  ((task.required_capabilities as string[]) ?? []).some(
+    (c) => String(c) !== BOOKKEEPING_CAP,
+  );
+
+export interface TelegramDeliveryManifest {
+  mode: "FILES" | "TEXT";
+  artifacts: string[];
+}
+
+/** The PAIR-stamped manifest on a canonical delivery task — the ONLY
+ *  send authority for artifact transmission. Absent on a pinned
+ *  TELEGRAM_DELIVERY task → the task carries no governed delivery
+ *  authority and must fail closed at the canonical seams. */
+export function deliveryManifest(
+  task: Record<string, unknown>,
+): TelegramDeliveryManifest | null {
+  const raw = (
+    (task.metadata as Record<string, unknown> | undefined)?.[
+      TELEGRAM_MANIFEST_FIELD
+    ] as Record<string, unknown> | undefined
+  );
+  if (!raw) return null;
+  const mode = raw.mode === "FILES" ? "FILES" : "TEXT";
+  const artifacts = Array.isArray(raw.artifacts)
+    ? raw.artifacts.map((a) => String(a))
+    : [];
+  return { mode, artifacts };
+}
+
 /**
  * The canonical per-task artifact model: structured worker_spec ops ∪
  * verb-attributed instruction paths ∪ declared pair_dataflow — all
@@ -211,6 +358,29 @@ export function extractTaskDataflow(task: Record<string, unknown>): TaskDataflow
   const d = declaredArtifacts(task);
   const produces = new Set([...c.produces, ...i.produces]);
   const consumes = new Set([...c.consumes, ...i.consumes]);
+  // PAIR-stamped delivery manifest: the delivery task consumes the exact
+  // manifested artifacts (it must read/stage them) and produces the
+  // staged outbox copy. Only PAIR writes this field — planner versions
+  // are stripped before extraction.
+  const manifest = isDeliveryTask(task) ? deliveryManifest(task) : null;
+  if (manifest) {
+    for (const a of manifest.artifacts) {
+      const n = normalizeArtifactPath(a);
+      if (!n) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_PATH",
+          `${String(task.task_key ?? "?")}:${String(a).slice(0, 80)}`,
+        );
+      }
+      consumes.add(n);
+      // FILES-mode delivery stages the deliverable into outbox/ — but a
+      // manifest name already outbox/-prefixed is the deliverable itself,
+      // so adding it as a produce would shadow its own consume edge.
+      if (manifest.mode === "FILES" && !n.startsWith("outbox/")) {
+        produces.add(`outbox/${path.posix.basename(n)}`);
+      }
+    }
+  }
   for (const p of [...d.produces, ...d.consumes]) {
     const n = normalizeArtifactPath(p);
     if (!n) {
@@ -260,13 +430,36 @@ function requiredEdges(
   for (const [i, task] of tasks.entries()) {
     const key = String(task.task_key ?? "");
     const model = models[i];
-    const needed = model.consumes.filter((a) => !model.produces.includes(a));
+    const manifest = isDeliveryTask(task) ? deliveryManifest(task) : null;
+    const manifestNames = new Set(
+      (manifest?.artifacts ?? [])
+        .map((a) => normalizeArtifactPath(a))
+        .filter((a): a is string => a !== null),
+    );
+    // Self-produced artifacts are normally excluded — but a manifest
+    // artifact must ALWAYS bind its producer (the delivery stages a copy;
+    // the instruction-grammar may also name it as a produce).
+    const needed = model.consumes.filter(
+      (a) => !model.produces.includes(a) || manifestNames.has(a),
+    );
     for (const artifact of needed) {
-      const producers = (indexByArtifact.get(artifact) ?? []).filter(
-        (j) => j !== i,
-      );
+      // Manifest artifacts bind producers of the named file OR of its
+      // staged outbox copy — both name the same deliverable.
+      const candidates =
+        manifestNames.has(artifact) && !artifact.startsWith("outbox/")
+          ? [artifact, `outbox/${path.posix.basename(artifact)}`]
+          : [artifact];
+      const producers = [
+        ...new Set(
+          candidates.flatMap((c) => indexByArtifact.get(c) ?? []),
+        ),
+      ].filter((j) => j !== i);
       const earlier = producers.filter((j) => j < i);
       if (producers.length === 0) {
+        // Manifest consumes may still bind to earlier remote uploaders
+        // (handled in the delivery block below) — skip the UNBOUND
+        // throw for them here.
+        if (manifestNames.has(artifact)) continue;
         throw new IntegrityError(
           "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
           JSON.stringify({ task: key, artifact }),
@@ -289,11 +482,53 @@ function requiredEdges(
       out[i].push({ producerIndex: earlier[0], artifact });
     }
     if (isDeliveryTask(task)) {
-      // Delivery consumes every other task's result text via
-      // dependency_outputs — it must run strictly last.
-      for (const [j] of tasks.entries()) {
-        if (j === i) continue;
-        out[i].push({ producerIndex: j, artifact: "RESULT_TEXT" });
+      // A TELEGRAM_DELIVERY task is a DAG leaf: it may depend ONLY on
+      // valid earlier producers — of the manifested artifacts, and (TEXT
+      // mode) of the result text of earlier content-bearing tasks. A
+      // delivery task without the PAIR-stamped manifest carries no
+      // governed send authority and fails closed; a needed producer
+      // placed later is an ORDER failure, never a forward-edge repair.
+      if (!manifest) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT",
+          JSON.stringify({ task: key }),
+        );
+      }
+      if (manifest.mode === "TEXT") {
+        const content = tasks
+          .map((t, j) => (j < i && isContentBearing(t) ? j : -1))
+          .filter((j) => j >= 0);
+        for (const j of content) {
+          out[i].push({ producerIndex: j, artifact: "RESULT_TEXT" });
+        }
+      }
+      // Manifest artifacts with no local producer bind to earlier remote
+      // tasks as PAIR_OUTBOX_UPLOAD producers — a governed upload lands
+      // locally only through that remote execution, so delivery must
+      // wait for it. A later remote uploader is an ORDER failure.
+      for (const artifact of manifestNames) {
+        if (out[i].some((r) => r.artifact === artifact)) continue;
+        const remoteEarlier = tasks
+          .map((t, j) => (j < i && isRemoteTask(t) ? j : -1))
+          .filter((j) => j >= 0);
+        if (remoteEarlier.length) {
+          for (const j of remoteEarlier) {
+            out[i].push({
+              producerIndex: j,
+              artifact: `PAIR_OUTBOX_UPLOAD:${artifact}`,
+            });
+          }
+          continue;
+        }
+        const remoteLater = tasks
+          .map((t, j) => (j > i && isRemoteTask(t) ? j : -1))
+          .filter((j) => j >= 0);
+        throw new IntegrityError(
+          remoteLater.length
+            ? "FAIL_CLOSED_PLAN_DATAFLOW_ORDER"
+            : "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+          JSON.stringify({ task: key, artifact }),
+        );
       }
     }
   }
@@ -320,6 +555,28 @@ function normalizedDeps(
     const ib = indexByKey.get(b) ?? Number.MAX_SAFE_INTEGER;
     return ia - ib || a.localeCompare(b);
   });
+}
+
+/** R2 §5 — a TELEGRAM_DELIVERY task is a DAG leaf: NOTHING may declare
+ *  a dependency on it. A forward edge out of delivery is an ORDER
+ *  failure — never silently reordered or serialized. */
+function assertDeliveryLeaves(
+  tasks: Array<Record<string, unknown>>,
+  depsByKey: Map<string, string[]>,
+): void {
+  const deliveryKeys = new Set(
+    tasks.filter(isDeliveryTask).map((t) => String(t.task_key)),
+  );
+  if (!deliveryKeys.size) return;
+  for (const [key, deps] of depsByKey) {
+    if (deliveryKeys.has(key)) continue;
+    if (deps.some((d) => deliveryKeys.has(d))) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_ORDER",
+        JSON.stringify({ task: key, forward_edge_to_delivery: true }),
+      );
+    }
+  }
 }
 
 /** Deterministic acyclicity check over task_key edges. */
@@ -350,9 +607,44 @@ function assertAcyclic(depsByKey: Map<string, string[]>): void {
  *
  * Returns the SAME array (mutated) plus the repair ledger.
  */
+export interface ReconcileOptions {
+  /** Operator-request authority — when omitted the plan cannot carry a
+   *  TELEGRAM_DELIVERY task (it fails closed on INTENT). */
+  telegramIntent?: TelegramDeliveryIntent;
+}
+
 export function reconcilePlanDataflow(
   tasks: Array<Record<string, unknown>>,
+  opts: ReconcileOptions = {},
 ): { tasks: Array<Record<string, unknown>>; repairs: DataflowRepair[] } {
+  // R2 §11 — PAIR-reserved fields are stripped from raw planner output
+  // before any extraction: planner metadata never mints data-flow,
+  // repair, or delivery authority. Re-running on an already-canonical
+  // list strips the PAIR-stamped values and recomputes them identically
+  // (idempotent).
+  stripReservedTaskMetadata(tasks);
+  const intent: TelegramDeliveryIntent = opts.telegramIntent ?? {
+    requested: false,
+    artifacts: [],
+    mode: "TEXT",
+  };
+  for (const t of tasks) {
+    if (!isDeliveryTask(t)) continue;
+    if (!intent.requested) {
+      // A delivery task with no explicit operator intent must never
+      // become send authority — the plan is invalid, failover material.
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT",
+        JSON.stringify({ task: String(t.task_key ?? "?") }),
+      );
+    }
+    const md = (t.metadata ??= {}) as Record<string, unknown>;
+    md[TELEGRAM_MANIFEST_FIELD] = {
+      requested: true,
+      mode: intent.mode,
+      artifacts: [...intent.artifacts],
+    };
+  }
   const models = tasks.map((t) => extractTaskDataflow(t));
   const required = requiredEdges(tasks, models);
   const repairs: DataflowRepair[] = [];
@@ -362,9 +654,22 @@ export function reconcilePlanDataflow(
       ? (task.depends_on as string[]).map(String)
       : [];
     const next = normalizedDeps(declared, required[i], tasks);
-    const added = next.filter((k) => !declared.includes(k));
     const md = (task.metadata ??= {}) as Record<string, unknown>;
+    // The planner's ORIGINAL declared deps are stamped once and kept —
+    // the repair ledger recomputes identically on replay (byte-identical
+    // canonical tasks, R2 §11).
+    const origDeps = Array.isArray(md[PAIR_DATAFLOW_ORIGINAL_DEPS])
+      ? (md[PAIR_DATAFLOW_ORIGINAL_DEPS] as string[]).map(String)
+      : declared;
+    const added = next.filter((k) => !origDeps.includes(k));
+    // Canonical key order: delete + re-set so replay produces the same
+    // byte ordering regardless of pre-existing stamped fields.
+    const manifest = md[TELEGRAM_MANIFEST_FIELD];
+    delete md[PAIR_DATAFLOW_ORIGINAL_DEPS];
+    delete md[TELEGRAM_MANIFEST_FIELD];
+    md[PAIR_DATAFLOW_ORIGINAL_DEPS] = origDeps;
     md.pair_dataflow = models[i];
+    if (manifest !== undefined) md[TELEGRAM_MANIFEST_FIELD] = manifest;
     if (added.length) {
       task.depends_on = next;
       for (const producerKey of added) {
@@ -378,7 +683,7 @@ export function reconcilePlanDataflow(
           producer_key: producerKey,
           artifact: req?.artifact ?? "RESULT_TEXT",
           reason: "ARTIFACT_DATAFLOW",
-          original_depends_on: declared,
+          original_depends_on: origDeps,
           resulting_depends_on: next,
         });
       }
@@ -399,6 +704,7 @@ export function reconcilePlanDataflow(
     }
   }
   assertAcyclic(depsByKey);
+  assertDeliveryLeaves(tasks, depsByKey);
   return { tasks, repairs };
 }
 
@@ -435,20 +741,56 @@ export function assertPlanDataflow(
     depsByKey.set(key, [...declared]);
   }
   assertAcyclic(depsByKey);
+  assertDeliveryLeaves(tasks, depsByKey);
 }
 
 /**
- * Recovery seam — proof that a FAILED task's canonical consumed input is
- * absent from the workspace. Reads ONLY the persisted digested
- * `metadata.pair_dataflow` (never executor prose): a task with no declared
- * consumes, or whose consumed artifacts all exist, returns null so the
- * caller keeps the generic classification. `selfProduced` artifacts are
- * skipped (the task writes them itself).
+ * Bounded outbox artifact resolution: a canonical consume like
+ * `outbox/x.txt` (or a manifest file name) resolves to the exact file
+ * OR the unique `<taskPrefix>-<name>` remote-upload variant inside the
+ * outbox directory — the same matching the governed delivery resolver
+ * uses, never a filesystem guess.
  */
-export function provenMissingConsumedArtifact(args: {
+function artifactPresentIn(
+  workspace: string,
+  artifact: string,
+  existsSync: (p: string) => boolean,
+  listDirSync: (p: string) => string[],
+): boolean {
+  const direct = path.join(workspace, artifact);
+  if (existsSync(direct)) return true;
+  // Remote-upload shape: /api/outbox lands `<taskPrefix>-<filename>`.
+  // Match a manifest/consume name against unique prefixed siblings.
+  const base = artifact.startsWith("outbox/")
+    ? artifact
+    : `outbox/${path.posix.basename(artifact)}`;
+  const obDir = path.join(workspace, path.posix.dirname(base));
+  const name = path.posix.basename(base);
+  if (existsSync(path.join(workspace, base))) return true;
+  let names: string[] = [];
+  try {
+    names = listDirSync(obDir);
+  } catch {
+    return false;
+  }
+  const matches = names.filter((f) => f.endsWith(`-${name}`));
+  return matches.length === 1;
+}
+
+/**
+ * Pre-dispatch prerequisite seam (R2 §9): proof that a task's canonical
+ * consumed input is absent from the workspace BEFORE an executor attempt
+ * is spent. Reads ONLY the persisted digested `metadata.pair_dataflow`
+ * (never executor prose, never post-execution inference): a task with no
+ * declared consumes, or whose consumed artifacts all exist, returns null
+ * so dispatch proceeds. `selfProduced` artifacts are skipped (the task
+ * writes them itself).
+ */
+export function missingConsumedArtifact(args: {
   task: Record<string, unknown>;
   workspace: string;
   existsSync?: (p: string) => boolean;
+  listDirSync?: (p: string) => string[];
 }): { artifact: string } | null {
   const df = (
     (args.task.metadata as Record<string, unknown> | undefined)
@@ -462,11 +804,21 @@ export function provenMissingConsumedArtifact(args: {
     Array.isArray(df?.produces) ? df.produces.map((a) => String(a)) : [],
   );
   const exists = args.existsSync ?? ((p: string) => fs.existsSync(p));
+  const listDir =
+    args.listDirSync ??
+    ((p: string) => fs.readdirSync(p).map(String));
   for (const raw of consumes) {
     const artifact = normalizeArtifactPath(raw);
     if (!artifact || produces.has(artifact)) continue;
-    if (exists(path.join(args.workspace, artifact))) continue;
+    if (
+      artifactPresentIn(args.workspace, artifact, exists, listDir)
+    ) {
+      continue;
+    }
     return { artifact };
   }
   return null;
 }
+
+/** @deprecated R2 — use missingConsumedArtifact (pre-dispatch seam). */
+export const provenMissingConsumedArtifact = missingConsumedArtifact;

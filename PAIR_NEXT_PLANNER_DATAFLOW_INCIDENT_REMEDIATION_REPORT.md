@@ -135,3 +135,100 @@ No new broad catch (none added anywhere); no summary/stderr regex as authority; 
 ## 8. Changed files
 
 See `git diff --stat` on the PR. Live deployment note: prod `/home/ubuntu/pair-prod-main` still runs `7a0edd1` until the operator merges and restarts; this PR does NOT restart or touch prod.
+
+---
+
+# R2 — Explicit Telegram Delivery Authority + Data-Flow Audit Closure (revised mandate)
+
+## 1. Semantics enforced (R2 §0)
+
+Telegram has two distinct roles and R2 makes them disjoint:
+
+- **(A) Notification channel** — mission lifecycle status updates to the operator. Carries NO files. Bridge notify block unchanged.
+- **(B) Explicit delivery channel** — sends ONLY what an effective operator request explicitly asked to be sent, through a governed `TELEGRAM_DELIVERY` operation with a canonical manifest.
+
+`FILE PRESENCE != TELEGRAM SEND AUTHORITY. OUTBOX PRESENCE != TELEGRAM SEND AUTHORITY. MISSION COMPLETION != FILE DELIVERY AUTHORITY.` An execution producing an artifact is storage/provenance only.
+
+## 2. Intent contract (§2) — `src/pair/plan-dataflow.ts`
+
+- `detectTelegramDeliveryIntent(goal)` — `requested = TELEGRAM_MENTION(/\btelegram\b|\btele\b/i) AND DELIVERY_VERB(send|deliver|forward|share|post|upload|gửi|đẩy|đưa|chuyển|báo|bắn|đăng|đính)`; `artifacts` = normalized `PATH_TOKEN` mentions (≤16); `mode = FILES` iff artifacts non-empty else `TEXT`. Conservative: unknown → not requested.
+- Authority is **pinned by PAIR at canonicalization** — `reconcilePlanDataflow(tasks, {telegramIntent})` stamps `metadata.pair_telegram_delivery = {requested:true, mode, artifacts[]}` on delivery tasks ONLY when `intent.requested`; otherwise a `TELEGRAM_DELIVERY` task fails closed (`FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT`). **Planner cannot mint intent** — stamped manifest is digest-covered (stamped pre-digest at preview/confirm/plan/replan, same as pair_dataflow).
+
+## 3. Manifest (§3)
+
+Workspace-relative names, `normalizeArtifactPath`-normalized, bounded ≤16, no traversal/absolute. FILES names get an implicit `outbox/<basename>` consume resolution candidate. TEXT mode = bounded text from task results (≤3500 chars). Manifest is stored in `metadata.pair_telegram_delivery` (field `pair_telegram_delivery`) — persisted in canonical plan, digest-covered, not expandable by executor/fs.
+
+## 4. Delivery DAG rules (§4 + §5)
+
+In `requiredEdges`, for a delivery task with stamped manifest:
+
+- **FILES**: each manifest artifact binds to the unique EARLIER producer of `{name}` or `outbox/{basename}` (later-only → `FAIL_CLOSED_PLAN_DATAFLOW_ORDER`; ambiguous → AMBIGUOUS_PRODUCER; none → remote fallback below).
+- **Remote fallback**: manifest artifact with no local producer edges to ALL earlier remote tasks via synthetic artifact `PAIR_OUTBOX_UPLOAD:{artifact}`; a LATER remote producer → `FAIL_CLOSED_PLAN_DATAFLOW_ORDER`; no earlier remote → `UNBOUND_INPUT`.
+- **TEXT**: RESULT_TEXT edges to every earlier content-bearing task (`isContentBearing` excludes `AUTOMATON_TASK_EXECUTION`); no invented artifact dep.
+- **Leaf-only**: `assertDeliveryLeaves` — any task declaring `depends_on` a delivery task → `FAIL_CLOSED_PLAN_DATAFLOW_ORDER` (in BOTH reconcile and assert). Delivery task without stamped manifest → `FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT`.
+- Manifest consumes live in `needed` always (a task's own grammar produce never self-satisfies its manifest).
+
+## 5. Bridge transport (§1 + §6) — `scripts/telegram-bridge.mjs`, `src/pair/telegram-delivery.ts`
+
+- **Generic outbox scan→send→.sent block REMOVED.** Outbox is storage only.
+- Bridge polls `GET /api/telegram-deliveries?state=QUEUED`; TEXT → send `req.text` + ack; FILES per artifact → `.sent` witness protocol: witness exists → ack without resend (crash-safe at-most-once); else rename-before-send → ack; send failure → rename back, stays QUEUED. Status notifications above it untouched.
+- **Durable entity** `telegram_delivery_request` (`TDR_<digest24>` deterministic per mission+task): minted in `settleExecution` COMPLETED+PASS for `TELEGRAM_DELIVERY`-cap tasks (idempotent tryGet). `pendingTelegramDeliveries` projects QUEUED + resolved abs paths (exact `outbox/rel` → unique `*-{rel}` remote-upload prefix → workspace path). `ackTelegramDelivery` idempotent per-artifact flip → request SENT when all acked; unknown artifact → `FAIL_CLOSED_TELEGRAM_DELIVERY_ARTIFACT`.
+- Endpoints: `GET /api/telegram-deliveries?state=` + `POST /api/telegram-deliveries/:id/ack` (`{artifact}`), MC_TOKEN-gated.
+
+## 6. §7–§12 closure
+
+- **§7**: `POST /api/outbox` lands `{outboxDir}/{taskPrefix}-{filename}` — storage only; resolution treats `*-{name}` uploads as candidates, never send authority.
+- **§8**: mission status notifications independent/working (bridge notify block untouched; test A+B+C proves COMPLETED + zero sends).
+- **§9**: `prerequisiteMissing(mission, task)` in the RUNNING dispatch loop BEFORE `routeGovernedTask` — canonical `pair_dataflow.consumes` resolved via `missingConsumedArtifact` (workspace direct + outbox exact + unique `*-{name}` remote-upload suffix) → `DEPENDENCY_FAILURE` via `startRecovery`, zero dispatches, no retry burn, no approval extension.
+- **§10**: `classifyWithDependencyEvidence` REMOVED — post-failure absence never reclassifies (file deleted mid-task → PROCESS_EXIT stays; test K).
+- **§11**: `RESERVED_TASK_METADATA_KEYS` (pair_dataflow, pair_dataflow_repairs, pair_telegram_delivery, telegram_delivery, telegram_delivery_requested, telegram_intent) stripped in `reconcilePlanDataflow` before extraction; PAIR restamps. `PAIR_DATAFLOW_ORIGINAL_DEPS` stamped once + preserved → byte-identical replay (test L).
+- **§12**: `nearestVerbRole(before)` — LAST consume/produce verb in bounded 120-char window; DESTINATION tail (to/into/onto/in) wins for destination paths; contract ops stay authoritative (test M).
+
+## 7. Tests (§13–16) — `pair-planner-dataflow-incident.test.ts` (25 total, +12)
+
+| Case | Evidence |
+|---|---|
+| A+B+C default | mission produces `outbox/report.txt` + stray `outbox/stray.png`, goal has NO telegram intent → COMPLETED, **0 delivery_request rows, 0 sends**; planner-minted delivery w/o intent → `FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT`, no mission |
+| D explicit FILES | goal "send it to telegram" + manifest [report.txt] → COMPLETED → **exactly ["report.txt"] sent once**, TDR `TDR_<digest>` SENT w/ `sent_at`, second poll `[]` |
+| E subset | manifest [a.txt,c.png] of producer's {a,b,c} → sent `["a.txt","c.png"]`, b.txt never |
+| F ordering | producer SLOW (RUNNING) → T3 undispatched, 0 requests, `bridgeSend=[]`; converge → sent once, second poll `[]` |
+| G+H remote | manifest `chart.png` w/ remote producer → `PAIR_OUTBOX_UPLOAD` dep [T2]; upload lands WHILE RUNNING → 0 sends; COMPLETED → resolves `TSK_x-chart.png` → `["chart.png"]` once |
+| I TEXT | deps [T1,T2] via RESULT_TEXT, zero artifact consumes; send `[TEXT:TDR_*]` once |
+| K post-dispatch | input deleted mid-exec → first decision NOT DEPENDENCY_FAILURE (PROCESS_EXIT); retry → PRE-dispatch DEPENDENCY_FAILURE, exec count stays 1 |
+| L forged | forged manifest/intent/pair_dataflow/repairs stripped + recomputed; forged manifest can't mint authority (INTENT throw) |
+| M grammar | `read input.txt then generate report.txt` → consume input/produce report; `copy a.txt into outbox/b.txt` → consume a/produce b |
+| N leaf | delivery-before-producer → ORDER; declared edge INTO delivery → ORDER; unproduced non-remote manifest → UNBOUND |
+| intent | mention+verb required both; vn verbs; no-verb→not requested; no-file→TEXT |
+
+## 8. Regression (§17)
+
+| Suite | Result |
+|---|---|
+| Focused incident (R1+R2) | 25/25 PASS |
+| pair-ops-telegram-delivery | 3/3 PASS |
+| Phase B | 123/123 PASS |
+| PR#23 live-ops-recovery | 20/20 PASS |
+| PR#24 route-capability | 36/36 PASS |
+| Phase C DSH routing | 51/51 PASS |
+| Phase D recovery-approval | 37/37 PASS |
+| heartbeat-scheduler | 20/20 PASS |
+| pair-llm-planner | 16/16 PASS |
+| plan-execute-flow | 14/14 PASS (in full suite) |
+| **Full suite** | **2588 pass / 2 fail / 15 skipped** — same 2 env P5 probes (DSH/CODEX binaries present in PATH). Base `7a0edd1` = 2563, R1 = 2576; +12 R2 tests, zero regression |
+| `npx tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## 9. §19 — 8 explicit proofs
+
+1. Ordinary mission + outbox files, no intent → **zero sends** (test A+B+C: COMPLETED, 0 TDR rows)
+2. COMPLETED + no intent → **zero deliveries** (same)
+3. Explicit intent → **manifested send once** (test D: `["report.txt"]` + SENT durable)
+4. Unrelated file → **not sent** (test E: b.txt absent; stray.png never)
+5. DEVIN upload pre-completion → **not sent** (test G+H: upload while RUNNING → `[]`)
+6. DEVIN completes → **once** (`["chart.png"]`, second poll `[]`)
+7. Missing prereq → **0 dispatches** + DEPENDENCY_FAILURE (tests C+D R1 & K: exec count stays 1/0)
+8. No forward-dep repair → delivery-before-producer → `FAIL_CLOSED_PLAN_DATAFLOW_ORDER` (test N)
+
+Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R2_PENDING_INDEPENDENT_AUDIT`
+
+STOP. DO NOT MERGE. DO NOT START PHASE E.

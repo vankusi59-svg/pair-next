@@ -272,27 +272,57 @@ async function notifyLoop(allowList) {
         );
     }
 
-    // TELEGRAM_DELIVERY outbox: mission tasks write workspace outbox/*.txt —
-    // forward each to every allowed chat, then mark .sent.
-    const projects = await mc("GET", "/api/projects").catch(() => []);
-    for (const prj of Array.isArray(projects) ? projects : projects?.projects ?? []) {
-      const outbox = path.join(String(prj.root_location ?? ""), "outbox");
-      if (!outbox || !fs.existsSync(outbox)) continue;
-      for (const f of fs.readdirSync(outbox)) {
-        if (f.endsWith(".sent")) continue;
-        const ext = path.extname(f).toLowerCase();
-        if (![".txt", ".md", ".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext)) continue;
-        const fp = path.join(outbox, f);
+    // Incident R2 — EXPLICIT delivery authority only. The bridge NEVER
+    // scans the outbox: it polls the canonical telegram_delivery_request
+    // queue (minted only by a governed TELEGRAM_DELIVERY task) and
+    // transports EXACTLY the manifested artifacts, acking each one.
+    // Per-file ".sent" rename-BEFORE-send is the crash-safe transport
+    // witness: a crash between rename and send leaves the mark, so the
+    // artifact is acked on the next pass WITHOUT re-send — at-most-once,
+    // never duplicated. A send failure renames back → stays QUEUED.
+    const deliveries =
+      (await mc("GET", "/api/telegram-deliveries?state=QUEUED").catch(() => ({})))?.deliveries ?? [];
+    for (const req of deliveries) {
+      const ack = (artifact) =>
+        mc("POST", `/api/telegram-deliveries/${encodeURIComponent(String(req.delivery_id))}/ack`, {
+          artifact: artifact ?? null,
+        });
+      if (String(req.mode) === "TEXT") {
         try {
-          if (ext === ".txt" || ext === ".md") {
-            const content = fs.readFileSync(fp, "utf8").trim();
-            if (content) for (const c of allowList) await send(c, `📨 ${f}:\n\n${content}`);
-          } else {
-            for (const c of allowList) await sendFile(c, fp);
-          }
-          fs.renameSync(fp, fp + ".sent");
+          const text = `📨 ${trunc(req.text ?? "", 3700)}`;
+          if (text.trim().length > 3) for (const c of allowList) await send(c, text);
+          await ack(null);
         } catch (e) {
-          console.error("outbox send", fp, String(e).slice(0, 120));
+          console.error("delivery text", req.delivery_id, String(e).slice(0, 120));
+        }
+        continue;
+      }
+      for (const art of req.artifacts ?? []) {
+        if (String(art.state) !== "QUEUED") continue;
+        if (!art.path) continue; // unresolved — stays QUEUED, never guessed
+        const fp = String(art.path);
+        const sentMark = `${fp}.sent`;
+        try {
+          if (fs.existsSync(sentMark)) {
+            await ack(art.name); // witness survives crash — never re-send
+            continue;
+          }
+          fs.renameSync(fp, sentMark);
+          try {
+            const ext = path.extname(fp).toLowerCase();
+            if (ext === ".txt" || ext === ".md") {
+              const content = fs.readFileSync(sentMark, "utf8").trim();
+              if (content) for (const c of allowList) await send(c, `📨 ${art.name}:\n\n${content}`);
+            } else {
+              for (const c of allowList) await sendFile(c, sentMark);
+            }
+          } catch (sendErr) {
+            fs.renameSync(sentMark, fp); // transport failed — back, stays QUEUED
+            throw sendErr;
+          }
+          await ack(art.name);
+        } catch (e) {
+          console.error("delivery artifact", req.delivery_id, art.name, String(e).slice(0, 120));
         }
       }
     }
