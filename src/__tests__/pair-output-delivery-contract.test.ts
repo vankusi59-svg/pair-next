@@ -67,6 +67,7 @@ import {
   utcnow,
   verifyOutputLanguageContent,
   DELIVERY_TEXT_ARTIFACT,
+  MAX_TELEGRAM_FILE_BYTES,
   MAX_TEXT_BYTES,
   PAIR_OUTPUT_LANGUAGE_KEY,
   PAIR_PLAN_CONTRACT_KEY,
@@ -1881,5 +1882,256 @@ describe("R3 — hashed bytes ARE the network bytes (post-verification TOCTOU cl
     expect(
       String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
     ).toMatch(/^[0-9a-f]{64}$/i);
+  });
+});
+
+describe("R4 — snapshot-first retry authority + bounded size + tmp cleanup", () => {
+  const mintR4 = (
+    ctx: ReturnType<typeof makeCtx>,
+    file: string,
+    content: string | Buffer,
+  ) => {
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const fp = path.join(outbox, file);
+    fs.writeFileSync(fp, content);
+    const sha = sha256File(fp);
+    return mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_R4", metadata: {} },
+      task: {
+        task_id: "T_R4",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true,
+            mode: "FILES",
+            artifacts: [file],
+          },
+        },
+      },
+      execution: { execution_id: "E_R4" },
+      outboxDir: outbox,
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { [file]: sha },
+    }) as Record<string, unknown>;
+  };
+
+  const snapOf = (ctx: ReturnType<typeof makeCtx>, deliveryId: string, name: string) =>
+    path.join(
+      ctx.workspace,
+      "outbox",
+      ".delivery-snapshots",
+      `${deliveryId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
+    );
+
+  it("Y1. definite send failure → source DELETED → retry sends the retained authorized snapshot", async () => {
+    const ctx = makeCtx("r4-y1");
+    const req = mintR4(ctx, "report.txt", VI_REPORT);
+    // First projection pins the snapshot; first send fails definitely.
+    const projected = pendingTelegramDeliveries(ctx.store);
+    expect(projected).toHaveLength(1);
+    const rec1 = recordingTransport({ fail: new Set(["report.txt"]) });
+    const r1 = await transportTelegramDelivery({
+      request: projected[0],
+      transport: rec1.transport,
+      isAllowed: () => true,
+      backend: storeBackend(ctx, projected[0]),
+    });
+    expect(r1.sent).toEqual([]);
+    // Slot is back to QUEUED with backoff; now the source vanishes.
+    fs.rmSync(path.join(ctx.workspace, "outbox", "report.txt"));
+    const later = new Date(Date.now() + 120_000).toISOString();
+    const rec2 = recordingTransport();
+    const { sent } = await runTransport(ctx, {
+      transport: rec2.transport,
+      now: later,
+    });
+    // The retained snapshot is the retry authority — original bytes ship.
+    expect(sent).toEqual(["report.txt"]);
+    expect(Buffer.from(rec2.calls[0].fileBytes!).toString("utf8")).toBe(VI_REPORT);
+    expect(sha256Hex(Buffer.from(rec2.calls[0].fileBytes!))).toBe(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    );
+  });
+
+  it("Y2. definite send failure → source MUTATED to bytes B → retry still sends snapshot A", async () => {
+    const ctx = makeCtx("r4-y2");
+    mintR4(ctx, "report.txt", VI_REPORT);
+    const projected = pendingTelegramDeliveries(ctx.store);
+    const rec1 = recordingTransport({ fail: new Set(["report.txt"]) });
+    await transportTelegramDelivery({
+      request: projected[0],
+      transport: rec1.transport,
+      isAllowed: () => true,
+      backend: storeBackend(ctx, projected[0]),
+    });
+    fs.writeFileSync(
+      path.join(ctx.workspace, "outbox", "report.txt"),
+      "MUTATED SOURCE BYTES B",
+    );
+    const later = new Date(Date.now() + 120_000).toISOString();
+    const rec2 = recordingTransport();
+    const { sent } = await runTransport(ctx, {
+      transport: rec2.transport,
+      now: later,
+    });
+    expect(sent).toEqual(["report.txt"]);
+    expect(Buffer.from(rec2.calls[0].fileBytes!).toString("utf8")).toBe(VI_REPORT);
+  });
+
+  it("Y3. restart shape: persisted QUEUED TDR + valid retained snapshot + missing source → snapshot reused", async () => {
+    const ctx = makeCtx("r4-y3");
+    const req = mintR4(ctx, "report.txt", VI_REPORT);
+    // First pass pins the snapshot (nothing transported yet).
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(1);
+    // Simulate restart: the workspace producer file is gone, only the
+    // persisted TDR + retained snapshot remain.
+    fs.rmSync(path.join(ctx.workspace, "outbox", "report.txt"));
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["report.txt"]);
+    expect(Buffer.from(rec.calls[0].fileBytes!).toString("utf8")).toBe(VI_REPORT);
+    expect(sha256Hex(Buffer.from(rec.calls[0].fileBytes!))).toBe(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    );
+  });
+
+  it("Y4. wrong-digest snapshot is never sent — reconstruction only from a sha-matching source", async () => {
+    const ctx = makeCtx("r4-y4");
+    const req = mintR4(ctx, "report.txt", VI_REPORT);
+    const id = String(req.delivery_id);
+    const snap = snapOf(ctx, id, "report.txt");
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(1);
+    // Corrupt the retained snapshot — it must never be trusted.
+    fs.writeFileSync(snap, "corrupted snapshot bytes");
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    // Source still matches canonical sha → reconstruction is allowed.
+    expect(sent).toEqual(["report.txt"]);
+    expect(Buffer.from(rec.calls[0].fileBytes!).toString("utf8")).toBe(VI_REPORT);
+    expect(sha256File(snap)).toBe(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    );
+  });
+
+  it("Y5. wrong-digest snapshot + mutated source → durable failure, zero network", async () => {
+    const ctx = makeCtx("r4-y5");
+    const req = mintR4(ctx, "report.txt", VI_REPORT);
+    const id = String(req.delivery_id);
+    const snap = snapOf(ctx, id, "report.txt");
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(1);
+    fs.writeFileSync(snap, "corrupted");
+    fs.writeFileSync(
+      path.join(ctx.workspace, "outbox", "report.txt"),
+      "mutated source",
+    );
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    const after = ctx.store.get("telegram_delivery_request", id);
+    expect(after.status).toBe("FAILED_DELIVERY");
+    const failedArt = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(failedArt.state).toBe("FAILED_DELIVERY");
+    expect(String(failedArt.last_error)).toContain("FAIL_CLOSED_TELEGRAM_ARTIFACT");
+  });
+
+  it("Y6. size bound: exactly at maximum → permitted; max+1 → durable terminal failure, 0 begin, 0 network, never repolled", async () => {
+    const ctx = makeCtx("r4-y6");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    // Exactly at the bound → allowed.
+    const okBuf = Buffer.alloc(MAX_TELEGRAM_FILE_BYTES, 0x61);
+    fs.writeFileSync(path.join(outbox, "big-ok.txt"), okBuf);
+    const shaOk = sha256File(path.join(outbox, "big-ok.txt"));
+    mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_Y6A", metadata: {} },
+      task: {
+        task_id: "T_Y6A",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true, mode: "FILES", artifacts: ["big-ok.txt"],
+          },
+        },
+      },
+      execution: { execution_id: "E_Y6A" },
+      outboxDir: outbox,
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { "big-ok.txt": shaOk },
+    });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["big-ok.txt"]);
+    expect(rec.calls[0].fileBytes!.length).toBe(MAX_TELEGRAM_FILE_BYTES);
+
+    // max + 1 byte → durable terminal failure.
+    const ctx2 = makeCtx("r4-y6b");
+    const outbox2 = path.join(ctx2.workspace, "outbox");
+    fs.mkdirSync(outbox2, { recursive: true });
+    const bigBuf = Buffer.alloc(MAX_TELEGRAM_FILE_BYTES + 1, 0x62);
+    fs.writeFileSync(path.join(outbox2, "big.txt"), bigBuf);
+    const shaBig = sha256File(path.join(outbox2, "big.txt"));
+    const req2 = mintTelegramDeliveryRequest({
+      store: ctx2.store,
+      mission: { mission_id: "M_Y6B", metadata: {} },
+      task: {
+        task_id: "T_Y6B",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true, mode: "FILES", artifacts: ["big.txt"],
+          },
+        },
+      },
+      execution: { execution_id: "E_Y6B" },
+      outboxDir: outbox2,
+      workspace: ctx2.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { "big.txt": shaBig },
+    }) as Record<string, unknown>;
+    const rec2 = recordingTransport();
+    const r2 = await runTransport(ctx2, { transport: rec2.transport });
+    expect(r2.sent).toEqual([]);
+    expect(rec2.calls).toHaveLength(0); // zero network, zero begin
+    const after = ctx2.store.get(
+      "telegram_delivery_request",
+      String(req2.delivery_id),
+    );
+    expect(after.status).toBe("FAILED_DELIVERY");
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(String(art.last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE",
+    );
+    expect(art.state).toBe("FAILED_DELIVERY");
+    expect(art.attempt_started_at).toBeUndefined(); // never claimed
+    // Second poll does not attempt it again.
+    const again = await runTransport(ctx2, { transport: rec2.transport });
+    expect(again.sent).toEqual([]);
+    expect(rec2.calls).toHaveLength(0);
+  }, 30000);
+
+  it("Y7. orphan <snap>.tmp cleaned with terminal lifecycle; empty dir removed", async () => {
+    const ctx = makeCtx("r4-y7");
+    const req = mintR4(ctx, "report.txt", VI_REPORT);
+    const id = String(req.delivery_id);
+    const snap = snapOf(ctx, id, "report.txt");
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(1);
+    // Crash-shaped artifact: a stale staging tmp beside the snapshot.
+    fs.writeFileSync(`${snap}.tmp`, "orphan tmp");
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["report.txt"]);
+    // Terminal (SENT) → next pass removes snapshot AND its orphan tmp.
+    pendingTelegramDeliveries(ctx.store);
+    expect(fs.existsSync(snap)).toBe(false);
+    expect(fs.existsSync(`${snap}.tmp`)).toBe(false);
+    expect(
+      fs.existsSync(path.join(ctx.workspace, "outbox", ".delivery-snapshots")),
+    ).toBe(false);
   });
 });

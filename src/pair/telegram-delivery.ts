@@ -174,6 +174,12 @@ export function telegramDeliveryBackoffSeconds(attemptCount: number): number {
  *  the PAIR_TG_DELIVERY_STALE_AFTER_MS env wiring (bounded, validated). */
 export const TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS = 60_000;
 
+/** R3/R4.2 — bounded byte materialization: the Telegram Bot API caps
+ *  bot uploads at ~50MB; a pinned artifact beyond this bound can never
+ *  send, so it converges to a durable terminal failure rather than
+ *  polling QUEUED forever (checked by stat BEFORE any full read). */
+export const MAX_TELEGRAM_FILE_BYTES = 48 * 1024 * 1024;
+
 export function deliveryRequestId(missionId: string, taskId: string): string {
   return `TDR_${digest(`telegram_delivery:${missionId}:${taskId}`).slice(0, 24)}`;
 }
@@ -223,12 +229,13 @@ function pruneDeliverySnapshots(req: Record<string, unknown>): void {
       if (!requestTerminal && !TERMINAL_DELIVERY_SLOT.has(String(a.state))) {
         continue;
       }
-      try {
-        fs.rmSync(deliverySnapshotPath(outbox, id, String(a.name)), {
-          force: true,
-        });
-      } catch {
-        /* best effort — a missing snapshot is already pruned */
+      const snap = deliverySnapshotPath(outbox, id, String(a.name));
+      for (const p of [snap, `${snap}.tmp`]) {
+        try {
+          fs.rmSync(p, { force: true });
+        } catch {
+          /* best effort — a missing snapshot is already pruned */
+        }
       }
     }
   }
@@ -867,68 +874,127 @@ export function pendingTelegramDeliveries(
         dirty = true;
         continue;
       }
-      const p = resolveDeliveryArtifactPath({
-        outboxDir: String(req.outbox_dir),
-        workspace: req.workspace ? String(req.workspace) : undefined,
-        name: String(a.name),
-      });
-      if (!p) {
-        a.state = "FAILED_DELIVERY";
-        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
-        a.completed_at = ts;
-        dirty = true;
-        continue;
-      }
-      // Canonical artifact identity replayed at send time: a manifested
-      // artifact mutated between mint and dispatch never reaches the
-      // bridge — durable terminal failure, zero network call burned.
-      let actual: string | null = null;
-      try {
-        actual = sha256File(p);
-      } catch {
-        actual = null;
-      }
-      if (actual !== a.sha256) {
-        a.state = "FAILED_DELIVERY";
-        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
-        a.completed_at = ts;
-        dirty = true;
-        continue;
-      }
-      // R2.3 — pin the verified bytes: the wire artifact must be the
-      // exact digest-authorized content, not whatever the workspace
-      // path holds at send time (TOCTOU between projection and send).
-      // Write the verified bytes into a request-owned snapshot and
-      // project THAT path; the snapshot lives in a dedicated hidden
-      // subdir so artifact-name resolution never confuses it for a
-      // manifested sibling. R3 — durability: the staged file data is
-      // fsynced before the atomic rename so a crash cannot leave a
-      // half-written snapshot masquerading as the authorized bytes.
+      // R4.1 — snapshot-first authority: the immutable identity is the
+      // TDR slot sha256; the pinned snapshot is its retained byte
+      // realization. A VALID snapshot (sha256 == slot digest) is
+      // already the canonical transport authority — reuse it; the
+      // mutable producer/workspace file is NOT required to still exist
+      // and is never re-read while a valid snapshot stands (source
+      // drift/deletion after a failed attempt cannot kill the retry).
       const snapDir = path.join(String(req.outbox_dir), DELIVERY_SNAPSHOT_DIR);
       const snapPath = deliverySnapshotPath(
         String(req.outbox_dir),
         String(req.delivery_id),
         String(a.name),
       );
+      let snapshotValid = false;
       try {
-        fs.mkdirSync(snapDir, { recursive: true });
-        const tmp = `${snapPath}.tmp`;
-        const bytes = fs.readFileSync(p);
-        const fd = fs.openSync(tmp, "w");
-        try {
-          fs.writeSync(fd, bytes);
-          fs.fsyncSync(fd);
-        } finally {
-          fs.closeSync(fd);
-        }
-        fs.renameSync(tmp, snapPath);
-        if (sha256File(snapPath) !== a.sha256) throw new Error("snapshot_digest_mismatch");
+        snapshotValid = sha256File(snapPath) === a.sha256;
       } catch {
-        a.state = "FAILED_DELIVERY";
-        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
-        a.completed_at = ts;
-        dirty = true;
-        continue;
+        snapshotValid = false;
+      }
+      if (!snapshotValid) {
+        // A mismatched snapshot is never trusted — replace it only from
+        // the canonical source: source must exist AND its sha256 must
+        // equal the slot digest (reconstruction is a fallback, not a
+        // re-baseline). Drop this delivery's own stale staging tmp from
+        // any crashed attempt first (R4.3).
+        try {
+          fs.rmSync(`${snapPath}.tmp`, { force: true });
+        } catch {
+          /* best effort */
+        }
+        const p = resolveDeliveryArtifactPath({
+          outboxDir: String(req.outbox_dir),
+          workspace: req.workspace ? String(req.workspace) : undefined,
+          name: String(a.name),
+        });
+        if (!p) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        // Canonical artifact identity replayed at send time: a
+        // manifested artifact mutated between mint and dispatch never
+        // reaches the bridge — durable terminal failure, zero network
+        // call burned.
+        let actual: string | null = null;
+        try {
+          actual = sha256File(p);
+        } catch {
+          actual = null;
+        }
+        if (actual !== a.sha256) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        // R4.2 — stat-first bound: never read the file merely to
+        // discover it exceeds the transport size cap.
+        try {
+          if (fs.statSync(p).size > MAX_TELEGRAM_FILE_BYTES) {
+            a.state = "FAILED_DELIVERY";
+            a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE";
+            a.completed_at = ts;
+            dirty = true;
+            continue;
+          }
+        } catch {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        // R2.3 — pin the verified bytes: the wire artifact must be the
+        // exact digest-authorized content, not whatever the workspace
+        // path holds at send time (TOCTOU between projection and send).
+        // Write the verified bytes into the request-owned snapshot and
+        // project THAT path. R3 — durability: the staged file data is
+        // fsynced before the atomic rename so a crash cannot leave a
+        // half-written snapshot masquerading as the authorized bytes.
+        try {
+          fs.mkdirSync(snapDir, { recursive: true });
+          const tmp = `${snapPath}.tmp`;
+          const bytes = fs.readFileSync(p);
+          const fd = fs.openSync(tmp, "w");
+          try {
+            fs.writeSync(fd, bytes);
+            fs.fsyncSync(fd);
+          } finally {
+            fs.closeSync(fd);
+          }
+          fs.renameSync(tmp, snapPath);
+          if (sha256File(snapPath) !== a.sha256) {
+            throw new Error("snapshot_digest_mismatch");
+          }
+        } catch {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+      } else {
+        // R4.2 — the retained snapshot is the transport authority; an
+        // oversized one can never be sent. Converge durably now (stat
+        // only — no full read), zero begin, zero network.
+        try {
+          if (fs.statSync(snapPath).size > MAX_TELEGRAM_FILE_BYTES) {
+            a.state = "FAILED_DELIVERY";
+            a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE";
+            a.completed_at = ts;
+            dirty = true;
+            continue;
+          }
+        } catch {
+          // Snapshot vanished between check and stat — rebuild next pass.
+          continue;
+        }
       }
       if (a.next_retry_at && a.next_retry_at > ts) continue; // backoff
       projected.push({

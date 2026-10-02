@@ -33,12 +33,12 @@
 
 import fs from "node:fs";
 import { digest, sha256Hex } from "./canonical.js";
-import { SHA256_HEX_RE } from "./telegram-delivery.js";
+import {
+  MAX_TELEGRAM_FILE_BYTES,
+  SHA256_HEX_RE,
+} from "./telegram-delivery.js";
 
-/** R3 — bounded byte materialization: the Telegram Bot API caps bot
- *  uploads at ~50MB; a pinned artifact beyond this bound can never
- *  send, so it is skipped before any attempt is claimed. */
-export const MAX_TELEGRAM_FILE_BYTES = 48 * 1024 * 1024;
+export { MAX_TELEGRAM_FILE_BYTES };
 
 export type GovernedSendResult =
   | { kind: "ok"; message_id?: string | number }
@@ -253,18 +253,23 @@ export async function transportTelegramDelivery(args: {
     if (String(art.state) !== "QUEUED" || !art.path) continue;
     const name = String(art.name);
     const fp = String(art.path);
-    // R3 — HASHED BYTES === CLAIMED BYTES === NETWORK BYTES: the pinned
-    // snapshot is read ONCE into a bounded buffer, the slot's
-    // authorized sha256 is verified against THAT buffer, and the same
-    // verified bytes are handed to the sender. There is no filesystem
-    // read between verification and payload construction — a mutation
-    // landing after the read cannot alter what is transmitted (the
-    // next projection re-verifies the source and converges the slot).
+    // R3/R4 — HASHED BYTES === CLAIMED BYTES === NETWORK BYTES: stat
+    // the pinned snapshot FIRST (no full read merely to discover the
+    // size), read it ONCE into a bounded buffer, prove the actual read
+    // length matches the stat (no mid-read growth), then verify the
+    // buffer against the slot's authorized sha256 — the SAME verified
+    // bytes are handed to the sender. No filesystem read exists
+    // between verification and payload construction.
     const wantSha = String(art.sha256 ?? "");
     let bytes: Buffer | null = null;
     try {
-      const b = fs.readFileSync(fp);
-      bytes = b.length <= MAX_TELEGRAM_FILE_BYTES ? b : null;
+      const st = fs.statSync(fp);
+      if (st.size > MAX_TELEGRAM_FILE_BYTES) {
+        bytes = null;
+      } else {
+        const b = fs.readFileSync(fp);
+        bytes = b.length === st.size ? b : null;
+      }
     } catch {
       bytes = null;
     }

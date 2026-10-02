@@ -634,3 +634,69 @@ Classification:
 `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R3_PENDING_REAUDIT`
 
 STOP. DO NOT MERGE. Await independent re-audit.
+
+# INDEPENDENT RE-AUDIT R4 REMEDIATION
+
+- **Previous audited HEAD:** `2ba03aa024ddac67024834c07f60b9a5e2782619`
+- **New HEAD:** see git log (this section committed on the same PR #30)
+- **Changed files:**
+  - `src/pair/telegram-delivery.ts` — snapshot-first FILES projection authority; stat-first size bound converging oversized artifacts to durable `FAILED_DELIVERY`; orphan `<snap>.tmp` cleanup in `pruneDeliverySnapshots`; `MAX_TELEGRAM_FILE_BYTES` moved here as the owning constant.
+  - `src/pair/telegram-transport.ts` — stat → bounded read → actual-length verification → sha256 → `begin` → send-same-buffer ordering; re-exports the bound for consumers.
+  - `src/__tests__/pair-output-delivery-contract.test.ts` — 7 new R4 adversarial regressions (Y1–Y7).
+  - `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_AUTHORITY_REPORT.md` — this section.
+
+## RCA (re-audit verdicts)
+
+- **R4.1 — retry authority inverted.** Even with R3 byte-materialization, every FILES projection still resolved + re-verified the MUTABLE source first and rewrote the snapshot from it. After a definite send failure (`QUEUED` + backoff), any later source mutation/deletion killed the retry even though the already-authorized retained snapshot was intact — defeating the entire purpose of snapshot retention for retries and restart durability.
+- **R4.2 — the size bound was not a bound.** Transport did `readFileSync` BEFORE checking `length <= MAX_TELEGRAM_FILE_BYTES`, so a huge file was fully allocated before rejection; worse, the oversized slot only hit `continue`, staying QUEUED forever — an infinite poll.
+- **R4.3 — orphan temp files.** `pruneDeliverySnapshots` removed only the final snapshot path; a crash between tmp write/fsync and `rename` left `<snap>.tmp` hidden in `.delivery-snapshots/` indefinitely.
+
+## R4.1 — Snapshot-first authority order
+
+New FILES projection order per QUEUED slot:
+
+1. Compute the deterministic snapshot path (`deliverySnapshotPath(outbox, delivery_id, name)`).
+2. **Reuse check:** `sha256File(snapPath) === slot.sha256` → the retained snapshot is ALREADY the canonical transport authority — project it directly. The mutable source is never required and never re-read while a valid snapshot stands.
+3. **Reconstruction fallback (only when no valid snapshot):** drop this delivery's own stale `.tmp` → resolve the canonical source → `sha256File(source) === slot.sha256` → stat-bound check → tmp-write → fsync → atomic rename → re-hash.
+4. A mismatched snapshot is never trusted: reconstruction runs against the source digest, and a missing/mismatched source converges to the same durable `FAILED_DELIVERY` (`..._UNRESOLVED` / `..._ARTIFACT_DIGEST`) as before — never a re-baseline to current bytes.
+
+The immutable identity remains the TDR slot sha256; the snapshot is its retained byte realization; the producer file is only a snapshot creation source.
+
+**Proofs (Y1–Y5):**
+- Y1: definite send failure → source deleted → retry after backoff sends the retained snapshot (fileBytes decode to the original text; sha256(fileBytes) === slot digest).
+- Y2: same failure → source mutated to bytes B → retry still ships bytes A.
+- Y3: restart shape — persisted QUEUED TDR + valid snapshot + missing source → snapshot reused, authorized bytes sent.
+- Y4: corrupted snapshot → never sent; reconstruction allowed only because the source still matches canonical sha256 (snapshot re-pinned with the authorized digest).
+- Y5: corrupted snapshot + mutated source → durable `FAILED_DELIVERY`, 0 network calls.
+
+## R4.2 — Bounded size enforcement
+
+- Projection-side: `fs.statSync` BEFORE any full read — source stat > `MAX_TELEGRAM_FILE_BYTES` → slot `FAILED_DELIVERY` + `FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE` (durable, zero `begin()`, zero network, never repolled). A retained oversized snapshot hits the same stat gate.
+- Transport-side: `statSync` → skip when over bound (defense) → `readFileSync` → actual read length MUST equal the stat size (`b.length === st.size`, no mid-read growth) → `sha256Hex(buffer) === slot.sha256` → `begin` → `send({fileBytes})`.
+- Y6 proof: a file of exactly `MAX_TELEGRAM_FILE_BYTES` sends (48MB fileBytes delivered); `MAX + 1` bytes → `FAILED_DELIVERY`/`TOO_LARGE`, 0 calls, `attempt_started_at` absent (never claimed), second poll still 0 calls.
+
+## R4.3 — Orphan temp lifecycle
+
+- `pruneDeliverySnapshots` removes `<snap>` AND `<snap>.tmp` for every terminal slot (and all slots of a terminal request); `.delivery-snapshots/` is `rmdir`'d when empty. Pruning is best-effort and scoped to this request's deterministic paths — another active delivery's staging object can never be removed.
+- A new staging attempt first removes its own stale `<snap>.tmp` (`rmSync` force) before rewriting.
+- Y7 proof: hand-created orphan `.tmp` beside a SENT delivery → next projection pass removes snapshot + tmp + empty dir.
+
+## Validation counts
+
+| Suite | Result |
+|---|---|
+| `pair-output-delivery-contract` (focused) | **64/64** (57 prior + 7 new R4 Y1–Y7) |
+| `pair-planner-dataflow-incident` | **106/106** |
+| `pair-ops-telegram-delivery` | **3/3** |
+| `pair-p9` (telegram lifecycle/transport) | **79/79** |
+| **Full suite** | **2806 pass / 2 failed / 15 skipped** — the 2 failures are the pre-existing `pair-p5` env-only tests 2+3 (expect `stockProbe.available===false`/EXECUTABLE_NOT_FOUND; this VM ships the binaries → `available===true`). Identical to the R3 baseline; unrelated. |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+Zero-network proofs: Y5 (no call when both snapshots and source can't satisfy the digest), Y6 oversized (0 calls, 0 claims), plus all R2/R3 gates unchanged — a snapshot that fails digest verification never reaches `begin()`; `sendFile` fail-closes on missing `fileBytes`.
+
+## Classification
+
+`PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R4_PENDING_REAUDIT`
+
+STOP. DO NOT MERGE. Await independent re-audit.
