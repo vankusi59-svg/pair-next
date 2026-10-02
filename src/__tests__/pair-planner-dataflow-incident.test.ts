@@ -50,6 +50,7 @@ import {
   deliveryRequestId,
   transportTelegramDelivery,
   beginDeliveryAttempt,
+  mintTelegramDeliveryRequest,
   deliveryManifest,
   createPlanPreview as persistPlanPreviewRow,
   TRANSPORT_IN_PROCESS,
@@ -846,6 +847,8 @@ function recordingTransport(opts?: {
   explode?: Set<string>;
   /** R4 §11 — transport claims ok but returns NO message_id. */
   noMid?: Set<string>;
+  /** R5 §12 — force a specific (possibly invalid) message_id value. */
+  midOverride?: Map<string, unknown>;
   onSend?: () => void;
 }): { calls: SendCall[]; transport: GovernedTelegramTransport } {
   const calls: SendCall[] = [];
@@ -859,7 +862,11 @@ function recordingTransport(opts?: {
         if (opts?.explode?.has(key)) throw new Error("socket died mid-send");
         if (opts?.fail?.has(key)) return { kind: "fail", error: "400 Bad Request: chat not found" };
         if (opts?.noMid?.has(key)) return { kind: "ok" };
-        return { kind: "ok", message_id: `MID_${key}` };
+        if (opts?.midOverride?.has(key)) {
+          return { kind: "ok", message_id: opts.midOverride.get(key) as number };
+        }
+        // R5 §4 — realistic numeric Telegram message_id (Bot API Integer).
+        return { kind: "ok", message_id: 1001 };
       },
     },
   };
@@ -1600,7 +1607,7 @@ describe("R3 §14 — governed transport failure semantics", () => {
     expect(after.status).toBe("SENT");
     const art = (after.artifacts as Array<Record<string, unknown>>)[0];
     expect(art.state).toBe("SENT");
-    expect(art.message_id).toBe("MID_report.txt");
+    expect(art.message_id).toBe(1001);
     expect(art.completed_at).toBeTruthy();
     // No '.sent' filename witness exists anywhere.
     const outbox = path.join(ctx.workspace, "outbox");
@@ -1724,9 +1731,9 @@ describe("R4 §9-10 — TEXT crash windows are identical to FILES", () => {
     const after = ctx.store.get("telegram_delivery_request", id);
     expect(after.text_state).toBe("UNKNOWN_SIDE_EFFECT");
     expect(String(after.unknown_reason)).toContain("stale_sending");
-    // Never re-projected as sendable, never claimed SENT.
+    // R5 §3/§11 — stale reconcile recomputes the REQUEST aggregate too.
     expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
-    expect(after.status).not.toBe("SENT");
+    expect(after.status).toBe("UNKNOWN_SIDE_EFFECT");
     const { sent: again } = await runTransport(ctx, { transport: rec.transport });
     expect(again).toEqual([]);
     expect(rec.calls).toHaveLength(0);
@@ -1758,7 +1765,7 @@ describe("R4 §9-10 — TEXT crash windows are identical to FILES", () => {
     expect(rec.calls).toHaveLength(1); // zero resend
     const after = ctx.store.get("telegram_delivery_request", id);
     expect(after.text_state).toBe("UNKNOWN_SIDE_EFFECT");
-    expect(after.status).not.toBe("SENT");
+    expect(after.status).toBe("UNKNOWN_SIDE_EFFECT");
     expect(after.message_id).toBeUndefined(); // never false SENT
   });
 });
@@ -1794,7 +1801,7 @@ describe("R4 §11 — SENT requires real message_id evidence", () => {
     const { request } = await startDeliveryMission(ctx, {});
     const id = String(request.delivery_id);
     ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" });
-    for (const mid of [undefined, null, ""]) {
+    for (const mid of [undefined, null, "", "MID_fake", "123", 0, -1, 1.5]) {
       expect(() =>
         ctx.control.transitionTelegramDelivery(id, {
           artifact: "report.txt", to: "SENT", message_id: mid as string,
@@ -1803,9 +1810,9 @@ describe("R4 §11 — SENT requires real message_id evidence", () => {
     }
     const after = ctx.store.get("telegram_delivery_request", id);
     expect((after.artifacts as Array<Record<string, unknown>>)[0].state).toBe("SENDING");
-    // …and a real message_id still lands SENT.
+    // …and a real positive-integer message_id still lands SENT.
     ctx.control.transitionTelegramDelivery(id, {
-      artifact: "report.txt", to: "SENT", message_id: "MID_1",
+      artifact: "report.txt", to: "SENT", message_id: 1001,
     });
     expect(ctx.store.get("telegram_delivery_request", id).status).toBe("SENT");
   });
@@ -1902,7 +1909,7 @@ describe("R4 §13-14 — /ack bypass removed + strict transition matrix", () => 
 
     // QUEUED→SENT rejected.
     expect(() =>
-      ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENT", message_id: "MID_1" }),
+      ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENT", message_id: 1001 }),
     ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
 
     // QUEUED→SENDING: deterministic attempt id (R4 §7).
@@ -1926,7 +1933,7 @@ describe("R4 §13-14 — /ack bypass removed + strict transition matrix", () => 
     expect(r2.status).toBe("UNSENDABLE");
     expect(() =>
       ctx2.control.transitionTelegramDelivery(String(r2.delivery_id), {
-        artifact: "report.txt", to: "SENT", message_id: "MID_1",
+        artifact: "report.txt", to: "SENT", message_id: 1001,
       }),
     ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY/);
 
@@ -1935,10 +1942,192 @@ describe("R4 §13-14 — /ack bypass removed + strict transition matrix", () => 
     const { request: r3 } = await startDeliveryMission(ctx3, {});
     const id3 = String(r3.delivery_id);
     ctx3.control.transitionTelegramDelivery(id3, { artifact: "report.txt", to: "SENDING" });
-    ctx3.control.transitionTelegramDelivery(id3, { artifact: "report.txt", to: "SENT", message_id: "MID_1" });
+    ctx3.control.transitionTelegramDelivery(id3, { artifact: "report.txt", to: "SENT", message_id: 1001 });
     expect(ctx3.store.get("telegram_delivery_request", id3).status).toBe("SENT");
     expect(() =>
       ctx3.control.transitionTelegramDelivery(id3, { artifact: "report.txt", to: "SENDING" }),
     ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
+  });
+});
+
+describe("R5 — aggregate request status + strict evidence + unresolved convergence", () => {
+  /** Mint a canonical multi-artifact FILES request directly (the same
+   *  authority path the runtime uses — task carries the PAIR-stamped
+   *  manifest). */
+  function mintFilesRequest(
+    ctx: ReturnType<typeof makeCtx>,
+    names: string[],
+  ): Record<string, unknown> {
+    fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
+    const req = mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_R5", metadata: {} },
+      task: {
+        task_id: "T3",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true, mode: "FILES", artifacts: names,
+          },
+        },
+      },
+      execution: { execution_id: "E_R5" },
+      outboxDir: path.join(ctx.workspace, "outbox"),
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+    });
+    expect(req).toBeTruthy();
+    return req as Record<string, unknown>;
+  }
+  const artOf = (ctx: ReturnType<typeof makeCtx>, id: string, name: string) =>
+    (ctx.store.get("telegram_delivery_request", id).artifacts as Array<Record<string, unknown>>)
+      .find((a) => a.name === name)!;
+  const reqOf = (ctx: ReturnType<typeof makeCtx>, id: string) =>
+    ctx.store.get("telegram_delivery_request", id);
+  const T = "2026-01-02T00:00:00.000Z";
+  const plus = (sec: number) => new Date(Date.parse(T) + sec * 1000).toISOString();
+
+  it("§7. mixed SENT + FAILED_DELIVERY → request FAILED_DELIVERY (never dead QUEUED), zero further sends", async () => {
+    const ctx = makeCtx("r5-mixed-sf");
+    const req = mintFilesRequest(ctx, ["a.txt", "b.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "b.txt"), "B");
+    const id = String(req.delivery_id);
+    const rec = recordingTransport({ fail: new Set(["b.txt"]) });
+    // Poll 1: a.txt sent (mid 1001); b.txt fail → QUEUED + backoff.
+    await runTransport(ctx, { transport: rec.transport, now: T });
+    expect(artOf(ctx, id, "a.txt").state).toBe("SENT");
+    expect(artOf(ctx, id, "b.txt").state).toBe("QUEUED");
+    expect(reqOf(ctx, id).status).toBe("QUEUED");
+    // Burn b.txt's remaining attempts through the backoff windows.
+    await runTransport(ctx, { transport: rec.transport, now: plus(6) }); // attempt 2
+    await runTransport(ctx, { transport: rec.transport, now: plus(17) }); // attempt 3 → ceiling
+    expect(artOf(ctx, id, "b.txt").state).toBe("FAILED_DELIVERY");
+    expect(artOf(ctx, id, "a.txt").state).toBe("SENT");
+    expect(reqOf(ctx, id).status).toBe("FAILED_DELIVERY"); // NOT dead QUEUED
+    expect(pendingTelegramDeliveries(ctx.store, plus(600))).toHaveLength(0);
+    expect(rec.calls.map((c) => c.name)).toEqual(["a.txt", "b.txt", "b.txt", "b.txt"]);
+    const later = await runTransport(ctx, { transport: rec.transport, now: plus(600) });
+    expect(later.sent).toEqual([]);
+    expect(rec.calls).toHaveLength(4);
+  });
+
+  it("§8. mixed SENT + UNKNOWN_SIDE_EFFECT → request UNKNOWN_SIDE_EFFECT; a.txt never resends", async () => {
+    const ctx = makeCtx("r5-mixed-su");
+    const req = mintFilesRequest(ctx, ["a.txt", "b.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "b.txt"), "B");
+    const id = String(req.delivery_id);
+    const rec = recordingTransport({ explode: new Set(["b.txt"]) });
+    await runTransport(ctx, { transport: rec.transport, now: T });
+    expect(artOf(ctx, id, "a.txt").state).toBe("SENT");
+    expect(artOf(ctx, id, "b.txt").state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(reqOf(ctx, id).status).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(pendingTelegramDeliveries(ctx.store, plus(600))).toHaveLength(0);
+    const later = await runTransport(ctx, { transport: rec.transport, now: plus(600) });
+    expect(later.sent).toEqual([]);
+    expect(rec.calls).toHaveLength(2); // a once, b once — never again
+  });
+
+  it("§9. FAILED_DELIVERY + UNKNOWN_SIDE_EFFECT → request UNKNOWN_SIDE_EFFECT (ambiguity dominates)", async () => {
+    const ctx = makeCtx("r5-mixed-fu");
+    const req = mintFilesRequest(ctx, ["a.txt", "b.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "b.txt"), "B");
+    const id = String(req.delivery_id);
+    const rec = recordingTransport({ fail: new Set(["a.txt"]), explode: new Set(["b.txt"]) });
+    await runTransport(ctx, { transport: rec.transport, now: T }); // a fail1, b unknown
+    await runTransport(ctx, { transport: rec.transport, now: plus(6) }); // a fail2
+    await runTransport(ctx, { transport: rec.transport, now: plus(17) }); // a fail3 → FAILED_DELIVERY
+    expect(artOf(ctx, id, "a.txt").state).toBe("FAILED_DELIVERY");
+    expect(artOf(ctx, id, "b.txt").state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(reqOf(ctx, id).status).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(pendingTelegramDeliveries(ctx.store, plus(600))).toHaveLength(0);
+    expect(rec.calls).toHaveLength(4);
+  });
+
+  it("§10. backoff-pending slot keeps request legitimately QUEUED; after expiry only that slot projects", async () => {
+    const ctx = makeCtx("r5-backoff");
+    const req = mintFilesRequest(ctx, ["a.txt", "b.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "b.txt"), "B");
+    const id = String(req.delivery_id);
+    const rec = recordingTransport({ fail: new Set(["b.txt"]) });
+    await runTransport(ctx, { transport: rec.transport, now: T });
+    expect(reqOf(ctx, id).status).toBe("QUEUED"); // b still progressable
+    // Before b's backoff expires: nothing projected, zero sends.
+    const early = await runTransport(ctx, { transport: recordingTransport().transport, now: plus(2) });
+    expect(early.sent).toEqual([]);
+    // After expiry: only b.txt projects; a.txt never reappears.
+    const rec2 = recordingTransport();
+    const later = await runTransport(ctx, { transport: rec2.transport, now: plus(6) });
+    expect(later.sent).toEqual(["b.txt"]);
+    expect(rec2.calls.map((c) => c.name)).toEqual(["b.txt"]);
+    expect(reqOf(ctx, id).status).toBe("SENT");
+  });
+
+  it("§11. stale single-FILE SENDING reconciles slot AND request to UNKNOWN_SIDE_EFFECT", async () => {
+    const ctx = makeCtx("r5-stale-file");
+    const req = mintFilesRequest(ctx, ["a.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    const id = String(req.delivery_id);
+    ctx.control.transitionTelegramDelivery(id, { artifact: "a.txt", to: "SENDING" });
+    expect(artOf(ctx, id, "a.txt").state).toBe("SENDING");
+    // "Restart": the stale reconcile inside the pending projection.
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
+    expect(artOf(ctx, id, "a.txt").state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(reqOf(ctx, id).status).toBe("UNKNOWN_SIDE_EFFECT");
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  it("§12. strict message_id — invalid values never SENT at transport or domain; 1001 lands SENT", async () => {
+    // Transport level: ok + invalid evidence → UNKNOWN_SIDE_EFFECT.
+    for (const bad of ["MID_fake", "123", 0, -1, 1.5, NaN, null] as const) {
+      const ctx = makeCtx(`r5-mid-${String(bad).replace(/[^a-z0-9]/gi, "")}`);
+      const req = mintFilesRequest(ctx, ["a.txt"]);
+      fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+      const id = String(req.delivery_id);
+      const rec = recordingTransport({ midOverride: new Map([["a.txt", bad]]) });
+      await runTransport(ctx, { transport: rec.transport, now: T });
+      expect(artOf(ctx, id, "a.txt").state).toBe("UNKNOWN_SIDE_EFFECT");
+      expect(artOf(ctx, id, "a.txt").message_id).toBeUndefined();
+      expect(reqOf(ctx, id).status).toBe("UNKNOWN_SIDE_EFFECT");
+    }
+    // Domain level: invalid ids rejected fail-closed; 1001 lands SENT.
+    const ctx = makeCtx("r5-mid-domain");
+    const req = mintFilesRequest(ctx, ["a.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    const id = String(req.delivery_id);
+    ctx.control.transitionTelegramDelivery(id, { artifact: "a.txt", to: "SENDING" });
+    for (const bad of [undefined, null, "", "MID_fake", "123", 0, -1, 1.5, NaN]) {
+      expect(() =>
+        ctx.control.transitionTelegramDelivery(id, {
+          artifact: "a.txt", to: "SENT", message_id: bad as number,
+        }),
+      ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_EVIDENCE/);
+    }
+    ctx.control.transitionTelegramDelivery(id, { artifact: "a.txt", to: "SENT", message_id: 1001 });
+    expect(artOf(ctx, id, "a.txt").state).toBe("SENT");
+    expect(artOf(ctx, id, "a.txt").message_id).toBe(1001);
+    expect(reqOf(ctx, id).status).toBe("SENT");
+  });
+
+  it("§13. unresolvable manifested artifact → durable FAILED_DELIVERY + FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED, ZERO network calls", async () => {
+    const ctx = makeCtx("r5-unresolved");
+    const req = mintFilesRequest(ctx, ["report.txt"]); // file never produced
+    const id = String(req.delivery_id);
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0); // zero Telegram network calls
+    expect(artOf(ctx, id, "report.txt").state).toBe("FAILED_DELIVERY");
+    expect(String(artOf(ctx, id, "report.txt").last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED",
+    );
+    expect(reqOf(ctx, id).status).toBe("FAILED_DELIVERY"); // not dead QUEUED
+    expect(pendingTelegramDeliveries(ctx.store, plus(600))).toHaveLength(0);
   });
 });

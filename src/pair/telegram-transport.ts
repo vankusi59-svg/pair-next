@@ -107,10 +107,11 @@ export async function transportTelegramDelivery(args: {
       // transport `ok` without message_id is ambiguous: classify
       // UNKNOWN_SIDE_EFFECT, never SENT.
       const mid = r.message_id;
+      // R5 §4 — Telegram `message_id` is an Integer; only a positive
+      // safe integer is canonical acceptance evidence. "MID_fake",
+      // "123", 0, -1, 1.5, NaN → UNKNOWN, never SENT.
       const valid =
-        typeof mid === "number"
-          ? Number.isFinite(mid)
-          : typeof mid === "string" && mid.trim().length > 0;
+        typeof mid === "number" && Number.isSafeInteger(mid) && mid > 0;
       if (!valid) {
         await args.backend.unknown(artifact, "acceptance_unproven:no message_id");
         return false;

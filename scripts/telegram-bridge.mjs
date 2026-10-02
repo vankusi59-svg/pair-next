@@ -132,10 +132,9 @@ async function governedSend({ chatId, text, filePath, name }) {
     // R4 §2 — a claimed success WITHOUT a real message_id is ambiguous:
     // validate response evidence here, never trust `ok` alone.
     const mid = result?.message_id;
+    // R5 §4 — Bot API message_id is an Integer; only positive safe ints.
     const validId =
-      typeof mid === "number"
-        ? Number.isFinite(mid)
-        : typeof mid === "string" && mid.trim().length > 0;
+      typeof mid === "number" && Number.isSafeInteger(mid) && mid > 0;
     if (!validId) {
       return { kind: "unknown", error: "acceptance_unproven:no message_id" };
     }

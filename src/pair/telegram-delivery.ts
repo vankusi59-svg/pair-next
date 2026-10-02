@@ -43,10 +43,14 @@
  *   FAILED_DELIVERY, a durable terminal hold — no automatic human
  *   approval, no infinite bridge retry.
  *
- * Request-level status: QUEUED → SENT (all payloads SENT) |
- * FAILED_DELIVERY (all payloads terminal-failed) | UNSENDABLE
+ * Request-level aggregate status (R5 §2): QUEUED → SENT (all payloads
+ * SENT) | FAILED_DELIVERY (terminal deterministic failures, no
+ * progressable payload left) | UNKNOWN_SIDE_EFFECT (acceptance
+ * ambiguity dominates once nothing progressable remains) | UNSENDABLE
  * (destination unresolvable/not allowed — durable hold, zero sends,
- * never broadcast).
+ * never broadcast). QUEUED means at least one payload can still make
+ * canonical automatic progress (eligible, backoff-pending, or SENDING)
+ * — a request with zero progressable payloads never stays QUEUED.
  */
 
 import fs from "node:fs";
@@ -127,7 +131,12 @@ export interface TelegramDeliveryRequestPayload {
   destination: DeliveryDestination | null;
   outbox_dir: string;
   workspace: string;
-  status: "QUEUED" | "SENT" | "UNSENDABLE" | "FAILED_DELIVERY";
+  status:
+    | "QUEUED"
+    | "SENT"
+    | "UNSENDABLE"
+    | "FAILED_DELIVERY"
+    | "UNKNOWN_SIDE_EFFECT";
   hold_reason?: string;
   created_at: string;
   sent_at?: string;
@@ -387,21 +396,48 @@ function eligible(slot: DeliverySlot, now: string): boolean {
   return true;
 }
 
+/** R5 §4 — Telegram Bot API `Message.message_id` is an Integer; only a
+ *  positive safe integer is canonical SENT evidence. */
+export function isValidTelegramMessageId(mid: unknown): mid is number {
+  return typeof mid === "number" && Number.isSafeInteger(mid) && mid > 0;
+}
+
+/** A slot can still make canonical automatic progress: eligible now,
+ *  QUEUED under bounded backoff (budget left), or in-flight SENDING. */
+function progressable(slot: DeliverySlot): boolean {
+  if (slot.state === "SENDING") return true;
+  return slot.state === "QUEUED" && slot.attempt_count < slot.max_attempts;
+}
+
+/** R5 §2 — canonical request aggregate. QUEUED only while ≥1 payload
+ *  can still make automatic progress; otherwise terminal aggregate:
+ *  UNKNOWN_SIDE_EFFECT dominates FAILED_DELIVERY, which dominates SENT
+ *  mix. Per-slot evidence is never flattened. */
 function recomputeStatus(
   req: Record<string, unknown>,
   next: Record<string, unknown>,
-): "QUEUED" | "SENT" | "UNSENDABLE" | "FAILED_DELIVERY" {
+): "QUEUED" | "SENT" | "UNSENDABLE" | "FAILED_DELIVERY" | "UNKNOWN_SIDE_EFFECT" {
   if (next.status === "UNSENDABLE") return "UNSENDABLE";
-  // Read the ALREADY-mutated slot states in `next` (not `req` — a second
+  // Read the ALREADY-mutated slot state in `next` (not `req` — a second
   // slots() copy would revert in-flight mutations).
-  const states =
+  const all: DeliverySlot[] =
     req.mode === "TEXT"
-      ? [next.text_state as DeliverySlot["state"]]
-      : ((next.artifacts as DeliverySlot[]) ?? []).map((a) => a.state);
-  if (states.length > 0 && states.every((s) => s === "SENT")) return "SENT";
-  if (states.length > 0 && states.every((s) => s === "FAILED_DELIVERY")) {
+      ? [
+          {
+            state: next.text_state as DeliverySlot["state"],
+            attempt_count: Number(next.attempt_count ?? 0),
+            max_attempts: Number(next.max_attempts ?? 1),
+          },
+        ]
+      : ((next.artifacts as DeliverySlot[]) ?? []);
+  if (all.some(progressable)) return "QUEUED";
+  if (all.some((s) => s.state === "UNKNOWN_SIDE_EFFECT")) {
+    return "UNKNOWN_SIDE_EFFECT";
+  }
+  if (all.some((s) => s.state === "FAILED_DELIVERY")) {
     return "FAILED_DELIVERY";
   }
+  if (all.length > 0 && all.every((s) => s.state === "SENT")) return "SENT";
   return "QUEUED";
 }
 
@@ -495,21 +531,18 @@ export function resolveDeliveryAttempt(args: {
   delete slot.attempt_number;
   delete slot.attempt_started_at;
   if (args.outcome === "SENT") {
-    const mid = args.messageId;
-    const valid =
-      typeof mid === "number"
-        ? Number.isFinite(mid)
-        : typeof mid === "string" && mid.trim().length > 0;
-    if (!valid) {
-      // R4 §2 — SENT requires real Telegram acceptance evidence; a
-      // claimed success without message_id is ambiguous, never SENT.
+    // R4 §2 + R5 §4-5 — SENT requires REAL Telegram acceptance evidence:
+    // a positive safe-integer message_id (Bot API Integer). Strings,
+    // "MID_fake", 0, negatives, fractions, NaN are all rejected
+    // fail-closed — a caller cannot forge SENT by posting fake ids.
+    if (!isValidTelegramMessageId(args.messageId)) {
       throw new IntegrityError(
         "FAIL_CLOSED_TELEGRAM_DELIVERY_EVIDENCE",
-        `${args.deliveryId}:${String(args.artifact ?? "text")}:message_id missing`,
+        `${args.deliveryId}:${String(args.artifact ?? "text")}:invalid message_id`,
       );
     }
     slot.state = "SENT";
-    slot.message_id = mid;
+    slot.message_id = args.messageId;
     slot.sent_at = args.now;
     slot.completed_at = args.now;
     delete slot.next_retry_at;
@@ -564,7 +597,13 @@ export function reconcileStaleDeliveryAttempts(
       }
       apply();
     }
-    if (dirty) putReq(store, next);
+    if (dirty) {
+      // R5 §3 — stale reconciliation must recompute the canonical
+      // request aggregate (a single stale payload → UNKNOWN_SIDE_EFFECT,
+      // never dead QUEUED).
+      next.status = recomputeStatus(req, next);
+      putReq(store, next);
+    }
   }
 }
 
@@ -591,22 +630,43 @@ export function pendingTelegramDeliveries(
       out.push(probe);
       continue;
     }
-    const artifacts = ((req.artifacts as DeliverySlot[]) ?? [])
-      .filter((a) => eligible(a, ts))
-      .map((a) => ({
+    // R5 §6 — an eligible-but-unresolvable manifested artifact (no exact
+    // file, no unique remote-upload match, no workspace-staged copy)
+    // converges deterministically to a durable terminal failure — never
+    // polled forever, never a network call burned on a nonexistent file.
+    const next = { ...req } as Record<string, unknown>;
+    let dirty = false;
+    const projected: Array<Record<string, unknown>> = [];
+    for (const a of (next.artifacts as DeliverySlot[])) {
+      if (a.state !== "QUEUED" || a.attempt_count >= a.max_attempts) continue;
+      const p = resolveDeliveryArtifactPath({
+        outboxDir: String(req.outbox_dir),
+        workspace: req.workspace ? String(req.workspace) : undefined,
+        name: String(a.name),
+      });
+      if (!p) {
+        a.state = "FAILED_DELIVERY";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
+        a.completed_at = ts;
+        dirty = true;
+        continue;
+      }
+      if (a.next_retry_at && a.next_retry_at > ts) continue; // backoff
+      projected.push({
         name: a.name,
         state: a.state,
         attempt_count: a.attempt_count,
         max_attempts: a.max_attempts,
         next_retry_at: a.next_retry_at,
-        path: resolveDeliveryArtifactPath({
-          outboxDir: String(req.outbox_dir),
-          workspace: req.workspace ? String(req.workspace) : undefined,
-          name: String(a.name),
-        }),
-      }));
-    if (!artifacts.length) continue;
-    out.push({ ...req, artifacts });
+        path: p,
+      });
+    }
+    if (dirty) {
+      next.status = recomputeStatus(req, next);
+      putReq(store, next);
+    }
+    if (!projected.length) continue;
+    out.push({ ...next, artifacts: projected });
   }
   return out;
 }

@@ -503,3 +503,106 @@ gate instead of re-sending instantly).
 Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R4_PENDING_INDEPENDENT_AUDIT`
 
 STOP. DO NOT MERGE. DO NOT START PHASE E.
+
+---
+
+# R5 — Final aggregate-state + evidence closure (audit `pasted-<R5 mandate>`)
+
+Base: audited R4 HEAD `7241313` · same PR #27 · narrow final closure — no
+redesign of R1–R4.
+
+## §1-2 — canonical request aggregation (BLOCKER) → closed
+
+`recomputeStatus` now implements the mandated aggregate over the uniform
+slot states — QUEUED only while ≥1 payload can still make canonical
+automatic progress (`SENDING`, or `QUEUED` with budget left, including
+bounded-backoff-pending). Once nothing progressable remains:
+`UNKNOWN_SIDE_EFFECT` dominates `FAILED_DELIVERY`, which dominates the
+SENT mix — SENT + FAILED → `FAILED_DELIVERY`; SENT + UNKNOWN or
+FAILED + UNKNOWN → `UNKNOWN_SIDE_EFFECT`; all SENT → `SENT`. Per-slot
+evidence is never flattened; SENT payloads never resend.
+
+## §3 — stale reconcile recomputes request status → closed
+
+`reconcileStaleDeliveryAttempts` now persists
+`recomputeStatus` after flipping stale `SENDING` slots — a single stale
+TEXT/FILE payload yields request `UNKNOWN_SIDE_EFFECT`, never dead
+QUEUED.
+
+## §4-5 — strict Telegram message_id (BLOCKER) → closed
+
+`isValidTelegramMessageId(mid) = Number.isSafeInteger(mid) && mid > 0`
+(Bot API `Message.message_id` is an Integer). Enforced at BOTH layers:
+transport `ok` + invalid/missing id → `backend.unknown`
+(`acceptance_unproven`); domain `SENDING→SENT` + invalid id →
+`FAIL_CLOSED_TELEGRAM_DELIVERY_EVIDENCE`. Rejected everywhere:
+`undefined null "" "MID_fake" "123" 0 -1 1.5 NaN`. Bridge
+`governedSend` uses the same check; test transport now returns realistic
+numeric ids (`1001`).
+
+## §6 — unresolvable manifest artifact converges (BLOCKER) → closed
+
+In `pendingTelegramDeliveries`, an eligible FILES slot whose canonical
+name cannot resolve (no exact outbox file, no unique remote-upload
+prefix match, no workspace-staged copy — producers canonically complete
+because the request exists) converges to `FAILED_DELIVERY` with
+`last_error = FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED` + request status
+recomputed — never polled forever, never a network call burned. No
+path guessing, no broadened matching; unique-prefix resolution kept.
+
+## §7-13 — required tests
+
+| Test | Result |
+|---|---|
+| §7 mixed SENT + FAILED (b.txt hits ceiling) → `FAILED_DELIVERY`, pending `[]`, zero sends | PASS |
+| §8 mixed SENT + UNKNOWN → `UNKNOWN_SIDE_EFFECT`, a never resends | PASS |
+| §9 FAILED + UNKNOWN → `UNKNOWN_SIDE_EFFECT` (ambiguity dominates) | PASS |
+| §10 backoff-pending keeps request `QUEUED`; before expiry pending `[]`; after expiry only b projects | PASS |
+| §11 stale single-FILE SENDING → slot + request `UNKNOWN_SIDE_EFFECT` (+ §9 TEXT) | PASS |
+| §12 strict message_id: 7 invalid values → UNKNOWN at transport; 9 → throw at domain; `1001` → SENT `message_id=1001` | PASS |
+| §13 unresolved artifact → `FAILED_DELIVERY` + `FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED`, zero network calls | PASS |
+
+## §14 — R1–R4 preserved
+
+58 R1–R4 focused tests pass unchanged (retry/assertions updated only for
+the new strict-id + aggregate semantics: numeric mid `1001`, TEXT stale
+asserts request `UNKNOWN_SIDE_EFFECT`).
+
+## §15 — regression (Node 22)
+
+| Surface | Result |
+|---|---|
+| Focused incident (R1–R5) | **65/65 PASS** (58 + 7 R5) |
+| **Full suite** | **2628 pass / 2 fail env P5 cũ / 15 skipped** (R4 2621 → +7, zero regression — same 2 pre-existing DSH/CODEX probe env fails since base) |
+| `npx tsc --noEmit` / `pnpm build` | clean / clean |
+
+## §16 — changed files (R5)
+
+- `src/pair/telegram-delivery.ts` — `isValidTelegramMessageId`,
+  `progressable()` + 5-rule `recomputeStatus`, stale reconcile → status
+  recompute, unresolved-artifact convergence in the pending projection.
+- `src/pair/telegram-transport.ts` — strict positive-safe-int mid check.
+- `scripts/telegram-bridge.mjs` — `governedSend` strict mid check.
+- `src/__tests__/pair-planner-dataflow-incident.test.ts` — +7 R5 tests;
+  numeric mid (`1001`); `midOverride` transport option; `mintFilesRequest`.
+- `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_REPORT.md` — this section.
+
+## §17 — explicit proofs
+
+1. SENT + FAILED → request `FAILED_DELIVERY`, not dead QUEUED (§7).
+2. SENT + UNKNOWN → `UNKNOWN_SIDE_EFFECT` (§8); FAILED + UNKNOWN →
+   `UNKNOWN_SIDE_EFFECT` (§9).
+3. Backoff-pending slot keeps request `QUEUED`; not projected before
+   `next_retry_at`; only that slot projects after (§10).
+4. Stale TEXT/FILE SENDING → slot `UNKNOWN_SIDE_EFFECT` AND request
+   `UNKNOWN_SIDE_EFFECT` (§11, R4 §9 updated).
+5. Fake/string/zero/negative/fractional message_id cannot produce SENT
+   — transport UNKNOWN, domain throws (§12).
+6. Positive integer `1001` produces SENT with `message_id=1001` (§12).
+7. Unresolved manifested artifact → `FAILED_DELIVERY` +
+   `FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED`, zero network calls (§13).
+8. All R1–R4 invariants PASS (65/65 focused, full suite zero regression).
+
+Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R5_PENDING_INDEPENDENT_AUDIT`
+
+STOP. DO NOT MERGE. DO NOT START PHASE E.
