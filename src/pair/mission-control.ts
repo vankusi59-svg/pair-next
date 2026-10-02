@@ -30,6 +30,7 @@ import {
   assertPlanDataflow,
   detectTelegramDeliveryIntent,
 } from "./plan-dataflow.js";
+import { detectOutputLanguage } from "./output-language.js";
 import {
   pendingTelegramDeliveries,
   beginDeliveryAttempt as beginDeliveryAttemptEntity,
@@ -576,6 +577,7 @@ export class MissionControl {
     // operator request before the preview is pinned.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
       telegramIntent: detectTelegramDeliveryIntent(input.goal),
+      outputLanguage: detectOutputLanguage(input.goal),
     });
     const eid = effectiveInputDigest({
       project_id: input.project_id,
@@ -672,7 +674,10 @@ export class MissionControl {
       // persisted mission_input.goal — the only delivery authority.
       assertPlanDataflow(
         v.preview.canonical_tasks as Array<Record<string, unknown>>,
-        { telegramIntent: detectTelegramDeliveryIntent(mi.goal) },
+        {
+          telegramIntent: detectTelegramDeliveryIntent(mi.goal),
+          outputLanguage: detectOutputLanguage(mi.goal),
+        },
       );
       // R5 — replay persisted authority VERBATIM. Normalization already ran
       // before the persisted digests at preview creation; confirm may only
@@ -688,6 +693,9 @@ export class MissionControl {
           plan_digest: v.preview.plan_digest,
           planner_attempt_id: v.preview.planner_attempt_id ?? null,
           planner: v.preview.planner ?? null,
+          // R2.2 — carried container provenance (evidence; validation
+          // requires the contract marker unconditionally).
+          plan_contract_version: v.preview.plan_contract_version ?? null,
         },
         // What the serve-side template planner returns verbatim — the exact
         // persisted canonical tasks, never re-planned.

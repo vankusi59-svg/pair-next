@@ -9,6 +9,7 @@ export * from "./spec-harness.js";
 export * from "./gate.js";
 export * from "./artifact-validation.js";
 export * from "./proposal.js";
+export * from "./output-language.js";
 export * from "./plan-dataflow.js";
 export * from "./telegram-delivery.js";
 export * from "./telegram-transport.js";

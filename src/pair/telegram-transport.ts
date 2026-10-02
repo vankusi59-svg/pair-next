@@ -19,10 +19,26 @@
  *    FAILED_DELIVERY past the ceiling); ambiguous (thrown, unknown
  *    acceptance, or `ok` WITHOUT message_id) → UNKNOWN_SIDE_EFFECT —
  *    never auto-resend, never claimed SENT (R4 §2).
- *  - file content reading (.txt/.md sent as message text; everything
- *    else as document upload) lives here so the bridge and tests share
- *    the exact same decision.
+ *  - FILES means ARTIFACT transport (R2.3/R3): every manifested
+ *    artifact — including .txt/.md — is sent as the digest-pinned file
+ *    (document/photo upload), never trimmed, truncated, or converted
+ *    to message text. The path projected by pendingTelegramDeliveries
+ *    is a request-owned snapshot; this module reads it ONCE into a
+ *    bounded byte buffer, hashes THAT buffer, and hands the same
+ *    verified bytes to the sender (`fileBytes`) — the uploader never
+ *    re-reads the path after verification, so
+ *    `sha256(network bytes) === TDR slot sha256` holds at the exact
+ *    point of transmission (no TOCTOU, no transform).
  */
+
+import { digest } from "./canonical.js";
+import {
+  boundedFileSha256,
+  MAX_TELEGRAM_FILE_BYTES,
+  SHA256_HEX_RE,
+} from "./telegram-delivery.js";
+
+export { MAX_TELEGRAM_FILE_BYTES };
 
 export type GovernedSendResult =
   | { kind: "ok"; message_id?: string | number }
@@ -36,7 +52,14 @@ export interface GovernedTelegramTransport {
   send(args: {
     chatId: string;
     text?: string;
+    /** Informational only — filename/path evidence. When `fileBytes`
+     *  is present the sender MUST NOT re-read this path: the verified
+     *  buffer is the network payload. */
     filePath?: string;
+    /** R3 — the digest-verified immutable payload: the exact bytes
+     *  whose sha256 was authorized. The uploader builds its network
+     *  body from THIS buffer — never a second filesystem read. */
+    fileBytes?: Uint8Array;
     name?: string;
   }): Promise<GovernedSendResult>;
 }
@@ -63,12 +86,6 @@ export interface DeliveryBackend {
   unsendable(reason: string): Promise<void> | void;
 }
 
-const TEXT_FILE_EXT = new Set([".txt", ".md"]);
-
-function extname(name: string): string {
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i).toLowerCase() : "";
-}
 
 /** R6 §6 — defense-in-depth process-local non-overlap guard: a trigger
  *  firing while the previous cycle is still running is skipped. The
@@ -102,7 +119,8 @@ export async function transportTelegramDelivery(args: {
   /** Authorization check on the bound destination (allowlist semantics). */
   isAllowed: (chatId: string) => boolean;
   backend: DeliveryBackend;
-  /** Reads artifact file content for .txt/.md message payloads. */
+  /** Deprecated (R2.3): FILES artifacts are always transported as
+   *  files — no caller-side text conversion is consulted. */
   readText?: (absPath: string) => string;
   /** Payload prefix — keeps the bridge's 📨 convention in one place. */
   textPrefix?: string;
@@ -166,6 +184,7 @@ export async function transportTelegramDelivery(args: {
   const send = async (a: {
     text?: string;
     filePath?: string;
+    fileBytes?: Uint8Array;
     name?: string;
   }): Promise<GovernedSendResult> => {
     try {
@@ -199,14 +218,33 @@ export async function transportTelegramDelivery(args: {
     // R4 §1 — TEXT carries the same durable slot state as FILES; only a
     // canonically eligible QUEUED text payload may begin.
     if (String(req.text_state) !== "QUEUED") return { sent, held: false };
-    const text = `${prefix}${String(req.text ?? "")}`.trim();
+    // R2.1 — re-prove payload evidence at the transport edge: the exact
+    // text that will be sent must still hash/length/source-match the
+    // bound evidence. Anything else never reaches begin or the network.
+    const body = String(req.text ?? "");
+    const wantSha = String(req.text_sha256 ?? "");
+    let actualSha: string | null = null;
+    try {
+      actualSha = digest(body);
+    } catch {
+      actualSha = null;
+    }
+    if (
+      !body.length ||
+      !SHA256_HEX_RE.test(wantSha) ||
+      actualSha !== wantSha ||
+      Number(req.text_length) !== body.length
+    ) {
+      return { sent, held: false };
+    }
+    const text = `${prefix}${body}`.trim();
     if (text.length <= prefix.trim().length) return { sent, held: false };
     // R7 — exclusive acquire required before any network call. A stale
     // projection is not authority: if the durable begin did not grant
     // this caller the attempt, the send must not happen.
     const acq = await args.backend.begin(null);
     if (!acq || acq.acquired !== true) return { sent, held: false };
-    const r = await send({ text: `${prefix}${String(req.text ?? "").slice(0, 3700)}` });
+    const r = await send({ text: `${prefix}${body.slice(0, 3700)}` });
     if (await resolve(null, r)) sent.push(`TEXT:${String(req.delivery_id)}`);
     return { sent, held: false };
   }
@@ -215,21 +253,29 @@ export async function transportTelegramDelivery(args: {
     if (String(art.state) !== "QUEUED" || !art.path) continue;
     const name = String(art.name);
     const fp = String(art.path);
+    // R3/R4/R5 — HASHED BYTES === CLAIMED BYTES === NETWORK BYTES:
+    // ONE canonical bounded read — stat first (no full read merely to
+    // discover the size), then read ONCE, prove actual length == stat
+    // size, and hash THOSE bytes — the SAME verified bytes are handed
+    // to the sender. No filesystem read exists between verification
+    // and payload construction.
+    const wantSha = String(art.sha256 ?? "");
+    const br = boundedFileSha256(fp);
+    if (
+      br.kind !== "ok" ||
+      !SHA256_HEX_RE.test(wantSha) ||
+      br.sha256 !== wantSha
+    ) {
+      continue;
+    }
+    const bytes = br.bytes;
     // R7 — exclusive acquire required before any network call.
     const acq = await args.backend.begin(name);
     if (!acq || acq.acquired !== true) continue;
-    let r: GovernedSendResult;
-    if (TEXT_FILE_EXT.has(extname(name)) && args.readText) {
-      const content = args.readText(fp).trim();
-      r = content
-        ? await send({
-            text: `${prefix}${name}:\n\n${content.slice(0, 3600)}`,
-            name,
-          })
-        : { kind: "fail", error: "artifact empty" };
-    } else {
-      r = await send({ filePath: fp, name });
-    }
+    // FILES = artifact transport: the digest-pinned file itself, never
+    // a trimmed/truncated text conversion (R2.3). `fileBytes` is the
+    // exact verified buffer — the uploader never re-reads filePath.
+    const r = await send({ filePath: fp, fileBytes: bytes, name });
     if (await resolve(name, r)) sent.push(name);
   }
   return { sent, held: false };

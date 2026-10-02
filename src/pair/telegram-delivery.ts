@@ -55,8 +55,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalJson, digest } from "./canonical.js";
+import { digest, sha256Hex } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { DELIVERY_TEXT_ARTIFACT } from "./output-language.js";
 import { deliveryManifest, normalizeArtifactPath } from "./plan-dataflow.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -104,6 +105,11 @@ export interface DeliverySlot {
   completed_at?: string;
   last_error?: string;
   unknown_reason?: string;
+  /** FILES only: canonical artifact identity (SHA-256 of the exact bytes
+   *  verified at the delivery-contract gate). The bridge-side projection
+   *  re-verifies it — a file mutated after minting fails closed with
+   *  FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST, zero network call. */
+  sha256?: string;
 }
 
 export interface TelegramDeliveryRequestPayload {
@@ -142,7 +148,20 @@ export interface TelegramDeliveryRequestPayload {
   sent_at?: string;
 }
 
-const MAX_TEXT_BYTES = 3500;
+export const MAX_TEXT_BYTES = 3500;
+/** Canonical artifact-digest shape — shared by the mint check, the
+ *  bridge-side projection, and the settle-time delivery gate. */
+export const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+
+/** R1.1 — THE one canonical materialization of the wire TEXT payload.
+ *  The delivery-contract gate materializes the payload from the
+ *  canonical source artifact with EXACTLY these rules, validates it,
+ *  and hands the same string to mint — mint never re-reads or
+ *  re-transforms the file (no TOCTOU / trim / truncation drift between
+ *  what was validated and what is sent). */
+export function materializeDeliveryTextPayload(raw: string): string {
+  return raw.trim().slice(0, MAX_TEXT_BYTES);
+}
 /** Canonical default ceiling — overridden by the mint-time
  *  PAIR_TG_DELIVERY_MAX_ATTEMPTS env wiring. */
 export const TELEGRAM_DELIVERY_DEFAULT_MAX_ATTEMPTS = 3;
@@ -155,8 +174,112 @@ export function telegramDeliveryBackoffSeconds(attemptCount: number): number {
  *  the PAIR_TG_DELIVERY_STALE_AFTER_MS env wiring (bounded, validated). */
 export const TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS = 60_000;
 
+/** R3/R4.2 — bounded byte materialization: the Telegram Bot API caps
+ *  bot uploads at ~50MB; a pinned artifact beyond this bound can never
+ *  send, so it converges to a durable terminal failure rather than
+ *  polling QUEUED forever (checked by stat BEFORE any full read). */
+export const MAX_TELEGRAM_FILE_BYTES = 48 * 1024 * 1024;
+
+/** R5 — the ONE canonical stat-first bounded file authority used by
+ *  every governed FILES seam (dispatch pin, settle gate, snapshot
+ *  verify, source→snapshot reconstruction, transport materialization).
+ *  NEVER performs an unbounded full read: stat proves
+ *  `size <= maxBytes` FIRST; a successful read additionally proves
+ *  `bytes.length === stat size` (no mid-read growth) and the sha256 is
+ *  computed over THOSE exact materialized bytes. */
+export type BoundedFileResult =
+  | { kind: "ok"; size: number; bytes: Buffer; sha256: string }
+  | { kind: "too_large"; size: number }
+  | { kind: "unresolved" };
+
+export function boundedFileSha256(
+  p: string,
+  maxBytes: number = MAX_TELEGRAM_FILE_BYTES,
+): BoundedFileResult {
+  let size: number;
+  try {
+    size = fs.statSync(p).size;
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (size > maxBytes) return { kind: "too_large", size };
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(p);
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (bytes.length !== size) return { kind: "unresolved" };
+  return { kind: "ok", size, bytes, sha256: sha256Hex(bytes) };
+}
+
 export function deliveryRequestId(missionId: string, taskId: string): string {
   return `TDR_${digest(`telegram_delivery:${missionId}:${taskId}`).slice(0, 24)}`;
+}
+
+/** R2.3/R3 — request-owned staging namespace for digest-pinned wire
+ *  snapshots: hidden so artifact-name resolution never confuses a
+ *  staged copy for a manifested sibling. */
+export const DELIVERY_SNAPSHOT_DIR = ".delivery-snapshots";
+
+/** Deterministic snapshot path shared by projection, transport, and
+ *  retention cleanup — same name every pass. */
+function deliverySnapshotPath(
+  outboxDir: string,
+  deliveryId: string,
+  name: string,
+): string {
+  return path.join(
+    outboxDir,
+    DELIVERY_SNAPSHOT_DIR,
+    `${deliveryId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
+  );
+}
+
+const TERMINAL_DELIVERY_SLOT = new Set(["SENT", "FAILED_DELIVERY"]);
+const TERMINAL_DELIVERY_REQUEST = new Set([
+  "SENT",
+  "FAILED_DELIVERY",
+  "UNSENDABLE",
+]);
+
+/** R3 — bounded snapshot retention. A pinned snapshot exists only
+ *  while its slot's fate is open (QUEUED retry, in-flight SENDING,
+ *  UNKNOWN_SIDE_EFFECT investigation — the bytes are the evidence of
+ *  what may/must still ship). Once a slot is SENT/FAILED_DELIVERY, or
+ *  the whole request lands terminal, the durable identity evidence is
+ *  the slot's sha256 itself and the staged bytes are removed on the
+ *  next projection pass — no unbounded hidden-file accumulation over
+ *  long-running production. Best-effort: a vanished file is no error. */
+function pruneDeliverySnapshots(req: Record<string, unknown>): void {
+  const outbox = req.outbox_dir;
+  if (typeof outbox !== "string" || !outbox) return;
+  const id = String(req.delivery_id);
+  const requestTerminal = TERMINAL_DELIVERY_REQUEST.has(String(req.status));
+  const artifacts = req.artifacts as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(artifacts)) {
+    for (const a of artifacts) {
+      if (!requestTerminal && !TERMINAL_DELIVERY_SLOT.has(String(a.state))) {
+        continue;
+      }
+      const snap = deliverySnapshotPath(outbox, id, String(a.name));
+      for (const p of [snap, `${snap}.tmp`]) {
+        try {
+          fs.rmSync(p, { force: true });
+        } catch {
+          /* best effort — a missing snapshot is already pruned */
+        }
+      }
+    }
+  }
+  const dir = path.join(outbox, DELIVERY_SNAPSHOT_DIR);
+  try {
+    if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
+      fs.rmdirSync(dir);
+    }
+  } catch {
+    /* best effort */
+  }
 }
 
 /** R3 §3 — bind the one canonical destination. */
@@ -199,6 +322,16 @@ export function mintTelegramDeliveryRequest(args: {
   defaultChatId?: string | null;
   /** Canonical retry ceiling stamped per payload (bounded, env-driven). */
   maxAttempts?: number;
+  /** FILES: artifact content identity verified at the delivery-contract
+   *  gate (manifest name → SHA-256 hex). R1.2 — MANDATORY: every FILES
+   *  manifest name must map to a valid SHA-256; a missing/incomplete/
+   *  malformed map mints nothing (no hash → no authority). */
+  artifactSha256?: Record<string, string>;
+  /** TEXT: the exact wire payload materialized and validated at the
+   *  delivery-contract gate — mint stores it verbatim and NEVER
+   *  re-reads the source file (R1.1: VALIDATED PAYLOAD === TDR
+   *  PAYLOAD). */
+  textPayload?: string;
 }): Record<string, unknown> | null {
   const manifest = deliveryManifest(args.task);
   if (!manifest) return null;
@@ -214,20 +347,52 @@ export function mintTelegramDeliveryRequest(args: {
     Number.isSafeInteger(args.maxAttempts) && (args.maxAttempts as number) > 0
       ? (args.maxAttempts as number)
       : TELEGRAM_DELIVERY_DEFAULT_MAX_ATTEMPTS;
+  if (manifest.mode === "FILES") {
+    // R1.2 — digest authority is mandatory: no hash → no authority.
+    // A FILES mint without the complete verified map, or with any
+    // malformed digest, fails closed before the request exists.
+    const bad = (name: string, why: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST",
+        JSON.stringify({ artifact: name, reason: why }),
+      );
+    };
+    const map = args.artifactSha256;
+    for (const name of manifest.artifacts) {
+      const sha = map?.[name];
+      if (sha === undefined || sha === null) bad(name, "missing_artifact_digest");
+      else if (!SHA256_HEX_RE.test(String(sha))) bad(name, "malformed_digest");
+    }
+  }
   const artifacts: DeliverySlot[] = manifest.artifacts.map((name) => ({
     name,
     state: "QUEUED",
     attempt_count: 0,
     max_attempts: maxAttempts,
+    ...(manifest.mode === "FILES"
+      ? { sha256: String(args.artifactSha256?.[name]) }
+      : {}),
   }));
   let text: string | null = null;
+  let textEvidence: Record<string, unknown> = {};
   if (manifest.mode === "TEXT") {
-    const result = args.execution.result as Record<string, unknown> | undefined;
-    const summary = result?.summary ?? result?.text ?? result;
-    text = (typeof summary === "string" ? summary : canonicalJson(summary ?? {})).slice(
-      0,
-      MAX_TEXT_BYTES,
-    );
+    // R1.1 — the TDR text is the EXACT payload materialized and
+    // language-validated at the delivery-contract gate. Mint never
+    // re-reads or re-transforms the source artifact: an unbound mint
+    // (caller forgot the gate) fails closed instead of fabricating a
+    // payload from unvalidated bytes.
+    if (typeof args.textPayload !== "string" || !args.textPayload.length) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_UNBOUND",
+        JSON.stringify({ artifact: DELIVERY_TEXT_ARTIFACT }),
+      );
+    }
+    text = args.textPayload;
+    textEvidence = {
+      text_sha256: digest(text),
+      text_length: text.length,
+      text_source_artifact: DELIVERY_TEXT_ARTIFACT,
+    };
   }
   const body: Record<string, unknown> = {
     delivery_id: id,
@@ -237,6 +402,7 @@ export function mintTelegramDeliveryRequest(args: {
     mode: manifest.mode,
     artifacts,
     text,
+    ...textEvidence,
     ...(manifest.mode === "TEXT"
       ? {
           text_state: "QUEUED",
@@ -682,11 +848,43 @@ export function pendingTelegramDeliveries(
   reconcileStaleDeliveryAttempts(store, ts, staleAfterMs);
   const out: Array<Record<string, unknown>> = [];
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
+    // R3 — bounded snapshot retention: a pinned snapshot is transport
+    // staging only while its slot's fate is open (QUEUED retry,
+    // in-flight SENDING, UNKNOWN_SIDE_EFFECT investigation — the bytes
+    // are the evidence of what may/must still ship). Once a slot lands
+    // SENT/FAILED_DELIVERY, or the whole request lands terminal
+    // (SENT/FAILED_DELIVERY/UNSENDABLE), the durable identity evidence
+    // is the slot's sha256 itself and the staged bytes are removed on
+    // this projection pass — no unbounded hidden-file accumulation.
+    pruneDeliverySnapshots(req);
     if (String(req.status) !== "QUEUED") continue;
     if (req.mode === "TEXT") {
       const probe = { ...req } as Record<string, unknown>;
       const [s] = slots(req, probe);
       if (!eligible(s.slot, ts)) continue;
+      // R2.1 — a TEXT payload has send authority ONLY when its canonical
+      // payload evidence is complete AND internally consistent with the
+      // exact persisted text. A persisted pre-contract request (e.g.
+      // text:"DONE", no bound evidence) has no provable payload source:
+      // it converges to a durable terminal failure — never migrated,
+      // never re-baselined from the workspace, zero network calls.
+      const text = req.text;
+      const evidenceOk =
+        typeof text === "string" &&
+        text.length > 0 &&
+        typeof req.text_sha256 === "string" &&
+        SHA256_HEX_RE.test(req.text_sha256) &&
+        req.text_sha256 === digest(text) &&
+        Number(req.text_length) === text.length &&
+        String(req.text_source_artifact) === DELIVERY_TEXT_ARTIFACT;
+      if (!evidenceOk) {
+        probe.text_state = "FAILED_DELIVERY";
+        probe.last_error = "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE";
+        probe.completed_at = ts;
+        probe.status = recomputeStatus(req, probe);
+        putReq(store, probe);
+        continue;
+      }
       out.push(probe);
       continue;
     }
@@ -699,17 +897,120 @@ export function pendingTelegramDeliveries(
     const projected: Array<Record<string, unknown>> = [];
     for (const a of (next.artifacts as DeliverySlot[])) {
       if (a.state !== "QUEUED" || a.attempt_count >= a.max_attempts) continue;
-      const p = resolveDeliveryArtifactPath({
-        outboxDir: String(req.outbox_dir),
-        workspace: req.workspace ? String(req.workspace) : undefined,
-        name: String(a.name),
-      });
-      if (!p) {
+      // R1.2 — a hashless FILES slot has NO send authority: a persisted
+      // request minted before digest authority was mandatory converges
+      // to deterministic terminal failure — never verified, never sent.
+      if (typeof a.sha256 !== "string" || !SHA256_HEX_RE.test(a.sha256)) {
         a.state = "FAILED_DELIVERY";
-        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
         a.completed_at = ts;
         dirty = true;
         continue;
+      }
+      // R4.1 — snapshot-first authority: the immutable identity is the
+      // TDR slot sha256; the pinned snapshot is its retained byte
+      // realization. A VALID snapshot (sha256 == slot digest) is
+      // already the canonical transport authority — reuse it; the
+      // mutable producer/workspace file is NOT required to still exist
+      // and is never re-read while a valid snapshot stands (source
+      // drift/deletion after a failed attempt cannot kill the retry).
+      const snapDir = path.join(String(req.outbox_dir), DELIVERY_SNAPSHOT_DIR);
+      const snapPath = deliverySnapshotPath(
+        String(req.outbox_dir),
+        String(req.delivery_id),
+        String(a.name),
+      );
+      // R5.1 — stat-first: an oversized retained snapshot is rejected
+      // by the bound before any full-file read; a size-valid snapshot
+      // is verified over its own materialized bytes.
+      let snapshotValid = false;
+      {
+        const sr = boundedFileSha256(snapPath);
+        snapshotValid = sr.kind === "ok" && sr.sha256 === a.sha256;
+      }
+      if (!snapshotValid) {
+        // A mismatched snapshot is never trusted — replace it only from
+        // the canonical source: source must exist AND its sha256 must
+        // equal the slot digest (reconstruction is a fallback, not a
+        // re-baseline). Drop this delivery's own stale staging tmp from
+        // any crashed attempt first (R4.3).
+        try {
+          fs.rmSync(`${snapPath}.tmp`, { force: true });
+        } catch {
+          /* best effort */
+        }
+        const p = resolveDeliveryArtifactPath({
+          outboxDir: String(req.outbox_dir),
+          workspace: req.workspace ? String(req.workspace) : undefined,
+          name: String(a.name),
+        });
+        if (!p) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        // R5.2 — canonical stat-first source authority: ONE bounded
+        // read resolves the file, proves actual length == stat size,
+        // and hashes THOSE bytes — the same materialized buffer is then
+        // staged into the snapshot (never a second source read).
+        // Oversized → durable TOO_LARGE with zero full-file read.
+        const br = boundedFileSha256(p);
+        if (br.kind === "unresolved") {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        if (br.kind === "too_large") {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        // Canonical artifact identity replayed at send time: a
+        // manifested artifact mutated between mint and dispatch never
+        // reaches the bridge — durable terminal failure, zero network
+        // call burned.
+        if (br.sha256 !== a.sha256) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        // R2.3 — pin the verified bytes: the wire artifact must be the
+        // exact digest-authorized content, not whatever the workspace
+        // path holds at send time (TOCTOU between projection and send).
+        // Write the verified bytes into the request-owned snapshot and
+        // project THAT path. R3 — durability: the staged file data is
+        // fsynced before the atomic rename so a crash cannot leave a
+        // half-written snapshot masquerading as the authorized bytes.
+        try {
+          fs.mkdirSync(snapDir, { recursive: true });
+          const tmp = `${snapPath}.tmp`;
+          const fd = fs.openSync(tmp, "w");
+          try {
+            fs.writeSync(fd, br.bytes);
+            fs.fsyncSync(fd);
+          } finally {
+            fs.closeSync(fd);
+          }
+          fs.renameSync(tmp, snapPath);
+          const post = boundedFileSha256(snapPath);
+          if (post.kind !== "ok" || post.sha256 !== a.sha256) {
+            throw new Error("snapshot_digest_mismatch");
+          }
+        } catch {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
       }
       if (a.next_retry_at && a.next_retry_at > ts) continue; // backoff
       projected.push({
@@ -718,7 +1019,8 @@ export function pendingTelegramDeliveries(
         attempt_count: a.attempt_count,
         max_attempts: a.max_attempts,
         next_retry_at: a.next_retry_at,
-        path: p,
+        path: snapPath,
+        sha256: a.sha256,
       });
     }
     if (dirty) {

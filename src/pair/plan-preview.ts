@@ -22,6 +22,7 @@
 
 import { digest, isCanonicalRiskCeiling, isCanonicalWorkspacePath, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { PAIR_PLAN_CONTRACT_VERSION } from "./plan-dataflow.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PlannerAttemptRecord } from "./planner-pool.js";
 
@@ -400,6 +401,11 @@ export function createPlanPreview(
             role: args.winner.role,
           }
         : null,
+      // R2.2 — authoritative persisted provenance: which plan-contract
+      // era minted this preview. Kept outside task metadata so the
+      // contract era is container evidence, not a task-local optional
+      // marker whose absence could be misread as "legacy".
+      plan_contract_version: PAIR_PLAN_CONTRACT_VERSION,
       consumed_mission_id: null,
       created_at: created,
       expires_at: expires,

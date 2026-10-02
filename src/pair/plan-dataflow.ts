@@ -55,6 +55,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError } from "./errors.js";
+import {
+  DELIVERY_TEXT_ARTIFACT,
+  isTextDeliverableName,
+  languagePhrase,
+  PAIR_OUTPUT_LANGUAGE_KEY,
+} from "./output-language.js";
+import type { OutputLanguage } from "./output-language.js";
+import { canonicalJson } from "./canonical.js";
 
 export const DELIVERY_CAPABILITY = "TELEGRAM_DELIVERY";
 
@@ -94,6 +102,18 @@ const MAX_MANIFEST_ARTIFACTS = 16;
  *  reserved key — a forged value only mutates evidence, never edges. */
 export const PAIR_DATAFLOW_ORIGINAL_DEPS = "pair_dataflow_original_deps";
 
+/** R1.3/R2.2 — PAIR-owned plan-contract version marker. Stamped on every
+ *  canonical TELEGRAM_DELIVERY task at the same reconcile seam as
+ *  `pair_output_language`. The marker is MANDATORY on every delivery
+ *  task at every validation boundary: marker absence is NOT proof of a
+ *  legacy plan (a fresh plan that bypassed reconcile looks identical),
+ *  so pre-contract shapes are rejected and must be re-planned under the
+ *  current contract era (forced-replan semantics — no `absent =>
+ *  legacy` inference, no unlimited tolerance). PAIR-reserved: the
+ *  planner cannot mint it. */
+export const PAIR_PLAN_CONTRACT_KEY = "pair_plan_contract";
+export const PAIR_PLAN_CONTRACT_VERSION = 2;
+
 export const RESERVED_TASK_METADATA_KEYS = [
   "pair_dataflow",
   "pair_dataflow_repairs",
@@ -101,6 +121,8 @@ export const RESERVED_TASK_METADATA_KEYS = [
   "telegram_delivery",
   "telegram_delivery_requested",
   "telegram_intent",
+  PAIR_OUTPUT_LANGUAGE_KEY,
+  PAIR_PLAN_CONTRACT_KEY,
 ] as const;
 
 function stripReservedTaskMetadata(
@@ -478,22 +500,56 @@ export function isPureBookkeepingTask(task: Record<string, unknown>): boolean {
  *  widens the manifest and never names a destination. */
 export function canonicalDeliveryTaskInstruction(
   intent: TelegramDeliveryIntent,
+  outputLanguage?: OutputLanguage,
 ): string {
-  const stage = intent.artifacts.length
-    ? `- Stage each manifested artifact into outbox/ keeping its filename: ${intent.artifacts.join(", ")}.\n`
-    : "";
+  const tail =
+    "- Do NOT call Telegram, any bot API, or any messaging tool — you have no such authority or tool. " +
+    "The external delivery is NOT your job.\n" +
+    "- Do not widen the deliverable set and do not pick a destination.\n" +
+    "Then reply DONE.";
+  if (intent.mode === "FILES") {
+    // FILES mode is transport-only: this step stages the manifested
+    // producer artifact byte-identically. It NEVER composes, rewrites,
+    // translates, or mutates deliverable content — a delivery prep task
+    // that rewrites the artifact fails the integrity gate at mint.
+    return (
+      "You are the governed TELEGRAM_DELIVERY preparation step of this PAIR mission. " +
+      "Your job is STAGING ONLY — PAIR's governed bridge performs the external delivery afterwards.\n" +
+      `- Manifested artifacts (exact filenames): ${intent.artifacts.join(", ")}.\n` +
+      "- Ensure each manifested artifact is present inside outbox/ under its exact manifest " +
+      "filename with its content UNCHANGED. When a manifested artifact lives elsewhere in the " +
+      "workspace, copy it into outbox/ keeping the filename and byte-identical content — never " +
+      "edit, translate, summarize, or regenerate it.\n" +
+      "- Never compose a report and never write or modify artifact content yourself. Stage " +
+      "exactly the manifested artifacts and nothing else.\n" +
+      tail
+    );
+  }
+  // TEXT mode — the canonical payload is the composed report artifact
+  // itself; the minted delivery request carries that file's content,
+  // never an execution acknowledgement.
   return (
     "You are the governed TELEGRAM_DELIVERY preparation step of this PAIR mission. " +
     "Your job is to PREPARE the deliverable only — PAIR's governed bridge performs " +
     "the external delivery afterwards.\n" +
     "- Read the upstream tasks' returned results in dependency_outputs (provided in your prompt).\n" +
-    "- Compose the final operator-facing report as concise plain text in the goal's language " +
-    "and write it to outbox/report.txt — the bridge reads that file afterwards.\n" +
-    stage +
-    "- Do NOT call Telegram, any bot API, or any messaging tool — you have no such authority or tool. " +
-    "The external delivery is NOT your job.\n" +
-    "- Do not widen the deliverable set and do not pick a destination.\n" +
-    "Then reply DONE."
+    `- Compose the final operator-facing report as concise plain text in ${languagePhrase(
+      outputLanguage?.code ?? null,
+    )} and write it to ${DELIVERY_TEXT_ARTIFACT} — that file is the canonical payload the bridge sends.\n` +
+    tail
+  );
+}
+
+/** PAIR-owned language contract line appended to instructions of tasks
+ *  that produce a manifested TEXT deliverable — a deterministic stamp,
+ *  never planner-derived. Stripped-then-appended so replay is
+ *  byte-identical (idempotent). */
+const OUTPUT_LANGUAGE_SUFFIX_RE = /\n?PAIR OUTPUT LANGUAGE CONTRACT:[^\n]*\n?/g;
+
+function outputLanguageSuffix(code: string): string {
+  return (
+    `\nPAIR OUTPUT LANGUAGE CONTRACT: operator-facing deliverable content you produce ` +
+    `(the report the operator receives) MUST be written in ${languagePhrase(code)}.`
   );
 }
 
@@ -844,6 +900,11 @@ export interface ReconcileOptions {
   /** Operator-request authority — when omitted the plan cannot carry a
    *  TELEGRAM_DELIVERY task (it fails closed on INTENT). */
   telegramIntent?: TelegramDeliveryIntent;
+  /** Canonical output-language authority derived from the effective
+   *  operator goal. Stamped onto the delivery task's reserved metadata
+   *  (digest-covered) and injected into manifested-artifact producer
+   *  instructions. Omitted → UNDETERMINED. */
+  outputLanguage?: OutputLanguage;
 }
 
 export function reconcilePlanDataflow(
@@ -875,6 +936,11 @@ export function reconcilePlanDataflow(
       t.task_instruction = CANONICAL_BOOKKEEPING_INSTRUCTION;
     }
   }
+  const outputLanguage: OutputLanguage = opts.outputLanguage ?? {
+    code: null,
+    authority: "UNDETERMINED",
+    evidence: { detector: "authority_unavailable" },
+  };
   for (const t of tasks) {
     if (!isDeliveryTask(t)) continue;
     const md = (t.metadata ??= {}) as Record<string, unknown>;
@@ -883,9 +949,24 @@ export function reconcilePlanDataflow(
       mode: intent.mode,
       artifacts: [...intent.artifacts],
     };
+    // Canonical output-language authority — stamped by PAIR from the
+    // effective operator goal, never from planner metadata (the key is
+    // reserved and stripped before this). Digest-covered through the
+    // pinned canonical task list; replay-verified at every assert
+    // boundary; re-derived from the goal at the delivery gate, so a
+    // tampered stamp cannot move runtime authority. Stamped ONLY when
+    // the caller proved the goal's authority — a reconcile without it
+    // leaves the key absent rather than minting a guessed one.
+    if (opts.outputLanguage !== undefined) {
+      // R1.3 — the contract marker mints the plan-contract version at
+      // the same seam: its presence converts the language stamp from
+      // tolerated-absent (legacy) into REQUIRED (new-contract plan).
+      md[PAIR_PLAN_CONTRACT_KEY] = { version: PAIR_PLAN_CONTRACT_VERSION };
+      md[PAIR_OUTPUT_LANGUAGE_KEY] = outputLanguage;
+    }
     // R8 §3 — PAIR-owned deterministic delivery-preparation contract:
     // the task stages the deliverable; the governed bridge sends.
-    t.task_instruction = canonicalDeliveryTaskInstruction(intent);
+    t.task_instruction = canonicalDeliveryTaskInstruction(intent, outputLanguage);
   }
   // R8 §2 — a non-delivery task carrying an affirmative delivery clause
   // makes the whole plan invalid at the canonical seam (failover picks
@@ -893,6 +974,31 @@ export function reconcilePlanDataflow(
   assertTaskDeliveryHygiene(tasks);
   const models = tasks.map((t) => extractTaskDataflow(t));
   const required = requiredEdges(tasks, models);
+  // Output-language authority propagates to the producers of manifested
+  // TEXT deliverables — a FILES-mode report written upstream must be
+  // composed in the canonical language. Only real artifact producers
+  // (incl. remote uploaders via PAIR_OUTBOX_UPLOAD edges) get the stamp;
+  // RESULT_TEXT intermediates keep the language freedom of mandate E.
+  if (outputLanguage.code) {
+    const suffix = outputLanguageSuffix(outputLanguage.code);
+    for (const [i, task] of tasks.entries()) {
+      if (!isDeliveryTask(task)) continue;
+      const producerIdx = new Set<number>();
+      for (const r of required[i]) {
+        if (r.artifact === "RESULT_TEXT") continue;
+        const name = r.artifact.startsWith("PAIR_OUTBOX_UPLOAD:")
+          ? r.artifact.slice("PAIR_OUTBOX_UPLOAD:".length)
+          : r.artifact;
+        if (!isTextDeliverableName(name)) continue;
+        producerIdx.add(r.producerIndex);
+      }
+      for (const j of producerIdx) {
+        const ins = String(tasks[j].task_instruction ?? "");
+        tasks[j].task_instruction =
+          ins.replace(OUTPUT_LANGUAGE_SUFFIX_RE, "").replace(/\n+$/, "") + suffix;
+      }
+    }
+  }
   const repairs: DataflowRepair[] = [];
   const depsByKey = new Map<string, string[]>();
   for (const [i, task] of tasks.entries()) {
@@ -911,11 +1017,17 @@ export function reconcilePlanDataflow(
     // Canonical key order: delete + re-set so replay produces the same
     // byte ordering regardless of pre-existing stamped fields.
     const manifest = md[TELEGRAM_MANIFEST_FIELD];
+    const outLang = md[PAIR_OUTPUT_LANGUAGE_KEY];
+    const planContract = md[PAIR_PLAN_CONTRACT_KEY];
     delete md[PAIR_DATAFLOW_ORIGINAL_DEPS];
     delete md[TELEGRAM_MANIFEST_FIELD];
+    delete md[PAIR_OUTPUT_LANGUAGE_KEY];
+    delete md[PAIR_PLAN_CONTRACT_KEY];
     md[PAIR_DATAFLOW_ORIGINAL_DEPS] = origDeps;
     md.pair_dataflow = models[i];
     if (manifest !== undefined) md[TELEGRAM_MANIFEST_FIELD] = manifest;
+    if (planContract !== undefined) md[PAIR_PLAN_CONTRACT_KEY] = planContract;
+    if (outLang !== undefined) md[PAIR_OUTPUT_LANGUAGE_KEY] = outLang;
     if (added.length) {
       task.depends_on = next;
       for (const producerKey of added) {
@@ -970,6 +1082,93 @@ export interface AssertPlanDataflowOptions {
    *  still require the PAIR-stamped manifest via the edge rules, and
    *  instruction hygiene ALWAYS runs. */
   telegramIntent?: TelegramDeliveryIntent;
+  /** Canonical output-language authority re-derived from the effective
+   *  goal: a stamped pair_output_language that differs from the
+   *  goal-derived contract — or sits on a non-delivery task — fails
+   *  closed (forged/tampered authority). Version gate (R1.3): a
+   *  delivery task stamped with the `pair_plan_contract` marker was
+   *  canonicalized under this contract — the language stamp is
+   *  MANDATORY there and missing fails closed. A delivery task without
+   *  the marker is a legacy pre-contract plan: an absent stamp is
+   *  still tolerated because runtime re-derives the language from the
+   *  mission goal at the delivery gate regardless. */
+  outputLanguage?: OutputLanguage;
+}
+
+/**
+ * The stamped pair_output_language on a delivery task must equal the
+ * goal-derived contract byte-for-byte — a different value is tampering,
+ * and the reserved key on a non-delivery task is forged authority.
+ * R1.3/R2.2 contract gate: `pair_plan_contract {version:2}` is REQUIRED
+ * on every delivery task — absent marker, unknown version, or missing
+ * stamp all fail closed (forced-replan semantics; marker absence is
+ * never treated as legacy provenance). A non-delivery task carrying
+ * either reserved key is forged authority.
+ */
+export function assertOutputLanguageAuthority(
+  tasks: Array<Record<string, unknown>>,
+  expected: OutputLanguage,
+): void {
+  const want = canonicalJson(expected);
+  for (const t of tasks) {
+    const md = t.metadata as Record<string, unknown> | undefined;
+    const stamped = md?.[PAIR_OUTPUT_LANGUAGE_KEY] as OutputLanguage | undefined;
+    const contract = md?.[PAIR_PLAN_CONTRACT_KEY] as
+      | { version?: unknown }
+      | undefined;
+    if (isDeliveryTask(t)) {
+      // R2.2 — every delivery task MUST carry the contract marker.
+      // Absence proves nothing about provenance (a bypassed plan looks
+      // identical to a pre-contract one), so there is no tolerated
+      // absence: reject and force re-plan under the current contract.
+      if (contract === undefined) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+          JSON.stringify({
+            task: String(t.task_key ?? "?"),
+            missing_plan_contract: true,
+          }),
+        );
+      }
+      const v = Number(contract?.version);
+      if (!Number.isSafeInteger(v) || v !== PAIR_PLAN_CONTRACT_VERSION) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+          JSON.stringify({
+            task: String(t.task_key ?? "?"),
+            unknown_plan_contract: contract ?? null,
+          }),
+        );
+      }
+      if (stamped === undefined) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+          JSON.stringify({
+            task: String(t.task_key ?? "?"),
+            missing_stamp: true,
+            plan_contract: contract,
+          }),
+        );
+      }
+      if (stamped !== undefined && canonicalJson(stamped) !== want) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+          JSON.stringify({
+            task: String(t.task_key ?? "?"),
+            expected: want,
+            stamped: canonicalJson(stamped),
+          }),
+        );
+      }
+      continue;
+    }
+    if (stamped !== undefined || contract !== undefined) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+        JSON.stringify({ task: String(t.task_key ?? "?"), forged: true }),
+      );
+    }
+  }
 }
 
 export function assertPlanDataflow(
@@ -982,6 +1181,9 @@ export function assertPlanDataflow(
   // fails closed instead of being consumed.
   if (opts.telegramIntent) {
     assertDeliveryTaskPresence(tasks, opts.telegramIntent);
+  }
+  if (opts.outputLanguage) {
+    assertOutputLanguageAuthority(tasks, opts.outputLanguage);
   }
   // R8 §2 — a persisted/bypassed non-delivery task carrying affirmative
   // delivery semantics fails closed at validation, before dispatch.
