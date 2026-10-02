@@ -10,8 +10,13 @@
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { ExecutorRegistry } from "./executor-registry.js";
-import { ModelEvidenceCatalog, modelIdentityDigest } from "./model-catalog.js";
-import { PROVIDER_OK_STATES, ProviderCatalog, providerIdentityDigest } from "./provider-catalog.js";
+import { isValidCapabilityScope, ModelEvidenceCatalog, modelIdentityDigest } from "./model-catalog.js";
+import {
+  PROVIDER_OK_STATES,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
+  ProviderCatalog,
+  providerIdentityDigest,
+} from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -240,10 +245,18 @@ export function providerModelEligibility(
     : null;
   // Receipt validity only binds a provider claiming qualified authority —
   // a non-qualified provider already fails PROVIDER_QUALIFIED.
+  // Phase E R5 §10 — a current provider qualification receipt must also
+  // prove the canonical required gate set at runtime: legacy/corrupt rows
+  // minted before today's safe commit seam (missing required gates or a
+  // non-PASS required value) are historical evidence only, never current
+  // authority.
   gates.PROVIDER_RECEIPT_CURRENT =
     !provider || !PROVIDER_OK_STATES.has(String(provider.lifecycle_state)) ||
     (providerReceipt &&
-      String(providerReceipt.material_fingerprint ?? "") === providerIdentityDigest(provider))
+      String(providerReceipt.material_fingerprint ?? "") === providerIdentityDigest(provider) &&
+      PROVIDER_QUALIFICATION_REQUIRED_GATES.every(
+        (g) => ((providerReceipt.gates ?? {}) as Record<string, unknown>)[g] === "PASS",
+      ))
       ? "PASS"
       : "FAIL";
 
@@ -302,6 +315,16 @@ export function providerModelEligibility(
   // later PASS cannot revive a failed covered one; N/A-PASS when the
   // model carries no qualified receipt (MODEL_QUALIFIED/MODEL_RECEIPT_*
   // already govern that axis).
+  // Phase E R5 §4 — a QUALIFIED model whose current qualification
+  // receipt carries an empty/malformed capability_scope is legacy/corrupt
+  // authority: historical only, never routable. Requires fresh probe +
+  // canonical requalification. N/A-PASS for non-QUALIFIED models
+  // (MODEL_QUALIFIED governs that axis).
+  gates.MODEL_QUALIFICATION_SCOPE_VALID =
+    !model || model.lifecycle_state !== "QUALIFIED" ||
+    (modelReceipt && isValidCapabilityScope(modelReceipt.capability_scope))
+      ? "PASS"
+      : "FAIL";
   const scope = (modelReceipt?.capability_scope ?? []) as string[];
   gates.MODEL_CAPABILITY_PROBE_CURRENT =
     !model || model.lifecycle_state !== "QUALIFIED" || !modelReceipt ||

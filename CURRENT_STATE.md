@@ -887,6 +887,22 @@ WOB1(A) and refused a legitimate retry.
   `currentProbeReceipts` excludes `provider_id: null`/foreign rows
   (inspectable history, never authority). Focused 62/62; full suite
   2731 pass / same 2 env P5 fails; tsc+build clean.
+- **R5 remediation** (same branch, pending re-audit): canonical
+  capability_scope contract — `normalizeCapabilityScope` requires a
+  non-empty array of non-blank identifiers (trim + first-seen dedupe),
+  enforced independently at `qualifyModel()` and the commit seam
+  (`FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE`); runtime gate
+  `MODEL_QUALIFICATION_SCOPE_VALID` makes legacy empty/malformed-scope
+  receipts non-routable (inspectable history; fresh probe +
+  requalification recovers). Provider qualification decision is now
+  canonical — `computeQualificationDecision` derives all five required
+  gates from durable state + caller policy input; the commit seam no
+  longer accepts caller-supplied `gates` (POLICY_PERMITS /
+  HEALTH_ACCEPTABLE=PASS no longer forgeable); `qualify()` delegates
+  to the same function; `PROVIDER_RECEIPT_CURRENT` requires the
+  complete required gate set PASS inside the current receipt.
+  Focused 69/69; full suite 2738 pass / same 2 env P5 fails;
+  tsc+build clean.
 
 ## Not yet
 

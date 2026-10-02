@@ -832,3 +832,128 @@ branch, no new PR, no merge:
 - this report — R4 section appended; all prior evidence preserved.
 
 STOP. DO NOT MERGE. Awaiting independent audit of R4.
+
+# R5 remediation — independent-audit MAJOR + CRITICAL closures
+
+Audited R4 HEAD: `149d6a348d20f5023e388c7b43ec4c3530932960`.
+
+## R5.1 Root cause and fix
+
+Two remaining fail-open seams:
+
+1. **Empty capability_scope passed qualification.** `Array.every` on
+   `[]` is vacuously true, so `qualifyModel(capability_scope=[])` minted
+   a QUALIFIED model + receipt with zero covering evidence — a real
+   authority bypass (the scope list was treated as trusted input at
+   qualify time, commit time, and runtime). Fix: canonical contract
+   `normalizeCapabilityScope` (model-catalog, exported once) — scope
+   must be a non-empty array of non-blank identifiers; values are
+   trimmed and deduplicated (first-seen order); anything else throws
+   `FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE`. Enforced INDEPENDENTLY at
+   both `qualifyModel()` (diagnostic path) and
+   `ModelEvidenceCatalog.issueQualificationReceipt()` (commit seam) —
+   neither trusts the other. Runtime: new gate
+   `MODEL_QUALIFICATION_SCOPE_VALID` in the shared eligibility
+   projection — a QUALIFIED model whose current receipt carries a
+   legacy empty/malformed scope → FAIL → planner + DSH reject;
+   historical receipt remains inspectable; recovery requires a fresh
+   probe + canonical requalification (tested).
+2. **Provider qualification receipt still trusted caller-supplied gate
+   VALUES.** `issueQualificationReceipt` accepted a caller `gates` map:
+   `POLICY_PERMITS`/`HEALTH_ACCEPTABLE` were not independently
+   derivable inside the seam, so `PASS` was forgeable — authority
+   bypass. Fix: one canonical computation
+   `ProviderCatalog.computeQualificationDecision(providerId, {env,
+   policyDenyList, policyVersion})` returns `{qualified, gates,
+   policy_version}` for all five required gates —
+   PROVIDER_EXISTS (trivial), AUTH_ACCEPTABLE (durable AUTH_OK or
+   `providerCredentialResolvable` env check), PROTOCOL_PROBED (durable
+   `probe_state==="PROBED"`), HEALTH_ACCEPTABLE (durable health not
+   UNAVAILABLE/DOWN), POLICY_PERMITS (not in caller policyDenyList).
+   The commit seam no longer takes `gates` at all — forged values are
+   structurally impossible; it calls the canonical function and throws
+   `FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES` (with `failing_gates`)
+   when the decision is unqualified. `ProviderValidator.qualify()` now
+   delegates to the same function — single implementation, no
+   duplicated gate logic. POLICY_PERMITS stays caller-influenced only
+   through the caller's own policy input (denylist), which is correct
+   authority semantics, not a forge.
+   Runtime: `PROVIDER_RECEIPT_CURRENT` now requires the canonical
+   required gate set to be present and `==="PASS"` inside the CURRENT
+   receipt — an injected fingerprint-valid receipt with `gates:{}` or
+   `POLICY_PERMITS:"FAIL"` set as current → FAIL → non-routable; a
+   complete valid receipt → PASS (control).
+
+## R5.2 R5 tests (new)
+
+- **r5s** (§13 A/B/C + §15): `qualifyModel([])` throws
+  `FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE` — no receipt, no QUALIFIED;
+  direct seam `issueQualificationReceipt([])` / `[""]` / `["   "]` /
+  `["\t\n"]` fail closed identically; control
+  `[" text_inference ","text_inference"]` → normalized
+  `["text_inference"]`, qualifies, `evidence_refs` point at the current
+  covering probe.
+- **r5l** (§14): injected QUALIFIED model + fingerprint-valid receipt
+  with `capability_scope:[]` set as current →
+  `MODEL_QUALIFICATION_SCOPE_VALID` FAIL → planner reject + DSH reject,
+  projection non-routable; canonical probe + `qualifyModel` clears it.
+- **r5d** (§8): AUTH_OK+PROBED+READY but `policyDenyList:[pid]` →
+  `qualify()` returns unqualified with `POLICY_PERMITS:"FAIL"`, no
+  receipt, non-routable; direct seam call identical; **smuggling
+  `{gates:{POLICY_PERMITS:"PASS"}}` into the seam no longer compiles/
+  applies** — the signature has no `gates` parameter.
+- **r5h** (§9): `health_state:"DOWN"` → `HEALTH_ACCEPTABLE:"FAIL"` →
+  no qualification; health restored → canonical qualify succeeds.
+- **r5r1/r5r2/r5r3** (§11/§12): `injectReceipt` plants a current
+  fingerprint-valid `provider_qualification` with `gates:{}` →
+  `PROVIDER_RECEIPT_CURRENT` FAIL, non-routable; same with
+  `POLICY_PERMITS:"FAIL"` → FAIL; all-PASS canonical gates → PASS +
+  eligible (control).
+- **Fixture updates (legitimate)**: all provider seam callers updated
+  to the new signature (`{policy_version, actor, env?, policyDenyList?}`);
+  phase-b/phase-c `mkProvider` now mints under canonical healthy state
+  and applies requested `auth_state`/`health_state` degradation AFTER
+  the receipt (post-qualification degradation ordering, same as the
+  credential-revocation pattern).
+
+## R5.3 Regression
+
+- Focused Phase E suite: **69/69** (34 + 11 R1 + 6 R2 + 6 R3 + 5 R4 + 7 R5).
+- Incident invariants (full run): planner-dataflow 106/106,
+  recovery-approval 37/37, ops-telegram-delivery 3/3,
+  live-ops-recovery-closure 20/20, runtime-hardening 11/11 — 177/177.
+- Sibling seam consumers: phase-b 123/123, phase-c-dsh 51/51,
+  p6 36/36.
+- Full suite: **2738 pass / 2 fail / 15 skip (2755)** — the 2 fails are
+  the same pre-existing env-only P5 assertions
+  (`EXECUTABLE_NOT_FOUND` — real `dsh`/`codex` on PATH; identical on
+  base `b08e8a5` and every audited HEAD). +7 vs R4 count.
+- `npx tsc --noEmit`: clean. `pnpm build`: clean.
+- Live E2E: unchanged from R2 (R5 touches qualification/evidence seams
+  only, not the boot path).
+
+## R5.4 Files changed in R5
+
+- `src/pair/provider-catalog.ts` — `providerCredentialResolvable`
+  export; new `computeQualificationDecision` (single canonical gate
+  authority); `issueQualificationReceipt` signature no longer accepts
+  `gates` — consumes the canonical decision.
+- `src/pair/provider-validation.ts` — `qualify()` delegates to
+  `computeQualificationDecision`; `credentialResolvable` delegates to
+  `providerCredentialResolvable`.
+- `src/pair/model-catalog.ts` — `normalizeCapabilityScope` +
+  `isValidCapabilityScope`; commit seam validates + normalizes scope.
+- `src/pair/model-probing.ts` — `qualifyModel` normalizes scope
+  independently before the gate loop.
+- `src/pair/model-routable.ts` — `PROVIDER_RECEIPT_CURRENT` requires
+  the canonical required gate set inside the current receipt; new
+  `MODEL_QUALIFICATION_SCOPE_VALID` gate.
+- `src/__tests__/pair-phase-e-provider-model-authority.test.ts` —
+  +7 R5 tests; seam call-sites updated; r3p/r4p rewritten for the
+  gates-free signature.
+- `src/__tests__/pair-phase-b.test.ts`,
+  `pair-phase-c-dsh-model-routing.test.ts`, `pair-p6.test.ts` —
+  fixture signature updates + post-receipt degradation ordering.
+- this report — R5 section appended; all prior evidence preserved.
+
+STOP. DO NOT MERGE. Awaiting independent audit of R5.

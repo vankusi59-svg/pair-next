@@ -40,6 +40,7 @@ import {
   modelIdentityDigest,
   projectRoutableModels,
   providerEntryId,
+  providerIdentityDigest,
   providerModelEligibility,
   providerRoutableGate,
   qualifyBinding,
@@ -235,7 +236,7 @@ describe("B — auth", () => {
     // after qualification" state this test targets).
     store.put("provider", id, { ...b, lifecycle_state: "QUALIFIED", auth_state: "AUTH_OK", probe_state: "PROBED" }, Number(b.version));
     const cat = new ProviderCatalog(store);
-    cat.issueQualificationReceipt("pv", { policy_version: "t", gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])), actor: "t" });
+    cat.issueQualificationReceipt("pv", { policy_version: "t", actor: "t" });
     const b2 = store.get("provider", id);
     store.put("provider", id, { ...b2, auth_state: "AUTH_REQUIRED" }, Number(b2.version));
     // AUTH_REQUIRED still fails PROVIDER_AUTH_OK even with a valid receipt.
@@ -1498,13 +1499,11 @@ describe("R3 — §8/§9 provider seam: forged receipt fails closed, canonical p
       lifecycle_state: "DISCOVERY_ELIGIBLE",
     }, Number(e.version));
 
-    // Forged commit: caller claims the full canonical gate set passed —
-    // the seam checks durable canonical state instead of trusting the
-    // caller.
+    // Forged commit attempt: the seam validates durable canonical state
+    // (and R5 recomputes gate values itself — no caller map exists).
     expect(() =>
       cat.issueQualificationReceipt("pv", {
         policy_version: "t",
-        gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])),
         actor: "t",
       }),
     ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE/);
@@ -1515,7 +1514,9 @@ describe("R3 — §8/§9 provider seam: forged receipt fails closed, canonical p
     const me = mkModel(store, "pv", "m1");
     expect(providerModelEligibility(store, "pv", me).gates.PROVIDER_PROBE_CURRENT).toBe("FAIL");
 
-    // A forged non-PASS gate value on a now-PROBED provider is rejected too.
+    // A denied-policy provider on canonical PROBED+AUTH_OK state is
+    // rejected by the derived decision — no caller gate map exists to
+    // forge.
     await new ProviderValidator(store).validateAccess("pv", {
       env: { PV_KEY: "cred" },
       probe: async () => ({ outcome: "AUTH_OK", latency_ms: 3 }),
@@ -1524,7 +1525,7 @@ describe("R3 — §8/§9 provider seam: forged receipt fails closed, canonical p
     expect(() =>
       cat.issueQualificationReceipt("pv", {
         policy_version: "t",
-        gates: { ...Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])), PROTOCOL_PROBED: "WARN" },
+        policyDenyList: ["pv"],
         actor: "t",
       }),
     ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
@@ -1731,11 +1732,8 @@ describe("R3 — §16 minted refs derive from covering current PASS evidence", (
  * window; a PASS for capability B never revives capability A.
  * R4 §11–§13 — strict provider ownership at record + projection. */
 
-const ALL_PASS_GATES = () =>
-  Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"]));
-
-describe("R4 — §4 canonical required provider gate set", () => {
-  it("gates={} and every missing/forged required gate fail closed; DISABLED still mints but stays non-routable", async () => {
+describe("R4/R5 — provider qualification decision integrity (§4, §8, §9, §18)", () => {
+  it("the commit seam derives canonical gates — denylist/DOWN forge-proof; DISABLED mints technically but stays non-routable", async () => {
     const { store } = makeCtx("r4p");
     const cat = new ProviderCatalog(store);
     // Canonical healthy state first (probe through the real validator).
@@ -1746,31 +1744,39 @@ describe("R4 — §4 canonical required provider gate set", () => {
     });
     expect(cat.getProvider("pv")!.probe_state).toBe("PROBED");
 
-    // Empty gate map cannot mint.
-    expect(() => cat.issueQualificationReceipt("pv", { policy_version: "t", gates: {}, actor: "t" }))
-      .toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
-    // Each required gate missing individually → fail closed.
-    for (const g of PROVIDER_QUALIFICATION_REQUIRED_GATES) {
-      const gates = ALL_PASS_GATES();
-      delete gates[g];
-      expect(() => cat.issueQualificationReceipt("pv", { policy_version: "t", gates, actor: "t" }))
-        .toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
-    }
-    // A forged FAIL value also fails.
+    // R5 §8 — POLICY_PERMITS is derived, not caller-supplied: a denied
+    // provider can never mint, on either seam.
+    expect(() =>
+      cat.issueQualificationReceipt("pv", { policy_version: "t", policyDenyList: ["pv"], actor: "t" }),
+    ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
+    expect(new ProviderValidator(store).qualify("pv", { env: { PV_KEY: "cred" }, policyDenyList: ["pv"] }).qualified).toBe(false);
+    // A raw caller trying to smuggle a forged gates map gets nothing —
+    // the seam's signature consumes no caller gate values at all.
     expect(() =>
       cat.issueQualificationReceipt("pv", {
         policy_version: "t",
-        gates: { ...ALL_PASS_GATES(), POLICY_PERMITS: "FAIL" },
+        policyDenyList: ["pv"],
+        gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])),
         actor: "t",
-      }),
+      } as never),
     ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
     expect(cat.getProvider("pv")!.current_qualification_receipt_id ?? null).toBeNull();
 
-    // §19 — DISABLED is operator authority: canonical qualification may
+    // R5 §9 — HEALTH_ACCEPTABLE likewise: a DOWN provider cannot mint
+    // even with an otherwise healthy AUTH_OK/PROBED row.
+    const down = cat.getProvider("pv")!;
+    store.put("provider", String(down.entry_id), { ...down, health_state: "DOWN" }, Number(down.version));
+    expect(() => cat.issueQualificationReceipt("pv", { policy_version: "t", actor: "t" }))
+      .toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
+    expect(new ProviderValidator(store).qualify("pv", { env: { PV_KEY: "cred" } }).gates.HEALTH_ACCEPTABLE).toBe("FAIL");
+    const back = cat.getProvider("pv")!;
+    store.put("provider", String(back.entry_id), { ...back, health_state: "HEALTHY" }, Number(back.version));
+
+    // §18 — DISABLED is operator authority: canonical qualification may
     // technically succeed, but DISABLED stays and routability stays closed.
     const e = cat.getProvider("pv")!;
     store.put("provider", String(e.entry_id), { ...e, conditions: ["DISABLED"] }, Number(e.version));
-    const receipt = cat.issueQualificationReceipt("pv", { policy_version: "t", gates: ALL_PASS_GATES(), actor: "t" });
+    const receipt = cat.issueQualificationReceipt("pv", { policy_version: "t", actor: "t" });
     expect(receipt.receipt_id).toBeTruthy();
     const after = cat.getProvider("pv")!;
     expect(after.conditions).toContain("DISABLED");
@@ -1954,5 +1960,209 @@ describe("R4 — §17/§18 strict provider ownership of probe evidence", () => {
       latency_ms: 1,
     });
     expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(true);
+  });
+});
+
+/* ==================== R5 — EMPTY-SCOPE + DECISION INTEGRITY ==========
+ * R5 §1–§4 — capability_scope must be canonically non-empty; legacy
+ * empty-scope receipts are historical only, never routable.
+ * R5 §5–§12 — provider gate values are canonical output; runtime
+ * receipt validation re-checks the required gate set. */
+
+describe("R5 — §13 canonical capability scope contract", () => {
+  it("empty/blank scopes fail closed at qualifyModel AND the commit seam", async () => {
+    const { store } = makeCtx("r5s");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+
+    // A: qualifyModel with [] — canonical scope error, no receipt, no QUALIFIED.
+    expect(() => qualifyModel(store, me, { capability_scope: [], actor: "t" }))
+      .toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE/);
+    expect(mcat.getModel(me)!.current_qualification_receipt_id ?? null).toBeNull();
+    expect(mcat.getModel(me)!.lifecycle_state).not.toBe("QUALIFIED");
+
+    // B: direct seam — same fail closed (no diagnostic-path bypass).
+    expect(() =>
+      mcat.issueQualificationReceipt(me, {
+        capability_scope: [],
+        verifier: "t",
+        evidence_refs: [],
+        actor: "t",
+      }),
+    ).toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE/);
+
+    // C: blank / whitespace-only identifiers — same.
+    for (const bad of [[""], ["   "], ["\t\n"]]) {
+      expect(() => qualifyModel(store, me, { capability_scope: bad, actor: "t" }))
+        .toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE/);
+      expect(() =>
+        mcat.issueQualificationReceipt(me, {
+          capability_scope: bad,
+          verifier: "t",
+          evidence_refs: [],
+          actor: "t",
+        }),
+      ).toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE/);
+    }
+    expect(mcat.listModels("pv").every((m) => m.lifecycle_state !== "QUALIFIED")).toBe(true);
+
+    // §15 control — normal path still works: fresh PASS probe then a
+    // canonical (trimmed/deduped) scope qualifies.
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_r5_text",
+      model_entry_id: me,
+      provider_id: "pv",
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    });
+    const q = qualifyModel(store, me, { capability_scope: [" text_inference ", "text_inference"], actor: "t" });
+    expect(q.qualified).toBe(true);
+    expect(q.receipt!.capability_scope).toEqual(["text_inference"]);
+    expect((q.receipt!.evidence_refs as string[]).length).toBeGreaterThan(0);
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R5 — §14 legacy empty-scope receipt is not current authority", () => {
+  it("QUALIFIED model + receipt capability_scope=[] → MODEL_QUALIFICATION_SCOPE_VALID FAIL, non-routable, planner rejects", async () => {
+    const { store } = makeCtx("r5l");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+    // Inject a legacy/corrupt qualified state: lifecycle QUALIFIED with a
+    // fingerprint-valid receipt whose scope is empty — minted before the
+    // safe commit seam existed.
+    const legacy = {
+      receipt_id: "MQR_legacy_empty",
+      model_entry_id: me,
+      capability_scope: [],
+      verifier: "legacy",
+      evidence_refs: [],
+      material_fingerprint: modelIdentityDigest(mcat.getModel(me)!),
+      issued_at: "2026-01-01T00:00:00Z",
+    };
+    store.put("model_qualification", legacy.receipt_id, legacy);
+    const cur = mcat.getModel(me)!;
+    store.put("model_entry", me, {
+      ...cur,
+      lifecycle_state: "QUALIFIED",
+      probe_state: "PROBED",
+      current_qualification_receipt_id: legacy.receipt_id,
+    }, Number(cur.version));
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_QUALIFICATION_SCOPE_VALID).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({ reject: true });
+    // Canonical requalification still works — fresh probe + valid scope.
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_r5_fix",
+      model_entry_id: me,
+      provider_id: "pv",
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    });
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(true);
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R5 — §8/§9 no public seam can forge POLICY_PERMITS or HEALTH_ACCEPTABLE", () => {
+  it("denylisted provider: qualify + raw seam both refuse; not routable", async () => {
+    const { store } = makeCtx("r5d");
+    await mkQualifiedProvider(store, "pv");
+    const cat = new ProviderCatalog(store);
+    const me = mkModel(store, "pv", "m1");
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+
+    // Fresh qualification attempt under a denylist — both seams refuse.
+    expect(new ProviderValidator(store).qualify("pv", { env: { PV_KEY: "cred" }, policyDenyList: ["pv"] }).qualified).toBe(false);
+    expect(() =>
+      cat.issueQualificationReceipt("pv", { policy_version: "t", policyDenyList: ["pv"], actor: "t" }),
+    ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
+    // Existing authority from the healthy epoch persists (receipt kept —
+    // policy denial is a new-decision state, not a receipt rewrite).
+    expect(cat.getProvider("pv")!.current_qualification_receipt_id).toBeTruthy();
+  });
+
+  it("DOWN provider: qualify + raw seam both refuse", async () => {
+    const { store } = makeCtx("r5h");
+    await mkQualifiedProvider(store, "pv");
+    const cat = new ProviderCatalog(store);
+    const p = cat.getProvider("pv")!;
+    store.put("provider", String(p.entry_id), { ...p, health_state: "DOWN" }, Number(p.version));
+    expect(new ProviderValidator(store).qualify("pv", { env: { PV_KEY: "cred" } }).gates.HEALTH_ACCEPTABLE).toBe("FAIL");
+    expect(() => cat.issueQualificationReceipt("pv", { policy_version: "t", actor: "t" }))
+      .toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
+  });
+});
+
+describe("R5 — §11/§12 provider receipt runtime gate validation", () => {
+  const seedQualified = async (store: PairEvidenceStore) => {
+    await mkQualifiedProvider(store, "pv");
+    const cat = new ProviderCatalog(store);
+    return { cat, p: cat.getProvider("pv")! };
+  };
+  const injectReceipt = (store: PairEvidenceStore, p: Record<string, unknown>, gates: Record<string, unknown>) => {
+    const rid = `PQR_legacy_${Object.keys(gates).length}_${Math.random().toString(36).slice(2, 8)}`;
+    store.put("provider_qualification", rid, {
+      receipt_id: rid,
+      provider_id: "pv",
+      policy_version: "legacy",
+      material_fingerprint: providerIdentityDigest(p),
+      gates,
+      issued_at: "2026-01-01T00:00:00Z",
+    });
+    const cur = store.get("provider", String(p.entry_id));
+    store.put("provider", String(p.entry_id), {
+      ...cur,
+      lifecycle_state: "QUALIFIED",
+      current_qualification_receipt_id: rid,
+    }, Number(cur.version));
+    return rid;
+  };
+
+  it("legacy receipt with missing required gates → PROVIDER_RECEIPT_CURRENT FAIL, non-routable", async () => {
+    const { store } = makeCtx("r5r1");
+    const { p } = await seedQualified(store);
+    const me = mkModel(store, "pv", "m1");
+    injectReceipt(store, p, {});
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.PROVIDER_RECEIPT_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+  });
+
+  it("legacy receipt with a failing required gate → FAIL, non-routable", async () => {
+    const { store } = makeCtx("r5r2");
+    const { p } = await seedQualified(store);
+    const me = mkModel(store, "pv", "m1");
+    injectReceipt(store, p, {
+      PROVIDER_EXISTS: "PASS", AUTH_ACCEPTABLE: "PASS", PROTOCOL_PROBED: "PASS",
+      HEALTH_ACCEPTABLE: "PASS", POLICY_PERMITS: "FAIL",
+    });
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.PROVIDER_RECEIPT_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+  });
+
+  it("§12 control — complete valid receipt remains supported", async () => {
+    const { store } = makeCtx("r5r3");
+    const { p } = await seedQualified(store);
+    const me = mkModel(store, "pv", "m1");
+    injectReceipt(store, p, {
+      PROVIDER_EXISTS: "PASS", AUTH_ACCEPTABLE: "PASS", PROTOCOL_PROBED: "PASS",
+      HEALTH_ACCEPTABLE: "PASS", POLICY_PERMITS: "PASS",
+    });
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.PROVIDER_RECEIPT_CURRENT).toBe("PASS");
+    expect(elig.eligible).toBe(true);
   });
 });

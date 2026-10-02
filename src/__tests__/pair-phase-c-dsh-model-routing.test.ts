@@ -92,11 +92,24 @@ const mkProvider = (
   // qualification receipt (both reachable only through canonical
   // qualification in production).
   if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+    // R5 — the seam derives the required gate set from durable state:
+    // mint under canonical healthy state, then apply the caller's
+    // degraded auth/health after the receipt (post-qualification
+    // degradation ordering).
+    const cur = store.get("provider", id);
+    store.put("provider", id, { ...cur, auth_state: "AUTH_OK", probe_state: "PROBED", health_state: "READY" }, Number(cur.version));
     new ProviderCatalog(store).issueQualificationReceipt(pid, {
       policy_version: "test-policy",
-      gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])) as Record<string, unknown>,
       actor: "test",
     });
+    if (opts.auth_state !== undefined || opts.health_state !== undefined) {
+      const b = store.get("provider", id);
+      store.put("provider", id, {
+        ...b,
+        auth_state: opts.auth_state ?? b.auth_state,
+        health_state: opts.health_state ?? b.health_state,
+      }, Number(b.version));
+    }
     if (lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
       const b = store.get("provider", id);
       store.put("provider", id, { ...b, lifecycle_state: "MODEL_DISCOVERY_ELIGIBLE" }, Number(b.version));

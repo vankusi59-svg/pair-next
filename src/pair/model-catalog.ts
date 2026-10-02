@@ -17,6 +17,40 @@ import type { PairEvidenceStore } from "./store.js";
 export const REMOVED_ABSENCE_THRESHOLD = 3;
 export const MODEL_TERMINAL_FOR_ROUTING = new Set(["REMOVED", "DEPRECATED", "BLOCKED"]);
 
+/** Phase E R5 §2 — canonical capability_scope contract: a non-empty
+ *  array of non-blank capability identifiers, trimmed and deduplicated
+ *  in first-seen order. Anything else fails closed. */
+export function normalizeCapabilityScope(scope: unknown): string[] {
+  if (!Array.isArray(scope) || scope.length === 0) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE",
+      JSON.stringify({ capability_scope: scope ?? null }),
+    );
+  }
+  const out: string[] = [];
+  for (const raw of scope) {
+    const cap = String(raw ?? "").trim();
+    if (!cap) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE",
+        JSON.stringify({ capability_scope: scope }),
+      );
+    }
+    if (!out.includes(cap)) out.push(cap);
+  }
+  return out;
+}
+
+/** Non-throwing predicate form — runtime receipt validation. */
+export function isValidCapabilityScope(scope: unknown): boolean {
+  try {
+    normalizeCapabilityScope(scope);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function norm(s: unknown): string {
   return String(s ?? "").trim();
 }
@@ -425,6 +459,11 @@ export class ModelEvidenceCatalog {
   ): Record<string, unknown> {
     const entry = this.getModel(modelEntryId);
     if (!entry) throw new NotFoundError(`model_entry:${modelEntryId}`);
+    // Phase E R5 §1–§3 — an empty/blank capability scope must never mint:
+    // `[].every(...)` vacuously passed and produced QUALIFIED authority
+    // with zero evidence. The commit seam enforces the canonical scope
+    // contract independently of the diagnostic qualifyModel path.
+    const scope = normalizeCapabilityScope(opts.capability_scope);
     // Phase E R2 §4 — this seam mints QUALIFIED authority, so it must
     // validate canonical CURRENT-epoch probe evidence itself rather than
     // trust caller-provided strings. Every capability in scope must be
@@ -436,7 +475,7 @@ export class ModelEvidenceCatalog {
     // evidence: every requested capability must have a current PASS (the
     // newest applicable receipt in the window), not merely "ever passed".
     const covering: Array<Record<string, unknown>> = [];
-    for (const cap of opts.capability_scope) {
+    for (const cap of scope) {
       const latest = this.latestProbeReceiptForCapability(modelEntryId, cap);
       if (!latest || !this.probeCurrentForCapability(modelEntryId, cap)) {
         throw new IntegrityError(
@@ -461,7 +500,7 @@ export class ModelEvidenceCatalog {
     const receipt = {
       receipt_id: newId("MQR"),
       model_entry_id: modelEntryId,
-      capability_scope: opts.capability_scope,
+      capability_scope: scope,
       verifier: opts.verifier,
       evidence_refs: [...new Set(covering.map((r) => String(r.probe_id)))],
       // Phase E §7 — bind the receipt to the model's material identity at

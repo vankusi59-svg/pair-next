@@ -59,6 +59,17 @@ export const PROVIDER_QUALIFICATION_REQUIRED_GATES = [
   "POLICY_PERMITS",
 ] as const;
 
+/** Credential resolvable = env name declared AND present in env. Shared by
+ * the canonical qualification decision and ProviderValidator. */
+export function providerCredentialResolvable(
+  entry: Record<string, unknown>,
+  env: Record<string, string | undefined>,
+): string {
+  const ref = entry.credential_reference_name;
+  if (!ref) return "AUTH_OK"; // provider declares no credential requirement
+  return env[String(ref)] ? "AUTH_OK" : "CREDENTIAL_MISSING";
+}
+
 const IDENTITY_FIELDS = [
   "provider_id",
   "provider_type",
@@ -505,9 +516,46 @@ export class ProviderCatalog {
     );
   }
 
+  /** Phase E R5 §6–§9 — the ONE canonical provider qualification
+   *  decision. Every required gate is derived here from durable
+   *  canonical state + supplied policy input; both the diagnostic path
+   *  (ProviderValidator.qualify) and the authority-committing seam
+   *  (issueQualificationReceipt) consume this computation — callers can
+   *  never author gate values. */
+  computeQualificationDecision(
+    providerId: string,
+    opts: {
+      env?: Record<string, string | undefined>;
+      policyDenyList?: string[];
+      policyVersion?: string;
+    } = {},
+  ): { qualified: boolean; gates: Record<string, string>; policy_version: string } {
+    const entry = this.mustGet(providerId);
+    const env = opts.env ?? (process.env as Record<string, string | undefined>);
+    const gates: Record<string, string> = {};
+    gates.PROVIDER_EXISTS = "PASS";
+    gates.AUTH_ACCEPTABLE =
+      String(entry.auth_state) === "AUTH_OK" || providerCredentialResolvable(entry, env) === "AUTH_OK"
+        ? "PASS"
+        : "FAIL";
+    gates.PROTOCOL_PROBED = String(entry.probe_state) === "PROBED" ? "PASS" : "FAIL";
+    gates.HEALTH_ACCEPTABLE = !["UNAVAILABLE", "DOWN"].includes(String(entry.health_state)) ? "PASS" : "FAIL";
+    gates.POLICY_PERMITS = !(opts.policyDenyList ?? []).includes(providerId) ? "PASS" : "FAIL";
+    return {
+      qualified: Object.values(gates).every((g) => g === "PASS"),
+      gates,
+      policy_version: opts.policyVersion ?? "P6_POLICY_V1",
+    };
+  }
+
   issueQualificationReceipt(
     providerId: string,
-    opts: { policy_version: string; gates: Record<string, unknown>; actor?: string },
+    opts: {
+      policy_version: string;
+      env?: Record<string, string | undefined>;
+      policyDenyList?: string[];
+      actor?: string;
+    },
   ): Record<string, unknown> {
     const entry = this.mustGet(providerId);
     // Phase E R3 §5–§7 — this commit seam installs QUALIFIED authority, so
@@ -533,26 +581,31 @@ export class ProviderCatalog {
         JSON.stringify({ provider_id: providerId, blocked_by: blocked }),
       );
     }
-    const missing = PROVIDER_QUALIFICATION_REQUIRED_GATES.filter((g) => !(g in opts.gates));
-    if (missing.length) {
+    // Phase E R5 §5–§9 — gate VALUES are canonical output, not caller
+    // input: the seam recomputes the decision from durable state + the
+    // same policy inputs, so a forged all-PASS map (or a forged
+    // POLICY_PERMITS/HEALTH_ACCEPTABLE) can never mint authority. No
+    // `gates` parameter exists on this seam.
+    const decision = this.computeQualificationDecision(providerId, {
+      env: opts.env,
+      policyDenyList: opts.policyDenyList,
+      policyVersion: opts.policy_version,
+    });
+    if (!decision.qualified) {
       throw new IntegrityError(
         "FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES",
-        JSON.stringify({ provider_id: providerId, missing_gates: missing }),
-      );
-    }
-    const failing = Object.entries(opts.gates).filter(([, v]) => v !== "PASS");
-    if (failing.length) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES",
-        JSON.stringify({ provider_id: providerId, failing_gates: failing.map(([k]) => k) }),
+        JSON.stringify({
+          provider_id: providerId,
+          failing_gates: PROVIDER_QUALIFICATION_REQUIRED_GATES.filter((g) => decision.gates[g] !== "PASS"),
+        }),
       );
     }
     const receipt = {
       receipt_id: newId("PQR"),
       provider_id: providerId,
-      policy_version: opts.policy_version,
+      policy_version: decision.policy_version,
       material_fingerprint: providerIdentityDigest(entry),
-      gates: opts.gates,
+      gates: decision.gates,
       issued_at: utcnow(),
     };
     this.store.put("provider_qualification", receipt.receipt_id, receipt);

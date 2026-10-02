@@ -1025,15 +1025,18 @@ const mkProvider = (
     // PROBED); a caller's degraded auth/probe state applies AFTER the
     // receipt, the same ordering a credential revocation would take.
     const cur = store.get("provider", id);
-    store.put("provider", id, { ...cur, auth_state: "AUTH_OK", probe_state: "PROBED" }, Number(cur.version));
+    store.put("provider", id, { ...cur, auth_state: "AUTH_OK", probe_state: "PROBED", health_state: "READY" }, Number(cur.version));
     new ProviderCatalog(store).issueQualificationReceipt(pid, {
       policy_version: "test-policy",
-      gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])) as Record<string, unknown>,
       actor: "test",
     });
-    if (opts.auth_state !== undefined) {
+    if (opts.auth_state !== undefined || opts.health_state !== undefined) {
       const b = store.get("provider", id);
-      store.put("provider", id, { ...b, auth_state: opts.auth_state }, Number(b.version));
+      store.put("provider", id, {
+        ...b,
+        auth_state: opts.auth_state ?? b.auth_state,
+        health_state: opts.health_state ?? b.health_state,
+      }, Number(b.version));
     }
     // Canonical post-qualification resting state: the receipt lands on
     // QUALIFIED, then the lifecycle settles at MODEL_DISCOVERY_ELIGIBLE —

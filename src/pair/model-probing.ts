@@ -9,7 +9,7 @@
 
 import { newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
-import { ModelEvidenceCatalog } from "./model-catalog.js";
+import { ModelEvidenceCatalog, normalizeCapabilityScope } from "./model-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const PROBE_TIERS = [0, 1, 2, 3] as const;
@@ -150,6 +150,10 @@ export function qualifyModel(
   const catalog = new ModelEvidenceCatalog(store);
   const entry = catalog.getModel(modelEntryId);
   if (!entry) throw new NotFoundError(`model_entry:${modelEntryId}`);
+  // Phase E R5 §1–§3 — canonical scope contract enforced at the
+  // diagnostic seam too: [] / blank identifiers fail closed before any
+  // gate runs ([].every() would otherwise pass vacuously).
+  const scope = normalizeCapabilityScope(opts.capability_scope);
 
   const gates: Record<string, string> = {};
   gates.MODEL_EXISTS = "PASS";
@@ -166,8 +170,8 @@ export function qualifyModel(
   // can never revive a failed one, and a superseded PASS cannot outrank a
   // newer FAIL on the same capability.
   const capCurrent = (cap: string) => catalog.probeCurrentForCapability(modelEntryId, cap);
-  gates.CURRENT_PROBE_EVIDENCE = opts.capability_scope.every(capCurrent) ? "PASS" : "FAIL";
-  for (const cap of opts.capability_scope) {
+  gates.CURRENT_PROBE_EVIDENCE = scope.every(capCurrent) ? "PASS" : "FAIL";
+  for (const cap of scope) {
     gates[`CAPABILITY_${cap.toUpperCase()}`] = capCurrent(cap) ? "PASS" : "FAIL";
   }
 
@@ -175,12 +179,12 @@ export function qualifyModel(
   if (!qualified) return { qualified: false, gates };
 
   const receipt = catalog.issueQualificationReceipt(modelEntryId, {
-    capability_scope: opts.capability_scope,
+    capability_scope: scope,
     verifier: opts.verifier ?? "DETERMINISTIC_PROBE_EVIDENCE",
     // The seam derives the minted evidence_refs from the actual covering
     // current PASS receipts; these caller refs are only validated against
     // the current window.
-    evidence_refs: opts.capability_scope
+    evidence_refs: scope
       .map((cap) => catalog.latestProbeReceiptForCapability(modelEntryId, cap))
       .filter((r): r is Record<string, unknown> => r != null)
       .map((r) => String(r.probe_id)),

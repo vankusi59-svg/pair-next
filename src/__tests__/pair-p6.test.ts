@@ -91,7 +91,6 @@ function seedProvider(
     }, Number(pre.version));
     catalog.issueQualificationReceipt(providerId, {
       policy_version: "test-policy",
-      gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])) as Record<string, unknown>,
       actor: "test",
     });
     if (opts.lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
