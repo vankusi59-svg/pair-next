@@ -45,6 +45,8 @@ import type { RecoveryController } from "./recovery-controller.js";
 import { classifyFailure } from "./recovery-controller.js";
 import {
   assertPlanDataflow,
+  assertTaskDeliverySemantic,
+  detectTelegramDeliveryIntent,
   missingConsumedArtifact,
 } from "./plan-dataflow.js";
 import { mintTelegramDeliveryRequest } from "./telegram-delivery.js";
@@ -543,7 +545,12 @@ export class MissionRuntime {
     // Incident R1 — pinned plans must be data-flow sound at the commit
     // boundary: every consumed artifact requires its producer edge. A
     // planner path that bypassed the canonicalize seam still fails closed.
-    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
+    // R8 — the intent↔presence invariant and instruction hygiene are
+    // re-proven here with the operator request (mission.goal) as the
+    // only delivery authority.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
+      telegramIntent: detectTelegramDeliveryIntent(mission.goal),
+    });
     this.deps.service.commitPlan({
       mission_id: missionId,
       tasks: tasks as unknown as Array<Record<string, unknown>>,
@@ -678,6 +685,13 @@ export class MissionRuntime {
       }
       const request = this.requestFor(mission, task);
       try {
+        // R8 §4 — pre-dispatch semantic defense: affirmative Telegram
+        // delivery semantics in task_instruction ⇒ the TASK itself must
+        // require TELEGRAM_DELIVERY (its ROLE, not the executor's caps).
+        // A persisted/bypassed/malformed plan reaching dispatch with a
+        // send directive on a non-delivery task fails closed with zero
+        // executor dispatch.
+        assertTaskDeliverySemantic(task as Record<string, unknown>);
         const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
         this.deps.service.updateTask(String(task.task_id), { status: "RUNNING" });
         const execution = routed.execution as Record<string, unknown>;
@@ -2410,8 +2424,12 @@ export class MissionRuntime {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
-    // Incident R1 — a replan is a new committed plan: same data-flow gate.
-    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
+    // Incident R1 — a replan is a new committed plan: same data-flow gate,
+    // and the same R8 delivery plan-shape re-proof (intent↔presence +
+    // instruction hygiene against the operator request).
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
+      telegramIntent: detectTelegramDeliveryIntent(mission.goal),
+    });
     // Old revision stays immutable; unfinished old tasks are settled as
     // CANCELLED (never silently reset), pending approvals/timers superseded.
     for (const t of oldTasks) {
