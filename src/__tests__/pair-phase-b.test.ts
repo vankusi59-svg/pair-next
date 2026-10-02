@@ -56,6 +56,7 @@ import {
   qualifyBinding,
   ProviderValidator,
   ProviderCatalog,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
   ModelEvidenceCatalog,
   MODEL_ROLE,
   DevinExecutorAdapter,
@@ -972,6 +973,7 @@ const mkModel = (
     mcat.recordProbeReceipt({
       probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
       model_entry_id: eid,
+      provider_id: pid,
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1026,7 +1028,7 @@ const mkProvider = (
     store.put("provider", id, { ...cur, auth_state: "AUTH_OK", probe_state: "PROBED" }, Number(cur.version));
     new ProviderCatalog(store).issueQualificationReceipt(pid, {
       policy_version: "test-policy",
-      gates: { fixture: "PASS" },
+      gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])) as Record<string, unknown>,
       actor: "test",
     });
     if (opts.auth_state !== undefined) {
@@ -1553,6 +1555,7 @@ describe("R3 live-found — model STALE residue cleared at canonical seam", () =
     mcat.recordProbeReceipt({
       probe_id: "PRB_p68",
       model_entry_id: me,
+      provider_id: pid,
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },

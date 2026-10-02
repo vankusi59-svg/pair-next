@@ -21,6 +21,7 @@ import {
   PairEvidenceStore,
   ProviderCatalog,
   ProviderValidator,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
   canonicalModelId,
   ensureBinding,
   normalizeEndpointIdentity,
@@ -90,7 +91,7 @@ function seedProvider(
     }, Number(pre.version));
     catalog.issueQualificationReceipt(providerId, {
       policy_version: "test-policy",
-      gates: { fixture: "PASS" },
+      gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])) as Record<string, unknown>,
       actor: "test",
     });
     if (opts.lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
@@ -256,6 +257,7 @@ describe("P6 discovery → catalog", () => {
     cat.recordProbeReceipt({
       probe_id: "PRB_x",
       model_entry_id: mid,
+      provider_id: "groq",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -643,6 +645,7 @@ function makeRoutableRow(
   cat.recordProbeReceipt({
     probe_id: `PRB_${providerId}_m1`,
     model_entry_id: mid,
+    provider_id: providerId,
     result: "PASS",
     probe_type: "text_inference",
     capability_evidence: { text_inference: "PASS" },

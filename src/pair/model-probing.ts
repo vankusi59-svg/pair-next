@@ -160,21 +160,15 @@ export function qualifyModel(
   // only: the receipts referenced by the entry's current probe_receipt_ids
   // window. Historical receipts from a pre-STALE/REMOVED epoch stay
   // persisted but are never consulted here.
-  const receipts = catalog.currentProbeReceipts(modelEntryId);
-  const passCaps = new Set<string>();
-  for (const r of receipts) {
-    if (r.result !== "PASS") continue;
-    const ce = (r.capability_evidence ?? {}) as Record<string, unknown>;
-    for (const k of Object.keys(ce)) if (ce[k] === "PASS" || ce[k] === true) passCaps.add(k);
-    if (r.probe_type && ce.passed !== false) passCaps.add(String(r.probe_type));
-  }
-  // Phase E R3 §4 — currentness respects the LATEST probe state: an
-  // earlier PASS in the window must not override a newer failure.
-  // probe_state only equals PROBED when the most recent canonical probe
-  // passed.
-  gates.CURRENT_PROBE_EVIDENCE = String(entry.probe_state ?? "") === "PROBED" ? "PASS" : "FAIL";
+  // Phase E R4 §6–§7 — evidence is LATEST-PER-CAPABILITY: the newest
+  // receipt in the window applicable to each requested capability must be
+  // a PASS that proves the capability. A PASS for an unrelated capability
+  // can never revive a failed one, and a superseded PASS cannot outrank a
+  // newer FAIL on the same capability.
+  const capCurrent = (cap: string) => catalog.probeCurrentForCapability(modelEntryId, cap);
+  gates.CURRENT_PROBE_EVIDENCE = opts.capability_scope.every(capCurrent) ? "PASS" : "FAIL";
   for (const cap of opts.capability_scope) {
-    gates[`CAPABILITY_${cap.toUpperCase()}`] = passCaps.has(cap) ? "PASS" : "FAIL";
+    gates[`CAPABILITY_${cap.toUpperCase()}`] = capCurrent(cap) ? "PASS" : "FAIL";
   }
 
   const qualified = Object.values(gates).every((g) => g === "PASS");
@@ -183,7 +177,13 @@ export function qualifyModel(
   const receipt = catalog.issueQualificationReceipt(modelEntryId, {
     capability_scope: opts.capability_scope,
     verifier: opts.verifier ?? "DETERMINISTIC_PROBE_EVIDENCE",
-    evidence_refs: receipts.filter((r) => r.result === "PASS").map((r) => String(r.probe_id)),
+    // The seam derives the minted evidence_refs from the actual covering
+    // current PASS receipts; these caller refs are only validated against
+    // the current window.
+    evidence_refs: opts.capability_scope
+      .map((cap) => catalog.latestProbeReceiptForCapability(modelEntryId, cap))
+      .filter((r): r is Record<string, unknown> => r != null)
+      .map((r) => String(r.probe_id)),
     actor: opts.actor,
   });
   return { qualified: true, gates, receipt };

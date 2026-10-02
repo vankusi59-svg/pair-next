@@ -687,3 +687,148 @@ seam trusted caller-supplied gate results instead of durable state.
 - this report — R3 section appended; R1+R2 evidence preserved verbatim.
 
 STOP. DO NOT MERGE. Awaiting independent audit of R3.
+
+---
+
+# R4 — CAPABILITY-SCOPED CURRENT EVIDENCE + PROVIDER GATE COMPLETENESS
+
+Audited HEAD: `957cb9960a858f2dc10eefac73c4102118a3c064` (R3).
+Three remaining evidence-authority gaps closed on the same PR, same
+branch, no new PR, no merge:
+
+- **§1–§4 Provider commit trust gap** — `issueQualificationReceipt`
+  trusted caller-supplied gate maps: `gates: {}` minted a receipt on a
+  canonical AUTH_OK/PROBED provider.
+- **§5–§10 Probe currentness was global, not capability-scoped** —
+  `probe_state==="PROBED"` and "any PASS in window" meant a PASS for
+  vision could revive text_inference after its latest FAIL.
+- **§11–§13 Probe receipts were not strictly provider-owned** —
+  `provider_id: null` (or a foreign provider id) rows counted as
+  current evidence.
+
+## R4.1 Semantics
+
+1. **Canonical required provider gate set** (§2/§3) — exported once as
+   `PROVIDER_QUALIFICATION_REQUIRED_GATES` from `provider-catalog.ts`
+   (`PROVIDER_EXISTS`, `AUTH_ACCEPTABLE`, `PROTOCOL_PROBED`,
+   `HEALTH_ACCEPTABLE`, `POLICY_PERMITS`). The commit seam now
+   validates: every required gate PRESENT (missing →
+   `FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES` with `missing_gates`
+   detail), every required gate `==="PASS"` (non-PASS → same error,
+   `failing_gates`). Ordering preserved: durable-state check
+   (`..._STATE`) → presence → values. Extra diagnostic gates tolerated,
+   never substitutive. `qualify()` emits exactly the canonical set.
+2. **Latest-per-capability currentness** (§5–§9) — new seam
+   `probeCurrentForCapability(model_entry_id, capability)`: the LATEST
+   receipt (canonical `probe_receipt_ids` append order — monotonic,
+   wall-clock-free) applicable to that capability must be a PASS that
+   evidences it (`capability_evidence[cap]==="PASS"`/`true`, or a typed
+   probe `probe_type===cap` with no contradicting `passed:false`).
+   Applicability = `probe_type===cap` ∪ `requested_capability===cap` ∪
+   `capability_evidence` declares the cap. A PASS for vision cannot
+   revive text_inference. Global `MODEL_PROBE_CURRENT` retained as an
+   additional availability gate; the authority gate is
+   `MODEL_CAPABILITY_PROBE_CURRENT` on the receipt's
+   `capability_scope` (N/A-PASS for non-QUALIFIED models —
+   `MODEL_QUALIFIED`/`MODEL_RECEIPT_CURRENT` govern that axis).
+   `issueQualificationReceipt` now requires current covering evidence
+   PER CAPABILITY (`FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING`);
+   the R3 global `probe_state` pre-check was removed (superseded —
+   a [text PASS, vision FAIL] model must still qualify for text).
+   `CURRENT_PROBE_EVIDENCE` and `CAPABILITY_<cap>` in `qualifyModel`
+   both read the per-capability seam.
+3. **Commit authority is the model seam** (§10) —
+   `issueQualificationReceipt` is the ONLY path from durable evidence
+   to `QUALIFIED`; `evidence_refs` = the latest covering receipt per
+   required capability (superseded PASS receipts excluded). Caller
+   `evidence_refs` still cannot widen beyond the window (FOREIGN
+   rejection preserved).
+4. **Strict provider ownership** (§11–§13) — `recordProbeReceipt`
+   throws `FAIL_CLOSED_PROBE_PROVIDER_MISMATCH` when both
+   `entry.provider_id` and `receipt.provider_id` are non-null and
+   differ (fail closed at recording, including `probeModel`, which
+   already stamps `provider_id` from the canonical entry).
+   `currentProbeReceipts` additionally requires
+   `receipt.provider_id === entry.provider_id` when the model declares
+   one — `null`-provider and foreign-provider rows stay inspectable in
+   `listProbeReceipts` but are never current authority
+   (projection-time filtering retained for legacy/corrupt rows).
+5. **§19 preserved** — `DISCOVERY_ELIGIBLE`/`DISABLED`/`UNQUALIFIED`
+   semantics untouched: technical qualification ≠ operator enablement;
+   DISABLED stays non-routable even when technically re-qualified;
+   UNQUALIFIED residue is still cleared by canonical requalification
+   (explicitly asserted in r4p).
+
+## R4.2 Tests (focused Phase E: 62/62)
+
+- **r4p** (§4): healthy AUTH_OK/PROBED provider + `gates:{}` →
+  `..._GATES`, no receipt, no promotion; each of the 5 required gates
+  removed individually → `..._GATES`; forged `POLICY_PERMITS:"FAIL"` →
+  `..._GATES`. §19 probe: DISABLED provider mints technically but keeps
+  `DISABLED` and `providerRoutableGate.pass===false`.
+- **r4x** (§14): text PASS → qualify → planner-eligible; text FAIL →
+  `MODEL_CAPABILITY_PROBE_CURRENT` FAIL + planner `{reject:true}`;
+  vision PASS → global `probe_state` flips PROBED but scoped gate
+  stays FAIL, `qualifyModel(["text_inference"])` refuses with
+  `CAPABILITY_TEXT_INFERENCE:"FAIL"`, planner still rejects.
+- **r4m** (§15): text+tools PASS → `["text_inference","tools"]`
+  qualified + routable; tools FAIL → scoped gate FAIL →
+  re-qualification refused; fresh tools PASS → both gates PASS →
+  qualified + routable again.
+- **r4s** (§16): PASS#1 + PASS#2 → receipt `evidence_refs ===
+  ["PRB_s_2"]` (superseded #1 excluded); FAIL#3 → all three inspectable
+  via `listProbeReceipts`, qualification + scoped gate FAIL.
+- **r4o** (§17/§18): `provider_id: null` receipt records into the
+  window but `currentProbeReceipts` = `[]` → qualification refused
+  (never-qualified model: scoped gate N/A-PASS, `MODEL_QUALIFIED`
+  holds the failure); `provider_id:"other-provider"` →
+  `FAIL_CLOSED_PROBE_PROVIDER_MISMATCH` at recording; the same row
+  injected past the boundary is excluded at projection → still no
+  qualification; fresh provider-bound PASS → qualifies.
+- **Fixture updates (legitimate, semantics unchanged)**: every
+  `recordProbeReceipt` call now declares `provider_id` (strict
+  ownership); provider seam callers pass the full canonical gate set
+  (`Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES...)`);
+  R3 r13 assertion narrowed to latest-covering refs; R3 r14
+  `CAPABILITY_TEXT_INFERENCE` now FAIL (latest FAIL supersedes older
+  PASS) and seam error is `..._MISSING`; r3p forged gate maps use the
+  canonical set so the durable-STATE check fires as intended.
+
+## R4.3 Regression
+
+- Focused Phase E suite: **62/62** (34 + 11 R1 + 6 R2 + 6 R3 + 5 R4).
+- R1–R8 incident invariants re-run: planner-dataflow 106/106,
+  recovery-approval 37/37, ops-telegram-delivery 3/3,
+  live-ops-recovery-closure 20/20, runtime-hardening 11/11 — 177/177.
+- Sibling seam consumers: phase-b 123/123, phase-c-dsh 51/51,
+  p6 36/36.
+- Full suite: **2731 pass / 2 fail / 15 skip (2748)** — the 2 fails are
+  the same pre-existing env-only P5 assertions
+  (`EXECUTABLE_NOT_FOUND` — real `dsh`/`codex` on PATH; identical on
+  base `b08e8a5` and all audited HEADs). +5 vs R3 count.
+- `npx tsc --noEmit`: clean. `pnpm build`: clean.
+- Live E2E: unchanged from R2 (R4 touches evidence seams only, not the
+  boot path).
+
+## R4.4 Files changed in R4
+
+- `src/pair/provider-catalog.ts` — exported
+  `PROVIDER_QUALIFICATION_REQUIRED_GATES`; commit seam requires
+  presence + all-PASS.
+- `src/pair/model-catalog.ts` — `recordProbeReceipt` provider mismatch
+  throw; `currentProbeReceipts` strict provider ownership; new
+  `receiptAppliesToCapability` / `latestProbeReceiptForCapability` /
+  `probeCurrentForCapability`; `issueQualificationReceipt`
+  per-capability coverage + latest-covering `evidence_refs`.
+- `src/pair/model-probing.ts` — `CURRENT_PROBE_EVIDENCE` +
+  `CAPABILITY_<cap>` read the per-capability seam.
+- `src/pair/model-routable.ts` — `MODEL_CAPABILITY_PROBE_CURRENT` gate.
+- `src/__tests__/pair-phase-e-provider-model-authority.test.ts` —
+  +5 R4 tests, fixture provider_ids, R3 assertion updates.
+- `src/__tests__/pair-phase-b.test.ts`,
+  `pair-phase-c-dsh-model-routing.test.ts`, `pair-p6.test.ts` —
+  legitimate fixture updates only (provider_id on receipts, canonical
+  gate set).
+- this report — R4 section appended; all prior evidence preserved.
+
+STOP. DO NOT MERGE. Awaiting independent audit of R4.

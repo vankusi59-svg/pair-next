@@ -296,6 +296,18 @@ export function providerModelEligibility(
       String(modelReceipt.material_fingerprint) === modelIdentityDigest(model))
       ? "PASS"
       : "FAIL";
+  // Phase E R4 §8 — capability-scoped currentness: every capability the
+  // current qualification receipt covers must still have a CURRENT PASS
+  // (latest applicable probe in the window). An unrelated capability's
+  // later PASS cannot revive a failed covered one; N/A-PASS when the
+  // model carries no qualified receipt (MODEL_QUALIFIED/MODEL_RECEIPT_*
+  // already govern that axis).
+  const scope = (modelReceipt?.capability_scope ?? []) as string[];
+  gates.MODEL_CAPABILITY_PROBE_CURRENT =
+    !model || model.lifecycle_state !== "QUALIFIED" || !modelReceipt ||
+    scope.every((cap) => modelCatalog.probeCurrentForCapability(modelEntryId, cap))
+      ? "PASS"
+      : "FAIL";
 
   const reason = Object.keys(gates).find((g) => gates[g] === "FAIL") ?? null;
   return { eligible: reason === null, gates, reason };

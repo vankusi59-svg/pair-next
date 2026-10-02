@@ -27,6 +27,7 @@ import {
   ProviderValidator,
   PROVIDER_DISCOVERY_SCAN_STATES,
   PROVIDER_OK_STATES,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
   PROVIDER_REMOVED_ABSENCE_THRESHOLD,
   assignModelRole,
   assertCanonicalModelRoleStateDisjoint,
@@ -146,6 +147,7 @@ const mkModel = (store: PairEvidenceStore, pid: string, mid: string, qualified =
     mcat.recordProbeReceipt({
       probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
       model_entry_id: eid,
+      provider_id: pid,
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -233,7 +235,7 @@ describe("B — auth", () => {
     // after qualification" state this test targets).
     store.put("provider", id, { ...b, lifecycle_state: "QUALIFIED", auth_state: "AUTH_OK", probe_state: "PROBED" }, Number(b.version));
     const cat = new ProviderCatalog(store);
-    cat.issueQualificationReceipt("pv", { policy_version: "t", gates: {}, actor: "t" });
+    cat.issueQualificationReceipt("pv", { policy_version: "t", gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])), actor: "t" });
     const b2 = store.get("provider", id);
     store.put("provider", id, { ...b2, auth_state: "AUTH_REQUIRED" }, Number(b2.version));
     // AUTH_REQUIRED still fails PROVIDER_AUTH_OK even with a valid receipt.
@@ -1021,6 +1023,7 @@ describe("R1 — §15 model reappearance = observation only", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_r15_fresh",
       model_entry_id: me,
+      provider_id: "pv",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1102,6 +1105,7 @@ describe("R1 — §16/§17 provider↔model linkage", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_r17",
       model_entry_id: me,
+      provider_id: "pv",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1166,6 +1170,7 @@ describe("R1 — §18/§12 receipt binding", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_r18_fresh",
       model_entry_id: me,
+      provider_id: "pv",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1305,6 +1310,7 @@ describe("R2 — §12/§13 historical probe cannot requalify; fresh probe restor
     mcat.recordProbeReceipt({
       probe_id: "PRB_r2_fresh",
       model_entry_id: me,
+      provider_id: "pv",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1342,6 +1348,7 @@ describe("R2 — §14 direct receipt bypass closed", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_mine",
       model_entry_id: me,
+      provider_id: "pv",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1491,12 +1498,13 @@ describe("R3 — §8/§9 provider seam: forged receipt fails closed, canonical p
       lifecycle_state: "DISCOVERY_ELIGIBLE",
     }, Number(e.version));
 
-    // Forged commit: caller claims every gate passed — the seam checks
-    // durable canonical state instead of trusting the caller.
+    // Forged commit: caller claims the full canonical gate set passed —
+    // the seam checks durable canonical state instead of trusting the
+    // caller.
     expect(() =>
       cat.issueQualificationReceipt("pv", {
         policy_version: "t",
-        gates: { AUTH_ACCEPTABLE: "PASS", PROTOCOL_PROBED: "PASS", HEALTH_ACCEPTABLE: "PASS", POLICY_PERMITS: "PASS" },
+        gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])),
         actor: "t",
       }),
     ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE/);
@@ -1516,7 +1524,7 @@ describe("R3 — §8/§9 provider seam: forged receipt fails closed, canonical p
     expect(() =>
       cat.issueQualificationReceipt("pv", {
         policy_version: "t",
-        gates: { AUTH_ACCEPTABLE: "PASS", PROTOCOL_PROBED: "WARN" },
+        gates: { ...Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])), PROTOCOL_PROBED: "WARN" },
         actor: "t",
       }),
     ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
@@ -1562,6 +1570,7 @@ describe("R3 — §12 model probe failure revokes invocation", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_r12_fail",
       model_entry_id: mePlanner,
+      provider_id: "pv",
       result: "FAIL",
       probe_type: "text_inference",
       latency_ms: 4,
@@ -1569,6 +1578,7 @@ describe("R3 — §12 model probe failure revokes invocation", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_r12_fail_d",
       model_entry_id: meDsh,
+      provider_id: "pv",
       result: "FAIL",
       probe_type: "text_inference",
       latency_ms: 4,
@@ -1597,12 +1607,13 @@ describe("R3 — §13 fresh PASS probe restores model invocation", () => {
     await mkQualifiedProvider(store, "pv");
     const mcat = new ModelEvidenceCatalog(store);
     const me = mkModel(store, "pv", "m1");
-    mcat.recordProbeReceipt({ probe_id: "PRB_r13_fail", model_entry_id: me, result: "FAIL", probe_type: "text_inference", latency_ms: 1 });
+    mcat.recordProbeReceipt({ probe_id: "PRB_r13_fail", model_entry_id: me, provider_id: "pv", result: "FAIL", probe_type: "text_inference", latency_ms: 1 });
     expect(providerModelEligibility(store, "pv", me).gates.MODEL_PROBE_CURRENT).toBe("FAIL");
 
     mcat.recordProbeReceipt({
       probe_id: "PRB_r13_pass",
       model_entry_id: me,
+      provider_id: "pv",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1612,9 +1623,9 @@ describe("R3 — §13 fresh PASS probe restores model invocation", () => {
     const q = qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" });
     expect(q.qualified).toBe(true);
     const refs = q.receipt!.evidence_refs as string[];
-    // The receipt refs the actual covering CURRENT PASS probes — the FAIL
-    // receipt is never evidence, and refs beyond the window never appear.
-    expect(new Set(refs)).toEqual(new Set(["PRB_pv_m1", "PRB_r13_pass"]));
+    // R4 §10 — refs carry only the LATEST covering receipt per capability;
+    // the superseded PASS and the FAIL receipt are never evidence.
+    expect(refs).toEqual(["PRB_r13_pass"]);
     expect(refs).not.toContain("PRB_r13_fail");
     // The minted receipt's refs are valid CURRENT window probe ids.
     const window = new Set(mcat.getModel(me)!.probe_receipt_ids as string[]);
@@ -1633,6 +1644,7 @@ describe("R3 — §14 older PASS never overrides latest FAIL", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_r14_pass",
       model_entry_id: me,
+      provider_id: "pv",
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
@@ -1641,6 +1653,7 @@ describe("R3 — §14 older PASS never overrides latest FAIL", () => {
     mcat.recordProbeReceipt({
       probe_id: "PRB_r14_fail",
       model_entry_id: me,
+      provider_id: "pv",
       result: "FAIL",
       probe_type: "text_inference",
       latency_ms: 1,
@@ -1651,10 +1664,10 @@ describe("R3 — §14 older PASS never overrides latest FAIL", () => {
     const q = qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" });
     expect(q.qualified).toBe(false);
     expect(q.gates.CURRENT_PROBE_EVIDENCE).toBe("FAIL");
-    // Coverage evidence exists (the PASS receipt) — the refusal is the
-    // current-state gate, not missing evidence.
-    expect(q.gates.CAPABILITY_TEXT_INFERENCE).toBe("PASS");
-    // The raw seam agrees: no receipt mints over a newer failure.
+    // R4 §7 — latest-per-capability: the superseded PASS cannot cover
+    // text_inference once a newer FAIL is the latest applicable receipt.
+    expect(q.gates.CAPABILITY_TEXT_INFERENCE).toBe("FAIL");
+    // The raw seam agrees: no current covering evidence, no receipt.
     expect(() =>
       mcat.issueQualificationReceipt(me, {
         capability_scope: ["text_inference"],
@@ -1662,7 +1675,7 @@ describe("R3 — §14 older PASS never overrides latest FAIL", () => {
         evidence_refs: ["PRB_r14_pass"],
         actor: "t",
       }),
-    ).toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_STATE/);
+    ).toThrow(/FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING/);
     expect(mcat.getModel(me)!.current_qualification_receipt_id).toBeNull();
   });
 });
@@ -1709,5 +1722,237 @@ describe("R3 — §16 minted refs derive from covering current PASS evidence", (
     });
     expect(receipt.evidence_refs).toEqual([passProbe]);
     expect((receipt.evidence_refs as string[]).length).toBeGreaterThan(0);
+  });
+});
+
+/* ==================== R4 — CAPABILITY-SCOPED CURRENT EVIDENCE =========
+ * R4 §1–§4 — the provider commit seam requires the full canonical gate
+ * set. R4 §5–§10 — evidence is LATEST-PER-CAPABILITY inside the current
+ * window; a PASS for capability B never revives capability A.
+ * R4 §11–§13 — strict provider ownership at record + projection. */
+
+const ALL_PASS_GATES = () =>
+  Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"]));
+
+describe("R4 — §4 canonical required provider gate set", () => {
+  it("gates={} and every missing/forged required gate fail closed; DISABLED still mints but stays non-routable", async () => {
+    const { store } = makeCtx("r4p");
+    const cat = new ProviderCatalog(store);
+    // Canonical healthy state first (probe through the real validator).
+    seedDiscovered(store, "pv");
+    await new ProviderValidator(store).validateAccess("pv", {
+      env: { PV_KEY: "cred" },
+      probe: async () => ({ outcome: "AUTH_OK", latency_ms: 2 }),
+    });
+    expect(cat.getProvider("pv")!.probe_state).toBe("PROBED");
+
+    // Empty gate map cannot mint.
+    expect(() => cat.issueQualificationReceipt("pv", { policy_version: "t", gates: {}, actor: "t" }))
+      .toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
+    // Each required gate missing individually → fail closed.
+    for (const g of PROVIDER_QUALIFICATION_REQUIRED_GATES) {
+      const gates = ALL_PASS_GATES();
+      delete gates[g];
+      expect(() => cat.issueQualificationReceipt("pv", { policy_version: "t", gates, actor: "t" }))
+        .toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
+    }
+    // A forged FAIL value also fails.
+    expect(() =>
+      cat.issueQualificationReceipt("pv", {
+        policy_version: "t",
+        gates: { ...ALL_PASS_GATES(), POLICY_PERMITS: "FAIL" },
+        actor: "t",
+      }),
+    ).toThrow(/FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES/);
+    expect(cat.getProvider("pv")!.current_qualification_receipt_id ?? null).toBeNull();
+
+    // §19 — DISABLED is operator authority: canonical qualification may
+    // technically succeed, but DISABLED stays and routability stays closed.
+    const e = cat.getProvider("pv")!;
+    store.put("provider", String(e.entry_id), { ...e, conditions: ["DISABLED"] }, Number(e.version));
+    const receipt = cat.issueQualificationReceipt("pv", { policy_version: "t", gates: ALL_PASS_GATES(), actor: "t" });
+    expect(receipt.receipt_id).toBeTruthy();
+    const after = cat.getProvider("pv")!;
+    expect(after.conditions).toContain("DISABLED");
+    expect(providerRoutableGate(after).pass).toBe(false);
+  });
+});
+
+describe("R4 — §14 cross-capability: later unrelated PASS cannot revive a failed capability", () => {
+  it("text PASS→qualify→routable; text FAIL→blocked; vision PASS→text still non-current, planner rejects", async () => {
+    const { store } = makeCtx("r4x");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const me = mkModel(store, "pv", "m1");
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    expect(assertPlannerCandidateEligible(store, me)).toBeUndefined();
+
+    const probe = (id: string, type: string, result: string) =>
+      mcat.recordProbeReceipt({
+        probe_id: id,
+        model_entry_id: me,
+        provider_id: "pv",
+        result,
+        probe_type: type,
+        capability_evidence: { [type]: result },
+        latency_ms: 1,
+      });
+    // Latest text evidence becomes FAIL.
+    probe("PRB_x_text_fail", "text_inference", "FAIL");
+    expect(providerModelEligibility(store, "pv", me).gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({ reject: true });
+
+    // A PASS for vision does NOT revive text_inference.
+    probe("PRB_x_vision_pass", "vision", "PASS");
+    expect(mcat.getModel(me)!.probe_state).toBe("PROBED"); // global summary only
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    const q = qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" });
+    expect(q.qualified).toBe(false);
+    expect(q.gates.CAPABILITY_TEXT_INFERENCE).toBe("FAIL");
+    expect(q.gates.CURRENT_PROBE_EVIDENCE).toBe("FAIL");
+    expect(assertPlannerCandidateEligible(store, me)).toMatchObject({ reject: true });
+  });
+});
+
+describe("R4 — §15 multi-capability qualification: one failing capability fails all", () => {
+  it("[text,tools] qualified → tools FAIL → unusable; fresh tools PASS → re-established", async () => {
+    const { store } = makeCtx("r4m");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+    const probe = (id: string, type: string, result: string) =>
+      mcat.recordProbeReceipt({
+        probe_id: id,
+        model_entry_id: me,
+        provider_id: "pv",
+        result,
+        probe_type: type,
+        capability_evidence: { [type]: result },
+        latency_ms: 1,
+      });
+    probe("PRB_m_text", "text_inference", "PASS");
+    probe("PRB_m_tools", "tools", "PASS");
+    const q1 = qualifyModel(store, me, { capability_scope: ["text_inference", "tools"], actor: "t" });
+    expect(q1.qualified).toBe(true);
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+
+    probe("PRB_m_tools_fail", "tools", "FAIL");
+    // The receipt scope [text,tools] no longer has current evidence for tools.
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference", "tools"], actor: "t" }).qualified).toBe(false);
+
+    probe("PRB_m_tools_pass2", "tools", "PASS");
+    const q2 = qualifyModel(store, me, { capability_scope: ["text_inference", "tools"], actor: "t" });
+    expect(q2.qualified).toBe(true);
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R4 — §16 superseded PASS receipts cannot authorize", () => {
+  it("[text PASS#1, text PASS#2] → receipt refs current covering #2 only; after FAIL#3 none authorize", async () => {
+    const { store } = makeCtx("r4s");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+    const probe = (id: string, result: string) =>
+      mcat.recordProbeReceipt({
+        probe_id: id,
+        model_entry_id: me,
+        provider_id: "pv",
+        result,
+        probe_type: "text_inference",
+        capability_evidence: { text_inference: result },
+        latency_ms: 1,
+      });
+    probe("PRB_s_1", "PASS");
+    probe("PRB_s_2", "PASS");
+    const q = qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" });
+    expect(q.qualified).toBe(true);
+    expect(q.receipt!.evidence_refs).toEqual(["PRB_s_2"]);
+
+    probe("PRB_s_3", "FAIL");
+    expect(mcat.listProbeReceipts(me).map((r) => r.probe_id)).toEqual(["PRB_s_1", "PRB_s_2", "PRB_s_3"]);
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(false);
+    expect(providerModelEligibility(store, "pv", me).gates.MODEL_CAPABILITY_PROBE_CURRENT).toBe("FAIL");
+  });
+});
+
+describe("R4 — §17/§18 strict provider ownership of probe evidence", () => {
+  it("provider_id=null receipt recorded but never current; wrong-provider fails at record + projection", async () => {
+    const { store } = makeCtx("r4o");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const me = String(entry.model_entry_id);
+
+    // §17 — legacy-style receipt without provider_id lands in the window
+    // (recording permits provider-less rows) but is never current
+    // provider-bound evidence.
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_o_null",
+      model_entry_id: me,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    });
+    expect(mcat.getModel(me)!.probe_receipt_ids).toContain("PRB_o_null");
+    expect(mcat.currentProbeReceipts(me)).toEqual([]);
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(false);
+    // Never qualified → the capability gate is N/A-PASS; routability stays
+    // closed through MODEL_QUALIFIED.
+    const elig0 = providerModelEligibility(store, "pv", me);
+    expect(elig0.eligible).toBe(false);
+    expect(elig0.gates.MODEL_QUALIFIED).toBe("FAIL");
+
+    // §18a — wrong provider_id fails closed AT RECORDING.
+    expect(() =>
+      mcat.recordProbeReceipt({
+        probe_id: "PRB_o_wrong",
+        model_entry_id: me,
+        provider_id: "other-provider",
+        result: "PASS",
+        probe_type: "text_inference",
+        capability_evidence: { text_inference: "PASS" },
+        latency_ms: 1,
+      }),
+    ).toThrow(/FAIL_CLOSED_PROBE_PROVIDER_MISMATCH/);
+
+    // §18b — a wrong-provider row injected around the recording boundary
+    // (corrupt/legacy DB row + window pointer) is still excluded at
+    // projection: no qualification authority.
+    const corrupt = {
+      probe_id: "PRB_o_corrupt",
+      model_entry_id: me,
+      provider_id: "other-provider",
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    };
+    store.put("probe_receipt", "PRB_o_corrupt", corrupt);
+    const cur = mcat.getModel(me)!;
+    store.put("model_entry", me, { ...cur, probe_receipt_ids: [...(cur.probe_receipt_ids as string[]), "PRB_o_corrupt"] }, Number(cur.version));
+    expect(mcat.currentProbeReceipts(me).map((r) => r.probe_id)).not.toContain("PRB_o_corrupt");
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(false);
+
+    // §17 end — a fresh provider-bound probe through the canonical path
+    // restores qualification.
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_o_bound",
+      model_entry_id: me,
+      provider_id: "pv",
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    });
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(true);
   });
 });

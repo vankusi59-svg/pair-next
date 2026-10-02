@@ -872,6 +872,21 @@ WOB1(A) and refused a legitimate retry.
   model qualification `evidence_refs` derived internally from covering
   current PASS receipts. Focused 57/57; full suite 2726 pass / same 2
   env P5 fails; tsc+build clean.
+- **R4 remediation** (same branch, pending re-audit): provider commit
+  seam requires the canonical gate set
+  `PROVIDER_QUALIFICATION_REQUIRED_GATES` (exported once) — every
+  required gate must be present and `==="PASS"` (`gates:{}` and any
+  missing/forged gate → `FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES`);
+  probe currentness is capability-scoped —
+  `probeCurrentForCapability` evaluates the LATEST applicable receipt
+  in window order per capability (new gate
+  `MODEL_CAPABILITY_PROBE_CURRENT`), so a PASS for one capability
+  never revives another; `evidence_refs` = latest covering receipt per
+  capability; strict provider ownership — `recordProbeReceipt` throws
+  `FAIL_CLOSED_PROBE_PROVIDER_MISMATCH` on wrong-provider rows and
+  `currentProbeReceipts` excludes `provider_id: null`/foreign rows
+  (inspectable history, never authority). Focused 62/62; full suite
+  2731 pass / same 2 env P5 fails; tsc+build clean.
 
 ## Not yet
 

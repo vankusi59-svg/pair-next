@@ -47,6 +47,18 @@ export const PROVIDER_DISCOVERY_SCAN_STATES = new Set([
  *  history preserved). */
 export const PROVIDER_REMOVED_ABSENCE_THRESHOLD = 3;
 
+/** Phase E R4 §2 — THE canonical required provider qualification gate
+ *  set (defined exactly once — ProviderValidator.qualify computes this
+ *  same set and the commit seam below requires every entry present and
+ *  PASS; extra diagnostic gates are allowed but can never substitute). */
+export const PROVIDER_QUALIFICATION_REQUIRED_GATES = [
+  "PROVIDER_EXISTS",
+  "AUTH_ACCEPTABLE",
+  "PROTOCOL_PROBED",
+  "HEALTH_ACCEPTABLE",
+  "POLICY_PERMITS",
+] as const;
+
 const IDENTITY_FIELDS = [
   "provider_id",
   "provider_type",
@@ -519,6 +531,13 @@ export class ProviderCatalog {
       throw new IntegrityError(
         "FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE",
         JSON.stringify({ provider_id: providerId, blocked_by: blocked }),
+      );
+    }
+    const missing = PROVIDER_QUALIFICATION_REQUIRED_GATES.filter((g) => !(g in opts.gates));
+    if (missing.length) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES",
+        JSON.stringify({ provider_id: providerId, missing_gates: missing }),
       );
     }
     const failing = Object.entries(opts.gates).filter(([, v]) => v !== "PASS");

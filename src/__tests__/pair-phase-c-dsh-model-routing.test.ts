@@ -38,6 +38,7 @@ import {
   PairControlPlane,
   PairEvidenceStore,
   ProviderCatalog,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
   providerEntryId,
   qualifyBinding,
   qualifyModel,
@@ -93,7 +94,7 @@ const mkProvider = (
   if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
     new ProviderCatalog(store).issueQualificationReceipt(pid, {
       policy_version: "test-policy",
-      gates: { fixture: "PASS" },
+      gates: Object.fromEntries(PROVIDER_QUALIFICATION_REQUIRED_GATES.map((g) => [g, "PASS"])) as Record<string, unknown>,
       actor: "test",
     });
     if (lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
@@ -128,6 +129,7 @@ const mkModel = (
     mcat.recordProbeReceipt({
       probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
       model_entry_id: eid,
+      provider_id: pid,
       result: "PASS",
       probe_type: "text_inference",
       capability_evidence: { text_inference: "PASS" },
