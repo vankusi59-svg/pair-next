@@ -369,7 +369,17 @@ async function notifyLoop(allowList) {
           transport: { send: governedSend },
           isAllowed: (chatId) => allowList.has(String(chatId)),
           backend: {
-            begin: (a) => t(a, { to: "SENDING" }),
+            // R7 §4 — exclusive acquire: the HTTP transition returns
+            // {delivery, acquired, attempt_id}; ONLY acquired===true is
+            // send authority — a stale projection is not.
+            begin: async (a) => {
+              const r = await t(a, { to: "SENDING" });
+              return {
+                acquired: r?.acquired === true,
+                attempt_id: r?.attempt_id ?? undefined,
+                reason: r?.reason ?? undefined,
+              };
+            },
             sent: (a, ev) => t(a, { to: "SENT", message_id: ev?.message_id ?? null }),
             failed: (a, err) => t(a, { to: "FAILED", error: err }),
             unknown: (a, err) => t(a, { to: "UNKNOWN", error: err }),

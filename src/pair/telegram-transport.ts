@@ -41,10 +41,22 @@ export interface GovernedTelegramTransport {
   }): Promise<GovernedSendResult>;
 }
 
+/** R7 — exclusive claim outcome: the ONLY positive acquisition
+ *  evidence a transport actor may act on. `attempt_id` identifies the
+ *  attempt; it is never ownership permission by itself. */
+export interface BeginDeliveryAcquire {
+  acquired: boolean;
+  attempt_id?: string;
+  reason?: string;
+}
+
 /** Durable-state surface — backed by the evidence store in-process or
  *  by the Mission Control HTTP transition endpoint in the bridge. */
 export interface DeliveryBackend {
-  begin(artifact: string | null): Promise<void> | void;
+  /** Exclusive acquire: QUEUED→SENDING. MUST return {acquired:true} only
+   *  when THIS call performed the transition — anything else means the
+   *  payload is already claimed and ZERO network calls may follow. */
+  begin(artifact: string | null): Promise<BeginDeliveryAcquire> | BeginDeliveryAcquire;
   sent(artifact: string | null, evidence: { message_id?: string | number | null }): Promise<void> | void;
   failed(artifact: string | null, error: string): Promise<void> | void;
   unknown(artifact: string | null, error: string): Promise<void> | void;
@@ -189,7 +201,11 @@ export async function transportTelegramDelivery(args: {
     if (String(req.text_state) !== "QUEUED") return { sent, held: false };
     const text = `${prefix}${String(req.text ?? "")}`.trim();
     if (text.length <= prefix.trim().length) return { sent, held: false };
-    await args.backend.begin(null);
+    // R7 — exclusive acquire required before any network call. A stale
+    // projection is not authority: if the durable begin did not grant
+    // this caller the attempt, the send must not happen.
+    const acq = await args.backend.begin(null);
+    if (!acq || acq.acquired !== true) return { sent, held: false };
     const r = await send({ text: `${prefix}${String(req.text ?? "").slice(0, 3700)}` });
     if (await resolve(null, r)) sent.push(`TEXT:${String(req.delivery_id)}`);
     return { sent, held: false };
@@ -199,7 +215,9 @@ export async function transportTelegramDelivery(args: {
     if (String(art.state) !== "QUEUED" || !art.path) continue;
     const name = String(art.name);
     const fp = String(art.path);
-    await args.backend.begin(name);
+    // R7 — exclusive acquire required before any network call.
+    const acq = await args.backend.begin(name);
+    if (!acq || acq.acquired !== true) continue;
     let r: GovernedSendResult;
     if (TEXT_FILE_EXT.has(extname(name)) && args.readText) {
       const content = args.readText(fp).trim();

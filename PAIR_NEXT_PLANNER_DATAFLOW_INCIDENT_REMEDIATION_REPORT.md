@@ -721,3 +721,97 @@ correct once attempts are actually stale.
 Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R6_PENDING_INDEPENDENT_AUDIT`
 
 STOP. DO NOT MERGE. DO NOT START PHASE E.
+
+---
+
+# R7 — Exclusive Telegram send claim (audit `pasted-<R7 mandate>`)
+
+Base: audited R6 HEAD `0ee18de` · same PR #27 · narrow concurrency
+closure — additive, no redesign of R1–R6.
+
+## §1-3 — begin is an exclusive ACQUIRE (BLOCKER) → closed
+
+Root cause: `beginDeliveryAttempt` treated a second QUEUED→SENDING
+begin on an already-SENDING slot as a silent idempotent replay — the
+caller got no ownership result, so two competing consumers (bridge
+processes / service instances) could both call Telegram for the same
+payload. `makeNonReentrant` only guards one process.
+
+`beginDeliveryAttempt` now returns `BeginDeliveryResult`:
+`{acquired:true, request, attempt_id, attempt_number}` ONLY when THIS
+call performed QUEUED→SENDING; an already-SENDING slot →
+`{acquired:false, reason:"ALREADY_CLAIMED", request, attempt_id}` with
+ZERO mutation (simple fail-safe design A — a lost begin response can
+never regain send permission; the slot converges via SENT or
+stale→UNKNOWN_SIDE_EFFECT). `attempt_id` identifies the attempt — never
+ownership permission. Budget/backoff/terminal begin still fails closed.
+
+## §4 — transport requires acquisition → closed
+
+`DeliveryBackend.begin` now returns `BeginDeliveryAcquire
+{acquired, attempt_id?, reason?}`. `transportTelegramDelivery` (TEXT and
+every FILES artifact alike) calls begin and proceeds to the network
+call ONLY on `acquired===true` — a stale QUEUED projection is never
+send authority; the persisted slot is.
+
+## §5 — HTTP surface explicit → closed
+
+`POST /api/telegram-deliveries/:id/transition {to:"SENDING"}` now
+returns `{delivery, acquired, attempt_id, reason}` — the bridge never
+infers acquisition from `slot.state`. Bridge `begin` maps the response;
+only `acquired===true` proceeds to the network call.
+
+## §7-11 — required tests (4 new, 74 total)
+
+| Test | Result |
+|---|---|
+| §7+§8 two consumers / two stale projections (no loop guard) → exactly ONE acquire, ONE send, ONE message_id=1001, loser zero calls | PASS |
+| §9 second begin while SENDING → `acquired=false`/`ALREADY_CLAIMED`, zero calls, owner then SENT 1001 | PASS |
+| §10 lost begin response → retry `ALREADY_CLAIMED`, same attempt_id, owner path still SENT | PASS |
+| §11 TEXT payload — identical exclusive acquire | PASS |
+
+## §12-13 — R6 lease + R1–R5 preserved
+
+Fresh-SENDING lease, transport timeout, non-overlap guard untouched;
+all 70 prior focused tests pass (R4 deterministic-attempt test updated
+to assert the new acquire contract — same idempotent identity).
+
+## §14 — regression (Node 22)
+
+| Surface | Result |
+|---|---|
+| Focused incident (R1–R7) | **74/74 PASS** |
+| **Full suite** | **2637 pass / 2 fail env P5 cũ / 15 skipped** (R6 2633 → +4, zero regression) |
+| `npx tsc --noEmit` / `pnpm build` | clean / clean |
+
+## §15 — changed files (R7)
+
+- `src/pair/telegram-delivery.ts` — `BeginDeliveryResult`; begin →
+  exclusive acquire (`ALREADY_CLAIMED` on SENDING, no mutation).
+- `src/pair/telegram-transport.ts` — `BeginDeliveryAcquire`;
+  `DeliveryBackend.begin` contract; TEXT/FILES send gated on
+  `acquired===true`.
+- `src/pair/mission-control-server.ts` — transition response carries
+  `acquired`/`attempt_id`/`reason` for SENDING.
+- `scripts/telegram-bridge.mjs` — `begin` maps acquired explicitly.
+- `src/__tests__/pair-planner-dataflow-incident.test.ts` — +4 R7 tests;
+  `storeBackend.begin` maps acquisition; R4 idempotent-begin assertions
+  updated to the acquire contract.
+- `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_REPORT.md` — this section.
+
+## §16 — explicit proofs
+
+1. Two consumers, same QUEUED projection → exactly one acquire, one
+   Telegram call, one message_id (§7/§8).
+2. Loser performs ZERO network calls (§7/§9/§11).
+3. Second begin while SENDING → `ALREADY_CLAIMED`, no send authority
+   (§9).
+4. Lost begin response → retry is `ALREADY_CLAIMED`, cannot duplicate
+   (§10).
+5. TEXT and FILE both exclusive (§9/§11).
+6. Owner still transitions SENDING→SENT normally with mid=1001.
+7. All 70 R1–R6 focused tests PASS (74/74); full suite zero regression.
+
+Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R7_PENDING_INDEPENDENT_AUDIT`
+
+STOP. DO NOT MERGE. DO NOT START PHASE E.

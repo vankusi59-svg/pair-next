@@ -463,26 +463,55 @@ function failTransition(deliveryId: string, slot: string, from: string, to: stri
 }
 
 /**
+ * R7 — exclusive send claim: `begin` is an ACQUIRE, not a status peek.
+ * `acquired === true` is the ONLY positive durable evidence that THIS
+ * caller performed QUEUED→SENDING and therefore holds transport
+ * authority for this attempt. A caller that finds the slot already
+ * SENDING gets `acquired:false`/`ALREADY_CLAIMED` — it must perform
+ * ZERO network calls; retrying a begin whose response was lost can
+ * never regain send permission (the slot converges via the normal
+ * SENT / stale→UNKNOWN_SIDE_EFFECT path). `attempt_id` identifies the
+ * attempt — it is NEVER ownership permission by itself.
+ */
+export interface BeginDeliveryResult {
+  acquired: boolean;
+  request: Record<string, unknown>;
+  /** Canonical attempt identity (present on both outcomes). */
+  attempt_id?: string;
+  attempt_number?: number;
+  /** e.g. "ALREADY_CLAIMED" on a competing/lost-response begin. */
+  reason?: string;
+}
+
+/**
  * QUEUED → SENDING: persist the deterministic attempt identity BEFORE
  * the network call (R4 §7 — ATT_<digest(delivery_id:slot:attempt_number)>,
  * no wall-clock inside the domain transition). Legal only from QUEUED
  * with retry budget remaining and next_retry_at elapsed (R4 §6).
- * Idempotent replay of the same in-flight begin returns existing state;
- * every other transition fails closed.
  */
 export function beginDeliveryAttempt(args: {
   store: PairEvidenceStore;
   deliveryId: string;
   artifact?: string | null;
   now: string;
-}): Record<string, unknown> {
+}): BeginDeliveryResult {
   const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
   if (req.status !== "QUEUED") {
     failTransition(args.deliveryId, String(args.artifact ?? "text"), String(req.status), "SENDING");
   }
   const next = { ...req };
   const { slot, apply } = findSlot(req, next, args.artifact);
-  if (slot.state === "SENDING") return req; // idempotent same-transition replay
+  if (slot.state === "SENDING") {
+    // Already claimed — durable state is authoritative, never send
+    // authority for a competing or response-lost caller.
+    return {
+      acquired: false,
+      reason: "ALREADY_CLAIMED",
+      request: req,
+      attempt_id: slot.attempt_id,
+      attempt_number: slot.attempt_number,
+    };
+  }
   if (slot.state !== "QUEUED") {
     failTransition(args.deliveryId, String(args.artifact ?? "text"), slot.state, "SENDING");
   }
@@ -494,13 +523,15 @@ export function beginDeliveryAttempt(args: {
   }
   const attemptNumber = slot.attempt_count + 1;
   slot.attempt_number = attemptNumber;
-  slot.attempt_id = `ATT_${digest(
+  const attemptId = `ATT_${digest(
     `${args.deliveryId}:${String(args.artifact ?? "text")}:${attemptNumber}`,
   ).slice(0, 16)}`;
+  slot.attempt_id = attemptId;
   slot.attempt_started_at = args.now;
   slot.state = "SENDING";
   apply();
-  return putReq(args.store, next);
+  const request = putReq(args.store, next);
+  return { acquired: true, request, attempt_id: attemptId, attempt_number: attemptNumber };
 }
 
 /**

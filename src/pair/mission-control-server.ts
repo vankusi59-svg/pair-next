@@ -373,6 +373,27 @@ export function createMissionControlServer(
             error: body.error === undefined ? undefined : String(body.error),
           } as never,
         );
+        // R7 §5 — exclusive claim surface: a SENDING transition returns
+        // the acquisition outcome explicitly so a transport actor never
+        // infers send authority from a stale projection.
+        if (
+          reqEntity &&
+          typeof reqEntity === "object" &&
+          "acquired" in (reqEntity as Record<string, unknown>)
+        ) {
+          const acq = reqEntity as {
+            acquired: boolean;
+            request: Record<string, unknown>;
+            attempt_id?: string;
+            reason?: string;
+          };
+          return void json(res, 200, {
+            delivery: acq.request,
+            acquired: acq.acquired === true,
+            attempt_id: acq.attempt_id ?? null,
+            reason: acq.reason ?? null,
+          });
+        }
         return void json(res, 200, { delivery: reqEntity });
       }
 

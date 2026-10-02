@@ -887,7 +887,16 @@ function storeBackend(
       ...body,
     });
   return {
-    begin: (a: string | null) => t(a, { to: "SENDING" }),
+    // R7 — exclusive acquire: only a begin that ACTUALLY performed
+    // QUEUED→SENDING returns acquired:true (send authority).
+    begin: (a: string | null) => {
+      const r = t(a, { to: "SENDING" }) as {
+        acquired: boolean;
+        attempt_id?: string;
+        reason?: string;
+      };
+      return { acquired: r.acquired === true, attempt_id: r.attempt_id, reason: r.reason };
+    },
     sent: (a: string | null, ev: { message_id?: string | number | null }) =>
       t(a, { to: "SENT", message_id: ev?.message_id ?? null }),
     failed: (a: string | null, err: string) => t(a, { to: "FAILED", error: err }),
@@ -1917,13 +1926,25 @@ describe("R4 §13-14 — /ack bypass removed + strict transition matrix", () => 
       ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENT", message_id: 1001 }),
     ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
 
-    // QUEUED→SENDING: deterministic attempt id (R4 §7).
-    const begun = ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" });
-    const att1 = (begun.artifacts as Array<Record<string, unknown>>)[0].attempt_id;
-    expect(String(att1)).toMatch(/^ATT_[0-9a-f]{16}$/);
-    // Idempotent replay of the same begin returns the existing attempt.
-    const replay = ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" });
-    expect((replay.artifacts as Array<Record<string, unknown>>)[0].attempt_id).toBe(att1);
+    // QUEUED→SENDING: deterministic attempt id (R4 §7) + exclusive
+    // acquire contract (R7 §2-6): the winning begin carries acquired=true
+    // + the canonical attempt identity; a replayed begin does NOT grant
+    // send authority — it reports the existing attempt only.
+    const begun = ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" }) as {
+      acquired: boolean; attempt_id: string; request: Record<string, unknown>;
+    };
+    expect(begun.acquired).toBe(true);
+    const att1 = String(begun.attempt_id);
+    expect(att1).toMatch(/^ATT_[0-9a-f]{16}$/);
+    expect((begun.request.artifacts as Array<Record<string, unknown>>)[0].attempt_id).toBe(att1);
+    // Replay of the same begin returns the existing attempt identity
+    // — identifies the attempt, never a second send permission.
+    const replay = ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "SENDING" }) as {
+      acquired: boolean; attempt_id?: string; reason?: string;
+    };
+    expect(replay.acquired).toBe(false);
+    expect(replay.reason).toBe("ALREADY_CLAIMED");
+    expect(replay.attempt_id).toBe(att1);
 
     // SENDING→UNKNOWN legal; UNKNOWN→SENDING rejected.
     ctx.control.transitionTelegramDelivery(id, { artifact: "report.txt", to: "UNKNOWN", error: "ambiguous" });
@@ -2268,5 +2289,132 @@ describe("incident R6 — fresh-vs-stale SENDING", () => {
     // After it settles, the next tick runs normally.
     await guarded();
     expect(ran).toBe(2);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// R7 — exclusive send claim (§7-§11). begin is an ACQUIRE: only the caller
+// that performed QUEUED→SENDING durably gets acquired=true and may call
+// Telegram. Any other consumer's begin returns ALREADY_CLAIMED → zero
+// network calls — correctness lives in the durable slot, not the JS guard.
+// ────────────────────────────────────────────────────────────────────────────
+
+describe("incident R7 — exclusive send claim", () => {
+  it("§7+§8. two consumers, same stale QUEUED projection → exactly ONE acquire, ONE network call, ONE message_id (FILE)", async () => {
+    const ctx = makeCtx("r7-two");
+    const req = mintFilesRequest(ctx, ["a.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    const id = String(req.delivery_id);
+    // Two competing consumers each take their own pre-begin projection —
+    // NO makeNonReentrant between them: durable claim is the authority.
+    const projA = pendingTelegramDeliveries(ctx.store, T)[0] as Record<string, unknown>;
+    const projB = pendingTelegramDeliveries(ctx.store, T)[0] as Record<string, unknown>;
+    const recA = recordingTransport();
+    const recB = recordingTransport();
+    const rA = await transportTelegramDelivery({
+      request: projA, transport: recA.transport, isAllowed: () => true,
+      backend: storeBackend(ctx, req, T),
+      readText: (p) => fs.readFileSync(p, "utf8"),
+    });
+    expect(rA.sent).toEqual(["a.txt"]);
+    // B begins against the already-terminal slot → conflict (fail closed),
+    // ZERO network calls. Global send count stays exactly 1.
+    await expect(
+      transportTelegramDelivery({
+        request: projB, transport: recB.transport, isAllowed: () => true,
+        backend: storeBackend(ctx, req, T),
+        readText: (p) => fs.readFileSync(p, "utf8"),
+      }),
+    ).rejects.toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION/);
+    expect(recB.calls).toHaveLength(0);
+    expect(recA.calls).toHaveLength(1);
+    const art = artOf(ctx, id, "a.txt");
+    expect(art.state).toBe("SENT");
+    expect(art.message_id).toBe(1001);
+    expect(reqOf(ctx, id).status).toBe("SENT");
+  });
+
+  it("§9. second begin while SENDING → acquired=false/ALREADY_CLAIMED, zero network; owner then SENT 1001", async () => {
+    const ctx = makeCtx("r7-claimed");
+    const req = mintFilesRequest(ctx, ["a.txt"]);
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
+    const id = String(req.delivery_id);
+    const projB = pendingTelegramDeliveries(ctx.store, T)[0] as Record<string, unknown>;
+    // A acquires the attempt.
+    const began = ctx.control.transitionTelegramDelivery(id, {
+      artifact: "a.txt", to: "SENDING", now: T,
+    }) as { acquired: boolean; attempt_id: string };
+    expect(began.acquired).toBe(true);
+    expect(String(began.attempt_id)).toMatch(/^ATT_[0-9a-f]{16}$/);
+    // B's transport works off the same stale QUEUED projection — its
+    // begin does NOT acquire → zero network sends, A's SENDING intact.
+    const recB = recordingTransport();
+    const rB = await transportTelegramDelivery({
+      request: projB, transport: recB.transport, isAllowed: () => true,
+      backend: storeBackend(ctx, req, plus(1)),
+      readText: (p) => fs.readFileSync(p, "utf8"),
+    });
+    expect(rB.sent).toEqual([]);
+    expect(recB.calls).toHaveLength(0);
+    const art = artOf(ctx, id, "a.txt");
+    expect(art.state).toBe("SENDING");
+    expect(art.attempt_id).toBe(began.attempt_id);
+    // A resolves with real evidence → canonical SENT.
+    ctx.control.transitionTelegramDelivery(id, {
+      artifact: "a.txt", to: "SENT", message_id: 1001, now: plus(2),
+    });
+    expect(artOf(ctx, id, "a.txt").state).toBe("SENT");
+    expect(artOf(ctx, id, "a.txt").message_id).toBe(1001);
+    expect(reqOf(ctx, id).status).toBe("SENT");
+  });
+
+  it("§10. lost begin response — retry reports ALREADY_CLAIMED, same attempt id, never send authority", async () => {
+    const ctx = makeCtx("r7-lost");
+    const req = mintFilesRequest(ctx, ["a.txt"]);
+    const id = String(req.delivery_id);
+    // A persists QUEUED→SENDING but "loses" the response.
+    const began = ctx.control.transitionTelegramDelivery(id, {
+      artifact: "a.txt", to: "SENDING", now: T,
+    }) as { acquired: boolean; attempt_id: string };
+    expect(began.acquired).toBe(true);
+    // A retries its begin: ALREADY_CLAIMED — the durable slot is the
+    // authority; no second attempt is minted, no send permission granted.
+    const replay = ctx.control.transitionTelegramDelivery(id, {
+      artifact: "a.txt", to: "SENDING", now: plus(1),
+    }) as { acquired: boolean; reason?: string; attempt_id?: string };
+    expect(replay.acquired).toBe(false);
+    expect(replay.reason).toBe("ALREADY_CLAIMED");
+    expect(replay.attempt_id).toBe(began.attempt_id); // identifies attempt, not ownership
+    // A's original owner path still resolves normally → single SENT.
+    ctx.control.transitionTelegramDelivery(id, {
+      artifact: "a.txt", to: "SENT", message_id: 1001, now: plus(2),
+    });
+    expect(reqOf(ctx, id).status).toBe("SENT");
+    expect(artOf(ctx, id, "a.txt").message_id).toBe(1001);
+  });
+
+  it("§11. TEXT payload uses the same exclusive acquire", async () => {
+    const ctx = makeCtx("r7-text");
+    const { request } = await startDeliveryMission(ctx, { intent: TEXT_INTENT });
+    const id = String(request.delivery_id);
+    const projB = pendingTelegramDeliveries(ctx.store, T)[0] as Record<string, unknown>;
+    const began = ctx.control.transitionTelegramDelivery(id, {
+      artifact: null, to: "SENDING", now: T,
+    }) as { acquired: boolean };
+    expect(began.acquired).toBe(true);
+    // A second consumer's transport on the stale projection → no acquire,
+    // zero network calls.
+    const recB = recordingTransport();
+    const rB = await transportTelegramDelivery({
+      request: projB, transport: recB.transport, isAllowed: () => true,
+      backend: storeBackend(ctx, request, plus(1)),
+    });
+    expect(rB.sent).toEqual([]);
+    expect(recB.calls).toHaveLength(0);
+    ctx.control.transitionTelegramDelivery(id, {
+      artifact: null, to: "SENT", message_id: 1001, now: plus(2),
+    });
+    expect(reqOf(ctx, id).status).toBe("SENT");
+    expect(reqOf(ctx, id).message_id).toBe(1001);
   });
 });
