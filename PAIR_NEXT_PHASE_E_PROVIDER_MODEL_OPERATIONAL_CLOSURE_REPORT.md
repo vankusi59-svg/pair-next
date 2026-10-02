@@ -324,3 +324,127 @@ identical failures were recorded on the base SHA before any Phase E edit.
   the model's upstream endpoint rejected the probe).
 
 STOP. DO NOT MERGE. Awaiting independent audit.
+
+---
+
+# PHASE E — R1 REMEDIATION (audited HEAD: `a46d8a984ebb7e1500f46d7e991a1d7151cc3990`)
+
+Independent audit of the Phase E core found nine blockers (§1–§12). R1 closes
+all of them on this same branch; the original Phase E evidence above is
+preserved verbatim.
+
+## R1.1 Root causes and closed semantics
+
+- **§1 STALE = NOT CURRENT = NOT ROUTABLE.** `PROVIDER_NOT_BLOCKED` covered
+  DISABLED/UNQUALIFIED/REMOVED but left STALE routable inside the threshold
+  window. New gate **`PROVIDER_CURRENT`** fails whenever
+  `conditions` contains `STALE` or `REMOVED` — the first authoritative
+  absence already revokes new-work authority (history stays inspectable).
+  The gate is evaluated on the availability channel (failover-eligible),
+  so planner/DSH reject with a structured rejection, never silently invoke.
+- **§2 Provider reappearance restores OBSERVATION only.** Previously a
+  re-observed REMOVED provider kept `QUALIFIED`/`AUTH_OK`/`PROBED` and its
+  receipt pointer, instantly regaining routing authority. Now
+  `upsertCandidate` — on REMOVED *or* STALE re-observation — records
+  `REAPPEARED` and demotes to `DISCOVERY_ELIGIBLE` + `AUTH_REQUIRED` +
+  `UNPROBED`. Historical rows (receipt, events) stay inspectable; only the
+  normal `validateAccess → probe → qualify` chain mints NEW authority.
+- **§3 Model reappearance identical.** `upsertModelClaim` now clears
+  STALE/REMOVED → `REAPPEARED` + `lifecycle_state = DISCOVERED` (previously
+  STALE was never even cleared, and re-observed REMOVED models kept
+  QUALIFIED). Re-qualification re-mints a new/current receipt.
+- **§4/§5 Canonical provider↔model linkage.** New gate
+  **`MODEL_PROVIDER_MATCH`**: `model.provider_id === provider.provider_id`,
+  else FAIL — a qualified P2 cannot pass independent gates into routing a
+  model owned by P1. `ensureBinding` throws
+  `FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH` at mutation time; injected
+  pre-R1 malformed rows project `routable=false` with
+  `MODEL_PROVIDER_MATCH=FAIL`; `qualifyBinding` on such rows throws the
+  same error. The gate lives inside `providerModelEligibility`, so
+  Planner, DSH, and `projectRoutableModels` all share it (§17: zero
+  invocations before the throw).
+- **§6/§7 Legacy fail-open removed.** `MODEL_RECEIPT_CURRENT` no longer
+  passes on `material_fingerprint === undefined`: a QUALIFIED model needs a
+  receipt AND a matching fingerprint. Policy **A** applied — legacy rows
+  remain historical evidence; fresh probe+qualification mints the bound
+  receipt (no blind hash backfill).
+- **§8/§9/§10 Source disappearance semantics — explicit.** A source that
+  never recorded a snapshot and reports `supports()=false` is
+  "never configured" → silently skipped. A source with a prior COMPLETE
+  snapshot reporting `supports()=false` is a "previously-active
+  authoritative source disappeared" → records an `ABSENT` snapshot and
+  contributes an authoritative empty claim set, so providers solely
+  dependent on it lose currentness through the normal bounded streak
+  (STALE→REMOVED). No indefinite last-known-good grant; FAILED snapshots
+  still never remove. Scope invariant: `source_id` is the authority key —
+  one source_id = one authority scope per store (documented; a test pins
+  the silent-vs-ABSENT distinction).
+- **§11 Contradiction = authority violation.** New gate
+  **`MODEL_PROVIDER_IDENTITY_CONSISTENT`** FAILs when the canonical entry
+  carries an unresolved `provider_id` contradiction. Added to
+  `AUTHORITY_GATES`/`DSH_AUTHORITY_GATES` → planner/DSH throw fail-closed.
+- **§12 Fingerprint binds provider ownership.** `modelIdentityDigest` now
+  includes `provider_id`, so a qualification receipt is bound to the
+  provider↔model linkage itself, not only the aliasing family+model
+  identity.
+
+## R1.2 New tests (§13–§20) — 11 added, focused suite 45/45
+
+- §13 STALE provider: `PROVIDER_CURRENT` FAIL → planner reject + DSH reject
+  + projection non-routable, zero invocations.
+- §14 provider QUALIFIED→STALE→REMOVED→re-observe → REAPPEARED/
+  DISCOVERY_ELIGIBLE/AUTH_REQUIRED/UNPROBED → non-routable + old receipt
+  inspectable → fresh validateAccess/probe/qualify → routable with NEW
+  receipt.
+- §15 model same: REMOVED→re-observe → REAPPEARED/DISCOVERED → non-routable
+  → fresh qualify → routable.
+- §16 `ensureBinding`(P2, model-of-P1) throws
+  `FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH`; injected QUALIFIED malformed
+  binding → `routable=false` + `MODEL_PROVIDER_MATCH` FAIL +
+  `qualifyBinding` throws.
+- §17 planner + DSH throw `FAIL_CLOSED_*` on linkage-mismatched candidates
+  (missing/contradictory `provider_id`) before any invocation.
+- §18 injected legacy fingerprint-less receipt → `MODEL_RECEIPT_CURRENT`
+  FAIL → re-qualification restores authority with bound fingerprint.
+- §12 `modelIdentityDigest` differs when `provider_id` differs.
+- §19 unresolved `provider_id` contradiction →
+  `MODEL_PROVIDER_IDENTITY_CONSISTENT` FAIL → planner throws.
+- §20 previously-active source `supports()=false` → ABSENT snapshot →
+  bounded STALE→REMOVED; never-configured source → silent skip.
+
+## R1.3 Regression
+
+- Focused Phase E suite: **45/45 PASS** (34 original + 11 R1).
+- Related suites: phase-a 16/16, phase-b 66/66, phase-c-dsh 51/51,
+  planner-dataflow incident, llm-planner 16/16, phase-d 37/37,
+  live-ops-recovery 20/20 — all PASS.
+- Full suite: **2714 pass / 2 fail / 15 skip (2731)** — the 2 fails are the
+  same pre-existing env-only P5 assertions documented since baseline
+  (`EXECUTABLE_NOT_FOUND` — real `dsh`/`codex` binaries on PATH; reproduce
+  on base `b08e8a5` and audited HEAD `a46d8a9`). +11 vs Phase E suite size.
+- `npx tsc --noEmit`: clean. `pnpm build`: clean.
+- Live E2E re-run with R1 code (scratch `PAIR_MC_DIR`, real credentials):
+  boot chain intact — 5 providers discovered, 3 routes QUALIFIED+bound,
+  `nvidia` remains unqualified/`DISCOVERY_ELIGIBLE` with no receipt —
+  identical canonical chain evidence as the original Phase E run.
+
+## R1.4 Files changed in R1
+
+- `src/pair/model-routable.ts` — `PROVIDER_CURRENT`,
+  `MODEL_PROVIDER_MATCH`, `MODEL_PROVIDER_IDENTITY_CONSISTENT` gates;
+  legacy fail-open removed from `MODEL_RECEIPT_CURRENT`;
+  `ensureBinding`/`qualifyBinding` → `FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH`.
+- `src/pair/provider-catalog.ts` — reappearance demotion
+  (REAPPEARED→DISCOVERY_ELIGIBLE/AUTH_REQUIRED/UNPROBED);
+  `hasCompletedSnapshot`.
+- `src/pair/model-catalog.ts` — reappearance demotion
+  (REAPPEARED→DISCOVERED); `modelIdentityDigest` += `provider_id`.
+- `src/pair/provider-discovery.ts` — §8/§9 source-disappearance semantics
+  (silent skip vs authoritative ABSENT claim).
+- `src/pair/model-role.ts`, `src/pair/dsh-model-router.ts` —
+  AUTHORITY_GATES += linkage/consistency gates.
+- `src/__tests__/pair-phase-e-provider-model-authority.test.ts` — +11 R1
+  tests (§13–§20); C4 comment updated.
+- this report — R1 section appended (original evidence preserved).
+
+STOP. DO NOT MERGE. Awaiting independent audit of R1.

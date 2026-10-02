@@ -242,16 +242,21 @@ export class ProviderCatalog {
     sources.add(sourceId);
     body.sources = [...sources].sort();
     body.last_seen_at = now;
-    // Current observation resets absence bookkeeping and revives a removed
-    // entry as REAPPEARED (history kept) — same semantics as model claims.
+    // Current observation resets absence bookkeeping and revives a
+    // stale/removed entry as REAPPEARED (history kept). Phase E R1 §2 —
+    // reappearance restores OBSERVATION only, never runtime authority:
+    // a provider that lost currentness must re-run the normal
+    // validateAccess → probe → qualification chain to mint new/current
+    // authority. Historical rows (receipt, events) stay inspectable.
     body.absence_streak = 0;
     const conditions = new Set((body.conditions as string[]) ?? []);
-    if (conditions.has("REMOVED")) {
+    if (conditions.has("REMOVED") || conditions.has("STALE")) {
       conditions.delete("REMOVED");
       conditions.delete("STALE");
       conditions.add("REAPPEARED");
-    } else if (conditions.has("STALE")) {
-      conditions.delete("STALE");
+      body.lifecycle_state = "DISCOVERY_ELIGIBLE";
+      body.auth_state = "AUTH_REQUIRED";
+      body.probe_state = "UNPROBED";
     }
     body.conditions = [...conditions].sort();
     body.identity_digest = providerIdentityDigest(body);
@@ -473,6 +478,15 @@ export class ProviderCatalog {
     };
     this.store.put("provider_snapshot", rec.snapshot_id, rec);
     return rec;
+  }
+
+  /** Phase E R1 §8 — whether a source has ever recorded a COMPLETE
+   *  snapshot here. Distinguishes "never configured" (silently skipped)
+   *  from "previously-active authoritative source disappeared". */
+  hasCompletedSnapshot(sourceId: string): boolean {
+    return (this.store.list("provider_snapshot") as Record<string, unknown>[]).some(
+      (s) => String(s.source_id) === sourceId && String(s.status) === "COMPLETE",
+    );
   }
 
   issueQualificationReceipt(

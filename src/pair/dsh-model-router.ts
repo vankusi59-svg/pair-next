@@ -132,6 +132,10 @@ const DSH_AUTHORITY_GATES = new Set([
   "PROVIDER_RECEIPT_CURRENT",
   "MODEL_RECEIPT_CURRENT",
   "MODEL_NOT_REVOKED",
+  // Phase E R1 — provider↔model linkage + identity contradictions are
+  // authority violations: fail closed before any dispatch (§4/§11/§17).
+  "MODEL_PROVIDER_MATCH",
+  "MODEL_PROVIDER_IDENTITY_CONSISTENT",
 ]);
 
 /**

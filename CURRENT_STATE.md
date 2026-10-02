@@ -828,6 +828,18 @@ WOB1(A) and refused a legitimate retry.
   CAPABILITY_TEXT_INFERENCE), `DISCOVERY_ELIGIBLE` provider non-routable
   with no receipt. IMPLEMENTED / PENDING INDEPENDENT AUDIT. See
   `PAIR_NEXT_PHASE_E_PROVIDER_MODEL_OPERATIONAL_CLOSURE_REPORT.md`.
+- **R1 remediation** (same branch, pending re-audit): STALE providers are
+  non-routable (`PROVIDER_CURRENT` gate); provider/model reappearance
+  restores OBSERVATION only (REAPPEARED → `DISCOVERY_ELIGIBLE`/`DISCOVERED`
+  + AUTH_REQUIRED/UNPROBED, re-qualification mints new authority);
+  `MODEL_PROVIDER_MATCH` + `MODEL_PROVIDER_IDENTITY_CONSISTENT` linkage
+  gates fail closed across planner/DSH/bindings
+  (`FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH`); legacy fingerprint-less
+  receipts no longer pass (`material_fingerprint` binds `provider_id`);
+  source disappearance is explicit — never-configured skips silently,
+  previously-active → ABSENT snapshot → bounded STALE→REMOVED (no
+  indefinite last-known-good). Focused 45/45; full suite 2714 pass / same
+  2 env P5 fails; tsc+build clean; live E2E boot chain intact.
 
 ## Not yet
 

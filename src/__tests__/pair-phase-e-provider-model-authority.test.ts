@@ -327,8 +327,9 @@ describe("C — provider currentness", () => {
     }
     const cat = new ProviderCatalog(store);
     expect(cat.getProvider("pv")!.conditions).toContain("REMOVED");
-    // Re-observation clears REMOVED→REAPPEARED but authority (auth_state)
-    // keeps its last proven value — re-qualification re-proves, no silent reset.
+    // R1 §2 — re-observation clears REMOVED→REAPPEARED and drops the entry
+    // back to DISCOVERY_ELIGIBLE observation state: re-appearance restores
+    // OBSERVATION only, never prior runtime authority.
     runProviderDiscovery(store, { context: { env }, sources: [srcA(["pv"])] });
     const p = cat.getProvider("pv")!;
     expect(p.conditions).toContain("REAPPEARED");
@@ -835,5 +836,401 @@ describe("K — concurrency / idempotency", () => {
     expect(() =>
       store.put("provider", String(entry.entry_id), { ...entry, display_name: "w2" }, Number(entry.version)),
     ).toThrow(/FAIL_CLOSED_VERSION_CONFLICT/);
+  });
+});
+
+/* ============ R1 — remediation test matrix (§13–§20) ======================
+ *
+ * §13  STALE = NOT CURRENT = NOT ROUTABLE (planner + DSH, zero invocation)
+ * §14  provider REAPPEARED → observation only → re-validate/probe/qualify
+ * §15  model REAPPEARED → observation only → fresh probe + qualify
+ * §16  provider↔model linkage mismatch: binding fail-closed + projection
+ * §17  Planner/DSH fail closed on linkage mismatch before any invocation
+ * §18  legacy fingerprint-less receipt → MODEL_RECEIPT_CURRENT FAIL
+ * §19  provider_id contradiction → MODEL_PROVIDER_IDENTITY_CONSISTENT FAIL
+ * §20  authoritative source disappearance → bounded absence (no indefinite
+ *      last-known-good); never-configured source is silent
+ */
+
+class TogglableSource {
+  supported = true;
+  constructor(
+    readonly sourceId: string,
+    private readonly ids: string[],
+  ) {}
+  supports(): boolean {
+    return this.supported;
+  }
+  discover() {
+    return this.ids.map((pid) => ({
+      provider_native_id: pid,
+      canonical_hint: pid,
+      source_id: this.sourceId,
+      display_name: pid,
+      provider_type: "OPENAI_COMPATIBLE",
+      protocol_family: "OPENAI_COMPATIBLE",
+      provider_family: pid,
+      credential_reference_name: `${pid.toUpperCase()}_KEY`,
+    }));
+  }
+}
+
+describe("R1 — §13 STALE non-routable", () => {
+  it("STALE provider: eligibility fails, planner+DSH reject before invocation, projection non-routable", async () => {
+    const { store, service } = makeCtx("r13");
+    const env = { PV_KEY: "cred" };
+    runProviderDiscovery(store, {
+      context: { env },
+      sources: [new CredentialEnvSource([{ provider_id: "pv", env_name: "PV_KEY" }])],
+    });
+    await mkQualifiedProvider(store, "pv");
+    const mePlanner = mkModel(store, "pv", "mp");
+    assignModelRole(store, mePlanner, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    const meDsh = mkModel(store, "pv", "md");
+    assignModelRole(store, meDsh, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+    const adapter = new DshExecutorAdapter({
+      journalRoot: path.join(freshDir("r13j"), "j"),
+      envReader: () => "cred",
+      compatEnvRouteFallback: true,
+      launchOverride: { command: "node", args: ["fixture.mjs", "--profile", "acp"] },
+    });
+    registerDsh(service, adapter);
+    const b = ensureBinding(service, {
+      executor_id: DSH_EXECUTOR_ID,
+      provider_id: "pv",
+      model_entry_id: meDsh,
+      transport_compat: "OPENAI_COMPLETIONS",
+    });
+    qualifyBinding(service, String(b.binding_id));
+    const cand = { ref: "pv:md", pid: "pv", mid: "md", model_entry_id: meDsh };
+    expect(() => assertPlannerCandidateEligible(store, mePlanner)).not.toThrow();
+    expect(() => assertDshCandidateEligible(service, cand, DSH_EXECUTOR_ID)).not.toThrow();
+    expect(projectRoutableModels(service)[0]!.routable).toBe(true);
+
+    // One authoritative absence → STALE. STALE = NOT CURRENT: new work
+    // cannot be authorized against it (history stays, authority gone).
+    runProviderDiscovery(store, {
+      context: { env },
+      sources: [new CredentialEnvSource([])],
+    });
+    const p = new ProviderCatalog(store).getProvider("pv")!;
+    expect(p.conditions).toContain("STALE");
+    expect(p.conditions).not.toContain("REMOVED");
+    expect(p.lifecycle_state).toBe("MODEL_DISCOVERY_ELIGIBLE"); // historical state kept
+    const elig = providerModelEligibility(store, "pv", mePlanner);
+    expect(elig.gates.PROVIDER_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    // Availability-channel rejection (failover-eligible, never an
+    // authority grant): planner returns a structured rejection, DSH too —
+    // both BEFORE any model invocation or dispatch.
+    expect(assertPlannerCandidateEligible(store, mePlanner)).toMatchObject({ reject: true });
+    const dshRej = assertDshCandidateEligible(service, cand, DSH_EXECUTOR_ID);
+    expect(dshRej).toMatchObject({ reject: true });
+    expect(projectRoutableModels(service)[0]!.routable).toBe(false);
+    expect(projectRoutableModels(service)[0]!.gates.PROVIDER_CURRENT).toBe("FAIL");
+  });
+});
+
+describe("R1 — §14 provider reappearance = observation only", () => {
+  it("REMOVED→reappeared provider loses all runtime authority until re-qualified", async () => {
+    const { store } = makeCtx("r14");
+    const env = { PV_KEY: "cred" };
+    const src = new CredentialEnvSource([{ provider_id: "pv", env_name: "PV_KEY" }]);
+    runProviderDiscovery(store, { context: { env }, sources: [src] });
+    await mkQualifiedProvider(store, "pv");
+    const me = mkModel(store, "pv", "m1");
+    const oldReceipt = String(new ProviderCatalog(store).getProvider("pv")!.current_qualification_receipt_id);
+    for (let i = 0; i < PROVIDER_REMOVED_ABSENCE_THRESHOLD; i++) {
+      runProviderDiscovery(store, { context: { env }, sources: [new CredentialEnvSource([])] });
+    }
+    const cat = new ProviderCatalog(store);
+    expect(cat.getProvider("pv")!.conditions).toContain("REMOVED");
+
+    // Re-observation: REAPPEARED + observation lifecycle restored, but
+    // auth/probe authority reset — the historical receipt stays inspectable.
+    runProviderDiscovery(store, { context: { env }, sources: [src] });
+    const p = cat.getProvider("pv")!;
+    expect(p.conditions).toContain("REAPPEARED");
+    expect(p.lifecycle_state).toBe("DISCOVERY_ELIGIBLE");
+    expect(p.auth_state).toBe("AUTH_REQUIRED");
+    expect(p.probe_state).toBe("UNPROBED");
+    expect(Number(p.absence_streak)).toBe(0);
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.PROVIDER_QUALIFIED).toBe("FAIL");
+    expect(elig.gates.PROVIDER_AUTH_OK).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    // Historical receipt row is inspectable — never silently deleted.
+    expect(store.get("provider_qualification", oldReceipt).receipt_id).toBe(oldReceipt);
+
+    // Normal re-proof chain restores authority with a NEW receipt.
+    const v = new ProviderValidator(store);
+    await v.validateAccess("pv", {
+      env: { PV_KEY: "cred" },
+      probe: async () => ({ outcome: "AUTH_OK", latency_ms: 3 }),
+    });
+    v.qualify("pv", { env: { PV_KEY: "cred" }, probed: true, actor: "t" });
+    const p2 = cat.getProvider("pv")!;
+    expect(p2.lifecycle_state).toBe("MODEL_DISCOVERY_ELIGIBLE"); // qualified lifecycle
+    expect(p2.current_qualification_receipt_id).not.toBe(oldReceipt);
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R1 — §15 model reappearance = observation only", () => {
+  it("REMOVED→reappeared model returns to DISCOVERED until fresh probe+qualify", async () => {
+    const { store } = makeCtx("r15");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const me = mkModel(store, "pv", "m1");
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+
+    // Three authoritative COMPLETE absences → REMOVED.
+    for (let i = 0; i < PROVIDER_REMOVED_ABSENCE_THRESHOLD; i++) {
+      mcat.reconcileAbsence("pv", new Set(), { snapshotStatus: "COMPLETE", actor: "t" });
+    }
+    let m = mcat.getModel(me)!;
+    expect(m.conditions).toContain("REMOVED");
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(false);
+
+    // Re-observation: REAPPEARED + lifecycle back to DISCOVERED — no
+    // regained new-work authority from reappearance alone.
+    mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    m = mcat.getModel(me)!;
+    expect(m.conditions).toContain("REAPPEARED");
+    expect(m.conditions).not.toContain("REMOVED");
+    expect(m.lifecycle_state).toBe("DISCOVERED");
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_QUALIFIED).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+
+    // Fresh probe+qualification mints new/current authority → routable.
+    mcat.issueQualificationReceipt(me, {
+      capability_scope: ["text_inference"],
+      verifier: "test-probe",
+      evidence_refs: ["fresh"],
+      actor: "t",
+    });
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+});
+
+describe("R1 — §16/§17 provider↔model linkage", () => {
+  it("mutation-time fail closed: binding P2→model-owned-by-P1 throws LINK_MISMATCH", async () => {
+    const { store, service } = makeCtx("r16a");
+    await mkQualifiedProvider(store, "p1");
+    await mkQualifiedProvider(store, "p2");
+    const me = mkModel(store, "p1", "m1");
+    expect(() =>
+      ensureBinding(service, {
+        executor_id: DSH_EXECUTOR_ID,
+        provider_id: "p2",
+        model_entry_id: me,
+        transport_compat: "OPENAI_COMPLETIONS",
+      }),
+    ).toThrow(/FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH/);
+    expect(listBindings(service)).toHaveLength(0);
+  });
+
+  it("injected legacy malformed binding: projection non-routable, qualify fail-closed", async () => {
+    const { store, service } = makeCtx("r16b");
+    await mkQualifiedProvider(store, "p1");
+    await mkQualifiedProvider(store, "p2");
+    const me = mkModel(store, "p1", "m1");
+    const adapter = new DshExecutorAdapter({
+      journalRoot: path.join(freshDir("r16bj"), "j"),
+      envReader: () => "cred",
+      compatEnvRouteFallback: true,
+      launchOverride: { command: "node", args: ["fixture.mjs", "--profile", "acp"] },
+    });
+    registerDsh(service, adapter);
+    // Pre-R1 row shape (QUALIFIED state persisted, wrong provider link).
+    store.put(
+      "model_binding",
+      "MBD_legacy",
+      {
+        binding_id: "MBD_legacy",
+        executor_id: DSH_EXECUTOR_ID,
+        provider_id: "p2",
+        model_entry_id: me,
+        transport_compat: "OPENAI_COMPLETIONS",
+        qualification_state: "QUALIFIED",
+        evidence_refs: [],
+        first_seen_at: "2026-01-01T00:00:00Z",
+        last_seen_at: "2026-01-01T00:00:00Z",
+        binding_digest: "legacy",
+        version: 0,
+      },
+      0,
+    );
+    const rows = projectRoutableModels(service);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.routable).toBe(false);
+    expect(rows[0]!.gates.MODEL_PROVIDER_MATCH).toBe("FAIL");
+    expect(() => qualifyBinding(service, "MBD_legacy")).toThrow(
+      /FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH/,
+    );
+    // Shared seam: the mismatched pair answers FAIL directly too.
+    expect(providerModelEligibility(store, "p2", me).gates.MODEL_PROVIDER_MATCH).toBe("FAIL");
+  });
+
+  it("planner + DSH throw on linkage mismatch before any invocation", async () => {
+    const { store, service } = makeCtx("r17");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    // Legacy/corrupt entry: no authoritative provider_id on the model.
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1", { provider_id: undefined }), "t");
+    const me = String(entry.model_entry_id);
+    mcat.issueQualificationReceipt(me, {
+      capability_scope: ["text_inference"],
+      verifier: "t",
+      evidence_refs: [],
+      actor: "t",
+    });
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    expect(() => assertPlannerCandidateEligible(store, me)).toThrow(
+      /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
+    );
+    const meDsh = mkModel(store, "pv", "m2", true);
+    store.put(
+      "model_entry",
+      meDsh,
+      { ...mcat.getModel(meDsh)!, provider_id: null },
+      Number(mcat.getModel(meDsh)!.version),
+    );
+    assignModelRole(store, meDsh, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+    expect(() =>
+      assertDshCandidateEligible(
+        service,
+        { ref: "pv:m2", pid: "pv", mid: "m2", model_entry_id: meDsh },
+        DSH_EXECUTOR_ID,
+      ),
+    ).toThrow(/FAIL_CLOSED/);
+  });
+});
+
+describe("R1 — §18/§12 receipt binding", () => {
+  it("legacy fingerprint-less receipt fails MODEL_RECEIPT_CURRENT; fresh qualify re-authorizes", async () => {
+    const { store } = makeCtx("r18");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const me = mkModel(store, "pv", "m1");
+    // Inject a pre-R1 legacy receipt (no material_fingerprint) as current.
+    store.put(
+      "model_qualification",
+      "MQR_legacy",
+      {
+        receipt_id: "MQR_legacy",
+        model_entry_id: me,
+        capability_scope: ["text_inference"],
+        verifier: "legacy-verifier",
+        evidence_refs: [],
+        issued_at: "2025-01-01T00:00:00Z",
+        version: 0,
+      },
+      0,
+    );
+    const body = mcat.getModel(me)!;
+    store.put(
+      "model_entry",
+      me,
+      { ...body, current_qualification_receipt_id: "MQR_legacy" },
+      Number(body.version),
+    );
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_RECEIPT_CURRENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+
+    // Fresh probe+qualification mints a bound receipt → authority restored.
+    mcat.issueQualificationReceipt(me, {
+      capability_scope: ["text_inference"],
+      verifier: "test-probe",
+      evidence_refs: [],
+      actor: "t",
+    });
+    const fresh = mcat.getModel(me)!;
+    const receipt = store.get("model_qualification", String(fresh.current_qualification_receipt_id));
+    expect(String(receipt.material_fingerprint)).toBe(modelIdentityDigest(fresh));
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+  });
+
+  it("modelIdentityDigest binds provider_id — linkage change invalidates the fingerprint", async () => {
+    const { store } = makeCtx("r12");
+    const mcat = new ModelEvidenceCatalog(store);
+    const { entry } = mcat.upsertModelClaim(CLAIM("pv", "m1"), "t");
+    const d1 = modelIdentityDigest(entry);
+    const d2 = modelIdentityDigest({ ...entry, provider_id: "other-provider" });
+    expect(d1).not.toBe(d2);
+    expect(String(entry.provider_id)).toBe("pv");
+  });
+});
+
+describe("R1 — §19 provider_id contradiction", () => {
+  it("unresolved provider_id contradiction fails MODEL_PROVIDER_IDENTITY_CONSISTENT", async () => {
+    const { store } = makeCtx("r19");
+    await mkQualifiedProvider(store, "pv");
+    const mcat = new ModelEvidenceCatalog(store);
+    const me = mkModel(store, "pv", "m1"); // QUALIFIED, provider_id=pv
+    // Second claim: same family+model identity, DIFFERENT provider_id.
+    mcat.upsertModelClaim(CLAIM("pv", "m1", { provider_id: "p2" }), "t");
+    const m = mcat.getModel(me)!;
+    expect(String(m.provider_id)).toBe("pv"); // first link never flips
+    expect(
+      (m.contradictions as Array<{ field?: string }>).some((c) => c.field === "provider_id"),
+    ).toBe(true);
+    const elig = providerModelEligibility(store, "pv", me);
+    expect(elig.gates.MODEL_PROVIDER_IDENTITY_CONSISTENT).toBe("FAIL");
+    expect(elig.eligible).toBe(false);
+    // Planner treats it as an authority violation — fail closed.
+    assignModelRole(store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    expect(() => assertPlannerCandidateEligible(store, me)).toThrow(
+      /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
+    );
+  });
+});
+
+describe("R1 — §20 source disappearance", () => {
+  it("previously-active source supports()=false → ABSENT observation → bounded streak → REMOVED", async () => {
+    const { store } = makeCtx("r20a");
+    const env = { PV_KEY: "cred" };
+    const src = new TogglableSource("SRC_A", ["pv"]);
+    runProviderDiscovery(store, { context: { env }, sources: [src] });
+    await mkQualifiedProvider(store, "pv");
+    const me = mkModel(store, "pv", "m1");
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(true);
+
+    src.supported = false; // authoritative source definitively disappears
+    runProviderDiscovery(store, { context: { env }, sources: [src] });
+    const snaps = (store.list("provider_snapshot") as Record<string, unknown>[]).filter(
+      (s) => s.source_id === "SRC_A",
+    );
+    expect(snaps.some((s) => s.status === "ABSENT")).toBe(true);
+    const p1 = new ProviderCatalog(store).getProvider("pv")!;
+    expect(p1.conditions).toContain("STALE");
+    expect(providerModelEligibility(store, "pv", me).eligible).toBe(false);
+
+    // Bounded — no indefinite last-known-good: hits REMOVED at threshold.
+    for (let i = 1; i < PROVIDER_REMOVED_ABSENCE_THRESHOLD; i++) {
+      runProviderDiscovery(store, { context: { env }, sources: [src] });
+    }
+    expect(new ProviderCatalog(store).getProvider("pv")!.conditions).toContain("REMOVED");
+  });
+
+  it("never-configured source (no prior snapshot) supports()=false → silent skip, nothing demoted", async () => {
+    const { store } = makeCtx("r20b");
+    const env = { PV_KEY: "cred", PV2_KEY: "cred" };
+    const srcB = new TogglableSource("SRC_B", ["pv2"]);
+    runProviderDiscovery(store, { context: { env }, sources: [srcB] });
+    const never = new TogglableSource("SRC_NEVER", []);
+    never.supported = false;
+    const res = runProviderDiscovery(store, { context: { env }, sources: [srcB, never] });
+    // No ABSENT snapshot, no claim — never observed, so no authority loss.
+    expect(
+      (store.list("provider_snapshot") as Record<string, unknown>[]).some(
+        (s) => s.source_id === "SRC_NEVER",
+      ),
+    ).toBe(false);
+    const p = new ProviderCatalog(store).getProvider("pv2")!;
+    expect(p.conditions ?? []).not.toContain("STALE");
+    expect(res.stale).toHaveLength(0);
   });
 });

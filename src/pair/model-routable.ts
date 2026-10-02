@@ -8,7 +8,7 @@
  */
 
 import { digest, newId, utcnow } from "./canonical.js";
-import { NotFoundError } from "./errors.js";
+import { IntegrityError, NotFoundError } from "./errors.js";
 import { ExecutorRegistry } from "./executor-registry.js";
 import { ModelEvidenceCatalog, modelIdentityDigest } from "./model-catalog.js";
 import { PROVIDER_OK_STATES, ProviderCatalog, providerIdentityDigest } from "./provider-catalog.js";
@@ -50,6 +50,25 @@ export function ensureBinding(
   },
 ): ModelBindingRow {
   const store = service.store;
+  // Phase E R1 §5 — mutation-time fail closed: a binding that names a
+  // provider different from the model's canonical provider_id is an
+  // authority mismatch, never created. (Orphan bindings for missing
+  // models still mint as DISCOVERED — observability, never routable.)
+  const model = new ModelEvidenceCatalog(store).getModel(opts.model_entry_id);
+  if (
+    model &&
+    model.provider_id &&
+    String(model.provider_id) !== String(opts.provider_id)
+  ) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH",
+      JSON.stringify({
+        binding_provider_id: opts.provider_id,
+        model_provider_id: model.provider_id,
+        model_entry_id: opts.model_entry_id,
+      }),
+    );
+  }
   const provisional = {
     binding_id: "",
     executor_id: opts.executor_id,
@@ -84,6 +103,23 @@ export function qualifyBinding(
   const store = service.store;
   const existing = store.tryGet("model_binding", bindingId) as ModelBindingRow | null;
   if (!existing) throw new NotFoundError(`model_binding:${bindingId}`);
+  // Phase E R1 §5 — fail closed before QUALIFIED authority exists: the
+  // binding's provider_id must equal the model's canonical provider_id.
+  const model = new ModelEvidenceCatalog(store).getModel(existing.model_entry_id);
+  if (
+    !model ||
+    !model.provider_id ||
+    String(model.provider_id) !== String(existing.provider_id)
+  ) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH",
+      JSON.stringify({
+        binding_id: bindingId,
+        binding_provider_id: existing.provider_id,
+        model_provider_id: model?.provider_id ?? null,
+      }),
+    );
+  }
   const body = { ...existing };
   (body as unknown as Record<string, unknown>).version = Number(existing.version);
   body.qualification_state = "QUALIFIED";
@@ -185,6 +221,16 @@ export function providerModelEligibility(
     )
       ? "PASS"
       : "FAIL";
+  // Phase E R1 §1 — STALE = NOT CURRENT = NOT ROUTABLE. The streak
+  // threshold to REMOVED is historical classification only; the first
+  // authoritative absence already revokes NEW-work authority.
+  gates.PROVIDER_CURRENT =
+    provider &&
+    !((provider.conditions as string[]) ?? []).some((c) =>
+      ["STALE", "REMOVED"].includes(c),
+    )
+      ? "PASS"
+      : "FAIL";
   // Phase E §7 — the current qualification receipt must still bind to the
   // provider's present material identity: a receipt minted before identity
   // facets changed cannot authorize new work.
@@ -202,23 +248,44 @@ export function providerModelEligibility(
 
   const model = modelCatalog.getModel(modelEntryId);
   const modelConditions = (model?.conditions ?? []) as string[];
+  // Phase E R1 §4 — provider↔model canonical linkage: the model's
+  // authoritative provider_id must equal the candidate provider's id. A
+  // malformed/corrupt binding (qualified P2 + model owned by P1) cannot
+  // pass independent gates into routability.
+  gates.MODEL_PROVIDER_MATCH =
+    provider &&
+    model &&
+    String(model.provider_id ?? "") === String(provider.provider_id)
+      ? "PASS"
+      : "FAIL";
+  // Phase E R1 §11 — an unresolved provider_id contradiction on the
+  // canonical entry is an authority conflict: not silently routable.
+  gates.MODEL_PROVIDER_IDENTITY_CONSISTENT =
+    model &&
+    !(((model.contradictions as Array<{ field?: string }>) ?? []).some(
+      (c) => c.field === "provider_id",
+    ))
+      ? "PASS"
+      : "FAIL";
   gates.MODEL_QUALIFIED = model?.lifecycle_state === "QUALIFIED" ? "PASS" : "FAIL";
   gates.MODEL_NOT_STALE =
     model && !modelConditions.includes("STALE") && !modelConditions.includes("REMOVED") ? "PASS" : "FAIL";
   gates.MODEL_NOT_REVOKED =
     model && !modelConditions.some((c) => ["REMOVED", "DEPRECATED", "BLOCKED"].includes(c)) ? "PASS" : "FAIL";
   gates.MODEL_AVAILABLE = model && !modelConditions.includes("UNAVAILABLE") ? "PASS" : "FAIL";
-  // Phase E §7 — model qualification must correspond to current model
-  // identity/probe evidence: a receipt whose recorded fingerprint diverges
-  // from the current entry is stale authority.
+  // Phase E R1 §6 — model qualification must correspond to current model
+  // identity AND provider ownership: missing receipt, missing fingerprint
+  // (legacy pre-R1 row), or fingerprint mismatch all fail current
+  // authority. Legacy fingerprint-less receipts stay historical evidence
+  // (§7 policy A) — a fresh probe+qualification mints the bound receipt.
   const modelReceipt = model?.current_qualification_receipt_id
     ? store.tryGet("model_qualification", String(model.current_qualification_receipt_id))
     : null;
   gates.MODEL_RECEIPT_CURRENT =
     !model || model.lifecycle_state !== "QUALIFIED" ||
     (modelReceipt &&
-      (modelReceipt.material_fingerprint === undefined ||
-        String(modelReceipt.material_fingerprint) === modelIdentityDigest(model)))
+      modelReceipt.material_fingerprint !== undefined &&
+      String(modelReceipt.material_fingerprint) === modelIdentityDigest(model))
       ? "PASS"
       : "FAIL";
 

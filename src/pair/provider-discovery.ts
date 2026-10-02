@@ -188,7 +188,24 @@ export function runProviderDiscovery(
   const claimedBySource = new Map<string, Set<string>>();
 
   for (const source of sources) {
-    if (!source.supports(context)) continue;
+    if (!source.supports(context)) {
+      // Phase E R1 §8-§10 — explicit source-disappearance semantics.
+      // "Never configured for this installation" (no prior snapshot) is
+      // NOT an absence observation — skip silently. A source that HAS a
+      // prior COMPLETE snapshot but now reports supports()=false is a
+      // previously-active authoritative source that definitively
+      // disappeared: it claims nothing this run, so providers solely
+      // dependent on it lose currentness through the normal bounded
+      // streak (never an indefinite last-known-good grant). The run
+      // records an ABSENT snapshot so the distinction is inspectable;
+      // ABSENT counts as a completed-authoritative-empty claim, unlike
+      // FAILED which never removes anything.
+      if (!catalog.hasCompletedSnapshot(source.sourceId)) continue;
+      claimedBySource.set(source.sourceId, new Set());
+      const snap = catalog.recordProviderSnapshot(source.sourceId, "ABSENT", [], { runId, actor });
+      snapshots.push(String(snap.snapshot_id));
+      continue;
+    }
     let candidates: ProviderCandidate[];
     try {
       candidates = [...source.discover(context)];

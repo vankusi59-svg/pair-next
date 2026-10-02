@@ -26,8 +26,12 @@ export function canonicalModelId(providerFamily: string, modelId: string): strin
 }
 
 export function modelIdentityDigest(entry: Record<string, unknown>): string {
+  // Phase E R1 §12 — provider ownership is part of model authority:
+  // qualification material must bind it. A receipt minted for provider P1
+  // + model M can never remain valid if the linkage changes to P2.
   return digest({
     model_entry_id: entry.model_entry_id,
+    provider_id: entry.provider_id ?? null,
     provider_family: entry.provider_family,
     model_id: entry.model_id,
     model_alias_ids: entry.model_alias_ids ?? [],
@@ -191,9 +195,15 @@ export class ModelEvidenceCatalog {
     body.updated_at = now;
     let reappeared = false;
     const conditions = new Set(body.conditions as string[]);
-    if (conditions.has("REMOVED")) {
+    // Phase E R1 §3 — reappearance restores OBSERVATION only. A model that
+    // reached STALE/REMOVED regains no new-work authority: lifecycle drops
+    // back to DISCOVERED and it must re-run fresh probe + qualifyModel to
+    // mint a new/current receipt. Historical evidence stays inspectable.
+    if (conditions.has("REMOVED") || conditions.has("STALE")) {
       conditions.delete("REMOVED");
+      conditions.delete("STALE");
       conditions.add("REAPPEARED");
+      body.lifecycle_state = "DISCOVERED";
       reappeared = true;
       changed = true;
     }

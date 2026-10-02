@@ -248,6 +248,11 @@ export function assertPlannerCandidateEligible(
     "PROVIDER_NOT_BLOCKED",
     "PROVIDER_RECEIPT_CURRENT",
     "MODEL_RECEIPT_CURRENT",
+    // Phase E R1 — provider↔model linkage mismatches and unresolved
+    // provider_id contradictions are authority violations: fail closed
+    // before any invocation (§4/§11/§17).
+    "MODEL_PROVIDER_MATCH",
+    "MODEL_PROVIDER_IDENTITY_CONSISTENT",
   ]);
   if (failed.some((g) => AUTHORITY_GATES.has(g))) {
     throw new IntegrityError(
