@@ -390,6 +390,10 @@ const runtime = new MissionRuntime({
   service, gate, router, adapters, scheduler, approvals, reconciliation: recon, recovery,
   planner,
   taskTimeoutSeconds: cfgTaskTimeoutS,
+  // R3 §3 — exactly-one configured default destination for missions that
+  // did NOT originate from a Telegram chat. Unset/ambiguous → explicit
+  // deliveries mint UNSENDABLE (fail closed, never broadcast).
+  telegramDeliveryDefaultChatId: process.env.PAIR_TG_DELIVERY_CHAT_ID || undefined,
 });
 const sup = new MissionSupervisor(service, runtime, recovery, recon);
 // Extraction sweep: every executor_execution whose result was collected folds

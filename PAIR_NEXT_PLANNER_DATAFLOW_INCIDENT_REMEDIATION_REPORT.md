@@ -232,3 +232,120 @@ In `requiredEdges`, for a delivery task with stamped manifest:
 Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R2_PENDING_INDEPENDENT_AUDIT`
 
 STOP. DO NOT MERGE. DO NOT START PHASE E.
+
+---
+
+# R3 — independent-audit closure (delivery scope + destination + transport)
+
+Audited R2 HEAD `d476f43888d6158cb64d4bb84e59f184ec148751` → R3 commit on the
+same PR #27. All R1/R2 + Phase A/B/C/D invariants preserved.
+
+## §0 Semantics closed
+
+- **Manifest over-capture root cause**: R2's `detectTelegramDeliveryIntent`
+  attributed file arguments from the WHOLE goal — `read private.csv,
+  create report.txt and send report.txt to Telegram` captured all three
+  names, authorizing a private input file for transmission. R3 rewrote the
+  intent contract as bounded CLAUSE grammar: a delivery clause = delivery
+  verb + Telegram mention within 160 chars (either direction); artifacts
+  are ONLY path tokens parsed from inside that clause by the
+  `CLAUSE_FILLER`/`CLAUSE_PATH` list grammar (path tokens checked before
+  filler articles so `a.txt` can't be eaten by "a"). Files outside the
+  clause — including consumed inputs like private.csv — never manifest.
+  Ambiguous scope → TEXT mode; unknown phrasing → not requested.
+- **Negation authority**: Unicode-boundary-correct `NEGATION_RE` (JS `\b`
+  does not treat `đ`/`à` as word chars — "đừng"/"và" silently failed
+  before; fixed with `(?<![\p{L}\p{N}\p{M}_])…(?!…)` + NFC normalize).
+  Any of `do not send / don't send / do not upload / đừng gửi / không cần
+  gửi` governing the clause → `requested=false, artifacts=[]` — fail-safe
+  is NO SEND.
+- **Recipient binding**: `mission_origin = {operator_id, MISSION_INGRESS}`
+  pinned at mission ingress (never caller metadata) → telegram:X origin
+  binds destination `chat_id=X` (`MISSION_ORIGIN` provenance); else
+  exactly-one `PAIR_TG_DELIVERY_CHAT_ID` (`CONFIGURED_DEFAULT`); else the
+  request mints `UNSENDABLE` + `hold_reason` (fail closed, durable). The
+  planner never mints a destination; the allowlist stays an authorization
+  check, never a broadcast list — a bound destination not in the
+  allowlist → UNSENDABLE hold, zero sends.
+- **Allowlist vs destination**: allowlist is checked INSIDE the transport
+  against the bound destination only — never iterated as recipients.
+- **Transport state machine**: per-artifact `QUEUED → SENDING → SENT |
+  QUEUED(+last_error) | UNKNOWN_SIDE_EFFECT` (request-level for TEXT).
+  `beginDeliveryAttempt` persists SENDING BEFORE the network call; SENT
+  requires definite success + `message_id` evidence + `completed_at`;
+  definite failure → back to QUEUED with bounded `last_error`; ambiguous
+  → UNKNOWN_SIDE_EFFECT — never auto-resend, never SENT.
+- **Success evidence**: `message_id` + `sent_at`/`completed_at` on the
+  artifact — filename marks are gone.
+- **Failure semantics**: `send()`/`sendFile()`/`tg()` now classify
+  definite (Telegram API said no) vs unknown (network/parse died inside
+  the call). `governedSend` propagates both — failures are NEVER
+  swallowed and NEVER acked.
+- **UNKNOWN_SIDE_EFFECT**: stale SENDING (process died inside the
+  transport window) reconciles to UNKNOWN_SIDE_EFFECT with
+  `stale_sending_reconciled:<ts>` evidence on the next
+  `pendingTelegramDeliveries` pass — explicit ambiguous path, no blind
+  resend, no false SENT.
+- **.sent removal**: the rename-before-send witness is deleted entirely —
+  no filename is transport state anymore (§6+§8 verified: zero `*.sent`
+  files created anywhere).
+- **Crash-window tests**: §15 A–D — crash-before-send → reconcile
+  UNKNOWN (0 sends); crash-after-accept-before-ack → UNKNOWN (1 send
+  ever, no dup); crash-after-SENT → 0 duplicate sends; ack/db failure →
+  durable SENDING → reconcilable UNKNOWN.
+- **Real transport tests**: `src/pair/telegram-transport.ts` extracts the
+  exact transport the bridge runs (`transportTelegramDelivery` with
+  injectable `GovernedTelegramTransport` + `DeliveryBackend`); tests call
+  the same function — no reimplemented test harness.
+- **Regression**: full R2/R1 non-regression — zero default sends,
+  explicit-only, pre-dispatch missing, no post-failure reclassify, no
+  forged metadata, leaf/order rules, remote DEVIN, notifications all PASS.
+
+## Changed files
+
+`src/pair/plan-dataflow.ts` (R3 clause grammar + Unicode boundaries),
+`src/pair/telegram-delivery.ts` (destination + UNSENDABLE + SENDING/SENT/
+UNKNOWN lifecycle + stale reconcile), `src/pair/telegram-transport.ts`
+(NEW — governed transport), `src/pair/mission-control.ts` (mission_origin
+pin + `transitionTelegramDelivery`), `src/pair/mission-control-server.ts`
+(`POST /api/telegram-deliveries/:id/transition`), `src/pair/
+mission-runtime.ts` (`telegramDeliveryDefaultChatId` dep + mint wiring),
+`src/pair/index.ts` (export), `scripts/serve-mission-control.mjs`
+(`PAIR_TG_DELIVERY_CHAT_ID` env), `scripts/telegram-bridge.mjs` (governed
+send + transition backend, `.sent` removed), test file (+23 tests → 48),
+this report.
+
+## Test counts
+
+| Suite | Result |
+|---|---|
+| Focused incident (R1+R2+R3) | **48/48 PASS** (13 R1 + 12 R2 + 23 R3) |
+| pair-ops-telegram-delivery | 3/3 PASS |
+| Phase B / PR#23 / PR#24 / Phase C / Phase D | 123+20+36+51+37 PASS |
+| **Full suite** | **2611 pass / 2 fail env P5 cũ / 15 skipped** (R2 2588 → +23, zero regression) |
+| `npx tsc --noEmit` / `pnpm build` | clean / clean |
+
+## §19 — 8 proofs
+
+1. `read private.csv, create report.txt and send report.txt to Telegram` →
+   manifest = `["report.txt"]` only (§11 A).
+2. `đừng gửi report.txt lên Telegram` → `requested=false`, zero send
+   authority (§12 — all 5 negations).
+3. Allowlist `{12345,67890}` + origin `telegram:12345` → every call goes
+   to `12345` only; `67890` never receives (§13 A).
+4. Definite failure → artifact back to QUEUED + `last_error`, status NOT
+   SENT, zero false ACK, retryable on next poll (§14 A/B/C).
+5. Crash before send after durable SENDING → reconcile
+   `UNKNOWN_SIDE_EFFECT`, zero sends, never claimed SENT (§15 A).
+6. Definite success → `message_id` + `completed_at` + request `SENT`
+   persisted (§14 D).
+7. Restart after SENT → zero duplicate sends (§15 C — exactly 1 network
+   call ever).
+8. All R2 invariants PASS — zero default sends, explicit-only intent,
+   pre-dispatch missing-input, no post-failure reclassify, forged
+   metadata stripped, leaf/order fail-closed, remote DEVIN upload,
+   notification separation (full regression + focused R2 suite).
+
+Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R3_PENDING_INDEPENDENT_AUDIT`
+
+STOP. DO NOT MERGE. DO NOT START PHASE E.

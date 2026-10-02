@@ -131,33 +131,118 @@ export interface TelegramDeliveryIntent {
 
 // The operator must BOTH name Telegram AND use a delivery verb — a bare
 // "telegram" mention (e.g. asking about the app) is not delivery intent.
-const TELEGRAM_MENTION = /\btelegram\b|\btele\b/i;
-const DELIVERY_VERB =
-  /\b(?:send|deliver|forward|share|post|upload|gửi|đẩy|đưa|chuyển|báo|bắn|đăng|đính)\b/i;
+// R3: the verb and the mention must share ONE delivery clause (within
+// CLAUSE_SPAN chars), and only artifacts INSIDE that clause's bounded
+// list grammar authorize files — a file mentioned elsewhere in the goal
+// is never manifested. A negated clause ("do not send", "đừng gửi",
+// "không cần gửi") authorizes nothing: the safe direction is NO SEND.
+// Word boundaries are Unicode-aware lookarounds (NOT \b): JS \b treats
+// only ASCII letters as word chars, so "đừng gửi"/'đẩy lên' never
+// matched the ASCII boundary and negated Vietnamese clauses slipped
+// through as send authority. (?<!L/N/M/_)(?!L/N/M/_) is the real
+// letter boundary for Vietnamese text.
+const TELEGRAM_MENTION_RE = /(?<![\p{L}\p{N}\p{M}_])(?:telegram|tele)(?![\p{L}\p{N}\p{M}_])/giu;
+const DELIVERY_VERB_RE =
+  /(?<![\p{L}\p{N}\p{M}_])(?:send|deliver|forward|share|post|upload|gửi|đẩy|đưa|chuyển|báo|bắn|đăng|đính)(?![\p{L}\p{N}\p{M}_])/giu;
+const NEGATION_RE =
+  /(?<![\p{L}\p{N}\p{M}_])(?:do\s+not|don't|dont|does\s+not|doesn't|doesnt|never|not|no|đừng|dung|không|khong|không\s+cần|khong\s+can|chớ|đừng\s+có|không\s+phải|không\s+bao\s+giờ)(?![\p{L}\p{N}\p{M}_])/iu;
+const CLAUSE_SPAN = 160;
+const CLAUSE_LIST_SPAN = 200;
+const CLAUSE_NEGATION_LOOKBACK = 48;
+// Filler consumed between consecutive artifact names inside a delivery
+// clause: list separators, prepositions, articles, and the Telegram
+// mention itself (covers "gửi telegram file a.txt" and "send a.txt to
+// telegram" orders alike).
+const CLAUSE_FILLER =
+  /^(?:[\s,.;:!?]+|(?:and|or|và|only|file|files|the|a|an|to|into|onto|in|for|with|named|as|keep|keeping|copy|qua|lên|trên|cho|của|các|cái|all|both|it|them|this|that|these|those|via|over|by|bằng|qua|qua\s+chat|telegram|tele)(?![\p{L}\p{N}\p{M}_]))\s*/iu;
+const CLAUSE_PATH =
+  /^(?:outbox\/(?:[\w-]+\/)*[\w-]+(?:\.[\w-]+)?|(?:[\w-]+\/)*[\w-]+\.[A-Za-z0-9]{1,10})(?=$|[^\w/.-])/;
+
+/** Parse the bounded artifact list that follows a delivery verb: only
+ *  path tokens chained by filler/separators count. Path tokens are
+ *  checked BEFORE filler so filler articles ("a", "an") can never eat
+ *  the stem of a filename ("a.txt"). Stops at the first non-filler,
+ *  non-path token — files mentioned outside the clause never enter
+ *  the manifest. */
+function clauseArtifacts(text: string, verbEnd: number): string[] {
+  const out: string[] = [];
+  let pos = verbEnd;
+  const limit = Math.min(text.length, verbEnd + CLAUSE_LIST_SPAN);
+  while (pos < limit && out.length < MAX_MANIFEST_ARTIFACTS) {
+    // Filler first when at a separator/article boundary…
+    let consumed = true;
+    while (consumed && pos < limit) {
+      consumed = false;
+      CLAUSE_FILLER.lastIndex = 0;
+      const f = CLAUSE_FILLER.exec(text.slice(pos, limit));
+      if (f && f[0].length > 0) {
+        // …but never let a filler article swallow a real path token.
+        const p = CLAUSE_PATH.exec(text.slice(pos, limit));
+        if (p) break;
+        pos += f[0].length;
+        consumed = true;
+      }
+    }
+    const p = CLAUSE_PATH.exec(text.slice(pos, limit));
+    if (!p) break;
+    const name = normalizeArtifactPath(p[0]);
+    if (!name) break;
+    if (!out.includes(name)) out.push(name);
+    pos += p[0].length;
+  }
+  return out;
+}
+
+/** A clause is negated when a negation marker governs the verb — bounded
+ *  lookback, cut at the previous sentence/clause boundary so a negation
+ *  in an earlier clause cannot bleed in. */
+function clauseNegated(text: string, verbStart: number): boolean {
+  let seg = text.slice(
+    Math.max(0, verbStart - CLAUSE_NEGATION_LOOKBACK),
+    verbStart,
+  );
+  const cut = seg.search(/[,;.!?\n][^,;.!?\n]*$/);
+  if (cut >= 0) seg = seg.slice(cut + 1);
+  return NEGATION_RE.test(seg);
+}
 
 /**
  * Bounded deterministic intent contract over the effective operator
  * request (the mission goal). Deliberately conservative: unknown
  * phrasings resolve to NOT requested — the safe direction is no send.
+ * A delivery clause = a delivery verb with a Telegram mention within
+ * CLAUSE_SPAN chars, not negated. Artifacts = only the bounded list
+ * inside authorized clauses; ambiguous scope → TEXT mode.
  */
 export function detectTelegramDeliveryIntent(
   goal: unknown,
 ): TelegramDeliveryIntent {
-  const text = String(goal ?? "").slice(0, 4096);
-  if (!TELEGRAM_MENTION.test(text) || !DELIVERY_VERB.test(text)) {
-    return { requested: false, artifacts: [], mode: "TEXT" };
-  }
-  const artifacts: string[] = [];
+  // NFC-normalize so decomposed Vietnamese text ("g\u01B0\u0309i")
+  // matches the same clause grammar as precomposed input.
+  const text = String(goal ?? "").normalize("NFC").slice(0, 4096);
+  const mentions: number[] = [];
   let m: RegExpExecArray | null;
-  PATH_TOKEN.lastIndex = 0;
-  while ((m = PATH_TOKEN.exec(text)) !== null) {
-    const p = normalizeArtifactPath(m[1]);
-    if (p && !artifacts.includes(p)) artifacts.push(p);
+  TELEGRAM_MENTION_RE.lastIndex = 0;
+  while ((m = TELEGRAM_MENTION_RE.exec(text)) !== null) {
+    mentions.push(m.index);
+  }
+  if (!mentions.length) return { requested: false, artifacts: [], mode: "TEXT" };
+  const artifacts: string[] = [];
+  let requested = false;
+  DELIVERY_VERB_RE.lastIndex = 0;
+  while ((m = DELIVERY_VERB_RE.exec(text)) !== null) {
+    const v = m.index;
+    const clause = mentions.some((p) => Math.abs(p - v) <= CLAUSE_SPAN);
+    if (!clause || clauseNegated(text, v)) continue;
+    requested = true;
+    for (const a of clauseArtifacts(text, v + m[0].length)) {
+      if (!artifacts.includes(a)) artifacts.push(a);
+    }
     if (artifacts.length >= MAX_MANIFEST_ARTIFACTS) break;
   }
   return {
-    requested: true,
-    artifacts,
+    requested,
+    artifacts: artifacts.slice(0, MAX_MANIFEST_ARTIFACTS),
     mode: artifacts.length ? "FILES" : "TEXT",
   };
 }

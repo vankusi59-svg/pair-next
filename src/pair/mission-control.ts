@@ -30,6 +30,9 @@ import { assertPlanDataflow } from "./plan-dataflow.js";
 import {
   ackTelegramDelivery as ackTelegramDeliveryEntity,
   pendingTelegramDeliveries,
+  beginDeliveryAttempt as beginDeliveryAttemptEntity,
+  resolveDeliveryAttempt as resolveDeliveryAttemptEntity,
+  holdTelegramDelivery as holdTelegramDeliveryEntity,
 } from "./telegram-delivery.js";
 import {
   assertPreviewWorkspaceAuthority,
@@ -133,6 +136,71 @@ export class MissionControl {
       artifact,
       now: utcnow(),
     });
+  }
+
+  /** R3 §7 — explicit transport lifecycle transition for one artifact
+   *  (or the TEXT request): QUEUED→SENDING (begin), SENDING→SENT |
+   *  QUEUED (definite failure) | UNKNOWN_SIDE_EFFECT (ambiguous), or
+   *  request-level UNSENDABLE hold (destination unresolvable / not
+   *  allowed). Only legal transitions mutate; all others no-op. */
+  transitionTelegramDelivery(
+    deliveryId: string,
+    input: {
+      artifact?: string | null;
+      to?: string;
+      message_id?: string | number;
+      error?: string;
+    },
+  ) {
+    const artifact = input.artifact === undefined ? undefined : input.artifact;
+    switch (String(input.to ?? "")) {
+      case "SENDING":
+        return beginDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          now: utcnow(),
+        });
+      case "SENT":
+        return resolveDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          outcome: "SENT",
+          messageId: input.message_id,
+          now: utcnow(),
+        });
+      case "FAILED":
+        return resolveDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          outcome: "FAILED",
+          error: input.error,
+          now: utcnow(),
+        });
+      case "UNKNOWN":
+        return resolveDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          outcome: "UNKNOWN",
+          error: input.error,
+          now: utcnow(),
+        });
+      case "UNSENDABLE":
+        return holdTelegramDeliveryEntity({
+          store: this.store,
+          deliveryId,
+          reason: String(input.error ?? "destination_not_allowed"),
+          now: utcnow(),
+        });
+      default:
+        throw new PolicyError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION",
+          String(input.to ?? ""),
+        );
+    }
   }
 
   missionDag(missionId: string) {
@@ -658,6 +726,15 @@ export class MissionControl {
       );
     }
     const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    // R3 §3 — pin the canonical mission origin for delivery-destination
+    // binding: the authenticated operator identity (x-operator-id), never
+    // caller-supplied metadata. A telegram:<chatId> origin binds explicit
+    // delivery back to exactly that chat.
+    metadata.mission_origin = {
+      operator_id: input.operator_id ?? null,
+      provenance: "MISSION_INGRESS",
+      pinned_at: utcnow(),
+    };
     const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
     if (boundAgentId) {
       try {
@@ -904,6 +981,15 @@ export class MissionControl {
       }
     }
     const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    // R3 §3 — pin the canonical mission origin for delivery-destination
+    // binding: the authenticated operator identity (x-operator-id), never
+    // caller-supplied metadata. A telegram:<chatId> origin binds explicit
+    // delivery back to exactly that chat.
+    metadata.mission_origin = {
+      operator_id: input.operator_id ?? null,
+      provenance: "MISSION_INGRESS",
+      pinned_at: utcnow(),
+    };
     const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
     if (boundAgentId) {
       // P12: a mission bound to an org_agent pins its agent execution

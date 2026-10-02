@@ -24,7 +24,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { resolveMcToken } from "../dist/pair/index.js";
+import { resolveMcToken, transportTelegramDelivery } from "../dist/pair/index.js";
 
 const TG_TOKEN = process.env.PAIR_TG_BOT_TOKEN ?? "";
 const MC_URL = (process.env.PAIR_MC_URL ?? "http://localhost:8788").replace(/\/+$/, "");
@@ -44,14 +44,34 @@ fs.mkdirSync(path.dirname(HALT_FILE), { recursive: true });
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 
 // ---- Telegram transport ----------------------------------------------------
+// Errors are classified: definite (Telegram API said no → bounded retry)
+// vs unknown (network/parse died inside the call — acceptance ambiguous).
+// Only governed delivery code consumes the classification; notification
+// sends stay best-effort.
 async function tg(method, params = {}) {
-  const res = await fetch(`${TG_API}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(params),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) throw new Error(`tg ${method}: ${res.status} ${JSON.stringify(data).slice(0, 200)}`);
+  let res;
+  try {
+    res = await fetch(`${TG_API}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(params),
+    });
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  if (!res.ok || data.ok === false) {
+    const e = new Error(`tg ${method}: ${res.status} ${JSON.stringify(data).slice(0, 200)}`);
+    e.tgKind = "fail";
+    throw e;
+  }
   return data.result;
 }
 
@@ -75,10 +95,46 @@ async function sendFile(chatId, filePath) {
   fd.append("chat_id", String(chatId));
   fd.append(field, new Blob([fs.readFileSync(filePath)]), name);
   fd.append("caption", `📎 ${name}`);
-  const res = await fetch(`${TG_API}/${method}`, { method: "POST", body: fd });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) throw new Error(`tg ${method}: ${res.status} ${String(data.description ?? "").slice(0, 150)}`);
+  let res;
+  try {
+    res = await fetch(`${TG_API}/${method}`, { method: "POST", body: fd });
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  if (!res.ok || data.ok === false) {
+    const e = new Error(`tg ${method}: ${res.status} ${String(data.description ?? "").slice(0, 150)}`);
+    e.tgKind = "fail";
+    throw e;
+  }
   return data.result;
+}
+
+// R3 §5 — governed transport: PROPAGATES failure classification instead
+// of the best-effort `send()` which swallows it. Definite API failure →
+// {kind:"fail"}; thrown/ambiguous acceptance → {kind:"unknown"}.
+async function governedSend({ chatId, text, filePath, name }) {
+  try {
+    const result = filePath
+      ? await sendFile(chatId, filePath)
+      : await tg("sendMessage", {
+          chat_id: chatId,
+          text: String(text ?? "").slice(0, 4000),
+          disable_web_page_preview: true,
+        });
+    return { kind: "ok", message_id: result?.message_id ?? null };
+  } catch (e) {
+    return e?.tgKind === "fail"
+      ? { kind: "fail", error: String(e).slice(0, 300) }
+      : { kind: "unknown", error: String(e).slice(0, 300) };
+  }
 }
 
 // ---- Mission Control client ------------------------------------------------
@@ -272,58 +328,40 @@ async function notifyLoop(allowList) {
         );
     }
 
-    // Incident R2 — EXPLICIT delivery authority only. The bridge NEVER
-    // scans the outbox: it polls the canonical telegram_delivery_request
-    // queue (minted only by a governed TELEGRAM_DELIVERY task) and
-    // transports EXACTLY the manifested artifacts, acking each one.
-    // Per-file ".sent" rename-BEFORE-send is the crash-safe transport
-    // witness: a crash between rename and send leaves the mark, so the
-    // artifact is acked on the next pass WITHOUT re-send — at-most-once,
-    // never duplicated. A send failure renames back → stays QUEUED.
+    // Incident R2+R3 — EXPLICIT delivery authority only. The bridge
+    // NEVER scans the outbox and NEVER broadcasts: it polls the
+    // canonical telegram_delivery_request queue and transports each
+    // manifested artifact to EXACTLY the request's bound destination
+    // through the shared governed-transport module. Durable lifecycle
+    // QUEUED→SENDING→SENT|FAILED|UNKNOWN_SIDE_EFFECT lives server-side;
+    // no filename ".sent" mark is transport proof. The allowlist is an
+    // authorization check only — a bound destination not in it → hold.
     const deliveries =
       (await mc("GET", "/api/telegram-deliveries?state=QUEUED").catch(() => ({})))?.deliveries ?? [];
     for (const req of deliveries) {
-      const ack = (artifact) =>
-        mc("POST", `/api/telegram-deliveries/${encodeURIComponent(String(req.delivery_id))}/ack`, {
-          artifact: artifact ?? null,
+      const t = (artifact, body) =>
+        mc(
+          "POST",
+          `/api/telegram-deliveries/${encodeURIComponent(String(req.delivery_id))}/transition`,
+          { artifact: artifact ?? null, ...body },
+        );
+      try {
+        await transportTelegramDelivery({
+          request: req,
+          transport: { send: governedSend },
+          isAllowed: (chatId) => allowList.has(String(chatId)),
+          backend: {
+            begin: (a) => t(a, { to: "SENDING" }),
+            sent: (a, ev) => t(a, { to: "SENT", message_id: ev?.message_id ?? null }),
+            failed: (a, err) => t(a, { to: "FAILED", error: err }),
+            unknown: (a, err) => t(a, { to: "UNKNOWN", error: err }),
+            unsendable: (reason) => t(null, { to: "UNSENDABLE", error: reason }),
+          },
+          readText: (p) => fs.readFileSync(p, "utf8"),
+          textPrefix: "📨 ",
         });
-      if (String(req.mode) === "TEXT") {
-        try {
-          const text = `📨 ${trunc(req.text ?? "", 3700)}`;
-          if (text.trim().length > 3) for (const c of allowList) await send(c, text);
-          await ack(null);
-        } catch (e) {
-          console.error("delivery text", req.delivery_id, String(e).slice(0, 120));
-        }
-        continue;
-      }
-      for (const art of req.artifacts ?? []) {
-        if (String(art.state) !== "QUEUED") continue;
-        if (!art.path) continue; // unresolved — stays QUEUED, never guessed
-        const fp = String(art.path);
-        const sentMark = `${fp}.sent`;
-        try {
-          if (fs.existsSync(sentMark)) {
-            await ack(art.name); // witness survives crash — never re-send
-            continue;
-          }
-          fs.renameSync(fp, sentMark);
-          try {
-            const ext = path.extname(fp).toLowerCase();
-            if (ext === ".txt" || ext === ".md") {
-              const content = fs.readFileSync(sentMark, "utf8").trim();
-              if (content) for (const c of allowList) await send(c, `📨 ${art.name}:\n\n${content}`);
-            } else {
-              for (const c of allowList) await sendFile(c, sentMark);
-            }
-          } catch (sendErr) {
-            fs.renameSync(sentMark, fp); // transport failed — back, stays QUEUED
-            throw sendErr;
-          }
-          await ack(art.name);
-        } catch (e) {
-          console.error("delivery artifact", req.delivery_id, art.name, String(e).slice(0, 120));
-        }
+      } catch (e) {
+        console.error("delivery", req.delivery_id, String(e).slice(0, 160));
       }
     }
   } catch (e) {

@@ -47,13 +47,20 @@ import {
   extractTaskDataflow,
   detectTelegramDeliveryIntent,
   pendingTelegramDeliveries,
-  ackTelegramDelivery,
   deliveryRequestId,
+  transportTelegramDelivery,
+  beginDeliveryAttempt,
+  deliveryManifest,
   createPlanPreview as persistPlanPreviewRow,
   TRANSPORT_IN_PROCESS,
   utcnow,
 } from "../pair/index.js";
-import type { TelegramDeliveryIntent } from "../pair/index.js";
+import type {
+  DeliveryBackend,
+  GovernedSendResult,
+  GovernedTelegramTransport,
+  TelegramDeliveryIntent,
+} from "../pair/index.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-dataflow-r1-"));
 let counter = 0;
@@ -297,7 +304,10 @@ class ScriptedAdapter implements ExecutorAdapter {
   }
 }
 
-function makeCtx(name: string, opts: { planner?: (i: never) => unknown } = {}) {
+function makeCtx(
+  name: string,
+  opts: { planner?: (i: never) => unknown; defaultChatId?: string | null } = {},
+) {
   const dir = freshDir(name);
   const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
   const store = new PairEvidenceStore(path.join(dir, "pair.db"));
@@ -326,6 +336,11 @@ function makeCtx(name: string, opts: { planner?: (i: never) => unknown } = {}) {
   const runtime = new MissionRuntime({
     service, gate, router, adapters: adapters as never, scheduler, approvals,
     reconciliation: recon, recovery, planner: planner as never,
+    // R3 §3 — the exactly-one configured default destination for
+    // non-Telegram-origin missions (PAIR_TG_DELIVERY_CHAT_ID wiring).
+    // `null` keeps it unset → delivery requests mint UNSENDABLE.
+    telegramDeliveryDefaultChatId:
+      "defaultChatId" in opts ? opts.defaultChatId ?? undefined : "111",
   });
   const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
   const control = new MissionControl({
@@ -409,7 +424,7 @@ function drive(ctx: ReturnType<typeof makeCtx>, mid: string, max = 120) {
 /* =================== A. RECONCILE — edge injection =================== */
 
 describe("R1 A–G — plan data-flow reconciliation", () => {
-  it("A. incident shape — consumer with empty depends_on gets producer edge + durable evidence", () => {
+  it("A. incident shape — consumer with empty depends_on gets producer edge + durable evidence", async () => {
     const raw = [
       goalTask("T1"),
       producerTask("T2", "analysis.txt", []),
@@ -444,7 +459,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     expect(() => assertPlanDataflow(tasks)).not.toThrow();
   });
 
-  it("remote tasks carry no local artifact I/O — result text flows only through edges", () => {
+  it("remote tasks carry no local artifact I/O — result text flows only through edges", async () => {
     const { tasks } = reconcilePlanDataflow(
       [
         goalTask("T1"),
@@ -478,7 +493,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     ).toThrow(/FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT/);
   });
 
-  it("B. declared producer edge → no duplicate injection, no repair for it", () => {
+  it("B. declared producer edge → no duplicate injection, no repair for it", async () => {
     const { tasks } = reconcilePlanDataflow([
       goalTask("T1"),
       producerTask("T2", "analysis.txt", []),
@@ -491,7 +506,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     ).toBeUndefined();
   });
 
-  it("C. fan-out B‖C → D — both producers wired, B/C stay parallel", () => {
+  it("C. fan-out B‖C → D — both producers wired, B/C stay parallel", async () => {
     const { tasks } = reconcilePlanDataflow([
       goalTask("T1"),
       producerTask("T2", "a.txt", []),
@@ -514,7 +529,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     expect(t4.depends_on).toEqual(["T2", "T3"]);
   });
 
-  it("D. consumed artifact with no producer → FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT", () => {
+  it("D. consumed artifact with no producer → FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT", async () => {
     expect(() =>
       reconcilePlanDataflow([
         goalTask("T1"),
@@ -523,7 +538,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     ).toThrow(/FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT/);
   });
 
-  it("E. two earlier producers of the same artifact → FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_PRODUCER", () => {
+  it("E. two earlier producers of the same artifact → FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_PRODUCER", async () => {
     expect(() =>
       reconcilePlanDataflow([
         producerTask("T2", "dup.txt", []),
@@ -533,7 +548,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     ).toThrow(/FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_PRODUCER/);
   });
 
-  it("F. producer only AFTER the consumer → FAIL_CLOSED_PLAN_DATAFLOW_ORDER (no reorder guess)", () => {
+  it("F. producer only AFTER the consumer → FAIL_CLOSED_PLAN_DATAFLOW_ORDER (no reorder guess)", async () => {
     expect(() =>
       reconcilePlanDataflow([
         consumerTask("T2", "late.txt", []),
@@ -549,7 +564,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     ).toThrow(/FAIL_CLOSED_PLAN_DATAFLOW/);
   });
 
-  it("G. repair is deterministic + idempotent — same input → same tasks → same digest", () => {
+  it("G. repair is deterministic + idempotent — same input → same tasks → same digest", async () => {
     const mk = () => JSON.parse(JSON.stringify([
       goalTask("T1"),
       producerTask("T2", "analysis.txt", []),
@@ -580,7 +595,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
     expect(JSON.stringify(again.tasks)).toBe(JSON.stringify(r1));
   });
 
-  it("absolute / traversal / ambiguous paths are never artifacts", () => {
+  it("absolute / traversal / ambiguous paths are never artifacts", async () => {
     expect(normalizeArtifactPath("/tmp/x.txt")).toBeNull();
     expect(normalizeArtifactPath("../x.txt")).toBeNull();
     expect(normalizeArtifactPath("a/../x.txt")).toBeNull();
@@ -607,7 +622,7 @@ describe("R1 A–G — plan data-flow reconciliation", () => {
 /* =================== H. LEGACY PREVIEW FAIL-CLOSED =================== */
 
 describe("R1 H — legacy READY preview with unsound DAG", () => {
-  it("confirm fails closed: FAIL_CLOSED_PLAN_DATAFLOW_UNSOUND, preview not consumed, no mission", () => {
+  it("confirm fails closed: FAIL_CLOSED_PLAN_DATAFLOW_UNSOUND, preview not consumed, no mission", async () => {
     const ctx = makeCtx("legacy-preview");
     const unsound = [
       producerTask("T1", "analysis.txt", []),
@@ -659,7 +674,7 @@ describe("R1 recovery — proven missing prerequisite → DEPENDENCY_FAILURE", (
       consumerTask("T3", "analysis.txt", ["T2"]),
     ]).tasks;
 
-  it("C+D. consumed artifact absent at settle → DEPENDENCY_FAILURE, no retry burn, no approval", () => {
+  it("C+D. consumed artifact absent at settle → DEPENDENCY_FAILURE, no retry burn, no approval", async () => {
     const ctx = makeCtx("dep-fail");
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "REASONING", "AUTOMATON_TASK_EXECUTION",
@@ -698,7 +713,7 @@ describe("R1 recovery — proven missing prerequisite → DEPENDENCY_FAILURE", (
     ).toHaveLength(0);
   });
 
-  it("A+B. failure without canonical consumes evidence → base class stands (PROCESS_EXIT retries)", () => {
+  it("A+B. failure without canonical consumes evidence → base class stands (PROCESS_EXIT retries)", async () => {
     const ctx = makeCtx("generic-fail");
     const adapter = new ScriptedAdapter("EX_A", ["FILE_OPERATIONS"]);
     registerAdapter(ctx, adapter);
@@ -735,7 +750,7 @@ describe("R1 recovery — proven missing prerequisite → DEPENDENCY_FAILURE", (
 /* =================== E2E — incident mission, repaired plan =================== */
 
 describe("R1 E2E — incident shape converges through the repaired plan", () => {
-  it("planner omits the delivery dep → reconcile injects it pre-preview → delivery waits for producer → exactly once, no retries/approvals", () => {
+  it("planner omits the delivery dep → reconcile injects it pre-preview → delivery waits for producer → exactly once, no retries/approvals", async () => {
     const rawUnsound = [
       goalTask("T1"),
       producerTask("T2", "analysis.txt", ["T1"]),
@@ -809,38 +824,92 @@ describe("R1 E2E — incident shape converges through the repaired plan", () => 
 
 /* =================== R2 — explicit telegram delivery authority =================== */
 
-/** Mirror of the bridge transport loop: poll QUEUED canonical requests,
- *  transport manifested artifacts via the `.sent` witness, ack each —
- *  the ONLY set Telegram may ever receive. */
-function bridgeSend(ctx: ReturnType<typeof makeCtx>): string[] {
+/** R3 — the tests run the REAL governed transport the bridge uses
+ *  (transportTelegramDelivery) with an injectable transport + a backend
+ *  that exercises the same transition endpoint as the HTTP bridge. */
+interface SendCall {
+  chatId: string;
+  text?: string;
+  filePath?: string;
+  name?: string;
+}
+
+function recordingTransport(opts?: {
+  fail?: Set<string>;
+  explode?: Set<string>;
+  onSend?: () => void;
+}): { calls: SendCall[]; transport: GovernedTelegramTransport } {
+  const calls: SendCall[] = [];
+  return {
+    calls,
+    transport: {
+      send: async (a: SendCall): Promise<GovernedSendResult> => {
+        opts?.onSend?.();
+        calls.push({ ...a });
+        const key = a.name ?? "TEXT";
+        if (opts?.explode?.has(key)) throw new Error("socket died mid-send");
+        if (opts?.fail?.has(key)) return { kind: "fail", error: "400 Bad Request: chat not found" };
+        return { kind: "ok", message_id: `MID_${key}` };
+      },
+    },
+  };
+}
+
+/** Server-side backend — identical transition semantics to the bridge's
+ *  HTTP /api/telegram-deliveries/:id/transition calls. */
+function storeBackend(ctx: ReturnType<typeof makeCtx>, req: Record<string, unknown>) {
+  const t = (artifact: string | null | undefined, body: Record<string, unknown>) =>
+    ctx.control.transitionTelegramDelivery(String(req.delivery_id), {
+      artifact,
+      ...body,
+    });
+  return {
+    begin: (a: string | null) => t(a, { to: "SENDING" }),
+    sent: (a: string | null, ev: { message_id?: string | number | null }) =>
+      t(a, { to: "SENT", message_id: ev?.message_id ?? null }),
+    failed: (a: string | null, err: string) => t(a, { to: "FAILED", error: err }),
+    unknown: (a: string | null, err: string) => t(a, { to: "UNKNOWN", error: err }),
+    unsendable: (reason: string) => t(null, { to: "UNSENDABLE", error: reason }),
+  };
+}
+
+async function runTransport(
+  ctx: ReturnType<typeof makeCtx>,
+  opts?: {
+    transport?: GovernedTelegramTransport;
+    allowlist?: Set<string>;
+    backend?: (req: Record<string, unknown>) => DeliveryBackend;
+  },
+): Promise<{ calls: SendCall[]; sent: string[] }> {
+  const recording = recordingTransport();
+  const transport = opts?.transport ?? recording.transport;
+  const isAllowed = opts?.allowlist
+    ? (c: string) => opts.allowlist!.has(c)
+    : () => true;
   const sent: string[] = [];
   for (const req of pendingTelegramDeliveries(ctx.store) as Array<
     Record<string, unknown>
   >) {
-    const ack = (artifact?: string) =>
-      ackTelegramDelivery({
-        store: ctx.store,
-        deliveryId: String(req.delivery_id),
-        artifact,
-        now: utcnow(),
-      });
-    if (String(req.mode) === "TEXT") {
-      sent.push(`TEXT:${String(req.delivery_id)}`);
-      ack();
-      continue;
-    }
-    for (const art of (req.artifacts as Array<Record<string, unknown>>) ?? []) {
-      if (String(art.state) !== "QUEUED" || !art.path) continue;
-      fs.renameSync(String(art.path), `${String(art.path)}.sent`);
-      sent.push(String(art.name));
-      ack(String(art.name));
-    }
+    const backend = opts?.backend ? opts.backend(req) : storeBackend(ctx, req);
+    const r = await transportTelegramDelivery({
+      request: req,
+      transport,
+      isAllowed,
+      backend,
+      readText: (p) => fs.readFileSync(p, "utf8"),
+      textPrefix: "📨 ",
+    });
+    sent.push(...r.sent);
   }
-  return sent;
+  return { calls: recording.calls, sent };
+}
+
+async function bridgeSend(ctx: ReturnType<typeof makeCtx>): Promise<string[]> {
+  return (await runTransport(ctx)).sent;
 }
 
 describe("R2 §13 — default: file/outbox/completion are never send authority", () => {
-  it("A+B+C. mission produces outbox files with no telegram intent → mission COMPLETED notifies, ZERO deliveries, stray file never sent", () => {
+  it("A+B+C. mission produces outbox files with no telegram intent → mission COMPLETED notifies, ZERO deliveries, stray file never sent", async () => {
     const ctx = makeCtx("r2-default");
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION",
@@ -873,10 +942,10 @@ describe("R2 §13 — default: file/outbox/completion are never send authority",
     // Zero canonical send requests — the bridge sees nothing to send.
     expect(ctx.store.list("telegram_delivery_request")).toHaveLength(0);
     expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
-    expect(bridgeSend(ctx)).toEqual([]);
+    expect(await bridgeSend(ctx)).toEqual([]);
   });
 
-  it("planner emits TELEGRAM_DELIVERY without operator intent → plan fails closed, no mission", () => {
+  it("planner emits TELEGRAM_DELIVERY without operator intent → plan fails closed, no mission", async () => {
     expect(() =>
       reconcilePlanDataflow([
         goalTask("T1"),
@@ -902,7 +971,7 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
       { telegramIntent: intent },
     ).tasks;
 
-  it("D. explicit FILES intent → exact manifested artifact sent exactly once, durable evidence", () => {
+  it("D. explicit FILES intent → exact manifested artifact sent exactly once, durable evidence", async () => {
     const ctx = makeCtx("r2-explicit");
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
@@ -911,7 +980,7 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
     registerAdapter(ctx, adapter);
     const m = ctx.control.startMission({
       project_id: ctx.projectId,
-      goal: "write report.txt and send it to telegram",
+      goal: "send report.txt to telegram",
       granted_permissions: ["FILE_WRITE", "FILE_READ"],
       authorized_workspaces: [ctx.workspace],
       metadata: { pinned_plan_tasks: deliveryPlan(FILES_INTENT(["report.txt"])) },
@@ -923,9 +992,9 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
     expect(String(reqs[0].delivery_id)).toBe(
       deliveryRequestId(mid, String((reqs[0]).task_id)),
     );
-    expect(bridgeSend(ctx)).toEqual(["report.txt"]); // manifest only
+    expect(await bridgeSend(ctx)).toEqual(["report.txt"]); // manifest only
     // Durable sent evidence + idempotency: a second poll sends nothing.
-    expect(bridgeSend(ctx)).toEqual([]);
+    expect(await bridgeSend(ctx)).toEqual([]);
     const after = ctx.store.get(
       "telegram_delivery_request",
       String(reqs[0].delivery_id),
@@ -934,7 +1003,7 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
     expect(after.sent_at).toBeTruthy();
   });
 
-  it("E. manifest subset — a.txt+c.png sent, b.txt never sent", () => {
+  it("E. manifest subset — a.txt+c.png sent, b.txt never sent", async () => {
     const ctx = makeCtx("r2-subset");
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
@@ -962,13 +1031,13 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
     });
     const mid = String(m.mission_id);
     expect(drive(ctx, mid)).toBe("COMPLETED");
-    const sent = bridgeSend(ctx).sort();
+    const sent = (await bridgeSend(ctx)).sort();
     expect(sent).toEqual(["a.txt", "c.png"]);
     expect(sent).not.toContain("b.txt");
-    expect(bridgeSend(ctx)).toEqual([]);
+    expect(await bridgeSend(ctx)).toEqual([]);
   });
 
-  it("F. producer still RUNNING → no send; after COMPLETED → exactly one send", () => {
+  it("F. producer still RUNNING → no send; after COMPLETED → exactly one send", async () => {
     const ctx = makeCtx("r2-waits");
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
@@ -978,7 +1047,7 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
     registerAdapter(ctx, adapter);
     const m = ctx.control.startMission({
       project_id: ctx.projectId,
-      goal: "write report.txt and send it to telegram",
+      goal: "send report.txt to telegram",
       granted_permissions: ["FILE_WRITE", "FILE_READ"],
       authorized_workspaces: [ctx.workspace],
       metadata: { pinned_plan_tasks: deliveryPlan(FILES_INTENT(["report.txt"])) },
@@ -1000,17 +1069,17 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
     expect(execsOf(ctx, mid).filter((e) => e.task_id === t2.task_id)).toHaveLength(1);
     expect(execsOf(ctx, mid).filter((e) => e.task_id === t3.task_id)).toHaveLength(0);
     expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
-    expect(bridgeSend(ctx)).toEqual([]); // nothing while producer runs
+    expect(await bridgeSend(ctx)).toEqual([]); // nothing while producer runs
     // Converge: producer finishes, delivery runs once, sends exactly once.
     const state = drive(ctx, mid);
     expect(state).toBe("COMPLETED");
-    expect(bridgeSend(ctx)).toEqual(["report.txt"]);
-    expect(bridgeSend(ctx)).toEqual([]);
+    expect(await bridgeSend(ctx)).toEqual(["report.txt"]);
+    expect(await bridgeSend(ctx)).toEqual([]);
   });
 });
 
 describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
-  it("G+H. remote upload with no intent → zero; upload while RUNNING → zero, COMPLETED → manifested send once", () => {
+  it("G+H. remote upload with no intent → zero; upload while RUNNING → zero, COMPLETED → manifested send once", async () => {
     const ctx = makeCtx("r2-remote");
     const remoteAdapter = new ScriptedAdapter("EX_R", [
       "REMOTE_CLOUD_TASK_EXECUTION",
@@ -1056,16 +1125,16 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
     // The remote upload lands while its producer is still RUNNING.
     fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
     fs.writeFileSync(path.join(ctx.workspace, "outbox/TSK_x-chart.png"), "png");
-    expect(bridgeSend(ctx)).toEqual([]); // upload ≠ send authority
+    expect(await bridgeSend(ctx)).toEqual([]); // upload ≠ send authority
     const state = drive(ctx, mid);
     expect(state).toBe("COMPLETED");
     // After completion the manifested artifact resolves via the unique
     // remote-upload prefix and sends exactly once.
-    expect(bridgeSend(ctx)).toEqual(["chart.png"]);
-    expect(bridgeSend(ctx)).toEqual([]);
+    expect(await bridgeSend(ctx)).toEqual(["chart.png"]);
+    expect(await bridgeSend(ctx)).toEqual([]);
   });
 
-  it("I. TEXT delivery waits for upstream COMPLETED, sends composed text once, invents no artifact dep", () => {
+  it("I. TEXT delivery waits for upstream COMPLETED, sends composed text once, invents no artifact dep", async () => {
     const ctx = makeCtx("r2-text");
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
@@ -1102,15 +1171,15 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
     });
     const mid = String(m.mission_id);
     expect(drive(ctx, mid)).toBe("COMPLETED");
-    const sent = bridgeSend(ctx);
+    const sent = await bridgeSend(ctx);
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatch(/^TEXT:TDR_/);
-    expect(bridgeSend(ctx)).toEqual([]);
+    expect(await bridgeSend(ctx)).toEqual([]);
   });
 });
 
 describe("R2 §9–12 — pre-dispatch prerequisite, post-failure, reserved fields, grammar, leaf", () => {
-  it("K. artifact deleted mid-execution → PROCESS_EXIT stands; next retry's PRE-dispatch check → DEPENDENCY_FAILURE with no new dispatch", () => {
+  it("K. artifact deleted mid-execution → PROCESS_EXIT stands; next retry's PRE-dispatch check → DEPENDENCY_FAILURE with no new dispatch", async () => {
     const ctx = makeCtx("r2-midtask");
     const adapter = new ScriptedAdapter("EX_A", [
       "FILE_OPERATIONS", "REASONING",
@@ -1147,7 +1216,7 @@ describe("R2 §9–12 — pre-dispatch prerequisite, post-failure, reserved fiel
     }
   });
 
-  it("L. forged planner metadata never mints authority — reserved fields stripped and recomputed", () => {
+  it("L. forged planner metadata never mints authority — reserved fields stripped and recomputed", async () => {
     const forged = {
       task_key: "T3", title: "t",
       task_instruction: "do work, then reply DONE.",
@@ -1190,7 +1259,7 @@ describe("R2 §9–12 — pre-dispatch prerequisite, post-failure, reserved fiel
     ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT/);
   });
 
-  it("M. grammar — nearest governing verb attributes produce/consume correctly", () => {
+  it("M. grammar — nearest governing verb attributes produce/consume correctly", async () => {
     const model = (instruction: string) =>
       extractTaskDataflow({
         task_key: "T9",
@@ -1211,7 +1280,7 @@ describe("R2 §9–12 — pre-dispatch prerequisite, post-failure, reserved fiel
     expect(m.produces).toContain("summary.txt");
   });
 
-  it("N. delivery-before-producer / forward edges → FAIL_CLOSED_PLAN_DATAFLOW_ORDER", () => {
+  it("N. delivery-before-producer / forward edges → FAIL_CLOSED_PLAN_DATAFLOW_ORDER", async () => {
     // Producer exists only AFTER the delivery task — no reorder guess.
     expect(() =>
       reconcilePlanDataflow(
@@ -1249,9 +1318,11 @@ describe("R2 §9–12 — pre-dispatch prerequisite, post-failure, reserved fiel
     ).toThrow(/FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT/);
   });
 
-  it("intent detection is deterministic and conservative — mention+verb required", () => {
+  it("intent detection is deterministic and conservative — mention+verb required", async () => {
+    // R3 §1: "send it" names no file in the delivery clause — the file
+    // belongs to the write clause, so scope is ambiguous → TEXT mode.
     expect(detectTelegramDeliveryIntent("write report.txt and send it to telegram")).toEqual({
-      requested: true, artifacts: ["report.txt"], mode: "FILES",
+      requested: true, artifacts: [], mode: "TEXT",
     });
     expect(detectTelegramDeliveryIntent("gửi telegram file a.txt và c.png")).toEqual({
       requested: true, artifacts: ["a.txt", "c.png"], mode: "FILES",
@@ -1268,5 +1339,342 @@ describe("R2 §9–12 — pre-dispatch prerequisite, post-failure, reserved fiel
     expect(detectTelegramDeliveryIntent("báo kết quả qua telegram")).toEqual({
       requested: true, artifacts: [], mode: "TEXT",
     });
+  });
+});
+
+/* =================== R3 — delivery closure =================== */
+
+/** Shared delivery-plan helper: goal + producer + governed delivery. */
+const r3DeliveryPlan = (intent: TelegramDeliveryIntent, file = "report.txt") =>
+  reconcilePlanDataflow(
+    [
+      goalTask("T1"),
+      {
+        task_key: "T2", title: "produce",
+        task_instruction: `write findings to outbox/${file}, then reply DONE.`,
+        required_capabilities: ["REASONING"], depends_on: ["T1"], metadata: {},
+      },
+      deliveryTask("T3", [], file),
+    ],
+    { telegramIntent: intent },
+  ).tasks;
+
+const startDeliveryMission = async (
+  ctx: ReturnType<typeof makeCtx>,
+  opts: { operatorId?: string; intent?: TelegramDeliveryIntent; file?: string; adapter?: ScriptedAdapter },
+) => {
+  const file = opts.file ?? "report.txt";
+  const intent = opts.intent ?? FILES_INTENT([file]);
+  const adapter = opts.adapter ?? new ScriptedAdapter("EX_A", [
+    "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+  ]);
+  adapter.behavior = { T1: "COMPLETE", T2: "WRITE", T3: "COMPLETE" };
+  registerAdapter(ctx, adapter);
+  const planTasks =
+    intent.mode === "TEXT"
+      ? reconcilePlanDataflow(
+          [
+            goalTask("T1"),
+            producerTask("T2", "analysis.txt", ["T1"]),
+            {
+              task_key: "T3", title: "deliver",
+              task_instruction:
+                "compose the upstream results into a report text and deliver it, then reply DONE.",
+              required_capabilities: ["TELEGRAM_DELIVERY"],
+              depends_on: [], metadata: {},
+            },
+          ],
+          { telegramIntent: intent },
+        ).tasks
+      : r3DeliveryPlan(intent, file);
+  const m = ctx.control.startMission({
+    project_id: ctx.projectId,
+    goal: `send ${file} to telegram`,
+    operator_id: opts.operatorId,
+    granted_permissions: ["FILE_WRITE", "FILE_READ"],
+    authorized_workspaces: [ctx.workspace],
+    metadata: { pinned_plan_tasks: planTasks },
+  });
+  const mid = String(m.mission_id);
+  expect(drive(ctx, mid)).toBe("COMPLETED");
+  const reqs = ctx.store.list("telegram_delivery_request");
+  expect(reqs).toHaveLength(1);
+  return { mission: m, mid, request: reqs[0], adapter };
+};
+
+describe("R3 §11 — manifest captures ONLY the delivery clause artifacts", () => {
+  it("A. private.csv read → only report.txt manifests (over-capture root cause)", () => {
+    expect(
+      detectTelegramDeliveryIntent(
+        "read private.csv, create report.txt and send report.txt to Telegram",
+      ),
+    ).toEqual({ requested: true, artifacts: ["report.txt"], mode: "FILES" });
+  });
+  it("B. two consumed inputs → only the manifested output", () => {
+    expect(
+      detectTelegramDeliveryIntent(
+        "read a.csv and b.csv, generate summary.md and send summary.md to Telegram",
+      ),
+    ).toEqual({ requested: true, artifacts: ["summary.md"], mode: "FILES" });
+  });
+  it("C. 'send only a.txt' → manifest is exactly a.txt, never b.txt", () => {
+    expect(
+      detectTelegramDeliveryIntent(
+        "create a.txt and b.txt, send only a.txt to Telegram",
+      ),
+    ).toEqual({ requested: true, artifacts: ["a.txt"], mode: "FILES" });
+  });
+  it("D. multi-artifact clause → both names, no more", () => {
+    expect(
+      detectTelegramDeliveryIntent("send a.txt and c.png to Telegram"),
+    ).toEqual({ requested: true, artifacts: ["a.txt", "c.png"], mode: "FILES" });
+  });
+  it("clause boundary — artifacts after the clause end do not manifest", () => {
+    const i = detectTelegramDeliveryIntent(
+      "send a.txt to telegram, then archive d.txt",
+    );
+    expect(i.artifacts).toEqual(["a.txt"]);
+    expect(detectTelegramDeliveryIntent("archive d.txt and send it to telegram").mode)
+      .toBe("TEXT");
+  });
+});
+
+describe("R3 §12 — negated delivery clauses authorize nothing", () => {
+  for (const g of [
+    "do not send report.txt to Telegram",
+    "don't send report.txt to Telegram",
+    "do not upload report.txt to Telegram",
+    "đừng gửi report.txt lên Telegram",
+    "không cần gửi report.txt lên Telegram",
+  ]) {
+    it(`"${g}" → requested=false, zero artifacts`, () => {
+      const i = detectTelegramDeliveryIntent(g);
+      expect(i.requested).toBe(false);
+      expect(i.artifacts).toEqual([]);
+    });
+  }
+  it("positive nearby phrasings still request", () => {
+    expect(detectTelegramDeliveryIntent("send report.txt to Telegram").requested).toBe(true);
+    expect(detectTelegramDeliveryIntent("gửi report.txt lên Telegram").requested).toBe(true);
+  });
+});
+
+describe("R3 §13 — canonical destination binding", () => {
+  it("A. telegram-origin mission → bound ONLY to the originating chat; allowlist has 2 chats but only origin receives", async () => {
+    const ctx = makeCtx("r3-dest-a");
+    const { request } = await startDeliveryMission(ctx, {
+      operatorId: "telegram:12345",
+    });
+    const dest = request.destination as Record<string, unknown>;
+    expect(dest).toMatchObject({
+      provider: "TELEGRAM", chat_id: "12345", provenance: "MISSION_ORIGIN",
+    });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, {
+      transport: rec.transport,
+      allowlist: new Set(["12345", "67890"]),
+    });
+    expect(sent).toEqual(["report.txt"]);
+    expect(rec.calls.map((c) => c.chatId)).toEqual(["12345"]); // never 67890
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    expect(after.status).toBe("SENT");
+  });
+
+  it("B. bound destination removed from allowlist → durable hold, ZERO sends, no broadcast", async () => {
+    const ctx = makeCtx("r3-dest-b");
+    const { request } = await startDeliveryMission(ctx, {
+      operatorId: "telegram:12345",
+    });
+    const rec = recordingTransport();
+    const { sent, calls } = await runTransport(ctx, {
+      transport: rec.transport,
+      allowlist: new Set(["67890"]), // origin chat no longer allowed
+    });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    void calls;
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    expect(after.status).toBe("UNSENDABLE");
+    expect(String(after.hold_reason)).toContain("NOT_ALLOWED");
+  });
+
+  it("C. non-telegram origin + no configured default → request minted UNSENDABLE, zero sends", async () => {
+    const ctx = makeCtx("r3-dest-c", { defaultChatId: null });
+    const { request } = await startDeliveryMission(ctx, { operatorId: "op1" });
+    expect(request.destination).toBeNull();
+    expect(request.status).toBe("UNSENDABLE");
+    expect(String(request.hold_reason)).toContain("DESTINATION_UNRESOLVED");
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  it("non-telegram origin + configured default → exactly that one chat", async () => {
+    const ctx = makeCtx("r3-dest-d", { defaultChatId: "777" });
+    const { request } = await startDeliveryMission(ctx, { operatorId: "op1" });
+    expect(request.destination).toMatchObject({
+      chat_id: "777", provenance: "CONFIGURED_DEFAULT",
+    });
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport });
+    expect(rec.calls.map((c) => c.chatId)).toEqual(["777"]);
+  });
+});
+
+describe("R3 §14 — governed transport failure semantics", () => {
+  it("A. TEXT definite failure → NOT SENT, no false ACK, failure persisted", async () => {
+    const ctx = makeCtx("r3-fail-text");
+    const { request } = await startDeliveryMission(ctx, { intent: TEXT_INTENT });
+    const rec = recordingTransport({ fail: new Set(["TEXT"]) });
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    expect(after.status).toBe("QUEUED");
+    expect(after.message_id).toBeUndefined();
+    expect(String(after.last_error)).toContain("chat not found");
+    // Retry on the next poll — bounded retryable state.
+    const { sent: retry } = await runTransport(ctx, { transport: recordingTransport().transport });
+    expect(retry).toHaveLength(1);
+  });
+
+  it("B. .txt artifact sendMessage fails → artifact stays QUEUED, no ACK", async () => {
+    const ctx = makeCtx("r3-fail-txt");
+    const { request } = await startDeliveryMission(ctx, {});
+    const rec = recordingTransport({ fail: new Set(["report.txt"]) });
+    await runTransport(ctx, { transport: rec.transport });
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    expect(after.status).toBe("QUEUED");
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("QUEUED");
+    expect(art.message_id).toBeUndefined();
+    expect(String(art.last_error)).toContain("chat not found");
+  });
+
+  it("C. binary sendDocument/sendPhoto fails → NOT SENT", async () => {
+    const ctx = makeCtx("r3-fail-bin");
+    const { request } = await startDeliveryMission(ctx, { file: "chart.png" });
+    const rec = recordingTransport({ fail: new Set(["chart.png"]) });
+    await runTransport(ctx, { transport: rec.transport });
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("QUEUED");
+    expect(after.status).toBe("QUEUED");
+    expect(rec.calls[0].filePath).toBeTruthy(); // document path, not text
+  });
+
+  it("D. definite success → SENT + message_id + completed evidence persisted", async () => {
+    const ctx = makeCtx("r3-ok");
+    const { request } = await startDeliveryMission(ctx, {});
+    const { sent } = await runTransport(ctx);
+    expect(sent).toEqual(["report.txt"]);
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    expect(after.status).toBe("SENT");
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("SENT");
+    expect(art.message_id).toBe("MID_report.txt");
+    expect(art.completed_at).toBeTruthy();
+    // No '.sent' filename witness exists anywhere.
+    const outbox = path.join(ctx.workspace, "outbox");
+    const stray = fs.readdirSync(outbox).filter((f) => f.endsWith(".sent"));
+    expect(stray).toEqual([]);
+  });
+});
+
+describe("R3 §15 — crash windows", () => {
+  it("A. crash before send after durable SENDING → reconcile UNKNOWN_SIDE_EFFECT, zero sends, never claimed SENT", async () => {
+    const ctx = makeCtx("r3-crash-a");
+    const { request } = await startDeliveryMission(ctx, {});
+    // Persist SENDING, then "process dies" before the network call.
+    beginDeliveryAttempt({
+      store: ctx.store, deliveryId: String(request.delivery_id),
+      artifact: "report.txt", now: utcnow(),
+    });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0); // no blind resend of the ambiguous slot
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(String(art.unknown_reason)).toContain("stale_sending");
+    expect(after.status).not.toBe("SENT");
+  });
+
+  it("B. crash after acceptance before ACK → explicit ambiguous path, not filename-based SENT", async () => {
+    const ctx = makeCtx("r3-crash-b");
+    const { request } = await startDeliveryMission(ctx, {});
+    // Transport succeeds but the SENT transition "dies" — backend throws.
+    const flaky = {
+      ...storeBackend(ctx, request),
+      sent: () => {
+        throw new Error("db write lost mid-ack");
+      },
+    };
+    const rec = recordingTransport();
+    await expect(
+      transportTelegramDelivery({
+        request: pendingTelegramDeliveries(ctx.store)[0],
+        transport: rec.transport,
+        isAllowed: () => true,
+        backend: flaky,
+        readText: (p) => fs.readFileSync(p, "utf8"),
+      }),
+    ).rejects.toThrow("db write lost");
+    expect(rec.calls).toHaveLength(1); // send DID happen once
+    // Artifact left SENDING → next poll reconciles to UNKNOWN — never
+    // re-sent, never declared SENT by a filename mark.
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(1); // no second send
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("UNKNOWN_SIDE_EFFECT");
+    const outbox = path.join(ctx.workspace, "outbox");
+    expect(fs.readdirSync(outbox).filter((f) => f.endsWith(".sent"))).toEqual([]);
+  });
+
+  it("C. crash after SENT persisted → restart sends nothing again", async () => {
+    const ctx = makeCtx("r3-crash-c");
+    const { request } = await startDeliveryMission(ctx, {});
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport });
+    const before = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    expect(before.status).toBe("SENT");
+    // "Restart": poll again — SENT artifacts never re-send.
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(1);
+  });
+
+  it("D. ack/db failure after transport → attempt reconcilable, no .sent reliance", async () => {
+    const ctx = makeCtx("r3-crash-d");
+    const { request } = await startDeliveryMission(ctx, {});
+    const flaky = {
+      ...storeBackend(ctx, request),
+      sent: () => {
+        throw new Error("connection reset");
+      },
+    };
+    const rec = recordingTransport();
+    await expect(
+      transportTelegramDelivery({
+        request: pendingTelegramDeliveries(ctx.store)[0],
+        transport: rec.transport,
+        isAllowed: () => true,
+        backend: flaky,
+      }),
+    ).rejects.toThrow("connection reset");
+    const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("SENDING"); // durable in-flight attempt
+    await runTransport(ctx, { transport: rec.transport }); // reconcile pass
+    const reconciled = ctx.store.get(
+      "telegram_delivery_request", String(request.delivery_id),
+    );
+    expect(
+      (reconciled.artifacts as Array<Record<string, unknown>>)[0].state,
+    ).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(rec.calls).toHaveLength(1); // exactly one network send ever
   });
 });

@@ -151,6 +151,10 @@ export interface MissionRuntimeDeps {
    * taskTimeoutSeconds() — this field must already be a positive int.
    */
   taskTimeoutSeconds?: number;
+  /** R3 §3 — exactly-one configured default Telegram destination for
+   *  non-Telegram-origin missions. Unset → such delivery requests mint
+   *  UNSENDABLE (fail closed, never broadcast). */
+  telegramDeliveryDefaultChatId?: string;
 }
 
 const DEFAULT_TASK_TIMEOUT = 120;
@@ -785,6 +789,7 @@ export class MissionRuntime {
             outboxDir: `${String(project.root_location)}/outbox`,
             workspace: ws,
             now: utcnow(),
+            defaultChatId: this.deps.telegramDeliveryDefaultChatId,
           });
         }
         return;

@@ -11,6 +11,7 @@ export * from "./artifact-validation.js";
 export * from "./proposal.js";
 export * from "./plan-dataflow.js";
 export * from "./telegram-delivery.js";
+export * from "./telegram-transport.js";
 export * from "./executor-registry.js";
 export * from "./route-registry.js";
 export * from "./route-selector.js";

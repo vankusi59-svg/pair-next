@@ -361,6 +361,25 @@ export function createMissionControlServer(
         );
         return void json(res, 200, { delivery: reqEntity });
       }
+      // R3 §7 — explicit transport lifecycle: QUEUED→SENDING→SENT |
+      // FAILED | UNKNOWN_SIDE_EFFECT per artifact (or the TEXT request),
+      // plus the UNSENDABLE destination hold. Replaces filename-based
+      // send proof entirely.
+      const transitionMatch = p.match(
+        /^\/api\/telegram-deliveries\/([^/]+)\/transition$/,
+      );
+      if (method === "POST" && transitionMatch) {
+        const reqEntity = c.transitionTelegramDelivery(
+          decodeURIComponent(transitionMatch[1]),
+          {
+            artifact: body.artifact === undefined ? undefined : body.artifact,
+            to: body.to === undefined ? undefined : String(body.to),
+            message_id: body.message_id,
+            error: body.error === undefined ? undefined : String(body.error),
+          } as never,
+        );
+        return void json(res, 200, { delivery: reqEntity });
+      }
 
       // Broker fetch: remote executor releases a named credential. R3 §2:
       // the worker credential is a TASK-SCOPED capability (x-broker-capability)
