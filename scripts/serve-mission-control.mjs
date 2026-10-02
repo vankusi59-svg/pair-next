@@ -90,6 +90,9 @@ import {
   reconcilePlanDataflow,
   detectTelegramDeliveryIntent,
   telegramDeliveryMaxAttempts,
+  telegramDeliveryStaleAfterMs,
+  telegramDeliveryTransportTimeoutMs,
+  assertTelegramDeliveryTiming,
   modelRoleOf,
   MODEL_ROLE,
   utcnow,
@@ -115,6 +118,15 @@ const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_M
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
 const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
 const cfgDevinBlockedGraceMs = devinBlockedGraceMs(); // PAIR_DEVIN_BLOCKED_GRACE_MS (ms, 5000..1800000) — blocked-clock only, never the task budget
+// R6 §3-4 — canonical Telegram delivery timing: SENDING lease > transport
+// timeout, enforced fail-closed here at startup.
+const cfgTgStaleAfterMs = telegramDeliveryStaleAfterMs();       // PAIR_TG_DELIVERY_STALE_AFTER_MS (ms, 5000..600000)
+const cfgTgTransportTimeoutMs = telegramDeliveryTransportTimeoutMs(); // PAIR_TG_DELIVERY_TRANSPORT_TIMEOUT_MS (ms, 1000..300000)
+assertTelegramDeliveryTiming({
+  staleAfterMs: cfgTgStaleAfterMs,
+  transportTimeoutMs: cfgTgTransportTimeoutMs,
+});
+console.log(`TG_DELIVERY_TIMING: stale_after=${cfgTgStaleAfterMs}ms > transport_timeout=${cfgTgTransportTimeoutMs}ms`);
 console.log(`EXEC_TIMEOUT: canonical governed budget PAIR_TASK_TIMEOUT_S=${cfgTaskTimeoutS}s → task.timeout (all executors) | Devin blockedGraceMs=${cfgDevinBlockedGraceMs} (separate blocked clock)`);
 
 // Phase A — MC token: explicit env > persistent file > generated 256-bit
@@ -454,6 +466,9 @@ const control = new MissionControl({
   schedules,
   costHaltFile: COST_HALT_FILE,
   planPreviewTtlSeconds: cfgPreviewTtlS,
+  // R6 §3 — canonical SENDING lease for the delivery read path
+  // (PAIR_TG_DELIVERY_STALE_AFTER_MS, bounded, validated at startup).
+  telegramDeliveryStaleAfterMs: cfgTgStaleAfterMs,
 });
 const business = new BusinessLayer({ store, control, schedules });
 const workforce = new WorkforceService({ store, business });

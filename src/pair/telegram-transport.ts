@@ -58,6 +58,26 @@ function extname(name: string): string {
   return i >= 0 ? name.slice(i).toLowerCase() : "";
 }
 
+/** R6 §6 — defense-in-depth process-local non-overlap guard: a trigger
+ *  firing while the previous cycle is still running is skipped. The
+ *  canonical correctness mechanism remains the durable SENDING lease —
+ *  this only prevents two bridge poll cycles from racing inside one
+ *  process. */
+export function makeNonReentrant(
+  fn: () => Promise<unknown> | unknown,
+): () => Promise<void> {
+  let running = false;
+  return async () => {
+    if (running) return;
+    running = true;
+    try {
+      await fn();
+    } finally {
+      running = false;
+    }
+  };
+}
+
 /**
  * Transport ONE canonical delivery request end to end. `request` is a
  * pendingTelegramDeliveries projection (QUEUED artifacts carry resolved
@@ -74,6 +94,10 @@ export async function transportTelegramDelivery(args: {
   readText?: (absPath: string) => string;
   /** Payload prefix — keeps the bridge's 📨 convention in one place. */
   textPrefix?: string;
+  /** R6 §4/§7 — canonical bounded transport timeout: a send still
+   *  in-flight past this is classified UNKNOWN (acceptance ambiguous),
+   *  never definite failure, never silent success. */
+  timeoutMs?: number;
 }): Promise<{ sent: string[]; held: boolean }> {
   const req = args.request;
   const dest = (
@@ -133,7 +157,24 @@ export async function transportTelegramDelivery(args: {
     name?: string;
   }): Promise<GovernedSendResult> => {
     try {
-      return await args.transport.send({ chatId, ...a });
+      const p = args.transport.send({ chatId, ...a });
+      const tmo = args.timeoutMs;
+      if (Number.isFinite(tmo) && (tmo as number) > 0) {
+        // R6 §7 — bounded transport timeout: a call that outlives the
+        // canonical deadline is UNKNOWN_SIDE_EFFECT (Telegram may have
+        // accepted), never a definite failure and never a blind retry.
+        const r = await Promise.race<GovernedSendResult | { timeout: true }>([
+          p,
+          new Promise<{ timeout: true }>((res) =>
+            setTimeout(() => res({ timeout: true }), tmo),
+          ),
+        ]);
+        if ("timeout" in r) {
+          return { kind: "unknown", error: `transport_timeout:${tmo}ms` };
+        }
+        return r;
+      }
+      return await p;
     } catch (e) {
       // A thrown transport error means acceptance is unknown — the send
       // may have landed. UNKNOWN_SIDE_EFFECT, never false SENT and

@@ -606,3 +606,118 @@ asserts request `UNKNOWN_SIDE_EFFECT`).
 Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R5_PENDING_INDEPENDENT_AUDIT`
 
 STOP. DO NOT MERGE. DO NOT START PHASE E.
+
+---
+
+# R6 — Fresh-vs-stale SENDING concurrency closure (audit `pasted-<R6 mandate>`)
+
+Base: audited R5 HEAD `c073be9` · same PR #27 · narrow concurrency
+closure — no redesign of R1–R5.
+
+## §1-3 — lease-based stale reconciliation (BLOCKER) → closed
+
+Root cause: `reconcileStaleDeliveryAttempts` treated EVERY durable
+`SENDING` as crashed — a 5s-overlapping bridge poll could flip a
+legitimately in-flight send to UNKNOWN_SIDE_EFFECT mid-request, so the
+subsequent SENT transition then failed-closed and a real send was
+falsely declared ambiguous.
+
+`reconcileStaleDeliveryAttempts(store, now, staleAfterMs)` is now
+LEASE-based on `attempt_started_at`: `age < staleAfterMs` → slot stays
+`SENDING` (progressable, never reconciled, never re-projected);
+`age >= staleAfterMs` → `UNKNOWN_SIDE_EFFECT` + request-aggregate
+recompute (R5 semantics preserved). Canonical setting:
+`PAIR_TG_DELIVERY_STALE_AFTER_MS` — bounded 5_000..600_000, default
+60_000ms, parsed through env-config, injected via
+`MissionControlDeps.telegramDeliveryStaleAfterMs` →
+`pendingTelegramDeliveries`/`reconcile` (default fallback
+`TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS` = 60_000).
+
+## §4/§7 — bounded transport timeout → closed
+
+`PAIR_TG_DELIVERY_TRANSPORT_TIMEOUT_MS` — bounded 1_000..300_000,
+default 25_000ms, env-config. `transportTelegramDelivery({timeoutMs})`
+races the governed send against the deadline: timeout after dispatch
+began → `{kind:"unknown"}` → `UNKNOWN_SIDE_EFFECT` — never definite
+failure, never blind retry, never silent success.
+`assertTelegramDeliveryTiming` enforces TRANSPORT_TIMEOUT < STALE_AFTER
+fail-closed at serve startup; bridge reads the canonical parse and
+passes `timeoutMs`.
+
+## §6 — bridge non-overlap (defense in depth) → closed
+
+`makeNonReentrant(fn)` (telegram-transport.ts, exported): a second
+interval trigger while a cycle is in flight is skipped; the DURABLE
+SENDING lease remains the canonical correctness mechanism. Bridge:
+`setInterval(() => void notifyGuarded(), 5000)`.
+
+## §8 — missing/malformed attempt_started_at → closed
+
+SENDING slot with missing or non-parseable `attempt_started_at` →
+`UNKNOWN_SIDE_EFFECT` with durable reason
+`stale_sending_missing_started_at` — never a fabricated fresh
+timestamp, never a retry.
+
+## §9-14 — required tests (5 new, 70 total)
+
+| Test | Result |
+|---|---|
+| §9+§11 fresh SENDING + overlapping poll → stays SENDING, zero re-projection, SENT 1001 then lands | PASS |
+| §10 SENDING older than lease → UNKNOWN_SIDE_EFFECT — TEXT and FILE identical, empty projection, zero resend | PASS |
+| §12 transport timeout → bounded UNKNOWN_SIDE_EFFECT, not definite failure, zero retry | PASS |
+| §13 missing/malformed attempt_started_at → UNKNOWN + `stale_sending_missing_started_at` | PASS |
+| §14 `makeNonReentrant` — overlapping triggers run one cycle at a time | PASS |
+
+Pre-existing crash-window tests (R3 A/B/D, R4 §9/§10, R5 §11) updated
+to poll PAST the lease — they now prove the same reconciles are still
+correct once attempts are actually stale.
+
+## §15 — R1-R5 preserved: all 70 focused tests pass.
+
+## §16 — regression (Node 22)
+
+| Surface | Result |
+|---|---|
+| Focused incident (R1–R6) | **70/70 PASS** |
+| **Full suite** | **2633 pass / 2 fail env P5 cũ / 15 skipped** (R5 2628 → +5, zero regression — same 2 pre-existing DSH/CODEX probe env fails) |
+| `npx tsc --noEmit` / `pnpm build` | clean / clean |
+
+## §17 — changed files (R6)
+
+- `src/pair/env-config.ts` — `TG_DELIVERY_STALE_AFTER_MS` +
+  `TG_DELIVERY_TRANSPORT_TIMEOUT_MS` (bounded, defaults 60s/25s) +
+  `assertTelegramDeliveryTiming` (timeout < stale, fail closed).
+- `src/pair/telegram-delivery.ts` — lease-based reconcile
+  (`attempt_started_at` + staleAfterMs; missing/malformed stamp →
+  UNKNOWN `stale_sending_missing_started_at`);
+  `pendingTelegramDeliveries(store, now, staleAfterMs)`;
+  `TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS`.
+- `src/pair/telegram-transport.ts` — `timeoutMs` (timeout →
+  `{kind:"unknown"}`) + `makeNonReentrant`.
+- `src/pair/mission-control.ts` — `telegramDeliveryStaleAfterMs` dep →
+  read path.
+- `scripts/serve-mission-control.mjs` — parse + assert timing +
+  dep wiring.
+- `scripts/telegram-bridge.mjs` — transport `timeoutMs` +
+  non-overlapping notify loop.
+- `src/__tests__/pair-planner-dataflow-incident.test.ts` — +5 R6 tests;
+  crash-window polls moved past the lease; R5 helpers hoisted module-level.
+- `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_REPORT.md` — this section.
+
+## §18 — explicit proofs
+
+1. Fresh SENDING + second poll → slot remains SENDING, request stays
+   QUEUED, zero re-projection (§9).
+2. Fresh SENDING then persists SENT with message_id=1001 (§9).
+3. SENDING older than lease → UNKNOWN_SIDE_EFFECT — TEXT and FILE same
+   rule, aggregate recomputed, empty projection (§10).
+4. Transport timeout → UNKNOWN_SIDE_EFFECT bounded, never definite
+   failure, zero retry (§12).
+5. Missing/malformed attempt_started_at → UNKNOWN +
+   `stale_sending_missing_started_at` (§13).
+6. notifyLoop triggers never overlap (`makeNonReentrant`, §14).
+7. All 65 R1–R5 focused tests PASS (70/70); full suite zero regression.
+
+Final classification: `PAIR_NEXT_PLANNER_DATAFLOW_INCIDENT_REMEDIATION_R6_PENDING_INDEPENDENT_AUDIT`
+
+STOP. DO NOT MERGE. DO NOT START PHASE E.

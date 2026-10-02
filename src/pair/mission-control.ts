@@ -68,6 +68,10 @@ export interface MissionControlDeps {
   costHaltFile?: string;
   /** Phase B: mission_plan_preview TTL in seconds (default 1800). */
   planPreviewTtlSeconds?: number;
+  /** R6 §3 — canonical SENDING lease (PAIR_TG_DELIVERY_STALE_AFTER_MS
+   *  wiring): a SENDING payload is reconciled to UNKNOWN only after
+   *  now - attempt_started_at exceeds this — never on a fresh poll. */
+  telegramDeliveryStaleAfterMs?: number;
 }
 
 function requireOperator(operatorId: string | undefined): string {
@@ -122,7 +126,11 @@ export class MissionControl {
    *  bridge never scans the outbox itself — a file in outbox/ is storage,
    *  never a send instruction. */
   telegramDeliveries(state?: string): Array<Record<string, unknown>> {
-    const pending = pendingTelegramDeliveries(this.store);
+    const pending = pendingTelegramDeliveries(
+      this.store,
+      undefined,
+      this.deps.telegramDeliveryStaleAfterMs,
+    );
     return state ? pending.filter((r) => r.status === state) : pending;
   }
 

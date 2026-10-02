@@ -55,6 +55,7 @@ import {
   createPlanPreview as persistPlanPreviewRow,
   TRANSPORT_IN_PROCESS,
   utcnow,
+  makeNonReentrant,
 } from "../pair/index.js";
 import type {
   DeliveryBackend,
@@ -1621,12 +1622,14 @@ describe("R3 §15 — crash windows", () => {
     const ctx = makeCtx("r3-crash-a");
     const { request } = await startDeliveryMission(ctx, {});
     // Persist SENDING, then "process dies" before the network call.
+    // R6 — reconciliation is lease-based: the next poll at T0+61s
+    // (past the 60s lease) classifies the crashed attempt UNKNOWN.
     beginDeliveryAttempt({
       store: ctx.store, deliveryId: String(request.delivery_id),
-      artifact: "report.txt", now: utcnow(),
+      artifact: "report.txt", now: T,
     });
     const rec = recordingTransport();
-    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    const { sent } = await runTransport(ctx, { transport: rec.transport, now: plus(61) });
     expect(sent).toEqual([]);
     expect(rec.calls).toHaveLength(0); // no blind resend of the ambiguous slot
     const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
@@ -1641,7 +1644,7 @@ describe("R3 §15 — crash windows", () => {
     const { request } = await startDeliveryMission(ctx, {});
     // Transport succeeds but the SENT transition "dies" — backend throws.
     const flaky = {
-      ...storeBackend(ctx, request),
+      ...storeBackend(ctx, request, T),
       sent: () => {
         throw new Error("db write lost mid-ack");
       },
@@ -1649,7 +1652,7 @@ describe("R3 §15 — crash windows", () => {
     const rec = recordingTransport();
     await expect(
       transportTelegramDelivery({
-        request: pendingTelegramDeliveries(ctx.store)[0],
+        request: pendingTelegramDeliveries(ctx.store, T)[0],
         transport: rec.transport,
         isAllowed: () => true,
         backend: flaky,
@@ -1657,9 +1660,9 @@ describe("R3 §15 — crash windows", () => {
       }),
     ).rejects.toThrow("db write lost");
     expect(rec.calls).toHaveLength(1); // send DID happen once
-    // Artifact left SENDING → next poll reconciles to UNKNOWN — never
-    // re-sent, never declared SENT by a filename mark.
-    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    // Artifact left SENDING → a poll past the 60s lease reconciles to
+    // UNKNOWN — never re-sent, never declared SENT by a filename mark.
+    const { sent } = await runTransport(ctx, { transport: rec.transport, now: plus(61) });
     expect(sent).toEqual([]);
     expect(rec.calls).toHaveLength(1); // no second send
     const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
@@ -1686,7 +1689,7 @@ describe("R3 §15 — crash windows", () => {
     const ctx = makeCtx("r3-crash-d");
     const { request } = await startDeliveryMission(ctx, {});
     const flaky = {
-      ...storeBackend(ctx, request),
+      ...storeBackend(ctx, request, T),
       sent: () => {
         throw new Error("connection reset");
       },
@@ -1694,7 +1697,7 @@ describe("R3 §15 — crash windows", () => {
     const rec = recordingTransport();
     await expect(
       transportTelegramDelivery({
-        request: pendingTelegramDeliveries(ctx.store)[0],
+        request: pendingTelegramDeliveries(ctx.store, T)[0],
         transport: rec.transport,
         isAllowed: () => true,
         backend: flaky,
@@ -1703,7 +1706,7 @@ describe("R3 §15 — crash windows", () => {
     const after = ctx.store.get("telegram_delivery_request", String(request.delivery_id));
     const art = (after.artifacts as Array<Record<string, unknown>>)[0];
     expect(art.state).toBe("SENDING"); // durable in-flight attempt
-    await runTransport(ctx, { transport: rec.transport }); // reconcile pass
+    await runTransport(ctx, { transport: rec.transport, now: plus(61) }); // reconcile pass past lease
     const reconciled = ctx.store.get(
       "telegram_delivery_request", String(request.delivery_id),
     );
@@ -1721,20 +1724,21 @@ describe("R4 §9-10 — TEXT crash windows are identical to FILES", () => {
     const id = String(request.delivery_id);
     // Durable SENDING on the TEXT payload, then the "process dies"
     // before the network call — Telegram may have accepted.
-    ctx.control.transitionTelegramDelivery(id, { artifact: null, to: "SENDING" });
+    ctx.control.transitionTelegramDelivery(id, { artifact: null, to: "SENDING", now: T });
     const sending = ctx.store.get("telegram_delivery_request", id);
     expect(sending.text_state).toBe("SENDING");
     const rec = recordingTransport();
-    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    // Poll past the 60s SENDING lease → crashed attempt reconciles.
+    const { sent } = await runTransport(ctx, { transport: rec.transport, now: plus(61) });
     expect(sent).toEqual([]);
     expect(rec.calls).toHaveLength(0); // ambiguous slot — no blind resend
     const after = ctx.store.get("telegram_delivery_request", id);
     expect(after.text_state).toBe("UNKNOWN_SIDE_EFFECT");
     expect(String(after.unknown_reason)).toContain("stale_sending");
     // R5 §3/§11 — stale reconcile recomputes the REQUEST aggregate too.
-    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
+    expect(pendingTelegramDeliveries(ctx.store, plus(61))).toHaveLength(0);
     expect(after.status).toBe("UNKNOWN_SIDE_EFFECT");
-    const { sent: again } = await runTransport(ctx, { transport: rec.transport });
+    const { sent: again } = await runTransport(ctx, { transport: rec.transport, now: plus(61) });
     expect(again).toEqual([]);
     expect(rec.calls).toHaveLength(0);
   });
@@ -1745,7 +1749,7 @@ describe("R4 §9-10 — TEXT crash windows are identical to FILES", () => {
     const id = String(request.delivery_id);
     // Network DID send (ok + message_id) but the SENT transition dies.
     const flaky = {
-      ...storeBackend(ctx, request),
+      ...storeBackend(ctx, request, T),
       sent: () => {
         throw new Error("db write lost mid-sent");
       },
@@ -1753,14 +1757,15 @@ describe("R4 §9-10 — TEXT crash windows are identical to FILES", () => {
     const rec = recordingTransport();
     await expect(
       transportTelegramDelivery({
-        request: pendingTelegramDeliveries(ctx.store)[0],
+        request: pendingTelegramDeliveries(ctx.store, T)[0],
         transport: rec.transport,
         isAllowed: () => true,
         backend: flaky,
       }),
     ).rejects.toThrow("db write lost");
     expect(rec.calls).toHaveLength(1); // the send happened once
-    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    // A poll past the 60s lease reconciles the ack-lost attempt.
+    const { sent } = await runTransport(ctx, { transport: rec.transport, now: plus(61) });
     expect(sent).toEqual([]);
     expect(rec.calls).toHaveLength(1); // zero resend
     const after = ctx.store.get("telegram_delivery_request", id);
@@ -1951,42 +1956,6 @@ describe("R4 §13-14 — /ack bypass removed + strict transition matrix", () => 
 });
 
 describe("R5 — aggregate request status + strict evidence + unresolved convergence", () => {
-  /** Mint a canonical multi-artifact FILES request directly (the same
-   *  authority path the runtime uses — task carries the PAIR-stamped
-   *  manifest). */
-  function mintFilesRequest(
-    ctx: ReturnType<typeof makeCtx>,
-    names: string[],
-  ): Record<string, unknown> {
-    fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
-    const req = mintTelegramDeliveryRequest({
-      store: ctx.store,
-      mission: { mission_id: "M_R5", metadata: {} },
-      task: {
-        task_id: "T3",
-        metadata: {
-          pair_telegram_delivery: {
-            requested: true, mode: "FILES", artifacts: names,
-          },
-        },
-      },
-      execution: { execution_id: "E_R5" },
-      outboxDir: path.join(ctx.workspace, "outbox"),
-      workspace: ctx.workspace,
-      now: utcnow(),
-      defaultChatId: "111",
-    });
-    expect(req).toBeTruthy();
-    return req as Record<string, unknown>;
-  }
-  const artOf = (ctx: ReturnType<typeof makeCtx>, id: string, name: string) =>
-    (ctx.store.get("telegram_delivery_request", id).artifacts as Array<Record<string, unknown>>)
-      .find((a) => a.name === name)!;
-  const reqOf = (ctx: ReturnType<typeof makeCtx>, id: string) =>
-    ctx.store.get("telegram_delivery_request", id);
-  const T = "2026-01-02T00:00:00.000Z";
-  const plus = (sec: number) => new Date(Date.parse(T) + sec * 1000).toISOString();
-
   it("§7. mixed SENT + FAILED_DELIVERY → request FAILED_DELIVERY (never dead QUEUED), zero further sends", async () => {
     const ctx = makeCtx("r5-mixed-sf");
     const req = mintFilesRequest(ctx, ["a.txt", "b.txt"]);
@@ -2071,14 +2040,15 @@ describe("R5 — aggregate request status + strict evidence + unresolved converg
     const req = mintFilesRequest(ctx, ["a.txt"]);
     fs.writeFileSync(path.join(ctx.workspace, "outbox", "a.txt"), "A");
     const id = String(req.delivery_id);
-    ctx.control.transitionTelegramDelivery(id, { artifact: "a.txt", to: "SENDING" });
+    ctx.control.transitionTelegramDelivery(id, { artifact: "a.txt", to: "SENDING", now: T });
     expect(artOf(ctx, id, "a.txt").state).toBe("SENDING");
-    // "Restart": the stale reconcile inside the pending projection.
-    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
+    // "Restart" at T0+61s: the lease-based stale reconcile inside the
+    // pending projection flips slot AND request to UNKNOWN_SIDE_EFFECT.
+    expect(pendingTelegramDeliveries(ctx.store, plus(61))).toHaveLength(0);
     expect(artOf(ctx, id, "a.txt").state).toBe("UNKNOWN_SIDE_EFFECT");
     expect(reqOf(ctx, id).status).toBe("UNKNOWN_SIDE_EFFECT");
     const rec = recordingTransport();
-    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    const { sent } = await runTransport(ctx, { transport: rec.transport, now: plus(61) });
     expect(sent).toEqual([]);
     expect(rec.calls).toHaveLength(0);
   });
@@ -2129,5 +2099,174 @@ describe("R5 — aggregate request status + strict evidence + unresolved converg
     );
     expect(reqOf(ctx, id).status).toBe("FAILED_DELIVERY"); // not dead QUEUED
     expect(pendingTelegramDeliveries(ctx.store, plus(600))).toHaveLength(0);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// R6 — fresh-vs-stale SENDING concurrency closure (§9-§14).
+// A durable SENDING slot is ambiguous ONLY once attempt_started_at is older
+// than the canonical lease — a poll that sees a FRESH SENDING must leave it
+// untouched and un-projected. Transport timeout → UNKNOWN. Missing stamp →
+// UNKNOWN (fail safe). Bridge notify loop never overlaps itself.
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Mint a canonical multi-artifact FILES request directly (the same
+ *  authority path the runtime uses — task carries the PAIR-stamped
+ *  manifest). */
+function mintFilesRequest(
+  ctx: ReturnType<typeof makeCtx>,
+  names: string[],
+): Record<string, unknown> {
+  fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
+  const req = mintTelegramDeliveryRequest({
+    store: ctx.store,
+    mission: { mission_id: "M_R5", metadata: {} },
+    task: {
+      task_id: "T3",
+      metadata: {
+        pair_telegram_delivery: {
+          requested: true, mode: "FILES", artifacts: names,
+        },
+      },
+    },
+    execution: { execution_id: "E_R5" },
+    outboxDir: path.join(ctx.workspace, "outbox"),
+    workspace: ctx.workspace,
+    now: utcnow(),
+    defaultChatId: "111",
+  });
+  expect(req).toBeTruthy();
+  return req as Record<string, unknown>;
+}
+const artOf = (ctx: ReturnType<typeof makeCtx>, id: string, name: string) =>
+  (ctx.store.get("telegram_delivery_request", id).artifacts as Array<Record<string, unknown>>)
+    .find((a) => a.name === name)!;
+const reqOf = (ctx: ReturnType<typeof makeCtx>, id: string) =>
+  ctx.store.get("telegram_delivery_request", id);
+const T = "2026-01-02T00:00:00.000Z";
+const plus = (sec: number) => new Date(Date.parse(T) + sec * 1000).toISOString();
+
+describe("incident R6 — fresh-vs-stale SENDING", () => {
+  it("§9+§11. fresh SENDING + overlapping poll → stays SENDING, nothing projected, then SENT 1001 lands", async () => {
+    const ctx = makeCtx("r6-fresh");
+    const { request } = await startDeliveryMission(ctx, { intent: TEXT_INTENT });
+    const id = String(request.delivery_id);
+    // Poll A: QUEUED → SENDING at T0 (network call "still running").
+    ctx.control.transitionTelegramDelivery(id, { artifact: null, to: "SENDING", now: T });
+    // Poll B at T0+5s (lease 60s): must NOT flip A's fresh slot and must
+    // NOT project it for a second send.
+    expect(pendingTelegramDeliveries(ctx.store, plus(5), 60_000)).toHaveLength(0);
+    let req = reqOf(ctx, id);
+    expect(req.text_state).toBe("SENDING");
+    expect(req.status).toBe("QUEUED"); // still progressable
+    // Poll A resolves with real acceptance evidence → SENT succeeds —
+    // the concurrent poll did not corrupt the in-flight attempt.
+    ctx.control.transitionTelegramDelivery(id, {
+      artifact: null, to: "SENT", message_id: 1001, now: plus(8),
+    });
+    req = reqOf(ctx, id);
+    expect(req.text_state).toBe("SENT");
+    expect(req.message_id).toBe(1001);
+    expect(req.status).toBe("SENT");
+  });
+
+  it("§10. SENDING older than the lease → UNKNOWN_SIDE_EFFECT (TEXT and FILE), empty projection, zero resend", async () => {
+    // TEXT
+    const ctxT = makeCtx("r6-stale-text");
+    const { request: rt } = await startDeliveryMission(ctxT, { intent: TEXT_INTENT });
+    const idT = String(rt.delivery_id);
+    ctxT.control.transitionTelegramDelivery(idT, { artifact: null, to: "SENDING", now: T });
+    expect(pendingTelegramDeliveries(ctxT.store, plus(61), 60_000)).toHaveLength(0);
+    let reqT = reqOf(ctxT, idT);
+    expect(reqT.text_state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(reqT.status).toBe("UNKNOWN_SIDE_EFFECT");
+    const recT = recordingTransport();
+    const { sent: sentT } = await runTransport(ctxT, { transport: recT.transport, now: plus(61) });
+    expect(sentT).toEqual([]);
+    expect(recT.calls).toHaveLength(0); // zero automatic resend
+    // FILE — same rule
+    const ctxF = makeCtx("r6-stale-file");
+    const rf = mintFilesRequest(ctxF, ["a.txt"]);
+    fs.writeFileSync(path.join(ctxF.workspace, "outbox", "a.txt"), "A");
+    const idF = String(rf.delivery_id);
+    ctxF.control.transitionTelegramDelivery(idF, { artifact: "a.txt", to: "SENDING", now: T });
+    expect(pendingTelegramDeliveries(ctxF.store, plus(61), 60_000)).toHaveLength(0);
+    expect(artOf(ctxF, idF, "a.txt").state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(reqOf(ctxF, idF).status).toBe("UNKNOWN_SIDE_EFFECT");
+  });
+
+  it("§12. transport timeout → bounded UNKNOWN_SIDE_EFFECT, never definite failure, zero retry", async () => {
+    const ctx = makeCtx("r6-timeout");
+    const { request } = await startDeliveryMission(ctx, { intent: TEXT_INTENT });
+    const id = String(request.delivery_id);
+    const hanging: GovernedTelegramTransport = {
+      send: () => new Promise<GovernedSendResult>(() => {}), // never resolves
+    };
+    const projected = pendingTelegramDeliveries(ctx.store, T);
+    expect(projected).toHaveLength(1);
+    const t0 = Date.now();
+    const r = await transportTelegramDelivery({
+      request: projected[0] as Record<string, unknown>,
+      transport: hanging,
+      isAllowed: () => true,
+      backend: storeBackend(ctx, request, T),
+      readText: (p) => fs.readFileSync(p, "utf8"),
+      timeoutMs: 50,
+    });
+    // Bounded — the call returned ~immediately, not after the send hung.
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(r.sent).toEqual([]);
+    const req = reqOf(ctx, id);
+    expect(req.text_state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(req.status).toBe("UNKNOWN_SIDE_EFFECT");
+    // And nothing is ever auto-resendable out of UNKNOWN.
+    expect(pendingTelegramDeliveries(ctx.store, plus(600))).toHaveLength(0);
+  });
+
+  it("§13. SENDING with missing/malformed attempt_started_at → UNKNOWN_SIDE_EFFECT, fail safe", async () => {
+    const ctx = makeCtx("r6-no-stamp");
+    const req = mintFilesRequest(ctx, ["a.txt"]);
+    const id = String(req.delivery_id);
+    // Forge a malformed durable state: SENDING slot with NO timestamp.
+    const row = ctx.store.get("telegram_delivery_request", id) as Record<string, unknown>;
+    (row.artifacts as Array<Record<string, unknown>>)[0].state = "SENDING";
+    ctx.store.put("telegram_delivery_request", id, row);
+    expect(pendingTelegramDeliveries(ctx.store, plus(1))).toHaveLength(0);
+    const art = artOf(ctx, id, "a.txt");
+    expect(art.state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(art.unknown_reason).toBe("stale_sending_missing_started_at");
+    expect(reqOf(ctx, id).status).toBe("UNKNOWN_SIDE_EFFECT");
+    // Malformed (non-parseable) stamp — same fail-safe.
+    const ctx2 = makeCtx("r6-bad-stamp");
+    const req2 = mintFilesRequest(ctx2, ["a.txt"]);
+    const id2 = String(req2.delivery_id);
+    const row2 = ctx2.store.get("telegram_delivery_request", id2) as Record<string, unknown>;
+    const slot2 = (row2.artifacts as Array<Record<string, unknown>>)[0];
+    slot2.state = "SENDING";
+    slot2.attempt_started_at = "not-a-timestamp";
+    ctx2.store.put("telegram_delivery_request", id2, row2);
+    expect(pendingTelegramDeliveries(ctx2.store, plus(1))).toHaveLength(0);
+    expect(artOf(ctx2, id2, "a.txt").state).toBe("UNKNOWN_SIDE_EFFECT");
+    expect(artOf(ctx2, id2, "a.txt").unknown_reason).toBe("stale_sending_missing_started_at");
+  });
+
+  it("§14. notify-loop guard: overlapping triggers never run two cycles concurrently", async () => {
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    let ran = 0;
+    const guarded = makeNonReentrant(async () => {
+      ran += 1;
+      inFlight += 1;
+      maxConcurrent = Math.max(maxConcurrent, inFlight);
+      await new Promise((r) => setTimeout(r, 40));
+      inFlight -= 1;
+    });
+    // Three interval ticks while the first cycle is unresolved.
+    await Promise.all([guarded(), guarded(), guarded()]);
+    expect(ran).toBe(1);
+    expect(maxConcurrent).toBe(1);
+    // After it settles, the next tick runs normally.
+    await guarded();
+    expect(ran).toBe(2);
   });
 });

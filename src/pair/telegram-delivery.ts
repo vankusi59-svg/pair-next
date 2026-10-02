@@ -150,6 +150,10 @@ export const TELEGRAM_DELIVERY_DEFAULT_MAX_ATTEMPTS = 3;
 export function telegramDeliveryBackoffSeconds(attemptCount: number): number {
   return Math.min(60, Math.max(1, attemptCount) * 5);
 }
+/** R6 §3 — canonical default SENDING lease: a durable SENDING slot is
+ *  stale only once now - attempt_started_at exceeds this; overridden by
+ *  the PAIR_TG_DELIVERY_STALE_AFTER_MS env wiring (bounded, validated). */
+export const TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS = 60_000;
 
 export function deliveryRequestId(missionId: string, taskId: string): string {
   return `TDR_${digest(`telegram_delivery:${missionId}:${taskId}`).slice(0, 24)}`;
@@ -578,16 +582,39 @@ export function resolveDeliveryAttempt(args: {
  * UNKNOWN_SIDE_EFFECT with durable evidence; never auto-resend, never
  * claim SENT (R3 §7D + R4 §1 — TEXT and FILES identical).
  */
+/**
+ * R6 — a durable SENDING slot is ambiguous ONLY once its lease
+ * `attempt_started_at` is older than `staleAfterMs`. A FRESH SENDING
+ * (overlapping poll while the network call is still in flight) is
+ * NEVER reconciled — reconcile neither corrupts it nor projects it
+ * for a second send. A SENDING slot with a missing/malformed
+ * `attempt_started_at` is unrecoverably ambiguous →
+ * UNKNOWN_SIDE_EFFECT (`stale_sending_missing_started_at`).
+ */
 export function reconcileStaleDeliveryAttempts(
   store: PairEvidenceStore,
   now: string,
+  staleAfterMs: number = TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS,
 ): void {
+  const nowMs = Date.parse(now);
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
     if (req.status !== "QUEUED") continue;
     let dirty = false;
     const next = { ...req } as Record<string, unknown>;
     for (const { slot, apply } of slots(req, next)) {
-      if (slot.state === "SENDING") {
+      if (slot.state !== "SENDING") {
+        apply();
+        continue;
+      }
+      const startedMs = Date.parse(String(slot.attempt_started_at ?? ""));
+      if (!Number.isFinite(startedMs)) {
+        dirty = true;
+        slot.state = "UNKNOWN_SIDE_EFFECT";
+        delete slot.attempt_id;
+        delete slot.attempt_number;
+        delete slot.attempt_started_at;
+        slot.unknown_reason = "stale_sending_missing_started_at";
+      } else if (nowMs - startedMs >= staleAfterMs) {
         dirty = true;
         slot.state = "UNKNOWN_SIDE_EFFECT";
         delete slot.attempt_id;
@@ -595,6 +622,7 @@ export function reconcileStaleDeliveryAttempts(
         delete slot.attempt_started_at;
         slot.unknown_reason = `stale_sending_reconciled:${now}`;
       }
+      // else: fresh SENDING — legitimately in flight, leave untouched.
       apply();
     }
     if (dirty) {
@@ -617,9 +645,10 @@ export function reconcileStaleDeliveryAttempts(
 export function pendingTelegramDeliveries(
   store: PairEvidenceStore,
   now?: string,
+  staleAfterMs: number = TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS,
 ): Array<Record<string, unknown>> {
   const ts = now ?? new Date().toISOString();
-  reconcileStaleDeliveryAttempts(store, ts);
+  reconcileStaleDeliveryAttempts(store, ts, staleAfterMs);
   const out: Array<Record<string, unknown>> = [];
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
     if (String(req.status) !== "QUEUED") continue;

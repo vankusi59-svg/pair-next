@@ -160,3 +160,58 @@ export function telegramDeliveryMaxAttempts(
     env,
   );
 }
+
+/** R6 §3 — canonical stale lease for a durable SENDING payload: a
+ *  SENDING slot is only "stale" once now - attempt_started_at exceeds
+ *  this. Fresh SENDING is never reconciled. */
+export const TG_DELIVERY_STALE_AFTER_MS = {
+  name: "PAIR_TG_DELIVERY_STALE_AFTER_MS",
+  defaultValue: 60_000,
+  bounds: { min: 5_000, max: 600_000, unit: "ms" },
+} as const;
+
+export function telegramDeliveryStaleAfterMs(
+  env: EnvLike = process.env as EnvLike,
+): number {
+  return readPositiveIntEnv(
+    TG_DELIVERY_STALE_AFTER_MS.name,
+    TG_DELIVERY_STALE_AFTER_MS.defaultValue,
+    TG_DELIVERY_STALE_AFTER_MS.bounds,
+    env,
+  );
+}
+
+/** R6 §4 — canonical bounded timeout for governed Telegram transport
+ *  calls (sendMessage/sendPhoto/sendDocument). A timeout after dispatch
+ *  began is UNKNOWN acceptance, never definite failure. */
+export const TG_DELIVERY_TRANSPORT_TIMEOUT_MS = {
+  name: "PAIR_TG_DELIVERY_TRANSPORT_TIMEOUT_MS",
+  defaultValue: 25_000,
+  bounds: { min: 1_000, max: 300_000, unit: "ms" },
+} as const;
+
+export function telegramDeliveryTransportTimeoutMs(
+  env: EnvLike = process.env as EnvLike,
+): number {
+  return readPositiveIntEnv(
+    TG_DELIVERY_TRANSPORT_TIMEOUT_MS.name,
+    TG_DELIVERY_TRANSPORT_TIMEOUT_MS.defaultValue,
+    TG_DELIVERY_TRANSPORT_TIMEOUT_MS.bounds,
+    env,
+  );
+}
+
+/** R6 §4 — TRANSPORT_TIMEOUT_MS must be strictly < STALE_AFTER_MS:
+ *  otherwise a send could still be legitimately in-flight when the
+ *  reconciler declares it stale. Fail closed at startup. */
+export function assertTelegramDeliveryTiming(args: {
+  staleAfterMs: number;
+  transportTimeoutMs: number;
+}): void {
+  if (!(args.transportTimeoutMs < args.staleAfterMs)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_CONFIG_INVALID",
+      `PAIR_TG_DELIVERY_TRANSPORT_TIMEOUT_MS (${args.transportTimeoutMs}) must be < PAIR_TG_DELIVERY_STALE_AFTER_MS (${args.staleAfterMs})`,
+    );
+  }
+}

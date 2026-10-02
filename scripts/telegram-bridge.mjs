@@ -24,7 +24,16 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { resolveMcToken, transportTelegramDelivery } from "../dist/pair/index.js";
+import {
+  resolveMcToken,
+  transportTelegramDelivery,
+  telegramDeliveryTransportTimeoutMs,
+  makeNonReentrant,
+} from "../dist/pair/index.js";
+// R6 §4/§7 — canonical bounded transport timeout (PAIR_TG_DELIVERY_
+// TRANSPORT_TIMEOUT_MS). A send outliving it is UNKNOWN_SIDE_EFFECT —
+// never definite failure, never a blind resend.
+const TG_TRANSPORT_TIMEOUT_MS = telegramDeliveryTransportTimeoutMs();
 
 const TG_TOKEN = process.env.PAIR_TG_BOT_TOKEN ?? "";
 const MC_URL = (process.env.PAIR_MC_URL ?? "http://localhost:8788").replace(/\/+$/, "");
@@ -368,6 +377,7 @@ async function notifyLoop(allowList) {
           },
           readText: (p) => fs.readFileSync(p, "utf8"),
           textPrefix: "📨 ",
+          timeoutMs: TG_TRANSPORT_TIMEOUT_MS,
         });
       } catch (e) {
         console.error("delivery", req.delivery_id, String(e).slice(0, 160));
@@ -399,7 +409,13 @@ async function main() {
   console.log(`telegram-bridge: allow file ${ALLOW_FILE}; halt lever ${HALT_FILE}`);
 
   let offset = 0;
-  setInterval(() => notifyLoop(allowedChats()), 5000);
+  // R6 §6 — defense-in-depth: an interval tick while the previous
+  // notifyLoop is still in flight is skipped. The DURABLE SENDING lease
+  // (attempt_started_at + PAIR_TG_DELIVERY_STALE_AFTER_MS) remains the
+  // canonical correctness mechanism — this only prevents two poll
+  // cycles racing inside this process.
+  const notifyGuarded = makeNonReentrant(() => notifyLoop(allowedChats()));
+  setInterval(() => void notifyGuarded(), 5000);
   for (;;) {
     let updates;
     try {
