@@ -36,6 +36,8 @@ import {
   ReconciliationService,
   RecoveryController,
   classifyFailure,
+  IntegrityError,
+  isSqliteContentionError,
   TRANSPORT_IN_PROCESS,
 } from "../pair/index.js";
 import type { ExecutorAdapter } from "../pair/adapter.js";
@@ -1924,5 +1926,107 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
         .list("recovery_decision")
         .filter((d) => d.mission_id === mid).length,
     ).toBe(decisionsBefore + 1); // effect completes exactly once
+  });
+
+  it("P1. R7 selective catch — non-contention integrity error during the contention re-read propagates fail-closed", () => {
+    const ctx = makeCtx("r7p");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    const T0 = "2999-01-01T00:00:00Z";
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    ctx.approvals.exercise(approvalId, {});
+    const { approvals2, store2, runtime2 } = makeRuntime2(ctx, []);
+
+    // B's CANONICAL RE-READ inside the contention handler fails with a
+    // non-contention governance error. First read (initial claim row)
+    // still succeeds — WAL readers are unaffected by A's writer lock.
+    const origTryGet = store2.tryGet.bind(store2);
+    let reads = 0;
+    store2.tryGet = (entityType: string, entityId: string) => {
+      if (
+        entityType === APPROVAL_EXERCISE_ENTITY &&
+        entityId === exerciseId &&
+        ++reads >= 2
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
+          entityId,
+        );
+      }
+      return origTryGet(entityType, entityId);
+    };
+
+    let threw: unknown = null;
+    ctx.store.immediate(() => {
+      // A holds the writer lock → B's claim CAS write contends (BUSY) →
+      // contention handler re-reads → HASH_MISMATCH must propagate.
+      try {
+        approvals2.claimExercise(approvalId, "MRI_B", T0);
+      } catch (e) {
+        threw = e;
+      }
+    });
+    expect(threw).toBeInstanceOf(IntegrityError);
+    expect(String((threw as Error).message)).toContain(
+      "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
+    );
+    // No ownership fabricated, no epoch advanced, APRE canonical.
+    const apre = ctx.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(apre.owner_id ?? null).toBeNull();
+    expect(Number(apre.claim_epoch)).toBe(0);
+    expect(String(apre.state)).toBe("APPLYING");
+
+    // Runtime-level: a non-contention integrity error in APRE
+    // convergence is NOT swallowed as contention — it propagates through
+    // the existing fail-closed path (tick throws as before R6).
+    store2.tryGet = (entityType: string, entityId: string) => {
+      if (entityType === APPROVAL_EXERCISE_ENTITY) {
+        throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", entityId);
+      }
+      return origTryGet(entityType, entityId);
+    };
+    let tickThrew: unknown = null;
+    try {
+      runtime2.tick(mid, T0);
+    } catch (e) {
+      tickThrew = e;
+    }
+    expect(tickThrew).toBeInstanceOf(IntegrityError);
+    expect(String((tickThrew as Error).message)).toContain(
+      "FAIL_CLOSED_ENTITY_HASH_MISMATCH",
+    );
+  });
+
+  it("P2. R7 detector — only SQLITE_BUSY*/SQLITE_LOCKED* classify as contention", () => {
+    const withCode = (code: string) =>
+      Object.assign(new Error("sqlite error"), { code });
+    // Positive cases — the driver's actual contention shapes.
+    expect(isSqliteContentionError(withCode("SQLITE_BUSY"))).toBe(true);
+    expect(isSqliteContentionError(withCode("SQLITE_BUSY_TIMEOUT"))).toBe(
+      true,
+    );
+    expect(isSqliteContentionError(withCode("SQLITE_BUSY_SNAPSHOT"))).toBe(
+      true,
+    );
+    expect(isSqliteContentionError(withCode("SQLITE_LOCKED"))).toBe(true);
+    expect(isSqliteContentionError(withCode("SQLITE_LOCKED_SHAREDCACHE"))).toBe(
+      true,
+    );
+    expect(
+      isSqliteContentionError(new Error("database is locked")),
+    ).toBe(true); // message fallback
+    // Negative cases — fail closed, never contention.
+    for (const e of [
+      new IntegrityError("FAIL_CLOSED_VERSION_CONFLICT", "x"),
+      new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", "x"),
+      withCode("SQLITE_CORRUPT"),
+      withCode("SQLITE_SCHEMA"),
+      new Error("generic programming defect"),
+      "SQLITE_BUSY", // not an Error object
+      null,
+      undefined,
+    ]) {
+      expect(isSqliteContentionError(e)).toBe(false);
+    }
   });
 });

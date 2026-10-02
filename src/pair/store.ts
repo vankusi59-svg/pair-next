@@ -55,7 +55,10 @@ export function isSqliteContentionError(e: unknown): boolean {
     return true;
   }
   const msg = String((e as { message?: unknown }).message ?? "");
-  return /SQLITE_(BUSY|LOCKED)/.test(msg);
+  // better-sqlite3's canonical lock-contention messages also surface
+  // without a `code` (e.g. re-wrapped errors): "database is locked" is
+  // the SQLITE_BUSY text and "database table is locked" SQLITE_LOCKED.
+  return /SQLITE_(BUSY|LOCKED)|database (is|table is) locked/i.test(msg);
 }
 
 export class PairEvidenceStore {

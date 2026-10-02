@@ -358,8 +358,16 @@ export class ApprovalQueue {
       let fresh: Record<string, unknown> | null = null;
       try {
         fresh = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
-      } catch {
-        fresh = null; // even the re-read contended — canonical stays
+      } catch (error) {
+        // R7 — selective catch: ONLY further contention may be swallowed
+        // here. A non-contention failure (hash mismatch, schema,
+        // corruption, governance IntegrityError) must propagate
+        // fail-closed — never be converted into a contention result.
+        if (isSqliteContentionError(error)) {
+          fresh = null; // even the re-read contended — canonical stays
+        } else {
+          throw error;
+        }
       }
       return {
         row: fresh,

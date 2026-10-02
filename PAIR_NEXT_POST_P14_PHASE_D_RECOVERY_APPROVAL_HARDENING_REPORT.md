@@ -533,3 +533,21 @@ All R0–R5 closures — R5 atomic fence+mutation intact (verify stays inside th
 `PAIR_NEXT_PHASE_D_R6_PENDING_INDEPENDENT_AUDIT`
 
 **STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+## Phase D R7 — Selective SQLite Contention Catch Closure
+
+**Commit:** R7 commit on `devin/post-p14-phase-d-recovery-approval-hardening` (after `91199bd`)
+
+### Broad-catch removal
+`claimExercise.contended()` previously used `try { fresh = tryGet(...) } catch { fresh = null }` — a NON-contention governance error during the canonical re-read was swallowed into a contention result. Now selective: `catch (e) { isSqliteContentionError(e) ? fresh = null : throw }`. All other R6 surfaces (`exercise`, `runFencedExerciseStage`, `markExercisedApplied`) were already selective; no new broad catches added.
+
+### Final detection rule
+`isSqliteContentionError`: `code` startsWith `SQLITE_BUSY`/`SQLITE_LOCKED`, OR message matches `SQLITE_(BUSY|LOCKED)` / "database is locked" / "database table is locked" (better-sqlite3's canonical contention text when re-wrapped without `code`). Positives: SQLITE_BUSY, SQLITE_BUSY_TIMEOUT, SQLITE_BUSY_SNAPSHOT, SQLITE_LOCKED, SQLITE_LOCKED_SHAREDCACHE, plain "database is locked". Negatives: FAIL_CLOSED_VERSION_CONFLICT, FAIL_CLOSED_ENTITY_HASH_MISMATCH, SQLITE_CORRUPT, SQLITE_SCHEMA, generic Error, non-Error objects — all fail closed.
+
+### Evidence
+- **P1**: writer lock held (conn A) → B's `claimExercise` CAS BUSY → re-read throws `FAIL_CLOSED_ENTITY_HASH_MISMATCH` → **propagates** (claimExercise throws; no ownership fabricated; APRE epoch0 ownerless unchanged). Runtime-level: same error inside tick → tick throws through existing fail-closed path — NOT swallowed as contention.
+- **P2**: detector positive/negative matrix (all pass).
+- R6 N/O contention tests still green — semantics unchanged (`fenced` vs `contended` distinct).
+
+### Gates
+- Focused suite: **37/37** · P23/P24/C/B: **230 pass** · Full: **2563 pass / 2 fail (same env P5 probes) / 15 skipped** (R6 2561/2/15 — +2, zero regression) · `tsc --noEmit` clean · `pnpm build` clean.
