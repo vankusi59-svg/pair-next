@@ -87,6 +87,12 @@ import {
   settlePlannerAttempt,
   finishPlannerRun,
   validatePlanProposal,
+  reconcilePlanDataflow,
+  detectTelegramDeliveryIntent,
+  telegramDeliveryMaxAttempts,
+  telegramDeliveryStaleAfterMs,
+  telegramDeliveryTransportTimeoutMs,
+  assertTelegramDeliveryTiming,
   modelRoleOf,
   MODEL_ROLE,
   utcnow,
@@ -112,6 +118,15 @@ const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_M
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
 const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
 const cfgDevinBlockedGraceMs = devinBlockedGraceMs(); // PAIR_DEVIN_BLOCKED_GRACE_MS (ms, 5000..1800000) — blocked-clock only, never the task budget
+// R6 §3-4 — canonical Telegram delivery timing: SENDING lease > transport
+// timeout, enforced fail-closed here at startup.
+const cfgTgStaleAfterMs = telegramDeliveryStaleAfterMs();       // PAIR_TG_DELIVERY_STALE_AFTER_MS (ms, 5000..600000)
+const cfgTgTransportTimeoutMs = telegramDeliveryTransportTimeoutMs(); // PAIR_TG_DELIVERY_TRANSPORT_TIMEOUT_MS (ms, 1000..300000)
+assertTelegramDeliveryTiming({
+  staleAfterMs: cfgTgStaleAfterMs,
+  transportTimeoutMs: cfgTgTransportTimeoutMs,
+});
+console.log(`TG_DELIVERY_TIMING: stale_after=${cfgTgStaleAfterMs}ms > transport_timeout=${cfgTgTransportTimeoutMs}ms`);
 console.log(`EXEC_TIMEOUT: canonical governed budget PAIR_TASK_TIMEOUT_S=${cfgTaskTimeoutS}s → task.timeout (all executors) | Devin blockedGraceMs=${cfgDevinBlockedGraceMs} (separate blocked clock)`);
 
 // Phase A — MC token: explicit env > persistent file > generated 256-bit
@@ -309,6 +324,18 @@ const canonicalizeLlmTasks = (rawTasks, goal) => {
       },
     };
   }
+  // Incident R1/R2 — deterministic artifact data-flow reconciliation at
+  // THE canonical seam, before validatePlanProposal + plan_digest: a
+  // task consuming an artifact must depend on its unique earlier
+  // producer (missing edges injected with durable repair evidence);
+  // unbound/ambiguous/backward producers throw FAIL_CLOSED_PLAN_DATAFLOW_*
+  // so the failover winner-check treats the raw plan as PLAN_INVALID.
+  // The telegram delivery authority is the operator REQUEST alone: the
+  // planner cannot mint a TELEGRAM_DELIVERY task unless the pinned
+  // canonical intent says the goal asked for it (R2 §2).
+  reconcilePlanDataflow(tasks, {
+    telegramIntent: detectTelegramDeliveryIntent(String(goal ?? "")),
+  });
   return tasks;
 };
 const planner = (input) => {
@@ -376,6 +403,12 @@ const runtime = new MissionRuntime({
   service, gate, router, adapters, scheduler, approvals, reconciliation: recon, recovery,
   planner,
   taskTimeoutSeconds: cfgTaskTimeoutS,
+  // R3 §3 — exactly-one configured default destination for missions that
+  // did NOT originate from a Telegram chat. Unset/ambiguous → explicit
+  // deliveries mint UNSENDABLE (fail closed, never broadcast).
+  telegramDeliveryDefaultChatId: process.env.PAIR_TG_DELIVERY_CHAT_ID || undefined,
+  // R4 §3 — canonical delivery retry ceiling (bounded 1..10, default 3).
+  telegramDeliveryMaxAttempts: telegramDeliveryMaxAttempts(),
 });
 const sup = new MissionSupervisor(service, runtime, recovery, recon);
 // Extraction sweep: every executor_execution whose result was collected folds
@@ -433,6 +466,9 @@ const control = new MissionControl({
   schedules,
   costHaltFile: COST_HALT_FILE,
   planPreviewTtlSeconds: cfgPreviewTtlS,
+  // R6 §3 — canonical SENDING lease for the delivery read path
+  // (PAIR_TG_DELIVERY_STALE_AFTER_MS, bounded, validated at startup).
+  telegramDeliveryStaleAfterMs: cfgTgStaleAfterMs,
 });
 const business = new BusinessLayer({ store, control, schedules });
 const workforce = new WorkforceService({ store, business });

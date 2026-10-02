@@ -26,6 +26,13 @@ import { projectRoutableModels } from "./model-routable.js";
 import { canonicalRiskCeiling, canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
+import { assertPlanDataflow } from "./plan-dataflow.js";
+import {
+  pendingTelegramDeliveries,
+  beginDeliveryAttempt as beginDeliveryAttemptEntity,
+  resolveDeliveryAttempt as resolveDeliveryAttemptEntity,
+  holdTelegramDelivery as holdTelegramDeliveryEntity,
+} from "./telegram-delivery.js";
 import {
   assertPreviewWorkspaceAuthority,
   createPlanPreview as persistPlanPreview,
@@ -61,6 +68,10 @@ export interface MissionControlDeps {
   costHaltFile?: string;
   /** Phase B: mission_plan_preview TTL in seconds (default 1800). */
   planPreviewTtlSeconds?: number;
+  /** R6 §3 — canonical SENDING lease (PAIR_TG_DELIVERY_STALE_AFTER_MS
+   *  wiring): a SENDING payload is reconciled to UNKNOWN only after
+   *  now - attempt_started_at exceeds this — never on a fresh poll. */
+  telegramDeliveryStaleAfterMs?: number;
 }
 
 function requireOperator(operatorId: string | undefined): string {
@@ -106,6 +117,92 @@ export class MissionControl {
       | null;
     const root = String(prj?.root_location ?? "");
     return root ? path.join(root, "outbox") : null;
+  }
+
+  /** Incident R2 §6 — the ONLY telegram file-delivery authority: canonical
+   *  `telegram_delivery_request` rows minted when a governed
+   *  TELEGRAM_DELIVERY task completes, projected for the bridge with
+   *  resolved absolute artifact paths inside the project outbox. The
+   *  bridge never scans the outbox itself — a file in outbox/ is storage,
+   *  never a send instruction. */
+  telegramDeliveries(state?: string): Array<Record<string, unknown>> {
+    const pending = pendingTelegramDeliveries(
+      this.store,
+      undefined,
+      this.deps.telegramDeliveryStaleAfterMs,
+    );
+    return state ? pending.filter((r) => r.status === state) : pending;
+  }
+
+  /** R3/R4 — the ONE production mutation path for delivery state
+   *  (the legacy /ack bypass was removed): explicit transport lifecycle
+   *  transition for one artifact (or the TEXT request):
+   *  QUEUED→SENDING (begin — deterministic attempt id, budget+backoff
+   *  enforced), SENDING→SENT (requires valid message_id evidence) |
+   *  QUEUED/FAILED_DELIVERY (definite failure — bounded retry) |
+   *  UNKNOWN_SIDE_EFFECT (ambiguous), or request-level UNSENDABLE hold
+   *  (destination unresolvable / not allowed). Illegal transitions
+   *  throw fail-closed — never silent no-ops. */
+  transitionTelegramDelivery(
+    deliveryId: string,
+    input: {
+      artifact?: string | null;
+      to?: string;
+      message_id?: string | number;
+      error?: string;
+      now?: string;
+    },
+  ) {
+    const artifact = input.artifact === undefined ? undefined : input.artifact;
+    const now = input.now ?? utcnow();
+    switch (String(input.to ?? "")) {
+      case "SENDING":
+        return beginDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          now,
+        });
+      case "SENT":
+        return resolveDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          outcome: "SENT",
+          messageId: input.message_id,
+          now,
+        });
+      case "FAILED":
+        return resolveDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          outcome: "FAILED",
+          error: input.error,
+          now,
+        });
+      case "UNKNOWN":
+        return resolveDeliveryAttemptEntity({
+          store: this.store,
+          deliveryId,
+          artifact,
+          outcome: "UNKNOWN",
+          error: input.error,
+          now,
+        });
+      case "UNSENDABLE":
+        return holdTelegramDeliveryEntity({
+          store: this.store,
+          deliveryId,
+          reason: String(input.error ?? "destination_not_allowed"),
+          now,
+        });
+      default:
+        throw new PolicyError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_TRANSITION",
+          String(input.to ?? ""),
+        );
+    }
   }
 
   missionDag(missionId: string) {
@@ -467,6 +564,12 @@ export class MissionControl {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
+    // Incident R1 — the previewed task list is digested/pinned below, so
+    // it must already be data-flow sound (consumed artifacts need their
+    // producer edge). The serve canonicalize seam repairs before this;
+    // an unsound proposal fails closed here rather than entering a
+    // digestible preview.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
     const eid = effectiveInputDigest({
       project_id: input.project_id,
       goal: input.goal,
@@ -553,6 +656,14 @@ export class MissionControl {
         { tasks: v.preview.canonical_tasks },
         knownCaps,
       );
+      // Incident R1 §6 — confirm only VALIDATES the persisted canonical
+      // plan; it never repairs. A READY preview pinned before the
+      // data-flow authority (or otherwise unsound) fails closed here —
+      // it is not consumed, no mission is created, the operator must
+      // request a fresh preview.
+      assertPlanDataflow(
+        v.preview.canonical_tasks as Array<Record<string, unknown>>,
+      );
       // R5 — replay persisted authority VERBATIM. Normalization already ran
       // before the persisted digests at preview creation; confirm may only
       // validate what was pinned, never widen it. A READY preview without
@@ -617,6 +728,15 @@ export class MissionControl {
       );
     }
     const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    // R3 §3 — pin the canonical mission origin for delivery-destination
+    // binding: the authenticated operator identity (x-operator-id), never
+    // caller-supplied metadata. A telegram:<chatId> origin binds explicit
+    // delivery back to exactly that chat.
+    metadata.mission_origin = {
+      operator_id: input.operator_id ?? null,
+      provenance: "MISSION_INGRESS",
+      pinned_at: utcnow(),
+    };
     const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
     if (boundAgentId) {
       try {
@@ -863,6 +983,15 @@ export class MissionControl {
       }
     }
     const metadata = { ...(input.metadata ?? {}) } as Record<string, unknown>;
+    // R3 §3 — pin the canonical mission origin for delivery-destination
+    // binding: the authenticated operator identity (x-operator-id), never
+    // caller-supplied metadata. A telegram:<chatId> origin binds explicit
+    // delivery back to exactly that chat.
+    metadata.mission_origin = {
+      operator_id: input.operator_id ?? null,
+      provenance: "MISSION_INGRESS",
+      pinned_at: utcnow(),
+    };
     const boundAgentId = metadata.org_agent_id ? String(metadata.org_agent_id) : null;
     if (boundAgentId) {
       // P12: a mission bound to an org_agent pins its agent execution

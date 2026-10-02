@@ -43,6 +43,11 @@ import {
 import type { ReconciliationService } from "./reconciliation.js";
 import type { RecoveryController } from "./recovery-controller.js";
 import { classifyFailure } from "./recovery-controller.js";
+import {
+  assertPlanDataflow,
+  missingConsumedArtifact,
+} from "./plan-dataflow.js";
+import { mintTelegramDeliveryRequest } from "./telegram-delivery.js";
 import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
@@ -146,6 +151,13 @@ export interface MissionRuntimeDeps {
    * taskTimeoutSeconds() — this field must already be a positive int.
    */
   taskTimeoutSeconds?: number;
+  /** R3 §3 — exactly-one configured default Telegram destination for
+   *  non-Telegram-origin missions. Unset → such delivery requests mint
+   *  UNSENDABLE (fail closed, never broadcast). */
+  telegramDeliveryDefaultChatId?: string;
+  /** R4 §3 — canonical retry ceiling stamped per payload at mint
+   *  (PAIR_TG_DELIVERY_MAX_ATTEMPTS wiring; bounded, env-driven). */
+  telegramDeliveryMaxAttempts?: number;
 }
 
 const DEFAULT_TASK_TIMEOUT = 120;
@@ -528,6 +540,10 @@ export class MissionRuntime {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
+    // Incident R1 — pinned plans must be data-flow sound at the commit
+    // boundary: every consumed artifact requires its producer edge. A
+    // planner path that bypassed the canonicalize seam still fails closed.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
     this.deps.service.commitPlan({
       mission_id: missionId,
       tasks: tasks as unknown as Array<Record<string, unknown>>,
@@ -638,6 +654,28 @@ export class MissionRuntime {
       },
     });
     for (const task of runnable) {
+      // Incident R2 §9 — pre-dispatch prerequisite evidence: when the
+      // canonical pinned plan says this task consumes a workspace
+      // artifact that is absent NOW, spending an executor attempt is
+      // provably futile — classify DEPENDENCY_FAILURE deterministically
+      // (bounded REPLAN/ABORT, zero dispatch, zero retry burn, zero
+      // approval). Absence checked BEFORE dispatch only — a file
+      // disappearing DURING execution proves nothing about its prior
+      // presence and never reclassifies the real failure.
+      const missing = this.prerequisiteMissing(mission, task);
+      if (missing) {
+        this.startRecovery(
+          missionId,
+          String(task.task_id),
+          null,
+          "DEPENDENCY_FAILURE",
+          now,
+          undefined,
+          undefined,
+          { missing_artifact: missing },
+        );
+        return;
+      }
       const request = this.requestFor(mission, task);
       try {
         const routed = this.deps.router.routeGovernedTask(request, this.deps.adapters);
@@ -661,9 +699,18 @@ export class MissionRuntime {
         // Dispatch-time routing failures carry no execution row — the executor
         // the route selection failed on still becomes bounded re-route
         // evidence so RE_ROUTE excludes it instead of re-selecting it.
-        this.startRecovery(missionId, String(task.task_id), null, failureClass, now, undefined, undefined, {
-          failedExecutorId: String((err as PairError).meta?.executor_id ?? "") || null,
-        });
+        this.startRecovery(
+          missionId,
+          String(task.task_id),
+          null,
+          failureClass,
+          now,
+          undefined,
+          undefined,
+          {
+            failedExecutorId: String((err as PairError).meta?.executor_id ?? "") || null,
+          },
+        );
         return;
       }
       const rtNow = String(this.runtimeEntity(missionId).state);
@@ -719,6 +766,36 @@ export class MissionRuntime {
           actor: this.actor,
           correlation_id: String(collected.correlation_id ?? ""),
         });
+        // Incident R2 §6 — mint the durable canonical send request ONLY
+        // for a task carrying the governed TELEGRAM_DELIVERY capability
+        // AND the PAIR-stamped manifest. Everything else — file presence,
+        // outbox contents, mission completion — authorizes nothing.
+        const settledTask = this.store.get("task", taskId);
+        const caps = (settledTask.required_capabilities as string[]) ?? [];
+        if (caps.includes("TELEGRAM_DELIVERY")) {
+          const mission = this.deps.service.getMission(missionId);
+          const project = this.deps.service.getProject(
+            String(mission.project_id),
+          );
+          const ws = String(
+            (settledTask.metadata as Record<string, unknown> | undefined)
+              ?.workspace ??
+              ((mission.metadata as Record<string, unknown>)
+                ?.authorized_workspaces as string[])?.[0] ??
+              String(project.root_location),
+          );
+          mintTelegramDeliveryRequest({
+            store: this.store,
+            mission,
+            task: settledTask,
+            execution: collected,
+            outboxDir: `${String(project.root_location)}/outbox`,
+            workspace: ws,
+            now: utcnow(),
+            defaultChatId: this.deps.telegramDeliveryDefaultChatId,
+            maxAttempts: this.deps.telegramDeliveryMaxAttempts,
+          });
+        }
         return;
       }
       // Validation failed — artifact failure, never mark success.
@@ -747,6 +824,34 @@ export class MissionRuntime {
   }
 
   /**
+   * Incident R2 §9/§10 — pre-dispatch prerequisite evidence ONLY. The
+   * canonical pinned `metadata.pair_dataflow.consumes` (never executor
+   * prose) is resolved against the governed workspace; a proven-absent
+   * input returns its artifact name so the caller enters deterministic
+   * DEPENDENCY_FAILURE without spending a dispatch. Post-execution
+   * absence is deliberately NOT consulted — a consumed input the task
+   * itself moved/deleted before an unrelated failure must not reclassify
+   * it.
+   */
+  private prerequisiteMissing(
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+  ): string | null {
+    const df = (task.metadata as Record<string, unknown> | undefined)
+      ?.pair_dataflow as Record<string, unknown> | undefined;
+    if (!Array.isArray(df?.consumes) || df.consumes.length === 0) return null;
+    const md = (mission.metadata as Record<string, unknown>) ?? {};
+    const workspace = String(
+      (task.metadata as Record<string, unknown> | undefined)?.workspace ??
+        (md.authorized_workspaces as string[])?.[0] ??
+        "",
+    );
+    if (!workspace) return null;
+    const missing = missingConsumedArtifact({ task, workspace });
+    return missing ? missing.artifact : null;
+  }
+
+  /**
    * The recovery decision is recorded, then the runtime moves to the state
    * that will execute it — retries/reroutes go through durable backoff;
    * approval blocks the task until decided; reconciliation sets a barrier.
@@ -767,8 +872,13 @@ export class MissionRuntime {
     infeasibleActions?: Array<{ action: RecoveryAction; reason: string }>,
     /** Route-authority closure — the executor a dispatch-time routing
      *  failure was scoped to (no execution row exists yet); carried into
-     *  pending.executor_id so bounded RE_ROUTE excludes it. */
-    extra?: { failedExecutorId?: string | null },
+     *  pending.executor_id so bounded RE_ROUTE excludes it.
+     *  `missing_artifact` records the pre-dispatch prerequisite evidence
+     *  (R2 §9) that produced a DEPENDENCY_FAILURE. */
+    extra?: {
+      failedExecutorId?: string | null;
+      missing_artifact?: string | null;
+    },
   ): void {
     const rt = this.runtimeEntity(missionId);
     const execution = executionId
@@ -852,6 +962,9 @@ export class MissionRuntime {
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
       infeasible_actions: infeasibleActions ?? [],
+      ...(extra?.missing_artifact
+        ? { missing_artifact: extra.missing_artifact }
+        : {}),
     };
     this.store.put(
       "mission_runtime",
@@ -2297,6 +2410,8 @@ export class MissionRuntime {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
+    // Incident R1 — a replan is a new committed plan: same data-flow gate.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
     // Old revision stays immutable; unfinished old tasks are settled as
     // CANCELLED (never silently reset), pending approvals/timers superseded.
     for (const t of oldTasks) {

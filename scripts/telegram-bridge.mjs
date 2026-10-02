@@ -24,7 +24,16 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { resolveMcToken } from "../dist/pair/index.js";
+import {
+  resolveMcToken,
+  transportTelegramDelivery,
+  telegramDeliveryTransportTimeoutMs,
+  makeNonReentrant,
+} from "../dist/pair/index.js";
+// R6 §4/§7 — canonical bounded transport timeout (PAIR_TG_DELIVERY_
+// TRANSPORT_TIMEOUT_MS). A send outliving it is UNKNOWN_SIDE_EFFECT —
+// never definite failure, never a blind resend.
+const TG_TRANSPORT_TIMEOUT_MS = telegramDeliveryTransportTimeoutMs();
 
 const TG_TOKEN = process.env.PAIR_TG_BOT_TOKEN ?? "";
 const MC_URL = (process.env.PAIR_MC_URL ?? "http://localhost:8788").replace(/\/+$/, "");
@@ -44,14 +53,34 @@ fs.mkdirSync(path.dirname(HALT_FILE), { recursive: true });
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 
 // ---- Telegram transport ----------------------------------------------------
+// Errors are classified: definite (Telegram API said no → bounded retry)
+// vs unknown (network/parse died inside the call — acceptance ambiguous).
+// Only governed delivery code consumes the classification; notification
+// sends stay best-effort.
 async function tg(method, params = {}) {
-  const res = await fetch(`${TG_API}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(params),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) throw new Error(`tg ${method}: ${res.status} ${JSON.stringify(data).slice(0, 200)}`);
+  let res;
+  try {
+    res = await fetch(`${TG_API}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(params),
+    });
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  if (!res.ok || data.ok === false) {
+    const e = new Error(`tg ${method}: ${res.status} ${JSON.stringify(data).slice(0, 200)}`);
+    e.tgKind = "fail";
+    throw e;
+  }
   return data.result;
 }
 
@@ -75,10 +104,55 @@ async function sendFile(chatId, filePath) {
   fd.append("chat_id", String(chatId));
   fd.append(field, new Blob([fs.readFileSync(filePath)]), name);
   fd.append("caption", `📎 ${name}`);
-  const res = await fetch(`${TG_API}/${method}`, { method: "POST", body: fd });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) throw new Error(`tg ${method}: ${res.status} ${String(data.description ?? "").slice(0, 150)}`);
+  let res;
+  try {
+    res = await fetch(`${TG_API}/${method}`, { method: "POST", body: fd });
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    e.tgKind = "unknown";
+    throw e;
+  }
+  if (!res.ok || data.ok === false) {
+    const e = new Error(`tg ${method}: ${res.status} ${String(data.description ?? "").slice(0, 150)}`);
+    e.tgKind = "fail";
+    throw e;
+  }
   return data.result;
+}
+
+// R3 §5 — governed transport: PROPAGATES failure classification instead
+// of the best-effort `send()` which swallows it. Definite API failure →
+// {kind:"fail"}; thrown/ambiguous acceptance → {kind:"unknown"}.
+async function governedSend({ chatId, text, filePath, name }) {
+  try {
+    const result = filePath
+      ? await sendFile(chatId, filePath)
+      : await tg("sendMessage", {
+          chat_id: chatId,
+          text: String(text ?? "").slice(0, 4000),
+          disable_web_page_preview: true,
+        });
+    // R4 §2 — a claimed success WITHOUT a real message_id is ambiguous:
+    // validate response evidence here, never trust `ok` alone.
+    const mid = result?.message_id;
+    // R5 §4 — Bot API message_id is an Integer; only positive safe ints.
+    const validId =
+      typeof mid === "number" && Number.isSafeInteger(mid) && mid > 0;
+    if (!validId) {
+      return { kind: "unknown", error: "acceptance_unproven:no message_id" };
+    }
+    return { kind: "ok", message_id: mid };
+  } catch (e) {
+    return e?.tgKind === "fail"
+      ? { kind: "fail", error: String(e).slice(0, 300) }
+      : { kind: "unknown", error: String(e).slice(0, 300) };
+  }
 }
 
 // ---- Mission Control client ------------------------------------------------
@@ -272,28 +346,51 @@ async function notifyLoop(allowList) {
         );
     }
 
-    // TELEGRAM_DELIVERY outbox: mission tasks write workspace outbox/*.txt —
-    // forward each to every allowed chat, then mark .sent.
-    const projects = await mc("GET", "/api/projects").catch(() => []);
-    for (const prj of Array.isArray(projects) ? projects : projects?.projects ?? []) {
-      const outbox = path.join(String(prj.root_location ?? ""), "outbox");
-      if (!outbox || !fs.existsSync(outbox)) continue;
-      for (const f of fs.readdirSync(outbox)) {
-        if (f.endsWith(".sent")) continue;
-        const ext = path.extname(f).toLowerCase();
-        if (![".txt", ".md", ".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext)) continue;
-        const fp = path.join(outbox, f);
-        try {
-          if (ext === ".txt" || ext === ".md") {
-            const content = fs.readFileSync(fp, "utf8").trim();
-            if (content) for (const c of allowList) await send(c, `📨 ${f}:\n\n${content}`);
-          } else {
-            for (const c of allowList) await sendFile(c, fp);
-          }
-          fs.renameSync(fp, fp + ".sent");
-        } catch (e) {
-          console.error("outbox send", fp, String(e).slice(0, 120));
-        }
+    // Incident R2+R3 — EXPLICIT delivery authority only. The bridge
+    // NEVER scans the outbox and NEVER broadcasts: it polls the
+    // canonical telegram_delivery_request queue and transports each
+    // manifested artifact to EXACTLY the request's bound destination
+    // through the shared governed-transport module. Durable lifecycle
+    // QUEUED→SENDING→SENT|FAILED|UNKNOWN_SIDE_EFFECT lives server-side;
+    // no filename ".sent" mark is transport proof. The allowlist is an
+    // authorization check only — a bound destination not in it → hold.
+    const deliveries =
+      (await mc("GET", "/api/telegram-deliveries?state=QUEUED").catch(() => ({})))?.deliveries ?? [];
+    for (const req of deliveries) {
+      const t = (artifact, body) =>
+        mc(
+          "POST",
+          `/api/telegram-deliveries/${encodeURIComponent(String(req.delivery_id))}/transition`,
+          { artifact: artifact ?? null, ...body },
+        );
+      try {
+        await transportTelegramDelivery({
+          request: req,
+          transport: { send: governedSend },
+          isAllowed: (chatId) => allowList.has(String(chatId)),
+          backend: {
+            // R7 §4 — exclusive acquire: the HTTP transition returns
+            // {delivery, acquired, attempt_id}; ONLY acquired===true is
+            // send authority — a stale projection is not.
+            begin: async (a) => {
+              const r = await t(a, { to: "SENDING" });
+              return {
+                acquired: r?.acquired === true,
+                attempt_id: r?.attempt_id ?? undefined,
+                reason: r?.reason ?? undefined,
+              };
+            },
+            sent: (a, ev) => t(a, { to: "SENT", message_id: ev?.message_id ?? null }),
+            failed: (a, err) => t(a, { to: "FAILED", error: err }),
+            unknown: (a, err) => t(a, { to: "UNKNOWN", error: err }),
+            unsendable: (reason) => t(null, { to: "UNSENDABLE", error: reason }),
+          },
+          readText: (p) => fs.readFileSync(p, "utf8"),
+          textPrefix: "📨 ",
+          timeoutMs: TG_TRANSPORT_TIMEOUT_MS,
+        });
+      } catch (e) {
+        console.error("delivery", req.delivery_id, String(e).slice(0, 160));
       }
     }
   } catch (e) {
@@ -322,7 +419,13 @@ async function main() {
   console.log(`telegram-bridge: allow file ${ALLOW_FILE}; halt lever ${HALT_FILE}`);
 
   let offset = 0;
-  setInterval(() => notifyLoop(allowedChats()), 5000);
+  // R6 §6 — defense-in-depth: an interval tick while the previous
+  // notifyLoop is still in flight is skipped. The DURABLE SENDING lease
+  // (attempt_started_at + PAIR_TG_DELIVERY_STALE_AFTER_MS) remains the
+  // canonical correctness mechanism — this only prevents two poll
+  // cycles racing inside this process.
+  const notifyGuarded = makeNonReentrant(() => notifyLoop(allowedChats()));
+  setInterval(() => void notifyGuarded(), 5000);
   for (;;) {
     let updates;
     try {

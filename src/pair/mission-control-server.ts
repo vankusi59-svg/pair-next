@@ -345,6 +345,58 @@ export function createMissionControlServer(
         return void json(res, 200, { ok: true, path: dest, bytes: buf.length });
       }
 
+      // Incident R2 — explicit telegram delivery authority. The bridge polls
+      // the QUEUED canonical requests (durable, restart-safe) and acks each
+      // manifested artifact after a successful transport. An outbox file is
+      // storage only — it NEVER appears here without a governed delivery.
+      if (method === "GET" && p === "/api/telegram-deliveries") {
+        const state = url.searchParams.get("state") ?? undefined;
+        return void json(res, 200, { deliveries: c.telegramDeliveries(state) });
+      }
+      // R4 §5 — the legacy /ack endpoint is REMOVED: it could flip a
+      // QUEUED payload to SENT with no SENDING and no message_id. The
+      // governed /transition lifecycle is the ONLY mutation path.
+      // R3 §7 — explicit transport lifecycle: QUEUED→SENDING→SENT |
+      // FAILED | UNKNOWN_SIDE_EFFECT per artifact (or the TEXT request),
+      // plus the UNSENDABLE destination hold. Replaces filename-based
+      // send proof entirely.
+      const transitionMatch = p.match(
+        /^\/api\/telegram-deliveries\/([^/]+)\/transition$/,
+      );
+      if (method === "POST" && transitionMatch) {
+        const reqEntity = c.transitionTelegramDelivery(
+          decodeURIComponent(transitionMatch[1]),
+          {
+            artifact: body.artifact === undefined ? undefined : body.artifact,
+            to: body.to === undefined ? undefined : String(body.to),
+            message_id: body.message_id,
+            error: body.error === undefined ? undefined : String(body.error),
+          } as never,
+        );
+        // R7 §5 — exclusive claim surface: a SENDING transition returns
+        // the acquisition outcome explicitly so a transport actor never
+        // infers send authority from a stale projection.
+        if (
+          reqEntity &&
+          typeof reqEntity === "object" &&
+          "acquired" in (reqEntity as Record<string, unknown>)
+        ) {
+          const acq = reqEntity as {
+            acquired: boolean;
+            request: Record<string, unknown>;
+            attempt_id?: string;
+            reason?: string;
+          };
+          return void json(res, 200, {
+            delivery: acq.request,
+            acquired: acq.acquired === true,
+            attempt_id: acq.attempt_id ?? null,
+            reason: acq.reason ?? null,
+          });
+        }
+        return void json(res, 200, { delivery: reqEntity });
+      }
+
       // Broker fetch: remote executor releases a named credential. R3 §2:
       // the worker credential is a TASK-SCOPED capability (x-broker-capability)
       // minted server-side from PAIR_BROKER_TOKEN — the master token itself
