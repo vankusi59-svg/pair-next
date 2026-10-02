@@ -407,6 +407,41 @@ export class ApprovalQueue {
     return { row, owned: false, applied: false, claim: null };
   }
 
+  /** R5 — atomic fenced stage: the claim re-verification AND the
+   *  mutation run inside ONE `BEGIN IMMEDIATE` transaction on the
+   *  canonical store. A competing `claimExercise` on a separate
+   *  connection cannot advance `claim_epoch` between the check and the
+   *  write — takeover may only land between committed stages, and the
+   *  stale owner's NEXT stage is then fenced atomically. A fenced stage
+   *  performs ZERO mutation and converges — never a runtime defect.
+   *  Keep each stage bounded: fence + one logical mutation per call,
+   *  preserving crash-resumability (never one giant transaction). */
+  runFencedExerciseStage<T>(
+    approvalId: string,
+    claim: { owner_id: string; claim_epoch: number } | null | undefined,
+    mutation: (row: Record<string, unknown>) => T,
+  ): { fenced: boolean; row: Record<string, unknown> | null; result?: T } {
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    return this.store.immediate(() => {
+      const row = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
+      const current =
+        row != null &&
+        claim != null &&
+        String(row.state) === "APPLYING" &&
+        String(row.owner_id ?? "") === claim.owner_id &&
+        Number(row.claim_epoch ?? 0) === claim.claim_epoch;
+      if (!current) {
+        return { fenced: true, row: row ?? null, result: undefined };
+      }
+      const result = mutation(row);
+      return {
+        fenced: false,
+        row: this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId),
+        result,
+      };
+    });
+  }
+
   /** R3 fencing check — prove the caller's claim token still owns the
    *  canonical APRE right now: owner_id match AND claim_epoch match AND
    *  state APPLYING. Returns the canonical row when current, `null`

@@ -1504,10 +1504,11 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     ).toBe(1);
   });
 
-  /** R4 — patch verifyExerciseClaim so B takes over exactly when call
-   *  `injectAt` runs: A's stage (injectAt-1) lands durably, then the
-   *  fence for stage injectAt sees the takeover and stops A mid-apply. */
-  function trapVerify(
+  /** R5 — patch runFencedExerciseStage so B takes over exactly BEFORE
+   *  the `injectAt`-th atomic stage: stages 1..injectAt-1 committed
+   *  atomically under epoch 1; stage injectAt's in-transaction fence
+   *  sees epoch 2 and stops A with zero mutation. */
+  function trapStage(
     ctx: ReturnType<typeof makeCtx>,
     approvalsB: ApprovalQueue,
     approvalId: string,
@@ -1515,13 +1516,13 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     at = "2999-01-01T00:01:01Z",
   ) {
     let calls = 0;
-    const orig = ctx.approvals.verifyExerciseClaim.bind(ctx.approvals);
-    ctx.approvals.verifyExerciseClaim = (id, claim) => {
+    const orig = ctx.approvals.runFencedExerciseStage.bind(ctx.approvals);
+    ctx.approvals.runFencedExerciseStage = (id, token, mutation) => {
       calls++;
       if (calls === injectAt) {
         approvalsB.claimExercise(id, "MRI_B", at); // takeover between stages
       }
-      return orig(id, claim);
+      return orig(id, token, mutation);
     };
   }
 
@@ -1550,7 +1551,9 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     // A claims epoch 1 and applies: stages land (barrier/task/exec/rt)
     // until the fence before clearPendingRecovery sees B's takeover.
     const { approvals2, store2, runtime2, exA2 } = makeRuntime2(ctx, []);
-    trapVerify(ctx, approvals2, approvalId, 5, T1);
+    // ACK arm atomic stages: 1 barrier+rt → 2 task FAILED → 3 exec
+    // outcome → 4 pending clear → 5 linkage+transition. Inject at 4.
+    trapStage(ctx, approvals2, approvalId, 4, T1);
     (ctx.runtime as unknown as { instanceId: string }).instanceId = "MRI_A";
     ctx.runtime.tick(mid, T0);
 
@@ -1599,48 +1602,78 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     expect(rtB.pending_recovery ?? null).toBeNull();
   });
 
-  it("K. R4 takeover after startRecovery mint, before stamp — B adopts the minted chain, no second decision", () => {
-    const ctx = makeCtx("r4k");
+  it("K. R5 chain-mint TOCTOU — B cannot interleave inside A's atomic mint+stamp; B then adopts A's chain, one decision", () => {
+    const ctx = makeCtx("r5k");
     const { mid } = driveToCeilingApproval(ctx);
     const approvalId = approvePending(ctx, mid);
     const T0 = "2999-01-01T00:00:00Z";
     const T1 = "2999-01-01T00:01:01Z";
 
     const { approvals2, store2, runtime2 } = makeRuntime2(ctx, []);
-    // Verify-call sequence in the EXTENSION arm: 1 head → 2 transition →
-    // 3 chain entry → 4 before-clear → 5 before-mint → 6 before-stamp.
-    // Inject at 6: A minted the fresh chain but never stamped it.
-    trapVerify(ctx, approvals2, approvalId, 6, T1);
+    // EXTENSION arm stages: 1 grant+rt → 2 transition → 3 clear →
+    // 4 mint+stamp (ONE transaction). Inside stage 4, B's takeover from
+    // a second connection cannot advance the epoch — the write lock is
+    // held until A's commit. After commit, B takes over and A's
+    // finalization is fenced.
+    let stageCalls = 0;
+    let intraTxnBlocked: unknown = null;
+    const origStage = ctx.approvals.runFencedExerciseStage.bind(ctx.approvals);
+    ctx.approvals.runFencedExerciseStage = (id, token, mutation) => {
+      stageCalls++;
+      const wrapped =
+        stageCalls === 4
+          ? () => {
+              try {
+                approvals2.claimExercise(id, "MRI_B", T1); // inside A's txn
+              } catch (e) {
+                intraTxnBlocked = e; // SQLITE_BUSY — cannot interleave
+              }
+              return mutation();
+            }
+          : mutation;
+      return origStage(id, token, wrapped);
+    };
+    const origMark = ctx.approvals.markExercisedApplied.bind(ctx.approvals);
+    ctx.approvals.markExercisedApplied = (id, o, e) => {
+      approvals2.claimExercise(id, "MRI_B", T1); // takeover after commit
+      return origMark(id, o, e);
+    };
     (ctx.runtime as unknown as { instanceId: string }).instanceId = "MRI_A";
     const decisionsBefore = ctx.store
       .list("recovery_decision")
       .filter((d) => d.mission_id === mid).length;
     ctx.runtime.tick(mid, T0);
 
+    expect(intraTxnBlocked).toBeTruthy(); // B could not interleave
     const minted = (rt(ctx, mid).pending_recovery ?? {}) as Record<
       string,
       unknown
     >;
     const mintedChainId = String(minted.recovery_id);
     expect(mintedChainId).toBeTruthy();
-    expect(minted.approval_exercise_id ?? null).toBeNull(); // never stamped
+    const exerciseId = String(
+      ctx.store
+        .list(APPROVAL_EXERCISE_ENTITY)
+        .find((x) => x.approval_id === approvalId)!.approval_exercise_id,
+    );
+    // A minted+stamped atomically under epoch1 — durable, exactly once.
+    expect(String(minted.approval_exercise_id)).toBe(exerciseId);
     expect(
       ctx.store.list("recovery_decision").filter((d) => d.mission_id === mid)
         .length,
-    ).toBe(decisionsBefore + 1); // A's mint is durable
+    ).toBe(decisionsBefore + 1);
+    const apreAfterA = ctx.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(apreAfterA.state)).toBe("APPLYING"); // A's close fenced
+    expect(String(apreAfterA.owner_id)).toBe("MRI_B");
+    expect(Number(apreAfterA.claim_epoch)).toBe(2);
 
-    // B converges: adopts the already-minted chain — zero new decisions.
+    // B converges: adopts the stamped chain — zero new decisions.
     (runtime2 as unknown as { instanceId: string }).instanceId = "MRI_B";
     runtime2.tick(mid, "2999-01-01T00:01:30Z");
     const adopted = (store2.get("mission_runtime", `MRT_${mid}`)
       .pending_recovery ?? {}) as Record<string, unknown>;
     expect(String(adopted.recovery_id)).toBe(mintedChainId); // SAME chain
-    const exerciseId = String(
-      store2
-        .list(APPROVAL_EXERCISE_ENTITY)
-        .find((x) => x.approval_id === approvalId)!.approval_exercise_id,
-    );
-    expect(String(adopted.approval_exercise_id)).toBe(exerciseId); // stamped by B
+    expect(String(adopted.approval_exercise_id)).toBe(exerciseId);
     expect(
       store2.list("recovery_decision").filter((d) => d.mission_id === mid)
         .length,
@@ -1666,10 +1699,10 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     const T1 = "2999-01-01T00:01:01Z";
 
     const { approvals2, store2, runtime2 } = makeRuntime2(ctx, []);
-    // REVALIDATION arm calls: 1 head → 2 transition → 3 chain entry →
-    // 4 before-clear → 5 before-mint. Inject at 5: old chain cleared,
-    // fresh chain never minted by A.
-    trapVerify(ctx, approvals2, approvalId, 5, T1);
+    // REVALIDATION arm stages: 1 rt put → 2 transition → 3 clear →
+    // 4 mint+stamp. Inject at 4: stale chain cleared atomically, A
+    // fenced before it could mint.
+    trapStage(ctx, approvals2, approvalId, 4, T1);
     (ctx.runtime as unknown as { instanceId: string }).instanceId = "MRI_A";
     const decisionsBefore = ctx.store
       .list("recovery_decision")
@@ -1695,5 +1728,63 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
     expect(String(apre[0].state)).toBe("APPLIED");
     expect(String(apre[0].owner_id)).toBe("MRI_B");
     expect(Number(apre[0].claim_epoch)).toBe(2);
+  });
+
+  it("M. R5 true TOCTOU — takeover cannot land between an in-transaction verify and its mutation", () => {
+    const ctx = makeCtx("r5m");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    const T0 = "2999-01-01T00:00:00Z";
+    const T1 = "2999-01-01T00:01:01Z";
+
+    ctx.approvals.exercise(approvalId, {});
+    const tokA = ctx.approvals.claimExercise(approvalId, "MRI_A", T0).claim!;
+    const { approvals2 } = makeRuntime2(ctx, []);
+
+    // Stage N: A verified epoch1 INSIDE BEGIN IMMEDIATE — B's takeover
+    // on a separate connection cannot complete before A's commit
+    // (busy_timeout → SQLITE_BUSY / blocked write).
+    let intraTxnBlocked: unknown = null;
+    const s1 = ctx.approvals.runFencedExerciseStage(approvalId, tokA, () => {
+      try {
+        approvals2.claimExercise(approvalId, "MRI_B", T1);
+      } catch (e) {
+        intraTxnBlocked = e;
+      }
+      return "stage1-committed";
+    });
+    expect(s1.fenced).toBe(false);
+    expect(s1.result).toBe("stage1-committed");
+    expect(intraTxnBlocked).toBeTruthy(); // B could not interleave
+    // The APRE stayed canonical epoch1 through A's commit.
+    const exerciseId = String(
+      ctx.store
+        .list(APPROVAL_EXERCISE_ENTITY)
+        .find((x) => x.approval_id === approvalId)!.approval_exercise_id,
+    );
+    const midRow = ctx.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(midRow.owner_id)).toBe("MRI_A");
+    expect(Number(midRow.claim_epoch)).toBe(1);
+
+    // After A's stage commits, B takeover succeeds → epoch2.
+    const take = approvals2.claimExercise(approvalId, "MRI_B", T1);
+    expect(take.owned).toBe(true);
+    expect(take.claim!.claim_epoch).toBe(2);
+
+    // Stage N+1: A's epoch1 is atomically fenced — ZERO mutation.
+    let wrote = false;
+    const s2 = ctx.approvals.runFencedExerciseStage(
+      approvalId,
+      tokA,
+      () => {
+        wrote = true;
+        return null;
+      },
+    );
+    expect(s2.fenced).toBe(true);
+    expect(wrote).toBe(false);
+    const row = ctx.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(row.owner_id)).toBe("MRI_B"); // canonical, B's
+    expect(Number(row.claim_epoch)).toBe(2);
   });
 });

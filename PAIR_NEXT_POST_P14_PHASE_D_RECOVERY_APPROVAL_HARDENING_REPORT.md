@@ -420,3 +420,61 @@ DSH_EXHAUSTED availability · authority→POLICY_DENIAL · ROUTE_INFEASIBLE · c
 `PAIR_NEXT_PHASE_D_R4_PENDING_INDEPENDENT_AUDIT`
 
 **STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R5 — Atomic APRE Fence + Mutation Closure
+
+Base: `256883e` (R4 audited HEAD). Scope: every APRE-owned critical stage now re-verifies the claim INSIDE the same `BEGIN IMMEDIATE` transaction as its mutation — the verify→takeover→write TOCTOU window is closed. Takeover can only land between committed stages; the stale owner's next stage is fenced atomically.
+
+## Atomic fencing primitive
+
+`ApprovalQueue.runFencedExerciseStage(approvalId, claimToken, mutation)` — opens `store.immediate(() => …)` (one `BEGIN IMMEDIATE…COMMIT` on the canonical connection), re-reads the APRE inside the transaction, requires `state==APPLYING && owner_id && claim_epoch` match, then runs exactly one bounded mutation. Stale → `{fenced:true}` with ZERO writes. Returns `{fenced, row, result}`.
+
+## Transaction boundaries
+
+Stages stay bounded (`fence + one logical mutation + commit`) — never one giant transaction, preserving crash-resumability, orphan adoption, persisted partial progress and lease takeover. No writer lock is held across executor/network/filesystem calls (pure canonical DB work only). Nested `store.immediate()` inside mutations (e.g. `service.updateTask`) collapse to savepoints — safe by better-sqlite3 semantics. Competing `claimExercise` on a second connection cannot advance `claim_epoch` while a stage holds the write lock (busy_timeout 5000 → SQLITE_BUSY), and `markExercisedApplied` remains the mandatory CAS-atomic finalization.
+
+## Atomic stage sequences
+
+| Arm | Stages |
+|-----|--------|
+| EXTENSION | grant+rt put → transition → [resume: clear → mint+stamp] → CAS APPLIED |
+| REVALIDATION | rt put → transition → [resume: clear → mint+stamp] → CAS APPLIED |
+| ACK_NO_REPLAY | barrier settle+rt put → task FAILED → exec terminal_outcome → pending clear → linkage clear+transition → CAS APPLIED |
+| `resumeExercisedChain` | adopt-stamp, or clear → **mint+stamp in ONE transaction** — the mint is atomically owned; no window for a stale mint followed by a stale stamp |
+
+Post-mint adoption (R4 `recovery_id` snapshot path) is preserved for durable chains minted by earlier code versions; under atomic mint+stamp the "minted-unstamped" state cannot arise from current code.
+
+## TOCTOU evidence (tests J–M, separate connections; busy_timeout makes in-transaction contention raise SQLITE_BUSY)
+
+- **J (UNKNOWN arm)**: takeover injected before stage 4 (pending clear). Barrier settle+rt, task FAILED, exec outcome committed atomically once each; A fenced at clear; B resumes → linkage clear+transition → APPLIED B/2; zero replay, one terminal outcome, pending neutralized.
+- **K (chain-mint TOCTOU)**: inside A's atomic mint+stamp transaction, B's `claimExercise` from a second connection is blocked (~5s SQLITE_BUSY — real evidence the write lock held); A mints+stamps under epoch 1 → commit → B takeover epoch 2 → A's `markExercisedApplied` fenced → B adopts the SAME `recovery_id` chain → exactly +1 `recovery_decision`, no duplicate, APPLIED B/2.
+- **L (REVALIDATION)**: takeover before mint+stamp stage → stale chain cleared, A fenced pre-mint → B rebuilds from `stale_recovery` → exactly +1 decision, APPLIED B/2.
+- **M (true verify→mutation TOCTOU, queue-level)**: inside A's in-transaction verify PASS for stage N, B's takeover attempt fails SQLITE_BUSY (cannot interleave); A's stage commits epoch1-valid; only after commit does B's takeover land epoch2; A's stage N+1 atomically fenced — zero mutation, no defect.
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **33/33 pass** (R4 32 + M) |
+| PR #23 / PR #24 / Phase C / Phase B | pass (230 tests) |
+| **Full suite** | **2559 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R4 `256883e` 2558/2/15 → +1 test, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+All R0–R4 closures: DSH_EXHAUSTED availability · authority→POLICY_DENIAL · ROUTE_INFEASIBLE · caller-presented scope · `expireSweep(now)` · exact SUPERSEDED relink · orphan discovery · deterministic plan + `stale_recovery` · `recovery_id` adoption · lease takeover · owner+epoch token · mandatory `markExercisedApplied` · extension no-stack · revalidation dedupe · UNKNOWN zero-replay · PR #23/#24/Phase C.
+
+## Changed files (R5)
+
+- `src/pair/approval-queue.ts` — new `runFencedExerciseStage` primitive (in-transaction claim verify + one mutation)
+- `src/pair/mission-runtime.ts` — `stillOwned()` replaced by `stage()` atomic runner across all arms; `resumeExercisedChain` mint+stamp unified into one transaction; adoption stamp atomic
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — trapVerify→trapStage migration, J/K/L retargeted, +M true-TOCTOU test
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R5_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**

@@ -1723,44 +1723,63 @@ export class MissionRuntime {
     const rtState = String(rt.state);
     const waiting = rtState === "WAITING_APPROVAL";
     const terminal = TERMINAL_RUNTIME.has(rtState as MissionRuntimeState);
-    // R3 — fencing token: claim_epoch is the authority. Every critical
-    // effect stage re-proves the claim against the canonical row right
-    // before mutating; once another owner advanced the epoch this token
-    // is dead forever. A stale holder converges — never a defect.
+    // R5 — atomic fencing: `claim_epoch` is the authority, and every
+    // bounded effect stage re-verifies it INSIDE the same BEGIN
+    // IMMEDIATE transaction as its mutation. Takeover can only land
+    // between committed stages; the stale owner's next stage is fenced
+    // atomically — zero writes, bounded convergence, never a defect.
     const token = claim.claim!;
-    const stillOwned = () =>
-      this.deps.approvals.verifyExerciseClaim(approvalId, token) !== null;
+    const stage = <T>(mutation: () => T) =>
+      this.deps.approvals.runFencedExerciseStage(
+        approvalId,
+        token,
+        mutation,
+      );
 
     switch (intent) {
       case "RECOVERY_TASK_ATTEMPT_EXTENSION":
       case LEGACY_RECOVERY_BUDGET_OVERRIDE: {
-        if (!stillOwned()) return;
-        // Task-scoped attempt grant — assignment keyed by the task the
-        // approval bound, with the exercise id as provenance. Replays
-        // write the same value, so the grant can never stack twice.
-        const ext = (rt.budget_extension as Record<string, unknown>) ?? {};
-        const tasks =
-          (ext.tasks as Record<string, Record<string, unknown>>) ?? {};
-        tasks[taskId] = {
-          attempts_per_task: Number(effect.attempts_per_task ?? 1),
-          baseline_attempts: Number(effect.baseline_attempts ?? 0),
-          baseline_identical: Number(effect.baseline_identical ?? 0),
-          approval_exercise_id: exerciseId,
-        };
-        rt.budget_extension = { ...ext, tasks };
-        this.store.put(
-          "mission_runtime",
-          String(rt.mission_runtime_id),
-          rt,
-          Number(rt.version),
-        );
+        // Atomic stage: keyed grant assignment + runtime persist. The
+        // exercise id is the provenance — replays write identical values,
+        // so the grant can never stack twice.
+        if (
+          stage(() => {
+            const rtS = this.runtimeEntity(missionId);
+            const ext =
+              (rtS.budget_extension as Record<string, unknown>) ?? {};
+            const tasks =
+              (ext.tasks as Record<string, Record<string, unknown>>) ?? {};
+            tasks[taskId] = {
+              attempts_per_task: Number(effect.attempts_per_task ?? 1),
+              baseline_attempts: Number(effect.baseline_attempts ?? 0),
+              baseline_identical: Number(effect.baseline_identical ?? 0),
+              approval_exercise_id: exerciseId,
+            };
+            rtS.budget_extension = { ...ext, tasks };
+            rtS.pending_approval_id = null;
+            this.store.put(
+              "mission_runtime",
+              String(rtS.mission_runtime_id),
+              rtS,
+              Number(rtS.version),
+            );
+          }).fenced
+        ) {
+          return;
+        }
         if (waiting) {
-          if (!stillOwned()) return; // R4: fence before transition
-          this.transitionRuntime(
-            missionId,
-            "RECOVERING",
-            "approval_exercised_attempt_extension",
-          );
+          // Atomic stage: approval-driven transition.
+          if (
+            stage(() =>
+              this.transitionRuntime(
+                missionId,
+                "RECOVERING",
+                "approval_exercised_attempt_extension",
+              ),
+            ).fenced
+          ) {
+            return;
+          }
         }
         // A FRESH governed decide() applies the widened per-task ceiling —
         // replaying the stale pending action would just re-mint the same
@@ -1774,30 +1793,43 @@ export class MissionRuntime {
             exerciseId,
             now,
             effect,
-            stillOwned,
+            stage,
           );
         }
         break;
       }
       case "RECOVERY_OPERATOR_REVALIDATION": {
-        if (!stillOwned()) return;
+        // Atomic stage: runtime persist (approval linkage cleared).
+        if (
+          stage(() => {
+            const rtS = this.runtimeEntity(missionId);
+            rtS.pending_approval_id = null;
+            this.store.put(
+              "mission_runtime",
+              String(rtS.mission_runtime_id),
+              rtS,
+              Number(rtS.version),
+            );
+          }).fenced
+        ) {
+          return;
+        }
         // Approval = "operator reviewed this escalation" — the effect is
         // a fresh bounded re-decision; the failure itself is unchanged.
         // If nothing actually changed, the same signature re-escalates
         // once and is bounded (§7), never an approval loop.
-        this.store.put(
-          "mission_runtime",
-          String(rt.mission_runtime_id),
-          rt,
-          Number(rt.version),
-        );
         if (waiting) {
-          if (!stillOwned()) return; // R4: fence before transition
-          this.transitionRuntime(
-            missionId,
-            "RECOVERING",
-            "approval_exercised_revalidation",
-          );
+          if (
+            stage(() =>
+              this.transitionRuntime(
+                missionId,
+                "RECOVERING",
+                "approval_exercised_revalidation",
+              ),
+            ).fenced
+          ) {
+            return;
+          }
         }
         if (!terminal) {
           this.resumeExercisedChain(
@@ -1806,96 +1838,151 @@ export class MissionRuntime {
             exerciseId,
             now,
             effect,
-            stillOwned,
+            stage,
           );
         }
         break;
       }
       case "ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY": {
-        if (!stillOwned()) return;
-        // §5 — explicit no-replay acknowledgment: settle the barrier with
-        // an operator outcome, fail the affected task terminally,
-        // neutralize the stale pending recovery, converge. The task is
-        // NEVER re-dispatched/re-routed on this approval.
+        // §5 — explicit no-replay acknowledgment, decomposed into atomic
+        // fenced stages: takeover between any two stages leaves the
+        // committed ones valid, and the new owner resumes idempotently.
+        // The task is NEVER re-dispatched/re-routed on this approval.
         const barriers =
           (rt.barriers as Record<string, Record<string, unknown>>) ?? {};
-        const barrier = barriers[taskId];
-        // Stamp-guarded: re-entry after a crash never re-settles — the
-        // settlement is already keyed to THIS approval_exercise_id.
-        if (
-          barrier &&
-          String(barrier.approval_exercise_id ?? "") !== exerciseId
-        ) {
-          barrier.settled = true;
-          barrier.operator_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
-          barrier.approval_exercise_id = exerciseId;
-          rt.barriers = barriers;
-        }
-        if (!stillOwned()) return; // R4: fence before task terminalize
-        if (taskId) {
-          const task = this.store.tryGet("task", taskId);
-          if (task && String(task.status) !== "FAILED") {
-            this.deps.service.updateTask(taskId, { status: "FAILED" });
-          }
-        }
-        if (!stillOwned()) return; // R4: fence before exec outcome write
-        // Neutralize the execution row: the operator outcome is durable on
-        // the execution itself so RUNNING's in-flight sweep can never
-        // re-drive it into recovery after restart — replay is impossible
-        // even though execution_state stays UNKNOWN (receipt preserved).
-        const barrierExecId = barrier?.execution_id
-          ? String(barrier.execution_id)
+        const barrierExecId = barriers[taskId]?.execution_id
+          ? String(barriers[taskId].execution_id)
           : null;
-        if (barrierExecId) {
-          const exec = this.store.tryGet("executor_execution", barrierExecId);
-          if (
-            exec &&
-            String(exec.terminal_outcome ?? "") !==
-              "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY"
-          ) {
-            exec.terminal_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
-            this.store.put(
+        // Atomic stage: barrier settlement keyed to this exercise.
+        if (
+          stage(() => {
+            const rtS = this.runtimeEntity(missionId);
+            const bars =
+              (rtS.barriers as Record<string, Record<string, unknown>>) ??
+              {};
+            const bar = bars[taskId];
+            if (
+              bar &&
+              String(bar.approval_exercise_id ?? "") !== exerciseId
+            ) {
+              bar.settled = true;
+              bar.operator_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
+              bar.approval_exercise_id = exerciseId;
+              rtS.barriers = bars;
+              this.store.put(
+                "mission_runtime",
+                String(rtS.mission_runtime_id),
+                rtS,
+                Number(rtS.version),
+              );
+            }
+          }).fenced
+        ) {
+          return;
+        }
+        // Atomic stage: task terminalization.
+        if (
+          taskId &&
+          stage(() => {
+            const task = this.store.tryGet("task", taskId);
+            if (task && String(task.status) !== "FAILED") {
+              this.deps.service.updateTask(taskId, { status: "FAILED" });
+            }
+          }).fenced
+        ) {
+          return;
+        }
+        // Atomic stage: neutralize the execution row — the operator
+        // outcome is durable so RUNNING's in-flight sweep can never
+        // re-drive it into recovery after restart (replay impossible
+        // even though execution_state stays UNKNOWN, receipt preserved).
+        if (
+          barrierExecId &&
+          stage(() => {
+            const exec = this.store.tryGet(
               "executor_execution",
               barrierExecId,
-              exec,
-              Number(exec.version),
             );
-          }
+            if (
+              exec &&
+              String(exec.terminal_outcome ?? "") !==
+                "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY"
+            ) {
+              exec.terminal_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
+              this.store.put(
+                "executor_execution",
+                barrierExecId,
+                exec,
+                Number(exec.version),
+              );
+            }
+          }).fenced
+        ) {
+          return;
         }
-        if (!stillOwned()) return; // R4: fence before runtime persist
-        this.store.put(
-          "mission_runtime",
-          String(rt.mission_runtime_id),
-          rt,
-          Number(rt.version),
-        );
-        if (!stillOwned()) return; // R4: fence before pending clear
-        this.clearPendingRecovery(missionId, "CANCELLED", "operator_no_replay");
-        if (!stillOwned()) return; // R4: fence before linkage clear + transition
-        const rt3 = this.runtimeEntity(missionId);
-        rt3.pending_approval_id = null;
-        this.store.put(
-          "mission_runtime",
-          String(rt3.mission_runtime_id),
-          rt3,
-          Number(rt3.version),
-        );
-        if (waiting) {
-          this.transitionRuntime(missionId, "RUNNING", "approval_exercised_no_replay");
+        // Atomic stage: pending recovery neutralization.
+        if (
+          stage(() =>
+            this.clearPendingRecovery(
+              missionId,
+              "CANCELLED",
+              "operator_no_replay",
+            ),
+          ).fenced
+        ) {
+          return;
+        }
+        // Atomic stage: approval linkage clear + resume transition.
+        if (
+          stage(() => {
+            const rt3 = this.runtimeEntity(missionId);
+            rt3.pending_approval_id = null;
+            this.store.put(
+              "mission_runtime",
+              String(rt3.mission_runtime_id),
+              rt3,
+              Number(rt3.version),
+            );
+            if (waiting) {
+              this.transitionRuntime(
+                missionId,
+                "RUNNING",
+                "approval_exercised_no_replay",
+              );
+            }
+          }).fenced
+        ) {
+          return;
         }
         break;
       }
       default: {
-        if (!stillOwned()) return;
-        this.store.put(
-          "mission_runtime",
-          String(rt.mission_runtime_id),
-          rt,
-          Number(rt.version),
-        );
+        if (
+          stage(() => {
+            const rtS = this.runtimeEntity(missionId);
+            rtS.pending_approval_id = null;
+            this.store.put(
+              "mission_runtime",
+              String(rtS.mission_runtime_id),
+              rtS,
+              Number(rtS.version),
+            );
+          }).fenced
+        ) {
+          return;
+        }
         if (waiting) {
-          if (!stillOwned()) return; // R4: fence before transition
-          this.transitionRuntime(missionId, "RUNNING", "approval_granted_resume");
+          if (
+            stage(() =>
+              this.transitionRuntime(
+                missionId,
+                "RUNNING",
+                "approval_granted_resume",
+              ),
+            ).fenced
+          ) {
+            return;
+          }
         }
       }
     }
@@ -1984,7 +2071,7 @@ export class MissionRuntime {
     exerciseId: string,
     now?: string,
     plan?: Record<string, unknown>,
-    stillOwned?: () => boolean,
+    stage?: <T>(mutation: () => T) => { fenced: boolean },
   ): void {
     const planHasSnapshot =
       plan != null &&
@@ -1994,7 +2081,7 @@ export class MissionRuntime {
     const planChainId = planStale
       ? String(planStale.recovery_id ?? "")
       : null;
-    if (stillOwned && !stillOwned()) return; // fenced mid-apply (R3)
+    if (!stage) return;
     const rt = this.runtimeEntity(missionId);
     const pending = rt.pending_recovery as Record<string, unknown> | null;
     if (
@@ -2014,45 +2101,63 @@ export class MissionRuntime {
       // instead of minting a second recovery_decision for this APRE.
       // Plans without the snapshot key (pre-R4 winners) cannot prove the
       // distinction — fall through to the conservative clear+rebuild.
-      if (stillOwned && !stillOwned()) return; // fence before stamp
-      pending.approval_exercise_id = exerciseId;
-      rt.pending_recovery = pending;
-      this.store.put(
-        "mission_runtime",
-        String(rt.mission_runtime_id),
-        rt,
-        Number(rt.version),
-      );
+      // Atomic stage: stamp + persist, atomically owned.
+      stage(() => {
+        const rtS = this.runtimeEntity(missionId);
+        const cur = rtS.pending_recovery as Record<string, unknown> | null;
+        if (cur) {
+          cur.approval_exercise_id = exerciseId;
+          rtS.pending_recovery = cur;
+          this.store.put(
+            "mission_runtime",
+            String(rtS.mission_runtime_id),
+            rtS,
+            Number(rtS.version),
+          );
+        }
+      });
       return;
     }
-    if (stillOwned && !stillOwned()) return; // R4: fence before clear
-    this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
+    // Atomic stage: clear the stale pending chain.
+    if (
+      stage(() =>
+        this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised"),
+      ).fenced
+    ) {
+      return;
+    }
     const stale = pending ?? planStale;
     if (!stale) return;
-    if (stillOwned && !stillOwned()) return; // fenced before chain mint
-    this.startRecovery(
-      missionId,
-      taskId || String(stale.task_id),
-      stale.execution_id ? String(stale.execution_id) : null,
-      stale.failure_class as ReturnType<typeof classifyFailure>,
-      now,
-      undefined,
-      stale.infeasible_actions as
-        | Array<{ action: RecoveryAction; reason: string }>
-        | undefined,
-    );
-    if (stillOwned && !stillOwned()) return; // R4: fence before stamp
-    const rtAfter = this.runtimeEntity(missionId);
-    const fresh = rtAfter.pending_recovery as Record<string, unknown> | null;
-    if (fresh) {
-      fresh.approval_exercise_id = exerciseId;
-      this.store.put(
-        "mission_runtime",
-        String(rtAfter.mission_runtime_id),
-        rtAfter,
-        Number(rtAfter.version),
+    // Atomic stage (§7 critical): recovery decision mint AND the
+    // approval_exercise_id stamp inside ONE transaction — a competing
+    // takeover cannot land between mint and stamp, so no window exists
+    // for a stale mint followed by a stale stamp.
+    stage(() => {
+      this.startRecovery(
+        missionId,
+        taskId || String(stale.task_id),
+        stale.execution_id ? String(stale.execution_id) : null,
+        stale.failure_class as ReturnType<typeof classifyFailure>,
+        now,
+        undefined,
+        stale.infeasible_actions as
+          | Array<{ action: RecoveryAction; reason: string }>
+          | undefined,
       );
-    }
+      const rtAfter = this.runtimeEntity(missionId);
+      const fresh = rtAfter.pending_recovery as
+        | Record<string, unknown>
+        | null;
+      if (fresh) {
+        fresh.approval_exercise_id = exerciseId;
+        this.store.put(
+          "mission_runtime",
+          String(rtAfter.mission_runtime_id),
+          rtAfter,
+          Number(rtAfter.version),
+        );
+      }
+    });
   }
 
   private clearPendingRecovery(
