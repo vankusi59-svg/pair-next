@@ -19,10 +19,18 @@
  *    FAILED_DELIVERY past the ceiling); ambiguous (thrown, unknown
  *    acceptance, or `ok` WITHOUT message_id) → UNKNOWN_SIDE_EFFECT —
  *    never auto-resend, never claimed SENT (R4 §2).
- *  - file content reading (.txt/.md sent as message text; everything
- *    else as document upload) lives here so the bridge and tests share
- *    the exact same decision.
+ *  - FILES means ARTIFACT transport (R2.3): every manifested artifact —
+ *    including .txt/.md — is sent as the digest-pinned file (document/
+ *    photo upload), never re-read, trimmed, truncated, or converted to
+ *    message text. The path projected by pendingTelegramDeliveries is
+ *    a request-owned snapshot of the digest-verified bytes; this module
+ *    re-verifies that exact path's digest immediately before claiming
+ *    the attempt, so the bytes entering the network call are provably
+ *    the bytes whose sha256 was authorized (no TOCTOU, no transform).
  */
+
+import { digest, sha256File } from "./canonical.js";
+import { SHA256_HEX_RE } from "./telegram-delivery.js";
 
 export type GovernedSendResult =
   | { kind: "ok"; message_id?: string | number }
@@ -63,12 +71,6 @@ export interface DeliveryBackend {
   unsendable(reason: string): Promise<void> | void;
 }
 
-const TEXT_FILE_EXT = new Set([".txt", ".md"]);
-
-function extname(name: string): string {
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i).toLowerCase() : "";
-}
 
 /** R6 §6 — defense-in-depth process-local non-overlap guard: a trigger
  *  firing while the previous cycle is still running is skipped. The
@@ -102,7 +104,8 @@ export async function transportTelegramDelivery(args: {
   /** Authorization check on the bound destination (allowlist semantics). */
   isAllowed: (chatId: string) => boolean;
   backend: DeliveryBackend;
-  /** Reads artifact file content for .txt/.md message payloads. */
+  /** Deprecated (R2.3): FILES artifacts are always transported as
+   *  files — no caller-side text conversion is consulted. */
   readText?: (absPath: string) => string;
   /** Payload prefix — keeps the bridge's 📨 convention in one place. */
   textPrefix?: string;
@@ -199,14 +202,33 @@ export async function transportTelegramDelivery(args: {
     // R4 §1 — TEXT carries the same durable slot state as FILES; only a
     // canonically eligible QUEUED text payload may begin.
     if (String(req.text_state) !== "QUEUED") return { sent, held: false };
-    const text = `${prefix}${String(req.text ?? "")}`.trim();
+    // R2.1 — re-prove payload evidence at the transport edge: the exact
+    // text that will be sent must still hash/length/source-match the
+    // bound evidence. Anything else never reaches begin or the network.
+    const body = String(req.text ?? "");
+    const wantSha = String(req.text_sha256 ?? "");
+    let actualSha: string | null = null;
+    try {
+      actualSha = digest(body);
+    } catch {
+      actualSha = null;
+    }
+    if (
+      !body.length ||
+      !SHA256_HEX_RE.test(wantSha) ||
+      actualSha !== wantSha ||
+      Number(req.text_length) !== body.length
+    ) {
+      return { sent, held: false };
+    }
+    const text = `${prefix}${body}`.trim();
     if (text.length <= prefix.trim().length) return { sent, held: false };
     // R7 — exclusive acquire required before any network call. A stale
     // projection is not authority: if the durable begin did not grant
     // this caller the attempt, the send must not happen.
     const acq = await args.backend.begin(null);
     if (!acq || acq.acquired !== true) return { sent, held: false };
-    const r = await send({ text: `${prefix}${String(req.text ?? "").slice(0, 3700)}` });
+    const r = await send({ text: `${prefix}${body.slice(0, 3700)}` });
     if (await resolve(null, r)) sent.push(`TEXT:${String(req.delivery_id)}`);
     return { sent, held: false };
   }
@@ -215,21 +237,24 @@ export async function transportTelegramDelivery(args: {
     if (String(art.state) !== "QUEUED" || !art.path) continue;
     const name = String(art.name);
     const fp = String(art.path);
+    // R2.3 — the slot's authorized sha256 must still match the pinned
+    // path bytes BEFORE any attempt is claimed: a diverging/tampered
+    // snapshot never reaches begin or the network (the next projection
+    // re-verifies the source and converges the slot deterministically).
+    const wantSha = String(art.sha256 ?? "");
+    let actualSha: string | null = null;
+    try {
+      actualSha = sha256File(fp);
+    } catch {
+      actualSha = null;
+    }
+    if (!SHA256_HEX_RE.test(wantSha) || actualSha !== wantSha) continue;
     // R7 — exclusive acquire required before any network call.
     const acq = await args.backend.begin(name);
     if (!acq || acq.acquired !== true) continue;
-    let r: GovernedSendResult;
-    if (TEXT_FILE_EXT.has(extname(name)) && args.readText) {
-      const content = args.readText(fp).trim();
-      r = content
-        ? await send({
-            text: `${prefix}${name}:\n\n${content.slice(0, 3600)}`,
-            name,
-          })
-        : { kind: "fail", error: "artifact empty" };
-    } else {
-      r = await send({ filePath: fp, name });
-    }
+    // FILES = artifact transport: the digest-pinned file itself, never
+    // a trimmed/truncated text conversion (R2.3).
+    const r = await send({ filePath: fp, name });
     if (await resolve(name, r)) sent.push(name);
   }
   return { sent, held: false };

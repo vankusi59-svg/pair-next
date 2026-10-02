@@ -56,6 +56,7 @@ import {
   normalizeArtifactPath,
   extractTaskDataflow,
   detectTelegramDeliveryIntent,
+  detectOutputLanguage,
   pendingTelegramDeliveries,
   deliveryRequestId,
   transportTelegramDelivery,
@@ -790,7 +791,10 @@ describe("R1 E2E — incident shape converges through the repaired plan", () => 
     const planner = () => ({
       tasks: reconcilePlanDataflow(
         JSON.parse(JSON.stringify(rawUnsound)),
-        { telegramIntent: FILES_INTENT(["analysis.txt"]) },
+        {
+          telegramIntent: FILES_INTENT(["analysis.txt"]),
+          outputLanguage: detectOutputLanguage("send analysis.txt to telegram"),
+        },
       ).tasks,
     });
     const ctx = makeCtx("e2e-incident", { planner: planner as never });
@@ -1028,7 +1032,10 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
         },
         deliveryTask("T3", [], "report.txt"),
       ],
-      { telegramIntent: intent },
+      {
+        telegramIntent: intent,
+        outputLanguage: detectOutputLanguage("send report.txt to telegram"),
+      },
     ).tasks;
 
   it("D. explicit FILES intent → exact manifested artifact sent exactly once, durable evidence", async () => {
@@ -1080,7 +1087,10 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
         },
         deliveryTask("T3", [], "a.txt"),
       ],
-      { telegramIntent: FILES_INTENT(["a.txt", "c.png"]) },
+      {
+        telegramIntent: FILES_INTENT(["a.txt", "c.png"]),
+        outputLanguage: detectOutputLanguage("send a.txt and c.png to telegram"),
+      },
     ).tasks;
     const m = ctx.control.startMission({
       project_id: ctx.projectId,
@@ -1157,7 +1167,10 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
         remoteTask("T2", ["T1"]),
         deliveryTask("T3", [], "chart.png"),
       ],
-      { telegramIntent: FILES_INTENT(["chart.png"]) },
+      {
+        telegramIntent: FILES_INTENT(["chart.png"]),
+        outputLanguage: detectOutputLanguage("research remotely and send chart.png to telegram"),
+      },
     ).tasks;
     // Delivery binds the remote producer as PAIR_OUTBOX_UPLOAD — never
     // a local artifact guess.
@@ -1213,7 +1226,10 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
           required_capabilities: ["TELEGRAM_DELIVERY"], depends_on: [], metadata: {},
         },
       ],
-      { telegramIntent: TEXT_INTENT },
+      {
+        telegramIntent: TEXT_INTENT,
+        outputLanguage: detectOutputLanguage("research and send results to telegram"),
+      },
     ).tasks;
     // TEXT mode: deps on every earlier content-bearing task (T1 uses
     // FILE_OPERATIONS here → content-bearing); NO artifact consume is
@@ -1406,7 +1422,10 @@ describe("R2 §9–12 — pre-dispatch prerequisite, post-failure, reserved fiel
 
 /* =================== R3 — delivery closure =================== */
 
-/** Shared delivery-plan helper: goal + producer + governed delivery. */
+/** Shared delivery-plan helper: goal + producer + governed delivery.
+ *  R2.2 — every delivery task must carry the contract marker, so the
+ *  canonical reconcile runs with the same output-language authority the
+ *  runtime will re-derive from the mission goal at commit. */
 const r3DeliveryPlan = (intent: TelegramDeliveryIntent, file = "report.txt") =>
   reconcilePlanDataflow(
     [
@@ -1418,7 +1437,10 @@ const r3DeliveryPlan = (intent: TelegramDeliveryIntent, file = "report.txt") =>
       },
       deliveryTask("T3", [], file),
     ],
-    { telegramIntent: intent },
+    {
+      telegramIntent: intent,
+      outputLanguage: detectOutputLanguage(`send ${file} to telegram`),
+    },
   ).tasks;
 
 const startDeliveryMission = async (
@@ -1453,7 +1475,10 @@ const startDeliveryMission = async (
               depends_on: [], metadata: {},
             },
           ],
-          { telegramIntent: intent },
+          {
+            telegramIntent: intent,
+            outputLanguage: detectOutputLanguage(`send ${file} to telegram`),
+          },
         ).tasks
       : r3DeliveryPlan(intent, file);
   const m = ctx.control.startMission({
@@ -2919,7 +2944,12 @@ describe("R8 §6 — production incident repro + correct path", () => {
           metadata: {},
         },
       ],
-      { telegramIntent: intent },
+      {
+        telegramIntent: intent,
+        outputLanguage: detectOutputLanguage(
+          "write analysis.txt and send analysis.txt to telegram",
+        ),
+      },
     ).tasks;
     const t3 = plan.find((t) => t.task_key === "T3")!;
     expect(t3.depends_on).toEqual(["T2"]); // delivery leaf binds the producer

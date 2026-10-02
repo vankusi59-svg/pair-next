@@ -693,6 +693,9 @@ export class MissionControl {
           plan_digest: v.preview.plan_digest,
           planner_attempt_id: v.preview.planner_attempt_id ?? null,
           planner: v.preview.planner ?? null,
+          // R2.2 — carried container provenance (evidence; validation
+          // requires the contract marker unconditionally).
+          plan_contract_version: v.preview.plan_contract_version ?? null,
         },
         // What the serve-side template planner returns verbatim — the exact
         // persisted canonical tasks, never re-planned.

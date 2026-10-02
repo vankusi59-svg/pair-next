@@ -749,6 +749,29 @@ export function pendingTelegramDeliveries(
       const probe = { ...req } as Record<string, unknown>;
       const [s] = slots(req, probe);
       if (!eligible(s.slot, ts)) continue;
+      // R2.1 — a TEXT payload has send authority ONLY when its canonical
+      // payload evidence is complete AND internally consistent with the
+      // exact persisted text. A persisted pre-contract request (e.g.
+      // text:"DONE", no bound evidence) has no provable payload source:
+      // it converges to a durable terminal failure — never migrated,
+      // never re-baselined from the workspace, zero network calls.
+      const text = req.text;
+      const evidenceOk =
+        typeof text === "string" &&
+        text.length > 0 &&
+        typeof req.text_sha256 === "string" &&
+        SHA256_HEX_RE.test(req.text_sha256) &&
+        req.text_sha256 === digest(text) &&
+        Number(req.text_length) === text.length &&
+        String(req.text_source_artifact) === DELIVERY_TEXT_ARTIFACT;
+      if (!evidenceOk) {
+        probe.text_state = "FAILED_DELIVERY";
+        probe.last_error = "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE";
+        probe.completed_at = ts;
+        probe.status = recomputeStatus(req, probe);
+        putReq(store, probe);
+        continue;
+      }
       out.push(probe);
       continue;
     }
@@ -799,6 +822,32 @@ export function pendingTelegramDeliveries(
         dirty = true;
         continue;
       }
+      // R2.3 — pin the verified bytes: the wire artifact must be the
+      // exact digest-authorized content, not whatever the workspace
+      // path holds at send time (TOCTOU between projection and send).
+      // Copy the verified bytes into a request-owned snapshot and
+      // project THAT path; the snapshot lives in a dedicated hidden
+      // subdir so artifact-name resolution never confuses it for a
+      // manifested sibling, and it remains as durable evidence of the
+      // exact bytes that were authorized for transport.
+      const snapDir = path.join(String(req.outbox_dir), ".delivery-snapshots");
+      const snapPath = path.join(
+        snapDir,
+        `${String(req.delivery_id)}-${String(a.name)}`.replace(/[^A-Za-z0-9._-]/g, "_"),
+      );
+      try {
+        fs.mkdirSync(snapDir, { recursive: true });
+        const tmp = `${snapPath}.tmp`;
+        fs.copyFileSync(p, tmp);
+        fs.renameSync(tmp, snapPath);
+        if (sha256File(snapPath) !== a.sha256) throw new Error("snapshot_digest_mismatch");
+      } catch {
+        a.state = "FAILED_DELIVERY";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+        a.completed_at = ts;
+        dirty = true;
+        continue;
+      }
       if (a.next_retry_at && a.next_retry_at > ts) continue; // backoff
       projected.push({
         name: a.name,
@@ -806,7 +855,8 @@ export function pendingTelegramDeliveries(
         attempt_count: a.attempt_count,
         max_attempts: a.max_attempts,
         next_retry_at: a.next_retry_at,
-        path: p,
+        path: snapPath,
+        sha256: a.sha256,
       });
     }
     if (dirty) {

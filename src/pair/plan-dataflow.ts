@@ -102,14 +102,15 @@ const MAX_MANIFEST_ARTIFACTS = 16;
  *  reserved key — a forged value only mutates evidence, never edges. */
 export const PAIR_DATAFLOW_ORIGINAL_DEPS = "pair_dataflow_original_deps";
 
-/** R1.3 — PAIR-owned plan-contract version marker. Stamped on every
+/** R1.3/R2.2 — PAIR-owned plan-contract version marker. Stamped on every
  *  canonical TELEGRAM_DELIVERY task at the same reconcile seam as
- *  `pair_output_language`. Presence = "this plan was canonicalized under
- *  the output-language contract" → the language stamp becomes MANDATORY.
- *  Absence = legacy pre-contract plan → the stamp is tolerated when
- *  absent but still must match when present (explicit version gate;
- *  unlimited `missing stamp => tolerate` applies only to plans that
- *  never saw the contract). PAIR-reserved: planner cannot mint it. */
+ *  `pair_output_language`. The marker is MANDATORY on every delivery
+ *  task at every validation boundary: marker absence is NOT proof of a
+ *  legacy plan (a fresh plan that bypassed reconcile looks identical),
+ *  so pre-contract shapes are rejected and must be re-planned under the
+ *  current contract era (forced-replan semantics — no `absent =>
+ *  legacy` inference, no unlimited tolerance). PAIR-reserved: the
+ *  planner cannot mint it. */
 export const PAIR_PLAN_CONTRACT_KEY = "pair_plan_contract";
 export const PAIR_PLAN_CONTRACT_VERSION = 2;
 
@@ -1098,10 +1099,11 @@ export interface AssertPlanDataflowOptions {
  * The stamped pair_output_language on a delivery task must equal the
  * goal-derived contract byte-for-byte — a different value is tampering,
  * and the reserved key on a non-delivery task is forged authority.
- * R1.3 version gate: `pair_plan_contract {version}` marks a
- * new-contract plan → stamp REQUIRED; absent marker → legacy plan →
- * absent stamp tolerated (explicit, version-gated compat — not
- * unlimited). An unknown/malformed marker version has no authority.
+ * R1.3/R2.2 contract gate: `pair_plan_contract {version:2}` is REQUIRED
+ * on every delivery task — absent marker, unknown version, or missing
+ * stamp all fail closed (forced-replan semantics; marker absence is
+ * never treated as legacy provenance). A non-delivery task carrying
+ * either reserved key is forged authority.
  */
 export function assertOutputLanguageAuthority(
   tasks: Array<Record<string, unknown>>,
@@ -1115,27 +1117,38 @@ export function assertOutputLanguageAuthority(
       | { version?: unknown }
       | undefined;
     if (isDeliveryTask(t)) {
-      if (contract !== undefined) {
-        const v = Number(contract?.version);
-        if (!Number.isSafeInteger(v) || v !== PAIR_PLAN_CONTRACT_VERSION) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
-            JSON.stringify({
-              task: String(t.task_key ?? "?"),
-              unknown_plan_contract: contract ?? null,
-            }),
-          );
-        }
-        if (stamped === undefined) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
-            JSON.stringify({
-              task: String(t.task_key ?? "?"),
-              missing_stamp: true,
-              plan_contract: contract,
-            }),
-          );
-        }
+      // R2.2 — every delivery task MUST carry the contract marker.
+      // Absence proves nothing about provenance (a bypassed plan looks
+      // identical to a pre-contract one), so there is no tolerated
+      // absence: reject and force re-plan under the current contract.
+      if (contract === undefined) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+          JSON.stringify({
+            task: String(t.task_key ?? "?"),
+            missing_plan_contract: true,
+          }),
+        );
+      }
+      const v = Number(contract?.version);
+      if (!Number.isSafeInteger(v) || v !== PAIR_PLAN_CONTRACT_VERSION) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+          JSON.stringify({
+            task: String(t.task_key ?? "?"),
+            unknown_plan_contract: contract ?? null,
+          }),
+        );
+      }
+      if (stamped === undefined) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY",
+          JSON.stringify({
+            task: String(t.task_key ?? "?"),
+            missing_stamp: true,
+            plan_contract: contract,
+          }),
+        );
       }
       if (stamped !== undefined && canonicalJson(stamped) !== want) {
         throw new IntegrityError(

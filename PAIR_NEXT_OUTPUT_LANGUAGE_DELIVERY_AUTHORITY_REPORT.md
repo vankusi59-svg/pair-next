@@ -366,3 +366,151 @@ Classification:
 `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R1_PENDING_REAUDIT`
 
 STOP. DO NOT MERGE. Await independent re-audit.
+
+---
+
+# INDEPENDENT RE-AUDIT R2 REMEDIATION
+
+- **Previous audited HEAD:** `ade9e3020f55977da6267232a77e421aa59e9614`
+- **New HEAD:** see git log (this section committed on the same PR #30)
+- **Scope:** R2.1 legacy TEXT quarantine, R2.2 authoritative plan-contract
+  provenance, R2.3 FILES network identity + TOCTOU closure. All R1
+  invariants preserved.
+
+## R2.1 — RCA and legacy TEXT quarantine semantics
+
+**RCA.** New-era TEXT mints stamp `text_sha256`/`text_length`/
+`text_source_artifact`, but `pendingTelegramDeliveries()` projected any
+eligible TEXT request *without validating that evidence*. A persisted
+pre-R1 TDR (`text:"DONE"`, `text_state:QUEUED`, no evidence) survived an
+upgrade and was sent by the new bridge — re-enabling the exact
+historical defect after restart.
+
+**Fix.** In `pendingTelegramDeliveries()` (src/pair/telegram-delivery.ts),
+before a TEXT slot is projected, the persisted request must prove
+complete, internally consistent canonical payload evidence:
+
+- `text` is a non-empty string, AND
+- `text_sha256` matches `SHA256_HEX_RE` AND equals `digest(text)` of the
+  EXACT persisted text, AND
+- `text_length === text.length`, AND
+- `text_source_artifact === DELIVERY_TEXT_ARTIFACT`.
+
+**Missing/malformed/mismatched → deterministic quarantine:**
+`text_state=FAILED_DELIVERY` + `last_error=FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE`
++ request `FAILED_DELIVERY` via `recomputeStatus` → terminal (never
+eligible again) → **zero network calls**. No migration, no
+re-baselining, no workspace inference: the persisted payload is never
+rewritten — a legacy `"DONE"` stays `"DONE"` and simply never ships.
+
+## R2.2 — authoritative plan-version provenance
+
+**RCA.** R1's `pair_plan_contract {version:2}` marker made the language
+stamp mandatory *when present*, but `marker absent ⇒ legacy` — absence
+was treated as proof of a pre-contract plan. A fresh plan bypassing
+`reconcilePlanDataflow()` could reach `assertPlanDataflow()` without the
+marker and receive the exemption forever.
+
+**Architecture chosen (mandate option C + container provenance).**
+The exemption is **removed entirely**: every TELEGRAM_DELIVERY task that
+reaches a validation boundary must carry `pair_plan_contract v2` +
+matching `pair_output_language` stamp. Marker absence is now
+`missing_plan_contract` — FAIL CLOSED at every boundary
+(createPlanPreview, confirmPlanPreview, runPlanning, runReplan). There
+is no `absent ⇒ legacy` inference anywhere.
+
+- Unknown/malformed version → `unknown_plan_contract` FAIL CLOSED.
+- Marker v2 present but stamp absent → `missing_stamp` FAIL.
+- Stamp ≠ goal-derived authority → mismatch FAIL.
+- Reserved keys on a non-delivery task → `forged` FAIL.
+
+**Persisted provenance (evidence, not just task-local markers):**
+`mission_plan_preview` rows now carry `plan_contract_version` outside
+task metadata (`plan-preview.ts`), and `confirmPlanPreview` copies it
+into mission `pinned_plan.plan_contract_version` — an operator can audit
+which contract era any plan was minted under. Compatibility for
+pre-v2 persisted rows is **forced-replan**: validation is unconditional,
+so a legacy-shaped preview fails at confirm and the operator
+re-previews under v2 (self-healing inside the preview TTL).
+
+## R2.3 — FILES network identity design + TOCTOU closure
+
+**RCA.** FILES SHA-256 was verified at projection, but
+`transportTelegramDelivery()` then **re-read the file** and — for
+`.txt`/`.md` — `.trim()`ed, truncated to 3600 chars, and sent it as
+message *text*. Two defects: (a) TOCTOU window between verification and
+transport; (b) the wire payload was a transformed derivative, not the
+pinned artifact — a `send report.txt` request shipped transformed text.
+
+**Design — snapshot-pinned artifact transport:**
+
+1. **Projection pins the bytes.** `pendingTelegramDeliveries()` copies
+   each eligible FILES artifact into `<outbox>/.delivery-snapshots/
+   <delivery_id>-<name>` (tmp-write → fsync-rename → re-hash); a
+   snapshot whose digest ≠ slot `sha256` fails the slot closed
+   (`FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST`). The projected `path` points
+   at the snapshot — the immutable bytes whose digest was authorized.
+2. **Transport re-proves before every network call.** For each FILES
+   artifact the transport reads `sha256File(path)` and requires it to
+   equal the slot `sha256` — malformed/mismatched → `continue` (no
+   `begin`, no claim, **zero network calls**); the slot stays QUEUED and
+   the next projection re-verifies + re-pins.
+3. **FILES means file transport.** Every manifested artifact — `.txt`,
+   `.md`, binaries — goes out via `send({filePath})` (document/photo
+   upload on the governed bridge, `sendPhoto`/`sendDocument`). The
+   text-conversion branch and `TEXT_FILE_EXT`/`extname` are deleted;
+   `readText` is deprecated dead argument. No `.trim()`, no truncation,
+   no message-text derivative.
+4. **TEXT keeps its own contract.** `sendText` now also requires the
+   mint evidence (`text_sha256`/`text_length` match the exact body)
+   before `begin` — a persisted body that drifts from its mint digest
+   can never ride the wire.
+
+`sha256(network artifact bytes) === TDR slot sha256` holds at the exact
+point of transmission — mutation after projection cannot alter sent
+bytes; a tampered snapshot fails the transport's own check.
+
+## R2 changed files
+
+- `src/pair/telegram-delivery.ts` — TEXT evidence gate at projection
+  (R2.1); FILES snapshot pin under `.delivery-snapshots/` (R2.3).
+- `src/pair/telegram-transport.ts` — per-artifact sha re-verify +
+  filePath-only transport; TEXT evidence check pre-`begin`; text
+  conversion removed.
+- `src/pair/plan-dataflow.ts` — `assertOutputLanguageAuthority`:
+  marker-absent → `missing_plan_contract` FAIL (exemption removed).
+- `src/pair/plan-preview.ts` — `plan_contract_version` container column.
+- `src/pair/mission-control.ts` — `pinned_plan.plan_contract_version`.
+- `src/__tests__/pair-output-delivery-contract.test.ts` — +12 R2 tests
+  (Q1–Q6, V1–V4, W1–W5); C1 `.txt` assert updated to file transport;
+  P5 rewritten to the fail-closed no-marker contract.
+- `src/__tests__/pair-planner-dataflow-incident.test.ts` — 6 reconcile
+  sites now pass `outputLanguage: detectOutputLanguage(<mission goal>)`
+  mirroring the serve seam (marker mandatory under R2.2).
+
+## R2 test results
+
+- New R2 focused tests: **12/12** (Q1–Q6 quarantine, V1–V4 provenance,
+  W1–W5 network identity).
+- `pair-output-delivery-contract`: **54 passed**
+- `pair-planner-dataflow-incident`: **106 passed**
+- `pair-ops-telegram-delivery`: **3 passed**
+- Full suite: **2796 passed / 2 failed / 15 skipped** (94 files) — the 2
+  failures are the unchanged env-only `pair-p5` tests 2+3
+  (`stockProbe.available===false` expected; this VM has the binaries).
+- `tsc --noEmit`: clean. `pnpm build`: clean.
+
+## R2 zero-network proofs
+
+- Q1–Q5: legacy/malformed TEXT TDRs → `FAILED_DELIVERY`, recording
+  transport **0 calls**, never re-projected, payload never rewritten.
+- F-series (R1) unchanged: hashless/malformed FILES → 0 calls.
+- W4: tampered snapshot → transport skips (`0` calls), next projection
+  re-pins and sends exactly the authorized bytes once.
+- V4: bypassed plan → `missing_plan_contract` at the planning tick —
+  commit never reached, **0 TDR rows**.
+
+Classification:
+`PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R2_PENDING_REAUDIT`
+
+STOP. DO NOT MERGE. Await independent re-audit.

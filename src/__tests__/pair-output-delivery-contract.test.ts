@@ -704,9 +704,13 @@ describe("C — exact production goal, FILES mode end-to-end", () => {
     expect(rec.calls).toHaveLength(1);
     const call = rec.calls[0];
     expect(call.name).toBe("report.txt");
-    // .txt is delivered as message text — the wire payload carries the
-    // producer's exact bytes (byte-identical, never rewritten).
-    expect(String(call.text)).toContain(VI_REPORT);
+    // R2.3 — FILES is artifact transport: the wire payload is the
+    // digest-pinned FILE itself (document upload), never text — and
+    // its bytes hash to the TDR slot digest.
+    expect(call.text).toBeUndefined();
+    expect(typeof call.filePath).toBe("string");
+    expect(sha256File(String(call.filePath))).toBe(String(arts[0].sha256));
+    expect(fs.readFileSync(String(call.filePath), "utf8")).toContain(VI_REPORT);
     const again = await runTransport(ctx);
     expect(again.sent).toEqual([]);
     void adapter;
@@ -1325,16 +1329,17 @@ describe("R1.3 — new plans must carry digest-covered language authority", () =
     ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
   });
 
-  it("P5. legacy pre-contract plan (no marker, no stamp) → still tolerated, explicitly version-gated", () => {
+  it("P5. R2.2 — marker absence is not legacy provenance: no-marker delivery plan → FAIL (forced replan)", () => {
     const plan = r1FilesPlan();
     const md = deliveryTask(plan).metadata as Record<string, unknown>;
     delete md[PAIR_OUTPUT_LANGUAGE_KEY];
     delete md[PAIR_PLAN_CONTRACT_KEY];
+    // Pre-contract-shaped tasks are rejected at EVERY validation
+    // boundary — there is no tolerated absence anymore.
     expect(() =>
       assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
-    ).not.toThrow();
-    // But a legacy plan carrying a WRONG stamp still fails — the gate
-    // tolerates absence, never a lie.
+    ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
+    // A no-marker plan carrying a WRONG stamp also fails.
     md[PAIR_OUTPUT_LANGUAGE_KEY] = { ...expectedLang(), code: "en" };
     expect(() =>
       assertPlanDataflow(plan, { telegramIntent: intent(), outputLanguage: expectedLang() }),
@@ -1409,5 +1414,363 @@ describe("R1.4 — language directives are output-scoped", () => {
     const ol = detectOutputLanguage(PROD_GOAL);
     expect(ol.code).toBe("vi");
     expect(ol.authority).toBe("GOAL_DIRECTIVE");
+  });
+});
+
+/* =================== INDEPENDENT RE-AUDIT R2 =================== */
+
+describe("R2.1 — legacy TEXT TDRs are quarantined, never migrated", () => {
+  const putTextReq = (
+    ctx: ReturnType<typeof makeCtx>,
+    id: string,
+    body: Record<string, unknown>,
+  ) =>
+    ctx.store.put("telegram_delivery_request", id, {
+      delivery_id: id,
+      mission_id: "M_L1",
+      task_id: "T_L1",
+      execution_id: "E_L1",
+      mode: "TEXT",
+      artifacts: [],
+      destination: {
+        provider: "TELEGRAM",
+        chat_id: "111",
+        provenance: "CONFIGURED_DEFAULT",
+      },
+      outbox_dir: path.join(ctx.workspace, "outbox"),
+      workspace: ctx.workspace,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      attempt_count: 0,
+      max_attempts: 3,
+      created_at: utcnow(),
+      ...body,
+    });
+
+  const validEvidence = (text: string) => ({
+    text,
+    text_sha256: digest(text),
+    text_length: text.length,
+    text_source_artifact: DELIVERY_TEXT_ARTIFACT,
+  });
+
+  it("Q1. legacy 'DONE' TDR with no evidence → FAILED_DELIVERY, zero network, payload never re-baselined", async () => {
+    const ctx = makeCtx("r2-q1");
+    putTextReq(ctx, "TDR_Q1", { text: "DONE" });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0); // zero network
+    const req = ctx.store.get("telegram_delivery_request", "TDR_Q1");
+    expect(req.status).toBe("FAILED_DELIVERY");
+    expect(req.text_state).toBe("FAILED_DELIVERY");
+    expect(String(req.last_error)).toBe("FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE");
+    // Terminal — never projected again.
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(0);
+    // No migration: the raw persisted payload is untouched.
+    expect(req.text).toBe("DONE");
+    expect(req.text_sha256).toBeUndefined();
+  });
+
+  it("Q2-Q5. malformed evidence matrix → every variant fails closed, zero network", async () => {
+    const ctx = makeCtx("r2-q2");
+    const base = validEvidence("the real report");
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["TDR_Q2", { ...base, text_sha256: null }], // missing sha
+      ["TDR_Q3", { ...base, text_sha256: digest("different bytes") }], // wrong sha
+      ["TDR_Q4", { ...base, text_length: 9999 }], // wrong length
+      ["TDR_Q5", { ...base, text_source_artifact: "outbox/other.txt" }], // wrong source
+      ["TDR_Q6", { ...base, text: "" }], // empty payload
+    ];
+    for (const [id, body] of cases) putTextReq(ctx, id, body);
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    for (const [id] of cases) {
+      const req = ctx.store.get("telegram_delivery_request", id);
+      expect(req.status).toBe("FAILED_DELIVERY");
+      expect(String(req.last_error)).toBe("FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE");
+    }
+  });
+
+  it("Q6. valid new-era TEXT TDR → projects and sends normally", async () => {
+    const ctx = makeCtx("r2-q6v");
+    putTextReq(ctx, "TDR_Q6V", validEvidence("the composed report"));
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["TEXT:TDR_Q6V"]);
+    expect(rec.calls).toHaveLength(1);
+    expect(String(rec.calls[0].text)).toContain("the composed report");
+    const req = ctx.store.get("telegram_delivery_request", "TDR_Q6V");
+    expect(req.status).toBe("SENT");
+  });
+});
+
+describe("R2.2 — plan-contract provenance is authoritative", () => {
+  const r2FilesPlan = () =>
+    reconcilePlanDataflow(prodPlan(), {
+      telegramIntent: FILES_INTENT(["report.txt"]),
+      outputLanguage: detectOutputLanguage(PROD_GOAL),
+    }).tasks;
+
+  it("V1. persisted preview carries container-level plan_contract_version (outside task metadata)", () => {
+    const ctx = makeCtx("r2-v1", {
+      planner: (() => ({ tasks: r2FilesPlan() })) as never,
+    });
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId,
+      goal: PROD_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      operator_id: "op1",
+    });
+    const row = ctx.store.get("mission_plan_preview", String(pv.preview_id));
+    expect(row.plan_contract_version).toBe(PAIR_PLAN_CONTRACT_VERSION);
+  });
+
+  it("V2. confirm carries the contract version into pinned_plan provenance", () => {
+    const ctx = makeCtx("r2-v2", {
+      planner: (() => ({ tasks: r2FilesPlan() })) as never,
+    });
+    const pv = ctx.control.createPlanPreview({
+      project_id: ctx.projectId,
+      goal: PROD_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      operator_id: "op1",
+    });
+    const m = ctx.control.confirmPlanPreview({
+      preview_id: String(pv.preview_id),
+      plan_digest: String(pv.plan_digest),
+      operator_id: "op1",
+    });
+    const pinned = (m.metadata as Record<string, unknown>).pinned_plan as Record<
+      string,
+      unknown
+    >;
+    expect(pinned.plan_contract_version).toBe(PAIR_PLAN_CONTRACT_VERSION);
+  });
+
+  it("V3. persisted pre-contract preview (no version, no marker) → confirm FAIL CLOSED (forced re-preview)", () => {
+    const ctx = makeCtx("r2-v3");
+    // A pre-v2-shaped persisted row: no container version, no task
+    // marker — indistinguishable from a bypassed fresh plan.
+    const legacyTasks = reconcilePlanDataflow(prodPlan(), {
+      telegramIntent: FILES_INTENT(["report.txt"]),
+    }).tasks;
+    ctx.store.put("mission_plan_preview", "MPP_OLD", {
+      preview_id: "MPP_OLD",
+      state: "READY",
+      project_id: ctx.projectId,
+      mission_input: {
+        project_id: ctx.projectId,
+        goal: PROD_GOAL,
+        metadata: {},
+        granted_permissions: ["FILE_WRITE", "FILE_READ"],
+        authorized_workspaces: [ctx.workspace],
+        risk_ceiling: "LOW",
+        operator_id: "op1",
+      },
+      effective_input_digest: "legacy",
+      plan_digest: "legacydigest",
+      canonical_tasks: legacyTasks,
+      planner_attempt_id: null,
+      planner: null,
+      consumed_mission_id: null,
+      created_at: utcnow(),
+      expires_at: "2999-01-01T00:00:00Z",
+      version: 0,
+    });
+    expect(() =>
+      ctx.control.confirmPlanPreview({
+        preview_id: "MPP_OLD",
+        plan_digest: "legacydigest",
+        operator_id: "op1",
+      }),
+    ).toThrow(/FAIL_CLOSED_OUTPUT_LANGUAGE_AUTHORITY/);
+    expect(ctx.store.list("mission")).toHaveLength(0); // forced replan — nothing committed
+  });
+
+  it("V4. a fresh plan bypassing reconcile (manifest but no contract marker) → FAIL CLOSED at commit", () => {
+    const ctx = makeCtx("r2-v4");
+    // Operator-pinned tasks where the delivery task carries its manifest
+    // but was never stamped under the contract era — marker absence is
+    // NOT proof of legacy: it is missing authority.
+    const bypass = prodPlan();
+    (bypass[4].metadata as Record<string, unknown>).pair_telegram_delivery = {
+      requested: true,
+      mode: "FILES",
+      artifacts: ["report.txt"],
+    };
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: PROD_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: bypass },
+    });
+    // First tick: CREATED → PLANNING. The planning tick fails closed —
+    // marker absence is missing authority, not legacy provenance.
+    expect(() => drive(ctx, String(m.mission_id), 3)).toThrow(/missing_plan_contract/);
+    expect(ctx.store.list("telegram_delivery_request")).toHaveLength(0);
+  });
+});
+
+describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
+  const mintFiles = (
+    ctx: ReturnType<typeof makeCtx>,
+    file: string,
+    content: string,
+  ) => {
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const fp = path.join(outbox, file);
+    fs.writeFileSync(fp, content);
+    const sha = sha256File(fp);
+    return mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_R23", metadata: {} },
+      task: {
+        task_id: "T_R23",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true,
+            mode: "FILES",
+            artifacts: [file],
+          },
+        },
+      },
+      execution: { execution_id: "E_R23" },
+      outboxDir: outbox,
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { [file]: sha },
+    }) as Record<string, unknown>;
+  };
+
+  it("W1. report.txt transports as a FILE (document), never text — whitespace preserved", async () => {
+    const ctx = makeCtx("r2-w1");
+    const content = `\n\n  ${VI_REPORT}\n\n`;
+    const req = mintFiles(ctx, "report.txt", content);
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["report.txt"]);
+    const call = rec.calls[0];
+    expect(call.text).toBeUndefined();
+    expect(call.filePath).toBeTruthy();
+    const wireBytes = fs.readFileSync(String(call.filePath));
+    // Leading/trailing whitespace preserved — byte-identical artifact.
+    expect(wireBytes.toString("utf8")).toBe(content);
+    expect(sha256File(String(call.filePath))).toBe(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    );
+  });
+
+  it("W2. a >3600-char .txt is preserved in full (no truncation)", async () => {
+    const ctx = makeCtx("r2-w2");
+    const content = EN_REPORT.repeat(60); // ~13k chars — past the old 3600 cut
+    mintFiles(ctx, "report.txt", content);
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["report.txt"]);
+    const wire = fs.readFileSync(String(rec.calls[0].filePath), "utf8");
+    expect(wire).toBe(content);
+    expect(wire.length).toBe(content.length);
+  });
+
+  it("W3. mutation after projection cannot alter transmitted bytes (TOCTOU closed)", async () => {
+    const ctx = makeCtx("r2-w3");
+    const req = mintFiles(ctx, "report.txt", VI_REPORT);
+    // Project first (digest verified + snapshot pinned), THEN mutate the
+    // source — the wire bytes must still be the authorized snapshot.
+    const projected = pendingTelegramDeliveries(ctx.store);
+    expect(projected).toHaveLength(1);
+    const source = path.join(ctx.workspace, "outbox", "report.txt");
+    fs.writeFileSync(source, "MUTATED AFTER PROJECTION");
+    const rec = recordingTransport();
+    const r = await transportTelegramDelivery({
+      request: projected[0],
+      transport: rec.transport,
+      isAllowed: () => true,
+      backend: storeBackend(ctx, projected[0]),
+    });
+    expect(r.sent).toEqual(["report.txt"]);
+    const wire = fs.readFileSync(String(rec.calls[0].filePath), "utf8");
+    expect(wire).toBe(VI_REPORT); // the pinned snapshot, not the mutation
+    expect(sha256File(String(rec.calls[0].filePath))).toBe(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    );
+  });
+
+  it("W4. snapshot pins bytes under .delivery-snapshots; a tampered snapshot never reaches the network", async () => {
+    const ctx = makeCtx("r2-w4");
+    const req = mintFiles(ctx, "report.txt", VI_REPORT);
+    const projected = pendingTelegramDeliveries(ctx.store);
+    expect(projected).toHaveLength(1);
+    const snapPath = String(
+      (projected[0].artifacts as Array<Record<string, unknown>>)[0].path,
+    );
+    expect(snapPath).toContain(".delivery-snapshots");
+    // The snapshot hashes to the authorized slot digest.
+    expect(sha256File(snapPath)).toBe(
+      String((req.artifacts as Array<Record<string, unknown>>)[0].sha256),
+    );
+    // Tamper the snapshot post-projection → transport skips the slot
+    // entirely (no claim, no network call).
+    fs.writeFileSync(snapPath, "tampered snapshot");
+    const rec = recordingTransport();
+    const r = await transportTelegramDelivery({
+      request: projected[0],
+      transport: rec.transport,
+      isAllowed: () => true,
+      backend: storeBackend(ctx, projected[0]),
+    });
+    expect(r.sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    // Next projection re-verifies the source and re-pins → heals and
+    // sends exactly the authorized bytes once.
+    const rec2 = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec2.transport });
+    expect(sent).toEqual(["report.txt"]);
+    expect(fs.readFileSync(String(rec2.calls[0].filePath), "utf8")).toBe(VI_REPORT);
+  });
+
+  it("W5. binary artifacts still transport as documents — lifecycle unchanged", async () => {
+    const ctx = makeCtx("r2-w5");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+    fs.writeFileSync(path.join(outbox, "chart.png"), png);
+    const sha = sha256File(path.join(outbox, "chart.png"));
+    mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_R25", metadata: {} },
+      task: {
+        task_id: "T_R25",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true,
+            mode: "FILES",
+            artifacts: ["chart.png"],
+          },
+        },
+      },
+      execution: { execution_id: "E_R25" },
+      outboxDir: outbox,
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { "chart.png": sha },
+    });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual(["chart.png"]);
+    const call = rec.calls[0];
+    expect(call.filePath).toBeTruthy();
+    expect(fs.readFileSync(String(call.filePath))).toEqual(png);
+    const req = ctx.store.list("telegram_delivery_request")[0];
+    expect(req.status).toBe("SENT");
   });
 });
