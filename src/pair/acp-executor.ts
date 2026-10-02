@@ -11,7 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { IntegrityError } from "./errors.js";
+import { IntegrityError, PairError } from "./errors.js";
 import {
   atomicWriteJson,
   digest,
@@ -27,7 +27,48 @@ export const ACP_JOURNAL_SCHEMA = "pair.os.vnext.acp-execution-journal.v1";
 
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 
-interface ExecutionRecord {
+/**
+ * Per-attempt context handed down by an adapter's `runAttempts` override
+ * (Phase C DSH model failover). `candidate` carries the router-selected
+ * model identity the attempt must pin; `remainingSeconds` is the shared
+ * task-deadline remainder; `markDispatch` flips durable dispatch_state
+ * immediately before the prompt is sent — the exact point after which no
+ * automatic failover may happen.
+ */
+export interface AcpAttemptContext {
+  candidate?: Record<string, unknown> | null;
+  remainingSeconds?: number;
+  /** Absolute shared task deadline (ms epoch) — every ACP stage clamps to
+   *  it and prompt dispatch is refused once it passes. */
+  deadlineAtMs?: number;
+  markDispatch?: () => void;
+}
+
+/** Remaining shared-deadline budget, or null when the attempt is unbounded. */
+export function attemptRemainingMs(attemptCtx: AcpAttemptContext | undefined): number | null {
+  const d = attemptCtx?.deadlineAtMs;
+  return d == null ? null : d - Date.now();
+}
+
+/** Timeout for one ACP setup stage: the caller's normal timeout clamped to
+ *  whatever the shared task deadline still allows. An already-expired
+ *  budget throws ACP_REQUEST_TIMEOUT instead of starting the stage. */
+export function attemptStageTimeout(
+  attemptCtx: AcpAttemptContext | undefined,
+  fallbackSeconds: number,
+): number {
+  const rem = attemptRemainingMs(attemptCtx);
+  if (rem == null) return fallbackSeconds;
+  if (rem <= 0) {
+    throw new PairError(
+      "ACP_REQUEST_TIMEOUT",
+      "shared task deadline exhausted during ACP session setup",
+    );
+  }
+  return Math.min(fallbackSeconds, Math.max(1, Math.ceil(rem / 1000)));
+}
+
+export interface ExecutionRecord {
   execution_id: string;
   governed_task_id: string;
   mission_id?: string;
@@ -119,8 +160,9 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
   /* ------------------------------------------------ provider hooks ----- */
   /** Resolve the launch descriptor, or null when the runtime is absent. */
   protected abstract resolveLaunch(): AcpLaunch | null;
-  /** Minimal provider env pins — never the full process env. */
-  protected providerEnv(): Record<string, string> {
+  /** Minimal provider env pins — never the full process env. The attempt
+   *  context lets a provider resolve per-candidate credentials. */
+  protected providerEnv(_attemptCtx?: AcpAttemptContext): Record<string, string> {
     return {};
   }
   /** Provider-specific probe fields (version, model route, auth presence). */
@@ -136,6 +178,7 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
     session: Record<string, unknown>,
     features: Record<string, unknown>,
     task: Record<string, unknown>,
+    _attemptCtx?: AcpAttemptContext,
   ): Promise<Record<string, unknown>> {
     void proc;
     void sessionId;
@@ -349,7 +392,6 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
     const runRoot = rec.run_root;
     const updatesLog = path.join(runRoot, "session_updates.jsonl");
     const decisionsLog = path.join(runRoot, "permission_decisions.jsonl");
-    const journalPath = path.join(runRoot, "execution_journal.json");
     const broker = new AcpPermissionBroker({
       workspace: task.workspace,
       allowed_paths: task.allowed_paths ?? [],
@@ -357,7 +399,58 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
       requested_tools: task.requested_tools ?? [],
       constraints: task.constraints ?? [],
     });
-    const proc = new AcpProcess(launch, this.providerEnv());
+    try {
+      await this.runAttempts(rec, task, launch, prompt, before, broker, updatesLog, decisionsLog);
+    } catch (error) {
+      const code = (error as { code?: string }).code ?? String(error);
+      const detail =
+        typeof (error as { detail?: string }).detail === "string"
+          ? (error as { detail: string }).detail
+          : code;
+      const status = code === "ACP_REQUEST_TIMEOUT" ? "TIMEOUT" : "FAILED";
+      this.finish(rec, task, before, status, code, detail);
+    }
+  }
+
+  /**
+   * Attempt seam (Phase C): adapters that route to a model pool override
+   * this to run `attemptExecution` per candidate. The default is one
+   * anonymous attempt — identical to pre-Phase-C behavior.
+   */
+  protected async runAttempts(
+    rec: ExecutionRecord,
+    task: Record<string, unknown>,
+    launch: AcpLaunch,
+    prompt: string,
+    before: Record<string, unknown>,
+    broker: AcpPermissionBroker,
+    updatesLog: string,
+    decisionsLog: string,
+  ): Promise<void> {
+    await this.attemptExecution(rec, task, launch, prompt, before, broker, updatesLog, decisionsLog, undefined);
+  }
+
+  /**
+   * One ACP session attempt: launch → initialize → session/new → provider
+   * pinning → dispatch mark → prompt. Everything before `proc.prompt` is
+   * pre-dispatch — provably side-effect-free. The journal's session fields
+   * describe the latest attempt; per-attempt canonical provenance lives in
+   * the provider's own attempt entity (dsh_model_attempt).
+   */
+  protected async attemptExecution(
+    rec: ExecutionRecord,
+    task: Record<string, unknown>,
+    launch: AcpLaunch,
+    prompt: string,
+    before: Record<string, unknown>,
+    broker: AcpPermissionBroker,
+    updatesLog: string,
+    decisionsLog: string,
+    attemptCtx: AcpAttemptContext | undefined,
+  ): Promise<void> {
+    const runRoot = rec.run_root;
+    const journalPath = path.join(runRoot, "execution_journal.json");
+    const proc = new AcpProcess(launch, this.providerEnv(attemptCtx));
     rec.proc = proc;
     try {
       await proc.start(
@@ -370,9 +463,9 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
           fs.appendFileSync(updatesLog, JSON.stringify({ ts: utcnow(), session_id: sessionId, update }) + "\n");
         },
       );
-      const init = await proc.initialize(30);
+      const init = await proc.initialize(attemptStageTimeout(attemptCtx, 30));
       const features = sessionFeatures(init);
-      const session = await proc.newSession(String(task.workspace), 60);
+      const session = await proc.newSession(String(task.workspace), attemptStageTimeout(attemptCtx, 60));
       const sessionId = String(session.sessionId ?? session.session_id ?? "");
       rec.session_id = sessionId;
       const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
@@ -383,23 +476,31 @@ export abstract class AcpExecutorAdapterBase implements ExecutorAdapter {
       journal.resume_mechanism = resumeMechanism(features);
       journal.started_at = utcnow();
       atomicWriteJson(journalPath, journal);
-      const setup = await this.postSessionSetup(proc, sessionId, session, features, task);
+      const setup = await this.postSessionSetup(proc, sessionId, session, features, task, attemptCtx);
       if (Object.keys(setup).length) {
         journal.post_session_setup = setup;
         atomicWriteJson(journalPath, journal);
       }
-      const timeout = Number(task.timeout ?? this.deps.timeoutSeconds ?? 300);
+      // Recheck the shared deadline: ACP setup may have consumed it all.
+      // Expired budget → no markDispatch, no prompt — the attempt stays
+      // PRE_DISPATCH so normal pre-dispatch rules classify the failure.
+      const remainingMs = attemptRemainingMs(attemptCtx);
+      if (remainingMs != null && remainingMs <= 0) {
+        throw new PairError(
+          "ACP_REQUEST_TIMEOUT",
+          "shared task deadline exhausted before prompt dispatch",
+        );
+      }
+      const timeout =
+        remainingMs != null
+          ? Math.max(1, Math.ceil(remainingMs / 1000))
+          : attemptCtx?.remainingSeconds ?? Number(task.timeout ?? this.deps.timeoutSeconds ?? 300);
+      // Exact dispatch boundary: after this line the task may produce side
+      // effects — no automatic failover is ever allowed past this point.
+      attemptCtx?.markDispatch?.();
       const promptResp = await proc.prompt(sessionId, prompt, timeout);
       const stopReason = String(promptResp.stopReason ?? promptResp.stop_reason ?? "end_turn");
       this.finish(rec, task, before, stopReason === "cancelled" ? "CANCELLED" : "COMPLETED", null);
-    } catch (error) {
-      const code = (error as { code?: string }).code ?? String(error);
-      const detail =
-        typeof (error as { detail?: string }).detail === "string"
-          ? (error as { detail: string }).detail
-          : code;
-      const status = code === "ACP_REQUEST_TIMEOUT" ? "TIMEOUT" : "FAILED";
-      this.finish(rec, task, before, status, code, detail);
     } finally {
       proc.close();
     }

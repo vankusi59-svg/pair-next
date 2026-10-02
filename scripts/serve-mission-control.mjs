@@ -27,6 +27,7 @@ import {
   CodexCliExecutorAdapter,
   DevinExecutorAdapter,
   DshExecutorAdapter,
+  createDshModelRouter,
   ExecutorRegistry,
   ExperienceExtractor,
   ExperienceService,
@@ -172,19 +173,24 @@ const native = new PairNativeExecutorAdapter(runner);
 
 const adapters = new Map([[PAIR_NATIVE_EXECUTOR_ID, native]]);
 const governed = new Map();
-if (process.env.PAIR_DSH_HOME) governed.set(DSH_EXECUTOR_ID, new DshExecutorAdapter({
-  journalRoot,
-  // Runtime model pin follows the resolved DSH primary route (role pool),
-  // never an unexamined env position.
-  envReader: (n) => (n === "PAIR_DSH_MODEL_ROUTE" ? DSH_PRIMARY_ROUTE : process.env[n]),
-  // Runtime role guard: the model DSH is about to execute with must hold
-  // DSH_EXECUTION in canonical authority — a PLANNER-pool model fails closed.
-  modelRoleAssertion: (provider, model) => {
-    const me = new ModelEvidenceCatalog(store).getModelByIds(provider, model);
-    if (!me) throw new IntegrityError("FAIL_CLOSED_MODEL_ROLE_UNASSIGNED", `no catalog entry for ${provider}:${model}`);
-    assertDshExecutionModelRole(store, String(me.model_entry_id));
-  },
-}));
+let dshAdapter = null;
+if (process.env.PAIR_DSH_HOME) {
+  dshAdapter = new DshExecutorAdapter({
+    journalRoot,
+    // Runtime model pin follows the resolved DSH primary route (role pool),
+    // never an unexamined env position. Legacy fallback only — when the
+    // Phase C model router is bound below, the router-selected model wins.
+    envReader: (n) => (n === "PAIR_DSH_MODEL_ROUTE" ? DSH_PRIMARY_ROUTE : process.env[n]),
+    // Runtime role guard: the model DSH is about to execute with must hold
+    // DSH_EXECUTION in canonical authority — a PLANNER-pool model fails closed.
+    modelRoleAssertion: (provider, model) => {
+      const me = new ModelEvidenceCatalog(store).getModelByIds(provider, model);
+      if (!me) throw new IntegrityError("FAIL_CLOSED_MODEL_ROLE_UNASSIGNED", `no catalog entry for ${provider}:${model}`);
+      assertDshExecutionModelRole(store, String(me.model_entry_id));
+    },
+  });
+  governed.set(DSH_EXECUTOR_ID, dshAdapter);
+}
 if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
@@ -614,6 +620,21 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
         model_entry_id: String(m.model_entry_id),
         transport_compat: "OPENAI_COMPLETIONS",
       });
+    }
+    // Phase C — governed DSH model routing: the canonical candidate pool is
+    // the resolved+deduped configured pool (primary → fallback → extras).
+    // Qualification is proven per-invocation by the router's eligibility
+    // gates (never trusted from boot memory); binding authority comes from
+    // canonical model_binding rows minted above.
+    if (dshAdapter && dshPool.length) {
+      dshAdapter.bindModelRouter(
+        createDshModelRouter({ service, executorId: DSH_EXECUTOR_ID, candidates: dshPool }),
+        service,
+      );
+      console.log(
+        "DSH_MODEL_POOL:",
+        JSON.stringify(dshPool.map((c) => `${c.ref}@${c.model_entry_id}`)),
+      );
     }
   }
 }
