@@ -3051,3 +3051,124 @@ describe("R8-R1 — unaccented `gui` delivery-verb alias", () => {
     ).toThrow(/FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/);
   });
 });
+
+/* =================== R8 audit remediation R2 — `GUI` false-positive ======
+ * Re-audit blocker: the `i` flag makes the unaccented `gui` alias match
+ * `GUI` — but all-caps GUI is the technical acronym (Graphical User
+ * Interface), never the Vietnamese verb. A bare acronym must never mint
+ * delivery authority: the detector rejects a verb match whose original
+ * source token is exactly all-caps "GUI"; `gui`/`Gui` stay valid.
+ */
+
+describe("R8-R2 — all-caps `GUI` acronym is not a delivery verb", () => {
+  it("A/B. `gui` and `Gui` remain delivery verbs", () => {
+    expect(
+      detectTelegramDeliveryIntent("gui bao cao den telegram").requested,
+    ).toBe(true);
+    expect(
+      detectTelegramDeliveryIntent("Gui bao cao den telegram").requested,
+    ).toBe(true);
+  });
+
+  it("C–G. all-caps GUI acronym → requested=false in every phrasing", () => {
+    for (const g of [
+      "GUI telegram",
+      "phân tích GUI telegram",
+      "thiết kế GUI cho telegram bot",
+      "review GUI telegram",
+      "GUI của telegram",
+    ]) {
+      expect(detectTelegramDeliveryIntent(g).requested).toBe(false);
+    }
+  });
+
+  it("H/I/J. production `gui` goal still works end to end (no R1 regression)", () => {
+    const goal =
+      "đào sâu dữ liệu mql5.com, mục tiêu tìm lợi thế bán hàng để bám bot ea mt5, tổng hợp thành 1 báo cáo file txt, rồi gui bao cao này đến telegram";
+    const intent = detectTelegramDeliveryIntent(goal);
+    expect(intent.requested).toBe(true);
+    expect(() =>
+      reconcilePlanDataflow(
+        [
+          {
+            task_key: "T1", title: "record",
+            task_instruction: "record the mission goal",
+            required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+            depends_on: [], metadata: {},
+          },
+          producerTask("T2", "bao_cao.txt", ["T1"]),
+        ],
+        { telegramIntent: intent },
+      ),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_MISSING/);
+    const plan = reconcilePlanDataflow(
+      [
+        goalTask("T1"),
+        producerTask("T2", "bao_cao.txt", ["T1"]),
+        {
+          task_key: "T3", title: "deliver",
+          task_instruction: "read findings and write outbox/report.txt, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"], depends_on: [],
+          metadata: {},
+        },
+      ],
+      { telegramIntent: intent },
+    ).tasks;
+    expect(plan.find((t) => t.task_key === "T3")!.task_instruction).toBe(
+      canonicalDeliveryTaskInstruction(intent),
+    );
+  });
+
+  it("K/L/M. negation still wins", () => {
+    for (const g of [
+      "khong gui telegram",
+      "dung gui telegram",
+      "do not gui this to telegram",
+      "never gui report to telegram",
+    ]) {
+      expect(detectTelegramDeliveryIntent(g).requested).toBe(false);
+    }
+  });
+
+  it("N–Q. word-boundary + collision negatives stay out", () => {
+    for (const g of [
+      "guide telegram",
+      "beguile telegram",
+      "mygui telegram",
+      "gui_component telegram",
+      "tao bao cao ve telegram",
+      "telegram",
+    ]) {
+      expect(detectTelegramDeliveryIntent(g).requested).toBe(false);
+    }
+  });
+
+  it("R/S. hygiene: 'send … telegram' trips, 'review GUI telegram' does NOT", () => {
+    const sendVerbTask = {
+      task_key: "T2", title: "x",
+      task_instruction: "write report and send it to telegram",
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+    };
+    expect(() => assertTaskDeliveryHygiene([sendVerbTask] as never)).toThrow(
+      /FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK/,
+    );
+    const guiTask = {
+      task_key: "T3", title: "x",
+      task_instruction: "review GUI telegram integration page",
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: {},
+    };
+    expect(() => assertTaskDeliveryHygiene([guiTask] as never)).not.toThrow();
+  });
+
+  it("T. canonical delivery instruction still parses as NO direct-send directive", () => {
+    for (const intent of [
+      FILES_INTENT(["a.txt"]),
+      { requested: true, artifacts: [], mode: "TEXT" as const },
+    ]) {
+      expect(
+        detectTelegramDeliveryIntent(canonicalDeliveryTaskInstruction(intent))
+          .requested,
+      ).toBe(false);
+    }
+  });
+});

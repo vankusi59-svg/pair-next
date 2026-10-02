@@ -234,6 +234,11 @@ export function detectTelegramDeliveryIntent(
   let requested = false;
   DELIVERY_VERB_RE.lastIndex = 0;
   while ((m = DELIVERY_VERB_RE.exec(text)) !== null) {
+    // The `i` flag makes the unaccented `gui` alias also match `GUI` — but
+    // all-caps is the technical acronym (Graphical User Interface), never
+    // the Vietnamese verb. Fail closed toward NO SEND: reject only when
+    // the matched token is exactly all-caps GUI; `gui`/`Gui` stay valid.
+    if (m[0] === "GUI") continue;
     const v = m.index;
     const clause = mentions.some((p) => Math.abs(p - v) <= CLAUSE_SPAN);
     if (!clause || clauseNegated(text, v)) continue;
