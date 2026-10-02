@@ -56,6 +56,7 @@ import {
   qualifyBinding,
   ProviderValidator,
   ProviderCatalog,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
   ModelEvidenceCatalog,
   MODEL_ROLE,
   DevinExecutorAdapter,
@@ -66,6 +67,7 @@ import {
   classifyFailure,
   TRANSPORT_IN_PROCESS,
   createPlanPreview as persistPlanPreviewRow,
+  qualifyModel,
   type DevinFetch,
   type PlannerAttemptRecord,
   type PlannerCandidate,
@@ -965,12 +967,20 @@ const mkModel = (
   const eid = String(entry.model_entry_id);
   const lifecycle = opts.lifecycle ?? "QUALIFIED";
   if (lifecycle === "QUALIFIED") {
-    mcat.issueQualificationReceipt(eid, {
-      capability_scope: ["text_inference"],
-      verifier: "test-probe",
-      evidence_refs: ["fixture"],
-      actor: "t",
+    // Phase E R2 §4 — fixtures mint qualifications only through the
+    // canonical probe→qualify chain; direct receipt minting is a
+    // fail-closed error now.
+    mcat.recordProbeReceipt({
+      probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
+      model_entry_id: eid,
+      provider_id: pid,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    const q = qualifyModel(store, eid, { capability_scope: ["text_inference"], actor: "t" });
+    if (!q.qualified) throw new Error(`mkModel fixture failed: ${JSON.stringify(q.gates)}`);
   } else if (lifecycle !== "DISCOVERED") {
     const body = store.get("model_entry", eid);
     store.put("model_entry", eid, { ...body, lifecycle_state: lifecycle }, Number(body.version));
@@ -992,13 +1002,57 @@ const mkProvider = (
 ) => {
   const id = providerEntryId(pid);
   const existing = store.tryGet("provider", id);
+  const lifecycle = opts.lifecycle ?? "QUALIFIED";
   store.put("provider", id, {
     ...(existing ?? { provider_id: pid, entry_id: id }),
-    lifecycle_state: opts.lifecycle ?? "QUALIFIED",
+    lifecycle_state: lifecycle,
     auth_state: opts.auth_state ?? "AUTH_OK",
     health_state: opts.health_state ?? "READY",
-    conditions: opts.conditions ?? [],
+    conditions: [],
+    // Phase E §6 — a QUALIFIED provider carries current probe evidence;
+    // explicit PROBE_* failures demote routability. R3 §7 —
+    // MODEL_DISCOVERY_ELIGIBLE is a qualified resting state too (the
+    // validator's own end state), so it carries PROBED evidence.
+    probe_state: ["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(lifecycle) ? "PROBED" : "UNPROBED",
   }, existing ? Number(existing.version) : 0);
+  // Phase E §7 — any routable-authority lifecycle (QUALIFIED or
+  // MODEL_DISCOVERY_ELIGIBLE, both reachable only through canonical
+  // qualification in production) carries a qualification receipt bound to
+  // the provider's material fingerprint.
+  if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+    // R3 §5 — the qualification commit seam validates durable state
+    // itself: mint under the canonical post-probe state (AUTH_OK +
+    // PROBED); a caller's degraded auth/probe state applies AFTER the
+    // receipt, the same ordering a credential revocation would take.
+    const cur = store.get("provider", id);
+    store.put("provider", id, { ...cur, auth_state: "AUTH_OK", probe_state: "PROBED", health_state: "READY" }, Number(cur.version));
+    new ProviderCatalog(store).issueQualificationReceipt(pid, {
+      policy_version: "test-policy",
+      actor: "test",
+    });
+    if (opts.auth_state !== undefined || opts.health_state !== undefined) {
+      const b = store.get("provider", id);
+      store.put("provider", id, {
+        ...b,
+        auth_state: opts.auth_state ?? b.auth_state,
+        health_state: opts.health_state ?? b.health_state,
+      }, Number(b.version));
+    }
+    // Canonical post-qualification resting state: the receipt lands on
+    // QUALIFIED, then the lifecycle settles at MODEL_DISCOVERY_ELIGIBLE —
+    // mirror the validator's own end state.
+    if (lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+      const b = store.get("provider", id);
+      store.put("provider", id, { ...b, lifecycle_state: "MODEL_DISCOVERY_ELIGIBLE" }, Number(b.version));
+    }
+  }
+  // Apply requested conditions AFTER the receipt: qualification canonically
+  // clears UNQUALIFIED, so a fixture asking for it must re-apply it — the
+  // same ordering an operator revoke would take in production.
+  if (opts.conditions?.length) {
+    const b = store.get("provider", id);
+    store.put("provider", id, { ...b, conditions: opts.conditions }, Number(b.version));
+  }
 };
 
 describe("R1 §9 — assertPlannerCandidateEligible", () => {
@@ -1287,17 +1341,20 @@ describe("R3 §4 — provider UNQUALIFIED recovery at canonical seam", () => {
     });
 
     // A — qualification failure leaves the UNQUALIFIED condition
-    const q1 = v.qualify(pid, { env: {}, probed: true });
+    const q1 = v.qualify(pid, { env: {} });
     expect(q1.qualified).toBe(false);
     expect(cat.getProvider(pid)!.conditions as string[]).toContain("UNQUALIFIED");
     expect(() => assertPlannerCandidateEligible(ctx.store, me)).toThrow(
       /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/,
     );
 
-    // B — provider now satisfies every gate: health recovered, probed via opts
+    // B — provider now satisfies every gate: health recovered + a real
+    // recorded probe (R2 §5 — the durable probe_state is the only
+    // PROTOCOL_PROBED authority; no caller-supplied bypass).
     const body = ctx.store.get("provider", providerEntryId(pid));
     ctx.store.put("provider", providerEntryId(pid), { ...body, health_state: "READY" }, Number(body.version));
-    const q2 = v.qualify(pid, { env: {}, probed: true });
+    new ProviderCatalog(ctx.store).recordProbeObservation(pid, "PASS");
+    const q2 = v.qualify(pid, { env: {} });
     expect(q2.qualified).toBe(true);
     expect(q2.receipt).toBeTruthy();
     const prov = cat.getProvider(pid)!;
@@ -1344,7 +1401,7 @@ describe("R3 §4 — provider UNQUALIFIED recovery at canonical seam", () => {
     const pid = "disabled-provider";
     mkModel(store, pid, "m61");
     mkProvider(store, pid, { conditions: ["DISABLED", "UNQUALIFIED"] });
-    const q = new ProviderValidator(store).qualify(pid, { env: {}, probed: true });
+    const q = new ProviderValidator(store).qualify(pid, { env: {} });
     expect(q.qualified).toBe(true);
     const conditions = cat.getProvider(pid)!.conditions as string[];
     expect(conditions).toContain("DISABLED"); // operator authority, not transient residue
@@ -1497,12 +1554,17 @@ describe("R3 live-found — model STALE residue cleared at canonical seam", () =
     setModelConditions(store, me, ["REAPPEARED", "STALE"]);
     expect(providerModelEligibility(store, pid, me).gates.MODEL_NOT_STALE).toBe("FAIL");
     // canonical qualification transition reconciles the transient marker
-    new ModelEvidenceCatalog(store).issueQualificationReceipt(me, {
-      capability_scope: ["text_inference"],
-      verifier: "t",
-      evidence_refs: ["e"],
-      actor: "t",
+    const mcat = new ModelEvidenceCatalog(store);
+    mcat.recordProbeReceipt({
+      probe_id: "PRB_p68",
+      model_entry_id: me,
+      provider_id: pid,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    expect(qualifyModel(store, me, { capability_scope: ["text_inference"], actor: "t" }).qualified).toBe(true);
     const after = store.get("model_entry", me);
     expect(after.conditions).not.toContain("STALE");
     expect(after.conditions).toContain("REAPPEARED"); // informational history preserved
@@ -1590,6 +1652,7 @@ describe("PRE-MERGE hotfix — executor timeout governance", () => {
       journalRoot: path.join(freshDir("ht-c-j"), "j"),
       launchOverride: { command: "node", args: [FAKE_ACP, "--profile", "acp"] },
       envReader: secretEnv,
+      compatEnvRouteFallback: true, // compat dispatch path (Phase E §12)
     });
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), "ht-c-ws-"));
     const disp = dsh.dispatch(governedTask(ws, "DEEPSEEK_HARNESS", { timeout: 2, task_instruction: "HANG_FOREVER now" }));

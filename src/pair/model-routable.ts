@@ -8,10 +8,15 @@
  */
 
 import { digest, newId, utcnow } from "./canonical.js";
-import { NotFoundError } from "./errors.js";
+import { IntegrityError, NotFoundError } from "./errors.js";
 import { ExecutorRegistry } from "./executor-registry.js";
-import { ModelEvidenceCatalog } from "./model-catalog.js";
-import { PROVIDER_OK_STATES, ProviderCatalog } from "./provider-catalog.js";
+import { isValidCapabilityScope, ModelEvidenceCatalog, modelIdentityDigest } from "./model-catalog.js";
+import {
+  PROVIDER_OK_STATES,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
+  ProviderCatalog,
+  providerIdentityDigest,
+} from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -50,6 +55,25 @@ export function ensureBinding(
   },
 ): ModelBindingRow {
   const store = service.store;
+  // Phase E R1 §5 — mutation-time fail closed: a binding that names a
+  // provider different from the model's canonical provider_id is an
+  // authority mismatch, never created. (Orphan bindings for missing
+  // models still mint as DISCOVERED — observability, never routable.)
+  const model = new ModelEvidenceCatalog(store).getModel(opts.model_entry_id);
+  if (
+    model &&
+    model.provider_id &&
+    String(model.provider_id) !== String(opts.provider_id)
+  ) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH",
+      JSON.stringify({
+        binding_provider_id: opts.provider_id,
+        model_provider_id: model.provider_id,
+        model_entry_id: opts.model_entry_id,
+      }),
+    );
+  }
   const provisional = {
     binding_id: "",
     executor_id: opts.executor_id,
@@ -84,6 +108,23 @@ export function qualifyBinding(
   const store = service.store;
   const existing = store.tryGet("model_binding", bindingId) as ModelBindingRow | null;
   if (!existing) throw new NotFoundError(`model_binding:${bindingId}`);
+  // Phase E R1 §5 — fail closed before QUALIFIED authority exists: the
+  // binding's provider_id must equal the model's canonical provider_id.
+  const model = new ModelEvidenceCatalog(store).getModel(existing.model_entry_id);
+  if (
+    !model ||
+    !model.provider_id ||
+    String(model.provider_id) !== String(existing.provider_id)
+  ) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH",
+      JSON.stringify({
+        binding_id: bindingId,
+        binding_provider_id: existing.provider_id,
+        model_provider_id: model?.provider_id ?? null,
+      }),
+    );
+  }
   const body = { ...existing };
   (body as unknown as Record<string, unknown>).version = Number(existing.version);
   body.qualification_state = "QUALIFIED";
@@ -165,23 +206,132 @@ export function providerModelEligibility(
   const provider = providerCatalog.getProvider(providerId);
   gates.PROVIDER_QUALIFIED =
     provider && PROVIDER_OK_STATES.has(String(provider.lifecycle_state)) ? "PASS" : "FAIL";
+  // Phase E §4 — AUTH_REQUIRED is NOT usable authority: a credential-bound
+  // provider becomes routable only when authorization is proven (AUTH_OK).
   gates.PROVIDER_AUTH_OK =
-    provider && ["AUTH_OK", "AUTH_REQUIRED"].includes(String(provider.auth_state)) ? "PASS" : "FAIL";
+    provider && String(provider.auth_state) === "AUTH_OK" ? "PASS" : "FAIL";
+  // Phase E §6 — a recorded probe FAILURE demotes routability (PROBE_*
+  // outcome markers). R3 §7 — exact semantics: only a durable PROBED
+  // state is current probe evidence; UNPROBED (never probed, legacy
+  // corruption, reappearance reset) fails like any PROBE_* failure.
+  gates.PROVIDER_PROBE_CURRENT =
+    provider && String(provider.probe_state ?? "") === "PROBED" ? "PASS" : "FAIL";
   gates.PROVIDER_HEALTH_OK =
     provider && !["UNAVAILABLE", "DOWN"].includes(String(provider.health_state)) ? "PASS" : "FAIL";
+  // Phase E §5 — REMOVED (absence-reconciled) providers are blocked like
+  // DISABLED/UNQUALIFIED; history stays inspectable, authority is gone.
   gates.PROVIDER_NOT_BLOCKED =
-    provider && !((provider.conditions as string[]) ?? []).some((c) => ["DISABLED", "UNQUALIFIED"].includes(c))
+    provider &&
+    !((provider.conditions as string[]) ?? []).some((c) =>
+      ["DISABLED", "UNQUALIFIED", "REMOVED"].includes(c),
+    )
+      ? "PASS"
+      : "FAIL";
+  // Phase E R1 §1 — STALE = NOT CURRENT = NOT ROUTABLE. The streak
+  // threshold to REMOVED is historical classification only; the first
+  // authoritative absence already revokes NEW-work authority.
+  gates.PROVIDER_CURRENT =
+    provider &&
+    !((provider.conditions as string[]) ?? []).some((c) =>
+      ["STALE", "REMOVED"].includes(c),
+    )
+      ? "PASS"
+      : "FAIL";
+  // Phase E §7 — the current qualification receipt must still bind to the
+  // provider's present material identity: a receipt minted before identity
+  // facets changed cannot authorize new work.
+  const providerReceipt = provider?.current_qualification_receipt_id
+    ? store.tryGet("provider_qualification", String(provider.current_qualification_receipt_id))
+    : null;
+  // Receipt validity only binds a provider claiming qualified authority —
+  // a non-qualified provider already fails PROVIDER_QUALIFIED.
+  // Phase E R5 §10 — a current provider qualification receipt must also
+  // prove the canonical required gate set at runtime: legacy/corrupt rows
+  // minted before today's safe commit seam (missing required gates or a
+  // non-PASS required value) are historical evidence only, never current
+  // authority.
+  gates.PROVIDER_RECEIPT_CURRENT =
+    !provider || !PROVIDER_OK_STATES.has(String(provider.lifecycle_state)) ||
+    (providerReceipt &&
+      String(providerReceipt.material_fingerprint ?? "") === providerIdentityDigest(provider) &&
+      PROVIDER_QUALIFICATION_REQUIRED_GATES.every(
+        (g) => ((providerReceipt.gates ?? {}) as Record<string, unknown>)[g] === "PASS",
+      ))
       ? "PASS"
       : "FAIL";
 
   const model = modelCatalog.getModel(modelEntryId);
   const modelConditions = (model?.conditions ?? []) as string[];
+  // Phase E R1 §4 — provider↔model canonical linkage: the model's
+  // authoritative provider_id must equal the candidate provider's id. A
+  // malformed/corrupt binding (qualified P2 + model owned by P1) cannot
+  // pass independent gates into routability.
+  gates.MODEL_PROVIDER_MATCH =
+    provider &&
+    model &&
+    String(model.provider_id ?? "") === String(provider.provider_id)
+      ? "PASS"
+      : "FAIL";
+  // Phase E R1 §11 — an unresolved provider_id contradiction on the
+  // canonical entry is an authority conflict: not silently routable.
+  gates.MODEL_PROVIDER_IDENTITY_CONSISTENT =
+    model &&
+    !(((model.contradictions as Array<{ field?: string }>) ?? []).some(
+      (c) => c.field === "provider_id",
+    ))
+      ? "PASS"
+      : "FAIL";
   gates.MODEL_QUALIFIED = model?.lifecycle_state === "QUALIFIED" ? "PASS" : "FAIL";
+  // Phase E R3 §1–§3 + R6 — a newer canonical probe failure revokes
+  // model invocation immediately, but ONLY at capability scope:
+  // MODEL_CAPABILITY_PROBE_CURRENT (below) is the runtime authority.
+  // model.probe_state is a global summary — every recordProbeReceipt
+  // overwrites it regardless of capability, so it must not independently
+  // override capability-scoped authority (an unrelated capability FAIL
+  // would otherwise revoke a healthy qualified capability). It remains
+  // useful for operator observability/diagnostics only.
   gates.MODEL_NOT_STALE =
     model && !modelConditions.includes("STALE") && !modelConditions.includes("REMOVED") ? "PASS" : "FAIL";
   gates.MODEL_NOT_REVOKED =
     model && !modelConditions.some((c) => ["REMOVED", "DEPRECATED", "BLOCKED"].includes(c)) ? "PASS" : "FAIL";
   gates.MODEL_AVAILABLE = model && !modelConditions.includes("UNAVAILABLE") ? "PASS" : "FAIL";
+  // Phase E R1 §6 — model qualification must correspond to current model
+  // identity AND provider ownership: missing receipt, missing fingerprint
+  // (legacy pre-R1 row), or fingerprint mismatch all fail current
+  // authority. Legacy fingerprint-less receipts stay historical evidence
+  // (§7 policy A) — a fresh probe+qualification mints the bound receipt.
+  const modelReceipt = model?.current_qualification_receipt_id
+    ? store.tryGet("model_qualification", String(model.current_qualification_receipt_id))
+    : null;
+  gates.MODEL_RECEIPT_CURRENT =
+    !model || model.lifecycle_state !== "QUALIFIED" ||
+    (modelReceipt &&
+      modelReceipt.material_fingerprint !== undefined &&
+      String(modelReceipt.material_fingerprint) === modelIdentityDigest(model))
+      ? "PASS"
+      : "FAIL";
+  // Phase E R4 §8 — capability-scoped currentness: every capability the
+  // current qualification receipt covers must still have a CURRENT PASS
+  // (latest applicable probe in the window). An unrelated capability's
+  // later PASS cannot revive a failed covered one; N/A-PASS when the
+  // model carries no qualified receipt (MODEL_QUALIFIED/MODEL_RECEIPT_*
+  // already govern that axis).
+  // Phase E R5 §4 — a QUALIFIED model whose current qualification
+  // receipt carries an empty/malformed capability_scope is legacy/corrupt
+  // authority: historical only, never routable. Requires fresh probe +
+  // canonical requalification. N/A-PASS for non-QUALIFIED models
+  // (MODEL_QUALIFIED governs that axis).
+  gates.MODEL_QUALIFICATION_SCOPE_VALID =
+    !model || model.lifecycle_state !== "QUALIFIED" ||
+    (modelReceipt && isValidCapabilityScope(modelReceipt.capability_scope))
+      ? "PASS"
+      : "FAIL";
+  const scope = (modelReceipt?.capability_scope ?? []) as string[];
+  gates.MODEL_CAPABILITY_PROBE_CURRENT =
+    !model || model.lifecycle_state !== "QUALIFIED" || !modelReceipt ||
+    scope.every((cap) => modelCatalog.probeCurrentForCapability(modelEntryId, cap))
+      ? "PASS"
+      : "FAIL";
 
   const reason = Object.keys(gates).find((g) => gates[g] === "FAIL") ?? null;
   return { eligible: reason === null, gates, reason };

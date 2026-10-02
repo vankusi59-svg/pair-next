@@ -9,7 +9,7 @@
 
 import { newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
-import { ModelEvidenceCatalog } from "./model-catalog.js";
+import { ModelEvidenceCatalog, normalizeCapabilityScope } from "./model-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const PROBE_TIERS = [0, 1, 2, 3] as const;
@@ -150,31 +150,44 @@ export function qualifyModel(
   const catalog = new ModelEvidenceCatalog(store);
   const entry = catalog.getModel(modelEntryId);
   if (!entry) throw new NotFoundError(`model_entry:${modelEntryId}`);
+  // Phase E R5 §1–§3 — canonical scope contract enforced at the
+  // diagnostic seam too: [] / blank identifiers fail closed before any
+  // gate runs ([].every() would otherwise pass vacuously).
+  const scope = normalizeCapabilityScope(opts.capability_scope);
 
   const gates: Record<string, string> = {};
   gates.MODEL_EXISTS = "PASS";
   gates.MODEL_NOT_REMOVED = (entry.conditions as string[]).includes("REMOVED") ? "FAIL" : "PASS";
   gates.MODEL_NOT_DEPRECATED = (entry.conditions as string[]).includes("DEPRECATED") ? "FAIL" : "PASS";
 
-  const receipts = catalog.listProbeReceipts(modelEntryId);
-  const passCaps = new Set<string>();
-  for (const r of receipts) {
-    if (r.result !== "PASS") continue;
-    const ce = (r.capability_evidence ?? {}) as Record<string, unknown>;
-    for (const k of Object.keys(ce)) if (ce[k] === "PASS" || ce[k] === true) passCaps.add(k);
-    if (r.probe_type && ce.passed !== false) passCaps.add(String(r.probe_type));
-  }
-  for (const cap of opts.capability_scope) {
-    gates[`CAPABILITY_${cap.toUpperCase()}`] = passCaps.has(cap) ? "PASS" : "FAIL";
+  // Phase E R2 §1-§3 — qualification consumes CURRENT-epoch probe evidence
+  // only: the receipts referenced by the entry's current probe_receipt_ids
+  // window. Historical receipts from a pre-STALE/REMOVED epoch stay
+  // persisted but are never consulted here.
+  // Phase E R4 §6–§7 — evidence is LATEST-PER-CAPABILITY: the newest
+  // receipt in the window applicable to each requested capability must be
+  // a PASS that proves the capability. A PASS for an unrelated capability
+  // can never revive a failed one, and a superseded PASS cannot outrank a
+  // newer FAIL on the same capability.
+  const capCurrent = (cap: string) => catalog.probeCurrentForCapability(modelEntryId, cap);
+  gates.CURRENT_PROBE_EVIDENCE = scope.every(capCurrent) ? "PASS" : "FAIL";
+  for (const cap of scope) {
+    gates[`CAPABILITY_${cap.toUpperCase()}`] = capCurrent(cap) ? "PASS" : "FAIL";
   }
 
   const qualified = Object.values(gates).every((g) => g === "PASS");
   if (!qualified) return { qualified: false, gates };
 
   const receipt = catalog.issueQualificationReceipt(modelEntryId, {
-    capability_scope: opts.capability_scope,
+    capability_scope: scope,
     verifier: opts.verifier ?? "DETERMINISTIC_PROBE_EVIDENCE",
-    evidence_refs: receipts.map((r) => String(r.probe_id)),
+    // The seam derives the minted evidence_refs from the actual covering
+    // current PASS receipts; these caller refs are only validated against
+    // the current window.
+    evidence_refs: scope
+      .map((cap) => catalog.latestProbeReceiptForCapability(modelEntryId, cap))
+      .filter((r): r is Record<string, unknown> => r != null)
+      .map((r) => String(r.probe_id)),
     actor: opts.actor,
   });
   return { qualified: true, gates, receipt };

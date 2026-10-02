@@ -21,6 +21,7 @@ import {
   PairEvidenceStore,
   ProviderCatalog,
   ProviderValidator,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
   canonicalModelId,
   ensureBinding,
   normalizeEndpointIdentity,
@@ -76,6 +77,27 @@ function seedProvider(
   if (opts.probe) body.probe_state = opts.probe;
   if (opts.conditions) body.conditions = opts.conditions;
   ctx.store.put("provider", String(entry.entry_id), body, Number(entry.version));
+  // Phase E §7 — routable-authority lifecycles carry a material-bound
+  // qualification receipt (only reachable through qualification in prod).
+  if (["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(String(opts.lifecycle))) {
+    // R3 §5 — the qualification commit seam now validates durable state
+    // itself: mirror the canonical post-qualification state (AUTH_OK +
+    // PROBED) the validator produces.
+    const pre = ctx.store.get("provider", String(entry.entry_id));
+    ctx.store.put("provider", String(entry.entry_id), {
+      ...pre,
+      auth_state: opts.auth ?? "AUTH_OK",
+      probe_state: opts.probe ?? "PROBED",
+    }, Number(pre.version));
+    catalog.issueQualificationReceipt(providerId, {
+      policy_version: "test-policy",
+      actor: "test",
+    });
+    if (opts.lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+      const b = ctx.store.get("provider", String(entry.entry_id));
+      ctx.store.put("provider", String(entry.entry_id), { ...b, lifecycle_state: "MODEL_DISCOVERY_ELIGIBLE" }, Number(b.version));
+    }
+  }
   return catalog.getProvider(providerId)!;
 }
 
@@ -230,8 +252,17 @@ describe("P6 discovery → catalog", () => {
     expect(rows[0].gates.MODEL_QUALIFIED).toBe("FAIL");
     expect(rows[0].gates.BINDING_QUALIFIED).toBe("FAIL");
 
-    // qualify model (evidence) + binding → routable
-    cat.issueQualificationReceipt(mid, { capability_scope: ["text_inference"], verifier: "test", evidence_refs: ["PRB_x"] });
+    // qualify model (canonical probe→qualify chain — R2 §4) + binding → routable
+    cat.recordProbeReceipt({
+      probe_id: "PRB_x",
+      model_entry_id: mid,
+      provider_id: "groq",
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
+    });
+    expect(qualifyModel(ctx.store, mid, { capability_scope: ["text_inference"] }).qualified).toBe(true);
     qualifyBinding(ctx.service, binding.binding_id, { evidence_refs: ["ev1"] });
     rows = projectRoutableModels(ctx.service);
     expect(rows).toHaveLength(1);
@@ -610,7 +641,16 @@ function makeRoutableRow(
   const cat = new ModelEvidenceCatalog(ctx.store);
   const mid = canonicalModelId(providerId, "m1");
   cat.upsertModelClaim(claim(providerId, providerId, "m1"));
-  cat.issueQualificationReceipt(mid, { capability_scope: ["text_inference"], verifier: "test", evidence_refs: [] });
+  cat.recordProbeReceipt({
+    probe_id: `PRB_${providerId}_m1`,
+    model_entry_id: mid,
+    provider_id: providerId,
+    result: "PASS",
+    probe_type: "text_inference",
+    capability_evidence: { text_inference: "PASS" },
+    latency_ms: 1,
+  });
+  qualifyModel(ctx.store, mid, { capability_scope: ["text_inference"] });
   if (opts.modelConditions) cat.setConditions(mid, opts.modelConditions);
   registerExecutor(ctx, "DEEPSEEK_HARNESS", opts.execOpts);
   const b = ensureBinding(ctx.service, {

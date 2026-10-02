@@ -37,8 +37,11 @@ import {
   MODEL_ROLE,
   PairControlPlane,
   PairEvidenceStore,
+  ProviderCatalog,
+  PROVIDER_QUALIFICATION_REQUIRED_GATES,
   providerEntryId,
   qualifyBinding,
+  qualifyModel,
   registerGovernedExecutors,
   resolveConfiguredModelRoleRoute,
   revokeModelRole,
@@ -69,18 +72,53 @@ const mkProvider = (
 ) => {
   const id = providerEntryId(pid);
   const existing = store.tryGet("provider", id);
+  const lifecycle = opts.lifecycle ?? "QUALIFIED";
   store.put(
     "provider",
     id,
     {
       ...(existing ?? { provider_id: pid, entry_id: id }),
-      lifecycle_state: opts.lifecycle ?? "QUALIFIED",
+      lifecycle_state: lifecycle,
       auth_state: opts.auth_state ?? "AUTH_OK",
       health_state: opts.health_state ?? "READY",
-      conditions: opts.conditions ?? [],
+      conditions: [],
+      // R3 §7 — MODEL_DISCOVERY_ELIGIBLE is a qualified resting state too,
+      // so it carries durable PROBED evidence like QUALIFIED.
+      probe_state: ["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(lifecycle) ? "PROBED" : "UNPROBED",
     },
     existing ? Number(existing.version) : 0,
   );
+  // Phase E §7 — routable-authority lifecycles carry a material-bound
+  // qualification receipt (both reachable only through canonical
+  // qualification in production).
+  if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+    // R5 — the seam derives the required gate set from durable state:
+    // mint under canonical healthy state, then apply the caller's
+    // degraded auth/health after the receipt (post-qualification
+    // degradation ordering).
+    const cur = store.get("provider", id);
+    store.put("provider", id, { ...cur, auth_state: "AUTH_OK", probe_state: "PROBED", health_state: "READY" }, Number(cur.version));
+    new ProviderCatalog(store).issueQualificationReceipt(pid, {
+      policy_version: "test-policy",
+      actor: "test",
+    });
+    if (opts.auth_state !== undefined || opts.health_state !== undefined) {
+      const b = store.get("provider", id);
+      store.put("provider", id, {
+        ...b,
+        auth_state: opts.auth_state ?? b.auth_state,
+        health_state: opts.health_state ?? b.health_state,
+      }, Number(b.version));
+    }
+    if (lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+      const b = store.get("provider", id);
+      store.put("provider", id, { ...b, lifecycle_state: "MODEL_DISCOVERY_ELIGIBLE" }, Number(b.version));
+    }
+  }
+  if (opts.conditions?.length) {
+    const b = store.get("provider", id);
+    store.put("provider", id, { ...b, conditions: opts.conditions }, Number(b.version));
+  }
 };
 
 const mkModel = (
@@ -99,12 +137,19 @@ const mkModel = (
   const eid = String(entry.model_entry_id);
   const lifecycle = opts.lifecycle ?? "QUALIFIED";
   if (lifecycle === "QUALIFIED") {
-    mcat.issueQualificationReceipt(eid, {
-      capability_scope: ["text_inference"],
-      verifier: "test-probe",
-      evidence_refs: ["fixture"],
-      actor: "t",
+    // Phase E R2 §4 — canonical probe→qualify chain only; direct receipt
+    // minting fails closed now.
+    mcat.recordProbeReceipt({
+      probe_id: `PRB_${pid}_${mid}`.replace(/[^A-Za-z0-9_-]/g, "_"),
+      model_entry_id: eid,
+      provider_id: pid,
+      result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" },
+      latency_ms: 1,
     });
+    const q = qualifyModel(store, eid, { capability_scope: ["text_inference"], actor: "t" });
+    if (!q.qualified) throw new Error(`mkModel fixture failed: ${JSON.stringify(q.gates)}`);
   } else if (lifecycle !== "DISCOVERED") {
     const body = store.get("model_entry", eid);
     store.put("model_entry", eid, { ...body, lifecycle_state: lifecycle }, Number(body.version));

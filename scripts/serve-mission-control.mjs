@@ -69,6 +69,7 @@ import {
   IntegrityError,
   PolicyError,
   modelProbeTimeoutMs,
+  modelDiscoveryTimeoutMs,
   llmPlannerTimeoutMs,
   taskTimeoutSeconds,
   planPreviewTtlSeconds,
@@ -99,6 +100,11 @@ import {
   utcnow,
 } from "../dist/pair/index.js";
 
+// Phase E §15 — declared credential VALUES are registered with the
+// canonical sanitizer once, at startup, so any external error/diagnostic
+// text that echoes them is redacted before it can be persisted or served.
+import { registerSensitiveMaterial } from "../dist/pair/sanitizer.js";
+
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const dir = process.env.PAIR_MC_DIR ?? path.join(root, ".pair-mc");
 fs.mkdirSync(dir, { recursive: true });
@@ -115,6 +121,7 @@ fs.mkdirSync(journalRoot, { recursive: true });
 // seam (env-config): every value is explicitly parsed, finite, positive, and
 // bounded; malformed input FAILS CLOSED here, before any side effects.
 const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_MS (ms, 500..120000)
+const cfgDiscoveryTimeoutMs = modelDiscoveryTimeoutMs(); // PAIR_MODEL_DISCOVERY_TIMEOUT_MS (ms, 500..120000)
 const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
 const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
@@ -519,23 +526,35 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   const dres = runProviderDiscovery(store, {
     context: { env: process.env, dshHome: process.env.PAIR_DSH_HOME, codexHome: process.env.CODEX_HOME },
   });
-  // Credential-env resolvability is a real check: mark access observed +
-  // discovery-eligible so model claims can fold in.
   const pc = new ProviderCatalog(store);
+  const validator = new ProviderValidator(store);
+  // Phase E §3 — enumeration-only bootstrap. The canonical validator records
+  // a REAL access observation (credential resolvable → AUTH_OK, else
+  // CREDENTIAL_MISSING); providers then get DISCOVERY_ELIGIBLE — an
+  // enumeration state that carries NO runtime authority (not in OK_STATES).
+  // Model claims fold in, but runtime routability is only reachable through
+  // the full validateAccess(probe)+qualify() chain below. The unconditional
+  // setLifecycle(MODEL_DISCOVERY_ELIGIBLE) shortcut is gone.
   for (const p of pc.listProviders()) {
-    const envName = String(p.credential_reference_name ?? "");
-    pc.recordAccessObservation(String(p.provider_id), envName && process.env[envName] ? "AUTH_OK" : "AUTH_REQUIRED");
-    pc.setLifecycle(String(p.provider_id), "MODEL_DISCOVERY_ELIGIBLE");
+    await validator.validateAccess(String(p.provider_id), { actor: "PAIR_MC" });
+    pc.setLifecycle(String(p.provider_id), "DISCOVERY_ELIGIBLE");
+    // Register declared credential values with the sanitizer so external
+    // error text can never persist them (Phase E §15).
+    const ref = p.credential_reference_name;
+    if (ref) registerSensitiveMaterial(process.env[String(ref)]);
   }
   const mres = await runModelDiscovery(store, {
-    context: { env: process.env, dshHome: process.env.PAIR_DSH_HOME },
+    context: {
+      env: process.env,
+      dshHome: process.env.PAIR_DSH_HOME,
+      discoveryTimeoutMs: cfgDiscoveryTimeoutMs,
+    },
   });
   console.log("DISCOVERY: providers", JSON.stringify({ created: dres.created, updated: dres.updated, errors: dres.errors }));
   console.log("DISCOVERY: models", JSON.stringify({ created: mres.created, updated: mres.updated, errors: mres.errors }));
 
   // Canonical qualification (P6): real provider probe + tier-1 model probe +
   // qualifyModel gates — nothing is marked QUALIFIED without live evidence.
-  const validator = new ProviderValidator(store);
   const mcat = new ModelEvidenceCatalog(store);
   const endpointOf = (p) => String(p.endpoint_reference ?? p.configured_endpoint_identity ?? "");
   const httpProbe = (provider, modelId) => async () => {
@@ -556,37 +575,39 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     }
   };
 
-  if (governed.has(DSH_EXECUTOR_ID)) {
-    // Phase A — canonical role pools: resolve configured routes to catalog
-    // model_entry_ids, enforce Planner∩DSH=∅ BEFORE assigning roles, then
-    // record each model's role. Qualification remains a separate gate — a
-    // role never substitutes for it.
-    // R2 — strict configured-route resolution: EVERY configured route must
-    // resolve to a canonical model_entry or boot fails closed BEFORE any
-    // role mutation. No .filter(Boolean) — an unresolved configured route
-    // is never silently dropped into a smaller pool.
-    const resolveCfg = (route, role) =>
-      resolveConfiguredModelRoleRoute((p, m) => mcat.getModelByIds(p, m), { route, role });
-    const plannerRefs = PLANNER_ROUTES.map((r) => resolveCfg(r, MODEL_ROLE.PLANNER_COORDINATOR));
-    const dshRefs = DSH_ROUTES.map((r) => resolveCfg(r, MODEL_ROLE.DSH_EXECUTION));
-    // Dedupe by canonical entry (operator may set fallback=primary for a
-    // single-route DSH pool) — dedupe AFTER resolution, never drop.
-    const seen = new Set();
-    const dshPool = dshRefs.filter((r) => (seen.has(r.model_entry_id) ? false : (seen.add(r.model_entry_id), true)));
-    // R1 — canonical reconciliation: the ACTIVE assignment set converges to
-    // exactly the desired pools in one atomic step (stale rows revoked to
-    // role=null, changed roles reassigned, all audited — history preserved
-    // in events). Then assert the resulting STORED state is disjoint, not
-    // merely the configured refs.
-    const roleRes = reconcileModelRoleAssignments(store, {
-      planner: plannerRefs,
-      dsh: dshPool,
-      actor: "PAIR_MC",
-    });
-    console.log("MODEL_ROLE: reconciled", JSON.stringify(roleRes));
-    assertCanonicalModelRoleStateDisjoint(store);
+  // Phase A — canonical role pools: resolve configured routes to catalog
+  // model_entry_ids, enforce Planner∩DSH=∅ BEFORE assigning roles, then
+  // record each model's role. Qualification remains a separate gate — a
+  // role never substitutes for it.
+  // R2 — strict configured-route resolution: EVERY configured route must
+  // resolve to a canonical model_entry or boot fails closed BEFORE any
+  // role mutation. No .filter(Boolean) — an unresolved configured route
+  // is never silently dropped into a smaller pool.
+  // Phase E §13 — role resolution + Planner qualification do NOT depend on
+  // DSH executor registration: the Planner provider/model lifecycle is an
+  // independent role authority and must not disappear if DSH is absent.
+  const resolveCfg = (route, role) =>
+    resolveConfiguredModelRoleRoute((p, m) => mcat.getModelByIds(p, m), { route, role });
+  const plannerRefs = PLANNER_ROUTES.map((r) => resolveCfg(r, MODEL_ROLE.PLANNER_COORDINATOR));
+  const dshRefs = DSH_ROUTES.map((r) => resolveCfg(r, MODEL_ROLE.DSH_EXECUTION));
+  // Dedupe by canonical entry (operator may set fallback=primary for a
+  // single-route DSH pool) — dedupe AFTER resolution, never drop.
+  const seen = new Set();
+  const dshPool = dshRefs.filter((r) => (seen.has(r.model_entry_id) ? false : (seen.add(r.model_entry_id), true)));
+  // R1 — canonical reconciliation: the ACTIVE assignment set converges to
+  // exactly the desired pools in one atomic step (stale rows revoked to
+  // role=null, changed roles reassigned, all audited — history preserved
+  // in events). Then assert the resulting STORED state is disjoint, not
+  // merely the configured refs.
+  const roleRes = reconcileModelRoleAssignments(store, {
+    planner: plannerRefs,
+    dsh: dshPool,
+    actor: "PAIR_MC",
+  });
+  console.log("MODEL_ROLE: reconciled", JSON.stringify(roleRes));
+  assertCanonicalModelRoleStateDisjoint(store);
 
-    const qualifyRoute = async ({ ref, pid, mid, model_entry_id }, bindToDsh) => {
+  const qualifyRoute = async ({ ref, pid, mid, model_entry_id }, bindToDsh) => {
       const prov = pc.getProvider(pid);
       const me = mcat.getModelByIds(pid, mid);
       if (!prov || !me) return null;
@@ -631,32 +652,38 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
       return { prov, me };
     };
 
-    // Planner pool: qualified separately, never bound to DSH_EXECUTOR_ID.
-    // Phase B: collect EVERY qualified route in configured order — the
-    // failover chain walks them deterministically at plan time.
-    for (const r of plannerRefs) {
-      const q = await qualifyRoute(r, false);
-      if (q) {
-        plannerCandidates.push({
-          model_entry_id: r.model_entry_id,
-          ref: r.ref,
-          provider: r.pid,
-          model: r.mid,
-          endpoint: endpointOf(q.prov),
-          credentialEnv: String(q.prov.credential_reference_name ?? ""),
-        });
-      }
+  // Planner pool: qualified separately, never bound to DSH_EXECUTOR_ID.
+  // Phase B: collect EVERY qualified route in configured order — the
+  // failover chain walks them deterministically at plan time.
+  // Phase E §13 — Planner qualification is independent of DSH executor
+  // registration and runs whenever a Planner route is configured.
+  for (const r of plannerRefs) {
+    const q = await qualifyRoute(r, false);
+    if (q) {
+      plannerCandidates.push({
+        model_entry_id: r.model_entry_id,
+        ref: r.ref,
+        provider: r.pid,
+        model: r.mid,
+        endpoint: endpointOf(q.prov),
+        credentialEnv: String(q.prov.credential_reference_name ?? ""),
+      });
     }
+  }
+
+  if (governed.has(DSH_EXECUTOR_ID)) {
     // DSH execution pool.
     for (const r of dshRefs) await qualifyRoute(r, true);
     // Other discovered models get DISCOVERED bindings — the routes page shows
     // them as unqualified fallbacks with their failing gate. PLANNER-pool
     // models are excluded: a planner-role model is not a DSH candidate.
+    // Phase E §9 — bind to the model's authoritative provider_id; family is
+    // the aliasing identity, not the authority.
     for (const m of mcat.listModels()) {
       if (modelRoleOf(store, String(m.model_entry_id)) === MODEL_ROLE.PLANNER_COORDINATOR) continue;
       ensureBinding(service, {
         executor_id: DSH_EXECUTOR_ID,
-        provider_id: String(m.provider_family),
+        provider_id: String(m.provider_id ?? m.provider_family),
         model_entry_id: String(m.model_entry_id),
         transport_compat: "OPENAI_COMPLETIONS",
       });

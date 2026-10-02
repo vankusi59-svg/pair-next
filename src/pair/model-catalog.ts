@@ -17,6 +17,40 @@ import type { PairEvidenceStore } from "./store.js";
 export const REMOVED_ABSENCE_THRESHOLD = 3;
 export const MODEL_TERMINAL_FOR_ROUTING = new Set(["REMOVED", "DEPRECATED", "BLOCKED"]);
 
+/** Phase E R5 §2 — canonical capability_scope contract: a non-empty
+ *  array of non-blank capability identifiers, trimmed and deduplicated
+ *  in first-seen order. Anything else fails closed. */
+export function normalizeCapabilityScope(scope: unknown): string[] {
+  if (!Array.isArray(scope) || scope.length === 0) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE",
+      JSON.stringify({ capability_scope: scope ?? null }),
+    );
+  }
+  const out: string[] = [];
+  for (const raw of scope) {
+    const cap = String(raw ?? "").trim();
+    if (!cap) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE",
+        JSON.stringify({ capability_scope: scope }),
+      );
+    }
+    if (!out.includes(cap)) out.push(cap);
+  }
+  return out;
+}
+
+/** Non-throwing predicate form — runtime receipt validation. */
+export function isValidCapabilityScope(scope: unknown): boolean {
+  try {
+    normalizeCapabilityScope(scope);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function norm(s: unknown): string {
   return String(s ?? "").trim();
 }
@@ -26,8 +60,12 @@ export function canonicalModelId(providerFamily: string, modelId: string): strin
 }
 
 export function modelIdentityDigest(entry: Record<string, unknown>): string {
+  // Phase E R1 §12 — provider ownership is part of model authority:
+  // qualification material must bind it. A receipt minted for provider P1
+  // + model M can never remain valid if the linkage changes to P2.
   return digest({
     model_entry_id: entry.model_entry_id,
+    provider_id: entry.provider_id ?? null,
     provider_family: entry.provider_family,
     model_id: entry.model_id,
     model_alias_ids: entry.model_alias_ids ?? [],
@@ -151,6 +189,24 @@ export class ModelEvidenceCatalog {
         changed = true;
       }
     }
+    // Phase E §8 — the provider_family+model_id identity is intentionally an
+    // aliasing identity; when a second claim for the same entry names a
+    // DIFFERENT provider_id, record a contradiction instead of silently
+    // folding (the entry keeps its first-seen provider link — never flips).
+    if (
+      claim.provider_id &&
+      body.provider_id &&
+      String(claim.provider_id) !== String(body.provider_id)
+    ) {
+      const contradictions = (body.contradictions as unknown[]) ?? [];
+      contradictions.push({
+        field: "provider_id",
+        prior: body.provider_id,
+        candidate: String(claim.provider_id),
+      });
+      body.contradictions = contradictions;
+      changed = true;
+    }
     const claims = { ...(body.capability_claims as Record<string, string>) };
     for (const h of claim.capability_hints ?? []) {
       if (!(h in claims)) {
@@ -173,9 +229,23 @@ export class ModelEvidenceCatalog {
     body.updated_at = now;
     let reappeared = false;
     const conditions = new Set(body.conditions as string[]);
-    if (conditions.has("REMOVED")) {
+    // Phase E R1 §3 — reappearance restores OBSERVATION only. A model that
+    // reached STALE/REMOVED regains no new-work authority: lifecycle drops
+    // back to DISCOVERED and it must re-run fresh probe + qualifyModel to
+    // mint a new/current receipt. Historical evidence stays inspectable.
+    // Phase E R2 §1-§2 — the CURRENT observation epoch resets too: probe
+    // state, current receipt pointer, and the current probe_receipt_ids
+    // window. Historical probe_receipt entities stay persisted and
+    // inspectable but can never be consumed as current authority.
+    if (conditions.has("REMOVED") || conditions.has("STALE")) {
       conditions.delete("REMOVED");
+      conditions.delete("STALE");
       conditions.add("REAPPEARED");
+      body.lifecycle_state = "DISCOVERED";
+      body.probe_state = "UNPROBED";
+      body.last_probe_at = null;
+      body.current_qualification_receipt_id = null;
+      body.probe_receipt_ids = [];
       reappeared = true;
       changed = true;
     }
@@ -267,8 +337,28 @@ export class ModelEvidenceCatalog {
 
   recordProbeReceipt(receipt: Record<string, unknown>): Record<string, unknown> {
     const pid = String(receipt.probe_id);
-    this.store.put("probe_receipt", pid, receipt);
     const entry = this.getModel(String(receipt.model_entry_id));
+    // Phase E R4 §13 — recording boundary: a receipt that claims a
+    // provider different from the model's canonical owner is corrupt
+    // evidence, not data. Fail closed here; legacy rows (provider_id
+    // absent) are still filtered at the current-evidence projection.
+    if (
+      entry &&
+      entry.provider_id != null &&
+      receipt.provider_id != null &&
+      String(receipt.provider_id) !== String(entry.provider_id)
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PROBE_PROVIDER_MISMATCH",
+        JSON.stringify({
+          probe_id: pid,
+          model_entry_id: receipt.model_entry_id,
+          receipt_provider_id: receipt.provider_id,
+          model_provider_id: entry.provider_id,
+        }),
+      );
+    }
+    this.store.put("probe_receipt", pid, receipt);
     if (entry) {
       const body: Record<string, unknown> = { ...entry };
       body.version = Number(entry.version);
@@ -299,18 +389,123 @@ export class ModelEvidenceCatalog {
     return receipts.sort((a, b) => String(a.probe_id).localeCompare(String(b.probe_id)));
   }
 
+  /** Phase E R2 §2 — the CURRENT-epoch probe receipts: only the receipts
+   *  referenced by the entry's current probe_receipt_ids window. Older
+   *  probe_receipt entities stay persisted/inspectable via
+   *  listProbeReceipts but are never current authority.
+   *  R3 §10 / R4 §11–§12 — strict ownership: a receipt in the window must
+   *  belong to this model (model_entry_id match) AND, when the model has a
+   *  canonical provider_id, prove the same provider (a null provider_id
+   *  receipt is never current provider-bound evidence — historical only).
+   *  Ordering follows the canonical receipt-window append order (R4 §6):
+   *  the entry's probe_receipt_ids sequence, not wall-clock time. */
+  currentProbeReceipts(modelEntryId: string): Array<Record<string, unknown>> {
+    const entry = this.getModel(modelEntryId);
+    const ids = (entry?.probe_receipt_ids as string[]) ?? [];
+    const out: Array<Record<string, unknown>> = [];
+    for (const id of ids) {
+      const r = this.store.tryGet("probe_receipt", String(id));
+      if (!r) continue;
+      if (String(r.model_entry_id) !== modelEntryId) continue;
+      if (
+        entry?.provider_id != null &&
+        String(r.provider_id ?? "") !== String(entry.provider_id)
+      ) {
+        continue;
+      }
+      out.push(r);
+    }
+    return out;
+  }
+
+  /** Phase E R4 §6 — does a window-order probe receipt pertain to the
+   *  capability: its probe type / requested capability names it, or its
+   *  capability_evidence speaks about it explicitly. */
+  private receiptAppliesToCapability(r: Record<string, unknown>, cap: string): boolean {
+    if (String(r.probe_type) === cap || String(r.requested_capability ?? "") === cap) return true;
+    const ce = (r.capability_evidence ?? {}) as Record<string, unknown>;
+    return Object.prototype.hasOwnProperty.call(ce, cap);
+  }
+
+  /** Phase E R4 §6 — the LATEST receipt in the current window applicable
+   *  to `cap` (canonical append order). */
+  latestProbeReceiptForCapability(
+    modelEntryId: string,
+    cap: string,
+  ): Record<string, unknown> | null {
+    const receipts = this.currentProbeReceipts(modelEntryId);
+    for (let i = receipts.length - 1; i >= 0; i--) {
+      if (this.receiptAppliesToCapability(receipts[i], cap)) return receipts[i];
+    }
+    return null;
+  }
+
+  /** Phase E R4 §6–§7 — CURRENT for a capability = the latest applicable
+   *  receipt is a PASS whose evidence actually proves the capability. */
+  probeCurrentForCapability(modelEntryId: string, cap: string): boolean {
+    const r = this.latestProbeReceiptForCapability(modelEntryId, cap);
+    if (!r || r.result !== "PASS") return false;
+    const ce = (r.capability_evidence ?? {}) as Record<string, unknown>;
+    return (
+      ce[cap] === "PASS" ||
+      ce[cap] === true ||
+      (String(r.probe_type) === cap && ce.passed !== false)
+    );
+  }
+
   issueQualificationReceipt(
     modelEntryId: string,
     opts: { capability_scope: string[]; verifier: string; evidence_refs: string[]; actor?: string },
   ): Record<string, unknown> {
     const entry = this.getModel(modelEntryId);
     if (!entry) throw new NotFoundError(`model_entry:${modelEntryId}`);
+    // Phase E R5 §1–§3 — an empty/blank capability scope must never mint:
+    // `[].every(...)` vacuously passed and produced QUALIFIED authority
+    // with zero evidence. The commit seam enforces the canonical scope
+    // contract independently of the diagnostic qualifyModel path.
+    const scope = normalizeCapabilityScope(opts.capability_scope);
+    // Phase E R2 §4 — this seam mints QUALIFIED authority, so it must
+    // validate canonical CURRENT-epoch probe evidence itself rather than
+    // trust caller-provided strings. Every capability in scope must be
+    // covered by a PASS probe_receipt referenced in the entry's CURRENT
+    // probe_receipt_ids; every evidence_ref must point into that same
+    // current window (foreign/historical refs are rejected).
+    const currentIds = new Set((entry.probe_receipt_ids as string[]) ?? []);
+    // Phase E R4 §7 — qualification consumes LATEST-PER-CAPABILITY
+    // evidence: every requested capability must have a current PASS (the
+    // newest applicable receipt in the window), not merely "ever passed".
+    const covering: Array<Record<string, unknown>> = [];
+    for (const cap of scope) {
+      const latest = this.latestProbeReceiptForCapability(modelEntryId, cap);
+      if (!latest || !this.probeCurrentForCapability(modelEntryId, cap)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING",
+          JSON.stringify({ model_entry_id: modelEntryId, capability: cap, current_probe_ids: [...currentIds] }),
+        );
+      }
+      covering.push(latest);
+    }
+    for (const ref of opts.evidence_refs) {
+      if (!currentIds.has(String(ref))) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_FOREIGN",
+          JSON.stringify({ model_entry_id: modelEntryId, evidence_ref: ref }),
+        );
+      }
+    }
+    // Phase E R3 §11 / R4 §10 — the minted receipt references the CURRENT
+    // covering receipt for each required capability (latest applicable
+    // PASS, deduplicated), never caller strings and never superseded
+    // PASSes that merely once held in the same epoch.
     const receipt = {
       receipt_id: newId("MQR"),
       model_entry_id: modelEntryId,
-      capability_scope: opts.capability_scope,
+      capability_scope: scope,
       verifier: opts.verifier,
-      evidence_refs: opts.evidence_refs,
+      evidence_refs: [...new Set(covering.map((r) => String(r.probe_id)))],
+      // Phase E §7 — bind the receipt to the model's material identity at
+      // qualification time so later drift cannot reuse stale authority.
+      material_fingerprint: modelIdentityDigest(entry),
       issued_at: utcnow(),
     };
     this.store.put("model_qualification", receipt.receipt_id, receipt);

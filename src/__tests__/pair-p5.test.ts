@@ -114,6 +114,10 @@ function makeCtx(
           journalRoot,
           launchOverride: { command: "node", args: [FAKE_ACP, "--profile", "acp"] },
           envReader: secretEnv,
+          // Compat: harness dispatches governed tasks without a bound model
+          // router — declared explicitly (Phase E §12: no silent env-route
+          // bypass in production).
+          compatEnvRouteFallback: true,
         });
   const codex =
     opts.codex === false

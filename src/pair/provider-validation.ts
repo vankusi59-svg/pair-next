@@ -8,7 +8,12 @@
  */
 
 import { IntegrityError, NotFoundError } from "./errors.js";
-import { PROVIDER_OK_STATES, ProviderCatalog } from "./provider-catalog.js";
+import {
+  PROVIDER_OK_STATES,
+  ProviderCatalog,
+  providerCredentialResolvable,
+  sanitizeDiagnostic,
+} from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const PROVIDER_ACCESS_OUTCOMES = new Set([
@@ -33,9 +38,7 @@ export class ProviderValidator {
 
   /** Credential resolvable = env name declared AND present in env. */
   credentialResolvable(entry: Record<string, unknown>, env: Record<string, string | undefined>): string {
-    const ref = entry.credential_reference_name;
-    if (!ref) return "AUTH_OK"; // provider declares no credential requirement
-    return env[String(ref)] ? "AUTH_OK" : "CREDENTIAL_MISSING";
+    return providerCredentialResolvable(entry, env);
   }
 
   async validateAccess(
@@ -60,7 +63,7 @@ export class ProviderValidator {
       } catch (err) {
         outcome = "UNREACHABLE";
         catalog.recordProbeObservation(providerId, "UNREACHABLE", {
-          detail: err instanceof Error ? err.message.slice(0, 200) : String(err),
+          detail: sanitizeDiagnostic(err instanceof Error ? err.message : err) ?? undefined,
           actor: opts.actor,
         });
       }
@@ -81,7 +84,6 @@ export class ProviderValidator {
       env?: Record<string, string | undefined>;
       policyVersion?: string;
       policyDenyList?: string[];
-      probed?: boolean;
       actor?: string;
     } = {},
   ): { qualified: boolean; gates: Record<string, string>; receipt?: Record<string, unknown> } {
@@ -90,19 +92,18 @@ export class ProviderValidator {
     if (!entry) throw new NotFoundError(`provider:${providerId}`);
     const env = opts.env ?? (process.env as Record<string, string | undefined>);
 
-    const gates: Record<string, string> = {};
-    gates.PROVIDER_EXISTS = "PASS";
-    gates.AUTH_ACCEPTABLE =
-      ["AUTH_OK", "AUTH_REQUIRED"].includes(String(entry.auth_state)) ||
-      this.credentialResolvable(entry, env) === "AUTH_OK"
-        ? "PASS"
-        : "FAIL";
-    gates.PROTOCOL_PROBED = entry.probe_state === "PROBED" || opts.probed === true ? "PASS" : "FAIL";
-    gates.HEALTH_ACCEPTABLE = !["UNAVAILABLE", "DOWN"].includes(String(entry.health_state)) ? "PASS" : "FAIL";
-    gates.POLICY_PERMITS = !(opts.policyDenyList ?? []).includes(providerId) ? "PASS" : "FAIL";
-
-    const qualified = Object.values(gates).every((g) => g === "PASS");
-    if (!qualified) {
+    // Phase E R5 §6–§7 — ONE canonical decision computes the required
+    // gate set from durable state + policy input; the same computation
+    // backs diagnostics here and the commit seam below, so caller values
+    // are never authority (PROTOCOL_PROBED reads durable state only —
+    // R2 §5; AUTH_REQUIRED is not acceptable authority — §4).
+    const decision = catalog.computeQualificationDecision(providerId, {
+      env,
+      policyDenyList: opts.policyDenyList,
+      policyVersion: opts.policyVersion,
+    });
+    const gates = decision.gates;
+    if (!decision.qualified) {
       catalog.setLifecycle(providerId, String(entry.lifecycle_state), {
         actor: opts.actor,
         conditions: [...new Set([...(entry.conditions as string[]), "UNQUALIFIED"])],
@@ -110,8 +111,9 @@ export class ProviderValidator {
       return { qualified: false, gates };
     }
     const receipt = catalog.issueQualificationReceipt(providerId, {
-      policy_version: opts.policyVersion ?? "P6_POLICY_V1",
-      gates,
+      policy_version: decision.policy_version,
+      env,
+      policyDenyList: opts.policyDenyList,
       actor: opts.actor,
     });
     catalog.setLifecycle(providerId, "MODEL_DISCOVERY_ELIGIBLE", { actor: opts.actor });
@@ -123,11 +125,21 @@ export function providerRoutableGate(entry: Record<string, unknown>): { pass: bo
   if (!PROVIDER_OK_STATES.has(String(entry.lifecycle_state))) {
     return { pass: false, reason: `PROVIDER_LIFECYCLE_${entry.lifecycle_state}` };
   }
-  if (entry.auth_state === "AUTH_FAILED" || entry.auth_state === "ACCESS_DENIED") {
+  // Phase E §4/§6 — only proven current AUTH_OK authorizes work: AUTH_REQUIRED
+  // (unresolved credential), UNREACHABLE, CREDENTIAL_MISSING, UNVALIDATED and
+  // AUTH_FAILED/ACCESS_DENIED all fail closed.
+  if (String(entry.auth_state) !== "AUTH_OK") {
     return { pass: false, reason: `PROVIDER_AUTH_${entry.auth_state}` };
   }
   const conditions = (entry.conditions ?? []) as string[];
-  if (conditions.includes("UNQUALIFIED") || conditions.includes("DISABLED")) {
+  // Phase E R2 §11 — provider-only subset of providerModelEligibility:
+  // they must agree on currentness — STALE is not current, not routable.
+  if (
+    conditions.includes("UNQUALIFIED") ||
+    conditions.includes("DISABLED") ||
+    conditions.includes("STALE") ||
+    conditions.includes("REMOVED")
+  ) {
     return { pass: false, reason: "PROVIDER_CONDITION_BLOCKED" };
   }
   return { pass: true };

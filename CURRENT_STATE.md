@@ -793,6 +793,127 @@ WOB1(A) and refused a legitimate retry.
   generic-gate mismatch with zero model attempts. DO NOT MERGE — pending
   audit. See `PAIR_NEXT_POST_P14_PHASE_C_DSH_MODEL_ROUTING_REPORT.md`.
 
+## Phase E — Provider / Model Operational Authority Closure (branch `devin/1790938483-phase-e`, pending independent audit)
+
+- `DISCOVERY_ELIGIBLE` lifecycle state: enumeration-only bootstrap (scanned
+  by `PROVIDER_DISCOVERY_SCAN_STATES`, NOT in `PROVIDER_OK_STATES`). The
+  unconditional `setLifecycle(MODEL_DISCOVERY_ELIGIBLE)` shortcut is gone —
+  `MODEL_DISCOVERY_ELIGIBLE` now requires a canonical `provider_qualification`
+  receipt bound by `material_fingerprint`.
+- Source-aware provider absence reconciliation: per-source COMPLETE/FAILED
+  `provider_snapshot` rows drive `reconcileProviderAbsence` — absent from
+  ALL completed sources → `absence_streak` → STALE≥1 / REMOVED≥3 (history
+  preserved); one source's absence cannot revoke a provider still observed
+  by another; re-observation → REAPPEARED.
+- Receipt validity: provider + model qualification receipts mint
+  `material_fingerprint` = identity digest; `PROVIDER_RECEIPT_CURRENT` /
+  `MODEL_RECEIPT_CURRENT` verify correspondence on authority-claiming
+  states — identity drift invalidates routing, never deletes the receipt.
+- Canonical routability is the ONLY runtime authority: unbound-router
+  governed DSH dispatch throws `FAIL_CLOSED_DSH_MODEL_ROUTER_UNBOUND`
+  unless `compatEnvRouteFallback` is explicitly declared (production MC
+  never sets it); Planner lifecycle is independent of DSH executor
+  registration (§13); bindings + router eligibility use authoritative
+  `provider_id` (§9); `provider_id` claim conflicts record
+  `contradictions[]`, never flip (§8).
+- Secret governance: `sanitizeDiagnostic` on all probe/discovery error
+  persistence; declared credential env values registered with the sanitizer
+  at boot (§15). Single timeout authority `PAIR_MODEL_DISCOVERY_TIMEOUT_MS`
+  (§14).
+- Validation: focused 34/34 (A–K); full suite 2694 pass / 2 pre-existing
+  env P5 fails (real dsh/codex on PATH, reproduced on base); tsc + build
+  clean. Live E2E on scratch `PAIR_MC_DIR` with real credentials: full
+  discover→validate→probe→qualify→reconcile→bind→routable chain, exact
+  failing-gate observability (gemini route refused by
+  CAPABILITY_TEXT_INFERENCE), `DISCOVERY_ELIGIBLE` provider non-routable
+  with no receipt. IMPLEMENTED / PENDING INDEPENDENT AUDIT. See
+  `PAIR_NEXT_PHASE_E_PROVIDER_MODEL_OPERATIONAL_CLOSURE_REPORT.md`.
+- **R1 remediation** (same branch, pending re-audit): STALE providers are
+  non-routable (`PROVIDER_CURRENT` gate); provider/model reappearance
+  restores OBSERVATION only (REAPPEARED → `DISCOVERY_ELIGIBLE`/`DISCOVERED`
+  + AUTH_REQUIRED/UNPROBED, re-qualification mints new authority);
+  `MODEL_PROVIDER_MATCH` + `MODEL_PROVIDER_IDENTITY_CONSISTENT` linkage
+  gates fail closed across planner/DSH/bindings
+  (`FAIL_CLOSED_MODEL_PROVIDER_LINK_MISMATCH`); legacy fingerprint-less
+  receipts no longer pass (`material_fingerprint` binds `provider_id`);
+  source disappearance is explicit — never-configured skips silently,
+  previously-active → ABSENT snapshot → bounded STALE→REMOVED (no
+  indefinite last-known-good). Focused 45/45; full suite 2714 pass / same
+  2 env P5 fails; tsc+build clean; live E2E boot chain intact.
+- **R2 remediation** (same branch, pending re-audit): model/probe evidence
+  is epoch-scoped — REAPPEARED resets `probe_state=UNPROBED`,
+  `last_probe_at=null`, `current_qualification_receipt_id=null`,
+  `probe_receipt_ids=[]` (historical receipt rows persist inspectable);
+  `qualifyModel` reads `currentProbeReceipts()` only +
+  `CURRENT_PROBE_EVIDENCE` gate; `issueQualificationReceipt` fails closed
+  (`FAIL_CLOSED_MODEL_QUALIFICATION_EVIDENCE_MISSING`/`_FOREIGN`) — a
+  caller can never mint QUALIFIED without current PASS probe receipts;
+  provider `opts.probed` bypass removed (`PROTOCOL_PROBED` = durable
+  `probe_state==="PROBED"` only); provider reappearance clears the
+  current receipt pointer; configured route `P:M` must resolve to a model
+  whose canonical `provider_id === P`
+  (`FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH`, before any
+  role/candidate/invocation — planner and DSH share the seam);
+  `providerRoutableGate` blocks STALE (agrees with `PROVIDER_CURRENT`).
+  Focused 51/51; full suite 2720 pass / same 2 env P5 fails; tsc+build
+  clean; live E2E confirms UNPROBED+receipt=null for enumeration-only
+  providers.
+- **R3 remediation** (same branch, pending re-audit): latest probe state
+  governs invocation — new `MODEL_PROBE_CURRENT` gate (exact `PROBED`,
+  availability-classified): a newer canonical probe FAILURE revokes new
+  model invocation at planner + DSH before dispatch while history stays
+  inspectable; `PROVIDER_PROBE_CURRENT` corrected to exact `PROBED`
+  (UNPROBED no longer passes); `qualifyModel` `CURRENT_PROBE_EVIDENCE` =
+  `probe_state==="PROBED"` (older PASS in window can't override latest
+  FAIL); provider `issueQualificationReceipt` commit seam validates
+  durable state itself (`AUTH_OK`+`PROBED`+no STALE/REMOVED, all-PASS
+  gates → `FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE`/`_GATES`);
+  `currentProbeReceipts` verifies `model_entry_id` + provider ownership;
+  model qualification `evidence_refs` derived internally from covering
+  current PASS receipts. Focused 57/57; full suite 2726 pass / same 2
+  env P5 fails; tsc+build clean.
+- **R4 remediation** (same branch, pending re-audit): provider commit
+  seam requires the canonical gate set
+  `PROVIDER_QUALIFICATION_REQUIRED_GATES` (exported once) — every
+  required gate must be present and `==="PASS"` (`gates:{}` and any
+  missing/forged gate → `FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES`);
+  probe currentness is capability-scoped —
+  `probeCurrentForCapability` evaluates the LATEST applicable receipt
+  in window order per capability (new gate
+  `MODEL_CAPABILITY_PROBE_CURRENT`), so a PASS for one capability
+  never revives another; `evidence_refs` = latest covering receipt per
+  capability; strict provider ownership — `recordProbeReceipt` throws
+  `FAIL_CLOSED_PROBE_PROVIDER_MISMATCH` on wrong-provider rows and
+  `currentProbeReceipts` excludes `provider_id: null`/foreign rows
+  (inspectable history, never authority). Focused 62/62; full suite
+  2731 pass / same 2 env P5 fails; tsc+build clean.
+- **R5 remediation** (same branch, pending re-audit): canonical
+  capability_scope contract — `normalizeCapabilityScope` requires a
+  non-empty array of non-blank identifiers (trim + first-seen dedupe),
+  enforced independently at `qualifyModel()` and the commit seam
+  (`FAIL_CLOSED_MODEL_QUALIFICATION_SCOPE`); runtime gate
+  `MODEL_QUALIFICATION_SCOPE_VALID` makes legacy empty/malformed-scope
+  receipts non-routable (inspectable history; fresh probe +
+  requalification recovers). Provider qualification decision is now
+  canonical — `computeQualificationDecision` derives all five required
+  gates from durable state + caller policy input; the commit seam no
+  longer accepts caller-supplied `gates` (POLICY_PERMITS /
+  HEALTH_ACCEPTABLE=PASS no longer forgeable); `qualify()` delegates
+  to the same function; `PROVIDER_RECEIPT_CURRENT` requires the
+  complete required gate set PASS inside the current receipt.
+  Focused 69/69; full suite 2738 pass / same 2 env P5 fails;
+  tsc+build clean.
+- **R6 remediation** (same branch, pending re-audit): capability-scoped
+  runtime authority — `MODEL_PROBE_CURRENT` (global `model.probe_state`
+  summary) removed from `providerModelEligibility`; runtime authority
+  = `MODEL_QUALIFIED` + `MODEL_RECEIPT_CURRENT` +
+  `MODEL_QUALIFICATION_SCOPE_VALID` + `MODEL_CAPABILITY_PROBE_CURRENT`.
+  `model.probe_state` remains observability/diagnostics only — an
+  unrelated capability FAIL can no longer revoke a healthy qualified
+  capability, and an unrelated PASS cannot revive a failed one.
+  Focused 73/73; full suite 2742 pass / same 2 env P5 fails;
+  tsc+build clean.
+
 ## Not yet
 
 - Workforce lifecycle beyond governed completion (Phase 4+), CEO

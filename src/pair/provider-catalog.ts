@@ -9,10 +9,22 @@
 
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { sanitizeUntrustedRemote } from "./sanitizer.js";
 import type { PairEvidenceStore } from "./store.js";
+
+/** Free-text diagnostics from external providers may echo credential
+ *  material — pass through the canonical sanitizer before persistence. */
+export function sanitizeDiagnostic(text: unknown): string | null {
+  if (text === null || text === undefined) return null;
+  return String(sanitizeUntrustedRemote(String(text).slice(0, 200)).value);
+}
 
 export const PROVIDER_LIFECYCLE_ORDER = [
   "DISCOVERED",
+  // Enumeration-only bootstrap state: the provider may be scanned for model
+  // claims, but carries NO runtime routing authority (not in OK_STATES).
+  // Runtime authority is reachable only through canonical qualification.
+  "DISCOVERY_ELIGIBLE",
   "PROBED",
   "ACCESS_VALIDATED",
   "QUALIFIED",
@@ -20,6 +32,43 @@ export const PROVIDER_LIFECYCLE_ORDER = [
 ] as const;
 
 export const PROVIDER_OK_STATES = new Set(["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"]);
+
+/** Lifecycle states a provider may be enumerated for model claims under —
+ *  canonical MODEL_DISCOVERY_ELIGIBLE (qualified) plus the enumeration-only
+ *  bootstrap state. Discovery eligibility never implies routability. */
+export const PROVIDER_DISCOVERY_SCAN_STATES = new Set([
+  "MODEL_DISCOVERY_ELIGIBLE",
+  "DISCOVERY_ELIGIBLE",
+]);
+
+/** Provider absence reconciliation (Phase E §5): consecutive COMPLETE
+ *  discovery runs in which every authoritative source misses the provider.
+ *  streak >= 1 → STALE condition; >= threshold → REMOVED (non-routable,
+ *  history preserved). */
+export const PROVIDER_REMOVED_ABSENCE_THRESHOLD = 3;
+
+/** Phase E R4 §2 — THE canonical required provider qualification gate
+ *  set (defined exactly once — ProviderValidator.qualify computes this
+ *  same set and the commit seam below requires every entry present and
+ *  PASS; extra diagnostic gates are allowed but can never substitute). */
+export const PROVIDER_QUALIFICATION_REQUIRED_GATES = [
+  "PROVIDER_EXISTS",
+  "AUTH_ACCEPTABLE",
+  "PROTOCOL_PROBED",
+  "HEALTH_ACCEPTABLE",
+  "POLICY_PERMITS",
+] as const;
+
+/** Credential resolvable = env name declared AND present in env. Shared by
+ * the canonical qualification decision and ProviderValidator. */
+export function providerCredentialResolvable(
+  entry: Record<string, unknown>,
+  env: Record<string, string | undefined>,
+): string {
+  const ref = entry.credential_reference_name;
+  if (!ref) return "AUTH_OK"; // provider declares no credential requirement
+  return env[String(ref)] ? "AUTH_OK" : "CREDENTIAL_MISSING";
+}
 
 const IDENTITY_FIELDS = [
   "provider_id",
@@ -166,6 +215,7 @@ export class ProviderCatalog {
       health_state: "UNKNOWN",
       conditions: [],
       capabilities: [],
+      absence_streak: 0,
       sources: [],
       evidence_refs: [],
       contradictions: [],
@@ -215,6 +265,27 @@ export class ProviderCatalog {
     sources.add(sourceId);
     body.sources = [...sources].sort();
     body.last_seen_at = now;
+    // Current observation resets absence bookkeeping and revives a
+    // stale/removed entry as REAPPEARED (history kept). Phase E R1 §2 —
+    // reappearance restores OBSERVATION only, never runtime authority:
+    // a provider that lost currentness must re-run the normal
+    // validateAccess → probe → qualification chain to mint new/current
+    // authority. Historical rows (receipt, events) stay inspectable.
+    body.absence_streak = 0;
+    const conditions = new Set((body.conditions as string[]) ?? []);
+    if (conditions.has("REMOVED") || conditions.has("STALE")) {
+      conditions.delete("REMOVED");
+      conditions.delete("STALE");
+      conditions.add("REAPPEARED");
+      body.lifecycle_state = "DISCOVERY_ELIGIBLE";
+      body.auth_state = "AUTH_REQUIRED";
+      body.probe_state = "UNPROBED";
+      // Phase E R2 §6 — the historical receipt row stays inspectable but
+      // is no longer CURRENT authority: clear the pointer so nothing can
+      // lean on a stale current receipt behind the lifecycle demotion.
+      body.current_qualification_receipt_id = null;
+    }
+    body.conditions = [...conditions].sort();
     body.identity_digest = providerIdentityDigest(body);
     const semanticNoOp = !changed && String(body.identity_digest) === String(existing.identity_digest);
     const entry = this.put(body.entry_id as string, body, {
@@ -334,7 +405,7 @@ export class ProviderCatalog {
       event_type: outcome === "PASS" ? "PROVIDER_PROBED" : "PROVIDER_PROBE_FAILED",
       new_state: outcome,
       actor: opts.actor ?? "PAIR_PROVIDER_CATALOG",
-      metadata: { latency_ms: opts.latency_ms ?? null, detail: opts.detail ?? null },
+      metadata: { latency_ms: opts.latency_ms ?? null, detail: sanitizeDiagnostic(opts.detail) },
     });
     return this.put(String(entry.entry_id), body, { actor: opts.actor ?? "PAIR_PROVIDER_CATALOG" });
   }
@@ -355,17 +426,186 @@ export class ProviderCatalog {
     return this.put(String(entry.entry_id), body, { actor: opts.actor ?? "PAIR_PROVIDER_CATALOG" });
   }
 
+  /**
+   * Phase E §5 — provider absence reconciliation across sources.
+   * `claimedBySource` maps each discovery source that completed a run to
+   * the provider_ids it observed. A provider is absent ONLY when no
+   * authoritative source claims it — absence from ONE source must not
+   * revoke a provider still proven current by another. Streak >= 1 →
+   * STALE condition (inspectable); streak >= PROVIDER_REMOVED_ABSENCE_
+   * THRESHOLD → REMOVED (non-routable, history preserved). Re-observation
+   * clears the streak/condition (handled in upsertCandidate).
+   */
+  reconcileProviderAbsence(
+    claimedBySource: Map<string, Set<string>>,
+    opts: { actor?: string; threshold?: number } = {},
+  ): { stale: string[]; removed: string[]; reappeared: string[] } {
+    const stale: string[] = [];
+    const removed: string[] = [];
+    const reappeared: string[] = [];
+    const threshold = opts.threshold ?? PROVIDER_REMOVED_ABSENCE_THRESHOLD;
+    if (claimedBySource.size === 0) return { stale, removed, reappeared };
+    const allClaimed = new Set<string>();
+    for (const ids of claimedBySource.values()) {
+      for (const id of ids) allClaimed.add(id);
+    }
+    for (const entry of this.listProviders()) {
+      const pid = String(entry.provider_id);
+      const observingSources = (entry.sources as unknown[]) ?? [];
+      // Only providers this discovery surface actually claims are subject
+      // to reconciliation — operator/persisted entities discovered through
+      // other authorities are untouched.
+      const discovered = [...observingSources].some((s) =>
+        claimedBySource.has(String((s as { source_id?: string })?.source_id ?? s)),
+      );
+      if (!discovered) continue;
+      if (allClaimed.has(pid)) continue; // still observed by ≥1 source
+      const body = { ...entry };
+      body.version = Number(entry.version);
+      const streak = Number(entry.absence_streak ?? 0) + 1;
+      body.absence_streak = streak;
+      const conditions = new Set(body.conditions as string[]);
+      if (streak >= threshold) {
+        if (!conditions.has("REMOVED")) {
+          conditions.delete("STALE");
+          conditions.add("REMOVED");
+          removed.push(pid);
+        }
+      } else {
+        conditions.add("STALE");
+        stale.push(pid);
+      }
+      body.conditions = [...conditions].sort();
+      this.put(String(entry.entry_id), body, {
+        actor: opts.actor ?? "PAIR_PROVIDER_DISCOVERY",
+        eventType: conditions.has("REMOVED")
+          ? "PROVIDER_REMOVED"
+          : "PROVIDER_STALE",
+      });
+    }
+    return { stale, removed, reappeared };
+  }
+
+  /** Per-source provider snapshot — the absence-reconciliation evidence
+   *  input. COMPLETE snapshots are the only authoritative "I looked and
+   *  saw/didn't see" claim; FAILED snapshots never remove anything. */
+  recordProviderSnapshot(
+    sourceId: string,
+    status: string,
+    claimedProviderIds: string[],
+    opts: { runId?: string; actor?: string } = {},
+  ): Record<string, unknown> {
+    const rec = {
+      snapshot_id: newId("PSN"),
+      source_id: sourceId,
+      status,
+      claimed_provider_ids: [...claimedProviderIds].sort(),
+      run_id: opts.runId ?? null,
+      recorded_at: utcnow(),
+    };
+    this.store.put("provider_snapshot", rec.snapshot_id, rec);
+    return rec;
+  }
+
+  /** Phase E R1 §8 — whether a source has ever recorded a COMPLETE
+   *  snapshot here. Distinguishes "never configured" (silently skipped)
+   *  from "previously-active authoritative source disappeared". */
+  hasCompletedSnapshot(sourceId: string): boolean {
+    return (this.store.list("provider_snapshot") as Record<string, unknown>[]).some(
+      (s) => String(s.source_id) === sourceId && String(s.status) === "COMPLETE",
+    );
+  }
+
+  /** Phase E R5 §6–§9 — the ONE canonical provider qualification
+   *  decision. Every required gate is derived here from durable
+   *  canonical state + supplied policy input; both the diagnostic path
+   *  (ProviderValidator.qualify) and the authority-committing seam
+   *  (issueQualificationReceipt) consume this computation — callers can
+   *  never author gate values. */
+  computeQualificationDecision(
+    providerId: string,
+    opts: {
+      env?: Record<string, string | undefined>;
+      policyDenyList?: string[];
+      policyVersion?: string;
+    } = {},
+  ): { qualified: boolean; gates: Record<string, string>; policy_version: string } {
+    const entry = this.mustGet(providerId);
+    const env = opts.env ?? (process.env as Record<string, string | undefined>);
+    const gates: Record<string, string> = {};
+    gates.PROVIDER_EXISTS = "PASS";
+    gates.AUTH_ACCEPTABLE =
+      String(entry.auth_state) === "AUTH_OK" || providerCredentialResolvable(entry, env) === "AUTH_OK"
+        ? "PASS"
+        : "FAIL";
+    gates.PROTOCOL_PROBED = String(entry.probe_state) === "PROBED" ? "PASS" : "FAIL";
+    gates.HEALTH_ACCEPTABLE = !["UNAVAILABLE", "DOWN"].includes(String(entry.health_state)) ? "PASS" : "FAIL";
+    gates.POLICY_PERMITS = !(opts.policyDenyList ?? []).includes(providerId) ? "PASS" : "FAIL";
+    return {
+      qualified: Object.values(gates).every((g) => g === "PASS"),
+      gates,
+      policy_version: opts.policyVersion ?? "P6_POLICY_V1",
+    };
+  }
+
   issueQualificationReceipt(
     providerId: string,
-    opts: { policy_version: string; gates: Record<string, unknown>; actor?: string },
+    opts: {
+      policy_version: string;
+      env?: Record<string, string | undefined>;
+      policyDenyList?: string[];
+      actor?: string;
+    },
   ): Record<string, unknown> {
     const entry = this.mustGet(providerId);
+    // Phase E R3 §5–§7 — this commit seam installs QUALIFIED authority, so
+    // it validates durable canonical state itself rather than trusting the
+    // caller: AUTH_OK + PROBED + no STALE/REMOVED, and a receipt never
+    // mints over failing gates. DISABLED/UNQUALIFIED are deliberately NOT
+    // rejected: DISABLED is operator authority preserved through
+    // requalification (never routable — PROVIDER_NOT_BLOCKED blocks
+    // downstream), and UNQUALIFIED is transient residue this same
+    // transition canonically clears (blocking it would deadlock
+    // requalification).
+    const blocked =
+      String(entry.auth_state) !== "AUTH_OK"
+        ? `auth_state=${entry.auth_state}`
+        : String(entry.probe_state) !== "PROBED"
+          ? `probe_state=${entry.probe_state}`
+          : ((entry.conditions as string[]) ?? []).some((c) => ["STALE", "REMOVED"].includes(c))
+            ? `conditions=${JSON.stringify(entry.conditions)}`
+            : null;
+    if (blocked) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE",
+        JSON.stringify({ provider_id: providerId, blocked_by: blocked }),
+      );
+    }
+    // Phase E R5 §5–§9 — gate VALUES are canonical output, not caller
+    // input: the seam recomputes the decision from durable state + the
+    // same policy inputs, so a forged all-PASS map (or a forged
+    // POLICY_PERMITS/HEALTH_ACCEPTABLE) can never mint authority. No
+    // `gates` parameter exists on this seam.
+    const decision = this.computeQualificationDecision(providerId, {
+      env: opts.env,
+      policyDenyList: opts.policyDenyList,
+      policyVersion: opts.policy_version,
+    });
+    if (!decision.qualified) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES",
+        JSON.stringify({
+          provider_id: providerId,
+          failing_gates: PROVIDER_QUALIFICATION_REQUIRED_GATES.filter((g) => decision.gates[g] !== "PASS"),
+        }),
+      );
+    }
     const receipt = {
       receipt_id: newId("PQR"),
       provider_id: providerId,
-      policy_version: opts.policy_version,
+      policy_version: decision.policy_version,
       material_fingerprint: providerIdentityDigest(entry),
-      gates: opts.gates,
+      gates: decision.gates,
       issued_at: utcnow(),
     };
     this.store.put("provider_qualification", receipt.receipt_id, receipt);

@@ -122,12 +122,20 @@ export function resolveDshModelBinding(
 
 /* ----------------------------------------------------- eligibility ------ */
 
-/** Gates whose failure is AUTHORITY (fail closed, never a failover signal). */
+/** Gates whose failure is AUTHORITY (fail closed, never a failover signal).
+ *  Phase E §7 adds receipt-validity gates — stale material evidence is an
+ *  authority rejection, not an availability dip. */
 const DSH_AUTHORITY_GATES = new Set([
   "PROVIDER_QUALIFIED",
   "PROVIDER_AUTH_OK",
   "PROVIDER_NOT_BLOCKED",
+  "PROVIDER_RECEIPT_CURRENT",
+  "MODEL_RECEIPT_CURRENT",
   "MODEL_NOT_REVOKED",
+  // Phase E R1 — provider↔model linkage + identity contradictions are
+  // authority violations: fail closed before any dispatch (§4/§11/§17).
+  "MODEL_PROVIDER_MATCH",
+  "MODEL_PROVIDER_IDENTITY_CONSISTENT",
 ]);
 
 /**
@@ -174,9 +182,12 @@ export function assertDshCandidateEligible(
       );
     }
   }
+  // Phase E §9 — the model's authoritative provider_id governs the lookup;
+  // provider_family is the aliasing identity only (they coincide in all
+  // canonical sources, but provider_id is the authority when present).
   const elig = providerModelEligibility(
     store,
-    String(model.provider_family ?? candidate.pid),
+    String(model.provider_id ?? model.provider_family ?? candidate.pid),
     mid,
   );
   if (!elig.eligible) {

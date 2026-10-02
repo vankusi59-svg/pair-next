@@ -239,7 +239,21 @@ export function assertPlannerCandidateEligible(
   );
   if (elig.eligible) return;
   const failed = Object.keys(elig.gates).filter((g) => elig.gates[g] === "FAIL");
-  const AUTHORITY_GATES = new Set(["PROVIDER_QUALIFIED", "PROVIDER_AUTH_OK", "PROVIDER_NOT_BLOCKED"]);
+  // Phase E §7 — receipt-validity failures are authority rejections (stale
+  // material evidence), never failover-eligible. Probe-currentness failures
+  // are availability (a retry/next-candidate may still succeed).
+  const AUTHORITY_GATES = new Set([
+    "PROVIDER_QUALIFIED",
+    "PROVIDER_AUTH_OK",
+    "PROVIDER_NOT_BLOCKED",
+    "PROVIDER_RECEIPT_CURRENT",
+    "MODEL_RECEIPT_CURRENT",
+    // Phase E R1 — provider↔model linkage mismatches and unresolved
+    // provider_id contradictions are authority violations: fail closed
+    // before any invocation (§4/§11/§17).
+    "MODEL_PROVIDER_MATCH",
+    "MODEL_PROVIDER_IDENTITY_CONSISTENT",
+  ]);
   if (failed.some((g) => AUTHORITY_GATES.has(g))) {
     throw new IntegrityError(
       "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE",
@@ -315,6 +329,19 @@ export function resolveConfiguredModelRoleRoute(
     throw new IntegrityError(
       "FAIL_CLOSED_MODEL_ROLE_ROUTE_UNRESOLVED",
       `role ${opts.role}: configured route did not resolve to a canonical model_entry ${JSON.stringify({ ref: route, role: opts.role, provider: pid, model: mid })}`,
+    );
+  }
+  // Phase E R2 §7-§10 — configured route P:M must resolve to a model whose
+  // CANONICAL provider ownership is P. provider_family is only an aliasing
+  // identity: resolving by family while the entry's provider_id names a
+  // different provider would let a role check one provider and invoke
+  // another (split authority). This check runs before role assignment,
+  // Planner/DSH pool construction, or any model invocation — defense in
+  // depth with MODEL_PROVIDER_MATCH and binding-level checks.
+  if (String((me as Record<string, unknown>).provider_id ?? "") !== pid) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MODEL_ROLE_ROUTE_PROVIDER_MISMATCH",
+      `role ${opts.role}: configured route names a provider that does not canonically own the model ${JSON.stringify({ ref: route, role: opts.role, provider: pid, model: mid, model_provider_id: (me as Record<string, unknown>).provider_id ?? null })}`,
     );
   }
   return { model_entry_id: String(me.model_entry_id), ref: route, pid, mid };

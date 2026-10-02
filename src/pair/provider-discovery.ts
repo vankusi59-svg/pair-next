@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
-import { ProviderCatalog } from "./provider-catalog.js";
+import { ProviderCatalog, sanitizeDiagnostic } from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export interface DiscoveryContext {
@@ -162,7 +162,16 @@ export function runProviderDiscovery(
     runId?: string;
     actor?: string;
   },
-): { created: string[]; updated: string[]; unchanged: string[]; errors: Record<string, string>; sync_id: string } {
+): {
+  created: string[];
+  updated: string[];
+  unchanged: string[];
+  errors: Record<string, string>;
+  stale: string[];
+  removed: string[];
+  snapshots: string[];
+  sync_id: string;
+} {
   const catalog = new ProviderCatalog(store);
   const sources = opts.sources ?? defaultSources();
   const context = opts.context;
@@ -171,33 +180,72 @@ export function runProviderDiscovery(
   const updated: string[] = [];
   const unchanged: string[] = [];
   const errors: Record<string, string> = {};
+  const snapshots: string[] = [];
   const actor = opts.actor ?? "PAIR_PROVIDER_DISCOVERY";
+  // Per-source claim sets drive Phase E §5 source-currentness
+  // reconciliation: only COMPLETE source runs count as authoritative
+  // observation evidence; a failed source can never falsely remove.
+  const claimedBySource = new Map<string, Set<string>>();
 
   for (const source of sources) {
-    if (!source.supports(context)) continue;
+    if (!source.supports(context)) {
+      // Phase E R1 §8-§10 — explicit source-disappearance semantics.
+      // "Never configured for this installation" (no prior snapshot) is
+      // NOT an absence observation — skip silently. A source that HAS a
+      // prior COMPLETE snapshot but now reports supports()=false is a
+      // previously-active authoritative source that definitively
+      // disappeared: it claims nothing this run, so providers solely
+      // dependent on it lose currentness through the normal bounded
+      // streak (never an indefinite last-known-good grant). The run
+      // records an ABSENT snapshot so the distinction is inspectable;
+      // ABSENT counts as a completed-authoritative-empty claim, unlike
+      // FAILED which never removes anything.
+      if (!catalog.hasCompletedSnapshot(source.sourceId)) continue;
+      claimedBySource.set(source.sourceId, new Set());
+      const snap = catalog.recordProviderSnapshot(source.sourceId, "ABSENT", [], { runId, actor });
+      snapshots.push(String(snap.snapshot_id));
+      continue;
+    }
     let candidates: ProviderCandidate[];
     try {
       candidates = [...source.discover(context)];
     } catch (err) {
-      // One source failing must not corrupt the whole catalog.
-      errors[source.sourceId] = err instanceof Error ? err.message.slice(0, 200) : String(err);
+      // One source failing must not corrupt the whole catalog — and must
+      // not count as an absence observation either (FAILED snapshot).
+      errors[source.sourceId] = sanitizeDiagnostic(err instanceof Error ? err.message : err) ?? "UNKNOWN";
+      catalog.recordProviderSnapshot(source.sourceId, "FAILED", [], { runId, actor });
       continue;
     }
+    const claimed = new Set<string>();
     for (const candidate of candidates) {
       try {
         const res = catalog.upsertCandidate(candidate as unknown as Record<string, unknown>, actor);
         const pid = String(res.entry.provider_id);
+        claimed.add(pid);
         if (res.created) created.push(pid);
         else if (res.semanticNoOp) unchanged.push(pid);
         else updated.push(pid);
       } catch (err) {
         errors[String(candidate.provider_native_id)] =
-          err instanceof Error ? err.message.slice(0, 200) : String(err);
+          sanitizeDiagnostic(err instanceof Error ? err.message : err) ?? "UNKNOWN";
       }
     }
+    claimedBySource.set(source.sourceId, claimed);
+    const snap = catalog.recordProviderSnapshot(source.sourceId, "COMPLETE", [...claimed], { runId, actor });
+    snapshots.push(String(snap.snapshot_id));
   }
+  const rec = catalog.reconcileProviderAbsence(claimedBySource, { actor });
   const receipt = catalog.recordSyncReceipt(runId, { created, updated, unchanged, errors }, { actor });
-  return { created, updated, unchanged, errors, sync_id: String(receipt.sync_id) };
+  return {
+    created,
+    updated,
+    unchanged,
+    errors,
+    stale: rec.stale,
+    removed: rec.removed,
+    snapshots,
+    sync_id: String(receipt.sync_id),
+  };
 }
 
 export function defaultSources(): ProviderDiscoverySource[] {
