@@ -498,6 +498,36 @@ export class ProviderCatalog {
     opts: { policy_version: string; gates: Record<string, unknown>; actor?: string },
   ): Record<string, unknown> {
     const entry = this.mustGet(providerId);
+    // Phase E R3 §5–§7 — this commit seam installs QUALIFIED authority, so
+    // it validates durable canonical state itself rather than trusting the
+    // caller: AUTH_OK + PROBED + no STALE/REMOVED, and a receipt never
+    // mints over failing gates. DISABLED/UNQUALIFIED are deliberately NOT
+    // rejected: DISABLED is operator authority preserved through
+    // requalification (never routable — PROVIDER_NOT_BLOCKED blocks
+    // downstream), and UNQUALIFIED is transient residue this same
+    // transition canonically clears (blocking it would deadlock
+    // requalification).
+    const blocked =
+      String(entry.auth_state) !== "AUTH_OK"
+        ? `auth_state=${entry.auth_state}`
+        : String(entry.probe_state) !== "PROBED"
+          ? `probe_state=${entry.probe_state}`
+          : ((entry.conditions as string[]) ?? []).some((c) => ["STALE", "REMOVED"].includes(c))
+            ? `conditions=${JSON.stringify(entry.conditions)}`
+            : null;
+    if (blocked) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE",
+        JSON.stringify({ provider_id: providerId, blocked_by: blocked }),
+      );
+    }
+    const failing = Object.entries(opts.gates).filter(([, v]) => v !== "PASS");
+    if (failing.length) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES",
+        JSON.stringify({ provider_id: providerId, failing_gates: failing.map(([k]) => k) }),
+      );
+    }
     const receipt = {
       receipt_id: newId("PQR"),
       provider_id: providerId,

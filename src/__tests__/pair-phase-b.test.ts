@@ -1008,19 +1008,31 @@ const mkProvider = (
     health_state: opts.health_state ?? "READY",
     conditions: [],
     // Phase E §6 — a QUALIFIED provider carries current probe evidence;
-    // explicit PROBE_* failures demote routability.
-    probe_state: lifecycle === "QUALIFIED" ? "PROBED" : "UNPROBED",
+    // explicit PROBE_* failures demote routability. R3 §7 —
+    // MODEL_DISCOVERY_ELIGIBLE is a qualified resting state too (the
+    // validator's own end state), so it carries PROBED evidence.
+    probe_state: ["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(lifecycle) ? "PROBED" : "UNPROBED",
   }, existing ? Number(existing.version) : 0);
   // Phase E §7 — any routable-authority lifecycle (QUALIFIED or
   // MODEL_DISCOVERY_ELIGIBLE, both reachable only through canonical
   // qualification in production) carries a qualification receipt bound to
   // the provider's material fingerprint.
   if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
+    // R3 §5 — the qualification commit seam validates durable state
+    // itself: mint under the canonical post-probe state (AUTH_OK +
+    // PROBED); a caller's degraded auth/probe state applies AFTER the
+    // receipt, the same ordering a credential revocation would take.
+    const cur = store.get("provider", id);
+    store.put("provider", id, { ...cur, auth_state: "AUTH_OK", probe_state: "PROBED" }, Number(cur.version));
     new ProviderCatalog(store).issueQualificationReceipt(pid, {
       policy_version: "test-policy",
-      gates: { fixture: true },
+      gates: { fixture: "PASS" },
       actor: "test",
     });
+    if (opts.auth_state !== undefined) {
+      const b = store.get("provider", id);
+      store.put("provider", id, { ...b, auth_state: opts.auth_state }, Number(b.version));
+    }
     // Canonical post-qualification resting state: the receipt lands on
     // QUALIFIED, then the lifecycle settles at MODEL_DISCOVERY_ELIGIBLE —
     // mirror the validator's own end state.

@@ -81,7 +81,9 @@ const mkProvider = (
       auth_state: opts.auth_state ?? "AUTH_OK",
       health_state: opts.health_state ?? "READY",
       conditions: [],
-      probe_state: lifecycle === "QUALIFIED" ? "PROBED" : "UNPROBED",
+      // R3 §7 — MODEL_DISCOVERY_ELIGIBLE is a qualified resting state too,
+      // so it carries durable PROBED evidence like QUALIFIED.
+      probe_state: ["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(lifecycle) ? "PROBED" : "UNPROBED",
     },
     existing ? Number(existing.version) : 0,
   );
@@ -91,7 +93,7 @@ const mkProvider = (
   if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
     new ProviderCatalog(store).issueQualificationReceipt(pid, {
       policy_version: "test-policy",
-      gates: { fixture: true },
+      gates: { fixture: "PASS" },
       actor: "test",
     });
     if (lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {

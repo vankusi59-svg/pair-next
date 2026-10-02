@@ -338,13 +338,21 @@ export class ModelEvidenceCatalog {
   /** Phase E R2 §2 — the CURRENT-epoch probe receipts: only the receipts
    *  referenced by the entry's current probe_receipt_ids window. Older
    *  probe_receipt entities stay persisted/inspectable via
-   *  listProbeReceipts but are never current authority. */
+   *  listProbeReceipts but are never current authority.
+   *  R3 §10 — ownership is verified too: a receipt in the window must
+   *  actually belong to this model (model_entry_id match) and, when both
+   *  sides carry provider_id, to the same provider — a corrupt/legacy
+   *  window referencing another model's probe grants nothing. */
   currentProbeReceipts(modelEntryId: string): Array<Record<string, unknown>> {
     const entry = this.getModel(modelEntryId);
     const ids = new Set(((entry?.probe_receipt_ids as string[]) ?? []).map(String));
     if (ids.size === 0) return [];
-    return (this.store.list("probe_receipt") as Record<string, unknown>[]).filter((r) =>
-      ids.has(String(r.probe_id)),
+    return (this.store.list("probe_receipt") as Record<string, unknown>[]).filter(
+      (r) =>
+        ids.has(String(r.probe_id)) &&
+        String(r.model_entry_id) === modelEntryId &&
+        (r.provider_id == null || entry?.provider_id == null ||
+          String(r.provider_id) === String(entry.provider_id)),
     );
   }
 
@@ -377,6 +385,14 @@ export class ModelEvidenceCatalog {
         );
       }
     }
+    // Phase E R3 §14 — the LATEST probe state governs: an older PASS in
+    // the current window must not mint over a newer failure.
+    if (String(entry.probe_state ?? "") !== "PROBED") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_MODEL_QUALIFICATION_STATE",
+        JSON.stringify({ model_entry_id: modelEntryId, probe_state: entry.probe_state ?? null }),
+      );
+    }
     for (const ref of opts.evidence_refs) {
       if (!currentIds.has(String(ref))) {
         throw new IntegrityError(
@@ -385,12 +401,26 @@ export class ModelEvidenceCatalog {
         );
       }
     }
+    // Phase E R3 §11 — the minted receipt records the ACTUAL covering
+    // current PASS probe receipts (derived internally), never trusting
+    // caller strings and never minting an untraceable receipt with empty
+    // evidence.
+    const covering = currentReceipts.filter((r) => {
+      if (r.result !== "PASS") return false;
+      const ce = (r.capability_evidence ?? {}) as Record<string, unknown>;
+      return opts.capability_scope.some(
+        (cap) =>
+          ce[cap] === "PASS" ||
+          ce[cap] === true ||
+          (String(r.probe_type) === cap && ce.passed !== false),
+      );
+    });
     const receipt = {
       receipt_id: newId("MQR"),
       model_entry_id: modelEntryId,
       capability_scope: opts.capability_scope,
       verifier: opts.verifier,
-      evidence_refs: opts.evidence_refs,
+      evidence_refs: covering.map((r) => String(r.probe_id)),
       // Phase E §7 — bind the receipt to the model's material identity at
       // qualification time so later drift cannot reuse stale authority.
       material_fingerprint: modelIdentityDigest(entry),

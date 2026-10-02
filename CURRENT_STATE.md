@@ -858,6 +858,20 @@ WOB1(A) and refused a legitimate retry.
   Focused 51/51; full suite 2720 pass / same 2 env P5 fails; tsc+build
   clean; live E2E confirms UNPROBED+receipt=null for enumeration-only
   providers.
+- **R3 remediation** (same branch, pending re-audit): latest probe state
+  governs invocation — new `MODEL_PROBE_CURRENT` gate (exact `PROBED`,
+  availability-classified): a newer canonical probe FAILURE revokes new
+  model invocation at planner + DSH before dispatch while history stays
+  inspectable; `PROVIDER_PROBE_CURRENT` corrected to exact `PROBED`
+  (UNPROBED no longer passes); `qualifyModel` `CURRENT_PROBE_EVIDENCE` =
+  `probe_state==="PROBED"` (older PASS in window can't override latest
+  FAIL); provider `issueQualificationReceipt` commit seam validates
+  durable state itself (`AUTH_OK`+`PROBED`+no STALE/REMOVED, all-PASS
+  gates → `FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE`/`_GATES`);
+  `currentProbeReceipts` verifies `model_entry_id` + provider ownership;
+  model qualification `evidence_refs` derived internally from covering
+  current PASS receipts. Focused 57/57; full suite 2726 pass / same 2
+  env P5 fails; tsc+build clean.
 
 ## Not yet
 

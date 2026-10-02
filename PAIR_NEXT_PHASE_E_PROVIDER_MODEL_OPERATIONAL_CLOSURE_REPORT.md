@@ -565,3 +565,125 @@ Now blocks STALE too; documented as the provider-only subset of
 - this report — R2 section appended; R1 evidence preserved verbatim.
 
 STOP. DO NOT MERGE. Awaiting independent audit of R2.
+
+---
+
+# R3 — QUALIFICATION AUTHORITY + CURRENT PROBE CLOSURE (audited HEAD `ec0a695`)
+
+Second independent audit of R2: **PASS on R2**, but Phase E FINAL = BLOCKED.
+The surviving-bug class: a model QUALIFIED receipt stayed valid after a
+NEWER canonical probe failed — the receipt binds model identity, not
+probe state, so nothing in R2 revoked invocation on fresh failure
+evidence. Same class on the provider side: the qualification commit
+seam trusted caller-supplied gate results instead of durable state.
+
+## R3.1 Semantics
+
+- **`MODEL_PROBE_CURRENT`** (new gate in `providerModelEligibility`,
+  availability-classified — NOT in `AUTHORITY_GATES`/`DSH_AUTHORITY_GATES`):
+  PASS ⇔ `model.probe_state === "PROBED"` exactly. Invariant:
+  **CURRENT FAILED MODEL PROBE = NO NEW MODEL INVOCATION** —
+  `UNPROBED`, `PROBE_*`, or any other state all FAIL. Planner reject and
+  DSH reject happen BEFORE invocation/dispatch; the qualification
+  receipt and probe history remain inspectable; a fresh PASS probe can
+  restore authority (availability semantics).
+- **`PROVIDER_PROBE_CURRENT`**: corrected to exact-`PROBED`. The
+  previous `!probe_state.startsWith("PROBE_")` let `UNPROBED` pass — a
+  never-probed provider read as current probe evidence.
+- **`qualifyModel` `CURRENT_PROBE_EVIDENCE`**: PASS ⇔
+  `entry.probe_state === "PROBED"`. The LATEST probe state governs — an
+  older PASS receipt in the same current window no longer overrides a
+  newer failure (`[PASS, FAIL]` epoch → `qualified: false` even though
+  `CAPABILITY_*` coverage exists).
+- **Provider `issueQualificationReceipt` (commit seam)**: now validates
+  durable canonical state itself before minting —
+  `auth_state === "AUTH_OK"`, `probe_state === "PROBED"`, no
+  `STALE`/`REMOVED` condition, and every recorded gate value
+  `=== "PASS"`. Violations throw
+  `FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE` /
+  `FAIL_CLOSED_PROVIDER_QUALIFICATION_GATES`; no receipt row, no
+  lifecycle/condition mutation. `DISABLED`/`UNQUALIFIED` are
+  deliberately NOT rejected: DISABLED is operator authority preserved
+  through canonical requalification (61F — routability is separately
+  blocked by `PROVIDER_NOT_BLOCKED`), and UNQUALIFIED is transient
+  residue this same transition canonically clears (60A–E) — rejecting
+  either would deadlock legitimate flows.
+- **Model `issueQualificationReceipt`**: likewise refuses
+  `probe_state !== "PROBED"` (`FAIL_CLOSED_MODEL_QUALIFICATION_STATE`)
+  so a direct seam call cannot mint over a newer failure even when
+  older-PASS coverage exists.
+- **`currentProbeReceipts` ownership**: a receipt in the window must
+  satisfy `receipt.model_entry_id === modelEntryId` AND (when both carry
+  `provider_id`) `receipt.provider_id === model.provider_id`. A corrupt
+  window referencing another model's probe id yields ZERO evidence.
+- **`evidence_refs` derivation**: the minted model qualification records
+  the ACTUAL covering current PASS receipts (derived internally from
+  `currentProbeReceipts` + capability coverage), never caller strings.
+  `evidence_refs: []` at call time still mints a fully traceable
+  receipt; caller-supplied refs are still validated against the current
+  window (`..._FOREIGN`).
+
+## R3.2 Tests (mandate §8–§16, +6 focused tests → 57/57)
+
+- **r3p** (§8+§9): `AUTH_OK`/`UNPROBED`/`DISCOVERY_ELIGIBLE` provider +
+  forged all-PASS gates → `FAIL_CLOSED_PROVIDER_QUALIFICATION_STATE`;
+  no receipt, `PROVIDER_PROBE_CURRENT` FAIL, `providerRoutableGate`
+  false. Forged `WARN` gate → `..._GATES`. Then real `validateAccess`
+  probe → `PROBED` → `qualify()` → receipt minted, gate PASS.
+- **r12** (§12): qualified+routable planner + DSH models; new FAIL
+  probes → `probe_state="PROBE_FAIL"`, `MODEL_PROBE_CURRENT` FAIL,
+  `eligible=false`, planner `{reject:true}`, DSH `{reject:true}`,
+  projection non-routable — all before any invocation; old PASS receipt
+  stays inspectable (`listProbeReceipts`), qualification receipt kept.
+- **r13m** (§13): fresh PASS → `PROBED` → `qualifyModel` → new receipt;
+  `evidence_refs` = exactly the covering current PASS ids (FAIL receipt
+  excluded); eligible again.
+- **r14** (§14): epoch `[PASS, FAIL]` → `qualifyModel` refuses
+  (`CURRENT_PROBE_EVIDENCE` FAIL while `CAPABILITY_TEXT_INFERENCE` PASS
+  — proof the refusal is current-state, not missing evidence); raw seam
+  agrees via `FAIL_CLOSED_MODEL_QUALIFICATION_STATE`; no receipt.
+- **r15** (§15): model A window injected with model B's probe id →
+  `currentProbeReceipts(A)` = `[]`; `qualifyModel(A)` fails coverage;
+  seam throws `..._MISSING`; no receipt minted.
+- **r16** (§16): `issueQualificationReceipt` with `evidence_refs: []` on
+  a covered model → mints with `evidence_refs` = actual covering PASS
+  probe ids (non-empty, traceable).
+
+## R3.3 Regression
+
+- Focused Phase E suite: **57/57** (34 original + 11 R1 + 6 R2 + 6 R3).
+- Related suites re-run: phase-b 123/123, phase-c-dsh 51/51, p6 36/36,
+  runtime-hardening 11/11 — PASS (legitimate fixture updates: mirror
+  canonical post-qualification `AUTH_OK`/`PROBED` state, `gates` values
+  `"PASS"`; no test semantics weakened).
+- Full suite: **2726 pass / 2 fail / 15 skip (2743)** — the 2 fails are
+  the same pre-existing env-only P5 assertions
+  (`EXECUTABLE_NOT_FOUND` — real `dsh`/`codex` binaries on PATH;
+  identical on base `b08e8a5` and both audited HEADs). +6 vs R2 count.
+- `npx tsc --noEmit`: clean. `pnpm build`: clean.
+- R1–R8 incident invariants: all preserved suites pass inside the full
+  run (planner dataflow 106/106, recovery-approval 37/37, ops telegram
+  delivery, live-ops recovery closure — no Telegram/dataflow semantics
+  touched).
+
+## R3.4 Files changed in R3
+
+- `src/pair/model-routable.ts` — `PROVIDER_PROBE_CURRENT` exact-PROBED;
+  new `MODEL_PROBE_CURRENT` gate (availability classification).
+- `src/pair/model-probing.ts` — `CURRENT_PROBE_EVIDENCE` reads
+  `probe_state`; `evidence_refs` filtered to PASS receipts.
+- `src/pair/model-catalog.ts` — `currentProbeReceipts` ownership
+  verification; `issueQualificationReceipt` probe-state gate +
+  internally-derived covering `evidence_refs`.
+- `src/pair/provider-catalog.ts` — `issueQualificationReceipt` durable
+  state + all-PASS gates validation (two dedicated fail-closed errors).
+- `src/__tests__/pair-phase-e-provider-model-authority.test.ts` — +6 R3
+  tests; `mkModel` unchanged (already canonical).
+- `src/__tests__/pair-phase-b.test.ts`,
+  `pair-phase-c-dsh-model-routing.test.ts`, `pair-p6.test.ts` —
+  legitimate fixture updates only: qualified lifecycles mint under
+  canonical `AUTH_OK`/`PROBED`, caller-degraded states applied
+  post-receipt (mirroring credential revocation ordering).
+- this report — R3 section appended; R1+R2 evidence preserved verbatim.
+
+STOP. DO NOT MERGE. Awaiting independent audit of R3.

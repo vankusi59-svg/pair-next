@@ -206,10 +206,11 @@ export function providerModelEligibility(
   gates.PROVIDER_AUTH_OK =
     provider && String(provider.auth_state) === "AUTH_OK" ? "PASS" : "FAIL";
   // Phase E §6 — a recorded probe FAILURE demotes routability (PROBE_*
-  // outcome markers). Absence of probe evidence is not a contradiction:
-  // PROVIDER_QUALIFIED already carries lifecycle authority.
+  // outcome markers). R3 §7 — exact semantics: only a durable PROBED
+  // state is current probe evidence; UNPROBED (never probed, legacy
+  // corruption, reappearance reset) fails like any PROBE_* failure.
   gates.PROVIDER_PROBE_CURRENT =
-    provider && !String(provider.probe_state ?? "").startsWith("PROBE_") ? "PASS" : "FAIL";
+    provider && String(provider.probe_state ?? "") === "PROBED" ? "PASS" : "FAIL";
   gates.PROVIDER_HEALTH_OK =
     provider && !["UNAVAILABLE", "DOWN"].includes(String(provider.health_state)) ? "PASS" : "FAIL";
   // Phase E §5 — REMOVED (absence-reconciled) providers are blocked like
@@ -268,6 +269,13 @@ export function providerModelEligibility(
       ? "PASS"
       : "FAIL";
   gates.MODEL_QUALIFIED = model?.lifecycle_state === "QUALIFIED" ? "PASS" : "FAIL";
+  // Phase E R3 §1–§3 — a newer canonical probe failure revokes model
+  // invocation immediately. The qualification receipt binds model
+  // identity, not probe state, so only an exact PROBED current state
+  // authorizes work (UNPROBED / PROBE_* both fail). Availability
+  // classification: a fresh PASS probe can restore authority.
+  gates.MODEL_PROBE_CURRENT =
+    model && String(model.probe_state ?? "") === "PROBED" ? "PASS" : "FAIL";
   gates.MODEL_NOT_STALE =
     model && !modelConditions.includes("STALE") && !modelConditions.includes("REMOVED") ? "PASS" : "FAIL";
   gates.MODEL_NOT_REVOKED =

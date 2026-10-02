@@ -79,9 +79,18 @@ function seedProvider(
   // Phase E §7 — routable-authority lifecycles carry a material-bound
   // qualification receipt (only reachable through qualification in prod).
   if (["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(String(opts.lifecycle))) {
+    // R3 §5 — the qualification commit seam now validates durable state
+    // itself: mirror the canonical post-qualification state (AUTH_OK +
+    // PROBED) the validator produces.
+    const pre = ctx.store.get("provider", String(entry.entry_id));
+    ctx.store.put("provider", String(entry.entry_id), {
+      ...pre,
+      auth_state: opts.auth ?? "AUTH_OK",
+      probe_state: opts.probe ?? "PROBED",
+    }, Number(pre.version));
     catalog.issueQualificationReceipt(providerId, {
       policy_version: "test-policy",
-      gates: { fixture: true },
+      gates: { fixture: "PASS" },
       actor: "test",
     });
     if (opts.lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {

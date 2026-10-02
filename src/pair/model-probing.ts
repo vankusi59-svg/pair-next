@@ -168,7 +168,11 @@ export function qualifyModel(
     for (const k of Object.keys(ce)) if (ce[k] === "PASS" || ce[k] === true) passCaps.add(k);
     if (r.probe_type && ce.passed !== false) passCaps.add(String(r.probe_type));
   }
-  gates.CURRENT_PROBE_EVIDENCE = receipts.some((r) => r.result === "PASS") ? "PASS" : "FAIL";
+  // Phase E R3 §4 — currentness respects the LATEST probe state: an
+  // earlier PASS in the window must not override a newer failure.
+  // probe_state only equals PROBED when the most recent canonical probe
+  // passed.
+  gates.CURRENT_PROBE_EVIDENCE = String(entry.probe_state ?? "") === "PROBED" ? "PASS" : "FAIL";
   for (const cap of opts.capability_scope) {
     gates[`CAPABILITY_${cap.toUpperCase()}`] = passCaps.has(cap) ? "PASS" : "FAIL";
   }
@@ -179,7 +183,7 @@ export function qualifyModel(
   const receipt = catalog.issueQualificationReceipt(modelEntryId, {
     capability_scope: opts.capability_scope,
     verifier: opts.verifier ?? "DETERMINISTIC_PROBE_EVIDENCE",
-    evidence_refs: receipts.map((r) => String(r.probe_id)),
+    evidence_refs: receipts.filter((r) => r.result === "PASS").map((r) => String(r.probe_id)),
     actor: opts.actor,
   });
   return { qualified: true, gates, receipt };
