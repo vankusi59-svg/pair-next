@@ -42,7 +42,12 @@ import {
 } from "./approval-queue.js";
 import type { ReconciliationService } from "./reconciliation.js";
 import type { RecoveryController } from "./recovery-controller.js";
-import { classifyFailure } from "./recovery-controller.js";
+import { classifyFailure, RECOVERY_MATRIX } from "./recovery-controller.js";
+import {
+  assertPlanDataflow,
+  provenMissingConsumedArtifact,
+} from "./plan-dataflow.js";
+import type { FailureClass } from "./recovery-controller.js";
 import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
@@ -528,6 +533,10 @@ export class MissionRuntime {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
+    // Incident R1 — pinned plans must be data-flow sound at the commit
+    // boundary: every consumed artifact requires its producer edge. A
+    // planner path that bypassed the canonicalize seam still fails closed.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
     this.deps.service.commitPlan({
       mission_id: missionId,
       tasks: tasks as unknown as Array<Record<string, unknown>>,
@@ -661,9 +670,18 @@ export class MissionRuntime {
         // Dispatch-time routing failures carry no execution row — the executor
         // the route selection failed on still becomes bounded re-route
         // evidence so RE_ROUTE excludes it instead of re-selecting it.
-        this.startRecovery(missionId, String(task.task_id), null, failureClass, now, undefined, undefined, {
-          failedExecutorId: String((err as PairError).meta?.executor_id ?? "") || null,
-        });
+        this.startRecovery(
+          missionId,
+          String(task.task_id),
+          null,
+          this.classifyWithDependencyEvidence(missionId, String(task.task_id), failureClass),
+          now,
+          undefined,
+          undefined,
+          {
+            failedExecutorId: String((err as PairError).meta?.executor_id ?? "") || null,
+          },
+        );
         return;
       }
       const rtNow = String(this.runtimeEntity(missionId).state);
@@ -743,7 +761,45 @@ export class MissionRuntime {
       error_class: String(errorObj?.class ?? ""),
       result: (collected.result as Record<string, unknown>) ?? null,
     });
-    this.startRecovery(missionId, taskId, executionId, failureClass);
+    this.startRecovery(
+      missionId,
+      taskId,
+      executionId,
+      this.classifyWithDependencyEvidence(missionId, taskId, failureClass),
+    );
+  }
+
+  /**
+   * Incident R1 — deterministic missing-prerequisite evidence. A task that
+   * canonically consumes a workspace artifact which is absent cannot
+   * succeed on retry: classify DEPENDENCY_FAILURE (non-retryable →
+   * REPLAN/ABORT) instead of burning identical attempts as PROCESS_EXIT.
+   * Evidence is the persisted digested `metadata.pair_dataflow` ONLY —
+   * never executor summary/stderr prose — so a task without declared
+   * consumes (or one whose inputs all exist) keeps the base class.
+   * Already-bounded classes are never widened.
+   */
+  private classifyWithDependencyEvidence(
+    missionId: string,
+    taskId: string,
+    base: FailureClass,
+  ): FailureClass {
+    if (!RECOVERY_MATRIX[base]?.retry_allowed) return base;
+    const task = this.store.tryGet("task", taskId);
+    if (!task) return base;
+    const df = (task.metadata as Record<string, unknown> | undefined)
+      ?.pair_dataflow as Record<string, unknown> | undefined;
+    if (!Array.isArray(df?.consumes) || df.consumes.length === 0) return base;
+    const mission = this.deps.service.getMission(missionId);
+    const md = (mission.metadata as Record<string, unknown>) ?? {};
+    const workspace = String(
+      (task.metadata as Record<string, unknown> | undefined)?.workspace ??
+        (md.authorized_workspaces as string[])?.[0] ??
+        "",
+    );
+    if (!workspace) return base;
+    const missing = provenMissingConsumedArtifact({ task, workspace });
+    return missing ? "DEPENDENCY_FAILURE" : base;
   }
 
   /**
@@ -2297,6 +2353,8 @@ export class MissionRuntime {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
+    // Incident R1 — a replan is a new committed plan: same data-flow gate.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
     // Old revision stays immutable; unfinished old tasks are settled as
     // CANCELLED (never silently reset), pending approvals/timers superseded.
     for (const t of oldTasks) {

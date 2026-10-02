@@ -87,6 +87,7 @@ import {
   settlePlannerAttempt,
   finishPlannerRun,
   validatePlanProposal,
+  reconcilePlanDataflow,
   modelRoleOf,
   MODEL_ROLE,
   utcnow,
@@ -309,6 +310,13 @@ const canonicalizeLlmTasks = (rawTasks, goal) => {
       },
     };
   }
+  // Incident R1 — deterministic artifact data-flow reconciliation at THE
+  // canonical seam, before validatePlanProposal + plan_digest: a task
+  // consuming an artifact must depend on its unique earlier producer
+  // (missing edges are injected with durable repair evidence); unbound/
+  // ambiguous/backward producers throw FAIL_CLOSED_PLAN_DATAFLOW_* so the
+  // failover winner-check treats the raw plan as PLAN_INVALID.
+  reconcilePlanDataflow(tasks);
   return tasks;
 };
 const planner = (input) => {

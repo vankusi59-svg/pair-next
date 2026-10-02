@@ -26,6 +26,7 @@ import { projectRoutableModels } from "./model-routable.js";
 import { canonicalRiskCeiling, canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
 import { validatePlanProposal } from "./proposal.js";
+import { assertPlanDataflow } from "./plan-dataflow.js";
 import {
   assertPreviewWorkspaceAuthority,
   createPlanPreview as persistPlanPreview,
@@ -467,6 +468,12 @@ export class MissionControl {
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
+    // Incident R1 — the previewed task list is digested/pinned below, so
+    // it must already be data-flow sound (consumed artifacts need their
+    // producer edge). The serve canonicalize seam repairs before this;
+    // an unsound proposal fails closed here rather than entering a
+    // digestible preview.
+    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>);
     const eid = effectiveInputDigest({
       project_id: input.project_id,
       goal: input.goal,
@@ -552,6 +559,14 @@ export class MissionControl {
       validatePlanProposal(
         { tasks: v.preview.canonical_tasks },
         knownCaps,
+      );
+      // Incident R1 §6 — confirm only VALIDATES the persisted canonical
+      // plan; it never repairs. A READY preview pinned before the
+      // data-flow authority (or otherwise unsound) fails closed here —
+      // it is not consumed, no mission is created, the operator must
+      // request a fresh preview.
+      assertPlanDataflow(
+        v.preview.canonical_tasks as Array<Record<string, unknown>>,
       );
       // R5 — replay persisted authority VERBATIM. Normalization already ran
       // before the persisted digests at preview creation; confirm may only
