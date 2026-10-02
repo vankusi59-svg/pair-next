@@ -1755,6 +1755,7 @@ export class MissionRuntime {
           Number(rt.version),
         );
         if (waiting) {
+          if (!stillOwned()) return; // R4: fence before transition
           this.transitionRuntime(
             missionId,
             "RECOVERING",
@@ -1791,6 +1792,7 @@ export class MissionRuntime {
           Number(rt.version),
         );
         if (waiting) {
+          if (!stillOwned()) return; // R4: fence before transition
           this.transitionRuntime(
             missionId,
             "RECOVERING",
@@ -1829,12 +1831,14 @@ export class MissionRuntime {
           barrier.approval_exercise_id = exerciseId;
           rt.barriers = barriers;
         }
+        if (!stillOwned()) return; // R4: fence before task terminalize
         if (taskId) {
           const task = this.store.tryGet("task", taskId);
           if (task && String(task.status) !== "FAILED") {
             this.deps.service.updateTask(taskId, { status: "FAILED" });
           }
         }
+        if (!stillOwned()) return; // R4: fence before exec outcome write
         // Neutralize the execution row: the operator outcome is durable on
         // the execution itself so RUNNING's in-flight sweep can never
         // re-drive it into recovery after restart — replay is impossible
@@ -1858,13 +1862,16 @@ export class MissionRuntime {
             );
           }
         }
+        if (!stillOwned()) return; // R4: fence before runtime persist
         this.store.put(
           "mission_runtime",
           String(rt.mission_runtime_id),
           rt,
           Number(rt.version),
         );
+        if (!stillOwned()) return; // R4: fence before pending clear
         this.clearPendingRecovery(missionId, "CANCELLED", "operator_no_replay");
+        if (!stillOwned()) return; // R4: fence before linkage clear + transition
         const rt3 = this.runtimeEntity(missionId);
         rt3.pending_approval_id = null;
         this.store.put(
@@ -1887,6 +1894,7 @@ export class MissionRuntime {
           Number(rt.version),
         );
         if (waiting) {
+          if (!stillOwned()) return; // R4: fence before transition
           this.transitionRuntime(missionId, "RUNNING", "approval_granted_resume");
         }
       }
@@ -1924,6 +1932,7 @@ export class MissionRuntime {
             execution_id: stale.execution_id ?? null,
             failure_class: stale.failure_class ?? null,
             infeasible_actions: stale.infeasible_actions ?? null,
+            recovery_id: stale.recovery_id ?? null,
           }
         : null,
     };
@@ -1977,6 +1986,14 @@ export class MissionRuntime {
     plan?: Record<string, unknown>,
     stillOwned?: () => boolean,
   ): void {
+    const planHasSnapshot =
+      plan != null &&
+      Object.prototype.hasOwnProperty.call(plan, "stale_recovery");
+    const planStale =
+      (plan?.stale_recovery as Record<string, unknown> | null) ?? null;
+    const planChainId = planStale
+      ? String(planStale.recovery_id ?? "")
+      : null;
     if (stillOwned && !stillOwned()) return; // fenced mid-apply (R3)
     const rt = this.runtimeEntity(missionId);
     const pending = rt.pending_recovery as Record<string, unknown> | null;
@@ -1986,10 +2003,31 @@ export class MissionRuntime {
     ) {
       return; // chain for this exercise already minted — resume it
     }
-    const stale =
-      pending ??
-      ((plan?.stale_recovery as Record<string, unknown> | null) ?? null);
+    if (
+      pending &&
+      planHasSnapshot &&
+      String(pending.recovery_id ?? "") !== String(planChainId ?? "")
+    ) {
+      // R4 — the previous owner minted this chain durably but was fenced
+      // before stamping it: its recovery_id differs from the snapshot's
+      // stale chain, so it IS the fresh exercise chain. Adopt it verbatim
+      // instead of minting a second recovery_decision for this APRE.
+      // Plans without the snapshot key (pre-R4 winners) cannot prove the
+      // distinction — fall through to the conservative clear+rebuild.
+      if (stillOwned && !stillOwned()) return; // fence before stamp
+      pending.approval_exercise_id = exerciseId;
+      rt.pending_recovery = pending;
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
+      );
+      return;
+    }
+    if (stillOwned && !stillOwned()) return; // R4: fence before clear
     this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
+    const stale = pending ?? planStale;
     if (!stale) return;
     if (stillOwned && !stillOwned()) return; // fenced before chain mint
     this.startRecovery(
@@ -2003,6 +2041,7 @@ export class MissionRuntime {
         | Array<{ action: RecoveryAction; reason: string }>
         | undefined,
     );
+    if (stillOwned && !stillOwned()) return; // R4: fence before stamp
     const rtAfter = this.runtimeEntity(missionId);
     const fresh = rtAfter.pending_recovery as Record<string, unknown> | null;
     if (fresh) {

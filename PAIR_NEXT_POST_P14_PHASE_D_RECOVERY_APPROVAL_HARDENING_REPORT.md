@@ -361,3 +361,62 @@ An effect mutation may run only while `verifyExerciseClaim` returns the canonica
 `PAIR_NEXT_PHASE_D_R3_PENDING_INDEPENDENT_AUDIT`
 
 **STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R4 — Per-Stage APRE Fencing Closure
+
+Base: `17d0c86` (R3 audited HEAD). Scope: fencing now re-verifies the claim token before EVERY meaningful canonical mutation — a mid-apply takeover stops the stale owner at the next stage, and a chain minted-but-unstamped by a fenced owner is adopted, never re-minted.
+
+## Mandatory fencing API
+
+`markExercisedApplied(approvalId, ownerId, claimEpoch)` — both params REQUIRED (no unfenced finalization path remains). Transitions `APPLYING→APPLIED` only while canonical `owner_id`/`claim_epoch`/`state=APPLYING` all match → returns `{row, applied, fenced}`; stale token → `{fenced:true, applied:false}` (test H proves `fenced:true` + row NOT APPLIED).
+
+## Per-stage fencing points
+
+`stillOwned()` = `verifyExerciseClaim(id, token)` — fresh canonical read each call. Fences placed:
+
+| Arm | Sequence |
+|-----|----------|
+| EXTENSION | v→grant assignment+rt put → v→runtime transition → v→chain entry → v→pending clear → v→decision mint (`startRecovery`) → v→chain stamp → token→APPLIED |
+| REVALIDATION | v→rt put → v→transition → chain fences as above → token→APPLIED |
+| ACK_NO_REPLAY | v→barrier settle (in-mem) → v→task FAILED → v→exec terminal_outcome → v→mission_runtime persist → v→pending_recovery clear → v→linkage clear + transition → token→APPLIED |
+| default | v→rt put → v→transition → token→APPLIED |
+
+`resumeExercisedChain` fences at: entry, before `clearPendingRecovery`, before `startRecovery` mint, before the chain-stamp put — plus inside the new adoption path.
+
+## Post-mint adoption (chain uniqueness)
+
+`stale_recovery` snapshot now records `recovery_id`. When `pending_recovery` exists unstamped and its `recovery_id` differs from the snapshot's chain, the pending IS a fresh chain minted by a fenced owner → the resuming owner ADOPTS it (stamp + put), never mints a second `recovery_decision`. Plans lacking the snapshot key fall back to conservative clear+rebuild — no misclassification.
+
+## Mid-apply takeover evidence (tests J/K/L — trap injects takeover inside a `verifyExerciseClaim` call)
+
+- **J (UNKNOWN arm)**: A epochs through stages; takeover injected at the fence before `clearPendingRecovery`. Result: barrier settled+stamped once (durable from A), task FAILED once, exec `terminal_outcome` once, A stopped before clear/transition/finalize; B renews epoch 2 → idempotent skips → neutralizes stale chain → `APPLIED` by B/2. Zero replay (`exA`/`exA2` dispatches frozen).
+- **K (EXTENSION, after mint before stamp)**: A mints the fresh chain unstamped → takeover → A fenced at stamp. B ADOPTS the same `recovery_id` chain — `recovery_decision` count `+1` total (A's mint), APRE `APPLIED` B/2.
+- **L (REVALIDATION, before mint)**: old chain cleared, takeover, A fenced pre-mint (decisions frozen). B rebuilds from `stale_recovery` → exactly `+1` decision, `APPLIED` B/2, §7 bound intact (1 approval).
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **32/32 pass** (29 R3 + J/K/L) |
+| PR #23 / PR #24 / Phase C / Phase B | pass (230 tests) |
+| **Full suite** | **2558 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R3 `17d0c86` 2555/2/15 → +3 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+DSH_EXHAUSTED availability · authority→POLICY_DENIAL · ROUTE_INFEASIBLE · caller-presented scope · `expireSweep(now)` · exact SUPERSEDED relink · orphan discovery at tick start · deterministic effect plan + stale_recovery · lease takeover + epoch token · extension no-stack · revalidation dedupe · UNKNOWN zero-replay · PR #23/#24/Phase C.
+
+## Changed files (R4)
+
+- `src/pair/approval-queue.ts` — `markExercisedApplied` ownerId/claimEpoch now mandatory (unfenced path removed)
+- `src/pair/mission-runtime.ts` — per-stage `stillOwned` fences in every arm; `resumeExercisedChain` 4-point fencing + post-mint adoption via `recovery_id` snapshot
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +3 tests (J/K/L) + takeover-injection trap
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R4_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**

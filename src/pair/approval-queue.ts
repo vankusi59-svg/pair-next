@@ -438,8 +438,8 @@ export class ApprovalQueue {
    *  never a defect. */
   markExercisedApplied(
     approvalId: string,
-    ownerId?: string,
-    claimEpoch?: number,
+    ownerId: string,
+    claimEpoch: number,
   ): { row: Record<string, unknown>; applied: boolean; fenced: boolean } {
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -448,9 +448,8 @@ export class ApprovalQueue {
         return { row, applied: true, fenced: false };
       }
       if (
-        ownerId !== undefined &&
-        (String(row.owner_id ?? "") !== ownerId ||
-          Number(row.claim_epoch ?? 0) !== Number(claimEpoch))
+        String(row.owner_id ?? "") !== ownerId ||
+        Number(row.claim_epoch ?? 0) !== Number(claimEpoch)
       ) {
         // Stale token — a different epoch owns the canonical row.
         return { row, applied: false, fenced: true };

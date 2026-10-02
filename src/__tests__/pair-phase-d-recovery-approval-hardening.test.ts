@@ -1503,4 +1503,197 @@ describe("PHD R2 — APRE ownership + crash convergence", () => {
         .length,
     ).toBe(1);
   });
+
+  /** R4 — patch verifyExerciseClaim so B takes over exactly when call
+   *  `injectAt` runs: A's stage (injectAt-1) lands durably, then the
+   *  fence for stage injectAt sees the takeover and stops A mid-apply. */
+  function trapVerify(
+    ctx: ReturnType<typeof makeCtx>,
+    approvalsB: ApprovalQueue,
+    approvalId: string,
+    injectAt: number,
+    at = "2999-01-01T00:01:01Z",
+  ) {
+    let calls = 0;
+    const orig = ctx.approvals.verifyExerciseClaim.bind(ctx.approvals);
+    ctx.approvals.verifyExerciseClaim = (id, claim) => {
+      calls++;
+      if (calls === injectAt) {
+        approvalsB.claimExercise(id, "MRI_B", at); // takeover between stages
+      }
+      return orig(id, claim);
+    };
+  }
+
+  it("J. R4 mid-apply takeover between UNKNOWN arm stages — fenced at stage boundary, B finishes", () => {
+    const ctx = makeCtx("r4j", SINGLE_TASK);
+    const exA = new ScriptedAdapter(
+      "EX_A",
+      [{ status: "UNKNOWN" }],
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+      `${ctx.dir}/run-root`,
+    );
+    registerAdapter(ctx, exA, exA.caps);
+    const mid = startMission(ctx);
+    tickUntil(ctx, mid, ["WAITING_APPROVAL", "ABORTED", "FAILED"]);
+    const approval = pendingApproval(ctx, mid);
+    const approvalId = String(approval.approval_id);
+    ctx.approvals.decide(
+      approvalId,
+      "op",
+      "APPROVED",
+      approval.scope_snapshot as Record<string, unknown>,
+    );
+    const T0 = "2999-01-01T00:00:00Z";
+    const T1 = "2999-01-01T00:01:01Z";
+
+    // A claims epoch 1 and applies: stages land (barrier/task/exec/rt)
+    // until the fence before clearPendingRecovery sees B's takeover.
+    const { approvals2, store2, runtime2, exA2 } = makeRuntime2(ctx, []);
+    trapVerify(ctx, approvals2, approvalId, 5, T1);
+    (ctx.runtime as unknown as { instanceId: string }).instanceId = "MRI_A";
+    ctx.runtime.tick(mid, T0);
+
+    const apre = ctx.store
+      .list(APPROVAL_EXERCISE_ENTITY)
+      .filter((x) => x.approval_id === approvalId);
+    expect(apre.length).toBe(1);
+    const exerciseId = String(apre[0].approval_exercise_id);
+    // Takeover landed mid-apply: canonical owner is B at epoch 2.
+    expect(String(apre[0].owner_id)).toBe("MRI_B");
+    expect(Number(apre[0].claim_epoch)).toBe(2);
+    expect(String(apre[0].state)).toBe("APPLYING"); // A could NOT finalize
+    // A's durable stages persisted — exactly once each.
+    const rtAfterA = rt(ctx, mid);
+    const barriers =
+      (rtAfterA.barriers as Record<string, Record<string, unknown>>) ?? {};
+    const taskId = String(apre[0].task_id);
+    expect(barriers[taskId].settled).toBe(true);
+    expect(String(barriers[taskId].approval_exercise_id)).toBe(exerciseId);
+    expect(String(ctx.store.get("task", taskId).status)).toBe("FAILED");
+    // A was fenced BEFORE clearPendingRecovery — chain still present.
+    expect(rtAfterA.pending_recovery ?? null).not.toBeNull();
+    const dispatchedAfterA = exA.dispatched.length; // the initial UNKNOWN
+
+    // B resumes: idempotent skips, neutralizes the stale chain, closes.
+    (runtime2 as unknown as { instanceId: string }).instanceId = "MRI_B";
+    runtime2.tick(mid, "2999-01-01T00:01:30Z");
+    const rtB = store2.get("mission_runtime", `MRT_${mid}`);
+    const row = store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(row.state)).toBe("APPLIED");
+    expect(String(row.owner_id)).toBe("MRI_B");
+    expect(Number(row.claim_epoch)).toBe(2);
+    // Exactly one terminal outcome, zero replay, pending neutralized.
+    const execs = store2
+      .list("executor_execution")
+      .filter((e) => e.mission_id === mid);
+    expect(
+      execs.filter(
+        (e) =>
+          String(e.terminal_outcome ?? "") ===
+          "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY",
+      ).length,
+    ).toBe(1);
+    expect(exA.dispatched.length).toBe(dispatchedAfterA); // zero replay
+    expect(exA2.dispatched.length).toBe(0);
+    expect(rtB.pending_recovery ?? null).toBeNull();
+  });
+
+  it("K. R4 takeover after startRecovery mint, before stamp — B adopts the minted chain, no second decision", () => {
+    const ctx = makeCtx("r4k");
+    const { mid } = driveToCeilingApproval(ctx);
+    const approvalId = approvePending(ctx, mid);
+    const T0 = "2999-01-01T00:00:00Z";
+    const T1 = "2999-01-01T00:01:01Z";
+
+    const { approvals2, store2, runtime2 } = makeRuntime2(ctx, []);
+    // Verify-call sequence in the EXTENSION arm: 1 head → 2 transition →
+    // 3 chain entry → 4 before-clear → 5 before-mint → 6 before-stamp.
+    // Inject at 6: A minted the fresh chain but never stamped it.
+    trapVerify(ctx, approvals2, approvalId, 6, T1);
+    (ctx.runtime as unknown as { instanceId: string }).instanceId = "MRI_A";
+    const decisionsBefore = ctx.store
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+    ctx.runtime.tick(mid, T0);
+
+    const minted = (rt(ctx, mid).pending_recovery ?? {}) as Record<
+      string,
+      unknown
+    >;
+    const mintedChainId = String(minted.recovery_id);
+    expect(mintedChainId).toBeTruthy();
+    expect(minted.approval_exercise_id ?? null).toBeNull(); // never stamped
+    expect(
+      ctx.store.list("recovery_decision").filter((d) => d.mission_id === mid)
+        .length,
+    ).toBe(decisionsBefore + 1); // A's mint is durable
+
+    // B converges: adopts the already-minted chain — zero new decisions.
+    (runtime2 as unknown as { instanceId: string }).instanceId = "MRI_B";
+    runtime2.tick(mid, "2999-01-01T00:01:30Z");
+    const adopted = (store2.get("mission_runtime", `MRT_${mid}`)
+      .pending_recovery ?? {}) as Record<string, unknown>;
+    expect(String(adopted.recovery_id)).toBe(mintedChainId); // SAME chain
+    const exerciseId = String(
+      store2
+        .list(APPROVAL_EXERCISE_ENTITY)
+        .find((x) => x.approval_id === approvalId)!.approval_exercise_id,
+    );
+    expect(String(adopted.approval_exercise_id)).toBe(exerciseId); // stamped by B
+    expect(
+      store2.list("recovery_decision").filter((d) => d.mission_id === mid)
+        .length,
+    ).toBe(decisionsBefore + 1); // no duplicate mint
+    const row = store2.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    expect(String(row.state)).toBe("APPLIED");
+    expect(String(row.owner_id)).toBe("MRI_B");
+    expect(Number(row.claim_epoch)).toBe(2);
+  });
+
+  it("L. R4 takeover before startRecovery mint — B rebuilds the chain from stale_recovery, exactly one decision", () => {
+    const ctx = makeCtx("r4l");
+    const exA = new ScriptedAdapter(
+      "EX_A",
+      [{ status: "FAILED", error_class: "AUTHENTICATION_REQUIRED" }],
+      ["ONLY_EX_A", "FILE_OPERATIONS"],
+    );
+    registerAdapter(ctx, exA, exA.caps);
+    const mid = startMission(ctx);
+    tickUntil(ctx, mid, ["WAITING_APPROVAL"]);
+    const approvalId = approvePending(ctx, mid);
+    const T0 = "2999-01-01T00:00:00Z";
+    const T1 = "2999-01-01T00:01:01Z";
+
+    const { approvals2, store2, runtime2 } = makeRuntime2(ctx, []);
+    // REVALIDATION arm calls: 1 head → 2 transition → 3 chain entry →
+    // 4 before-clear → 5 before-mint. Inject at 5: old chain cleared,
+    // fresh chain never minted by A.
+    trapVerify(ctx, approvals2, approvalId, 5, T1);
+    (ctx.runtime as unknown as { instanceId: string }).instanceId = "MRI_A";
+    const decisionsBefore = ctx.store
+      .list("recovery_decision")
+      .filter((d) => d.mission_id === mid).length;
+    ctx.runtime.tick(mid, T0);
+    expect(
+      ctx.store.list("recovery_decision").filter((d) => d.mission_id === mid)
+        .length,
+    ).toBe(decisionsBefore); // A minted nothing — fenced pre-mint
+    expect(rt(ctx, mid).pending_recovery ?? null).toBeNull(); // stale cleared
+
+    // B rebuilds from the persisted stale_recovery snapshot — one chain.
+    (runtime2 as unknown as { instanceId: string }).instanceId = "MRI_B";
+    runtime2.tick(mid, "2999-01-01T00:01:30Z");
+    expect(
+      store2.list("recovery_decision").filter((d) => d.mission_id === mid)
+        .length,
+    ).toBe(decisionsBefore + 1); // exactly B's mint
+    const apre = store2
+      .list(APPROVAL_EXERCISE_ENTITY)
+      .filter((x) => x.approval_id === approvalId);
+    expect(apre.length).toBe(1);
+    expect(String(apre[0].state)).toBe("APPLIED");
+    expect(String(apre[0].owner_id)).toBe("MRI_B");
+    expect(Number(apre[0].claim_epoch)).toBe(2);
+  });
 });
