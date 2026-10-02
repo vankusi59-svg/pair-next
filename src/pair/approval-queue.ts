@@ -317,7 +317,12 @@ export class ApprovalQueue {
     ownerId: string,
     now?: string,
     leaseMs = 60_000,
-  ): { row: Record<string, unknown>; owned: boolean; applied: boolean } {
+  ): {
+    row: Record<string, unknown>;
+    owned: boolean;
+    applied: boolean;
+    claim: { owner_id: string; claim_epoch: number } | null;
+  } {
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const row = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
@@ -328,7 +333,7 @@ export class ApprovalQueue {
         );
       }
       if (String(row.state ?? "APPLIED") === "APPLIED") {
-        return { row, owned: false, applied: true };
+        return { row, owned: false, applied: true, claim: null };
       }
       const at = now ?? utcnow();
       const lease = String(row.lease_expires_at ?? "");
@@ -336,6 +341,9 @@ export class ApprovalQueue {
       const owner = String(row.owner_id ?? "");
       if (owner === ownerId && active) {
         // Same owner renewing its lease — CAS only to extend the window.
+        // Only reachable while this claimant still owns the CURRENT
+        // epoch: once another owner advanced claim_epoch, owner_id
+        // differs and this path is permanently closed (R3 fencing).
         const renewed = {
           ...row,
           claimed_at: at,
@@ -348,14 +356,22 @@ export class ApprovalQueue {
             renewed,
             Number(row.version),
           );
-          return { row: saved, owned: true, applied: false };
+          return {
+            row: saved,
+            owned: true,
+            applied: false,
+            claim: {
+              owner_id: ownerId,
+              claim_epoch: Number(row.claim_epoch ?? 0),
+            },
+          };
         } catch (error) {
           if (error instanceof IntegrityError) continue;
           throw error;
         }
       }
       if (active && owner !== "") {
-        return { row, owned: false, applied: false }; // live other owner
+        return { row, owned: false, applied: false, claim: null }; // live other owner
       }
       // Unowned or stale owner — CAS takeover.
       const next = {
@@ -372,7 +388,15 @@ export class ApprovalQueue {
           next,
           Number(row.version),
         );
-        return { row: saved, owned: true, applied: false };
+        return {
+          row: saved,
+          owned: true,
+          applied: false,
+          claim: {
+            owner_id: ownerId,
+            claim_epoch: Number(saved.claim_epoch ?? 0),
+          },
+        };
       } catch (error) {
         if (error instanceof IntegrityError) continue; // raced — re-read
         throw error;
@@ -380,34 +404,77 @@ export class ApprovalQueue {
     }
     // Contention resolved elsewhere — converge on the canonical row.
     const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
-    return { row, owned: false, applied: false };
+    return { row, owned: false, applied: false, claim: null };
   }
 
-  /** Lifecycle close: the caller's effect writes are durable. Idempotent
-   * — a re-entering caller after a crash completes the same transition.
-   * CAS-loss safe: a takeover/renew between claim and close can bump the
-   * version; re-read and either converge (someone else already landed
-   * APPLIED) or retry the close — never surface the race as a defect. */
-  markExercisedApplied(approvalId: string): Record<string, unknown> {
+  /** R3 fencing check — prove the caller's claim token still owns the
+   *  canonical APRE right now: owner_id match AND claim_epoch match AND
+   *  state APPLYING. Returns the canonical row when current, `null`
+   *  when the holder is stale (taken over, superseded, or finalized).
+   *  Effect stages call this before every critical mutation; a null
+   *  result is bounded convergence, never a defect. */
+  verifyExerciseClaim(
+    approvalId: string,
+    claim: { owner_id: string; claim_epoch: number } | null | undefined,
+  ): Record<string, unknown> | null {
+    if (!claim) return null;
+    const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
+    const row = this.store.tryGet(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    if (!row) return null;
+    if (String(row.state) !== "APPLYING") return null;
+    if (String(row.owner_id ?? "") !== claim.owner_id) return null;
+    if (Number(row.claim_epoch ?? 0) !== claim.claim_epoch) return null;
+    return row;
+  }
+
+  /** Lifecycle close: the caller's effect writes are durable. Fenced by
+   *  the claim token (R3): `APPLIED` is written only while the canonical
+   *  row still belongs to this exact (owner_id, claim_epoch) — a token
+   *  taken over by another owner can NEVER land the close, so APPLIED
+   *  proves the fenced owner finished. Idempotent for a re-entering
+   *  legitimate owner; CAS-loss safe. Returns {row, applied, fenced}:
+   *  `applied` when APPLIED is durable (by this call or already),
+   *  `fenced` when the caller's token is stale — bounded convergence,
+   *  never a defect. */
+  markExercisedApplied(
+    approvalId: string,
+    ownerId?: string,
+    claimEpoch?: number,
+  ): { row: Record<string, unknown>; applied: boolean; fenced: boolean } {
     const exerciseId = `APRE_${String(approvalId).replace(/^APR_/, "")}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const row = this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
-      if (String(row.state) === "APPLIED") return row;
+      if (String(row.state) === "APPLIED") {
+        return { row, applied: true, fenced: false };
+      }
+      if (
+        ownerId !== undefined &&
+        (String(row.owner_id ?? "") !== ownerId ||
+          Number(row.claim_epoch ?? 0) !== Number(claimEpoch))
+      ) {
+        // Stale token — a different epoch owns the canonical row.
+        return { row, applied: false, fenced: true };
+      }
       row.state = "APPLIED";
       row.applied_at = utcnow();
       try {
-        return this.store.put(
+        const saved = this.store.put(
           APPROVAL_EXERCISE_ENTITY,
           exerciseId,
           row,
           Number(row.version),
         );
+        return { row: saved, applied: true, fenced: false };
       } catch (error) {
         if (error instanceof IntegrityError) continue;
         throw error;
       }
     }
-    return this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId);
+    return {
+      row: this.store.get(APPROVAL_EXERCISE_ENTITY, exerciseId),
+      applied: false,
+      fenced: false,
+    };
   }
 
   /** Exercised approval evidence for a mission/task — the §7 bound that

@@ -294,3 +294,70 @@ exercised_at, applied_at
 `PAIR_NEXT_PHASE_D_R2_PENDING_INDEPENDENT_AUDIT`
 
 **STOP. DO NOT MERGE. DO NOT START PHASE E.**
+
+---
+
+# Phase D R3 — APRE Stale Owner Fencing Closure
+
+Base: `3e11041` (R2 audited HEAD). Scope: `claim_epoch` is now a real fencing token — a stale owner that resumes after takeover has zero authority over the APRE effect.
+
+## Fencing-token design
+
+`claimExercise()` returns `claim: {owner_id, claim_epoch} | null` alongside `{row, owned, applied}`. `convergeExercise` retains that exact token for the whole apply: `token = claim.claim`. Every critical effect stage re-proves the token against the canonical row before mutating via `verifyExerciseClaim(approvalId, token)` — owner_id AND claim_epoch AND state APPLYING must all still match; any mismatch = stale → stop, bounded convergence, never a defect.
+
+## Authority rule + validation points
+
+An effect mutation may run only while `verifyExerciseClaim` returns the canonical row for the retained token. Fenced surfaces (all inside `convergeExercise` / `resumeExercisedChain`):
+
+| Surface | Validation point |
+|---------|------------------|
+| mission_runtime writes (all arms) | `if (!stillOwned()) return` at each case head |
+| budget extension grant | EXTENSION arm head fence |
+| pending_recovery / chain clear+mint+stamp | `resumeExercisedChain` fence at entry AND after `clearPendingRecovery`, before `startRecovery` |
+| barrier settlement | ACK arm head fence |
+| task terminalization | ACK arm head fence |
+| execution terminal_outcome | ACK arm head fence |
+| APRE finalization | `markExercisedApplied(approvalId, owner_id, claim_epoch)` |
+
+`markExercisedApplied` transitions to APPLIED only while the canonical row still matches the exact (owner_id, claim_epoch) in APPLYING — returns `{row, applied, fenced}`; a stale token gets `{fenced:true, applied:false}` and can NEVER land APPLIED, so `APPLIED` proves the fenced owner finished.
+
+## Lease-renew + stale-owner semantics
+
+- Renew is reachable only when the claimant still owns the CURRENT epoch (`owner === ownerId && lease active`); once another owner advanced `claim_epoch`, `owner_id` differs and the renew path is permanently closed — epoch N is fenced forever after epoch N+1.
+- Stale owner behavior: `verifyExerciseClaim` → null, `markExercisedApplied` → fenced, `claimExercise` → `owned:false` while the new owner's lease is live, re-claiming after the new lease ALSO expires is a legitimate fresh claim at a NEW epoch — the old token is never honored.
+- `claim_epoch` increments per successful takeover (1 → 2 → …) — durable handoff evidence.
+
+## Adversarial evidence (tests H + I)
+
+**H — full stale-owner fence** (EXTENSION): A claims epoch 1 → lease expires → B takes epoch 2 on a separate `PairEvidenceStore` connection → A resumes with its in-memory token: `verifyExerciseClaim` → null, `markExercisedApplied` → `{fenced:true}`, `claimExercise` → `owned:false`; A's runtime ticks → claim denied → zero effect writes (grant untouched, stale chain unstomped, decisions frozen). B applies + finalizes: 1 APRE, `state=APPLIED`, `owner=MRI_B`, `claim_epoch=2`, exactly `decisionsBefore+1` recovery decisions, exactly 1 grant entry.
+
+**I — takeover after partial effect** (REVALIDATION): A claims epoch 1, writes a partial effect (`pending_approval_id` cleared), stalls pre-chain-mint → lease expires → B takeover epoch 2 → A resumes fenced on both gates → B converges: adopts the same arm, mints the ONE canonical re-decision chain (via `stale_recovery` snapshot), marks APPLIED. Result: 1 APRE APPLIED by B/epoch2, exactly +1 `recovery_decision` (B's), 1 approval (§7 bound intact) — no duplicate chain, no stomp.
+
+## Regression
+
+| Suite | Result |
+|-------|--------|
+| Phase D focused | **29/29 pass** (27 R2 + H/I) |
+| PR #23 (`pair-live-ops-recovery-closure`) | pass |
+| PR #24 (`pair-route-capability-authority`) | pass |
+| Phase C (`pair-phase-c-dsh-model-routing`) | pass |
+| Phase B (`pair-phase-b`) | pass |
+| **Full suite** | **2555 pass / 2 fail / 15 skipped** — identical 2 env P5 probe failures; R2 `3e11041` 2553/2/15 → +2 tests, zero regression |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Preserved
+
+`FAIL_CLOSED_DSH_MODEL_EXHAUSTED` availability semantics · DSH authority → POLICY_DENIAL · ROUTE_INFEASIBLE · caller-presented scope · `expireSweep(now)` · exact SUPERSEDED relink · APRE orphan discovery at tick start · deterministic effect plan + `stale_recovery` · task-scoped extension (no stacking) · UNKNOWN no-replay (zero replay) · PR #23/#24/Phase C.
+
+## Changed files (R3)
+
+- `src/pair/approval-queue.ts` — `claimExercise` returns `claim` token; new `verifyExerciseClaim` fencing check; `markExercisedApplied(approvalId, ownerId, claimEpoch)` → `{row, applied, fenced}`
+- `src/pair/mission-runtime.ts` — fencing token retained in `convergeExercise`; `stillOwned` gate at every arm head; `resumeExercisedChain` fenced at entry + before chain mint; finalization requires token match
+- `src/__tests__/pair-phase-d-recovery-approval-hardening.test.ts` — +2 tests (H, I)
+
+## Classification
+
+`PAIR_NEXT_PHASE_D_R3_PENDING_INDEPENDENT_AUDIT`
+
+**STOP. DO NOT MERGE. DO NOT START PHASE E.**

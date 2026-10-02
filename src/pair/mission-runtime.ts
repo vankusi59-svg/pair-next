@@ -1723,10 +1723,18 @@ export class MissionRuntime {
     const rtState = String(rt.state);
     const waiting = rtState === "WAITING_APPROVAL";
     const terminal = TERMINAL_RUNTIME.has(rtState as MissionRuntimeState);
+    // R3 — fencing token: claim_epoch is the authority. Every critical
+    // effect stage re-proves the claim against the canonical row right
+    // before mutating; once another owner advanced the epoch this token
+    // is dead forever. A stale holder converges — never a defect.
+    const token = claim.claim!;
+    const stillOwned = () =>
+      this.deps.approvals.verifyExerciseClaim(approvalId, token) !== null;
 
     switch (intent) {
       case "RECOVERY_TASK_ATTEMPT_EXTENSION":
       case LEGACY_RECOVERY_BUDGET_OVERRIDE: {
+        if (!stillOwned()) return;
         // Task-scoped attempt grant — assignment keyed by the task the
         // approval bound, with the exercise id as provenance. Replays
         // write the same value, so the grant can never stack twice.
@@ -1759,11 +1767,19 @@ export class MissionRuntime {
         // pending_recovery; stale scheduled actions are swept first. A
         // terminal mission cannot run a chain — converge only.
         if (!terminal) {
-          this.resumeExercisedChain(missionId, taskId, exerciseId, now, effect);
+          this.resumeExercisedChain(
+            missionId,
+            taskId,
+            exerciseId,
+            now,
+            effect,
+            stillOwned,
+          );
         }
         break;
       }
       case "RECOVERY_OPERATOR_REVALIDATION": {
+        if (!stillOwned()) return;
         // Approval = "operator reviewed this escalation" — the effect is
         // a fresh bounded re-decision; the failure itself is unchanged.
         // If nothing actually changed, the same signature re-escalates
@@ -1782,11 +1798,19 @@ export class MissionRuntime {
           );
         }
         if (!terminal) {
-          this.resumeExercisedChain(missionId, taskId, exerciseId, now, effect);
+          this.resumeExercisedChain(
+            missionId,
+            taskId,
+            exerciseId,
+            now,
+            effect,
+            stillOwned,
+          );
         }
         break;
       }
       case "ACKNOWLEDGE_UNKNOWN_SIDE_EFFECT_NO_REPLAY": {
+        if (!stillOwned()) return;
         // §5 — explicit no-replay acknowledgment: settle the barrier with
         // an operator outcome, fail the affected task terminally,
         // neutralize the stale pending recovery, converge. The task is
@@ -1855,6 +1879,7 @@ export class MissionRuntime {
         break;
       }
       default: {
+        if (!stillOwned()) return;
         this.store.put(
           "mission_runtime",
           String(rt.mission_runtime_id),
@@ -1869,8 +1894,13 @@ export class MissionRuntime {
     // Lifecycle close — the whole effect is durable. A crash anywhere
     // above leaves APPLYING owned by this instance; the next claim
     // (self or a post-lease takeover) re-enters and re-applies the same
-    // idempotent writes until this line runs.
-    this.deps.approvals.markExercisedApplied(approvalId);
+    // idempotent writes until this line runs. Fenced by the claim token:
+    // a stale owner cannot land APPLIED for a row it no longer owns.
+    this.deps.approvals.markExercisedApplied(
+      approvalId,
+      token.owner_id,
+      token.claim_epoch,
+    );
   }
 
   /** Deterministic effect plan for an approval exercise — persisted on
@@ -1945,7 +1975,9 @@ export class MissionRuntime {
     exerciseId: string,
     now?: string,
     plan?: Record<string, unknown>,
+    stillOwned?: () => boolean,
   ): void {
+    if (stillOwned && !stillOwned()) return; // fenced mid-apply (R3)
     const rt = this.runtimeEntity(missionId);
     const pending = rt.pending_recovery as Record<string, unknown> | null;
     if (
@@ -1959,6 +1991,7 @@ export class MissionRuntime {
       ((plan?.stale_recovery as Record<string, unknown> | null) ?? null);
     this.clearPendingRecovery(missionId, "COMPLETED", "approval_exercised");
     if (!stale) return;
+    if (stillOwned && !stillOwned()) return; // fenced before chain mint
     this.startRecovery(
       missionId,
       taskId || String(stale.task_id),
