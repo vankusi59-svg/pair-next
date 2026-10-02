@@ -30,7 +30,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
@@ -52,6 +52,7 @@ import {
   assertPlanDataflow,
   canonicalDeliveryTaskInstruction,
   classifyTextLanguage,
+  boundedFileSha256,
   deliveryManifest,
   detectOutputLanguage,
   detectTelegramDeliveryIntent,
@@ -2133,5 +2134,240 @@ describe("R4 — snapshot-first retry authority + bounded size + tmp cleanup", (
     expect(
       fs.existsSync(path.join(ctx.workspace, "outbox", ".delivery-snapshots")),
     ).toBe(false);
+  });
+});
+
+describe("R5 — true stat-first bounded file authority (no unbounded read)", () => {
+  const MAX = MAX_TELEGRAM_FILE_BYTES;
+  const fakeSha = "a".repeat(64);
+
+  /** sparse MAX+1 file — allocated on disk lazily, NEVER in memory. */
+  const sparseOversize = (fp: string) => {
+    fs.writeFileSync(fp, "");
+    fs.truncateSync(fp, MAX + 1);
+  };
+  /** every readFileSync call on `fp`, with the byte-length it returned */
+  const readsOf = (
+    spy: ReturnType<typeof vi.spyOn>,
+    fp: string,
+  ): number[] =>
+    (spy.mock.calls as Array<[unknown, ...unknown[]]>)
+      .map((c, i) => ({ arg: c[0], i }))
+      .filter(({ arg }) => String(arg) === fp)
+      .map(({ i }) =>
+        Buffer.isBuffer(spy.mock.results[i].value)
+          ? (spy.mock.results[i].value as Buffer).length
+          : String(spy.mock.results[i].value).length,
+      );
+
+  const mintZ = (
+    ctx: ReturnType<typeof makeCtx>,
+    file: string,
+    sha: string,
+  ) =>
+    mintTelegramDeliveryRequest({
+      store: ctx.store,
+      mission: { mission_id: "M_R5", metadata: {} },
+      task: {
+        task_id: "T_R5",
+        metadata: {
+          pair_telegram_delivery: {
+            requested: true, mode: "FILES", artifacts: [file],
+          },
+        },
+      },
+      execution: { execution_id: "E_R5" },
+      outboxDir: path.join(ctx.workspace, "outbox"),
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { [file]: sha },
+    }) as Record<string, unknown>;
+
+  it("Z1. projection source MAX+1 → FAILED TOO_LARGE with ZERO full-file read", async () => {
+    const ctx = makeCtx("r5-z1");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const fp = path.join(outbox, "big.txt");
+    sparseOversize(fp);
+    mintZ(ctx, "big.txt", fakeSha);
+    const spy = vi.spyOn(fs, "readFileSync");
+    try {
+      const projected = pendingTelegramDeliveries(ctx.store);
+      expect(projected).toHaveLength(0);
+      const rec = recordingTransport();
+      const { sent } = await runTransport(ctx, { transport: rec.transport });
+      expect(sent).toEqual([]);
+      expect(rec.calls).toHaveLength(0);
+    } finally {
+      // The oversized file was NEVER fully materialized.
+      expect(readsOf(spy, fp)).toEqual([]);
+      spy.mockRestore();
+    }
+    const after = ctx.store.get(
+      "telegram_delivery_request",
+      String(deliveries(ctx)[0].delivery_id),
+    );
+    const art = (after.artifacts as Array<Record<string, unknown>>)[0];
+    expect(art.state).toBe("FAILED_DELIVERY");
+    expect(art.last_error).toBe("FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE");
+  });
+
+  it("Z2. oversized retained snapshot → rejected by stat before ANY read; reconstruction still allowed from valid source", async () => {
+    const ctx = makeCtx("r5-z2");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const fp = path.join(outbox, "report.txt");
+    fs.writeFileSync(fp, VI_REPORT);
+    const req = mintZ(ctx, "report.txt", sha256File(fp));
+    // First pass stages a small valid snapshot.
+    expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(1);
+    const snap = path.join(
+      outbox,
+      ".delivery-snapshots",
+      `${String(req.delivery_id)}-report.txt`.replace(/[^A-Za-z0-9._-]/g, "_"),
+    );
+    expect(fs.existsSync(snap)).toBe(true);
+    // Crash-shaped: the retained snapshot is now an oversized sparse file.
+    sparseOversize(snap);
+    const spy = vi.spyOn(fs, "readFileSync");
+    try {
+      const rec = recordingTransport();
+      const { sent } = await runTransport(ctx, { transport: rec.transport });
+      expect(sent).toEqual(["report.txt"]); // rebuilt from valid source
+      expect(Buffer.from(rec.calls[0].fileBytes!).toString("utf8")).toBe(VI_REPORT);
+      // No readFileSync ever materialized the oversized snapshot: the
+      // only snapPath read allowed is the post-rename verify of the
+      // freshly re-staged small file.
+      for (const len of readsOf(spy, snap)) expect(len).toBeLessThanOrEqual(MAX);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("Z3. dispatch pin on oversized artifact → TOO_LARGE state, ZERO full-file read", () => {
+    const ctx = makeCtx("r5-z3");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const fp = path.join(outbox, "big.txt");
+    sparseOversize(fp);
+    ctx.store.put("task", "T_Z3", {
+      task_id: "T_Z3",
+      required_capabilities: ["TELEGRAM_DELIVERY"],
+      metadata: {
+        workspace: ctx.workspace,
+        pair_telegram_delivery: {
+          requested: true, mode: "FILES", artifacts: ["big.txt"],
+        },
+      },
+    });
+    const spy = vi.spyOn(fs, "readFileSync");
+    try {
+      (
+        ctx.runtime as unknown as {
+          pinDeliveryArtifactDigests(
+            m: Record<string, unknown>,
+            t: Record<string, unknown>,
+          ): void;
+        }
+      ).pinDeliveryArtifactDigests(
+        { project_id: ctx.projectId, metadata: {} },
+        ctx.store.get("task", "T_Z3"),
+      );
+      expect(readsOf(spy, fp)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+    const pin = (
+      ctx.store.get("task", "T_Z3").metadata as Record<string, unknown>
+    ).pair_delivery_artifact_digests as Record<
+      string,
+      { path: string; sha256: string | null; state: string }
+    >;
+    expect(pin["big.txt"].state).toBe("TOO_LARGE");
+    expect(pin["big.txt"].sha256).toBeNull();
+  });
+
+  it("Z4. settle-time artifact grown to oversized → TOO_LARGE violation, ZERO full-file read, zero mint", () => {
+    const ctx = makeCtx("r5-z4");
+    const outbox = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(outbox, { recursive: true });
+    const fp = path.join(outbox, "report.txt");
+    fs.writeFileSync(fp, VI_REPORT);
+    const realSha = sha256File(fp);
+    const task = {
+      task_id: "T_Z4",
+      required_capabilities: ["TELEGRAM_DELIVERY"],
+      metadata: {
+        workspace: ctx.workspace,
+        pair_telegram_delivery: {
+          requested: true, mode: "FILES", artifacts: ["report.txt"],
+        },
+        pair_delivery_artifact_digests: {
+          "report.txt": { path: fp, sha256: realSha, state: "PINNED" },
+        },
+      },
+    };
+    // The artifact grew beyond the bound after dispatch.
+    sparseOversize(fp);
+    const spy = vi.spyOn(fs, "readFileSync");
+    try {
+      const r = (
+        ctx.runtime as unknown as {
+          assertDeliveryDeliverable(
+            m: Record<string, unknown>,
+            t: Record<string, unknown>,
+          ): { ok: boolean; violation?: Record<string, unknown> };
+        }
+      ).assertDeliveryDeliverable(
+        {
+          project_id: ctx.projectId,
+          metadata: {},
+          goal: "viết báo cáo bằng tiếng việt",
+        },
+        task,
+      );
+      expect(r.ok).toBe(false);
+      expect(String(r.violation?.code)).toBe(
+        "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE",
+      );
+      expect(readsOf(spy, fp)).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(deliveries(ctx)).toHaveLength(0); // zero TDR minted
+  });
+
+  it("Z5. pin recorded TOO_LARGE → settle reports precise reason, not generic missing-pin", () => {
+    const ctx = makeCtx("r5-z5");
+    const fp = path.join(ctx.workspace, "outbox", "big.txt");
+    const task = {
+      task_id: "T_Z5",
+      required_capabilities: ["TELEGRAM_DELIVERY"],
+      metadata: {
+        workspace: ctx.workspace,
+        pair_telegram_delivery: {
+          requested: true, mode: "FILES", artifacts: ["big.txt"],
+        },
+        pair_delivery_artifact_digests: {
+          "big.txt": { path: fp, sha256: null, state: "TOO_LARGE" },
+        },
+      },
+    };
+    const r = (
+      ctx.runtime as unknown as {
+        assertDeliveryDeliverable(
+          m: Record<string, unknown>,
+          t: Record<string, unknown>,
+        ): { ok: boolean; violation?: Record<string, unknown> };
+      }
+    ).assertDeliveryDeliverable(
+      { project_id: ctx.projectId, metadata: {}, goal: "write a report" },
+      task,
+    );
+    expect(r.ok).toBe(false);
+    expect(String(r.violation?.code)).toBe(
+      "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE",
+    );
   });
 });

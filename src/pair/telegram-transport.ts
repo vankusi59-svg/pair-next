@@ -31,9 +31,9 @@
  *    point of transmission (no TOCTOU, no transform).
  */
 
-import fs from "node:fs";
-import { digest, sha256Hex } from "./canonical.js";
+import { digest } from "./canonical.js";
 import {
+  boundedFileSha256,
   MAX_TELEGRAM_FILE_BYTES,
   SHA256_HEX_RE,
 } from "./telegram-delivery.js";
@@ -253,33 +253,22 @@ export async function transportTelegramDelivery(args: {
     if (String(art.state) !== "QUEUED" || !art.path) continue;
     const name = String(art.name);
     const fp = String(art.path);
-    // R3/R4 — HASHED BYTES === CLAIMED BYTES === NETWORK BYTES: stat
-    // the pinned snapshot FIRST (no full read merely to discover the
-    // size), read it ONCE into a bounded buffer, prove the actual read
-    // length matches the stat (no mid-read growth), then verify the
-    // buffer against the slot's authorized sha256 — the SAME verified
-    // bytes are handed to the sender. No filesystem read exists
-    // between verification and payload construction.
+    // R3/R4/R5 — HASHED BYTES === CLAIMED BYTES === NETWORK BYTES:
+    // ONE canonical bounded read — stat first (no full read merely to
+    // discover the size), then read ONCE, prove actual length == stat
+    // size, and hash THOSE bytes — the SAME verified bytes are handed
+    // to the sender. No filesystem read exists between verification
+    // and payload construction.
     const wantSha = String(art.sha256 ?? "");
-    let bytes: Buffer | null = null;
-    try {
-      const st = fs.statSync(fp);
-      if (st.size > MAX_TELEGRAM_FILE_BYTES) {
-        bytes = null;
-      } else {
-        const b = fs.readFileSync(fp);
-        bytes = b.length === st.size ? b : null;
-      }
-    } catch {
-      bytes = null;
-    }
+    const br = boundedFileSha256(fp);
     if (
-      bytes === null ||
+      br.kind !== "ok" ||
       !SHA256_HEX_RE.test(wantSha) ||
-      sha256Hex(bytes) !== wantSha
+      br.sha256 !== wantSha
     ) {
       continue;
     }
+    const bytes = br.bytes;
     // R7 — exclusive acquire required before any network call.
     const acq = await args.backend.begin(name);
     if (!acq || acq.acquired !== true) continue;

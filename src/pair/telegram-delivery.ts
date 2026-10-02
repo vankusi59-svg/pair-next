@@ -55,7 +55,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { digest, sha256File } from "./canonical.js";
+import { digest, sha256Hex } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import { DELIVERY_TEXT_ARTIFACT } from "./output-language.js";
 import { deliveryManifest, normalizeArtifactPath } from "./plan-dataflow.js";
@@ -179,6 +179,39 @@ export const TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS = 60_000;
  *  send, so it converges to a durable terminal failure rather than
  *  polling QUEUED forever (checked by stat BEFORE any full read). */
 export const MAX_TELEGRAM_FILE_BYTES = 48 * 1024 * 1024;
+
+/** R5 — the ONE canonical stat-first bounded file authority used by
+ *  every governed FILES seam (dispatch pin, settle gate, snapshot
+ *  verify, source→snapshot reconstruction, transport materialization).
+ *  NEVER performs an unbounded full read: stat proves
+ *  `size <= maxBytes` FIRST; a successful read additionally proves
+ *  `bytes.length === stat size` (no mid-read growth) and the sha256 is
+ *  computed over THOSE exact materialized bytes. */
+export type BoundedFileResult =
+  | { kind: "ok"; size: number; bytes: Buffer; sha256: string }
+  | { kind: "too_large"; size: number }
+  | { kind: "unresolved" };
+
+export function boundedFileSha256(
+  p: string,
+  maxBytes: number = MAX_TELEGRAM_FILE_BYTES,
+): BoundedFileResult {
+  let size: number;
+  try {
+    size = fs.statSync(p).size;
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (size > maxBytes) return { kind: "too_large", size };
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(p);
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (bytes.length !== size) return { kind: "unresolved" };
+  return { kind: "ok", size, bytes, sha256: sha256Hex(bytes) };
+}
 
 export function deliveryRequestId(missionId: string, taskId: string): string {
   return `TDR_${digest(`telegram_delivery:${missionId}:${taskId}`).slice(0, 24)}`;
@@ -887,11 +920,13 @@ export function pendingTelegramDeliveries(
         String(req.delivery_id),
         String(a.name),
       );
+      // R5.1 — stat-first: an oversized retained snapshot is rejected
+      // by the bound before any full-file read; a size-valid snapshot
+      // is verified over its own materialized bytes.
       let snapshotValid = false;
-      try {
-        snapshotValid = sha256File(snapPath) === a.sha256;
-      } catch {
-        snapshotValid = false;
+      {
+        const sr = boundedFileSha256(snapPath);
+        snapshotValid = sr.kind === "ok" && sr.sha256 === a.sha256;
       }
       if (!snapshotValid) {
         // A mismatched snapshot is never trusted — replace it only from
@@ -916,36 +951,33 @@ export function pendingTelegramDeliveries(
           dirty = true;
           continue;
         }
-        // Canonical artifact identity replayed at send time: a
-        // manifested artifact mutated between mint and dispatch never
-        // reaches the bridge — durable terminal failure, zero network
-        // call burned.
-        let actual: string | null = null;
-        try {
-          actual = sha256File(p);
-        } catch {
-          actual = null;
-        }
-        if (actual !== a.sha256) {
+        // R5.2 — canonical stat-first source authority: ONE bounded
+        // read resolves the file, proves actual length == stat size,
+        // and hashes THOSE bytes — the same materialized buffer is then
+        // staged into the snapshot (never a second source read).
+        // Oversized → durable TOO_LARGE with zero full-file read.
+        const br = boundedFileSha256(p);
+        if (br.kind === "unresolved") {
           a.state = "FAILED_DELIVERY";
-          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
           a.completed_at = ts;
           dirty = true;
           continue;
         }
-        // R4.2 — stat-first bound: never read the file merely to
-        // discover it exceeds the transport size cap.
-        try {
-          if (fs.statSync(p).size > MAX_TELEGRAM_FILE_BYTES) {
-            a.state = "FAILED_DELIVERY";
-            a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE";
-            a.completed_at = ts;
-            dirty = true;
-            continue;
-          }
-        } catch {
+        if (br.kind === "too_large") {
           a.state = "FAILED_DELIVERY";
-          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+        // Canonical artifact identity replayed at send time: a
+        // manifested artifact mutated between mint and dispatch never
+        // reaches the bridge — durable terminal failure, zero network
+        // call burned.
+        if (br.sha256 !== a.sha256) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
           a.completed_at = ts;
           dirty = true;
           continue;
@@ -960,16 +992,16 @@ export function pendingTelegramDeliveries(
         try {
           fs.mkdirSync(snapDir, { recursive: true });
           const tmp = `${snapPath}.tmp`;
-          const bytes = fs.readFileSync(p);
           const fd = fs.openSync(tmp, "w");
           try {
-            fs.writeSync(fd, bytes);
+            fs.writeSync(fd, br.bytes);
             fs.fsyncSync(fd);
           } finally {
             fs.closeSync(fd);
           }
           fs.renameSync(tmp, snapPath);
-          if (sha256File(snapPath) !== a.sha256) {
+          const post = boundedFileSha256(snapPath);
+          if (post.kind !== "ok" || post.sha256 !== a.sha256) {
             throw new Error("snapshot_digest_mismatch");
           }
         } catch {
@@ -977,22 +1009,6 @@ export function pendingTelegramDeliveries(
           a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
           a.completed_at = ts;
           dirty = true;
-          continue;
-        }
-      } else {
-        // R4.2 — the retained snapshot is the transport authority; an
-        // oversized one can never be sent. Converge durably now (stat
-        // only — no full read), zero begin, zero network.
-        try {
-          if (fs.statSync(snapPath).size > MAX_TELEGRAM_FILE_BYTES) {
-            a.state = "FAILED_DELIVERY";
-            a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE";
-            a.completed_at = ts;
-            dirty = true;
-            continue;
-          }
-        } catch {
-          // Snapshot vanished between check and stat — rebuild next pass.
           continue;
         }
       }

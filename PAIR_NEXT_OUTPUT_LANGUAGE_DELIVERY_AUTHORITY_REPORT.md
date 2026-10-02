@@ -700,3 +700,71 @@ Zero-network proofs: Y5 (no call when both snapshots and source can't satisfy th
 `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R4_PENDING_REAUDIT`
 
 STOP. DO NOT MERGE. Await independent re-audit.
+
+# INDEPENDENT RE-AUDIT R5 REMEDIATION
+
+- **Previous audited HEAD:** `492b12c9b5ec3ebeded6c0a5b564a3f236c1fd97`
+- **New HEAD:** see git log (this section committed on the same PR #30)
+- **Changed files:**
+  - `src/pair/telegram-delivery.ts` — new canonical `boundedFileSha256()` helper (stat → bound check → single read → actual-length proof → hash over those bytes); snapshot reuse check, source fallback, and post-rename re-verification all routed through it; source fallback now stages the SAME buffer it hashed (one read total).
+  - `src/pair/mission-runtime.ts` — `pinDeliveryArtifactDigests()` stat-first with precise per-artifact `state` (`PINNED`/`ABSENT`/`TOO_LARGE`); `assertDeliveryDeliverable()` stat-first and maps a TOO_LARGE pin state to `FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE` (never a generic missing-pin).
+  - `src/pair/telegram-transport.ts` — materialization now delegates to the same `boundedFileSha256()` helper (behavior unchanged — it was already stat-first).
+  - `src/__tests__/pair-output-delivery-contract.test.ts` — 5 new adversarial no-read proofs (Z1–Z5) using an instrumented `fs.readFileSync` spy + sparse `truncateSync` oversize files (no huge buffers allocated).
+  - `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_AUTHORITY_REPORT.md` — this section.
+
+## RCA
+
+R4 made oversized artifacts *converge* durably, but the bound was not yet a *memory* bound: `sha256File()` internally calls `fs.readFileSync()`, so several governed seams could still fully allocate a huge file before rejecting it:
+
+- projection snapshot reuse check: `sha256File(snapPath)` ran before any stat;
+- projection source fallback: `sha256File(source)` ran before the size gate, and the source was then read a SECOND time for the snapshot write;
+- dispatch pin (`pinDeliveryArtifactDigests`): direct `sha256File` on the producer artifact;
+- settle gate (`assertDeliveryDeliverable`): direct `sha256File` again;
+- oversized pin/downstream failures collapsed into a generic "missing pin" instead of a precise deterministic reason.
+
+## Shared design — `boundedFileSha256(path, maxBytes)`
+
+ONE canonical helper now backs every governed FILES seam. Contract:
+
+- `stat` FIRST — never calls `readFileSync` before the size check;
+- `size > maxBytes` → `{kind:"too_large", size}` — zero bytes materialized;
+- stat fails / read fails / `bytes.length !== stat.size` (mid-read growth) → `{kind:"unresolved"}`;
+- success → `{kind:"ok", size, bytes, sha256}` where sha256 is computed over THOSE exact materialized bytes — the caller can stage/send the same buffer (no second read).
+
+Lives in `telegram-delivery.ts` (which owns `MAX_TELEGRAM_FILE_BYTES`); `mission-runtime.ts` and `telegram-transport.ts` import it — no new dependency edges, no cycles.
+
+## Seam-by-seam stat-first proof
+
+| Seam | Order now |
+|---|---|
+| Dispatch pin | stat → TOO_LARGE → `{sha256:null, state:"TOO_LARGE"}` persisted; valid → `{sha256, state:"PINNED"}` |
+| Settle gate | pin `state` honored (TOO_LARGE → precise violation) → resolve → stat → bound → one bounded read → digest compare against pin |
+| Snapshot reuse | stat → oversize = invalid (no hash, no read) → falls into reconstruction semantics |
+| Source→snapshot | stat → bound → ONE read (hash + stage share the same buffer) → fsync tmp → rename → bounded re-verify |
+| Transport | `boundedFileSha256` → begin → send SAME buffer (unchanged semantics) |
+
+## Adversarial no-read evidence
+
+- **Z1** source MAX+1 (sparse): `FAILED_DELIVERY`/`FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE`; the `fs.readFileSync` spy recorded ZERO calls for that path.
+- **Z2** retained snapshot replaced by a sparse MAX+1 file: rejected by stat; spy shows every `readFileSync` on the snapshot path returned ≤ MAX (the only read is the post-rename verify of the re-staged small file); delivery still succeeds with original bytes — reconstruction semantics preserved.
+- **Z3** dispatch pin on oversized artifact: pin persisted as `{sha256:null, state:"TOO_LARGE"}`; ZERO `readFileSync` calls on the artifact path.
+- **Z4** settle-time artifact grown past the bound: `FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE`, ZERO reads on the path, zero TDR minted.
+- **Z5** pin `state:"TOO_LARGE"` → settle reports the precise TOO_LARGE code, not `PIN_MISSING`.
+
+## Validation counts
+
+| Suite | Result |
+|---|---|
+| `pair-output-delivery-contract` (focused) | **69/69** (64 prior + 5 new Z1–Z5) |
+| `pair-planner-dataflow-incident` | **106/106** |
+| `pair-ops-telegram-delivery` | **3/3** |
+| `pair-p9` (telegram lifecycle/transport) | **79/79** |
+| **Full suite** | **2811 pass / 2 failed / 15 skipped** — the 2 failures remain the pre-existing `pair-p5` env-only tests 2+3 (expect `stockProbe.available===false`/EXECUTABLE_NOT_FOUND; this VM ships the binaries → `available===true`). Identical to the R4 baseline; unrelated. |
+| `tsc --noEmit` | clean |
+| `pnpm build` | clean |
+
+## Classification
+
+`PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_CONTENT_AUTHORITY_R5_PENDING_REAUDIT`
+
+STOP. DO NOT MERGE. Await independent re-audit.

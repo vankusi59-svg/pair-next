@@ -30,7 +30,7 @@
 
 import fs from "node:fs";
 import { IntegrityError, PairError, PolicyError } from "./errors.js";
-import { newId, sha256File, utcnow } from "./canonical.js";
+import { newId, utcnow } from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 import type { GovernedTaskGate } from "./gate.js";
 import type { MissionRouter } from "./mission-router.js";
@@ -52,6 +52,7 @@ import {
   missingConsumedArtifact,
 } from "./plan-dataflow.js";
 import {
+  boundedFileSha256,
   materializeDeliveryTextPayload,
   mintTelegramDeliveryRequest,
   resolveDeliveryArtifactPath,
@@ -415,18 +416,27 @@ export class MissionRuntime {
           ?.authorized_workspaces as string[])?.[0] ??
         String(project.root_location),
     );
-    const digests: Record<string, { path: string | null; sha256: string | null }> = {};
+    // R5.3 — stat-first pin: an oversized artifact is recorded with a
+    // PRECISE state (TOO_LARGE) — never a generic missing pin, never a
+    // full-file read merely to pin.
+    const digests: Record<
+      string,
+      { path: string | null; sha256: string | null; state: string }
+    > = {};
     for (const name of manifest.artifacts) {
       const p = resolveDeliveryArtifactPath({ outboxDir, workspace, name });
       let sha: string | null = null;
+      let state = "ABSENT";
       if (p) {
-        try {
-          sha = sha256File(p);
-        } catch {
-          sha = null;
+        const br = boundedFileSha256(p);
+        if (br.kind === "ok") {
+          sha = br.sha256;
+          state = "PINNED";
+        } else if (br.kind === "too_large") {
+          state = "TOO_LARGE";
         }
       }
-      digests[name] = { path: p, sha256: sha };
+      digests[name] = { path: p, sha256: sha, state };
     }
     this.deps.service.updateTask(String(task.task_id), {
       metadata: { ...md, pair_delivery_artifact_digests: digests },
@@ -555,12 +565,21 @@ export class MissionRuntime {
     // (governed recovery/replan) — it must NEVER silently re-baseline
     // against current bytes.
     const pinned = md.pair_delivery_artifact_digests as
-      | Record<string, { sha256?: string | null }>
+      | Record<string, { sha256?: string | null; state?: string }>
       | undefined;
-    const pinMissing = (name: string): Record<string, unknown> => ({
-      code: "FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING",
-      artifact: name,
-    });
+    const pinMissing = (
+      name: string,
+      state?: string,
+    ): Record<string, unknown> =>
+      state === "TOO_LARGE"
+        ? {
+            code: "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE",
+            artifact: name,
+          }
+        : {
+            code: "FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING",
+            artifact: name,
+          };
     if (pinned === undefined) {
       return {
         ok: false,
@@ -575,7 +594,10 @@ export class MissionRuntime {
         typeof before.sha256 !== "string" ||
         !SHA256_HEX_RE.test(before.sha256)
       ) {
-        return { ok: false, violation: pinMissing(name) };
+        return {
+          ok: false,
+          violation: pinMissing(name, before?.state),
+        };
       }
       const p = resolveDeliveryArtifactPath({ outboxDir, workspace, name });
       if (!p) {
@@ -587,18 +609,22 @@ export class MissionRuntime {
           },
         };
       }
-      let sha: string;
-      try {
-        sha = sha256File(p);
-      } catch {
+      // R5.4 — stat-first settle: an artifact grown beyond the bound
+      // converges to TOO_LARGE without any full-file read.
+      const br = boundedFileSha256(p);
+      if (br.kind !== "ok") {
         return {
           ok: false,
           violation: {
-            code: "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED",
+            code:
+              br.kind === "too_large"
+                ? "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE"
+                : "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED",
             artifact: name,
           },
         };
       }
+      const sha = br.sha256;
       if (before.sha256 !== sha) {
         return {
           ok: false,
