@@ -41,6 +41,7 @@ import {
   detectOutputLanguage,
   detectTelegramDeliveryIntent,
   deliveryManifest,
+  deliveryRequestId,
   digest,
   mintArtifactCapability,
   pendingTelegramDeliveries,
@@ -50,11 +51,14 @@ import {
   transportTelegramDelivery,
   utcnow,
   workerExecutionId,
+  mintTelegramDeliveryRequest,
   DELIVERY_TEXT_ARTIFACT,
   MAX_TELEGRAM_FILE_BYTES,
+  TELEGRAM_DELIVERY_MINTED,
 } from "../pair/index.js";
 import type {
   DeliveryBackend,
+  DeliveryProvenanceBinding,
   GovernedSendResult,
   GovernedTelegramTransport,
   TelegramDeliveryIntent,
@@ -283,13 +287,15 @@ class ScriptedAdapter implements ExecutorAdapter {
   }
 }
 
-function makeCtx(
+/** The production wiring of the harness — every component built against
+ *  ONE store. R2.5 reuses it verbatim for the fresh post-restart stack so
+ *  no object referencing the closed store survives. */
+function wireStack(
   name: string,
-  opts: { defaultChatId?: string | null } = {},
+  workspace: string,
+  store: PairEvidenceStore,
+  opts: { defaultChatId?: string | null; projectId?: string } = {},
 ) {
-  const dir = freshDir(name);
-  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
-  const store = new PairEvidenceStore(path.join(dir, "pair.db"));
   const service = new PairControlPlane(store);
   const gate = new GovernedTaskGate(service);
   const registry = new ExecutorRegistry(service);
@@ -324,11 +330,30 @@ function makeCtx(
   ]) {
     service.registerCapability(cap, { risk_class: "LOW" });
   }
-  const project = service.createProject({ name, root_location: workspace });
+  const projectId =
+    opts.projectId !== undefined
+      ? opts.projectId
+      : String(
+          service.createProject({ name, root_location: workspace })
+            .project_id,
+        );
   return {
-    dir, workspace, store, service, gate, registry, router, recovery, recon,
+    service, gate, registry, router, recovery, recon,
     approvals, scheduler, runtime, supervisor, control, adapters,
-    projectId: String(project.project_id),
+    projectId,
+  };
+}
+
+function makeCtx(
+  name: string,
+  opts: { defaultChatId?: string | null } = {},
+) {
+  const dir = freshDir(name);
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+  return {
+    dir, workspace, store,
+    ...wireStack(name, workspace, store, opts),
   };
 }
 
@@ -1322,24 +1347,29 @@ describe("F4 R1 — audit remediation", () => {
     const stalePath = path.join(ctx.workspace, "outbox", "report.txt");
     fs.writeFileSync(stalePath, "STALE BYTES — introduced across restart");
 
-    // Real restart: close the first instance entirely, reopen the SAME
-    // durable DB with fresh PairEvidenceStore / service / control.
+    // R2.5 — REAL restart: close the first instance entirely and rebuild
+    // the WHOLE stack against the SAME durable DB — fresh
+    // PairEvidenceStore + PairControlPlane + gate/registry/router +
+    // recovery + reconciliation + approvals + scheduler + MissionRuntime
+    // + supervisor + MissionControl via the same production constructors
+    // the harness uses. NO object referencing the closed store survives.
     const dbPath = path.join(ctx.dir, "pair.db");
     ctx.store.close();
     const store2 = new PairEvidenceStore(dbPath);
-    const service2 = new PairControlPlane(store2);
-    const control2 = new MissionControl({
-      service: service2,
-      runtime: ctx.runtime,
-      supervisor: ctx.supervisor,
-      scheduler: ctx.scheduler,
-      approvals: ctx.approvals,
-      reconciliation: ctx.recon,
-      observability: new MissionObservability(service2),
-      planner: (() => ({})) as never,
+    const b = wireStack("f4-r14-b", ctx.workspace, store2, {
+      projectId: ctx.projectId,
     });
-    // Transport over the REOPENED store: durable canonical provenance
-    // drives the send — CAS bytes, not the contaminated outbox file.
+    // Fresh runtime resume: a tick on the reopened stack converges the
+    // already-COMPLETED mission without re-dispatching anything.
+    b.runtime.tick(mid, utcnow());
+    expect(String(b.service.getMission(mid).status ?? "")).not.toBe("FAILED");
+    // The durable mint receipt survives the instance boundary.
+    const receipts = store2
+      .listEvidence(mid)
+      .filter((e) => String(e.kind) === TELEGRAM_DELIVERY_MINTED);
+    expect(receipts).toHaveLength(1);
+    // Transport over the FRESH stack: durable canonical provenance drives
+    // the send — CAS bytes, never the contaminated outbox file.
     const rec = recordingTransport();
     const sent: string[] = [];
     const pending2 = pendingTelegramDeliveries(store2) as Array<
@@ -1347,7 +1377,7 @@ describe("F4 R1 — audit remediation", () => {
     >;
     for (const req of pending2) {
       const t = (artifact: string | null | undefined, body: Record<string, unknown>) =>
-        control2.transitionTelegramDelivery(String(req.delivery_id), {
+        b.control.transitionTelegramDelivery(String(req.delivery_id), {
           artifact, ...body,
         });
       const r = await transportTelegramDelivery({
@@ -1377,6 +1407,398 @@ describe("F4 R1 — audit remediation", () => {
     // on the same reopened store sends nothing.
     const again = pendingTelegramDeliveries(store2);
     expect(again).toHaveLength(0);
+    store2.close();
+  });
+});
+
+/* =============================== F4 R2 ==================================== */
+
+/** Mint a provenance-bound FILES TDR directly through the production
+ *  seam — real canonical producers (task + governed + execution +
+ *  validator + CAS bytes) then the real mint, so the immutable
+ *  TELEGRAM_DELIVERY_MINTED receipt anchors the row. */
+function mkBoundFilesTdr(
+  ctx: ReturnType<typeof makeCtx>,
+  o: {
+    missionId: string;
+    files: Array<{ manifest: string; logical: string; bytes: string }>;
+  },
+) {
+  const mid = o.missionId;
+  const planId = `PLAN_${mid}`;
+  const key = `TP${mid}`;
+  let eid: string;
+  let gtId: string;
+  if (o.files.length === 1) {
+    const p = mkCanonicalProducer(ctx, {
+      missionId: mid, key, planId,
+      name: o.files[0]!.logical, bytes: o.files[0]!.bytes,
+    });
+    eid = p.eid;
+    gtId = p.gtId;
+  } else {
+    const p = mkDualArtifactProducer(ctx, {
+      missionId: mid, key, planId,
+      nameA: o.files[0]!.logical, nameB: o.files[1]!.logical,
+      bytesA: o.files[0]!.bytes, bytesB: o.files[1]!.bytes,
+    });
+    eid = p.eid;
+    gtId = p.gtId;
+  }
+  const blobDir = path.join(ctx.dir, "artifacts", "blobs");
+  const artifactSha256: Record<string, string> = {};
+  const artifactSources: Record<string, string> = {};
+  const artifactProvenance: Record<string, DeliveryProvenanceBinding> = {};
+  for (const f of o.files) {
+    const sha = sha256Hex(Buffer.from(f.bytes));
+    const cas = path.join(blobDir, sha);
+    artifactSha256[f.manifest] = sha;
+    artifactSources[f.manifest] = cas;
+    artifactProvenance[f.manifest] = {
+      artifact_id: canonicalArtifactId(eid, f.logical),
+      producer_execution_id: eid,
+      governed_task_id: gtId,
+      logical_name: f.logical,
+      sha256: sha,
+      source_path: cas,
+    };
+  }
+  const taskId = `TDEL_${mid}`;
+  const task = {
+    task_id: taskId, task_key: "T5", mission_id: mid, plan_id: planId,
+    depends_on: [key], required_capabilities: ["TELEGRAM_DELIVERY"],
+    metadata: {
+      workspace: ctx.workspace,
+      pair_telegram_delivery: {
+        requested: true, mode: "FILES",
+        artifacts: o.files.map((f) => f.manifest),
+      },
+    },
+  };
+  const mission = missionRow(ctx, mid);
+  const req = mintTelegramDeliveryRequest({
+    store: ctx.store,
+    mission,
+    task,
+    execution: { execution_id: `EXEC_DEL_${mid}` },
+    outboxDir: path.join(ctx.workspace, "outbox"),
+    workspace: ctx.workspace,
+    now: utcnow(),
+    defaultChatId: "111",
+    artifactSha256,
+    artifactSources,
+    artifactProvenance,
+  });
+  return { req: req!, eid, gtId, taskId };
+}
+
+/** Mint a provenance-bound TEXT TDR — the delivery execution itself is
+ *  the declared producer of the canonical payload artifact (F4.4). */
+function mkBoundTextTdr(
+  ctx: ReturnType<typeof makeCtx>,
+  o: { missionId: string; text: string },
+) {
+  const mid = o.missionId;
+  const planId = `PLAN_${mid}`;
+  const p = mkCanonicalProducer(ctx, {
+    missionId: mid, key: `TP${mid}`, planId,
+    name: DELIVERY_TEXT_ARTIFACT, bytes: o.text,
+  });
+  const taskId = `TDEL_${mid}`;
+  const task = {
+    task_id: taskId, task_key: "T5", mission_id: mid, plan_id: planId,
+    depends_on: [`TP${mid}`], required_capabilities: ["TELEGRAM_DELIVERY"],
+    metadata: {
+      workspace: ctx.workspace,
+      pair_telegram_delivery: { requested: true, mode: "TEXT" },
+    },
+  };
+  const textProvenance: DeliveryProvenanceBinding = {
+    artifact_id: p.artifactId,
+    producer_execution_id: p.eid,
+    governed_task_id: p.gtId,
+    logical_name: DELIVERY_TEXT_ARTIFACT,
+    sha256: sha256Hex(Buffer.from(o.text)),
+  };
+  const req = mintTelegramDeliveryRequest({
+    store: ctx.store,
+    mission: missionRow(ctx, mid),
+    task,
+    execution: { execution_id: `EXEC_DEL_${mid}` },
+    outboxDir: path.join(ctx.workspace, "outbox"),
+    workspace: ctx.workspace,
+    now: utcnow(),
+    defaultChatId: "111",
+    textPayload: o.text,
+    textProvenance,
+  });
+  return { req: req!, eid: p.eid, gtId: p.gtId, taskId };
+}
+
+const rewrite = (
+  ctx: ReturnType<typeof makeCtx>,
+  req: Record<string, unknown>,
+  body: Record<string, unknown>,
+) =>
+  ctx.store.put(
+    "telegram_delivery_request",
+    String(req.delivery_id),
+    body,
+    Number(req.version),
+  );
+
+async function expectFailClosedNoTransport(
+  ctx: ReturnType<typeof makeCtx>,
+  mode: "FILES" | "TEXT",
+) {
+  const rec = recordingTransport();
+  const { sent } = await runTransport(ctx, { transport: rec.transport });
+  expect(sent).toEqual([]);
+  expect(rec.calls).toHaveLength(0);
+  const after = deliveries(ctx)[0]!;
+  if (mode === "TEXT") {
+    expect(String(after.text_state)).toBe("FAILED_DELIVERY");
+    expect(String(after.last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+    );
+  } else {
+    for (const s of after.artifacts as Array<Record<string, unknown>>) {
+      expect(String(s.state)).toBe("FAILED_DELIVERY");
+      expect(String(s.last_error)).toBe(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+      );
+    }
+  }
+  expect(String(after.status)).not.toBe("SENT");
+}
+
+describe("F4 R2 — audit remediation round 2", () => {
+  it("R2.1 FILES: deleting ALL provenance fields + coherent source_path/sha256 rewrite → still FAIL CLOSED (no legacy downgrade)", async () => {
+    const ctx = makeCtx("f4-r21f");
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: "M_R21F",
+      files: [{ manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT }],
+    });
+    const slot = (req.artifacts as Array<Record<string, unknown>>)[0]!;
+    const pathB = path.join(ctx.workspace, "outbox", "report.txt");
+    fs.mkdirSync(path.dirname(pathB), { recursive: true });
+    fs.writeFileSync(pathB, "ADVERSARY BYTES B");
+    const stripped = { ...slot } as Record<string, unknown>;
+    delete stripped.artifact_id;
+    delete stripped.producer_execution_id;
+    delete stripped.producer_governed_task_id;
+    delete stripped.logical_name;
+    stripped.source_path = pathB;
+    stripped.sha256 = sha256Hex(Buffer.from("ADVERSARY BYTES B"));
+    rewrite(ctx, req, { ...req, artifacts: [stripped] });
+    // The immutable receipt still exists — hash-only must NOT rescue it.
+    await expectFailClosedNoTransport(ctx, "FILES");
+  });
+
+  it("R2.1 TEXT: deleting text provenance fields + coherent payload rewrite → still FAIL CLOSED", async () => {
+    const ctx = makeCtx("f4-r21t");
+    const { req } = mkBoundTextTdr(ctx, {
+      missionId: "M_R21T", text: VI_REPORT,
+    });
+    const badText = "ADVERSARY PAYLOAD";
+    const stripped = { ...req } as Record<string, unknown>;
+    delete stripped.text_artifact_id;
+    delete stripped.text_producer_execution_id;
+    delete stripped.text_producer_governed_task_id;
+    delete stripped.text_artifact_sha256;
+    stripped.text = badText;
+    stripped.text_sha256 = digest(badText);
+    stripped.text_length = badText.length;
+    rewrite(ctx, req, stripped);
+    await expectFailClosedNoTransport(ctx, "TEXT");
+  });
+
+  it("R2.2 A: rename report.txt → forged.txt retaining valid canonical binding → FAIL CLOSED", async () => {
+    const ctx = makeCtx("f4-r22a");
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: "M_R22A",
+      files: [{ manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT }],
+    });
+    const slot = (req.artifacts as Array<Record<string, unknown>>)[0]!;
+    rewrite(ctx, req, {
+      ...req,
+      artifacts: [{ ...slot, name: "forged.txt" }],
+    });
+    await expectFailClosedNoTransport(ctx, "FILES");
+  });
+
+  it("R2.2 B: duplicate one receipt-bound artifact into two differently named slots → FAIL CLOSED", async () => {
+    const ctx = makeCtx("f4-r22b");
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: "M_R22B",
+      files: [{ manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT }],
+    });
+    const slot = (req.artifacts as Array<Record<string, unknown>>)[0]!;
+    rewrite(ctx, req, {
+      ...req,
+      artifacts: [slot, { ...slot, name: "report-copy.txt" }],
+    });
+    await expectFailClosedNoTransport(ctx, "FILES");
+  });
+
+  it("R2.2 C: remove one slot from a multi-file request → FAIL CLOSED", async () => {
+    const ctx = makeCtx("f4-r22c");
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: "M_R22C",
+      files: [
+        { manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT },
+        { manifest: "data.txt", logical: "outbox/data.txt", bytes: "DATA BYTES" },
+      ],
+    });
+    const slots = req.artifacts as Array<Record<string, unknown>>;
+    expect(slots).toHaveLength(2);
+    rewrite(ctx, req, { ...req, artifacts: [slots[0]] });
+    await expectFailClosedNoTransport(ctx, "FILES");
+  });
+
+  it("R2.2 D: untouched exact receipt-bound request → PASS (control)", async () => {
+    const ctx = makeCtx("f4-r22d");
+    mkBoundFilesTdr(ctx, {
+      missionId: "M_R22D",
+      files: [
+        { manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT },
+        { manifest: "data.txt", logical: "outbox/data.txt", bytes: "DATA BYTES" },
+      ],
+    });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent.sort()).toEqual(["data.txt", "report.txt"]);
+    expect(rec.calls).toHaveLength(2);
+    expect(Buffer.from(rec.calls[0]!.fileBytes!).toString("utf8")).toBeTruthy();
+  });
+
+  it("R2.3: mutate payload delivery_id on the same canonical entity key → FAIL CLOSED, zero network", async () => {
+    const ctx = makeCtx("f4-r23");
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: "M_R23",
+      files: [{ manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT }],
+    });
+    rewrite(ctx, req, { ...req, delivery_id: "TDR_FORGED_IDENTITY" });
+    await expectFailClosedNoTransport(ctx, "FILES");
+    // The receipt is still resolvable through the canonical entity id —
+    // the mutation can never re-select or escape receipt authority.
+    const receipts = ctx.store
+      .listEvidence("M_R23")
+      .filter((e) => String(e.kind) === TELEGRAM_DELIVERY_MINTED);
+    expect(receipts).toHaveLength(1);
+  });
+
+  it("R2.4: atomic mint — injected fault between receipt and row write rolls back BOTH; retry mints exactly one of each", async () => {
+    const ctx = makeCtx("f4-r24");
+    const mid = "M_R24";
+    mkCanonicalProducer(ctx, {
+      missionId: mid, key: `TP${mid}`, planId: `PLAN_${mid}`,
+      name: "outbox/report.txt", bytes: VI_REPORT,
+    });
+    const prod = mkCanonicalProducer(ctx, {
+      missionId: `${mid}x`, key: `TP${mid}x`, planId: `PLAN_${mid}x`,
+      name: "outbox/report.txt", bytes: VI_REPORT,
+    });
+    const sha = sha256Hex(Buffer.from(VI_REPORT));
+    const cas = path.join(ctx.dir, "artifacts", "blobs", sha);
+    const mintArgs = () => ({
+      store: ctx.store,
+      mission: missionRow(ctx, mid),
+      task: {
+        task_id: "TDEL_R24", task_key: "T5", mission_id: mid,
+        plan_id: "PLAN_R24", depends_on: [`TP${mid}`],
+        required_capabilities: ["TELEGRAM_DELIVERY"],
+        metadata: {
+          workspace: ctx.workspace,
+          pair_telegram_delivery: {
+            requested: true, mode: "FILES", artifacts: ["report.txt"],
+          },
+        },
+      },
+      execution: { execution_id: "EXEC_DEL_R24" },
+      outboxDir: path.join(ctx.workspace, "outbox"),
+      workspace: ctx.workspace,
+      now: utcnow(),
+      defaultChatId: "111",
+      artifactSha256: { "report.txt": sha },
+      artifactSources: { "report.txt": cas },
+      artifactProvenance: {
+        "report.txt": {
+          artifact_id: prod.artifactId,
+          producer_execution_id: prod.eid,
+          governed_task_id: prod.gtId,
+          logical_name: "outbox/report.txt",
+          sha256: sha,
+          source_path: cas,
+        },
+      },
+    });
+    const deliveryId = deliveryRequestId(mid, "TDEL_R24");
+    const receiptsFor = (
+      store: PairEvidenceStore = ctx.store,
+      id: string = deliveryId,
+    ) =>
+      store
+        .listEvidence()
+        .filter(
+          (e) =>
+            String(e.kind) === TELEGRAM_DELIVERY_MINTED &&
+            String(
+              (
+                (e.payload as Record<string, unknown>)
+                  .payload as Record<string, unknown>
+              ).delivery_id ?? "",
+            ) === id,
+        );
+
+    // 1. fault injected between receipt-write and TDR-write (the store
+    //    put inside the atomic transaction throws) → rollback leaves
+    //    NEITHER durable receipt nor row.
+    const origPut = ctx.store.put.bind(ctx.store);
+    let armed = true;
+    const mutableStore = ctx.store as unknown as {
+      put: typeof origPut;
+    };
+    mutableStore.put = ((
+      type: string, id: string, body: Record<string, unknown>, v?: number,
+    ) => {
+      if (armed && type === "telegram_delivery_request") {
+        armed = false;
+        throw new Error("INJECTED_CRASH_MID_MINT");
+      }
+      return origPut(type, id, body, v);
+    }) as typeof origPut;
+    try {
+      mintTelegramDeliveryRequest(mintArgs());
+      expect.unreachable("injected crash must propagate");
+    } catch (err) {
+      expect(String(err)).toContain("INJECTED_CRASH_MID_MINT");
+    } finally {
+      mutableStore.put = origPut;
+    }
+    expect(
+      ctx.store.tryGet("telegram_delivery_request", deliveryId),
+    ).toBeNull();
+    expect(receiptsFor()).toHaveLength(0);
+
+    // 2. retry after the injected failure → exactly one receipt + one TDR.
+    const req = mintTelegramDeliveryRequest(mintArgs());
+    expect(req).toBeTruthy();
+    expect(receiptsFor()).toHaveLength(1);
+    expect(deliveries(ctx)).toHaveLength(1);
+
+    // 3. a second mint attempt (serialized race equivalent) converges to
+    //    the SAME canonical row — zero extra receipt, zero row mutation.
+    const again = mintTelegramDeliveryRequest(mintArgs());
+    expect(String(again!.delivery_id)).toBe(String(req!.delivery_id));
+    expect(receiptsFor()).toHaveLength(1);
+    expect(deliveries(ctx)).toHaveLength(1);
+
+    // 4. restart after the successful mint → still exactly one receipt.
+    const dbPath = path.join(ctx.dir, "pair.db");
+    ctx.store.close();
+    const store2 = new PairEvidenceStore(dbPath);
+    expect(receiptsFor(store2)).toHaveLength(1);
     store2.close();
   });
 });

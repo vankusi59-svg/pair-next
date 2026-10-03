@@ -318,3 +318,132 @@ Same 2 env-only `pair-p5` executable-probe failures (reproduced on base
 
 Classification:
 `PAIR_NEXT_PHASE_F4_DELIVERY_ARTIFACT_PROVENANCE_R1_PENDING_AUDIT`
+
+================================================================================
+R2 REMEDIATION — whole-request receipt binding, atomic mint, fresh-runtime proof
+================================================================================
+
+Audited head at R2 work start: `6268e7b0985570d5e48b64a3c254fed197e66c59`.
+New head: see final commit on PR #35. All work on the same PR — no new PR, no merge.
+
+## R2.1 — provenance is not downgradeable to legacy
+
+Receipt existence now OWNS the authority path. In
+`pendingTelegramDeliveries` the mint receipts are indexed by the
+canonical entity identity and `bound = receipts.length > 0`. The FILES
+slot gate is `bound || a.artifact_id !== undefined` and the TEXT gate is
+`bound || req.text_artifact_id !== undefined`: once a
+`TELEGRAM_DELIVERY_MINTED` receipt exists for the entity, deleting every
+provenance field off the mutable row cannot reach the hash-only legacy
+path — the slot/text fails closed instead. Legacy compatibility is now
+identified ONLY by "no receipt AND no binding fields" (pre-F4 rows),
+never by "the row happens to lack artifact_id".
+
+Tests: FILES row with ALL provenance fields deleted + coherent
+source_path/sha256 rewrite to adversary bytes → FAIL CLOSED, zero
+transport (the immutable receipt still exists). TEXT same on text/
+text_sha256/text_length.
+
+## R2.2 — the receipt binds the request as a WHOLE contract
+
+New `wholeContractValid(req, receipt)`:
+- mode must match the receipt.
+- TEXT: text_artifact_id, text_producer_execution_id,
+  text_producer_governed_task_id, text_source_artifact (= receipt
+  logical_name), text_artifact_sha256, text_sha256 AND text_length must
+  ALL equal the receipt fields.
+- FILES: receipt artifact entries must match the row slots
+  BIJECTIVELY — exact count first, then each slot must match one
+  remaining receipt entry on name + artifact_id + producer_execution_id
+  + governed_task_id + logical_name + sha256; unmatched residue = invalid.
+  Extra slot, missing slot, renamed slot, duplicated slot → all fail.
+- Delivery identity is also bound: `req.delivery_id === req.entity_id`
+  (R2.3) and receipts must be EXACTLY ONE for the entity.
+
+Tests: A rename report.txt→forged.txt retaining valid canonical binding
+→ FAIL. B duplicate one receipt-bound artifact into a second named slot
+→ FAIL. C remove one slot of a 2-file request → FAIL. D untouched
+receipt-bound 2-file request → PASS (control, 2 sends).
+
+## R2.3 — delivery identity is the canonical entity identity
+
+`req.delivery_id === req.entity_id` is now part of the accepted-request
+invariant (`identityOk`), and receipts are resolved by `req.entity_id` —
+the field `store.put` injects into the stored body, which a canonical
+write cannot forge. A coherent `store.put` rewrite of
+`payload.delivery_id` therefore can neither escape receipt authority nor
+fabricate a second entity: `putReq` now writes back to
+`entity_id ?? delivery_id` — the canonical entity key — so the row is
+marked FAILED_DELIVERY on the real entity (previously it crashed with a
+version conflict against the forged key). Test mutates delivery_id on
+the same canonical key → FAIL CLOSED, zero network, receipt still
+exactly one.
+
+## R2.4 — mint receipt + TDR row are crash-atomic
+
+`mintTelegramDeliveryRequest` mints inside ONE `store.immediate`
+transaction: in-transaction `tryGet` re-check (not just the
+pre-transaction read) → idempotent return of the existing row; the
+TELEGRAM_DELIVERY_MINTED receipt append and the TDR `store.put` are
+atomic — either both durable or neither. `appendEvidence` is a plain
+INSERT, safe inside the transaction.
+
+Test: an injected fault between receipt-write and row-write (the put
+inside the transaction throws) rolls back BOTH — zero receipt AND zero
+row durable. Retry mints exactly one receipt + one row. A second
+(serialized-race-equivalent) mint converges to the same canonical row —
+one receipt, one row, no mutation. After a real store close/reopen,
+exactly one receipt remains.
+
+## R2.5 — genuinely fresh-runtime restart proof
+
+The harness's production wiring was extracted into `wireStack(name,
+workspace, store, opts)` — same constructors for service/gate/registry/
+router/recovery/reconciliation/approvals/scheduler/adapters/planner/
+runtime/supervisor/control + capability registration. `makeCtx` delegates
+to it. The R1.4 restart test was rewritten for R2.5: instance B is a
+WHOLE new stack built by `wireStack` over a reopened `PairEvidenceStore`
+on the same DB — fresh store + PairControlPlane + scheduler + approvals
++ recovery + MissionRuntime + MissionControl; zero objects referencing
+the closed store. A tick on the fresh runtime converges the completed
+mission without re-dispatch; the durable mint receipt survives; stale
+same-name outbox bytes written BETWEEN the instances are never
+re-baselined; wire bytes are the canonical CAS bytes; exactly-once.
+
+## R2.6 — no regression of prior closures
+
+All A1–A11 and R1 tests keep passing unchanged (the R1.4 test itself was
+the one rewritten per R2.5 — its assertions only got stronger).
+
+## Validation (R2, all on final HEAD)
+
+| Suite | Result |
+|---|---|
+| `pair-f4-delivery-provenance` (A1–A11 + 6 R1 + 8 R2) | 25/25 |
+| `pair-output-delivery-contract` | 69/69 |
+| `pair-planner-dataflow-incident` | 106/106 |
+| `pair-ops-telegram-delivery` | 3/3 |
+| `pair-f1-*` + `pair-f2-*` + `pair-f3-*` + runtime/recovery suites | 369/369 + runtime-hardening 11 + live-ops 20 + phase-d 37 |
+| focused batch total | 640/640 |
+| races after `rm -rf dist` (`f1-r1` + `f1-r2`) | 120/120 |
+| **Full repository regression** | **3205 pass / 2 fail** |
+
+Same 2 env-only `pair-p5` executable-probe failures (reproduced on base
+`3e17525`). `npx tsc --noEmit` 0 errors · `pnpm build` PASS ·
+`pnpm audit --audit-level=high` 0 high (1 low, 8 moderate — same as base).
+
+## Remaining limitations
+
+- Pre-F4 legacy TDR rows (minted before provenance binding existed) keep
+  the hash-only path by authoritative history (no receipt + no binding
+  fields) — they can never gain a receipt retroactively.
+- `wholeContractValid` treats the receipt artifact list as a SET — FILES
+  manifest order is not semantically relevant in transport (one send per
+  slot), so reordering is accepted; any slot multiset mismatch is not.
+- The R2.4 race test models a serialized competitor through the canonical
+  seam (BEGIN IMMEDIATE serializes writers) rather than spawning two OS
+  writers — the durable-state assertions (1 row / 1 receipt) are what the
+  mandate requires.
+
+Classification:
+`PAIR_NEXT_PHASE_F4_DELIVERY_ARTIFACT_PROVENANCE_R2_PENDING_AUDIT`

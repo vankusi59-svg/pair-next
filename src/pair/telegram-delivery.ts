@@ -528,38 +528,48 @@ export function mintTelegramDeliveryRequest(args: {
         }),
     created_at: args.now,
   };
-  // F4 R1.2 — emit the immutable mint receipt BEFORE the mutable row
-  // exists: a request carrying provenance binding is only ever valid
-  // against this append-only anchor. A dangling receipt (insert later
-  // failing) grants nothing — the row simply does not exist.
-  if (prov !== undefined || args.textProvenance !== undefined) {
-    args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_MINTED, {
-      delivery_id: id,
-      mode: manifest.mode,
-      ...(manifest.mode === "FILES"
-        ? {
-            artifacts: artifacts.map((a) => ({
-              name: a.name,
-              artifact_id: a.artifact_id,
-              producer_execution_id: a.producer_execution_id,
-              governed_task_id: a.producer_governed_task_id,
-              logical_name: a.logical_name,
-              sha256: a.sha256,
-            })),
-          }
-        : {
-            artifact_id: args.textProvenance!.artifact_id,
-            producer_execution_id:
-              args.textProvenance!.producer_execution_id,
-            governed_task_id: args.textProvenance!.governed_task_id,
-            logical_name: DELIVERY_TEXT_ARTIFACT,
-            artifact_sha256: args.textProvenance!.sha256,
-            text_sha256: textEvidence.text_sha256,
-            text_length: textEvidence.text_length,
-          }),
-    });
-  }
-  return args.store.put(TELEGRAM_DELIVERY_REQUEST, id, body);
+  // F4 R2.4 — the mint receipt and the TDR row are ONE atomic durable
+  // write: BEGIN IMMEDIATE serializes competing minters so a concurrent
+  // or crashed mint can never leave an orphan receipt behind (which
+  // would permanently poison the request — projection requires exactly
+  // one receipt). The existence re-check runs INSIDE the transaction:
+  // an already-minted canonical TDR is adopted as-is, zero extra
+  // receipt, zero row mutation.
+  return args.store.immediate(() => {
+    const existingTx = args.store.tryGet(TELEGRAM_DELIVERY_REQUEST, id);
+    if (existingTx) return existingTx;
+    // F4 R1.2 — emit the immutable mint receipt with the mutable row in
+    // the same commit: a request carrying provenance binding is only
+    // ever valid against this append-only anchor.
+    if (prov !== undefined || args.textProvenance !== undefined) {
+      args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_MINTED, {
+        delivery_id: id,
+        mode: manifest.mode,
+        ...(manifest.mode === "FILES"
+          ? {
+              artifacts: artifacts.map((a) => ({
+                name: a.name,
+                artifact_id: a.artifact_id,
+                producer_execution_id: a.producer_execution_id,
+                governed_task_id: a.producer_governed_task_id,
+                logical_name: a.logical_name,
+                sha256: a.sha256,
+              })),
+            }
+          : {
+              artifact_id: args.textProvenance!.artifact_id,
+              producer_execution_id:
+                args.textProvenance!.producer_execution_id,
+              governed_task_id: args.textProvenance!.governed_task_id,
+              logical_name: DELIVERY_TEXT_ARTIFACT,
+              artifact_sha256: args.textProvenance!.sha256,
+              text_sha256: textEvidence.text_sha256,
+              text_length: textEvidence.text_length,
+            }),
+      });
+    }
+    return args.store.put(TELEGRAM_DELIVERY_REQUEST, id, body);
+  });
 }
 
 /**
@@ -777,7 +787,12 @@ function putReq(
   store: PairEvidenceStore,
   req: Record<string, unknown>,
 ): Record<string, unknown> {
-  return store.put(TELEGRAM_DELIVERY_REQUEST, String(req.delivery_id), {
+  // F4 R2.3 — the durable entity key is the canonical entity identity,
+  // NEVER the mutable payload delivery_id: a rewritten delivery_id must
+  // still converge onto the real row (or deterministically conflict),
+  // never fabricate a second entity under the forged key.
+  const key = String(req.entity_id ?? req.delivery_id);
+  return store.put(TELEGRAM_DELIVERY_REQUEST, key, {
     ...req,
     version: req.version,
   });
@@ -1016,7 +1031,7 @@ export function pendingTelegramDeliveries(
   // a coherent mutable-row rewrite fails closed, never re-baselines.
   let mintReceipts: Map<string, Record<string, unknown>[]> | null = null;
   const receiptsFor = (
-    deliveryId: string,
+    entityId: string,
   ): Record<string, unknown>[] => {
     if (mintReceipts === null) {
       mintReceipts = new Map();
@@ -1024,6 +1039,9 @@ export function pendingTelegramDeliveries(
         if (String(ev.kind) !== TELEGRAM_DELIVERY_MINTED) continue;
         const p = (ev.payload as Record<string, unknown>)
           .payload as Record<string, unknown>;
+        // Receipts are immutable — their delivery_id IS the canonical
+        // entity identity stamped at mint; resolution keys off that,
+        // never the (mutable) request payload's delivery_id (R2.3).
         const id = String(p.delivery_id ?? "");
         if (!id) continue;
         const list = mintReceipts.get(id) ?? [];
@@ -1031,7 +1049,7 @@ export function pendingTelegramDeliveries(
         mintReceipts.set(id, list);
       }
     }
-    return mintReceipts.get(deliveryId) ?? [];
+    return mintReceipts.get(entityId) ?? [];
   };
   let artifactAuthority: ArtifactAuthority | null = null;
   const authority = (): ArtifactAuthority => {
@@ -1043,11 +1061,68 @@ export function pendingTelegramDeliveries(
     });
     return artifactAuthority;
   };
-  /** Provenance proof for one bound payload: exactly one receipt exists
-   *  AND every bound field on the row equals the receipt AND the
-   *  artifact still verifies through the canonical authority (immutable
-   *  acceptance history ↔ row ↔ execution linkage ↔ digest). */
-  const provenanceValid = (
+  /** F4 R2 — the immutable mint receipt is a WHOLE-REQUEST contract.
+   *  Resolution is by the canonical entity identity (`entity_id` — the
+   *  durable entity key the store injects and `put` cannot rewrite away
+   *  from the key), never by the mutable payload `delivery_id`. When a
+   *  receipt exists for this canonical identity the row MUST carry the
+   *  complete provenance contract: same mode, exact slot count, exact
+   *  manifest names, and every bound field equal to the receipt — no
+   *  extra/missing/renamed/duplicated slot, and no provenance field may
+   *  be deleted to fall back to the legacy hash-only path. */
+  const wholeContractValid = (
+    req: Record<string, unknown>,
+    receipt: Record<string, unknown>,
+  ): boolean => {
+    if (String(req.mode ?? "") !== String(receipt.mode ?? "")) return false;
+    if (String(req.mode) === "TEXT") {
+      return (
+        typeof req.text_artifact_id === "string" &&
+        String(receipt.artifact_id ?? "") === req.text_artifact_id &&
+        typeof req.text_producer_execution_id === "string" &&
+        String(receipt.producer_execution_id ?? "") ===
+          req.text_producer_execution_id &&
+        typeof req.text_producer_governed_task_id === "string" &&
+        String(receipt.governed_task_id ?? "") ===
+          req.text_producer_governed_task_id &&
+        String(receipt.logical_name ?? "") ===
+          String(req.text_source_artifact ?? "") &&
+        typeof req.text_artifact_sha256 === "string" &&
+        String(receipt.artifact_sha256 ?? receipt.sha256 ?? "") ===
+          req.text_artifact_sha256 &&
+        String(receipt.text_sha256 ?? "") === String(req.text_sha256 ?? "") &&
+        Number(receipt.text_length) === Number(req.text_length)
+      );
+    }
+    const ra = Array.isArray(receipt.artifacts)
+      ? (receipt.artifacts as Array<Record<string, unknown>>)
+      : [];
+    const slots = Array.isArray(req.artifacts)
+      ? (req.artifacts as DeliverySlot[])
+      : [];
+    if (ra.length === 0 || ra.length !== slots.length) return false;
+    const remaining = [...ra];
+    for (const a of slots) {
+      const i = remaining.findIndex(
+        (r) =>
+          String(r.name ?? "") === String(a.name ?? "") &&
+          String(r.artifact_id ?? "") === String(a.artifact_id ?? "") &&
+          String(r.producer_execution_id ?? "") ===
+            String(a.producer_execution_id ?? "") &&
+          String(r.governed_task_id ?? "") ===
+            String(a.producer_governed_task_id ?? "") &&
+          String(r.logical_name ?? "") === String(a.logical_name ?? "") &&
+          String(r.sha256 ?? "") === String(a.sha256 ?? ""),
+      );
+      if (i < 0) return false;
+      remaining.splice(i, 1);
+    }
+    return remaining.length === 0;
+  };
+  /** Live canonical re-verification of one bound artifact: immutable
+   *  acceptance history ↔ row ↔ execution linkage ↔ digest, through
+   *  the F1/F2 authority seam. */
+  const liveVerify = (
     req: Record<string, unknown>,
     bound: {
       artifact_id: unknown;
@@ -1055,35 +1130,8 @@ export function pendingTelegramDeliveries(
       governed_task_id: unknown;
       logical_name: unknown;
       sha256: unknown;
-      extra?: Record<string, unknown>;
     },
   ): boolean => {
-    const receipts = receiptsFor(String(req.delivery_id));
-    if (receipts.length !== 1) return false;
-    const r = receipts[0]!;
-    const list = Array.isArray(r.artifacts)
-      ? (r.artifacts as Array<Record<string, unknown>>)
-      : r.artifact_id !== undefined
-        ? [r]
-        : [];
-    const match = list.find(
-      (a) => String(a.artifact_id ?? "") === String(bound.artifact_id ?? ""),
-    );
-    if (!match) return false;
-    if (
-      String(match.producer_execution_id ?? "") !==
-        String(bound.producer_execution_id ?? "") ||
-      String(match.governed_task_id ?? "") !==
-        String(bound.governed_task_id ?? "") ||
-      String(match.logical_name ?? "") !== String(bound.logical_name ?? "") ||
-      String(match.sha256 ?? match.artifact_sha256 ?? "") !==
-        String(bound.sha256 ?? "")
-    ) {
-      return false;
-    }
-    for (const [k, v] of Object.entries(bound.extra ?? {})) {
-      if (match[k] !== v) return false;
-    }
     try {
       authority().verifyArtifactForConsumption(String(bound.artifact_id), {
         execution_id: String(bound.producer_execution_id),
@@ -1108,6 +1156,24 @@ export function pendingTelegramDeliveries(
     // this projection pass — no unbounded hidden-file accumulation.
     pruneDeliverySnapshots(req);
     if (String(req.status) !== "QUEUED") continue;
+    // F4 R2 — resolve the immutable mint-receipt contract ONCE for the
+    // whole request, by the CANONICAL entity identity (`entity_id`),
+    // never by the mutable payload `delivery_id`: a rewritten
+    // delivery_id can neither escape nor re-select receipt authority
+    // (identity mismatch is itself a fail-closed violation). When a
+    // receipt exists the row must match it as a WHOLE contract —
+    // deleted provenance fields, renamed/duplicated/added/removed
+    // slots, or any bound-field drift is a violation, never a legacy
+    // fallback. `bound` = a mint receipt anchors this entity; a row
+    // carrying bound provenance fields with no receipt is equally
+    // invalid (a receipt is always emitted with the mint that binds).
+    const entityId = String(req.entity_id ?? "");
+    const identityOk =
+      entityId.length > 0 && String(req.delivery_id ?? "") === entityId;
+    const receipts = entityId ? receiptsFor(entityId) : [];
+    const bound = receipts.length > 0;
+    const contractOk =
+      identityOk && receipts.length === 1 && wholeContractValid(req, receipts[0]!);
     if (req.mode === "TEXT") {
       const probe = { ...req } as Record<string, unknown>;
       const [s] = slots(req, probe);
@@ -1127,29 +1193,26 @@ export function pendingTelegramDeliveries(
         req.text_sha256 === digest(text) &&
         Number(req.text_length) === text.length &&
         String(req.text_source_artifact) === DELIVERY_TEXT_ARTIFACT;
-      // F4 R1.2 — when the row carries a provenance binding the payload
-      // must additionally anchor to the immutable mint receipt AND the
-      // still-canonical artifact: a coherent rewrite of
-      // text/text_sha256/text_length leaves the bound receipt fields
-      // (artifact sha + producer identity) inconsistent → fail closed.
+      // F4 R2 — receipt-bound (or binding-field-carrying) requests must
+      // satisfy the whole receipt contract AND live re-verification;
+      // an unbound row may only use the legacy path when NO receipt
+      // exists for its canonical identity.
       const provOk =
-        req.text_artifact_id === undefined ||
-        provenanceValid(req, {
-          artifact_id: req.text_artifact_id,
-          producer_execution_id: req.text_producer_execution_id,
-          governed_task_id: req.text_producer_governed_task_id,
-          logical_name: req.text_source_artifact,
-          sha256: req.text_artifact_sha256,
-          extra: {
-            text_sha256: req.text_sha256,
-            text_length: req.text_length,
-          },
-        });
-      if (!evidenceOk || !provOk) {
+        bound || req.text_artifact_id !== undefined
+          ? contractOk &&
+            liveVerify(req, {
+              artifact_id: req.text_artifact_id,
+              producer_execution_id: req.text_producer_execution_id,
+              governed_task_id: req.text_producer_governed_task_id,
+              logical_name: req.text_source_artifact,
+              sha256: req.text_artifact_sha256,
+            })
+          : true;
+      if (!evidenceOk || !provOk || !identityOk) {
         probe.text_state = "FAILED_DELIVERY";
-        probe.last_error = evidenceOk
-          ? "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE"
-          : "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE";
+        probe.last_error = !evidenceOk
+          ? "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE"
+          : "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
         probe.completed_at = ts;
         probe.status = recomputeStatus(req, probe);
         putReq(store, probe);
@@ -1177,26 +1240,31 @@ export function pendingTelegramDeliveries(
         dirty = true;
         continue;
       }
-      // F4 R1.2 — a bound slot must prove its provenance BEFORE the
-      // first snapshot materialization: the immutable mint receipt is
-      // the anchor, the canonical authority the live re-verification.
-      // A coherent rewrite of source_path/sha256/identity leaves the
-      // receipt fields inconsistent → terminal failure, zero transport.
-      if (
-        a.artifact_id !== undefined &&
-        !provenanceValid(req, {
-          artifact_id: a.artifact_id,
-          producer_execution_id: a.producer_execution_id,
-          governed_task_id: a.producer_governed_task_id,
-          logical_name: a.logical_name,
-          sha256: a.sha256,
-        })
-      ) {
-        a.state = "FAILED_DELIVERY";
-        a.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
-        a.completed_at = ts;
-        dirty = true;
-        continue;
+      // F4 R2 — provenance authority is whole-request: when a mint
+      // receipt anchors this entity (or the slot still carries bound
+      // fields), the request must satisfy the exact receipt contract
+      // AND the slot's artifact must live-verify through the canonical
+      // authority — BEFORE the first snapshot materialization.
+      // Deleting the provenance fields cannot downgrade to legacy:
+      // the immutable receipt still exists → fail closed.
+      if (bound || a.artifact_id !== undefined) {
+        const ok =
+          contractOk &&
+          identityOk &&
+          liveVerify(req, {
+            artifact_id: a.artifact_id,
+            producer_execution_id: a.producer_execution_id,
+            governed_task_id: a.producer_governed_task_id,
+            logical_name: a.logical_name,
+            sha256: a.sha256,
+          });
+        if (!ok) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
       }
       // R4.1 — snapshot-first authority: the immutable identity is the
       // TDR slot sha256; the pinned snapshot is its retained byte
