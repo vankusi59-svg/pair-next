@@ -31,6 +31,8 @@ The serve script (`scripts/serve-mission-control.mjs`) wires the full stack: evi
 
 Dashboard auth: `Authorization: Bearer $PAIR_MC_TOKEN`; writes require `x-operator-id`. Token resolution (shared by server + telegram bridge): explicit `PAIR_MC_TOKEN` → `$PAIR_HOME/pair-mc-token` (chmod 600) → generated 256-bit random persisted there. No static default ever ships; to inspect it locally read the file (`cat ~/pair-mc-token`) — it is never logged.
 
+**Devin API:** set `PAIR_DEVIN_API_KEY` to a service-user or personal-access `cog_` credential to use API v3. Set `PAIR_DEVIN_ORG_ID` when choosing an organization explicitly (required for enterprise service users whose `/v3/self` has no org). Otherwise the adapter resolves the credential's organization via `/v3/self`. Sessions and separately paginated messages use `/v3/organizations/{org_id}/sessions`; the organization and API version are pinned in each execution journal. Legacy `apk_`/`apk_user_` keys and historic v1 execution journals retain API v1. `PAIR_DEVIN_MODE` applies only to legacy v1; v3 uses its documented default mode. See [Devin authentication](https://docs.devin.ai/api-reference/authentication).
+
 ## Docs
 
 - `ARCHITECTURE.md` — current PAIR Next control-plane architecture

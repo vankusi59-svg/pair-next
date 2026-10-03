@@ -13,7 +13,7 @@
  *   CODEX_HOME          codex auth home (enables CODEX executor when set)
  *   PAIR_DEVIN_API_KEY  Devin API key (cog_...); without it DEVIN registers
  *                       UNQUALIFIED (fail-closed, shown in UI with reason)
- *   PAIR_DEVIN_ORG_ID   optional Devin org override
+ *   PAIR_DEVIN_ORG_ID   optional v3 org override; otherwise resolve via /v3/self
  *   PAIR_DSH_MODEL_ROUTE  optional provider:model override
  */
 import fs from "node:fs";

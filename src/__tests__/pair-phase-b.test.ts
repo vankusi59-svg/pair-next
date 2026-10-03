@@ -1681,7 +1681,7 @@ describe("PRE-MERGE hotfix — executor timeout governance", () => {
 
   const mkDevin = (dir: string, nowRef: { v: number }, over: Record<string, unknown> = {}) =>
     new DevinExecutorAdapter({
-      journalRoot: path.join(dir, "j"), apiKey: "cog_test",
+      journalRoot: path.join(dir, "j"), apiKey: "cog_test", apiVersion: "v1",
       fetchFn: (m) => ({ status: 200, data: m === "GET" ? { status_enum: "working" } : { session_id: "s1", url: "u" } }) as DevinFetch,
       nowMs: () => nowRef.v, now: () => new Date(nowRef.v).toISOString(),
       ...over,

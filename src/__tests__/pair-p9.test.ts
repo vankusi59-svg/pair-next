@@ -779,7 +779,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
   it("34. DEVIN qualified registration succeeds (contract transport)", () => {
     const ctx = makeCtx("t34");
     const fetchFn: DevinFetch = () => ({ status: 200, data: { session_id: "s1", url: "https://app.devin.ai/sessions/s1" } });
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn });
     expect(adapter.probe().available).toBe(true);
     const res = registerDevin(ctx, adapter);
     expect(res.routable).toContain("DEVIN");
@@ -788,7 +788,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
   it("35. forged Devin dispatch rejected", () => {
     const ctx = makeCtx("t35");
     const fetchFn: DevinFetch = () => ({ status: 200, data: { session_id: "s1" } });
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn });
     expect(() =>
       adapter.dispatch({ executor_id: "DEVIN", governance_state: "PENDING", task_id: "t", mission_id: "m", governed_task_id: "g", workspace: ctx.workspace, correlation_id: "c" }),
     ).toThrowError(/NOT_DISPATCH_AUTHORIZED/);
@@ -804,7 +804,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
       calls++;
       return { status: 200, data: { session_id: "devin-same-remote" } };
     };
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn });
     const task = {
       executor_id: "DEVIN",
       governance_state: "DISPATCH_AUTHORIZED",
@@ -825,7 +825,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
       status: 200,
       data: m === "GET" ? { status_enum: "finished", structured_output: { done: true }, url: "u" } : { session_id: "s1", url: "u" },
     });
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn });
     const disp = adapter.dispatch({
       executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
       task_id: "t", mission_id: "m", governed_task_id: "GT1",
@@ -849,7 +849,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     });
     let nowMs = 1_000_000;
     const adapter = new DevinExecutorAdapter({
-      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn,
+      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn,
       blockedGraceMs: 60_000, nowMs: () => nowMs,
       now: () => new Date(nowMs).toISOString(),
     });
@@ -898,7 +898,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     });
     let nowMs = 2_000_000;
     const adapter = new DevinExecutorAdapter({
-      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn,
+      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn,
       blockedGraceMs: 60_000, nowMs: () => nowMs,
       now: () => new Date(nowMs).toISOString(),
     });
@@ -933,7 +933,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     });
     let nowMs = 3_000_000;
     const adapter = new DevinExecutorAdapter({
-      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn,
+      journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn,
       blockedGraceMs: 60_000, nowMs: () => nowMs,
       now: () => new Date(nowMs).toISOString(),
     });
@@ -970,7 +970,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     };
     const adapter = new DevinExecutorAdapter({
       journalRoot: path.join(ctx.dir, "devin-j"),
-      apiKey: "cog_test",
+      apiKey: "cog_test", apiVersion: "v1",
       fetchFn,
       costGuard: () => ({ allowed: false, reason: "BUDGET_EXCEEDED: remote dispatch budget 10/10 reached" }),
     });
@@ -1011,7 +1011,7 @@ describe("P9 §36 — isolation, approvals, Mission Control backend", () => {
     // Guard open again → dispatch proceeds normally.
     const adapter = new DevinExecutorAdapter({
       journalRoot: path.join(ctx.dir, "devin-j"),
-      apiKey: "cog_test",
+      apiKey: "cog_test", apiVersion: "v1",
       fetchFn: () => ({ status: 200, data: { session_id: "s-ok", status_enum: "finished" } }),
       costGuard: () => ({ allowed: true }),
     });
@@ -1034,7 +1034,7 @@ describe("P9 §36 — artifacts, health, fairness, completion", () => {
   it("38. Devin artifact verification required (remote refs are not artifacts)", () => {
     const ctx = makeCtx("t38");
     const fetchFn: DevinFetch = () => ({ status: 200, data: { session_id: "s1", status_enum: "finished" } });
-    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", fetchFn });
+    const adapter = new DevinExecutorAdapter({ journalRoot: path.join(ctx.dir, "devin-j"), apiKey: "cog_test", apiVersion: "v1", fetchFn });
     const disp = adapter.dispatch({
       executor_id: "DEVIN", governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
       task_id: "t", mission_id: "m", governed_task_id: "GT1",

@@ -611,7 +611,7 @@ function devinWith(
   let nowMs = opts.nowStart ?? 5_000_000;
   const adapter = new DevinExecutorAdapter({
     journalRoot: path.join(dir, "devin-j"),
-    apiKey: "cog_test",
+    apiKey: "cog_test", apiVersion: "v1",
     fetchFn,
     blockedGraceMs: 60_000,
     taskTimeoutMs: opts.taskTimeoutMs ?? 300_000,
@@ -717,7 +717,7 @@ describe("LORC B — governed completion protocol", () => {
     };
     const adapter = new DevinExecutorAdapter({
       journalRoot: path.join(dir, "devin-j"),
-      apiKey: "cog_test",
+      apiKey: "cog_test", apiVersion: "v1",
       fetchFn,
     });
     const ws = fs.mkdtempSync(path.join(dir, "ws-"));

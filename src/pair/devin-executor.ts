@@ -1,5 +1,5 @@
 /**
- * P9 DEVIN executor — Devin REST API (v1 sessions create/inspect/message)
+ * P9 DEVIN executor — Devin REST API (v3 for cog_ credentials, legacy v1)
  * behind the canonical ExecutorAdapter contract.
  *
  * In this environment Devin is only programmatically reachable via
@@ -46,7 +46,6 @@ export const DEVIN_ROUTE_ID = "RTE_DEVIN_API";
 export const DEVIN_BINDING_MECHANISM = "AMBIENT_FIXED";
 
 const DEFAULT_BASE_URL = "https://api.devin.ai";
-const DEFAULT_ORG_ID = "org-95faaf8c42dc4b2eb6d9e17a5fc5fe90";
 const DEFAULT_DEVIN_MODE = "swe-2-max";
 const DEVIN_MODE_FALLBACK = "swe-2-high";
 export interface DevinResponse {
@@ -65,8 +64,10 @@ export interface DevinAdapterDeps {
   journalRoot: string;
   /** Defaults: env PAIR_DEVIN_API_KEY. */
   apiKey?: string | null;
-  /** Defaults: env PAIR_DEVIN_ORG_ID → DEFAULT_ORG_ID. */
+  /** Defaults: env PAIR_DEVIN_ORG_ID, otherwise the credential's /v3/self org. */
   orgId?: string;
+  /** Defaults to v3 for cog_ credentials; legacy apk_ keys retain v1. */
+  apiVersion?: "v1" | "v3";
   /** Devin agent mode pinned on dispatched sessions. Defaults: env
    *  PAIR_DEVIN_MODE → "swe-2-max". If the API rejects the mode
    *  (not enabled for the org), dispatch retries once with the
@@ -123,7 +124,7 @@ function lastDevinMessage(data: Record<string, unknown>): string | null {
   if (!Array.isArray(msgs)) return null;
   const last = [...(msgs as Array<Record<string, unknown>>)]
     .reverse()
-    .find((m) => String(m.type) === "devin_message");
+    .find((m) => String(m.type) === "devin_message" || m.source === "devin");
   const text = last ? String(last.message ?? "") : "";
   return text || null;
 }
@@ -133,7 +134,7 @@ function mapStatus(statusEnum: string): string {
   if (s === "finished") return "COMPLETED";
   if (s === "blocked") return "FAILED";
   if (s === "working" || s === "resumed") return "RUNNING";
-  if (s === "expired" || s.startsWith("suspend")) return "FAILED";
+  if (s === "expired" || s === "exited" || s.startsWith("suspend")) return "FAILED";
   return "RUNNING";
 }
 
@@ -297,7 +298,8 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
   readonly runtime_type = "REMOTE_CLOUD";
   private readonly executions = new Map<string, Record<string, unknown>>();
   private readonly apiKey: string | null;
-  private readonly orgId: string;
+  private orgId: string | null;
+  private readonly apiVersion: "v1" | "v3";
   private readonly baseUrl: string;
   private readonly devinMode: string;
   private readonly fetchFn: DevinFetch;
@@ -310,7 +312,8 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
 
   constructor(deps: DevinAdapterDeps) {
     this.apiKey = deps.apiKey ?? process.env.PAIR_DEVIN_API_KEY ?? null;
-    this.orgId = deps.orgId ?? process.env.PAIR_DEVIN_ORG_ID ?? DEFAULT_ORG_ID;
+    this.orgId = deps.orgId ?? process.env.PAIR_DEVIN_ORG_ID ?? null;
+    this.apiVersion = deps.apiVersion ?? (this.apiKey?.startsWith("cog_") ? "v3" : "v1");
     this.baseUrl = deps.baseUrl ?? DEFAULT_BASE_URL;
     this.devinMode = deps.devinMode ?? process.env.PAIR_DEVIN_MODE ?? DEFAULT_DEVIN_MODE;
     this.fetchFn = deps.fetchFn ?? curlFetch;
@@ -350,6 +353,68 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
 
   /* ---------------- probe / qualify / health ----------------------------- */
 
+  private resolveOrgId(): string {
+    if (!this.orgId) {
+      const res = this.api("GET", "/v3/self");
+      if (res.status !== 200) {
+        throw new PolicyError("FAIL_CLOSED_DEVIN_ORG_UNRESOLVED", `http_${res.status}`);
+      }
+      const org = res.data.principal_type === "pat_user"
+        ? res.data.devin_sessions_org_id
+        : res.data.org_id;
+      if (typeof org === "string" && org.trim()) this.orgId = org;
+    }
+    if (!this.orgId?.trim()) {
+      throw new PolicyError("FAIL_CLOSED_DEVIN_ORG_UNRESOLVED", "set PAIR_DEVIN_ORG_ID for this credential");
+    }
+    return this.orgId;
+  }
+
+  private sessionPath(rec?: Record<string, unknown>): string {
+    // Journals written before v3 are v1. Never reinterpret a historic session
+    // under a different API or organization after an environment change.
+    const version = rec ? (rec.remote_api_version ?? "v1") : this.apiVersion;
+    if (version === "v1") return "/v1/sessions";
+    const org = rec ? rec.remote_org_id : this.resolveOrgId();
+    if (typeof org !== "string" || !org.trim()) {
+      throw new PolicyError("FAIL_CLOSED_DEVIN_ORG_UNRESOLVED", "v3 journal has no organization");
+    }
+    return `/v3/organizations/${encodeURIComponent(org)}/sessions`;
+  }
+
+  private sessionDetail(rec: Record<string, unknown>): DevinResponse {
+    const endpoint = `${this.sessionPath(rec)}/${encodeURIComponent(String(rec.remote_session_id))}`;
+    const res = this.api("GET", endpoint);
+    if (res.status !== 200 || rec.remote_api_version !== "v3") return res;
+    // V3 messages are separate and chronological. Read through the final page
+    // before trusting a completion marker; user messages never prove completion.
+    const messages: Record<string, unknown>[] = [];
+    const cursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < 100; page++) {
+      const query = cursor ? `&after=${encodeURIComponent(cursor)}` : "";
+      const msg = this.api("GET", `${endpoint}/messages?first=200${query}`);
+      if (msg.status !== 200 || !Array.isArray(msg.data.items)) {
+        return { status: msg.status === 200 ? 502 : msg.status, data: {} };
+      }
+      messages.push(...msg.data.items as Record<string, unknown>[]);
+      if (msg.data.has_next_page !== true) {
+        const detail = { ...res.data, messages };
+        const status = String(res.data.status ?? "");
+        const statusDetail = String(res.data.status_detail ?? "");
+        const statusEnum = status === "running"
+          ? (statusDetail === "waiting_for_user" || statusDetail === "waiting_for_approval" ? "blocked" : statusDetail === "finished" ? "finished" : "working")
+          : status === "new" ? "working" : status;
+        return { status: 200, data: { ...detail, status_enum: statusEnum } };
+      }
+      const next = msg.data.end_cursor;
+      if (typeof next !== "string" || !next || cursors.has(next)) break;
+      cursors.add(next);
+      cursor = next;
+    }
+    return { status: 502, data: {} };
+  }
+
   probe(): Record<string, unknown> {
     if (!this.apiKey) {
       return {
@@ -367,6 +432,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       transport: DEVIN_TRANSPORT,
       base_url: this.baseUrl,
       org_id: this.orgId,
+      api_version: this.apiVersion,
     };
   }
 
@@ -589,17 +655,17 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       });
       return { ...record };
     }
+    const endpoint = this.sessionPath();
     const body = (mode: string): Record<string, unknown> => ({
       prompt: this.buildPrompt(task),
-      idempotent: true,
       tags: ["pair-os", String(task.mission_id)],
       title: `PAIR ${String(task.task_key ?? task.task_id)}`,
-      devin_mode: mode,
+      ...(this.apiVersion === "v1" ? { idempotent: true, devin_mode: mode } : {}),
     });
-    let res = this.api("POST", `/v1/sessions`, body(this.devinMode));
-    let usedMode = this.devinMode;
-    if (res.status === 400 && this.devinMode !== DEVIN_MODE_FALLBACK) {
-      res = this.api("POST", `/v1/sessions`, body(DEVIN_MODE_FALLBACK));
+    let res = this.api("POST", endpoint, body(this.devinMode));
+    let usedMode = this.apiVersion === "v3" ? "normal" : this.devinMode;
+    if (this.apiVersion === "v1" && res.status === 400 && this.devinMode !== DEVIN_MODE_FALLBACK) {
+      res = this.api("POST", endpoint, body(DEVIN_MODE_FALLBACK));
       usedMode = DEVIN_MODE_FALLBACK;
     }
     if (res.status === 401 || res.status === 403) {
@@ -611,6 +677,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     const runRoot = path.join(this.journalRoot, executionId);
     fs.mkdirSync(runRoot, { recursive: true });
     const rawId = String(res.data.session_id ?? res.data.devin_id ?? "");
+    if (!rawId.trim()) throw new PolicyError("FAIL_CLOSED_DEVIN_DISPATCH_REJECTED", "missing session_id");
     const sessionId = rawId.startsWith("devin-") ? rawId.slice(6) : rawId;
     const record: Record<string, unknown> = {
       executor_id: this.executor_id,
@@ -631,6 +698,8 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       remote_session_id: sessionId ? `devin-${sessionId}` : null,
       remote_url: res.data.url ?? null,
       remote_devin_mode: usedMode,
+      remote_api_version: this.apiVersion,
+      remote_org_id: this.apiVersion === "v3" ? this.orgId : null,
     };
     this.executions.set(executionId, record);
     atomicWriteJson(path.join(runRoot, "devin-dispatch.json"), {
@@ -654,11 +723,12 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     const effectiveTimeoutMs = Number(rec.task_timeout_ms ?? this.taskTimeoutMs);
     const timedOut =
       Number.isFinite(startedMs) && this.nowMs() - startedMs > effectiveTimeoutMs;
-    const res = this.api("GET", `/v1/sessions/${remoteId}`);
+    const res = this.sessionDetail(rec);
     if (res.status === 404) {
       rec.status = "UNKNOWN";
       rec.finished_at = this.now();
-    } else if (res.status < 400) {
+    } else if (res.status === 200) {
+      rec.remote_detail = res.data;
       const statusEnum = String(res.data.status_enum ?? res.data.status ?? "");
       // Completion evidence hierarchy: the governed completion marker →
       // legacy bare-DONE fallback. Either in the last devin_message tail
@@ -714,7 +784,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     const rec = this.requireRecord(executionId);
     const remoteId = String(rec.remote_session_id ?? "");
     if (remoteId && this.apiKey) {
-      const res = this.api("POST", `/v1/sessions/${remoteId}/messages`, {
+      const res = this.api("POST", `${this.sessionPath(rec)}/${encodeURIComponent(remoteId)}/messages`, {
         message: "PAIR operator cancellation: stop work on this task now.",
       });
       if (res.status >= 400) rec.cancel_request_failed = true;
@@ -731,10 +801,10 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     const rec = this.requireRecord(executionId);
     if (rec.result) return rec.result as Record<string, unknown>;
     const remoteId = String(rec.remote_session_id ?? "");
-    let remoteDetail: Record<string, unknown> = {};
+    let remoteDetail: Record<string, unknown> = (rec.remote_detail as Record<string, unknown>) ?? {};
     if (remoteId && this.apiKey) {
-      const res = this.api("GET", `/v1/sessions/${remoteId}`);
-      if (res.status < 400) remoteDetail = res.data;
+      const res = this.sessionDetail(rec);
+      if (res.status === 200) remoteDetail = res.data;
     }
     const status = TERMINAL.has(String(rec.status)) ? String(rec.status) : "UNKNOWN";
     const result: Record<string, unknown> = {
@@ -749,9 +819,8 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       started_at: rec.started_at,
       completed_at: rec.finished_at ?? this.now(),
       // The deliverable for remote tasks is the agent's reply text — prefer
-      // structured_output, else the last devin_message (v1 returns messages
-      // inline; the standalone /messages endpoint does not exist), else the
-      // status enum.
+      // structured_output, else the last Devin message (inline on v1,
+      // separately paginated on v3), else the status enum.
       output:
         remoteDetail.structured_output ??
         lastDevinMessage(remoteDetail) ??
@@ -761,7 +830,7 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       remote_refs: {
         session_id: remoteId || null,
         session_url: remoteDetail.url ?? rec.remote_url ?? null,
-        pull_request: remoteDetail.pull_request ?? null,
+        pull_request: remoteDetail.pull_request ?? remoteDetail.pull_requests ?? null,
       },
       error:
         status === "COMPLETED"
