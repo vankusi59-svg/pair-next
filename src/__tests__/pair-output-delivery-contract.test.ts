@@ -34,6 +34,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
+  ArtifactProvenanceValidator,
   ExecutorRegistry,
   GovernedTaskGate,
   MissionControl,
@@ -48,6 +49,9 @@ import {
   RecoveryController,
   TRANSPORT_IN_PROCESS,
   IntegrityError,
+  canonicalArtifactId,
+  mintArtifactCapability,
+  workerExecutionId,
   assertOutputLanguageAuthority,
   assertPlanDataflow,
   canonicalDeliveryTaskInstruction,
@@ -184,6 +188,10 @@ class ScriptedAdapter implements ExecutorAdapter {
   caps: string[];
   dispatched: string[] = [];
   collected: Record<string, Record<string, unknown>> = {};
+  /** execution_id → workspace-relative files the execution actually
+   *  wrote — declared in collect_result the same way the production
+   *  adapter's finish() workspace-diff declares them. */
+  private wrote: Record<string, string[]> = {};
   /** task_key → behavior; default COMPLETED */
   behavior: Record<
     string,
@@ -227,6 +235,7 @@ class ScriptedAdapter implements ExecutorAdapter {
         const fp = path.join(this.workspace, f);
         fs.mkdirSync(path.dirname(fp), { recursive: true });
         fs.writeFileSync(fp, this.fileContent[key] ?? `content of ${f}`);
+        (this.wrote[eid] ??= []).push(f);
       }
     }
     if (b === "CLOBBER" && this.workspace) {
@@ -236,6 +245,7 @@ class ScriptedAdapter implements ExecutorAdapter {
         const fp = path.join(this.workspace, f);
         fs.mkdirSync(path.dirname(fp), { recursive: true });
         fs.writeFileSync(fp, "CLOBBERED — rewritten by the delivery task");
+        (this.wrote[eid] ??= []).push(f);
       }
     }
     if (b === "SKIPWRITE" && this.workspace) {
@@ -268,7 +278,22 @@ class ScriptedAdapter implements ExecutorAdapter {
     // Canonical WorkerResult carries the full PAIR identity — merge the
     // execution id the same way production adapters bind it.
     const r = this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
-    return { execution_id: executionId, artifacts: [], ...r };
+    // Production contract: the result declares the artifacts THIS
+    // execution created/changed ({path, sha256, byte_size}) — the
+    // validator ingests them into canonical authority.
+    const artifacts = (this.wrote[executionId] ?? [])
+      .map((f) => {
+        const fp = path.join(this.workspace, f);
+        if (!fs.existsSync(fp)) return null;
+        const bytes = fs.readFileSync(fp);
+        return {
+          path: f,
+          sha256: sha256Hex(bytes),
+          byte_size: bytes.length,
+        };
+      })
+      .filter((a): a is NonNullable<typeof a> => a !== null);
+    return { execution_id: executionId, artifacts, ...r };
   }
   collect_artifacts() {
     return [];
@@ -373,6 +398,139 @@ function registerAdapter(ctx: ReturnType<typeof makeCtx>, adapter: ScriptedAdapt
     capabilities: adapter.caps,
   });
   ctx.adapters.set(adapter.executor_id, adapter);
+}
+
+/* ----------------- F4 canonical-producer fixture seam ---------------------- */
+
+/** Fabricate a legitimate in-mission artifact producer through the REAL
+ *  production seams: task row (produces declaration) → governed task →
+ *  executor_execution COMPLETED with the declared artifact contract →
+ *  ArtifactProvenanceValidator (local ingest) or the capability upload
+ *  lane (remote ingest). The canonical artifact row + RESULT_VALIDATED
+ *  anchor + ARTIFACT_ACCEPTED history it emits are exactly what
+ *  resolveDeliveryArtifact / verifyArtifactForConsumption re-prove. */
+function mkCanonicalProducer(
+  ctx: ReturnType<typeof makeCtx>,
+  o: {
+    missionId: string;
+    key: string;
+    planId: string;
+    name: string;
+    bytes: Buffer | string;
+    remote?: boolean;
+    executor?: string;
+    pass?: boolean;
+  },
+) {
+  const tid = `ATSK_${o.key}`;
+  const gtId = `GT_${tid}`;
+  const executor = o.executor ?? "EX_PROD";
+  const eid = workerExecutionId(executor, gtId);
+  const bytes = Buffer.isBuffer(o.bytes) ? o.bytes : Buffer.from(o.bytes);
+  ctx.store.put(
+    "task",
+    tid,
+    {
+      task_id: tid,
+      task_key: o.key,
+      mission_id: o.missionId,
+      plan_id: o.planId,
+      title: o.key,
+      task_instruction: `produce ${o.name}`,
+      required_capabilities: ["FILE_OPERATIONS"],
+      depends_on: [],
+      status: "COMPLETED",
+      metadata: {
+        pair_dataflow: { produces: [o.name], consumes: [] },
+      },
+      version: 0,
+    },
+    0,
+  );
+  ctx.store.put(
+    "governed_task",
+    gtId,
+    {
+      governed_task_id: gtId,
+      mission_id: o.missionId,
+      task_id: tid,
+      correlation_id: `COR_${tid}`,
+      executor_id: executor,
+      plan_revision: 1,
+      workspace: ctx.workspace,
+      allowed_paths: [ctx.workspace],
+      governance_state: "DISPATCH_AUTHORIZED",
+      dispatch_enabled: true,
+      created_at: utcnow(),
+      version: 0,
+    },
+    0,
+  );
+  ctx.store.put(
+    "executor_execution",
+    eid,
+    {
+      execution_id: eid,
+      governed_task_id: gtId,
+      mission_id: o.missionId,
+      task_id: tid,
+      executor_id: executor,
+      plan_revision: 1,
+      correlation_id: `COR_${tid}`,
+      execution_state: "RUNNING",
+      dispatch_timestamp: utcnow(),
+      workspace: ctx.workspace,
+      version: 0,
+    },
+    0,
+  );
+  let declared: Record<string, unknown>[] = [];
+  if (o.remote) {
+    const cap = mintArtifactCapability("MASTER", {
+      mission_id: o.missionId,
+      task_id: tid,
+      governed_task_id: gtId,
+      execution_id: eid,
+      executor_id: executor,
+    });
+    ctx.control.acceptArtifactUpload("MASTER", cap, {
+      filename: o.name,
+      mission_id: o.missionId,
+      task_id: tid,
+      bytes,
+    });
+  } else {
+    const fp = path.join(ctx.workspace, o.name);
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    fs.writeFileSync(fp, bytes);
+    declared = [
+      { path: o.name, sha256: sha256Hex(bytes), byte_size: bytes.length },
+    ];
+  }
+  const settled = ctx.store.get("executor_execution", eid);
+  ctx.store.put(
+    "executor_execution",
+    eid,
+    {
+      ...settled,
+      execution_state: o.pass === false ? "FAILED" : "COMPLETED",
+      result: {
+        status: o.pass === false ? "FAILED" : "COMPLETED",
+        artifacts: declared,
+      },
+    },
+    settled.version,
+  );
+  new ArtifactProvenanceValidator().validate_execution(ctx.service, eid);
+  const art = ctx.store.tryGet(
+    "artifact",
+    canonicalArtifactId(eid, o.name),
+  );
+  return {
+    tid, gtId, eid, executor, key: o.key, name: o.name, bytes,
+    artifact: art as Record<string, unknown> | null,
+    artifactId: String(art?.artifact_id ?? canonicalArtifactId(eid, o.name)),
+  };
 }
 
 const rt = (ctx: ReturnType<typeof makeCtx>, mid: string) =>
@@ -750,24 +908,24 @@ describe("C — exact production goal, FILES mode end-to-end", () => {
     expect(rec.calls).toHaveLength(0);
   });
 
-  it("C3. delivery task clobbers the manifested artifact → FAIL CLOSED on identity mismatch, zero TDR", async () => {
+  it("C3. delivery task clobbers the outbox file — canonical CAS bytes still deliver the producer's content (F4: the file is never authority)", async () => {
     const { ctx, mid } = buildMission(
       "c3-clobber",
       { T1: "COMPLETE", T2: "COMPLETE", T3: "COMPLETE", T4: "WRITE", T5: "CLOBBER" },
       { T4: VI_REPORT },
     );
+    // F4 — the outbox file is transport/staging only: a workspace
+    // clobber by the delivery task can never reach the retained CAS
+    // object the pin binds. Delivery must succeed with the PRODUCER's
+    // verified bytes — not fail, and never with the clobbered bytes.
     const state = drive(ctx, mid);
-    expect(state).not.toBe("COMPLETED");
-    expect(deliveries(ctx)).toHaveLength(0);
-    const ev = evidence(ctx, mid, "DELIVERY_CONTRACT_VIOLATED");
-    expect(ev.length).toBeGreaterThan(0);
-    expect(JSON.stringify(ev.map((e) => e.payload))).toContain(
-      "FAIL_CLOSED_DELIVERY_ARTIFACT_MUTATED",
-    );
+    expect(state).toBe("COMPLETED");
     const rec = recordingTransport();
     const { sent } = await runTransport(ctx, { transport: rec.transport });
-    expect(sent).toEqual([]);
-    expect(rec.calls).toHaveLength(0);
+    expect(sent).toEqual(["report.txt"]);
+    expect(Buffer.from(rec.calls[0].fileBytes!).toString("utf8")).toBe(
+      VI_REPORT,
+    );
   });
 
   it("C4. post-mint mutation → bridge-side digest guard fails closed, zero network calls", async () => {
@@ -793,6 +951,7 @@ describe("C — exact production goal, FILES mode end-to-end", () => {
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { "report.txt": sha },
+      artifactSources: { "report.txt": fp },
     }) as Record<string, unknown>;
     expect(String((req.artifacts as Array<Record<string, unknown>>)[0].sha256)).toBe(sha);
     // Mutation between mint and send.
@@ -922,8 +1081,10 @@ describe("D — TEXT mode: exactly one canonical payload source", () => {
     // No TDR minted: DONE could not become the payload.
     expect(deliveries(ctx)).toHaveLength(0);
     const ev = evidence(ctx, mid, "DELIVERY_CONTRACT_VIOLATED");
+    // F4.4 — "report.txt exists" is never proof; the execution wrote
+    // nothing and no in-mission producer contract exists → provenance.
     expect(JSON.stringify(ev.map((e) => e.payload))).toContain(
-      "FAIL_CLOSED_DELIVERY_TEXT_PAYLOAD_MISSING",
+      "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
     );
   });
 
@@ -1229,6 +1390,7 @@ describe("R1.2 — FILES digest authority is mandatory", () => {
       goal: PROD_GOAL,
       metadata: { authorized_workspaces: [ctx.workspace] },
     };
+    const exec = { execution_id: "E_NOPIN" };
     const task = {
       task_id: "TX",
       task_key: "T5",
@@ -1244,18 +1406,19 @@ describe("R1.2 — FILES digest authority is mandatory", () => {
       assertDeliveryDeliverable(
         mission: Record<string, unknown>,
         task: Record<string, unknown>,
+        execution: Record<string, unknown>,
       ): { ok: boolean; violation?: Record<string, unknown> };
     }).assertDeliveryDeliverable.bind(ctx.runtime);
     // No pin at all → PIN_MISSING — the gate does NOT adopt the current
     // file hash as the baseline even though the bytes sit right there.
-    const noPin = gate(m, task) as { ok: boolean; violation: Record<string, unknown> };
+    const noPin = gate(m, task, exec) as { ok: boolean; violation: Record<string, unknown> };
     expect(noPin.ok).toBe(false);
     expect(String(noPin.violation.code)).toBe("FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING");
     // Pin row exists but the artifact entry is absent → PIN_MISSING.
     const partial = gate(m, {
       ...task,
       metadata: { ...task.metadata, pair_delivery_artifact_digests: {} },
-    }) as { ok: boolean; violation: Record<string, unknown> };
+    }, exec) as { ok: boolean; violation: Record<string, unknown> };
     expect(partial.ok).toBe(false);
     expect(String(partial.violation.code)).toBe("FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING");
     // Pin entry with a null/malformed digest → PIN_MISSING (no authority).
@@ -1267,23 +1430,56 @@ describe("R1.2 — FILES digest authority is mandatory", () => {
           "report.txt": { path: null, sha256: null },
         },
       },
-    }) as { ok: boolean; violation: Record<string, unknown> };
+    }, exec) as { ok: boolean; violation: Record<string, unknown> };
     expect(malformed.ok).toBe(false);
     expect(String(malformed.violation.code)).toBe("FAIL_CLOSED_DELIVERY_ARTIFACT_PIN_MISSING");
-    // Correct pin → gate passes (control case).
-    const good = gate(m, {
+    // F4.1 — a pin carrying a valid sha256 but NO canonical artifact
+    // binding (artifact_id + producer_execution_id) is provenance-blind:
+    // even though the bytes sit in the outbox it must fail closed.
+    const noBinding = gate(m, {
       ...task,
       metadata: {
         ...task.metadata,
         pair_delivery_artifact_digests: {
           "report.txt": {
-            path: path.join(outbox, "report.txt"),
+            path: null,
             sha256: sha256File(path.join(outbox, "report.txt")),
           },
         },
       },
-    }) as { ok: boolean };
+    }, exec) as { ok: boolean; violation: Record<string, unknown> };
+    expect(noBinding.ok).toBe(false);
+    expect(String(noBinding.violation.code)).toBe("FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE");
+    // Control case — a pin bound to a REAL canonical artifact whose
+    // producer is a legitimate dep-predecessor task in this mission.
+    const prod = mkCanonicalProducer(ctx, {
+      missionId: "M_NOPIN",
+      key: "TP",
+      planId: "PLAN_GATE",
+      name: "outbox/report.txt",
+      bytes: VI_REPORT,
+    });
+    const good = gate(m, {
+      ...task,
+      plan_id: "PLAN_GATE",
+      depends_on: ["TP"],
+      metadata: {
+        ...task.metadata,
+        pair_delivery_artifact_digests: {
+          "report.txt": {
+            path: null,
+            state: "PINNED",
+            artifact_id: prod.artifactId,
+            producer_execution_id: prod.eid,
+            logical_name: prod.name,
+            sha256: sha256Hex(prod.bytes),
+          },
+        },
+      },
+    }, exec) as { ok: boolean; sources: Record<string, string> };
     expect(good.ok).toBe(true);
+    // The staged source is the CAS blob — never the outbox path.
+    expect(String(good.sources["report.txt"])).not.toContain("outbox");
   });
 });
 
@@ -1654,6 +1850,7 @@ describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { [file]: sha },
+      artifactSources: { [file]: fp },
     }) as Record<string, unknown>;
   };
 
@@ -1771,6 +1968,7 @@ describe("R2.3 — FILES artifacts hit the network as the pinned bytes", () => {
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { "chart.png": sha },
+      artifactSources: { "chart.png": path.join(outbox, "chart.png") },
     });
     const rec = recordingTransport();
     const { sent } = await runTransport(ctx, { transport: rec.transport });
@@ -1813,6 +2011,7 @@ describe("R3 — hashed bytes ARE the network bytes (post-verification TOCTOU cl
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { [file]: sha },
+      artifactSources: { [file]: fp },
     }) as Record<string, unknown>;
   };
 
@@ -1919,6 +2118,7 @@ describe("R4 — snapshot-first retry authority + bounded size + tmp cleanup", (
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { [file]: sha },
+      artifactSources: { [file]: fp },
     }) as Record<string, unknown>;
   };
 
@@ -2067,6 +2267,7 @@ describe("R4 — snapshot-first retry authority + bounded size + tmp cleanup", (
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { "big-ok.txt": shaOk },
+      artifactSources: { "big-ok.txt": path.join(outbox, "big-ok.txt") },
     });
     const rec = recordingTransport();
     const { sent } = await runTransport(ctx, { transport: rec.transport });
@@ -2097,6 +2298,7 @@ describe("R4 — snapshot-first retry authority + bounded size + tmp cleanup", (
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { "big.txt": shaBig },
+      artifactSources: { "big.txt": path.join(outbox2, "big.txt") },
     }) as Record<string, unknown>;
     const rec2 = recordingTransport();
     const r2 = await runTransport(ctx2, { transport: rec2.transport });
@@ -2185,6 +2387,9 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
       now: utcnow(),
       defaultChatId: "111",
       artifactSha256: { [file]: sha },
+      // F4.3 — the stamped canonical byte source; the outbox path is
+      // used here only as the CAS-path stand-in for the fixture.
+      artifactSources: { [file]: path.join(ctx.workspace, "outbox", file) },
     }) as Record<string, unknown>;
 
   it("Z1. projection source MAX+1 → FAILED TOO_LARGE with ZERO full-file read", async () => {
@@ -2248,14 +2453,27 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
     }
   });
 
-  it("Z3. dispatch pin on oversized artifact → TOO_LARGE state, ZERO full-file read", () => {
+  it("Z3. dispatch pin on oversized canonical artifact → TOO_LARGE state, never re-reads the workspace file", () => {
     const ctx = makeCtx("r5-z3");
     const outbox = path.join(ctx.workspace, "outbox");
     fs.mkdirSync(outbox, { recursive: true });
     const fp = path.join(outbox, "big.txt");
-    sparseOversize(fp);
+    // A legit in-mission producer whose canonical artifact exceeds the
+    // Telegram bound (but sits under the CAS bound): real bytes through
+    // the real ingest seam.
+    mkCanonicalProducer(ctx, {
+      missionId: "M_Z3",
+      key: "TP",
+      planId: "PLAN_Z3",
+      name: "outbox/big.txt",
+      bytes: Buffer.alloc(MAX_TELEGRAM_FILE_BYTES + 1, 0x62),
+    });
     ctx.store.put("task", "T_Z3", {
       task_id: "T_Z3",
+      task_key: "T5",
+      mission_id: "M_Z3",
+      plan_id: "PLAN_Z3",
+      depends_on: ["TP"],
       required_capabilities: ["TELEGRAM_DELIVERY"],
       metadata: {
         workspace: ctx.workspace,
@@ -2274,9 +2492,10 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
           ): void;
         }
       ).pinDeliveryArtifactDigests(
-        { project_id: ctx.projectId, metadata: {} },
+        { project_id: ctx.projectId, mission_id: "M_Z3", plan_revision: 1, metadata: {} },
         ctx.store.get("task", "T_Z3"),
       );
+      // The pin must never re-materialize the workspace file itself.
       expect(readsOf(spy, fp)).toEqual([]);
     } finally {
       spy.mockRestore();
@@ -2285,21 +2504,29 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
       ctx.store.get("task", "T_Z3").metadata as Record<string, unknown>
     ).pair_delivery_artifact_digests as Record<
       string,
-      { path: string; sha256: string | null; state: string }
+      { path: string | null; sha256: string | null; state: string }
     >;
     expect(pin["big.txt"].state).toBe("TOO_LARGE");
     expect(pin["big.txt"].sha256).toBeNull();
   });
 
-  it("Z4. settle-time artifact grown to oversized → TOO_LARGE violation, ZERO full-file read, zero mint", () => {
+  it("Z4. settle-time canonical row tampered after pin → PROVENANCE violation, ZERO full-file read, zero mint", () => {
     const ctx = makeCtx("r5-z4");
     const outbox = path.join(ctx.workspace, "outbox");
     fs.mkdirSync(outbox, { recursive: true });
     const fp = path.join(outbox, "report.txt");
     fs.writeFileSync(fp, VI_REPORT);
-    const realSha = sha256File(fp);
+    const prod = mkCanonicalProducer(ctx, {
+      missionId: "M_Z4",
+      key: "TP",
+      planId: "PLAN_Z4",
+      name: "outbox/report.txt",
+      bytes: VI_REPORT,
+    });
     const task = {
       task_id: "T_Z4",
+      plan_id: "PLAN_Z4",
+      depends_on: ["TP"],
       required_capabilities: ["TELEGRAM_DELIVERY"],
       metadata: {
         workspace: ctx.workspace,
@@ -2307,12 +2534,24 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
           requested: true, mode: "FILES", artifacts: ["report.txt"],
         },
         pair_delivery_artifact_digests: {
-          "report.txt": { path: fp, sha256: realSha, state: "PINNED" },
+          "report.txt": {
+            path: null,
+            state: "PINNED",
+            artifact_id: prod.artifactId,
+            producer_execution_id: prod.eid,
+            logical_name: prod.name,
+            sha256: sha256Hex(prod.bytes),
+          },
         },
       },
     };
-    // The artifact grew beyond the bound after dispatch.
-    sparseOversize(fp);
+    // Semantic tamper through the canonical seam: the row's sha is
+    // rewritten with a valid entity hash — binding re-proof must catch it.
+    const row = ctx.store.get("artifact", prod.artifactId) as Record<string, unknown>;
+    ctx.store.put("artifact", prod.artifactId, {
+      ...row,
+      sha256: "0".repeat(64),
+    }, Number(row.version));
     const spy = vi.spyOn(fs, "readFileSync");
     try {
       const r = (
@@ -2320,19 +2559,22 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
           assertDeliveryDeliverable(
             m: Record<string, unknown>,
             t: Record<string, unknown>,
+            e: Record<string, unknown>,
           ): { ok: boolean; violation?: Record<string, unknown> };
         }
       ).assertDeliveryDeliverable(
         {
           project_id: ctx.projectId,
+          mission_id: "M_Z4",
           metadata: {},
           goal: "viết báo cáo bằng tiếng việt",
         },
         task,
+        { execution_id: "E_Z4" },
       );
       expect(r.ok).toBe(false);
       expect(String(r.violation?.code)).toBe(
-        "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE",
+        "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
       );
       expect(readsOf(spy, fp)).toEqual([]);
     } finally {
@@ -2362,11 +2604,13 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
         assertDeliveryDeliverable(
           m: Record<string, unknown>,
           t: Record<string, unknown>,
+          e: Record<string, unknown>,
         ): { ok: boolean; violation?: Record<string, unknown> };
       }
     ).assertDeliveryDeliverable(
       { project_id: ctx.projectId, metadata: {}, goal: "write a report" },
       task,
+      { execution_id: "E_Z5" },
     );
     expect(r.ok).toBe(false);
     expect(String(r.violation?.code)).toBe(

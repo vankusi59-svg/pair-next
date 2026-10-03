@@ -153,6 +153,14 @@ export class ArtifactAuthority {
 
   /* ============================ public seams ============================ */
 
+  /** F4 — deterministic retained-CAS object path for a verified digest.
+   *  The blob name IS the digest, so the path alone grants no authority —
+   *  readers still re-verify bytes against the pinned sha256 before use
+   *  (delivery snapshot staging does exactly that). */
+  casBlobPath(sha256: string): string {
+    return path.join(this.opts.blobDir, sha256);
+  }
+
   /** The ONE canonical single-artifact ingest seam (F1 §4). All
    *  identities are resolved from durable PAIR state — a caller supplies
    *  only the claimed execution_id + producer_executor_id and the

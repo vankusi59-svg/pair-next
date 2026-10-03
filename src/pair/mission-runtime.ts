@@ -28,9 +28,14 @@
  * no task is silently reset and nothing is re-dispatched twice.
  */
 
-import fs from "node:fs";
+import path from "node:path";
 import { IntegrityError, PairError, PolicyError } from "./errors.js";
-import { digest, newId, utcnow } from "./canonical.js";
+import {
+  canonicalArtifactId,
+  digest,
+  newId,
+  utcnow,
+} from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 import type { GovernedTaskGate } from "./gate.js";
 import type { MissionRouter } from "./mission-router.js";
@@ -56,11 +61,9 @@ import {
   isRemoteCapabilityTask,
 } from "./artifact-handoff.js";
 import {
-  boundedFileSha256,
   materializeDeliveryTextPayload,
   MAX_TELEGRAM_FILE_BYTES,
   mintTelegramDeliveryRequest,
-  resolveDeliveryArtifactPath,
   SHA256_HEX_RE,
 } from "./telegram-delivery.js";
 import {
@@ -431,9 +434,9 @@ export class MissionRuntime {
 
   /** FILES-mode artifact identity pinning — durable runtime evidence on
    *  task.metadata.pair_delivery_artifact_digests (manifest name →
-   *  resolved path + SHA-256 at first dispatch). Pin-once: later
-   *  requestFor calls keep the original pin so a prep task's mutation
-   *  cannot re-baseline itself. */
+   *  canonical artifact binding + SHA-256 at first dispatch). Pin-once:
+   *  later requestFor calls keep the original pin so a prep task's
+   *  mutation cannot re-baseline itself. */
   private pinDeliveryArtifactDigests(
     mission: Record<string, unknown>,
     task: Record<string, unknown>,
@@ -446,35 +449,49 @@ export class MissionRuntime {
     }
     const md = (task.metadata as Record<string, unknown>) ?? {};
     if (md.pair_delivery_artifact_digests !== undefined) return;
-    const project = this.deps.service.getProject(String(mission.project_id));
-    const outboxDir = `${String(project.root_location)}/outbox`;
-    const workspace = String(
-      md.workspace ??
-        ((mission.metadata as Record<string, unknown>)
-          ?.authorized_workspaces as string[])?.[0] ??
-        String(project.root_location),
-    );
-    // R5.3 — stat-first pin: an oversized artifact is recorded with a
-    // PRECISE state (TOO_LARGE) — never a generic missing pin, never a
-    // full-file read merely to pin.
+    // F4.1 — the pin binds CANONICAL PROVENANCE, never a filename: each
+    // manifested artifact must resolve to the in-mission artifact row a
+    // legitimate earlier producer committed (execution → anchored PASS →
+    // ARTIFACT_ACCEPTED → CAS re-verified NOW). A same-name file in the
+    // shared outbox grants no authority; a manifest artifact without an
+    // in-mission producer fails closed BEFORE any executor spend.
     const digests: Record<
       string,
-      { path: string | null; sha256: string | null; state: string }
+      {
+        path: string | null;
+        sha256: string | null;
+        state: string;
+        artifact_id?: string;
+        producer_execution_id?: string;
+        logical_name?: string;
+      }
     > = {};
     for (const name of manifest.artifacts) {
-      const p = resolveDeliveryArtifactPath({ outboxDir, workspace, name });
-      let sha: string | null = null;
-      let state = "ABSENT";
-      if (p) {
-        const br = boundedFileSha256(p, MAX_TELEGRAM_FILE_BYTES);
-        if (br.kind === "ok") {
-          sha = br.sha256;
-          state = "PINNED";
-        } else if (br.kind === "too_large") {
-          state = "TOO_LARGE";
-        }
+      const hit = this.deps.service.artifactResolver.resolveDeliveryArtifact({
+        mission,
+        task,
+        name,
+      });
+      if (!hit) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
+          JSON.stringify({ artifact: name, reason: "no_in_mission_producer" }),
+        );
       }
-      digests[name] = { path: p, sha256: sha, state };
+      if (
+        Number(hit.artifact.byte_size) > MAX_TELEGRAM_FILE_BYTES
+      ) {
+        digests[name] = { path: null, sha256: null, state: "TOO_LARGE" };
+        continue;
+      }
+      digests[name] = {
+        path: null,
+        sha256: String(hit.artifact.sha256),
+        state: "PINNED",
+        artifact_id: String(hit.artifact.artifact_id),
+        producer_execution_id: String(hit.execution.execution_id),
+        logical_name: String(hit.artifact.logical_name),
+      };
     }
     this.deps.service.updateTask(String(task.task_id), {
       metadata: { ...md, pair_delivery_artifact_digests: digests },
@@ -486,15 +503,19 @@ export class MissionRuntime {
    * and the TELEGRAM_DELIVERY success mark, strictly before any
    * telegram_delivery_request (external send authority) is minted.
    *
-   *   FILES: every manifested artifact must resolve and be byte-identical
-   *   to the identity pinned at dispatch (`pair_delivery_artifact_digests`)
-   *   — a missing, fabricated, or mutated artifact fails closed. Textual
-   *   manifested deliverables additionally satisfy the canonical output
-   *   language (re-derived from the mission goal — never from task
-   *   metadata the executor could have written).
-   *   TEXT: the canonical payload artifact (outbox/report.txt) must
-   *   exist and satisfy the canonical language — the executor's "DONE"
-   *   is never the deliverable.
+   *   FILES: every manifested artifact must re-verify through the F1
+   *   canonical authority against the provenance binding pinned at
+   *   dispatch (`pair_delivery_artifact_digests`: artifact_id + producer
+   *   execution + sha256) — an in-mission artifact produced by a
+   *   legitimate predecessor, never a same-name file. Textual manifested
+   *   deliverables additionally satisfy the canonical output language
+   *   (re-derived from the mission goal — never from task metadata the
+   *   executor could have written).
+   *   TEXT: the canonical payload (outbox/report.txt) must be an
+   *   accepted in-mission artifact — produced by the CURRENT delivery
+   *   execution or an earlier governed producer; a stale same-name
+   *   outbox file grants zero authority. The executor's "DONE" is never
+   *   the deliverable.
    *
    * Violation → { ok:false, violation } → task FAILED + governed
    * recovery (ARTIFACT_VALIDATION_FAILURE), zero transport.
@@ -502,10 +523,14 @@ export class MissionRuntime {
   private assertDeliveryDeliverable(
     mission: Record<string, unknown>,
     task: Record<string, unknown>,
+    execution: Record<string, unknown>,
   ):
     | {
         ok: true;
         digests: Record<string, string>;
+        /** F4.3 — manifest name → retained CAS object path the bridge
+         *  stages verified bytes from (never the shared outbox). */
+        sources?: Record<string, string>;
         /** R1.1 — the ONE materialized+validated wire TEXT payload;
          *  mint stores it verbatim (VALIDATED === SENT). */
         textPayload?: string;
@@ -514,28 +539,10 @@ export class MissionRuntime {
     const manifest = deliveryManifest(task);
     if (!manifest) return { ok: true, digests: {} };
     const md = (task.metadata as Record<string, unknown>) ?? {};
-    const project = this.deps.service.getProject(String(mission.project_id));
-    const outboxDir = `${String(project.root_location)}/outbox`;
-    const workspace = String(
-      md.workspace ??
-        ((mission.metadata as Record<string, unknown>)
-          ?.authorized_workspaces as string[])?.[0] ??
-        String(project.root_location),
-    );
     // Language authority is re-derived from the effective operator goal —
     // a stamped metadata value can be tampered with, the goal cannot.
     const expectedLanguage =
       detectOutputLanguage(mission.goal).code ?? null;
-    const readBounded = (p: string): string => {
-      const fd = fs.openSync(p, "r");
-      try {
-        const buf = Buffer.alloc(256 * 1024);
-        const n = fs.readSync(fd, buf, 0, buf.length, 0);
-        return buf.subarray(0, n).toString("utf8");
-      } finally {
-        fs.closeSync(fd);
-      }
-    };
     const languageViolation = (
       artifact: string,
       text: string,
@@ -550,32 +557,74 @@ export class MissionRuntime {
       };
     };
     if (manifest.mode === "TEXT") {
-      const p = resolveDeliveryArtifactPath({
-        outboxDir,
-        workspace,
-        name: DELIVERY_TEXT_ARTIFACT,
-      });
-      if (!p) {
+      // F4.4 — the payload must be CANONICAL in-mission authority:
+      // (a) an artifact the CURRENT delivery execution produced and got
+      // accepted (executor declared the staged payload → validator
+      // ingest → row bound to this execution), or (b) an earlier
+      // in-mission producer's canonical artifact under the governed
+      // producer contract. A stale same-name file sitting in the shared
+      // outbox — valid language, valid sha, unchanged bytes — grants
+      // ZERO authority and is never consulted.
+      let resolved: { artifact: Record<string, unknown>; bytes: Buffer } | null =
+        null;
+      const names = [
+        DELIVERY_TEXT_ARTIFACT,
+        path.posix.basename(DELIVERY_TEXT_ARTIFACT),
+      ];
+      // (a) the delivery execution's own artifact, by deterministic id.
+      for (const name of names) {
+        const id = canonicalArtifactId(String(execution.execution_id), name);
+        if (!this.store.tryGet("artifact", id)) continue;
+        try {
+          resolved = this.deps.service.artifacts.readForConsumption(id, {
+            execution_id: String(execution.execution_id),
+            mission_id: String(mission.mission_id),
+            governed_task_id: String(execution.governed_task_id),
+            producer_executor_id: String(execution.executor_id),
+            logical_name: name,
+          });
+          break;
+        } catch {
+          resolved = null;
+        }
+      }
+      // (b) an earlier in-mission producer's canonical artifact.
+      if (!resolved) {
+        const hit = this.deps.service.artifactResolver.resolveDeliveryArtifact({
+          mission,
+          task,
+          name: DELIVERY_TEXT_ARTIFACT,
+        });
+        if (hit) {
+          try {
+            resolved = this.deps.service.artifacts.readForConsumption(
+              String(hit.artifact.artifact_id),
+              {
+                execution_id: String(hit.execution.execution_id),
+                mission_id: String(mission.mission_id),
+                governed_task_id: String(hit.execution.governed_task_id),
+                producer_executor_id: String(hit.execution.executor_id),
+                logical_name: String(hit.artifact.logical_name),
+                sha256: String(hit.artifact.sha256),
+                byte_size: Number(hit.artifact.byte_size),
+              },
+            );
+          } catch {
+            resolved = null;
+          }
+        }
+      }
+      if (!resolved) {
         return {
           ok: false,
           violation: {
-            code: "FAIL_CLOSED_DELIVERY_TEXT_PAYLOAD_MISSING",
+            code: "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
             artifact: DELIVERY_TEXT_ARTIFACT,
+            reason: "no_current_execution_or_in_mission_producer",
           },
         };
       }
-      let raw = "";
-      try {
-        raw = readBounded(p);
-      } catch {
-        return {
-          ok: false,
-          violation: {
-            code: "FAIL_CLOSED_DELIVERY_TEXT_PAYLOAD_MISSING",
-            artifact: DELIVERY_TEXT_ARTIFACT,
-          },
-        };
-      }
+      const raw = resolved.bytes.toString("utf8");
       // R1.1 — ONE materialization: the exact wire payload is derived
       // once with the canonical rules (trim + MAX_TEXT_BYTES) and the
       // language gate validates THAT string — never the untruncated
@@ -597,13 +646,23 @@ export class MissionRuntime {
       if (bad) return { ok: false, violation: bad };
       return { ok: true, digests: {}, textPayload };
     }
-    // FILES — R1.2 mandatory digest authority: dispatch pin exists AND
-    // pin.sha256 is a valid digest AND pre-mint hash == pin. A
-    // pre-contract execution reaching settle with NO pin fails closed
-    // (governed recovery/replan) — it must NEVER silently re-baseline
-    // against current bytes.
+    // FILES — F4.1 canonical provenance authority: the dispatch pin must
+    // carry the in-mission artifact binding (artifact_id + producer
+    // execution + pinned sha). Settle RE-VERIFIES that binding through
+    // the F1 authority NOW — the outbox file is never consulted; the
+    // digest mint passes is the canonical row's sha, and the bytes the
+    // bridge sends come from retained CAS storage.
     const pinned = md.pair_delivery_artifact_digests as
-      | Record<string, { sha256?: string | null; state?: string }>
+      | Record<
+          string,
+          {
+            sha256?: string | null;
+            state?: string;
+            artifact_id?: string;
+            producer_execution_id?: string;
+            logical_name?: string;
+          }
+        >
       | undefined;
     const pinMissing = (
       name: string,
@@ -625,6 +684,8 @@ export class MissionRuntime {
       };
     }
     const digests: Record<string, string> = {};
+    const sources: Record<string, string> = {};
+    const languageBytes: Record<string, Buffer> = {};
     for (const name of manifest.artifacts) {
       const before = pinned[name];
       if (
@@ -637,32 +698,48 @@ export class MissionRuntime {
           violation: pinMissing(name, before?.state),
         };
       }
-      const p = resolveDeliveryArtifactPath({ outboxDir, workspace, name });
-      if (!p) {
+      const artifactId = String(before.artifact_id ?? "");
+      const producerExec = String(before.producer_execution_id ?? "");
+      if (!artifactId || !producerExec) {
+        // A pin without canonical provenance (pre-F4 minted or tampered)
+        // grants no authority — never fall back to name-based bytes.
         return {
           ok: false,
           violation: {
-            code: "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED",
+            code: "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
             artifact: name,
+            reason: "pin_without_canonical_binding",
           },
         };
       }
-      // R5.4 — stat-first settle: an artifact grown beyond the bound
-      // converges to TOO_LARGE without any full-file read.
-      const br = boundedFileSha256(p, MAX_TELEGRAM_FILE_BYTES);
-      if (br.kind !== "ok") {
+      let artifact: Record<string, unknown>;
+      let bytes: Buffer;
+      try {
+        const hit = this.deps.service.artifacts.readForConsumption(
+          artifactId,
+          {
+            execution_id: producerExec,
+            mission_id: String(mission.mission_id),
+            logical_name:
+              typeof before.logical_name === "string"
+                ? before.logical_name
+                : undefined,
+            sha256: before.sha256,
+          },
+        );
+        artifact = hit.artifact;
+        bytes = hit.bytes;
+      } catch {
         return {
           ok: false,
           violation: {
-            code:
-              br.kind === "too_large"
-                ? "FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE"
-                : "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED",
+            code: "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
             artifact: name,
+            reason: "canonical_reverify_failed",
           },
         };
       }
-      const sha = br.sha256;
+      const sha = String(artifact.sha256);
       if (before.sha256 !== sha) {
         return {
           ok: false,
@@ -675,18 +752,21 @@ export class MissionRuntime {
         };
       }
       digests[name] = sha;
+      // F4.3 — the bridge's byte source is the retained CAS object, not
+      // anything in the shared outbox/workspace. The path is stamped
+      // onto the request at mint; the projection re-verifies its sha
+      // before staging it into the request-owned snapshot.
+      sources[name] = this.deps.service.artifacts.casBlobPath(sha);
+      languageBytes[name] = bytes;
+    }
+    for (const name of manifest.artifacts) {
       if (expectedLanguage && isTextDeliverableName(name)) {
-        let content = "";
-        try {
-          content = readBounded(p);
-        } catch {
-          content = "";
-        }
+        const content = (languageBytes[name] ?? Buffer.alloc(0)).toString("utf8");
         const bad = languageViolation(name, content);
         if (bad) return { ok: false, violation: bad };
       }
     }
-    return { ok: true, digests };
+    return { ok: true, digests, sources };
   }
 
   /** Governed dependency handoff: completed dep executions' canonical results. */
@@ -1132,6 +1212,7 @@ export class MissionRuntime {
         const settledTask = this.store.get("task", taskId);
         const caps = (settledTask.required_capabilities as string[]) ?? [];
         let artifactSha256: Record<string, string> | undefined;
+        let artifactSources: Record<string, string> | undefined;
         let textPayload: string | undefined;
         if (caps.includes("TELEGRAM_DELIVERY")) {
           // Output/delivery contract gate — strictly BEFORE the success
@@ -1146,6 +1227,7 @@ export class MissionRuntime {
           const check = this.assertDeliveryDeliverable(
             this.deps.service.getMission(missionId),
             settledTask,
+            collected,
           );
           if (!check.ok) {
             this.store.appendEvidence(
@@ -1176,6 +1258,7 @@ export class MissionRuntime {
             return;
           }
           artifactSha256 = check.digests;
+          artifactSources = check.sources;
           textPayload = check.textPayload;
         }
         this.deps.service.updateTask(taskId, {
@@ -1217,6 +1300,7 @@ export class MissionRuntime {
             defaultChatId: this.deps.telegramDeliveryDefaultChatId,
             maxAttempts: this.deps.telegramDeliveryMaxAttempts,
             artifactSha256,
+            artifactSources,
             textPayload,
           });
         }

@@ -30,6 +30,8 @@ import {
   GovernedTaskGate,
   IntegrityError,
   MissionControl,
+  mintArtifactCapability,
+  sha256Hex,
   MissionObservability,
   MissionRouter,
   MissionRuntime,
@@ -65,6 +67,7 @@ import {
   deliveryManifest,
   createPlanPreview as persistPlanPreviewRow,
   TRANSPORT_IN_PROCESS,
+  compatOutboxBasename,
   utcnow,
   makeNonReentrant,
 } from "../pair/index.js";
@@ -145,10 +148,15 @@ const TEXT_INTENT: TelegramDeliveryIntent = {
   mode: "TEXT",
 };
 
-const remoteTask = (key = "T2", deps: string[] = ["T1"]) => ({
+const remoteTask = (key = "T2", deps: string[] = ["T1"], produces: string[] = []) => ({
   task_key: key,
   title: "remote research",
-  task_instruction: "research mql5 ea trends remotely, return findings, then reply DONE.",
+  // F4.2 — a remote task produces only through an EXPLICIT declared
+  // produce edge (the bounded instruction grammar, or the canonical
+  // artifact contract), never by mere precedence.
+  task_instruction: produces.length
+    ? `research remotely, then write ${produces.join(" and ")}, then reply DONE.`
+    : "research mql5 ea trends remotely, return findings, then reply DONE.",
   required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION"],
   depends_on: deps,
   metadata: {},
@@ -170,6 +178,20 @@ class ScriptedAdapter implements ExecutorAdapter {
   /** SLOW behavior: executions stay RUNNING for N observe() polls. */
   holdTicks = 2;
   private holds: Record<string, number> = {};
+  /** execution_id → workspace-relative files the execution actually
+   *  wrote — declared in collect_result like the production finish()
+   *  workspace-diff contract. */
+  private wrote: Record<string, string[]> = {};
+  private recordWrite(eid: string, f: string) {
+    (this.wrote[eid] ??= []).push(f);
+  }
+  /** Remote-capability tasks never write workspace files — their
+   *  artifacts land only through the capability-bound upload lane. */
+  private isRemote(taskRow: Record<string, unknown> | null | undefined) {
+    return ((taskRow?.required_capabilities as string[]) ?? []).includes(
+      "REMOTE_CLOUD_TASK_EXECUTION",
+    );
+  }
 
   constructor(id: string, caps: string[]) {
     this.executor_id = id;
@@ -196,7 +218,7 @@ class ScriptedAdapter implements ExecutorAdapter {
     const b = this.behavior[key] ?? "COMPLETE";
     let status = "COMPLETED";
     let error: Record<string, unknown> | undefined;
-    if (b === "WRITE" && this.workspace) {
+    if (b === "WRITE" && this.workspace && !this.isRemote(taskRow)) {
       // Producer honors its canonical contract on disk.
       const df = (
         (taskRow?.metadata as Record<string, unknown> | undefined)
@@ -206,6 +228,7 @@ class ScriptedAdapter implements ExecutorAdapter {
         const fp = path.join(this.workspace, f);
         fs.mkdirSync(path.dirname(fp), { recursive: true });
         fs.writeFileSync(fp, `content of ${f}`);
+        this.recordWrite(eid, f);
       }
     }
     if (b === "GATED") {
@@ -298,10 +321,11 @@ class ScriptedAdapter implements ExecutorAdapter {
             ?.pair_dataflow as Record<string, unknown> | undefined
         );
         for (const f of (df?.produces as string[]) ?? []) {
-          if (this.workspace && this.behavior[String(taskRow?.task_key)] === "SLOW") {
+          if (this.workspace && !this.isRemote(taskRow) && this.behavior[String(taskRow?.task_key)] === "SLOW") {
             const fp = path.join(this.workspace, f);
             fs.mkdirSync(path.dirname(fp), { recursive: true });
             fs.writeFileSync(fp, `content of ${f}`);
+            this.recordWrite(executionId, f);
           }
         }
         this.collected[executionId] = {
@@ -320,7 +344,15 @@ class ScriptedAdapter implements ExecutorAdapter {
     // Canonical WorkerResult carries the full PAIR identity — merge the
     // execution id the same way production adapters bind it.
     const r = this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
-    return { execution_id: executionId, artifacts: [], ...r };
+    const artifacts = (this.wrote[executionId] ?? [])
+      .map((f) => {
+        const fp = path.join(this.workspace, f);
+        if (!fs.existsSync(fp)) return null;
+        const bytes = fs.readFileSync(fp);
+        return { path: f, sha256: sha256Hex(bytes), byte_size: bytes.length };
+      })
+      .filter((a): a is NonNullable<typeof a> => a !== null);
+    return { execution_id: executionId, artifacts, ...r };
   }
   collect_artifacts() {
     return [];
@@ -1167,7 +1199,7 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
     const plan = reconcilePlanDataflow(
       [
         goalTask("T1"),
-        remoteTask("T2", ["T1"]),
+        remoteTask("T2", ["T1"], ["chart.png"]),
         deliveryTask("T3", [], "chart.png"),
       ],
       {
@@ -1175,8 +1207,8 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
         outputLanguage: detectOutputLanguage("research remotely and send chart.png to telegram"),
       },
     ).tasks;
-    // Delivery binds the remote producer as PAIR_OUTBOX_UPLOAD — never
-    // a local artifact guess.
+    // Delivery binds the remote producer through its DECLARED produce
+    // edge — never a local artifact guess.
     const t3 = plan.find((x) => x.task_key === "T3")!;
     expect(t3.depends_on).toEqual(["T2"]);
     const m = ctx.control.startMission({
@@ -1198,14 +1230,46 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
     for (let i = 0; i < 8 && execsOf(ctx, mid).filter((e) => e.task_id === t2r.task_id).length === 0; i++) {
       tick();
     }
-    // The remote upload lands while its producer is still RUNNING.
-    fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
-    fs.writeFileSync(path.join(ctx.workspace, "outbox/TSK_x-chart.png"), "png");
+    // The remote upload lands while its producer is still RUNNING —
+    // through the canonical capability-bound ingest lane (F1/F2), which
+    // is the only authority a remote artifact has under F4.
+    const t2Exec = execsOf(ctx, mid).find(
+      (e) => e.task_id === t2r.task_id,
+    )!;
+    const t2Gov = ctx.store
+      .list("governed_task")
+      .find((g) => g.task_id === t2r.task_id)!;
+    const cap = mintArtifactCapability("MASTER", {
+      mission_id: mid,
+      task_id: t2r.task_id,
+      governed_task_id: String(t2Gov.governed_task_id),
+      execution_id: String(t2Exec.execution_id),
+      executor_id: "EX_R",
+    });
+    const acceptance = ctx.control.acceptArtifactUpload("MASTER", cap, {
+      filename: "chart.png",
+      mission_id: mid,
+      task_id: t2r.task_id,
+      bytes: Buffer.from("png"),
+    });
+    // The upload endpoint also materializes the compat staging file —
+    // storage only, resolved by the pre-dispatch presence check; send
+    // authority stays canonical (artifact_id-bound pin → CAS bytes).
+    const art = acceptance.artifact as Record<string, unknown>;
+    const taskPrefix = String(art.task_id).replace(/[^\w.\-]/g, "_").slice(-40);
+    const frag = String(art.artifact_id).replace(/^ART_/, "").slice(0, 16);
+    const fname = compatOutboxBasename(String(art.logical_name ?? "file"));
+    const obDir = path.join(ctx.workspace, "outbox");
+    fs.mkdirSync(obDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(obDir, `${taskPrefix}-${frag}-${fname}`),
+      Buffer.from("png"),
+    );
     expect(await bridgeSend(ctx)).toEqual([]); // upload ≠ send authority
     const state = drive(ctx, mid);
     expect(state).toBe("COMPLETED");
-    // After completion the manifested artifact resolves via the unique
-    // remote-upload prefix and sends exactly once.
+    // After completion the manifested artifact resolves to the remote
+    // producer's canonical artifact and sends exactly once.
     expect(await bridgeSend(ctx)).toEqual(["chart.png"]);
     expect(await bridgeSend(ctx)).toEqual([]);
   });
@@ -2205,6 +2269,7 @@ function mintFilesRequest(
   const outbox = path.join(ctx.workspace, "outbox");
   fs.mkdirSync(outbox, { recursive: true });
   const artifactSha256: Record<string, string> = {};
+  const artifactSources: Record<string, string> = {};
   for (const name of names) {
     if (opts.create === false) {
       artifactSha256[name] = digest(`unproduced:${name}`);
@@ -2213,6 +2278,9 @@ function mintFilesRequest(
     const content = name === "b.txt" ? "B" : "A";
     fs.writeFileSync(path.join(outbox, path.basename(name)), content);
     artifactSha256[name] = sha256File(path.join(outbox, path.basename(name)));
+    // F4.3 — stamped byte source (the outbox path stands in for the
+    // CAS path here since the fixture never ingests).
+    artifactSources[name] = path.join(outbox, path.basename(name));
   }
   const req = mintTelegramDeliveryRequest({
     store: ctx.store,
@@ -2231,6 +2299,7 @@ function mintFilesRequest(
     now: utcnow(),
     defaultChatId: "111",
     artifactSha256,
+    artifactSources,
   });
   expect(req).toBeTruthy();
   return req as Record<string, unknown>;

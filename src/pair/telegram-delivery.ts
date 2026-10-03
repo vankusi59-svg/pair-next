@@ -111,6 +111,11 @@ export interface DeliverySlot {
    *  re-verifies it — a file mutated after minting fails closed with
    *  FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST, zero network call. */
   sha256?: string;
+  /** FILES only (F4): retained CAS object path stamped at mint — the
+   *  canonical bytes for `sha256` live here, NOT in the shared outbox.
+   *  The projection stages verified bytes from this path only; a slot
+   *  minted without it has no canonical byte source. */
+  source_path?: string;
 }
 
 export interface TelegramDeliveryRequestPayload {
@@ -303,6 +308,11 @@ export function mintTelegramDeliveryRequest(args: {
    *  manifest name must map to a valid SHA-256; a missing/incomplete/
    *  malformed map mints nothing (no hash → no authority). */
   artifactSha256?: Record<string, string>;
+  /** FILES: manifest name → retained CAS object path the canonical
+   *  bytes for `artifactSha256[name]` live at (stamped at mint by the
+   *  caller that verified them — the projection stages from THIS path
+   *  and re-proves its digest, never the shared outbox). */
+  artifactSources?: Record<string, string>;
   /** TEXT: the exact wire payload materialized and validated at the
    *  delivery-contract gate — mint stores it verbatim and NEVER
    *  re-reads the source file (R1.1: VALIDATED PAYLOAD === TDR
@@ -346,7 +356,12 @@ export function mintTelegramDeliveryRequest(args: {
     attempt_count: 0,
     max_attempts: maxAttempts,
     ...(manifest.mode === "FILES"
-      ? { sha256: String(args.artifactSha256?.[name]) }
+      ? {
+          sha256: String(args.artifactSha256?.[name]),
+          ...(typeof args.artifactSources?.[name] === "string"
+            ? { source_path: args.artifactSources[name] }
+            : {}),
+        }
       : {}),
   }));
   let text: string | null = null;
@@ -939,11 +954,15 @@ export function pendingTelegramDeliveries(
         } catch {
           /* best effort */
         }
-        const p = resolveDeliveryArtifactPath({
-          outboxDir: String(req.outbox_dir),
-          workspace: req.workspace ? String(req.workspace) : undefined,
-          name: String(a.name),
-        });
+        // F4.3 — the ONE canonical byte source is the CAS object path
+        // stamped at mint (the bytes the delivery-contract gate verified
+        // live there). The shared outbox is staging/transport, NEVER
+        // authority: a stale same-name file cannot be selected, cannot
+        // shadow the canonical artifact, and is never opened.
+        const p =
+          typeof a.source_path === "string" && a.source_path.length
+            ? a.source_path
+            : null;
         if (!p) {
           a.state = "FAILED_DELIVERY";
           a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
