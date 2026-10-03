@@ -249,6 +249,7 @@ function mkGovernedConsumer(
 ) {
   const gtId = `GT_${consumer.tid}`;
   const executor = opts.remote ? EX_REMOTE : EX;
+  const depDigest = artifactDependencySetDigest(entries);
   ctx.store.put(
     "governed_task",
     gtId,
@@ -264,11 +265,29 @@ function mkGovernedConsumer(
       governance_state: "DISPATCH_AUTHORIZED",
       dispatch_enabled: true,
       dependency_artifacts: entries,
+      dependency_artifacts_digest: depDigest,
       created_at: utcnow(),
       version: 0,
     },
     0,
   );
+  // Production order (gate.createGovernedTaskContinuation): the governed
+  // row + dep-set digest is pinned, then the immutable VALIDATED event
+  // records that same digest — the dep_set_history anchor.
+  ctx.store.event({
+    entity_type: "governed_task",
+    entity_id: gtId,
+    event_type: "GOVERNED_TASK_VALIDATED",
+    new_state: "VALIDATED",
+    actor: "PAIR_GOVERNED_TASK_GATE",
+    correlation_id: `COR_${consumer.tid}`,
+    metadata: {
+      mission_id: ctx.missionId,
+      task_id: consumer.tid,
+      executor_id: executor,
+      dependency_artifacts_digest: depDigest,
+    },
+  });
   let eid: string | null = null;
   if (opts.execState !== undefined && opts.execState !== null) {
     eid = workerExecutionId(executor, gtId);

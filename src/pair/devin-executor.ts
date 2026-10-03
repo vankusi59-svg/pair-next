@@ -30,6 +30,7 @@ import { mintArtifactCapability } from "./artifact-capability.js";
 import {
   artifactDependencySetDigest,
   mintArtifactConsumeCapability,
+  artifactConsumeCapabilityMasterFromEnv,
 } from "./artifact-consume-capability.js";
 import type { DependencyArtifactEntry } from "./artifact-handoff.js";
 import type { ExecutorAdapter } from "./adapter.js";
@@ -318,8 +319,10 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     // minted execution-scoped capability (never the master itself) — the
     // upload lands as a canonical ART_* row. The generic outbox token path
     // remains legacy storage-only compatibility.
-    const artifactMaster =
-      process.env.PAIR_ARTIFACT_UPLOAD_TOKEN || process.env.PAIR_BROKER_TOKEN;
+    // R1.5 — ONE canonical master resolution seam shared with the
+    // server's consume-fetch lane: PAIR_ARTIFACT_UPLOAD_TOKEN then
+    // PAIR_BROKER_TOKEN (PAIR_OUTBOX_TOKEN is never artifact authority).
+    const artifactMaster = artifactConsumeCapabilityMasterFromEnv();
     if (outboxUrl && artifactMaster) {
       const executionId = workerExecutionId(this.executor_id, String(task.governed_task_id));
       const cap = mintArtifactCapability(artifactMaster, {
@@ -359,13 +362,35 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       const items = depArts
         .map(
           (e) =>
-            `  - ${e.logical_name} → .pair/dependency-artifacts/${e.artifact_id}/${e.logical_name} (sha256:${e.sha256}, ${e.byte_size} bytes)`,
+            `  - ${e.logical_name} → .pair/dependency-artifacts/${e.artifact_id}/${e.logical_name} (sha256:${e.sha256}, byte_size:${e.byte_size}, artifact_id:${e.artifact_id})`,
         )
         .join("\n");
+      // R1.6 — bounded-retry fetch protocol: the exec row may not be
+      // durable yet when the remote worker first fetches (publication
+      // race) — retry inside a strict finite loop, verify with a REAL
+      // digest tool + exact byte size, quarantine a bad file, and STOP
+      // after the ceiling. No unbounded retries, no host paths.
+      const fetchOne = (e: DependencyArtifactEntry): string => {
+        const target = `.pair/dependency-artifacts/${e.artifact_id}/${e.logical_name}`;
+        return (
+          `mkdir -p "$(dirname '${target}')" && ok=0; ` +
+          `for i in 1 2 3 4 5; do ` +
+          `if curl -sf -X POST "${fetchBase}/api/artifacts/fetch" ` +
+          `-H "x-artifact-consume-capability: ${consume}" ` +
+          `-H "content-type: application/json" ` +
+          `-d '{"artifact_id":"${e.artifact_id}"}' -o '${target}' ` +
+          `&& [ "$(sha256sum '${target}' | cut -d' ' -f1)" = '${e.sha256}' ] ` +
+          `&& [ "$(wc -c < '${target}' | tr -d ' ')" = '${e.byte_size}' ]; then ok=1; break; fi; ` +
+          `sleep "$((i * 2))"; done; ` +
+          `[ "$ok" = 1 ] || { rm -f '${target}'; echo "DEPENDENCY_FETCH_FAILED ${e.artifact_id}"; }`
+        );
+      };
       lines.push(
         "Dependency artifacts: PAIR pinned canonical input artifacts for this task. Fetch each into the workspace at the listed relative path BEFORE starting work:\n" +
           items +
-          `\nFetch command per artifact: curl -sf -X POST "${fetchBase}/api/artifacts/fetch" -H "x-artifact-consume-capability: ${consume}" -H "content-type: application/json" -d '{"artifact_id":"<ARTIFACT_ID>"}' -o <target path>; then verify: printf of the file's sha256 must equal the listed sha256 and size must equal byte_size. If a fetch fails or digest mismatches, STOP and report — never substitute your own content.`,
+          `\nFor EACH listed artifact run exactly this bounded recipe (the first fetch may briefly return 403/404 while the execution publishes — the loop's 5 attempts with growing sleeps cover only that window, never retry forever):\n` +
+          depArts.map((e) => fetchOne(e)).join("\n") +
+          `\nIf the digest or byte size never verifies, or a fetch still fails after the bounded retries, the recipe removes the file and prints DEPENDENCY_FETCH_FAILED: STOP and report — never substitute your own content.`,
       );
     }
     // Credential broker: when a service needs a login/token, the agent pulls

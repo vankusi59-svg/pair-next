@@ -218,3 +218,118 @@ Remaining technical debt (unchanged): the two env-only P5
 `b903cb4`); remote fetch end-to-end is proven through the production control
 seam (`fetchArtifactForConsumption`) — the HTTP route wrapper is a thin map
 verified by route-level coverage elsewhere.
+
+---
+
+# R1 REMEDIATION ROUND (source-review re-audit)
+
+HEAD after R1: appended commit on the same PR #32.
+
+## R1.1 — consumption consumes F1 history authority
+
+`verifyForExecution` and consumption now share ONE seam,
+`verifyAcceptedArtifact(artifactId, execution)` — immutable
+`ARTIFACT_ACCEPTED` facts ↔ current row ↔ producer durable identity ↔
+storage contract ↔ retained CAS bytes re-verified NOW. A row coherently
+rewritten to different (still CAS-valid) bytes fails on `sha256`/`byte_size`
+history; a row without acceptance history fails `no_acceptance_history`.
+`verifyArtifactForConsumption` + `readForConsumption` take an EXPECTED
+producer binding (execution/task/governed/executor/sha256/byte_size/
+logical_name) from the already-pinned contract — the mutable row is never
+consulted for what to trust. Restart preserves the binding (durable events).
+
+## R1.2 — RESULT_VALIDATED anchor required for PASS
+
+`ArtifactDependencyResolver` no longer accepts merely a terminal-looking
+validation row: PASS requires a durable `RESULT_VALIDATED` event on the
+`executor_execution` entity whose `correlation_id` matches and whose
+`metadata.validation_id` equals the durable validation row id. Missing
+event / wrong validation_id / wrong correlation / foreign-scope event →
+`not_consumable` → `FAIL_CLOSED_DEPENDENCY_RESOLUTION`.
+
+## R1.3 — parent-component containment + verify-pin-before-write
+
+`materializeForConsumer` resolves the pinned destination's parent via
+realpath and requires containment inside the dependency root BEFORE any
+byte lands (a swapped parent symlink redirects zero bytes), then
+re-verifies the pin contract (sha256 + byte_size against the authority)
+before the write — bytes that fail the pin write zero bytes. Converge /
+different-bytes preservation unchanged; the materialized file is
+re-hashed and byte-counted after rename.
+
+## R1.4 — immutable handoff binding + approval scope
+
+The governed task row now carries `dependency_artifacts_digest`
+(sha256 over the canonical dep-set projection) and
+`GOVERNED_TASK_VALIDATED` events record it; `recordApproval` binds the
+approval scope to that digest — an approval granted for dep-set A does
+NOT authorize dep-set B. Handoff entities use the canonical
+`handoff_binding_digest` (artifact + pin + consumer identity) as their
+deterministic id, so a tampered pin is a different binding, not the same
+row mutated.
+
+## R1.5 — one canonical consume-master resolution
+
+`/api/artifacts/fetch` resolves the consume authority through ONE seam:
+`x-artifact-capability` (artifact token) preferred, broker token
+fallback, the legacy `x-artifact-upload-token`/outbox token NEVER
+accepted as consume authority, neither → fetch lane disabled (404).
+Covered by real HTTP route tests against the production server.
+
+## R1.6 — remote fetch bootstrap recipe
+
+The governed prompt's REMOTE DEPENDENCY FETCH recipe now: creates the
+parent dir, retries the bounded `for i in 1 2 3 4 5` loop with backoff,
+verifies the download with real `sha256sum` + `wc -c` against the pin,
+quarantines on mismatch (`mv` to `.quarantine`), writes ASCII-safe curl
+headers (no raw token interpolation beyond the ASCII env), and on
+unrecoverable failure emits `DEPENDENCY_FETCH_FAILED` + STOP — never a
+silent partial.
+
+## R1.7 — production-path E2E
+
+`R1.7 G` runs the REAL pipeline: `MissionRuntime` + `PairControlPlane` +
+`createMissionControlServer` on real HTTP in a SEPARATE spawned worker
+process sharing the same `pair.db` (WAL multi-process). Remote adapter
+dispatches with the verbatim governed prompt, performs real
+pre-execution fetches (403 `execution_unknown` — dispatch precedes exec
+persistence, exactly production), real RUNNING fetch 200, uploads via
+`acap1`; local consumer reads the exact pinned materialized bytes at
+dispatch. Covered: remote producer→local consumer, remote consumer fetch
+lifecycle incl. pre-exec rejection + bounded retry, restart between
+producer PASS and consumer dispatch (new store/runtime/adapter instances
+re-derive everything from durable state — no in-memory carry-over, no
+duplicate dispatch), and a remote non-leaf DAG edge flowing over real
+HTTP.
+
+## R1 mandatory tests
+
+`src/__tests__/pair-f2-r1-remediation.test.ts` — 43 tests:
+
+| Describe | Coverage |
+|---|---|
+| A (R1.1) | A1–A7: expected-binding consume, row rewrite→reject, CAS tamper→reject, storage rewrite→reject, malformed/conflicting history→reject, restart binding |
+| B (R1.2) | B1–B7: PASS requires RESULT_VALIDATED anchor — no validation / no event / wrong validation_id / wrong correlation / foreign scope / tampered event all reject; intact PASS consumable |
+| C (R1.3) | C1–C8: parent-symlink swap → zero bytes outside workspace; converge/different-bytes; sha/size pin re-verify before write; nested containment; collision names |
+| D (R1.4) | D1–D8: digest persisted on governed + VALIDATED event; tampered dep-set/digest → not dispatch-authorized; approval for set A does not authorize set B; handoff id binding-digest derived |
+| E (R1.5) | E1–E5: token-preferred, broker-fallback, outbox-token-never-authority, neither→disabled, body bound — over the real HTTP route |
+| F (R1.6) | F1–F4: prompt carries bounded retry loop, mkdir, sha256sum+wc -c verification, quarantine+STOP, ASCII-safe headers |
+| G (R1.7) | G1–G4: real-runtime + real-HTTP E2E matrix incl. restart and remote non-leaf DAG |
+
+## R1 gates
+
+| Gate | Result |
+|---|---|
+| R1 suite | 43/43 |
+| F2 contract suite | 53/53 |
+| F1 authority + R1 + R2–R7 remediation files | 20 + 25 + 95 |
+| Dataflow incident + output-delivery contract | 106 + 69 |
+| `rm -rf dist` → READY+GO true multi-process races | PASS on current source |
+| Full suite on FINAL R1 HEAD | 3047 pass / 2 fail — only the known env-only P5 `stockProbe.available` failures (reproduce on base `b903cb4`) |
+| `npx tsc --noEmit` | PASS |
+| `pnpm build` | PASS |
+| `pnpm audit --audit-level=high` | PASS — 0 high |
+
+Classification:
+
+`PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_R1_PENDING_SOURCE_REVIEW`

@@ -104,6 +104,55 @@ export function dependencyConsumerPath(
   return `${DEPENDENCY_ARTIFACT_ROOT}/${artifactId}/${logicalName}`;
 }
 
+/**
+ * F2 R1.4 — digest over EVERY immutable handoff field. The
+ * ARTIFACT_HANDOFF_PINNED event carries it; verification recomputes it
+ * from the current row and requires BOTH the row's stored digest AND the
+ * immutable event anchor to agree — a coherent rewrite of the handoff
+ * row (or of the governed row + handoff together) never re-derives the
+ * originally pinned digest.
+ */
+export function handoffBindingDigest(input: {
+  handoff_id: string;
+  contract: string;
+  mode: string;
+  mission_id: string;
+  artifact_id: string;
+  producer_task_id: string;
+  producer_governed_task_id: string;
+  producer_execution_id: string;
+  producer_executor_id: string;
+  consumer_task_id: string;
+  consumer_governed_task_id: string;
+  consumer_executor_id: string;
+  logical_name: string;
+  sha256: string;
+  byte_size: number;
+  consumer_relative_path: string;
+}): string {
+  return digest({
+    contract: "pair-artifact-handoff-binding.v1",
+    fields: {
+      handoff_id: input.handoff_id,
+      contract: input.contract,
+      mode: input.mode,
+      mission_id: input.mission_id,
+      artifact_id: input.artifact_id,
+      producer_task_id: input.producer_task_id,
+      producer_governed_task_id: input.producer_governed_task_id,
+      producer_execution_id: input.producer_execution_id,
+      producer_executor_id: input.producer_executor_id,
+      consumer_task_id: input.consumer_task_id,
+      consumer_governed_task_id: input.consumer_governed_task_id,
+      consumer_executor_id: input.consumer_executor_id,
+      logical_name: input.logical_name,
+      sha256: input.sha256,
+      byte_size: input.byte_size,
+      consumer_relative_path: input.consumer_relative_path,
+    },
+  });
+}
+
 export function canonicalHandoffId(
   consumerGovernedTaskId: string,
   artifactId: string,
@@ -363,7 +412,11 @@ export class ArtifactDependencyResolver {
           String(e.mission_id) === missionId &&
           String(e.task_id) === String(producer.task_id) &&
           Number(e.plan_revision) === planRevision &&
-          String(e.execution_state) === "COMPLETED",
+          String(e.execution_state) === "COMPLETED" &&
+          String(
+            (e.result as Record<string, unknown> | undefined)?.status ?? "",
+          ) === "COMPLETED" &&
+          !!e.correlation_id,
       )
       .sort((a, b) =>
         String(b.dispatch_timestamp ?? "").localeCompare(
@@ -372,13 +425,37 @@ export class ArtifactDependencyResolver {
       );
     const validations = this.store.list("execution_validation");
     for (const exec of executions) {
-      const pass = validations
-        .filter(
-          (v) =>
-            String(v.execution_id) === String(exec.execution_id) &&
-            String(v.status) === "PASS",
-        )
-        .pop();
+      // R1.2 — a PASS row alone is never authority: the immutable
+      // RESULT_VALIDATED event must anchor THAT exact validation_id
+      // under the execution's correlation. PASS without the anchor is
+      // not consumable; contradictory anchored PASSes fail closed.
+      const execEvents = this.store.listEvents(
+        "executor_execution",
+        String(exec.execution_id),
+      );
+      const anchored = validations.filter(
+        (v) =>
+          String(v.execution_id) === String(exec.execution_id) &&
+          String(v.status) === "PASS" &&
+          execEvents.some(
+            (ev) =>
+              String(ev.event_type) === "RESULT_VALIDATED" &&
+              String(ev.new_state) === "PASS" &&
+              String(ev.correlation_id ?? "") ===
+                String(exec.correlation_id ?? "") &&
+              String(
+                (ev.metadata as Record<string, unknown> | undefined)
+                  ?.validation_id ?? "",
+              ) === String(v.validation_id ?? ""),
+          ),
+      );
+      if (anchored.length > 1) {
+        throw new DependencyResolutionError(
+          "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+          `contradictory_validations:${String(exec.execution_id)}`,
+        );
+      }
+      const pass = anchored[0];
       if (!pass) continue;
       const ids = Array.isArray(pass.artifact_ids)
         ? (pass.artifact_ids as unknown[]).map(String)
@@ -504,6 +581,11 @@ export class ArtifactHandoffService {
         pinned.push(existing);
         continue;
       }
+      const bindingDigest = handoffBindingDigest({
+        handoff_id: handoffId,
+        contract: HANDOFF_CONTRACT,
+        ...fields,
+      });
       const row = this.store.put(
         HANDOFF_ENTITY,
         handoffId,
@@ -511,6 +593,7 @@ export class ArtifactHandoffService {
           handoff_id: handoffId,
           contract: HANDOFF_CONTRACT,
           state: "PINNED",
+          binding_digest: bindingDigest,
           ...fields,
           created_at: utcnow(),
           updated_at: utcnow(),
@@ -530,6 +613,7 @@ export class ArtifactHandoffService {
           artifact_id: fields.artifact_id,
           consumer_task_id: fields.consumer_task_id,
           mode,
+          binding_digest: bindingDigest,
         },
       });
       pinned.push(row);
@@ -547,16 +631,41 @@ export class ArtifactHandoffService {
     const entries = (
       (governed.dependency_artifacts as unknown[] | undefined) ?? []
     ).map((e) => validateDependencyArtifactEntry(e));
+    // R1.4 — re-bind the dep-set against the persisted digest + the
+    // immutable VALIDATED event before ANY materialization write.
+    this.assertDepSetBound(governed, entries);
     if (!entries.length) return [];
     const workspace = String(governed.workspace);
     const allowedPaths = (governed.allowed_paths as string[]) ?? [workspace];
     const materialized: string[] = [];
     for (const e of entries) {
       const handoff = this.requireHandoff(governed, e, "PINNED_MATERIALIZED");
-      // Re-verify the canonical artifact AND read its retained bytes at
-      // handoff time — never the producer's path, never row claims alone.
-      const { bytes } = this.artifacts.readForConsumption(e.artifact_id);
-      const dest = this.resolveConsumerDest(workspace, allowedPaths, e);
+      // R1.2/R1.3 — read the retained CAS bytes ONLY against the pinned
+      // expected producer binding (execution/task/governed/mission/
+      // executor/logical_name/sha256/byte_size). A consumption
+      // verification failure happens BEFORE any destination write.
+      const { bytes } = this.artifacts.readForConsumption(e.artifact_id, {
+        execution_id: e.producer_execution_id,
+        mission_id: String(governed.mission_id),
+        task_id: e.producer_task_id,
+        governed_task_id: e.producer_governed_task_id,
+        producer_executor_id: e.producer_executor_id,
+        logical_name: e.logical_name,
+        sha256: e.sha256,
+        byte_size: e.byte_size,
+      });
+      if (sha256Hex(bytes) !== e.sha256 || bytes.length !== e.byte_size) {
+        throw new DependencyResolutionError(
+          "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+          `${e.artifact_id}:pin_bytes_mismatch`,
+        );
+      }
+      const { dest, realWorkspace, realAllowedRoots } = this.resolveConsumerDest(
+        workspace,
+        allowedPaths,
+        e,
+      );
+      const realHandoffRoot = path.join(realWorkspace, DEPENDENCY_ARTIFACT_ROOT);
       if (fs.existsSync(dest) || fs.lstatSync(dest, { throwIfNoEntry: false })) {
         const st = fs.lstatSync(dest);
         if (st.isSymbolicLink() || !st.isFile()) {
@@ -566,7 +675,7 @@ export class ArtifactHandoffService {
           );
         }
         const existing = secureReadContained(dest, MAX_ARTIFACT_BYTES, [
-          path.resolve(workspace, DEPENDENCY_ARTIFACT_ROOT),
+          realHandoffRoot,
         ]);
         if (
           existing.kind === "ok" &&
@@ -584,6 +693,14 @@ export class ArtifactHandoffService {
         );
       }
       fs.mkdirSync(path.dirname(dest), { recursive: true });
+      // R1.3 — prove the REAL parent still lives beneath the real
+      // workspace AND a real allowed root before any byte is written.
+      this.assertRealParentContained(
+        dest,
+        realWorkspace,
+        realAllowedRoots,
+        e.consumer_relative_path,
+      );
       const tmp = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
       const fh = fs.openSync(tmp, "w");
       try {
@@ -612,7 +729,7 @@ export class ArtifactHandoffService {
       // Post-write verification of the MATERIALIZED object (open-object
       // bound — a swapped path can never qualify).
       const written = secureReadContained(dest, MAX_ARTIFACT_BYTES, [
-        path.resolve(workspace, DEPENDENCY_ARTIFACT_ROOT),
+        realHandoffRoot,
       ]);
       if (
         written.kind !== "ok" ||
@@ -681,6 +798,14 @@ export class ArtifactHandoffService {
     const entries = (
       (governed!.dependency_artifacts as unknown[] | undefined) ?? []
     ).map((e) => validateDependencyArtifactEntry(e));
+    // R1.4 — the row's dep-set digest + immutable VALIDATED anchor must
+    // still bind the current set before ANY fetch is served.
+    try {
+      this.assertDepSetBound(governed!, entries);
+    } catch {
+      this.rejectHandoffEvent(governed!, artifactId, "dep_set_rewritten");
+      reject("dep_set_rewritten");
+    }
     // The pinned dependency set itself is bound into the capability —
     // mutating the pin after the capability was minted invalidates it.
     if (artifactDependencySetDigest(entries) !== claims.dependency_set_digest) {
@@ -698,6 +823,16 @@ export class ArtifactHandoffService {
     }
     const { artifact, bytes } = this.artifacts.readForConsumption(
       entry!.artifact_id,
+      {
+        execution_id: entry!.producer_execution_id,
+        mission_id: String(governed!.mission_id),
+        task_id: entry!.producer_task_id,
+        governed_task_id: entry!.producer_governed_task_id,
+        producer_executor_id: entry!.producer_executor_id,
+        logical_name: entry!.logical_name,
+        sha256: entry!.sha256,
+        byte_size: entry!.byte_size,
+      },
     );
     // Handoff identity must still match the pinned entry — a rebound
     // handoff never serves bytes. The F1 row carries the producer
@@ -745,6 +880,7 @@ export class ArtifactHandoffService {
     const entries = (
       (governed.dependency_artifacts as unknown[] | undefined) ?? []
     ).map((e) => validateDependencyArtifactEntry(e));
+    this.assertDepSetBound(governed, entries);
     if (entries.length !== handoffs.length) {
       throw new DependencyResolutionError(
         "FAIL_CLOSED_ARTIFACT_HANDOFF_CONFLICT",
@@ -756,6 +892,44 @@ export class ArtifactHandoffService {
       // FETCHED depending on the consumption lane — binding integrity
       // is what dispatch authorization needs.
       this.assertHandoffBinding(governed, e);
+    }
+  }
+
+  /** R1.4 — the governed row's persisted `dependency_artifacts_digest`
+   *  must equal the digest of the CURRENT pinned set, and (when a
+   *  contract exists) the immutable GOVERNED_TASK_VALIDATED event must
+   *  record that same digest. A coherent rewrite of the governed row +
+   *  handoff rows cannot re-derive the recorded anchor. */
+  assertDepSetBound(
+    governed: Record<string, unknown>,
+    entries: DependencyArtifactEntry[],
+  ): void {
+    const rowDigest = governed.dependency_artifacts_digest;
+    if (!entries.length && rowDigest === undefined) return;
+    const depDigest = artifactDependencySetDigest(entries);
+    const gtid = String(governed.governed_task_id);
+    if (String(rowDigest ?? "") !== depDigest) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_CONFLICT",
+        `${gtid}:dep_set_digest`,
+      );
+    }
+    if (!entries.length) return;
+    const anchored = this.store
+      .listEvents("governed_task", gtid)
+      .some(
+        (ev) =>
+          String(ev.event_type) === "GOVERNED_TASK_VALIDATED" &&
+          String(
+            (ev.metadata as Record<string, unknown> | undefined)
+              ?.dependency_artifacts_digest ?? "",
+          ) === depDigest,
+      );
+    if (!anchored) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_CONFLICT",
+        `${gtid}:dep_set_history`,
+      );
     }
   }
 
@@ -826,6 +1000,7 @@ export class ArtifactHandoffService {
       producer_executor_id: entry.producer_executor_id,
       consumer_task_id: governed.task_id,
       consumer_governed_task_id: governed.governed_task_id,
+      consumer_executor_id: governed.executor_id,
       logical_name: entry.logical_name,
       sha256: entry.sha256,
       byte_size: entry.byte_size,
@@ -839,35 +1014,143 @@ export class ArtifactHandoffService {
         );
       }
     }
+    // R1.4 — field equality alone cannot catch a coherent dual rewrite
+    // (governed row AND handoff row rewritten together): the digest of
+    // every immutable field must match the row's stored binding_digest
+    // AND an immutable ARTIFACT_HANDOFF_PINNED event carrying it. State
+    // may transition; binding facts may never change.
+    const recomputed = handoffBindingDigest({
+      handoff_id: String(r.handoff_id),
+      contract: String(r.contract),
+      mode: String(r.mode),
+      mission_id: String(r.mission_id),
+      artifact_id: String(r.artifact_id),
+      producer_task_id: String(r.producer_task_id),
+      producer_governed_task_id: String(r.producer_governed_task_id),
+      producer_execution_id: String(r.producer_execution_id),
+      producer_executor_id: String(r.producer_executor_id),
+      consumer_task_id: String(r.consumer_task_id),
+      consumer_governed_task_id: String(r.consumer_governed_task_id),
+      consumer_executor_id: String(r.consumer_executor_id),
+      logical_name: String(r.logical_name),
+      sha256: String(r.sha256),
+      byte_size: Number(r.byte_size),
+      consumer_relative_path: String(r.consumer_relative_path),
+    });
+    if (
+      String(r.handoff_id) !== handoffId ||
+      String(r.contract) !== HANDOFF_CONTRACT ||
+      String(r.binding_digest ?? "") !== recomputed
+    ) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_CONFLICT",
+        `${handoffId}:binding_digest`,
+      );
+    }
+    const pinned = this.store
+      .listEvents(HANDOFF_ENTITY, handoffId)
+      .some(
+        (ev) =>
+          String(ev.event_type) === "ARTIFACT_HANDOFF_PINNED" &&
+          String(
+            (ev.metadata as Record<string, unknown> | undefined)
+              ?.binding_digest ?? "",
+          ) === recomputed,
+      );
+    if (!pinned) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_CONFLICT",
+        `${handoffId}:binding_history`,
+      );
+    }
     return r;
   }
 
+  /**
+   * F2 R1.3 — the REAL materialization destination. Containment is proven
+   * against the REAL governed workspace root and REAL allowed roots, and
+   * every already-existing ancestor component of the handoff path must be
+   * a real directory — a symlinked `.pair`, `dependency-artifacts` or
+   * `<ART>` component that realpaths outside can never redirect the write.
+   */
   private resolveConsumerDest(
     workspace: string,
     allowedPaths: string[],
     entry: DependencyArtifactEntry,
-  ): string {
+  ): { dest: string; realWorkspace: string; realAllowedRoots: string[] } {
     const rel = entry.consumer_relative_path;
+    const fail = (reason: string): never => {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+        `${rel}:${reason}`,
+      );
+    };
     if (!rel.startsWith(`${DEPENDENCY_ARTIFACT_ROOT}/`)) {
+      fail("outside_handoff_root");
+    }
+    let realWorkspace: string;
+    try {
+      realWorkspace = fs.realpathSync(workspace);
+    } catch {
+      fail("workspace_unresolvable");
+    }
+    const relParts = rel.split("/").filter(Boolean);
+    const dest = path.join(realWorkspace!, ...relParts);
+    if (!pathWithin(dest, realWorkspace!)) {
+      fail("outside_workspace");
+    }
+    // Existing ancestor components must be real directories — never a
+    // symlinked handoff-root component (the escape this rule exists for).
+    let cursor = realWorkspace!;
+    for (const comp of relParts.slice(0, -1)) {
+      cursor = path.join(cursor, comp);
+      const st = fs.lstatSync(cursor, { throwIfNoEntry: false });
+      if (!st) break; // not created yet — will be a real mkdir'd directory
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        fail("parent_symlink");
+      }
+    }
+    const realAllowedRoots: string[] = [];
+    for (const ap of allowedPaths) {
+      try {
+        realAllowedRoots.push(fs.realpathSync(ap));
+      } catch {
+        // unresolvable allowed roots simply cannot authorize a write
+      }
+    }
+    if (!realAllowedRoots.some((r) => pathWithin(dest, r))) {
+      fail("outside_allowed_paths");
+    }
+    return { dest, realWorkspace: realWorkspace!, realAllowedRoots };
+  }
+
+  /** R1.3 — after mkdir, the REAL parent directory must still live
+   *  beneath the real workspace and a real allowed root (covers a
+   *  component swapped to a symlink between checks). */
+  private assertRealParentContained(
+    dest: string,
+    realWorkspace: string,
+    realAllowedRoots: string[],
+    rel: string,
+  ): void {
+    const fail = (reason: string): never => {
       throw new DependencyResolutionError(
         "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
-        `${rel}:outside_handoff_root`,
+        `${rel}:${reason}`,
       );
+    };
+    let realParent: string;
+    try {
+      realParent = fs.realpathSync(path.dirname(dest));
+    } catch {
+      fail("parent_unresolvable");
     }
-    const dest = path.resolve(workspace, rel);
-    if (!pathWithin(dest, workspace)) {
-      throw new DependencyResolutionError(
-        "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
-        `${rel}:outside_workspace`,
-      );
+    if (!pathWithin(realParent!, realWorkspace)) {
+      fail("parent_outside_workspace");
     }
-    if (!allowedPaths.some((ap) => pathWithin(dest, ap))) {
-      throw new DependencyResolutionError(
-        "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
-        `${rel}:outside_allowed_paths`,
-      );
+    if (!realAllowedRoots.some((r) => pathWithin(realParent!, r))) {
+      fail("parent_outside_allowed_paths");
     }
-    return dest;
   }
 
   private markState(

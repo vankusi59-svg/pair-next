@@ -24,6 +24,7 @@ import {
   MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES,
   type DependencyArtifactEntry,
 } from "./artifact-handoff.js";
+import { artifactDependencySetDigest } from "./artifact-consume-capability.js";
 
 const RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
 const HIGH_IMPACT_PERMISSIONS = new Set([
@@ -369,6 +370,11 @@ export class GovernedTaskGate {
         "dependency_bytes",
       );
     }
+    // F2 R1.4 — the approval scope covers the dependency-artifact SET
+    // by canonical digest: an approval recorded for set A can never
+    // authorize the SAME task scope with set B pinned later.
+    const dependencyArtifactsDigest =
+      artifactDependencySetDigest(dependencyArtifacts);
     const approvalScope = {
       mission_id: mission.mission_id,
       task_id: task.task_id,
@@ -377,6 +383,7 @@ export class GovernedTaskGate {
       allowed_paths: allowedPaths,
       permissions: requested,
       expected_output_contract: request.expected_output_contract,
+      dependency_artifacts_digest: dependencyArtifactsDigest,
     };
     const scopeDigest = digest(approvalScope);
 
@@ -418,6 +425,10 @@ export class GovernedTaskGate {
       // producer_execution_id/consumer_relative_path can never remain
       // dispatch-authorized.
       dependency_artifacts: dependencyArtifacts,
+      // F2 R1.4 — the dep-set digest is itself durable authority: any
+      // post-governance rewrite of dependency_artifacts changes the
+      // digest and is caught against the VALIDATED event anchor.
+      dependency_artifacts_digest: dependencyArtifactsDigest,
       timeout,
       expected_output_contract: request.expected_output_contract,
       risk_class: riskClass,
@@ -458,6 +469,7 @@ export class GovernedTaskGate {
         executor_id: adapter.executor_id,
         risk_class: riskClass,
         approval_required: needsApproval,
+        dependency_artifacts_digest: dependencyArtifactsDigest,
       },
     });
     this.store.appendEvidence(String(mission.mission_id), "GOVERNED_TASK_VALIDATED", {
@@ -492,6 +504,21 @@ export class GovernedTaskGate {
     approved_by: string;
     request: Record<string, unknown>;
   }): Record<string, unknown> {
+    // F2 R1.4 — the approval binds the dep-set by canonical digest;
+    // the request's dependency_artifacts are shape-verified before they
+    // can influence the scope.
+    const requestDeps = params.request.dependency_artifacts;
+    if (requestDeps !== undefined && !Array.isArray(requestDeps)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DEPENDENCY_ARTIFACT_CONTRACT",
+        "dependency_artifacts",
+      );
+    }
+    const depDigest = artifactDependencySetDigest(
+      ((requestDeps as unknown[] | undefined) ?? []).map((e) =>
+        validateDependencyArtifactEntry(e),
+      ),
+    );
     const scope = {
       mission_id: params.mission_id,
       task_id: params.task_id,
@@ -500,6 +527,7 @@ export class GovernedTaskGate {
       allowed_paths: params.request.allowed_paths,
       permissions: params.request.permissions ?? [],
       expected_output_contract: params.request.expected_output_contract,
+      dependency_artifacts_digest: depDigest,
     };
     const approvalId = newId("APR");
     const approval = {

@@ -14,6 +14,7 @@ import path from "node:path";
 import { IntegrityError, PairError, PolicyError } from "./errors.js";
 import { compatOutboxBasename } from "./canonical.js";
 import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
+import { artifactConsumeCapabilityMasterFromEnv } from "./artifact-consume-capability.js";
 import { ulid } from "ulid";
 import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
@@ -613,7 +614,12 @@ export function createMissionControlServer(
         const capability = String(
           req.headers["x-artifact-consume-capability"] ?? "",
         );
-        const master = deps.brokerToken;
+        // R1.5 — ONE canonical consume-master resolution seam:
+        // PAIR_ARTIFACT_UPLOAD_TOKEN, falling back to PAIR_BROKER_TOKEN.
+        // It is identical to the executor's mint-side resolution, so a
+        // distinct artifact token never fails on the broker master.
+        // PAIR_OUTBOX_TOKEN is NEVER consume authority.
+        const master = artifactConsumeCapabilityMasterFromEnv();
         if (!master || !capability) {
           return void json(res, 403, { error: "UNAUTHORIZED_ARTIFACT_CONSUME" });
         }
@@ -621,12 +627,14 @@ export function createMissionControlServer(
           const { artifact, bytes } = c.fetchArtifactForConsumption(master, capability, {
             artifact_id: body.artifact_id,
           });
+          // R1.6 companion — ASCII-safe identity headers only; the raw
+          // logical name would crash the response on non-ASCII names and
+          // the consumer already carries the pinned name contract-side.
           res.writeHead(200, {
             "content-type": "application/octet-stream",
             "x-artifact-id": String(artifact.artifact_id),
             "x-artifact-sha256": String(artifact.sha256),
             "x-artifact-byte-size": String(artifact.byte_size),
-            "x-artifact-logical-name": String(artifact.logical_name),
           });
           res.end(bytes);
           return;

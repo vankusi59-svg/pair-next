@@ -60,6 +60,16 @@ export const MAX_ARTIFACT_NAME_BYTES = 200;
 export const ARTIFACT_ENTITY = "artifact";
 export const ARTIFACT_CONTRACT = "pair-artifact.v1";
 
+/** Immutable facts an ARTIFACT_ACCEPTED event records — the history a
+ *  current row must still match (R7.2). */
+interface AcceptedArtifactFacts {
+  logical_name: string;
+  producer_executor_id: string;
+  sha256: string;
+  byte_size: number;
+  channel: string;
+}
+
 /** States in which artifact acceptance is closed. A COMPLETED/RUNNING
  *  execution may still accept (local settle validates post-COMPLETED;
  *  remote workers upload before their completion marker). FAILED,
@@ -451,24 +461,37 @@ export class ArtifactAuthority {
         `${executionId}:durable_linkage`,
       );
     }
-    // R6.3 — the expected set comes from the APPEND-ONLY, hash-verified
-    // event plane: every artifact once canonically accepted for this
-    // execution must still exist and remain fully canonical at terminal
-    // validation. Deriving it from current mutable rows would be
-    // fail-open — a mutated/moved/deleted row would simply vanish from
-    // the set and let a result pass around it.
-    // R7.2 — an ARTIFACT_ACCEPTED event binds the accepted artifact's
-    // identity AND its accepted content as immutable facts; malformed
-    // history fails closed and duplicate acceptances must describe the
-    // same facts.
-    type Acceptance = {
-      logical_name: string;
-      producer_executor_id: string;
-      sha256: string;
-      byte_size: number;
-      channel: string;
-    };
-    const expected = new Map<string, Acceptance>();
+    const expected = this.acceptanceFactsForExecution(executionId);
+    // §4 — a current row claiming this execution WITHOUT a historical
+    // ARTIFACT_ACCEPTED is injected authority: fail closed, never grant
+    // it PASS authority merely because its fields look canonical.
+    for (const row of this.store.list(ARTIFACT_ENTITY)) {
+      const id = String(row.artifact_id);
+      if (String(row.execution_id) === executionId && !expected.has(id)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+          `${id}:no_acceptance_history`,
+        );
+      }
+    }
+    const verified: string[] = [];
+    for (const id of expected.keys()) {
+      // One shared seam (R1.1): immutable acceptance facts ↔ current row
+      // ↔ producer identity ↔ storage ↔ retained bytes NOW.
+      this.verifyAcceptedArtifact(id, execution);
+      verified.push(id);
+    }
+    return verified;
+  }
+
+  /** R6.3 + R7.2 — the immutable acceptance facts recorded by the
+   *  append-only hash-verified ARTIFACT_ACCEPTED event plane for ONE
+   *  execution. Malformed history and conflicting duplicate acceptances
+   *  fail closed; the set is the authority every consumer derives from. */
+  private acceptanceFactsForExecution(
+    executionId: string,
+  ): Map<string, AcceptedArtifactFacts> {
+    const expected = new Map<string, AcceptedArtifactFacts>();
     for (const ev of this.store.listEvents(ARTIFACT_ENTITY)) {
       if (
         String(ev.event_type) !== "ARTIFACT_ACCEPTED" ||
@@ -499,7 +522,7 @@ export class ArtifactAuthority {
       }
       const channel = md!.channel;
       if (typeof channel !== "string" || !channel) mal("channel");
-      const facts: Acceptance = {
+      const facts = {
         logical_name: logicalName,
         producer_executor_id: producer as string,
         sha256: sha as string,
@@ -524,48 +547,57 @@ export class ArtifactAuthority {
       }
       expected.set(id, facts);
     }
-    // §4 — a current row claiming this execution WITHOUT a historical
-    // ARTIFACT_ACCEPTED is injected authority: fail closed, never grant
-    // it PASS authority merely because its fields look canonical.
-    for (const row of this.store.list(ARTIFACT_ENTITY)) {
-      const id = String(row.artifact_id);
-      if (String(row.execution_id) === executionId && !expected.has(id)) {
-        throw new IntegrityError(
-          "FAIL_CLOSED_ARTIFACT_VERIFICATION",
-          `${id}:no_acceptance_history`,
-        );
-      }
+    return expected;
+  }
+
+  /**
+   * F2 R1.1 — the ONE shared consumption authority: proves a single
+   * artifact is bound end-to-end as
+   *
+   *   ARTIFACT_ACCEPTED immutable history
+   *   ↔ current ART row
+   *   ↔ producer durable identity (execution + governed task)
+   *   ↔ storage contract
+   *   ↔ retained CAS bytes verified NOW
+   *
+   * Terminal validation and F2 consumption call the same seam — a row
+   * coherently rewritten to different (still CAS-valid) bytes fails on
+   * history; a row without acceptance history never qualifies.
+   */
+  private verifyAcceptedArtifact(
+    artifactId: string,
+    execution: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const id = artifactId;
+    const fail = (reason: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+        `${id}:${reason}`,
+      );
+    };
+    const facts = this.acceptanceFactsForExecution(
+      String(execution.execution_id),
+    ).get(id);
+    if (!facts) fail("no_acceptance_history");
+    const row = this.store.tryGet(ARTIFACT_ENTITY, id) as Record<
+      string,
+      unknown
+    > | null;
+    if (!row) fail("missing");
+    if (String(row!.artifact_id) !== id) fail("artifact_id_field");
+    if (String(row!.logical_name) !== facts!.logical_name) fail("logical_name");
+    if (String(row!.producer_executor_id) !== facts!.producer_executor_id) {
+      fail("producer_executor_id");
     }
-    const verified: string[] = [];
-    for (const [id, facts] of expected) {
-      const fail = (reason: string): never => {
-        throw new IntegrityError("FAIL_CLOSED_ARTIFACT_VERIFICATION", `${id}:${reason}`);
-      };
-      const row = this.store.tryGet(ARTIFACT_ENTITY, id) as Record<
-        string,
-        unknown
-      > | null;
-      if (!row) {
-        throw new IntegrityError(
-          "FAIL_CLOSED_ARTIFACT_VERIFICATION",
-          `${id}:missing`,
-        );
-      }
-      // R7.2 — the current row must still match the immutable facts the
-      // historical acceptance recorded; a coherently rewritten row
-      // (same ids, different accepted bytes) must never pass.
-      if (String(row.artifact_id) !== id) fail("artifact_id_field");
-      if (String(row.logical_name) !== facts.logical_name) fail("logical_name");
-      if (String(row.producer_executor_id) !== facts.producer_executor_id) {
-        fail("producer_executor_id");
-      }
-      if (String(row.sha256) !== facts.sha256) fail("sha256");
-      if (Number(row.byte_size) !== facts.byte_size) fail("byte_size");
-      if (String(row.ingested_via) !== facts.channel) fail("ingested_via");
-      this.verifyCanonicalRowShape(row, execution, executionId);
-      verified.push(id);
-    }
-    return verified;
+    if (String(row!.sha256) !== facts!.sha256) fail("sha256");
+    if (Number(row!.byte_size) !== facts!.byte_size) fail("byte_size");
+    if (String(row!.ingested_via) !== facts!.channel) fail("ingested_via");
+    this.verifyCanonicalRowShape(
+      row!,
+      execution,
+      String(execution.execution_id),
+    );
+    return row!;
   }
 
   /**
@@ -620,9 +652,11 @@ export class ArtifactAuthority {
   /**
    * F2 §6–§7 — the narrow consumption-time authority: prove ONE artifact
    * is fully canonical AND bound to the claimed producer execution/task/
-   * mission RIGHT NOW. The durable execution↔governed linkage is
-   * re-checked and the retained CAS bytes are re-verified — a row that
-   * merely looks canonical can never serve a consumer.
+   * mission RIGHT NOW. The caller supplies the EXPECTED producer binding
+   * (from an already-pinned dependency contract / known-durable context)
+   * — the mutable artifact row is never consulted for what to trust.
+   * Historical acceptance facts, durable linkage, current row identity,
+   * storage contract and retained CAS bytes are all re-verified NOW.
    */
   verifyArtifactForConsumption(
     artifactId: string,
@@ -632,6 +666,9 @@ export class ArtifactAuthority {
       task_id?: string;
       governed_task_id?: string;
       producer_executor_id?: string;
+      sha256?: string;
+      byte_size?: number;
+      logical_name?: string;
     },
   ): Record<string, unknown> {
     const fail = (reason: string): never => {
@@ -640,11 +677,6 @@ export class ArtifactAuthority {
         `${artifactId}:${reason}`,
       );
     };
-    const row = this.store.tryGet(ARTIFACT_ENTITY, artifactId) as
-      | Record<string, unknown>
-      | null;
-    if (!row) fail("missing");
-    if (String(row!.artifact_id) !== artifactId) fail("artifact_id_field");
     const execution = this.store.tryGet(
       "executor_execution",
       expected.execution_id,
@@ -667,54 +699,77 @@ export class ArtifactAuthority {
     ) {
       fail("durable_linkage");
     }
-    if (String(row!.execution_id) !== expected.execution_id) fail("execution_id");
+    const row = this.verifyAcceptedArtifact(artifactId, execution);
+    if (String(row.execution_id) !== expected.execution_id) fail("execution_id");
     if (
       expected.mission_id !== undefined &&
-      String(row!.mission_id) !== expected.mission_id
+      String(row.mission_id) !== expected.mission_id
     ) {
       fail("mission_id");
     }
     if (
       expected.task_id !== undefined &&
-      String(row!.task_id) !== expected.task_id
+      String(row.task_id) !== expected.task_id
     ) {
       fail("task_id");
     }
     if (
       expected.governed_task_id !== undefined &&
-      String(row!.governed_task_id) !== expected.governed_task_id
+      String(row.governed_task_id) !== expected.governed_task_id
     ) {
       fail("governed_task_id");
     }
     if (
       expected.producer_executor_id !== undefined &&
-      String(row!.producer_executor_id) !== expected.producer_executor_id
+      String(row.producer_executor_id) !== expected.producer_executor_id
     ) {
       fail("producer_executor_id");
     }
-    this.verifyCanonicalRowShape(row!, execution, expected.execution_id);
-    return row!;
+    if (
+      expected.sha256 !== undefined &&
+      String(row.sha256) !== expected.sha256
+    ) {
+      fail("sha256");
+    }
+    if (
+      expected.byte_size !== undefined &&
+      Number(row.byte_size) !== expected.byte_size
+    ) {
+      fail("byte_size");
+    }
+    if (
+      expected.logical_name !== undefined &&
+      String(row.logical_name) !== expected.logical_name
+    ) {
+      fail("logical_name");
+    }
+    return row;
   }
 
-  /** F2 — verified retained bytes for a canonical artifact: the row is
-   *  fully re-verified first, then the CAS blob is read through the
-   *  open-object primitive and must match sha256 + byte_size. */
-  readForConsumption(artifactId: string): {
+  /** F2 R1.2 — verified retained bytes for a canonical artifact. The
+   *  caller supplies the pinned expected producer binding — artifact id,
+   *  producer execution/task/governed/mission/executor + logical name +
+   *  sha256 + byte_size — and the returned bytes are the exact retained
+   *  CAS bytes only after the pinned expectations verify against the
+   *  F1 acceptance history AND the current row AND the open-object CAS
+   *  read. The mutable row never defines the expected authority. */
+  readForConsumption(
+    artifactId: string,
+    expected: {
+      execution_id: string;
+      mission_id?: string;
+      task_id?: string;
+      governed_task_id?: string;
+      producer_executor_id?: string;
+      logical_name?: string;
+      sha256?: string;
+      byte_size?: number;
+    },
+  ): {
     artifact: Record<string, unknown>;
     bytes: Buffer;
   } {
-    const row = this.store.tryGet(ARTIFACT_ENTITY, artifactId) as
-      | Record<string, unknown>
-      | null;
-    if (!row) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_ARTIFACT_VERIFICATION",
-        `${artifactId}:missing`,
-      );
-    }
-    const artifact = this.verifyArtifactForConsumption(artifactId, {
-      execution_id: String(row.execution_id),
-    });
+    const artifact = this.verifyArtifactForConsumption(artifactId, expected);
     const sha = String(artifact.sha256);
     const blob = this.readCasBlob(path.join(this.opts.blobDir, sha));
     if (
