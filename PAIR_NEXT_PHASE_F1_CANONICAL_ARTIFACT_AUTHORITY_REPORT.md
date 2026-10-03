@@ -405,7 +405,7 @@ Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R4_PENDING_SOUR
 ## INDEPENDENT SOURCE-REVIEW R5 REMEDIATION
 
 - **Previous reviewed HEAD:** `ef7d96afab1c8c35afe5adce742b39169169761f`
-- **New HEAD:** `<pending — stamped after commit>`
+- **New HEAD:** `65cbc0acaa082029e1d74106aa863c36eebc2dc7`
 - **Changed files:** `src/pair/gate.ts`, `src/pair/artifact-authority.ts`, `src/pair/artifact-validation.ts`, `src/__tests__/pair-f1-r2-remediation.test.ts`, `src/__tests__/pair-f1-r1-remediation.test.ts`, `src/__tests__/pair-f1-artifact-authority.test.ts`, `src/__tests__/{pair-p8,pair-p9,pair-p10,pair-p12,pair-p13,pair-live-ops-recovery-closure,pair-phase-b,pair-phase-d-recovery-approval-hardening,pair-planner-dataflow-incident,pair-output-delivery-contract,pair-runtime-hardening,pair-route-capability-authority}.test.ts`, `CURRENT_STATE.md`, this report.
 
 ### RCA — R5.1 ARTIFACT DECLARATION CONTRACT + STRICT RESULT ENVELOPE FAIL-OPEN
