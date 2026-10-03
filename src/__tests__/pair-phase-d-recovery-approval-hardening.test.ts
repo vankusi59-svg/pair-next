@@ -120,9 +120,8 @@ class ScriptedAdapter implements ExecutorAdapter {
     return { status: "CANCELLED" };
   }
   collect_result(executionId: string) {
-    return (
-      this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } }
-    );
+    const r = this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
+    return { execution_id: executionId, artifacts: [], ...r };
   }
   collect_artifacts() {
     return [];

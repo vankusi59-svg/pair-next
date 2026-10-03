@@ -587,7 +587,7 @@ describe("P2 vertical slice + worker execution", () => {
     const validation = ctx.gate.validate_execution_result(executionId);
     expect(validation.status).toBe("FAIL");
     expect(validation.failures).toEqual(
-      expect.arrayContaining([expect.stringContaining("sha256 mismatch")]),
+      expect.arrayContaining([expect.stringContaining("DECLARED_MISMATCH")]),
     );
     // No artifact entities persisted for a failed batch.
     expect(ctx.store.list("artifact")).toHaveLength(0);

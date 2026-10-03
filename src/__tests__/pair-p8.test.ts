@@ -60,6 +60,7 @@ class ScriptedAdapter implements ExecutorAdapter {
   script: Array<{ status: string; error_class?: string }> = [];
   dispatched: string[] = [];
   collected: Record<string, Record<string, unknown>> = {};
+  tasks: Record<string, Record<string, unknown>> = {};
   observeOverride: Record<string, unknown> | null = null;
   dispatchEvidence: { dispatched: boolean; execution_id?: string } | undefined;
   available = true;
@@ -87,6 +88,7 @@ class ScriptedAdapter implements ExecutorAdapter {
     const step = this.script.shift() ?? { status: "COMPLETED" };
     const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
     this.dispatched.push(eid);
+    this.tasks[eid] = task;
     this.collected[eid] = step.status === "FAILED"
       ? { status: "FAILED", error: { class: step.error_class ?? "PROCESS_EXIT", message: step.error_class ?? "failed" } }
       : { status: step.status, summary: `${this.executor_id} did work` };
@@ -107,7 +109,16 @@ class ScriptedAdapter implements ExecutorAdapter {
     return { status: "CANCELLED" };
   }
   collect_result(executionId: string) {
-    return this.collected[executionId] ?? { status: "UNKNOWN" };
+    const t = this.tasks[executionId] ?? {};
+    const r = this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
+    return {
+      execution_id: executionId,
+      mission_id: t.mission_id,
+      task_id: t.task_id,
+      governed_task_id: t.governed_task_id,
+      artifacts: [],
+      ...r,
+    };
   }
   collect_artifacts() {
     return [];

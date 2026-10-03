@@ -66,6 +66,7 @@ const ALL_CAPS = [
 class ScriptedAdapter implements ExecutorAdapter {
   readonly executor_id: string;
   dispatched: string[] = [];
+  tasks: Record<string, Record<string, unknown>> = {};
   available = true;
   throwOnDispatch = false;
   resultPayload: Record<string, unknown> = { status: "COMPLETED", summary: "ok" };
@@ -90,6 +91,7 @@ class ScriptedAdapter implements ExecutorAdapter {
     if (this.throwOnDispatch) throw new Error("ADAPTER_DISPATCH_FAILED");
     const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
     this.dispatched.push(eid);
+    this.tasks[eid] = task;
     return { execution_id: eid, status: "COMPLETED", run_root: null, workspace: task.workspace };
   }
   observe() {
@@ -98,8 +100,16 @@ class ScriptedAdapter implements ExecutorAdapter {
   cancel() {
     return { status: "CANCELLED" };
   }
-  collect_result() {
-    return this.resultPayload;
+  collect_result(executionId: string) {
+    const t = this.tasks[executionId] ?? {};
+    return {
+      execution_id: executionId,
+      mission_id: t.mission_id,
+      task_id: t.task_id,
+      governed_task_id: t.governed_task_id,
+      artifacts: [],
+      ...this.resultPayload,
+    };
   }
   collect_artifacts() {
     return [];
@@ -1077,7 +1087,15 @@ try {
     });
     const adapter = {
       executor_id: "EXEC_A",
-      collect_result: () => ({ status: "COMPLETED", output: args.hostile }),
+      collect_result: () => ({
+        status: "COMPLETED",
+        output: args.hostile,
+        execution_id: args.executionId,
+        governed_task_id: "GTSK_restart",
+        mission_id: "MSN_restart",
+        task_id: "TSK_restart",
+        artifacts: [],
+      }),
     };
     gate.collect_execution_result(adapter, args.executionId);
     const dump = JSON.stringify({

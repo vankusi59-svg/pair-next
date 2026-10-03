@@ -67,6 +67,7 @@ class ScriptedAdapter implements ExecutorAdapter {
   script: Array<{ status: string; error_class?: string }>;
   caps: string[];
   dispatched: string[] = [];
+  tasks: Record<string, Record<string, unknown>> = {};
   qualified = true;
 
   constructor(
@@ -98,6 +99,7 @@ class ScriptedAdapter implements ExecutorAdapter {
       : { status: "COMPLETED" };
     const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
     this.dispatched.push(eid);
+    this.tasks[eid] = task;
     return { execution_id: eid, status: step.status, run_root: null, workspace: task.workspace };
   }
   observe() {
@@ -106,8 +108,17 @@ class ScriptedAdapter implements ExecutorAdapter {
   cancel() {
     return { status: "CANCELLED" };
   }
-  collect_result() {
-    return { status: "COMPLETED", summary: "ok" };
+  collect_result(executionId: string) {
+    const t = this.tasks[executionId] ?? {};
+    return {
+      status: "COMPLETED",
+      summary: "ok",
+      execution_id: executionId,
+      mission_id: t.mission_id,
+      task_id: t.task_id,
+      governed_task_id: t.governed_task_id,
+      artifacts: [],
+    };
   }
   collect_artifacts() {
     return [];

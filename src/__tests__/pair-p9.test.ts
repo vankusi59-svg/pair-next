@@ -113,7 +113,8 @@ class ScriptedAdapter implements ExecutorAdapter {
     return { status: "CANCELLED" };
   }
   collect_result(executionId: string) {
-    return this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
+    const r = this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
+    return { execution_id: executionId, artifacts: [], ...r };
   }
   collect_artifacts() {
     return [];
@@ -377,7 +378,18 @@ describe("P9 §36 — runtime planning + scheduling", () => {
     ctx.runtime.run(mid, { maxTicks: 5 });
     ctx.runtime.pause(mid, "op1");
     ex.script.push({ status: "COMPLETED" });
-    ex.collected[ex.dispatched[0]] = { status: "COMPLETED", summary: "done" };
+    {
+      const exec = ctx.store.get("executor_execution", ex.dispatched[0]) as Record<string, unknown>;
+      ex.collected[ex.dispatched[0]] = {
+        status: "COMPLETED",
+        summary: "done",
+        execution_id: exec.execution_id,
+        mission_id: exec.mission_id,
+        task_id: exec.task_id,
+        governed_task_id: exec.governed_task_id,
+        artifacts: [],
+      };
+    }
     ctx.runtime.resume(mid, "op1");
     ctx.runtime.run(mid);
     expect(rt(ctx, mid).state).toBe("COMPLETED");
@@ -430,7 +442,18 @@ describe("P9 §36 — restart/crash recovery", () => {
     const mid = startMission(ctx);
     ctx.runtime.run(mid, { maxTicks: 4 }); // T1 dispatched, RUNNING
     expect(ex.dispatched.length).toBe(1);
-    ex.collected[ex.dispatched[0]] = { status: "COMPLETED", summary: "s" };
+    {
+      const exec = ctx.store.get("executor_execution", ex.dispatched[0]) as Record<string, unknown>;
+      ex.collected[ex.dispatched[0]] = {
+        status: "COMPLETED",
+        summary: "s",
+        execution_id: exec.execution_id,
+        mission_id: exec.mission_id,
+        task_id: exec.task_id,
+        governed_task_id: exec.governed_task_id,
+        artifacts: [],
+      };
+    }
     const rt2 = new MissionRuntime({
       service: ctx.service, gate: ctx.gate, router: ctx.router,
       adapters: ctx.adapters, scheduler: ctx.scheduler, approvals: ctx.approvals,
@@ -464,7 +487,18 @@ describe("P9 §36 — restart/crash recovery", () => {
     ctx.runtime.run(mid, { maxTicks: 4 });
     // Worker finished but no collect happened — canonical executor_execution
     // still non-terminal; a fresh runtime settles it.
-    ex.collected[ex.dispatched[0]] = { status: "COMPLETED", summary: "done" };
+    {
+      const exec = ctx.store.get("executor_execution", ex.dispatched[0]) as Record<string, unknown>;
+      ex.collected[ex.dispatched[0]] = {
+        status: "COMPLETED",
+        summary: "done",
+        execution_id: exec.execution_id,
+        mission_id: exec.mission_id,
+        task_id: exec.task_id,
+        governed_task_id: exec.governed_task_id,
+        artifacts: [],
+      };
+    }
     const rt2 = new MissionRuntime({
       service: ctx.service, gate: ctx.gate, router: ctx.router,
       adapters: ctx.adapters, scheduler: ctx.scheduler, approvals: ctx.approvals,

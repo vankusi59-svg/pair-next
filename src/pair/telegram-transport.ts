@@ -260,7 +260,7 @@ export async function transportTelegramDelivery(args: {
     // to the sender. No filesystem read exists between verification
     // and payload construction.
     const wantSha = String(art.sha256 ?? "");
-    const br = boundedFileSha256(fp);
+    const br = boundedFileSha256(fp, MAX_TELEGRAM_FILE_BYTES);
     if (
       br.kind !== "ok" ||
       !SHA256_HEX_RE.test(wantSha) ||

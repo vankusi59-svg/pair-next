@@ -26,6 +26,7 @@ import { IntegrityError, NotFoundError, PolicyError } from "./errors.js";
 import { atomicWriteJson, utcnow, workerExecutionId } from "./canonical.js";
 import { devinBlockedGraceMs, devinTaskTimeoutMs } from "./env-config.js";
 import { mintBrokerCapability } from "./broker-capability.js";
+import { mintArtifactCapability } from "./artifact-capability.js";
 import type { ExecutorAdapter } from "./adapter.js";
 
 export const DEVIN_EXECUTOR_ID = "DEVIN";
@@ -306,12 +307,29 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     // File-deliverable return path: when the operator configured an outbox
     // endpoint, remote artifacts (chart screenshots, report files) are pushed
     // back over it — files written to the remote workspace stay remote and
-    // would otherwise be unreachable. The token is upload-only by design.
+    // would otherwise be unreachable.
     const outboxUrl = process.env.PAIR_OUTBOX_URL;
-    const outboxToken = process.env.PAIR_OUTBOX_TOKEN;
-    if (outboxUrl && outboxToken) {
+    // F1 §6: when the artifact master is configured the worker gets ONLY a
+    // minted execution-scoped capability (never the master itself) — the
+    // upload lands as a canonical ART_* row. The generic outbox token path
+    // remains legacy storage-only compatibility.
+    const artifactMaster =
+      process.env.PAIR_ARTIFACT_UPLOAD_TOKEN || process.env.PAIR_BROKER_TOKEN;
+    if (outboxUrl && artifactMaster) {
+      const executionId = workerExecutionId(this.executor_id, String(task.governed_task_id));
+      const cap = mintArtifactCapability(artifactMaster, {
+        mission_id: String(task.mission_id),
+        task_id: String(task.task_id),
+        governed_task_id: String(task.governed_task_id),
+        execution_id: executionId,
+        executor_id: this.executor_id,
+      });
       lines.push(
-        `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${outboxToken}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE emitting the completion marker.`,
+        `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-artifact-capability: ${cap}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Any file type; max 64MB. Do this BEFORE emitting the completion marker.`,
+      );
+    } else if (outboxUrl && process.env.PAIR_OUTBOX_TOKEN) {
+      lines.push(
+        `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${process.env.PAIR_OUTBOX_TOKEN}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE emitting the completion marker.`,
       );
     }
     // Credential broker: when a service needs a login/token, the agent pulls

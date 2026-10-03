@@ -1815,6 +1815,7 @@ class R4Adapter implements ExecutorAdapter {
   writeFile = false;
   dispatchEvidence: { dispatched: boolean; execution_id?: string } | undefined;
   private execCount = 0;
+  readonly tasksByExec: Record<string, Record<string, unknown>> = {};
   constructor(id = "R4_EXEC") {
     this.executor_id = id;
   }
@@ -1837,6 +1838,7 @@ class R4Adapter implements ExecutorAdapter {
     this.execCount += 1;
     const eid = `EXEC_${this.executor_id}_${this.execCount}`;
     this.dispatched.push(task);
+    this.tasksByExec[eid] = task;
     if (this.writeFile) {
       fs.writeFileSync(path.join(String(task.workspace), `done-${this.execCount}.txt`), "ok");
     }
@@ -1848,8 +1850,17 @@ class R4Adapter implements ExecutorAdapter {
   cancel() {
     return { status: "CANCELLED" };
   }
-  collect_result() {
-    return { status: "COMPLETED", summary: "ok" };
+  collect_result(executionId: string) {
+    const t = this.tasksByExec[executionId] ?? {};
+    return {
+      status: "COMPLETED",
+      summary: "ok",
+      execution_id: executionId,
+      mission_id: t.mission_id,
+      task_id: t.task_id,
+      governed_task_id: t.governed_task_id,
+      artifacts: [],
+    };
   }
   collect_artifacts() {
     return [];

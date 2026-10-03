@@ -13,6 +13,7 @@
  */
 
 import Database from "better-sqlite3";
+import path from "node:path";
 import { canonicalJson, digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { BROKER_CAPABILITY_SOURCE } from "./sanitizer.js";
@@ -63,8 +64,12 @@ export function isSqliteContentionError(e: unknown): boolean {
 
 export class PairEvidenceStore {
   readonly db: Database.Database;
+  /** Directory holding pair.db — canonical deployment root for
+   *  co-located durable state (F1 artifact blob store). */
+  readonly dbDir: string;
 
   constructor(dbPath: string) {
+    this.dbDir = path.dirname(dbPath);
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");

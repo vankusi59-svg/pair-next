@@ -55,7 +55,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { digest, sha256Hex } from "./canonical.js";
+import { boundedFileSha256, compatOutboxBasename, digest, sha256Hex } from "./canonical.js";
+import type { BoundedFileResult } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import { DELIVERY_TEXT_ARTIFACT } from "./output-language.js";
 import { deliveryManifest, normalizeArtifactPath } from "./plan-dataflow.js";
@@ -180,38 +181,13 @@ export const TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS = 60_000;
  *  polling QUEUED forever (checked by stat BEFORE any full read). */
 export const MAX_TELEGRAM_FILE_BYTES = 48 * 1024 * 1024;
 
-/** R5 — the ONE canonical stat-first bounded file authority used by
- *  every governed FILES seam (dispatch pin, settle gate, snapshot
- *  verify, source→snapshot reconstruction, transport materialization).
- *  NEVER performs an unbounded full read: stat proves
- *  `size <= maxBytes` FIRST; a successful read additionally proves
- *  `bytes.length === stat size` (no mid-read growth) and the sha256 is
- *  computed over THOSE exact materialized bytes. */
-export type BoundedFileResult =
-  | { kind: "ok"; size: number; bytes: Buffer; sha256: string }
-  | { kind: "too_large"; size: number }
-  | { kind: "unresolved" };
-
-export function boundedFileSha256(
-  p: string,
-  maxBytes: number = MAX_TELEGRAM_FILE_BYTES,
-): BoundedFileResult {
-  let size: number;
-  try {
-    size = fs.statSync(p).size;
-  } catch {
-    return { kind: "unresolved" };
-  }
-  if (size > maxBytes) return { kind: "too_large", size };
-  let bytes: Buffer;
-  try {
-    bytes = fs.readFileSync(p);
-  } catch {
-    return { kind: "unresolved" };
-  }
-  if (bytes.length !== size) return { kind: "unresolved" };
-  return { kind: "ok", size, bytes, sha256: sha256Hex(bytes) };
-}
+/** R5/F1 — the ONE canonical stat-first bounded file authority lives in
+ *  canonical.ts so every governed byte seam (delivery pins/snapshots/
+ *  transport AND the F1 artifact ingest authority) shares identical
+ *  semantics: stat proves `size <= maxBytes` FIRST, a successful read
+ *  proves `bytes.length === stat size`, and the sha256 is computed over
+ *  THOSE exact materialized bytes. Re-exported for compatibility. */
+export { boundedFileSha256, type BoundedFileResult };
 
 export function deliveryRequestId(missionId: string, taskId: string): string {
   return `TDR_${digest(`telegram_delivery:${missionId}:${taskId}`).slice(0, 24)}`;
@@ -437,7 +413,26 @@ export function resolveDeliveryArtifactPath(args: {
   existsSync?: (p: string) => boolean;
   listDirSync?: (p: string) => string[];
 }): string | null {
-  const normalized = normalizeArtifactPath(args.name);
+  let normalized = normalizeArtifactPath(args.name);
+  if (!normalized) {
+    // R2.5 — a logical artifact name outside the manifest charset
+    // (e.g. `a b.txt`, `a?b.txt`) can still resolve deterministically
+    // through the shared compat rule when it is a plain basename with
+    // no traversal — the compat writer's deterministic output is what
+    // this lookup is for. Strictly reject anything with separators.
+    const raw = String(args.name ?? "");
+    if (
+      raw &&
+      !raw.includes("/") &&
+      !raw.includes("\\") &&
+      !raw.includes("\0") &&
+      raw !== "." &&
+      raw !== ".." &&
+      !raw.startsWith("~")
+    ) {
+      normalized = raw;
+    }
+  }
   if (!normalized) return null;
   const rel = normalized.startsWith("outbox/")
     ? normalized.slice("outbox/".length)
@@ -453,7 +448,12 @@ export function resolveDeliveryArtifactPath(args: {
   } catch {
     names = [];
   }
-  const prefixed = names.filter((f) => f.endsWith(`-${rel}`));
+  // R2.5 — ONE canonical naming rule with the compat writer: resolve by
+  // the same sanitized basename the outbox materialization emits
+  // (`<task>-<artfrag>-<compatBasename>`). Distinct logical names that
+  // sanitize alike produce multiple matches -> fail closed, never pick.
+  const compatRel = compatOutboxBasename(rel);
+  const prefixed = names.filter((f) => f.endsWith(`-${compatRel}`));
   if (prefixed.length === 1) return path.join(args.outboxDir, prefixed[0]);
   if (args.workspace) {
     const staged = path.join(args.workspace, normalized);
@@ -925,7 +925,7 @@ export function pendingTelegramDeliveries(
       // is verified over its own materialized bytes.
       let snapshotValid = false;
       {
-        const sr = boundedFileSha256(snapPath);
+        const sr = boundedFileSha256(snapPath, MAX_TELEGRAM_FILE_BYTES);
         snapshotValid = sr.kind === "ok" && sr.sha256 === a.sha256;
       }
       if (!snapshotValid) {
@@ -956,7 +956,7 @@ export function pendingTelegramDeliveries(
         // and hashes THOSE bytes — the same materialized buffer is then
         // staged into the snapshot (never a second source read).
         // Oversized → durable TOO_LARGE with zero full-file read.
-        const br = boundedFileSha256(p);
+        const br = boundedFileSha256(p, MAX_TELEGRAM_FILE_BYTES);
         if (br.kind === "unresolved") {
           a.state = "FAILED_DELIVERY";
           a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
@@ -1000,7 +1000,7 @@ export function pendingTelegramDeliveries(
             fs.closeSync(fd);
           }
           fs.renameSync(tmp, snapPath);
-          const post = boundedFileSha256(snapPath);
+          const post = boundedFileSha256(snapPath, MAX_TELEGRAM_FILE_BYTES);
           if (post.kind !== "ok" || post.sha256 !== a.sha256) {
             throw new Error("snapshot_digest_mismatch");
           }

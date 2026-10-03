@@ -54,6 +54,7 @@ import {
 import {
   boundedFileSha256,
   materializeDeliveryTextPayload,
+  MAX_TELEGRAM_FILE_BYTES,
   mintTelegramDeliveryRequest,
   resolveDeliveryArtifactPath,
   SHA256_HEX_RE,
@@ -428,7 +429,7 @@ export class MissionRuntime {
       let sha: string | null = null;
       let state = "ABSENT";
       if (p) {
-        const br = boundedFileSha256(p);
+        const br = boundedFileSha256(p, MAX_TELEGRAM_FILE_BYTES);
         if (br.kind === "ok") {
           sha = br.sha256;
           state = "PINNED";
@@ -611,7 +612,7 @@ export class MissionRuntime {
       }
       // R5.4 — stat-first settle: an artifact grown beyond the bound
       // converges to TOO_LARGE without any full-file read.
-      const br = boundedFileSha256(p);
+      const br = boundedFileSha256(p, MAX_TELEGRAM_FILE_BYTES);
       if (br.kind !== "ok") {
         return {
           ok: false,

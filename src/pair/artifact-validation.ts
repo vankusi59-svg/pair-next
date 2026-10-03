@@ -9,7 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { newId, pathWithin, sha256File, utcnow } from "./canonical.js";
+import { newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -25,19 +25,37 @@ export class ArtifactProvenanceValidator {
     const workspace = String(governed.workspace);
     const allowedPaths = (governed.allowed_paths as string[]) ?? [workspace];
 
-    const artifacts =
-      (result?.artifacts as Array<Record<string, unknown>> | undefined) ?? [];
     const status = String(result?.status ?? "FAILED");
 
     const validationId = newId("XVLD");
     const failures: string[] = [];
 
+    // R6.2 — the validator is an independent terminal defense: it must
+    // survive malformed result structure even though Gate normally
+    // rejects it first. A non-array `artifacts` fails the validation;
+    // each entry must be a non-null, non-array object — never coerced.
+    // R7.1 — the validator independently requires `artifacts` to be an
+    // array: missing/undefined/null/object/string all FAIL here even
+    // though Gate is normally the canonical ingress. An executor with
+    // nothing to declare must explicitly emit `artifacts: []`.
+    const rawArtifacts: unknown = result?.artifacts;
+    if (!Array.isArray(rawArtifacts)) {
+      failures.push("result.artifacts is not an array");
+    }
+    const artifactEntries: unknown[] = Array.isArray(rawArtifacts) ? rawArtifacts : [];
+
     // Result-state gate: a non-COMPLETED result may never carry validated artifacts.
     const checkedArtifacts: Array<Record<string, unknown>> = [];
-    for (const art of artifacts) {
-      const rel = String(art.path ?? "");
-      if (!rel || path.isAbsolute(rel) || rel.split("/").includes("..")) {
-        failures.push(`artifact path invalid: ${rel || "<empty>"}`);
+    for (const entry of artifactEntries) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        failures.push("artifact entry is not an object");
+        continue;
+      }
+      const art = entry as Record<string, unknown>;
+      const relField: unknown = art.path;
+      const rel = typeof relField === "string" ? relField : "";
+      if (typeof relField !== "string" || !rel || path.isAbsolute(rel) || rel.split("/").includes("..")) {
+        failures.push(`artifact path invalid: ${rel || "<invalid>"}`);
         continue;
       }
       const abs = path.resolve(workspace, rel);
@@ -49,53 +67,105 @@ export class ArtifactProvenanceValidator {
         failures.push(`artifact missing: ${rel}`);
         continue;
       }
-      const actualSha = sha256File(abs);
-      const actualSize = fs.statSync(abs).size;
-      if (art.sha256 && String(art.sha256) !== actualSha) {
-        failures.push(`artifact sha256 mismatch: ${rel}`);
+      // F1 §9: no symlink may mint canonical artifact authority.
+      if (fs.lstatSync(abs).isSymbolicLink()) {
+        failures.push(`artifact symlink: ${rel}`);
         continue;
       }
-      if (art.byte_size !== undefined && Number(art.byte_size) !== actualSize) {
-        failures.push(`artifact byte_size mismatch: ${rel}`);
+      // R5.1 — the worker-result contract is mandatory: every declared
+      // artifact carries its DECLARED sha256 (exactly 64 lowercase hex)
+      // and byte_size (finite non-negative integer). Missing metadata is
+      // a contract failure — PAIR computes actual bytes itself, but it
+      // never computes the worker's declaration for it.
+      const declaredSha = art.sha256;
+      if (typeof declaredSha !== "string" || !/^[0-9a-f]{64}$/.test(declaredSha)) {
+        failures.push(`artifact declaration invalid sha256: ${rel}`);
         continue;
       }
-      checkedArtifacts.push({ ...art, sha256: actualSha, byte_size: actualSize });
+      const declaredSize = art.byte_size;
+      if (
+        typeof declaredSize !== "number" ||
+        !Number.isInteger(declaredSize) ||
+        declaredSize < 0
+      ) {
+        failures.push(`artifact declaration invalid byte_size: ${rel}`);
+        continue;
+      }
+      // R2.2 — the validator performs NO independent content read. The
+      // declared sha256/byte_size are forwarded as expectations; the ONE
+      // authoritative materialization inside ArtifactAuthority reads the
+      // bytes once and compares them, so VALIDATED BYTES == CANONICAL
+      // RETAINED BYTES (no validate-then-reread TOCTOU).
+      checkedArtifacts.push({
+        path: rel,
+        sha256: declaredSha,
+        byte_size: declaredSize,
+      });
     }
 
-    const pass = failures.length === 0 && status === "COMPLETED";
+    let pass = failures.length === 0 && status === "COMPLETED";
     if (!pass && status === "COMPLETED" && failures.length === 0) {
       failures.push("non-completed result cannot pass validation");
+      pass = false;
     }
 
-    if (pass) {
-      for (const art of checkedArtifacts) {
-        const artifactId = newId("ART");
-        store.put(
-          "artifact",
-          artifactId,
-          {
-            artifact_id: artifactId,
-            execution_id: executionId,
-            governed_task_id: governed.governed_task_id,
-            mission_id: execution.mission_id,
-            task_id: execution.task_id,
-            path: art.path,
-            sha256: art.sha256,
-            byte_size: art.byte_size,
-            created_at: utcnow(),
-            version: 0,
-          },
-          0,
-        );
-        store.event({
-          entity_type: "artifact",
-          entity_id: artifactId,
-          event_type: "ARTIFACT_ACCEPTED",
-          new_state: String(art.path),
+    // F1 §5 + R1.6 — local artifacts converge through the ONE canonical
+    // ingest seam as a SINGLE atomic batch: PASS means every required
+    // canonical authority committed; FAIL mints ZERO new ART rows (a
+    // prefix of accepted artifacts can never survive a failed
+    // validation). Previously accepted remote-upload artifacts persist
+    // (they are already canonical) but are not re-minted here.
+    let acceptedIds: string[] = [];
+    if (pass && checkedArtifacts.length) {
+      try {
+        const batch = service.artifacts.acceptBatch({
+          execution_id: executionId,
+          producer_executor_id: String(execution.executor_id),
+          items: checkedArtifacts.map((art) => ({
+            logical_name: String(art.path),
+            source: {
+              kind: "path" as const,
+              path: path.resolve(workspace, String(art.path)),
+            },
+            expected_sha256: String(art.sha256),
+            expected_byte_size: Number(art.byte_size),
+          })),
+          channel: "LOCAL_EXECUTION",
           actor: "PAIR_ARTIFACT_VALIDATOR",
           correlation_id: String(execution.correlation_id),
+          allow_post_result: true,
         });
+        acceptedIds = batch.artifacts.map((a) => String(a.artifact_id));
+      } catch (e) {
+        failures.push(
+          `artifact ingest rejected: ${e instanceof IntegrityError ? e.code : String(e)}`,
+        );
+        pass = false;
       }
+    }
+    // F1 §7 + R5.2 — remote executions return artifacts:[] adapter-
+    // side, but capability-bound uploads already minted canonical ART_*
+    // rows. A terminal PASS may only expose artifact_ids whose retained
+    // CAS bytes verify NOW — the authority re-proves every candidate
+    // row (complete identity + storage contract + retained bytes via
+    // the R4 open-object primitive); ANY malformed or unverifiable row
+    // fails the whole validation rather than being dropped silently.
+    if (pass) {
+      try {
+        const verifiedIds = service.artifacts.verifyForExecution(executionId);
+        acceptedIds.push(...verifiedIds.filter((id) => !acceptedIds.includes(id)));
+      } catch (e) {
+        failures.push(
+          `artifact retained-byte verification failed: ${e instanceof IntegrityError ? `${e.code}:${e.message}` : String(e)}`,
+        );
+        pass = false;
+      }
+    }
+    if (!pass) {
+      // R1.6 — a FAIL exposes zero new local authority; prior remote
+      // references are diagnostics, not PASS authority, so they move to
+      // a separate non-authoritative field.
+      acceptedIds = [];
     }
 
     const validation = store.put(
@@ -109,6 +179,10 @@ export class ArtifactProvenanceValidator {
         status: pass ? "PASS" : "FAIL",
         failures,
         artifact_count: checkedArtifacts.length,
+        artifact_ids: acceptedIds,
+        referenced_artifact_ids: service.artifacts
+          .forExecution(executionId)
+          .map((a) => String(a.artifact_id)),
         created_at: utcnow(),
         version: 0,
       },

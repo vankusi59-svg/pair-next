@@ -809,7 +809,7 @@ describe("P5 handoff, normalization, evidence (18–22)", () => {
     fs.appendFileSync(path.join(ctx.workspace, "agent_out.txt"), "tampered");
     const v2 = new ArtifactProvenanceValidator().validate_execution(ctx.service, execId);
     expect(v2.status).toBe("FAIL");
-    expect(String(v2.failures)).toContain("sha256 mismatch");
+    expect(String(v2.failures)).toContain("DECLARED_MISMATCH");
   }, 40_000);
 
   it("21: restart preserves routing/execution evidence; rehydrated adapter collects result", async () => {

@@ -77,6 +77,129 @@ export function sha256File(filePath: string): string {
   return sha256Hex(fs.readFileSync(filePath));
 }
 
+/** F1/R5 — the ONE canonical stat-first bounded file authority used by
+ *  every governed byte seam (delivery pins/snapshots/transport, artifact
+ *  ingest). NEVER performs an unbounded full read: stat proves
+ *  `size <= maxBytes` FIRST; a successful read additionally proves
+ *  `bytes.length === stat size` (no mid-read growth) and the sha256 is
+ *  computed over THOSE exact materialized bytes. */
+export type BoundedFileResult =
+  | { kind: "ok"; size: number; bytes: Buffer; sha256: string }
+  | { kind: "too_large"; size: number }
+  | { kind: "unresolved" };
+
+export function boundedFileSha256(p: string, maxBytes: number): BoundedFileResult {
+  let size: number;
+  try {
+    size = fs.statSync(p).size;
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (size > maxBytes) return { kind: "too_large", size };
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(p);
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (bytes.length !== size) return { kind: "unresolved" };
+  return { kind: "ok", size, bytes, sha256: sha256Hex(bytes) };
+}
+
+/** F1 — deterministic canonical artifact identity: the same producer
+ *  execution + logical name always resolves the same ART_* id, so an
+ *  idempotent replay converges instead of minting duplicate authority. */
+export function canonicalArtifactId(executionId: string, logicalName: string): string {
+  return `ART_${digest({ execution_id: executionId, logical_name: logicalName }).slice(0, 32).toUpperCase()}`;
+}
+
+/** R2.5 — ONE canonical compat-naming rule shared by the outbox
+ *  materialization writer and the delivery resolver. A logical artifact
+ *  basename is deterministically mapped to its compat filename — two
+ *  distinct logical names MAY share one compat basename, but their
+ *  full compat path stays injective via the artifact-id fragment. */
+export function compatOutboxBasename(logicalName: string): string {
+  return path.basename(String(logicalName)).replace(/[^\w.\-]/g, "_");
+}
+
+/** R2.1 — secure contained file read: binds containment proof and byte
+ *  materialization to the SAME opened file object. `realpath(check) →
+ *  reopen(path)` is a TOCTOU — a parent symlink or directory entry can
+ *  be swapped between resolution and read. Here the fd is opened once
+ *  (O_NOFOLLOW on the final component), the OPENED object's real path
+ *  is resolved through /proc/self/fd (Linux — fails closed where
+ *  unavailable), proven under a governed allowed root, fstat'd, bounded,
+ *  read and length-verified — all on that one fd. Parent-symlink swaps
+ *  after open cannot redirect the already-bound file object. */
+export type SecureContainedReadResult =
+  | { kind: "ok"; size: number; bytes: Buffer }
+  | { kind: "too_large"; size: number }
+  | { kind: "unresolved" }
+  | { kind: "outside" }
+  | { kind: "symlink" };
+
+export function secureReadContained(
+  p: string,
+  maxBytes: number,
+  allowedRoots: string[],
+): SecureContainedReadResult {
+  let fd: number;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") return { kind: "symlink" };
+    return { kind: "unresolved" };
+  }
+  try {
+    const fdPath = `/proc/self/fd/${fd}`;
+    if (!fs.existsSync("/proc/self/fd")) {
+      // No platform seam to prove opened-object containment — fail
+      // closed rather than fall back to a racy pathname check.
+      return { kind: "unresolved" };
+    }
+    let real: string;
+    try {
+      real = fs.realpathSync(fdPath);
+    } catch {
+      return { kind: "unresolved" };
+    }
+    const inside = allowedRoots.some((ap) => {
+      try {
+        return pathWithin(real, fs.realpathSync(ap));
+      } catch {
+        return false;
+      }
+    });
+    if (!inside) return { kind: "outside" };
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!st.isFile()) return { kind: "unresolved" };
+    if (st.size > BigInt(maxBytes)) {
+      return { kind: "too_large", size: Number(st.size) };
+    }
+    const size = Number(st.size);
+    const bytes = Buffer.alloc(size);
+    const read = fs.readSync(fd, bytes, 0, size, 0);
+    if (read !== size) return { kind: "unresolved" };
+    // R3.3 — re-fstat the SAME fd after the read: a file that grew or
+    // was mutated during materialization must never silently pass.
+    // dev/ino pin file identity; size/mtimeNs/ctimeNs pin content
+    // mutation wherever the filesystem exposes them.
+    const st2 = fs.fstatSync(fd, { bigint: true });
+    if (
+      st2.dev !== st.dev ||
+      st2.ino !== st.ino ||
+      st2.size !== st.size ||
+      st2.mtimeNs !== st.mtimeNs ||
+      st2.ctimeNs !== st.ctimeNs
+    ) {
+      return { kind: "unresolved" };
+    }
+    return { kind: "ok", size, bytes };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export function utcnow(): string {
   return new Date().toISOString();
 }

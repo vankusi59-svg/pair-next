@@ -76,6 +76,7 @@ const ALL_CAPS = [
 class ScriptedAdapter implements ExecutorAdapter {
   readonly executor_id: string;
   dispatched: string[] = [];
+  tasks: Record<string, Record<string, unknown>> = {};
   available = true;
   constructor(id: string) {
     this.executor_id = id;
@@ -97,6 +98,7 @@ class ScriptedAdapter implements ExecutorAdapter {
   dispatch(task: Record<string, unknown>) {
     const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
     this.dispatched.push(eid);
+    this.tasks[eid] = task;
     return {
       execution_id: eid,
       status: "COMPLETED",
@@ -110,8 +112,17 @@ class ScriptedAdapter implements ExecutorAdapter {
   cancel() {
     return { status: "CANCELLED" };
   }
-  collect_result() {
-    return { status: "COMPLETED", summary: "ok" };
+  collect_result(executionId: string) {
+    const t = this.tasks[executionId] ?? {};
+    return {
+      status: "COMPLETED",
+      summary: "ok",
+      execution_id: executionId,
+      mission_id: t.mission_id,
+      task_id: t.task_id,
+      governed_task_id: t.governed_task_id,
+      artifacts: [],
+    };
   }
   collect_artifacts() {
     return [];
@@ -964,7 +975,17 @@ try {
       dispatch() { throw new Error("MUST_NOT_DISPATCH_AGAIN"); },
       observe() { return { status: "RUNNING" }; },
       cancel() { return { status: "CANCELLED" }; },
-      collect_result() { return { status: "COMPLETED" }; },
+      collect_result(executionId) {
+        const exec = new PAIR.PairEvidenceStore(dbPath).get("executor_execution", executionId);
+        return {
+          status: "COMPLETED",
+          execution_id: executionId,
+          governed_task_id: exec.governed_task_id,
+          mission_id: exec.mission_id,
+          task_id: exec.task_id,
+          artifacts: [],
+        };
+      },
       collect_artifacts() { return []; },
       health() { return { state: "READY" }; },
       dispatch_evidence() { return { dispatched: true, execution_id: args.evidenceExecId }; },
