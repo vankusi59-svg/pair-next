@@ -1835,12 +1835,26 @@ describe("R1.7 G — production E2E", () => {
         reject(new Error(`server worker exited ${code} buf=${buf}`)),
       );
     });
+    // F5.5 — the simulated deployment HAS the remote ingest lane (the
+    // spawned worker serves /api/outbox with UPMASTER); declare it in env
+    // exactly like the prod start script does so the structural
+    // lane-availability gate sees the same deployment reality.
+    const savedEnv = {
+      PAIR_OUTBOX_URL: process.env.PAIR_OUTBOX_URL,
+      PAIR_ARTIFACT_UPLOAD_TOKEN: process.env.PAIR_ARTIFACT_UPLOAD_TOKEN,
+    };
+    process.env.PAIR_OUTBOX_URL = `http://127.0.0.1:${port}`;
+    process.env.PAIR_ARTIFACT_UPLOAD_TOKEN = UPMASTER;
     return {
       port,
       child: child as ChildProcess,
       close: async () => {
         child.kill("SIGTERM");
         await new Promise<void>((r) => child.on("exit", () => r()));
+        for (const k of Object.keys(savedEnv) as Array<keyof typeof savedEnv>) {
+          if (savedEnv[k] === undefined) delete process.env[k];
+          else process.env[k] = savedEnv[k];
+        }
       },
     };
   };

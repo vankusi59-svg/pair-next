@@ -9,7 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { newId, pathWithin, utcnow } from "./canonical.js";
+import { digest, newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -161,6 +161,64 @@ export class ArtifactProvenanceValidator {
         pass = false;
       }
     }
+    // F5.3 — REMOTE declared-produces closure: a remote execution whose
+    // pinned contract carries `declared_produces` may only reach PASS
+    // when EVERY declared logical name resolves to exactly ONE canonical
+    // verified artifact identity belonging to THIS execution. Completion
+    // prose, remote files, executor claims, filenames or shared-outbox
+    // contents grant zero authority — only ARTIFACT_ACCEPTED rows that
+    // verify NOW count. The approval-scope re-derivation below also
+    // proves the governed contract itself was not mutated post-mint
+    // (a rewritten `declared_produces` or `expected_output_contract`
+    // changes the scope digest and fails closed).
+    const declaredRaw = (
+      governed.expected_output_contract as Record<string, unknown> | undefined
+    )?.declared_produces;
+    let remoteProducesMissing: string[] = [];
+    let declaredProducesDigest: string | null = null;
+    if (pass && Array.isArray(declaredRaw)) {
+      declaredProducesDigest = digest(declaredRaw);
+      const scope = {
+        mission_id: governed.mission_id,
+        task_id: governed.task_id,
+        executor_id: governed.executor_id,
+        workspace: String(governed.workspace),
+        allowed_paths: governed.allowed_paths,
+        permissions: governed.permissions ?? [],
+        expected_output_contract: governed.expected_output_contract,
+        dependency_artifacts_digest: governed.dependency_artifacts_digest,
+      };
+      if (
+        digest(scope) !== String(governed.approval_scope_digest ?? "")
+      ) {
+        failures.push(
+          "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract",
+        );
+        pass = false;
+      } else {
+        const declared = declaredRaw
+          .map((n) => String(n))
+          .filter((n) => n.length > 0);
+        if (declared.length) {
+          const verified = new Set(acceptedIds);
+          const acceptedRows = service.artifacts
+            .forExecution(executionId)
+            .filter((a) => verified.has(String(a.artifact_id)));
+          for (const name of declared) {
+            const identities = acceptedRows.filter(
+              (a) => String(a.logical_name) === name,
+            ).length;
+            if (identities !== 1) remoteProducesMissing.push(name);
+          }
+          if (remoteProducesMissing.length) {
+            for (const name of remoteProducesMissing) {
+              failures.push(`FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`);
+            }
+            pass = false;
+          }
+        }
+      }
+    }
     if (!pass) {
       // R1.6 — a FAIL exposes zero new local authority; prior remote
       // references are diagnostics, not PASS authority, so they move to
@@ -183,6 +241,15 @@ export class ArtifactProvenanceValidator {
         referenced_artifact_ids: service.artifacts
           .forExecution(executionId)
           .map((a) => String(a.artifact_id)),
+        // F5 — bounded typed evidence for the produces gate (no paths,
+        // no secrets, no remote prose): the logical names that failed
+        // closure and the pinned declared-set digest.
+        ...(remoteProducesMissing.length
+          ? { remote_produces_missing: remoteProducesMissing }
+          : {}),
+        ...(declaredProducesDigest
+          ? { declared_produces_digest: declaredProducesDigest }
+          : {}),
         created_at: utcnow(),
         version: 0,
       },
@@ -202,6 +269,15 @@ export class ArtifactProvenanceValidator {
       validation_id: validationId,
       status: pass ? "PASS" : "FAIL",
       failures,
+      ...(remoteProducesMissing.length
+        ? {
+            remote_produces_missing: remoteProducesMissing,
+            declared_produces_digest: declaredProducesDigest,
+            governed_task_id: governed.governed_task_id,
+            task_id: governed.task_id,
+            mission_id: execution.mission_id,
+          }
+        : {}),
     });
     return validation;
   }

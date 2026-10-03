@@ -445,6 +445,22 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     // server's consume-fetch lane: PAIR_ARTIFACT_UPLOAD_TOKEN then
     // PAIR_BROKER_TOKEN (PAIR_OUTBOX_TOKEN is never artifact authority).
     const artifactMaster = artifactConsumeCapabilityMasterFromEnv();
+    // F5.2 — when the governed contract pins declared produces, EVERY
+    // declared logical name is a mandatory canonical upload through the
+    // existing execution-scoped lane — remote workspace existence or
+    // completion prose does not satisfy a declared produce.
+    const declaredRaw = (
+      task.expected_output_contract as Record<string, unknown> | undefined
+    )?.declared_produces;
+    const declaredProduces = Array.isArray(declaredRaw)
+      ? declaredRaw.map((n) => String(n)).filter((n) => n.length > 0)
+      : [];
+    if (declaredProduces.length && !(outboxUrl && artifactMaster)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_REMOTE_INGEST_LANE_UNAVAILABLE",
+        String(task.task_id),
+      );
+    }
     if (outboxUrl && artifactMaster) {
       const executionId = workerExecutionId(this.executor_id, String(task.governed_task_id));
       const cap = mintArtifactCapability(artifactMaster, {
@@ -457,6 +473,13 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       lines.push(
         `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-artifact-capability: ${cap}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Any file type; max 64MB. Do this BEFORE emitting the completion marker.`,
       );
+      if (declaredProduces.length) {
+        lines.push(
+          "Required canonical produced artifacts (MANDATORY — this governed task declared each of them; upload EVERY one through the artifact lane above using the EXACT declared name as \"filename\", BEFORE emitting PAIR_EXECUTION_COMPLETE):",
+          ...declaredProduces.map((n) => `- ${n}`),
+          "A file existing only in your remote workspace does NOT satisfy a declared artifact; failing to upload every declared artifact means the task is NOT complete.",
+        );
+      }
     } else if (outboxUrl && process.env.PAIR_OUTBOX_TOKEN) {
       lines.push(
         `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${process.env.PAIR_OUTBOX_TOKEN}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE emitting the completion marker.`,
