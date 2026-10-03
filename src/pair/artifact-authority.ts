@@ -42,7 +42,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { ulid } from "ulid";
 import {
-  boundedFileSha256,
   canonicalArtifactId,
   secureReadContained,
   sha256Hex,
@@ -658,17 +657,24 @@ export class ArtifactAuthority {
     // must be the content-addressed `blobs/<sha>` — no alternate path,
     // no traversal, no missing ref.
     if (String(storage.ref ?? "") !== `blobs/${p.sha256}`) return false;
-    // …and the retained object must be a REGULAR FILE at the canonical
-    // destination (a symlink whose target happens to match is not a
-    // canonical retained blob).
+    // …and the retained object must verify as a canonical CAS blob:
+    // ONE open-object read (O_NOFOLLOW → same-fd regular/bound/read/
+    // post-fstat) — never lstat→reopen, never a symlink.
     const blobPath = path.join(this.opts.blobDir, p.sha256);
-    try {
-      if (!fs.lstatSync(blobPath).isFile()) return false;
-    } catch {
-      return false;
-    }
-    const blob = boundedFileSha256(blobPath, this.maxBytes);
-    return blob.kind === "ok" && blob.sha256 === p.sha256;
+    const blob = this.readCasBlob(blobPath);
+    return blob !== null && blob.sha256 === p.sha256;
+  }
+
+  /** R4.1 — the ONE canonical CAS read primitive: open once with
+   *  O_RDONLY|O_NOFOLLOW, fstat the SAME fd (regular file), bound,
+   *  read the SAME fd, post-read fstat stability, then hash those
+   *  exact bytes. The object proven regular IS the object hashed —
+   *  lstat→reopen is a TOCTOU and a final-component symlink always
+   *  fails closed. */
+  private readCasBlob(dest: string): { bytes: Buffer; sha256: string } | null {
+    const r = secureReadContained(dest, this.maxBytes, [this.opts.blobDir]);
+    if (r.kind !== "ok") return null;
+    return { bytes: r.bytes, sha256: sha256Hex(r.bytes) };
   }
 
   /** R3.1/R2.6 — the ONE directory-durability barrier: parent-dir
@@ -699,25 +705,19 @@ export class ArtifactAuthority {
   private persistBlob(sha256: string, bytes: Buffer): void {
     const dir = this.opts.blobDir;
     const dest = path.join(dir, sha256);
-    // R3.2 — reuse requires a REGULAR FILE at the canonical
-    // destination; a symlink is never trusted as a retained blob.
-    let isRegular = false;
-    try {
-      isRegular = fs.lstatSync(dest).isFile();
-    } catch {
-      isRegular = false;
-    }
-    if (isRegular) {
-      const existing = boundedFileSha256(dest, this.maxBytes);
-      if (existing.kind === "ok" && existing.sha256 === sha256) {
-        // R3.1 — a reused blob backing a NEW authority mint must still
-        // carry a successful durability barrier: a previous failed
-        // dir-fsync cannot be bypassed just because the renamed bytes
-        // remain visible. Never unlink — the blob may already back
-        // another canonical artifact; re-prove the barrier instead.
-        this.ensureBlobDirectoryDurable(dir, sha256);
-        return;
-      }
+    // R4.1 — reuse proof through the SAME open-object primitive: a
+    // matching digest on the OPENED regular file may be reused; a
+    // symlink or a torn/mismatched object falls through to rewrite
+    // (rename atomically replaces whatever sat at dest).
+    const existing = this.readCasBlob(dest);
+    if (existing !== null && existing.sha256 === sha256) {
+      // R3.1 — a reused blob backing a NEW authority mint must still
+      // carry a successful durability barrier: a previous failed
+      // dir-fsync cannot be bypassed just because the renamed bytes
+      // remain visible. Never unlink — the blob may already back
+      // another canonical artifact; re-prove the barrier instead.
+      this.ensureBlobDirectoryDurable(dir, sha256);
+      return;
     }
     fs.mkdirSync(dir, { recursive: true });
     const tmp = path.join(dir, `${sha256}.tmp-${process.pid}-${ulid()}`);
@@ -731,8 +731,8 @@ export class ArtifactAuthority {
     fs.renameSync(tmp, dest);
     // R1.9/R3.1 — commit the directory entry through the same barrier.
     this.ensureBlobDirectoryDurable(dir, sha256);
-    const post = boundedFileSha256(dest, this.maxBytes);
-    if (post.kind !== "ok" || post.sha256 !== sha256) {
+    const post = this.readCasBlob(dest);
+    if (post === null || post.sha256 !== sha256) {
       try {
         fs.unlinkSync(dest);
       } catch {

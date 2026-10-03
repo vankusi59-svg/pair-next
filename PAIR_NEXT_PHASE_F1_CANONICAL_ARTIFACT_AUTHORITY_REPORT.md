@@ -363,3 +363,39 @@ src/__tests__/pair-p2.test.ts / pair-p5.test.ts   failure-code expectation → D
 - `dependency_artifacts` / downstream consumer materialization remain deferred to F2 (non-ACCEPTED rows stay non-authoritative).
 
 Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R3_PENDING_SOURCE_REVIEW`
+
+---
+
+## INDEPENDENT SOURCE-REVIEW R4 REMEDIATION
+
+- **Previous reviewed HEAD:** `db4932f4852a286f28a709761314fc59297f46ab`
+- **New HEAD:** `<pending>`
+- **Changed files:** `src/pair/artifact-authority.ts`, `src/__tests__/pair-f1-r2-remediation.test.ts`, `src/__tests__/fixtures/f1-worker-accept.mts`, `CURRENT_STATE.md`, this report.
+
+### RCA — R4.1 CAS REGULAR-FILE READ MUST BE OPEN-OBJECT BOUND
+
+- **Root cause:** `isCanonicalPrior` and `persistBlob` existing-blob reuse proved "regular file" via `lstat(path)` then hashed via `boundedFileSha256(path)` — which REOPENS the pathname. The object proven regular was not guaranteed to be the object actually read/hashed (path-swap TOCTOU).
+- **Fix:** ONE canonical CAS read primitive `readCasBlob(dest)` wraps `secureReadContained` — open once `O_RDONLY|O_NOFOLLOW` → fstat SAME fd (regular) → bound → read SAME fd → post-read fstat stability → `sha256Hex` of those exact bytes. The object proven regular IS the object hashed; a final-component symlink is rejected at open. Used for: (1) retained-CAS prior proof, (2) existing-blob reuse decision, (3) post-rename verification.
+- **Adversarial proof:** R4-D1 CAS dest swapped to symlink→external matching bytes → `REPLAY_CONFLICT`; D2 static symlink at dest → never reused (seam rewrites a REAL blob, mint proceeds correctly); D3 regular blob → converges; D4 corrupt regular blob → conflict; D5 fresh write → mint.
+
+### RCA — R4.2 TRUE CONCURRENCY TEST NEEDS A REAL READY BARRIER
+
+- **Root cause:** children waited on `goFile` BEFORE constructing the store, while the parent merely slept 800ms — no proof every child actually reached the barrier; sleep was correctness authority.
+- **Fix:** READY+GO at the exact pre-BEGIN-IMMEDIATE seam, test-only: each worker creates its own `PairEvidenceStore`, wraps ITS OWN `store.immediate()` — first invocation writes a unique READY file, busy-waits for GO, then delegates to the ORIGINAL immediate (production semantics untouched). Parent polls until EVERY READY exists, then writes GO. No sleep establishes readiness.
+- **Proof under `rm -rf dist`:** all 4 races pass on CURRENT SOURCE via tsx — 31+2→32 (1 success+1 COUNT), 30+3→32, same-id same-bytes→converge, same-id diff-bytes→1 authority+1 REPLAY_CONFLICT.
+
+### Validation (final HEAD)
+
+- R2/R3/R4 file: **48/48** — clean-checkout proof ran under `rm -rf dist`
+- Focused F1+R1+contract+ops+incident+runtime+p9: **302/302**
+- Full suite on final HEAD: **2904 pass / 2 fail / 15 skipped** — only the known P5 env-only `stockProbe.available` fails (reproduce on base `6ff9d35`)
+- `npx tsc --noEmit` 0 errors · `pnpm build` PASS · `pnpm audit --audit-level=high` → 0 high/critical (1 low, 8 moderate baseline)
+- Remote DAG-leaf restriction diff = 0; F2/F3/P15 untouched; ONE artifact entity/contract seam unchanged
+
+### Remaining limitations
+
+- `/proc/self/fd` containment is Linux-semantics; non-Linux fails closed by design.
+- Same-size mutations within one kernel timestamp tick are filesystem-unobservable; every observable mutation fails closed.
+- `dependency_artifacts` / downstream consumer materialization remain deferred to F2.
+
+Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R4_PENDING_SOURCE_REVIEW`

@@ -658,12 +658,12 @@ describe("R2-G true multi-process count races", () => {
     fs.writeFileSync(src1, "R1");
     fs.writeFileSync(src2, "R2");
     const go = path.join(ctx.d, "go");
+    const ready = [path.join(ctx.d, "rdy-a"), path.join(ctx.d, "rdy-b")];
     const pending = [
-      raceWorker(ctx, p.eid, "r1.bin", src1, go),
-      raceWorker(ctx, p.eid, "r2.bin", src2, go),
+      raceWorker(ctx, p.eid, "r1.bin", src1, go, ready[0]),
+      raceWorker(ctx, p.eid, "r2.bin", src2, go, ready[1]),
     ];
-    // small settle so both children are blocked on the barrier
-    await new Promise((r) => setTimeout(r, 800));
+    await waitAllReady(ready);
     fs.writeFileSync(go, "");
     const results = await Promise.all(pending);
     expect(results.filter((r) => r.ok)).toHaveLength(1);
@@ -681,8 +681,11 @@ describe("R2-G true multi-process count races", () => {
       return fp;
     });
     const go = path.join(ctx.d, "go");
-    const pending = files.map((f) => raceWorker(ctx, p.eid, path.basename(f), f, go));
-    await new Promise((r) => setTimeout(r, 800));
+    const ready = files.map((_f, i) => path.join(ctx.d, `rdy-${i}`));
+    const pending = files.map((f, i) =>
+      raceWorker(ctx, p.eid, path.basename(f), f, go, ready[i]),
+    );
+    await waitAllReady(ready);
     fs.writeFileSync(go, "");
     const results = await Promise.all(pending);
     expect(results.filter((r) => r.ok)).toHaveLength(2);
@@ -698,11 +701,12 @@ describe("R2-G true multi-process count races", () => {
     fs.writeFileSync(src1, "SAME");
     fs.writeFileSync(src2, "SAME");
     const go = path.join(ctx.d, "go");
+    const ready = [path.join(ctx.d, "rdy-a"), path.join(ctx.d, "rdy-b")];
     const pending = [
-      raceWorker(ctx, p.eid, "dup.bin", src1, go),
-      raceWorker(ctx, p.eid, "dup.bin", src2, go),
+      raceWorker(ctx, p.eid, "dup.bin", src1, go, ready[0]),
+      raceWorker(ctx, p.eid, "dup.bin", src2, go, ready[1]),
     ];
-    await new Promise((r) => setTimeout(r, 800));
+    await waitAllReady(ready);
     fs.writeFileSync(go, "");
     const results = await Promise.all(pending);
     expect(results.filter((r) => r.ok)).toHaveLength(2);
@@ -719,11 +723,12 @@ describe("R2-G true multi-process count races", () => {
     fs.writeFileSync(src1, "AAA");
     fs.writeFileSync(src2, "BBB");
     const go = path.join(ctx.d, "go");
+    const ready = [path.join(ctx.d, "rdy-a"), path.join(ctx.d, "rdy-b")];
     const pending = [
-      raceWorker(ctx, p.eid, "conflict.bin", src1, go),
-      raceWorker(ctx, p.eid, "conflict.bin", src2, go),
+      raceWorker(ctx, p.eid, "conflict.bin", src1, go, ready[0]),
+      raceWorker(ctx, p.eid, "conflict.bin", src2, go, ready[1]),
     ];
-    await new Promise((r) => setTimeout(r, 800));
+    await waitAllReady(ready);
     fs.writeFileSync(go, "");
     const results = await Promise.all(pending);
     expect(results.filter((r) => r.ok)).toHaveLength(1);
@@ -738,14 +743,15 @@ describe("R2-G true multi-process count races", () => {
   }, 90000);
 });
 
-/** Spawn ONE worker process blocked on `go` file; returns a promise of
- *  its JSON result. */
+/** Spawn ONE worker parked at the READY+GO barrier inside its own
+ *  store.immediate() seam; returns a promise of its JSON result. */
 function raceWorker(
   ctx: ReturnType<typeof mkCtx>,
   eid: string,
   name: string,
   src: string,
   go: string,
+  ready: string,
 ): Promise<{ ok: boolean; replayed?: boolean; code?: string }> {
   const out = path.join(ctx.d, `w-${seq++}.json`);
   return new Promise((resolve) => {
@@ -761,6 +767,7 @@ function raceWorker(
         name,
         src,
         go,
+        ready,
         out,
       ],
       { timeout: 60000 },
@@ -774,6 +781,18 @@ function raceWorker(
     );
     child.on("error", () => resolve({ ok: false, code: "WORKER_SPAWN_FAIL" }));
   });
+}
+
+/** R4.2 — REAL barrier: wait until EVERY worker's READY file exists
+ *  (each is written inside that worker's own store.immediate() seam,
+ *  i.e. parked at the pre-BEGIN-IMMEDIATE boundary), THEN fire GO.
+ *  No sleep establishes readiness. */
+async function waitAllReady(readyFiles: string[]): Promise<void> {
+  const dl = Date.now() + 60000;
+  while (!readyFiles.every((f) => fs.existsSync(f))) {
+    if (Date.now() > dl) throw new Error("READY_BARRIER_TIMEOUT");
+    await new Promise((r) => setTimeout(r, 25));
+  }
 }
 
 /* ==================== R3.1 durability barrier not retry-bypassable ======= */
@@ -1076,5 +1095,108 @@ describe("R3-C secure same-fd read stability", () => {
         }),
       ),
     ).toBe("FAIL_CLOSED_ARTIFACT_TOO_LARGE");
+  });
+});
+
+/* ==================== R4.1 CAS open-object bound reads ================== */
+describe("R4-D CAS regular-file proof bound to the read object", () => {
+  const acceptX = (
+    ctx: ReturnType<typeof mkCtx>,
+    eid: string,
+    bytes: Buffer,
+    name = "a.txt",
+  ) =>
+    ctx.authority.accept({
+      execution_id: eid,
+      producer_executor_id: EX,
+      logical_name: name,
+      source: { kind: "buffer", bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+  const closeExec = (ctx: ReturnType<typeof mkCtx>, eid: string) => {
+    const exRow = ctx.store.get("executor_execution", eid) as Record<string, unknown>;
+    ctx.store.put(
+      "executor_execution",
+      eid,
+      { ...exRow, result: { status: "COMPLETED" }, execution_state: "COMPLETED" },
+      Number(exRow.version),
+    );
+  };
+  const replayX = (ctx: ReturnType<typeof mkCtx>, eid: string, bytes: Buffer, name = "a.txt") =>
+    run(() =>
+      ctx.authority.accept({
+        execution_id: eid,
+        producer_executor_id: EX,
+        logical_name: name,
+        source: { kind: "buffer", bytes },
+        channel: "REMOTE_UPLOAD",
+        actor: "T",
+      }),
+    );
+
+  it("R4-D1 forged regular-file lstat while dest is a symlink → never qualifies", () => {
+    const ctx = mkCtx("r4d1");
+    const p = mkProducer(ctx);
+    const bytes = Buffer.from("D1");
+    const acc = acceptX(ctx, p.eid, bytes);
+    const blob = blobPath(ctx, String(acc.artifact.sha256));
+    const ext = path.join(ctx.d, "ext.bin");
+    fs.writeFileSync(ext, bytes);
+    fs.unlinkSync(blob);
+    fs.symlinkSync(ext, blob);
+    // Whatever any earlier stat-based proof would have reported, the
+    // opened object is still a symlink → O_NOFOLLOW rejects it.
+    closeExec(ctx, p.eid);
+    expect(replayX(ctx, p.eid, bytes)).toBe("FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT");
+  });
+  it("R4-D2 static CAS symlink at dest → fail closed, never reused", () => {
+    const ctx = mkCtx("r4d2");
+    const p1 = mkProducer(ctx);
+    const bytes = Buffer.from("D2");
+    const acc = acceptX(ctx, p1.eid, bytes, "a.txt");
+    const blob = blobPath(ctx, String(acc.artifact.sha256));
+    const ext = path.join(ctx.d, "ext2.bin");
+    fs.writeFileSync(ext, bytes);
+    fs.unlinkSync(blob);
+    fs.symlinkSync(ext, blob);
+    // persistBlob reuse on a SECOND execution with same bytes: symlink
+    // is never trusted → the seam rewrites a real CAS file and mints.
+    const p2 = mkProducer(ctx);
+    const r = acceptX(ctx, p2.eid, bytes, "b.txt");
+    expect(fs.lstatSync(blob).isFile() && !fs.lstatSync(blob).isSymbolicLink()).toBe(true);
+    expect(String(r.artifact.sha256)).toBe(String(acc.artifact.sha256));
+  });
+  it("R4-D3 regular correct CAS blob → replay converges", () => {
+    const ctx = mkCtx("r4d3");
+    const p = mkProducer(ctx);
+    const bytes = Buffer.from("D3");
+    acceptX(ctx, p.eid, bytes);
+    closeExec(ctx, p.eid);
+    const r = ctx.authority.accept({
+      execution_id: p.eid,
+      producer_executor_id: EX,
+      logical_name: "a.txt",
+      source: { kind: "buffer", bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    expect(r.replayed).toBe(true);
+  });
+  it("R4-D4 corrupt regular blob → not canonical prior", () => {
+    const ctx = mkCtx("r4d4");
+    const p = mkProducer(ctx);
+    const bytes = Buffer.from("D4");
+    const acc = acceptX(ctx, p.eid, bytes);
+    fs.writeFileSync(blobPath(ctx, String(acc.artifact.sha256)), "CORRUPTED");
+    closeExec(ctx, p.eid);
+    expect(replayX(ctx, p.eid, bytes)).toBe("FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT");
+  });
+  it("R4-D5 fresh write path unchanged → mints", () => {
+    const ctx = mkCtx("r4d5");
+    const p = mkProducer(ctx);
+    const r = acceptX(ctx, p.eid, Buffer.from("D5"), "fresh.txt");
+    expect(r.replayed).toBe(false);
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(1);
   });
 });
