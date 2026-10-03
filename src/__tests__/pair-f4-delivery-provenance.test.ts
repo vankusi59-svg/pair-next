@@ -57,6 +57,8 @@ import {
   TELEGRAM_DELIVERY_MINTED,
   TELEGRAM_DELIVERY_ATTEMPT_STARTED,
   TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
+  deliveryAttemptLedger,
+  reconcileStaleDeliveryAttempts,
   deliverySnapshotRoot,
 } from "../pair/index.js";
 import type {
@@ -2670,5 +2672,328 @@ describe("F4 R4 — final send-gate closure", () => {
     expect(row.attempt_count).toBe(1);
     expect(rec.calls).toHaveLength(1);
     expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(2);
+  });
+});
+
+describe("Phase F4 R5 — transactional reconcile + budget-aware ledger", () => {
+  const attemptEv = (
+    ctx: ReturnType<typeof makeCtx>,
+    mid: string,
+    kind: string,
+  ) =>
+    evidence(ctx, mid, kind).map(
+      (ev) =>
+        (ev.payload as Record<string, unknown>)
+          .payload as Record<string, unknown>,
+    );
+
+  const failRec = () => {
+    const calls: Array<Record<string, unknown>> = [];
+    return {
+      calls,
+      transport: {
+        send: async (args: Record<string, unknown>) => {
+          calls.push(args);
+          return { kind: "fail" as const, error: "boom" };
+        },
+      },
+    };
+  };
+
+  const beginDirect = (
+    ctx: ReturnType<typeof makeCtx>,
+    req: Record<string, unknown>,
+  ) =>
+    ctx.control.transitionTelegramDelivery(String(req.delivery_id), {
+      to: "SENDING",
+    });
+  const resolveDirect = (
+    ctx: ReturnType<typeof makeCtx>,
+    req: Record<string, unknown>,
+    input: Record<string, unknown>,
+  ) =>
+    ctx.control.transitionTelegramDelivery(String(req.delivery_id), input);
+
+  const attId = (entityId: string, slot: string, n: number) =>
+    `ATT_${digest(`${entityId}:${slot}:${n}`).slice(0, 16)}`;
+
+  /** Append a canonical STARTED/RESOLVED pair directly into durable
+   *  evidence (append-only — the historical-fault seam). */
+  const appendHistory = (
+    ctx: ReturnType<typeof makeCtx>,
+    mid: string,
+    entityId: string,
+    slot: string,
+    seq: Array<"STARTED" | "FAILED" | "SENT" | "UNKNOWN">,
+    sentMessageId: unknown = 7777,
+  ) => {
+    let n = 0;
+    for (const step of seq) {
+      if (step === "STARTED") {
+        n += 1;
+        ctx.store.appendEvidence(mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED, {
+          delivery_id: entityId,
+          slot,
+          attempt_id: attId(entityId, slot, n),
+          attempt_number: n,
+          started_at: "2026-10-04T00:00:00.000Z",
+        });
+      } else {
+        ctx.store.appendEvidence(mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED, {
+          delivery_id: entityId,
+          slot,
+          attempt_id: attId(entityId, slot, n),
+          attempt_number: n,
+          outcome: step,
+          message_id: step === "SENT" ? sentMessageId : null,
+          error: step === "FAILED" ? "boom" : null,
+          resolved_at: "2026-10-04T00:05:00.000Z",
+        });
+      }
+    }
+  };
+
+  it("R5.1-race: a competing writer between candidate discovery and the reconcile transaction cannot mint an incorrect UNKNOWN", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R5RACE1";
+    const { req: td } = mkBoundTextTdr(ctx, { missionId: mid, text: "race" });
+    beginDirect(ctx, td);
+    const row = deliveries(ctx).find((d) => d.delivery_id === td.delivery_id)!;
+    expect(row.text_state).toBe("SENDING");
+    // Simulate a second writer landing BETWEEN the outer candidate list
+    // and reconcile's authority check: it refreshes attempt_started_at
+    // so the attempt is no longer stale.
+    const origList = ctx.store.list.bind(ctx.store);
+    let injected = false;
+    const spy = vi.spyOn(ctx.store, "list").mockImplementation(((
+      entityType: string,
+    ) => {
+      const rows = origList(entityType);
+      if (entityType === "telegram_delivery_request" && !injected) {
+        injected = true;
+        const cur = origList(entityType).find(
+          (r) => String(r.entity_id) === String(row.entity_id),
+        )!;
+        ctx.store.put(
+          entityType,
+          String(cur.entity_id),
+          {
+            ...cur,
+            attempt_started_at: "2026-10-05T01:59:30.000Z",
+          },
+          Number(cur.version),
+        );
+      }
+      return rows;
+    }) as typeof ctx.store.list);
+    try {
+      reconcileStaleDeliveryAttempts(ctx.store, "2026-10-05T02:00:00.000Z");
+    } finally {
+      spy.mockRestore();
+    }
+    const after = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    // The in-transaction reload saw the fresh started_at → untouched,
+    // zero incorrect RESOLVED UNKNOWN evidence.
+    expect(after.text_state).toBe("SENDING");
+    expect(
+      attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED),
+    ).toHaveLength(0);
+  });
+
+  it("R5.1-crash: a fault between evidence append and row write rolls back both", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R5CRASH1";
+    const { req: td } = mkBoundTextTdr(ctx, { missionId: mid, text: "crash" });
+    beginDirect(ctx, td);
+    const before = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    expect(before.text_state).toBe("SENDING");
+    const origAppend = ctx.store.appendEvidence.bind(ctx.store);
+    const spy = vi
+      .spyOn(ctx.store, "appendEvidence")
+      .mockImplementation((
+        missionId: string,
+        kind: string,
+        payload: Record<string, unknown>,
+      ) => {
+        const out = origAppend(missionId, kind, payload);
+        if (kind === TELEGRAM_DELIVERY_ATTEMPT_RESOLVED) {
+          throw new Error("crash-after-append");
+        }
+        return out;
+      });
+    try {
+      expect(() =>
+        reconcileStaleDeliveryAttempts(ctx.store, "2026-10-05T02:00:00.000Z"),
+      ).toThrow(/crash-after-append/);
+    } finally {
+      spy.mockRestore();
+    }
+    // Whole transaction rolled back: zero evidence AND row unchanged.
+    expect(
+      attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED),
+    ).toHaveLength(0);
+    const after = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    expect(after.text_state).toBe("SENDING");
+    expect(after.attempt_started_at).toBe(before.attempt_started_at);
+  });
+
+  it("R5.5A: over-budget immutable history (STARTED #4 > max_attempts 3) makes the ledger invalid everywhere", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R5OB1";
+    const { req: td } = mkBoundTextTdr(ctx, {
+      missionId: mid,
+      text: "over-budget",
+      maxAttempts: 3,
+    });
+    const entityId = String(td.entity_id);
+    appendHistory(ctx, mid, entityId, "text", [
+      "STARTED", "FAILED",
+      "STARTED", "FAILED",
+      "STARTED", "FAILED",
+      "STARTED",
+    ]);
+    // Ledger itself is invalid — over the immutable ceiling.
+    const ledger = deliveryAttemptLedger(ctx.store, mid, entityId, () => 3);
+    expect(ledger.valid).toBe(false);
+    expect(ledger.slots.get("text")?.seqError).toBe("started_over_ceiling");
+    // Forge a coherent SENDING projection claiming the open attempt #4.
+    const row = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    rewrite(ctx, row, {
+      ...row,
+      text_state: "SENDING",
+      attempt_id: attId(entityId, "text", 4),
+      attempt_number: 4,
+      attempt_started_at: "2026-10-04T00:00:00.000Z",
+      attempt_count: 3,
+    });
+    // Stale reconcile: bound + contract-ok but invalid ledger →
+    // quarantine, ZERO resolved evidence minted.
+    reconcileStaleDeliveryAttempts(ctx.store, "2026-10-05T02:00:00.000Z");
+    expect(
+      attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED),
+    ).toHaveLength(3);
+    const q = deliveries(ctx).find((d) => d.delivery_id === td.delivery_id)!;
+    expect(q.status).toBe("FAILED_DELIVERY");
+    // Direct resolve denied on the invalid ledger.
+    expect(() =>
+      resolveDirect(ctx, q, { to: "SENT", message_id: 9999 }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY/);
+    // Direct begin denied too (row forged QUEUED over the bad ledger).
+    rewrite(ctx, q, { ...q, status: "QUEUED", text_state: "QUEUED", last_error: null });
+    expect(() => beginDirect(ctx, q)).toThrow(
+      /FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE/,
+    );
+    // Pending: zero eligible payloads.
+    expect(pendingTelegramDeliveries(ctx.store, "2026-10-05T02:00:00.000Z")).toHaveLength(0);
+  });
+
+  it("R5.5B: forged QUEUED row over a 3-FAILED exhausted history still gets no attempt #4 authority", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R5OB2";
+    const { req: td } = mkBoundTextTdr(ctx, {
+      missionId: mid,
+      text: "exhausted",
+      maxAttempts: 3,
+    });
+    const entityId = String(td.entity_id);
+    appendHistory(ctx, mid, entityId, "text", [
+      "STARTED", "FAILED",
+      "STARTED", "FAILED",
+      "STARTED", "FAILED",
+    ]);
+    const row = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    rewrite(ctx, row, {
+      ...row,
+      text_state: "QUEUED",
+      attempt_count: 3,
+    });
+    expect(() => beginDirect(ctx, row)).toThrow(
+      /FAIL_CLOSED_TELEGRAM_DELIVERY/,
+    );
+    expect(
+      attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED),
+    ).toHaveLength(3);
+  });
+
+  it.each([
+    { label: "zero", mid2: 0 },
+    { label: "string", mid2: "7777" },
+    { label: "negative", mid2: -42 },
+  ])("R5.5C: RESOLVED SENT with message_id=$label is an invalid ledger, not terminal authority", ({ mid2 }) => {
+    const ctx = makeCtx();
+    const mid = "MSN_R5SENT";
+    const { req: td } = mkBoundTextTdr(ctx, { missionId: mid, text: "fake sent" });
+    const entityId = String(td.entity_id);
+    appendHistory(
+      ctx, mid, entityId, "text", ["STARTED", "SENT"], mid2,
+    );
+    const ledger = deliveryAttemptLedger(ctx.store, mid, entityId, () => 3);
+    expect(ledger.valid).toBe(false);
+    expect(ledger.slots.get("text")?.seqError).toBe("sent_invalid_message_id");
+    // A coherent QUEUED row may not resurrect against this ledger.
+    const row = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    rewrite(ctx, row, { ...row, text_state: "QUEUED" });
+    expect(() => beginDirect(ctx, row)).toThrow(
+      /FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE/,
+    );
+  });
+
+  it("R5.5D control: 1F + 2F + 3SENT(valid id) is a valid canonical terminal history", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R5CTL1";
+    const { req: td } = mkBoundTextTdr(ctx, {
+      missionId: mid,
+      text: "terminal",
+      maxAttempts: 3,
+    });
+    const entityId = String(td.entity_id);
+    appendHistory(ctx, mid, entityId, "text", [
+      "STARTED", "FAILED",
+      "STARTED", "FAILED",
+      "STARTED", "SENT",
+    ], 8888);
+    const ledger = deliveryAttemptLedger(ctx.store, mid, entityId, () => 3);
+    expect(ledger.valid).toBe(true);
+    const h = ledger.slots.get("text")!;
+    expect(h.started).toBe(3);
+    expect(h.consumed).toBe(2);
+    expect(h.terminal).toBe("SENT");
+  });
+
+  it("R5.5E control: append-only FAILED history still drives a clean retry", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R5CTL2";
+    const { req: td } = mkBoundTextTdr(ctx, { missionId: mid, text: "retry" });
+    const entityId = String(td.entity_id);
+    appendHistory(ctx, mid, entityId, "text", ["STARTED", "FAILED"]);
+    const row = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    rewrite(ctx, row, {
+      ...row,
+      text_state: "QUEUED",
+      attempt_count: 1,
+    });
+    await runTransport(ctx, { transport: recordingTransport().transport });
+    const after = deliveries(ctx).find(
+      (d) => d.delivery_id === td.delivery_id,
+    )!;
+    expect(after.status).toBe("SENT");
+    expect(after.text_state).toBe("SENT");
+    const started = attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED);
+    expect(started).toHaveLength(2);
+    expect(Number(started[1]!.attempt_number)).toBe(2);
   });
 });

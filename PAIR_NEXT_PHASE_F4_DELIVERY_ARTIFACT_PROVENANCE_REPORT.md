@@ -663,13 +663,106 @@ Only the two known env-only `pair-p5` executable-probe failures remain —
 reproduced on canonical base `3e17525` (DSH/CODEX executables present in this
 environment make `probe().available === true`).
 
+## F4 R5 — transactional reconcile + budget-aware ledger closure
+
+Audit verdict on R4 (`9cdc03c`): R4.1/R4.2/R4.3 PASS; **R4.4 BLOCKED** —
+stale reconcile verified outside its writer transaction (check-then-write
+race); **R4.5** logically PASS but must run inside that transaction;
+**R4.6 PARTIAL** — the sequence ledger did not know the immutable mint
+`max_attempts`, so an over-budget append-only history (STARTED #4 under a
+ceiling of 3) was "structurally valid".
+
+### R5.1 — one writer transaction for stale reconcile
+
+`reconcileStaleDeliveryAttempts` re-shaped: the outer `store.list` now
+yields **candidate entity ids only — never authority**. For each candidate
+id, ONE `store.immediate` performs, in order: (1) canonical reload by
+`entity_id`, (2) current status/state check, (3) single mint-receipt
+resolution via the shared `deliveryStaticAuthority`, (4) full static
+send-contract re-proof, (5) immutable ledger rebuild, (6) ledger
+validation, (7) exact SENDING slot identification, (8) exact unresolved
+STARTED identity proof, (9) stale-threshold re-check against the CURRENT
+durable `attempt_started_at`, (10) `RESOLVED UNKNOWN` evidence append,
+(11) `UNKNOWN_SIDE_EFFECT` projection write — **all or nothing**. A
+competing writer landing between candidate discovery and the transaction
+cannot interleave (BEGIN IMMEDIATE serializes writers): a refreshed
+`attempt_started_at` is re-read in-transaction and no incorrect UNKNOWN is
+minted; a fault between evidence append and row write rolls back both
+(proven by tests).
+
+### R5.2 — budget-aware immutable ledger
+
+`deliveryAttemptLedger` accepts a per-slot immutable ceiling
+(`ceilingFor`) resolved from the mint receipt via
+`deliveryCeilingFromReceipt` — receipt `max_attempts` (TEXT/request) or
+the per-artifact ceiling (FILES); `null` for unbound/legacy rows, which
+keep legacy semantics. A STARTED whose `attempt_number` exceeds the
+ceiling yields `seqError: started_over_ceiling` → **ledger INVALID**, not
+merely non-sendable: every authority seam (pending, begin, resolve, stale
+reconcile) fails closed on `ledger_invalid`. Since each FAILED resolve
+pairs a STARTED within the ceiling, consumed failures can never exceed
+it; a STARTED after FAILED-at-ceiling is illegal by the same rule.
+Mutable `max_attempts` is never authority for receipt-bound rows.
+
+### R5.3 — terminal SENT requires canonical acceptance evidence
+
+A `RESOLVED { outcome: SENT, message_id: invalid }` can no longer
+establish terminal SENT authority: inside the ledger's sequence walk a
+SENT outcome requires `isValidTelegramMessageId(message_id)` (positive
+safe integer) or the slot history is `sent_invalid_message_id` → invalid.
+UNKNOWN/FAILED outcome semantics unchanged.
+
+### R5.4 — corrected R4.D replay test
+
+`R4.D` now reads the ACTUAL immutable `attempt_id`/`attempt_number` from
+`ev.payload.payload` (the `listEvidence` wrapper), asserts the
+deterministic `ATT_<digest(entity:slot:1)>` form, rewrites the mutable
+row to SENDING replaying that exact identity, and proves: real resolve →
+`FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE`, exactly one RESOLVED remains,
+no second SENT authority.
+
+### R5.5 — adversarial proofs
+
+| Test | Proof |
+|---|---|
+| R5.1-race | competing writer refreshes `attempt_started_at` between candidate list and txn → row untouched, ZERO RESOLVED UNKNOWN |
+| R5.1-crash | throw after `appendEvidence` inside the txn → both evidence and row write rolled back |
+| R5.5A | ceiling 3 + history 1F/2F/3F/STARTED4 → `started_over_ceiling`; stale reconcile → quarantine, ZERO new evidence; direct resolve denied; direct begin denied; pending empty |
+| R5.5B | ceiling 3 + history 1F/2F/3F + forged QUEUED/count3 row → begin denied, no attempt #4 authority |
+| R5.5C | RESOLVED SENT with message_id 0 / "7777" / -42 → `sent_invalid_message_id`, ledger invalid, begin denied |
+| R5.5D | control — 1F/2F/3SENT(valid id) → valid canonical terminal history (started=3, consumed=2, terminal SENT) |
+| R5.5E | control — append-only 1F + forged QUEUED/count1 → clean canonical retry attempt #2 SENT |
+
+## Validation
+
+| Suite | Result |
+|---|---|
+| `pair-f4-delivery-provenance` (A1–A11 + R1 + R2 + R3 + R4 + R5) | 61/61 |
+| `pair-output-delivery-contract` | 69/69 |
+| `pair-planner-dataflow-incident` | 106/106 |
+| `pair-ops-telegram-delivery` + `pair-live-ops-recovery-closure` | 23/23 |
+| `pair-f1-*` + `pair-f2-*` | 297/297 |
+| `pair-f3-*` + phase-d + runtime | 120/120 |
+| `rm -rf dist` → `pnpm build` | PASS |
+| `npx tsc --noEmit` | 0 errors |
+| **Full repository regression** | **3241 pass / 2 fail** |
+| `pnpm audit --audit-level=high` | 0 high (1 low / 8 moderate) |
+
+Only the two known env-only `pair-p5` executable-probe failures remain —
+reproduced on canonical base `3e17525` (DSH/CODEX executables present in
+this environment make `probe().available === true`).
+
 ## Remaining limitations
 
 - Legacy (pre-F4, no receipt + no binding fields) rows keep the hash-only
-  path and mint no lifecycle evidence until a begin creates their first
+  path and no immutable ceiling check until a begin creates their first
   STARTED — from then on the ledger rules apply to them too.
 - `deliveryAttemptLedger` validates per-slot sequences; cross-slot shared
   attempt numbering is not modeled (slots are independent by design).
+- `opts.receipts` on `reconcileStaleDeliveryAttempts` is an immutable
+  append-only hint shared from the pending pass (mint receipts are
+  write-once); per-candidate checks still re-run inside the writer
+  transaction.
 
 Classification:
-`PAIR_NEXT_PHASE_F4_FINAL_SEND_GATE_R4_PENDING_AUDIT`
+`PAIR_NEXT_PHASE_F4_TRANSACTIONAL_LIFECYCLE_R5_PENDING_AUDIT`

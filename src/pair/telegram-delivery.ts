@@ -913,6 +913,12 @@ export function deliveryAttemptLedger(
   store: PairEvidenceStore,
   missionId: string,
   entityId: string,
+  /** F4 R5.2 — immutable per-slot retry ceiling from the mint receipt.
+   *  Omit/return null for legacy unbound rows (legacy semantics
+   *  preserved); bound rows enforce attempt_number <= ceiling — an
+   *  over-budget STARTED makes the ledger INVALID, not merely
+   *  non-sendable. */
+  ceilingFor?: (slotKey: string) => number | null,
 ): DeliveryAttemptLedger {
   const raw = new Map<string, DeliveryAttemptEvent[]>();
   for (const ev of store.listEvidence(missionId)) {
@@ -975,6 +981,13 @@ export function deliveryAttemptLedger(
           h.seqError = "attempt_number_sequence";
           break;
         }
+        // F4 R5.2 — a STARTED beyond the immutable mint ceiling is an
+        // invalid ledger, never a permitted attempt.
+        const ceil = ceilingFor?.(slotKey) ?? null;
+        if (ceil !== null && Number.isFinite(ceil) && expectNumber > ceil) {
+          h.seqError = "started_over_ceiling";
+          break;
+        }
         const wantId = `ATT_${digest(
           `${entityId}:${slotKey}:${expectNumber}`,
         ).slice(0, 16)}`;
@@ -999,8 +1012,17 @@ export function deliveryAttemptLedger(
         }
         if (ev.outcome === "FAILED") {
           h.consumed += 1;
-        } else if (ev.outcome === "SENT" || ev.outcome === "UNKNOWN") {
-          h.terminal = ev.outcome;
+        } else if (ev.outcome === "SENT") {
+          // F4 R5.3 — SENT terminal authority requires canonical
+          // Telegram acceptance evidence: a positive safe integer
+          // message_id only.
+          if (!isValidTelegramMessageId(ev.message_id)) {
+            h.seqError = "sent_invalid_message_id";
+            break;
+          }
+          h.terminal = "SENT";
+        } else if (ev.outcome === "UNKNOWN") {
+          h.terminal = "UNKNOWN";
         } else {
           h.seqError = "resolved_bad_outcome";
           break;
@@ -1243,6 +1265,27 @@ function deliveryCarriesBinding(req: Record<string, unknown>): boolean {
   return false;
 }
 
+/** F4 R5.2 — the immutable per-slot retry ceiling straight from the
+ *  mint receipt; null for unbound/legacy rows (legacy semantics). */
+function deliveryCeilingFromReceipt(
+  req: Record<string, unknown>,
+  receipt: Record<string, unknown> | null,
+  slotKey: string,
+): number | null {
+  if (!receipt) return null;
+  if (String(req.mode) === "TEXT" || slotKey === "text") {
+    const c = Number(receipt.max_attempts);
+    return Number.isSafeInteger(c) && c > 0 ? c : null;
+  }
+  const entry = (Array.isArray(receipt.artifacts)
+    ? (receipt.artifacts as Array<Record<string, unknown>>)
+    : []
+  ).find((e) => String(e.name ?? "") === slotKey);
+  if (!entry) return null;
+  const c = Number(entry.max_attempts);
+  return Number.isSafeInteger(c) && c > 0 ? c : null;
+}
+
 /** F4 R4.1 — the effective retry ceiling: the immutable mint receipt for
  *  bound requests, never a widened mutable field. */
 function deliveryEffectiveCeiling(
@@ -1393,7 +1436,9 @@ export function beginDeliveryAttempt(args: {
     }
     // F4 R4.1 — E/F: rebuild and validate the immutable lifecycle
     // ledger; the durable row must be an exact legal projection.
-    const ledger = deliveryAttemptLedger(args.store, missionId, entityId);
+    const ledger = deliveryAttemptLedger(args.store, missionId, entityId, (k) =>
+      deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
+    );
     if (!ledger.valid) {
       throw new IntegrityError(
         "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
@@ -1501,7 +1546,9 @@ export function resolveDeliveryAttempt(args: {
         `${args.deliveryId}:${slotKey}:resolve static contract violation`,
       );
     }
-    const ledger = deliveryAttemptLedger(args.store, missionId, entityId);
+    const ledger = deliveryAttemptLedger(args.store, missionId, entityId, (k) =>
+      deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
+    );
     // F4 R4.3 — a RESOLVED event may be appended ONLY when the immutable
     // ledger holds exactly one unresolved STARTED for this slot and the
     // mutable SENDING identity matches it exactly. Mutable corruption can
@@ -1605,108 +1652,118 @@ export function reconcileStaleDeliveryAttempts(
   opts?: { receipts?: Map<string, Record<string, unknown>[]> },
 ): void {
   const nowMs = Date.parse(now);
-  for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
-    if (req.status !== "QUEUED") continue;
-    // F4 R4.5 — lifecycle evidence may only be minted from a request
-    // whose canonical entity identity + immutable mint/static contract
-    // is still valid. A statically forged TDR gets ZERO attempt-evidence
-    // mutations (the projection pass fails it closed separately).
-    const staticAuth = deliveryStaticAuthority(store, req, opts?.receipts);
-    const boundish = staticAuth.bound || deliveryCarriesBinding(req);
-    if (boundish && !staticAuth.contractOk) continue;
-    const entityId = String(req.entity_id ?? req.delivery_id);
-    const ledger =
-      boundish
-        ? deliveryAttemptLedger(store, String(req.mission_id), entityId)
+  // F4 R5.1 — the outer list is DISCOVERY ONLY: it yields candidate
+  // entity ids and is never authority. Every authority-relevant check
+  // happens inside the writer transaction, on the row re-loaded inside
+  // it — another writer can never interleave between verification and
+  // the immutable UNKNOWN append.
+  const candidates = store
+    .list(TELEGRAM_DELIVERY_REQUEST)
+    .map((r) => String(r.entity_id ?? ""))
+    .filter((id) => id.length > 0);
+  for (const entityId of candidates) {
+    store.immediate(() => {
+      const req = store.get(TELEGRAM_DELIVERY_REQUEST, entityId);
+      if (String(req.status) !== "QUEUED") return;
+      // F4 R4.5/R5.1 — the SAME canonical static verifier, inside this
+      // transaction: lifecycle evidence may only be minted while the
+      // complete immutable mint contract still holds.
+      const staticAuth = deliveryStaticAuthority(store, req, opts?.receipts);
+      const boundish = staticAuth.bound || deliveryCarriesBinding(req);
+      if (boundish && !staticAuth.contractOk) return;
+      const ledger = boundish
+        ? deliveryAttemptLedger(store, String(req.mission_id), entityId, (k) =>
+            deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
+          )
         : null;
-    let dirty = false;
-    const next = { ...req } as Record<string, unknown>;
-    const resolvedStale: Array<{
-      slotKey: string;
-      attempt_id?: string;
-      attempt_number?: number;
-      reason: string;
-    }> = [];
-    for (const { slot, apply } of slots(req, next)) {
-      if (slot.state !== "SENDING") {
-        apply();
-        continue;
-      }
-      const slotKey =
-        req.mode === "TEXT" ? "text" : String(slot.name ?? "text");
-      const staleAttemptId = slot.attempt_id;
-      const staleAttemptNumber = slot.attempt_number;
-      const startedMs = Date.parse(String(slot.attempt_started_at ?? ""));
-      if (!Number.isFinite(startedMs) || nowMs - startedMs >= staleAfterMs) {
-        const reason = !Number.isFinite(startedMs)
-          ? "stale_sending_missing_started_at"
-          : `stale_sending_reconciled:${now}`;
-        if (boundish) {
-          // F4 R4.4 — stale resolution requires the EXACT unresolved
-          // STARTED authority: same attempt_id + attempt_number, not
-          // already resolved. Forged SENDING without it → quarantine the
-          // projection, append ZERO lifecycle evidence.
-          const started = deliveryOpenStarted(ledger!, slotKey, slot);
-          dirty = true;
-          if ("error" in started) {
-            slot.state = "FAILED_DELIVERY";
-            delete slot.attempt_id;
-            delete slot.attempt_number;
-            delete slot.attempt_started_at;
-            slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+      let dirty = false;
+      const next = { ...req } as Record<string, unknown>;
+      const resolvedStale: Array<{
+        slotKey: string;
+        attempt_id?: string;
+        attempt_number?: number;
+        reason: string;
+      }> = [];
+      for (const { slot, apply } of slots(req, next)) {
+        if (slot.state !== "SENDING") {
+          apply();
+          continue;
+        }
+        const slotKey =
+          req.mode === "TEXT" ? "text" : String(slot.name ?? "text");
+        const staleAttemptId = slot.attempt_id;
+        const staleAttemptNumber = slot.attempt_number;
+        // F4 R5.1 — the stale threshold is re-checked against the
+        // CURRENT durable attempt_started_at, inside this transaction.
+        const startedMs = Date.parse(String(slot.attempt_started_at ?? ""));
+        if (!Number.isFinite(startedMs) || nowMs - startedMs >= staleAfterMs) {
+          const reason = !Number.isFinite(startedMs)
+            ? "stale_sending_missing_started_at"
+            : `stale_sending_reconciled:${now}`;
+          if (boundish) {
+            // F4 R4.4 — stale resolution requires the EXACT unresolved
+            // STARTED authority: same attempt_id + attempt_number, not
+            // already resolved. Forged SENDING without it → quarantine
+            // the projection, append ZERO lifecycle evidence.
+            const started = deliveryOpenStarted(ledger!, slotKey, slot);
+            dirty = true;
+            if ("error" in started) {
+              slot.state = "FAILED_DELIVERY";
+              delete slot.attempt_id;
+              delete slot.attempt_number;
+              delete slot.attempt_started_at;
+              slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+            } else {
+              slot.state = "UNKNOWN_SIDE_EFFECT";
+              delete slot.attempt_id;
+              delete slot.attempt_number;
+              delete slot.attempt_started_at;
+              slot.unknown_reason = reason;
+              resolvedStale.push({
+                slotKey,
+                attempt_id: staleAttemptId,
+                attempt_number: staleAttemptNumber,
+                reason,
+              });
+            }
           } else {
+            dirty = true;
             slot.state = "UNKNOWN_SIDE_EFFECT";
             delete slot.attempt_id;
             delete slot.attempt_number;
             delete slot.attempt_started_at;
             slot.unknown_reason = reason;
-            resolvedStale.push({
-              slotKey,
-              attempt_id: staleAttemptId,
-              attempt_number: staleAttemptNumber,
-              reason,
-            });
           }
-        } else {
-          dirty = true;
-          slot.state = "UNKNOWN_SIDE_EFFECT";
-          delete slot.attempt_id;
-          delete slot.attempt_number;
-          delete slot.attempt_started_at;
-          slot.unknown_reason = reason;
         }
+        // else: fresh SENDING — legitimately in flight, leave untouched.
+        apply();
       }
-      // else: fresh SENDING — legitimately in flight, leave untouched.
-      apply();
-    }
-    if (dirty) {
+      if (!dirty) return;
       // R5 §3 — stale reconciliation must recompute the canonical
       // request aggregate (a single stale payload → UNKNOWN_SIDE_EFFECT,
       // never dead QUEUED).
       next.status = recomputeStatus(req, next);
-      // F4 R3.3/R4.4 — exact-STARTED-proven stale-resolution evidence and
-      // the mutable projection commit atomically; quarantined rows mint
-      // no lifecycle evidence.
-      store.immediate(() => {
-        for (const r of resolvedStale) {
-          store.appendEvidence(
-            String(req.mission_id),
-            TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
-            {
-              delivery_id: entityId,
-              slot: r.slotKey,
-              attempt_id: r.attempt_id ?? null,
-              attempt_number: r.attempt_number ?? null,
-              outcome: "UNKNOWN",
-              message_id: null,
-              error: r.reason,
-              resolved_at: now,
-            },
-          );
-        }
-        putReq(store, next);
-      });
-    }
+      // F4 R3.3/R4.4/R5.1 — exact-STARTED-proven stale-resolution
+      // evidence and the mutable projection commit atomically in THIS
+      // transaction; a failure rolls back both.
+      for (const r of resolvedStale) {
+        store.appendEvidence(
+          String(req.mission_id),
+          TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
+          {
+            delivery_id: entityId,
+            slot: r.slotKey,
+            attempt_id: r.attempt_id ?? null,
+            attempt_number: r.attempt_number ?? null,
+            outcome: "UNKNOWN",
+            message_id: null,
+            error: r.reason,
+            resolved_at: now,
+          },
+        );
+      }
+      putReq(store, next);
+    });
   }
 }
 
@@ -1754,10 +1811,14 @@ export function pendingTelegramDeliveries(
   // root alone cannot be redirected by a coherent TDR rewrite.
   const snapshotRoot = deliverySnapshotRoot(store);
   const attemptLedgers = new Map<string, DeliveryAttemptLedger>();
-  const ledgerFor = (entityId: string, missionId: string) => {
+  const ledgerFor = (
+    entityId: string,
+    missionId: string,
+    ceilingFor: (slotKey: string) => number | null,
+  ) => {
     let l = attemptLedgers.get(entityId);
     if (!l) {
-      l = deliveryAttemptLedger(store, missionId, entityId);
+      l = deliveryAttemptLedger(store, missionId, entityId, ceilingFor);
       attemptLedgers.set(entityId, l);
     }
     return l;
@@ -1813,7 +1874,9 @@ export function pendingTelegramDeliveries(
     // coherent rollback (SENT→QUEUED, attempt_count→0, deleted
     // message_id) can never mint a new send permission — the slot
     // converges to a durable terminal lifecycle violation instead.
-    const ledger = ledgerFor(entityId, String(req.mission_id));
+    const ledger = ledgerFor(entityId, String(req.mission_id), (k) =>
+      deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
+    );
     const lifecycleViolation = (slotKey: string, slot: DeliverySlot) =>
       deliverySlotLifecycleViolation(ledger, slotKey, slot);
     if (req.mode === "TEXT") {
