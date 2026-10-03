@@ -27,6 +27,11 @@ import { atomicWriteJson, utcnow, workerExecutionId } from "./canonical.js";
 import { devinBlockedGraceMs, devinTaskTimeoutMs } from "./env-config.js";
 import { mintBrokerCapability } from "./broker-capability.js";
 import { mintArtifactCapability } from "./artifact-capability.js";
+import {
+  artifactDependencySetDigest,
+  mintArtifactConsumeCapability,
+} from "./artifact-consume-capability.js";
+import type { DependencyArtifactEntry } from "./artifact-handoff.js";
 import type { ExecutorAdapter } from "./adapter.js";
 
 export const DEVIN_EXECUTOR_ID = "DEVIN";
@@ -330,6 +335,37 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     } else if (outboxUrl && process.env.PAIR_OUTBOX_TOKEN) {
       lines.push(
         `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${process.env.PAIR_OUTBOX_TOKEN}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE emitting the completion marker.`,
+      );
+    }
+    // F2 §16 — governed dependency fetch: when the governed task pins
+    // dependency_artifacts, the remote worker fetches each canonical
+    // artifact through a consume capability (acread1) bound to THIS
+    // execution and to the pinned dependency-set digest. The worker
+    // receives artifact_id, sha256, byte_size and a remote-relative
+    // target path — never the master secret, CAS layout, or host paths.
+    const depArts = (task.dependency_artifacts as DependencyArtifactEntry[] | undefined) ?? [];
+    const fetchBase = process.env.PAIR_OUTBOX_URL;
+    if (depArts.length && fetchBase && artifactMaster) {
+      const executionId = workerExecutionId(this.executor_id, String(task.governed_task_id));
+      const depSetDigest = artifactDependencySetDigest(depArts);
+      const consume = mintArtifactConsumeCapability(artifactMaster, {
+        mission_id: String(task.mission_id),
+        task_id: String(task.task_id),
+        governed_task_id: String(task.governed_task_id),
+        execution_id: executionId,
+        executor_id: this.executor_id,
+        dependency_set_digest: depSetDigest,
+      });
+      const items = depArts
+        .map(
+          (e) =>
+            `  - ${e.logical_name} → .pair/dependency-artifacts/${e.artifact_id}/${e.logical_name} (sha256:${e.sha256}, ${e.byte_size} bytes)`,
+        )
+        .join("\n");
+      lines.push(
+        "Dependency artifacts: PAIR pinned canonical input artifacts for this task. Fetch each into the workspace at the listed relative path BEFORE starting work:\n" +
+          items +
+          `\nFetch command per artifact: curl -sf -X POST "${fetchBase}/api/artifacts/fetch" -H "x-artifact-consume-capability: ${consume}" -H "content-type: application/json" -d '{"artifact_id":"<ARTIFACT_ID>"}' -o <target path>; then verify: printf of the file's sha256 must equal the listed sha256 and size must equal byte_size. If a fetch fails or digest mismatches, STOP and report — never substitute your own content.`,
       );
     }
     // Credential broker: when a service needs a login/token, the agent pulls

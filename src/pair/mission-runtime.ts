@@ -52,6 +52,10 @@ import {
   missingConsumedArtifact,
 } from "./plan-dataflow.js";
 import {
+  DependencyResolutionError,
+  isRemoteCapabilityTask,
+} from "./artifact-handoff.js";
+import {
   boundedFileSha256,
   materializeDeliveryTextPayload,
   MAX_TELEGRAM_FILE_BYTES,
@@ -388,6 +392,15 @@ export class MissionRuntime {
         (task.required_capabilities as string[]) ??
         [],
       dependency_outputs: this.dependencyOutputs(String(mission.mission_id), task),
+      // F2 §5/§8 — the dependency-artifact contract is resolved at the
+      // ONE governed-request seam so every dispatch arm (initial,
+      // retry, re-route) pins the same canonical bytes. Resolution is
+      // fail-closed: an unresolvable/ambiguous/ungoverned edge throws
+      // DependencyResolutionError BEFORE any executor spend.
+      dependency_artifacts: this.deps.service.artifactResolver.resolveForConsumer({
+        mission,
+        task,
+      }),
       correlation_id: `${mission.mission_id}:${task.task_id}`,
     };
   }
@@ -952,7 +965,37 @@ export class MissionRuntime {
       // approval). Absence checked BEFORE dispatch only — a file
       // disappearing DURING execution proves nothing about its prior
       // presence and never reclassifies the real failure.
-      const missing = this.prerequisiteMissing(mission, task);
+      let request: Record<string, unknown>;
+      try {
+        // F2 §12/§18 — dependency resolution runs INSIDE the governed
+        // request seam; an unresolvable edge is a provable pre-dispatch
+        // failure: zero routing, zero dispatch, zero spend.
+        request = this.requestFor(mission, task);
+      } catch (err) {
+        if (err instanceof DependencyResolutionError) {
+          this.startRecovery(
+            missionId,
+            String(task.task_id),
+            null,
+            "DEPENDENCY_FAILURE",
+            now,
+            undefined,
+            undefined,
+            { dependency_resolution_error: `${err.code}:${err.message}` },
+          );
+          return;
+        }
+        throw err;
+      }
+      const missing = this.prerequisiteMissing(
+        mission,
+        task,
+        new Set(
+          ((request.dependency_artifacts as Array<Record<string, unknown>>) ?? []).map(
+            (e) => String(e.logical_name),
+          ),
+        ),
+      );
       if (missing) {
         this.startRecovery(
           missionId,
@@ -966,7 +1009,6 @@ export class MissionRuntime {
         );
         return;
       }
-      const request = this.requestFor(mission, task);
       try {
         // R8 §4 — pre-dispatch semantic defense: affirmative Telegram
         // delivery semantics in task_instruction ⇒ the TASK itself must
@@ -1169,10 +1211,23 @@ export class MissionRuntime {
   private prerequisiteMissing(
     mission: Record<string, unknown>,
     task: Record<string, unknown>,
+    canonicalResolved?: Set<string>,
   ): string | null {
+    // F2 — a remote consumer's declared consumes are LOGICAL artifact
+    // names, not local workspace paths: nothing local can prove their
+    // presence/absence — canonical resolution already gated them.
+    if (isRemoteCapabilityTask(task)) return null;
     const df = (task.metadata as Record<string, unknown> | undefined)
       ?.pair_dataflow as Record<string, unknown> | undefined;
     if (!Array.isArray(df?.consumes) || df.consumes.length === 0) return null;
+    // Names resolved into canonical dependency_artifacts are material-
+    // ized from CAS (not the producer's workspace path) — the source
+    // path may legitimately be absent.
+    const raw = (df.consumes as unknown[]).map(String);
+    const consumes = canonicalResolved
+      ? raw.filter((n) => !canonicalResolved.has(n))
+      : raw;
+    if (!consumes.length) return null;
     const md = (mission.metadata as Record<string, unknown>) ?? {};
     const workspace = String(
       (task.metadata as Record<string, unknown> | undefined)?.workspace ??
@@ -1180,7 +1235,14 @@ export class MissionRuntime {
         "",
     );
     if (!workspace) return null;
-    const missing = missingConsumedArtifact({ task, workspace });
+    const scoped = {
+      ...task,
+      metadata: {
+        ...(task.metadata as Record<string, unknown> | undefined),
+        pair_dataflow: { ...df, consumes },
+      },
+    } as Record<string, unknown>;
+    const missing = missingConsumedArtifact({ task: scoped, workspace });
     return missing ? missing.artifact : null;
   }
 
@@ -1211,6 +1273,7 @@ export class MissionRuntime {
     extra?: {
       failedExecutorId?: string | null;
       missing_artifact?: string | null;
+      dependency_resolution_error?: string | null;
     },
   ): void {
     const rt = this.runtimeEntity(missionId);

@@ -562,41 +562,172 @@ export class ArtifactAuthority {
       if (String(row.sha256) !== facts.sha256) fail("sha256");
       if (Number(row.byte_size) !== facts.byte_size) fail("byte_size");
       if (String(row.ingested_via) !== facts.channel) fail("ingested_via");
-      const sha = String(row.sha256 ?? "");
-      if (String(row.execution_id) !== executionId) fail("execution_id");
-      if (String(row.contract ?? "") !== ARTIFACT_CONTRACT) fail("contract");
-      if (String(row.state ?? "") !== "ACCEPTED") fail("state");
-      if (id !== canonicalArtifactId(executionId, String(row.logical_name))) {
-        fail("artifact_id");
-      }
-      if (String(row.mission_id) !== String(execution.mission_id)) fail("mission_id");
-      if (String(row.task_id) !== String(execution.task_id)) fail("task_id");
-      if (String(row.governed_task_id) !== String(execution.governed_task_id)) {
-        fail("governed_task_id");
-      }
-      if (String(row.producer_executor_id) !== String(execution.executor_id)) {
-        fail("producer_executor_id");
-      }
-      if (
-        typeof row.byte_size !== "number" ||
-        !Number.isInteger(row.byte_size) ||
-        row.byte_size < 0
-      ) {
-        fail("byte_size");
-      }
-      const storage = row.storage as Record<string, unknown> | undefined;
-      if (String(storage?.kind ?? "") !== "PAIR_ARTIFACT_CAS") fail("storage.kind");
-      if (String(storage?.sha256 ?? "") !== sha) fail("storage.sha256");
-      if (String(storage?.ref ?? "") !== `blobs/${sha}`) fail("storage.ref");
-      // R4 open-object-bound retained proof: regular opened object,
-      // digest == row sha, materialized length == declared byte_size.
-      const blob = this.readCasBlob(path.join(this.opts.blobDir, sha));
-      if (blob === null || blob.sha256 !== sha || blob.bytes.length !== row.byte_size) {
-        fail("retained_bytes");
-      }
+      this.verifyCanonicalRowShape(row, execution, executionId);
       verified.push(id);
     }
     return verified;
+  }
+
+  /**
+   * The canonical-shape proof shared by terminal validation and F2
+   * consumption: contract, state, deterministic id, full execution/
+   * governed linkage, storage contract, and the retained CAS bytes
+   * verified NOW via the open-object-bound read primitive.
+   */
+  private verifyCanonicalRowShape(
+    row: Record<string, unknown>,
+    execution: Record<string, unknown>,
+    executionId: string,
+  ): void {
+    const id = String(row.artifact_id);
+    const fail = (reason: string): never => {
+      throw new IntegrityError("FAIL_CLOSED_ARTIFACT_VERIFICATION", `${id}:${reason}`);
+    };
+    const sha = String(row.sha256 ?? "");
+    if (String(row.execution_id) !== executionId) fail("execution_id");
+    if (String(row.contract ?? "") !== ARTIFACT_CONTRACT) fail("contract");
+    if (String(row.state ?? "") !== "ACCEPTED") fail("state");
+    if (id !== canonicalArtifactId(executionId, String(row.logical_name))) {
+      fail("artifact_id");
+    }
+    if (String(row.mission_id) !== String(execution.mission_id)) fail("mission_id");
+    if (String(row.task_id) !== String(execution.task_id)) fail("task_id");
+    if (String(row.governed_task_id) !== String(execution.governed_task_id)) {
+      fail("governed_task_id");
+    }
+    if (String(row.producer_executor_id) !== String(execution.executor_id)) {
+      fail("producer_executor_id");
+    }
+    if (
+      typeof row.byte_size !== "number" ||
+      !Number.isInteger(row.byte_size) ||
+      row.byte_size < 0
+    ) {
+      fail("byte_size");
+    }
+    const storage = row.storage as Record<string, unknown> | undefined;
+    if (String(storage?.kind ?? "") !== "PAIR_ARTIFACT_CAS") fail("storage.kind");
+    if (String(storage?.sha256 ?? "") !== sha) fail("storage.sha256");
+    if (String(storage?.ref ?? "") !== `blobs/${sha}`) fail("storage.ref");
+    // R4 open-object-bound retained proof: regular opened object,
+    // digest == row sha, materialized length == declared byte_size.
+    const blob = this.readCasBlob(path.join(this.opts.blobDir, sha));
+    if (blob === null || blob.sha256 !== sha || blob.bytes.length !== row.byte_size) {
+      fail("retained_bytes");
+    }
+  }
+
+  /**
+   * F2 §6–§7 — the narrow consumption-time authority: prove ONE artifact
+   * is fully canonical AND bound to the claimed producer execution/task/
+   * mission RIGHT NOW. The durable execution↔governed linkage is
+   * re-checked and the retained CAS bytes are re-verified — a row that
+   * merely looks canonical can never serve a consumer.
+   */
+  verifyArtifactForConsumption(
+    artifactId: string,
+    expected: {
+      execution_id: string;
+      mission_id?: string;
+      task_id?: string;
+      governed_task_id?: string;
+      producer_executor_id?: string;
+    },
+  ): Record<string, unknown> {
+    const fail = (reason: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+        `${artifactId}:${reason}`,
+      );
+    };
+    const row = this.store.tryGet(ARTIFACT_ENTITY, artifactId) as
+      | Record<string, unknown>
+      | null;
+    if (!row) fail("missing");
+    if (String(row!.artifact_id) !== artifactId) fail("artifact_id_field");
+    const execution = this.store.tryGet(
+      "executor_execution",
+      expected.execution_id,
+    ) as Record<string, unknown> | null;
+    if (!execution) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_EXECUTION_UNKNOWN",
+        expected.execution_id,
+      );
+    }
+    const governed = this.store.tryGet(
+      "governed_task",
+      String(execution.governed_task_id),
+    ) as Record<string, unknown> | null;
+    if (
+      !governed ||
+      String(execution.mission_id) !== String(governed.mission_id) ||
+      String(execution.task_id) !== String(governed.task_id) ||
+      String(governed.executor_id) !== String(execution.executor_id)
+    ) {
+      fail("durable_linkage");
+    }
+    if (String(row!.execution_id) !== expected.execution_id) fail("execution_id");
+    if (
+      expected.mission_id !== undefined &&
+      String(row!.mission_id) !== expected.mission_id
+    ) {
+      fail("mission_id");
+    }
+    if (
+      expected.task_id !== undefined &&
+      String(row!.task_id) !== expected.task_id
+    ) {
+      fail("task_id");
+    }
+    if (
+      expected.governed_task_id !== undefined &&
+      String(row!.governed_task_id) !== expected.governed_task_id
+    ) {
+      fail("governed_task_id");
+    }
+    if (
+      expected.producer_executor_id !== undefined &&
+      String(row!.producer_executor_id) !== expected.producer_executor_id
+    ) {
+      fail("producer_executor_id");
+    }
+    this.verifyCanonicalRowShape(row!, execution, expected.execution_id);
+    return row!;
+  }
+
+  /** F2 — verified retained bytes for a canonical artifact: the row is
+   *  fully re-verified first, then the CAS blob is read through the
+   *  open-object primitive and must match sha256 + byte_size. */
+  readForConsumption(artifactId: string): {
+    artifact: Record<string, unknown>;
+    bytes: Buffer;
+  } {
+    const row = this.store.tryGet(ARTIFACT_ENTITY, artifactId) as
+      | Record<string, unknown>
+      | null;
+    if (!row) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+        `${artifactId}:missing`,
+      );
+    }
+    const artifact = this.verifyArtifactForConsumption(artifactId, {
+      execution_id: String(row.execution_id),
+    });
+    const sha = String(artifact.sha256);
+    const blob = this.readCasBlob(path.join(this.opts.blobDir, sha));
+    if (
+      blob === null ||
+      blob.sha256 !== sha ||
+      blob.bytes.length !== Number(artifact.byte_size)
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+        `${artifactId}:retained_bytes`,
+      );
+    }
+    return { artifact, bytes: blob.bytes };
   }
 
   /** Read-model projection (F1 §10): canonical fields only — no host

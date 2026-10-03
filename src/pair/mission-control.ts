@@ -10,6 +10,7 @@
 import fs from "node:fs";
 import { verifyBrokerCapability } from "./broker-capability.js";
 import { verifyArtifactCapability } from "./artifact-capability.js";
+import { verifyArtifactConsumeCapability } from "./artifact-consume-capability.js";
 import type { ArtifactAcceptance } from "./artifact-authority.js";
 import { registerSensitiveMaterial } from "./sanitizer.js";
 import path from "node:path";
@@ -202,6 +203,33 @@ export class MissionControl {
       correlation_id: null,
       allow_post_result: false,
     });
+  }
+
+  /**
+   * F2 §12–§15 — the remote consume lane: a remote worker presents an
+   * acread1 consume capability and an artifact_id; the lane verifies the
+   * capability, re-checks CURRENT durable consumer state (execution live,
+   * governed task bound, artifact pinned, dependency-set digest equal),
+   * re-runs F1 retained-byte verification, and returns the exact CAS
+   * bytes. Never lists, never serves paths, bounded.
+   */
+  fetchArtifactForConsumption(
+    masterSecret: string,
+    capabilityToken: string,
+    body: { artifact_id?: unknown },
+  ): { artifact: Record<string, unknown>; bytes: Buffer } {
+    const claims = verifyArtifactConsumeCapability(masterSecret, capabilityToken);
+    if (!claims) {
+      throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_INVALID", "signature");
+    }
+    const artifactId = String(body.artifact_id ?? "");
+    if (!artifactId.startsWith("ART_")) {
+      throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH", "artifact_id");
+    }
+    return this.deps.service.artifactHandoffs.authorizeConsumeFetch(
+      claims,
+      artifactId,
+    );
   }
 
   /** F1 §10 — read-only canonical artifact projection. */

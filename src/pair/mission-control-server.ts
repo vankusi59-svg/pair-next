@@ -11,7 +11,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { IntegrityError, PolicyError } from "./errors.js";
+import { IntegrityError, PairError, PolicyError } from "./errors.js";
 import { compatOutboxBasename } from "./canonical.js";
 import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
 import { ulid } from "ulid";
@@ -323,11 +323,12 @@ export function createMissionControlServer(
           })
         : {};
     if (body === null) return;
-    // POST /api/outbox and /api/broker/fetch carry their own narrow tokens —
-    // exempt from the MC gate.
+    // POST /api/outbox, /api/broker/fetch and /api/artifacts/fetch carry
+    // their own narrow tokens — exempt from the MC gate.
     const isOutboxUpload = method === "POST" && p === "/api/outbox";
     const isBrokerFetch = method === "POST" && p === "/api/broker/fetch";
-    if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch) {
+    const isArtifactFetch = method === "POST" && p === "/api/artifacts/fetch";
+    if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch && !isArtifactFetch) {
       const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
       const q = url.searchParams.get("token") ?? "";
       if (bearer !== deps.authToken && q !== deps.authToken) {
@@ -603,6 +604,42 @@ export function createMissionControlServer(
           domains: cred.domains,
           value: cred.value,
         });
+      }
+      // F2 §14 — the remote consume lane: the remote worker presents an
+      // acread1 consume capability in x-artifact-consume-capability and a
+      // single artifact_id in the body; the response is the exact CAS
+      // byte slice plus identity headers. No paths, no listing.
+      if (isArtifactFetch) {
+        const capability = String(
+          req.headers["x-artifact-consume-capability"] ?? "",
+        );
+        const master = deps.brokerToken;
+        if (!master || !capability) {
+          return void json(res, 403, { error: "UNAUTHORIZED_ARTIFACT_CONSUME" });
+        }
+        try {
+          const { artifact, bytes } = c.fetchArtifactForConsumption(master, capability, {
+            artifact_id: body.artifact_id,
+          });
+          res.writeHead(200, {
+            "content-type": "application/octet-stream",
+            "x-artifact-id": String(artifact.artifact_id),
+            "x-artifact-sha256": String(artifact.sha256),
+            "x-artifact-byte-size": String(artifact.byte_size),
+            "x-artifact-logical-name": String(artifact.logical_name),
+          });
+          res.end(bytes);
+          return;
+        } catch (e) {
+          const code = e instanceof PairError ? e.code : "FAIL_CLOSED";
+          const status =
+            code === "FAIL_CLOSED_ARTIFACT_VERIFICATION" ||
+            code === "FAIL_CLOSED_ARTIFACT_HANDOFF_MISSING" ||
+            code === "FAIL_CLOSED_ARTIFACT_EXECUTION_UNKNOWN"
+              ? 404
+              : 403;
+          return void json(res, status, { error: code });
+        }
       }
 
       if (method === "GET" && p === "/api/health") return void json(res, 200, c.health());

@@ -13,6 +13,10 @@ import { canonicalRiskCeiling, canonicalWorkspacePath, newId, pathWithin, planMa
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { AgentContractService } from "./agent-contract.js";
 import { ArtifactAuthority } from "./artifact-authority.js";
+import {
+  ArtifactDependencyResolver,
+  ArtifactHandoffService,
+} from "./artifact-handoff.js";
 import { CostService } from "./cost.js";
 import { SecretPolicyService } from "./secret-policy.js";
 import { RouteRegistry } from "./route-registry.js";
@@ -36,6 +40,8 @@ export class PairControlPlane {
   private _cost: CostService | null = null;
   private _secretPolicies: SecretPolicyService | null = null;
   private _artifacts: ArtifactAuthority | null = null;
+  private _artifactResolver: ArtifactDependencyResolver | null = null;
+  private _artifactHandoffs: ArtifactHandoffService | null = null;
 
   constructor(public readonly store: PairEvidenceStore) {}
 
@@ -80,6 +86,23 @@ export class PairControlPlane {
       ),
     });
     return this._artifacts;
+  }
+
+  /** Lazy F2 dependency resolver: consumer task → declared dataflow →
+   *  validated producer execution → canonical artifact pin. */
+  get artifactResolver(): ArtifactDependencyResolver {
+    this._artifactResolver ??= new ArtifactDependencyResolver(this);
+    return this._artifactResolver;
+  }
+
+  /** Lazy F2 handoff service: durable artifact_handoff entity, governed
+   *  local materialization, remote fetch authorization. */
+  get artifactHandoffs(): ArtifactHandoffService {
+    this._artifactHandoffs ??= new ArtifactHandoffService(
+      this.store,
+      this.artifacts,
+    );
+    return this._artifactHandoffs;
   }
 
   createProject(params: { name: string; root_location: string }): Record<string, unknown> {

@@ -17,6 +17,13 @@ import type { PairEvidenceStore } from "./store.js";
 import type { ExecutorAdapter } from "./adapter.js";
 import { ArtifactProvenanceValidator } from "./artifact-validation.js";
 import { sanitizeUntrustedRemote } from "./sanitizer.js";
+import {
+  isRemoteCapabilityTask,
+  validateDependencyArtifactEntry,
+  MAX_DEPENDENCY_ARTIFACTS_PER_TASK,
+  MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES,
+  type DependencyArtifactEntry,
+} from "./artifact-handoff.js";
 
 const RISK_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
 const HIGH_IMPACT_PERMISSIONS = new Set([
@@ -335,6 +342,33 @@ export class GovernedTaskGate {
       approvalRequirements.length > 0;
 
     const governedTaskId = newId("GTSK");
+    // F2 §8 — dependency_artifacts pin arrives on the request as the
+    // resolver's output; every entry is shape-verified before it can
+    // become governed contract.
+    const rawDeps = request.dependency_artifacts;
+    if (rawDeps !== undefined && !Array.isArray(rawDeps)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DEPENDENCY_ARTIFACT_CONTRACT",
+        "dependency_artifacts",
+      );
+    }
+    const dependencyArtifacts: DependencyArtifactEntry[] = (
+      (rawDeps as unknown[] | undefined) ?? []
+    ).map((e) => validateDependencyArtifactEntry(e));
+    if (dependencyArtifacts.length > MAX_DEPENDENCY_ARTIFACTS_PER_TASK) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DEPENDENCY_ARTIFACT_CONTRACT",
+        "dependency_count",
+      );
+    }
+    let depTotal = 0;
+    for (const e of dependencyArtifacts) depTotal += e.byte_size;
+    if (depTotal > MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DEPENDENCY_ARTIFACT_CONTRACT",
+        "dependency_bytes",
+      );
+    }
     const approvalScope = {
       mission_id: mission.mission_id,
       task_id: task.task_id,
@@ -377,6 +411,13 @@ export class GovernedTaskGate {
       constraints: [...constraints],
       requested_tools: (request.requested_tools as string[] | undefined) ?? [],
       dependency_outputs: (request.dependency_outputs as unknown[] | undefined) ?? [],
+      // F2 §4/§8 — the resolved dependency-artifact contract is persisted
+      // on the governed task BEFORE authorization: the governance digest
+      // below covers it, and dispatch re-verifies the digest so a post-
+      // governance mutation of artifact_id/sha256/byte_size/
+      // producer_execution_id/consumer_relative_path can never remain
+      // dispatch-authorized.
+      dependency_artifacts: dependencyArtifacts,
       timeout,
       expected_output_contract: request.expected_output_contract,
       risk_class: riskClass,
@@ -395,6 +436,14 @@ export class GovernedTaskGate {
       governedTaskId,
       saved as Record<string, unknown>,
       saved.version,
+    );
+    // F2 §8/§11 — pin the durable artifact_handoff rows bound to this
+    // governed task (PINNED state). Idempotent; a conflicting existing
+    // handoff fails closed.
+    this.service.artifactHandoffs.pinForGovernedTask(
+      resaved,
+      dependencyArtifacts,
+      isRemoteCapabilityTask(task) ? "REMOTE_FETCH" : "LOCAL_MATERIALIZATION",
     );
     this.store.event({
       entity_type: "governed_task",
@@ -527,6 +576,11 @@ export class GovernedTaskGate {
         String(task.governance_state),
       );
     }
+    // F2 §8 — the pinned artifact_handoff rows are the immutable
+    // post-governance authority for dependency_artifacts: any mutation
+    // after the pin (field rewrite, entry removal, tamper) fails closed
+    // here, BEFORE any dispatch/spend.
+    this.service.artifactHandoffs.assertContractUnmutated(task);
     if (task.executor_id !== adapter.executor_id) {
       throw new IntegrityError(
         "FAIL_CLOSED_EXECUTOR_ROUTING_MISMATCH",
@@ -662,6 +716,18 @@ export class GovernedTaskGate {
       predispatchTask,
       adapter.executor_id,
     );
+
+    // F2 §9 — LOCAL materialization of pinned dependency artifacts
+    // happens strictly BEFORE any external executor call and before the
+    // monetary reservation: a provable materialization failure burns
+    // zero dispatch and zero spend.
+    const depEntries = (task.dependency_artifacts as unknown[] | undefined) ?? [];
+    if (depEntries.length && !isRemoteCapabilityTask(predispatchTask)) {
+      this.service.artifactHandoffs.materializeForConsumer(task);
+    }
+    // For REMOTE consumers nothing materializes locally — the pinned
+    // rows are fetched by the remote worker through the consume
+    // capability lane (acread1) at /api/artifacts/fetch.
 
     // P13: atomic monetary authority — check + HELD reservation inside
     // one transaction, after contract authority and before dispatch.
