@@ -469,6 +469,125 @@ export class ArtifactDependencyResolver {
   }
 
   /**
+   * F4.1 — delivery provenance authority: resolve ONE manifested
+   * artifact name to the canonical in-mission artifact a legitimate
+   * earlier producer actually committed.
+   *
+   * Legitimacy = the producer governed task (a) is in the SAME plan as
+   * the delivery task, (b) is a depends_on predecessor of it, and
+   * (c) declares the artifact in its canonical pair_dataflow.produces
+   * (the named file OR its staged `outbox/<basename>` copy — both name
+   * the same deliverable). The candidate then goes through the same
+   * execution → anchored PASS → ARTIFACT_ACCEPTED → F1 re-verification
+   * chain as dependency consumption — a stale same-name file sitting
+   * in the shared outbox is never consulted.
+   *
+   * Returns a discriminated result: `bound` (exactly one canonical
+   * artifact), `no_producer` (no declared in-mission producer), or
+   * `no_canonical_artifact` (a declared producer exists but no canonical
+   * artifact resolved — producer identity is carried so the caller can
+   * report a typed dependency failure). Throws fail-closed on ambiguous
+   * producers OR ambiguous canonical artifacts (delivery can never
+   * guess which one carries send authority).
+   */
+  resolveDeliveryArtifact(args: {
+    mission: Record<string, unknown>;
+    task: Record<string, unknown>;
+    name: string;
+  }):
+    | {
+        kind: "bound";
+        execution: Record<string, unknown>;
+        artifact: Record<string, unknown>;
+      }
+    | { kind: "no_producer" }
+    | { kind: "no_canonical_artifact"; producer: Record<string, unknown> } {
+    const task = args.task;
+    const missionId = String(args.mission.mission_id);
+    const planId = String(task.plan_id);
+    const planRevision = Number(args.mission.plan_revision ?? 0);
+    const depRefs = new Set(
+      ((task.depends_on as string[]) ?? []).map((d) => String(d)),
+    );
+    const planTasks = this.service
+      .listTasks(missionId)
+      .filter(
+        (t) =>
+          String(t.plan_id) === planId &&
+          String(t.task_id) !== String(task.task_id),
+      );
+    const producesOf = (t: Record<string, unknown>): Set<string> => {
+      const p = (t.metadata as Record<string, unknown> | undefined)
+        ?.pair_dataflow as Record<string, unknown> | undefined;
+      return new Set(
+        Array.isArray(p?.produces) ? (p!.produces as unknown[]).map(String) : [],
+      );
+    };
+    const isDepPredecessor = (t: Record<string, unknown>): boolean =>
+      depRefs.has(String(t.task_key)) || depRefs.has(String(t.task_id));
+    // The manifested logical name and its staged outbox copy are the
+    // same deliverable — a producer may declare either form.
+    const name = normalizeArtifactName(args.name);
+    const candidates = new Set<string>([name]);
+    if (!name.startsWith("outbox/")) {
+      candidates.add(`outbox/${name.split("/").pop()}`);
+    }
+    const producers = planTasks.filter(
+      (t) =>
+        isDepPredecessor(t) &&
+        [...candidates].some((c) => producesOf(t).has(c)),
+    );
+    if (producers.length === 0) return { kind: "no_producer" as const };
+    if (producers.length > 1) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+        `ambiguous_delivery_producer:${name}`,
+        {
+          dependency_reason: "DELIVERY_ARTIFACT_PROVENANCE",
+          artifact_name: name,
+          consumer_task_id: String(task.task_id),
+        },
+      );
+    }
+    const producer = producers[0]!;
+    const produced = producesOf(producer);
+    // R1.3 — a manifest artifact must resolve to EXACTLY ONE canonical
+    // artifact identity. The source name and its staged outbox alias are
+    // compatible spellings of one deliverable, but they are DISTINCT
+    // canonical artifacts when the producer accepted both: selecting
+    // the lexical first is silent artifact selection — fail closed.
+    const hits = new Map<
+      string,
+      { execution: Record<string, unknown>; artifact: Record<string, unknown> }
+    >();
+    for (const candidate of [...candidates].sort()) {
+      if (!produced.has(candidate)) continue;
+      const hit = this.resolveProducerArtifact(
+        missionId,
+        producer,
+        candidate,
+        planRevision,
+      );
+      if (hit) hits.set(String(hit.artifact.artifact_id), hit);
+    }
+    if (hits.size > 1) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+        `ambiguous_delivery_artifact:${name}`,
+        {
+          dependency_reason: "DELIVERY_ARTIFACT_PROVENANCE",
+          artifact_name: name,
+          producer_task_id: String(producer.task_id),
+          consumer_task_id: String(task.task_id),
+        },
+      );
+    }
+    const bound = [...hits.values()][0];
+    if (bound) return { kind: "bound" as const, ...bound };
+    return { kind: "no_canonical_artifact" as const, producer };
+  }
+
+  /**
    * The producer's canonical artifact for `logicalName`: the LATEST
    * producer execution carrying a terminal validation PASS whose
    * artifact_ids include a matching canonical artifact — re-verified

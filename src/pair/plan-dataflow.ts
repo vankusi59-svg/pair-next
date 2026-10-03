@@ -48,7 +48,7 @@
  * manifest artifacts + required upstream result text — it is a DAG leaf
  * and never gains forward dependencies). Remote-capability tasks
  * produce/consume NO workspace artifacts: their files stay remote; a
- * governed /api/outbox upload is separately modeled as a PAIR_OUTBOX_UPLOAD
+ * governed /api/outbox upload is separately modeled as a staged copy
  * edge for delivery manifest resolution.
  */
 
@@ -676,6 +676,14 @@ export function extractTaskDataflow(task: Record<string, unknown>): TaskDataflow
         produces.add(`outbox/${path.posix.basename(n)}`);
       }
     }
+    // F4.4 — a TEXT-mode delivery execution genuinely writes the
+    // canonical payload file (outbox/report.txt): declare it so the
+    // execution's own artifact ingest can bind the payload to THIS
+    // execution — "report.txt exists" is never proof; its canonical
+    // artifact under the current execution is.
+    if (manifest.mode === "TEXT") {
+      produces.add(DELIVERY_TEXT_ARTIFACT);
+    }
   }
   for (const p of [...d.produces, ...d.consumes]) {
     const n = normalizeArtifactPath(p);
@@ -755,10 +763,9 @@ function requiredEdges(
       ].filter((j) => j !== i);
       const earlier = producers.filter((j) => j < i);
       if (producers.length === 0) {
-        // Manifest consumes may still bind to earlier remote uploaders
-        // (handled in the delivery block below) — skip the UNBOUND
-        // throw for them here.
-        if (manifestNames.has(artifact)) continue;
+        // F4.2 — a manifested artifact without any declared producer is
+        // UNBOUND, full stop: remote tasks are producers only through an
+        // explicit declared produce edge, never by mere precedence.
         throw new IntegrityError(
           "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
           JSON.stringify({ task: key, artifact }),
@@ -801,34 +808,12 @@ function requiredEdges(
           out[i].push({ producerIndex: j, artifact: "RESULT_TEXT" });
         }
       }
-      // Manifest artifacts with no local producer bind to earlier remote
-      // tasks as PAIR_OUTBOX_UPLOAD producers — a governed upload lands
-      // locally only through that remote execution, so delivery must
-      // wait for it. A later remote uploader is an ORDER failure.
-      for (const artifact of manifestNames) {
-        if (out[i].some((r) => r.artifact === artifact)) continue;
-        const remoteEarlier = tasks
-          .map((t, j) => (j < i && isRemoteTask(t) ? j : -1))
-          .filter((j) => j >= 0);
-        if (remoteEarlier.length) {
-          for (const j of remoteEarlier) {
-            out[i].push({
-              producerIndex: j,
-              artifact: `PAIR_OUTBOX_UPLOAD:${artifact}`,
-            });
-          }
-          continue;
-        }
-        const remoteLater = tasks
-          .map((t, j) => (j > i && isRemoteTask(t) ? j : -1))
-          .filter((j) => j >= 0);
-        throw new IntegrityError(
-          remoteLater.length
-            ? "FAIL_CLOSED_PLAN_DATAFLOW_ORDER"
-            : "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
-          JSON.stringify({ task: key, artifact }),
-        );
-      }
+      // F4.2 — the remote-predecessor inference is REMOVED: an earlier
+      // remote task that never declared the artifact cannot be its
+      // producer (PAIROutboxUpload implicit binding is gone). A
+      // manifested artifact's legitimate producer was already bound by
+      // the declared-produce pass above; every remaining unbound
+      // manifest artifact reached the UNBOUND throw there.
     }
     // F2 §20 — DAG-LEAF NARROWING: a remote task listed in depends_on
     // must be bound by an explicitly declared consume edge resolved in
@@ -1004,9 +989,9 @@ export function reconcilePlanDataflow(
   const required = requiredEdges(tasks, models);
   // Output-language authority propagates to the producers of manifested
   // TEXT deliverables — a FILES-mode report written upstream must be
-  // composed in the canonical language. Only real artifact producers
-  // (incl. remote uploaders via PAIR_OUTBOX_UPLOAD edges) get the stamp;
-  // RESULT_TEXT intermediates keep the language freedom of mandate E.
+  // composed in the canonical language. Only declared artifact
+  // producers get the stamp; RESULT_TEXT intermediates keep the
+  // language freedom of mandate E.
   if (outputLanguage.code) {
     const suffix = outputLanguageSuffix(outputLanguage.code);
     for (const [i, task] of tasks.entries()) {
@@ -1014,10 +999,7 @@ export function reconcilePlanDataflow(
       const producerIdx = new Set<number>();
       for (const r of required[i]) {
         if (r.artifact === "RESULT_TEXT") continue;
-        const name = r.artifact.startsWith("PAIR_OUTBOX_UPLOAD:")
-          ? r.artifact.slice("PAIR_OUTBOX_UPLOAD:".length)
-          : r.artifact;
-        if (!isTextDeliverableName(name)) continue;
+        if (!isTextDeliverableName(r.artifact)) continue;
         producerIdx.add(r.producerIndex);
       }
       for (const j of producerIdx) {

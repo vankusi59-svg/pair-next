@@ -58,6 +58,7 @@ import path from "node:path";
 import { boundedFileSha256, compatOutboxBasename, digest, sha256Hex } from "./canonical.js";
 import type { BoundedFileResult } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { ArtifactAuthority } from "./artifact-authority.js";
 import { DELIVERY_TEXT_ARTIFACT } from "./output-language.js";
 import { deliveryManifest, normalizeArtifactPath } from "./plan-dataflow.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -111,7 +112,54 @@ export interface DeliverySlot {
    *  re-verifies it — a file mutated after minting fails closed with
    *  FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST, zero network call. */
   sha256?: string;
+  /** FILES only (F4): retained CAS object path stamped at mint — the
+   *  canonical bytes for `sha256` live here, NOT in the shared outbox.
+   *  The projection stages verified bytes from this path only; a slot
+   *  minted without it has no canonical byte source. */
+  source_path?: string;
+  /** F4 R1.2 — canonical provenance binding (transport carries it, the
+   *  immutable mint receipt anchors it): artifact row + producer
+   *  execution/governed identity + logical name. A slot carrying these
+   *  fields is valid ONLY while they equal the TELEGRAM_DELIVERY_MINTED
+   *  receipt AND the artifact still verifies through the canonical
+   *  authority — a coherent row rewrite cannot re-baseline either. */
+  artifact_id?: string;
+  producer_execution_id?: string;
+  producer_governed_task_id?: string;
+  logical_name?: string;
 }
+
+/** F4 R1.2 — the canonical provenance binding minted into a FILES slot
+ *  or the TEXT payload: the same binding the delivery-contract gate
+ *  re-verified, persisted durably and anchored by an immutable
+ *  append-only TELEGRAM_DELIVERY_MINTED receipt emitted at mint. */
+export interface DeliveryProvenanceBinding {
+  artifact_id: string;
+  producer_execution_id: string;
+  governed_task_id: string;
+  logical_name: string;
+  sha256: string;
+  /** FILES only — retained CAS path (transport realization, never
+   *  authority; the sha + identity above are what the receipt binds). */
+  source_path?: string;
+}
+
+/** Evidence kind of the immutable delivery-mint receipt — one row per
+ *  minted request, append-only (governed_evidence is insert-only and
+ *  payload-hash verified on read). Coherent rewrites of the mutable
+ *  request row can never re-baseline it. */
+export const TELEGRAM_DELIVERY_MINTED = "TELEGRAM_DELIVERY_MINTED";
+
+/** F4 R3.3 — append-only attempt lifecycle authority. BEGIN persists
+ *  TELEGRAM_DELIVERY_ATTEMPT_STARTED atomically with the SENDING
+ *  projection; each resolve persists TELEGRAM_DELIVERY_ATTEMPT_RESOLVED
+ *  atomically with the terminal/queued projection. The immutable
+ *  history is authority — the mutable TDR row is a cache of it, and a
+ *  coherent row rollback can never mint a new send permission. */
+export const TELEGRAM_DELIVERY_ATTEMPT_STARTED =
+  "TELEGRAM_DELIVERY_ATTEMPT_STARTED";
+export const TELEGRAM_DELIVERY_ATTEMPT_RESOLVED =
+  "TELEGRAM_DELIVERY_ATTEMPT_RESOLVED";
 
 export interface TelegramDeliveryRequestPayload {
   delivery_id: string;
@@ -123,6 +171,13 @@ export interface TelegramDeliveryRequestPayload {
   artifacts: DeliverySlot[];
   /** TEXT: the bounded composed result text. */
   text: string | null;
+  /** F4 R1.2 — TEXT canonical provenance binding (same authority as the
+   *  FILES slot fields): the canonical artifact + producer identity the
+   *  payload was materialized from. Anchored by the mint receipt. */
+  text_artifact_id?: string;
+  text_producer_execution_id?: string;
+  text_producer_governed_task_id?: string;
+  text_artifact_sha256?: string;
   /** TEXT mode: identical slot fields live at request level (R4 §8). */
   text_state?: DeliverySlot["state"];
   attempt_count?: number;
@@ -198,17 +253,27 @@ export function deliveryRequestId(missionId: string, taskId: string): string {
  *  staged copy for a manifested sibling. */
 export const DELIVERY_SNAPSHOT_DIR = ".delivery-snapshots";
 
+/** F4 R3.2 — request-owned delivery snapshot storage lives under the
+ *  CANONICAL store root (deployment/dbDir-scoped), never under the
+ *  mutable `outbox_dir`/`workspace`/`delivery_id` stamped on the row.
+ *  The shared outbox remains transport staging only: a coherently
+ *  rewritten TDR cannot redirect snapshot writes or retention deletes
+ *  into a forged directory. */
+export function deliverySnapshotRoot(store: PairEvidenceStore): string {
+  return path.join(store.dbDir, DELIVERY_SNAPSHOT_DIR);
+}
+
 /** Deterministic snapshot path shared by projection, transport, and
- *  retention cleanup — same name every pass. */
+ *  retention cleanup — same name every pass, keyed by the canonical
+ *  entity identity (never the mutable payload delivery_id). */
 function deliverySnapshotPath(
-  outboxDir: string,
-  deliveryId: string,
+  snapshotRoot: string,
+  entityId: string,
   name: string,
 ): string {
   return path.join(
-    outboxDir,
-    DELIVERY_SNAPSHOT_DIR,
-    `${deliveryId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
+    snapshotRoot,
+    `${entityId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
   );
 }
 
@@ -227,10 +292,11 @@ const TERMINAL_DELIVERY_REQUEST = new Set([
  *  the slot's sha256 itself and the staged bytes are removed on the
  *  next projection pass — no unbounded hidden-file accumulation over
  *  long-running production. Best-effort: a vanished file is no error. */
-function pruneDeliverySnapshots(req: Record<string, unknown>): void {
-  const outbox = req.outbox_dir;
-  if (typeof outbox !== "string" || !outbox) return;
-  const id = String(req.delivery_id);
+function pruneDeliverySnapshots(
+  req: Record<string, unknown>,
+  snapshotRoot: string,
+): void {
+  const id = String(req.entity_id ?? req.delivery_id);
   const requestTerminal = TERMINAL_DELIVERY_REQUEST.has(String(req.status));
   const artifacts = req.artifacts as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(artifacts)) {
@@ -238,7 +304,7 @@ function pruneDeliverySnapshots(req: Record<string, unknown>): void {
       if (!requestTerminal && !TERMINAL_DELIVERY_SLOT.has(String(a.state))) {
         continue;
       }
-      const snap = deliverySnapshotPath(outbox, id, String(a.name));
+      const snap = deliverySnapshotPath(snapshotRoot, id, String(a.name));
       for (const p of [snap, `${snap}.tmp`]) {
         try {
           fs.rmSync(p, { force: true });
@@ -248,7 +314,7 @@ function pruneDeliverySnapshots(req: Record<string, unknown>): void {
       }
     }
   }
-  const dir = path.join(outbox, DELIVERY_SNAPSHOT_DIR);
+  const dir = snapshotRoot;
   try {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
       fs.rmdirSync(dir);
@@ -303,11 +369,27 @@ export function mintTelegramDeliveryRequest(args: {
    *  manifest name must map to a valid SHA-256; a missing/incomplete/
    *  malformed map mints nothing (no hash → no authority). */
   artifactSha256?: Record<string, string>;
+  /** FILES: manifest name → retained CAS object path the canonical
+   *  bytes for `artifactSha256[name]` live at (stamped at mint by the
+   *  caller that verified them — the projection stages from THIS path
+   *  and re-proves its digest, never the shared outbox). */
+  artifactSources?: Record<string, string>;
+  /** FILES (F4 R1.2): manifest name → canonical provenance binding the
+   *  delivery-contract gate verified (artifact row + producer
+   *  execution/governed identity + logical name + sha). When present it
+   *  is authoritative: every slot carries the binding and the mint
+   *  emits the immutable TELEGRAM_DELIVERY_MINTED receipt anchoring it. */
+  artifactProvenance?: Record<string, DeliveryProvenanceBinding>;
   /** TEXT: the exact wire payload materialized and validated at the
    *  delivery-contract gate — mint stores it verbatim and NEVER
    *  re-reads the source file (R1.1: VALIDATED PAYLOAD === TDR
    *  PAYLOAD). */
   textPayload?: string;
+  /** TEXT (F4 R1.2): canonical provenance binding of the artifact the
+   *  payload was materialized from. Anchored by the mint receipt — a
+   *  coherent text/text_sha256/text_length rewrite cannot re-baseline
+   *  the payload origin. */
+  textProvenance?: DeliveryProvenanceBinding;
 }): Record<string, unknown> | null {
   const manifest = deliveryManifest(args.task);
   if (!manifest) return null;
@@ -340,15 +422,60 @@ export function mintTelegramDeliveryRequest(args: {
       else if (!SHA256_HEX_RE.test(String(sha))) bad(name, "malformed_digest");
     }
   }
-  const artifacts: DeliverySlot[] = manifest.artifacts.map((name) => ({
-    name,
-    state: "QUEUED",
-    attempt_count: 0,
-    max_attempts: maxAttempts,
-    ...(manifest.mode === "FILES"
-      ? { sha256: String(args.artifactSha256?.[name]) }
-      : {}),
-  }));
+  const prov = args.artifactProvenance;
+  const artifacts: DeliverySlot[] = manifest.artifacts.map((name) => {
+    const binding = prov?.[name];
+    if (manifest.mode === "FILES" && prov !== undefined) {
+      // R1.2 — a provenance-declared mint binds EVERY manifested
+      // artifact: a missing/malformed binding or a digest that
+      // disagrees with the verified map fails closed before mint.
+      const fail = (why: string): never => {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_ARTIFACT_PROVENANCE",
+          JSON.stringify({ artifact: name, reason: why }),
+        );
+      };
+      if (
+        !binding ||
+        typeof binding.artifact_id !== "string" ||
+        !binding.artifact_id ||
+        typeof binding.producer_execution_id !== "string" ||
+        !binding.producer_execution_id ||
+        typeof binding.governed_task_id !== "string" ||
+        !binding.governed_task_id ||
+        typeof binding.logical_name !== "string" ||
+        !binding.logical_name ||
+        !SHA256_HEX_RE.test(String(binding.sha256)) ||
+        binding.sha256 !== String(args.artifactSha256?.[name])
+      ) {
+        fail(
+          !binding ? "missing_provenance_binding" : "malformed_provenance_binding",
+        );
+      }
+    }
+    return {
+      name,
+      state: "QUEUED",
+      attempt_count: 0,
+      max_attempts: maxAttempts,
+      ...(manifest.mode === "FILES"
+        ? {
+            sha256: String(args.artifactSha256?.[name]),
+            ...(typeof args.artifactSources?.[name] === "string"
+              ? { source_path: args.artifactSources[name] }
+              : {}),
+            ...(binding
+              ? {
+                  artifact_id: binding.artifact_id,
+                  producer_execution_id: binding.producer_execution_id,
+                  producer_governed_task_id: binding.governed_task_id,
+                  logical_name: binding.logical_name,
+                }
+              : {}),
+          }
+        : {}),
+    };
+  });
   let text: string | null = null;
   let textEvidence: Record<string, unknown> = {};
   if (manifest.mode === "TEXT") {
@@ -368,6 +495,32 @@ export function mintTelegramDeliveryRequest(args: {
       text_sha256: digest(text),
       text_length: text.length,
       text_source_artifact: DELIVERY_TEXT_ARTIFACT,
+      ...(args.textProvenance
+        ? (() => {
+            const b = args.textProvenance!;
+            if (
+              typeof b.artifact_id !== "string" || !b.artifact_id ||
+              typeof b.producer_execution_id !== "string" ||
+              !b.producer_execution_id ||
+              typeof b.governed_task_id !== "string" || !b.governed_task_id ||
+              !SHA256_HEX_RE.test(String(b.sha256))
+            ) {
+              throw new IntegrityError(
+                "FAIL_CLOSED_TELEGRAM_ARTIFACT_PROVENANCE",
+                JSON.stringify({
+                  artifact: DELIVERY_TEXT_ARTIFACT,
+                  reason: "malformed_provenance_binding",
+                }),
+              );
+            }
+            return {
+              text_artifact_id: b.artifact_id,
+              text_producer_execution_id: b.producer_execution_id,
+              text_producer_governed_task_id: b.governed_task_id,
+              text_artifact_sha256: b.sha256,
+            };
+          })()
+        : {}),
     };
   }
   const body: Record<string, unknown> = {
@@ -397,7 +550,65 @@ export function mintTelegramDeliveryRequest(args: {
         }),
     created_at: args.now,
   };
-  return args.store.put(TELEGRAM_DELIVERY_REQUEST, id, body);
+  // F4 R2.4 — the mint receipt and the TDR row are ONE atomic durable
+  // write: BEGIN IMMEDIATE serializes competing minters so a concurrent
+  // or crashed mint can never leave an orphan receipt behind (which
+  // would permanently poison the request — projection requires exactly
+  // one receipt). The existence re-check runs INSIDE the transaction:
+  // an already-minted canonical TDR is adopted as-is, zero extra
+  // receipt, zero row mutation.
+  return args.store.immediate(() => {
+    const existingTx = args.store.tryGet(TELEGRAM_DELIVERY_REQUEST, id);
+    if (existingTx) return existingTx;
+    // F4 R1.2 — emit the immutable mint receipt with the mutable row in
+    // the same commit: a request carrying provenance binding is only
+    // ever valid against this append-only anchor.
+    if (prov !== undefined || args.textProvenance !== undefined) {
+      args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_MINTED, {
+        delivery_id: id,
+        // F4 R3.1 — the immutable mint authority binds the COMPLETE
+        // static send contract, not just artifact provenance: canonical
+        // entity identity, mission/task/execution, mode, canonical
+        // destination + sendability, the stamped staging roots, and the
+        // canonical retry ceiling. Mutable lifecycle fields (state,
+        // attempt_count, timestamps, message_id) legitimately evolve
+        // and are never bound here.
+        mission_id: missionId,
+        task_id: taskId,
+        execution_id: String(args.execution.execution_id),
+        mode: manifest.mode,
+        destination: destination ?? null,
+        sendable: destination != null,
+        outbox_dir: args.outboxDir,
+        workspace: args.workspace,
+        max_attempts: maxAttempts,
+        ...(manifest.mode === "FILES"
+          ? {
+              artifacts: artifacts.map((a) => ({
+                name: a.name,
+                artifact_id: a.artifact_id,
+                producer_execution_id: a.producer_execution_id,
+                governed_task_id: a.producer_governed_task_id,
+                logical_name: a.logical_name,
+                sha256: a.sha256,
+                source_path: a.source_path ?? null,
+                max_attempts: a.max_attempts,
+              })),
+            }
+          : {
+              artifact_id: args.textProvenance!.artifact_id,
+              producer_execution_id:
+                args.textProvenance!.producer_execution_id,
+              governed_task_id: args.textProvenance!.governed_task_id,
+              logical_name: DELIVERY_TEXT_ARTIFACT,
+              artifact_sha256: args.textProvenance!.sha256,
+              text_sha256: textEvidence.text_sha256,
+              text_length: textEvidence.text_length,
+            }),
+      });
+    }
+    return args.store.put(TELEGRAM_DELIVERY_REQUEST, id, body);
+  });
 }
 
 /**
@@ -615,7 +826,12 @@ function putReq(
   store: PairEvidenceStore,
   req: Record<string, unknown>,
 ): Record<string, unknown> {
-  return store.put(TELEGRAM_DELIVERY_REQUEST, String(req.delivery_id), {
+  // F4 R2.3 — the durable entity key is the canonical entity identity,
+  // NEVER the mutable payload delivery_id: a rewritten delivery_id must
+  // still converge onto the real row (or deterministically conflict),
+  // never fabricate a second entity under the forged key.
+  const key = String(req.entity_id ?? req.delivery_id);
+  return store.put(TELEGRAM_DELIVERY_REQUEST, key, {
     ...req,
     version: req.version,
   });
@@ -649,11 +865,522 @@ export interface BeginDeliveryResult {
   reason?: string;
 }
 
+/* ---------------------- attempt lifecycle ledger (F4 R3.3) --------- */
+
+type DeliveryAttemptEvent = {
+  kind: "STARTED" | "RESOLVED";
+  slot: string;
+  attempt_id?: string;
+  attempt_number?: number;
+  outcome?: string;
+  message_id?: unknown;
+};
+
+type DeliveryAttemptSlotHistory = {
+  /** count of STARTED events — the next attempt's durable identity. */
+  started: number;
+  /** count of RESOLVED FAILED events — the retry-budget consumption
+   *  authority (mutable attempt_count is only a projection of this). */
+  consumed: number;
+  events: DeliveryAttemptEvent[];
+  /** the ONE unresolved STARTED, when exactly one exists. */
+  open: DeliveryAttemptEvent | null;
+  /** terminal resolved outcome — SENT/UNKNOWN end the lifecycle. */
+  terminal: "SENT" | "UNKNOWN" | null;
+  /** set when this slot's immutable sequence is malformed — callers
+   *  MUST fail closed and never derive send authority from it. */
+  seqError?: string;
+};
+
+/** F4 R4.6 — the validated immutable attempt lifecycle for ONE canonical
+ *  delivery entity. `valid === false` means malformed append-only
+ *  history — never a source of new send authority. */
+export interface DeliveryAttemptLedger {
+  slots: Map<string, DeliveryAttemptSlotHistory>;
+  valid: boolean;
+  error?: string;
+}
+
+/** F4 R3.3/R3.4 + R4.6 — the immutable append-only attempt lifecycle
+ *  ledger for ONE canonical delivery entity, derived from attempt
+ *  evidence (seq-ordered). Sequence rules per slot: attempt_number is
+ *  1..N strictly incrementing, every STARTED carries the deterministic
+ *  `ATT_<digest(entityId:slot:N)>` identity, a RESOLVED pairs exactly
+ *  the preceding unresolved STARTED, no RESOLVED without STARTED, no
+ *  duplicate RESOLVED, at most one open STARTED, and nothing may start
+ *  after a terminal SENT/UNKNOWN. Malformed history → `valid:false`. */
+export function deliveryAttemptLedger(
+  store: PairEvidenceStore,
+  missionId: string,
+  entityId: string,
+  /** F4 R5.2 — immutable per-slot retry ceiling from the mint receipt.
+   *  Omit/return null for legacy unbound rows (legacy semantics
+   *  preserved); bound rows enforce attempt_number <= ceiling — an
+   *  over-budget STARTED makes the ledger INVALID, not merely
+   *  non-sendable. */
+  ceilingFor?: (slotKey: string) => number | null,
+): DeliveryAttemptLedger {
+  const raw = new Map<string, DeliveryAttemptEvent[]>();
+  for (const ev of store.listEvidence(missionId)) {
+    const kind = String(ev.kind);
+    if (
+      kind !== TELEGRAM_DELIVERY_ATTEMPT_STARTED &&
+      kind !== TELEGRAM_DELIVERY_ATTEMPT_RESOLVED
+    ) {
+      continue;
+    }
+    const p = (ev.payload as Record<string, unknown>)
+      .payload as Record<string, unknown>;
+    if (String(p.delivery_id ?? "") !== entityId) continue;
+    const slotKey = String(p.slot ?? "text");
+    const list = raw.get(slotKey) ?? [];
+    if (kind === TELEGRAM_DELIVERY_ATTEMPT_STARTED) {
+      list.push({
+        kind: "STARTED",
+        slot: slotKey,
+        attempt_id: p.attempt_id as string | undefined,
+        attempt_number: p.attempt_number as number | undefined,
+      });
+    } else {
+      list.push({
+        kind: "RESOLVED",
+        slot: slotKey,
+        attempt_id: p.attempt_id as string | undefined,
+        attempt_number: p.attempt_number as number | undefined,
+        outcome: String(p.outcome ?? ""),
+        message_id: p.message_id,
+      });
+    }
+    raw.set(slotKey, list);
+  }
+  const slots = new Map<string, DeliveryAttemptSlotHistory>();
+  let valid = true;
+  let error: string | undefined;
+  for (const [slotKey, events] of raw) {
+    const h: DeliveryAttemptSlotHistory = {
+      started: 0,
+      consumed: 0,
+      events,
+      open: null,
+      terminal: null,
+    };
+    let open: DeliveryAttemptEvent | null = null;
+    let expectNumber = 1;
+    for (const ev of events) {
+      if (h.seqError) break;
+      if (h.terminal) {
+        h.seqError = "activity_after_terminal";
+        break;
+      }
+      if (ev.kind === "STARTED") {
+        if (open) {
+          h.seqError = "unresolved_started_overlap";
+          break;
+        }
+        if (Number(ev.attempt_number) !== expectNumber) {
+          h.seqError = "attempt_number_sequence";
+          break;
+        }
+        // F4 R5.2 — a STARTED beyond the immutable mint ceiling is an
+        // invalid ledger, never a permitted attempt.
+        const ceil = ceilingFor?.(slotKey) ?? null;
+        if (ceil !== null && Number.isFinite(ceil) && expectNumber > ceil) {
+          h.seqError = "started_over_ceiling";
+          break;
+        }
+        const wantId = `ATT_${digest(
+          `${entityId}:${slotKey}:${expectNumber}`,
+        ).slice(0, 16)}`;
+        if (String(ev.attempt_id ?? "") !== wantId) {
+          h.seqError = "attempt_id_mismatch";
+          break;
+        }
+        h.started += 1;
+        expectNumber += 1;
+        open = ev;
+      } else {
+        if (!open) {
+          h.seqError = "resolved_without_started";
+          break;
+        }
+        if (
+          String(ev.attempt_id ?? "") !== String(open.attempt_id ?? "") ||
+          Number(ev.attempt_number) !== Number(open.attempt_number)
+        ) {
+          h.seqError = "resolved_mismatch";
+          break;
+        }
+        if (ev.outcome === "FAILED") {
+          h.consumed += 1;
+        } else if (ev.outcome === "SENT") {
+          // F4 R5.3 — SENT terminal authority requires canonical
+          // Telegram acceptance evidence: a positive safe integer
+          // message_id only.
+          if (!isValidTelegramMessageId(ev.message_id)) {
+            h.seqError = "sent_invalid_message_id";
+            break;
+          }
+          h.terminal = "SENT";
+        } else if (ev.outcome === "UNKNOWN") {
+          h.terminal = "UNKNOWN";
+        } else {
+          h.seqError = "resolved_bad_outcome";
+          break;
+        }
+        open = null;
+      }
+    }
+    h.open = open;
+    if (h.seqError) {
+      valid = false;
+      error ??= `${slotKey}:${h.seqError}`;
+    }
+    slots.set(slotKey, h);
+  }
+  return { slots, valid, error };
+}
+
+/* ============================ F4 R4 — canonical send-authority verifier ====
+ * ONE verifier shared by pending projection, BEGIN, RESOLVE, and stale
+ * reconciliation — identical semantics at every lifecycle seam, so a
+ * stale projection can never widen what durable state would allow. */
+
+/** All TELEGRAM_DELIVERY_MINTED receipts grouped by canonical entity id
+ *  (the receipt payload's delivery_id — stamped at mint, immutable). */
+function deliveryMintReceiptsAll(
+  store: PairEvidenceStore,
+): Map<string, Record<string, unknown>[]> {
+  const map = new Map<string, Record<string, unknown>[]>();
+  for (const ev of store.listEvidence()) {
+    if (String(ev.kind) !== TELEGRAM_DELIVERY_MINTED) continue;
+    const p = (ev.payload as Record<string, unknown>)
+      .payload as Record<string, unknown>;
+    const id = String(p.delivery_id ?? "");
+    if (!id) continue;
+    const list = map.get(id) ?? [];
+    list.push(p);
+    map.set(id, list);
+  }
+  return map;
+}
+
+function deliveryDestinationEqual(a: unknown, b: unknown): boolean {
+  const da = a as Record<string, unknown> | null | undefined;
+  const db = b as Record<string, unknown> | null | undefined;
+  if (da == null || db == null) return da == null && db == null;
+  return (
+    String(da.provider ?? "") === String(db.provider ?? "") &&
+    String(da.chat_id ?? "") === String(db.chat_id ?? "") &&
+    String(da.provenance ?? "") === String(db.provenance ?? "")
+  );
+}
+
+/** F4 R2/R3.1 — the immutable mint receipt is a WHOLE-REQUEST contract:
+ *  mode + complete static send authority + bijective slot match. */
+function deliveryWholeContractValid(
+  req: Record<string, unknown>,
+  receipt: Record<string, unknown>,
+): boolean {
+  if (String(req.mode ?? "") !== String(receipt.mode ?? "")) return false;
+  if (String(req.mission_id ?? "") !== String(receipt.mission_id ?? ""))
+    return false;
+  if (String(req.task_id ?? "") !== String(receipt.task_id ?? ""))
+    return false;
+  if (String(req.execution_id ?? "") !== String(receipt.execution_id ?? ""))
+    return false;
+  if (!deliveryDestinationEqual(req.destination, receipt.destination))
+    return false;
+  if (String(req.outbox_dir ?? "") !== String(receipt.outbox_dir ?? ""))
+    return false;
+  if (String(req.workspace ?? "") !== String(receipt.workspace ?? ""))
+    return false;
+  const ceiling = Number(receipt.max_attempts);
+  if (!Number.isSafeInteger(ceiling) || ceiling <= 0) return false;
+  if (receipt.sendable === false && String(req.status) !== "UNSENDABLE")
+    return false;
+  if (String(req.mode) === "TEXT") {
+    return (
+      Number(req.max_attempts) === ceiling &&
+      typeof req.text_artifact_id === "string" &&
+      String(receipt.artifact_id ?? "") === req.text_artifact_id &&
+      typeof req.text_producer_execution_id === "string" &&
+      String(receipt.producer_execution_id ?? "") ===
+        req.text_producer_execution_id &&
+      typeof req.text_producer_governed_task_id === "string" &&
+      String(receipt.governed_task_id ?? "") ===
+        req.text_producer_governed_task_id &&
+      String(receipt.logical_name ?? "") ===
+        String(req.text_source_artifact ?? "") &&
+      typeof req.text_artifact_sha256 === "string" &&
+      String(receipt.artifact_sha256 ?? receipt.sha256 ?? "") ===
+        req.text_artifact_sha256 &&
+      String(receipt.text_sha256 ?? "") === String(req.text_sha256 ?? "") &&
+      Number(receipt.text_length) === Number(req.text_length)
+    );
+  }
+  const ra = Array.isArray(receipt.artifacts)
+    ? (receipt.artifacts as Array<Record<string, unknown>>)
+    : [];
+  const slots = Array.isArray(req.artifacts)
+    ? (req.artifacts as DeliverySlot[])
+    : [];
+  if (ra.length === 0 || ra.length !== slots.length) return false;
+  const remaining = [...ra];
+  for (const a of slots) {
+    const i = remaining.findIndex(
+      (r) =>
+        String(r.name ?? "") === String(a.name ?? "") &&
+        String(r.artifact_id ?? "") === String(a.artifact_id ?? "") &&
+        String(r.producer_execution_id ?? "") ===
+          String(a.producer_execution_id ?? "") &&
+        String(r.governed_task_id ?? "") ===
+          String(a.producer_governed_task_id ?? "") &&
+        String(r.logical_name ?? "") === String(a.logical_name ?? "") &&
+        String(r.sha256 ?? "") === String(a.sha256 ?? "") &&
+        String(r.source_path ?? "") === String(a.source_path ?? "") &&
+        Number(r.max_attempts) === Number(a.max_attempts),
+    );
+    if (i < 0) return false;
+    remaining.splice(i, 1);
+  }
+  return remaining.length === 0;
+}
+
+/** The canonical artifact authority for live re-verification, scoped to
+ *  the store's deployment artifact directory. */
+function deliveryArtifactAuthority(store: PairEvidenceStore) {
+  return new ArtifactAuthority(store, {
+    blobDir: path.join(
+      process.env.PAIR_ARTIFACT_DIR ?? path.join(store.dbDir, "artifacts"),
+      "blobs",
+    ),
+  });
+}
+
+/** Live canonical re-verification of one bound artifact through the
+ *  F1/F2 authority seam (verifyArtifactForConsumption). */
+function deliveryLiveVerify(
+  store: PairEvidenceStore,
+  req: Record<string, unknown>,
+  bound: {
+    artifact_id: unknown;
+    producer_execution_id: unknown;
+    governed_task_id: unknown;
+    logical_name: unknown;
+    sha256: unknown;
+  },
+): boolean {
+  try {
+    deliveryArtifactAuthority(store).verifyArtifactForConsumption(
+      String(bound.artifact_id),
+      {
+        execution_id: String(bound.producer_execution_id),
+        mission_id: String(req.mission_id),
+        governed_task_id: String(bound.governed_task_id),
+        logical_name: String(bound.logical_name),
+        sha256: String(bound.sha256),
+      },
+    );
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/** The provenance binding a request/slot claims, for live re-verify. */
+function deliverySlotBinding(
+  req: Record<string, unknown>,
+  slotKey: string,
+): {
+  artifact_id: unknown;
+  producer_execution_id: unknown;
+  governed_task_id: unknown;
+  logical_name: unknown;
+  sha256: unknown;
+} | null {
+  if (String(req.mode) === "TEXT" || slotKey === "text") {
+    return {
+      artifact_id: req.text_artifact_id,
+      producer_execution_id: req.text_producer_execution_id,
+      governed_task_id: req.text_producer_governed_task_id,
+      logical_name: req.text_source_artifact,
+      sha256: req.text_artifact_sha256,
+    };
+  }
+  const slot = (Array.isArray(req.artifacts)
+    ? (req.artifacts as DeliverySlot[])
+    : []
+  ).find((a) => String(a.name) === slotKey);
+  if (!slot) return null;
+  return {
+    artifact_id: slot.artifact_id,
+    producer_execution_id: slot.producer_execution_id,
+    governed_task_id: slot.producer_governed_task_id,
+    logical_name: slot.logical_name,
+    sha256: slot.sha256,
+  };
+}
+
+/** The resolved static authority for one durable request row — the same
+ *  computation at every lifecycle seam. */
+interface DeliveryStaticAuthority {
+  entityId: string;
+  identityOk: boolean;
+  bound: boolean;
+  receipts: Record<string, unknown>[];
+  receipt: Record<string, unknown> | null;
+  contractOk: boolean;
+}
+function deliveryStaticAuthority(
+  store: PairEvidenceStore,
+  req: Record<string, unknown>,
+  receiptsAll?: Map<string, Record<string, unknown>[]>,
+): DeliveryStaticAuthority {
+  const entityId = String(req.entity_id ?? "");
+  const identityOk =
+    entityId.length > 0 && String(req.delivery_id ?? "") === entityId;
+  const receipts =
+    (receiptsAll?.get(entityId) ??
+      deliveryMintReceiptsAll(store).get(entityId)) ??
+    [];
+  const bound = receipts.length > 0;
+  const receipt = receipts.length === 1 ? receipts[0]! : null;
+  const contractOk =
+    identityOk && receipt !== null && deliveryWholeContractValid(req, receipt);
+  return { entityId, identityOk, bound, receipts, receipt, contractOk };
+}
+
+/** Whether the request carries provenance-binding fields (bound-shaped
+ *  even when no receipt exists — equally invalid). */
+function deliveryCarriesBinding(req: Record<string, unknown>): boolean {
+  if (req.text_artifact_id !== undefined) return true;
+  if (
+    Array.isArray(req.artifacts) &&
+    (req.artifacts as Array<Record<string, unknown>>).some(
+      (a) => a.artifact_id !== undefined,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** F4 R5.2 — the immutable per-slot retry ceiling straight from the
+ *  mint receipt; null for unbound/legacy rows (legacy semantics). */
+function deliveryCeilingFromReceipt(
+  req: Record<string, unknown>,
+  receipt: Record<string, unknown> | null,
+  slotKey: string,
+): number | null {
+  if (!receipt) return null;
+  if (String(req.mode) === "TEXT" || slotKey === "text") {
+    const c = Number(receipt.max_attempts);
+    return Number.isSafeInteger(c) && c > 0 ? c : null;
+  }
+  const entry = (Array.isArray(receipt.artifacts)
+    ? (receipt.artifacts as Array<Record<string, unknown>>)
+    : []
+  ).find((e) => String(e.name ?? "") === slotKey);
+  if (!entry) return null;
+  const c = Number(entry.max_attempts);
+  return Number.isSafeInteger(c) && c > 0 ? c : null;
+}
+
+/** F4 R4.1 — the effective retry ceiling: the immutable mint receipt for
+ *  bound requests, never a widened mutable field. */
+function deliveryEffectiveCeiling(
+  req: Record<string, unknown>,
+  slotKey: string,
+  slot: DeliverySlot,
+  staticAuth: DeliveryStaticAuthority,
+): number {
+  if (!staticAuth.contractOk) return Number(slot.max_attempts ?? 0);
+  const r = staticAuth.receipt!;
+  if (String(req.mode) === "TEXT" || slotKey === "text") {
+    return Number(r.max_attempts);
+  }
+  const ra = (Array.isArray(r.artifacts)
+    ? (r.artifacts as Array<Record<string, unknown>>)
+    : []
+  ).find(
+    (e) =>
+      String(e.name ?? "") === slotKey &&
+      String(e.artifact_id ?? "") === String(slot.artifact_id ?? ""),
+  );
+  return ra ? Number(ra.max_attempts) : Number(r.max_attempts);
+}
+
+/** F4 R3.3/R4 — is the mutable slot an exact legal projection of the
+ *  immutable ledger? Any disagreement is a violation — never a new send
+ *  permission. */
+function deliverySlotLifecycleViolation(
+  ledger: DeliveryAttemptLedger,
+  slotKey: string,
+  slot: DeliverySlot,
+): boolean {
+  if (!ledger.valid) return true;
+  const h = ledger.slots.get(slotKey);
+  if (!h || h.events.length === 0) return false;
+  if (h.seqError) return true;
+  if (Number(slot.attempt_count ?? 0) !== h.consumed) return true;
+  if (h.terminal === "SENT") {
+    return (
+      slot.state !== "SENT" ||
+      String(slot.message_id ?? "") !==
+        String(h.events[h.events.length - 1]!.message_id ?? "")
+    );
+  }
+  if (h.terminal === "UNKNOWN") {
+    return slot.state !== "UNKNOWN_SIDE_EFFECT";
+  }
+  if (h.open) {
+    return (
+      slot.state !== "SENDING" ||
+      String(slot.attempt_id ?? "") !== String(h.open.attempt_id ?? "")
+    );
+  }
+  // RESOLVED FAILED is the last event — legit projections are QUEUED
+  // retry or FAILED_DELIVERY terminal with the consumed count intact.
+  return !(slot.state === "QUEUED" || slot.state === "FAILED_DELIVERY");
+}
+
+/** F4 R4.3 — the ONE unresolved STARTED an outcome may resolve, or a
+ *  reason string. Exact attempt_id + attempt_number pairing only. */
+function deliveryOpenStarted(
+  ledger: DeliveryAttemptLedger,
+  slotKey: string,
+  slot: DeliverySlot,
+): { open: DeliveryAttemptEvent } | { error: string } {
+  if (!ledger.valid) {
+    return { error: `ledger_invalid:${ledger.error ?? "unknown"}` };
+  }
+  const h = ledger.slots.get(slotKey);
+  const open = h?.open;
+  if (!open) return { error: "no_unresolved_started" };
+  if (
+    String(slot.attempt_id ?? "") !== String(open.attempt_id ?? "") ||
+    Number(slot.attempt_number) !== Number(open.attempt_number)
+  ) {
+    return { error: "started_identity_mismatch" };
+  }
+  return { open };
+}
+
 /**
  * QUEUED → SENDING: persist the deterministic attempt identity BEFORE
  * the network call (R4 §7 — ATT_<digest(delivery_id:slot:attempt_number)>,
  * no wall-clock inside the domain transition). Legal only from QUEUED
  * with retry budget remaining and next_retry_at elapsed (R4 §6).
+ * F4 R3.3 — the immutable attempt-start evidence and the SENDING
+ * projection commit in ONE atomic transaction: either both durable or
+ * neither. Attempt identity and budget consumption derive from the
+ * immutable ledger — a rewritten attempt_count cannot lower either.
+ * F4 R4.1/R4.2 — BEGIN is the FINAL immutable send-authority gate: the
+ * durable row is re-loaded inside this transaction and re-proved against
+ * the mint receipt's complete static contract, the live artifact
+ * authority, and the validated lifecycle ledger — before a new STARTED
+ * is minted. Terminal SENT/UNKNOWN ledgers NEVER re-acquire; an open
+ * STARTED means only that in-flight attempt exists.
  */
 export function beginDeliveryAttempt(args: {
   store: PairEvidenceStore;
@@ -661,43 +1388,115 @@ export function beginDeliveryAttempt(args: {
   artifact?: string | null;
   now: string;
 }): BeginDeliveryResult {
-  const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
-  if (req.status !== "QUEUED") {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), String(req.status), "SENDING");
-  }
-  const next = { ...req };
-  const { slot, apply } = findSlot(req, next, args.artifact);
-  if (slot.state === "SENDING") {
-    // Already claimed — durable state is authoritative, never send
-    // authority for a competing or response-lost caller.
-    return {
-      acquired: false,
-      reason: "ALREADY_CLAIMED",
-      request: req,
-      attempt_id: slot.attempt_id,
-      attempt_number: slot.attempt_number,
-    };
-  }
-  if (slot.state !== "QUEUED") {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), slot.state, "SENDING");
-  }
-  if (slot.attempt_count >= slot.max_attempts) {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), "BUDGET_EXHAUSTED", "SENDING");
-  }
-  if (slot.next_retry_at && slot.next_retry_at > args.now) {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), "BACKOFF_PENDING", "SENDING");
-  }
-  const attemptNumber = slot.attempt_count + 1;
-  slot.attempt_number = attemptNumber;
-  const attemptId = `ATT_${digest(
-    `${args.deliveryId}:${String(args.artifact ?? "text")}:${attemptNumber}`,
-  ).slice(0, 16)}`;
-  slot.attempt_id = attemptId;
-  slot.attempt_started_at = args.now;
-  slot.state = "SENDING";
-  apply();
-  const request = putReq(args.store, next);
-  return { acquired: true, request, attempt_id: attemptId, attempt_number: attemptNumber };
+  return args.store.immediate(() => {
+    // F4 R4.1 — A: load the canonical durable TDR inside THIS
+    // transaction — a stale projection is never authority.
+    const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
+    const slotKey = String(args.artifact ?? "text");
+    const entityId = String(req.entity_id ?? args.deliveryId);
+    const missionId = String(req.mission_id);
+    const staticAuth = deliveryStaticAuthority(args.store, req);
+    const boundish = staticAuth.bound || deliveryCarriesBinding(req);
+    // F4 R4.1 — B/C/D: when the immutable mint contract applies, the
+    // durable row must satisfy it completely AND the slot's live
+    // artifact/provenance contract re-verify — before any STARTED.
+    if (boundish) {
+      if (!staticAuth.contractOk) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+          `${args.deliveryId}:${slotKey}:begin static contract violation`,
+        );
+      }
+      const binding = deliverySlotBinding(req, slotKey);
+      if (!binding || !deliveryLiveVerify(args.store, req, binding)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+          `${args.deliveryId}:${slotKey}:begin live authority violation`,
+        );
+      }
+    }
+    if (req.status !== "QUEUED") {
+      failTransition(args.deliveryId, slotKey, String(req.status), "SENDING");
+    }
+    const next = { ...req };
+    const { slot, apply } = findSlot(req, next, args.artifact);
+    if (slot.state === "SENDING") {
+      // Already claimed — durable state is authoritative, never send
+      // authority for a competing or response-lost caller.
+      return {
+        acquired: false,
+        reason: "ALREADY_CLAIMED",
+        request: req,
+        attempt_id: slot.attempt_id,
+        attempt_number: slot.attempt_number,
+      };
+    }
+    if (slot.state !== "QUEUED") {
+      failTransition(args.deliveryId, slotKey, slot.state, "SENDING");
+    }
+    // F4 R4.1 — E/F: rebuild and validate the immutable lifecycle
+    // ledger; the durable row must be an exact legal projection.
+    const ledger = deliveryAttemptLedger(args.store, missionId, entityId, (k) =>
+      deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
+    );
+    if (!ledger.valid) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+        `${args.deliveryId}:${slotKey}:ledger_invalid:${ledger.error ?? ""}`,
+      );
+    }
+    const hist = ledger.slots.get(slotKey);
+    if (deliverySlotLifecycleViolation(ledger, slotKey, slot)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+        `${args.deliveryId}:${slotKey}:projection_not_legal`,
+      );
+    }
+    // F4 R4.1 — a resolved SENT/UNKNOWN lifecycle NEVER acquires again;
+    // an open STARTED means only that in-flight attempt exists.
+    if (hist?.terminal) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+        `${args.deliveryId}:${slotKey}:terminal_${hist.terminal}`,
+      );
+    }
+    // F4 R4.2 — G: the retry ceiling is the immutable mint receipt for
+    // bound requests — never a widened mutable field.
+    const effectiveMax = deliveryEffectiveCeiling(req, slotKey, slot, staticAuth);
+    const consumed = Math.max(
+      hist?.consumed ?? 0,
+      Number(slot.attempt_count ?? 0),
+    );
+    if (consumed >= effectiveMax) {
+      failTransition(args.deliveryId, slotKey, "BUDGET_EXHAUSTED", "SENDING");
+    }
+    if (slot.next_retry_at && slot.next_retry_at > args.now) {
+      failTransition(args.deliveryId, slotKey, "BACKOFF_PENDING", "SENDING");
+    }
+    // H — mint STARTED + SENDING atomically with the durable proof.
+    const attemptNumber = Math.max(
+      hist?.started ?? 0,
+      Number(slot.attempt_count ?? 0),
+    ) + 1;
+    slot.attempt_number = attemptNumber;
+    const attemptId = `ATT_${digest(
+      `${entityId}:${slotKey}:${attemptNumber}`,
+    ).slice(0, 16)}`;
+    slot.attempt_id = attemptId;
+    slot.attempt_started_at = args.now;
+    slot.state = "SENDING";
+    apply();
+    // R3.3 — attempt-start authority inside the same commit.
+    args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_ATTEMPT_STARTED, {
+      delivery_id: entityId,
+      slot: slotKey,
+      attempt_id: attemptId,
+      attempt_number: attemptNumber,
+      started_at: args.now,
+    });
+    const request = putReq(args.store, next);
+    return { acquired: true, request, attempt_id: attemptId, attempt_number: attemptNumber };
+  });
 }
 
 /**
@@ -717,21 +1516,59 @@ export function resolveDeliveryAttempt(args: {
   error?: string;
   now: string;
 }): Record<string, unknown> {
-  const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
-  const next = { ...req };
-  const { slot, apply } = findSlot(req, next, args.artifact);
-  if (slot.state !== "SENDING") {
-    failTransition(
-      args.deliveryId,
-      String(args.artifact ?? "text"),
-      slot.state,
-      args.outcome,
+  return args.store.immediate(() => {
+    const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
+    const next = { ...req };
+    const { slot, apply } = findSlot(req, next, args.artifact);
+    const slotKey = String(args.artifact ?? "text");
+    const entityId = String(req.entity_id ?? args.deliveryId);
+    const missionId = String(req.mission_id);
+    if (slot.state !== "SENDING") {
+      failTransition(
+        args.deliveryId,
+        slotKey,
+        slot.state,
+        args.outcome,
+      );
+    }
+    // R3.3 — the resolving attempt's durable identity is captured BEFORE
+    // the mutable projection fields are cleared, so the immutable
+    // resolve evidence binds exactly the attempt that was in flight.
+    const resolvedAttemptId = slot.attempt_id;
+    const resolvedAttemptNumber = slot.attempt_number;
+    const staticAuth = deliveryStaticAuthority(args.store, req);
+    const boundish = staticAuth.bound || deliveryCarriesBinding(req);
+    // F4 R4.5 — lifecycle evidence may only be minted when the complete
+    // immutable static contract still holds for this durable row.
+    if (boundish && !staticAuth.contractOk) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+        `${args.deliveryId}:${slotKey}:resolve static contract violation`,
+      );
+    }
+    const ledger = deliveryAttemptLedger(args.store, missionId, entityId, (k) =>
+      deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
     );
-  }
-  delete slot.attempt_id;
-  delete slot.attempt_number;
-  delete slot.attempt_started_at;
-  if (args.outcome === "SENT") {
+    // F4 R4.3 — a RESOLVED event may be appended ONLY when the immutable
+    // ledger holds exactly one unresolved STARTED for this slot and the
+    // mutable SENDING identity matches it exactly. Mutable corruption can
+    // never be laundered into immutable history.
+    const gate =
+      boundish || (ledger.slots.get(slotKey)?.events.length ?? 0) > 0;
+    if (gate) {
+      const started = deliveryOpenStarted(ledger, slotKey, slot);
+      if ("error" in started) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+          `${args.deliveryId}:${slotKey}:${started.error}`,
+        );
+      }
+    }
+    const consumed = ledger.slots.get(slotKey)?.consumed ?? 0;
+    delete slot.attempt_id;
+    delete slot.attempt_number;
+    delete slot.attempt_started_at;
+    if (args.outcome === "SENT") {
     // R4 §2 + R5 §4-5 — SENT requires REAL Telegram acceptance evidence:
     // a positive safe-integer message_id (Bot API Integer). Strings,
     // "MID_fake", 0, negatives, fractions, NaN are all rejected
@@ -749,7 +1586,9 @@ export function resolveDeliveryAttempt(args: {
     delete slot.next_retry_at;
     delete slot.last_error;
   } else if (args.outcome === "FAILED") {
-    slot.attempt_count = slot.attempt_count + 1;
+    // R3.4 — consumption derives from the immutable ledger, never the
+    // mutable row alone: a rewritten attempt_count cannot un-consume.
+    slot.attempt_count = consumed + 1;
     slot.last_error = String(args.error ?? "telegram transport failed").slice(0, 300);
     if (slot.attempt_count < slot.max_attempts) {
       slot.state = "QUEUED";
@@ -770,7 +1609,25 @@ export function resolveDeliveryAttempt(args: {
   const status = recomputeStatus(req, next);
   next.status = status;
   if (status === "SENT") next.sent_at = args.now;
+  // R3.3 — the immutable resolve evidence and the mutable projection
+  // commit atomically inside this transaction. F4 R4.3 — evidence is
+  // appended only when the exact STARTED authority gate was enforced
+  // (bound rows / rows with existing lifecycle history) — a legacy row
+  // without any history mints no orphan RESOLVED.
+  if (gate) {
+    args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED, {
+      delivery_id: entityId,
+      slot: slotKey,
+      attempt_id: resolvedAttemptId ?? null,
+      attempt_number: resolvedAttemptNumber ?? null,
+      outcome: args.outcome,
+      message_id: args.outcome === "SENT" ? args.messageId : null,
+      error: args.outcome === "SENT" ? null : String(args.error ?? "").slice(0, 300) || null,
+      resolved_at: args.now,
+    });
+  }
   return putReq(args.store, next);
+  });
 }
 
 /**
@@ -792,43 +1649,121 @@ export function reconcileStaleDeliveryAttempts(
   store: PairEvidenceStore,
   now: string,
   staleAfterMs: number = TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS,
+  opts?: { receipts?: Map<string, Record<string, unknown>[]> },
 ): void {
   const nowMs = Date.parse(now);
-  for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
-    if (req.status !== "QUEUED") continue;
-    let dirty = false;
-    const next = { ...req } as Record<string, unknown>;
-    for (const { slot, apply } of slots(req, next)) {
-      if (slot.state !== "SENDING") {
+  // F4 R5.1 — the outer list is DISCOVERY ONLY: it yields candidate
+  // entity ids and is never authority. Every authority-relevant check
+  // happens inside the writer transaction, on the row re-loaded inside
+  // it — another writer can never interleave between verification and
+  // the immutable UNKNOWN append.
+  const candidates = store
+    .list(TELEGRAM_DELIVERY_REQUEST)
+    .map((r) => String(r.entity_id ?? ""))
+    .filter((id) => id.length > 0);
+  for (const entityId of candidates) {
+    store.immediate(() => {
+      const req = store.get(TELEGRAM_DELIVERY_REQUEST, entityId);
+      if (String(req.status) !== "QUEUED") return;
+      // F4 R4.5/R5.1 — the SAME canonical static verifier, inside this
+      // transaction: lifecycle evidence may only be minted while the
+      // complete immutable mint contract still holds.
+      const staticAuth = deliveryStaticAuthority(store, req, opts?.receipts);
+      const boundish = staticAuth.bound || deliveryCarriesBinding(req);
+      if (boundish && !staticAuth.contractOk) return;
+      const ledger = boundish
+        ? deliveryAttemptLedger(store, String(req.mission_id), entityId, (k) =>
+            deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
+          )
+        : null;
+      let dirty = false;
+      const next = { ...req } as Record<string, unknown>;
+      const resolvedStale: Array<{
+        slotKey: string;
+        attempt_id?: string;
+        attempt_number?: number;
+        reason: string;
+      }> = [];
+      for (const { slot, apply } of slots(req, next)) {
+        if (slot.state !== "SENDING") {
+          apply();
+          continue;
+        }
+        const slotKey =
+          req.mode === "TEXT" ? "text" : String(slot.name ?? "text");
+        const staleAttemptId = slot.attempt_id;
+        const staleAttemptNumber = slot.attempt_number;
+        // F4 R5.1 — the stale threshold is re-checked against the
+        // CURRENT durable attempt_started_at, inside this transaction.
+        const startedMs = Date.parse(String(slot.attempt_started_at ?? ""));
+        if (!Number.isFinite(startedMs) || nowMs - startedMs >= staleAfterMs) {
+          const reason = !Number.isFinite(startedMs)
+            ? "stale_sending_missing_started_at"
+            : `stale_sending_reconciled:${now}`;
+          if (boundish) {
+            // F4 R4.4 — stale resolution requires the EXACT unresolved
+            // STARTED authority: same attempt_id + attempt_number, not
+            // already resolved. Forged SENDING without it → quarantine
+            // the projection, append ZERO lifecycle evidence.
+            const started = deliveryOpenStarted(ledger!, slotKey, slot);
+            dirty = true;
+            if ("error" in started) {
+              slot.state = "FAILED_DELIVERY";
+              delete slot.attempt_id;
+              delete slot.attempt_number;
+              delete slot.attempt_started_at;
+              slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+            } else {
+              slot.state = "UNKNOWN_SIDE_EFFECT";
+              delete slot.attempt_id;
+              delete slot.attempt_number;
+              delete slot.attempt_started_at;
+              slot.unknown_reason = reason;
+              resolvedStale.push({
+                slotKey,
+                attempt_id: staleAttemptId,
+                attempt_number: staleAttemptNumber,
+                reason,
+              });
+            }
+          } else {
+            dirty = true;
+            slot.state = "UNKNOWN_SIDE_EFFECT";
+            delete slot.attempt_id;
+            delete slot.attempt_number;
+            delete slot.attempt_started_at;
+            slot.unknown_reason = reason;
+          }
+        }
+        // else: fresh SENDING — legitimately in flight, leave untouched.
         apply();
-        continue;
       }
-      const startedMs = Date.parse(String(slot.attempt_started_at ?? ""));
-      if (!Number.isFinite(startedMs)) {
-        dirty = true;
-        slot.state = "UNKNOWN_SIDE_EFFECT";
-        delete slot.attempt_id;
-        delete slot.attempt_number;
-        delete slot.attempt_started_at;
-        slot.unknown_reason = "stale_sending_missing_started_at";
-      } else if (nowMs - startedMs >= staleAfterMs) {
-        dirty = true;
-        slot.state = "UNKNOWN_SIDE_EFFECT";
-        delete slot.attempt_id;
-        delete slot.attempt_number;
-        delete slot.attempt_started_at;
-        slot.unknown_reason = `stale_sending_reconciled:${now}`;
-      }
-      // else: fresh SENDING — legitimately in flight, leave untouched.
-      apply();
-    }
-    if (dirty) {
+      if (!dirty) return;
       // R5 §3 — stale reconciliation must recompute the canonical
       // request aggregate (a single stale payload → UNKNOWN_SIDE_EFFECT,
       // never dead QUEUED).
       next.status = recomputeStatus(req, next);
+      // F4 R3.3/R4.4/R5.1 — exact-STARTED-proven stale-resolution
+      // evidence and the mutable projection commit atomically in THIS
+      // transaction; a failure rolls back both.
+      for (const r of resolvedStale) {
+        store.appendEvidence(
+          String(req.mission_id),
+          TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
+          {
+            delivery_id: entityId,
+            slot: r.slotKey,
+            attempt_id: r.attempt_id ?? null,
+            attempt_number: r.attempt_number ?? null,
+            outcome: "UNKNOWN",
+            message_id: null,
+            error: r.reason,
+            resolved_at: now,
+          },
+        );
+      }
       putReq(store, next);
-    }
+    });
   }
 }
 
@@ -845,22 +1780,117 @@ export function pendingTelegramDeliveries(
   staleAfterMs: number = TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS,
 ): Array<Record<string, unknown>> {
   const ts = now ?? new Date().toISOString();
-  reconcileStaleDeliveryAttempts(store, ts, staleAfterMs);
   const out: Array<Record<string, unknown>> = [];
+  // F4 R4 — the ONE canonical send-authority verifier: mint receipts are
+  // resolved once per pass and shared with stale reconciliation, so
+  // lifecycle evidence can never be minted before static-contract proof.
+  const mintReceipts = deliveryMintReceiptsAll(store);
+  const receiptsFor = (entityId: string): Record<string, unknown>[] =>
+    mintReceipts.get(entityId) ?? [];
+  reconcileStaleDeliveryAttempts(store, ts, staleAfterMs, {
+    receipts: mintReceipts,
+  });
+  const liveVerify = (
+    req: Record<string, unknown>,
+    bound: {
+      artifact_id: unknown;
+      producer_execution_id: unknown;
+      governed_task_id: unknown;
+      logical_name: unknown;
+      sha256: unknown;
+    },
+  ): boolean => deliveryLiveVerify(store, req, bound);
+  const wholeContractValid = (
+    req: Record<string, unknown>,
+    receipt: Record<string, unknown>,
+  ): boolean => deliveryWholeContractValid(req, receipt);
+
+  // F4 R3.2 — request-owned snapshot storage is canonical store-scoped
+  // (deployment root), NEVER derived from mutable outbox_dir/workspace/
+  // delivery_id fields. prune + snapshot materialization under this
+  // root alone cannot be redirected by a coherent TDR rewrite.
+  const snapshotRoot = deliverySnapshotRoot(store);
+  const attemptLedgers = new Map<string, DeliveryAttemptLedger>();
+  const ledgerFor = (
+    entityId: string,
+    missionId: string,
+    ceilingFor: (slotKey: string) => number | null,
+  ) => {
+    let l = attemptLedgers.get(entityId);
+    if (!l) {
+      l = deliveryAttemptLedger(store, missionId, entityId, ceilingFor);
+      attemptLedgers.set(entityId, l);
+    }
+    return l;
+  };
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
-    // R3 — bounded snapshot retention: a pinned snapshot is transport
-    // staging only while its slot's fate is open (QUEUED retry,
-    // in-flight SENDING, UNKNOWN_SIDE_EFFECT investigation — the bytes
-    // are the evidence of what may/must still ship). Once a slot lands
-    // SENT/FAILED_DELIVERY, or the whole request lands terminal
-    // (SENT/FAILED_DELIVERY/UNSENDABLE), the durable identity evidence
-    // is the slot's sha256 itself and the staged bytes are removed on
-    // this projection pass — no unbounded hidden-file accumulation.
-    pruneDeliverySnapshots(req);
+    // F4 R2 — resolve the immutable mint-receipt contract ONCE for the
+    // whole request, by the CANONICAL entity identity (`entity_id`),
+    // never by the mutable payload `delivery_id`: a rewritten
+    // delivery_id can neither escape nor re-select receipt authority
+    // (identity mismatch is itself a fail-closed violation). When a
+    // receipt exists the row must match it as a WHOLE contract —
+    // deleted provenance fields, renamed/duplicated/added/removed
+    // slots, or any bound-field drift is a violation, never a legacy
+    // fallback. `bound` = a mint receipt anchors this entity; a row
+    // carrying bound provenance fields with no receipt is equally
+    // invalid (a receipt is always emitted with the mint that binds).
+    const staticAuth = deliveryStaticAuthority(store, req, mintReceipts);
+    const { entityId, identityOk, bound, contractOk } = staticAuth;
+    const receipts = staticAuth.receipts;
+    // F4 R3.2 — NO filesystem read/write/delete derived from a
+    // receipt-bound TDR may happen before its static immutable
+    // authority has been validated. A bound row that fails its whole
+    // contract gets zero filesystem operations this pass.
+    if (!bound || contractOk) {
+      // R3 — bounded snapshot retention (canonical root only):
+      // a pinned snapshot is transport staging only while its slot's
+      // fate is open; terminal slots/requests shed their staged bytes
+      // on this pass — no unbounded hidden-file accumulation.
+      pruneDeliverySnapshots(req, snapshotRoot);
+    }
     if (String(req.status) !== "QUEUED") continue;
+    // F4 R4.5 — a bound row whose immutable static contract no longer
+    // holds is quarantined HERE, before any lifecycle evidence could be
+    // minted in its name: every slot fails closed, zero evidence, zero
+    // filesystem, zero transport.
+    if (staticAuth.bound && !staticAuth.contractOk) {
+      const probe = { ...req } as Record<string, unknown>;
+      for (const { slot, apply } of slots(req, probe)) {
+        slot.state = "FAILED_DELIVERY";
+        slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
+        slot.completed_at = ts;
+        delete slot.attempt_id;
+        delete slot.attempt_number;
+        delete slot.attempt_started_at;
+        apply();
+      }
+      probe.status = recomputeStatus(req, probe);
+      putReq(store, probe);
+      continue;
+    }
+    // F4 R3.3 — the immutable attempt lifecycle ledger is the high-water
+    // authority for every slot: the mutable row is a cache of it. A
+    // coherent rollback (SENT→QUEUED, attempt_count→0, deleted
+    // message_id) can never mint a new send permission — the slot
+    // converges to a durable terminal lifecycle violation instead.
+    const ledger = ledgerFor(entityId, String(req.mission_id), (k) =>
+      deliveryCeilingFromReceipt(req, staticAuth.receipt, k),
+    );
+    const lifecycleViolation = (slotKey: string, slot: DeliverySlot) =>
+      deliverySlotLifecycleViolation(ledger, slotKey, slot);
     if (req.mode === "TEXT") {
       const probe = { ...req } as Record<string, unknown>;
       const [s] = slots(req, probe);
+      if (lifecycleViolation("text", s.slot)) {
+        s.slot.state = "FAILED_DELIVERY";
+        s.slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+        s.slot.completed_at = ts;
+        s.apply();
+        probe.status = recomputeStatus(req, probe);
+        putReq(store, probe);
+        continue;
+      }
       if (!eligible(s.slot, ts)) continue;
       // R2.1 — a TEXT payload has send authority ONLY when its canonical
       // payload evidence is complete AND internally consistent with the
@@ -877,9 +1907,26 @@ export function pendingTelegramDeliveries(
         req.text_sha256 === digest(text) &&
         Number(req.text_length) === text.length &&
         String(req.text_source_artifact) === DELIVERY_TEXT_ARTIFACT;
-      if (!evidenceOk) {
+      // F4 R2 — receipt-bound (or binding-field-carrying) requests must
+      // satisfy the whole receipt contract AND live re-verification;
+      // an unbound row may only use the legacy path when NO receipt
+      // exists for its canonical identity.
+      const provOk =
+        bound || req.text_artifact_id !== undefined
+          ? contractOk &&
+            liveVerify(req, {
+              artifact_id: req.text_artifact_id,
+              producer_execution_id: req.text_producer_execution_id,
+              governed_task_id: req.text_producer_governed_task_id,
+              logical_name: req.text_source_artifact,
+              sha256: req.text_artifact_sha256,
+            })
+          : true;
+      if (!evidenceOk || !provOk || !identityOk) {
         probe.text_state = "FAILED_DELIVERY";
-        probe.last_error = "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE";
+        probe.last_error = !evidenceOk
+          ? "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE"
+          : "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
         probe.completed_at = ts;
         probe.status = recomputeStatus(req, probe);
         putReq(store, probe);
@@ -896,6 +1943,13 @@ export function pendingTelegramDeliveries(
     let dirty = false;
     const projected: Array<Record<string, unknown>> = [];
     for (const a of (next.artifacts as DeliverySlot[])) {
+      if (lifecycleViolation(String(a.name), a)) {
+        a.state = "FAILED_DELIVERY";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+        a.completed_at = ts;
+        dirty = true;
+        continue;
+      }
       if (a.state !== "QUEUED" || a.attempt_count >= a.max_attempts) continue;
       // R1.2 — a hashless FILES slot has NO send authority: a persisted
       // request minted before digest authority was mandatory converges
@@ -907,6 +1961,32 @@ export function pendingTelegramDeliveries(
         dirty = true;
         continue;
       }
+      // F4 R2 — provenance authority is whole-request: when a mint
+      // receipt anchors this entity (or the slot still carries bound
+      // fields), the request must satisfy the exact receipt contract
+      // AND the slot's artifact must live-verify through the canonical
+      // authority — BEFORE the first snapshot materialization.
+      // Deleting the provenance fields cannot downgrade to legacy:
+      // the immutable receipt still exists → fail closed.
+      if (bound || a.artifact_id !== undefined) {
+        const ok =
+          contractOk &&
+          identityOk &&
+          liveVerify(req, {
+            artifact_id: a.artifact_id,
+            producer_execution_id: a.producer_execution_id,
+            governed_task_id: a.producer_governed_task_id,
+            logical_name: a.logical_name,
+            sha256: a.sha256,
+          });
+        if (!ok) {
+          a.state = "FAILED_DELIVERY";
+          a.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
+          a.completed_at = ts;
+          dirty = true;
+          continue;
+        }
+      }
       // R4.1 — snapshot-first authority: the immutable identity is the
       // TDR slot sha256; the pinned snapshot is its retained byte
       // realization. A VALID snapshot (sha256 == slot digest) is
@@ -914,10 +1994,10 @@ export function pendingTelegramDeliveries(
       // mutable producer/workspace file is NOT required to still exist
       // and is never re-read while a valid snapshot stands (source
       // drift/deletion after a failed attempt cannot kill the retry).
-      const snapDir = path.join(String(req.outbox_dir), DELIVERY_SNAPSHOT_DIR);
+      const snapDir = snapshotRoot;
       const snapPath = deliverySnapshotPath(
-        String(req.outbox_dir),
-        String(req.delivery_id),
+        snapshotRoot,
+        entityId,
         String(a.name),
       );
       // R5.1 — stat-first: an oversized retained snapshot is rejected
@@ -939,11 +2019,15 @@ export function pendingTelegramDeliveries(
         } catch {
           /* best effort */
         }
-        const p = resolveDeliveryArtifactPath({
-          outboxDir: String(req.outbox_dir),
-          workspace: req.workspace ? String(req.workspace) : undefined,
-          name: String(a.name),
-        });
+        // F4.3 — the ONE canonical byte source is the CAS object path
+        // stamped at mint (the bytes the delivery-contract gate verified
+        // live there). The shared outbox is staging/transport, NEVER
+        // authority: a stale same-name file cannot be selected, cannot
+        // shadow the canonical artifact, and is never opened.
+        const p =
+          typeof a.source_path === "string" && a.source_path.length
+            ? a.source_path
+            : null;
         if (!p) {
           a.state = "FAILED_DELIVERY";
           a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_UNRESOLVED";
