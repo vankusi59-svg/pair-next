@@ -121,7 +121,16 @@ describe("F1-A local canonical artifact ingest", () => {
     const ctx = mkCtx("a1");
     const prod = mkProducer(ctx, {
       state: "COMPLETED",
-      result: { status: "COMPLETED", artifacts: [{ path: "out.txt" }] },
+      result: {
+        status: "COMPLETED",
+        artifacts: [
+          {
+            path: "out.txt",
+            sha256: sha256Hex(Buffer.from("local-bytes-A")),
+            byte_size: "local-bytes-A".length,
+          },
+        ],
+      },
     });
     fs.writeFileSync(path.join(ctx.workspace, "out.txt"), "local-bytes-A");
     const v = new ArtifactProvenanceValidator().validate_execution(ctx.service, prod.eid) as Record<
@@ -148,7 +157,10 @@ describe("F1-A local canonical artifact ingest", () => {
     const ctx = mkCtx("a2");
     const prod = mkProducer(ctx, {
       state: "COMPLETED",
-      result: { status: "COMPLETED", artifacts: [{ path: "out.txt", sha256: "0".repeat(64) }] },
+      result: {
+        status: "COMPLETED",
+        artifacts: [{ path: "out.txt", sha256: "0".repeat(64), byte_size: 4 }],
+      },
     });
     fs.writeFileSync(path.join(ctx.workspace, "out.txt"), "real");
     const v = new ArtifactProvenanceValidator().validate_execution(ctx.service, prod.eid);

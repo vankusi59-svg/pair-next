@@ -54,6 +54,25 @@ export class ArtifactProvenanceValidator {
         failures.push(`artifact symlink: ${rel}`);
         continue;
       }
+      // R5.1 — the worker-result contract is mandatory: every declared
+      // artifact carries its DECLARED sha256 (exactly 64 lowercase hex)
+      // and byte_size (finite non-negative integer). Missing metadata is
+      // a contract failure — PAIR computes actual bytes itself, but it
+      // never computes the worker's declaration for it.
+      const declaredSha = art.sha256;
+      if (typeof declaredSha !== "string" || !/^[0-9a-f]{64}$/.test(declaredSha)) {
+        failures.push(`artifact declaration invalid sha256: ${rel}`);
+        continue;
+      }
+      const declaredSize = art.byte_size;
+      if (
+        typeof declaredSize !== "number" ||
+        !Number.isInteger(declaredSize) ||
+        declaredSize < 0
+      ) {
+        failures.push(`artifact declaration invalid byte_size: ${rel}`);
+        continue;
+      }
       // R2.2 — the validator performs NO independent content read. The
       // declared sha256/byte_size are forwarded as expectations; the ONE
       // authoritative materialization inside ArtifactAuthority reads the
@@ -86,12 +105,8 @@ export class ArtifactProvenanceValidator {
               kind: "path" as const,
               path: path.resolve(workspace, String(art.path)),
             },
-            ...(art.sha256 !== undefined
-              ? { expected_sha256: String(art.sha256) }
-              : {}),
-            ...(art.byte_size !== undefined
-              ? { expected_byte_size: Number(art.byte_size) }
-              : {}),
+            expected_sha256: String(art.sha256),
+            expected_byte_size: Number(art.byte_size),
           })),
           channel: "LOCAL_EXECUTION",
           actor: "PAIR_ARTIFACT_VALIDATOR",
@@ -106,17 +121,25 @@ export class ArtifactProvenanceValidator {
         pass = false;
       }
     }
-    // F1 §7 — remote executions return artifacts:[] adapter-side, but
-    // capability-bound uploads already minted canonical ART_* rows.
-    // Restart/re-observation reconstructs the same references from
-    // durable state — no re-upload, no re-baselining.
+    // F1 §7 + R5.2 — remote executions return artifacts:[] adapter-
+    // side, but capability-bound uploads already minted canonical ART_*
+    // rows. A terminal PASS may only expose artifact_ids whose retained
+    // CAS bytes verify NOW — the authority re-proves every candidate
+    // row (complete identity + storage contract + retained bytes via
+    // the R4 open-object primitive); ANY malformed or unverifiable row
+    // fails the whole validation rather than being dropped silently.
     if (pass) {
-      const remoteIds = service.artifacts
-        .forExecution(executionId)
-        .map((a) => String(a.artifact_id))
-        .filter((id) => !acceptedIds.includes(id));
-      acceptedIds.push(...remoteIds);
-    } else {
+      try {
+        const verifiedIds = service.artifacts.verifyForExecution(executionId);
+        acceptedIds.push(...verifiedIds.filter((id) => !acceptedIds.includes(id)));
+      } catch (e) {
+        failures.push(
+          `artifact retained-byte verification failed: ${e instanceof IntegrityError ? e.code : String(e)}`,
+        );
+        pass = false;
+      }
+    }
+    if (!pass) {
       // R1.6 — a FAIL exposes zero new local authority; prior remote
       // references are diagnostics, not PASS authority, so they move to
       // a separate non-authoritative field.

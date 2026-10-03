@@ -958,14 +958,40 @@ export class GovernedTaskGate {
   ): Record<string, unknown> {
     const execution = this.store.get("executor_execution", executionId);
     let result = adapter.collect_result(executionId);
-    // Identity binding: result must name the same governed task / mission / task.
-    for (const field of ["mission_id", "task_id", "governed_task_id"]) {
-      if (result[field] && String(result[field]) !== String(execution[field])) {
+    // R5.1 — strict result envelope: EVERY result entering canonical
+    // execution state must carry the common PAIR identity fields and a
+    // terminal status. A missing field is a contract failure — never a
+    // "no mismatch".
+    const expectedIds: Record<string, unknown> = {
+      mission_id: execution.mission_id,
+      task_id: execution.task_id,
+      governed_task_id: execution.governed_task_id,
+      execution_id: executionId,
+    };
+    for (const [field, expected] of Object.entries(expectedIds)) {
+      const value = result[field];
+      if (value === undefined || value === null || String(value) === "") {
         throw new IntegrityError(
-          "FAIL_CLOSED_RESULT_IDENTITY_MISMATCH",
-          `${field}:${result[field]}!=${execution[field]}`,
+          "FAIL_CLOSED_RESULT_IDENTITY_MISSING",
+          `${field}:absent`,
         );
       }
+      if (String(value) !== String(expected)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_RESULT_IDENTITY_MISMATCH",
+          `${field}:${String(value)}!=${String(expected)}`,
+        );
+      }
+    }
+    const resultStatus = String(result.status ?? "");
+    if (!["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"].includes(resultStatus)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_RESULT_ENVELOPE",
+        `status:${resultStatus || "<absent>"}`,
+      );
+    }
+    if (result.artifacts !== undefined && !Array.isArray(result.artifacts)) {
+      throw new IntegrityError("FAIL_CLOSED_RESULT_ENVELOPE", "artifacts:not-array");
     }
     // P13-R4 §1: untrusted remote output is sanitized BEFORE it becomes
     // canonical — broker capabilities, the master token and released

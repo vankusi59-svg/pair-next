@@ -708,7 +708,11 @@ describe("R1-E capability claims ↔ durable state", () => {
 describe("R1-F local validator batch atomicity", () => {
   it("R1-F1 33-artifact batch → validation FAIL + ZERO new ART rows", () => {
     const ctx = mkCtx("f1");
-    const arts = Array.from({ length: 33 }, (_, i) => ({ path: `a${i}.txt` }));
+    const arts = Array.from({ length: 33 }, (_, i) => ({
+      path: `a${i}.txt`,
+      sha256: sha256Hex(Buffer.from(`a${i}.txt`)),
+      byte_size: `a${i}.txt`.length,
+    }));
     const p = mkProducer(ctx, {
       state: "COMPLETED",
       result: { status: "COMPLETED", artifacts: arts },
@@ -741,7 +745,10 @@ describe("R1-F local validator batch atomicity", () => {
         ...(ctx.store.get("executor_execution", p.eid) as Record<string, unknown>),
         result: {
           status: "COMPLETED",
-          artifacts: [{ path: "a.txt" }, { path: "b.txt" }],
+          artifacts: [
+            { path: "a.txt", sha256: sha256Hex(Buffer.from("A")), byte_size: 1 },
+            { path: "b.txt", sha256: sha256Hex(Buffer.from("B")), byte_size: 1 },
+          ],
         },
       },
       1,
@@ -769,7 +776,10 @@ describe("R1-F local validator batch atomicity", () => {
       state: "COMPLETED",
       result: {
         status: "COMPLETED",
-        artifacts: [{ path: "a.txt" }, { path: "b.txt" }],
+        artifacts: [
+          { path: "a.txt", sha256: sha256Hex(Buffer.from("A")), byte_size: 1 },
+          { path: "b.txt", sha256: sha256Hex(Buffer.from("B")), byte_size: 1 },
+        ],
       },
     });
 
@@ -795,7 +805,10 @@ describe("R1-F local validator batch atomicity", () => {
       state: "COMPLETED",
       result: {
         status: "COMPLETED",
-        artifacts: [{ path: "a.txt" }, { path: "b.txt" }],
+        artifacts: [
+          { path: "a.txt", sha256: sha256Hex(Buffer.from("A")), byte_size: 1 },
+          { path: "b.txt", sha256: sha256Hex(Buffer.from("B")), byte_size: 1 },
+        ],
       },
     });
     fs.writeFileSync(path.join(ctx.workspace, "a.txt"), "A");
@@ -815,7 +828,12 @@ describe("R1-F local validator batch atomicity", () => {
     const ctx = mkCtx("f4");
     const p = mkProducer(ctx, {
       state: "COMPLETED",
-      result: { status: "COMPLETED", artifacts: [{ path: "a.txt" }] },
+      result: {
+        status: "COMPLETED",
+        artifacts: [
+          { path: "a.txt", sha256: sha256Hex(Buffer.from("A")), byte_size: 1 },
+        ],
+      },
     });
     fs.writeFileSync(path.join(ctx.workspace, "a.txt"), "A");
     const v1 = new ArtifactProvenanceValidator().validate_execution(ctx.service, p.eid);

@@ -22,6 +22,7 @@ import {
   ArtifactAuthority,
   ArtifactProvenanceValidator,
   compatOutboxBasename,
+  GovernedTaskGate,
   IntegrityError,
   mintArtifactCapability,
   MissionControl,
@@ -1198,5 +1199,230 @@ describe("R4-D CAS regular-file proof bound to the read object", () => {
     const r = acceptX(ctx, p.eid, Buffer.from("D5"), "fresh.txt");
     expect(r.replayed).toBe(false);
     expect(ctx.authority.forExecution(p.eid)).toHaveLength(1);
+  });
+});
+
+/* ==================== R5.1 declaration contract + result envelope ======= */
+describe("R5-A worker artifact declaration metadata is mandatory", () => {
+  const validate = (ctx: ReturnType<typeof mkCtx>, eid: string) =>
+    new ArtifactProvenanceValidator().validate_execution(ctx.service, eid) as Record<
+      string,
+      unknown
+    >;
+  const ctxFor = (tag: string, artifactEntry: Record<string, unknown>) => {
+    const ctx = mkCtx(tag);
+    const p = mkProducer(ctx, {
+      state: "COMPLETED",
+      result: { status: "COMPLETED", artifacts: [artifactEntry] },
+    });
+    fs.writeFileSync(path.join(ctx.workspace, "a.txt"), "AAA");
+    return { ctx, p };
+  };
+
+  it("R5-A1 entry missing sha256+byte_size → FAIL, zero ART rows", () => {
+    const { ctx, p } = ctxFor("r5a1", { path: "a.txt" });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+  });
+  it("R5-A2 path + sha only → FAIL", () => {
+    const { ctx, p } = ctxFor("r5a2", { path: "a.txt", sha256: sha256Hex(Buffer.from("AAA")) });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+  });
+  it("R5-A3 path + byte_size only → FAIL", () => {
+    const { ctx, p } = ctxFor("r5a3", { path: "a.txt", byte_size: 3 });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R5-A4 malformed digest (short / uppercase / non-hex) → FAIL", () => {
+    for (const bad of ["abc", "F".repeat(64), "z".repeat(64)]) {
+      const { ctx, p } = ctxFor(`r5a4-${bad.slice(0, 3)}`, {
+        path: "a.txt",
+        sha256: bad,
+        byte_size: 3,
+      });
+      expect(validate(ctx, p.eid).status).toBe("FAIL");
+      expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+    }
+  });
+  it("R5-A5 invalid byte_size (negative/fractional/string) → FAIL", () => {
+    // NaN/Infinity cannot even persist through the canonical result row —
+    // store.put throws NON_FINITE_NUMBER_IN_CANONICAL_JSON at write time.
+    for (const bad of [-1, 2.5, "3" as unknown as number]) {
+      const { ctx, p } = ctxFor(`r5a5-${String(bad)}`, {
+        path: "a.txt",
+        sha256: sha256Hex(Buffer.from("AAA")),
+        byte_size: bad,
+      });
+      expect(validate(ctx, p.eid).status).toBe("FAIL");
+      expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+    }
+  });
+  it("R5-A6 valid declaration + matching bytes → PASS, one realization", () => {
+    const { ctx, p } = ctxFor("r5a6", {
+      path: "a.txt",
+      sha256: sha256Hex(Buffer.from("AAA")),
+      byte_size: 3,
+    });
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("PASS");
+    expect((v.artifact_ids as string[]).length).toBe(1);
+  });
+});
+
+describe("R5-E strict result envelope at canonical ingest", () => {
+  const gateResult = (
+    ctx: ReturnType<typeof mkCtx>,
+    eid: string,
+    result: Record<string, unknown>,
+  ) => {
+    const adapter = { collect_result: () => result } as never;
+    return run(() =>
+      new GovernedTaskGate(ctx.service).collect_execution_result(adapter, eid),
+    );
+  };
+  const fullIds = (ctx: ReturnType<typeof mkCtx>, p: { eid: string; tid: string; gtId: string }) => ({
+    execution_id: p.eid,
+    governed_task_id: p.gtId,
+    task_id: p.tid,
+    mission_id: ctx.missionId,
+    status: "COMPLETED",
+    artifacts: [],
+  });
+
+  it("R5-E1 missing each identity field → IDENTITY_MISSING", () => {
+    for (const missing of ["mission_id", "task_id", "governed_task_id", "execution_id"]) {
+      const ctx = mkCtx(`r5e1-${missing}`);
+      const p = mkProducer(ctx);
+      const res = fullIds(ctx, p) as Record<string, unknown>;
+      delete res[missing];
+      expect(gateResult(ctx, p.eid, res)).toBe("FAIL_CLOSED_RESULT_IDENTITY_MISSING");
+    }
+  });
+  it("R5-E2 present but mismatched identity → MISMATCH preserved", () => {
+    const ctx = mkCtx("r5e2");
+    const p = mkProducer(ctx);
+    const res = { ...fullIds(ctx, p), mission_id: "MSN_OTHER" };
+    expect(gateResult(ctx, p.eid, res)).toBe("FAIL_CLOSED_RESULT_IDENTITY_MISMATCH");
+  });
+  it("R5-E3 non-terminal/absent status → ENVELOPE fail", () => {
+    const ctx = mkCtx("r5e3");
+    const p = mkProducer(ctx);
+    expect(gateResult(ctx, p.eid, { ...fullIds(ctx, p), status: "RUNNING" })).toBe(
+      "FAIL_CLOSED_RESULT_ENVELOPE",
+    );
+    const res = fullIds(ctx, p);
+    delete (res as Record<string, unknown>).status;
+    expect(gateResult(ctx, p.eid, res)).toBe("FAIL_CLOSED_RESULT_ENVELOPE");
+  });
+  it("R5-E4 artifacts present but not an array → ENVELOPE fail", () => {
+    const ctx = mkCtx("r5e4");
+    const p = mkProducer(ctx);
+    expect(
+      gateResult(ctx, p.eid, { ...fullIds(ctx, p), artifacts: "nope" }),
+    ).toBe("FAIL_CLOSED_RESULT_ENVELOPE");
+  });
+});
+
+/* ==================== R5.2 retained-CAS terminal re-verification ======== */
+describe("R5-B terminal PASS requires retained CAS verified NOW", () => {
+  const setupRemote = (ctx: ReturnType<typeof mkCtx>, bytes = Buffer.from("REMOTE")) => {
+    const p = mkProducer(ctx); // RUNNING — remote uploads happen during execution
+    const acc = ctx.authority.accept({
+      execution_id: p.eid,
+      producer_executor_id: EX,
+      logical_name: "remote.txt",
+      source: { kind: "buffer", bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid) as Record<string, unknown>;
+    exec.result = { status: "COMPLETED", artifacts: [] };
+    exec.execution_state = "COMPLETED";
+    ctx.store.put("executor_execution", p.eid, exec, Number(exec.version));
+    return { p, acc };
+  };
+  const validate = (ctx: ReturnType<typeof mkCtx>, eid: string) =>
+    new ArtifactProvenanceValidator().validate_execution(ctx.service, eid) as Record<
+      string,
+      unknown
+    >;
+
+  it("R5-B1 intact canonical upload → PASS exposes artifact id", () => {
+    const ctx = mkCtx("r5b1");
+    const { p, acc } = setupRemote(ctx);
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("PASS");
+    expect(v.artifact_ids).toEqual([String(acc.artifact.artifact_id)]);
+  });
+  it("R5-B2 retained blob deleted → FAIL + artifact_ids []", () => {
+    const ctx = mkCtx("r5b2");
+    const { p, acc } = setupRemote(ctx);
+    fs.unlinkSync(blobPath(ctx, String(acc.artifact.sha256)));
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(v.artifact_ids).toEqual([]);
+  });
+  it("R5-B3 retained blob corrupted → FAIL", () => {
+    const ctx = mkCtx("r5b3");
+    const { p, acc } = setupRemote(ctx);
+    fs.writeFileSync(blobPath(ctx, String(acc.artifact.sha256)), "TAMPERED");
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R5-B4 CAS path replaced with symlink to identical bytes → FAIL", () => {
+    const ctx = mkCtx("r5b4");
+    const { p, acc } = setupRemote(ctx);
+    const blob = blobPath(ctx, String(acc.artifact.sha256));
+    const ext = path.join(ctx.d, "ext.bin");
+    fs.writeFileSync(ext, "REMOTE");
+    fs.unlinkSync(blob);
+    fs.symlinkSync(ext, blob);
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R5-B5 ART storage.ref tampered → FAIL", () => {
+    const ctx = mkCtx("r5b5");
+    const { p, acc } = setupRemote(ctx);
+    const row = ctx.store.get("artifact", String(acc.artifact.artifact_id)) as Record<
+      string,
+      unknown
+    >;
+    (row.storage as Record<string, unknown>).ref = "blobs/other";
+    ctx.store.put("artifact", String(row.artifact_id), row, Number(row.version));
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R5-B6 ART byte_size tampered → FAIL", () => {
+    const ctx = mkCtx("r5b6");
+    const { p, acc } = setupRemote(ctx);
+    const row = ctx.store.get("artifact", String(acc.artifact.artifact_id)) as Record<
+      string,
+      unknown
+    >;
+    row.byte_size = 999999;
+    ctx.store.put("artifact", String(row.artifact_id), row, Number(row.version));
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R5-B7 ART producer identity tampered → FAIL", () => {
+    const ctx = mkCtx("r5b7");
+    const { p, acc } = setupRemote(ctx);
+    const row = ctx.store.get("artifact", String(acc.artifact.artifact_id)) as Record<
+      string,
+      unknown
+    >;
+    row.producer_executor_id = "EX_OTHER";
+    ctx.store.put("artifact", String(row.artifact_id), row, Number(row.version));
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R5-B8 restart with intact CAS → verification still PASS", () => {
+    const ctx = mkCtx("r5b8");
+    const { p, acc } = setupRemote(ctx);
+    ctx.store.close();
+    const store2 = new PairEvidenceStore(path.join(ctx.d, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const v = new ArtifactProvenanceValidator().validate_execution(service2, p.eid) as Record<
+      string,
+      unknown
+    >;
+    expect(v.status).toBe("PASS");
+    expect(v.artifact_ids).toEqual([String(acc.artifact.artifact_id)]);
+    store2.close();
   });
 });

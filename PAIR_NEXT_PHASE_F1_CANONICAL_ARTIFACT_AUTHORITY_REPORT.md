@@ -399,3 +399,48 @@ Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R3_PENDING_SOUR
 - `dependency_artifacts` / downstream consumer materialization remain deferred to F2.
 
 Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R4_PENDING_SOURCE_REVIEW`
+
+---
+
+## INDEPENDENT SOURCE-REVIEW R5 REMEDIATION
+
+- **Previous reviewed HEAD:** `ef7d96afab1c8c35afe5adce742b39169169761f`
+- **New HEAD:** `<pending — stamped after commit>`
+- **Changed files:** `src/pair/gate.ts`, `src/pair/artifact-authority.ts`, `src/pair/artifact-validation.ts`, `src/__tests__/pair-f1-r2-remediation.test.ts`, `src/__tests__/pair-f1-r1-remediation.test.ts`, `src/__tests__/pair-f1-artifact-authority.test.ts`, `src/__tests__/{pair-p8,pair-p9,pair-p10,pair-p12,pair-p13,pair-live-ops-recovery-closure,pair-phase-b,pair-phase-d-recovery-approval-hardening,pair-planner-dataflow-incident,pair-output-delivery-contract,pair-runtime-hardening,pair-route-capability-authority}.test.ts`, `CURRENT_STATE.md`, this report.
+
+### RCA — R5.1 ARTIFACT DECLARATION CONTRACT + STRICT RESULT ENVELOPE FAIL-OPEN
+
+- **Root cause 1 (declaration):** `result.artifacts` entries missing `sha256`/`byte_size` still reached `ArtifactAuthority.acceptBatch` — the validator treated absence as "PAIR may compute the declaration for the worker," so worker-declared identity never had to exist.
+- **Root cause 2 (envelope):** `Gate.collect_execution_result` compared mission/task/governed ids ONLY when the field was present (`if (result[field] && ...)`) — a result that simply omitted every identity field passed as "no mismatch," and non-terminal/UNKNOWN statuses were never envelope-gated.
+- **Fix (declaration):** validator independently refuses — no reliance on TS types — any artifact entry whose `sha256` is not exactly `/^[0-9a-f]{64}$/` or whose `byte_size` is not a finite integer ≥ 0: `failures.push(...)` → entry skipped → validation FAIL → ZERO new ART rows. Non-empty `path` string remains required (existing check). Valid entries carry `expected_sha256`/`expected_byte_size` into `acceptBatch`, where the single materialized-byte realization must match (`FAIL_CLOSED_ARTIFACT_DECLARED_MISMATCH` preserved).
+- **Fix (envelope):** `collect_execution_result` now requires, before anything else: `mission_id`, `task_id`, `governed_task_id`, `execution_id` each present AND equal to the durable `executor_execution` row (`FAIL_CLOSED_RESULT_IDENTITY_MISSING` for absence, `FAIL_CLOSED_RESULT_IDENTITY_MISMATCH` for inequality), `status` present and inside the accepted terminal enum `{COMPLETED, FAILED, CANCELLED, TIMEOUT}` (`FAIL_CLOSED_RESULT_ENVELOPE`), and `artifacts`, when present, an array. Missing identity is a contract failure — never "no mismatch." These are exactly the fields the canonical `WorkerResult` contract already mandates (`worker_execution_id` remains adapter-protocol-scoped); no remote-only field was invented.
+- **Test-adapter corrections (envelope blast radius):** 12 scripted test adapters/payloads that returned results missing identity fields were corrected to emit the canonical fields real adapters always emit (identity merged from the dispatched task / durable execution row); 5 historical result fixtures now carry valid worker declarations. No production assertion was weakened — every fixed fake now mirrors `worker-protocol.ts`'s required result fields.
+
+### RCA — R5.2 RETAINED CAS NOT RE-VERIFIED AT TERMINAL VALIDATION
+
+- **Root cause:** `forExecution`/`artifact_ids` exposed rows that were valid at mint time, but a terminal PASS never re-proved the retained CAS bytes still existed/verified NOW — DB authority was trusted over byte authority.
+- **Fix:** authority-owned `verifyForExecution(executionId)` resolves the durable execution + governed linkage (`FAIL_CLOSED_ARTIFACT_VERIFICATION:<id>:durable_linkage|governed_task_missing` on drift), then for EVERY ACCEPTED candidate row requires: contract `pair-artifact.v1`, deterministic `artifact_id`, mission/task/governed equality, `producer_executor_id === execution.executor_id` (and `governed.executor_id === execution.executor_id`), `byte_size` valid integer ≥ 0, `storage.kind`/`storage.sha256`/`storage.ref === "blobs/<sha>"` exact, and `readCasBlob` (the R4 open-object primitive) digest == `row.sha256` AND `bytes.length == row.byte_size`. ANY malformed or unverifiable candidate throws `IntegrityError("FAIL_CLOSED_ARTIFACT_VERIFICATION", "<id>:<reason>")` — the whole validation fails closed; nothing is silently omitted.
+- **Wiring (§6):** the local validator, after the ingest batch passes, calls `verifyForExecution` — covering local mints AND remote capability uploads (`artifacts:[]` results re-verified through the same authority before ids enter `artifact_ids`). On failure: `status=FAIL`, `artifact_ids=[]`; `referenced_artifact_ids` retains prior remote rows as diagnostics only — never PASS authority.
+
+### Adversarial coverage (new permanent tests — 18)
+
+- **R5-A1–A6:** missing sha256+byte_size → FAIL/0 rows; sha-only → FAIL; size-only → FAIL; short/uppercase/non-hex digest → FAIL; negative/fractional/string size → FAIL (NaN/Infinity cannot persist — `NON_FINITE_NUMBER_IN_CANONICAL_JSON` at write); valid declaration + matching bytes → PASS through ONE realization.
+- **R5-E1–E4:** each identity field absent → `FAIL_CLOSED_RESULT_IDENTITY_MISSING`; present-but-different → `IDENTITY_MISMATCH`; `RUNNING`/absent status → `FAIL_CLOSED_RESULT_ENVELOPE`; non-array artifacts → `ENVELOPE`.
+- **R5-B1–B8:** remote upload + COMPLETED + intact CAS → PASS exposes the id; blob deleted → FAIL + `artifact_ids:[]`; blob corrupted → FAIL; CAS path swapped to symlink with identical bytes → FAIL; `storage.ref` tampered → FAIL; `byte_size` tampered → FAIL; producer identity tampered → FAIL; store close + reopen with intact CAS → PASS.
+
+### Validation (final HEAD)
+
+- R2/R3/R4/R5 remediation file: **66/66** — clean-checkout proof ran under `rm -rf dist`
+- F1+R1 files: **45/45**
+- Delivery contract / incident / ops / p8–p13 / phase-b/d / runtime / route-capability / live-ops: all green
+- Full suite on final HEAD: **2922 pass / 2 fail / 15 skipped** — only the known P5 env-only `stockProbe.available` fails (reproduce on base `6ff9d35`)
+- `npx tsc --noEmit` 0 errors · `pnpm build` PASS · `pnpm audit --audit-level=high` → 0 high/critical (1 low, 8 moderate baseline)
+- Remote DAG-leaf restriction diff = 0; F2/F3/P15 untouched; no dependency_artifacts/downstream/cross-executor changes (§10 scope held)
+
+### Remaining limitations
+
+- `/proc/self/fd` containment is Linux-semantics; non-Linux fails closed by design.
+- Same-size mutations within one kernel timestamp tick are filesystem-unobservable; every observable mutation fails closed.
+- `dependency_artifacts` / downstream consumer materialization remain deferred to F2 (non-ACCEPTED rows stay non-authoritative).
+
+Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R5_PENDING_SOURCE_REVIEW`

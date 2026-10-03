@@ -94,7 +94,10 @@ class ScriptedAdapter implements ExecutorAdapter {
     return { status: "CANCELLED" };
   }
   collect_result(executionId: string) {
-    return this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
+    // Canonical WorkerResult carries the full PAIR identity — merge the
+    // execution id the same way production adapters bind it.
+    const r = this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
+    return { execution_id: executionId, ...r };
   }
   collect_artifacts() {
     return [];

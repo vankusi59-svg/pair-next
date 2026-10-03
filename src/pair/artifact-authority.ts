@@ -417,6 +417,81 @@ export class ArtifactAuthority {
       );
   }
 
+  /** R5.2 — terminal re-verification: every candidate ACCEPTED
+   *  pair-artifact.v1 row for this execution must prove the COMPLETE
+   *  canonical contract AND that its retained CAS bytes verify NOW.
+   *  A malformed row, a tampered storage ref, or a missing/corrupted/
+   *  symlinked retained object fails closed — it is never silently
+   *  dropped so the execution can pass around it.
+   *  Returns the verified artifact_ids (PASS authority). */
+  verifyForExecution(executionId: string): string[] {
+    const execution = this.store.tryGet("executor_execution", executionId) as
+      | Record<string, unknown>
+      | null;
+    if (!execution) {
+      throw new IntegrityError("FAIL_CLOSED_ARTIFACT_EXECUTION_UNKNOWN", executionId);
+    }
+    const governed = this.store.tryGet(
+      "governed_task",
+      String(execution.governed_task_id),
+    ) as Record<string, unknown> | null;
+    if (!governed) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+        `${executionId}:governed_task_missing`,
+      );
+    }
+    if (
+      String(execution.mission_id) !== String(governed.mission_id) ||
+      String(execution.task_id) !== String(governed.task_id) ||
+      String(governed.executor_id) !== String(execution.executor_id)
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+        `${executionId}:durable_linkage`,
+      );
+    }
+    const verified: string[] = [];
+    for (const row of this.forExecution(executionId)) {
+      const id = String(row.artifact_id);
+      const fail = (reason: string): never => {
+        throw new IntegrityError("FAIL_CLOSED_ARTIFACT_VERIFICATION", `${id}:${reason}`);
+      };
+      const sha = String(row.sha256 ?? "");
+      if (String(row.contract ?? "") !== ARTIFACT_CONTRACT) fail("contract");
+      if (id !== canonicalArtifactId(executionId, String(row.logical_name))) {
+        fail("artifact_id");
+      }
+      if (String(row.mission_id) !== String(execution.mission_id)) fail("mission_id");
+      if (String(row.task_id) !== String(execution.task_id)) fail("task_id");
+      if (String(row.governed_task_id) !== String(execution.governed_task_id)) {
+        fail("governed_task_id");
+      }
+      if (String(row.producer_executor_id) !== String(execution.executor_id)) {
+        fail("producer_executor_id");
+      }
+      if (
+        typeof row.byte_size !== "number" ||
+        !Number.isInteger(row.byte_size) ||
+        row.byte_size < 0
+      ) {
+        fail("byte_size");
+      }
+      const storage = row.storage as Record<string, unknown> | undefined;
+      if (String(storage?.kind ?? "") !== "PAIR_ARTIFACT_CAS") fail("storage.kind");
+      if (String(storage?.sha256 ?? "") !== sha) fail("storage.sha256");
+      if (String(storage?.ref ?? "") !== `blobs/${sha}`) fail("storage.ref");
+      // R4 open-object-bound retained proof: regular opened object,
+      // digest == row sha, materialized length == declared byte_size.
+      const blob = this.readCasBlob(path.join(this.opts.blobDir, sha));
+      if (blob === null || blob.sha256 !== sha || blob.bytes.length !== row.byte_size) {
+        fail("retained_bytes");
+      }
+      verified.push(id);
+    }
+    return verified;
+  }
+
   /** Read-model projection (F1 §10): canonical fields only — no host
    *  filesystem path is exposed as external authority. Pre-F1 rows
    *  (path-only provenance) remain inspectable as LEGACY_PATH_ONLY. */
