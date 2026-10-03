@@ -13,6 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError, PolicyError } from "./errors.js";
 import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
+import { ulid } from "ulid";
 import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
 import type { BusinessLayer } from "./business.js";
@@ -238,9 +239,61 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+/** R1.3 — wire-level body bounds. The request stream is bounded
+ *  BEFORE full materialization: Content-Length is rejected early when
+ *  it already exceeds the route bound, and cumulative streaming bytes
+ *  are counted as chunks arrive — the socket is aborted the moment the
+ *  bound is crossed; no `Buffer.concat` ever runs on an over-limit
+ *  body. `/api/outbox` gets the canonical artifact wire bound
+ *  (base64(64MiB) + bounded JSON overhead); every other route takes the
+ *  small default bound (no API posts near it). */
+const BODY_OVERHEAD_BYTES = 64 * 1024;
+export const ARTIFACT_WIRE_BODY_BYTES =
+  Math.ceil(MAX_ARTIFACT_BYTES * 4 / 3) + BODY_OVERHEAD_BYTES;
+const LEGACY_WIRE_BODY_BYTES =
+  Math.ceil(8 * 1024 * 1024 * 4 / 3) + BODY_OVERHEAD_BYTES;
+const DEFAULT_BODY_BOUND_BYTES = 8 * 1024 * 1024;
+
+class BodyTooLargeError extends Error {
+  constructor(public readonly limit: number) {
+    super(`REQUEST_BODY_TOO_LARGE:${limit}`);
+    this.name = "BodyTooLargeError";
+  }
+}
+
+function routeBodyBound(p: string, req: http.IncomingMessage): number {
+  if (p === "/api/outbox") {
+    // The artifact-capability lane owns the 64MiB wire bound; the legacy
+    // x-outbox-token lane keeps its 8MB artifact contract — its wire
+    // bound is correspondingly smaller so legacy junk never approaches
+    // the artifact bound.
+    return req.headers["x-artifact-capability"]
+      ? ARTIFACT_WIRE_BODY_BYTES
+      : LEGACY_WIRE_BODY_BYTES;
+  }
+  return DEFAULT_BODY_BOUND_BYTES;
+}
+
+async function readBody(
+  req: http.IncomingMessage,
+  maxBytes: number,
+): Promise<Record<string, unknown>> {
+  const cl = Number(req.headers["content-length"] ?? 0);
+  if (cl > maxBytes) {
+    throw new BodyTooLargeError(maxBytes);
+  }
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let total = 0;
+  for await (const c of req) {
+    total += (c as Buffer).length;
+    if (total > maxBytes) {
+      // Abort accumulation the moment the bound is crossed — the caller
+      // answers 413 on the still-open socket; Node tears the request
+      // stream down after res.end().
+      throw new BodyTooLargeError(maxBytes);
+    }
+    chunks.push(c as Buffer);
+  }
   if (!chunks.length) return {};
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
@@ -257,7 +310,18 @@ export function createMissionControlServer(
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
     const method = req.method ?? "GET";
-    const body = method === "POST" || method === "PUT" ? await readBody(req) : {};
+    const body =
+      method === "POST" || method === "PUT"
+        ? await readBody(req, routeBodyBound(p, req)).catch((e: unknown) => {
+            if (e instanceof BodyTooLargeError) {
+              json(res, 413, { error: "REQUEST_BODY_TOO_LARGE" });
+              return null;
+            }
+            json(res, 400, { error: "REQUEST_BODY_READ_FAILED" });
+            return null;
+          })
+        : {};
+    if (body === null) return;
     // POST /api/outbox and /api/broker/fetch carry their own narrow tokens —
     // exempt from the MC gate.
     const isOutboxUpload = method === "POST" && p === "/api/outbox";
@@ -364,15 +428,22 @@ export function createMissionControlServer(
           // legacy upload would. Outbox presence remains storage only —
           // send authority still comes from a canonical delivery request.
           const outboxDir = c.missionOutboxDir(String(art.mission_id));
-          let outboxPath: string | null = null;
+          let materialized = false;
           if (outboxDir) {
             const filename = path
               .basename(String(art.logical_name ?? "file"))
               .replace(/[^\w.\-]/g, "_");
             const taskPrefix = String(art.task_id).replace(/[^\w.\-]/g, "_").slice(-40);
+            // R1.7 — inject the canonical artifact identity between
+            // taskPrefix and basename: two distinct logical artifacts
+            // can never collide on one compat file, while the
+            // `-<basename>` suffix keeps the delivery resolver's
+            // endsWith() match working (ambiguous suffixes fail closed
+            // inside the resolver, never guess).
+            const frag = String(art.artifact_id).replace(/^ART_/, "").slice(0, 16);
             fs.mkdirSync(outboxDir, { recursive: true });
-            const dest = path.join(outboxDir, `${taskPrefix}-${filename}`);
-            const tmp = `${dest}.tmp-${process.pid}`;
+            const dest = path.join(outboxDir, `${taskPrefix}-${frag}-${filename}`);
+            const tmp = `${dest}.tmp-${process.pid}-${ulid()}`;
             const fh = fs.openSync(tmp, "w");
             try {
               fs.writeSync(fh, buf);
@@ -381,15 +452,18 @@ export function createMissionControlServer(
               fs.closeSync(fh);
             }
             fs.renameSync(tmp, dest);
-            outboxPath = dest;
+            materialized = true;
           }
+          // R1.8 — canonical response carries logical references only;
+          // no absolute host path is disclosed to the remote executor.
           return void json(res, 200, {
             ok: true,
             artifact_id: art.artifact_id,
             sha256: art.sha256,
             byte_size: art.byte_size,
             replayed: acceptance.replayed,
-            path: outboxPath,
+            storage_ref: `pair-artifact://sha256/${String(art.sha256)}`,
+            materialized,
           });
         }
         if (!deps.outboxToken || String(req.headers["x-outbox-token"] ?? "") !== deps.outboxToken) {

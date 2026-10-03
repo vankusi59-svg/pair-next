@@ -195,3 +195,63 @@ src/__tests__/pair-f1-artifact-authority.test.ts  NEW  20 tests
 - F2 (cross-executor consumption/materialization) and F3 (planner/recovery digest closure) intentionally untouched.
 
 **Explicit confirmations:** remote-task DAG-leaf restriction UNCHANGED; no self-merge; one branch; one PR.
+
+---
+
+# INDEPENDENT RE-AUDIT R1 REMEDIATION
+
+**Classification:** `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R1_PENDING_REAUDIT` — STOP. DO NOT MERGE.
+
+- **Previous audited HEAD:** `e0dae9f2df746c58be13bdf7939f9f0be0a79179`
+- **Audit verdict addressed:** `P31_F1_CLEAN_ROOM_AUDIT_BLOCKED_R1_REQUIRED`
+- All 9 findings closed on the same PR #31.
+
+## R1 — RCA + implementation per finding
+
+| # | Finding | Root cause | Closure |
+|---|---------|-----------|---------|
+| F1-1 | ARTIFACT-COUNT-RACE (HIGH) | count check ran BEFORE `store.immediate` — two distinct-name writers both saw 31 and committed 33 | `acceptBatch` mint path now re-reads priors + recounts + enforces cap INSIDE `store.immediate()` — writers serialize on the SQLite write lock; loser sees winner's commit → `FAIL_CLOSED_ARTIFACT_COUNT_EXCEEDED`. No process-local mutex. |
+| F1-2 | PARENT-SYMLINK-ESCAPE (HIGH) | `assertNotSymlink` lstat'd only the final component; validator's `pathWithin` was lexical | Seam now `realpathSync`s the source AND every allowed root; `pathWithin(real, realpath(root))` required — parent/nested symlink escapes → `FAIL_CLOSED_ARTIFACT_PATH_OUTSIDE`. Final-component symlink still rejected. |
+| F1-3 | UNBOUNDED-HTTP-BODY (HIGH) | `readBody` accumulated all chunks + `Buffer.concat` + `JSON.parse` before any bound | `readBody(req, bound)` counts cumulative stream bytes AND early-rejects oversized `Content-Length`; bound is per-route — `/api/outbox` capability lane = `ceil(64MiB*4/3)+64KB`, legacy outbox lane = `ceil(8MiB*4/3)+64KB`, all other routes = 8MB default → deterministic 413, no `Buffer.concat` on over-limit bodies. |
+| F1-4 | CLOSED-LIFECYCLE-IDEMPOTENCY (HIGH) | `verifyProducer` lifecycle gate ran BEFORE prior-row check → exact replay after close failed | New order: identity/linkage → name → bounded bytes → hash → deterministic ART id → exact prior ACCEPTED+sha match converges idempotently even post-close; sha mismatch → `REPLAY_CONFLICT`; only NEW mints hit the lifecycle gate. Forged execution_id still dies at identity proof first. |
+| F1-5 | capability claims unchecked (MEDIUM) | claims.mission_id/task_id/governed_task_id were never compared to durable rows | `acceptArtifactUpload` now verifies ALL FIVE claims vs `executor_execution`↔`governed_task` durable state before ingest → `FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH`. |
+| F1-6 | batch partial authority (MEDIUM) | per-artifact accept loop — failed validation left ACCEPTED prefix rows | `ArtifactAuthority.acceptBatch` — ONE canonical batch seam in the same authority: stage all blobs → single `immediate` txn mints all new rows or none. FAIL → zero new local ART rows + `execution_validation.artifact_ids: []` (prior remote refs moved to `referenced_artifact_ids` diagnostic field). |
+| F1-7 | outbox compat collision (MEDIUM) | sanitize mapped `a b.txt`/`a?b.txt` to the same `${taskPrefix}-${filename}` dest | dest = `${taskPrefix}-${ART_<id16>}-${basename}` — injective per canonical identity, still `endsWith('-'+basename)` so the delivery resolver matches unchanged (ambiguous suffixes fail closed in the resolver); tmp name = `${dest}.tmp-${pid}-${ulid}`. |
+| F1-8 | host path disclosure (LOW) | upload response returned absolute `path` | Response = `{ok, artifact_id, sha256, byte_size, replayed, storage_ref: pair-artifact://sha256/<sha>, materialized}` — no host path anywhere. |
+| F1-9 | CAS dir fsync missing (LOW) | file fsync only; rename entry could be lost on power failure | After `renameSync`: `openSync(dir, O_DIRECTORY)` + `fsyncSync` + close. Platforms without dir-fsync (EINVAL) degrade deliberately — post-rename bounded re-verify still applies. |
+
+## R1 adversarial proofs (permanent suite `pair-f1-r1-remediation.test.ts`, 25 tests)
+
+- **A1** 31+2 writers → 32 cap holds, loser `COUNT_EXCEEDED` · **A2** 30+3 → ≤32 · **A3** same id+bytes → one authority · **A4** conflicting bytes → original preserved.
+- **B1** `ws/linkdir→outside` → `PATH_OUTSIDE` + validator FAIL + 0 rows · **B2** nested escape rejected · **B3** genuine inside path passes.
+- **C1** oversized Content-Length → 413 pre-read (raw socket) · **C2** ~100MB chunked → bounded abort mid-stream · **C3** 13MB junk JSON → 413 legacy bound · **C4** in-bound still 200.
+- **D1** accept→lost response→close→identical retry → 200 `replayed:true` same ART id (endpoint-level) · **D2** closed+new → `EXECUTION_CLOSED` · **D3** closed+conflict → `REPLAY_CONFLICT`.
+- **E** all five claims mutated independently → `CAPABILITY_MISMATCH`; correct claims pass · **E2** acap/bcap domain separation holds.
+- **F1** 33-artifact batch → FAIL + zero rows + `artifact_ids:[]` · **F2** late conflict → FAIL + prefix not minted · **F2b** injected blob-write failure → FAIL + zero partial rows · **F3** valid batch atomic PASS · **F4** replay-only batch → PASS, no dup.
+- **G1** `a b.txt`+`a?b.txt` → two distinct compat files, bytes intact · **G2** concurrent same-artifact replay → one dest, zero tmp residue.
+- **H** response JSON contains no host path · **I** ≥2 fsyncSync calls per ingest (file + dir).
+
+## Validation counts
+
+- F1 original suite: 20/20 · R1 permanent suite: 25/25
+- Focused: output-delivery-contract 69/69 · planner-dataflow-incident 106/106 · ops-telegram 3/3 · live-ops-recovery 20/20 · route-capability 36/36 · runtime-hardening 11/11 · phase-d 37/37 · p9 79/79
+- **Full suite: 2856 pass / 2 fail / 15 skip** — the 2 are the same env-only P5 stockProbe failures, reproduced identically on base `6ff9d35` (VM has dsh/codex binaries installed).
+- `npx tsc --noEmit`: 0 errors · `pnpm build`: PASS · `pnpm audit --audit-level=high`: 0 high/critical (9 low/moderate baseline)
+
+## Files changed in R1
+
+```
+src/pair/artifact-authority.ts        rewritten — verifyIdentity/assertOpen split, realpath
+                                     containment, acceptBatch atomic mint, dir fsync
+src/pair/mission-control.ts          +claims↔durable cross-check (all 5 claims)
+src/pair/mission-control-server.ts   bounded readBody + route bounds + collision-safe
+                                     compat dest + tmp-unique + no-path response
+src/pair/artifact-validation.ts      batch ingest via acceptBatch; FAIL → artifact_ids:[],
+                                     referenced_artifact_ids diagnostics
+src/__tests__/pair-f1-artifact-authority.test.ts  B4/B6 expectations updated to R1 semantics
+src/__tests__/pair-f1-r1-remediation.test.ts      NEW — 25 permanent adversarial proofs
+PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_REPORT.md  this section
+CURRENT_STATE.md
+```
+
+**Preserved untouched:** PR #30 delivery-contract invariants; remote DAG-leaf; F2/F3/P15; single `artifact` entity/`pair-artifact.v1` contract/`ArtifactAuthority` implementation (batch seam lives inside it).

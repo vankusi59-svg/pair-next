@@ -229,7 +229,7 @@ describe("F1-B remote capability ingest", () => {
           ctx.control.acceptArtifactUpload(MASTER, badExec, { filename: "x", bytes: Buffer.from("x") });
         } catch (e) { return e; }
       })(),
-    )).toBe("FAIL_CLOSED_ARTIFACT_PRODUCER_MISMATCH");
+    )).toBe("NOT_INTEGRITY:PolicyError: FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH:durable_identity");
     // unknown execution
     const badEid = mintArtifactCapability(MASTER, {
       mission_id: ctx.missionId, task_id: prod.tid, governed_task_id: prod.gtId,
@@ -237,7 +237,7 @@ describe("F1-B remote capability ingest", () => {
     });
     expect(code(
       (() => { try { ctx.control.acceptArtifactUpload(MASTER, badEid, { filename: "x", bytes: Buffer.from("x") }); } catch (e) { return e; } })(),
-    )).toBe("FAIL_CLOSED_ARTIFACT_EXECUTION_UNKNOWN");
+    )).toBe("NOT_INTEGRITY:PolicyError: FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH:durable_identity");
     // terminal execution
     const dead = mkProducer(ctx, { state: "FAILED" });
     expect(code(
@@ -296,8 +296,19 @@ describe("F1-B remote capability ingest", () => {
         expect(res.status).toBe(200);
         expect(j.artifact_id).toBe(canonicalArtifactId(prod.eid, "chart.png"));
         expect(j.sha256).toBe(sha256Hex(Buffer.from("PNGDATA")));
-        expect(fs.existsSync(String(j.path))).toBe(true);
-        expect(fs.readFileSync(String(j.path)).equals(Buffer.from("PNGDATA"))).toBe(true);
+        // R1.8 — no host path in the response; logical refs only.
+        expect(j.path).toBeUndefined();
+        expect(String(j.storage_ref)).toBe(`pair-artifact://sha256/${String(j.sha256)}`);
+        expect(j.materialized).toBe(true);
+        // compat materialization: unique `<taskPrefix>-<frag>-<basename>`
+        const outboxFiles = fs.readdirSync(path.join(ctx.workspace, "outbox"));
+        expect(outboxFiles).toHaveLength(1);
+        expect(outboxFiles[0]!.endsWith("-chart.png")).toBe(true);
+        expect(
+          fs
+            .readFileSync(path.join(ctx.workspace, "outbox", outboxFiles[0]!))
+            .equals(Buffer.from("PNGDATA")),
+        ).toBe(true);
         // read model
         const list = await fetch(`http://127.0.0.1:${port}/api/artifacts?mission_id=${ctx.missionId}`);
         const jl = (await list.json()) as { artifacts: Array<Record<string, unknown>> };

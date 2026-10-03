@@ -156,6 +156,32 @@ export class MissionControl {
     if (!claims) {
       throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_INVALID", "signature");
     }
+    // R1.5 — every capability claim must agree with CURRENT durable
+    // producer state; a stale/inconsistent claim fails closed rather
+    // than being silently absorbed by derived identity.
+    const execution = this.deps.service.store.tryGet(
+      "executor_execution",
+      claims.execution_id,
+    ) as Record<string, unknown> | null;
+    const governed = execution
+      ? (this.deps.service.store.tryGet(
+          "governed_task",
+          String(execution.governed_task_id),
+        ) as Record<string, unknown> | null)
+      : null;
+    if (
+      !execution ||
+      !governed ||
+      String(execution.mission_id) !== claims.mission_id ||
+      String(execution.task_id) !== claims.task_id ||
+      String(execution.governed_task_id) !== claims.governed_task_id ||
+      String(execution.executor_id) !== claims.executor_id ||
+      String(execution.execution_id) !== claims.execution_id ||
+      String(governed.mission_id) !== claims.mission_id ||
+      String(governed.task_id) !== claims.task_id
+    ) {
+      throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH", "durable_identity");
+    }
     // Cross-check: supplied identity fields must equal the capability's
     // — the capability (not the caller body) is the authority.
     for (const k of ["mission_id", "task_id"] as const) {

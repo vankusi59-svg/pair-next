@@ -85,44 +85,54 @@ export class ArtifactProvenanceValidator {
       pass = false;
     }
 
-    // F1 §5 — local artifacts converge through the ONE canonical ingest
-    // seam: validated workspace bytes are ingested into the content-
-    // addressed store, so an `artifact` row now means "PAIR accepted and
-    // retained these exact bytes with this provenance" — not merely
-    // "this path existed at validation time."
-    const acceptedIds: string[] = [];
-    if (pass) {
-      for (const art of checkedArtifacts) {
-        const abs = path.resolve(workspace, String(art.path));
-        try {
-          const acceptance = service.artifacts.accept({
-            execution_id: executionId,
-            producer_executor_id: String(execution.executor_id),
+    // F1 §5 + R1.6 — local artifacts converge through the ONE canonical
+    // ingest seam as a SINGLE atomic batch: PASS means every required
+    // canonical authority committed; FAIL mints ZERO new ART rows (a
+    // prefix of accepted artifacts can never survive a failed
+    // validation). Previously accepted remote-upload artifacts persist
+    // (they are already canonical) but are not re-minted here.
+    let acceptedIds: string[] = [];
+    if (pass && checkedArtifacts.length) {
+      try {
+        const batch = service.artifacts.acceptBatch({
+          execution_id: executionId,
+          producer_executor_id: String(execution.executor_id),
+          items: checkedArtifacts.map((art) => ({
             logical_name: String(art.path),
-            source: { kind: "path", path: abs },
-            channel: "LOCAL_EXECUTION",
-            actor: "PAIR_ARTIFACT_VALIDATOR",
-            correlation_id: String(execution.correlation_id),
-            allow_post_result: true,
-          });
-          acceptedIds.push(String(acceptance.artifact.artifact_id));
-        } catch (e) {
-          failures.push(
-            `artifact ingest rejected: ${e instanceof IntegrityError ? e.code : String(e)}`,
-          );
-        }
+            source: {
+              kind: "path" as const,
+              path: path.resolve(workspace, String(art.path)),
+            },
+          })),
+          channel: "LOCAL_EXECUTION",
+          actor: "PAIR_ARTIFACT_VALIDATOR",
+          correlation_id: String(execution.correlation_id),
+          allow_post_result: true,
+        });
+        acceptedIds = batch.artifacts.map((a) => String(a.artifact_id));
+      } catch (e) {
+        failures.push(
+          `artifact ingest rejected: ${e instanceof IntegrityError ? e.code : String(e)}`,
+        );
+        pass = false;
       }
-      pass = failures.length === 0;
     }
     // F1 §7 — remote executions return artifacts:[] adapter-side, but
     // capability-bound uploads already minted canonical ART_* rows.
     // Restart/re-observation reconstructs the same references from
     // durable state — no re-upload, no re-baselining.
-    const remoteIds = service.artifacts
-      .forExecution(executionId)
-      .map((a) => String(a.artifact_id))
-      .filter((id) => !acceptedIds.includes(id));
-    acceptedIds.push(...remoteIds);
+    if (pass) {
+      const remoteIds = service.artifacts
+        .forExecution(executionId)
+        .map((a) => String(a.artifact_id))
+        .filter((id) => !acceptedIds.includes(id));
+      acceptedIds.push(...remoteIds);
+    } else {
+      // R1.6 — a FAIL exposes zero new local authority; prior remote
+      // references are diagnostics, not PASS authority, so they move to
+      // a separate non-authoritative field.
+      acceptedIds = [];
+    }
 
     const validation = store.put(
       "execution_validation",
@@ -136,6 +146,9 @@ export class ArtifactProvenanceValidator {
         failures,
         artifact_count: checkedArtifacts.length,
         artifact_ids: acceptedIds,
+        referenced_artifact_ids: service.artifacts
+          .forExecution(executionId)
+          .map((a) => String(a.artifact_id)),
         created_at: utcnow(),
         version: 0,
       },
