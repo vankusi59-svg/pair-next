@@ -94,14 +94,32 @@ export interface DependencyArtifactEntry {
   contract: typeof DEPENDENCY_ARTIFACT_CONTRACT;
 }
 
+/** R3.1 — the consumer-isolation scope: a deterministic, bounded,
+ *  filesystem-safe digest segment derived ONLY from the canonical
+ *  consumer task identity. Distinct consumer tasks of the same ART in
+ *  the same workspace get distinct materialization roots; the scope is
+ *  stable across restart and re-governance of the same task, never
+ *  contains producer/host paths, and is never planner prose. */
+export function artifactConsumerScope(consumerTaskId: string): string {
+  return `CT_${digest(
+    `pair-artifact-consumer-scope.v1|${consumerTaskId}`,
+  ).slice(0, 24)}`;
+}
+
 /** The only destination shape a dependency artifact may be given —
- *  deterministic and derived from the pinned artifact identity, never
- *  from producer or planner text. */
+ *  deterministic and derived from the pinned artifact identity + the
+ *  canonical consumer task identity, never from producer or planner
+ *  text. Authority: this field is RECOMPUTED at every authority
+ *  boundary (gate, pin, materialize, fetch) — a caller-supplied path
+ *  merely living under the handoff root is never accepted. */
 export function dependencyConsumerPath(
+  consumerTaskId: string,
   artifactId: string,
   logicalName: string,
 ): string {
-  return `${DEPENDENCY_ARTIFACT_ROOT}/${artifactId}/${logicalName}`;
+  return `${DEPENDENCY_ARTIFACT_ROOT}/${artifactConsumerScope(
+    consumerTaskId,
+  )}/${artifactId}/${logicalName}`;
 }
 
 /**
@@ -164,9 +182,15 @@ export function canonicalHandoffId(
 }
 
 /** Shape validation for a dependency-artifact entry — used at the gate
- *  so a malformed pin can never reach the governed contract. */
+ *  so a malformed pin can never reach the governed contract. When the
+ *  canonical consumer task id is supplied (EVERY authority boundary:
+ *  gate, handoff pin, materialization, remote fetch), the entry's
+ *  consumer_relative_path must equal the recomputed canonical
+ *  destination EXACTLY — a forged path that merely stays under the
+ *  handoff root is rejected (R3.1 §3). */
 export function validateDependencyArtifactEntry(
   raw: unknown,
+  consumerTaskId?: string,
 ): DependencyArtifactEntry {
   const fail = (field: string): never => {
     throw new IntegrityError(
@@ -211,6 +235,19 @@ export function validateDependencyArtifactEntry(
     normalizeArtifactName(e.logical_name);
   } catch {
     fail("logical_name");
+  }
+  // R3.1 — the destination is authority, not caller input: recompute
+  // the canonical consumer-scoped path and require exact equality.
+  if (
+    consumerTaskId !== undefined &&
+    rel! !==
+      dependencyConsumerPath(
+        consumerTaskId,
+        String(e.artifact_id),
+        String(e.logical_name),
+      )
+  ) {
+    fail("consumer_relative_path");
   }
   return {
     artifact_id: String(e.artifact_id),
@@ -391,6 +428,7 @@ export class ArtifactDependencyResolver {
         sha256: String(artifact.sha256),
         byte_size: Number(artifact.byte_size),
         consumer_relative_path: dependencyConsumerPath(
+          String(task.task_id),
           artifactId,
           String(artifact.logical_name),
         ),
@@ -584,7 +622,14 @@ export class ArtifactHandoffService {
     mode: HandoffMode,
   ): Array<Record<string, unknown>> {
     const pinned: Array<Record<string, unknown>> = [];
-    for (const e of entries) {
+    for (const raw of entries) {
+      // R3.1 — the pinned destination is RECOMPUTED from this governed
+      // consumer task's canonical identity at the pin boundary, never
+      // trusted as under-root caller input.
+      const e = validateDependencyArtifactEntry(
+        raw,
+        String(governed.task_id),
+      );
       const handoffId = canonicalHandoffId(
         String(governed.governed_task_id),
         e.artifact_id,
@@ -671,7 +716,10 @@ export class ArtifactHandoffService {
   materializeForConsumer(governed: Record<string, unknown>): string[] {
     const entries = (
       (governed.dependency_artifacts as unknown[] | undefined) ?? []
-    ).map((e) => validateDependencyArtifactEntry(e));
+    ).map((e) =>
+      // R3.1 — recomputed canonical consumer destination, exact match.
+      validateDependencyArtifactEntry(e, String(governed.task_id)),
+    );
     // R1.4 — re-bind the dep-set against the persisted digest + the
     // immutable VALIDATED event before ANY materialization write.
     this.assertDepSetBound(governed, entries);
@@ -781,8 +829,43 @@ export class ArtifactHandoffService {
         } finally {
           fs.closeSync(fh);
         }
-        // Rename WITHIN the same pinned directory object.
-        fs.renameSync(tmpBound, destBound);
+        // R3.2 — atomic NO-REPLACE publication: hard-link the verified
+        // temp object inside the SAME pinned directory object. link()
+        // is atomic create-if-absent — a destination that raced into
+        // existence after the lstat can never be silently overwritten
+        // (rename() would replace it). On EEXIST the destination is
+        // validated through the pinned dir: exact canonical bytes →
+        // idempotent converge; anything else → FAIL, untouched.
+        try {
+          fs.linkSync(tmpBound, destBound);
+          fs.unlinkSync(tmpBound);
+        } catch (pubErr) {
+          const pubCode = String(
+            (pubErr as NodeJS.ErrnoException).code ?? "",
+          );
+          try {
+            fs.unlinkSync(tmpBound);
+          } catch {
+            /* temp may already be gone — best-effort cleanup */
+          }
+          if (pubCode !== "EEXIST") throw pubErr;
+          const raced = secureReadContained(destBound, MAX_ARTIFACT_BYTES, [
+            dirPath,
+          ]);
+          if (
+            raced.kind === "ok" &&
+            sha256Hex(raced.bytes) === e.sha256 &&
+            raced.bytes.length === e.byte_size
+          ) {
+            this.markState(handoff, "MATERIALIZED", governed);
+            materialized.push(e.consumer_relative_path);
+            continue;
+          }
+          throw new DependencyResolutionError(
+            "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+            `${e.consumer_relative_path}:existing_bytes_differ`,
+          );
+        }
         // fsync the SAME directory object — never a reopened pathname.
         try {
           fs.fsyncSync(dirFd);
@@ -869,7 +952,11 @@ export class ArtifactHandoffService {
     }
     const entries = (
       (governed!.dependency_artifacts as unknown[] | undefined) ?? []
-    ).map((e) => validateDependencyArtifactEntry(e));
+    ).map((e) =>
+      // R3.1 — recomputed canonical consumer destination, exact match
+      // at the fetch boundary too.
+      validateDependencyArtifactEntry(e, String(governed!.task_id)),
+    );
     // R1.4 — the row's dep-set digest + immutable VALIDATED anchor must
     // still bind the current set before ANY fetch is served.
     try {
@@ -951,7 +1038,10 @@ export class ArtifactHandoffService {
     }
     const entries = (
       (governed.dependency_artifacts as unknown[] | undefined) ?? []
-    ).map((e) => validateDependencyArtifactEntry(e));
+    ).map((e) =>
+      // R3.1 — recomputed canonical consumer destination, exact match.
+      validateDependencyArtifactEntry(e, String(governed.task_id)),
+    );
     this.assertDepSetBound(governed, entries);
     if (entries.length !== handoffs.length) {
       throw new DependencyResolutionError(

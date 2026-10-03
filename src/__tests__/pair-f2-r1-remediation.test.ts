@@ -778,10 +778,10 @@ describe("R1.3 C — materialization containment", () => {
     const { gc, entries } = setupC(ctx);
     const outside = path.join(ctx.d, "escape");
     fs.mkdirSync(outside);
-    const artDir = path.join(
-      ctx.workspace,
-      DEPENDENCY_ARTIFACT_ROOT,
-      entries[0]!.artifact_id,
+    // R3.1 — the per-artifact parent dir lives UNDER the consumer scope:
+    // derive it from the pinned canonical destination.
+    const artDir = path.dirname(
+      path.join(ctx.workspace, entries[0]!.consumer_relative_path),
     );
     fs.mkdirSync(path.dirname(artDir), { recursive: true });
     fs.symlinkSync(outside, artDir);
@@ -1007,6 +1007,8 @@ describe("R1.4 D — immutable binding authority", () => {
   it("D7. approval for dep-set A must NOT authorize dep-set B", () => {
     const ctx = mkCtx("d7");
     const gate = new GovernedTaskGate(ctx.service);
+    const active = ctx.service.activeRevision(ctx.missionId);
+    const taskId = `ATSK_APR_${seq++}`;
     const entriesA: DependencyArtifactEntry[] = [
       {
         artifact_id: "ART_A",
@@ -1017,13 +1019,13 @@ describe("R1.4 D — immutable binding authority", () => {
         logical_name: "a.txt",
         sha256: sha256Hex(Buffer.from("a")),
         byte_size: 1,
-        consumer_relative_path: dependencyConsumerPath("ART_A", "a.txt"),
+        consumer_relative_path: dependencyConsumerPath(taskId, "ART_A", "a.txt"),
         contract: DEPENDENCY_ARTIFACT_CONTRACT,
       },
     ];
     const entriesB = [
       { ...entriesA[0]!, artifact_id: "ART_B", logical_name: "b.txt",
-        consumer_relative_path: dependencyConsumerPath("ART_B", "b.txt") },
+        consumer_relative_path: dependencyConsumerPath(taskId, "ART_B", "b.txt") },
     ];
     const adapter = {
       executor_id: EX,
@@ -1031,8 +1033,6 @@ describe("R1.4 D — immutable binding authority", () => {
       qualify: () => ({ qualified: true, dispatch_enabled: true }),
       capabilities: () => ({ capability_ids: ["FILE_OPERATIONS"] }),
     } as never;
-    const active = ctx.service.activeRevision(ctx.missionId);
-    const taskId = `ATSK_APR_${seq++}`;
     ctx.store.put(
       "task",
       taskId,

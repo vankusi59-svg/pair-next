@@ -431,3 +431,83 @@ stubbed `curl` on PATH.
 Classification:
 
 `PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_R2_PENDING_SOURCE_REVIEW`
+
+# R3 remediation round (source-review)
+
+## R3.1 — consumer-isolated dependency destinations
+
+`consumer_relative_path` is now `.pair/dependency-artifacts/<CONSUMER_SCOPE>/<ARTIFACT_ID>/<logical_name>`
+where `CONSUMER_SCOPE = CT_<sha256("pair-artifact-consumer-scope.v1"|<consumer_task_id>)[0:24]>` —
+deterministic, filesystem-safe, bounded, stable across restart AND retry/re-governance
+of the same task, derived ONLY from canonical consumer task identity (never producer
+paths, never planner prose).
+
+Before R3.1 the path was `.pair/dependency-artifacts/<ARTIFACT_ID>/<logical_name>`:
+two consumers of the same ART in one workspace shared one destination, so T3's
+materialization could overwrite T2's live (mutated/deleted) input.
+
+`consumer_relative_path` is the AUTHORITY: the resolver generates it from consumer
+task identity + artifact_id + logical_name, and EVERY boundary recomputes the
+expected destination and requires exact equality — `validateDependencyArtifactEntry(raw,
+consumerTaskId)` is wired into the Gate's governed-task creation, the approval dep-set
+digest, handoff pin, materialization, remote consume-fetch authorization and
+`assertContractUnmutated`. A forged `.pair/dependency-artifacts/some-other-location/file`
+under the root is rejected — `startsWith` alone never sufficed. The path stays bound
+into `dependency_artifacts_digest` / handoff `binding_digest` / approval scope; the
+remote recipe consumes `entry.consumer_relative_path` so the same scope flows to the
+remote lane.
+
+## R3.2 — atomic no-replace publication
+
+The final write used `lstat(destBound)` absent → write tmp → `renameSync`, which
+silently REPLACES a racing object created in between. Publication is now
+`fs.linkSync(tmpBound, destBound)` — atomic create-if-absent inside the SAME pinned
+parent-dir object (rename() would replace; link() loses with EEXIST). On EEXIST the
+destination is validated through the pinned dir via `secureReadContained`:
+
+- exact sha256 + byte_size on a regular opened object → idempotent CONVERGE
+  (`markState` repairs the row without a rewrite)
+- different bytes → `FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE`
+  (`:existing_bytes_differ`) — the existing object is left untouched
+- symlink/non-regular → FAIL CLOSED untouched (`secureReadContained` opens
+  `O_NOFOLLOW` and rejects non-regular objects)
+- any non-EEXIST publish error → temp cleaned up and the error propagates
+
+The temp object is cleaned up on every handled failure/convergence path.
+
+The remote lane (R3 §9-10) now publishes with the same no-clobber semantics:
+`buildDependencyFetchRecipe` emits `dep_ok` (regular non-symlink + exact sha +
+size), early-converges on an exact existing target, refuses to overwrite any other
+existing object, and publishes with `ln "$tmp" "$target"` — EEXIST → re-validate
+the raced destination (exact → converge; anything else → FAIL `exit 3`). `mv -f`
+is gone from the publication path; `rm -f "$target"` is removed entirely — the
+remote recipe can never delete a consumer's existing file.
+
+## R3 mandatory tests
+
+`src/__tests__/pair-f2-r3-remediation.test.ts` — 18 tests:
+
+| Describe | Coverage |
+|---|---|
+| A (R3.1) | A1: two consumers T2/T3 of same ART → distinct CT-scope paths; A2: T3 materialization leaves T2's mutated copy untouched; A3: T2 delete → T3 independent; A4: restart re-derives same T3 dest; A5: forged under-root path + another consumer's legitimate path → contract reject at pin AND materialize; A6: same-task retry converges deterministically, scope `CT_[0-9a-f]{24}` |
+| B (R3.2) | B1: different bytes injected inside the linkSync seam → FAIL + injected bytes unchanged; B2: exact bytes injected → converge, existing inode preserved, state MATERIALIZED; B3: symlink injected → FAIL + symlink + outside target untouched; B4: racing materializer publishes first → second converges (peer inode survives); B5: two consumers same ART → distinct destinations both publish; B6: crash post-publish pre-MATERIALIZED → restart converges + repairs state, no rewrite |
+| C (R3 §9-10) | C1–C6 real-shell: isolated path created + exact bytes; existing exact → converge no-rewrite (inode stable); existing different → `exit 3` + untouched; symlink → `exit 3` + untouched; bad download → quarantine + `exit 3`; two consumers same remote workspace → isolated targets |
+
+## R3 gates
+
+| Gate | Result |
+|---|---|
+| R3 suite | 18/18 |
+| R2 suite | 35/35 |
+| R1 suite | 43/43 |
+| F2 contract suite | 53/53 |
+| F1 authority + R1 + R2–R7 remediation files | 20 + 25 + 95 |
+| `rm -rf dist` → READY+GO true multi-process races | PASS on current source |
+| Full suite on FINAL R3 HEAD | 3100 pass / 2 fail — only the known env-only P5 `stockProbe.available` failures (reproduce on base `b903cb4`) |
+| `npx tsc --noEmit` | PASS |
+| `pnpm build` | PASS |
+| `pnpm audit --audit-level=high` | PASS — 0 high (1 low + 8 moderate pre-existing) |
+
+Classification:
+
+`PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_R3_PENDING_SOURCE_REVIEW`

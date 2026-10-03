@@ -186,9 +186,10 @@ export function shellLiteral(value: string): string {
  *   - every interpolated value goes through shellLiteral (the canonical
  *     logical-name charset is broader than a safe single-quoted literal)
  *   - the target is EXACTLY entry.consumer_relative_path
- *   - download lands in a tmp sibling; the verified artifact reaches the
- *     target only via atomic rename — a partial/invalid response never
- *     masquerades as prepared input
+ *   - download lands in a tmp sibling; the verified artifact reaches
+ *     the target only via atomic no-replace publication (hard-link
+ *     create-if-absent) — a raced/existing destination is never
+ *     overwritten: exact canonical bytes converge, anything else fails
  *   - real `sha256sum` + `wc -c` verification inside a bounded 5-attempt
  *     loop; a quarantined copy of the last bad download is kept
  *   - on exhaustion the recipe removes any unverified file, prints
@@ -216,23 +217,45 @@ export function buildDependencyFetchRecipe(
   const failEcho = shellLiteral(`DEPENDENCY_FETCH_FAILED ${art}`);
   return [
     `target=${target}`,
+    // dep_ok <file>: an EXISTING object is consumable only when it is a
+    // regular non-symlink file with EXACTLY the pinned sha + size.
+    `dep_ok() {`,
+    `  [ -f "$1" ] && [ ! -L "$1" ] &&`,
+    `  [ "$(sha256sum -- "$1" | cut -d' ' -f1)" = ${sha} ] &&`,
+    `  [ "$(wc -c < "$1" | tr -d ' ')" = ${size} ]`,
+    `}`,
+    // R3.2 — no-clobber: an existing exact target converges without a
+    // download; any other existing object fails (never overwritten).
+    `if dep_ok "$target"; then exit 0; fi`,
+    `if [ -e "$target" ] || [ -L "$target" ]; then`,
+    `  echo ${failEcho}`,
+    `  exit 3`,
+    `fi`,
     `mkdir -p -- "$(dirname -- "$target")" || { echo ${failEcho}; exit 3; }`,
     `tmp="$target.tmp.$$"`,
     `ok=0`,
     `for i in 1 2 3 4 5; do`,
     `  if curl -sf -X POST ${url} -H "x-artifact-consume-capability: "${cap} -H "content-type: application/json" -d ${body} -o "$tmp"; then`,
-    `    if [ "$(sha256sum -- "$tmp" | cut -d' ' -f1)" = ${sha} ] && [ "$(wc -c < "$tmp" | tr -d ' ')" = ${size} ]; then ok=1; break; fi`,
+    `    if dep_ok "$tmp"; then ok=1; break; fi`,
     `  fi`,
     `  sleep "$((i * \${PAIR_FETCH_BACKOFF:-2}))"`,
     `done`,
-    `if [ "$ok" = 1 ]; then`,
-    `  mv -f -- "$tmp" "$target" || { echo ${failEcho}; exit 3; }`,
-    `else`,
+    `if [ "$ok" != 1 ]; then`,
     `  if [ -f "$tmp" ]; then mv -f -- "$tmp" "$target.quarantine" 2>/dev/null || rm -f -- "$tmp"; fi`,
-    `  rm -f -- "$target"`,
+    `  rm -f -- "$tmp"`,
     `  echo ${failEcho}`,
     `  exit 3`,
     `fi`,
+    // Atomic create-if-absent publication — ln loses with EEXIST rather
+    // than replacing; the raced destination is then re-validated.
+    `if ln -- "$tmp" "$target" 2>/dev/null; then exit 0; fi`,
+    `if dep_ok "$target"; then`,
+    `  rm -f -- "$tmp"`,
+    `  exit 0`,
+    `fi`,
+    `rm -f -- "$tmp"`,
+    `echo ${failEcho}`,
+    `exit 3`,
   ].join("\n");
 }
 

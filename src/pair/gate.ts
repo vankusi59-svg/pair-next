@@ -355,7 +355,12 @@ export class GovernedTaskGate {
     }
     const dependencyArtifacts: DependencyArtifactEntry[] = (
       (rawDeps as unknown[] | undefined) ?? []
-    ).map((e) => validateDependencyArtifactEntry(e));
+    ).map((e) =>
+      // R3.1 — the consumer destination is recomputed from THIS task's
+      // canonical identity; a forged under-root path can never become
+      // governed contract.
+      validateDependencyArtifactEntry(e, String(task.task_id)),
+    );
     if (dependencyArtifacts.length > MAX_DEPENDENCY_ARTIFACTS_PER_TASK) {
       throw new IntegrityError(
         "FAIL_CLOSED_DEPENDENCY_ARTIFACT_CONTRACT",
@@ -516,7 +521,7 @@ export class GovernedTaskGate {
     }
     const depDigest = artifactDependencySetDigest(
       ((requestDeps as unknown[] | undefined) ?? []).map((e) =>
-        validateDependencyArtifactEntry(e),
+        validateDependencyArtifactEntry(e, params.task_id),
       ),
     );
     const scope = {

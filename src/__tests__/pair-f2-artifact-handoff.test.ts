@@ -372,7 +372,7 @@ const depSetup = (ctx: ReturnType<typeof mkCtx>, opts: { remote?: boolean; produ
 describe("A — dependency resolution", () => {
   it("A1. declared consume → unique producer predecessor → canonical pinned entry", () => {
     const ctx = mkCtx("a1");
-    const { prod, entries } = depSetup(ctx);
+    const { prod, cons, entries } = depSetup(ctx);
     expect(entries).toHaveLength(1);
     const e = entries[0]!;
     expect(e.contract).toBe(DEPENDENCY_ARTIFACT_CONTRACT);
@@ -384,7 +384,7 @@ describe("A — dependency resolution", () => {
     expect(e.logical_name).toBe("report.txt");
     expect(e.sha256).toBe(sha256Hex(prod.bytes));
     expect(e.byte_size).toBe(prod.bytes.length);
-    expect(e.consumer_relative_path).toBe(dependencyConsumerPath(e.artifact_id, "report.txt"));
+    expect(e.consumer_relative_path).toBe(dependencyConsumerPath(cons.tid, e.artifact_id, "report.txt"));
   });
 
   it("A2. consume name with no producing predecessor → fail closed", () => {
@@ -624,8 +624,12 @@ describe("E — destination containment", () => {
   });
 
   it("E3. same logical name across artifacts → distinct destinations (artifact_id keyed, no collision)", () => {
-    expect(dependencyConsumerPath("ART_A", "x.txt"))
-      .not.toBe(dependencyConsumerPath("ART_B", "x.txt"));
+    expect(dependencyConsumerPath("TASK_C", "ART_A", "x.txt"))
+      .not.toBe(dependencyConsumerPath("TASK_C", "ART_B", "x.txt"));
+    // R3.1 — distinct consumers of the SAME artifact also get distinct
+    // isolated destinations.
+    expect(dependencyConsumerPath("TASK_C", "ART_A", "x.txt"))
+      .not.toBe(dependencyConsumerPath("TASK_D", "ART_A", "x.txt"));
   });
 
   it("E4. destination outside allowed_paths → materialization rejects", () => {
