@@ -1140,6 +1140,11 @@ describe("R1.5 E — canonical consume-master resolution over HTTP", () => {
     const server: Server = createMissionControlServer({
       control: ctx.control,
       artifactUploadToken: env.PAIR_ARTIFACT_UPLOAD_TOKEN,
+      // R2.4 — the bootstrap resolves the consume-master chain once:
+      // artifact token preferred, broker fallback. Ambient env is never
+      // consulted inside request handling.
+      artifactConsumeToken:
+        env.PAIR_ARTIFACT_UPLOAD_TOKEN || env.PAIR_BROKER_TOKEN,
     } as never);
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     try {
@@ -1452,6 +1457,9 @@ describe("R1.6 F — remote fetch protocol", () => {
     process.env.PAIR_ARTIFACT_UPLOAD_TOKEN = "ART_MASTER_A";
     const server = createMissionControlServer({
       control: ctx.control,
+      // R2.4 — injected consume master (bootstrap resolution), never
+      // ambient env.
+      artifactConsumeToken: "ART_MASTER_A",
     } as never);
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     try {

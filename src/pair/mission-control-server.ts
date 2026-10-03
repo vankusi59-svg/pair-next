@@ -14,7 +14,6 @@ import path from "node:path";
 import { IntegrityError, PairError, PolicyError } from "./errors.js";
 import { compatOutboxBasename } from "./canonical.js";
 import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
-import { artifactConsumeCapabilityMasterFromEnv } from "./artifact-consume-capability.js";
 import { ulid } from "ulid";
 import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
@@ -68,6 +67,14 @@ export interface MissionControlServerDeps {
    *  never mint canonical artifact authority. Unset → capability ingest
    *  disabled. */
   artifactUploadToken?: string;
+  /** F2 R2.4 — master secret that verifies `x-artifact-consume-capability`
+   *  on /api/artifacts/fetch. Resolved ONCE at bootstrap
+   *  (PAIR_ARTIFACT_UPLOAD_TOKEN || PAIR_BROKER_TOKEN, mirroring the
+   *  executor's mint side); request handling never inspects ambient env.
+   *  Falls back to artifactUploadToken — serve-mission-control already
+   *  resolves the same chain there. PAIR_OUTBOX_TOKEN is never consume
+   *  authority. Neither set → the consume lane is disabled. */
+  artifactConsumeToken?: string;
   /** Optional business layer: companies → org agents → work items →
    *  routines → budgets, all dispatching through startMission. */
   business?: BusinessLayer;
@@ -614,12 +621,13 @@ export function createMissionControlServer(
         const capability = String(
           req.headers["x-artifact-consume-capability"] ?? "",
         );
-        // R1.5 — ONE canonical consume-master resolution seam:
-        // PAIR_ARTIFACT_UPLOAD_TOKEN, falling back to PAIR_BROKER_TOKEN.
-        // It is identical to the executor's mint-side resolution, so a
-        // distinct artifact token never fails on the broker master.
-        // PAIR_OUTBOX_TOKEN is NEVER consume authority.
-        const master = artifactConsumeCapabilityMasterFromEnv();
+        // R1.5/R2.4 — ONE canonical consume master, resolved ONCE at
+        // bootstrap and injected: artifactConsumeToken, falling back to
+        // the artifact upload master (serve-mission-control resolves
+        // PAIR_ARTIFACT_UPLOAD_TOKEN || PAIR_BROKER_TOKEN into either).
+        // PAIR_OUTBOX_TOKEN is NEVER consume authority, and request
+        // handling never inspects ambient env.
+        const master = deps.artifactConsumeToken ?? deps.artifactUploadToken;
         if (!master || !capability) {
           return void json(res, 403, { error: "UNAUTHORIZED_ARTIFACT_CONSUME" });
         }

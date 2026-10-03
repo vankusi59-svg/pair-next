@@ -170,6 +170,72 @@ const curlFetch: DevinFetch = (method, url, body, authHeader) => {
   }
 };
 
+/**
+ * F2 R2.5 — ONE canonical POSIX shell-literal encoder. Any string —
+ * spaces, unicode, apostrophes, `$`, backticks, `;`, quotes — becomes a
+ * single-quoted literal that can never inject shell. The only escape
+ * needed inside single quotes is for `'` itself (`'"'"'`).
+ */
+export function shellLiteral(value: string): string {
+  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+}
+
+/**
+ * F2 R1.6 + R2.5 — the ONE production builder for the remote dependency
+ * fetch recipe. Properties:
+ *   - every interpolated value goes through shellLiteral (the canonical
+ *     logical-name charset is broader than a safe single-quoted literal)
+ *   - the target is EXACTLY entry.consumer_relative_path
+ *   - download lands in a tmp sibling; the verified artifact reaches the
+ *     target only via atomic rename — a partial/invalid response never
+ *     masquerades as prepared input
+ *   - real `sha256sum` + `wc -c` verification inside a bounded 5-attempt
+ *     loop; a quarantined copy of the last bad download is kept
+ *   - on exhaustion the recipe removes any unverified file, prints
+ *     DEPENDENCY_FETCH_FAILED <artifact_id> and EXITS NON-ZERO — the
+ *     preparation command actually fails, so task work never continues
+ */
+export function buildDependencyFetchRecipe(
+  entry: {
+    artifact_id: string;
+    sha256: string;
+    byte_size: number;
+    consumer_relative_path: string;
+  },
+  args: { fetchBase: string; consumeCapability: string },
+): string {
+  const art = String(entry.artifact_id);
+  const url = shellLiteral(
+    `${String(args.fetchBase).replace(/\/+$/, "")}/api/artifacts/fetch`,
+  );
+  const body = shellLiteral(JSON.stringify({ artifact_id: art }));
+  const target = shellLiteral(entry.consumer_relative_path);
+  const cap = shellLiteral(args.consumeCapability);
+  const sha = shellLiteral(entry.sha256);
+  const size = shellLiteral(String(entry.byte_size));
+  const failEcho = shellLiteral(`DEPENDENCY_FETCH_FAILED ${art}`);
+  return [
+    `target=${target}`,
+    `mkdir -p -- "$(dirname -- "$target")" || { echo ${failEcho}; exit 3; }`,
+    `tmp="$target.tmp.$$"`,
+    `ok=0`,
+    `for i in 1 2 3 4 5; do`,
+    `  if curl -sf -X POST ${url} -H "x-artifact-consume-capability: "${cap} -H "content-type: application/json" -d ${body} -o "$tmp"; then`,
+    `    if [ "$(sha256sum -- "$tmp" | cut -d' ' -f1)" = ${sha} ] && [ "$(wc -c < "$tmp" | tr -d ' ')" = ${size} ]; then ok=1; break; fi`,
+    `  fi`,
+    `  sleep "$((i * \${PAIR_FETCH_BACKOFF:-2}))"`,
+    `done`,
+    `if [ "$ok" = 1 ]; then`,
+    `  mv -f -- "$tmp" "$target" || { echo ${failEcho}; exit 3; }`,
+    `else`,
+    `  if [ -f "$tmp" ]; then mv -f -- "$tmp" "$target.quarantine" 2>/dev/null || rm -f -- "$tmp"; fi`,
+    `  rm -f -- "$target"`,
+    `  echo ${failEcho}`,
+    `  exit 3`,
+    `fi`,
+  ].join("\n");
+}
+
 export class DevinExecutorAdapter implements ExecutorAdapter {
   readonly executor_id = DEVIN_EXECUTOR_ID;
   readonly runtime_type = "REMOTE_CLOUD";
@@ -362,35 +428,23 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
       const items = depArts
         .map(
           (e) =>
-            `  - ${e.logical_name} → .pair/dependency-artifacts/${e.artifact_id}/${e.logical_name} (sha256:${e.sha256}, byte_size:${e.byte_size}, artifact_id:${e.artifact_id})`,
+            `  - ${e.logical_name} → ${e.consumer_relative_path} (sha256:${e.sha256}, byte_size:${e.byte_size}, artifact_id:${e.artifact_id})`,
         )
         .join("\n");
-      // R1.6 — bounded-retry fetch protocol: the exec row may not be
-      // durable yet when the remote worker first fetches (publication
-      // race) — retry inside a strict finite loop, verify with a REAL
-      // digest tool + exact byte size, quarantine a bad file, and STOP
-      // after the ceiling. No unbounded retries, no host paths.
-      const fetchOne = (e: DependencyArtifactEntry): string => {
-        const target = `.pair/dependency-artifacts/${e.artifact_id}/${e.logical_name}`;
-        return (
-          `mkdir -p "$(dirname '${target}')" && ok=0; ` +
-          `for i in 1 2 3 4 5; do ` +
-          `if curl -sf -X POST "${fetchBase}/api/artifacts/fetch" ` +
-          `-H "x-artifact-consume-capability: ${consume}" ` +
-          `-H "content-type: application/json" ` +
-          `-d '{"artifact_id":"${e.artifact_id}"}' -o '${target}' ` +
-          `&& [ "$(sha256sum '${target}' | cut -d' ' -f1)" = '${e.sha256}' ] ` +
-          `&& [ "$(wc -c < '${target}' | tr -d ' ')" = '${e.byte_size}' ]; then ok=1; break; fi; ` +
-          `sleep "$((i * 2))"; done; ` +
-          `[ "$ok" = 1 ] || { rm -f '${target}'; echo "DEPENDENCY_FETCH_FAILED ${e.artifact_id}"; }`
-        );
-      };
+      // R1.6/R2.5 — bounded-retry fetch protocol built by ONE canonical
+      // production function (shell-safe literals, download-to-tmp, real
+      // digest+size verification, quarantine, non-zero exit on failure).
+      const fetchOne = (e: DependencyArtifactEntry): string =>
+        buildDependencyFetchRecipe(e, {
+          fetchBase,
+          consumeCapability: consume,
+        });
       lines.push(
         "Dependency artifacts: PAIR pinned canonical input artifacts for this task. Fetch each into the workspace at the listed relative path BEFORE starting work:\n" +
           items +
-          `\nFor EACH listed artifact run exactly this bounded recipe (the first fetch may briefly return 403/404 while the execution publishes — the loop's 5 attempts with growing sleeps cover only that window, never retry forever):\n` +
+          `\nFor EACH listed artifact run exactly this bounded recipe (the first fetch may briefly return 403/404 while the execution publishes — the loop's 5 attempts with growing sleeps cover only that window, never retry forever). The recipe itself EXITS NON-ZERO on failure — a non-zero exit means the task must not continue:\n` +
           depArts.map((e) => fetchOne(e)).join("\n") +
-          `\nIf the digest or byte size never verifies, or a fetch still fails after the bounded retries, the recipe removes the file and prints DEPENDENCY_FETCH_FAILED: STOP and report — never substitute your own content.`,
+          `\nIf the digest or byte size never verifies, or a fetch still fails after the bounded retries, the recipe quarantines/removes the file, prints DEPENDENCY_FETCH_FAILED and exits non-zero: STOP and report — never substitute your own content.`,
       );
     }
     // Credential broker: when a service needs a login/token, the agent pulls

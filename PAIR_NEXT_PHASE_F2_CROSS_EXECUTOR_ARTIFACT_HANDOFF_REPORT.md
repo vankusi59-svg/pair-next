@@ -333,3 +333,101 @@ HTTP.
 Classification:
 
 `PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_R1_PENDING_SOURCE_REVIEW`
+
+# F2 R2 SOURCE-REVIEW REMEDIATION — REMOTE-CONSUMER AUTHORITY + PASS SCOPE + FD-BOUND MATERIALIZATION CLOSURE
+
+Remediates the second source-review round on the F2 branch. All five
+findings closed; all R1 + F1 R1–R7 closures preserved.
+
+## R2.1 — remote consumer never falls back to local-path semantics
+
+Previously a `LOCAL producer → declared consume edge → no canonical ART →
+REMOTE consumer` edge was fail-open: the resolver `continue`d for the
+local producer and `MissionRuntime.prerequisiteMissing` returned null for
+remote consumers, so the remote task dispatched without the declared
+input. Now: when a candidate is missing, if the producer OR the consumer
+is remote-capable the resolver throws
+`FAIL_CLOSED_DEPENDENCY_RESOLUTION:remote_edge_artifact_missing:<name>`;
+only a local→local edge keeps the legacy path semantics (returns []).
+
+## R2.2 — PASS validation row must bind durable scope exactly
+
+The resolver's `anchored` filter now requires, in addition to the
+RESULT_VALIDATED event: `validation.validation_id` non-empty and equal to
+the event's `metadata.validation_id`; `validation.mission_id ==
+execution.mission_id == consumer mission`; `validation.governed_task_id ==
+execution.governed_task_id`; `artifact_ids` an actual array; and the
+durable execution↔governed linkage still agrees (governed row exists with
+matching mission/task/executor). Mutating any validation-row field makes
+the candidate non-consumable; restart keeps the binding.
+
+## R2.3 — materialization is fd-bound end to end
+
+The previous materialization proved the parent path contained, then
+opened by pathname — a check→path-open TOCTOU. Now
+`openContainedParentFd` opens the real workspace `O_DIRECTORY|O_NOFOLLOW`,
+walks each directory component (mkdir inside the OPENED parent fd object
+via `/proc/self/fd/<fd>`), opens each component `O_DIRECTORY|O_NOFOLLOW`
+and proves the OPENED object realpaths inside the real workspace and
+(final level) an allowed root. The temp file is created relative to
+`/proc/self/fd/<parentFd>` with `O_EXCL|O_NOFOLLOW`, the opened temp
+object is verified inside the proven dir before any write, rename happens
+within the same pinned dir object, the dir fd is fsync'd, and the final
+opened object is re-verified against the binding. No mutable handoff-root
+pathname is a sole allowed root; without `O_DIRECTORY`/`/proc` the
+implementation fails closed (`opened_object_unprovable`). A symlink or
+directory-object swap at ANY window — before checks, after checks, before
+temp open, before rename — yields zero bytes outside the workspace.
+
+## R2.4 — server uses the injected canonical consume master
+
+`/api/artifacts/fetch` no longer calls
+`artifactConsumeCapabilityMasterFromEnv()` inside request handling. The
+server takes `artifactConsumeToken` (falling back to
+`artifactUploadToken`), resolved ONCE at composition: `serve-mission-control`
+injects `PAIR_ARTIFACT_UPLOAD_TOKEN || PAIR_BROKER_TOKEN`. Ambient env is
+never inspected per request; `PAIR_OUTBOX_TOKEN` is never consume
+authority; no injected master → lane disabled.
+
+## R2.5 — fetch recipe is shell-safe and actually exits non-zero
+
+`buildDependencyFetchRecipe` (exported, single deterministic seam) encodes
+every interpolated value through `shellLiteral` (`'…'` with `'"'"'`
+escapes) — arbitrary `consumer_relative_path` chars (spaces, unicode,
+apostrophes, shell metachars) cannot break quoting or inject commands.
+The recipe downloads to `$target.tmp.$$`, verifies `sha256sum` +
+`wc -c` against the pin, `mv -f` on success, and on exhausted retries
+quarantines the temp, removes the target, emits `DEPENDENCY_FETCH_FAILED`
+and `exit 3` — the recipe itself exits non-zero (previously it returned
+0). Tests E1–E8 execute the generated recipe in a real `bash` with a
+stubbed `curl` on PATH.
+
+## R2 mandatory tests
+
+`src/__tests__/pair-f2-r2-remediation.test.ts` — 35 tests:
+
+| Describe | Coverage |
+|---|---|
+| A (R2.1) | A1–A6: canonical PASS → remote resolves; artifacts:[] → DEPENDENCY_FAILURE; missing/failed validation → fail; local→local legacy preserved; mixed consumes fail whole resolution |
+| B (R2.2) | B1–B8: validation row mutation (mission_id, governed_task_id, empty validation_id, non-array artifact_ids), wrong event anchor/correlation → reject; intact + restart → PASS |
+| C (R2.3) | C1–C8: static component symlinks, post-check swaps via fs.openSync interception (zero bytes outside), no false converge, normal pass, idempotent converge |
+| D (R2.4) | D1–D5: injected master works with all env unset; ambient env contradicting injection is ignored; broker-fallback injection; ambient-env-only → disabled; outbox token never authority — real HTTP route tests |
+| E (R2.5) | E1–E8: real-shell recipe runs — spaces/unicode/apostrophe names, metachar injection impossible, http failure → non-zero + target absent, digest/size mismatch → non-zero + quarantine, success → exact bytes |
+
+## R2 gates
+
+| Gate | Result |
+|---|---|
+| R2 suite | 35/35 |
+| R1 suite | 43/43 |
+| F2 contract suite | 53/53 |
+| F1 authority + R1 + R2–R7 remediation files | 20 + 25 + 95 |
+| `rm -rf dist` → READY+GO true multi-process races | PASS on current source |
+| Full suite on FINAL R2 HEAD | 3082 pass / 2 fail — only the known env-only P5 `stockProbe.available` failures (reproduce on base `b903cb4`) |
+| `npx tsc --noEmit` | PASS |
+| `pnpm build` | PASS |
+| `pnpm audit --audit-level=high` | PASS — 0 high (1 low + 8 moderate pre-existing) |
+
+Classification:
+
+`PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_R2_PENDING_SOURCE_REVIEW`

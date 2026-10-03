@@ -352,16 +352,24 @@ export class ArtifactDependencyResolver {
         planRevision,
       );
       if (!candidate) {
-        if (isRemoteCapabilityTask(producer)) {
-          // A remote file edge can never fall back to shared filesystem
-          // semantics: no canonical artifact → the edge is ungoverned.
+        // R2.1 — a remote edge can never fall back to shared filesystem
+        // semantics: a missing canonical artifact fails closed when the
+        // PRODUCER is remote (it cannot place a local file) AND when the
+        // CONSUMER is remote (it cannot read one). Only the local →
+        // local pair may keep legacy path-only dependency semantics —
+        // prerequisiteMissing explicitly declines remote consumers.
+        if (
+          isRemoteCapabilityTask(producer) ||
+          isRemoteCapabilityTask(task)
+        ) {
           throw new DependencyResolutionError(
             "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
-            `remote_producer_artifact_missing:${name}`,
+            `remote_edge_artifact_missing:${name}`,
           );
         }
-        // Local producer without canonical artifact authority — legacy
-        // path-only dependency stays outside this mechanism entirely.
+        // Local producer + local consumer without canonical artifact
+        // authority — legacy path dependency stays outside this
+        // mechanism entirely.
         continue;
       }
       const { execution, artifact } = candidate;
@@ -433,22 +441,55 @@ export class ArtifactDependencyResolver {
         "executor_execution",
         String(exec.execution_id),
       );
-      const anchored = validations.filter(
-        (v) =>
-          String(v.execution_id) === String(exec.execution_id) &&
-          String(v.status) === "PASS" &&
-          execEvents.some(
-            (ev) =>
-              String(ev.event_type) === "RESULT_VALIDATED" &&
-              String(ev.new_state) === "PASS" &&
-              String(ev.correlation_id ?? "") ===
-                String(exec.correlation_id ?? "") &&
-              String(
-                (ev.metadata as Record<string, unknown> | undefined)
-                  ?.validation_id ?? "",
-              ) === String(v.validation_id ?? ""),
-          ),
-      );
+      const anchored = validations.filter((v) => {
+        if (String(v.execution_id) !== String(exec.execution_id)) {
+          return false;
+        }
+        if (String(v.status) !== "PASS") return false;
+        // R2.2 — the PASS validation ROW itself must still bind the exact
+        // durable producer scope: a row mutated after the immutable
+        // RESULT_VALIDATED event was written must never anchor. The
+        // event only proves SOME PASS existed; the row must still be
+        // the one that ran against THIS execution under THIS mission.
+        const vid = String(v.validation_id ?? "");
+        if (!vid) return false;
+        if (
+          String(v.mission_id) !== missionId ||
+          String(v.mission_id) !== String(exec.mission_id)
+        ) {
+          return false;
+        }
+        if (
+          String(v.governed_task_id) !== String(exec.governed_task_id)
+        ) {
+          return false;
+        }
+        if (!Array.isArray(v.artifact_ids)) return false;
+        // Durable execution ↔ governed linkage must still agree.
+        const gov = this.store.tryGet(
+          "governed_task",
+          String(exec.governed_task_id),
+        ) as Record<string, unknown> | null;
+        if (
+          !gov ||
+          String(gov.mission_id) !== String(exec.mission_id) ||
+          String(gov.task_id) !== String(exec.task_id) ||
+          String(gov.executor_id) !== String(exec.executor_id)
+        ) {
+          return false;
+        }
+        return execEvents.some(
+          (ev) =>
+            String(ev.event_type) === "RESULT_VALIDATED" &&
+            String(ev.new_state) === "PASS" &&
+            String(ev.correlation_id ?? "") ===
+              String(exec.correlation_id ?? "") &&
+            String(
+              (ev.metadata as Record<string, unknown> | undefined)
+                ?.validation_id ?? "",
+            ) === vid,
+        );
+      });
       if (anchored.length > 1) {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
@@ -660,89 +701,120 @@ export class ArtifactHandoffService {
           `${e.artifact_id}:pin_bytes_mismatch`,
         );
       }
-      const { dest, realWorkspace, realAllowedRoots } = this.resolveConsumerDest(
-        workspace,
-        allowedPaths,
-        e,
-      );
-      const realHandoffRoot = path.join(realWorkspace, DEPENDENCY_ARTIFACT_ROOT);
-      if (fs.existsSync(dest) || fs.lstatSync(dest, { throwIfNoEntry: false })) {
-        const st = fs.lstatSync(dest);
-        if (st.isSymbolicLink() || !st.isFile()) {
-          throw new DependencyResolutionError(
-            "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
-            `${e.consumer_relative_path}:conflict`,
-          );
-        }
-        const existing = secureReadContained(dest, MAX_ARTIFACT_BYTES, [
-          realHandoffRoot,
-        ]);
-        if (
-          existing.kind === "ok" &&
-          sha256Hex(existing.bytes) === e.sha256 &&
-          existing.bytes.length === e.byte_size
-        ) {
-          // Identical bytes already pinned — converge, never rewrite.
-          this.markState(handoff, "MATERIALIZED", governed);
-          materialized.push(e.consumer_relative_path);
-          continue;
-        }
-        throw new DependencyResolutionError(
-          "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
-          `${e.consumer_relative_path}:existing_bytes_differ`,
-        );
-      }
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      // R1.3 — prove the REAL parent still lives beneath the real
-      // workspace AND a real allowed root before any byte is written.
-      this.assertRealParentContained(
-        dest,
+      const { relParts, realWorkspace, realAllowedRoots } =
+        this.resolveConsumerDest(workspace, allowedPaths, e);
+      // R2.3 — the directory OBJECT proven inside the governed workspace
+      // is the directory object used to create/write/rename the
+      // dependency file. Everything below the bound fd is expressed as
+      // /proc/self/fd/<fd>/<name> — a component swapped to a symlink at
+      // any instant can never redirect a byte.
+      const parent = this.openContainedParentFd(
         realWorkspace,
+        relParts.slice(0, -1),
         realAllowedRoots,
         e.consumer_relative_path,
       );
-      const tmp = `${dest}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
-      const fh = fs.openSync(tmp, "w");
+      const dirFd = parent.fd;
       try {
-        fs.writeSync(fh, bytes);
-        fs.fsyncSync(fh);
-      } finally {
-        fs.closeSync(fh);
-      }
-      fs.renameSync(tmp, dest);
-      try {
-        const dh = fs.openSync(path.dirname(dest), "r");
-        try {
-          fs.fsyncSync(dh);
-        } finally {
-          fs.closeSync(dh);
-        }
-      } catch (err) {
-        const code = String((err as NodeJS.ErrnoException).code ?? "");
-        if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(code)) {
+        const dirPath = `/proc/self/fd/${dirFd}`;
+        const base = relParts[relParts.length - 1]!;
+        const destBound = `${dirPath}/${base}`;
+        const st = fs.lstatSync(destBound, { throwIfNoEntry: false });
+        if (st) {
+          if (st.isSymbolicLink() || !st.isFile()) {
+            throw new DependencyResolutionError(
+              "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+              `${e.consumer_relative_path}:conflict`,
+            );
+          }
+          // Converge read bound to the SAME opened dir object —
+          // [dirPath] resolves through the fd, never a mutable root
+          // pathname.
+          const existing = secureReadContained(
+            destBound,
+            MAX_ARTIFACT_BYTES,
+            [dirPath],
+          );
+          if (
+            existing.kind === "ok" &&
+            sha256Hex(existing.bytes) === e.sha256 &&
+            existing.bytes.length === e.byte_size
+          ) {
+            this.markState(handoff, "MATERIALIZED", governed);
+            materialized.push(e.consumer_relative_path);
+            continue;
+          }
           throw new DependencyResolutionError(
             "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
-            `${e.consumer_relative_path}:dir_fsync:${code}`,
+            `${e.consumer_relative_path}:existing_bytes_differ`,
           );
         }
-      }
-      // Post-write verification of the MATERIALIZED object (open-object
-      // bound — a swapped path can never qualify).
-      const written = secureReadContained(dest, MAX_ARTIFACT_BYTES, [
-        realHandoffRoot,
-      ]);
-      if (
-        written.kind !== "ok" ||
-        sha256Hex(written.bytes) !== e.sha256 ||
-        written.bytes.length !== e.byte_size
-      ) {
-        throw new DependencyResolutionError(
-          "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
-          `${e.consumer_relative_path}:post_write_mismatch`,
+        const tmpBound = `${dirPath}/.${base}.tmp-${process.pid}-${Math.random()
+          .toString(36)
+          .slice(2, 10)}`;
+        const fh = fs.openSync(
+          tmpBound,
+          fs.constants.O_WRONLY |
+            fs.constants.O_CREAT |
+            fs.constants.O_EXCL |
+            fs.constants.O_NOFOLLOW,
+          0o600,
         );
+        try {
+          // Verify the OPENED temp object BEFORE any byte lands:
+          // regular file whose realpath stays inside the proven dir.
+          if (!fs.fstatSync(fh).isFile()) {
+            throw new DependencyResolutionError(
+              "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+              `${e.consumer_relative_path}:tmp_object`,
+            );
+          }
+          const realTmp = fs.realpathSync(`/proc/self/fd/${fh}`);
+          if (!pathWithin(realTmp, parent.realPath)) {
+            throw new DependencyResolutionError(
+              "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+              `${e.consumer_relative_path}:tmp_outside`,
+            );
+          }
+          fs.writeSync(fh, bytes);
+          fs.fsyncSync(fh);
+        } finally {
+          fs.closeSync(fh);
+        }
+        // Rename WITHIN the same pinned directory object.
+        fs.renameSync(tmpBound, destBound);
+        // fsync the SAME directory object — never a reopened pathname.
+        try {
+          fs.fsyncSync(dirFd);
+        } catch (err) {
+          const code = String((err as NodeJS.ErrnoException).code ?? "");
+          if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP"].includes(code)) {
+            throw new DependencyResolutionError(
+              "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+              `${e.consumer_relative_path}:dir_fsync:${code}`,
+            );
+          }
+        }
+        // Post-write verification of the MATERIALIZED object, bound to
+        // the same proven directory (never the mutable root pathname).
+        const written = secureReadContained(destBound, MAX_ARTIFACT_BYTES, [
+          dirPath,
+        ]);
+        if (
+          written.kind !== "ok" ||
+          sha256Hex(written.bytes) !== e.sha256 ||
+          written.bytes.length !== e.byte_size
+        ) {
+          throw new DependencyResolutionError(
+            "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+            `${e.consumer_relative_path}:post_write_mismatch`,
+          );
+        }
+        this.markState(handoff, "MATERIALIZED", governed);
+        materialized.push(e.consumer_relative_path);
+      } finally {
+        fs.closeSync(dirFd);
       }
-      this.markState(handoff, "MATERIALIZED", governed);
-      materialized.push(e.consumer_relative_path);
     }
     return materialized;
   }
@@ -1077,7 +1149,11 @@ export class ArtifactHandoffService {
     workspace: string,
     allowedPaths: string[],
     entry: DependencyArtifactEntry,
-  ): { dest: string; realWorkspace: string; realAllowedRoots: string[] } {
+  ): {
+    relParts: string[];
+    realWorkspace: string;
+    realAllowedRoots: string[];
+  } {
     const rel = entry.consumer_relative_path;
     const fail = (reason: string): never => {
       throw new DependencyResolutionError(
@@ -1121,36 +1197,96 @@ export class ArtifactHandoffService {
     if (!realAllowedRoots.some((r) => pathWithin(dest, r))) {
       fail("outside_allowed_paths");
     }
-    return { dest, realWorkspace: realWorkspace!, realAllowedRoots };
+    return { relParts, realWorkspace: realWorkspace!, realAllowedRoots };
   }
 
-  /** R1.3 — after mkdir, the REAL parent directory must still live
-   *  beneath the real workspace and a real allowed root (covers a
-   *  component swapped to a symlink between checks). */
-  private assertRealParentContained(
-    dest: string,
+  /**
+   * F2 R2.3 — open the FINAL materialization parent directory ONCE as an
+   * object (O_DIRECTORY | O_NOFOLLOW) and prove the OPENED object lives
+   * beneath the real workspace and a real allowed root. Each missing
+   * component is created INSIDE the previously proven directory object
+   * (mkdir through /proc/self/fd/<fd>), so a swapped pathname component
+   * can never redirect even the directory creation. The returned fd
+   * pins the proven object; callers express every later name lookup as
+   * /proc/self/fd/<fd>/<name>. Fails closed when the platform cannot
+   * prove the opened object (no O_DIRECTORY, no /proc/self/fd).
+   */
+  private openContainedParentFd(
     realWorkspace: string,
+    dirComponents: string[],
     realAllowedRoots: string[],
     rel: string,
-  ): void {
+  ): { fd: number; realPath: string } {
     const fail = (reason: string): never => {
       throw new DependencyResolutionError(
         "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
         `${rel}:${reason}`,
       );
     };
-    let realParent: string;
+    if (
+      typeof fs.constants.O_DIRECTORY !== "number" ||
+      !fs.existsSync("/proc/self/fd")
+    ) {
+      fail("opened_object_unprovable");
+    }
+    const openDir = (p: string): number => {
+      let fd: number;
+      try {
+        fd = fs.openSync(
+          p,
+          fs.constants.O_RDONLY |
+            fs.constants.O_DIRECTORY |
+            fs.constants.O_NOFOLLOW,
+        );
+      } catch {
+        fail("parent_open");
+      }
+      return fd!;
+    };
+    const prove = (fd: number, final: boolean): string => {
+      let real: string;
+      try {
+        real = fs.realpathSync(`/proc/self/fd/${fd}`);
+      } catch {
+        fail("parent_unresolvable");
+      }
+      if (!pathWithin(real!, realWorkspace)) {
+        fail("parent_outside_workspace");
+      }
+      if (
+        final &&
+        !realAllowedRoots.some((r) => pathWithin(real!, r))
+      ) {
+        fail("parent_outside_allowed_paths");
+      }
+      return real!;
+    };
+    let curFd = openDir(realWorkspace);
+    let curReal = prove(curFd, false);
     try {
-      realParent = fs.realpathSync(path.dirname(dest));
-    } catch {
-      fail("parent_unresolvable");
+      for (let i = 0; i < dirComponents.length; i++) {
+        const compPath = `/proc/self/fd/${curFd}/${dirComponents[i]}`;
+        const st = fs.lstatSync(compPath, { throwIfNoEntry: false });
+        if (!st) {
+          // mkdir INSIDE the proven directory object — a swapped path
+          // component can never redirect this creation.
+          try {
+            fs.mkdirSync(compPath);
+          } catch {
+            fail("parent_mkdir");
+          }
+        }
+        const childFd = openDir(compPath);
+        const childReal = prove(childFd, i === dirComponents.length - 1);
+        fs.closeSync(curFd);
+        curFd = childFd;
+        curReal = childReal;
+      }
+    } catch (err) {
+      fs.closeSync(curFd);
+      throw err;
     }
-    if (!pathWithin(realParent!, realWorkspace)) {
-      fail("parent_outside_workspace");
-    }
-    if (!realAllowedRoots.some((r) => pathWithin(realParent!, r))) {
-      fail("parent_outside_allowed_paths");
-    }
+    return { fd: curFd, realPath: curReal! };
   }
 
   private markState(
