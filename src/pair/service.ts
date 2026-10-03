@@ -12,6 +12,7 @@ import path from "node:path";
 import { canonicalRiskCeiling, canonicalWorkspacePath, newId, pathWithin, planManifestDigest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import { AgentContractService } from "./agent-contract.js";
+import { ArtifactAuthority } from "./artifact-authority.js";
 import { CostService } from "./cost.js";
 import { SecretPolicyService } from "./secret-policy.js";
 import { RouteRegistry } from "./route-registry.js";
@@ -34,6 +35,7 @@ export class PairControlPlane {
   private _agentContracts: AgentContractService | null = null;
   private _cost: CostService | null = null;
   private _secretPolicies: SecretPolicyService | null = null;
+  private _artifacts: ArtifactAuthority | null = null;
 
   constructor(public readonly store: PairEvidenceStore) {}
 
@@ -63,6 +65,21 @@ export class PairControlPlane {
   get secretPolicies(): SecretPolicyService {
     this._secretPolicies ??= new SecretPolicyService(this);
     return this._secretPolicies;
+  }
+
+  /** Lazy canonical F1 artifact authority: the ONE ingest seam for
+   *  local and remote artifacts plus the content-addressed byte store
+   *  (default root: <pair.db dir>/artifacts/blobs — deployment-scoped,
+   *  not per-project, so retained bytes survive project churn and stay
+   *  co-located with the canonical evidence store). */
+  get artifacts(): ArtifactAuthority {
+    this._artifacts ??= new ArtifactAuthority(this.store, {
+      blobDir: path.join(
+        process.env.PAIR_ARTIFACT_DIR ?? path.join(this.store.dbDir, "artifacts"),
+        "blobs",
+      ),
+    });
+    return this._artifacts;
   }
 
   createProject(params: { name: string; root_location: string }): Record<string, unknown> {

@@ -77,6 +77,42 @@ export function sha256File(filePath: string): string {
   return sha256Hex(fs.readFileSync(filePath));
 }
 
+/** F1/R5 — the ONE canonical stat-first bounded file authority used by
+ *  every governed byte seam (delivery pins/snapshots/transport, artifact
+ *  ingest). NEVER performs an unbounded full read: stat proves
+ *  `size <= maxBytes` FIRST; a successful read additionally proves
+ *  `bytes.length === stat size` (no mid-read growth) and the sha256 is
+ *  computed over THOSE exact materialized bytes. */
+export type BoundedFileResult =
+  | { kind: "ok"; size: number; bytes: Buffer; sha256: string }
+  | { kind: "too_large"; size: number }
+  | { kind: "unresolved" };
+
+export function boundedFileSha256(p: string, maxBytes: number): BoundedFileResult {
+  let size: number;
+  try {
+    size = fs.statSync(p).size;
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (size > maxBytes) return { kind: "too_large", size };
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(p);
+  } catch {
+    return { kind: "unresolved" };
+  }
+  if (bytes.length !== size) return { kind: "unresolved" };
+  return { kind: "ok", size, bytes, sha256: sha256Hex(bytes) };
+}
+
+/** F1 — deterministic canonical artifact identity: the same producer
+ *  execution + logical name always resolves the same ART_* id, so an
+ *  idempotent replay converges instead of minting duplicate authority. */
+export function canonicalArtifactId(executionId: string, logicalName: string): string {
+  return `ART_${digest({ execution_id: executionId, logical_name: logicalName }).slice(0, 32).toUpperCase()}`;
+}
+
 export function utcnow(): string {
   return new Date().toISOString();
 }

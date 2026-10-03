@@ -12,6 +12,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError, PolicyError } from "./errors.js";
+import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
 import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
 import type { BusinessLayer } from "./business.js";
@@ -58,6 +59,12 @@ export interface MissionControlServerDeps {
    */
   broker?: CredentialBroker;
   brokerToken?: string;
+  /** F1 §6 — master secret that verifies `x-artifact-capability` remote
+   *  uploads (PAIR_ARTIFACT_UPLOAD_TOKEN or the broker master). The
+   *  generic outbox token remains transport compatibility only — it can
+   *  never mint canonical artifact authority. Unset → capability ingest
+   *  disabled. */
+  artifactUploadToken?: string;
   /** Optional business layer: companies → org agents → work items →
    *  routines → budgets, all dispatching through startMission. */
   business?: BusinessLayer;
@@ -318,6 +325,73 @@ export function createMissionControlServer(
       // (screenshots, reports) base64-encoded; stored in the mission's
       // project outbox for the delivery pipeline to pick up.
       if (isOutboxUpload) {
+        // F1 §6 — capability-bound canonical ingest. `x-artifact-capability`
+        // is an execution-scoped HMAC capability minted server-side at
+        // dispatch; the generic outbox token remains a legacy storage-only
+        // path and NEVER mints canonical artifact authority.
+        const artifactCap = String(req.headers["x-artifact-capability"] ?? "");
+        if (artifactCap) {
+          if (!deps.artifactUploadToken) {
+            return void json(res, 403, { error: "ARTIFACT_INGEST_DISABLED" });
+          }
+          const b64 = String(body.data_base64 ?? "");
+          // Bound the wire payload BEFORE decode: base64 inflates ~4/3,
+          // so anything beyond the artifact cap encoding is rejected
+          // without materializing it.
+          if (b64.length > Math.ceil(MAX_ARTIFACT_BYTES * 4 / 3) + 64) {
+            return void json(res, 413, { error: "FAIL_CLOSED_ARTIFACT_TOO_LARGE" });
+          }
+          let buf: Buffer;
+          try {
+            buf = Buffer.from(b64, "base64");
+          } catch {
+            return void json(res, 400, { error: "invalid base64" });
+          }
+          if (!buf.length) return void json(res, 400, { error: "FAIL_CLOSED_ARTIFACT_EMPTY" });
+          if (buf.length > MAX_ARTIFACT_BYTES) {
+            return void json(res, 413, { error: "FAIL_CLOSED_ARTIFACT_TOO_LARGE" });
+          }
+          const acceptance = c.acceptArtifactUpload(deps.artifactUploadToken, artifactCap, {
+            filename: body.filename,
+            mission_id: body.mission_id,
+            task_id: body.task_id,
+            bytes: buf,
+          });
+          const art = acceptance.artifact;
+          // Delivery compatibility: materialize the same verified bytes
+          // into the project outbox under the governed naming convention
+          // so the TELEGRAM_DELIVERY FILES seam resolves it exactly as a
+          // legacy upload would. Outbox presence remains storage only —
+          // send authority still comes from a canonical delivery request.
+          const outboxDir = c.missionOutboxDir(String(art.mission_id));
+          let outboxPath: string | null = null;
+          if (outboxDir) {
+            const filename = path
+              .basename(String(art.logical_name ?? "file"))
+              .replace(/[^\w.\-]/g, "_");
+            const taskPrefix = String(art.task_id).replace(/[^\w.\-]/g, "_").slice(-40);
+            fs.mkdirSync(outboxDir, { recursive: true });
+            const dest = path.join(outboxDir, `${taskPrefix}-${filename}`);
+            const tmp = `${dest}.tmp-${process.pid}`;
+            const fh = fs.openSync(tmp, "w");
+            try {
+              fs.writeSync(fh, buf);
+              fs.fsyncSync(fh);
+            } finally {
+              fs.closeSync(fh);
+            }
+            fs.renameSync(tmp, dest);
+            outboxPath = dest;
+          }
+          return void json(res, 200, {
+            ok: true,
+            artifact_id: art.artifact_id,
+            sha256: art.sha256,
+            byte_size: art.byte_size,
+            replayed: acceptance.replayed,
+            path: outboxPath,
+          });
+        }
         if (!deps.outboxToken || String(req.headers["x-outbox-token"] ?? "") !== deps.outboxToken) {
           return void json(res, 403, { error: "UNAUTHORIZED_OUTBOX_TOKEN" });
         }
@@ -342,9 +416,21 @@ export function createMissionControlServer(
         const taskPrefix = String(body.task_id ?? "remote").replace(/[^\w.\-]/g, "_").slice(-40);
         const dest = path.join(outboxDir, `${taskPrefix}-${filename}`);
         fs.writeFileSync(dest, buf);
-        return void json(res, 200, { ok: true, path: dest, bytes: buf.length });
+        return void json(res, 200, { ok: true, path: dest, bytes: buf.length, canonical: false });
       }
 
+      // F1 §10 — read-only canonical artifact projection (no host paths).
+      if (method === "GET" && p === "/api/artifacts") {
+        return void json(res, 200, {
+          artifacts: c.artifacts(url.searchParams.get("mission_id") ?? undefined),
+        });
+      }
+      const artifactGet = p.match(/^\/api\/artifacts\/([^/]+)$/);
+      if (method === "GET" && artifactGet) {
+        const a = c.artifact(decodeURIComponent(artifactGet[1]));
+        if (!a) return void json(res, 404, { error: "NOT_FOUND" });
+        return void json(res, 200, { artifact: a });
+      }
       // Incident R2 — explicit telegram delivery authority. The bridge polls
       // the QUEUED canonical requests (durable, restart-safe) and acks each
       // manifested artifact after a successful transport. An outbox file is

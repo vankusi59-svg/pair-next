@@ -9,6 +9,8 @@
 
 import fs from "node:fs";
 import { verifyBrokerCapability } from "./broker-capability.js";
+import { verifyArtifactCapability } from "./artifact-capability.js";
+import type { ArtifactAcceptance } from "./artifact-authority.js";
 import { registerSensitiveMaterial } from "./sanitizer.js";
 import path from "node:path";
 import { IntegrityError, NotFoundError, PolicyError } from "./errors.js";
@@ -136,6 +138,51 @@ export class MissionControl {
       this.deps.telegramDeliveryStaleAfterMs,
     );
     return state ? pending.filter((r) => r.status === state) : pending;
+  }
+
+  /* ---------------- F1 canonical artifact authority ------------------------- */
+
+  /** F1 §6 — capability-bound remote artifact ingest. The capability
+   *  claims (mission/task/governed_task/execution/executor) are verified
+   *  cryptographically AND against canonical state; every body identity
+   *  field must equal the capability's — a caller can never upload as
+   *  another mission/task/execution or mint arbitrary provenance. */
+  acceptArtifactUpload(
+    masterSecret: string,
+    capabilityToken: string,
+    body: { filename?: unknown; mission_id?: unknown; task_id?: unknown; bytes: Buffer },
+  ): ArtifactAcceptance {
+    const claims = verifyArtifactCapability(masterSecret, capabilityToken);
+    if (!claims) {
+      throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_INVALID", "signature");
+    }
+    // Cross-check: supplied identity fields must equal the capability's
+    // — the capability (not the caller body) is the authority.
+    for (const k of ["mission_id", "task_id"] as const) {
+      const v = body[k];
+      if (v !== undefined && String(v) !== claims[k]) {
+        throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH", k);
+      }
+    }
+    return this.deps.service.artifacts.accept({
+      execution_id: claims.execution_id,
+      producer_executor_id: claims.executor_id,
+      logical_name: String(body.filename ?? ""),
+      source: { kind: "buffer", bytes: body.bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: `REMOTE_EXECUTOR:${claims.executor_id}`,
+      correlation_id: null,
+      allow_post_result: false,
+    });
+  }
+
+  /** F1 §10 — read-only canonical artifact projection. */
+  artifacts(missionId?: string): Array<Record<string, unknown>> {
+    return this.deps.service.artifacts.list(missionId);
+  }
+
+  artifact(artifactId: string): Record<string, unknown> | null {
+    return this.deps.service.artifacts.get(artifactId);
   }
 
   /** R3/R4 — the ONE production mutation path for delivery state

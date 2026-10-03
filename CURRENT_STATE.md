@@ -914,6 +914,23 @@ WOB1(A) and refused a legitimate retry.
   Focused 73/73; full suite 2742 pass / same 2 env P5 fails;
   tsc+build clean.
 
+## Output language + delivery content authority (MERGED via PR #30 → `6ff9d35`)
+
+- **Output-language contract**: canonical `output_language` stamp (digest-covered, plan-contract v2); output-scoped directive grammar; language verification gate before TDR mint; wrong-language output → deterministic UNDETERMINED, never sent.
+- **Delivery content authority**: TEXT mode binds the exact validated payload into the TDR (text_sha256/text_length/text_source_artifact mandatory at projection — legacy "DONE" rows quarantined to FAILED_DELIVERY, zero network, no re-baseline); plan-contract v2 mandatory on every delivery plan (missing/forged marker → forced re-preview).
+- **FILES = artifact transport**: dispatch pin + TDR slot sha256 mandatory; projection stages an immutable `.delivery-snapshots/<digest>` pin (fsync+rename+re-verify); snapshot-first retry authority (source drift/deletion cannot kill a retry; snapshot mismatch → reconstruct only from a sha-matching source, never re-baseline); transport reads the snapshot ONCE into a bounded buffer → hashes THAT buffer → `fileBytes` flows to the governed sender (Telegram uploader never re-reads the path — TOCTOU closed); `.txt`/`.md`/binary preserved byte-identical as documents; oversized → stat-first `FAIL_CLOSED_TELEGRAM_ARTIFACT_TOO_LARGE` (no unbounded read); orphan `.tmp` cleanup; exclusive begin, retry ceilings, UNKNOWN_SIDE_EFFECT preserved.
+- Full report: `PAIR_NEXT_OUTPUT_LANGUAGE_DELIVERY_AUTHORITY_REPORT.md`.
+
+## Phase F1 — Canonical Artifact Authority Foundation (branch `devin/1790985872-phase-f1-artifact-authority`, pending independent audit)
+
+- **One artifact entity**: `artifact` rows under contract `pair-artifact.v1` — `artifact_id = ART_<digest(execution_id, logical_name)>` resolved wholly from durable producer state (execution → governed_task → mission/task); caller-supplied identity or sha256 is never authority; PAIR hashes independently.
+- **Content-addressed byte store**: `<pair.db>/artifacts/blobs/<sha256>` — immutable, dedup by digest, tmp→fsync→rename→re-verify, orphan-tmp sweepable; canonical bytes live outside project workspaces (post-accept source mutation cannot touch them).
+- **One ingest seam** `ArtifactAuthority.accept()`: producer-chain verification (unknown execution / linkage / executor mismatch / closed states incl. post-result remote uploads), name canonicalization (traversal/absolute/backslash reject), stat-first 64MB bound, count cap 32/execution (replay-exempt), symlink reject, independent sha256, atomic row+blob converge; same identity+same bytes → idempotent, different bytes → `FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT` + rejection evidence.
+- **Local validator migrated**: `ArtifactProvenanceValidator` ingests through the seam; an artifact row now means "PAIR accepted and retained these exact bytes"; `execution_validation.artifact_ids` carries the canonical ids.
+- **Remote ingest**: `acap1` execution-scoped capability (HMAC claims bound to mission/task/governed_task/execution/executor; master = `PAIR_ARTIFACT_UPLOAD_TOKEN || PAIR_BROKER_TOKEN`, never the outbox token remote sees); capability lane in `/api/outbox` → canonical ingest + outbox materialization (delivery compat preserved); legacy token lane is transport-compat only (`canonical:false` — cannot mint authority).
+- **Read model**: `GET /api/artifacts[?mission_id]` / `/:id` → safe `pair-artifact://sha256/<sha>` refs, no host paths; pre-F1 path-only rows stay inspectable as `LEGACY_PATH_ONLY`, never promoted.
+- Remote-task DAG-leaf restriction UNCHANGED; F2/F3/P15 untouched. Full evidence: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_REPORT.md`.
+
 ## Not yet
 
 - Workforce lifecycle beyond governed completion (Phase 4+), CEO

@@ -9,8 +9,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { newId, pathWithin, sha256File, utcnow } from "./canonical.js";
+import { boundedFileSha256, newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
 import type { PairControlPlane } from "./service.js";
 
 export class ArtifactProvenanceValidator {
@@ -49,8 +50,24 @@ export class ArtifactProvenanceValidator {
         failures.push(`artifact missing: ${rel}`);
         continue;
       }
-      const actualSha = sha256File(abs);
-      const actualSize = fs.statSync(abs).size;
+      // F1 §9: no symlink may mint canonical artifact authority.
+      if (fs.lstatSync(abs).isSymbolicLink()) {
+        failures.push(`artifact symlink: ${rel}`);
+        continue;
+      }
+      // F1: stat-first bounded read — an oversized artifact is rejected
+      // before any unbounded materialization.
+      const br = boundedFileSha256(abs, MAX_ARTIFACT_BYTES);
+      if (br.kind === "too_large") {
+        failures.push(`artifact too large: ${rel}`);
+        continue;
+      }
+      if (br.kind !== "ok") {
+        failures.push(`artifact unresolved: ${rel}`);
+        continue;
+      }
+      const actualSha = br.sha256;
+      const actualSize = br.size;
       if (art.sha256 && String(art.sha256) !== actualSha) {
         failures.push(`artifact sha256 mismatch: ${rel}`);
         continue;
@@ -62,41 +79,50 @@ export class ArtifactProvenanceValidator {
       checkedArtifacts.push({ ...art, sha256: actualSha, byte_size: actualSize });
     }
 
-    const pass = failures.length === 0 && status === "COMPLETED";
+    let pass = failures.length === 0 && status === "COMPLETED";
     if (!pass && status === "COMPLETED" && failures.length === 0) {
       failures.push("non-completed result cannot pass validation");
+      pass = false;
     }
 
+    // F1 §5 — local artifacts converge through the ONE canonical ingest
+    // seam: validated workspace bytes are ingested into the content-
+    // addressed store, so an `artifact` row now means "PAIR accepted and
+    // retained these exact bytes with this provenance" — not merely
+    // "this path existed at validation time."
+    const acceptedIds: string[] = [];
     if (pass) {
       for (const art of checkedArtifacts) {
-        const artifactId = newId("ART");
-        store.put(
-          "artifact",
-          artifactId,
-          {
-            artifact_id: artifactId,
+        const abs = path.resolve(workspace, String(art.path));
+        try {
+          const acceptance = service.artifacts.accept({
             execution_id: executionId,
-            governed_task_id: governed.governed_task_id,
-            mission_id: execution.mission_id,
-            task_id: execution.task_id,
-            path: art.path,
-            sha256: art.sha256,
-            byte_size: art.byte_size,
-            created_at: utcnow(),
-            version: 0,
-          },
-          0,
-        );
-        store.event({
-          entity_type: "artifact",
-          entity_id: artifactId,
-          event_type: "ARTIFACT_ACCEPTED",
-          new_state: String(art.path),
-          actor: "PAIR_ARTIFACT_VALIDATOR",
-          correlation_id: String(execution.correlation_id),
-        });
+            producer_executor_id: String(execution.executor_id),
+            logical_name: String(art.path),
+            source: { kind: "path", path: abs },
+            channel: "LOCAL_EXECUTION",
+            actor: "PAIR_ARTIFACT_VALIDATOR",
+            correlation_id: String(execution.correlation_id),
+            allow_post_result: true,
+          });
+          acceptedIds.push(String(acceptance.artifact.artifact_id));
+        } catch (e) {
+          failures.push(
+            `artifact ingest rejected: ${e instanceof IntegrityError ? e.code : String(e)}`,
+          );
+        }
       }
+      pass = failures.length === 0;
     }
+    // F1 §7 — remote executions return artifacts:[] adapter-side, but
+    // capability-bound uploads already minted canonical ART_* rows.
+    // Restart/re-observation reconstructs the same references from
+    // durable state — no re-upload, no re-baselining.
+    const remoteIds = service.artifacts
+      .forExecution(executionId)
+      .map((a) => String(a.artifact_id))
+      .filter((id) => !acceptedIds.includes(id));
+    acceptedIds.push(...remoteIds);
 
     const validation = store.put(
       "execution_validation",
@@ -109,6 +135,7 @@ export class ArtifactProvenanceValidator {
         status: pass ? "PASS" : "FAIL",
         failures,
         artifact_count: checkedArtifacts.length,
+        artifact_ids: acceptedIds,
         created_at: utcnow(),
         version: 0,
       },

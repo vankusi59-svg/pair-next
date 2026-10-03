@@ -843,6 +843,12 @@ const server = createMissionControlServer({
   // management rides the normal MC-token routes /api/credentials.
   broker,
   brokerToken: process.env.PAIR_BROKER_TOKEN || undefined,
+  // F1 artifact ingest master: verifies x-artifact-capability uploads at
+  // /api/outbox. Falls back to the broker master (both are server-side
+  // only secrets the remote worker never sees — it carries only the
+  // minted execution-scoped capability).
+  artifactUploadToken:
+    process.env.PAIR_ARTIFACT_UPLOAD_TOKEN || process.env.PAIR_BROKER_TOKEN || undefined,
   // Business layer: companies/org-agents/work-items/routines/budgets —
   // always on; entities live in the canonical store alongside missions.
   business,
