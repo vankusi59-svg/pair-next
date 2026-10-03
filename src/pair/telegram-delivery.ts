@@ -150,6 +150,17 @@ export interface DeliveryProvenanceBinding {
  *  request row can never re-baseline it. */
 export const TELEGRAM_DELIVERY_MINTED = "TELEGRAM_DELIVERY_MINTED";
 
+/** F4 R3.3 — append-only attempt lifecycle authority. BEGIN persists
+ *  TELEGRAM_DELIVERY_ATTEMPT_STARTED atomically with the SENDING
+ *  projection; each resolve persists TELEGRAM_DELIVERY_ATTEMPT_RESOLVED
+ *  atomically with the terminal/queued projection. The immutable
+ *  history is authority — the mutable TDR row is a cache of it, and a
+ *  coherent row rollback can never mint a new send permission. */
+export const TELEGRAM_DELIVERY_ATTEMPT_STARTED =
+  "TELEGRAM_DELIVERY_ATTEMPT_STARTED";
+export const TELEGRAM_DELIVERY_ATTEMPT_RESOLVED =
+  "TELEGRAM_DELIVERY_ATTEMPT_RESOLVED";
+
 export interface TelegramDeliveryRequestPayload {
   delivery_id: string;
   mission_id: string;
@@ -242,17 +253,27 @@ export function deliveryRequestId(missionId: string, taskId: string): string {
  *  staged copy for a manifested sibling. */
 export const DELIVERY_SNAPSHOT_DIR = ".delivery-snapshots";
 
+/** F4 R3.2 — request-owned delivery snapshot storage lives under the
+ *  CANONICAL store root (deployment/dbDir-scoped), never under the
+ *  mutable `outbox_dir`/`workspace`/`delivery_id` stamped on the row.
+ *  The shared outbox remains transport staging only: a coherently
+ *  rewritten TDR cannot redirect snapshot writes or retention deletes
+ *  into a forged directory. */
+export function deliverySnapshotRoot(store: PairEvidenceStore): string {
+  return path.join(store.dbDir, DELIVERY_SNAPSHOT_DIR);
+}
+
 /** Deterministic snapshot path shared by projection, transport, and
- *  retention cleanup — same name every pass. */
+ *  retention cleanup — same name every pass, keyed by the canonical
+ *  entity identity (never the mutable payload delivery_id). */
 function deliverySnapshotPath(
-  outboxDir: string,
-  deliveryId: string,
+  snapshotRoot: string,
+  entityId: string,
   name: string,
 ): string {
   return path.join(
-    outboxDir,
-    DELIVERY_SNAPSHOT_DIR,
-    `${deliveryId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
+    snapshotRoot,
+    `${entityId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
   );
 }
 
@@ -271,10 +292,11 @@ const TERMINAL_DELIVERY_REQUEST = new Set([
  *  the slot's sha256 itself and the staged bytes are removed on the
  *  next projection pass — no unbounded hidden-file accumulation over
  *  long-running production. Best-effort: a vanished file is no error. */
-function pruneDeliverySnapshots(req: Record<string, unknown>): void {
-  const outbox = req.outbox_dir;
-  if (typeof outbox !== "string" || !outbox) return;
-  const id = String(req.delivery_id);
+function pruneDeliverySnapshots(
+  req: Record<string, unknown>,
+  snapshotRoot: string,
+): void {
+  const id = String(req.entity_id ?? req.delivery_id);
   const requestTerminal = TERMINAL_DELIVERY_REQUEST.has(String(req.status));
   const artifacts = req.artifacts as Array<Record<string, unknown>> | undefined;
   if (Array.isArray(artifacts)) {
@@ -282,7 +304,7 @@ function pruneDeliverySnapshots(req: Record<string, unknown>): void {
       if (!requestTerminal && !TERMINAL_DELIVERY_SLOT.has(String(a.state))) {
         continue;
       }
-      const snap = deliverySnapshotPath(outbox, id, String(a.name));
+      const snap = deliverySnapshotPath(snapshotRoot, id, String(a.name));
       for (const p of [snap, `${snap}.tmp`]) {
         try {
           fs.rmSync(p, { force: true });
@@ -292,7 +314,7 @@ function pruneDeliverySnapshots(req: Record<string, unknown>): void {
       }
     }
   }
-  const dir = path.join(outbox, DELIVERY_SNAPSHOT_DIR);
+  const dir = snapshotRoot;
   try {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
       fs.rmdirSync(dir);
@@ -544,7 +566,22 @@ export function mintTelegramDeliveryRequest(args: {
     if (prov !== undefined || args.textProvenance !== undefined) {
       args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_MINTED, {
         delivery_id: id,
+        // F4 R3.1 — the immutable mint authority binds the COMPLETE
+        // static send contract, not just artifact provenance: canonical
+        // entity identity, mission/task/execution, mode, canonical
+        // destination + sendability, the stamped staging roots, and the
+        // canonical retry ceiling. Mutable lifecycle fields (state,
+        // attempt_count, timestamps, message_id) legitimately evolve
+        // and are never bound here.
+        mission_id: missionId,
+        task_id: taskId,
+        execution_id: String(args.execution.execution_id),
         mode: manifest.mode,
+        destination: destination ?? null,
+        sendable: destination != null,
+        outbox_dir: args.outboxDir,
+        workspace: args.workspace,
+        max_attempts: maxAttempts,
         ...(manifest.mode === "FILES"
           ? {
               artifacts: artifacts.map((a) => ({
@@ -554,6 +591,8 @@ export function mintTelegramDeliveryRequest(args: {
                 governed_task_id: a.producer_governed_task_id,
                 logical_name: a.logical_name,
                 sha256: a.sha256,
+                source_path: a.source_path ?? null,
+                max_attempts: a.max_attempts,
               })),
             }
           : {
@@ -826,11 +865,83 @@ export interface BeginDeliveryResult {
   reason?: string;
 }
 
+/* ---------------------- attempt lifecycle ledger (F4 R3.3) --------- */
+
+type DeliveryAttemptEvent = {
+  kind: "STARTED" | "RESOLVED";
+  slot: string;
+  attempt_id?: string;
+  attempt_number?: number;
+  outcome?: string;
+  message_id?: unknown;
+};
+
+type DeliveryAttemptSlotHistory = {
+  /** count of STARTED events — the next attempt's durable identity. */
+  started: number;
+  /** count of RESOLVED FAILED events — the retry-budget consumption
+   *  authority (mutable attempt_count is only a projection of this). */
+  consumed: number;
+  events: DeliveryAttemptEvent[];
+};
+
+/** F4 R3.3/R3.4 — the immutable append-only attempt lifecycle ledger
+ *  for ONE canonical delivery entity, derived from attempt evidence
+ *  (seq-ordered). The mutable TDR row is a cache of this history; any
+ *  disagreement is a violation, never a new send permission. */
+export function deliveryAttemptLedger(
+  store: PairEvidenceStore,
+  missionId: string,
+  entityId: string,
+): Map<string, DeliveryAttemptSlotHistory> {
+  const map = new Map<string, DeliveryAttemptSlotHistory>();
+  for (const ev of store.listEvidence(missionId)) {
+    const kind = String(ev.kind);
+    if (
+      kind !== TELEGRAM_DELIVERY_ATTEMPT_STARTED &&
+      kind !== TELEGRAM_DELIVERY_ATTEMPT_RESOLVED
+    ) {
+      continue;
+    }
+    const p = (ev.payload as Record<string, unknown>)
+      .payload as Record<string, unknown>;
+    if (String(p.delivery_id ?? "") !== entityId) continue;
+    const slotKey = String(p.slot ?? "text");
+    const h = map.get(slotKey) ?? { started: 0, consumed: 0, events: [] };
+    if (kind === TELEGRAM_DELIVERY_ATTEMPT_STARTED) {
+      h.started += 1;
+      h.events.push({
+        kind: "STARTED",
+        slot: slotKey,
+        attempt_id: p.attempt_id as string | undefined,
+        attempt_number: p.attempt_number as number | undefined,
+      });
+    } else {
+      const outcome = String(p.outcome ?? "");
+      if (outcome === "FAILED") h.consumed += 1;
+      h.events.push({
+        kind: "RESOLVED",
+        slot: slotKey,
+        attempt_id: p.attempt_id as string | undefined,
+        attempt_number: p.attempt_number as number | undefined,
+        outcome,
+        message_id: p.message_id,
+      });
+    }
+    map.set(slotKey, h);
+  }
+  return map;
+}
+
 /**
  * QUEUED → SENDING: persist the deterministic attempt identity BEFORE
  * the network call (R4 §7 — ATT_<digest(delivery_id:slot:attempt_number)>,
  * no wall-clock inside the domain transition). Legal only from QUEUED
  * with retry budget remaining and next_retry_at elapsed (R4 §6).
+ * F4 R3.3 — the immutable attempt-start evidence and the SENDING
+ * projection commit in ONE atomic transaction: either both durable or
+ * neither. Attempt identity and budget consumption derive from the
+ * immutable ledger — a rewritten attempt_count cannot lower either.
  */
 export function beginDeliveryAttempt(args: {
   store: PairEvidenceStore;
@@ -838,43 +949,68 @@ export function beginDeliveryAttempt(args: {
   artifact?: string | null;
   now: string;
 }): BeginDeliveryResult {
-  const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
-  if (req.status !== "QUEUED") {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), String(req.status), "SENDING");
-  }
-  const next = { ...req };
-  const { slot, apply } = findSlot(req, next, args.artifact);
-  if (slot.state === "SENDING") {
-    // Already claimed — durable state is authoritative, never send
-    // authority for a competing or response-lost caller.
-    return {
-      acquired: false,
-      reason: "ALREADY_CLAIMED",
-      request: req,
-      attempt_id: slot.attempt_id,
-      attempt_number: slot.attempt_number,
-    };
-  }
-  if (slot.state !== "QUEUED") {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), slot.state, "SENDING");
-  }
-  if (slot.attempt_count >= slot.max_attempts) {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), "BUDGET_EXHAUSTED", "SENDING");
-  }
-  if (slot.next_retry_at && slot.next_retry_at > args.now) {
-    failTransition(args.deliveryId, String(args.artifact ?? "text"), "BACKOFF_PENDING", "SENDING");
-  }
-  const attemptNumber = slot.attempt_count + 1;
-  slot.attempt_number = attemptNumber;
-  const attemptId = `ATT_${digest(
-    `${args.deliveryId}:${String(args.artifact ?? "text")}:${attemptNumber}`,
-  ).slice(0, 16)}`;
-  slot.attempt_id = attemptId;
-  slot.attempt_started_at = args.now;
-  slot.state = "SENDING";
-  apply();
-  const request = putReq(args.store, next);
-  return { acquired: true, request, attempt_id: attemptId, attempt_number: attemptNumber };
+  return args.store.immediate(() => {
+    const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
+    if (req.status !== "QUEUED") {
+      failTransition(args.deliveryId, String(args.artifact ?? "text"), String(req.status), "SENDING");
+    }
+    const next = { ...req };
+    const { slot, apply } = findSlot(req, next, args.artifact);
+    if (slot.state === "SENDING") {
+      // Already claimed — durable state is authoritative, never send
+      // authority for a competing or response-lost caller.
+      return {
+        acquired: false,
+        reason: "ALREADY_CLAIMED",
+        request: req,
+        attempt_id: slot.attempt_id,
+        attempt_number: slot.attempt_number,
+      };
+    }
+    if (slot.state !== "QUEUED") {
+      failTransition(args.deliveryId, String(args.artifact ?? "text"), slot.state, "SENDING");
+    }
+    const slotKey = String(args.artifact ?? "text");
+    const entityId = String(req.entity_id ?? args.deliveryId);
+    const ledger = deliveryAttemptLedger(
+      args.store,
+      String(req.mission_id),
+      entityId,
+    );
+    const hist = ledger.get(slotKey);
+    // R3.4 — consumed attempts and the next attempt number derive from
+    // the immutable history AND the mutable row, whichever is greater;
+    // neither can be lowered by a coherent row rewrite.
+    const consumed = Math.max(hist?.consumed ?? 0, Number(slot.attempt_count ?? 0));
+    if (consumed >= slot.max_attempts) {
+      failTransition(args.deliveryId, slotKey, "BUDGET_EXHAUSTED", "SENDING");
+    }
+    if (slot.next_retry_at && slot.next_retry_at > args.now) {
+      failTransition(args.deliveryId, slotKey, "BACKOFF_PENDING", "SENDING");
+    }
+    const attemptNumber = Math.max(
+      hist?.started ?? 0,
+      Number(slot.attempt_count ?? 0),
+    ) + 1;
+    slot.attempt_number = attemptNumber;
+    const attemptId = `ATT_${digest(
+      `${args.deliveryId}:${slotKey}:${attemptNumber}`,
+    ).slice(0, 16)}`;
+    slot.attempt_id = attemptId;
+    slot.attempt_started_at = args.now;
+    slot.state = "SENDING";
+    apply();
+    // R3.3 — attempt-start authority inside the same commit.
+    args.store.appendEvidence(String(req.mission_id), TELEGRAM_DELIVERY_ATTEMPT_STARTED, {
+      delivery_id: entityId,
+      slot: slotKey,
+      attempt_id: attemptId,
+      attempt_number: attemptNumber,
+      started_at: args.now,
+    });
+    const request = putReq(args.store, next);
+    return { acquired: true, request, attempt_id: attemptId, attempt_number: attemptNumber };
+  });
 }
 
 /**
@@ -894,21 +1030,34 @@ export function resolveDeliveryAttempt(args: {
   error?: string;
   now: string;
 }): Record<string, unknown> {
-  const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
-  const next = { ...req };
-  const { slot, apply } = findSlot(req, next, args.artifact);
-  if (slot.state !== "SENDING") {
-    failTransition(
-      args.deliveryId,
-      String(args.artifact ?? "text"),
-      slot.state,
-      args.outcome,
-    );
-  }
-  delete slot.attempt_id;
-  delete slot.attempt_number;
-  delete slot.attempt_started_at;
-  if (args.outcome === "SENT") {
+  return args.store.immediate(() => {
+    const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
+    const next = { ...req };
+    const { slot, apply } = findSlot(req, next, args.artifact);
+    const slotKey = String(args.artifact ?? "text");
+    const entityId = String(req.entity_id ?? args.deliveryId);
+    if (slot.state !== "SENDING") {
+      failTransition(
+        args.deliveryId,
+        slotKey,
+        slot.state,
+        args.outcome,
+      );
+    }
+    // R3.3 — the resolving attempt's durable identity is captured BEFORE
+    // the mutable projection fields are cleared, so the immutable
+    // resolve evidence binds exactly the attempt that was in flight.
+    const resolvedAttemptId = slot.attempt_id;
+    const resolvedAttemptNumber = slot.attempt_number;
+    const consumed = deliveryAttemptLedger(
+      args.store,
+      String(req.mission_id),
+      entityId,
+    ).get(slotKey)?.consumed ?? 0;
+    delete slot.attempt_id;
+    delete slot.attempt_number;
+    delete slot.attempt_started_at;
+    if (args.outcome === "SENT") {
     // R4 §2 + R5 §4-5 — SENT requires REAL Telegram acceptance evidence:
     // a positive safe-integer message_id (Bot API Integer). Strings,
     // "MID_fake", 0, negatives, fractions, NaN are all rejected
@@ -926,7 +1075,9 @@ export function resolveDeliveryAttempt(args: {
     delete slot.next_retry_at;
     delete slot.last_error;
   } else if (args.outcome === "FAILED") {
-    slot.attempt_count = slot.attempt_count + 1;
+    // R3.4 — consumption derives from the immutable ledger, never the
+    // mutable row alone: a rewritten attempt_count cannot un-consume.
+    slot.attempt_count = consumed + 1;
     slot.last_error = String(args.error ?? "telegram transport failed").slice(0, 300);
     if (slot.attempt_count < slot.max_attempts) {
       slot.state = "QUEUED";
@@ -947,7 +1098,20 @@ export function resolveDeliveryAttempt(args: {
   const status = recomputeStatus(req, next);
   next.status = status;
   if (status === "SENT") next.sent_at = args.now;
+  // R3.3 — the immutable resolve evidence and the mutable projection
+  // commit atomically inside this transaction.
+  args.store.appendEvidence(String(req.mission_id), TELEGRAM_DELIVERY_ATTEMPT_RESOLVED, {
+    delivery_id: entityId,
+    slot: slotKey,
+    attempt_id: resolvedAttemptId ?? null,
+    attempt_number: resolvedAttemptNumber ?? null,
+    outcome: args.outcome,
+    message_id: args.outcome === "SENT" ? args.messageId : null,
+    error: args.outcome === "SENT" ? null : String(args.error ?? "").slice(0, 300) || null,
+    resolved_at: args.now,
+  });
   return putReq(args.store, next);
+  });
 }
 
 /**
@@ -975,11 +1139,21 @@ export function reconcileStaleDeliveryAttempts(
     if (req.status !== "QUEUED") continue;
     let dirty = false;
     const next = { ...req } as Record<string, unknown>;
+    const resolvedStale: Array<{
+      slotKey: string;
+      attempt_id?: string;
+      attempt_number?: number;
+      reason: string;
+    }> = [];
     for (const { slot, apply } of slots(req, next)) {
       if (slot.state !== "SENDING") {
         apply();
         continue;
       }
+      const slotKey =
+        req.mode === "TEXT" ? "text" : String(slot.name ?? "text");
+      const staleAttemptId = slot.attempt_id;
+      const staleAttemptNumber = slot.attempt_number;
       const startedMs = Date.parse(String(slot.attempt_started_at ?? ""));
       if (!Number.isFinite(startedMs)) {
         dirty = true;
@@ -988,6 +1162,12 @@ export function reconcileStaleDeliveryAttempts(
         delete slot.attempt_number;
         delete slot.attempt_started_at;
         slot.unknown_reason = "stale_sending_missing_started_at";
+        resolvedStale.push({
+          slotKey,
+          attempt_id: staleAttemptId,
+          attempt_number: staleAttemptNumber,
+          reason: "stale_sending_missing_started_at",
+        });
       } else if (nowMs - startedMs >= staleAfterMs) {
         dirty = true;
         slot.state = "UNKNOWN_SIDE_EFFECT";
@@ -995,6 +1175,12 @@ export function reconcileStaleDeliveryAttempts(
         delete slot.attempt_number;
         delete slot.attempt_started_at;
         slot.unknown_reason = `stale_sending_reconciled:${now}`;
+        resolvedStale.push({
+          slotKey,
+          attempt_id: staleAttemptId,
+          attempt_number: staleAttemptNumber,
+          reason: `stale_sending_reconciled:${now}`,
+        });
       }
       // else: fresh SENDING — legitimately in flight, leave untouched.
       apply();
@@ -1004,7 +1190,28 @@ export function reconcileStaleDeliveryAttempts(
       // request aggregate (a single stale payload → UNKNOWN_SIDE_EFFECT,
       // never dead QUEUED).
       next.status = recomputeStatus(req, next);
-      putReq(store, next);
+      // F4 R3.3 — stale-resolution evidence and the mutable projection
+      // commit atomically: the attempt's UNKNOWN outcome is immutable.
+      const entityId = String(req.entity_id ?? req.delivery_id);
+      store.immediate(() => {
+        for (const r of resolvedStale) {
+          store.appendEvidence(
+            String(req.mission_id),
+            TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
+            {
+              delivery_id: entityId,
+              slot: r.slotKey,
+              attempt_id: r.attempt_id ?? null,
+              attempt_number: r.attempt_number ?? null,
+              outcome: "UNKNOWN",
+              message_id: null,
+              error: r.reason,
+              resolved_at: now,
+            },
+          );
+        }
+        putReq(store, next);
+      });
     }
   }
 }
@@ -1070,13 +1277,42 @@ export function pendingTelegramDeliveries(
    *  manifest names, and every bound field equal to the receipt — no
    *  extra/missing/renamed/duplicated slot, and no provenance field may
    *  be deleted to fall back to the legacy hash-only path. */
+  const destinationEqual = (a: unknown, b: unknown): boolean => {
+    const da = a as Record<string, unknown> | null | undefined;
+    const db = b as Record<string, unknown> | null | undefined;
+    if (da == null || db == null) return da == null && db == null;
+    return (
+      String(da.provider ?? "") === String(db.provider ?? "") &&
+      String(da.chat_id ?? "") === String(db.chat_id ?? "") &&
+      String(da.provenance ?? "") === String(db.provenance ?? "")
+    );
+  };
   const wholeContractValid = (
     req: Record<string, unknown>,
     receipt: Record<string, unknown>,
   ): boolean => {
     if (String(req.mode ?? "") !== String(receipt.mode ?? "")) return false;
+    // F4 R3.1 — the receipt binds the COMPLETE static send authority:
+    // mission/task/execution identity, canonical destination +
+    // sendability, the stamped staging roots, and the canonical retry
+    // ceiling. A coherent rewrite of any of them fails the contract
+    // BEFORE any filesystem operation or transport call.
+    if (String(req.mission_id ?? "") !== String(receipt.mission_id ?? ""))
+      return false;
+    if (String(req.task_id ?? "") !== String(receipt.task_id ?? ""))
+      return false;
+    if (String(req.execution_id ?? "") !== String(receipt.execution_id ?? ""))
+      return false;
+    if (!destinationEqual(req.destination, receipt.destination)) return false;
+    if (String(req.outbox_dir ?? "") !== String(receipt.outbox_dir ?? ""))
+      return false;
+    if (String(req.workspace ?? "") !== String(receipt.workspace ?? ""))
+      return false;
+    const ceiling = Number(receipt.max_attempts);
+    if (!Number.isSafeInteger(ceiling) || ceiling <= 0) return false;
     if (String(req.mode) === "TEXT") {
       return (
+        Number(req.max_attempts) === ceiling &&
         typeof req.text_artifact_id === "string" &&
         String(receipt.artifact_id ?? "") === req.text_artifact_id &&
         typeof req.text_producer_execution_id === "string" &&
@@ -1112,7 +1348,11 @@ export function pendingTelegramDeliveries(
           String(r.governed_task_id ?? "") ===
             String(a.producer_governed_task_id ?? "") &&
           String(r.logical_name ?? "") === String(a.logical_name ?? "") &&
-          String(r.sha256 ?? "") === String(a.sha256 ?? ""),
+          String(r.sha256 ?? "") === String(a.sha256 ?? "") &&
+          // F4 R3.1/R3.2 — the stamped staging source and the canonical
+          // retry ceiling are bound fields, not free mutable metadata.
+          String(r.source_path ?? "") === String(a.source_path ?? "") &&
+          Number(r.max_attempts) === Number(a.max_attempts),
       );
       if (i < 0) return false;
       remaining.splice(i, 1);
@@ -1145,17 +1385,24 @@ export function pendingTelegramDeliveries(
     }
     return true;
   };
+  // F4 R3.2 — request-owned snapshot storage is canonical store-scoped
+  // (deployment root), NEVER derived from mutable outbox_dir/workspace/
+  // delivery_id fields. prune + snapshot materialization under this
+  // root alone cannot be redirected by a coherent TDR rewrite.
+  const snapshotRoot = deliverySnapshotRoot(store);
+  const attemptLedgers = new Map<
+    string,
+    Map<string, DeliveryAttemptSlotHistory>
+  >();
+  const ledgerFor = (entityId: string, missionId: string) => {
+    let l = attemptLedgers.get(entityId);
+    if (!l) {
+      l = deliveryAttemptLedger(store, missionId, entityId);
+      attemptLedgers.set(entityId, l);
+    }
+    return l;
+  };
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
-    // R3 — bounded snapshot retention: a pinned snapshot is transport
-    // staging only while its slot's fate is open (QUEUED retry,
-    // in-flight SENDING, UNKNOWN_SIDE_EFFECT investigation — the bytes
-    // are the evidence of what may/must still ship). Once a slot lands
-    // SENT/FAILED_DELIVERY, or the whole request lands terminal
-    // (SENT/FAILED_DELIVERY/UNSENDABLE), the durable identity evidence
-    // is the slot's sha256 itself and the staged bytes are removed on
-    // this projection pass — no unbounded hidden-file accumulation.
-    pruneDeliverySnapshots(req);
-    if (String(req.status) !== "QUEUED") continue;
     // F4 R2 — resolve the immutable mint-receipt contract ONCE for the
     // whole request, by the CANONICAL entity identity (`entity_id`),
     // never by the mutable payload `delivery_id`: a rewritten
@@ -1174,9 +1421,63 @@ export function pendingTelegramDeliveries(
     const bound = receipts.length > 0;
     const contractOk =
       identityOk && receipts.length === 1 && wholeContractValid(req, receipts[0]!);
+    // F4 R3.2 — NO filesystem read/write/delete derived from a
+    // receipt-bound TDR may happen before its static immutable
+    // authority has been validated. A bound row that fails its whole
+    // contract gets zero filesystem operations this pass.
+    if (!bound || contractOk) {
+      // R3 — bounded snapshot retention (canonical root only):
+      // a pinned snapshot is transport staging only while its slot's
+      // fate is open; terminal slots/requests shed their staged bytes
+      // on this pass — no unbounded hidden-file accumulation.
+      pruneDeliverySnapshots(req, snapshotRoot);
+    }
+    if (String(req.status) !== "QUEUED") continue;
+    // F4 R3.3 — the immutable attempt lifecycle ledger is the high-water
+    // authority for every slot: the mutable row is a cache of it. A
+    // coherent rollback (SENT→QUEUED, attempt_count→0, deleted
+    // message_id) can never mint a new send permission — the slot
+    // converges to a durable terminal lifecycle violation instead.
+    const ledger = ledgerFor(entityId, String(req.mission_id));
+    const lifecycleViolation = (
+      slotKey: string,
+      slot: DeliverySlot,
+    ): boolean => {
+      const h = ledger.get(slotKey);
+      if (!h || h.events.length === 0) return false;
+      if (Number(slot.attempt_count ?? 0) !== h.consumed) return true;
+      const last = h.events[h.events.length - 1]!;
+      if (last.kind === "STARTED") {
+        return (
+          slot.state !== "SENDING" ||
+          String(slot.attempt_id ?? "") !== String(last.attempt_id ?? "")
+        );
+      }
+      if (last.outcome === "SENT") {
+        return (
+          slot.state !== "SENT" ||
+          String(slot.message_id ?? "") !== String(last.message_id ?? "")
+        );
+      }
+      if (last.outcome === "UNKNOWN") {
+        return slot.state !== "UNKNOWN_SIDE_EFFECT";
+      }
+      // RESOLVED FAILED — legit projections are QUEUED retry or
+      // FAILED_DELIVERY terminal with the consumed count intact.
+      return !(slot.state === "QUEUED" || slot.state === "FAILED_DELIVERY");
+    };
     if (req.mode === "TEXT") {
       const probe = { ...req } as Record<string, unknown>;
       const [s] = slots(req, probe);
+      if (lifecycleViolation("text", s.slot)) {
+        s.slot.state = "FAILED_DELIVERY";
+        s.slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+        s.slot.completed_at = ts;
+        s.apply();
+        probe.status = recomputeStatus(req, probe);
+        putReq(store, probe);
+        continue;
+      }
       if (!eligible(s.slot, ts)) continue;
       // R2.1 — a TEXT payload has send authority ONLY when its canonical
       // payload evidence is complete AND internally consistent with the
@@ -1229,6 +1530,13 @@ export function pendingTelegramDeliveries(
     let dirty = false;
     const projected: Array<Record<string, unknown>> = [];
     for (const a of (next.artifacts as DeliverySlot[])) {
+      if (lifecycleViolation(String(a.name), a)) {
+        a.state = "FAILED_DELIVERY";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+        a.completed_at = ts;
+        dirty = true;
+        continue;
+      }
       if (a.state !== "QUEUED" || a.attempt_count >= a.max_attempts) continue;
       // R1.2 — a hashless FILES slot has NO send authority: a persisted
       // request minted before digest authority was mandatory converges
@@ -1273,10 +1581,10 @@ export function pendingTelegramDeliveries(
       // mutable producer/workspace file is NOT required to still exist
       // and is never re-read while a valid snapshot stands (source
       // drift/deletion after a failed attempt cannot kill the retry).
-      const snapDir = path.join(String(req.outbox_dir), DELIVERY_SNAPSHOT_DIR);
+      const snapDir = snapshotRoot;
       const snapPath = deliverySnapshotPath(
-        String(req.outbox_dir),
-        String(req.delivery_id),
+        snapshotRoot,
+        entityId,
         String(a.name),
       );
       // R5.1 — stat-first: an oversized retained snapshot is rejected

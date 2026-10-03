@@ -58,6 +58,7 @@ import {
   classifyTextLanguage,
   boundedFileSha256,
   deliveryManifest,
+  deliverySnapshotRoot,
   detectOutputLanguage,
   detectTelegramDeliveryIntent,
   digest,
@@ -2124,9 +2125,7 @@ describe("R4 — snapshot-first retry authority + bounded size + tmp cleanup", (
 
   const snapOf = (ctx: ReturnType<typeof makeCtx>, deliveryId: string, name: string) =>
     path.join(
-      ctx.workspace,
-      "outbox",
-      ".delivery-snapshots",
+      deliverySnapshotRoot(ctx.store),
       `${deliveryId}-${name}`.replace(/[^A-Za-z0-9._-]/g, "_"),
     );
 
@@ -2337,7 +2336,7 @@ describe("R4 — snapshot-first retry authority + bounded size + tmp cleanup", (
     expect(fs.existsSync(snap)).toBe(false);
     expect(fs.existsSync(`${snap}.tmp`)).toBe(false);
     expect(
-      fs.existsSync(path.join(ctx.workspace, "outbox", ".delivery-snapshots")),
+      fs.existsSync(deliverySnapshotRoot(ctx.store)),
     ).toBe(false);
   });
 });
@@ -2431,8 +2430,7 @@ describe("R5 — true stat-first bounded file authority (no unbounded read)", ()
     // First pass stages a small valid snapshot.
     expect(pendingTelegramDeliveries(ctx.store)).toHaveLength(1);
     const snap = path.join(
-      outbox,
-      ".delivery-snapshots",
+      deliverySnapshotRoot(ctx.store),
       `${String(req.delivery_id)}-report.txt`.replace(/[^A-Za-z0-9._-]/g, "_"),
     );
     expect(fs.existsSync(snap)).toBe(true);

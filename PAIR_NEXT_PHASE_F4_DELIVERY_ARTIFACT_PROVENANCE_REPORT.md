@@ -447,3 +447,115 @@ Same 2 env-only `pair-p5` executable-probe failures (reproduced on base
 
 Classification:
 `PAIR_NEXT_PHASE_F4_DELIVERY_ARTIFACT_PROVENANCE_R2_PENDING_AUDIT`
+
+---
+
+# F4 R3 — send-authority closure (audit round 3)
+
+Prev audited HEAD `f9ce5f0` → new HEAD (this commit). Same PR #35.
+
+## Findings closed
+
+- **R3.1 — complete static send authority in the mint receipt.** The
+  `TELEGRAM_DELIVERY_MINTED` receipt now binds every static field that
+  determines what/where/how a request may send: `delivery_id` (canonical
+  entity id), `mission_id`, `task_id`, `execution_id`, `mode`,
+  `destination {provider, chat_id, provenance}` (or `null`), `sendable`,
+  `max_attempts` ceiling, `outbox_dir`, `workspace`, and per-slot
+  `source_path`/`max_attempts` for FILES. `wholeContractValid` proves
+  exact equality of every bound static field before any projection or
+  send — a coherent rewrite of mission/task/execution/destination/
+  staging roots is a fail-closed violation. Mutable lifecycle fields
+  (state, attempt_count, timestamps, message_id) are never bound.
+- **R3.2 — filesystem staging root is not mutable authority (design B).**
+  Snapshot storage moved to `deliverySnapshotRoot(store)` =
+  `store.dbDir/.delivery-snapshots`, keyed by canonical `entity_id` —
+  independent of mutable `outbox_dir`/`workspace`/`delivery_id`. All
+  filesystem effects (prune, mkdir/write/rename/rm) happen only AFTER
+  the bound row passes its whole static contract: a bound row failing
+  validation gets ZERO filesystem operations. The receipt still binds
+  `outbox_dir`/`workspace`, so forging either is fail-closed before any
+  fs touch.
+- **R3.3 — rollback-resistant append-only lifecycle.**
+  `TELEGRAM_DELIVERY_ATTEMPT_STARTED` / `..._RESOLVED` evidence rows are
+  the immutable high-water authority; the mutable row is a projection.
+  `beginDeliveryAttempt`/`resolveDeliveryAttempt` each commit evidence +
+  projection in ONE `store.immediate` transaction (crash in either rolls
+  back both). Attempt authority binds delivery entity id, slot identity,
+  `attempt_id`, `attempt_number`, outcome, `message_id` (SENT), and
+  timestamps. `reconcileStaleDeliveryAttempts` appends RESOLVED UNKNOWN
+  evidence inside the same transaction as the projection. At every
+  projection pass the slot must equal the ledger: `attempt_count ===
+  consumed`, last STARTED ⇒ SENDING with same attempt_id, RESOLVED
+  SENT ⇒ SENT with same message_id, UNKNOWN ⇒ UNKNOWN_SIDE_EFFECT,
+  FAILED ⇒ QUEUED-or-FAILED_DELIVERY. Any disagreement → durable
+  `FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE` — a mutable rollback never
+  mints a new send permission.
+- **R3.4 — immutable retry budget.** `max_attempts` is stamped in the
+  receipt and each FILES slot entry; consumption derives from
+  `deliveryAttemptLedger` (`consumed` = RESOLVED FAILED count; next
+  `attempt_number` = `max(started, attempt_count)+1`; begin refuses
+  `consumed >= max_attempts`). Rewriting the ceiling or zeroing
+  `attempt_count` mints no budget.
+- **R3.5 — R1/R2 contracts preserved**: receipt existence owns the
+  authority path, bijective slot set, TEXT payload binding, entity_id
+  authority, live `verifyArtifactForConsumption`, atomic mint, fresh
+  restart, DEPENDENCY_FAILURE, alias ambiguity, F1/F2/F3 invariants.
+
+## Design answers
+
+- **Static send-authority receipt**: one `TELEGRAM_DELIVERY_MINTED` row
+  per entity carries the complete static contract; `wholeContractValid`
+  is a total verifier — nothing static escapes binding.
+- **Destination binding**: `{provider, chat_id, provenance}` triple
+  compared exactly; `sendable:false` receipts require row status
+  `UNSENDABLE` — a forged QUEUED + forged destination is both a contract
+  violation and (absent history) has no send path.
+- **Filesystem root**: design B — canonical `store.dbDir`-scoped root;
+  mutable workspace/outbox remain staging inputs only.
+- **Attempt lifecycle**: append-only evidence per slot; atomic
+  BEGIN/RESOLVE; projection is a verifiable cache of the ledger.
+- **Retry budget**: ceiling stamped at mint; consumption derived from
+  immutable attempt history, not the mutable counter.
+
+## Tests added (17 — total file 42/42)
+
+R3.1a origin A→B retarget · R3.1b default A→B · R3.1c UNSENDABLE→QUEUED
+forged activation · R3.1d-f mission_id/task_id/execution_id rewrite ·
+R3.2a forged outbox_dir → zero fs ops (mkdir/write/rename/rm spies) ·
+R3.2b forged terminal row → prune untouched · R3.3a FILES SENT→QUEUED
+rollback · R3.3b TEXT same · R3.3c crash-in-begin atomicity · R3.3d
+crash-in-resolve atomicity · R3.3e real restart with durable history ·
+R3.4a ceiling rewrite · R3.4b ledger-derived numbering + count rollback
+fail-closed · R3.4c exhausted resurrection · R3.5 clean control.
+
+## Validation
+
+| Suite | Result |
+|---|---|
+| `pair-f4-delivery-provenance` (A1–A11 + R1 + R2 + R3) | 42/42 |
+| `pair-output-delivery-contract` | 69/69 |
+| `pair-planner-dataflow-incident` | 106/106 |
+| `pair-f1-*` + `pair-f2-*` + `pair-f3-*` + ops/runtime/phase-d | all pass |
+| F1 race suites after `rm -rf dist` | 140/140 |
+| **Full repository regression** | **3222 pass / 2 fail** |
+
+Same 2 env-only `pair-p5` executable-probe failures (reproduced on base
+`3e17525`). `npx tsc --noEmit` 0 errors · `pnpm build` PASS ·
+`pnpm audit --audit-level=high` 0 high.
+
+## Remaining limitations
+
+- Pre-F4 legacy TDR rows keep the hash-only path (no receipt + no
+  binding fields) — never retroactively receiptable.
+- The lifecycle ledger is rebuilt per projection pass from
+  `listEvidence` — O(mission evidence) per request; fine at current
+  scale.
+- Crash-in-transport between evidence append and store commit inside a
+  single `store.immediate` is atomic by sqlite; a crash BETWEEN the
+  immediate calls (e.g. between begin() returning and the send) leaves
+  a durable STARTED row — stale reconciliation resolves it to
+  UNKNOWN_SIDE_EFFECT as designed.
+
+Classification:
+`PAIR_NEXT_PHASE_F4_DELIVERY_SEND_AUTHORITY_R3_PENDING_AUDIT`

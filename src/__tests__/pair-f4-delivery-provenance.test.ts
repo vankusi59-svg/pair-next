@@ -18,7 +18,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
@@ -55,6 +55,9 @@ import {
   DELIVERY_TEXT_ARTIFACT,
   MAX_TELEGRAM_FILE_BYTES,
   TELEGRAM_DELIVERY_MINTED,
+  TELEGRAM_DELIVERY_ATTEMPT_STARTED,
+  TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
+  deliverySnapshotRoot,
 } from "../pair/index.js";
 import type {
   DeliveryBackend,
@@ -1422,6 +1425,9 @@ function mkBoundFilesTdr(
   o: {
     missionId: string;
     files: Array<{ manifest: string; logical: string; bytes: string }>;
+    chatId?: string | null;
+    mission?: Record<string, unknown>;
+    maxAttempts?: number;
   },
 ) {
   const mid = o.missionId;
@@ -1475,7 +1481,10 @@ function mkBoundFilesTdr(
       },
     },
   };
-  const mission = missionRow(ctx, mid);
+  const mission = o.mission ?? missionRow(ctx, mid);
+  if (o.maxAttempts !== undefined) {
+    // per-request ceiling override exercised by R3.4b
+  }
   const req = mintTelegramDeliveryRequest({
     store: ctx.store,
     mission,
@@ -1484,7 +1493,8 @@ function mkBoundFilesTdr(
     outboxDir: path.join(ctx.workspace, "outbox"),
     workspace: ctx.workspace,
     now: utcnow(),
-    defaultChatId: "111",
+    defaultChatId: o.chatId === undefined ? "111" : (o.chatId ?? undefined),
+    maxAttempts: o.maxAttempts,
     artifactSha256,
     artifactSources,
     artifactProvenance,
@@ -1496,7 +1506,12 @@ function mkBoundFilesTdr(
  *  the declared producer of the canonical payload artifact (F4.4). */
 function mkBoundTextTdr(
   ctx: ReturnType<typeof makeCtx>,
-  o: { missionId: string; text: string },
+  o: {
+    missionId: string;
+    text: string;
+    chatId?: string | null;
+    mission?: Record<string, unknown>;
+  },
 ) {
   const mid = o.missionId;
   const planId = `PLAN_${mid}`;
@@ -1522,13 +1537,13 @@ function mkBoundTextTdr(
   };
   const req = mintTelegramDeliveryRequest({
     store: ctx.store,
-    mission: missionRow(ctx, mid),
+    mission: o.mission ?? missionRow(ctx, mid),
     task,
     execution: { execution_id: `EXEC_DEL_${mid}` },
     outboxDir: path.join(ctx.workspace, "outbox"),
     workspace: ctx.workspace,
     now: utcnow(),
-    defaultChatId: "111",
+    defaultChatId: o.chatId === undefined ? "111" : (o.chatId ?? undefined),
     textPayload: o.text,
     textProvenance,
   });
@@ -1800,5 +1815,556 @@ describe("F4 R2 — audit remediation round 2", () => {
     const store2 = new PairEvidenceStore(dbPath);
     expect(receiptsFor(store2)).toHaveLength(1);
     store2.close();
+  });
+});
+
+/* ================= F4 R3 — immutable send-authority closure ==================
+ * R3.1 — the mint receipt binds the COMPLETE static send authority
+ *        (entity/mission/task/execution/mode/destination/sendability/
+ *        ceiling/staging roots) — any coherent rewrite of a static field
+ *        is a fail-closed violation.
+ * R3.2 — request-owned snapshot storage is canonical store-scoped
+ *        (deliverySnapshotRoot), never derived from mutable
+ *        outbox_dir/workspace; a bound row failing its contract gets
+ *        ZERO filesystem operations.
+ * R3.3 — append-only attempt lifecycle evidence (STARTED/RESOLVED) is the
+ *        high-water authority; a mutable rollback NEVER mints a new send
+ *        permission — it converges to a durable lifecycle failure.
+ * R3.4 — max_attempts is the receipt-stamped ceiling; consumption derives
+ *        from immutable attempt history.
+ * ========================================================================== */
+
+describe("F4 R3 — immutable send-authority closure", () => {
+  const failRec = () => {
+    const calls: SendCall[] = [];
+    return {
+      calls,
+      transport: {
+        send: async (a: SendCall): Promise<GovernedSendResult> => {
+          calls.push({ ...a });
+          return { kind: "fail", error: "transport down" };
+        },
+      } as GovernedTelegramTransport,
+    };
+  };
+  const attemptEv = (
+    ctx: ReturnType<typeof makeCtx>,
+    mid: string,
+    kind: string,
+  ) => ctx.store.listEvidence(mid).filter((e) => String(e.kind) === kind);
+  const withOrigin = (
+    ctx: ReturnType<typeof makeCtx>,
+    mid: string,
+    chatId: string,
+  ) => {
+    const m = missionRow(ctx, mid);
+    return {
+      ...m,
+      metadata: {
+        ...(m.metadata as Record<string, unknown>),
+        mission_origin: { operator_id: `telegram:${chatId}` },
+      },
+    } as Record<string, unknown>;
+  };
+  const forgeChat = (
+    body: Record<string, unknown>,
+    provenance: string,
+    chatId: string,
+  ) => ({
+    ...body,
+    destination: { provider: "TELEGRAM", chat_id: chatId, provenance },
+  });
+
+  /* ---- R3.1 — complete static send-authority binding ---------------------- */
+
+  it("R3.1a. mission-origin chat A→B retarget → fail closed, zero transport", async () => {
+    const ctx = makeCtx("f4-r31a");
+    const mid = "M_R31A";
+    const { req } = mkBoundTextTdr(ctx, {
+      missionId: mid,
+      text: VI_REPORT,
+      mission: withOrigin(ctx, mid, "777"),
+    });
+    const cur = deliveries(ctx)[0]!;
+    expect(String((cur.destination as Record<string, unknown>).chat_id)).toBe("777");
+    expect(String(cur.status)).toBe("QUEUED");
+    rewrite(ctx, req, forgeChat(cur, "MISSION_ORIGIN", "888"));
+    await expectFailClosedNoTransport(ctx, "TEXT");
+  });
+
+  it("R3.1b. configured-default chat A→B retarget → fail closed, zero transport", async () => {
+    const ctx = makeCtx("f4-r31b");
+    const mid = "M_R31B";
+    const { req } = mkBoundTextTdr(ctx, {
+      missionId: mid,
+      text: VI_REPORT,
+    });
+    const cur = deliveries(ctx)[0]!;
+    expect(
+      String((cur.destination as Record<string, unknown>).provenance),
+    ).toBe("CONFIGURED_DEFAULT");
+    rewrite(ctx, req, forgeChat(cur, "CONFIGURED_DEFAULT", "999"));
+    await expectFailClosedNoTransport(ctx, "TEXT");
+  });
+
+  it("R3.1c. UNSENDABLE row forged QUEUED with destination=B → zero network", async () => {
+    const ctx = makeCtx("f4-r31c");
+    const mid = "M_R31C";
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: mid,
+      chatId: null,
+      files: [
+        { manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT },
+      ],
+    });
+    const cur = deliveries(ctx)[0]!;
+    expect(String(cur.status)).toBe("UNSENDABLE");
+    // Forge a full activation: QUEUED + forged destination + open slots.
+    const body = {
+      ...cur,
+      status: "QUEUED",
+      destination: {
+        provider: "TELEGRAM",
+        chat_id: "999",
+        provenance: "CONFIGURED_DEFAULT",
+      },
+      artifacts: (cur.artifacts as Array<Record<string, unknown>>).map(
+        (a) => ({ ...a, state: "QUEUED" }),
+      ),
+    };
+    delete body.last_error;
+    delete body.completed_at;
+    rewrite(ctx, req, body);
+    await expectFailClosedNoTransport(ctx, "FILES");
+  });
+
+  it.each([
+    ["mission_id", "M_OTHER"],
+    ["task_id", "TDEL_OTHER"],
+    ["execution_id", "EXEC_OTHER"],
+  ])(
+    "R3.1d-f. rewritten static identity %s → fail closed, zero transport",
+    async (field, value) => {
+      const ctx = makeCtx(`f4-r31-${field}`);
+      const mid = `M_R31_${field.toUpperCase().slice(0, 3)}`;
+      const { req } = mkBoundTextTdr(ctx, {
+        missionId: mid,
+        text: VI_REPORT,
+      });
+      const cur = deliveries(ctx)[0]!;
+      const body = { ...cur, [field]: value };
+      if (field === "mission_id") body.plan_id = cur.plan_id;
+      rewrite(ctx, req, body);
+      await expectFailClosedNoTransport(ctx, "TEXT");
+    },
+  );
+
+  /* ---- R3.2 — canonical store-scoped snapshot root ------------------------ */
+
+  it("R3.2a. forged outbox_dir → fail closed + ZERO fs ops on forged dir", async () => {
+    const ctx = makeCtx("f4-r32a");
+    const mid = "M_R32A";
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: mid,
+      files: [
+        { manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT },
+      ],
+    });
+    const forged = path.join(ctx.dir, "forged-outbox");
+    const cur = deliveries(ctx)[0]!;
+    rewrite(ctx, req, { ...cur, outbox_dir: forged });
+    const touched: string[] = [];
+    const spy = (name: "mkdirSync" | "writeFileSync" | "renameSync" | "rmSync") =>
+      vi
+        .spyOn(fs, name)
+        .mockImplementation(((...a: unknown[]) => {
+          touched.push(`${name}:${String(a[0])}`);
+          return undefined as never;
+        }) as never);
+    const spies = [spy("mkdirSync"), spy("writeFileSync"), spy("renameSync"), spy("rmSync")];
+    try {
+      const rec = recordingTransport();
+      const { sent } = await runTransport(ctx, { transport: rec.transport });
+      expect(sent).toEqual([]);
+      expect(rec.calls).toHaveLength(0);
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+    // ZERO filesystem operations derived from the forged root — and with
+    // the contract invalid the canonical root is untouched this pass too.
+    expect(touched.filter((p) => p.includes(forged))).toEqual([]);
+    expect(fs.existsSync(forged)).toBe(false);
+    const after = deliveries(ctx)[0]!;
+    expect(
+      (after.artifacts as Array<Record<string, unknown>>).map((a) =>
+        String(a.last_error),
+      ),
+    ).toContain("FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE");
+  });
+
+  it("R3.2b. forged terminal row → prune never touches the forged root", async () => {
+    const ctx = makeCtx("f4-r32b");
+    const mid = "M_R32B";
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: mid,
+      files: [
+        { manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT },
+      ],
+    });
+    const forged = path.join(ctx.dir, "forged-terminal");
+    fs.mkdirSync(forged, { recursive: true });
+    const cur = deliveries(ctx)[0]!;
+    // Forge the row into a terminal state rooted at the forged dir —
+    // prune must not interpret it as authority to delete anything there.
+    rewrite(ctx, req, {
+      ...cur,
+      outbox_dir: forged,
+      status: "FAILED_DELIVERY",
+      artifacts: (cur.artifacts as Array<Record<string, unknown>>).map(
+        (a) => ({ ...a, state: "FAILED_DELIVERY" }),
+      ),
+    });
+    const rmCalls: string[] = [];
+    const rmSpy = vi
+      .spyOn(fs, "rmSync")
+      .mockImplementation(((...a: unknown[]) => {
+        rmCalls.push(String(a[0]));
+        return undefined as never;
+      }) as never);
+    try {
+      pendingTelegramDeliveries(ctx.store);
+    } finally {
+      rmSpy.mockRestore();
+    }
+    expect(rmCalls.filter((p) => p.startsWith(forged))).toEqual([]);
+  });
+
+  /* ---- R3.3 — rollback-resistant immutable attempt lifecycle -------------- */
+
+  it("R3.3a. FILES: SENT+message_id → coherent rollback → zero new calls, durable lifecycle failure", async () => {
+    const ctx = makeCtx("f4-r33a");
+    const mid = "M_R33A";
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: mid,
+      files: [
+        { manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT },
+      ],
+    });
+    const rec = recordingTransport();
+    const first = await runTransport(ctx, { transport: rec.transport });
+    expect(first.sent).toEqual(["report.txt"]);
+    expect(rec.calls).toHaveLength(1);
+    const sent = deliveries(ctx)[0]!;
+    expect(String(sent.status)).toBe("SENT");
+    // Immutable evidence exists: STARTED + RESOLVED SENT.
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED).length).toBe(1);
+    const res = attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED);
+    expect(res.length).toBe(1);
+    const rp = (res[0]!.payload as Record<string, unknown>)
+      .payload as Record<string, unknown>;
+    expect(String(rp.outcome)).toBe("SENT");
+    expect(String(rp.message_id)).toBe("1001");
+    // Adversary: roll the mutable row back to a fresh QUEUED state.
+    const body = {
+      ...sent,
+      status: "QUEUED",
+      artifacts: (sent.artifacts as Array<Record<string, unknown>>).map(
+        (a) => ({
+          ...a,
+          state: "QUEUED",
+          attempt_count: 0,
+          message_id: undefined,
+          sent_at: undefined,
+          completed_at: undefined,
+        }),
+      ),
+    };
+    for (const a of body.artifacts as Array<Record<string, unknown>>) {
+      delete a.message_id;
+      delete a.sent_at;
+      delete a.completed_at;
+    }
+    delete body.message_id;
+    delete body.sent_at;
+    delete body.completed_at;
+    rewrite(ctx, sent, body);
+    const rec2 = recordingTransport();
+    const second = await runTransport(ctx, { transport: rec2.transport });
+    expect(second.sent).toEqual([]);
+    expect(rec2.calls).toHaveLength(0); // rollback minted no new permission
+    const after = deliveries(ctx)[0]!;
+    expect(String(after.status)).toBe("FAILED_DELIVERY");
+    expect(
+      (after.artifacts as Array<Record<string, unknown>>).map((a) =>
+        String(a.last_error),
+      ),
+    ).toContain("FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE");
+  });
+
+  it("R3.3b. TEXT: SENT+message_id → coherent rollback → zero new calls, durable lifecycle failure", async () => {
+    const ctx = makeCtx("f4-r33b");
+    const mid = "M_R33B";
+    const { req } = mkBoundTextTdr(ctx, {
+      missionId: mid,
+      text: VI_REPORT,
+    });
+    const rec = recordingTransport();
+    const first = await runTransport(ctx, { transport: rec.transport });
+    expect(first.sent).toEqual([`TEXT:${String(req.delivery_id)}`]);
+    const sent = deliveries(ctx)[0]!;
+    expect(String(sent.status)).toBe("SENT");
+    const body = {
+      ...sent,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      attempt_count: 0,
+      message_id: undefined,
+      sent_at: undefined,
+      completed_at: undefined,
+    };
+    delete body.message_id;
+    delete body.sent_at;
+    delete body.completed_at;
+    rewrite(ctx, sent, body);
+    const rec2 = recordingTransport();
+    const second = await runTransport(ctx, { transport: rec2.transport });
+    expect(second.sent).toEqual([]);
+    expect(rec2.calls).toHaveLength(0);
+    const after = deliveries(ctx)[0]!;
+    expect(String(after.status)).toBe("FAILED_DELIVERY");
+    expect(String(after.last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+    );
+  });
+
+  it("R3.3c. crash inside BEGIN txn → zero STARTED evidence + row still QUEUED", async () => {
+    const ctx = makeCtx("f4-r33c");
+    const mid = "M_R33C";
+    mkBoundTextTdr(ctx, { missionId: mid, text: VI_REPORT });
+    const putSpy = vi
+      .spyOn(ctx.store, "put")
+      .mockImplementationOnce((() => {
+        throw new Error("injected crash inside begin txn");
+      }) as never);
+    try {
+      await expect(runTransport(ctx)).rejects.toThrow("injected crash");
+    } finally {
+      putSpy.mockRestore();
+    }
+    // Atomicity: neither the evidence row nor the SENDING projection
+    // survived — the slot is still a clean QUEUED.
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(0);
+    const row = deliveries(ctx)[0]!;
+    expect(String(row.status)).toBe("QUEUED");
+    expect(String(row.text_state)).toBe("QUEUED");
+    expect(row.attempt_id).toBeUndefined();
+    // Recovery: a clean pass sends normally.
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([`TEXT:${String(row.delivery_id)}`]);
+  });
+
+  it("R3.3d. crash inside RESOLVE txn → zero RESOLVED evidence + slot stays SENDING", async () => {
+    const ctx = makeCtx("f4-r33d");
+    const mid = "M_R33D";
+    mkBoundTextTdr(ctx, { missionId: mid, text: VI_REPORT });
+    // Throw on the SECOND store.put (first is the begin projection).
+    const orig = ctx.store.put.bind(ctx.store);
+    let n = 0;
+    const putSpy = vi
+      .spyOn(ctx.store, "put")
+      .mockImplementation(((...a: Parameters<typeof orig>) => {
+        n += 1;
+        if (n === 2) throw new Error("injected crash inside resolve txn");
+        return orig(...a);
+      }) as never);
+    let transportSends = 0;
+    const counting: GovernedTelegramTransport = {
+      send: async () => {
+        transportSends += 1;
+        return { kind: "ok", message_id: 4242 };
+      },
+    };
+    try {
+      await expect(
+        runTransport(ctx, { transport: counting }),
+      ).rejects.toThrow("injected crash");
+    } finally {
+      putSpy.mockRestore();
+    }
+    expect(transportSends).toBe(1); // send happened…
+    // …but the resolve rolled back entirely: no RESOLVED row, and the
+    // SENDING projection was never persisted either.
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(0);
+    const row = deliveries(ctx)[0]!;
+    expect(String(row.text_state)).toBe("SENDING");
+    // The durable STARTED row drives stale reconciliation to
+    // UNKNOWN_SIDE_EFFECT — never a blind resend.
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+  });
+
+  it("R3.3e. real restart: immutable attempt history survives — forged rollback still fails closed", async () => {
+    const ctx = makeCtx("f4-r33e");
+    const mid = "M_R33E";
+    mkBoundTextTdr(ctx, { missionId: mid, text: VI_REPORT });
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport });
+    expect(String(deliveries(ctx)[0]!.status)).toBe("SENT");
+    // Real restart: close and reopen the store on the same DB.
+    const dbPath = path.join(ctx.dir, "pair.db");
+    ctx.store.close();
+    const store2 = new PairEvidenceStore(dbPath);
+    const list2 = () =>
+      store2.list("telegram_delivery_request") as Array<
+        Record<string, unknown>
+      >;
+    const sent = list2()[0]!;
+    // Forge a rollback on the reopened store.
+    const body = {
+      ...sent,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      attempt_count: 0,
+    };
+    delete body.message_id;
+    delete body.sent_at;
+    delete body.completed_at;
+    store2.put(
+      "telegram_delivery_request",
+      String(sent.delivery_id),
+      body,
+      Number(sent.version),
+    );
+    expect(pendingTelegramDeliveries(store2)).toEqual([]);
+    const after = list2()[0]!;
+    expect(String(after.status)).toBe("FAILED_DELIVERY");
+    expect(String(after.last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+    );
+    store2.close();
+  });
+
+  /* ---- R3.4 — immutable retry budget ------------------------------------- */
+
+  it("R3.4a. mint max_attempts=3 rewritten to 100 → receipt ceiling still authoritative (fail closed)", async () => {
+    const ctx = makeCtx("f4-r34a");
+    const mid = "M_R34A";
+    const { req } = mkBoundFilesTdr(ctx, {
+      missionId: mid,
+      files: [
+        { manifest: "report.txt", logical: "outbox/report.txt", bytes: VI_REPORT },
+      ],
+    });
+    const cur = deliveries(ctx)[0]!;
+    const slot = (cur.artifacts as Array<Record<string, unknown>>)[0]!;
+    expect(Number(slot.max_attempts)).toBe(3);
+    rewrite(ctx, req, {
+      ...cur,
+      artifacts: [{ ...slot, max_attempts: 100 }],
+    });
+    await expectFailClosedNoTransport(ctx, "FILES");
+  });
+
+  it("R3.4b. consumed history is authoritative — numbering continues from ledger; mutable count rollback → fail closed", async () => {
+    // Part 1 (legit retry): two consumed FAILED attempts — the third
+    // attempt's durable identity derives from the immutable ledger.
+    const ctx = makeCtx("f4-r34b");
+    const mid = "M_R34B";
+    mkBoundTextTdr(ctx, { missionId: mid, text: VI_REPORT });
+    const fr = failRec();
+    await runTransport(ctx, { transport: fr.transport }); // attempt 1 fail
+    let cur = deliveries(ctx)[0]!;
+    rewrite(ctx, cur, { ...cur, next_retry_at: utcnow() });
+    await runTransport(ctx, { transport: fr.transport }); // attempt 2 fail
+    cur = deliveries(ctx)[0]!;
+    expect(Number(cur.attempt_count)).toBe(2);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(2);
+    cur = deliveries(ctx)[0]!;
+    rewrite(ctx, cur, { ...cur, next_retry_at: utcnow() });
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport }); // attempt 3 ok
+    const starts = attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED);
+    expect(starts).toHaveLength(3);
+    const lastStart = (
+      starts[2]!.payload as Record<string, unknown>
+    ).payload as Record<string, unknown>;
+    expect(Number(lastStart.attempt_number)).toBe(3);
+    // Part 2 (adversary): a fresh request with 2 consumed failures — a
+    // mutable attempt_count reset mints no new budget: the row is a
+    // lifecycle violation, zero further sends.
+    const ctx2 = makeCtx("f4-r34b2");
+    const mid2 = "M_R34B2";
+    mkBoundTextTdr(ctx2, { missionId: mid2, text: VI_REPORT });
+    const fr2 = failRec();
+    await runTransport(ctx2, { transport: fr2.transport });
+    let cur2 = deliveries(ctx2)[0]!;
+    rewrite(ctx2, cur2, { ...cur2, next_retry_at: utcnow() });
+    await runTransport(ctx2, { transport: fr2.transport });
+    cur2 = deliveries(ctx2)[0]!;
+    expect(Number(cur2.attempt_count)).toBe(2);
+    rewrite(ctx2, cur2, {
+      ...cur2,
+      attempt_count: 0,
+      next_retry_at: utcnow(),
+    });
+    const rec2 = recordingTransport();
+    const { sent } = await runTransport(ctx2, { transport: rec2.transport });
+    expect(sent).toEqual([]);
+    expect(rec2.calls).toHaveLength(0);
+    const after = deliveries(ctx2)[0]!;
+    expect(String(after.last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+    );
+    expect(
+      ctx2.store
+        .listEvidence(mid2)
+        .filter((e) => String(e.kind) === TELEGRAM_DELIVERY_ATTEMPT_STARTED),
+    ).toHaveLength(2);
+  });
+
+  it("R3.4c. exhausted budget → full resurrection rewrite (QUEUED+count0+max100) → zero network", async () => {
+    const ctx = makeCtx("f4-r34c");
+    const mid = "M_R34C";
+    mkBoundTextTdr(ctx, { missionId: mid, text: VI_REPORT });
+    const fr = failRec();
+    for (let i = 0; i < 3; i++) {
+      const cur = deliveries(ctx)[0]!;
+      if (i > 0)
+        rewrite(ctx, cur, { ...cur, next_retry_at: utcnow() });
+      await runTransport(ctx, { transport: fr.transport });
+    }
+    const dead = deliveries(ctx)[0]!;
+    expect(String(dead.status)).toBe("FAILED_DELIVERY");
+    // Resurrect: QUEUED + zeroed counter + raised ceiling.
+    const body = {
+      ...dead,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      attempt_count: 0,
+      max_attempts: 100,
+    };
+    delete body.last_error;
+    delete body.completed_at;
+    rewrite(ctx, dead, body);
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    const after = deliveries(ctx)[0]!;
+    expect(String(after.status)).toBe("FAILED_DELIVERY");
+  });
+
+  /* ---- R3.5 — control: untouched bound row still delivers ----------------- */
+
+  it("R3.5. untouched bound row → clean contract + consistent ledger → sends once (control)", async () => {
+    const ctx = makeCtx("f4-r35");
+    const mid = "M_R35";
+    const { req } = mkBoundTextTdr(ctx, { missionId: mid, text: VI_REPORT });
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([`TEXT:${String(req.delivery_id)}`]);
+    expect(rec.calls).toHaveLength(1);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(1);
   });
 });
