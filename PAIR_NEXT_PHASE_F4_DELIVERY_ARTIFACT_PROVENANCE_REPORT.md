@@ -224,3 +224,97 @@ canonical base `3e17525`, unchanged by this phase).
   (execution-scoped HMAC) — unchanged from F1/F2.
 - TEXT payload language/size contract unchanged; F4 binds provenance,
   not content quality.
+
+---
+
+# R1 REMEDIATION — independent source audit round 1
+
+Audited HEAD: `ec4fbf4` · Remediation pushed on the same PR #35.
+
+## R1.1 — provenance pin miss is a typed dependency failure
+
+`resolveDeliveryArtifact` now returns a discriminated result —
+`{kind:"bound"} | {kind:"no_producer"} | {kind:"no_canonical_artifact"}`
+— instead of throwing a generic `IntegrityError`. `pinDeliveryArtifactDigests`
+maps each miss to a typed `DependencyResolutionError`
+(`FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE`): `no_producer` →
+`PLAN_DATAFLOW_UNBOUND`, `no_canonical_artifact` →
+`PRODUCER_CANONICAL_ARTIFACT_MISSING` with `artifact_name` +
+`producer_task_id` + `consumer_task_id`. `runRunning`'s pre-dispatch catch
+converts it into governed recovery (`startRecovery` /
+`DEPENDENCY_FAILURE` + structured `failure_context` persisted on
+`pending_recovery`) — no exception escapes the tick, no TDR is minted.
+
+E2E over the REAL `MissionRuntime`: producer declares `report.txt`,
+completes PASS, but has NO accepted canonical artifact → zero dispatches,
+zero TDR, zero Telegram calls, recovery decision exists with
+`failure_class=DEPENDENCY_FAILURE` and the persisted structured reason.
+
+## R1.2 — TDR carries canonical provenance binding (receipt + live re-verify)
+
+Hybrid mint-receipt + live-verification design:
+
+- `DeliveryProvenanceBinding` — `{artifact_id, producer_execution_id,
+  governed_task_id, logical_name, sha256, source_path}` carried on FILES
+  slots (`artifact_id`, `producer_execution_id`,
+  `producer_governed_task_id`, `logical_name`) and on the TEXT payload
+  (`text_artifact_id`, `text_producer_execution_id`,
+  `text_producer_governed_task_id`, `text_artifact_sha256`).
+- `mintTelegramDeliveryRequest` requires a binding for every bound
+  payload (missing/malformed → `FAIL_CLOSED_TELEGRAM_ARTIFACT_PROVENANCE`)
+  and emits an immutable `TELEGRAM_DELIVERY_MINTED` evidence receipt —
+  append-only, surviving any coherent mutable-row rewrite — BEFORE the
+  row insert (a bound row can never exist without its receipt).
+- `pendingTelegramDeliveries` fail-closes unless exactly ONE receipt
+  exists for the delivery (`receipts.length !== 1` → invalid) AND
+  `ArtifactAuthority.verifyArtifactForConsumption` re-proves the live
+  canonical facts (mission/task/logical name/sha) before the first
+  snapshot materialization. A coherent `store.put` rewrite of
+  `source_path`/`sha256`/text fields leaves the receipt fields
+  inconsistent → `FAILED_DELIVERY` + `FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE`,
+  zero transport.
+- `source_path` remains transport realization only — never authority.
+- Legacy unbound rows (pre-F4 mints) keep the hash-only path.
+
+Adversarial via canonical `store.put` seam (valid entity hash, no raw
+corruption): FILES slot rewritten to foreign artifact B bytes+sha →
+FAIL CLOSED; TEXT text+text_sha256(`digest()`)+text_length rewritten
+coherently → FAIL CLOSED — both zero sends, durable last_error.
+
+## R1.3 — manifest alias ambiguity fails closed
+
+`resolveDeliveryArtifact` collects every canonical artifact identity hit
+across all aliases (`report.txt` AND `outbox/report.txt`): 0 →
+`no_canonical_artifact`, 1 → `bound`, >1 → typed
+`DependencyResolutionError` `ambiguous_delivery_artifact` /
+`DELIVERY_ARTIFACT_PROVENANCE` — no lexical-order selection. Producer
+accepting BOTH aliases for one manifest name → pin fails closed, zero
+TDR; single-alias still binds.
+
+## R1.4 — real restart proof
+
+Test closes the first `PairEvidenceStore`, reopens the SAME durable DB
+with a fresh store/control/services, stages `slot.source_path` bytes
+from CAS, transports over the reopened store — exactly-once send
+(`SENT` + message_id), TDR terminal `SENT`. Stale same-name outbox bytes
+introduced between instances are never re-baselined (authority = durable
+receipt + CAS, never the filesystem).
+
+## Validation (R1, all on final HEAD)
+
+| Suite | Result |
+|---|---|
+| `pair-f4-delivery-provenance` (A1–A11 + R1.1/R1.1b/R1.2-FILES/R1.2-TEXT/R1.3/R1.4) | 17/17 |
+| `pair-output-delivery-contract` | 69/69 |
+| `pair-planner-dataflow-incident` | 106/106 |
+| `pair-ops-telegram-delivery` | 3/3 |
+| `pair-f1-*` + `pair-f2-*` + `pair-f3-*` | 369/369 |
+| races after `rm -rf dist` (`f1-r2` + `f2-r2`) | 130/130 |
+| **Full repository regression** | **3197 pass / 2 fail** |
+
+Same 2 env-only `pair-p5` executable-probe failures (reproduced on base
+`3e17525`). `npx tsc --noEmit` 0 errors · `pnpm build` PASS ·
+`pnpm audit --audit-level=high` 0 high (1 low, 8 moderate — same as base).
+
+Classification:
+`PAIR_NEXT_PHASE_F4_DELIVERY_ARTIFACT_PROVENANCE_R1_PENDING_AUDIT`

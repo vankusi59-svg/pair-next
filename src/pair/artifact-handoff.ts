@@ -482,18 +482,26 @@ export class ArtifactDependencyResolver {
    * chain as dependency consumption — a stale same-name file sitting
    * in the shared outbox is never consulted.
    *
-   * Returns null when no legitimate producer artifact exists; throws
-   * fail-closed on ambiguous producers (delivery can never guess which
-   * one carries send authority).
+   * Returns a discriminated result: `bound` (exactly one canonical
+   * artifact), `no_producer` (no declared in-mission producer), or
+   * `no_canonical_artifact` (a declared producer exists but no canonical
+   * artifact resolved — producer identity is carried so the caller can
+   * report a typed dependency failure). Throws fail-closed on ambiguous
+   * producers OR ambiguous canonical artifacts (delivery can never
+   * guess which one carries send authority).
    */
   resolveDeliveryArtifact(args: {
     mission: Record<string, unknown>;
     task: Record<string, unknown>;
     name: string;
-  }): {
-    execution: Record<string, unknown>;
-    artifact: Record<string, unknown>;
-  } | null {
+  }):
+    | {
+        kind: "bound";
+        execution: Record<string, unknown>;
+        artifact: Record<string, unknown>;
+      }
+    | { kind: "no_producer" }
+    | { kind: "no_canonical_artifact"; producer: Record<string, unknown> } {
     const task = args.task;
     const missionId = String(args.mission.mission_id);
     const planId = String(task.plan_id);
@@ -529,7 +537,7 @@ export class ArtifactDependencyResolver {
         isDepPredecessor(t) &&
         [...candidates].some((c) => producesOf(t).has(c)),
     );
-    if (producers.length === 0) return null;
+    if (producers.length === 0) return { kind: "no_producer" as const };
     if (producers.length > 1) {
       throw new DependencyResolutionError(
         "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
@@ -543,6 +551,15 @@ export class ArtifactDependencyResolver {
     }
     const producer = producers[0]!;
     const produced = producesOf(producer);
+    // R1.3 — a manifest artifact must resolve to EXACTLY ONE canonical
+    // artifact identity. The source name and its staged outbox alias are
+    // compatible spellings of one deliverable, but they are DISTINCT
+    // canonical artifacts when the producer accepted both: selecting
+    // the lexical first is silent artifact selection — fail closed.
+    const hits = new Map<
+      string,
+      { execution: Record<string, unknown>; artifact: Record<string, unknown> }
+    >();
     for (const candidate of [...candidates].sort()) {
       if (!produced.has(candidate)) continue;
       const hit = this.resolveProducerArtifact(
@@ -551,9 +568,23 @@ export class ArtifactDependencyResolver {
         candidate,
         planRevision,
       );
-      if (hit) return hit;
+      if (hit) hits.set(String(hit.artifact.artifact_id), hit);
     }
-    return null;
+    if (hits.size > 1) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+        `ambiguous_delivery_artifact:${name}`,
+        {
+          dependency_reason: "DELIVERY_ARTIFACT_PROVENANCE",
+          artifact_name: name,
+          producer_task_id: String(producer.task_id),
+          consumer_task_id: String(task.task_id),
+        },
+      );
+    }
+    const bound = [...hits.values()][0];
+    if (bound) return { kind: "bound" as const, ...bound };
+    return { kind: "no_canonical_artifact" as const, producer };
   }
 
   /**

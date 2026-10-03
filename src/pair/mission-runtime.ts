@@ -66,6 +66,7 @@ import {
   mintTelegramDeliveryRequest,
   SHA256_HEX_RE,
 } from "./telegram-delivery.js";
+import type { DeliveryProvenanceBinding } from "./telegram-delivery.js";
 import {
   DELIVERY_TEXT_ARTIFACT,
   detectOutputLanguage,
@@ -467,17 +468,38 @@ export class MissionRuntime {
       }
     > = {};
     for (const name of manifest.artifacts) {
-      const hit = this.deps.service.artifactResolver.resolveDeliveryArtifact({
+      const res = this.deps.service.artifactResolver.resolveDeliveryArtifact({
         mission,
         task,
         name,
       });
-      if (!hit) {
-        throw new IntegrityError(
+      if (res.kind === "no_producer") {
+        throw new DependencyResolutionError(
           "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
           JSON.stringify({ artifact: name, reason: "no_in_mission_producer" }),
+          {
+            dependency_reason: "PLAN_DATAFLOW_UNBOUND",
+            artifact_name: name,
+            consumer_task_id: String(task.task_id),
+          },
         );
       }
+      if (res.kind === "no_canonical_artifact") {
+        throw new DependencyResolutionError(
+          "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
+          JSON.stringify({
+            artifact: name,
+            reason: "producer_canonical_artifact_missing",
+          }),
+          {
+            dependency_reason: "PRODUCER_CANONICAL_ARTIFACT_MISSING",
+            artifact_name: name,
+            producer_task_id: String(res.producer.task_id),
+            consumer_task_id: String(task.task_id),
+          },
+        );
+      }
+      const hit = res;
       if (
         Number(hit.artifact.byte_size) > MAX_TELEGRAM_FILE_BYTES
       ) {
@@ -534,6 +556,11 @@ export class MissionRuntime {
         /** R1.1 — the ONE materialized+validated wire TEXT payload;
          *  mint stores it verbatim (VALIDATED === SENT). */
         textPayload?: string;
+        /** F4 R1.2 — canonical provenance bindings verified HERE: the
+         *  mint stamps them onto the durable request and anchors them
+         *  with the immutable TELEGRAM_DELIVERY_MINTED receipt. */
+        provenance?: Record<string, DeliveryProvenanceBinding>;
+        textProvenance?: DeliveryProvenanceBinding;
       }
     | { ok: false; violation: Record<string, unknown> } {
     const manifest = deliveryManifest(task);
@@ -567,6 +594,10 @@ export class MissionRuntime {
       // ZERO authority and is never consulted.
       let resolved: { artifact: Record<string, unknown>; bytes: Buffer } | null =
         null;
+      // F4 R1.2 — the provenance binding of `resolved`: which canonical
+      // artifact + producer identity the payload was materialized from.
+      // Minted durably + anchored by the TELEGRAM_DELIVERY_MINTED receipt.
+      let resolvedProv: DeliveryProvenanceBinding | null = null;
       const names = [
         DELIVERY_TEXT_ARTIFACT,
         path.posix.basename(DELIVERY_TEXT_ARTIFACT),
@@ -583,18 +614,27 @@ export class MissionRuntime {
             producer_executor_id: String(execution.executor_id),
             logical_name: name,
           });
+          resolvedProv = {
+            artifact_id: id,
+            producer_execution_id: String(execution.execution_id),
+            governed_task_id: String(execution.governed_task_id),
+            logical_name: name,
+            sha256: String(resolved.artifact.sha256),
+          };
           break;
         } catch {
           resolved = null;
+          resolvedProv = null;
         }
       }
       // (b) an earlier in-mission producer's canonical artifact.
       if (!resolved) {
-        const hit = this.deps.service.artifactResolver.resolveDeliveryArtifact({
+        const res = this.deps.service.artifactResolver.resolveDeliveryArtifact({
           mission,
           task,
           name: DELIVERY_TEXT_ARTIFACT,
         });
+        const hit = res.kind === "bound" ? res : null;
         if (hit) {
           try {
             resolved = this.deps.service.artifacts.readForConsumption(
@@ -609,8 +649,16 @@ export class MissionRuntime {
                 byte_size: Number(hit.artifact.byte_size),
               },
             );
+            resolvedProv = {
+              artifact_id: String(hit.artifact.artifact_id),
+              producer_execution_id: String(hit.execution.execution_id),
+              governed_task_id: String(hit.execution.governed_task_id),
+              logical_name: String(hit.artifact.logical_name),
+              sha256: String(hit.artifact.sha256),
+            };
           } catch {
             resolved = null;
+            resolvedProv = null;
           }
         }
       }
@@ -644,7 +692,12 @@ export class MissionRuntime {
       }
       const bad = languageViolation(DELIVERY_TEXT_ARTIFACT, textPayload);
       if (bad) return { ok: false, violation: bad };
-      return { ok: true, digests: {}, textPayload };
+      return {
+        ok: true,
+        digests: {},
+        textPayload,
+        ...(resolvedProv ? { textProvenance: resolvedProv } : {}),
+      };
     }
     // FILES — F4.1 canonical provenance authority: the dispatch pin must
     // carry the in-mission artifact binding (artifact_id + producer
@@ -685,6 +738,7 @@ export class MissionRuntime {
     }
     const digests: Record<string, string> = {};
     const sources: Record<string, string> = {};
+    const provenance: Record<string, DeliveryProvenanceBinding> = {};
     const languageBytes: Record<string, Buffer> = {};
     for (const name of manifest.artifacts) {
       const before = pinned[name];
@@ -757,6 +811,17 @@ export class MissionRuntime {
       // onto the request at mint; the projection re-verifies its sha
       // before staging it into the request-owned snapshot.
       sources[name] = this.deps.service.artifacts.casBlobPath(sha);
+      // F4 R1.2 — the verified canonical provenance binding: stamped
+      // into the durable request + anchored by the immutable mint
+      // receipt. `source_path` is transport realization only.
+      provenance[name] = {
+        artifact_id: artifactId,
+        producer_execution_id: producerExec,
+        governed_task_id: String(artifact.governed_task_id),
+        logical_name: String(artifact.logical_name),
+        sha256: sha,
+        source_path: sources[name],
+      };
       languageBytes[name] = bytes;
     }
     for (const name of manifest.artifacts) {
@@ -766,7 +831,7 @@ export class MissionRuntime {
         if (bad) return { ok: false, violation: bad };
       }
     }
-    return { ok: true, digests, sources };
+    return { ok: true, digests, sources, provenance };
   }
 
   /** Governed dependency handoff: completed dep executions' canonical results. */
@@ -1213,7 +1278,11 @@ export class MissionRuntime {
         const caps = (settledTask.required_capabilities as string[]) ?? [];
         let artifactSha256: Record<string, string> | undefined;
         let artifactSources: Record<string, string> | undefined;
+        let artifactProvenance:
+          | Record<string, DeliveryProvenanceBinding>
+          | undefined;
         let textPayload: string | undefined;
+        let textProvenance: DeliveryProvenanceBinding | undefined;
         if (caps.includes("TELEGRAM_DELIVERY")) {
           // Output/delivery contract gate — strictly BEFORE the success
           // mark, i.e. before any telegram_delivery_request (external
@@ -1259,7 +1328,9 @@ export class MissionRuntime {
           }
           artifactSha256 = check.digests;
           artifactSources = check.sources;
+          artifactProvenance = check.provenance;
           textPayload = check.textPayload;
+          textProvenance = check.textProvenance;
         }
         this.deps.service.updateTask(taskId, {
           status: "COMPLETED",
@@ -1301,7 +1372,9 @@ export class MissionRuntime {
             maxAttempts: this.deps.telegramDeliveryMaxAttempts,
             artifactSha256,
             artifactSources,
+            artifactProvenance,
             textPayload,
+            textProvenance,
           });
         }
         return;

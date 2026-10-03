@@ -58,6 +58,7 @@ import path from "node:path";
 import { boundedFileSha256, compatOutboxBasename, digest, sha256Hex } from "./canonical.js";
 import type { BoundedFileResult } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { ArtifactAuthority } from "./artifact-authority.js";
 import { DELIVERY_TEXT_ARTIFACT } from "./output-language.js";
 import { deliveryManifest, normalizeArtifactPath } from "./plan-dataflow.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -116,7 +117,38 @@ export interface DeliverySlot {
    *  The projection stages verified bytes from this path only; a slot
    *  minted without it has no canonical byte source. */
   source_path?: string;
+  /** F4 R1.2 — canonical provenance binding (transport carries it, the
+   *  immutable mint receipt anchors it): artifact row + producer
+   *  execution/governed identity + logical name. A slot carrying these
+   *  fields is valid ONLY while they equal the TELEGRAM_DELIVERY_MINTED
+   *  receipt AND the artifact still verifies through the canonical
+   *  authority — a coherent row rewrite cannot re-baseline either. */
+  artifact_id?: string;
+  producer_execution_id?: string;
+  producer_governed_task_id?: string;
+  logical_name?: string;
 }
+
+/** F4 R1.2 — the canonical provenance binding minted into a FILES slot
+ *  or the TEXT payload: the same binding the delivery-contract gate
+ *  re-verified, persisted durably and anchored by an immutable
+ *  append-only TELEGRAM_DELIVERY_MINTED receipt emitted at mint. */
+export interface DeliveryProvenanceBinding {
+  artifact_id: string;
+  producer_execution_id: string;
+  governed_task_id: string;
+  logical_name: string;
+  sha256: string;
+  /** FILES only — retained CAS path (transport realization, never
+   *  authority; the sha + identity above are what the receipt binds). */
+  source_path?: string;
+}
+
+/** Evidence kind of the immutable delivery-mint receipt — one row per
+ *  minted request, append-only (governed_evidence is insert-only and
+ *  payload-hash verified on read). Coherent rewrites of the mutable
+ *  request row can never re-baseline it. */
+export const TELEGRAM_DELIVERY_MINTED = "TELEGRAM_DELIVERY_MINTED";
 
 export interface TelegramDeliveryRequestPayload {
   delivery_id: string;
@@ -128,6 +160,13 @@ export interface TelegramDeliveryRequestPayload {
   artifacts: DeliverySlot[];
   /** TEXT: the bounded composed result text. */
   text: string | null;
+  /** F4 R1.2 — TEXT canonical provenance binding (same authority as the
+   *  FILES slot fields): the canonical artifact + producer identity the
+   *  payload was materialized from. Anchored by the mint receipt. */
+  text_artifact_id?: string;
+  text_producer_execution_id?: string;
+  text_producer_governed_task_id?: string;
+  text_artifact_sha256?: string;
   /** TEXT mode: identical slot fields live at request level (R4 §8). */
   text_state?: DeliverySlot["state"];
   attempt_count?: number;
@@ -313,11 +352,22 @@ export function mintTelegramDeliveryRequest(args: {
    *  caller that verified them — the projection stages from THIS path
    *  and re-proves its digest, never the shared outbox). */
   artifactSources?: Record<string, string>;
+  /** FILES (F4 R1.2): manifest name → canonical provenance binding the
+   *  delivery-contract gate verified (artifact row + producer
+   *  execution/governed identity + logical name + sha). When present it
+   *  is authoritative: every slot carries the binding and the mint
+   *  emits the immutable TELEGRAM_DELIVERY_MINTED receipt anchoring it. */
+  artifactProvenance?: Record<string, DeliveryProvenanceBinding>;
   /** TEXT: the exact wire payload materialized and validated at the
    *  delivery-contract gate — mint stores it verbatim and NEVER
    *  re-reads the source file (R1.1: VALIDATED PAYLOAD === TDR
    *  PAYLOAD). */
   textPayload?: string;
+  /** TEXT (F4 R1.2): canonical provenance binding of the artifact the
+   *  payload was materialized from. Anchored by the mint receipt — a
+   *  coherent text/text_sha256/text_length rewrite cannot re-baseline
+   *  the payload origin. */
+  textProvenance?: DeliveryProvenanceBinding;
 }): Record<string, unknown> | null {
   const manifest = deliveryManifest(args.task);
   if (!manifest) return null;
@@ -350,20 +400,60 @@ export function mintTelegramDeliveryRequest(args: {
       else if (!SHA256_HEX_RE.test(String(sha))) bad(name, "malformed_digest");
     }
   }
-  const artifacts: DeliverySlot[] = manifest.artifacts.map((name) => ({
-    name,
-    state: "QUEUED",
-    attempt_count: 0,
-    max_attempts: maxAttempts,
-    ...(manifest.mode === "FILES"
-      ? {
-          sha256: String(args.artifactSha256?.[name]),
-          ...(typeof args.artifactSources?.[name] === "string"
-            ? { source_path: args.artifactSources[name] }
-            : {}),
-        }
-      : {}),
-  }));
+  const prov = args.artifactProvenance;
+  const artifacts: DeliverySlot[] = manifest.artifacts.map((name) => {
+    const binding = prov?.[name];
+    if (manifest.mode === "FILES" && prov !== undefined) {
+      // R1.2 — a provenance-declared mint binds EVERY manifested
+      // artifact: a missing/malformed binding or a digest that
+      // disagrees with the verified map fails closed before mint.
+      const fail = (why: string): never => {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_ARTIFACT_PROVENANCE",
+          JSON.stringify({ artifact: name, reason: why }),
+        );
+      };
+      if (
+        !binding ||
+        typeof binding.artifact_id !== "string" ||
+        !binding.artifact_id ||
+        typeof binding.producer_execution_id !== "string" ||
+        !binding.producer_execution_id ||
+        typeof binding.governed_task_id !== "string" ||
+        !binding.governed_task_id ||
+        typeof binding.logical_name !== "string" ||
+        !binding.logical_name ||
+        !SHA256_HEX_RE.test(String(binding.sha256)) ||
+        binding.sha256 !== String(args.artifactSha256?.[name])
+      ) {
+        fail(
+          !binding ? "missing_provenance_binding" : "malformed_provenance_binding",
+        );
+      }
+    }
+    return {
+      name,
+      state: "QUEUED",
+      attempt_count: 0,
+      max_attempts: maxAttempts,
+      ...(manifest.mode === "FILES"
+        ? {
+            sha256: String(args.artifactSha256?.[name]),
+            ...(typeof args.artifactSources?.[name] === "string"
+              ? { source_path: args.artifactSources[name] }
+              : {}),
+            ...(binding
+              ? {
+                  artifact_id: binding.artifact_id,
+                  producer_execution_id: binding.producer_execution_id,
+                  producer_governed_task_id: binding.governed_task_id,
+                  logical_name: binding.logical_name,
+                }
+              : {}),
+          }
+        : {}),
+    };
+  });
   let text: string | null = null;
   let textEvidence: Record<string, unknown> = {};
   if (manifest.mode === "TEXT") {
@@ -383,6 +473,32 @@ export function mintTelegramDeliveryRequest(args: {
       text_sha256: digest(text),
       text_length: text.length,
       text_source_artifact: DELIVERY_TEXT_ARTIFACT,
+      ...(args.textProvenance
+        ? (() => {
+            const b = args.textProvenance!;
+            if (
+              typeof b.artifact_id !== "string" || !b.artifact_id ||
+              typeof b.producer_execution_id !== "string" ||
+              !b.producer_execution_id ||
+              typeof b.governed_task_id !== "string" || !b.governed_task_id ||
+              !SHA256_HEX_RE.test(String(b.sha256))
+            ) {
+              throw new IntegrityError(
+                "FAIL_CLOSED_TELEGRAM_ARTIFACT_PROVENANCE",
+                JSON.stringify({
+                  artifact: DELIVERY_TEXT_ARTIFACT,
+                  reason: "malformed_provenance_binding",
+                }),
+              );
+            }
+            return {
+              text_artifact_id: b.artifact_id,
+              text_producer_execution_id: b.producer_execution_id,
+              text_producer_governed_task_id: b.governed_task_id,
+              text_artifact_sha256: b.sha256,
+            };
+          })()
+        : {}),
     };
   }
   const body: Record<string, unknown> = {
@@ -412,6 +528,37 @@ export function mintTelegramDeliveryRequest(args: {
         }),
     created_at: args.now,
   };
+  // F4 R1.2 — emit the immutable mint receipt BEFORE the mutable row
+  // exists: a request carrying provenance binding is only ever valid
+  // against this append-only anchor. A dangling receipt (insert later
+  // failing) grants nothing — the row simply does not exist.
+  if (prov !== undefined || args.textProvenance !== undefined) {
+    args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_MINTED, {
+      delivery_id: id,
+      mode: manifest.mode,
+      ...(manifest.mode === "FILES"
+        ? {
+            artifacts: artifacts.map((a) => ({
+              name: a.name,
+              artifact_id: a.artifact_id,
+              producer_execution_id: a.producer_execution_id,
+              governed_task_id: a.producer_governed_task_id,
+              logical_name: a.logical_name,
+              sha256: a.sha256,
+            })),
+          }
+        : {
+            artifact_id: args.textProvenance!.artifact_id,
+            producer_execution_id:
+              args.textProvenance!.producer_execution_id,
+            governed_task_id: args.textProvenance!.governed_task_id,
+            logical_name: DELIVERY_TEXT_ARTIFACT,
+            artifact_sha256: args.textProvenance!.sha256,
+            text_sha256: textEvidence.text_sha256,
+            text_length: textEvidence.text_length,
+          }),
+    });
+  }
   return args.store.put(TELEGRAM_DELIVERY_REQUEST, id, body);
 }
 
@@ -862,6 +1009,94 @@ export function pendingTelegramDeliveries(
   const ts = now ?? new Date().toISOString();
   reconcileStaleDeliveryAttempts(store, ts, staleAfterMs);
   const out: Array<Record<string, unknown>> = [];
+  // F4 R1.2 — lazily built: delivery_id → mint receipts, and the
+  // canonical artifact authority for terminal re-verification. Rows
+  // carrying a provenance binding are valid ONLY against the append-only
+  // TELEGRAM_DELIVERY_MINTED receipt AND the still-canonical artifact —
+  // a coherent mutable-row rewrite fails closed, never re-baselines.
+  let mintReceipts: Map<string, Record<string, unknown>[]> | null = null;
+  const receiptsFor = (
+    deliveryId: string,
+  ): Record<string, unknown>[] => {
+    if (mintReceipts === null) {
+      mintReceipts = new Map();
+      for (const ev of store.listEvidence()) {
+        if (String(ev.kind) !== TELEGRAM_DELIVERY_MINTED) continue;
+        const p = (ev.payload as Record<string, unknown>)
+          .payload as Record<string, unknown>;
+        const id = String(p.delivery_id ?? "");
+        if (!id) continue;
+        const list = mintReceipts.get(id) ?? [];
+        list.push(p);
+        mintReceipts.set(id, list);
+      }
+    }
+    return mintReceipts.get(deliveryId) ?? [];
+  };
+  let artifactAuthority: ArtifactAuthority | null = null;
+  const authority = (): ArtifactAuthority => {
+    artifactAuthority ??= new ArtifactAuthority(store, {
+      blobDir: path.join(
+        process.env.PAIR_ARTIFACT_DIR ?? path.join(store.dbDir, "artifacts"),
+        "blobs",
+      ),
+    });
+    return artifactAuthority;
+  };
+  /** Provenance proof for one bound payload: exactly one receipt exists
+   *  AND every bound field on the row equals the receipt AND the
+   *  artifact still verifies through the canonical authority (immutable
+   *  acceptance history ↔ row ↔ execution linkage ↔ digest). */
+  const provenanceValid = (
+    req: Record<string, unknown>,
+    bound: {
+      artifact_id: unknown;
+      producer_execution_id: unknown;
+      governed_task_id: unknown;
+      logical_name: unknown;
+      sha256: unknown;
+      extra?: Record<string, unknown>;
+    },
+  ): boolean => {
+    const receipts = receiptsFor(String(req.delivery_id));
+    if (receipts.length !== 1) return false;
+    const r = receipts[0]!;
+    const list = Array.isArray(r.artifacts)
+      ? (r.artifacts as Array<Record<string, unknown>>)
+      : r.artifact_id !== undefined
+        ? [r]
+        : [];
+    const match = list.find(
+      (a) => String(a.artifact_id ?? "") === String(bound.artifact_id ?? ""),
+    );
+    if (!match) return false;
+    if (
+      String(match.producer_execution_id ?? "") !==
+        String(bound.producer_execution_id ?? "") ||
+      String(match.governed_task_id ?? "") !==
+        String(bound.governed_task_id ?? "") ||
+      String(match.logical_name ?? "") !== String(bound.logical_name ?? "") ||
+      String(match.sha256 ?? match.artifact_sha256 ?? "") !==
+        String(bound.sha256 ?? "")
+    ) {
+      return false;
+    }
+    for (const [k, v] of Object.entries(bound.extra ?? {})) {
+      if (match[k] !== v) return false;
+    }
+    try {
+      authority().verifyArtifactForConsumption(String(bound.artifact_id), {
+        execution_id: String(bound.producer_execution_id),
+        mission_id: String(req.mission_id),
+        governed_task_id: String(bound.governed_task_id),
+        logical_name: String(bound.logical_name),
+        sha256: String(bound.sha256),
+      });
+    } catch {
+      return false;
+    }
+    return true;
+  };
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
     // R3 — bounded snapshot retention: a pinned snapshot is transport
     // staging only while its slot's fate is open (QUEUED retry,
@@ -892,9 +1127,29 @@ export function pendingTelegramDeliveries(
         req.text_sha256 === digest(text) &&
         Number(req.text_length) === text.length &&
         String(req.text_source_artifact) === DELIVERY_TEXT_ARTIFACT;
-      if (!evidenceOk) {
+      // F4 R1.2 — when the row carries a provenance binding the payload
+      // must additionally anchor to the immutable mint receipt AND the
+      // still-canonical artifact: a coherent rewrite of
+      // text/text_sha256/text_length leaves the bound receipt fields
+      // (artifact sha + producer identity) inconsistent → fail closed.
+      const provOk =
+        req.text_artifact_id === undefined ||
+        provenanceValid(req, {
+          artifact_id: req.text_artifact_id,
+          producer_execution_id: req.text_producer_execution_id,
+          governed_task_id: req.text_producer_governed_task_id,
+          logical_name: req.text_source_artifact,
+          sha256: req.text_artifact_sha256,
+          extra: {
+            text_sha256: req.text_sha256,
+            text_length: req.text_length,
+          },
+        });
+      if (!evidenceOk || !provOk) {
         probe.text_state = "FAILED_DELIVERY";
-        probe.last_error = "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE";
+        probe.last_error = evidenceOk
+          ? "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE"
+          : "FAIL_CLOSED_TELEGRAM_TEXT_PAYLOAD_EVIDENCE";
         probe.completed_at = ts;
         probe.status = recomputeStatus(req, probe);
         putReq(store, probe);
@@ -918,6 +1173,27 @@ export function pendingTelegramDeliveries(
       if (typeof a.sha256 !== "string" || !SHA256_HEX_RE.test(a.sha256)) {
         a.state = "FAILED_DELIVERY";
         a.last_error = "FAIL_CLOSED_TELEGRAM_ARTIFACT_DIGEST";
+        a.completed_at = ts;
+        dirty = true;
+        continue;
+      }
+      // F4 R1.2 — a bound slot must prove its provenance BEFORE the
+      // first snapshot materialization: the immutable mint receipt is
+      // the anchor, the canonical authority the live re-verification.
+      // A coherent rewrite of source_path/sha256/identity leaves the
+      // receipt fields inconsistent → terminal failure, zero transport.
+      if (
+        a.artifact_id !== undefined &&
+        !provenanceValid(req, {
+          artifact_id: a.artifact_id,
+          producer_execution_id: a.producer_execution_id,
+          governed_task_id: a.producer_governed_task_id,
+          logical_name: a.logical_name,
+          sha256: a.sha256,
+        })
+      ) {
+        a.state = "FAILED_DELIVERY";
+        a.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
         a.completed_at = ts;
         dirty = true;
         continue;

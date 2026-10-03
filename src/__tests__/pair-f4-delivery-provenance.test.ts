@@ -41,6 +41,7 @@ import {
   detectOutputLanguage,
   detectTelegramDeliveryIntent,
   deliveryManifest,
+  digest,
   mintArtifactCapability,
   pendingTelegramDeliveries,
   reconcilePlanDataflow,
@@ -983,5 +984,399 @@ describe("F4 — delivery artifact provenance closure", () => {
     ).produces as string[];
     expect(produces).toContain("outbox/report.txt");
     expect((t5.depends_on as string[]).includes("T4")).toBe(true);
+  });
+});
+
+/* ========================= F4 R1 — audit remediation ========================
+ * R1.1: a delivery pin miss (declared producer, no canonical artifact) is a
+ *       typed DEPENDENCY_FAILURE entering governed recovery — never an
+ *       exception escaping the tick.
+ * R1.2: the durable TDR payload carries canonical provenance binding anchored
+ *       by an immutable mint receipt — a coherent mutable-row rewrite fails
+ *       closed, zero transport.
+ * R1.3: manifest alias ambiguity (report.txt + outbox/report.txt both
+ *       canonically accepted by one producer) fails closed — never a lexical
+ *       first-match selection.
+ * R1.4: real restart proof — fresh store/services/runtime over the same
+ *       durable DB consume only canonical provenance; stale same-name bytes
+ *       introduced between instances never re-baseline. */
+
+/** Producer declaring TWO manifest aliases — one execution, two canonical
+ *  artifacts (the R1.3 ambiguity shape). Real ingest seams throughout. */
+function mkDualArtifactProducer(
+  ctx: ReturnType<typeof makeCtx>,
+  o: {
+    missionId: string;
+    key: string;
+    planId: string;
+    nameA: string;
+    nameB: string;
+    bytesA: Buffer | string;
+    bytesB: Buffer | string;
+  },
+) {
+  const tid = `ATSK_${o.key}`;
+  const gtId = `GT_${tid}`;
+  const executor = "EX_PROD";
+  const eid = workerExecutionId(executor, gtId);
+  const bytesA = Buffer.isBuffer(o.bytesA) ? o.bytesA : Buffer.from(o.bytesA);
+  const bytesB = Buffer.isBuffer(o.bytesB) ? o.bytesB : Buffer.from(o.bytesB);
+  ctx.store.put("task", tid, {
+    task_id: tid, task_key: o.key, mission_id: o.missionId, plan_id: o.planId,
+    title: o.key, task_instruction: `produce ${o.nameA} and ${o.nameB}`,
+    required_capabilities: ["FILE_OPERATIONS"], depends_on: [],
+    status: "COMPLETED",
+    metadata: { pair_dataflow: { produces: [o.nameA, o.nameB], consumes: [] } },
+    version: 0,
+  }, 0);
+  ctx.store.put("governed_task", gtId, {
+    governed_task_id: gtId, mission_id: o.missionId, task_id: tid,
+    correlation_id: `COR_${tid}`, executor_id: executor, plan_revision: 1,
+    workspace: ctx.workspace, allowed_paths: [ctx.workspace],
+    governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+    created_at: utcnow(), version: 0,
+  }, 0);
+  ctx.store.put("executor_execution", eid, {
+    execution_id: eid, governed_task_id: gtId, mission_id: o.missionId,
+    task_id: tid, executor_id: executor, plan_revision: 1,
+    correlation_id: `COR_${tid}`, execution_state: "RUNNING",
+    dispatch_timestamp: utcnow(), workspace: ctx.workspace, version: 0,
+  }, 0);
+  const declared: Record<string, unknown>[] = [];
+  for (const [n, b] of [[o.nameA, bytesA], [o.nameB, bytesB]] as const) {
+    const fp = path.join(ctx.workspace, n);
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    fs.writeFileSync(fp, b);
+    declared.push({ path: n, sha256: sha256Hex(b), byte_size: b.length });
+  }
+  const settled = ctx.store.get("executor_execution", eid);
+  ctx.store.put("executor_execution", eid, {
+    ...settled,
+    execution_state: "COMPLETED",
+    result: { status: "COMPLETED", artifacts: declared },
+  }, settled.version);
+  new ArtifactProvenanceValidator().validate_execution(ctx.service, eid);
+  return { tid, gtId, eid, executor, key: o.key };
+}
+
+describe("F4 R1 — audit remediation", () => {
+  it("R1.1 E2E: declared producer + PASS + NO canonical artifact → typed DEPENDENCY_FAILURE via REAL runtime (zero dispatch/TDR/network)", async () => {
+    const ctx = makeCtx("f4-r11");
+    const adapter = new ScriptedAdapter("EX_A", [
+      "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    ]);
+    // T4 declares the produce edge (plan contract) but its execution
+    // completes with artifacts:[] — no canonical artifact exists.
+    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "COMPLETE", T4: "COMPLETE", T5: "COMPLETE" };
+    registerAdapter(ctx, adapter);
+    const plan = reconcilePlanDataflow(prodPlan(), {
+      telegramIntent: detectTelegramDeliveryIntent(PROD_GOAL),
+      outputLanguage: detectOutputLanguage(PROD_GOAL),
+    }).tasks;
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: PROD_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: plan },
+    });
+    const mid = String(m.mission_id);
+    // Drive tick-by-tick: the pin miss must never escape a tick as an
+    // exception — it enters governed recovery as DEPENDENCY_FAILURE.
+    let depFailure: Record<string, unknown> | null = null;
+    let state = "";
+    let t = Date.parse("2026-01-01T00:00:00Z");
+    for (let i = 0; i < 200; i++) {
+      t += 120_000;
+      ctx.runtime.tick(mid, new Date(t).toISOString()); // throws → test fails
+      state = String(rt(ctx, mid).state);
+      const pend = rt(ctx, mid).pending_recovery as Record<
+        string,
+        unknown
+      > | null;
+      if (pend && String(pend.failure_class) === "DEPENDENCY_FAILURE") {
+        depFailure = pend;
+      }
+      if (["COMPLETED", "FAILED", "ABORTED", "WAITING_APPROVAL", "CANCELLED"].includes(state)) break;
+    }
+    // The mission converged through bounded recovery — never delivered.
+    expect(state).not.toBe("COMPLETED");
+    expect(depFailure).not.toBeNull();
+    const fctx = depFailure!.failure_context as Record<string, unknown>;
+    expect(String(fctx.dependency_reason)).toBe(
+      "PRODUCER_CANONICAL_ARTIFACT_MISSING",
+    );
+    expect(String(fctx.artifact_name)).toBe("report.txt");
+    expect(String(fctx.source_code)).toBe(
+      "FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE",
+    );
+    expect(fctx.producer_task_id).toBeTruthy();
+    expect(fctx.consumer_task_id).toBeTruthy();
+    // Zero delivery dispatch: the TELEGRAM_DELIVERY task never ran.
+    const t5 = ctx.store
+      .list("task")
+      .find((x) => String(x.mission_id) === mid && String(x.task_key) === "T5");
+    expect(t5).toBeTruthy();
+    expect(
+      ctx.store
+        .list("executor_execution")
+        .filter((e) => String(e.task_id) === String(t5!.task_id)),
+    ).toHaveLength(0);
+    // Zero send authority + zero network.
+    expect(deliveries(ctx)).toHaveLength(0);
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  it("R1.1b: no declared producer → DEPENDENCY_FAILURE too (typed PLAN_DATAFLOW_UNBOUND)", async () => {
+    const ctx = makeCtx("f4-r11b");
+    const task = deliveryTask(ctx, {
+      missionId: "M_R11B", planId: "PLAN_R11B", taskId: "TDEL_R11B",
+      dependsOn: [], artifacts: ["report.txt"],
+    });
+    ctx.store.put("task", "TDEL_R11B", { ...task, status: "READY", version: 0 }, 0);
+    try {
+      pinOf(ctx)(missionRow(ctx, "M_R11B"), ctx.store.get("task", "TDEL_R11B"));
+      expect.unreachable("pin must fail");
+    } catch (err) {
+      expect(err).toBeInstanceOf(IntegrityError);
+      // Typed dependency failure — governed recovery consumes it.
+      const dre = err as InstanceType<typeof IntegrityError> & {
+        dependency_reason?: string;
+        artifact_name?: string;
+        consumer_task_id?: string;
+      };
+      expect(dre.dependency_reason).toBe("PLAN_DATAFLOW_UNBOUND");
+      expect(dre.artifact_name).toBe("report.txt");
+      expect(dre.consumer_task_id).toBe("TDEL_R11B");
+    }
+    expect(deliveries(ctx)).toHaveLength(0);
+  });
+
+  it("R1.2 FILES: coherent mutable-row rewrite (source_path→B + sha256→sha(B)) → projection fails closed, zero transport", async () => {
+    const ctx = makeCtx("f4-r12f");
+    const adapter = new ScriptedAdapter("EX_A", [
+      "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    ]);
+    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "COMPLETE", T4: "WRITE", T5: "COMPLETE" };
+    adapter.fileContent = { T4: VI_REPORT };
+    registerAdapter(ctx, adapter);
+    const plan = reconcilePlanDataflow(prodPlan(), {
+      telegramIntent: detectTelegramDeliveryIntent(PROD_GOAL),
+      outputLanguage: detectOutputLanguage(PROD_GOAL),
+    }).tasks;
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: PROD_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: plan },
+    });
+    const mid = String(m.mission_id);
+    expect(drive(ctx, mid)).toBe("COMPLETED");
+    const req = deliveries(ctx)[0]!;
+    const slot = (req.artifacts as Array<Record<string, unknown>>)[0]!;
+    // Precondition: the slot carries the canonical provenance binding.
+    expect(slot.artifact_id).toBeTruthy();
+    expect(slot.producer_execution_id).toBeTruthy();
+    // Adversary: rewrite the row COHERENTLY through the canonical store
+    // seam — new source_path AND new sha256 matching bytes B, entity
+    // hash stays valid. Under hash-only authority this would re-baseline.
+    const pathB = path.join(ctx.workspace, "outbox", "report.txt");
+    fs.writeFileSync(pathB, "ADVERSARY BYTES B");
+    const shaB = sha256Hex(Buffer.from("ADVERSARY BYTES B"));
+    const mutated = {
+      ...req,
+      artifacts: [{ ...slot, source_path: pathB, sha256: shaB }],
+    };
+    ctx.store.put("telegram_delivery_request", String(req.delivery_id), mutated, Number(req.version));
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    const after = deliveries(ctx)[0]!;
+    const slotAfter = (after.artifacts as Array<Record<string, unknown>>)[0]!;
+    expect(String(slotAfter.state)).toBe("FAILED_DELIVERY");
+    expect(String(slotAfter.last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+    );
+    expect(String(after.status)).toBe("FAILED_DELIVERY");
+  });
+
+  it("R1.2 TEXT: coherent text/text_sha256/text_length rewrite → projection fails closed, zero transport", async () => {
+    const ctx = makeCtx("f4-r12t");
+    const adapter = new ScriptedAdapter("EX_A", [
+      "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    ]);
+    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "WRITE" };
+    adapter.fileContent = { T3: VI_REPORT };
+    registerAdapter(ctx, adapter);
+    const plan = reconcilePlanDataflow(textPlan(), {
+      telegramIntent: TEXT_INTENT,
+      outputLanguage: detectOutputLanguage(TEXT_GOAL),
+    }).tasks;
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: TEXT_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: plan },
+    });
+    const mid = String(m.mission_id);
+    expect(drive(ctx, mid)).toBe("COMPLETED");
+    const req = deliveries(ctx)[0]!;
+    expect(req.mode).toBe("TEXT");
+    expect(req.text_artifact_id).toBeTruthy();
+    const badText = "ADVERSARY TEXT — completely rewritten payload";
+    const mutated = {
+      ...req,
+      text: badText,
+      // Coherent rewrite: the row's own evidence fields all agree with
+      // the replaced payload — only the immutable mint receipt refutes it.
+      text_sha256: digest(badText),
+      text_length: badText.length,
+    };
+    ctx.store.put("telegram_delivery_request", String(req.delivery_id), mutated, Number(req.version));
+    const rec = recordingTransport();
+    const { sent } = await runTransport(ctx, { transport: rec.transport });
+    expect(sent).toEqual([]);
+    expect(rec.calls).toHaveLength(0);
+    const after = deliveries(ctx)[0]!;
+    expect(String(after.text_state)).toBe("FAILED_DELIVERY");
+    expect(String(after.last_error)).toBe(
+      "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+    );
+  });
+
+  it("R1.3: one producer canonically accepting report.txt AND outbox/report.txt → FAIL CLOSED ambiguity (no lexical pick)", async () => {
+    const ctx = makeCtx("f4-r13");
+    mkDualArtifactProducer(ctx, {
+      missionId: "M_R13", key: "TP", planId: "PLAN_R13",
+      nameA: "report.txt", nameB: "outbox/report.txt",
+      bytesA: "REPORT A — source name", bytesB: "REPORT B — outbox alias",
+    });
+    const task = deliveryTask(ctx, {
+      missionId: "M_R13", planId: "PLAN_R13", taskId: "TDEL_R13",
+      dependsOn: ["TP"], artifacts: ["report.txt"],
+    });
+    ctx.store.put("task", "TDEL_R13", { ...task, status: "READY", version: 0 }, 0);
+    try {
+      pinOf(ctx)(missionRow(ctx, "M_R13"), ctx.store.get("task", "TDEL_R13"));
+      expect.unreachable("ambiguous aliases must fail closed");
+    } catch (err) {
+      const dre = err as InstanceType<typeof IntegrityError> & {
+        code?: string;
+        dependency_reason?: string;
+        producer_task_id?: string;
+      };
+      expect(String(dre.message)).toContain("ambiguous_delivery_artifact");
+      expect(dre.dependency_reason).toBe("DELIVERY_ARTIFACT_PROVENANCE");
+      expect(dre.producer_task_id).toBeTruthy();
+    }
+    expect(deliveries(ctx)).toHaveLength(0);
+    // Single-alias cases still pass: producer declaring only the source
+    // name resolves exactly one canonical identity.
+    const prod = mkCanonicalProducer(ctx, {
+      missionId: "M_R13S", key: "TPS", planId: "PLAN_R13S",
+      name: "report.txt", bytes: VI_REPORT,
+    });
+    const t2 = deliveryTask(ctx, {
+      missionId: "M_R13S", planId: "PLAN_R13S", taskId: "TDEL_R13S",
+      dependsOn: ["TPS"], artifacts: ["report.txt"],
+    });
+    ctx.store.put("task", "TDEL_R13S", { ...t2, status: "READY", version: 0 }, 0);
+    pinOf(ctx)(missionRow(ctx, "M_R13S"), ctx.store.get("task", "TDEL_R13S"));
+    const pin = (
+      ctx.store.get("task", "TDEL_R13S").metadata as Record<string, unknown>
+    ).pair_delivery_artifact_digests as Record<string, Record<string, unknown>>;
+    expect(String(pin["report.txt"].artifact_id)).toBe(prod.artifactId);
+  });
+
+  it("R1.4: real restart — fresh store/services over the same durable DB deliver exactly once; inter-instance stale bytes never re-baseline", async () => {
+    const ctx = makeCtx("f4-r14");
+    const adapter = new ScriptedAdapter("EX_A", [
+      "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    ]);
+    adapter.behavior = { T1: "COMPLETE", T2: "COMPLETE", T3: "COMPLETE", T4: "WRITE", T5: "COMPLETE" };
+    adapter.fileContent = { T4: VI_REPORT };
+    registerAdapter(ctx, adapter);
+    const plan = reconcilePlanDataflow(prodPlan(), {
+      telegramIntent: detectTelegramDeliveryIntent(PROD_GOAL),
+      outputLanguage: detectOutputLanguage(PROD_GOAL),
+    }).tasks;
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: PROD_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: { pinned_plan_tasks: plan },
+    });
+    const mid = String(m.mission_id);
+    expect(drive(ctx, mid)).toBe("COMPLETED");
+    expect(deliveries(ctx)).toHaveLength(1);
+
+    // Introduce stale same-name outbox bytes BETWEEN instances — the
+    // classic contamination the durable provenance must ignore.
+    const stalePath = path.join(ctx.workspace, "outbox", "report.txt");
+    fs.writeFileSync(stalePath, "STALE BYTES — introduced across restart");
+
+    // Real restart: close the first instance entirely, reopen the SAME
+    // durable DB with fresh PairEvidenceStore / service / control.
+    const dbPath = path.join(ctx.dir, "pair.db");
+    ctx.store.close();
+    const store2 = new PairEvidenceStore(dbPath);
+    const service2 = new PairControlPlane(store2);
+    const control2 = new MissionControl({
+      service: service2,
+      runtime: ctx.runtime,
+      supervisor: ctx.supervisor,
+      scheduler: ctx.scheduler,
+      approvals: ctx.approvals,
+      reconciliation: ctx.recon,
+      observability: new MissionObservability(service2),
+      planner: (() => ({})) as never,
+    });
+    // Transport over the REOPENED store: durable canonical provenance
+    // drives the send — CAS bytes, not the contaminated outbox file.
+    const rec = recordingTransport();
+    const sent: string[] = [];
+    const pending2 = pendingTelegramDeliveries(store2) as Array<
+      Record<string, unknown>
+    >;
+    for (const req of pending2) {
+      const t = (artifact: string | null | undefined, body: Record<string, unknown>) =>
+        control2.transitionTelegramDelivery(String(req.delivery_id), {
+          artifact, ...body,
+        });
+      const r = await transportTelegramDelivery({
+        request: req,
+        transport: rec.transport,
+        isAllowed: () => true,
+        backend: {
+          begin: (a) => {
+            const rr = t(a, { to: "SENDING" }) as { acquired: boolean };
+            return { acquired: rr.acquired === true };
+          },
+          sent: (a, ev) => t(a, { to: "SENT", message_id: ev?.message_id ?? null }),
+          failed: (a, err) => t(a, { to: "FAILED", error: err }),
+          unknown: (a, err) => t(a, { to: "UNKNOWN", error: err }),
+          unsendable: (reason) => t(null, { to: "UNSENDABLE", error: reason }),
+        },
+        readText: (p) => fs.readFileSync(p, "utf8"),
+      });
+      sent.push(...r.sent);
+    }
+    expect(sent).toEqual(["report.txt"]);
+    expect(rec.calls).toHaveLength(1);
+    // Wire bytes are the CANONICAL producer bytes — the inter-instance
+    // outbox contamination never re-baselined the delivery.
+    expect(Buffer.from(rec.calls[0].fileBytes!).toString("utf8")).toBe(VI_REPORT);
+    // Exactly-once intact across the fresh instance: a second projection
+    // on the same reopened store sends nothing.
+    const again = pendingTelegramDeliveries(store2);
+    expect(again).toHaveLength(0);
+    store2.close();
   });
 });
