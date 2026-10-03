@@ -1216,6 +1216,23 @@ export function assertPlanDataflow(
   // R8 §2 — a persisted/bypassed non-delivery task carrying affirmative
   // delivery semantics fails closed at validation, before dispatch.
   assertTaskDeliveryHygiene(tasks);
+  assertPlanArtifactStructure(tasks);
+}
+
+/**
+ * F3 — THE canonical structural artifact/dataflow check shared by the
+ * goal-aware assertPlanDataflow and the pure feasibility seam
+ * (plan-feasibility.analyzePlanFeasibility). Verifies the executable
+ * artifact graph only: every consumed artifact binds exactly one earlier
+ * producer, required edges are declared, remote deps carry an explicit
+ * governed consume edge, the DAG is acyclic, and delivery tasks stay
+ * leaves. Contains NO goal/intent/language authority — those stay in
+ * assertPlanDataflow. Structural impossibility only: a missing future
+ * artifact is never a violation here.
+ */
+export function assertPlanArtifactStructure(
+  tasks: Array<Record<string, unknown>>,
+): void {
   const models = tasks.map((t) => extractTaskDataflow(t));
   const required = requiredEdges(tasks, models);
   const depsByKey = new Map<string, string[]>();

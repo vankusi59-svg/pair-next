@@ -405,7 +405,22 @@ export class PairEvidenceStore {
     source: string;
     reason: string;
     proposal: unknown;
-  }): { revision_id: string; proposal_digest: string } {
+    /** F3 — execution-meaning digest (pair-plan-semantic.v1) computed by
+     *  commitPlan over the COMMITTED task rows. Separate authority from
+     *  proposal_digest (raw planner output provenance): identical planner
+     *  proposals can differ semantically and vice-versa. Rejected replan
+     *  candidates are never revisions — they live in replan_attempt rows. */
+    plan_semantic_digest?: string;
+    /** F3 R2 — exact attempt-bound commit identity for replan commits
+     *  (pair-replan-commit.v1). Semantic digest alone is NOT a commit
+     *  receipt: it proves plan meaning, never WHICH attempt committed
+     *  this revision. Absent on non-replan commits. */
+    replan_commit?: {
+      recovery_id: string;
+      replan_attempt_id: string;
+      superseded_plan_id: string;
+    };
+  }): { revision_id: string; proposal_digest: string; plan_semantic_digest?: string } {
     const revisionId = newId("REV");
     const body = {
       revision_id: revisionId,
@@ -415,6 +430,17 @@ export class PairEvidenceStore {
       source: params.source,
       reason: params.reason,
       proposal_digest: digest(params.proposal),
+      plan_semantic_digest: params.plan_semantic_digest,
+      ...(params.replan_commit
+        ? {
+            replan_commit: {
+              contract: "pair-replan-commit.v1",
+              recovery_id: params.replan_commit.recovery_id,
+              replan_attempt_id: params.replan_commit.replan_attempt_id,
+              superseded_plan_id: params.replan_commit.superseded_plan_id,
+            },
+          }
+        : {}),
       timestamp: utcnow(),
     };
     this.db

@@ -12,6 +12,10 @@
 
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
+import {
+  structuredFailureSignatureSuffix,
+  type RecoveryFailureContext,
+} from "./plan-feasibility.js";
 import type { PairControlPlane } from "./service.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -367,6 +371,13 @@ export class RecoveryController {
        *  identical-signature retries are exactly what the grant re-arms. */
       consecutive_identical_ceiling?: number;
     };
+    /** F3 — bounded structured root-cause (pair-recovery-failure-context.v1).
+     *  When it carries a typed dependency_reason the failure signature is
+     *  extended to bind the deterministic root cause (reason + task + failed
+     *  plan semantic digest + artifact/producer identity) so the same
+     *  deterministic plan + same failure yields the same signature across
+     *  restart. Persisted verbatim on the decision receipt. */
+    failure_context?: RecoveryFailureContext | null;
   }): Record<string, unknown> {
     if (!this.enabled()) {
       throw new PolicyError("FAIL_CLOSED_RECOVERY_DISABLED", input.mission_id);
@@ -391,7 +402,9 @@ export class RecoveryController {
         error_class: input.error?.class,
         result: input.result,
       });
-    const signature = this.signatureOf(failureClass, input.executor_id, input.capability);
+    const signature =
+      this.signatureOf(failureClass, input.executor_id, input.capability) +
+      structuredFailureSignatureSuffix(input.failure_context);
     const counts = this.ledgerCounts(input.mission_id, taskId, signature);
     const now = input.now ?? utcnow();
 
@@ -519,6 +532,7 @@ export class RecoveryController {
         selected === "APPLY_VERIFIED_REMEDIATION" ? input.verified_remediation_ids![0] : null,
       evidence_refs: input.evidence_refs ?? (input.execution_id ? [input.execution_id] : []),
       settled_reconciliation: input.settled_reconciliation ?? null,
+      failure_context: input.failure_context ?? null,
       selfmod_candidate_eligible: RECOVERY_MATRIX[failureClass].may_create_selfmod_candidate === true,
       created_at: now,
       correlation_id: input.correlation_id ?? null,

@@ -34,6 +34,18 @@ export interface LlmPlannerConfig {
   env?: NodeJS.ProcessEnv | ((name: string) => string | undefined);
   /** Injectable for tests — defaults to global fetch. */
   fetchFn?: typeof fetch;
+  /** F3 — bounded structured failure context on a REPLAN: the planner must
+   *  propose a feasible ALTERNATIVE, never a semantic re-emission of the
+   *  failed plan; the rejected digests are named in the prompt. */
+  replanContext?: {
+    recovery_id?: string;
+    failure_signature?: string | null;
+    failure_class: string;
+    dependency_reason?: string | null;
+    failed_task_key?: string | null;
+    failed_plan_semantic_digest?: string | null;
+    rejected_semantic_digests?: string[];
+  };
 }
 
 export interface LlmPlanResult {
@@ -254,6 +266,7 @@ Rules:
 - VISUAL DELIVERABLES: if the goal asks for a real chart, screenshot, or image (chụp ảnh/biểu đồ/chart/screenshot), the remote task must capture it with its browser AND upload the file via the outbox endpoint described in its prompt — the file is unusable if it stays on the remote machine. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
 - TELEGRAM_DELIVERY (when ALLOWED): ONLY when the goal EXPLICITLY asks to send/deliver named output to Telegram (gửi tele/telegram, báo qua telegram, send/deliver to telegram) — never add it for a goal that merely mentions a file, an outbox, or completion. Add it as a DAG-leaf task with capability TELEGRAM_DELIVERY, depending ONLY on the tasks that produce what the goal asked to be sent. PAIR pins the delivery manifest, the canonical output language, and the final delivery instruction from the operator request — the plan does not choose what may be sent, in which language, or how. Instruction placeholder: "Stage the manifested artifacts into outbox/ unchanged, then reply DONE." (PAIR rewrites it canonically.)
 - FILE DELIVERABLES: when the goal names a file to create AND asks to send it (e.g. "tạo file X.md ... gửi telegram"), the producing task must write the file directly into outbox/<exact filename> — not the workspace root — so the delivery pipeline picks it up.
+- BYTE DEPENDENCIES: "needs the data from T2" is NOT an input — bytes are. When a task needs another task's FILE output, the PRODUCER's instruction must name the exact artifact path it writes (e.g. "write findings to report.txt") and the CONSUMER's instruction must name that same path as its input (e.g. "read report.txt") — identical names, producer earlier, consumer depends_on the producer. A consumer that only says "send the report" with no file edge consumes the producer's RESULT TEXT via dependency_outputs — valid only for local (non-remote) producers.
 - Keep task instructions concrete and verifiable; end with "then reply DONE."
 - No prose, no markdown — JSON only.`;
 
@@ -281,6 +294,20 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     `MAX_TASKS: ${maxTasks}\n` +
     (cfg.capabilitySets?.length
       ? `EXECUTOR_CAPABILITY_SETS (one executor can serve a task only when its set covers ALL the task's required_capabilities): ${cfg.capabilitySets.map((s) => `[${s.join(", ")}]`).join(" ")}\n`
+      : "") +
+    (cfg.replanContext
+      ? `\nREPLAN CONTEXT — this is a recovery replan after a governed failure:\n` +
+        `failure_class: ${cfg.replanContext.failure_class}\n` +
+        (cfg.replanContext.dependency_reason
+          ? `dependency_reason: ${cfg.replanContext.dependency_reason} (the plan's artifact/dataflow shape could not be resolved at dispatch)\n`
+          : "") +
+        (cfg.replanContext.failed_task_key
+          ? `failed_task: ${cfg.replanContext.failed_task_key}\n`
+          : "") +
+        `Do NOT re-emit the failed plan or a semantic equivalent (same topology, instructions, artifact edges, executor constraints, delivery behavior — plan_semantic_digest ${cfg.replanContext.failed_plan_semantic_digest ?? "n/a"}). ` +
+        `Previously rejected candidate digests you must not reproduce: ${(cfg.replanContext.rejected_semantic_digests ?? []).join(", ") || "none"}.\n` +
+        `Propose a genuinely different feasible plan for the SAME goal: change the artifact flow or task decomposition so the named failure cannot recur (e.g. make the needed artifact the explicit output of an earlier producer task and name the same path in the consumer's instruction). ` +
+        `Preserve every unrelated constraint (capabilities allowed, DAG rules, telegram rules) and request no wider permissions than the failed plan.\n`
       : "") +
     `\nMISSION GOAL:\n${goal}`;
 

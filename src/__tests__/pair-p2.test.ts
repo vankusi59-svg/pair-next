@@ -148,7 +148,7 @@ async function seedGovernedTask(
       {
         task_key: "T1",
         title: "read fixture + write result",
-        task_instruction: "read fixture.txt then write out/result.txt",
+        task_instruction: "write out/result.txt",
         required_capabilities: ["FILE_OPERATIONS"],
         depends_on: [],
         selected_executor: PAIR_NATIVE_EXECUTOR_ID,

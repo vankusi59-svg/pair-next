@@ -139,7 +139,7 @@ function seedMission(
       {
         task_key: "T1",
         title: "routed governed task",
-        task_instruction: "read fixture.txt then write out/result.txt",
+        task_instruction: "write out/result.txt",
         required_capabilities: opts.capabilities ?? ["FILE_OPERATIONS"],
         depends_on: [],
         metadata: opts.metadata ?? { risk_class: "LOW" },
