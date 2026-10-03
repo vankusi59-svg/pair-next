@@ -598,9 +598,12 @@ describe("P9 §36 — restart/crash recovery", () => {
   it("19. REPLAN actually invokes planner pipeline", () => {
     let calls = 0;
     const ctx = makeCtx("t19", {
-      planner: () => {
+      planner: (input: { reason?: string }) => {
         calls++;
-        return { tasks: [{ task_key: "T1", title: "v2", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }] };
+        // A replan must propose a semantically different plan — F3 rejects
+        // same-plan re-emissions as duplicates.
+        const title = input.reason === "replan" ? "v2-replanned" : "v1";
+        return { tasks: [{ task_key: "T1", title, required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }] };
       },
     });
     registerScripted(ctx, new ScriptedAdapter("EX_A"));
@@ -616,7 +619,14 @@ describe("P9 §36 — restart/crash recovery", () => {
 
   it("20. REPLAN creates new revision + 21. old plan immutable", () => {
     const ctx = makeCtx("t20", {
-      planner: () => ({ tasks: [{ task_key: "T1", title: "t", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }] }),
+      planner: (input: { reason?: string }) => ({
+        tasks: [{
+          task_key: "T1",
+          title: input.reason === "replan" ? "t-replanned" : "t",
+          required_capabilities: ["FILE_OPERATIONS"],
+          depends_on: [],
+        }],
+      }),
     });
     registerScripted(ctx, new ScriptedAdapter("EX_A"));
     const mid = startMission(ctx);

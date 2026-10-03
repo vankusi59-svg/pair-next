@@ -70,14 +70,31 @@ export const MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES = 256 * 1024 * 1024;
 
 /** Dependency-resolution failures classify deterministically as
  *  DEPENDENCY_FAILURE (the recovery classifier maps the FAIL_CLOSED_
- *  DEPENDENCY_* code family) — zero dispatch, zero executor spend. */
+ *  DEPENDENCY_* code family) — zero dispatch, zero executor spend.
+ *  F3 §16 — the error carries TYPED structured detail (dependency_reason
+ *  + bounded identities): recovery authority consumes these fields, the
+ *  human-readable message stays diagnostic-only. */
 export class DependencyResolutionError extends IntegrityError {
+  dependency_reason?: string;
+  artifact_name?: string;
+  producer_task_id?: string;
+  consumer_task_id?: string;
   constructor(
     code: string,
     detail: string,
+    context?: {
+      dependency_reason?: string;
+      artifact_name?: string;
+      producer_task_id?: string;
+      consumer_task_id?: string;
+    },
   ) {
     super(code, detail);
     this.name = "DependencyResolutionError";
+    if (context?.dependency_reason) this.dependency_reason = context.dependency_reason;
+    if (context?.artifact_name) this.artifact_name = context.artifact_name;
+    if (context?.producer_task_id) this.producer_task_id = context.producer_task_id;
+    if (context?.consumer_task_id) this.consumer_task_id = context.consumer_task_id;
   }
 }
 
@@ -323,6 +340,7 @@ export class ArtifactDependencyResolver {
       throw new DependencyResolutionError(
         "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
         `dependency_count>${MAX_DEPENDENCY_ARTIFACTS_PER_TASK}`,
+        { dependency_reason: "HANDOFF_CONTRACT_INVALID", consumer_task_id: String(task.task_id) },
       );
     }
     const missionId = String(args.mission.mission_id);
@@ -361,6 +379,7 @@ export class ArtifactDependencyResolver {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
           `consume_name_invalid:${String(rawName).slice(0, 80)}`,
+          { dependency_reason: "HANDOFF_CONTRACT_INVALID", artifact_name: String(rawName).slice(0, 80), consumer_task_id: String(task.task_id) },
         );
       }
       const producers = planTasks.filter(
@@ -373,12 +392,14 @@ export class ArtifactDependencyResolver {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
           `unbound_consume:${name}`,
+          { dependency_reason: "PLAN_DATAFLOW_UNBOUND", artifact_name: name, consumer_task_id: String(task.task_id) },
         );
       }
       if (producers.length > 1) {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
           `ambiguous_producer:${name}`,
+          { dependency_reason: "PLAN_DATAFLOW_AMBIGUOUS", artifact_name: name, consumer_task_id: String(task.task_id) },
         );
       }
       const producer = producers[0]!;
@@ -402,6 +423,14 @@ export class ArtifactDependencyResolver {
           throw new DependencyResolutionError(
             "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
             `remote_edge_artifact_missing:${name}`,
+            {
+              dependency_reason: isRemoteCapabilityTask(task)
+                ? "REMOTE_CONSUMER_ARTIFACT_MISSING"
+                : "PRODUCER_CANONICAL_ARTIFACT_MISSING",
+              artifact_name: name,
+              producer_task_id: String(producer.task_id),
+              consumer_task_id: String(task.task_id),
+            },
           );
         }
         // Local producer + local consumer without canonical artifact
@@ -415,6 +444,7 @@ export class ArtifactDependencyResolver {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
           `dependency_bytes>${MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES}`,
+          { dependency_reason: "HANDOFF_CONTRACT_INVALID", consumer_task_id: String(task.task_id) },
         );
       }
       const artifactId = String(artifact.artifact_id);
@@ -532,6 +562,7 @@ export class ArtifactDependencyResolver {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
           `contradictory_validations:${String(exec.execution_id)}`,
+          { dependency_reason: "PRODUCER_VALIDATION_UNAVAILABLE" },
         );
       }
       const pass = anchored[0];
@@ -578,6 +609,7 @@ export class ArtifactDependencyResolver {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
           `ambiguous_artifact:${logicalName}`,
+          { dependency_reason: "PLAN_DATAFLOW_AMBIGUOUS", artifact_name: logicalName },
         );
       }
       if (matches.length === 1) {
@@ -747,7 +779,8 @@ export class ArtifactHandoffService {
         throw new DependencyResolutionError(
           "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
           `${e.artifact_id}:pin_bytes_mismatch`,
-        );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
       }
       const { relParts, realWorkspace, realAllowedRoots } =
         this.resolveConsumerDest(workspace, allowedPaths, e);
@@ -773,7 +806,8 @@ export class ArtifactHandoffService {
             throw new DependencyResolutionError(
               "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
               `${e.consumer_relative_path}:conflict`,
-            );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
           }
           // Converge read bound to the SAME opened dir object —
           // [dirPath] resolves through the fd, never a mutable root
@@ -795,7 +829,8 @@ export class ArtifactHandoffService {
           throw new DependencyResolutionError(
             "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
             `${e.consumer_relative_path}:existing_bytes_differ`,
-          );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
         }
         const tmpBound = `${dirPath}/.${base}.tmp-${process.pid}-${Math.random()
           .toString(36)
@@ -815,14 +850,16 @@ export class ArtifactHandoffService {
             throw new DependencyResolutionError(
               "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
               `${e.consumer_relative_path}:tmp_object`,
-            );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
           }
           const realTmp = fs.realpathSync(`/proc/self/fd/${fh}`);
           if (!pathWithin(realTmp, parent.realPath)) {
             throw new DependencyResolutionError(
               "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
               `${e.consumer_relative_path}:tmp_outside`,
-            );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
           }
           fs.writeSync(fh, bytes);
           fs.fsyncSync(fh);
@@ -864,7 +901,8 @@ export class ArtifactHandoffService {
           throw new DependencyResolutionError(
             "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
             `${e.consumer_relative_path}:existing_bytes_differ`,
-          );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
         }
         // fsync the SAME directory object — never a reopened pathname.
         try {
@@ -875,7 +913,8 @@ export class ArtifactHandoffService {
             throw new DependencyResolutionError(
               "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
               `${e.consumer_relative_path}:dir_fsync:${code}`,
-            );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
           }
         }
         // Post-write verification of the MATERIALIZED object, bound to
@@ -891,7 +930,8 @@ export class ArtifactHandoffService {
           throw new DependencyResolutionError(
             "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
             `${e.consumer_relative_path}:post_write_mismatch`,
-          );
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
         }
         this.markState(handoff, "MATERIALIZED", governed);
         materialized.push(e.consumer_relative_path);
@@ -1249,6 +1289,7 @@ export class ArtifactHandoffService {
       throw new DependencyResolutionError(
         "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
         `${rel}:${reason}`,
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
       );
     };
     if (!rel.startsWith(`${DEPENDENCY_ARTIFACT_ROOT}/`)) {
@@ -1311,6 +1352,7 @@ export class ArtifactHandoffService {
       throw new DependencyResolutionError(
         "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
         `${rel}:${reason}`,
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
       );
     };
     if (

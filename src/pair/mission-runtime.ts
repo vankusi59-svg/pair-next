@@ -30,7 +30,7 @@
 
 import fs from "node:fs";
 import { IntegrityError, PairError, PolicyError } from "./errors.js";
-import { newId, utcnow } from "./canonical.js";
+import { digest, newId, utcnow } from "./canonical.js";
 import type { PairControlPlane } from "./service.js";
 import type { GovernedTaskGate } from "./gate.js";
 import type { MissionRouter } from "./mission-router.js";
@@ -72,6 +72,15 @@ import {
 import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
+import {
+  buildRecoveryFailureContext,
+  persistedPlanSemanticDigest,
+  canonicalPlanSemanticDigest,
+  MAX_REPLAN_CANDIDATES_PER_DECISION,
+  ReplanAttemptLedger,
+  type DependencyReason,
+  type RecoveryFailureContext,
+} from "./plan-feasibility.js";
 
 export const MISSION_RUNTIME_STATES = [
   "CREATED",
@@ -146,6 +155,18 @@ export interface RuntimePlannerInput {
   /** Tasks of the superseded revision, for replans (informational). */
   superseded_tasks?: Array<Record<string, unknown>>;
   reason: string;
+  /** F3 — structured failure context + rejected-candidate digests the
+   *  planner MUST honor on replans: propose a feasible ALTERNATIVE, never
+   *  a semantic re-emission of the failed plan. */
+  replan_context?: {
+    recovery_id: string;
+    failure_signature: string | null;
+    failure_class: string;
+    dependency_reason?: string | null;
+    failed_task_key?: string | null;
+    failed_plan_semantic_digest: string | null;
+    rejected_semantic_digests: string[];
+  };
 }
 export type RuntimePlanner = (
   input: RuntimePlannerInput,
@@ -981,7 +1002,14 @@ export class MissionRuntime {
             now,
             undefined,
             undefined,
-            { dependency_resolution_error: `${err.code}:${err.message}` },
+            {
+              dependency_resolution_error: `${err.code}:${err.message}`,
+              dependency_reason: err.dependency_reason,
+              artifact_name: err.artifact_name,
+              producer_task_id: err.producer_task_id,
+              consumer_task_id: err.consumer_task_id,
+              source_code: err.code,
+            },
           );
           return;
         }
@@ -1005,7 +1033,12 @@ export class MissionRuntime {
           now,
           undefined,
           undefined,
-          { missing_artifact: missing },
+          {
+            missing_artifact: missing,
+            dependency_reason: "LOCAL_PREREQUISITE_MISSING",
+            artifact_name: missing,
+            source_code: "FAIL_CLOSED_LOCAL_PREREQUISITE_MISSING",
+          },
         );
         return;
       }
@@ -1123,6 +1156,19 @@ export class MissionRuntime {
               taskId,
               executionId,
               "ARTIFACT_VALIDATION_FAILURE",
+              undefined,
+              undefined,
+              undefined,
+              {
+                artifact_name:
+                  typeof check.violation.artifact === "string"
+                    ? check.violation.artifact
+                    : null,
+                source_code:
+                  typeof check.violation.code === "string"
+                    ? check.violation.code
+                    : null,
+              },
             );
             return;
           }
@@ -1274,9 +1320,45 @@ export class MissionRuntime {
       failedExecutorId?: string | null;
       missing_artifact?: string | null;
       dependency_resolution_error?: string | null;
+      /** F3 — typed structured root-cause fields (bounded, never prose). */
+      dependency_reason?: DependencyReason | string | null;
+      artifact_name?: string | null;
+      producer_task_id?: string | null;
+      consumer_task_id?: string | null;
+      source_code?: string | null;
+      /** Pre-built context carried forward (e.g. replan-candidate
+       *  exhaustion re-decision — the root cause is the ORIGINAL failure,
+       *  not the candidate loop). */
+      failure_context?: RecoveryFailureContext | null;
     },
   ): void {
     const rt = this.runtimeEntity(missionId);
+    const mission = this.deps.service.getMission(missionId);
+    const taskRow = this.store.tryGet("task", taskId) as
+      | Record<string, unknown>
+      | null;
+    // F3 §19 — every recovery start binds a bounded structured root
+    // cause (recomputed from committed task rows, so pre-F3 revisions
+    // carry the same authority). A pre-built context wins when the
+    // caller carries the chain forward (apply-failure, replan
+    // exhaustion): the root cause stays the ORIGINAL failure.
+    const allTaskRows = this.deps.service.listTasks(missionId);
+    const failureContext: RecoveryFailureContext =
+      extra?.failure_context ??
+      buildRecoveryFailureContext({
+        mission,
+        task_id: taskId,
+        task: taskRow,
+        tasks: allTaskRows,
+        failure_class: failureClass,
+        dependency_reason:
+          (extra?.dependency_reason as DependencyReason | undefined) ??
+          (extra?.missing_artifact ? "LOCAL_PREREQUISITE_MISSING" : null),
+        artifact_name: extra?.artifact_name ?? extra?.missing_artifact ?? null,
+        producer_task_id: extra?.producer_task_id ?? null,
+        consumer_task_id: extra?.consumer_task_id ?? taskId,
+        source_code: extra?.source_code ?? null,
+      });
     const execution = executionId
       ? this.store.tryGet("executor_execution", executionId)
       : null;
@@ -1334,7 +1416,7 @@ export class MissionRuntime {
       failure_class: failureClass,
       eligible_executors: eligible,
       risk_class: String(
-        ((this.deps.service.getMission(missionId).metadata as Record<string, unknown>)
+        ((mission.metadata as Record<string, unknown>)
           ?.risk_ceiling as string) ?? "HIGH",
       ),
       correlation_id: `${missionId}:${taskId}`,
@@ -1346,6 +1428,7 @@ export class MissionRuntime {
       },
       settled_reconciliation: settledReconciliation ?? null,
       infeasible_actions: infeasibleActions ?? [],
+      failure_context: failureContext,
       now,
     });
     rt.pending_recovery = {
@@ -1358,6 +1441,7 @@ export class MissionRuntime {
       failure_class: failureClass,
       backoff_ms: decision.backoff_ms,
       infeasible_actions: infeasibleActions ?? [],
+      failure_context: failureContext,
       ...(extra?.missing_artifact
         ? { missing_artifact: extra.missing_artifact }
         : {}),
@@ -1831,6 +1915,11 @@ export class MissionRuntime {
         failedExecutorId:
           String((err as PairError).meta?.executor_id ?? "") ||
           (pending.executor_id ? String(pending.executor_id) : null),
+        // F3 — the apply-path defect chains off the ORIGINAL failure's
+        // root cause, never a fresh one.
+        failure_context:
+          (pending.failure_context as RecoveryFailureContext | undefined) ??
+          null,
       },
     );
   }
@@ -2788,52 +2877,212 @@ export class MissionRuntime {
 
   /* ---------------- REPLANNING -------------------------------------------- */
 
+  /**
+   * F3 §26 — bounded replan: at most MAX_REPLAN_CANDIDATES_PER_DECISION
+   * candidates per recovery decision, each persisted to the durable
+   * replan_attempt ledger BEFORE the next is requested, and every check
+   * (proposal validity, artifact/dataflow feasibility, semantic
+   * duplicate vs the failed plan + prior rejected candidates) resolves
+   * BEFORE the old plan is touched (no task cancels, no approval/timer
+   * supersede, no commit). A duplicate or infeasible candidate consumes
+   * its slot; the next planner request carries the rejected digests so
+   * a semantic re-emission cannot spend the remaining slot on the same
+   * plan shape. Exhaustion does NOT retry — the REPLAN action itself is
+   * marked infeasible and a FRESH RecoveryController decision picks the
+   * next matrix action (DEPENDENCY_FAILURE → ABORT).
+   */
   private runReplan(missionId: string): void {
     const mission = this.deps.service.getMission(missionId);
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", missionId);
     }
+    const rt = this.runtimeEntity(missionId);
+    const pending = (rt.pending_recovery ?? undefined) as
+      | Record<string, unknown>
+      | undefined;
+    const recoveryId = String(pending?.recovery_id ?? "");
+    const pendingCtx = pending?.failure_context as
+      | RecoveryFailureContext
+      | undefined;
     const advice = this.adviseSafely(mission);
     const oldPlanId = String(mission.plan_id ?? "");
-    const oldTasks = this.deps.service.listTasks(missionId).filter((t) => t.plan_id === oldPlanId);
-    const proposal = this.deps.planner({
-      mission,
-      advice: advice ?? null,
-      superseded_tasks: oldTasks,
-      reason: "replan",
-    });
+    const allTasks = this.deps.service.listTasks(missionId);
+    const oldTasks = allTasks.filter((t) => t.plan_id === oldPlanId);
+    const allTaskRows = allTasks as Array<Record<string, unknown>>;
+    // Failed-plan semantic authority: the pending failure context carries
+    // it when the failure was structured; otherwise recompute from the
+    // committed task rows (pre-F3 revisions carry the same meaning).
+    const failedDigest =
+      pendingCtx?.plan_semantic_digest ??
+      persistedPlanSemanticDigest({
+        store: this.store,
+        mission,
+        tasks: allTaskRows,
+      });
+    const ledger = new ReplanAttemptLedger(this.store);
+    const rejectedDigests = new Set(
+      ledger.rejectedCandidateDigests(recoveryId),
+    );
+    const forbidden = new Set<string>([
+      ...(failedDigest ? [failedDigest] : []),
+      ...rejectedDigests,
+    ]);
     const knownCaps = new Set(
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
-    const tasks = validatePlanProposal(proposal, knownCaps);
-    // Incident R1 — a replan is a new committed plan: same data-flow gate,
-    // and the same R8 delivery plan-shape re-proof (intent↔presence +
-    // instruction hygiene against the operator request).
-    assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(mission.goal),
-      outputLanguage: detectOutputLanguage(mission.goal),
-    });
-    // Old revision stays immutable; unfinished old tasks are settled as
-    // CANCELLED (never silently reset), pending approvals/timers superseded.
-    for (const t of oldTasks) {
-      if (!SETTLED_TASK.has(String(t.status))) {
-        this.deps.service.updateTask(String(t.task_id), {
-          status: "CANCELLED",
-          cancel_reason: "PLAN_SUPERSEDED",
-        });
+    const decisionRow = recoveryId
+      ? (this.store.tryGet("recovery_decision", recoveryId) as
+          | Record<string, unknown>
+          | null)
+      : null;
+    const failedTaskKey =
+      pendingCtx?.task_key ??
+      (() => {
+        const t = allTaskRows.find(
+          (x) => String(x.task_id) === String(pending?.task_id ?? ""),
+        );
+        return t?.task_key != null ? String(t.task_key) : null;
+      })();
+
+    while (
+      ledger.attemptsUsed(recoveryId) < MAX_REPLAN_CANDIDATES_PER_DECISION
+    ) {
+      const attemptIndex = ledger.attemptsUsed(recoveryId);
+      const proposal = this.deps.planner({
+        mission,
+        advice: advice ?? null,
+        superseded_tasks: oldTasks,
+        reason: "replan",
+        replan_context: {
+          recovery_id: recoveryId,
+          failure_signature:
+            decisionRow?.failure_signature != null
+              ? String(decisionRow.failure_signature)
+              : null,
+          failure_class: String(pending?.failure_class ?? ""),
+          dependency_reason: pendingCtx?.dependency_reason ?? null,
+          failed_task_key: failedTaskKey,
+          failed_plan_semantic_digest: failedDigest,
+          rejected_semantic_digests: [...rejectedDigests],
+        },
+      });
+      let tasks: Array<Record<string, unknown>> | null = null;
+      let candidateDigest: string | null = null;
+      let status:
+        | "ACCEPTED"
+        | "REJECTED_DUPLICATE"
+        | "REJECTED_FEASIBILITY"
+        | "REJECTED_INVALID" = "ACCEPTED";
+      let rejectionReason: string | null = null;
+      try {
+        const validated = validatePlanProposal(proposal, knownCaps);
+        // Same data-flow + delivery plan-shape proof as the initial plan
+        // (R1/R8) — feasibility for candidate accounting is structural.
+        assertPlanDataflow(
+          validated as unknown as Array<Record<string, unknown>>,
+          {
+            telegramIntent: detectTelegramDeliveryIntent(mission.goal),
+            outputLanguage: detectOutputLanguage(mission.goal),
+          },
+        );
+        tasks = validated as unknown as Array<Record<string, unknown>>;
+        candidateDigest = canonicalPlanSemanticDigest(tasks);
+        if (forbidden.has(candidateDigest)) {
+          status = "REJECTED_DUPLICATE";
+          rejectionReason = "PLAN_SEMANTIC_DUPLICATE";
+        }
+      } catch (err) {
+        const code = String(
+          (err as { code?: string })?.code ?? "PLAN_REJECTED",
+        );
+        status =
+          code === "FAIL_CLOSED_PLAN_FEASIBILITY" ||
+          code.startsWith("FAIL_CLOSED_PLAN_DATAFLOW")
+            ? "REJECTED_FEASIBILITY"
+            : "REJECTED_INVALID";
+        rejectionReason = code;
+        // The semantic digest of a rejected candidate still binds its
+        // shape when computable — an identical semantic re-emission is
+        // caught even when the rejection was for validity, not dataflow.
+        try {
+          const raw = (proposal as { tasks?: unknown[] })?.tasks;
+          if (Array.isArray(raw)) {
+            candidateDigest = canonicalPlanSemanticDigest(
+              raw as Array<Record<string, unknown>>,
+            );
+          }
+        } catch {
+          candidateDigest = null;
+        }
       }
+      // Persist rejection/acceptance BEFORE advancing candidates — the
+      // ledger row is durable evidence; a crash between candidate and
+      // commit replays the same bounded slot, never an unbounded retry.
+      ledger.record({
+        mission_id: missionId,
+        recovery_id: recoveryId,
+        failure_signature:
+          decisionRow?.failure_signature != null
+            ? String(decisionRow.failure_signature)
+            : null,
+        failed_plan_semantic_digest: failedDigest,
+        attempt_index: attemptIndex,
+        proposal_digest: digest(proposal),
+        candidate_plan_semantic_digest: candidateDigest,
+        status,
+        rejection_reason: rejectionReason,
+      });
+      if (status !== "ACCEPTED") {
+        if (candidateDigest) {
+          rejectedDigests.add(candidateDigest);
+          forbidden.add(candidateDigest);
+        }
+        continue;
+      }
+      // ACCEPTED — only NOW does the old plan mutate (F3 §22).
+      for (const t of oldTasks) {
+        if (!SETTLED_TASK.has(String(t.status))) {
+          this.deps.service.updateTask(String(t.task_id), {
+            status: "CANCELLED",
+            cancel_reason: "PLAN_SUPERSEDED",
+          });
+        }
+      }
+      this.deps.approvals.supersede(missionId, undefined, "PLAN_SUPERSEDED");
+      this.deps.scheduler.supersedePending(missionId, "PLAN_SUPERSEDED");
+      this.deps.service.commitPlan({
+        mission_id: missionId,
+        tasks: tasks!,
+        source: "AUTOMATON_PLANNER",
+        reason: "replan",
+        proposal,
+      });
+      this.clearPendingRecovery(missionId, "CANCELLED", "replan_committed");
+      this.transitionRuntime(missionId, "READY", "replan_committed");
+      return;
     }
-    this.deps.approvals.supersede(missionId, undefined, "PLAN_SUPERSEDED");
-    this.deps.scheduler.supersedePending(missionId, "PLAN_SUPERSEDED");
-    this.deps.service.commitPlan({
-      mission_id: missionId,
-      tasks: tasks as unknown as Array<Record<string, unknown>>,
-      source: "AUTOMATON_PLANNER",
-      reason: "replan",
-      proposal,
-    });
-    this.clearPendingRecovery(missionId, "CANCELLED", "replan_committed");
-    this.transitionRuntime(missionId, "READY", "replan_committed");
+
+    // Candidates exhausted — the REPLAN action is itself infeasible for
+    // this failure chain; a FRESH RecoveryController decision picks the
+    // next valid action (never another same-signature replan loop).
+    const priorInfeasible =
+      (pending?.infeasible_actions as
+        | Array<{ action: RecoveryAction; reason: string }>
+        | undefined) ?? [];
+    this.startRecovery(
+      missionId,
+      String(pending?.task_id ?? ""),
+      pending?.execution_id != null ? String(pending.execution_id) : null,
+      (pending?.failure_class as ReturnType<typeof classifyFailure>) ??
+        "DEPENDENCY_FAILURE",
+      undefined,
+      undefined,
+      [
+        ...priorInfeasible.filter((e) => e.action !== "REPLAN"),
+        { action: "REPLAN", reason: "FAIL_CLOSED_REPLAN_CANDIDATES_EXHAUSTED" },
+      ],
+      { failure_context: pendingCtx ?? null },
+    );
   }
 
   /* ---------------- WAITING_APPROVAL -------------------------------------- */

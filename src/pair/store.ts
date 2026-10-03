@@ -405,7 +405,13 @@ export class PairEvidenceStore {
     source: string;
     reason: string;
     proposal: unknown;
-  }): { revision_id: string; proposal_digest: string } {
+    /** F3 — execution-meaning digest (pair-plan-semantic.v1) computed by
+     *  commitPlan over the COMMITTED task rows. Separate authority from
+     *  proposal_digest (raw planner output provenance): identical planner
+     *  proposals can differ semantically and vice-versa. Rejected replan
+     *  candidates are never revisions — they live in replan_attempt rows. */
+    plan_semantic_digest?: string;
+  }): { revision_id: string; proposal_digest: string; plan_semantic_digest?: string } {
     const revisionId = newId("REV");
     const body = {
       revision_id: revisionId,
@@ -415,6 +421,7 @@ export class PairEvidenceStore {
       source: params.source,
       reason: params.reason,
       proposal_digest: digest(params.proposal),
+      plan_semantic_digest: params.plan_semantic_digest,
       timestamp: utcnow(),
     };
     this.db

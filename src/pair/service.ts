@@ -18,6 +18,7 @@ import {
   ArtifactHandoffService,
 } from "./artifact-handoff.js";
 import { CostService } from "./cost.js";
+import { analyzePlanFeasibility, canonicalPlanSemanticDigest } from "./plan-feasibility.js";
 import { SecretPolicyService } from "./secret-policy.js";
 import { RouteRegistry } from "./route-registry.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -258,7 +259,12 @@ export class PairControlPlane {
     return saved;
   }
 
-  /** Record a validated proposal as a new active plan revision. */
+  /** Record a validated proposal as a new active plan revision.
+   *  F3 §12 — the commit boundary re-proves structural artifact/dataflow
+   *  feasibility on the proposal itself (independent of executor health)
+   *  and persists the pair-plan-semantic.v1 digest computed over the
+   *  COMMITTED task rows, so the persisted plan is what carries semantic
+   *  authority — never a derived approximation. */
   commitPlan(params: {
     mission_id: string;
     tasks: Array<Record<string, unknown>>;
@@ -266,11 +272,13 @@ export class PairControlPlane {
     reason?: string;
     proposal: unknown;
   }): { plan_id: string; revision: number; task_ids: string[] } {
+    analyzePlanFeasibility(params.tasks);
     const mission = this.getMission(params.mission_id);
     const revisions = this.store.planRevisions(params.mission_id);
     const revision = revisions.length + 1;
     const planId = newId("PLN");
     const taskIds: string[] = [];
+    const committedTasks: Array<Record<string, unknown>> = [];
     for (const [index, t] of params.tasks.entries()) {
       const taskId = newId("TSK");
       taskIds.push(taskId);
@@ -285,6 +293,10 @@ export class PairControlPlane {
         task_instruction: String(t.task_instruction ?? t.description ?? t.title ?? ""),
         required_capabilities: t.required_capabilities ?? [],
         selected_executor: t.selected_executor ?? null,
+        // F3 — the planner-declared executor pin, frozen at commit.
+        // Routing later overwrites selected_executor with the resolved
+        // binding; the semantic digest must always see the PLAN pin.
+        planner_selected_executor: t.selected_executor ?? null,
         status: "READY",
         metadata: t.metadata ?? {},
         depends_on: t.depends_on ?? [],
@@ -292,7 +304,9 @@ export class PairControlPlane {
         version: 0,
       };
       this.store.put("task", taskId, task, 0);
+      committedTasks.push(task);
     }
+    const planSemanticDigest = canonicalPlanSemanticDigest(committedTasks);
     this.store.put(
       "plan",
       planId,
@@ -314,6 +328,7 @@ export class PairControlPlane {
       source: params.source,
       reason: params.reason ?? "PLAN_COMMIT",
       proposal: params.proposal,
+      plan_semantic_digest: planSemanticDigest,
     });
     mission.plan_id = planId;
     mission.plan_state = "PLANNED";
@@ -328,6 +343,7 @@ export class PairControlPlane {
       metadata: {
         revision,
         task_ids: taskIds,
+        plan_semantic_digest: planSemanticDigest,
         plan_manifest_digest: planManifestDigest({
           mission_id: params.mission_id,
           plan_id: planId,

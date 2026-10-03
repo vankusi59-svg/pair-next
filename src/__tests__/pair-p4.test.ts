@@ -126,7 +126,7 @@ function seedMission(ctx: Ctx, opts: { permissions?: string[] } = {}) {
       {
         task_key: "T1",
         title: "p4 governed task",
-        task_instruction: "read fixture.txt write out/result.txt",
+        task_instruction: "write out/result.txt",
         required_capabilities: ["FILE_OPERATIONS"],
         depends_on: [],
         metadata: { risk_class: "LOW" },
