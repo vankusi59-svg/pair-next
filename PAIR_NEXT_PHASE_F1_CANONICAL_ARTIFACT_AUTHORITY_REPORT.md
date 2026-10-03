@@ -263,7 +263,7 @@ CURRENT_STATE.md
 **Mandate:** `pasted-1790991806129.txt` — source-review of R1 HEAD `bb7b24fe2d250ba456aa198da7aed2062314dd07` found 4 HIGH + 2 MEDIUM + 1 TEST-GOVERNANCE finding. Same PR #31, no merge.
 
 - **Previous R1 HEAD:** `bb7b24f`
-- **New HEAD:** `<pending>`
+- **New HEAD:** `bdebdde06f4c33f7267f26b3d9b3b89dc908ae6a`
 - **Fix classification:** `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R2_PENDING_SOURCE_REVIEW`
 
 ## Per-finding RCA + closure
