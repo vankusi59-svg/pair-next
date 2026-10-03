@@ -271,7 +271,15 @@ export class PairControlPlane {
     source: string;
     reason?: string;
     proposal: unknown;
-  }): { plan_id: string; revision: number; task_ids: string[] } {
+    /** F3 R2 — exact attempt-bound commit identity (replan commits
+     *  only). Persisted on the revision so a commit receipt proves
+     *  WHICH replan attempt committed it, never just shared semantics. */
+    replan_commit?: {
+      recovery_id: string;
+      replan_attempt_id: string;
+      superseded_plan_id: string;
+    };
+  }): { plan_id: string; revision: number; task_ids: string[]; plan_semantic_digest: string } {
     analyzePlanFeasibility(params.tasks);
     const mission = this.getMission(params.mission_id);
     const revisions = this.store.planRevisions(params.mission_id);
@@ -328,6 +336,7 @@ export class PairControlPlane {
       reason: params.reason ?? "PLAN_COMMIT",
       proposal: params.proposal,
       plan_semantic_digest: planSemanticDigest,
+      ...(params.replan_commit ? { replan_commit: params.replan_commit } : {}),
     });
     mission.plan_id = planId;
     mission.plan_state = "PLANNED";
@@ -351,7 +360,7 @@ export class PairControlPlane {
         }),
       },
     });
-    return { plan_id: planId, revision, task_ids: taskIds };
+    return { plan_id: planId, revision, task_ids: taskIds, plan_semantic_digest: planSemanticDigest };
   }
 
   getTask(taskId: string): Record<string, unknown> {

@@ -428,6 +428,66 @@ export function replanAttemptId(
   return `RPA_${digest(`pair-replan-attempt.v1|${recoveryId}|${attemptIndex}`).slice(0, 24)}`;
 }
 
+/** F3 R2 — exact attempt-bound commit identity persisted on a replan
+ *  plan revision. A semantic digest proves plan MEANING, never which
+ *  recovery/attempt committed a revision or whether it superseded the
+ *  failed plan — so receipt lookup is exact binding, never a digest
+ *  scan over history. */
+export const REPLAN_COMMIT_CONTRACT = "pair-replan-commit.v1";
+
+/** TRUE only when the revision's attempt-bound commit identity matches
+ *  the attempt EXACTLY: same mission, recovery, attempt, superseded
+ *  plan, and semantic digest. Anything short of exact binding is not
+ *  evidence this attempt committed the revision. */
+export function revisionBoundToAttempt(
+  revision: Record<string, unknown>,
+  attempt: ReplanAttemptRecord,
+): boolean {
+  const rc = revision.replan_commit as
+    | {
+        contract?: unknown;
+        recovery_id?: unknown;
+        replan_attempt_id?: unknown;
+        superseded_plan_id?: unknown;
+      }
+    | null
+    | undefined;
+  return (
+    rc != null &&
+    rc.contract === REPLAN_COMMIT_CONTRACT &&
+    String(rc.replan_attempt_id) === attempt.replan_attempt_id &&
+    String(rc.recovery_id) === attempt.recovery_id &&
+    String(rc.superseded_plan_id) === String(attempt.superseded_plan_id ?? "") &&
+    String(revision.mission_id) === attempt.mission_id &&
+    String(revision.plan_semantic_digest) ===
+      String(attempt.candidate_plan_semantic_digest ?? "")
+  );
+}
+
+/** §5 — exact commit-receipt validation: an ACCEPTED attempt's receipt
+ *  must name a revision that exists and is bound to THIS attempt. */
+export function assertReplanCommitReceipt(
+  revisions: Array<Record<string, unknown>>,
+  attempt: ReplanAttemptRecord,
+): Record<string, unknown> {
+  const receipt = attempt.commit_receipt;
+  const rev =
+    receipt != null
+      ? revisions.find(
+          (r) =>
+            String(r.plan_id) === String(receipt.plan_id) &&
+            Number(r.revision) === Number(receipt.revision),
+        )
+      : undefined;
+  if (!rev || !revisionBoundToAttempt(rev, attempt)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_REPLAN_COMMIT_RECEIPT",
+      `${attempt.replan_attempt_id}:${receipt?.plan_id ?? "none"}@${receipt?.revision ?? "none"}`,
+    );
+  }
+  return rev;
+}
+
 /**
  * Durable bounded ledger of replan candidates for ONE recovery decision
  * (rejection evidence is governance evidence, not plan revisions).
@@ -584,7 +644,11 @@ export class ReplanAttemptLedger {
       if (
         r &&
         String(r.plan_id) === String(receipt.plan_id) &&
-        Number(r.revision) === Number(receipt.revision)
+        Number(r.revision) === Number(receipt.revision) &&
+        String(r.plan_semantic_digest) ===
+          String(receipt.plan_semantic_digest) &&
+        String(receipt.plan_semantic_digest) ===
+          String(existing.candidate_plan_semantic_digest)
       ) {
         return existing; // idempotent finalize replay
       }
@@ -597,6 +661,18 @@ export class ReplanAttemptLedger {
       throw new IntegrityError(
         "FAIL_CLOSED_REPLAN_ATTEMPT_SLOT_CONFLICT",
         `${replanAttemptIdValue}:${existing.status}->ACCEPTED`,
+      );
+    }
+    // F3 R2 §6 — the receipt's semantic digest MUST equal the prepared
+    // candidate's: same plan_id/revision with a different digest is a
+    // deterministic integrity violation, never a converge.
+    if (
+      String(receipt.plan_semantic_digest) !==
+      String(existing.candidate_plan_semantic_digest)
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_REPLAN_ATTEMPT_SLOT_CONFLICT",
+        `${replanAttemptIdValue}:receipt_digest_mismatch`,
       );
     }
     const updated: ReplanAttemptRecord = {

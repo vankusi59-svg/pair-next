@@ -315,3 +315,73 @@ time regardless of actual provider availability.
 
 **Classification:**
 `PAIR_NEXT_PHASE_F3_PLANNER_RECOVERY_ARTIFACT_DATAFLOW_CLOSURE_R1_PENDING_SOURCE_REVIEW`
+
+# R2 FINAL REPLAN COMMIT-RECEIPT AUTHORITY CLOSURE (post-R1 audit)
+
+Finding: `commitCandidate` adopted any historical revision sharing the
+candidate's semantic digest (excluding only the superseded plan_id).
+Semantic digest proves plan MEANING — never which recovery/attempt
+committed a revision. With history rev1=Plan B, rev2=Plan A (failed),
+a replan proposing Plan B adopted rev1 as "its" commit, bound the
+receipt to a revision it never wrote, superseded Plan A, and cleared
+recovery while no active Plan-B commit ever happened.
+
+## R2 changes
+
+- `mission_plan_revision` now carries `replan_commit` —
+  `pair-replan-commit.v1` {recovery_id, replan_attempt_id,
+  superseded_plan_id} — written by `commitPlan({replan_commit})`
+  (replan commits only; absent on non-replan commits).
+- The historical digest scan is REMOVED. Receipt discovery is exact
+  attempt-bound only: `revisionBoundToAttempt` requires revision's
+  replan_commit.recovery_id/replan_attempt_id/superseded_plan_id +
+  mission_id + plan_semantic_digest to equal the attempt's facts.
+- `assertReplanCommitReceipt` (§5): an ACCEPTED attempt's receipt must
+  name a revision that EXISTS and binds THIS attempt — receipt naming
+  a foreign/unbound revision fails closed
+  (`FAIL_CLOSED_REPLAN_COMMIT_RECEIPT`).
+- `commitPlan` returns `plan_semantic_digest`; the commit path re-proves
+  persisted digest == prepared candidate digest
+  (`FAIL_CLOSED_REPLAN_COMMIT_DIGEST`) and re-fetches the created
+  revision to verify the binding before markCommitted.
+- `markCommitted` strengthened (§6): PREPARED→ACCEPTED requires
+  receipt.plan_semantic_digest == candidate_plan_semantic_digest;
+  ACCEPTED replay must match plan_id + revision + digest — same
+  plan_id/revision with a wrong digest is SLOT_CONFLICT.
+- Concurrent resume (§8): the attempt row is RE-READ inside
+  `store.immediate`; a slower writer holding a stale PREPARED snapshot
+  sees ACCEPTED, verifies the exact bound receipt, converges with zero
+  writes — never a second revision.
+- Prior C2 (digest-only adoption) rewritten to commit with attempt
+  binding — per §11, digest-only adoption is not preserved.
+
+## R2 tests (pair-f3-r2-remediation.test.ts — 10/10)
+
+- H1 (the bug): rev1=Plan B, rev2=Plan A active+invalidated, replan
+  proposes Plan B → revision 3 committed with exact attempt binding;
+  rev1 stays historical, rev2 tasks superseded, mission.plan_id=rev3.
+- H2: same-digest revision bound to a foreign recovery/attempt →
+  ignored; exact candidate committed once.
+- H3: MULTIPLE same-digest historical revisions → none adopted.
+- H4: PREPARED without binding → exact commit once + receipt.
+- H5: restart with PREPARED → one commit, zero planner calls.
+- H6: bound revision + receipt exist → converge, zero second revision.
+- H7: receipt wrong digest (same plan_id/revision) → SLOT_CONFLICT.
+- H8: receipt names revision bound to another recovery → RECEIPT fail.
+- H9: receipt names revision bound to another attempt in the same
+  recovery → RECEIPT fail.
+- H10: two concurrent resumes of one PREPARED snapshot → exactly one
+  new revision, both converge on the same ACCEPTED receipt.
+
+## R2 validation
+
+- R2 10/10; R1 20/20; F3 20+17; incident 106; phase-d recovery 37;
+  F2 R1–R4 + contract 152; F1 140 incl. rm -rf dist race proofs;
+  focused batch 416/416.
+- `rm -rf dist` + `pnpm build` PASS; `npx tsc --noEmit` 0 errors;
+  `pnpm audit --audit-level=high` clean (1 low / 8 moderate — none high).
+- Full regression 3175 pass / 2 fail — only the base-reproduced
+  environment-only P5 probe tests.
+
+**Classification:**
+`PAIR_NEXT_PHASE_F3_PLANNER_RECOVERY_ARTIFACT_DATAFLOW_CLOSURE_R2_PENDING_SOURCE_REVIEW`

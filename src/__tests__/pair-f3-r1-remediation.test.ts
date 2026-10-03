@@ -568,7 +568,7 @@ describe("F3 R1 C — crash windows of the replan commit", () => {
     store2.close();
   });
 
-  it("C2. committed revision lacking a receipt (legacy window) — restart binds the receipt, NEVER a second commit", () => {
+  it("C2. attempt-bound revision lacking a receipt (R2 binding) — restart binds the receipt, NEVER a second commit", () => {
     const ctx = makeCtx("c2", () => incidentPlan());
     ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }, { status: "COMPLETED" }]), ["FILE_OPERATIONS"]);
     const mid = ctx.startMission();
@@ -602,12 +602,21 @@ describe("F3 R1 C — crash windows of the replan commit", () => {
       source: "AUTOMATON_PLANNER",
       reason: "replan",
       proposal: candidate,
+      // F3 R2 — the commit is bound to THIS attempt: the revision is
+      // findable only through exact attempt-bound evidence, never a
+      // semantic-digest scan.
+      replan_commit: {
+        recovery_id: recoveryId,
+        replan_attempt_id: prepared.replan_attempt_id,
+        superseded_plan_id: String(ctx.service.getMission(mid).plan_id),
+      },
     });
     expect(direct.revision).toBe(2);
     ctx.store.close();
 
     // Restart — runReplan sees the PREPARED row, finds the revision by
-    // digest, binds the receipt: no second commit, no planner call.
+    // EXACT attempt binding, binds the receipt: no second commit, no
+    // planner call.
     const { store2, calls2, drive2, service2 } = rebuild(ctx, () => incidentPlan());
     expect(drive2(mid)).toBe("COMPLETED");
     expect(calls2.filter((c) => c.reason === "replan")).toHaveLength(0);

@@ -73,11 +73,13 @@ import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
 import {
+  assertReplanCommitReceipt,
   buildRecoveryFailureContext,
   persistedPlanSemanticDigest,
   canonicalPlanSemanticDigest,
   MAX_REPLAN_CANDIDATES_PER_DECISION,
   ReplanAttemptLedger,
+  revisionBoundToAttempt,
   type DependencyReason,
   type RecoveryFailureContext,
   type ReplanAttemptRecord,
@@ -2953,73 +2955,8 @@ export class MissionRuntime {
      * attempt flips ACCEPTED only with a durable commit receipt bound
      * to the plan revision, and supersession/finalize converges
      * idempotently on replay. */
-    const commitCandidate = (prepared: ReplanAttemptRecord): void => {
-      // R1.3 — ONE atomic transaction (BEGIN IMMEDIATE … COMMIT): the
-      // plan commit + attempt receipt + old-plan supersession + pending
-      // clear + READY transition land together or not at all. A crash
-      // inside rolls back EVERYTHING except the already-durable PREPARED
-      // row — old plan intact, candidate prepared; a crash after leaves
-      // the committed revision discoverable by digest on restart.
-      this.store.immediate(() => {
-        const revisions = this.store.planRevisions(missionId);
-        // The receipt must bind a NEW revision — never the superseded
-        // plan's own row: a legitimate replan restoring the committed
-        // semantics shares the failed plan's digest (post-commit row
-        // mutation changed the LIVE rows, not the committed contract),
-        // so plan_id exclusion is required, not just digest matching.
-        const committedRev = revisions.find(
-          (r) =>
-            r.plan_semantic_digest != null &&
-            String(r.plan_semantic_digest) ===
-              String(prepared.candidate_plan_semantic_digest ?? "") &&
-            String(r.plan_id) !== String(prepared.superseded_plan_id ?? ""),
-        );
-        if (committedRev) {
-          // Commit already landed before the crash — bind the receipt,
-          // never commit a second revision.
-          ledger.markCommitted(prepared.replan_attempt_id, {
-            plan_id: String(committedRev.plan_id),
-            revision: Number(committedRev.revision),
-            plan_semantic_digest:
-              prepared.candidate_plan_semantic_digest ?? null,
-          });
-        } else {
-          const res = this.deps.service.commitPlan({
-            mission_id: missionId,
-            tasks: (prepared.prepared_tasks ??
-              []) as Array<Record<string, unknown>>,
-            source: "AUTOMATON_PLANNER",
-            reason: "replan",
-            proposal:
-              prepared.prepared_proposal ?? { tasks: prepared.prepared_tasks },
-          });
-          ledger.markCommitted(prepared.replan_attempt_id, {
-            plan_id: res.plan_id,
-            revision: res.revision,
-            plan_semantic_digest:
-              prepared.candidate_plan_semantic_digest ?? null,
-          });
-        }
-        // Old-plan supersession — deterministic and idempotent; runs
-        // only after the new plan revision provably exists.
-        const supersededPlanId = String(prepared.superseded_plan_id ?? "");
-        for (const t of this.deps.service.listTasks(missionId)) {
-          if (
-            String(t.plan_id) === supersededPlanId &&
-            !SETTLED_TASK.has(String(t.status))
-          ) {
-            this.deps.service.updateTask(String(t.task_id), {
-              status: "CANCELLED",
-              cancel_reason: "PLAN_SUPERSEDED",
-            });
-          }
-        }
-        this.deps.approvals.supersede(missionId, undefined, "PLAN_SUPERSEDED");
-        this.deps.scheduler.supersedePending(missionId, "PLAN_SUPERSEDED");
-        this.clearPendingRecovery(missionId, "CANCELLED", "replan_committed");
-        this.transitionRuntime(missionId, "READY", "replan_committed");
-      });
-    };
+    const commitCandidate = (prepared: ReplanAttemptRecord): void =>
+      this.commitPreparedReplan(missionId, prepared, ledger);
 
     // A durably-prepared candidate finishes its EXACT commit first —
     // no planner call, no replacement candidate, never a second commit.
@@ -3186,6 +3123,120 @@ export class MissionRuntime {
       ],
       { failure_context: pendingCtx ?? null },
     );
+  }
+
+  /* F3 R1.3 + R2 — crash-safe replan commit with EXACT attempt-bound
+   * receipt authority. The passed attempt row may be stale (a slower
+   * writer may have committed already), so the row is RE-READ inside
+   * the writer-serialized transaction:
+   *   ACCEPTED → verify the exact attempt-bound receipt → converge
+   *   (the committing transaction already landed supersession + clear
+   *   + READY atomically — zero writes needed).
+   *   PREPARED → find a revision bound to THIS attempt
+   *   (pair-replan-commit.v1: recovery + attempt + superseded +
+   *   mission + semantic digest — NEVER a digest scan over history)
+   *   or commit the prepared candidate exactly once. */
+  private commitPreparedReplan(
+    missionId: string,
+    prepared: ReplanAttemptRecord,
+    ledger: ReplanAttemptLedger,
+  ): void {
+    // ONE atomic transaction (BEGIN IMMEDIATE … COMMIT): commit +
+    // receipt + old-plan supersession + pending clear + READY land
+    // together or not at all. A crash inside rolls back EVERYTHING
+    // except the already-durable PREPARED row.
+    this.store.immediate(() => {
+      const fresh = this.store.tryGet(
+        "replan_attempt",
+        prepared.replan_attempt_id,
+      ) as ReplanAttemptRecord | null;
+      if (!fresh) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_REPLAN_ATTEMPT_MISSING",
+          prepared.replan_attempt_id,
+        );
+      }
+      const revisions = () => this.store.planRevisions(missionId);
+      if (fresh.status === "ACCEPTED") {
+        // §5/§8 — converge ONLY through exact attempt-bound evidence:
+        // the receipt must name a revision bound to THIS attempt.
+        assertReplanCommitReceipt(revisions(), fresh);
+        return;
+      }
+      if (fresh.status !== "PREPARED") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_REPLAN_ATTEMPT_SLOT_CONFLICT",
+          `${fresh.replan_attempt_id}:${fresh.status}`,
+        );
+      }
+      // §3 — exact attempt-bound binding; semantic digest alone is
+      // never a commit receipt (a historical revision may share the
+      // candidate's semantics yet belong to no recovery/attempt).
+      let bound =
+        revisions().find((r) => revisionBoundToAttempt(r, fresh)) ?? null;
+      if (!bound) {
+        const res = this.deps.service.commitPlan({
+          mission_id: missionId,
+          tasks: (fresh.prepared_tasks ??
+            []) as Array<Record<string, unknown>>,
+          source: "AUTOMATON_PLANNER",
+          reason: "replan",
+          proposal:
+            fresh.prepared_proposal ?? { tasks: fresh.prepared_tasks },
+          replan_commit: {
+            recovery_id: fresh.recovery_id,
+            replan_attempt_id: fresh.replan_attempt_id,
+            superseded_plan_id: String(fresh.superseded_plan_id ?? ""),
+          },
+        });
+        // §7 — prove what was persisted equals the prepared candidate:
+        // a commit transformation is an integrity violation.
+        if (
+          String(res.plan_semantic_digest) !==
+          String(fresh.candidate_plan_semantic_digest)
+        ) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_REPLAN_COMMIT_DIGEST",
+            `${fresh.replan_attempt_id}:${res.plan_id}`,
+          );
+        }
+        bound =
+          revisions().find(
+            (r) =>
+              String(r.plan_id) === String(res.plan_id) &&
+              Number(r.revision) === Number(res.revision),
+          ) ?? null;
+        if (!bound || !revisionBoundToAttempt(bound, fresh)) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_REPLAN_COMMIT_RECEIPT",
+            `${fresh.replan_attempt_id}:${res.plan_id}@${res.revision}`,
+          );
+        }
+      }
+      ledger.markCommitted(fresh.replan_attempt_id, {
+        plan_id: String(bound.plan_id),
+        revision: Number(bound.revision),
+        plan_semantic_digest: String(bound.plan_semantic_digest),
+      });
+      // Old-plan supersession — deterministic and idempotent; runs only
+      // after the new plan revision provably exists.
+      const supersededPlanId = String(fresh.superseded_plan_id ?? "");
+      for (const t of this.deps.service.listTasks(missionId)) {
+        if (
+          String(t.plan_id) === supersededPlanId &&
+          !SETTLED_TASK.has(String(t.status))
+        ) {
+          this.deps.service.updateTask(String(t.task_id), {
+            status: "CANCELLED",
+            cancel_reason: "PLAN_SUPERSEDED",
+          });
+        }
+      }
+      this.deps.approvals.supersede(missionId, undefined, "PLAN_SUPERSEDED");
+      this.deps.scheduler.supersedePending(missionId, "PLAN_SUPERSEDED");
+      this.clearPendingRecovery(missionId, "CANCELLED", "replan_committed");
+      this.transitionRuntime(missionId, "READY", "replan_committed");
+    });
   }
 
   /* ---------------- WAITING_APPROVAL -------------------------------------- */
