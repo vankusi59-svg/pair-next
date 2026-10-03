@@ -457,16 +457,72 @@ export class ArtifactAuthority {
     // validation. Deriving it from current mutable rows would be
     // fail-open — a mutated/moved/deleted row would simply vanish from
     // the set and let a result pass around it.
-    const expected = new Set<string>();
+    // R7.2 — an ARTIFACT_ACCEPTED event binds the accepted artifact's
+    // identity AND its accepted content as immutable facts; malformed
+    // history fails closed and duplicate acceptances must describe the
+    // same facts.
+    type Acceptance = {
+      logical_name: string;
+      producer_executor_id: string;
+      sha256: string;
+      byte_size: number;
+      channel: string;
+    };
+    const expected = new Map<string, Acceptance>();
     for (const ev of this.store.listEvents(ARTIFACT_ENTITY)) {
       if (
-        String(ev.event_type) === "ARTIFACT_ACCEPTED" &&
+        String(ev.event_type) !== "ARTIFACT_ACCEPTED" ||
         String(
           ((ev.metadata as Record<string, unknown> | null) ?? {}).execution_id ?? "",
-        ) === executionId
+        ) !== executionId
       ) {
-        expected.add(String(ev.entity_id));
+        continue;
       }
+      const id = String(ev.entity_id);
+      const mal = (field: string): never => {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+          `${id}:malformed_history:${field}`,
+        );
+      };
+      const md = ev.metadata as Record<string, unknown> | null;
+      if (md === null || typeof md !== "object") mal("metadata");
+      const logicalName = String(ev.new_state ?? "");
+      if (!logicalName) mal("new_state");
+      const producer = md!.producer_executor_id;
+      if (typeof producer !== "string" || !producer) mal("producer_executor_id");
+      const sha = md!.sha256;
+      if (typeof sha !== "string" || !/^[0-9a-f]{64}$/.test(sha)) mal("sha256");
+      const size = md!.byte_size;
+      if (typeof size !== "number" || !Number.isInteger(size) || size < 0) {
+        mal("byte_size");
+      }
+      const channel = md!.channel;
+      if (typeof channel !== "string" || !channel) mal("channel");
+      const facts: Acceptance = {
+        logical_name: logicalName,
+        producer_executor_id: producer as string,
+        sha256: sha as string,
+        byte_size: size as number,
+        channel: channel as string,
+      };
+      const prev = expected.get(id);
+      if (prev) {
+        if (
+          prev.logical_name !== facts.logical_name ||
+          prev.producer_executor_id !== facts.producer_executor_id ||
+          prev.sha256 !== facts.sha256 ||
+          prev.byte_size !== facts.byte_size ||
+          prev.channel !== facts.channel
+        ) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+            `${id}:conflicting_history`,
+          );
+        }
+        continue;
+      }
+      expected.set(id, facts);
     }
     // §4 — a current row claiming this execution WITHOUT a historical
     // ARTIFACT_ACCEPTED is injected authority: fail closed, never grant
@@ -481,7 +537,7 @@ export class ArtifactAuthority {
       }
     }
     const verified: string[] = [];
-    for (const id of expected) {
+    for (const [id, facts] of expected) {
       const fail = (reason: string): never => {
         throw new IntegrityError("FAIL_CLOSED_ARTIFACT_VERIFICATION", `${id}:${reason}`);
       };
@@ -495,6 +551,17 @@ export class ArtifactAuthority {
           `${id}:missing`,
         );
       }
+      // R7.2 — the current row must still match the immutable facts the
+      // historical acceptance recorded; a coherently rewritten row
+      // (same ids, different accepted bytes) must never pass.
+      if (String(row.artifact_id) !== id) fail("artifact_id_field");
+      if (String(row.logical_name) !== facts.logical_name) fail("logical_name");
+      if (String(row.producer_executor_id) !== facts.producer_executor_id) {
+        fail("producer_executor_id");
+      }
+      if (String(row.sha256) !== facts.sha256) fail("sha256");
+      if (Number(row.byte_size) !== facts.byte_size) fail("byte_size");
+      if (String(row.ingested_via) !== facts.channel) fail("ingested_via");
       const sha = String(row.sha256 ?? "");
       if (String(row.execution_id) !== executionId) fail("execution_id");
       if (String(row.contract ?? "") !== ARTIFACT_CONTRACT) fail("contract");

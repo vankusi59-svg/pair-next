@@ -34,8 +34,12 @@ export class ArtifactProvenanceValidator {
     // survive malformed result structure even though Gate normally
     // rejects it first. A non-array `artifacts` fails the validation;
     // each entry must be a non-null, non-array object — never coerced.
+    // R7.1 — the validator independently requires `artifacts` to be an
+    // array: missing/undefined/null/object/string all FAIL here even
+    // though Gate is normally the canonical ingress. An executor with
+    // nothing to declare must explicitly emit `artifacts: []`.
     const rawArtifacts: unknown = result?.artifacts;
-    if (rawArtifacts !== undefined && !Array.isArray(rawArtifacts)) {
+    if (!Array.isArray(rawArtifacts)) {
       failures.push("result.artifacts is not an array");
     }
     const artifactEntries: unknown[] = Array.isArray(rawArtifacts) ? rawArtifacts : [];

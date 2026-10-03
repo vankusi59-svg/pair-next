@@ -524,3 +524,63 @@ remote DAG-leaf restriction.
 Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R6_PENDING_SOURCE_REVIEW`
 
 STOP. DO NOT MERGE.
+
+---
+
+## R7 SOURCE-REVIEW REMEDIATION — FINAL HISTORICAL-BINDING CLOSURE
+
+New HEAD: <pending>
+Reviewed HEAD: `cd9bda03ee1dbf00a5866b5823b093a3380e2c37` (prior `79bb3ac`)
+
+### Findings closed
+
+**R7.1 — validator independently requires `artifacts` array.** `ArtifactProvenanceValidator`
+now requires `result.artifacts` to BE an array — missing/undefined/null/object/string are
+all validation FAILs (`result.artifacts is not an array`), even though Gate is normally
+the canonical ingress. An executor with nothing to declare must explicitly emit
+`artifacts: []`. The shared `canonical-mission-completion` test helper was updated to emit
+`artifacts: []` in its COMPLETED results (81 downstream tests across p9/p11/p14 suites
+consume it).
+
+**R7.2 — historical acceptance binds immutable artifact content.** `verifyForExecution`
+no longer uses ARTIFACT_ACCEPTED events only to derive the expected id set — it now
+extracts the immutable acceptance facts each event recorded (`entity_id`, `new_state` =
+logical_name, `metadata.execution_id`, `metadata.producer_executor_id`,
+`metadata.sha256`, `metadata.byte_size`, `metadata.channel`) and requires the CURRENT row
+to still match every one of them:
+
+- `row.artifact_id === event.entity_id` (payload field, not just the entity key)
+- `row.logical_name === event.new_state`
+- `row.producer_executor_id === metadata.producer_executor_id`
+- `row.sha256 === metadata.sha256`
+- `row.byte_size === metadata.byte_size`
+- `row.ingested_via === metadata.channel`
+
+A coherently rewritten row — same execution_id, same logical_name, same deterministic
+ART id, but sha/size/storage changed to different valid bytes B — now FAILS because
+history says the accepted content was A. Malformed historical metadata (missing
+fields, bad sha256, non-integer byte_size, missing channel, missing new_state) fails
+closed as `malformed_history`; multiple ARTIFACT_ACCEPTED events for the same id must
+describe identical facts or `conflicting_history` fails closed. All R6 canonical checks
+(deterministic id, contract, state, mission/task/governed linkage, storage kind/sha/ref,
+retained CAS `readCasBlob` + byte length) are retained unchanged.
+
+### Tests (13 new, `pair-f1-r2-remediation.test.ts` — 95 total)
+
+| Group | Cases | Result |
+|---|---|---|
+| R7-A | missing field, null, {}, string, `[]` | FAIL / PASS — 5 |
+| R7-B | bytes A→B swap, artifact_id field, channel, producer, logical_name, malformed metadata, conflicting history, intact, restart | FAIL / PASS — 8 |
+
+### Validation evidence
+
+- `rm -rf dist` → remediation file **95/95** (READY+GO race still passes on current source)
+- focused: contract 69/69, incident 106/106, F1 20/20, R1 25/25, p14 127/127
+- **FULL suite on final HEAD: 2951 pass / 2 fail** — only the two env-only P5
+  `stockProbe.available` failures (reproduce on base `6ff9d35`); 15 skipped
+- `npx tsc --noEmit` 0 errors · `pnpm build` PASS · `pnpm audit --audit-level=high` 0 high
+- `src/pair/mc-server.ts` DAG-leaf remote restriction: 0 diff vs base
+
+Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R7_PENDING_SOURCE_REVIEW`
+
+STOP. DO NOT MERGE.

@@ -193,7 +193,7 @@ export function canonicallyCompleteMission(
       dispatch_timestamp: utcnow(),
       run_root: `${workspace}/run`,
       workspace,
-      result: { status: "COMPLETED", output: "done" },
+      result: { status: "COMPLETED", output: "done", artifacts: [] },
       version: 0,
     }, 0);
     store.event({

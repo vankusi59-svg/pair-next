@@ -1654,3 +1654,181 @@ describe("R6-D rogue artifact rows without acceptance history", () => {
     expect(v.failures.join(" ")).toContain("no_acceptance_history");
   });
 });
+
+/* =============== R7.1 validator independently requires artifacts array === */
+describe("R7-A validator requires an explicit artifacts array", () => {
+  const validate = (ctx: ReturnType<typeof mkCtx>, eid: string) =>
+    new ArtifactProvenanceValidator().validate_execution(ctx.service, eid) as Record<
+      string,
+      unknown
+    >;
+  const ctxFor = (tag: string, artifacts: unknown, includeField = true) => {
+    const ctx = mkCtx(tag);
+    const result: Record<string, unknown> = { status: "COMPLETED" };
+    if (includeField) result.artifacts = artifacts;
+    const p = mkProducer(ctx, { state: "COMPLETED", result });
+    return { ctx, p };
+  };
+
+  it("R7-A1 COMPLETED result with no artifacts field → FAIL", () => {
+    const { ctx, p } = ctxFor("r7a1", undefined, false);
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R7-A2 artifacts:null → FAIL", () => {
+    const { ctx, p } = ctxFor("r7a2", null);
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R7-A3 artifacts:{} / string → FAIL", () => {
+    const a = ctxFor("r7a3a", {});
+    expect(validate(a.ctx, a.p.eid).status).toBe("FAIL");
+    const b = ctxFor("r7a3b", "a.txt");
+    expect(validate(b.ctx, b.p.eid).status).toBe("FAIL");
+  });
+  it("R7-A4 artifacts:[] → structural portion valid (PASS)", () => {
+    const { ctx, p } = ctxFor("r7a4", []);
+    expect(validate(ctx, p.eid).status).toBe("PASS");
+  });
+});
+
+/* ====== R7.2 historical acceptance binds immutable artifact content ===== */
+describe("R7-B current row must match immutable acceptance facts", () => {
+  const validate = (ctx: ReturnType<typeof mkCtx>, eid: string) =>
+    new ArtifactProvenanceValidator().validate_execution(ctx.service, eid) as Record<
+      string,
+      unknown
+    >;
+  const setup = (ctx: ReturnType<typeof mkCtx>) => {
+    const p = mkProducer(ctx);
+    const acc = ctx.authority.accept({
+      execution_id: p.eid,
+      producer_executor_id: EX,
+      logical_name: "r.txt",
+      source: { kind: "buffer", bytes: Buffer.from("HIST") },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid) as Record<string, unknown>;
+    exec.result = { status: "COMPLETED", artifacts: [] };
+    exec.execution_state = "COMPLETED";
+    ctx.store.put("executor_execution", p.eid, exec, Number(exec.version));
+    return { p, acc, id: String(acc.artifact.artifact_id) };
+  };
+  const mutate = (
+    ctx: ReturnType<typeof mkCtx>,
+    id: string,
+    patch: Record<string, unknown>,
+  ) => {
+    const row = ctx.store.get("artifact", id) as Record<string, unknown>;
+    Object.assign(row, patch);
+    ctx.store.put("artifact", id, row, Number(row.version));
+  };
+
+  it("R7-B1 row mutated to different-but-valid bytes B → FAIL (history says A)", () => {
+    const ctx = mkCtx("r7b1");
+    const { p, id } = setup(ctx);
+    const b = Buffer.from("OTHER-BYTES");
+    const shaB = sha256Hex(b);
+    fs.writeFileSync(blobPath(ctx, shaB), b);
+    mutate(ctx, id, {
+      sha256: shaB,
+      byte_size: b.length,
+      storage: { kind: "PAIR_ARTIFACT_CAS", ref: `blobs/${shaB}`, sha256: shaB },
+    });
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(v.failures.join(" ")).toContain(":sha256");
+  });
+  it("R7-B2 row.artifact_id payload field changed → FAIL", () => {
+    const ctx = mkCtx("r7b2");
+    const { p, id } = setup(ctx);
+    mutate(ctx, id, { artifact_id: "ART_FORGED" });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R7-B3 ingested_via/channel changed → FAIL", () => {
+    const ctx = mkCtx("r7b3");
+    const { p, id } = setup(ctx);
+    mutate(ctx, id, { ingested_via: "LOCAL_WORKSPACE" });
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(v.failures.join(" ")).toContain(":ingested_via");
+  });
+  it("R7-B4 producer_executor_id changed → FAIL", () => {
+    const ctx = mkCtx("r7b4");
+    const { p, id } = setup(ctx);
+    mutate(ctx, id, { producer_executor_id: "EXE_OTHER" });
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(v.failures.join(" ")).toContain(":producer_executor_id");
+  });
+  it("R7-B5 logical_name changed (internally consistent row) → FAIL", () => {
+    const ctx = mkCtx("r7b5");
+    const { p, id } = setup(ctx);
+    mutate(ctx, id, { logical_name: "renamed.txt" });
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(v.failures.join(" ")).toContain(":logical_name");
+  });
+  it("R7-B6 malformed historical acceptance metadata → FAIL CLOSED", () => {
+    const ctx = mkCtx("r7b6");
+    const { p, id } = setup(ctx);
+    // a second, hash-verified but semantically malformed acceptance record
+    ctx.store.event({
+      entity_type: "artifact",
+      entity_id: id,
+      event_type: "ARTIFACT_ACCEPTED",
+      new_state: "r.txt",
+      actor: "T",
+      metadata: {
+        execution_id: p.eid,
+        producer_executor_id: EX,
+        sha256: "NOT_HEX",
+        byte_size: 4,
+        channel: "REMOTE_UPLOAD",
+      },
+    });
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(v.failures.join(" ")).toContain("malformed_history");
+  });
+  it("R7-B6b conflicting second acceptance facts → FAIL CLOSED", () => {
+    const ctx = mkCtx("r7b6c");
+    const { p, id } = setup(ctx);
+    ctx.store.event({
+      entity_type: "artifact",
+      entity_id: id,
+      event_type: "ARTIFACT_ACCEPTED",
+      new_state: "r.txt",
+      actor: "T",
+      metadata: {
+        execution_id: p.eid,
+        producer_executor_id: EX,
+        sha256: sha256Hex(Buffer.from("DIFFERENT")),
+        byte_size: 4,
+        channel: "REMOTE_UPLOAD",
+      },
+    });
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(v.failures.join(" ")).toContain("conflicting_history");
+  });
+  it("R7-B7 normal history + untouched row/CAS → PASS", () => {
+    const ctx = mkCtx("r7b7");
+    const { p, id } = setup(ctx);
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("PASS");
+    expect(v.artifact_ids).toEqual([id]);
+  });
+  it("R7-B8 restart → historical binding still PASS", () => {
+    const ctx = mkCtx("r7b8");
+    const { p, id } = setup(ctx);
+    ctx.store.close();
+    const store2 = new PairEvidenceStore(path.join(ctx.d, "pair.db"));
+    const v = new ArtifactProvenanceValidator().validate_execution(
+      new PairControlPlane(store2),
+      p.eid,
+    ) as Record<string, unknown>;
+    expect(v.status).toBe("PASS");
+    expect(v.artifact_ids).toEqual([id]);
+    store2.close();
+  });
+});
