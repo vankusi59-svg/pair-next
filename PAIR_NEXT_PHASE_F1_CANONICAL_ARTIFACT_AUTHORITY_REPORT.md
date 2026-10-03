@@ -369,7 +369,7 @@ Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R3_PENDING_SOUR
 ## INDEPENDENT SOURCE-REVIEW R4 REMEDIATION
 
 - **Previous reviewed HEAD:** `db4932f4852a286f28a709761314fc59297f46ab`
-- **New HEAD:** `<pending>`
+- **New HEAD:** `a8011eb5d2dfa4600ddeac15d87e04cecaf543ef`
 - **Changed files:** `src/pair/artifact-authority.ts`, `src/__tests__/pair-f1-r2-remediation.test.ts`, `src/__tests__/fixtures/f1-worker-accept.mts`, `CURRENT_STATE.md`, this report.
 
 ### RCA — R4.1 CAS REGULAR-FILE READ MUST BE OPEN-OBJECT BOUND
