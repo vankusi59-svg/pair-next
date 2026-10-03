@@ -883,18 +883,38 @@ type DeliveryAttemptSlotHistory = {
    *  authority (mutable attempt_count is only a projection of this). */
   consumed: number;
   events: DeliveryAttemptEvent[];
+  /** the ONE unresolved STARTED, when exactly one exists. */
+  open: DeliveryAttemptEvent | null;
+  /** terminal resolved outcome — SENT/UNKNOWN end the lifecycle. */
+  terminal: "SENT" | "UNKNOWN" | null;
+  /** set when this slot's immutable sequence is malformed — callers
+   *  MUST fail closed and never derive send authority from it. */
+  seqError?: string;
 };
 
-/** F4 R3.3/R3.4 — the immutable append-only attempt lifecycle ledger
- *  for ONE canonical delivery entity, derived from attempt evidence
- *  (seq-ordered). The mutable TDR row is a cache of this history; any
- *  disagreement is a violation, never a new send permission. */
+/** F4 R4.6 — the validated immutable attempt lifecycle for ONE canonical
+ *  delivery entity. `valid === false` means malformed append-only
+ *  history — never a source of new send authority. */
+export interface DeliveryAttemptLedger {
+  slots: Map<string, DeliveryAttemptSlotHistory>;
+  valid: boolean;
+  error?: string;
+}
+
+/** F4 R3.3/R3.4 + R4.6 — the immutable append-only attempt lifecycle
+ *  ledger for ONE canonical delivery entity, derived from attempt
+ *  evidence (seq-ordered). Sequence rules per slot: attempt_number is
+ *  1..N strictly incrementing, every STARTED carries the deterministic
+ *  `ATT_<digest(entityId:slot:N)>` identity, a RESOLVED pairs exactly
+ *  the preceding unresolved STARTED, no RESOLVED without STARTED, no
+ *  duplicate RESOLVED, at most one open STARTED, and nothing may start
+ *  after a terminal SENT/UNKNOWN. Malformed history → `valid:false`. */
 export function deliveryAttemptLedger(
   store: PairEvidenceStore,
   missionId: string,
   entityId: string,
-): Map<string, DeliveryAttemptSlotHistory> {
-  const map = new Map<string, DeliveryAttemptSlotHistory>();
+): DeliveryAttemptLedger {
+  const raw = new Map<string, DeliveryAttemptEvent[]>();
   for (const ev of store.listEvidence(missionId)) {
     const kind = String(ev.kind);
     if (
@@ -907,30 +927,400 @@ export function deliveryAttemptLedger(
       .payload as Record<string, unknown>;
     if (String(p.delivery_id ?? "") !== entityId) continue;
     const slotKey = String(p.slot ?? "text");
-    const h = map.get(slotKey) ?? { started: 0, consumed: 0, events: [] };
+    const list = raw.get(slotKey) ?? [];
     if (kind === TELEGRAM_DELIVERY_ATTEMPT_STARTED) {
-      h.started += 1;
-      h.events.push({
+      list.push({
         kind: "STARTED",
         slot: slotKey,
         attempt_id: p.attempt_id as string | undefined,
         attempt_number: p.attempt_number as number | undefined,
       });
     } else {
-      const outcome = String(p.outcome ?? "");
-      if (outcome === "FAILED") h.consumed += 1;
-      h.events.push({
+      list.push({
         kind: "RESOLVED",
         slot: slotKey,
         attempt_id: p.attempt_id as string | undefined,
         attempt_number: p.attempt_number as number | undefined,
-        outcome,
+        outcome: String(p.outcome ?? ""),
         message_id: p.message_id,
       });
     }
-    map.set(slotKey, h);
+    raw.set(slotKey, list);
+  }
+  const slots = new Map<string, DeliveryAttemptSlotHistory>();
+  let valid = true;
+  let error: string | undefined;
+  for (const [slotKey, events] of raw) {
+    const h: DeliveryAttemptSlotHistory = {
+      started: 0,
+      consumed: 0,
+      events,
+      open: null,
+      terminal: null,
+    };
+    let open: DeliveryAttemptEvent | null = null;
+    let expectNumber = 1;
+    for (const ev of events) {
+      if (h.seqError) break;
+      if (h.terminal) {
+        h.seqError = "activity_after_terminal";
+        break;
+      }
+      if (ev.kind === "STARTED") {
+        if (open) {
+          h.seqError = "unresolved_started_overlap";
+          break;
+        }
+        if (Number(ev.attempt_number) !== expectNumber) {
+          h.seqError = "attempt_number_sequence";
+          break;
+        }
+        const wantId = `ATT_${digest(
+          `${entityId}:${slotKey}:${expectNumber}`,
+        ).slice(0, 16)}`;
+        if (String(ev.attempt_id ?? "") !== wantId) {
+          h.seqError = "attempt_id_mismatch";
+          break;
+        }
+        h.started += 1;
+        expectNumber += 1;
+        open = ev;
+      } else {
+        if (!open) {
+          h.seqError = "resolved_without_started";
+          break;
+        }
+        if (
+          String(ev.attempt_id ?? "") !== String(open.attempt_id ?? "") ||
+          Number(ev.attempt_number) !== Number(open.attempt_number)
+        ) {
+          h.seqError = "resolved_mismatch";
+          break;
+        }
+        if (ev.outcome === "FAILED") {
+          h.consumed += 1;
+        } else if (ev.outcome === "SENT" || ev.outcome === "UNKNOWN") {
+          h.terminal = ev.outcome;
+        } else {
+          h.seqError = "resolved_bad_outcome";
+          break;
+        }
+        open = null;
+      }
+    }
+    h.open = open;
+    if (h.seqError) {
+      valid = false;
+      error ??= `${slotKey}:${h.seqError}`;
+    }
+    slots.set(slotKey, h);
+  }
+  return { slots, valid, error };
+}
+
+/* ============================ F4 R4 — canonical send-authority verifier ====
+ * ONE verifier shared by pending projection, BEGIN, RESOLVE, and stale
+ * reconciliation — identical semantics at every lifecycle seam, so a
+ * stale projection can never widen what durable state would allow. */
+
+/** All TELEGRAM_DELIVERY_MINTED receipts grouped by canonical entity id
+ *  (the receipt payload's delivery_id — stamped at mint, immutable). */
+function deliveryMintReceiptsAll(
+  store: PairEvidenceStore,
+): Map<string, Record<string, unknown>[]> {
+  const map = new Map<string, Record<string, unknown>[]>();
+  for (const ev of store.listEvidence()) {
+    if (String(ev.kind) !== TELEGRAM_DELIVERY_MINTED) continue;
+    const p = (ev.payload as Record<string, unknown>)
+      .payload as Record<string, unknown>;
+    const id = String(p.delivery_id ?? "");
+    if (!id) continue;
+    const list = map.get(id) ?? [];
+    list.push(p);
+    map.set(id, list);
   }
   return map;
+}
+
+function deliveryDestinationEqual(a: unknown, b: unknown): boolean {
+  const da = a as Record<string, unknown> | null | undefined;
+  const db = b as Record<string, unknown> | null | undefined;
+  if (da == null || db == null) return da == null && db == null;
+  return (
+    String(da.provider ?? "") === String(db.provider ?? "") &&
+    String(da.chat_id ?? "") === String(db.chat_id ?? "") &&
+    String(da.provenance ?? "") === String(db.provenance ?? "")
+  );
+}
+
+/** F4 R2/R3.1 — the immutable mint receipt is a WHOLE-REQUEST contract:
+ *  mode + complete static send authority + bijective slot match. */
+function deliveryWholeContractValid(
+  req: Record<string, unknown>,
+  receipt: Record<string, unknown>,
+): boolean {
+  if (String(req.mode ?? "") !== String(receipt.mode ?? "")) return false;
+  if (String(req.mission_id ?? "") !== String(receipt.mission_id ?? ""))
+    return false;
+  if (String(req.task_id ?? "") !== String(receipt.task_id ?? ""))
+    return false;
+  if (String(req.execution_id ?? "") !== String(receipt.execution_id ?? ""))
+    return false;
+  if (!deliveryDestinationEqual(req.destination, receipt.destination))
+    return false;
+  if (String(req.outbox_dir ?? "") !== String(receipt.outbox_dir ?? ""))
+    return false;
+  if (String(req.workspace ?? "") !== String(receipt.workspace ?? ""))
+    return false;
+  const ceiling = Number(receipt.max_attempts);
+  if (!Number.isSafeInteger(ceiling) || ceiling <= 0) return false;
+  if (receipt.sendable === false && String(req.status) !== "UNSENDABLE")
+    return false;
+  if (String(req.mode) === "TEXT") {
+    return (
+      Number(req.max_attempts) === ceiling &&
+      typeof req.text_artifact_id === "string" &&
+      String(receipt.artifact_id ?? "") === req.text_artifact_id &&
+      typeof req.text_producer_execution_id === "string" &&
+      String(receipt.producer_execution_id ?? "") ===
+        req.text_producer_execution_id &&
+      typeof req.text_producer_governed_task_id === "string" &&
+      String(receipt.governed_task_id ?? "") ===
+        req.text_producer_governed_task_id &&
+      String(receipt.logical_name ?? "") ===
+        String(req.text_source_artifact ?? "") &&
+      typeof req.text_artifact_sha256 === "string" &&
+      String(receipt.artifact_sha256 ?? receipt.sha256 ?? "") ===
+        req.text_artifact_sha256 &&
+      String(receipt.text_sha256 ?? "") === String(req.text_sha256 ?? "") &&
+      Number(receipt.text_length) === Number(req.text_length)
+    );
+  }
+  const ra = Array.isArray(receipt.artifacts)
+    ? (receipt.artifacts as Array<Record<string, unknown>>)
+    : [];
+  const slots = Array.isArray(req.artifacts)
+    ? (req.artifacts as DeliverySlot[])
+    : [];
+  if (ra.length === 0 || ra.length !== slots.length) return false;
+  const remaining = [...ra];
+  for (const a of slots) {
+    const i = remaining.findIndex(
+      (r) =>
+        String(r.name ?? "") === String(a.name ?? "") &&
+        String(r.artifact_id ?? "") === String(a.artifact_id ?? "") &&
+        String(r.producer_execution_id ?? "") ===
+          String(a.producer_execution_id ?? "") &&
+        String(r.governed_task_id ?? "") ===
+          String(a.producer_governed_task_id ?? "") &&
+        String(r.logical_name ?? "") === String(a.logical_name ?? "") &&
+        String(r.sha256 ?? "") === String(a.sha256 ?? "") &&
+        String(r.source_path ?? "") === String(a.source_path ?? "") &&
+        Number(r.max_attempts) === Number(a.max_attempts),
+    );
+    if (i < 0) return false;
+    remaining.splice(i, 1);
+  }
+  return remaining.length === 0;
+}
+
+/** The canonical artifact authority for live re-verification, scoped to
+ *  the store's deployment artifact directory. */
+function deliveryArtifactAuthority(store: PairEvidenceStore) {
+  return new ArtifactAuthority(store, {
+    blobDir: path.join(
+      process.env.PAIR_ARTIFACT_DIR ?? path.join(store.dbDir, "artifacts"),
+      "blobs",
+    ),
+  });
+}
+
+/** Live canonical re-verification of one bound artifact through the
+ *  F1/F2 authority seam (verifyArtifactForConsumption). */
+function deliveryLiveVerify(
+  store: PairEvidenceStore,
+  req: Record<string, unknown>,
+  bound: {
+    artifact_id: unknown;
+    producer_execution_id: unknown;
+    governed_task_id: unknown;
+    logical_name: unknown;
+    sha256: unknown;
+  },
+): boolean {
+  try {
+    deliveryArtifactAuthority(store).verifyArtifactForConsumption(
+      String(bound.artifact_id),
+      {
+        execution_id: String(bound.producer_execution_id),
+        mission_id: String(req.mission_id),
+        governed_task_id: String(bound.governed_task_id),
+        logical_name: String(bound.logical_name),
+        sha256: String(bound.sha256),
+      },
+    );
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/** The provenance binding a request/slot claims, for live re-verify. */
+function deliverySlotBinding(
+  req: Record<string, unknown>,
+  slotKey: string,
+): {
+  artifact_id: unknown;
+  producer_execution_id: unknown;
+  governed_task_id: unknown;
+  logical_name: unknown;
+  sha256: unknown;
+} | null {
+  if (String(req.mode) === "TEXT" || slotKey === "text") {
+    return {
+      artifact_id: req.text_artifact_id,
+      producer_execution_id: req.text_producer_execution_id,
+      governed_task_id: req.text_producer_governed_task_id,
+      logical_name: req.text_source_artifact,
+      sha256: req.text_artifact_sha256,
+    };
+  }
+  const slot = (Array.isArray(req.artifacts)
+    ? (req.artifacts as DeliverySlot[])
+    : []
+  ).find((a) => String(a.name) === slotKey);
+  if (!slot) return null;
+  return {
+    artifact_id: slot.artifact_id,
+    producer_execution_id: slot.producer_execution_id,
+    governed_task_id: slot.producer_governed_task_id,
+    logical_name: slot.logical_name,
+    sha256: slot.sha256,
+  };
+}
+
+/** The resolved static authority for one durable request row — the same
+ *  computation at every lifecycle seam. */
+interface DeliveryStaticAuthority {
+  entityId: string;
+  identityOk: boolean;
+  bound: boolean;
+  receipts: Record<string, unknown>[];
+  receipt: Record<string, unknown> | null;
+  contractOk: boolean;
+}
+function deliveryStaticAuthority(
+  store: PairEvidenceStore,
+  req: Record<string, unknown>,
+  receiptsAll?: Map<string, Record<string, unknown>[]>,
+): DeliveryStaticAuthority {
+  const entityId = String(req.entity_id ?? "");
+  const identityOk =
+    entityId.length > 0 && String(req.delivery_id ?? "") === entityId;
+  const receipts =
+    (receiptsAll?.get(entityId) ??
+      deliveryMintReceiptsAll(store).get(entityId)) ??
+    [];
+  const bound = receipts.length > 0;
+  const receipt = receipts.length === 1 ? receipts[0]! : null;
+  const contractOk =
+    identityOk && receipt !== null && deliveryWholeContractValid(req, receipt);
+  return { entityId, identityOk, bound, receipts, receipt, contractOk };
+}
+
+/** Whether the request carries provenance-binding fields (bound-shaped
+ *  even when no receipt exists — equally invalid). */
+function deliveryCarriesBinding(req: Record<string, unknown>): boolean {
+  if (req.text_artifact_id !== undefined) return true;
+  if (
+    Array.isArray(req.artifacts) &&
+    (req.artifacts as Array<Record<string, unknown>>).some(
+      (a) => a.artifact_id !== undefined,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** F4 R4.1 — the effective retry ceiling: the immutable mint receipt for
+ *  bound requests, never a widened mutable field. */
+function deliveryEffectiveCeiling(
+  req: Record<string, unknown>,
+  slotKey: string,
+  slot: DeliverySlot,
+  staticAuth: DeliveryStaticAuthority,
+): number {
+  if (!staticAuth.contractOk) return Number(slot.max_attempts ?? 0);
+  const r = staticAuth.receipt!;
+  if (String(req.mode) === "TEXT" || slotKey === "text") {
+    return Number(r.max_attempts);
+  }
+  const ra = (Array.isArray(r.artifacts)
+    ? (r.artifacts as Array<Record<string, unknown>>)
+    : []
+  ).find(
+    (e) =>
+      String(e.name ?? "") === slotKey &&
+      String(e.artifact_id ?? "") === String(slot.artifact_id ?? ""),
+  );
+  return ra ? Number(ra.max_attempts) : Number(r.max_attempts);
+}
+
+/** F4 R3.3/R4 — is the mutable slot an exact legal projection of the
+ *  immutable ledger? Any disagreement is a violation — never a new send
+ *  permission. */
+function deliverySlotLifecycleViolation(
+  ledger: DeliveryAttemptLedger,
+  slotKey: string,
+  slot: DeliverySlot,
+): boolean {
+  if (!ledger.valid) return true;
+  const h = ledger.slots.get(slotKey);
+  if (!h || h.events.length === 0) return false;
+  if (h.seqError) return true;
+  if (Number(slot.attempt_count ?? 0) !== h.consumed) return true;
+  if (h.terminal === "SENT") {
+    return (
+      slot.state !== "SENT" ||
+      String(slot.message_id ?? "") !==
+        String(h.events[h.events.length - 1]!.message_id ?? "")
+    );
+  }
+  if (h.terminal === "UNKNOWN") {
+    return slot.state !== "UNKNOWN_SIDE_EFFECT";
+  }
+  if (h.open) {
+    return (
+      slot.state !== "SENDING" ||
+      String(slot.attempt_id ?? "") !== String(h.open.attempt_id ?? "")
+    );
+  }
+  // RESOLVED FAILED is the last event — legit projections are QUEUED
+  // retry or FAILED_DELIVERY terminal with the consumed count intact.
+  return !(slot.state === "QUEUED" || slot.state === "FAILED_DELIVERY");
+}
+
+/** F4 R4.3 — the ONE unresolved STARTED an outcome may resolve, or a
+ *  reason string. Exact attempt_id + attempt_number pairing only. */
+function deliveryOpenStarted(
+  ledger: DeliveryAttemptLedger,
+  slotKey: string,
+  slot: DeliverySlot,
+): { open: DeliveryAttemptEvent } | { error: string } {
+  if (!ledger.valid) {
+    return { error: `ledger_invalid:${ledger.error ?? "unknown"}` };
+  }
+  const h = ledger.slots.get(slotKey);
+  const open = h?.open;
+  if (!open) return { error: "no_unresolved_started" };
+  if (
+    String(slot.attempt_id ?? "") !== String(open.attempt_id ?? "") ||
+    Number(slot.attempt_number) !== Number(open.attempt_number)
+  ) {
+    return { error: "started_identity_mismatch" };
+  }
+  return { open };
 }
 
 /**
@@ -942,6 +1332,12 @@ export function deliveryAttemptLedger(
  * projection commit in ONE atomic transaction: either both durable or
  * neither. Attempt identity and budget consumption derive from the
  * immutable ledger — a rewritten attempt_count cannot lower either.
+ * F4 R4.1/R4.2 — BEGIN is the FINAL immutable send-authority gate: the
+ * durable row is re-loaded inside this transaction and re-proved against
+ * the mint receipt's complete static contract, the live artifact
+ * authority, and the validated lifecycle ledger — before a new STARTED
+ * is minted. Terminal SENT/UNKNOWN ledgers NEVER re-acquire; an open
+ * STARTED means only that in-flight attempt exists.
  */
 export function beginDeliveryAttempt(args: {
   store: PairEvidenceStore;
@@ -950,9 +1346,34 @@ export function beginDeliveryAttempt(args: {
   now: string;
 }): BeginDeliveryResult {
   return args.store.immediate(() => {
+    // F4 R4.1 — A: load the canonical durable TDR inside THIS
+    // transaction — a stale projection is never authority.
     const req = args.store.get(TELEGRAM_DELIVERY_REQUEST, args.deliveryId);
+    const slotKey = String(args.artifact ?? "text");
+    const entityId = String(req.entity_id ?? args.deliveryId);
+    const missionId = String(req.mission_id);
+    const staticAuth = deliveryStaticAuthority(args.store, req);
+    const boundish = staticAuth.bound || deliveryCarriesBinding(req);
+    // F4 R4.1 — B/C/D: when the immutable mint contract applies, the
+    // durable row must satisfy it completely AND the slot's live
+    // artifact/provenance contract re-verify — before any STARTED.
+    if (boundish) {
+      if (!staticAuth.contractOk) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+          `${args.deliveryId}:${slotKey}:begin static contract violation`,
+        );
+      }
+      const binding = deliverySlotBinding(req, slotKey);
+      if (!binding || !deliveryLiveVerify(args.store, req, binding)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+          `${args.deliveryId}:${slotKey}:begin live authority violation`,
+        );
+      }
+    }
     if (req.status !== "QUEUED") {
-      failTransition(args.deliveryId, String(args.artifact ?? "text"), String(req.status), "SENDING");
+      failTransition(args.deliveryId, slotKey, String(req.status), "SENDING");
     }
     const next = { ...req };
     const { slot, apply } = findSlot(req, next, args.artifact);
@@ -968,40 +1389,60 @@ export function beginDeliveryAttempt(args: {
       };
     }
     if (slot.state !== "QUEUED") {
-      failTransition(args.deliveryId, String(args.artifact ?? "text"), slot.state, "SENDING");
+      failTransition(args.deliveryId, slotKey, slot.state, "SENDING");
     }
-    const slotKey = String(args.artifact ?? "text");
-    const entityId = String(req.entity_id ?? args.deliveryId);
-    const ledger = deliveryAttemptLedger(
-      args.store,
-      String(req.mission_id),
-      entityId,
+    // F4 R4.1 — E/F: rebuild and validate the immutable lifecycle
+    // ledger; the durable row must be an exact legal projection.
+    const ledger = deliveryAttemptLedger(args.store, missionId, entityId);
+    if (!ledger.valid) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+        `${args.deliveryId}:${slotKey}:ledger_invalid:${ledger.error ?? ""}`,
+      );
+    }
+    const hist = ledger.slots.get(slotKey);
+    if (deliverySlotLifecycleViolation(ledger, slotKey, slot)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+        `${args.deliveryId}:${slotKey}:projection_not_legal`,
+      );
+    }
+    // F4 R4.1 — a resolved SENT/UNKNOWN lifecycle NEVER acquires again;
+    // an open STARTED means only that in-flight attempt exists.
+    if (hist?.terminal) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+        `${args.deliveryId}:${slotKey}:terminal_${hist.terminal}`,
+      );
+    }
+    // F4 R4.2 — G: the retry ceiling is the immutable mint receipt for
+    // bound requests — never a widened mutable field.
+    const effectiveMax = deliveryEffectiveCeiling(req, slotKey, slot, staticAuth);
+    const consumed = Math.max(
+      hist?.consumed ?? 0,
+      Number(slot.attempt_count ?? 0),
     );
-    const hist = ledger.get(slotKey);
-    // R3.4 — consumed attempts and the next attempt number derive from
-    // the immutable history AND the mutable row, whichever is greater;
-    // neither can be lowered by a coherent row rewrite.
-    const consumed = Math.max(hist?.consumed ?? 0, Number(slot.attempt_count ?? 0));
-    if (consumed >= slot.max_attempts) {
+    if (consumed >= effectiveMax) {
       failTransition(args.deliveryId, slotKey, "BUDGET_EXHAUSTED", "SENDING");
     }
     if (slot.next_retry_at && slot.next_retry_at > args.now) {
       failTransition(args.deliveryId, slotKey, "BACKOFF_PENDING", "SENDING");
     }
+    // H — mint STARTED + SENDING atomically with the durable proof.
     const attemptNumber = Math.max(
       hist?.started ?? 0,
       Number(slot.attempt_count ?? 0),
     ) + 1;
     slot.attempt_number = attemptNumber;
     const attemptId = `ATT_${digest(
-      `${args.deliveryId}:${slotKey}:${attemptNumber}`,
+      `${entityId}:${slotKey}:${attemptNumber}`,
     ).slice(0, 16)}`;
     slot.attempt_id = attemptId;
     slot.attempt_started_at = args.now;
     slot.state = "SENDING";
     apply();
     // R3.3 — attempt-start authority inside the same commit.
-    args.store.appendEvidence(String(req.mission_id), TELEGRAM_DELIVERY_ATTEMPT_STARTED, {
+    args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_ATTEMPT_STARTED, {
       delivery_id: entityId,
       slot: slotKey,
       attempt_id: attemptId,
@@ -1036,6 +1477,7 @@ export function resolveDeliveryAttempt(args: {
     const { slot, apply } = findSlot(req, next, args.artifact);
     const slotKey = String(args.artifact ?? "text");
     const entityId = String(req.entity_id ?? args.deliveryId);
+    const missionId = String(req.mission_id);
     if (slot.state !== "SENDING") {
       failTransition(
         args.deliveryId,
@@ -1049,11 +1491,33 @@ export function resolveDeliveryAttempt(args: {
     // resolve evidence binds exactly the attempt that was in flight.
     const resolvedAttemptId = slot.attempt_id;
     const resolvedAttemptNumber = slot.attempt_number;
-    const consumed = deliveryAttemptLedger(
-      args.store,
-      String(req.mission_id),
-      entityId,
-    ).get(slotKey)?.consumed ?? 0;
+    const staticAuth = deliveryStaticAuthority(args.store, req);
+    const boundish = staticAuth.bound || deliveryCarriesBinding(req);
+    // F4 R4.5 — lifecycle evidence may only be minted when the complete
+    // immutable static contract still holds for this durable row.
+    if (boundish && !staticAuth.contractOk) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE",
+        `${args.deliveryId}:${slotKey}:resolve static contract violation`,
+      );
+    }
+    const ledger = deliveryAttemptLedger(args.store, missionId, entityId);
+    // F4 R4.3 — a RESOLVED event may be appended ONLY when the immutable
+    // ledger holds exactly one unresolved STARTED for this slot and the
+    // mutable SENDING identity matches it exactly. Mutable corruption can
+    // never be laundered into immutable history.
+    const gate =
+      boundish || (ledger.slots.get(slotKey)?.events.length ?? 0) > 0;
+    if (gate) {
+      const started = deliveryOpenStarted(ledger, slotKey, slot);
+      if ("error" in started) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE",
+          `${args.deliveryId}:${slotKey}:${started.error}`,
+        );
+      }
+    }
+    const consumed = ledger.slots.get(slotKey)?.consumed ?? 0;
     delete slot.attempt_id;
     delete slot.attempt_number;
     delete slot.attempt_started_at;
@@ -1099,17 +1563,22 @@ export function resolveDeliveryAttempt(args: {
   next.status = status;
   if (status === "SENT") next.sent_at = args.now;
   // R3.3 — the immutable resolve evidence and the mutable projection
-  // commit atomically inside this transaction.
-  args.store.appendEvidence(String(req.mission_id), TELEGRAM_DELIVERY_ATTEMPT_RESOLVED, {
-    delivery_id: entityId,
-    slot: slotKey,
-    attempt_id: resolvedAttemptId ?? null,
-    attempt_number: resolvedAttemptNumber ?? null,
-    outcome: args.outcome,
-    message_id: args.outcome === "SENT" ? args.messageId : null,
-    error: args.outcome === "SENT" ? null : String(args.error ?? "").slice(0, 300) || null,
-    resolved_at: args.now,
-  });
+  // commit atomically inside this transaction. F4 R4.3 — evidence is
+  // appended only when the exact STARTED authority gate was enforced
+  // (bound rows / rows with existing lifecycle history) — a legacy row
+  // without any history mints no orphan RESOLVED.
+  if (gate) {
+    args.store.appendEvidence(missionId, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED, {
+      delivery_id: entityId,
+      slot: slotKey,
+      attempt_id: resolvedAttemptId ?? null,
+      attempt_number: resolvedAttemptNumber ?? null,
+      outcome: args.outcome,
+      message_id: args.outcome === "SENT" ? args.messageId : null,
+      error: args.outcome === "SENT" ? null : String(args.error ?? "").slice(0, 300) || null,
+      resolved_at: args.now,
+    });
+  }
   return putReq(args.store, next);
   });
 }
@@ -1133,10 +1602,23 @@ export function reconcileStaleDeliveryAttempts(
   store: PairEvidenceStore,
   now: string,
   staleAfterMs: number = TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS,
+  opts?: { receipts?: Map<string, Record<string, unknown>[]> },
 ): void {
   const nowMs = Date.parse(now);
   for (const req of store.list(TELEGRAM_DELIVERY_REQUEST)) {
     if (req.status !== "QUEUED") continue;
+    // F4 R4.5 — lifecycle evidence may only be minted from a request
+    // whose canonical entity identity + immutable mint/static contract
+    // is still valid. A statically forged TDR gets ZERO attempt-evidence
+    // mutations (the projection pass fails it closed separately).
+    const staticAuth = deliveryStaticAuthority(store, req, opts?.receipts);
+    const boundish = staticAuth.bound || deliveryCarriesBinding(req);
+    if (boundish && !staticAuth.contractOk) continue;
+    const entityId = String(req.entity_id ?? req.delivery_id);
+    const ledger =
+      boundish
+        ? deliveryAttemptLedger(store, String(req.mission_id), entityId)
+        : null;
     let dirty = false;
     const next = { ...req } as Record<string, unknown>;
     const resolvedStale: Array<{
@@ -1155,32 +1637,44 @@ export function reconcileStaleDeliveryAttempts(
       const staleAttemptId = slot.attempt_id;
       const staleAttemptNumber = slot.attempt_number;
       const startedMs = Date.parse(String(slot.attempt_started_at ?? ""));
-      if (!Number.isFinite(startedMs)) {
-        dirty = true;
-        slot.state = "UNKNOWN_SIDE_EFFECT";
-        delete slot.attempt_id;
-        delete slot.attempt_number;
-        delete slot.attempt_started_at;
-        slot.unknown_reason = "stale_sending_missing_started_at";
-        resolvedStale.push({
-          slotKey,
-          attempt_id: staleAttemptId,
-          attempt_number: staleAttemptNumber,
-          reason: "stale_sending_missing_started_at",
-        });
-      } else if (nowMs - startedMs >= staleAfterMs) {
-        dirty = true;
-        slot.state = "UNKNOWN_SIDE_EFFECT";
-        delete slot.attempt_id;
-        delete slot.attempt_number;
-        delete slot.attempt_started_at;
-        slot.unknown_reason = `stale_sending_reconciled:${now}`;
-        resolvedStale.push({
-          slotKey,
-          attempt_id: staleAttemptId,
-          attempt_number: staleAttemptNumber,
-          reason: `stale_sending_reconciled:${now}`,
-        });
+      if (!Number.isFinite(startedMs) || nowMs - startedMs >= staleAfterMs) {
+        const reason = !Number.isFinite(startedMs)
+          ? "stale_sending_missing_started_at"
+          : `stale_sending_reconciled:${now}`;
+        if (boundish) {
+          // F4 R4.4 — stale resolution requires the EXACT unresolved
+          // STARTED authority: same attempt_id + attempt_number, not
+          // already resolved. Forged SENDING without it → quarantine the
+          // projection, append ZERO lifecycle evidence.
+          const started = deliveryOpenStarted(ledger!, slotKey, slot);
+          dirty = true;
+          if ("error" in started) {
+            slot.state = "FAILED_DELIVERY";
+            delete slot.attempt_id;
+            delete slot.attempt_number;
+            delete slot.attempt_started_at;
+            slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE";
+          } else {
+            slot.state = "UNKNOWN_SIDE_EFFECT";
+            delete slot.attempt_id;
+            delete slot.attempt_number;
+            delete slot.attempt_started_at;
+            slot.unknown_reason = reason;
+            resolvedStale.push({
+              slotKey,
+              attempt_id: staleAttemptId,
+              attempt_number: staleAttemptNumber,
+              reason,
+            });
+          }
+        } else {
+          dirty = true;
+          slot.state = "UNKNOWN_SIDE_EFFECT";
+          delete slot.attempt_id;
+          delete slot.attempt_number;
+          delete slot.attempt_started_at;
+          slot.unknown_reason = reason;
+        }
       }
       // else: fresh SENDING — legitimately in flight, leave untouched.
       apply();
@@ -1190,9 +1684,9 @@ export function reconcileStaleDeliveryAttempts(
       // request aggregate (a single stale payload → UNKNOWN_SIDE_EFFECT,
       // never dead QUEUED).
       next.status = recomputeStatus(req, next);
-      // F4 R3.3 — stale-resolution evidence and the mutable projection
-      // commit atomically: the attempt's UNKNOWN outcome is immutable.
-      const entityId = String(req.entity_id ?? req.delivery_id);
+      // F4 R3.3/R4.4 — exact-STARTED-proven stale-resolution evidence and
+      // the mutable projection commit atomically; quarantined rows mint
+      // no lifecycle evidence.
       store.immediate(() => {
         for (const r of resolvedStale) {
           store.appendEvidence(
@@ -1229,139 +1723,16 @@ export function pendingTelegramDeliveries(
   staleAfterMs: number = TELEGRAM_DELIVERY_DEFAULT_STALE_AFTER_MS,
 ): Array<Record<string, unknown>> {
   const ts = now ?? new Date().toISOString();
-  reconcileStaleDeliveryAttempts(store, ts, staleAfterMs);
   const out: Array<Record<string, unknown>> = [];
-  // F4 R1.2 — lazily built: delivery_id → mint receipts, and the
-  // canonical artifact authority for terminal re-verification. Rows
-  // carrying a provenance binding are valid ONLY against the append-only
-  // TELEGRAM_DELIVERY_MINTED receipt AND the still-canonical artifact —
-  // a coherent mutable-row rewrite fails closed, never re-baselines.
-  let mintReceipts: Map<string, Record<string, unknown>[]> | null = null;
-  const receiptsFor = (
-    entityId: string,
-  ): Record<string, unknown>[] => {
-    if (mintReceipts === null) {
-      mintReceipts = new Map();
-      for (const ev of store.listEvidence()) {
-        if (String(ev.kind) !== TELEGRAM_DELIVERY_MINTED) continue;
-        const p = (ev.payload as Record<string, unknown>)
-          .payload as Record<string, unknown>;
-        // Receipts are immutable — their delivery_id IS the canonical
-        // entity identity stamped at mint; resolution keys off that,
-        // never the (mutable) request payload's delivery_id (R2.3).
-        const id = String(p.delivery_id ?? "");
-        if (!id) continue;
-        const list = mintReceipts.get(id) ?? [];
-        list.push(p);
-        mintReceipts.set(id, list);
-      }
-    }
-    return mintReceipts.get(entityId) ?? [];
-  };
-  let artifactAuthority: ArtifactAuthority | null = null;
-  const authority = (): ArtifactAuthority => {
-    artifactAuthority ??= new ArtifactAuthority(store, {
-      blobDir: path.join(
-        process.env.PAIR_ARTIFACT_DIR ?? path.join(store.dbDir, "artifacts"),
-        "blobs",
-      ),
-    });
-    return artifactAuthority;
-  };
-  /** F4 R2 — the immutable mint receipt is a WHOLE-REQUEST contract.
-   *  Resolution is by the canonical entity identity (`entity_id` — the
-   *  durable entity key the store injects and `put` cannot rewrite away
-   *  from the key), never by the mutable payload `delivery_id`. When a
-   *  receipt exists for this canonical identity the row MUST carry the
-   *  complete provenance contract: same mode, exact slot count, exact
-   *  manifest names, and every bound field equal to the receipt — no
-   *  extra/missing/renamed/duplicated slot, and no provenance field may
-   *  be deleted to fall back to the legacy hash-only path. */
-  const destinationEqual = (a: unknown, b: unknown): boolean => {
-    const da = a as Record<string, unknown> | null | undefined;
-    const db = b as Record<string, unknown> | null | undefined;
-    if (da == null || db == null) return da == null && db == null;
-    return (
-      String(da.provider ?? "") === String(db.provider ?? "") &&
-      String(da.chat_id ?? "") === String(db.chat_id ?? "") &&
-      String(da.provenance ?? "") === String(db.provenance ?? "")
-    );
-  };
-  const wholeContractValid = (
-    req: Record<string, unknown>,
-    receipt: Record<string, unknown>,
-  ): boolean => {
-    if (String(req.mode ?? "") !== String(receipt.mode ?? "")) return false;
-    // F4 R3.1 — the receipt binds the COMPLETE static send authority:
-    // mission/task/execution identity, canonical destination +
-    // sendability, the stamped staging roots, and the canonical retry
-    // ceiling. A coherent rewrite of any of them fails the contract
-    // BEFORE any filesystem operation or transport call.
-    if (String(req.mission_id ?? "") !== String(receipt.mission_id ?? ""))
-      return false;
-    if (String(req.task_id ?? "") !== String(receipt.task_id ?? ""))
-      return false;
-    if (String(req.execution_id ?? "") !== String(receipt.execution_id ?? ""))
-      return false;
-    if (!destinationEqual(req.destination, receipt.destination)) return false;
-    if (String(req.outbox_dir ?? "") !== String(receipt.outbox_dir ?? ""))
-      return false;
-    if (String(req.workspace ?? "") !== String(receipt.workspace ?? ""))
-      return false;
-    const ceiling = Number(receipt.max_attempts);
-    if (!Number.isSafeInteger(ceiling) || ceiling <= 0) return false;
-    if (String(req.mode) === "TEXT") {
-      return (
-        Number(req.max_attempts) === ceiling &&
-        typeof req.text_artifact_id === "string" &&
-        String(receipt.artifact_id ?? "") === req.text_artifact_id &&
-        typeof req.text_producer_execution_id === "string" &&
-        String(receipt.producer_execution_id ?? "") ===
-          req.text_producer_execution_id &&
-        typeof req.text_producer_governed_task_id === "string" &&
-        String(receipt.governed_task_id ?? "") ===
-          req.text_producer_governed_task_id &&
-        String(receipt.logical_name ?? "") ===
-          String(req.text_source_artifact ?? "") &&
-        typeof req.text_artifact_sha256 === "string" &&
-        String(receipt.artifact_sha256 ?? receipt.sha256 ?? "") ===
-          req.text_artifact_sha256 &&
-        String(receipt.text_sha256 ?? "") === String(req.text_sha256 ?? "") &&
-        Number(receipt.text_length) === Number(req.text_length)
-      );
-    }
-    const ra = Array.isArray(receipt.artifacts)
-      ? (receipt.artifacts as Array<Record<string, unknown>>)
-      : [];
-    const slots = Array.isArray(req.artifacts)
-      ? (req.artifacts as DeliverySlot[])
-      : [];
-    if (ra.length === 0 || ra.length !== slots.length) return false;
-    const remaining = [...ra];
-    for (const a of slots) {
-      const i = remaining.findIndex(
-        (r) =>
-          String(r.name ?? "") === String(a.name ?? "") &&
-          String(r.artifact_id ?? "") === String(a.artifact_id ?? "") &&
-          String(r.producer_execution_id ?? "") ===
-            String(a.producer_execution_id ?? "") &&
-          String(r.governed_task_id ?? "") ===
-            String(a.producer_governed_task_id ?? "") &&
-          String(r.logical_name ?? "") === String(a.logical_name ?? "") &&
-          String(r.sha256 ?? "") === String(a.sha256 ?? "") &&
-          // F4 R3.1/R3.2 — the stamped staging source and the canonical
-          // retry ceiling are bound fields, not free mutable metadata.
-          String(r.source_path ?? "") === String(a.source_path ?? "") &&
-          Number(r.max_attempts) === Number(a.max_attempts),
-      );
-      if (i < 0) return false;
-      remaining.splice(i, 1);
-    }
-    return remaining.length === 0;
-  };
-  /** Live canonical re-verification of one bound artifact: immutable
-   *  acceptance history ↔ row ↔ execution linkage ↔ digest, through
-   *  the F1/F2 authority seam. */
+  // F4 R4 — the ONE canonical send-authority verifier: mint receipts are
+  // resolved once per pass and shared with stale reconciliation, so
+  // lifecycle evidence can never be minted before static-contract proof.
+  const mintReceipts = deliveryMintReceiptsAll(store);
+  const receiptsFor = (entityId: string): Record<string, unknown>[] =>
+    mintReceipts.get(entityId) ?? [];
+  reconcileStaleDeliveryAttempts(store, ts, staleAfterMs, {
+    receipts: mintReceipts,
+  });
   const liveVerify = (
     req: Record<string, unknown>,
     bound: {
@@ -1371,29 +1742,18 @@ export function pendingTelegramDeliveries(
       logical_name: unknown;
       sha256: unknown;
     },
-  ): boolean => {
-    try {
-      authority().verifyArtifactForConsumption(String(bound.artifact_id), {
-        execution_id: String(bound.producer_execution_id),
-        mission_id: String(req.mission_id),
-        governed_task_id: String(bound.governed_task_id),
-        logical_name: String(bound.logical_name),
-        sha256: String(bound.sha256),
-      });
-    } catch {
-      return false;
-    }
-    return true;
-  };
+  ): boolean => deliveryLiveVerify(store, req, bound);
+  const wholeContractValid = (
+    req: Record<string, unknown>,
+    receipt: Record<string, unknown>,
+  ): boolean => deliveryWholeContractValid(req, receipt);
+
   // F4 R3.2 — request-owned snapshot storage is canonical store-scoped
   // (deployment root), NEVER derived from mutable outbox_dir/workspace/
   // delivery_id fields. prune + snapshot materialization under this
   // root alone cannot be redirected by a coherent TDR rewrite.
   const snapshotRoot = deliverySnapshotRoot(store);
-  const attemptLedgers = new Map<
-    string,
-    Map<string, DeliveryAttemptSlotHistory>
-  >();
+  const attemptLedgers = new Map<string, DeliveryAttemptLedger>();
   const ledgerFor = (entityId: string, missionId: string) => {
     let l = attemptLedgers.get(entityId);
     if (!l) {
@@ -1414,13 +1774,9 @@ export function pendingTelegramDeliveries(
     // fallback. `bound` = a mint receipt anchors this entity; a row
     // carrying bound provenance fields with no receipt is equally
     // invalid (a receipt is always emitted with the mint that binds).
-    const entityId = String(req.entity_id ?? "");
-    const identityOk =
-      entityId.length > 0 && String(req.delivery_id ?? "") === entityId;
-    const receipts = entityId ? receiptsFor(entityId) : [];
-    const bound = receipts.length > 0;
-    const contractOk =
-      identityOk && receipts.length === 1 && wholeContractValid(req, receipts[0]!);
+    const staticAuth = deliveryStaticAuthority(store, req, mintReceipts);
+    const { entityId, identityOk, bound, contractOk } = staticAuth;
+    const receipts = staticAuth.receipts;
     // F4 R3.2 — NO filesystem read/write/delete derived from a
     // receipt-bound TDR may happen before its static immutable
     // authority has been validated. A bound row that fails its whole
@@ -1433,39 +1789,33 @@ export function pendingTelegramDeliveries(
       pruneDeliverySnapshots(req, snapshotRoot);
     }
     if (String(req.status) !== "QUEUED") continue;
+    // F4 R4.5 — a bound row whose immutable static contract no longer
+    // holds is quarantined HERE, before any lifecycle evidence could be
+    // minted in its name: every slot fails closed, zero evidence, zero
+    // filesystem, zero transport.
+    if (staticAuth.bound && !staticAuth.contractOk) {
+      const probe = { ...req } as Record<string, unknown>;
+      for (const { slot, apply } of slots(req, probe)) {
+        slot.state = "FAILED_DELIVERY";
+        slot.last_error = "FAIL_CLOSED_TELEGRAM_DELIVERY_PROVENANCE";
+        slot.completed_at = ts;
+        delete slot.attempt_id;
+        delete slot.attempt_number;
+        delete slot.attempt_started_at;
+        apply();
+      }
+      probe.status = recomputeStatus(req, probe);
+      putReq(store, probe);
+      continue;
+    }
     // F4 R3.3 — the immutable attempt lifecycle ledger is the high-water
     // authority for every slot: the mutable row is a cache of it. A
     // coherent rollback (SENT→QUEUED, attempt_count→0, deleted
     // message_id) can never mint a new send permission — the slot
     // converges to a durable terminal lifecycle violation instead.
     const ledger = ledgerFor(entityId, String(req.mission_id));
-    const lifecycleViolation = (
-      slotKey: string,
-      slot: DeliverySlot,
-    ): boolean => {
-      const h = ledger.get(slotKey);
-      if (!h || h.events.length === 0) return false;
-      if (Number(slot.attempt_count ?? 0) !== h.consumed) return true;
-      const last = h.events[h.events.length - 1]!;
-      if (last.kind === "STARTED") {
-        return (
-          slot.state !== "SENDING" ||
-          String(slot.attempt_id ?? "") !== String(last.attempt_id ?? "")
-        );
-      }
-      if (last.outcome === "SENT") {
-        return (
-          slot.state !== "SENT" ||
-          String(slot.message_id ?? "") !== String(last.message_id ?? "")
-        );
-      }
-      if (last.outcome === "UNKNOWN") {
-        return slot.state !== "UNKNOWN_SIDE_EFFECT";
-      }
-      // RESOLVED FAILED — legit projections are QUEUED retry or
-      // FAILED_DELIVERY terminal with the consumed count intact.
-      return !(slot.state === "QUEUED" || slot.state === "FAILED_DELIVERY");
-    };
+    const lifecycleViolation = (slotKey: string, slot: DeliverySlot) =>
+      deliverySlotLifecycleViolation(ledger, slotKey, slot);
     if (req.mode === "TEXT") {
       const probe = { ...req } as Record<string, unknown>;
       const [s] = slots(req, probe);

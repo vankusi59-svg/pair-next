@@ -559,3 +559,117 @@ Same 2 env-only `pair-p5` executable-probe failures (reproduced on base
 
 Classification:
 `PAIR_NEXT_PHASE_F4_DELIVERY_SEND_AUTHORITY_R3_PENDING_AUDIT`
+
+---
+
+# R4 — FINAL SEND-GATE / LIFECYCLE LEDGER CLOSURE
+
+Previous audited HEAD: `ebce53d` · New HEAD: (see git log) · Same PR #35.
+
+## Findings closed (mandate R4.1–R4.6)
+
+- **R4.1 — BEGIN is itself the final immutable gate.** `beginDeliveryAttempt`
+  re-loads the durable row inside the SAME `store.immediate` and re-proves,
+  before minting any STARTED: (A) canonical TDR by entity key, (B) exactly one
+  `TELEGRAM_DELIVERY_MINTED` receipt when bound, (C) the complete immutable
+  static contract (`deliveryWholeContractValid`), (D) the slot's live
+  artifact/provenance contract via `verifyArtifactForConsumption`,
+  (E) the rebuilt immutable lifecycle ledger, (F) the row is an exact legal
+  projection of that ledger, (G) the immutable retry ceiling, and only then
+  (H) mints STARTED + SENDING atomically. Terminal SENT/UNKNOWN ledgers NEVER
+  acquire again; an unresolved STARTED yields `ALREADY_CLAIMED` (acquired:false)
+  or fail-closed; FAILED history permits a next attempt only below the
+  immutable ceiling with valid backoff.
+- **R4.2 — receipt-bound ceiling.** `deliveryEffectiveCeiling` derives the
+  effective `max_attempts` from the immutable mint receipt (per-slot entry for
+  FILES, request-level for TEXT) — a mutable widened `max_attempts` is both a
+  contract violation and never authorizes a send.
+- **R4.3 — exact STARTED→RESOLVED pairing.** `resolveDeliveryAttempt` requires,
+  inside its writer transaction, exactly one UNRESOLVED `STARTED` for the slot
+  whose `attempt_id` + `attempt_number` exactly equal the mutable SENDING
+  identity — else `FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE` and ZERO new
+  lifecycle evidence (forged `ATT_FAKE`/replayed already-resolved ids denied).
+  SENT keeps the real-`message_id` requirement.
+- **R4.4 — stale reconcile exact-STARTED authority.**
+  `reconcileStaleDeliveryAttempts` resolves stale SENDING to UNKNOWN only when
+  the static contract holds AND the exact unresolved STARTED exists
+  (id+number match, not already resolved). Forged SENDING without immutable
+  STARTED → the slot is quarantined to `FAILED_DELIVERY` with ZERO RESOLVED
+  evidence — mutable corruption can never be laundered into immutable history.
+- **R4.5 — static contract before any lifecycle evidence.** Stale
+  reconciliation uses the SAME canonical request verifier as pending/begin
+  (`deliveryStaticAuthority` + the pass's receipts map): a statically forged
+  TDR gets ZERO attempt-evidence mutations, and `pendingTelegramDeliveries`
+  additionally quarantines any bound row whose contract fails — FAILED slot,
+  zero evidence, zero filesystem, zero transport.
+- **R4.6 — true sequence validation.** `deliveryAttemptLedger` returns
+  `{slots, valid, error}` and PROVES the per-slot sequence (not just counts):
+  `attempt_number` starts at 1 and increments by exactly 1; each STARTED's
+  `attempt_id` equals the deterministic `ATT_<digest(entity:slot:n)>`; at most
+  one unresolved STARTED; every RESOLVED pairs its preceding open STARTED
+  (exact id+number); no duplicate/unpaired RESOLVED; after terminal
+  SENT/UNKNOWN no later STARTED is legal (`activity_after_terminal`).
+  Malformed immutable history → `ledger.valid === false` → every seam fails
+  closed and no send authority is ever derived from it.
+
+## Canonical reusable verifier (extracted, single semantics)
+
+`deliveryMintReceiptsAll` · `deliveryStaticAuthority` (entity identity +
+receipt resolution + whole-contract verdict) · `deliveryWholeContractValid` ·
+`deliveryDestinationEqual` · `deliveryArtifactAuthority`/`deliveryLiveVerify` ·
+`deliverySlotBinding` · `deliveryCarriesBinding` · `deliveryEffectiveCeiling` ·
+`deliverySlotLifecycleViolation` · `deliveryOpenStarted`. PENDING, BEGIN,
+RESOLVE and stale reconciliation call the same helpers — no incompatible
+duplicated verification.
+
+## Atomicity (mandate)
+
+BEGIN: verification + STARTED + SENDING projection in ONE `store.immediate`.
+RESOLVE: exact-STARTED verification + RESOLVED + row projection in ONE.
+Stale reconcile: static-contract + exact-STARTED verification + UNKNOWN + row
+projection in ONE `store.immediate`. No check-then-write outside the writer
+transaction.
+
+## Adversarial tests added (10 — total file 52/52)
+
+R4.A stale projection + SENT-row rollback → real begin denied, zero network,
+zero STARTED #2, projection converges FAILED · R4.B exhausted retry + mutable
+ceiling widened → real begin denied, zero attempt #4 · R4.C forged SENDING
+(`ATT_FAKE`, n=7) → resolve SENT denied, zero RESOLVED evidence, no immutable
+SENT authority · R4.D replayed already-resolved STARTED identity → second
+resolve denied · R4.E forged stale SENDING without STARTED → ZERO UNKNOWN
+evidence, slot quarantined · R4.F static-contract tamper (mission_id) before
+stale reconciliation → ZERO RESOLVED evidence, zero network, row quarantined ·
+R4.G malformed immutable history (RESOLVED without STARTED via the append-only
+seam) → fail closed, no send · R4.H terminal SENT + mutable QUEUED → direct
+begin denied · R4.I terminal UNKNOWN + mutable QUEUED → direct begin denied ·
+R4.J clean FAILED retry → next canonical attempt permitted (control).
+
+## Validation
+
+| Suite | Result |
+|---|---|
+| `pair-f4-delivery-provenance` (A1–A11 + R1 + R2 + R3 + R4) | 52/52 |
+| `pair-output-delivery-contract` | 69/69 |
+| `pair-planner-dataflow-incident` | 106/106 |
+| `pair-ops-telegram-delivery` + `pair-live-ops-recovery-closure` | 23/23 |
+| `pair-f1-*` + `pair-f2-*` + `pair-f3-*` + phase-d + runtime | 417/417 |
+| `rm -rf dist` → `npx tsc --noEmit` | 0 errors |
+| `pnpm build` | PASS |
+| **Full repository regression** | **3232 pass / 2 fail** |
+| `pnpm audit --audit-level=high` | 0 high (1 low / 8 moderate) |
+
+Only the two known env-only `pair-p5` executable-probe failures remain —
+reproduced on canonical base `3e17525` (DSH/CODEX executables present in this
+environment make `probe().available === true`).
+
+## Remaining limitations
+
+- Legacy (pre-F4, no receipt + no binding fields) rows keep the hash-only
+  path and mint no lifecycle evidence until a begin creates their first
+  STARTED — from then on the ledger rules apply to them too.
+- `deliveryAttemptLedger` validates per-slot sequences; cross-slot shared
+  attempt numbering is not modeled (slots are independent by design).
+
+Classification:
+`PAIR_NEXT_PHASE_F4_FINAL_SEND_GATE_R4_PENDING_AUDIT`

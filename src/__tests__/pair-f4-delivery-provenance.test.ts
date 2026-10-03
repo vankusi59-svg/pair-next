@@ -1511,6 +1511,7 @@ function mkBoundTextTdr(
     text: string;
     chatId?: string | null;
     mission?: Record<string, unknown>;
+    maxAttempts?: number;
   },
 ) {
   const mid = o.missionId;
@@ -1546,6 +1547,7 @@ function mkBoundTextTdr(
     defaultChatId: o.chatId === undefined ? "111" : (o.chatId ?? undefined),
     textPayload: o.text,
     textProvenance,
+    maxAttempts: o.maxAttempts,
   });
   return { req: req!, eid: p.eid, gtId: p.gtId, taskId };
 }
@@ -2366,5 +2368,307 @@ describe("F4 R3 — immutable send-authority closure", () => {
     expect(rec.calls).toHaveLength(1);
     expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
     expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(1);
+  });
+});
+
+/* ============================ F4 R4 — final send-gate / lifecycle ledger ====
+ * Every seam that can mint lifecycle authority re-proves the immutable
+ * contract inside its own writer transaction — a stale or forged
+ * projection can never be laundered into a send. */
+describe("F4 R4 — final send-gate closure", () => {
+  const failRec = (): {
+    calls: SendCall[];
+    transport: GovernedTelegramTransport;
+  } => {
+    const calls: SendCall[] = [];
+    return {
+      calls,
+      transport: {
+        send: async (a: SendCall): Promise<GovernedSendResult> => {
+          calls.push({ ...a });
+          return { kind: "fail", error: "boom" };
+        },
+      },
+    };
+  };
+  const attemptEv = (
+    ctx: ReturnType<typeof makeCtx>,
+    mid: string,
+    kind: string,
+  ) => evidence(ctx, mid, kind);
+  const beginDirect = (
+    ctx: ReturnType<typeof makeCtx>,
+    req: Record<string, unknown>,
+    artifact: string | null,
+  ) =>
+    ctx.control.transitionTelegramDelivery(String(req.delivery_id), {
+      artifact,
+      to: "SENDING",
+    });
+  const resolveDirect = (
+    ctx: ReturnType<typeof makeCtx>,
+    req: Record<string, unknown>,
+    body: Record<string, unknown>,
+  ) =>
+    ctx.control.transitionTelegramDelivery(String(req.delivery_id), body);
+
+  it("R4.A — stale projection rolled back after SENT can never mint attempt #2", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4A";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-a" });
+    const pending = pendingTelegramDeliveries(ctx.store);
+    const req = pending[0]!;
+    // Real send #1 — the old projected copy is retained.
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport });
+    const sent = deliveries(ctx)[0]!;
+    expect(sent.text_state).toBe("SENT");
+    // Coherent rollback through the canonical store seam.
+    const { message_id: _m, ...noMid } = sent as Record<string, unknown>;
+    rewrite(ctx, sent, {
+      ...noMid,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      attempt_count: 0,
+    });
+    // The OLD projection through the REAL begin path must be denied.
+    expect(() => beginDirect(ctx, req, null)).toThrow(
+      /FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE/,
+    );
+    // And the durable row itself can never mint attempt #2 — the
+    // rolled-back projection converges FAILED on the next pending pass.
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+    expect(rec.calls).toHaveLength(1);
+    pendingTelegramDeliveries(ctx.store);
+    const row = deliveries(ctx)[0]!;
+    expect(row.text_state).toBe("FAILED_DELIVERY");
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+  });
+
+  it("R4.B — exhausted retry ceiling bound by the mint receipt; widened mutable max_attempts cannot mint attempt", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4B";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-b", maxAttempts: 3 });
+    const fail = failRec();
+    for (let i = 0; i < 3; i++) {
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + i * 15 * 60 * 1000 + 70_000);
+      await runTransport(ctx, { transport: fail.transport });
+      vi.useRealTimers();
+    }
+    const row = deliveries(ctx)[0]!;
+    expect(row.text_state).toBe("FAILED_DELIVERY");
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(3);
+    // Coherent rewrite: status+state QUEUED, max_attempts widened.
+    rewrite(ctx, row, {
+      ...row,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      max_attempts: 100,
+    });
+    // REAL begin — denied; zero attempt #4.
+    expect(() => beginDirect(ctx, row, null)).toThrow(
+      /FAIL_CLOSED_TELEGRAM_DELIVERY/,
+    );
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(3);
+    await runTransport(ctx, { transport: recordingTransport().transport });
+    expect(fail.calls).toHaveLength(3);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(3);
+  });
+
+  it("R4.C — forged SENDING without any STARTED cannot be resolved SENT", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4C";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-c" });
+    const req = deliveries(ctx)[0]!;
+    // Forge a coherent SENDING with a plausible attempt identity — no
+    // begin was ever called, so no immutable STARTED exists.
+    rewrite(ctx, req, {
+      ...req,
+      status: "QUEUED",
+      text_state: "SENDING",
+      attempt_id: "ATT_FAKE123456",
+      attempt_number: 7,
+      attempt_started_at: new Date().toISOString(),
+    });
+    expect(() =>
+      resolveDirect(ctx, req, { to: "SENT", message_id: 123 }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE/);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(0);
+    // The forged attempt established NO immutable SENT authority —
+    // begin for the slot still mints attempt 1 (or fails the
+    // projection check — never reuses the fake).
+    const row = deliveries(ctx)[0]!;
+    expect(row.text_state).not.toBe("SENT");
+  });
+
+  it("R4.D — replayed resolve against an already-resolved STARTED fails closed", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4D";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-d" });
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport });
+    const sent = deliveries(ctx)[0]!;
+    expect(sent.text_state).toBe("SENT");
+    const started = attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)[0]!;
+    const resolvedId = String(
+      (started.payload as Record<string, unknown>).attempt_id,
+    );
+    // Forge SENDING carrying the ALREADY-RESOLVED attempt identity.
+    rewrite(ctx, sent, {
+      ...sent,
+      status: "QUEUED",
+      text_state: "SENDING",
+      attempt_id: resolvedId,
+      attempt_number: 1,
+      attempt_started_at: new Date().toISOString(),
+    });
+    expect(() =>
+      resolveDirect(ctx, sent, { to: "SENT", message_id: 999 }),
+    ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE/);
+    // Exactly one RESOLVED — the first, legitimate one.
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(1);
+  });
+
+  it("R4.E — forged stale SENDING without STARTED produces ZERO UNKNOWN evidence", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4E";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-e" });
+    const req = deliveries(ctx)[0]!;
+    rewrite(ctx, req, {
+      ...req,
+      status: "QUEUED",
+      text_state: "SENDING",
+      attempt_id: "ATT_FORGEDSTALE",
+      attempt_number: 1,
+      attempt_started_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+    // pending → stale reconcile — the forged attempt has no immutable
+    // STARTED → quarantine the projection, append ZERO evidence.
+    pendingTelegramDeliveries(ctx.store);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(0);
+    const row = deliveries(ctx)[0]!;
+    expect(row.text_state).not.toBe("UNKNOWN_SIDE_EFFECT");
+  });
+
+  it("R4.F — static-contract tamper before stale reconciliation mints ZERO lifecycle evidence", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4F";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-f" });
+    // Legitimate BEGIN — durable SENDING + immutable STARTED.
+    const pend = pendingTelegramDeliveries(ctx.store)[0]!;
+    beginDirect(ctx, pend, null);
+    const sending = deliveries(ctx)[0]!;
+    expect(sending.text_state).toBe("SENDING");
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+    // Tamper the STATIC contract — mission_id drift — while SENDING.
+    rewrite(ctx, sending, { ...sending, mission_id: "MSN_R4F_TAMPERED" });
+    // Age the attempt past the stale window and reconcile.
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 15 * 60_000);
+    pendingTelegramDeliveries(ctx.store);
+    vi.useRealTimers();
+    // ZERO new RESOLVED evidence — static contract fails first; the
+    // forged row is quarantined without any lifecycle evidence.
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(0);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+    const forged = deliveries(ctx)[0]!;
+    expect(forged.text_state).toBe("FAILED_DELIVERY");
+  });
+
+  it("R4.G — malformed immutable sequence (RESOLVED without STARTED) fails closed", () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4G";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-g" });
+    const req = deliveries(ctx)[0]!;
+    // Append a malformed immutable history directly through the
+    // append-only seam — RESOLVED without any STARTED.
+    ctx.store.appendEvidence(mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED, {
+      delivery_id: String(req.delivery_id),
+      slot: "text",
+      attempt_id: "ATT_GHOST",
+      attempt_number: 1,
+      outcome: "SENT",
+      message_id: 1,
+      error: null,
+      resolved_at: new Date().toISOString(),
+    });
+    const pending = pendingTelegramDeliveries(ctx.store);
+    expect(pending).toHaveLength(0);
+    const row = deliveries(ctx)[0]!;
+    expect(row.text_state).toBe("FAILED_DELIVERY");
+  });
+
+  it("R4.H — terminal SENT ledger denies a fresh begin even after mutable QUEUED rollback", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4H";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-h" });
+    await runTransport(ctx, { transport: recordingTransport().transport });
+    const sent = deliveries(ctx)[0]!;
+    rewrite(ctx, sent, {
+      ...sent,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      attempt_count: 1,
+      message_id: 1001,
+    });
+    expect(() => beginDirect(ctx, sent, null)).toThrow(
+      /FAIL_CLOSED_TELEGRAM_DELIVERY/,
+    );
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+  });
+
+  it("R4.I — terminal UNKNOWN ledger denies a fresh begin after mutable QUEUED rollback", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4I";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-i" });
+    // Legit send with an UNKNOWN transport outcome → immutable terminal
+    // UNKNOWN lifecycle authority.
+    await runTransport(ctx, {
+      transport: {
+        send: async () => ({ kind: "unknown", error: "lost" }),
+      },
+    });
+    const unk = deliveries(ctx)[0]!;
+    expect(unk.text_state).toBe("UNKNOWN_SIDE_EFFECT");
+    rewrite(ctx, unk, {
+      ...unk,
+      status: "QUEUED",
+      text_state: "QUEUED",
+      attempt_count: 1,
+    });
+    expect(() => beginDirect(ctx, unk, null)).toThrow(
+      /FAIL_CLOSED_TELEGRAM_DELIVERY/,
+    );
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(1);
+  });
+
+  it("R4.J — a clean FAILED attempt still permits the next canonical retry", async () => {
+    const ctx = makeCtx();
+    const mid = "MSN_R4J";
+    missionRow(ctx, mid);
+    mkBoundTextTdr(ctx, { missionId: mid, text: "r4-j", maxAttempts: 2 });
+    await runTransport(ctx, { transport: failRec().transport });
+    const failed = deliveries(ctx)[0]!;
+    expect(failed.text_state).toBe("QUEUED");
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 15 * 60_000);
+    const rec = recordingTransport();
+    await runTransport(ctx, { transport: rec.transport });
+    vi.useRealTimers();
+    const row = deliveries(ctx)[0]!;
+    expect(row.text_state).toBe("SENT");
+    expect(row.attempt_count).toBe(1);
+    expect(rec.calls).toHaveLength(1);
+    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)).toHaveLength(2);
   });
 });
