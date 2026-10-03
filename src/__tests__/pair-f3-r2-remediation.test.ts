@@ -25,6 +25,7 @@ import type {
 } from "../pair/mission-runtime.js";
 import {
   ApprovalQueue,
+  assertReplanCommitReceipt,
   canonicalPlanSemanticDigest,
   ExecutorRegistry,
   GovernedTaskGate,
@@ -664,5 +665,173 @@ describe("F3 R2 — commit receipt is attempt-bound, never digest-only", () => {
     expect(at.status).toBe("ACCEPTED");
     expect(String(at.commit_receipt?.plan_id)).toBe(String(revs.at(-1)!.plan_id));
     expect(Number(at.commit_receipt?.revision)).toBe(before + 1);
+  });
+});
+
+
+/* ============ F3 R3 — receipt self-consistency (3-way digest) ============ */
+describe("F3 R3 — ACCEPTED receipt independently re-proven on resume", () => {
+  /** Rewrite an attempt row through the CANONICAL store seam — valid
+   *  entity hash + version — so only semantic receipt validation can
+   *  catch the corruption (no hash-mismatch shortcut). */
+  const rewriteAttempt = (
+    ctx: ReturnType<typeof makeCtx>,
+    attempt: ReplanAttemptRecord,
+    mutate: (r: ReplanAttemptRecord) => void,
+  ) => {
+    const row = ctx.store.get(
+      "replan_attempt",
+      attempt.replan_attempt_id,
+    ) as ReplanAttemptRecord;
+    mutate(row);
+    ctx.store.put(
+      "replan_attempt",
+      attempt.replan_attempt_id,
+      row as unknown as Record<string, unknown>,
+      Number(row.version ?? 0),
+    );
+  };
+
+  it("R3.1. valid PREPARED → commit → ACCEPTED receipt → assertReplanCommitReceipt PASS", () => {
+    const ctx = makeCtx("r3-1", () => planB());
+    ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL"), ["FILE_OPERATIONS"]);
+    const mid = ctx.startMission();
+    ctx.tickUntil(mid, () => ctx.service.listTasks(mid).length > 0);
+    invalidateActiveTask(ctx, mid);
+    ctx.toReplanning(mid);
+    const prepared = mkPrepared(ctx, mid, planB());
+    ctx.commitReplan(mid, prepared);
+    const at = attempts(ctx.store, mid)[0];
+    expect(at.status).toBe("ACCEPTED");
+    const rev = assertReplanCommitReceipt(
+      ctx.store.planRevisions(mid),
+      at,
+    );
+    expect(String(rev.plan_id)).toBe(String(at.commit_receipt?.plan_id));
+  });
+
+  it("R3.2. canonically-rewritten receipt digest (same plan_id/revision, WRONG digest) → FAIL_CLOSED on resume", () => {
+    const ctx = makeCtx("r3-2", () => planB());
+    ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL"), ["FILE_OPERATIONS"]);
+    const mid = ctx.startMission();
+    ctx.tickUntil(mid, () => ctx.service.listTasks(mid).length > 0);
+    invalidateActiveTask(ctx, mid);
+    ctx.toReplanning(mid);
+    const prepared = mkPrepared(ctx, mid, planB());
+    ctx.commitReplan(mid, prepared); // valid ACCEPTED
+    // Corrupt ONLY the receipt's semantic digest via the canonical
+    // seam — plan_id + revision stay correct, entity hash stays valid.
+    rewriteAttempt(ctx, prepared, (r) => {
+      if (r.commit_receipt) {
+        r.commit_receipt = {
+          ...r.commit_receipt,
+          plan_semantic_digest: "ff".repeat(32),
+        };
+      }
+    });
+    const corrupted = attempts(ctx.store, mid)[0];
+    expect(corrupted.status).toBe("ACCEPTED");
+    expect(() => ctx.commitReplan(mid, corrupted)).toThrowError(
+      /FAIL_CLOSED_REPLAN_COMMIT_RECEIPT/,
+    );
+  });
+
+  it("R3.3. receipt digest correct but revision carries NO attempt binding → FAIL_CLOSED", () => {
+    const ctx = makeCtx("r3-3", () => planB());
+    ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL"), ["FILE_OPERATIONS"]);
+    const mid = ctx.startMission();
+    ctx.tickUntil(mid, () => ctx.service.listTasks(mid).length > 0);
+    invalidateActiveTask(ctx, mid);
+    ctx.toReplanning(mid);
+    const prepared = mkPrepared(ctx, mid, planB());
+    // Commit an UNBOUND same-digest revision, then forge an ACCEPTED
+    // receipt naming it (digest matches — only the binding proof fails).
+    const unbound = ctx.service.commitPlan({
+      mission_id: mid,
+      tasks: planB().tasks,
+      source: "AUTOMATON_PLANNER",
+      reason: "replan",
+      proposal: planB(),
+    });
+    const ledger = new ReplanAttemptLedger(ctx.store);
+    ledger.markCommitted(prepared.replan_attempt_id, {
+      plan_id: unbound.plan_id,
+      revision: unbound.revision,
+      plan_semantic_digest: digestB(),
+    });
+    const at = attempts(ctx.store, mid)[0];
+    expect(() => ctx.commitReplan(mid, at)).toThrowError(
+      /FAIL_CLOSED_REPLAN_COMMIT_RECEIPT/,
+    );
+  });
+
+  it("R3.4. receipt digest == revision digest but != candidate digest → FAIL_CLOSED", () => {
+    const ctx = makeCtx("r3-4", () => planB());
+    ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL"), ["FILE_OPERATIONS"]);
+    const mid = ctx.startMission();
+    ctx.tickUntil(mid, () => ctx.service.listTasks(mid).length > 0);
+    invalidateActiveTask(ctx, mid);
+    ctx.toReplanning(mid);
+    const prepared = mkPrepared(ctx, mid, planB()); // candidate = digestB
+    // Revision bound to this attempt but committed over DIFFERENT tasks
+    // (digestA) — receipt digest == revision digest, both != candidate.
+    const foreignDigest = ctx.service.commitPlan({
+      mission_id: mid,
+      tasks: planA().tasks,
+      source: "AUTOMATON_PLANNER",
+      reason: "replan",
+      proposal: planA(),
+      replan_commit: {
+        recovery_id: prepared.recovery_id,
+        replan_attempt_id: prepared.replan_attempt_id,
+        superseded_plan_id: String(prepared.superseded_plan_id),
+      },
+    });
+    const digestA = String(foreignDigest.plan_semantic_digest);
+    expect(digestA).not.toBe(digestB());
+    // Forge ACCEPTED receipt consistent with the foreign-digest
+    // revision — markCommitted would refuse, so write via the seam.
+    rewriteAttempt(ctx, prepared, (r) => {
+      r.status = "ACCEPTED";
+      r.commit_receipt = {
+        plan_id: foreignDigest.plan_id,
+        revision: foreignDigest.revision,
+        plan_semantic_digest: digestA,
+      };
+    });
+    const at = attempts(ctx.store, mid)[0];
+    expect(() => ctx.commitReplan(mid, at)).toThrowError(
+      /FAIL_CLOSED_REPLAN_COMMIT_RECEIPT/,
+    );
+  });
+
+  it("R3.5. valid ACCEPTED stale-resume → converge, ZERO new revision, ZERO planner call", () => {
+    const ctx = makeCtx("r3-5", () => planB());
+    ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL"), ["FILE_OPERATIONS"]);
+    const mid = ctx.startMission();
+    ctx.tickUntil(mid, () => ctx.service.listTasks(mid).length > 0);
+    invalidateActiveTask(ctx, mid);
+    ctx.toReplanning(mid);
+    const prepared = mkPrepared(ctx, mid, planB());
+    ctx.commitReplan(mid, prepared);
+    const count = ctx.store.planRevisions(mid).length;
+    ctx.store.close();
+    const { store2, calls2, runtime2, drive2 } = rebuild(ctx, () => planA());
+    // Stale PREPARED snapshot resume on the rebuilt runtime — the in-txn
+    // re-read sees ACCEPTED + proven receipt → converge, zero writes.
+    (
+      runtime2 as unknown as {
+        commitPreparedReplan(
+          m: string,
+          p: ReplanAttemptRecord,
+          l: ReplanAttemptLedger,
+        ): void;
+      }
+    ).commitPreparedReplan(mid, prepared, new ReplanAttemptLedger(store2));
+    expect(store2.planRevisions(mid)).toHaveLength(count);
+    expect(calls2.filter((c) => c.reason === "replan")).toHaveLength(0);
+    expect(drive2(mid)).toBe("COMPLETED");
+    expect(store2.planRevisions(mid)).toHaveLength(count);
+    store2.close();
   });
 });

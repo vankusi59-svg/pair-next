@@ -464,8 +464,16 @@ export function revisionBoundToAttempt(
   );
 }
 
-/** §5 — exact commit-receipt validation: an ACCEPTED attempt's receipt
- *  must name a revision that exists and is bound to THIS attempt. */
+/** F3 R3 §5 — exact commit-receipt validation: an ACCEPTED attempt's
+ *  receipt must independently prove EVERY field — resume consumes the
+ *  durable row and cannot lean on markCommitted having checked it at
+ *  write time (a coherently store-rewritten receipt keeps a valid
+ *  entity hash). The semantic digest is a THREE-WAY identity:
+ *    attempt.candidate_plan_semantic_digest
+ *      == receipt.plan_semantic_digest
+ *      == revision.plan_semantic_digest
+ *  plus the revision exists, is named by plan_id+revision, and binds
+ *  THIS attempt exactly. No field is diagnostic-only. */
 export function assertReplanCommitReceipt(
   revisions: Array<Record<string, unknown>>,
   attempt: ReplanAttemptRecord,
@@ -479,7 +487,15 @@ export function assertReplanCommitReceipt(
             Number(r.revision) === Number(receipt.revision),
         )
       : undefined;
-  if (!rev || !revisionBoundToAttempt(rev, attempt)) {
+  if (
+    !receipt ||
+    !rev ||
+    String(receipt.plan_semantic_digest) !==
+      String(attempt.candidate_plan_semantic_digest ?? "") ||
+    String(receipt.plan_semantic_digest) !==
+      String(rev.plan_semantic_digest) ||
+    !revisionBoundToAttempt(rev, attempt)
+  ) {
     throw new IntegrityError(
       "FAIL_CLOSED_REPLAN_COMMIT_RECEIPT",
       `${attempt.replan_attempt_id}:${receipt?.plan_id ?? "none"}@${receipt?.revision ?? "none"}`,

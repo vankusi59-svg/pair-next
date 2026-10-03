@@ -385,3 +385,50 @@ recovery while no active Plan-B commit ever happened.
 
 **Classification:**
 `PAIR_NEXT_PHASE_F3_PLANNER_RECOVERY_ARTIFACT_DATAFLOW_CLOSURE_R2_PENDING_SOURCE_REVIEW`
+
+# R3 FINAL COMMIT-RECEIPT SELF-CONSISTENCY CLOSURE (post-R2 audit)
+
+Finding: `assertReplanCommitReceipt` verified revision↔attempt binding
+but never independently re-proved the RECEIPT's own
+`plan_semantic_digest`. An ACCEPTED row whose receipt digest was
+coherently rewritten through the canonical store seam (valid entity
+hash, valid version) still passed the resume verifier while
+plan_id/revision pointed at the correct bound revision.
+
+## R3 change (narrow)
+
+`assertReplanCommitReceipt` now enforces the THREE-WAY digest identity —
+no field is diagnostic-only:
+
+    attempt.candidate_plan_semantic_digest
+      == receipt.plan_semantic_digest
+      == revision.plan_semantic_digest
+
+plus receipt exists, names revision by plan_id+revision, and
+`revisionBoundToAttempt` holds (mission / recovery_id /
+replan_attempt_id / superseded_plan_id). Any deviation →
+`FAIL_CLOSED_REPLAN_COMMIT_RECEIPT`.
+
+## R3 tests (5 new, inside pair-f3-r2-remediation.test.ts — file now 15/15)
+
+- R3.1 valid commit → ACCEPTED → receipt verifier PASS.
+- R3.2 receipt digest rewritten via canonical store.put (same
+  plan_id/revision, valid hash) → resume FAIL_CLOSED — proves SEMANTIC
+  receipt validation, not hash-mismatch shortcut.
+- R3.3 receipt digest correct but revision unbound → FAIL_CLOSED.
+- R3.4 receipt digest == revision digest but != candidate → FAIL_CLOSED.
+- R3.5 valid ACCEPTED stale-resume → converge, zero new revision, zero
+  planner call. R3.6/R3.7 covered by re-run H1/H10 (15/15 green).
+
+## R3 validation
+
+- R3+R2 file 15/15; R1 20/20; F3 37/37; incident 106; focused batch
+  416/416 incl. F1 races post `rm -rf dist`; `pnpm build` PASS;
+  `npx tsc --noEmit` 0; `pnpm audit --audit-level=high` clean (1 low /
+  8 moderate).
+- Full regression 3180 pass / 2 fail — only the base-reproduced
+  environment-only P5 probe tests.
+- R1.1/R1.2/R1.3/R2 invariants preserved; no async planner work.
+
+**Classification:**
+`PAIR_NEXT_PHASE_F3_PLANNER_RECOVERY_ARTIFACT_DATAFLOW_CLOSURE_R3_PENDING_SOURCE_REVIEW`
