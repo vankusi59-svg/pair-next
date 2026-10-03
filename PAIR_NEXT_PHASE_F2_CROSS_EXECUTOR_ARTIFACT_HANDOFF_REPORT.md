@@ -6,7 +6,7 @@ Classification: `PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_PENDING_SOUR
 |---|---|
 | Canonical base SHA | `b903cb473b0ccff37cee93ad7062f274bf90dfb8` (PR #31 merge commit — F1 R1–R7 merged) |
 | Branch | `devin/1790999231-phase-f2-artifact-handoff` |
-| New HEAD | `<pending>` |
+| New HEAD | `21914ac4fafd4cf2ac6394a8e0968fe46a5f1b00` |
 | PR | (single new PR — created with this report) |
 | Scope | F2 ONLY. No F3. No P15. No merge. |
 
@@ -209,7 +209,7 @@ Test file: `src/__tests__/pair-f2-artifact-handoff.test.ts` (53 tests, A–N).
 | Focused: F1 authority (20) + dataflow incident (106) + llm-planner (16) + output-delivery (69) | PASS — 211 |
 | `pnpm build` | PASS |
 | `pnpm audit --audit-level=high` | PASS — 0 high |
-| Full suite (`pnpm test`) on FINAL HEAD | `<pending>` |
+| Full suite (`pnpm test`)  on FINAL HEAD 21914ac4fafd4cf2ac6394a8e0968fe46a5f1b00 | `21914ac4fafd4cf2ac6394a8e0968fe46a5f1b00` |
 | Cross-executor matrix L→L / R→L / L→R / R→R | PASS — I1–I4 |
 | DAG narrowing accept vs control-reject | PASS — M1–M3 |
 
