@@ -849,6 +849,11 @@ const server = createMissionControlServer({
   // minted execution-scoped capability).
   artifactUploadToken:
     process.env.PAIR_ARTIFACT_UPLOAD_TOKEN || process.env.PAIR_BROKER_TOKEN || undefined,
+  // F2 consume master: verifies x-artifact-consume-capability at
+  // /api/artifacts/fetch — resolved ONCE here at bootstrap (same chain
+  // the executor mints against); request handling never reads env.
+  artifactConsumeToken:
+    process.env.PAIR_ARTIFACT_UPLOAD_TOKEN || process.env.PAIR_BROKER_TOKEN || undefined,
   // Business layer: companies/org-agents/work-items/routines/budgets —
   // always on; entities live in the canonical store alongside missions.
   business,

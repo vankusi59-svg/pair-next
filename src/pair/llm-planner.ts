@@ -10,6 +10,7 @@
  */
 
 import { PolicyError } from "./errors.js";
+import { extractTaskDataflow } from "./plan-dataflow.js";
 
 export const LLM_PLANNER_MAX_INSTRUCTION = 2000;
 export const LLM_PLANNER_DEFAULT_MAX_TASKS = 5;
@@ -110,8 +111,9 @@ function extractJson(text: string): unknown {
 
 /**
  * Capabilities served by remote executors whose outputs live on the remote
- * side (returned as refs, not local workspace files). A remote task must be a
- * DAG leaf: a downstream local task cannot consume a remote artifact.
+ * side (returned as refs, not local workspace files). F2: a downstream task
+ * may consume a remote artifact ONLY through an explicitly declared
+ * produces/consumes edge — undeclared remote coupling stays rejected.
  */
 const REMOTE_CAPS = new Set([
   "REMOTE_CLOUD_TASK_EXECUTION",
@@ -138,6 +140,17 @@ export function sanitizePlan(
   const tasks: Array<Record<string, unknown>> = [];
   const seen = new Set<string>();
   const remoteKeys = new Set<string>();
+  const rawByKey = new Map(raw.map((t) => [String(t.task_key ?? ""), t]));
+  /** F2 §20 — sanitize-stage edge check via the same dataflow model the
+   *  committed plan applies later (planner-supplied pair_dataflow is a
+   *  hint only; assertPlanDataflow re-verifies without reserved keys). */
+  const candidateTaskDataflow = (t: Record<string, unknown>) => {
+    try {
+      return extractTaskDataflow(t);
+    } catch {
+      return { produces: [] as string[], consumes: [] as string[] };
+    }
+  };
   for (const t of raw) {
     if (tasks.length >= maxTasks) {
       warnings.push("MAX_TASKS_TRUNCATED");
@@ -169,18 +182,38 @@ export function sanitizePlan(
       warnings.push(`DROP_EMPTY_INSTRUCTION:${key}`);
       continue;
     }
-    // Remote tasks are leaves — drop the task rather than prune the edge when
-    // a later task tries to depend on remote output that can never be local.
-    // Exception: TELEGRAM_DELIVERY — it consumes the remote task's returned
-    // result text via dependency_outputs (not remote files), so that edge is
-    // safe and is how remote-produced reports reach the operator.
+    // F2 §20 — remote tasks are no longer unconditional leaves: a
+    // dependent may consume remote output ONLY through an explicitly
+    // declared artifact edge (a consume name the remote dep produces).
+    // TELEGRAM_DELIVERY remains exempt (it consumes result text via
+    // dependency_outputs, not remote files). A remote dep with no
+    // declared edge stays rejected — plan-dataflow re-verifies the same
+    // rule authoritatively against the committed plan.
     const isTelegramDelivery = caps.includes("TELEGRAM_DELIVERY");
     const deps = Array.isArray(t.depends_on)
       ? [...new Set(t.depends_on.map((d) => String(d)).filter((d) => seen.has(d)))]
       : [];
-    if (!isTelegramDelivery && deps.some((d) => remoteKeys.has(d))) {
-      warnings.push(`DROP_REMOTE_DEPENDENT:${key}`);
-      continue;
+    if (!isTelegramDelivery) {
+      const cand = candidateTaskDataflow({
+        task_key: key,
+        task_instruction: instruction,
+        required_capabilities: caps,
+        metadata:
+          t.metadata &&
+          typeof t.metadata === "object" &&
+          !Array.isArray(t.metadata)
+            ? t.metadata
+            : {},
+      });
+      const ungoverned = deps.some((d) => {
+        if (!remoteKeys.has(d)) return false;
+        const depProduces = candidateTaskDataflow(rawByKey.get(d) ?? {});
+        return !cand.consumes.some((c) => depProduces.produces.includes(c));
+      });
+      if (ungoverned) {
+        warnings.push(`DROP_REMOTE_DEPENDENT:${key}`);
+        continue;
+      }
     }
     if (Array.isArray(t.depends_on) && deps.length !== new Set(t.depends_on.map((d) => String(d))).size) {
       warnings.push(`DEP_FORWARD_OR_UNKNOWN_PRUNED:${key}`);
@@ -217,7 +250,7 @@ Rules:
 - 2 to MAX_TASKS tasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS/AUTOMATON_TASK_EXECUTION for pure file writes.
 - LIVE DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price") that local executors cannot fetch — local executors have NO internet — the data-gathering task MUST use REMOTE_CLOUD_TASK_EXECUTION (the remote executor has a real browser/network). Instruct it to RETURN the full findings as its final result text — files it writes stay remote and are invisible locally.
 - REAL BUILD WORK: when the goal asks to actually BUILD or FIX software (xây/build/create a website/app/tool/bot/script, viết code, fix bug, deploy) — i.e. real code across multiple files, not a single small file — the build task MUST use REMOTE_CLOUD_TASK_EXECUTION. Local executors can only write simple text files and CANNOT code real software; giving them build work produces documentation instead of a product. Instruct the remote task to RETURN a summary + key file contents (or upload via outbox for larger artifacts).
-- REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION run on a REMOTE executor: their files stay remote (only the returned result text comes back). Such a task must be a DAG leaf — the ONLY dependent allowed is a TELEGRAM_DELIVERY task, which receives the remote result text through dependency_outputs.
+- REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION run on a REMOTE executor: their result text comes back, and their uploaded files land as canonical artifacts. A downstream task may depend on a remote task ONLY when it explicitly declares the produced artifact as an input (read the file it produces — name the artifact in its instruction or worker_spec); a remote dep with no declared artifact edge is rejected. TELEGRAM_DELIVERY tasks always may depend on remote tasks (they receive the remote result text through dependency_outputs).
 - VISUAL DELIVERABLES: if the goal asks for a real chart, screenshot, or image (chụp ảnh/biểu đồ/chart/screenshot), the remote task must capture it with its browser AND upload the file via the outbox endpoint described in its prompt — the file is unusable if it stays on the remote machine. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
 - TELEGRAM_DELIVERY (when ALLOWED): ONLY when the goal EXPLICITLY asks to send/deliver named output to Telegram (gửi tele/telegram, báo qua telegram, send/deliver to telegram) — never add it for a goal that merely mentions a file, an outbox, or completion. Add it as a DAG-leaf task with capability TELEGRAM_DELIVERY, depending ONLY on the tasks that produce what the goal asked to be sent. PAIR pins the delivery manifest, the canonical output language, and the final delivery instruction from the operator request — the plan does not choose what may be sent, in which language, or how. Instruction placeholder: "Stage the manifested artifacts into outbox/ unchanged, then reply DONE." (PAIR rewrites it canonically.)
 - FILE DELIVERABLES: when the goal names a file to create AND asks to send it (e.g. "tạo file X.md ... gửi telegram"), the producing task must write the file directly into outbox/<exact filename> — not the workspace root — so the delivery pipeline picks it up.

@@ -641,7 +641,14 @@ export function assertTaskDeliverySemantic(
  * Unsafe declared paths fail closed.
  */
 export function extractTaskDataflow(task: Record<string, unknown>): TaskDataflow {
-  if (isRemoteTask(task)) return { produces: [], consumes: [] };
+  // F2 §20 — remote tasks now carry dataflow names: their produces are
+  // the canonical ART logical names and their consumes are governed by
+  // the artifact handoff contract (acread fetch), both resolved only to
+  // F1-validated canonical artifacts. The fail-closed counterpart is in
+  // assertPlanDataflow: a remote task listed in depends_on must be bound
+  // by an explicitly declared consume edge — undeclared remote coupling
+  // still fails.
+
   const c = contractArtifacts(task);
   const i = instructionArtifacts(task);
   const d = declaredArtifacts(task);
@@ -715,6 +722,9 @@ function requiredEdges(
   }
   const out: Array<{ producerIndex: number; artifact: string }[]> = tasks.map(
     () => [],
+  );
+  const indexByKey = new Map(
+    tasks.map((t, j) => [String(t.task_key), j] as const),
   );
   for (const [i, task] of tasks.entries()) {
     const key = String(task.task_key ?? "");
@@ -818,6 +828,24 @@ function requiredEdges(
             : "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
           JSON.stringify({ task: key, artifact }),
         );
+      }
+    }
+    // F2 §20 — DAG-LEAF NARROWING: a remote task listed in depends_on
+    // must be bound by an explicitly declared consume edge resolved in
+    // this loop. Remote coupling with no governed artifact edge can
+    // never become a canonical handoff, so it remains rejected like any
+    // undeclared dependency.
+    if (!isDeliveryTask(task)) {
+      for (const dep of (task.depends_on as string[] | undefined) ?? []) {
+        const j = indexByKey.get(String(dep));
+        if (j === undefined || j === i) continue;
+        if (!isRemoteTask(tasks[j])) continue;
+        if (!out[i].some((r) => r.producerIndex === j)) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_PLAN_DATAFLOW_UNGOVERNED_REMOTE_EDGE",
+            JSON.stringify({ task: key, depends_on: String(dep) }),
+          );
+        }
       }
     }
   }

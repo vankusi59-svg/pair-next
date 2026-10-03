@@ -27,6 +27,12 @@ import { atomicWriteJson, utcnow, workerExecutionId } from "./canonical.js";
 import { devinBlockedGraceMs, devinTaskTimeoutMs } from "./env-config.js";
 import { mintBrokerCapability } from "./broker-capability.js";
 import { mintArtifactCapability } from "./artifact-capability.js";
+import {
+  artifactDependencySetDigest,
+  mintArtifactConsumeCapability,
+  artifactConsumeCapabilityMasterFromEnv,
+} from "./artifact-consume-capability.js";
+import type { DependencyArtifactEntry } from "./artifact-handoff.js";
 import type { ExecutorAdapter } from "./adapter.js";
 
 export const DEVIN_EXECUTOR_ID = "DEVIN";
@@ -163,6 +169,128 @@ const curlFetch: DevinFetch = (method, url, body, authHeader) => {
     return { status: 0, data: { error: String((error as Error).message).slice(0, 200) } };
   }
 };
+
+/**
+ * F2 R2.5 — ONE canonical POSIX shell-literal encoder. Any string —
+ * spaces, unicode, apostrophes, `$`, backticks, `;`, quotes — becomes a
+ * single-quoted literal that can never inject shell. The only escape
+ * needed inside single quotes is for `'` itself (`'"'"'`).
+ */
+export function shellLiteral(value: string): string {
+  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+}
+
+/**
+ * F2 R1.6 + R2.5 — the ONE production builder for the remote dependency
+ * fetch recipe. Properties:
+ *   - every interpolated value goes through shellLiteral (the canonical
+ *     logical-name charset is broader than a safe single-quoted literal)
+ *   - the target is EXACTLY entry.consumer_relative_path
+ *   - download lands in a tmp sibling; the verified artifact reaches
+ *     the target only via atomic no-replace publication (hard-link
+ *     create-if-absent) — a raced/existing destination is never
+ *     overwritten: exact canonical bytes converge, anything else fails
+ *   - real `sha256sum` + `wc -c` verification inside a bounded 5-attempt
+ *     loop; a quarantined copy of the last bad download is kept
+ *   - on exhaustion the recipe removes any unverified file, prints
+ *     DEPENDENCY_FETCH_FAILED <artifact_id> and EXITS NON-ZERO — the
+ *     preparation command actually fails, so task work never continues
+ */
+export function buildDependencyFetchRecipe(
+  entry: {
+    artifact_id: string;
+    sha256: string;
+    byte_size: number;
+    consumer_relative_path: string;
+  },
+  args: { fetchBase: string; consumeCapability: string },
+): string {
+  const art = String(entry.artifact_id);
+  const url = shellLiteral(
+    `${String(args.fetchBase).replace(/\/+$/, "")}/api/artifacts/fetch`,
+  );
+  const body = shellLiteral(JSON.stringify({ artifact_id: art }));
+  const target = shellLiteral(entry.consumer_relative_path);
+  const cap = shellLiteral(args.consumeCapability);
+  const sha = shellLiteral(entry.sha256);
+  const size = shellLiteral(String(entry.byte_size));
+  const failEcho = shellLiteral(`DEPENDENCY_FETCH_FAILED ${art}`);
+  // R4 — a successful recipe must FALL THROUGH, never `exit 0`: the
+  // preparation shell composes ONE recipe per pinned artifact
+  // (buildDependencyFetchPreparation joins them), so `exit 0` after
+  // artifact #1 would terminate the shell and leave artifacts #2..N
+  // unprepared. Only failure exits non-zero — it stops preparation and
+  // prevents later task work. Success paths finish the artifact, clean
+  // the temp, and return to the next recipe.
+  return [
+    `target=${target}`,
+    // dep_ok <file>: an EXISTING object is consumable only when it is a
+    // regular non-symlink file with EXACTLY the pinned sha + size.
+    `dep_ok() {`,
+    `  [ -f "$1" ] && [ ! -L "$1" ] &&`,
+    `  [ "$(sha256sum -- "$1" | cut -d' ' -f1)" = ${sha} ] &&`,
+    `  [ "$(wc -c < "$1" | tr -d ' ')" = ${size} ]`,
+    `}`,
+    // R3.2 — no-clobber: an existing exact target converges without a
+    // download (and never creates a temp); any other existing object
+    // fails (never overwritten).
+    `if dep_ok "$target"; then`,
+    `  :`,
+    `elif [ -e "$target" ] || [ -L "$target" ]; then`,
+    `  echo ${failEcho}`,
+    `  exit 3`,
+    `else`,
+    `  mkdir -p -- "$(dirname -- "$target")" || { echo ${failEcho}; exit 3; }`,
+    `  tmp="$target.tmp.$$"`,
+    `  ok=0`,
+    `  for i in 1 2 3 4 5; do`,
+    `    if curl -sf -X POST ${url} -H "x-artifact-consume-capability: "${cap} -H "content-type: application/json" -d ${body} -o "$tmp"; then`,
+    `      if dep_ok "$tmp"; then ok=1; break; fi`,
+    `    fi`,
+    `    sleep "$((i * \${PAIR_FETCH_BACKOFF:-2}))"`,
+    `  done`,
+    `  if [ "$ok" != 1 ]; then`,
+    `    if [ -f "$tmp" ]; then mv -f -- "$tmp" "$target.quarantine" 2>/dev/null || rm -f -- "$tmp"; fi`,
+    `    rm -f -- "$tmp"`,
+    `    echo ${failEcho}`,
+    `    exit 3`,
+    `  fi`,
+    // Atomic create-if-absent publication — ln loses with EEXIST rather
+    // than replacing; the raced destination is then re-validated. On
+    // success or exact-converge the temp hardlink is removed; anything
+    // else fails preparation.
+    `  if ln -- "$tmp" "$target" 2>/dev/null; then`,
+    `    rm -f -- "$tmp"`,
+    `  elif dep_ok "$target"; then`,
+    `    rm -f -- "$tmp"`,
+    `  else`,
+    `    rm -f -- "$tmp"`,
+    `    echo ${failEcho}`,
+    `    exit 3`,
+    `  fi`,
+    `fi`,
+  ].join("\n");
+}
+
+/**
+ * R4 — ONE canonical preparation composition for ALL of a task's pinned
+ * dependency artifacts: the exact block Devin's buildPrompt embeds.
+ * Each recipe falls through on success so every artifact is prepared;
+ * a failure exits non-zero and stops preparation before task work.
+ */
+export function buildDependencyFetchPreparation(
+  entries: {
+    artifact_id: string;
+    sha256: string;
+    byte_size: number;
+    consumer_relative_path: string;
+  }[],
+  args: { fetchBase: string; consumeCapability: string },
+): string {
+  return entries
+    .map((e) => buildDependencyFetchRecipe(e, args))
+    .join("\n");
+}
 
 export class DevinExecutorAdapter implements ExecutorAdapter {
   readonly executor_id = DEVIN_EXECUTOR_ID;
@@ -313,8 +441,10 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     // minted execution-scoped capability (never the master itself) — the
     // upload lands as a canonical ART_* row. The generic outbox token path
     // remains legacy storage-only compatibility.
-    const artifactMaster =
-      process.env.PAIR_ARTIFACT_UPLOAD_TOKEN || process.env.PAIR_BROKER_TOKEN;
+    // R1.5 — ONE canonical master resolution seam shared with the
+    // server's consume-fetch lane: PAIR_ARTIFACT_UPLOAD_TOKEN then
+    // PAIR_BROKER_TOKEN (PAIR_OUTBOX_TOKEN is never artifact authority).
+    const artifactMaster = artifactConsumeCapabilityMasterFromEnv();
     if (outboxUrl && artifactMaster) {
       const executionId = workerExecutionId(this.executor_id, String(task.governed_task_id));
       const cap = mintArtifactCapability(artifactMaster, {
@@ -330,6 +460,47 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
     } else if (outboxUrl && process.env.PAIR_OUTBOX_TOKEN) {
       lines.push(
         `File deliverables: if the instruction asks for a chart, screenshot, or any file the operator must receive, upload each via: curl -X POST "${outboxUrl}/api/outbox" -H "x-outbox-token: ${process.env.PAIR_OUTBOX_TOKEN}" -H "content-type: application/json" -d '{"mission_id":"${String(task.mission_id)}","task_id":"${String(task.task_id)}","filename":"<name>.png","data_base64":"<base64 content>"}'. Allowed: png/jpg/jpeg/webp/gif/md/txt, max 8MB. Do this BEFORE emitting the completion marker.`,
+      );
+    }
+    // F2 §16 — governed dependency fetch: when the governed task pins
+    // dependency_artifacts, the remote worker fetches each canonical
+    // artifact through a consume capability (acread1) bound to THIS
+    // execution and to the pinned dependency-set digest. The worker
+    // receives artifact_id, sha256, byte_size and a remote-relative
+    // target path — never the master secret, CAS layout, or host paths.
+    const depArts = (task.dependency_artifacts as DependencyArtifactEntry[] | undefined) ?? [];
+    const fetchBase = process.env.PAIR_OUTBOX_URL;
+    if (depArts.length && fetchBase && artifactMaster) {
+      const executionId = workerExecutionId(this.executor_id, String(task.governed_task_id));
+      const depSetDigest = artifactDependencySetDigest(depArts);
+      const consume = mintArtifactConsumeCapability(artifactMaster, {
+        mission_id: String(task.mission_id),
+        task_id: String(task.task_id),
+        governed_task_id: String(task.governed_task_id),
+        execution_id: executionId,
+        executor_id: this.executor_id,
+        dependency_set_digest: depSetDigest,
+      });
+      const items = depArts
+        .map(
+          (e) =>
+            `  - ${e.logical_name} → ${e.consumer_relative_path} (sha256:${e.sha256}, byte_size:${e.byte_size}, artifact_id:${e.artifact_id})`,
+        )
+        .join("\n");
+      // R1.6/R2.5/R4 — bounded-retry fetch protocol built by ONE canonical
+      // production composition (shell-safe literals, download-to-tmp, real
+      // digest+size verification, quarantine, non-zero exit on failure;
+      // each successful recipe FALLS THROUGH so every pinned artifact is
+      // prepared before task work).
+      lines.push(
+        "Dependency artifacts: PAIR pinned canonical input artifacts for this task. Fetch each into the workspace at the listed relative path BEFORE starting work:\n" +
+          items +
+          `\nFor EACH listed artifact run exactly this bounded recipe (the first fetch may briefly return 403/404 while the execution publishes — the loop's 5 attempts with growing sleeps cover only that window, never retry forever). A recipe EXITS NON-ZERO on failure — a non-zero exit means the task must not continue:\n` +
+          buildDependencyFetchPreparation(depArts, {
+            fetchBase,
+            consumeCapability: consume,
+          }) +
+          `\nIf the digest or byte size never verifies, or a fetch still fails after the bounded retries, the recipe quarantines/removes the file, prints DEPENDENCY_FETCH_FAILED and exits non-zero: STOP and report — never substitute your own content.`,
       );
     }
     // Credential broker: when a service needs a login/token, the agent pulls

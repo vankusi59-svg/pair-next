@@ -10,6 +10,8 @@ export * from "./gate.js";
 export * from "./artifact-validation.js";
 export * from "./artifact-authority.js";
 export * from "./artifact-capability.js";
+export * from "./artifact-consume-capability.js";
+export * from "./artifact-handoff.js";
 export * from "./proposal.js";
 export * from "./output-language.js";
 export * from "./plan-dataflow.js";

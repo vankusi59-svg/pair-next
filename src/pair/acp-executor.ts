@@ -120,12 +120,28 @@ export function buildGovernedPrompt(task: Record<string, unknown>): string {
       JSON.stringify(deps, null, 1) +
       "\n\n"
     : "";
+  // F2 §17 — the canonical dependency-artifact contract: PAIR already
+  // materialized each pinned artifact into the governed handoff root
+  // inside the workspace. The agent receives logical name + expected
+  // digest + relative path — never the producer's paths.
+  const depArts = (task.dependency_artifacts as unknown[]) ?? [];
+  const depArtBlock = depArts.length
+    ? "DEPENDENCY ARTIFACTS — canonical bytes pre-materialized by PAIR (read-only, do not modify):\n" +
+      (depArts as Array<Record<string, unknown>>)
+        .map(
+          (e) =>
+            `- ${String(e.logical_name)} (sha256:${String(e.sha256).slice(0, 16)}…, ${e.byte_size} bytes) → workspace/${String(e.consumer_relative_path)}`,
+        )
+        .join("\n") +
+      "\n\n"
+    : "";
   return (
     "PAIR OS GOVERNED SOFTWARE TASK. You are a replaceable executor, not mission authority.\n" +
     `Mission ID: ${task.mission_id}\nTask ID: ${task.task_id}\nPlan revision: ${task.plan_revision ?? ""}\n` +
     `Correlation ID: ${task.correlation_id}\n` +
     `Task instruction: ${task.task_instruction}\n\n` +
     depBlock +
+    depArtBlock +
     "HARD WORKSPACE BOUNDARY:\n" +
     `- workspace: ${task.workspace}\n- allowed paths:\n${allowed}\n` +
     "Never access or modify a path outside the workspace/allowed paths. Never read credential stores or dump secrets.\n" +
