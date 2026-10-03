@@ -55,7 +55,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { boundedFileSha256, digest, sha256Hex } from "./canonical.js";
+import { boundedFileSha256, compatOutboxBasename, digest, sha256Hex } from "./canonical.js";
 import type { BoundedFileResult } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import { DELIVERY_TEXT_ARTIFACT } from "./output-language.js";
@@ -413,7 +413,26 @@ export function resolveDeliveryArtifactPath(args: {
   existsSync?: (p: string) => boolean;
   listDirSync?: (p: string) => string[];
 }): string | null {
-  const normalized = normalizeArtifactPath(args.name);
+  let normalized = normalizeArtifactPath(args.name);
+  if (!normalized) {
+    // R2.5 — a logical artifact name outside the manifest charset
+    // (e.g. `a b.txt`, `a?b.txt`) can still resolve deterministically
+    // through the shared compat rule when it is a plain basename with
+    // no traversal — the compat writer's deterministic output is what
+    // this lookup is for. Strictly reject anything with separators.
+    const raw = String(args.name ?? "");
+    if (
+      raw &&
+      !raw.includes("/") &&
+      !raw.includes("\\") &&
+      !raw.includes("\0") &&
+      raw !== "." &&
+      raw !== ".." &&
+      !raw.startsWith("~")
+    ) {
+      normalized = raw;
+    }
+  }
   if (!normalized) return null;
   const rel = normalized.startsWith("outbox/")
     ? normalized.slice("outbox/".length)
@@ -429,7 +448,12 @@ export function resolveDeliveryArtifactPath(args: {
   } catch {
     names = [];
   }
-  const prefixed = names.filter((f) => f.endsWith(`-${rel}`));
+  // R2.5 — ONE canonical naming rule with the compat writer: resolve by
+  // the same sanitized basename the outbox materialization emits
+  // (`<task>-<artfrag>-<compatBasename>`). Distinct logical names that
+  // sanitize alike produce multiple matches -> fail closed, never pick.
+  const compatRel = compatOutboxBasename(rel);
+  const prefixed = names.filter((f) => f.endsWith(`-${compatRel}`));
   if (prefixed.length === 1) return path.join(args.outboxDir, prefixed[0]);
   if (args.workspace) {
     const staged = path.join(args.workspace, normalized);

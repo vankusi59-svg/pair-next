@@ -12,6 +12,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError, PolicyError } from "./errors.js";
+import { compatOutboxBasename } from "./canonical.js";
 import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
 import { ulid } from "ulid";
 import type { MissionControl } from "./mission-control.js";
@@ -430,9 +431,7 @@ export function createMissionControlServer(
           const outboxDir = c.missionOutboxDir(String(art.mission_id));
           let materialized = false;
           if (outboxDir) {
-            const filename = path
-              .basename(String(art.logical_name ?? "file"))
-              .replace(/[^\w.\-]/g, "_");
+            const filename = compatOutboxBasename(String(art.logical_name ?? "file"));
             const taskPrefix = String(art.task_id).replace(/[^\w.\-]/g, "_").slice(-40);
             // R1.7 — inject the canonical artifact identity between
             // taskPrefix and basename: two distinct logical artifacts

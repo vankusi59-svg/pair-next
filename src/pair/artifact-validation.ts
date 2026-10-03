@@ -9,9 +9,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { boundedFileSha256, newId, pathWithin, utcnow } from "./canonical.js";
+import { newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
-import { MAX_ARTIFACT_BYTES } from "./artifact-authority.js";
 import type { PairControlPlane } from "./service.js";
 
 export class ArtifactProvenanceValidator {
@@ -55,28 +54,12 @@ export class ArtifactProvenanceValidator {
         failures.push(`artifact symlink: ${rel}`);
         continue;
       }
-      // F1: stat-first bounded read — an oversized artifact is rejected
-      // before any unbounded materialization.
-      const br = boundedFileSha256(abs, MAX_ARTIFACT_BYTES);
-      if (br.kind === "too_large") {
-        failures.push(`artifact too large: ${rel}`);
-        continue;
-      }
-      if (br.kind !== "ok") {
-        failures.push(`artifact unresolved: ${rel}`);
-        continue;
-      }
-      const actualSha = br.sha256;
-      const actualSize = br.size;
-      if (art.sha256 && String(art.sha256) !== actualSha) {
-        failures.push(`artifact sha256 mismatch: ${rel}`);
-        continue;
-      }
-      if (art.byte_size !== undefined && Number(art.byte_size) !== actualSize) {
-        failures.push(`artifact byte_size mismatch: ${rel}`);
-        continue;
-      }
-      checkedArtifacts.push({ ...art, sha256: actualSha, byte_size: actualSize });
+      // R2.2 — the validator performs NO independent content read. The
+      // declared sha256/byte_size are forwarded as expectations; the ONE
+      // authoritative materialization inside ArtifactAuthority reads the
+      // bytes once and compares them, so VALIDATED BYTES == CANONICAL
+      // RETAINED BYTES (no validate-then-reread TOCTOU).
+      checkedArtifacts.push({ ...art });
     }
 
     let pass = failures.length === 0 && status === "COMPLETED";
@@ -103,6 +86,12 @@ export class ArtifactProvenanceValidator {
               kind: "path" as const,
               path: path.resolve(workspace, String(art.path)),
             },
+            ...(art.sha256 !== undefined
+              ? { expected_sha256: String(art.sha256) }
+              : {}),
+            ...(art.byte_size !== undefined
+              ? { expected_byte_size: Number(art.byte_size) }
+              : {}),
           })),
           channel: "LOCAL_EXECUTION",
           actor: "PAIR_ARTIFACT_VALIDATOR",

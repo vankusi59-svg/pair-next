@@ -113,6 +113,76 @@ export function canonicalArtifactId(executionId: string, logicalName: string): s
   return `ART_${digest({ execution_id: executionId, logical_name: logicalName }).slice(0, 32).toUpperCase()}`;
 }
 
+/** R2.5 — ONE canonical compat-naming rule shared by the outbox
+ *  materialization writer and the delivery resolver. A logical artifact
+ *  basename is deterministically mapped to its compat filename — two
+ *  distinct logical names MAY share one compat basename, but their
+ *  full compat path stays injective via the artifact-id fragment. */
+export function compatOutboxBasename(logicalName: string): string {
+  return path.basename(String(logicalName)).replace(/[^\w.\-]/g, "_");
+}
+
+/** R2.1 — secure contained file read: binds containment proof and byte
+ *  materialization to the SAME opened file object. `realpath(check) →
+ *  reopen(path)` is a TOCTOU — a parent symlink or directory entry can
+ *  be swapped between resolution and read. Here the fd is opened once
+ *  (O_NOFOLLOW on the final component), the OPENED object's real path
+ *  is resolved through /proc/self/fd (Linux — fails closed where
+ *  unavailable), proven under a governed allowed root, fstat'd, bounded,
+ *  read and length-verified — all on that one fd. Parent-symlink swaps
+ *  after open cannot redirect the already-bound file object. */
+export type SecureContainedReadResult =
+  | { kind: "ok"; size: number; bytes: Buffer }
+  | { kind: "too_large"; size: number }
+  | { kind: "unresolved" }
+  | { kind: "outside" }
+  | { kind: "symlink" };
+
+export function secureReadContained(
+  p: string,
+  maxBytes: number,
+  allowedRoots: string[],
+): SecureContainedReadResult {
+  let fd: number;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") return { kind: "symlink" };
+    return { kind: "unresolved" };
+  }
+  try {
+    const fdPath = `/proc/self/fd/${fd}`;
+    if (!fs.existsSync("/proc/self/fd")) {
+      // No platform seam to prove opened-object containment — fail
+      // closed rather than fall back to a racy pathname check.
+      return { kind: "unresolved" };
+    }
+    let real: string;
+    try {
+      real = fs.realpathSync(fdPath);
+    } catch {
+      return { kind: "unresolved" };
+    }
+    const inside = allowedRoots.some((ap) => {
+      try {
+        return pathWithin(real, fs.realpathSync(ap));
+      } catch {
+        return false;
+      }
+    });
+    if (!inside) return { kind: "outside" };
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return { kind: "unresolved" };
+    if (st.size > maxBytes) return { kind: "too_large", size: st.size };
+    const bytes = Buffer.alloc(st.size);
+    const read = fs.readSync(fd, bytes, 0, st.size, 0);
+    if (read !== st.size) return { kind: "unresolved" };
+    return { kind: "ok", size: st.size, bytes };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 export function utcnow(): string {
   return new Date().toISOString();
 }

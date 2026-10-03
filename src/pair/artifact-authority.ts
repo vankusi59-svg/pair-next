@@ -44,7 +44,7 @@ import { ulid } from "ulid";
 import {
   boundedFileSha256,
   canonicalArtifactId,
-  pathWithin,
+  secureReadContained,
   sha256Hex,
   utcnow,
 } from "./canonical.js";
@@ -185,6 +185,11 @@ export class ArtifactAuthority {
     items: Array<{
       logical_name: string;
       source: { kind: "path"; path: string } | { kind: "buffer"; bytes: Buffer };
+      /** R2.2 — worker-declared expectations, verified inside the ONE
+       *  materialization: the exact bytes read once here are the bytes
+       *  hashed, CAS-retained and row-minted. */
+      expected_sha256?: string;
+      expected_byte_size?: number;
     }>;
     channel: ArtifactIngestChannel;
     actor: string;
@@ -214,11 +219,30 @@ export class ArtifactAuthority {
         correlation_id: args.correlation_id,
         execution_id: args.execution_id,
       });
+      const sha = sha256Hex(bytes);
+      // R2.2 — declared identity verified against THE materialized
+      // buffer: a file that changed between a caller's own earlier
+      // check and this read can never mint canonical bytes != declared.
+      if (item.expected_sha256 !== undefined && item.expected_sha256 !== sha) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_DECLARED_MISMATCH",
+          `${logicalName}:sha256`,
+        );
+      }
+      if (
+        item.expected_byte_size !== undefined &&
+        Number(item.expected_byte_size) !== bytes.length
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_DECLARED_MISMATCH",
+          `${logicalName}:byte_size`,
+        );
+      }
       prepared.push({
         logical_name: logicalName,
         artifact_id: canonicalArtifactId(args.execution_id, logicalName),
         bytes,
-        sha256: sha256Hex(bytes),
+        sha256: sha,
         artifact_class: artifactClass(logicalName),
       });
     }
@@ -245,7 +269,16 @@ export class ArtifactAuthority {
           `${p.artifact_id}:${p.logical_name}`,
         );
       }
-      if (String(prior.state) !== "ACCEPTED") allPrior = false;
+      // R2.3 — a same-sha ACCEPTED row is NOT enough: only a fully
+      // canonical F1 prior (contract + every identity dimension +
+      // retained CAS bytes verifying to this digest) may satisfy a
+      // post-close idempotent replay. Legacy/malformed rows fail closed.
+      if (!this.isCanonicalPrior(prior, p, identity, args)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT",
+          `${p.artifact_id}:noncanonical-prior`,
+        );
+      }
     }
     if (allPrior) {
       const artifacts = prepared.map(
@@ -298,7 +331,10 @@ export class ArtifactAuthority {
           | Record<string, unknown>
           | null;
         if (prior) {
-          if (String(prior.sha256) === p.sha256 && String(prior.state) === "ACCEPTED") {
+          if (
+            String(prior.sha256) === p.sha256 &&
+            this.isCanonicalPrior(prior, p, identity, args)
+          ) {
             replayed.push(p.artifact_id);
             artifacts.push(prior);
             continue;
@@ -485,6 +521,16 @@ export class ArtifactAuthority {
         `${executionId}:${producerExecutorId}`,
       );
     }
+    // R2.4 — the complete durable chain must agree: the governed task's
+    // executor of record == the execution's executor == the claimed
+    // producer. A durable contradiction between governance rows fails
+    // closed even when the claimed producer matches the execution row.
+    if (String(governed.executor_id ?? "") !== String(execution.executor_id)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_ARTIFACT_LINKAGE",
+        `${executionId}:governed executor ${String(governed.executor_id)} != ${String(execution.executor_id)}`,
+      );
+    }
     const allowed =
       (Array.isArray(governed.allowed_paths) && (governed.allowed_paths as string[]).length
         ? (governed.allowed_paths as string[]).map(String)
@@ -554,11 +600,22 @@ export class ArtifactAuthority {
       }
       return bytes;
     }
-    this.assertContained(source.path, identity.allowed_paths, ev);
-    const br = boundedFileSha256(source.path, this.maxBytes);
+    // R2.1 — containment and byte materialization are bound to ONE
+    // opened file object (open-once + /proc/self/fd realpath +
+    // fstat + bounded read on the same fd). A parent symlink swap
+    // after open cannot redirect the already-bound object.
+    const br = secureReadContained(source.path, this.maxBytes, identity.allowed_paths);
     if (br.kind === "too_large") {
       this.rejectMeta(ev.mission_id, ev, "ARTIFACT_TOO_LARGE", `size=${br.size}`);
       throw new IntegrityError("FAIL_CLOSED_ARTIFACT_TOO_LARGE", `size=${br.size}`);
+    }
+    if (br.kind === "outside") {
+      this.rejectMeta(ev.mission_id, ev, "ARTIFACT_PATH_OUTSIDE", source.path);
+      throw new IntegrityError("FAIL_CLOSED_ARTIFACT_PATH_OUTSIDE", source.path);
+    }
+    if (br.kind === "symlink") {
+      this.rejectMeta(ev.mission_id, ev, "ARTIFACT_SYMLINK", source.path);
+      throw new IntegrityError("FAIL_CLOSED_ARTIFACT_SYMLINK", source.path);
     }
     if (br.kind !== "ok") {
       this.rejectMeta(ev.mission_id, ev, "ARTIFACT_UNRESOLVED", source.path);
@@ -571,53 +628,34 @@ export class ArtifactAuthority {
     return br.bytes;
   }
 
-  /** R1.2 — real filesystem containment. `lstat(final)` alone misses a
-   *  parent-directory symlink (`ws/link -> /outside`; `link/x.bin` is a
-   *  regular file). The canonical seam resolves the real path of the
-   *  source and requires it under the real path of a governed allowed
-   *  root — plus keeps the strict final-component symlink rejection. */
-  private assertContained(
-    source: string,
-    allowedPaths: string[],
-    ev: {
-      mission_id: string;
-      logical_name: string;
-      actor: string;
-      correlation_id?: string | null;
-      execution_id: string;
-    },
-  ): void {
-    try {
-      if (fs.lstatSync(source).isSymbolicLink()) {
-        this.rejectMeta(ev.mission_id, ev, "ARTIFACT_SYMLINK", source);
-        throw new IntegrityError("FAIL_CLOSED_ARTIFACT_SYMLINK", source);
-      }
-    } catch (e) {
-      if (e instanceof IntegrityError) throw e;
-      this.rejectMeta(ev.mission_id, ev, "ARTIFACT_UNRESOLVED", source);
-      throw new IntegrityError("FAIL_CLOSED_ARTIFACT_UNRESOLVED", source);
-    }
-    let real: string;
-    try {
-      real = fs.realpathSync(source);
-    } catch {
-      this.rejectMeta(ev.mission_id, ev, "ARTIFACT_UNRESOLVED", source);
-      throw new IntegrityError("FAIL_CLOSED_ARTIFACT_UNRESOLVED", source);
-    }
-    const inside = allowedPaths.some((ap) => {
-      try {
-        return pathWithin(real, fs.realpathSync(ap));
-      } catch {
-        return false;
-      }
-    });
-    if (!inside) {
-      this.rejectMeta(ev.mission_id, ev, "ARTIFACT_PATH_OUTSIDE", `${source}->${real}`);
-      throw new IntegrityError(
-        "FAIL_CLOSED_ARTIFACT_PATH_OUTSIDE",
-        `${source} resolves outside allowed_paths`,
-      );
-    }
+  /** R2.3 — canonical prior proof: a row may satisfy idempotent replay
+   *  only when it is a VALID F1 authority — correct contract, every
+   *  identity dimension agreeing with the durable producer chain, the
+   *  deterministic ART id, the normalized logical name, ACCEPTED state,
+   *  matching byte_size, CAS storage bound to the row sha, AND the
+   *  retained blob actually verifying to the incoming digest. A
+   *  same-id/same-sha legacy or malformed row is never elevated. */
+  private isCanonicalPrior(
+    prior: Record<string, unknown>,
+    p: PreparedArtifact,
+    identity: ProducerIdentity,
+    args: { execution_id: string; producer_executor_id: string },
+  ): boolean {
+    if (String(prior.contract ?? "") !== ARTIFACT_CONTRACT) return false;
+    if (String(prior.artifact_id) !== p.artifact_id) return false;
+    if (String(prior.execution_id) !== args.execution_id) return false;
+    if (String(prior.governed_task_id) !== identity.governed_task_id) return false;
+    if (String(prior.mission_id) !== identity.mission_id) return false;
+    if (String(prior.task_id) !== identity.task_id) return false;
+    if (String(prior.producer_executor_id) !== args.producer_executor_id) return false;
+    if (String(prior.logical_name) !== p.logical_name) return false;
+    if (String(prior.state) !== "ACCEPTED") return false;
+    if (Number(prior.byte_size) !== p.bytes.length) return false;
+    const storage = prior.storage as Record<string, unknown> | undefined;
+    if (!storage || String(storage.kind ?? "") !== "PAIR_ARTIFACT_CAS") return false;
+    if (String(storage.sha256 ?? "") !== p.sha256) return false;
+    const blob = boundedFileSha256(path.join(this.opts.blobDir, p.sha256), this.maxBytes);
+    return blob.kind === "ok" && blob.sha256 === p.sha256;
   }
 
   private persistBlob(sha256: string, bytes: Buffer): void {
@@ -635,10 +673,12 @@ export class ArtifactAuthority {
       fs.closeSync(fh);
     }
     fs.renameSync(tmp, dest);
-    // R1.9 — commit the directory entry too: without a parent-dir fsync
-    // a power-loss can drop the rename while data itself was durable.
-    // Filesystems that cannot fsync a directory (EINVAL/ENOTSUP) degrade
-    // deliberately — the post-rename content verify still applies.
+    // R1.9/R2.6 — commit the directory entry too: without a parent-dir
+    // fsync a power-loss can drop the rename while data itself was
+    // durable. ONLY documented unsupported-platform/fs errors degrade
+    // (post-rename bounded re-verify still applies); any unexpected
+    // durability failure (EIO, EPERM, ...) fails closed — a silently
+    // uncommitted directory entry must never masquerade as durable.
     try {
       const dfd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
       try {
@@ -646,8 +686,15 @@ export class ArtifactAuthority {
       } finally {
         fs.closeSync(dfd);
       }
-    } catch {
-      /* platform without directory fsync — documented fallback */
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EOPNOTSUPP") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY",
+          `${sha256}:${String(e)}`,
+        );
+      }
+      /* documented unsupported dir-fsync platform/fs — fallback */
     }
     const post = boundedFileSha256(dest, this.maxBytes);
     if (post.kind !== "ok" || post.sha256 !== sha256) {

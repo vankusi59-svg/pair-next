@@ -352,7 +352,7 @@ describe("F1-C/D mutation + replay/concurrency", () => {
     const ctx = mkCtx("d3");
     const prod = mkProducer(ctx);
     const store2 = new PairEvidenceStore(path.join(ctx.d, "pair.db"));
-    const auth2 = new ArtifactAuthority(store2, { blobDir: path.join(ctx.d, "blobs") });
+    const auth2 = new ArtifactAuthority(store2, { blobDir: path.join(ctx.d, "artifacts", "blobs") });
     const args = {
       execution_id: prod.eid, producer_executor_id: EX, logical_name: "f.txt",
       source: { kind: "buffer", bytes: Buffer.from("dup") } as const,
@@ -392,7 +392,7 @@ describe("F1-E crash/restart convergence", () => {
       actor: "T", allow_post_result: false,
     });
     const store2 = new PairEvidenceStore(path.join(ctx.d, "pair.db"));
-    const auth2 = new ArtifactAuthority(store2, { blobDir: path.join(ctx.d, "blobs") });
+    const auth2 = new ArtifactAuthority(store2, { blobDir: path.join(ctx.d, "artifacts", "blobs") });
     const rows = auth2.forExecution(prod.eid);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.artifact_id).toBe(r1.artifact.artifact_id);

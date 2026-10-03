@@ -255,3 +255,63 @@ CURRENT_STATE.md
 ```
 
 **Preserved untouched:** PR #30 delivery-contract invariants; remote DAG-leaf; F2/F3/P15; single `artifact` entity/`pair-artifact.v1` contract/`ArtifactAuthority` implementation (batch seam lives inside it).
+
+---
+
+# INDEPENDENT SOURCE-REVIEW R2 REMEDIATION
+
+**Mandate:** `pasted-1790991806129.txt` — source-review of R1 HEAD `bb7b24fe2d250ba456aa198da7aed2062314dd07` found 4 HIGH + 2 MEDIUM + 1 TEST-GOVERNANCE finding. Same PR #31, no merge.
+
+- **Previous R1 HEAD:** `bb7b24f`
+- **New HEAD:** `<pending>`
+- **Fix classification:** `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R2_PENDING_SOURCE_REVIEW`
+
+## Per-finding RCA + closure
+
+| Finding | Root cause | Fix |
+|---|---|---|
+| R2.1 `F1-PATH-CONTAINMENT-READ-TOCTOU` (HIGH) | `assertContained()` proved realpath on one resolution, then `boundedFileSha256(source.path)` **reopened the original pathname** — a parent-symlink/dir-entry swap between them could mint outside bytes | New `secureReadContained()` in `canonical.ts`: `openSync(O_RDONLY|O_NOFOLLOW)` once → `/proc/self/fd/<fd>` realpath proves the **opened object** is under a real allowed root → `fstat(fd)` → bound → `readSync(fd)` → `bytes.length === fstat.size` → hash. Containment + bytes bound to ONE fd; post-open symlink/dir swaps cannot redirect it. Non-Linux (no /proc/self/fd) fails closed. `assertContained` deleted |
+| R2.2 `F1-VALIDATED-BYTES-CANONICAL-BYTES-TOCTOU` (HIGH) | Validator read+hashed bytes, then `acceptBatch` re-read the path — declared sha/size verified against read #1, canonical bytes taken from read #2 | Validator no longer reads content: declared `sha256`/`byte_size` forwarded as `expected_sha256`/`expected_byte_size` into `acceptBatch`; the ONE authoritative materialization reads once and compares → `FAIL_CLOSED_ARTIFACT_DECLARED_MISMATCH`. VALIDATED BYTES == CANONICAL RETAINED BYTES |
+| R2.3 `F1-REPLAY-CANONICAL-AUTHORITY-INCOMPLETE` (HIGH) | Replay accepted any same-id/same-sha `ACCEPTED` row — a legacy/malformed row at the deterministic ART id could be elevated by replay | `isCanonicalPrior()` requires: `contract==pair-artifact.v1` + artifact_id==deterministic id + execution/governed/mission/task/producer/logical_name all equal canonical identity + `ACCEPTED` + `byte_size` match + `storage.kind==PAIR_ARTIFACT_CAS` + `storage.sha256==row sha` + retained CAS blob exists and verifies to the incoming digest. Any failure → `FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT`. Applies in both the pre-txn convergence scan and the in-transaction raced check |
+| R2.4 `F1-PRODUCER-EXECUTOR-DURABLE-LINKAGE-GAP` (HIGH) | Authority checked `execution.executor_id == producer` but not `governed_task.executor_id == execution.executor_id` — durable governance rows could contradict and still pass | `verifyIdentity` now requires `governed.executor_id === execution.executor_id` (`FAIL_CLOSED_ARTIFACT_LINKAGE`); MC capability cross-check additionally requires `governed.executor_id === claims.executor_id === execution.executor_id` |
+| R2.5 `F1-OUTBOX-COMPAT-NAME-RESOLUTION-MISMATCH` (MEDIUM) | Writer sanitized `a b.txt`→`a_b.txt` but resolver matched `endsWith('-a b.txt')` — legitimate names needing sanitize could never resolve | One canonical `compatOutboxBasename()` in `canonical.ts` used by BOTH the compat writer and `resolveDeliveryArtifactPath`; resolver additionally tolerates non-manifest-charset plain basenames (no separators/traversal). Two names sanitizing alike → multiple matches → resolver fails closed, never picks wrong |
+| R2.6 `F1-CAS-DIR-FSYNC-OVERBROAD-FALLBACK` (MEDIUM) | dir-fsync catch swallowed ALL errors — real durability failures (EIO/EPERM) masqueraded as durable commit | Only `EINVAL`/`ENOTSUP`/`EOPNOTSUPP` fall back (documented unsupported platform/fs); anything else → `FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY` |
+| R2.7 count-race test governance | R1 "concurrent" tests ran sequentially in one JS thread | TRUE multi-process races: `src/__tests__/fixtures/f1-worker-accept.cjs` — separate Node processes + separate `PairEvidenceStore` connections to the SAME db, barrier file. 31+2→32 (1 ok/1 COUNT), 30+3→32 (2 ok/1 COUNT), same identity+same bytes→2 ok/1 row, same identity+different bytes→1 ok/1 REPLAY_CONFLICT. The `store.immediate` authority model holds under real concurrency |
+
+## Adversarial proofs (new R2 suite — 29 tests)
+
+- R2-A1: link→inside at open, swapped→outside inside the `/proc/self/fd` resolution hook — minted bytes = inside bytes (fd binds the opened object)
+- R2-A2: swapped before open → `PATH_OUTSIDE` · R2-A3: file replaced after open → retained original object or fail closed (never REPL bytes) · R2-A4: static cases
+- R2-B1/B2: declared sha(A)+file B same-size → FAIL + 0 rows; declared size drift → FAIL + 0 rows · R2-B3: valid → PASS, CAS retains exactly validated bytes
+- R2-C1–C9: prior row missing/wrong contract, wrong producer/governed/mission/logical_name, storage-sha mismatch, missing or corrupt CAS blob — every replay fails `REPLAY_CONFLICT`, zero promotion · R2-C10: valid prior post-close → `replayed:true`
+- R2-D1/D2: governed.executor `DEVIN` vs execution `CODEX` → direct accept `FAIL_CLOSED_ARTIFACT_LINKAGE`; capability upload `CAPABILITY_MISMATCH`
+- R2-E1–E3: `a b.txt`, `a?b.txt` resolve through the shared rule; colliding names → fail closed
+- R2-F1–F3: EINVAL fallback ok; EIO + arbitrary error → `FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY`, 0 rows
+- R2-G1–G4: real multi-process races as above
+
+## Validation counts
+
+- New R2 suite: **29/29** · F1 suite: **20/20** · R1 suite: **25/25** · delivery contract: **69/69** · incident: **106/106** · ops: **3/3** · live-ops: **20/20** · route-capability: **36/36** · runtime-hardening: **11/11** · p9: **79/79**
+- **Full suite: 2883 pass / 4 fail / 15 skip** — 2 are the same env-only P5 stockProbe fails (reproduced on base `6ff9d35`); 2 were expectation-string updates in P2/P5 (tamper still fails closed — code renamed to `DECLARED_MISMATCH`, updated)
+- `npx tsc --noEmit`: 0 errors · `pnpm build`: PASS · `pnpm audit --audit-level=high`: 0 high/critical
+
+## Files changed in R2
+
+```
+src/pair/canonical.ts               +secureReadContained (opened-object containment+bounded read)
+                                    +compatOutboxBasename (shared compat naming rule)
+src/pair/artifact-authority.ts      materialize → secureReadContained; expected sha/size;
+                                    isCanonicalPrior; governed-executor linkage; fsync classification
+src/pair/artifact-validation.ts     no independent read; passes expected sha/size into batch
+src/pair/mission-control.ts         +governed.executor_id durable cross-check
+src/pair/mission-control-server.ts  compat writer uses compatOutboxBasename
+src/pair/telegram-delivery.ts       resolver uses compatOutboxBasename + plain-basename tolerance
+src/__tests__/pair-f1-r2-remediation.test.ts      NEW — 29 permanent adversarial proofs
+src/__tests__/fixtures/f1-worker-accept.cjs       NEW — multi-process race worker
+src/__tests__/pair-f1-artifact-authority.test.ts  D3/E2 fresh-connection auth uses same blobDir
+src/__tests__/pair-p2.test.ts / pair-p5.test.ts   failure-code expectation → DECLARED_MISMATCH
+```
+
+**Preserved:** PR #30 delivery authority; remote DAG-leaf (0 diff); F2/F3/P15 untouched; ONE `artifact` entity + `pair-artifact.v1` + `ArtifactAuthority` (no parallel authority systems).
+
+**Remaining limitations:** `secureReadContained` requires Linux `/proc/self/fd` for opened-object identity — non-Linux deployments fail closed (deliberate); P5 env-only fails unchanged.

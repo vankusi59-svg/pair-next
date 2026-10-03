@@ -177,6 +177,8 @@ export class MissionControl {
       String(execution.governed_task_id) !== claims.governed_task_id ||
       String(execution.executor_id) !== claims.executor_id ||
       String(execution.execution_id) !== claims.execution_id ||
+      String(governed.executor_id) !== claims.executor_id ||
+      String(governed.executor_id) !== String(execution.executor_id) ||
       String(governed.mission_id) !== claims.mission_id ||
       String(governed.task_id) !== claims.task_id
     ) {
