@@ -2517,23 +2517,45 @@ describe("F4 R4 — final send-gate closure", () => {
     const sent = deliveries(ctx)[0]!;
     expect(sent.text_state).toBe("SENT");
     const started = attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED)[0]!;
-    const resolvedId = String(
-      (started.payload as Record<string, unknown>).attempt_id,
+    // listEvidence() returns wrapper rows — the immutable attempt identity
+    // lives under ev.payload.payload, not on the wrapper itself.
+    const startedPayload = (started.payload as Record<string, unknown>)
+      .payload as Record<string, unknown>;
+    const resolvedId = String(startedPayload.attempt_id ?? "");
+    const resolvedNum = Number(startedPayload.attempt_number);
+    expect(resolvedId.length).toBeGreaterThan(0);
+    expect(resolvedId).toBe(
+      `ATT_${digest(`${String(sent.entity_id)}:text:1`).slice(0, 16)}`,
     );
-    // Forge SENDING carrying the ALREADY-RESOLVED attempt identity.
+    expect(resolvedNum).toBe(1);
+    // Forge SENDING replaying the ALREADY-RESOLVED historical attempt
+    // identity exactly — real attempt_id + real attempt_number.
     rewrite(ctx, sent, {
       ...sent,
       status: "QUEUED",
       text_state: "SENDING",
       attempt_id: resolvedId,
-      attempt_number: 1,
+      attempt_number: resolvedNum,
       attempt_started_at: new Date().toISOString(),
     });
     expect(() =>
       resolveDirect(ctx, sent, { to: "SENT", message_id: 999 }),
     ).toThrow(/FAIL_CLOSED_TELEGRAM_DELIVERY_LIFECYCLE/);
-    // Exactly one RESOLVED — the first, legitimate one.
-    expect(attemptEv(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED)).toHaveLength(1);
+    // Exactly one RESOLVED — the first, legitimate one — and no second
+    // immutable SENT authority was ever minted.
+    const resolved = attemptEv(
+      ctx,
+      mid,
+      TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
+    );
+    expect(resolved).toHaveLength(1);
+    expect(
+      resolved.filter((ev) => {
+        const p = (ev.payload as Record<string, unknown>)
+          .payload as Record<string, unknown>;
+        return String(p.outcome) === "SENT";
+      }),
+    ).toHaveLength(1);
   });
 
   it("R4.E — forged stale SENDING without STARTED produces ZERO UNKNOWN evidence", () => {
