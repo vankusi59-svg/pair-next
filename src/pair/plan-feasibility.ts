@@ -216,19 +216,13 @@ export function canonicalPlanSemanticDigest(
     if (md.pair_output_language !== undefined) {
       body.output_language = md.pair_output_language;
     }
-    // Only genuinely execution-authoritative: an explicit executor pin
-    // constrains routing — a planner that leaves it null expresses no
-    // constraint either way. On committed rows the pin is the
-    // commit-frozen planner_selected_executor — routing pins written by
-    // routeGovernedTask post-commit are dispatch state, never plan
-    // semantics.
-    const executorPin =
-      t.planner_selected_executor !== undefined
-        ? t.planner_selected_executor
-        : t.selected_executor;
-    if (executorPin != null && executorPin !== "") {
-      body.selected_executor = String(executorPin);
-    }
+    // R1.2 — selected_executor is NOT plan semantics: the planner never
+    // chooses executors (MissionRouter resolves the binding post-commit
+    // and overwrites task.selected_executor as routing evidence), so the
+    // field carries no execution-authoritative constraint. Including it
+    // would let an identical plan pass as "different" by mutating an
+    // ignored field — and would make the digest depend on post-commit
+    // routing state for legacy rows. Excluded entirely.
     return body;
   });
   return digest({ contract: PLAN_SEMANTIC_CONTRACT, tasks: semantic });
@@ -383,6 +377,7 @@ export const MAX_REPLAN_CANDIDATES_PER_DECISION = 2;
 
 export type ReplanAttemptStatus =
   | "CANDIDATE"
+  | "PREPARED"
   | "REJECTED_DUPLICATE"
   | "REJECTED_FEASIBILITY"
   | "REJECTED_INVALID"
@@ -399,6 +394,27 @@ export interface ReplanAttemptRecord {
   attempt_index: number;
   proposal_digest: string | null;
   candidate_plan_semantic_digest: string | null;
+  /** R1.3 — PREPARED durability: the exact canonical validated task
+   *  contract that passed every pre-commit gate. Bounded by the plan
+   *  task-count limit; canonical task contracts are governance
+   *  evidence, never model chain-of-thought or secrets. */
+  prepared_tasks?: Array<Record<string, unknown>> | null;
+  /** The raw proposal that produced prepared_tasks — persisted so the
+   *  resumed commit records identical revision provenance without
+   *  another planner call. */
+  prepared_proposal?: unknown;
+  /** plan_id active at prepare time — the plan this candidate
+   *  supersedes; lets a resumed commit supersede exactly the right
+   *  tasks even after a restart. */
+  superseded_plan_id?: string | null;
+  /** Durable commit receipt — set only when the candidate's plan
+   *  revision provably exists. ACCEPTED never names a pre-commit
+   *  candidate. */
+  commit_receipt?: {
+    plan_id: string;
+    revision: number;
+    plan_semantic_digest: string | null;
+  } | null;
   status: ReplanAttemptStatus;
   rejection_reason: string | null;
   created_at: string;
@@ -443,7 +459,12 @@ export class ReplanAttemptLedger {
 
   /** Persist one resolved attempt row + append-only event. Idempotent on
    *  the deterministic slot id — a crash-restarted slot with the same
-   *  index converges instead of duplicating. */
+   *  index converges instead of duplicating. R1.3 §18 — replay binds
+   *  EVERY immutable authority fact: mission/recovery/signature/failed
+   *  digest/index/proposal+candidate digests/status/rejection_reason/
+   *  prepared content/superseded plan. Any conflicting replay fails
+   *  closed; the deterministic slot never silently converges when
+   *  immutable authority differs. */
   record(args: {
     mission_id: string;
     recovery_id: string;
@@ -452,6 +473,9 @@ export class ReplanAttemptLedger {
     attempt_index: number;
     proposal_digest?: string | null;
     candidate_plan_semantic_digest?: string | null;
+    prepared_tasks?: Array<Record<string, unknown>> | null;
+    prepared_proposal?: unknown;
+    superseded_plan_id?: string | null;
     status: ReplanAttemptStatus;
     rejection_reason?: string | null;
   }): ReplanAttemptRecord {
@@ -460,12 +484,26 @@ export class ReplanAttemptLedger {
       | ReplanAttemptRecord
       | null;
     if (existing) {
-      // Replay-safe slot: identical resolved content converges; a
-      // conflicting replay of the same slot is a defect, not a new row.
+      const immutableMismatch =
+        String(existing.mission_id) !== String(args.mission_id) ||
+        String(existing.recovery_id) !== String(args.recovery_id) ||
+        (existing.failure_signature ?? null) !==
+          (args.failure_signature ?? null) ||
+        (existing.failed_plan_semantic_digest ?? null) !==
+          (args.failed_plan_semantic_digest ?? null) ||
+        (existing.proposal_digest ?? null) !==
+          (args.proposal_digest ?? null) ||
+        (existing.candidate_plan_semantic_digest ?? null) !==
+          (args.candidate_plan_semantic_digest ?? null) ||
+        (existing.rejection_reason ?? null) !==
+          (args.rejection_reason ?? null) ||
+        (existing.superseded_plan_id ?? null) !==
+          (args.superseded_plan_id ?? null) ||
+        digest(existing.prepared_tasks ?? null) !==
+          digest(args.prepared_tasks ?? null);
       if (
-        existing.status === args.status &&
-        (existing.candidate_plan_semantic_digest ?? null) ===
-          (args.candidate_plan_semantic_digest ?? null)
+        !immutableMismatch &&
+        existing.status === args.status
       ) {
         return existing;
       }
@@ -486,6 +524,10 @@ export class ReplanAttemptLedger {
       proposal_digest: args.proposal_digest ?? null,
       candidate_plan_semantic_digest:
         args.candidate_plan_semantic_digest ?? null,
+      prepared_tasks: args.prepared_tasks ?? null,
+      prepared_proposal: args.prepared_proposal ?? null,
+      superseded_plan_id: args.superseded_plan_id ?? null,
+      commit_receipt: null,
       status: args.status,
       rejection_reason: args.rejection_reason ?? null,
       created_at: utcnow(),
@@ -506,5 +548,88 @@ export class ReplanAttemptLedger {
       },
     });
     return row;
+  }
+
+  /** Durably-prepared candidates still awaiting their commit — the
+   *  crash-resume set. At most ONE can legitimately exist per recovery
+   *  (a PREPARED row blocks new planner calls until committed). */
+  pendingPrepared(recoveryId: string): ReplanAttemptRecord[] {
+    return this.listForRecovery(recoveryId).filter(
+      (r) => r.status === "PREPARED",
+    );
+  }
+
+  /** PREPARED → ACCEPTED transition bound to the durable commit receipt
+   *  (the candidate's plan revision provably exists). Only PREPARED may
+   *  transition; anything else is a slot conflict. */
+  markCommitted(
+    replanAttemptIdValue: string,
+    receipt: {
+      plan_id: string;
+      revision: number;
+      plan_semantic_digest: string | null;
+    },
+  ): ReplanAttemptRecord {
+    const existing = this.store.tryGet("replan_attempt", replanAttemptIdValue) as
+      | ReplanAttemptRecord
+      | null;
+    if (!existing) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_REPLAN_ATTEMPT_MISSING",
+        replanAttemptIdValue,
+      );
+    }
+    if (existing.status === "ACCEPTED") {
+      const r = existing.commit_receipt;
+      if (
+        r &&
+        String(r.plan_id) === String(receipt.plan_id) &&
+        Number(r.revision) === Number(receipt.revision)
+      ) {
+        return existing; // idempotent finalize replay
+      }
+      throw new IntegrityError(
+        "FAIL_CLOSED_REPLAN_ATTEMPT_SLOT_CONFLICT",
+        `${replanAttemptIdValue}:conflicting_receipt`,
+      );
+    }
+    if (existing.status !== "PREPARED") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_REPLAN_ATTEMPT_SLOT_CONFLICT",
+        `${replanAttemptIdValue}:${existing.status}->ACCEPTED`,
+      );
+    }
+    const updated: ReplanAttemptRecord = {
+      ...existing,
+      status: "ACCEPTED",
+      commit_receipt: {
+        plan_id: receipt.plan_id,
+        revision: receipt.revision,
+        plan_semantic_digest: receipt.plan_semantic_digest,
+      },
+    };
+    this.store.put(
+      "replan_attempt",
+      replanAttemptIdValue,
+      updated as unknown as Record<string, unknown>,
+      Number(existing.version ?? 0),
+    );
+    this.store.event({
+      entity_type: "replan_attempt",
+      entity_id: replanAttemptIdValue,
+      event_type: "REPLAN_ATTEMPT_RESOLVED",
+      old_state: "PREPARED",
+      new_state: "ACCEPTED",
+      actor: "PAIR_REPLAN_LEDGER",
+      metadata: {
+        mission_id: existing.mission_id,
+        recovery_id: existing.recovery_id,
+        attempt_index: existing.attempt_index,
+        candidate_plan_semantic_digest: existing.candidate_plan_semantic_digest,
+        plan_id: receipt.plan_id,
+        plan_revision: receipt.revision,
+      },
+    });
+    return updated;
   }
 }

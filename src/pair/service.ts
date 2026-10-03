@@ -292,11 +292,10 @@ export class PairControlPlane {
         description: String(t.description ?? t.title ?? ""),
         task_instruction: String(t.task_instruction ?? t.description ?? t.title ?? ""),
         required_capabilities: t.required_capabilities ?? [],
+        // R1.2 — selected_executor is routing evidence only: the router
+        // overwrites it post-commit, so it is never plan semantics and
+        // never enters the semantic digest.
         selected_executor: t.selected_executor ?? null,
-        // F3 — the planner-declared executor pin, frozen at commit.
-        // Routing later overwrites selected_executor with the resolved
-        // binding; the semantic digest must always see the PLAN pin.
-        planner_selected_executor: t.selected_executor ?? null,
         status: "READY",
         metadata: t.metadata ?? {},
         depends_on: t.depends_on ?? [],

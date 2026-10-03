@@ -198,3 +198,120 @@ matrix action (ABORT for DEPENDENCY_FAILURE) instead of looping.
 
 **Classification:**
 `PAIR_NEXT_PHASE_F3_PLANNER_RECOVERY_ARTIFACT_DATAFLOW_CLOSURE_PENDING_SOURCE_REVIEW`
+
+# R1 SOURCE-REVIEW REMEDIATION (post-audit)
+
+Mandate: production replanner wiring + true semantic digest authority +
+crash-safe replan commit. Three blockers; all closed on the same PR.
+
+## R1.1 — production runtime planner honors replan_context
+
+The serve script's planner ignored `input.replan_context`: on REPLAN it
+re-emitted pinned_plan_tasks / metadata.llm_plan / the deterministic
+template as a "fresh" candidate, guaranteeing REJECTED_DUPLICATE every
+time regardless of actual provider availability.
+
+- New module `src/pair/serve-planner.ts` owns the serve composition:
+  `makeServeCanonicalizer` (sanitize + PAIR_NATIVE contract enrichment +
+  reconcilePlanDataflow — verbatim the prior inline steps) and
+  `makeServePlanner` (REPLAN branch: call the configured synchronous
+  `replanProvider` with the full `replan_context` — failed digest,
+  rejection digests, failure signature; canonicalize its candidate
+  through the SAME path as initial plans; `validatePlanProposal` +
+  F3 feasibility + semantic duplicate gate all run downstream in
+  runReplan).
+- No provider configured → `FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE`
+  (deducts no attempt slot — provider-absence is not candidate noise).
+  Provider candidate exists but fails canonicalization →
+  `FAIL_CLOSED_REPLAN_PROVIDER_INFEASIBLE`. Both bubble to
+  recoveryGuard → recovery boundary → next decision — never a replay.
+- RuntimePlanner stays synchronous; the mandate's Plan-B acceptance
+  ("live replanner unsupported under the synchronous contract" is
+  allowed provided REPLAN fails CLOSED) holds when
+  `replanProvider: null` — prod currently wires null, so a REPLAN
+  decision deterministically lands on the matrix's next action instead
+  of looping. Tests A4–A7 prove both branches on the ACTUAL
+  serve-composition seam.
+- The old planner is deleted from the script entirely (no private
+  second path); `canonicalizeLlmTasks` continues to serve the
+  planner-failover winner-check.
+
+## R1.2 — selected_executor removed from plan semantics
+
+- `semanticTaskBody` no longer emits `planner_selected_executor`; the
+  commitPlan freeze writing `planner_selected_executor` onto committed
+  rows is deleted. Router post-commit binding stays (routing evidence
+  on task rows) but can never make two identical plans look different,
+  and a pre-F3 legacy plan now computes the SAME semantic digest before
+  routing, after routing, and after restart (B3+B5 committed-row digest
+  equals revision digest across those windows).
+
+## R1.3 — crash-safe replan commit (PREPARED → ACCEPTED)
+
+- `replan_attempt` gains `PREPARED` status + `prepared_tasks`,
+  `prepared_proposal`, `superseded_plan_id`, and `commit_receipt
+  {plan_id, revision, plan_semantic_digest}`.
+- `ledger.record({status:"PREPARED", ...})` durably persists the exact
+  validated candidate BEFORE any mutation; a validated proposal is
+  never called ACCEPTED pre-commit.
+- The commit is ONE atomic `store.immediate` region:
+  {find already-committed revision by digest EXCLUDING the superseded
+  plan_id → bind receipt | commitPlan} + markCommitted + old-task
+  cancel/PLAN_SUPERSEDED + approvals.supersede +
+  scheduler.supersedePending + clearPendingRecovery +
+  transition READY. Crash inside → rollback, old plan intact, PREPARED
+  survives; crash after → fully durable.
+- Restart resume: runReplan checks `pendingPrepared(recovery_id)` FIRST —
+  >1 → `FAIL_CLOSED_REPLAN_ATTEMPT_STATE`; ==1 → re-commit the SAME
+  durable candidate with ZERO planner calls. Committed-revision
+  digest search excludes the superseded plan_id (a legitimate replan
+  restoring committed semantics shares the failed plan's digest —
+  receipt binding must never match the superseded row).
+- `markCommitted` is a closed state machine: PREPARED→ACCEPTED+receipt
+  + RESOLVED event; same receipt idempotent; conflicting receipt or
+  non-PREPARED slot → `FAIL_CLOSED_REPLAN_ATTEMPT_SLOT_CONFLICT`;
+  missing id → `FAIL_CLOSED_REPLAN_ATTEMPT_MISSING`.
+- `record()` replay check now compares ALL immutable facts
+  (mission_id, recovery_id, attempt-index slot fields excluded from
+  conflict but slot-keyed, failure_signature, failed/candidate/proposal
+  digests, rejection_reason, superseded_plan_id, prepared-tasks digest)
+  — conflicting replay FAIL CLOSED, identical replay converges.
+
+## R1 tests (pair-f3-r1-remediation.test.ts — 20/20)
+
+- A1–A3 initial-plan branches preserved (pinned → llm_plan → template).
+- A4 no provider → UNAVAILABLE fail-closed on the real composition.
+- A5 uncanonicalizable provider candidate → INFEASIBLE.
+- A6 provider candidate canonicalized; replan_context reaches provider.
+- A7a/b/c E2E on MissionRuntime: provider null → REPLAN infeasible →
+  ABORTED, 1 revision, 0 attempts consumed; Plan-B provider →
+  COMPLETED, ACCEPTED + receipt; provider replays failed plan →
+  2× REJECTED_DUPLICATE, 1 revision, ABORTED.
+- B1+B6 executor-pin-insensitive duplicate detection; B2+B4 no freeze,
+  router still binds evidence; B3+B5 committed digest == revision
+  digest across routing + restart.
+- C1 crash between PREPARED and commit → restart commits SAME prepared
+  candidate, ZERO planner calls; C2 legacy committed revision w/o
+  receipt → receipt binds, no second commit; C3 post-commit crash →
+  fully converged; C4 crash mid-transaction → rollback, PREPARED +
+  old plan intact, resume converges; C5 two PREPARED →
+  FAIL_CLOSED_REPLAN_ATTEMPT_STATE; C6 markCommitted contract matrix.
+- D1 immutable-facts replay conflict → SLOT_CONFLICT.
+- E1 incident loop dead: 2 bounded duplicates → infeasible → ABORTED.
+
+## R1 validation
+
+- R1 20/20; F3 20+17; incident 106; F2 R1–R4 + contract 152;
+  F1 140 (incl. rm -rf dist race proofs); phase-d recovery 37.
+- Full regression 3165 pass / 2 fail — only the previously reproduced
+  environment-only P5 probe tests (DSH/CODEX binaries present on this
+  VM; identical failure on base 350d48d).
+- `rm -rf dist` + `pnpm build` PASS; `npx tsc --noEmit` 0 errors;
+  `pnpm audit --audit-level=high` clean.
+- I2 regression found and fixed during validation: receipt-binding
+  digest search could match the superseded plan's own revision
+  (legitimate semantic-restore shares the failed digest) — excluded
+  superseded plan_id; incident suite green.
+
+**Classification:**
+`PAIR_NEXT_PHASE_F3_PLANNER_RECOVERY_ARTIFACT_DATAFLOW_CLOSURE_R1_PENDING_SOURCE_REVIEW`

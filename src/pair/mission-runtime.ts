@@ -80,6 +80,7 @@ import {
   ReplanAttemptLedger,
   type DependencyReason,
   type RecoveryFailureContext,
+  type ReplanAttemptRecord,
 } from "./plan-feasibility.js";
 
 export const MISSION_RUNTIME_STATES = [
@@ -2944,35 +2945,137 @@ export class MissionRuntime {
         return t?.task_key != null ? String(t.task_key) : null;
       })();
 
+    /* R1.3 — crash-safe candidate protocol. One shared seam commits a
+     * durably-prepared candidate: the exact canonical task contract is
+     * read from the PREPARED ledger row (never a re-planned candidate),
+     * the plan revision commits BEFORE the old plan mutates (a crash
+     * between leaves "old plan intact + candidate prepared"), the
+     * attempt flips ACCEPTED only with a durable commit receipt bound
+     * to the plan revision, and supersession/finalize converges
+     * idempotently on replay. */
+    const commitCandidate = (prepared: ReplanAttemptRecord): void => {
+      // R1.3 — ONE atomic transaction (BEGIN IMMEDIATE … COMMIT): the
+      // plan commit + attempt receipt + old-plan supersession + pending
+      // clear + READY transition land together or not at all. A crash
+      // inside rolls back EVERYTHING except the already-durable PREPARED
+      // row — old plan intact, candidate prepared; a crash after leaves
+      // the committed revision discoverable by digest on restart.
+      this.store.immediate(() => {
+        const revisions = this.store.planRevisions(missionId);
+        // The receipt must bind a NEW revision — never the superseded
+        // plan's own row: a legitimate replan restoring the committed
+        // semantics shares the failed plan's digest (post-commit row
+        // mutation changed the LIVE rows, not the committed contract),
+        // so plan_id exclusion is required, not just digest matching.
+        const committedRev = revisions.find(
+          (r) =>
+            r.plan_semantic_digest != null &&
+            String(r.plan_semantic_digest) ===
+              String(prepared.candidate_plan_semantic_digest ?? "") &&
+            String(r.plan_id) !== String(prepared.superseded_plan_id ?? ""),
+        );
+        if (committedRev) {
+          // Commit already landed before the crash — bind the receipt,
+          // never commit a second revision.
+          ledger.markCommitted(prepared.replan_attempt_id, {
+            plan_id: String(committedRev.plan_id),
+            revision: Number(committedRev.revision),
+            plan_semantic_digest:
+              prepared.candidate_plan_semantic_digest ?? null,
+          });
+        } else {
+          const res = this.deps.service.commitPlan({
+            mission_id: missionId,
+            tasks: (prepared.prepared_tasks ??
+              []) as Array<Record<string, unknown>>,
+            source: "AUTOMATON_PLANNER",
+            reason: "replan",
+            proposal:
+              prepared.prepared_proposal ?? { tasks: prepared.prepared_tasks },
+          });
+          ledger.markCommitted(prepared.replan_attempt_id, {
+            plan_id: res.plan_id,
+            revision: res.revision,
+            plan_semantic_digest:
+              prepared.candidate_plan_semantic_digest ?? null,
+          });
+        }
+        // Old-plan supersession — deterministic and idempotent; runs
+        // only after the new plan revision provably exists.
+        const supersededPlanId = String(prepared.superseded_plan_id ?? "");
+        for (const t of this.deps.service.listTasks(missionId)) {
+          if (
+            String(t.plan_id) === supersededPlanId &&
+            !SETTLED_TASK.has(String(t.status))
+          ) {
+            this.deps.service.updateTask(String(t.task_id), {
+              status: "CANCELLED",
+              cancel_reason: "PLAN_SUPERSEDED",
+            });
+          }
+        }
+        this.deps.approvals.supersede(missionId, undefined, "PLAN_SUPERSEDED");
+        this.deps.scheduler.supersedePending(missionId, "PLAN_SUPERSEDED");
+        this.clearPendingRecovery(missionId, "CANCELLED", "replan_committed");
+        this.transitionRuntime(missionId, "READY", "replan_committed");
+      });
+    };
+
+    // A durably-prepared candidate finishes its EXACT commit first —
+    // no planner call, no replacement candidate, never a second commit.
+    const pendingPrepared = ledger.pendingPrepared(recoveryId);
+    if (pendingPrepared.length > 1) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_REPLAN_ATTEMPT_STATE",
+        `${recoveryId}:multiple_prepared`,
+      );
+    }
+    if (pendingPrepared.length === 1) {
+      commitCandidate(pendingPrepared[0]);
+      return;
+    }
+
     while (
       ledger.attemptsUsed(recoveryId) < MAX_REPLAN_CANDIDATES_PER_DECISION
     ) {
       const attemptIndex = ledger.attemptsUsed(recoveryId);
-      const proposal = this.deps.planner({
-        mission,
-        advice: advice ?? null,
-        superseded_tasks: oldTasks,
-        reason: "replan",
-        replan_context: {
-          recovery_id: recoveryId,
-          failure_signature:
-            decisionRow?.failure_signature != null
-              ? String(decisionRow.failure_signature)
-              : null,
-          failure_class: String(pending?.failure_class ?? ""),
-          dependency_reason: pendingCtx?.dependency_reason ?? null,
-          failed_task_key: failedTaskKey,
-          failed_plan_semantic_digest: failedDigest,
-          rejected_semantic_digests: [...rejectedDigests],
-        },
-      });
+      let proposal: unknown;
+      try {
+        proposal = this.deps.planner({
+          mission,
+          advice: advice ?? null,
+          superseded_tasks: oldTasks,
+          reason: "replan",
+          replan_context: {
+            recovery_id: recoveryId,
+            failure_signature:
+              decisionRow?.failure_signature != null
+                ? String(decisionRow.failure_signature)
+                : null,
+            failure_class: String(pending?.failure_class ?? ""),
+            dependency_reason: pendingCtx?.dependency_reason ?? null,
+            failed_task_key: failedTaskKey,
+            failed_plan_semantic_digest: failedDigest,
+            rejected_semantic_digests: [...rejectedDigests],
+          },
+        });
+      } catch (err) {
+        const code = String((err as { code?: string })?.code ?? "");
+        // R1.1 — the REPLAN action itself is infeasible when no governed
+        // replan provider can produce a candidate: not a candidate
+        // rejection, no bounded slot consumed — route straight to the
+        // exhaustion path so a fresh RecoveryController decision picks
+        // the next matrix action.
+        if (code.startsWith("FAIL_CLOSED_REPLAN_PROVIDER")) break;
+        throw err;
+      }
       let tasks: Array<Record<string, unknown>> | null = null;
       let candidateDigest: string | null = null;
       let status:
-        | "ACCEPTED"
         | "REJECTED_DUPLICATE"
         | "REJECTED_FEASIBILITY"
-        | "REJECTED_INVALID" = "ACCEPTED";
+        | "REJECTED_INVALID"
+        | null = null;
       let rejectionReason: string | null = null;
       try {
         const validated = validatePlanProposal(proposal, knownCaps);
@@ -3015,10 +3118,34 @@ export class MissionRuntime {
           candidateDigest = null;
         }
       }
-      // Persist rejection/acceptance BEFORE advancing candidates — the
-      // ledger row is durable evidence; a crash between candidate and
-      // commit replays the same bounded slot, never an unbounded retry.
-      ledger.record({
+      if (status !== null) {
+        // Persist rejection BEFORE advancing candidates — durable
+        // evidence; a crash replays the same bounded slot.
+        ledger.record({
+          mission_id: missionId,
+          recovery_id: recoveryId,
+          failure_signature:
+            decisionRow?.failure_signature != null
+              ? String(decisionRow.failure_signature)
+              : null,
+          failed_plan_semantic_digest: failedDigest,
+          attempt_index: attemptIndex,
+          proposal_digest: digest(proposal),
+          candidate_plan_semantic_digest: candidateDigest,
+          status,
+          rejection_reason: rejectionReason,
+        });
+        if (candidateDigest) {
+          rejectedDigests.add(candidateDigest);
+          forbidden.add(candidateDigest);
+        }
+        continue;
+      }
+      // PREPARED — the exact candidate (canonical validated tasks + raw
+      // proposal + superseded plan) is durable BEFORE any commit or any
+      // old-plan mutation; commitCandidate then finishes it atomically-
+      // convergent (commit → receipt → supersede → clear).
+      const preparedRow = ledger.record({
         mission_id: missionId,
         recovery_id: recoveryId,
         failure_signature:
@@ -3029,36 +3156,12 @@ export class MissionRuntime {
         attempt_index: attemptIndex,
         proposal_digest: digest(proposal),
         candidate_plan_semantic_digest: candidateDigest,
-        status,
-        rejection_reason: rejectionReason,
+        prepared_tasks: tasks,
+        prepared_proposal: proposal,
+        superseded_plan_id: oldPlanId,
+        status: "PREPARED",
       });
-      if (status !== "ACCEPTED") {
-        if (candidateDigest) {
-          rejectedDigests.add(candidateDigest);
-          forbidden.add(candidateDigest);
-        }
-        continue;
-      }
-      // ACCEPTED — only NOW does the old plan mutate (F3 §22).
-      for (const t of oldTasks) {
-        if (!SETTLED_TASK.has(String(t.status))) {
-          this.deps.service.updateTask(String(t.task_id), {
-            status: "CANCELLED",
-            cancel_reason: "PLAN_SUPERSEDED",
-          });
-        }
-      }
-      this.deps.approvals.supersede(missionId, undefined, "PLAN_SUPERSEDED");
-      this.deps.scheduler.supersedePending(missionId, "PLAN_SUPERSEDED");
-      this.deps.service.commitPlan({
-        mission_id: missionId,
-        tasks: tasks!,
-        source: "AUTOMATON_PLANNER",
-        reason: "replan",
-        proposal,
-      });
-      this.clearPendingRecovery(missionId, "CANCELLED", "replan_committed");
-      this.transitionRuntime(missionId, "READY", "replan_committed");
+      commitCandidate(preparedRow);
       return;
     }
 

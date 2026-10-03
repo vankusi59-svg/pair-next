@@ -226,10 +226,19 @@ describe("F3 A — canonicalPlanSemanticDigest pair-plan-semantic.v1", () => {
     expect(canonicalPlanSemanticDigest(b)).not.toBe(canonicalPlanSemanticDigest(base()));
   });
 
-  it("A7. selected_executor change → different digest", () => {
+  it("A7. selected_executor is NOT plan semantics — change → SAME digest (R1.2)", () => {
+    // R1.2 — the planner never chooses executors; MissionRouter resolves
+    // the binding post-commit and overwrites task.selected_executor as
+    // routing evidence. It must not enter canonicalPlanSemanticDigest:
+    // a pre-routing, post-routing, or post-restart copy of the SAME plan
+    // computes the same semantic digest.
     const b = base();
     b[0].selected_executor = "EX_ALPHA";
-    expect(canonicalPlanSemanticDigest(b)).not.toBe(canonicalPlanSemanticDigest(base()));
+    expect(canonicalPlanSemanticDigest(b)).toBe(canonicalPlanSemanticDigest(base()));
+    const c = base();
+    c[0].selected_executor = "EX_OTHER";
+    c[1].selected_executor = "EX_ALPHA";
+    expect(canonicalPlanSemanticDigest(c)).toBe(canonicalPlanSemanticDigest(base()));
   });
 
   it("A8. raw key-order / shape noise does NOT change the digest", () => {
