@@ -73,7 +73,10 @@ import {
   isTextDeliverableName,
   verifyOutputLanguageContent,
 } from "./output-language.js";
-import { MAX_ARTIFACTS_PER_EXECUTION } from "./artifact-authority.js";
+import {
+  artifactNamesEquivalent,
+  MAX_ARTIFACTS_PER_EXECUTION,
+} from "./artifact-authority.js";
 import { artifactConsumeCapabilityMasterFromEnv } from "./artifact-consume-capability.js";
 import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
@@ -1499,8 +1502,48 @@ export class MissionRuntime {
     // ized from CAS (not the producer's workspace path) — the source
     // path may legitimately be absent.
     const raw = (df.consumes as unknown[]).map(String);
-    const consumes = canonicalResolved
-      ? raw.filter((n) => !canonicalResolved.has(n))
+    // DSN-1 — resolved coverage is judged through the canonical
+    // spelling rule (X ≡ outbox/<basename>), never raw strings: a
+    // consume and the bound artifact may legitimately use different
+    // accepted spellings of one deliverable. For delivery tasks the
+    // canonical binding is the provenance pin minted during requestFor
+    // (pair_delivery_artifact_digests) — dependency_artifacts is empty
+    // there by design, and the pinned bytes arrive via the CAS snapshot
+    // path, not the shared outbox. Re-read the durable row: the pin was
+    // written after this in-memory task snapshot was taken.
+    const resolvedNames = new Set<string>(canonicalResolved ?? []);
+    let curTask: Record<string, unknown> | null = null;
+    try {
+      curTask = this.deps.service.getTask(String(task.task_id));
+    } catch {
+      curTask = null;
+    }
+    const pin = (
+      (curTask?.metadata as Record<string, unknown> | undefined) ??
+      (task.metadata as Record<string, unknown> | undefined)
+    )?.pair_delivery_artifact_digests as
+      | Record<string, Record<string, unknown> | null>
+      | undefined;
+    if (pin && typeof pin === "object") {
+      for (const [alias, entry] of Object.entries(pin)) {
+        if (
+          entry &&
+          typeof entry.artifact_id === "string" &&
+          entry.artifact_id &&
+          String(entry.state) === "PINNED"
+        ) {
+          resolvedNames.add(alias);
+          if (typeof entry.logical_name === "string" && entry.logical_name) {
+            resolvedNames.add(entry.logical_name);
+          }
+        }
+      }
+    }
+    const consumes = resolvedNames.size
+      ? raw.filter(
+          (n) =>
+            ![...resolvedNames].some((r) => artifactNamesEquivalent(r, n)),
+        )
       : raw;
     if (!consumes.length) return null;
     const md = (mission.metadata as Record<string, unknown>) ?? {};

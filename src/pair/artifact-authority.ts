@@ -134,6 +134,28 @@ export function normalizeArtifactName(raw: unknown): string {
   return name;
 }
 
+/** DSN-1 — the ONE spelling-equivalence rule for artifact logical
+ *  names: `X` and its staged `outbox/<basename(X)>` copy name the same
+ *  deliverable (the resolver has always accepted both forms when
+ *  binding delivery manifests; the consume side uses the same rule).
+ *  Every name-matching seam must compare through this — never raw
+ *  strings. Returns false for unnormalizable names, so a malformed
+ *  consume/produce can never widen into an equivalence match. */
+export function artifactNamesEquivalent(a: unknown, b: unknown): boolean {
+  try {
+    const spellingsOf = (raw: unknown): string[] => {
+      const n = normalizeArtifactName(raw);
+      return n.startsWith("outbox/")
+        ? [n]
+        : [n, `outbox/${n.split("/").pop()}`];
+    };
+    const bs = new Set(spellingsOf(b));
+    return spellingsOf(a).some((s) => bs.has(s));
+  } catch {
+    return false;
+  }
+}
+
 export class ArtifactAuthority {
   constructor(
     private readonly store: PairEvidenceStore,

@@ -43,6 +43,7 @@ import {
 } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import {
+  artifactNamesEquivalent,
   normalizeArtifactName,
   MAX_ARTIFACT_BYTES,
   type ArtifactAuthority,
@@ -382,8 +383,13 @@ export class ArtifactDependencyResolver {
           { dependency_reason: "HANDOFF_CONTRACT_INVALID", artifact_name: String(rawName).slice(0, 80), consumer_task_id: String(task.task_id) },
         );
       }
+      // DSN-1 — producer matching compares through the canonical
+      // spelling rule (X ≡ outbox/<basename>): a producer may declare
+      // either accepted form of the same deliverable.
+      const producesMatch = (t: Record<string, unknown>): string[] =>
+        [...producesOf(t)].filter((p) => artifactNamesEquivalent(p, name));
       const producers = planTasks.filter(
-        (t) => isDepPredecessor(t) && producesOf(t).has(name),
+        (t) => isDepPredecessor(t) && producesMatch(t).length > 0,
       );
       if (producers.length === 0) {
         // Declared consume with no producing predecessor: under the
@@ -403,12 +409,38 @@ export class ArtifactDependencyResolver {
         );
       }
       const producer = producers[0]!;
-      const candidate = this.resolveProducerArtifact(
-        missionId,
-        producer,
-        name,
-        planRevision,
-      );
+      // DSN-1 — resolve every declared produce spelling equivalent to
+      // the consume; equivalent spellings that bound DISTINCT canonical
+      // artifacts are ambiguous — the consume can never pick lexically.
+      const hits = new Map<
+        string,
+        {
+          execution: Record<string, unknown>;
+          artifact: Record<string, unknown>;
+        }
+      >();
+      for (const declared of producesMatch(producer).sort()) {
+        const hit = this.resolveProducerArtifact(
+          missionId,
+          producer,
+          declared,
+          planRevision,
+        );
+        if (hit) hits.set(String(hit.artifact.artifact_id), hit);
+      }
+      if (hits.size > 1) {
+        throw new DependencyResolutionError(
+          "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+          `ambiguous_dependency_artifact:${name}`,
+          {
+            dependency_reason: "PLAN_DATAFLOW_AMBIGUOUS",
+            artifact_name: name,
+            producer_task_id: String(producer.task_id),
+            consumer_task_id: String(task.task_id),
+          },
+        );
+      }
+      const candidate = [...hits.values()][0] ?? null;
       if (!candidate) {
         // R2.1 — a remote edge can never fall back to shared filesystem
         // semantics: a missing canonical artifact fails closed when the
@@ -526,16 +558,16 @@ export class ArtifactDependencyResolver {
     const isDepPredecessor = (t: Record<string, unknown>): boolean =>
       depRefs.has(String(t.task_key)) || depRefs.has(String(t.task_id));
     // The manifested logical name and its staged outbox copy are the
-    // same deliverable — a producer may declare either form.
+    // same deliverable — a producer may declare either accepted form.
+    // DSN-1 — matching compares through the canonical spelling rule
+    // (X ≡ outbox/<basename>) in BOTH directions: a manifest carrying
+    // the outbox-prefixed spelling binds an unprefixed declared
+    // produce just as an unprefixed manifest binds outbox/<basename>.
     const name = normalizeArtifactName(args.name);
-    const candidates = new Set<string>([name]);
-    if (!name.startsWith("outbox/")) {
-      candidates.add(`outbox/${name.split("/").pop()}`);
-    }
+    const producesMatch = (t: Record<string, unknown>): string[] =>
+      [...producesOf(t)].filter((p) => artifactNamesEquivalent(p, name));
     const producers = planTasks.filter(
-      (t) =>
-        isDepPredecessor(t) &&
-        [...candidates].some((c) => producesOf(t).has(c)),
+      (t) => isDepPredecessor(t) && producesMatch(t).length > 0,
     );
     if (producers.length === 0) return { kind: "no_producer" as const };
     if (producers.length > 1) {
@@ -550,7 +582,6 @@ export class ArtifactDependencyResolver {
       );
     }
     const producer = producers[0]!;
-    const produced = producesOf(producer);
     // R1.3 — a manifest artifact must resolve to EXACTLY ONE canonical
     // artifact identity. The source name and its staged outbox alias are
     // compatible spellings of one deliverable, but they are DISTINCT
@@ -560,12 +591,11 @@ export class ArtifactDependencyResolver {
       string,
       { execution: Record<string, unknown>; artifact: Record<string, unknown> }
     >();
-    for (const candidate of [...candidates].sort()) {
-      if (!produced.has(candidate)) continue;
+    for (const declared of producesMatch(producer).sort()) {
       const hit = this.resolveProducerArtifact(
         missionId,
         producer,
-        candidate,
+        declared,
         planRevision,
       );
       if (hit) hits.set(String(hit.artifact.artifact_id), hit);
