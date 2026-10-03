@@ -511,3 +511,59 @@ remote recipe can never delete a consumer's existing file.
 Classification:
 
 `PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_R3_PENDING_SOURCE_REVIEW`
+
+# R4 remediation round (source-review)
+
+## R4 — successful recipe must not terminate the preparation shell
+
+`buildDependencyFetchRecipe` used `exit 0` on success paths (`dep_ok` converge
+and `ln` publish). But Devin's buildPrompt composes ONE recipe per pinned
+artifact — `depArts.map(fetchOne).join("\n")` — so with 2+ dependencies the
+first successful recipe terminated the whole preparation shell and artifacts
+#2..N were never prepared: task work could begin on an incomplete dependency
+set.
+
+`buildDependencyFetchRecipe` now has NO `exit 0`: an exact existing target
+converges with `:`, an existing foreign object fails with `exit 3`, and the
+fetch/publish else-branch finishes with `rm -f "$tmp"` on success (or exact
+EEXIST converge) and `rm -f + DEPENDENCY_FETCH_FAILED + exit 3` on any
+failure. Success falls through to the next recipe; failure exits non-zero,
+stops preparation and prevents later task work. `buildDependencyFetchPreparation`
+is the exported canonical composition — the exact block buildPrompt embeds —
+so tests exercise the same production seam the worker runs.
+
+## R4 mandatory tests
+
+`src/__tests__/pair-f2-r4-remediation.test.ts` — 8 tests, all executing the
+REAL production composition in a real bash with a stubbed curl:
+
+| Test | Coverage |
+|---|---|
+| A1 | two fresh deps → exit 0, BOTH targets exact, zero `.tmp.*` leftovers |
+| A2 | first existing exact → converges, preparation CONTINUES to second (the direct regression) |
+| A3 | three fresh → all three prepared |
+| A4 | second fetch fails → exit 3, first stays valid, second absent, THIRD never even attempted (fetched.log proves exactly the bounded 5 attempts then stop) |
+| A5 | first exact + second different → fail, NEITHER existing object overwritten |
+| A6 | spaces/unicode/apostrophes in both names → shell-safe, both prepared |
+| A7 | same ART under two distinct consumer scopes → both prepared independently |
+| B1 | Devin prompt proof — governed remote task with 2 dependency_artifacts: prompt's actual extracted recipe block prepares both in a real shell |
+
+## R4 gates
+
+| Gate | Result |
+|---|---|
+| R4 suite | 8/8 |
+| R3 suite | 18/18 |
+| R2 suite | 35/35 |
+| R1 suite | 43/43 |
+| F2 contract suite | 53/53 |
+| F1 authority + R1 + R2–R7 remediation files | 20 + 25 + 95 |
+| `rm -rf dist` → READY+GO true multi-process races | PASS on current source |
+| Full suite on FINAL R4 HEAD | 3108 pass / 2 fail — only the known env-only P5 `stockProbe.available` failures (reproduce on base `b903cb4`) |
+| `npx tsc --noEmit` | PASS |
+| `pnpm build` | PASS |
+| `pnpm audit --audit-level=high` | PASS — 0 high (1 low + 8 moderate pre-existing) |
+
+Classification:
+
+`PAIR_NEXT_PHASE_F2_CROSS_EXECUTOR_ARTIFACT_HANDOFF_R4_PENDING_SOURCE_REVIEW`

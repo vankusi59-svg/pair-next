@@ -215,6 +215,13 @@ export function buildDependencyFetchRecipe(
   const sha = shellLiteral(entry.sha256);
   const size = shellLiteral(String(entry.byte_size));
   const failEcho = shellLiteral(`DEPENDENCY_FETCH_FAILED ${art}`);
+  // R4 — a successful recipe must FALL THROUGH, never `exit 0`: the
+  // preparation shell composes ONE recipe per pinned artifact
+  // (buildDependencyFetchPreparation joins them), so `exit 0` after
+  // artifact #1 would terminate the shell and leave artifacts #2..N
+  // unprepared. Only failure exits non-zero — it stops preparation and
+  // prevents later task work. Success paths finish the artifact, clean
+  // the temp, and return to the next recipe.
   return [
     `target=${target}`,
     // dep_ok <file>: an EXISTING object is consumable only when it is a
@@ -225,38 +232,64 @@ export function buildDependencyFetchRecipe(
     `  [ "$(wc -c < "$1" | tr -d ' ')" = ${size} ]`,
     `}`,
     // R3.2 — no-clobber: an existing exact target converges without a
-    // download; any other existing object fails (never overwritten).
-    `if dep_ok "$target"; then exit 0; fi`,
-    `if [ -e "$target" ] || [ -L "$target" ]; then`,
-    `  echo ${failEcho}`,
-    `  exit 3`,
-    `fi`,
-    `mkdir -p -- "$(dirname -- "$target")" || { echo ${failEcho}; exit 3; }`,
-    `tmp="$target.tmp.$$"`,
-    `ok=0`,
-    `for i in 1 2 3 4 5; do`,
-    `  if curl -sf -X POST ${url} -H "x-artifact-consume-capability: "${cap} -H "content-type: application/json" -d ${body} -o "$tmp"; then`,
-    `    if dep_ok "$tmp"; then ok=1; break; fi`,
-    `  fi`,
-    `  sleep "$((i * \${PAIR_FETCH_BACKOFF:-2}))"`,
-    `done`,
-    `if [ "$ok" != 1 ]; then`,
-    `  if [ -f "$tmp" ]; then mv -f -- "$tmp" "$target.quarantine" 2>/dev/null || rm -f -- "$tmp"; fi`,
-    `  rm -f -- "$tmp"`,
-    `  echo ${failEcho}`,
-    `  exit 3`,
-    `fi`,
-    // Atomic create-if-absent publication — ln loses with EEXIST rather
-    // than replacing; the raced destination is then re-validated.
-    `if ln -- "$tmp" "$target" 2>/dev/null; then exit 0; fi`,
+    // download (and never creates a temp); any other existing object
+    // fails (never overwritten).
     `if dep_ok "$target"; then`,
-    `  rm -f -- "$tmp"`,
-    `  exit 0`,
+    `  :`,
+    `elif [ -e "$target" ] || [ -L "$target" ]; then`,
+    `  echo ${failEcho}`,
+    `  exit 3`,
+    `else`,
+    `  mkdir -p -- "$(dirname -- "$target")" || { echo ${failEcho}; exit 3; }`,
+    `  tmp="$target.tmp.$$"`,
+    `  ok=0`,
+    `  for i in 1 2 3 4 5; do`,
+    `    if curl -sf -X POST ${url} -H "x-artifact-consume-capability: "${cap} -H "content-type: application/json" -d ${body} -o "$tmp"; then`,
+    `      if dep_ok "$tmp"; then ok=1; break; fi`,
+    `    fi`,
+    `    sleep "$((i * \${PAIR_FETCH_BACKOFF:-2}))"`,
+    `  done`,
+    `  if [ "$ok" != 1 ]; then`,
+    `    if [ -f "$tmp" ]; then mv -f -- "$tmp" "$target.quarantine" 2>/dev/null || rm -f -- "$tmp"; fi`,
+    `    rm -f -- "$tmp"`,
+    `    echo ${failEcho}`,
+    `    exit 3`,
+    `  fi`,
+    // Atomic create-if-absent publication — ln loses with EEXIST rather
+    // than replacing; the raced destination is then re-validated. On
+    // success or exact-converge the temp hardlink is removed; anything
+    // else fails preparation.
+    `  if ln -- "$tmp" "$target" 2>/dev/null; then`,
+    `    rm -f -- "$tmp"`,
+    `  elif dep_ok "$target"; then`,
+    `    rm -f -- "$tmp"`,
+    `  else`,
+    `    rm -f -- "$tmp"`,
+    `    echo ${failEcho}`,
+    `    exit 3`,
+    `  fi`,
     `fi`,
-    `rm -f -- "$tmp"`,
-    `echo ${failEcho}`,
-    `exit 3`,
   ].join("\n");
+}
+
+/**
+ * R4 — ONE canonical preparation composition for ALL of a task's pinned
+ * dependency artifacts: the exact block Devin's buildPrompt embeds.
+ * Each recipe falls through on success so every artifact is prepared;
+ * a failure exits non-zero and stops preparation before task work.
+ */
+export function buildDependencyFetchPreparation(
+  entries: {
+    artifact_id: string;
+    sha256: string;
+    byte_size: number;
+    consumer_relative_path: string;
+  }[],
+  args: { fetchBase: string; consumeCapability: string },
+): string {
+  return entries
+    .map((e) => buildDependencyFetchRecipe(e, args))
+    .join("\n");
 }
 
 export class DevinExecutorAdapter implements ExecutorAdapter {
@@ -454,19 +487,19 @@ export class DevinExecutorAdapter implements ExecutorAdapter {
             `  - ${e.logical_name} → ${e.consumer_relative_path} (sha256:${e.sha256}, byte_size:${e.byte_size}, artifact_id:${e.artifact_id})`,
         )
         .join("\n");
-      // R1.6/R2.5 — bounded-retry fetch protocol built by ONE canonical
-      // production function (shell-safe literals, download-to-tmp, real
-      // digest+size verification, quarantine, non-zero exit on failure).
-      const fetchOne = (e: DependencyArtifactEntry): string =>
-        buildDependencyFetchRecipe(e, {
-          fetchBase,
-          consumeCapability: consume,
-        });
+      // R1.6/R2.5/R4 — bounded-retry fetch protocol built by ONE canonical
+      // production composition (shell-safe literals, download-to-tmp, real
+      // digest+size verification, quarantine, non-zero exit on failure;
+      // each successful recipe FALLS THROUGH so every pinned artifact is
+      // prepared before task work).
       lines.push(
         "Dependency artifacts: PAIR pinned canonical input artifacts for this task. Fetch each into the workspace at the listed relative path BEFORE starting work:\n" +
           items +
-          `\nFor EACH listed artifact run exactly this bounded recipe (the first fetch may briefly return 403/404 while the execution publishes — the loop's 5 attempts with growing sleeps cover only that window, never retry forever). The recipe itself EXITS NON-ZERO on failure — a non-zero exit means the task must not continue:\n` +
-          depArts.map((e) => fetchOne(e)).join("\n") +
+          `\nFor EACH listed artifact run exactly this bounded recipe (the first fetch may briefly return 403/404 while the execution publishes — the loop's 5 attempts with growing sleeps cover only that window, never retry forever). A recipe EXITS NON-ZERO on failure — a non-zero exit means the task must not continue:\n` +
+          buildDependencyFetchPreparation(depArts, {
+            fetchBase,
+            consumeCapability: consume,
+          }) +
           `\nIf the digest or byte size never verifies, or a fetch still fails after the bounded retries, the recipe quarantines/removes the file, prints DEPENDENCY_FETCH_FAILED and exits non-zero: STOP and report — never substitute your own content.`,
       );
     }
