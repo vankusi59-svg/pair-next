@@ -624,8 +624,11 @@ describe("R2-F directory fsync error classification", () => {
 });
 
 /* ==================== R2.7 true multi-process races ====================== */
-const WORKER = path.join(__dirname, "fixtures", "f1-worker-accept.cjs");
-const DIST_INDEX = path.resolve(__dirname, "..", "..", "dist", "pair", "index.js");
+/* R3.4 — the concurrency proof runs CURRENT SOURCE through the repo's
+ *  tsx loader; it must hold on a clean checkout without `dist/`. */
+const WORKER = path.join(__dirname, "fixtures", "f1-worker-accept.mts");
+const SRC_INDEX = path.resolve(__dirname, "..", "pair", "index.ts");
+const TSX = path.resolve(__dirname, "..", "..", "node_modules", ".bin", "tsx");
 
 /** Seed `count` canonical artifacts via buffer sources. */
 function seedArts(
@@ -747,10 +750,10 @@ function raceWorker(
   const out = path.join(ctx.d, `w-${seq++}.json`);
   return new Promise((resolve) => {
     const child = execFile(
-      process.execPath,
+      TSX,
       [
         WORKER,
-        DIST_INDEX,
+        SRC_INDEX,
         path.join(ctx.d, "pair.db"),
         path.join(ctx.d, "artifacts", "blobs"),
         eid,
@@ -772,3 +775,306 @@ function raceWorker(
     child.on("error", () => resolve({ ok: false, code: "WORKER_SPAWN_FAIL" }));
   });
 }
+
+/* ==================== R3.1 durability barrier not retry-bypassable ======= */
+describe("R3-A CAS durability barrier on reuse", () => {
+  const injectDirFsyncFail = (failRef: { fail: boolean; code: string }) => {
+    const origOpen = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation(((pth: unknown, ...rest: unknown[]) => {
+      const flags = typeof rest[0] === "number" ? rest[0] : 0;
+      if (flags & fs.constants.O_DIRECTORY) {
+        if (failRef.fail) {
+          throw Object.assign(new Error("injected"), { code: failRef.code });
+        }
+      }
+      return (origOpen as (...a: unknown[]) => unknown).call(fs, pth, ...rest);
+    }) as typeof fs.openSync);
+  };
+  const tryAccept = (ctx: ReturnType<typeof mkCtx>, eid: string) =>
+    run(() =>
+      ctx.authority.accept({
+        execution_id: eid,
+        producer_executor_id: EX,
+        logical_name: "a.txt",
+        source: { kind: "buffer", bytes: Buffer.from("DURABLE") },
+        channel: "REMOTE_UPLOAD",
+        actor: "T",
+      }),
+    );
+
+  it("R3-A1 fresh rename → dir fsync EIO → FAIL, zero ART rows", () => {
+    const ctx = mkCtx("r3a1");
+    const p = mkProducer(ctx);
+    const failRef = { fail: true, code: "EIO" };
+    injectDirFsyncFail(failRef);
+    expect(tryAccept(ctx, p.eid)).toBe("FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+  });
+  it("R3-A2 retry while dir fsync still EIO → FAIL AGAIN, zero rows (no bypass)", () => {
+    const ctx = mkCtx("r3a2");
+    const p = mkProducer(ctx);
+    const failRef = { fail: true, code: "EIO" };
+    injectDirFsyncFail(failRef);
+    expect(tryAccept(ctx, p.eid)).toBe("FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY");
+    // blob bytes now sit renamed on disk — the retry MUST still fail
+    // rather than mint authority on an unproven durability barrier
+    expect(tryAccept(ctx, p.eid)).toBe("FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+  });
+  it("R3-A3 retry after barrier succeeds → authority mints", () => {
+    const ctx = mkCtx("r3a3");
+    const p = mkProducer(ctx);
+    const failRef = { fail: true, code: "EIO" };
+    injectDirFsyncFail(failRef);
+    expect(tryAccept(ctx, p.eid)).toBe("FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY");
+    failRef.fail = false;
+    expect(tryAccept(ctx, p.eid)).toBe("NO_THROW");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(1);
+  });
+  it("R3-A4 documented unsupported code keeps deterministic fallback", () => {
+    const ctx = mkCtx("r3a4");
+    const p = mkProducer(ctx);
+    const failRef = { fail: true, code: "ENOTSUP" };
+    injectDirFsyncFail(failRef);
+    expect(tryAccept(ctx, p.eid)).toBe("NO_THROW");
+  });
+});
+
+/* ==================== R3.2 complete storage contract ===================== */
+describe("R3-B canonical prior storage contract", () => {
+  const setupCorruptedReplay = (
+    ctx: ReturnType<typeof mkCtx>,
+    prod: { eid: string },
+    mutate: (row: Record<string, unknown>) => void,
+  ): string => {
+    const bytes = Buffer.from("STOR-CONTRACT");
+    const accepted = ctx.authority.accept({
+      execution_id: prod.eid,
+      producer_executor_id: EX,
+      logical_name: "a.txt",
+      source: { kind: "buffer", bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    const row = ctx.store.get("artifact", String(accepted.artifact.artifact_id)) as Record<string, unknown>;
+    mutate(row);
+    ctx.store.put("artifact", String(row.artifact_id), row, Number(row.version));
+    const exRow = ctx.store.get("executor_execution", prod.eid) as Record<string, unknown>;
+    ctx.store.put(
+      "executor_execution",
+      prod.eid,
+      { ...exRow, result: { status: "COMPLETED" }, execution_state: "COMPLETED" },
+      Number(exRow.version),
+    );
+    return run(() =>
+      ctx.authority.accept({
+        execution_id: prod.eid,
+        producer_executor_id: EX,
+        logical_name: "a.txt",
+        source: { kind: "buffer", bytes },
+        channel: "REMOTE_UPLOAD",
+        actor: "T",
+      }),
+    );
+  };
+
+  it("R3-B1 wrong storage.ref → replay conflict", () => {
+    const ctx = mkCtx("r3b1");
+    const p = mkProducer(ctx);
+    expect(
+      setupCorruptedReplay(ctx, p, (r) => {
+        (r.storage as Record<string, unknown>).ref = "blobs/not-the-digest";
+      }),
+    ).toBe("FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT");
+  });
+  it("R3-B2 missing storage.ref → replay conflict", () => {
+    const ctx = mkCtx("r3b2");
+    const p = mkProducer(ctx);
+    expect(
+      setupCorruptedReplay(ctx, p, (r) => {
+        delete (r.storage as Record<string, unknown>).ref;
+      }),
+    ).toBe("FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT");
+  });
+  it("R3-B3 traversal/absolute storage.ref → replay conflict", () => {
+    const ctx = mkCtx("r3b3");
+    const p = mkProducer(ctx);
+    expect(
+      setupCorruptedReplay(ctx, p, (r) => {
+        (r.storage as Record<string, unknown>).ref = "../escape/blobs/x";
+      }),
+    ).toBe("FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT");
+  });
+  it("R3-B4 CAS destination as symlink to matching external bytes → not canonical", () => {
+    const ctx = mkCtx("r3b4");
+    const p = mkProducer(ctx);
+    const bytes = Buffer.from("SYMLINKED");
+    const accepted = ctx.authority.accept({
+      execution_id: p.eid,
+      producer_executor_id: EX,
+      logical_name: "a.txt",
+      source: { kind: "buffer", bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    const blob = blobPath(ctx, String(accepted.artifact.sha256));
+    const ext = path.join(ctx.d, "external.bin");
+    fs.writeFileSync(ext, bytes); // identical bytes outside CAS
+    fs.unlinkSync(blob);
+    fs.symlinkSync(ext, blob);
+    const exRow = ctx.store.get("executor_execution", p.eid) as Record<string, unknown>;
+    ctx.store.put(
+      "executor_execution",
+      p.eid,
+      { ...exRow, result: { status: "COMPLETED" }, execution_state: "COMPLETED" },
+      Number(exRow.version),
+    );
+    expect(
+      run(() =>
+        ctx.authority.accept({
+          execution_id: p.eid,
+          producer_executor_id: EX,
+          logical_name: "a.txt",
+          source: { kind: "buffer", bytes },
+          channel: "REMOTE_UPLOAD",
+          actor: "T",
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT");
+  });
+  it("R3-B5 normal canonical blob/ref → replay converges", () => {
+    const ctx = mkCtx("r3b5");
+    const p = mkProducer(ctx);
+    const bytes = Buffer.from("GOOD-REF");
+    ctx.authority.accept({
+      execution_id: p.eid,
+      producer_executor_id: EX,
+      logical_name: "a.txt",
+      source: { kind: "buffer", bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    const exRow = ctx.store.get("executor_execution", p.eid) as Record<string, unknown>;
+    ctx.store.put(
+      "executor_execution",
+      p.eid,
+      { ...exRow, result: { status: "COMPLETED" }, execution_state: "COMPLETED" },
+      Number(exRow.version),
+    );
+    const r = ctx.authority.accept({
+      execution_id: p.eid,
+      producer_executor_id: EX,
+      logical_name: "a.txt",
+      source: { kind: "buffer", bytes },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    expect(r.replayed).toBe(true);
+  });
+});
+
+/* ==================== R3.3 mid-read growth/mutation detection ============ */
+describe("R3-C secure same-fd read stability", () => {
+  const acceptFile = (ctx: ReturnType<typeof mkCtx>, eid: string, fp: string) =>
+    run(() =>
+      ctx.authority.accept({
+        execution_id: eid,
+        producer_executor_id: EX,
+        logical_name: path.basename(fp),
+        source: { kind: "path", path: fp },
+        channel: "LOCAL_EXECUTION",
+        actor: "T",
+        allow_post_result: true,
+      }),
+    );
+
+  /** Mutate `fp` inside fs.readSync — after the pre-read fstat, inside
+   *  the same materialization window the post-read fstat must catch. */
+  const mutateInsideRead = (fp: string, mutate: () => void) => {
+    const origRead = fs.readSync;
+    const origOpen = fs.openSync;
+    const fds = new Set<number>();
+    vi.spyOn(fs, "openSync").mockImplementation(((pth: unknown, ...rest: unknown[]) => {
+      const fd = (origOpen as (...a: unknown[]) => unknown).call(fs, pth, ...rest) as number;
+      if (String(pth) === fp) fds.add(fd);
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "readSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+      if (fds.has(fd)) mutate();
+      return (origRead as (...a: unknown[]) => unknown).call(fs, fd, ...rest);
+    }) as typeof fs.readSync);
+  };
+
+  it("R3-C1 file grows after fstat → FAIL CLOSED (unresolved)", () => {
+    const ctx = mkCtx("r3c1");
+    const p = mkProducer(ctx);
+    const fp = path.join(ctx.workspace, "grow.bin");
+    fs.writeFileSync(fp, "BASE");
+    mutateInsideRead(fp, () => fs.appendFileSync(fp, "-GROWN"));
+    expect(acceptFile(ctx, p.eid, fp)).toBe("FAIL_CLOSED_ARTIFACT_UNRESOLVED");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+  });
+  it("R3-C2 same-size content mutation → mutation metadata detected, FAIL CLOSED", () => {
+    const ctx = mkCtx("r3c2");
+    const p = mkProducer(ctx);
+    const fp = path.join(ctx.workspace, "mut.bin");
+    fs.writeFileSync(fp, "AAAA");
+    mutateInsideRead(fp, () => {
+      fs.writeFileSync(fp, "BBBB"); // same size, new bytes
+      // Same-size writes inside one kernel timestamp tick are invisible
+      // to any filesystem observer; force the observable case — a
+      // mutation landing on a different mtime — which MUST fail closed.
+      const t = new Date(Date.now() + 5000);
+      fs.utimesSync(fp, t, t);
+    });
+    expect(acceptFile(ctx, p.eid, fp)).toBe("FAIL_CLOSED_ARTIFACT_UNRESOLVED");
+  });
+  it("R3-C3 rename-replacement after open → never becomes the bytes read", () => {
+    const ctx = mkCtx("r3c3");
+    const p = mkProducer(ctx);
+    const fp = path.join(ctx.workspace, "repl.bin");
+    fs.writeFileSync(fp, "ORIG");
+    mutateInsideRead(fp, () => {
+      const repl = path.join(ctx.d, "repl2.bin");
+      fs.writeFileSync(repl, "REPL");
+      fs.renameSync(repl, fp);
+    });
+    const code = acceptFile(ctx, p.eid, fp);
+    if (code === "NO_THROW") {
+      const art = ctx.authority.forExecution(p.eid)[0];
+      expect(String(art.sha256)).toBe(sha256Hex(Buffer.from("ORIG")));
+    } else {
+      expect(code).toMatch(/^FAIL_CLOSED_ARTIFACT_/);
+    }
+  });
+  it("R3-C4 stable file → PASS", () => {
+    const ctx = mkCtx("r3c4");
+    const p = mkProducer(ctx);
+    const fp = path.join(ctx.workspace, "stable.bin");
+    fs.writeFileSync(fp, "STABLE");
+    expect(acceptFile(ctx, p.eid, fp)).toBe("NO_THROW");
+  });
+  it("R3-C5 oversized file still rejected before materialization", () => {
+    const ctx = mkCtx("r3c5");
+    const p = mkProducer(ctx);
+    const fp = path.join(ctx.workspace, "big.bin");
+    fs.writeFileSync(fp, Buffer.alloc(1024));
+    const small = new ArtifactAuthority(ctx.store, {
+      blobDir: path.join(ctx.d, "smallblobs"),
+      maxBytes: 512,
+    });
+    expect(
+      run(() =>
+        small.accept({
+          execution_id: p.eid,
+          producer_executor_id: EX,
+          logical_name: "big.bin",
+          source: { kind: "path", path: fp },
+          channel: "LOCAL_EXECUTION",
+          actor: "T",
+          allow_post_result: true,
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_ARTIFACT_TOO_LARGE");
+  });
+});

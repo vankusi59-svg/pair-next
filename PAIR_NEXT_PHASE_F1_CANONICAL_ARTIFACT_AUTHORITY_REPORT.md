@@ -315,3 +315,51 @@ src/__tests__/pair-p2.test.ts / pair-p5.test.ts   failure-code expectation → D
 **Preserved:** PR #30 delivery authority; remote DAG-leaf (0 diff); F2/F3/P15 untouched; ONE `artifact` entity + `pair-artifact.v1` + `ArtifactAuthority` (no parallel authority systems).
 
 **Remaining limitations:** `secureReadContained` requires Linux `/proc/self/fd` for opened-object identity — non-Linux deployments fail closed (deliberate); P5 env-only fails unchanged.
+
+---
+
+## INDEPENDENT SOURCE-REVIEW R3 REMEDIATION
+
+- **Previous reviewed HEAD:** `e590b71323c5278dd6fbd0d1484ecd2d77d682bb`
+- **New HEAD:** `<pending>`
+- **Changed files:** `src/pair/canonical.ts`, `src/pair/artifact-authority.ts`, `src/__tests__/pair-f1-r2-remediation.test.ts`, `src/__tests__/fixtures/f1-worker-accept.mts` (replaces `.cjs`), `CURRENT_STATE.md`, this report.
+
+### RCA — R3.1 F1-CAS-DURABILITY-RETRY-BYPASS (HIGH)
+
+- **Root cause:** `persistBlob` early-returned on an existing correct-SHA blob — a retry after a dir-fsync failure reused the renamed bytes WITHOUT re-proving the directory durability barrier, then minted authority.
+- **Fix:** one canonical barrier `ensureBlobDirectoryDurable(dir)` now runs (a) after every fresh `rename` and (b) before trusting ANY existing matching blob for a new authority mint. Codes tolerated: `EINVAL|ENOTSUP|EOPNOTSUPP` only; `EIO`/`EPERM`/unexpected → `FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY`. Reuse never unlinks (a shared blob may back another canonical artifact).
+- **Adversarial proof:** R3-A1 rename+EIO→FAIL,0 rows; A2 retry-still-EIO→FAIL again,0 rows (no bypass); A3 barrier healed→mint; A4 ENOTSUP→deterministic fallback.
+
+### RCA — R3.2 F1-CANONICAL-PRIOR-STORAGE-INTEGRITY-GAP (MEDIUM)
+
+- **Root cause:** `isCanonicalPrior` verified `storage.kind`/`storage.sha256` but NOT `storage.ref`; a prior with a malformed/wrong ref still classified canonical. The CAS destination was also not required to be a regular file (a symlink to matching external bytes could pose as retained authority).
+- **Fix:** prior is canonical only if `storage.ref === "blobs/<sha256>"` (no absolute/traversal/alternate) AND `lstat(blobDir/<sha>).isFile()` (non-symlink regular file) AND bounded digest re-verify. Same regular-file requirement applied when `persistBlob` decides an existing blob is reusable.
+- **Adversarial proof:** R3-B1 wrong ref, B2 missing ref, B3 traversal ref → `FAIL_CLOSED_ARTIFACT_REPLAY_CONFLICT`; B4 CAS-dest symlink→external matching bytes → conflict; B5 normal canonical → replay converges.
+
+### RCA — R3.3 F1-SECURE-READ-MIDREAD-GROWTH-GAP (HIGH)
+
+- **Root cause:** `secureReadContained` fstat'd once, allocated pre-read size, read exactly that — a file growing (or same-size mutating) between fstat and read could silently pass with an unstable realization.
+- **Fix:** after the length-verified read, `fstatSync(fd, {bigint})` runs AGAIN on the SAME fd and `dev|ino|size|mtimeNs|ctimeNs` must be unchanged — any growth/mutation lands `unresolved` → `FAIL_CLOSED_ARTIFACT_UNRESOLVED`. Containment stays bound to the same opened object; the path is never reopened. Same-size mutation inside one kernel timestamp tick is unobservable to any filesystem observer — the observable case (distinct mtime) fails closed.
+- **Adversarial proof:** R3-C1 append-during-read→fail closed,0 rows; C2 same-size mutation w/ distinct mtime→fail closed; C3 rename-replacement→original-or-fail-closed (never REPL); C4 stable→PASS; C5 oversized still pre-read rejected.
+
+### RCA — R3.4 F1-CONCURRENCY-PROOF-DEPENDS-ON-UNTRACKED-DIST (TEST-GOVERNANCE)
+
+- **Root cause:** the multi-process race fixture `require`d `dist/pair/index.js` — untracked build output: missing on clean checkout, or stale vs the HEAD under test.
+- **Fix:** worker is now `fixtures/f1-worker-accept.mts` spawned via the repo's own `node_modules/.bin/tsx`, importing `src/pair/index.ts` — genuine separate OS processes + separate PairEvidenceStore connections + same DB + start barrier, executed against CURRENT SOURCE. Verified: `rm -rf dist` → all 4 races pass.
+- **Proof:** R2-G1..G4 pass under `rm -rf dist` (31+2→32, 30+3→32, same-id converge/conflict).
+
+### Validation (final HEAD)
+
+- R2+R3 file: **43/43** (29 R2 + 14 R3) — clean-checkout proof ran under `rm -rf dist`
+- Focused F1+R1+contract+ops+incident+runtime+p9: **302/302**
+- Full suite on final HEAD: **2899 pass / 2 fail / 15 skipped** — only the known P5 env-only `stockProbe.available` fails (reproduce on base `6ff9d35`)
+- `npx tsc --noEmit` 0 errors · `pnpm build` PASS · `pnpm audit --audit-level=high` → 0 high/critical (1 low, 8 moderate baseline)
+- Remote DAG-leaf restriction diff = 0; F2/F3/P15 untouched; ONE artifact entity/contract seam unchanged
+
+### Remaining limitations
+
+- `/proc/self/fd` containment is Linux-semantics; non-Linux fails closed by design.
+- Same-size mutations within a single kernel timestamp tick are filesystem-unobservable (documented); every observable mutation fails closed.
+- `dependency_artifacts` / downstream consumer materialization remain deferred to F2 (non-ACCEPTED rows stay non-authoritative).
+
+Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R3_PENDING_SOURCE_REVIEW`

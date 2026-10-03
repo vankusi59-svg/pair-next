@@ -654,31 +654,29 @@ export class ArtifactAuthority {
     const storage = prior.storage as Record<string, unknown> | undefined;
     if (!storage || String(storage.kind ?? "") !== "PAIR_ARTIFACT_CAS") return false;
     if (String(storage.sha256 ?? "") !== p.sha256) return false;
-    const blob = boundedFileSha256(path.join(this.opts.blobDir, p.sha256), this.maxBytes);
+    // R3.2 — the canonical storage contract is exact: the logical ref
+    // must be the content-addressed `blobs/<sha>` — no alternate path,
+    // no traversal, no missing ref.
+    if (String(storage.ref ?? "") !== `blobs/${p.sha256}`) return false;
+    // …and the retained object must be a REGULAR FILE at the canonical
+    // destination (a symlink whose target happens to match is not a
+    // canonical retained blob).
+    const blobPath = path.join(this.opts.blobDir, p.sha256);
+    try {
+      if (!fs.lstatSync(blobPath).isFile()) return false;
+    } catch {
+      return false;
+    }
+    const blob = boundedFileSha256(blobPath, this.maxBytes);
     return blob.kind === "ok" && blob.sha256 === p.sha256;
   }
 
-  private persistBlob(sha256: string, bytes: Buffer): void {
-    const dir = this.opts.blobDir;
-    const dest = path.join(dir, sha256);
-    const existing = boundedFileSha256(dest, this.maxBytes);
-    if (existing.kind === "ok" && existing.sha256 === sha256) return;
-    fs.mkdirSync(dir, { recursive: true });
-    const tmp = path.join(dir, `${sha256}.tmp-${process.pid}-${ulid()}`);
-    const fh = fs.openSync(tmp, "w");
-    try {
-      fs.writeSync(fh, bytes);
-      fs.fsyncSync(fh);
-    } finally {
-      fs.closeSync(fh);
-    }
-    fs.renameSync(tmp, dest);
-    // R1.9/R2.6 — commit the directory entry too: without a parent-dir
-    // fsync a power-loss can drop the rename while data itself was
-    // durable. ONLY documented unsupported-platform/fs errors degrade
-    // (post-rename bounded re-verify still applies); any unexpected
-    // durability failure (EIO, EPERM, ...) fails closed — a silently
-    // uncommitted directory entry must never masquerade as durable.
+  /** R3.1/R2.6 — the ONE directory-durability barrier: parent-dir
+   *  fsync so a power-loss cannot drop a committed blob name. ONLY
+   *  documented unsupported-platform/fs codes degrade; every other
+   *  failure (EIO, EPERM, ...) fails closed — an uncommitted directory
+   *  entry must never masquerade as durable. */
+  private ensureBlobDirectoryDurable(dir: string, sha256: string): void {
     try {
       const dfd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
       try {
@@ -696,6 +694,43 @@ export class ArtifactAuthority {
       }
       /* documented unsupported dir-fsync platform/fs — fallback */
     }
+  }
+
+  private persistBlob(sha256: string, bytes: Buffer): void {
+    const dir = this.opts.blobDir;
+    const dest = path.join(dir, sha256);
+    // R3.2 — reuse requires a REGULAR FILE at the canonical
+    // destination; a symlink is never trusted as a retained blob.
+    let isRegular = false;
+    try {
+      isRegular = fs.lstatSync(dest).isFile();
+    } catch {
+      isRegular = false;
+    }
+    if (isRegular) {
+      const existing = boundedFileSha256(dest, this.maxBytes);
+      if (existing.kind === "ok" && existing.sha256 === sha256) {
+        // R3.1 — a reused blob backing a NEW authority mint must still
+        // carry a successful durability barrier: a previous failed
+        // dir-fsync cannot be bypassed just because the renamed bytes
+        // remain visible. Never unlink — the blob may already back
+        // another canonical artifact; re-prove the barrier instead.
+        this.ensureBlobDirectoryDurable(dir, sha256);
+        return;
+      }
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = path.join(dir, `${sha256}.tmp-${process.pid}-${ulid()}`);
+    const fh = fs.openSync(tmp, "w");
+    try {
+      fs.writeSync(fh, bytes);
+      fs.fsyncSync(fh);
+    } finally {
+      fs.closeSync(fh);
+    }
+    fs.renameSync(tmp, dest);
+    // R1.9/R3.1 — commit the directory entry through the same barrier.
+    this.ensureBlobDirectoryDurable(dir, sha256);
     const post = boundedFileSha256(dest, this.maxBytes);
     if (post.kind !== "ok" || post.sha256 !== sha256) {
       try {

@@ -1,10 +1,11 @@
-/* R2.7 — true competing writer: separate Node process + separate
+/* R2.7/R3.4 — true competing writer: separate Node process + separate
  * PairEvidenceStore connection to the SAME SQLite DB, gated on a
  * start-barrier file so writers hit the count/cap critical section
- * concurrently. */
-const fs = require("fs");
+ * concurrently. Loads CURRENT SOURCE via tsx — never a stale dist/. */
+import fs from "node:fs";
 const [, , modPath, dbPath, blobDir, eid, ex, name, src, goFile, outFile] = process.argv;
-const { PairEvidenceStore, ArtifactAuthority } = require(modPath);
+const mod = (await import(modPath)) as Record<string, any>;
+const { PairEvidenceStore, ArtifactAuthority } = mod;
 const deadline = Date.now() + 30000;
 while (!fs.existsSync(goFile)) { if (Date.now() > deadline) process.exit(2); }
 const store = new PairEvidenceStore(dbPath);
@@ -16,7 +17,7 @@ try {
     actor: "W", allow_post_result: true,
   });
   fs.writeFileSync(outFile, JSON.stringify({ ok: true, replayed: r.replayed }));
-} catch (e) {
-  fs.writeFileSync(outFile, JSON.stringify({ ok: false, code: e.code ?? String(e) }));
+} catch (e: any) {
+  fs.writeFileSync(outFile, JSON.stringify({ ok: false, code: e?.code ?? String(e) }));
 }
 store.close();

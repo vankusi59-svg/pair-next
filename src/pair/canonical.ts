@@ -171,13 +171,30 @@ export function secureReadContained(
       }
     });
     if (!inside) return { kind: "outside" };
-    const st = fs.fstatSync(fd);
+    const st = fs.fstatSync(fd, { bigint: true });
     if (!st.isFile()) return { kind: "unresolved" };
-    if (st.size > maxBytes) return { kind: "too_large", size: st.size };
-    const bytes = Buffer.alloc(st.size);
-    const read = fs.readSync(fd, bytes, 0, st.size, 0);
-    if (read !== st.size) return { kind: "unresolved" };
-    return { kind: "ok", size: st.size, bytes };
+    if (st.size > BigInt(maxBytes)) {
+      return { kind: "too_large", size: Number(st.size) };
+    }
+    const size = Number(st.size);
+    const bytes = Buffer.alloc(size);
+    const read = fs.readSync(fd, bytes, 0, size, 0);
+    if (read !== size) return { kind: "unresolved" };
+    // R3.3 — re-fstat the SAME fd after the read: a file that grew or
+    // was mutated during materialization must never silently pass.
+    // dev/ino pin file identity; size/mtimeNs/ctimeNs pin content
+    // mutation wherever the filesystem exposes them.
+    const st2 = fs.fstatSync(fd, { bigint: true });
+    if (
+      st2.dev !== st.dev ||
+      st2.ino !== st.ino ||
+      st2.size !== st.size ||
+      st2.mtimeNs !== st.mtimeNs ||
+      st2.ctimeNs !== st.ctimeNs
+    ) {
+      return { kind: "unresolved" };
+    }
+    return { kind: "ok", size, bytes };
   } finally {
     fs.closeSync(fd);
   }
