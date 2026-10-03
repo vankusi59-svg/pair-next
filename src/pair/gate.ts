@@ -958,10 +958,18 @@ export class GovernedTaskGate {
   ): Record<string, unknown> {
     const execution = this.store.get("executor_execution", executionId);
     let result = adapter.collect_result(executionId);
-    // R5.1 — strict result envelope: EVERY result entering canonical
-    // execution state must carry the common PAIR identity fields and a
-    // terminal status. A missing field is a contract failure — never a
+    // R5.1/R6.1 — strict result envelope: EVERY result entering canonical
+    // execution state must be a non-null object carrying the common PAIR
+    // identity fields, a terminal status, and an explicit `artifacts`
+    // array. A missing field is a contract failure — never a
     // "no mismatch".
+    if (
+      typeof result !== "object" ||
+      result === null ||
+      Array.isArray(result)
+    ) {
+      throw new IntegrityError("FAIL_CLOSED_RESULT_ENVELOPE", "result:not-object");
+    }
     const expectedIds: Record<string, unknown> = {
       mission_id: execution.mission_id,
       task_id: execution.task_id,
@@ -990,8 +998,10 @@ export class GovernedTaskGate {
         `status:${resultStatus || "<absent>"}`,
       );
     }
-    if (result.artifacts !== undefined && !Array.isArray(result.artifacts)) {
-      throw new IntegrityError("FAIL_CLOSED_RESULT_ENVELOPE", "artifacts:not-array");
+    // R6.1 — `artifacts` is REQUIRED: an executor with nothing to declare
+    // must explicitly emit `artifacts: []`; absence is never equivalent.
+    if (!Array.isArray(result.artifacts)) {
+      throw new IntegrityError("FAIL_CLOSED_RESULT_ENVELOPE", "artifacts:required-array");
     }
     // P13-R4 §1: untrusted remote output is sanitized BEFORE it becomes
     // canonical — broker capabilities, the master token and released

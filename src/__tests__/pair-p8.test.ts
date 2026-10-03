@@ -116,6 +116,7 @@ class ScriptedAdapter implements ExecutorAdapter {
       mission_id: t.mission_id,
       task_id: t.task_id,
       governed_task_id: t.governed_task_id,
+      artifacts: [],
       ...r,
     };
   }

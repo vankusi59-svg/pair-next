@@ -444,3 +444,83 @@ Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R4_PENDING_SOUR
 - `dependency_artifacts` / downstream consumer materialization remain deferred to F2 (non-ACCEPTED rows stay non-authoritative).
 
 Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R5_PENDING_SOURCE_REVIEW`
+
+---
+
+## R6 SOURCE-REVIEW REMEDIATION — FINAL EXPECTED-ARTIFACT CLOSURE
+
+New HEAD: <pending>
+Reviewed HEAD: `63ec25bbd63bba5e17055878b34c965292831430` (prior `ef7d96a`)
+
+### Findings closed
+
+**R6.1 — `artifacts` is REQUIRED in the result envelope.** `Gate.collect_execution_result` now
+rejects a result that is not a non-null object (`result:not-object`) and requires `artifacts`
+to be present AND an array (`artifacts:required-array`) — `FAIL_CLOSED_RESULT_ENVELOPE`.
+Missing is no longer equivalent to `[]`; executors with nothing to declare must emit
+`artifacts: []`. All three production adapters already emit it (`devin-executor.ts:589`,
+`codex-adapter.ts:583`, `worker-runner.ts:232`, required by `worker-protocol.ts`); only test
+fake adapters needed updating (collected-merge fakes get an `artifacts: []` default).
+
+**R6.2 — defensive per-entry validation.** `ArtifactProvenanceValidator` now treats
+`result.artifacts` as `unknown`: non-array → failure (defense even though Gate rejects).
+Each entry must be non-null, `typeof object`, and not an array before ANY property is read —
+`artifacts:[null]` produces validation FAIL, never an uncontrolled TypeError. `path` must be
+`typeof string` non-empty (`path:123` is rejected, never coerced to `"123"`), then the
+existing absolute/`..` rules; `sha256` must be exactly `/^[0-9a-f]{64}$/`; `byte_size` a
+finite integer `>= 0`. Malformed entries → FAIL, `artifact_ids: []`, zero new authority.
+`referened_artifact_ids` stays diagnostic-only.
+
+**R6.3 — expected artifact set comes from append-only acceptance evidence.**
+`verifyForExecution` no longer derives its candidate set from mutable `forExecution()` rows
+(contract+state+execution_id filtered). It now derives the expected set from the
+hash-verified append-only event plane: `listEvents("artifact")` re-verifies every event's
+`digest(body) === event_hash` on read (tamper throws), filtered to
+`event_type == "ARTIFACT_ACCEPTED" && metadata.execution_id == executionId`. Every
+historically-accepted id must still exist (`tryGet` → missing is `FAIL`), keep
+`execution_id == requested execution`, contract `pair-artifact.v1`, state `ACCEPTED`,
+deterministic artifact_id, full mission/task/governed/producer linkage, exact
+`storage.kind`/`sha256`/`ref`, and pass retained-CAS `readCasBlob` NOW. State flips,
+contract alters, execution moves, and entity deletion all fail closed
+(`FAIL_CLOSED_ARTIFACT_VERIFICATION`) instead of silently becoming "zero artifacts".
+
+**R6.4 (§4) — rogue-row detection.** Any current `artifact` row claiming
+`execution_id == requested execution` that is absent from the historical expected set is
+injected authority → `FAIL_CLOSED_ARTIFACT_VERIFICATION:<id>:no_acceptance_history` — a
+manually inserted canonical-looking ACCEPTED row can never become PASS authority.
+IntegrityError detail (`e.message`) is now propagated into the validator's failure strings.
+
+### Tests (18 new, all in `src/__tests__/pair-f1-r2-remediation.test.ts`, 82 total)
+
+| Group | Cases | Result |
+|---|---|---|
+| R6-A envelope | missing field, `null`, `{}`, non-object result, `[]` valid | ENVELOPE fail / pass — 5 |
+| R6-B entries | `[null]`, `["a.txt"]`, `path:123`, `artifacts:{}`, valid | FAIL no-throw / PASS — 5 |
+| R6-C history | state, contract, execution_id moved, entity deleted, intact, restart | FAIL / PASS — 6 |
+| R6-D rogue | injected canonical-looking ACCEPTED row, no event | FAIL `no_acceptance_history` — 1 |
+| plus | R6-B3b non-array artifacts field | 1 |
+
+### Validation evidence
+
+- `rm -rf dist` → remediation file **82/82** (READY+GO true-process race still passes on
+  current source)
+- focused: contract 69/69, incident 106/106, F1 20/20, R1 25/25
+- **FULL suite on final HEAD: 2938 pass / 2 fail** — only the two env-only P5
+  `stockProbe.available` failures (dsh/codex executables present on this box; reproduce on
+  base `6ff9d35`); 15 skipped
+- `npx tsc --noEmit` 0 errors · `pnpm build` PASS · `pnpm audit --audit-level=high`
+  0 high (1 low, 8 moderate — pre-existing)
+- `src/pair/mc-server.ts` DAG-leaf remote restriction: 0 diff vs base
+
+### Preserved closures
+
+R1–R5 closures verified intact by the same suites: single authority seam, open-object
+containment, one byte realization, mandatory declaration contract, strict result
+identity/status, serialized cap, atomic batch, canonical replay, producer linkage,
+storage.ref exactness, CAS O_NOFOLLOW same-object proof, directory durability barrier,
+READY+GO concurrency, compat outbox naming, bounded HTTP, PR #30 delivery semantics,
+remote DAG-leaf restriction.
+
+Classification: `PAIR_NEXT_PHASE_F1_CANONICAL_ARTIFACT_AUTHORITY_R6_PENDING_SOURCE_REVIEW`
+
+STOP. DO NOT MERGE.

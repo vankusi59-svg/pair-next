@@ -107,6 +107,7 @@ class ScriptedAdapter implements ExecutorAdapter {
       mission_id: t.mission_id,
       task_id: t.task_id,
       governed_task_id: t.governed_task_id,
+      artifacts: [],
       ...this.resultPayload,
     };
   }
@@ -1093,6 +1094,7 @@ try {
         governed_task_id: "GTSK_restart",
         mission_id: "MSN_restart",
         task_id: "TSK_restart",
+        artifacts: [],
       }),
     };
     gate.collect_execution_result(adapter, args.executionId);

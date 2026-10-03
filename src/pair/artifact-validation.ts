@@ -25,19 +25,33 @@ export class ArtifactProvenanceValidator {
     const workspace = String(governed.workspace);
     const allowedPaths = (governed.allowed_paths as string[]) ?? [workspace];
 
-    const artifacts =
-      (result?.artifacts as Array<Record<string, unknown>> | undefined) ?? [];
     const status = String(result?.status ?? "FAILED");
 
     const validationId = newId("XVLD");
     const failures: string[] = [];
 
+    // R6.2 — the validator is an independent terminal defense: it must
+    // survive malformed result structure even though Gate normally
+    // rejects it first. A non-array `artifacts` fails the validation;
+    // each entry must be a non-null, non-array object — never coerced.
+    const rawArtifacts: unknown = result?.artifacts;
+    if (rawArtifacts !== undefined && !Array.isArray(rawArtifacts)) {
+      failures.push("result.artifacts is not an array");
+    }
+    const artifactEntries: unknown[] = Array.isArray(rawArtifacts) ? rawArtifacts : [];
+
     // Result-state gate: a non-COMPLETED result may never carry validated artifacts.
     const checkedArtifacts: Array<Record<string, unknown>> = [];
-    for (const art of artifacts) {
-      const rel = String(art.path ?? "");
-      if (!rel || path.isAbsolute(rel) || rel.split("/").includes("..")) {
-        failures.push(`artifact path invalid: ${rel || "<empty>"}`);
+    for (const entry of artifactEntries) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        failures.push("artifact entry is not an object");
+        continue;
+      }
+      const art = entry as Record<string, unknown>;
+      const relField: unknown = art.path;
+      const rel = typeof relField === "string" ? relField : "";
+      if (typeof relField !== "string" || !rel || path.isAbsolute(rel) || rel.split("/").includes("..")) {
+        failures.push(`artifact path invalid: ${rel || "<invalid>"}`);
         continue;
       }
       const abs = path.resolve(workspace, rel);
@@ -78,7 +92,11 @@ export class ArtifactProvenanceValidator {
       // authoritative materialization inside ArtifactAuthority reads the
       // bytes once and compares them, so VALIDATED BYTES == CANONICAL
       // RETAINED BYTES (no validate-then-reread TOCTOU).
-      checkedArtifacts.push({ ...art });
+      checkedArtifacts.push({
+        path: rel,
+        sha256: declaredSha,
+        byte_size: declaredSize,
+      });
     }
 
     let pass = failures.length === 0 && status === "COMPLETED";
@@ -134,7 +152,7 @@ export class ArtifactProvenanceValidator {
         acceptedIds.push(...verifiedIds.filter((id) => !acceptedIds.includes(id)));
       } catch (e) {
         failures.push(
-          `artifact retained-byte verification failed: ${e instanceof IntegrityError ? e.code : String(e)}`,
+          `artifact retained-byte verification failed: ${e instanceof IntegrityError ? `${e.code}:${e.message}` : String(e)}`,
         );
         pass = false;
       }

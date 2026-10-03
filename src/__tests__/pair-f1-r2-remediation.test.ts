@@ -21,6 +21,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ArtifactAuthority,
   ArtifactProvenanceValidator,
+  canonicalArtifactId,
   compatOutboxBasename,
   GovernedTaskGate,
   IntegrityError,
@@ -1424,5 +1425,232 @@ describe("R5-B terminal PASS requires retained CAS verified NOW", () => {
     expect(v.status).toBe("PASS");
     expect(v.artifact_ids).toEqual([String(acc.artifact.artifact_id)]);
     store2.close();
+  });
+});
+
+/* ==================== R6.1 artifacts:[] is REQUIRED ===================== */
+describe("R6-A result envelope requires explicit artifacts array", () => {
+  const gateResult = (
+    ctx: ReturnType<typeof mkCtx>,
+    eid: string,
+    result: Record<string, unknown> | null,
+  ) => {
+    const adapter = { collect_result: () => result } as never;
+    return run(() =>
+      new GovernedTaskGate(ctx.service).collect_execution_result(adapter, eid),
+    );
+  };
+  const base = (ctx: ReturnType<typeof mkCtx>, p: { eid: string; tid: string; gtId: string }) => ({
+    execution_id: p.eid,
+    governed_task_id: p.gtId,
+    task_id: p.tid,
+    mission_id: ctx.missionId,
+    status: "COMPLETED",
+  });
+
+  it("R6-A1 missing artifacts field → ENVELOPE fail (absent ≠ [])", () => {
+    const ctx = mkCtx("r6a1");
+    const p = mkProducer(ctx);
+    expect(gateResult(ctx, p.eid, base(ctx, p))).toBe("FAIL_CLOSED_RESULT_ENVELOPE");
+  });
+  it("R6-A2 artifacts:null → FAIL", () => {
+    const ctx = mkCtx("r6a2");
+    const p = mkProducer(ctx);
+    expect(gateResult(ctx, p.eid, { ...base(ctx, p), artifacts: null })).toBe(
+      "FAIL_CLOSED_RESULT_ENVELOPE",
+    );
+  });
+  it("R6-A3 artifacts:{} → FAIL", () => {
+    const ctx = mkCtx("r6a3");
+    const p = mkProducer(ctx);
+    expect(gateResult(ctx, p.eid, { ...base(ctx, p), artifacts: {} })).toBe(
+      "FAIL_CLOSED_RESULT_ENVELOPE",
+    );
+  });
+  it("R6-A3b non-object result → FAIL", () => {
+    const ctx = mkCtx("r6a3b");
+    const p = mkProducer(ctx);
+    expect(gateResult(ctx, p.eid, null as never)).toBe("FAIL_CLOSED_RESULT_ENVELOPE");
+    expect(gateResult(ctx, p.eid, ["x"] as never)).toBe("FAIL_CLOSED_RESULT_ENVELOPE");
+  });
+});
+
+/* ==================== R6.2 defensive artifact-entry validation ========== */
+describe("R6-B validator defends each artifact entry without coercion", () => {
+  const validate = (ctx: ReturnType<typeof mkCtx>, eid: string) =>
+    new ArtifactProvenanceValidator().validate_execution(ctx.service, eid) as Record<
+      string,
+      unknown
+    >;
+  const ctxFor = (tag: string, artifacts: unknown) => {
+    const ctx = mkCtx(tag);
+    const p = mkProducer(ctx, {
+      state: "COMPLETED",
+      result: { status: "COMPLETED", artifacts },
+    });
+    fs.writeFileSync(path.join(ctx.workspace, "a.txt"), "AAA");
+    return { ctx, p };
+  };
+
+  it("R6-B1 artifacts:[null] → FAIL, no exception escape", () => {
+    const { ctx, p } = ctxFor("r6b1", [null]);
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("FAIL");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+  });
+  it("R6-B2 artifacts:['a.txt'] (string entry) → FAIL", () => {
+    const { ctx, p } = ctxFor("r6b2", ["a.txt"]);
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+    expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
+  });
+  it("R6-B3 path:123 with valid-looking sha/size → FAIL, never coerced", () => {
+    const { ctx, p } = ctxFor("r6b3", [
+      { path: 123, sha256: sha256Hex(Buffer.from("AAA")), byte_size: 3 },
+    ]);
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R6-B3b artifacts:{} non-array result field → FAIL", () => {
+    const { ctx, p } = ctxFor("r6b3c", { not: "array" });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R6-B4 valid object entry → PASS preserved", () => {
+    const { ctx, p } = ctxFor("r6b4", [
+      { path: "a.txt", sha256: sha256Hex(Buffer.from("AAA")), byte_size: 3 },
+    ]);
+    expect(validate(ctx, p.eid).status).toBe("PASS");
+  });
+});
+
+/* ============ R6.3 expected set = append-only acceptance history ======== */
+describe("R6-C historically accepted artifacts must remain fully canonical", () => {
+  const validate = (ctx: ReturnType<typeof mkCtx>, eid: string) =>
+    new ArtifactProvenanceValidator().validate_execution(ctx.service, eid) as Record<
+      string,
+      unknown
+    >;
+  const setup = (ctx: ReturnType<typeof mkCtx>) => {
+    const p = mkProducer(ctx); // RUNNING — remote upload precedes result
+    const acc = ctx.authority.accept({
+      execution_id: p.eid,
+      producer_executor_id: EX,
+      logical_name: "r.txt",
+      source: { kind: "buffer", bytes: Buffer.from("HIST") },
+      channel: "REMOTE_UPLOAD",
+      actor: "T",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid) as Record<string, unknown>;
+    exec.result = { status: "COMPLETED", artifacts: [] };
+    exec.execution_state = "COMPLETED";
+    ctx.store.put("executor_execution", p.eid, exec, Number(exec.version));
+    return { p, acc };
+  };
+  const mutate = (
+    ctx: ReturnType<typeof mkCtx>,
+    id: string,
+    patch: Record<string, unknown> | null,
+  ) => {
+    const row = ctx.store.get("artifact", id) as Record<string, unknown>;
+    if (patch === null) {
+      // delete the entity while its acceptance event remains
+      (ctx.store as unknown as { db: { prepare: (s: string) => { run: (a: string, b: string) => void } } })
+        .db.prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+        .run("artifact", id);
+      return;
+    }
+    Object.assign(row, patch);
+    ctx.store.put("artifact", id, row, Number(row.version));
+  };
+
+  it("R6-C1 state moved off ACCEPTED → FAIL", () => {
+    const ctx = mkCtx("r6c1");
+    const { p, acc } = setup(ctx);
+    mutate(ctx, String(acc.artifact.artifact_id), { state: "REJECTED" });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R6-C2 contract altered → FAIL", () => {
+    const ctx = mkCtx("r6c2");
+    const { p, acc } = setup(ctx);
+    mutate(ctx, String(acc.artifact.artifact_id), { contract: "pair-artifact.v0" });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R6-C3 execution_id moved to another execution → FAIL", () => {
+    const ctx = mkCtx("r6c3");
+    const { p, acc } = setup(ctx);
+    mutate(ctx, String(acc.artifact.artifact_id), { execution_id: "EXE_OTHER" });
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R6-C4 artifact entity deleted, event remains → FAIL (not 'zero artifacts')", () => {
+    const ctx = mkCtx("r6c4");
+    const { p, acc } = setup(ctx);
+    mutate(ctx, String(acc.artifact.artifact_id), null);
+    expect(validate(ctx, p.eid).status).toBe("FAIL");
+  });
+  it("R6-C5 intact row + intact CAS → PASS", () => {
+    const ctx = mkCtx("r6c5");
+    const { p, acc } = setup(ctx);
+    const v = validate(ctx, p.eid);
+    expect(v.status).toBe("PASS");
+    expect(v.artifact_ids).toEqual([String(acc.artifact.artifact_id)]);
+  });
+  it("R6-C6 restart reconstructs expected set from append-only events → PASS", () => {
+    const ctx = mkCtx("r6c6");
+    const { p, acc } = setup(ctx);
+    ctx.store.close();
+    const store2 = new PairEvidenceStore(path.join(ctx.d, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const v = new ArtifactProvenanceValidator().validate_execution(service2, p.eid) as Record<
+      string,
+      unknown
+    >;
+    expect(v.status).toBe("PASS");
+    expect(v.artifact_ids).toEqual([String(acc.artifact.artifact_id)]);
+    store2.close();
+  });
+});
+
+describe("R6-D rogue artifact rows without acceptance history", () => {
+  it("R6-D1 injected canonical-looking ACCEPTED row → never PASS authority", () => {
+    const ctx = mkCtx("r6d1");
+    const p = mkProducer(ctx, {
+      state: "COMPLETED",
+      result: { status: "COMPLETED", artifacts: [] },
+    });
+    // Manually insert a row that LOOKS fully canonical for this execution
+    // but has no ARTIFACT_ACCEPTED event behind it.
+    const bytes = Buffer.from("ROGUE");
+    const sha = sha256Hex(bytes);
+    fs.mkdirSync(path.join(ctx.d, "artifacts", "blobs"), { recursive: true });
+    fs.writeFileSync(blobPath(ctx, sha), bytes);
+    const rid = canonicalArtifactId(p.eid, "rogue.txt");
+    ctx.store.put(
+      "artifact",
+      rid,
+      {
+        artifact_id: rid,
+        execution_id: p.eid,
+        governed_task_id: p.gtId,
+        task_id: p.tid,
+        mission_id: ctx.missionId,
+        producer_executor_id: EX,
+        logical_name: "rogue.txt",
+        artifact_class: "OUTPUT",
+        sha256: sha,
+        byte_size: bytes.length,
+        state: "ACCEPTED",
+        contract: "pair-artifact.v1",
+        ingested_via: "REMOTE_UPLOAD",
+        storage: { kind: "PAIR_ARTIFACT_CAS", ref: `blobs/${sha}`, sha256: sha },
+        created_at: utcnow(),
+        version: 0,
+      },
+      0,
+    );
+    const v = new ArtifactProvenanceValidator().validate_execution(ctx.service, p.eid) as Record<
+      string,
+      unknown
+    >;
+    expect(v.status).toBe("FAIL");
+    expect(v.artifact_ids).toEqual([]);
+    expect(v.failures.join(" ")).toContain("no_acceptance_history");
   });
 });

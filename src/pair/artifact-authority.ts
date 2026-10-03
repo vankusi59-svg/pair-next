@@ -451,14 +451,54 @@ export class ArtifactAuthority {
         `${executionId}:durable_linkage`,
       );
     }
-    const verified: string[] = [];
-    for (const row of this.forExecution(executionId)) {
+    // R6.3 — the expected set comes from the APPEND-ONLY, hash-verified
+    // event plane: every artifact once canonically accepted for this
+    // execution must still exist and remain fully canonical at terminal
+    // validation. Deriving it from current mutable rows would be
+    // fail-open — a mutated/moved/deleted row would simply vanish from
+    // the set and let a result pass around it.
+    const expected = new Set<string>();
+    for (const ev of this.store.listEvents(ARTIFACT_ENTITY)) {
+      if (
+        String(ev.event_type) === "ARTIFACT_ACCEPTED" &&
+        String(
+          ((ev.metadata as Record<string, unknown> | null) ?? {}).execution_id ?? "",
+        ) === executionId
+      ) {
+        expected.add(String(ev.entity_id));
+      }
+    }
+    // §4 — a current row claiming this execution WITHOUT a historical
+    // ARTIFACT_ACCEPTED is injected authority: fail closed, never grant
+    // it PASS authority merely because its fields look canonical.
+    for (const row of this.store.list(ARTIFACT_ENTITY)) {
       const id = String(row.artifact_id);
+      if (String(row.execution_id) === executionId && !expected.has(id)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+          `${id}:no_acceptance_history`,
+        );
+      }
+    }
+    const verified: string[] = [];
+    for (const id of expected) {
       const fail = (reason: string): never => {
         throw new IntegrityError("FAIL_CLOSED_ARTIFACT_VERIFICATION", `${id}:${reason}`);
       };
+      const row = this.store.tryGet(ARTIFACT_ENTITY, id) as Record<
+        string,
+        unknown
+      > | null;
+      if (!row) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_ARTIFACT_VERIFICATION",
+          `${id}:missing`,
+        );
+      }
       const sha = String(row.sha256 ?? "");
+      if (String(row.execution_id) !== executionId) fail("execution_id");
       if (String(row.contract ?? "") !== ARTIFACT_CONTRACT) fail("contract");
+      if (String(row.state ?? "") !== "ACCEPTED") fail("state");
       if (id !== canonicalArtifactId(executionId, String(row.logical_name))) {
         fail("artifact_id");
       }

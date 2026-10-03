@@ -114,7 +114,7 @@ class ScriptedAdapter implements ExecutorAdapter {
   }
   collect_result(executionId: string) {
     const r = this.collected[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
-    return { execution_id: executionId, ...r };
+    return { execution_id: executionId, artifacts: [], ...r };
   }
   collect_artifacts() {
     return [];
@@ -387,6 +387,7 @@ describe("P9 §36 — runtime planning + scheduling", () => {
         mission_id: exec.mission_id,
         task_id: exec.task_id,
         governed_task_id: exec.governed_task_id,
+        artifacts: [],
       };
     }
     ctx.runtime.resume(mid, "op1");
@@ -450,6 +451,7 @@ describe("P9 §36 — restart/crash recovery", () => {
         mission_id: exec.mission_id,
         task_id: exec.task_id,
         governed_task_id: exec.governed_task_id,
+        artifacts: [],
       };
     }
     const rt2 = new MissionRuntime({
@@ -494,6 +496,7 @@ describe("P9 §36 — restart/crash recovery", () => {
         mission_id: exec.mission_id,
         task_id: exec.task_id,
         governed_task_id: exec.governed_task_id,
+        artifacts: [],
       };
     }
     const rt2 = new MissionRuntime({
