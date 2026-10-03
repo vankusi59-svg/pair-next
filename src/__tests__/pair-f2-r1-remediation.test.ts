@@ -44,6 +44,7 @@ import {
   DEPENDENCY_ARTIFACT_ROOT,
   dependencyConsumerPath,
   DevinExecutorAdapter,
+  digest,
   ExecutorRegistry,
   GovernedTaskGate,
   handoffBindingDigest,
@@ -154,6 +155,7 @@ function mkProducer(
       task_id: tid,
       correlation_id: `COR_${tid}`,
       executor_id: executor,
+      plan_id: "PLAN_F2",
       plan_revision: 1,
       workspace: ctx.workspace,
       allowed_paths: [ctx.workspace],
@@ -164,6 +166,59 @@ function mkProducer(
     },
     0,
   );
+  {
+    // F5 R1.B — mirror the production mint: every governed task emits the
+    // immutable GOVERNED_TASK_VALIDATED anchor; remote tasks additionally
+    // pin the F5 declared-produces contract.
+    const governed = ctx.store.get("governed_task", gtId);
+    if (opts.remote) {
+      governed.expected_output_contract = {
+        type: "TASK_RESULT",
+        declared_produces: [name],
+      };
+    }
+    governed.permissions = governed.permissions ?? [];
+    governed.dependency_artifacts_digest =
+      governed.dependency_artifacts_digest ?? null;
+    governed.approval_scope_digest = digest({
+      mission_id: governed.mission_id,
+      task_id: governed.task_id,
+      executor_id: governed.executor_id,
+      workspace: String(governed.workspace),
+      allowed_paths: governed.allowed_paths,
+      permissions: governed.permissions,
+      expected_output_contract: governed.expected_output_contract,
+      dependency_artifacts_digest: governed.dependency_artifacts_digest,
+    });
+    ctx.store.put("governed_task", gtId, governed, Number(governed.version));
+    const declared = opts.remote ? [name] : null;
+    ctx.store.event({
+      entity_type: "governed_task",
+      entity_id: gtId,
+      event_type: "GOVERNED_TASK_VALIDATED",
+      new_state: "VALIDATED",
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: `COR_${tid}`,
+      metadata: {
+        mission_id: ctx.missionId, task_id: tid, executor_id: executor,
+        governed_task_id: gtId,
+        plan_id: "PLAN_F2", plan_revision: 1,
+        approval_scope_digest: governed.approval_scope_digest,
+        remote_produces_contract: !!opts.remote,
+        declared_produces: declared,
+        declared_produces_digest: declared ? digest(declared) : null,
+      },
+    });
+    ctx.store.appendEvidence(ctx.missionId, "GOVERNED_TASK_VALIDATED", {
+      governed_task_id: gtId, task_id: tid, executor_id: executor,
+      mission_id: ctx.missionId,
+      plan_id: "PLAN_F2", plan_revision: 1,
+      approval_scope_digest: governed.approval_scope_digest,
+      remote_produces_contract: !!opts.remote,
+      declared_produces: declared,
+      declared_produces_digest: declared ? digest(declared) : null,
+    });
+  }
   const bytes =
     opts.artifactBytes === undefined
       ? Buffer.from(`artifact-of-${tid}`)
@@ -1835,12 +1890,26 @@ describe("R1.7 G — production E2E", () => {
         reject(new Error(`server worker exited ${code} buf=${buf}`)),
       );
     });
+    // F5.5 — the simulated deployment HAS the remote ingest lane (the
+    // spawned worker serves /api/outbox with UPMASTER); declare it in env
+    // exactly like the prod start script does so the structural
+    // lane-availability gate sees the same deployment reality.
+    const savedEnv = {
+      PAIR_OUTBOX_URL: process.env.PAIR_OUTBOX_URL,
+      PAIR_ARTIFACT_UPLOAD_TOKEN: process.env.PAIR_ARTIFACT_UPLOAD_TOKEN,
+    };
+    process.env.PAIR_OUTBOX_URL = `http://127.0.0.1:${port}`;
+    process.env.PAIR_ARTIFACT_UPLOAD_TOKEN = UPMASTER;
     return {
       port,
       child: child as ChildProcess,
       close: async () => {
         child.kill("SIGTERM");
         await new Promise<void>((r) => child.on("exit", () => r()));
+        for (const k of Object.keys(savedEnv) as Array<keyof typeof savedEnv>) {
+          if (savedEnv[k] === undefined) delete process.env[k];
+          else process.env[k] = savedEnv[k];
+        }
       },
     };
   };

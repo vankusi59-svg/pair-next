@@ -73,6 +73,8 @@ import {
   isTextDeliverableName,
   verifyOutputLanguageContent,
 } from "./output-language.js";
+import { MAX_ARTIFACTS_PER_EXECUTION } from "./artifact-authority.js";
+import { artifactConsumeCapabilityMasterFromEnv } from "./artifact-consume-capability.js";
 import type { RecoveryAction } from "./recovery-controller.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
 import { validatePlanProposal } from "./proposal.js";
@@ -387,6 +389,48 @@ export class MissionRuntime {
 
   /* ---------------- governed request builder ----------------------------- */
 
+  /** F5.1 — the remote declared-produces projection. For a remote-capability
+   *  task the canonical PAIR-stamped `metadata.pair_dataflow.produces` set is
+   *  normalized (trim/dedupe/sorted, bounded by the artifact-authority bound)
+   *  and pinned into `expected_output_contract.declared_produces` so the
+   *  governed execution contract carries the dispatch-time authority —
+   *  approval-scope + governance digests cover it and it is immutable after
+   *  dispatch. `pair_dataflow.produces` remains the plan authority; this is
+   *  only its pinned projection, never a second dataflow authority.
+   *  Non-remote tasks keep the contract untouched (local produces are
+   *  already closed by the F1 result-artifact batch).
+   *  F5.5 — structural feasibility at governed-request time (before any
+   *  remote spend): a remote task declaring produces can only satisfy them
+   *  when the canonical remote ingest lane exists in this deployment
+   *  (outbox endpoint + upload master) — otherwise the plan shape can never
+   *  canonicalize its declared produces and fails closed here. */
+  private expectedOutputContractFor(
+    task: Record<string, unknown>,
+    tmd: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const base =
+      (tmd.expected_output_contract as Record<string, unknown>) ?? {
+        type: "TASK_RESULT",
+      };
+    if (!isRemoteCapabilityTask(task)) return base;
+    const df = tmd.pair_dataflow as Record<string, unknown> | undefined;
+    const produces = normalizeDeclaredProduces(df?.produces, task);
+    if (produces.length && !remoteIngestLaneAvailable()) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_REMOTE_INGEST_LANE_UNAVAILABLE",
+        JSON.stringify({
+          task_id: String(task.task_id),
+          declared_count: produces.length,
+        }),
+        {
+          dependency_reason: "REMOTE_PRODUCER_ARTIFACT_MISSING",
+          producer_task_id: String(task.task_id),
+        },
+      );
+    }
+    return { ...base, declared_produces: produces };
+  }
+
   private requestFor(
     mission: Record<string, unknown>,
     task: Record<string, unknown>,
@@ -413,8 +457,7 @@ export class MissionRuntime {
       permissions: (mission.granted_permissions as string[]) ?? [],
       constraints: (md.constraints as string[]) ?? [],
       timeout: Number(tmd.timeout ?? this.deps.taskTimeoutSeconds ?? DEFAULT_TASK_TIMEOUT),
-      expected_output_contract:
-        tmd.expected_output_contract ?? { type: "TASK_RESULT" },
+      expected_output_contract: this.expectedOutputContractFor(task, tmd),
       requested_tools:
         (tmd.requested_tools as string[]) ??
         (task.required_capabilities as string[]) ??
@@ -1381,6 +1424,32 @@ export class MissionRuntime {
       }
       // Validation failed — artifact failure, never mark success.
       this.deps.service.updateTask(taskId, { status: "FAILED" });
+      // F5.4 — a remote declared-produces closure violation is a
+      // DEPENDENCY_FAILURE on the PRODUCER task itself (the task whose
+      // settle just failed): typed dependency reason, bounded context,
+      // deterministic bounded recovery — never an unclassified throw.
+      const remoteMissing = Array.isArray(validation.remote_produces_missing)
+        ? (validation.remote_produces_missing as string[])
+        : [];
+      if (remoteMissing.length) {
+        this.startRecovery(
+          missionId,
+          taskId,
+          executionId,
+          "DEPENDENCY_FAILURE",
+          undefined,
+          undefined,
+          undefined,
+          {
+            dependency_reason: "REMOTE_PRODUCER_ARTIFACT_MISSING",
+            artifact_name: remoteMissing.join(","),
+            producer_task_id: taskId,
+            consumer_task_id: taskId,
+            source_code: "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE",
+          },
+        );
+        return;
+      }
       this.startRecovery(
         missionId,
         taskId,
@@ -3551,4 +3620,83 @@ export class MissionRuntime {
 
 function rt_pendingRemediation(rt: Record<string, unknown>): boolean {
   return rt.pending_remediation != null;
+}
+
+/* ================================================================== */
+/* F5 — REMOTE declared-produces authority                              */
+/* ================================================================== */
+
+/** F5.1 — normalized declared-produces projection. Strings only, trimmed,
+ *  deduped, deterministically sorted, bounded by the artifact-authority
+ *  per-execution bound; any violation fails closed at governed-request
+ *  time (a malformed declared set can never reach the pinned contract). */
+export function normalizeDeclaredProduces(
+  raw: unknown,
+  task: Record<string, unknown>,
+): string[] {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) {
+    throw new DependencyResolutionError(
+      "FAIL_CLOSED_DECLARED_PRODUCES_INVALID",
+      JSON.stringify({ task_id: String(task.task_id), kind: "not_array" }),
+      {
+        dependency_reason: "REMOTE_PRODUCER_ARTIFACT_MISSING",
+        producer_task_id: String(task.task_id),
+      },
+    );
+  }
+  const out = new Set<string>();
+  for (const entry of raw) {
+    if (typeof entry !== "string") {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_DECLARED_PRODUCES_INVALID",
+        JSON.stringify({ task_id: String(task.task_id), kind: "not_string" }),
+        {
+          dependency_reason: "REMOTE_PRODUCER_ARTIFACT_MISSING",
+          producer_task_id: String(task.task_id),
+        },
+      );
+    }
+    const name = entry.trim();
+    if (!name) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_DECLARED_PRODUCES_INVALID",
+        JSON.stringify({ task_id: String(task.task_id), kind: "empty_name" }),
+        {
+          dependency_reason: "REMOTE_PRODUCER_ARTIFACT_MISSING",
+          producer_task_id: String(task.task_id),
+        },
+      );
+    }
+    out.add(name);
+  }
+  const sorted = [...out].sort();
+  if (sorted.length > MAX_ARTIFACTS_PER_EXECUTION) {
+    throw new DependencyResolutionError(
+      "FAIL_CLOSED_DECLARED_PRODUCES_BOUNDS",
+      JSON.stringify({
+        task_id: String(task.task_id),
+        declared_count: sorted.length,
+      }),
+      {
+        dependency_reason: "REMOTE_PRODUCER_ARTIFACT_MISSING",
+        producer_task_id: String(task.task_id),
+      },
+    );
+  }
+  return sorted;
+}
+
+/** F5.5 — structural remote-ingest availability: the ONE canonical
+ *  remote ingest authority is the execution-scoped upload lane
+ *  (`/api/outbox` + `x-artifact-capability` → acceptArtifactUpload),
+ *  which exists only when both the endpoint URL and the upload master
+ *  are configured. Structural only — never a live remote health probe. */
+export function remoteIngestLaneAvailable(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return (
+    Boolean(String(env.PAIR_OUTBOX_URL ?? "").trim()) &&
+    artifactConsumeCapabilityMasterFromEnv(env) !== undefined
+  );
 }

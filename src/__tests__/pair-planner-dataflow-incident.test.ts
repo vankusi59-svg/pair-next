@@ -1186,6 +1186,16 @@ describe("R2 §14–15 — explicit delivery sends only manifested artifacts", (
 describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
   it("G+H. remote upload with no intent → zero; upload while RUNNING → zero, COMPLETED → manifested send once", async () => {
     const ctx = makeCtx("r2-remote");
+    // F5.5 — this test simulates a deployment WITH the remote ingest
+    // lane (it drives acceptArtifactUpload directly); declare it in env
+    // like the prod start script so the structural lane gate sees it.
+    const savedEnv = {
+      PAIR_OUTBOX_URL: process.env.PAIR_OUTBOX_URL,
+      PAIR_ARTIFACT_UPLOAD_TOKEN: process.env.PAIR_ARTIFACT_UPLOAD_TOKEN,
+    };
+    process.env.PAIR_OUTBOX_URL = "http://127.0.0.1:1";
+    process.env.PAIR_ARTIFACT_UPLOAD_TOKEN = "MASTER";
+    try {
     const remoteAdapter = new ScriptedAdapter("EX_R", [
       "REMOTE_CLOUD_TASK_EXECUTION",
     ]);
@@ -1272,6 +1282,12 @@ describe("R2 §16 — remote outbox upload + TEXT delivery", () => {
     // producer's canonical artifact and sends exactly once.
     expect(await bridgeSend(ctx)).toEqual(["chart.png"]);
     expect(await bridgeSend(ctx)).toEqual([]);
+    } finally {
+      for (const k of Object.keys(savedEnv) as Array<keyof typeof savedEnv>) {
+        if (savedEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[k];
+      }
+    }
   });
 
   it("I. TEXT delivery waits for upstream COMPLETED, sends composed text once, invents no artifact dep", async () => {

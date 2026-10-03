@@ -392,6 +392,28 @@ export class GovernedTaskGate {
     };
     const scopeDigest = digest(approvalScope);
 
+    // F5 R1.B — the immutable mint anchor: the GOVERNED_TASK_VALIDATED
+    // event/evidence below binds the COMPLETE scope authority (its
+    // approval_scope_digest covers expected_output_contract, whose
+    // declared_produces set for remote tasks is separately bound here
+    // as its own digest + exact normalized set). Terminal validation
+    // resolves THIS anchor — never the mutable governed row — to prove
+    // the contract was not downgraded or coherently rewritten after
+    // mint.
+    const remoteProducesContract = isRemoteCapabilityTask(task);
+    const contractDeclared = (
+      request.expected_output_contract as
+        | Record<string, unknown>
+        | undefined
+    )?.declared_produces;
+    const anchoredDeclared: string[] | null =
+      remoteProducesContract && Array.isArray(contractDeclared)
+        ? contractDeclared.map((n) => String(n))
+        : null;
+    const anchoredDeclaredDigest = anchoredDeclared
+      ? digest(anchoredDeclared)
+      : null;
+
     let approvalId: string | null = null;
     if (needsApproval) {
       const approval = this.findValidApproval(
@@ -475,14 +497,28 @@ export class GovernedTaskGate {
         risk_class: riskClass,
         approval_required: needsApproval,
         dependency_artifacts_digest: dependencyArtifactsDigest,
+        // F5 R1.B — immutable mint-time F5 contract binding.
+        governed_task_id: governedTaskId,
+        plan_id: active.plan_id,
+        plan_revision: active.revision,
+        approval_scope_digest: scopeDigest,
+        remote_produces_contract: remoteProducesContract,
+        declared_produces: anchoredDeclared,
+        declared_produces_digest: anchoredDeclaredDigest,
       },
     });
     this.store.appendEvidence(String(mission.mission_id), "GOVERNED_TASK_VALIDATED", {
       governed_task_id: governedTaskId,
       task_id: task.task_id,
       executor_id: adapter.executor_id,
+      mission_id: mission.mission_id,
+      plan_id: active.plan_id,
+      plan_revision: active.revision,
       approval_scope_digest: scopeDigest,
       approval_id: approvalId,
+      remote_produces_contract: remoteProducesContract,
+      declared_produces: anchoredDeclared,
+      declared_produces_digest: anchoredDeclaredDigest,
     });
     return { governed_task: resaved };
   }
