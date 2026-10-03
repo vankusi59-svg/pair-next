@@ -321,7 +321,7 @@ src/__tests__/pair-p2.test.ts / pair-p5.test.ts   failure-code expectation → D
 ## INDEPENDENT SOURCE-REVIEW R3 REMEDIATION
 
 - **Previous reviewed HEAD:** `e590b71323c5278dd6fbd0d1484ecd2d77d682bb`
-- **New HEAD:** `<pending>`
+- **New HEAD:** `17d90f2242b5947f2dc7bef0a90923fecc9e8df9`
 - **Changed files:** `src/pair/canonical.ts`, `src/pair/artifact-authority.ts`, `src/__tests__/pair-f1-r2-remediation.test.ts`, `src/__tests__/fixtures/f1-worker-accept.mts` (replaces `.cjs`), `CURRENT_STATE.md`, this report.
 
 ### RCA — R3.1 F1-CAS-DURABILITY-RETRY-BYPASS (HIGH)
