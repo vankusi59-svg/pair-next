@@ -453,6 +453,35 @@ function mkRemoteProducer(
   };
   governed.approval_scope_digest = scopeDigest(governed);
   ctx.store.put("governed_task", gtId, governed, 0);
+  // F5 R1.B — emit the immutable GOVERNED_TASK_VALIDATED mint anchor
+  // exactly as the gate does (event + evidence), binding the mint-time
+  // F5 contract + scope digest.
+  ctx.store.event({
+    entity_type: "governed_task",
+    entity_id: gtId,
+    event_type: "GOVERNED_TASK_VALIDATED",
+    new_state: "VALIDATED",
+    actor: "PAIR_GOVERNED_TASK_GATE",
+    correlation_id: `COR_${tid}`,
+    metadata: {
+      mission_id: o.missionId, task_id: tid, executor_id: executor,
+      governed_task_id: gtId,
+      plan_id: o.planId ?? "PLAN_F5", plan_revision: 1,
+      approval_scope_digest: governed.approval_scope_digest,
+      remote_produces_contract: true,
+      declared_produces: [...o.produces].sort(),
+      declared_produces_digest: digest([...o.produces].sort()),
+    },
+  });
+  ctx.store.appendEvidence(o.missionId, "GOVERNED_TASK_VALIDATED", {
+    governed_task_id: gtId, task_id: tid, executor_id: executor,
+    mission_id: o.missionId,
+    plan_id: o.planId ?? "PLAN_F5", plan_revision: 1,
+    approval_scope_digest: governed.approval_scope_digest,
+    remote_produces_contract: true,
+    declared_produces: [...o.produces].sort(),
+    declared_produces_digest: digest([...o.produces].sort()),
+  });
   // Execution stays OPEN (RUNNING, no result) — remote uploads may only
   // land while the execution is open; the result is persisted at settle.
   ctx.store.put(
@@ -1240,5 +1269,360 @@ describe("F5 — E2E + restart + handoff", () => {
       delete process.env.PAIR_OUTBOX_URL;
       delete process.env.PAIR_ARTIFACT_UPLOAD_TOKEN;
     }
+  });
+});
+
+/* ====================== R1 — immutable mint-anchor authority ============= */
+
+const mutateGoverned = (
+  ctx: ReturnType<typeof makeCtx>,
+  gtId: string,
+  fn: (g: Record<string, unknown>) => void,
+) => {
+  const g = ctx.store.get("governed_task", gtId);
+  fn(g);
+  ctx.store.put("governed_task", gtId, g, Number(g.version));
+};
+
+describe("F5 R1 — immutable mint-time anchor governs F5 binding", () => {
+  it("R1-1. declared_produces deleted post-dispatch → FAIL (no legacy downgrade)", () => {
+    const ctx = makeCtx("f5r1-1");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R1" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      const c = { ...(g.expected_output_contract as Record<string, unknown>) };
+      delete c.declared_produces;
+      g.expected_output_contract = c;
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    const failures = validationRow(ctx, p.eid)!.failures as string[];
+    expect(failures).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces",
+      ]),
+    );
+  });
+
+  it("R1-2. declared_produces set to null → FAIL", () => {
+    const ctx = makeCtx("f5r1-2");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R2" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.expected_output_contract = {
+        ...(g.expected_output_contract as Record<string, unknown>),
+        declared_produces: null,
+      };
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+    expect(
+      validationRow(ctx, p.eid)!.failures as string[],
+    ).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces",
+      ]),
+    );
+  });
+
+  it("R1-3. declared_produces reshaped to string/object → FAIL", () => {
+    for (const shape of ["data.json", { name: "data.json" }]) {
+      const ctx = makeCtx(`f5r1-3-${typeof shape === "string" ? "s" : "o"}`);
+      const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R3" });
+      const exec = ctx.store.get("executor_execution", p.eid);
+      upload(ctx, exec, "data.json", "ok");
+      mutateGoverned(ctx, p.gtId, (g) => {
+        g.expected_output_contract = {
+          ...(g.expected_output_contract as Record<string, unknown>),
+          declared_produces: shape,
+        };
+        g.approval_scope_digest = scopeDigest(g);
+      });
+      completeRemote(ctx, p.eid);
+      expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+    }
+  });
+
+  it("R1-4. declared_produces narrowed [] + row scope digest recomputed → FAIL vs anchor", () => {
+    const ctx = makeCtx("f5r1-4");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R4" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.expected_output_contract = {
+        ...(g.expected_output_contract as Record<string, unknown>),
+        declared_produces: [],
+      };
+      // Attacker keeps the MUTABLE row self-consistent — the immutable
+      // anchor still exposes the drift.
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract",
+      ]),
+    );
+  });
+
+  it("R1-5. narrowing ['data.json','report.md']→['data.json'] + recompute → FAIL", () => {
+    const ctx = makeCtx("f5r1-5");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["data.json", "report.md"],
+      missionId: "M_R5",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "a");
+    upload(ctx, exec, "report.md", "b");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.expected_output_contract = {
+        ...(g.expected_output_contract as Record<string, unknown>),
+        declared_produces: ["data.json"],
+      };
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+  });
+
+  it("R1-6. widening declared_produces + recompute → FAIL", () => {
+    const ctx = makeCtx("f5r1-6");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R6" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "a");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.expected_output_contract = {
+        ...(g.expected_output_contract as Record<string, unknown>),
+        declared_produces: ["data.json", "extra.md"],
+      };
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+  });
+
+  it("R1-7. coherent rewrite of BOTH approval_scope_digest + governance_digest → FAIL", () => {
+    const ctx = makeCtx("f5r1-7");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R7" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.expected_output_contract = {
+        ...(g.expected_output_contract as Record<string, unknown>),
+        declared_produces: [],
+      };
+      g.approval_scope_digest = scopeDigest(g);
+      g.governance_digest = digest(g);
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract",
+      ]),
+    );
+  });
+
+  it("R1-8. anchor deleted → remote execution can NEVER downgrade to legacy → FAIL", () => {
+    const ctx = makeCtx("f5r1-8");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R8" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    // Delete the immutable mint anchor (raw removal — history corruption).
+    ctx.store.db
+      .prepare(
+        "DELETE FROM events WHERE entity_type='governed_task' AND entity_id=? AND event_type='GOVERNED_TASK_VALIDATED'",
+      )
+      .run(p.gtId);
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining(["FAIL_CLOSED_GOVERNED_MINT_ANCHOR:MISSING"]),
+    );
+  });
+
+  it("R1-9. duplicate/conflicting anchor minted → FAIL (ambiguous authority)", () => {
+    const ctx = makeCtx("f5r1-9");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R9" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    // Forge a SECOND competing anchor.
+    ctx.store.event({
+      entity_type: "governed_task",
+      entity_id: p.gtId,
+      event_type: "GOVERNED_TASK_VALIDATED",
+      new_state: "VALIDATED",
+      actor: "FORGERY",
+      metadata: {
+        mission_id: "M_R9", task_id: p.tid, executor_id: p.executor,
+        governed_task_id: p.gtId,
+        remote_produces_contract: false,
+      },
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining(["FAIL_CLOSED_GOVERNED_MINT_ANCHOR:AMBIGUOUS"]),
+    );
+  });
+
+  it("R1-10. foreign-id forged anchor (different task/executor ids) → FAIL", () => {
+    const ctx = makeCtx("f5r1-10");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_RA" });
+    // Remove the genuine anchor and mint a forged one whose identity
+    // binds a DIFFERENT task/executor — exactly one anchor exists but it
+    // does not correspond to this governed task.
+    ctx.store.db
+      .prepare(
+        "DELETE FROM events WHERE entity_type='governed_task' AND entity_id=? AND event_type='GOVERNED_TASK_VALIDATED'",
+      )
+      .run(p.gtId);
+    ctx.store.event({
+      entity_type: "governed_task",
+      entity_id: p.gtId,
+      event_type: "GOVERNED_TASK_VALIDATED",
+      new_state: "VALIDATED",
+      actor: "FORGERY",
+      metadata: {
+        mission_id: "M_RA", task_id: "FOREIGN_TASK",
+        executor_id: "EX_FOREIGN", governed_task_id: p.gtId,
+        remote_produces_contract: true,
+        declared_produces: ["data.json"],
+        declared_produces_digest: digest(["data.json"]),
+      },
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining(["FAIL_CLOSED_GOVERNED_MINT_ANCHOR:IDENTITY"]),
+    );
+  });
+
+  it("R1-11. restart with intact anchor + artifact → PASS exactly once", () => {
+    const ctx = makeCtx("f5r1-11");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_RB" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "durable");
+    completeRemote(ctx, p.eid);
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const v = new ArtifactProvenanceValidator().validate_execution(service2, p.eid);
+    expect(String(v.status)).toBe("PASS");
+  });
+
+  it("R1-12. restart with MUTATED row + intact anchor → same FAIL after reopen", () => {
+    const ctx = makeCtx("f5r1-12");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_RC" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "durable");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.expected_output_contract = {
+        ...(g.expected_output_contract as Record<string, unknown>),
+        declared_produces: [],
+      };
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    completeRemote(ctx, p.eid);
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const v = new ArtifactProvenanceValidator().validate_execution(service2, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+  });
+
+  it("R1-13. genuine remote declared_produces:[] from mint stays valid", () => {
+    const ctx = makeCtx("f5r1-13");
+    const p = mkRemoteProducer(ctx, { produces: [], missionId: "M_RD" });
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+  });
+
+  it("R1-14. LOCAL task — planner-supplied declared_produces cannot mint F5 authority", () => {
+    const ctx = makeCtx("f5r1-14");
+    const tid = "LT_R14";
+    const gtId = `GT_${tid}`;
+    const eid = workerExecutionId(EX_LOCAL, gtId);
+    ctx.store.put(
+      "task",
+      tid,
+      {
+        task_id: tid, task_key: "TK_R14", mission_id: "M_RE",
+        title: "local task", task_instruction: "local work",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [], status: "READY",
+        metadata: {
+          expected_output_contract: {
+            type: "TASK_RESULT",
+            // A planner-supplied declared_produces must not grant F5
+            // binding on a non-remote task — local closure stays the
+            // documented legacy semantics.
+            declared_produces: ["never-uploaded.json"],
+          },
+        },
+        version: 0,
+      },
+      0,
+    );
+    const governed: Record<string, unknown> = {
+      governed_task_id: gtId, mission_id: "M_RE", task_id: tid,
+      correlation_id: `COR_${tid}`, executor_id: EX_LOCAL,
+      plan_id: "PLAN_R14", plan_revision: 1,
+      workspace: ctx.workspace, allowed_paths: [ctx.workspace],
+      permissions: [], dependency_artifacts_digest: null,
+      expected_output_contract: {
+        type: "TASK_RESULT",
+        declared_produces: ["never-uploaded.json"],
+      },
+      governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      created_at: utcnow(), version: 0,
+    };
+    governed.approval_scope_digest = scopeDigest(governed);
+    ctx.store.put("governed_task", gtId, governed, 0);
+    // Local mint emits the anchor with remote_produces_contract: false —
+    // the planner-supplied field does not become F5 authority.
+    ctx.store.event({
+      entity_type: "governed_task",
+      entity_id: gtId,
+      event_type: "GOVERNED_TASK_VALIDATED",
+      new_state: "VALIDATED",
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      metadata: {
+        mission_id: "M_RE", task_id: tid, executor_id: EX_LOCAL,
+        governed_task_id: gtId,
+        plan_id: "PLAN_R14", plan_revision: 1,
+        approval_scope_digest: governed.approval_scope_digest,
+        remote_produces_contract: false,
+        declared_produces: null,
+        declared_produces_digest: null,
+      },
+    });
+    ctx.store.put(
+      "executor_execution",
+      eid,
+      {
+        execution_id: eid, governed_task_id: gtId, mission_id: "M_RE",
+        task_id: tid, executor_id: EX_LOCAL, correlation_id: `COR_${tid}`,
+        execution_state: "COMPLETED",
+        result: { status: "COMPLETED", artifacts: [], summary: "done" },
+        workspace: ctx.workspace,
+        version: 0,
+      },
+      0,
+    );
+    const v = validate(ctx, eid);
+    // Local task keeps prior semantics — no upload, no declared-produces
+    // closure requirement.
+    expect(String(v.status)).toBe("PASS");
   });
 });

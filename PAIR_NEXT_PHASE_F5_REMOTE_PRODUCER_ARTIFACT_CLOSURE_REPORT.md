@@ -324,3 +324,122 @@ T4 TELEGRAM     consumes:[gold_report.md]
 
 PR pushed, **NOT merged**. Awaiting audit.
 `PAIR_NEXT_PHASE_F5_REMOTE_PRODUCER_ARTIFACT_CLOSURE_PENDING_AUDIT`
+
+---
+
+# Phase F5 R1 — IMMUTABLE MINT-TIME ANCHOR AUTHORITY
+
+Prev audited HEAD: `885b7e0b185dea6d9758a4825874bed444319ade` (PR #36, same branch — DO NOT MERGE)
+
+## R1.A — defect closed
+
+The F5.3 gate decided whether the remote-produces contract applied from
+the CURRENT presence/type of the mutable
+`governed.expected_output_contract.declared_produces` field, and
+compared a recomputed scope against the mutable row's own
+`approval_scope_digest`. A post-dispatch delete/null/narrow of that
+field — with the row digest recomputed self-consistently — silently
+downgraded an F5-minted remote execution back to legacy semantics. The
+decision of "is this execution F5-bound" now comes only from immutable
+mint-time provenance.
+
+## R1.B — the immutable anchor chosen
+
+The EXISTING `GOVERNED_TASK_VALIDATED` mint anchor is extended (no
+second competing authority) — both the `store.event` metadata and the
+`appendEvidence` body at governed-task mint (gate.ts) now immutably
+bind:
+
+| field | source |
+|---|---|
+| `governed_task_id` / `mission_id` / `task_id` / `executor_id` | identity correspondence |
+| `plan_id` / `plan_revision` | active plan at mint |
+| `approval_scope_digest` | the complete scope digest minted BEFORE the row is mutable |
+| `remote_produces_contract` | `isRemoteCapabilityTask(task)` at mint — the F5 applicability bit |
+| `declared_produces` | the exact normalized pinned set (null for non-remote) |
+| `declared_produces_digest` | `digest(declared_produces)` — explicit set binding |
+
+The anchor's `approval_scope_digest` is the high-water authority — the
+scope it covers includes `expected_output_contract` (and therefore
+`declared_produces`), so ANY coherent rewrite of the mutable row's own
+digest still mismatches the immutable mint value.
+
+## Terminal validation order (artifact-validation.ts)
+
+For a remote-capable execution, before artifact closure:
+
+1. `store.listEvents("governed_task", gtid)` filtered to
+   `GOVERNED_TASK_VALIDATED` must yield **exactly one** anchor →
+   `FAIL_CLOSED_GOVERNED_MINT_ANCHOR:MISSING` / `:AMBIGUOUS`.
+2. Identity correspondence: anchor `task_id` / `executor_id` /
+   `mission_id` must equal the governed row →
+   `FAIL_CLOSED_GOVERNED_MINT_ANCHOR:IDENTITY` (the `entity_id`
+   binding is already proven by the query).
+3. `remote_produces_contract === true` binds the F5 contract forever:
+   - current `declared_produces` must be an Array →
+     `FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces`;
+   - recomputed current scope must digest-equal the ANCHOR's
+     `approval_scope_digest` →
+     `FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract`;
+   - current set must digest-equal `declared_produces_digest` →
+     `FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces_digest`;
+   - only then the existing exact-one-identity-per-name closure runs.
+4. An anchor minted pre-F5 (the marker field absent) preserves the
+   documented legacy semantics — **legacy classification derives only
+   from immutable provenance**, never from field absence on the
+   mutable row (R1.C).
+
+Non-remote executions keep prior semantics entirely; a planner-supplied
+`declared_produces` on a LOCAL task cannot mint F5 authority
+(`remote_produces_contract` is false in its anchor — the marker is
+decided at mint, not by field content).
+
+## R1.D — adversarial tests (14 new, suite now 42)
+
+| # | attack | result |
+|---|---|---|
+| R1-1 | `declared_produces` deleted post-dispatch | FAIL `declared_produces` |
+| R1-2 | set to `null` | FAIL `declared_produces` |
+| R1-3 | reshaped to string/object | FAIL (both) |
+| R1-4 | narrowed `→[]` + row digest recomputed self-consistently | FAIL vs anchor |
+| R1-5 | `[a,b]→[a]` + recompute | FAIL |
+| R1-6 | widened + recompute | FAIL |
+| R1-7 | BOTH `approval_scope_digest` + `governance_digest` rewritten coherently | FAIL |
+| R1-8 | anchor row deleted | FAIL `MINT_ANCHOR:MISSING` — never legacy |
+| R1-9 | second conflicting anchor minted | FAIL `MINT_ANCHOR:AMBIGUOUS` |
+| R1-10 | forged single anchor with foreign task/executor ids | FAIL `MINT_ANCHOR:IDENTITY` |
+| R1-11 | fresh-reopen: intact anchor + artifact | PASS once |
+| R1-12 | fresh-reopen: mutated row + intact anchor | same FAIL |
+| R1-13 | genuine remote `declared_produces:[]` from mint | PASS |
+| R1-14 | local task + planner-supplied `declared_produces` | PASS — legacy semantics, no F5 authority minted |
+
+Harness change: hand-built remote producers in the F5/F2 test files now
+emit the mint anchor exactly as the gate does (event + evidence +
+pinned contract + scope digest) — the same shape production mints
+today.
+
+## Validation
+
+- F5 suite: **42/42**
+- F2 chain (r1/r2/r3 + handoff): all green after harness anchor mirror
+- F1 20 · F3 20+closures · F4 61 · incident 106 · p9/p10/p12/p13 +
+  llm-planner + output-delivery 351
+- `tsc --noEmit` 0 · `pnpm build` PASS · `pnpm audit --audit-level=high` 0
+- Full suite + `rm -rf dist` race: see §final counts below
+
+## Residual risks (R1)
+
+- A remote execution minted WITHOUT any anchor (pre-anchor-history or a
+  bypassed gate) can never validate — intended fail-closed; anchor
+  emission lives inside the same mint transaction path as the governed
+  row.
+- Anchor metadata is secret-free by `PairEvidenceStore.assertSecretFree`
+  (enforced at event write).
+- `remote_produces_contract` decided by task capabilities at mint — a
+  task whose capabilities were rewritten post-mint does not re-classify;
+  the anchor is authoritative by design.
+
+## Stop state (R1)
+
+PR #36 pushed, **NOT merged**. Awaiting audit.
+`PAIR_NEXT_PHASE_F5_R1_MINT_ANCHOR_AUTHORITY_PENDING_AUDIT`

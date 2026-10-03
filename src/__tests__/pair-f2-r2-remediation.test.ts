@@ -30,6 +30,7 @@ import {
   createMissionControlServer,
   DependencyResolutionError,
   DEPENDENCY_ARTIFACT_CONTRACT,
+  digest,
   IntegrityError,
   mintArtifactCapability,
   mintArtifactConsumeCapability,
@@ -135,6 +136,55 @@ function mkProducer(
     },
     0,
   );
+  if (opts.remote) {
+    // F5 R1.B — mirror the production mint: pin declared_produces and
+    // emit the immutable GOVERNED_TASK_VALIDATED anchor binding it.
+    const governed = ctx.store.get("governed_task", gtId);
+    governed.expected_output_contract = {
+      type: "TASK_RESULT",
+      declared_produces: [name],
+    };
+    governed.permissions = governed.permissions ?? [];
+    governed.dependency_artifacts_digest =
+      governed.dependency_artifacts_digest ?? null;
+    governed.approval_scope_digest = digest({
+      mission_id: governed.mission_id,
+      task_id: governed.task_id,
+      executor_id: governed.executor_id,
+      workspace: String(governed.workspace),
+      allowed_paths: governed.allowed_paths,
+      permissions: governed.permissions,
+      expected_output_contract: governed.expected_output_contract,
+      dependency_artifacts_digest: governed.dependency_artifacts_digest,
+    });
+    ctx.store.put("governed_task", gtId, governed, Number(governed.version));
+    ctx.store.event({
+      entity_type: "governed_task",
+      entity_id: gtId,
+      event_type: "GOVERNED_TASK_VALIDATED",
+      new_state: "VALIDATED",
+      actor: "PAIR_GOVERNED_TASK_GATE",
+      correlation_id: `COR_${tid}`,
+      metadata: {
+        mission_id: ctx.missionId, task_id: tid, executor_id: executor,
+        governed_task_id: gtId,
+        plan_id: "PLAN_F2R2", plan_revision: 1,
+        approval_scope_digest: governed.approval_scope_digest,
+        remote_produces_contract: true,
+        declared_produces: [name],
+        declared_produces_digest: digest([name]),
+      },
+    });
+    ctx.store.appendEvidence(ctx.missionId, "GOVERNED_TASK_VALIDATED", {
+      governed_task_id: gtId, task_id: tid, executor_id: executor,
+      mission_id: ctx.missionId,
+      plan_id: "PLAN_F2R2", plan_revision: 1,
+      approval_scope_digest: governed.approval_scope_digest,
+      remote_produces_contract: true,
+      declared_produces: [name],
+      declared_produces_digest: digest([name]),
+    });
+  }
   const bytes =
     opts.artifactBytes === undefined
       ? Buffer.from(`artifact-of-${tid}`)

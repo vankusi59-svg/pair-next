@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { digest, newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { isRemoteCapabilityTask } from "./artifact-handoff.js";
 import type { PairControlPlane } from "./service.js";
 
 export class ArtifactProvenanceValidator {
@@ -161,60 +162,122 @@ export class ArtifactProvenanceValidator {
         pass = false;
       }
     }
-    // F5.3 — REMOTE declared-produces closure: a remote execution whose
-    // pinned contract carries `declared_produces` may only reach PASS
-    // when EVERY declared logical name resolves to exactly ONE canonical
-    // verified artifact identity belonging to THIS execution. Completion
-    // prose, remote files, executor claims, filenames or shared-outbox
-    // contents grant zero authority — only ARTIFACT_ACCEPTED rows that
-    // verify NOW count. The approval-scope re-derivation below also
-    // proves the governed contract itself was not mutated post-mint
-    // (a rewritten `declared_produces` or `expected_output_contract`
-    // changes the scope digest and fails closed).
+    // F5.3 + R1.A/R1.B — REMOTE declared-produces closure. Whether the
+    // F5 contract applies is decided by the IMMUTABLE mint-time
+    // GOVERNED_TASK_VALIDATED anchor, never by the current type or
+    // presence of a mutable governed field. A remote-capable execution:
+    //   1. must have exactly ONE anchor (missing/ambiguous → fail);
+    //   2. the anchor's identity fields must correspond to the row;
+    //   3. remote_produces_contract === true on the anchor binds the F5
+    //      contract forever — the CURRENT declared_produces must be an
+    //      Array digest-equal to the mint set, and the recomputed scope
+    //      must equal the anchor's immutable approval_scope_digest (a
+    //      coherent rewrite of the mutable row's own digest fails);
+    //   4. only then does canonical artifact closure run.
+    // An anchor minted pre-F5 (the marker field absent) preserves the
+    // documented legacy semantics — immutable provenance decides
+    // legacy, never field absence on the mutable row.
     const declaredRaw = (
       governed.expected_output_contract as Record<string, unknown> | undefined
     )?.declared_produces;
     let remoteProducesMissing: string[] = [];
     let declaredProducesDigest: string | null = null;
-    if (pass && Array.isArray(declaredRaw)) {
-      declaredProducesDigest = digest(declaredRaw);
-      const scope = {
-        mission_id: governed.mission_id,
-        task_id: governed.task_id,
-        executor_id: governed.executor_id,
-        workspace: String(governed.workspace),
-        allowed_paths: governed.allowed_paths,
-        permissions: governed.permissions ?? [],
-        expected_output_contract: governed.expected_output_contract,
-        dependency_artifacts_digest: governed.dependency_artifacts_digest,
-      };
-      if (
-        digest(scope) !== String(governed.approval_scope_digest ?? "")
-      ) {
+    const taskRow = store.tryGet(
+      "task",
+      String(governed.task_id),
+    ) as Record<string, unknown> | null;
+    const remoteExecution = taskRow
+      ? isRemoteCapabilityTask(taskRow)
+      : false;
+    if (pass && remoteExecution) {
+      const gtid = String(governed.governed_task_id);
+      const anchors = store
+        .listEvents("governed_task", gtid)
+        .filter(
+          (ev) => String(ev.event_type) === "GOVERNED_TASK_VALIDATED",
+        );
+      if (anchors.length !== 1) {
         failures.push(
-          "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract",
+          `FAIL_CLOSED_GOVERNED_MINT_ANCHOR:${
+            anchors.length === 0 ? "MISSING" : "AMBIGUOUS"
+          }`,
         );
         pass = false;
       } else {
-        const declared = declaredRaw
-          .map((n) => String(n))
-          .filter((n) => n.length > 0);
-        if (declared.length) {
-          const verified = new Set(acceptedIds);
-          const acceptedRows = service.artifacts
-            .forExecution(executionId)
-            .filter((a) => verified.has(String(a.artifact_id)));
-          for (const name of declared) {
-            const identities = acceptedRows.filter(
-              (a) => String(a.logical_name) === name,
-            ).length;
-            if (identities !== 1) remoteProducesMissing.push(name);
-          }
-          if (remoteProducesMissing.length) {
-            for (const name of remoteProducesMissing) {
-              failures.push(`FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`);
-            }
+        const meta = (anchors[0].metadata ?? {}) as Record<
+          string,
+          unknown
+        >;
+        const identityOk =
+          String(meta.task_id ?? "") === String(governed.task_id) &&
+          String(meta.executor_id ?? "") ===
+            String(governed.executor_id) &&
+          String(meta.mission_id ?? "") === String(governed.mission_id);
+        if (!identityOk) {
+          failures.push("FAIL_CLOSED_GOVERNED_MINT_ANCHOR:IDENTITY");
+          pass = false;
+        } else if (meta.remote_produces_contract === true) {
+          const mintScopeDigest = String(
+            meta.approval_scope_digest ?? "",
+          );
+          const mintDeclaredDigest = meta.declared_produces_digest;
+          const currentScope = {
+            mission_id: governed.mission_id,
+            task_id: governed.task_id,
+            executor_id: governed.executor_id,
+            workspace: String(governed.workspace),
+            allowed_paths: governed.allowed_paths,
+            permissions: governed.permissions ?? [],
+            expected_output_contract: governed.expected_output_contract,
+            dependency_artifacts_digest:
+              governed.dependency_artifacts_digest,
+          };
+          if (!Array.isArray(declaredRaw)) {
+            failures.push(
+              "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces",
+            );
             pass = false;
+          } else if (
+            !mintScopeDigest ||
+            digest(currentScope) !== mintScopeDigest
+          ) {
+            failures.push(
+              "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract",
+            );
+            pass = false;
+          } else if (
+            typeof mintDeclaredDigest !== "string" ||
+            digest(declaredRaw) !== mintDeclaredDigest
+          ) {
+            failures.push(
+              "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces_digest",
+            );
+            pass = false;
+          } else {
+            declaredProducesDigest = mintDeclaredDigest;
+            const declared = declaredRaw
+              .map((n) => String(n))
+              .filter((n) => n.length > 0);
+            if (declared.length) {
+              const verified = new Set(acceptedIds);
+              const acceptedRows = service.artifacts
+                .forExecution(executionId)
+                .filter((a) => verified.has(String(a.artifact_id)));
+              for (const name of declared) {
+                const identities = acceptedRows.filter(
+                  (a) => String(a.logical_name) === name,
+                ).length;
+                if (identities !== 1) remoteProducesMissing.push(name);
+              }
+              if (remoteProducesMissing.length) {
+                for (const name of remoteProducesMissing) {
+                  failures.push(
+                    `FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`,
+                  );
+                }
+                pass = false;
+              }
+            }
           }
         }
       }
