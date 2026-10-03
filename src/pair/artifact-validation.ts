@@ -11,7 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { digest, newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
-import { isRemoteCapabilityTask } from "./artifact-handoff.js";
+import { MAX_ARTIFACTS_PER_EXECUTION } from "./artifact-authority.js";
 import type { PairControlPlane } from "./service.js";
 
 export class ArtifactProvenanceValidator {
@@ -162,34 +162,30 @@ export class ArtifactProvenanceValidator {
         pass = false;
       }
     }
-    // F5.3 + R1.A/R1.B — REMOTE declared-produces closure. Whether the
-    // F5 contract applies is decided by the IMMUTABLE mint-time
-    // GOVERNED_TASK_VALIDATED anchor, never by the current type or
-    // presence of a mutable governed field. A remote-capable execution:
-    //   1. must have exactly ONE anchor (missing/ambiguous → fail);
-    //   2. the anchor's identity fields must correspond to the row;
-    //   3. remote_produces_contract === true on the anchor binds the F5
-    //      contract forever — the CURRENT declared_produces must be an
-    //      Array digest-equal to the mint set, and the recomputed scope
-    //      must equal the anchor's immutable approval_scope_digest (a
-    //      coherent rewrite of the mutable row's own digest fails);
-    //   4. only then does canonical artifact closure run.
-    // An anchor minted pre-F5 (the marker field absent) preserves the
-    // documented legacy semantics — immutable provenance decides
-    // legacy, never field absence on the mutable row.
+    // F5.3 + R1/R2 — REMOTE declared-produces closure under the
+    // immutable mint-time authority chain:
+    //   executor_execution → governed_task → exactly-one
+    //   GOVERNED_TASK_VALIDATED anchor → anchor.remote_produces_contract.
+    // R2.A: F5 applicability NEVER derives from the current (mutable)
+    // task row — a post-dispatch capability rewrite or task deletion can
+    // no longer downgrade an F5-minted execution. R2.B: the anchor's
+    // complete pinned identity (governed/mission/task/executor/plan)
+    // must correspond across anchor ↔ governed ↔ execution. R2.C: an
+    // anchor marked remote_produces_contract must SELF-VALIDATE — its
+    // declared_produces must be a normalized sorted-deduped bounded
+    // array whose digest equals declared_produces_digest; the CURRENT
+    // declared set is then required to digest-equal that immutable mint
+    // set, and the recomputed scope must equal the anchor's immutable
+    // approval_scope_digest. Only then does canonical artifact closure
+    // run. A pre-F5 anchor (marker field absent) preserves documented
+    // legacy semantics — immutable provenance decides legacy, never
+    // field absence on a mutable row.
     const declaredRaw = (
       governed.expected_output_contract as Record<string, unknown> | undefined
     )?.declared_produces;
     let remoteProducesMissing: string[] = [];
     let declaredProducesDigest: string | null = null;
-    const taskRow = store.tryGet(
-      "task",
-      String(governed.task_id),
-    ) as Record<string, unknown> | null;
-    const remoteExecution = taskRow
-      ? isRemoteCapabilityTask(taskRow)
-      : false;
-    if (pass && remoteExecution) {
+    if (pass) {
       const gtid = String(governed.governed_task_id);
       const anchors = store
         .listEvents("governed_task", gtid)
@@ -208,77 +204,130 @@ export class ArtifactProvenanceValidator {
           string,
           unknown
         >;
+        const strEq = (a: unknown, b: unknown): boolean =>
+          typeof a === "string" && a.length > 0 && a === b;
+        const marker = meta.remote_produces_contract;
+        // R2.B — the complete mint identity, three-way. F5-era anchors
+        // (the marker field present) must bind EVERY pinned identity
+        // field — governed/mission/task/executor/plan across anchor ↔
+        // governed ↔ execution. Pre-F5 anchors carry only the original
+        // three identity fields and keep the documented legacy check.
+        const legacyIdentityOk =
+          strEq(meta.mission_id, governed.mission_id) &&
+          strEq(meta.mission_id, execution.mission_id) &&
+          strEq(meta.task_id, governed.task_id) &&
+          strEq(meta.task_id, execution.task_id) &&
+          strEq(meta.executor_id, governed.executor_id) &&
+          strEq(meta.executor_id, execution.executor_id);
         const identityOk =
-          String(meta.task_id ?? "") === String(governed.task_id) &&
-          String(meta.executor_id ?? "") ===
-            String(governed.executor_id) &&
-          String(meta.mission_id ?? "") === String(governed.mission_id);
+          marker === undefined
+            ? legacyIdentityOk
+            : legacyIdentityOk &&
+              strEq(meta.governed_task_id, gtid) &&
+              strEq(meta.governed_task_id, execution.governed_task_id) &&
+              strEq(meta.plan_id, governed.plan_id) &&
+              Number.isFinite(Number(meta.plan_revision)) &&
+              Number(meta.plan_revision) ===
+                Number(governed.plan_revision) &&
+              Number(meta.plan_revision) ===
+                Number(execution.plan_revision);
         if (!identityOk) {
           failures.push("FAIL_CLOSED_GOVERNED_MINT_ANCHOR:IDENTITY");
           pass = false;
-        } else if (meta.remote_produces_contract === true) {
-          const mintScopeDigest = String(
-            meta.approval_scope_digest ?? "",
-          );
-          const mintDeclaredDigest = meta.declared_produces_digest;
-          const currentScope = {
-            mission_id: governed.mission_id,
-            task_id: governed.task_id,
-            executor_id: governed.executor_id,
-            workspace: String(governed.workspace),
-            allowed_paths: governed.allowed_paths,
-            permissions: governed.permissions ?? [],
-            expected_output_contract: governed.expected_output_contract,
-            dependency_artifacts_digest:
-              governed.dependency_artifacts_digest,
-          };
-          if (!Array.isArray(declaredRaw)) {
-            failures.push(
-              "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces",
+        } else {
+          if (marker === true) {
+            // R2.C — anchor self-validation: the immutable declared set
+            // must itself satisfy the mint normalization contract
+            // (string names, already-trimmed, unique, canonically
+            // sorted, inside the per-execution bound) and digest-match
+            // its own declared_produces_digest.
+            const ad = meta.declared_produces;
+            const adDigest = meta.declared_produces_digest;
+            const anchorDeclaredOk =
+              Array.isArray(ad) &&
+              ad.every(
+                (n) =>
+                  typeof n === "string" &&
+                  n.length > 0 &&
+                  n === n.trim(),
+              ) &&
+              new Set(ad as unknown[]).size ===
+                (ad as unknown[]).length &&
+              [...(ad as string[])].sort().join("") ===
+                (ad as string[]).join("") &&
+              (ad as string[]).length <= MAX_ARTIFACTS_PER_EXECUTION &&
+              typeof adDigest === "string" &&
+              adDigest.length > 0 &&
+              digest(ad) === adDigest;
+            const mintScopeDigest = String(
+              meta.approval_scope_digest ?? "",
             );
-            pass = false;
-          } else if (
-            !mintScopeDigest ||
-            digest(currentScope) !== mintScopeDigest
-          ) {
-            failures.push(
-              "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract",
-            );
-            pass = false;
-          } else if (
-            typeof mintDeclaredDigest !== "string" ||
-            digest(declaredRaw) !== mintDeclaredDigest
-          ) {
-            failures.push(
-              "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces_digest",
-            );
-            pass = false;
-          } else {
-            declaredProducesDigest = mintDeclaredDigest;
-            const declared = declaredRaw
-              .map((n) => String(n))
-              .filter((n) => n.length > 0);
-            if (declared.length) {
-              const verified = new Set(acceptedIds);
-              const acceptedRows = service.artifacts
-                .forExecution(executionId)
-                .filter((a) => verified.has(String(a.artifact_id)));
-              for (const name of declared) {
-                const identities = acceptedRows.filter(
-                  (a) => String(a.logical_name) === name,
-                ).length;
-                if (identities !== 1) remoteProducesMissing.push(name);
-              }
-              if (remoteProducesMissing.length) {
-                for (const name of remoteProducesMissing) {
-                  failures.push(
-                    `FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`,
-                  );
+            const currentScope = {
+              mission_id: governed.mission_id,
+              task_id: governed.task_id,
+              executor_id: governed.executor_id,
+              workspace: String(governed.workspace),
+              allowed_paths: governed.allowed_paths,
+              permissions: governed.permissions ?? [],
+              expected_output_contract: governed.expected_output_contract,
+              dependency_artifacts_digest:
+                governed.dependency_artifacts_digest,
+            };
+            if (!anchorDeclaredOk) {
+              failures.push(
+                "FAIL_CLOSED_GOVERNED_MINT_ANCHOR:DECLARED_PRODUCES",
+              );
+              pass = false;
+            } else if (!Array.isArray(declaredRaw)) {
+              failures.push(
+                "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces",
+              );
+              pass = false;
+            } else if (
+              !mintScopeDigest ||
+              digest(currentScope) !== mintScopeDigest
+            ) {
+              failures.push(
+                "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:expected_output_contract",
+              );
+              pass = false;
+            } else if (digest(declaredRaw) !== adDigest) {
+              failures.push(
+                "FAIL_CLOSED_GOVERNED_SCOPE_MUTATED:declared_produces_digest",
+              );
+              pass = false;
+            } else {
+              declaredProducesDigest = adDigest as string;
+              const declared = declaredRaw
+                .map((n) => String(n))
+                .filter((n) => n.length > 0);
+              if (declared.length) {
+                const verified = new Set(acceptedIds);
+                const acceptedRows = service.artifacts
+                  .forExecution(executionId)
+                  .filter((a) => verified.has(String(a.artifact_id)));
+                for (const name of declared) {
+                  const identities = acceptedRows.filter(
+                    (a) => String(a.logical_name) === name,
+                  ).length;
+                  if (identities !== 1) remoteProducesMissing.push(name);
                 }
-                pass = false;
+                if (remoteProducesMissing.length) {
+                  for (const name of remoteProducesMissing) {
+                    failures.push(
+                      `FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`,
+                    );
+                  }
+                  pass = false;
+                }
               }
             }
+          } else if (marker !== undefined && marker !== false) {
+            failures.push("FAIL_CLOSED_GOVERNED_MINT_ANCHOR:MARKER");
+            pass = false;
           }
+          // marker === false → non-F5 contract; marker absent → the
+          // anchor predates F5 and keeps documented legacy semantics.
         }
       }
     }

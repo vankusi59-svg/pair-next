@@ -443,3 +443,103 @@ today.
 
 PR #36 pushed, **NOT merged**. Awaiting audit.
 `PAIR_NEXT_PHASE_F5_R1_MINT_ANCHOR_AUTHORITY_PENDING_AUDIT`
+
+---
+
+# F5 R2 — APPLICABILITY FROM THE IMMUTABLE MINT ANCHOR ONLY
+
+Prev audited HEAD `895911b` → new HEAD (this push). Same PR #36, no merge.
+
+## Finding (audit)
+
+R1 still decided *F5 applicability* from the **current task row**
+(`isRemoteCapabilityTask(taskRow)`) — a mutable field. A post-dispatch
+capability rewrite (or task deletion) could downgrade an F5-minted
+execution out of the contract, and the anchor identity check did not
+cover the pinned plan identity or the anchor's own contract fields.
+
+## Change (R2.A–R2.C)
+
+`src/pair/artifact-validation.ts` — the remote closure gate was
+rewritten so **every** governed execution resolves its mint anchor
+first:
+
+1. `executor_execution → governed_task → exactly-one
+   GOVERNED_TASK_VALIDATED anchor`. The current task row is **never**
+   consulted for applicability — only for supplemental checks elsewhere.
+2. **R2.B complete identity** — F5-era anchors (the
+   `remote_produces_contract` field present) must bind every pinned
+   identity field three-way: `governed_task_id`, `mission_id`,
+   `task_id`, `executor_id`, `plan_id`, `plan_revision` across
+   anchor ↔ governed ↔ execution → any miss is
+   `FAIL_CLOSED_GOVERNED_MINT_ANCHOR:IDENTITY`. A pre-F5 anchor (marker
+   absent) keeps the documented legacy three-field identity check and
+   legacy semantics — provenance decides legacy.
+3. Marker interpretation: `true` → F5 contract required permanently;
+   `false` → non-F5; a **malformed** marker (present, non-boolean) →
+   `FAIL_CLOSED_GOVERNED_MINT_ANCHOR:MARKER`.
+4. **R2.C anchor self-validation** — for `marker === true` the anchor's
+   own `declared_produces` must satisfy the mint normalization contract
+   (string names, already-trimmed, unique, canonically sorted, ≤
+   `MAX_ARTIFACTS_PER_EXECUTION`) AND `digest(declared_produces) ===
+   declared_produces_digest` — else
+   `FAIL_CLOSED_GOVERNED_MINT_ANCHOR:DECLARED_PRODUCES`. Only then:
+   current declared set must be an Array digest-equal to the mint set,
+   recomputed scope must equal the anchor's immutable
+   `approval_scope_digest`, then canonical closure runs.
+
+No gate.ts change was needed — the anchor already binds all fields.
+
+**ONCE F5-BOUND, ALWAYS F5-BOUND.**
+
+## Tests — 14 adversarial proofs + counterfactual (15 new, 57 total)
+
+| Case | Mutation | Result |
+|---|---|---|
+| R2-1 | remote producer, zero uploads, caps REMOTE→local pre-settlement | FAIL `REMOTE_PRODUCES_INCOMPLETE` |
+| R2-2 | + task row DELETED | FAIL — anchor authority remains |
+| R2-3 | unrelated task metadata mutated | PASS — applicability unchanged |
+| R2-4 | governed+execution `plan_revision` coherently rewritten | FAIL `IDENTITY` |
+| R2-5 | governed `plan_id`+rev + exec rev + recomputed digests | FAIL `IDENTITY` |
+| R2-6 | `execution.governed_task_id` rebound to a different genuine governed task | FAIL `durable_linkage` (typed) |
+| R2-7 | execution mission/task/executor mutated | FAIL `durable_linkage` (typed) |
+| R2-8 | anchor `declared_produces` malformed (dup) w/ matching digest | FAIL `DECLARED_PRODUCES` |
+| R2-9 | anchor array changed w/o matching digest | FAIL `DECLARED_PRODUCES` |
+| R2-10 | anchor array+digest coherently rewritten in the row | `FAIL_CLOSED_EVENT_HASH_MISMATCH` — append-only seam |
+| R2-11 | genuine pre-F5 anchor, marker absent | PASS — documented legacy |
+| R2-12 | local anchor `marker:false`, caps rewritten remote post-dispatch | PASS — stays non-F5 |
+| R2-13 | restart intact → PASS; mutate → same FAIL | identical post-reopen |
+| R2-14 | restart after caps downgrade | still FAIL |
+| R2-E | full mission counterfactual: T2 remote `produces:[data.json]`, caps mutated inside `onCollect` (post-dispatch, pre-settlement), zero upload | T2 terminal validation FAILs at the producer, no PASS `execution_validation` minted, T3 never dispatched, no shared-workspace/outbox filename fallback, recovery bounded |
+
+Harness note: `mkGovernedConsumer`-era anchors in F2/F4/F1 remediation
+files now emit the F5-era anchor shape for **every** producer
+(local → `remote_produces_contract:false`) mirroring production mint.
+
+## Validation
+
+- F5 file **57/57** (42 prior + 15 new)
+- F1 20 + r1/r2 remediation 120 · F2 chain 155 · F3 + closures · F4 61
+  · output-delivery 69 · incident · governed-task/gate suites — all green
+- `npx tsc --noEmit` 0 · `rm -rf dist && pnpm build` PASS
+- `pnpm audit --audit-level=high` 0
+- **Full suite: 3289 pass / 2 fail** — only the 2 known env-only P5
+  failures (DSH/CODEX executables present on this box flip the
+  "executable not found" probe asserts); reproducible on `c7a6575`.
+
+## Residual risks (R2)
+
+- Execution-row mutations that break the mission/task/executor durable
+  linkage are caught FIRST by the F1 `verifyForExecution` seam
+  (`durable_linkage`) — the anchor identity seam defends the same
+  invariant for cases where the linkage triple still matches (forged
+  anchors, plan-field rewrites). Both paths fail closed with typed
+  evidence.
+- Anchor resolution requires an anchor for every governed execution —
+  a governed row minted through a bypassed/corrupt gate (no anchor)
+  fails closed `MINT_ANCHOR:MISSING`; production mint always emits it.
+
+## Stop state (R2)
+
+PR #36 pushed, **NOT merged**. Awaiting audit.
+`PAIR_NEXT_PHASE_F5_R2_MINT_ANCHOR_AUTHORITY_PENDING_AUDIT`

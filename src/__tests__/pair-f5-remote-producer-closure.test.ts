@@ -1613,6 +1613,7 @@ describe("F5 R1 — immutable mint-time anchor governs F5 binding", () => {
       {
         execution_id: eid, governed_task_id: gtId, mission_id: "M_RE",
         task_id: tid, executor_id: EX_LOCAL, correlation_id: `COR_${tid}`,
+        plan_id: "PLAN_R14", plan_revision: 1,
         execution_state: "COMPLETED",
         result: { status: "COMPLETED", artifacts: [], summary: "done" },
         workspace: ctx.workspace,
@@ -1624,5 +1625,491 @@ describe("F5 R1 — immutable mint-time anchor governs F5 binding", () => {
     // Local task keeps prior semantics — no upload, no declared-produces
     // closure requirement.
     expect(String(v.status)).toBe("PASS");
+  });
+});
+
+/* ==================== F5 R2 — mint-anchor-first authority ====================
+ * R2.A: F5 applicability resolves through execution → governed → exactly-one
+ *       GOVERNED_TASK_VALIDATED anchor → remote_produces_contract — never the
+ *       mutable task row. R2.B: complete pinned identity incl. plan across
+ *       anchor ↔ governed ↔ execution. R2.C: the anchor self-validates its
+ *       own declared contract. R2.D: adversarial matrix. R2.E: counterfactual.
+ */
+const mutateExecution = (
+  ctx: ReturnType<typeof makeCtx>,
+  eid: string,
+  fn: (e: Record<string, unknown>) => void,
+) => {
+  const e = ctx.store.get("executor_execution", eid);
+  fn(e);
+  ctx.store.put("executor_execution", eid, e, Number(e.version));
+};
+
+/** Replace the genuine anchor with a forged one (event-hash-safe). */
+const forgeAnchor = (
+  ctx: ReturnType<typeof makeCtx>,
+  p: { gtId: string; tid: string; executor: string },
+  metadata: Record<string, unknown>,
+) => {
+  ctx.store.db
+    .prepare(
+      "DELETE FROM events WHERE entity_type='governed_task' AND entity_id=? AND event_type='GOVERNED_TASK_VALIDATED'",
+    )
+    .run(p.gtId);
+  ctx.store.event({
+    entity_type: "governed_task",
+    entity_id: p.gtId,
+    event_type: "GOVERNED_TASK_VALIDATED",
+    new_state: "VALIDATED",
+    actor: "PAIR_GOVERNED_TASK_GATE",
+    correlation_id: `COR_${p.tid}`,
+    metadata,
+  });
+};
+
+describe("F5 R2 — applicability comes from the immutable mint anchor", () => {
+  it("R2-1. remote producer uploads nothing + task caps mutated REMOTE→local pre-settlement → FAIL, no legacy PASS", () => {
+    const ctx = makeCtx("f5r2-1");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R21" });
+    // Post-dispatch capability rewrite: the mutable task row now claims to
+    // be LOCAL. Under the anchor, the execution stays F5-bound forever.
+    const task = ctx.store.get("task", p.tid);
+    ctx.store.put(
+      "task",
+      p.tid,
+      { ...task, required_capabilities: ["FILE_OPERATIONS"] },
+      Number(task.version),
+    );
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:data.json",
+      ]),
+    );
+  });
+
+  it("R2-2. remote producer uploads nothing + task row DELETED → F5 authority remains → FAIL", () => {
+    const ctx = makeCtx("f5r2-2");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R22" });
+    ctx.store.db
+      .prepare("DELETE FROM entities WHERE entity_type='task' AND entity_id=?")
+      .run(p.tid);
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:data.json",
+      ]),
+    );
+  });
+
+  it("R2-3. unrelated task metadata mutated post-dispatch → applicability unchanged → closure still runs", () => {
+    const ctx = makeCtx("f5r2-3");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R23" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    const task = ctx.store.get("task", p.tid);
+    ctx.store.put(
+      "task",
+      p.tid,
+      {
+        ...task,
+        title: "retitled",
+        metadata: {
+          pair_dataflow: { produces: ["data.json"], consumes: ["mutated.json"] },
+          unrelated: "rewritten",
+        },
+      },
+      Number(task.version),
+    );
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+  });
+
+  it("R2-4. governed.plan_revision + execution.plan_revision coherently rewritten → FAIL identity", () => {
+    const ctx = makeCtx("f5r2-4");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R24" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.plan_revision = 2;
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    mutateExecution(ctx, p.eid, (e) => {
+      e.plan_revision = 2;
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining(["FAIL_CLOSED_GOVERNED_MINT_ANCHOR:IDENTITY"]),
+    );
+  });
+
+  it("R2-5. governed.plan_id + plan_revision + execution.plan_revision rewritten + digests recomputed → FAIL vs anchor", () => {
+    const ctx = makeCtx("f5r2-5");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R25" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    mutateGoverned(ctx, p.gtId, (g) => {
+      g.plan_id = "PLAN_FORGED";
+      g.plan_revision = 9;
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    mutateExecution(ctx, p.eid, (e) => {
+      e.plan_revision = 9;
+      e.plan_id = "PLAN_FORGED";
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining(["FAIL_CLOSED_GOVERNED_MINT_ANCHOR:IDENTITY"]),
+    );
+  });
+
+  it("R2-6. execution.governed_task_id mutated → FAIL identity", () => {
+    const ctx = makeCtx("f5r2-6");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R26" });
+    const p2 = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R26" });
+    // Rebind the execution to a DIFFERENT genuine governed task: its own
+    // mission/task/executor no longer correspond to the loaded governed
+    // row — the F1 durable-linkage authority seam fails closed first with
+    // typed evidence (the anchor identity seam defends the same invariant
+    // when the linkage triple still matches, e.g. forged anchors).
+    mutateExecution(ctx, p.eid, (e) => {
+      e.governed_task_id = p2.gtId;
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    const fs6 = validationRow(ctx, p.eid)!.failures as string[];
+    expect(
+      fs6.some(
+        (f) =>
+          f.includes("FAIL_CLOSED_ARTIFACT_VERIFICATION") &&
+          f.includes("durable_linkage"),
+      ),
+    ).toBe(true);
+  });
+
+  it("R2-7. execution mission/task/executor mutated → FAIL identity", () => {
+    const ctx = makeCtx("f5r2-7");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R27" });
+    mutateExecution(ctx, p.eid, (e) => {
+      e.mission_id = "M_FOREIGN";
+      e.task_id = "TASK_FOREIGN";
+      e.executor_id = "EX_FOREIGN";
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    // The mutable execution row contradicting the durable linkage triple
+    // fails closed at the F1 artifact authority seam — typed evidence.
+    const fs7 = validationRow(ctx, p.eid)!.failures as string[];
+    expect(
+      fs7.some(
+        (f) =>
+          f.includes("FAIL_CLOSED_ARTIFACT_VERIFICATION") &&
+          f.includes("durable_linkage"),
+      ),
+    ).toBe(true);
+  });
+
+  it("R2-8. anchor declared_produces malformed while digest present → FAIL closed", () => {
+    const ctx = makeCtx("f5r2-8");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R28" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    // Forged anchor: declared_produces not normalized (duplicate entries)
+    // even though the digest field matches that same malformed array.
+    const malformed = ["data.json", "data.json"];
+    forgeAnchor(ctx, p, {
+      mission_id: "M_R28", task_id: p.tid, executor_id: p.executor,
+      governed_task_id: p.gtId,
+      plan_id: "PLAN_F5", plan_revision: 1,
+      approval_scope_digest: scopeDigest(
+        ctx.store.get("governed_task", p.gtId),
+      ),
+      remote_produces_contract: true,
+      declared_produces: malformed,
+      declared_produces_digest: digest(malformed),
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_GOVERNED_MINT_ANCHOR:DECLARED_PRODUCES",
+      ]),
+    );
+  });
+
+  it("R2-9. anchor declared_produces changed without matching digest → FAIL closed", () => {
+    const ctx = makeCtx("f5r2-9");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R29" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    forgeAnchor(ctx, p, {
+      mission_id: "M_R29", task_id: p.tid, executor_id: p.executor,
+      governed_task_id: p.gtId,
+      plan_id: "PLAN_F5", plan_revision: 1,
+      approval_scope_digest: scopeDigest(
+        ctx.store.get("governed_task", p.gtId),
+      ),
+      remote_produces_contract: true,
+      declared_produces: ["other.json"],
+      declared_produces_digest: digest(["data.json"]),
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.failures as string[]).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_GOVERNED_MINT_ANCHOR:DECLARED_PRODUCES",
+      ]),
+    );
+  });
+
+  it("R2-10. anchor array+digest changed coherently → append-only hash-history seam catches", () => {
+    const ctx = makeCtx("f5r2-10");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R210" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "ok");
+    // Direct event-row rewrite: even a COHERENT anchor forgery cannot
+    // update event_hash — reading it back trips the store integrity seam.
+    const row = ctx.store.db
+      .prepare(
+        "SELECT event_id, metadata_json FROM events WHERE entity_type='governed_task' AND entity_id=? AND event_type='GOVERNED_TASK_VALIDATED'",
+      )
+      .get(p.gtId) as { event_id: string; metadata_json: string };
+    const meta = JSON.parse(String(row.metadata_json)) as Record<string, unknown>;
+    meta.declared_produces = ["other.json"];
+    meta.declared_produces_digest = digest(["other.json"]);
+    ctx.store.db
+      .prepare("UPDATE events SET metadata_json=? WHERE event_id=?")
+      .run(JSON.stringify(meta), String(row.event_id));
+    completeRemote(ctx, p.eid);
+    expect(() => validate(ctx, p.eid)).toThrowError(
+      /FAIL_CLOSED_EVENT_HASH_MISMATCH/,
+    );
+  });
+
+  it("R2-11. genuine pre-F5 anchor with no marker → documented legacy semantics preserved", () => {
+    const ctx = makeCtx("f5r2-11");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R211" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    // Pre-F5 mint: anchor carries ONLY the original identity fields — no
+    // marker, no governed_task_id, no plan fields, no scope/declared
+    // digests. And the governed row of that era carried no F5 contract.
+    forgeAnchor(ctx, p, {
+      mission_id: "M_R211", task_id: p.tid, executor_id: p.executor,
+      risk_class: "AUTO", approval_required: false,
+      dependency_artifacts_digest: null,
+    });
+    mutateGoverned(ctx, p.gtId, (g) => {
+      delete g.expected_output_contract;
+      g.approval_scope_digest = scopeDigest(g);
+    });
+    completeRemote(ctx, p.eid);
+    // Legacy semantics: no F5 closure — the remote execution validates on
+    // the pre-F5 rules even with zero uploads.
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+  });
+
+  it("R2-12. local anchor marker:false stays non-F5 even if task caps rewritten remote", () => {
+    const ctx = makeCtx("f5r2-12");
+    // Mint a LOCAL governed chain (marker:false anchor) — the same shape a
+    // real local task emits under current code.
+    const tid = `LT_R212`;
+    const gtId = `GT_${tid}`;
+    const eid = workerExecutionId(EX_LOCAL, gtId);
+    ctx.store.put(
+      "task",
+      tid,
+      {
+        task_id: tid, task_key: "TK_R212", mission_id: "M_R212",
+        plan_id: "PLAN_R212", title: "local",
+        task_instruction: "local work",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [], status: "COMPLETED",
+        metadata: {},
+        version: 0,
+      },
+      0,
+    );
+    const governed: Record<string, unknown> = {
+      governed_task_id: gtId, mission_id: "M_R212", task_id: tid,
+      correlation_id: `COR_${tid}`, executor_id: EX_LOCAL,
+      plan_id: "PLAN_R212", plan_revision: 1,
+      workspace: ctx.workspace, allowed_paths: [ctx.workspace],
+      permissions: [], dependency_artifacts_digest: null,
+      governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      created_at: utcnow(), version: 0,
+    };
+    governed.approval_scope_digest = scopeDigest(governed);
+    ctx.store.put("governed_task", gtId, governed, 0);
+    ctx.store.event({
+      entity_type: "governed_task", entity_id: gtId,
+      event_type: "GOVERNED_TASK_VALIDATED", new_state: "VALIDATED",
+      actor: "PAIR_GOVERNED_TASK_GATE", correlation_id: `COR_${tid}`,
+      metadata: {
+        mission_id: "M_R212", task_id: tid, executor_id: EX_LOCAL,
+        governed_task_id: gtId, plan_id: "PLAN_R212", plan_revision: 1,
+        approval_scope_digest: governed.approval_scope_digest,
+        remote_produces_contract: false,
+        declared_produces: null,
+        declared_produces_digest: null,
+      },
+    });
+    ctx.store.put(
+      "executor_execution",
+      eid,
+      {
+        execution_id: eid, governed_task_id: gtId, mission_id: "M_R212",
+        task_id: tid, executor_id: EX_LOCAL, correlation_id: `COR_${tid}`,
+        plan_id: "PLAN_R212", plan_revision: 1,
+        execution_state: "COMPLETED",
+        result: { status: "COMPLETED", artifacts: [], summary: "done" },
+        workspace: ctx.workspace, version: 0,
+      },
+      0,
+    );
+    // Hostile rewrite: mutable task row now claims REMOTE capability —
+    // the marker:false anchor still governs: no F5 closure.
+    const task = ctx.store.get("task", tid);
+    ctx.store.put(
+      "task",
+      tid,
+      { ...task, required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION"] },
+      Number(task.version),
+    );
+    expect(String(validate(ctx, eid).status)).toBe("PASS");
+  });
+
+  it("R2-13. restart → applicability + identity identical (PASS survives; mutation still fails after reopen)", () => {
+    const ctx = makeCtx("f5r2-13");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R213" });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "data.json", "durable");
+    completeRemote(ctx, p.eid);
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    expect(
+      String(
+        new ArtifactProvenanceValidator().validate_execution(service2, p.eid)
+          .status,
+      ),
+    ).toBe("PASS");
+    // Same reopened DB, now mutate and re-validate: identical FAIL.
+    const g = store2.get("governed_task", p.gtId);
+    g.plan_revision = 7;
+    g.approval_scope_digest = scopeDigest(g);
+    store2.put("governed_task", p.gtId, g, Number(g.version));
+    expect(
+      String(
+        new ArtifactProvenanceValidator().validate_execution(service2, p.eid)
+          .status,
+      ),
+    ).toBe("FAIL");
+  });
+
+  it("R2-14. restart post-capability-downgrade → still FAIL (ONCE F5-BOUND, ALWAYS F5-BOUND)", () => {
+    const ctx = makeCtx("f5r2-14");
+    const p = mkRemoteProducer(ctx, { produces: ["data.json"], missionId: "M_R214" });
+    const task = ctx.store.get("task", p.tid);
+    ctx.store.put(
+      "task",
+      p.tid,
+      { ...task, required_capabilities: ["FILE_OPERATIONS"] },
+      Number(task.version),
+    );
+    completeRemote(ctx, p.eid);
+    const store2 = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const service2 = new PairControlPlane(store2);
+    const v = new ArtifactProvenanceValidator().validate_execution(service2, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    const rows = store2
+      .list("execution_validation")
+      .filter((r) => String(r.execution_id) === p.eid);
+    expect(String(rows.at(-1)!.status)).toBe("FAIL");
+    expect(rows.at(-1)!.failures as string[]).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:data.json",
+      ]),
+    );
+  });
+
+  it("R2-E. counterfactual mission: T2 remote produces data.json, caps mutated post-dispatch, zero upload → producer FAILs, T3 never dispatched, no fallback", () => {
+    const ctx = makeCtx("f5r2-e");
+    process.env.PAIR_OUTBOX_URL = OUTBOX_URL;
+    process.env.PAIR_ARTIFACT_UPLOAD_TOKEN = MASTER;
+    try {
+      const remote = new ScriptedAdapter(EX_REMOTE, ["REMOTE_CLOUD_TASK_EXECUTION"]);
+      const local = new ScriptedAdapter(EX_LOCAL, ["FILE_OPERATIONS", "REASONING"]);
+      registerAdapter(ctx, remote);
+      registerAdapter(ctx, local);
+      // Inside the remote collect (post-dispatch, pre-settlement) the task
+      // row's capabilities are rewritten to local — the mutable row can no
+      // longer downgrade the minted F5 contract.
+      remote.onCollect = (eid: string) => {
+        const t = remote.results[eid]?.task_id;
+        if (!t) return;
+        const row = ctx.store.tryGet("task", String(t)) as
+          | Record<string, unknown>
+          | null;
+        if (!row) return;
+        ctx.store.put(
+          "task",
+          String(t),
+          { ...row, required_capabilities: ["FILE_OPERATIONS"] },
+          Number(row.version),
+        );
+      };
+      const plan = reconcilePlanDataflow(remoteProducerPlan(["data.json"])).tasks;
+      const m = startMission(ctx, plan);
+      const mid = String(m.mission_id);
+      drive(ctx, mid);
+      const t2 = taskByKey(ctx, mid, "T2")!;
+      const t3 = taskByKey(ctx, mid, "T3")!;
+      // T2 terminal validation FAILS at the producer.
+      const t2Exec = execForTask(ctx, String(t2.task_id))!;
+      const vrow = validationRow(ctx, String(t2Exec.execution_id))!;
+      expect(String(vrow.status)).toBe("FAIL");
+      expect(vrow.failures as string[]).toEqual(
+        expect.arrayContaining([
+          "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:data.json",
+        ]),
+      );
+      expect(String(t2.status)).toBe("FAILED");
+      // No PASS execution_validation was ever minted for T2.
+      expect(
+        ctx.store
+          .list("execution_validation")
+          .filter(
+            (v) =>
+              String(v.execution_id) === String(t2Exec.execution_id) &&
+              String(v.status) === "PASS",
+          ),
+      ).toHaveLength(0);
+      // T3 never dispatched — no shared-workspace/outbox filename fallback.
+      expect(
+        executions(ctx).some((e) => String(e.task_id) === String(t3.task_id)),
+      ).toBe(false);
+      // Recovery remains bounded: decisions recorded, mission does not hang.
+      const decisions = ctx.store
+        .list("recovery_decision")
+        .filter((d) => String(d.mission_id) === mid);
+      expect(decisions.length).toBeGreaterThan(0);
+      expect(decisions.length).toBeLessThanOrEqual(3);
+      const fc = decisions[0]!.failure_context as Record<string, unknown>;
+      expect(String(fc?.failure_class)).toBe("DEPENDENCY_FAILURE");
+    } finally {
+      delete process.env.PAIR_OUTBOX_URL;
+      delete process.env.PAIR_ARTIFACT_UPLOAD_TOKEN;
+    }
   });
 });

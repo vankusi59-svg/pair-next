@@ -126,6 +126,7 @@ function mkProducer(
       task_id: tid,
       correlation_id: `COR_${tid}`,
       executor_id: executor,
+      plan_id: "PLAN_F2",
       plan_revision: 1,
       workspace: ctx.workspace,
       allowed_paths: [ctx.workspace],
@@ -136,14 +137,17 @@ function mkProducer(
     },
     0,
   );
-  if (opts.remote) {
-    // F5 R1.B — mirror the production mint: pin declared_produces and
-    // emit the immutable GOVERNED_TASK_VALIDATED anchor binding it.
+  {
+    // F5 R1.B — mirror the production mint: every governed task emits the
+    // immutable GOVERNED_TASK_VALIDATED anchor; remote tasks additionally
+    // pin the F5 declared-produces contract.
     const governed = ctx.store.get("governed_task", gtId);
-    governed.expected_output_contract = {
-      type: "TASK_RESULT",
-      declared_produces: [name],
-    };
+    if (opts.remote) {
+      governed.expected_output_contract = {
+        type: "TASK_RESULT",
+        declared_produces: [name],
+      };
+    }
     governed.permissions = governed.permissions ?? [];
     governed.dependency_artifacts_digest =
       governed.dependency_artifacts_digest ?? null;
@@ -158,6 +162,7 @@ function mkProducer(
       dependency_artifacts_digest: governed.dependency_artifacts_digest,
     });
     ctx.store.put("governed_task", gtId, governed, Number(governed.version));
+    const declared = opts.remote ? [name] : null;
     ctx.store.event({
       entity_type: "governed_task",
       entity_id: gtId,
@@ -168,21 +173,21 @@ function mkProducer(
       metadata: {
         mission_id: ctx.missionId, task_id: tid, executor_id: executor,
         governed_task_id: gtId,
-        plan_id: "PLAN_F2R2", plan_revision: 1,
+        plan_id: "PLAN_F2", plan_revision: 1,
         approval_scope_digest: governed.approval_scope_digest,
-        remote_produces_contract: true,
-        declared_produces: [name],
-        declared_produces_digest: digest([name]),
+        remote_produces_contract: !!opts.remote,
+        declared_produces: declared,
+        declared_produces_digest: declared ? digest(declared) : null,
       },
     });
     ctx.store.appendEvidence(ctx.missionId, "GOVERNED_TASK_VALIDATED", {
       governed_task_id: gtId, task_id: tid, executor_id: executor,
       mission_id: ctx.missionId,
-      plan_id: "PLAN_F2R2", plan_revision: 1,
+      plan_id: "PLAN_F2", plan_revision: 1,
       approval_scope_digest: governed.approval_scope_digest,
-      remote_produces_contract: true,
-      declared_produces: [name],
-      declared_produces_digest: digest([name]),
+      remote_produces_contract: !!opts.remote,
+      declared_produces: declared,
+      declared_produces_digest: declared ? digest(declared) : null,
     });
   }
   const bytes =

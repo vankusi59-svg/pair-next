@@ -21,6 +21,7 @@ import {
   MissionControl,
   PairControlPlane,
   PairEvidenceStore,
+  digest,
   sha256Hex,
   utcnow,
   workerExecutionId,
@@ -72,13 +73,58 @@ function mkProducer(
   ctx.store.put("governed_task", gtId, {
     governed_task_id: gtId, mission_id: ctx.missionId, task_id: tid,
     correlation_id: `COR_${tid}`, executor_id: opts.executor ?? EX,
+    plan_id: "PLAN_ANCHOR", plan_revision: 1,
     workspace: ctx.workspace, allowed_paths: [ctx.workspace],
     governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
     created_at: utcnow(), version: 0,
   }, 0);
+  {
+    // F5 R1.B — mirror the production mint anchor for a local task.
+    const governed = ctx.store.get("governed_task", gtId);
+    governed.permissions = governed.permissions ?? [];
+    governed.dependency_artifacts_digest =
+      governed.dependency_artifacts_digest ?? null;
+    governed.approval_scope_digest = digest({
+      mission_id: governed.mission_id,
+      task_id: governed.task_id,
+      executor_id: governed.executor_id,
+      workspace: String(governed.workspace),
+      allowed_paths: governed.allowed_paths,
+      permissions: governed.permissions,
+      expected_output_contract: governed.expected_output_contract,
+      dependency_artifacts_digest: governed.dependency_artifacts_digest,
+    });
+    ctx.store.put("governed_task", gtId, governed, Number(governed.version));
+    ctx.store.event({
+      entity_type: "governed_task", entity_id: gtId,
+      event_type: "GOVERNED_TASK_VALIDATED", new_state: "VALIDATED",
+      actor: "PAIR_GOVERNED_TASK_GATE", correlation_id: `COR_${tid}`,
+      metadata: {
+        mission_id: ctx.missionId, task_id: tid,
+        executor_id: opts.executor ?? EX,
+        governed_task_id: gtId, plan_id: "PLAN_ANCHOR", plan_revision: 1,
+        approval_scope_digest: governed.approval_scope_digest,
+        remote_produces_contract: false,
+        declared_produces: null,
+        declared_produces_digest: null,
+      },
+    });
+    ctx.store.appendEvidence(ctx.missionId, "GOVERNED_TASK_VALIDATED", {
+      governed_task_id: gtId, task_id: tid,
+      executor_id: opts.executor ?? EX,
+      mission_id: ctx.missionId,
+      plan_id: "PLAN_ANCHOR", plan_revision: 1,
+      approval_scope_digest: governed.approval_scope_digest,
+      remote_produces_contract: false,
+      declared_produces: null,
+      declared_produces_digest: null,
+    });
+  }
   const exec: Record<string, unknown> = {
     execution_id: eid, governed_task_id: gtId, mission_id: ctx.missionId,
-    task_id: tid, executor_id: opts.executor ?? EX, correlation_id: `COR_${tid}`,
+    task_id: tid, executor_id: opts.executor ?? EX,
+    plan_id: "PLAN_ANCHOR", plan_revision: 1,
+    correlation_id: `COR_${tid}`,
     execution_state: opts.state ?? "RUNNING", dispatch_timestamp: utcnow(),
     workspace: ctx.workspace, version: 0,
   };
