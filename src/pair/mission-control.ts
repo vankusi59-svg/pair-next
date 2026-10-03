@@ -9,7 +9,10 @@
 
 import fs from "node:fs";
 import { verifyBrokerCapability } from "./broker-capability.js";
-import { verifyArtifactCapability } from "./artifact-capability.js";
+import {
+  verifyArtifactCapability,
+  type ArtifactCapabilityClaims,
+} from "./artifact-capability.js";
 import { verifyArtifactConsumeCapability } from "./artifact-consume-capability.js";
 import type { ArtifactAcceptance } from "./artifact-authority.js";
 import { registerSensitiveMaterial } from "./sanitizer.js";
@@ -155,6 +158,7 @@ export class MissionControl {
   ): ArtifactAcceptance {
     const claims = verifyArtifactCapability(masterSecret, capabilityToken);
     if (!claims) {
+      this.recordArtifactCapabilityReject("signature", capabilityToken, body, null);
       throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_INVALID", "signature");
     }
     // R1.5 — every capability claim must agree with CURRENT durable
@@ -183,6 +187,7 @@ export class MissionControl {
       String(governed.mission_id) !== claims.mission_id ||
       String(governed.task_id) !== claims.task_id
     ) {
+      this.recordArtifactCapabilityReject("durable_identity", capabilityToken, body, claims);
       throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH", "durable_identity");
     }
     // Cross-check: supplied identity fields must equal the capability's
@@ -190,6 +195,7 @@ export class MissionControl {
     for (const k of ["mission_id", "task_id"] as const) {
       const v = body[k];
       if (v !== undefined && String(v) !== claims[k]) {
+        this.recordArtifactCapabilityReject(k, capabilityToken, body, claims);
         throw new PolicyError("FAIL_CLOSED_ARTIFACT_CAPABILITY_MISMATCH", k);
       }
     }
@@ -203,6 +209,57 @@ export class MissionControl {
       correlation_id: null,
       allow_post_result: false,
     });
+  }
+
+  /** ACR-1 — durable reject evidence at the capability seam. Rejects that
+   *  happen before accept() never produced an audit row, so a remote
+   *  worker's "sent verbatim" claim could not be disproved from evidence.
+   *  Emits at most ONE append-only event per DISTINCT received capability
+   *  value (deterministic entity id = digest prefix of the received
+   *  bytes) — replayed identical rejects are deduped, new rejections
+   *  always land. Only bounded non-secret fields persist: stage, sha256
+   *  of the received capability, filename, and the claimed identity
+   *  fields present in the request. Never the raw capability, auth
+   *  headers, body bytes, or the master secret. An evidence failure must
+   *  never mask the rejection itself. */
+  private recordArtifactCapabilityReject(
+    stage: string,
+    capabilityToken: string,
+    body: { filename?: unknown; mission_id?: unknown; task_id?: unknown },
+    claims: ArtifactCapabilityClaims | null,
+  ): void {
+    try {
+      const bounded = (v: unknown, max: number): string | null =>
+        v === undefined || v === null ? null : String(v).slice(0, max);
+      const capability_sha256 = sha256Hex(capabilityToken);
+      const entityId = `ACR_${capability_sha256.slice(0, 16)}`;
+      const store = this.store;
+      if (store.listEvents("artifact_capability_reject", entityId).length > 0) {
+        return;
+      }
+      store.event({
+        entity_type: "artifact_capability_reject",
+        entity_id: entityId,
+        event_type: "ARTIFACT_CAPABILITY_REJECTED",
+        new_state: stage,
+        actor: "PAIR_ARTIFACT_INGEST",
+        correlation_id: null,
+        metadata: {
+          stage,
+          capability_sha256,
+          filename: bounded(body.filename, 256),
+          claimed_mission_id:
+            bounded(claims?.mission_id, 128) ?? bounded(body.mission_id, 128),
+          claimed_task_id:
+            bounded(claims?.task_id, 128) ?? bounded(body.task_id, 128),
+          claimed_execution_id:
+            bounded(claims?.execution_id, 128) ??
+            bounded((body as Record<string, unknown>).execution_id, 128),
+        },
+      });
+    } catch {
+      /* audit write must never alter the fail-closed outcome */
+    }
   }
 
   /**
