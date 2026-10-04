@@ -3438,3 +3438,76 @@ describe("PATH-GRAMMAR-R1 — modifier destinations need a governing produce ver
     expect(m.consumes).toContain("in.csv");
   });
 });
+
+describe("PATH-GRAMMAR-R2 — adjacent destinations are verb-governed", () => {
+  const df = (instr: string) =>
+    extractTaskDataflow({
+      task_key: "T1",
+      task_instruction: instr,
+      required_capabilities: [],
+      metadata: {},
+    });
+
+  it("A. adjacent comparison input: 'Compare results to baseline.csv' consumes, never produces", () => {
+    const m = df("Compare results to baseline.csv.");
+    expect(m.consumes).toContain("baseline.csv");
+    expect(m.produces).not.toContain("baseline.csv");
+  });
+
+  it("B. unbound adjacent comparison input fails closed at the canonical seam", () => {
+    expect(() =>
+      reconcilePlanDataflow(
+        [
+          {
+            task_key: "T1",
+            task_instruction: "Compare results to baseline.csv.",
+            required_capabilities: ["REASONING"],
+            depends_on: [],
+            metadata: {},
+          },
+        ] as never,
+        { telegramIntent: { requested: false, artifacts: [], mode: "TEXT" } },
+      ),
+    ).toThrow(/FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT/);
+  });
+
+  it("C. write destination still produces: 'Write the final report to report.md'", () => {
+    expect(df("Write the final report to report.md.").produces).toContain(
+      "report.md",
+    );
+    expect(df("Save data to market_data.json.").produces).toContain(
+      "market_data.json",
+    );
+  });
+
+  it("D. copy source/destination: 'Copy input.csv to output.csv'", () => {
+    const m = df("Copy input.csv to output.csv.");
+    expect(m.consumes).toContain("input.csv");
+    expect(m.produces).toContain("output.csv");
+  });
+
+  it("E. R1 modifier case preserved: 'format findings into a professional report.md'", () => {
+    const m = df(
+      "Read analysis_temp.txt and format the findings into a professional report.md file.",
+    );
+    expect(m.consumes).toContain("analysis_temp.txt");
+    expect(m.produces).toContain("report.md");
+  });
+
+  it("F. R1 purpose phrase preserved: 'Read source data to compare with baseline.csv'", () => {
+    const m = df("Read source data to compare with baseline.csv.");
+    expect(m.consumes).toContain("baseline.csv");
+    expect(m.produces).not.toContain("baseline.csv");
+  });
+
+  it("G. 'Check values against/reference/to baseline.csv' never produces", () => {
+    for (const instr of [
+      "Check values against baseline.csv.",
+      "Check values to reference baseline.csv.",
+      "Check values to baseline.csv.",
+    ]) {
+      const m = df(instr);
+      expect(m.produces).not.toContain("baseline.csv");
+    }
+  });
+});
