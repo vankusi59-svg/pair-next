@@ -632,7 +632,7 @@ export function sanitizePlan(
       warnings.push(`DROP_UNSERVABLE_CAPS:${key}`);
       continue;
     }
-    const instruction = String(t.task_instruction ?? "").slice(0, LLM_PLANNER_MAX_INSTRUCTION);
+    let instruction = String(t.task_instruction ?? "").slice(0, LLM_PLANNER_MAX_INSTRUCTION);
     if (!instruction.trim()) {
       warnings.push(`DROP_EMPTY_INSTRUCTION:${key}`);
       continue;
@@ -648,26 +648,64 @@ export function sanitizePlan(
     const deps = Array.isArray(t.depends_on)
       ? [...new Set(t.depends_on.map((d) => String(d)).filter((d) => seen.has(d)))]
       : [];
+    const metadata =
+      t.metadata && typeof t.metadata === "object" && !Array.isArray(t.metadata)
+        ? (t.metadata as Record<string, unknown>)
+        : {};
     if (!isTelegramDelivery) {
-      const cand = candidateTaskDataflow({
+      const taskShape = {
         task_key: key,
         task_instruction: instruction,
         required_capabilities: caps,
-        metadata:
-          t.metadata &&
-          typeof t.metadata === "object" &&
-          !Array.isArray(t.metadata)
-            ? t.metadata
-            : {},
-      });
-      const ungoverned = deps.some((d) => {
+        metadata,
+      };
+      const cand = candidateTaskDataflow(taskShape);
+      const depProducesOf = (d: string) =>
+        candidateTaskDataflow(rawByKey.get(d) ?? {}).produces;
+      const offending = deps.filter((d) => {
         if (!remoteKeys.has(d)) return false;
-        const depProduces = candidateTaskDataflow(rawByKey.get(d) ?? {});
-        return !cand.consumes.some((c) => depProduces.produces.includes(c));
+        return !cand.consumes.some((c) => depProducesOf(d).includes(c));
       });
-      if (ungoverned) {
-        warnings.push(`DROP_REMOTE_DEPENDENT:${key}`);
-        continue;
+      if (offending.length) {
+        // P-GRAMMAR2 §2 — bounded unambiguous repair only: exactly ONE
+        // offending remote producer emitting exactly ONE artifact, and
+        // every consume edge the consumer already declared binds a real
+        // produce of one of its deps (a consumer naming an artifact NO
+        // dep produces is incoherent — never widen or guess). The repair
+        // is a canonical instruction suffix naming the artifact as an
+        // input; extraction must then prove the edge real — nothing is
+        // bypassed or annotated around the gate.
+        const depProduces = depProducesOf(offending[0] ?? "");
+        const edgesAllReal = cand.consumes.every((c) =>
+          deps.some((d) => depProducesOf(d).includes(c)),
+        );
+        const suffix =
+          depProduces.length === 1
+            ? ` Input artifact to read: ${depProduces[0]}.`
+            : "";
+        let repaired = false;
+        if (
+          offending.length === 1 &&
+          depProduces.length === 1 &&
+          edgesAllReal &&
+          suffix.length > 0 &&
+          instruction.length + suffix.length <= LLM_PLANNER_MAX_INSTRUCTION
+        ) {
+          const repairedInstruction = instruction + suffix;
+          const recand = candidateTaskDataflow({
+            ...taskShape,
+            task_instruction: repairedInstruction,
+          });
+          if (recand.consumes.includes(depProduces[0] as string)) {
+            instruction = repairedInstruction;
+            warnings.push(`REPAIRED_REMOTE_DEPENDENT_EDGE:${key}`);
+            repaired = true;
+          }
+        }
+        if (!repaired) {
+          warnings.push(`DROP_REMOTE_DEPENDENT:${key}`);
+          continue;
+        }
       }
     }
     if (Array.isArray(t.depends_on) && deps.length !== new Set(t.depends_on.map((d) => String(d))).size) {
@@ -675,10 +713,6 @@ export function sanitizePlan(
     }
     if (caps.some((c) => REMOTE_CAPS.has(c))) remoteKeys.add(key);
     seen.add(key);
-    const metadata =
-      t.metadata && typeof t.metadata === "object" && !Array.isArray(t.metadata)
-        ? (t.metadata as Record<string, unknown>)
-        : {};
     tasks.push({
       task_key: key,
       title: String(t.title ?? key).slice(0, 200),
@@ -710,6 +744,7 @@ Rules:
 - TELEGRAM_DELIVERY (when ALLOWED): ONLY when the goal EXPLICITLY asks to send/deliver named output to Telegram (gửi tele/telegram, báo qua telegram, send/deliver to telegram) — never add it for a goal that merely mentions a file, an outbox, or completion. Add it as a DAG-leaf task with capability TELEGRAM_DELIVERY, depending ONLY on the tasks that produce what the goal asked to be sent. PAIR pins the delivery manifest, the canonical output language, and the final delivery instruction from the operator request — the plan does not choose what may be sent, in which language, or how. Instruction placeholder: "Stage the manifested artifacts into outbox/ unchanged, then reply DONE." (PAIR rewrites it canonically.)
 - FILE DELIVERABLES: when the goal names a file to create AND asks to send it (e.g. "tạo file X.md ... gửi telegram"), the producing task must write the file directly into outbox/<exact filename> — not the workspace root — so the delivery pipeline picks it up.
 - BYTE DEPENDENCIES: "needs the data from T2" is NOT an input — bytes are. When a task needs another task's FILE output, the PRODUCER's instruction must name the exact artifact path it writes (e.g. "write findings to report.txt") and the CONSUMER's instruction must name that same path as its input (e.g. "read report.txt") — identical names, producer earlier, consumer depends_on the producer. A consumer that only says "send the report" with no file edge consumes the producer's RESULT TEXT via dependency_outputs — valid only for local (non-remote) producers.
+- REMOTE EDGE EXAMPLES: VALID — remote T2's instruction writes "outbox/review.md"; consumer T3's instruction says "Read outbox/review.md and market.json, write report.md, then reply DONE." and T3's depends_on includes T2. INVALID — T3's instruction says "Tổng hợp kết quả từ các nguồn và viết report.md": no literal artifact path → REJECTED. A non-delivery task that depends_on a remote task MUST name the produced artifact path in its read/input instruction — paraphrases like "the results", "the output", "các nguồn" never constitute an artifact edge.
 - Keep task instructions concrete and verifiable; end with "then reply DONE."
 - No prose, no markdown — JSON only.`;
 
