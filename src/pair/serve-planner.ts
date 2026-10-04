@@ -31,6 +31,9 @@ import {
   reservedAutomatonMisuseKey,
   resolveWorkTaskBudget,
   sanitizePlan,
+  goalRequiresCurrentExternalData,
+  taskRequiresNetworkAccess,
+  instructionIsDataGathering,
 } from "./llm-planner.js";
 import {
   reconcilePlanDataflow,
@@ -181,6 +184,43 @@ export function makeServeCanonicalizer(deps: {
       deps.executorCapSets() as never[],
     );
     if (!tasks.length) return [] as Array<Record<string, unknown>>;
+    // PRV2-A R2 — deterministic network-requirement authority at the
+    // canonical seam (prompt wording is guidance, not authority):
+    //  a) goal explicitly needs current/external data → the canonical work
+    //     plan must contain a LEGITIMATE data-gathering task carrying
+    //     NETWORK_ACCESS (fetch-shaped instruction — a dummy task carrying
+    //     the capability does not count);
+    //  b) a task whose instruction explicitly requests live/web fetching
+    //     must itself carry NETWORK_ACCESS.
+    // Neither rewrites the model's proposal — the candidate fails typed
+    // and planner failover proceeds.
+    if (goalRequiresCurrentExternalData(goal)) {
+      const legitimate = tasks.some((t) => {
+        const caps = (t.required_capabilities as string[] | undefined) ?? [];
+        return (
+          caps.includes("NETWORK_ACCESS") &&
+          instructionIsDataGathering(String(t.task_instruction ?? ""))
+        );
+      });
+      if (!legitimate) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED",
+          "goal requires current/external data but no legitimate NETWORK_ACCESS data-gathering task",
+        );
+      }
+    }
+    for (const t of tasks) {
+      const caps = (t.required_capabilities as string[] | undefined) ?? [];
+      if (
+        !caps.includes("NETWORK_ACCESS") &&
+        taskRequiresNetworkAccess(String(t.task_instruction ?? ""))
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED",
+          `task ${String(t.task_key)} requests live/web fetching without NETWORK_ACCESS`,
+        );
+      }
+    }
     // PRV2-A §D — deterministic key/dependency remap: kept work tasks
     // become T2..T(n+1) in emitted order; a dependency on a dropped
     // bookkeeping-shaped task resolves to PAIR's injected T1.

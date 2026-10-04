@@ -115,6 +115,67 @@ export function reservedAutomatonMisuseKey(
 export const LLM_PLAN_RESERVED_CAPABILITY_WARNING =
   "LLM_PLAN_RESERVED_CAPABILITY_AUTOMATON";
 
+/* ---------------- PRV2-A R2 — current/external-data intent ----------------
+ * One canonical, conservative, deterministic detector. It powers the
+ * canonical planner gate: a goal that explicitly needs current/external
+ * data demands a legitimate NETWORK_ACCESS data-gathering task in the
+ * canonical work plan, and a task instruction that explicitly requests
+ * live/web fetching must carry NETWORK_ACCESS itself. Generic historical
+ * analysis is NOT treated as current-data work merely because data words
+ * like "price" appear — a recency/online marker is required. */
+
+/** Recency markers (English + Vietnamese). Multi-word Vietnamese phrases
+ *  need no \b (diacritics make it unreliable); they are phrases already. */
+const CURRENCY_RE =
+  /\b(today|tonight|current(?:ly)?|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now)\b|hôm nay|hiện tại|hiện giờ|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay|hiện nay/iu;
+
+/** Explicit online/web markers — never bare "web" (a "web app" is not a
+ *  network request) and never "website". */
+const ONLINE_RE =
+  /\b(the\s+web|world\s+wide\s+web|internet|online|web\s+search|search\s+the\s+web|google|bing|wikipedia)\b|trên mạng|trên internet|mạng internet/iu;
+
+/** Information-retrieval verbs. Word-bounded so "fetched", "scraper",
+ *  "research" do NOT match — only an explicit request to retrieve. */
+const FETCH_VERB_RE =
+  /\b(fetch(?:es)?|get|gets|getting|retrieve[sd]?|search(?:es)?|look\s?up|lookup|find|finds|browse[sd]?|scrape[sd]?|checks?|checking|gather(?:s|ing|ed)?|collect(?:s|ed|ing)?|quer(?:y|ies|ied)|pull(?:s|ing)?|download(?:s|ed|ing)?|tìm|tra|lấy)\b|tìm kiếm|tra cứu|kiểm tra|thu thập|xem tin/iu;
+
+/** Things one would gather from an external source. */
+const DATA_OBJECT_RE =
+  /\b(price[sd]?|rates?|news|weather|stocks?|markets?|headlines?|trends?|updates?|information|data|reports?|scores?|results?|quotes?|articles?|forex|exchange|forecast|outlook|tin)\b|giá|tin tức|thời tiết|thị trường|tỷ giá|dữ liệu|thông tin|báo cáo|\bbáo\b/iu;
+
+/** Does the GOAL explicitly intend current/external data? Conservative:
+ *  a recency marker together with something to gather (or an online
+ *  marker), or an explicit online-search shape. */
+export function goalRequiresCurrentExternalData(goal: string): boolean {
+  const g = String(goal ?? "");
+  const currency = CURRENCY_RE.test(g);
+  const online = ONLINE_RE.test(g);
+  const verb = FETCH_VERB_RE.test(g);
+  const obj = DATA_OBJECT_RE.test(g);
+  return (currency && (verb || obj || online)) || (online && verb && obj);
+}
+
+/** Does the task instruction explicitly request live/web fetching
+ *  (a retrieval verb + a recency or online marker)? Such a task MUST
+ *  itself carry NETWORK_ACCESS. */
+export function taskRequiresNetworkAccess(instruction: string): boolean {
+  const t = String(instruction ?? "");
+  return (
+    FETCH_VERB_RE.test(t) && (CURRENCY_RE.test(t) || ONLINE_RE.test(t))
+  );
+}
+
+/** Does the instruction describe data-gathering work (a retrieval verb +
+ *  something retrievable)? Used to prove a NETWORK_ACCESS task is a
+ *  legitimate gatherer — not a dummy carrying the capability. */
+export function instructionIsDataGathering(instruction: string): boolean {
+  const t = String(instruction ?? "");
+  return (
+    FETCH_VERB_RE.test(t) &&
+    (DATA_OBJECT_RE.test(t) || ONLINE_RE.test(t) || CURRENCY_RE.test(t))
+  );
+}
+
 export interface LlmPlannerConfig {
   /** Provider chat/completions URL (P6 endpoint_reference). */
   endpoint: string;

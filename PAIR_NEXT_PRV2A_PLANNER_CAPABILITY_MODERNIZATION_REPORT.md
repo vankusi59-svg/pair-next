@@ -300,3 +300,114 @@ fixture (B5), `NETWORK_ACCESS` registered known capability (B6).
 Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R1_PENDING_AUDIT`
 
 STOP — pending independent audit. DO NOT MERGE.
+
+---
+
+## R2 — deterministic network-requirement authority at the canonical seam
+
+Audited base: `ee3ebdda4709c94eb0f1e3b046b16d99ede0e029` (PR #41, R1).
+Audit finding closed: the current/external-data → `NETWORK_ACCESS`
+requirement existed only in the Planner prompt — a model could emit
+`["REASONING"]` for `analyze today's gold price` and route to a
+non-network executor (DSH). Prompt compliance is not authority.
+
+### Invariants
+
+- Goal explicitly requires current/external data AND the canonical work
+  plan has no legitimate `NETWORK_ACCESS` data-gathering task →
+  `IntegrityError("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED")` —
+  thrown inside `makeServeCanonicalizer` after sanitize, i.e. BEFORE the
+  plan can become the winning/pinned canonical plan (attempt settles
+  FAILED/CANONICAL_VALIDATION_FAILED → planner failover proceeds).
+- A task whose instruction explicitly requests live/web fetching but
+  lacks `NETWORK_ACCESS` →
+  `IntegrityError("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED")`
+  (checked for every work task regardless of goal intent).
+- The proposal is never rewritten: NETWORK_ACCESS is not auto-added and
+  requested caps are never rewritten — the candidate fails typed.
+- A `NETWORK_ACCESS` task counts toward the goal requirement ONLY when
+  its instruction is itself data-gathering (fetch verb + retrievable
+  object/recency/online marker) — the anti-dummy rule.
+
+### Design — one canonical detector (llm-planner.ts)
+
+Conservative keyword detector — four bounded regexes (EN + VI), no
+unrelated semantic system reused:
+
+- `CURRENCY_RE` — recency markers: today/tonight/current/latest/newest/
+  live/real-time/up-to-date/breaking/right now; hôm nay/hiện tại/hiện
+  giờ/mới nhất/mới đây/gần đây/trực tiếp/bây giờ/lúc này/hiện nay.
+- `ONLINE_RE` — explicit online markers: the web/internet/online/web
+  search/google/bing/wikipedia; trên mạng/trên internet. Bare `web` and
+  `website` deliberately absent (a "web app" is not a network request).
+- `FETCH_VERB_RE` — retrieval verbs, word-bounded (`fetched`,
+  `scraper`, `research` do NOT match): fetch/get/retrieve/search/
+  look up/find/browse/scrape/check/gather/collect/query/pull/download;
+  tìm/tra/lấy/tìm kiếm/tra cứu/kiểm tra/thu thập/xem tin.
+- `DATA_OBJECT_RE` — retrievables: price/rate/news/weather/stock/
+  market/headline/trend/update/information/data/report/score/result/
+  quote/article/forex/exchange/forecast/outlook; giá/tin tức/thời
+  tiết/thị trường/tỷ giá/dữ liệu/thông tin/báo cáo/tin/báo.
+
+Three exported predicates:
+
+- `goalRequiresCurrentExternalData(goal)` =
+  `(currency AND (verb OR object OR online)) OR (online AND verb AND
+  object)` — a recency marker alone does not fire, nor does "price"
+  alone. `"analyze gold price"` → false; `"analyze today's gold
+  price"` → true; `"build a web scraper"`/`"build a website
+  dashboard"`/`"review the search results in results.txt"` → false.
+- `taskRequiresNetworkAccess(instruction)` =
+  `verb AND (currency OR online)` — "analyze the fetched data" → false.
+- `instructionIsDataGathering(instruction)` =
+  `verb AND (object OR online OR currency)` — "create report.txt" /
+  "think about the market" → false.
+
+### Enforcement point
+
+`serve-planner.ts` `makeServeCanonicalizer`, after `sanitizePlan` and
+before key-remap/prepend — the same canonical seam where the R1.A
+reserved-capability throw lives. IntegrityError propagates exactly like
+every other canonicalize rejection: failover-eligible, never pin-able.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused `pair-prv2a-planner-modernization` | **41/41 PASS** (33 R1 + 8 R2) |
+| Regression battery (llm-planner, CPL-1, CNI-1, dataflow-incident, ops-telegram, F3×4, p4/p7/p8/p13, F4, F5) | **554/554 PASS** (15 files) |
+| `npx tsc --noEmit` | clean |
+| `rm -rf dist && pnpm build` | PASS |
+| Full suite | **3427 pass / 2 failed** — same 2 env-only P5 fails as baseline (stock probes expect missing DSH/CODEX executables) |
+| `pnpm audit` | 0 high (6 moderate — unchanged baseline, no new deps) |
+
+### Required adversarial proofs delivered
+
+R2-det detector matrix (currency/online gate, `price`-alone negative,
+VI phrases, task-level + legitimacy shapes) · R2-N1
+`"analyze today's gold price"` + REASONING-only →
+`FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED` · R2-N2 same goal +
+`["NETWORK_ACCESS","REASONING"]` fetch task → canonicalize PASS ·
+R2-N3 historical/offline goal unaffected · R2-N4 NETWORK on an
+unrelated dummy task (`create report.txt`) does NOT satisfy the
+requirement → typed reject · R2-N5 task instruction requesting live
+fetch without NETWORK → `FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED`
+· R2-N6 NETWORK task with non-gathering instruction also illegitimate ·
+R2-N7 routing over the valid canonical plan: DSH
+`MISSING_CAPABILITIES:NETWORK_ACCESS`, codex-like OFF
+`MISSING_LIVE_CAPABILITIES:NETWORK_ACCESS`, codex-like ON eligible and
+selected over devin (higher priority → devin also wins when codex OFF
+proves both lanes serve it).
+
+### Residual limitations (unchanged)
+
+- Boot-OFF→flip-ON Codex needs re-registration (fail-closed asymmetry).
+- `PLAN_SCHEMA` still cannot emit declared edge fields.
+- The detector is keyword-bounded by design: a goal needing current
+  data phrased without any recency/online/retrieval marker (e.g.
+  `"what is the gold price"`) is not flagged — mandate prescribes
+  conservative over noisy.
+
+Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R2_PENDING_AUDIT`
+
+STOP — pending independent audit. DO NOT MERGE.

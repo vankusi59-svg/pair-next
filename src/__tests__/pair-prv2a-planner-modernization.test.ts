@@ -28,6 +28,9 @@ import {
   llmPlan,
   sanitizePlan,
   LLM_PLAN_RESERVED_CAPABILITY_WARNING,
+  goalRequiresCurrentExternalData,
+  taskRequiresNetworkAccess,
+  instructionIsDataGathering,
   WORK_TASK_HARD_CEILING,
 } from "../pair/llm-planner.js";
 import {
@@ -245,7 +248,14 @@ describe("PRV2-A adaptive budget", () => {
       "và đề xuất cải tiến EA strategy";
     expect(deriveWorkTaskBudget(goal)).toBeGreaterThanOrEqual(6);
     const raw = Array.from({ length: 5 }, (_, i) =>
-      work(`T${i + 1}`, `step ${i + 1}`, ["REASONING"], i ? [`T${i}`] : []),
+      work(
+        `T${i + 1}`,
+        i === 0
+          ? "fetch the latest market prices and news"
+          : `step ${i + 1}`,
+        i === 0 ? ["NETWORK_ACCESS", "REASONING"] : ["REASONING"],
+        i ? [`T${i}`] : [],
+      ),
     );
     raw.push(
       work(
@@ -728,5 +738,187 @@ describe("PRV2-A R1.B — NETWORK_ACCESS routing authority", () => {
     );
     expect(out).toHaveLength(1);
     expect(out[0].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+});
+
+/* ---------------- R2 — deterministic network-requirement authority ---------------- */
+
+const PLAN_NET_REQ = "FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED";
+const TASK_NET_REQ = "FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED";
+
+function expectIntegrityCode(fn: () => unknown, code: string) {
+  try {
+    fn();
+    expect.unreachable("expected IntegrityError");
+  } catch (e) {
+    expect(e).toBeInstanceOf(IntegrityError);
+    expect(String((e as IntegrityError).code)).toBe(code);
+  }
+}
+
+describe("PRV2-A R2 — canonical network-requirement gate", () => {
+  it("R2-det: conservative detector — currency/online markers required, 'price' alone is not current-data", () => {
+    expect(goalRequiresCurrentExternalData("analyze today's gold price")).toBe(true);
+    expect(goalRequiresCurrentExternalData("fetch the latest gold and BTC news")).toBe(true);
+    expect(goalRequiresCurrentExternalData("tìm tin tức mới nhất về vàng")).toBe(true);
+    expect(goalRequiresCurrentExternalData("lấy giá vàng hiện tại")).toBe(true);
+    expect(goalRequiresCurrentExternalData("search the web for gold prices")).toBe(true);
+    // historical / offline work is unaffected
+    expect(goalRequiresCurrentExternalData("analyze gold price and write report to report.txt")).toBe(false);
+    expect(goalRequiresCurrentExternalData("analyze historical XAUUSD data and backtest an EA")).toBe(false);
+    expect(goalRequiresCurrentExternalData("build a web scraper")).toBe(false);
+    expect(goalRequiresCurrentExternalData("build a website dashboard")).toBe(false);
+    expect(goalRequiresCurrentExternalData("review the search results stored in results.txt")).toBe(false);
+    // task-level
+    expect(taskRequiresNetworkAccess("fetch the latest gold price")).toBe(true);
+    expect(taskRequiresNetworkAccess("search the web for BTC news")).toBe(true);
+    expect(taskRequiresNetworkAccess("tìm giá vàng hôm nay")).toBe(true);
+    expect(taskRequiresNetworkAccess("analyze the fetched data")).toBe(false);
+    expect(taskRequiresNetworkAccess("review the search results")).toBe(false);
+    // legitimacy shape
+    expect(instructionIsDataGathering("fetch current gold prices")).toBe(true);
+    expect(instructionIsDataGathering("search for the latest news")).toBe(true);
+    expect(instructionIsDataGathering("create report.txt")).toBe(false);
+    expect(instructionIsDataGathering("think about the market")).toBe(false);
+  });
+
+  it("R2-N1 (adversarial): 'analyze today's gold price' + REASONING-only → typed plan reject", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [work("T1", "analyze the gold price and write report.txt", ["REASONING"])],
+          "analyze today's gold price",
+        ),
+      PLAN_NET_REQ,
+    );
+  });
+
+  it("R2-N2: same goal + legitimate NETWORK data-gathering task → canonicalize PASS", () => {
+    const out = canon(
+      [
+        work("T1", "fetch the current gold price from the internet", [
+          "NETWORK_ACCESS",
+          "REASONING",
+        ]),
+        work("T2", "write analysis report.txt", ["FILE_OPERATIONS"], ["T1"]),
+      ],
+      "analyze today's gold price",
+    );
+    expect(out.map((t) => t.task_key)).toEqual(["T1", "T2", "T3"]);
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R2-N3: historical/offline goal genuinely needing no current data is unaffected", () => {
+    const out = canon(
+      [
+        work("T1", "analyze historical XAUUSD data", ["REASONING"]),
+        work("T2", "write backtest.md", ["FILE_OPERATIONS"], ["T1"]),
+      ],
+      "analyze historical XAUUSD data and write a backtest note",
+    );
+    expect(out.map((t) => t.task_key)).toEqual(["T1", "T2", "T3"]);
+  });
+
+  it("R2-N4 (adversarial): NETWORK_ACCESS on an unrelated dummy task does NOT satisfy the goal requirement", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "create report.txt placeholder", [
+              "FILE_OPERATIONS",
+              "NETWORK_ACCESS",
+            ]),
+            work("T2", "analyze the gold trend", ["REASONING"], ["T1"]),
+          ],
+          "analyze today's gold price",
+        ),
+      PLAN_NET_REQ,
+    );
+  });
+
+  it("R2-N5 (adversarial): task instruction explicitly requests live fetching but lacks NETWORK → task-level typed reject", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "fetch the latest gold price and write price.txt", [
+              "REASONING",
+            ]),
+          ],
+          "write a price note",
+        ),
+      TASK_NET_REQ,
+    );
+  });
+
+  it("R2-N6 (adversarial): NETWORK task without a data-gathering instruction is not legitimate either", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "think about the market", ["NETWORK_ACCESS", "REASONING"]),
+          ],
+          "analyze today's gold price",
+        ),
+      PLAN_NET_REQ,
+    );
+  });
+
+  it("R2-N7: routing over a valid network plan — DSH ineligible, codex ON eligible, codex OFF rejected, devin eligible", () => {
+    const plan = canon(
+      [
+        work("T1", "fetch the current gold price", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "analyze today's gold price",
+    );
+    const netCaps = (plan[1].required_capabilities as string[]);
+    const ctx = makeRouterCtx("r2n7");
+    registerNetExecutor(ctx, "dsh_like", [
+      "CODE_GENERATION", "CODE_EDITING", "FILE_OPERATIONS",
+      "SHELL_EXECUTION", "REASONING", "TELEGRAM_DELIVERY",
+    ], 5);
+    registerNetExecutor(ctx, "codex_like", [
+      "CODE_GENERATION", "FILE_OPERATIONS", "SHELL_EXECUTION",
+      "PYTHON_EXECUTION", "REASONING", "NETWORK_ACCESS",
+    ], 10);
+    registerNetExecutor(ctx, "devin_like", [
+      "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION",
+      "NETWORK_ACCESS", "REASONING",
+    ], 50);
+    const codexOff = new LiveCapsAdapter("codex_like", [
+      "CODE_GENERATION", "FILE_OPERATIONS", "SHELL_EXECUTION",
+      "PYTHON_EXECUTION", "REASONING",
+    ]);
+    const adaptersOff = new Map<string, ExecutorAdapter>([
+      ["dsh_like", new LiveCapsAdapter("dsh_like", [
+        "CODE_GENERATION", "CODE_EDITING", "FILE_OPERATIONS",
+        "SHELL_EXECUTION", "REASONING", "TELEGRAM_DELIVERY",
+      ])],
+      ["codex_like", codexOff],
+      ["devin_like", new LiveCapsAdapter("devin_like", [
+        "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION",
+        "NETWORK_ACCESS", "REASONING",
+      ])],
+    ]);
+    const dOff = routeNet(ctx, adaptersOff, netCaps);
+    expect(dOff.selected_executor).toBe("devin_like");
+    const rej = dOff.rejected_executors as Array<{ executor_id: string; reasons: string[] }>;
+    expect(rej.find((r) => r.executor_id === "dsh_like")!.reasons.join(",")).toContain("NETWORK_ACCESS");
+    expect(rej.find((r) => r.executor_id === "codex_like")!.reasons).toContain(
+      "MISSING_LIVE_CAPABILITIES:NETWORK_ACCESS",
+    );
+    // codex ON → eligible
+    const adaptersOn = new Map<string, ExecutorAdapter>([
+      ["codex_like", new LiveCapsAdapter("codex_like", [
+        "CODE_GENERATION", "FILE_OPERATIONS", "SHELL_EXECUTION",
+        "PYTHON_EXECUTION", "REASONING", "NETWORK_ACCESS",
+      ])],
+      ["devin_like", new LiveCapsAdapter("devin_like", [
+        "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION",
+        "NETWORK_ACCESS", "REASONING",
+      ])],
+    ]);
+    const dOn = routeNet(ctx, adaptersOn, netCaps);
+    expect(dOn.selected_executor).toBe("codex_like");
   });
 });
