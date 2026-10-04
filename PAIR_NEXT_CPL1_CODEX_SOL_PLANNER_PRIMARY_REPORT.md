@@ -17,7 +17,7 @@ Per-attempt `assertCodexPlannerCandidateEligible`: role + DSH-overlap violations
 
 ## Default order + operator override
 
-`PAIR_PLANNER_MODEL_ROUTE` default `codex-cli:gpt-6.1-sol` → `PAIR_PLANNER_FALLBACK_ROUTE` default `gemini:gemini-3.1-flash-lite` → `PAIR_PLANNER_EXTRA_ROUTES` extras — in `scripts/serve-mission-control.mjs` and `scripts/start-pair-live.sh`. Env-config compat fully preserved: an explicit env always wins; empty fallback disables it; api-only route lists keep codex out entirely (test J). `PAIR_CODEX_PLANNER_TIMEOUT_MS` (env-config, 5s–900s, default 120s) bounds planner invocations; `PAIR_CODEX_PLANNER_EXECUTABLE`/`PAIR_CODEX_EXECUTABLE` override binary resolution (`which codex` fallback).
+`PAIR_PLANNER_MODEL_ROUTE` default `codex-cli:gpt-6.1-sol` → `PAIR_PLANNER_FALLBACK_ROUTE` default `gemini:gemini-3.1-flash-lite` → `PAIR_PLANNER_EXTRA_ROUTES` extras — in `scripts/serve-mission-control.mjs` and `scripts/start-pair-live.sh`. Env-config compat fully preserved: an explicit env always wins; empty fallback disables it; api-only route lists keep codex out entirely (test J). `PAIR_CODEX_PLANNER_TIMEOUT_MS` (env-config, 5s–900s, default 900s = 15min) bounds planner invocations; `PAIR_CODEX_PLANNER_EXECUTABLE`/`PAIR_CODEX_EXECUTABLE` override binary resolution (`which codex` fallback).
 
 ## Warning → failure_class map (codex transport)
 
@@ -108,6 +108,48 @@ Scratch stack `PAIR_MC_DIR=/home/ubuntu/.pair-cpl1-scratch/mc` on :8789, real `C
 ## Residual limitations (R1)
 
 - A **never-qualified** codex provider (e.g. CLI missing at boot) is canonical-authority-fail-closed: the plan call aborts `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE` rather than silently falling to gemini — deliberate: an authority violation in the pool is an operator problem, not an availability flake (§3/§4B). Refreshable availability drift still fails over to gemini normally.
-- Provider conditions `STALE`/`DISABLED` are never cleared by the refresh seam — only derived evidence (probe receipts, access observations, qualification receipts, model lifecycle) is re-minted through canonical seams.
+- Provider conditions `STALE`/`DISABLED` were never cleared by the R1 refresh seam — only derived evidence was re-minted. (Superseded in R2: STALE is now cleared through the canonical `upsertCandidate` re-observation; DISABLED/REMOVED/UNQUALIFIED remain never-cleared, never auto-revived.)
 
 Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R1_PENDING_AUDIT`
+
+---
+
+# CPL-1 R2 — Production probe default + actual provider-STALE canonical recovery (PENDING AUDIT)
+
+- **R2 base**: `f201d6b` (audited R1 HEAD) · **branch**: same `devin/1791091651-cpl1-codex-sol-planner` (PR #40, in-place remediation — no new PR, no merge)
+
+## R2.A — Production startup probe default
+
+`scripts/start-pair-live.sh` forced `PAIR_MODEL_PROBE_TIMEOUT_MS=30000` over the canonical 60000 env-config default → changed to `${PAIR_MODEL_PROBE_TIMEOUT_MS:-60000}`. Explicit env still wins verbatim (20000→20000, 45000→45000); no hidden minimum; env-config bounds unchanged. Regression test R2.A reads the script and pins the `:-60000` default line.
+
+## R2.B — Actual provider-STALE canonical recovery
+
+R1 proved refresh via `probe_state` drift but not a real `conditions=["STALE"]` (PROVIDER_CURRENT=FAIL) recovery. `refreshCodexPlannerQualification` now begins with a **canonical re-observation** step: when the provider carries STALE (and not REMOVED/DISABLED — belt-and-suspenders; those are upfront authority throws that never reach the refresh seam), it re-observes the SAME configured codex-cli identity through `ProviderCatalog.upsertCandidate` — the identical candidate literal shared with `ensureCodexCliPlannerCatalog` (provider_id=codex-cli, LOCAL_CLI, CODEX_CLI protocol family, codex-cli://local endpoint). Canonical reappearance semantics clear STALE→REAPPEARED and demote stale authority (lifecycle DISCOVERY_ELIGIBLE, AUTH_REQUIRED, UNPROBED, receipt pointer nulled), then the normal validateAccess→qualify→setLifecycle→probeModel→qualifyModel chain re-mints authority. No direct mutation/deletion of the STALE condition; no shadow currentness flag; canonical conflict/identity validation preserved. REMOVED/DISABLED/bad-receipt/identity violations still fail closed with ZERO refresh and ZERO invocation.
+
+## R2 tests (all in `pair-cpl1-codex-planner.test.ts`, 31/31 PASS)
+
+- **R2.A**: start-pair-live.sh contains the `:-60000` default line, no `:-30000` for the probe var.
+- **R2.B1**: conditions=["STALE"] → `providerModelEligibility` proves PROVIDER_CURRENT=FAIL upfront → ONE bounded recovery (re-observation + 1 provider probe + 1 model probe = 2 PROBE spawns) → exactly ONE PLAN invocation → codex `attempt_no=1`, gemini=0 calls; durable provider row: STALE cleared, PROBED/AUTH_OK/QUALIFIED, fresh current receipt.
+- **R2.B2**: STALE + dead probe → re-observation runs, requalification fails → ZERO PLAN, typed FAILED attempt, gemini wins.
+- **R2.B3**: conditions=["REMOVED"] → authority throw (AUTHORITY_REJECTED), ZERO refresh, ZERO invocation, REMOVED mark persists (no auto-revive through upsertCandidate).
+- DISABLED (B), provider/model receipt-invalid (C/G/G2), ownership mismatch (D), provider_id contradiction (E), model BLOCKED (F3) — all retained from R1, still ZERO invocation.
+
+## Validation (R2, all real runs)
+
+- Focused CPL-1 suite **31/31 PASS** (R1 27/27 + R2.A script default + R2.B1/B2/B3).
+- `npx tsc --noEmit`: clean · `rm -rf dist && pnpm build`: PASS · `pnpm audit --audit-level=high`: 0 high (1 low, 8 moderate — unchanged).
+- Full suite: **3368 pass / 2 fail** — only the two known env-only P5 registration failures (unchanged vs base `f201d6b`).
+
+## Live smoke (R2)
+
+Scratch stack `PAIR_MC_DIR=/home/ubuntu/.pair-cpl1-scratch/mc` on :8789, real `CODEX_HOME` ChatGPT auth, R2 dist. Boot: `MODEL_ROUTE: codex-cli:gpt-6.1-sol QUALIFIED (codex planner, probe PASS)`.
+
+- **Codex-primary**: POST `/api/missions/preview` → durable `planner_attempt PA_01M42WRJEPS7F5JJWWMS5FJR84` **SUCCESS attempt_no=1**, `planner_run PRN_01M42WRJEPA9BVSY2SH0C3T5GZ` **WINNER_SELECTED winner_attempt_no=1**, preview `MPP_01M42WSCZAFQGBPPKBZ4E6WH88` READY `plan_model=gpt-6.1-sol`, auth `auth_mode=chatgpt`, server env carried NO `PAIR_MODEL_PROBE_TIMEOUT_MS` (canonical 60000 default in effect).
+- **Actual STALE recovery (high-fidelity)**: provider `PRV_a7b49220f00b358aae4b76fe` `conditions=["STALE"]` written to the live db (PROVIDER_CURRENT=FAIL) → POST preview → canonical re-observation cleared STALE→`["REAPPEARED"]` → live `codexPlannerProbe` re-minted `probe_state=PROBED`/`auth_state=AUTH_OK`/`lifecycle=QUALIFIED` + fresh receipt `PQR_01M42WSQXDWCEXZ5…` → full eligibility PASS → codex invoked → attempt `PA_01M42WSK5KFWCN34XWYJH51J9P` **SUCCESS attempt_no=1**, run `PRN_01M42WSK5J8CRKKFQ5W0AX6VVV` **WINNER_SELECTED winner_attempt_no=1**, preview `MPP_01M42WTJFYD95ZBF1565H7AYK3` READY.
+- Note: an earlier smoke run for a goal asking live internet fetches produced `PLAN_INVALID` for the codex attempt (it drew a `REMOTE_CLOUD_TASK_EXECUTION` task and this scratch stack registers no DEVIN executor — canonical rejection, failover evidence intact) — a plan-content matter, unrelated to R2 eligibility/auth/timeout scope.
+
+## Residual limitations (R2)
+
+Same as R1 plus: re-observation restores OBSERVATION only — STALE recovery always re-runs the full authority chain; a re-observation conflict on identity facets still fails closed via the canonical catalog seam.
+
+Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R2_PENDING_AUDIT`

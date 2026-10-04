@@ -479,6 +479,20 @@ export async function refreshCodexPlannerQualification(
       env: opts.env,
     });
   const pc = new ProviderCatalog(store);
+  // R2.B — canonical re-observation for a STALE provider before the
+  // re-probe: a legitimate current observation through the SAME
+  // ProviderCatalog.upsertCandidate authority seam that seeding uses
+  // (identical codex-cli identity facets) clears STALE → REAPPEARED and
+  // demotes stale authority (lifecycle DISCOVERY_ELIGIBLE, AUTH_REQUIRED,
+  // UNPROBED, receipt pointer cleared) so the normal
+  // validateAccess→qualify chain must re-mint authority. Gated to
+  // STALE-only: REMOVED/DISABLED/UNQUALIFIED are operator/authority marks
+  // — they never reach the refresh seam (upfront authority throw) and
+  // must never auto-revive through re-observation.
+  const conditions = new Set(((pc.getProvider(opts.provider_id)?.conditions ?? []) as string[]));
+  if (conditions.has("STALE") && !conditions.has("REMOVED") && !conditions.has("DISABLED")) {
+    pc.upsertCandidate(codexCliProviderCandidate(), actor);
+  }
   const validator = new ProviderValidator(store);
   const acc = await validator.validateAccess(opts.provider_id, { probe: codexProbe, actor });
   const pq = validator.qualify(opts.provider_id, { actor });
@@ -635,28 +649,33 @@ const POST_REFRESH_STRUCTURAL_GATES = new Set([
  * then carries a real model_entry_id that role assignment, disjointness
  * enforcement, eligibility, and planner_attempt evidence all bind to.
  */
+/** The ONE canonical candidate identity for the codex-cli planner
+ *  provider — used by seeding AND by STALE re-observation (R2.B) so the
+ *  re-observed identity is byte-identical: provider_id=codex-cli,
+ *  LOCAL_CLI, CODEX_CLI protocol family, codex-cli://local endpoint. */
+function codexCliProviderCandidate(): Record<string, unknown> {
+  return {
+    provider_native_id: CODEX_CLI_PROVIDER_ID,
+    provider_id: CODEX_CLI_PROVIDER_ID,
+    provider_type: "LOCAL_CLI",
+    protocol_family: CODEX_CLI_PROTOCOL_FAMILY,
+    provider_family: CODEX_CLI_PROVIDER_ID,
+    configured_endpoint_identity: CODEX_CLI_ENDPOINT,
+    endpoint_reference: CODEX_CLI_ENDPOINT,
+    credential_reference_name: null,
+    credential_envs: [],
+    capabilities: [],
+    source_id: "PAIR_PROVIDER_REGISTRY",
+  };
+}
+
 export function ensureCodexCliPlannerCatalog(
   store: PairEvidenceStore,
   model: string,
   actor = "PAIR_MC",
 ): string {
   const pc = new ProviderCatalog(store);
-  pc.upsertCandidate(
-    {
-      provider_native_id: CODEX_CLI_PROVIDER_ID,
-      provider_id: CODEX_CLI_PROVIDER_ID,
-      provider_type: "LOCAL_CLI",
-      protocol_family: CODEX_CLI_PROTOCOL_FAMILY,
-      provider_family: CODEX_CLI_PROVIDER_ID,
-      configured_endpoint_identity: CODEX_CLI_ENDPOINT,
-      endpoint_reference: CODEX_CLI_ENDPOINT,
-      credential_reference_name: null,
-      credential_envs: [],
-      capabilities: [],
-      source_id: "PAIR_PROVIDER_REGISTRY",
-    },
-    actor,
-  );
+  pc.upsertCandidate(codexCliProviderCandidate(), actor);
   const mcat = new ModelEvidenceCatalog(store);
   mcat.upsertModelClaim(
     {

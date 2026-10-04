@@ -40,6 +40,7 @@ import {
 import { ModelEvidenceCatalog, canonicalModelId } from "../pair/model-catalog.js";
 import { ProviderCatalog } from "../pair/provider-catalog.js";
 import { ProviderValidator } from "../pair/provider-validation.js";
+import { providerModelEligibility } from "../pair/model-routable.js";
 import { probeModel, qualifyModel } from "../pair/model-probing.js";
 import {
   modelProbeTimeoutMs,
@@ -58,6 +59,7 @@ import { validatePlanProposal } from "../pair/proposal.js";
 import { IntegrityError } from "../pair/errors.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-cpl1-"));
+const ROOT_DIR = path.resolve(import.meta.dirname, "..", "..");
 let counter = 0;
 const freshDir = (n: string) => {
   const p = path.join(ROOT, `${counter++}-${n}`);
@@ -828,5 +830,90 @@ describe("CPL-1 R1 auth isolation + timeout authority", () => {
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeGreaterThanOrEqual(2_400);
     expect(elapsed).toBeLessThan(15_000); // honored the 2.5s config, not a 60s substitute
+  });
+});
+
+/**
+ * CPL-1 R2 — production probe-timeout default + ACTUAL provider-STALE
+ * canonical recovery. STALE is availability-channel (PROVIDER_CURRENT) —
+ * it earns ONE bounded canonical refresh whose first step is a canonical
+ * re-observation of the SAME configured codex-cli identity through
+ * ProviderCatalog.upsertCandidate (STALE → REAPPEARED, stale authority
+ * demoted), then the normal validateAccess → qualify → probe/qualify
+ * chain re-mints authority. REMOVED/DISABLED/receipt/identity violations
+ * never reach the refresh seam — upfront authority throw, ZERO refresh,
+ * ZERO codex invocation.
+ */
+describe("CPL-1 R2 — startup default + provider STALE canonical recovery", () => {
+  it("R2.A. production start script default probe timeout is 60000, no hidden floor", () => {
+    const script = fs.readFileSync(path.join(ROOT_DIR, "scripts", "start-pair-live.sh"), "utf8");
+    expect(script).toContain('PAIR_MODEL_PROBE_TIMEOUT_MS="${PAIR_MODEL_PROBE_TIMEOUT_MS:-60000}"');
+    expect(script).not.toMatch(/PAIR_MODEL_PROBE_TIMEOUT_MS="\$\{PAIR_MODEL_PROBE_TIMEOUT_MS:-30000\}"/);
+  });
+
+  it("R2.B1. provider STALE → canonical re-observation → fresh authority → codex wins #1", async () => {
+    const dir = freshDir("r2-stale");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.conditions = ["STALE"]; });
+    // Prove the canonical gate really fails BEFORE the pool runs:
+    // PROVIDER_CURRENT = FAIL (availability channel → refreshable).
+    const pre = providerModelEligibility(store, CODEX_CLI_PROVIDER_ID, codex.model_entry_id);
+    expect(pre.gates.PROVIDER_CURRENT).toBe("FAIL");
+    const { exe } = makeFakeCodex(dir, "ok");
+    const { res, geminiCalls } = await runPool({
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+    });
+    expect(res.winner.provider).toBe("codex-cli");
+    expect(res.winner.attempt_no).toBe(1);
+    expect(geminiCalls.length).toBe(0);
+    const ledger = invokeLedger(dir);
+    // Exactly ONE bounded recovery cycle: 1 validateAccess probe +
+    // 1 model probe, then exactly ONE codex PLAN invocation.
+    expect(ledger.filter((k) => k === "PROBE").length).toBe(2);
+    expect(ledger.filter((k) => k === "PLAN").length).toBe(1);
+    // Canonical seams cleared STALE legitimately and re-minted authority.
+    const p = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect((p.conditions as string[]).includes("STALE")).toBe(false);
+    expect(p.probe_state).toBe("PROBED");
+    expect(p.auth_state).toBe("AUTH_OK");
+    expect(p.lifecycle_state).toBe("QUALIFIED");
+    expect(p.current_qualification_receipt_id).not.toBeNull();
+  });
+
+  it("R2.B2. provider STALE + probe still fails → ZERO plan, typed FAILED, gemini wins", async () => {
+    const dir = freshDir("r2-stale-fail");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.conditions = ["STALE"]; });
+    const { res, geminiCalls } = await runPool({
+      store, codex, dir,
+      exeEnv: { PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex") },
+      scratch: path.join(dir, "scr"),
+    });
+    // Re-observation cleared STALE legitimately, but the dead probe makes
+    // requalification fail → typed FAILED attempt, ZERO plan spawn, gemini.
+    expect(res.winner.provider).toBe("gemini");
+    expect(res.attempts[0].outcome).toBe("FAILED");
+    expect(geminiCalls.length).toBe(1);
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(0);
+  });
+
+  it("R2.B3. provider REMOVED → authority throw, ZERO refresh, ZERO codex invocation", async () => {
+    const dir = freshDir("r2-removed");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.conditions = ["REMOVED"]; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    // REMOVED must NOT flow through upsertCandidate re-observation: the
+    // mark stays and no probe/plan ever spawned.
+    expect(invokeLedger(dir).length).toBe(0);
+    const p = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect((p.conditions as string[]).includes("REMOVED")).toBe(true);
+    const a = store.list("planner_attempt");
+    expect(String(a[0].warnings)).toContain("AUTHORITY_REJECTED");
   });
 });
