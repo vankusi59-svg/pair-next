@@ -34,6 +34,8 @@ export const PLANNER_FAILURE_CLASS = {
   QUOTA_RATE_LIMITED: "QUOTA_RATE_LIMITED",
   AUTH_REJECTED: "AUTH_REJECTED",
   CREDENTIAL_MISSING: "CREDENTIAL_MISSING",
+  /** Codex CLI transport: the `codex` binary is not resolvable/executable. */
+  CLI_MISSING: "CLI_MISSING",
   EMPTY_RESPONSE: "EMPTY_RESPONSE",
   MALFORMED_RESPONSE: "MALFORMED_RESPONSE",
   PLAN_INVALID: "PLAN_INVALID",
@@ -45,6 +47,16 @@ export type PlannerFailureClass =
 /** Map llmPlan()'s warning codes to deterministic failure classes. */
 export function classifyPlannerFailure(warnings: string[]): PlannerFailureClass {
   const w = warnings[0] ?? "LLM_PLANNER_REQUEST_ERROR";
+  // CPL-1 — Codex CLI transport warnings map onto the same classes; a
+  // transport-specific code is evidence detail, not a parallel taxonomy.
+  if (w === "CODEX_CLI_MISSING") return PLANNER_FAILURE_CLASS.CLI_MISSING;
+  if (w === "CODEX_AUTH_FAILED") return PLANNER_FAILURE_CLASS.AUTH_REJECTED;
+  if (w === "CODEX_MODEL_UNAVAILABLE") return PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE;
+  if (w === "CODEX_TIMEOUT") return PLANNER_FAILURE_CLASS.TIMEOUT;
+  if (w === "CODEX_RATE_LIMITED") return PLANNER_FAILURE_CLASS.QUOTA_RATE_LIMITED;
+  if (w === "CODEX_OUTPUT_INVALID") return PLANNER_FAILURE_CLASS.MALFORMED_RESPONSE;
+  if (w === "CODEX_PLAN_DEGENERATE") return PLANNER_FAILURE_CLASS.PLAN_DEGENERATE;
+  if (w === "CODEX_SPAWN_ERROR" || w.startsWith("CODEX_SPAWN_ERROR:")) return PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE;
   if (w === "LLM_PLANNER_NO_CREDENTIAL") return PLANNER_FAILURE_CLASS.CREDENTIAL_MISSING;
   if (w === "LLM_PLANNER_REQUEST_TIMEOUT") return PLANNER_FAILURE_CLASS.TIMEOUT;
   if (w === "LLM_PLANNER_REQUEST_ERROR") return PLANNER_FAILURE_CLASS.NETWORK_ERROR;
@@ -77,6 +89,10 @@ export interface PlannerCandidate {
   endpoint: string;
   /** Env var NAME holding the credential — never the value. */
   credentialEnv: string;
+  /** Transport for the invocation (CPL-1): default OpenAI-compatible HTTP;
+   *  "codex_cli" routes go through the dedicated CodexPlannerProvider
+   *  spawn transport — never the governed CodexCliExecutorAdapter. */
+  transport?: "openai_http" | "codex_cli";
 }
 
 export interface PlannerAttemptRecord {
@@ -145,10 +161,15 @@ export async function runPlannerFailover(opts: {
   planFn: (c: PlannerCandidate) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
   /** Canonical per-invocation eligibility proof (role + lifecycle).
    *  Throw = authority failure (propagates); return {reject:true,...} =
-   *  failover-eligible availability rejection. */
+   *  failover-eligible availability rejection. May be async (CPL-1 R1 —
+   *  a transport's codex-first seam performs ONE bounded canonical
+   *  refresh before settling an availability rejection). */
   assertEligible: (
     c: PlannerCandidate,
-  ) => void | { reject: true; failure_class: PlannerFailureClass; reason: string };
+  ) =>
+    | void
+    | { reject: true; failure_class: PlannerFailureClass; reason: string }
+    | Promise<void | { reject: true; failure_class: PlannerFailureClass; reason: string }>;
   /** The one canonical task-preparation seam — returns the exact canonical
    *  task list the preview will pin; any throw → PLAN_INVALID failover. */
   canonicalize?: (tasks: Array<Record<string, unknown>>, c: PlannerCandidate) => Array<Record<string, unknown>>;
@@ -197,7 +218,7 @@ export async function runPlannerFailover(opts: {
     // must not look like a crashed in-flight invocation.
     let elig;
     try {
-      elig = opts.assertEligible(c);
+      elig = await opts.assertEligible(c);
     } catch (e) {
       settle({
         ...base,

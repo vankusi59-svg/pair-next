@@ -70,6 +70,13 @@ import {
   modelProbeTimeoutMs,
   modelDiscoveryTimeoutMs,
   llmPlannerTimeoutMs,
+  codexPlannerTimeoutMs,
+  codexPlannerPlan,
+  assertCodexPlannerCandidateEligibleWithRefresh,
+  refreshCodexPlannerQualification,
+  ensureCodexCliPlannerCatalog,
+  CODEX_CLI_PROVIDER_ID,
+  CODEX_CLI_ENDPOINT,
   taskTimeoutSeconds,
   planPreviewTtlSeconds,
   devinBlockedGraceMs,
@@ -105,6 +112,9 @@ import { registerSensitiveMaterial } from "../dist/pair/sanitizer.js";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const dir = process.env.PAIR_MC_DIR ?? path.join(root, ".pair-mc");
+// CPL-1 — codex planner transport scratch root (module scope: the boot
+// qualification probe AND the plan-time invoke both run under it).
+const codexPlannerScratch = path.join(dir, "planner-cli");
 fs.mkdirSync(dir, { recursive: true });
 // Reuse an existing project's workspace on restart — durable state survives
 // reboots; only mint a new ws-* dir when no project exists yet.
@@ -121,6 +131,7 @@ fs.mkdirSync(journalRoot, { recursive: true });
 const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_MS (ms, 500..120000)
 const cfgDiscoveryTimeoutMs = modelDiscoveryTimeoutMs(); // PAIR_MODEL_DISCOVERY_TIMEOUT_MS (ms, 500..120000)
 const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
+const cfgCodexPlannerTimeoutMs = codexPlannerTimeoutMs(); // PAIR_CODEX_PLANNER_TIMEOUT_MS (ms, 5000..900000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
 const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
 const cfgDevinBlockedGraceMs = devinBlockedGraceMs(); // PAIR_DEVIN_BLOCKED_GRACE_MS (ms, 5000..1800000) — blocked-clock only, never the task budget
@@ -148,8 +159,14 @@ console.log(`MC_TOKEN: resolved via ${mcToken.source} (file=${mcToken.path})`);
 // first, then fallback, then extras, in configured order (deduped on the
 // resolved canonical model_entry_id). Planner failover NEVER borrows a
 // DSH_EXECUTION model — pools stay disjoint as canonical authority.
-const PLANNER_PRIMARY_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
-const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "").trim();
+// CPL-1 — canonical planner default: codex-cli:gpt-6.1-sol is the priority-1
+// planner route (dedicated CodexPlannerProvider transport, never the
+// governed executor adapter); the existing Gemini route remains #2 and
+// configured extras follow. PAIR_PLANNER_MODEL_ROUTE / _FALLBACK_ROUTE /
+// _EXTRA_ROUTES keep full operator override — an explicit env setting
+// always wins over these defaults; an empty fallback disables it.
+const PLANNER_PRIMARY_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "codex-cli:gpt-6.1-sol").trim();
+const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
 const PLANNER_ROUTES = [PLANNER_PRIMARY_ROUTE];
 if (PLANNER_FALLBACK_ROUTE) PLANNER_ROUTES.push(PLANNER_FALLBACK_ROUTE);
 for (const extra of String(process.env.PAIR_PLANNER_EXTRA_ROUTES ?? "").split(",")) {
@@ -480,6 +497,18 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
     }
   };
 
+  // CPL-1 — seed the codex-cli provider/model into the canonical catalogs
+  // BEFORE strict route resolution whenever a planner route names
+  // `codex-cli:<model>`. The candidate then resolves to a real
+  // model_entry_id: role assignment, planner∩DSH disjointness, probe
+  // evidence, eligibility, and planner_attempt rows all bind the same
+  // identity as every other transport (smallest architecture change,
+  // same authority seam).
+  for (const r of PLANNER_ROUTES) {
+    const cm = /^codex-cli:(.+)$/.exec(r);
+    if (cm) ensureCodexCliPlannerCatalog(store, cm[1].trim(), "PAIR_MC");
+  }
+
   // Phase A — canonical role pools: resolve configured routes to catalog
   // model_entry_ids, enforce Planner∩DSH=∅ BEFORE assigning roles, then
   // record each model's role. Qualification remains a separate gate — a
@@ -557,12 +586,56 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
       return { prov, me };
     };
 
+  // CPL-1 — codex-cli planner route: qualification still runs the REAL
+  // invocation probes (CLI present + auth usable + model invocable — the
+  // typed outcome lands in provider probe_state/auth_state + model probe
+  // receipts). Unlike HTTP routes, the candidate stays IN the pool even
+  // when the probe fails: per-attempt eligibility then emits the typed
+  // FAILED planner_attempt evidence the mandate requires instead of a
+  // silently absent route. It is never invoked while ineligible — the
+  // eligibility gate blocks the spawn and failover continues.
+  // R1 — the boot qualification is the SAME canonical refresh cycle the
+  // per-attempt codex-first seam runs; cfgProbeTimeoutMs (canonical
+  // PAIR_MODEL_PROBE_TIMEOUT_MS) is the authoritative probe budget.
+  const qualifyCodexPlannerRoute = async ({ ref, pid, mid }) => {
+    const prov = pc.getProvider(pid);
+    const me = mcat.getModelByIds(pid, mid);
+    if (!prov || !me) { console.log("MODEL_ROUTE:", ref, "catalog row missing after seed — skipped"); return; }
+    const ref2 = await refreshCodexPlannerQualification(store, {
+      provider_id: pid,
+      model_entry_id: String(me.model_entry_id),
+      model: mid,
+      scratchDir: codexPlannerScratch,
+      timeoutMs: cfgProbeTimeoutMs,
+      actor: "PAIR_MC",
+    });
+    if (!ref2.provider_qualified) {
+      console.log("MODEL_ROUTE:", ref, "codex provider NOT qualified", `access=${ref2.access_outcome}`);
+    }
+    console.log("MODEL_ROUTE:", ref, ref2.model_qualified
+      ? `QUALIFIED (codex planner, probe ${ref2.model_probe_result})`
+      : `NOT qualified — candidate retained for typed failover evidence (${ref2.model_probe_result ?? ref2.access_outcome})`);
+    plannerCandidates.push({
+      model_entry_id: String(me.model_entry_id),
+      ref,
+      provider: pid,
+      model: mid,
+      endpoint: CODEX_CLI_ENDPOINT,
+      credentialEnv: "",
+      transport: "codex_cli",
+    });
+  };
+
   // Planner pool: qualified separately, never bound to DSH_EXECUTOR_ID.
   // Phase B: collect EVERY qualified route in configured order — the
   // failover chain walks them deterministically at plan time.
   // Phase E §13 — Planner qualification is independent of DSH executor
   // registration and runs whenever a Planner route is configured.
   for (const r of plannerRefs) {
+    if (r.pid === CODEX_CLI_PROVIDER_ID) {
+      await qualifyCodexPlannerRoute(r);
+      continue;
+    }
     const q = await qualifyRoute(r, false);
     if (q) {
       plannerCandidates.push({
@@ -648,7 +721,27 @@ const planExpander = async (input) => {
       // §9 — full canonical eligibility re-proved before EVERY invocation
       // (role still held, model usable, provider still eligible, never a
       // DSH_EXECUTION model/alias borrowed into planning).
-      assertEligible: (c) => assertPlannerCandidateEligible(store, c.model_entry_id),
+      // CPL-1 R1 — codex-cli candidates run the SAME canonical eligibility
+      // as HTTP candidates plus the codex-first rule: an availability
+      // rejection earns ONE bounded canonical refresh (re-probe +
+      // requalify through the canonical evidence seams, cfgProbeTimeoutMs
+      // authoritative) then a full re-proof — PASS keeps codex #1,
+      // still-fail settles the typed attempt and failover continues.
+      // Authority violations throw before any refresh (never retried).
+      assertEligible: (c) =>
+        c.transport === "codex_cli"
+          ? assertCodexPlannerCandidateEligibleWithRefresh(store, c, {
+              refresh: () =>
+                refreshCodexPlannerQualification(store, {
+                  provider_id: c.provider,
+                  model_entry_id: c.model_entry_id,
+                  model: c.model,
+                  scratchDir: codexPlannerScratch,
+                  timeoutMs: cfgProbeTimeoutMs,
+                  actor: "PAIR_PLANNER",
+                }),
+            })
+          : assertPlannerCandidateEligible(store, c.model_entry_id),
       // §6/§7 — ONE canonical task-preparation seam: sanitize + native
       // contract enrichment + the same validatePlanProposal the preview
       // pins. A non-empty raw plan failing canonical validation is
@@ -658,15 +751,28 @@ const planExpander = async (input) => {
         validatePlanProposal({ tasks: canon }, knownCapabilityIds());
         return canon;
       },
+      // CPL-1 — transport branch: codex-cli candidates invoke the
+      // dedicated CodexPlannerProvider spawn transport (planner-side
+      // only — no governed dispatch); every other route keeps the
+      // OpenAI-compatible llmPlan call. Both return the same
+      // {tasks, warnings} contract into the SAME canonicalize seam.
       planFn: (c) =>
-        llmPlan(goal, {
-          endpoint: `${c.endpoint}/chat/completions`,
-          credentialEnv: c.credentialEnv,
-          model: c.model,
-          timeoutMs: cfgPlannerTimeoutMs,
-          allowedCapabilities: LLM_PLANNER_CAPS,
-          capabilitySets: executorCapSets(),
-        }),
+        c.transport === "codex_cli"
+          ? codexPlannerPlan(goal, {
+              model: c.model,
+              timeoutMs: cfgCodexPlannerTimeoutMs,
+              scratchDir: codexPlannerScratch,
+              allowedCapabilities: LLM_PLANNER_CAPS,
+              capabilitySets: executorCapSets(),
+            })
+          : llmPlan(goal, {
+              endpoint: `${c.endpoint}/chat/completions`,
+              credentialEnv: c.credentialEnv,
+              model: c.model,
+              timeoutMs: cfgPlannerTimeoutMs,
+              allowedCapabilities: LLM_PLANNER_CAPS,
+              capabilitySets: executorCapSets(),
+            }),
       onAttemptStart: (base) =>
         persistPlannerAttemptStart(store, {
           planner_run_id: String(run.planner_run_id),

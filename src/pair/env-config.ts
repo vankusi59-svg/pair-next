@@ -63,10 +63,12 @@ export function readPositiveIntEnv(
 
 /* --------------------------- documented knobs --------------------------- */
 
-/** Model/provider liveness probe budget. Unit: milliseconds. Bounds 0.5s–120s. */
+/** Model/provider liveness probe budget. Unit: milliseconds. Bounds 0.5s–120s.
+ *  CPL-1 R1 §7 — canonical default 60s; transport-specific code must not
+ *  substitute its own floor/ceiling for the configured value. */
 export const MODEL_PROBE_TIMEOUT = {
   name: "PAIR_MODEL_PROBE_TIMEOUT_MS",
-  defaultValue: 8_000,
+  defaultValue: 60_000,
   bounds: { min: 500, max: 120_000, unit: "ms" },
 } as const;
 
@@ -85,6 +87,15 @@ export const LLM_PLANNER_TIMEOUT = {
   name: "PAIR_LLM_PLANNER_TIMEOUT_MS",
   defaultValue: 20_000,
   bounds: { min: 2_000, max: 900_000, unit: "ms" },
+} as const;
+
+/** CPL-1 — Codex CLI plan-generation budget (a real `codex exec` plan can
+ *  run minutes; R1 §9 — default 15 minutes, independent from the
+ *  PAIR_MODEL_PROBE_TIMEOUT_MS liveness budget). Unit: ms. Bounds 5s–900s. */
+export const CODEX_PLANNER_TIMEOUT = {
+  name: "PAIR_CODEX_PLANNER_TIMEOUT_MS",
+  defaultValue: 900_000,
+  bounds: { min: 5_000, max: 900_000, unit: "ms" },
 } as const;
 
 /** Governed task execution budget. Unit: seconds. Bounds 5s–7200s. */
@@ -138,6 +149,10 @@ export function modelDiscoveryTimeoutMs(env: EnvLike = process.env as EnvLike): 
 
 export function llmPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(LLM_PLANNER_TIMEOUT.name, LLM_PLANNER_TIMEOUT.defaultValue, LLM_PLANNER_TIMEOUT.bounds, env);
+}
+
+export function codexPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(CODEX_PLANNER_TIMEOUT.name, CODEX_PLANNER_TIMEOUT.defaultValue, CODEX_PLANNER_TIMEOUT.bounds, env);
 }
 
 export function taskTimeoutSeconds(env: EnvLike = process.env as EnvLike): number {

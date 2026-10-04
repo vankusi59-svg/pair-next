@@ -215,10 +215,17 @@ export interface PlannerEligibilityRejection {
   failure_class: PlannerFailureClass;
   reason: string;
 }
-export function assertPlannerCandidateEligible(
+
+/**
+ * Role + planner/DSH disjointness proof shared by every planner-candidate
+ * eligibility check (HTTP and Codex CLI transports, CPL-1). Throws on
+ * authority violations — never a failover verdict. Returns the model_entry
+ * row on success.
+ */
+export function assertPlannerRoleAndDisjoint(
   store: PairEvidenceStore,
   modelEntryId: string,
-): PlannerEligibilityRejection | void {
+): Record<string, unknown> {
   assertPlannerModelRole(store, modelEntryId);
   const mid = String(modelEntryId);
   const model = store.get("model_entry", mid);
@@ -232,6 +239,15 @@ export function assertPlannerCandidateEligible(
       );
     }
   }
+  return model;
+}
+
+export function assertPlannerCandidateEligible(
+  store: PairEvidenceStore,
+  modelEntryId: string,
+): PlannerEligibilityRejection | void {
+  const mid = String(modelEntryId);
+  const model = assertPlannerRoleAndDisjoint(store, mid);
   const elig = providerModelEligibility(
     store,
     String(model.provider_id ?? model.provider_family ?? ""),
