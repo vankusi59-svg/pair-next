@@ -262,14 +262,31 @@ export async function runPlannerFailover(opts: {
       if (opts.canonicalize) {
         try {
           canonical = opts.canonicalize(res.tasks, c);
-        } catch {
+        } catch (e) {
+          // P-GRAMMAR2 §3 — bounded typed observability: surface the
+          // thrown canonical-validation code on the attempt (bounded
+          // length, strict charset) alongside the class marker — never
+          // exception messages, stack traces, or secret material.
+          const code =
+            e &&
+            typeof e === "object" &&
+            typeof (e as { code?: unknown }).code === "string"
+              ? String((e as { code: string }).code).slice(0, 80)
+              : "";
+          const coded = /^[A-Z0-9_:.\-]+$/.test(code)
+            ? `VALIDATION_CODE:${code}`
+            : null;
           settle({
             ...base,
             completed_at: now(),
             latency_ms: Date.now() - t0,
             outcome: "FAILED",
             failure_class: PLANNER_FAILURE_CLASS.PLAN_INVALID,
-            warnings: [...res.warnings.slice(0, 9), "CANONICAL_VALIDATION_FAILED"],
+            warnings: [
+              ...res.warnings.slice(0, coded ? 8 : 9),
+              ...(coded ? [coded] : []),
+              "CANONICAL_VALIDATION_FAILED",
+            ],
           });
           continue;
         }
