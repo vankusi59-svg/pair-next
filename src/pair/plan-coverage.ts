@@ -204,7 +204,13 @@ function taskProducesDeliverable(task: Record<string, unknown>, name: string): b
 /* constraints + prohibitions                                          */
 /* ------------------------------------------------------------------ */
 
-const TASK_AMOUNT_RE = /\$\s*(\d+(?:\.\d+)?)/g;
+/** Checkable task amounts — common explicit forms of the SAME unit the
+ *  constraint states (`$50` ≡ `50 USD` ≡ `USD 50`; no conversion). */
+const TASK_AMOUNT_RES = [
+  /\$\s*(\d+(?:\.\d+)?)/g,
+  /\b(\d+(?:\.\d+)?)\s*usd\b/gi,
+  /\busd\s*(\d+(?:\.\d+)?)/gi,
+];
 const TELEGRAM_PROHIBITED_TERMS = new Set(["telegram", "tele", "bot"]);
 
 /** Bounded channel/platform vocabulary for `only <channel>` constraints:
@@ -256,9 +262,11 @@ function violatesOnlyConstraint(instr: string, onlyTerms: string[]): string | nu
 
 function instructionAmounts(instr: string): number[] {
   const out: number[] = [];
-  TASK_AMOUNT_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = TASK_AMOUNT_RE.exec(instr)) !== null) out.push(Number(m[1]));
+  for (const re of TASK_AMOUNT_RES) {
+    re.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(instr)) !== null) out.push(Number(m[1]));
+  }
   return out;
 }
 
@@ -359,37 +367,56 @@ export function assertPlanCoverage(
     // checkable quantity (e.g. a budget ceiling): a task instruction
     // asserting a larger explicit amount is a proven contradiction.
     if (req.maxAmount !== undefined) {
+      let sawAmount = false;
       for (const t of work) {
         const instr = String(t.task_instruction ?? "");
         for (const amt of instructionAmounts(instr)) {
+          sawAmount = true;
           if (amt > req.maxAmount) {
             violated(req, `task ${String(t.task_key)} asserts amount ${amt} > budget ${req.maxAmount}`);
           }
         }
       }
-      rows.push({ requirement_id: req.id, kind: req.kind, state: "PROVEN", task_keys: [] });
+      // No checkable amount → preserved, never claimed proven.
+      rows.push({
+        requirement_id: req.id,
+        kind: req.kind,
+        state: sawAmount ? "PROVEN" : "PRESERVED",
+        task_keys: [],
+      });
       continue;
     }
-    // `only X` bounds: deterministic contradiction detection — a task
-    // invoking a known sibling of the permitted value (mql4 for an
-    // mql5-only constraint, slack for a telegram-only one) is a proven
-    // violation; absence of the dimension is not proof either way.
+    // `only X` bounds: a mandatory bounded constraint may not be
+    // silently dropped — the permitted value must be carried into the
+    // relevant executable work. A known sibling → VIOLATION; nothing
+    // carrying the value → the constraint is uncovered → INCOMPLETE.
     if (req.onlyTerms?.length) {
-      let sawEvidence = false;
       for (const t of work) {
         const instr = String(t.task_instruction ?? "");
         const bad = violatesOnlyConstraint(instr, req.onlyTerms);
         if (bad) {
           violated(req, `task ${String(t.task_key)} invokes "${bad}" excluded by only=${req.onlyTerms.join(",")}`);
         }
-        for (const term of req.onlyTerms) {
-          if (onlyConstraintEvidence(instr, term)) sawEvidence = true;
-        }
       }
+      const carries = (t: Record<string, unknown>, term: string): boolean =>
+        onlyConstraintEvidence(String(t.task_instruction ?? ""), term);
+      // Relevance binding: the value must be carried by the constrained
+      // work itself — a requirement-covering task (never bookkeeping,
+      // never an unrelated dummy that merely mentions the term). A
+      // channel `only` binds tasks that engage that channel dimension.
+      const coversMandatory = (t: Record<string, unknown>): boolean =>
+        contract.obligations.some((o) => covers(t, o)) ||
+        contract.deliverables.some((d) => covers(t, d));
+      const satisfied = req.onlyTerms.every((term) =>
+        work.some((t) =>
+          carries(t, term) && (ONLY_CHANNELS.has(term) || coversMandatory(t)),
+        ),
+      );
+      if (!satisfied) incomplete(req);
       rows.push({
         requirement_id: req.id,
         kind: req.kind,
-        state: sawEvidence ? "PROVEN" : "PRESERVED",
+        state: "PROVEN",
         task_keys: [],
       });
       continue;

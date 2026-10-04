@@ -248,15 +248,16 @@ describe("PRV2-B coverage authority", () => {
 
   it("coverage states: budget PROVEN, deadline PRESERVED, unverifiable constraint never PROVEN", () => {
     const contract: GoalContract = extractGoalContract(
-      "analyze market, budget <= $50, use only MQL5, deadline Friday",
+      "analyze market, budget <= $50, use only MQL5, in english, deadline Friday",
     );
     const report = assertPlanCoverage(contract, [
       canonicalBookkeepingTask("g") as Record<string, unknown>,
-      work("T1", "analyze market within a $20 budget", ["REASONING"]),
+      work("T1", "analyze market within a $20 budget using MQL5 data", ["REASONING"]),
     ]);
     const byId = new Map(report.rows.map((r) => [r.requirement_id, r]));
     expect(byId.get("CON_001")?.state).toBe("PROVEN");
-    expect(byId.get("CON_002")?.state).toBe("PRESERVED");
+    expect(byId.get("CON_002")?.state).toBe("PROVEN");
+    expect(byId.get("CON_003")?.state).toBe("PRESERVED");
     expect(byId.get("DDL_001")?.state).toBe("PRESERVED");
   });
 
@@ -371,14 +372,21 @@ describe("PRV2-B R1.B — bounded only-constraint contradiction detection", () =
     );
   });
 
-  it("R1.B-5: unverifiable only-bound stays PRESERVED — never claimed PROVEN", () => {
-    const contract = extractGoalContract("analyze market, use only candlesticks");
-    const report = assertPlanCoverage(contract, [
-      canonicalBookkeepingTask("g") as Record<string, unknown>,
-      work("T1", "analyze the market", ["REASONING"]),
-    ]);
-    const row = report.rows.find((r) => r.requirement_id === "CON_001");
-    expect(row?.state).toBe("PRESERVED");
+  it("R1.B-5: unverifiable only-bound — carried → PROVEN, silently dropped → INCOMPLETE", () => {
+    // "use only candlesticks": no enumerable sibling space → never a
+    // VIOLATION, but an uncovered bound is still a dropped constraint.
+    const carried = assertPlanCoverage(
+      extractGoalContract("analyze market, use only candlesticks"),
+      [
+        canonicalBookkeepingTask("g") as Record<string, unknown>,
+        work("T1", "analyze the market using candlesticks", ["REASONING"]),
+      ],
+    );
+    expect(carried.rows.find((r) => r.requirement_id === "CON_001")?.state).toBe("PROVEN");
+    expectCode(
+      () => canon([work("T1", "analyze the market", ["REASONING"])], "analyze market, use only candlesticks"),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
   });
 
   it("R1.B-6: budget ceiling behavior retained alongside only-constraints", () => {
@@ -426,6 +434,82 @@ describe("PRV2-B R1.C — deliverable matching uses canonical artifactNamesEquiv
         ),
       "FAIL_CLOSED_PLAN_INCOMPLETE",
     );
+  });
+});
+
+/* ------------- R2 — bounded constraints must be carried ------------- */
+
+describe("PRV2-B R2 — a mandatory bounded constraint may not be silently dropped", () => {
+  const GOAL_ONLY2 = "research current EA market, use only MQL5";
+
+  it("R2-1: generic covering task never carried the bound → INCOMPLETE", () => {
+    expectCode(
+      () => canon([work("T1", "research current EA market", ["REASONING", "NETWORK_ACCESS"])], GOAL_ONLY2),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+
+  it("R2-2: sibling task MQL4 → CONSTRAINT_VIOLATION (retained)", () => {
+    expectCode(
+      () => canon([work("T1", "research current MQL4 EAs", ["REASONING", "NETWORK_ACCESS"])], GOAL_ONLY2),
+      "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("R2-3: covering task carrying MQL5 → PASS", () => {
+    expect(
+      canon([work("T1", "research current MQL5 EAs", ["REASONING", "NETWORK_ACCESS"])], GOAL_ONLY2).length,
+    ).toBe(2);
+  });
+
+  it("R2-4: unrelated dummy task mentioning MQL5 does not grant coverage", () => {
+    expectCode(
+      () =>
+        canon(
+          [
+            work("T1", "research current EA market", ["REASONING", "NETWORK_ACCESS"]),
+            work("T2", "write a note mentioning MQL5 once", ["REASONING"], ["T1"]),
+          ],
+          GOAL_ONLY2,
+        ),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+
+  it("R2-5: bookkeeping never satisfies an only-bound", () => {
+    const report = () =>
+      assertPlanCoverage(extractGoalContract(GOAL_ONLY2), [
+        canonicalBookkeepingTask("g") as Record<string, unknown>,
+      ]);
+    expectCode(report, "FAIL_CLOSED_PLAN_INCOMPLETE");
+  });
+
+  it("R2-6: budget — '100 USD' form → CONSTRAINT_VIOLATION", () => {
+    expectCode(
+      () => canon([work("T1", "analyze pricing using 100 USD", ["REASONING"])], "analyze pricing, budget <= $50"),
+      "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("R2-7: budget — 'USD 100' form → CONSTRAINT_VIOLATION", () => {
+    expectCode(
+      () => canon([work("T1", "analyze pricing using USD 100", ["REASONING"])], "analyze pricing, budget <= $50"),
+      "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("R2-8: budget — task amount within ceiling ($40) → PASS", () => {
+    expect(
+      canon([work("T1", "analyze pricing within $40", ["REASONING"])], "analyze pricing, budget <= $50").length,
+    ).toBe(2);
+  });
+
+  it("R2-9: budget with no checkable task amount → PRESERVED, never PROVEN", () => {
+    const report = assertPlanCoverage(extractGoalContract("analyze pricing, budget <= $50"), [
+      canonicalBookkeepingTask("g") as Record<string, unknown>,
+      work("T1", "analyze pricing carefully", ["REASONING"]),
+    ]);
+    expect(report.rows.find((r) => r.requirement_id === "CON_001")?.state).toBe("PRESERVED");
   });
 });
 

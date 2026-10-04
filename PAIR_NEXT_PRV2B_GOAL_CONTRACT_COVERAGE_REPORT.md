@@ -265,3 +265,46 @@ leaks across directories) — INCOMPLETE.
   `pnpm audit` — 0 high (1 low + 8 moderate, unchanged).
 
 Classification: `PAIR_NEXT_PRV2B_GOAL_CONTRACT_COVERAGE_R1_PENDING_AUDIT`
+
+---
+
+## R2 remediation (audited base `9b71a35`, same PR #42)
+
+Independent audit confirms R1.A/B/C closed; ONE issue remained and is
+closed below.
+
+### R2 — a recognized bounded constraint may not be silently dropped
+
+R1 marked an `only`-constraint `PRESERVED` when no task carried the
+permitted value — meaning the operator's explicit bound could vanish
+from the executable plan. Now:
+
+- **Sibling contradiction → VIOLATED** (unchanged R1.B semantics).
+- **Carriage required**: for every `onlyTerm`, at least one canonical
+  work task must carry the permitted value — else the constraint is
+  uncovered → `FAIL_CLOSED_PLAN_INCOMPLETE` (never PRESERVED-as-success).
+- **Relevance binding**: the carrying task must be the constrained work
+  — for non-channel terms it must cover ≥1 obligation/deliverable, so an
+  unrelated dummy mentioning `MQL5` never grants coverage and
+  bookkeeping never satisfies a bound; channel `only` terms bind tasks
+  engaging that channel. Proven:
+  `research current EA market` under `use only MQL5` → INCOMPLETE;
+  `research current MQL4 EAs` → VIOLATION; `research current MQL5 EAs` →
+  PASS; `T1 research EA market + T2 note mentioning MQL5` → INCOMPLETE.
+- **Budget currency forms**: checkable amounts now include `$100`,
+  `100 USD`, `USD 100` — same-unit comparison only, no conversion.
+  `100 USD` / `USD 100` under `budget <= $50` → VIOLATION; `$40` → PASS.
+  A task carrying no checkable amount now leaves the budget row
+  `PRESERVED`, never `PROVEN`.
+
+### R2 validation
+
+- Focused: PRV2-B **45/45** (36 retained/updated + 9 R2 adversarial).
+- Regression battery **711/711** (PRV2-A 59, F1×3, F2×4, F3×4, F4, F5,
+  DSN-1, telegram, dataflow-incident, CPL-1, CNI-1).
+- Full suite: **3490 pass / 2 fail** — same 2 environment-only P5
+  failures as baseline (3481 + 9 new).
+- `tsc --noEmit` clean; `rm -rf dist && pnpm build` clean;
+  `pnpm audit` — 0 high (1 low + 8 moderate, unchanged).
+
+Classification: `PAIR_NEXT_PRV2B_GOAL_CONTRACT_COVERAGE_R2_PENDING_AUDIT`
