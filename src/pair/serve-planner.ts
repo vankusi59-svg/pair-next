@@ -34,6 +34,7 @@ import {
   goalRequiresCurrentExternalData,
   taskRequiresNetworkAccess,
   instructionIsDataGathering,
+  instructionSatisfiesGoalSubject,
 } from "./llm-planner.js";
 import {
   reconcilePlanDataflow,
@@ -197,9 +198,14 @@ export function makeServeCanonicalizer(deps: {
     if (goalRequiresCurrentExternalData(goal)) {
       const legitimate = tasks.some((t) => {
         const caps = (t.required_capabilities as string[] | undefined) ?? [];
+        const instr = String(t.task_instruction ?? "");
         return (
           caps.includes("NETWORK_ACCESS") &&
-          instructionIsDataGathering(String(t.task_instruction ?? ""))
+          instructionIsDataGathering(instr) &&
+          // R4 — subject binding: the task must gather the subject the
+          // goal's current-data obligation is about, not merely be a
+          // legitimate gatherer of something unrelated.
+          instructionSatisfiesGoalSubject(instr, goal)
         );
       });
       if (!legitimate) {

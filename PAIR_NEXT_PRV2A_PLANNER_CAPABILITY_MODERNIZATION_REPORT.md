@@ -496,3 +496,58 @@ unchanged and passing.
 Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R3_PENDING_AUDIT`
 
 STOP — pending independent audit. DO NOT MERGE.
+
+---
+
+## R4 — goal↔task subject binding for the network requirement
+
+Audited base: `4155af5f83958ab854ae61a15e103033968da84a` (PR #41, R3).
+Finding closed: the goal-level gate accepted ANY legitimate
+NETWORK_ACCESS gatherer — an unrelated real gatherer ("fetch the latest
+gold price") could satisfy "Research the latest GPT models".
+
+### Design — bounded lexical subject proof (no semantic classifier)
+
+- `externalSubjectKeys(text)` — canonical subject lexemes present in a
+  text: the detector's subject vocabulary singular-normalized
+  ("models"→"model") plus a small alias map (btc→bitcoin, eth→ethereum,
+  xau/xauusd→gold) and a VI→EN phrase map (mô hình→model, tin tức/tin/
+  báo→news, giá→price, vàng→gold, thị trường→market, tỷ giá→rate,
+  phiên bản→version, dữ liệu/thông tin/báo cáo→data/information/
+  report) — a Vietnamese goal binds a Vietnamese task by SUBJECT, not
+  literal wording.
+- `instructionSatisfiesGoalSubject(instr, goal)` — true iff the task's
+  subject keys overlap the goal's (one shared canonical lexeme is
+  sufficient, same conservative family); vacuous when the goal yields
+  no lexemes (plain data-gathering rule then applies).
+- `makeServeCanonicalizer` legitimacy now requires all three:
+  `NETWORK_ACCESS` cap AND `instructionIsDataGathering(instr)` AND
+  `instructionSatisfiesGoalSubject(instr, goal)`. The task-level gate
+  `FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED` is unchanged.
+
+### Adversarial proofs
+
+- Goal "Research the latest GPT models" + T1 NETWORK "fetch the latest
+  gold price" + T2 REASONING "analyze GPT models" →
+  `FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED` (T1 gathers but binds
+  no goal subject).
+- Same goal + T1 NETWORK "research the latest GPT models and return
+  current findings" → PASS.
+- VI: goal "Nghiên cứu các EA MQL5 mới nhất" + "lấy giá vàng hôm nay"
+  → REJECT; + "nghiên cứu các EA MQL5 mới nhất" → PASS.
+- Alias bindings proven: "latest BTC quote" binds "current bitcoin
+  price"; "latest XAUUSD quote" binds "current gold price".
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused `pair-prv2a-planner-modernization` | **49/49 PASS** (45 + 4 R4) |
+| Regression battery (16 files) | **607/607 PASS** |
+| `npx tsc --noEmit` | clean |
+| `rm -rf dist && pnpm build` | PASS |
+| Full suite | **3435 pass / 2 failed** — same 2 env-only P5 fails as baseline |
+
+Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R4_PENDING_AUDIT`
+
+STOP — pending independent audit. DO NOT MERGE.

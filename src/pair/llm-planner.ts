@@ -236,6 +236,72 @@ export function instructionIsDataGathering(instruction: string): boolean {
   );
 }
 
+/* ---------------- PRV2-A R4 — goal↔task subject binding -------------------
+ * The NETWORK_ACCESS task satisfying a goal-level current-data
+ * obligation must gather data RELEVANT to that obligation. A bounded
+ * lexical proof: extract the canonical external-subject lexemes present
+ * in each text (same vocabulary family as the detector, singular-
+ * normalized, small alias map) and require a non-empty overlap. No
+ * semantic classifier; one shared canonical lexeme is sufficient
+ * binding — conservative like the rest of the detector. */
+
+const SUBJECT_LEXEMES = new Set([
+  "model", "version", "release", "api", "product", "price", "news",
+  "weather", "rate", "exchange", "forex", "stock", "market", "crypto",
+  "bitcoin", "ethereum", "gold", "ea", "mql4", "mql5", "package",
+  "listing", "framework", "tool", "provider", "offering", "announcement",
+  "feed", "article", "headline", "trend", "quote", "forecast", "outlook",
+  "score", "library", "sdk", "plugin", "service", "competitor", "event",
+  "update", "information", "data", "report", "result",
+]);
+
+const SUBJECT_ALIAS: Record<string, string> = {
+  btc: "bitcoin", eth: "ethereum", xau: "gold", xauusd: "gold",
+};
+
+/** Vietnamese subject phrases → canonical English keys so a VI goal
+ *  binds a VI task by subject, not by literal wording. */
+const VI_SUBJECT_PHRASES: Array<[RegExp, string]> = [
+  [/mô hình/iu, "model"], [/phiên bản/iu, "version"],
+  [/tin tức|\btin\b|\bbáo\b/iu, "news"], [/thời tiết/iu, "weather"],
+  [/thị trường/iu, "market"], [/tỷ giá/iu, "rate"],
+  [/giá/iu, "price"], [/\bvàng\b/iu, "gold"],
+  [/dữ liệu/iu, "data"], [/thông tin/iu, "information"],
+  [/báo cáo/iu, "report"],
+];
+
+/** Canonical external-subject keys present in a text (e.g. "models" →
+ *  "model", "btc" → "bitcoin", "giá vàng" → {"price","gold"}). */
+export function externalSubjectKeys(text: string): Set<string> {
+  const t = String(text ?? "");
+  const keys = new Set<string>();
+  for (const m of t.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+    let key = SUBJECT_ALIAS[m[0]] ?? m[0];
+    if (!SUBJECT_LEXEMES.has(key) && key.endsWith("s")) {
+      const stem = key.slice(0, -1);
+      if (SUBJECT_LEXEMES.has(stem)) key = stem;
+    }
+    if (SUBJECT_LEXEMES.has(key)) keys.add(key);
+  }
+  for (const [re, key] of VI_SUBJECT_PHRASES) if (re.test(t)) keys.add(key);
+  return keys;
+}
+
+/** Does the task instruction plausibly gather the subject the goal's
+ *  current-data obligation is about? One shared canonical lexeme is
+ *  sufficient binding. When the goal yields no lexemes at all the
+ *  subject proof is vacuous — the plain data-gathering check applies. */
+export function instructionSatisfiesGoalSubject(
+  instruction: string,
+  goal: string,
+): boolean {
+  const goalKeys = externalSubjectKeys(goal);
+  if (goalKeys.size === 0) return true;
+  const taskKeys = externalSubjectKeys(instruction);
+  for (const k of taskKeys) if (goalKeys.has(k)) return true;
+  return false;
+}
+
 export interface LlmPlannerConfig {
   /** Provider chat/completions URL (P6 endpoint_reference). */
   endpoint: string;

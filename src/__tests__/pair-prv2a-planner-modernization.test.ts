@@ -31,6 +31,8 @@ import {
   goalRequiresCurrentExternalData,
   taskRequiresNetworkAccess,
   instructionIsDataGathering,
+  instructionSatisfiesGoalSubject,
+  externalSubjectKeys,
   WORK_TASK_HARD_CEILING,
 } from "../pair/llm-planner.js";
 import {
@@ -992,5 +994,69 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
         ),
       TASK_NET_REQ,
     );
+  });
+
+  it("R4-det: subject extraction + binding — canonical lexemes, plural/alias/VI normalization", () => {
+    expect([...externalSubjectKeys("Research the latest GPT models")]).toEqual(["model"]);
+    expect(externalSubjectKeys("fetch the current gold price")).toEqual(new Set(["gold", "price"]));
+    expect(externalSubjectKeys("lấy giá vàng hôm nay")).toEqual(new Set(["price", "gold"]));
+    expect(externalSubjectKeys("Nghiên cứu các EA MQL5 mới nhất")).toEqual(new Set(["ea", "mql5"]));
+    expect(instructionSatisfiesGoalSubject("fetch the latest gold price", "Research the latest GPT models")).toBe(false);
+    expect(instructionSatisfiesGoalSubject("research the latest GPT models and return current findings", "Research the latest GPT models")).toBe(true);
+    expect(instructionSatisfiesGoalSubject("lấy giá vàng hôm nay", "Nghiên cứu các EA MQL5 mới nhất")).toBe(false);
+    expect(instructionSatisfiesGoalSubject("nghiên cứu các EA MQL5 mới nhất", "Nghiên cứu các EA MQL5 mới nhất")).toBe(true);
+    // aliases: btc≡bitcoin, xauusd≡gold, vi subject maps
+    expect(instructionSatisfiesGoalSubject("fetch the latest BTC quote", "get the current bitcoin price")).toBe(true);
+    expect(instructionSatisfiesGoalSubject("fetch the latest XAUUSD quote", "get the current gold price")).toBe(true);
+  });
+
+  it("R4-N10 (adversarial): unrelated real gatherer does NOT satisfy the goal's current-data subject", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "fetch the latest gold price", ["NETWORK_ACCESS", "REASONING"]),
+            work("T2", "analyze GPT models", ["REASONING"], ["T1"]),
+          ],
+          "Research the latest GPT models",
+        ),
+      PLAN_NET_REQ,
+    );
+  });
+
+  it("R4-N11: subject-bound NETWORK gatherer → PASS", () => {
+    const out = canon(
+      [
+        work("T1", "research the latest GPT models and return current findings", [
+          "NETWORK_ACCESS",
+          "REASONING",
+        ]),
+      ],
+      "Research the latest GPT models",
+    );
+    expect(out.map((t) => t.task_key)).toEqual(["T1", "T2"]);
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R4-N12 (adversarial, VI): 'lấy giá vàng hôm nay' cannot satisfy 'Nghiên cứu các EA MQL5 mới nhất'", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "lấy giá vàng hôm nay", ["NETWORK_ACCESS", "REASONING"]),
+            work("T2", "phân tích các EA", ["REASONING"], ["T1"]),
+          ],
+          "Nghiên cứu các EA MQL5 mới nhất",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "nghiên cứu các EA MQL5 mới nhất", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "Nghiên cứu các EA MQL5 mới nhất",
+    );
+    expect(out.map((t) => t.task_key)).toEqual(["T1", "T2"]);
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
   });
 });
