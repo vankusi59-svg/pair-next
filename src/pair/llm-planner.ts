@@ -95,7 +95,9 @@ function envGet(env: LlmPlannerConfig["env"], name: string): string | undefined 
   return typeof env === "function" ? env(name) : env[name];
 }
 
-/** Extract the first balanced {...} JSON object from LLM text output. */
+/** Extract the first balanced {...} JSON object from LLM text output.
+ *  Exported as extractPlanJson for the Codex CLI planner transport
+ *  (CPL-1) — every transport parses plan text through ONE seam. */
 function extractJson(text: string): unknown {
   const stripped = text.replace(/```(?:json)?/g, "").trim();
   const start = stripped.indexOf("{");
@@ -120,6 +122,7 @@ function extractJson(text: string): unknown {
   }
   throw new PolicyError("LLM_PLAN_UNBALANCED_JSON", "planner.parse");
 }
+export const extractPlanJson = extractJson;
 
 /**
  * Capabilities served by remote executors whose outputs live on the remote
@@ -270,26 +273,23 @@ Rules:
 - Keep task instructions concrete and verifiable; end with "then reply DONE."
 - No prose, no markdown — JSON only.`;
 
-export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmPlanResult> {
+/**
+ * The ONE canonical planner prompt — shared by every planner transport
+ * (OpenAI-compatible HTTP and the Codex CLI planner provider, CPL-1).
+ * Any drift between transports is a contract violation: all candidates
+ * must answer the same prompt under the same task-shape authority.
+ */
+export function buildPlannerUserPrompt(
+  goal: string,
+  cfg: {
+    allowedCapabilities: string[];
+    capabilitySets?: string[][];
+    maxTasks?: number;
+    replanContext?: LlmPlannerConfig["replanContext"];
+  },
+): string {
   const maxTasks = cfg.maxTasks ?? LLM_PLANNER_DEFAULT_MAX_TASKS;
-  const timeoutMs = cfg.timeoutMs ?? LLM_PLANNER_DEFAULT_TIMEOUT_MS;
-  const apiKey = envGet(cfg.env, cfg.credentialEnv);
-  const fetchImpl = cfg.fetchFn ?? fetch;
-
-  // Fail closed on unusable plans: tasks=[] signals "no plan" — the caller
-  // must reject submission rather than silently run the T1-only bookkeeping
-  // plan, which would execute nothing yet report COMPLETED (seen live).
-  const reject = (warnings: string[]): LlmPlanResult => ({
-    tasks: [],
-    source: "FALLBACK",
-    model: cfg.model,
-    warnings,
-  });
-
-  if (!apiKey) return reject(["LLM_PLANNER_NO_CREDENTIAL"]);
-  if (!cfg.allowedCapabilities.length) return reject(["LLM_PLANNER_NO_CAPS"]);
-
-  const userPrompt =
+  return (
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +
     `MAX_TASKS: ${maxTasks}\n` +
     (cfg.capabilitySets?.length
@@ -309,7 +309,34 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
         `Propose a genuinely different feasible plan for the SAME goal: change the artifact flow or task decomposition so the named failure cannot recur (e.g. make the needed artifact the explicit output of an earlier producer task and name the same path in the consumer's instruction). ` +
         `Preserve every unrelated constraint (capabilities allowed, DAG rules, telegram rules) and request no wider permissions than the failed plan.\n`
       : "") +
-    `\nMISSION GOAL:\n${goal}`;
+    `\nMISSION GOAL:\n${goal}`
+  );
+}
+
+export function plannerSystemPrompt(): string {
+  return SYSTEM_PROMPT;
+}
+
+export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmPlanResult> {
+  const maxTasks = cfg.maxTasks ?? LLM_PLANNER_DEFAULT_MAX_TASKS;
+  const timeoutMs = cfg.timeoutMs ?? LLM_PLANNER_DEFAULT_TIMEOUT_MS;
+  const apiKey = envGet(cfg.env, cfg.credentialEnv);
+  const fetchImpl = cfg.fetchFn ?? fetch;
+
+  // Fail closed on unusable plans: tasks=[] signals "no plan" — the caller
+  // must reject submission rather than silently run the T1-only bookkeeping
+  // plan, which would execute nothing yet report COMPLETED (seen live).
+  const reject = (warnings: string[]): LlmPlanResult => ({
+    tasks: [],
+    source: "FALLBACK",
+    model: cfg.model,
+    warnings,
+  });
+
+  if (!apiKey) return reject(["LLM_PLANNER_NO_CREDENTIAL"]);
+  if (!cfg.allowedCapabilities.length) return reject(["LLM_PLANNER_NO_CAPS"]);
+
+  const userPrompt = buildPlannerUserPrompt(goal, cfg);
 
   // One attempt: fetch + parse + sanitize into a task DAG (or warnings).
   const attempt = async (): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }> => {

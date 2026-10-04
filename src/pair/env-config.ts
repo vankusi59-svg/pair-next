@@ -87,6 +87,14 @@ export const LLM_PLANNER_TIMEOUT = {
   bounds: { min: 2_000, max: 900_000, unit: "ms" },
 } as const;
 
+/** CPL-1 — Codex CLI planner invocation budget (a real `codex exec` takes
+ *  10–60s; distinct from the HTTP planner budget). Unit: ms. Bounds 5s–900s. */
+export const CODEX_PLANNER_TIMEOUT = {
+  name: "PAIR_CODEX_PLANNER_TIMEOUT_MS",
+  defaultValue: 120_000,
+  bounds: { min: 5_000, max: 900_000, unit: "ms" },
+} as const;
+
 /** Governed task execution budget. Unit: seconds. Bounds 5s–7200s. */
 export const TASK_TIMEOUT = {
   name: "PAIR_TASK_TIMEOUT_S",
@@ -138,6 +146,10 @@ export function modelDiscoveryTimeoutMs(env: EnvLike = process.env as EnvLike): 
 
 export function llmPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(LLM_PLANNER_TIMEOUT.name, LLM_PLANNER_TIMEOUT.defaultValue, LLM_PLANNER_TIMEOUT.bounds, env);
+}
+
+export function codexPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(CODEX_PLANNER_TIMEOUT.name, CODEX_PLANNER_TIMEOUT.defaultValue, CODEX_PLANNER_TIMEOUT.bounds, env);
 }
 
 export function taskTimeoutSeconds(env: EnvLike = process.env as EnvLike): number {
