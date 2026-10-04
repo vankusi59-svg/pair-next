@@ -40,6 +40,7 @@ import {
   ArtifactDependencyResolver,
   ArtifactProvenanceValidator,
   ApprovalQueue,
+  artifactNamesEquivalent,
   canonicalArtifactId,
   DependencyResolutionError,
   digest,
@@ -682,5 +683,88 @@ describe("DSN-1 — consume-name spelling normalization", () => {
     // file was never a source, and is physically untouched.
     expect(fs.readFileSync(path.join(ctx.workspace, written[0]!))).toEqual(prod.bytes);
     expect(fs.readFileSync(path.join(ctx.workspace, "data.json"), "utf8")).toBe("STALE-BYTES");
+  });
+
+  /* ------------------------- DSN-1 R1 — pairwise equivalence ------------ */
+
+  it("R1.A — same basename in different directories is NOT equivalent (no transitive outbox-alias binding)", () => {
+    const ctx = makeCtx("r1a");
+    // The mandated truth table — pairwise-direct equivalence only.
+    expect(artifactNamesEquivalent("chart.png", "chart.png")).toBe(true);
+    expect(artifactNamesEquivalent("chart.png", "outbox/chart.png")).toBe(true);
+    expect(artifactNamesEquivalent("outbox/chart.png", "chart.png")).toBe(true);
+    expect(artifactNamesEquivalent("dir/chart.png", "outbox/chart.png")).toBe(true);
+    expect(artifactNamesEquivalent("outbox/chart.png", "dir/chart.png")).toBe(true);
+    expect(artifactNamesEquivalent("dirA/chart.png", "dirB/chart.png")).toBe(false);
+    expect(artifactNamesEquivalent("chart.png", "dir/chart.png")).toBe(false);
+    expect(
+      artifactNamesEquivalent(
+        "reports/internal/report.md",
+        "reports/customer/report.md",
+      ),
+    ).toBe(false);
+    // Unnormalizable input still fails closed to false.
+    expect(artifactNamesEquivalent("a/../b.txt", "outbox/b.txt")).toBe(false);
+
+    // Producer 'reports/internal/report.md' can never satisfy consume
+    // 'reports/customer/report.md' — pre-fix both names generated the
+    // staged spelling 'outbox/report.md' and INTERSECTED, so the consume
+    // bound the unrelated canonical artifact. Now the resolve fails
+    // closed as unbound: no producer declares an equivalent name.
+    const prod = mkProducer(ctx, {
+      produces: "reports/internal/report.md", remote: true, taskKey: "TP",
+    });
+    const cons = mkConsumer(ctx, [prod], {
+      consume: "reports/customer/report.md",
+    });
+    const mission = missionRow(ctx, cons.missionId);
+    const code = errCode(() =>
+      resolver(ctx).resolveForConsumer({ mission, task: cons.task }),
+    );
+    expect(code).toBe("DEP:FAIL_CLOSED_DEPENDENCY_RESOLUTION");
+    // And the delivery lane enforces the same non-equivalence: manifest
+    // 'reports/customer/report.md' cannot pin produce
+    // 'reports/internal/report.md' — the pin mint fails closed too.
+    const del = mkDeliveryTask(ctx, {
+      missionId: prod.missionId, planId: prod.planId,
+      dependsOn: [prod.key],
+      artifacts: ["reports/customer/report.md"],
+      consumes: ["reports/customer/report.md"],
+    });
+    const delCode = errCode(() =>
+      dispatchArmPrereq(ctx, mission, del.tid),
+    );
+    expect(delCode).toBe("DEP:FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE");
+  });
+
+  it("R1.B — an unrelated resolved artifact cannot exempt a same-basename consume; the legacy check still reports it", () => {
+    const ctx = makeCtx("r1b");
+    // One consume binds canonically ('dirA/chart.png'); the other
+    // ('dirB/chart.png') shares only the basename. Its declared producer
+    // produced no canonical artifact → genuinely unresolved.
+    const resolved = mkProducer(ctx, {
+      produces: "dirA/chart.png", remote: true, taskKey: "TPA",
+    });
+    const legacy = mkProducer(ctx, {
+      produces: "dirB/chart.png", artifactBytes: null, taskKey: "TPB",
+    });
+    const cons = mkConsumer(ctx, [resolved, legacy], {
+      consume: ["dirA/chart.png", "dirB/chart.png"],
+    });
+    const mission = missionRow(ctx, cons.missionId);
+    const { request, missing } = dispatchArmPrereq(ctx, mission, cons.tid);
+    const entries = request.dependency_artifacts as DependencyArtifactEntry[];
+    expect(entries).toHaveLength(1);
+    expect(String(entries[0]!.artifact_id)).toBe(resolved.artifactId);
+    expect(String(entries[0]!.logical_name)).toBe("dirA/chart.png");
+    // Pre-fix: resolved 'dirA/chart.png' generated 'outbox/chart.png' and
+    // so did consume 'dirB/chart.png' → set intersection → wrongly
+    // exempted → missing null. Pairwise equivalence keeps it unresolved:
+    // the legacy local-path check must still run and report it.
+    expect(missing).toBe("dirB/chart.png");
+    // Providing the legacy file clears it — legacy semantics unchanged.
+    fs.mkdirSync(path.join(ctx.workspace, "dirB"), { recursive: true });
+    fs.writeFileSync(path.join(ctx.workspace, "dirB", "chart.png"), "legacy");
+    expect(dispatchArmPrereq(ctx, mission, cons.tid).missing).toBeNull();
   });
 });

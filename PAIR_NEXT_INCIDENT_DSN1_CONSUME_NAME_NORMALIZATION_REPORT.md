@@ -126,7 +126,52 @@ full suite:                3313 pass / 2 fail — only the 2 known env-only
 pnpm audit --audit-level=high: 0 high (9 moderate/low, unchanged)
 ```
 
-## 6. Residual / non-goals
+---
+
+## 6. DSN-1 R1 — pairwise-direct equivalence (audit remediation)
+
+**Finding:** the first implementation generated an `outbox/<basename>`
+alias for BOTH inputs and intersected the spelling sets. Two unrelated
+directory-qualified names sharing a basename
+(`reports/internal/report.md` vs `reports/customer/report.md`) therefore
+intersected at `outbox/report.md` and were treated as equivalent —
+broader than DSN-1 semantics allow.
+
+**Fix:** `artifactNamesEquivalent()` is now strictly pairwise-direct:
+
+1. normalize both names via `normalizeArtifactName` (un-normalizable → false);
+2. `na === nb` → true;
+3. otherwise true only when ONE side equals `outbox/<basename>` of the
+   OTHER — never by mapping both sides through a shared basename.
+
+Truth table (all asserted in R1.A): `chart.png`↔`chart.png` true;
+`chart.png`↔`outbox/chart.png` both directions true;
+`dir/chart.png`↔`outbox/chart.png` both directions true;
+`dirA/chart.png`↔`dirB/chart.png` false; `chart.png`↔`dir/chart.png`
+false; `reports/internal/report.md`↔`reports/customer/report.md` false;
+un-normalizable input false. No seams redesigned — the helper's callers
+(`resolveForConsumer`, `resolveDeliveryArtifact`, `prerequisiteMissing`)
+are untouched.
+
+**New adversarial tests (suite now 11/11):**
+
+- **R1.A** — truth table + producer `reports/internal/report.md` cannot
+  satisfy consume `reports/customer/report.md` →
+  `FAIL_CLOSED_DEPENDENCY_RESOLUTION` (unbound); the delivery lane
+  likewise fails the pin mint with
+  `FAIL_CLOSED_DELIVERY_ARTIFACT_PROVENANCE`.
+- **R1.B** — resolved `dirA/chart.png` cannot exempt unresolved consume
+  `dirB/chart.png` (same basename): the real dispatch arm binds only
+  `dirA/chart.png`, the legacy local-path check still runs and reports
+  `dirB/chart.png` missing; providing the file clears it.
+
+**R1 validation:** DSN-1 11/11 · F2 chain 157/157 · F4+F5+delivery
+190/190 · F1+F3+incident 318/318 · `tsc --noEmit` 0 · `rm -rf dist` build
+PASS · full suite 3306 pass / 2 fail (the same 2 env-only P5 failures;
+`pair-p6-live` env-gated → skipped this run, it ran in the baseline) ·
+audit 0 high. No planner/F4/F5 authority semantics changed.
+
+## 7. Residual / non-goals
 
 - Local→local consumes with **no** canonical artifact still use the legacy
   workspace-path check — by design (R2.1: only that lane keeps path

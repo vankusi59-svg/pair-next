@@ -139,18 +139,24 @@ export function normalizeArtifactName(raw: unknown): string {
  *  deliverable (the resolver has always accepted both forms when
  *  binding delivery manifests; the consume side uses the same rule).
  *  Every name-matching seam must compare through this — never raw
- *  strings. Returns false for unnormalizable names, so a malformed
- *  consume/produce can never widen into an equivalence match. */
+ *  strings. Equivalence is PAIRWISE-direct only: exact name equality,
+ *  or ONE side is the `outbox/<basename>` staging alias of the OTHER.
+ *  Two non-outbox paths that merely share a basename
+ *  (`dirA/report.md` vs `dirB/report.md`) are NEVER equivalent —
+ *  equivalence is never inferred transitively through a generated
+ *  `outbox/<basename>` spelling. Returns false for unnormalizable
+ *  names, so a malformed consume/produce can never widen into an
+ *  equivalence match. */
 export function artifactNamesEquivalent(a: unknown, b: unknown): boolean {
   try {
-    const spellingsOf = (raw: unknown): string[] => {
-      const n = normalizeArtifactName(raw);
-      return n.startsWith("outbox/")
-        ? [n]
-        : [n, `outbox/${n.split("/").pop()}`];
-    };
-    const bs = new Set(spellingsOf(b));
-    return spellingsOf(a).some((s) => bs.has(s));
+    const na = normalizeArtifactName(a);
+    const nb = normalizeArtifactName(b);
+    if (na === nb) return true;
+    const staged = (n: string): string => `outbox/${n.split("/").pop()}`;
+    return (
+      (nb.startsWith("outbox/") && nb === staged(na)) ||
+      (na.startsWith("outbox/") && na === staged(nb))
+    );
   } catch {
     return false;
   }
