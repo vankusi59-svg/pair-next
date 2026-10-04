@@ -1,0 +1,360 @@
+/**
+ * PRV2-B — Plan coverage authority. The ONE seam that decides whether a
+ * canonical plan actually covers the operator's Goal Contract before the
+ * plan may pin.
+ *
+ * The model's optional `pair_coverage` mapping is a proposal only — PAIR
+ * verifies every requirement independently, so a fabricated mapping (or
+ * a missing one) can never certify coverage the tasks do not provide:
+ *  - obligation covered  = a work task whose instruction is a bounded
+ *    semantic match (verb class + subject identity + preserved quantity);
+ *  - deliverable covered = a task that is a real producer per the
+ *    existing canonical artifact/dataflow machinery (extractTaskDataflow),
+ *    not a filename grep;
+ *  - constraint held     = no task contradicts a bounded constraint
+ *    (explicit budget ceilings are checked directly; the rest are
+ *    PRESERVED, never claimed PROVEN when unverifiable);
+ *  - prohibition held    = no task instruction invokes the prohibited
+ *    term and no task claims the prohibited capability;
+ *  - bookkeeping (AUTOMATON_TASK_EXECUTION) can never count as coverage.
+ *
+ * Fail-closed codes:
+ *  FAIL_CLOSED_PLAN_INCOMPLETE            — a mandatory requirement has
+ *                                           no genuine covering task.
+ *  FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION  — a task provably contradicts
+ *                                           a constraint or prohibition.
+ * Both are IntegrityErrors thrown at the canonical seam → the candidate
+ * attempt settles FAILED/PLAN_INVALID and planner failover proceeds.
+ */
+
+import { IntegrityError } from "./errors.js";
+import { extractTaskDataflow } from "./plan-dataflow.js";
+import { externalSubjectKeys, subjectAnchors } from "./llm-planner.js";
+import type { GoalContract, GoalRequirement } from "./goal-contract.js";
+
+export type CoverageState = "PROVEN" | "PRESERVED" | "UNVERIFIABLE" | "VIOLATED";
+
+export interface CoverageRow {
+  requirement_id: string;
+  kind: GoalRequirement["kind"];
+  state: CoverageState;
+  task_keys: string[];
+}
+
+export interface PlanCoverageReport {
+  contractDigest: string;
+  verdict: "PASS";
+  rows: CoverageRow[];
+}
+
+/* ------------------------------------------------------------------ */
+/* bounded correspondence                                              */
+/* ------------------------------------------------------------------ */
+
+/** Verb classes shared by obligation text and task instruction. A task
+ *  must perform work of the same class as the obligation it covers. */
+const VERB_CLASSES: Array<{ cls: string; re: RegExp }> = [
+  { cls: "research", re: /\b(?:research|study|studies|investigat|survey|gather|collect|nghiên cứu|khảo sát|thu thập)/iu },
+  { cls: "analyze", re: /\b(?:analy[sz]e|analys|assess|evaluat|review|phân tích|đánh giá|xem xét)/iu },
+  { cls: "compare", re: /\b(?:compar|benchmark|contrast|so sánh|đối chiếu)/iu },
+  { cls: "propose", re: /\b(?:propos|recommend|suggest|deriv|identify|đề xuất|xác định)/iu },
+  { cls: "fetch", re: /\b(?:fetch|retriev|get|pull|download|scrape|extract|gather|collect|lấy|tải|thu thập|tra cứu)/iu },
+  { cls: "create", re: /\b(?:creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai)/iu },
+  { cls: "compute", re: /\b(?:comput|calcul|measure|quantif|estimat|forecast|tính|ước tính|dự báo)/iu },
+  { cls: "plot", re: /\b(?:plot|draw|chart|graph|vẽ|biểu đồ)/iu },
+  { cls: "summarize", re: /\b(?:summar|digest|tóm tắt)/iu },
+  { cls: "test", re: /\b(?:test|verif|validat|check|kiểm tra|kiểm)/iu },
+  { cls: "monitor", re: /\b(?:monitor|track|watch|theo dõi|giám sát)/iu },
+  { cls: "translate", re: /\b(?:translat|dịch)/iu },
+  { cls: "deploy", re: /\b(?:deploy|publish|xuất bản)/iu },
+  { cls: "list", re: /\b(?:list|rank|score|select|choose|screen|liệt kê|xếp hạng|chọn)/iu },
+];
+
+function verbClasses(text: string): Set<string> {
+  const s = new Set<string>();
+  for (const { cls, re } of VERB_CLASSES) if (re.test(text)) s.add(cls);
+  return s;
+}
+
+/** Tokens that carry no subject content — verbs, function words,
+ *  recency/quantity modifiers — excluded from content-token overlap. */
+const CONTENT_TOKEN_STOP = new Set([
+  "research", "study", "studies", "investigate", "survey", "analyse",
+  "analyze", "analyses", "assess", "evaluate", "review", "compare",
+  "comparing", "benchmark", "contrast", "propose",
+  "recommend", "suggest", "derive", "identify", "fetch", "retrieve",
+  "collect", "gather", "download", "scrape", "extract", "create",
+  "write", "build", "develop", "design", "implement", "produce",
+  "generate", "draft", "save", "export", "render", "compute",
+  "calculate", "measure", "quantify", "estimate", "forecast", "plot",
+  "draw", "summarize", "digest", "test", "verify",
+  "validate", "check", "monitor", "track", "translate", "deploy",
+  "publish", "list", "rank", "score", "select", "choose", "screen",
+  "get", "pull", "return", "read", "send", "stage", "then",
+  "reply", "done", "use", "using",
+  "the", "a", "an", "and", "or", "of", "to", "in", "on", "at",
+  "for", "from", "with", "by", "as", "is", "are", "be", "it",
+  "its", "this", "that", "these", "those", "you", "your", "we",
+  "our", "they", "their", "if", "than", "so", "such", "all",
+  "any", "each", "every", "no", "not", "only", "same", "own",
+  "over", "per", "via", "vs", "based", "into", "about",
+  "current", "currently", "latest", "newest", "new", "live",
+  "recent", "online", "today", "now", "real", "time", "top",
+  "best", "least", "most", "min", "max", "minimum", "maximum",
+  "fewer", "up", "down", "out",
+]);
+
+/** Content-bearing tokens of a requirement clause — the subject words
+ *  a covering task must share when no identity anchor exists. */
+function contentTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of text.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+    const w = m[0];
+    if (w.length < 3 || /^\d+$/.test(w) || CONTENT_TOKEN_STOP.has(w)) continue;
+    out.add(w);
+  }
+  return out;
+}
+
+function sharesContentToken(reqText: string, taskText: string): boolean {
+  const req = contentTokens(reqText);
+  if (!req.size) return false;
+  const task = new Set<string>();
+  for (const m of taskText.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+    const w = m[0];
+    task.add(w);
+    if (w.endsWith("s")) task.add(w.slice(0, -1));
+  }
+  for (const w of req) {
+    if (task.has(w) || (w.endsWith("s") && task.has(w.slice(0, -1)))) return true;
+  }
+  return false;
+}
+
+function taskIsBookkeeping(t: Record<string, unknown>): boolean {
+  const caps = (t.required_capabilities as string[] | undefined) ?? [];
+  return caps.includes("AUTOMATON_TASK_EXECUTION");
+}
+
+function taskKeys(tasks: Array<Record<string, unknown>>): Map<string, Record<string, unknown>> {
+  const m = new Map<string, Record<string, unknown>>();
+  for (const t of tasks) m.set(String(t.task_key ?? ""), t);
+  return m;
+}
+
+/** Bounded semantic correspondence between an obligation clause and a
+ *  task instruction: same verb class, the obligation's subject identity
+ *  anchors are all bound, subject classes preserved when no anchors
+ *  exist, and any stated quantity is preserved (never downgraded). */
+function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
+  const t = instr.trim();
+  if (!t) return false;
+  const reqVerbs = verbClasses(req.text);
+  const taskVerbs = verbClasses(t);
+  // The task must perform at least one verb class the requirement asked.
+  if (reqVerbs.size && ![...reqVerbs].some((v) => taskVerbs.has(v))) {
+    return false;
+  }
+  const reqAnchors = subjectAnchors(req.text);
+  const taskAnchors = subjectAnchors(t);
+  // Subject identity: every anchor in the requirement must appear in the
+  // task (generic modifiers are never anchors — PRV2-A R7 semantics).
+  for (const a of reqAnchors) {
+    if (!taskAnchors.has(a)) return false;
+  }
+  // Subject class preservation when the obligation has no identity
+  // anchor: at least one shared subject-class key is required so a
+  // task about an unrelated subject cannot claim coverage.
+  const reqKeys = externalSubjectKeys(req.text);
+  if (!reqAnchors.size) {
+    // No identity anchor: subject-class overlap OR a shared content
+    // token is required — a shared verb alone ("the comparison") can
+    // never prove the task performs THIS obligation's work.
+    const taskKeysSet = externalSubjectKeys(t);
+    const keyOverlap = [...reqKeys].some((k) => taskKeysSet.has(k));
+    if (!keyOverlap && !sharesContentToken(req.text, t)) return false;
+  }
+  // Quantity preservation: a stated floor must appear in the task at
+  // the same or a larger magnitude — "20" can never become "5".
+  if (req.quantity?.min !== undefined) {
+    const nums = [...t.matchAll(/\b(\d{1,6})\b/g)].map((m) => Number(m[1]));
+    if (!nums.length || Math.max(...nums) < req.quantity.min) return false;
+  }
+  return true;
+}
+
+/** A task covers a deliverable only when the canonical artifact/dataflow
+ *  machinery proves it produces the named file — declared produces,
+ *  produce-verb instruction extraction, or the delivery manifest —
+ *  never by filename grep alone. */
+function taskProducesDeliverable(task: Record<string, unknown>, name: string): boolean {
+  try {
+    const df = extractTaskDataflow(task);
+    const want = name.split("/").pop() ?? name;
+    // The operator names the deliverable ("report.md"); a producer may
+    // declare it under a governed directory (outbox/report.md) — artifact
+    // identity is the basename plus its exact spelling.
+    return df.produces.some(
+      (p) => p === name || (p.split("/").pop() ?? p) === want,
+    );
+  } catch {
+    return false;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* constraints + prohibitions                                          */
+/* ------------------------------------------------------------------ */
+
+const TASK_AMOUNT_RE = /\$\s*(\d+(?:\.\d+)?)/g;
+const TELEGRAM_PROHIBITED_TERMS = new Set(["telegram", "tele", "bot"]);
+
+function instructionAmounts(instr: string): number[] {
+  const out: number[] = [];
+  TASK_AMOUNT_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = TASK_AMOUNT_RE.exec(instr)) !== null) out.push(Number(m[1]));
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* the authority seam                                                  */
+/* ------------------------------------------------------------------ */
+
+/** Validate a model-proposed `pair_coverage` annotation on a task:
+ *  every claimed requirement id must exist in the contract AND the task
+ *  must genuinely cover it — declaration alone grants nothing. */
+function validateProposedCoverage(
+  task: Record<string, unknown>,
+  contract: GoalContract,
+  coveredBy: (task: Record<string, unknown>, req: GoalRequirement) => boolean,
+): void {
+  const md = (task.metadata ?? {}) as Record<string, unknown>;
+  const declared = md.pair_coverage;
+  if (declared === undefined) return;
+  if (!Array.isArray(declared) || declared.length > 32) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+      `task ${String(task.task_key)} carries malformed pair_coverage`,
+    );
+  }
+  const all = new Map<string, GoalRequirement>();
+  for (const r of [
+    ...contract.obligations,
+    ...contract.deliverables,
+    ...contract.constraints,
+    ...contract.prohibitions,
+  ]) all.set(r.id, r);
+  for (const id of declared.map((x) => String(x))) {
+    const req = all.get(id);
+    if (!req || (req.kind === "obligation" || req.kind === "deliverable") && !coveredBy(task, req)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_INCOMPLETE",
+        `task ${String(task.task_key)} claims coverage of ${id} it does not provide`,
+      );
+    }
+  }
+}
+
+/** THE coverage authority seam — called at canonicalize time, before
+ *  the plan can become the winning/pinned canonical plan. */
+export function assertPlanCoverage(
+  contract: GoalContract,
+  tasks: Array<Record<string, unknown>>,
+): PlanCoverageReport {
+  const work = tasks.filter((t) => !taskIsBookkeeping(t));
+  const byKey = taskKeys(tasks);
+  const rows: CoverageRow[] = [];
+
+  const covers = (task: Record<string, unknown>, req: GoalRequirement): boolean => {
+    const instr = String(task.task_instruction ?? "");
+    return req.kind === "obligation"
+      ? taskCoversObligation(instr, req)
+      : taskProducesDeliverable(task, String(req.target ?? ""));
+  };
+
+  // Validate model-proposed mappings first — a fabricated mapping is a
+  // hard failure, never an authority grant.
+  for (const t of work) validateProposedCoverage(t, contract, covers);
+
+  const incomplete = (req: GoalRequirement): never => {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+      JSON.stringify({
+        requirement: req.id,
+        kind: req.kind,
+        text: req.text.slice(0, 160),
+      }),
+    );
+  };
+  const violated = (req: GoalRequirement, why: string): never => {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+      JSON.stringify({
+        requirement: req.id,
+        kind: req.kind,
+        why,
+        text: req.text.slice(0, 160),
+      }),
+    );
+  };
+
+  for (const req of contract.obligations) {
+    const hits = work.filter((t) => covers(t, req)).map((t) => String(t.task_key));
+    if (!hits.length) incomplete(req);
+    rows.push({ requirement_id: req.id, kind: req.kind, state: "PROVEN", task_keys: hits });
+  }
+  for (const req of contract.deliverables) {
+    const hits = work.filter((t) => covers(t, req)).map((t) => String(t.task_key));
+    if (!hits.length) incomplete(req);
+    rows.push({ requirement_id: req.id, kind: req.kind, state: "PROVEN", task_keys: hits });
+  }
+  for (const req of contract.constraints) {
+    // Bounded direct validation only where the constraint exposes a
+    // checkable quantity (e.g. a budget ceiling): a task instruction
+    // asserting a larger explicit amount is a proven contradiction.
+    if (req.maxAmount !== undefined) {
+      for (const t of work) {
+        const instr = String(t.task_instruction ?? "");
+        for (const amt of instructionAmounts(instr)) {
+          if (amt > req.maxAmount) {
+            violated(req, `task ${String(t.task_key)} asserts amount ${amt} > budget ${req.maxAmount}`);
+          }
+        }
+      }
+      rows.push({ requirement_id: req.id, kind: req.kind, state: "PROVEN", task_keys: [] });
+      continue;
+    }
+    // Constraints PAIR cannot directly validate are preserved as
+    // requirements the plan must not contradict — recorded, never
+    // silently dropped, and never claimed PROVEN.
+    rows.push({ requirement_id: req.id, kind: req.kind, state: "PRESERVED", task_keys: [] });
+  }
+  for (const req of contract.prohibitions) {
+    const terms = req.terms ?? [];
+    for (const t of work) {
+      const instr = String(t.task_instruction ?? "").toLowerCase();
+      const caps = (t.required_capabilities as string[] | undefined) ?? [];
+      for (const term of terms) {
+        if (TELEGRAM_PROHIBITED_TERMS.has(term) && caps.includes("TELEGRAM_DELIVERY")) {
+          violated(req, `task ${String(t.task_key)} requests prohibited TELEGRAM_DELIVERY`);
+        }
+        if (instr.includes(term)) {
+          violated(req, `task ${String(t.task_key)} invokes prohibited term "${term}"`);
+        }
+      }
+    }
+    rows.push({ requirement_id: req.id, kind: req.kind, state: "PROVEN", task_keys: [] });
+  }
+  if (contract.deadline) {
+    // Deadlines are preserved verbatim; PAIR has no scheduling engine,
+    // and invented dates are forbidden — recorded, never adjudicated.
+    rows.push({
+      requirement_id: contract.deadline.id,
+      kind: "constraint",
+      state: "PRESERVED",
+      task_keys: [],
+    });
+  }
+  return { contractDigest: contract.contractDigest, verdict: "PASS", rows };
+}

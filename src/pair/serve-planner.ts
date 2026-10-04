@@ -42,6 +42,8 @@ import {
   CANONICAL_BOOKKEEPING_INSTRUCTION,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
+import { extractGoalContract } from "./goal-contract.js";
+import { assertPlanCoverage } from "./plan-coverage.js";
 import { IntegrityError } from "./errors.js";
 import { DSH_EXECUTOR_ID } from "./dsh-adapter.js";
 import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
@@ -301,6 +303,18 @@ export function makeServeCanonicalizer(deps: {
       telegramIntent: detectTelegramDeliveryIntent(String(goal ?? "")),
       outputLanguage: detectOutputLanguage(String(goal ?? "")),
     });
+    // PRV2-B — Goal Contract coverage authority, AFTER dataflow
+    // reconcile and remap so the check binds the canonical task keys
+    // the plan will pin: every mandatory obligation must be covered by
+    // a genuine work task, every named deliverable by a real producer
+    // (canonical artifact machinery — not filename grep), no task may
+    // contradict a bounded constraint or invoke a prohibited term.
+    // The contract is the deterministic projection of the raw goal — a
+    // replan for the same goal is checked against the same contract
+    // (replanning changes HOW, never WHAT). A fabricated model
+    // `pair_coverage` mapping is evidence, never authority: PAIR
+    // verifies every requirement independently.
+    assertPlanCoverage(extractGoalContract(String(goal ?? "")), allTasks);
     return allTasks;
   };
 }

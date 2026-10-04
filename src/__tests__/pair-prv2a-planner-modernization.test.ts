@@ -142,7 +142,7 @@ describe("PRV2-A bookkeeping injection", () => {
   it("5. bookkeeping is injected even when the model emits only work tasks", () => {
     const out = canon(
       [
-        work("T1", "research gold price drivers, write findings to findings.txt", ["REASONING"]),
+        work("T1", "analyze gold price drivers, write findings to findings.txt", ["REASONING"]),
         work("T2", "read findings.txt and write report.txt", ["FILE_OPERATIONS"], ["T1"]),
       ],
       goal,
@@ -155,9 +155,9 @@ describe("PRV2-A bookkeeping injection", () => {
   it("6. final canonical keys are deterministic: T1 bookkeeping, T2..Tn work", () => {
     const out = canon(
       [
-        work("T1", "research x", ["REASONING"]),
-        work("T2", "write out.txt", ["FILE_OPERATIONS"], ["T1"]),
-        work("T3", "review out.txt", ["REASONING"], ["T2"]),
+        work("T1", "analyze gold price", ["REASONING"]),
+        work("T2", "write report.txt", ["FILE_OPERATIONS"], ["T1"]),
+        work("T3", "review report.txt", ["REASONING"], ["T2"]),
       ],
       goal,
     );
@@ -169,7 +169,7 @@ describe("PRV2-A bookkeeping injection", () => {
     const out = canon(
       [
         bookkeepingShaped("T1"),
-        work("T2", "research drivers", ["REASONING"], ["T1"]),
+        work("T2", "analyze gold drivers", ["REASONING"], ["T1"]),
         work("T3", "write report.txt", ["FILE_OPERATIONS"], ["T2"]),
       ],
       goal,
@@ -187,7 +187,7 @@ describe("PRV2-A bookkeeping injection", () => {
       [
         bookkeepingShaped("T1"),
         bookkeepingShaped("T2"),
-        work("T3", "research and write report.txt", ["REASONING", "FILE_OPERATIONS"], ["T1"]),
+        work("T3", "analyze gold price and write report.txt", ["REASONING", "FILE_OPERATIONS"], ["T1"]),
       ],
       goal,
     );
@@ -236,7 +236,7 @@ describe("PRV2-A adaptive budget", () => {
   it("10. simple goal → small budget (≤4 work tasks)", () => {
     expect(deriveWorkTaskBudget("analyze gold price")).toBe(4);
     const raw = Array.from({ length: 6 }, (_, i) =>
-      work(`T${i + 1}`, `step ${i + 1}`, ["REASONING"]),
+      work(`T${i + 1}`, `analyze gold price part ${i + 1}`, ["REASONING"]),
     );
     const out = canon(raw, "analyze gold price");
     expect(out).toHaveLength(5); // T1 bookkeeping + 4 work
@@ -255,7 +255,13 @@ describe("PRV2-A adaptive budget", () => {
         `T${i + 1}`,
         i === 0
           ? "fetch the latest BTC ETH gold market prices and news"
-          : `step ${i + 1}`,
+          : i === 1
+            ? "draw the BTC ETH gold price comparison chart"
+            : i === 2
+              ? "analyze the correlation between the assets"
+              : i === 3
+                ? "write report.md"
+                : "write summary.md and đề xuất cải tiến EA strategy",
         i === 0 ? ["NETWORK_ACCESS", "REASONING"] : ["REASONING"],
         i ? [`T${i}`] : [],
       ),
@@ -406,7 +412,7 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
   it("R1.A-4: accepted plan still has exactly ONE AUTOMATON task — T1 = canonicalBookkeepingTask(goal)", () => {
     const out = canon(
       [
-        work("T1", "research gold price", ["REASONING"]),
+        work("T1", "analyze gold price", ["REASONING"]),
         work("T2", "read findings write report.txt", ["FILE_OPERATIONS"], ["T1"]),
       ],
       goal,
@@ -430,7 +436,7 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
   });
 
   it("R1.A-5: model-emitted pure bookkeeping still normalizes (never a second authority)", () => {
-    const out = canon([bookkeepingShaped("T1"), work("T2", "do x", ["REASONING"])], goal);
+    const out = canon([bookkeepingShaped("T1"), work("T2", "analyze gold price and write report.txt", ["REASONING"])], goal);
     const automaton = out.filter((t) =>
       (t.required_capabilities as string[]).includes("AUTOMATON_TASK_EXECUTION"),
     );
@@ -484,7 +490,7 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
         {
           task_key: "T2",
           title: "analyze",
-          task_instruction: "Write findings to findings.txt, then reply DONE.",
+          task_instruction: "Analyze gold price and write report.txt, then reply DONE.",
           required_capabilities: ["FILE_OPERATIONS"],
           depends_on: ["T1"],
         },
@@ -838,7 +844,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
           "NETWORK_ACCESS",
           "REASONING",
         ]),
-        work("T2", "write analysis report.txt", ["FILE_OPERATIONS"], ["T1"]),
+        work("T2", "analyze the gold price and write analysis.txt", ["FILE_OPERATIONS"], ["T1"]),
       ],
       "analyze today's gold price",
     );
@@ -906,6 +912,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     const plan = canon(
       [
         work("T1", "fetch the current gold price", ["NETWORK_ACCESS", "REASONING"]),
+        work("T2", "analyze the gold price data", ["REASONING"], ["T1"]),
       ],
       "analyze today's gold price",
     );

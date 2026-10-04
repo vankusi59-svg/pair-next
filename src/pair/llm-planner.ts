@@ -14,6 +14,7 @@ import {
   extractTaskDataflow,
   isPureBookkeepingTask,
 } from "./plan-dataflow.js";
+import { extractGoalContract } from "./goal-contract.js";
 
 export const LLM_PLANNER_MAX_INSTRUCTION = 2000;
 export const LLM_PLANNER_DEFAULT_MAX_TASKS = 5;
@@ -344,7 +345,19 @@ const ANCHOR_STOP = new Set([
   "project", "commits", "commit", "diffs", "diff", "modules", "module",
   "directory", "folders", "folder", "logs", "log", "local", "disk",
   "filesystem", "monorepo", "source", "open",
+  // quantity bounds — modifiers, never subject identity
+  "least", "most", "min", "max", "minimum", "maximum", "fewer",
 ]);
+
+/** Canonical form of an anchor-lexeme token (alias + plural stem). */
+function anchorLexeme(lc: string): string | null {
+  const a = SUBJECT_ALIAS[lc] ?? lc;
+  if (ANCHOR_LEXEMES.has(a)) return a;
+  if (a.endsWith("s") && ANCHOR_LEXEMES.has(a.slice(0, -1))) {
+    return a.slice(0, -1);
+  }
+  return null;
+}
 
 /** Subject identity anchors present in a text: canonical anchor
  *  lexemes + capitalized-name tokens (proper nouns/acronyms), alias-
@@ -355,8 +368,11 @@ export function subjectAnchors(text: string): Set<string> {
   for (const m of t.matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0];
     const lc = w.toLowerCase();
-    if (ANCHOR_LEXEMES.has(SUBJECT_ALIAS[lc] ?? lc)) {
-      anchors.add(SUBJECT_ALIAS[lc] ?? lc);
+    // Canonical anchor lexemes — alias- and plural-normalized so
+    // "EAs" ≡ "ea" exactly like "EA" does (PRV2-B).
+    const lex = anchorLexeme(lc);
+    if (lex) {
+      anchors.add(lex);
       continue;
     }
     // capitalized candidate: proper noun or acronym — never vocabulary,
@@ -713,9 +729,29 @@ export function buildPlannerUserPrompt(
   },
 ): string {
   const workTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
+  // PRV2-B — the planner receives the canonical Goal Contract alongside
+  // the raw goal. The contract is read-only authority: the model must
+  // cover it, never mutate it, never invent requirements, never
+  // downgrade quantities, and may attach "pair_coverage": ["OBL_001",
+  // ...] to a task's metadata as a PROPOSAL only — PAIR verifies every
+  // requirement independently and a fabricated mapping fails closed.
+  const contract = extractGoalContract(goal);
+  const reqLines = [
+    ...contract.obligations.map((r) => `${r.id} obligation: ${r.text}`),
+    ...contract.deliverables.map((r) => `${r.id} deliverable: ${r.text}`),
+    ...contract.constraints.map((r) => `${r.id} constraint: ${r.text}`),
+    ...contract.prohibitions.map((r) => `${r.id} prohibition: ${r.text}`),
+    ...(contract.deadline ? [`${contract.deadline.id} deadline: ${contract.deadline.text}`] : []),
+  ];
+  const contractBlock = reqLines.length
+    ? `GOAL CONTRACT (canonical — you must cover it, not change it):\n` +
+      reqLines.join("\n") +
+      `\nEvery obligation needs ≥1 real work task performing that work; every deliverable needs a task that produces the exact named file; no task may contradict a constraint or do anything a prohibition forbids; quantities stated in the contract must be preserved verbatim. You may attach "pair_coverage": ["REQ_ID", ...] inside a task's metadata to declare which contract rows that task covers — declaration is a proposal only, never proof.\n`
+    : "";
   return (
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +
     `WORK_TASKS: ${workTasks}\n` +
+    contractBlock +
     (cfg.capabilitySets?.length
       ? `EXECUTOR_CAPABILITY_SETS (one executor can serve a task only when its set covers ALL the task's required_capabilities): ${cfg.capabilitySets.map((s) => `[${s.join(", ")}]`).join(" ")}\n`
       : "") +
@@ -736,6 +772,7 @@ export function buildPlannerUserPrompt(
     `\nMISSION GOAL:\n${goal}`
   );
 }
+
 
 export function plannerSystemPrompt(): string {
   return SYSTEM_PROMPT;

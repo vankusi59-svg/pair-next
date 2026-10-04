@@ -70,6 +70,8 @@ export * from "./cost.js";
 export * from "./secret-policy.js";
 export * from "./devin-executor.js";
 export * from "./llm-planner.js";
+export * from "./goal-contract.js";
+export * from "./plan-coverage.js";
 export * from "./codex-planner.js";
 export * from "./selfmod-bootstrap.js";
 export * from "./promotion-service.js";
