@@ -33,6 +33,7 @@ import {
   instructionIsDataGathering,
   instructionSatisfiesGoalSubject,
   externalSubjectKeys,
+  subjectAnchors,
   WORK_TASK_HARD_CEILING,
 } from "../pair/llm-planner.js";
 import {
@@ -253,7 +254,7 @@ describe("PRV2-A adaptive budget", () => {
       work(
         `T${i + 1}`,
         i === 0
-          ? "fetch the latest market prices and news"
+          ? "fetch the latest BTC ETH gold market prices and news"
           : `step ${i + 1}`,
         i === 0 ? ["NETWORK_ACCESS", "REASONING"] : ["REASONING"],
         i ? [`T${i}`] : [],
@@ -1057,6 +1058,65 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
       "Nghiên cứu các EA MQL5 mới nhất",
     );
     expect(out.map((t) => t.task_key)).toEqual(["T1", "T2"]);
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R5-det: anchor extraction — named identities bound, generic classes never anchor", () => {
+    expect(subjectAnchors("Research the latest GPT models")).toEqual(new Set(["gpt"]));
+    expect(subjectAnchors("Research the latest OpenAI API versions")).toEqual(new Set(["openai"]));
+    expect(subjectAnchors("get the current gold price")).toEqual(new Set(["gold"]));
+    expect(subjectAnchors("check current weather")).toEqual(new Set());
+    expect(subjectAnchors("Nghiên cứu các EA MQL5 mới nhất")).toEqual(new Set(["ea", "mql5"]));
+    expect(subjectAnchors("find current USD/VND rate")).toEqual(new Set(["usd", "vnd"]));
+    expect(subjectAnchors("fetch the latest BTC quote")).toEqual(new Set(["bitcoin"]));
+    expect(subjectAnchors("Research the latest Claude models")).toEqual(new Set(["claude"]));
+    // binding semantics
+    expect(instructionSatisfiesGoalSubject("Research the latest Claude models", "Research the latest GPT models")).toBe(false);
+    expect(instructionSatisfiesGoalSubject("Research the latest GPT models", "Research the latest GPT models")).toBe(true);
+    expect(instructionSatisfiesGoalSubject("Research current Stripe API versions", "Research the latest OpenAI API versions")).toBe(false);
+    expect(instructionSatisfiesGoalSubject("Research current OpenAI API versions", "Research the latest OpenAI API versions")).toBe(true);
+    // no goal anchor → class-overlap fallback preserved
+    expect(instructionSatisfiesGoalSubject("check current weather", "check current weather")).toBe(true);
+  });
+
+  it("R5-N13 (adversarial): 'Claude models' NETWORK gatherer cannot satisfy a 'GPT models' goal", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "Research the latest Claude models", ["NETWORK_ACCESS", "REASONING"]),
+            work("T2", "analyze GPT models", ["REASONING"], ["T1"]),
+          ],
+          "Research the latest GPT models",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "Research the latest GPT models", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "Research the latest GPT models",
+    );
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R5-N14 (adversarial): 'Stripe API versions' cannot satisfy an 'OpenAI API versions' goal; OpenAI-bound task passes", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "Research the latest Stripe API versions", ["NETWORK_ACCESS", "REASONING"]),
+          ],
+          "Research the latest OpenAI API versions",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "Research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "Research the latest OpenAI API versions",
+    );
     expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
   });
 });

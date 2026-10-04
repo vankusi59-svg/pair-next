@@ -287,14 +287,105 @@ export function externalSubjectKeys(text: string): Set<string> {
   return keys;
 }
 
-/** Does the task instruction plausibly gather the subject the goal's
- *  current-data obligation is about? One shared canonical lexeme is
- *  sufficient binding. When the goal yields no lexemes at all the
- *  subject proof is vacuous — the plain data-gathering check applies. */
+/* ---------------- PRV2-A R5 — subject identity anchors -------------------
+ * A generic class match alone cannot prove the NETWORK gatherer is
+ * fetching the goal's actual subject: "the latest GPT models" is not
+ * satisfied by "the latest Claude models" though both share `model`.
+ * Anchors = canonical named-subject lexemes + capitalized tokens
+ * (proper names / acronyms) minus detector vocabulary and function
+ * words. When the goal has ≥1 usable anchor the task must preserve at
+ * least one; when it has none, the R4 class-overlap rule applies. */
+
+/** Canonical named subjects — lowercase-mentionable identities. */
+const ANCHOR_LEXEMES = new Set([
+  "gold", "bitcoin", "ethereum", "silver", "oil", "eurusd", "usdjpy",
+  "ea", "mql4", "mql5",
+]);
+
+/** Vocabulary + function words never usable as an identity anchor. */
+const ANCHOR_STOP = new Set([
+  ...SUBJECT_LEXEMES,
+  // retrieval/research intent
+  "research", "analyzes", "analyzed", "analyzing", "analysis", "study",
+  "studies", "investigate", "survey", "compare", "comparing", "review",
+  "fetch", "fetches", "get", "gets", "getting", "retrieve", "retrieves",
+  "retrieved", "search", "searches", "look", "lookup", "find", "finds",
+  "browse", "scrape", "check", "checks", "checking", "gather", "gathers",
+  "gathered", "gathering", "collect", "collects", "collected",
+  "collecting", "query", "queries", "pull", "pulls", "pulling",
+  "download", "downloads", "downloaded", "downloading",
+  // work verbs
+  "write", "writes", "writing", "create", "creates", "creating",
+  "produce", "produces", "producing", "generate", "generates", "draw",
+  "draws", "stage", "stages", "staging", "use", "uses", "using", "read",
+  "reads", "reading", "summarize", "summarizes", "return", "returns",
+  "record", "records", "list", "lists", "compile", "compiles", "build",
+  "builds", "deploy", "deploys", "run", "runs", "send", "sends", "post",
+  "posts", "translate", "translates", "extract", "extracts", "compute",
+  "computes", "evaluate", "evaluates", "predict", "parse", "parses",
+  "validate", "verify", "describe", "explain", "plot", "plots",
+  "visualize", "recommend", "suggest", "analyze",
+  // recency / shape words
+  "today", "tonight", "latest", "newest", "live", "breaking", "current",
+  "currently", "online", "recent", "new", "real", "time", "up", "date",
+  "right", "now", "free", "paid", "top", "best", "main", "key",
+  // function words + misc
+  "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "at",
+  "from", "with", "about", "into", "by", "is", "are", "was", "were",
+  "be", "been", "it", "its", "this", "that", "these", "those", "you",
+  "your", "we", "our", "they", "their", "as", "if", "then", "than",
+  "so", "such", "all", "any", "both", "each", "every", "no", "not",
+  "only", "same", "own", "over", "per", "via", "vs", "etc",
+  "sources", "findings", "summary", "note", "placeholder", "step",
+  "task", "goal", "plan", "output", "input", "instruction", "artifact",
+  "artifacts", "file", "files", "text", "content", "gửi", "các", "và",
+]);
+
+/** Subject identity anchors present in a text: canonical anchor
+ *  lexemes + capitalized-name tokens (proper nouns/acronyms), alias-
+ *  normalized (BTC→bitcoin, XAUUSD→gold). */
+export function subjectAnchors(text: string): Set<string> {
+  const t = String(text ?? "");
+  const anchors = new Set<string>();
+  for (const m of t.matchAll(/[\p{L}\p{N}]+/gu)) {
+    const w = m[0];
+    const lc = w.toLowerCase();
+    if (ANCHOR_LEXEMES.has(SUBJECT_ALIAS[lc] ?? lc)) {
+      anchors.add(SUBJECT_ALIAS[lc] ?? lc);
+      continue;
+    }
+    // capitalized candidate: proper noun or acronym — never vocabulary,
+    // and pure ASCII so a diacritic-bearing word-fragment ("Nghi" from
+    // "Nghiên") can never become a false anchor.
+    if (
+      w !== lc &&
+      w.length >= 2 &&
+      /[A-Z]/.test(w) &&
+      /^[A-Za-z0-9]+$/.test(w)
+    ) {
+      if (!ANCHOR_STOP.has(lc)) anchors.add(SUBJECT_ALIAS[lc] ?? lc);
+    }
+  }
+  for (const [re, key] of VI_SUBJECT_PHRASES) {
+    if (re.test(t) && ANCHOR_LEXEMES.has(key)) anchors.add(key);
+  }
+  return anchors;
+}
+
+/** Does the task instruction gather the subject the goal's current-data
+ *  obligation is about? R5: when the goal has usable identity anchors
+ *  the task must share at least one (generic class overlap is NOT
+ *  sufficient); otherwise the R4 class-overlap rule applies. */
 export function instructionSatisfiesGoalSubject(
   instruction: string,
   goal: string,
 ): boolean {
+  const goalAnchors = subjectAnchors(goal);
+  if (goalAnchors.size > 0) {
+    const taskAnchors = subjectAnchors(instruction);
+    for (const a of taskAnchors) if (goalAnchors.has(a)) return true;
+    return false;
+  }
   const goalKeys = externalSubjectKeys(goal);
   if (goalKeys.size === 0) return true;
   const taskKeys = externalSubjectKeys(instruction);

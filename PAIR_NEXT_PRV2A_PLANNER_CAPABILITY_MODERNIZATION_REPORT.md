@@ -551,3 +551,58 @@ gold price") could satisfy "Research the latest GPT models".
 Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R4_PENDING_AUDIT`
 
 STOP — pending independent audit. DO NOT MERGE.
+
+---
+
+## R5 — subject identity anchors: class overlap is not identity binding
+
+Audited base: `f6fb6d4cbeab3de8dd464330dacb82668f3c1019` (PR #41, R4).
+Finding closed: generic class lexemes (model/api/version/price...) let
+unrelated same-class subjects satisfy the obligation — "latest Claude
+models" passed for a "latest GPT models" goal.
+
+### Design — SUBJECT CLASS vs SUBJECT IDENTITY
+
+- `subjectAnchors(text)` — two bounded sources, deterministic, no
+  entity database:
+  - canonical anchor lexemes lowercase-mentionable: gold, bitcoin,
+    ethereum, silver, oil, eurusd, usdjpy, ea, mql4, mql5 (VI phrase
+    map feeds these too: vàng→gold, EA/MQL5);
+  - capitalized tokens (proper nouns / acronyms: GPT, OpenAI, Stripe,
+    Claude, USD, VND, BTC, XAUUSD) minus `ANCHOR_STOP` = all detector
+    vocabulary (class lexemes, verbs, recency words) + function words —
+    so "The"/"Research"/"Latest" never anchor; pure-ASCII requirement
+    keeps diacritic fragments ("Nghi" < "Nghiên") out.
+  - SUBJECT_ALIAS applied (btc→bitcoin, xauusd→gold).
+- `instructionSatisfiesGoalSubject`: goal has ≥1 anchor → the NETWORK
+  task must share ≥1 anchor (generic class overlap insufficient);
+  goal has no anchor → R4 class-overlap rule preserved (goals like
+  "check current weather" unaffected).
+- No other seam touched: task-level gate, Router, CNI-1, bookkeeping,
+  budget, Telegram/dataflow, failover unchanged.
+
+### Adversarial proofs
+
+- "Research the latest GPT models" + NETWORK "Research the latest
+  Claude models" → `FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED`;
+  + "Research the latest GPT models" → PASS.
+- "Research the latest OpenAI API versions" + NETWORK "Research the
+  latest Stripe API versions" → REJECT; + "Research current OpenAI
+  API versions" → PASS.
+- Retained: BTC↔bitcoin, XAUUSD↔gold, VI EA/MQL5 binding, gold-vs-GPT
+  rejection, all R1–R4 tests.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused `pair-prv2a-planner-modernization` | **52/52 PASS** (49 + 3 R5) |
+| Regression battery (16 files) | **607/607 PASS** |
+| `npx tsc --noEmit` | clean |
+| `rm -rf dist && pnpm build` | PASS |
+| `pnpm audit` | 0 high (9 moderate/low, same as baseline) |
+| Full suite | **3438 pass / 2 failed** — same 2 env-only P5 fails as baseline |
+
+Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R5_PENDING_AUDIT`
+
+STOP — pending independent audit. DO NOT MERGE.
