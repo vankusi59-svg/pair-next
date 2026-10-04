@@ -782,6 +782,41 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     expect(instructionIsDataGathering("think about the market")).toBe(false);
   });
 
+  it("R3.A-det: generic `current` next to broad output nouns is LOCAL_CURRENT_STATE, never external authority", () => {
+    // the four mandated false-positive goals
+    expect(goalRequiresCurrentExternalData("Review the current code and write a report")).toBe(false);
+    expect(goalRequiresCurrentExternalData("Analyze the current project data from local CSV")).toBe(false);
+    expect(goalRequiresCurrentExternalData("Summarize the current repository state")).toBe(false);
+    expect(goalRequiresCurrentExternalData("Review the current branch and produce a report")).toBe(false);
+    // generic current + research + broad noun (no local word, no external subject) is still not authority
+    expect(goalRequiresCurrentExternalData("Analyze the current data")).toBe(false);
+    expect(goalRequiresCurrentExternalData("Review the current information and write a summary")).toBe(false);
+    // but generic current + explicit retrieval of an external object still requires network
+    expect(goalRequiresCurrentExternalData("get the current gold price")).toBe(true);
+    expect(goalRequiresCurrentExternalData("check current weather")).toBe(true);
+    expect(goalRequiresCurrentExternalData("find current USD/VND rate")).toBe(true);
+    expect(goalRequiresCurrentExternalData("analyze the current market")).toBe(true);
+    // task-level mirrors the same semantic class
+    expect(taskRequiresNetworkAccess("Analyze the current data")).toBe(false);
+    expect(taskRequiresNetworkAccess("Review the current code")).toBe(false);
+    expect(taskRequiresNetworkAccess("Analyze the current market trends")).toBe(true);
+  });
+
+  it("R3.B-det: recency-qualified research/analysis about an external subject is current-data work", () => {
+    expect(goalRequiresCurrentExternalData("Research the latest GPT models")).toBe(true);
+    expect(goalRequiresCurrentExternalData("Research the latest OpenAI API versions")).toBe(true);
+    expect(goalRequiresCurrentExternalData("Analyze the latest AI model releases")).toBe(true);
+    expect(goalRequiresCurrentExternalData("Nghiên cứu các EA MQL5 mới nhất")).toBe(true);
+    expect(goalRequiresCurrentExternalData("Phân tích các model AI mới nhất")).toBe(true);
+    expect(goalRequiresCurrentExternalData("Nghiên cứu API miễn phí mới nhất")).toBe(true);
+    // task-level covers the same semantic class
+    expect(taskRequiresNetworkAccess("Research the latest GPT models and return findings.")).toBe(true);
+    expect(taskRequiresNetworkAccess("Phân tích các model AI mới nhất")).toBe(true);
+    // and a recency-qualified research task is a legitimate gatherer
+    expect(instructionIsDataGathering("Research the latest GPT models")).toBe(true);
+    expect(instructionIsDataGathering("Phân tích các model AI mới nhất")).toBe(true);
+  });
+
   it("R2-N1 (adversarial): 'analyze today's gold price' + REASONING-only → typed plan reject", () => {
     expectIntegrityCode(
       () =>
@@ -920,5 +955,42 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     ]);
     const dOn = routeNet(ctx, adaptersOn, netCaps);
     expect(dOn.selected_executor).toBe("codex_like");
+  });
+
+  it("R3-N8 (adversarial): 'Research the latest GPT models' + REASONING-only → typed plan reject; + legit research NETWORK task → PASS", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [work("T1", "summarize the findings", ["REASONING"])],
+          "Research the latest GPT models",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "Research the latest GPT models and return findings.", [
+          "NETWORK_ACCESS",
+          "REASONING",
+        ]),
+      ],
+      "Research the latest GPT models",
+    );
+    expect(out.map((t) => t.task_key)).toEqual(["T1", "T2"]);
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R3-N9 (adversarial): task 'Research the latest GPT models and return findings.' with REASONING only → task-level typed reject", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "Research the latest GPT models and return findings.", [
+              "REASONING",
+            ]),
+          ],
+          "produce a model comparison note",
+        ),
+      TASK_NET_REQ,
+    );
   });
 });

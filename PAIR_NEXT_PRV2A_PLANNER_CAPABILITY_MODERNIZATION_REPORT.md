@@ -411,3 +411,88 @@ proves both lanes serve it).
 Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R2_PENDING_AUDIT`
 
 STOP — pending independent audit. DO NOT MERGE.
+
+---
+
+## R3 — detector precision: LOCAL_CURRENT_STATE vs CURRENT_EXTERNAL_INFORMATION
+
+Audited base: `52b9b74561d1046877c85253b6d198a3ef6e36db` (PR #41, R2).
+Two HIGH findings closed; scope kept to exactly those findings.
+
+### R3.A — false-positive local-current goals (fixed)
+
+Root cause: `current` sat in one flat recency list and broad output
+nouns (`report`/`data`/`information`) sat in one flat object list — so
+"Review the current code and write a report" classified as external-data.
+
+Fix (same single detector, restructured into signal classes):
+
+- Recency split: `STRONG_CURRENCY_RE` (today/latest/newest/live/
+  real-time/up-to-date/breaking/right now; hôm nay/mới nhất/mới đây/
+  gần đây/trực tiếp/bây giờ/lúc này) vs `GENERIC_CURRENT_RE`
+  (current/currently; hiện tại/hiện giờ/hiện nay) — generic current is
+  ambiguous local-or-external and weaker.
+- New `LOCAL_SOURCE_RE` (repo/repository/branch/workspace/file/CSV/
+  source code/codebase/code/project/commit/diff/module/directory/
+  folder/log/local/disk/filesystem/monorepo; mã nguồn/thư mục/tệp/
+  dự án/nhánh/cục bộ): an explicit local source WITHOUT an online
+  marker suppresses the requirement entirely — local current state is
+  never external-data authority.
+- Generic current fires only with an explicit retrieval verb +
+  retrievable/external object ("get the current gold price", "check
+  current weather", "find current USD/VND rate") or research intent
+  against an EXTERNAL subject ("analyze the current market") — never
+  against a broad output noun.
+
+### R3.B — false-negative research phrasing (fixed)
+
+New `RESEARCH_RE` intent class (research/analyze/study/investigate/
+survey/compare/review; nghiên cứu/phân tích/đánh giá/so sánh/khảo sát/
+tổng hợp) joins `FETCH_VERB_RE` as retrieval intent, and new
+`EXTERNAL_SUBJECT_RE` (models/versions/releases/APIs/products/prices/
+news/weather/rates/exchange/forex/stocks/markets/crypto/bitcoin/eth/
+gold/xau/ea/mql4/mql5/packages/listings/frameworks/tools/providers/
+offerings/announcements/feeds/articles/headlines/trends/quotes/
+forecasts/outlook/scores/libraries/sdks/plugins/services/competitors/
+events; giá/tin tức/thời tiết/thị trường/tỷ giá/mô hình/phiên bản/tin/
+báo) joins `DATA_OBJECT_RE` as the retrievable-subject class. Goal rule
+is now: online-or-strong-recency requires (fetch OR research) AND
+(external subject OR broad object); generic current requires fetch AND
+subject, or research AND external subject. Task-level rule mirrors the
+same semantic class; `instructionIsDataGathering` accepts research
+intent too, so a recency-qualified research task is a legitimate
+NETWORK gatherer.
+
+### Adversarial proofs (all mandated cases)
+
+NO-network: "Review the current code and write a report" · "Analyze the
+current project data from local CSV" · "Summarize the current
+repository state" · "Review the current branch and produce a report" ·
+"Analyze the current data" (research + broad noun, no external subject)
+· task-level "Analyze the current data" / "Review the current code".
+NETWORK-required: "get the current gold price" · "check current
+weather" · "find current USD/VND rate" · "analyze the current market" ·
+"Research the latest GPT models" · "Research the latest OpenAI API
+versions" · "Analyze the latest AI model releases" · "Nghiên cứu các
+EA MQL5 mới nhất" · "Phân tích các model AI mới nhất" · "Nghiên cứu
+API miễn phí mới nhất". Canonical: R3-N8 goal "Research the latest GPT
+models" + REASONING-only → `FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED`,
+same goal + legit research NETWORK task → PASS; R3-N9 task "Research
+the latest GPT models and return findings." with REASONING →
+`FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED`. All R2 tests retained
+unchanged and passing.
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused `pair-prv2a-planner-modernization` | **45/45 PASS** (41 + 4 R3) |
+| Regression battery (16 files: llm-planner, CPL-1, CNI-1, dataflow-incident, ops-telegram, F3×4, p4/p7/p8/p13, F4, F5, F2-handoff) | **607/607 PASS** |
+| `npx tsc --noEmit` | clean |
+| `rm -rf dist && pnpm build` | PASS |
+| Full suite | **3431 pass / 2 failed** — same 2 env-only P5 fails as baseline |
+| `pnpm audit` | 0 high (unchanged, no new deps) |
+
+Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R3_PENDING_AUDIT`
+
+STOP — pending independent audit. DO NOT MERGE.
