@@ -283,9 +283,12 @@ export const TELEGRAM_MANIFEST_FIELD = "pair_telegram_delivery";
 // A path token: workspace-relative segments ending in a filename — either
 // `name.ext` or an `outbox/` path. The token must not be preceded by a path
 // character, so absolute paths like `/home/x/f.txt` never match (the `/`
-// before `home` is in the negated class and swallows the whole token).
+// before `home` is in the negated class and swallows the whole token). A
+// trailing `.` counts as a boundary only when it does NOT continue the
+// filename — sentence-final `report.md.` is still `report.md`, while
+// `file.txt.bak` never degrades to `file.txt`.
 const PATH_TOKEN =
-  /(?:^|[^\w/.-])(outbox\/(?:[\w-]+\/)*[\w-]+(?:\.[\w-]+)?|(?:[\w-]+\/)*[\w-]+\.[A-Za-z0-9]{1,10})(?=$|[^\w/.-])/g;
+  /(?:^|[^\w/.-])(outbox\/(?:[\w-]+\/)*[\w-]+(?:\.[\w-]+)?|(?:[\w-]+\/)*[\w-]+\.[A-Za-z0-9]{1,10})(?=$|[^\w/.-]|\.(?![\w-]))/g;
 
 // Verbs attributing a read/consume role to the following path.
 const CONSUME_VERB =
@@ -293,8 +296,13 @@ const CONSUME_VERB =
 // Verbs attributing a write/produce role to the following path.
 const PRODUCE_VERB =
   /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads)\b/gi;
-// Destination marker immediately before the path: "to X", "into outbox/X".
-const DESTINATION = /\b(?:to|into|onto|inside|in)\s*$/i;
+// Destination marker before the path: "to X", "into outbox/X", or the
+// marker followed by a bounded run of modifiers — "format the findings
+// into a professional report.md" still attributes report.md to the
+// destination marker. Bare `in` only counts when adjacent ("in X"), never
+// across gap words ("in the process of X").
+const DESTINATION =
+  /\b(?:(?:to|into|onto|inside)(?:\s+[\w-]+){0,5}\s*|in)\s*$/i;
 
 /** Nearest governing verb before a path mention: the LAST consume/produce
  *  verb inside the bounded lookback window wins — "read input.txt then
@@ -377,7 +385,7 @@ function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
     const p = normalizeArtifactPath(m[1]);
     if (!p) continue;
     const before = instruction.slice(Math.max(0, m.index - 120), m.index);
-    const tail = before.slice(-10);
+    const tail = before.slice(-48);
     // Destination marker wins: "copy X into outbox/Y" consumes X, produces Y.
     if (DESTINATION.test(tail)) {
       produces.add(p);

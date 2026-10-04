@@ -3318,3 +3318,70 @@ describe("R8-R2 — all-caps `GUI` acronym is not a delivery verb", () => {
     }
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* PATH GRAMMAR REGRESSION — the instruction-artifact grammar must      */
+/* recognize the phrasings governed planners actually emit. Live        */
+/* incident: every planner candidate wrote filenames at sentence ends   */
+/* ("Save the raw data to market_data.json.") and modifier-separated    */
+/* destinations ("format the findings into a professional report.md"),   */
+/* producing consumes without produces → FAIL_CLOSED_PLAN_DATAFLOW_     */
+/* UNBOUND_INPUT on every attempt → FAIL_CLOSED_PLANNER_EXHAUSTED.      */
+/* ------------------------------------------------------------------ */
+describe("PATH-GRAMMAR — planner-natural phrasings", () => {
+  const df = (instr: string) =>
+    extractTaskDataflow({
+      task_key: "T1",
+      task_instruction: instr,
+      required_capabilities: [],
+      metadata: {},
+    });
+
+  it("A. sentence-final filename still binds: 'Save the raw data to market_data.json.' produces", () => {
+    expect(df("Save the raw data to market_data.json.").produces).toContain(
+      "market_data.json",
+    );
+    expect(df("Read market_data.json.").consumes).toContain("market_data.json");
+  });
+
+  it("B. filename followed by . and more text: 'Write it to x.txt. Then stop.' produces x.txt", () => {
+    expect(df("Write it to x.txt. Then stop.").produces).toContain("x.txt");
+  });
+
+  it("C. extension continuation never degrades: 'file.txt.bak' matches nothing", () => {
+    expect(df("write output to file.txt.bak").produces).toEqual([]);
+    expect(df("read file.txt.bak").consumes).toEqual([]);
+  });
+
+  it("D. modifier-separated destination: 'format findings into a professional report.md' produces", () => {
+    expect(
+      df(
+        "Read analysis_temp.txt and format the findings into a professional report.md file.",
+      ).produces,
+    ).toContain("report.md");
+    expect(
+      df("Write the results into a clean summary.md file.").produces,
+    ).toContain("summary.md");
+  });
+
+  it("E. adjacent destination markers unchanged: 'to', 'into', 'onto', 'inside', bare 'in'", () => {
+    expect(df("copy data.csv to out.csv").produces).toContain("out.csv");
+    expect(df("copy data.csv into out.csv").produces).toContain("out.csv");
+    expect(df("write payload in outbox/x.md").produces).toContain(
+      "outbox/x.md",
+    );
+  });
+
+  it("F. bare 'in' with gap words stays non-destination (consume attribution unchanged)", () => {
+    // "in the process of" is not a destination — the path must fall back
+    // to verb attribution, here the consume verb "read".
+    const m = df("keep it in the process of scratch.txt and read it");
+    expect(m.produces).not.toContain("scratch.txt");
+  });
+
+  it("G. consume-first ordering still wins without destination: 'read input.txt' consumes", () => {
+    const m = df("read input.txt carefully");
+    expect(m.consumes).toContain("input.txt");
+    expect(m.produces).toEqual([]);
+  });
+});
