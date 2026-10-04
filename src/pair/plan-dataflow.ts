@@ -283,35 +283,77 @@ export const TELEGRAM_MANIFEST_FIELD = "pair_telegram_delivery";
 // A path token: workspace-relative segments ending in a filename — either
 // `name.ext` or an `outbox/` path. The token must not be preceded by a path
 // character, so absolute paths like `/home/x/f.txt` never match (the `/`
-// before `home` is in the negated class and swallows the whole token).
+// before `home` is in the negated class and swallows the whole token). A
+// trailing `.` counts as a boundary only when it does NOT continue the
+// filename — sentence-final `report.md.` is still `report.md`, while
+// `file.txt.bak` never degrades to `file.txt`.
 const PATH_TOKEN =
-  /(?:^|[^\w/.-])(outbox\/(?:[\w-]+\/)*[\w-]+(?:\.[\w-]+)?|(?:[\w-]+\/)*[\w-]+\.[A-Za-z0-9]{1,10})(?=$|[^\w/.-])/g;
+  /(?:^|[^\w/.-])(outbox\/(?:[\w-]+\/)*[\w-]+(?:\.[\w-]+)?|(?:[\w-]+\/)*[\w-]+\.[A-Za-z0-9]{1,10})(?=$|[^\w/.-]|\.(?![\w-]))/g;
 
 // Verbs attributing a read/consume role to the following path.
 const CONSUME_VERB =
-  /\b(?:read|reads|reading|load|loads|cat|consume|consumes|review|summarize|summarise|inspect|check|open|opens|use|uses|using|copy|copies|copying|move|moves|attach|includes?|including|contains|from)\b/gi;
+  /\b(?:read|reads|reading|load|loads|cat|consume|consumes|review|summarize|summarise|inspect|check|open|opens|use|uses|using|copy|copies|copying|move|moves|attach|includes?|including|contains|from|compare|compares|comparing|reference|references|refer|versus|vs)\b/gi;
+// Transfer verbs consume their source but produce their destination —
+// "copy input.csv to output.csv" consumes input.csv, produces
+// output.csv. Detected by the exact governing word so a bare consume
+// role never blinds the destination rule.
+const TRANSFER_WORDS = new Set([
+  "copy",
+  "copies",
+  "copying",
+  "move",
+  "moves",
+  "moving",
+  "summarize",
+  "summarizes",
+  "summarise",
+]);
 // Verbs attributing a write/produce role to the following path.
 const PRODUCE_VERB =
-  /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads)\b/gi;
-// Destination marker immediately before the path: "to X", "into outbox/X".
-const DESTINATION = /\b(?:to|into|onto|inside|in)\s*$/i;
+  /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads|format|formats|formatting|compose|composes|composing)\b/gi;
+// Destination marker immediately before the path: "to X", "into
+// outbox/X", "in X".
+const DESTINATION_ADJACENT = /\b(?:to|into|onto|inside|in)\s*$/i;
+// Modifier-separated destination: the marker followed by a bounded run
+// of words — "format the findings into a professional report.md". A
+// gap-word destination is NOT independently a producer: it only mints a
+// produced artifact when a produce/transform verb governs the phrase
+// ("format"), so purpose phrases like "to compare with baseline.csv"
+// stay consumes under their governing read/use semantics.
+const DESTINATION_GAP = /\b(?:to|into|onto|inside)(?:\s+[\w-]+){1,5}\s*$/i;
 
 /** Nearest governing verb before a path mention: the LAST consume/produce
  *  verb inside the bounded lookback window wins — "read input.txt then
  *  generate report.txt" attributes `report.txt` to `generate` (produce),
- *  never to the earlier `read`. Returns null when unattributed. */
-function nearestVerbRole(before: string): "consume" | "produce" | null {
-  let role: "consume" | "produce" | null = null;
+ *  never to the earlier `read`. Returns null when unattributed. The
+ *  matched word is reported so transfer verbs (copy/move) can grant
+ *  produce authority to their destination while consuming their source. */
+function nearestVerbMatch(
+  before: string,
+): { role: "consume" | "produce"; index: number; word: string } | null {
+  let best: {
+    role: "consume" | "produce";
+    index: number;
+    word: string;
+  } | null = null;
   let m: RegExpExecArray | null;
   CONSUME_VERB.lastIndex = 0;
-  let consumeAt = -1;
-  while ((m = CONSUME_VERB.exec(before)) !== null) consumeAt = m.index;
+  while ((m = CONSUME_VERB.exec(before)) !== null) {
+    if (!best || m.index >= best.index) {
+      best = { role: "consume", index: m.index, word: m[0] };
+    }
+  }
   PRODUCE_VERB.lastIndex = 0;
-  let produceAt = -1;
-  while ((m = PRODUCE_VERB.exec(before)) !== null) produceAt = m.index;
-  if (consumeAt < 0 && produceAt < 0) return null;
-  role = consumeAt > produceAt ? "consume" : "produce";
-  return role;
+  while ((m = PRODUCE_VERB.exec(before)) !== null) {
+    if (!best || m.index >= best.index) {
+      best = { role: "produce", index: m.index, word: m[0] };
+    }
+  }
+  return best;
+}
+
+function nearestVerbRole(before: string): "consume" | "produce" | null {
+  return nearestVerbMatch(before)?.role ?? null;
 }
 
 /**
@@ -360,10 +402,13 @@ function contractArtifacts(task: Record<string, unknown>): TaskDataflow {
 /**
  * Bounded instruction-text grammar: a path mention counts only when the
  * NEAREST governing verb attributes a role to it (deterministic local
- * attribution, bounded 120-char lookback). A destination marker
- * immediately before the path (`to`, `into`, `onto`, `in`) wins over
- * verbs — "copy X into outbox/Y" consumes X and produces Y. Mentions
- * with no attributed verb are ignored (bounded grammar never guesses).
+ * attribution, bounded 120-char lookback). A destination marker before
+ * the path (`to`, `into`, `onto`, `in`, optionally followed by a bounded
+ * modifier run) mints a produce only under a produce/transform or
+ * transfer governing verb — "write report to report.md" and "copy X to
+ * outbox/Y" produce their destinations, while "compare results to
+ * baseline.csv" stays a consume under its compare verb. Mentions with
+ * no attributed verb are ignored (bounded grammar never guesses).
  */
 function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
   const produces = new Set<string>();
@@ -377,13 +422,24 @@ function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
     const p = normalizeArtifactPath(m[1]);
     if (!p) continue;
     const before = instruction.slice(Math.max(0, m.index - 120), m.index);
-    const tail = before.slice(-10);
-    // Destination marker wins: "copy X into outbox/Y" consumes X, produces Y.
-    if (DESTINATION.test(tail)) {
+    const tail = before.slice(-48);
+    const near = nearestVerbMatch(before);
+    const role = near?.role ?? null;
+    // Destination markers (adjacent or modifier-separated) mint a produce
+    // ONLY under a governing produce/transform verb or a transfer verb —
+    // "write report to report.md" produces report.md; "copy input.csv to
+    // output.csv" produces output.csv; but "compare results to
+    // baseline.csv" keeps baseline.csv a consume under its governing
+    // compare verb — a `to FILE` phrase never independently mints an
+    // output. Otherwise the path falls back to ordinary verb attribution.
+    const transfer = near !== null && TRANSFER_WORDS.has(near.word.toLowerCase());
+    if (
+      (DESTINATION_ADJACENT.test(tail) || DESTINATION_GAP.test(tail)) &&
+      (role === "produce" || transfer)
+    ) {
       produces.add(p);
       continue;
     }
-    const role = nearestVerbRole(before);
     if (role === "consume") {
       consumes.add(p);
       continue;

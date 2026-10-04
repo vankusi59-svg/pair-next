@@ -55,11 +55,11 @@ export interface PlanCoverageReport {
 /** Verb classes shared by obligation text and task instruction. A task
  *  must perform work of the same class as the obligation it covers. */
 const VERB_CLASSES: Array<{ cls: string; re: RegExp }> = [
-  { cls: "research", re: /\b(?:research|study|studies|investigat|survey|gather|collect|nghiên cứu|khảo sát|thu thập)/iu },
+  { cls: "research", re: /\b(?:research|study|studies|investigat|survey|search|find|browse|gather|collect|nghiên cứu|khảo sát|thu thập|tìm)/iu },
   { cls: "analyze", re: /\b(?:analy[sz]e|analys|assess|evaluat|review|phân tích|đánh giá|xem xét)/iu },
   { cls: "compare", re: /\b(?:compar|benchmark|contrast|so sánh|đối chiếu)/iu },
   { cls: "propose", re: /\b(?:propos|recommend|suggest|deriv|identify|đề xuất|xác định)/iu },
-  { cls: "fetch", re: /\b(?:fetch|retriev|get|pull|download|scrape|extract|gather|collect|lấy|tải|thu thập|tra cứu)/iu },
+  { cls: "fetch", re: /\b(?:fetch|retriev|get|pull|download|scrape|extract|search|find|browse|gather|collect|lấy|tải|thu thập|tra cứu|tìm)/iu },
   { cls: "create", re: /\b(?:creat|writ|build|develop|design|implement|produc|generat|draft|save|export|render|tạo|viết|soạn|lưu|xuất|xây|phát triển|thiết kế|triển khai)/iu },
   { cls: "compute", re: /\b(?:comput|calcul|measure|quantif|estimat|forecast|tính|ước tính|dự báo)/iu },
   { cls: "plot", re: /\b(?:plot|draw|chart|graph|vẽ|biểu đồ)/iu },
@@ -92,7 +92,7 @@ const CONTENT_TOKEN_STOP = new Set([
   "validate", "check", "monitor", "track", "translate", "deploy",
   "publish", "list", "rank", "score", "select", "choose", "screen",
   "get", "pull", "return", "read", "send", "stage", "then",
-  "reply", "done", "use", "using",
+  "reply", "done", "use", "using", "search", "find", "browse",
   "the", "a", "an", "and", "or", "of", "to", "in", "on", "at",
   "for", "from", "with", "by", "as", "is", "are", "be", "it",
   "its", "this", "that", "these", "those", "you", "your", "we",

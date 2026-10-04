@@ -545,3 +545,185 @@ describe("PRV2-B failover", () => {
     expect(res.tasks.length).toBe(4);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* LIVE REGRESSION — the natural-planner vocabulary must cover natural */
+/* obligation verbs. Live incident: goal "research 15 MQL5 ..." was     */
+/* planned as "Search the official MQL5 marketplace..." — `search` was  */
+/* in no verb class, so the research obligation found no covering task  */
+/* → FAIL_CLOSED_PLAN_INCOMPLETE on every planner candidate.            */
+/* ------------------------------------------------------------------ */
+describe("live-vocab — search/find/browse obligations", () => {
+  it("A. 'Search ...' task covers a 'research ...' obligation (anchors + quantity bound)", () => {
+    const contract = extractGoalContract(
+      "research 15 MQL5 expert advisors on the marketplace",
+    );
+    const r = assertPlanCoverage(contract, [
+      canonicalBookkeepingTask(
+        "research 15 MQL5 expert advisors on the marketplace",
+      ),
+      work(
+        "T2",
+        "Search the official MQL5 marketplace for the 15 most recent MQL5 expert advisors and collect pricing",
+        ["NETWORK_ACCESS", "REASONING"],
+      ),
+    ]);
+    expect(r.rows.find((x) => x.requirement_id === "OBL_001")?.state).toBe(
+      "PROVEN",
+    );
+  });
+
+  it("B. Vietnamese 'tìm' task covers a 'nghiên cứu' obligation", () => {
+    const contract = extractGoalContract("nghiên cứu các EA MQL5 mới nhất");
+    const r = assertPlanCoverage(contract, [
+      canonicalBookkeepingTask("nghiên cứu các EA MQL5 mới nhất"),
+      work(
+        "T2",
+        "tìm các EA MQL5 mới nhất trên marketplace chính thức",
+        ["NETWORK_ACCESS", "REASONING"],
+      ),
+    ]);
+    expect(r.rows.find((x) => x.requirement_id === "OBL_001")?.state).toBe(
+      "PROVEN",
+    );
+  });
+
+  it("C. unrelated-subject 'search' still cannot cover the research obligation", () => {
+    const contract = extractGoalContract(
+      "research 15 MQL5 expert advisors on the marketplace",
+    );
+    expectCode(
+      () =>
+        assertPlanCoverage(contract, [
+          canonicalBookkeepingTask(
+            "research 15 MQL5 expert advisors on the marketplace",
+          ),
+          work(
+            "T2",
+            "search the latest gold prices and collect 15 quotes",
+            ["NETWORK_ACCESS", "REASONING"],
+          ),
+        ]),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* LIVE REGRESSION — the exact multi-gate plan the three planner        */
+/* candidates emitted in production. Before the grammar fix, sentence-  */
+/* final artifact names made consumes producer-less                     */
+/* (FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT) on every attempt.          */
+/* ------------------------------------------------------------------ */
+describe("live-e2e — production-shaped plan canonicalizes end-to-end", () => {
+  const LIVE_GOAL =
+    "research 15 MQL5 expert advisors mới nhất trên thị trường, use only " +
+    "MQL5 official marketplace listings, so sánh pricing và features, " +
+    "viết report.md, gửi qua telegram, budget <= $2, xong trước cuối tuần";
+  const LIVE_TASKS = [
+    work(
+      "T1",
+      "Search the official MQL5 marketplace for the 15 most recent Expert " +
+        "Advisors. Extract their names, pricing, and key features. Save the " +
+        "raw data to market_data.json. Use only official MQL5 listings.",
+      ["NETWORK_ACCESS", "REASONING"],
+    ),
+    work(
+      "T2",
+      "Read market_data.json. Analyze and compare the pricing and features " +
+        "of the 15 Expert Advisors. Ensure all selected items are within the " +
+        "$2 budget constraint. Write the comparative analysis to analysis_temp.txt.",
+      ["FILE_OPERATIONS", "REASONING"],
+      ["T1"],
+    ),
+    work(
+      "T3",
+      "Read analysis_temp.txt and format the findings into a professional " +
+        "report.md file. Ensure the report includes the comparison table and " +
+        "summary. Write the final report to outbox/report.md.",
+      ["CODE_GENERATION", "FILE_OPERATIONS"],
+      ["T2"],
+    ),
+    work(
+      "T4",
+      "Stage the manifested artifacts from outbox/report.md into the " +
+        "telegram delivery pipeline, then reply DONE.",
+      ["TELEGRAM_DELIVERY"],
+      ["T3"],
+    ),
+  ];
+  // Production executor capability sets — NETWORK resolves only via
+  // CODEX/DEVIN-shaped sets (capability still bounded, just not needed
+  // for this gate: canonicalizer checks plan shape, not assignment).
+  const PROD_SETS = [
+    [
+      "CODE_GENERATION",
+      "CODE_EDITING",
+      "FILE_OPERATIONS",
+      "SHELL_EXECUTION",
+      "REASONING",
+      "TELEGRAM_DELIVERY",
+    ],
+    [
+      "CODE_GENERATION",
+      "CODE_EDITING",
+      "FILE_OPERATIONS",
+      "SHELL_EXECUTION",
+      "REASONING",
+      "PYTHON_EXECUTION",
+      "TELEGRAM_DELIVERY",
+      "NETWORK_ACCESS",
+    ],
+    [
+      "REMOTE_CLOUD_TASK_EXECUTION",
+      "AUTONOMOUS_CODE_EXECUTION",
+      "NETWORK_ACCESS",
+    ],
+    ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
+  ];
+  const prodCanon = (raw: Array<Record<string, unknown>>, goal: string) =>
+    makeServeCanonicalizer({ executorCapSets: () => PROD_SETS })(raw, goal);
+
+  it("A. the exact emitted plan canonicalizes: dataflow bound, coverage PROVEN", () => {
+    const out = prodCanon(LIVE_TASKS, LIVE_GOAL);
+    const keys = out.map((t) => String(t.task_key));
+    expect(keys).toEqual(["T1", "T2", "T3", "T4", "T5"]);
+    // Producer edges bound: T3 consumes market_data.json → depends on T2.
+    const t3 = out.find((t) => String(t.task_key) === "T3")!;
+    expect(t3.depends_on).toContain("T2");
+  });
+
+  it("B. same plan minus the MQL5 carriage still fails closed (R2 preserved)", () => {
+    const weakened = LIVE_TASKS.map((t, i) =>
+      i === 0
+        ? work(
+            "T1",
+            "Search the marketplace for the 15 most recent Expert " +
+              "Advisors and save raw data to market_data.json.",
+            ["NETWORK_ACCESS", "REASONING"],
+          )
+        : t,
+    );
+    expectCode(
+      () => prodCanon(weakened, LIVE_GOAL),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+});
+
+describe("live-vocab R1 — browse covers research", () => {
+  it("A. 'Browse the official MQL5 marketplace...' covers 'research 15 MQL5 EAs'", () => {
+    const contract = extractGoalContract("research 15 MQL5 EAs");
+    const r = assertPlanCoverage(contract, [
+      canonicalBookkeepingTask("research 15 MQL5 EAs"),
+      work(
+        "T2",
+        "Browse the official MQL5 marketplace for 15 MQL5 EAs and collect pricing",
+        ["NETWORK_ACCESS", "REASONING"],
+      ),
+    ]);
+    expect(r.rows.find((x) => x.requirement_id === "OBL_001")?.state).toBe(
+      "PROVEN",
+    );
+  });
+});
