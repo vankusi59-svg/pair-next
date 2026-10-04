@@ -39,6 +39,9 @@ export const DEVIN_EXECUTOR_ID = "DEVIN";
 export const DEVIN_CAPABILITIES = [
   "REMOTE_CLOUD_TASK_EXECUTION",
   "AUTONOMOUS_CODE_EXECUTION",
+  // PRV2-A R1.B — the governed Devin execution environment has ambient
+  // network access; the claim is static because the environment is.
+  "NETWORK_ACCESS",
 ] as const;
 
 export const DEVIN_TRANSPORT = "REMOTE_API";

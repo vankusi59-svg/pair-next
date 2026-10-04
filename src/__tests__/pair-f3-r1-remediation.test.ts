@@ -15,12 +15,16 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import type { RuntimePlanner, RuntimePlannerInput } from "../pair/mission-runtime.js";
+import { createDatabase } from "../state/database.js";
+import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types.js";
+import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import {
   ApprovalQueue,
   canonicalPlanSemanticDigest,
   ExecutorRegistry,
   GovernedTaskGate,
   IntegrityError,
+  makeServeCanonicalizer,
   makeServePlanner,
   MissionControl,
   MissionObservability,
@@ -30,6 +34,8 @@ import {
   MissionSupervisor,
   PairControlPlane,
   PairEvidenceStore,
+  PairNativeExecutorAdapter,
+  PairNativeWorkerRunner,
   ReconciliationService,
   RecoveryController,
   ReplanAttemptLedger,
@@ -87,6 +93,23 @@ class ScriptedAdapter implements ExecutorAdapter {
   health() { return { state: "READY" } };
 }
 
+const noopInference: WorkerInferenceClient = {
+  chat: async () => {
+    throw new Error("spec-bound harness must not call inference");
+  },
+};
+const noopCompute = {
+  exec: async () => {
+    throw new Error("no remote compute");
+  },
+  writeFile: async () => {
+    throw new Error("no remote compute");
+  },
+  readFile: async () => {
+    throw new Error("no remote compute");
+  },
+} as unknown as ComputeClient;
+
 const df = (produces: string[] = [], consumes: string[] = []) => ({
   pair_dataflow: { produces, consumes },
 });
@@ -113,6 +136,17 @@ const incidentPlan = () => ({
 const altPlan = () => ({
   tasks: [task("T1", ["FILE_OPERATIONS"], [], "write summary.txt standalone", df(["summary.txt"]))],
 });
+
+/** PRV2-A — a committed plan is always the CANONICALIZED shape: PAIR's
+ *  injected T1 bookkeeping + remapped work keys. Replays of the same
+ *  work graph re-canonicalize to the identical shape, so duplicate
+ *  detection still binds. */
+const canonPlan = (raw: Array<Record<string, unknown>>) =>
+  makeServeCanonicalizer({
+    executorCapSets: () => [
+      ["FILE_OPERATIONS", "REASONING", REMOTE, "AUTOMATON_TASK_EXECUTION"],
+    ],
+  })(raw, "f3 r1 test mission");
 
 interface PlannerCall {
   reason: string;
@@ -208,6 +242,20 @@ function makeCtx(name: string, planner: RuntimePlanner) {
     }
     return String(rt(mid).state);
   };
+  /** PAIR's injected bookkeeping task runs through the real
+   *  PAIR_NATIVE worker harness (spawned child + event-loop timers):
+   *  a synchronous drive can never yield, so executions stay RUNNING.
+   *  driveAsync yields real event-loop time between ticks. */
+  const driveAsync = async (mid: string, max = 200) => {
+    const clock = fakeClock();
+    for (let i = 0; i < max; i++) {
+      runtime.tick(mid, clock());
+      await new Promise((r) => setTimeout(r, 15));
+      const s = String(rt(mid).state);
+      if (["ABORTED", "FAILED", "COMPLETED", "WAITING_APPROVAL"].includes(s)) return s;
+    }
+    return String(rt(mid).state);
+  };
   const toReplanning = (mid: string) => {
     const clock = fakeClock();
     for (let i = 0; i < 60; i++) {
@@ -216,10 +264,44 @@ function makeCtx(name: string, planner: RuntimePlanner) {
     }
     throw new Error(`never reached REPLANNING: ${String(rt(mid).state)}`);
   };
+  /** PAIR's injected T1 bookkeeping task is a worker_spec contract
+   *  executed by the real PAIR_NATIVE harness — a scripted adapter
+   *  cannot produce its evidence. Registered through the canonical
+   *  AUTOMATON_WORKER identity + seeded PAIR_NATIVE route. */
+  const registerNativeExecutor = () => {
+    const automatonDb = createDatabase(path.join(d, "automaton.db"));
+    const runner = new PairNativeWorkerRunner({
+      db: automatonDb.raw,
+      config: { name: `f3r1-${name}`, logLevel: "error" } as unknown as AutomatonConfig,
+      identity: { name: `f3r1-${name}` } as unknown as AutomatonIdentity,
+      inference: noopInference,
+      compute: noopCompute,
+      journalRoot: path.join(d, "journal"),
+      allowedEditRoot: d,
+    });
+    const adapter = new PairNativeExecutorAdapter(runner);
+    registry.register({
+      executor_id: adapter.executor_id,
+      executor_type: "AUTOMATON_WORKER",
+      capabilities: ["AUTOMATON_TASK_EXECUTION"],
+      health_state: "READY",
+      status: "ENABLED",
+      metadata: {
+        qualification_state: "QUALIFIED",
+        max_concurrency: 4,
+        permission_modes: ["READ", "WRITE", "FILE_READ", "FILE_WRITE"],
+        workspace_modes: ["EXPLICIT_WORKSPACE"],
+        routing_priority: 100,
+        supports_cancel: true,
+      },
+    });
+    service.routes.seedPairNativeRoute();
+    adapters.set(adapter.executor_id, adapter);
+  };
   return {
     d, dbPath, workspace, store, service, gate, registry, router, recovery,
     recon, approvals, scheduler, runtime, control, adapters, calls,
-    registerAdapter, startMission, rt, drive, toReplanning,
+    registerAdapter, registerNativeExecutor, startMission, rt, drive, driveAsync, toReplanning,
     projectId: String(project.project_id),
   };
 }
@@ -369,7 +451,11 @@ describe("F3 R1 A — production serve/runtime planner seam", () => {
     // consumed upstream, not dropped.
     expect(seen).toHaveLength(1);
     expect(String(seen[0]?.recovery_id)).toBe("RCV_1");
-    expect(out.tasks.length).toBe(1);
+    // PRV2-A — the emitted work graph gains PAIR's injected T1
+    // bookkeeping: [T1 bookkeeping, T2 work].
+    expect(out.tasks.length).toBe(2);
+    expect(out.tasks[0].required_capabilities).toEqual(["AUTOMATON_TASK_EXECUTION"]);
+    expect(out.tasks[1].task_key).toBe("T2");
   });
 
   it("A7a. ACTUAL composition, provider null — REPLAN fails closed, old plan NEVER replayed", () => {
@@ -395,14 +481,16 @@ describe("F3 R1 A — production serve/runtime planner seam", () => {
     expect(tasks.find((t) => t.task_key === "T1")!.status).toBe("COMPLETED");
   });
 
-  it("A7b. ACTUAL composition, provider emits Plan B — commits exactly once, mission completes", () => {
+  it("A7b. ACTUAL composition, provider emits Plan B — commits exactly once, mission completes", async () => {
     const { planner } = makeServePlanner(
       deps({ replanProvider: () => altPlan() }),
     );
     const ctx = makeCtx("a7b", planner);
+    // PAIR's injected T1 bookkeeping needs the real PAIR_NATIVE harness.
+    ctx.registerNativeExecutor();
     ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }, { status: "COMPLETED" }]), ["FILE_OPERATIONS"]);
-    const mid = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
-    expect(ctx.drive(mid)).toBe("COMPLETED");
+    const mid = ctx.startMission({ pinned_plan_tasks: canonPlan(incidentPlan().tasks) });
+    expect(await ctx.driveAsync(mid)).toBe("COMPLETED");
     const at = attempts(ctx.store, mid);
     expect(at.map((a) => a.status)).toEqual(["ACCEPTED"]);
     expect(ctx.store.planRevisions(mid)).toHaveLength(2);
@@ -416,8 +504,9 @@ describe("F3 R1 A — production serve/runtime planner seam", () => {
       deps({ replanProvider: () => incidentPlan() }),
     );
     const ctx = makeCtx("a7c", planner);
+    ctx.registerNativeExecutor();
     ctx.registerAdapter(new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }]), ["FILE_OPERATIONS"]);
-    const mid = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+    const mid = ctx.startMission({ pinned_plan_tasks: canonPlan(incidentPlan().tasks) });
     expect(ctx.drive(mid)).toBe("ABORTED");
     // Provider emitted the pinned plan twice; both bounded slots spent
     // on duplicates — the stored plan was NEVER committed a second time.

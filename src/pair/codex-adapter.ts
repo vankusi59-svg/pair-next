@@ -180,7 +180,17 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
 
   capabilities(): Record<string, unknown> {
     const q = this.lastQualification ?? this.qualify();
-    const ids = q.qualified ? [...CODEX_CAPABILITY_IDS] : [];
+    // PRV2-A R1.B — NETWORK_ACCESS is claimed LIVE, consistent with the
+    // CNI-1 per-dispatch authority: PAIR_CODEX_NETWORK=off (or unset/
+    // anything non-truthy) → the capability is absent at THIS moment, so
+    // a stale boot-time registration can never keep Codex routable for
+    // network work after the operator kills it.
+    const ids = q.qualified
+      ? [
+          ...CODEX_CAPABILITY_IDS,
+          ...(this.codexNetworkAllowed() ? ["NETWORK_ACCESS"] : []),
+        ]
+      : [];
     return { executor_id: this.executor_id, capability_ids: ids, capabilities: ids };
   }
 
