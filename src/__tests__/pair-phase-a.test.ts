@@ -90,7 +90,7 @@ describe("A — canonical timeout config", () => {
   });
 
   it("safe defaults when unset", () => {
-    expect(modelProbeTimeoutMs({})).toBe(8_000);
+    expect(modelProbeTimeoutMs({})).toBe(60_000); // CPL-1 R1 §8 — canonical 60s probe budget
     expect(llmPlannerTimeoutMs({})).toBe(20_000);
     expect(taskTimeoutSeconds({})).toBe(120);
   });

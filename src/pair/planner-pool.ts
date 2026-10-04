@@ -161,10 +161,15 @@ export async function runPlannerFailover(opts: {
   planFn: (c: PlannerCandidate) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
   /** Canonical per-invocation eligibility proof (role + lifecycle).
    *  Throw = authority failure (propagates); return {reject:true,...} =
-   *  failover-eligible availability rejection. */
+   *  failover-eligible availability rejection. May be async (CPL-1 R1 —
+   *  a transport's codex-first seam performs ONE bounded canonical
+   *  refresh before settling an availability rejection). */
   assertEligible: (
     c: PlannerCandidate,
-  ) => void | { reject: true; failure_class: PlannerFailureClass; reason: string };
+  ) =>
+    | void
+    | { reject: true; failure_class: PlannerFailureClass; reason: string }
+    | Promise<void | { reject: true; failure_class: PlannerFailureClass; reason: string }>;
   /** The one canonical task-preparation seam — returns the exact canonical
    *  task list the preview will pin; any throw → PLAN_INVALID failover. */
   canonicalize?: (tasks: Array<Record<string, unknown>>, c: PlannerCandidate) => Array<Record<string, unknown>>;
@@ -213,7 +218,7 @@ export async function runPlannerFailover(opts: {
     // must not look like a crashed in-flight invocation.
     let elig;
     try {
-      elig = opts.assertEligible(c);
+      elig = await opts.assertEligible(c);
     } catch (e) {
       settle({
         ...base,

@@ -34,10 +34,14 @@ import {
   LLM_PLANNER_DEFAULT_MAX_TASKS,
   LLM_PLANNER_MIN_TASKS,
 } from "./llm-planner.js";
-import { assertPlannerRoleAndDisjoint } from "./model-role.js";
+import { assertPlannerCandidateEligible } from "./model-role.js";
+import { providerModelEligibility } from "./model-routable.js";
 import type { PairEvidenceStore } from "./store.js";
 import { ProviderCatalog } from "./provider-catalog.js";
 import { ModelEvidenceCatalog, canonicalModelId } from "./model-catalog.js";
+import { ProviderValidator } from "./provider-validation.js";
+import { probeModel, qualifyModel } from "./model-probing.js";
+import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import type { PlannerCandidate } from "./planner-pool.js";
 import type { PlannerEligibilityRejection } from "./model-role.js";
 
@@ -45,7 +49,7 @@ export const CODEX_CLI_PROVIDER_ID = "codex-cli";
 export const CODEX_CLI_PROTOCOL_FAMILY = "CODEX_CLI";
 export const CODEX_CLI_ENDPOINT = "codex-cli://local";
 export const CODEX_PLANNER_DEFAULT_MODEL = "gpt-6.1-sol";
-export const CODEX_PLANNER_DEFAULT_TIMEOUT_MS = 120_000;
+export const CODEX_PLANNER_DEFAULT_TIMEOUT_MS = 900_000;
 
 /** Codex-transport warning codes — mapped onto PlannerFailureClass in
  *  classifyPlannerFailure (planner-pool.ts). */
@@ -94,15 +98,18 @@ function resolveExecutable(env: CodexPlannerEnv | undefined): string | null {
   }
 }
 
-/** Child env: secrets pinned only when present; CODEX_HOME needed for
- *  ChatGPT auth files. Nothing is logged or persisted from it. */
+/** Child env: minimal inherited surface only; CODEX_HOME pins the
+ *  persisted ChatGPT session. CODEX_API_KEY/OPENAI_API_KEY are
+ *  deliberately NOT forwarded (R1.B): `codex exec` env API-key auth can
+ *  take precedence over the persisted ChatGPT session — an ambient key in
+ *  the PAIR parent must never silently flip the planner onto API billing.
+ *  Nothing is logged or persisted from it. */
 function childEnv(env: CodexPlannerEnv | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of [
     "PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH",
-    "OPENAI_API_KEY", "CODEX_API_KEY",
     // test-only fake-executable controls — inert for the real binary
-    "FAKE_CODEX_BEHAVIOR", "FAKE_CODEX_PIDFILE",
+    "FAKE_CODEX_BEHAVIOR", "FAKE_CODEX_PIDFILE", "FAKE_CODEX_INVOKELOG", "FAKE_CODEX_ENVFILE",
   ]) {
     const v = envGet(env, k);
     if (v) out[k] = v;
@@ -286,7 +293,9 @@ export async function codexPlannerProbe(opts: {
   const ping = {
     executable: exe,
     model: opts.model,
-    timeoutMs: Math.min(opts.timeoutMs ?? 60_000, 60_000),
+    // R1.C — the configured probe budget is authoritative verbatim: no
+    // hidden codex-specific ceiling/floor on top of it.
+    timeoutMs: opts.timeoutMs ?? 60_000,
     scratchDir: opts.scratchDir,
     schema: PING_SCHEMA,
   };
@@ -393,75 +402,231 @@ export function codexPlannerArgvForTest(
 }
 
 /**
- * Per-attempt eligibility for codex-cli candidates — the transport-specific
- * extension the failover seam permits. Role + planner/DSH disjointness +
- * model authority conditions keep THROW semantics (authority, never
- * failover); usability is read from DURABLE probe/access evidence written
- * by qualification (no silent config presence), with provider/model
- * availability translated into typed failover-eligible rejections.
+ * Per-attempt eligibility for codex-cli candidates (R1.A) — the FULL
+ * canonical Phase E eligibility every planner transport must satisfy:
+ * role + planner/DSH disjointness + `providerModelEligibility` (all
+ * provider/model authority gates) via the shared canonical seam
+ * `assertPlannerCandidateEligible`. Authority violations keep the
+ * canonical THROW semantics (FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE /
+ * role / overlap codes — never a failover verdict); availability
+ * rejections pass through verbatim, then are enriched with codex-typed
+ * failure classes read from the DURABLE probe evidence so
+ * planner_attempt rows stay transport-faithful.
  */
 export function assertCodexPlannerCandidateEligible(
   store: PairEvidenceStore,
   candidate: Pick<PlannerCandidate, "model_entry_id" | "provider" | "model">,
 ): PlannerEligibilityRejection | void {
-  const model = assertPlannerRoleAndDisjoint(store, candidate.model_entry_id);
-  // Authority conditions on the model itself stay fail-closed (operator
-  // marks / lifecycle removals are never a retryable availability signal).
-  const conditions = (model.conditions as string[]) ?? [];
-  const authorityHit = conditions.find((c) => ["REMOVED", "DEPRECATED", "BLOCKED"].includes(c));
-  if (authorityHit) {
-    throw new IntegrityError(
-      "FAIL_CLOSED_PLANNER_MODEL_AUTHORITY",
-      JSON.stringify({ model_entry_id: candidate.model_entry_id, condition: authorityHit }),
-    );
-  }
-  const provider = new ProviderCatalog(store).getProvider(candidate.provider);
-  if (!provider) {
-    return { reject: true, failure_class: PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE, reason: "provider_missing" };
-  }
-  // Availability → typed failover-eligible reject derived from the LAST
-  // recorded probe/access evidence (never silently assumed usable).
-  const authState = String(provider.auth_state ?? "");
-  const probeState = String(provider.probe_state ?? "");
-  const lifecycle = String(provider.lifecycle_state ?? "");
-  if (authState === "AUTH_FAILED") {
-    return { reject: true, failure_class: PLANNER_FAILURE_CLASS.AUTH_REJECTED, reason: "auth_failed" };
-  }
-  if (probeState === "PROBE_CLI_MISSING") {
-    return { reject: true, failure_class: PLANNER_FAILURE_CLASS.CLI_MISSING, reason: "cli_missing" };
-  }
-  if (probeState === "PROBE_MODEL_UNAVAILABLE") {
-    return { reject: true, failure_class: PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE, reason: "model_unavailable" };
-  }
-  if (probeState === "PROBE_TIMEOUT") {
-    return { reject: true, failure_class: PLANNER_FAILURE_CLASS.TIMEOUT, reason: "timeout" };
-  }
-  if (probeState === "PROBE_RATE_LIMITED") {
-    return { reject: true, failure_class: PLANNER_FAILURE_CLASS.QUOTA_RATE_LIMITED, reason: "rate_limited" };
-  }
-  if (probeState.startsWith("PROBE_") || probeState === "UNPROBED") {
-    return {
-      reject: true,
-      failure_class: PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE,
-      reason: `probe_state:${probeState}`,
-    };
-  }
-  if (lifecycle !== "QUALIFIED" && lifecycle !== "ACCESS_VALIDATED" && lifecycle !== "PROBED") {
-    return {
-      reject: true,
-      failure_class: PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE,
-      reason: `lifecycle:${lifecycle}`,
-    };
-  }
-  if (String(model.lifecycle_state ?? "") !== "QUALIFIED") {
-    return {
-      reject: true,
-      failure_class: PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE,
-      reason: `model_lifecycle:${String(model.lifecycle_state ?? "UNKNOWN")}`,
-    };
-  }
-  return;
+  const verdict = assertPlannerCandidateEligible(store, candidate.model_entry_id);
+  if (!verdict) return;
+  // Availability-channel verdict only (authority already threw above).
+  // The last recorded probe outcome may carry a more specific codex
+  // failure type than the generic availability class — translate for
+  // evidence; the verdict's failed-gate reason is preserved verbatim.
+  const typed = codexProbeStateFailureClass(store, candidate);
+  return typed ? { reject: true, failure_class: typed, reason: verdict.reason } : verdict;
 }
+
+/** Codex-typed failure class from the durable provider probe_state, when
+ *  it is more specific than the generic availability class. */
+function codexProbeStateFailureClass(
+  store: PairEvidenceStore,
+  candidate: Pick<PlannerCandidate, "provider">,
+): PlannerFailureClass | null {
+  const provider = new ProviderCatalog(store).getProvider(String(candidate.provider));
+  const probeState = String(provider?.probe_state ?? "");
+  return probeState === "PROBE_CLI_MISSING" ? PLANNER_FAILURE_CLASS.CLI_MISSING
+    : probeState === "PROBE_TIMEOUT" ? PLANNER_FAILURE_CLASS.TIMEOUT
+    : probeState === "PROBE_RATE_LIMITED" ? PLANNER_FAILURE_CLASS.QUOTA_RATE_LIMITED
+    : probeState === "PROBE_MODEL_UNAVAILABLE" ? PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE
+    : null;
+}
+
+/**
+ * ONE bounded canonical refresh/requalification cycle for the codex-cli
+ * planner provider+model (R1 §3A) — the SAME seams boot qualification
+ * uses: validateAccess (real bounded probe → durable probe_state/
+ * auth_state) → qualify (provider qualification receipt) → probeModel
+ * (model probe receipt) → qualifyModel (model qualification receipt,
+ * supersedes a stale epoch). No shadow qualification: every write goes
+ * through the existing canonical Provider/Model evidence seams, and the
+ * verdict is never returned here — callers re-run FULL eligibility.
+ */
+export async function refreshCodexPlannerQualification(
+  store: PairEvidenceStore,
+  opts: {
+    provider_id: string;
+    model_entry_id: string;
+    model: string;
+    scratchDir: string;
+    /** Canonical configured probe budget (PAIR_MODEL_PROBE_TIMEOUT_MS). */
+    timeoutMs: number;
+    env?: CodexPlannerEnv;
+    actor?: string;
+  },
+): Promise<{
+  access_outcome: string;
+  provider_qualified: boolean;
+  model_probe_result: string | null;
+  model_qualified: boolean;
+}> {
+  const actor = opts.actor ?? "PAIR_PLANNER";
+  const codexProbe = () =>
+    codexPlannerProbe({
+      model: opts.model,
+      scratchDir: opts.scratchDir,
+      timeoutMs: opts.timeoutMs,
+      env: opts.env,
+    });
+  const pc = new ProviderCatalog(store);
+  const validator = new ProviderValidator(store);
+  const acc = await validator.validateAccess(opts.provider_id, { probe: codexProbe, actor });
+  const pq = validator.qualify(opts.provider_id, { actor });
+  if (pq.qualified) pc.setLifecycle(opts.provider_id, "QUALIFIED", { actor });
+  const me = store.tryGet("model_entry", opts.model_entry_id);
+  let modelProbeResult: string | null = null;
+  let modelQualified = false;
+  if (me && !((me.conditions as string[]) ?? []).includes("REMOVED")) {
+    const prb = await probeModel(store, opts.model_entry_id, 1, {
+      probeFn: async () => {
+        const r = await codexProbe();
+        return {
+          result: r.outcome === "AUTH_OK" ? "PASS" : r.outcome === "RATE_LIMITED" ? "RATE_LIMITED" : "FAIL",
+          latency_ms: r.latency_ms,
+          capability_evidence: r.outcome === "AUTH_OK" ? { text_inference: "PASS" } : {},
+          requests_used: 1,
+          tokens_used: 1,
+        };
+      },
+      capability: "text_inference",
+      executorId: CODEX_EXECUTOR_ID,
+      actor,
+    });
+    modelProbeResult = String(prb.result ?? null);
+    modelQualified = qualifyModel(store, opts.model_entry_id, {
+      capability_scope: ["text_inference"],
+      actor,
+    }).qualified;
+  }
+  return {
+    access_outcome: String(acc.outcome),
+    provider_qualified: pq.qualified,
+    model_probe_result: modelProbeResult,
+    model_qualified: modelQualified,
+  };
+}
+
+/**
+ * Codex-first canonical eligibility with bounded refresh (R1 §3).
+ * Classification is the canonical two-channel split — never a
+ * hand-written gate list:
+ *
+ *   - AUTHORITY violations (role/disjoint + the canonical AUTHORITY_GATES:
+ *     PROVIDER_QUALIFIED/AUTH_OK/NOT_BLOCKED/RECEIPT_CURRENT,
+ *     MODEL_PROVIDER_MATCH/IDENTITY_CONSISTENT/RECEIPT_CURRENT) throw
+ *     BEFORE any refresh — structural/operator rejections are never
+ *     retried.
+ *   - AVAILABILITY rejections (probe/currentness/health/scope evidence
+ *     the canonical projection calls failover-eligible) earn exactly ONE
+ *     bounded canonical refresh via `refreshCodexPlannerQualification`,
+ *     then the FULL canonical eligibility is re-proved. PASS → the
+ *     candidate is invoked and stays priority #1; still-reject → the
+ *     typed failed attempt settles (reason records both verdicts) and
+ *     failover continues to the next candidate.
+ */
+export async function assertCodexPlannerCandidateEligibleWithRefresh(
+  store: PairEvidenceStore,
+  candidate: Pick<PlannerCandidate, "model_entry_id" | "provider" | "model">,
+  deps: {
+    /** The bounded canonical refresh cycle (production wires
+     *  refreshCodexPlannerQualification; tests may substitute). */
+    refresh: () => Promise<unknown>;
+  },
+): Promise<PlannerEligibilityRejection | void> {
+  const verdict = assertCodexPlannerCandidateEligible(store, candidate);
+  if (!verdict) return; // eligible now, or authority threw before this point
+  // Refreshable rejection → exactly ONE bounded canonical refresh. Snapshot
+  // operator marks first: marks that APPEAR during the refresh still abort
+  // (a concurrent operator revocation is never availability evidence).
+  const operatorMarksBefore = providerOperatorMarks(store, candidate);
+  try {
+    await deps.refresh();
+  } catch (e) {
+    // Integrity/authority-typed failures inside the canonical refresh
+    // seams propagate (e.g. a model REMOVED mid-flight) — they are not
+    // failover evidence. Anything else means the refresh could not even
+    // run; the original typed rejection stands.
+    if (e instanceof IntegrityError) throw e;
+    return {
+      ...verdict,
+      reason: `${verdict.reason}|refresh_error:${String(e instanceof Error ? e.name : e).slice(0, 60)}`,
+    };
+  }
+  let after: PlannerEligibilityRejection | void;
+  try {
+    after = assertCodexPlannerCandidateEligible(store, candidate);
+  } catch (e) {
+    // Post-refresh authority failure (§4A FAIL path): if the ONLY new
+    // authority fact is evidence the refresh itself legitimately
+    // committed — a failed canonical requalification stamping
+    // UNQUALIFIED — the attempt settles typed FAILED and failover
+    // proceeds (the durable mark stays for the operator; the NEXT
+    // invocation re-throws upfront). Newly-appearing DISABLED/REMOVED
+    // marks (concurrent operator action) and receipt/identity-gate
+    // violations are always structural → propagate.
+    if (!(e instanceof IntegrityError) || String(e.code ?? "") !== "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE") throw e;
+    const marksAfter = providerOperatorMarks(store, candidate);
+    const freshOperatorMark = [...OPERATOR_MARKS].some((m) => !operatorMarksBefore.has(m) && marksAfter.has(m));
+    if (freshOperatorMark) throw e;
+    const failed = postRefreshFailedGates(store, candidate);
+    if (failed.some((g) => POST_REFRESH_STRUCTURAL_GATES.has(g))) throw e;
+    const typed = codexProbeStateFailureClass(store, candidate) ?? PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE;
+    return {
+      reject: true,
+      failure_class: typed,
+      reason: `${verdict.reason}|refresh_failed:${failed.join(",") || String(e.code)}`,
+    };
+  }
+  if (!after) return; // canonical refresh repaired currentness → priority #1 kept
+  return { ...after, reason: `${verdict.reason}|refresh_failed:${after.reason}` };
+}
+
+/** Current failed gate names from the canonical eligibility computation
+ *  (read-only — used to label a post-refresh authority failure). */
+function postRefreshFailedGates(
+  store: PairEvidenceStore,
+  candidate: Pick<PlannerCandidate, "model_entry_id" | "provider">,
+): string[] {
+  const model = store.tryGet("model_entry", String(candidate.model_entry_id));
+  const pid = String(model?.provider_id ?? candidate.provider);
+  const elig = providerModelEligibility(store, pid, String(candidate.model_entry_id));
+  return Object.entries(elig.gates).filter(([, v]) => v === "FAIL").map(([k]) => k);
+}
+
+/** DISABLED/REMOVED/UNQUALIFIED-style operator marks on the provider row.
+ *  Snapshot compared across the bounded refresh: a mark that newly
+ *  appears mid-refresh (concurrent operator action) must abort, while a
+ *  mark the refresh itself committed (a legitimately-failed canonical
+ *  requalification stamping UNQUALIFIED) is availability evidence. */
+function providerOperatorMarks(
+  store: PairEvidenceStore,
+  candidate: Pick<PlannerCandidate, "model_entry_id" | "provider">,
+): Set<string> {
+  const model = store.tryGet("model_entry", String(candidate.model_entry_id));
+  const pid = String(model?.provider_id ?? candidate.provider);
+  const provider = new ProviderCatalog(store).getProvider(pid);
+  return new Set(((provider?.conditions ?? []) as string[]).map(String));
+}
+
+const OPERATOR_MARKS = new Set(["DISABLED", "REMOVED"]);
+/** Failed gates that are always structural after a refresh — receipt or
+ *  identity violations can never be auto-repaired by a planner refresh. */
+const POST_REFRESH_STRUCTURAL_GATES = new Set([
+  "PROVIDER_RECEIPT_CURRENT",
+  "MODEL_RECEIPT_CURRENT",
+  "MODEL_PROVIDER_MATCH",
+  "MODEL_PROVIDER_IDENTITY_CONSISTENT",
+]);
 
 /**
  * Seed the codex-cli provider + model_entry into the canonical catalogs so

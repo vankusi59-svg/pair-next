@@ -72,8 +72,8 @@ import {
   llmPlannerTimeoutMs,
   codexPlannerTimeoutMs,
   codexPlannerPlan,
-  codexPlannerProbe,
-  assertCodexPlannerCandidateEligible,
+  assertCodexPlannerCandidateEligibleWithRefresh,
+  refreshCodexPlannerQualification,
   ensureCodexCliPlannerCatalog,
   CODEX_CLI_PROVIDER_ID,
   CODEX_CLI_ENDPOINT,
@@ -594,40 +594,27 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   // FAILED planner_attempt evidence the mandate requires instead of a
   // silently absent route. It is never invoked while ineligible — the
   // eligibility gate blocks the spawn and failover continues.
+  // R1 — the boot qualification is the SAME canonical refresh cycle the
+  // per-attempt codex-first seam runs; cfgProbeTimeoutMs (canonical
+  // PAIR_MODEL_PROBE_TIMEOUT_MS) is the authoritative probe budget.
   const qualifyCodexPlannerRoute = async ({ ref, pid, mid }) => {
     const prov = pc.getProvider(pid);
     const me = mcat.getModelByIds(pid, mid);
     if (!prov || !me) { console.log("MODEL_ROUTE:", ref, "catalog row missing after seed — skipped"); return; }
-    const codexProbe = () => codexPlannerProbe({
+    const ref2 = await refreshCodexPlannerQualification(store, {
+      provider_id: pid,
+      model_entry_id: String(me.model_entry_id),
       model: mid,
       scratchDir: codexPlannerScratch,
-      timeoutMs: Math.max(cfgProbeTimeoutMs, 60_000),
+      timeoutMs: cfgProbeTimeoutMs,
+      actor: "PAIR_MC",
     });
-    await validator.validateAccess(pid, { probe: codexProbe, actor: "PAIR_MC" });
-    const pq = validator.qualify(pid, { actor: "PAIR_MC" });
-    if (pq.qualified) pc.setLifecycle(pid, "QUALIFIED");
-    else console.log("MODEL_ROUTE:", ref, "codex provider NOT qualified", JSON.stringify(pq.gates));
-    if (!(me.conditions ?? []).includes("REMOVED")) {
-      const prb = await probeModel(store, String(me.model_entry_id), 1, {
-        probeFn: async () => {
-          const r2 = await codexProbe();
-          return {
-            result: r2.outcome === "AUTH_OK" ? "PASS" : r2.outcome === "RATE_LIMITED" ? "RATE_LIMITED" : "FAIL",
-            latency_ms: r2.latency_ms,
-            capability_evidence: r2.outcome === "AUTH_OK" ? { text_inference: "PASS" } : {},
-            requests_used: 1,
-            tokens_used: 1,
-          };
-        },
-        capability: "text_inference",
-        executorId: CODEX_EXECUTOR_ID,
-        actor: "PAIR_MC",
-      });
-      const mq = qualifyModel(store, String(me.model_entry_id), { capability_scope: ["text_inference"], actor: "PAIR_MC" });
-      console.log("MODEL_ROUTE:", ref, mq.qualified
-        ? `QUALIFIED (codex planner, probe ${prb.result})`
-        : `NOT qualified — candidate retained for typed failover evidence (${prb.result})`);
+    if (!ref2.provider_qualified) {
+      console.log("MODEL_ROUTE:", ref, "codex provider NOT qualified", `access=${ref2.access_outcome}`);
     }
+    console.log("MODEL_ROUTE:", ref, ref2.model_qualified
+      ? `QUALIFIED (codex planner, probe ${ref2.model_probe_result})`
+      : `NOT qualified — candidate retained for typed failover evidence (${ref2.model_probe_result ?? ref2.access_outcome})`);
     plannerCandidates.push({
       model_entry_id: String(me.model_entry_id),
       ref,
@@ -734,13 +721,26 @@ const planExpander = async (input) => {
       // §9 — full canonical eligibility re-proved before EVERY invocation
       // (role still held, model usable, provider still eligible, never a
       // DSH_EXECUTION model/alias borrowed into planning).
-      // CPL-1 — codex-cli candidates get the transport-specific
-      // eligibility seam (same role/disjointness authority; availability
-      // verdicts read durable probe evidence). HTTP candidates keep the
-      // shared providerModelEligibility path unchanged.
+      // CPL-1 R1 — codex-cli candidates run the SAME canonical eligibility
+      // as HTTP candidates plus the codex-first rule: an availability
+      // rejection earns ONE bounded canonical refresh (re-probe +
+      // requalify through the canonical evidence seams, cfgProbeTimeoutMs
+      // authoritative) then a full re-proof — PASS keeps codex #1,
+      // still-fail settles the typed attempt and failover continues.
+      // Authority violations throw before any refresh (never retried).
       assertEligible: (c) =>
         c.transport === "codex_cli"
-          ? assertCodexPlannerCandidateEligible(store, c)
+          ? assertCodexPlannerCandidateEligibleWithRefresh(store, c, {
+              refresh: () =>
+                refreshCodexPlannerQualification(store, {
+                  provider_id: c.provider,
+                  model_entry_id: c.model_entry_id,
+                  model: c.model,
+                  scratchDir: codexPlannerScratch,
+                  timeoutMs: cfgProbeTimeoutMs,
+                  actor: "PAIR_PLANNER",
+                }),
+            })
           : assertPlannerCandidateEligible(store, c.model_entry_id),
       // §6/§7 — ONE canonical task-preparation seam: sanitize + native
       // contract enrichment + the same validatePlanProposal the preview

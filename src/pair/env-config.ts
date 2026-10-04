@@ -63,10 +63,12 @@ export function readPositiveIntEnv(
 
 /* --------------------------- documented knobs --------------------------- */
 
-/** Model/provider liveness probe budget. Unit: milliseconds. Bounds 0.5s–120s. */
+/** Model/provider liveness probe budget. Unit: milliseconds. Bounds 0.5s–120s.
+ *  CPL-1 R1 §7 — canonical default 60s; transport-specific code must not
+ *  substitute its own floor/ceiling for the configured value. */
 export const MODEL_PROBE_TIMEOUT = {
   name: "PAIR_MODEL_PROBE_TIMEOUT_MS",
-  defaultValue: 8_000,
+  defaultValue: 60_000,
   bounds: { min: 500, max: 120_000, unit: "ms" },
 } as const;
 
@@ -87,11 +89,12 @@ export const LLM_PLANNER_TIMEOUT = {
   bounds: { min: 2_000, max: 900_000, unit: "ms" },
 } as const;
 
-/** CPL-1 — Codex CLI planner invocation budget (a real `codex exec` takes
- *  10–60s; distinct from the HTTP planner budget). Unit: ms. Bounds 5s–900s. */
+/** CPL-1 — Codex CLI plan-generation budget (a real `codex exec` plan can
+ *  run minutes; R1 §9 — default 15 minutes, independent from the
+ *  PAIR_MODEL_PROBE_TIMEOUT_MS liveness budget). Unit: ms. Bounds 5s–900s. */
 export const CODEX_PLANNER_TIMEOUT = {
   name: "PAIR_CODEX_PLANNER_TIMEOUT_MS",
-  defaultValue: 120_000,
+  defaultValue: 900_000,
   bounds: { min: 5_000, max: 900_000, unit: "ms" },
 } as const;
 

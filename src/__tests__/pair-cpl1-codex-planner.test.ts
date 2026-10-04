@@ -25,6 +25,8 @@ import {
   codexPlannerPlan,
   codexPlannerProbe,
   assertCodexPlannerCandidateEligible,
+  assertCodexPlannerCandidateEligibleWithRefresh,
+  refreshCodexPlannerQualification,
   ensureCodexCliPlannerCatalog,
   codexPlannerArgvForTest,
   CODEX_CLI_PROVIDER_ID,
@@ -37,6 +39,14 @@ import {
 } from "../pair/model-role.js";
 import { ModelEvidenceCatalog, canonicalModelId } from "../pair/model-catalog.js";
 import { ProviderCatalog } from "../pair/provider-catalog.js";
+import { ProviderValidator } from "../pair/provider-validation.js";
+import { probeModel, qualifyModel } from "../pair/model-probing.js";
+import {
+  modelProbeTimeoutMs,
+  codexPlannerTimeoutMs,
+  MODEL_PROBE_TIMEOUT,
+  CODEX_PLANNER_TIMEOUT,
+} from "../pair/env-config.js";
 import { makeServeCanonicalizer } from "../pair/serve-planner.js";
 import {
   beginPlannerRun,
@@ -67,6 +77,21 @@ const b = process.env.FAKE_CODEX_BEHAVIOR || "ok";
 let prompt = "";
 process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
+  // R1 — invocation ledger: PLAN (real planner prompt) vs PROBE (ping
+  // schema prompt) so tests can assert ZERO invocation / bounded refresh.
+  const invokeLog = process.env.FAKE_CODEX_INVOKELOG;
+  if (invokeLog) {
+    fs.appendFileSync(invokeLog, (prompt.includes('"ok": true') ? "PROBE" : "PLAN") + "\\n");
+  }
+  // R1 §6 — dump the auth-relevant env the child actually received.
+  const envFile = process.env.FAKE_CODEX_ENVFILE;
+  if (envFile) {
+    fs.writeFileSync(envFile, JSON.stringify({
+      CODEX_HOME: process.env.CODEX_HOME != null,
+      CODEX_API_KEY: process.env.CODEX_API_KEY != null,
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY != null,
+    }));
+  }
   if (b === "sleep") { setTimeout(() => {}, 120000); return; }
   if (b === "authfail") { process.stderr.write("error: 401 unauthorized — login required\\n"); process.exit(1); }
   if (b === "modelunavail") { process.stderr.write("error: model gpt-6.1-sol is not available for this account\\n"); process.exit(1); }
@@ -109,27 +134,43 @@ function makeFakeCodex(dir: string, behavior: string): { exe: string } {
 const CAP_SETS = [["AUTOMATON_TASK_EXECUTION", "FILE_OPERATIONS", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION", "TELEGRAM_DELIVERY"]];
 const CAPS = ["AUTOMATON_TASK_EXECUTION", "FILE_OPERATIONS", "REASONING", "CODE_GENERATION", "CODE_EDITING", "SHELL_EXECUTION", "PYTHON_EXECUTION", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION", "TELEGRAM_DELIVERY"];
 
-function seedCodexCandidate(store: PairEvidenceStore, opts: { qualified?: boolean; authFailed?: boolean; cliMissing?: boolean } = {}): PlannerCandidate {
+/** Canonical seed (R1.A): the provider/model are qualified through the
+ *  REAL seams (validateAccess probe → qualify receipt → probeModel
+ *  receipt → qualifyModel receipt + lifecycle) so the FULL Phase E gate
+ *  set — including PROVIDER_RECEIPT_CURRENT / MODEL_RECEIPT_CURRENT —
+ *  passes legitimately. Row-poking is reserved for the adversarial cases. */
+async function seedCodexCandidate(store: PairEvidenceStore, opts: { cliMissing?: boolean; timeoutProbe?: boolean } = {}): Promise<PlannerCandidate> {
   const mid = "gpt-6.1-sol";
   const meId = ensureCodexCliPlannerCatalog(store, mid, "TEST");
   const pc = new ProviderCatalog(store);
   if (opts.cliMissing) {
     pc.recordProbeObservation(CODEX_CLI_PROVIDER_ID, "CLI_MISSING", { detail: "codex executable not resolvable", actor: "TEST" });
     pc.recordAccessObservation(CODEX_CLI_PROVIDER_ID, "UNREACHABLE", { actor: "TEST" });
-  } else if (opts.authFailed) {
-    pc.recordProbeObservation(CODEX_CLI_PROVIDER_ID, "AUTH_FAILED", { actor: "TEST" });
-    pc.recordAccessObservation(CODEX_CLI_PROVIDER_ID, "AUTH_FAILED", { actor: "TEST" });
-  } else if (opts.qualified !== false) {
-    pc.recordProbeObservation(CODEX_CLI_PROVIDER_ID, "PASS", { actor: "TEST" });
-    pc.recordAccessObservation(CODEX_CLI_PROVIDER_ID, "AUTH_OK", { actor: "TEST" });
+  } else {
+    const pv = new ProviderValidator(store);
+    await pv.validateAccess(CODEX_CLI_PROVIDER_ID, {
+      probe: async () => ({
+        outcome: opts.timeoutProbe ? "TIMEOUT" : "AUTH_OK",
+        latency_ms: 1,
+        detail: "seed",
+      }),
+      actor: "TEST",
+    });
+    pv.qualify(CODEX_CLI_PROVIDER_ID, { actor: "TEST" });
     pc.setLifecycle(CODEX_CLI_PROVIDER_ID, "QUALIFIED", { actor: "TEST" });
-  }
-  if (opts.qualified !== false && !opts.cliMissing && !opts.authFailed) {
-    const mcat = new ModelEvidenceCatalog(store);
-    const me = mcat.getModel(meId)!;
-    me.lifecycle_state = "QUALIFIED";
-    me.probe_state = "PROBED";
-    store.put("model_entry", String(me.model_entry_id), me, Number(me.version));
+    await probeModel(store, meId, 1, {
+      probeFn: async () => ({
+        result: "PASS",
+        latency_ms: 1,
+        capability_evidence: { text_inference: "PASS" },
+        requests_used: 1,
+        tokens_used: 1,
+      }),
+      capability: "text_inference",
+      executorId: "CODEX",
+      actor: "TEST",
+    });
+    qualifyModel(store, meId, { capability_scope: ["text_inference"], actor: "TEST" });
   }
   assignModelRole(store, meId, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "TEST" });
   return {
@@ -143,6 +184,33 @@ function seedCodexCandidate(store: PairEvidenceStore, opts: { qualified?: boolea
   };
 }
 
+/** Mutate the durable provider row directly (adversarial fixtures only). */
+function pokeProvider(store: PairEvidenceStore, fn: (p: Record<string, unknown>) => void): void {
+  const pc = new ProviderCatalog(store);
+  const p = pc.getProvider(CODEX_CLI_PROVIDER_ID)!;
+  fn(p);
+  store.put("provider", String(p.entry_id), p, Number(p.version));
+}
+function pokeModel(store: PairEvidenceStore, meId: string, fn: (m: Record<string, unknown>) => void): void {
+  const mcat = new ModelEvidenceCatalog(store);
+  const m = mcat.getModel(meId)!;
+  fn(m);
+  store.put("model_entry", String(m.model_entry_id), m, Number(m.version));
+}
+function pokeModelReceipt(store: PairEvidenceStore, meId: string, fn: (r: Record<string, unknown>) => void): void {
+  const mcat = new ModelEvidenceCatalog(store);
+  const m = mcat.getModel(meId)!;
+  const rid = String(m.current_qualification_receipt_id);
+  const r = store.get("model_qualification", rid);
+  fn(r);
+  store.put("model_qualification", rid, r, Number(r.version));
+}
+/** Read the fake-codex invocation ledger: ["PROBE"|"PLAN"] per spawn. */
+const invokeLedger = (dir: string) =>
+  fs.existsSync(path.join(dir, "invokes.log"))
+    ? fs.readFileSync(path.join(dir, "invokes.log"), "utf8").trim().split("\n").filter(Boolean)
+    : [];
+
 const geminiCandidate = (id = "ME_GEM"): PlannerCandidate => ({
   model_entry_id: id, ref: "gemini:gemini-3.1-flash-lite", provider: "gemini",
   model: "gemini-3.1-flash-lite", endpoint: "https://gem.test", credentialEnv: "ENV_X",
@@ -153,17 +221,44 @@ async function runPool(opts: {
   codex: PlannerCandidate;
   exeEnv: Record<string, string>;
   exe?: string;
+  dir?: string;
+  /** When false, codex eligibility runs WITHOUT the R1 refresh seam
+   *  (mirrors pre-R1 behavior / proves refresh is what repairs). */
+  refresh?: boolean;
   geminiPlan?: () => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
   scratch: string;
 }) {
   const canonicalize = makeServeCanonicalizer({ executorCapSets: () => CAP_SETS });
   const run = beginPlannerRun(opts.store, { routes: [opts.codex.ref, "gemini:gemini-3.1-flash-lite"], actor: "TEST" });
   const geminiCalls: number[] = [];
+  const exeEnv = {
+    ...process.env,
+    ...(opts.exe ? { PAIR_CODEX_PLANNER_EXECUTABLE: opts.exe } : {}),
+    ...(opts.dir ? { FAKE_CODEX_INVOKELOG: path.join(opts.dir, "invokes.log") } : {}),
+    ...opts.exeEnv,
+  };
   try {
     const res = await runPlannerFailover({
       candidates: [opts.codex, geminiCandidate()],
+      // Production wiring (R1): codex candidates run canonical eligibility
+      // + ONE bounded canonical refresh on availability rejections.
       assertEligible: (c) =>
-        c.transport === "codex_cli" ? assertCodexPlannerCandidateEligible(opts.store, c) : undefined,
+        c.transport === "codex_cli"
+          ? opts.refresh === false
+            ? assertCodexPlannerCandidateEligible(opts.store, c)
+            : assertCodexPlannerCandidateEligibleWithRefresh(opts.store, c, {
+                refresh: () =>
+                  refreshCodexPlannerQualification(opts.store, {
+                    provider_id: c.provider,
+                    model_entry_id: c.model_entry_id,
+                    model: c.model,
+                    scratchDir: opts.scratch,
+                    timeoutMs: 2_000,
+                    env: exeEnv,
+                    actor: "TEST",
+                  }),
+              })
+          : undefined,
       canonicalize: (tasks) => {
         const canon = canonicalize(tasks, "goal");
         validatePlanProposal({ tasks: canon }, new Set(CAPS));
@@ -176,7 +271,7 @@ async function runPool(opts: {
               executable: opts.exe,
               timeoutMs: 8_000,
               scratchDir: opts.scratch,
-              env: { ...process.env, ...opts.exeEnv },
+              env: exeEnv,
               allowedCapabilities: CAPS,
               capabilitySets: CAP_SETS,
             })
@@ -206,10 +301,10 @@ describe("CPL-1 codex planner primary", () => {
   it("A. sol wins primary → winner_attempt_no=1, gemini never invoked", async () => {
     const dir = freshDir("a");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     const { exe } = makeFakeCodex(dir, "ok");
     const { res, geminiCalls, run } = await runPool({
-      store, codex, exe, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
     });
     expect(res.winner.attempt_no).toBe(1);
     expect(res.winner.route).toBe("codex-cli:gpt-6.1-sol");
@@ -227,30 +322,88 @@ describe("CPL-1 codex planner primary", () => {
     expect(String(runRow.outcome ?? runRow.state)).toBeTruthy();
   });
 
-  it("B. CLI missing at eligibility → typed FAILED attempt → gemini wins #2", async () => {
+  it("B. never-qualified provider → AUTHORITY fail-closed (canonical), ZERO invocation, no gemini", async () => {
     const dir = freshDir("b");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store, { cliMissing: true });
-    const { res, geminiCalls } = await runPool({ store, codex, exeEnv: {}, scratch: path.join(dir, "scr") });
-    expect(res.winner.attempt_no).toBe(2);
+    const codex = await seedCodexCandidate(store, { cliMissing: true });
+    // Canonical split (R1.A): PROVIDER_QUALIFIED/PROVIDER_AUTH_OK are
+    // authority gates — an unproven/unqualified provider is a STRUCTURAL
+    // violation, not a refreshable availability case. Throw propagates:
+    // attempt settles AUTHORITY_REJECTED, ZERO codex invocation, run
+    // fails closed (no silent gemini fallback for an authority problem).
+    await expect(
+      runPool({
+        store, codex, dir,
+        exeEnv: { PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex") },
+        scratch: path.join(dir, "scr"),
+      }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+    const attempts = store.list("planner_attempt");
+    expect(attempts.length).toBe(1);
+    expect(String(attempts[0].outcome)).toBe("FAILED");
+    expect(String(attempts[0].warnings)).toContain("AUTHORITY_REJECTED:FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE");
+  });
+
+  it("B2. stale probe evidence on a QUALIFIED provider → refresh repairs → codex keeps #1", async () => {
+    const dir = freshDir("b2");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    // Availability-channel drift (§4A): provider stays QUALIFIED + valid
+    // receipt, but probe_state drifted to PROBE_TIMEOUT →
+    // PROVIDER_PROBE_CURRENT fails (availability, not authority) → ONE
+    // bounded canonical refresh re-probes through the REAL codex
+    // transport seams → fresh evidence PASS → full eligibility PASS →
+    // codex invoked and wins #1.
+    pokeProvider(store, (p) => { p.probe_state = "PROBE_TIMEOUT"; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    const { res, geminiCalls } = await runPool({
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+    });
+    expect(res.winner.attempt_no).toBe(1);
+    expect(res.winner.provider).toBe("codex-cli");
+    expect(res.winner.outcome).toBe("SUCCESS");
+    expect(geminiCalls.length).toBe(0);
+    const ledger = invokeLedger(dir);
+    // Bounded refresh: exactly ONE validateAccess probe + ONE model probe
+    // (2 PROBE invocations), then the real plan invocation.
+    expect(ledger.filter((k) => k === "PROBE").length).toBe(2);
+    expect(ledger.filter((k) => k === "PLAN").length).toBe(1);
+  });
+
+  it("B3. refresh probe still dead → refresh-committed UNQUALIFIED is availability evidence → typed FAILED → gemini (§4A fail)", async () => {
+    const dir = freshDir("b3");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.probe_state = "PROBE_TIMEOUT"; });
+    // Probe binary dead: refresh's canonical requalification FAILS and
+    // legitimately stamps UNQUALIFIED — that is availability evidence
+    // committed through canonical seams, so the attempt settles FAILED
+    // (Gemini proceeds), not an authority abort. ZERO plan spawn.
+    const { res, geminiCalls } = await runPool({
+      store, codex, dir,
+      exeEnv: { PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex") },
+      scratch: path.join(dir, "scr"),
+    });
     expect(res.winner.provider).toBe("gemini");
     expect(res.attempts[0].outcome).toBe("FAILED");
     expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.CLI_MISSING);
-    expect(res.attempts[0].warnings.join(",")).toContain("cli_missing");
+    expect(res.attempts[0].warnings.join(",")).toContain("refresh_failed");
     expect(geminiCalls.length).toBe(1);
-    const attempts = store.list("planner_attempt");
-    expect(attempts.length).toBe(2);
-    expect(String(attempts[0].outcome)).toBe("FAILED");
-    expect(String(attempts[0].failure_class)).toBe("CLI_MISSING");
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(0);
+    // Durable mark committed by the failed requalification stays for the
+    // operator — a SECOND eligibility evaluation now fails upfront.
+    const prov = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect((prov.conditions as string[]).includes("UNQUALIFIED")).toBe(true);
   });
 
   it("C. auth failure at invoke → FAILED/AUTH_REJECTED → gemini wins #2", async () => {
     const dir = freshDir("c");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     const { exe } = makeFakeCodex(dir, "authfail");
     const { res } = await runPool({
-      store, codex, exe, exeEnv: { FAKE_CODEX_BEHAVIOR: "authfail" }, scratch: path.join(dir, "scr"),
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "authfail" }, scratch: path.join(dir, "scr"),
     });
     expect(res.winner.attempt_no).toBe(2);
     expect(res.attempts[0].outcome).toBe("FAILED");
@@ -261,10 +414,10 @@ describe("CPL-1 codex planner primary", () => {
   it("D. model unavailable → FAILED/MODEL_UNAVAILABLE → gemini wins", async () => {
     const dir = freshDir("d");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     const { exe } = makeFakeCodex(dir, "modelunavail");
     const { res } = await runPool({
-      store, codex, exe, exeEnv: { FAKE_CODEX_BEHAVIOR: "modelunavail" }, scratch: path.join(dir, "scr"),
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "modelunavail" }, scratch: path.join(dir, "scr"),
     });
     expect(res.winner.provider).toBe("gemini");
     expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE);
@@ -273,7 +426,7 @@ describe("CPL-1 codex planner primary", () => {
   it("E. timeout → FAILED/TIMEOUT + child killed (no orphan process)", async () => {
     const dir = freshDir("e");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     const { exe } = makeFakeCodex(dir, "sleep");
     const pidFile = path.join(dir, "codex.pid");
     const t0 = Date.now();
@@ -299,10 +452,10 @@ describe("CPL-1 codex planner primary", () => {
   it("F. malformed output → FAILED/MALFORMED_RESPONSE → gemini wins", async () => {
     const dir = freshDir("f");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     const { exe } = makeFakeCodex(dir, "garbage");
     const { res } = await runPool({
-      store, codex, exe, exeEnv: { FAKE_CODEX_BEHAVIOR: "garbage" }, scratch: path.join(dir, "scr"),
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "garbage" }, scratch: path.join(dir, "scr"),
     });
     expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.MALFORMED_RESPONSE);
     expect(res.attempts[0].warnings.join(",")).toContain("CODEX_OUTPUT_INVALID");
@@ -312,10 +465,10 @@ describe("CPL-1 codex planner primary", () => {
   it("G. canonically-invalid plan (undeclared remote dep) → PLAN_INVALID → gemini wins", async () => {
     const dir = freshDir("g");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     const { exe } = makeFakeCodex(dir, "remote_no_edge");
     const { res } = await runPool({
-      store, codex, exe, exeEnv: { FAKE_CODEX_BEHAVIOR: "remote_no_edge" }, scratch: path.join(dir, "scr"),
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "remote_no_edge" }, scratch: path.join(dir, "scr"),
     });
     expect(res.attempts[0].outcome).toBe("FAILED");
     expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.PLAN_INVALID);
@@ -325,7 +478,7 @@ describe("CPL-1 codex planner primary", () => {
   it("H. authority separation — planner argv is read-only/no-net/isolated; zero governed side effects", async () => {
     const dir = freshDir("h");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     const { exe } = makeFakeCodex(dir, "ok");
     const argv = codexPlannerArgvForTest("gpt-6.1-sol", "/tmp/scr");
     const joined = argv.join(" ");
@@ -342,16 +495,16 @@ describe("CPL-1 codex planner primary", () => {
     expect(joined).not.toContain("execution_journal");
     expect(joined).not.toContain("pair_workspace");
     const before = store.list("governed_task").length + store.list("execution").length;
-    await runPool({ store, codex, exe, exeEnv: {}, scratch: path.join(dir, "scr") });
+    await runPool({ store, codex, exe, dir, exeEnv: {}, scratch: path.join(dir, "scr") });
     const after = store.list("governed_task").length + store.list("execution").length;
     expect(after).toBe(before); // planning produced zero executor/dispatch entities
     expect(store.list("planner_attempt").length).toBe(1); // only planner evidence
   });
 
-  it("I. planner↔DSH disjointness: aliased DSH model + missing role both fail closed", () => {
+  it("I. planner↔DSH disjointness: aliased DSH model + missing role both fail closed", async () => {
     const dir = freshDir("i");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
-    const codex = seedCodexCandidate(store);
+    const codex = await seedCodexCandidate(store);
     // aliased DSH entry — same canonical identity → overlap → authority throw
     const mcat = new ModelEvidenceCatalog(store);
     mcat.upsertModelClaim({
@@ -429,5 +582,251 @@ describe("CPL-1 codex planner primary", () => {
     expect(classify("CODEX_OUTPUT_INVALID")).toBe(PLANNER_FAILURE_CLASS.MALFORMED_RESPONSE);
     expect(classify("CODEX_RATE_LIMITED")).toBe(PLANNER_FAILURE_CLASS.QUOTA_RATE_LIMITED);
     expect(classify(CODEX_PLANNER_WARNING.MODEL_UNAVAILABLE)).toBe(PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE);
+  });
+});
+
+/**
+ * CPL-1 R1 §4 — adversarial canonical-eligibility matrix. Every case
+ * proves the codex planner passes the FULL Phase E authority (identical
+ * to HTTP candidates): structural/operator violations → authority throw,
+ * ZERO codex invocation, no auto-revive; refreshable currentness → ONE
+ * bounded canonical refresh → only fresh PASS evidence may invoke.
+ */
+describe("CPL-1 R1 adversarial eligibility (§4)", () => {
+  it("B. provider DISABLED/BLOCKED → authority throw, ZERO invocation, no auto-revive", async () => {
+    const dir = freshDir("r1b");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.conditions = ["DISABLED"]; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0); // ZERO codex invocation — no probe, no plan
+    const a = store.list("planner_attempt");
+    expect(a.length).toBe(1);
+    expect(String(a[0].warnings)).toContain("AUTHORITY_REJECTED:FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE");
+  });
+
+  it("C. provider receipt fingerprint mismatch → authority throw, ZERO invocation", async () => {
+    const dir = freshDir("r1c");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    // Drift a material identity facet AFTER qualification → the minted
+    // provider receipt no longer binds → PROVIDER_RECEIPT_CURRENT fails
+    // (authority channel — a stale receipt is never refreshed silently).
+    pokeProvider(store, (p) => { p.configured_endpoint_identity = "codex-cli://mutated-endpoint"; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("D. provider/model ownership mismatch → MODEL_PROVIDER_MATCH FAIL → throw, ZERO invocation", async () => {
+    const dir = freshDir("r1d");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.provider_id = "foreign-provider"; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("E. unresolved provider_id contradiction → authority throw, ZERO invocation", async () => {
+    const dir = freshDir("r1e");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => {
+      m.contradictions = [{ field: "provider_id", prior: "codex-cli", candidate: "foreign-provider" }];
+    });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("F1. model STALE → refreshable → canonical requalification repairs → codex wins #1", async () => {
+    const dir = freshDir("r1f1");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.conditions = ["STALE"]; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    const { res } = await runPool({
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+    });
+    // MODEL_NOT_STALE is availability-channel: ONE bounded canonical
+    // refresh re-probes + requalifies (issueQualificationReceipt
+    // canonically supersedes STALE) → full eligibility PASS → invoke.
+    expect(res.winner.attempt_no).toBe(1);
+    expect(res.winner.provider).toBe("codex-cli");
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(1);
+  });
+
+  it("F2. model UNAVAILABLE → refresh cannot legitimately repair → ZERO plan, gemini wins", async () => {
+    const dir = freshDir("r1f2");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.conditions = ["UNAVAILABLE"]; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    const { res } = await runPool({
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+    });
+    expect(res.winner.provider).toBe("gemini");
+    expect(res.attempts[0].outcome).toBe("FAILED");
+    expect(res.attempts[0].warnings.join(",")).toContain("refresh_failed");
+    // The bounded refresh ran its probes but the canonical seams keep
+    // UNAVAILABLE — no plan invocation, no auto-revive.
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(0);
+  });
+
+  it("F3. model BLOCKED → authority throw, ZERO invocation", async () => {
+    const dir = freshDir("r1f3");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.conditions = ["BLOCKED"]; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_MODEL_ROLE_MODEL_NOT_USABLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("G. model receipt fingerprint invalid → AUTHORITY throw, ZERO invocation (§4C)", async () => {
+    const dir = freshDir("r1g");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModelReceipt(store, codex.model_entry_id, (r) => { r.material_fingerprint = "deadbeef".repeat(8); });
+    const { exe } = makeFakeCodex(dir, "ok");
+    // MODEL_RECEIPT_CURRENT is an AUTHORITY gate — an invalid/stale
+    // receipt is a structural violation: ZERO invocation, no planner
+    // refresh (remediation is operator canonical requalification only).
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+    const a = store.list("planner_attempt");
+    expect(String(a[0].warnings)).toContain("AUTHORITY_REJECTED");
+  });
+
+  it("G2. provider receipt fingerprint invalid → AUTHORITY throw, ZERO invocation (§4C)", async () => {
+    const dir = freshDir("r1g2");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    const pc = new ProviderCatalog(store);
+    const p = pc.getProvider(CODEX_CLI_PROVIDER_ID)!;
+    const rid = String(p.current_qualification_receipt_id);
+    const r = store.get("provider_qualification", rid);
+    r.material_fingerprint = "deadbeef".repeat(8);
+    store.put("provider_qualification", rid, r, Number(r.version));
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("H. malformed capability scope on current receipt → refresh mints valid scope → codex wins #1", async () => {
+    const dir = freshDir("r1h");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModelReceipt(store, codex.model_entry_id, (r) => { r.capability_scope = []; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    const { res } = await runPool({
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+    });
+    // MODEL_QUALIFICATION_SCOPE_VALID is availability-channel — a fresh
+    // canonical qualification mints a receipt with a valid scope → invoke.
+    expect(res.winner.attempt_no).toBe(1);
+    expect(res.winner.provider).toBe("codex-cli");
+  });
+
+  it("I. capability probe no longer current → ONE bounded refresh → new PASS authorizes codex #1", async () => {
+    const dir = freshDir("r1i");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    // A newer FAIL probe receipt supersedes the qualified window →
+    // MODEL_CAPABILITY_PROBE_CURRENT fails (availability).
+    await probeModel(store, codex.model_entry_id, 1, {
+      probeFn: async () => ({ result: "FAIL", latency_ms: 1, capability_evidence: { text_inference: "FAIL" }, requests_used: 1, tokens_used: 1 }),
+      capability: "text_inference",
+      executorId: "CODEX",
+      actor: "TEST",
+    });
+    const { exe } = makeFakeCodex(dir, "ok");
+    const { res } = await runPool({
+      store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+    });
+    expect(res.winner.attempt_no).toBe(1);
+    expect(res.winner.provider).toBe("codex-cli");
+    // Refresh produced exactly one new PASS probe cycle (2 probe
+    // invocations: provider + model) before the plan invocation.
+    expect(invokeLedger(dir).filter((k) => k === "PROBE").length).toBe(2);
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(1);
+  });
+});
+
+describe("CPL-1 R1 auth isolation + timeout authority", () => {
+  it("§6/B. planner child never inherits CODEX_API_KEY/OPENAI_API_KEY; CODEX_HOME present", async () => {
+    const dir = freshDir("auth-iso");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    const { exe } = makeFakeCodex(dir, "ok");
+    const envFile = path.join(dir, "child-env.json");
+    const codexHome = path.join(dir, "codex-home");
+    fs.mkdirSync(codexHome, { recursive: true });
+    // Parent carries ambient API keys + a valid CODEX_HOME — the planner
+    // child must see CODEX_HOME but NOT either API key.
+    const { res } = await runPool({
+      store, codex, exe, dir,
+      exeEnv: {
+        FAKE_CODEX_BEHAVIOR: "ok",
+        FAKE_CODEX_ENVFILE: envFile,
+        CODEX_HOME: codexHome,
+        CODEX_API_KEY: "fake-nonprod-dummy-value",
+        OPENAI_API_KEY: "fake-nonprod-dummy-value",
+      },
+      scratch: path.join(dir, "scr"),
+    });
+    expect(res.winner.provider).toBe("codex-cli");
+    const seen = JSON.parse(fs.readFileSync(envFile, "utf8"));
+    expect(seen.CODEX_HOME).toBe(true);
+    expect(seen.CODEX_API_KEY).toBe(false);
+    expect(seen.OPENAI_API_KEY).toBe(false);
+  });
+
+  it("§10. defaults: probe=60000, planner=900000; independent overrides; no cross-coupling", () => {
+    expect(MODEL_PROBE_TIMEOUT.defaultValue).toBe(60_000);
+    expect(CODEX_PLANNER_TIMEOUT.defaultValue).toBe(900_000);
+    expect(modelProbeTimeoutMs({})).toBe(60_000);
+    expect(codexPlannerTimeoutMs({})).toBe(900_000);
+    // Independent overrides — each knob reads only its own env name.
+    expect(modelProbeTimeoutMs({ PAIR_MODEL_PROBE_TIMEOUT_MS: "20000" })).toBe(20_000);
+    expect(codexPlannerTimeoutMs({ PAIR_CODEX_PLANNER_TIMEOUT_MS: "600000" })).toBe(600_000);
+    expect(modelProbeTimeoutMs({ PAIR_CODEX_PLANNER_TIMEOUT_MS: "600000" })).toBe(60_000);
+    expect(codexPlannerTimeoutMs({ PAIR_MODEL_PROBE_TIMEOUT_MS: "20000" })).toBe(900_000);
+    // Bounds still fail closed on malformed input.
+    expect(() => modelProbeTimeoutMs({ PAIR_MODEL_PROBE_TIMEOUT_MS: "abc" })).toThrow();
+    expect(() => codexPlannerTimeoutMs({ PAIR_CODEX_PLANNER_TIMEOUT_MS: "abc" })).toThrow();
+  });
+
+  it("§10. sleeping codex probe is killed at the configured budget — no hidden 60s floor/ceiling", async () => {
+    const dir = freshDir("probe-budget");
+    const { exe } = makeFakeCodex(dir, "sleep");
+    const t0 = Date.now();
+    const r = await codexPlannerProbe({
+      model: "gpt-6.1-sol",
+      executable: exe,
+      timeoutMs: 2_500,
+      scratchDir: path.join(dir, "scr"),
+      env: { ...process.env, FAKE_CODEX_BEHAVIOR: "sleep" },
+    });
+    expect(r.outcome).toBe("TIMEOUT");
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeGreaterThanOrEqual(2_400);
+    expect(elapsed).toBeLessThan(15_000); // honored the 2.5s config, not a 60s substitute
   });
 });
