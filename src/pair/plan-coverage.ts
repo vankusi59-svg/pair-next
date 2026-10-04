@@ -55,7 +55,7 @@ export interface PlanCoverageReport {
 /** Verb classes shared by obligation text and task instruction. A task
  *  must perform work of the same class as the obligation it covers. */
 const VERB_CLASSES: Array<{ cls: string; re: RegExp }> = [
-  { cls: "research", re: /\b(?:research|study|studies|investigat|survey|search|find|gather|collect|nghiên cứu|khảo sát|thu thập|tìm)/iu },
+  { cls: "research", re: /\b(?:research|study|studies|investigat|survey|search|find|browse|gather|collect|nghiên cứu|khảo sát|thu thập|tìm)/iu },
   { cls: "analyze", re: /\b(?:analy[sz]e|analys|assess|evaluat|review|phân tích|đánh giá|xem xét)/iu },
   { cls: "compare", re: /\b(?:compar|benchmark|contrast|so sánh|đối chiếu)/iu },
   { cls: "propose", re: /\b(?:propos|recommend|suggest|deriv|identify|đề xuất|xác định)/iu },

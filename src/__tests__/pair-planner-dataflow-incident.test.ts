@@ -3385,3 +3385,56 @@ describe("PATH-GRAMMAR — planner-natural phrasings", () => {
     expect(m.produces).toEqual([]);
   });
 });
+
+describe("PATH-GRAMMAR-R1 — modifier destinations need a governing produce verb", () => {
+  const df = (instr: string) =>
+    extractTaskDataflow({
+      task_key: "T1",
+      task_instruction: instr,
+      required_capabilities: [],
+      metadata: {},
+    });
+
+  it("A. produce-governed modifier destination still produces: 'format ... into a professional report.md'", () => {
+    const m = df(
+      "Read analysis_temp.txt and format the findings into a professional report.md file.",
+    );
+    expect(m.produces).toContain("report.md");
+    expect(m.consumes).toContain("analysis_temp.txt");
+  });
+
+  it("B. 'write results into a clean summary.md' produces", () => {
+    expect(df("Write results into a clean summary.md file.").produces).toContain(
+      "summary.md",
+    );
+  });
+
+  it("C. purpose phrase is NOT a producer: 'Read source data to compare with baseline.csv'", () => {
+    const m = df("Read source data to compare with baseline.csv.");
+    expect(m.produces).not.toContain("baseline.csv");
+    expect(m.consumes).toContain("baseline.csv");
+  });
+
+  it("D. unbound comparison input still fails closed at the canonical seam", () => {
+    expect(() =>
+      reconcilePlanDataflow(
+        [
+          {
+            task_key: "T1",
+            task_instruction: "Read source data to compare with baseline.csv.",
+            required_capabilities: ["REASONING"],
+            depends_on: [],
+            metadata: {},
+          },
+        ] as never,
+        { telegramIntent: { requested: false, artifacts: [], mode: "TEXT" } },
+      ),
+    ).toThrow(/FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT/);
+  });
+
+  it("E. adjacent destinations stay unconditional: 'read x and copy it to out.csv' produces out.csv", () => {
+    const m = df("Read in.csv and copy it to out.csv");
+    expect(m.produces).toContain("out.csv");
+    expect(m.consumes).toContain("in.csv");
+  });
+});

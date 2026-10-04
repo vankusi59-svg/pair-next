@@ -710,3 +710,20 @@ describe("live-e2e — production-shaped plan canonicalizes end-to-end", () => {
     );
   });
 });
+
+describe("live-vocab R1 — browse covers research", () => {
+  it("A. 'Browse the official MQL5 marketplace...' covers 'research 15 MQL5 EAs'", () => {
+    const contract = extractGoalContract("research 15 MQL5 EAs");
+    const r = assertPlanCoverage(contract, [
+      canonicalBookkeepingTask("research 15 MQL5 EAs"),
+      work(
+        "T2",
+        "Browse the official MQL5 marketplace for 15 MQL5 EAs and collect pricing",
+        ["NETWORK_ACCESS", "REASONING"],
+      ),
+    ]);
+    expect(r.rows.find((x) => x.requirement_id === "OBL_001")?.state).toBe(
+      "PROVEN",
+    );
+  });
+});

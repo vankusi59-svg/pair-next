@@ -295,14 +295,17 @@ const CONSUME_VERB =
   /\b(?:read|reads|reading|load|loads|cat|consume|consumes|review|summarize|summarise|inspect|check|open|opens|use|uses|using|copy|copies|copying|move|moves|attach|includes?|including|contains|from)\b/gi;
 // Verbs attributing a write/produce role to the following path.
 const PRODUCE_VERB =
-  /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads)\b/gi;
-// Destination marker before the path: "to X", "into outbox/X", or the
-// marker followed by a bounded run of modifiers — "format the findings
-// into a professional report.md" still attributes report.md to the
-// destination marker. Bare `in` only counts when adjacent ("in X"), never
-// across gap words ("in the process of X").
-const DESTINATION =
-  /\b(?:(?:to|into|onto|inside)(?:\s+[\w-]+){0,5}\s*|in)\s*$/i;
+  /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads|format|formats|formatting|compose|composes|composing)\b/gi;
+// Destination marker immediately before the path: "to X", "into
+// outbox/X", "in X" — unconditional, as before.
+const DESTINATION_ADJACENT = /\b(?:to|into|onto|inside|in)\s*$/i;
+// Modifier-separated destination: the marker followed by a bounded run
+// of words — "format the findings into a professional report.md". A
+// gap-word destination is NOT independently a producer: it only mints a
+// produced artifact when a produce/transform verb governs the phrase
+// ("format"), so purpose phrases like "to compare with baseline.csv"
+// stay consumes under their governing read/use semantics.
+const DESTINATION_GAP = /\b(?:to|into|onto|inside)(?:\s+[\w-]+){1,5}\s*$/i;
 
 /** Nearest governing verb before a path mention: the LAST consume/produce
  *  verb inside the bounded lookback window wins — "read input.txt then
@@ -386,12 +389,18 @@ function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
     if (!p) continue;
     const before = instruction.slice(Math.max(0, m.index - 120), m.index);
     const tail = before.slice(-48);
+    const role = nearestVerbRole(before);
     // Destination marker wins: "copy X into outbox/Y" consumes X, produces Y.
-    if (DESTINATION.test(tail)) {
+    // Adjacent markers are unconditional; a modifier-separated marker
+    // mints a produce only under a governing produce/transform verb —
+    // otherwise the path falls back to ordinary verb attribution.
+    if (
+      DESTINATION_ADJACENT.test(tail) ||
+      (DESTINATION_GAP.test(tail) && role === "produce")
+    ) {
       produces.add(p);
       continue;
     }
-    const role = nearestVerbRole(before);
     if (role === "consume") {
       consumes.add(p);
       continue;
