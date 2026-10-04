@@ -115,6 +115,31 @@ export class CapabilityRouter {
       }
     }
 
+    // 5b. PRV2-A R1.B — live eligibility proof for dynamically-claimed
+    // capabilities: at DISPATCH a NETWORK_ACCESS task may only be served
+    // by an executor whose CURRENT capability declaration includes it
+    // (Codex resolves it per dispatch from PAIR_CODEX_NETWORK, so the
+    // CNI-1 kill-switch stays authoritative). A static registry claim
+    // alone never suffices — a stale registration fails closed here.
+    if (
+      live &&
+      adapter &&
+      opts.requiredCapabilities.has("NETWORK_ACCESS") &&
+      !reasons.length
+    ) {
+      const liveOut = adapter.capabilities?.() ?? {};
+      const liveCaps = new Set(
+        (
+          (liveOut.capability_ids as string[] | undefined) ??
+          (liveOut.capabilities as string[] | undefined) ??
+          []
+        ).map(String),
+      );
+      if (!liveCaps.has("NETWORK_ACCESS")) {
+        reasons.push("MISSING_LIVE_CAPABILITIES:NETWORK_ACCESS");
+      }
+    }
+
     // 6. auth state acceptable
     const authState = String(descriptor.auth_state);
     if (AUTH_REJECTED.has(authState)) reasons.push(`AUTH_UNAVAILABLE:${authState}`);

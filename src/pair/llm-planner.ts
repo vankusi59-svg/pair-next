@@ -87,6 +87,34 @@ export function isBookkeepingShapedTask(
   });
 }
 
+/** PRV2-A R1.A — AUTOMATON_TASK_EXECUTION is PAIR-reserved, not merely
+ *  prompt-forbidden. A model emission is RESERVED-MISUSE when it carries
+ *  AUTOMATON anywhere in its raw capability list and is NOT a pure
+ *  bookkeeping-shaped task (the only emission PAIR is allowed to
+ *  normalize away). Returns the task_key of the first misuse, else null.
+ *  Callers must reject deterministically — never strip AUTOMATON from a
+ *  mixed task and pretend the model requested something different. */
+export function reservedAutomatonMisuseKey(
+  rawTasks: Array<Record<string, unknown>>,
+): string | null {
+  for (const t of rawTasks ?? []) {
+    const rawCaps = Array.isArray(t?.required_capabilities)
+      ? (t.required_capabilities as unknown[]).map((c) => String(c))
+      : [];
+    if (!rawCaps.includes("AUTOMATON_TASK_EXECUTION")) continue;
+    const pure = isPureBookkeepingTask({
+      required_capabilities: rawCaps,
+      metadata: t?.metadata,
+    });
+    if (!pure) return String(t?.task_key ?? "?");
+  }
+  return null;
+}
+
+/** Typed warning code for planner-layer reserved-misuse rejections. */
+export const LLM_PLAN_RESERVED_CAPABILITY_WARNING =
+  "LLM_PLAN_RESERVED_CAPABILITY_AUTOMATON";
+
 export interface LlmPlannerConfig {
   /** Provider chat/completions URL (P6 endpoint_reference). */
   endpoint: string;
@@ -332,10 +360,10 @@ Output ONLY a JSON object: {"tasks": [...]}. Each task is a WORK task — work t
 Rules:
 - Emit ONLY genuine work tasks. PAIR injects its own bookkeeping task (recording the goal) before the plan is committed — NEVER emit a task whose purpose is recording the goal, and NEVER request AUTOMATON_TASK_EXECUTION (it is reserved for PAIR's injected bookkeeping task).
 - 1 to WORK_TASKS work tasks. Every task must exist for at least one concrete reason: a distinct deliverable/output, a distinct capability boundary, independently parallelizable work, a verification/review boundary, or a side-effect boundary. Do NOT split trivial sequential prose work into microtasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS for pure file writes.
-- CURRENT/EXTERNAL DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price"), the data-gathering task must request capabilities sufficient for current-data/network research under ALLOWED_CAPABILITIES. You describe WHAT the task needs — the Mission Router chooses WHICH executor serves it; never assume a specific executor has or lacks internet. Instruct the task to RETURN the full findings as its final result text, and name produced files explicitly when a downstream task must read them.
+- CURRENT/EXTERNAL DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price"), the data-gathering task MUST include NETWORK_ACCESS in required_capabilities — it is a real routing fact: only an executor currently authorized for network access may serve the task, and the Mission Router chooses WHICH one. You describe WHAT the task needs; never assume a specific executor has or lacks internet. Instruct the task to RETURN the full findings as its final result text, and name produced files explicitly when a downstream task must read them.
 - SOFTWARE WORK: when the goal asks to build or fix software (xây/build/create a website/app/tool/bot/script, viết code, fix bug, deploy), pick the minimum capability set the job requires (CODE_GENERATION, CODE_EDITING, SHELL_EXECUTION, PYTHON_EXECUTION, FILE_OPERATIONS). You describe the work — the router decides which executor satisfies the set.
 - REMOTE DATAFLOW CONTRACT: tasks carrying REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION may execute remotely — their result text comes back, and their uploaded files land as canonical artifacts. A downstream task may depend on a remote task ONLY when it explicitly declares the produced artifact as an input (read the file it produces — name the artifact in its instruction or worker_spec); a remote dep with no declared artifact edge is rejected. TELEGRAM_DELIVERY tasks always may depend on remote tasks (they receive the remote result text through dependency_outputs).
-- VISUAL DELIVERABLES: a chart computed from data the plan already produces is ordinary compute work (e.g. PYTHON_EXECUTION); a screenshot of a live website needs a network-capable execution capability from ALLOWED_CAPABILITIES; a generated image is only possible when a governed image-generation capability exists in ALLOWED_CAPABILITIES. If a visual file is produced by a task that may execute remotely, it must be uploaded via the outbox endpoint described in that task's prompt — a file left on a remote machine is unusable. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
+- VISUAL DELIVERABLES: a chart computed from data the plan already produces is ordinary compute work (e.g. PYTHON_EXECUTION); a screenshot of a live website needs a task that includes NETWORK_ACCESS; a generated image is only possible when a governed image-generation capability exists in ALLOWED_CAPABILITIES. If a visual file is produced by a task that may execute remotely, it must be uploaded via the outbox endpoint described in that task's prompt — a file left on a remote machine is unusable. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
 - TELEGRAM_DELIVERY (when ALLOWED): ONLY when the goal EXPLICITLY asks to send/deliver named output to Telegram (gửi tele/telegram, báo qua telegram, send/deliver to telegram) — never add it for a goal that merely mentions a file, an outbox, or completion. Add it as a DAG-leaf task with capability TELEGRAM_DELIVERY, depending ONLY on the tasks that produce what the goal asked to be sent. PAIR pins the delivery manifest, the canonical output language, and the final delivery instruction from the operator request — the plan does not choose what may be sent, in which language, or how. Instruction placeholder: "Stage the manifested artifacts into outbox/ unchanged, then reply DONE." (PAIR rewrites it canonically.)
 - FILE DELIVERABLES: when the goal names a file to create AND asks to send it (e.g. "tạo file X.md ... gửi telegram"), the producing task must write the file directly into outbox/<exact filename> — not the workspace root — so the delivery pipeline picks it up.
 - BYTE DEPENDENCIES: "needs the data from T2" is NOT an input — bytes are. When a task needs another task's FILE output, the PRODUCER's instruction must name the exact artifact path it writes (e.g. "write findings to report.txt") and the CONSUMER's instruction must name that same path as its input (e.g. "read report.txt") — identical names, producer earlier, consumer depends_on the producer. A consumer that only says "send the report" with no file edge consumes the producer's RESULT TEXT via dependency_outputs — valid only for local (non-remote) producers.
@@ -388,6 +416,15 @@ export function plannerSystemPrompt(): string {
 
 export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmPlanResult> {
   const maxTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
+  // R1.A — sanitize keeps the PAIR-reserved AUTOMATON key ONLY so a pure
+  // bookkeeping-shaped emission survives to the canonicalize seam for
+  // deterministic normalization (drop + dependency remap onto injected
+  // T1). It is never model-visible (ALLOWED_CAPABILITIES renders
+  // cfg.allowedCapabilities verbatim) and can never survive as a work
+  // task — reservedAutomatonMisuseKey above throws the candidate first.
+  const sanitizeCaps = cfg.allowedCapabilities.includes("AUTOMATON_TASK_EXECUTION")
+    ? cfg.allowedCapabilities
+    : [...cfg.allowedCapabilities, "AUTOMATON_TASK_EXECUTION"];
   const timeoutMs = cfg.timeoutMs ?? LLM_PLANNER_DEFAULT_TIMEOUT_MS;
   const apiKey = envGet(cfg.env, cfg.credentialEnv);
   const fetchImpl = cfg.fetchFn ?? fetch;
@@ -446,8 +483,12 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     }
     const rawTasks = (parsed as { tasks?: unknown })?.tasks;
     if (!Array.isArray(rawTasks) || !rawTasks.length) return { tasks: [], warnings: ["LLM_PLAN_NO_TASKS"] };
-
-    const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], cfg.allowedCapabilities, maxTasks, cfg.capabilitySets);
+    // PRV2-A R1.A — reserved-capability misuse (AUTOMATON outside pure
+    // bookkeeping shape) fails the candidate deterministically; it is
+    // never stripped-and-pretended into a different request.
+    const reservedKey = reservedAutomatonMisuseKey(rawTasks as Array<Record<string, unknown>>);
+    if (reservedKey) return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${reservedKey}`] };
+    const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], sanitizeCaps, maxTasks, cfg.capabilitySets);
     if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
     return { tasks, warnings };
   };
@@ -458,7 +499,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
   for (let i = 0; i < 2; i++) {
     const a = await attempt();
     const usable = a.tasks.filter(
-      (t) => !isBookkeepingShapedTask(t, cfg.allowedCapabilities),
+      (t) => !isBookkeepingShapedTask(t, sanitizeCaps),
     );
     if (usable.length >= LLM_PLANNER_MIN_TASKS) {
       return { tasks: a.tasks, source: "LLM", model: cfg.model, warnings: [...warnings, ...a.warnings] };

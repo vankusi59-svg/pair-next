@@ -29,6 +29,8 @@ import { PLANNER_FAILURE_CLASS, type PlannerFailureClass } from "./planner-pool.
 import {
   buildPlannerUserPrompt,
   plannerSystemPrompt,
+  LLM_PLAN_RESERVED_CAPABILITY_WARNING,
+  reservedAutomatonMisuseKey,
   extractPlanJson,
   sanitizePlan,
   isBookkeepingShapedTask,
@@ -378,9 +380,22 @@ export async function codexPlannerPlan(
   if (!Array.isArray(rawTasks) || !rawTasks.length) {
     return { tasks: [], warnings: ["LLM_PLAN_NO_TASKS"] };
   }
+  // PRV2-A R1.A — reserved-capability misuse fails the candidate typed;
+  // AUTOMATON is never stripped off a mixed task and pretended away.
+  const misuseKey = reservedAutomatonMisuseKey(rawTasks as Array<Record<string, unknown>>);
+  if (misuseKey) {
+    return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${misuseKey}`] };
+  }
+  // R1.A — sanitize keeps the PAIR-reserved AUTOMATON key ONLY so a pure
+  // bookkeeping-shaped emission survives to the canonicalize seam for
+  // deterministic normalization; it is never model-visible and can never
+  // survive as a work task (the misuse check above rejects it first).
+  const sanitizeCaps = cfg.allowedCapabilities.includes("AUTOMATON_TASK_EXECUTION")
+    ? cfg.allowedCapabilities
+    : [...cfg.allowedCapabilities, "AUTOMATON_TASK_EXECUTION"];
   const { tasks, warnings } = sanitizePlan(
     rawTasks as Parameters<typeof sanitizePlan>[0],
-    cfg.allowedCapabilities,
+    sanitizeCaps,
     workBudget,
     cfg.capabilitySets,
   );
@@ -388,7 +403,7 @@ export async function codexPlannerPlan(
   // PRV2-A §D — degenerate = ZERO usable work tasks (a bookkeeping-only
   // plan performs no work; PAIR injects bookkeeping itself).
   const usable = tasks.filter(
-    (t) => !isBookkeepingShapedTask(t, cfg.allowedCapabilities),
+    (t) => !isBookkeepingShapedTask(t, sanitizeCaps),
   );
   if (usable.length < LLM_PLANNER_MIN_TASKS) {
     return { tasks: [], warnings: [...warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE] };

@@ -166,3 +166,137 @@ byte-determinism. Mandate asked for ≥16 — delivered 17.
   PAIR owns the only legal one).
 
 STOP — pending independent audit. DO NOT MERGE.
+
+---
+
+# PRV2-A R1 — Independent-audit remediation (reserved AUTOMATON + real NETWORK_ACCESS)
+
+Base: PR #41 branch `devin/1791105961-prv2a-planner-modernization`, audited
+HEAD `932ced7`. Two audit blockers, both closed on the same branch. DO NOT
+MERGE — pending audit.
+
+## R1.A — AUTOMATON_TASK_EXECUTION is PAIR-owned, not prompt-forbidden
+
+**Invariants (verbatim from mandate):**
+
+- RAW MODEL WORK TASKS → MUST NEVER retain `AUTOMATON_TASK_EXECUTION`.
+- FINAL CANONICAL PLAN → exactly one `AUTOMATON_TASK_EXECUTION` task →
+  `task_key` T1 → exact `canonicalBookkeepingTask(goal)`.
+
+**Design:**
+
+- `SERVE_LLM_WORK_CAPS` (`serve-planner.ts`) = `SERVE_LLM_PLANNER_CAPS`
+  minus `AUTOMATON_TASK_EXECUTION` — the model-visible work vocabulary.
+  `SERVE_LLM_PLANNER_CAPS` stays the final canonical vocabulary for
+  `validatePlanProposal`. `serve-mission-control.mjs` now feeds planners
+  `SERVE_LLM_WORK_CAPS` (`LLM_PLANNER_CAPS`), so `buildPlannerUserPrompt`'s
+  `ALLOWED_CAPABILITIES:` line can never show AUTOMATON to a model.
+- `reservedAutomatonMisuseKey(rawTasks)` (`llm-planner.ts`) inspects the
+  RAW emission before any sanitization: a task is a violation iff its raw
+  `required_capabilities` contains AUTOMATON AND it is not
+  `isPureBookkeepingTask` — i.e. a MIXED task (`[AUTOMATON, X]`) or a pure
+  task carrying a foreign worker_spec. Returns the offending `task_key`.
+- Enforced at two barriers with the correct failover semantics each:
+  - `llmPlan` / `codexPlannerPlan` (planner layer): returns
+    `{ tasks: [], warnings: ["LLM_PLAN_RESERVED_CAPABILITY_AUTOMATON:<key>"] }`
+    — a deterministic typed candidate rejection, failover-eligible
+    (`classifyPlannerFailure` default → PLAN_INVALID). Deliberately NOT an
+    IntegrityError here: thrown planFn errors abort the whole run without
+    failover (planner-pool.ts), which would be a worse outcome.
+  - `makeServeCanonicalizer` (canonical layer): throws `IntegrityError`
+    `FAIL_CLOSED_PLAN_RESERVED_CAPABILITY_AUTOMATON_TASK_EXECUTION` — the
+    canonicalize throw becomes a FAILED/`CANONICAL_VALIDATION_FAILED`
+    attempt → next candidate (failover-eligible). Covers any raw task
+    stream that bypasses the planner layer.
+- A mixed task is NEVER stripped-and-pretended: the whole candidate dies —
+  no surviving FILE_OPERATIONS variant, no second bookkeeping worker_spec,
+  no false-completion path.
+- Pure bookkeeping-shaped emissions still normalize exactly as before
+  (dropped, deps remapped to T1). To preserve the end-to-end
+  bookkeeping-dep→T1 remap, both planners sanitize the model's work
+  against `sanitizeCaps = allowedCapabilities ∪ {AUTOMATON}` — a
+  shape-passthrough only, never model-visible: AUTOMATON is still absent
+  from `allowedCapabilities` in the prompt, the raw reserved-misuse check
+  runs first, and `isBookkeepingShapedTask` is evaluated against
+  `sanitizeCaps` so bookkeeping emissions don't count as usable work.
+- Final-plan invariant tests prove exactly one AUTOMATON task = T1 =
+  `canonicalBookkeepingTask(goal)` (modulo `pair_dataflow` annotations
+  stamped by `reconcilePlanDataflow`).
+
+## R1.B — NETWORK_ACCESS is a real routing fact
+
+**Design:**
+
+- `NETWORK_ACCESS` added to `SERVE_LLM_PLANNER_CAPS` and to the
+  `service.registerCapability` list in `serve-mission-control.mjs` — it is
+  a real, registered capability (`validatePlanProposal` accepts it;
+  known-capability test B6).
+- Planner prompt: current/external-data tasks MUST include
+  `NETWORK_ACCESS` in `required_capabilities`; a live-website screenshot
+  needs it. Explicitly framed as a routing fact — the router picks WHICH
+  executor is currently authorized; the model never assumes one.
+- Devin: static `NETWORK_ACCESS` added to `DEVIN_CAPABILITIES` (governed
+  cloud environment has ambient network).
+- Codex: `capabilities()` claims `NETWORK_ACCESS` LIVE — appended only
+  when `codexNetworkAllowed()` (CNI-1: `PAIR_CODEX_NETWORK` resolved per
+  call via `envReader`) is truthy. A static registration can therefore be
+  stale; the claim must be re-proven at dispatch.
+- CapabilityRouter DISPATCH step 5b: when the task requires
+  `NETWORK_ACCESS` and the executor passed all prior gates (incl. live
+  `qualify()`), the adapter's CURRENT `capabilities()` output must declare
+  `NETWORK_ACCESS` — else `MISSING_LIVE_CAPABILITIES:NETWORK_ACCESS`.
+  `PAIR_CODEX_NETWORK=off` after a boot-time ON registration → the static
+  claim passes step 3 but the live check fails closed. CNI-1 per-dispatch
+  resolution is untouched (argv still binds `network.enabled`/`web_search`
+  per dispatch).
+- DSH: `DSH_CAPABILITY_IDS` unchanged — no NETWORK_ACCESS; it can never
+  be network-eligible merely via REASONING/SHELL_EXECUTION.
+- Asymmetry (fail-closed, documented): boot-OFF→flip-ON Codex stays
+  un-servable until re-registration, because step 3's static check fails
+  first; boot-ON→flip-OFF is caught by the live check. Recorded as
+  residual, consistent with fail-closed bias.
+- No REASONING/SHELL/PYTHON proxy accepted anywhere: network tasks route
+  only on the explicit `NETWORK_ACCESS` fact.
+
+## Validation
+
+| Gate | Result |
+|---|---|
+| `npx tsc --noEmit` | PASS (0 errors) |
+| Focused PRV2-A suite | **33/33 PASS** (17 base + 16 new: vocab/prompt, reserved-adversarial 7-case matrix, network-routing B1–B6) |
+| `pair-llm-planner` | 16/16 PASS |
+| `pair-cpl1-codex-planner` | 49/49 PASS |
+| `pair-cni1-codex-network` | 22/22 PASS |
+| `pair-planner-dataflow-incident` | 106/106 PASS |
+| `pair-ops-telegram-delivery` | 3/3 PASS |
+| `pair-f3-*` (4 suites) | 72/72 PASS |
+| `pair-p4`/`p7`/`p8` (router/governance) | 81/81 PASS |
+| Full suite | **3419 pass / 2 failed** — the same 2 env-only P5 fails as `main` `2fd4a91` baseline (stock-adapter probes expect missing executables; both present on this VM) |
+| `rm -rf dist && pnpm build` | PASS (clean build) |
+| `pnpm audit` | 0 high (1 low, 8 moderate — unchanged, no new deps) |
+
+## Required adversarial + routing tests delivered
+
+R1.A: `SERVE_LLM_WORK_CAPS`/prompt vocabulary (2), reserved mixed-task
+adversarial `canon()` throws (3: single mixed, mixed-among-others,
+pure-with-foreign-worker_spec), exact-one-AUTOMATON=T1 invariant (2),
+`llmPlan` typed-warning rejection + bookkeeping passthrough (2).
+R1.B: DSH-not-selected (B1), codex live-OFF reject
+`MISSING_LIVE_CAPABILITIES:NETWORK_ACCESS` (B2), live-ON eligible (B3),
+offline reasoning task unaffected (B4), real `CodexCliExecutorAdapter`
+live claim toggling on `PAIR_CODEX_NETWORK` with a qualified fake-CLI
+fixture (B5), `NETWORK_ACCESS` registered known capability (B6).
+
+## Residual limitations
+
+- Boot-OFF→flip-ON Codex needs a re-registration to serve network tasks
+  (static step-3 check fails closed first). The unsafe direction (ON→OFF)
+  is closed live. Stale-claim alternative — recording a static claim that
+  cannot represent per-dispatch state — was rejected per the mandate's
+  live-proof guidance.
+- `PLAN_SCHEMA` still cannot emit declared edge fields (unchanged from
+  base PRV2-A residual — not silently widened).
+
+Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R1_PENDING_AUDIT`
+
+STOP — pending independent audit. DO NOT MERGE.

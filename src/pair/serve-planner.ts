@@ -28,6 +28,7 @@
  */
 import {
   isBookkeepingShapedTask,
+  reservedAutomatonMisuseKey,
   resolveWorkTaskBudget,
   sanitizePlan,
 } from "./llm-planner.js";
@@ -54,7 +55,19 @@ export const SERVE_LLM_PLANNER_CAPS = [
   "REMOTE_CLOUD_TASK_EXECUTION",
   "AUTONOMOUS_CODE_EXECUTION",
   "TELEGRAM_DELIVERY",
+  // PRV2-A R1.B — real routing fact: current/external-data tasks request
+  // it; only an executor currently authorized for network access may
+  // serve them (Codex live via CNI-1, Devin ambient governed network).
+  "NETWORK_ACCESS",
 ];
+
+/** PRV2-A R1.A — the model-visible WORK capability vocabulary: every
+ *  capability a work task may request. AUTOMATON_TASK_EXECUTION is
+ *  PAIR-reserved (it powers the injected bookkeeping task, which the
+ *  model never authors) and is therefore NOT in this set. */
+export const SERVE_LLM_WORK_CAPS = SERVE_LLM_PLANNER_CAPS.filter(
+  (c) => c !== "AUTOMATON_TASK_EXECUTION",
+);
 
 
 /** PRV2-A §D — the PAIR-owned bookkeeping task: deterministic identity
@@ -132,6 +145,21 @@ export function makeServeCanonicalizer(deps: {
     // {AUTOMATON_TASK_EXECUTION}) is deterministically normalized away so
     // the plan can never carry two bookkeeping authorities.
     const bookkeepingKeys = new Set<string>();
+    // PRV2-A R1.A — reserved-capability misuse is a deterministic typed
+    // reject: any task carrying AUTOMATON_TASK_EXECUTION that is not
+    // pure-bookkeeping-shaped (a MIXED task, or a pure task with a
+    // foreign worker_spec) can never become a canonical work task — no
+    // stripping, no second bookkeeping worker_spec, no false-completion
+    // path. The candidate fails PLAN_INVALID and failover proceeds.
+    const misuseKey = reservedAutomatonMisuseKey(
+      (rawTasks ?? []) as Array<Record<string, unknown>>,
+    );
+    if (misuseKey) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_RESERVED_CAPABILITY_AUTOMATON_TASK_EXECUTION",
+        `task ${misuseKey} requests PAIR-reserved AUTOMATON_TASK_EXECUTION outside bookkeeping shape`,
+      );
+    }
     const workRaw = (rawTasks ?? []).filter((t) => {
       const shaped = isBookkeepingShapedTask(
         (t ?? {}) as Record<string, unknown>,
@@ -148,7 +176,7 @@ export function makeServeCanonicalizer(deps: {
     const workBudget = resolveWorkTaskBudget(goal, deps.maxWorkTasks);
     const { tasks } = sanitizePlan(
       workRaw as never[],
-      SERVE_LLM_PLANNER_CAPS,
+      SERVE_LLM_WORK_CAPS,
       workBudget,
       deps.executorCapSets() as never[],
     );

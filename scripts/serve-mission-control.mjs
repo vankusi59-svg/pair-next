@@ -95,7 +95,7 @@ import {
   finishPlannerRun,
   validatePlanProposal,
   makeServePlanner,
-  SERVE_LLM_PLANNER_CAPS,
+  SERVE_LLM_WORK_CAPS,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
   telegramDeliveryTransportTimeoutMs,
@@ -301,7 +301,11 @@ const selfmod = new SelfImprovementController(service, {
 // below runs: T1 PAIR_NATIVE records the goal, T2 DSH/Gemini analysis,
 // optional T3 Codex when the goal mentions code/script/python.
 // LLM plan capability allowlist lives in serve-planner.ts — one source.
-const LLM_PLANNER_CAPS = SERVE_LLM_PLANNER_CAPS;
+// PRV2-A R1.A — the model-visible planner vocabulary is WORK-only:
+// AUTOMATON_TASK_EXECUTION is PAIR-reserved (injected T1) and never
+// shown to the planner. SERVE_LLM_PLANNER_CAPS stays the final canonical
+// vocabulary for validatePlanProposal.
+const LLM_PLANNER_CAPS = SERVE_LLM_WORK_CAPS;
 // Capability sets of the currently-qualified executors — sanitizePlan drops
 // any task whose required_capabilities no single executor can serve.
 const executorCapSets = () =>
@@ -427,7 +431,7 @@ registry.register({
   },
 });
 service.routes.seedPairNativeRoute();
-for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION", "TELEGRAM_DELIVERY"])
+for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTION", "SHELL_EXECUTION", "CODE_GENERATION", "CODE_EDITING", "REASONING", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION", "TELEGRAM_DELIVERY", "NETWORK_ACCESS"])
   service.registerCapability(c, { risk_class: "LOW" });
 if (governed.size) {
   const reg = registerGovernedExecutors(service, governed, "PAIR_MC", {
