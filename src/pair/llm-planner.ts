@@ -339,6 +339,11 @@ const ANCHOR_STOP = new Set([
   "sources", "findings", "summary", "note", "placeholder", "step",
   "task", "goal", "plan", "output", "input", "instruction", "artifact",
   "artifacts", "file", "files", "text", "content", "gửi", "các", "và",
+  // local-source vocabulary — never an external identity
+  "repo", "repository", "branch", "workspace", "csv", "code",
+  "project", "commits", "commit", "diffs", "diff", "modules", "module",
+  "directory", "folders", "folder", "logs", "log", "local", "disk",
+  "filesystem", "monorepo", "source", "open",
 ]);
 
 /** Subject identity anchors present in a text: canonical anchor
@@ -368,6 +373,39 @@ export function subjectAnchors(text: string): Set<string> {
   }
   for (const [re, key] of VI_SUBJECT_PHRASES) {
     if (re.test(t) && ANCHOR_LEXEMES.has(key)) anchors.add(key);
+  }
+  // Case-insensitive context anchors: a non-vocabulary token adjacent
+  // to a subject-class term (±2 positions) names the external subject
+  // — "gpt models", "openai api" — regardless of casing.
+  const toks: { w: string; i: number }[] = [];
+  for (const m of t.matchAll(/[\p{L}\p{N}]+/gu)) {
+    toks.push({ w: m[0], i: m.index ?? 0 });
+  }
+  const classAt = toks.map(({ w }) => {
+    let lc = w.toLowerCase();
+    lc = SUBJECT_ALIAS[lc] ?? lc;
+    if (!SUBJECT_LEXEMES.has(lc) && lc.endsWith("s")) {
+      const stem = lc.slice(0, -1);
+      if (SUBJECT_LEXEMES.has(stem)) lc = stem;
+    }
+    return SUBJECT_LEXEMES.has(lc);
+  });
+  for (let i = 0; i < toks.length; i++) {
+    if (!classAt[i]) continue;
+    for (let j = Math.max(0, i - 2); j <= Math.min(toks.length - 1, i + 2); j++) {
+      if (j === i || classAt[j]) continue;
+      const w = toks[j].w;
+      const lc = SUBJECT_ALIAS[w.toLowerCase()] ?? w.toLowerCase();
+      if (
+        w.length >= 2 &&
+        !/^[0-9]+$/.test(w) &&
+        !ANCHOR_STOP.has(lc) &&
+        /^[A-Za-z0-9]+$/.test(w) &&
+        t[toks[j].i - 1] !== "."
+      ) {
+        anchors.add(lc);
+      }
+    }
   }
   return anchors;
 }

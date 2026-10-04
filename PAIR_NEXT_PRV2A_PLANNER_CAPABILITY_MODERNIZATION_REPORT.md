@@ -606,3 +606,58 @@ models" passed for a "latest GPT models" goal.
 Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R5_PENDING_AUDIT`
 
 STOP — pending independent audit. DO NOT MERGE.
+
+---
+
+## R6 — case-insensitive subject identity (casing is not a governance signal)
+
+Audited base: `34b3731606fe2203da51f113d8f6c06eaa0bd7f1` (PR #41, R5).
+Finding closed: R5 anchors came mostly from capitalized tokens, so
+`gpt`/`openai`/`stripe`/`claude` lowercase didn't anchor — both
+directions broken: wrong-subject bypass ("latest claude models" for a
+lowercase "gpt" goal) and false fail-closed ("Research the latest GPT
+models" vs lowercase "research the latest gpt models").
+
+### Design — bounded context-anchor extraction
+
+`subjectAnchors` now draws identity from THREE deterministic sources:
+1. canonical anchor lexemes (unchanged);
+2. capitalized proper/acronym tokens (unchanged);
+3. **context anchors**: a non-vocabulary token within ±2 positions of
+   a subject-class term names the external subject regardless of case
+   ("gpt models", "openai api"). Still excluded: verbs, recency words,
+   class lexemes, function words, output words, local-source
+   vocabulary (added to ANCHOR_STOP), pure digits, tokens following
+   "." (file-extension fragments like `md` in `report.md`), and
+   non-ASCII fragments.
+
+Casing now never creates/removes authority: `gpt ≡ GPT`,
+`openai ≡ OpenAI`, aliases unchanged (BTC≡btc≡bitcoin, XAU≡XAUUSD≡gold).
+
+### Adversarial proofs
+
+- `research the latest gpt models` + NETWORK `research the latest
+  claude models` → `FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED`;
+  + `research the latest gpt models` → PASS.
+- `Research the latest GPT models` + lowercase `research the latest
+  gpt models` → PASS.
+- `research the latest openai api versions` + `research latest stripe
+  api versions` → REJECT; + `research current OpenAI API versions` →
+  PASS.
+- All R1–R5 tests retained unchanged (task-level gate, Router, CNI-1,
+  bookkeeping, budget, Telegram/dataflow, failover untouched).
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused `pair-prv2a-planner-modernization` | **56/56 PASS** (52 + 4 R6) |
+| Regression battery (16 files) | **607/607 PASS** |
+| `npx tsc --noEmit` | clean |
+| `rm -rf dist && pnpm build` | PASS |
+| `pnpm audit` | 0 high (9 moderate/low, same as baseline) |
+| Full suite | **3442 pass / 2 failed** — same 2 env-only P5 fails as baseline |
+
+Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R6_PENDING_AUDIT`
+
+STOP — pending independent audit. DO NOT MERGE.

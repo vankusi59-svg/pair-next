@@ -1119,4 +1119,64 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
   });
+
+  it("R6-det: case-insensitive context anchors — lowercase identity beside a class term binds the same way", () => {
+    expect(subjectAnchors("research the latest gpt models")).toEqual(new Set(["gpt"]));
+    expect(subjectAnchors("research the latest openai api versions")).toEqual(new Set(["openai"]));
+    expect(subjectAnchors("research latest stripe api versions")).toEqual(new Set(["stripe"]));
+    expect(subjectAnchors("check current weather")).toEqual(new Set());
+    // casing never changes the extracted identity
+    expect(subjectAnchors("research the latest gpt models")).toEqual(subjectAnchors("Research the latest GPT models"));
+  });
+
+  it("R6-N15 (adversarial): lowercase 'claude models' cannot satisfy lowercase 'gpt models' goal; matching 'gpt' task passes", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "research the latest claude models", ["NETWORK_ACCESS", "REASONING"]),
+            work("T2", "analyze gpt models", ["REASONING"], ["T1"]),
+          ],
+          "research the latest gpt models",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "research the latest gpt models",
+    );
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R6-N16 (adversarial): case is never a binding difference — 'Research the latest GPT models' goal accepts lowercase 'gpt' task", () => {
+    const out = canon(
+      [
+        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "Research the latest GPT models",
+    );
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R6-N17 (adversarial): lowercase 'stripe api' cannot satisfy lowercase 'openai api' goal; OpenAI-bound task passes", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "research latest stripe api versions", ["NETWORK_ACCESS", "REASONING"]),
+          ],
+          "research the latest openai api versions",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "research the latest openai api versions",
+    );
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
 });
