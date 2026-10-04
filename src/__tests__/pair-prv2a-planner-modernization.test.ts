@@ -1179,4 +1179,51 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
   });
+
+  it("R7-det: adjacent-modifier extraction — generic descriptors never anchor", () => {
+    expect(subjectAnchors("research the latest commercial gpt models")).toEqual(new Set(["gpt"]));
+    expect(subjectAnchors("research the latest public openai api versions")).toEqual(new Set(["openai"]));
+    expect(subjectAnchors("research the latest enterprise stripe apis")).toEqual(new Set(["stripe"]));
+    expect(subjectAnchors("gpt 4 models")).toEqual(new Set(["gpt"]));
+  });
+
+  it("R7-N18 (adversarial): shared modifier 'commercial' does not bind — Claude vs GPT still rejects, matching GPT passes", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "research the latest commercial claude models", ["NETWORK_ACCESS", "REASONING"]),
+          ],
+          "research the latest commercial gpt models",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "research the latest commercial gpt models", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "research the latest commercial gpt models",
+    );
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("R7-N19 (adversarial): shared modifier 'public' does not bind — Stripe vs OpenAI still rejects, OpenAI-bound task passes", () => {
+    expectIntegrityCode(
+      () =>
+        canon(
+          [
+            work("T1", "research the latest public stripe api versions", ["NETWORK_ACCESS", "REASONING"]),
+          ],
+          "research the latest public openai api versions",
+        ),
+      PLAN_NET_REQ,
+    );
+    const out = canon(
+      [
+        work("T1", "research current openai api versions", ["NETWORK_ACCESS", "REASONING"]),
+      ],
+      "research the latest public openai api versions",
+    );
+    expect(out[1].required_capabilities).toContain("NETWORK_ACCESS");
+  });
 });

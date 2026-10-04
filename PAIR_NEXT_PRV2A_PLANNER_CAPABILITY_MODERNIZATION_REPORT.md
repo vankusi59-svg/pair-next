@@ -661,3 +661,54 @@ Casing now never creates/removes authority: `gpt ≡ GPT`,
 Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R6_PENDING_AUDIT`
 
 STOP — pending independent audit. DO NOT MERGE.
+
+---
+
+## R7 — generic modifiers are not identity anchors
+
+Audited base: `94980cdf5dd6aa04e9a8b0bceabe950839712e33` (PR #41, R6).
+Finding closed: the ±2 context window treated every nearby non-stop
+token as an anchor, so a shared modifier ("commercial", "public")
+could falsely bind ("commercial claude models" ≈ "commercial gpt
+models").
+
+### Design — adjacent-modifier extraction
+
+Context scan now takes only the SINGLE NEAREST candidate adjacent to
+each subject-class term: scan outward (both directions, ≤2); stop
+words, class terms, extension fragments and non-ASCII tokens
+terminate the scan (noun-phrase boundary); pure digits are skipped so
+a version tail still reaches the identity ("gpt 4 models" → gpt).
+Generic descriptors two positions away are never extracted — no
+adjective list needed. Binding rule, anchors lexemes, capitalized
+extraction and case-insensitive behavior unchanged.
+
+### Adversarial proofs
+
+- `research the latest commercial gpt models` + NETWORK `research the
+  latest commercial claude models` →
+  `FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED`; + `research the
+  latest commercial gpt models` → PASS.
+- `research the latest public openai api versions` + `research the
+  latest public stripe api versions` → REJECT; + `research current
+  openai api versions` → PASS.
+- Extraction: `commercial gpt models` → {gpt}; `public openai api
+  versions` → {openai}; `gpt 4 models` → {gpt}.
+- All R1–R6 tests retained (lowercase distinction, case-insensitive
+  binding, OpenAI/Stripe, BTC/bitcoin, XAUUSD/gold, EA/MQL5,
+  local-current suppression).
+
+### Validation
+
+| Check | Result |
+|---|---|
+| Focused `pair-prv2a-planner-modernization` | **59/59 PASS** (56 + 3 R7) |
+| Regression battery (16 files) | **607/607 PASS** |
+| `npx tsc --noEmit` | clean |
+| `rm -rf dist && pnpm build` | PASS |
+| `pnpm audit` | 0 high (9 moderate/low, same as baseline) |
+| Full suite | **3445 pass / 2 failed** — same 2 env-only P5 fails as baseline |
+
+Classification: `PAIR_NEXT_PRV2A_PLANNER_CAPABILITY_MODERNIZATION_R7_PENDING_AUDIT`
+
+STOP — pending independent audit. DO NOT MERGE.

@@ -392,18 +392,29 @@ export function subjectAnchors(text: string): Set<string> {
   });
   for (let i = 0; i < toks.length; i++) {
     if (!classAt[i]) continue;
-    for (let j = Math.max(0, i - 2); j <= Math.min(toks.length - 1, i + 2); j++) {
-      if (j === i || classAt[j]) continue;
-      const w = toks[j].w;
-      const lc = SUBJECT_ALIAS[w.toLowerCase()] ?? w.toLowerCase();
-      if (
-        w.length >= 2 &&
-        !/^[0-9]+$/.test(w) &&
-        !ANCHOR_STOP.has(lc) &&
-        /^[A-Za-z0-9]+$/.test(w) &&
-        t[toks[j].i - 1] !== "."
-      ) {
+    // The subject identity is the modifier ADJACENT to the class term —
+    // scan outward for the single nearest candidate in each direction.
+    // Stop words, class terms, extension fragments and non-ASCII tokens
+    // terminate the scan (they bound the noun phrase); pure digits are
+    // skipped so a version tail ("gpt 4 models") still reaches "gpt".
+    // Generic descriptors two positions away ("commercial gpt models")
+    // are therefore never anchors.
+    for (const dir of [-1, 1] as const) {
+      for (let j = i + dir; j >= 0 && j < toks.length && Math.abs(j - i) <= 2; j += dir) {
+        if (classAt[j]) break;
+        const w = toks[j].w;
+        const lc = SUBJECT_ALIAS[w.toLowerCase()] ?? w.toLowerCase();
+        if (/^[0-9]+$/.test(w)) continue;
+        if (
+          w.length < 2 ||
+          ANCHOR_STOP.has(lc) ||
+          !/^[A-Za-z0-9]+$/.test(w) ||
+          t[toks[j].i - 1] === "."
+        ) {
+          break;
+        }
         anchors.add(lc);
+        break;
       }
     }
   }
