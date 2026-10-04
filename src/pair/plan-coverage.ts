@@ -28,6 +28,7 @@
  */
 
 import { IntegrityError } from "./errors.js";
+import { artifactNamesEquivalent } from "./artifact-authority.js";
 import { extractTaskDataflow } from "./plan-dataflow.js";
 import { externalSubjectKeys, subjectAnchors } from "./llm-planner.js";
 import type { GoalContract, GoalRequirement } from "./goal-contract.js";
@@ -186,17 +187,14 @@ function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
 /** A task covers a deliverable only when the canonical artifact/dataflow
  *  machinery proves it produces the named file — declared produces,
  *  produce-verb instruction extraction, or the delivery manifest —
- *  never by filename grep alone. */
+ *  never by filename grep alone. Name matching goes through the ONE
+ *  canonical equivalence authority `artifactNamesEquivalent` (DSN-1):
+ *  exact identity or the `outbox/<basename>` staging alias — never a
+ *  two-sided basename guess (`dirA/x ≡ dirB/x` is not equivalent). */
 function taskProducesDeliverable(task: Record<string, unknown>, name: string): boolean {
   try {
     const df = extractTaskDataflow(task);
-    const want = name.split("/").pop() ?? name;
-    // The operator names the deliverable ("report.md"); a producer may
-    // declare it under a governed directory (outbox/report.md) — artifact
-    // identity is the basename plus its exact spelling.
-    return df.produces.some(
-      (p) => p === name || (p.split("/").pop() ?? p) === want,
-    );
+    return df.produces.some((p) => artifactNamesEquivalent(p, name));
   } catch {
     return false;
   }
@@ -208,6 +206,53 @@ function taskProducesDeliverable(task: Record<string, unknown>, name: string): b
 
 const TASK_AMOUNT_RE = /\$\s*(\d+(?:\.\d+)?)/g;
 const TELEGRAM_PROHIBITED_TERMS = new Set(["telegram", "tele", "bot"]);
+
+/** Bounded channel/platform vocabulary for `only <channel>` constraints:
+ *  the sibling space is enumerable here, never a free-text guess. */
+const ONLY_CHANNELS = new Set([
+  "telegram", "slack", "discord", "email", "sms", "whatsapp",
+  "webhook", "api", "cli",
+]);
+
+/** Versioned family siblings: "mql5" admits the family `mql\d` — a task
+ *  naming "mql4" provably violates an `only mql5` bound. Returns the
+ *  family regex or null when the term has no enumerable siblings. */
+function versionFamilyRe(term: string): RegExp | null {
+  const m = /^([a-z][a-z0-9_-]{1,}?)(\d+)$/.exec(term);
+  if (!m) return null;
+  return new RegExp(`\\b${m[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+\\b`, "i");
+}
+
+/** Does the instruction carry evidence of engaging the constrained
+ *  dimension at all (it names the permitted value)? */
+function onlyConstraintEvidence(instr: string, term: string): boolean {
+  return new RegExp(
+    `\\b${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
+    "i",
+  ).test(instr);
+}
+
+/** Deterministic contradiction detection for `only X` constraints:
+ *  returns the excluded sibling token the instruction invokes, or null.
+ *  Unknown sibling spaces yield null (PRESERVED), never a guess. */
+function violatesOnlyConstraint(instr: string, onlyTerms: string[]): string | null {
+  const lc = instr.toLowerCase();
+  for (const term of onlyTerms) {
+    const fam = versionFamilyRe(term);
+    if (fam) {
+      for (const m of lc.matchAll(new RegExp(fam.source, "gi"))) {
+        if (m[0] !== term.toLowerCase()) return m[0];
+      }
+      continue;
+    }
+    if (ONLY_CHANNELS.has(term)) {
+      for (const ch of ONLY_CHANNELS) {
+        if (ch !== term && new RegExp(`\\b${ch}\\b`, "i").test(lc)) return ch;
+      }
+    }
+  }
+  return null;
+}
 
 function instructionAmounts(instr: string): number[] {
   const out: number[] = [];
@@ -323,6 +368,30 @@ export function assertPlanCoverage(
         }
       }
       rows.push({ requirement_id: req.id, kind: req.kind, state: "PROVEN", task_keys: [] });
+      continue;
+    }
+    // `only X` bounds: deterministic contradiction detection — a task
+    // invoking a known sibling of the permitted value (mql4 for an
+    // mql5-only constraint, slack for a telegram-only one) is a proven
+    // violation; absence of the dimension is not proof either way.
+    if (req.onlyTerms?.length) {
+      let sawEvidence = false;
+      for (const t of work) {
+        const instr = String(t.task_instruction ?? "");
+        const bad = violatesOnlyConstraint(instr, req.onlyTerms);
+        if (bad) {
+          violated(req, `task ${String(t.task_key)} invokes "${bad}" excluded by only=${req.onlyTerms.join(",")}`);
+        }
+        for (const term of req.onlyTerms) {
+          if (onlyConstraintEvidence(instr, term)) sawEvidence = true;
+        }
+      }
+      rows.push({
+        requirement_id: req.id,
+        kind: req.kind,
+        state: sawEvidence ? "PROVEN" : "PRESERVED",
+        task_keys: [],
+      });
       continue;
     }
     // Constraints PAIR cannot directly validate are preserved as

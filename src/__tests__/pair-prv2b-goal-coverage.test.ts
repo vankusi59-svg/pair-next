@@ -269,6 +269,166 @@ describe("PRV2-B coverage authority", () => {
   });
 });
 
+/* -------------------- R1.A — multi-dimension clauses -------------------- */
+
+describe("PRV2-B R1.A — clause dimensions are not mutually exclusive", () => {
+  it("R1.A-1: 'research 20 MQL5 EAs by 31/10' mints OBL(min 20) + DDL", () => {
+    const c = extractGoalContract("research 20 MQL5 EAs by 31/10");
+    expect(c.obligations.map((r) => r.id)).toEqual(["OBL_001"]);
+    expect(c.obligations[0].quantity?.min).toBe(20);
+    expect(c.deadline?.id).toBe("DDL_001");
+    expect(c.deadline?.text).toContain("31/10");
+  });
+
+  it("R1.A-2: 'research current EA market, use only MQL5' mints OBL + only-constraint", () => {
+    const c = extractGoalContract("research current EA market, use only MQL5");
+    expect(c.obligations.length).toBe(1);
+    const only = c.constraints.find((r) => r.onlyTerms?.includes("mql5"));
+    expect(only).toBeDefined();
+  });
+
+  it("R1.A-3: 'research MQL5 EAs only' keeps the research obligation", () => {
+    const c = extractGoalContract("research MQL5 EAs only");
+    expect(c.obligations.length).toBe(1);
+    expect(c.constraints.some((r) => r.onlyTerms?.includes("mql5"))).toBe(true);
+  });
+
+  it("R1.A-4: plan omitting the research task under a deadline clause → INCOMPLETE", () => {
+    expectCode(
+      () =>
+        canon(
+          [work("T1", "write a summary of the findings", ["FILE_OPERATIONS"])],
+          "research 20 MQL5 EAs by 31/10",
+        ),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+
+  it("R1.A-5: covering the obligation under a deadline clause → PASS", () => {
+    const out = canon(
+      [work("T1", "research 20 current MQL5 EAs and record findings", ["REASONING", "NETWORK_ACCESS"])],
+      "research 20 MQL5 EAs by 31/10",
+    );
+    expect(out.length).toBe(2);
+  });
+
+  it("R1.A-6: prohibition still outranks — a forbidden clause never mints an obligation", () => {
+    const c = extractGoalContract("analyze pricing, do not use martingale sizing");
+    expect(c.prohibitions).toHaveLength(1);
+    expect(c.prohibitions[0].terms).toContain("martingale");
+    expect(c.obligations.every((o) => !/martingale/i.test(o.text))).toBe(true);
+  });
+
+  it("R1.A-7: produce+file-only clause stays DEL-only (no duplicate OBL)", () => {
+    const c = extractGoalContract("create report.md");
+    expect(c.deliverables.map((r) => r.id)).toEqual(["DEL_001"]);
+    expect(c.obligations).toHaveLength(0);
+  });
+});
+
+/* -------------------- R1.B — `only` constraint contradiction -------------------- */
+
+describe("PRV2-B R1.B — bounded only-constraint contradiction detection", () => {
+  const GOAL_ONLY = "research EA market, use only MQL5";
+
+  it("R1.B-1: task invoking the excluded sibling mql4 → CONSTRAINT_VIOLATION", () => {
+    expectCode(
+      () => canon([work("T1", "research current MQL4 EAs", ["REASONING", "NETWORK_ACCESS"])], GOAL_ONLY),
+      "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("R1.B-2: task honoring only-mql5 → PASS (constraint PROVEN via evidence)", () => {
+    const out = canon(
+      [work("T1", "research current MQL5 EAs", ["REASONING", "NETWORK_ACCESS"])],
+      GOAL_ONLY,
+    );
+    expect(out.length).toBe(2);
+  });
+
+  it("R1.B-3: 'MQL5 only' word-order variant binds the same constraint", () => {
+    const c = extractGoalContract("research EA market, MQL5 only");
+    expect(c.constraints.some((r) => r.onlyTerms?.includes("mql5"))).toBe(true);
+    expectCode(
+      () => canon([work("T1", "research MQL4 EAs", ["REASONING"])], "research EA market, MQL5 only"),
+      "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("R1.B-4: only-channel bound — telegram-only goal rejects a slack task", () => {
+    const c = extractGoalContract("analyze results, notify only telegram");
+    expect(c.constraints.some((r) => r.onlyTerms?.includes("telegram"))).toBe(true);
+    expectCode(
+      () =>
+        canon(
+          [
+            work("T1", "analyze the results data", ["REASONING"]),
+            work("T2", "notify via slack when done", ["REASONING"], ["T1"]),
+          ],
+          "analyze results, notify only telegram",
+        ),
+      "FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION",
+    );
+  });
+
+  it("R1.B-5: unverifiable only-bound stays PRESERVED — never claimed PROVEN", () => {
+    const contract = extractGoalContract("analyze market, use only candlesticks");
+    const report = assertPlanCoverage(contract, [
+      canonicalBookkeepingTask("g") as Record<string, unknown>,
+      work("T1", "analyze the market", ["REASONING"]),
+    ]);
+    const row = report.rows.find((r) => r.requirement_id === "CON_001");
+    expect(row?.state).toBe("PRESERVED");
+  });
+
+  it("R1.B-6: budget ceiling behavior retained alongside only-constraints", () => {
+    const contract = extractGoalContract("analyze market, budget <= $50, use only MQL5");
+    expect(contract.constraints).toHaveLength(2);
+    const report = assertPlanCoverage(contract, [
+      canonicalBookkeepingTask("g") as Record<string, unknown>,
+      work("T1", "analyze the market within a $20 budget using MQL5 data", ["REASONING"]),
+    ]);
+    const byId = new Map(report.rows.map((r) => [r.requirement_id, r]));
+    expect(byId.get("CON_001")?.state).toBe("PROVEN");
+    expect(byId.get("CON_002")?.state).toBe("PROVEN");
+  });
+});
+
+/* -------------------- R1.C — canonical DSN-1 deliverable equivalence -------------------- */
+
+describe("PRV2-B R1.C — deliverable matching uses canonical artifactNamesEquivalent", () => {
+  it("R1.C-1: report.md ↔ report.md and outbox staging alias are equivalent", () => {
+    expect(
+      canon([work("T1", "write the findings to report.md", ["FILE_OPERATIONS"])], "create report.md").length,
+    ).toBe(2);
+    expect(
+      canon([work("T1", "write the findings to outbox/report.md", ["FILE_OPERATIONS"])], "create report.md").length,
+    ).toBe(2);
+  });
+
+  it("R1.C-2: two-sided basename is never equivalence — dirA/x.md vs x.md → INCOMPLETE", () => {
+    expectCode(
+      () =>
+        canon(
+          [work("T1", "write the findings to reports/internal/report.md", ["FILE_OPERATIONS"])],
+          "create report.md",
+        ),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+
+  it("R1.C-3: sibling directories sharing a basename are not equivalent (dirA/X vs dirB/X)", () => {
+    expectCode(
+      () =>
+        canon(
+          [work("T1", "write the findings to reports/customer/report.md", ["FILE_OPERATIONS"])],
+          "create reports/internal/report.md",
+        ),
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+  });
+});
+
 /* ------------------------------ failover ------------------------------ */
 
 describe("PRV2-B failover", () => {

@@ -38,6 +38,8 @@ export interface GoalRequirement {
   terms?: string[];
   /** For budget-like constraints: the operator's ceiling amount. */
   maxAmount?: number;
+  /** For `only X`-bounded constraints: the explicit permitted value(s). */
+  onlyTerms?: string[];
 }
 
 export interface GoalContract {
@@ -159,6 +161,38 @@ function extractQuantity(clause: string): { min?: number; max?: number } | undef
   return q.min !== undefined || q.max !== undefined ? q : undefined;
 }
 
+/** `only X` / `X only` / `chỉ (dùng) X` — the explicit bounded value an
+ *  `only`-constraint permits. Only concrete tokens count; function words
+ *  ("only the results") never mint a bound. For the `X only` form the
+ *  bound is the digit-bearing identity token nearest `only` when one
+ *  exists ("research MQL5 EAs only" → mql5), else the token directly
+ *  preceding it. The three orders are tried independently — a leftmost
+ *  alternation match ("use only" capturing "use") can never win. */
+const ONLY_AFTER_RE = /\bonly\s+([\p{L}\p{N}_-]+)/iu;
+const ONLY_BEFORE_RE = /([\p{L}\p{N}_-]+(?:\s+[\p{L}\p{N}_-]+){0,2})\s+only\b/iu;
+const ONLY_VI_RE = /\bchỉ\s+(?:dùng\s+|dụng\s+)?([\p{L}\p{N}_-]+)/iu;
+const ONLY_TERM_STOP = new Set([
+  "the", "a", "an", "this", "that", "these", "those", "one", "two",
+  "for", "to", "in", "on", "at", "of", "with", "by", "as", "be",
+  "use", "using", "dùng", "dụng", "if", "when", "than", "then",
+]);
+
+function extractOnlyTerms(clause: string): string[] | undefined {
+  const m1 = ONLY_AFTER_RE.exec(clause);
+  const m3 = ONLY_VI_RE.exec(clause);
+  let term = (m1?.[1] ?? m3?.[1] ?? "").toLowerCase();
+  if (!term) {
+    const m2 = ONLY_BEFORE_RE.exec(clause);
+    if (m2) {
+      const words = m2[1].toLowerCase().split(/\s+/).filter(Boolean);
+      const versioned = [...words].reverse().find((w) => /\d/.test(w));
+      term = versioned ?? words[words.length - 1] ?? "";
+    }
+  }
+  if (term.length < 2 || ONLY_TERM_STOP.has(term)) return undefined;
+  return [term];
+}
+
 function prohibitionTerms(clause: string): string[] {
   const rest = clause.replace(PROHIBITION_RE, " ").trim();
   const terms: string[] = [];
@@ -207,13 +241,16 @@ export function extractGoalContract(goal: string): GoalContract {
       });
       continue;
     }
-    if (!deadline && DEADLINE_RE.test(clause)) {
-      deadline = { id: "DDL_001", text: clause.slice(0, 500) };
-      continue;
-    }
     // An explicit telegram-delivery clause is governed by the existing
     // intent authority — it mints neither obligation nor deliverable.
     if (detectTelegramDeliveryIntent(clause).requested) continue;
+    // A clause carries as many orthogonal requirement dimensions as it
+    // states: "research 20 MQL5 EAs by 31/10" is BOTH an obligation AND
+    // a deadline; "research MQL5 EAs only" is BOTH an obligation AND a
+    // constraint. No early continue may drop mandatory work.
+    if (!deadline && DEADLINE_RE.test(clause)) {
+      deadline = { id: "DDL_001", text: clause.slice(0, 500) };
+    }
     const files: string[] = [];
     if (PRODUCE_VERB_RE.test(clause)) {
       FILE_RE.lastIndex = 0;
@@ -222,23 +259,21 @@ export function extractGoalContract(goal: string): GoalContract {
         if (!files.includes(fm[1])) files.push(fm[1]);
       }
     }
-    if (files.length) {
-      for (const f of files.slice(0, 8)) {
-        push(deliverables, "DEL", clause, {
-          target: f,
-          quantity: extractQuantity(clause),
-        });
-      }
-      continue;
+    for (const f of files.slice(0, 8)) {
+      push(deliverables, "DEL", clause, {
+        target: f,
+        quantity: extractQuantity(clause),
+      });
     }
     if (CONSTRAINT_RE.test(clause)) {
       const bm = BUDGET_RE.exec(clause);
       const maxAmount = bm ? Number(bm[1] ?? bm[2] ?? bm[3]) : undefined;
+      const onlyTerms = extractOnlyTerms(clause);
       push(constraints, "CON", clause, {
         quantity: extractQuantity(clause),
         ...(maxAmount !== undefined ? { maxAmount } : {}),
+        ...(onlyTerms ? { onlyTerms } : {}),
       });
-      continue;
     }
     // Obligations are imperative clauses: the clause must LEAD with a
     // work verb (after list/filler prefixes). A noun-phrase clause that
@@ -249,7 +284,16 @@ export function extractGoalContract(goal: string): GoalContract {
     for (let i = 0; i < 4 && LEADING_FILLER_RE.test(rest); i++) {
       rest = rest.replace(LEADING_FILLER_RE, "").trim();
     }
-    if (OBLIGATION_VERB_RE.test(rest)) {
+    // A clause whose only work content is produce-verb + file target is
+    // already fully represented by its DEL row ("create report.md") —
+    // duplicating it as an obligation adds noise, not coverage. An
+    // additional non-produce work verb in the same clause is separate
+    // mandatory work and mints an obligation on its own.
+    const beyondProduce = clause
+      .replace(PRODUCE_VERB_RE, " ")
+      .replace(FILE_RE, " ");
+    const delOnly = files.length > 0 && !OBLIGATION_VERB_RE.test(beyondProduce);
+    if (!delOnly && OBLIGATION_VERB_RE.test(rest)) {
       const first = /^[\p{L}\p{N}_]+/u.exec(rest);
       if (
         first &&

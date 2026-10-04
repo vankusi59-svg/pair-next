@@ -196,3 +196,72 @@ quantity downgrade, no contract mutation after extraction.
   (PRV2-A residual, unchanged).
 
 Classification: `PAIR_NEXT_PRV2B_GOAL_CONTRACT_COVERAGE_PENDING_AUDIT`
+
+---
+
+## R1 remediation (audited base `aa8a84b`, same PR #42)
+
+Independent audit found 3 HIGH structural blockers; all closed below.
+
+### R1.A — clause dimensions are no longer mutually exclusive
+
+`extractGoalContract` previously `continue`d after the first matching
+dimension, silently dropping mandatory work. Now each clause contributes
+every orthogonal row it states: prohibition still outranks everything (a
+forbidden clause never mints positive requirements) and the
+telegram-delivery clause still defers to the existing intent authority;
+then deadline, deliverables, `only`-constraints, and verb-led
+obligations are minted independently.
+
+- `research 20 MQL5 EAs by 31/10` → `OBL_001` (quantity.min=20) **and**
+  `DDL_001` — proven: plan omitting the research task →
+  `FAIL_CLOSED_PLAN_INCOMPLETE`; covering task → PASS.
+- `research current EA market, use only MQL5` → `OBL_001` +
+  `CON_001(onlyTerms:[mql5])`.
+- `research MQL5 EAs only` → research obligation retained +
+  `only`-constraint.
+- Deliverable precision: a clause whose only work content is
+  produce-verb + file target ("create report.md") stays DEL-only — no
+  duplicate OBL — while an additional non-produce work verb in the same
+  clause mints an obligation on its own.
+
+### R1.B — `only X` bounds get deterministic contradiction detection
+
+`only`-clauses now extract their bounded value (`onlyTerms`):
+`only MQL5`, `MQL5 only`, `chỉ (dùng) X` — three word orders tried
+independently so a leftmost match ("use only" capturing "use") never
+wins; for the `X only` form the digit-bearing identity token nearest
+`only` is the bound ("research MQL5 EAs only" → `mql5`).
+
+A task provably contradicts the bound when it invokes a known sibling:
+- **versioned family** — `mql5` admits the family `mql\d`; a task
+  naming `mql4` → `FAIL_CLOSED_PLAN_CONSTRAINT_VIOLATION`;
+- **bounded channel/platform set** — `only telegram` + a task naming
+  `slack` → VIOLATED.
+
+No sibling space enumerable → `PRESERVED`, never `PROVEN`
+("use only candlesticks" + generic task → PRESERVED). A task naming the
+permitted value is evidence → `PROVEN`. Budget ceilings unchanged.
+Proven: `research EA market, use only MQL5` + `research MQL4 EAs` →
+CONSTRAINT_VIOLATION; + `research MQL5 EAs` → PASS.
+
+### R1.C — deliverable matching uses the canonical DSN-1 authority
+
+`taskProducesDeliverable` no longer implements its own basename rule —
+it delegates to `artifactNamesEquivalent()` in `artifact-authority.ts`,
+the single pairwise equivalence used by F1/F2/F4 delivery/handoff:
+`report.md ≡ report.md ≡ outbox/report.md`; `dirA/report.md ≢ dirB/report.md`
+and `reports/internal/report.md ≢ report.md` (basename equivalence never
+leaks across directories) — INCOMPLETE.
+
+### R1 validation
+
+- Focused: PRV2-B **36/36** (20 retained + 16 R1 adversarial).
+- Regression battery **711/711** (PRV2-A 59, F3×4, F1×3, F2×4, F4, F5,
+  DSN-1, telegram, dataflow-incident, CPL-1, CNI-1).
+- Full suite: **3481 pass / 2 fail** — same 2 environment-only P5
+  failures as baseline (3465 + 16 new).
+- `tsc --noEmit` clean; `rm -rf dist && pnpm build` clean;
+  `pnpm audit` — 0 high (1 low + 8 moderate, unchanged).
+
+Classification: `PAIR_NEXT_PRV2B_GOAL_CONTRACT_COVERAGE_R1_PENDING_AUDIT`
