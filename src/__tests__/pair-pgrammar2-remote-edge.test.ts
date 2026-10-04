@@ -18,6 +18,7 @@ import {
   detectTelegramDeliveryIntent,
   reconcilePlanDataflow,
 } from "../pair/plan-dataflow.js";
+import { boundedAttemptWarnings } from "../pair/planner-pool.js";
 import {
   LLM_PLANNER_MAX_INSTRUCTION,
   buildPlannerUserPrompt,
@@ -491,5 +492,170 @@ describe("P-GRAMMAR2 E — regression guards", () => {
     };
     expect(t4After.depends_on).toEqual(["T2", "T3"]);
     expect(tasks.map((t) => t.task_key)).toEqual(["T1", "T2", "T3", "T4", "T5"]);
+  });
+});
+
+describe("P-GRAMMAR2 R1.A — durable repair evidence inside the ≤10 bound", () => {
+  const cand = (id: string) => ({
+    model_entry_id: id,
+    ref: `p:${id}`,
+    provider: "p",
+    model: id,
+    endpoint: "https://example.test",
+    credentialEnv: "ENV_X",
+  });
+
+  // 11 drop-warning tasks so the repair marker lands past the old
+  // slice(0,10) boundary, then the incident repair pair at the end.
+  const manyWarningsPlan = () => {
+    const rawTasks = [
+      ...Array.from({ length: 11 }, (_, i) => ({
+        task_key: `T${i + 1}`,
+        title: "bad",
+        task_instruction: "do something",
+        required_capabilities: ["NOT_A_REAL_CAPABILITY"],
+        depends_on: [] as string[],
+      })),
+      remoteTask("T50", "outbox/final.md"),
+      consumer(
+        "T51",
+        "Tổng hợp các nguồn, write summary.md, then reply DONE.",
+        ["T50"],
+      ),
+    ];
+    return sanitizePlan(rawTasks, CAPS, 13, SETS);
+  };
+
+  it("R1.A1. >10 earlier warnings — repair marker retained, bound held, task repaired, replay identical", async () => {
+    const res = await runPlannerFailover({
+      candidates: [cand("A")],
+      planFn: async () => manyWarningsPlan(),
+      assertEligible: () => {},
+      canonicalize: (tasks) => tasks,
+    });
+    const attempt = res.attempts[0];
+    // source warnings exceed the bound and the marker sat past index 10
+    const src = res.warnings;
+    expect(src.length).toBeGreaterThan(10);
+    expect(src.indexOf("REPAIRED_REMOTE_DEPENDENT_EDGE:T51")).toBeGreaterThan(9);
+    // durable attempt: ≤10, repair provenance retained, no duplicates
+    expect(attempt.warnings.length).toBeLessThanOrEqual(10);
+    expect(attempt.warnings).toContain("REPAIRED_REMOTE_DEPENDENT_EDGE:T51");
+    expect(new Set(attempt.warnings).size).toBe(attempt.warnings.length);
+    // canonical task itself is the repaired one — provenance is real
+    const t51 = res.tasks.find((t) => t.task_key === "T51");
+    expect(String(t51?.task_instruction)).toContain("outbox/final.md");
+    expect(attempt.warnings).not.toContain("DROP_REMOTE_DEPENDENT:T51");
+    // deterministic ordering: replay yields the identical bounded set
+    const res2 = await runPlannerFailover({
+      candidates: [cand("A")],
+      planFn: async () => manyWarningsPlan(),
+      assertEligible: () => {},
+      canonicalize: (tasks) => tasks,
+    });
+    expect(res2.attempts[0].warnings).toEqual(attempt.warnings);
+  });
+
+  it("R1.A2. helper: order preserved, earliest non-repair fill budget, no repair evicted", () => {
+    const warns = [
+      ...Array.from({ length: 12 }, (_, i) => `W${i}`),
+      "REPAIRED_REMOTE_DEPENDENT_EDGE:T9",
+      "REPAIRED_REMOTE_DEPENDENT_EDGE:T10",
+    ];
+    const bound = boundedAttemptWarnings(warns);
+    expect(bound.length).toBeLessThanOrEqual(10);
+    expect(bound).toContain("REPAIRED_REMOTE_DEPENDENT_EDGE:T9");
+    expect(bound).toContain("REPAIRED_REMOTE_DEPENDENT_EDGE:T10");
+    // earliest 8 non-repair warnings survive; tail evicted
+    expect(bound.slice(0, 8)).toEqual([
+      "W0",
+      "W1",
+      "W2",
+      "W3",
+      "W4",
+      "W5",
+      "W6",
+      "W7",
+    ]);
+    expect(bound).not.toContain("W11");
+    // ≤10 input passes through unchanged
+    expect(boundedAttemptWarnings(["a", "b"])).toEqual(["a", "b"]);
+  });
+});
+
+describe("P-GRAMMAR2 R1.B — VALIDATION_CODE exact identity (no truncation)", () => {
+  const cand = (id: string) => ({
+    model_entry_id: id,
+    ref: `p:${id}`,
+    provider: "p",
+    model: id,
+    endpoint: "https://example.test",
+    credentialEnv: "ENV_X",
+  });
+  const okPlan = () => ({
+    tasks: [
+      {
+        task_key: "T1",
+        title: "t",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+      },
+    ],
+    warnings: [] as string[],
+  });
+  const runWithCode = async (code: string) =>
+    runPlannerFailover({
+      candidates: [cand("A"), cand("B")],
+      planFn: async () => okPlan(),
+      assertEligible: () => {},
+      canonicalize: (_tasks, c) => {
+        if (c.model_entry_id === "A")
+          throw Object.assign(new IntegrityError("X", "m"), { code });
+        return _tasks;
+      },
+    });
+
+  it("R1.B1. exactly-80 safe code → retained verbatim", async () => {
+    const code = "A".repeat(80);
+    const res = await runWithCode(code);
+    expect(res.attempts[0].warnings).toContain(`VALIDATION_CODE:${code}`);
+    expect(res.attempts[0].warnings).toContain("CANONICAL_VALIDATION_FAILED");
+    expect(res.attempts[0].warnings.length).toBeLessThanOrEqual(10);
+  });
+
+  it("R1.B2. 81-char safe code → omitted entirely, never truncated", async () => {
+    const code = "B".repeat(81);
+    const res = await runWithCode(code);
+    const w = res.attempts[0].warnings;
+    expect(w).toContain("CANONICAL_VALIDATION_FAILED");
+    expect(w.some((x) => x.startsWith("VALIDATION_CODE:"))).toBe(false);
+    expect(w.join("|")).not.toContain("B".repeat(80));
+  });
+
+  it("R1.B3. invalid-charset code → omitted", async () => {
+    const res = await runWithCode("FAIL CODE WITH SPACE");
+    const w = res.attempts[0].warnings;
+    expect(w).toContain("CANONICAL_VALIDATION_FAILED");
+    expect(w.some((x) => x.startsWith("VALIDATION_CODE:"))).toBe(false);
+  });
+
+  it("R1.B4. ordinary IntegrityError code → exact value retained", async () => {
+    const res = await runPlannerFailover({
+      candidates: [cand("A"), cand("B")],
+      planFn: async () => okPlan(),
+      assertEligible: () => {},
+      canonicalize: (_tasks, c) => {
+        if (c.model_entry_id === "A")
+          throw new IntegrityError(
+            "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+            "details",
+          );
+        return _tasks;
+      },
+    });
+    expect(res.attempts[0].warnings).toContain(
+      "VALIDATION_CODE:FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+    );
+    expect(res.attempts[0].warnings.length).toBeLessThanOrEqual(10);
   });
 });

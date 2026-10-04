@@ -44,6 +44,35 @@ export const PLANNER_FAILURE_CLASS = {
 export type PlannerFailureClass =
   (typeof PLANNER_FAILURE_CLASS)[keyof typeof PLANNER_FAILURE_CLASS];
 
+/**
+ * R1.A — bounded durable attempt warnings that never evict PAIR-authored
+ * repair provenance. The durable set stays ≤10 and in original order:
+ * every REPAIRED_REMOTE_DEPENDENT_EDGE marker is retained (it proves a
+ * PAIR-authored instruction rewrite — indistinguishable from model text
+ * if dropped), and the earliest non-repair warnings fill the remaining
+ * budget. Deterministic, no duplicates, never unbounded.
+ */
+export function boundedAttemptWarnings(warnings: string[]): string[] {
+  if (warnings.length <= 10) return [...warnings];
+  const isRepair = (w: string) =>
+    w.startsWith("REPAIRED_REMOTE_DEPENDENT_EDGE:");
+  const nonRepairBudget = Math.max(
+    0,
+    10 - warnings.filter(isRepair).length,
+  );
+  const out: string[] = [];
+  let keptNonRepair = 0;
+  for (const w of warnings) {
+    if (isRepair(w)) {
+      if (out.length < 10) out.push(w);
+    } else if (keptNonRepair < nonRepairBudget) {
+      out.push(w);
+      keptNonRepair++;
+    }
+  }
+  return out;
+}
+
 /** Map llmPlan()'s warning codes to deterministic failure classes. */
 export function classifyPlannerFailure(warnings: string[]): PlannerFailureClass {
   const w = warnings[0] ?? "LLM_PLANNER_REQUEST_ERROR";
@@ -264,18 +293,24 @@ export async function runPlannerFailover(opts: {
           canonical = opts.canonicalize(res.tasks, c);
         } catch (e) {
           // P-GRAMMAR2 §3 — bounded typed observability: surface the
-          // thrown canonical-validation code on the attempt (bounded
-          // length, strict charset) alongside the class marker — never
-          // exception messages, stack traces, or secret material.
-          const code =
+          // thrown canonical-validation code on the attempt alongside
+          // the class marker — never exception messages, stack traces,
+          // or secret material. R1.B — exact identity only: the RAW
+          // code must itself be non-empty, ≤80 chars, and strict-safe;
+          // a longer or malformed code persists NO VALIDATION_CODE
+          // rather than a truncated/fabricated identity.
+          const rawCode =
             e &&
             typeof e === "object" &&
             typeof (e as { code?: unknown }).code === "string"
-              ? String((e as { code: string }).code).slice(0, 80)
+              ? (e as { code: string }).code
               : "";
-          const coded = /^[A-Z0-9_:.\-]+$/.test(code)
-            ? `VALIDATION_CODE:${code}`
-            : null;
+          const coded =
+            rawCode.length > 0 &&
+            rawCode.length <= 80 &&
+            /^[A-Z0-9_:.\-]+$/.test(rawCode)
+              ? `VALIDATION_CODE:${rawCode}`
+              : null;
           settle({
             ...base,
             completed_at: now(),
@@ -302,7 +337,7 @@ export async function runPlannerFailover(opts: {
           continue;
         }
       }
-      settle({ ...base, completed_at: completed, latency_ms: Date.now() - t0, outcome: "SUCCESS", warnings: res.warnings.slice(0, 10) });
+      settle({ ...base, completed_at: completed, latency_ms: Date.now() - t0, outcome: "SUCCESS", warnings: boundedAttemptWarnings(res.warnings) });
       return { tasks: canonical, winner: attempts[attempts.length - 1], attempts, warnings: res.warnings };
     } catch (e) {
       // Integrity/authority failures are not failover-eligible — settle
