@@ -85,6 +85,16 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     return (this.deps.envReader ?? ((n) => process.env[n]))(name);
   }
 
+  /**
+   * CNI-1: ambient CODEX internet authority. Server-level env switch —
+   * resolved per dispatch so an operator change affects the next dispatch.
+   * Truthy: on|true|1 (trim + case-insensitive); everything else OFF.
+   */
+  private codexNetworkAllowed(): boolean {
+    const v = (this.env("PAIR_CODEX_NETWORK") ?? "").trim().toLowerCase();
+    return v === "on" || v === "true" || v === "1";
+  }
+
   private resolveExecutable(): { command: string; prefixArgs: string[] } | null {
     if (this.deps.executable) {
       return {
@@ -201,7 +211,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     };
   }
 
-  private permissionArgs(task: Record<string, unknown>): string[] {
+  private permissionArgs(task: Record<string, unknown>, netAllowed: boolean): string[] {
     const perms = new Set(((task.permissions as string[]) ?? []).map(String));
     const writeAllowed = perms.has("WRITE") || perms.has("FILE_WRITE");
     const profile = writeAllowed ? "pair_workspace" : "pair_read";
@@ -217,7 +227,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       "--config", `default_permissions=${profile}`,
       "--config", `permissions.${profile}.extends=:workspace`,
       "--config", `permissions.${profile}.filesystem=${filesystem}`,
-      "--config", `permissions.${profile}.network.enabled=false`,
+      "--config", `permissions.${profile}.network.enabled=${netAllowed}`,
       "--config", `permissions.${profile}.workspace_roots={'${workspace}'=true}`,
     ];
   }
@@ -282,6 +292,8 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       },
       required: ["status", "summary", "artifacts"],
     });
+    const netAllowed = this.codexNetworkAllowed();
+    console.log(`CODEX_NETWORK: ${netAllowed ? "on" : "off"}`);
     const args = [
       ...exe.prefixArgs,
       "exec",
@@ -292,8 +304,8 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       "--strict-config",
       "--color", "never",
       "--config", "approval_policy=never",
-      "--config", "web_search=disabled",
-      ...this.permissionArgs(task),
+      "--config", `web_search=${netAllowed ? "live" : "disabled"}`,
+      ...this.permissionArgs(task, netAllowed),
       "-C", workspace,
       "--output-schema", schemaPath,
       "--output-last-message", finalPath,

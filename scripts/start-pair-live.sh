@@ -92,6 +92,7 @@ DSH_SETTINGS="$HOME/.pair-dsh-home/settings.yaml"
   PAIR_PLANNER_EXTRA_ROUTES="${PAIR_PLANNER_EXTRA_ROUTES:-badq:openai/gpt-oss-20b}" \
   PAIR_DSH_MODEL_ROUTE="${PAIR_DSH_MODEL_ROUTE:-groq:openai/gpt-oss-20b}" \
   PAIR_DSH_FALLBACK_ROUTE="${PAIR_DSH_FALLBACK_ROUTE:-cloudflare:@cf/zai-org/glm-4.7-flash}" \
+  PAIR_CODEX_NETWORK="${PAIR_CODEX_NETWORK:-on}" \
   nohup node scripts/serve-mission-control.mjs > "$MC_LOG" 2>&1 &
 )
 echo "==> server starting (log $MC_LOG)"
