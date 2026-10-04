@@ -2300,3 +2300,121 @@ describe("RPN-1 — canonical DSN-1 name equivalence at the produces gate", () =
     expect(validationRow(ctx, p.eid)!.remote_produces_missing).toBeUndefined();
   });
 });
+
+describe("RPN-1 R1 — injective declared↔artifact binding (one artifact ≠ two slots)", () => {
+  it("R1-A. live incident still PASS — declared outbox/X + bare upload X", () => {
+    const ctx = makeCtx("rpn1r1-a");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["outbox/github_ea.md"],
+      missionId: "M_R1A",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "github_ea.md", "ea-bytes");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toBeUndefined();
+  });
+
+  it("R1-B. exact unchanged — declared X + upload X → PASS", () => {
+    const ctx = makeCtx("rpn1r1-b");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["github_ea.md"],
+      missionId: "M_R1B",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "github_ea.md", "ea-bytes");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+  });
+
+  it("R1-C. two declared aliases + two exact artifacts → PASS", () => {
+    const ctx = makeCtx("rpn1r1-c");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["chart.png", "outbox/chart.png"],
+      missionId: "M_R1C",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "chart.png", "a");
+    upload(ctx, exec, "outbox/chart.png", "b");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+  });
+
+  it("R1-D. CRITICAL — one artifact cannot close two declared slots (bare direction)", () => {
+    const ctx = makeCtx("rpn1r1-d");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["chart.png", "outbox/chart.png"],
+      missionId: "M_R1D",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "chart.png", "a");
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    const row = validationRow(ctx, p.eid)!;
+    expect(row.remote_produces_missing).toEqual(["outbox/chart.png"]);
+    expect(row.failures).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:outbox/chart.png",
+      ]),
+    );
+  });
+
+  it("R1-E. mirror — declared X + outbox/X, only outbox/X uploaded → FAIL names X", () => {
+    const ctx = makeCtx("rpn1r1-e");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["chart.png", "outbox/chart.png"],
+      missionId: "M_R1E",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "outbox/chart.png", "b");
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    const row = validationRow(ctx, p.eid)!;
+    expect(row.remote_produces_missing).toEqual(["chart.png"]);
+    expect(row.failures).toEqual(
+      expect.arrayContaining([
+        "FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:chart.png",
+      ]),
+    );
+  });
+
+  it("R1-F. foreign/consumed equivalent artifact still satisfies nothing", () => {
+    const ctx = makeCtx("rpn1r1-f");
+    const foreign = mkRemoteProducer(ctx, {
+      produces: ["github_ea.md"],
+      missionId: "M_R1F",
+    });
+    const fexec = ctx.store.get("executor_execution", foreign.eid);
+    upload(ctx, fexec, "github_ea.md", "foreign");
+    completeRemote(ctx, foreign.eid);
+    expect(String(validate(ctx, foreign.eid).status)).toBe("PASS");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["github_ea.md", "outbox/github_ea.md"],
+      missionId: "M_R1F",
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toEqual([
+      "github_ea.md",
+      "outbox/github_ea.md",
+    ]);
+  });
+
+  it("R1-G. wrong directories still fail under injective binding", () => {
+    const ctx = makeCtx("rpn1r1-g");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["dirA/x.md"],
+      missionId: "M_R1G",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "dirB/x.md", "other");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toEqual([
+      "dirA/x.md",
+    ]);
+  });
+});

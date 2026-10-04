@@ -309,40 +309,52 @@ export class ArtifactProvenanceValidator {
                 const acceptedRows = service.artifacts
                   .forExecution(executionId)
                   .filter((a) => verified.has(String(a.artifact_id)));
+                // RPN-1 — declared names compare through the ONE
+                // canonical DSN-1 equivalence rule (outbox/<basename>
+                // staging alias), never raw strings. RPN-1 R1 — the
+                // closure is an INJECTIVE binding: one declared slot ↔
+                // one unique accepted artifact identity, so a single
+                // produced artifact can never close two separately
+                // pinned declarations. Phase 1 binds every exact-name
+                // declaration first; phase 2 closes remaining
+                // declarations through the equivalence band against
+                // still-UNBOUND artifacts only. Name match alone never
+                // authorizes — every candidate is already an ACCEPTED
+                // artifact CAS-verified for THIS execution.
+                const boundArtifactIds = new Set<string>();
+                const unresolved: string[] = [];
                 for (const name of declared) {
-                  // RPN-1 — declared names compare through the ONE
-                  // canonical DSN-1 equivalence rule (outbox/<basename>
-                  // staging alias), never raw strings. Exact spelling
-                  // wins first; the equivalence band applies only when
-                  // no exact-name artifact exists — so two DISTINCT
-                  // declared spellings each satisfied by their exact
-                  // artifact never collapse into ambiguity, while the
-                  // live-incident spelling (declared outbox/X, uploaded
-                  // X) still closes. Name match alone never authorizes:
-                  // the row must be an ACCEPTED artifact verified for
-                  // THIS execution, and exactly one identity may
-                  // satisfy each declared name.
                   const exact = acceptedRows.filter(
-                    (a) => String(a.logical_name) === name,
+                    (a) =>
+                      String(a.logical_name) === name &&
+                      !boundArtifactIds.has(String(a.artifact_id)),
                   );
-                  const candidates =
-                    exact.length > 0
-                      ? exact
-                      : acceptedRows.filter((a) =>
-                          artifactNamesEquivalent(name, a.logical_name),
-                        );
-                  if (candidates.length !== 1) {
+                  if (exact.length === 1) {
+                    boundArtifactIds.add(String(exact[0]!.artifact_id));
+                  } else {
+                    unresolved.push(name);
+                  }
+                }
+                for (const name of unresolved) {
+                  const candidates = acceptedRows.filter(
+                    (a) =>
+                      !boundArtifactIds.has(String(a.artifact_id)) &&
+                      artifactNamesEquivalent(name, a.logical_name),
+                  );
+                  if (candidates.length === 1) {
+                    boundArtifactIds.add(String(candidates[0]!.artifact_id));
+                  } else {
                     remoteProducesMissing.push(name);
                   }
                 }
-                if (remoteProducesMissing.length) {
-                  for (const name of remoteProducesMissing) {
-                    failures.push(
-                      `FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`,
-                    );
-                  }
-                  pass = false;
+              }
+              if (remoteProducesMissing.length) {
+                for (const name of remoteProducesMissing) {
+                  failures.push(
+                    `FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`,
+                  );
                 }
+                pass = false;
               }
             }
           } else if (marker !== undefined && marker !== false) {

@@ -92,3 +92,52 @@ Focused: **F5 suite 67/67** (58 prior + 9 RPN-1). The DSN-1 D8 fixture (producer
 
 - **Planner Remote Artifact Edge Hardening** — planner candidates repeatedly emit remote-dependent tasks without naming the remote-produced artifact in the consumer instruction (`DROP_REMOTE_DEPENDENT`, observed 3/4 attempts across two planner runs). F2 behaves correctly; left for a separate follow-up.
 - **Planner Attempt Typed Error Observability** — `planner_attempt` rows retain only `CANONICAL_VALIDATION_FAILED`; the original typed IntegrityError code is lost.
+
+---
+
+## R1 — Injective declared↔artifact binding (audited base `e868ae3`)
+
+**Issue:** under RPN-1's per-name matching, one accepted artifact could satisfy multiple `declared_produces` slots — declared `[chart.png, outbox/chart.png]` + one uploaded `chart.png` would PASS (exact for slot 1, equivalent for slot 2). False completion: a single produced artifact closed two separately pinned contract entries.
+
+**Fix (same seam, two-phase injective binding):**
+
+```ts
+const boundArtifactIds = new Set<string>();
+const unresolved: string[] = [];
+// Phase 1 — exact-name declarations bind first.
+for (const name of declared) {
+  const exact = acceptedRows.filter(
+    (a) => String(a.logical_name) === name &&
+          !boundArtifactIds.has(String(a.artifact_id)));
+  if (exact.length === 1) boundArtifactIds.add(String(exact[0]!.artifact_id));
+  else unresolved.push(name);
+}
+// Phase 2 — remaining declarations close via canonical equivalence
+// against still-UNBOUND artifacts only.
+for (const name of unresolved) {
+  const candidates = acceptedRows.filter(
+    (a) => !boundArtifactIds.has(String(a.artifact_id)) &&
+           artifactNamesEquivalent(name, a.logical_name));
+  if (candidates.length === 1)
+    boundArtifactIds.add(String(candidates[0]!.artifact_id));
+  else remoteProducesMissing.push(name);
+}
+```
+
+Each canonical `artifact_id` binds at most once; the declared contract is preserved exactly as minted (no collapsing of equivalent declared names). `artifactNamesEquivalent` untouched; every other F5 authority untouched.
+
+**R1 test matrix** (new `RPN-1 R1` describe, 7 tests):
+
+| Case | Declared | Uploaded | Result |
+|---|---|---|---|
+| R1-A live incident | `outbox/github_ea.md` | `github_ea.md` | PASS |
+| R1-B exact | `github_ea.md` | `github_ea.md` | PASS |
+| R1-C two aliases + two exacts | `chart.png`+`outbox/chart.png` | both | PASS |
+| R1-D one artifact/two slots | `chart.png`+`outbox/chart.png` | `chart.png` only | FAIL `INCOMPLETE:outbox/chart.png` |
+| R1-E mirror | `chart.png`+`outbox/chart.png` | `outbox/chart.png` only | FAIL `INCOMPLETE:chart.png` |
+| R1-F foreign/consumed | `[github_ea.md, outbox/github_ea.md]` | foreign exec's `github_ea.md` | FAIL both missing |
+| R1-G wrong dirs | `dirA/x.md` | `dirB/x.md` | FAIL |
+
+All prior RPN-1 A–J tests retained and passing. Focused: **F5 74/74 + DSN-1 11/11**. Regression: **650/650** (F1×3, F2×4, F4, dataflow-incident, PRV2-A/B, recovery×2). Full suite **3532 pass / 2 fail** = the two known P5 environment-only failures, identical to baseline. `tsc --noEmit` clean; `rm -rf dist && pnpm build` clean; `pnpm audit` 0 high (unchanged lockfile baseline).
+
+Classification: `PAIR_NEXT_RPN1_REMOTE_PRODUCES_NAME_EQUIVALENCE_R1_PENDING_AUDIT`.
