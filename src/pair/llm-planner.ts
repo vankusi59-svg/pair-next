@@ -10,13 +10,82 @@
  */
 
 import { PolicyError } from "./errors.js";
-import { extractTaskDataflow } from "./plan-dataflow.js";
+import {
+  extractTaskDataflow,
+  isPureBookkeepingTask,
+} from "./plan-dataflow.js";
 
 export const LLM_PLANNER_MAX_INSTRUCTION = 2000;
 export const LLM_PLANNER_DEFAULT_MAX_TASKS = 5;
 export const LLM_PLANNER_DEFAULT_TIMEOUT_MS = 20000;
-/** A usable plan always has >=2 tasks: T1 only records the goal. */
-export const LLM_PLANNER_MIN_TASKS = 2;
+/** PRV2-A §D — the planner emits WORK tasks only; PAIR injects the
+ *  canonical bookkeeping task at the canonicalize seam. A plan is
+ *  degenerate when it carries ZERO usable work tasks (a bookkeeping-only
+ *  plan still performs no real work). */
+export const LLM_PLANNER_MIN_TASKS = 1;
+
+/** PRV2-A §E — adaptive work-task budget. The deterministic bookkeeping
+ *  task is NOT a work task and is never counted. */
+export const WORK_TASK_HARD_CEILING = 12;
+export const WORK_TASK_BUDGET_SIMPLE = 4;
+export const WORK_TASK_BUDGET_MEDIUM = 6;
+export const WORK_TASK_BUDGET_COMPLEX = 10;
+
+/** Deterministic complexity score → bounded budget (exact rule, §E):
+ *    score = wordCount + 4*numberedListMarkers + 2*connectiveHits
+ *    score ≤ 40 → simple (4); ≤ 120 → medium (6); else complex (10).
+ *  Pure function of the goal text — the model cannot request an
+ *  arbitrary budget. */
+export function deriveWorkTaskBudget(goal: string): number {
+  const g = String(goal ?? "");
+  const words = g.split(/\s+/u).filter(Boolean).length;
+  const enumerations = Math.min(
+    (g.match(/\b\d+\s*[.)]/gu) ?? []).length,
+    10,
+  );
+  const connectives = (
+    g
+      .toLowerCase()
+      .match(/\b(và|and|then|sau đó|tiếp|rồi|cuối cùng|finally|also|song song)\b|[,;]/gu) ?? []
+  ).length;
+  const score = words + 4 * enumerations + 2 * connectives;
+  if (score <= 40) return WORK_TASK_BUDGET_SIMPLE;
+  if (score <= 120) return WORK_TASK_BUDGET_MEDIUM;
+  return WORK_TASK_BUDGET_COMPLEX;
+}
+
+/** Effective budget = min(derived, configuredMax) under the absolute
+ *  hard ceiling (12 work tasks). A configured cap only tightens. */
+export function resolveWorkTaskBudget(goal: string, configuredMax?: number): number {
+  const ceiling = Math.min(
+    configuredMax ?? WORK_TASK_HARD_CEILING,
+    WORK_TASK_HARD_CEILING,
+  );
+  return Math.max(1, Math.min(deriveWorkTaskBudget(goal), ceiling));
+}
+
+/** PRV2-A §D — a model-emitted task is bookkeeping-shaped when its
+ *  filtered (allowed-vocabulary) capabilities are exactly
+ *  {AUTOMATON_TASK_EXECUTION}: the ONLY thing it could do is PAIR's
+ *  bookkeeping. PAIR injects bookkeeping itself, so such a task is
+ *  normalized away at the canonicalize seam (never two bookkeeping
+ *  authorities in one plan). */
+export function isBookkeepingShapedTask(
+  task: Record<string, unknown>,
+  allowedCapabilities: string[],
+): boolean {
+  const capSet = new Set(allowedCapabilities);
+  const caps = Array.isArray(task.required_capabilities)
+    ? task.required_capabilities.map((c) => String(c)).filter((c) => capSet.has(c))
+    : [];
+  if (!caps.length || !caps.every((c) => c === "AUTOMATON_TASK_EXECUTION")) {
+    return false;
+  }
+  return isPureBookkeepingTask({
+    required_capabilities: caps,
+    metadata: task.metadata,
+  });
+}
 
 export interface LlmPlannerConfig {
   /** Provider chat/completions URL (P6 endpoint_reference). */
@@ -253,7 +322,7 @@ export function sanitizePlan(
 
 const SYSTEM_PROMPT = `You are the PAIR OS mission planner. Convert the operator's mission goal into a JSON task DAG.
 
-Output ONLY a JSON object: {"tasks": [...]}. Each task:
+Output ONLY a JSON object: {"tasks": [...]}. Each task is a WORK task — work that serves the goal directly:
 - "task_key": "T1", "T2", ... sequential
 - "title": short label
 - "task_instruction": self-contained instruction for an autonomous executor agent. It must name the REAL WORK the operator asked for — carry the goal's subject matter verbatim into the instruction (e.g. goal "phân tích giá vàng hôm nay" → instruction "analyze today's gold price using ICT concepts — market structure, liquidity, order blocks — and write findings to analysis.txt"). NEVER emit meta-instructions like "analyze the goal" or "summarize the mission". Mention workspace-relative file paths when files must be read/written (e.g. "read mission_goal.txt", "write result to out.txt"). The executor runs inside the mission workspace.
@@ -261,12 +330,12 @@ Output ONLY a JSON object: {"tasks": [...]}. Each task:
 - "depends_on": earlier task_keys only (DAG, acyclic). MUST list every task whose output this task needs: if it reads/copies/delivers a file another task writes, or uses its returned result, the producer goes in depends_on. Undeclared inputs make the task run before its data exists. Independent tasks stay parallel — only real producers are dependencies.
 
 Rules:
-- Always include a first task T1 that records the goal into mission_goal.txt via capability AUTOMATON_TASK_EXECUTION.
-- 2 to MAX_TASKS tasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS/AUTOMATON_TASK_EXECUTION for pure file writes.
-- LIVE DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price") that local executors cannot fetch — local executors have NO internet — the data-gathering task MUST use REMOTE_CLOUD_TASK_EXECUTION (the remote executor has a real browser/network). Instruct it to RETURN the full findings as its final result text — files it writes stay remote and are invisible locally.
-- REAL BUILD WORK: when the goal asks to actually BUILD or FIX software (xây/build/create a website/app/tool/bot/script, viết code, fix bug, deploy) — i.e. real code across multiple files, not a single small file — the build task MUST use REMOTE_CLOUD_TASK_EXECUTION. Local executors can only write simple text files and CANNOT code real software; giving them build work produces documentation instead of a product. Instruct the remote task to RETURN a summary + key file contents (or upload via outbox for larger artifacts).
-- REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION run on a REMOTE executor: their result text comes back, and their uploaded files land as canonical artifacts. A downstream task may depend on a remote task ONLY when it explicitly declares the produced artifact as an input (read the file it produces — name the artifact in its instruction or worker_spec); a remote dep with no declared artifact edge is rejected. TELEGRAM_DELIVERY tasks always may depend on remote tasks (they receive the remote result text through dependency_outputs).
-- VISUAL DELIVERABLES: if the goal asks for a real chart, screenshot, or image (chụp ảnh/biểu đồ/chart/screenshot), the remote task must capture it with its browser AND upload the file via the outbox endpoint described in its prompt — the file is unusable if it stays on the remote machine. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
+- Emit ONLY genuine work tasks. PAIR injects its own bookkeeping task (recording the goal) before the plan is committed — NEVER emit a task whose purpose is recording the goal, and NEVER request AUTOMATON_TASK_EXECUTION (it is reserved for PAIR's injected bookkeeping task).
+- 1 to WORK_TASKS work tasks. Every task must exist for at least one concrete reason: a distinct deliverable/output, a distinct capability boundary, independently parallelizable work, a verification/review boundary, or a side-effect boundary. Do NOT split trivial sequential prose work into microtasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS for pure file writes.
+- CURRENT/EXTERNAL DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price"), the data-gathering task must request capabilities sufficient for current-data/network research under ALLOWED_CAPABILITIES. You describe WHAT the task needs — the Mission Router chooses WHICH executor serves it; never assume a specific executor has or lacks internet. Instruct the task to RETURN the full findings as its final result text, and name produced files explicitly when a downstream task must read them.
+- SOFTWARE WORK: when the goal asks to build or fix software (xây/build/create a website/app/tool/bot/script, viết code, fix bug, deploy), pick the minimum capability set the job requires (CODE_GENERATION, CODE_EDITING, SHELL_EXECUTION, PYTHON_EXECUTION, FILE_OPERATIONS). You describe the work — the router decides which executor satisfies the set.
+- REMOTE DATAFLOW CONTRACT: tasks carrying REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION may execute remotely — their result text comes back, and their uploaded files land as canonical artifacts. A downstream task may depend on a remote task ONLY when it explicitly declares the produced artifact as an input (read the file it produces — name the artifact in its instruction or worker_spec); a remote dep with no declared artifact edge is rejected. TELEGRAM_DELIVERY tasks always may depend on remote tasks (they receive the remote result text through dependency_outputs).
+- VISUAL DELIVERABLES: a chart computed from data the plan already produces is ordinary compute work (e.g. PYTHON_EXECUTION); a screenshot of a live website needs a network-capable execution capability from ALLOWED_CAPABILITIES; a generated image is only possible when a governed image-generation capability exists in ALLOWED_CAPABILITIES. If a visual file is produced by a task that may execute remotely, it must be uploaded via the outbox endpoint described in that task's prompt — a file left on a remote machine is unusable. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
 - TELEGRAM_DELIVERY (when ALLOWED): ONLY when the goal EXPLICITLY asks to send/deliver named output to Telegram (gửi tele/telegram, báo qua telegram, send/deliver to telegram) — never add it for a goal that merely mentions a file, an outbox, or completion. Add it as a DAG-leaf task with capability TELEGRAM_DELIVERY, depending ONLY on the tasks that produce what the goal asked to be sent. PAIR pins the delivery manifest, the canonical output language, and the final delivery instruction from the operator request — the plan does not choose what may be sent, in which language, or how. Instruction placeholder: "Stage the manifested artifacts into outbox/ unchanged, then reply DONE." (PAIR rewrites it canonically.)
 - FILE DELIVERABLES: when the goal names a file to create AND asks to send it (e.g. "tạo file X.md ... gửi telegram"), the producing task must write the file directly into outbox/<exact filename> — not the workspace root — so the delivery pipeline picks it up.
 - BYTE DEPENDENCIES: "needs the data from T2" is NOT an input — bytes are. When a task needs another task's FILE output, the PRODUCER's instruction must name the exact artifact path it writes (e.g. "write findings to report.txt") and the CONSUMER's instruction must name that same path as its input (e.g. "read report.txt") — identical names, producer earlier, consumer depends_on the producer. A consumer that only says "send the report" with no file edge consumes the producer's RESULT TEXT via dependency_outputs — valid only for local (non-remote) producers.
@@ -288,10 +357,10 @@ export function buildPlannerUserPrompt(
     replanContext?: LlmPlannerConfig["replanContext"];
   },
 ): string {
-  const maxTasks = cfg.maxTasks ?? LLM_PLANNER_DEFAULT_MAX_TASKS;
+  const workTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
   return (
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +
-    `MAX_TASKS: ${maxTasks}\n` +
+    `WORK_TASKS: ${workTasks}\n` +
     (cfg.capabilitySets?.length
       ? `EXECUTOR_CAPABILITY_SETS (one executor can serve a task only when its set covers ALL the task's required_capabilities): ${cfg.capabilitySets.map((s) => `[${s.join(", ")}]`).join(" ")}\n`
       : "") +
@@ -318,7 +387,7 @@ export function plannerSystemPrompt(): string {
 }
 
 export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmPlanResult> {
-  const maxTasks = cfg.maxTasks ?? LLM_PLANNER_DEFAULT_MAX_TASKS;
+  const maxTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
   const timeoutMs = cfg.timeoutMs ?? LLM_PLANNER_DEFAULT_TIMEOUT_MS;
   const apiKey = envGet(cfg.env, cfg.credentialEnv);
   const fetchImpl = cfg.fetchFn ?? fetch;
@@ -383,12 +452,15 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     return { tasks, warnings };
   };
 
-  // Degenerate output (fewer than MIN_TASKS usable tasks — a T1-only plan
-  // only records the goal and performs no work) replans once, then rejects.
+  // Degenerate output (ZERO usable work tasks — a bookkeeping-only plan
+  // performs no work) replans once, then rejects.
   const warnings: string[] = [];
   for (let i = 0; i < 2; i++) {
     const a = await attempt();
-    if (a.tasks.length >= LLM_PLANNER_MIN_TASKS) {
+    const usable = a.tasks.filter(
+      (t) => !isBookkeepingShapedTask(t, cfg.allowedCapabilities),
+    );
+    if (usable.length >= LLM_PLANNER_MIN_TASKS) {
       return { tasks: a.tasks, source: "LLM", model: cfg.model, warnings: [...warnings, ...a.warnings] };
     }
     warnings.push(...a.warnings, "LLM_PLAN_DEGENERATE");

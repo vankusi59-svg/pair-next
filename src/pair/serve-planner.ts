@@ -26,7 +26,11 @@
  *   explicitly UNSUPPORTED under the current sync contract and REPLAN
  *   fails closed rather than replaying the old plan.
  */
-import { sanitizePlan } from "./llm-planner.js";
+import {
+  isBookkeepingShapedTask,
+  resolveWorkTaskBudget,
+  sanitizePlan,
+} from "./llm-planner.js";
 import {
   reconcilePlanDataflow,
   detectTelegramDeliveryIntent,
@@ -53,6 +57,43 @@ export const SERVE_LLM_PLANNER_CAPS = [
 ];
 
 
+/** PRV2-A §D — the PAIR-owned bookkeeping task: deterministic identity
+ *  (T1, canonical instruction, canonical worker_spec carrying the goal as
+ *  payload — never as an instruction the model could contaminate). */
+export function canonicalBookkeepingTask(goal: string): Record<string, unknown> {
+  return {
+    task_key: "T1",
+    title: "record mission goal",
+    task_instruction: CANONICAL_BOOKKEEPING_INSTRUCTION,
+    required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
+    depends_on: [],
+    metadata: {
+      expected_output_contract: {
+        type: "TASK_RESULT",
+        worker_spec: {
+          ops: [
+            {
+              op: "write_text_file",
+              path: "mission_goal.txt",
+              content: goal,
+              idempotency_class: "WRITE",
+              risk_class: "MEDIUM",
+            },
+            {
+              op: "finish",
+              result: { summary: "goal recorded" },
+              idempotency_class: "READ_ONLY",
+              risk_class: "LOW",
+            },
+          ],
+          limits: { max_ops: 4, timeout_seconds: 30 },
+          allowed_ops: ["write_text_file", "finish"],
+        },
+      },
+    },
+  };
+}
+
 export interface ServePlannerDeps {
   /** Whether a governed executor id is registered + qualified (template
    *  plan T2/T3 emission). Production: `(id) => governed.has(id)`. */
@@ -78,22 +119,77 @@ export interface ServePlannerDeps {
  *  construction. */
 export function makeServeCanonicalizer(deps: {
   executorCapSets: () => string[][];
+  /** PRV2-A §E — optional configured work-task ceiling (only tightens the
+   *  derived adaptive budget; hard ceiling 12 always applies). */
+  maxWorkTasks?: number;
 }): (
   rawTasks: Array<Record<string, unknown>>,
   goal: string,
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal) => {
+    // PRV2-A §D — the model emits WORK tasks only; PAIR owns bookkeeping.
+    // A model-emitted bookkeeping-shaped task (filtered caps ⊆
+    // {AUTOMATON_TASK_EXECUTION}) is deterministically normalized away so
+    // the plan can never carry two bookkeeping authorities.
+    const bookkeepingKeys = new Set<string>();
+    const workRaw = (rawTasks ?? []).filter((t) => {
+      const shaped = isBookkeepingShapedTask(
+        (t ?? {}) as Record<string, unknown>,
+        SERVE_LLM_PLANNER_CAPS,
+      );
+      if (shaped) {
+        const k = String((t as Record<string, unknown>)?.task_key ?? "");
+        if (k) bookkeepingKeys.add(k);
+      }
+      return !shaped;
+    });
+    // PRV2-A §E — adaptive work-task budget bounds the work graph; the
+    // injected bookkeeping task is not counted against it.
+    const workBudget = resolveWorkTaskBudget(goal, deps.maxWorkTasks);
     const { tasks } = sanitizePlan(
-      rawTasks as never[],
+      workRaw as never[],
       SERVE_LLM_PLANNER_CAPS,
-      5,
+      workBudget,
       deps.executorCapSets() as never[],
     );
     if (!tasks.length) return [] as Array<Record<string, unknown>>;
+    // PRV2-A §D — deterministic key/dependency remap: kept work tasks
+    // become T2..T(n+1) in emitted order; a dependency on a dropped
+    // bookkeeping-shaped task resolves to PAIR's injected T1.
+    const keyMap = new Map<string, string>();
+    tasks.forEach((t, i) => keyMap.set(String(t.task_key), `T${i + 2}`));
+    const rawByKey = new Map(
+      (rawTasks ?? []).map((t) => [
+        String((t as Record<string, unknown>)?.task_key ?? ""),
+        t as Record<string, unknown>,
+      ]),
+    );
+    const workTasks = tasks.map((t) => {
+      const raw = rawByKey.get(String(t.task_key));
+      const rawDeps = Array.isArray(raw?.depends_on)
+        ? (raw!.depends_on as unknown[]).map((d) => String(d))
+        : [];
+      const remapped = [
+        ...(rawDeps.some((d) => bookkeepingKeys.has(d)) ? ["T1"] : []),
+        ...(((t.depends_on as string[]) ?? [])
+          .map((d) => keyMap.get(d))
+          .filter((d): d is string => typeof d === "string")),
+      ];
+      return {
+        ...t,
+        task_key: keyMap.get(String(t.task_key))!,
+        depends_on: [...new Set(remapped)],
+      };
+    });
+    const tasksWithBookkeeping: Array<Record<string, unknown>> = [
+      canonicalBookkeepingTask(String(goal ?? "")),
+      ...workTasks,
+    ];
+    const allTasks = tasksWithBookkeeping;
     // PAIR_NATIVE tasks need an expected_output_contract worker_spec —
     // the LLM cannot emit one, so inject the canonical write-file
     // contract for any native-capability task that lacks it.
-    for (const t of tasks as Array<Record<string, unknown>>) {
+    for (const t of allTasks) {
       const caps = t.required_capabilities as string[];
       if (!caps.includes("AUTOMATON_TASK_EXECUTION")) continue;
       const md = (t.metadata ??= {}) as Record<string, unknown>;
@@ -127,11 +223,11 @@ export function makeServeCanonicalizer(deps: {
     // producer; unbound/ambiguous/backward producers throw
     // FAIL_CLOSED_PLAN_DATAFLOW_*. The telegram delivery authority is
     // the operator REQUEST alone.
-    reconcilePlanDataflow(tasks as never[], {
+    reconcilePlanDataflow(allTasks as never[], {
       telegramIntent: detectTelegramDeliveryIntent(String(goal ?? "")),
       outputLanguage: detectOutputLanguage(String(goal ?? "")),
     });
-    return tasks as Array<Record<string, unknown>>;
+    return allTasks;
   };
 }
 
@@ -200,40 +296,7 @@ export function makeServePlanner(deps: ServePlannerDeps): {
       if (tasks.length) return { tasks };
     }
     const tasks: Array<Record<string, unknown>> = [
-      {
-        task_key: "T1",
-        title: "record mission goal",
-        // R8 §3 — PAIR-owned bookkeeping instruction: the goal text is
-        // payload written by worker_spec, never a task directive (an
-        // operator send request must not leak into the instruction).
-        task_instruction: CANONICAL_BOOKKEEPING_INSTRUCTION,
-        required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
-        depends_on: [],
-        metadata: {
-          expected_output_contract: {
-            type: "TASK_RESULT",
-            worker_spec: {
-              ops: [
-                {
-                  op: "write_text_file",
-                  path: "mission_goal.txt",
-                  content: goal,
-                  idempotency_class: "WRITE",
-                  risk_class: "MEDIUM",
-                },
-                {
-                  op: "finish",
-                  result: { summary: "goal recorded" },
-                  idempotency_class: "READ_ONLY",
-                  risk_class: "LOW",
-                },
-              ],
-              limits: { max_ops: 4, timeout_seconds: 30 },
-              allowed_ops: ["write_text_file", "finish"],
-            },
-          },
-        },
-      },
+      canonicalBookkeepingTask(goal),
     ];
     if (deps.hasExecutor(DSH_EXECUTOR_ID)) {
       tasks.push({

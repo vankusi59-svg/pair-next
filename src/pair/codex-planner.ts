@@ -31,7 +31,8 @@ import {
   plannerSystemPrompt,
   extractPlanJson,
   sanitizePlan,
-  LLM_PLANNER_DEFAULT_MAX_TASKS,
+  isBookkeepingShapedTask,
+  resolveWorkTaskBudget,
   LLM_PLANNER_MIN_TASKS,
 } from "./llm-planner.js";
 import { assertPlannerCandidateEligible, assertPlannerRoleAndDisjoint } from "./model-role.js";
@@ -342,11 +343,12 @@ export async function codexPlannerPlan(
   const exe = cfg.executable ?? resolveExecutable(cfg.env);
   if (!exe) return { tasks: [], warnings: [CODEX_PLANNER_WARNING.CLI_MISSING] };
   const timeoutMs = cfg.timeoutMs ?? CODEX_PLANNER_DEFAULT_TIMEOUT_MS;
+  const workBudget = resolveWorkTaskBudget(goal, cfg.maxTasks);
   const prompt =
     `${plannerSystemPrompt()}\n\n${buildPlannerUserPrompt(goal, {
       allowedCapabilities: cfg.allowedCapabilities,
       capabilitySets: cfg.capabilitySets,
-      maxTasks: cfg.maxTasks ?? LLM_PLANNER_DEFAULT_MAX_TASKS,
+      maxTasks: cfg.maxTasks,
     })}`;
   let out: Awaited<ReturnType<typeof invokeRaw>>;
   try {
@@ -379,11 +381,16 @@ export async function codexPlannerPlan(
   const { tasks, warnings } = sanitizePlan(
     rawTasks as Parameters<typeof sanitizePlan>[0],
     cfg.allowedCapabilities,
-    cfg.maxTasks ?? LLM_PLANNER_DEFAULT_MAX_TASKS,
+    workBudget,
     cfg.capabilitySets,
   );
   if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
-  if (tasks.length < LLM_PLANNER_MIN_TASKS) {
+  // PRV2-A §D — degenerate = ZERO usable work tasks (a bookkeeping-only
+  // plan performs no work; PAIR injects bookkeeping itself).
+  const usable = tasks.filter(
+    (t) => !isBookkeepingShapedTask(t, cfg.allowedCapabilities),
+  );
+  if (usable.length < LLM_PLANNER_MIN_TASKS) {
     return { tasks: [], warnings: [...warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE] };
   }
   return { tasks, warnings };
