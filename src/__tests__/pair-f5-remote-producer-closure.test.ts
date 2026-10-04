@@ -28,6 +28,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApprovalQueue,
   ArtifactProvenanceValidator,
+  artifactNamesEquivalent,
   canonicalArtifactId,
   DependencyResolutionError,
   ExecutorRegistry,
@@ -2111,5 +2112,191 @@ describe("F5 R2 — applicability comes from the immutable mint anchor", () => {
       delete process.env.PAIR_OUTBOX_URL;
       delete process.env.PAIR_ARTIFACT_UPLOAD_TOKEN;
     }
+  });
+});
+
+describe("RPN-1 — canonical DSN-1 name equivalence at the produces gate", () => {
+  it("A. exact name unchanged → PASS", () => {
+    const ctx = makeCtx("rpn1-a");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["github_ea.md"],
+      missionId: "M_RPN_A",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "github_ea.md", "ea-bytes");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+    const row = validationRow(ctx, p.eid)!;
+    expect(row.artifact_ids).toEqual(
+      expect.arrayContaining([canonicalArtifactId(p.eid, "github_ea.md")]),
+    );
+    expect(row.remote_produces_missing).toBeUndefined();
+  });
+
+  it("B. declared outbox alias + bare remote upload → PASS (live incident)", () => {
+    const ctx = makeCtx("rpn1-b");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["outbox/github_ea.md"],
+      missionId: "M_RPN_B",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "github_ea.md", "ea-bytes");
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("PASS");
+    const row = validationRow(ctx, p.eid)!;
+    expect(row.remote_produces_missing).toBeUndefined();
+    expect(row.artifact_ids).toEqual(
+      expect.arrayContaining([canonicalArtifactId(p.eid, "github_ea.md")]),
+    );
+  });
+
+  it("C. reverse staging spelling → PASS (outbox upload satisfies bare declared)", () => {
+    // canonicalArtifactId derives from the UPLOADED logical name.
+    expect(artifactNamesEquivalent("github_ea.md", "outbox/github_ea.md")).toBe(
+      true,
+    );
+    const ctx = makeCtx("rpn1-c");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["github_ea.md"],
+      missionId: "M_RPN_C",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "outbox/github_ea.md", "ea-bytes");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+  });
+
+  it("D. wrong directories remain different → FAIL", () => {
+    const ctx = makeCtx("rpn1-d");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["reports/internal/report.md"],
+      missionId: "M_RPN_D",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "reports/customer/report.md", "other");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toEqual([
+      "reports/internal/report.md",
+    ]);
+  });
+
+  it("E. same basename, unrelated directories → FAIL (no basename collapse)", () => {
+    const ctx = makeCtx("rpn1-e");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["dirA/x.md"],
+      missionId: "M_RPN_E",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "dirB/x.md", "other");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toEqual([
+      "dirA/x.md",
+    ]);
+  });
+
+  it("F. equivalent upstream/consumed artifact cannot satisfy produces claim", () => {
+    const ctx = makeCtx("rpn1-f");
+    // Upstream producer uploads github_ea.md under ITS OWN execution —
+    // that is the consumed/dependency artifact for the remote task.
+    const upstream = mkRemoteProducer(ctx, {
+      produces: ["github_ea.md"],
+      missionId: "M_RPN_F",
+    });
+    const upExec = ctx.store.get("executor_execution", upstream.eid);
+    upload(ctx, upExec, "github_ea.md", "upstream-bytes");
+    completeRemote(ctx, upstream.eid);
+    expect(String(validate(ctx, upstream.eid).status)).toBe("PASS");
+    // The remote task declares outbox/github_ea.md but uploads nothing —
+    // name equivalence with the dependency artifact never substitutes
+    // for producer identity bound to THIS execution.
+    const p = mkRemoteProducer(ctx, {
+      produces: ["outbox/github_ea.md"],
+      missionId: "M_RPN_F",
+    });
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toEqual([
+      "outbox/github_ea.md",
+    ]);
+  });
+
+  it("G. equivalent name + wrong producer execution → still FAIL (provenance required)", () => {
+    const ctx = makeCtx("rpn1-g");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["outbox/github_ea.md"],
+      missionId: "M_RPN_G",
+    });
+    const foreign = mkRemoteProducer(ctx, {
+      produces: ["github_ea.md"],
+      missionId: "M_RPN_G",
+    });
+    const fexec = ctx.store.get("executor_execution", foreign.eid);
+    upload(ctx, fexec, "github_ea.md", "foreign");
+    completeRemote(ctx, foreign.eid);
+    expect(String(validate(ctx, foreign.eid).status)).toBe("PASS");
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("FAIL");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toEqual([
+      "outbox/github_ea.md",
+    ]);
+  });
+
+  it("H. live incident shape — declared outbox alias, bare ACCEPTED upload, no recovery reason", () => {
+    const ctx = makeCtx("rpn1-h");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["outbox/github_ea.md"],
+      missionId: "M_RPN_H",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "github_ea.md", "live-ea-bytes");
+    completeRemote(ctx, p.eid);
+    const v = validate(ctx, p.eid);
+    expect(String(v.status)).toBe("PASS");
+    const row = validationRow(ctx, p.eid)!;
+    expect(row.status).toBe("PASS");
+    expect(row.failures).toEqual([]);
+    // The RESULT_VALIDATION evidence records no produces gap.
+    const ev = ctx.store
+      .listEvidence("M_RPN_H")
+      .find((e) => String(e.kind) === "RESULT_VALIDATION")!;
+    expect(
+      (ev.payload as Record<string, unknown>).remote_produces_missing,
+    ).toBeUndefined();
+  });
+
+  it("I. both spellings uploaded — exact name wins; extra equivalent artifact is an unconstrained extra produce", () => {
+    const ctx = makeCtx("rpn1-i");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["outbox/github_ea.md"],
+      missionId: "M_RPN_I",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "github_ea.md", "a");
+    upload(ctx, exec, "outbox/github_ea.md", "b");
+    completeRemote(ctx, p.eid);
+    // Exact-spelling artifact satisfies the declared name; the extra
+    // equivalent-spelling artifact is a surplus produce, not a closure
+    // failure.
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toBeUndefined();
+  });
+
+  it("J. two declared equivalent spellings each bound by their exact artifact → PASS (no collapse)", () => {
+    const ctx = makeCtx("rpn1-j");
+    const p = mkRemoteProducer(ctx, {
+      produces: ["chart.png", "outbox/chart.png"],
+      missionId: "M_RPN_J",
+    });
+    const exec = ctx.store.get("executor_execution", p.eid);
+    upload(ctx, exec, "chart.png", "a");
+    upload(ctx, exec, "outbox/chart.png", "b");
+    completeRemote(ctx, p.eid);
+    expect(String(validate(ctx, p.eid).status)).toBe("PASS");
+    expect(validationRow(ctx, p.eid)!.remote_produces_missing).toBeUndefined();
   });
 });

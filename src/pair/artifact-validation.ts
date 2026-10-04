@@ -11,7 +11,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { digest, newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
-import { MAX_ARTIFACTS_PER_EXECUTION } from "./artifact-authority.js";
+import {
+  MAX_ARTIFACTS_PER_EXECUTION,
+  artifactNamesEquivalent,
+} from "./artifact-authority.js";
 import type { PairControlPlane } from "./service.js";
 
 export class ArtifactProvenanceValidator {
@@ -307,10 +310,30 @@ export class ArtifactProvenanceValidator {
                   .forExecution(executionId)
                   .filter((a) => verified.has(String(a.artifact_id)));
                 for (const name of declared) {
-                  const identities = acceptedRows.filter(
+                  // RPN-1 — declared names compare through the ONE
+                  // canonical DSN-1 equivalence rule (outbox/<basename>
+                  // staging alias), never raw strings. Exact spelling
+                  // wins first; the equivalence band applies only when
+                  // no exact-name artifact exists — so two DISTINCT
+                  // declared spellings each satisfied by their exact
+                  // artifact never collapse into ambiguity, while the
+                  // live-incident spelling (declared outbox/X, uploaded
+                  // X) still closes. Name match alone never authorizes:
+                  // the row must be an ACCEPTED artifact verified for
+                  // THIS execution, and exactly one identity may
+                  // satisfy each declared name.
+                  const exact = acceptedRows.filter(
                     (a) => String(a.logical_name) === name,
-                  ).length;
-                  if (identities !== 1) remoteProducesMissing.push(name);
+                  );
+                  const candidates =
+                    exact.length > 0
+                      ? exact
+                      : acceptedRows.filter((a) =>
+                          artifactNamesEquivalent(name, a.logical_name),
+                        );
+                  if (candidates.length !== 1) {
+                    remoteProducesMissing.push(name);
+                  }
                 }
                 if (remoteProducesMissing.length) {
                   for (const name of remoteProducesMissing) {
