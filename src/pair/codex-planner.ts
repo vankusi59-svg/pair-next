@@ -417,7 +417,24 @@ export function assertCodexPlannerCandidateEligible(
   store: PairEvidenceStore,
   candidate: Pick<PlannerCandidate, "model_entry_id" | "provider" | "model">,
 ): PlannerEligibilityRejection | void {
-  const verdict = assertPlannerCandidateEligible(store, candidate.model_entry_id);
+  let verdict: PlannerEligibilityRejection | void;
+  try {
+    verdict = assertPlannerCandidateEligible(store, candidate.model_entry_id);
+  } catch (e) {
+    // CPL-1 R5 — an authority throw whose EVERY failed gate is an
+    // operational preflight gate AND current durable codex probe/auth
+    // evidence proves an operational failure is a typed availability
+    // rejection (failover-eligible: ZERO plan, Gemini proceeds), not a
+    // whole-pool abort. Receipt/identity/linkage gate failures,
+    // DISABLED/REMOVED conditions, and unrecognized evidence all keep
+    // throwing. Never returns success — only full eligibility PASS may
+    // invoke the planner.
+    if (e instanceof IntegrityError && String(e.code ?? "") === "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE") {
+      const ops = codexOperationalFailureRejection(store, candidate, e);
+      if (ops) return ops;
+    }
+    throw e;
+  }
   if (!verdict) return;
   // Availability-channel verdict only (authority already threw above).
   // The last recorded probe outcome may carry a more specific codex
@@ -439,6 +456,73 @@ function codexProbeStateFailureClass(
     : probeState === "PROBE_TIMEOUT" ? PLANNER_FAILURE_CLASS.TIMEOUT
     : probeState === "PROBE_RATE_LIMITED" ? PLANNER_FAILURE_CLASS.QUOTA_RATE_LIMITED
     : probeState === "PROBE_MODEL_UNAVAILABLE" ? PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE
+    : null;
+}
+
+/** The only AUTHORITY gates durable codex preflight evidence can explain:
+ *  the provider could not prove QUALIFIED/AUTH_OK/NOT_BLOCKED because a
+ *  bounded operational probe/validation already recorded WHY. Receipt and
+ *  provider↔model linkage gates stay structural. Availability gates
+ *  (PROBE_CURRENT, MODEL_QUALIFIED, …) failing alongside is expected —
+ *  they ARE the operational evidence. */
+const OPERATIONAL_EXPLAINABLE_GATES = new Set([
+  "PROVIDER_QUALIFIED",
+  "PROVIDER_AUTH_OK",
+  "PROVIDER_NOT_BLOCKED",
+]);
+const CANONICAL_AUTHORITY_GATES = new Set([
+  "PROVIDER_QUALIFIED",
+  "PROVIDER_AUTH_OK",
+  "PROVIDER_NOT_BLOCKED",
+  "PROVIDER_RECEIPT_CURRENT",
+  "MODEL_RECEIPT_CURRENT",
+  "MODEL_PROVIDER_MATCH",
+  "MODEL_PROVIDER_IDENTITY_CONSISTENT",
+]);
+
+/**
+ * CPL-1 R5 — convert an eligibility authority throw into a typed
+ * failover-eligible rejection ONLY when (a) every failed gate is
+ * operational-preflight, (b) no DISABLED/REMOVED operator condition is
+ * present, and (c) the durable probe_state/auth_state records a
+ * recognized operational codex failure (CLI_MISSING, TIMEOUT,
+ * RATE_LIMITED, MODEL_UNAVAILABLE, AUTH_FAILED/CREDENTIAL_MISSING,
+ * UNREACHABLE). UNQUALIFIED alone is NOT sufficient — it only converts
+ * alongside proven operational probe evidence. Returns null when the
+ * throw cannot be explained operationally (caller rethrows).
+ */
+function codexOperationalFailureRejection(
+  store: PairEvidenceStore,
+  candidate: Pick<PlannerCandidate, "model_entry_id" | "provider">,
+  e: IntegrityError,
+): PlannerEligibilityRejection | null {
+  let failed: string[] = [];
+  try {
+    const detail = JSON.parse(String(e.detail ?? "{}")) as { failed_gates?: string[] };
+    failed = Array.isArray(detail.failed_gates) ? detail.failed_gates : [];
+  } catch {
+    return null;
+  }
+  const failedAuthority = failed.filter((g) => CANONICAL_AUTHORITY_GATES.has(g));
+  if (!failedAuthority.length || !failedAuthority.every((g) => OPERATIONAL_EXPLAINABLE_GATES.has(g))) return null;
+  const provider = new ProviderCatalog(store).getProvider(String(candidate.provider));
+  const conditions = (provider?.conditions ?? []) as string[];
+  if (conditions.some((c) => c === "DISABLED" || c === "REMOVED")) return null;
+  const probeState = String(provider?.probe_state ?? "");
+  const authState = String(provider?.auth_state ?? "");
+  const typed =
+    codexProbeStateFailureClass(store, candidate)
+    ?? (["PROBE_AUTH_FAILED", "PROBE_AUTH_REJECTED", "PROBE_CREDENTIAL_MISSING"].includes(probeState)
+      ? PLANNER_FAILURE_CLASS.AUTH_REJECTED
+      : probeState === "PROBE_UNREACHABLE"
+        ? PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE
+        : authState === "AUTH_FAILED" || authState === "CREDENTIAL_MISSING"
+          ? PLANNER_FAILURE_CLASS.AUTH_REJECTED
+          : authState === "UNREACHABLE" || authState === "ACCESS_DENIED"
+            ? PLANNER_FAILURE_CLASS.PROVIDER_UNAVAILABLE
+            : null);
+  return typed
+    ? { reject: true, failure_class: typed, reason: `${failed.join(",")}|operational_evidence:${probeState || authState}` }
     : null;
 }
 

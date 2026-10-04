@@ -254,3 +254,44 @@ Only those two gates are pre-probe authority: `PROVIDER_QUALIFIED`/`PROVIDER_PRO
 Live smoke not re-run: production behavior outside the guard boundary is unchanged (R3 smoke already proved codex#1 path + bootstrap qualify).
 
 Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R4_PENDING_AUDIT`
+
+---
+
+# CPL-1 R5 — Operational codex unavailability fails over to Gemini instead of aborting the pool
+
+Base (audited HEAD): `ebc676945b35cf67cdb96b5fdd9d6badf7951160` — same branch / PR #40. Final narrowly-scoped remediation.
+
+## The violation
+
+A codex boot-qualification failure leaves durable operational evidence (`PROBE_CLI_MISSING`/`PROBE_TIMEOUT`/`PROBE_MODEL_UNAVAILABLE`/`PROBE_RATE_LIMITED`/`PROBE_AUTH_*`/`PROBE_UNREACHABLE` + optionally `UNQUALIFIED` residue). At plan time `assertPlannerCandidateEligible` then throws `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE` on provider authority gates → `runPlannerFailover` propagated → **Gemini never reached** — required order (codex#1 → gemini#2) broken exactly when codex is operationally dead.
+
+## The fix (codex-specific classification seam, canonical semantics untouched)
+
+`assertCodexPlannerCandidateEligible` catches the `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE` throw and applies `codexOperationalFailureRejection`, which returns a typed `{reject, failure_class}` ONLY when ALL hold — otherwise the throw propagates unchanged:
+
+1. every failed **authority** gate is in `{PROVIDER_QUALIFIED, PROVIDER_AUTH_OK, PROVIDER_NOT_BLOCKED}` (receipt/linkage authority failures stay structural — availability gates failing alongside is expected, they ARE the evidence);
+2. provider conditions carry no `DISABLED`/`REMOVED` operator mark;
+3. durable evidence proves a recognized operational failure: `probe_state` ∈ `PROBE_CLI_MISSING`/`PROBE_TIMEOUT`/`PROBE_RATE_LIMITED`/`PROBE_MODEL_UNAVAILABLE`/`PROBE_AUTH_FAILED`/`PROBE_AUTH_REJECTED`/`PROBE_CREDENTIAL_MISSING`/`PROBE_UNREACHABLE` → `CLI_MISSING`/`TIMEOUT`/`QUOTA_RATE_LIMITED`/`MODEL_UNAVAILABLE`/`AUTH_REJECTED`/`PROVIDER_UNAVAILABLE` (existing `PLANNER_FAILURE_CLASS` vocabulary), with `auth_state` ∈ `AUTH_FAILED`/`CREDENTIAL_MISSING`/`UNREACHABLE`/`ACCESS_DENIED` as fallback evidence.
+
+`UNQUALIFIED` alone is NOT sufficient (manual/ambiguous residue with a healthy probe history still throws — R5.A7). The classification reads current durable state, never a caller flag, and never returns success — only a full canonical eligibility PASS may invoke `codexPlannerPlan`. `assertPlannerCandidateEligible` itself is unchanged: global Phase E semantics and HTTP-planner authority are intact.
+
+Structural set preserved as throws: DISABLED/REMOVED, identity mismatch, provider_id contradiction, receipt/fingerprint corruption, model BLOCKED/DEPRECATED/REMOVED, role violations, planner↔DSH overlap (all proven by retained R1–R4 tests).
+
+## Tests (R5, suite now 49/49)
+
+- **B (replaced)**: boot CLI_MISSING evidence → codex attempt#1 FAILED/`CLI_MISSING` → ZERO PLAN spawn → gemini wins attempt#2.
+- **R5.A2–A5 (boot-shaped)**: real `refreshCodexPlannerQualification` against the fake CLI (authfail/modelunavail/sleep/ratelimit) commits durable evidence → pool run → codex FAILED with `AUTH_REJECTED`/`MODEL_UNAVAILABLE`/`TIMEOUT`/`QUOTA_RATE_LIMITED` → gemini#2, ZERO plan.
+- **R5.A6 (recovery regression)**: boot fail→gemini#2 → canonical requalification with working exe (UNQUALIFIED canonically removed, QUALIFIED/AUTH_OK/PROBED) → next pool run codex attempt#1 SUCCESS, gemini=0 — transient failure does not permanently demote codex.
+- **R5.A7**: manual `UNQUALIFIED` with `PROBED` history (no operational evidence) → still `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`, ZERO plan.
+- Retained throws: DISABLED/REMOVED/mismatch/contradiction/bad-receipt/role/overlap cases all still ZERO-invocation authority aborts.
+
+## Validation (R5, all real runs)
+
+- Focused CPL-1 suite **49/49 PASS**.
+- Phase A (60) + Phase B + Phase C DSH (51) + Phase E + CNI-1: 329 tests PASS.
+- `npx tsc --noEmit`: clean · `rm -rf dist && pnpm build`: PASS · `pnpm audit --audit-level=high`: 0 high (1 low, 8 moderate — unchanged).
+- Full suite: **3386 pass / 2 fail / 15 skipped** — only the two known env-only P5 registration failures (unchanged vs audited base `ebc6769`).
+
+Live smoke not re-run: production invocation path unchanged (classification layer only).
+
+Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R5_PENDING_FINAL_AUDIT`

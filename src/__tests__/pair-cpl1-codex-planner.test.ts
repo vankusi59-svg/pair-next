@@ -324,27 +324,27 @@ describe("CPL-1 codex planner primary", () => {
     expect(String(runRow.outcome ?? runRow.state)).toBeTruthy();
   });
 
-  it("B. never-qualified provider → AUTHORITY fail-closed (canonical), ZERO invocation, no gemini", async () => {
+  it("B. boot CLI missing → codex FAILED/CLI_MISSING, ZERO plan, gemini wins #2 (R5)", async () => {
     const dir = freshDir("b");
     const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    // Boot-shaped durable evidence: the qualification probe already
+    // recorded CLI_MISSING — the codex planner is operationally dead,
+    // NOT structurally corrupt. R5: the candidate settles a typed FAILED
+    // attempt and failover proceeds to gemini.
     const codex = await seedCodexCandidate(store, { cliMissing: true });
-    // Canonical split (R1.A): PROVIDER_QUALIFIED/PROVIDER_AUTH_OK are
-    // authority gates — an unproven/unqualified provider is a STRUCTURAL
-    // violation, not a refreshable availability case. Throw propagates:
-    // attempt settles AUTHORITY_REJECTED, ZERO codex invocation, run
-    // fails closed (no silent gemini fallback for an authority problem).
-    await expect(
-      runPool({
-        store, codex, dir,
-        exeEnv: { PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex") },
-        scratch: path.join(dir, "scr"),
-      }),
-    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
-    expect(invokeLedger(dir).length).toBe(0);
-    const attempts = store.list("planner_attempt");
-    expect(attempts.length).toBe(1);
-    expect(String(attempts[0].outcome)).toBe("FAILED");
-    expect(String(attempts[0].warnings)).toContain("AUTHORITY_REJECTED:FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE");
+    const { res, geminiCalls } = await runPool({
+      store, codex, dir,
+      exeEnv: { PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex") },
+      scratch: path.join(dir, "scr"),
+    });
+    expect(res.winner.provider).toBe("gemini");
+    expect(res.winner.attempt_no).toBe(2);
+    expect(res.attempts[0].outcome).toBe("FAILED");
+    expect(res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.CLI_MISSING);
+    expect(geminiCalls.length).toBe(1);
+    // ZERO codex plan invocation (bounded refresh probes may run — the
+    // invoke ledger must show no PLAN spawn).
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(0);
   });
 
   it("B2. stale probe evidence on a QUALIFIED provider → refresh repairs → codex keeps #1", async () => {
@@ -1185,5 +1185,133 @@ describe("CPL-1 R4 — transient UNQUALIFIED recovery + pre-probe identity autho
       PAIR_CODEX_PLANNER_EXECUTABLE: exe, FAKE_CODEX_BEHAVIOR: "ok",
     })).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
     expect(invokeLedger(dir).length).toBe(0);
+  });
+});
+
+/**
+ * CPL-1 R5 — operational codex unavailability is a typed FAILED attempt,
+ * not a whole-pool abort. A boot-shaped qualification run (the SAME
+ * refreshCodexPlannerQualification seam production boot uses) commits
+ * durable probe/auth evidence; the plan-time codex-specific eligibility
+ * then classifies it as failover-eligible while every structural
+ * violation keeps throwing.
+ */
+describe("CPL-1 R5 — operational codex failure → typed attempt → gemini #2", () => {
+  async function bootQualify(
+    store: PairEvidenceStore,
+    modelEntryId: string,
+    dir: string,
+    env: Record<string, string>,
+    timeoutMs = 4_000,
+  ): Promise<void> {
+    await refreshCodexPlannerQualification(store, {
+      provider_id: CODEX_CLI_PROVIDER_ID,
+      model_entry_id: modelEntryId,
+      model: "gpt-6.1-sol",
+      scratchDir: path.join(dir, "scr"),
+      timeoutMs,
+      env: { ...process.env, FAKE_CODEX_INVOKELOG: path.join(dir, "boot-invokes.log"), ...env },
+      actor: "TEST",
+    });
+  }
+
+  /** Seed the catalog like a boot that found a dead codex: run the real
+   *  qualification seam against the given fake behavior, then pool. */
+  async function runAfterBootFailure(
+    dir: string,
+    behavior: string,
+    expectedClass: string,
+    extra: { timeoutMs?: number } = {},
+  ): Promise<void> {
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const meId = ensureCodexCliPlannerCatalog(store, "gpt-6.1-sol", "TEST");
+    assignModelRole(store, meId, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "TEST" });
+    const { exe } = makeFakeCodex(dir, behavior);
+    await bootQualify(store, meId, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: exe,
+      FAKE_CODEX_BEHAVIOR: behavior,
+    }, extra.timeoutMs ?? 4_000);
+    // Boot committed durable operational evidence; plan time now.
+    const codex: PlannerCandidate = {
+      provider: CODEX_CLI_PROVIDER_ID, model: "gpt-6.1-sol", transport: "codex_cli",
+      plan: async () => ({ tasks: [] }),
+      model_entry_id: meId,
+    } as PlannerCandidate;
+    const { res, geminiCalls } = await runPool({
+      store, codex, dir, exe,
+      exeEnv: { PAIR_CODEX_PLANNER_EXECUTABLE: exe, FAKE_CODEX_BEHAVIOR: behavior },
+      scratch: path.join(dir, "scr"),
+    });
+    expect(res.winner.provider).toBe("gemini");
+    expect(res.winner.attempt_no).toBe(2);
+    expect(res.attempts[0].outcome).toBe("FAILED");
+    expect(res.attempts[0].failure_class).toBe(expectedClass);
+    expect(geminiCalls.length).toBe(1);
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(0);
+  }
+
+  it("R5.A2. boot AUTH_FAILED → codex FAILED/AUTH_REJECTED → gemini #2", async () => {
+    await runAfterBootFailure(freshDir("r5-authfail"), "authfail", PLANNER_FAILURE_CLASS.AUTH_REJECTED);
+  });
+
+  it("R5.A3. boot MODEL_UNAVAILABLE → codex FAILED/MODEL_UNAVAILABLE → gemini #2", async () => {
+    await runAfterBootFailure(freshDir("r5-modelunavail"), "modelunavail", PLANNER_FAILURE_CLASS.MODEL_UNAVAILABLE);
+  });
+
+  it("R5.A4. boot TIMEOUT → codex FAILED/TIMEOUT → gemini #2", async () => {
+    await runAfterBootFailure(freshDir("r5-timeout"), "sleep", PLANNER_FAILURE_CLASS.TIMEOUT, { timeoutMs: 1_200 });
+  });
+
+  it("R5.A5. boot RATE_LIMITED → codex FAILED/QUOTA_RATE_LIMITED → gemini #2", async () => {
+    await runAfterBootFailure(freshDir("r5-ratelimit"), "ratelimit", PLANNER_FAILURE_CLASS.QUOTA_RATE_LIMITED);
+  });
+
+  it("R5.A6. recovery regression — boot fails (gemini) → canonical requalification PASS → codex wins #1 next run", async () => {
+    const dir = freshDir("r5-recovery");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const meId = ensureCodexCliPlannerCatalog(store, "gpt-6.1-sol", "TEST");
+    assignModelRole(store, meId, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "TEST" });
+    // Boot 1: dead CLI → operational failure stamped → gemini fallback.
+    await bootQualify(store, meId, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex"),
+    });
+    const codex = {
+      provider: CODEX_CLI_PROVIDER_ID, model: "gpt-6.1-sol", transport: "codex_cli",
+      model_entry_id: meId,
+    } as PlannerCandidate;
+    const dead = { PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex") };
+    const r1 = await runPool({ store, codex, dir, exeEnv: dead, scratch: path.join(dir, "scr") });
+    expect(r1.res.winner.provider).toBe("gemini");
+    expect(r1.res.attempts[0].failure_class).toBe(PLANNER_FAILURE_CLASS.CLI_MISSING);
+    // Boot 2 / canonical requalification: CLI back → full qualification PASS.
+    const { exe } = makeFakeCodex(dir, "ok");
+    await bootQualify(store, meId, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: exe, FAKE_CODEX_BEHAVIOR: "ok",
+    });
+    const p = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect(p.lifecycle_state).toBe("QUALIFIED");
+    expect((p.conditions as string[]).includes("UNQUALIFIED")).toBe(false);
+    // Next planner run: codex invoked and wins #1 — transient failure did
+    // not permanently demote it.
+    const r2 = await runPool({
+      store, codex, dir, exe, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr"),
+    });
+    expect(r2.res.winner.provider).toBe("codex-cli");
+    expect(r2.res.winner.attempt_no).toBe(1);
+    expect(r2.geminiCalls.length).toBe(0);
+  });
+
+  it("R5.A7. UNQUALIFIED alone (no operational probe evidence) → still authority throw, no failover", async () => {
+    const dir = freshDir("r5-unqualified-structural");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    // Manual UNQUALIFIED stamp with a HEALTHY probe history (PROBED) —
+    // no operational evidence → NOT failover-eligible.
+    pokeProvider(store, (p) => { p.conditions = ["UNQUALIFIED"]; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      runPool({ store, codex, exe, dir, exeEnv: { FAKE_CODEX_BEHAVIOR: "ok" }, scratch: path.join(dir, "scr") }),
+    ).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).filter((k) => k === "PLAN").length).toBe(0);
   });
 });
