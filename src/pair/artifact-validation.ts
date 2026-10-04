@@ -11,7 +11,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { digest, newId, pathWithin, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
-import { MAX_ARTIFACTS_PER_EXECUTION } from "./artifact-authority.js";
+import {
+  MAX_ARTIFACTS_PER_EXECUTION,
+  artifactNamesEquivalent,
+} from "./artifact-authority.js";
 import type { PairControlPlane } from "./service.js";
 
 export class ArtifactProvenanceValidator {
@@ -306,20 +309,52 @@ export class ArtifactProvenanceValidator {
                 const acceptedRows = service.artifacts
                   .forExecution(executionId)
                   .filter((a) => verified.has(String(a.artifact_id)));
+                // RPN-1 — declared names compare through the ONE
+                // canonical DSN-1 equivalence rule (outbox/<basename>
+                // staging alias), never raw strings. RPN-1 R1 — the
+                // closure is an INJECTIVE binding: one declared slot ↔
+                // one unique accepted artifact identity, so a single
+                // produced artifact can never close two separately
+                // pinned declarations. Phase 1 binds every exact-name
+                // declaration first; phase 2 closes remaining
+                // declarations through the equivalence band against
+                // still-UNBOUND artifacts only. Name match alone never
+                // authorizes — every candidate is already an ACCEPTED
+                // artifact CAS-verified for THIS execution.
+                const boundArtifactIds = new Set<string>();
+                const unresolved: string[] = [];
                 for (const name of declared) {
-                  const identities = acceptedRows.filter(
-                    (a) => String(a.logical_name) === name,
-                  ).length;
-                  if (identities !== 1) remoteProducesMissing.push(name);
-                }
-                if (remoteProducesMissing.length) {
-                  for (const name of remoteProducesMissing) {
-                    failures.push(
-                      `FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`,
-                    );
+                  const exact = acceptedRows.filter(
+                    (a) =>
+                      String(a.logical_name) === name &&
+                      !boundArtifactIds.has(String(a.artifact_id)),
+                  );
+                  if (exact.length === 1) {
+                    boundArtifactIds.add(String(exact[0]!.artifact_id));
+                  } else {
+                    unresolved.push(name);
                   }
-                  pass = false;
                 }
+                for (const name of unresolved) {
+                  const candidates = acceptedRows.filter(
+                    (a) =>
+                      !boundArtifactIds.has(String(a.artifact_id)) &&
+                      artifactNamesEquivalent(name, a.logical_name),
+                  );
+                  if (candidates.length === 1) {
+                    boundArtifactIds.add(String(candidates[0]!.artifact_id));
+                  } else {
+                    remoteProducesMissing.push(name);
+                  }
+                }
+              }
+              if (remoteProducesMissing.length) {
+                for (const name of remoteProducesMissing) {
+                  failures.push(
+                    `FAIL_CLOSED_REMOTE_PRODUCES_INCOMPLETE:${name}`,
+                  );
+                }
+                pass = false;
               }
             }
           } else if (marker !== undefined && marker !== false) {
