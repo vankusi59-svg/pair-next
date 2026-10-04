@@ -1063,3 +1063,127 @@ describe("CPL-1 R3.A — structural pre-probe guard (ZERO codex probe)", () => {
     expect(p.lifecycle_state).toBe("QUALIFIED");
   });
 });
+
+/**
+ * CPL-1 R4 — UNQUALIFIED is transient residue, not an operator denial; and
+ * the pre-probe guard must also prove canonical provider↔model identity
+ * linkage (MODEL_PROVIDER_MATCH / MODEL_PROVIDER_IDENTITY_CONSISTENT)
+ * before any codexPlannerProbe — including the boot path that never ran
+ * eligibility first and the plan-time TOCTOU where linkage breaks after
+ * the availability verdict.
+ */
+describe("CPL-1 R4 — transient UNQUALIFIED recovery + pre-probe identity authority", () => {
+  /** Boot-shaped direct refresh; returns the refresh result (callers get
+   *  outcomes, structural violations throw IntegrityError). */
+  async function bootRefresh(
+    store: PairEvidenceStore,
+    modelEntryId: string,
+    dir: string,
+    env: Record<string, string>,
+  ): Promise<{ access_outcome: string; provider_qualified: boolean; model_probe_result: string | null; model_qualified: boolean }> {
+    return refreshCodexPlannerQualification(store, {
+      provider_id: CODEX_CLI_PROVIDER_ID,
+      model_entry_id: modelEntryId,
+      model: "gpt-6.1-sol",
+      scratchDir: path.join(dir, "scr"),
+      timeoutMs: 4_000,
+      env: {
+        ...process.env,
+        FAKE_CODEX_INVOKELOG: path.join(dir, "invokes.log"),
+        ...env,
+      },
+      actor: "TEST",
+    });
+  }
+
+  it("R4.A1. UNQUALIFIED is transient: failed boot stamps it, second boot canonically recovers", async () => {
+    const dir = freshDir("r4-unqualified");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const meId = ensureCodexCliPlannerCatalog(store, "gpt-6.1-sol", "TEST");
+    assignModelRole(store, meId, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "TEST" });
+    // First boot-shaped qualification — dead executable → probe fails →
+    // canonical qualify stamps UNQUALIFIED residue.
+    const r1 = await bootRefresh(store, meId, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: path.join(dir, "nonexistent-codex"),
+    });
+    expect(r1.provider_qualified).toBe(false);
+    const p1 = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect((p1.conditions as string[]).includes("UNQUALIFIED")).toBe(true);
+    // Second boot-shaped call with a working fake — the guard must NOT
+    // deadlock on UNQUALIFIED: bounded probes run, canonical qualify
+    // succeeds and legitimately removes the residue.
+    const { exe } = makeFakeCodex(dir, "ok");
+    const r2 = await bootRefresh(store, meId, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: exe,
+      FAKE_CODEX_BEHAVIOR: "ok",
+    });
+    expect(r2.provider_qualified).toBe(true);
+    const ledger = invokeLedger(dir);
+    expect(ledger.filter((k) => k === "PROBE").length).toBe(2);
+    const p2 = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect((p2.conditions as string[]).includes("UNQUALIFIED")).toBe(false);
+    expect(p2.lifecycle_state).toBe("QUALIFIED");
+    expect(p2.auth_state).toBe("AUTH_OK");
+    expect(p2.probe_state).toBe("PROBED");
+    expect(p2.current_qualification_receipt_id).not.toBeNull();
+  });
+
+  it("R4.B1. model.provider_id ≠ provider → MODEL_PROVIDER_MATCH FAIL → ZERO probe", async () => {
+    const dir = freshDir("r4-provider-mismatch");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.provider_id = "foreign-provider"; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(bootRefresh(store, codex.model_entry_id, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: exe, FAKE_CODEX_BEHAVIOR: "ok",
+    })).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("R4.B2. unresolved provider_id contradiction → MODEL_PROVIDER_IDENTITY_CONSISTENT FAIL → ZERO probe", async () => {
+    const dir = freshDir("r4-contradiction");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => {
+      m.contradictions = [{ field: "provider_id", claimed: "other-provider", canonical: CODEX_CLI_PROVIDER_ID }];
+    });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(bootRefresh(store, codex.model_entry_id, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: exe, FAKE_CODEX_BEHAVIOR: "ok",
+    })).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("R4.B3. TOCTOU — refreshable verdict, provider_id mutated before refresh → ZERO probe", async () => {
+    const dir = freshDir("r4-toctou-match");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.probe_state = "PROBE_TIMEOUT"; });
+    const verdict = providerModelEligibility(store, CODEX_CLI_PROVIDER_ID, codex.model_entry_id);
+    expect(verdict.gates.MODEL_PROVIDER_MATCH).toBe("PASS");
+    // TOCTOU: linkage broken after the verdict, before refresh.
+    pokeModel(store, codex.model_entry_id, (m) => { m.provider_id = "foreign-provider"; });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(bootRefresh(store, codex.model_entry_id, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: exe, FAKE_CODEX_BEHAVIOR: "ok",
+    })).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+
+  it("R4.B4. TOCTOU — refreshable verdict, provider_id contradiction installed before refresh → ZERO probe", async () => {
+    const dir = freshDir("r4-toctou-contradiction");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.probe_state = "PROBE_TIMEOUT"; });
+    const verdict = providerModelEligibility(store, CODEX_CLI_PROVIDER_ID, codex.model_entry_id);
+    expect(verdict.gates.MODEL_PROVIDER_IDENTITY_CONSISTENT).toBe("PASS");
+    pokeModel(store, codex.model_entry_id, (m) => {
+      m.contradictions = [{ field: "provider_id", claimed: "other-provider", canonical: CODEX_CLI_PROVIDER_ID }];
+    });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(bootRefresh(store, codex.model_entry_id, dir, {
+      PAIR_CODEX_PLANNER_EXECUTABLE: exe, FAKE_CODEX_BEHAVIOR: "ok",
+    })).rejects.toThrow(/FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    expect(invokeLedger(dir).length).toBe(0);
+  });
+});

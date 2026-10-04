@@ -214,3 +214,43 @@ Note on scratch fixture: between smoke sessions the long-idle scratch db accumul
 Same as R2. The guard mirrors canonical structural semantics; any NEW structural mark class added to `providerModelEligibility` later must also be added here (both read the same durable conditions, so drift would only add probe invocations that still fail downstream — never a skip of authority).
 
 Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R3_PENDING_AUDIT`
+
+---
+
+# CPL-1 R4 — Transient UNQUALIFIED recovery + pre-probe identity authority
+
+Base (audited HEAD): `c20569695c88dc8f5dc2f5d6022660bc4bd09aba` — same branch / PR #40.
+
+## R4.A — UNQUALIFIED removed from the structural pre-probe rejection set
+
+Phase E defines `UNQUALIFIED` as **transient qualification residue**: `ProviderValidator.qualify()` stamps it on canonical failure and `issueQualificationReceipt()` legitimately removes it after successful requalification — blocking the qualification seam on it would deadlock recovery. The pre-probe guard now rejects only `DISABLED`/`REMOVED`; an UNQUALIFIED provider passes the guard and the normal canonical chain (`validateAccess` probe → `qualify` → receipt) clears the residue on success. Plan-time semantics unchanged: `assertPlannerCandidateEligible` still treats UNQUALIFIED as authority failure (`PROVIDER_NOT_BLOCKED` FAIL → throw, never refreshable) — the fix is specifically that the shared boot/refresh seam no longer deadlocks a transient mark.
+
+## R4.B — Canonical provider↔model linkage authority before probe
+
+The guard now also evaluates the two structural identity gates from the shared `providerModelEligibility()` projection on a fresh canonical read:
+
+```text
+MODEL_PROVIDER_MATCH              FAIL → FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE → ZERO probe
+MODEL_PROVIDER_IDENTITY_CONSISTENT FAIL → FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE → ZERO probe
+```
+
+Only those two gates are pre-probe authority: `PROVIDER_QUALIFIED`/`PROVIDER_PROBE_CURRENT`/`MODEL_QUALIFIED`/receipt/currentness gates are intentionally NOT required at this point — legitimate bootstrap enters this seam exactly to mint them.
+
+## Tests (R4, 5 new — suite now 43/43)
+
+- **R4.A1 (restart/recovery regression)**: bootstrap catalog + role, first boot refresh with dead exe → `provider_qualified=false` + `UNQUALIFIED` stamped; second boot refresh with working fake → 2 bounded PROBE invocations → `QUALIFIED`/`AUTH_OK`/`PROBED` + fresh `current_qualification_receipt_id` + `UNQUALIFIED` canonically absent — no manual mutation.
+- **R4.B1**: `model.provider_id="foreign-provider"` → `MODEL_PROVIDER_MATCH` FAIL → IntegrityError, ZERO probe.
+- **R4.B2**: `model.contradictions=[{field:"provider_id"}]` → `MODEL_PROVIDER_IDENTITY_CONSISTENT` FAIL → IntegrityError, ZERO probe.
+- **R4.B3/B4 (TOCTOU)**: refreshable `PROBE_TIMEOUT` verdict → provider_id mutated / contradiction installed → fresh structural read at refresh start detects → ZERO probe.
+- Retained: R3.A1 DISABLED→ZERO probe, R2.B3 REMOVED→ZERO probe/refresh, R2.B1 STALE→recovery, R1 §15 PROBE_TIMEOUT→recovery, R3.A7 bootstrap→probes normally.
+
+## Validation (R4, all real runs)
+
+- Focused CPL-1 suite **43/43 PASS**.
+- Phase A (60) + Phase B + Phase C DSH (51) + Phase E + CNI-1: 329 tests PASS.
+- `npx tsc --noEmit`: clean · `rm -rf dist && pnpm build`: PASS · `pnpm audit --audit-level=high`: 0 high (1 low, 8 moderate — unchanged).
+- Full suite: **3380 pass / 2 fail / 15 skipped** — only the two known env-only P5 registration failures (`pair-p5.test.ts` cases 2+3, unchanged vs audited base `c205696`).
+
+Live smoke not re-run: production behavior outside the guard boundary is unchanged (R3 smoke already proved codex#1 path + bootstrap qualify).
+
+Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R4_PENDING_AUDIT`

@@ -479,23 +479,32 @@ export async function refreshCodexPlannerQualification(
       env: opts.env,
     });
   const pc = new ProviderCatalog(store);
-  // CPL-1 R3.A — structural pre-probe guard on a FRESH canonical read at
-  // refresh start (closes the plan-time TOCTOU: marks installed after the
-  // availability verdict are observed here too). Explicit operator/
+  // CPL-1 R3.A + R4 — structural pre-probe guard on a FRESH canonical read
+  // at refresh start (closes the plan-time TOCTOU: marks installed after
+  // the availability verdict are observed here too). Explicit operator/
   // authority marks fail closed BEFORE any codexPlannerProbe — provider
-  // DISABLED/REMOVED/UNQUALIFIED (canonical NOT_BLOCKED semantics; a
-  // never-qualified bootstrap row carries none of these so legitimate
-  // first-boot probing is unaffected), and model REMOVED/DEPRECATED/
-  // BLOCKED / planner↔DSH overlap via the shared role seam. STALE and
-  // probe/currentness evidence are NOT structural — re-observation and
-  // bounded re-probe below still handle them.
+  // DISABLED/REMOVED; model REMOVED/DEPRECATED/BLOCKED / planner↔DSH
+  // overlap via the shared role seam; and the canonical identity-linkage
+  // authority gates MODEL_PROVIDER_MATCH / MODEL_PROVIDER_IDENTITY_CONSISTENT
+  // via the shared providerModelEligibility projection. R4.A — UNQUALIFIED
+  // is transient qualification residue, NOT an operator denial: the normal
+  // canonical qualify chain below legitimately clears it after a
+  // successful requalification (issueQualificationReceipt removes it), so
+  // it must not deadlock recovery here. R4.B — only the two linkage gates
+  // are checked pre-probe: PROVIDER_QUALIFIED/probe-currentness/receipt
+  // gates are intentionally NOT required (legitimate bootstrap starts
+  // unqualified/unprobed and is exactly what this seam re-mints).
   const structural = ((pc.getProvider(opts.provider_id)?.conditions ?? []) as string[]).filter(
-    (c) => c === "DISABLED" || c === "REMOVED" || c === "UNQUALIFIED",
+    (c) => c === "DISABLED" || c === "REMOVED",
   );
-  if (structural.length > 0) {
+  const linkage = providerModelEligibility(store, opts.provider_id, opts.model_entry_id);
+  const failedLinkage = (["MODEL_PROVIDER_MATCH", "MODEL_PROVIDER_IDENTITY_CONSISTENT"] as const).filter(
+    (g) => linkage.gates[g] === "FAIL",
+  );
+  if (structural.length > 0 || failedLinkage.length > 0) {
     throw new IntegrityError(
       "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE",
-      JSON.stringify({ model_entry_id: opts.model_entry_id, structural_conditions: structural }),
+      JSON.stringify({ model_entry_id: opts.model_entry_id, structural_conditions: structural, failed_gates: failedLinkage }),
     );
   }
   assertPlannerRoleAndDisjoint(store, opts.model_entry_id);
