@@ -153,3 +153,64 @@ Scratch stack `PAIR_MC_DIR=/home/ubuntu/.pair-cpl1-scratch/mc` on :8789, real `C
 Same as R1 plus: re-observation restores OBSERVATION only — STALE recovery always re-runs the full authority chain; a re-observation conflict on identity facets still fails closed via the canonical catalog seam.
 
 Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R2_PENDING_AUDIT`
+
+---
+
+# CPL-1 R3 — Structural pre-probe guard + deterministic probe-timeout test
+
+Base (audited HEAD): `4b31a2a9b1638fe3ca17e3637641f5e6a1826fb3` — same branch / PR #40.
+
+## R3.A — Structural authority is checked BEFORE any boot/refresh codex probe
+
+`refreshCodexPlannerQualification` is the shared qualification/refresh seam for BOTH the planner-pool bounded refresh AND boot route qualification. Before R3 a caller could reach `ProviderValidator.validateAccess → codexPlannerProbe` without any structural check (boot path never ran eligibility; plan-time TOCTOU could land a mark between the availability verdict and refresh start).
+
+The refresh now opens with a structural pre-probe guard on a FRESH canonical read:
+
+```text
+provider conditions ∩ {DISABLED, REMOVED, UNQUALIFIED} ≠ ∅
+  → throw FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE (structural_conditions listed)
+assertPlannerRoleAndDisjoint(store, model_entry_id)
+  → role missing/mismatch, planner↔DSH overlap,
+    model REMOVED/DEPRECATED/BLOCKED → IntegrityError (canonical codes)
+then: R2 STALE re-observation → validateAccess(probe) → qualify → probeModel → qualifyModel
+```
+
+Canonical semantics reused — NOT a parallel eligibility system: provider marks mirror the canonical `PROVIDER_NOT_BLOCKED` gate set; model/role/overlap checks are the same `assertPlannerRoleAndDisjoint` seam the pool eligibility already runs. Distinguishes recoverable evidence/currentness (STALE, PROBE_TIMEOUT → still probed/re-qualified via R2/R1 paths) from explicit structural/operator denial (→ ZERO probe, ZERO plan). A never-qualified bootstrap row carries none of the operator marks, so legitimate first-boot probing is unaffected (proven by R3.A7 — discovery/unprobed provider runs both bounded probes and reaches QUALIFIED).
+
+TOCTOU closure: the guard reads the durable rows at refresh start — a DISABLED/model-blocking mark installed after the availability verdict but before refresh is observed and aborts before spawn (R3.A5).
+
+## R3.B — §10 probe-timeout test uses the supported executable override
+
+`codexPlannerProbe` has no `executable` option — the test previously passed it anyway, so executable resolution could fall through to `which codex` on the host. Now `PAIR_CODEX_PLANNER_EXECUTABLE=<fake sleep>` rides `env` (the production override seam); the test proves the fake child ran via the existing invocation ledger (`PROBE` entry) + `FAKE_CODEX_PIDFILE`, asserts TIMEOUT at the configured 2500 ms budget, and asserts the timed-out child is dead (`process.kill(pid, 0)` throws — no orphan). Valid on hosts with no real `codex` binary.
+
+## R3.C — evidence cleanup
+
+PR description updated: `PAIR_MODEL_PROBE_TIMEOUT_MS` default 60000 ms; `PAIR_CODEX_PLANNER_TIMEOUT_MS` default 900000 ms (15 min); focused count current (38/38). Report/CURRENT_STATE consistent.
+
+## Tests (R3)
+
+- **R3.A1**: provider DISABLED → direct refresh (no caller eligibility) → `FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE`, ZERO probe, ZERO plan.
+- **R3.A2/A3/A4**: model BLOCKED / DEPRECATED / REMOVED → `FAIL_CLOSED_MODEL_ROLE_MODEL_NOT_USABLE`, ZERO probe.
+- **R3.A5 (TOCTOU)**: refreshable verdict (PROBE_TIMEOUT, PROVIDER_NOT_BLOCKED=PASS) → DISABLED installed → refresh aborts pre-probe, mark persists.
+- **R3.A6**: model carrying DSH_EXECUTION role → role authority throw, ZERO probe.
+- **R3.A7**: unprobed bootstrap provider → guard does NOT block → 2 bounded PROBE + QUALIFIED.
+- Retained: R2.B1 STALE→recover→codex#1 (2 PROBE+1 PLAN, fresh receipt), R2.B2 STALE+dead-probe→gemini, R2.B3 REMOVED→authority throw ZERO invocation.
+
+## Validation (R3, all real runs)
+
+- Focused CPL-1 suite **38/38 PASS** (was 31/31 + 7 new R3 cases).
+- Phase A (60) + Phase B planner failover + Phase C DSH (51) + Phase E provider/model authority + CNI-1: all PASS.
+- `npx tsc --noEmit`: clean · `rm -rf dist && pnpm build`: PASS · `pnpm audit --audit-level=high`: 0 high (1 low, 8 moderate — unchanged).
+- Full suite: **3375 pass / 2 fail / 15 skipped** — only the two known env-only P5 registration failures (`pair-p5.test.ts` cases 2+3, unchanged vs audited base `4b31a2a`).
+
+## Live smoke (R3)
+
+Scratch stack `PAIR_MC_DIR=/home/ubuntu/.pair-cpl1-scratch/mc`, R3 dist, real `CODEX_HOME` ChatGPT auth, no `PAIR_MODEL_PROBE_TIMEOUT_MS` in env (canonical 60000 default). Boot: `MODEL_ROUTE: codex-cli:gpt-6.1-sol QUALIFIED (codex planner, probe PASS)` — guard did not impede legitimate bootstrap. POST `/api/missions/preview` → attempt `PA_01M42XYGJ4T60ZRHR6QM5WVAR4` **SUCCESS attempt_no=1**, run `PRN_01M42XYGJ37ZBRB5CVA3PE5JBH` **WINNER_SELECTED winner_attempt_no=1**, preview `MPP_01M42XZ5EQ8E1M9MB462WEDPZ3` READY `plan_model=gpt-6.1-sol`. (A first preview run hit codex plan-quality variance — no declared edges → canonical PLAN_INVALID for both planner routes; a second run produced valid declared edges and won #1. Plan content is outside R3 scope; failover evidence remained correct.)
+
+Note on scratch fixture: between smoke sessions the long-idle scratch db accumulated canonical `STALE`/`REAPPEARED` marks on HTTP providers (absence-streak reconciliation at discovery when the provider API keys/`PAIR_DSH_HOME` weren't in the relaunch env) — canonical Phase E currentness behavior, unchanged by R3; fixture state was reset for the smoke.
+
+## Residual limitations (R3)
+
+Same as R2. The guard mirrors canonical structural semantics; any NEW structural mark class added to `providerModelEligibility` later must also be added here (both read the same durable conditions, so drift would only add probe invocations that still fail downstream — never a skip of authority).
+
+Classification: `PAIR_NEXT_CPL1_CODEX_SOL_PLANNER_PRIMARY_R3_PENDING_AUDIT`

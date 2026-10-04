@@ -34,7 +34,7 @@ import {
   LLM_PLANNER_DEFAULT_MAX_TASKS,
   LLM_PLANNER_MIN_TASKS,
 } from "./llm-planner.js";
-import { assertPlannerCandidateEligible } from "./model-role.js";
+import { assertPlannerCandidateEligible, assertPlannerRoleAndDisjoint } from "./model-role.js";
 import { providerModelEligibility } from "./model-routable.js";
 import type { PairEvidenceStore } from "./store.js";
 import { ProviderCatalog } from "./provider-catalog.js";
@@ -479,6 +479,26 @@ export async function refreshCodexPlannerQualification(
       env: opts.env,
     });
   const pc = new ProviderCatalog(store);
+  // CPL-1 R3.A — structural pre-probe guard on a FRESH canonical read at
+  // refresh start (closes the plan-time TOCTOU: marks installed after the
+  // availability verdict are observed here too). Explicit operator/
+  // authority marks fail closed BEFORE any codexPlannerProbe — provider
+  // DISABLED/REMOVED/UNQUALIFIED (canonical NOT_BLOCKED semantics; a
+  // never-qualified bootstrap row carries none of these so legitimate
+  // first-boot probing is unaffected), and model REMOVED/DEPRECATED/
+  // BLOCKED / planner↔DSH overlap via the shared role seam. STALE and
+  // probe/currentness evidence are NOT structural — re-observation and
+  // bounded re-probe below still handle them.
+  const structural = ((pc.getProvider(opts.provider_id)?.conditions ?? []) as string[]).filter(
+    (c) => c === "DISABLED" || c === "REMOVED" || c === "UNQUALIFIED",
+  );
+  if (structural.length > 0) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE",
+      JSON.stringify({ model_entry_id: opts.model_entry_id, structural_conditions: structural }),
+    );
+  }
+  assertPlannerRoleAndDisjoint(store, opts.model_entry_id);
   // R2.B — canonical re-observation for a STALE provider before the
   // re-probe: a legitimate current observation through the SAME
   // ProviderCatalog.upsertCandidate authority seam that seeding uses

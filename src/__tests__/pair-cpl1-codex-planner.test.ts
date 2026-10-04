@@ -818,18 +818,37 @@ describe("CPL-1 R1 auth isolation + timeout authority", () => {
   it("§10. sleeping codex probe is killed at the configured budget — no hidden 60s floor/ceiling", async () => {
     const dir = freshDir("probe-budget");
     const { exe } = makeFakeCodex(dir, "sleep");
+    // R3.B — codexPlannerProbe resolves the executable from opts.env
+    // (PAIR_CODEX_PLANNER_EXECUTABLE); there is no `executable` option.
+    // Proving the FAKE binary is what ran: invoke ledger + pidfile.
+    const invokeLog = path.join(dir, "invoke.log");
+    const pidFile = path.join(dir, "child.pid");
     const t0 = Date.now();
     const r = await codexPlannerProbe({
       model: "gpt-6.1-sol",
-      executable: exe,
       timeoutMs: 2_500,
       scratchDir: path.join(dir, "scr"),
-      env: { ...process.env, FAKE_CODEX_BEHAVIOR: "sleep" },
+      env: {
+        ...process.env,
+        PAIR_CODEX_PLANNER_EXECUTABLE: exe,
+        FAKE_CODEX_BEHAVIOR: "sleep",
+        FAKE_CODEX_INVOKELOG: invokeLog,
+        FAKE_CODEX_PIDFILE: pidFile,
+      },
     });
     expect(r.outcome).toBe("TIMEOUT");
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeGreaterThanOrEqual(2_400);
     expect(elapsed).toBeLessThan(15_000); // honored the 2.5s config, not a 60s substitute
+    // The fake sleeping executable was the child actually spawned — ledger
+    // recorded the probe invocation and the pidfile carries its pid.
+    expect(fs.existsSync(invokeLog)).toBe(true);
+    expect(fs.readFileSync(invokeLog, "utf8").trim()).toBe("PROBE");
+    expect(fs.existsSync(pidFile)).toBe(true);
+    const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    // Timed-out child was killed — no orphan sleeping process survives.
+    await new Promise((res) => setTimeout(res, 500));
+    expect(() => process.kill(pid, 0)).toThrow();
   });
 });
 
@@ -915,5 +934,132 @@ describe("CPL-1 R2 — startup default + provider STALE canonical recovery", () 
     expect((p.conditions as string[]).includes("REMOVED")).toBe(true);
     const a = store.list("planner_attempt");
     expect(String(a[0].warnings)).toContain("AUTHORITY_REJECTED");
+  });
+});
+
+/**
+ * CPL-1 R3.A — structural pre-probe guard: refreshCodexPlannerQualification
+ * is the shared path both the pool refresh and boot qualification use, so
+ * explicit operator/authority marks must fail closed BEFORE any
+ * codexPlannerProbe — even when the caller never ran eligibility first
+ * (boot) or a mark lands after the availability verdict (TOCTOU).
+ * Legitimate bootstrap (discovery/unprobed) is untouched: STALE +
+ * PROBE_TIMEOUT recovery paths (R2.B1/R1 §15) still reach the probe.
+ */
+describe("CPL-1 R3.A — structural pre-probe guard (ZERO codex probe)", () => {
+  /** Boot-shaped direct refresh: the caller performs NO eligibility check
+   *  before invoking the shared qualification/refresh seam. */
+  async function directRefreshRejects(
+    store: PairEvidenceStore,
+    modelEntryId: string,
+    dir: string,
+    expected: RegExp,
+  ): Promise<void> {
+    const { exe } = makeFakeCodex(dir, "ok");
+    await expect(
+      refreshCodexPlannerQualification(store, {
+        provider_id: CODEX_CLI_PROVIDER_ID,
+        model_entry_id: modelEntryId,
+        model: "gpt-6.1-sol",
+        scratchDir: path.join(dir, "scr"),
+        timeoutMs: 2_000,
+        env: {
+          ...process.env,
+          PAIR_CODEX_PLANNER_EXECUTABLE: exe,
+          FAKE_CODEX_BEHAVIOR: "ok",
+          FAKE_CODEX_INVOKELOG: path.join(dir, "invokes.log"),
+        },
+        actor: "TEST",
+      }),
+    ).rejects.toThrow(expected);
+    // ZERO codex probe — the fake executable ledger is empty.
+    expect(invokeLedger(dir).length).toBe(0);
+  }
+
+  it("R3.A1. provider DISABLED → fail closed BEFORE probe", async () => {
+    const dir = freshDir("r3-disabled");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeProvider(store, (p) => { p.conditions = ["DISABLED"]; });
+    await directRefreshRejects(store, codex.model_entry_id, dir, /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+  });
+
+  it("R3.A2. model BLOCKED → fail closed BEFORE probe", async () => {
+    const dir = freshDir("r3-model-blocked");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.conditions = ["BLOCKED"]; });
+    await directRefreshRejects(store, codex.model_entry_id, dir, /FAIL_CLOSED_MODEL_ROLE_MODEL_NOT_USABLE/);
+  });
+
+  it("R3.A3. model DEPRECATED → fail closed BEFORE probe", async () => {
+    const dir = freshDir("r3-model-deprecated");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.conditions = ["DEPRECATED"]; });
+    await directRefreshRejects(store, codex.model_entry_id, dir, /FAIL_CLOSED_MODEL_ROLE_MODEL_NOT_USABLE/);
+  });
+
+  it("R3.A4. model REMOVED → fail closed BEFORE probe", async () => {
+    const dir = freshDir("r3-model-removed");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    pokeModel(store, codex.model_entry_id, (m) => { m.conditions = ["REMOVED"]; });
+    await directRefreshRejects(store, codex.model_entry_id, dir, /FAIL_CLOSED_MODEL_ROLE_MODEL_NOT_USABLE/);
+  });
+
+  it("R3.A5. TOCTOU — refreshable verdict, DISABLED installed before refresh → aborts, ZERO probe", async () => {
+    const dir = freshDir("r3-toctou");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    // Initial eligibility verdict is refreshable: probe_state drift is an
+    // availability-channel failure (probe-currentness gate FAIL, authority
+    // gates PASS) → the pool would award ONE bounded refresh.
+    pokeProvider(store, (p) => { p.probe_state = "PROBE_TIMEOUT"; });
+    const verdict = providerModelEligibility(store, CODEX_CLI_PROVIDER_ID, codex.model_entry_id);
+    expect(verdict.eligible).toBe(false);
+    expect(verdict.gates.PROVIDER_NOT_BLOCKED).toBe("PASS");
+    // TOCTOU: an operator DISABLED lands between the verdict and refresh.
+    pokeProvider(store, (p) => { p.conditions = ["DISABLED"]; });
+    // The guard re-reads canonical state at refresh start → ZERO probe.
+    await directRefreshRejects(store, codex.model_entry_id, dir, /FAIL_CLOSED_PLANNER_PROVIDER_INELIGIBLE/);
+    const p = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect((p.conditions as string[]).includes("DISABLED")).toBe(true);
+  });
+
+  it("R3.A6. planner role violated (DSH_EXECUTION on the model) → fail closed BEFORE probe", async () => {
+    const dir = freshDir("r3-role");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const codex = await seedCodexCandidate(store);
+    assignModelRole(store, codex.model_entry_id, MODEL_ROLE.DSH_EXECUTION, { actor: "TEST" });
+    await directRefreshRejects(store, codex.model_entry_id, dir, /FAIL_CLOSED_MODEL_ROLE|FAIL_CLOSED_PLANNER_DSH_OVERLAP/);
+  });
+
+  it("R3.A7. bootstrap still probes — discovery/unprobed provider is NOT blocked by the guard", async () => {
+    const dir = freshDir("r3-bootstrap");
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    // Seeded catalog rows but NO qualification/probe evidence — the
+    // legitimate first-boot shape the guard must let through.
+    const meId = ensureCodexCliPlannerCatalog(store, "gpt-6.1-sol", "TEST");
+    assignModelRole(store, meId, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "TEST" });
+    const { exe } = makeFakeCodex(dir, "ok");
+    await refreshCodexPlannerQualification(store, {
+      provider_id: CODEX_CLI_PROVIDER_ID,
+      model_entry_id: meId,
+      model: "gpt-6.1-sol",
+      scratchDir: path.join(dir, "scr"),
+      timeoutMs: 5_000,
+      env: {
+        ...process.env,
+        PAIR_CODEX_PLANNER_EXECUTABLE: exe,
+        FAKE_CODEX_BEHAVIOR: "ok",
+        FAKE_CODEX_INVOKELOG: path.join(dir, "invokes.log"),
+      },
+      actor: "TEST",
+    });
+    // Boot qualification ran the bounded probes legitimately.
+    expect(invokeLedger(dir).filter((k) => k === "PROBE").length).toBe(2);
+    const p = new ProviderCatalog(store).getProvider(CODEX_CLI_PROVIDER_ID)!;
+    expect(p.lifecycle_state).toBe("QUALIFIED");
   });
 });
