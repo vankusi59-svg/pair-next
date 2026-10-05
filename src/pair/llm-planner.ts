@@ -525,6 +525,10 @@ type RawTask = {
   task_instruction?: unknown;
   required_capabilities?: unknown;
   depends_on?: unknown;
+  /** P-COVMAP — the model-facing coverage-map field (top-level is
+   *  authoritative; the strict Codex schema can only emit top-level).
+   *  Normalized into `metadata.pair_coverage` by sanitizePlan. */
+  pair_coverage?: unknown;
   metadata?: unknown;
 };
 
@@ -676,6 +680,45 @@ export function sanitizePlan(
       t.metadata && typeof t.metadata === "object" && !Array.isArray(t.metadata)
         ? (t.metadata as Record<string, unknown>)
         : {};
+    // P-COVMAP — every work task must declare its Goal Contract coverage
+    // checklist. Top-level `pair_coverage` is the authoritative model-facing
+    // field (the strict Codex schema can only emit top-level); a legacy HTTP
+    // `metadata.pair_coverage` is honored only when the top-level field is
+    // absent — both present and different is a deterministic conflict, and
+    // the task is dropped rather than silently resolved. Normalization keeps
+    // only canonical requirement-id grammar (OBL_/DEL_/CON_/PRO_/DDL_### —
+    // claimability is adjudicated at the coverage gate, never here), dedupes
+    // in stable order, bounds to 32, and stores the map canonically at
+    // `metadata.pair_coverage`.
+    const topCoverage = t.pair_coverage;
+    const metaCoverage = metadata.pair_coverage;
+    if (
+      topCoverage !== undefined &&
+      metaCoverage !== undefined &&
+      JSON.stringify(topCoverage) !== JSON.stringify(metaCoverage)
+    ) {
+      warnings.push(`DROP_COVERAGE_CONFLICT:${key}`);
+      continue;
+    }
+    const rawCoverage = topCoverage !== undefined ? topCoverage : metaCoverage;
+    if (rawCoverage !== undefined) {
+      if (!Array.isArray(rawCoverage) || rawCoverage.length > 32) {
+        // Malformed field — strip it; when the contract has mandatory rows
+        // the completeness gate fails the candidate UNDECLARED (typed),
+        // teaching the planner to re-emit a valid map on the one re-ask.
+        warnings.push(`DROP_MALFORMED_COVERAGE:${key}`);
+        delete metadata.pair_coverage;
+      } else {
+        const ids: string[] = [];
+        for (const e of rawCoverage) {
+          if (typeof e !== "string" || !/^(?:OBL|DEL|CON|PRO|DDL)_\d{3}$/.test(e)) {
+            continue;
+          }
+          if (!ids.includes(e)) ids.push(e);
+        }
+        metadata.pair_coverage = ids;
+      }
+    }
     if (!isTelegramDelivery) {
       const taskShape = {
         task_key: key,
@@ -853,7 +896,8 @@ export function buildPlannerUserPrompt(
   const contractBlock = reqLines.length
     ? `GOAL CONTRACT (canonical — you must cover it, not change it):\n` +
       reqLines.join("\n") +
-      `\nEvery obligation needs ≥1 real work task performing that work; every deliverable needs a task that produces the exact named file; no task may contradict a constraint or do anything a prohibition forbids; quantities stated in the contract must be preserved verbatim. You may attach "pair_coverage": ["REQ_ID", ...] inside a task's metadata to declare which contract rows that task covers — declaration is a proposal only, never proof.\n`
+      `\nEvery obligation needs ≥1 real work task performing that work; every deliverable needs a task that produces the exact named file; no task may contradict a constraint or do anything a prohibition forbids; quantities stated in the contract must be preserved verbatim. ` +
+      `COVERAGE MAP (mandatory): every work task MUST carry "pair_coverage": ["REQ_ID", ...] declaring exactly which OBL_* and DEL_* rows it covers (emit "pair_coverage": [] when it covers none); every OBL_* and DEL_* id listed above MUST be claimed by at least one work task; CON_*, PRO_* and DDL_* rows are checked by PAIR directly and MUST NOT be claimed; never invent requirement ids; declaration is a proposal only — PAIR independently verifies every claim, and a fabricated claim or an unclaimed row fails closed.\n`
     : "";
   return (
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +

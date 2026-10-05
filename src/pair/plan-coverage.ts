@@ -275,8 +275,10 @@ function instructionAmounts(instr: string): number[] {
 /* ------------------------------------------------------------------ */
 
 /** Validate a model-proposed `pair_coverage` annotation on a task:
- *  every claimed requirement id must exist in the contract AND the task
- *  must genuinely cover it — declaration alone grants nothing. */
+ *  every claimed requirement id must exist in the contract AND be a
+ *  claimable kind (obligation or deliverable — CON/PRO/DDL rows are
+ *  PAIR-side checks, never claimable rows) AND the task must genuinely
+ *  cover it — declaration alone grants nothing. */
 function validateProposedCoverage(
   task: Record<string, unknown>,
   contract: GoalContract,
@@ -300,7 +302,7 @@ function validateProposedCoverage(
   ]) all.set(r.id, r);
   for (const id of declared.map((x) => String(x))) {
     const req = all.get(id);
-    if (!req || (req.kind === "obligation" || req.kind === "deliverable") && !coveredBy(task, req)) {
+    if (!req || (req.kind !== "obligation" && req.kind !== "deliverable") || !coveredBy(task, req)) {
       throw new IntegrityError(
         "FAIL_CLOSED_PLAN_INCOMPLETE",
         `task ${String(task.task_key)} claims coverage of ${id} it does not provide`,
@@ -329,6 +331,57 @@ export function assertPlanCoverage(
   // Validate model-proposed mappings first — a fabricated mapping is a
   // hard failure, never an authority grant.
   for (const t of work) validateProposedCoverage(t, contract, covers);
+
+  // P-COVMAP — bookkeeping can never mint coverage: the PAIR-injected
+  // bookkeeping task never carries a map, and a model-authored
+  // bookkeeping-shaped emission is normalized away upstream — any
+  // surviving claim on bookkeeping is fabricated.
+  for (const t of tasks) {
+    if (taskIsBookkeeping(t) && (t.metadata as Record<string, unknown> | undefined)?.pair_coverage !== undefined) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_INCOMPLETE",
+        `task ${String(t.task_key)} claims coverage on PAIR bookkeeping`,
+      );
+    }
+  }
+
+  // P-COVMAP — the coverage map is a MANDATORY checklist: when the
+  // contract has mandatory rows, every work task must carry a (possibly
+  // empty) pair_coverage array, and every OBL_*/DEL_* id must be claimed
+  // by at least one work task. A missing declaration is its own failure
+  // class — FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED — distinct from
+  // PLAN_INCOMPLETE (declared coverage proved insufficient). A contract
+  // with zero OBL/DEL rows leaves this gate a no-op, as before.
+  const expectedIds = [
+    ...contract.obligations.map((r) => r.id),
+    ...contract.deliverables.map((r) => r.id),
+  ];
+  if (expectedIds.length) {
+    const declared = new Set<string>();
+    const undeclaredTasks: string[] = [];
+    for (const t of work) {
+      const pc = ((t.metadata ?? {}) as Record<string, unknown>).pair_coverage;
+      if (!Array.isArray(pc)) {
+        undeclaredTasks.push(String(t.task_key));
+        continue;
+      }
+      for (const id of pc) declared.add(String(id));
+    }
+    const missing = expectedIds.filter((id) => !declared.has(id));
+    if (missing.length || undeclaredTasks.length) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED",
+        JSON.stringify({
+          requirements: missing.slice(0, 16),
+          reason: "UNDECLARED",
+          missing_count: missing.length,
+          ...(undeclaredTasks.length
+            ? { undeclared_tasks: undeclaredTasks.slice(0, 8) }
+            : {}),
+        }),
+      );
+    }
+  }
 
   const incomplete = (req: GoalRequirement): never => {
     throw new IntegrityError(

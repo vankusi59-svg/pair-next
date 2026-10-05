@@ -64,12 +64,14 @@ const workTask = (
   instruction: string,
   caps: string[],
   depends_on: string[] = [],
+  pairCov?: string[],
 ): Record<string, unknown> => ({
   task_key: key,
   title: key,
   task_instruction: instruction,
   required_capabilities: caps,
   depends_on,
+  ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
 });
 
 const BOOKKEEPING = workTask(
@@ -85,8 +87,8 @@ describe("NETWORK binding repair", () => {
   it("T1 (positive, llm lane): fetch-shaped task missing NETWORK_ACCESS is repaired → canonicalizer PASSES", async () => {
     const raw = planJson([
       BOOKKEEPING,
-      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"]),
-      workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"]),
+      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"], ["OBL_001"]),
+      workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"], []),
     ]);
     const r = await llmPlan(GOAL_NET, { ...CFG, fetchFn: okFetch(raw) });
     const t2 = r.tasks.find((t) => t.task_key === "T2")!;
@@ -115,8 +117,8 @@ process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
   fs.writeFileSync(out, JSON.stringify({ tasks: ${JSON.stringify([
     BOOKKEEPING,
-    workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"]),
-    workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"]),
+    workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"], ["OBL_001"]),
+    workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"], []),
   ])} }));
   process.exit(0);
 });

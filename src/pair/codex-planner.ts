@@ -242,13 +242,17 @@ const PLAN_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on"],
+        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on", "pair_coverage"],
         properties: {
           task_key: { type: "string" },
           title: { type: "string" },
           task_instruction: { type: "string" },
           required_capabilities: { type: "array", items: { type: "string" } },
           depends_on: { type: "array", items: { type: "string" } },
+          // P-COVMAP — the mandatory Goal Contract coverage checklist; a
+          // task covering nothing emits []. Normalized into
+          // metadata.pair_coverage by the shared sanitize seam.
+          pair_coverage: { type: "array", items: { type: "string" } },
         },
       },
     },
