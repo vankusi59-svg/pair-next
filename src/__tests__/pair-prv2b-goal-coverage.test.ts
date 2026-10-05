@@ -25,6 +25,23 @@ const FULL_SETS = [SERVE_LLM_PLANNER_CAPS.slice()];
 const canon = (raw: Array<Record<string, unknown>>, goal: string) =>
   makeServeCanonicalizer({ executorCapSets: () => FULL_SETS })(raw, goal);
 
+/** R2 — every fresh work task carries a valid structured network
+ *  requirement (LOCAL by default; these fixtures test coverage/constraint
+ *  authority, not network authority). */
+const NETREQ_LOCAL = {
+  source_kind: "LOCAL",
+  access_intent: "READ",
+  freshness: "NOT_REQUIRED",
+} as const;
+/** Goals carrying NETWORK tasks in this file literally name `mql5.com`
+ *  (R3: explicit-host authorization only — no entity→host binding). */
+const NETREQ_EXT_MQL5 = {
+  source_kind: "EXTERNAL_SITE",
+  access_intent: "RESEARCH",
+  freshness: "REQUIRED",
+  source_locator: "https://www.mql5.com",
+} as const;
+
 const work = (
   key: string,
   instruction: string,
@@ -38,7 +55,12 @@ const work = (
   task_instruction: instruction,
   required_capabilities: caps,
   depends_on,
-  ...(metadata ? { metadata } : {}),
+  metadata: {
+    network_requirement: caps.includes("NETWORK_ACCESS")
+      ? NETREQ_EXT_MQL5
+      : NETREQ_LOCAL,
+    ...(metadata ?? {}),
+  },
   ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
 });
 
@@ -156,7 +178,7 @@ describe("PRV2-B coverage authority", () => {
   });
 
   it("E — quantity downgrade rejected; equal-or-greater bound passes", () => {
-    const goal = "research at least 20 MQL5 EA products";
+    const goal = "research at least 20 MQL5 EA products on mql5.com";
     const downgraded = [
       work("T1", "research 5 MQL5 EA products", ["REASONING"], [], undefined, ["OBL_001"]),
     ];
@@ -310,7 +332,7 @@ describe("PRV2-B R1.A — clause dimensions are not mutually exclusive", () => {
   it("R1.A-5: covering the obligation under a deadline clause → PASS", () => {
     const out = canon(
       [work("T1", "research 20 current MQL5 EAs and record findings", ["REASONING", "NETWORK_ACCESS"], [], undefined, ["OBL_001"])],
-      "research 20 MQL5 EAs by 31/10",
+      "research 20 MQL5 EAs on mql5.com by 31/10",
     );
     expect(out.length).toBe(2);
   });
@@ -332,7 +354,7 @@ describe("PRV2-B R1.A — clause dimensions are not mutually exclusive", () => {
 /* -------------------- R1.B — `only` constraint contradiction -------------------- */
 
 describe("PRV2-B R1.B — bounded only-constraint contradiction detection", () => {
-  const GOAL_ONLY = "research EA market, use only MQL5";
+  const GOAL_ONLY = "research EA market, use only MQL5, see mql5.com";
 
   it("R1.B-1: task invoking the excluded sibling mql4 → CONSTRAINT_VIOLATION", () => {
     expectCode(
@@ -442,7 +464,7 @@ describe("PRV2-B R1.C — deliverable matching uses canonical artifactNamesEquiv
 /* ------------- R2 — bounded constraints must be carried ------------- */
 
 describe("PRV2-B R2 — a mandatory bounded constraint may not be silently dropped", () => {
-  const GOAL_ONLY2 = "research current EA market, use only MQL5";
+  const GOAL_ONLY2 = "research current EA market, use only MQL5, see mql5.com";
 
   it("R2-1: generic covering task never carried the bound → INCOMPLETE", () => {
     expectCode(
@@ -664,7 +686,7 @@ describe("live-vocab — search/find/browse obligations", () => {
 describe("live-e2e — production-shaped plan canonicalizes end-to-end", () => {
   const LIVE_GOAL =
     "research 15 MQL5 expert advisors mới nhất trên thị trường, use only " +
-    "MQL5 official marketplace listings, so sánh pricing và features, " +
+    "MQL5 official marketplace listings trên mql5.com, so sánh pricing và features, " +
     "viết report.md, gửi qua telegram, budget <= $2, xong trước cuối tuần";
   const LIVE_TASKS = [
     work(

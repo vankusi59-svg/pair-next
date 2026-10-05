@@ -56,10 +56,47 @@ import { IntegrityError } from "../pair/errors.js";
 /** One executor covering the whole allowed vocabulary → no task is ever
  *  dropped on joint-servability grounds. */
 const FULL_SETS = [SERVE_LLM_PLANNER_CAPS.slice()];
-const canon = (raw: Array<Record<string, unknown>>, goal: string) =>
-  makeServeCanonicalizer({ executorCapSets: () => FULL_SETS })(raw, goal);
+const canon = (
+  raw: Array<Record<string, unknown>>,
+  goal: string,
+  provenance?: "fresh" | "persisted",
+) =>
+  makeServeCanonicalizer({ executorCapSets: () => FULL_SETS })(
+    raw,
+    goal,
+    provenance ? { provenance } : undefined,
+  );
+/** Legacy persisted-plan fixtures (pre-structured-contract tasks carry no
+ *  network_requirement; LEGACY semantics only apply to persisted plans). */
+const canonLegacy = (
+  raw: Array<Record<string, unknown>>,
+  goal: string,
+) => canon(raw, goal, "persisted");
+
+const NETREQ_LOCAL = {
+  source_kind: "LOCAL",
+  access_intent: "READ",
+  freshness: "NOT_REQUIRED",
+} as const;
 
 const work = (
+  key: string,
+  instruction: string,
+  caps: string[],
+  depends_on: string[] = [],
+  metadata?: Record<string, unknown>,
+  pairCov?: string[],
+) => ({
+  task_key: key,
+  title: key,
+  task_instruction: instruction,
+  required_capabilities: caps,
+  depends_on,
+  metadata: { network_requirement: NETREQ_LOCAL, ...(metadata ?? {}) },
+  ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
+});
+/** A task as a persisted legacy plan carried it — no structured field. */
+const legacyWork = (
   key: string,
   instruction: string,
   caps: string[],
@@ -249,7 +286,7 @@ describe("PRV2-A adaptive budget", () => {
 
   it("11. complex goal may exceed the previous 5-task total limit", () => {
     const goal =
-      "1. fetch BTC ETH prices 2. fetch gold XAU 3. draw comparison chart " +
+      "1. fetch BTC ETH prices from api.btc.example 2. fetch gold XAU 3. draw comparison chart " +
       "4. gather latest news 5. analyze correlation 6. write report.md " +
       "7. write summary.md and finally gửi báo cáo tới telegram, " +
       "và đề xuất cải tiến EA strategy";
@@ -275,7 +312,18 @@ describe("PRV2-A adaptive budget", () => {
                 : "write summary.md and đề xuất cải tiến EA strategy",
         i === 0 ? ["NETWORK_ACCESS", "REASONING"] : ["REASONING"],
         i ? [`T${i}`] : [],
-        undefined,
+        i === 0
+          ? {
+              // R3: the goal literally names api.btc.example → the
+              // locator host is operator-authorized (explicit-host only)
+              network_requirement: {
+                source_kind: "EXTERNAL_SITE",
+                access_intent: "RESEARCH",
+                freshness: "REQUIRED",
+                source_locator: "https://api.btc.example",
+              },
+            }
+          : undefined,
         cov[i],
       ),
     );
@@ -509,6 +557,11 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
           required_capabilities: ["FILE_OPERATIONS"],
           depends_on: ["T1"],
           pair_coverage: ["OBL_001", "DEL_001"],
+          network_requirement: {
+            source_kind: "LOCAL",
+            access_intent: "READ",
+            freshness: "NOT_REQUIRED",
+          },
         },
       ],
     });
@@ -845,8 +898,8 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R2-N1 (adversarial): 'analyze today's gold price' + REASONING-only → typed plan reject", () => {
     expectIntegrityCode(
       () =>
-        canon(
-          [work("T1", "analyze the gold price and write report.txt", ["REASONING"])],
+        canonLegacy(
+          [legacyWork("T1", "analyze the gold price and write report.txt", ["REASONING"])],
           "analyze today's gold price",
         ),
       PLAN_NET_REQ,
@@ -854,13 +907,13 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   });
 
   it("R2-N2: same goal + legitimate NETWORK data-gathering task → canonicalize PASS", () => {
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "fetch the current gold price from the internet", [
+        legacyWork("T1", "fetch the current gold price from the internet", [
           "NETWORK_ACCESS",
           "REASONING",
         ], [], undefined, []),
-        work("T2", "analyze the gold price and write analysis.txt", ["FILE_OPERATIONS"], ["T1"], undefined, ["OBL_001"]),
+        legacyWork("T2", "analyze the gold price and write analysis.txt", ["FILE_OPERATIONS"], ["T1"], undefined, ["OBL_001"]),
       ],
       "analyze today's gold price",
     );
@@ -869,10 +922,10 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   });
 
   it("R2-N3: historical/offline goal genuinely needing no current data is unaffected", () => {
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "analyze historical XAUUSD data", ["REASONING"], [], undefined, ["OBL_001"]),
-        work("T2", "write backtest.md", ["FILE_OPERATIONS"], ["T1"], undefined, ["OBL_002"]),
+        legacyWork("T1", "analyze historical XAUUSD data", ["REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T2", "write backtest.md", ["FILE_OPERATIONS"], ["T1"], undefined, ["OBL_002"]),
       ],
       "analyze historical XAUUSD data and write a backtest note",
     );
@@ -882,13 +935,13 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R2-N4 (adversarial): NETWORK_ACCESS on an unrelated dummy task does NOT satisfy the goal requirement", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "create report.txt placeholder", [
+            legacyWork("T1", "create report.txt placeholder", [
               "FILE_OPERATIONS",
               "NETWORK_ACCESS",
             ]),
-            work("T2", "analyze the gold trend", ["REASONING"], ["T1"]),
+            legacyWork("T2", "analyze the gold trend", ["REASONING"], ["T1"]),
           ],
           "analyze today's gold price",
         ),
@@ -899,9 +952,9 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R2-N5 (adversarial): task instruction explicitly requests live fetching but lacks NETWORK → task-level typed reject", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "fetch the latest gold price and write price.txt", [
+            legacyWork("T1", "fetch the latest gold price and write price.txt", [
               "REASONING",
             ]),
           ],
@@ -914,9 +967,9 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R2-N6 (adversarial): NETWORK task without a data-gathering instruction is not legitimate either", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "think about the market", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T1", "think about the market", ["NETWORK_ACCESS", "REASONING"]),
           ],
           "analyze today's gold price",
         ),
@@ -925,10 +978,10 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   });
 
   it("R2-N7: routing over a valid network plan — DSH ineligible, codex ON eligible, codex OFF rejected, devin eligible", () => {
-    const plan = canon(
+    const plan = canonLegacy(
       [
-        work("T1", "fetch the current gold price", ["NETWORK_ACCESS", "REASONING"], [], undefined, []),
-        work("T2", "analyze the gold price data", ["REASONING"], ["T1"], undefined, ["OBL_001"]),
+        legacyWork("T1", "fetch the current gold price", ["NETWORK_ACCESS", "REASONING"], [], undefined, []),
+        legacyWork("T2", "analyze the gold price data", ["REASONING"], ["T1"], undefined, ["OBL_001"]),
       ],
       "analyze today's gold price",
     );
@@ -986,15 +1039,15 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R3-N8 (adversarial): 'Research the latest GPT models' + REASONING-only → typed plan reject; + legit research NETWORK task → PASS", () => {
     expectIntegrityCode(
       () =>
-        canon(
-          [work("T1", "summarize the findings", ["REASONING"])],
+        canonLegacy(
+          [legacyWork("T1", "summarize the findings", ["REASONING"])],
           "Research the latest GPT models",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "Research the latest GPT models and return findings.", [
+        legacyWork("T1", "Research the latest GPT models and return findings.", [
           "NETWORK_ACCESS",
           "REASONING",
         ], [], undefined, ["OBL_001"]),
@@ -1008,9 +1061,9 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R3-N9 (adversarial): task 'Research the latest GPT models and return findings.' with REASONING only → task-level typed reject", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "Research the latest GPT models and return findings.", [
+            legacyWork("T1", "Research the latest GPT models and return findings.", [
               "REASONING",
             ]),
           ],
@@ -1037,10 +1090,10 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R4-N10 (adversarial): unrelated real gatherer does NOT satisfy the goal's current-data subject", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "fetch the latest gold price", ["NETWORK_ACCESS", "REASONING"]),
-            work("T2", "analyze GPT models", ["REASONING"], ["T1"]),
+            legacyWork("T1", "fetch the latest gold price", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T2", "analyze GPT models", ["REASONING"], ["T1"]),
           ],
           "Research the latest GPT models",
         ),
@@ -1049,9 +1102,9 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   });
 
   it("R4-N11: subject-bound NETWORK gatherer → PASS", () => {
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "research the latest GPT models and return current findings", [
+        legacyWork("T1", "research the latest GPT models and return current findings", [
           "NETWORK_ACCESS",
           "REASONING",
         ], [], undefined, ["OBL_001"]),
@@ -1065,18 +1118,18 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R4-N12 (adversarial, VI): 'lấy giá vàng hôm nay' cannot satisfy 'Nghiên cứu các EA MQL5 mới nhất'", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "lấy giá vàng hôm nay", ["NETWORK_ACCESS", "REASONING"]),
-            work("T2", "phân tích các EA", ["REASONING"], ["T1"]),
+            legacyWork("T1", "lấy giá vàng hôm nay", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T2", "phân tích các EA", ["REASONING"], ["T1"]),
           ],
           "Nghiên cứu các EA MQL5 mới nhất",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "nghiên cứu các EA MQL5 mới nhất", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "nghiên cứu các EA MQL5 mới nhất", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Nghiên cứu các EA MQL5 mới nhất",
     );
@@ -1105,18 +1158,18 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R5-N13 (adversarial): 'Claude models' NETWORK gatherer cannot satisfy a 'GPT models' goal", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "Research the latest Claude models", ["NETWORK_ACCESS", "REASONING"]),
-            work("T2", "analyze GPT models", ["REASONING"], ["T1"]),
+            legacyWork("T1", "Research the latest Claude models", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T2", "analyze GPT models", ["REASONING"], ["T1"]),
           ],
           "Research the latest GPT models",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "Research the latest GPT models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "Research the latest GPT models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Research the latest GPT models",
     );
@@ -1126,17 +1179,17 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R5-N14 (adversarial): 'Stripe API versions' cannot satisfy an 'OpenAI API versions' goal; OpenAI-bound task passes", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "Research the latest Stripe API versions", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T1", "Research the latest Stripe API versions", ["NETWORK_ACCESS", "REASONING"]),
           ],
           "Research the latest OpenAI API versions",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "Research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "Research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Research the latest OpenAI API versions",
     );
@@ -1155,18 +1208,18 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R6-N15 (adversarial): lowercase 'claude models' cannot satisfy lowercase 'gpt models' goal; matching 'gpt' task passes", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "research the latest claude models", ["NETWORK_ACCESS", "REASONING"]),
-            work("T2", "analyze gpt models", ["REASONING"], ["T1"]),
+            legacyWork("T1", "research the latest claude models", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T2", "analyze gpt models", ["REASONING"], ["T1"]),
           ],
           "research the latest gpt models",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest gpt models",
     );
@@ -1174,9 +1227,9 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   });
 
   it("R6-N16 (adversarial): case is never a binding difference — 'Research the latest GPT models' goal accepts lowercase 'gpt' task", () => {
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Research the latest GPT models",
     );
@@ -1186,17 +1239,17 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R6-N17 (adversarial): lowercase 'stripe api' cannot satisfy lowercase 'openai api' goal; OpenAI-bound task passes", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "research latest stripe api versions", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T1", "research latest stripe api versions", ["NETWORK_ACCESS", "REASONING"]),
           ],
           "research the latest openai api versions",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest openai api versions",
     );
@@ -1213,17 +1266,17 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R7-N18 (adversarial): shared modifier 'commercial' does not bind — Claude vs GPT still rejects, matching GPT passes", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "research the latest commercial claude models", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T1", "research the latest commercial claude models", ["NETWORK_ACCESS", "REASONING"]),
           ],
           "research the latest commercial gpt models",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "research the latest commercial gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "research the latest commercial gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest commercial gpt models",
     );
@@ -1233,17 +1286,17 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R7-N19 (adversarial): shared modifier 'public' does not bind — Stripe vs OpenAI still rejects, OpenAI-bound task passes", () => {
     expectIntegrityCode(
       () =>
-        canon(
+        canonLegacy(
           [
-            work("T1", "research the latest public stripe api versions", ["NETWORK_ACCESS", "REASONING"]),
+            legacyWork("T1", "research the latest public stripe api versions", ["NETWORK_ACCESS", "REASONING"]),
           ],
           "research the latest public openai api versions",
         ),
       PLAN_NET_REQ,
     );
-    const out = canon(
+    const out = canonLegacy(
       [
-        work("T1", "research current openai api versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
+        legacyWork("T1", "research current openai api versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest public openai api versions",
     );

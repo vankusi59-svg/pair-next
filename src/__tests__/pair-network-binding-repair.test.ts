@@ -1,7 +1,11 @@
 /**
- * NETWORK binding repair — deterministic bounded repair of a fetch-shaped
- * task missing NETWORK_ACCESS. One shared helper post-sanitize on BOTH
- * planner transports; canonical network gates stay authoritative.
+ * NETWORK binding repair — R2 semantics: a task is repaired only when its
+ * canonical structured `network_requirement` is semantically REQUIRED AND
+ * operator-authorized by the goal (a hostname/URL the goal literally
+ * names — R3: no entity-token authorization), with
+ * NETWORK_ACCESS allowed and the repaired capability set jointly servable.
+ * One shared helper post-sanitize on BOTH planner transports; the canonical
+ * network gate stays authoritative.
  * Adversarial T1–T10 per mandate.
  */
 import { describe, expect, it } from "vitest";
@@ -18,7 +22,7 @@ import { makeServeCanonicalizer } from "../pair/serve-planner.js";
 import { IntegrityError } from "../pair/errors.js";
 
 const GOAL_NET =
-  "Nghiên cứu thị trường MQL5 hiện tại để tìm một cơ hội EA MT5 có tiềm năng thương mại tốt.";
+  "Nghiên cứu thị trường mql5.com hiện tại để tìm một cơ hội EA MT5 có tiềm năng thương mại tốt.";
 const GOAL_LOCAL = "Analyze historical XAUUSD data and backtest an EA.";
 
 /** Executor capability universe: one executor serving network+reasoning work. */
@@ -35,6 +39,27 @@ const ALLOWED = [
 
 const FETCH_INSTRUCTION =
   "Research the current MQL5 marketplace online, fetch the latest EA MT5 trends from the web, and write market_research.md.";
+
+/** Structured requirements — the canonical inner object. Emission to a
+ *  planner transport writes it top-level; sanitize normalizes it into
+ *  metadata; repair + the gate read `metadata.network_requirement`. */
+const REQ_MQL5 = {
+  source_kind: "EXTERNAL_SITE",
+  access_intent: "RESEARCH",
+  freshness: "REQUIRED",
+  source_locator: "https://www.mql5.com",
+};
+const REQ_BTC = {
+  source_kind: "EXTERNAL_SITE",
+  access_intent: "RESEARCH",
+  freshness: "REQUIRED",
+  source_locator: "https://www.btc.example",
+};
+const REQ_LOCAL = {
+  source_kind: "LOCAL",
+  access_intent: "READ",
+  freshness: "NOT_REQUIRED",
+};
 
 const planJson = (tasks: Array<Record<string, unknown>>) =>
   JSON.stringify({ tasks });
@@ -59,12 +84,22 @@ const CFG = {
 const canon = (raw: Array<Record<string, unknown>>, goal: string) =>
   makeServeCanonicalizer({ executorCapSets: () => CAP_SETS })(raw, goal);
 
+const canonFail = (raw: Array<Record<string, unknown>>, goal: string) => {
+  try {
+    canon(raw, goal);
+    return null;
+  } catch (e) {
+    return { code: String((e as IntegrityError).code), detail: String((e as IntegrityError).message) };
+  }
+};
+
 const workTask = (
   key: string,
   instruction: string,
   caps: string[],
   depends_on: string[] = [],
   pairCov?: string[],
+  netReq?: Record<string, unknown>,
 ): Record<string, unknown> => ({
   task_key: key,
   title: key,
@@ -72,7 +107,24 @@ const workTask = (
   required_capabilities: caps,
   depends_on,
   ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
+  // emission form (top-level) AND post-sanitize form (metadata) — the two
+  // seams this suite exercises read different homes for the same object.
+  ...(netReq
+    ? {
+        network_requirement: netReq,
+        metadata: { network_requirement: netReq },
+      }
+    : {}),
 });
+
+/** Same task as a persisted/legacy plan carried it (fieldless). */
+const legacyTask = (
+  key: string,
+  instruction: string,
+  caps: string[],
+  depends_on: string[] = [],
+): Record<string, unknown> =>
+  workTask(key, instruction, caps, depends_on);
 
 const BOOKKEEPING = workTask(
   "T1",
@@ -84,11 +136,11 @@ const markerFor = (warnings: string[], key: string) =>
   warnings.filter((w) => w === `REPAIRED_NETWORK_CAPABILITY:${key}`);
 
 describe("NETWORK binding repair", () => {
-  it("T1 (positive, llm lane): fetch-shaped task missing NETWORK_ACCESS is repaired → canonicalizer PASSES", async () => {
+  it("T1 (positive, llm lane): REQUIRED+operator-authorized requirement missing NETWORK_ACCESS is repaired → canonicalizer PASSES", async () => {
     const raw = planJson([
       BOOKKEEPING,
-      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"], ["OBL_001"]),
-      workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"], []),
+      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"], ["OBL_001"], REQ_MQL5),
+      workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"], [], REQ_LOCAL),
     ]);
     const r = await llmPlan(GOAL_NET, { ...CFG, fetchFn: okFetch(raw) });
     const t2 = r.tasks.find((t) => t.task_key === "T2")!;
@@ -117,8 +169,8 @@ process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
   fs.writeFileSync(out, JSON.stringify({ tasks: ${JSON.stringify([
     BOOKKEEPING,
-    workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"], ["OBL_001"]),
-    workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"], []),
+    workTask("T2", FETCH_INSTRUCTION, ["REASONING"], ["T1"], ["OBL_001"], REQ_MQL5),
+    workTask("T3", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], ["T2"], [], REQ_LOCAL),
   ])} }));
   process.exit(0);
 });
@@ -141,10 +193,12 @@ process.stdin.on("end", () => {
     expect(out.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("T3 (local goal): fetch-shaped instruction + local-only goal → ZERO repair", () => {
-    const tasks = [workTask("T2", FETCH_INSTRUCTION, ["REASONING"])];
+  it("T3 (unauthorized locator): REQUIRED requirement naming a host the goal never names → ZERO repair", () => {
+    const tasks = [
+      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], undefined, REQ_MQL5),
+    ];
     const r = repairNetworkCapabilityBinding(tasks, {
-      goal: GOAL_LOCAL,
+      goal: GOAL_LOCAL, // XAUUSD — no mql5 host
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
@@ -153,35 +207,59 @@ process.stdin.on("end", () => {
     expect(r.tasks[0].required_capabilities).toEqual(["REASONING"]);
   });
 
-  it("T4 (non-fetch task): instruction not network-shaped → no capability added", () => {
-    const tasks = [workTask("T2", "Analyze fetched_data.csv and write report.txt.", ["REASONING"])];
-    const r = repairNetworkCapabilityBinding(tasks, {
+  it("T4 (structured authority wins over prose): LOCAL-looking instruction but REQUIRED+authorized requirement → repair elevates; instruction never self-elevates alone", () => {
+    // requirement is the authority — a quiet instruction cannot suppress a
+    // declared REQUIRED requirement, and a loud one cannot elevate a
+    // declared LOCAL one.
+    const quiet = [
+      workTask("T2", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], [], [], REQ_MQL5),
+    ];
+    const rQuiet = repairNetworkCapabilityBinding(quiet, {
       goal: GOAL_NET,
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    expect(r.warnings).toEqual([]);
-    expect(r.tasks[0].required_capabilities).toEqual(["REASONING"]);
+    expect(markerFor(rQuiet.warnings, "T2")).toEqual([
+      "REPAIRED_NETWORK_CAPABILITY:T2",
+    ]);
+    expect(rQuiet.tasks[0].required_capabilities).toEqual([
+      "FILE_OPERATIONS",
+      "NETWORK_ACCESS",
+    ]);
+    const loud = [
+      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], [], REQ_LOCAL),
+    ];
+    const rLoud = repairNetworkCapabilityBinding(loud, {
+      goal: GOAL_NET,
+      allowedCapabilities: ALLOWED,
+      capabilitySets: CAP_SETS,
+    });
+    expect(rLoud.warnings).toEqual([]);
+    expect(rLoud.tasks[0].required_capabilities).toEqual(["REASONING"]);
   });
 
-  it("T5 (wrong subject): fetch-shaped task about a DIFFERENT subject → no repair; plan-level gate still rejects", () => {
+  it("T5 (wrong subject): REQUIRED requirement for a host the goal never authorizes → no repair; INVALID gate still rejects", () => {
     const tasks = [
-      workTask("T2", "Search the web for the latest BTC news and write btc.md.", ["REASONING"]),
+      workTask(
+        "T2",
+        "Search the web for the latest BTC news and write btc.md.",
+        ["REASONING"],
+        [],
+        [],
+        REQ_BTC,
+      ),
     ];
     const r = repairNetworkCapabilityBinding(tasks, {
-      goal: GOAL_NET, // MQL5/EA subject
+      goal: GOAL_NET, // names mql5.com — btc.example is unauthorized
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
     expect(r.warnings).toEqual([]);
     expect(r.tasks[0].required_capabilities).toEqual(["REASONING"]);
-    // canonical plan-level gate remains authoritative: no legitimate gatherer → fail
-    expect(() => canon([BOOKKEEPING, ...r.tasks], GOAL_NET)).toThrowError(IntegrityError);
-    try {
-      canon([BOOKKEEPING, ...r.tasks], GOAL_NET);
-    } catch (e) {
-      expect((e as IntegrityError).code).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
-    }
+    // canonical authority gate remains authoritative: unauthorized source → INVALID
+    const f = canonFail([BOOKKEEPING, ...r.tasks], GOAL_NET);
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
   });
 
   it("T6 (unservable): no executor set covers the repaired capability set → NO fabricated repair, fail-closed intact", () => {
@@ -189,7 +267,9 @@ process.stdin.on("end", () => {
       ["NETWORK_ACCESS"], // network executor without REASONING
       ["REASONING", "FILE_OPERATIONS"], // local executor without NETWORK
     ];
-    const tasks = [workTask("T2", FETCH_INSTRUCTION, ["REASONING"])];
+    const tasks = [
+      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], [], REQ_MQL5),
+    ];
     const r = repairNetworkCapabilityBinding(tasks, {
       goal: GOAL_NET,
       allowedCapabilities: ALLOWED,
@@ -198,12 +278,16 @@ process.stdin.on("end", () => {
     expect(r.warnings).toEqual([]);
     expect(r.tasks[0].required_capabilities).toEqual(["REASONING"]);
     // and the canonical gate still fails the task closed
-    expect(() => canon([BOOKKEEPING, ...r.tasks], GOAL_NET)).toThrowError(IntegrityError);
+    expect(() => canon([BOOKKEEPING, ...r.tasks], GOAL_NET)).toThrowError(
+      IntegrityError,
+    );
   });
 
   it("T7 (capability not allowed): NETWORK_ACCESS absent from allowed vocabulary → no repair", () => {
     const noNetAllowed = ALLOWED.filter((c) => c !== "NETWORK_ACCESS");
-    const tasks = [workTask("T2", FETCH_INSTRUCTION, ["REASONING"])];
+    const tasks = [
+      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], [], REQ_MQL5),
+    ];
     const r = repairNetworkCapabilityBinding(tasks, {
       goal: GOAL_NET,
       allowedCapabilities: noNetAllowed,
@@ -214,7 +298,9 @@ process.stdin.on("end", () => {
   });
 
   it("T8 (already correct): task carrying NETWORK_ACCESS → zero repair, zero warning, zero change", () => {
-    const tasks = [workTask("T2", FETCH_INSTRUCTION, ["NETWORK_ACCESS", "REASONING"])];
+    const tasks = [
+      workTask("T2", FETCH_INSTRUCTION, ["NETWORK_ACCESS", "REASONING"], [], [], REQ_MQL5),
+    ];
     const r = repairNetworkCapabilityBinding(tasks, {
       goal: GOAL_NET,
       allowedCapabilities: ALLOWED,
@@ -236,35 +322,43 @@ process.stdin.on("end", () => {
     expect(out.length).toBeLessThanOrEqual(12); // protected markers all retained
   });
 
-  it("T10 (gates still authoritative): both existing network gates still fire post-repair", () => {
-    // (a) local goal → repair suppressed → task-level gate still rejects the fetch task
-    expect(() =>
-      canon([BOOKKEEPING, workTask("T2", FETCH_INSTRUCTION, ["REASONING"])], GOAL_LOCAL),
-    ).toThrowError(IntegrityError);
-    try {
-      canon([BOOKKEEPING, workTask("T2", FETCH_INSTRUCTION, ["REASONING"])], GOAL_LOCAL);
-    } catch (e) {
-      expect((e as IntegrityError).code).toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
-    }
-    // (b) current-data goal, one legit NETWORK gatherer + one non-eligible
-    //     fetch task (repair skipped: instructionIsDataGathering=false on T3's
-    //     non-gathering fetch) → plan-level PASSES, task-level still fires.
-    const legitGatherer = workTask(
-      "T2",
-      "Research the latest MQL5 EA trends online and write research.md.",
-      ["NETWORK_ACCESS", "REASONING"],
+  it("T10 (gates still authoritative): the canonical network gate still fires post-repair", () => {
+    // (a) REQUIRED+unauthorized locator → INVALID (UNAUTHORIZED_SOURCE)
+    const a = canonFail(
+      [BOOKKEEPING, workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], [], REQ_BTC)],
+      GOAL_NET,
     );
-    const nonEligibleFetch = workTask(
-      "T3",
-      "Search the web for the latest BTC price today.",
-      ["REASONING"],
-      ["T2"],
+    expect(a?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(a?.detail).toContain("UNAUTHORIZED_SOURCE");
+    // (b) NOT_REQUIRED requirement + NETWORK cap → INVALID (UNAUTHORIZED_CAPABILITY)
+    const b = canonFail(
+      [
+        BOOKKEEPING,
+        workTask("T2", "Write note.txt then reply DONE.", ["NETWORK_ACCESS", "REASONING"], [], [], REQ_LOCAL),
+      ],
+      GOAL_LOCAL,
     );
-    try {
-      canon([BOOKKEEPING, legitGatherer, nonEligibleFetch], GOAL_NET);
-      throw new Error("expected task-level gate rejection");
-    } catch (e) {
-      expect((e as IntegrityError).code).toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
-    }
+    expect(b?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(b?.detail).toContain("UNAUTHORIZED_CAPABILITY");
+    // (c) missing field on a fresh emission → REQUIREMENT_MISSING
+    const c = canonFail(
+      [BOOKKEEPING, legacyTask("T2", "Write note.txt then reply DONE.", ["REASONING"])],
+      GOAL_LOCAL,
+    );
+    expect(c?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(c?.detail).toContain("REQUIREMENT_MISSING");
+    // (d) malformed field → REQUIREMENT_MALFORMED
+    const d = canonFail(
+      [
+        BOOKKEEPING,
+        {
+          ...workTask("T2", "Write note.txt then reply DONE.", ["REASONING"]),
+          metadata: { network_requirement: { source_kind: "PORTAL" } },
+        },
+      ],
+      GOAL_LOCAL,
+    );
+    expect(d?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(d?.detail).toContain("REQUIREMENT_MALFORMED");
   });
 });
