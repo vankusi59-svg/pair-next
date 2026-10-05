@@ -242,7 +242,7 @@ const PLAN_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on", "pair_coverage"],
+        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on", "pair_coverage", "network_requirement"],
         properties: {
           task_key: { type: "string" },
           title: { type: "string" },
@@ -253,6 +253,30 @@ const PLAN_SCHEMA = {
           // task covering nothing emits []. Normalized into
           // metadata.pair_coverage by the shared sanitize seam.
           pair_coverage: { type: "array", items: { type: "string" } },
+          // R1 — the mandatory structured network/source requirement;
+          // enum-constrained so the strict transport can never emit an
+          // invalid kind/intent/freshness. Normalized into
+          // metadata.network_requirement by the shared sanitize seam.
+          network_requirement: {
+            type: "object",
+            additionalProperties: false,
+            required: ["source_kind", "access_intent", "freshness", "source_locator"],
+            properties: {
+              source_kind: {
+                type: "string",
+                enum: ["LOCAL", "EXTERNAL_SITE", "EXTERNAL_API", "REMOTE_REPOSITORY", "UNKNOWN"],
+              },
+              access_intent: {
+                type: "string",
+                enum: ["NONE", "READ", "RESEARCH", "FETCH"],
+              },
+              freshness: {
+                type: "string",
+                enum: ["NOT_REQUIRED", "REQUIRED", "UNKNOWN"],
+              },
+              source_locator: { type: ["string", "null"] },
+            },
+          },
         },
       },
     },

@@ -234,6 +234,16 @@ export function extractReaskDetail(e: unknown, validationCode: string): string {
       }
       break;
     }
+    case "FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID": {
+      // gate detail: {"task": <key>, "reason": <bounded reason token>}
+      const j = tryJsonObject(detail);
+      const t = j ? safeField(j.task) : null;
+      const r = j ? safeField(j.reason) : null;
+      if (typeof t === "string") {
+        out = `task=${t}${typeof r === "string" ? ` reason=${r}` : ""}`;
+      }
+      break;
+    }
     default:
       break;
   }

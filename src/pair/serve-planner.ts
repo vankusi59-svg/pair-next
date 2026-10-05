@@ -37,6 +37,11 @@ import {
   instructionSatisfiesGoalSubject,
 } from "./llm-planner.js";
 import {
+  FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
+  taskNetworkAuthority,
+  type NetworkRequirement,
+} from "./network-requirement.js";
+import {
   reconcilePlanDataflow,
   detectTelegramDeliveryIntent,
   CANONICAL_BOOKKEEPING_INSTRUCTION,
@@ -187,17 +192,57 @@ export function makeServeCanonicalizer(deps: {
       deps.executorCapSets() as never[],
     );
     if (!tasks.length) return [] as Array<Record<string, unknown>>;
-    // PRV2-A R2 — deterministic network-requirement authority at the
-    // canonical seam (prompt wording is guidance, not authority):
-    //  a) goal explicitly needs current/external data → the canonical work
-    //     plan must contain a LEGITIMATE data-gathering task carrying
-    //     NETWORK_ACCESS (fetch-shaped instruction — a dummy task carrying
-    //     the capability does not count);
-    //  b) a task whose instruction explicitly requests live/web fetching
-    //     must itself carry NETWORK_ACCESS.
-    // Neither rewrites the model's proposal — the candidate fails typed
+    // PRV2-A R2 + NETWORK-REQ R1 — deterministic network-requirement
+    // authority at the canonical seam (prompt wording is guidance, not
+    // authority). A task carrying a validated structured
+    // `metadata.network_requirement` is judged by it — the legacy
+    // instruction/goal vocabulary detectors decide ONLY tasks without
+    // structured evidence, and a derived-required declaration proves the
+    // goal's external-data need so the legacy goal-level check cannot
+    // veto it (raw "file"/"outbox" wording used to suppress it).
+    //  a) structured: contradictory evidence (internal, or against the
+    //     task's own instruction) rejects the candidate typed — never a
+    //     silent side-pick; a consistent derived-required task must
+    //     itself carry NETWORK_ACCESS.
+    //  b) legacy goal-level: goal explicitly needs current/external data
+    //     AND no derived-required declaration proves it → the canonical
+    //     work plan must contain a LEGITIMATE data-gathering task
+    //     carrying NETWORK_ACCESS (fetch-shaped instruction — a dummy
+    //     task carrying the capability does not count).
+    //  c) legacy per-task: no structured field + fetch-shaped
+    //     instruction must itself carry NETWORK_ACCESS.
+    // None rewrites the model's proposal — the candidate fails typed
     // and planner failover proceeds.
-    if (goalRequiresCurrentExternalData(goal)) {
+    const taskNetAuth = (t: Record<string, unknown>) =>
+      taskNetworkAuthority({
+        req: ((t.metadata as Record<string, unknown> | undefined)
+          ?.network_requirement ?? null) as NetworkRequirement | null,
+        instruction: String(t.task_instruction ?? ""),
+        instructionIsNetworkShaped: taskRequiresNetworkAccess(
+          String(t.task_instruction ?? ""),
+        ),
+      });
+    // Contradictory structured evidence rejects FIRST — a present field
+    // that is internally incoherent or contradicts its own instruction is
+    // the candidate's structural defect and must never be masked by a
+    // vocabulary-level rejection.
+    for (const t of tasks) {
+      const auth = taskNetAuth(t);
+      if (!auth.consistent) {
+        throw new IntegrityError(
+          FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
+          JSON.stringify({
+            task: String(t.task_key),
+            reason: auth.contradiction,
+          }),
+        );
+      }
+    }
+    const anyDerivedRequired = tasks.some((t) => {
+      const a = taskNetAuth(t);
+      return a.consistent && a.required;
+    });
+    if (!anyDerivedRequired && goalRequiresCurrentExternalData(goal)) {
       const legitimate = tasks.some((t) => {
         const caps = (t.required_capabilities as string[] | undefined) ?? [];
         const instr = String(t.task_instruction ?? "");
@@ -219,10 +264,11 @@ export function makeServeCanonicalizer(deps: {
     }
     for (const t of tasks) {
       const caps = (t.required_capabilities as string[] | undefined) ?? [];
-      if (
-        !caps.includes("NETWORK_ACCESS") &&
-        taskRequiresNetworkAccess(String(t.task_instruction ?? ""))
-      ) {
+      const auth = taskNetAuth(t);
+      const requires = auth.present
+        ? auth.required
+        : taskRequiresNetworkAccess(String(t.task_instruction ?? ""));
+      if (requires && !caps.includes("NETWORK_ACCESS")) {
         throw new IntegrityError(
           "FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED",
           `task ${String(t.task_key)} requests live/web fetching without NETWORK_ACCESS`,

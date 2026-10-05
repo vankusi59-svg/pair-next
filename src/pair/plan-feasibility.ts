@@ -216,6 +216,12 @@ export function canonicalPlanSemanticDigest(
     if (md.pair_output_language !== undefined) {
       body.output_language = md.pair_output_language;
     }
+    // R1 — the structured network requirement feeds NETWORK authority
+    // (capability elevation), so it MUST be bound into plan identity:
+    // mutable metadata can never act as un-bound authority.
+    if (md.network_requirement !== undefined) {
+      body.network_requirement = md.network_requirement;
+    }
     // R1.2 — selected_executor is NOT plan semantics: the planner never
     // chooses executors (MissionRouter resolves the binding post-commit
     // and overwrites task.selected_executor as routing evidence), so the
