@@ -162,6 +162,38 @@ export function extractReaskDetail(e: unknown, validationCode: string): string {
       }
       break;
     }
+    case "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED": {
+      // gate detail: {"requirements": [<id>, ...], "reason": "UNDECLARED",
+      //               "missing_count": <n>, "undeclared_tasks": [<key>, ...]}
+      // — requirement ids and task keys only, never requirement text.
+      const j = tryJsonObject(detail);
+      const safeList = (v: unknown, cap: number): string[] =>
+        Array.isArray(v)
+          ? v
+              .map(safeField)
+              .filter((x): x is string => typeof x === "string")
+              .slice(0, cap)
+          : [];
+      const reqs = j ? safeList(j.requirements, 16) : [];
+      const undeclared = j ? safeList(j.undeclared_tasks, 8) : [];
+      const mc = j ? j.missing_count : undefined;
+      const parts: string[] = [];
+      if (reqs.length) parts.push(`requirements=${reqs.join(",")}`);
+      if (
+        typeof mc === "number" &&
+        Number.isInteger(mc) &&
+        mc > 0 &&
+        mc <= 128 &&
+        mc > reqs.length
+      ) {
+        parts.push(`missing_count=${mc}`);
+      }
+      if (undeclared.length) parts.push(`undeclared_tasks=${undeclared.join(",")}`);
+      if (reqs.length || undeclared.length) {
+        out = `${parts.join(" ")} reason=UNDECLARED`;
+      }
+      break;
+    }
     case "FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED": {
       // gate detail: "task <key> requests live/web fetching without NETWORK_ACCESS"
       const m = /^task (\S+) requests live\/web fetching without NETWORK_ACCESS$/.exec(detail);

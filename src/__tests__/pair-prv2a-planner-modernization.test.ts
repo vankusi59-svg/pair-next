@@ -65,6 +65,7 @@ const work = (
   caps: string[],
   depends_on: string[] = [],
   metadata?: Record<string, unknown>,
+  pairCov?: string[],
 ) => ({
   task_key: key,
   title: key,
@@ -72,6 +73,7 @@ const work = (
   required_capabilities: caps,
   depends_on,
   ...(metadata ? { metadata } : {}),
+  ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
 });
 
 const bookkeepingShaped = (key: string) =>
@@ -142,8 +144,8 @@ describe("PRV2-A bookkeeping injection", () => {
   it("5. bookkeeping is injected even when the model emits only work tasks", () => {
     const out = canon(
       [
-        work("T1", "analyze gold price drivers, write findings to findings.txt", ["REASONING"]),
-        work("T2", "read findings.txt and write report.txt", ["FILE_OPERATIONS"], ["T1"]),
+        work("T1", "analyze gold price drivers, write findings to findings.txt", ["REASONING"], [], undefined, ["OBL_001"]),
+        work("T2", "read findings.txt and write report.txt", ["FILE_OPERATIONS"], ["T1"], undefined, ["DEL_001"]),
       ],
       goal,
     );
@@ -155,9 +157,9 @@ describe("PRV2-A bookkeeping injection", () => {
   it("6. final canonical keys are deterministic: T1 bookkeeping, T2..Tn work", () => {
     const out = canon(
       [
-        work("T1", "analyze gold price", ["REASONING"]),
-        work("T2", "write report.txt", ["FILE_OPERATIONS"], ["T1"]),
-        work("T3", "review report.txt", ["REASONING"], ["T2"]),
+        work("T1", "analyze gold price", ["REASONING"], [], undefined, ["OBL_001"]),
+        work("T2", "write report.txt", ["FILE_OPERATIONS"], ["T1"], undefined, ["DEL_001"]),
+        work("T3", "review report.txt", ["REASONING"], ["T2"], undefined, []),
       ],
       goal,
     );
@@ -169,8 +171,8 @@ describe("PRV2-A bookkeeping injection", () => {
     const out = canon(
       [
         bookkeepingShaped("T1"),
-        work("T2", "analyze gold drivers", ["REASONING"], ["T1"]),
-        work("T3", "write report.txt", ["FILE_OPERATIONS"], ["T2"]),
+        work("T2", "analyze gold drivers", ["REASONING"], ["T1"], undefined, ["OBL_001"]),
+        work("T3", "write report.txt", ["FILE_OPERATIONS"], ["T2"], undefined, ["DEL_001"]),
       ],
       goal,
     );
@@ -187,7 +189,7 @@ describe("PRV2-A bookkeeping injection", () => {
       [
         bookkeepingShaped("T1"),
         bookkeepingShaped("T2"),
-        work("T3", "analyze gold price and write report.txt", ["REASONING", "FILE_OPERATIONS"], ["T1"]),
+        work("T3", "analyze gold price and write report.txt", ["REASONING", "FILE_OPERATIONS"], ["T1"], undefined, ["OBL_001", "DEL_001"]),
       ],
       goal,
     );
@@ -209,12 +211,14 @@ describe("PRV2-A bookkeeping injection", () => {
     const tgGoal = "write analysis.txt and gửi analysis.txt tới telegram";
     const out = canon(
       [
-        work("T1", "research and write analysis.txt", ["REASONING"]),
+        work("T1", "research and write analysis.txt", ["REASONING"], [], undefined, ["DEL_001"]),
         work(
           "T2",
           "Stage the manifested artifacts into outbox/ unchanged, then reply DONE.",
           ["TELEGRAM_DELIVERY"],
           ["T1"],
+          undefined,
+          [],
         ),
       ],
       tgGoal,
@@ -236,7 +240,7 @@ describe("PRV2-A adaptive budget", () => {
   it("10. simple goal → small budget (≤4 work tasks)", () => {
     expect(deriveWorkTaskBudget("analyze gold price")).toBe(4);
     const raw = Array.from({ length: 6 }, (_, i) =>
-      work(`T${i + 1}`, `analyze gold price part ${i + 1}`, ["REASONING"]),
+      work(`T${i + 1}`, `analyze gold price part ${i + 1}`, ["REASONING"], [], undefined, ["OBL_001"]),
     );
     const out = canon(raw, "analyze gold price");
     expect(out).toHaveLength(5); // T1 bookkeeping + 4 work
@@ -250,6 +254,13 @@ describe("PRV2-A adaptive budget", () => {
       "7. write summary.md and finally gửi báo cáo tới telegram, " +
       "và đề xuất cải tiến EA strategy";
     expect(deriveWorkTaskBudget(goal)).toBeGreaterThanOrEqual(6);
+    const cov = [
+      ["OBL_001", "OBL_002", "OBL_004"],
+      ["OBL_003"],
+      ["OBL_005"],
+      ["DEL_001"],
+      ["OBL_006", "DEL_002"],
+    ];
     const raw = Array.from({ length: 5 }, (_, i) =>
       work(
         `T${i + 1}`,
@@ -264,6 +275,8 @@ describe("PRV2-A adaptive budget", () => {
                 : "write summary.md and đề xuất cải tiến EA strategy",
         i === 0 ? ["NETWORK_ACCESS", "REASONING"] : ["REASONING"],
         i ? [`T${i}`] : [],
+        undefined,
+        cov[i],
       ),
     );
     raw.push(
@@ -272,6 +285,8 @@ describe("PRV2-A adaptive budget", () => {
         "Stage the manifested artifacts into outbox/ unchanged, then reply DONE.",
         ["TELEGRAM_DELIVERY"],
         ["T5"],
+        undefined,
+        [],
       ),
     );
     const out = canon(raw, goal);
@@ -412,8 +427,8 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
   it("R1.A-4: accepted plan still has exactly ONE AUTOMATON task — T1 = canonicalBookkeepingTask(goal)", () => {
     const out = canon(
       [
-        work("T1", "analyze gold price", ["REASONING"]),
-        work("T2", "read findings write report.txt", ["FILE_OPERATIONS"], ["T1"]),
+        work("T1", "analyze gold price", ["REASONING"], [], undefined, ["OBL_001"]),
+        work("T2", "read findings write report.txt", ["FILE_OPERATIONS"], ["T1"], undefined, ["DEL_001"]),
       ],
       goal,
     );
@@ -436,7 +451,7 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
   });
 
   it("R1.A-5: model-emitted pure bookkeeping still normalizes (never a second authority)", () => {
-    const out = canon([bookkeepingShaped("T1"), work("T2", "analyze gold price and write report.txt", ["REASONING"])], goal);
+    const out = canon([bookkeepingShaped("T1"), work("T2", "analyze gold price and write report.txt", ["REASONING"], [], undefined, ["OBL_001", "DEL_001"])], goal);
     const automaton = out.filter((t) =>
       (t.required_capabilities as string[]).includes("AUTOMATON_TASK_EXECUTION"),
     );
@@ -493,6 +508,7 @@ describe("PRV2-A R1.A — reserved AUTOMATON_TASK_EXECUTION", () => {
           task_instruction: "Analyze gold price and write report.txt, then reply DONE.",
           required_capabilities: ["FILE_OPERATIONS"],
           depends_on: ["T1"],
+          pair_coverage: ["OBL_001", "DEL_001"],
         },
       ],
     });
@@ -843,8 +859,8 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
         work("T1", "fetch the current gold price from the internet", [
           "NETWORK_ACCESS",
           "REASONING",
-        ]),
-        work("T2", "analyze the gold price and write analysis.txt", ["FILE_OPERATIONS"], ["T1"]),
+        ], [], undefined, []),
+        work("T2", "analyze the gold price and write analysis.txt", ["FILE_OPERATIONS"], ["T1"], undefined, ["OBL_001"]),
       ],
       "analyze today's gold price",
     );
@@ -855,8 +871,8 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R2-N3: historical/offline goal genuinely needing no current data is unaffected", () => {
     const out = canon(
       [
-        work("T1", "analyze historical XAUUSD data", ["REASONING"]),
-        work("T2", "write backtest.md", ["FILE_OPERATIONS"], ["T1"]),
+        work("T1", "analyze historical XAUUSD data", ["REASONING"], [], undefined, ["OBL_001"]),
+        work("T2", "write backtest.md", ["FILE_OPERATIONS"], ["T1"], undefined, ["OBL_002"]),
       ],
       "analyze historical XAUUSD data and write a backtest note",
     );
@@ -911,8 +927,8 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R2-N7: routing over a valid network plan — DSH ineligible, codex ON eligible, codex OFF rejected, devin eligible", () => {
     const plan = canon(
       [
-        work("T1", "fetch the current gold price", ["NETWORK_ACCESS", "REASONING"]),
-        work("T2", "analyze the gold price data", ["REASONING"], ["T1"]),
+        work("T1", "fetch the current gold price", ["NETWORK_ACCESS", "REASONING"], [], undefined, []),
+        work("T2", "analyze the gold price data", ["REASONING"], ["T1"], undefined, ["OBL_001"]),
       ],
       "analyze today's gold price",
     );
@@ -981,7 +997,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
         work("T1", "Research the latest GPT models and return findings.", [
           "NETWORK_ACCESS",
           "REASONING",
-        ]),
+        ], [], undefined, ["OBL_001"]),
       ],
       "Research the latest GPT models",
     );
@@ -1038,7 +1054,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
         work("T1", "research the latest GPT models and return current findings", [
           "NETWORK_ACCESS",
           "REASONING",
-        ]),
+        ], [], undefined, ["OBL_001"]),
       ],
       "Research the latest GPT models",
     );
@@ -1060,7 +1076,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     const out = canon(
       [
-        work("T1", "nghiên cứu các EA MQL5 mới nhất", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "nghiên cứu các EA MQL5 mới nhất", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Nghiên cứu các EA MQL5 mới nhất",
     );
@@ -1100,7 +1116,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     const out = canon(
       [
-        work("T1", "Research the latest GPT models", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "Research the latest GPT models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Research the latest GPT models",
     );
@@ -1120,7 +1136,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     const out = canon(
       [
-        work("T1", "Research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "Research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Research the latest OpenAI API versions",
     );
@@ -1150,7 +1166,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     const out = canon(
       [
-        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest gpt models",
     );
@@ -1160,7 +1176,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
   it("R6-N16 (adversarial): case is never a binding difference — 'Research the latest GPT models' goal accepts lowercase 'gpt' task", () => {
     const out = canon(
       [
-        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "research the latest gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "Research the latest GPT models",
     );
@@ -1180,7 +1196,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     const out = canon(
       [
-        work("T1", "research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "research current OpenAI API versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest openai api versions",
     );
@@ -1207,7 +1223,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     const out = canon(
       [
-        work("T1", "research the latest commercial gpt models", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "research the latest commercial gpt models", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest commercial gpt models",
     );
@@ -1227,7 +1243,7 @@ describe("PRV2-A R2 — canonical network-requirement gate", () => {
     );
     const out = canon(
       [
-        work("T1", "research current openai api versions", ["NETWORK_ACCESS", "REASONING"]),
+        work("T1", "research current openai api versions", ["NETWORK_ACCESS", "REASONING"], [], undefined, ["OBL_001"]),
       ],
       "research the latest public openai api versions",
     );
