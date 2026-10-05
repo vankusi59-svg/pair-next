@@ -96,6 +96,86 @@ export function boundedReaskTaskWarnings(warnings: string[]): string[] {
   return out;
 }
 
+/** P-REASK R4 — structured rejection detail for the ONE re-ask: built ONLY
+ *  from allowlisted fields of the gate's own structured `IntegrityError.detail`
+ *  (never `e.message`, never task instructions, plan JSON, requirement text,
+ *  model output, or arbitrary operator text). Every emitted value must match
+ *  the canonical-identifier grammar; anything malformed, unrecognized, or
+ *  over-budget falls back to the exact validation_code — never a truncated
+ *  unsafe string. */
+const SAFE_REASK_FIELD_RE = /^[A-Za-z0-9_./-]{1,120}$/;
+const REASK_DETAIL_LINE_RE = /^[\x20-\x7E]{1,200}$/;
+
+const tryJsonObject = (s: string): Record<string, unknown> | null => {
+  try {
+    const j = JSON.parse(s);
+    return j && typeof j === "object" && !Array.isArray(j) ? j : null;
+  } catch {
+    return null;
+  }
+};
+
+/** Field is only usable when it is a REAL string matching the identifier
+ *  grammar — String(undefined)/String(null) would pass the regex and
+ *  fabricate "task=undefined" detail lines. */
+const safeField = (v: unknown): string | null =>
+  typeof v === "string" && SAFE_REASK_FIELD_RE.test(v) ? v : null;
+
+export function extractReaskDetail(e: unknown, validationCode: string): string {
+  const detail =
+    e instanceof IntegrityError && typeof e.detail === "string" ? e.detail : "";
+  let out: string | null = null;
+  switch (validationCode) {
+    case "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT": {
+      // gate detail: {"task": <key>, "artifact": <name>}
+      const j = tryJsonObject(detail);
+      const t = j ? safeField(j.task) : null;
+      const a = j ? safeField(j.artifact) : null;
+      if (typeof t === "string" && typeof a === "string") {
+        out = `task=${t} artifact=${a}`;
+      }
+      break;
+    }
+    case "FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK": {
+      // gate detail: {"task": <key>} — never the instruction text.
+      const j = tryJsonObject(detail);
+      const t = j && safeField(j.task);
+      if (typeof t === "string") {
+        out = `task=${t}`;
+      }
+      break;
+    }
+    case "FAIL_CLOSED_PLAN_INCOMPLETE": {
+      // JSON form: {"requirement": <id>, "kind": <k>, "text": ...} — text is
+      // operator-goal-derived and never rendered. Prose form:
+      // "task <key> claims coverage of <id> it does not provide".
+      const j = tryJsonObject(detail);
+      const req = j && safeField(j.requirement);
+      if (typeof req === "string") {
+        const kind = j && safeField(j.kind);
+        out = `requirement=${req}${typeof kind === "string" ? ` kind=${kind}` : ""}`;
+      } else {
+        const m = /^task (\S+) claims coverage of ([A-Z0-9_]+) it does not provide$/.exec(detail);
+        if (m && SAFE_REASK_FIELD_RE.test(m[1]) && SAFE_REASK_FIELD_RE.test(m[2])) {
+          out = `task=${m[1]} requirement=${m[2]}`;
+        }
+      }
+      break;
+    }
+    case "FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED": {
+      // gate detail: "task <key> requests live/web fetching without NETWORK_ACCESS"
+      const m = /^task (\S+) requests live\/web fetching without NETWORK_ACCESS$/.exec(detail);
+      if (m && SAFE_REASK_FIELD_RE.test(m[1])) {
+        out = `task=${m[1]} reason=NETWORK_ACCESS_REQUIRED`;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return out !== null && REASK_DETAIL_LINE_RE.test(out) ? out : validationCode;
+}
+
 /** Failure classes carrying operator-safe diagnostics. */
 export const PLANNER_FAILURE_CLASS = {
   TIMEOUT: "TIMEOUT",
@@ -461,6 +541,7 @@ export async function runPlannerFailover(opts: {
                 rejectionContext: {
                   validation_code: reaskCode,
                   task_warnings: boundedReaskTaskWarnings(res.warnings),
+                  detail: extractReaskDetail(e, reaskCode),
                 },
               });
               if (Array.isArray(res2.tasks) && res2.tasks.length) {

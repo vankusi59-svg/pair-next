@@ -466,6 +466,11 @@ export function instructionSatisfiesGoalSubject(
 export interface PlannerRejectionContext {
   validation_code: string;
   task_warnings: string[];
+  /** P-REASK R4 — one bounded line built from allowlisted structured gate
+   *  detail (task/artifact/requirement identifiers), or the validation_code
+   *  itself as fallback. Never raw exception text, instructions, plan JSON,
+   *  requirement text, or secrets. */
+  detail?: string;
 }
 
 export interface LlmPlannerConfig {
@@ -827,6 +832,7 @@ export function buildPlannerUserPrompt(
     (cfg.rejectionContext
       ? `\nPLAN REJECTION — your previous plan from this same planner candidate was rejected by PAIR for the following canonical validation defect:\n` +
         `validation_code: ${cfg.rejectionContext.validation_code}\n` +
+        `rejection_detail: ${typeof cfg.rejectionContext.detail === "string" && /^[\x20-\x7E]{1,200}$/.test(cfg.rejectionContext.detail) ? cfg.rejectionContext.detail : cfg.rejectionContext.validation_code}\n` +
         `task warnings: ${cfg.rejectionContext.task_warnings.filter((w) => /^[A-Z0-9_:.\-]+$/.test(String(w))).slice(0, 10).join(", ") || "none"}\n` +
         `Do not re-emit it unchanged. Make the minimum change necessary to fix the named defect. Preserve unrelated task structure, capabilities, dependencies, constraints and delivery intent. Request no wider authority.\n`
       : "") +
