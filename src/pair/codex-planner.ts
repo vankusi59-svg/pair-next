@@ -36,6 +36,7 @@ import {
   isBookkeepingShapedTask,
   resolveWorkTaskBudget,
   LLM_PLANNER_MIN_TASKS,
+  type PlannerRejectionContext,
 } from "./llm-planner.js";
 import { assertPlannerCandidateEligible, assertPlannerRoleAndDisjoint } from "./model-role.js";
 import { providerModelEligibility } from "./model-routable.js";
@@ -88,6 +89,10 @@ export interface CodexPlannerInvokeConfig {
   allowedCapabilities: string[];
   capabilitySets?: string[][];
   maxTasks?: number;
+  /** P-REASK — bounded rejection feedback on the ONE canonical-rejection
+   *  re-ask; rendered into the SAME canonical prompt builder as every
+   *  other transport (MINIMAL-REPAIR, never F3 alternative-plan). */
+  rejectionContext?: PlannerRejectionContext;
 }
 
 function resolveExecutable(env: CodexPlannerEnv | undefined): string | null {
@@ -351,6 +356,7 @@ export async function codexPlannerPlan(
       allowedCapabilities: cfg.allowedCapabilities,
       capabilitySets: cfg.capabilitySets,
       maxTasks: cfg.maxTasks,
+      rejectionContext: cfg.rejectionContext,
     })}`;
   let out: Awaited<ReturnType<typeof invokeRaw>>;
   try {

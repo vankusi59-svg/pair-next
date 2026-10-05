@@ -458,6 +458,16 @@ export function instructionSatisfiesGoalSubject(
   return false;
 }
 
+/** P-REASK — bounded deterministic rejection feedback PAIR hands back to
+ *  the SAME planner candidate on its one canonical-rejection re-ask.
+ *  Built ONLY from PAIR-owned evidence: the exact typed validation code
+ *  and the task-keyed sanitize markers (DROP_*, DEP_*, REPAIRED_*). Never
+ *  raw model output, task instruction bodies, exception text, or secrets. */
+export interface PlannerRejectionContext {
+  validation_code: string;
+  task_warnings: string[];
+}
+
 export interface LlmPlannerConfig {
   /** Provider chat/completions URL (P6 endpoint_reference). */
   endpoint: string;
@@ -474,6 +484,11 @@ export interface LlmPlannerConfig {
   env?: NodeJS.ProcessEnv | ((name: string) => string | undefined);
   /** Injectable for tests — defaults to global fetch. */
   fetchFn?: typeof fetch;
+  /** P-REASK — hard provider-request bound for THIS invocation. The
+   *  default preserves the historical ≤2-call contract (one internal
+   *  retry on degenerate output); a rejection-feedback re-ask passes 1 —
+   *  exactly one provider request, never a recursive retry layer. */
+  maxProviderRequests?: number;
   /** F3 — bounded structured failure context on a REPLAN: the planner must
    *  propose a feasible ALTERNATIVE, never a semantic re-emission of the
    *  failed plan; the rejected digests are named in the prompt. */
@@ -486,6 +501,10 @@ export interface LlmPlannerConfig {
     failed_plan_semantic_digest?: string | null;
     rejected_semantic_digests?: string[];
   };
+  /** P-REASK — bounded rejection feedback on the ONE canonical-rejection
+   *  re-ask: MINIMAL-REPAIR semantics (fix the named defect, preserve all
+   *  other structure) — never F3's alternative-plan semantics. */
+  rejectionContext?: PlannerRejectionContext;
 }
 
 export interface LlmPlanResult {
@@ -761,6 +780,7 @@ export function buildPlannerUserPrompt(
     capabilitySets?: string[][];
     maxTasks?: number;
     replanContext?: LlmPlannerConfig["replanContext"];
+    rejectionContext?: LlmPlannerConfig["rejectionContext"];
   },
 ): string {
   const workTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
@@ -803,6 +823,12 @@ export function buildPlannerUserPrompt(
         `Previously rejected candidate digests you must not reproduce: ${(cfg.replanContext.rejected_semantic_digests ?? []).join(", ") || "none"}.\n` +
         `Propose a genuinely different feasible plan for the SAME goal: change the artifact flow or task decomposition so the named failure cannot recur (e.g. make the needed artifact the explicit output of an earlier producer task and name the same path in the consumer's instruction). ` +
         `Preserve every unrelated constraint (capabilities allowed, DAG rules, telegram rules) and request no wider permissions than the failed plan.\n`
+      : "") +
+    (cfg.rejectionContext
+      ? `\nPLAN REJECTION — your previous plan from this same planner candidate was rejected by PAIR for the following canonical validation defect:\n` +
+        `validation_code: ${cfg.rejectionContext.validation_code}\n` +
+        `task warnings: ${cfg.rejectionContext.task_warnings.filter((w) => /^[A-Z0-9_:.\-]+$/.test(String(w))).slice(0, 10).join(", ") || "none"}\n` +
+        `Do not re-emit it unchanged. Make the minimum change necessary to fix the named defect. Preserve unrelated task structure, capabilities, dependencies, constraints and delivery intent. Request no wider authority.\n`
       : "") +
     `\nMISSION GOAL:\n${goal}`
   );
@@ -893,9 +919,16 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
   };
 
   // Degenerate output (ZERO usable work tasks — a bookkeeping-only plan
-  // performs no work) replans once, then rejects.
+  // performs no work) replans once, then rejects. P-REASK —
+  // cfg.maxProviderRequests bounds THIS invocation's provider calls: the
+  // default 2 preserves the historical INITIAL retry contract; a
+  // canonical-rejection re-ask passes 1 — exactly one provider request.
   const warnings: string[] = [];
-  for (let i = 0; i < 2; i++) {
+  const maxProviderRequests = Math.max(
+    1,
+    Math.min(2, cfg.maxProviderRequests ?? 2),
+  );
+  for (let i = 0; i < maxProviderRequests; i++) {
     const a = await attempt();
     const usable = a.tasks.filter(
       (t) => !isBookkeepingShapedTask(t, sanitizeCaps),

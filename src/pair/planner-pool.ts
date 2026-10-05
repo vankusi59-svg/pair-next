@@ -24,6 +24,77 @@
  */
 
 import { IntegrityError } from "./errors.js";
+import type { PlannerRejectionContext } from "./llm-planner.js";
+
+/** P-REASK — bounded invocation context passed to every planFn call so
+ *  all transports share ONE contract. INITIAL carries kind only (the
+ *  planFn's own configured defaults apply). REASK carries the rejection
+ *  feedback, the effective remaining-budget timeout, and a hard
+ *  provider-request limit (1 — exactly one model call per re-ask). */
+export interface PlannerInvocation {
+  kind: "INITIAL" | "REASK";
+  /** Effective per-request timeout for this call (REASK = min(normal
+   *  per-request timeout, remaining candidate budget)). */
+  timeoutMs?: number;
+  /** Hard provider-request bound for this call (REASK = 1). */
+  maxProviderRequests?: number;
+  /** Bounded deterministic rejection feedback — present iff kind=REASK. */
+  rejectionContext?: PlannerRejectionContext;
+}
+
+/** P-REASK R3 — per-candidate latency authority. `ceilingMs` is the
+ *  candidate's total worst-case envelope measured from attempt START
+ *  (HTTP = 2×per-request timeout because an INITIAL call may perform up
+ *  to two provider requests; Codex = its single-invocation timeout);
+ *  `requestTimeoutMs` is the normal per-request timeout. */
+export interface PlannerLatencyBudget {
+  ceilingMs: number;
+  requestTimeoutMs: number;
+}
+
+/** P-REASK R0 — canonical codes that make a canonicalize rejection
+ *  eligible for the ONE bounded feedback re-ask: canonical plan-
+ *  validation families only. Eligibility/authority/transport/timeout/
+ *  credential/NO_JSON-degenerate failures never qualify. */
+const REASK_CODE_PREFIX = /^FAIL_CLOSED_(?:PLAN|DELIVERY|TELEGRAM|TASK)_/;
+const SAFE_CODE_RE = /^[A-Z0-9_:.\-]+$/;
+
+/** Returns the exact typed code when `e` is an eligible canonical
+ *  plan-validation IntegrityError, else null. Exact identity only — an
+ *  over-length or malformed code is never truncated into a fake one. */
+export function extractReaskEligibleCode(e: unknown): string | null {
+  if (!(e instanceof IntegrityError)) return null;
+  const code = e.code;
+  if (
+    typeof code !== "string" ||
+    code.length === 0 ||
+    code.length > 80 ||
+    !SAFE_CODE_RE.test(code) ||
+    !REASK_CODE_PREFIX.test(code)
+  ) {
+    return null;
+  }
+  return code;
+}
+
+/** Bounded deterministic feedback built ONLY from PAIR-owned evidence:
+ *  task-keyed sanitize markers of the DROP_*, DEP_*, REPAIRED_* families
+ *  on the strict safe charset — deduped, order-preserved, ≤10. Never raw
+ *  model output, task instruction bodies, exception text, or secrets. */
+export function boundedReaskTaskWarnings(warnings: string[]): string[] {
+  const out: string[] = [];
+  for (const w of warnings) {
+    if (
+      out.length < 10 &&
+      SAFE_CODE_RE.test(w) &&
+      (w.startsWith("DROP_") || w.startsWith("DEP_") || w.startsWith("REPAIRED_")) &&
+      !out.includes(w)
+    ) {
+      out.push(w);
+    }
+  }
+  return out;
+}
 
 /** Failure classes carrying operator-safe diagnostics. */
 export const PLANNER_FAILURE_CLASS = {
@@ -46,28 +117,31 @@ export type PlannerFailureClass =
 
 /**
  * R1.A — bounded durable attempt warnings that never evict PAIR-authored
- * repair provenance. The durable set stays ≤10 and in original order:
- * every REPAIRED_REMOTE_DEPENDENT_EDGE marker is retained (it proves a
- * PAIR-authored instruction rewrite — indistinguishable from model text
- * if dropped), and the earliest non-repair warnings fill the remaining
- * budget. Deterministic, no duplicates, never unbounded.
+ * provenance. The durable set stays ≤10 and in original order: every
+ * protected marker is retained — REPAIRED_REMOTE_DEPENDENT_EDGE (proves
+ * a PAIR-authored instruction rewrite) and P-REASK REASK:* /
+ * REASK_SUCCEEDED:* (proves PAIR's one bounded feedback re-ask) — and
+ * the earliest non-protected warnings fill the remaining budget.
+ * Deterministic, no duplicates, never unbounded.
  */
 export function boundedAttemptWarnings(warnings: string[]): string[] {
-  if (warnings.length <= 10) return [...warnings];
-  const isRepair = (w: string) =>
-    w.startsWith("REPAIRED_REMOTE_DEPENDENT_EDGE:");
-  const nonRepairBudget = Math.max(
+  const isProtected = (w: string) =>
+    w.startsWith("REPAIRED_REMOTE_DEPENDENT_EDGE:") ||
+    w.startsWith("REASK:") ||
+    w.startsWith("REASK_SUCCEEDED:");
+  const nonProtectedBudget = Math.max(
     0,
-    10 - warnings.filter(isRepair).length,
+    10 - warnings.filter(isProtected).length,
   );
   const out: string[] = [];
-  let keptNonRepair = 0;
+  let keptNonProtected = 0;
   for (const w of warnings) {
-    if (isRepair(w)) {
+    if (out.includes(w)) continue;
+    if (isProtected(w)) {
       if (out.length < 10) out.push(w);
-    } else if (keptNonRepair < nonRepairBudget) {
+    } else if (keptNonProtected < nonProtectedBudget) {
       out.push(w);
-      keptNonRepair++;
+      keptNonProtected++;
     }
   }
   return out;
@@ -187,7 +261,10 @@ export interface PlannerFailoverResult {
  */
 export async function runPlannerFailover(opts: {
   candidates: PlannerCandidate[];
-  planFn: (c: PlannerCandidate) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
+  planFn: (
+    c: PlannerCandidate,
+    invocation: PlannerInvocation,
+  ) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
   /** Canonical per-invocation eligibility proof (role + lifecycle).
    *  Throw = authority failure (propagates); return {reject:true,...} =
    *  failover-eligible availability rejection. May be async (CPL-1 R1 —
@@ -204,6 +281,15 @@ export async function runPlannerFailover(opts: {
   canonicalize?: (tasks: Array<Record<string, unknown>>, c: PlannerCandidate) => Array<Record<string, unknown>>;
   onAttemptStart?: (base: Omit<PlannerAttemptRecord, "outcome">) => unknown;
   onAttemptEnd?: (token: unknown, record: PlannerAttemptRecord) => void;
+  /** P-REASK R4 — fires AFTER eligibility re-proof and BEFORE the second
+   *  model invocation so the STARTED attempt row durably records
+   *  `REASK:<code>`; a crash after this point leaves provable evidence
+   *  that the re-ask began. Never a second attempt row. */
+  onAttemptReask?: (token: unknown, validationCode: string) => void;
+  /** P-REASK R3 — per-candidate latency authority. When absent the
+   *  re-ask runs with no budget limit (test seams); production wires the
+   *  transport-derived ceiling so worst-case latency never grows. */
+  latencyBudget?: (c: PlannerCandidate) => PlannerLatencyBudget;
   onExhausted?: (attempts: PlannerAttemptRecord[]) => void;
   now?: () => string;
 }): Promise<PlannerFailoverResult> {
@@ -271,8 +357,13 @@ export async function runPlannerFailover(opts: {
       });
       continue;
     }
+    // P-REASK — set only after the re-ask marker is durably persisted
+    // (onAttemptReask). When the SECOND invocation itself dies, the outer
+    // catch keeps `REASK:<code>` in the settled warnings so the durable
+    // row still proves the re-ask began.
+    let reaskInitiated: string | null = null;
     try {
-      const res = await opts.planFn(c);
+      const res = await opts.planFn(c, { kind: "INITIAL" });
       const completed = now();
       if (!Array.isArray(res.tasks) || !res.tasks.length) {
         settle({
@@ -311,6 +402,150 @@ export async function runPlannerFailover(opts: {
             /^[A-Z0-9_:.\-]+$/.test(rawCode)
               ? `VALIDATION_CODE:${rawCode}`
               : null;
+          // P-REASK — ONE bounded feedback re-ask for an eligible
+          // canonical plan-validation rejection: same candidate, typed
+          // code + task-keyed markers as feedback, exactly one provider
+          // request, inside the candidate latency ceiling. Everything
+          // else keeps the historical FAILED → failover semantics.
+          const reaskCode = extractReaskEligibleCode(e);
+          if (reaskCode) {
+            const budget = opts.latencyBudget?.(c);
+            const preReproofRemaining =
+              budget == null
+                ? Number.MAX_SAFE_INTEGER
+                : budget.ceilingMs - (Date.now() - t0);
+            if (preReproofRemaining > 0) {
+              // §9/R4 + R1.A — a second model invocation re-proves
+              // canonical eligibility first. An authority throw falls
+              // straight into the outer catch, which settles the attempt
+              // EXACTLY ONCE (single FAILED record/event, original
+              // attempt_no) — no inner settle may precede it. An
+              // availability rejection prevents the re-ask; normal
+              // failover proceeds.
+              const elig2 = await opts.assertEligible(c);
+              if (elig2 && elig2.reject) {
+                settle({
+                  ...base,
+                  completed_at: now(),
+                  latency_ms: Date.now() - t0,
+                  outcome: "FAILED",
+                  failure_class: elig2.failure_class,
+                  warnings: [`ELIGIBILITY_REJECTED:${elig2.reason}`],
+                });
+                continue;
+              }
+              // R1.B — remaining budget is recomputed AFTER the
+              // re-proof consumed real time; a non-positive remainder
+              // means no marker, no event, no second invocation — the
+              // candidate settles on the ORIGINAL canonical rejection.
+              const remaining =
+                budget == null
+                  ? Number.MAX_SAFE_INTEGER
+                  : budget.ceilingMs - (Date.now() - t0);
+              if (remaining > 0) {
+              // Durable BEFORE the second invocation: the STARTED row
+              // records PAIR's re-ask so a crash mid-call can never make
+              // the second model request silently absent. R1.C — the
+              // persistence seam itself fails closed (governance
+              // IntegrityError) when provenance cannot be established;
+              // the model is then never invoked.
+              opts.onAttemptReask?.(token, reaskCode);
+              reaskInitiated = reaskCode;
+              const res2 = await opts.planFn(c, {
+                kind: "REASK",
+                timeoutMs: Math.min(
+                  budget?.requestTimeoutMs ?? Number.MAX_SAFE_INTEGER,
+                  remaining,
+                ),
+                maxProviderRequests: 1,
+                rejectionContext: {
+                  validation_code: reaskCode,
+                  task_warnings: boundedReaskTaskWarnings(res.warnings),
+                },
+              });
+              if (Array.isArray(res2.tasks) && res2.tasks.length) {
+                try {
+                  const canonical2 = opts.canonicalize
+                    ? opts.canonicalize(res2.tasks, c)
+                    : res2.tasks;
+                  if (!canonical2.length) {
+                    settle({
+                      ...base,
+                      completed_at: now(),
+                      latency_ms: Date.now() - t0,
+                      outcome: "FAILED",
+                      failure_class: PLANNER_FAILURE_CLASS.PLAN_INVALID,
+                      warnings: boundedAttemptWarnings([
+                        ...res.warnings,
+                        ...res2.warnings,
+                        `REASK:${reaskCode}`,
+                        "CANONICAL_VALIDATION_EMPTY",
+                      ]),
+                    });
+                    continue;
+                  }
+                  settle({
+                    ...base,
+                    completed_at: now(),
+                    latency_ms: Date.now() - t0,
+                    outcome: "SUCCESS",
+                    warnings: boundedAttemptWarnings([
+                      ...res.warnings,
+                      ...res2.warnings,
+                      `REASK:${reaskCode}`,
+                      `REASK_SUCCEEDED:${reaskCode}`,
+                    ]),
+                  });
+                  return { tasks: canonical2, winner: attempts[attempts.length - 1], attempts, warnings: res2.warnings };
+                } catch (e2) {
+                  // Second canonical rejection: deterministic FINAL
+                  // validation identity — the second code is the
+                  // terminal defect; REASK:<initial> stays durable.
+                  const rawCode2 =
+                    e2 &&
+                    typeof e2 === "object" &&
+                    typeof (e2 as { code?: unknown }).code === "string"
+                      ? (e2 as { code: string }).code
+                      : "";
+                  const coded2 =
+                    rawCode2.length > 0 &&
+                    rawCode2.length <= 80 &&
+                    SAFE_CODE_RE.test(rawCode2)
+                      ? `VALIDATION_CODE:${rawCode2}`
+                      : null;
+                  settle({
+                    ...base,
+                    completed_at: now(),
+                    latency_ms: Date.now() - t0,
+                    outcome: "FAILED",
+                    failure_class: PLANNER_FAILURE_CLASS.PLAN_INVALID,
+                    warnings: boundedAttemptWarnings([
+                      ...res.warnings,
+                      ...res2.warnings,
+                      ...(coded2 ? [coded2] : []),
+                      `REASK:${reaskCode}`,
+                      "CANONICAL_VALIDATION_FAILED",
+                    ]),
+                  });
+                  continue;
+                }
+              }
+              settle({
+                ...base,
+                completed_at: now(),
+                latency_ms: Date.now() - t0,
+                outcome: "FAILED",
+                failure_class: classifyPlannerFailure(res2.warnings),
+                warnings: boundedAttemptWarnings([
+                  ...res.warnings,
+                  ...res2.warnings,
+                  `REASK:${reaskCode}`,
+                ]),
+              });
+              continue;
+              }
+            }
+          }
           settle({
             ...base,
             completed_at: now(),
@@ -342,13 +577,18 @@ export async function runPlannerFailover(opts: {
     } catch (e) {
       // Integrity/authority failures are not failover-eligible — settle
       // the STARTED row to terminal FAILED, then propagate (R3 §5/§6).
+      // A re-ask already durably initiated keeps its marker on the row.
+      const reaskMarker = reaskInitiated ? [`REASK:${reaskInitiated}`] : [];
       if (e instanceof IntegrityError) {
         settle({
           ...base,
           completed_at: now(),
           latency_ms: Date.now() - t0,
           outcome: "FAILED",
-          warnings: [`AUTHORITY_REJECTED:${String(e.code ?? "IntegrityError").slice(0, 80)}`],
+          warnings: boundedAttemptWarnings([
+            `AUTHORITY_REJECTED:${String(e.code ?? "IntegrityError").slice(0, 80)}`,
+            ...reaskMarker,
+          ]),
         });
         throw e;
       }
@@ -358,7 +598,10 @@ export async function runPlannerFailover(opts: {
         latency_ms: Date.now() - t0,
         outcome: "FAILED",
         failure_class: PLANNER_FAILURE_CLASS.NETWORK_ERROR,
-        warnings: [String(e instanceof Error ? e.name : e).slice(0, 80)],
+        warnings: boundedAttemptWarnings([
+          String(e instanceof Error ? e.name : e).slice(0, 80),
+          ...reaskMarker,
+        ]),
       });
     }
   }

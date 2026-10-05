@@ -516,7 +516,42 @@ describe("PRV2-B R2 — a mandatory bounded constraint may not be silently dropp
 /* ------------------------------ failover ------------------------------ */
 
 describe("PRV2-B failover", () => {
-  it("J — candidate#1 incomplete fails typed; candidate#2 wins", async () => {
+  it("J — candidate#1 incomplete fails typed; ONE feedback re-ask, then candidate#2 wins", async () => {
+    const candidates = [
+      { ref: "c1", provider: "p", model_entry_id: "m1", model: "m1", transport: "http" },
+      { ref: "c2", provider: "p", model_entry_id: "m2", model: "m2", transport: "http" },
+    ] as never[];
+    const canonFn = makeServeCanonicalizer({ executorCapSets: () => FULL_SETS });
+    let call = 0;
+    const res = await runPlannerFailover({
+      candidates,
+      assertEligible: () => {},
+      planFn: async () => {
+        call++;
+        return {
+          // P-REASK: candidate#1's corrected re-ask (call 2) still omits
+          // the third obligation — a second typed rejection is terminal
+          // for the candidate, failover proceeds to c2.
+          tasks:
+            call === 1 || call === 2
+              ? TASKS_3OBL.slice(0, 2) // missing "propose 3 strategies"
+              : TASKS_3OBL,
+          warnings: [],
+        };
+      },
+      canonicalize: (tasks) => canonFn(tasks, GOAL_3OBL),
+    });
+    expect(res.attempts).toHaveLength(2);
+    expect(res.attempts[0].outcome).toBe("FAILED");
+    expect(res.attempts[0].failure_class).toBe("PLAN_INVALID");
+    expect(res.attempts[0].warnings.join("|")).toContain(
+      "REASK:FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+    expect(res.winner?.route).toBe("c2");
+    expect(res.tasks.length).toBe(4);
+  });
+
+  it("J2 — the SAME candidate self-corrects on the ONE re-ask and wins", async () => {
     const candidates = [
       { ref: "c1", provider: "p", model_entry_id: "m1", model: "m1", transport: "http" },
       { ref: "c2", provider: "p", model_entry_id: "m2", model: "m2", transport: "http" },
@@ -531,17 +566,20 @@ describe("PRV2-B failover", () => {
         return {
           tasks:
             call === 1
-              ? TASKS_3OBL.slice(0, 2) // missing "propose 3 strategies"
-              : TASKS_3OBL,
+              ? TASKS_3OBL.slice(0, 2)
+              : TASKS_3OBL, // corrected on the re-ask
           warnings: [],
         };
       },
       canonicalize: (tasks) => canonFn(tasks, GOAL_3OBL),
     });
-    expect(res.attempts).toHaveLength(2);
-    expect(res.attempts[0].outcome).toBe("FAILED");
-    expect(res.attempts[0].failure_class).toBe("PLAN_INVALID");
-    expect(res.winner?.route).toBe("c2");
+    // One attempt row: c1's re-ask fixed the coverage defect — c2 never ran.
+    expect(res.attempts).toHaveLength(1);
+    expect(res.attempts[0].outcome).toBe("SUCCESS");
+    expect(res.attempts[0].warnings.join("|")).toContain(
+      "REASK_SUCCEEDED:FAIL_CLOSED_PLAN_INCOMPLETE",
+    );
+    expect(res.winner?.route).toBe("c1");
     expect(res.tasks.length).toBe(4);
   });
 });

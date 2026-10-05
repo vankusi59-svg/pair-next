@@ -147,6 +147,77 @@ export function persistPlannerAttemptStart(
   });
 }
 
+/** P-REASK R4 — durable PAIR-initiated re-ask provenance: the STARTED
+ *  attempt row records `REASK:<code>` BEFORE the second model invocation
+ *  so a crash mid-re-ask can never make the second request silently
+ *  absent. Same row, never a second planner_attempt; a STARTED→STARTED
+ *  event preserves the initiation order. The marker survives inside the
+ *  bounded ≤10 warning set (REASK:* is a protected family). */
+export function markPlannerAttemptReask(
+  store: PairEvidenceStore,
+  args: {
+    planner_attempt_id: string;
+    validation_code: string;
+    actor?: string;
+  },
+): void {
+  // P-REASK R1.C — fail closed: a second model invocation must never
+  // proceed when durable REASK provenance cannot be established. The
+  // thrown codes are governance-class `FAIL_CLOSED_PLANNER_*`, which the
+  // P-REASK prefix allowlist does NOT cover — a persistence failure can
+  // never recurse into another re-ask.
+  const code = String(args.validation_code ?? "");
+  if (!code.length || code.length > 80 || !/^[A-Z0-9_:.\-]+$/.test(code)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_REASK_PROVENANCE:CODE",
+      `reask validation identity rejected for attempt ${String(args.planner_attempt_id)}`,
+    );
+  }
+  store.immediate(() => {
+    const row = store.tryGet(ATTEMPT_ENTITY, args.planner_attempt_id);
+    if (!row) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_REASK_PROVENANCE:MISSING",
+        `no durable planner_attempt row for ${String(args.planner_attempt_id)}`,
+      );
+    }
+    if (row.outcome !== "STARTED") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_REASK_PROVENANCE:OUTCOME",
+        `planner_attempt ${String(args.planner_attempt_id)} outcome=${String(row.outcome)} — re-ask only on STARTED`,
+      );
+    }
+    const marker = `REASK:${code}`;
+    const warnings = Array.isArray(row.warnings)
+      ? [...(row.warnings as string[])]
+      : [];
+    if (!warnings.includes(marker)) {
+      warnings.push(marker);
+    }
+    store.put(
+      ATTEMPT_ENTITY,
+      args.planner_attempt_id,
+      { ...row, warnings: warnings.slice(0, 10) },
+      Number(row.version ?? 0),
+    );
+    store.event({
+      entity_type: ATTEMPT_ENTITY,
+      entity_id: args.planner_attempt_id,
+      event_type: "PLANNER_ATTEMPT_REASK_STARTED",
+      old_state: "STARTED",
+      new_state: "STARTED",
+      actor: args.actor ?? "PAIR_PLANNER",
+      metadata: {
+        planner_run_id: row.planner_run_id,
+        route: row.route,
+        model_entry_id: row.model_entry_id,
+        attempt_no: row.attempt_no,
+        validation_code: code,
+      },
+    });
+  });
+}
+
 /** Settle a STARTED attempt row to its final outcome — same row updated,
  *  never a duplicate row per invocation. */
 export function settlePlannerAttempt(
