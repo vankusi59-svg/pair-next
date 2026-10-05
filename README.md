@@ -19,9 +19,16 @@ pnpm test             # full deterministic suite
 
 ### Live governed stack
 
+Fresh host — three commands:
+
 ```bash
-scripts/start-pair-live.sh   # builds, starts server :8788, tunnel, telegram bridge
+bash scripts/pair-bootstrap.sh          # idempotent: installs missing node/pnpm/codex/dsh/cloudflared + builds
+#   ^ then fill the [MISS] secrets it prints (PAIR_TG_BOT_TOKEN or ~/pair-tg-token,
+#     provider API keys in env, 'codex login' once)
+scripts/start-pair-live.sh              # builds, starts server :8788, tunnel, telegram bridge
 ```
+
+`pair-bootstrap.sh --check` reports without changing anything.
 
 The serve script (`scripts/serve-mission-control.mjs`) wires the full stack: evidence store, governed gate, executor registry, mission router, planner (multi-provider DSH model routes: `PAIR_DSH_MODEL_ROUTE`, `PAIR_DSH_FALLBACK_ROUTE`, `PAIR_DSH_EXTRA_ROUTES`), business layer, credential broker, experience service.
 

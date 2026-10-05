@@ -1,0 +1,53 @@
+llm-pi-ai:
+  providers:
+    nvidia:
+      displayName: NVIDIA NIM
+      apiKeyEnv: NVIDIA_API_KEY
+      api: openai-completions
+      baseURL: https://integrate.api.nvidia.com/v1
+      models:
+      - id: z-ai/glm-5.3-flash
+        compat:
+          supportsStore: false
+      - id: z-ai/glm-5.3-flash-lite
+        compat:
+          supportsStore: false
+    cloudflare:
+      displayName: Cloudflare Workers AI
+      apiKeyEnv: CLOUDFLARE_API_TOKEN
+      api: openai-completions
+      baseURL: https://api.cloudflare.com/client/v4/accounts/1229b313e8c03caa03f1d181a1e7fd97/ai/v1
+      models:
+      - id: '@cf/zai-org/glm-4.7-flash'
+        compat:
+          supportsStore: false
+    groq:
+      displayName: Groq
+      apiKeyEnv: GROQ_API_KEY
+      api: openai-completions
+      baseURL: https://api.groq.com/openai/v1
+      models:
+      - id: openai/gpt-oss-20b
+        compat:
+          supportsStore: false
+    gemini:
+      displayName: Gemini
+      apiKeyEnv: GEMINI_API_KEY
+      api: openai-completions
+      baseURL: https://generativelanguage.googleapis.com/v1beta/openai
+      models:
+      - id: gemini-3.6-flash
+        compat:
+          supportsStore: false
+      - id: gemini-3.1-flash-lite
+        compat:
+          supportsStore: false
+    badq:
+      displayName: BADQ Recovery Test
+      apiKeyEnv: GROQ_API_KEY
+      api: openai-completions
+      baseURL: https://api.groq.com/openai/v1
+      models:
+      - id: openai/gpt-oss-20b
+        compat:
+          supportsStore: false
