@@ -22,6 +22,7 @@ CHECK_ONLY=0
 PAIR_HOME="${PAIR_HOME:-$HOME}"
 MC_DIR="${PAIR_MC_DIR:-$PAIR_HOME/pair-mc-live}"
 DSH_HOME="${PAIR_DSH_HOME:-$HOME/.pair-dsh-home}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 NODE_WANT_MAJOR=22
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -49,10 +50,17 @@ pi_ai_file() {
   local r; r="$(npm_root)"
   [ -n "$r" ] && printf '%s' "$r/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js"
 }
-dsh_installed() {
-  command -v dsh >/dev/null 2>&1 && return 0
-  local r; r="$(npm_root)"
-  [ -n "$r" ] && [ -d "$r/@deepseek-ai/dsh" ]
+dsh_pkg_dir() { local r; r="$(npm_root)"; [ -n "$r" ] && printf '%s' "$r/@deepseek-ai/dsh"; }
+dsh_pkg_present() { local d; d="$(dsh_pkg_dir)"; [ -n "$d" ] && [ -d "$d" ]; }
+dsh_bin_path() { command -v dsh 2>/dev/null; }
+# the binary PAIR will actually invoke must resolve INSIDE the pinned npm
+# package — a foreign `dsh` shadowing on PATH is a split-brain install.
+dsh_bin_real() { local b; b="$(dsh_bin_path)"; [ -n "$b" ] && realpath "$b" 2>/dev/null; }
+dsh_bound() {
+  local d b; d="$(dsh_pkg_dir)"; b="$(dsh_bin_real)"
+  [ -n "$d" ] && [ -n "$b" ] || return 1
+  case "$b" in "$d"/*) return 0;; esac
+  return 1
 }
 dsh_version() {
   local r; r="$(npm_root)"
@@ -65,12 +73,22 @@ patch_marker_present() {
 allow_file_ready() {
   local f="$MC_DIR/telegram-allow.json"
   [ -f "$f" ] || return 1
+  # bridge contract (telegram-bridge.mjs allowedChats): JSON array -> Set(String).
+  # ready = at least one integer chat id scalar; negative ids are valid
+  # (Telegram group/channel ids) — null/""/{}/placeholders are not.
   python3 - "$f" <<'PY' >/dev/null 2>&1
-import json,sys
+import json,re,sys
 try: d=json.load(open(sys.argv[1]))
 except Exception: sys.exit(1)
-if not isinstance(d,list) or not d: sys.exit(1)
-if any("PUT_YOUR" in str(x) for x in d): sys.exit(1)
+if not isinstance(d,list): sys.exit(1)
+def ok(x):
+    if isinstance(x,bool): return False
+    if isinstance(x,int): s=str(x)
+    elif isinstance(x,str): s=x.strip()
+    else: return False
+    if "PUT_YOUR" in s: return False
+    return re.fullmatch(r"-?\d+", s) is not None
+if not any(ok(x) for x in d): sys.exit(1)
 PY
 }
 token_ready() {
@@ -150,19 +168,25 @@ fi
 # --- dsh executor (pinned) -------------------------------------------------------
 NPM_ROOT_G="$(npm_root)"
 DSH_HAVE="$(dsh_version)"
-if dsh_installed && [ "$DSH_HAVE" = "$DSH_WANT" ]; then
-  have "dsh executor $DSH_HAVE"
+if dsh_bound && [ "$DSH_HAVE" = "$DSH_WANT" ]; then
+  have "dsh executor $DSH_HAVE ($(dsh_bin_path))"
 else
-  need "dsh executor @deepseek-ai/dsh@$DSH_WANT${DSH_HAVE:+ (have $DSH_HAVE)}"
+  if [ -n "$(dsh_bin_path)" ] && ! dsh_bound; then
+    need "dsh PATH binary resolves outside pinned package (split-brain: $(dsh_bin_real) vs $(dsh_pkg_dir))"
+  elif [ -z "$(dsh_bin_path)" ] && dsh_pkg_present; then
+    need "dsh binary not on PATH (pinned package present at $(dsh_pkg_dir))"
+  else
+    need "dsh executor @deepseek-ai/dsh@$DSH_WANT${DSH_HAVE:+ (have $DSH_HAVE)}"
+  fi
   if [ "$CHECK_ONLY" = "0" ]; then
     npm install -g "@deepseek-ai/dsh@$DSH_WANT" >/dev/null
     NPM_ROOT_G="$(npm_root)"
-    acted "dsh via npm -g ($(dsh_version))"
+    acted "dsh via npm -g ($(dsh_version)) — PATH binding re-checked in final state"
   fi
 fi
 
 # --- dsh gemini compat patch (fail-closed, marker-verified) -----------------------
-if dsh_installed; then
+if dsh_pkg_present; then
   if [ "$CHECK_ONLY" = "1" ]; then
     if patch_marker_present; then
       have "dsh gemini compat patch (marker verified)"
@@ -250,9 +274,9 @@ freq() { # freq "label" test...
 }
 node_ok() { command -v node >/dev/null 2>&1 && [ "$(node -v | sed 's/^v//;s/\..*//')" -ge 20 ]; }
 pnpm_ok() { [ "$(cd "$ROOT" && pnpm -v 2>/dev/null)" = "$PNPM_WANT" ]; }
-dsh_ok()  { dsh_installed && [ "$(dsh_version)" = "$DSH_WANT" ]; }
-patch_ok() { ! dsh_installed || patch_marker_present; }
-codex_auth_ok() { [ -f "$HOME/.codex/auth.json" ]; }
+dsh_ok()  { dsh_bound && [ "$(dsh_version)" = "$DSH_WANT" ]; }
+patch_ok() { ! dsh_pkg_present || patch_marker_present; }
+codex_auth_ok() { [ -f "${CODEX_HOME:-$HOME/.codex}/auth.json" ]; }
 env_set() { [ -n "${!1:-}" ]; }
 
 freq "node >= 20" node_ok
@@ -260,7 +284,7 @@ freq "pnpm@$PNPM_WANT" pnpm_ok
 repo_built() { [ -d "$ROOT/node_modules" ] && [ -d "$ROOT/dist" ]; }
 freq "repo build (node_modules + dist)" repo_built
 freq "codex CLI" command -v codex
-freq "codex auth (~/.codex/auth.json — 'codex login' once)" codex_auth_ok
+freq "codex auth ($CODEX_HOME/auth.json — 'codex login' once)" codex_auth_ok
 freq "dsh @deepseek-ai/dsh@$DSH_WANT" dsh_ok
 freq "dsh gemini compat patch" patch_ok
 freq "dsh settings.yaml" test -f "$DSH_SETTINGS"

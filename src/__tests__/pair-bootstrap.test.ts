@@ -14,6 +14,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -52,6 +53,7 @@ function piAiContent(kind: "patched" | "unpatched" | "broken"): string {
 interface Env {
   home: string;
   fakebin: string;
+  npmBin: string;
   npmRoot: string;
   log: string;
   env: NodeJS.ProcessEnv;
@@ -73,9 +75,11 @@ function mkEnv(o: Opts): Env {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "pair-boot-"));
   const fakebin = path.join(home, "fakebin");
   const npmRoot = path.join(home, "npm-global");
+  const npmBin = path.join(home, "npm-bin"); // npm global bin — separate PATH entry
   const log = path.join(home, "stub.log");
   fs.mkdirSync(fakebin, { recursive: true });
   fs.mkdirSync(npmRoot, { recursive: true });
+  fs.mkdirSync(npmBin, { recursive: true });
   const stub = (name: string, body: string) => {
     fs.writeFileSync(path.join(fakebin, name), `#!/bin/sh\n${body}`);
     fs.chmodSync(path.join(fakebin, name), 0o755);
@@ -97,7 +101,10 @@ case "$*" in
     mkdir -p "$STUB_NPM_ROOT/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api"
     printf '{"version":"0.2.0-rc.2"}' > "$STUB_NPM_ROOT/@deepseek-ai/dsh/package.json"
     if [ -n "$STUB_PI_AI_SRC" ]; then cp "$STUB_PI_AI_SRC" "$STUB_NPM_ROOT/${PI_AI_REL}"; fi
-    printf '#!/bin/sh\\nexit 0\\n' > "$STUB_FAKEBIN/dsh"; chmod +x "$STUB_FAKEBIN/dsh";;
+    mkdir -p "$STUB_NPM_ROOT/@deepseek-ai/dsh/bin"
+    printf '#!/bin/sh\\nexit 0\\n' > "$STUB_NPM_ROOT/@deepseek-ai/dsh/bin/dsh"
+    chmod +x "$STUB_NPM_ROOT/@deepseek-ai/dsh/bin/dsh"
+    ln -sf "$STUB_NPM_ROOT/@deepseek-ai/dsh/bin/dsh" "$STUB_NPM_BIN/dsh";;
 esac`);
 
   if (o.dshInstalled) {
@@ -111,7 +118,12 @@ esac`);
     if (kind !== "absent") {
       fs.writeFileSync(path.join(npmRoot, PI_AI_REL), piAiContent(kind));
     }
-    stub("dsh", "exit 0");
+    // binary lives inside the package; the npm bin dir links to it → bound install
+    fs.mkdirSync(path.join(npmRoot, "@deepseek-ai/dsh/bin"), { recursive: true });
+    const bin = path.join(npmRoot, "@deepseek-ai/dsh/bin/dsh");
+    fs.writeFileSync(bin, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(bin, 0o755);
+    fs.symlinkSync(bin, path.join(npmBin, "dsh"));
   }
   if (o.settingsYaml) {
     const dsh = path.join(home, ".pair-dsh-home");
@@ -139,9 +151,10 @@ esac`);
   }
 
   const env: NodeJS.ProcessEnv = {
-    PATH: `${fakebin}:/usr/bin:/bin`,
+    PATH: `${fakebin}:${npmBin}:/usr/bin:/bin`,
     HOME: home,
     STUB_NPM_ROOT: npmRoot,
+    STUB_NPM_BIN: npmBin,
     STUB_FAKEBIN: fakebin,
     STUB_LOG: log,
     STUB_PI_AI_SRC: "",
@@ -165,7 +178,7 @@ esac`);
     fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
     fs.writeFileSync(path.join(home, ".codex/auth.json"), "{}");
   }
-  return { home, fakebin, npmRoot, log, env };
+  return { home, fakebin, npmBin, npmRoot, log, env };
 }
 
 function run(e: Env, args: string[] = []): { code: number; out: string } {
@@ -185,7 +198,9 @@ function treeSnapshot(dir: string): string {
       const p = path.join(d, n);
       const st = fs.statSync(p);
       entries.push(
-        st.isDirectory() ? `d ${p}` : `f ${p} ${st.size} ${fs.readFileSync(p).toString("base64").length}`,
+        st.isDirectory()
+          ? `d ${p}`
+          : `f ${p} ${st.size} ${(st.mode & 0o777).toString(8)} ${crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")}`,
       );
       if (st.isDirectory()) walk(p);
     }
@@ -306,5 +321,63 @@ describe("pair-bootstrap.sh — R1 hardening", () => {
     expect(log).not.toContain("npm install");
     expect(log).not.toContain("corepack");
     expect(log).not.toContain("curl");
+  });
+
+  it("A-split: PATH dsh outside the pinned package = split-brain MISS, even in install", () => {
+    // prefix-A binary shadows PATH while the pinned package sits in prefix-B
+    const e = mkEnv({ dshInstalled: true, piAi: "patched", secrets: true });
+    const foreign = path.join(e.home, "other-prefix/bin/dsh");
+    fs.mkdirSync(path.dirname(foreign), { recursive: true });
+    fs.writeFileSync(foreign, "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(foreign, 0o755);
+    fs.symlinkSync(foreign, path.join(e.fakebin, "dsh"));
+    const rc = run(e, ["--check"]);
+    expect(rc.out).toMatch(/split-brain/);
+    expect(rc.out).toMatch(/\[MISS\] dsh @deepseek-ai\/dsh@0\.2\.0-rc\.2/);
+    expect(rc.code).not.toBe(0);
+    const ri = run(e); // install cannot fix PATH shadowing — must stay MISS
+    expect(ri.code).not.toBe(0);
+    expect(ri.out).toMatch(/\[MISS\] dsh @deepseek-ai\/dsh@0\.2\.0-rc\.2/);
+  });
+
+  it("CODEX_HOME honored: custom home auth passes; default-home auth does not leak", () => {
+    const e = mkEnv({ dshInstalled: true, piAi: "patched", secrets: true, settingsYaml: true, allow: "ready", cloudflared: true });
+    const custom = path.join(e.home, "custom-codex");
+    fs.mkdirSync(custom, { recursive: true });
+    e.env.CODEX_HOME = custom;
+    const rMiss = run(e, ["--check"]);
+    expect(rMiss.out).toMatch(/\[MISS\] codex auth/);
+    fs.writeFileSync(path.join(custom, "auth.json"), "{}");
+    const rOk = run(e, ["--check"]);
+    expect(rOk.out).toMatch(/\[ok\]   codex auth/);
+    expect(rOk.code).toBe(0);
+  });
+
+  it("C3: snapshot helper detects a same-size byte mutation", () => {
+    const e = mkEnv({});
+    const f = path.join(e.home, "m.txt");
+    fs.writeFileSync(f, "AAAA");
+    const s1 = treeSnapshot(e.home);
+    fs.writeFileSync(f, "BBBB"); // same size, different bytes
+    expect(treeSnapshot(e.home)).not.toBe(s1);
+  });
+
+  it("D3: allowlist readiness — [null], [\"\"], [{}], placeholder all MISS; negative id ok", () => {
+    for (const bad of ["[null]", '[""]', "[{}]", '["PUT_YOUR_TELEGRAM_CHAT_ID"]']) {
+      const e = mkEnv({ dshInstalled: true, piAi: "patched", secrets: true, settingsYaml: true, cloudflared: true });
+      const mc = path.join(e.home, "pair-mc-live");
+      fs.mkdirSync(mc, { recursive: true });
+      fs.writeFileSync(path.join(mc, "telegram-allow.json"), bad);
+      const r = run(e, ["--check"]);
+      expect(r.out).toMatch(/\[MISS\] telegram-allow\.json/);
+      expect(r.code).not.toBe(0);
+    }
+    const e = mkEnv({ dshInstalled: true, piAi: "patched", secrets: true, settingsYaml: true, cloudflared: true });
+    const mc = path.join(e.home, "pair-mc-live");
+    fs.mkdirSync(mc, { recursive: true });
+    fs.writeFileSync(path.join(mc, "telegram-allow.json"), '["-1001234567890"]\n'); // negative group id
+    const r = run(e, ["--check"]);
+    expect(r.out).not.toMatch(/\[MISS\] telegram-allow\.json/);
+    expect(r.code).toBe(0);
   });
 });
