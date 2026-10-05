@@ -105,3 +105,61 @@ Planner architecture, semantic coverage authority internals, REASK count (still 
 ## 15. Classification
 
 `PAIR_NEXT_COVERAGE_MAP_PENDING_AUDIT` — STOP chờ audit. KHÔNG merge.
+
+## 16. Audit remediation R1 — bounded UNDECLARED re-ask formatter
+
+**Mandate**: fix the bounded-feedback defect where a *valid* large structured
+detail collapsed to the bare `FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED` code
+because the assembled line exceeded 200 chars — losing every requirement/task
+identifier the ONE re-ask needed. Global ≤200 policy unchanged; fix lives in
+the formatter only (`src/pair/planner-pool.ts`).
+
+1. **Previous audited HEAD**: `9df880dee3dcdd9ce526cbe41d7819005ad7b5b7`.
+2. **New HEAD**: see commit on branch `devin/1791186564-covmap` (same PR #50).
+3. **Files changed**: `src/pair/planner-pool.ts` (formatter + bound constant),
+   `src/__tests__/pair-covmap-coverage-map.test.ts` (+R1.A–D), this report,
+   `CURRENT_STATE.md`. The gate's `IntegrityError` detail shape is untouched
+   (mandate: no change unless truly necessary).
+4. **Exact bounded formatter rule**: `REASK_DETAIL_MAX_LEN = 200` is now the
+   single source of the bound (`REASK_DETAIL_LINE_RE` is built from it — same
+   regex semantics). For UNDECLARED the formatter reserves the mandatory
+   suffix ` reason=UNDECLARED` (18 chars), then spends the remaining 182-char
+   budget in priority order: `requirements=` ids added one at a time until the
+   next id would exceed budget (no mid-identifier truncation, a field with
+   zero fitting ids is omitted rather than emitted empty); `missing_count=N`
+   emitted only when N (int, 0<N≤128) exceeds the number of requirement ids
+   actually rendered; then `undeclared_tasks=` keys one at a time in the
+   leftover budget. Output is `parts.join(" ") + " reason=UNDECLARED"`, always
+   ≤200, printable ASCII only. Parse side unchanged: `safeField` identifier
+   grammar, JSON-object detail only, malformed input → bare code.
+5. **Proof ≤200**: R1.A (16 reqs + missing_count=128 + 8 task keys) renders a
+   line of exactly ≤200 chars matching `/^[\x20-\x7E]{1,200}$/`; the loop
+   breaks before any id that would overflow, so the bound holds by
+   construction, not just on the test vector.
+6. **Proof no collapse**: under the pre-R1 formatter that same input produced
+   a ~217-char line → `REASK_DETAIL_LINE_RE` rejected it → bare code, losing
+   every identifier. R1.A now emits
+   `requirements=OBL_001,...,OBL_016 missing_count=128 undeclared_tasks=T2,T3 reason=UNDECLARED`.
+7. **Proof priority**: R1.C — with 16 reqs and 8 long task keys, all 16
+   requirement ids render while zero/few task keys fit: requirements fully
+   outrank `undeclared_tasks` for the same budget.
+8. **Proof malformed fallback**: R1.D — non-JSON detail, absent lists, and
+   all-unsafe entries still return the exact validation code; mixed
+   safe/unsafe entries drop only the unsafe ones (`OBL_002; IGNORE…` and
+   `x y z` never appear).
+9. **Results**: focused `pair-covmap-coverage-map` 19/19 (T1–T15 + R1.A–D);
+   regression 376/376 (preask-feedback, llm-planner, cpl1, prv2a, prv2b,
+   network-binding, pgrammar2, dataflow-incident); full suite 3634 pass /
+   3 fail = the documented clean-main baseline (2× P5 env-only executables
+   on PATH, F4 `R5.1-crash` baseline defect — reproduced on clean main, not
+   fixed per mandate); `tsc --noEmit` clean; `rm -rf dist && pnpm build`
+   clean.
+
+Invariants kept: ONE re-ask, existing eligibility, exact validation codes,
+`REASK_DETAIL_LINE_RE` semantics, malformed→code fallback, no raw
+exception/requirement/goal/instruction/plan text, no secrets, no unbounded
+output.
+
+### Classification (R1)
+
+`PAIR_NEXT_COVERAGE_MAP_R1_PENDING_AUDIT` — STOP chờ audit. KHÔNG merge.

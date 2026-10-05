@@ -104,7 +104,10 @@ export function boundedReaskTaskWarnings(warnings: string[]): string[] {
  *  over-budget falls back to the exact validation_code — never a truncated
  *  unsafe string. */
 const SAFE_REASK_FIELD_RE = /^[A-Za-z0-9_./-]{1,120}$/;
-const REASK_DETAIL_LINE_RE = /^[\x20-\x7E]{1,200}$/;
+/** Upper bound enforced by REASK_DETAIL_LINE_RE — formatters budget against
+ *  this exact number so the regex and the formatter can never drift apart. */
+const REASK_DETAIL_MAX_LEN = 200;
+const REASK_DETAIL_LINE_RE = new RegExp(`^[\\x20-\\x7E]{1,${REASK_DETAIL_MAX_LEN}}$`);
 
 const tryJsonObject = (s: string): Record<string, unknown> | null => {
   try {
@@ -177,20 +180,49 @@ export function extractReaskDetail(e: unknown, validationCode: string): string {
       const reqs = j ? safeList(j.requirements, 16) : [];
       const undeclared = j ? safeList(j.undeclared_tasks, 8) : [];
       const mc = j ? j.missing_count : undefined;
-      const parts: string[] = [];
-      if (reqs.length) parts.push(`requirements=${reqs.join(",")}`);
-      if (
-        typeof mc === "number" &&
-        Number.isInteger(mc) &&
-        mc > 0 &&
-        mc <= 128 &&
-        mc > reqs.length
-      ) {
-        parts.push(`missing_count=${mc}`);
-      }
-      if (undeclared.length) parts.push(`undeclared_tasks=${undeclared.join(",")}`);
       if (reqs.length || undeclared.length) {
-        out = `${parts.join(" ")} reason=UNDECLARED`;
+        // Bounded formatter: reserve the mandatory ` reason=UNDECLARED`
+        // suffix, then spend the remaining budget in priority order
+        // (requirements > missing_count > undeclared_tasks), adding
+        // identifiers one at a time so a valid large input degrades to a
+        // shorter-but-useful line instead of collapsing to the bare code.
+        const reasonSuffix = " reason=UNDECLARED";
+        const budget = REASK_DETAIL_MAX_LEN - reasonSuffix.length;
+        const parts: string[] = [];
+        let used = 0;
+        const appendCsvField = (label: string, values: string[]): number => {
+          let csv = "";
+          let rendered = 0;
+          for (const v of values) {
+            const next = csv ? `${csv},${v}` : v;
+            const cost = (used > 0 ? 1 : 0) + label.length + next.length;
+            if (used + cost > budget) break;
+            csv = next;
+            rendered++;
+          }
+          if (rendered > 0) {
+            parts.push(`${label}${csv}`);
+            used += (used > 0 ? 1 : 0) + label.length + csv.length;
+          }
+          return rendered;
+        };
+        const renderedReqs = appendCsvField("requirements=", reqs);
+        if (
+          typeof mc === "number" &&
+          Number.isInteger(mc) &&
+          mc > 0 &&
+          mc <= 128 &&
+          mc > renderedReqs
+        ) {
+          const token = `missing_count=${mc}`;
+          const cost = (used > 0 ? 1 : 0) + token.length;
+          if (used + cost <= budget) {
+            parts.push(token);
+            used += cost;
+          }
+        }
+        appendCsvField("undeclared_tasks=", undeclared);
+        if (parts.length) out = `${parts.join(" ")}${reasonSuffix}`;
       }
       break;
     }
