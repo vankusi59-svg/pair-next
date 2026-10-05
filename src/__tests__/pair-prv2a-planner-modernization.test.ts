@@ -286,7 +286,7 @@ describe("PRV2-A adaptive budget", () => {
 
   it("11. complex goal may exceed the previous 5-task total limit", () => {
     const goal =
-      "1. fetch BTC ETH prices 2. fetch gold XAU 3. draw comparison chart " +
+      "1. fetch BTC ETH prices from api.btc.example 2. fetch gold XAU 3. draw comparison chart " +
       "4. gather latest news 5. analyze correlation 6. write report.md " +
       "7. write summary.md and finally gửi báo cáo tới telegram, " +
       "và đề xuất cải tiến EA strategy";
@@ -314,8 +314,8 @@ describe("PRV2-A adaptive budget", () => {
         i ? [`T${i}`] : [],
         i === 0
           ? {
-              // goal names BTC/ETH identities → their labels authorize
-              // an external source host carrying them
+              // R3: the goal literally names api.btc.example → the
+              // locator host is operator-authorized (explicit-host only)
               network_requirement: {
                 source_kind: "EXTERNAL_SITE",
                 access_intent: "RESEARCH",

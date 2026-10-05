@@ -14,7 +14,8 @@
  *   requirement derivation → OPERATOR-side authorization check → governed
  *   capability binding → existing NETWORK gates → executor.
  *
- * R2 closes two authority blockers:
+ * R2 closes two authority blockers (R3 removed the identity channel —
+ * see below):
  *
  *  BLOCKER 1 — a planner declaration must never bootstrap capability.
  *    A structured requirement is SEMANTIC evidence ("task needs network"),
@@ -37,6 +38,17 @@
  *    stored mission — tasks already canonicalized before the field was
  *    mandatory) may keep the legacy instruction/goal detectors, and only
  *    tasks that provably lack the field.
+ *
+ * R3 closes the identity-authorization over-grant: operator-side
+ *   authorization now derives ONLY from an explicit hostname/URL the
+ *   operator goal literally writes. NO entity→hostname channel exists:
+ *   no proper-noun / ALL-CAPS / camelCase / digit tokens, no
+ *   label-membership matching (`mql5` in the goal NEVER authorizes
+ *   `mql5.attacker.example`). A goal naming `mql5.com` authorizes
+ *   `mql5.com` and its subdomains on DNS-label boundaries
+ *   (`api.mql5.com` ✓; `mql5.attacker.example`, `evil-mql5.com`,
+ *   `mql5.com.evil.org` ✗). Naming a subdomain authorizes only that
+ *   subdomain and below — least authority, no sibling/parent widening.
  *
  * Planner field contract (sanitizePlan, shared by every transport):
  *   top-level `network_requirement` is authoritative; a legacy
@@ -102,6 +114,68 @@ const HOST_SHAPE_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i;
 
 const stripWww = (h: string): string => h.replace(/^www\./i, "");
 
+/* ---------------- goal-side explicit-host extraction (R3) ---------------- */
+
+/** Strict DNS label: 1–63 chars, alnum + interior hyphens only. */
+const DNS_LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
+/** Bare dotted token (not URL-adjacent: no scheme/slash/dot/word char at
+ *  either edge). Ambiguous by nature — it can equally be a hostname or a
+ *  file name — so `bareTokenHost` decides conservatively. */
+const BARE_DOTTED_RE = new RegExp(
+  `(?<![\\w/.-])${DNS_LABEL}(?:\\.${DNS_LABEL})+(?![\\w/.-])`,
+  "gi",
+);
+
+/** Filename-shaped final labels — a bounded FILENAME-syntax denylist, NOT
+ *  a TLD allowlist. This is the mandated "structural rule that does not
+ *  turn ordinary filenames into authority": a bare dotted token whose
+ *  last label is a ubiquitous file extension (`math.txt`, `config.json`,
+ *  `data.csv`) is treated as a file name, not an authorized host. The
+ *  fail direction is DENY — a genuine host ending in one of these labels
+ *  is simply not operator-authorized (fail-closed). Unlisted extensions
+ *  still resolve as hosts — bounded residual, disclosed in the report. */
+const FILE_EXTENSION_LABELS = new Set([
+  "txt", "md", "markdown", "rst", "log", "json", "jsonl", "csv", "tsv",
+  "xml", "yaml", "yml", "toml", "ini", "cfg", "conf", "properties",
+  "env", "lock", "tmp", "temp", "bak", "dat", "diff", "patch",
+  "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods",
+  "odp", "rtf", "tex", "epub", "html", "htm", "css",
+  "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "java", "c", "h",
+  "cpp", "hpp", "cs", "go", "rs", "rb", "php", "pl", "sh", "bash",
+  "zsh", "bat", "ps1", "sql", "lua", "r", "swift", "kt", "scala",
+  "ex", "exs", "erl", "hs", "mq4", "mq5", "mqh", "ex4", "ex5",
+  "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tif",
+  "tiff", "mp3", "wav", "ogg", "flac", "mp4", "mov", "avi", "mkv",
+  "webm", "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar",
+  "jar", "war", "apk", "dmg", "iso", "img", "exe", "dll", "so",
+  "dylib", "bin", "elf", "msi", "deb", "rpm", "db", "sqlite",
+  "sqlite3", "mdb", "dump", "wasm", "map",
+]);
+
+/** Is a bare dotted token a GOAL-NAMED HOST (not a filename)? Structural,
+ *  context-free, fail-closed:
+ *   - every label must be a strict DNS label;
+ *   - the final label must contain a letter (kills `1.2`, `192.168.1.1`);
+ *   - the final label must not be a filename extension (`math.txt`,
+ *     `report.csv` never authorize network access).
+ *  Anything ambiguous resolves to null — the operator grants nothing. */
+function bareTokenHost(token: string): string | null {
+  const t = token.toLowerCase();
+  if (t.length > 253) return null;
+  const labels = t.split(".");
+  if (labels.length < 2) return null;
+  for (const l of labels) {
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(l)) return null;
+  }
+  const last = labels[labels.length - 1] as string;
+  if (!/[a-z]/.test(last)) return null;
+  if (FILE_EXTENSION_LABELS.has(last)) return null;
+  const h = stripWww(t);
+  // after www-strip the remainder must still be a dotted host
+  if (!h.includes(".")) return null;
+  return h;
+}
+
 /** Extract the hostname a locator resolves to — TLD-free syntactic
  *  classification: `scheme://host[/…]`, `www.host[…]`, or a bare
  *  dotted-host first segment (`mql5.com/en/market` → `mql5.com`).
@@ -129,7 +203,8 @@ export function isUnambiguousExternalLocator(locator: string): boolean {
 /** Syntactic external-source shape: a scheme URL, a www. host, or a bare
  *  host the goal itself names. Replaces the former hard-coded public TLD
  *  list — a bare `report.txt`/`config.yaml` token is NOT external even
- *  though it carries a dot, unless the goal literally names it as a host. */
+ *  though it carries a dot, unless the goal literally names that host
+ *  (exact or label-boundary subdomain, per `goalAuthorizesHost`). */
 export function isExternalShapedLocator(
   locator: string,
   goalHosts?: ReadonlySet<string>,
@@ -137,7 +212,9 @@ export function isExternalShapedLocator(
   const s = String(locator ?? "").trim();
   if (isUnambiguousExternalLocator(s)) return true;
   const h = requirementLocatorHost(s);
-  return h !== null && goalHosts !== undefined && goalHosts.has(h);
+  return (
+    h !== null && goalHosts !== undefined && goalAuthorizesHost(h, goalHosts)
+  );
 }
 
 /** Syntactic host extraction from the operator goal — the canonical
@@ -157,57 +234,35 @@ export function extractGoalHosts(goal: string): Set<string> {
       if (seg) hosts.add(seg);
     }
   }
-  for (const m of g.matchAll(/(?<![\w/.-])[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+(?![\w/.-])/g)) {
-    hosts.add(stripWww(m[0].toLowerCase()));
+  for (const m of g.matchAll(BARE_DOTTED_RE)) {
+    const h = bareTokenHost(m[0]);
+    if (h) hosts.add(h);
   }
   return hosts;
 }
 
-/** Identity tokens — a proper-noun-shaped word the goal names (contains
- *  a digit or an uppercase letter, so common lowercase nouns like
- *  "price"/"models" never qualify): "MQL5", "GPT", "OpenAI", "Stripe",
- *  "MT5". When the operator names an external entity, the planner's
- *  normalization of that entity into a host ("mql5.com") stays
- *  operator-authorized; a locator for a different entity never is. */
-export function extractGoalIdentities(goal: string): Set<string> {
-  const ids = extractGoalHosts(goal);
-  for (const m of String(goal ?? "").matchAll(
-    /(?<![\w/.-])[a-zA-Z0-9][a-zA-Z0-9-]{1,31}(?![\w/.-])/g,
-  )) {
-    const tok = m[0];
-    // Proper-noun shape: a digit, an uppercase letter past position 0
-    // (camelCase brand "OpenAI"), or ≥2 ALL-CAPS letters ("GPT", "EA").
-    // Plain lowercase nouns and sentence-initial capitals never qualify.
-    const letters = (tok.match(/[a-zA-Z]/g) ?? []).length;
-    const allCaps = letters >= 2 && letters === (tok.match(/[A-Z]/g) ?? []).length;
-    if (/[0-9]/.test(tok) || /[A-Z]/.test(tok.slice(1)) || allCaps) {
-      ids.add(tok.toLowerCase());
-    }
-  }
-  return ids;
-}
-
 /** Does the operator goal authorize external access to this host?
- *  Syntactic bindings, nothing else: exact host match, parent-domain
- *  containment either direction (goal names `mql5.com`, locator is
- *  `api.mql5.com` — or vice versa), or a host label equal to a
- *  goal-named IDENTITY token (goal says "MQL5" → `mql5.com` stays
- *  authorized; a locator for a different entity never is).
- *  No host/identity in the goal → nothing external is authorized. */
+ *  R3 final rule — exact match or DNS-label-boundary subdomain
+ *  containment against a host the goal LITERALLY names:
+ *    goal `mql5.com`      → allows `mql5.com`, `api.mql5.com`,
+ *                          `www.mql5.com` (www is normalized away);
+ *                          denies `mql5.attacker.example`,
+ *                          `foo.mql5.example`, `mql5.com.evil.org`,
+ *                          `evil-mql5.com`, `attacker-mql5.com`,
+ *                          `mql5com.example`.
+ *    goal `api.mql5.com`  → allows `api.mql5.com`, `x.api.mql5.com`;
+ *                          does NOT widen to the parent or sibling
+ *                          hosts — least authority.
+ *  No identity/label membership exists — an entity token in the goal is
+ *  never a hostname authorization. No host named → nothing external is
+ *  authorized. */
 export function goalAuthorizesHost(
   host: string,
-  goalIdentities: ReadonlySet<string>,
+  goalHosts: ReadonlySet<string>,
 ): boolean {
-  const labels = host.split(".");
-  for (const g of goalIdentities) {
-    if (
-      host === g ||
-      host.endsWith(`.${g}`) ||
-      g.endsWith(`.${host}`) ||
-      labels.includes(g)
-    ) {
-      return true;
-    }
+  const h = stripWww(String(host ?? "").toLowerCase());
+  for (const g of goalHosts) {
+    if (h === g || h.endsWith(`.${g}`)) return true;
   }
   return false;
 }
@@ -373,12 +428,14 @@ export type NetworkTaskResolution =
 export function resolveTaskNetworkAuthority(args: {
   req: NetworkRequirement | null;
   state: NetworkRequirementFieldState;
-  goalIdentities: ReadonlySet<string>;
+  /** Hosts the operator goal literally names (extractGoalHosts) — the
+   *  sole authorization surface. */
+  goalHosts: ReadonlySet<string>;
   /** true = fresh planner emission (structured contract mandatory);
    *  false = persisted plan provenance (legacy fallback allowed). */
   fresh: boolean;
 }): NetworkTaskResolution {
-  const { req, state, goalIdentities, fresh } = args;
+  const { req, state, goalHosts, fresh } = args;
   if (state === "malformed" || state === "conflict") {
     return {
       verdict: "INVALID",
@@ -411,7 +468,7 @@ export function resolveTaskNetworkAuthority(args: {
   if (!required) {
     return { verdict: "NOT_REQUIRED", authorized: false, reason: null, req };
   }
-  if (!networkRequirementOperatorAuthorized(req, goalIdentities)) {
+  if (!networkRequirementOperatorAuthorized(req, goalHosts)) {
     // Semantically required but the operator goal never authorized the
     // declared source — a planner declaration is never authorization.
     return {

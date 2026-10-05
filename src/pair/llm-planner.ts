@@ -16,7 +16,7 @@ import {
 } from "./plan-dataflow.js";
 import { extractGoalContract } from "./goal-contract.js";
 import {
-  extractGoalIdentities,
+  extractGoalHosts,
   NETWORK_REQUIREMENT_ERROR_KEY,
   networkRequirementFieldState,
   parseNetworkRequirementShape,
@@ -839,12 +839,14 @@ export function sanitizePlan(
  *  data-gatherer but forgot to declare NETWORK_ACCESS gets the capability
  *  added BEFORE the canonical network gates evaluate — instead of the plan
  *  dying on a model annotation omission. Eligibility requires ALL of:
- *  (a) the operator goal itself authorizes current/external data;
- *  (b) the task's own instruction is fetch-shaped (taskRequiresNetworkAccess);
- *  (c) it is real gathering work (instructionIsDataGathering);
- *  (d) its subject binds to the goal's subject (instructionSatisfiesGoalSubject);
- *  (e) NETWORK_ACCESS is in the planner's allowed vocabulary;
- *  (f) the repaired capability set stays jointly servable by ≥1 supplied
+ *  (a) the task carries a valid structured network_requirement that
+ *      semantically requires network (resolveTaskNetworkAuthority →
+ *      REQUIRED) — shared verdict with the canonical gate;
+ *  (b) the operator goal authorizes the declared source: the locator
+ *      host is an explicit hostname/URL the goal literally names
+ *      (exact or DNS-label-boundary subdomain — never an entity token);
+ *  (c) NETWORK_ACCESS is in the planner's allowed vocabulary;
+ *  (d) the repaired capability set stays jointly servable by ≥1 supplied
  *      executor capability set — never fabricates an unrunnable task.
  *  Anything else stays untouched and the canonical gates decide. Emits
  *  `REPAIRED_NETWORK_CAPABILITY:<task_key>` warnings; shared by llmPlan and
@@ -874,7 +876,7 @@ export function repairNetworkCapabilityBinding(
   // Missing/malformed/contradictory fields are left for the canonical
   // gate's typed rejection — this seam can never repair vocabulary-shaped
   // instructions on a fresh emission.
-  const goalIdentities = extractGoalIdentities(opts.goal);
+  const goalHosts = extractGoalHosts(opts.goal);
   const out = tasks.map((t) => {
     const caps = Array.isArray(t.required_capabilities)
       ? t.required_capabilities.map((c) => String(c))
@@ -884,7 +886,7 @@ export function repairNetworkCapabilityBinding(
     const res = resolveTaskNetworkAuthority({
       req: (md.network_requirement ?? null) as NetworkRequirement | null,
       state: networkRequirementFieldState(t),
-      goalIdentities,
+      goalHosts,
       fresh: true,
     });
     if (res.verdict !== "REQUIRED" || !res.authorized) return t;

@@ -1,5 +1,8 @@
 /**
  * R2 — NETWORK-requirement authority hardening (audit remediation).
+ *  (R3 removed the entity-identity channel — this file now exercises the
+ *  explicit-host-only authorization surface; R3 adversarial cases live
+ *  in pair-network-requirement-r3.test.ts.)
  *
  *  BLOCKER 1: a planner declaration can never bootstrap capability —
  *    EXTERNAL + locator not named by the operator goal → typed INVALID
@@ -18,7 +21,7 @@ import { llmPlan, repairNetworkCapabilityBinding } from "../pair/llm-planner.js"
 import { makeServeCanonicalizer } from "../pair/serve-planner.js";
 import { extractGoalContract } from "../pair/goal-contract.js";
 import {
-  extractGoalIdentities,
+  extractGoalHosts,
   isExternalShapedLocator,
   networkRequirementInternalContradiction,
   parseNetworkRequirementShape,
@@ -237,7 +240,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       "mql5.com にアクセスして最新のEAデータを収集し、outbox/r.txt に保存する。",
     ];
     for (const goal of goals) {
-      const hosts = extractGoalIdentities(goal);
+      const hosts = extractGoalHosts(goal);
       expect(hosts.has("mql5.com")).toBe(true); // language-free syntactic extraction
       const tasks = [
         taskWithReq(
@@ -264,7 +267,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       const res = resolveTaskNetworkAuthority({
         req: EXT_REQ,
         state: "valid",
-        goalIdentities: extractGoalIdentities(goal),
+        goalHosts: extractGoalHosts(goal),
         fresh: true,
       });
       expect(res).toMatchObject({ verdict: "INVALID", reason: "UNAUTHORIZED_SOURCE" });
@@ -427,7 +430,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     const res = resolveTaskNetworkAuthority({
       req: unknownReq,
       state: "valid",
-      goalIdentities: new Set(),
+      goalHosts: new Set(),
       fresh: true,
     });
     expect(res.verdict).toBe("NOT_REQUIRED");
@@ -461,7 +464,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     // Arbitrary dotted hosts are never looked up in a TLD vocabulary:
     // they authorize iff the goal itself names them.
     const goal = "Truy cập data.portal-xk.example123 và lưu kết quả vào outbox/d.txt.";
-    const hosts = extractGoalIdentities(goal);
+    const hosts = extractGoalHosts(goal);
     expect(hosts.has("data.portal-xk.example123")).toBe(true);
     const req: NetworkRequirement = {
       source_kind: "EXTERNAL_SITE",
@@ -472,7 +475,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     const res = resolveTaskNetworkAuthority({
       req,
       state: "valid",
-      goalIdentities: hosts,
+      goalHosts: hosts,
       fresh: true,
     });
     expect(res).toMatchObject({ verdict: "REQUIRED", authorized: true });
@@ -489,6 +492,9 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     // a bare dotted token is external-shaped ONLY when the goal names it
     expect(isExternalShapedLocator("report.txt", hosts)).toBe(false);
     expect(isExternalShapedLocator("report.txt", new Set(["report.txt"]))).toBe(true);
+    // and a goal-named host authorizes its label-boundary subdomains
+    expect(isExternalShapedLocator("api.report.example", new Set(["report.example"]))).toBe(true);
+    expect(isExternalShapedLocator("report.example.attacker.org", new Set(["report.example"]))).toBe(false);
     expect(isExternalShapedLocator("https://anything.example", new Set())).toBe(true);
   });
 
@@ -554,7 +560,7 @@ describe("R1 invariants retained under R2", () => {
         source_locator: "something.example",
       },
       state: "valid",
-      goalIdentities: new Set(),
+      goalHosts: new Set(),
       fresh: true,
     });
     expect(res).toMatchObject({ verdict: "INVALID", reason: "LOCATOR_WITHOUT_SOURCE" });

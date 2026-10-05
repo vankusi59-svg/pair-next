@@ -1,7 +1,8 @@
 /**
  * NETWORK binding repair — R2 semantics: a task is repaired only when its
  * canonical structured `network_requirement` is semantically REQUIRED AND
- * operator-authorized by the goal (host or identity the goal names), with
+ * operator-authorized by the goal (a hostname/URL the goal literally
+ * names — R3: no entity-token authorization), with
  * NETWORK_ACCESS allowed and the repaired capability set jointly servable.
  * One shared helper post-sanitize on BOTH planner transports; the canonical
  * network gate stays authoritative.
@@ -21,7 +22,7 @@ import { makeServeCanonicalizer } from "../pair/serve-planner.js";
 import { IntegrityError } from "../pair/errors.js";
 
 const GOAL_NET =
-  "Nghiên cứu thị trường MQL5 hiện tại để tìm một cơ hội EA MT5 có tiềm năng thương mại tốt.";
+  "Nghiên cứu thị trường mql5.com hiện tại để tìm một cơ hội EA MT5 có tiềm năng thương mại tốt.";
 const GOAL_LOCAL = "Analyze historical XAUUSD data and backtest an EA.";
 
 /** Executor capability universe: one executor serving network+reasoning work. */
@@ -197,7 +198,7 @@ process.stdin.on("end", () => {
       workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], undefined, REQ_MQL5),
     ];
     const r = repairNetworkCapabilityBinding(tasks, {
-      goal: GOAL_LOCAL, // XAUUSD — no mql5 host/identity
+      goal: GOAL_LOCAL, // XAUUSD — no mql5 host
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
@@ -249,7 +250,7 @@ process.stdin.on("end", () => {
       ),
     ];
     const r = repairNetworkCapabilityBinding(tasks, {
-      goal: GOAL_NET, // MQL5/EA subject — btc.example is unauthorized
+      goal: GOAL_NET, // names mql5.com — btc.example is unauthorized
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });

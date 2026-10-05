@@ -37,7 +37,7 @@ import {
   instructionSatisfiesGoalSubject,
 } from "./llm-planner.js";
 import {
-  extractGoalIdentities,
+  extractGoalHosts,
   FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
   networkRequirementFieldState,
   resolveTaskNetworkAuthority,
@@ -216,13 +216,13 @@ export function makeServeCanonicalizer(deps: {
     // planner transport is fresh by default; only the stored
     // `metadata.llm_plan` path marks persisted.
     const netFresh = ctx?.provenance !== "persisted";
-    const netGoalIdentities = extractGoalIdentities(goal);
+    const netGoalHosts = extractGoalHosts(goal);
     const taskNetRes = (t: Record<string, unknown>) =>
       resolveTaskNetworkAuthority({
         req: ((t.metadata as Record<string, unknown> | undefined)
           ?.network_requirement ?? null) as NetworkRequirement | null,
         state: networkRequirementFieldState(t),
-        goalIdentities: netGoalIdentities,
+        goalHosts: netGoalHosts,
         fresh: netFresh,
       });
     for (const t of tasks) {
