@@ -73,21 +73,28 @@ patch_marker_present() {
 allow_file_ready() {
   local f="$MC_DIR/telegram-allow.json"
   [ -f "$f" ] || return 1
-  # bridge contract (telegram-bridge.mjs allowedChats): JSON array -> Set(String).
-  # ready = at least one integer chat id scalar; negative ids are valid
-  # (Telegram group/channel ids) — null/""/{}/placeholders are not.
+  # bridge contract (telegram-bridge.mjs allowedChats): JSON array -> Set(String),
+  # incoming id compared via String(chatId). ready = at least one entry whose
+  # String() representation IS the canonical Telegram chat-id the bridge will
+  # match: -?[1-9]\d*  (no whitespace, no leading zeros, no 0/-0). Negative
+  # group/channel ids (-100…) are valid. JSON numeric entries must be safe
+  # integers — Node String(>2^53) would print an imprecise decimal.
   python3 - "$f" <<'PY' >/dev/null 2>&1
 import json,re,sys
 try: d=json.load(open(sys.argv[1]))
 except Exception: sys.exit(1)
 if not isinstance(d,list): sys.exit(1)
+MAX_SAFE=2**53-1
 def ok(x):
     if isinstance(x,bool): return False
-    if isinstance(x,int): s=str(x)
-    elif isinstance(x,str): s=x.strip()
+    if isinstance(x,int):
+        if x==0 or abs(x)>MAX_SAFE: return False
+        s=str(x)
+    elif isinstance(x,str):
+        s=x  # no strip: " 123 " is not the canonical id String(chatId) produces
     else: return False
     if "PUT_YOUR" in s: return False
-    return re.fullmatch(r"-?\d+", s) is not None
+    return re.fullmatch(r"-?[1-9]\d*", s) is not None
 if not any(ok(x) for x in d): sys.exit(1)
 PY
 }

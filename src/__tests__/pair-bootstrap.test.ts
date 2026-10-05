@@ -362,22 +362,39 @@ describe("pair-bootstrap.sh — R1 hardening", () => {
     expect(treeSnapshot(e.home)).not.toBe(s1);
   });
 
-  it("D3: allowlist readiness — [null], [\"\"], [{}], placeholder all MISS; negative id ok", () => {
-    for (const bad of ["[null]", '[""]', "[{}]", '["PUT_YOUR_TELEGRAM_CHAT_ID"]']) {
-      const e = mkEnv({ dshInstalled: true, piAi: "patched", secrets: true, settingsYaml: true, cloudflared: true });
-      const mc = path.join(e.home, "pair-mc-live");
-      fs.mkdirSync(mc, { recursive: true });
-      fs.writeFileSync(path.join(mc, "telegram-allow.json"), bad);
-      const r = run(e, ["--check"]);
-      expect(r.out).toMatch(/\[MISS\] telegram-allow\.json/);
-      expect(r.code).not.toBe(0);
-    }
+  const allowCase = (json: string) => {
     const e = mkEnv({ dshInstalled: true, piAi: "patched", secrets: true, settingsYaml: true, cloudflared: true });
     const mc = path.join(e.home, "pair-mc-live");
     fs.mkdirSync(mc, { recursive: true });
-    fs.writeFileSync(path.join(mc, "telegram-allow.json"), '["-1001234567890"]\n'); // negative group id
-    const r = run(e, ["--check"]);
-    expect(r.out).not.toMatch(/\[MISS\] telegram-allow\.json/);
-    expect(r.code).toBe(0);
+    fs.writeFileSync(path.join(mc, "telegram-allow.json"), json);
+    return run(e, ["--check"]);
+  };
+
+  it("D3: allowlist canonical identity — non-id shapes MISS, canonical ids PASS", () => {
+    for (const bad of ["[null]", '[""]', "[{}]", '["PUT_YOUR_TELEGRAM_CHAT_ID"]']) {
+      const r = allowCase(bad);
+      expect(r.out).toMatch(/\[MISS\] telegram-allow\.json/);
+      expect(r.code).not.toBe(0);
+    }
+    for (const good of ['["-1001234567890"]', '["12345"]', "[12345]", "[-1001234567890]", '[null,"12345"]']) {
+      const r = allowCase(good);
+      expect(r.out).not.toMatch(/\[MISS\] telegram-allow\.json/);
+      expect(r.code).toBe(0);
+    }
+  });
+
+  it("D4: allowlist rejects non-canonical ids — whitespace, leading zeros, zero, unsafe int", () => {
+    // bridge does Set(String(x)) vs String(chatId): these never match a real id
+    for (const bad of [
+      '[" 12345 "]',   // whitespace-padded
+      '["0012345"]',   // leading zero
+      '["-00123"]',    // negative leading zero
+      '["0"]', "[0]", '["-0"]',
+      "[9007199254740993]", // > Number.MAX_SAFE_INTEGER — String() prints imprecise decimal
+    ]) {
+      const r = allowCase(bad);
+      expect(r.out).toMatch(/\[MISS\] telegram-allow\.json/);
+      expect(r.code).not.toBe(0);
+    }
   });
 });
