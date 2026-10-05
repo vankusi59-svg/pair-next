@@ -76,6 +76,7 @@ const out = outIdx >= 0 ? argv[outIdx + 1] : null;
 const pidFile = process.env.FAKE_CODEX_PIDFILE;
 if (pidFile) fs.writeFileSync(pidFile, String(process.pid));
 const b = process.env.FAKE_CODEX_BEHAVIOR || "ok";
+const LOCAL_REQ = { source_kind: "LOCAL", access_intent: "READ", freshness: "NOT_REQUIRED" };
 let prompt = "";
 process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
@@ -112,14 +113,14 @@ process.stdin.on("end", () => {
     // consumer reads an artifact nobody produces → canonicalize FAIL_CLOSED
     fs.writeFileSync(out, JSON.stringify({ tasks: [
       { task_key: "T1", title: "record", task_instruction: "write goal to mission_goal.txt then reply DONE.", required_capabilities: ["AUTOMATON_TASK_EXECUTION"], depends_on: [] },
-      { task_key: "T2", title: "consume", task_instruction: "read missing_input.json and analyze it then reply DONE.", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+      { task_key: "T2", title: "consume", task_instruction: "read missing_input.json and analyze it then reply DONE.", required_capabilities: ["REASONING"], depends_on: ["T1"], network_requirement: LOCAL_REQ },
     ] }));
     process.exit(0);
   }
   // ok — valid two-task plan
   fs.writeFileSync(out, JSON.stringify({ tasks: [
     { task_key: "T1", title: "record goal", task_instruction: "write the goal to mission_goal.txt then reply DONE.", required_capabilities: ["AUTOMATON_TASK_EXECUTION"], depends_on: [] },
-    { task_key: "T2", title: "analyze", task_instruction: "analyze BTC data and write note.txt then reply DONE.", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+    { task_key: "T2", title: "analyze", task_instruction: "analyze BTC data and write note.txt then reply DONE.", required_capabilities: ["REASONING"], depends_on: ["T1"], network_requirement: LOCAL_REQ },
   ] }));
   process.exit(0);
 });
@@ -280,7 +281,7 @@ async function runPool(opts: {
           : (geminiCalls.push(1), (opts.geminiPlan ?? (async () => ({
               tasks: [
                 { task_key: "T1", title: "g", task_instruction: "write goal to mission_goal.txt then reply DONE.", required_capabilities: ["AUTOMATON_TASK_EXECUTION"], depends_on: [] },
-                { task_key: "T2", title: "g2", task_instruction: "write note.txt then reply DONE.", required_capabilities: ["REASONING"], depends_on: ["T1"] },
+                { task_key: "T2", title: "g2", task_instruction: "write note.txt then reply DONE.", required_capabilities: ["REASONING"], depends_on: ["T1"], metadata: { network_requirement: { source_kind: "LOCAL", access_intent: "READ", freshness: "NOT_REQUIRED" } } },
               ],
               warnings: [],
             })))()),

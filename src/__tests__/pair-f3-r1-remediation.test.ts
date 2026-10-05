@@ -113,6 +113,14 @@ const noopCompute = {
 const df = (produces: string[] = [], consumes: string[] = []) => ({
   pair_dataflow: { produces, consumes },
 });
+/** R2 — replan emissions are fresh: every work task carries a valid
+ *  structured network requirement (LOCAL — these fixtures never involve
+ *  network authority). */
+const NETREQ_LOCAL = {
+  source_kind: "LOCAL",
+  access_intent: "READ",
+  freshness: "NOT_REQUIRED",
+};
 const task = (
   key: string,
   caps: string[],
@@ -125,7 +133,7 @@ const task = (
   task_instruction: instruction,
   required_capabilities: caps,
   depends_on: deps,
-  metadata,
+  metadata: { network_requirement: NETREQ_LOCAL, ...metadata },
 });
 const incidentPlan = () => ({
   tasks: [

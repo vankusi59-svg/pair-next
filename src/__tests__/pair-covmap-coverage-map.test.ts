@@ -33,6 +33,15 @@ const canon = (raw: Array<Record<string, unknown>>, goal: string) =>
 const UNDECLARED = "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED";
 const INCOMPLETE = "FAIL_CLOSED_PLAN_INCOMPLETE";
 
+/** R2 — every fresh work task carries a valid structured network
+ *  requirement (LOCAL by default; these fixtures test coverage, not
+ *  network authority). */
+const NETREQ_LOCAL = {
+  source_kind: "LOCAL",
+  access_intent: "READ",
+  freshness: "NOT_REQUIRED",
+} as const;
+
 const work = (
   key: string,
   instruction: string,
@@ -46,7 +55,7 @@ const work = (
   task_instruction: instruction,
   required_capabilities: caps,
   depends_on,
-  ...(metadata ? { metadata } : {}),
+  metadata: { network_requirement: NETREQ_LOCAL, ...(metadata ?? {}) },
   ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
 });
 

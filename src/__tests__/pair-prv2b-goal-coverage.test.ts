@@ -25,6 +25,23 @@ const FULL_SETS = [SERVE_LLM_PLANNER_CAPS.slice()];
 const canon = (raw: Array<Record<string, unknown>>, goal: string) =>
   makeServeCanonicalizer({ executorCapSets: () => FULL_SETS })(raw, goal);
 
+/** R2 — every fresh work task carries a valid structured network
+ *  requirement (LOCAL by default; these fixtures test coverage/constraint
+ *  authority, not network authority). */
+const NETREQ_LOCAL = {
+  source_kind: "LOCAL",
+  access_intent: "READ",
+  freshness: "NOT_REQUIRED",
+} as const;
+/** Goals in this file name the MQL5 entity → a locator for mql5.com is
+ *  operator-authorized (identity-label binding). */
+const NETREQ_EXT_MQL5 = {
+  source_kind: "EXTERNAL_SITE",
+  access_intent: "RESEARCH",
+  freshness: "REQUIRED",
+  source_locator: "https://www.mql5.com",
+} as const;
+
 const work = (
   key: string,
   instruction: string,
@@ -38,7 +55,12 @@ const work = (
   task_instruction: instruction,
   required_capabilities: caps,
   depends_on,
-  ...(metadata ? { metadata } : {}),
+  metadata: {
+    network_requirement: caps.includes("NETWORK_ACCESS")
+      ? NETREQ_EXT_MQL5
+      : NETREQ_LOCAL,
+    ...(metadata ?? {}),
+  },
   ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
 });
 

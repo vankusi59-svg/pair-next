@@ -37,8 +37,10 @@ import {
   instructionSatisfiesGoalSubject,
 } from "./llm-planner.js";
 import {
+  extractGoalIdentities,
   FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
-  taskNetworkAuthority,
+  networkRequirementFieldState,
+  resolveTaskNetworkAuthority,
   type NetworkRequirement,
 } from "./network-requirement.js";
 import {
@@ -149,8 +151,9 @@ export function makeServeCanonicalizer(deps: {
 }): (
   rawTasks: Array<Record<string, unknown>>,
   goal: string,
+  ctx?: { provenance?: "fresh" | "persisted" },
 ) => Array<Record<string, unknown>> {
-  return (rawTasks, goal) => {
+  return (rawTasks, goal, ctx) => {
     // PRV2-A §D — the model emits WORK tasks only; PAIR owns bookkeeping.
     // A model-emitted bookkeeping-shaped task (filtered caps ⊆
     // {AUTOMATON_TASK_EXECUTION}) is deterministically normalized away so
@@ -192,56 +195,63 @@ export function makeServeCanonicalizer(deps: {
       deps.executorCapSets() as never[],
     );
     if (!tasks.length) return [] as Array<Record<string, unknown>>;
-    // PRV2-A R2 + NETWORK-REQ R1 — deterministic network-requirement
+    // PRV2-A R2 + NETWORK-REQ R1/R2 — deterministic network-requirement
     // authority at the canonical seam (prompt wording is guidance, not
-    // authority). A task carrying a validated structured
-    // `metadata.network_requirement` is judged by it — the legacy
-    // instruction/goal vocabulary detectors decide ONLY tasks without
-    // structured evidence, and a derived-required declaration proves the
-    // goal's external-data need so the legacy goal-level check cannot
-    // veto it (raw "file"/"outbox" wording used to suppress it).
-    //  a) structured: contradictory evidence (internal, or against the
-    //     task's own instruction) rejects the candidate typed — never a
-    //     silent side-pick; a consistent derived-required task must
-    //     itself carry NETWORK_ACCESS.
-    //  b) legacy goal-level: goal explicitly needs current/external data
-    //     AND no derived-required declaration proves it → the canonical
-    //     work plan must contain a LEGITIMATE data-gathering task
-    //     carrying NETWORK_ACCESS (fetch-shaped instruction — a dummy
-    //     task carrying the capability does not count).
-    //  c) legacy per-task: no structured field + fetch-shaped
-    //     instruction must itself carry NETWORK_ACCESS.
-    // None rewrites the model's proposal — the candidate fails typed
-    // and planner failover proceeds.
-    const taskNetAuth = (t: Record<string, unknown>) =>
-      taskNetworkAuthority({
+    // authority). ONE shared verdict (`resolveTaskNetworkAuthority`)
+    // decides each task:
+    //  INVALID  — missing/malformed/conflict field under the fresh
+    //     contract, internal contradiction, or a semantically-required
+    //     source the operator goal never authorized → typed candidate
+    //     rejection (`FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID`),
+    //     never a silent pick.
+    //  REQUIRED — semantically required AND operator-authorized (the
+    //     declared locator host is one the goal itself names): the task
+    //     must carry NETWORK_ACCESS (repair adds it when servable).
+    //  NOT_REQUIRED — structured field says no network: vocabulary can
+    //     never override it, and a NETWORK_ACCESS claim is UNAUTHORIZED.
+    //  LEGACY   — no structured evidence on a provably persisted plan
+    //     (ctx.provenance === "persisted"): the legacy instruction/goal
+    //     detectors decide, exactly as pre-contract plans did.
+    // Provenance is CALL-SITE context, never inferred from data: every
+    // planner transport is fresh by default; only the stored
+    // `metadata.llm_plan` path marks persisted.
+    const netFresh = ctx?.provenance !== "persisted";
+    const netGoalIdentities = extractGoalIdentities(goal);
+    const taskNetRes = (t: Record<string, unknown>) =>
+      resolveTaskNetworkAuthority({
         req: ((t.metadata as Record<string, unknown> | undefined)
           ?.network_requirement ?? null) as NetworkRequirement | null,
-        instruction: String(t.task_instruction ?? ""),
-        instructionIsNetworkShaped: taskRequiresNetworkAccess(
-          String(t.task_instruction ?? ""),
-        ),
+        state: networkRequirementFieldState(t),
+        goalIdentities: netGoalIdentities,
+        fresh: netFresh,
       });
-    // Contradictory structured evidence rejects FIRST — a present field
-    // that is internally incoherent or contradicts its own instruction is
-    // the candidate's structural defect and must never be masked by a
-    // vocabulary-level rejection.
     for (const t of tasks) {
-      const auth = taskNetAuth(t);
-      if (!auth.consistent) {
+      const res = taskNetRes(t);
+      if (res.verdict === "INVALID") {
         throw new IntegrityError(
           FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
           JSON.stringify({
             task: String(t.task_key),
-            reason: auth.contradiction,
+            reason: res.reason,
+          }),
+        );
+      }
+      const caps = (t.required_capabilities as string[] | undefined) ?? [];
+      if (res.verdict === "NOT_REQUIRED" && caps.includes("NETWORK_ACCESS")) {
+        // Structured field declares no network need — a NETWORK_ACCESS
+        // claim is a capability the planner could not authorize.
+        throw new IntegrityError(
+          FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
+          JSON.stringify({
+            task: String(t.task_key),
+            reason: "UNAUTHORIZED_CAPABILITY",
           }),
         );
       }
     }
-    const anyDerivedRequired = tasks.some((t) => {
-      const a = taskNetAuth(t);
-      return a.consistent && a.required;
-    });
+    const anyDerivedRequired = tasks.some(
+      (t) => taskNetRes(t).verdict === "REQUIRED",
+    );
     if (!anyDerivedRequired && goalRequiresCurrentExternalData(goal)) {
       const legitimate = tasks.some((t) => {
         const caps = (t.required_capabilities as string[] | undefined) ?? [];
@@ -264,10 +274,13 @@ export function makeServeCanonicalizer(deps: {
     }
     for (const t of tasks) {
       const caps = (t.required_capabilities as string[] | undefined) ?? [];
-      const auth = taskNetAuth(t);
-      const requires = auth.present
-        ? auth.required
-        : taskRequiresNetworkAccess(String(t.task_instruction ?? ""));
+      const res = taskNetRes(t);
+      const requires =
+        res.verdict === "REQUIRED"
+          ? true
+          : res.verdict === "LEGACY"
+            ? taskRequiresNetworkAccess(String(t.task_instruction ?? ""))
+            : false;
       if (requires && !caps.includes("NETWORK_ACCESS")) {
         throw new IntegrityError(
           "FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED",
@@ -423,9 +436,15 @@ export function makeServePlanner(deps: ServePlannerDeps): {
     }
     const llm = mdata.llm_plan as unknown[] | undefined;
     if (Array.isArray(llm) && llm.length) {
+      // R2 — persisted-plan provenance: this list was canonicalized and
+      // stored before the structured network requirement was mandatory.
+      // Explicit context proves legacy; a field-less task here may fall
+      // back to the legacy detectors (fresh emissions never reach this
+      // branch — they come through the planner transports above).
       const tasks = canonicalizeLlmTasks(
         llm as Array<Record<string, unknown>>,
         goal,
+        { provenance: "persisted" },
       );
       if (tasks.length) return { tasks };
     }

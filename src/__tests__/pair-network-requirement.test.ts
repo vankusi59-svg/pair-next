@@ -1,22 +1,36 @@
 /**
- * R1 — canonical structured network requirement (source_kind/access_intent/
- * freshness/source_locator) → deterministic capability derivation. The model
- * only NORMALIZES meaning; PAIR-owned deterministic code decides NETWORK
- * authority. Adversarial matrix A–J per mandate.
+ * R2 — NETWORK-requirement authority hardening (audit remediation).
+ *
+ *  BLOCKER 1: a planner declaration can never bootstrap capability —
+ *    EXTERNAL + locator not named by the operator goal → typed INVALID
+ *    (UNAUTHORIZED_SOURCE); NETWORK_ACCESS on a NOT_REQUIRED/legacy task →
+ *    UNAUTHORIZED_CAPABILITY; elevation requires semantic REQUIRED +
+ *    operator-side canonical authorization + servability.
+ *  BLOCKER 2: fresh vs legacy is explicit call-site provenance — fresh
+ *    emissions missing/malformed/conflict → typed INVALID, never the
+ *    legacy vocabulary detectors; only persisted plans may fall back.
+ *
+ * Adversarial matrix A–L per mandate (A/B/C traverse the real production
+ * path: llmPlan sanitize → repair → canonicalize).
  */
 import { describe, expect, it } from "vitest";
 import { llmPlan, repairNetworkCapabilityBinding } from "../pair/llm-planner.js";
 import { makeServeCanonicalizer } from "../pair/serve-planner.js";
 import { extractGoalContract } from "../pair/goal-contract.js";
 import {
+  extractGoalIdentities,
+  isExternalShapedLocator,
+  networkRequirementInternalContradiction,
   parseNetworkRequirementShape,
-  taskNetworkAuthority,
+  requirementLocatorHost,
+  resolveTaskNetworkAuthority,
   type NetworkRequirement,
 } from "../pair/network-requirement.js";
 import { IntegrityError } from "../pair/errors.js";
 
 const MQL5_GOAL =
   "Truy cập MQL5.com và nghiên cứu 10 EA MT5 đang nổi bật. Với mỗi EA, thu thập tên, giá, rating, review mới trong 7 ngày gần nhất. Tổng hợp thành báo cáo tiếng Việt. Lưu báo cáo vào outbox/mql5_report.txt. Khi báo cáo hoàn thành, gửi file đó tới Telegram. Không được tự bịa dữ liệu nếu không truy cập hoặc xác minh được trên MQL5.";
+const MATH_GOAL = "Tính căn bậc hai của 144 và lưu kết quả vào math.txt.";
 
 const CAP_SETS = [
   ["REASONING", "NETWORK_ACCESS", "FILE_OPERATIONS", "CODE_GENERATION", "TELEGRAM_DELIVERY"],
@@ -30,8 +44,16 @@ const ALLOWED = [
   "TELEGRAM_DELIVERY",
 ];
 
-const canon = (raw: Array<Record<string, unknown>>, goal: string) =>
-  makeServeCanonicalizer({ executorCapSets: () => CAP_SETS })(raw, goal);
+const canon = (
+  raw: Array<Record<string, unknown>>,
+  goal: string,
+  provenance?: "fresh" | "persisted",
+) =>
+  makeServeCanonicalizer({ executorCapSets: () => CAP_SETS })(
+    raw,
+    goal,
+    provenance ? { provenance } : undefined,
+  );
 
 const planJson = (tasks: Array<Record<string, unknown>>) =>
   JSON.stringify({ tasks });
@@ -66,8 +88,7 @@ const LOCAL_REQ: NetworkRequirement = {
 const BOOKKEEPING = {
   task_key: "T1",
   title: "T1",
-  task_instruction:
-    "Write the goal to mission_goal.txt, then reply DONE.",
+  task_instruction: "Write the goal to mission_goal.txt, then reply DONE.",
   required_capabilities: ["AUTOMATON_TASK_EXECUTION"],
   depends_on: [],
 };
@@ -90,195 +111,329 @@ const taskWithReq = (
   ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
 });
 
-const canonCode = (fn: () => unknown): string | null => {
+interface CanonFail {
+  code: string;
+  detail: string;
+}
+const canonFail = (fn: () => unknown): CanonFail | null => {
   try {
     fn();
     return null;
   } catch (e) {
-    return e instanceof IntegrityError ? e.code ?? null : "NON_INTEGRITY";
+    if (e instanceof IntegrityError) {
+      return { code: e.code ?? "?", detail: e.message };
+    }
+    return { code: "NON_INTEGRITY", detail: String(e) };
   }
 };
 
-describe("R1 structured network requirement — A–J", () => {
-  it("A (incident replay): MQL5 goal + structured EXTERNAL req → NETWORK authority without vocabulary", async () => {
-    // The incident goal's LOCAL_SOURCE words (file/outbox/báo cáo) killed the
-    // legacy detector. With structured evidence the plan-level gate must NOT
-    // fire and the fetch task must end with NETWORK_ACCESS.
-    const contract = extractGoalContract(MQL5_GOAL);
-    const oblIds = contract.obligations.map((r) => r.id);
-    const raw = [
-      BOOKKEEPING,
-      taskWithReq(
-        "T2",
-        "Fetch live data from the MQL5 marketplace — research the 10 trending EA MT5 listings, collect names, prices, ratings and recent reviews, then write research notes to research_notes.md.",
-        ["NETWORK_ACCESS", "REASONING"], // emitted or upstream-repaired cap
-        EXT_REQ,
-        ["T1"],
-        oblIds.slice(0, 1),
-      ),
-      {
-        ...taskWithReq(
-          "T3",
-          "Thu thập tên EA và review mới trong 7 ngày gần nhất từ research notes, tóm tắt người dùng đang khen và phàn nàn điều gì, rồi viết báo cáo tiếng Việt lưu vào outbox/mql5_report.txt.",
-          ["REASONING", "FILE_OPERATIONS"],
-          LOCAL_REQ,
-          ["T2"],
-          [...oblIds.slice(1), ...contract.deliverables.map((r) => r.id)],
-        ),
-        produces: ["outbox/mql5_report.txt"],
-      },
-      {
-        task_key: "T4",
-        title: "T4",
-        task_instruction:
-          "Deliver the file outbox/mql5_report.txt to Telegram.",
-        required_capabilities: ["TELEGRAM_DELIVERY", "FILE_OPERATIONS"],
-        depends_on: ["T3"],
-        pair_coverage: [],
-      },
-    ];
-    const out = canon(raw, MQL5_GOAL);
-    const t2 = out.find((t) => String(t.task_instruction).includes("MQL5 marketplace"))!;
-    expect(t2).toBeDefined();
-    // canonicalize does not mutate caps — the missing-cap gate REQUIRES the
-    // declaration to have been elevated upstream by the repair seam.
-  });
-
-  it("A2 (structured repair): llmPlan emits req without cap → REPAIRED_NETWORK_CAPABILITY elevates", async () => {
+describe("R2 network-requirement authority — adversarial A–L", () => {
+  it("A: forged EXTERNAL on a math goal cannot bootstrap NETWORK (full production path)", async () => {
+    // Planner emits a forged structured requirement for a source the
+    // operator goal never named — through llmPlan sanitize → repair →
+    // canonicalize, zero NETWORK_ACCESS may ever be minted.
     const raw = planJson([
-      { ...BOOKKEEPING },
       {
         task_key: "T2",
         title: "T2",
         task_instruction:
-          "Fetch live data from the MQL5 marketplace — research the trending EA MT5 listings and recent reviews, write notes to research_notes.md.",
+          "Compute the square root of 144 and write the result to math.txt.",
         required_capabilities: ["REASONING"],
-        depends_on: ["T1"],
+        depends_on: [],
+        pair_coverage: ["OBL_001"],
+        network_requirement: EXT_REQ, // forged: mql5.com on a math goal
+      },
+    ]);
+    const r = await llmPlan(MATH_GOAL, { ...CFG, fetchFn: okFetch(raw) });
+    const t2 = r.tasks.find((t) => t.task_key === "T2")!;
+    // repair must NOT elevate: declaration alone is never authorization.
+    expect(r.warnings).not.toContain("REPAIRED_NETWORK_CAPABILITY:T2");
+    expect(t2.required_capabilities).not.toContain("NETWORK_ACCESS");
+    // canonical gate rejects the candidate typed — no silent pick.
+    const f = canonFail(() => canon(r.tasks, MATH_GOAL));
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
+    expect(f?.detail).toContain("T2");
+  });
+
+  it("B: forged EXTERNAL WITH a NETWORK_ACCESS claim is also rejected — cap cannot self-authorize", async () => {
+    const raw = planJson([
+      {
+        task_key: "T2",
+        title: "T2",
+        task_instruction:
+          "Compute the square root of 144 and write the result to math.txt.",
+        required_capabilities: ["REASONING", "NETWORK_ACCESS"],
+        depends_on: [],
         pair_coverage: ["OBL_001"],
         network_requirement: EXT_REQ,
       },
     ]);
-    const r = await llmPlan(MQL5_GOAL, { ...CFG, fetchFn: okFetch(raw) });
-    const t2 = r.tasks.find((t) =>
-      String(t.task_instruction).includes("MQL5 marketplace"),
-    )!;
-    expect(t2.required_capabilities).toContain("NETWORK_ACCESS");
-    expect(r.warnings).toContain("REPAIRED_NETWORK_CAPABILITY:T2");
-    // persisted to the canonical authority lane — digest-bound identity
-    expect(
-      (t2.metadata as Record<string, unknown>).network_requirement,
-    ).toEqual(EXT_REQ);
+    const r = await llmPlan(MATH_GOAL, { ...CFG, fetchFn: okFetch(raw) });
+    const f = canonFail(() => canon(r.tasks, MATH_GOAL));
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
+    // A NOT_REQUIRED task may not carry NETWORK_ACCESS at all.
+    const f2 = canonFail(() =>
+      canon(
+        [
+          taskWithReq(
+            "T2",
+            "Read notes.md and summarize.",
+            ["REASONING", "NETWORK_ACCESS"],
+            LOCAL_REQ,
+            ["T1"],
+          ),
+        ],
+        "Summarize notes.md.",
+      ),
+    );
+    expect(f2?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(f2?.detail).toContain("UNAUTHORIZED_CAPABILITY");
   });
 
-  it("B (local real source): 'đọc file config hiện tại' → LOCAL, no NETWORK", () => {
-    const goal = "Đọc file config hiện tại trong workspace và tóm tắt các mục cấu hình.";
-    const tasks = [
-      taskWithReq(
-        "T2",
-        "Read the file config.yaml in the workspace and summarize its settings into config_summary.md.",
-        ["REASONING", "FILE_OPERATIONS"],
-        LOCAL_REQ,
-        ["T1"],
-      ),
+  it("C: exact MQL5 positive still works — goal-named host authorizes repair + canonicalize", async () => {
+    const contract = extractGoalContract(MQL5_GOAL);
+    const oblIds = contract.obligations.map((x) => x.id);
+    const raw = planJson([
+      {
+        task_key: "T2",
+        title: "T2",
+        task_instruction:
+          "Fetch live data from the MQL5 marketplace — research the 10 trending EA MT5 listings, collect names, prices, ratings and recent reviews, then write research notes to research_notes.md.",
+        required_capabilities: ["REASONING"],
+        depends_on: [],
+        pair_coverage: [oblIds[0] ?? "OBL_001"],
+        network_requirement: EXT_REQ,
+      },
+      {
+        task_key: "T3",
+        title: "T3",
+        task_instruction:
+          "Đọc research_notes.md và tổng hợp thành báo cáo tiếng Việt lưu vào outbox/mql5_report.txt.",
+        required_capabilities: ["REASONING", "FILE_OPERATIONS"],
+        depends_on: ["T2"],
+        pair_coverage: oblIds.slice(1),
+        produces: ["outbox/mql5_report.txt"],
+        network_requirement: LOCAL_REQ,
+      },
+    ]);
+    const r = await llmPlan(MQL5_GOAL, { ...CFG, fetchFn: okFetch(raw) });
+    // goal names mql5.com → locator authorized → repair elevates.
+    expect(r.warnings).toContain("REPAIRED_NETWORK_CAPABILITY:T2");
+    const t2 = r.tasks.find((t) => t.task_key === "T2")!;
+    expect(t2.required_capabilities).toContain("NETWORK_ACCESS");
+    // Canonicalize: no NETWORK authority rejection (INVALID / missing-cap).
+    // A downstream gate (coverage, dataflow, delivery) may still judge the
+    // plan — none of those are what R2's network authority decides.
+    const f = canonFail(() => canon(r.tasks, MQL5_GOAL));
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+  });
+
+  it("D: multilingual equivalence — VN/EN/JA goals naming the host behave identically", async () => {
+    const goals = [
+      "Truy cập mql5.com và thu thập dữ liệu EA mới nhất, lưu vào outbox/r.txt.",
+      "Access mql5.com and collect the latest EA data, save into outbox/r.txt.",
+      "mql5.com にアクセスして最新のEAデータを収集し、outbox/r.txt に保存する。",
     ];
-    const auth = taskNetworkAuthority({
-      req: LOCAL_REQ,
-      instruction: String(tasks[0].task_instruction),
-      instructionIsNetworkShaped: false,
+    for (const goal of goals) {
+      const hosts = extractGoalIdentities(goal);
+      expect(hosts.has("mql5.com")).toBe(true); // language-free syntactic extraction
+      const tasks = [
+        taskWithReq(
+          "T2",
+          "Fetch the latest EA data from mql5.com into notes.md.",
+          ["REASONING"],
+          EXT_REQ,
+          ["T1"],
+        ),
+      ];
+      const r = repairNetworkCapabilityBinding(tasks, {
+        goal,
+        allowedCapabilities: ALLOWED,
+        capabilitySets: CAP_SETS,
+      });
+      expect(r.warnings).toEqual(["REPAIRED_NETWORK_CAPABILITY:T2"]);
+    }
+    // …and a math goal in any language authorizes nothing.
+    for (const goal of [
+      "Tính căn bậc hai của 144 và lưu vào math.txt.",
+      "Compute sqrt(144) and write math.txt.",
+      "144 の平方根を計算して math.txt に書く。",
+    ]) {
+      const res = resolveTaskNetworkAuthority({
+        req: EXT_REQ,
+        state: "valid",
+        goalIdentities: extractGoalIdentities(goal),
+        fresh: true,
+      });
+      expect(res).toMatchObject({ verdict: "INVALID", reason: "UNAUTHORIZED_SOURCE" });
+    }
+  });
+
+  it("E: fresh HTTP planner omitting the field → REQUIREMENT_MISSING typed reject (REASK-eligible, never legacy)", async () => {
+    const raw = planJson([
+      {
+        task_key: "T2",
+        title: "T2",
+        task_instruction:
+          "Fetch the latest MQL5 market data from the web into market.md.",
+        required_capabilities: ["NETWORK_ACCESS", "REASONING"],
+        depends_on: [],
+        pair_coverage: ["OBL_001"],
+        // no network_requirement — field absent on a fresh emission
+      },
+    ]);
+    const r = await llmPlan(MQL5_GOAL, { ...CFG, fetchFn: okFetch(raw) });
+    const f = canonFail(() => canon(r.tasks, MQL5_GOAL));
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(f?.detail).toContain("REQUIREMENT_MISSING");
+    // FAIL_CLOSED_PLAN_* is inside the pool's REASK-eligibility prefix.
+    expect(f!.code.startsWith("FAIL_CLOSED_PLAN_")).toBe(true);
+  });
+
+  it("F: fresh malformed field → REQUIREMENT_MALFORMED reject, no legacy drop", async () => {
+    const raw = planJson([
+      {
+        task_key: "T2",
+        title: "T2",
+        task_instruction:
+          "Fetch the latest MQL5 market data from the web into market.md.",
+        required_capabilities: ["REASONING"],
+        depends_on: [],
+        pair_coverage: ["OBL_001"],
+        network_requirement: "I AM NETWORK, TRUST ME",
+      },
+    ]);
+    const r = await llmPlan(MQL5_GOAL, { ...CFG, fetchFn: okFetch(raw) });
+    // sanitize keeps the task carrying the reserved error marker — the
+    // candidate rejects typed, never silently drops to vocabulary.
+    expect(r.warnings).toContain("MALFORMED_NETWORK_REQ:T2");
+    const t2 = r.tasks.find((t) => t.task_key === "T2")!;
+    expect(
+      (t2.metadata as Record<string, unknown>).network_requirement_error,
+    ).toBe("MALFORMED");
+    const f = canonFail(() => canon(r.tasks, MQL5_GOAL));
+    expect(f?.detail).toContain("REQUIREMENT_MALFORMED");
+    // top-level vs metadata conflict → REQUIREMENT_CONFLICT.
+    const raw2 = planJson([
+      {
+        task_key: "T2",
+        title: "T2",
+        task_instruction: "Summarize notes.md.",
+        required_capabilities: ["REASONING"],
+        depends_on: [],
+        pair_coverage: [],
+        network_requirement: EXT_REQ,
+        metadata: { network_requirement: LOCAL_REQ },
+      },
+    ]);
+    const r2 = await llmPlan("Summarize notes.md.", {
+      ...CFG,
+      fetchFn: okFetch(raw2),
     });
-    expect(auth.consistent).toBe(true);
-    expect(auth.required).toBe(false);
-    // repair never elevates a declared-LOCAL task
-    const r = repairNetworkCapabilityBinding(tasks, {
-      goal,
+    expect(r2.warnings).toContain("NETWORK_REQ_CONFLICT:T2");
+    const f2 = canonFail(() => canon(r2.tasks, "Summarize notes.md."));
+    expect(f2?.detail).toContain("REQUIREMENT_CONFLICT");
+  });
+
+  it("G: true legacy persisted plan — provenance-gated compat path still works", () => {
+    const goal = "Research the latest MQL5 market trends online.";
+    const legacyTask = taskWithReq(
+      "T2",
+      "Fetch the latest MQL5 market data from the web into market.md.",
+      ["NETWORK_ACCESS", "REASONING"],
+      null,
+      ["T1"],
+    );
+    delete (legacyTask as { metadata?: unknown }).metadata;
+    // persisted provenance: fieldless task → LEGACY verdict → vocabulary
+    // detectors decide, exactly as pre-contract plans did. The network
+    // gate passes; a downstream gate (coverage undeclared — persisted
+    // plans predate pair_coverage too) may reject — that IS the proof
+    // the LEGACY network path was honored.
+    const f = canonFail(() => canon([legacyTask], goal, "persisted"));
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+    // legacy plan-level gate fires first: the goal demands current
+    // external data and no legitimate NETWORK task exists at all.
+    const legacyNoCap = taskWithReq(
+      "T2",
+      "Fetch the latest MQL5 market data from the web into market.md.",
+      ["REASONING"],
+      null,
+      ["T1"],
+    );
+    delete (legacyNoCap as { metadata?: unknown }).metadata;
+    const f2 = canonFail(() => canon([legacyNoCap], goal, "persisted"));
+    expect(f2?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+    // legacy PER-TASK gate: a capped legitimate gatherer satisfies the
+    // plan-level check, then the uncapped fetch-shaped task is rejected.
+    const legit = taskWithReq(
+      "T3",
+      "Fetch the latest MQL5 market trends online into trends.md.",
+      ["NETWORK_ACCESS", "REASONING"],
+      null,
+      ["T1"],
+    );
+    delete (legit as { metadata?: unknown }).metadata;
+    const f3 = canonFail(() =>
+      canon([legit, legacyNoCap], goal, "persisted"),
+    );
+    expect(f3?.code).toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
+  });
+
+  it("H: missing field is NOT a legacy claim — fresh emission with fetch vocabulary still rejects", () => {
+    const fetchTask = taskWithReq(
+      "T2",
+      "Fetch the latest MQL5 market data from the web into market.md.",
+      ["NETWORK_ACCESS", "REASONING"],
+      null,
+      ["T1"],
+    );
+    delete (fetchTask as { metadata?: unknown }).metadata;
+    const goal = "Research the latest MQL5 market trends online.";
+    // Same bytes canonicalize under persisted but reject under fresh —
+    // provenance is call-site context, never inferred from the data.
+    const fp = canonFail(() => canon([fetchTask], goal, "persisted"));
+    expect(fp === null || !fp.code.includes("NETWORK")).toBe(true);
+    const f = canonFail(() => canon([fetchTask], goal, "fresh"));
+    expect(f?.detail).toContain("REQUIREMENT_MISSING");
+    const f2 = canonFail(() => canon([fetchTask], goal)); // default = fresh
+    expect(f2?.detail).toContain("REQUIREMENT_MISSING");
+  });
+
+  it("I: UNKNOWN declaration → zero elevation, no silent legacy detector", () => {
+    const unknownReq: NetworkRequirement = {
+      source_kind: "UNKNOWN",
+      access_intent: "READ",
+      freshness: "UNKNOWN",
+    };
+    const t = taskWithReq(
+      "T2",
+      "Fetch the latest pricing data from the web into data.md.",
+      ["REASONING"],
+      unknownReq,
+      ["T1"],
+    );
+    const r = repairNetworkCapabilityBinding([t], {
+      goal: "Summarize local notes.",
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
+    // no elevation — and the instruction's fetch vocabulary was never
+    // consulted (fresh structured contract).
     expect(r.warnings).toEqual([]);
     expect(r.tasks[0].required_capabilities).not.toContain("NETWORK_ACCESS");
-  });
-
-  it("C (repo local state): LOCAL requirement → never NETWORK", () => {
-    const auth = taskNetworkAuthority({
-      req: LOCAL_REQ,
-      instruction: "Inspect the current state of this repository and list recent commits into repo_state.md.",
-      instructionIsNetworkShaped: false,
+    const res = resolveTaskNetworkAuthority({
+      req: unknownReq,
+      state: "valid",
+      goalIdentities: new Set(),
+      fresh: true,
     });
-    expect(auth).toMatchObject({ present: true, required: false, consistent: true });
+    expect(res.verdict).toBe("NOT_REQUIRED");
   });
 
-  it("D (external source + file output): deliverable FILE nouns cannot whitewash EXTERNAL", () => {
-    // SOURCE≠OUTPUT invariant — outbox/report deliverables stay file-shaped
-    // while the declared source_kind remains EXTERNAL.
-    const req: NetworkRequirement = {
-      source_kind: "EXTERNAL_SITE",
-      access_intent: "FETCH",
-      freshness: "REQUIRED",
-      source_locator: "mql5.com",
-    };
-    const auth = taskNetworkAuthority({
-      req,
-      instruction:
-        "Fetch EA listings from mql5.com and save the report to outbox/mql5_report.txt.",
-      instructionIsNetworkShaped: true,
-    });
-    expect(auth).toMatchObject({ present: true, required: true, consistent: true });
-  });
-
-  it("E (multilingual): same structured class in VN/EN/JA → identical verdict, no language regex in policy", () => {
-    const insts = [
-      "Lấy dữ liệu từ mql5.com và ghi vào notes.md.", // VN — locator carries corroboration
-      "Fetch the data from mql5.com into notes.md.", // EN
-      "mql5.com からデータを取得して notes.md に保存する。", // JA — locator still corroborates
-    ];
-    for (const instruction of insts) {
-      const auth = taskNetworkAuthority({
-        req: EXT_REQ,
-        instruction,
-        instructionIsNetworkShaped: /fetch/i.test(instruction),
-      });
-      expect(auth).toMatchObject({ present: true, required: true, consistent: true });
-    }
-  });
-
-  it("F1 (malformed shape): non-object / bad enum network_requirement is DROPPED to legacy, never authority", () => {
-    for (const bad of [
-      "https://mql5.com",
-      { source_kind: "INTERNET", access_intent: "READ", freshness: "REQUIRED" },
-      { source_kind: "EXTERNAL_SITE" }, // missing fields
-      null,
-      42,
-    ]) {
-      const p = parseNetworkRequirementShape(bad);
-      expect(p.ok).toBe(false);
-    }
-    // valid objects DO parse — proves the drops were shape-driven
-    expect(parseNetworkRequirementShape(EXT_REQ).ok).toBe(true);
-  });
-
-  it("F2 (contradictory): LOCAL source_kind + external URL locator → FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID", () => {
-    const forged = taskWithReq(
-      "T2",
-      "Read local notes.md and summarize.",
-      ["REASONING"],
-      { source_kind: "LOCAL", access_intent: "READ", freshness: "NOT_REQUIRED", source_locator: "https://mql5.com" } as NetworkRequirement,
-      ["T1"],
-    );
-    const code = canonCode(() => canon([BOOKKEEPING, forged], "Summarize notes.md."));
-    expect(code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-  });
-
-  it("F3 (declaration wins): LOCAL-declared task is trusted even when instruction vocabulary echoes the goal", () => {
-    // Live finding: downstream tasks restate the goal's recency phrasing
-    // ("tổng hợp nghiên cứu 10 EA đang nổi bật") which the legacy
-    // instruction detector flags as fetch-shaped — the declaration must
-    // still win, never elevate, never spuriously reject.
-    const auth = taskNetworkAuthority({
-      req: LOCAL_REQ,
-      instruction: "Đọc mql5_research.txt và tổng hợp nghiên cứu 10 EA MT5 đang nổi bật thành báo cáo tiếng Việt.",
-      instructionIsNetworkShaped: true,
-    });
-    expect(auth).toMatchObject({ present: true, required: false, consistent: true });
+  it("J: canonical LOCAL task with research/recency vocabulary → no NETWORK; vocabulary cannot override", () => {
     const t = taskWithReq(
       "T2",
       "Đọc mql5_research.txt và tổng hợp nghiên cứu 10 EA MT5 đang nổi bật thành báo cáo tiếng Việt.",
@@ -286,33 +441,139 @@ describe("R1 structured network requirement — A–J", () => {
       LOCAL_REQ,
       ["T1"],
     );
-    const code = canonCode(() => canon([BOOKKEEPING, t], "Summarize findings."));
-    expect(code).not.toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(code).not.toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
+    // Network gate does not demand NETWORK_ACCESS and does not reject —
+    // any later-gate outcome (coverage etc.) is outside this assertion.
+    const f = canonFail(() => canon([t], "Summarize findings."));
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+    // And a NETWORK_ACCESS claim on it is unauthorized.
+    const withCap = taskWithReq(
+      "T2",
+      "Đọc mql5_research.txt và tổng hợp báo cáo.",
+      ["REASONING", "NETWORK_ACCESS"],
+      LOCAL_REQ,
+      ["T1"],
+    );
+    const f2 = canonFail(() => canon([withCap], "Summarize findings."));
+    expect(f2?.detail).toContain("UNAUTHORIZED_CAPABILITY");
   });
 
-  it("G (UNKNOWN): never self-grants; UNKNOWN + locator → contradiction", () => {
-    const unknownReq: NetworkRequirement = {
-      source_kind: "UNKNOWN",
-      access_intent: "READ",
-      freshness: "UNKNOWN",
+  it("K: locator generality — non-listed TLDs/hosts authorize by goal naming, no TLD list", () => {
+    // Arbitrary dotted hosts are never looked up in a TLD vocabulary:
+    // they authorize iff the goal itself names them.
+    const goal = "Truy cập data.portal-xk.example123 và lưu kết quả vào outbox/d.txt.";
+    const hosts = extractGoalIdentities(goal);
+    expect(hosts.has("data.portal-xk.example123")).toBe(true);
+    const req: NetworkRequirement = {
+      source_kind: "EXTERNAL_SITE",
+      access_intent: "FETCH",
+      freshness: "REQUIRED",
+      source_locator: "data.portal-xk.example123",
     };
-    const a1 = taskNetworkAuthority({
-      req: unknownReq,
-      instruction: "Summarize notes.md.",
-      instructionIsNetworkShaped: false,
+    const res = resolveTaskNetworkAuthority({
+      req,
+      state: "valid",
+      goalIdentities: hosts,
+      fresh: true,
     });
-    expect(a1).toMatchObject({ present: true, required: false, consistent: true });
-    // UNKNOWN source + a locator → who/what is being read is incoherent → reject
-    const a2 = taskNetworkAuthority({
-      req: { ...unknownReq, source_locator: "something.example" },
-      instruction: "Summarize notes.md.",
-      instructionIsNetworkShaped: false,
-    });
-    expect(a2.consistent).toBe(false);
+    expect(res).toMatchObject({ verdict: "REQUIRED", authorized: true });
+    // scheme URL locator for a goal-named host
+    expect(requirementLocatorHost("https://internal.corp/page?x=1")).toBe(
+      "internal.corp",
+    );
+    expect(requirementLocatorHost("www.sub.example.net/p")).toBe(
+      "sub.example.net",
+    );
+    // file names and paths are never hosts
+    expect(requirementLocatorHost("outbox/report.txt")).toBeNull();
+    expect(requirementLocatorHost("notes")).toBeNull();
+    // a bare dotted token is external-shaped ONLY when the goal names it
+    expect(isExternalShapedLocator("report.txt", hosts)).toBe(false);
+    expect(isExternalShapedLocator("report.txt", new Set(["report.txt"]))).toBe(true);
+    expect(isExternalShapedLocator("https://anything.example", new Set())).toBe(true);
   });
 
-  it("H (legacy compat): fieldless tasks keep the legacy detector path", () => {
+  it("L: digest binds requirement + error marker — post-binding mutation changes plan identity", async () => {
+    const { canonicalPlanSemanticDigest } = await import(
+      "../pair/plan-feasibility.js"
+    );
+    const base = {
+      task_key: "T2",
+      task_instruction: "Compute sqrt(144) and write math.txt.",
+      required_capabilities: ["REASONING"],
+      depends_on: [],
+      metadata: { network_requirement: LOCAL_REQ },
+    };
+    const d1 = canonicalPlanSemanticDigest([base]);
+    const mutated = {
+      ...base,
+      metadata: { network_requirement: EXT_REQ },
+    };
+    const d2 = canonicalPlanSemanticDigest([mutated]);
+    expect(d1).not.toBe(d2);
+    const withErr = {
+      ...base,
+      metadata: {
+        network_requirement: LOCAL_REQ,
+        network_requirement_error: "MALFORMED",
+      },
+    };
+    expect(canonicalPlanSemanticDigest([withErr])).not.toBe(d1);
+    // shape normalization order is canonical: same semantics → same digest
+    const reordered = {
+      ...base,
+      metadata: {
+        network_requirement: {
+          source_locator: undefined,
+          freshness: "NOT_REQUIRED",
+          access_intent: "READ",
+          source_kind: "LOCAL",
+        },
+      },
+    };
+    const normalized = parseNetworkRequirementShape(
+      (reordered.metadata as Record<string, unknown>).network_requirement,
+    );
+    expect(normalized.ok).toBe(true);
+  });
+});
+
+describe("R1 invariants retained under R2", () => {
+  it("internal contradictions still reject typed (LOCAL+URL locator, UNKNOWN+locator)", () => {
+    const contradiction = networkRequirementInternalContradiction({
+      source_kind: "LOCAL",
+      access_intent: "READ",
+      freshness: "NOT_REQUIRED",
+      source_locator: "https://mql5.com",
+    });
+    expect(contradiction).toBe("LOCAL_WITH_EXTERNAL_LOCATOR");
+    const res = resolveTaskNetworkAuthority({
+      req: {
+        source_kind: "UNKNOWN",
+        access_intent: "READ",
+        freshness: "UNKNOWN",
+        source_locator: "something.example",
+      },
+      state: "valid",
+      goalIdentities: new Set(),
+      fresh: true,
+    });
+    expect(res).toMatchObject({ verdict: "INVALID", reason: "LOCATOR_WITHOUT_SOURCE" });
+  });
+
+  it("malformed shapes never parse as authority", () => {
+    for (const bad of [
+      "https://mql5.com",
+      { source_kind: "INTERNET", access_intent: "READ", freshness: "REQUIRED" },
+      { source_kind: "EXTERNAL_SITE" },
+      null,
+      42,
+    ]) {
+      expect(parseNetworkRequirementShape(bad).ok).toBe(false);
+    }
+    expect(parseNetworkRequirementShape(EXT_REQ).ok).toBe(true);
+  });
+
+  it("persisted-path repair never elevates fieldless tasks (repair is fresh-only)", () => {
     const legacyTask = taskWithReq(
       "T2",
       "Fetch the latest MQL5 market data from the web into market.md.",
@@ -321,104 +582,14 @@ describe("R1 structured network requirement — A–J", () => {
       ["T1"],
     );
     delete (legacyTask as { metadata?: unknown }).metadata;
-    const r = repairNetworkCapabilityBinding(
-      [legacyTask],
-      {
-        goal: "Research the latest MQL5 market trends online.",
-        allowedCapabilities: ALLOWED,
-        capabilitySets: CAP_SETS,
-      },
-    );
-    // legacy 4-condition path still repairs a clearly-fetch-shaped task
-    expect(r.warnings).toEqual(["REPAIRED_NETWORK_CAPABILITY:T2"]);
-    expect(r.tasks[0].required_capabilities).toContain("NETWORK_ACCESS");
-  });
-
-  it("I (precedence): structured EXTERNAL wins over file/outbox deliverable nouns in the goal", () => {
-    // Goal carries every local-signal word the legacy LOCAL_SOURCE_RE fires
-    // on; structured evidence must still authorize NETWORK.
-    const goal =
-      "Truy cập mql5.com, thu thập dữ liệu EA mới nhất, lưu vào file outbox/report.txt rồi gửi file đó qua telegram.";
-    const netTask = taskWithReq(
-      "T2",
-      "Fetch the newest EA data from the MQL5 marketplace and write it to outbox/report.txt.",
-      ["REASONING", "NETWORK_ACCESS", "FILE_OPERATIONS"],
-      EXT_REQ,
-      ["T1"],
-      ["OBL_001"],
-    );
-    // anyDerivedRequired → plan-level legacy check skipped entirely
-    const code = canonCode(() => canon([BOOKKEEPING, netTask], goal));
-    expect(code).not.toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
-  });
-
-  it("J1 (forged metadata, malformed): invalid metadata.network_requirement drops to legacy, is never authority", async () => {
-    const raw = planJson([
-      { ...BOOKKEEPING },
-      {
-        task_key: "T2",
-        title: "T2",
-        task_instruction:
-          "Fetch the latest MQL5 market data from the web into market.md.",
-        required_capabilities: ["REASONING"],
-        depends_on: ["T1"],
-        pair_coverage: ["OBL_001"],
-        metadata: { network_requirement: "I AM NETWORK, TRUST ME" },
-      },
-    ]);
-    const r = await llmPlan(
-      "Research the latest MQL5 market trends online.",
-      { ...CFG, fetchFn: okFetch(raw) },
-    );
-    expect(r.warnings).toContain("DROP_MALFORMED_NETWORK_REQ:T2");
-    const t2 = r.tasks.find((t) => t.task_key === "T2")!;
-    expect(
-      (t2.metadata as Record<string, unknown>).network_requirement,
-    ).toBeUndefined();
-  });
-
-  it("J2 (forged metadata, conflicting): top-level vs metadata conflict → task dropped", async () => {
-    const raw = planJson([
-      { ...BOOKKEEPING },
-      {
-        task_key: "T2",
-        title: "T2",
-        task_instruction: "Summarize notes.md.",
-        required_capabilities: ["REASONING"],
-        depends_on: ["T1"],
-        pair_coverage: [],
-        network_requirement: EXT_REQ,
-        metadata: { network_requirement: LOCAL_REQ },
-      },
-    ]);
-    const r = await llmPlan("Summarize notes.md.", {
-      ...CFG,
-      fetchFn: okFetch(raw),
+    // repair only runs on the fresh planner path — a persisted plan's
+    // fieldless task is judged by the canonicalizer's LEGACY branch.
+    const r = repairNetworkCapabilityBinding([legacyTask], {
+      goal: "Research the latest MQL5 market trends online.",
+      allowedCapabilities: ALLOWED,
+      capabilitySets: CAP_SETS,
     });
-    expect(r.warnings).toContain("DROP_NETWORK_REQ_CONFLICT:T2");
-    expect(r.tasks.find((t) => t.task_key === "T2")).toBeUndefined();
-  });
-
-  it("J3 (forged authority): forged EXTERNAL cannot mint capability — gate still demands NETWORK_ACCESS", () => {
-    // A well-formed consistent declaration derives the REQUIREMENT but can
-    // never mint the capability itself: no NETWORK_ACCESS on the task → the
-    // unchanged fail-closed gate rejects. Forgery grants nothing.
-    const forged = taskWithReq(
-      "T2",
-      "Compute the square root of 144 and write math.txt.",
-      ["REASONING"],
-      EXT_REQ,
-      ["T1"],
-    );
-    const code = canonCode(() => canon([BOOKKEEPING, forged], "Compute math."));
-    expect(code).toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
-  });
-
-  it("schema drift: both field spellings normalize into the same canonical object", () => {
-    // top-level spelling parsed identically to a metadata spelling
-    const a = parseNetworkRequirementShape(EXT_REQ);
-    const b = parseNetworkRequirementShape(JSON.parse(JSON.stringify(EXT_REQ)));
-    expect(a.ok && b.ok).toBe(true);
-    if (a.ok && b.ok) expect(a.req).toEqual(b.req);
+    // fresh verdict on missing field = INVALID → repair leaves it alone
+    expect(r.tasks[0].required_capabilities).not.toContain("NETWORK_ACCESS");
   });
 });
