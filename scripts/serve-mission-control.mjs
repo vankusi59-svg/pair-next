@@ -92,6 +92,7 @@ import {
   beginPlannerRun,
   persistPlannerAttemptStart,
   settlePlannerAttempt,
+  markPlannerAttemptReask,
   finishPlannerRun,
   validatePlanProposal,
   makeServePlanner,
@@ -760,23 +761,36 @@ const planExpander = async (input) => {
       // only — no governed dispatch); every other route keeps the
       // OpenAI-compatible llmPlan call. Both return the same
       // {tasks, warnings} contract into the SAME canonicalize seam.
-      planFn: (c) =>
+      planFn: (c, invocation) =>
         c.transport === "codex_cli"
           ? codexPlannerPlan(goal, {
               model: c.model,
-              timeoutMs: cfgCodexPlannerTimeoutMs,
+              // P-REASK R3 — the re-ask runs inside the remaining
+              // candidate budget, never a second full timeout.
+              timeoutMs: invocation?.timeoutMs ?? cfgCodexPlannerTimeoutMs,
               scratchDir: codexPlannerScratch,
               allowedCapabilities: LLM_PLANNER_CAPS,
               capabilitySets: executorCapSets(),
+              rejectionContext: invocation?.rejectionContext,
             })
           : llmPlan(goal, {
               endpoint: `${c.endpoint}/chat/completions`,
               credentialEnv: c.credentialEnv,
               model: c.model,
-              timeoutMs: cfgPlannerTimeoutMs,
+              timeoutMs: invocation?.timeoutMs ?? cfgPlannerTimeoutMs,
               allowedCapabilities: LLM_PLANNER_CAPS,
               capabilitySets: executorCapSets(),
+              rejectionContext: invocation?.rejectionContext,
+              maxProviderRequests: invocation?.maxProviderRequests,
             }),
+      // P-REASK R3 — hard per-candidate latency ceiling, measured from
+      // attempt START: HTTP = 2×per-request timeout (its INITIAL call may
+      // make up to two provider requests); Codex = its single-invocation
+      // timeout. The re-ask spends only what the envelope left over.
+      latencyBudget: (c) =>
+        c.transport === "codex_cli"
+          ? { ceilingMs: cfgCodexPlannerTimeoutMs, requestTimeoutMs: cfgCodexPlannerTimeoutMs }
+          : { ceilingMs: 2 * cfgPlannerTimeoutMs, requestTimeoutMs: cfgPlannerTimeoutMs },
       onAttemptStart: (base) =>
         persistPlannerAttemptStart(store, {
           planner_run_id: String(run.planner_run_id),
@@ -784,6 +798,14 @@ const planExpander = async (input) => {
           record: base,
           actor: "PAIR_PLANNER",
         }).planner_attempt_id,
+      // P-REASK R4 — durable re-ask initiation on the SAME attempt row
+      // before the second model invocation (never a second row).
+      onAttemptReask: (paid, code) =>
+        markPlannerAttemptReask(store, {
+          planner_attempt_id: String(paid),
+          validation_code: String(code),
+          actor: "PAIR_PLANNER",
+        }),
       onAttemptEnd: (paid, rec) =>
         settlePlannerAttempt(store, {
           planner_attempt_id: String(paid),
