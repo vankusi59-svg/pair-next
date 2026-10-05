@@ -227,14 +227,26 @@ ORIGINAL canonical rejection (`VALIDATION_CODE:<code>` +
 No new env knob.
 
 **Proof**:
-- `R1.B-1`: ceiling 60ms, re-proof sleeps 120ms → zero REASK
-  invocations, zero `REASK:` marker/event, attempt row carries the
-  original `VALIDATION_CODE:` + `PLAN_INVALID` settle, deterministic
-  failover to candidate B (winner).
-- `R1.B-2`: ceiling 60s, re-proof sleeps ~150ms → REASK
-  `timeoutMs <= ceiling - elapsed_at_proof_end (+25ms jitter)` AND
-  strictly below the pre-proof bound — the post-reproof remainder, not
-  the stale snapshot.
+- `R1.B-1`: eligibility call counter — call #1 (INITIAL for A) returns
+  immediately and does NOT consume the ceiling; call #2 (the REASK
+  re-proof) sleeps 150ms > the 60ms ceiling; call #3 (B's INITIAL) is
+  immediate. Asserted: the re-proof call actually occurred
+  (`eligCalls == [1,2,3]`), zero REASK planFn invocations, zero `REASK:`
+  marker, zero `PLANNER_ATTEMPT_REASK_STARTED` events, candidate A
+  settles original `PLAN_INVALID` with exact
+  `VALIDATION_CODE:FAIL_CLOSED_PLAN_INCOMPLETE`, candidate B wins
+  normally.
+- `R1.B-2`: `requestTimeoutMs = 30000` sits ABOVE `ceilingMs = 2000` so
+  the provider-request bound can never mask the remaining-budget value.
+  The re-proof burns a measurable ~400ms. Asserted: REASK `timeoutMs`
+  is bounded by the POST-reproof remainder (`≤ postBound + 50ms jitter`),
+  is materially lower than the PRE-reproof remainder (`≤ preBound - 200`),
+  and is > 0.
+- **Counterfactual proven**: both tests were executed against the
+  pre-R1.B implementation (HEAD `59357d8` in a scratch worktree) — both
+  FAIL (`timeoutMs == 2000 vs bound 1648`; REASK invoked despite the
+  exhausted budget), demonstrating the tests detect the stale-remaining
+  defect rather than passing vacuously.
 
 ### R1.C — REASK evidence persistence fails closed: CLOSED
 

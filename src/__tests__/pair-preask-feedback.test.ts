@@ -747,6 +747,7 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
     const run = beginPlannerRun(store, { routes: ["p:A", "p:B"], actor: "PAIR_PLANNER" });
     const calls: string[] = [];
     let reaskCalls = 0;
+    const eligCalls: number[] = [];
     const res = await runPlannerFailover({
       candidates: [cand("A"), cand("B")],
       planFn: async (c, inv) => {
@@ -754,7 +755,12 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
         return okPlan("p");
       },
       assertEligible: async () => {
-        await sleep(120); // re-proof burns the whole 60ms ceiling
+        eligCalls.push(eligCalls.length + 1);
+        // Call #1 = INITIAL eligibility for A — immediate, does NOT
+        // consume the ceiling. Call #2 = the REASK re-proof for A —
+        // sleeps longer than the remaining 60ms candidate budget.
+        // Later calls (B's eligibility) are immediate.
+        if (eligCalls.length === 2) await sleep(150);
       },
       canonicalize: (tasks, c) => {
         if (c.model_entry_id === "A") throw new IntegrityError("FAIL_CLOSED_PLAN_INCOMPLETE", "x");
@@ -782,6 +788,8 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
           actor: "PAIR_PLANNER",
         }),
     });
+    // The REASK re-proof (eligibility call #2) actually occurred.
+    expect(eligCalls).toEqual([1, 2, 3]); // A-INITIAL, A-REASK proof, B-INITIAL
     // Candidate A: budget exhausted inside re-proof → original
     // rejection semantics (VALIDATION_CODE + CANONICAL_VALIDATION_FAILED),
     // zero REASK marker/event, zero second invocation.
@@ -803,7 +811,11 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
     expect(res.winner.model_entry_id).toBe("B");
   });
 
-  it("R1.B-2 — re-proof consuming PART of the budget → REASK timeout reflects POST-reproof remainder", async () => {
+  it("R1.B-2 — REASK timeout is the POST-reproof remainder, not the pre-reproof snapshot", async () => {
+    // Budget shaping: requestTimeoutMs (30000) sits ABOVE the ceiling so
+    // it can never mask the remaining-budget value — any timeoutMs below
+    // 2000 must come from the remaining recompute, and any timeoutMs ≥
+    // the pre-reproof remainder would prove the stale-snapshot bug.
     const invs: PlannerInvocation[] = [];
     let tEligStart = 0;
     let tEligEnd = 0;
@@ -819,7 +831,7 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
         eligCalls++;
         if (eligCalls === 2) {
           tEligStart = Date.now();
-          await sleep(150);
+          await sleep(400); // burn a clearly measurable slice of the ceiling
           tEligEnd = Date.now();
         }
       },
@@ -827,20 +839,27 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
         if (invs.length === 1) throw new IntegrityError("FAIL_CLOSED_PLAN_INCOMPLETE", "x");
         return tasks;
       },
-      latencyBudget: () => ({ ceilingMs: 60000, requestTimeoutMs: 10000 }),
+      latencyBudget: () => ({ ceilingMs: 2000, requestTimeoutMs: 30000 }),
     });
     expect(res.winner.model_entry_id).toBe("A");
     expect(invs).toHaveLength(2);
+    expect(eligCalls).toBe(2);
     const reask = invs[1];
-    // Post-reproof remainder bound: timeout must be at most the budget
-    // remaining measured when the re-proof FINISHED (not when it
-    // started) — slack only for scheduling jitter.
-    const postReproofBound = 60000 - (tEligEnd - tStart);
-    expect(reask.timeoutMs).toBeLessThanOrEqual(postReproofBound + 25);
-    // And strictly below what a PRE-reproof snapshot would have allowed:
-    const preReproofBound = 60000 - (tEligStart - tStart);
-    expect(reask.timeoutMs).toBeLessThan(preReproofBound);
+    // Bounds measured against tStart (a lower bound on attempt start t0):
+    //   remaining_post ≤ ceiling - (tEligEnd - tStart)
+    //   remaining_pre  ≥ ceiling - (tEligStart - tStart)   [snapshot BEFORE proof]
+    const postBound = 2000 - (tEligEnd - tStart);   // ~1600 minus plan/canonicalize ms
+    const preBound = 2000 - (tEligStart - tStart);  // ~2000 minus plan/canonicalize ms
     expect(reask.timeoutMs).toBeGreaterThan(0);
+    // POST-reproof bound: the timeout must fit the budget as it stood
+    // when the re-proof FINISHED (generous jitter margin only).
+    expect(reask.timeoutMs).toBeLessThanOrEqual(postBound + 50);
+    // MATERIALLY below the PRE-reproof remainder: the 400ms proof burn
+    // must be visible in the timeout. Under the stale-remaining
+    // implementation timeoutMs would be ~preBound (≈ ceiling − plan ms)
+    // and this assertion would FAIL by ~400ms — the defect is proven
+    // distinguishable, not hidden by requestTimeoutMs.
+    expect(reask.timeoutMs).toBeLessThanOrEqual(preBound - 200);
   });
 
   it("R1.C — persistence seam fail-closed: missing attempt evidence → REASK never invokes the model", async () => {
