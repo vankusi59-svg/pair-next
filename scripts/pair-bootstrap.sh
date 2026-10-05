@@ -4,15 +4,15 @@
 # Idempotent: every step checks first, installs only what's missing/wrong.
 # Usage:
 #   bash scripts/pair-bootstrap.sh           # install everything missing
-#   bash scripts/pair-bootstrap.sh --check   # report only, change nothing
+#   bash scripts/pair-bootstrap.sh --check   # read-only report (zero mutation)
 #
-# What it installs: node (via nvm), pnpm (corepack), repo deps + dist build,
-# codex CLI, dsh executor (+ gemini compat patch + settings.yaml), cloudflared,
-# pair-mc-live scaffold (telegram-allow.json template).
+# Installs: node (via nvm), pnpm (version pinned from package.json
+# packageManager), repo deps + dist build, codex CLI, @deepseek-ai/dsh
+# (version pinned to the compat-patch-verified release) + gemini compat patch
+# + settings.yaml, cloudflared, pair-mc-live scaffold.
 #
-# What it CANNOT install (prints a checklist at the end): secrets —
-# PAIR_TG_BOT_TOKEN / ~/pair-tg-token, provider API keys (NVIDIA_API_KEY,
-# GROQ_API_KEY, CLOUDFLARE_API_TOKEN, GEMINI_API_KEY), codex auth (~/.codex).
+# Never installs or prints secrets — ends with a configured/missing checklist.
+# Exit code: 0 iff the final-state check finds nothing missing.
 
 set -uo pipefail
 
@@ -25,13 +25,58 @@ DSH_HOME="${PAIR_DSH_HOME:-$HOME/.pair-dsh-home}"
 NODE_WANT_MAJOR=22
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-OK=(); MISS=(); ACT=()
-note()  { echo "  $*"; }
-have()  { OK+=("$1"); note "[ok]   $1"; }
-need()  { MISS+=("$1"); note "[MISS] $1"; }
-acted() { ACT+=("$1"); note "[did]  $1"; }
+# Pinned versions (reproducibility).
+# pnpm: canonical version is the repo's packageManager field — derive it so a
+#   repo bump follows automatically; never floating pnpm@latest.
+PNPM_WANT="$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"pnpm@\([0-9.]*\)".*/\1/p' "$ROOT/package.json" | head -1)"
+PNPM_WANT="${PNPM_WANT:-10.28.1}"
+# dsh: pinned to the release verified compatible with dsh-gemini-compat.sh
+#   anchors (0.2.0-rc.2). A blind `latest` install could ship pi-ai source the
+#   patcher cannot patch — that must fail closed, not silently pass.
+DSH_WANT="0.2.0-rc.2"
+# codex + cloudflared intentionally track latest: no PAIR compat layer depends
+#   on their internals — codex is probed by version/transport at boot and the
+#   planner only needs a working binary; cloudflared is a protocol-stable
+#   tunnel binary. Pinning them adds maintenance with no correctness gain.
 
-run()   { [ "$CHECK_ONLY" = "1" ] && return 0; "$@"; }
+note()  { echo "  $*"; }
+have()  { note "[ok]   $1"; }
+need()  { note "[MISS] $1"; }
+acted() { note "[did]  $1"; }
+
+npm_root() { npm root -g 2>/dev/null; }
+pi_ai_file() {
+  local r; r="$(npm_root)"
+  [ -n "$r" ] && printf '%s' "$r/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js"
+}
+dsh_installed() {
+  command -v dsh >/dev/null 2>&1 && return 0
+  local r; r="$(npm_root)"
+  [ -n "$r" ] && [ -d "$r/@deepseek-ai/dsh" ]
+}
+dsh_version() {
+  local r; r="$(npm_root)"
+  [ -n "$r" ] && sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$r/@deepseek-ai/dsh/package.json" 2>/dev/null | head -1
+}
+patch_marker_present() {
+  local f; f="$(pi_ai_file)"
+  [ -n "$f" ] && [ -f "$f" ] && grep -q 'geminiThoughtSignature' "$f"
+}
+allow_file_ready() {
+  local f="$MC_DIR/telegram-allow.json"
+  [ -f "$f" ] || return 1
+  python3 - "$f" <<'PY' >/dev/null 2>&1
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+if not isinstance(d,list) or not d: sys.exit(1)
+if any("PUT_YOUR" in str(x) for x in d): sys.exit(1)
+PY
+}
+token_ready() {
+  [ -n "${PAIR_TG_BOT_TOKEN:-}" ] && return 0
+  [ -s "$PAIR_HOME/pair-tg-token" ]
+}
 
 # --- node -------------------------------------------------------------------
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
@@ -42,15 +87,16 @@ elif [ -d "$NVM_DIR/versions/node" ]; then
   NODE_BIN="$(ls -d "$NVM_DIR"/versions/node/v${NODE_WANT_MAJOR}*/bin/node 2>/dev/null | sort -V | tail -1)"
 fi
 
-NODE_MAJOR="0"
+NODE_MAJOR=0
 [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ] && NODE_MAJOR="$("$NODE_BIN" -v | sed 's/^v//;s/\..*//')"
 
 if [ "$NODE_MAJOR" -ge 20 ]; then
   have "node $("$NODE_BIN" -v) ($NODE_BIN)"
   export PATH="$(dirname "$NODE_BIN"):$PATH"
 else
-  need "node >= 20 (want v$NODE_WANT_MAJOR via nvm)"
-  if [ "$CHECK_ONLY" = "0" ]; then
+  if [ "$CHECK_ONLY" = "1" ]; then
+    need "node >= 20 (want v$NODE_WANT_MAJOR via nvm)"
+  else
     [ -f "$NVM_DIR/nvm.sh" ] || {
       note "installing nvm..."
       curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
@@ -58,89 +104,103 @@ else
     . "$NVM_DIR/nvm.sh"
     nvm install "$NODE_WANT_MAJOR" >/dev/null
     nvm alias default "$NODE_WANT_MAJOR" >/dev/null
-    export PATH="$NVM_DIR/versions/node/v$("$NVM_DIR/nvm.sh" >/dev/null 2>&1; nvm version "$NODE_WANT_MAJOR" | tr -d 'v')/bin:$PATH"
     NODE_BIN="$(ls -d "$NVM_DIR"/versions/node/v${NODE_WANT_MAJOR}*/bin/node | sort -V | tail -1)"
     export PATH="$(dirname "$NODE_BIN"):$PATH"
     acted "node $(node -v) via nvm"
   fi
 fi
 
-# --- pnpm -------------------------------------------------------------------
-if command -v pnpm >/dev/null 2>&1; then
-  have "pnpm $(pnpm -v)"
+# --- pnpm (pinned to repo packageManager) -------------------------------------
+# measure pnpm in repo context: the corepack shim serves packageManager's pin there.
+PNPM_HAVE="$(cd "$ROOT" && pnpm -v 2>/dev/null || true)"
+if [ "$PNPM_HAVE" = "$PNPM_WANT" ]; then
+  have "pnpm $PNPM_HAVE"
 else
-  need "pnpm"
+  need "pnpm@$PNPM_WANT${PNPM_HAVE:+ (have $PNPM_HAVE)}"
   if [ "$CHECK_ONLY" = "0" ]; then
     if command -v corepack >/dev/null 2>&1; then
       corepack enable >/dev/null 2>&1 || true
-      corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
+      corepack prepare "pnpm@$PNPM_WANT" --activate >/dev/null 2>&1 || true
     fi
-    command -v pnpm >/dev/null 2>&1 || npm install -g pnpm >/dev/null
-    acted "pnpm $(pnpm -v 2>/dev/null || echo '?')"
+    [ "$(cd "$ROOT" && pnpm -v 2>/dev/null)" = "$PNPM_WANT" ] || npm install -g "pnpm@$PNPM_WANT" >/dev/null
+    acted "pnpm $(cd "$ROOT" && pnpm -v 2>/dev/null || echo 'FAILED')"
   fi
 fi
 
-# --- repo deps + build --------------------------------------------------------
+# --- repo deps + build ---------------------------------------------------------
 if [ -d "$ROOT/node_modules" ] && [ -d "$ROOT/dist" ]; then
   have "repo deps + dist/ build ($ROOT)"
 else
   need "pnpm install + build in $ROOT"
-  if [ "$CHECK_ONLY" = "0" ] && command -v pnpm >/dev/null 2>&1; then
+  if [ "$CHECK_ONLY" = "0" ]; then
     (cd "$ROOT" && pnpm install && pnpm build) && acted "pnpm install + build"
   fi
 fi
 
-# --- codex CLI -----------------------------------------------------------------
+# --- codex CLI (latest — nothing in PAIR depends on codex internals) -------------
 if command -v codex >/dev/null 2>&1; then
   have "codex $(codex --version 2>/dev/null | head -1)"
 else
   need "codex CLI (@openai/codex)"
-  run npm install -g @openai/codex >/dev/null && acted "codex CLI via npm -g"
-fi
-if [ -f "$HOME/.codex/auth.json" ]; then
-  have "codex auth (~/.codex/auth.json)"
-else
-  MISS+=("codex auth — run 'codex login' once (ChatGPT account or API key)")
-  note "[MISS] codex auth — run 'codex login' once"
-fi
-
-# --- dsh executor ---------------------------------------------------------------
-NPM_ROOT_G="$(npm root -g 2>/dev/null || true)"
-if command -v dsh >/dev/null 2>&1 || [ -n "$NPM_ROOT_G" ] && [ -d "$NPM_ROOT_G/@deepseek-ai/dsh" ]; then
-  have "dsh executor (@deepseek-ai/dsh)"
-else
-  need "dsh executor (@deepseek-ai/dsh)"
-  run npm install -g @deepseek-ai/dsh >/dev/null && acted "dsh via npm -g"
-  NPM_ROOT_G="$(npm root -g 2>/dev/null || true)"
-fi
-
-# gemini compat patch (re-run safe: exits 0 'already patched')
-# dsh may live under nvm's global node_modules — point the patcher at npm root -g.
-if [ -f "$ROOT/scripts/dsh-gemini-compat.sh" ] && [ -n "$NPM_ROOT_G" ]; then
   if [ "$CHECK_ONLY" = "0" ]; then
-    out="$(env DSH_PI_AI_PATH="$NPM_ROOT_G" bash "$ROOT/scripts/dsh-gemini-compat.sh" 2>&1 || true)"
-    case "$out" in
-      *"already patched"*|*"patched"*) acted "dsh gemini compat patch ($out)" ;;
-      *) note "  !! gemini compat patch: $out" ;;
-    esac
-  else
-    have "dsh gemini compat patch (re-applied on install)"
+    npm install -g @openai/codex >/dev/null && acted "codex CLI via npm -g"
   fi
 fi
 
-# dsh settings.yaml
-if [ -f "$DSH_HOME/settings.yaml" ]; then
+# --- dsh executor (pinned) -------------------------------------------------------
+NPM_ROOT_G="$(npm_root)"
+DSH_HAVE="$(dsh_version)"
+if dsh_installed && [ "$DSH_HAVE" = "$DSH_WANT" ]; then
+  have "dsh executor $DSH_HAVE"
+else
+  need "dsh executor @deepseek-ai/dsh@$DSH_WANT${DSH_HAVE:+ (have $DSH_HAVE)}"
+  if [ "$CHECK_ONLY" = "0" ]; then
+    npm install -g "@deepseek-ai/dsh@$DSH_WANT" >/dev/null
+    NPM_ROOT_G="$(npm_root)"
+    acted "dsh via npm -g ($(dsh_version))"
+  fi
+fi
+
+# --- dsh gemini compat patch (fail-closed, marker-verified) -----------------------
+if dsh_installed; then
+  if [ "$CHECK_ONLY" = "1" ]; then
+    if patch_marker_present; then
+      have "dsh gemini compat patch (marker verified)"
+    else
+      need "dsh gemini compat patch (unpatched at $(pi_ai_file))"
+    fi
+  else
+    # no || true — patcher failure must propagate to the final check.
+    if env DSH_PI_AI_PATH="$(npm_root)" bash "$ROOT/scripts/dsh-gemini-compat.sh" \
+       && patch_marker_present; then
+      acted "dsh gemini compat patch verified"
+    else
+      need "dsh gemini compat patch FAILED — dsh unusable until fixed"
+    fi
+  fi
+fi
+
+# --- dsh settings.yaml (+ .imported restore, same as start-pair-live.sh) ---------
+DSH_SETTINGS="$DSH_HOME/settings.yaml"
+if [ -f "$DSH_SETTINGS" ]; then
   have "dsh settings.yaml ($DSH_HOME)"
+elif [ -f "$DSH_SETTINGS.imported" ]; then
+  # dsh renames settings.yaml -> settings.yaml.imported after importing it once;
+  # never seed the template over it — restore the imported semantic config.
+  need "dsh settings.yaml (settings.yaml.imported present — install mode restores it)"
+  if [ "$CHECK_ONLY" = "0" ]; then
+    cp "$DSH_SETTINGS.imported" "$DSH_SETTINGS" && acted "settings.yaml restored from .imported"
+  fi
 else
   need "dsh settings.yaml"
   if [ "$CHECK_ONLY" = "0" ]; then
     mkdir -p "$DSH_HOME"
-    cp "$ROOT/scripts/pair-dsh-settings.example.yaml" "$DSH_HOME/settings.yaml" \
-      && acted "settings.yaml <- repo template (edit providers/models as needed)"
+    cp "$ROOT/scripts/pair-dsh-settings.example.yaml" "$DSH_SETTINGS" \
+      && acted "settings.yaml <- repo template"
   fi
 fi
 
-# --- cloudflared ------------------------------------------------------------------
+# --- cloudflared (latest — protocol-stable tunnel binary) -------------------------
 CF_BIN="${CLOUDFLARED_BIN:-$PAIR_HOME/cloudflared}"
 if command -v cloudflared >/dev/null 2>&1 || [ -x "$CF_BIN" ]; then
   have "cloudflared"
@@ -154,36 +214,78 @@ else
 fi
 
 # --- live dir scaffold --------------------------------------------------------------
-[ -d "$MC_DIR" ] || { need "$MC_DIR"; run mkdir -p "$MC_DIR" && acted "mkdir $MC_DIR"; }
-ALLOW_FILE="$MC_DIR/telegram-allow.json"
-if [ -f "$ALLOW_FILE" ]; then
-  have "telegram-allow.json"
+if [ -d "$MC_DIR" ]; then
+  have "$MC_DIR"
 else
-  need "telegram-allow.json (chat allowlist)"
-  run printf '["%s"]\n' "${PAIR_TG_CHAT_ID:-PUT_YOUR_TELEGRAM_CHAT_ID}" > "$ALLOW_FILE" \
-    && acted "telegram-allow.json scaffold — set PAIR_TG_CHAT_ID or edit it"
+  need "$MC_DIR"
+  if [ "$CHECK_ONLY" = "0" ]; then
+    mkdir -p "$MC_DIR" && acted "mkdir $MC_DIR"
+  fi
+fi
+if allow_file_ready; then
+  have "telegram-allow.json (valid, configured)"
+else
+  if [ "$CHECK_ONLY" = "1" ]; then
+    need "telegram-allow.json (missing / unparseable / placeholder)"
+  else
+    [ -f "$MC_DIR/telegram-allow.json" ] \
+      || printf '["%s"]\n' "${PAIR_TG_CHAT_ID:-PUT_YOUR_TELEGRAM_CHAT_ID}" > "$MC_DIR/telegram-allow.json"
+    if allow_file_ready; then
+      acted "telegram-allow.json configured"
+    else
+      need "telegram-allow.json — set PAIR_TG_CHAT_ID or edit $MC_DIR/telegram-allow.json"
+    fi
+  fi
 fi
 
-# --- secrets checklist (never print values) -------------------------------------------
+# === final state — authoritative summary + exit code ==============================
+# Recomputed from disk AFTER all install steps: a component that was installed
+# successfully reports [ok] here; nothing installed remains a stale MISS.
 echo
-echo "==> secrets checklist (configured = present, value never shown)"
-sec_env() { # name, file fallback
-  local name="$1" file="${2:-}"
-  if [ -n "${!name:-}" ]; then echo "  [ok]   $name (env)";
-  elif [ -n "$file" ] && [ -f "$file" ]; then echo "  [ok]   $name ($file)";
-  else echo "  [MISS] $name — set env or write $file"; MISS+=("$name"); fi
+echo "==> final state"
+FMISS=()
+freq() { # freq "label" test...
+  local label="$1"; shift
+  if "$@" >/dev/null 2>&1; then echo "  [ok]   $label"; else echo "  [MISS] $label"; FMISS+=("$label"); fi
 }
-sec_env PAIR_TG_BOT_TOKEN "$PAIR_HOME/pair-tg-token"
-for k in NVIDIA_API_KEY GROQ_API_KEY CLOUDFLARE_API_TOKEN GEMINI_API_KEY; do
-  sec_env "$k" ""
+node_ok() { command -v node >/dev/null 2>&1 && [ "$(node -v | sed 's/^v//;s/\..*//')" -ge 20 ]; }
+pnpm_ok() { [ "$(cd "$ROOT" && pnpm -v 2>/dev/null)" = "$PNPM_WANT" ]; }
+dsh_ok()  { dsh_installed && [ "$(dsh_version)" = "$DSH_WANT" ]; }
+patch_ok() { ! dsh_installed || patch_marker_present; }
+codex_auth_ok() { [ -f "$HOME/.codex/auth.json" ]; }
+env_set() { [ -n "${!1:-}" ]; }
+
+freq "node >= 20" node_ok
+freq "pnpm@$PNPM_WANT" pnpm_ok
+repo_built() { [ -d "$ROOT/node_modules" ] && [ -d "$ROOT/dist" ]; }
+freq "repo build (node_modules + dist)" repo_built
+freq "codex CLI" command -v codex
+freq "codex auth (~/.codex/auth.json — 'codex login' once)" codex_auth_ok
+freq "dsh @deepseek-ai/dsh@$DSH_WANT" dsh_ok
+freq "dsh gemini compat patch" patch_ok
+freq "dsh settings.yaml" test -f "$DSH_SETTINGS"
+cf_ok() { command -v cloudflared >/dev/null 2>&1 || [ -x "$CF_BIN" ]; }
+freq "cloudflared" cf_ok
+freq "telegram-allow.json configured" allow_file_ready
+
+echo "  -- required secrets (default live stack; values never shown)"
+freq "PAIR_TG_BOT_TOKEN or ~/pair-tg-token (non-empty)" token_ready
+for k in GROQ_API_KEY CLOUDFLARE_API_TOKEN GEMINI_API_KEY; do
+  freq "$k (env)" env_set "$k"
 done
+if env_set NVIDIA_API_KEY; then
+  echo "  [ok]   NVIDIA_API_KEY (optional — no default route uses it)"
+else
+  echo "  [info] NVIDIA_API_KEY unset — optional (no default route uses it)"
+fi
 [ -f "$PAIR_HOME/pair-mc-token" ] && echo "  [ok]   MC token file" \
   || echo "  [info] MC token — auto-generated by start-pair-live.sh"
 
 echo
-echo "==> summary: ${#OK[@]} ok, ${#ACT[@]} installed/changed, ${#MISS[@]} missing"
-if [ "${#MISS[@]}" -gt 0 ]; then
-  echo "    next: provide the [MISS] items above, then rerun this script."
+echo "==> summary: ${#FMISS[@]} still missing"
+if [ "${#FMISS[@]}" -gt 0 ]; then
+  echo "    next: fix the [MISS] items above, then rerun this script."
+else
+  echo "    ready: PAIR_TG_BOT_TOKEN=... bash scripts/start-pair-live.sh"
 fi
-echo "    then: PAIR_TG_BOT_TOKEN=... bash scripts/start-pair-live.sh"
-[ "${#MISS[@]}" -eq 0 ]
+[ "${#FMISS[@]}" -eq 0 ]
