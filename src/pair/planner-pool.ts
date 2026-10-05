@@ -410,30 +410,19 @@ export async function runPlannerFailover(opts: {
           const reaskCode = extractReaskEligibleCode(e);
           if (reaskCode) {
             const budget = opts.latencyBudget?.(c);
-            const remaining =
+            const preReproofRemaining =
               budget == null
                 ? Number.MAX_SAFE_INTEGER
                 : budget.ceilingMs - (Date.now() - t0);
-            if (remaining > 0) {
-              // §9/R4 — a second model invocation re-proves canonical
-              // eligibility first: authority failures propagate with the
-              // same semantics; availability rejection prevents the
-              // re-ask and normal failover proceeds.
-              let elig2;
-              try {
-                elig2 = await opts.assertEligible(c);
-              } catch (e2) {
-                settle({
-                  ...base,
-                  completed_at: now(),
-                  latency_ms: Date.now() - t0,
-                  outcome: "FAILED",
-                  warnings: [
-                    `AUTHORITY_REJECTED:${String((e2 as { code?: string }).code ?? (e2 instanceof Error ? e2.name : e2)).slice(0, 80)}`,
-                  ],
-                });
-                throw e2;
-              }
+            if (preReproofRemaining > 0) {
+              // §9/R4 + R1.A — a second model invocation re-proves
+              // canonical eligibility first. An authority throw falls
+              // straight into the outer catch, which settles the attempt
+              // EXACTLY ONCE (single FAILED record/event, original
+              // attempt_no) — no inner settle may precede it. An
+              // availability rejection prevents the re-ask; normal
+              // failover proceeds.
+              const elig2 = await opts.assertEligible(c);
               if (elig2 && elig2.reject) {
                 settle({
                   ...base,
@@ -445,9 +434,21 @@ export async function runPlannerFailover(opts: {
                 });
                 continue;
               }
+              // R1.B — remaining budget is recomputed AFTER the
+              // re-proof consumed real time; a non-positive remainder
+              // means no marker, no event, no second invocation — the
+              // candidate settles on the ORIGINAL canonical rejection.
+              const remaining =
+                budget == null
+                  ? Number.MAX_SAFE_INTEGER
+                  : budget.ceilingMs - (Date.now() - t0);
+              if (remaining > 0) {
               // Durable BEFORE the second invocation: the STARTED row
               // records PAIR's re-ask so a crash mid-call can never make
-              // the second model request silently absent.
+              // the second model request silently absent. R1.C — the
+              // persistence seam itself fails closed (governance
+              // IntegrityError) when provenance cannot be established;
+              // the model is then never invoked.
               opts.onAttemptReask?.(token, reaskCode);
               reaskInitiated = reaskCode;
               const res2 = await opts.planFn(c, {
@@ -542,6 +543,7 @@ export async function runPlannerFailover(opts: {
                 ]),
               });
               continue;
+              }
             }
           }
           settle({

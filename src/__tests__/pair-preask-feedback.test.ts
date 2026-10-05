@@ -670,4 +670,294 @@ describe("P-REASK — canonical-rejection feedback re-ask", () => {
     expect(extractReaskEligibleCode(new Error("x"))).toBeNull();
     expect(extractReaskEligibleCode("FAIL_CLOSED_PLAN_INCOMPLETE")).toBeNull();
   });
+
+  /* -------------------- R1 remediation — adversarial -------------------- */
+
+  it("R1.A — re-proof authority throw settles ONCE, propagates exact code, zero REASK", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1a-"));
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const run = beginPlannerRun(store, { routes: ["p:A"], actor: "PAIR_PLANNER" });
+    let eligCalls = 0;
+    let planCalls = 0;
+    const ends: string[] = [];
+    const thrown = await runPlannerFailover({
+      candidates: [cand("A")],
+      planFn: async (_c, inv) => {
+        planCalls++;
+        return okPlan("p");
+      },
+      assertEligible: () => {
+        eligCalls++;
+        if (eligCalls === 2) {
+          throw new IntegrityError("FAIL_CLOSED_MODEL_AUTHORITY_DENIED", "credential revoked");
+        }
+      },
+      canonicalize: (tasks) => {
+        throw new IntegrityError("FAIL_CLOSED_PLAN_INCOMPLETE", "x");
+      },
+      onAttemptStart: (base) =>
+        persistPlannerAttemptStart(store, {
+          planner_run_id: String(run.planner_run_id),
+          record: base,
+          actor: "PAIR_PLANNER",
+        }).planner_attempt_id,
+      onAttemptReask: (token, code) =>
+        markPlannerAttemptReask(store, {
+          planner_attempt_id: String(token),
+          validation_code: code,
+          actor: "PAIR_PLANNER",
+        }),
+      onAttemptEnd: (token, rec) => {
+        ends.push(rec.outcome);
+        settlePlannerAttempt(store, {
+          planner_attempt_id: String(token),
+          record: rec,
+          actor: "PAIR_PLANNER",
+        });
+      },
+    }).then(
+      () => null,
+      (err) => err,
+    );
+    // Exact original authority error propagated.
+    expect(thrown).toBeInstanceOf(IntegrityError);
+    expect((thrown as IntegrityError).code).toBe("FAIL_CLOSED_MODEL_AUTHORITY_DENIED");
+    // Exactly ONE attempt row, ONE onAttemptEnd, ONE terminal FAILED event.
+    expect(store.list("planner_attempt")).toHaveLength(1);
+    expect(ends).toEqual(["FAILED"]);
+    const failedEvents = store
+      .listEvents("planner_attempt", (store.list("planner_attempt")[0] as { planner_attempt_id: string }).planner_attempt_id)
+      .filter((e) => String((e as { event_type?: string }).event_type) === "PLANNER_ATTEMPT_FAILED");
+    expect(failedEvents).toHaveLength(1);
+    // Zero REASK invocation and zero REASK marker/event.
+    expect(planCalls).toBe(1);
+    const row = store.list("planner_attempt")[0] as { warnings: string[]; attempt_no: number };
+    expect(row.warnings.join("|")).not.toContain("REASK:");
+    expect(row.attempt_no).toBe(1);
+    expect(
+      store
+        .listEvents("planner_attempt", (row as { planner_attempt_id: string }).planner_attempt_id)
+        .filter((e) => String((e as { event_type?: string }).event_type).includes("REASK")),
+    ).toHaveLength(0);
+  });
+
+  it("R1.B-1 — re-proof consuming the ENTIRE budget → no REASK, no marker, original PLAN_INVALID settle", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1b1-"));
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const run = beginPlannerRun(store, { routes: ["p:A", "p:B"], actor: "PAIR_PLANNER" });
+    const calls: string[] = [];
+    let reaskCalls = 0;
+    const res = await runPlannerFailover({
+      candidates: [cand("A"), cand("B")],
+      planFn: async (c, inv) => {
+        calls.push(`${c.model_entry_id}:${inv.kind}`);
+        return okPlan("p");
+      },
+      assertEligible: async () => {
+        await sleep(120); // re-proof burns the whole 60ms ceiling
+      },
+      canonicalize: (tasks, c) => {
+        if (c.model_entry_id === "A") throw new IntegrityError("FAIL_CLOSED_PLAN_INCOMPLETE", "x");
+        return tasks;
+      },
+      latencyBudget: () => ({ ceilingMs: 60, requestTimeoutMs: 10000 }),
+      onAttemptStart: (base) =>
+        persistPlannerAttemptStart(store, {
+          planner_run_id: String(run.planner_run_id),
+          record: base,
+          actor: "PAIR_PLANNER",
+        }).planner_attempt_id,
+      onAttemptReask: (token, code) => {
+        reaskCalls++;
+        markPlannerAttemptReask(store, {
+          planner_attempt_id: String(token),
+          validation_code: code,
+          actor: "PAIR_PLANNER",
+        });
+      },
+      onAttemptEnd: (token, rec) =>
+        settlePlannerAttempt(store, {
+          planner_attempt_id: String(token),
+          record: rec,
+          actor: "PAIR_PLANNER",
+        }),
+    });
+    // Candidate A: budget exhausted inside re-proof → original
+    // rejection semantics (VALIDATION_CODE + CANONICAL_VALIDATION_FAILED),
+    // zero REASK marker/event, zero second invocation.
+    expect(reaskCalls).toBe(0);
+    expect(calls).toEqual(["A:INITIAL", "B:INITIAL"]);
+    const rows = store.list("planner_attempt");
+    const rowA = rows.find((r) => String((r as { route?: string }).route).endsWith(":A")) as
+      | { warnings: string[]; failure_class: string }
+      | undefined;
+    expect(rowA).toBeTruthy();
+    expect(rowA!.warnings.join("|")).toContain("VALIDATION_CODE:FAIL_CLOSED_PLAN_INCOMPLETE");
+    expect(rowA!.warnings.join("|")).not.toContain("REASK:");
+    expect(rowA!.failure_class).toBe("PLAN_INVALID");
+    expect(
+      store
+        .listEvents("planner_attempt", String((rowA as { planner_attempt_id: string }).planner_attempt_id))
+        .filter((e) => String((e as { event_type?: string }).event_type).includes("REASK")),
+    ).toHaveLength(0);
+    expect(res.winner.model_entry_id).toBe("B");
+  });
+
+  it("R1.B-2 — re-proof consuming PART of the budget → REASK timeout reflects POST-reproof remainder", async () => {
+    const invs: PlannerInvocation[] = [];
+    let tEligStart = 0;
+    let tEligEnd = 0;
+    let eligCalls = 0;
+    const tStart = Date.now();
+    const res = await runPlannerFailover({
+      candidates: [cand("A")],
+      planFn: async (_c, inv) => {
+        invs.push(inv);
+        return okPlan("p");
+      },
+      assertEligible: async () => {
+        eligCalls++;
+        if (eligCalls === 2) {
+          tEligStart = Date.now();
+          await sleep(150);
+          tEligEnd = Date.now();
+        }
+      },
+      canonicalize: (tasks) => {
+        if (invs.length === 1) throw new IntegrityError("FAIL_CLOSED_PLAN_INCOMPLETE", "x");
+        return tasks;
+      },
+      latencyBudget: () => ({ ceilingMs: 60000, requestTimeoutMs: 10000 }),
+    });
+    expect(res.winner.model_entry_id).toBe("A");
+    expect(invs).toHaveLength(2);
+    const reask = invs[1];
+    // Post-reproof remainder bound: timeout must be at most the budget
+    // remaining measured when the re-proof FINISHED (not when it
+    // started) — slack only for scheduling jitter.
+    const postReproofBound = 60000 - (tEligEnd - tStart);
+    expect(reask.timeoutMs).toBeLessThanOrEqual(postReproofBound + 25);
+    // And strictly below what a PRE-reproof snapshot would have allowed:
+    const preReproofBound = 60000 - (tEligStart - tStart);
+    expect(reask.timeoutMs).toBeLessThan(preReproofBound);
+    expect(reask.timeoutMs).toBeGreaterThan(0);
+  });
+
+  it("R1.C — persistence seam fail-closed: missing attempt evidence → REASK never invokes the model", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1c-"));
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const run = beginPlannerRun(store, { routes: ["p:A"], actor: "PAIR_PLANNER" });
+    let planCalls = 0;
+    const thrown = await runPlannerFailover({
+      candidates: [cand("A")],
+      planFn: async (_c, inv) => {
+        planCalls++;
+        return okPlan("p");
+      },
+      assertEligible: () => {},
+      canonicalize: (tasks) => {
+        throw new IntegrityError("FAIL_CLOSED_PLAN_INCOMPLETE", "x");
+      },
+      onAttemptStart: (base) =>
+        persistPlannerAttemptStart(store, {
+          planner_run_id: String(run.planner_run_id),
+          record: base,
+          actor: "PAIR_PLANNER",
+        }).planner_attempt_id,
+      onAttemptReask: () => {
+        // Point the canonical seam at a row that does not exist.
+        markPlannerAttemptReask(store, {
+          planner_attempt_id: "PA_DOES_NOT_EXIST",
+          validation_code: "FAIL_CLOSED_PLAN_INCOMPLETE",
+          actor: "PAIR_PLANNER",
+        });
+      },
+      onAttemptEnd: (token, rec) =>
+        settlePlannerAttempt(store, {
+          planner_attempt_id: String(token),
+          record: rec,
+          actor: "PAIR_PLANNER",
+        }),
+    }).then(
+      () => null,
+      (err) => err,
+    );
+    expect(thrown).toBeInstanceOf(IntegrityError);
+    expect((thrown as IntegrityError).code).toBe("FAIL_CLOSED_PLANNER_REASK_PROVENANCE:MISSING");
+    expect(planCalls).toBe(1); // model #2 never invoked
+  });
+
+  it("R1.C-2 — non-STARTED attempt row blocks the re-ask at the canonical seam", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pair-preask-r1c2-"));
+    const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const run = beginPlannerRun(store, { routes: ["p:A"], actor: "PAIR_PLANNER" });
+    const start = persistPlannerAttemptStart(store, {
+      planner_run_id: String(run.planner_run_id),
+      record: {
+        planner_run_id: String(run.planner_run_id),
+        route: "p:A",
+        provider: "p",
+        model_entry_id: "A",
+        model: "A",
+        attempt_no: 1,
+        outcome: "STARTED",
+        started_at: new Date().toISOString(),
+        warnings: [],
+      },
+      actor: "PAIR_PLANNER",
+    });
+    // Settle it first → no longer STARTED.
+    settlePlannerAttempt(store, {
+      planner_attempt_id: String(start.planner_attempt_id),
+      record: {
+        planner_run_id: String(run.planner_run_id),
+        route: "p:A",
+        provider: "p",
+        model_entry_id: "A",
+        model: "A",
+        attempt_no: 1,
+        outcome: "FAILED",
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+        latency_ms: 1,
+        warnings: [],
+      },
+      actor: "PAIR_PLANNER",
+    });
+    expect(() =>
+      markPlannerAttemptReask(store, {
+        planner_attempt_id: String(start.planner_attempt_id),
+        validation_code: "FAIL_CLOSED_PLAN_INCOMPLETE",
+      }),
+    ).toThrowError(/FAIL_CLOSED_PLANNER_REASK_PROVENANCE:OUTCOME/);
+    // Invalid validation identity likewise fail-closed.
+    expect(() =>
+      markPlannerAttemptReask(store, {
+        planner_attempt_id: String(start.planner_attempt_id),
+        validation_code: "lowercase bad!",
+      }),
+    ).toThrowError(/FAIL_CLOSED_PLANNER_REASK_PROVENANCE:CODE/);
+    // A STARTED row still accepts the marker (happy path preserved).
+    const s2 = persistPlannerAttemptStart(store, {
+      planner_run_id: String(run.planner_run_id),
+      record: {
+        planner_run_id: String(run.planner_run_id),
+        route: "p:A",
+        provider: "p",
+        model_entry_id: "A",
+        model: "A",
+        attempt_no: 2,
+        outcome: "STARTED",
+        started_at: new Date().toISOString(),
+        warnings: [],
+      },
+      actor: "PAIR_PLANNER",
+    });
+    expect(() =>
+      markPlannerAttemptReask(store, {
+        planner_attempt_id: String(s2.planner_attempt_id),
+        validation_code: "FAIL_CLOSED_PLAN_INCOMPLETE",
+      }),
+    ).not.toThrow();
+  });
 });

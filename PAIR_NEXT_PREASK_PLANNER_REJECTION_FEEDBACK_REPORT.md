@@ -182,3 +182,105 @@ being discarded after one narrow typed defect.
   F1–F5/RPN-1/DSN-1 invariants, or any env knob.
 
 **DO NOT MERGE** — pending independent audit.
+
+---
+
+## 10. R1 remediation (audit on HEAD `59357d82e4d8a4a5beae12c15d2fbc251be5fd64`)
+
+### R1.A — double-settlement on re-proof authority throw: CLOSED
+
+**Defect**: the second `assertEligible(c)` call sat inside an inner
+try/catch that settled the candidate `AUTHORITY_REJECTED` and then
+rethrew — the propagated `IntegrityError` landed in the outer catch,
+which settled the SAME candidate a second time: two `onAttemptEnd`
+calls, two `PLANNER_ATTEMPT_FAILED` events, two `attempts` entries.
+
+**Fix (smallest control-flow correction, no failover refactor)**: the
+inner try/catch was removed entirely; `const elig2 = await
+opts.assertEligible(c)` now falls straight into the outer catch, which
+settles the attempt EXACTLY ONCE with `AUTHORITY_REJECTED:<code>` and
+rethrows the ORIGINAL error unmodified. `reaskInitiated` is still null
+at that point so no REASK marker is merged; the attempt keeps its
+original `attempt_no`.
+
+**Proof** (test `R1.A`): INITIAL eligibility passes → non-empty plan →
+canonicalize throws `FAIL_CLOSED_PLAN_INCOMPLETE` (eligible) → second
+eligibility throws `FAIL_CLOSED_MODEL_AUTHORITY_DENIED` → asserted:
+exact propagated code, `planner_attempt` count == 1, `onAttemptEnd`
+calls == 1, `PLANNER_ATTEMPT_FAILED` events == 1, planFn invocations ==
+1 (zero REASK), zero `REASK:` markers/events, `attempt_no` == 1.
+
+### R1.B — remaining budget recomputed AFTER eligibility re-proof: CLOSED
+
+**Defect**: `remaining` was snapshotted BEFORE `assertEligible(c)` — the
+re-proof's own latency was never deducted from the REASK timeout, so a
+re-ask could exceed the candidate ceiling by exactly the proof's cost.
+
+**Fix**: keep the pre-check (`preReproofRemaining > 0` — skips the proof
+entirely when already out of budget), then after the proof PASSES
+recompute `remaining = ceilingMs - (Date.now() - t0)`. Only when that
+post-reproof remainder is positive is the durable REASK marker written
+and the model invoked, with `timeoutMs = min(requestTimeoutMs,
+remaining)`. Non-positive remainder → the candidate settles on the
+ORIGINAL canonical rejection (`VALIDATION_CODE:<code>` +
+`CANONICAL_VALIDATION_FAILED`, `PLAN_INVALID`) and failover proceeds.
+No new env knob.
+
+**Proof**:
+- `R1.B-1`: ceiling 60ms, re-proof sleeps 120ms → zero REASK
+  invocations, zero `REASK:` marker/event, attempt row carries the
+  original `VALIDATION_CODE:` + `PLAN_INVALID` settle, deterministic
+  failover to candidate B (winner).
+- `R1.B-2`: ceiling 60s, re-proof sleeps ~150ms → REASK
+  `timeoutMs <= ceiling - elapsed_at_proof_end (+25ms jitter)` AND
+  strictly below the pre-proof bound — the post-reproof remainder, not
+  the stale snapshot.
+
+### R1.C — REASK evidence persistence fails closed: CLOSED
+
+**Defect**: `markPlannerAttemptReask` silently returned when the
+`planner_attempt` row was missing, when `outcome !== "STARTED"`, or when
+the validation identity was invalid — the second model invocation would
+proceed with no durable provenance.
+
+**Fix**: the canonical seam now throws a governance-specific
+`IntegrityError` on each of those conditions:
+`FAIL_CLOSED_PLANNER_REASK_PROVENANCE:CODE` / `:MISSING` / `:OUTCOME`.
+`FAIL_CLOSED_PLANNER_*` is NOT in the P-REASK eligible prefix family
+(`FAIL_CLOSED_(PLAN|DELIVERY|TELEGRAM|TASK)_*`) — a persistence failure
+can never recurse into another re-ask. Thrown inside the outer try, it
+settles once as `AUTHORITY_REJECTED` (R1.A semantics) and propagates.
+Store CAS/event semantics unchanged. Production ordering is now:
+re-proof PASS → positive post-reproof remaining → durable marker +
+`PLANNER_ATTEMPT_REASK_STARTED` → only then model invocation #2.
+
+**Proof**: `R1.C` — `onAttemptReask` pointing at a nonexistent row →
+propagated `FAIL_CLOSED_PLANNER_REASK_PROVENANCE:MISSING`, planFn
+invocations == 1 (model #2 never invoked). `R1.C-2` — settled
+(non-STARTED) row → `:OUTCOME` throw; invalid identity → `:CODE` throw;
+a STARTED row still accepts the marker (happy path preserved).
+
+### R1 validation
+
+| Check | Result |
+|---|---|
+| Focused P-REASK (5 new adversarial) | **30/30 PASS** |
+| Regression (11 files: preask, phase-b, cpl1, llm-planner, pgrammar2, prv2a, prv2b, f3×3, dataflow-incident) | **522/522 PASS** |
+| Full suite | **3589 pass / 2 fail** — same 2 P5 env-only failures as baseline `66d2062`; not converted |
+| `tsc --noEmit` | clean |
+| `rm -rf dist && pnpm build` | clean |
+| `pnpm audit` | 6 moderate, 0 high — baseline unchanged |
+
+### R1 changed files (HEAD `59357d8` → R1 HEAD)
+
+```
+ src/pair/planner-pool.ts                       | inner catch removed; post-reproof recompute
+ src/pair/plan-preview.ts                       | markPlannerAttemptReask fail-closed
+ src/__tests__/pair-preask-feedback.test.ts     | +5 adversarial tests (25 → 30)
+```
+
+Scope held: no change to trigger prefixes, the one-request bound,
+prompt wording, F3 `replanContext`, canonicalize/coverage/dataflow/
+delivery gates, pool ordering, executor/model routing, or grammar.
+
+**DO NOT MERGE** — pending independent audit.
