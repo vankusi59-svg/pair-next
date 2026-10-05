@@ -35,6 +35,7 @@ import {
   sanitizePlan,
   isBookkeepingShapedTask,
   resolveWorkTaskBudget,
+  repairNetworkCapabilityBinding,
   LLM_PLANNER_MIN_TASKS,
   type PlannerRejectionContext,
 } from "./llm-planner.js";
@@ -406,15 +407,22 @@ export async function codexPlannerPlan(
     cfg.capabilitySets,
   );
   if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
+  // Bounded repair BEFORE the canonical network gates — the SAME helper the
+  // HTTP/Gemini lane uses, at the equivalent post-sanitize seam.
+  const netRepair = repairNetworkCapabilityBinding(tasks, {
+    goal,
+    allowedCapabilities: cfg.allowedCapabilities,
+    capabilitySets: cfg.capabilitySets,
+  });
   // PRV2-A §D — degenerate = ZERO usable work tasks (a bookkeeping-only
   // plan performs no work; PAIR injects bookkeeping itself).
-  const usable = tasks.filter(
+  const usable = netRepair.tasks.filter(
     (t) => !isBookkeepingShapedTask(t, sanitizeCaps),
   );
   if (usable.length < LLM_PLANNER_MIN_TASKS) {
-    return { tasks: [], warnings: [...warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE] };
+    return { tasks: [], warnings: [...warnings, ...netRepair.warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE] };
   }
-  return { tasks, warnings };
+  return { tasks: netRepair.tasks, warnings: [...warnings, ...netRepair.warnings] };
 }
 
 /** argv the planner child runs under — exposed for evidence/tests: proves

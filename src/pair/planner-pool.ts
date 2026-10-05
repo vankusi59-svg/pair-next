@@ -206,7 +206,7 @@ export type PlannerFailureClass =
  */
 export function boundedAttemptWarnings(warnings: string[]): string[] {
   const isProtected = (w: string) =>
-    w.startsWith("REPAIRED_REMOTE_DEPENDENT_EDGE:") ||
+    w.startsWith("REPAIRED_") ||
     w.startsWith("REASK:") ||
     w.startsWith("REASK_SUCCEEDED:");
   const nonProtectedBudget = Math.max(

@@ -749,6 +749,53 @@ export function sanitizePlan(
   return { tasks, warnings };
 }
 
+/** Deterministic bounded repair: a task that is unambiguously a live/web
+ *  data-gatherer but forgot to declare NETWORK_ACCESS gets the capability
+ *  added BEFORE the canonical network gates evaluate — instead of the plan
+ *  dying on a model annotation omission. Eligibility requires ALL of:
+ *  (a) the operator goal itself authorizes current/external data;
+ *  (b) the task's own instruction is fetch-shaped (taskRequiresNetworkAccess);
+ *  (c) it is real gathering work (instructionIsDataGathering);
+ *  (d) its subject binds to the goal's subject (instructionSatisfiesGoalSubject);
+ *  (e) NETWORK_ACCESS is in the planner's allowed vocabulary;
+ *  (f) the repaired capability set stays jointly servable by ≥1 supplied
+ *      executor capability set — never fabricates an unrunnable task.
+ *  Anything else stays untouched and the canonical gates decide. Emits
+ *  `REPAIRED_NETWORK_CAPABILITY:<task_key>` warnings; shared by llmPlan and
+ *  codexPlannerPlan — ONE implementation, no per-transport variants. */
+export function repairNetworkCapabilityBinding(
+  tasks: Array<Record<string, unknown>>,
+  opts: {
+    goal: string;
+    allowedCapabilities: string[];
+    capabilitySets?: string[][];
+  },
+): { tasks: Array<Record<string, unknown>>; warnings: string[] } {
+  const warnings: string[] = [];
+  if (!goalRequiresCurrentExternalData(opts.goal)) return { tasks, warnings };
+  if (!opts.allowedCapabilities.includes("NETWORK_ACCESS")) return { tasks, warnings };
+  // Servability must be PROVEN against a supplied executor set — when no
+  // capabilitySets were supplied there is nothing to prove it against.
+  if (!opts.capabilitySets?.length) return { tasks, warnings };
+  const out = tasks.map((t) => {
+    const caps = Array.isArray(t.required_capabilities)
+      ? t.required_capabilities.map((c) => String(c))
+      : [];
+    if (caps.includes("NETWORK_ACCESS")) return t;
+    const instruction = String(t.task_instruction ?? "");
+    if (!taskRequiresNetworkAccess(instruction)) return t;
+    if (!instructionIsDataGathering(instruction)) return t;
+    if (!instructionSatisfiesGoalSubject(instruction, opts.goal)) return t;
+    const repaired = [...new Set([...caps, "NETWORK_ACCESS"])].sort();
+    if (!opts.capabilitySets!.some((set) => repaired.every((c) => set.includes(c)))) {
+      return t;
+    }
+    warnings.push(`REPAIRED_NETWORK_CAPABILITY:${String(t.task_key ?? "")}`);
+    return { ...t, required_capabilities: repaired };
+  });
+  return { tasks: out, warnings };
+}
+
 const SYSTEM_PROMPT = `You are the PAIR OS mission planner. Convert the operator's mission goal into a JSON task DAG.
 
 Output ONLY a JSON object: {"tasks": [...]}. Each task is a WORK task — work that serves the goal directly:
@@ -921,7 +968,15 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     if (reservedKey) return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${reservedKey}`] };
     const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], sanitizeCaps, maxTasks, cfg.capabilitySets);
     if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
-    return { tasks, warnings };
+    // Bounded repair BEFORE the canonical network gates: a fetch-shaped task
+    // missing NETWORK_ACCESS gets it added deterministically (same helper the
+    // codex planner lane uses) instead of dying on the annotation omission.
+    const repair = repairNetworkCapabilityBinding(tasks, {
+      goal,
+      allowedCapabilities: cfg.allowedCapabilities,
+      capabilitySets: cfg.capabilitySets,
+    });
+    return { tasks: repair.tasks, warnings: [...warnings, ...repair.warnings] };
   };
 
   // Degenerate output (ZERO usable work tasks — a bookkeeping-only plan
