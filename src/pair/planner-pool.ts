@@ -165,67 +165,9 @@ export function extractReaskDetail(e: unknown, validationCode: string): string {
       }
       break;
     }
-    case "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED": {
-      // gate detail: {"requirements": [<id>, ...], "reason": "UNDECLARED",
-      //               "missing_count": <n>, "undeclared_tasks": [<key>, ...]}
-      // — requirement ids and task keys only, never requirement text.
-      const j = tryJsonObject(detail);
-      const safeList = (v: unknown, cap: number): string[] =>
-        Array.isArray(v)
-          ? v
-              .map(safeField)
-              .filter((x): x is string => typeof x === "string")
-              .slice(0, cap)
-          : [];
-      const reqs = j ? safeList(j.requirements, 16) : [];
-      const undeclared = j ? safeList(j.undeclared_tasks, 8) : [];
-      const mc = j ? j.missing_count : undefined;
-      if (reqs.length || undeclared.length) {
-        // Bounded formatter: reserve the mandatory ` reason=UNDECLARED`
-        // suffix, then spend the remaining budget in priority order
-        // (requirements > missing_count > undeclared_tasks), adding
-        // identifiers one at a time so a valid large input degrades to a
-        // shorter-but-useful line instead of collapsing to the bare code.
-        const reasonSuffix = " reason=UNDECLARED";
-        const budget = REASK_DETAIL_MAX_LEN - reasonSuffix.length;
-        const parts: string[] = [];
-        let used = 0;
-        const appendCsvField = (label: string, values: string[]): number => {
-          let csv = "";
-          let rendered = 0;
-          for (const v of values) {
-            const next = csv ? `${csv},${v}` : v;
-            const cost = (used > 0 ? 1 : 0) + label.length + next.length;
-            if (used + cost > budget) break;
-            csv = next;
-            rendered++;
-          }
-          if (rendered > 0) {
-            parts.push(`${label}${csv}`);
-            used += (used > 0 ? 1 : 0) + label.length + csv.length;
-          }
-          return rendered;
-        };
-        const renderedReqs = appendCsvField("requirements=", reqs);
-        if (
-          typeof mc === "number" &&
-          Number.isInteger(mc) &&
-          mc > 0 &&
-          mc <= 128 &&
-          mc > renderedReqs
-        ) {
-          const token = `missing_count=${mc}`;
-          const cost = (used > 0 ? 1 : 0) + token.length;
-          if (used + cost <= budget) {
-            parts.push(token);
-            used += cost;
-          }
-        }
-        appendCsvField("undeclared_tasks=", undeclared);
-        if (parts.length) out = `${parts.join(" ")}${reasonSuffix}`;
-      }
-      break;
-    }
+    // (FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED retired — the UNDECLARED gate
+    // no longer exists under the simplified planner contract; the
+    // PLAN_INCOMPLETE branch above still carries fabricated-claim detail.)
     case "FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED": {
       // gate detail: "task <key> requests live/web fetching without NETWORK_ACCESS"
       const m = /^task (\S+) requests live\/web fetching without NETWORK_ACCESS$/.exec(detail);

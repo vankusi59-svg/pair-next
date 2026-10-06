@@ -364,8 +364,11 @@ describe("R3 — explicit-host-only operator authorization (adversarial A–K)",
     expect(rbad.tasks[0].required_capabilities).not.toContain("NETWORK_ACCESS");
   });
 
-  it("R3.I — fresh contract regression: missing/malformed/conflict unchanged", async () => {
-    // missing
+  it("R3.I — fresh contract under simplification: missing/malformed/conflict degrade to 'no evidence', never kill", async () => {
+    // PLANNER-CONTRACT SIMPLIFICATION — the advisory field is optional:
+    // annotation defects degrade to 'no structured evidence' and PAIR
+    // derives authority from the instruction (which here names the
+    // goal-authorized host mql5.com → REQUIRED, bound upstream).
     const miss = planJson([
       {
         task_key: "T2",
@@ -378,8 +381,8 @@ describe("R3 — explicit-host-only operator authorization (adversarial A–K)",
     ]);
     const r1 = await llmPlan("Research MQL5.com", { ...CFG, fetchFn: okFetch(miss) });
     const f1 = canonFail(() => canon(r1.tasks, "Research MQL5.com"));
-    expect(f1?.detail).toContain("REQUIREMENT_MISSING");
-    // malformed
+    expect(f1 === null || !f1.code.includes("NETWORK")).toBe(true);
+    // malformed — degrade + PAIR-owned binding elevates via instruction
     const mal = planJson([
       emitFetchTask("mql5.com"),
     ]);
@@ -391,8 +394,8 @@ describe("R3 — explicit-host-only operator authorization (adversarial A–K)",
     });
     expect(r2.warnings).toContain("MALFORMED_NETWORK_REQ:T2");
     const f2 = canonFail(() => canon(r2.tasks, "Research MQL5.com"));
-    expect(f2?.detail).toContain("REQUIREMENT_MALFORMED");
-    // conflict top-level vs metadata
+    expect(f2 === null || !f2.code.includes("NETWORK")).toBe(true);
+    // conflict top-level vs metadata — same degradation
     const con = planJson([emitFetchTask("mql5.com")]);
     const p3 = JSON.parse(con) as { tasks: Array<Record<string, unknown>> };
     p3.tasks[0].metadata = { network_requirement: LOCAL_REQ };
@@ -402,7 +405,7 @@ describe("R3 — explicit-host-only operator authorization (adversarial A–K)",
     });
     expect(r3.warnings).toContain("NETWORK_REQ_CONFLICT:T2");
     const f3 = canonFail(() => canon(r3.tasks, "Research MQL5.com"));
-    expect(f3?.detail).toContain("REQUIREMENT_CONFLICT");
+    expect(f3 === null || !f3.code.includes("NETWORK")).toBe(true);
   });
 
   it("R3.J — persisted legacy regression: provenance-gated detectors still apply exactly as R2", () => {
@@ -419,9 +422,11 @@ describe("R3 — explicit-host-only operator authorization (adversarial A–K)",
     // network authority itself does not reject (a later gate may judge)
     const f = canonFail(() => canon([legacyTask], goal, "persisted"));
     expect(f === null || !f.code.includes("NETWORK")).toBe(true);
-    // and the same bytes under fresh provenance still fail REQUIREMENT_MISSING
+    // and the same bytes under fresh provenance: the missing advisory
+    // field degrades — PAIR derives REQUIRED from the fetch-shaped
+    // instruction itself, so it no longer dies on REQUIREMENT_MISSING.
     const f2 = canonFail(() => canon([legacyTask], goal, "fresh"));
-    expect(f2?.detail).toContain("REQUIREMENT_MISSING");
+    expect(f2 === null || !f2.code.includes("NETWORK")).toBe(true);
   });
 
   it("R3.K — digest/replay: no new mutable authority field exists to bind", async () => {

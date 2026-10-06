@@ -4,8 +4,9 @@
  * A plan may pin only when every mandatory obligation/deliverable the
  * Goal Contract extracted from the raw operator goal is genuinely covered
  * by a canonical work task, no constraint is contradicted, and no
- * prohibition is invoked. The model's pair_coverage mapping is a proposal
- * — PAIR verifies coverage independently, so lying never helps.
+ * prohibition is invoked. The model's pair_coverage mapping is an
+ * OPTIONAL hint — PAIR verifies coverage independently (existential
+ * evidence), so lying never helps and a missing hint never kills.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -64,13 +65,13 @@ const work = (
   ...(pairCov !== undefined ? { pair_coverage: pairCov } : {}),
 });
 
-function expectCode(fn: () => unknown, code: string) {
+function expectCode(fn: () => unknown, code: string): IntegrityError {
   try {
     fn();
   } catch (e) {
     expect(e).toBeInstanceOf(IntegrityError);
     expect(String((e as IntegrityError).code ?? "")).toBe(code);
-    return;
+    return e as IntegrityError;
   }
   throw new Error(`expected ${code}`);
 }
@@ -141,9 +142,10 @@ describe("PRV2-B contract extraction", () => {
 /* --------------------------- coverage seam ---------------------------- */
 
 describe("PRV2-B coverage authority", () => {
-  it("A — obligation row no task declares → FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED", () => {
+  it("A — obligation row no task covers → FAIL_CLOSED_PLAN_INCOMPLETE (existential, hint contract)", () => {
     const only2 = TASKS_3OBL.slice(0, 2);
-    expectCode(() => canon(only2, GOAL_3OBL), "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED");
+    const e = expectCode(() => canon(only2, GOAL_3OBL), "FAIL_CLOSED_PLAN_INCOMPLETE");
+    expect(String(e.detail)).toContain("OBL_003");
   });
 
   it("B — every obligation covered by a valid task → PASS", () => {
@@ -258,16 +260,18 @@ describe("PRV2-B coverage authority", () => {
       work("T1", "research competitors and list their positioning", ["REASONING"], [], undefined, ["OBL_001"]),
       work("T3", "propose 3 sales strategies based on the comparison", ["REASONING"], [], undefined, ["OBL_003"]),
     ];
-    expectCode(() => canon(replanned, GOAL_3OBL), "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED");
+    const e = expectCode(() => canon(replanned, GOAL_3OBL), "FAIL_CLOSED_PLAN_INCOMPLETE");
+    expect(String(e.detail)).toContain("OBL_002");
   });
 
-  it("K — bookkeeping can never declare coverage", () => {
+  it("K — bookkeeping can never satisfy coverage", () => {
     const contract = extractGoalContract(GOAL_3OBL);
     const bk = canonicalBookkeepingTask(GOAL_3OBL) as Record<string, unknown>;
-    expectCode(
+    const e = expectCode(
       () => assertPlanCoverage(contract, [bk]),
-      "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED",
+      "FAIL_CLOSED_PLAN_INCOMPLETE",
     );
+    expect(String(e.detail)).toContain("OBL_001");
   });
 
   it("coverage states: budget PROVEN, deadline PRESERVED, unverifiable constraint never PROVEN", () => {
@@ -505,7 +509,7 @@ describe("PRV2-B R2 — a mandatory bounded constraint may not be silently dropp
       assertPlanCoverage(extractGoalContract(GOAL_ONLY2), [
         canonicalBookkeepingTask("g") as Record<string, unknown>,
       ]);
-    expectCode(report, "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED");
+    expectCode(report, "FAIL_CLOSED_PLAN_INCOMPLETE");
   });
 
   it("R2-6: budget — '100 USD' form → CONSTRAINT_VIOLATION", () => {
@@ -569,7 +573,7 @@ describe("PRV2-B failover", () => {
     expect(res.attempts[0].outcome).toBe("FAILED");
     expect(res.attempts[0].failure_class).toBe("PLAN_INVALID");
     expect(res.attempts[0].warnings.join("|")).toContain(
-      "REASK:FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED",
+      "REASK:FAIL_CLOSED_PLAN_INCOMPLETE",
     );
     expect(res.winner?.route).toBe("c2");
     expect(res.tasks.length).toBe(4);
@@ -601,7 +605,7 @@ describe("PRV2-B failover", () => {
     expect(res.attempts).toHaveLength(1);
     expect(res.attempts[0].outcome).toBe("SUCCESS");
     expect(res.attempts[0].warnings.join("|")).toContain(
-      "REASK_SUCCEEDED:FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED",
+      "REASK_SUCCEEDED:FAIL_CLOSED_PLAN_INCOMPLETE",
     );
     expect(res.winner?.route).toBe("c1");
     expect(res.tasks.length).toBe(4);

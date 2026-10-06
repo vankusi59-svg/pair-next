@@ -130,7 +130,10 @@ describe("PRV2-A prompt", () => {
     const liveData = prompt.split("\n").find((l) => l.includes("CURRENT/EXTERNAL DATA"))!;
     expect(liveData).not.toContain("MUST use REMOTE_CLOUD_TASK_EXECUTION");
     expect(liveData).toContain("NETWORK_ACCESS");
-    expect(liveData).toContain("Mission Router");
+    // planner-contract simplification: PAIR derives/binds — the model's
+    // capability claim is a hint, never the routing decision
+    expect(liveData).toContain("PAIR derives the network requirement");
+    expect(liveData).toContain("binds NETWORK_ACCESS");
   });
 
   it("2. software build work is no longer forced to REMOTE_CLOUD_TASK_EXECUTION", () => {

@@ -207,10 +207,11 @@ process.stdin.on("end", () => {
     expect(r.tasks[0].required_capabilities).toEqual(["REASONING"]);
   });
 
-  it("T4 (structured authority wins over prose): LOCAL-looking instruction but REQUIRED+authorized requirement → repair elevates; instruction never self-elevates alone", () => {
-    // requirement is the authority — a quiet instruction cannot suppress a
-    // declared REQUIRED requirement, and a loud one cannot elevate a
-    // declared LOCAL one.
+  it("T4 (evidence union): REQUIRED+authorized requirement elevates a quiet instruction — and a fetch-shaped instruction elevates a wrong LOCAL annotation (PAIR derives, annotation is advisory)", () => {
+    // requirement is evidence, not suppression: a valid REQUIRED
+    // requirement binds even when the instruction reads local; and under
+    // the simplified contract a wrong LOCAL annotation can no longer
+    // suppress the instruction's own fetch evidence.
     const quiet = [
       workTask("T2", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], [], [], REQ_MQL5),
     ];
@@ -234,8 +235,11 @@ process.stdin.on("end", () => {
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    expect(rLoud.warnings).toEqual([]);
-    expect(rLoud.tasks[0].required_capabilities).toEqual(["REASONING"]);
+    expect(rLoud.warnings).toEqual(["REPAIRED_NETWORK_CAPABILITY:T2"]);
+    expect(rLoud.tasks[0].required_capabilities).toEqual([
+      "NETWORK_ACCESS",
+      "REASONING",
+    ]);
   });
 
   it("T5 (wrong subject): REQUIRED requirement for a host the goal never authorizes → no repair; INVALID gate still rejects", () => {
@@ -330,7 +334,10 @@ process.stdin.on("end", () => {
     );
     expect(a?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
     expect(a?.detail).toContain("UNAUTHORIZED_SOURCE");
-    // (b) NOT_REQUIRED requirement + NETWORK cap → INVALID (UNAUTHORIZED_CAPABILITY)
+    // (b) NOT_REQUIRED task + a NETWORK claim → advisory claim survives
+    // (never an authority grant, never a rejection — PAIR derives the
+    // requirement; the claim merely routes to an executor whose own
+    // policy holds network)
     const b = canonFail(
       [
         BOOKKEEPING,
@@ -338,16 +345,14 @@ process.stdin.on("end", () => {
       ],
       GOAL_LOCAL,
     );
-    expect(b?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(b?.detail).toContain("UNAUTHORIZED_CAPABILITY");
-    // (c) missing field on a fresh emission → REQUIREMENT_MISSING
+    expect(b === null || !b.code.includes("NETWORK")).toBe(true);
+    // (c) missing field on a fresh emission → degrades to 'no evidence'
     const c = canonFail(
       [BOOKKEEPING, legacyTask("T2", "Write note.txt then reply DONE.", ["REASONING"])],
       GOAL_LOCAL,
     );
-    expect(c?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(c?.detail).toContain("REQUIREMENT_MISSING");
-    // (d) malformed field → REQUIREMENT_MALFORMED
+    expect(c === null || !c.code.includes("NETWORK")).toBe(true);
+    // (d) malformed field → same degradation
     const d = canonFail(
       [
         BOOKKEEPING,
@@ -358,7 +363,6 @@ process.stdin.on("end", () => {
       ],
       GOAL_LOCAL,
     );
-    expect(d?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(d?.detail).toContain("REQUIREMENT_MALFORMED");
+    expect(d === null || !d.code.includes("NETWORK")).toBe(true);
   });
 });

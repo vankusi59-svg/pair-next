@@ -110,10 +110,13 @@ const CONTENT_TOKEN_STOP = new Set([
 ]);
 
 /** Content-bearing tokens of a requirement clause — the subject words
- *  a covering task must share when no identity anchor exists. */
+ *  a covering task must share when no identity anchor exists. Unicode
+ *  letters are the token charset: diacritics-bearing text (Vietnamese
+ *  obligations like `tóm tắt mục đích dự án`) otherwise shatters into
+ *  sub-3 fragments and can never produce evidence. */
 function contentTokens(text: string): Set<string> {
   const out = new Set<string>();
-  for (const m of text.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+  for (const m of text.toLowerCase().matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0];
     if (w.length < 3 || /^\d+$/.test(w) || CONTENT_TOKEN_STOP.has(w)) continue;
     out.add(w);
@@ -125,7 +128,7 @@ function sharesContentToken(reqText: string, taskText: string): boolean {
   const req = contentTokens(reqText);
   if (!req.size) return false;
   const task = new Set<string>();
-  for (const m of taskText.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+  for (const m of taskText.toLowerCase().matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0];
     task.add(w);
     if (w.endsWith("s")) task.add(w.slice(0, -1));
@@ -496,43 +499,16 @@ export function assertPlanCoverage(
     }
   }
 
-  // P-COVMAP — the coverage map is a MANDATORY checklist: when the
-  // contract has mandatory rows, every work task must carry a (possibly
-  // empty) pair_coverage array, and every OBL_*/DEL_* id must be claimed
-  // by at least one work task. A missing declaration is its own failure
-  // class — FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED — distinct from
-  // PLAN_INCOMPLETE (declared coverage proved insufficient). A contract
-  // with zero OBL/DEL rows leaves this gate a no-op, as before.
-  const expectedIds = [
-    ...contract.obligations.map((r) => r.id),
-    ...contract.deliverables.map((r) => r.id),
-  ];
-  if (expectedIds.length) {
-    const declared = new Set<string>();
-    const undeclaredTasks: string[] = [];
-    for (const t of work) {
-      const pc = ((t.metadata ?? {}) as Record<string, unknown>).pair_coverage;
-      if (!Array.isArray(pc)) {
-        undeclaredTasks.push(String(t.task_key));
-        continue;
-      }
-      for (const id of pc) declared.add(String(id));
-    }
-    const missing = expectedIds.filter((id) => !declared.has(id));
-    if (missing.length || undeclaredTasks.length) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED",
-        JSON.stringify({
-          requirements: missing.slice(0, 16),
-          reason: "UNDECLARED",
-          missing_count: missing.length,
-          ...(undeclaredTasks.length
-            ? { undeclared_tasks: undeclaredTasks.slice(0, 8) }
-            : {}),
-        }),
-      );
-    }
-  }
+  // PLANNER-CONTRACT SIMPLIFICATION — `pair_coverage` is a HINT, never a
+  // mandate: a work task is no longer required to declare the map, and
+  // an unclaimed row can never kill a plan by bookkeeping alone. PAIR
+  // derives coverage existentially below — the same covers() evidence
+  // the claim validator uses — so a task genuinely performing an
+  // obligation satisfies it whether or not the model annotated it.
+  // What still fails closed: a DECLARED claim the task does not
+  // actually perform (validated above — fabricated evidence, never an
+  // authority grant), a claim on PAIR bookkeeping (above), and any row
+  // no task existentially provides (PLAN_INCOMPLETE below).
 
   const incomplete = (req: GoalRequirement): never => {
     throw new IntegrityError(

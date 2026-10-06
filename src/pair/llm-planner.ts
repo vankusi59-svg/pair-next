@@ -20,7 +20,7 @@ import {
   NETWORK_REQUIREMENT_ERROR_KEY,
   networkRequirementFieldState,
   parseNetworkRequirementShape,
-  resolveTaskNetworkAuthority,
+  resolveFreshTaskNetworkAuthority,
   type NetworkRequirement,
 } from "./network-requirement.js";
 
@@ -692,15 +692,16 @@ export function sanitizePlan(
       t.metadata && typeof t.metadata === "object" && !Array.isArray(t.metadata)
         ? (t.metadata as Record<string, unknown>)
         : {};
-    // P-COVMAP — every work task must declare its Goal Contract coverage
-    // checklist. Top-level `pair_coverage` is the authoritative model-facing
-    // field (the strict Codex schema can only emit top-level); a legacy HTTP
-    // `metadata.pair_coverage` is honored only when the top-level field is
-    // absent — both present and different is a deterministic conflict, and
-    // the task is dropped rather than silently resolved. Normalization keeps
-    // only canonical requirement-id grammar (OBL_/DEL_/CON_/PRO_/DDL_### —
-    // claimability is adjudicated at the coverage gate, never here), dedupes
-    // in stable order, bounds to 32, and stores the map canonically at
+    // Coverage hints: `pair_coverage` is OPTIONAL model evidence, never a
+    // mandate (planner-contract simplification — PAIR derives coverage
+    // existentially at the gate). Top-level `pair_coverage` is the
+    // model-facing field; a legacy HTTP `metadata.pair_coverage` is
+    // honored only when the top-level field is absent — both present and
+    // different is a deterministic conflict, and the task is dropped
+    // rather than silently resolved. Normalization keeps only canonical
+    // requirement-id grammar (OBL_/DEL_/CON_/PRO_/DDL_### — claimability
+    // is adjudicated at the coverage gate, never here), dedupes in
+    // stable order, bounds to 32, and stores the hint canonically at
     // `metadata.pair_coverage`.
     const topCoverage = t.pair_coverage;
     const metaCoverage = metadata.pair_coverage;
@@ -715,9 +716,8 @@ export function sanitizePlan(
     const rawCoverage = topCoverage !== undefined ? topCoverage : metaCoverage;
     if (rawCoverage !== undefined) {
       if (!Array.isArray(rawCoverage) || rawCoverage.length > 32) {
-        // Malformed field — strip it; when the contract has mandatory rows
-        // the completeness gate fails the candidate UNDECLARED (typed),
-        // teaching the planner to re-emit a valid map on the one re-ask.
+        // Malformed field — strip it; the field is a hint, so the task
+        // survives and PAIR's own coverage derivation decides.
         warnings.push(`DROP_MALFORMED_COVERAGE:${key}`);
         delete metadata.pair_coverage;
       } else {
@@ -731,14 +731,15 @@ export function sanitizePlan(
         metadata.pair_coverage = ids;
       }
     }
-    // R1/R2 — the model-facing structured network/source requirement
+    // R1/R2 — the optional advisory network/source requirement
     // (canonical semantics per network-requirement.ts). Top-level
-    // `network_requirement` is authoritative; `metadata.network_requirement`
-    // is honored only when top-level is absent. Under the fresh contract
-    // a conflict or malformed field is NEVER silently dropped: the task
-    // survives carrying a reserved `network_requirement_error` marker so
-    // the canonical gate rejects the CANDIDATE typed (REASK teaches the
-    // planner to re-emit a valid field) — nothing here decides NETWORK
+    // `network_requirement` wins; `metadata.network_requirement` is
+    // honored only when top-level is absent. A conflict or malformed
+    // field is never silently dropped: the task survives carrying a
+    // reserved `network_requirement_error` marker so the canonical gate
+    // can still read the defect (it no longer rejects on it — under the
+    // simplified planner contract the field is advisory evidence only,
+    // and PAIR derives authority itself) — nothing here decides NETWORK
     // authority (the canonicalizer + repair do).
     const topNetReq = t.network_requirement;
     const metaNetReq = metadata.network_requirement;
@@ -835,22 +836,28 @@ export function sanitizePlan(
   return { tasks, warnings };
 }
 
-/** Deterministic bounded repair: a task that is unambiguously a live/web
- *  data-gatherer but forgot to declare NETWORK_ACCESS gets the capability
- *  added BEFORE the canonical network gates evaluate — instead of the plan
- *  dying on a model annotation omission. Eligibility requires ALL of:
- *  (a) the task carries a valid structured network_requirement that
- *      semantically requires network (resolveTaskNetworkAuthority →
- *      REQUIRED) — shared verdict with the canonical gate;
- *  (b) the operator goal authorizes the declared source: the locator
- *      host is an explicit hostname/URL the goal literally names
- *      (exact or DNS-label-boundary subdomain — never an entity token);
- *  (c) NETWORK_ACCESS is in the planner's allowed vocabulary;
- *  (d) the repaired capability set stays jointly servable by ≥1 supplied
- *      executor capability set — never fabricates an unrunnable task.
- *  Anything else stays untouched and the canonical gates decide. Emits
- *  `REPAIRED_NETWORK_CAPABILITY:<task_key>` warnings; shared by llmPlan and
- *  codexPlannerPlan — ONE implementation, no per-transport variants. */
+/** Deterministic bounded repair: PAIR — not the planner — owns the
+ *  NETWORK_ACCESS binding. A task PAIR derives as network-requiring
+ *  (resolveFreshTaskNetworkAuthority → REQUIRED: a valid advisory
+ *  requirement, a fetch-shaped instruction, or an instruction naming a
+ *  goal-authorized host — always operator-authorized) gets the
+ *  capability added BEFORE the canonical network gates evaluate — the
+ *  plan never dies on a model annotation omission or a missing/wrong
+ *  structured field. Eligibility requires ALL of:
+ *  (a) the fresh authority verdict is REQUIRED (same shared verdict the
+ *      canonical gate consumes);
+ *  (b) NETWORK_ACCESS is in the planner's allowed vocabulary;
+ *  (c) the repaired capability set stays jointly servable by ≥1 supplied
+ *      executor capability set — executor POLICY decides availability,
+ *      never the planner's text; unservable stays unbound and the
+ *      canonical gate fails it closed.
+ *  A planner NETWORK_ACCESS claim on a task PAIR derives as
+ *  NOT_REQUIRED is advisory routing metadata — never an authority
+ *  grant and never a rejection reason (the claim merely routes to an
+ *  executor whose own policy holds network).
+ *  Emits `REPAIRED_NETWORK_CAPABILITY:<task_key>` warnings; shared by
+ *  llmPlan and codexPlannerPlan — ONE implementation, no per-transport
+ *  variants. */
 export function repairNetworkCapabilityBinding(
   tasks: Array<Record<string, unknown>>,
   opts: {
@@ -864,32 +871,31 @@ export function repairNetworkCapabilityBinding(
   // Servability must be PROVEN against a supplied executor set — when no
   // capabilitySets were supplied there is nothing to prove it against.
   if (!opts.capabilitySets?.length) return { tasks, warnings };
-  // R2 — ONE rule: the repair consumes the SAME canonical authority
-  // verdict as the canonical gate. Elevation requires ALL of:
-  //   semantic network required (valid structured requirement),
-  //   AND operator-side canonical authorization (the declared locator
-  //     host is one the operator goal itself names — planner declaration
-  //     alone is never authorization),
-  //   AND NETWORK_ACCESS in the planner's allowed vocabulary,
-  //   AND the repaired capability set jointly servable by ≥1 supplied
-  //     executor capability set — never fabricates an unrunnable task.
-  // Missing/malformed/contradictory fields are left for the canonical
-  // gate's typed rejection — this seam can never repair vocabulary-shaped
-  // instructions on a fresh emission.
   const goalHosts = extractGoalHosts(opts.goal);
+  const goalRequiresExternal = goalRequiresCurrentExternalData(opts.goal);
+  const goalHasSubject =
+    externalSubjectKeys(opts.goal).size > 0 ||
+    subjectAnchors(opts.goal).size > 0;
   const out = tasks.map((t) => {
     const caps = Array.isArray(t.required_capabilities)
       ? t.required_capabilities.map((c) => String(c))
       : [];
     if (caps.includes("NETWORK_ACCESS")) return t;
     const md = (t.metadata ?? {}) as Record<string, unknown>;
-    const res = resolveTaskNetworkAuthority({
+    const instr = String(t.task_instruction ?? "");
+    const res = resolveFreshTaskNetworkAuthority({
       req: (md.network_requirement ?? null) as NetworkRequirement | null,
       state: networkRequirementFieldState(t),
       goalHosts,
-      fresh: true,
+      instructionRequiresNetwork: taskRequiresNetworkAccess(instr),
+      goalRequiresExternalData: goalRequiresExternal,
+      instructionMatchesGoalSubject:
+        goalHasSubject && instructionSatisfiesGoalSubject(instr, opts.goal),
+      instruction: instr,
     });
-    if (res.verdict !== "REQUIRED" || !res.authorized) return t;
+    // INVALID is left untouched for the canonical gate's typed reject;
+    // NOT_REQUIRED needs no binding.
+    if (res.verdict !== "REQUIRED") return t;
     const repaired = [...new Set([...caps, "NETWORK_ACCESS"])].sort();
     if (!opts.capabilitySets!.some((set) => repaired.every((c) => set.includes(c)))) {
       return t;
@@ -907,13 +913,13 @@ Output ONLY a JSON object: {"tasks": [...]}. Each task is a WORK task — work t
 - "title": short label
 - "task_instruction": self-contained instruction for an autonomous executor agent. It must name the REAL WORK the operator asked for — carry the goal's subject matter verbatim into the instruction (e.g. goal "phân tích giá vàng hôm nay" → instruction "analyze today's gold price using ICT concepts — market structure, liquidity, order blocks — and write findings to analysis.txt"). NEVER emit meta-instructions like "analyze the goal" or "summarize the mission". Mention workspace-relative file paths when files must be read/written (e.g. "read mission_goal.txt", "write result to out.txt"). The executor runs inside the mission workspace.
 - "required_capabilities": subset of the ALLOWED_CAPABILITIES list — pick the minimum needed. The router maps capabilities to executors; you never name an executor.
-- "network_requirement": {"source_kind": "LOCAL"|"EXTERNAL_SITE"|"EXTERNAL_API"|"REMOTE_REPOSITORY"|"UNKNOWN", "access_intent": "NONE"|"READ"|"RESEARCH"|"FETCH", "freshness": "NOT_REQUIRED"|"REQUIRED"|"UNKNOWN", "source_locator": optional string} — REQUIRED on every work task: WHERE the task's INPUT data comes from. Deliverables (files, outbox, reports, telegram) are OUTPUT, never the source. LOCAL = workspace/repo/local data; EXTERNAL_SITE = a named website or page (+ locator like "mql5.com"); EXTERNAL_API = a web API; REMOTE_REPOSITORY = a remote repo/registry; UNKNOWN = you cannot tell. NONE = no source read; READ = retrieve specific items; RESEARCH = explore/aggregate; FETCH = pull current/live data. CONSISTENCY: EXTERNAL_*/REMOTE_REPOSITORY + READ/RESEARCH/FETCH ⇒ required_capabilities MUST include NETWORK_ACCESS and the instruction must carry the fetch intent or name the locator; LOCAL/UNKNOWN ⇒ the instruction may not request live/web fetching. Mismatch fails the plan. Pure compute: LOCAL+NONE+NOT_REQUIRED, no locator. AUTHORIZATION: an EXTERNAL_*/REMOTE_REPOSITORY source_locator must name a host the goal itself names (e.g. goal says "truy cập MQL5.com" → locator "mql5.com" or "https://www.mql5.com/..."); PAIR rejects external sources the operator goal did not authorize and treats every missing/malformed field as a plan-level failure — emit the field on EVERY work task.
+- "network_requirement": OPTIONAL advisory hint only — PAIR derives each task's network requirement itself from the instruction and the goal, and binds NETWORK_ACCESS itself; you never need to mint it. If you do emit it: {"source_kind": "LOCAL"|"EXTERNAL_SITE"|"EXTERNAL_API"|"REMOTE_REPOSITORY"|"UNKNOWN", "access_intent": "NONE"|"READ"|"RESEARCH"|"FETCH", "freshness": "NOT_REQUIRED"|"REQUIRED"|"UNKNOWN", "source_locator": optional string} describing WHERE the task's INPUT data comes from — it is a hint, never authority, and a declared external source the goal itself does not name is still rejected. When in doubt, omit it.
 - "depends_on": earlier task_keys only (DAG, acyclic). MUST list every task whose output this task needs: if it reads/copies/delivers a file another task writes, or uses its returned result, the producer goes in depends_on. Undeclared inputs make the task run before its data exists. Independent tasks stay parallel — only real producers are dependencies.
 
 Rules:
 - Emit ONLY genuine work tasks. PAIR injects its own bookkeeping task (recording the goal) before the plan is committed — NEVER emit a task whose purpose is recording the goal, and NEVER request AUTOMATON_TASK_EXECUTION (it is reserved for PAIR's injected bookkeeping task).
 - 1 to WORK_TASKS work tasks. Every task must exist for at least one concrete reason: a distinct deliverable/output, a distinct capability boundary, independently parallelizable work, a verification/review boundary, or a side-effect boundary. Do NOT split trivial sequential prose work into microtasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS for pure file writes.
-- CURRENT/EXTERNAL DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price"), the data-gathering task MUST include NETWORK_ACCESS in required_capabilities — it is a real routing fact: only an executor currently authorized for network access may serve the task, and the Mission Router chooses WHICH one. You describe WHAT the task needs; never assume a specific executor has or lacks internet. Instruct the task to RETURN the full findings as its final result text, and name produced files explicitly when a downstream task must read them.
+- CURRENT/EXTERNAL DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price"), the data-gathering task's instruction MUST say to fetch/collect it and name the real source — PAIR derives the network requirement and binds NETWORK_ACCESS itself from the instruction wording (a required_capabilities claim is a hint, never the decision). Instruct the task to RETURN the full findings as its final result text, and name produced files explicitly when a downstream task must read them.
 - SOFTWARE WORK: when the goal asks to build or fix software (xây/build/create a website/app/tool/bot/script, viết code, fix bug, deploy), pick the minimum capability set the job requires (CODE_GENERATION, CODE_EDITING, SHELL_EXECUTION, PYTHON_EXECUTION, FILE_OPERATIONS). You describe the work — the router decides which executor satisfies the set.
 - REMOTE DATAFLOW CONTRACT: tasks carrying REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION may execute remotely — their result text comes back, and their uploaded files land as canonical artifacts. A downstream task may depend on a remote task ONLY when it explicitly declares the produced artifact as an input (read the file it produces — name the artifact in its instruction or worker_spec); a remote dep with no declared artifact edge is rejected. TELEGRAM_DELIVERY tasks always may depend on remote tasks (they receive the remote result text through dependency_outputs).
 - VISUAL DELIVERABLES: a chart computed from data the plan already produces is ordinary compute work (e.g. PYTHON_EXECUTION); a screenshot of a live website needs a task that includes NETWORK_ACCESS; a generated image is only possible when a governed image-generation capability exists in ALLOWED_CAPABILITIES. If a visual file is produced by a task that may execute remotely, it must be uploaded via the outbox endpoint described in that task's prompt — a file left on a remote machine is unusable. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
@@ -959,7 +965,7 @@ export function buildPlannerUserPrompt(
     ? `GOAL CONTRACT (canonical — you must cover it, not change it):\n` +
       reqLines.join("\n") +
       `\nEvery obligation needs ≥1 real work task performing that work; every deliverable needs a task that produces the exact named file; no task may contradict a constraint or do anything a prohibition forbids; quantities stated in the contract must be preserved verbatim. ` +
-      `COVERAGE MAP (mandatory): every work task MUST carry "pair_coverage": ["REQ_ID", ...] declaring exactly which OBL_* and DEL_* rows it covers (emit "pair_coverage": [] when it covers none); every OBL_* and DEL_* id listed above MUST be claimed by at least one work task; CON_*, PRO_* and DDL_* rows are checked by PAIR directly and MUST NOT be claimed; never invent requirement ids; declaration is a proposal only — PAIR independently verifies every claim, and a fabricated claim or an unclaimed row fails closed.\n`
+      `COVERAGE MAP (optional hint): a work task MAY carry "pair_coverage": ["REQ_ID", ...] naming the OBL_* and DEL_* rows it performs. PAIR derives and verifies coverage itself from your tasks — an unclaimed row that a task genuinely performs still passes; a claimed row the task does NOT actually perform is fabricated evidence and fails the plan closed. Never claim CON_*, PRO_* or DDL_* rows (PAIR checks those directly) and never invent requirement ids. When in doubt, omit the field.\n`
     : "";
   return (
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +
