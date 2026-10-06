@@ -98,14 +98,15 @@ const IMPL_LANE_CAPS = new Set([
 ]);
 
 /** Bounded deterministic task→executor-shape classifier: capability-based
- *  only, no instruction parsing. Remote-lane or network-only tasks prefer
- *  the remote/long-running account executor (DEVIN); implementation-lane
- *  tasks prefer the focused local account executor (CODEX); anything else
- *  is NEUTRAL and falls back to intra-tier priority order. */
+ *  only, no instruction parsing. Remote-lane tasks prefer the remote
+ *  account executor (DEVIN); implementation-lane tasks prefer the focused
+ *  local account executor (CODEX); anything else — including ordinary
+ *  NETWORK_ACCESS-only work — is NEUTRAL and falls back to conservative
+ *  intra-tier priority order. R2: capability shape is the execution
+ *  contract; a network-capable task is NOT a remote task. */
 export function taskSuitability(caps: ReadonlySet<string>): TaskSuitability {
   for (const c of caps) if (REMOTE_LANE_CAPS.has(c)) return "DEVIN_PREFERRED";
   for (const c of caps) if (IMPL_LANE_CAPS.has(c)) return "CODEX_PREFERRED";
-  if (caps.has("NETWORK_ACCESS")) return "DEVIN_PREFERRED";
   return "NEUTRAL";
 }
 
@@ -346,12 +347,20 @@ export class CapabilityRouter {
     // hard-eligible set ONLY: economic tier (account-session first) →
     // task-suitability rank → routing_priority → executor-id tie-break.
     // Suitability never admits, removes, or resurrects a candidate.
-    // R1: a declared task_profile (bounded planner hint, canonical
-    // metadata.task_profile) takes precedence over caps-based inference —
-    // it expresses the nature of the work, not a required executor.
-    const suitability =
-      profileSuitability(taskMeta.task_profile) ??
-      taskSuitability(requiredCapabilities);
+    // R2: task_profile is nature/audit metadata, NOT authority — it may
+    // only confirm a CODEX_PREFERRED (focused-local) nature. A
+    // DEVIN_PREFERRED profile (LONG_RESEARCH/REPO_SCALE/LONG_AUTONOMOUS)
+    // is honored only when the task's own capability contract is remote
+    // (REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION); on
+    // local/shared caps it degrades to caps-based inference so a local
+    // task can never be routed to DEVIN by metadata alone.
+    const declared = profileSuitability(taskMeta.task_profile);
+    const remoteContract = [...requiredCapabilities].some((c) => REMOTE_LANE_CAPS.has(c));
+    const suitability = remoteContract
+      ? "DEVIN_PREFERRED"
+      : declared === "CODEX_PREFERRED"
+        ? "CODEX_PREFERRED"
+        : taskSuitability(requiredCapabilities);
     eligible.sort(
       (a, b) =>
         accountTierOf(String(a.executor_id)) - accountTierOf(String(b.executor_id)) ||

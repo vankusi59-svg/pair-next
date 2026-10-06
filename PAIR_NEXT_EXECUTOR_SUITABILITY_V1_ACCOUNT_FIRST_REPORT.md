@@ -115,3 +115,32 @@ Mandate R1.A–R1.H. Same-task bounded fallback, daily-limit removal, VE structu
 - Focused: suitability 23/23; p5 20/22 (2 baseline env fails); p6 36/36; p7; phase-b 123/123; phase-d 37/37; f2-handoff 53/53; f5 74/74; llm-planner 17/17 — all green.
 - **Full suite: 3864 pass / 3 fail** — 3 fails byte-identical baseline (F4 R5.1-crash, 2× P5 env executables). Pass-count delta vs V1 count is exactly the test-file rewrite (27→23 tests).
 - `npx tsc --noEmit` clean; `rm -rf dist && npm run build` clean.
+
+## R2 — audit remediation round 2 (audited HEAD `efe6390`, pending audit)
+
+Scope-reduction: the owner-locked policy drops the universal DEVIN→CODEX same-task fallback for remote-shaped work. task_profile is nature/audit metadata, never execution authority.
+
+### R2.A/E — task_profile authority narrowed
+
+- Suitability rule rewritten: `remoteContract (caps ∩ REMOTE_LANE_CAPS) → DEVIN_PREFERRED; declared FOCUSED_LOCAL → CODEX_PREFERRED; else caps-based`. A DEVIN_PREFERRED profile (LONG_RESEARCH/REPO_SCALE/LONG_AUTONOMOUS) is honored ONLY when the task's own capability contract is remote; on local/shared caps it degrades to caps-based inference — profile can never route a local task to DEVIN (R2.3/R2.8).
+- `taskSuitability` no longer maps NETWORK_ACCESS-only → DEVIN_PREFERRED; ordinary network work is NEUTRAL → conservative intra-tier priority order (CODEX 60 before DEVIN 80). remote-vs-local classification remains purely capability-based — `isRemoteCapabilityTask` untouched, F2/F5 seams (remote_produces_contract, REMOTE_FETCH/LOCAL_MATERIALIZATION, dependency artifacts) unchanged (R2.9–11).
+
+### R2.B — same-task repo fallback requirement withdrawn
+
+- R1.3/R1.4 acceptance removed: `NETWORK_ACCESS + REPO_SCALE` is no longer a remote-routing claim. A remote task is `{REMOTE_CLOUD_TASK_EXECUTION|AUTONOMOUS_CODE_EXECUTION [+NETWORK_ACCESS]}` — DEVIN up → DEVIN; DEVIN down → eligible=∅ → existing recovery/replan, no forced local fallback (R2.4–R2.7).
+
+### R2.C — planner contract
+
+- `TASK PROFILE` bullet: profile = nature/audit metadata, never execution authority, required_capabilities is the contract. `REMOTE EXECUTION CONTRACT` bullet (replaces LARGE-SCALE wording): mint remote caps only for genuinely remote-sandbox work (autonomous remote session / remote workspace / long-running remote execution); ordinary network research = NETWORK_ACCESS + local caps, never remote-shaped; repo-scale/autonomous IS remote; no redundant local caps stacked onto remote tasks.
+
+### R2.F/G — unchanged
+
+- Daily Devin task count stays deleted; PAIR_COST_HALT/COST_HALT_FILE remain the operator kill switch (R2.15/16). DSH stays last: never vaults via priority/VE/P12, and remote-only tasks cannot degrade to DSH (it lacks remote caps — eligible=∅ is correct).
+
+### Tests (R2.1–R2.16 + boundary)
+
+`pair-executor-suitability-v1.test.ts` rewritten → 20 tests: full R2.1–R2.16 truth table + classifier (NETWORK_ACCESS→NEUTRAL), profileSuitability bounded map, receipt fields (task_suitability NEUTRAL + recorded profile), economic-class map, PAIR_NATIVE preserved, historical v1 receipt verify.
+
+- Focused: suitability 20/20; llm-planner 17/17; f3 20/20; p6 36/36; p7 36/36; f2-handoff 53/53; f5 74/74; phase-d 37/37; p5 20/22 (2 baseline env fails).
+- **Full suite: 3861 pass / 3 fail** — 3 fails byte-identical baseline (F4 R5.1-crash, 2× P5 env executables); pass delta vs R1 = test rewrite 23→20.
+- `npx tsc --noEmit` clean; `rm -rf dist && npm run build` clean.
