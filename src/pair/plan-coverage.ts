@@ -208,10 +208,19 @@ function taskCoversObligation(instr: string, req: GoalRequirement): boolean {
   if (!reqAnchors.size) {
     // No identity anchor: subject-class overlap OR a shared content
     // token is required — a shared verb alone ("the comparison") can
-    // never prove the task performs THIS obligation's work.
-    const taskKeysSet = externalSubjectKeys(t);
-    const keyOverlap = [...reqKeys].some((k) => taskKeysSet.has(k));
-    if (!keyOverlap && !sharesContentToken(req.text, t)) return false;
+    // never prove the task performs THIS obligation's work. Exception:
+    // a verb-only obligation names no subject at all — every token is an
+    // action lexeme or below the token floor, so no subject evidence can
+    // ever exist; demanding it makes the obligation un-coverable (dead
+    // obligation → PLAN_INCOMPLETE). When the requirement carries no
+    // subject evidence AND it did exercise a verb class (checked above),
+    // the same-class verb in the task is sufficient evidence.
+    const subjectEvidence = reqKeys.size > 0 || contentTokens(req.text).size > 0;
+    if (subjectEvidence || !reqVerbs.size) {
+      const taskKeysSet = externalSubjectKeys(t);
+      const keyOverlap = [...reqKeys].some((k) => taskKeysSet.has(k));
+      if (!keyOverlap && !sharesContentToken(req.text, t)) return false;
+    }
   }
   // Quantity preservation: a stated floor must appear in the task at
   // the same or a larger magnitude — "20" can never become "5".
