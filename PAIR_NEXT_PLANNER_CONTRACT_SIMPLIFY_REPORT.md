@@ -280,3 +280,118 @@ Report + CURRENT_STATE now list the model-facing contract correctly as
   outside the set can still contribute a subject token; the noun-identity
   trade-off is deliberate (not an NLP fix).
 - All other prior residuals unchanged.
+
+---
+
+# R2 AUDIT ROUND — FINAL fresh-network semantics (closes network planning for this PR)
+
+- R2 BASE HEAD: `90510faa2e6dc9e4d6048c2508248b4b6b717263`
+- R2 NEW HEAD: (see latest commit below)
+
+## FINAL FRESH NETWORK RULE
+
+`network_requirement` remains advisory-only — it is never read for any
+verdict. PAIR derives network need from the operator goal + the task's
+`task_instruction` alone, under exactly this rule:
+
+```
+if instruction names host(s):
+    if goalHosts.size > 0:
+        every instruction host MUST be authorized by goalHosts
+        otherwise → UNAUTHORIZED_SOURCE
+    else if goalRequiresExternalData:
+        instruction-selected hosts are allowed at PLAN level
+        (runtime/executor policy remains authoritative)
+    else:
+        instruction host is unauthorized → UNAUTHORIZED_SOURCE
+```
+
+- `network_requirement.source_locator` is NOT an input to this decision.
+- No authority is inferred from entity names.
+- A goal that neither names a host nor requests external/current data
+  authorizes no instruction-named host.
+
+## What changed vs R1
+
+R1 denied EVERY instruction-named host under a hostless goal. R2 narrows
+that: a hostless goal that DEMANDS external/current data
+(`goalRequiresCurrentExternalData` — recency-marked fetch/research on an
+external subject) lets the plan-level task select its real source — the
+exact production shape of "Phân tích giá vàng hôm nay" where the operator
+asks for current data but does not pick a website. The deny surface is
+untouched where it matters:
+
+- Goal names host(s) → instruction hosts ⊆ goal hosts, else
+  `UNAUTHORIZED_SOURCE` (least-authority boundary preserved, subdomain
+  rules per `goalAuthorizesHost` unchanged).
+- Goal names no host AND demands nothing external → instruction-invented
+  host still `UNAUTHORIZED_SOURCE` (R3.B invariant kept: "Research MQL5"
+  carries no recency marker → `mql5.com`/`mql5.attacker.example` in an
+  instruction still die).
+
+## plan-level selection ≠ runtime permission
+
+A selected source only satisfies plan authority. Execution still requires
+an executor serving `NETWORK_ACCESS` — under a no-network executor policy
+the plan still dies `FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED`
+(R2.6). MissionRouter, GovernedTaskGate, adapter/runtime controls and the
+Codex kill-switch are untouched.
+
+## Prompt cleanup (`llm-planner.ts`)
+
+Removed wording implying "a declared external source the goal itself does
+not name is still rejected". The prompt now states: operator-named site →
+preserve that boundary (subdomains ok); operator requests current/external
+research without a source → the instruction should name an appropriate
+real source; `network_requirement` optional advisory; PAIR/runtime decide
+actual network permission. No mandatory structured metadata reintroduced.
+
+## Tests
+
+`pair-planner-contract-simplify.test.ts` 32/32 (+9 R2): R2.1 hostless gold
+goal + `tradingview.com` → REQUIRED; R2.2 "from the web" → REQUIRED;
+R2.3 github goal + `attacker.example` → `UNAUTHORIZED_SOURCE`; R2.4
+github.com → REQUIRED; R2.5 "Summarize local report.txt" + invented host
+→ `UNAUTHORIZED_SOURCE`; R2.6 hostless external goal + chosen host + no
+network executor → zero repair + `TASK_NETWORK_CAPABILITY_REQUIRED`;
+R2.7 wrong/malformed/conflicting annotations flip no R2 verdict; R2.8
+persisted provenance keeps legacy INVALID semantics; R2.9 end-to-end
+hostless gold proof (PAIR binds `NETWORK_ACCESS`, plan pins). All R1 and
+pre-existing tests kept green — including R3.B, whose goal ("Research
+MQL5 and summarize") carries no recency marker and therefore authorizes
+no instruction-named host.
+
+## Validation
+
+- Focused planner set: **311/311** (simplify 32, netreq 15, netreq-r3 11,
+  binding-repair 10, covmap 15, prv2b-coverage 52, prv2a 59,
+  prohibition-narrowing 52, pgrammar2 26, preask 39).
+- Full suite: **3749 pass / 3 fail** — byte-identical baseline
+  (F4 `R5.1-crash` + 2× P5 env probes; 15 skipped).
+- `npx tsc --noEmit` clean; `npm run build` clean.
+- Aquascope canonical proof (E1) remains green under the final rule.
+
+## R2 explicit answers
+
+1. Goal names github.com, task chooses attacker.example — must fail?
+   **YES** (`UNAUTHORIZED_SOURCE`, R2.3).
+2. Goal requires current external data but names no host, task chooses
+   tradingview.com — may pass plan network authority? **YES** (R2.1,
+   R2.9).
+3. Can that task run when the selected executor has network disabled?
+   **NO** (`FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED`, R2.6).
+4. Can `network_requirement` annotation grant or deny authority?
+   **NO** (it is never read; R2.7).
+5. Persisted legacy missions changed? **NO** (`fresh:false` resolver
+   byte-unchanged; R2.8).
+
+## R2 residual risks
+
+- Hostless + external-demanding goals let ANY well-formed host in an
+  instruction pass plan authority — host trust is delegated to runtime
+  executor policy by design (the mandate's plan-vs-runtime distinction).
+- `goalRequiresCurrentExternalData` remains a lexical heuristic; a goal
+  with a recency marker the operator did not mean as external-demand
+  could authorize a chosen source. Bounded; acceptable per the mandate's
+  "no additional heuristics" directive.
+- All R1 residuals unchanged.

@@ -572,9 +572,22 @@ export function resolveFreshTaskNetworkAuthority(args: {
   // authorization stays fail-closed against hosts the INSTRUCTION
   // itself names (goal-text authority), never against annotation text.
   const instrHosts = extractGoalHosts(args.instruction);
-  for (const h of instrHosts) {
-    if (!goalAuthorizesHost(h, goalHosts)) {
+  // R2 final fresh-host policy:
+  //  - goal names hosts → every instruction-named host MUST be ⊆ them
+  //  - goal names none but demands external/current data → instruction
+  //    may SELECT its sources at plan level (runtime/executor policy
+  //    stays authoritative — plan authority ≠ network permission)
+  //  - goal names none and demands nothing external → instruction host
+  //    is unauthorized
+  if (instrHosts.size > 0 && goalHosts.size === 0) {
+    if (!args.goalRequiresExternalData) {
       return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
+    }
+  } else {
+    for (const h of instrHosts) {
+      if (!goalAuthorizesHost(h, goalHosts)) {
+        return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
+      }
     }
   }
   // Derived requirement: only the instruction's own wording + its named

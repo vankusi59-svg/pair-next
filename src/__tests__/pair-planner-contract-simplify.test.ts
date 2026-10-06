@@ -25,6 +25,9 @@ import { describe, expect, it } from "vitest";
 import {
   llmPlan,
   repairNetworkCapabilityBinding,
+  goalRequiresCurrentExternalData,
+  taskRequiresNetworkAccess,
+  instructionSatisfiesGoalSubject,
 } from "../pair/llm-planner.js";
 import {
   makeServeCanonicalizer,
@@ -35,6 +38,7 @@ import { assertPlanDataflow } from "../pair/plan-dataflow.js";
 import {
   extractGoalHosts,
   resolveFreshTaskNetworkAuthority,
+  resolveTaskNetworkAuthority,
   type NetworkRequirement,
 } from "../pair/network-requirement.js";
 import { IntegrityError } from "../pair/errors.js";
@@ -562,5 +566,176 @@ describe("R1.B — coverage subject evidence excludes action tokens", () => {
       "Summarize the report purpose and write it to outbox/r.txt.",
     );
     expect(f).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* R2 — final fresh-network rule: plan-level source selection           */
+/* ------------------------------------------------------------------ */
+
+describe("R2 — hostless external goal may select its source; named goal stays least-authority", () => {
+  const GOLD_GOAL = "Phân tích giá vàng hôm nay.";
+  const GITHUB_GOAL2 =
+    "Truy cập github.com và xem repository cognitive-engineering-lab/aquascope.";
+  const LOCAL_GOAL = "Summarize local report.txt.";
+
+  /** Resolve the fresh verdict exactly the way the canonical gate does. */
+  const verdict = (
+    goal: string,
+    instruction: string,
+    req: Record<string, unknown> | null = null,
+    state: "missing" | "valid" | "malformed" | "conflict" = "missing",
+  ) =>
+    resolveFreshTaskNetworkAuthority({
+      req: req as never,
+      state,
+      goalHosts: extractGoalHosts(goal),
+      instructionRequiresNetwork: taskRequiresNetworkAccess(instruction),
+      goalRequiresExternalData: goalRequiresCurrentExternalData(goal),
+      instructionMatchesGoalSubject: instructionSatisfiesGoalSubject(
+        instruction,
+        goal,
+      ),
+      instruction,
+    });
+
+  it("R2.1 hostless external goal + concrete chosen host → REQUIRED/PASS", () => {
+    const v = verdict(
+      GOLD_GOAL,
+      "Fetch current gold prices from tradingview.com and write gold.txt.",
+    );
+    expect(v).toMatchObject({ verdict: "REQUIRED", authorized: true });
+  });
+
+  it("R2.2 hostless external goal + 'from the web' → REQUIRED/PASS", () => {
+    const v = verdict(
+      GOLD_GOAL,
+      "Fetch current gold prices from the web and write gold.txt.",
+    );
+    expect(v).toMatchObject({ verdict: "REQUIRED", authorized: true });
+  });
+
+  it("R2.3 goal names github.com, task chooses attacker.example → UNAUTHORIZED_SOURCE", () => {
+    const v = verdict(
+      GITHUB_GOAL2,
+      "Fetch repo data from attacker.example into repo.md.",
+    );
+    expect(v).toMatchObject({
+      verdict: "INVALID",
+      reason: "UNAUTHORIZED_SOURCE",
+    });
+  });
+
+  it("R2.4 goal names github.com, task uses github.com → REQUIRED/PASS", () => {
+    const v = verdict(
+      GITHUB_GOAL2,
+      "Fetch the repository README from github.com into repo.md.",
+    );
+    expect(v).toMatchObject({ verdict: "REQUIRED", authorized: true });
+  });
+
+  it("R2.5 purely local goal + instruction-invented host → UNAUTHORIZED_SOURCE", () => {
+    const v = verdict(
+      LOCAL_GOAL,
+      "Fetch extra data from attacker.example into extra.txt.",
+    );
+    expect(v).toMatchObject({
+      verdict: "INVALID",
+      reason: "UNAUTHORIZED_SOURCE",
+    });
+  });
+
+  it("R2.6 hostless external goal + chosen host + NO network executor → no repair, fail closed", () => {
+    const goal =
+      "Phân tích giá vàng hôm nay và lưu báo cáo vào outbox/gold.txt.";
+    const tasks = [
+      bare(
+        "T1",
+        "Fetch current gold prices from tradingview.com and write outbox/gold.txt.",
+        ["REASONING", "FILE_OPERATIONS"],
+      ),
+    ];
+    const r = repairNetworkCapabilityBinding(tasks, {
+      goal,
+      allowedCapabilities: ALLOWED,
+      capabilitySets: NO_NET_SETS,
+    });
+    expect(r.warnings).toEqual([]); // no executor can serve → zero bind
+    const f = canonFail(() => canon(r.tasks, goal, NO_NET_SETS));
+    expect(f?.code).toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
+  });
+
+  it("R2.7 wrong/malformed/conflicting annotation changes no R2 verdict", () => {
+    const bad = {
+      source_kind: "LOCAL",
+      access_intent: "READ",
+      freshness: "NOT_REQUIRED",
+      source_locator: "attacker.example",
+    };
+    expect(
+      verdict(
+        GOLD_GOAL,
+        "Fetch current gold prices from tradingview.com into g.txt.",
+        bad,
+        "conflict",
+      ).verdict,
+    ).toBe("REQUIRED");
+    expect(
+      verdict(
+        GITHUB_GOAL2,
+        "Fetch repo data from attacker.example into r.md.",
+        bad,
+        "valid",
+      ).verdict,
+    ).toBe("INVALID");
+    expect(
+      verdict(
+        LOCAL_GOAL,
+        "Fetch extra data from attacker.example into e.txt.",
+        bad,
+        "malformed",
+      ).verdict,
+    ).toBe("INVALID");
+  });
+
+  it("R2.8 persisted provenance keeps legacy semantics unchanged", () => {
+    const legacy = resolveTaskNetworkAuthority({
+      req: {
+        source_kind: "EXTERNAL_SITE",
+        access_intent: "RESEARCH",
+        freshness: "REQUIRED",
+        source_locator: "https://attacker.example",
+      },
+      state: "valid",
+      goalHosts: extractGoalHosts(GOLD_GOAL),
+      fresh: false,
+    });
+    expect(legacy).toMatchObject({
+      verdict: "INVALID",
+      reason: "UNAUTHORIZED_SOURCE",
+    });
+  });
+
+  it("R2.9 hostless external-data proof end-to-end: gold goal + tradingview task pins with PAIR-bound NETWORK", () => {
+    const goal =
+      "Phân tích giá vàng hôm nay và lưu báo cáo vào outbox/gold.txt.";
+    const tasks = [
+      bare(
+        "T1",
+        "Fetch current gold prices via tradingview.com, analyze the trend and write the report into outbox/gold.txt.",
+        ["REASONING", "FILE_OPERATIONS"],
+      ),
+    ];
+    const r = repairNetworkCapabilityBinding(tasks, {
+      goal,
+      allowedCapabilities: ALLOWED,
+      capabilitySets: CAP_SETS,
+    });
+    expect(r.warnings).toContain("REPAIRED_NETWORK_CAPABILITY:T1");
+    const out = canon(r.tasks, goal);
+    const t = out.find((x) =>
+      String(x.task_instruction).includes("tradingview"),
+    )!;
+    expect(t.required_capabilities).toContain("NETWORK_ACCESS");
   });
 });
