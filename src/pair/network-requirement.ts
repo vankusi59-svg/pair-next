@@ -119,13 +119,15 @@ const stripWww = (h: string): string => h.replace(/^www\./i, "");
 /** Strict DNS label: 1–63 chars, alnum + interior hyphens only. */
 const DNS_LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
 /** Bare dotted token (not URL-adjacent: no scheme/slash/word char at
- *  either edge, no `@` on the left so `user@host` never mints authority,
- *  and a `.` on the right only continues the token when a label char
- *  actually follows it — a sentence-final `host.` period does NOT block
- *  the match). Ambiguous by nature — it can equally be a hostname or a
- *  file name — so `bareTokenHost` decides conservatively. */
+ *  either edge, no `@` on the left so `user@host` never mints authority.
+ *  A `.` on the right blocks the match only when it is token-continuing
+ *  — followed by `.` or a label char — so a lone sentence-final `host.`
+ *  period mints the host while a malformed dotted suffix (`host..foo`,
+ *  `host...`, `host..`) fails closed instead of minting a valid prefix.
+ *  Ambiguous by nature — it can equally be a hostname or a file name —
+ *  so `bareTokenHost` decides conservatively. */
 const BARE_DOTTED_RE = new RegExp(
-  `(?<![\\w/.@-])${DNS_LABEL}(?:\\.${DNS_LABEL})+(?![\\w/-]|\\.(?=[\\w-]))`,
+  `(?<![\\w/.@-])${DNS_LABEL}(?:\\.${DNS_LABEL})+(?![\\w/-]|\\.(?=\\.|[\\w-]))`,
   "gi",
 );
 

@@ -69,6 +69,21 @@ describe("DEBT C — sentence-final bare host extraction", () => {
     );
   });
 
+  it("C10 — malformed dotted suffix fail-closed: '..foo' / '...foo' / '..' không mint prefix host", () => {
+    expect(extractGoalHosts("trên github.com..foo xong")).toEqual(new Set());
+    expect(extractGoalHosts("trên github.com...foo xong")).toEqual(new Set());
+    expect(extractGoalHosts("trên github.com.. xong")).toEqual(new Set());
+  });
+
+  it("C11 — lone sentence-period vẫn mint khi theo sau là punctuation/whitespace, không phải label", () => {
+    expect(extractGoalHosts("trên github.com., tiếp")).toEqual(
+      new Set(["github.com"]),
+    );
+    expect(extractGoalHosts("trên github.com. - ghi chú")).toEqual(
+      new Set(["github.com"]),
+    );
+  });
+
   it("C9 — incident goal mint đủ {mql5.com, github.com} → github.com authorized", () => {
     const hosts = extractGoalHosts(INCIDENT_GOAL);
     expect(hosts).toEqual(new Set(["mql5.com", "github.com"]));

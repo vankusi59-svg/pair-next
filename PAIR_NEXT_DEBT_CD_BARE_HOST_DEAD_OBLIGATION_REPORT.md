@@ -103,3 +103,29 @@ Không đụng: `goalAuthorizesHost`, `requirementLocatorHost`, `FILE_EXTENSION_
 1. `repairNetworkCapabilityBinding` bind `NETWORK_ACCESS` dư cho task local chỉ vì instruction nhắc host (`REPAIRED_NETWORK_CAPABILITY:T3` trên plan thật — task so sánh local). Fail-open hướng an toàn nhưng nhiễu audit trail.
 2. Planner đôi lúc copy "gửi đến telegram" vào non-delivery task → `FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK` (gate gạt đúng; là sol emission pattern, có thể siết prompt sau).
 3. Một residual C mới: `github.com..foo` (double period) mint `github.com` — garbage input hướng fail-open nhẹ; operator literal vẫn viết github.com nên authority không mở rộng về thực chất.
+
+---
+
+## §R1 — malformed dotted suffix fail-closed (audit remediation, base `a09a492`)
+
+### Finding
+
+Vá C đầu tiên (`\.(?=[\w-])`) cho `.` cuối câu mint host đúng, nhưng còn fail-open: `github.com..foo` (`. `theo sau bởi `.` rồi label) được match prefix `github.com` — authority boundary không được truncate malformed token rồi mint valid prefix.
+
+### Exact fix (regex-only, seam không đổi)
+
+Right-edge lookahead `(?![\w/-]|\.(?=[\w-]))` → `(?![\w/-]|\.(?=\.|[\w-]))`: `.` ở right edge là token-continuing khi **theo sau bởi `.` HOẶC label char** — chỉ dấu chấm đứng một mình (punctuation) được phép mint. `github.com.`/`github.com.,`/`github.com. - x` vẫn mint; `github.com..foo`, `github.com...foo`, `github.com..` → ∅.
+
+### R1 before/after (verify trên dist mới)
+
+| Input | Trước R1 | Sau R1 |
+|---|---|---|
+| `github.com..foo` | `{github.com}` | ∅ |
+| `github.com...foo` | `{github.com}` | ∅ |
+| `github.com..` | `{github.com}` | ∅ |
+| `github.com.` / `github.com,` | `{github.com}` | giữ |
+| `mql5.com.evil.org` | `{mql5.com.evil.org}` | giữ |
+| `a@github.com.` | ∅ | giữ ∅ |
+| `github.com. - ghi chú` / `github.com.,` | `{github.com}` | giữ |
+
+Tests: +C10 (3 malformed forms → ∅), +C11 (lone period trước punctuation/whitespace vẫn mint). Suite DEBT C: 9→11. Focused 88/88 (C+D + network-req ×2 + binding-repair + contract-simplify). Full: **3840 pass / 3 fail** = baseline byte-identical (+2). tsc + `rm -rf dist` build clean. DEBT D production code (`taskCoversObligation`) không đổi; scope phụ không đụng.
