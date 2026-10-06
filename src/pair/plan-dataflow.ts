@@ -358,7 +358,7 @@ const TLD_LIKE_EXT = new Set([
 // "node.js docs". Consulted only after the numeric/TLD shape checks, so
 // ".js" stays mintable in file context ("Đọc file node.js").
 const EXTERNAL_MARKER_BEFORE =
-  /(?:website|web\s?site|docs?|documentation|blog|forum|homepage|trên)\s*$/iu;
+  /(?:website|web\s?site|docs?|documentation|blog|forum|homepage)\s*$/iu;
 const EXTERNAL_MARKER_AFTER =
   /^\s*(?:docs?|documentation|website|web\s?site|blog|forum|homepage)\b/i;
 
@@ -378,14 +378,22 @@ function isNonArtifactDottedToken(
   return false;
 }
 
-/* Passive VI reference — "(đã) được <produce-verb> trong/vào X" cites
- * content already inside X: the task must READ X, never produces it.
- * The passive construction carries no produce authority, so the mention
- * demotes to a consume edge — a read-reference can never invent a
- * producer and mask a missing one. Checked before the destination rule
- * so `ghi`+`trong` can't mint produce out of a passive form. */
-const PASSIVE_REF_VI =
-  /(?:đã\s+)?được\s+(?:ghi|viết|soạn|lưu|xuất|tạo|sinh|xây\s+dựng|kết\s+xuất)\s+(?:trong|vào)\s*$/iu;
+/* Passive VI reference — bounded per-phrase semantics, never an
+ * unconditional demote:
+ *   "(đã) được <produce-verb> trong X" — containment/reference: can
+ *   never mint produce (a passive mention grants no write authority),
+ *   and mints consume ONLY when the text before the passive phrase
+ *   independently shows a read/reference verb ("Đọc các phát hiện đã
+ *   được ghi trong X" — `đọc` proves the read). Without independent
+ *   evidence the mention is ignored, never guessed.
+ *   "(đã) được <produce-verb> vào X" — passive destination: `vào`
+ *   keeps output semantics ("Kết quả được ghi vào report.md"), the
+ *   mention stays a produce and never demotes to consume.
+ *   A negated passive ("không|đừng|chưa được ghi …") is a prohibition:
+ *   neither consume nor produce — prohibition is not read evidence.
+ * Group 1 = optional negation, group 2 = the preposition. */
+const PASSIVE_VI =
+  /(?:(không|đừng|chưa)\s+)?(?:đã\s+)?được\s+(?:ghi|viết|soạn|lưu|xuất|tạo|sinh|xây\s+dựng|kết\s+xuất)\s+(trong|vào)\s*$/iu;
 
 /** Nearest governing verb before a path mention: the LAST consume/produce
  *  verb inside the bounded lookback window wins — "read input.txt then
@@ -514,10 +522,21 @@ function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
     if (isNonArtifactDottedToken(p, tail, after)) continue;
     const near = nearestVerbMatch(before);
     const role = near?.role ?? null;
-    // Passive reference demotes to consume — "được ghi trong X" cites
-    // existing content, it grants no produce authority.
-    if (PASSIVE_REF_VI.test(tail)) {
-      consumes.add(p);
+    // Passive VI reference — bounded: negation mints nothing; `vào`
+    // keeps destination produce; `trong` consumes only with independent
+    // read evidence left of the passive phrase, else the mention is
+    // ignored rather than guessed.
+    const passive = PASSIVE_VI.exec(tail);
+    if (passive !== null) {
+      if (passive[1] !== undefined) continue; // prohibition
+      if (passive[2].toLowerCase() === "vào") {
+        produces.add(p);
+        continue;
+      }
+      const rest = before.slice(0, before.length - passive[0].length);
+      if (nearestVerbMatch(rest)?.role === "consume") {
+        consumes.add(p);
+      }
       continue;
     }
     // Destination markers (adjacent or modifier-separated) mint a produce

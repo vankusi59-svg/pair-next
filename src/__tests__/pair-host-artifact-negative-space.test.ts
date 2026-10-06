@@ -148,9 +148,9 @@ describe("DEBT-A E — '.js' ambiguity truth table", () => {
     expect(d.produces).toEqual(["outbox/r.md"]);
   });
 
-  it("E4. 'trên node.js' → trên marker, no artifact", () => {
+  it("E4. 'trên node.js' — bare trên is NOT external evidence; `đọc` mints consume (ambiguous → no heuristic expansion, R2.A)", () => {
     const d = df("Đọc tài liệu trên node.js và viết outbox/r.md");
-    expect(d.consumes).toEqual([]);
+    expect(d.consumes).toEqual(["node.js"]);
     expect(d.produces).toEqual(["outbox/r.md"]);
   });
 
@@ -181,5 +181,73 @@ describe("DEBT-A F — passive '(đã) được <produce-verb> trong X' never in
 
   it("F4. control: 'Viết nội dung và lưu trong y.md' active → produce", () => {
     expect(df("Viết nội dung và lưu trong y.md").produces).toEqual(["y.md"]);
+  });
+});
+
+describe("DEBT-A R2.A — bare 'trên' is not external evidence", () => {
+  it("R2A.1. 'Đọc dữ liệu trên report.md' → consume report.md", () => {
+    expect(df("Đọc dữ liệu trên report.md").consumes).toEqual(["report.md"]);
+  });
+
+  it("R2A.2. 'Kiểm tra dữ liệu trên baseline.csv' → consume baseline.csv", () => {
+    expect(df("Kiểm tra dữ liệu trên baseline.csv").consumes).toEqual([
+      "baseline.csv",
+    ]);
+  });
+
+  it("R2A.3. 'So sánh dữ liệu trên baseline.csv' → consume baseline.csv", () => {
+    expect(df("So sánh dữ liệu trên baseline.csv").consumes).toEqual([
+      "baseline.csv",
+    ]);
+  });
+
+  it("R2A.4. 'Lưu kết quả trên report.md' → produce via `lưu`, never rejected", () => {
+    expect(df("Lưu kết quả trên report.md").produces).toEqual(["report.md"]);
+  });
+});
+
+describe("DEBT-A R2.B — passive semantics: vào destination / trong evidence / negation", () => {
+  it("R2B.1. 'Kết quả được ghi vào report.md' — passive destination keeps PRODUCE, never consume", () => {
+    const d = df("Kết quả được ghi vào report.md");
+    expect(d.produces).toEqual(["report.md"]);
+    expect(d.consumes).toEqual([]);
+  });
+
+  it("R2B.2. 'Báo cáo được lưu vào outbox/report.md' — destination produce, not UNBOUND input", () => {
+    const d = df("Báo cáo được lưu vào outbox/report.md");
+    expect(d.produces).toEqual(["outbox/report.md"]);
+    expect(d.consumes).toEqual([]);
+  });
+
+  it("R2B.3. 'Không được ghi trong report.md' — prohibition mints nothing", () => {
+    const d = df("Không được ghi trong report.md");
+    expect(d.consumes).toEqual([]);
+    expect(d.produces).toEqual([]);
+  });
+
+  it("R2B.4. 'Không được ghi vào report.md' — negated passive destination mints nothing", () => {
+    const d = df("Không được ghi vào report.md");
+    expect(d.consumes).toEqual([]);
+    expect(d.produces).toEqual([]);
+  });
+
+  it("R2B.5. 'được <verb> trong X' WITHOUT independent read evidence → mention ignored, never guessed", () => {
+    const d = df("Kết quả được ghi trong report.md");
+    expect(d.consumes).toEqual([]);
+    expect(d.produces).toEqual([]);
+  });
+
+  it("R2B.6. 'được <verb> trong X' WITH independent read evidence → consume", () => {
+    const d = df("Đọc các phát hiện đã được ghi trong hermes_findings.md");
+    expect(d.consumes).toEqual(["hermes_findings.md"]);
+    expect(d.produces).toEqual([]);
+  });
+
+  it("R2B.7. incident T2 pinned — passive cite consumes findings, produces only the review", () => {
+    const d = df(
+      "Đọc hermes_findings.md và viết bản tóm tắt bằng tiếng Việt vào outbox/hermes_review.md. Dẫn các nguồn đã được ghi trong hermes_findings.md.",
+    );
+    expect(d.consumes).toEqual(["hermes_findings.md"]);
+    expect(d.produces).toEqual(["outbox/hermes_review.md"]);
   });
 });

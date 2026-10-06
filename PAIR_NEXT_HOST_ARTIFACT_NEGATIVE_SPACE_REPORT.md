@@ -104,3 +104,71 @@ không-mint để chống regression nếu regex sau này nới.
 - File thật tên `notes.io`/`report.com` trong free text bị reject (TLD trade-off
   mandate đã chấp nhận); structured declaration vẫn được.
 - Debt B (orphan RUNNING execution) — mandate loại khỏi scope, handoff riêng.
+
+---
+
+# §R2 — audit remediation (audited HEAD `6e9c8fb`, on same PR)
+
+Two bounded fixes, same seams; no scope expansion.
+
+## R2.A — bare `trên` removed from external-marker authority
+
+`EXTERNAL_MARKER_BEFORE` dropped `trên`: "Đọc dữ liệu trên report.md" had a real
+workspace artifact rejected as an external identifier. External rejection now
+rests only on explicit web-surface markers (website|web site|site|docs?|
+documentation|blog|forum|homepage before/after). "Đọc tài liệu trên node.js" is
+ambiguous → not forced external (mandate: no heuristic expansion) → `đọc` mints
+consume. TLD rule still rejects github.com/react.dev/example.org alone.
+
+Before/after (dist-verified):
+
+| Phrase | R1 | R2 |
+|---|---|---|
+| `Đọc dữ liệu trên report.md` | nothing minted (rejected) | `consumes:["report.md"]` |
+| `Kiểm tra/So sánh dữ liệu trên baseline.csv` | nothing | consume |
+| `Lưu kết quả trên report.md` | nothing | `produces:["report.md"]` (`lưu`) |
+| `Đọc tài liệu trên node.js` | nothing | `consumes:["node.js"]` (ambiguous kept) |
+
+## R2.B — passive reference split by preposition + negation guard
+
+`PASSIVE_REF_VI` (unconditional `consumes.add`) replaced by `PASSIVE_VI` with
+two capture groups — `(?:(không|đừng|chưa)\s+)?` negation and `(trong|vào)`:
+
+- **Negated** (`không được ghi trong/vào X`) → mention ignored entirely —
+  prohibition is neither read evidence nor produce authority.
+- **`vào`** (`Kết quả được ghi vào report.md`) → keeps destination PRODUCE;
+  never demotes to consume ("Báo cáo được lưu vào outbox/report.md" no longer
+  an invented UNBOUND input).
+- **`trong`** → never produce; consume ONLY when the remainder of `before`
+  (text left of the passive phrase) independently shows a consume-role verb
+  via `nearestVerbMatch` — "Đọc các phát hiện đã được ghi trong X" (`đọc`
+  proves the read) → consume; "Kết quả được ghi trong X" (no evidence) →
+  mention ignored, never guessed.
+
+Before/after (dist-verified):
+
+| Phrase | R1 | R2 |
+|---|---|---|
+| `Kết quả được ghi vào report.md` | `consumes:["report.md"]` (wrong) | `produces:["report.md"]` |
+| `Báo cáo được lưu vào outbox/report.md` | consume (wrong) | produce |
+| `Không được ghi trong report.md` | consume (wrong) | neither |
+| `Không được ghi vào report.md` | consume (wrong) | neither |
+| `Kết quả được ghi trong report.md` | consume (wrong) | neither (no evidence) |
+| `Đọc ... đã được ghi trong hermes_findings.md` | consume | consume (independent `đọc` evidence) |
+
+## R2.C — R1 proofs preserved
+
+Incident plan verified on fresh dist: T1 `produces:[hermes_findings.md]`,
+T2 `produces:[outbox/hermes_review.md] consumes:[hermes_findings.md]` —
+`assertPlanDataflow` PASS, zero UNBOUND. hosts/versions still rejected,
+`notes.io` structured path untouched, network/telegram/contract unchanged.
+
+## R2 tests
+
+11 new adversarial tests (R2A.1–4, R2B.1–7) + E4 updated to the new `trên`
+semantics: suite **36/36 PASS**. Focused 310/310; full **3809 pass / 3 fail**
+= byte-identical baseline (F4 R5.1-crash + 2× P5 env). tsc + clean build clean.
+
+Residual: `không` only captured when adjacent to `được` (bounded negation, per
+mandate — not a negation engine); "đã không được" order form uncovered; EN
+passive uncovered.
