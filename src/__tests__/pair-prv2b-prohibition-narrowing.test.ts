@@ -622,3 +622,49 @@ describe("R2-F5 — 'order/ordering' is not a trade act", () => {
     }
   });
 });
+
+describe("R3 — bounded action→object scope inside a segment (and/và/or/hoặc)", () => {
+  const GOAL_DEL_R3 = "analyze XAUUSD strategy, do not delete report.md";
+  const mkDel = (checkInstr: string) => [
+    work("T1", "analyze XAUUSD strategy and write findings to report.md", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"]),
+    work("T2", checkInstr, ["REASONING"], ["T1"], undefined, []),
+  ];
+
+  it("R3.a — 'check report.md and delete temp' PASSes: 'and delete' opens a new action scope", () => {
+    expect(canon(mkDel("check report.md and delete the scratch file"), GOAL_DEL_R3).length).toBe(3);
+    expect(canon(mkDel("review report.md và xóa the scratch file"), GOAL_DEL_R3).length).toBe(3);
+  });
+
+  it("R3.b — 'check temp and delete report.md' FAILs in EN and VI", () => {
+    expectCode(() => canon(mkDel("check the scratch file and delete report.md"), GOAL_DEL_R3), VIOLATION);
+    expectCode(() => canon(mkDel("kiểm tra the scratch file và xóa report.md"), GOAL_DEL_R3), VIOLATION);
+  });
+
+  it("R3.c — 'delete temp and report.md' FAILs: 'and' joins the object list of ONE action", () => {
+    expectCode(() => canon(mkDel("delete the scratch file and report.md"), GOAL_DEL_R3), VIOLATION);
+  });
+
+  const GOAL_USE_R3 = "analyze XAUUSD strategy, do not use martingale";
+
+  it("R3.d — 'review martingale and use fixed sizing' PASSes in EN and VI", () => {
+    expect(canon([
+      work("T1", "analyze XAUUSD strategy and review martingale and use fixed sizing", ["REASONING"], [], undefined, ["OBL_001"]),
+    ], GOAL_USE_R3).length).toBe(2);
+    expect(canon([
+      work("T1", "phân tích XAUUSD strategy và đánh giá martingale và dùng fixed sizing", ["REASONING"], [], undefined, ["OBL_001"]),
+    ], GOAL_USE_R3).length).toBe(2);
+  });
+
+  it("R3.e — 'review fixed sizing and use martingale' FAILs; 'use grid and martingale' FAILs", () => {
+    expectCode(() => canon([
+      work("T1", "analyze XAUUSD strategy and review fixed sizing and use martingale", ["REASONING"], [], undefined, ["OBL_001"]),
+    ], GOAL_USE_R3), VIOLATION);
+    expectCode(() => canon([
+      work("T1", "analyze XAUUSD strategy and use grid and martingale", ["REASONING"], [], undefined, ["OBL_001"]),
+    ], GOAL_USE_R3), VIOLATION);
+  });
+
+  it("R3.f — passive object stays bound: 'report.md was deleted' FAILs", () => {
+    expectCode(() => canon(mkDel("the file report.md was deleted during cleanup"), GOAL_DEL_R3), VIOLATION);
+  });
+});

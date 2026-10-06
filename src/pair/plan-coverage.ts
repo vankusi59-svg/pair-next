@@ -252,7 +252,7 @@ const NEGATION_WINDOW_RE =
  *  martingale" is ONE `use` scope), so treating them as boundaries
  *  would fail open. */
 const INSTR_SEGMENT_RE =
-  /[,;.!?;:—–…]|\s+(?:then|but|however|nevertheless|sau\s+đó|sau\s+khi|rồi|nhưng)\s+/giu;
+  /[,;!?;:—–…]|\.(?![\p{L}\p{N}])|\s+(?:then|but|however|nevertheless|sau\s+đó|sau\s+khi|rồi|nhưng)\s+/giu;
 
 function instructionSegments(instr: string): Array<[number, number]> {
   const segs: Array<[number, number]> = [];
@@ -283,37 +283,76 @@ function termMatchSpans(
   return out;
 }
 
-/** R2 — a structured prohibition violates only when a non-negated
- *  forbidden action AND a prohibited object term land in the SAME
- *  instruction segment: "check report.md, then delete temp.txt" is not
- *  the banned act on report.md — whole-task co-occurrence is gone.
+/** Passive auxiliaries before the action flip the object to the
+ *  LEFT of the verb: "report.md was deleted" / "report.md sẽ bị xóa".
+ *  Bounded — aux + at most one intervening token, whitespace-only. */
+const PASSIVE_AUX_RE =
+  /(?:bị|be|been|being|is|are|was|were|get|gets|got|getting)\s+(?:[\p{L}\p{N}_-]+\s+){0,1}$/iu;
+
+/** R3 — a structured prohibition violates only when a non-negated
+ *  forbidden action AND a prohibited object term land inside the
+ *  action's OWN object scope: forward from the action to the next
+ *  action boundary (any class — "check X and delete Y" makes `delete`
+ *  own only `Y`) or to the segment end. Connectives `and|và|or|hoặc`
+ *  stay inside the scope — they join one action's object list
+ *  ("delete temp and report.md" bans both). A passive hit binds the
+ *  object before the verb instead (span between neighbouring actions).
  *  A ban with no object terms still forbids the class outright. */
 function taskShowsProhibitedAct(
   instr: string,
   classes: Set<string>,
   terms: string[],
 ): { cls: string; term: string | null } | null {
-  const acts: Array<{ cls: string; start: number }> = [];
+  const hits: Array<{ cls: string; start: number; end: number; negated: boolean }> = [];
   for (const { cls, re } of PROHIBITION_ACTION_CLASSES) {
-    if (!classes.has(cls)) continue;
     const g = new RegExp(re.source, "giu");
     let m: RegExpExecArray | null;
     while ((m = g.exec(instr)) !== null) {
       const before = instr.slice(Math.max(0, m.index - 48), m.index);
-      if (!NEGATION_WINDOW_RE.test(before)) {
-        acts.push({ cls, start: m.index });
+      hits.push({
+        cls,
+        start: m.index,
+        end: m.index + m[0].length,
+        negated: NEGATION_WINDOW_RE.test(before),
+      });
+    }
+  }
+  hits.sort((a, b) => a.start - b.start || b.end - a.end);
+  const acts0 = hits.filter((h) => classes.has(h.cls) && !h.negated);
+  if (!acts0.length) return null;
+  if (!terms.length) return { cls: acts0[0].cls, term: null };
+  // An action-looking token inside a prohibited filename ("write.txt"
+  // under a delete ban on write.txt) is the OBJECT, not an action and
+  // not a scope boundary: drop hits overlapping term spans that sit in
+  // a dotted filename context (`term.ext`).
+  const objectSpans: Array<[number, number]> = [];
+  for (const term of terms) {
+    for (const [ts, te] of termMatchSpans(instr, term)) {
+      if (instr[te] === "." && /[\p{L}\p{N}]/u.test(instr[te + 1] ?? "")) {
+        objectSpans.push([ts, te]);
       }
     }
   }
+  const hits2 = objectSpans.length
+    ? hits.filter((h) => !objectSpans.some(([s, e]) => h.start < e && h.end > s))
+    : hits;
+  const acts = hits2.filter((h) => classes.has(h.cls) && !h.negated);
   if (!acts.length) return null;
-  if (!terms.length) return { cls: acts[0].cls, term: null };
   const segs = instructionSegments(instr);
   for (const a of acts) {
     const seg = segs.find(([s, e]) => a.start >= s && a.start < e);
     if (!seg) continue;
+    const next = hits2.find((h) => h.start >= a.end);
+    const prev = [...hits2].reverse().find((h) => h.end <= a.start);
+    const passive = PASSIVE_AUX_RE.test(
+      instr.slice(Math.max(0, a.start - 32), a.start),
+    );
+    const [os, oe] = passive
+      ? [prev ? prev.end : seg[0], a.start]
+      : [a.end, next ? next.start : seg[1]];
     for (const term of terms) {
       for (const [ts, te] of termMatchSpans(instr, term)) {
-        if (ts >= seg[0] && te <= seg[1]) return { cls: a.cls, term };
+        if (ts >= os && te <= oe) return { cls: a.cls, term };
       }
     }
   }

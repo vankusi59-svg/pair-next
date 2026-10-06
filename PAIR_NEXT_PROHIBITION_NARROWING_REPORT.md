@@ -156,3 +156,29 @@ Five findings closed on the same PR/scope. Audited base `dd5253d`; new HEAD reco
 - Negation suppression still ≤2 whitespace tokens before the action hit.
 - Bare `không` + unknown verb (outside the 12 classes) mints NO prohibition — e.g. `không đuổi` — documented bounded miss vs. the over-extraction it replaced.
 - Condition evaluation (`if/unless/nếu`) is STILL only a cutoff — a true conditional ban always bans; full conditional semantics remain a separate work item.
+---
+
+## AUDIT R3 REMEDIATION (audited HEAD `2c38469`)
+
+ONE finding closed — in-segment `and/và/or/hoặc` false-positive: co-occurrence inside a segment was not enough, e.g. `check report.md and delete temp.txt` failed under `do not delete report.md`.
+
+### Fix — bounded action→object scope (`plan-coverage.ts`)
+
+Every action-class hit now owns a bounded **object scope**: from the end of the action hit forward to the NEXT action hit (any of the 12 classes — `and delete`, `và xóa` open a new action scope) or the segment end. Connectives `and|và|or|hoặc` never split the scope — they join ONE action's object list (`delete temp.txt and report.md` bans both objects of that single `delete`). Violation requires a term hit inside the owning action's scope — `review martingale and use fixed sizing` binds `use → fixed sizing`, so `martingale` (owned by `review`) never trips the use-ban.
+
+Two adjacent correctness fixes the same refactor surfaced/required:
+
+- **Filename dots are not segment breaks**: `.` inside a word (`report.md`) no longer splits segments — `\.(?![\p{L}\p{N}])`. Previously `the file report.md was deleted` could never violate because `report`/`deleted` always landed in different segments at the extension dot.
+- **Passive voice binds leftward**: a hit preceded by auxiliaries (`bị|be|been|being|is|are|was|were|get|gets|got|getting`, ≤1 intervening token, whitespace-only) owns the span from the previous action boundary to the verb — `report.md was deleted` fails closed.
+- **Action-looking tokens inside the prohibited filename are the object, not actions**: a hit overlapping a term span in a dotted filename context (`write.txt` under `do not delete write.txt`) is dropped from the hit/boundary set — otherwise `delete write.txt` could never violate (`write` self-boundary swallowed the object).
+
+### Validation
+- Focused suite: **49/49 PASS** (43 prior + 6 R3 tests covering every mandated case incl. VI forms + passive)
+- Regression (PRV2-B + P-COVMAP + dataflow-incident + preask + network-req): **260/260**
+- Full suite: **3709 pass / 3 fail / 24 skipped** — byte-identical baseline (F4 R5.1-crash, P5 DSH env, P5 CODEX env)
+- `tsc --noEmit` clean; `rm -rf dist && npm run build` clean
+
+### Residual limitations (updated)
+- Object scope is forward-only for active voice — a fronted object WITHOUT passive auxiliaries (`report.md please delete`) misses; bounded, documented.
+- Passive auxiliaries are a fixed small list; `được` excluded (ambiguous permission/passive) — `report.md được xóa` misses unless another form is used.
+- Negation suppression still ≤2 whitespace tokens; all prior R2 residuals stand.
