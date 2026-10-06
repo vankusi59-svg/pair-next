@@ -134,7 +134,7 @@ equivalence introduced).
 # R1 — Goal Contract artifact-list preservation (audit remediation)
 
 **R1 BASE HEAD:** `591b509351789eec28611fafd4642adf9279b4a8`
-**R1 NEW HEAD:** _filled at commit_
+**R1 NEW HEAD:** `3eda4303bc01482cbd4961c85f3bee5b15b25d83`
 
 ## Root cause
 
