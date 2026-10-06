@@ -36,6 +36,12 @@ export interface GoalRequirement {
   target?: string;
   /** For prohibitions: the distilled content terms the plan must avoid. */
   terms?: string[];
+  /** For prohibitions: the bounded forbidden-action class(es) the clause
+   *  bans (e.g. delete/use/send). A task violates only when it performs
+   *  a compatible action ON a prohibited object — mentioning the object
+   *  to inspect/research it is never the prohibited act. Absent when no
+   *  action verb is identifiable (term-only enforcement). */
+  actionClass?: string[];
   /** For budget-like constraints: the operator's ceiling amount. */
   maxAmount?: number;
   /** For `only X`-bounded constraints: the explicit permitted value(s). */
@@ -92,9 +98,58 @@ function splitClauses(goal: string): string[] {
 /* ------------------------------------------------------------------ */
 
 const PROHIBITION_RE =
-  /\b(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|đừng|cấm|không nên|tránh)\b/iu;
-const PROHIBITED_VERB_STRIP =
-  /^(?:use|using|send|sending|run|running|deliver|execute|post|include|access|call|invoke|touch|dùng|sử dụng|gửi|chạy|đăng|dùng tới)\s+/iu;
+  /\b(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|không|đừng|cấm|tránh)\b/iu;
+
+/** Bounded forbidden-action vocabulary — the role PROHIBITED_VERB_STRIP
+ *  was declared for, made real: a prohibition bans a PERFORMING action
+ *  on its object, not the vocabulary around it. Observation verbs
+ *  (check/research/analyze/review/verify/read/monitor) are deliberately
+ *  absent — a task that merely inspects the object is never the act. */
+export const PROHIBITION_ACTION_CLASSES: ReadonlyArray<{
+  cls: string;
+  re: RegExp;
+}> = [
+  { cls: "delete", re: /\b(?:delete|remove|drop|erase|xóa|xoá|loại bỏ|hủy|huỷ)/iu },
+  { cls: "use", re: /\b(?:use|using|used|utili[sz]e|apply|employ|adopt|incorporat|includ|dùng|sử dụng|áp dụng|vận dụng)/iu },
+  { cls: "send", re: /\b(?:send|deliver|post|forward|share|broadcast|gửi|đăng|chia sẻ)/iu },
+  { cls: "access", re: /\b(?:access|invoke|touch|reach|connect|log ?in|call|truy cập|kết nối|đăng nhập|liên hệ)/iu },
+  { cls: "execute", re: /\b(?:run|execut|launch|start|boot|deploy|chạy|thực thi|khởi chạy|triển khai)/iu },
+  { cls: "modify", re: /\b(?:modif|edit|overwrit|chang|updat|alter|append|sửa|ghi đè|thay đổi|cập nhật|chỉnh)/iu },
+  { cls: "fabricate", re: /\b(?:fabricat|invent|forge|fake|hallucinat|bịa|ngụy|giả mạo)/iu },
+  { cls: "trade", re: /\b(?:trad|buy|sell|order|deal|giao dịch|mua|bán|đặt lệnh|đầu tư|ký gửi)/iu },
+  { cls: "copy", re: /\b(?:copy|copies|duplicat|clone|sao chép|nhân bản)/iu },
+  { cls: "install", re: /\b(?:install|cài)/iu },
+  { cls: "download", re: /\b(?:download|tải)/iu },
+  { cls: "write", re: /\b(?:write|writes|wrote|draft|compose|viết|soạn)/iu },
+];
+
+/** Conditional openers — a prohibition tail that scopes WHEN the ban
+ *  applies is condition vocabulary, never prohibited content. The ban
+ *  itself lives in the clause head (or, when the marker opens the
+ *  clause, in the text after the condition). */
+const CONDITIONAL_MARKER_RE =
+  /\b(?:trừ khi|miễn là|trong trường hợp|in case|as long as|so long as|provided that|provided|unless|if|when|nếu|khi(?!\s*nào)|lúc(?!\s*nào))\b/iu;
+const TAIL_CONNECTOR_RE = /^(?:thì|then|that|là)\s+/iu;
+
+/** The part of a prohibition clause that carries the ban — the head
+ *  before a conditional marker when that head is trigger+payload, else
+ *  the prohibition that follows the condition, else the clause itself
+ *  (an embedded marker like "khi nào"/"bao giờ" never splits). */
+function prohibitionHead(clause: string): string {
+  const m = CONDITIONAL_MARKER_RE.exec(clause);
+  if (!m) return clause;
+  const before = clause.slice(0, m.index);
+  if (
+    PROHIBITION_RE.test(before) &&
+    /[\p{L}\p{N}]{2,}/u.test(before.replace(PROHIBITION_RE, " "))
+  ) {
+    return before;
+  }
+  const after = clause.slice(m.index + m[0].length).replace(TAIL_CONNECTOR_RE, "");
+  const trig = PROHIBITION_RE.exec(after);
+  if (trig) return after.slice(trig.index);
+  return clause;
+}
 
 const DEADLINE_RE =
   /\bdeadline\b|\bdue\b|\bhạn\b|\btrước ngày\b|\btrước\b.{0,12}\b(?:giờ|ngày)\b|\bby\s+\d{1,2}[/-]\d{1,2}/iu;
@@ -136,7 +191,19 @@ const PROHIBITION_STOPWORDS = new Set([
   "call", "invoke", "touch", "any", "anything", "except", "ngoại",
   "trừ", "the", "a", "an", "to", "for", "with", "from", "tới", "đến",
   "qua", "qua lại", "on", "in", "dùng", "sử", "dụng", "gửi", "chạy",
-  "đăng", "bất", "kỳ", "gì",
+  "đăng", "bất", "kỳ", "gì", "phải", "cần", "có",
+  // conditional + connective vocabulary — scoping words, never the
+  // prohibited object
+  "if", "when", "unless", "nếu", "khi", "miễn", "trường", "hợp", "thì",
+  "nào", "bao", "giờ", "case", "provided", "long", "as", "and", "or",
+  "nor", "else", "than", "hoặc", "cùng", "với", "của", "cho", "là",
+  "các", "những", "một", "mỗi", "vào", "ra", "lên", "xuống", "lại",
+  "hết", "còn", "sau", "trước", "giữa", "dưới", "ở", "tại", "về",
+  "theo", "như",
+  // file extensions — identity lives in the stem, never the suffix
+  "txt", "md", "json", "csv", "pdf", "html", "png", "jpg", "jpeg",
+  "webp", "svg", "ts", "tsx", "js", "mjs", "py", "ipynb", "doc",
+  "docx", "xlsx", "zip",
 ]);
 
 function extractQuantity(clause: string): { min?: number; max?: number } | undefined {
@@ -193,15 +260,30 @@ function extractOnlyTerms(clause: string): string[] | undefined {
   return [term];
 }
 
-function prohibitionTerms(clause: string): string[] {
-  const rest = clause.replace(PROHIBITION_RE, " ").trim();
+/** The structured prohibition payload: the bounded action class(es)
+ *  the clause bans plus the object terms it bans them on. Everything
+ *  after a conditional marker is scoping, never blacklist content. */
+function prohibitionPayload(clause: string): {
+  terms: string[];
+  actionClass?: string[];
+} {
+  const head = prohibitionHead(clause).replace(PROHIBITION_RE, " ");
+  const classes: string[] = [];
+  let stripped = head;
+  for (const { cls, re } of PROHIBITION_ACTION_CLASSES) {
+    if (re.test(head)) classes.push(cls);
+    stripped = stripped.replace(new RegExp(re.source, "giu"), " ");
+  }
   const terms: string[] = [];
-  for (const m of rest.matchAll(/[\p{L}\p{N}]+/gu)) {
+  for (const m of stripped.matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0].toLowerCase();
     if (w.length < 3 || PROHIBITION_STOPWORDS.has(w)) continue;
     if (!terms.includes(w)) terms.push(w);
   }
-  return terms.slice(0, 8);
+  return {
+    terms: terms.slice(0, 8),
+    ...(classes.length ? { actionClass: classes.slice(0, 4) } : {}),
+  };
 }
 
 /** Extract the Goal Contract — the deterministic, append-only projection
@@ -236,9 +318,7 @@ export function extractGoalContract(goal: string): GoalContract {
     // Prohibition outranks everything — a clause that forbids also naming
     // a file or a verb must not mint a deliverable/obligation.
     if (PROHIBITION_RE.test(clause)) {
-      push(prohibitions, "PRO", clause, {
-        terms: prohibitionTerms(clause),
-      });
+      push(prohibitions, "PRO", clause, prohibitionPayload(clause));
       continue;
     }
     // An explicit telegram-delivery clause is governed by the existing

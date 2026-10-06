@@ -31,7 +31,11 @@ import { IntegrityError } from "./errors.js";
 import { artifactNamesEquivalent } from "./artifact-authority.js";
 import { extractTaskDataflow } from "./plan-dataflow.js";
 import { externalSubjectKeys, subjectAnchors } from "./llm-planner.js";
-import type { GoalContract, GoalRequirement } from "./goal-contract.js";
+import {
+  PROHIBITION_ACTION_CLASSES,
+  type GoalContract,
+  type GoalRequirement,
+} from "./goal-contract.js";
 
 export type CoverageState = "PROVEN" | "PRESERVED" | "UNVERIFIABLE" | "VIOLATED";
 
@@ -212,6 +216,42 @@ const TASK_AMOUNT_RES = [
   /\busd\s*(\d+(?:\.\d+)?)/gi,
 ];
 const TELEGRAM_PROHIBITED_TERMS = new Set(["telegram", "tele", "bot"]);
+
+/* ------------------------------------------------------------------ */
+/* prohibition enforcement — action-gated, object-scoped                */
+/* ------------------------------------------------------------------ */
+
+/** A prohibited term matches only as a whole token — "cap" inside
+ *  "capacity" or "cat" inside "concatenate" is never evidence. */
+function termHit(instr: string, term: string): boolean {
+  const re = new RegExp(
+    `(?<![\\p{L}\\p{N}])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`,
+    "iu",
+  );
+  return re.test(instr);
+}
+
+/** Negation markers bounded to ≤3 tokens before the verb — "avoid using
+ *  martingale" / "không sử dụng martingale" declares compliance, never
+ *  performs the act. */
+const NEGATION_WINDOW_RE =
+  /(?:not|n't|never|no\b|non\b|without|avoid(?:ing)?|instead of|rather than|không|chẳng|chưa|tránh|đừng|thay vì|miễn|cấm|ngoài)\s*(?:[\p{L}\p{N}_-]+[\s,.]*){0,3}$/iu;
+
+/** Does the instruction perform a forbidden action class? Every
+ *  non-negated surface match counts; a match preceded by a negation
+ *  marker within a bounded window is suppressed. */
+function taskShowsAction(instr: string, classes: Set<string>): string | null {
+  for (const { cls, re } of PROHIBITION_ACTION_CLASSES) {
+    if (!classes.has(cls)) continue;
+    const g = new RegExp(re.source, "giu");
+    let m: RegExpExecArray | null;
+    while ((m = g.exec(instr)) !== null) {
+      const before = instr.slice(Math.max(0, m.index - 48), m.index);
+      if (!NEGATION_WINDOW_RE.test(before)) return cls;
+    }
+  }
+  return null;
+}
 
 /** Bounded channel/platform vocabulary for `only <channel>` constraints:
  *  the sibling space is enumerable here, never a free-text guess. */
@@ -481,15 +521,39 @@ export function assertPlanCoverage(
   }
   for (const req of contract.prohibitions) {
     const terms = req.terms ?? [];
+    const classes = new Set(req.actionClass ?? []);
     for (const t of work) {
-      const instr = String(t.task_instruction ?? "").toLowerCase();
+      const instr = String(t.task_instruction ?? "");
       const caps = (t.required_capabilities as string[] | undefined) ?? [];
+      // Capability authority is unchanged: a banned telegram surface is
+      // violated by the capability claim itself, independent of wording.
       for (const term of terms) {
         if (TELEGRAM_PROHIBITED_TERMS.has(term) && caps.includes("TELEGRAM_DELIVERY")) {
           violated(req, `task ${String(t.task_key)} requests prohibited TELEGRAM_DELIVERY`);
         }
-        if (instr.includes(term)) {
-          violated(req, `task ${String(t.task_key)} invokes prohibited term "${term}"`);
+      }
+      if (classes.size) {
+        // Structured prohibition: violation requires performing a
+        // compatible action ON a prohibited object — mentioning the
+        // object to check/research/review it is never the act. A ban
+        // with no object terms forbids the action class outright.
+        const shown = taskShowsAction(instr, classes);
+        if (shown) {
+          const hit = terms.find((term) => termHit(instr, term));
+          if (hit) {
+            violated(req, `task ${String(t.task_key)} performs prohibited ${shown} on "${hit}"`);
+          }
+          if (!terms.length) {
+            violated(req, `task ${String(t.task_key)} performs prohibited ${shown}`);
+          }
+        }
+      } else {
+        // No identifiable action — term-only enforcement (boundary
+        // match, fail-closed for unparseable prohibition shapes).
+        for (const term of terms) {
+          if (termHit(instr, term)) {
+            violated(req, `task ${String(t.task_key)} invokes prohibited term "${term}"`);
+          }
         }
       }
     }
