@@ -223,11 +223,14 @@ describe("P-UI-6 llm-planner", () => {
       ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
       ["REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION"],
     ];
-    const caps = ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION"];
+    // SUITABILITY_V1 — local impl caps on a remote-lane task are normalized
+    // away first; a genuinely unservable combo must keep a non-redundant cap
+    // (TELEGRAM_DELIVERY) that no single set serves alongside the remote one.
+    const caps = ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION", "TELEGRAM_DELIVERY"];
     const { tasks, warnings } = sanitizePlan(
       [
         { task_key: "T1", title: "a", task_instruction: "x", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] },
-        { task_key: "T2", title: "b", task_instruction: "x", required_capabilities: ["FILE_OPERATIONS", "REMOTE_CLOUD_TASK_EXECUTION"], depends_on: [] },
+        { task_key: "T2", title: "b", task_instruction: "x", required_capabilities: ["TELEGRAM_DELIVERY", "REMOTE_CLOUD_TASK_EXECUTION"], depends_on: [] },
         { task_key: "T3", title: "c", task_instruction: "x", required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION"], depends_on: [] },
       ],
       caps,
@@ -236,6 +239,33 @@ describe("P-UI-6 llm-planner", () => {
     );
     expect(tasks.map((t) => t.task_key)).toEqual(["T1", "T3"]);
     expect(warnings).toContain("DROP_UNSERVABLE_CAPS:T2");
+  });
+
+  it("SUITABILITY_V1: strips redundant local impl caps on remote-lane tasks instead of dropping them", () => {
+    const sets = [
+      ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
+      ["REMOTE_CLOUD_TASK_EXECUTION", "AUTONOMOUS_CODE_EXECUTION", "NETWORK_ACCESS"],
+    ];
+    const caps = [
+      "FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "REMOTE_CLOUD_TASK_EXECUTION",
+      "AUTONOMOUS_CODE_EXECUTION", "NETWORK_ACCESS", "CODE_GENERATION", "SHELL_EXECUTION",
+    ];
+    const { tasks, warnings } = sanitizePlan(
+      [
+        // remote cap + redundant local caps → normalized, task survives
+        { task_key: "T1", title: "a", task_instruction: "x", required_capabilities: ["REMOTE_CLOUD_TASK_EXECUTION", "FILE_OPERATIONS", "CODE_GENERATION"], depends_on: [] },
+        // NETWORK_ACCESS is NOT redundant — kept alongside the remote cap
+        { task_key: "T2", title: "b", task_instruction: "x", required_capabilities: ["AUTONOMOUS_CODE_EXECUTION", "NETWORK_ACCESS", "SHELL_EXECUTION"], depends_on: [] },
+      ],
+      caps,
+      5,
+      sets,
+    );
+    expect(tasks.map((t) => t.task_key)).toEqual(["T1", "T2"]);
+    expect(tasks[0].required_capabilities).toEqual(["REMOTE_CLOUD_TASK_EXECUTION"]);
+    expect(tasks[1].required_capabilities).toEqual(["AUTONOMOUS_CODE_EXECUTION", "NETWORK_ACCESS"]);
+    expect(warnings).toContain("NORMALIZED_REMOTE_CAPS:T1");
+    expect(warnings).toContain("NORMALIZED_REMOTE_CAPS:T2");
   });
 
   it("drops tasks that depend on a remote-capability task (remote outputs are not local files)", () => {

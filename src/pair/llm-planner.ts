@@ -614,6 +614,17 @@ const REMOTE_CAPS = new Set([
   "REMOTE_CLOUD_TASK_EXECUTION",
   "AUTONOMOUS_CODE_EXECUTION",
 ]);
+/** EXECUTOR_SUITABILITY_V1 — on a remote-lane task these local
+ *  implementation capabilities are redundant (the remote lane
+ *  encapsulates execution) and are normalized away in sanitizePlan. */
+const REMOTE_REDUNDANT_LOCAL_CAPS = new Set([
+  "FILE_OPERATIONS",
+  "CODE_GENERATION",
+  "CODE_EDITING",
+  "SHELL_EXECUTION",
+  "PYTHON_EXECUTION",
+  "REASONING",
+]);
 
 /**
  * Validate + clamp raw LLM tasks into a safe proposal. Rules (spec §2.1):
@@ -656,9 +667,24 @@ export function sanitizePlan(
       warnings.push(`DROP_INVALID_TASK_KEY:${key || "?"}`);
       continue;
     }
-    const caps = Array.isArray(t.required_capabilities)
+    let caps = Array.isArray(t.required_capabilities)
       ? t.required_capabilities.map((c) => String(c)).filter((c) => capSet.has(c))
       : [];
+    // EXECUTOR_SUITABILITY_V1 — a task carrying a remote-lane capability
+    // encapsulates execution on the remote side: redundant local
+    // implementation capabilities narrow eligibility without adding
+    // authority (they can even make the set unservable by any executor —
+    // e.g. {REMOTE_CLOUD_TASK_EXECUTION, FILE_OPERATIONS}). Strip them
+    // BEFORE the non-empty and jointly-servable checks so a remote-shaped
+    // task stays routable. NETWORK_ACCESS is kept — it is PAIR's network
+    // authority claim, not a redundant local-execution capability.
+    if (caps.some((c) => REMOTE_CAPS.has(c))) {
+      const kept = caps.filter((c) => !REMOTE_REDUNDANT_LOCAL_CAPS.has(c));
+      if (kept.length !== caps.length) {
+        caps = kept;
+        warnings.push(`NORMALIZED_REMOTE_CAPS:${key}`);
+      }
+    }
     if (!caps.length) {
       warnings.push(`DROP_NO_ALLOWED_CAPS:${key}`);
       continue;
@@ -922,6 +948,7 @@ Rules:
 - 1 to WORK_TASKS work tasks. Every task must exist for at least one concrete reason: a distinct deliverable/output, a distinct capability boundary, independently parallelizable work, a verification/review boundary, or a side-effect boundary. Do NOT split trivial sequential prose work into microtasks. Prefer analysis/reasoning steps (REASONING) for thinking work, CODE_GENERATION/PYTHON_EXECUTION for code, SHELL_EXECUTION for running things, FILE_OPERATIONS for pure file writes.
 - CURRENT/EXTERNAL DATA: if the goal needs current/external information (words like "hôm nay", "hiện tại", "giá", "tin tức", "mới nhất", "today", "current", "latest", "news", "price"), the data-gathering task's instruction MUST say to fetch/collect it and name the real source — PAIR derives the network requirement and binds NETWORK_ACCESS itself from the instruction wording (a required_capabilities claim is a hint, never the decision). Instruct the task to RETURN the full findings as its final result text, and name produced files explicitly when a downstream task must read them.
 - SOFTWARE WORK: when the goal asks to build or fix software (xây/build/create a website/app/tool/bot/script, viết code, fix bug, deploy), pick the minimum capability set the job requires (CODE_GENERATION, CODE_EDITING, SHELL_EXECUTION, PYTHON_EXECUTION, FILE_OPERATIONS). You describe the work — the router decides which executor satisfies the set.
+- LARGE-SCALE / AUTONOMOUS WORK: for repo-scale inspection or audit, cloning a repository, multi-file implementation with build+test, autonomous multi-step work, or long multi-source web research, prefer REMOTE_CLOUD_TASK_EXECUTION or AUTONOMOUS_CODE_EXECUTION as the task's capability — it encapsulates the whole execution on the remote side, including its files and artifacts. Do NOT stack local implementation capabilities (CODE_*/FILE_*/SHELL_*/PYTHON_*/REASONING) onto the same task — they are redundant there and the task must stay servable by ONE executor's set. Add NETWORK_ACCESS when the work needs live external data.
 - REMOTE DATAFLOW CONTRACT: tasks carrying REMOTE_CLOUD_TASK_EXECUTION / AUTONOMOUS_CODE_EXECUTION may execute remotely — their result text comes back, and their uploaded files land as canonical artifacts. A downstream task may depend on a remote task ONLY when it explicitly declares the produced artifact as an input (read the file it produces — name the artifact in its instruction or worker_spec); a remote dep with no declared artifact edge is rejected. TELEGRAM_DELIVERY tasks always may depend on remote tasks (they receive the remote result text through dependency_outputs).
 - VISUAL DELIVERABLES: a chart computed from data the plan already produces is ordinary compute work (e.g. PYTHON_EXECUTION); a screenshot of a live website needs a task that includes NETWORK_ACCESS; a generated image is only possible when a governed image-generation capability exists in ALLOWED_CAPABILITIES. If a visual file is produced by a task that may execute remotely, it must be uploaded via the outbox endpoint described in that task's prompt — a file left on a remote machine is unusable. Followed by a TELEGRAM_DELIVERY task when the goal also asks to send it to the operator.
 - TELEGRAM_DELIVERY (when ALLOWED): ONLY when the goal EXPLICITLY asks to send/deliver named output to Telegram (gửi tele/telegram, báo qua telegram, send/deliver to telegram) — never add it for a goal that merely mentions a file, an outbox, or completion. Add it as a DAG-leaf task with capability TELEGRAM_DELIVERY, depending ONLY on the tasks that produce what the goal asked to be sent. PAIR pins the delivery manifest, the canonical output language, and the final delivery instruction from the operator request — the plan does not choose what may be sent, in which language, or how. Instruction placeholder: "Stage the manifested artifacts into outbox/ unchanged, then reply DONE." (PAIR rewrites it canonically.)

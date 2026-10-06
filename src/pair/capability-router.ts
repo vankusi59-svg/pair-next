@@ -28,6 +28,77 @@ import type { PairControlPlane } from "./service.js";
 
 export const ROUTING_POLICY_VERSION = "pair.os.vnext.capability-routing.v1";
 
+/* ── EXECUTOR_SUITABILITY_V1_ACCOUNT_FIRST ─────────────────────────────
+ * Economic classification of the governed workforce: account/session
+ * executors are the DEFAULT general workforce; metered-API executors are
+ * general-purpose fallback only. A metered executor must never outrank a
+ * hard-eligible account executor on routing_priority, verified-experience
+ * score, or the deterministic tie-break — it may only win when no account
+ * executor survives hard eligibility (capability/health/quota/workspace)
+ * or through the existing bounded recovery reroute path.
+ *
+ * PAIR_NATIVE keeps its distinct semantics: it is NATIVE class, never
+ * swept into the account-vs-metered comparison — it stays in the
+ * non-account tier and keeps its legacy ordering there. An executor not
+ * declared below conservatively classifies as NON-ACCOUNT: it never
+ * receives the account-first boost.
+ */
+export type ExecutorEconomicClass = "ACCOUNT_SESSION" | "METERED_API" | "NATIVE";
+export const EXECUTOR_ECONOMIC_CLASS: Readonly<Record<string, ExecutorEconomicClass>> = {
+  CODEX: "ACCOUNT_SESSION",
+  DEVIN: "ACCOUNT_SESSION",
+  DEEPSEEK_HARNESS: "METERED_API",
+  PAIR_NATIVE: "NATIVE",
+};
+
+const ACCOUNT_TIER = 0;
+const NON_ACCOUNT_TIER = 1;
+const accountTierOf = (executorId: string): number =>
+  EXECUTOR_ECONOMIC_CLASS[executorId] === "ACCOUNT_SESSION"
+    ? ACCOUNT_TIER
+    : NON_ACCOUNT_TIER;
+
+export type TaskSuitability = "DEVIN_PREFERRED" | "CODEX_PREFERRED" | "NEUTRAL";
+
+/** Remote-lane capabilities — only account executors declare them today;
+ *  they encapsulate repo-scale/autonomous execution on the remote side. */
+const REMOTE_LANE_CAPS = new Set([
+  "REMOTE_CLOUD_TASK_EXECUTION",
+  "AUTONOMOUS_CODE_EXECUTION",
+]);
+/** Local implementation-lane capabilities — focused code/script work. */
+const IMPL_LANE_CAPS = new Set([
+  "CODE_GENERATION",
+  "CODE_EDITING",
+  "SHELL_EXECUTION",
+  "PYTHON_EXECUTION",
+  "FILE_OPERATIONS",
+]);
+
+/** Bounded deterministic task→executor-shape classifier: capability-based
+ *  only, no instruction parsing. Remote-lane or network-only tasks prefer
+ *  the remote/long-running account executor (DEVIN); implementation-lane
+ *  tasks prefer the focused local account executor (CODEX); anything else
+ *  is NEUTRAL and falls back to intra-tier priority order. */
+export function taskSuitability(caps: ReadonlySet<string>): TaskSuitability {
+  for (const c of caps) if (REMOTE_LANE_CAPS.has(c)) return "DEVIN_PREFERRED";
+  for (const c of caps) if (IMPL_LANE_CAPS.has(c)) return "CODEX_PREFERRED";
+  if (caps.has("NETWORK_ACCESS")) return "DEVIN_PREFERRED";
+  return "NEUTRAL";
+}
+
+/** Vastly exceeds EXPERIENCE_SCORE_WEIGHTS.MAX_ADJUSTMENT (40) so a
+ *  suitability ordering can never be flipped by verified-experience
+ *  adjustment — VE only re-orders candidates of equal suitability rank
+ *  inside the same economic tier. */
+const SUITABILITY_BASE_GAP = 1000;
+
+function suitabilityRank(executorId: string, suitability: TaskSuitability): number {
+  if (suitability === "NEUTRAL") return 0;
+  const preferred = suitability === "DEVIN_PREFERRED" ? "DEVIN" : "CODEX";
+  return executorId === preferred ? 0 : 1;
+}
+
 const EXECUTION_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 const AUTH_REJECTED = new Set(["AUTH_REQUIRED", "UNAUTHENTICATED", "EXPIRED", "NONE", "DENIED"]);
 const QUOTA_REJECTED = new Set(["EXHAUSTED", "DEPLETED", "BLOCKED"]);
@@ -255,22 +326,36 @@ export class CapabilityRouter {
       }
     }
 
-    // 12. deterministic priority + executor-id tie-break
+    // 12. EXECUTOR_SUITABILITY_V1 — deterministic ordering inside the
+    // hard-eligible set ONLY: economic tier (account-session first) →
+    // task-suitability rank → routing_priority → executor-id tie-break.
+    // Suitability never admits, removes, or resurrects a candidate.
+    const suitability = taskSuitability(requiredCapabilities);
     eligible.sort(
       (a, b) =>
+        accountTierOf(String(a.executor_id)) - accountTierOf(String(b.executor_id)) ||
+        suitabilityRank(String(a.executor_id), suitability) -
+          suitabilityRank(String(b.executor_id), suitability) ||
         (Number(a.routing_priority) || 100) - (Number(b.routing_priority) || 100) ||
         String(a.executor_id).localeCompare(String(b.executor_id)),
     );
     // P12: contract executor preference is a deterministic reorder inside
-    // the eligible set (first declared preference that survived all gates
-    // leads). It never admits a rejected executor. Advisors may still
-    // re-rank the reordered set below.
+    // the eligible set — bounded per economic tier since SUITABILITY_V1:
+    // a preferred executor leads within its own tier segment but cannot
+    // vault a metered executor above a hard-eligible account executor.
+    // It never admits a rejected executor. Advisors may still re-rank the
+    // reordered set below.
     const contractPreferred = (opts.preferredExecutors ?? []).filter((id) =>
       eligible.some((d) => String(d.executor_id) === id),
     );
     for (const id of [...contractPreferred].reverse()) {
       const idx = eligible.findIndex((d) => String(d.executor_id) === id);
-      if (idx >= 0) eligible.unshift(...eligible.splice(idx, 1));
+      if (idx < 0) continue;
+      const tier = accountTierOf(id);
+      const tierStart = eligible.findIndex(
+        (d) => accountTierOf(String(d.executor_id)) === tier,
+      );
+      eligible.splice(tierStart < 0 ? idx : tierStart, 0, ...eligible.splice(idx, 1));
     }
     // P7: advisory re-rank runs strictly INSIDE the hard-eligible set — it can
     // never add, remove, or resurrect a candidate, only reorder by bounded
@@ -278,15 +363,30 @@ export class CapabilityRouter {
     let selected = eligible.length ? String(eligible[0].executor_id) : null;
     let advisorReceipt: Record<string, unknown> | null = null;
     if (opts.routingAdvisor && eligible.length >= 1) {
+      // SUITABILITY_V1 — verified-experience adjustment stays bounded to the
+      // top economic tier: a metered executor can never be experience-
+      // promoted above a hard-eligible account executor. The advisor pool
+      // is the top-tier segment; each member's effective base carries the
+      // suitability gap so VE may tie-break/reorder only within equal
+      // suitability ranks (gap ≫ MAX_ADJUSTMENT).
+      const topTier = accountTierOf(String(eligible[0].executor_id));
+      const advisorPool: Array<Record<string, unknown>> = eligible
+        .filter((d) => accountTierOf(String(d.executor_id)) === topTier)
+        .map((d) => ({
+          ...d,
+          routing_priority:
+            suitabilityRank(String(d.executor_id), suitability) * SUITABILITY_BASE_GAP +
+            (Number(d.routing_priority) || 100),
+        }));
       advisorReceipt = opts.routingAdvisor.advise({
-        eligible,
+        eligible: advisorPool,
         task,
         environment: opts.environment,
         correlation_id: opts.correlationId,
         persist: opts.persist !== false,
       });
       const advised = String(advisorReceipt.selected ?? "");
-      if (advised && eligible.some((d) => String(d.executor_id) === advised)) {
+      if (advised && advisorPool.some((d) => String(d.executor_id) === advised)) {
         selected = advised;
       } else {
         selected = eligible.length ? String(eligible[0].executor_id) : null;
@@ -316,6 +416,10 @@ export class CapabilityRouter {
       score_version: advisorReceipt
         ? String(advisorReceipt.score_version)
         : null,
+      // SUITABILITY_V1 — evidence of the economic/suitability layer applied
+      // to this decision (empty → legacy ordering could not be expressed).
+      task_suitability: suitability,
+      economic_policy: "ACCOUNT_FIRST",
     };
     const digestBody: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(decision)) {

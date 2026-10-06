@@ -464,9 +464,11 @@ describe("P5 selection", () => {
       picks.push(String(r.routing_decision.selected_executor));
       lastDecisionId = String(r.routing_decision.routing_decision_id);
     }
-    // FILE_OPERATIONS eligible: PAIR_NATIVE(100), DSH(10), CODEX(50) → DSH wins both times.
+    // FILE_OPERATIONS eligible: PAIR_NATIVE(100), DSH(10), CODEX(50) —
+    // SUITABILITY_V1: account-tier CODEX wins both times; metered DSH can
+    // never outrank an eligible account executor on priority alone.
     expect(picks[0]).toBe(picks[1]);
-    expect(picks[0]).toBe(DSH_EXECUTOR_ID);
+    expect(picks[0]).toBe(CODEX_EXECUTOR_ID);
     expect(ctx.router.verifyRoutingDecision(lastDecisionId)).toBe(true);
   });
 });
@@ -677,7 +679,10 @@ describe("P5 governance invariants (14–17)", () => {
 });
 
 describe("P5 handoff, normalization, evidence (18–22)", () => {
-  it("18: T1→PAIR_NATIVE, T2→CODEX, T3→DSH — one mission, canonical IDs preserved", async () => {
+  // EXECUTOR_SUITABILITY_V1 — T3 (SHELL_EXECUTION) is servable by CODEX and
+  // DSH; the account-tier + impl-lane preference makes CODEX win, so a
+  // metered DSH pick is only reachable when CODEX is absent (see t19dsh).
+  it("18: T1→PAIR_NATIVE, T2→CODEX, T3→CODEX — one mission, canonical IDs preserved", async () => {
     const ctx = makeCtx("t18", { priorities: { [DSH_EXECUTOR_ID]: 10 } });
     cleanups.push(() => ctx.runner.shutdown());
     registerPairNative(ctx);
@@ -717,31 +722,33 @@ describe("P5 handoff, normalization, evidence (18–22)", () => {
     await waitTerminal(ctx.codex!, String(r2.execution.execution_id));
     const c2 = ctx.gate.collect_execution_result(ctx.codex!, String(r2.execution.execution_id));
 
-    // T3 — DSH (priority 10 beats CODEX 50 on SHELL_EXECUTION overlap).
+    // T3 — CODEX (SUITABILITY_V1: account-tier beats metered DSH on the
+    // shared SHELL_EXECUTION lane; DSH remains reachable only when the
+    // account executor is not eligible — covered by t19dsh below).
     const r3 = ctx.router.routeGovernedTask(
       requestFor(ctx, m, 2, {
-        instruction: "dsh step",
+        instruction: "codex step 2",
         dependencyOutputs: [{ from: "T2", summary: (c2.result as Record<string, unknown>).summary }],
       }),
       adaptersOf(ctx),
     );
-    expect(String(r3.routing_decision.selected_executor)).toBe(DSH_EXECUTOR_ID);
-    await waitTerminal(ctx.dsh!, String(r3.execution.execution_id));
-    const c3 = ctx.gate.collect_execution_result(ctx.dsh!, String(r3.execution.execution_id));
+    expect(String(r3.routing_decision.selected_executor)).toBe(CODEX_EXECUTOR_ID);
+    await waitTerminal(ctx.codex!, String(r3.execution.execution_id));
+    const c3 = ctx.gate.collect_execution_result(ctx.codex!, String(r3.execution.execution_id));
 
-    // Canonical PAIR execution IDs across all three; distinct executors.
+    // Canonical PAIR execution IDs; distinct executors NATIVE + CODEX.
     const ids = [r1, r2, r3].map((r) => String(r.execution.execution_id));
     for (const id of ids) expect(id).toMatch(/^EXE_/);
     const execs = ctx.store
       .list("executor_execution")
       .filter((e) => e.mission_id === m.missionId);
     expect(new Set(execs.map((e) => String(e.executor_id)))).toEqual(
-      new Set([PAIR_NATIVE_EXECUTOR_ID, CODEX_EXECUTOR_ID, DSH_EXECUTOR_ID]),
+      new Set([PAIR_NATIVE_EXECUTOR_ID, CODEX_EXECUTOR_ID]),
     );
     // Dependency outputs were threaded into the governed prompt (canonical spec).
     const spec3 = JSON.parse(
       fs.readFileSync(
-        path.join(acpRunRoot(path.join(ctx.dir, "journal"), ids[2]), "spec.json"),
+        path.join(codexRunRoot(path.join(ctx.dir, "journal"), ids[2]), "spec.json"),
         "utf8"),
     );
     expect(JSON.stringify(spec3.dependency_outputs)).toContain("T2");
@@ -753,23 +760,31 @@ describe("P5 handoff, normalization, evidence (18–22)", () => {
     cleanups.push(() => ctx.runner.shutdown());
     registerPairNative(ctx);
     ctx.service.routes.seedPairNativeRoute();
+    // SUITABILITY_V1 — DSH only wins a shared-capability task when the
+    // account executor is absent; exercise its canonical shape in a
+    // CODEX-free ctx (same fixture, separate mission).
+    const ctxDsh = makeCtx("t19dsh", { codex: false });
+    cleanups.push(() => ctxDsh.runner.shutdown());
+    registerPairNative(ctxDsh);
+    ctxDsh.service.routes.seedPairNativeRoute();
     fs.writeFileSync(path.join(ctx.workspace, "f.txt"), "x");
     const collectStatus = async (
+      c: Ctx,
       adapter: ExecutorAdapter,
       caps: string[],
       workerSpec?: Record<string, unknown>,
     ) => {
-      const m = seedMission(ctx, [taskSpec("T1", caps, "norm")]);
+      const m = seedMission(c, [taskSpec("T1", caps, "norm")]);
       const req = {
-        ...requestFor(ctx, m, 0, { instruction: "norm" }),
+        ...requestFor(c, m, 0, { instruction: "norm" }),
         ...(workerSpec ? { expected_output_contract: workerSpec } : {}),
       };
-      const r = ctx.router.routeGovernedTask(req, adaptersOf(ctx));
+      const r = c.router.routeGovernedTask(req, adaptersOf(c));
       const execId = String(r.execution.execution_id);
       await waitTerminal(adapter, execId);
-      return ctx.gate.collect_execution_result(adapter, execId);
+      return c.gate.collect_execution_result(adapter, execId);
     };
-    const rNative = await collectStatus(ctx.adapter, ["AUTOMATON_TASK_EXECUTION"], {
+    const rNative = await collectStatus(ctx, ctx.adapter, ["AUTOMATON_TASK_EXECUTION"], {
       type: "TASK_RESULT",
       worker_spec: {
         ops: [{ op: "finish", result: { summary: "ok" }, idempotency_class: "READ_ONLY", risk_class: "LOW" }],
@@ -777,8 +792,8 @@ describe("P5 handoff, normalization, evidence (18–22)", () => {
         allowed_ops: ["finish"],
       },
     });
-    const rDsh = await collectStatus(ctx.dsh!, ["SHELL_EXECUTION"]);
-    const rCodex = await collectStatus(ctx.codex!, ["PYTHON_EXECUTION"]);
+    const rDsh = await collectStatus(ctxDsh, ctxDsh.dsh!, ["SHELL_EXECUTION"]);
+    const rCodex = await collectStatus(ctx, ctx.codex!, ["PYTHON_EXECUTION"]);
     for (const c of [rNative, rDsh, rCodex]) {
       const res = c.result as Record<string, unknown>;
       expect(res).toBeTruthy();

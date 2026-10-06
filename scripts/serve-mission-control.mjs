@@ -233,10 +233,12 @@ if (process.env.PAIR_DSH_HOME) {
 if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
-// Cost guard — caps remote Devin dispatches per UTC day (ACU spend) and the
-// PAIR_COST_HALT=1 kill-switch. Rejections settle FAILED/BUDGET_EXCEEDED →
-// recovery escalates to the operator instead of silently spending.
-const MAX_REMOTE_PER_DAY = Number(process.env.PAIR_MAX_REMOTE_TASKS_PER_DAY ?? 10);
+// Dispatch ceiling — Devin runs on an account/session (EXECUTOR_SUITABILITY_V1
+// economic policy: NOT a paid per-task API-token lane), so this is a resource
+// ceiling on remote dispatches per UTC day, not a metered-spend budget; the
+// PAIR_COST_HALT=1 kill-switch is unchanged. Rejections settle
+// FAILED/BUDGET_EXCEEDED → recovery escalates to the operator.
+const MAX_REMOTE_PER_DAY = Number(process.env.PAIR_MAX_REMOTE_TASKS_PER_DAY ?? 50);
 // Runtime-flippable halt: bridges/ops drop this file to stop remote spend
 // without restarting the server (same effect as PAIR_COST_HALT=1).
 const COST_HALT_FILE = process.env.PAIR_COST_HALT_FILE ?? path.join(dir, "COST_HALT");

@@ -687,13 +687,15 @@ describe("P7 — scoring bounds / receipts / feedback (tests 29–32)", () => {
 describe("P7 — controlled positive adaptive selection (§28)", () => {
   it("A. two hard-eligible executors: ACTIVE experience flips selection; revoke restores baseline", () => {
     const ctx = makeCtx("adaptive");
-    registerExecutor(ctx, "DSH", { priority: 10 });
+    // SUITABILITY_V1 — both members of the account tier so verified
+    // experience may still reorder between them (VE never crosses tiers).
+    registerExecutor(ctx, "DEVIN", { priority: 10 });
     registerExecutor(ctx, "CODEX", { priority: 30 });
     const { task } = seedTask(ctx);
 
-    // baseline deterministic: DSH (lower priority wins)
+    // baseline deterministic: DEVIN (lower priority wins)
     const base = ctx.router.route(task, { routingAdvisor: ctx.routingAdvisor, environment: ENV });
-    expect(String(base.selected_executor)).toBe("DSH");
+    expect(String(base.selected_executor)).toBe("DEVIN");
     expect(String(base.adaptive_mode)).toBe("BASELINE");
 
     // verified CODEX affinity (two real observations satisfy ROUTING_PRIOR
@@ -711,11 +713,11 @@ describe("P7 — controlled positive adaptive selection (§28)", () => {
     expect(String(adaptive.selected_executor)).toBe("CODEX");
     expect(String(adaptive.adaptive_mode)).toBe("ADAPTIVE");
     const receipt = ctx.store.get("advisor_decision", String(adaptive.advisor_decision_id));
-    expect([...(receipt.eligible_candidates as string[])].sort()).toEqual(["CODEX", "DSH"]);
+    expect([...(receipt.eligible_candidates as string[])].sort()).toEqual(["CODEX", "DEVIN"]);
     expect((receipt.experience_ids_applied as string[]).length).toBeGreaterThan(0);
     const adj = receipt.experience_adjustments as Record<string, number>;
     expect(adj.CODEX).toBeGreaterThan(0);
-    expect(adj.DSH).toBe(0);
+    expect(adj.DEVIN).toBe(0);
     expect(adj.CODEX).toBeLessThanOrEqual(40); // bounded
     // hard gates unchanged — eligible set identical, no candidate added
     expect(adaptive.eligible_executors).toEqual(base.eligible_executors);
@@ -724,7 +726,7 @@ describe("P7 — controlled positive adaptive selection (§28)", () => {
     // revoke → deterministic baseline restored
     for (const id of uniqueIds) ctx.experience.revoke(id, "rollback");
     const after = ctx.router.route(task, { routingAdvisor: ctx.routingAdvisor, environment: ENV });
-    expect(String(after.selected_executor)).toBe("DSH");
+    expect(String(after.selected_executor)).toBe("DEVIN");
   });
 });
 
