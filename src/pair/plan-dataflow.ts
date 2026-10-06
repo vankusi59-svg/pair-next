@@ -307,20 +307,38 @@ const TRANSFER_WORDS = new Set([
   "summarize",
   "summarizes",
   "summarise",
+  "tóm tắt",
 ]);
 // Verbs attributing a write/produce role to the following path.
 const PRODUCE_VERB =
   /\b(?:write|writes|writing|create|creates|creating|produce|produces|producing|generate|generates|save|saves|saving|output|outputs|emit|emits|place|places|put|puts|store|stores|persist|persists|upload|uploads|format|formats|formatting|compose|composes|composing)\b/gi;
+// Vietnamese verb alternates carrying the same attribution roles as the
+// English lists — planner-authored instructions are routinely Vietnamese
+// and a verb the lists do not know leaves every path mention
+// unattributed (produces=[] was the live P-GRAMMAR3 incident). Boundary
+// form differs from `\b`: several lexemes begin/end on a diacritic vowel
+// (`mở`, `giá`) where \b cannot fire, so these consume a leading
+// non-letter boundary and use a trailing lookahead. Multi-word lexemes
+// are listed before their prefixes so the longest match wins.
+const CONSUME_VERB_VI =
+  /(?:^|[^\p{L}\p{N}])(đọc|mở|xem xét|xem|so sánh|đối chiếu|phân tích|đánh giá|kiểm tra|kiểm|tham khảo|rà soát|sử dụng|dùng|lấy|tóm tắt)(?=[^\p{L}\p{N}]|$)/giu;
+/** A VI action token trailing a naming noun is the noun-phrase suffix,
+ *  not a governing verb — "viết báo cáo phân tích vào x.txt" must
+ *  attribute x.txt to `viết`, never let `phân tích` steal the role. */
+const VI_NOUN_SUFFIX =
+  /(?:báo cáo|bản|file|tài liệu|kết quả|nội dung|bảng|danh sách)\s*$/iu;
+const PRODUCE_VERB_VI =
+  /(?:^|[^\p{L}\p{N}])(tạo|viết|ghi|soạn|lưu|xuất|sinh|xây dựng|kết xuất)(?=[^\p{L}\p{N}]|$)/giu;
 // Destination marker immediately before the path: "to X", "into
 // outbox/X", "in X".
-const DESTINATION_ADJACENT = /\b(?:to|into|onto|inside|in)\s*$/i;
+const DESTINATION_ADJACENT = /\b(?:to|into|onto|inside|in|vào|trong)\s*$/i;
 // Modifier-separated destination: the marker followed by a bounded run
 // of words — "format the findings into a professional report.md". A
 // gap-word destination is NOT independently a producer: it only mints a
 // produced artifact when a produce/transform verb governs the phrase
 // ("format"), so purpose phrases like "to compare with baseline.csv"
 // stay consumes under their governing read/use semantics.
-const DESTINATION_GAP = /\b(?:to|into|onto|inside)(?:\s+[\w-]+){1,5}\s*$/i;
+const DESTINATION_GAP = /\b(?:to|into|onto|inside|vào|trong)(?:\s+[\w-]+){1,5}\s*$/i;
 
 /** Nearest governing verb before a path mention: the LAST consume/produce
  *  verb inside the bounded lookback window wins — "read input.txt then
@@ -347,6 +365,25 @@ function nearestVerbMatch(
   while ((m = PRODUCE_VERB.exec(before)) !== null) {
     if (!best || m.index >= best.index) {
       best = { role: "produce", index: m.index, word: m[0] };
+    }
+  }
+  // Same nearest-verb rule for the Vietnamese alternates — a VI match
+  // reports its capture so index/word stay honest, and a token parked
+  // on a naming noun (báo cáo phân tích / bản tóm tắt) is skipped.
+  CONSUME_VERB_VI.lastIndex = 0;
+  while ((m = CONSUME_VERB_VI.exec(before)) !== null) {
+    const index = m.index + m[0].length - m[1].length;
+    if (VI_NOUN_SUFFIX.test(before.slice(0, index))) continue;
+    if (!best || index >= best.index) {
+      best = { role: "consume", index, word: m[1] };
+    }
+  }
+  PRODUCE_VERB_VI.lastIndex = 0;
+  while ((m = PRODUCE_VERB_VI.exec(before)) !== null) {
+    const index = m.index + m[0].length - m[1].length;
+    if (VI_NOUN_SUFFIX.test(before.slice(0, index))) continue;
+    if (!best || index >= best.index) {
+      best = { role: "produce", index, word: m[1] };
     }
   }
   return best;
