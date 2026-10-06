@@ -1,8 +1,8 @@
 # P-GRAMMAR3 — Bounded artifact-list grammar for `extractTaskDataflow`
 
 **BASE SHA:** `a5bee58` (main, post-PR#54 merge)
-**HEAD SHA:** _filled at commit_
-**Branch:** `devin/<ts>-p-grammar3` — ONE new PR, **not merged**
+**HEAD SHA:** `555bca3`
+**Branch:** `devin/1791272343-p-grammar3` — ONE new PR, **not merged**
 
 ## 1. Root cause
 
