@@ -26,7 +26,7 @@ import { IntegrityError } from "./errors.js";
 import { ExecutorRegistry, QUALIFIED_TRANSPORTS, TRANSPORT_AUTOMATON_WORKER_POOL, TRANSPORT_SUBPROCESS_WORKER, TRANSPORT_UNKNOWN, CANONICAL_IDENTITIES } from "./executor-registry.js";
 import type { PairControlPlane } from "./service.js";
 
-export const ROUTING_POLICY_VERSION = "pair.os.vnext.capability-routing.v1";
+export const ROUTING_POLICY_VERSION = "pair.os.vnext.capability-routing.v2";
 
 /* ── EXECUTOR_SUITABILITY_V1_ACCOUNT_FIRST ─────────────────────────────
  * Economic classification of the governed workforce: account/session
@@ -60,6 +60,28 @@ const accountTierOf = (executorId: string): number =>
 
 export type TaskSuitability = "DEVIN_PREFERRED" | "CODEX_PREFERRED" | "NEUTRAL";
 
+/** EXECUTOR_SUITABILITY_V1 R1 — bounded deterministic task-nature hint.
+ *  The planner may declare ONE of these on a task (canonical
+ *  `metadata.task_profile`) to describe the nature of the work — never an
+ *  executor name. The router maps profile → executor suitability; the
+ *  hint grants no authority and never bypasses hard eligibility. */
+export const TASK_PROFILES: ReadonlySet<string> = new Set([
+  "FOCUSED_LOCAL",
+  "LONG_RESEARCH",
+  "REPO_SCALE",
+  "LONG_AUTONOMOUS",
+]);
+const PROFILE_SUITABILITY: Readonly<Record<string, TaskSuitability>> = {
+  FOCUSED_LOCAL: "CODEX_PREFERRED",
+  LONG_RESEARCH: "DEVIN_PREFERRED",
+  REPO_SCALE: "DEVIN_PREFERRED",
+  LONG_AUTONOMOUS: "DEVIN_PREFERRED",
+};
+export function profileSuitability(profile: unknown): TaskSuitability | null {
+  if (typeof profile !== "string") return null;
+  return PROFILE_SUITABILITY[profile] ?? null;
+}
+
 /** Remote-lane capabilities — only account executors declare them today;
  *  they encapsulate repo-scale/autonomous execution on the remote side. */
 const REMOTE_LANE_CAPS = new Set([
@@ -86,12 +108,6 @@ export function taskSuitability(caps: ReadonlySet<string>): TaskSuitability {
   if (caps.has("NETWORK_ACCESS")) return "DEVIN_PREFERRED";
   return "NEUTRAL";
 }
-
-/** Vastly exceeds EXPERIENCE_SCORE_WEIGHTS.MAX_ADJUSTMENT (40) so a
- *  suitability ordering can never be flipped by verified-experience
- *  adjustment — VE only re-orders candidates of equal suitability rank
- *  inside the same economic tier. */
-const SUITABILITY_BASE_GAP = 1000;
 
 function suitabilityRank(executorId: string, suitability: TaskSuitability): number {
   if (suitability === "NEUTRAL") return 0;
@@ -330,7 +346,12 @@ export class CapabilityRouter {
     // hard-eligible set ONLY: economic tier (account-session first) →
     // task-suitability rank → routing_priority → executor-id tie-break.
     // Suitability never admits, removes, or resurrects a candidate.
-    const suitability = taskSuitability(requiredCapabilities);
+    // R1: a declared task_profile (bounded planner hint, canonical
+    // metadata.task_profile) takes precedence over caps-based inference —
+    // it expresses the nature of the work, not a required executor.
+    const suitability =
+      profileSuitability(taskMeta.task_profile) ??
+      taskSuitability(requiredCapabilities);
     eligible.sort(
       (a, b) =>
         accountTierOf(String(a.executor_id)) - accountTierOf(String(b.executor_id)) ||
@@ -352,10 +373,13 @@ export class CapabilityRouter {
       const idx = eligible.findIndex((d) => String(d.executor_id) === id);
       if (idx < 0) continue;
       const tier = accountTierOf(id);
-      const tierStart = eligible.findIndex(
-        (d) => accountTierOf(String(d.executor_id)) === tier,
+      const rank = suitabilityRank(id, suitability);
+      const segStart = eligible.findIndex(
+        (d) =>
+          accountTierOf(String(d.executor_id)) === tier &&
+          suitabilityRank(String(d.executor_id), suitability) === rank,
       );
-      eligible.splice(tierStart < 0 ? idx : tierStart, 0, ...eligible.splice(idx, 1));
+      eligible.splice(segStart < 0 ? idx : segStart, 0, ...eligible.splice(idx, 1));
     }
     // P7: advisory re-rank runs strictly INSIDE the hard-eligible set — it can
     // never add, remove, or resurrect a candidate, only reorder by bounded
@@ -363,21 +387,24 @@ export class CapabilityRouter {
     let selected = eligible.length ? String(eligible[0].executor_id) : null;
     let advisorReceipt: Record<string, unknown> | null = null;
     if (opts.routingAdvisor && eligible.length >= 1) {
-      // SUITABILITY_V1 — verified-experience adjustment stays bounded to the
-      // top economic tier: a metered executor can never be experience-
-      // promoted above a hard-eligible account executor. The advisor pool
-      // is the top-tier segment; each member's effective base carries the
-      // suitability gap so VE may tie-break/reorder only within equal
-      // suitability ranks (gap ≫ MAX_ADJUSTMENT).
+      // SUITABILITY_V1 R1 — structural isolation, no magic-number gap:
+      // verified experience may reorder ONLY the top segment — the
+      // hard-eligible members inside the top economic tier AND the top
+      // suitability rank. Lower-rank members of the same tier are not
+      // visible to the advisor at all, so VE can never cross an economic
+      // tier or a suitability rank regardless of score or priority delta.
       const topTier = accountTierOf(String(eligible[0].executor_id));
-      const advisorPool: Array<Record<string, unknown>> = eligible
+      const topRank = eligible
         .filter((d) => accountTierOf(String(d.executor_id)) === topTier)
-        .map((d) => ({
-          ...d,
-          routing_priority:
-            suitabilityRank(String(d.executor_id), suitability) * SUITABILITY_BASE_GAP +
-            (Number(d.routing_priority) || 100),
-        }));
+        .reduce(
+          (m, d) => Math.min(m, suitabilityRank(String(d.executor_id), suitability)),
+          Number.MAX_SAFE_INTEGER,
+        );
+      const advisorPool: Array<Record<string, unknown>> = eligible.filter(
+        (d) =>
+          accountTierOf(String(d.executor_id)) === topTier &&
+          suitabilityRank(String(d.executor_id), suitability) === topRank,
+      );
       advisorReceipt = opts.routingAdvisor.advise({
         eligible: advisorPool,
         task,
@@ -419,6 +446,9 @@ export class CapabilityRouter {
       // SUITABILITY_V1 — evidence of the economic/suitability layer applied
       // to this decision (empty → legacy ordering could not be expressed).
       task_suitability: suitability,
+      task_profile: profileSuitability(taskMeta.task_profile)
+        ? String(taskMeta.task_profile)
+        : null,
       economic_policy: "ACCOUNT_FIRST",
     };
     const digestBody: Record<string, unknown> = {};

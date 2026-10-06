@@ -233,24 +233,15 @@ if (process.env.PAIR_DSH_HOME) {
 if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
-// Dispatch ceiling — Devin runs on an account/session (EXECUTOR_SUITABILITY_V1
-// economic policy: NOT a paid per-task API-token lane), so this is a resource
-// ceiling on remote dispatches per UTC day, not a metered-spend budget; the
-// PAIR_COST_HALT=1 kill-switch is unchanged. Rejections settle
-// FAILED/BUDGET_EXCEEDED → recovery escalates to the operator.
-const MAX_REMOTE_PER_DAY = Number(process.env.PAIR_MAX_REMOTE_TASKS_PER_DAY ?? 50);
-// Runtime-flippable halt: bridges/ops drop this file to stop remote spend
-// without restarting the server (same effect as PAIR_COST_HALT=1).
+// OPERATOR REMOTE EXECUTION KILL SWITCH — Devin runs on account/session
+// economics (EXECUTOR_SUITABILITY_V1: NOT a metered lane), so PAIR does NOT
+// self-impose any daily task count. PAIR_COST_HALT=1 (or the flippable halt
+// file) blocks ALL remote dispatch fail-closed; provider quota is the
+// provider's own state, not a PAIR accounting artifact. Rejections settle
+// FAILED → recovery escalates to the operator.
 const COST_HALT_FILE = process.env.PAIR_COST_HALT_FILE ?? path.join(dir, "COST_HALT");
 const isCostHalted = () =>
   process.env.PAIR_COST_HALT === "1" || fs.existsSync(COST_HALT_FILE);
-const remoteDispatchesToday = () => {
-  const today = utcnow().slice(0, 10);
-  return service.store
-    .list("executor_execution")
-    .filter((e) => String(e.executor_id) === DEVIN_EXECUTOR_ID && String(e.created_at ?? "").startsWith(today))
-    .length;
-};
 governed.set(
   DEVIN_EXECUTOR_ID,
   new DevinExecutorAdapter({
@@ -261,10 +252,7 @@ governed.set(
     blockedGraceMs: cfgDevinBlockedGraceMs,
     costGuard: () => {
       if (isCostHalted())
-        return { allowed: false, reason: "COST_HALT: cost halt active (env or halt file) — all remote dispatch blocked" };
-      const n = remoteDispatchesToday();
-      if (n >= MAX_REMOTE_PER_DAY)
-        return { allowed: false, reason: `BUDGET_EXCEEDED: remote dispatch budget ${n}/${MAX_REMOTE_PER_DAY} per day reached` };
+        return { allowed: false, reason: "REMOTE_EXECUTION_HALT: operator kill-switch active (PAIR_COST_HALT=1 or halt file) — all remote dispatch blocked" };
       return { allowed: true };
     },
   }),

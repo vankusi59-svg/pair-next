@@ -242,13 +242,20 @@ const PLAN_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on"],
+        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on", "task_profile"],
         properties: {
           task_key: { type: "string" },
           title: { type: "string" },
           task_instruction: { type: "string" },
           required_capabilities: { type: "array", items: { type: "string" } },
           depends_on: { type: "array", items: { type: "string" } },
+          // EXECUTOR_SUITABILITY_V1 R1 — bounded task-nature hint; the
+          // strict-output API requires every properties key in `required`.
+          // Sanitize validates membership; an out-of-enum value is stripped.
+          task_profile: {
+            type: "string",
+            enum: ["FOCUSED_LOCAL", "LONG_RESEARCH", "REPO_SCALE", "LONG_AUTONOMOUS"],
+          },
           // pair_coverage / network_requirement are deliberately NOT in
           // this schema: the strict-output API rejects any properties key
           // missing from `required`, and optional fields are inexpressible.

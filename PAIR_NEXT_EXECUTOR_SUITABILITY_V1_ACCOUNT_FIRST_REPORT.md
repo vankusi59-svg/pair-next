@@ -75,3 +75,43 @@ No recovery-code change needed: the ordering itself yields Devin→Codex, Codex�
 - Remote-lane tasks have no non-DEVIN executor — with DEVIN down they fail-closed (eligible=∅) rather than degrading to local execution; that is the mandate's intent (remote lane is authoritative).
 - DSH only carries out TELEGRAM_DELIVERY/file work when no account executor can serve it — if an operator *wants* DSH specifically, it must be the only eligible executor.
 - Economic class map is executor_id-keyed; a future renamed/new executor id defaults to non-account tier (fail-safe toward metered ordering, never vaults).
+
+## R1 — audit remediation (audited HEAD `b58bbd5`, pending audit)
+
+Mandate R1.A–R1.H. Same-task bounded fallback, daily-limit removal, VE structural isolation, P12 consistency, planner nature-not-executor, ROUTING_POLICY_VERSION v2, DSH last, invariants kept.
+
+### R1.A — task_profile hint (bounded, deterministic, canonical)
+
+- New `TASK_PROFILES` enum {FOCUSED_LOCAL, LONG_RESEARCH, REPO_SCALE, LONG_AUTONOMOUS} + `PROFILE_SUITABILITY` + `profileSuitability()` in capability-router.ts; the planner describes the NATURE of work (`metadata.task_profile`), never an executor name. An unknown/forgeable value is stripped at sanitize (`DROP_INVALID_TASK_PROFILE:<key>`) — the task survives on caps-based suitability; the hint grants no authority and never bypasses hard eligibility.
+- Suitability resolution order: `profileSuitability(metadata.task_profile) ?? taskSuitability(caps)` — declared nature wins; absent → caps inference (V1 rule).
+- `metadata.task_profile` is bound into `canonicalPlanSemanticDigest` (plan-feasibility.ts) — a replan cannot silently rewrite the work's nature; sanitize + commitPlan carry it verbatim (`RawTask.task_profile` → `metadata.task_profile`).
+- Codex PLAN_SCHEMA: `task_profile` added as a required property (strict-output API cannot express optional fields — same convention as every other schema property). Prompt: new `TASK PROFILE` bullet requires the declaration; `LARGE-SCALE / AUTONOMOUS WORK` bullet rewritten — remote caps only when remote semantics are genuinely required, never as an executor-preference proxy; minimum-capability principle kept.
+- SAME-TASK fallback proof (R1.3/R1.4): identical caps+profile — DEVIN up → DEVIN, DEVIN down → CODEX; no capability-set delta. Genuine remote-cap tasks (REMOTE_CLOUD/AUTONOMOUS) still fail closed with DEVIN down — only that shape may legitimately produce eligible=∅ (R1.16).
+
+### R1.B — Devin daily task limit REMOVED
+
+- Deleted from scripts/serve-mission-control.mjs: `MAX_REMOTE_PER_DAY`, `PAIR_MAX_REMOTE_TASKS_PER_DAY`, `remoteDispatchesToday()`, the `n >= MAX_REMOTE_PER_DAY → BUDGET_EXCEEDED` branch, and defaults 10/50. No daily count remains anywhere — R1.13/R1.14 pin the mechanism's absence at source level.
+- `PAIR_COST_HALT` / `COST_HALT_FILE` kept and re-framed as the OPERATOR REMOTE EXECUTION KILL SWITCH — the only remote-dispatch block, fail-closed (`REMOTE_EXECUTION_HALT`), never a soft quota.
+
+### R1.C — VE structural isolation (no magic number)
+
+- `SUITABILITY_BASE_GAP` (1000) deleted. Advisor pool is now computed structurally: `hard-eligible ∩ top economic tier ∩ top suitability rank` — VE may only re-order peers inside that pool using their ORIGINAL routing_priority bases; no injected scores. VE structurally cannot cross tier or rank (R1.8: priority delta >1000 still confined; R1.9: metered executor excluded whenever an account executor is eligible).
+
+### R1.D — P12 consistency
+
+- `preferredExecutors` reorders within its own (tier, rank) segment only — cannot vault DSH above account executors, cannot pull a lower suitability rank above the task's preferred rank, cannot resurrect a rejected executor (R1.10).
+
+### R1.E / R1.F / R1.G / R1.H
+
+- Planner writes nature+minimum caps only (R1.E); remote caps never used as proxy (R1.17 — CODEX fallback inherits nothing fake).
+- `ROUTING_POLICY_VERSION` → `pair.os.vnext.capability-routing.v2` (receipts gain `task_suitability`, `task_profile`, `economic_policy`). Historical receipts are NOT rewritten — `verifyDecisionDigest` recomputes over stored fields, so a v1 receipt still verifies (R1.18).
+- DSH last preserved: metered tier only wins when no account executor is eligible or DSH is the only hard-compatible executor (R1.6).
+- Invariants kept: single routing authority, all 12 gates first, select-only semantics, no second router/LLM/NLP/global renumber.
+
+### Tests (R1.1–R1.18 + boundary suite)
+
+`src/__tests__/pair-executor-suitability-v1.test.ts` rewritten — 23 tests: R1.1–R1.18 pins (same-task profile fallback ×2, dispatch-time credential requalification fallback, >1000-delta VE isolation, P12 bounds, no-daily-limit source pin, kill-switch preserved, F2/F5 intact, historical v1 receipt verify) + classifier/profileSuitability boundary + NEUTRAL/metered/economic-class pins.
+
+- Focused: suitability 23/23; p5 20/22 (2 baseline env fails); p6 36/36; p7; phase-b 123/123; phase-d 37/37; f2-handoff 53/53; f5 74/74; llm-planner 17/17 — all green.
+- **Full suite: 3864 pass / 3 fail** — 3 fails byte-identical baseline (F4 R5.1-crash, 2× P5 env executables). Pass-count delta vs V1 count is exactly the test-file rewrite (27→23 tests).
+- `npx tsc --noEmit` clean; `rm -rf dist && npm run build` clean.

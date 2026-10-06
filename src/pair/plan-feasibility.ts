@@ -210,6 +210,12 @@ export function canonicalPlanSemanticDigest(
     if (md.expected_output_contract !== undefined) {
       body.expected_output_contract = md.expected_output_contract;
     }
+    // EXECUTOR_SUITABILITY_V1 R1 — a declared task-nature hint is plan
+    // semantics: bound into the semantic digest so a replan cannot silently
+    // rewrite the work's nature.
+    if (md.task_profile !== undefined) {
+      body.task_profile = md.task_profile;
+    }
     if (md.pair_telegram_delivery !== undefined) {
       body.telegram_delivery = md.pair_telegram_delivery;
     }
