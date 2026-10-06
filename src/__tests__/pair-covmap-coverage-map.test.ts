@@ -261,7 +261,7 @@ describe("P-COVMAP — mandatory coverage map", () => {
     expect(out.length).toBe(2);
   });
 
-  it("T9 — Codex schema: pair_coverage is an OPTIONAL hint in PLAN_SCHEMA; [] and non-empty normalize identically", async () => {
+  it("T9 — Codex schema: strict-schema invariant holds (every properties key is required); stray pair_coverage still normalizes", async () => {
     const planA = [
       work("T1", "research competitors and summarize their positioning", ["REASONING"], [], undefined, ["OBL_001"]),
       work("T2", "write the findings to report.md", ["FILE_OPERATIONS"], ["T1"], undefined, ["DEL_001"]),
@@ -281,8 +281,10 @@ describe("P-COVMAP — mandatory coverage map", () => {
       (t2.metadata as Record<string, unknown>)?.pair_coverage,
     ).toEqual(["DEL_001"]);
 
-    // The schema written for the invocation keeps the field OPTIONAL —
-    // present as a hint, never required (planner-contract simplification).
+    // Strict structured-output invariant: every key in `properties` MUST
+    // appear in `required` at each object level, else the API rejects the
+    // whole schema (regression pin — an optional-properties shape killed
+    // every codex planner call with invalid_json_schema).
     const schemaFile = fs
       .readdirSync(fake.scratchDir)
       .flatMap((d) => {
@@ -290,9 +292,23 @@ describe("P-COVMAP — mandatory coverage map", () => {
         return fs.existsSync(p) ? [p] : [];
       })[0];
     const schema = JSON.parse(fs.readFileSync(schemaFile, "utf8"));
+    const checkLevel = (obj: unknown): void => {
+      if (typeof obj !== "object" || obj === null) return;
+      const o = obj as { type?: unknown; properties?: unknown; required?: unknown; items?: unknown };
+      if (o.type === "object" && typeof o.properties === "object" && o.properties !== null) {
+        for (const k of Object.keys(o.properties as Record<string, unknown>)) {
+          expect(o.required).toContain(k);
+        }
+        for (const v of Object.values(o.properties as Record<string, unknown>)) checkLevel(v);
+      }
+      if (o.items !== undefined) checkLevel(o.items);
+    };
+    checkLevel(schema);
     const item = schema.properties.tasks.items;
-    expect(item.required).not.toContain("pair_coverage");
-    expect(item.required).not.toContain("network_requirement");
+    // Advisory fields left the model-facing contract — not in the schema
+    // at all (optional fields are inexpressible under strict output).
+    expect(item.properties.pair_coverage).toBeUndefined();
+    expect(item.properties.network_requirement).toBeUndefined();
     expect(item.required).toEqual(
       expect.arrayContaining([
         "task_key",
@@ -302,13 +318,7 @@ describe("P-COVMAP — mandatory coverage map", () => {
         "depends_on",
       ]),
     );
-    expect(item.properties.pair_coverage).toEqual({
-      type: "array",
-      items: { type: "string" },
-    });
     expect(item.additionalProperties).toBe(false);
-    // no nullable / anyOf escape hatch
-    expect(JSON.stringify(item.properties.pair_coverage)).not.toContain("null");
 
     // empty arrays are accepted and normalize to an empty map
     const fakeEmpty = fakeCodex([
