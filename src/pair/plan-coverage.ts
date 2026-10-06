@@ -109,6 +109,32 @@ const CONTENT_TOKEN_STOP = new Set([
   "fewer", "up", "down", "out",
 ]);
 
+/** Vietnamese action/verb tokens (bounded — mirrors the VI alternations
+ *  already declared in VERB_CLASSES): the action itself is never subject
+ *  evidence, so "tóm tắt thời tiết" can never cover "tóm tắt mục đích
+ *  dự án" by sharing "tóm". Kept to unambiguous action lexemes ≥3 chars —
+ *  noun-shaped tokens (`giá`, `báo`, `bản`, `hạng`, `tính`, `đồ`) stay
+ *  OUT: they carry subject identity and the subject-class map already
+ *  routes them. */
+const CONTENT_TOKEN_VI_ACTION_STOP = new Set([
+  "tóm", "tắt", // tóm tắt — summarize
+  "phân", "tích", // phân tích — analyze
+  "nghiên", "cứu", // nghiên cứu — research
+  "khảo", "sát", // khảo sát — survey
+  "thu", "thập", // thu thập — collect
+  "tìm", "tra", "lấy", "tải", "cào", // find/lookup/get/download/scrape
+  "xem", "xét", "đánh", // xem xét / đánh giá — review/assess
+  "sánh", "đối", "chiếu", // so sánh / đối chiếu — compare
+  "xuất", "xác", "định", // đề xuất / xác định — propose/identify
+  "tạo", "viết", "soạn", "lưu", "xây", "dựng", // create/write/draft/save/build
+  "phát", "triển", "thiết", // phát triển / thiết kế — develop/design
+  "ước", // ước tính — estimate
+  "vẽ", "biểu", // vẽ / biểu đồ — plot/chart
+  "kiểm", "theo", "dõi", "giám", // kiểm tra / theo dõi / giám sát — test/monitor
+  "dịch", "liệt", "xếp", "chọn", // dịch / liệt kê / xếp hạng / chọn — translate/list/rank/select
+  "đọc", "ghi", "gửi", "xóa", "sửa", // read/write/send/delete/modify
+]);
+
 /** Content-bearing tokens of a requirement clause — the subject words
  *  a covering task must share when no identity anchor exists. Unicode
  *  letters are the token charset: diacritics-bearing text (Vietnamese
@@ -118,7 +144,12 @@ function contentTokens(text: string): Set<string> {
   const out = new Set<string>();
   for (const m of text.toLowerCase().matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0];
-    if (w.length < 3 || /^\d+$/.test(w) || CONTENT_TOKEN_STOP.has(w)) continue;
+    if (
+      w.length < 3 ||
+      /^\d+$/.test(w) ||
+      CONTENT_TOKEN_STOP.has(w) ||
+      CONTENT_TOKEN_VI_ACTION_STOP.has(w)
+    ) continue;
     out.add(w);
   }
   return out;

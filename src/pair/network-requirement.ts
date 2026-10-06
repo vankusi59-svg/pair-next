@@ -562,44 +562,32 @@ export function resolveFreshTaskNetworkAuthority(args: {
    *  here with the same goal-host grammar. */
   instruction: string;
 }): FreshNetworkTaskResolution {
-  const { req, state, goalHosts } = args;
-  // Advisory structured evidence: only a VALID, non-contradictory field
-  // counts — missing/malformed/conflict/contradictory degrade to absent.
-  const usable =
-    state === "valid" && req !== null && !networkRequirementInternalContradiction(req)
-      ? req
-      : null;
-  const reqRequires = usable !== null && networkRequirementRequiresAccess(usable);
-  // A declared locator host is minted-hostname evidence even on a field
-  // that otherwise degrades (a contradictory LOCAL+https://evil.com still
-  // wrote a foreign hostname) — it must be one the goal literally names,
-  // unconditionally.
-  const locHost = requirementLocatorHost(req?.source_locator ?? null);
-  if (locHost && !goalAuthorizesHost(locHost, goalHosts)) {
-    return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
-  }
-  // Instruction-named hosts are authority evidence too — but only when
-  // the goal names hosts at all is there anything to subset against.
+  const { goalHosts } = args;
+  // R1.A — the planner annotation (`args.req`, `args.state`) is
+  // intentionally UNREAD for the verdict: under the simplified contract
+  // it can neither GRANT nor DENY network authority. A wrong locator, a
+  // malformed/conflicting/contradictory field, or a self-elevating
+  // declaration all degrade to "no evidence" — the verdict is a pure
+  // function of the canonical goal + task instruction text. Host
+  // authorization stays fail-closed against hosts the INSTRUCTION
+  // itself names (goal-text authority), never against annotation text.
   const instrHosts = extractGoalHosts(args.instruction);
-  if (goalHosts.size > 0) {
-    for (const h of instrHosts) {
-      if (!goalAuthorizesHost(h, goalHosts)) {
-        return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
-      }
+  for (const h of instrHosts) {
+    if (!goalAuthorizesHost(h, goalHosts)) {
+      return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
     }
   }
-  const named = new Set(instrHosts);
-  if (locHost) named.add(locHost);
-  const requires =
-    reqRequires || args.instructionRequiresNetwork || instrHosts.size > 0;
+  // Derived requirement: only the instruction's own wording + its named
+  // hosts can create network need — never the annotation.
+  const requires = args.instructionRequiresNetwork || instrHosts.size > 0;
   if (!requires) {
     return { verdict: "NOT_REQUIRED", authorized: false, reason: null };
   }
-  // Authorization surfaces: a named host ⊆ goal (already enforced
-  // above), the goal's own external-data demand, or the instruction
-  // satisfying the goal's external subject.
+  // Authorization surfaces (goal-text only): instruction-named host ⊆
+  // goal hosts (already enforced above), the goal's own external-data
+  // demand, or the instruction satisfying the goal's external subject.
   const authorized =
-    (named.size > 0 && goalHosts.size > 0) ||
+    (instrHosts.size > 0 && goalHosts.size > 0) ||
     args.goalRequiresExternalData ||
     args.instructionMatchesGoalSubject;
   if (!authorized) {

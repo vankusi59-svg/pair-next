@@ -203,13 +203,15 @@ export function makeServeCanonicalizer(deps: {
     // wording is guidance, never authority). Provenance picks the
     // verdict, CALL-SITE context never inferred from data:
     //  FRESH (every planner transport): resolveFreshTaskNetworkAuthority
-    //    — PAIR derives the requirement itself (valid advisory field,
-    //    fetch-shaped instruction, or an instruction-named host). The
-    //    structured field is OPTIONAL evidence: missing/malformed/
-    //    conflict/contradictory degrade to "no evidence", never a
-    //    rejection. The single fresh rejection class is
-    //    UNAUTHORIZED_SOURCE — a named host the goal does not authorize,
-    //    or a requirement with zero authorization evidence.
+    //    — PAIR derives the requirement itself from goal + instruction
+    //    text alone (fetch-shaped instruction, or an instruction-named
+    //    host). The structured field is advisory metadata that is never
+    //    read for the verdict: it can neither grant nor deny authority,
+    //    so wrong/malformed/conflicting annotations never reject. The
+    //    single fresh rejection class is
+    //    UNAUTHORIZED_SOURCE — an instruction-named host the goal does
+    //    not authorize, or a derived requirement with zero authorization
+    //    evidence.
     //    REQUIRED  — needs network AND authorized: PAIR binds
     //      NETWORK_ACCESS upstream (repair, servable by executor policy).
     //    NOT_REQUIRED — no derived need; a planner NETWORK_ACCESS claim

@@ -838,9 +838,9 @@ export function sanitizePlan(
 
 /** Deterministic bounded repair: PAIR — not the planner — owns the
  *  NETWORK_ACCESS binding. A task PAIR derives as network-requiring
- *  (resolveFreshTaskNetworkAuthority → REQUIRED: a valid advisory
- *  requirement, a fetch-shaped instruction, or an instruction naming a
- *  goal-authorized host — always operator-authorized) gets the
+ *  (resolveFreshTaskNetworkAuthority → REQUIRED: a fetch-shaped
+ *  instruction or an instruction naming a goal-authorized host —
+ *  always operator-authorized, never annotation-derived) gets the
  *  capability added BEFORE the canonical network gates evaluate — the
  *  plan never dies on a model annotation omission or a missing/wrong
  *  structured field. Eligibility requires ALL of:

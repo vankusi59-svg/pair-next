@@ -3,8 +3,9 @@
 Mandate: remove `network_requirement` + `pair_coverage` from the mandatory
 model-facing contract. PAIR owns canonical metadata derivation, validation and
 normalization; the planner is responsible for the semantic core only —
-`task_key`, `task_instruction`, `depends_on`, `required_capabilities` (when a
-capability has a real semantic role). Fail-closed stays for real
+`task_key`, `title`, `task_instruction`, `depends_on`, `required_capabilities`
+(`title` is still required by the Codex schema; when a capability has a real
+semantic role). Fail-closed stays for real
 authority/security. Minimal fix using existing seams.
 
 - Branch: `devin/1791261163-planner-contract-simplify`
@@ -149,3 +150,133 @@ authority/security. Minimal fix using existing seams.
 - A plan whose tasks *require* network under an executor policy that serves
   none still fails closed by design (`TASK_NETWORK_CAPABILITY_REQUIRED`) —
   unchanged semantics, now PAIR-derived rather than planner-declared.
+
+---
+
+# R1 AUDIT ROUND — two logic defects + wording correction
+
+- R1 BASE HEAD: `70a031965f9ff1abdee7b248b73fcc23cf518c26`
+- R1 NEW HEAD: (see latest commit below)
+- Scope: minimal remediation on the same PR — no redesign, no new seams.
+
+## R1.A — fresh `network_requirement` is now *truly* advisory
+
+**Root cause (audited defect):** `resolveFreshTaskNetworkAuthority` still
+consumed the planner annotation (`req.source_locator`) — a wrong/malformed
+locator produced `INVALID/UNAUTHORIZED_SOURCE` even when the task's own
+instruction named no unauthorized host: the annotation could create
+*negative* authority (a wrong fresh annotation alone could kill a valid
+plan). The same read also let a REQUIRED declaration elevate a quiet
+instruction (positive authority from text).
+
+**Fix:** `resolveFreshTaskNetworkAuthority` no longer reads `args.req` or
+`args.state` for the verdict. The verdict is a pure function of the canonical
+goal + the task's `task_instruction`:
+
+1. hosts the *instruction text itself* names (`extractGoalHosts` on the
+   instruction, same grammar) must be ⊆ goal-authorized hosts — an
+   instruction-named host the goal never authorized still fails
+   `FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID {UNAUTHORIZED_SOURCE}`;
+   note: this check is **unconditional** — a hostless goal authorizes no
+   instruction-named host (R3.B regression restored: under
+   "Research MQL5" a task fetching `mql5.com`/`mql5.attacker.example`
+   still fails — the earlier draft gated the subset check on
+   `goalHosts.size>0` which would have opened that hole; the audit tests
+   caught it);
+2. `requires = instructionRequiresNetwork || instrHosts.size>0` — the
+   annotation cannot create the requirement either;
+3. authorization surfaces are goal-text only: instruction-named host ⊆
+   goal hosts, `goalRequiresExternalData`, or
+   `instructionSatisfiesGoalSubject`.
+
+Annotation verdicts therefore collapse to evidence-free noise: no case in
+which annotation text can either grant or deny authority on fresh emissions.
+The persisted path (`resolveTaskNetworkAuthority`, `provenance:"persisted"`)
+is byte-unchanged — legacy stored plans still judge their stored annotations.
+
+**Proofs (new tests, `pair-planner-contract-simplify.test.ts` R1.A):**
+A1 semantic fetch task + NO annotation → REQUIRED, PAIR binds, plan pins;
+A2 identical task + wrong `source_locator` in annotation → byte-identical
+canonical outcome (annotation cannot deny); A3 malformed/conflicting
+annotation → identical outcome; A4 instruction names `attacker.example`
+under the github goal → `UNAUTHORIZED_SOURCE`; A5 derived-required task under
+a no-network executor policy → `FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED`;
+plus a direct resolver proof that a REQUIRED annotation on a silent
+instruction → `NOT_REQUIRED` (cannot grant). Affected pre-existing tests
+(`pair-network-requirement` A/B/D, `pair-network-binding-repair` T3/T4/T5/T10)
+were rewritten to the new invariant — every one asserted annotation-derived
+authority (grant or deny) on the fresh path; the persisted-path assertions
+are kept via `fresh:false` checks.
+
+## R1.B — VI action/verb tokens are no longer subject evidence
+
+**Root cause (audited defect):** after the unicode tokenizer fix, coverage
+subject overlap could be satisfied by shared *action* tokens —
+`tóm tắt thời tiết Hà Nội` covered `tóm tắt mục đích dự án` purely because
+`tóm`/`tắt` overlapped; `phân tích giá vàng` vs `phân tích giá bitcoin`
+similarly.
+
+**Fix:** `contentTokens` skips the new `CONTENT_TOKEN_VI_ACTION_STOP` set — a
+bounded list of Vietnamese action/verb lexemes drawn from the existing
+`VERB_CLASSES` vocabulary (tóm tắt/phân tích/nghiên cứu/thu thập/tìm/tra/
+lấy/tải/xem/đánh/sánh/xuất/xác định/tạo/viết/soạn/lưu/xây dựng/phát triển/
+thiết/ước/vẽ/biểu/kiểm/theo dõi/giám/dịch/liệt/xếp/chọn/đọc/ghi/gửi/xóa/sửa
+…). Noun-shaped identity tokens (`giá`, `báo`, `bản`, `hạng`, `đồ`) are
+deliberately NOT stopped — they carry subject identity. No NLP, no
+mission-specific tokens, no one-off `"tóm"`.
+
+**Proofs:** B1 `tóm tắt mục đích dự án` covered by a matching task → COVER;
+B2 `tóm tắt thời tiết Hà Nội` → `FAIL_CLOSED_PLAN_INCOMPLETE`; B3
+`phân tích giá vàng` vs `phân tích giá bitcoin` → `FAIL_CLOSED_PLAN_INCOMPLETE`;
+B4 `phân tích giá vàng hiện tại` → COVER; B5 aquascope obligation still
+covered; EN control unchanged.
+
+## R1.C — contract wording
+
+Report + CURRENT_STATE now list the model-facing contract correctly as
+`task_key`, `title`, `task_instruction`, `depends_on`,
+`required_capabilities` — `title` remains a required field of the Codex
+`PLAN_SCHEMA` (its simplification is a separate future PR, not this one).
+
+## R1 validation
+
+- Focused: `pair-planner-contract-simplify` 23/23 (11→23: +A1–A5 + grant-side
+  + B1–B5 + EN control), `pair-network-requirement` 15/15,
+  `pair-network-requirement-r3` 11/11, `pair-network-binding-repair` 10/10,
+  `pair-covmap-coverage-map` 15/15, `pair-prv2b-goal-coverage` 52/52,
+  `pair-prv2a-planner-modernization` 59/59,
+  `pair-prv2b-prohibition-narrowing` 52/52 → **237/237** (+2 extra planner
+  suites `pgrammar2` 26/26, `preask` 39/39 also green).
+- Full suite: **3740 pass / 3 fail** — byte-identical baseline
+  (F4 `R5.1-crash` + 2× P5 env probes; 15 skipped). Zero new failures.
+- `npx tsc --noEmit` clean; `npm run build` clean.
+- Aquascope canonical proof re-run: E1 (metadata-free plan →
+  `REPAIRED_NETWORK_CAPABILITY:T1` + pin) still green under the
+  annotation-free resolver.
+
+## R1 explicit answers
+
+1. **Can a wrong/malformed/conflicting fresh annotation alone kill a valid
+   plan?** — NO. The annotation is never read for the verdict; wrong-locator,
+   malformed, conflicting and self-elevating shapes all degrade to "no
+   evidence". Proven byte-identical outcomes in A2/A3.
+2. **Can a shared VI action token alone prove subject coverage?** — NO.
+   `tóm`/`tắt`/`phân tích` no longer enter subject evidence (B2, B3).
+3. **Can an instruction-named unauthorized host still be rejected?** — YES.
+   The ⊆ check on instruction-named hosts is unconditional and now also
+   covers hostless goals (A4, R3.B restored).
+4. **Can a genuinely uncovered obligation still fail closed?** — YES.
+   `FAIL_CLOSED_PLAN_INCOMPLETE` still fires (B2, B3, E3 fabricated-claim).
+
+## R1 residual risks
+
+- `goalRequiresExternalData` / `instructionMatchesGoalSubject` remain
+  heuristic lexical surfaces — a goal demanding external data authorizes
+  ANY fetch-shaped instruction with no named host (the instruction contains
+  no host to police; executor policy + coverage gates handle subject
+  mismatch). Bounded and documented; tightening belongs to a separate work
+  item.
+- `CONTENT_TOKEN_VI_ACTION_STOP` is a closed vocabulary — a VI action verb
+  outside the set can still contribute a subject token; the noun-identity
+  trade-off is deliberate (not an NLP fix).
+- All other prior residuals unchanged.

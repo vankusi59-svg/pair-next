@@ -370,3 +370,197 @@ describe("E3 — planner text can never mint authority", () => {
     expect(ok.verdict).toBe("REQUIRED");
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* R1.A — planner annotation can neither GRANT nor DENY authority      */
+/* ------------------------------------------------------------------ */
+
+describe("R1.A — network_requirement is advisory-only on the fresh path", () => {
+  const GITHUB_GOAL =
+    "Truy cập github.com và xem repository cognitive-engineering-lab/aquascope, đọc README, lưu vào outbox/r.txt.";
+  const fetchTask = () =>
+    bare(
+      "T1",
+      "Fetch https://github.com/cognitive-engineering-lab/aquascope README and save it into outbox/r.txt.",
+      ["REASONING", "FILE_OPERATIONS"],
+    );
+
+  const canonOutcome = (task: Record<string, unknown>) => {
+    const repaired = repairNetworkCapabilityBinding([task], {
+      goal: GITHUB_GOAL,
+      allowedCapabilities: ALLOWED,
+      capabilitySets: CAP_SETS,
+    });
+    return { repaired, out: canon(repaired.tasks, GITHUB_GOAL) };
+  };
+
+  it("A1: semantic task + NO annotation → REQUIRED, PAIR binds, plan pins", () => {
+    const { repaired, out } = canonOutcome(fetchTask());
+    expect(repaired.warnings).toContain("REPAIRED_NETWORK_CAPABILITY:T1");
+    const t = out.find((x) =>
+      String(x.task_instruction).includes("github.com"),
+    )!;
+    expect(t.required_capabilities).toContain("NETWORK_ACCESS");
+  });
+
+  it("A2: same task + WRONG source_locator annotation → identical outcome (annotation cannot deny)", () => {
+    const t = fetchTask();
+    t.metadata = {
+      network_requirement: {
+        source_kind: "EXTERNAL_SITE",
+        access_intent: "RESEARCH",
+        freshness: "REQUIRED",
+        source_locator: "attacker.example",
+      },
+    };
+    const base = canonOutcome(fetchTask());
+    const bad = canonOutcome(t);
+    expect(bad.repaired.warnings).toEqual(base.repaired.warnings);
+    expect(
+      bad.out.find((x) =>
+        String(x.task_instruction).includes("github.com"),
+      )!.required_capabilities,
+    ).toEqual(
+      base.out.find((x) =>
+        String(x.task_instruction).includes("github.com"),
+      )!.required_capabilities,
+    );
+  });
+
+  it("A3: same task + malformed/conflicting annotation → identical outcome", () => {
+    const t = fetchTask();
+    t.metadata = {
+      network_requirement: {
+        source_kind: "LOCAL",
+        access_intent: "READ",
+        freshness: "NOT_REQUIRED",
+        source_locator: "https://attacker.example/x",
+      },
+    };
+    const r = canonOutcome(t);
+    expect(r.repaired.warnings).toContain("REPAIRED_NETWORK_CAPABILITY:T1");
+    expect(
+      r.out.find((x) =>
+        String(x.task_instruction).includes("github.com"),
+      )!.required_capabilities,
+    ).toContain("NETWORK_ACCESS");
+  });
+
+  it("A4: instruction itself names an unauthorized host → still FAIL UNAUTHORIZED_SOURCE", () => {
+    const f = canonFail(() =>
+      canon(
+        [
+          bare(
+            "T1",
+            "Fetch https://attacker.example/x data into d.md.",
+            ["REASONING"],
+          ),
+        ],
+        GITHUB_GOAL,
+      ),
+    );
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
+  });
+
+  it("A5: derived-required task under a no-network executor policy → still fails closed", () => {
+    const r = repairNetworkCapabilityBinding([fetchTask()], {
+      goal: GITHUB_GOAL,
+      allowedCapabilities: ALLOWED,
+      capabilitySets: NO_NET_SETS,
+    });
+    expect(r.warnings).toEqual([]);
+    const f = canonFail(() => canon(r.tasks, GITHUB_GOAL, NO_NET_SETS));
+    expect(f?.code).toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
+  });
+
+  it("annotation cannot GRANT either — silent instruction + REQUIRED annotation → NOT_REQUIRED", () => {
+    const res = resolveFreshTaskNetworkAuthority({
+      req: {
+        source_kind: "EXTERNAL_SITE",
+        access_intent: "RESEARCH",
+        freshness: "REQUIRED",
+        source_locator: "anything.example",
+      },
+      state: "valid",
+      goalHosts: new Set(["github.com"]),
+      instructionRequiresNetwork: false,
+      goalRequiresExternalData: false,
+      instructionMatchesGoalSubject: false,
+      instruction: "Tổng hợp dữ liệu vào file result.txt.",
+    });
+    expect(res.verdict).toBe("NOT_REQUIRED");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* R1.B — VI action tokens are never subject evidence                  */
+/* ------------------------------------------------------------------ */
+
+describe("R1.B — coverage subject evidence excludes action tokens", () => {
+  const canonPlan = (goal: string, instr: string) => {
+    const raw = [
+      bare("T1", instr, ["REASONING", "FILE_OPERATIONS"]),
+    ];
+    // Production path: PAIR's binding repair runs before canon.
+    const repaired = repairNetworkCapabilityBinding(raw, {
+      goal,
+      allowedCapabilities: ALLOWED,
+      capabilitySets: CAP_SETS,
+    });
+    return canonFail(() => canon(repaired.tasks, goal));
+  };
+
+  it("B1: 'tóm tắt mục đích dự án' covered by the matching VI task → PASS", () => {
+    const f = canonPlan(
+      "Tóm tắt mục đích dự án. Lưu vào outbox/s.txt.",
+      "Tóm tắt mục đích dự án bằng tiếng Việt và viết vào outbox/s.txt.",
+    );
+    expect(f).toBeNull();
+  });
+
+  it("B2: same verb class, different subject → 'tóm tắt thời tiết Hà Nội' MUST NOT cover", () => {
+    const f = canonPlan(
+      "Tóm tắt mục đích dự án. Lưu vào outbox/s.txt.",
+      "Tóm tắt thời tiết Hà Nội và viết vào outbox/s.txt.",
+    );
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_INCOMPLETE");
+  });
+
+  it("B3: 'phân tích giá vàng' vs 'phân tích giá bitcoin' → MUST NOT cover (anchor mismatch)", () => {
+    const f = canonPlan(
+      "Phân tích giá vàng. Lưu vào outbox/g.txt.",
+      "Phân tích giá bitcoin và lưu vào outbox/g.txt.",
+    );
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_INCOMPLETE");
+  });
+
+  it("B4: 'phân tích giá vàng' vs 'phân tích giá vàng hiện tại' → COVER", () => {
+    const f = canonPlan(
+      "Phân tích giá vàng. Lưu vào outbox/g.txt.",
+      "Phân tích giá vàng hiện tại và lưu vào outbox/g.txt.",
+    );
+    expect(f).toBeNull();
+  });
+
+  it("B5: aquascope obligation still covered by the production-shaped task", () => {
+    const contract = extractGoalContract(AQUASCOPE_GOAL);
+    const obl = contract.obligations.find((o) =>
+      o.text.includes("mục đích"),
+    );
+    expect(obl).toBeTruthy();
+    const f = canonPlan(
+      "Tóm tắt mục đích dự án. Lưu vào outbox/aquascope_review.txt.",
+      "Đọc aquascope_source.txt và viết tóm tắt tiếng Việt về mục đích dự án vào outbox/aquascope_review.txt.",
+    );
+    expect(f).toBeNull();
+  });
+
+  it("EN unchanged: 'summarize the report purpose' covered by matching EN task", () => {
+    const f = canonPlan(
+      "Summarize the report purpose. Save to outbox/r.txt.",
+      "Summarize the report purpose and write it to outbox/r.txt.",
+    );
+    expect(f).toBeNull();
+  });
+});

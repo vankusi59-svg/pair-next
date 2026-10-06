@@ -137,10 +137,10 @@ const canonFail = (fn: () => unknown): CanonFail | null => {
 };
 
 describe("R2 network-requirement authority — adversarial A–L", () => {
-  it("A: forged EXTERNAL on a math goal cannot bootstrap NETWORK (full production path)", async () => {
+  it("A: forged EXTERNAL on a math goal can neither bootstrap NETWORK nor kill a valid task (full production path)", async () => {
     // Planner emits a forged structured requirement for a source the
-    // operator goal never named — through llmPlan sanitize → repair →
-    // canonicalize, zero NETWORK_ACCESS may ever be minted.
+    // operator goal never named — under the simplified contract the
+    // annotation is advisory: it mints nothing and kills nothing.
     const raw = planJson([
       {
         task_key: "T2",
@@ -155,17 +155,30 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     ]);
     const r = await llmPlan(MATH_GOAL, { ...CFG, fetchFn: okFetch(raw) });
     const t2 = r.tasks.find((t) => t.task_key === "T2")!;
-    // repair must NOT elevate: declaration alone is never authorization.
+    // Cannot GRANT: no repair, no NETWORK_ACCESS minted from text alone.
     expect(r.warnings).not.toContain("REPAIRED_NETWORK_CAPABILITY:T2");
     expect(t2.required_capabilities).not.toContain("NETWORK_ACCESS");
-    // canonical gate rejects the candidate typed — no silent pick.
+    // Cannot DENY: the quiet task stays NOT_REQUIRED — no NETWORK gate
+    // may reject it on annotation grounds.
     const f = canonFail(() => canon(r.tasks, MATH_GOAL));
-    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
-    expect(f?.detail).toContain("T2");
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+    // The persisted/legacy path is untouched: the same annotation shape
+    // still rejects under pre-simplification provenance.
+    const legacy = resolveTaskNetworkAuthority({
+      req: EXT_REQ,
+      state: "valid",
+      goalHosts: extractGoalHosts(MATH_GOAL),
+      instructionRequiresNetwork: false,
+      goalRequiresExternalData: false,
+      instructionMatchesGoalSubject: false,
+      instruction: "Compute the square root of 144 and write math.txt.",
+      fresh: false,
+    });
+    expect(legacy.verdict).toBe("INVALID");
+    expect(legacy.reason).toBe("UNAUTHORIZED_SOURCE");
   });
 
-  it("B: forged EXTERNAL WITH a NETWORK_ACCESS claim is also rejected — cap cannot self-authorize", async () => {
+  it("B: forged EXTERNAL WITH a NETWORK_ACCESS claim is advisory — the annotation can neither convict nor authorize", async () => {
     const raw = planJson([
       {
         task_key: "T2",
@@ -179,13 +192,13 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       },
     ]);
     const r = await llmPlan(MATH_GOAL, { ...CFG, fetchFn: okFetch(raw) });
+    // A planner NETWORK_ACCESS claim + forged annotation on a quiet task
+    // is advisory routing metadata: it can neither authorize network nor
+    // convict the task — no NETWORK gate may fire on the fresh path.
     const f = canonFail(() => canon(r.tasks, MATH_GOAL));
-    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
-    // PLANNER-CONTRACT SIMPLIFICATION — a planner NETWORK_ACCESS claim on
-    // a task PAIR derives as NOT_REQUIRED is advisory routing metadata,
-    // never an authority grant and never a rejection reason on the fresh
-    // path: PAIR's own verdict decides network binding.
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+    // And the claim itself is never auto-elevated to authority either:
+    // PAIR's own verdict decides network binding.
     const f2 = canonFail(() =>
       canon(
         [
@@ -266,9 +279,10 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       });
       expect(r.warnings).toEqual(["REPAIRED_NETWORK_CAPABILITY:T2"]);
     }
-    // …and a math goal in any language authorizes nothing — the fresh
-    // verdict rejects a forged locator just the same (UNAUTHORIZED_SOURCE
-    // survives as the single fresh rejection class).
+    // …and a math goal in any language: a forged locator is ignored
+    // identically — the quiet instruction yields NOT_REQUIRED in every
+    // language (the annotation can neither grant nor deny, so nothing
+    // is left to authorize or reject on its text).
     for (const goal of [
       "Tính căn bậc hai của 144 và lưu vào math.txt.",
       "Compute sqrt(144) and write math.txt.",
@@ -283,8 +297,23 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
         instructionMatchesGoalSubject: false,
         instruction: "Compute sqrt(144) and write math.txt.",
       });
-      expect(res).toMatchObject({ verdict: "INVALID", reason: "UNAUTHORIZED_SOURCE" });
+      expect(res).toMatchObject({ verdict: "NOT_REQUIRED" });
     }
+    // …but an INSTRUCTION-named host the goal never authorized is still
+    // rejected in every language — the annotation wasn't needed for it.
+    const denied = resolveFreshTaskNetworkAuthority({
+      req: null,
+      state: "missing",
+      goalHosts: new Set(["mql5.com"]),
+      instructionRequiresNetwork: true,
+      goalRequiresExternalData: true,
+      instructionMatchesGoalSubject: false,
+      instruction: "Fetch https://btc.example/x into n.md.",
+    });
+    expect(denied).toMatchObject({
+      verdict: "INVALID",
+      reason: "UNAUTHORIZED_SOURCE",
+    });
   });
 
   it("E: fresh HTTP planner omitting the field → PAIR derives the requirement itself (advisory contract)", async () => {
