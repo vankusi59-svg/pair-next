@@ -83,9 +83,7 @@ function splitClauses(goal: string): string[] {
   const hard = text.split(/\r?\n|;|(?<=[^.]\.)\s+|\u2022|-\s+/u);
   const clauses: string[] = [];
   for (const h of hard) {
-    for (const seg of h.split(
-      /\s*(?:,|(?:\s+)(?:and then|then|sau đó|rồi)\s+)/iu,
-    )) {
+    for (const seg of splitSegGuarded(h)) {
       for (const part of splitConnectiveGuarded(seg)) {
         const s = part.trim();
         if (s) clauses.push(s);
@@ -112,12 +110,49 @@ function splitConnectiveGuarded(seg: string): string[] {
   while ((m = CONNECTIVE_GUARD_RE.exec(seg)) !== null) {
     const before = seg.slice(last, m.index);
     const after = seg.slice(m.index + m[0].length);
+    // A connector flanked by path tokens joins members of ONE artifact
+    // list — "Tạo hai file input/a.txt và input/b.txt" must stay one
+    // produce clause or the second file can never mint a deliverable.
+    // Filename on only one flank is ordinary work punctuation: split.
+    if (
+      FILE_EDGE_TAIL_RE.test(before) &&
+      FILE_EDGE_HEAD_RE.test(after)
+    ) {
+      continue;
+    }
     if (
       PROHIBITION_RE.test(before) &&
       ACTION_TAIL_RE.test(before.trimEnd()) &&
       ACTION_LEAD_RE.test(after)
     ) {
       continue; // connector joins two forbidden actions — keep joined
+    }
+    out.push(seg.slice(last, m.index));
+    last = m.index + m[0].length;
+  }
+  out.push(seg.slice(last));
+  return out;
+}
+
+/** The comma separator gets the same bounded file-list guard: "Tạo các
+ *  file a.md, b.csv và c.txt" only preserves all three targets if the
+ *  commas inside the list do not split the produce clause. Phrase
+ *  separators (then/sau đó/rồi/and then) always split — they separate
+ *  work, never list members. */
+const SEG_SPLIT_RE =
+  /\s*(?:,|(?:\s+)(?:and then|then|sau đó|rồi)\s+)/giu;
+function splitSegGuarded(seg: string): string[] {
+  const out: string[] = [];
+  let last = 0;
+  SEG_SPLIT_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = SEG_SPLIT_RE.exec(seg)) !== null) {
+    if (
+      m[0].includes(",") &&
+      FILE_EDGE_TAIL_RE.test(seg.slice(0, m.index)) &&
+      FILE_EDGE_HEAD_RE.test(seg.slice(m.index + m[0].length))
+    ) {
+      continue;
     }
     out.push(seg.slice(last, m.index));
     last = m.index + m[0].length;
@@ -233,7 +268,26 @@ const CONSTRAINT_RE =
 const BUDGET_RE =
   /\bbudget\b[^\d]{0,20}(\d+(?:\.\d+)?)|\bngân sách\b[^\d]{0,20}(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)\s*(?:budget|max|tối đa)/i;
 
-const FILE_RE = /\b((?:[\w-]+\/)*[\w][\w.-]*\.(?:md|txt|json|csv|pdf|html?|png|jpe?g|webp|svg|ts|tsx|js|mjs|py|ipynb|docx?|xlsx|zip|mq[45]))\b/gi;
+/** Extension vocabulary shared by FILE_RE and the clause-split edge
+ *  checks — the split guards recognize exactly the path shapes the
+ *  extractor mints, nothing more. */
+const FILE_EXT_GROUP =
+  "md|txt|json|csv|pdf|html?|png|jpe?g|webp|svg|ts|tsx|js|mjs|py|ipynb|docx?|xlsx|zip|mq[45]";
+const FILE_RE = new RegExp(
+  `\\b((?:[\\w-]+\\/)*[\\w][\\w.-]*\\.(?:${FILE_EXT_GROUP}))\\b`,
+  "gi",
+);
+/** Bounded file-list evidence for the clause splitters: does the text
+ *  end / begin with a filename-or-path token? A separator flanked by
+ *  both is joining members of one artifact list. */
+const FILE_EDGE_TAIL_RE = new RegExp(
+  `(?:[\\w-]+\\/)*[\\w][\\w.-]*\\.(?:${FILE_EXT_GROUP})[.]?\\s*$`,
+  "i",
+);
+const FILE_EDGE_HEAD_RE = new RegExp(
+  `^\\s*(?:[\\w-]+\\/)*[\\w][\\w.-]*\\.(?:${FILE_EXT_GROUP})[.]?(?![\\w.-])`,
+  "i",
+);
 
 const PRODUCE_VERB_RE =
   /\b(?:create|write|produce|generate|save|draft|export|render|emit|build|tạo|viết|soạn|lưu|xuất|sinh|render)/iu;

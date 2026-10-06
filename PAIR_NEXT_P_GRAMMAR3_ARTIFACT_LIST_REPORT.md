@@ -128,3 +128,75 @@ equivalence introduced).
 5. **Planner contract (schema/prompts/`pair_coverage`/MissionRouter) changed?** NO — only the instruction grammar and the goal-side `FILE_RE`; no prompt, schema, router, or executor change.
 
 **Classification:** `PAIR_NEXT_P_GRAMMAR3_ARTIFACT_LIST_PENDING_AUDIT`
+
+---
+
+# R1 — Goal Contract artifact-list preservation (audit remediation)
+
+**R1 BASE HEAD:** `591b509351789eec28611fafd4642adf9279b4a8`
+**R1 NEW HEAD:** _filled at commit_
+
+## Root cause
+
+`splitConnectiveGuarded()` treated `và`/`and` as an ordinary clause
+boundary, and the comma separator in `splitClauses` did the same, so an
+artifact list was fragmented before extraction:
+
+`Tạo hai file input/a.txt và input/b.txt với nội dung mẫu khác nhau`
+→ `["Tạo hai file input/a.txt", "input/b.txt với nội dung mẫu khác nhau"]`
+— clause 1 mints `input/a.txt`; clause 2 has no produce verb and mints
+nothing. The P-GRAMMAR3 `FILE_RE` patch fixed dir-drop (`input/a.txt`
+spelled whole) but not list preservation.
+
+## Semantic fix
+
+Bounded, evidence-driven guard shared by both splitters — a separator
+joins members of ONE artifact list iff BOTH flanks are filename/path
+tokens (`FILE_EDGE_TAIL_RE` / `FILE_EDGE_HEAD_RE`, built from the same
+`FILE_EXT_GROUP` as `FILE_RE`, with `[.]?` tolerance for a trailing
+sentence period):
+
+- `splitConnectiveGuarded` skips `và|and` when `tail∈file ∧ head∈file`
+  (the existing prohibition guard is unchanged and independent).
+- new `splitSegGuarded` replaces the raw `h.split()` for the comma /
+  `then|sau đó|rồi|and then` level: only `,` matches can be guarded;
+  phrase separators always split (they separate work, not list members).
+
+Controls hold because the guard needs file evidence on BOTH sides:
+`Nghiên cứu thị trường và viết report.md` (tail `trường` not a file →
+splits), `Đọc input/a.txt và tạo outbox/result.md` (head `tạo` not a
+file → splits, `a.txt` never minted as produced).
+
+## Tests
+
+6 new R1 cases in `pair-pgrammar3-artifact-list.test.ts` (24 total):
+R1.1 exact incident clause → `[input/a.txt, input/b.txt]`; R1.2
+three-item VI list → `[a.md, b.csv, c.txt]`; R1.3 EN list →
+`[a.txt, b.txt]`; R1.4 work connector keeps obligation + DEL semantics;
+R1.5 mixed verbs do not fuse (result.md only); R1.6 verbatim incident
+goal → contract mints all three targets and the semantic plan passes
+`extractGoalContract` + `assertPlanCoverage` + `reconcilePlanDataflow` +
+`assertPlanDataflow` (the previously-claimed assert call is now real).
+
+Focused set (7 files): **326/326**. Full suite: **3773 pass / 3 fail /
+15 skipped** — the 3 failures are the byte-identical baseline (F4
+R5.1-crash, 2× P5 env executables). `npx tsc --noEmit` clean;
+`rm -rf dist && npm run build` clean.
+
+## Residual risks
+
+Unchanged from P-GRAMMAR3: `repairNetworkCapabilityBinding` remains
+negation-blind (OUT OF SCOPE per mandate); guard vocabulary is bounded
+to `FILE_EXT_GROUP` extensions — a list member whose name has no known
+extension still splits (same fail-closed shape as before).
+
+## R1 answers
+
+1. **Does Goal Contract now mint BOTH input/a.txt and input/b.txt?** YES.
+2. **Does "Tạo các file A, B và C" preserve all three?** YES.
+3. **Does "Nghiên cứu X và viết report.md" retain work-clause semantics?** YES — OBL + DEL unchanged.
+4. **Does "Đọc A và tạo B" mark A as produced?** NO — only `outbox/result.md` mints.
+5. **Does the exact incident pass coverage + reconcile + assertPlanDataflow?** YES.
+6. **Were network or Planner contract semantics changed?** NO.
+
+**Classification:** `PAIR_NEXT_P_GRAMMAR3_ARTIFACT_LIST_R1_PENDING_AUDIT`

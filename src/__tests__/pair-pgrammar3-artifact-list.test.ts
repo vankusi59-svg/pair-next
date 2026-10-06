@@ -22,6 +22,7 @@
 
 import { describe, expect, it } from "vitest";
 import { extractGoalContract } from "../pair/goal-contract.js";
+import { assertPlanDataflow } from "../pair/plan-dataflow.js";
 import { assertPlanCoverage } from "../pair/plan-coverage.js";
 import {
   extractTaskDataflow,
@@ -147,6 +148,84 @@ describe("P-GRAMMAR3 D — Goal Contract keeps full relative paths", () => {
   it("bare filenames keep their bare target (no regression)", () => {
     const c = extractGoalContract("create report.md");
     expect(c.deliverables[0].target).toBe("report.md");
+  });
+});
+
+describe("P-GRAMMAR3 R1 — Goal Contract preserves artifact lists", () => {
+  const targets = (goal: string) =>
+    extractGoalContract(goal).deliverables.map((d) => d.target);
+
+  it("R1.1 exact incident clause mints BOTH input/a.txt and input/b.txt — no basename-drop, no second-file loss", () => {
+    expect(
+      targets("Tạo hai file input/a.txt và input/b.txt với nội dung mẫu khác nhau."),
+    ).toEqual(["input/a.txt", "input/b.txt"]);
+  });
+
+  it("R1.2 three-item VI list preserves all three: a.md, b.csv và c.txt", () => {
+    expect(targets("Tạo các file a.md, b.csv và c.txt.")).toEqual([
+      "a.md",
+      "b.csv",
+      "c.txt",
+    ]);
+  });
+
+  it("R1.3 EN list preserves both: Create files a.txt and b.txt", () => {
+    expect(targets("Create files a.txt and b.txt.")).toEqual([
+      "a.txt",
+      "b.txt",
+    ]);
+  });
+
+  it("R1.4 work connector stays a work connector — Nghiên cứu X và viết report.md keeps obligation + deliverable semantics", () => {
+    const c = extractGoalContract("Nghiên cứu thị trường và viết report.md.");
+    expect(targets("Nghiên cứu thị trường và viết report.md.")).toEqual([
+      "report.md",
+    ]);
+    expect(c.obligations.map((o) => o.text)).toContain("Nghiên cứu thị trường");
+  });
+
+  it("R1.5 mixed verbs do NOT fuse — Đọc input/a.txt và tạo outbox/result.md produces only result.md", () => {
+    const t = targets("Đọc input/a.txt và tạo outbox/result.md.");
+    expect(t).toEqual(["outbox/result.md"]);
+    expect(t).not.toContain("input/a.txt");
+  });
+
+  it("R1.6 exact incident end-to-end: contract mints all three targets; plan passes coverage + reconcile + assertPlanDataflow", () => {
+    const GOAL =
+      "Tạo hai file input/a.txt và input/b.txt với nội dung mẫu khác nhau, " +
+      "sau đó dùng một task khác đọc cả hai file, so sánh điểm giống nhau, " +
+      "khác nhau và mâu thuẫn, rồi tạo outbox/comparison.md bằng tiếng Việt. " +
+      "Không truy cập Internet và không sử dụng bất kỳ nguồn bên ngoài nào.";
+    const contract = extractGoalContract(GOAL);
+    expect(contract.deliverables.map((d) => d.target)).toEqual([
+      "input/a.txt",
+      "input/b.txt",
+      "outbox/comparison.md",
+    ]);
+    const tasks = [
+      {
+        task_key: "T2",
+        task_instruction:
+          "Tạo hai file input/a.txt và input/b.txt với nội dung mẫu khác nhau " +
+          "bằng tiếng Việt về cùng một chủ đề, có điểm giống nhau, khác nhau " +
+          "và ít nhất một mâu thuẫn rõ ràng. Không truy cập Internet.",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+      },
+      {
+        task_key: "T3",
+        task_instruction:
+          "Đọc cả hai file input/a.txt và input/b.txt, so sánh điểm giống " +
+          "nhau, khác nhau và mâu thuẫn, rồi tạo outbox/comparison.md " +
+          "bằng tiếng Việt.",
+        required_capabilities: ["REASONING", "FILE_OPERATIONS"],
+        depends_on: ["T2"],
+      },
+    ];
+    const coverage = assertPlanCoverage(contract, tasks);
+    expect(coverage.rows.every((r) => r.state !== "VIOLATED")).toBe(true);
+    const reconciled = reconcilePlanDataflow(tasks);
+    expect(() => assertPlanDataflow(reconciled.tasks)).not.toThrow();
   });
 });
 
