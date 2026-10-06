@@ -31,7 +31,11 @@ import { IntegrityError } from "./errors.js";
 import { artifactNamesEquivalent } from "./artifact-authority.js";
 import { extractTaskDataflow } from "./plan-dataflow.js";
 import { externalSubjectKeys, subjectAnchors } from "./llm-planner.js";
-import type { GoalContract, GoalRequirement } from "./goal-contract.js";
+import {
+  PROHIBITION_ACTION_CLASSES,
+  type GoalContract,
+  type GoalRequirement,
+} from "./goal-contract.js";
 
 export type CoverageState = "PROVEN" | "PRESERVED" | "UNVERIFIABLE" | "VIOLATED";
 
@@ -212,6 +216,153 @@ const TASK_AMOUNT_RES = [
   /\busd\s*(\d+(?:\.\d+)?)/gi,
 ];
 const TELEGRAM_PROHIBITED_TERMS = new Set(["telegram", "tele", "bot"]);
+
+/* ------------------------------------------------------------------ */
+/* prohibition enforcement — action-gated, object-scoped                */
+/* ------------------------------------------------------------------ */
+
+/** A prohibited term matches only as a whole token — "cap" inside
+ *  "capacity" or "cat" inside "concatenate" is never evidence. */
+function termHit(instr: string, term: string): boolean {
+  const re = new RegExp(
+    `(?<![\\p{L}\\p{N}])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`,
+    "iu",
+  );
+  return re.test(instr);
+}
+
+/** Negation markers bounded to ≤2 word tokens before the verb —
+ *  "avoid using" / "không sử dụng" declares compliance, never performs
+ *  the act. R1 — scope is strict: only whitespace separates tokens, so
+ *  any punctuation breaks it, and clause connectives (then/but/however/
+ *  sau đó/nhưng/và/and/or/hoặc) are breakers — "do not analyze first,
+ *  then use martingale" never suppresses the real `use`. On ambiguity
+ *  the match stays live — suppression can never fail-open. */
+const NEGATION_WINDOW_RE =
+  /(?:not|n't|never|no|non|without|avoid(?:ing)?|instead\s+of|rather\s+than|không|chẳng|chưa|tránh|đừng|thay\s+vì|miễn|cấm|ngoài)\s+(?:(?!(?:then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc)(?=\s|$))[\p{L}\p{N}_-]+\s+){0,2}$/iu;
+
+/* ------------------------------------------------------------------ */
+/* R2 — segment-local action↔object association                         */
+/* ------------------------------------------------------------------ */
+
+/** Task instructions split into scope segments on punctuation and on
+ *  clause-shifting connectives (then/but/however/nevertheless/
+ *  sau đó/sau khi/rồi/nhưng). `and`/`và`/`or`/`hoặc` are deliberately
+ *  NOT breakers — they join an action's object list ("use grid and
+ *  martingale" is ONE `use` scope), so treating them as boundaries
+ *  would fail open. */
+const INSTR_SEGMENT_RE =
+  /[,;!?;:—–…]|\.(?![\p{L}\p{N}])|\s+(?:then|but|however|nevertheless|sau\s+đó|sau\s+khi|rồi|nhưng)\s+/giu;
+
+function instructionSegments(instr: string): Array<[number, number]> {
+  const segs: Array<[number, number]> = [];
+  let last = 0;
+  INSTR_SEGMENT_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = INSTR_SEGMENT_RE.exec(instr)) !== null) {
+    segs.push([last, m.index]);
+    last = m.index + m[0].length;
+  }
+  segs.push([last, instr.length]);
+  return segs;
+}
+
+/** Every boundary match of a prohibited term with its position. */
+function termMatchSpans(
+  instr: string,
+  term: string,
+): Array<[number, number]> {
+  const re = new RegExp(
+    `(?<![\\p{L}\\p{N}])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`,
+    "giu",
+  );
+  const out: Array<[number, number]> = [];
+  for (const m of instr.matchAll(re)) {
+    out.push([m.index, m.index + m[0].length]);
+  }
+  return out;
+}
+
+/** Passive auxiliaries before the action flip the object to the
+ *  LEFT of the verb: "report.md was deleted" / "report.md sẽ bị xóa".
+ *  Bounded — aux + at most one intervening token, whitespace-only. */
+const PASSIVE_AUX_RE =
+  /(?:bị|be|been|being|is|are|was|were|get|gets|got|getting)\s+(?:[\p{L}\p{N}_-]+\s+){0,1}$/iu;
+
+/** R3 — a structured prohibition violates only when a non-negated
+ *  forbidden action AND a prohibited object term land inside the
+ *  action's OWN object scope: forward from the action to the next
+ *  action boundary (any class — "check X and delete Y" makes `delete`
+ *  own only `Y`) or to the segment end. Connectives `and|và|or|hoặc`
+ *  stay inside the scope — they join one action's object list
+ *  ("delete temp and report.md" bans both). A passive hit binds the
+ *  object before the verb instead (span between neighbouring actions).
+ *  A ban with no object terms still forbids the class outright. */
+function taskShowsProhibitedAct(
+  instr: string,
+  classes: Set<string>,
+  terms: string[],
+): { cls: string; term: string | null } | null {
+  const hits: Array<{ cls: string; start: number; end: number; negated: boolean }> = [];
+  for (const { cls, re } of PROHIBITION_ACTION_CLASSES) {
+    const g = new RegExp(re.source, "giu");
+    let m: RegExpExecArray | null;
+    while ((m = g.exec(instr)) !== null) {
+      const before = instr.slice(Math.max(0, m.index - 48), m.index);
+      hits.push({
+        cls,
+        start: m.index,
+        end: m.index + m[0].length,
+        negated: NEGATION_WINDOW_RE.test(before),
+      });
+    }
+  }
+  hits.sort((a, b) => a.start - b.start || b.end - a.end);
+  const acts0 = hits.filter((h) => classes.has(h.cls) && !h.negated);
+  if (!acts0.length) return null;
+  if (!terms.length) return { cls: acts0[0].cls, term: null };
+  // An action-looking token inside a prohibited filename ("write.txt"
+  // under a delete ban on write.txt) is the OBJECT, not an action and
+  // not a scope boundary: drop hits overlapping term spans that sit in
+  // a dotted filename context (`term.ext`).
+  const objectSpans: Array<[number, number]> = [];
+  for (const term of terms) {
+    for (const [ts, te] of termMatchSpans(instr, term)) {
+      if (instr[te] === "." && /[\p{L}\p{N}]/u.test(instr[te + 1] ?? "")) {
+        objectSpans.push([ts, te]);
+      }
+    }
+  }
+  const hits2 = objectSpans.length
+    ? hits.filter((h) => !objectSpans.some(([s, e]) => h.start < e && h.end > s))
+    : hits;
+  const acts = hits2.filter((h) => classes.has(h.cls) && !h.negated);
+  if (!acts.length) return null;
+  const segs = instructionSegments(instr);
+  for (const a of acts) {
+    const seg = segs.find(([s, e]) => a.start >= s && a.start < e);
+    if (!seg) continue;
+    // R4 — scope boundaries must come from the SAME segment: an action
+    // in a later/earlier clause never clamps this action's scope and
+    // os/oe can never escape seg.
+    const next = hits2.find((h) => h.start >= a.end && h.start < seg[1]);
+    const prev = [...hits2]
+      .reverse()
+      .find((h) => h.end <= a.start && h.start >= seg[0]);
+    const passive = PASSIVE_AUX_RE.test(
+      instr.slice(Math.max(0, a.start - 32), a.start),
+    );
+    const [os, oe] = passive
+      ? [prev ? prev.end : seg[0], a.start]
+      : [a.end, next ? next.start : seg[1]];
+    for (const term of terms) {
+      for (const [ts, te] of termMatchSpans(instr, term)) {
+        if (ts >= os && te <= oe) return { cls: a.cls, term };
+      }
+    }
+  }
+  return null;
+}
 
 /** Bounded channel/platform vocabulary for `only <channel>` constraints:
  *  the sibling space is enumerable here, never a free-text guess. */
@@ -481,15 +632,39 @@ export function assertPlanCoverage(
   }
   for (const req of contract.prohibitions) {
     const terms = req.terms ?? [];
+    const classes = new Set(req.actionClass ?? []);
     for (const t of work) {
-      const instr = String(t.task_instruction ?? "").toLowerCase();
+      const instr = String(t.task_instruction ?? "");
       const caps = (t.required_capabilities as string[] | undefined) ?? [];
+      // Capability authority is unchanged: a banned telegram surface is
+      // violated by the capability claim itself, independent of wording.
       for (const term of terms) {
         if (TELEGRAM_PROHIBITED_TERMS.has(term) && caps.includes("TELEGRAM_DELIVERY")) {
           violated(req, `task ${String(t.task_key)} requests prohibited TELEGRAM_DELIVERY`);
         }
-        if (instr.includes(term)) {
-          violated(req, `task ${String(t.task_key)} invokes prohibited term "${term}"`);
+      }
+      if (classes.size) {
+        // Structured prohibition: violation requires performing a
+        // compatible action ON a prohibited object in the same
+        // instruction segment — mentioning the object elsewhere or
+        // performing the action on a different object is not the act.
+        // A ban with no object terms forbids the action class outright.
+        const act = taskShowsProhibitedAct(instr, classes, terms);
+        if (act) {
+          violated(
+            req,
+            act.term
+              ? `task ${String(t.task_key)} performs prohibited ${act.cls} on "${act.term}"`
+              : `task ${String(t.task_key)} performs prohibited ${act.cls}`,
+          );
+        }
+      } else {
+        // No identifiable action — term-only enforcement (boundary
+        // match, fail-closed for unparseable prohibition shapes).
+        for (const term of terms) {
+          if (termHit(instr, term)) {
+            violated(req, `task ${String(t.task_key)} invokes prohibited term "${term}"`);
+          }
         }
       }
     }
