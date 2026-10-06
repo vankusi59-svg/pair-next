@@ -470,3 +470,155 @@ describe("R1-F4 — action classes come from the action phrase, not the object",
     ).toBe(2);
   });
 });
+
+/* ================= AUDIT R2 — five findings ================= */
+
+describe("R2-F1 — action↔object association is segment-local, not whole-task", () => {
+  const GOAL_DEL = "analyze XAUUSD strategy, do not delete report.md";
+
+  it("F1.a — 'check report.md, then delete temp.txt' PASSes; 'check temp.txt, then delete report.md' FAILs", () => {
+    const mk = (checkInstr: string) => [
+      work("T1", "analyze XAUUSD strategy and write findings to report.md", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"]),
+      work("T2", checkInstr, ["REASONING"], ["T1"], undefined, []),
+    ];
+    expect(canon(mk("check report.md exists, then delete the scratch file"), GOAL_DEL).length).toBe(3);
+    expectCode(() => canon(mk("check the scratch file exists, then delete report.md"), GOAL_DEL), VIOLATION);
+  });
+
+  it("F1.b — 'review martingale, then use fixed sizing' PASSes; 'review fixed sizing, then use martingale' FAILs", () => {
+    const goal = "analyze XAUUSD strategy, do not use martingale";
+    const ok = [
+      work("T1", "analyze XAUUSD strategy and review martingale setups, then use fixed sizing", ["REASONING"], [], undefined, ["OBL_001"]),
+    ];
+    expect(canon(ok, goal).length).toBe(2);
+    const bad = [
+      work("T1", "analyze XAUUSD strategy review, then use martingale", ["REASONING"], [], undefined, ["OBL_001"]),
+    ];
+    expectCode(() => canon(bad, goal), VIOLATION);
+  });
+
+  it("F1.c — 'use grid and martingale' still FAILs: and/or join an action's object list", () => {
+    const bad = [
+      work("T1", "analyze XAUUSD strategy and use grid and martingale", ["REASONING"], [], undefined, ["OBL_001"]),
+    ];
+    expectCode(() => canon(bad, "analyze XAUUSD strategy, do not use martingale"), VIOLATION);
+  });
+});
+
+describe("R2-F2 — bare 'không' requires a forbidden-action lead", () => {
+  it("F2.a — 'phân tích EA không martingale' keeps the obligation, mints 0 prohibition", () => {
+    const c = extractGoalContract("phân tích EA không martingale");
+    expect(c.prohibitions).toHaveLength(0);
+    expect(c.obligations.length).toBeGreaterThan(0);
+  });
+
+  it("F2.b — 'không có martingale' → obligation only; 'không dùng martingale' → obligation + PRO use", () => {
+    const a = extractGoalContract("phân tích EA không có martingale");
+    expect(a.prohibitions).toHaveLength(0);
+    expect(a.obligations.length).toBeGreaterThan(0);
+    const b = extractGoalContract("phân tích EA không dùng martingale");
+    // the pre-trigger span mints the 'phân tích EA' obligation
+    expect(b.obligations.length).toBeGreaterThan(0);
+    expect(b.obligations[0].text).toContain("phân tích EA");
+    expect(b.prohibitions).toHaveLength(1);
+    expect(b.prohibitions[0].actionClass).toEqual(["use"]);
+    expect(b.prohibitions[0].terms).toContain("martingale");
+    // and it enforces
+    expectCode(
+      () => canon([work("T1", "phân tích EA và dùng martingale sizing", ["REASONING"], [], undefined, ["OBL_001"])], "phân tích EA không dùng martingale"),
+      VIOLATION,
+    );
+  });
+
+  it("F2.c — natural bans still mint; 'ngân sách không quá $50' is constraint only", () => {
+    expect(extractGoalContract("analyze the market, không gửi Telegram").prohibitions).toHaveLength(1);
+    expect(extractGoalContract("analyze the market, không xóa report.md").prohibitions).toHaveLength(1);
+    const c = extractGoalContract("analyze XAUUSD strategy, ngân sách không quá $50");
+    expect(c.prohibitions).toHaveLength(0);
+    expect(c.constraints.map((r) => r.maxAmount)).toContain(50);
+  });
+});
+
+describe("R2-F3 — multi-action prohibitions survive 'and/và' clause splitting", () => {
+  it("F3.a — or/and/hoặc/và multi-action forms all mint [delete, modify] end-to-end", () => {
+    for (const goal of [
+      "do not delete or modify report.md",
+      "do not delete and modify report.md",
+      "không xóa hoặc sửa report.md",
+      "không xóa và sửa report.md",
+    ]) {
+      const g = `analyze the market, ${goal}`;
+      const c = extractGoalContract(g);
+      expect(c.prohibitions).toHaveLength(1);
+      expect(c.prohibitions[0].actionClass).toEqual(
+        expect.arrayContaining(["delete", "modify"]),
+      );
+      expect(c.prohibitions[0].terms).toContain("report");
+      expectCode(
+        () => canon([work("T1", "analyze the market and modify report.md", ["REASONING"], [], undefined, ["OBL_001"])], g),
+        VIOLATION,
+      );
+      expectCode(
+        () => canon([work("T1", "analyze the market and delete report.md", ["REASONING"], [], undefined, ["OBL_001"])], g),
+        VIOLATION,
+      );
+    }
+  });
+
+  it("F3.b — normal 'and' splitting still splits obligations (guard needs a trigger)", () => {
+    const c = extractGoalContract("analyze the market and write report.md");
+    expect(c.prohibitions).toHaveLength(0);
+    expect(c.obligations.length).toBeGreaterThan(0);
+    expect(c.deliverables.length).toBeGreaterThan(0); // 'write report.md' still mints DEL
+  });
+});
+
+describe("R2-F4 — conditional markers are unicode-boundary safe", () => {
+  it("F4.a — 'miễn là backup tồn tại, đừng gửi file' mints [send]+{file}; condition never a term", () => {
+    const c = extractGoalContract("miễn là backup tồn tại, đừng gửi file");
+    expect(c.prohibitions).toHaveLength(1);
+    expect(c.prohibitions[0].actionClass).toEqual(["send"]);
+    expect(c.prohibitions[0].terms).toEqual(["file"]);
+  });
+
+  it("F4.b — every VI marker cuts the tail: trừ khi / nếu / khi / miễn là / trong trường hợp", () => {
+    for (const marker of ["trừ khi", "nếu", "khi", "miễn là", "trong trường hợp"]) {
+      const c = extractGoalContract(`analyze the market, đừng gửi file ${marker} backup chưa xong`);
+      expect(c.prohibitions).toHaveLength(1);
+      expect(c.prohibitions[0].terms).toEqual(["file"]);
+    }
+  });
+
+  it("F4.c — a marker inside a longer token never matches", () => {
+    // 'minếu' contains 'nếu' mid-token — no marker, no tail cut
+    const c = extractGoalContract("analyze the market, đừng gửi file minếu thiếu");
+    expect(c.prohibitions[0].terms).toContain("minếu");
+    // 'khinh' contains 'khi' — boundary blocks it
+    const c2 = extractGoalContract("analyze the market, đừng gửi file khinh khí");
+    expect(c2.prohibitions[0].terms).toContain("khinh");
+  });
+});
+
+describe("R2-F5 — 'order/ordering' is not a trade act", () => {
+  const GOAL_TRADE = "analyze XAUUSD strategy, do not trade";
+
+  it("F5.a — data-ordering prose PASSes: 'order results by score', 'sort and order the candidates'", () => {
+    for (const instr of [
+      "analyze XAUUSD strategy and order results by score",
+      "analyze XAUUSD strategy, sort and order the candidates",
+    ]) {
+      expect(canon([work("T1", instr, ["REASONING"], [], undefined, ["OBL_001"])], GOAL_TRADE).length).toBe(2);
+    }
+  });
+
+  it("F5.b — real trade acts still FAIL: 'place an order', 'trade/buy/sell XAUUSD'", () => {
+    for (const instr of [
+      "analyze XAUUSD strategy and place an order",
+      "analyze XAUUSD strategy and trade XAUUSD",
+      "analyze XAUUSD strategy and buy XAUUSD",
+      "analyze XAUUSD strategy and sell XAUUSD",
+    ]) {
+      expectCode(() => canon([work("T1", instr, ["REASONING"], [], undefined, ["OBL_001"])], GOAL_TRADE), VIOLATION);
+    }
+  });
+});

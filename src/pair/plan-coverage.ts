@@ -241,17 +241,80 @@ function termHit(instr: string, term: string): boolean {
 const NEGATION_WINDOW_RE =
   /(?:not|n't|never|no|non|without|avoid(?:ing)?|instead\s+of|rather\s+than|không|chẳng|chưa|tránh|đừng|thay\s+vì|miễn|cấm|ngoài)\s+(?:(?!(?:then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc)(?=\s|$))[\p{L}\p{N}_-]+\s+){0,2}$/iu;
 
-/** Does the instruction perform a forbidden action class? Every
- *  non-negated surface match counts; a match preceded by a negation
- *  marker within a bounded window is suppressed. */
-function taskShowsAction(instr: string, classes: Set<string>): string | null {
+/* ------------------------------------------------------------------ */
+/* R2 — segment-local action↔object association                         */
+/* ------------------------------------------------------------------ */
+
+/** Task instructions split into scope segments on punctuation and on
+ *  clause-shifting connectives (then/but/however/nevertheless/
+ *  sau đó/sau khi/rồi/nhưng). `and`/`và`/`or`/`hoặc` are deliberately
+ *  NOT breakers — they join an action's object list ("use grid and
+ *  martingale" is ONE `use` scope), so treating them as boundaries
+ *  would fail open. */
+const INSTR_SEGMENT_RE =
+  /[,;.!?;:—–…]|\s+(?:then|but|however|nevertheless|sau\s+đó|sau\s+khi|rồi|nhưng)\s+/giu;
+
+function instructionSegments(instr: string): Array<[number, number]> {
+  const segs: Array<[number, number]> = [];
+  let last = 0;
+  INSTR_SEGMENT_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = INSTR_SEGMENT_RE.exec(instr)) !== null) {
+    segs.push([last, m.index]);
+    last = m.index + m[0].length;
+  }
+  segs.push([last, instr.length]);
+  return segs;
+}
+
+/** Every boundary match of a prohibited term with its position. */
+function termMatchSpans(
+  instr: string,
+  term: string,
+): Array<[number, number]> {
+  const re = new RegExp(
+    `(?<![\\p{L}\\p{N}])${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`,
+    "giu",
+  );
+  const out: Array<[number, number]> = [];
+  for (const m of instr.matchAll(re)) {
+    out.push([m.index, m.index + m[0].length]);
+  }
+  return out;
+}
+
+/** R2 — a structured prohibition violates only when a non-negated
+ *  forbidden action AND a prohibited object term land in the SAME
+ *  instruction segment: "check report.md, then delete temp.txt" is not
+ *  the banned act on report.md — whole-task co-occurrence is gone.
+ *  A ban with no object terms still forbids the class outright. */
+function taskShowsProhibitedAct(
+  instr: string,
+  classes: Set<string>,
+  terms: string[],
+): { cls: string; term: string | null } | null {
+  const acts: Array<{ cls: string; start: number }> = [];
   for (const { cls, re } of PROHIBITION_ACTION_CLASSES) {
     if (!classes.has(cls)) continue;
     const g = new RegExp(re.source, "giu");
     let m: RegExpExecArray | null;
     while ((m = g.exec(instr)) !== null) {
       const before = instr.slice(Math.max(0, m.index - 48), m.index);
-      if (!NEGATION_WINDOW_RE.test(before)) return cls;
+      if (!NEGATION_WINDOW_RE.test(before)) {
+        acts.push({ cls, start: m.index });
+      }
+    }
+  }
+  if (!acts.length) return null;
+  if (!terms.length) return { cls: acts[0].cls, term: null };
+  const segs = instructionSegments(instr);
+  for (const a of acts) {
+    const seg = segs.find(([s, e]) => a.start >= s && a.start < e);
+    if (!seg) continue;
+    for (const term of terms) {
+      for (const [ts, te] of termMatchSpans(instr, term)) {
+        if (ts >= seg[0] && te <= seg[1]) return { cls: a.cls, term };
+      }
     }
   }
   return null;
@@ -538,18 +601,18 @@ export function assertPlanCoverage(
       }
       if (classes.size) {
         // Structured prohibition: violation requires performing a
-        // compatible action ON a prohibited object — mentioning the
-        // object to check/research/review it is never the act. A ban
-        // with no object terms forbids the action class outright.
-        const shown = taskShowsAction(instr, classes);
-        if (shown) {
-          const hit = terms.find((term) => termHit(instr, term));
-          if (hit) {
-            violated(req, `task ${String(t.task_key)} performs prohibited ${shown} on "${hit}"`);
-          }
-          if (!terms.length) {
-            violated(req, `task ${String(t.task_key)} performs prohibited ${shown}`);
-          }
+        // compatible action ON a prohibited object in the same
+        // instruction segment — mentioning the object elsewhere or
+        // performing the action on a different object is not the act.
+        // A ban with no object terms forbids the action class outright.
+        const act = taskShowsProhibitedAct(instr, classes, terms);
+        if (act) {
+          violated(
+            req,
+            act.term
+              ? `task ${String(t.task_key)} performs prohibited ${act.cls} on "${act.term}"`
+              : `task ${String(t.task_key)} performs prohibited ${act.cls}`,
+          );
         }
       } else {
         // No identifiable action — term-only enforcement (boundary

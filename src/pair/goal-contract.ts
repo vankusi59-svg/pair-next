@@ -84,62 +84,124 @@ function splitClauses(goal: string): string[] {
   const clauses: string[] = [];
   for (const h of hard) {
     for (const seg of h.split(
-      /\s*(?:,|(?:\s+)(?:and then|then|sau đó|rồi|và|and)\s+)/iu,
+      /\s*(?:,|(?:\s+)(?:and then|then|sau đó|rồi)\s+)/iu,
     )) {
-      const s = seg.trim();
-      if (s) clauses.push(s);
+      for (const part of splitConnectiveGuarded(seg)) {
+        const s = part.trim();
+        if (s) clauses.push(s);
+      }
     }
   }
   return clauses.slice(0, 32);
+}
+
+/** `and`/`và` inside a prohibition action phrase is a CONNECTOR, not a
+ *  clause boundary — "do not delete and modify report.md" must keep
+ *  [delete, modify] joined or the second forbidden action is lost to
+ *  the split. The guard is bounded and fires only when (a) a
+ *  prohibition trigger already exists earlier in the same clause-so-far
+ *  AND (b) both flanking words are forbidden-action shapes
+ *  (ACTION_TAIL_RE / ACTION_LEAD_RE). `or`/`hoặc` were never clause
+ *  separators; `and`/`và` everywhere else still splits normally. */
+const CONNECTIVE_GUARD_RE = /\s+(?:và|and)\s+/giu;
+function splitConnectiveGuarded(seg: string): string[] {
+  const out: string[] = [];
+  let last = 0;
+  CONNECTIVE_GUARD_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = CONNECTIVE_GUARD_RE.exec(seg)) !== null) {
+    const before = seg.slice(last, m.index);
+    const after = seg.slice(m.index + m[0].length);
+    if (
+      PROHIBITION_RE.test(before) &&
+      ACTION_TAIL_RE.test(before.trimEnd()) &&
+      ACTION_LEAD_RE.test(after)
+    ) {
+      continue; // connector joins two forbidden actions — keep joined
+    }
+    out.push(seg.slice(last, m.index));
+    last = m.index + m[0].length;
+  }
+  out.push(seg.slice(last));
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
 /* classification vocabulary (bounded EN + VI, no classifiers)         */
 /* ------------------------------------------------------------------ */
 
-/** R1 — bare `không` requires structural evidence: it triggers only
- *  before a real action/object token, never before measurement/modal/
- *  quality words where the negative describes a property (`ngân sách
- *  không quá $50`, `không có`, `không đúng`) rather than banning an
- *  act. The lookahead suppression set is a bounded list of VI modifier
- *  vocabulary, not an open stopword scan. Multi-word triggers
- *  (`không được|không đc|không nên`) keep matching explicitly. */
-const PROHIBITION_RE =
-  /(?<![\p{L}\p{N}])(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?!\s*(?:quá|hơn|phải|có|được|nên|cần|đủ|đúng|sai|thấy|biết|khác|giống|cùng|ít|nhiều|xa|gần|cao|thấp|tốt|xấu|rõ|dễ|khó|lớn|nhỏ|chắc|hết|xong|muốn|tồn tại|hiện có|liên quan)(?=\s|$)))\b/iu;
+/* ------------------------------------------------------------------ */
+/* forbidden-action vocabulary — single source for trigger + payload    */
+/* ------------------------------------------------------------------ */
+
+/** Per-class surface alternation bodies — boundaries are applied
+ *  uniformly by ACTION_TOKEN_RE so no class owns its own edge. Every
+ *  surface form is an explicit inflection (R1): arbitrary prefixes
+ *  never mint an action (`use` must not match `user`/`useful`, `ran`
+ *  must not match `orange`). Observation verbs (check/research/analyze/
+ *  review/verify/read/monitor) are deliberately absent — a task that
+ *  merely inspects the object is never the prohibited act.
+ *  R2 — `order/ordering` left the trade class: data-ordering prose
+ *  ("order results by score") is not a trade; only the contextual
+ *  `place (an|the|some|N) order` phrase remains. */
+const ACTION_FORMS: ReadonlyArray<{ cls: string; forms: string }> = [
+  { cls: "delete", forms: "deletes?|deleted|deleting|removes?|removed|removing|drops?|dropped|dropping|erases?|erased|erasing|xóa|xoá|loại\\s+bỏ|hủy|huỷ|hủy\\s+bỏ|huỷ\\s+bỏ" },
+  { cls: "use", forms: "uses?|using|used|utili[sz]es?|utili[sz]ed|utili[sz]ing|appl(?:y|ies|ied|ying)|employs?|employed|employing|adopts?|adopted|adopting|incorporates?|incorporated|incorporating|includes?|included|including|dùng|sử\\s+dụng|áp\\s+dụng|vận\\s+dụng" },
+  { cls: "send", forms: "sends?|sent|sending|delivers?|delivered|delivering|posts?|posted|posting|forwards?|forwarded|forwarding|shares?|shared|sharing|broadcasts?|broadcasting|gửi|đăng(?!\\s+(?:nhập|ký))|chia\\s+sẻ" },
+  { cls: "access", forms: "access(?:es|ed|ing)?|invokes?|invoked|invoking|touch(?:es|ed|ing)?|reach(?:es|ed|ing)?|connect(?:s|ed|ing|ion)?|logs?\\s*in|logging\\s+in|calls?|called|calling|truy\\s+cập|kết\\s+nối|đăng\\s+nhập|liên\\s+hệ" },
+  { cls: "execute", forms: "runs?|ran|running|executes?|executed|executing|execution|launch(?:es|ed|ing)?|starts?|started|starting|boots?|booted|booting|deploys?|deployed|deploying|chạy|thực\\s+thi|khởi\\s+chạy|triển\\s+khai" },
+  { cls: "modify", forms: "modif(?:y|ies|ied|ying|ication)?|edits?|edited|editing|overwrit(?:e|es|ing|ten)|chang(?:e|es|ed|ing)|updat(?:e|es|ed|ing)|alters?|altered|altering|appends?|appended|appending|sửa(?:\\s+đổi|\\s+chữa)?|ghi\\s+đè|thay\\s+đổi|cập\\s+nhật|chỉnh(?:\\s+sửa)?" },
+  { cls: "fabricate", forms: "fabricates?|fabricated|fabricating|invents?|invented|inventing|forges?|forged|forging|fakes?|faked|faking|hallucinates?|hallucinated|hallucinating|bịa(?:\\s+đặt|\\s+ra)?|ngụy\\s+tạo|giả\\s+mạo" },
+  { cls: "trade", forms: "trades?|traded|trading|buys?|bought|buying|sells?|sold|selling|deals?|dealt|dealing|plac(?:e|es|ed|ing)\\s+(?:(?:an?|the|some|few|\\d+)\\s+)?orders?|giao\\s+dịch|mua|bán|đặt\\s+lệnh|đầu\\s+tư|ký\\s+gửi" },
+  { cls: "copy", forms: "cop(?:y|ies|ied|ying)|duplicates?|duplicated|duplicating|clones?|cloned|cloning|sao\\s+chép|nhân\\s+bản" },
+  { cls: "install", forms: "installs?|installed|installing|cài(?:\\s+đặt)?" },
+  { cls: "download", forms: "downloads?|downloaded|downloading|tải(?:\\s+xuống|\\s+về)?" },
+  { cls: "write", forms: "writes?|wrote|written|writing|drafts?|drafted|drafting|composes?|composed|composing|viết|soạn" },
+];
+
+const ACTION_TOKEN_RE = (body: string) =>
+  new RegExp(`(?<![\\p{L}\\p{N}])(?:${body})(?![\\p{L}\\p{N}])`, "iu");
 
 /** Bounded forbidden-action vocabulary — the role PROHIBITED_VERB_STRIP
  *  was declared for, made real: a prohibition bans a PERFORMING action
- *  on its object, not the vocabulary around it. Observation verbs
- *  (check/research/analyze/review/verify/read/monitor) are deliberately
- *  absent — a task that merely inspects the object is never the act. */
+ *  on its object, not the vocabulary around it. */
 export const PROHIBITION_ACTION_CLASSES: ReadonlyArray<{
   cls: string;
   re: RegExp;
-}> = [
-  // R1 — every surface form is an explicit inflection with hard token
-  // boundaries; arbitrary prefixes never mint an action (`use` must not
-  // match `user`/`useful`, `execut` must not match `executive`,
-  // `ran` must not match `orange`).
-  { cls: "delete", re: /(?<![\p{L}\p{N}])(?:deletes?|deleted|deleting|removes?|removed|removing|drops?|dropped|dropping|erases?|erased|erasing|xóa|xoá|loại\s+bỏ|hủy|huỷ|hủy\s+bỏ|huỷ\s+bỏ)(?![\p{L}\p{N}])/iu },
-  { cls: "use", re: /(?<![\p{L}\p{N}])(?:uses?|using|used|utili[sz]es?|utili[sz]ed|utili[sz]ing|appl(?:y|ies|ied|ying)|employs?|employed|employing|adopts?|adopted|adopting|incorporates?|incorporated|incorporating|includes?|included|including|dùng|sử\s+dụng|áp\s+dụng|vận\s+dụng)(?![\p{L}\p{N}])/iu },
-  { cls: "send", re: /(?<![\p{L}\p{N}])(?:sends?|sent|sending|delivers?|delivered|delivering|posts?|posted|posting|forwards?|forwarded|forwarding|shares?|shared|sharing|broadcasts?|broadcasting|gửi|đăng(?!\s+(?:nhập|ký))|chia\s+sẻ)(?![\p{L}\p{N}])/iu },
-  { cls: "access", re: /(?<![\p{L}\p{N}])(?:access(?:es|ed|ing)?|invokes?|invoked|invoking|touch(?:es|ed|ing)?|reach(?:es|ed|ing)?|connect(?:s|ed|ing|ion)?|logs?\s*in|logging\s+in|calls?|called|calling|truy\s+cập|kết\s+nối|đăng\s+nhập|liên\s+hệ)(?![\p{L}\p{N}])/iu },
-  { cls: "execute", re: /(?<![\p{L}\p{N}])(?:runs?|ran|running|executes?|executed|executing|execution|launch(?:es|ed|ing)?|starts?|started|starting|boots?|booted|booting|deploys?|deployed|deploying|chạy|thực\s+thi|khởi\s+chạy|triển\s+khai)(?![\p{L}\p{N}])/iu },
-  { cls: "modify", re: /(?<![\p{L}\p{N}])(?:modif(?:y|ies|ied|ying|ication)?|edits?|edited|editing|overwrit(?:e|es|ing|ten)|chang(?:e|es|ed|ing)|updat(?:e|es|ed|ing)|alters?|altered|altering|appends?|appended|appending|sửa(?:\s+đổi|\s+chữa)?|ghi\s+đè|thay\s+đổi|cập\s+nhật|chỉnh(?:\s+sửa)?)(?![\p{L}\p{N}])/iu },
-  { cls: "fabricate", re: /(?<![\p{L}\p{N}])(?:fabricates?|fabricated|fabricating|invents?|invented|inventing|forges?|forged|forging|fakes?|faked|faking|hallucinates?|hallucinated|hallucinating|bịa(?:\s+đặt|\s+ra)?|ngụy\s+tạo|giả\s+mạo)(?![\p{L}\p{N}])/iu },
-  { cls: "trade", re: /(?<![\p{L}\p{N}])(?:trades?|traded|trading|buys?|bought|buying|sells?|sold|selling|orders?|ordered|ordering|deals?|dealt|dealing|giao\s+dịch|mua|bán|đặt\s+lệnh|đầu\s+tư|ký\s+gửi)(?![\p{L}\p{N}])/iu },
-  { cls: "copy", re: /(?<![\p{L}\p{N}])(?:cop(?:y|ies|ied|ying)|duplicates?|duplicated|duplicating|clones?|cloned|cloning|sao\s+chép|nhân\s+bản)(?![\p{L}\p{N}])/iu },
-  { cls: "install", re: /(?<![\p{L}\p{N}])(?:installs?|installed|installing|cài(?:\s+đặt)?)(?![\p{L}\p{N}])/iu },
-  { cls: "download", re: /(?<![\p{L}\p{N}])(?:downloads?|downloaded|downloading|tải(?:\s+xuống|\s+về)?)(?![\p{L}\p{N}])/iu },
-  { cls: "write", re: /(?<![\p{L}\p{N}])(?:writes?|wrote|written|writing|drafts?|drafted|drafting|composes?|composed|composing|viết|soạn)(?![\p{L}\p{N}])/iu },
-];
+}> = ACTION_FORMS.map(({ cls, forms }) => ({
+  cls,
+  re: ACTION_TOKEN_RE(forms),
+}));
+
+const ALL_ACTION_FORMS = ACTION_FORMS.map((f) => f.forms).join("|");
+/** Action-shape checks for the clause-splitting guard — "does the word
+ *  after a connective begin a forbidden action" / "does the text before
+ *  it end in one" (e.g. `delete and modify`, `xóa và sửa`). */
+const ACTION_LEAD_RE = new RegExp(`^(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])`, "iu");
+const ACTION_TAIL_RE = new RegExp(`(?:${ALL_ACTION_FORMS})$`, "iu");
+
+/** Prohibition triggers. R2 — bare `không` mints a prohibition ONLY
+ *  when it leads directly into a known forbidden-action phrase
+ *  (`không dùng/gửi/xóa/sử dụng/đặt lệnh…`): a negative describing a
+ *  property (`không quá`, `không có`, `không martingale`) is never a
+ *  ban — the trigger needs structural action evidence, not a
+ *  suppress-word list. Multi-word triggers (`không được|không đc|
+ *  không nên`) keep matching explicitly. Boundaries are unicode
+ *  lookarounds — JS `\b` is ASCII-only and can never see `đừng`/`ế`-
+ *  edged words. */
+const PROHIBITION_RE = new RegExp(
+  `(?<![\\p{L}\\p{N}])(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?=\\s+(?:${ALL_ACTION_FORMS})(?![\\p{L}\\p{N}])))(?![\\p{L}\\p{N}])`,
+  "iu",
+);
 
 /** Conditional openers — a prohibition tail that scopes WHEN the ban
  *  applies is condition vocabulary, never prohibited content. The ban
  *  itself lives in the clause head (or, when the marker opens the
- *  clause, in the text after the condition). */
+ *  clause, in the text after the condition). Boundaries are unicode
+ *  lookarounds so `miễn là`/`nếu`-style accented edges match and a
+ *  marker embedded in a longer token never does. */
 const CONDITIONAL_MARKER_RE =
-  /\b(?:trừ khi|miễn là|trong trường hợp|in case|as long as|so long as|provided that|provided|unless|if|when|nếu|khi(?!\s*nào)|lúc(?!\s*nào))\b/iu;
+  /(?<![\p{L}\p{N}])(?:trừ khi|miễn là|trong trường hợp|in case|as long as|so long as|provided that|provided|unless|if|when|nếu|khi(?!\s*nào)|lúc(?!\s*nào))(?![\p{L}\p{N}])/iu;
 const TAIL_CONNECTOR_RE = /^(?:thì|then|that|là)\s+/iu;
 
 /** The part of a prohibition clause that carries the ban — the head
@@ -354,6 +416,20 @@ function prohibitionPayload(clause: string): {
 export function extractGoalContract(goal: string): GoalContract {
   const raw = String(goal ?? "");
   const clauses = splitClauses(raw);
+  // A prohibition trigger opening mid-clause scopes only its own span —
+  // "phân tích EA không dùng martingale" keeps the `phân tích EA`
+  // obligation AND mints the `use` prohibition; the trigger must not
+  // swallow mandatory work stated earlier in the same clause.
+  const expanded: string[] = [];
+  for (const c of clauses) {
+    const tm = PROHIBITION_RE.exec(c);
+    if (tm && tm.index > 0 && /[\p{L}\p{N}]/u.test(c.slice(0, tm.index))) {
+      expanded.push(c.slice(0, tm.index).trim());
+      expanded.push(c.slice(tm.index).trim());
+    } else {
+      expanded.push(c);
+    }
+  }
   const obligations: GoalRequirement[] = [];
   const deliverables: GoalRequirement[] = [];
   const constraints: GoalRequirement[] = [];
@@ -377,7 +453,7 @@ export function extractGoalContract(goal: string): GoalContract {
     });
   };
 
-  for (const clause of clauses) {
+  for (const clause of expanded) {
     // Prohibition outranks everything — a clause that forbids also naming
     // a file or a verb must not mint a deliverable/obligation.
     if (PROHIBITION_RE.test(clause)) {

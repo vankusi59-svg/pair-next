@@ -112,3 +112,47 @@ Post-R1 end-to-end testing on a scratch stack (port 8790, real codex-sol planner
 
 ### Residual advisories (documented, not fixed — out of mandate)
 - **Existence-check runtime abort**: planner declares `report.md` a consumed input of "check whether it exists" → `DEPENDENCY_FAILURE`/`PLAN_DATAFLOW_UNBOUND` abort post-commit. Gate minted correctly; upstream planner-emission quirk.
+---
+
+## AUDIT R2 REMEDIATION (audited HEAD `dd5253d`)
+
+Five findings closed on the same PR/scope. Audited base `dd5253d`; new HEAD recorded below.
+
+### F1 (HIGH) — bounded local association action↔object
+
+**Before**: one non-negated action-class hit + one term hit anywhere in the task instruction → violation — whole-task co-occurrence. `check report.md, then delete temp.txt` failed the same as the real act.
+
+**After** (`plan-coverage.ts`): `instructionSegments()` splits each instruction on punctuation `[ ,;.!?;:—–… ]` and on clause-shifting connectives ` then | but | however | nevertheless | sau đó | sau khi | rồi | nhưng ` (whitespace-gated). `and | và | or | hoặc` are deliberately NOT breakers — "use grid and martingale" is a single object list and splitting there would fail open. `termMatchSpans()` finds every boundary-match span of each prohibited term; `taskShowsProhibitedAct` requires a non-negated action hit AND a term hit inside the SAME segment (no terms → the class is banned outright anywhere). Result: `check report.md, then delete temp.txt` PASSes, `check temp.txt, then delete report.md` FAILs; `review martingale, then use fixed sizing` PASSes, `use martingale` anywhere still FAILs.
+
+### F2 (HIGH) — bare `không` requires a forbidden-action lead
+
+**Before**: bare `không` carried a bounded suppress-word lookahead; `phân tích EA không martingale` still minted a prohibition (descriptive shorthand swallowed the obligation).
+
+**After** (`goal-contract.ts`): the suppress-word list is DELETED. Bare `không` is a trigger only when immediately followed by a known forbidden-action form — `không(?=\s+(?:ALL_ACTION_FORMS)(?![\p{L}\p{N}]))`, the same 12-class vocabulary enforcement uses (`ALL_ACTION_FORMS` is now exported from a single `ACTION_FORMS` table — one alternation source for both sides). `không gửi/xóa/dùng` mint as before; `không có martingale`, `không martingale`, `không quá $50` mint nothing (constraint/obligation survive). NEW mid-clause expansion: when a `PROHIBITION_RE` match starts inside a clause with text before it, the clause is split at the match — `phân tích EA không dùng martingale` mints obligation `phân tích EA` PLUS prohibition `[use]+{martingale}`.
+
+### F3 (HIGH) — multi-action `and/và` survived clause splitting
+
+**Before**: `splitClauses` cut on ` và | and ` anywhere → `do not delete and modify report.md` split at `and`, leaving `modify report.md` a separate non-prohibition clause — `modify` silently unbanned.
+
+**After**: `và|and` removed from the clause separator; they now split ONLY inside `splitConnectiveGuarded` — a guarded split that requires ALL THREE: `PROHIBITION_RE` matches the text before the connective, that text ENDS in an action form (`ACTION_TAIL_RE`), and the text after LEADS with an action form (`ACTION_LEAD_RE`). `delete and modify` survives intact (both classes minted); `analyze the market and write report.md` still splits (before-side ends in `market`, not an action). Deterministic, no parser. VI `hoặc`/`và` connectors already joined action classes inside `prohibitionPayload`'s connector-walk — now `and`/`và` reach it.
+
+### F4 (MEDIUM) — unicode-safe conditional markers
+
+`CONDITIONAL_MARKER_RE` replaced both `\b` edges with `(?<![\p{L}\p{N}])`/`(?![\p{L}\p{N}])` — `miễn là backup tồn tại, đừng gửi file` now mints `[send]+{file}` (đ-initial `miễn`/`đừng` boundary works); `minếu`/`khinh` never match a marker mid-token. Marker set: `trừ khi | miễn là | trong trường hợp | in case | as long as | so long as | provided that | provided | unless | if | when | nếu | khi(?! nào) | lúc(?! nào)`. No other VI trigger/marker regex retains `\b` (PROHIBITION_RE lead was fixed in R1.1; all class boundaries already unicode).
+
+### F5 (MEDIUM) — `order/ordering` ≠ trade
+
+`trade` class dropped `orders?|ordered|ordering` and gained the contextual `plac(?:e|es|ed|ing)\s+(?:(?:an?|the|some|few|\d+)\s+)?orders?`. `order results by score` / `sort and order the candidates` PASS under `do not trade`; `place an order`, `trade/buy/sell XAUUSD` still FAIL.
+
+### Validation
+- Focused suite: **43/43 PASS** (30 prior + 13 R2 tests covering every mandated case table)
+- Regression (PRV2-B + P-COVMAP + dataflow-incident + preask + network-req): **254/254**
+- Full suite: **3703 pass / 3 fail / 24 skipped** — byte-identical baseline (F4 R5.1-crash, P5 DSH env, P5 CODEX env); skip drift is env probes
+- `tsc --noEmit` clean; `rm -rf dist && npm run build` clean
+
+### Residual limitations (updated)
+- Segment splitting is punctuation + a bounded connective list — an action→object pair spanning an UNLISTED breaker (e.g. `however that may be,` vs. exotic adverbs) reads as one segment; direction is fail-closed on the ban side and PASS-open on the legit side only when punctuation separates them.
+- `and/or` between an action and its objects stays one segment BY DESIGN (object-list scope) — `use grid and martingale` still bans.
+- Negation suppression still ≤2 whitespace tokens before the action hit.
+- Bare `không` + unknown verb (outside the 12 classes) mints NO prohibition — e.g. `không đuổi` — documented bounded miss vs. the over-extraction it replaced.
+- Condition evaluation (`if/unless/nếu`) is STILL only a cutoff — a true conditional ban always bans; full conditional semantics remain a separate work item.
