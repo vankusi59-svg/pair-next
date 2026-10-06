@@ -231,11 +231,15 @@ function termHit(instr: string, term: string): boolean {
   return re.test(instr);
 }
 
-/** Negation markers bounded to ≤3 tokens before the verb — "avoid using
- *  martingale" / "không sử dụng martingale" declares compliance, never
- *  performs the act. */
+/** Negation markers bounded to ≤2 word tokens before the verb —
+ *  "avoid using" / "không sử dụng" declares compliance, never performs
+ *  the act. R1 — scope is strict: only whitespace separates tokens, so
+ *  any punctuation breaks it, and clause connectives (then/but/however/
+ *  sau đó/nhưng/và/and/or/hoặc) are breakers — "do not analyze first,
+ *  then use martingale" never suppresses the real `use`. On ambiguity
+ *  the match stays live — suppression can never fail-open. */
 const NEGATION_WINDOW_RE =
-  /(?:not|n't|never|no\b|non\b|without|avoid(?:ing)?|instead of|rather than|không|chẳng|chưa|tránh|đừng|thay vì|miễn|cấm|ngoài)\s*(?:[\p{L}\p{N}_-]+[\s,.]*){0,3}$/iu;
+  /(?:not|n't|never|no|non|without|avoid(?:ing)?|instead\s+of|rather\s+than|không|chẳng|chưa|tránh|đừng|thay\s+vì|miễn|cấm|ngoài)\s+(?:(?!(?:then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc)(?=\s|$))[\p{L}\p{N}_-]+\s+){0,2}$/iu;
 
 /** Does the instruction perform a forbidden action class? Every
  *  non-negated surface match counts; a match preceded by a negation

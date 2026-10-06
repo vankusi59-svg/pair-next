@@ -58,3 +58,38 @@ Digest: `actionClass` rides `canonicalizeForDigest` → contractDigest changes v
 - Term-only prohibitions (no identifiable action verb) keep the old gating on object mention — the mandate's narrowing applies where an action is identifiable.
 - `actionClass` vocabulary is bounded (12 classes EN/VI) — an exotic banned verb (`do not extrapolate`) falls back to term-only; additive extension point, not semantic NLP.
 - Multi-word prohibited objects (`bịa dữ liệu`) rely on per-token `liệu` boundary match — a task `tạo dữ liệu` shows FABRICATE? No — `tạo` is not fabricate → passes; `bịa dữ liệu` violates via `bịa`+`liệu` (verified B8).
+
+---
+
+## AUDIT R1 REMEDIATION (audited HEAD `1033019` → new HEAD pending push)
+
+Four findings closed, same files, minimal scope.
+
+### F1 — bare `không` over-classification (HIGH, fixed)
+`PROHIBITION_RE` bare `không` now carries a bounded lookahead suppression: `không(?!\s*(?:quá|hơn|phải|có|được|nên|cần|đủ|đúng|sai|thấy|biết|khác|giống|cùng|ít|nhiều|xa|gần|cao|thấp|tốt|xấu|rõ|dễ|khó|lớn|nhỏ|chắc|hết|xong|muốn|tồn tại|hiện có|liên quan)(?=\s|$))` — descriptive negatives never trigger; `không gửi/xóa/dùng/…` still do. Verified: `ngân sách không quá $50` mints constraint `maxAmount=50` + zero prohibitions; `phân tích EA không có martingale` mints the obligation; all three natural VI bans mint correctly.
+
+**Incidental root-cause fix**: JS `\b` is ASCII-only — `quá\b` never matches (á is non-word). All boundaries moved to `(?<![\p{L}\p{N}])`/`(?![\p{L}\p{N}])`/`(?=\s|$)` lookarounds — affects every diacritic-ending VI lexeme in the touched regexes.
+
+### F2 — negation window could suppress a real act (HIGH, fixed)
+`NEGATION_WINDOW_RE` tightened: `\s+`-only separators (punctuation always breaks scope), ≤2 tokens (was ≤3), and clause connectives `then|but|however|nevertheless|sau|nhưng|rồi|và|and|or|hoặc` are per-token breakers. `do not analyze first, then use martingale` → VIOLATION (was suppressed); `avoid using` / `will not use` / `không sử dụng` still suppress. Ambiguity resolves to live match — suppression can never fail-open.
+
+### F3 — prefix false-positives in action regexes (fixed)
+Every class regex rewritten to explicit inflection lists + hard `(?<![\p{L}\p{N}])`/`(?![\p{L}\p{N}])` boundaries: `uses?|using|used|utili[sz]e[ds]?|…` — `user`/`useful`/`executive`/`orange`/`tradition`/`posture` never mint an action; `use/using/used/includes/including` still match. `đăng(?!\s+(?:nhập|ký))` keeps `đăng nhập/ký` out of the send class (access claims it via longest-match tie-break anyway).
+
+### F4 — action classes from the ACTION PHRASE, not the object (HIGH, fixed)
+`prohibitionPayload` now: masks filename-shaped tokens (`write.txt`) before the action scan → takes the FIRST class hit → extends only across connector words (`or|and|và|hoặc`) — `do not delete write.txt` → `[delete]` with terms `[write]`; `do not access download folder` → `[access]` (download stays object); `do not delete or modify report.md` → `[delete, modify]` deterministically. Terms strip only admitted action spans — object identity survives even when the object is an action-looking token.
+
+### Tests added (14)
+F1.a–c (budget/obligation survival + natural bans), F2.a–d (breaker fail-closed + genuine compliance suppressed), F3.a–c (prefix FP matrix + explicit inflections still firing), F4.a–d (object-identity + multi-action deterministic).
+
+### Validation
+- Focused suite: **29/29 PASS** (15 original + 14 R1)
+- Regression (PRV2-B + covmap + dataflow + preask + grammar2 + netreq): **276/276**
+- Full suite: **3689 pass / 3 fail / 24 skipped** — same 3 baseline fails (F4 R5.1-crash, P5 DSH env, P5 CODEX env); skip-count drift is env probes
+- `tsc --noEmit` clean; `rm -rf dist && npm run build` clean
+
+### Residual limitations (updated)
+- `không` + suppress-word means "không thực hiện"-style bans through intervening adverbs aren't suppressed — they trigger (safe direction).
+- Negation window ≤2 whitespace-separated tokens; a distant negation (`avoid, as noted, using`) still counts as live act — fail-closed direction.
+- `ordering` still reads trade (`orders?|ordered|ordering`); bounded.
+- Overlapping same-start hits resolve longest-first (`đăng nhập` → access, not send).

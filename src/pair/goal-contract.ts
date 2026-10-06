@@ -97,8 +97,15 @@ function splitClauses(goal: string): string[] {
 /* classification vocabulary (bounded EN + VI, no classifiers)         */
 /* ------------------------------------------------------------------ */
 
+/** R1 — bare `không` requires structural evidence: it triggers only
+ *  before a real action/object token, never before measurement/modal/
+ *  quality words where the negative describes a property (`ngân sách
+ *  không quá $50`, `không có`, `không đúng`) rather than banning an
+ *  act. The lookahead suppression set is a bounded list of VI modifier
+ *  vocabulary, not an open stopword scan. Multi-word triggers
+ *  (`không được|không đc|không nên`) keep matching explicitly. */
 const PROHIBITION_RE =
-  /\b(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|không|đừng|cấm|tránh)\b/iu;
+  /\b(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?!\s*(?:quá|hơn|phải|có|được|nên|cần|đủ|đúng|sai|thấy|biết|khác|giống|cùng|ít|nhiều|xa|gần|cao|thấp|tốt|xấu|rõ|dễ|khó|lớn|nhỏ|chắc|hết|xong|muốn|tồn tại|hiện có|liên quan)(?=\s|$)))\b/iu;
 
 /** Bounded forbidden-action vocabulary — the role PROHIBITED_VERB_STRIP
  *  was declared for, made real: a prohibition bans a PERFORMING action
@@ -109,18 +116,22 @@ export const PROHIBITION_ACTION_CLASSES: ReadonlyArray<{
   cls: string;
   re: RegExp;
 }> = [
-  { cls: "delete", re: /\b(?:delete|remove|drop|erase|xóa|xoá|loại bỏ|hủy|huỷ)/iu },
-  { cls: "use", re: /\b(?:use|using|used|utili[sz]e|apply|employ|adopt|incorporat|includ|dùng|sử dụng|áp dụng|vận dụng)/iu },
-  { cls: "send", re: /\b(?:send|deliver|post|forward|share|broadcast|gửi|đăng|chia sẻ)/iu },
-  { cls: "access", re: /\b(?:access|invoke|touch|reach|connect|log ?in|call|truy cập|kết nối|đăng nhập|liên hệ)/iu },
-  { cls: "execute", re: /\b(?:run|execut|launch|start|boot|deploy|chạy|thực thi|khởi chạy|triển khai)/iu },
-  { cls: "modify", re: /\b(?:modif|edit|overwrit|chang|updat|alter|append|sửa|ghi đè|thay đổi|cập nhật|chỉnh)/iu },
-  { cls: "fabricate", re: /\b(?:fabricat|invent|forge|fake|hallucinat|bịa|ngụy|giả mạo)/iu },
-  { cls: "trade", re: /\b(?:trad|buy|sell|order|deal|giao dịch|mua|bán|đặt lệnh|đầu tư|ký gửi)/iu },
-  { cls: "copy", re: /\b(?:copy|copies|duplicat|clone|sao chép|nhân bản)/iu },
-  { cls: "install", re: /\b(?:install|cài)/iu },
-  { cls: "download", re: /\b(?:download|tải)/iu },
-  { cls: "write", re: /\b(?:write|writes|wrote|draft|compose|viết|soạn)/iu },
+  // R1 — every surface form is an explicit inflection with hard token
+  // boundaries; arbitrary prefixes never mint an action (`use` must not
+  // match `user`/`useful`, `execut` must not match `executive`,
+  // `ran` must not match `orange`).
+  { cls: "delete", re: /(?<![\p{L}\p{N}])(?:deletes?|deleted|deleting|removes?|removed|removing|drops?|dropped|dropping|erases?|erased|erasing|xóa|xoá|loại\s+bỏ|hủy|huỷ|hủy\s+bỏ|huỷ\s+bỏ)(?![\p{L}\p{N}])/iu },
+  { cls: "use", re: /(?<![\p{L}\p{N}])(?:uses?|using|used|utili[sz]es?|utili[sz]ed|utili[sz]ing|appl(?:y|ies|ied|ying)|employs?|employed|employing|adopts?|adopted|adopting|incorporates?|incorporated|incorporating|includes?|included|including|dùng|sử\s+dụng|áp\s+dụng|vận\s+dụng)(?![\p{L}\p{N}])/iu },
+  { cls: "send", re: /(?<![\p{L}\p{N}])(?:sends?|sent|sending|delivers?|delivered|delivering|posts?|posted|posting|forwards?|forwarded|forwarding|shares?|shared|sharing|broadcasts?|broadcasting|gửi|đăng(?!\s+(?:nhập|ký))|chia\s+sẻ)(?![\p{L}\p{N}])/iu },
+  { cls: "access", re: /(?<![\p{L}\p{N}])(?:access(?:es|ed|ing)?|invokes?|invoked|invoking|touch(?:es|ed|ing)?|reach(?:es|ed|ing)?|connect(?:s|ed|ing|ion)?|logs?\s*in|logging\s+in|calls?|called|calling|truy\s+cập|kết\s+nối|đăng\s+nhập|liên\s+hệ)(?![\p{L}\p{N}])/iu },
+  { cls: "execute", re: /(?<![\p{L}\p{N}])(?:runs?|ran|running|executes?|executed|executing|execution|launch(?:es|ed|ing)?|starts?|started|starting|boots?|booted|booting|deploys?|deployed|deploying|chạy|thực\s+thi|khởi\s+chạy|triển\s+khai)(?![\p{L}\p{N}])/iu },
+  { cls: "modify", re: /(?<![\p{L}\p{N}])(?:modif(?:y|ies|ied|ying|ication)?|edits?|edited|editing|overwrit(?:e|es|ing|ten)|chang(?:e|es|ed|ing)|updat(?:e|es|ed|ing)|alters?|altered|altering|appends?|appended|appending|sửa(?:\s+đổi|\s+chữa)?|ghi\s+đè|thay\s+đổi|cập\s+nhật|chỉnh(?:\s+sửa)?)(?![\p{L}\p{N}])/iu },
+  { cls: "fabricate", re: /(?<![\p{L}\p{N}])(?:fabricates?|fabricated|fabricating|invents?|invented|inventing|forges?|forged|forging|fakes?|faked|faking|hallucinates?|hallucinated|hallucinating|bịa(?:\s+đặt|\s+ra)?|ngụy\s+tạo|giả\s+mạo)(?![\p{L}\p{N}])/iu },
+  { cls: "trade", re: /(?<![\p{L}\p{N}])(?:trades?|traded|trading|buys?|bought|buying|sells?|sold|selling|orders?|ordered|ordering|deals?|dealt|dealing|giao\s+dịch|mua|bán|đặt\s+lệnh|đầu\s+tư|ký\s+gửi)(?![\p{L}\p{N}])/iu },
+  { cls: "copy", re: /(?<![\p{L}\p{N}])(?:cop(?:y|ies|ied|ying)|duplicates?|duplicated|duplicating|clones?|cloned|cloning|sao\s+chép|nhân\s+bản)(?![\p{L}\p{N}])/iu },
+  { cls: "install", re: /(?<![\p{L}\p{N}])(?:installs?|installed|installing|cài(?:\s+đặt)?)(?![\p{L}\p{N}])/iu },
+  { cls: "download", re: /(?<![\p{L}\p{N}])(?:downloads?|downloaded|downloading|tải(?:\s+xuống|\s+về)?)(?![\p{L}\p{N}])/iu },
+  { cls: "write", re: /(?<![\p{L}\p{N}])(?:writes?|wrote|written|writing|drafts?|drafted|drafting|composes?|composed|composing|viết|soạn)(?![\p{L}\p{N}])/iu },
 ];
 
 /** Conditional openers — a prohibition tail that scopes WHEN the ban
@@ -260,20 +271,72 @@ function extractOnlyTerms(clause: string): string[] | undefined {
   return [term];
 }
 
+/** Connectors that legally extend a forbidden-action phrase —
+ *  "delete or modify" mints both classes; "access download" (no
+ *  connector) mints `access` only, `download` stays object identity. */
+const ACTION_CONNECTOR_WORDS = new Set(["or", "and", "và", "hoặc"]);
+/** Filename-shaped tokens are objects, never actions — masked before
+ *  the action scan so `write.txt` cannot mint a `write` class. */
+const FILELIKE_TOKEN_RE = /[\p{L}\p{N}_-]+\.[\p{L}\p{N}]+/gu;
+
 /** The structured prohibition payload: the bounded action class(es)
  *  the clause bans plus the object terms it bans them on. Everything
- *  after a conditional marker is scoping, never blacklist content. */
+ *  after a conditional marker is scoping, never prohibited content.
+ *  R1 — action classes come from the ACTION PHRASE alone: the first
+ *  action-verb match plus later matches bridged only by connectors.
+ *  An action-looking token sitting in the object keeps its identity
+ *  in `terms` and never mints a second forbidden action. */
 function prohibitionPayload(clause: string): {
   terms: string[];
   actionClass?: string[];
 } {
   const head = prohibitionHead(clause).replace(PROHIBITION_RE, " ");
-  const classes: string[] = [];
-  let stripped = head;
+  const masked = head.replace(FILELIKE_TOKEN_RE, (t) => " ".repeat(t.length));
+  const wordTokens = [...masked.matchAll(/[\p{L}\p{N}]+/gu)];
+  // Every action-class surface match, sorted by position (ties: the
+  // longer match wins — `đăng nhập` reads access, not send).
+  const hits: Array<{ tok: number; cls: string; start: number; end: number }> = [];
   for (const { cls, re } of PROHIBITION_ACTION_CLASSES) {
-    if (re.test(head)) classes.push(cls);
-    stripped = stripped.replace(new RegExp(re.source, "giu"), " ");
+    const g = new RegExp(re.source, "giu");
+    let m: RegExpExecArray | null;
+    while ((m = g.exec(masked)) !== null) {
+      const start = m.index;
+      const tok = wordTokens.findIndex(
+        (t) => start >= t.index! && start < t.index! + t[0].length,
+      );
+      if (tok >= 0) hits.push({ tok, cls, start, end: start + m[0].length });
+    }
   }
+  hits.sort((a, b) => a.start - b.start || b.end - a.end);
+  const classes: string[] = [];
+  const spans: Array<[number, number]> = [];
+  if (hits.length) {
+    classes.push(hits[0].cls);
+    spans.push([hits[0].start, hits[0].end]);
+    let prev = hits[0];
+    for (let k = 1; k < hits.length && classes.length < 4; k++) {
+      const h = hits[k];
+      if (h.start < prev.end) continue; // overlap with an admitted span
+      // word tokens lying strictly between the two spans — all must be
+      // connectors for the later match to join the action phrase
+      const gap = wordTokens
+        .filter((t) => t.index! >= prev.end && t.index! + t[0].length <= h.start)
+        .map((t) => t[0].toLowerCase());
+      if (!gap.length || !gap.every((w) => ACTION_CONNECTOR_WORDS.has(w))) break;
+      if (!classes.includes(h.cls)) classes.push(h.cls);
+      spans.push([h.start, h.end]);
+      prev = h;
+    }
+  }
+  // Terms come from the whole head minus the admitted action spans —
+  // object identity (including action-looking tokens) survives intact.
+  let stripped = "";
+  let cursor = 0;
+  for (const [s, e] of spans) {
+    stripped += head.slice(cursor, s) + " ";
+    cursor = e;
+  }
+  stripped += head.slice(cursor);
   const terms: string[] = [];
   for (const m of stripped.matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0].toLowerCase();

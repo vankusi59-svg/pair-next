@@ -283,3 +283,175 @@ describe("narrowing B — enforcement binds action to object", () => {
     expectCode(() => canon(bad, goal), VIOLATION);
   });
 });
+
+/* ================= AUDIT R1 — four findings ================= */
+
+describe("R1-F1 — bare 'không' needs structural evidence", () => {
+  it("F1.a — 'ngân sách không quá $50' mints a budget constraint, never a prohibition", () => {
+    const c = extractGoalContract("analyze XAUUSD strategy, ngân sách không quá $50");
+    expect(c.prohibitions).toHaveLength(0);
+    expect(c.constraints.length).toBeGreaterThan(0);
+    expect(c.constraints.map((r) => r.maxAmount)).toContain(50);
+  });
+
+  it("F1.b — 'phân tích EA không có martingale' mints the obligation, prohibition does not swallow it", () => {
+    const c = extractGoalContract("phân tích EA không có martingale");
+    expect(c.prohibitions).toHaveLength(0);
+    expect(c.obligations.length).toBeGreaterThan(0);
+  });
+
+  it("F1.c — natural bans still mint: 'không gửi Telegram', 'không xóa report.md', 'không dùng martingale'", () => {
+    const a = extractGoalContract("analyze the market, không gửi Telegram");
+    expect(a.prohibitions).toHaveLength(1);
+    expect(a.prohibitions[0].actionClass).toEqual(["send"]);
+    expect(a.prohibitions[0].terms).toContain("telegram");
+    const b = extractGoalContract("analyze the market, không xóa report.md");
+    expect(b.prohibitions[0].actionClass).toEqual(["delete"]);
+    expect(b.prohibitions[0].terms).toContain("report");
+    const d = extractGoalContract("analyze the market, không dùng martingale");
+    expect(d.prohibitions[0].actionClass).toEqual(["use"]);
+    expect(d.prohibitions[0].terms).toContain("martingale");
+  });
+});
+
+describe("R1-F2 — negation suppression scope is bounded", () => {
+  const GOAL_USE = "analyze XAUUSD strategy, do not use martingale";
+
+  it("F2.a — 'do not analyze first, then use martingale' MUST FAIL (then is a breaker)", () => {
+    const bad = [
+      work("T1", "analyze XAUUSD strategy; do not analyze first, then use martingale", ["REASONING"], [], undefined, ["OBL_001"]),
+    ];
+    expectCode(() => canon(bad, GOAL_USE), VIOLATION);
+  });
+
+  it("F2.b — punctuation breaks the window: 'avoid X. then use martingale' fails", () => {
+    const bad = [
+      work("T1", "analyze XAUUSD strategy, avoid grid. Then use martingale sizing", ["REASONING"], [], undefined, ["OBL_001"]),
+    ];
+    expectCode(() => canon(bad, GOAL_USE), VIOLATION);
+  });
+
+  it("F2.c — connectives 'but'/'sau đó'/'nhưng' break the window → FAIL", () => {
+    for (const instr of [
+      "analyze XAUUSD strategy, avoid the hype but use martingale",
+      "analyze XAUUSD strategy, tránh grid sau đó use martingale",
+      "analyze XAUUSD strategy, tránh grid nhưng vẫn dùng martingale",
+    ]) {
+      expectCode(
+        () => canon([work("T1", instr, ["REASONING"], [], undefined, ["OBL_001"])], GOAL_USE),
+        VIOLATION,
+      );
+    }
+  });
+
+  it("F2.d — genuine compliance stays suppressed: 'avoid using', 'will not use', 'không sử dụng'", () => {
+    for (const instr of [
+      "analyze XAUUSD strategy and avoid using martingale",
+      "analyze XAUUSD strategy and will not use martingale",
+      "phân tích XAUUSD strategy và không sử dụng martingale",
+    ]) {
+      expect(
+        canon([work("T1", instr, ["REASONING"], [], undefined, ["OBL_001"])], GOAL_USE).length,
+      ).toBe(2);
+    }
+  });
+});
+
+describe("R1-F3 — action regex prefix false-positives gone", () => {
+  const GOAL_USE = "analyze XAUUSD strategy, do not use martingale";
+
+  it("F3.a — 'user'/'useful'/'user feedback' never mint the use action", () => {
+    for (const instr of [
+      "analyze XAUUSD strategy and martingale user feedback",
+      "analyze XAUUSD strategy and useful martingale research",
+    ]) {
+      expect(
+        canon([work("T1", instr, ["REASONING"], [], undefined, ["OBL_001"])], GOAL_USE).length,
+      ).toBe(2);
+    }
+  });
+
+  it("F3.b — explicit inflections still match: use/using/used/includes/including → FAIL", () => {
+    for (const instr of [
+      "analyze XAUUSD strategy and use martingale",
+      "analyze XAUUSD strategy using martingale sizing",
+      "analyze XAUUSD strategy that previously used martingale",
+      "analyze XAUUSD strategy including martingale sizing",
+    ]) {
+      expectCode(
+        () => canon([work("T1", instr, ["REASONING"], [], undefined, ["OBL_001"])], GOAL_USE),
+        VIOLATION,
+      );
+    }
+  });
+
+  it("F3.c — other classes audited: 'orange'≠ran, 'executive'≠execute, 'tradition'≠trade, 'posture'≠post", () => {
+    // run-ban goal: 'orange'/'ranging' must not mint execute
+    const runGoal = "analyze XAUUSD strategy, do not run backtests";
+    expect(
+      canon([work("T1", "analyze XAUUSD strategy and orange juice prices", ["REASONING"], [], undefined, ["OBL_001"])], runGoal).length,
+    ).toBe(2);
+    const execGoal = "analyze XAUUSD strategy, do not execute orders";
+    expect(
+      canon([work("T1", "analyze XAUUSD strategy for the executive summary", ["REASONING"], [], undefined, ["OBL_001"])], execGoal).length,
+    ).toBe(2);
+    const tradeGoal = "analyze XAUUSD strategy, do not trade";
+    expect(
+      canon([work("T1", "analyze XAUUSD strategy and market traditions", ["REASONING"], [], undefined, ["OBL_001"])], tradeGoal).length,
+    ).toBe(2);
+    const postGoal = "analyze XAUUSD strategy, do not send posts to telegram";
+    expect(
+      canon([work("T1", "analyze XAUUSD strategy and posture of the market", ["REASONING"], [], undefined, ["OBL_001"])], postGoal).length,
+    ).toBe(2);
+  });
+});
+
+describe("R1-F4 — action classes come from the action phrase, not the object", () => {
+  it("F4.a — 'do not delete write.txt' mints delete only; write.txt keeps object identity", () => {
+    const c = extractGoalContract("analyze the market, do not delete write.txt");
+    const p = c.prohibitions[0];
+    expect(p.actionClass).toEqual(["delete"]);
+    expect(p.terms).toContain("write");
+  });
+
+  it("F4.b — 'write to write.txt' PASSes; 'delete write.txt' FAILs", () => {
+    const goal = "analyze XAUUSD strategy, do not delete write.txt";
+    const ok = [
+      work("T1", "analyze XAUUSD strategy and write findings to write.txt", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"]),
+    ];
+    expect(canon(ok, goal).length).toBe(2);
+    const bad = [
+      work("T1", "analyze XAUUSD strategy then delete write.txt", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"]),
+    ];
+    expectCode(() => canon(bad, goal), VIOLATION);
+  });
+
+  it("F4.c — 'do not access download folder' does not mint a second download action", () => {
+    const c = extractGoalContract("analyze the market, do not access download folder");
+    expect(c.prohibitions[0].actionClass).toEqual(["access"]);
+    expect(c.prohibitions[0].terms).toEqual(expect.arrayContaining(["download", "folder"]));
+    // a task that DOWNLOADS (different action) is not the banned act
+    const ok = [
+      work("T1", "analyze XAUUSD strategy and download the dataset zip", ["REASONING"], [], undefined, ["OBL_001"]),
+    ];
+    expect(canon(ok, "analyze XAUUSD strategy, do not access download folder").length).toBe(2);
+  });
+
+  it("F4.d — real multi-action 'do not delete or modify report.md' is deterministic", () => {
+    const c = extractGoalContract("analyze the market, do not delete or modify report.md");
+    expect(c.prohibitions[0].actionClass).toEqual(["delete", "modify"]);
+    const goal = "analyze XAUUSD strategy, do not delete or modify report.md";
+    expectCode(
+      () => canon([work("T1", "analyze XAUUSD strategy then delete report.md", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"])], goal),
+      VIOLATION,
+    );
+    expectCode(
+      () => canon([work("T1", "analyze XAUUSD strategy then modify report.md", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"])], goal),
+      VIOLATION,
+    );
+    // write is not among the banned classes → still passes
+    expect(
+      canon([work("T1", "analyze XAUUSD strategy and write findings to report.md", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"])], goal).length,
+    ).toBe(2);
+  });
+});
