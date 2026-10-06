@@ -312,6 +312,21 @@ describe("R1-F1 — bare 'không' needs structural evidence", () => {
     expect(d.prohibitions[0].actionClass).toEqual(["use"]);
     expect(d.prohibitions[0].terms).toContain("martingale");
   });
+
+  it("F1.d — 'đừng' trigger fires (leading-đ boundary fixed): 'đừng gửi telegram' / 'đừng xóa report.md'", () => {
+    const a = extractGoalContract("analyze the market, đừng gửi telegram");
+    expect(a.prohibitions).toHaveLength(1);
+    expect(a.prohibitions[0].actionClass).toEqual(["send"]);
+    expect(a.prohibitions[0].terms).toContain("telegram");
+    const b = extractGoalContract("analyze the market, đừng xóa report.md");
+    expect(b.prohibitions[0].actionClass).toEqual(["delete"]);
+    expect(b.prohibitions[0].terms).toContain("report");
+    // the most common VI phrasing now enforces at the gate too
+    const bad = [
+      work("T1", "analyze the market and broadcast the findings on telegram", ["REASONING"], [], undefined, ["OBL_001"]),
+    ];
+    expectCode(() => canon(bad, "analyze the market, đừng gửi telegram"), VIOLATION);
+  });
 });
 
 describe("R1-F2 — negation suppression scope is bounded", () => {

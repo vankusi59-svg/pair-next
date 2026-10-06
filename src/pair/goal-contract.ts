@@ -105,7 +105,7 @@ function splitClauses(goal: string): string[] {
  *  vocabulary, not an open stopword scan. Multi-word triggers
  *  (`không được|không đc|không nên`) keep matching explicitly. */
 const PROHIBITION_RE =
-  /\b(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?!\s*(?:quá|hơn|phải|có|được|nên|cần|đủ|đúng|sai|thấy|biết|khác|giống|cùng|ít|nhiều|xa|gần|cao|thấp|tốt|xấu|rõ|dễ|khó|lớn|nhỏ|chắc|hết|xong|muốn|tồn tại|hiện có|liên quan)(?=\s|$)))\b/iu;
+  /(?<![\p{L}\p{N}])(?:do not|don't|do n't|never|must not|shall not|may not|cannot|không được|không đc|không nên|đừng|cấm|tránh|không(?!\s*(?:quá|hơn|phải|có|được|nên|cần|đủ|đúng|sai|thấy|biết|khác|giống|cùng|ít|nhiều|xa|gần|cao|thấp|tốt|xấu|rõ|dễ|khó|lớn|nhỏ|chắc|hết|xong|muốn|tồn tại|hiện có|liên quan)(?=\s|$)))\b/iu;
 
 /** Bounded forbidden-action vocabulary — the role PROHIBITED_VERB_STRIP
  *  was declared for, made real: a prohibition bans a PERFORMING action

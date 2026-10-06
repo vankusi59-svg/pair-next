@@ -93,3 +93,22 @@ F1.a–c (budget/obligation survival + natural bans), F2.a–d (breaker fail-clo
 - Negation window ≤2 whitespace-separated tokens; a distant negation (`avoid, as noted, using`) still counts as live act — fail-closed direction.
 - `ordering` still reads trade (`orders?|ordered|ordering`); bounded.
 - Overlapping same-start hits resolve longest-first (`đăng nhập` → access, not send).
+
+---
+
+## R1.1 ADDENDUM — E2E-found `đừng` dead trigger (fixed in-place)
+
+Post-R1 end-to-end testing on a scratch stack (port 8790, real codex-sol planner, fresh DB, prod untouched) proved the gate works on BOTH `1033019` and `6c952da`, and surfaced one surviving hole in the same regex this PR owns:
+
+- **`đừng` was dead code** — JS `\b` is ASCII-only; leading `đ` is non-word so `\b(?:…|đừng|…)` never matched a `đừng`-initial trigger (e.g. `Đừng gửi telegram` → zero prohibitions minted). Fix: `PROHIBITION_RE` leading `\b` → `(?<![\p{L}\p{N}])` — the same unicode-boundary move R1 applied to the action classes. Now `đừng gửi/xóa` mint `[send|delete]` and enforce (F1.d test, 30/30 focused).
+
+### E2E evidence (testing agent, scratch stack)
+| Case | `1033019` | `6c952da` |
+|---|---|---|
+| VI conditional-prohibition mql5 goal (the production incident shape) | ✅ plan minted via real planner → mission **COMPLETED**, real `outbox/mql5_ea5.txt` + TELEGRAM_DELIVERY_MINTED | ✅ identical — COMPLETED |
+| `do not delete report.md` + check/write plan | ✅ minted + committed (runtime later aborts on `DEPENDENCY_RESOLUTION` — planner declared the file consumed; separate upstream quirk, gate unaffected) | ✅ identical |
+| NEGATIVE: ban + request telegram | ✅ 409 `FAIL_CLOSED_PLANNER_EXHAUSTED`, no mission | ✅ identical |
+| Canonicalize seam, 8 adversarial cases | ✅ 8/8 | ✅ 8/8 |
+
+### Residual advisories (documented, not fixed — out of mandate)
+- **Existence-check runtime abort**: planner declares `report.md` a consumed input of "check whether it exists" → `DEPENDENCY_FAILURE`/`PLAN_DATAFLOW_UNBOUND` abort post-commit. Gate minted correctly; upstream planner-emission quirk.
