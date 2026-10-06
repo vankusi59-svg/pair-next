@@ -321,8 +321,8 @@ describe("E3 — planner text can never mint authority", () => {
     // canonicalizer prunes the non-dataflow edge, and the emitted
     // canonical DAG is acyclic — the mission-issue seam agrees.
     const cyclic = [
-      bare("T1", "Đọc a.txt.", ["FILE_OPERATIONS"], ["T2"]),
-      bare("T2", "Đọc b.txt.", ["FILE_OPERATIONS"], ["T1"]),
+      bare("T1", "Đọc dữ liệu đầu vào.", ["FILE_OPERATIONS"], ["T2"]),
+      bare("T2", "Đọc dữ liệu thứ hai.", ["FILE_OPERATIONS"], ["T1"]),
     ];
     const cycOut = canon(cyclic, "Đọc file.");
     expect(() => assertPlanDataflow(cycOut)).not.toThrow();
@@ -339,7 +339,7 @@ describe("E3 — planner text can never mint authority", () => {
         ["TELEGRAM_DELIVERY"],
         ["T1"],
       ),
-      bare("T3", "Đọc lại r.txt để kiểm tra.", ["FILE_OPERATIONS"], ["T2"]),
+      bare("T3", "Đọc lại outbox/r.txt để kiểm tra.", ["FILE_OPERATIONS"], ["T2"]),
     ];
     const f = canonFail(() => canon(forwardEdge, goal));
     expect(f?.code).toBe("FAIL_CLOSED_PLAN_DATAFLOW_ORDER");
@@ -555,7 +555,7 @@ describe("R1.B — coverage subject evidence excludes action tokens", () => {
     expect(obl).toBeTruthy();
     const f = canonPlan(
       "Tóm tắt mục đích dự án. Lưu vào outbox/aquascope_review.txt.",
-      "Đọc aquascope_source.txt và viết tóm tắt tiếng Việt về mục đích dự án vào outbox/aquascope_review.txt.",
+      "Đọc dữ liệu nguồn và viết tóm tắt tiếng Việt về mục đích dự án vào outbox/aquascope_review.txt.",
     );
     expect(f).toBeNull();
   });

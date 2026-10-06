@@ -233,7 +233,7 @@ const CONSTRAINT_RE =
 const BUDGET_RE =
   /\bbudget\b[^\d]{0,20}(\d+(?:\.\d+)?)|\bngân sách\b[^\d]{0,20}(\d+(?:\.\d+)?)|\$(\d+(?:\.\d+)?)\s*(?:budget|max|tối đa)/i;
 
-const FILE_RE = /\b([\w][\w.-]*\.(?:md|txt|json|csv|pdf|html?|png|jpe?g|webp|svg|ts|tsx|js|mjs|py|ipynb|docx?|xlsx|zip|mq[45]))\b/gi;
+const FILE_RE = /\b((?:[\w-]+\/)*[\w][\w.-]*\.(?:md|txt|json|csv|pdf|html?|png|jpe?g|webp|svg|ts|tsx|js|mjs|py|ipynb|docx?|xlsx|zip|mq[45]))\b/gi;
 
 const PRODUCE_VERB_RE =
   /\b(?:create|write|produce|generate|save|draft|export|render|emit|build|tạo|viết|soạn|lưu|xuất|sinh|render)/iu;
