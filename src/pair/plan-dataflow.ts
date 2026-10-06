@@ -340,6 +340,74 @@ const DESTINATION_ADJACENT = /\b(?:to|into|onto|inside|in|vào|trong)\s*$/i;
 // stay consumes under their governing read/use semantics.
 const DESTINATION_GAP = /\b(?:to|into|onto|inside|vào|trong)(?:\s+[\w-]+){1,5}\s*$/i;
 
+/* --- DEBT A: negative space for dotted tokens -------------------------
+ * PATH_TOKEN's catch-all `name.[A-Za-z0-9]{1,10}` shape also matches
+ * dotted identifiers that are never workspace artifacts — hostnames
+ * ("website github.com" minted consumes:["github.com"] and killed the
+ * live hermes-agent plan with UNBOUND_INPUT), version strings ("v1.2",
+ * "gpt-6.1"), and web-doc references ("node.js docs"). Rejection lives
+ * only on this instruction free-text seam: normalizeArtifactPath() also
+ * validates structured/authoritative declarations where "notes.io" is a
+ * legitimate name, so the host check must NOT be global. */
+const TLD_LIKE_EXT = new Set([
+  "com", "org", "net", "io", "ai", "dev", "app", "xyz", "info",
+  "co", "gov", "edu", "me", "us", "site", "online", "cloud",
+]);
+// Web-flavored markers that make a single-segment dotted token an
+// external identifier rather than a workspace file — "website node.js",
+// "node.js docs". Consulted only after the numeric/TLD shape checks, so
+// ".js" stays mintable in file context ("Đọc file node.js").
+const EXTERNAL_MARKER_BEFORE =
+  /(?:website|web\s?site|docs?|documentation|blog|forum|homepage)\s*$/iu;
+const EXTERNAL_MARKER_AFTER =
+  /^\s*(?:docs?|documentation|website|web\s?site|blog|forum|homepage)\b/i;
+
+function isNonArtifactDottedToken(
+  token: string,
+  before: string,
+  after: string,
+): boolean {
+  if (token.includes("/")) return false; // directory-carrying = real path
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const ext = token.slice(dot + 1).toLowerCase();
+  if (/^\d+$/.test(ext)) return true; // v1.2 / gpt-6.1 — version, not file
+  if (TLD_LIKE_EXT.has(ext)) return true; // github.com — host, not file
+  if (EXTERNAL_MARKER_BEFORE.test(before)) return true;
+  if (EXTERNAL_MARKER_AFTER.test(after)) return true;
+  return false;
+}
+
+/* Negated VI write — "không|chưa|đừng [có|được|được phép] <produce-verb>
+ * [≤5 modifier words] trong|vào X", optionally prefixed by `đã`. A
+ * prohibition carries neither read evidence nor write authority: the
+ * mention mints NOTHING (a minted produce would fabricate a producer
+ * and mask a missing real one downstream). The guard is anchored at
+ * the very end of the tail window so a negation in an earlier clause
+ * never poisons a later affirmative write — "Không truy cập Internet.
+ * Ghi kết quả vào report.md" still produces report.md. Checked before
+ * the passive and destination rules so the produce verb can't re-mint
+ * through those paths. */
+const NEGATED_WRITE_VI =
+  /(?:đã\s+)?(?:không|chưa|đừng)\s+(?:(?:có|được(?:\s+phép)?)\s+)?(?:ghi|viết|soạn|lưu|xuất|tạo|sinh|xây\s+dựng|kết\s+xuất)(?:\s+[\p{L}\p{N}-]+){0,5}\s+(?:trong|vào)\s*$/iu;
+
+/* Passive VI reference — bounded per-phrase semantics, never an
+ * unconditional demote:
+ *   "(đã) được <produce-verb> trong X" — containment/reference: can
+ *   never mint produce (a passive mention grants no write authority),
+ *   and mints consume ONLY when the text before the passive phrase
+ *   independently shows a read/reference verb ("Đọc các phát hiện đã
+ *   được ghi trong X" — `đọc` proves the read). Without independent
+ *   evidence the mention is ignored, never guessed.
+ *   "(đã) được <produce-verb> vào X" — passive destination: `vào`
+ *   keeps output semantics ("Kết quả được ghi vào report.md"), the
+ *   mention stays a produce and never demotes to consume.
+ *   A negated passive ("không|đừng|chưa được ghi …") is a prohibition:
+ *   neither consume nor produce — prohibition is not read evidence.
+ * Group 1 = optional negation, group 2 = the preposition. */
+const PASSIVE_VI =
+  /(?:(không|đừng|chưa)\s+)?(?:đã\s+)?được\s+(?:ghi|viết|soạn|lưu|xuất|tạo|sinh|xây\s+dựng|kết\s+xuất)\s+(trong|vào)\s*$/iu;
+
 /** Nearest governing verb before a path mention: the LAST consume/produce
  *  verb inside the bounded lookback window wins — "read input.txt then
  *  generate report.txt" attributes `report.txt` to `generate` (produce),
@@ -460,8 +528,32 @@ function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
     if (!p) continue;
     const before = instruction.slice(Math.max(0, m.index - 120), m.index);
     const tail = before.slice(-48);
+    const after = instruction.slice(
+      m.index + m[0].length,
+      m.index + m[0].length + 48,
+    );
+    if (isNonArtifactDottedToken(p, tail, after)) continue;
     const near = nearestVerbMatch(before);
     const role = near?.role ?? null;
+    // Negated write — prohibition mints neither consume nor produce.
+    if (NEGATED_WRITE_VI.test(tail)) continue;
+    // Passive VI reference — bounded: negation mints nothing; `vào`
+    // keeps destination produce; `trong` consumes only with independent
+    // read evidence left of the passive phrase, else the mention is
+    // ignored rather than guessed.
+    const passive = PASSIVE_VI.exec(tail);
+    if (passive !== null) {
+      if (passive[1] !== undefined) continue; // prohibition
+      if (passive[2].toLowerCase() === "vào") {
+        produces.add(p);
+        continue;
+      }
+      const rest = before.slice(0, before.length - passive[0].length);
+      if (nearestVerbMatch(rest)?.role === "consume") {
+        consumes.add(p);
+      }
+      continue;
+    }
     // Destination markers (adjacent or modifier-separated) mint a produce
     // ONLY under a governing produce/transform verb or a transfer verb —
     // "write report to report.md" produces report.md; "copy input.csv to
