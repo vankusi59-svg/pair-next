@@ -249,36 +249,11 @@ const PLAN_SCHEMA = {
           task_instruction: { type: "string" },
           required_capabilities: { type: "array", items: { type: "string" } },
           depends_on: { type: "array", items: { type: "string" } },
-          // Coverage hint — OPTIONAL proposal (planner-contract
-          // simplification: PAIR derives coverage existentially, the
-          // model may attach ids as evidence). Normalized into
-          // metadata.pair_coverage by the shared sanitize seam.
-          pair_coverage: { type: "array", items: { type: "string" } },
-          // Advisory network/source requirement — OPTIONAL hint under
-          // the simplified planner contract (PAIR derives authority);
-          // enum-constrained so an emitted field can never carry an
-          // invalid kind/intent/freshness. Normalized into
-          // metadata.network_requirement by the shared sanitize seam.
-          network_requirement: {
-            type: "object",
-            additionalProperties: false,
-            required: ["source_kind", "access_intent", "freshness", "source_locator"],
-            properties: {
-              source_kind: {
-                type: "string",
-                enum: ["LOCAL", "EXTERNAL_SITE", "EXTERNAL_API", "REMOTE_REPOSITORY", "UNKNOWN"],
-              },
-              access_intent: {
-                type: "string",
-                enum: ["NONE", "READ", "RESEARCH", "FETCH"],
-              },
-              freshness: {
-                type: "string",
-                enum: ["NOT_REQUIRED", "REQUIRED", "UNKNOWN"],
-              },
-              source_locator: { type: ["string", "null"] },
-            },
-          },
+          // pair_coverage / network_requirement are deliberately NOT in
+          // this schema: the strict-output API rejects any properties key
+          // missing from `required`, and optional fields are inexpressible.
+          // PAIR derives both itself; a stray emission is still normalized
+          // by the shared sanitize seam on other lanes.
         },
       },
     },

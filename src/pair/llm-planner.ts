@@ -913,7 +913,7 @@ Output ONLY a JSON object: {"tasks": [...]}. Each task is a WORK task — work t
 - "title": short label
 - "task_instruction": self-contained instruction for an autonomous executor agent. It must name the REAL WORK the operator asked for — carry the goal's subject matter verbatim into the instruction (e.g. goal "phân tích giá vàng hôm nay" → instruction "analyze today's gold price using ICT concepts — market structure, liquidity, order blocks — and write findings to analysis.txt"). NEVER emit meta-instructions like "analyze the goal" or "summarize the mission". Mention workspace-relative file paths when files must be read/written (e.g. "read mission_goal.txt", "write result to out.txt"). The executor runs inside the mission workspace.
 - "required_capabilities": subset of the ALLOWED_CAPABILITIES list — pick the minimum needed. The router maps capabilities to executors; you never name an executor.
-- "network_requirement": OPTIONAL advisory hint only — PAIR derives each task's network requirement itself from the instruction and the goal, and binds NETWORK_ACCESS itself; you never need to mint it. If you do emit it: {"source_kind": "LOCAL"|"EXTERNAL_SITE"|"EXTERNAL_API"|"REMOTE_REPOSITORY"|"UNKNOWN", "access_intent": "NONE"|"READ"|"RESEARCH"|"FETCH", "freshness": "NOT_REQUIRED"|"REQUIRED"|"UNKNOWN", "source_locator": optional string} describing WHERE the task's INPUT data comes from — it is a hint, never authority; PAIR and runtime policy decide the actual network permission. When in doubt, omit it.
+- Do NOT emit "network_requirement" — PAIR derives each task's network requirement itself from the instruction and the goal, and binds NETWORK_ACCESS itself; the emission schema does not carry the field and it is never authority. PAIR and runtime policy decide the actual network permission.
 - EXTERNAL SOURCE CHOICE: if the operator's goal names a website/host, tasks must use exactly that source (its subdomains are fine) — do not substitute a different site. If the operator asks for current/external research WITHOUT naming a source, the task instruction may and should name an appropriate real source (e.g. "Fetch current gold prices from tradingview.com") — plan-level source selection is allowed; PAIR and runtime policy still decide actual network permission.
 - "depends_on": earlier task_keys only (DAG, acyclic). MUST list every task whose output this task needs: if it reads/copies/delivers a file another task writes, or uses its returned result, the producer goes in depends_on. Undeclared inputs make the task run before its data exists. Independent tasks stay parallel — only real producers are dependencies.
 
@@ -950,10 +950,9 @@ export function buildPlannerUserPrompt(
   const workTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
   // PRV2-B — the planner receives the canonical Goal Contract alongside
   // the raw goal. The contract is read-only authority: the model must
-  // cover it, never mutate it, never invent requirements, never
-  // downgrade quantities, and may attach "pair_coverage": ["OBL_001",
-  // ...] to a task's metadata as a PROPOSAL only — PAIR verifies every
-  // requirement independently and a fabricated mapping fails closed.
+  // cover it, never mutate it, never invent requirements, and never
+  // downgrade quantities — PAIR verifies every requirement
+  // independently and a fabricated claim fails closed.
   const contract = extractGoalContract(goal);
   const reqLines = [
     ...contract.obligations.map((r) => `${r.id} obligation: ${r.text}`),
@@ -966,7 +965,7 @@ export function buildPlannerUserPrompt(
     ? `GOAL CONTRACT (canonical — you must cover it, not change it):\n` +
       reqLines.join("\n") +
       `\nEvery obligation needs ≥1 real work task performing that work; every deliverable needs a task that produces the exact named file; no task may contradict a constraint or do anything a prohibition forbids; quantities stated in the contract must be preserved verbatim. ` +
-      `COVERAGE MAP (optional hint): a work task MAY carry "pair_coverage": ["REQ_ID", ...] naming the OBL_* and DEL_* rows it performs. PAIR derives and verifies coverage itself from your tasks — an unclaimed row that a task genuinely performs still passes; a claimed row the task does NOT actually perform is fabricated evidence and fails the plan closed. Never claim CON_*, PRO_* or DDL_* rows (PAIR checks those directly) and never invent requirement ids. When in doubt, omit the field.\n`
+      `PAIR derives and verifies coverage itself from your tasks — an obligation a task genuinely performs passes without any claim; a claimed row a task does NOT actually perform is fabricated evidence and fails the plan closed. Do NOT emit "pair_coverage" — the emission schema does not carry it.\n`
     : "";
   return (
     `ALLOWED_CAPABILITIES: ${cfg.allowedCapabilities.sort().join(", ")}\n` +
