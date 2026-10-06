@@ -378,6 +378,19 @@ function isNonArtifactDottedToken(
   return false;
 }
 
+/* Negated VI write — "không|chưa|đừng [có|được|được phép] <produce-verb>
+ * [≤5 modifier words] trong|vào X", optionally prefixed by `đã`. A
+ * prohibition carries neither read evidence nor write authority: the
+ * mention mints NOTHING (a minted produce would fabricate a producer
+ * and mask a missing real one downstream). The guard is anchored at
+ * the very end of the tail window so a negation in an earlier clause
+ * never poisons a later affirmative write — "Không truy cập Internet.
+ * Ghi kết quả vào report.md" still produces report.md. Checked before
+ * the passive and destination rules so the produce verb can't re-mint
+ * through those paths. */
+const NEGATED_WRITE_VI =
+  /(?:đã\s+)?(?:không|chưa|đừng)\s+(?:(?:có|được(?:\s+phép)?)\s+)?(?:ghi|viết|soạn|lưu|xuất|tạo|sinh|xây\s+dựng|kết\s+xuất)(?:\s+[\p{L}\p{N}-]+){0,5}\s+(?:trong|vào)\s*$/iu;
+
 /* Passive VI reference — bounded per-phrase semantics, never an
  * unconditional demote:
  *   "(đã) được <produce-verb> trong X" — containment/reference: can
@@ -522,6 +535,8 @@ function instructionArtifacts(task: Record<string, unknown>): TaskDataflow {
     if (isNonArtifactDottedToken(p, tail, after)) continue;
     const near = nearestVerbMatch(before);
     const role = near?.role ?? null;
+    // Negated write — prohibition mints neither consume nor produce.
+    if (NEGATED_WRITE_VI.test(tail)) continue;
     // Passive VI reference — bounded: negation mints nothing; `vào`
     // keeps destination produce; `trong` consumes only with independent
     // read evidence left of the passive phrase, else the mention is

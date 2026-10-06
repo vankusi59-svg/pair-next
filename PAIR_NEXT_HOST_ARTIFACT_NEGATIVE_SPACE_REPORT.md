@@ -172,3 +172,58 @@ semantics: suite **36/36 PASS**. Focused 310/310; full **3809 pass / 3 fail**
 Residual: `không` only captured when adjacent to `được` (bounded negation, per
 mandate — not a negation engine); "đã không được" order form uncovered; EN
 passive uncovered.
+
+---
+
+# §R3 — audit remediation (audited HEAD `d5cd9ac`, on same PR)
+
+One bounded gap: negated writes whose negation isn't adjacent to `được`
+fell through to the ordinary nearest-verb + destination rules, so
+`Không ghi vào report.md` / `Đừng lưu trong report.md` /
+`Đã không được ghi vào report.md` / `Không được phép ghi vào report.md`
+still minted `produces:["report.md"]` — fabricated producer authority.
+
+## Rule added
+
+`NEGATED_WRITE_VI` — anchored at the very end of the 48-char tail, checked
+before the passive and destination rules inside `instructionArtifacts()`:
+
+```
+(?:đã\s+)?(?:không|chưa|đừng)\s+
+(?:(?:có|được(?:\s+phép)?)\s+)?
+(?:ghi|viết|soạn|lưu|xuất|tạo|sinh|xây\s+dựng|kết\s+xuất)
+(?:\s+[\p{L}\p{N}-]+){0,5}\s+(?:trong|vào)\s*$
+```
+
+Match → the artifact mention is ignored entirely (prohibition is neither
+read evidence nor write authority). The gap class is unicode
+(`[\p{L}\p{N}-]+` — ASCII `[\w-]` silently broke on `báo cáo`), and a
+sentence period cannot sit inside a gap word, so a negation can never
+cross a clause boundary to poison a later affirmative write:
+`Không truy cập Internet. Ghi kết quả vào report.md` still produces.
+
+Covers: `không <verb>`, `chưa <verb>`, `đừng <verb>`, `đừng có <verb>`,
+`không được <verb>`, `chưa được <verb>`, `đã không được <verb>`,
+`không được phép <verb>` — each with optional ≤5-word modifier gap
+before `trong|vào`.
+
+## Before/after (dist-verified)
+
+| Phrase | R2 | R3 |
+|---|---|---|
+| `Không ghi vào report.md` | produces (wrong) | neither |
+| `Đừng có lưu trong report.md` | produces (wrong) | neither |
+| `Đã không được ghi vào report.md` | produces (wrong) | neither |
+| `Không được phép ghi vào report.md` | produces (wrong) | neither |
+| `Không truy cập Internet. Ghi kết quả vào report.md` | produces | produces (invariant kept) |
+
+## Tests
+
++11: 8 mandated negated forms + gap-with-diacritics + earlier-clause
+invariant + affirmative/passive controls. Suite 47/47; focused 321/321;
+full **3820 pass / 3 fail** = byte-identical baseline (F4 R5.1-crash +
+2× P5 env). tsc + `rm -rf dist && npm run build` clean.
+
+Residual: EN negation (`do not write into X`) uncovered — VI-scoped;
+`không phải được` order form uncovered; gap words cannot contain digits+
+dot (still bounded).

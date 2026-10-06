@@ -251,3 +251,52 @@ describe("DEBT-A R2.B — passive semantics: vào destination / trong evidence /
     expect(d.produces).toEqual(["outbox/hermes_review.md"]);
   });
 });
+
+describe("DEBT-A R3 — negated write mints neither consume nor produce", () => {
+  const negated = [
+    "Không ghi vào report.md",
+    "Đừng ghi vào report.md",
+    "Đừng có lưu trong report.md",
+    "Chưa ghi vào report.md",
+    "Không được ghi vào report.md",
+    "Đã không được ghi vào report.md",
+    "Không được phép ghi vào report.md",
+    "Không được phép lưu trong report.md",
+  ];
+  for (const s of negated) {
+    it(`R3. "${s}" → produces [] consumes []`, () => {
+      const d = df(s);
+      expect(d.produces).toEqual([]);
+      expect(d.consumes).toEqual([]);
+    });
+  }
+
+  it("R3.gap. 'Đừng ghi báo cáo vào report.md' — modifier gap inside negated write still suppressed", () => {
+    const d = df("Đừng ghi báo cáo vào report.md");
+    expect(d.produces).toEqual([]);
+    expect(d.consumes).toEqual([]);
+  });
+
+  it("R3.invariant. 'Không truy cập Internet. Ghi kết quả vào report.md' — earlier-clause negation never poisons the write → PRODUCE", () => {
+    const d = df("Không truy cập Internet. Ghi kết quả vào report.md");
+    expect(d.produces).toEqual(["report.md"]);
+    expect(d.consumes).toEqual([]);
+  });
+
+  it("R3.controls — affirmative write/passive-destination/read-evidence unchanged", () => {
+    expect(df("Ghi vào report.md").produces).toEqual(["report.md"]);
+    expect(df("Lưu trong report.md").produces).toEqual(["report.md"]);
+    expect(df("Kết quả được ghi vào report.md").produces).toEqual([
+      "report.md",
+    ]);
+    expect(df("Báo cáo được lưu vào outbox/report.md").produces).toEqual([
+      "outbox/report.md",
+    ]);
+    const cite = df(
+      "Đọc các phát hiện đã được ghi trong hermes_findings.md",
+    );
+    expect(cite.consumes).toEqual(["hermes_findings.md"]);
+    expect(cite.produces).toEqual([]);
+    expect(df("Đọc dữ liệu trên report.md").consumes).toEqual(["report.md"]);
+  });
+});
