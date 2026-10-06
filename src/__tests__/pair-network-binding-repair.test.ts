@@ -193,24 +193,42 @@ process.stdin.on("end", () => {
     expect(out.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("T3 (unauthorized locator): REQUIRED requirement naming a host the goal never names → ZERO repair", () => {
-    const tasks = [
-      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], undefined, REQ_MQL5),
+  it("T3 (annotation is advisory): a foreign REQUIRED locator can neither GRANT a quiet task NETWORK nor DENY a fetch task it", () => {
+    // grant side: quiet instruction + REQUIRED+mql5 locator → NOT_REQUIRED
+    const quiet = [
+      workTask("T2", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], [], [], REQ_MQL5),
     ];
-    const r = repairNetworkCapabilityBinding(tasks, {
-      goal: GOAL_LOCAL, // XAUUSD — no mql5 host
+    const rQuiet = repairNetworkCapabilityBinding(quiet, {
+      goal: GOAL_LOCAL,
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    expect(r.warnings).toEqual([]);
-    expect(r.tasks[0]).toBe(tasks[0]); // untouched identity
-    expect(r.tasks[0].required_capabilities).toEqual(["REASONING"]);
+    expect(rQuiet.warnings).toEqual([]);
+    expect(rQuiet.tasks[0].required_capabilities).not.toContain("NETWORK_ACCESS");
+    // deny side: same fetch task with a locator the goal never names →
+    // the annotation is ignored; instruction+goal evidence still binds.
+    const tasks = [
+      workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], undefined, REQ_BTC),
+    ];
+    const r = repairNetworkCapabilityBinding(tasks, {
+      goal: GOAL_LOCAL,
+      allowedCapabilities: ALLOWED,
+      capabilitySets: CAP_SETS,
+    });
+    const base = repairNetworkCapabilityBinding(
+      [workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], undefined)],
+      { goal: GOAL_LOCAL, allowedCapabilities: ALLOWED, capabilitySets: CAP_SETS },
+    );
+    expect(r.warnings).toEqual(base.warnings);
+    expect(r.tasks[0].required_capabilities).toEqual(
+      base.tasks[0].required_capabilities,
+    );
   });
 
-  it("T4 (structured authority wins over prose): LOCAL-looking instruction but REQUIRED+authorized requirement → repair elevates; instruction never self-elevates alone", () => {
-    // requirement is the authority — a quiet instruction cannot suppress a
-    // declared REQUIRED requirement, and a loud one cannot elevate a
-    // declared LOCAL one.
+  it("T4 (annotation can't grant or deny): a REQUIRED annotation never elevates a quiet instruction — and a wrong LOCAL annotation never suppresses a fetch instruction", () => {
+    // A quiet instruction stays NOT_REQUIRED no matter what the
+    // annotation declares: the verdict is a pure function of
+    // instruction + goal.
     const quiet = [
       workTask("T2", "Write findings.txt then reply DONE.", ["FILE_OPERATIONS"], [], [], REQ_MQL5),
     ];
@@ -219,12 +237,9 @@ process.stdin.on("end", () => {
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    expect(markerFor(rQuiet.warnings, "T2")).toEqual([
-      "REPAIRED_NETWORK_CAPABILITY:T2",
-    ]);
+    expect(rQuiet.warnings).toEqual([]);
     expect(rQuiet.tasks[0].required_capabilities).toEqual([
       "FILE_OPERATIONS",
-      "NETWORK_ACCESS",
     ]);
     const loud = [
       workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], [], REQ_LOCAL),
@@ -234,11 +249,14 @@ process.stdin.on("end", () => {
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    expect(rLoud.warnings).toEqual([]);
-    expect(rLoud.tasks[0].required_capabilities).toEqual(["REASONING"]);
+    expect(rLoud.warnings).toEqual(["REPAIRED_NETWORK_CAPABILITY:T2"]);
+    expect(rLoud.tasks[0].required_capabilities).toEqual([
+      "NETWORK_ACCESS",
+      "REASONING",
+    ]);
   });
 
-  it("T5 (wrong subject): REQUIRED requirement for a host the goal never authorizes → no repair; INVALID gate still rejects", () => {
+  it("T5 (subject mismatch ≠ network annotation): a fetch-shaped instruction binds under an external-data goal even with a foreign locator — subject coverage is judged by other gates, never by the annotation", () => {
     const tasks = [
       workTask(
         "T2",
@@ -250,16 +268,15 @@ process.stdin.on("end", () => {
       ),
     ];
     const r = repairNetworkCapabilityBinding(tasks, {
-      goal: GOAL_NET, // names mql5.com — btc.example is unauthorized
+      goal: GOAL_NET, // demands external data; instruction names no host
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    expect(r.warnings).toEqual([]);
-    expect(r.tasks[0].required_capabilities).toEqual(["REASONING"]);
-    // canonical authority gate remains authoritative: unauthorized source → INVALID
+    expect(r.warnings).toEqual(["REPAIRED_NETWORK_CAPABILITY:T2"]);
+    // No NETWORK gate may judge this plan on the annotation; any
+    // remaining failure belongs to coverage/dataflow gates.
     const f = canonFail([BOOKKEEPING, ...r.tasks], GOAL_NET);
-    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
   });
 
   it("T6 (unservable): no executor set covers the repaired capability set → NO fabricated repair, fail-closed intact", () => {
@@ -323,14 +340,28 @@ process.stdin.on("end", () => {
   });
 
   it("T10 (gates still authoritative): the canonical network gate still fires post-repair", () => {
-    // (a) REQUIRED+unauthorized locator → INVALID (UNAUTHORIZED_SOURCE)
+    // (a) instruction-named host the goal never authorized → INVALID
+    //     (UNAUTHORIZED_SOURCE) — the one surviving fresh rejection.
     const a = canonFail(
-      [BOOKKEEPING, workTask("T2", FETCH_INSTRUCTION, ["REASONING"], [], [], REQ_BTC)],
+      [
+        BOOKKEEPING,
+        workTask(
+          "T2",
+          "Fetch https://www.btc.example/x into n.md.",
+          ["REASONING"],
+          [],
+          [],
+          REQ_MQL5,
+        ),
+      ],
       GOAL_NET,
     );
     expect(a?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
     expect(a?.detail).toContain("UNAUTHORIZED_SOURCE");
-    // (b) NOT_REQUIRED requirement + NETWORK cap → INVALID (UNAUTHORIZED_CAPABILITY)
+    // (b) NOT_REQUIRED task + a NETWORK claim → advisory claim survives
+    // (never an authority grant, never a rejection — PAIR derives the
+    // requirement; the claim merely routes to an executor whose own
+    // policy holds network)
     const b = canonFail(
       [
         BOOKKEEPING,
@@ -338,16 +369,14 @@ process.stdin.on("end", () => {
       ],
       GOAL_LOCAL,
     );
-    expect(b?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(b?.detail).toContain("UNAUTHORIZED_CAPABILITY");
-    // (c) missing field on a fresh emission → REQUIREMENT_MISSING
+    expect(b === null || !b.code.includes("NETWORK")).toBe(true);
+    // (c) missing field on a fresh emission → degrades to 'no evidence'
     const c = canonFail(
       [BOOKKEEPING, legacyTask("T2", "Write note.txt then reply DONE.", ["REASONING"])],
       GOAL_LOCAL,
     );
-    expect(c?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(c?.detail).toContain("REQUIREMENT_MISSING");
-    // (d) malformed field → REQUIREMENT_MALFORMED
+    expect(c === null || !c.code.includes("NETWORK")).toBe(true);
+    // (d) malformed field → same degradation
     const d = canonFail(
       [
         BOOKKEEPING,
@@ -358,7 +387,6 @@ process.stdin.on("end", () => {
       ],
       GOAL_LOCAL,
     );
-    expect(d?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(d?.detail).toContain("REQUIREMENT_MALFORMED");
+    expect(d === null || !d.code.includes("NETWORK")).toBe(true);
   });
 });

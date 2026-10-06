@@ -226,11 +226,15 @@ export function extractGoalHosts(goal: string): Set<string> {
   const hosts = new Set<string>();
   const g = String(goal ?? "");
   for (const m of g.matchAll(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)\]]+/gi)) {
+    // The URL charset stops at whitespace but admits sentence punctuation
+    // a writer naturally follows a URL with (`https://h, and …`): strip a
+    // trailing punctuation tail before parsing — it is never hostname.
+    const raw = m[0].replace(/[.,;:!?]+$/, "");
     try {
-      const h = new URL(m[0]).hostname.toLowerCase();
+      const h = new URL(raw).hostname.toLowerCase();
       if (h) hosts.add(stripWww(h));
     } catch {
-      const seg = requirementLocatorHost(m[0]);
+      const seg = requirementLocatorHost(raw);
       if (seg) hosts.add(seg);
     }
   }
@@ -431,8 +435,12 @@ export function resolveTaskNetworkAuthority(args: {
   /** Hosts the operator goal literally names (extractGoalHosts) — the
    *  sole authorization surface. */
   goalHosts: ReadonlySet<string>;
-  /** true = fresh planner emission (structured contract mandatory);
-   *  false = persisted plan provenance (legacy fallback allowed). */
+  /** fresh is a retained input shape only: production callers pass
+   *  `false` (persisted plans) — the fresh planner path now consumes
+   *  `resolveFreshTaskNetworkAuthority` (planner-contract simplification:
+   *  the structured field is optional advisory evidence, never a
+   *  mandatory emission). Kept intact so persisted-plan and replay
+   *  semantics stay byte-identical. */
   fresh: boolean;
 }): NetworkTaskResolution {
   const { req, state, goalHosts, fresh } = args;
@@ -479,4 +487,124 @@ export function resolveTaskNetworkAuthority(args: {
     };
   }
   return { verdict: "REQUIRED", authorized: true, reason: null, req };
+}
+
+/* ------------------------------------------------------------------ */
+/* PLANNER-CONTRACT SIMPLIFICATION — the fresh planner path            */
+/* ------------------------------------------------------------------ */
+
+/** The FRESH-emission authority verdict. Under the simplified planner
+ *  contract the structured `network_requirement` is OPTIONAL advisory
+ *  evidence — a planner annotation is never what makes a task routable.
+ *  PAIR derives the requirement deterministically from THREE bounded
+ *  evidence sources, all goal/task text (never model-minted authority):
+ *
+ *    requires  = a VALID, non-contradictory structured requirement that
+ *                semantically requires network
+ *             || the instruction detector (taskRequiresNetworkAccess —
+ *                same vocabulary persisted plans use)
+ *             || the instruction names ≥1 host-shaped token
+ *
+ *    authorization (BLOCKER authority — fail closed):
+ *      - a DECLARED source_locator host the goal never names is a minted
+ *        hostname → INVALID unconditionally (planner declarations are
+ *        never authorization — R3 authority preserved verbatim).
+ *      - an INSTRUCTION-named host must be one the goal literally names
+ *        whenever the goal names ≥1 host (a foreign host under a
+ *        host-naming goal is an authority grab → INVALID). Under a
+ *        host-free goal an instruction host is merely a source pick —
+ *        ambient executor policy decides, the host itself authorizes
+ *        nothing.
+ *      - remaining authorization surfaces: the goal's own external-data
+ *        demand (goalRequiresCurrentExternalData) or the task
+ *        instruction satisfying the goal's external subject
+ *        (instructionSatisfiesGoalSubject — the same subject binding the
+ *        plan-level gate already uses).
+ *      - a requirement with zero authorization evidence → INVALID
+ *        (UNAUTHORIZED_SOURCE), the single fresh rejection class.
+ *
+ *  Annotation defects that used to kill fresh plans now degrade to
+ *  "no structured evidence": missing/malformed/conflict fields and
+ *  internally-contradictory ones are simply ignored — they can never
+ *  mint authority and never kill a semantic plan. A planner NETWORK
+ *  capability claim is likewise advisory routing metadata, not an
+ *  authority grant: it is PAIR's verdict (bound deterministically
+ *  upstream) that decides REQUIRED, and the claim is never rejected
+ *  for contradicting an annotation PAIR ignores anyway.
+ *
+ *  REQUIRED      — needs network AND authorized → PAIR binds
+ *                  NETWORK_ACCESS (servable executor policy decides).
+ *  NOT_REQUIRED  — PAIR derived no network need; the task carries no
+ *                  PAIR-bound network authority.
+ *  INVALID       — UNAUTHORIZED_SOURCE only: a named host the operator
+ *                  goal does not authorize, or a network requirement
+ *                  with no authorization evidence of any kind. */
+export type FreshNetworkTaskResolution =
+  | { verdict: "REQUIRED" | "NOT_REQUIRED"; authorized: boolean; reason: null }
+  | { verdict: "INVALID"; authorized: false; reason: "UNAUTHORIZED_SOURCE" };
+
+export function resolveFreshTaskNetworkAuthority(args: {
+  req: NetworkRequirement | null;
+  state: NetworkRequirementFieldState;
+  /** Hosts the operator goal literally names (extractGoalHosts). */
+  goalHosts: ReadonlySet<string>;
+  /** taskRequiresNetworkAccess(instruction) — precomputed by the caller
+   *  (the detector lives in llm-planner; this module stays import-free
+   *  of it). */
+  instructionRequiresNetwork: boolean;
+  /** goalRequiresCurrentExternalData(goal) — precomputed by the caller. */
+  goalRequiresExternalData: boolean;
+  /** instructionSatisfiesGoalSubject(instruction, goal) with the
+   *  goal-actually-has-external-subject guard applied — precomputed by
+   *  the caller (the binding helpers live in llm-planner). */
+  instructionMatchesGoalSubject: boolean;
+  /** The task instruction text — instruction-named hosts are harvested
+   *  here with the same goal-host grammar. */
+  instruction: string;
+}): FreshNetworkTaskResolution {
+  const { goalHosts } = args;
+  // R1.A — the planner annotation (`args.req`, `args.state`) is
+  // intentionally UNREAD for the verdict: under the simplified contract
+  // it can neither GRANT nor DENY network authority. A wrong locator, a
+  // malformed/conflicting/contradictory field, or a self-elevating
+  // declaration all degrade to "no evidence" — the verdict is a pure
+  // function of the canonical goal + task instruction text. Host
+  // authorization stays fail-closed against hosts the INSTRUCTION
+  // itself names (goal-text authority), never against annotation text.
+  const instrHosts = extractGoalHosts(args.instruction);
+  // R2 final fresh-host policy:
+  //  - goal names hosts → every instruction-named host MUST be ⊆ them
+  //  - goal names none but demands external/current data → instruction
+  //    may SELECT its sources at plan level (runtime/executor policy
+  //    stays authoritative — plan authority ≠ network permission)
+  //  - goal names none and demands nothing external → instruction host
+  //    is unauthorized
+  if (instrHosts.size > 0 && goalHosts.size === 0) {
+    if (!args.goalRequiresExternalData) {
+      return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
+    }
+  } else {
+    for (const h of instrHosts) {
+      if (!goalAuthorizesHost(h, goalHosts)) {
+        return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
+      }
+    }
+  }
+  // Derived requirement: only the instruction's own wording + its named
+  // hosts can create network need — never the annotation.
+  const requires = args.instructionRequiresNetwork || instrHosts.size > 0;
+  if (!requires) {
+    return { verdict: "NOT_REQUIRED", authorized: false, reason: null };
+  }
+  // Authorization surfaces (goal-text only): instruction-named host ⊆
+  // goal hosts (already enforced above), the goal's own external-data
+  // demand, or the instruction satisfying the goal's external subject.
+  const authorized =
+    (instrHosts.size > 0 && goalHosts.size > 0) ||
+    args.goalRequiresExternalData ||
+    args.instructionMatchesGoalSubject;
+  if (!authorized) {
+    return { verdict: "INVALID", authorized: false, reason: "UNAUTHORIZED_SOURCE" };
+  }
+  return { verdict: "REQUIRED", authorized: true, reason: null };
 }

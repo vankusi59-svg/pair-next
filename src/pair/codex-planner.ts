@@ -242,19 +242,21 @@ const PLAN_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on", "pair_coverage", "network_requirement"],
+        required: ["task_key", "title", "task_instruction", "required_capabilities", "depends_on"],
         properties: {
           task_key: { type: "string" },
           title: { type: "string" },
           task_instruction: { type: "string" },
           required_capabilities: { type: "array", items: { type: "string" } },
           depends_on: { type: "array", items: { type: "string" } },
-          // P-COVMAP — the mandatory Goal Contract coverage checklist; a
-          // task covering nothing emits []. Normalized into
+          // Coverage hint — OPTIONAL proposal (planner-contract
+          // simplification: PAIR derives coverage existentially, the
+          // model may attach ids as evidence). Normalized into
           // metadata.pair_coverage by the shared sanitize seam.
           pair_coverage: { type: "array", items: { type: "string" } },
-          // R1 — the mandatory structured network/source requirement;
-          // enum-constrained so the strict transport can never emit an
+          // Advisory network/source requirement — OPTIONAL hint under
+          // the simplified planner contract (PAIR derives authority);
+          // enum-constrained so an emitted field can never carry an
           // invalid kind/intent/freshness. Normalized into
           // metadata.network_requirement by the shared sanitize seam.
           network_requirement: {

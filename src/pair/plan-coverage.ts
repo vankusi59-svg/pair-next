@@ -109,13 +109,47 @@ const CONTENT_TOKEN_STOP = new Set([
   "fewer", "up", "down", "out",
 ]);
 
+/** Vietnamese action/verb tokens (bounded — mirrors the VI alternations
+ *  already declared in VERB_CLASSES): the action itself is never subject
+ *  evidence, so "tóm tắt thời tiết" can never cover "tóm tắt mục đích
+ *  dự án" by sharing "tóm". Kept to unambiguous action lexemes ≥3 chars —
+ *  noun-shaped tokens (`giá`, `báo`, `bản`, `hạng`, `tính`, `đồ`) stay
+ *  OUT: they carry subject identity and the subject-class map already
+ *  routes them. */
+const CONTENT_TOKEN_VI_ACTION_STOP = new Set([
+  "tóm", "tắt", // tóm tắt — summarize
+  "phân", "tích", // phân tích — analyze
+  "nghiên", "cứu", // nghiên cứu — research
+  "khảo", "sát", // khảo sát — survey
+  "thu", "thập", // thu thập — collect
+  "tìm", "tra", "lấy", "tải", "cào", // find/lookup/get/download/scrape
+  "xem", "xét", "đánh", // xem xét / đánh giá — review/assess
+  "sánh", "đối", "chiếu", // so sánh / đối chiếu — compare
+  "xuất", "xác", "định", // đề xuất / xác định — propose/identify
+  "tạo", "viết", "soạn", "lưu", "xây", "dựng", // create/write/draft/save/build
+  "phát", "triển", "thiết", // phát triển / thiết kế — develop/design
+  "ước", // ước tính — estimate
+  "vẽ", "biểu", // vẽ / biểu đồ — plot/chart
+  "kiểm", "theo", "dõi", "giám", // kiểm tra / theo dõi / giám sát — test/monitor
+  "dịch", "liệt", "xếp", "chọn", // dịch / liệt kê / xếp hạng / chọn — translate/list/rank/select
+  "đọc", "ghi", "gửi", "xóa", "sửa", // read/write/send/delete/modify
+]);
+
 /** Content-bearing tokens of a requirement clause — the subject words
- *  a covering task must share when no identity anchor exists. */
+ *  a covering task must share when no identity anchor exists. Unicode
+ *  letters are the token charset: diacritics-bearing text (Vietnamese
+ *  obligations like `tóm tắt mục đích dự án`) otherwise shatters into
+ *  sub-3 fragments and can never produce evidence. */
 function contentTokens(text: string): Set<string> {
   const out = new Set<string>();
-  for (const m of text.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+  for (const m of text.toLowerCase().matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0];
-    if (w.length < 3 || /^\d+$/.test(w) || CONTENT_TOKEN_STOP.has(w)) continue;
+    if (
+      w.length < 3 ||
+      /^\d+$/.test(w) ||
+      CONTENT_TOKEN_STOP.has(w) ||
+      CONTENT_TOKEN_VI_ACTION_STOP.has(w)
+    ) continue;
     out.add(w);
   }
   return out;
@@ -125,7 +159,7 @@ function sharesContentToken(reqText: string, taskText: string): boolean {
   const req = contentTokens(reqText);
   if (!req.size) return false;
   const task = new Set<string>();
-  for (const m of taskText.toLowerCase().matchAll(/[a-z0-9]+/g)) {
+  for (const m of taskText.toLowerCase().matchAll(/[\p{L}\p{N}]+/gu)) {
     const w = m[0];
     task.add(w);
     if (w.endsWith("s")) task.add(w.slice(0, -1));
@@ -496,43 +530,16 @@ export function assertPlanCoverage(
     }
   }
 
-  // P-COVMAP — the coverage map is a MANDATORY checklist: when the
-  // contract has mandatory rows, every work task must carry a (possibly
-  // empty) pair_coverage array, and every OBL_*/DEL_* id must be claimed
-  // by at least one work task. A missing declaration is its own failure
-  // class — FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED — distinct from
-  // PLAN_INCOMPLETE (declared coverage proved insufficient). A contract
-  // with zero OBL/DEL rows leaves this gate a no-op, as before.
-  const expectedIds = [
-    ...contract.obligations.map((r) => r.id),
-    ...contract.deliverables.map((r) => r.id),
-  ];
-  if (expectedIds.length) {
-    const declared = new Set<string>();
-    const undeclaredTasks: string[] = [];
-    for (const t of work) {
-      const pc = ((t.metadata ?? {}) as Record<string, unknown>).pair_coverage;
-      if (!Array.isArray(pc)) {
-        undeclaredTasks.push(String(t.task_key));
-        continue;
-      }
-      for (const id of pc) declared.add(String(id));
-    }
-    const missing = expectedIds.filter((id) => !declared.has(id));
-    if (missing.length || undeclaredTasks.length) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED",
-        JSON.stringify({
-          requirements: missing.slice(0, 16),
-          reason: "UNDECLARED",
-          missing_count: missing.length,
-          ...(undeclaredTasks.length
-            ? { undeclared_tasks: undeclaredTasks.slice(0, 8) }
-            : {}),
-        }),
-      );
-    }
-  }
+  // PLANNER-CONTRACT SIMPLIFICATION — `pair_coverage` is a HINT, never a
+  // mandate: a work task is no longer required to declare the map, and
+  // an unclaimed row can never kill a plan by bookkeeping alone. PAIR
+  // derives coverage existentially below — the same covers() evidence
+  // the claim validator uses — so a task genuinely performing an
+  // obligation satisfies it whether or not the model annotated it.
+  // What still fails closed: a DECLARED claim the task does not
+  // actually perform (validated above — fabricated evidence, never an
+  // authority grant), a claim on PAIR bookkeeping (above), and any row
+  // no task existentially provides (PLAN_INCOMPLETE below).
 
   const incomplete = (req: GoalRequirement): never => {
     throw new IntegrityError(

@@ -35,11 +35,14 @@ import {
   taskRequiresNetworkAccess,
   instructionIsDataGathering,
   instructionSatisfiesGoalSubject,
+  externalSubjectKeys,
+  subjectAnchors,
 } from "./llm-planner.js";
 import {
   extractGoalHosts,
   FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
   networkRequirementFieldState,
+  resolveFreshTaskNetworkAuthority,
   resolveTaskNetworkAuthority,
   type NetworkRequirement,
 } from "./network-requirement.js";
@@ -195,36 +198,54 @@ export function makeServeCanonicalizer(deps: {
       deps.executorCapSets() as never[],
     );
     if (!tasks.length) return [] as Array<Record<string, unknown>>;
-    // PRV2-A R2 + NETWORK-REQ R1/R2 — deterministic network-requirement
-    // authority at the canonical seam (prompt wording is guidance, not
-    // authority). ONE shared verdict (`resolveTaskNetworkAuthority`)
-    // decides each task:
-    //  INVALID  — missing/malformed/conflict field under the fresh
-    //     contract, internal contradiction, or a semantically-required
-    //     source the operator goal never authorized → typed candidate
-    //     rejection (`FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID`),
-    //     never a silent pick.
-    //  REQUIRED — semantically required AND operator-authorized (the
-    //     declared locator host is one the goal itself names): the task
-    //     must carry NETWORK_ACCESS (repair adds it when servable).
-    //  NOT_REQUIRED — structured field says no network: vocabulary can
-    //     never override it, and a NETWORK_ACCESS claim is UNAUTHORIZED.
-    //  LEGACY   — no structured evidence on a provably persisted plan
-    //     (ctx.provenance === "persisted"): the legacy instruction/goal
-    //     detectors decide, exactly as pre-contract plans did.
-    // Provenance is CALL-SITE context, never inferred from data: every
-    // planner transport is fresh by default; only the stored
-    // `metadata.llm_plan` path marks persisted.
+    // PRV2-A R2 + NETWORK-REQ R1/R2 + PLANNER-CONTRACT SIMPLIFICATION —
+    // deterministic network authority at the canonical seam (prompt
+    // wording is guidance, never authority). Provenance picks the
+    // verdict, CALL-SITE context never inferred from data:
+    //  FRESH (every planner transport): resolveFreshTaskNetworkAuthority
+    //    — PAIR derives the requirement itself from goal + instruction
+    //    text alone (fetch-shaped instruction, or an instruction-named
+    //    host). The structured field is advisory metadata that is never
+    //    read for the verdict: it can neither grant nor deny authority,
+    //    so wrong/malformed/conflicting annotations never reject. The
+    //    single fresh rejection class is
+    //    UNAUTHORIZED_SOURCE — an instruction-named host the goal does
+    //    not authorize, or a derived requirement with zero authorization
+    //    evidence.
+    //    REQUIRED  — needs network AND authorized: PAIR binds
+    //      NETWORK_ACCESS upstream (repair, servable by executor policy).
+    //    NOT_REQUIRED — no derived need; a planner NETWORK_ACCESS claim
+    //      is advisory routing metadata, not a rejection reason.
+    //  PERSISTED (metadata.llm_plan only): the pre-simplification
+    //    verdict (resolveTaskNetworkAuthority) is preserved verbatim —
+    //    LEGACY detectors, NOT_REQUIRED+claim → UNAUTHORIZED_CAPABILITY.
     const netFresh = ctx?.provenance !== "persisted";
     const netGoalHosts = extractGoalHosts(goal);
-    const taskNetRes = (t: Record<string, unknown>) =>
-      resolveTaskNetworkAuthority({
-        req: ((t.metadata as Record<string, unknown> | undefined)
-          ?.network_requirement ?? null) as NetworkRequirement | null,
-        state: networkRequirementFieldState(t),
-        goalHosts: netGoalHosts,
-        fresh: netFresh,
-      });
+    const netGoalDemand = goalRequiresCurrentExternalData(goal);
+    const netGoalHasSubject =
+      externalSubjectKeys(goal).size > 0 || subjectAnchors(goal).size > 0;
+    const taskNetRes = (t: Record<string, unknown>) => {
+      const md = (t.metadata ?? {}) as Record<string, unknown>;
+      const instr = String(t.task_instruction ?? "");
+      return netFresh
+        ? resolveFreshTaskNetworkAuthority({
+            req: (md.network_requirement ?? null) as NetworkRequirement | null,
+            state: networkRequirementFieldState(t),
+            goalHosts: netGoalHosts,
+            instructionRequiresNetwork: taskRequiresNetworkAccess(instr),
+            goalRequiresExternalData: netGoalDemand,
+            instructionMatchesGoalSubject:
+              netGoalHasSubject &&
+              instructionSatisfiesGoalSubject(instr, goal),
+            instruction: instr,
+          })
+        : resolveTaskNetworkAuthority({
+            req: (md.network_requirement ?? null) as NetworkRequirement | null,
+            state: networkRequirementFieldState(t),
+            goalHosts: netGoalHosts,
+            fresh: false,
+          });
+    };
     for (const t of tasks) {
       const res = taskNetRes(t);
       if (res.verdict === "INVALID") {
@@ -237,9 +258,9 @@ export function makeServeCanonicalizer(deps: {
         );
       }
       const caps = (t.required_capabilities as string[] | undefined) ?? [];
-      if (res.verdict === "NOT_REQUIRED" && caps.includes("NETWORK_ACCESS")) {
-        // Structured field declares no network need — a NETWORK_ACCESS
-        // claim is a capability the planner could not authorize.
+      if (!netFresh && res.verdict === "NOT_REQUIRED" && caps.includes("NETWORK_ACCESS")) {
+        // Persisted-only: a structured NOT_REQUIRED field under the old
+        // contract makes a NETWORK_ACCESS claim unauthorized.
         throw new IntegrityError(
           FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID,
           JSON.stringify({

@@ -17,7 +17,12 @@
  * path: llmPlan sanitize → repair → canonicalize).
  */
 import { describe, expect, it } from "vitest";
-import { llmPlan, repairNetworkCapabilityBinding } from "../pair/llm-planner.js";
+import {
+  goalRequiresCurrentExternalData,
+  llmPlan,
+  repairNetworkCapabilityBinding,
+  taskRequiresNetworkAccess,
+} from "../pair/llm-planner.js";
 import { makeServeCanonicalizer } from "../pair/serve-planner.js";
 import { extractGoalContract } from "../pair/goal-contract.js";
 import {
@@ -26,6 +31,7 @@ import {
   networkRequirementInternalContradiction,
   parseNetworkRequirementShape,
   requirementLocatorHost,
+  resolveFreshTaskNetworkAuthority,
   resolveTaskNetworkAuthority,
   type NetworkRequirement,
 } from "../pair/network-requirement.js";
@@ -131,10 +137,10 @@ const canonFail = (fn: () => unknown): CanonFail | null => {
 };
 
 describe("R2 network-requirement authority — adversarial A–L", () => {
-  it("A: forged EXTERNAL on a math goal cannot bootstrap NETWORK (full production path)", async () => {
+  it("A: forged EXTERNAL on a math goal can neither bootstrap NETWORK nor kill a valid task (full production path)", async () => {
     // Planner emits a forged structured requirement for a source the
-    // operator goal never named — through llmPlan sanitize → repair →
-    // canonicalize, zero NETWORK_ACCESS may ever be minted.
+    // operator goal never named — under the simplified contract the
+    // annotation is advisory: it mints nothing and kills nothing.
     const raw = planJson([
       {
         task_key: "T2",
@@ -149,17 +155,30 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     ]);
     const r = await llmPlan(MATH_GOAL, { ...CFG, fetchFn: okFetch(raw) });
     const t2 = r.tasks.find((t) => t.task_key === "T2")!;
-    // repair must NOT elevate: declaration alone is never authorization.
+    // Cannot GRANT: no repair, no NETWORK_ACCESS minted from text alone.
     expect(r.warnings).not.toContain("REPAIRED_NETWORK_CAPABILITY:T2");
     expect(t2.required_capabilities).not.toContain("NETWORK_ACCESS");
-    // canonical gate rejects the candidate typed — no silent pick.
+    // Cannot DENY: the quiet task stays NOT_REQUIRED — no NETWORK gate
+    // may reject it on annotation grounds.
     const f = canonFail(() => canon(r.tasks, MATH_GOAL));
-    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
-    expect(f?.detail).toContain("T2");
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+    // The persisted/legacy path is untouched: the same annotation shape
+    // still rejects under pre-simplification provenance.
+    const legacy = resolveTaskNetworkAuthority({
+      req: EXT_REQ,
+      state: "valid",
+      goalHosts: extractGoalHosts(MATH_GOAL),
+      instructionRequiresNetwork: false,
+      goalRequiresExternalData: false,
+      instructionMatchesGoalSubject: false,
+      instruction: "Compute the square root of 144 and write math.txt.",
+      fresh: false,
+    });
+    expect(legacy.verdict).toBe("INVALID");
+    expect(legacy.reason).toBe("UNAUTHORIZED_SOURCE");
   });
 
-  it("B: forged EXTERNAL WITH a NETWORK_ACCESS claim is also rejected — cap cannot self-authorize", async () => {
+  it("B: forged EXTERNAL WITH a NETWORK_ACCESS claim is advisory — the annotation can neither convict nor authorize", async () => {
     const raw = planJson([
       {
         task_key: "T2",
@@ -173,10 +192,13 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       },
     ]);
     const r = await llmPlan(MATH_GOAL, { ...CFG, fetchFn: okFetch(raw) });
+    // A planner NETWORK_ACCESS claim + forged annotation on a quiet task
+    // is advisory routing metadata: it can neither authorize network nor
+    // convict the task — no NETWORK gate may fire on the fresh path.
     const f = canonFail(() => canon(r.tasks, MATH_GOAL));
-    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
-    // A NOT_REQUIRED task may not carry NETWORK_ACCESS at all.
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+    // And the claim itself is never auto-elevated to authority either:
+    // PAIR's own verdict decides network binding.
     const f2 = canonFail(() =>
       canon(
         [
@@ -191,8 +213,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
         "Summarize notes.md.",
       ),
     );
-    expect(f2?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(f2?.detail).toContain("UNAUTHORIZED_CAPABILITY");
+    expect(f2 === null || !f2.code.includes("NETWORK")).toBe(true);
   });
 
   it("C: exact MQL5 positive still works — goal-named host authorizes repair + canonicalize", async () => {
@@ -258,23 +279,48 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       });
       expect(r.warnings).toEqual(["REPAIRED_NETWORK_CAPABILITY:T2"]);
     }
-    // …and a math goal in any language authorizes nothing.
+    // …and a math goal in any language: a forged locator is ignored
+    // identically — the quiet instruction yields NOT_REQUIRED in every
+    // language (the annotation can neither grant nor deny, so nothing
+    // is left to authorize or reject on its text).
     for (const goal of [
       "Tính căn bậc hai của 144 và lưu vào math.txt.",
       "Compute sqrt(144) and write math.txt.",
       "144 の平方根を計算して math.txt に書く。",
     ]) {
-      const res = resolveTaskNetworkAuthority({
+      const res = resolveFreshTaskNetworkAuthority({
         req: EXT_REQ,
         state: "valid",
         goalHosts: extractGoalHosts(goal),
-        fresh: true,
+        instructionRequiresNetwork: false,
+        goalRequiresExternalData: goalRequiresCurrentExternalData(goal),
+        instructionMatchesGoalSubject: false,
+        instruction: "Compute sqrt(144) and write math.txt.",
       });
-      expect(res).toMatchObject({ verdict: "INVALID", reason: "UNAUTHORIZED_SOURCE" });
+      expect(res).toMatchObject({ verdict: "NOT_REQUIRED" });
     }
+    // …but an INSTRUCTION-named host the goal never authorized is still
+    // rejected in every language — the annotation wasn't needed for it.
+    const denied = resolveFreshTaskNetworkAuthority({
+      req: null,
+      state: "missing",
+      goalHosts: new Set(["mql5.com"]),
+      instructionRequiresNetwork: true,
+      goalRequiresExternalData: true,
+      instructionMatchesGoalSubject: false,
+      instruction: "Fetch https://btc.example/x into n.md.",
+    });
+    expect(denied).toMatchObject({
+      verdict: "INVALID",
+      reason: "UNAUTHORIZED_SOURCE",
+    });
   });
 
-  it("E: fresh HTTP planner omitting the field → REQUIREMENT_MISSING typed reject (REASK-eligible, never legacy)", async () => {
+  it("E: fresh HTTP planner omitting the field → PAIR derives the requirement itself (advisory contract)", async () => {
+    // PLANNER-CONTRACT SIMPLIFICATION: the structured field is optional
+    // advisory evidence — a missing field on a fresh emission can never
+    // kill a semantically-correct plan. PAIR derives REQUIRED from the
+    // fetch-shaped instruction + the goal's own external-data demand.
     const raw = planJson([
       {
         task_key: "T2",
@@ -284,18 +330,19 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
         required_capabilities: ["NETWORK_ACCESS", "REASONING"],
         depends_on: [],
         pair_coverage: ["OBL_001"],
-        // no network_requirement — field absent on a fresh emission
+        // no network_requirement — optional under the new contract
       },
     ]);
     const r = await llmPlan(MQL5_GOAL, { ...CFG, fetchFn: okFetch(raw) });
     const f = canonFail(() => canon(r.tasks, MQL5_GOAL));
-    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
-    expect(f?.detail).toContain("REQUIREMENT_MISSING");
-    // FAIL_CLOSED_PLAN_* is inside the pool's REASK-eligibility prefix.
-    expect(f!.code.startsWith("FAIL_CLOSED_PLAN_")).toBe(true);
+    // No network-authority rejection (a later gate may still judge).
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
   });
 
-  it("F: fresh malformed field → REQUIREMENT_MALFORMED reject, no legacy drop", async () => {
+  it("F: fresh malformed/conflict field → degrades to no evidence, PAIR derives authority", async () => {
+    // PLANNER-CONTRACT SIMPLIFICATION: a malformed advisory field degrades
+    // to 'no structured evidence' — PAIR still derives REQUIRED from the
+    // fetch-shaped instruction and binds NETWORK_ACCESS itself.
     const raw = planJson([
       {
         task_key: "T2",
@@ -309,16 +356,22 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       },
     ]);
     const r = await llmPlan(MQL5_GOAL, { ...CFG, fetchFn: okFetch(raw) });
-    // sanitize keeps the task carrying the reserved error marker — the
-    // candidate rejects typed, never silently drops to vocabulary.
+    // sanitize keeps the task carrying the reserved error marker —
+    // evidence the defect existed, but no longer a kill.
     expect(r.warnings).toContain("MALFORMED_NETWORK_REQ:T2");
     const t2 = r.tasks.find((t) => t.task_key === "T2")!;
     expect(
       (t2.metadata as Record<string, unknown>).network_requirement_error,
     ).toBe("MALFORMED");
+    // PAIR-owned binding: instruction-derived REQUIRED + authorized →
+    // repair binds the capability; the canonical gate does not reject.
+    expect(r.warnings).toContain("REPAIRED_NETWORK_CAPABILITY:T2");
+    expect(t2.required_capabilities).toContain("NETWORK_ACCESS");
     const f = canonFail(() => canon(r.tasks, MQL5_GOAL));
-    expect(f?.detail).toContain("REQUIREMENT_MALFORMED");
-    // top-level vs metadata conflict → REQUIREMENT_CONFLICT.
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
+    // top-level vs metadata conflict → same degradation: the conflict
+    // marker is kept as evidence, then PAIR decides from the
+    // instruction (local summarize → NOT_REQUIRED → no network reject).
     const raw2 = planJson([
       {
         task_key: "T2",
@@ -337,7 +390,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     });
     expect(r2.warnings).toContain("NETWORK_REQ_CONFLICT:T2");
     const f2 = canonFail(() => canon(r2.tasks, "Summarize notes.md."));
-    expect(f2?.detail).toContain("REQUIREMENT_CONFLICT");
+    expect(f2 === null || !f2.code.includes("NETWORK")).toBe(true);
   });
 
   it("G: true legacy persisted plan — provenance-gated compat path still works", () => {
@@ -385,7 +438,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     expect(f3?.code).toBe("FAIL_CLOSED_TASK_NETWORK_CAPABILITY_REQUIRED");
   });
 
-  it("H: missing field is NOT a legacy claim — fresh emission with fetch vocabulary still rejects", () => {
+  it("H: missing field on fresh emission — PAIR derives REQUIRED from the instruction (same verdict as persisted)", () => {
     const fetchTask = taskWithReq(
       "T2",
       "Fetch the latest MQL5 market data from the web into market.md.",
@@ -395,17 +448,19 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     );
     delete (fetchTask as { metadata?: unknown }).metadata;
     const goal = "Research the latest MQL5 market trends online.";
-    // Same bytes canonicalize under persisted but reject under fresh —
-    // provenance is call-site context, never inferred from the data.
+    // Same bytes canonicalize under persisted (LEGACY detectors) AND
+    // fresh (PAIR-derived REQUIRED from the fetch-shaped instruction +
+    // the goal's own external-data demand) — a missing advisory field
+    // can no longer kill a semantically correct plan.
     const fp = canonFail(() => canon([fetchTask], goal, "persisted"));
     expect(fp === null || !fp.code.includes("NETWORK")).toBe(true);
     const f = canonFail(() => canon([fetchTask], goal, "fresh"));
-    expect(f?.detail).toContain("REQUIREMENT_MISSING");
+    expect(f === null || !f.code.includes("NETWORK")).toBe(true);
     const f2 = canonFail(() => canon([fetchTask], goal)); // default = fresh
-    expect(f2?.detail).toContain("REQUIREMENT_MISSING");
+    expect(f2 === null || !f2.code.includes("NETWORK")).toBe(true);
   });
 
-  it("I: UNKNOWN declaration → zero elevation, no silent legacy detector", () => {
+  it("I: UNKNOWN declaration degrades to no evidence — instruction decides; a fetch task under a non-authorizing goal fails closed", () => {
     const unknownReq: NetworkRequirement = {
       source_kind: "UNKNOWN",
       access_intent: "READ",
@@ -418,22 +473,34 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       unknownReq,
       ["T1"],
     );
+    // UNKNOWN carries no requirement — but the instruction demands a
+    // fetch while the goal authorizes nothing → INVALID (the ONLY fresh
+    // rejection class), never silently bound and never silently dropped.
+    const res = resolveFreshTaskNetworkAuthority({
+      req: unknownReq,
+      state: "valid",
+      goalHosts: new Set(),
+      instructionRequiresNetwork: taskRequiresNetworkAccess(
+        "Fetch the latest pricing data from the web into data.md.",
+      ),
+      goalRequiresExternalData: goalRequiresCurrentExternalData(
+        "Summarize local notes.",
+      ),
+      instructionMatchesGoalSubject: false,
+      instruction: "Fetch the latest pricing data from the web into data.md.",
+    });
+    expect(res).toMatchObject({ verdict: "INVALID", reason: "UNAUTHORIZED_SOURCE" });
     const r = repairNetworkCapabilityBinding([t], {
       goal: "Summarize local notes.",
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    // no elevation — and the instruction's fetch vocabulary was never
-    // consulted (fresh structured contract).
     expect(r.warnings).toEqual([]);
     expect(r.tasks[0].required_capabilities).not.toContain("NETWORK_ACCESS");
-    const res = resolveTaskNetworkAuthority({
-      req: unknownReq,
-      state: "valid",
-      goalHosts: new Set(),
-      fresh: true,
-    });
-    expect(res.verdict).toBe("NOT_REQUIRED");
+    // and the canonical gate rejects it typed.
+    const f = canonFail(() => canon([t], "Summarize local notes.", "fresh"));
+    expect(f?.code).toBe("FAIL_CLOSED_PLAN_NETWORK_REQUIREMENT_INVALID");
+    expect(f?.detail).toContain("UNAUTHORIZED_SOURCE");
   });
 
   it("J: canonical LOCAL task with research/recency vocabulary → no NETWORK; vocabulary cannot override", () => {
@@ -448,7 +515,8 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
     // any later-gate outcome (coverage etc.) is outside this assertion.
     const f = canonFail(() => canon([t], "Summarize findings."));
     expect(f === null || !f.code.includes("NETWORK")).toBe(true);
-    // And a NETWORK_ACCESS claim on it is unauthorized.
+    // PLANNER-CONTRACT SIMPLIFICATION: a NETWORK_ACCESS claim on a
+    // NOT_REQUIRED task is advisory routing metadata, not a rejection.
     const withCap = taskWithReq(
       "T2",
       "Đọc mql5_research.txt và tổng hợp báo cáo.",
@@ -457,7 +525,7 @@ describe("R2 network-requirement authority — adversarial A–L", () => {
       ["T1"],
     );
     const f2 = canonFail(() => canon([withCap], "Summarize findings."));
-    expect(f2?.detail).toContain("UNAUTHORIZED_CAPABILITY");
+    expect(f2 === null || !f2.code.includes("NETWORK")).toBe(true);
   });
 
   it("K: locator generality — non-listed TLDs/hosts authorize by goal naming, no TLD list", () => {
@@ -579,7 +647,7 @@ describe("R1 invariants retained under R2", () => {
     expect(parseNetworkRequirementShape(EXT_REQ).ok).toBe(true);
   });
 
-  it("persisted-path repair never elevates fieldless tasks (repair is fresh-only)", () => {
+  it("fieldless fresh emission — PAIR-owned binding elevates via instruction evidence alone", () => {
     const legacyTask = taskWithReq(
       "T2",
       "Fetch the latest MQL5 market data from the web into market.md.",
@@ -588,14 +656,16 @@ describe("R1 invariants retained under R2", () => {
       ["T1"],
     );
     delete (legacyTask as { metadata?: unknown }).metadata;
-    // repair only runs on the fresh planner path — a persisted plan's
-    // fieldless task is judged by the canonicalizer's LEGACY branch.
+    // PLANNER-CONTRACT SIMPLIFICATION: a missing advisory field is no
+    // longer a repair blocker — PAIR derives REQUIRED from the
+    // fetch-shaped instruction + the goal's external-data demand and
+    // binds the capability itself (servable executor policy decides).
     const r = repairNetworkCapabilityBinding([legacyTask], {
       goal: "Research the latest MQL5 market trends online.",
       allowedCapabilities: ALLOWED,
       capabilitySets: CAP_SETS,
     });
-    // fresh verdict on missing field = INVALID → repair leaves it alone
-    expect(r.tasks[0].required_capabilities).not.toContain("NETWORK_ACCESS");
+    expect(r.warnings).toContain("REPAIRED_NETWORK_CAPABILITY:T2");
+    expect(r.tasks[0].required_capabilities).toContain("NETWORK_ACCESS");
   });
 });

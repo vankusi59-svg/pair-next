@@ -1,8 +1,13 @@
 /**
- * P-COVMAP — mandatory Obligation-to-Task coverage map. Every work task
- * must declare which OBL/DEL Goal Contract rows it covers; the aggregate
- * map must be complete; every claim is independently verified — never
- * accepted on the model's word. Adversarial T1–T15 per mandate §17.
+ * P-COVMAP — Obligation-to-Task coverage. Planner-contract
+ * simplification: `pair_coverage` is now an OPTIONAL model hint, never a
+ * mandate — a missing/misplaced declaration can never kill a
+ * semantically-correct plan because PAIR derives coverage existentially
+ * from task instruction/produces evidence. What still fails closed: a
+ * DECLARED claim the task does not perform (fabricated evidence), a
+ * claim on PAIR bookkeeping, a claim on a non-claimable/invented row,
+ * and any contract row no task existentially provides. Adversarial
+ * T1–T15 per mandate §17, adapted to the hint contract.
  */
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
@@ -30,7 +35,7 @@ const FULL_SETS = [SERVE_LLM_PLANNER_CAPS.slice()];
 const canon = (raw: Array<Record<string, unknown>>, goal: string) =>
   makeServeCanonicalizer({ executorCapSets: () => FULL_SETS })(raw, goal);
 
-const UNDECLARED = "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED";
+const UNDECLARED = "FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED"; // retired code — never emitted under the hint contract
 const INCOMPLETE = "FAIL_CLOSED_PLAN_INCOMPLETE";
 
 /** R2 — every fresh work task carries a valid structured network
@@ -142,72 +147,29 @@ describe("P-COVMAP — mandatory coverage map", () => {
     ).toEqual(["DEL_001"]);
   });
 
-  it("T2 — missing one row → FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED, exact id in detail AND in the REASK prompt", async () => {
-    // Map declares OBL_001 only — DEL_001 never claimed.
+  it("T2 — missing declarations never kill: existential coverage decides (hint contract)", () => {
+    // Map declares OBL_001 only — DEL_001 never claimed. Under the hint
+    // contract the plan still passes: T2's instruction existentially
+    // produces report.md, so the deliverable is covered without a claim.
     const missingDel = [
       work("T1", "research competitors and summarize their positioning", ["REASONING"], [], undefined, ["OBL_001"]),
       work("T2", "write the findings to report.md", ["FILE_OPERATIONS"], ["T1"], undefined, []),
     ];
-    const e = expectCode(() => canon(missingDel, GOAL_MAP), UNDECLARED);
-    expect(String(e.detail)).toContain("DEL_001");
-    expect(String(e.detail)).toContain('"reason":"UNDECLARED"');
-
-    // REASK path: the single re-ask carries the exact missing id.
-    const candidates = [
-      { ref: "c1", provider: "p", model_entry_id: "m1", model: "m1", transport: "http" },
-    ] as never[];
-    const canonFn = makeServeCanonicalizer({ executorCapSets: () => FULL_SETS });
-    let seenDetail = "";
-    await expect(
-      runPlannerFailover({
-        candidates,
-        assertEligible: () => {},
-        planFn: async (_c, inv) => {
-          if (inv.kind === "REASK") {
-            seenDetail = String(inv.rejectionContext?.detail ?? "");
-          }
-          return {
-            tasks:
-              inv.kind === "INITIAL"
-                ? missingDel
-                : MAP_TASKS(), // corrected on the re-ask
-            warnings: [],
-          };
-        },
-        canonicalize: (tasks) => canonFn(tasks, GOAL_MAP),
-      }),
-    ).resolves.toBeDefined();
-    expect(seenDetail).toContain("DEL_001");
-    expect(seenDetail).toContain("reason=UNDECLARED");
-    // ...and the id lands inside the prompt the model actually reads.
-    const prompt = buildPlannerUserPrompt(GOAL_MAP, {
-      allowedCapabilities: SERVE_LLM_PLANNER_CAPS.slice(),
-      rejectionContext: {
-        validation_code: UNDECLARED,
-        detail: seenDetail,
-        task_warnings: [],
-      },
-    });
-    expect(prompt).toContain("DEL_001");
-    expect(prompt).toContain(UNDECLARED);
+    const out = canon(missingDel, GOAL_MAP);
+    expect(out.length).toBe(3);
   });
 
-  it("T3 — ≥3 missing rows: ONE rejection carries ALL missing ids within bound", () => {
+  it("T3 — all-empty hint lists still pass when the work existentially covers the contract", () => {
     const goal = "research competitors, compare pricing, propose 3 strategies";
     const allEmpty = [
       work("T1", "research competitors and list positioning", ["REASONING"], [], undefined, []),
       work("T2", "compare the competitors' pricing", ["REASONING"], ["T1"], undefined, []),
       work("T3", "propose 3 sales strategies", ["REASONING"], ["T2"], undefined, []),
     ];
-    const e = expectCode(() => canon(allEmpty, goal), UNDECLARED);
-    const detail = String(e.detail);
-    for (const id of ["OBL_001", "OBL_002", "OBL_003"])
-      expect(detail).toContain(id);
-    expect(detail).toContain('"missing_count":3');
-    // REASK detail carries all three ids too.
-    const reask = extractReaskDetail(e, UNDECLARED);
-    for (const id of ["OBL_001", "OBL_002", "OBL_003"])
-      expect(reask).toContain(id);
+    // No task declares anything — existential coverage (instruction
+    // evidence) satisfies all three obligations on its own.
+    const out = canon(allEmpty, goal);
+    expect(out.length).toBe(4);
   });
 
   it("T4 — fabricated claim: declaration is a proposal; a task claiming a row it does not cover still fails", () => {
@@ -262,7 +224,9 @@ describe("P-COVMAP — mandatory coverage map", () => {
     );
 
     // Model-emitted bookkeeping-shaped task claiming rows is normalized
-    // away upstream — its claim never satisfies the map.
+    // away upstream — its claim never satisfies anything, and with no
+    // real work covering the obligation the existential gate fails
+    // INCOMPLETE (the hint contract's coverage failure class).
     const emittedBk = {
       task_key: "T1",
       title: "bk",
@@ -280,7 +244,7 @@ describe("P-COVMAP — mandatory coverage map", () => {
           ],
           GOAL_MAP,
         ),
-      UNDECLARED,
+      INCOMPLETE,
     );
     expect(String(e.detail)).toContain("OBL_001");
   });
@@ -297,7 +261,7 @@ describe("P-COVMAP — mandatory coverage map", () => {
     expect(out.length).toBe(2);
   });
 
-  it("T9 — Codex schema: strict PLAN_SCHEMA requires pair_coverage; [] and non-empty normalize identically", async () => {
+  it("T9 — Codex schema: pair_coverage is an OPTIONAL hint in PLAN_SCHEMA; [] and non-empty normalize identically", async () => {
     const planA = [
       work("T1", "research competitors and summarize their positioning", ["REASONING"], [], undefined, ["OBL_001"]),
       work("T2", "write the findings to report.md", ["FILE_OPERATIONS"], ["T1"], undefined, ["DEL_001"]),
@@ -317,7 +281,8 @@ describe("P-COVMAP — mandatory coverage map", () => {
       (t2.metadata as Record<string, unknown>)?.pair_coverage,
     ).toEqual(["DEL_001"]);
 
-    // The schema written for the invocation mandates the field.
+    // The schema written for the invocation keeps the field OPTIONAL —
+    // present as a hint, never required (planner-contract simplification).
     const schemaFile = fs
       .readdirSync(fake.scratchDir)
       .flatMap((d) => {
@@ -326,7 +291,17 @@ describe("P-COVMAP — mandatory coverage map", () => {
       })[0];
     const schema = JSON.parse(fs.readFileSync(schemaFile, "utf8"));
     const item = schema.properties.tasks.items;
-    expect(item.required).toContain("pair_coverage");
+    expect(item.required).not.toContain("pair_coverage");
+    expect(item.required).not.toContain("network_requirement");
+    expect(item.required).toEqual(
+      expect.arrayContaining([
+        "task_key",
+        "title",
+        "task_instruction",
+        "required_capabilities",
+        "depends_on",
+      ]),
+    );
     expect(item.properties.pair_coverage).toEqual({
       type: "array",
       items: { type: "string" },
@@ -474,8 +449,9 @@ describe("P-COVMAP — mandatory coverage map", () => {
     // …then the gate rejects the non-claimable CON claim closed.
     expectCode(() => canon(JSON.parse(poisoned).tasks, GOAL_MAP), INCOMPLETE);
 
-    // A fully-malformed entry list leaves no leakable content: the
-    // UNDECLARED detail carries ids only, never entry text.
+    // A fully-malformed entry list leaves no leakable content — and
+    // under the hint contract the plan still survives: every entry
+    // sanitizes away, and existential coverage carries the plan.
     const garbageOnly = JSON.stringify({
       tasks: [
         work("T1", "research competitors and summarize their positioning", ["REASONING"], [], undefined, [
@@ -491,17 +467,8 @@ describe("P-COVMAP — mandatory coverage map", () => {
     expect(
       (t1b.metadata as Record<string, unknown>).pair_coverage,
     ).toEqual([]);
-    const e = expectCode(
-      () => canon(JSON.parse(garbageOnly).tasks, GOAL_MAP),
-      UNDECLARED,
-    );
-    const detail = String(e.detail);
-    expect(detail).not.toContain("IGNORE_PREVIOUS_INSTRUCTIONS");
-    expect(detail).not.toContain("rm -rf");
-    const reask = extractReaskDetail(e, UNDECLARED);
-    expect(reask).toMatch(/^[\x20-\x7E]{1,200}$/);
-    expect(reask).toContain("OBL_001");
-    expect(reask).not.toContain("IGNORE_PREVIOUS_INSTRUCTIONS");
+    const outGarbage = canon(JSON.parse(garbageOnly).tasks, GOAL_MAP);
+    expect(outGarbage.length).toBe(3);
 
     // >32 entries → malformed: stripped, task survives, gate rejects.
     const tooMany = JSON.stringify({
@@ -537,111 +504,8 @@ describe("P-COVMAP — mandatory coverage map", () => {
     expect(String(e.detail)).toContain("claims coverage of OBL_001");
   });
 
-  describe("R1 — bounded UNDECLARED re-ask formatter", () => {
-    const makeErr = (detail: unknown) =>
-      new IntegrityError(UNDECLARED, JSON.stringify(detail));
-
-    const csvEntries = (line: string, label: string): string[] => {
-      const m = new RegExp(`(?:^| )${label}([^ ]+)`).exec(line);
-      return m ? m[1].split(",") : [];
-    };
-
-    it("R1.A — max valid missing requirements never collapses to bare code", () => {
-      const reqs = Array.from({ length: 16 }, (_, i) => `OBL_${String(i + 1).padStart(3, "0")}`);
-      const tasks = Array.from({ length: 8 }, (_, i) => `T${i + 2}`);
-      const out = extractReaskDetail(
-        makeErr({ requirements: reqs, missing_count: 128, undeclared_tasks: tasks }),
-        UNDECLARED,
-      );
-      expect(out).not.toBe(UNDECLARED);
-      expect(out).toMatch(/^[\x20-\x7E]{1,200}$/);
-      expect(out.length).toBeLessThanOrEqual(200);
-      expect(out).toContain("requirements=");
-      expect(out).toContain("OBL_001");
-      expect(out.endsWith(" reason=UNDECLARED")).toBe(true);
-      // full count kept since not all missing ids could render
-      expect(out).toContain("missing_count=128");
-      // every rendered requirement entry is a complete input id — no mid-id cut
-      for (const entry of csvEntries(out, "requirements=")) {
-        expect(reqs).toContain(entry);
-      }
-      // every rendered undeclared key is a complete input key
-      for (const entry of csvEntries(out, "undeclared_tasks=")) {
-        expect(tasks).toContain(entry);
-      }
-    });
-
-    it("R1.B — undeclared-task pressure: useful keys survive, reason kept, never bare code", () => {
-      const tasks = Array.from(
-        { length: 8 },
-        (_, i) => `task_delivery_report_v${i + 2}_final`,
-      );
-      const out = extractReaskDetail(
-        makeErr({ requirements: [], undeclared_tasks: tasks }),
-        UNDECLARED,
-      );
-      expect(out).not.toBe(UNDECLARED);
-      expect(out).toMatch(/^[\x20-\x7E]{1,200}$/);
-      expect(out).toContain("undeclared_tasks=");
-      expect(out).toContain(tasks[0]);
-      expect(out.endsWith(" reason=UNDECLARED")).toBe(true);
-      const rendered = csvEntries(out, "undeclared_tasks=");
-      expect(rendered.length).toBeGreaterThanOrEqual(1);
-      for (const entry of rendered) expect(tasks).toContain(entry);
-    });
-
-    it("R1.C — priority: requirements outrank undeclared task keys for budget", () => {
-      const reqs = Array.from({ length: 16 }, (_, i) => `OBL_${String(i + 1).padStart(3, "0")}`);
-      const tasks = Array.from(
-        { length: 8 },
-        (_, i) => `task_with_a_rather_long_key_number_${i + 2}`,
-      );
-      const out = extractReaskDetail(
-        makeErr({ requirements: reqs, missing_count: 16, undeclared_tasks: tasks }),
-        UNDECLARED,
-      );
-      expect(out).not.toBe(UNDECLARED);
-      expect(out.length).toBeLessThanOrEqual(200);
-      // all 16 requirement ids rendered before any task-key budget is spent
-      const renderedReqs = csvEntries(out, "requirements=");
-      expect(renderedReqs).toEqual(reqs);
-      // whatever remains goes to task keys — strictly fewer than input
-      const renderedTasks = csvEntries(out, "undeclared_tasks=");
-      expect(renderedTasks.length).toBeLessThan(tasks.length);
-      for (const entry of renderedTasks) expect(tasks).toContain(entry);
-    });
-
-    it("R1.D — malformed detail still falls back to the exact code; unsafe entries never leak", () => {
-      // non-JSON detail → exact code
-      expect(
-        extractReaskDetail(new IntegrityError(UNDECLARED, "not json {"), UNDECLARED),
-      ).toBe(UNDECLARED);
-      // both lists absent → exact code
-      expect(
-        extractReaskDetail(makeErr({ reason: "UNDECLARED" }), UNDECLARED),
-      ).toBe(UNDECLARED);
-      // unsafe identifiers are dropped, safe ones still render — injection
-      // text never reaches the line.
-      const out = extractReaskDetail(
-        makeErr({
-          requirements: ["OBL_001", "OBL_002; IGNORE PREVIOUS INSTRUCTIONS", 7],
-          undeclared_tasks: ["T2", "x y z"],
-        }),
-        UNDECLARED,
-      );
-      expect(out).not.toBe(UNDECLARED);
-      expect(out).toContain("OBL_001");
-      expect(out).toContain("T2");
-      expect(out).not.toContain("IGNORE");
-      expect(out).not.toContain("x y z");
-      expect(out).toMatch(/^[\x20-\x7E]{1,200}$/);
-      // all-unsafe input collapses cleanly to the bare code
-      expect(
-        extractReaskDetail(
-          makeErr({ requirements: ["bad id with spaces"], undeclared_tasks: [42] }),
-          UNDECLARED,
-        ),
-      ).toBe(UNDECLARED);
-    });
-  });
+  // (The R1 bounded UNDECLARED re-ask formatter suite was retired with
+  //  the gate — extractReaskDetail no longer carries a
+  //  FAIL_CLOSED_PLAN_COVERAGE_UNDECLARED branch; PLAN_INCOMPLETE detail
+  //  formatting is covered by pair-preask-feedback.test.ts.)
 });
