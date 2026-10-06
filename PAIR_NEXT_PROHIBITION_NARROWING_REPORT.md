@@ -182,3 +182,25 @@ Two adjacent correctness fixes the same refactor surfaced/required:
 - Object scope is forward-only for active voice — a fronted object WITHOUT passive auxiliaries (`report.md please delete`) misses; bounded, documented.
 - Passive auxiliaries are a fixed small list; `được` excluded (ambiguous permission/passive) — `report.md được xóa` misses unless another form is used.
 - Negation suppression still ≤2 whitespace tokens; all prior R2 residuals stand.
+---
+
+## AUDIT R4 REMEDIATION (audited HEAD `063bb6a`)
+
+ONE finding closed — scope boundaries were not clamped to the containing segment: `next`/`prev` were searched across the whole instruction, so an action in another clause could become the boundary and let an object scope cross a punctuation boundary (`delete temp.txt. review report.md and use fixed sizing` falsely violated — `use` in the later segment became `delete`'s forward bound, stretching its scope over `report.md`).
+
+### Fix (`plan-coverage.ts`, scope resolution only)
+
+- `next` = first hit with `start >= a.end` AND `start < segEnd` (same segment only).
+- `prev` = last hit with `end <= a.start` AND `start >= segStart` (same segment only).
+- Active scope stays `[a.end, next?.start ?? segEnd]` ⊆ seg; passive scope stays `[prev?.end ?? segStart, a.start]` ⊆ seg — os/oe can never escape the segment.
+
+Proof: `delete temp.txt. review report.md and use fixed sizing` PASS (`delete` owns only `temp.txt`); `summarize report.md. temp.txt was deleted` PASS (passive `deleted` binds only `temp.txt`, the earlier segment's `report.md` never trips the ban). Controls: `delete report.md. review temp.txt` FAIL; `temp.txt was reviewed. report.md was deleted` FAIL; all R3 controls unchanged.
+
+### Validation
+- Focused suite: **52/52 PASS** (49 prior + 3 R4 tests covering every mandated case)
+- Regression (PRV2-B + P-COVMAP + dataflow-incident + preask + network-req): **263/263**
+- Full suite: **3712 pass / 3 fail / 24 skipped** — byte-identical baseline (F4 R5.1-crash, P5 DSH env, P5 CODEX env)
+- `tsc --noEmit` clean; `rm -rf dist && npm run build` clean
+
+### Residual limitations
+Unchanged from R3 (fronted object without aux, `được` aux exclusion, ≤2-token negation window, conditional evaluation out of scope).

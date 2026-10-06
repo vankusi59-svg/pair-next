@@ -342,8 +342,13 @@ function taskShowsProhibitedAct(
   for (const a of acts) {
     const seg = segs.find(([s, e]) => a.start >= s && a.start < e);
     if (!seg) continue;
-    const next = hits2.find((h) => h.start >= a.end);
-    const prev = [...hits2].reverse().find((h) => h.end <= a.start);
+    // R4 — scope boundaries must come from the SAME segment: an action
+    // in a later/earlier clause never clamps this action's scope and
+    // os/oe can never escape seg.
+    const next = hits2.find((h) => h.start >= a.end && h.start < seg[1]);
+    const prev = [...hits2]
+      .reverse()
+      .find((h) => h.end <= a.start && h.start >= seg[0]);
     const passive = PASSIVE_AUX_RE.test(
       instr.slice(Math.max(0, a.start - 32), a.start),
     );

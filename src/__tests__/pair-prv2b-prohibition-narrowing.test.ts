@@ -668,3 +668,28 @@ describe("R3 — bounded action→object scope inside a segment (and/và/or/ho�
     expectCode(() => canon(mkDel("the file report.md was deleted during cleanup"), GOAL_DEL_R3), VIOLATION);
   });
 });
+
+describe("R4 — action scope is clamped to its own segment", () => {
+  const GOAL_DEL_R4 = "analyze XAUUSD strategy, do not delete report.md";
+  // T1 produces both artifacts so every consume edge is bound.
+  const mkR4 = (checkInstr: string) => [
+    work("T1", "analyze XAUUSD strategy and write findings to report.md and a scratch note to temp.txt", ["REASONING", "FILE_OPERATIONS"], [], undefined, ["OBL_001"]),
+    work("T2", checkInstr, ["REASONING"], ["T1"], undefined, []),
+  ];
+
+  it("R4.a — 'delete temp.txt. review report.md and use fixed sizing' PASSes: a later-segment `use` is not delete's boundary", () => {
+    expect(canon(mkR4("delete temp.txt. review report.md and use fixed sizing"), GOAL_DEL_R4).length).toBe(3);
+  });
+
+  it("R4.b — 'write report.md. temp.txt was deleted' PASSes: passive binds inside its own segment only", () => {
+    expect(canon(mkR4("summarize report.md. temp.txt was deleted"), GOAL_DEL_R4).length).toBe(3);
+  });
+
+  it("R4.c — controls still FAIL/PASS exactly: cross-boundary scope never hides a real act", () => {
+    expectCode(() => canon(mkR4("delete report.md. review temp.txt"), GOAL_DEL_R4), VIOLATION);
+    expectCode(() => canon(mkR4("temp.txt was reviewed. report.md was deleted"), GOAL_DEL_R4), VIOLATION);
+    expect(canon(mkR4("check report.md and delete temp.txt"), GOAL_DEL_R4).length).toBe(3);
+    expectCode(() => canon(mkR4("check temp.txt and delete report.md"), GOAL_DEL_R4), VIOLATION);
+    expectCode(() => canon(mkR4("delete temp.txt and report.md"), GOAL_DEL_R4), VIOLATION);
+  });
+});
