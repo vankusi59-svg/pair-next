@@ -412,13 +412,38 @@ function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
     if (SOURCE_PREP_WORDS.has(w) && destBound) continue;
     if (CONTEXT_PREP_WORDS.has(w)) return false;
     if (LOCATIVE_PREP_WORDS.has(w)) {
+      // R4: judge the whole object phrase between the governing verb
+      // and the locative — a single positive tail token is not enough
+      // ("hàm phân tích" = coding-object head + content modifier; the
+      // file still only locates the produced object). Every non-filler
+      // word of the phrase must be file-content evidence.
       let j = i - 1;
-      while (j >= 0 && LOCATIVE_OBJECT_FILLER_WORDS.has(words[j].toLowerCase())) {
+      let sawContent = false;
+      let pure = true;
+      while (j >= 0) {
+        const pw = words[j].toLowerCase();
+        if (LOCATIVE_OBJECT_FILLER_WORDS.has(pw)) {
+          j--;
+          continue;
+        }
+        if (
+          PRODUCE_GOVERNING_WORDS.has(pw) ||
+          NON_PRODUCE_ACTION_WORDS.has(pw) ||
+          CONTEXT_PREP_WORDS.has(pw) ||
+          SOURCE_PREP_WORDS.has(pw) ||
+          DEST_PREP_WORDS.has(pw) ||
+          LOCATIVE_PREP_WORDS.has(pw)
+        ) {
+          break;
+        }
+        if (!FILE_CONTENT_OBJECT_WORDS.has(pw)) {
+          pure = false;
+          break;
+        }
+        sawContent = true;
         j--;
       }
-      if (j < 0 || !FILE_CONTENT_OBJECT_WORDS.has(words[j].toLowerCase())) {
-        return false;
-      }
+      if (!sawContent || !pure) return false;
       continue;
     }
   }

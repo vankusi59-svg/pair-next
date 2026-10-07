@@ -213,3 +213,33 @@ describe("goal contract — produce→object binding R3: positive file-content e
     expect(dels("Write docs in docs.md")).toEqual(["docs.md"]);
   });
 });
+
+/** R4 audit — phrase-level evidence. A single positive tail token is
+ *  not enough: "hàm phân tích"/"hàm xử lý dữ liệu" carry a coding-object
+ *  head (hàm) with content-word modifiers; the file still only locates
+ *  the produced object. The whole object phrase between the governing
+ *  verb and the locative must be pure file-content. The VN cases minted
+ *  pre-patch (non-vacuous); the EN head-final cases already failed. */
+describe("goal contract — produce→object binding R4: object-phrase must be pure content", () => {
+  it("Tạo hàm phân tích trong src/foo.ts → NO DEL (non-vacuous: minted pre-patch — head 'hàm' is not content)", () => {
+    expect(dels("Tạo hàm phân tích trong src/foo.ts")).toEqual([]);
+  });
+
+  it("Tạo hàm xử lý dữ liệu trong src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Tạo hàm xử lý dữ liệu trong src/foo.ts")).toEqual([]);
+  });
+
+  it("Create analysis function in src/foo.ts → NO DEL (EN head 'function' not content)", () => {
+    expect(dels("Create analysis function in src/foo.ts")).toEqual([]);
+  });
+
+  it("Create data handler in src/foo.ts → NO DEL (EN head 'handler' not content)", () => {
+    expect(dels("Create data handler in src/foo.ts")).toEqual([]);
+  });
+
+  it("Tạo báo cáo phân tích trong report.md → DEL report.md (pure content phrase still mints)", () => {
+    expect(dels("Tạo báo cáo phân tích trong report.md")).toEqual([
+      "report.md",
+    ]);
+  });
+});
