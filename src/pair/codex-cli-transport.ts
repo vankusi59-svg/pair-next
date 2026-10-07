@@ -169,27 +169,74 @@ export interface CodexCliInvokeConfig {
   schema?: Record<string, unknown>;
   /** Prefix for the per-invocation scratch subdir name. */
   runPrefix?: string;
+  /** Byte bound on the role's final-message file (R3.C). When set, the
+   *  file is statted BEFORE any read — an oversized output is reported
+   *  as `finalOversized` without an unbounded readFileSync allocation. */
+  maxFinalBytes?: number;
+  /** When true the per-invocation run dir (schema.json + final.txt —
+   *  the RAW model output) is removed on every outcome. CEO passes
+   *  this: raw CEO output is never durable evidence. The Planner
+   *  retains its current semantics (run dirs preserved). */
+  removeRunDir?: boolean;
+}
+
+export interface CodexCliInvokeOutcome {
+  result: CodexCliSpawnResult;
+  finalText: string | null;
+  /** true when the final-message file exceeded `maxFinalBytes` —
+   *  the file was NEVER read. */
+  finalOversized: boolean;
 }
 
 /** Real non-interactive codex invocation — one typed outcome + the
- *  collected final message (untrusted text; exit 0 is never authority). */
+ *  collected final message (untrusted text; exit 0 is never authority).
+ *
+ *  SCRATCH HYGIENE (R3.C): with `removeRunDir` set, the per-invocation
+ *  run dir — including the raw final-message text and the schema file —
+ *  is removed on EVERY outcome (COMPLETED / FAILED / TIMEOUT /
+ *  SPAWN_FAILED / oversized / spawn throw). Raw model output exists
+ *  only in memory; the durable evidence is the caller's
+ *  response_digest. The configured scratch ROOT itself is never
+ *  deleted. Callers that leave `removeRunDir` unset retain the prior
+ *  behavior (run dir preserved — e.g. the Planner contract). */
 export async function invokeCodexCli(
   cfg: CodexCliInvokeConfig,
   prompt: string,
   env: CodexCliEnv | undefined,
-): Promise<{ result: CodexCliSpawnResult; finalText: string | null }> {
+): Promise<CodexCliInvokeOutcome> {
   const runDir = path.join(
     cfg.scratchDir,
     `${cfg.runPrefix ?? "cx"}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`,
   );
   fs.mkdirSync(runDir, { recursive: true });
-  const schemaPath = path.join(runDir, "schema.json");
-  const finalPath = path.join(runDir, "final.txt");
-  if (cfg.schema) fs.writeFileSync(schemaPath, JSON.stringify(cfg.schema));
-  const args = cfg.argv(runDir, schemaPath, finalPath);
-  const result = await spawnCodexCli(cfg.executable, args, prompt, runDir, cfg.timeoutMs, env);
-  const finalText = fs.existsSync(finalPath) ? fs.readFileSync(finalPath, "utf8") : null;
-  return { result, finalText };
+  try {
+    const schemaPath = path.join(runDir, "schema.json");
+    const finalPath = path.join(runDir, "final.txt");
+    if (cfg.schema) fs.writeFileSync(schemaPath, JSON.stringify(cfg.schema));
+    const args = cfg.argv(runDir, schemaPath, finalPath);
+    const result = await spawnCodexCli(cfg.executable, args, prompt, runDir, cfg.timeoutMs, env);
+    let finalText: string | null = null;
+    let finalOversized = false;
+    if (fs.existsSync(finalPath)) {
+      // Bound BEFORE allocation — an oversized final file is never
+      // read into memory.
+      const size = fs.statSync(finalPath).size;
+      if (cfg.maxFinalBytes !== undefined && size > cfg.maxFinalBytes) {
+        finalOversized = true;
+      } else {
+        finalText = fs.readFileSync(finalPath, "utf8");
+      }
+    }
+    return { result, finalText, finalOversized };
+  } finally {
+    if (cfg.removeRunDir) {
+      try {
+        fs.rmSync(runDir, { recursive: true, force: true });
+      } catch {
+        /* cleanup is best-effort; never mask the typed outcome */
+      }
+    }
+  }
 }
 
 /** The ONE canonical candidate identity for the codex-cli provider —

@@ -206,22 +206,22 @@ export function ceoDecisionDigest(r: Record<string, unknown>): string {
 }
 
 /** Immutable START-identity digest — pins every field that fixes the
- *  attempt's identity at claim time (R2.C). */
+ *  attempt's identity at claim time (R2.C + R3.D `started_by`). */
 export function ceoAttemptStartDigest(f: {
   attempt_id: string; cycle_id: string; objective_id: string;
   business_id: string; observation_digest: string; attempt_number: number;
   model_entry_id: string; provider_id: string; model_id: string;
-  started_at: string;
+  started_at: string; started_by: string;
 }): string {
   return digest({ ceo_attempt_start: 1, ...f });
 }
 
 /** Immutable SETTLE transition digest — pins the narrow STARTED→*
- *  transition fields (R2.C). */
+ *  transition fields (R2.C + R3.D `settled_by` actor provenance). */
 export function ceoAttemptSettleDigest(f: {
   attempt_id: string; to: string; settled_at: string;
   response_digest: string | null; canonical_proposal_digest: string | null;
-  failure_code: string | null;
+  failure_code: string | null; settled_by: string;
 }): string {
   return digest({ ceo_attempt_settle: 1, from: "STARTED", ...f });
 }
@@ -271,6 +271,16 @@ export function assertCanonicalCeoAttempt(store: PairEvidenceStore, row: Row): v
   if (String(s.new_state ?? "") !== "STARTED" || (s.old_state ?? null) !== null) {
     attemptFail("START anchor header mismatch");
   }
+  // R3.D — the START event actor IS the claimer: `operator:${started_by}`.
+  // `started_by` lives inside the immutable start identity — tampering
+  // the row, the anchor metadata, or the event actor all fail closed.
+  if (typeof row.started_by !== "string" || !String(row.started_by).trim() ||
+      String(row.started_by).length > 256) {
+    attemptFail("attempt started_by malformed");
+  }
+  if (String(s.actor ?? "") !== `operator:${String(row.started_by)}`) {
+    attemptFail("START anchor actor != operator:started_by");
+  }
   const smd = (s.metadata ?? {}) as Record<string, unknown>;
   const startFields = {
     attempt_id: String(row.attempt_id),
@@ -283,6 +293,7 @@ export function assertCanonicalCeoAttempt(store: PairEvidenceStore, row: Row): v
     provider_id: String(row.provider_id),
     model_id: String(row.model_id),
     started_at: String(row.started_at),
+    started_by: String(row.started_by),
   };
   for (const [k, v] of Object.entries(startFields)) {
     if (smd[k] !== v) attemptFail(`START anchor ${k} mismatch`);
@@ -306,6 +317,16 @@ export function assertCanonicalCeoAttempt(store: PairEvidenceStore, row: Row): v
     attemptFail("SETTLE anchor header mismatch");
   }
   const tmd = (st.metadata ?? {}) as Record<string, unknown>;
+  // R3.D — the settlement actor is deterministic: in-cycle settles are
+  // the claimer; system stale reconciliation is `operator:system`.
+  const expectedSettler =
+    state === "UNKNOWN" ? "operator:system" : `operator:${String(row.started_by)}`;
+  if (String(st.actor ?? "") !== expectedSettler) {
+    attemptFail(`SETTLE anchor actor ${String(st.actor)} != ${expectedSettler}`);
+  }
+  if (String(tmd.settled_by ?? "") !== expectedSettler) {
+    attemptFail("SETTLE settled_by pin mismatch");
+  }
   if (String(tmd.attempt_id ?? "") !== String(row.attempt_id) ||
       String(tmd.from ?? "") !== "STARTED" || String(tmd.to ?? "") !== state) {
     attemptFail("SETTLE anchor transition mismatch");
@@ -324,6 +345,7 @@ export function assertCanonicalCeoAttempt(store: PairEvidenceStore, row: Row): v
     response_digest: settleField(row, "response_digest"),
     canonical_proposal_digest: settleField(row, "canonical_proposal_digest"),
     failure_code: settleField(row, "failure_code"),
+    settled_by: expectedSettler,
   })) {
     attemptFail("SETTLE anchor digest mismatch");
   }
@@ -538,6 +560,7 @@ export class CeoPlanningCycleService {
       from: "STARTED",
       to,
       settled_at,
+      settled_by: `operator:${actor}`,
       response_digest: (next.response_digest as string | null) ?? null,
       canonical_proposal_digest: (next.canonical_proposal_digest as string | null) ?? null,
       failure_code: (next.failure_code as string | null) ?? null,
@@ -555,6 +578,7 @@ export class CeoPlanningCycleService {
           attempt_id: pins.attempt_id,
           to: pins.to,
           settled_at: pins.settled_at,
+          settled_by: pins.settled_by,
           response_digest: pins.response_digest,
           canonical_proposal_digest: pins.canonical_proposal_digest,
           failure_code: pins.failure_code,
@@ -584,8 +608,11 @@ export class CeoPlanningCycleService {
    *  attempt commits and immediately before the provider call. Zero
    *  write-transaction is held during the network call. */
   private reproveModelAuthority(attempt: Row): void {
-    this.assertCeoModelUsable(this.deps.model_entry_id);
+    // R3.B — transport identity re-proof FIRST: a mid-flight provider
+    // drift is a provenance violation (NON_CODEX_TRANSPORT), reported
+    // before the broader eligibility degradation codes.
     const transport = resolveCeoModelTransport(this.store, this.deps.model_entry_id);
+    this.assertCeoModelUsable(this.deps.model_entry_id);
     if (transport.model_entry_id !== String(attempt.model_entry_id) ||
         transport.provider_id !== String(attempt.provider_id) ||
         transport.model_id !== String(attempt.model_id)) {
@@ -753,12 +780,12 @@ export class CeoPlanningCycleService {
         provider_id: transport.provider_id,
         model_id: transport.model_id,
         started_at: startedAt,
+        started_by: actor,
       };
       this.store.put(CEO_DECISION_ATTEMPT_ENTITY, attemptId, {
         schema_version: CEO_ATTEMPT_SCHEMA_VERSION,
         ...startFields,
         state: "STARTED",
-        started_by: actor,
         settled_at: null,
         response_digest: null,
         canonical_proposal_digest: null,

@@ -125,6 +125,7 @@ const mkProvider = (
   const id = providerEntryId(pid);
   const existing = store.tryGet("provider", id);
   const lifecycle = opts.lifecycle ?? "QUALIFIED";
+  const codex = pid === "codex-cli";
   store.put("provider", id, {
     ...(existing ?? { provider_id: pid, entry_id: id }),
     lifecycle_state: lifecycle,
@@ -132,10 +133,15 @@ const mkProvider = (
     health_state: opts.health_state ?? "READY",
     conditions: [],
     probe_state: ["QUALIFIED", "MODEL_DISCOVERY_ELIGIBLE"].includes(lifecycle) ? "PROBED" : "UNPROBED",
-    // CEO transport resolution needs endpoint + credential env NAMES.
-    endpoint_reference: "https://provider.test",
-    credential_envs: ["TEST_API_KEY"],
-    credential_reference_name: "TEST_API_KEY",
+    // R3.B — the canonical codex-cli transport identity (subscription
+    // lane: no HTTP endpoint, no credential envs). A non-codex provider
+    // keeps a generic shape for the NEGATIVE tests only.
+    provider_type: codex ? "LOCAL_CLI" : "REMOTE_HTTP",
+    protocol_family: codex ? "CODEX_CLI" : "HTTPS_JSON",
+    endpoint_reference: codex ? "codex-cli://local" : "https://provider.test",
+    configured_endpoint_identity: codex ? "codex-cli://local" : "https://provider.test",
+    credential_envs: codex ? [] : ["TEST_API_KEY"],
+    credential_reference_name: codex ? null : "TEST_API_KEY",
   }, existing ? Number(existing.version) : 0);
   if (lifecycle === "QUALIFIED" || lifecycle === "MODEL_DISCOVERY_ELIGIBLE") {
     const cur = store.get("provider", id);
@@ -220,9 +226,8 @@ function freshStack(name: string): Stack {
 /** Stack + canonical model/provider + CEO service with a canned invoker. */
 function freshCeo(name: string, raw: string | ((i: CeoInvokeInput) => CeoInvokeResult | Promise<CeoInvokeResult>), modelId?: string, extraDeps: Record<string, unknown> = {}) {
   const s = freshStack(name);
-  const pid = `p${counter}`;
-  const me = modelId ?? mkModel(s.store, pid, "ceo-m");
-  mkProvider(s.store, `p${counter}` === pid ? pid : String(s.store.get("model_entry", me).provider_id));
+  const me = modelId ?? mkModel(s.store, "codex-cli", "ceo-m");
+  mkProvider(s.store, String(s.store.get("model_entry", me).provider_id));
   const invoker = new FakeInvoker((i) =>
     typeof raw === "function" ? raw(i) : ({
       model_entry_id: me,
@@ -291,12 +296,12 @@ function mintStartedAttempt(s: Stack, opts: {
     provider_id: opts.provider_id,
     model_id: opts.model_id,
     started_at: opts.started_at ?? new Date().toISOString(),
+    started_by: actor,
   };
   s.store.put("ceo_decision_attempt", attemptId, {
     schema_version: "pair.os.vnext.ceo-decision-attempt.v1",
     ...startFields,
     state: "STARTED",
-    started_by: actor,
     settled_at: null,
     response_digest: null,
     canonical_proposal_digest: null,
@@ -442,7 +447,7 @@ describe("P15.3 B — invocation gates", () => {
 
   it("DSH_EXECUTION model (direct + alias) → DSH overlap fail closed, zero attempts, zero calls", async () => {
     const s = freshStack("b3");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const meDsh = mkModel(s.store, pid, "dsh-m");
     mkProvider(s.store, pid);
     assignModelRole(s.store, meDsh, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
@@ -462,7 +467,7 @@ describe("P15.3 B — invocation gates", () => {
   it("provider/model unavailable → no invocation, no decision; authority-ineligible → fail closed", async () => {
     // availability gate (provider DOWN) → CEO_MODEL_UNAVAILABLE
     const s1 = freshStack("b4a");
-    const pid1 = `p${counter}`;
+    const pid1 = "codex-cli";
     const me1 = mkModel(s1.store, pid1, "m1");
     mkProvider(s1.store, pid1, { health_state: "DOWN" });
     const inv1 = new FakeInvoker(() => { throw new Error("must not invoke"); });
@@ -474,7 +479,7 @@ describe("P15.3 B — invocation gates", () => {
     s1.store.close();
     // authority gate (provider never qualified) → PROVIDER_INELIGIBLE
     const s2 = freshStack("b4b");
-    const pid2 = `p${counter}`;
+    const pid2 = "codex-cli";
     const me2 = mkModel(s2.store, pid2, "m2");
     mkProvider(s2.store, pid2, { lifecycle: "DISCOVERED" });
     const svc2 = new CeoPlanningCycleService({ store: s2.store, objectives: s2.objectives, workstreams: s2.workstreams, invoker: new FakeInvoker(() => { throw new Error("x"); }), model_entry_id: me2 });
@@ -525,7 +530,7 @@ describe("P15.3 B — invocation gates", () => {
 
   it("invoker-reported identity must equal configured model → mismatch rejects", async () => {
     const s = freshStack("b6");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const me = mkModel(s.store, pid, "m1");
     mkProvider(s.store, pid);
     const inv = new FakeInvoker(() => ({
@@ -799,7 +804,7 @@ describe("P15.3 G — TOCTOU stale decision closure", () => {
 describe("P15.3 H — crash safety", () => {
   it("fault on anchor write → whole commit rolls back; STARTED attempt reconciles → bounded retry succeeds", async () => {
     const s = freshStack("h1");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const me = mkModel(s.store, pid, "m1");
     mkProvider(s.store, pid);
     const bid = mkBusiness(s.store);
@@ -835,7 +840,7 @@ describe("P15.3 H — crash safety", () => {
 
   it("live STARTED attempt → INFLIGHT; reconciled after grace → one bounded retry", async () => {
     const s = freshStack("h2");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const me = mkModel(s.store, pid, "m1");
     mkProvider(s.store, pid);
     const bid = mkBusiness(s.store);
@@ -880,7 +885,7 @@ describe("P15.3 H — crash safety", () => {
 describe("P15.3 I — concurrency", () => {
   it("two callers, same observation → at most ONE live invocation; loser gets INFLIGHT, retry converges", async () => {
     const s = freshStack("i1");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const me = mkModel(s.store, pid, "m1");
     mkProvider(s.store, pid);
     const bid = mkBusiness(s.store);
@@ -1028,7 +1033,7 @@ describe("P15.3 K — no forbidden side effects", () => {
 describe("P15.3 R — model-role regression (§27)", () => {
   it("planner model serves CEO via the separate seam WITHOUT losing PLANNER_COORDINATOR; pools stay disjoint", async () => {
     const s = freshStack("r1");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const mePlanner = mkModel(s.store, pid, "planner-m");
     const meDsh = mkModel(s.store, pid, "dsh-m");
     mkProvider(s.store, pid);
@@ -1280,7 +1285,7 @@ describe("P15.3 R2.B — decision receipt re-proves identity", () => {
 describe("P15.3 R2.C — canonical attempt authority", () => {
   it("a bare store.put row (CCA_x1) is ZERO attempt authority → cap/INFLIGHT reads fail closed", async () => {
     const s = freshStack("r2c-1");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const me = mkModel(s.store, pid, "m1");
     mkProvider(s.store, pid);
     const bid = mkBusiness(s.store);
@@ -1311,7 +1316,7 @@ describe("P15.3 R2.C — canonical attempt authority", () => {
 
   it("canonical-shaped row WITHOUT the START anchor → zero authority", async () => {
     const s = freshStack("r2c-2");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const me = mkModel(s.store, pid, "m1");
     mkProvider(s.store, pid);
     const bid = mkBusiness(s.store);
@@ -1412,7 +1417,7 @@ describe("P15.3 R2.C — canonical attempt authority", () => {
 describe("P15.3 R2.D — model authority re-proof after STARTED commit", () => {
   it("provider authority revoked between claim and invoke → REJECTED attempt, ZERO calls, no decision", async () => {
     const s2 = freshStack("r2d-1");
-    const pid2 = `p${counter}`;
+    const pid2 = "codex-cli";
     const me2 = mkModel(s2.store, pid2, "m2");
     mkProvider(s2.store, pid2);
     const bid2 = mkBusiness(s2.store);
@@ -1443,7 +1448,7 @@ describe("P15.3 R2.D — model authority re-proof after STARTED commit", () => {
 
   it("model replaced with a DSH_EXECUTION-aliased entry between claim and invoke → re-proof fails closed", async () => {
     const s = freshStack("r2d-2");
-    const pid = `p${counter}`;
+    const pid = "codex-cli";
     const me = mkModel(s.store, pid, "m1");
     const dsh = mkModel(s.store, pid, "dsh-m");
     mkProvider(s.store, pid);
@@ -1547,16 +1552,27 @@ process.stdin.on("end", () => {
   if (b === "ratelimit") { process.stderr.write("error: 429 rate limit exceeded\\n"); process.exit(1); }
   if (!out) { process.stderr.write("missing --output-last-message\\n"); process.exit(1); }
   if (b === "garbage") { fs.writeFileSync(out, "not json at all"); process.exit(0); }
+  if (b === "oversized") { fs.writeFileSync(out, "x".repeat(80 * 1024)); process.exit(0); }
+  // R3.A — the REAL strict --output-schema shape: every declared
+  // property present, variant-inapplicable fields as explicit null.
   if (b === "ceo_init") {
     fs.writeFileSync(out, JSON.stringify({
       schema: "pair.ceo-decision.v1", decision_kind: "INITIALIZE_WORKSTREAMS",
-      workstreams: [{ workstream_key: "w1", title: "T", goal: "G" }],
-      priority_order: ["w1"], summary: "init",
+      workstreams: [{ workstream_key: "w1", title: "T", goal: "G", depends_on_keys: null }],
+      priority_order: ["w1"], wait_reason: null, summary: "init",
+    }));
+    process.exit(0);
+  }
+  if (b === "ceo_prior") {
+    fs.writeFileSync(out, JSON.stringify({
+      schema: "pair.ceo-decision.v1", decision_kind: "PRIORITIZE_EXISTING",
+      workstreams: null, priority_order: ["w1"], wait_reason: null, summary: "p",
     }));
     process.exit(0);
   }
   fs.writeFileSync(out, JSON.stringify({
     schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+    workstreams: null, priority_order: null,
     wait_reason: "AWAITING_PROGRESS", summary: "wait",
   }));
   process.exit(0);
@@ -1770,6 +1786,359 @@ describe("P15.3 R2-CLI — Codex CLI subscription transport (addendum)", () => {
     const r = await svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
     expect(String(r.decision.decision_kind)).toBe("WAIT");
     expect(modelRoleOf(s.store, me)).toBe(MODEL_ROLE.PLANNER_COORDINATOR);
+    s.store.close();
+  });
+});
+
+/* ============================ R3.A — null-placeholder normalization ============================ */
+
+describe("P15.3 R3.A — strict-schema null placeholders normalize at the raw boundary", () => {
+  // The REAL --output-schema strict shape: every declared property
+  // present; variant-inapplicable fields are explicit null.
+  it("schema-shaped WAIT with explicit nulls → PASS; stored proposal carries NO null placeholders", async () => {
+    const s = freshCeo("r3a-1", JSON.stringify({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+      workstreams: null, priority_order: null,
+      wait_reason: "AWAITING_PROGRESS", summary: "ok",
+    }));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const r = await s.svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("WAIT");
+    const stored = r.decision.proposal as Record<string, unknown>;
+    expect(stored.workstreams).toBeUndefined();
+    expect(stored.priority_order).toBeUndefined();
+    expect(Object.values(stored).some((v) => v === null)).toBe(false);
+    s.store.close();
+  });
+
+  it("schema-shaped INITIALIZE with null wait_reason + null depends_on_keys → PASS + canonical graph", async () => {
+    const s = freshCeo("r3a-2", JSON.stringify({
+      schema: "pair.ceo-decision.v1", decision_kind: "INITIALIZE_WORKSTREAMS",
+      workstreams: [
+        { workstream_key: "a", title: "A", goal: "g", depends_on_keys: null },
+        { workstream_key: "b", title: "B", goal: "g", depends_on_keys: ["a"] },
+      ],
+      priority_order: ["a", "b"], wait_reason: null, summary: "init",
+    }));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const r = await s.svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("INITIALIZE_WORKSTREAMS");
+    expect((r.decision.proposal as { workstreams: unknown[] }).workstreams).toHaveLength(2);
+    expect(s.store.list("work_item").length).toBeGreaterThan(0);
+    s.store.close();
+  });
+
+  it("schema-shaped PRIORITIZE with null workstreams/wait_reason → PASS receipt", async () => {
+    const s = freshCeo("r3a-3", initProposalJson(["w1"]));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    // next cycle (new observation) — PRIORITIZE with strict nulls
+    const inv2 = new FakeInvoker(() => ({
+      model_entry_id: s.me, provider_id: "codex-cli", model_id: "ceo-m",
+      raw_text: JSON.stringify({
+        schema: "pair.ceo-decision.v1", decision_kind: "PRIORITIZE_EXISTING",
+        workstreams: null, priority_order: ["w1"], wait_reason: null, summary: null,
+      }),
+    }));
+    const svc2 = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv2, model_entry_id: s.me,
+    });
+    // force a fresh observation by amending the objective
+    const o2 = s.objectives.get(oid);
+    s.objectives.amend(oid, { business_id: bid, patch: { target: "11" }, reason: "r", actor: `operator:${OP}` });
+    const r2 = await svc2.runCycle({ objective_id: oid, actor: OP });
+    expect(String(r2.decision.decision_kind)).toBe("PRIORITIZE_EXISTING");
+    void o2;
+    s.store.close();
+  });
+
+  it("non-null contradictory fields still reject the WHOLE proposal", async () => {
+    const s = freshCeo("r3a-4", JSON.stringify({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+      workstreams: [{ workstream_key: "x", title: "T", goal: "G", depends_on_keys: null }],
+      priority_order: null, wait_reason: "AWAITING_PROGRESS", summary: null,
+    }));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await expectFail(() => s.svc.runCycle({ objective_id: String(o.objective_id), actor: OP }), "FAIL_CLOSED_CEO_DECISION_INVALID");
+    expect(decisionsOf(s.store)).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("normalization boundary: stored canonical proposal rejects placeholder nulls (no weakening)", async () => {
+    const { validateCanonicalCeoProposal, normalizeCeoRawProposalJson } = await import("../pair/ceo-decision.js");
+    // raw path normalizes
+    const p = validateCanonicalCeoProposal(
+      normalizeCeoRawProposalJson({
+        schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+        workstreams: null, priority_order: null,
+        wait_reason: "AWAITING_PROGRESS", summary: null,
+      }),
+      { requireSchema: true },
+    );
+    expect(p.wait_reason).toBe("AWAITING_PROGRESS");
+    expect("summary" in p).toBe(false);
+    // stored canonical path must NOT normalize — a null field is malformed
+    expect(() => validateCanonicalCeoProposal({
+      decision_kind: "WAIT", wait_reason: "AWAITING_PROGRESS", workstreams: null,
+    })).toThrowError(/INVALID/);
+    // same for the parse path with non-null contradiction
+    const { parseCeoDecisionText } = await import("../pair/ceo-decision.js");
+    expect(() => parseCeoDecisionText(JSON.stringify({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+      workstreams: [{ workstream_key: "x", title: "t", goal: "g" }],
+      wait_reason: "AWAITING_PROGRESS",
+    }))).toThrowError(/INVALID/);
+  });
+});
+
+/* ============================ R3.B — codex-cli-only provider authority ============================ */
+
+describe("P15.3 R3.B — codex-cli is the ONLY CEO provider authority", () => {
+  it("eligible model under a NON-codex provider → ZERO attempt, ZERO invocation, fail closed", async () => {
+    const s = freshStack("r3b-1");
+    const me = mkModel(s.store, "openai", "gpt-x"); // eligible generic HTTP provider
+    mkProvider(s.store, "openai");
+    const inv = new FakeInvoker(() => { throw new Error("MUST NOT INVOKE"); });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await expectFail(() => svc.runCycle({ objective_id: String(o.objective_id), actor: OP }), "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT");
+    expect(inv.calls).toBe(0);
+    expect(attemptsOf(s.store)).toHaveLength(0); // before claim
+    s.store.close();
+  });
+
+  it("forged transport (provider/protocol not codex-cli) → invoker rejects BEFORE spawn", async () => {
+    const s = freshStack("r3b-2");
+    const me = seedCeoCodex(s);
+    const exe = makeFakeCeoCodex(s.dbPath + "-d");
+    const logFile = path.join(ROOT, `invokelog-${counter}.txt`);
+    const invoker = new CodexCliCeoDecisionInvoker({
+      executable: exe, scratchDir: s.dbPath + "-scr",
+      env: { PATH: process.env.PATH ?? "", FAKE_CODEX_INVOKELOG: logFile, FAKE_CODEX_BEHAVIOR: "ceo_ok" },
+    });
+    const forged = {
+      model_entry_id: me, provider_id: "openai", provider_family: "openai",
+      model_id: "gpt-x", protocol_family: "CODEX_CLI",
+    };
+    await expectFail(() => invoker.invoke({
+      transport: forged, system_prompt: "s", user_prompt: "u", observation_digest: "d",
+    }), "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT");
+    const forged2 = { ...forged, provider_id: "codex-cli", protocol_family: "HTTPS_JSON" };
+    await expectFail(() => invoker.invoke({
+      transport: forged2, system_prompt: "s", user_prompt: "u", observation_digest: "d",
+    }), "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT");
+    expect(fs.existsSync(logFile)).toBe(false); // zero spawn
+    s.store.close();
+  });
+
+  it("codex-cli endpoint identity drift → fail closed at resolution", async () => {
+    const s = freshStack("r3b-3");
+    const me = seedCeoCodex(s);
+    const p = s.store.get("provider", providerEntryId("codex-cli"));
+    s.store.put("provider", String(p.entry_id), {
+      ...p, endpoint_reference: "https://api.openai.com/v1",
+    }, Number(p.version));
+    const inv = new FakeInvoker(() => { throw new Error("MUST NOT INVOKE"); });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await expectFail(() => svc.runCycle({ objective_id: String(o.objective_id), actor: OP }), "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT");
+    expect(inv.calls).toBe(0);
+    expect(attemptsOf(s.store)).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("mid-flight provider protocol drift after START claim → re-proof rejects, attempt REJECTED, zero CLI call", async () => {
+    const s = freshStack("r3b-4");
+    const me = seedCeoCodex(s);
+    const inv = new FakeInvoker(() => { throw new Error("MUST NOT INVOKE"); });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+      after_attempt_claim: () => {
+        const p = s.store.get("provider", providerEntryId("codex-cli"));
+        s.store.put("provider", String(p.entry_id), { ...p, protocol_family: "HTTPS_JSON" }, Number(p.version));
+      },
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await expectFail(() => svc.runCycle({ objective_id: String(o.objective_id), actor: OP }), "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT");
+    expect(inv.calls).toBe(0);
+    expect(String(attemptsOf(s.store)[0]!.state)).toBe("REJECTED");
+    assertCanonicalCeoAttempt(s.store, attemptsOf(s.store)[0]!);
+    s.store.close();
+  });
+});
+
+/* ============================ R3.C — scratch hygiene + pre-read bound ============================ */
+
+describe("P15.3 R3.C — raw Codex output never persists; bounded read", () => {
+  const mkCli = async (name: string, behavior: string) => {
+    const s = freshStack(`r3c-${name}`);
+    const me = seedCeoCodex(s);
+    const scr = s.dbPath + "-scr";
+    fs.mkdirSync(scr, { recursive: true });
+    const invoker = new CodexCliCeoDecisionInvoker({
+      executable: makeFakeCeoCodex(s.dbPath + "-d"), scratchDir: scr,
+      env: { PATH: process.env.PATH ?? "", FAKE_CODEX_BEHAVIOR: behavior },
+    });
+    const input = {
+      transport: {
+        model_entry_id: me, provider_id: CODEX_CLI_PROVIDER_ID,
+        provider_family: CODEX_CLI_PROVIDER_ID, model_id: "gpt-6.1-sol",
+        protocol_family: "CODEX_CLI",
+      },
+      system_prompt: "s", user_prompt: "u", observation_digest: "d",
+      timeout_ms: 3_000,
+    };
+    return { s, scr, invoker, input };
+  };
+
+  it("valid call → result in memory + run dir removed; scratch root preserved", async () => {
+    const { s, scr, invoker, input } = await mkCli("ok", "ceo_ok");
+    const res = await invoker.invoke(input);
+    expect(res.raw_text).toContain("pair.ceo-decision.v1");
+    expect(fs.existsSync(scr)).toBe(true);
+    expect(fs.readdirSync(scr)).toHaveLength(0); // zero residual final.txt/schema.json
+    s.store.close();
+  });
+
+  it("malformed output → cleanup still happens", async () => {
+    const { s, scr, invoker, input } = await mkCli("bad", "garbage");
+    const res = await invoker.invoke(input);
+    expect(res.raw_text).toBe("not json at all");
+    expect(() => JSON.parse(res.raw_text)).toThrow();
+    expect(fs.readdirSync(scr)).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("timeout → cleanup still happens", async () => {
+    const { s, scr, invoker, input } = await mkCli("to", "sleep");
+    await expectFail(() => invoker.invoke(input), "FAIL_CLOSED_CEO_CLI_TIMEOUT");
+    expect(fs.readdirSync(scr)).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("oversized final file → rejected WITHOUT unbounded read; cleanup happens", async () => {
+    const { s, scr, invoker, input } = await mkCli("big", "oversized");
+    await expectFail(() => invoker.invoke(input), "FAIL_CLOSED_CEO_CLI_OUTPUT_INVALID");
+    expect(fs.readdirSync(scr)).toHaveLength(0);
+    s.store.close();
+  });
+});
+
+/* ============================ R3.D — attempt actor provenance ============================ */
+
+describe("P15.3 R3.D — attempt actor provenance pinned", () => {
+  async function committedCycle(name: string) {
+    const s = freshCeo(name, initProposalJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    return { s, oid, did: String(r.decision.decision_id), bid };
+  }
+  const strictRead = (s: ReturnType<typeof freshCeo>, _oid: string, did: string) =>
+    assertCanonicalCeoDecision(s, s.store.get("ceo_decision", did) as never);
+
+  it("tamper started_by on the row → strict attempt validation fails", async () => {
+    const { s, oid, did } = await committedCycle("r3d-1");
+    const dec = s.store.get("ceo_decision", did);
+    const att = s.store.get("ceo_decision_attempt", String(dec.attempt_id));
+    s.store.put("ceo_decision_attempt", String(dec.attempt_id), { ...att, started_by: "999" }, Number(att.version));
+    await expectFail(() => strictRead(s, oid, did), "FAIL_CLOSED_CEO_DECISION_ATTEMPT");
+    s.store.close();
+  });
+
+  it("tamper START event actor + recompute event_hash → fail", async () => {
+    const { s, oid, did } = await committedCycle("r3d-2");
+    const dec = s.store.get("ceo_decision", did);
+    const aid = String(dec.attempt_id);
+    const ev = s.store.listEvents("ceo_decision_attempt", aid)
+      .find((e) => String(e.event_type) === "CEO_DECISION_ATTEMPT_STARTED")!;
+    const body = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state ?? null, new_state: ev.new_state,
+      actor: "operator:intruder", correlation_id: ev.correlation_id ?? null,
+      metadata: ev.metadata, created_at: ev.created_at,
+    };
+    dbOf(s.store).prepare(
+      "UPDATE events SET actor=?, event_hash=? WHERE event_id=?",
+    ).run("operator:intruder", eventHash(body), String(ev.event_id));
+    await expectFail(() => strictRead(s, oid, did), "FAIL_CLOSED_CEO_DECISION_ATTEMPT");
+    s.store.close();
+  });
+
+  it("tamper SETTLE event actor + recompute event_hash → fail", async () => {
+    const { s, oid, did } = await committedCycle("r3d-3");
+    const dec = s.store.get("ceo_decision", did);
+    const aid = String(dec.attempt_id);
+    const ev = s.store.listEvents("ceo_decision_attempt", aid)
+      .find((e) => String(e.event_type) === "CEO_DECISION_ATTEMPT_SETTLED")!;
+    const body = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state ?? null, new_state: ev.new_state,
+      actor: "operator:intruder", correlation_id: ev.correlation_id ?? null,
+      metadata: ev.metadata, created_at: ev.created_at,
+    };
+    dbOf(s.store).prepare(
+      "UPDATE events SET actor=?, event_hash=? WHERE event_id=?",
+    ).run("operator:intruder", eventHash(body), String(ev.event_id));
+    await expectFail(() => strictRead(s, oid, did), "FAIL_CLOSED_CEO_DECISION_ATTEMPT");
+    s.store.close();
+  });
+
+  it("system reconciliation settles with operator:system — canonical", async () => {
+    const s = freshCeo("r3d-4", () => new Promise<CeoInvokeResult>(() => {}));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const p = s.svc.runCycle({ objective_id: oid, actor: OP }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 50));
+    const att = attemptsOf(s.store)[0]!;
+    expect(String(att.state)).toBe("STARTED");
+    // age it past grace
+    const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    s.store.put("ceo_decision_attempt", String(att.attempt_id), { ...att, started_at: old }, Number(att.version));
+    // started_at is pinned in START metadata — patch it there too so the
+    // attempt stays canonical while aged.
+    const ev = s.store.listEvents("ceo_decision_attempt", String(att.attempt_id))[0]!;
+    const md = { ...(ev.metadata as Record<string, unknown>), started_at: old };
+    md.start_identity_digest = ceoAttemptStartDigest({
+      attempt_id: String(att.attempt_id), cycle_id: String(att.cycle_id),
+      objective_id: oid, business_id: String(att.business_id),
+      observation_digest: String(att.observation_digest),
+      attempt_number: Number(att.attempt_number),
+      model_entry_id: String(att.model_entry_id),
+      provider_id: String(att.provider_id), model_id: String(att.model_id),
+      started_at: old, started_by: OP,
+    });
+    const body2 = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state ?? null, new_state: ev.new_state,
+      actor: ev.actor, correlation_id: ev.correlation_id ?? null,
+      metadata: md, created_at: ev.created_at,
+    };
+    dbOf(s.store).prepare("UPDATE events SET metadata_json=?, event_hash=? WHERE event_id=?")
+      .run(JSON.stringify(md), eventHash(body2), String(ev.event_id));
+    expect(s.svc.reconcileStaleAttempts(oid)).toBe(1);
+    const settled = s.store.get("ceo_decision_attempt", String(att.attempt_id));
+    expect(String(settled.state)).toBe("UNKNOWN");
+    assertCanonicalCeoAttempt(s.store, settled); // operator:system settle actor canonical
+    void p;
     s.store.close();
   });
 });

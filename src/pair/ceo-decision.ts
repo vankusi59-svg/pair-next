@@ -21,6 +21,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  CODEX_CLI_ENDPOINT,
+  CODEX_CLI_PROTOCOL_FAMILY,
+  CODEX_CLI_PROVIDER_ID,
   CODEX_CLI_WARNING,
   classifyCodexCliExit,
   invokeCodexCli,
@@ -262,9 +265,41 @@ export function validateCanonicalCeoProposal(
 }
 
 /**
- * raw model text → JSON parse → strict shape → discriminated-union
- * validation. Any unknown field, malformed member, forbidden kind, or
- * contradictory authority-bearing field rejects the WHOLE proposal.
+ * THE ONE raw→canonical normalization boundary (R3.A). A strict
+ * schema-constrained Codex output (`--output-schema`, OpenAI strict
+ * mode: all properties required + nullable) emits explicit `null`
+ * placeholders for variant-inapplicable fields, e.g. a WAIT decision
+ * carries `workstreams: null, priority_order: null`.
+ *
+ * At THIS boundary ONLY: `null` on a variant-inapplicable field
+ * normalizes to ABSENT. Non-null contradictory fields remain INVALID
+ * inside the canonical validator. `depends_on_keys: null` inside a
+ * workstream item normalizes the same way. The stored canonical
+ * proposal therefore NEVER carries placeholder nulls —
+ * assertCanonicalCeoDecision() keeps requiring the canonical shape.
+ */
+export function normalizeCeoRawProposalJson(input: unknown): unknown {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return input;
+  const o = { ...(input as Record<string, unknown>) };
+  for (const k of ["workstreams", "priority_order", "wait_reason", "summary"]) {
+    if (o[k] === null) delete o[k];
+  }
+  if (Array.isArray(o.workstreams)) {
+    o.workstreams = o.workstreams.map((w) => {
+      if (!w || typeof w !== "object" || Array.isArray(w)) return w;
+      const we = { ...(w as Record<string, unknown>) };
+      if (we.depends_on_keys === null) delete we.depends_on_keys;
+      return we;
+    });
+  }
+  return o;
+}
+
+/**
+ * raw model text → JSON parse → null-placeholder normalization (R3.A)
+ * → strict shape → discriminated-union validation. Any unknown field,
+ * malformed member, forbidden kind, or contradictory authority-bearing
+ * field rejects the WHOLE proposal.
  */
 export function parseCeoDecisionText(raw: string): CeoProposal {
   if (typeof raw !== "string" || !raw.trim() || raw.length > CEO_MAX_OUTPUT_BYTES) {
@@ -276,7 +311,10 @@ export function parseCeoDecisionText(raw: string): CeoProposal {
   } catch {
     invalid("no balanced JSON object in model output");
   }
-  return validateCanonicalCeoProposal(parsed, { requireSchema: true });
+  return validateCanonicalCeoProposal(
+    normalizeCeoRawProposalJson(parsed),
+    { requireSchema: true },
+  );
 }
 
 /** Canonical digest of a validated proposal — decision receipt identity. */
@@ -363,6 +401,30 @@ export function resolveCeoModelTransport(
     throw new IntegrityError(
       "FAIL_CLOSED_CEO_MODEL_UNRESOLVED",
       `provider ${providerId} for model_entry ${String(modelEntryId)} does not exist`,
+    );
+  }
+  // R3.B — Codex CLI is the ONLY CEO_DECISION provider authority: the
+  // canonical transport identity itself must be Codex CLI. An eligible
+  // model_entry under any other provider/protocol/endpoint is never
+  // executed through `codex exec` — provenance mismatch fails closed.
+  if (providerId !== CODEX_CLI_PROVIDER_ID) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT",
+      `model_entry ${String(modelEntryId)} resolves to provider ${providerId}`,
+    );
+  }
+  if (String(provider.protocol_family ?? "") !== CODEX_CLI_PROTOCOL_FAMILY) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT",
+      `provider ${providerId} protocol_family ${String(provider.protocol_family)}`,
+    );
+  }
+  const endpoint = String(
+    provider.endpoint_reference ?? provider.configured_endpoint_identity ?? "");
+  if (endpoint !== CODEX_CLI_ENDPOINT) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT",
+      `provider ${providerId} endpoint identity mismatch`,
     );
   }
   return {
@@ -500,6 +562,16 @@ export class CodexCliCeoDecisionInvoker implements CeoDecisionInvoker {
   ) {}
 
   async invoke(input: CeoInvokeInput): Promise<CeoInvokeResult> {
+    // R3.B — defensive authority: this invoker executes `codex exec`;
+    // a transport claiming any other provider/protocol is refused
+    // BEFORE spawn (forged transports never reach the CLI).
+    if (input.transport.provider_id !== CODEX_CLI_PROVIDER_ID ||
+        input.transport.protocol_family !== CODEX_CLI_PROTOCOL_FAMILY) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT",
+        `transport ${input.transport.provider_id}/${input.transport.protocol_family} is not codex-cli`,
+      );
+    }
     const exe = this.opts.executable ?? resolveCodexExecutable(this.opts.env);
     if (!exe) {
       throw new IntegrityError(
@@ -520,6 +592,12 @@ export class CodexCliCeoDecisionInvoker implements CeoDecisionInvoker {
           scratchDir,
           schema: CEO_DECISION_JSON_SCHEMA,
           runPrefix: "ceo",
+          // R3.C — bound BEFORE read: an oversized final file is
+          // rejected from its stat() size, never buffered.
+          maxFinalBytes: CEO_MAX_OUTPUT_BYTES,
+          // R3.C — raw model output is never durable evidence: the
+          // per-invocation run dir is removed on every outcome.
+          removeRunDir: true,
           argv: (runDir, schemaPath, finalPath) =>
             ceoCliArgv(input.transport.model_id, runDir, schemaPath, finalPath),
         },
@@ -532,7 +610,10 @@ export class CodexCliCeoDecisionInvoker implements CeoDecisionInvoker {
         `spawn error ${String(e).slice(0, 120)}`,
       );
     }
-    const { result, finalText } = out;
+    const { result, finalText, finalOversized } = out;
+    if (finalOversized) {
+      throw new IntegrityError("FAIL_CLOSED_CEO_CLI_OUTPUT_INVALID", "output oversized");
+    }
     if (result.status === "TIMEOUT") {
       throw new IntegrityError("FAIL_CLOSED_CEO_CLI_TIMEOUT", result.error ?? "codex timeout");
     }
