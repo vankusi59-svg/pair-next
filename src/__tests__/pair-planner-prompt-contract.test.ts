@@ -132,10 +132,22 @@ describe("planner prompt contract — re-ask guidance", () => {
     expect(p).toMatch(/exclusively to the TELEGRAM_DELIVERY task/i);
   });
 
-  it("rejection FAIL_CLOSED_PLAN_INCOMPLETE gets produce-the-named-file guidance", () => {
+  it("R2.A: FAIL_CLOSED_PLAN_INCOMPLETE keeps generic minimal-repair, NO missing-file diagnosis", () => {
+    // PLAN_INCOMPLETE is a generic coverage failure (missing obligation,
+    // legitimate deliverable, quantity mismatch — or a Goal Contract
+    // false-positive like M3's DEL_001). The prompt must not self-diagnose
+    // it as a missing file producer.
     const p = rejectedPrompt("FAIL_CLOSED_PLAN_INCOMPLETE");
-    expect(p).toMatch(/produces the exact named file/i);
-    expect(p).toMatch(/outbox endpoint/i);
+    expect(p).toMatch(/minimum change necessary to fix the named defect/i);
+    // The absence assertions scope to the rejection section: the GOAL
+    // CONTRACT block's generic coverage line ("every deliverable needs a
+    // task that produces the exact named file") is canonical semantics
+    // present in every prompt — not a PLAN_INCOMPLETE-specific diagnosis.
+    const rejection = p.slice(p.indexOf("PLAN REJECTION"));
+    expect(rejection).not.toMatch(/goal-named file\/deliverable has no producing task/i);
+    expect(rejection).not.toMatch(/produces the exact named file/i);
+    expect(rejection).not.toMatch(/outbox endpoint/i);
+    expect(rejection).not.toMatch(/Specific fix:/i);
   });
 
   it("rejection FAIL_CLOSED_PLAN_DATAFLOW_* gets consistent-path guidance", () => {

@@ -1002,9 +1002,6 @@ export function buildPlannerUserPrompt(
         (cfg.rejectionContext.validation_code === "FAIL_CLOSED_DELIVERY_VERB_IN_NON_DELIVERY_TASK"
           ? `Specific fix: remove the Telegram send/delivery directive (or purpose clause) from the non-delivery task — the producer keeps only its production work; delivery intent belongs exclusively to the TELEGRAM_DELIVERY task; preserve the artifact/dependency relationship.\n`
           : "") +
-        (cfg.rejectionContext.validation_code === "FAIL_CLOSED_PLAN_INCOMPLETE"
-          ? `Specific fix: a goal-named file/deliverable has no producing task — declare a task that produces the exact named file (for remote work, upload it via the outbox endpoint); preserve unrelated task structure and dependencies.\n`
-          : "") +
         (cfg.rejectionContext.validation_code === "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT" ||
          cfg.rejectionContext.validation_code === "FAIL_CLOSED_PLAN_DATAFLOW_ORDER"
           ? `Specific fix: a task consumes an artifact with no earlier producer — use ONE consistent path per artifact, declare the producing task earlier, and never restate the same file under a different path form or verb; preserve the artifact/dependency relationship.\n`
