@@ -403,6 +403,15 @@ export function assertCanonicalObjectiveWorkstreamBinding(
   if (anchors.length !== 1) {
     fail(`expected exactly 1 OBJECTIVE_WORKSTREAM_COMMITTED anchor, got ${anchors.length}`);
   }
+  // R3.B — the event HEADER itself is bound to the binding's
+  // provenance: actor = operator:${created_by}, new_state COMMITTED,
+  // old_state null. The append-only hash protects the body; the
+  // validator now proves the body represents the same authority.
+  if (String(anchors[0]!.actor) !== `operator:${String(row.created_by)}` ||
+      String(anchors[0]!.new_state) !== "COMMITTED" ||
+      (anchors[0]!.old_state ?? null) !== null) {
+    fail("anchor event header does not match binding provenance");
+  }
   const md = (anchors[0]!.metadata ?? {}) as Record<string, unknown>;
   const wsRows = (row.workstreams as Array<Record<string, unknown>> | undefined) ?? [];
   const expectedAnchor: Record<string, unknown> = {
@@ -493,7 +502,12 @@ export class ObjectiveWorkstreamService {
     root: Row;
     children: Row[];
   } {
-    if (!input.actor || !String(input.actor).trim()) {
+    // R3.A — actor is runtime authority SHAPE, first check before any
+    // deadline evaluation or transaction: a non-string value must never
+    // reach a persisted authority row the canonical reader would reject.
+    if (typeof input.actor !== "string" ||
+        !input.actor.trim() ||
+        input.actor.length > 256) {
       throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "objective_workstream.decompose");
     }
     const objectiveId = boundedStr("objective_id", input.objective_id, 256);

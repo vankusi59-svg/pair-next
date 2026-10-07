@@ -1046,3 +1046,93 @@ describe("P15.2 R2.E — strict integer shape", () => {
     s.store.close();
   });
 });
+
+/* ============================ R3 — final closures ============================ */
+
+describe("P15.2 R3.A — strict actor runtime shape", () => {
+  it("non-string / blank actors reject BEFORE any deadline evaluation or write", () => {
+    for (const bad of [123, {}, "   ", null, undefined, []]) {
+      const s = freshStack(`r3a-${String(bad)}`);
+      const bid = mkBusiness(s.store);
+      // deadline in the past — if actor validation ran AFTER
+      // evaluateDeadline the objective would already be EXPIRED.
+      const o = mkObjective(s.objectives, bid, { deadline: "2000-01-01T00:00:00.000Z" });
+      const oid = String(o.objective_id);
+      expectFail(
+        () => s.svc.decomposeObjective({
+          objective_id: oid, ...pins(o),
+          workstreams: [{ workstream_key: "a", title: "t", goal: "g" }],
+          actor: bad as unknown as string,
+        }),
+        "FAIL_CLOSED_OPERATOR_ID_REQUIRED",
+      );
+      // zero authority rows minted
+      expect(rowCount(s.store, "work_item")).toBe(0);
+      expect(rowCount(s.store, "work_decomposition")).toBe(0);
+      expect(rowCount(s.store, "objective_workstream_binding")).toBe(0);
+      // and the objective itself was NEVER touched — the actor check ran
+      // before evaluateDeadline, so no EXPIRED commit happened.
+      expect(String(s.objectives.get(oid).status)).toBe("ACTIVE");
+      s.store.close();
+    }
+    // valid actor still passes (same objective, fresh pins)
+    const s = freshStack("r3a-ok");
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const r = s.svc.decomposeObjective({
+      objective_id: String(o.objective_id), ...pins(o),
+      workstreams: [{ workstream_key: "a", title: "t", goal: "g" }], actor: OP,
+    });
+    expect(r.binding.created_by).toBe(OP);
+    s.store.close();
+  });
+});
+
+describe("P15.2 R3.B — anchor event header provenance", () => {
+  function committed(name: string) {
+    const s = freshStack(name);
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    s.svc.decomposeObjective({
+      objective_id: oid, ...pins(o),
+      ...proposal([{ workstream_key: "a", title: "A", goal: "g" }]),
+    });
+    return { ...s, bid, oid, o };
+  }
+
+  it("rewritten anchor actor / new_state (with recomputed event hash) → strict read fails", () => {
+    const mutations: Array<(body: Record<string, unknown>) => void> = [
+      (b) => { b.actor = "operator:attacker"; },
+      (b) => { b.new_state = "DRAFT"; },
+      (b) => { b.old_state = "PENDING"; },
+    ];
+    for (const [i, mutate] of mutations.entries()) {
+      const { store, oid, svc } = committed(`r3b-${i}`);
+      const bid2 = objectiveWorkstreamBindingId(oid);
+      const anchor = store.listEvents("objective_workstream_binding", bid2)[0]!;
+      const body = {
+        event_id: anchor.event_id, entity_type: anchor.entity_type, entity_id: anchor.entity_id,
+        event_type: anchor.event_type, old_state: anchor.old_state ?? null,
+        new_state: anchor.new_state, actor: anchor.actor,
+        correlation_id: anchor.correlation_id ?? null,
+        metadata: anchor.metadata, created_at: anchor.created_at,
+      };
+      mutate(body);
+      const sqlParts: string[] = [];
+      const vals: unknown[] = [];
+      sqlParts.push("actor=?", "new_state=?", "old_state=?", "event_hash=?");
+      vals.push(body.actor, body.new_state, body.old_state, eventHash(body), String(anchor.event_id));
+      dbOf(store).prepare(`UPDATE events SET ${sqlParts.join(",")} WHERE event_id=?`).run(...vals);
+      expectFail(() => svc.getBinding(oid), "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_BINDING");
+      store.close();
+    }
+  });
+
+  it("unchanged anchor stays PASS after Objective amendment", () => {
+    const { store, objectives, bid, oid, svc } = committed("r3b-amend");
+    objectives.amend(oid, { business_id: bid, patch: { target: "12" }, reason: "r", actor: `operator:${OP}` });
+    expect(svc.getBinding(oid)!.binding_id).toBe(objectiveWorkstreamBindingId(oid));
+    store.close();
+  });
+});
