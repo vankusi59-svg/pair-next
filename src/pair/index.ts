@@ -66,6 +66,7 @@ export * from "./broker-capability.js";
 export * from "./sanitizer.js";
 export * from "./business.js";
 export * from "./agent-contract.js";
+export * from "./objective-authority.js";
 export * from "./cost.js";
 export * from "./secret-policy.js";
 export * from "./devin-executor.js";
