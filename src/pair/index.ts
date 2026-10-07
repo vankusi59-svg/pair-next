@@ -77,6 +77,7 @@ export * from "./codex-planner.js";
 export * from "./selfmod-bootstrap.js";
 export * from "./promotion-service.js";
 export * from "./work-graph.js";
+export * from "./objective-workstream.js";
 export * from "./work-coordination.js";
 export * from "./work-completion.js";
 export * from "./routine-mirror.js";

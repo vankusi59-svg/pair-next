@@ -1040,6 +1040,10 @@ export class WorkforceService {
             String(existing.assignee_agent_id ?? "") === String(spec.assignee_agent_id ?? "") &&
             (existing.requires_review === true) === spec.requires_review &&
             String(existing.required_capability ?? "") === String(spec.required_capability ?? "") &&
+            // P15.2 — objective identity is inherited from the parent,
+            // never caller-supplied: a residue carrying a conflicting
+            // objective_id is never silently adopted.
+            String(existing.objective_id ?? "") === String(parent.objective_id ?? "") &&
             String(existing.title) === spec.title &&
             String(existing.goal) === spec.goal &&
             String(existing.status) === freshStatus &&
@@ -1062,6 +1066,10 @@ export class WorkforceService {
             goal: String(c.goal),
             assignee_agent_id: c.assignee_agent_id,
             parent_work_item_id: workItemId,
+            // P15.2 — derived-only objective propagation: the child
+            // inherits the parent's objective_id when the parent has
+            // one; caller metadata is never consulted.
+            objective_id: parent.objective_id ? String(parent.objective_id) : undefined,
             required_capability: reqCap ?? undefined,
             requires_review: c.requires_review === true,
             decomposition_id: decompId,
