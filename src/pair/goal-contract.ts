@@ -292,6 +292,65 @@ const FILE_EDGE_HEAD_RE = new RegExp(
 const PRODUCE_VERB_RE =
   /\b(?:create|write|produce|generate|save|draft|export|render|emit|build|tạo|viết|soạn|lưu|xuất|sinh|render)/iu;
 
+/** Produce→object binding (M3 CASE_B): a filename mints DEL_* only when
+ *  its leftward governing token is a produce verb. Clause-level
+ *  co-occurrence of a produce verb and a filename is NOT binding —
+ *  "tạo PR ... sửa src/foo.test.ts" must not fabricate a deliverable for
+ *  the modify-target file. The backward scan stops at the first
+ *  governing token; connectives, other filenames, filler and unknown
+ *  words pass through; destination prepositions (to/vào/into/thành/ra)
+ *  pass through — the verb before them governs ("write results to
+ *  report.md" produces report.md). Source/context prepositions and
+ *  non-produce action verbs stop the scan with NO mint — the file is an
+ *  input, a modify-target, or a contextual mention. Reaching clause
+ *  start without a governing verb → no mint: conservative incompleteness
+ *  beats a fabricated requirement. */
+const PRODUCE_GOVERNING_WORDS = new Set([
+  "create", "write", "produce", "generate", "save", "draft", "export",
+  "render", "emit", "build",
+  "tạo", "viết", "soạn", "lưu", "xuất", "sinh",
+]);
+const NON_PRODUCE_ACTION_WORDS = new Set([
+  // Modify/delete class — the file is the object being changed or removed.
+  "fix", "edit", "modify", "patch", "update", "change", "refactor",
+  "rename", "move", "delete", "remove", "drop", "replace", "revert",
+  "amend", "adjust", "tweak",
+  "sửa", "chỉnh", "đổi", "thay", "xóa", "gỡ", "loại", "bỏ", "vá",
+  "huỷ", "hủy", "cập", "nhật", "điều",
+  // Read/consume/inspect class — the file is an input being used.
+  "read", "open", "load", "parse", "inspect", "review", "analyze",
+  "analyse", "study", "survey", "check", "verify", "validate", "monitor",
+  "fetch", "retrieve", "collect", "gather", "download", "scrape",
+  "extract", "compare", "contrast", "assess", "evaluate", "use", "apply",
+  "consume", "reference", "cite", "import", "merge", "watch", "test",
+  "đọc", "xem", "mở", "kiểm", "tra", "phân", "tích", "khảo", "sát",
+  "đối", "chiếu", "sánh", "nghiên", "cứu", "tải", "thu", "thập", "lấy",
+  "tìm", "đánh", "giá", "dùng", "dụng", "áp", "trích", "dẫn", "nhập",
+  "gộp",
+]);
+const NON_OBJECT_PREP_WORDS = new Set([
+  "from", "từ", "of", "trong", "within", "inside", "in", "on", "at",
+  "trên", "about", "về", "like", "như", "theo", "per", "based",
+  "against", "với", "for", "cho", "because", "vì", "by", "bởi", "via",
+  "through", "qua", "over", "under", "behind", "before", "after", "sau",
+  "trước", "giữa", "between", "among", "ngoài", "outside", "except",
+  "trừ", "without", "để", "during", "khi", "lúc", "while", "since",
+  "kể", "until", "beyond", "around", "near", "beside", "along", "kèm",
+  "cùng", "vs", "versus",
+]);
+const GOVERNING_WORD_RE = /[\p{L}\p{N}_]+/gu;
+function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
+  const words = clause.slice(0, fileIndex).match(GOVERNING_WORD_RE) ?? [];
+  for (let i = words.length - 1; i >= 0; i--) {
+    const w = words[i].toLowerCase();
+    if (PRODUCE_GOVERNING_WORDS.has(w)) return true;
+    if (NON_PRODUCE_ACTION_WORDS.has(w) || NON_OBJECT_PREP_WORDS.has(w)) {
+      return false;
+    }
+  }
+  return false;
+}
+
 /** Work verbs that make a clause an obligation. Delivery verbs (send /
  *  gửi / deliver) are deliberately absent — delivery is governed by the
  *  existing telegram intent authority, never by an obligation row. */
@@ -524,12 +583,17 @@ export function extractGoalContract(goal: string): GoalContract {
     if (!deadline && DEADLINE_RE.test(clause)) {
       deadline = { id: "DDL_001", text: clause.slice(0, 500) };
     }
+    // A filename mints DEL_* only when its leftward governing token is a
+    // produce verb — clause-level co-occurrence of a produce verb and a
+    // filename is not binding (M3 CASE_B: `tạo` governed "PR" while the
+    // modify-target .test.ts in the same clause minted a fabricated
+    // DEL_001). See isProduceGovernedFile.
     const files: string[] = [];
-    if (PRODUCE_VERB_RE.test(clause)) {
-      FILE_RE.lastIndex = 0;
-      let fm: RegExpExecArray | null;
-      while ((fm = FILE_RE.exec(clause)) !== null) {
-        if (!files.includes(fm[1])) files.push(fm[1]);
+    FILE_RE.lastIndex = 0;
+    let fm: RegExpExecArray | null;
+    while ((fm = FILE_RE.exec(clause)) !== null) {
+      if (!files.includes(fm[1]) && isProduceGovernedFile(clause, fm.index)) {
+        files.push(fm[1]);
       }
     }
     for (const f of files.slice(0, 8)) {
