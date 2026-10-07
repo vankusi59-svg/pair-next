@@ -85,10 +85,31 @@ describe("planner prompt contract — delivery hygiene (M4 RC2)", () => {
 });
 
 describe("planner prompt contract — dataflow/coverage gaps seen live (R1 round 2)", () => {
-  it("goal-named files are deliverables: a task must produce them, remote produces via outbox upload", () => {
-    expect(PROMPT).toMatch(/GOAL-NAMED FILES ARE DELIVERABLES/);
-    expect(PROMPT).toMatch(/some task must PRODUCE that exact filename/i);
-    expect(PROMPT).toMatch(/uploading them via the outbox endpoint/i);
+  const goalNamedBullet = () =>
+    PROMPT.match(/GOAL-NAMED FILE DELIVERABLES[^\n]*/i)?.[0] ?? "";
+
+  it("R1.A — real named deliverable still requires a producer with the exact filename", () => {
+    const b = goalNamedBullet();
+    expect(b).toMatch(/GOAL-NAMED/i);
+    expect(b).toMatch(/output\/deliverable|deliverable/i);
+    expect(b).toMatch(/some task must produce that exact filename/i);
+    expect(b).toMatch(/outbox endpoint/i);
+  });
+
+  it("R1.B — modify/edit/fix of a source file does NOT by itself make it a deliverable", () => {
+    const b = goalNamedBullet();
+    expect(b).toMatch(/modif|edit|fix/i);
+    expect(b).toMatch(/does not|never|not by itself/i);
+    // the over-broad "create or modify => PRODUCE" overstatement is gone
+    expect(b).not.toMatch(/create or modify/i);
+  });
+
+  it("R1.C — remote artifact handoff invariants survive the narrowing", () => {
+    const b = goalNamedBullet();
+    expect(b).toMatch(/remote/i);
+    expect(PROMPT).toMatch(/REMOTE DATAFLOW CONTRACT/);
+    expect(PROMPT).toMatch(/BYTE DEPENDENCIES/);
+    expect(PROMPT).toMatch(/TELEGRAM_DELIVERY/);
   });
 
   it("one path per artifact: no restating the same file under a different path form or verb", () => {
