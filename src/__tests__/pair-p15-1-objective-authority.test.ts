@@ -833,11 +833,15 @@ describe("P15.1 R2.A — canonical verifier resolution", () => {
       }),
       "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
     );
-    // A CANONICAL mission + a real governed evidence under it → attaches.
+    // R4.B Option A — even a canonical mission + real governed evidence
+    // cannot attach: attach is owner-authorized only, no reusable
+    // canonical provenance verifier exists in P15.1.
     const mid = mkMission(store, bid);
     const ev = mkAttachEvidence(store, mid);
-    const row = svc.attachEvidence(oid, { business_id: bid, evidence: ev, actor: "e" });
-    expect((row.evidence_refs as unknown[]).length).toBe(1);
+    expectFail(
+      () => svc.attachEvidence(oid, { business_id: bid, evidence: ev, actor: "e" }),
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+    );
     store.close();
   });
 
@@ -880,32 +884,38 @@ describe("P15.1 R2.A — canonical verifier resolution", () => {
       }),
       "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
     );
-    // Fully canonical artifact + real evidence → attaches.
+    // R4.B Option A — even a fully canonical artifact + acceptance
+    // evidence cannot attach: generic store.put + ARTIFACT_ACCEPTED is
+    // not domain authority; attach is owner-authorized only.
     const aid = mkCanonicalArtifact(store, mid);
-    const row = svc.attachEvidence(oid, {
-      business_id: bid,
-      evidence: { evidence_key: ev.evidence_key, verifier: `artifact:${aid}`, source: "s" },
-      actor: "e",
-    });
-    expect((row.evidence_refs as unknown[]).length).toBe(1);
+    expectFail(
+      () => svc.attachEvidence(oid, {
+        business_id: bid,
+        evidence: { evidence_key: ev.evidence_key, verifier: `artifact:${aid}`, source: "s" },
+        actor: "e",
+      }),
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+    );
     store.close();
   });
 
-  it("attachEvidence via artifact resolves through mission — foreign-business mission rejected", () => {
-    const { store, svc } = freshDb("r3a-art-foreign");
+  it("attachEvidence via artifact fails closed even with a canonical artifact + mission (R4.B)", () => {
+    const { store, svc } = freshDb("r4b-art-foreign");
     const bidA = mkBusiness(store, "BIZ_RA");
     const bidB = mkBusiness(store, "BIZ_RB");
     const o = mkObjective(svc, bidA);
     const midB = mkMission(store, bidB);
     const aidB = mkCanonicalArtifact(store, midB);
     const evB = mkAttachEvidence(store, midB);
+    // artifact: verifiers are never attach authority — fail closed
+    // before any provenance resolution.
     expectFail(
       () => svc.attachEvidence(String(o.objective_id), {
         business_id: bidA,
         evidence: { evidence_key: evB.evidence_key, verifier: `artifact:${aidB}`, source: "s" },
         actor: "e",
       }),
-      "FAIL_CLOSED_OBJECTIVE_SCOPE",
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
     );
     store.close();
   });
@@ -927,8 +937,8 @@ describe("P15.1 R2.A — canonical verifier resolution", () => {
     store.close();
   });
 
-  it("attach via mission requires the evidence to exist under that mission", () => {
-    const { store, svc } = freshDb("r3a-attkey");
+  it("attach via mission fails closed even when the mission is canonical (R4.B)", () => {
+    const { store, svc } = freshDb("r4b-attkey");
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
     const mid = mkMission(store, bid);
@@ -938,7 +948,7 @@ describe("P15.1 R2.A — canonical verifier resolution", () => {
         evidence: { evidence_key: "EVD_ghost", verifier: `mission:${mid}`, source: "s" },
         actor: "e",
       }),
-      "FAIL_CLOSED_OBJECTIVE_EVIDENCE",
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
     );
     store.close();
   });
@@ -1019,9 +1029,8 @@ describe("P15.1 R2.B — idempotency semantic binding", () => {
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
     const oid = String(o.objective_id);
-    const mid = mkMission(store, bid);
-    const attachEv = mkAttachEvidence(store, mid);
-    svc.attachEvidence(oid, { business_id: bid, evidence: attachEv, actor: "e" });
+    const attachEv = ownerEvidence("attach-key-1");
+    svc.attachEvidence(oid, { business_id: bid, evidence: attachEv, actor: OWNER });
     // same key as a PROGRESS application — different semantic digest →
     // conflict fires on the ledger BEFORE verifier resolution.
     expectFail(
@@ -1427,10 +1436,13 @@ describe("P15.1 R3.C — unanimous business provenance", () => {
       created_at: "x", version: 0,
     }, 0);
     const ev = mkAttachEvidence(store, mid);
+    // R4.B — attach is owner-authorized only: contradictory provenance
+    // never even reaches resolution; both objectives reject at the
+    // verifier seam.
     for (const [oid, bid] of [[String(oA.objective_id), bidA], [String(oB.objective_id), bidB]] as const) {
       expectFail(
         () => svc.attachEvidence(oid, { business_id: bid, evidence: ev, actor: "e" }),
-        "FAIL_CLOSED_OBJECTIVE_PROVENANCE",
+        "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
       );
     }
     store.close();
@@ -1447,10 +1459,46 @@ describe("P15.1 R3.C — unanimous business provenance", () => {
       created_at: "x", version: 0,
     }, 0);
     const ev = mkAttachEvidence(store, mid);
+    // R4.B — attach is owner-authorized only (no provenance resolution).
     expectFail(
       () => svc.attachEvidence(String(o.objective_id), { business_id: bid, evidence: ev, actor: "e" }),
-      "FAIL_CLOSED_OBJECTIVE_SCOPE",
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
     );
+    store.close();
+  });
+});
+
+/* ==================== R4.A — create digest is integrity-bound ==================== */
+
+describe("P15.1 R4.A — create_semantic_digest integrity binding", () => {
+  it("tampering create_semantic_digest via direct store.put → strict get FAIL CLOSED", () => {
+    const { store, svc } = freshDb("r4a-digest");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid, { target: "10" });
+    const oid = String(o.objective_id);
+    const row = JSON.parse(JSON.stringify(svc.get(oid))) as Record<string, unknown>;
+    row.create_semantic_digest = digest("forged-create-semantics");
+    // A direct canonical-row mutation without digest rebinding must be
+    // caught by strict read — objective_digest binds it (R4.A).
+    store.put("objective", oid, row, Number(row.version));
+    expectFail(() => svc.get(oid), "FAIL_CLOSED_OBJECTIVE_DIGEST");
+    store.close();
+  });
+
+  it("amend recomputes objective_digest while retaining the exact original create_semantic_digest", () => {
+    const { store, svc } = freshDb("r4a-amend");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid, { target: "10" });
+    const oid = String(o.objective_id);
+    const csd = String(o.create_semantic_digest);
+    const d0 = String(o.objective_digest);
+    const amended = svc.amend(oid, { business_id: bid, patch: { target: "12" }, reason: "r", actor: OWNER });
+    expect(String(amended.create_semantic_digest)).toBe(csd);
+    expect(String(amended.objective_digest)).not.toBe(d0);
+    // strict read still validates — the digest binds the retained csd.
+    const reread = svc.get(oid);
+    expect(String(reread.create_semantic_digest)).toBe(csd);
+    expect(String(reread.target)).toBe("12");
     store.close();
   });
 });
