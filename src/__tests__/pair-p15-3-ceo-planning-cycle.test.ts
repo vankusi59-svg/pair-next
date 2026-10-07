@@ -58,6 +58,7 @@ import {
   ceoAttemptId,
   ceoAttemptStartDigest,
   ceoCycleId,
+  ceoDecisionDigest,
   ceoDecisionId,
   ceoCliArgv,
   digest,
@@ -341,6 +342,28 @@ function eventHash(body: Record<string, unknown>): string {
 }
 function dbOf(store: PairEvidenceStore) {
   return (store as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown; get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[] } } }).db;
+}
+
+/** Rewrite an entity payload IN PLACE (same version) with a recomputed
+ *  payload_hash — a byte-level mutation primitive for provenance tests.
+ *  Unlike store.put it preserves the store version, which lets tests
+ *  either keep a row canonical (consistent rewrites) or forge it while
+ *  retaining the pinned lifecycle cardinality. */
+function sqlRewriteEntity(
+  store: PairEvidenceStore,
+  entityType: string,
+  entityId: string,
+  fn: (body: Record<string, unknown>) => void,
+): void {
+  const row = dbOf(store)
+    .prepare("SELECT payload FROM entities WHERE entity_type=? AND entity_id=?")
+    .get(entityType, entityId) as { payload: string } | undefined;
+  if (!row) throw new Error(`entity ${entityType}:${entityId} absent`);
+  const body = JSON.parse(row.payload) as Record<string, unknown>;
+  fn(body);
+  dbOf(store)
+    .prepare("UPDATE entities SET payload=?, payload_hash=? WHERE entity_type=? AND entity_id=?")
+    .run(JSON.stringify(body), digest(body), entityType, entityId);
 }
 
 /* ============================ A — observation ============================ */
@@ -2110,9 +2133,11 @@ describe("P15.3 R3.D — attempt actor provenance pinned", () => {
     await new Promise((r) => setTimeout(r, 50));
     const att = attemptsOf(s.store)[0]!;
     expect(String(att.state)).toBe("STARTED");
-    // age it past grace
+    // age it past grace — in-place byte rewrite keeps version=1 so the
+    // aged STARTED row stays canonical under the R4.B cardinality pin.
     const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    s.store.put("ceo_decision_attempt", String(att.attempt_id), { ...att, started_at: old }, Number(att.version));
+    sqlRewriteEntity(s.store, "ceo_decision_attempt", String(att.attempt_id),
+      (b) => { b.started_at = old; });
     // started_at is pinned in START metadata — patch it there too so the
     // attempt stays canonical while aged.
     const ev = s.store.listEvents("ceo_decision_attempt", String(att.attempt_id))[0]!;
@@ -2139,6 +2164,269 @@ describe("P15.3 R3.D — attempt actor provenance pinned", () => {
     expect(String(settled.state)).toBe("UNKNOWN");
     assertCanonicalCeoAttempt(s.store, settled); // operator:system settle actor canonical
     void p;
+    s.store.close();
+  });
+});
+
+/* ============================ R4.A — terminal monotonicity ============================ */
+
+describe("P15.3 R4.A — attempt terminal monotonicity", () => {
+  it("UNKNOWN never resurrects: late invocation cannot commit; bounded attempt #2 commits", async () => {
+    let release: ((v: CeoInvokeResult) => void) | undefined;
+    const gate = new Promise<CeoInvokeResult>((r) => { release = r; });
+    let calls = 0;
+    // eslint-disable-next-line prefer-const
+    let s: ReturnType<typeof freshCeo>;
+    s = freshCeo("r4a-1", () => {
+      calls += 1;
+      if (calls === 1) return gate;
+      const m = s.store.get("model_entry", s.me);
+      return {
+        model_entry_id: s.me,
+        provider_id: String(m.provider_id),
+        model_id: String(m.model_id),
+        raw_text: initProposalJson(),
+      };
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const did = ceoDecisionId(oid, ceoCycleId(oid, buildCeoObservation(s, oid).observation_digest));
+
+    // (1)+(2): pending real invocation; STARTED attempt committed.
+    const p = s.svc.runCycle({ objective_id: oid, actor: OP });
+    const pGuard = p.then(() => "resolved" as const, (e) => e);
+    await new Promise((r) => setTimeout(r, 60));
+    const att = attemptsOf(s.store)[0]!;
+    const aid = String(att.attempt_id);
+    expect(String(att.state)).toBe("STARTED");
+
+    // (3): age past grace → reconcile → canonical UNKNOWN.
+    const old = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    sqlRewriteEntity(s.store, "ceo_decision_attempt", aid,
+      (b) => { b.started_at = old; });
+    const ev = s.store.listEvents("ceo_decision_attempt", aid)[0]!;
+    const md = { ...(ev.metadata as Record<string, unknown>), started_at: old };
+    md.start_identity_digest = ceoAttemptStartDigest({
+      attempt_id: aid, cycle_id: String(att.cycle_id),
+      objective_id: oid, business_id: String(att.business_id),
+      observation_digest: String(att.observation_digest),
+      attempt_number: Number(att.attempt_number),
+      model_entry_id: String(att.model_entry_id),
+      provider_id: String(att.provider_id), model_id: String(att.model_id),
+      started_at: old, started_by: OP,
+    });
+    const evBody = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state ?? null, new_state: ev.new_state,
+      actor: ev.actor, correlation_id: ev.correlation_id ?? null,
+      metadata: md, created_at: ev.created_at,
+    };
+    dbOf(s.store).prepare("UPDATE events SET metadata_json=?, event_hash=? WHERE event_id=?")
+      .run(JSON.stringify(md), eventHash(evBody), String(ev.event_id));
+    expect(s.svc.reconcileStaleAttempts(oid)).toBe(1);
+    expect(String(s.store.get("ceo_decision_attempt", aid).state)).toBe("UNKNOWN");
+
+    // (4)+(5)+(6): release the OLD invocation — it must NOT commit any
+    // decision, and its INITIALIZE must mint zero binding/work graph.
+    const m = s.store.get("model_entry", s.me);
+    release!({
+      model_entry_id: s.me,
+      provider_id: String(m.provider_id),
+      model_id: String(m.model_id),
+      raw_text: initProposalJson(),
+    });
+    const outcome = await pGuard;
+    expect((outcome as IntegrityError).code ?? outcome).toBe("FAIL_CLOSED_CEO_DECISION_ATTEMPT");
+
+    // (5): zero CEO decision row minted by the late worker.
+    expect(s.store.tryGet("ceo_decision", did)).toBeNull();
+    expect(decisionsOf(s.store)).toHaveLength(0);
+    // (6): zero CEO-authorized binding / work graph from the late result.
+    expect(s.workstreams.getBinding(oid)).toBeNull();
+    expect(s.store.list("work_item")).toHaveLength(0);
+    // (7): attempt #1 remains canonical UNKNOWN — exactly 1 SETTLE anchor.
+    const settled = s.store.get("ceo_decision_attempt", aid);
+    expect(String(settled.state)).toBe("UNKNOWN");
+    assertCanonicalCeoAttempt(s.store, settled);
+    const settles = s.store.listEvents("ceo_decision_attempt", aid)
+      .filter((e) => String(e.event_type) === "CEO_DECISION_ATTEMPT_SETTLED");
+    expect(settles).toHaveLength(1);
+
+    // (8): bounded attempt #2 on the SAME observation commits normally.
+    const r2 = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    expect(calls).toBe(2);
+    expect(String(r2.decision.decision_id)).toBe(did);
+    expect(String(r2.decision.state)).toBe("COMMITTED");
+    expect(String(r2.attempt_id)).not.toBe(aid);
+    const attempts = attemptsOf(s.store);
+    expect(attempts).toHaveLength(2);
+    const att2 = attempts.find((a) => Number(a.attempt_number) === 2)!;
+    expect(String(att2.state)).toBe("ACCEPTED");
+    assertCanonicalCeoAttempt(s.store, att2);
+    expect(s.workstreams.getBinding(oid)).not.toBeNull();
+    s.store.close();
+  });
+
+  it("terminal attempt never transitions — settle on a settled row is a converged no-op", async () => {
+    const s = freshCeo("r4a-2", initProposalJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const att = attemptsOf(s.store)[0]!;
+    expect(String(att.state)).toBe("ACCEPTED");
+    // Second reconcile pass touches nothing; no second SETTLE anchor.
+    expect(s.svc.reconcileStaleAttempts(oid)).toBe(0);
+    assertCanonicalCeoAttempt(s.store, s.store.get("ceo_decision_attempt", String(att.attempt_id)));
+    expect(s.store.listEvents("ceo_decision_attempt", String(att.attempt_id))
+      .filter((e) => String(e.event_type) === "CEO_DECISION_ATTEMPT_SETTLED")).toHaveLength(1);
+    s.store.close();
+  });
+});
+
+/* ============================ R4.B — strict canonical row shape ============================ */
+
+describe("P15.3 R4.B — strict canonical row shape + immutability", () => {
+  async function committed(name: string) {
+    const s = freshCeo(name, initProposalJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    return { s, oid, did: String(r.decision.decision_id) };
+  }
+
+  it("shadow authority fields on the decision row → strict read fails", async () => {
+    for (const field of [
+      "executor_id", "mission_id", "assignee_agent_id",
+      "selected_model", "router", "telegram",
+    ]) {
+      const { s, did } = await committed(`r4b-${field}`);
+      sqlRewriteEntity(s.store, "ceo_decision", did, (b) => { b[field] = "x"; });
+      await expectFail(
+        () => assertCanonicalCeoDecision(s, s.store.get("ceo_decision", did) as never),
+        "FAIL_CLOSED_CEO_DECISION",
+      );
+      s.store.close();
+    }
+  });
+
+  it("shadow field on the attempt row → strict attempt validation fails", async () => {
+    const { s, did } = await committed("r4b-att");
+    const dec = s.store.get("ceo_decision", did);
+    const aid = String(dec.attempt_id);
+    sqlRewriteEntity(s.store, "ceo_decision_attempt", aid, (b) => { b.mission_id = "m1"; });
+    await expectFail(
+      () => assertCanonicalCeoDecision(s, s.store.get("ceo_decision", did) as never),
+      "FAIL_CLOSED_CEO_DECISION_ATTEMPT",
+    );
+    s.store.close();
+  });
+
+  it("generic rewrite of a committed decision (create-only pin) → fails", async () => {
+    const { s, did } = await committed("r4b-rewrite");
+    const dec = s.store.get("ceo_decision", did);
+    // A byte-identical generic rewrite bumps version 1→2 — no longer authority.
+    s.store.put("ceo_decision", did, { ...dec, version: 1 }, 1);
+    await expectFail(
+      () => assertCanonicalCeoDecision(s, s.store.get("ceo_decision", did) as never),
+      "FAIL_CLOSED_CEO_DECISION",
+    );
+    s.store.close();
+  });
+
+  it("generic rewrite of a terminal attempt (lifecycle cardinality) → fails", async () => {
+    const { s, did } = await committed("r4b-att-rewrite");
+    const dec = s.store.get("ceo_decision", did);
+    const aid = String(dec.attempt_id);
+    const att = s.store.get("ceo_decision_attempt", aid);
+    s.store.put("ceo_decision_attempt", aid, { ...att, version: 2 }, 2);
+    await expectFail(
+      () => assertCanonicalCeoAttempt(s.store, s.store.get("ceo_decision_attempt", aid)),
+      "FAIL_CLOSED_CEO_DECISION_ATTEMPT",
+    );
+    s.store.close();
+  });
+
+  it("non-vacuous control: valid committed decision + attempt pass strict read", async () => {
+    const { s, did } = await committed("r4b-control");
+    const dec = s.store.get("ceo_decision", did);
+    assertCanonicalCeoDecision(s, dec as never);
+    assertCanonicalCeoAttempt(s.store, s.store.get("ceo_decision_attempt", String(dec.attempt_id)));
+    s.store.close();
+  });
+});
+
+/* ============================ R4.C — end-to-end actor provenance ============================ */
+
+describe("P15.3 R4.C — decision created_by == attempt started_by", () => {
+  it("internally-consistent forged creator still fails on the attempt link", async () => {
+    const s = freshCeo("r4c-1", initProposalJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const did = String(r.decision.decision_id);
+
+    // Forge: rewrite the decision row for creator "mallory" — recompute
+    // decision_digest, keep store version 1, AND rewrite the COMMITTED
+    // anchor actor + pinned digest so the forged row is internally
+    // consistent. The linked canonical attempt still belongs to OP.
+    let newDigest = "";
+    sqlRewriteEntity(s.store, "ceo_decision", did, (b) => {
+      b.created_by = "mallory";
+      b.decision_digest = ceoDecisionDigest(b);
+      newDigest = String(b.decision_digest);
+    });
+    const ev = s.store.listEvents("ceo_decision", did)
+      .find((e) => String(e.event_type) === "CEO_DECISION_COMMITTED")!;
+    const md = { ...(ev.metadata as Record<string, unknown>), decision_digest: newDigest };
+    const evBody = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state ?? null, new_state: ev.new_state,
+      actor: "operator:mallory", correlation_id: ev.correlation_id ?? null,
+      metadata: md, created_at: ev.created_at,
+    };
+    dbOf(s.store).prepare("UPDATE events SET actor=?, metadata_json=?, event_hash=? WHERE event_id=?")
+      .run("operator:mallory", JSON.stringify(md), eventHash(evBody), String(ev.event_id));
+
+    await expectFail(
+      () => assertCanonicalCeoDecision(s, s.store.get("ceo_decision", did) as never),
+      "FAIL_CLOSED_CEO_DECISION",
+    );
+    s.store.close();
+  });
+
+  it("replay path enforces the same link — forged creator fails runCycle replay", async () => {
+    const s = freshCeo("r4c-2", initProposalJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const did = String(r.decision.decision_id);
+    sqlRewriteEntity(s.store, "ceo_decision", did, (b) => {
+      b.created_by = "mallory";
+      b.decision_digest = ceoDecisionDigest(b);
+    });
+    const ev = s.store.listEvents("ceo_decision", did)
+      .find((e) => String(e.event_type) === "CEO_DECISION_COMMITTED")!;
+    const md = {
+      ...(ev.metadata as Record<string, unknown>),
+      decision_digest: String(s.store.get("ceo_decision", did).decision_digest),
+    };
+    const evBody = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state ?? null, new_state: ev.new_state,
+      actor: "operator:mallory", correlation_id: ev.correlation_id ?? null,
+      metadata: md, created_at: ev.created_at,
+    };
+    dbOf(s.store).prepare("UPDATE events SET actor=?, metadata_json=?, event_hash=? WHERE event_id=?")
+      .run("operator:mallory", JSON.stringify(md), eventHash(evBody), String(ev.event_id));
+    await expectFail(
+      () => s.svc.runCycle({ objective_id: oid, actor: OP }),
+      "FAIL_CLOSED_CEO_DECISION",
+    );
     s.store.close();
   });
 });
