@@ -87,19 +87,76 @@ function expectFail(fn: () => unknown, code: string) {
 
 let missionSeq = 0;
 
-/** A real canonical mission bound to a business (metadata.business_id is
- *  the binding startMission writes). */
+/** A real CANONICAL mission bound to a business — the shape
+ *  startMission actually writes: goal + status + the
+ *  metadata.mission_origin ingress provenance pin + unanimous business
+ *  bindings (metadata.business_id + business_context.business_id). A
+ *  minimally shaped store.put row is not domain authority (R3.A.4). */
 function mkMission(store: PairEvidenceStore, businessId: string): string {
   const mid = `MSN_R2_${digest(`${businessId}:${missionSeq++}`).slice(0, 12)}`;
   store.put("mission", mid, {
     mission_id: mid,
+    goal: "canonical goal",
     status: "COMPLETED",
-    metadata: { business_id: businessId },
+    metadata: {
+      business_id: businessId,
+      business_context: { business_id: businessId, provenance: "caller", pinned_at: "x" },
+      mission_origin: { operator_id: "op", provenance: "MISSION_INGRESS", pinned_at: "x" },
+    },
     created_at: "x",
     updated_at: "x",
     version: 0,
   }, 0);
   return mid;
+}
+
+/** A canonical ACCEPTED PAIR artifact under a mission — the contract +
+ *  CAS storage shape the artifact subsystem writes plus the
+ *  ARTIFACT_ACCEPTED governed-evidence provenance record binding
+ *  artifact_id + execution_id + sha256 (R3.A.2). */
+function mkCanonicalArtifact(store: PairEvidenceStore, missionId: string): string {
+  const aid = `ART_${digest(`art:${missionSeq++}`).slice(0, 10)}`;
+  const sha = digest(`bytes:${aid}`);
+  store.put("artifact", aid, {
+    artifact_id: aid,
+    mission_id: missionId,
+    execution_id: `EX_${aid.slice(4)}`,
+    governed_task_id: `GTSK_${aid.slice(4)}`,
+    task_id: `T_${aid.slice(4)}`,
+    producer_executor_id: "CODEX",
+    logical_name: "report.md",
+    artifact_class: "FILE",
+    sha256: sha,
+    byte_size: 12,
+    state: "ACCEPTED",
+    contract: "pair-artifact.v1",
+    ingested_via: "EXECUTION",
+    storage: { kind: "PAIR_ARTIFACT_CAS", ref: `blobs/${sha}`, sha256: sha },
+    created_at: "x",
+    version: 0,
+  }, 0);
+  store.appendEvidence(missionId, "ARTIFACT_ACCEPTED", {
+    artifact_id: aid,
+    execution_id: `EX_${aid.slice(4)}`,
+    governed_task_id: `GTSK_${aid.slice(4)}`,
+    task_id: `T_${aid.slice(4)}`,
+    producer_executor_id: "CODEX",
+    logical_name: "report.md",
+    sha256: sha,
+    byte_size: 12,
+  });
+  return aid;
+}
+
+/** A real governed evidence row under a mission for the attach path
+ *  (any kind — attach references provenance, it does not claim a
+ *  measurement). */
+function mkAttachEvidence(
+  store: PairEvidenceStore,
+  missionId: string,
+): { evidence_key: string; verifier: string; source: string } {
+  const { evidence_id } = store.appendEvidence(missionId, "DELIVERY_ATTEMPT", { seq: missionSeq });
+  return { evidence_key: evidence_id, verifier: `mission:${missionId}`, source: "governed-evidence" };
 }
 
 /** A real governed OBJECTIVE_PROGRESS evidence row under a mission —
@@ -149,14 +206,12 @@ describe("P15.1 A — create/read durability", () => {
     const { dbPath, store, svc } = freshDb("restart");
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
-    const mid = mkMission(store, bid);
-    const ev = mkProgressEvidence(store, mid, String(o.objective_id), "KPI_1", 4);
     svc.recordProgress(String(o.objective_id), {
       business_id: bid,
       kpi_id: "KPI_1",
       value: 4,
-      evidence: ev,
-      actor: "executor:codex",
+      evidence: ownerEvidence("ev-restart"),
+      actor: OWNER,
     });
     store.close();
     const store2 = new PairEvidenceStore(dbPath);
@@ -201,10 +256,9 @@ describe("P15.1 B — duplicate/idempotent operations", () => {
     const { store, svc } = freshDb("dupev");
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
-    const mid = mkMission(store, bid);
-    const ev = mkProgressEvidence(store, mid, String(o.objective_id), "KPI_1", 5);
-    svc.recordProgress(String(o.objective_id), { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: "e" });
-    svc.recordProgress(String(o.objective_id), { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: "e" });
+    const ev = ownerEvidence("ev-replay");
+    svc.recordProgress(String(o.objective_id), { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: OWNER });
+    svc.recordProgress(String(o.objective_id), { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: OWNER });
     const row = svc.get(String(o.objective_id));
     expect((row.kpis as Array<Record<string, unknown>>)[0].current).toBe(5);
     const ledger = row.applied_evidence_keys as Array<{ key: string }>;
@@ -258,16 +312,15 @@ describe("P15.1 C — CAS/concurrency", () => {
     const oid = String(o.objective_id);
     // Alternating writers on separate connections — every op re-reads
     // inside immediate() and CAS-commits, so neither write is lost.
-    const mid = mkMission(store, bid);
     for (let i = 0; i < 6; i++) {
       const s = i % 2 === 0 ? svc : svc2;
-      const ev = mkProgressEvidence(store, mid, oid, "KPI_1", i + 1);
+      const ev = ownerEvidence(`ev-race-${i}`);
       s.recordProgress(oid, {
         business_id: bid,
         kpi_id: "KPI_1",
         value: i + 1,
         evidence: ev,
-        actor: "e",
+        actor: OWNER,
       });
     }
     const row = svc.get(oid);
@@ -386,14 +439,12 @@ describe("P15.1 E — KPI verified progress", () => {
     const { store, svc } = freshDb("e-ok");
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
-    const mid = mkMission(store, bid);
-    const ev = mkProgressEvidence(store, mid, String(o.objective_id), "KPI_1", 3);
     const row = svc.recordProgress(String(o.objective_id), {
       business_id: bid,
       kpi_id: "KPI_1",
       value: 3,
-      evidence: ev,
-      actor: "executor:codex",
+      evidence: ownerEvidence("ev-3"),
+      actor: OWNER,
     });
     expect((row.kpis as Array<Record<string, unknown>>)[0].current).toBe(3);
     store.close();
@@ -436,14 +487,12 @@ describe("P15.1 E — KPI verified progress", () => {
     const { store, svc } = freshDb("e-kpi");
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
-    const mid = mkMission(store, bid);
-    const ev = mkProgressEvidence(store, mid, String(o.objective_id), "KPI_2", 1);
     const row = svc.recordProgress(String(o.objective_id), {
       business_id: bid,
       kpi_id: "KPI_2",
       value: 1,
-      evidence: ev,
-      actor: "e",
+      evidence: ownerEvidence("ev-kpi2"),
+      actor: OWNER,
     });
     const kpis = row.kpis as Array<Record<string, unknown>>;
     expect(kpis[0].current).toBeNull();
@@ -727,118 +776,169 @@ describe("P15.1 R2.A — canonical verifier resolution", () => {
     store.close();
   });
 
-  it("real same-business mission + binding OBJECTIVE_PROGRESS evidence — passes", () => {
-    const { store, svc } = freshDb("r2a-real");
+  it("automated mission KPI progress is deliberately fail-closed — even canonical mission + real OBJECTIVE_PROGRESS evidence", () => {
+    const { store, svc } = freshDb("r3a-progress-closed");
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
     const mid = mkMission(store, bid);
     const ev = mkProgressEvidence(store, mid, String(o.objective_id), "KPI_1", 7);
-    const row = svc.recordProgress(String(o.objective_id), {
-      business_id: bid, kpi_id: "KPI_1", value: 7, evidence: ev, actor: "executor:codex",
-    });
-    expect((row.kpis as Array<Record<string, unknown>>)[0].current).toBe(7);
+    // PAIR has no canonical business-outcome verifier: generic
+    // appendEvidence + a real mission is not measurement authority
+    // (R3.A.5/R3.A.6).
+    expectFail(
+      () => svc.recordProgress(String(o.objective_id), {
+        business_id: bid, kpi_id: "KPI_1", value: 7, evidence: ev, actor: "executor:codex",
+      }),
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+    );
+    expect((svc.get(String(o.objective_id)).kpis as Array<Record<string, unknown>>)[0].current).toBeNull();
     store.close();
   });
 
-  it("real evidence belonging to business B cannot update objective of business A", () => {
-    const { store, svc } = freshDb("r2a-foreign");
-    const bidA = mkBusiness(store, "BIZ_RA");
-    const bidB = mkBusiness(store, "BIZ_RB");
-    const o = mkObjective(svc, bidA);
-    const midB = mkMission(store, bidB);
-    const ev = mkProgressEvidence(store, midB, String(o.objective_id), "KPI_1", 7);
+  it("automated artifact KPI progress is deliberately fail-closed — even a canonical accepted artifact", () => {
+    const { store, svc } = freshDb("r3a-artifact-closed");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid);
+    const mid = mkMission(store, bid);
+    const aid = mkCanonicalArtifact(store, mid);
+    const ev = mkProgressEvidence(store, mid, String(o.objective_id), "KPI_1", 4);
     expectFail(
       () => svc.recordProgress(String(o.objective_id), {
-        business_id: bidA, kpi_id: "KPI_1", value: 7, evidence: ev, actor: "e",
+        business_id: bid, kpi_id: "KPI_1", value: 4,
+        evidence: { evidence_key: ev.evidence_key, verifier: `artifact:${aid}`, source: "s" },
+        actor: "e",
       }),
-      "FAIL_CLOSED_OBJECTIVE_SCOPE",
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
     );
     store.close();
   });
 
-  it("evidence exists under a real mission but does NOT bind the claimed measurement → reject", () => {
-    const { store, svc } = freshDb("r2a-mismatch");
+  it("attachEvidence: a minimally shaped store.put mission row is NOT authority", () => {
+    const { store, svc } = freshDb("r3a-fakemission");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid);
+    const oid = String(o.objective_id);
+    // Fabricated minimal row — exists, integrity-consistent, but lacks
+    // the canonical mission shape (goal + mission_origin provenance pin).
+    store.put("mission", "MSN_FAKE", {
+      mission_id: "MSN_FAKE", status: "COMPLETED",
+      metadata: { business_id: bid }, created_at: "x", version: 0,
+    }, 0);
+    const { evidence_id } = store.appendEvidence("MSN_FAKE", "DELIVERY_ATTEMPT", { x: 1 });
+    expectFail(
+      () => svc.attachEvidence(oid, {
+        business_id: bid,
+        evidence: { evidence_key: evidence_id, verifier: "mission:MSN_FAKE", source: "s" },
+        actor: "e",
+      }),
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+    );
+    // A CANONICAL mission + a real governed evidence under it → attaches.
+    const mid = mkMission(store, bid);
+    const ev = mkAttachEvidence(store, mid);
+    const row = svc.attachEvidence(oid, { business_id: bid, evidence: ev, actor: "e" });
+    expect((row.evidence_refs as unknown[]).length).toBe(1);
+    store.close();
+  });
+
+  it("attachEvidence: a minimally shaped store.put artifact row is NOT authority — canonical acceptance provenance required", () => {
+    const { store, svc } = freshDb("r3a-fakeartifact");
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
     const oid = String(o.objective_id);
     const mid = mkMission(store, bid);
-    // evidence binds value=7 — caller claims value=5, wrong kpi, wrong objective
-    const real = mkProgressEvidence(store, mid, oid, "KPI_1", 7);
-    for (const claim of [
-      { kpi_id: "KPI_1", value: 5 },                       // wrong value
-      { kpi_id: "KPI_2", value: 7 },                       // wrong kpi
-    ]) {
-      expectFail(
-        () => svc.recordProgress(oid, {
-          business_id: bid, kpi_id: claim.kpi_id, value: claim.value, evidence: real, actor: "e",
-        }),
-        "FAIL_CLOSED_OBJECTIVE_MEASUREMENT",
-      );
-    }
-    // evidence bound to a DIFFERENT objective
-    const other = mkObjective(svc, bid, { dedup_key: "other", title: "Other" });
-    const foreign = mkProgressEvidence(store, mid, String(other.objective_id), "KPI_1", 7);
-    expectFail(
-      () => svc.recordProgress(oid, {
-        business_id: bid, kpi_id: "KPI_1", value: 7, evidence: foreign, actor: "e",
-      }),
-      "FAIL_CLOSED_OBJECTIVE_MEASUREMENT",
-    );
-    // evidence_key that doesn't exist under the mission at all
-    expectFail(
-      () => svc.recordProgress(oid, {
-        business_id: bid, kpi_id: "KPI_1", value: 7,
-        evidence: { evidence_key: "ghost-key", verifier: `mission:${mid}`, source: "s" }, actor: "e",
-      }),
-      "FAIL_CLOSED_OBJECTIVE_MEASUREMENT",
-    );
-    // non-PROGRESS kind under a real mission is not a measurement
-    const { evidence_id } = store.appendEvidence(mid, "DISPATCH_AUTHORIZED", { x: 1 });
-    expectFail(
-      () => svc.recordProgress(oid, {
-        business_id: bid, kpi_id: "KPI_1", value: 7,
-        evidence: { evidence_key: evidence_id, verifier: `mission:${mid}`, source: "s" }, actor: "e",
-      }),
-      "FAIL_CLOSED_OBJECTIVE_MEASUREMENT",
-    );
-    expect((svc.get(oid).kpis as Array<Record<string, unknown>>)[0].current).toBeNull();
-    store.close();
-  });
-
-  it("artifact verifier resolves through its mission — real path passes, foreign fails", () => {
-    const { store, svc } = freshDb("r2a-art");
-    const bidA = mkBusiness(store, "BIZ_ARTA");
-    const bidB = mkBusiness(store, "BIZ_ARTB");
-    const o = mkObjective(svc, bidA);
-    const oid = String(o.objective_id);
-    const mid = mkMission(store, bidA);
-    const aid = `ART_${digest("a1").slice(0, 10)}`;
-    store.put("artifact", aid, {
-      artifact_id: aid, mission_id: mid, state: "ACCEPTED", logical_name: "r.csv",
-      sha256: "x", created_at: "x", version: 0,
+    // Fabricated artifact row — correct-looking fields but no canonical
+    // contract/storage and no ARTIFACT_ACCEPTED provenance.
+    store.put("artifact", "ART_FAKE", {
+      artifact_id: "ART_FAKE", mission_id: mid, state: "ACCEPTED",
+      logical_name: "r.csv", sha256: "x", created_at: "x", version: 0,
     }, 0);
-    const ev = mkProgressEvidence(store, mid, oid, "KPI_1", 4);
-    const row = svc.recordProgress(oid, {
-      business_id: bidA, kpi_id: "KPI_1", value: 4,
+    const ev = mkAttachEvidence(store, mid);
+    expectFail(
+      () => svc.attachEvidence(oid, {
+        business_id: bid,
+        evidence: { evidence_key: ev.evidence_key, verifier: "artifact:ART_FAKE", source: "s" },
+        actor: "e",
+      }),
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+    );
+    // Contract-correct shape but NO ARTIFACT_ACCEPTED evidence → fail.
+    const sha = digest("noaccept");
+    store.put("artifact", "ART_NOACC", {
+      artifact_id: "ART_NOACC", mission_id: mid, execution_id: "EX_NOACC",
+      governed_task_id: "GTSK_NOACC", producer_executor_id: "CODEX",
+      logical_name: "r.md", sha256: sha, byte_size: 4, state: "ACCEPTED",
+      contract: "pair-artifact.v1", ingested_via: "EXECUTION",
+      storage: { kind: "PAIR_ARTIFACT_CAS", ref: `blobs/${sha}`, sha256: sha },
+      created_at: "x", version: 0,
+    }, 0);
+    expectFail(
+      () => svc.attachEvidence(oid, {
+        business_id: bid,
+        evidence: { evidence_key: ev.evidence_key, verifier: "artifact:ART_NOACC", source: "s" },
+        actor: "e",
+      }),
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+    );
+    // Fully canonical artifact + real evidence → attaches.
+    const aid = mkCanonicalArtifact(store, mid);
+    const row = svc.attachEvidence(oid, {
+      business_id: bid,
       evidence: { evidence_key: ev.evidence_key, verifier: `artifact:${aid}`, source: "s" },
       actor: "e",
     });
-    expect((row.kpis as Array<Record<string, unknown>>)[0].current).toBe(4);
-    // artifact bound to a foreign-business mission → rejected
+    expect((row.evidence_refs as unknown[]).length).toBe(1);
+    store.close();
+  });
+
+  it("attachEvidence via artifact resolves through mission — foreign-business mission rejected", () => {
+    const { store, svc } = freshDb("r3a-art-foreign");
+    const bidA = mkBusiness(store, "BIZ_RA");
+    const bidB = mkBusiness(store, "BIZ_RB");
+    const o = mkObjective(svc, bidA);
     const midB = mkMission(store, bidB);
-    const aidB = `ART_${digest("a2").slice(0, 10)}`;
-    store.put("artifact", aidB, {
-      artifact_id: aidB, mission_id: midB, state: "ACCEPTED", logical_name: "r.csv",
-      sha256: "x", created_at: "x", version: 0,
-    }, 0);
-    const evB = mkProgressEvidence(store, midB, oid, "KPI_1", 9);
+    const aidB = mkCanonicalArtifact(store, midB);
+    const evB = mkAttachEvidence(store, midB);
     expectFail(
-      () => svc.recordProgress(oid, {
-        business_id: bidA, kpi_id: "KPI_1", value: 9,
+      () => svc.attachEvidence(String(o.objective_id), {
+        business_id: bidA,
         evidence: { evidence_key: evB.evidence_key, verifier: `artifact:${aidB}`, source: "s" },
         actor: "e",
       }),
       "FAIL_CLOSED_OBJECTIVE_SCOPE",
+    );
+    store.close();
+  });
+
+  it("generic appendEvidence OBJECTIVE_PROGRESS alone is not KPI authority", () => {
+    const { store, svc } = freshDb("r3a-generic");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid);
+    const mid = mkMission(store, bid);
+    // A fully-binding governed evidence row under a canonical mission —
+    // still NOT authority for a measurement (R3.A.6).
+    const ev = mkProgressEvidence(store, mid, String(o.objective_id), "KPI_1", 9);
+    expectFail(
+      () => svc.recordProgress(String(o.objective_id), {
+        business_id: bid, kpi_id: "KPI_1", value: 9, evidence: ev, actor: "e",
+      }),
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+    );
+    store.close();
+  });
+
+  it("attach via mission requires the evidence to exist under that mission", () => {
+    const { store, svc } = freshDb("r3a-attkey");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid);
+    const mid = mkMission(store, bid);
+    expectFail(
+      () => svc.attachEvidence(String(o.objective_id), {
+        business_id: bid,
+        evidence: { evidence_key: "EVD_ghost", verifier: `mission:${mid}`, source: "s" },
+        actor: "e",
+      }),
+      "FAIL_CLOSED_OBJECTIVE_EVIDENCE",
     );
     store.close();
   });
@@ -881,24 +981,23 @@ describe("P15.1 R2.B — idempotency semantic binding", () => {
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
     const oid = String(o.objective_id);
-    const mid = mkMission(store, bid);
-    const ev = mkProgressEvidence(store, mid, oid, "KPI_1", 5);
-    svc.recordProgress(oid, { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: "e" });
+    const ev = ownerEvidence("ek-sem");
+    svc.recordProgress(oid, { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: OWNER });
     // same key, different value — the semantic digest differs → conflict
     expectFail(
-      () => svc.recordProgress(oid, { business_id: bid, kpi_id: "KPI_1", value: 6, evidence: ev, actor: "e" }),
+      () => svc.recordProgress(oid, { business_id: bid, kpi_id: "KPI_1", value: 6, evidence: ev, actor: OWNER }),
       "FAIL_CLOSED_OBJECTIVE_EVIDENCE_CONFLICT",
     );
     // same key, different kpi
     expectFail(
-      () => svc.recordProgress(oid, { business_id: bid, kpi_id: "KPI_2", value: 5, evidence: ev, actor: "e" }),
+      () => svc.recordProgress(oid, { business_id: bid, kpi_id: "KPI_2", value: 5, evidence: ev, actor: OWNER }),
       "FAIL_CLOSED_OBJECTIVE_EVIDENCE_CONFLICT",
     );
     // same key, different verifier
     expectFail(
       () => svc.recordProgress(oid, {
         business_id: bid, kpi_id: "KPI_1", value: 5,
-        evidence: { evidence_key: ev.evidence_key, verifier: OWNER, source: ev.source }, actor: OWNER,
+        evidence: { evidence_key: ev.evidence_key, verifier: "operator:mallory", source: ev.source }, actor: OWNER,
       }),
       "FAIL_CLOSED_OBJECTIVE_EVIDENCE_CONFLICT",
     );
@@ -906,7 +1005,7 @@ describe("P15.1 R2.B — idempotency semantic binding", () => {
     expectFail(
       () => svc.recordProgress(oid, {
         business_id: bid, kpi_id: "KPI_1", value: 5,
-        evidence: { evidence_key: ev.evidence_key, verifier: ev.verifier, source: "other" }, actor: "e",
+        evidence: { evidence_key: ev.evidence_key, verifier: ev.verifier, source: "other" }, actor: OWNER,
       }),
       "FAIL_CLOSED_OBJECTIVE_EVIDENCE_CONFLICT",
     );
@@ -921,14 +1020,16 @@ describe("P15.1 R2.B — idempotency semantic binding", () => {
     const o = mkObjective(svc, bid);
     const oid = String(o.objective_id);
     const mid = mkMission(store, bid);
-    const { evidence_id } = store.appendEvidence(mid, "OBJECTIVE_PROGRESS", {
-      objective_id: oid, kpi_id: "KPI_1", value: 5,
-    });
-    const attachEv = { evidence_key: evidence_id, verifier: `mission:${mid}`, source: "s" };
+    const attachEv = mkAttachEvidence(store, mid);
     svc.attachEvidence(oid, { business_id: bid, evidence: attachEv, actor: "e" });
-    // same key as a PROGRESS application — different semantic digest → conflict
+    // same key as a PROGRESS application — different semantic digest →
+    // conflict fires on the ledger BEFORE verifier resolution.
     expectFail(
-      () => svc.recordProgress(oid, { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: attachEv, actor: "e" }),
+      () => svc.recordProgress(oid, {
+        business_id: bid, kpi_id: "KPI_1", value: 5,
+        evidence: { evidence_key: attachEv.evidence_key, verifier: OWNER, source: attachEv.source },
+        actor: OWNER,
+      }),
       "FAIL_CLOSED_OBJECTIVE_EVIDENCE_CONFLICT",
     );
     store.close();
@@ -1230,19 +1331,17 @@ describe("P15.1 R2.F — real worker-thread contention", () => {
     const bid = mkBusiness(store);
     const o = mkObjective(svc, bid);
     const oid = String(o.objective_id);
-    const mid = mkMission(store, bid);
-    const ev = mkProgressEvidence(store, mid, oid, "KPI_1", 5);
+    const ev = ownerEvidence("ek-race");
     const results = await runR2Race([
-      { op: "progress", dbPath, args: { oid, input: { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: "e" } } },
-      { op: "progress", dbPath, args: { oid, input: { business_id: bid, kpi_id: "KPI_1", value: 6, evidence: ev, actor: "e" } } },
+      { op: "progress", dbPath, args: { oid, input: { business_id: bid, kpi_id: "KPI_1", value: 5, evidence: ev, actor: OWNER } } },
+      { op: "progress", dbPath, args: { oid, input: { business_id: bid, kpi_id: "KPI_1", value: 6, evidence: ev, actor: OWNER } } },
     ]);
     const row = svc.get(oid);
-    expect((row.kpis as Array<Record<string, unknown>>)[0].current).toBe(5);
+    expect([5, 6]).toContain((row.kpis as Array<Record<string, unknown>>)[0].current);
     expect(okCount(results)).toBe(1);
     const loser = results.find((r) => !r.ok) as { code: string };
     expect([
       "FAIL_CLOSED_OBJECTIVE_EVIDENCE_CONFLICT",
-      "FAIL_CLOSED_OBJECTIVE_MEASUREMENT",
       "FAIL_CLOSED_VERSION_CONFLICT",
     ]).toContain(loser.code);
     store.close();
@@ -1252,6 +1351,179 @@ describe("P15.1 R2.F — real worker-thread contention", () => {
 function okCount(results: R2Outcome[]): number {
   return results.filter((r) => r.ok).length;
 }
+
+/* ==================== R3.B — create digest survives amendment ==================== */
+
+describe("P15.1 R3.B — create_semantic_digest is immutable", () => {
+  it("replay of the ORIGINAL create after an amend converges to the amended row — no new row/event/version", () => {
+    const { store, svc } = freshDb("r3b-replay");
+    const bid = mkBusiness(store);
+    const a = mkObjective(svc, bid, { target: "10" });
+    const oid = String(a.objective_id);
+    const amended = svc.amend(oid, { business_id: bid, actor: OWNER, patch: { target: "12" } });
+    expect(amended.target).toBe("12");
+    // exact replay of the ORIGINAL create → returns CURRENT amended row
+    const replay = mkObjective(svc, bid, { target: "10" });
+    expect(replay.objective_id).toBe(oid);
+    expect(replay.target).toBe("12"); // current amended term, not the replayed one
+    expect(replay.version).toBe(amended.version);
+    expect(replay.terms_version).toBe(amended.terms_version);
+    // create_semantic_digest is unchanged by the amend
+    expect(replay.create_semantic_digest).toBe(a.create_semantic_digest);
+    store.close();
+  });
+
+  it("same dedup identity + different original terms → CREATE_CONFLICT (even post-amend)", () => {
+    const { store, svc } = freshDb("r3b-conflict");
+    const bid = mkBusiness(store);
+    const a = mkObjective(svc, bid, { target: "10" });
+    const oid = String(a.objective_id);
+    svc.amend(oid, { business_id: bid, actor: OWNER, patch: { target: "12" } });
+    expectFail(
+      () => mkObjective(svc, bid, { target: "99" }),
+      "FAIL_CLOSED_OBJECTIVE_CREATE_CONFLICT",
+    );
+    // the amended row is untouched
+    const cur = svc.get(oid);
+    expect(cur.target).toBe("12");
+    store.close();
+  });
+
+  it("restart between create/amend/replay preserves create semantics", () => {
+    const { dbPath, store, svc } = freshDb("r3b-restart");
+    const bid = mkBusiness(store);
+    const a = mkObjective(svc, bid, { target: "10" });
+    const oid = String(a.objective_id);
+    svc.amend(oid, { business_id: bid, actor: OWNER, patch: { target: "12" } });
+    store.close();
+    const store2 = new PairEvidenceStore(dbPath);
+    const svc2 = new ObjectiveAuthorityService(store2);
+    const replay = mkObjective(svc2, bid, { target: "10" });
+    expect(replay.objective_id).toBe(oid);
+    expect(replay.target).toBe("12");
+    store2.close();
+  });
+});
+
+/* ==================== R3.C — business provenance contradiction ==================== */
+
+describe("P15.1 R3.C — unanimous business provenance", () => {
+  it("contradictory mission business bindings fail closed for BOTH sides", () => {
+    const { store, svc } = freshDb("r3c-conflict");
+    const bidA = mkBusiness(store, "BIZ_RA");
+    const bidB = mkBusiness(store, "BIZ_RB");
+    const oA = mkObjective(svc, bidA);
+    const oB = mkObjective(svc, bidB);
+    // metadata.business_id=A but business_context.business_id=B — a
+    // contradiction: never valid for either side.
+    const mid = `MSN_MIX_${digest("mix").slice(0, 8)}`;
+    store.put("mission", mid, {
+      mission_id: mid, goal: "g", status: "COMPLETED",
+      metadata: {
+        business_id: bidA,
+        business_context: { business_id: bidB },
+        mission_origin: { operator_id: "op", provenance: "MISSION_INGRESS", pinned_at: "x" },
+      },
+      created_at: "x", version: 0,
+    }, 0);
+    const ev = mkAttachEvidence(store, mid);
+    for (const [oid, bid] of [[String(oA.objective_id), bidA], [String(oB.objective_id), bidB]] as const) {
+      expectFail(
+        () => svc.attachEvidence(oid, { business_id: bid, evidence: ev, actor: "e" }),
+        "FAIL_CLOSED_OBJECTIVE_PROVENANCE",
+      );
+    }
+    store.close();
+  });
+
+  it("mission with NO business binding provable → fail closed", () => {
+    const { store, svc } = freshDb("r3c-nobind");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid);
+    const mid = `MSN_NB_${digest("nb").slice(0, 8)}`;
+    store.put("mission", mid, {
+      mission_id: mid, goal: "g", status: "COMPLETED",
+      metadata: { mission_origin: { operator_id: "op", provenance: "MISSION_INGRESS", pinned_at: "x" } },
+      created_at: "x", version: 0,
+    }, 0);
+    const ev = mkAttachEvidence(store, mid);
+    expectFail(
+      () => svc.attachEvidence(String(o.objective_id), { business_id: bid, evidence: ev, actor: "e" }),
+      "FAIL_CLOSED_OBJECTIVE_SCOPE",
+    );
+    store.close();
+  });
+});
+
+/* ==================== R3.D — strict runtime shape ==================== */
+
+describe("P15.1 R3.D — strict runtime shape", () => {
+  function tamper(o: Record<string, unknown>, mutate: (t: Record<string, unknown>) => void): Record<string, unknown> {
+    const t = JSON.parse(JSON.stringify(o)) as Record<string, unknown>;
+    mutate(t);
+    return t;
+  }
+
+  it("numeric-string KPI fields are malformed canonical state — current='5', target='10' fail closed", () => {
+    const { store, svc } = freshDb("r3d-kpi");
+    const bid = mkBusiness(store);
+    const o = mkObjective(svc, bid);
+    const oid = String(o.objective_id);
+    const liveVersion = () => Number((store.tryGet("objective", oid) as Record<string, unknown>).version);
+    for (const mutate of [
+      (t: Record<string, unknown>) => { (t.kpis as Array<Record<string, unknown>>)[0].current = "5"; },
+      (t: Record<string, unknown>) => { (t.kpis as Array<Record<string, unknown>>)[0].target = "10"; },
+      (t: Record<string, unknown>) => { (t.kpis as Array<Record<string, unknown>>)[0].baseline = "0"; },
+    ]) {
+      const row = tamper(svc.get(oid), mutate);
+      store.put("objective", oid, row, Number(row.version));
+      expectFail(() => svc.get(oid), "FAIL_CLOSED_OBJECTIVE_INTEGRITY");
+      // restore the canonical row — payload.version must equal the live
+      // stored version (put CAS-bumps to version+1)
+      const clean = tamper(row, (t) => { (t.kpis as Array<Record<string, unknown>>)[0].current = null; (t.kpis as Array<Record<string, unknown>>)[0].target = 10; (t.kpis as Array<Record<string, unknown>>)[0].baseline = 0; t.version = liveVersion(); });
+      store.put("objective", oid, clean, Number(clean.version));
+    }
+    store.close();
+  });
+
+  it("duplicate ledger key (even same digest) and empty digest are malformed canonical state", () => {
+    const { store, svc } = freshDb("r3d-ledger");
+    const bid = mkBusiness(store);
+    mkObjective(svc, bid, { budget_ceiling_microusd: 500 });
+    const o = svc.list(bid).find((r) => String(r.schema_version) === "pair.os.vnext.objective.v1");
+    const oid = String(o?.objective_id);
+    const liveVersion = () => Number((store.tryGet("objective", oid) as Record<string, unknown>).version);
+    for (const mutate of [
+      // duplicate key, same digest
+      (t: Record<string, unknown>) => {
+        t.applied_spend_keys = [{ key: "s1", digest: "d" }, { key: "s1", digest: "d" }];
+      },
+      // empty digest
+      (t: Record<string, unknown>) => {
+        t.applied_spend_keys = [{ key: "s1", digest: "" }];
+      },
+      // legacy bare-string entry — malformed under strict shape
+      (t: Record<string, unknown>) => {
+        t.applied_evidence_keys = ["legacy-key"];
+      },
+      // empty key
+      (t: Record<string, unknown>) => {
+        t.applied_spend_keys = [{ key: "", digest: "d" }];
+      },
+    ]) {
+      const canonical = svc.get(oid);
+      const row = tamper(canonical, mutate);
+      store.put("objective", oid, row, Number(row.version));
+      expectFail(() => svc.get(oid), "FAIL_CLOSED_OBJECTIVE_INTEGRITY");
+      // restore the canonical row before the next mutation (CAS version
+      // must match the live stored version)
+      const restore = JSON.parse(JSON.stringify(canonical)) as Record<string, unknown>;
+      restore.version = liveVersion();
+      store.put("objective", oid, restore, Number(restore.version));
+    }
+    store.close();
+  });
+});
 
 /* ==================== integration seam: BusinessLayer ==================== */
 

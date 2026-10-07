@@ -42,6 +42,7 @@
  */
 
 import { canonicalJson, digest, utcnow } from "./canonical.js";
+import { ARTIFACT_CONTRACT } from "./artifact-authority.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 
@@ -80,24 +81,28 @@ const OBJECTIVE_TRANSITIONS: Record<ObjectiveStatus, readonly ObjectiveStatus[]>
 export const KPI_DIRECTIONS = ["AT_LEAST", "AT_MOST", "EXACT"] as const;
 export type KpiDirection = (typeof KPI_DIRECTIONS)[number];
 
-/** Verification-authority kinds accepted on progress/evidence records.
- *  A prefix alone is NOT authority — each kind resolves against canonical
- *  state before it may move anything:
+/** Verification-authority kinds accepted on evidence records. A prefix
+ *  alone is NOT authority — each kind resolves against canonical state
+ *  before it may move anything (R3.A: row existence is persistence
+ *  integrity, not domain authority):
  *   - operator:<id>  — explicit owner-authorized measurement: the verifier
- *     must equal owner_authority_id AND the actor must be the owner.
- *   - mission:<id>   — a canonical mission row that exists, passes store
- *     integrity verification on read, and binds to the same business.
- *   - artifact:<id>  — a canonical artifact row resolving through its
- *     mission to the same business.
+ *     must equal owner_authority_id AND the actor must be the owner. This
+ *     is the ONLY seam that may move a KPI in P15.1.
+ *   - mission:<id>   — attach path only: a CANONICAL mission row (ingress
+ *     provenance pin + goal + status) whose business bindings are
+ *     unanimous and equal the objective's.
+ *   - artifact:<id>  — attach path only: a canonical ACCEPTED PAIR
+ *     artifact with ARTIFACT_ACCEPTED provenance resolving through a
+ *     canonical mission to the same business.
  *  "service"/self-report/other strings have no canonical outcome
  *  authority today — they fail closed rather than pretend verification.
  */
 const VERIFIER_KINDS = new Set(["operator", "mission", "artifact"]);
 
-/** Governed-evidence kind that carries a canonical KPI measurement under
- *  a mission — the bounded contract for future business-outcome
- *  verification. Payload must bind {objective_id, kpi_id, value}. */
-export const OBJECTIVE_PROGRESS_EVIDENCE_KIND = "OBJECTIVE_PROGRESS";
+/** Canonical evidence kind minted by the artifact subsystem on
+ *  acceptance — the authoritative provenance record an artifact must
+ *  carry before it may act as a verification context for attach. */
+const ARTIFACT_ACCEPTED_EVIDENCE_KIND = "ARTIFACT_ACCEPTED";
 
 /** On-row dedup ledgers are bounded — an overflow fails closed rather
  *  than letting the row grow without limit. */
@@ -336,17 +341,24 @@ function ledgerOf(value: unknown): ObjectiveLedgerEntry[] {
   if (value.length > LEDGER_CAP) {
     throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_LEDGER_FULL", "ledger");
   }
+  const seen = new Set<string>();
   return value.map((e) => {
-    if (typeof e === "string") {
-      // Legacy bare-key entry (pre-R2 rows) — semantics unprovable, so any
-      // replay against it deterministically conflicts (fail closed).
-      return { key: e, digest: "" };
-    }
+    // R3.D — strict runtime shape: only {key, digest} entries with
+    // non-empty strings are canonical; a legacy bare string, an empty
+    // digest, or a duplicate key (even with the same digest) is malformed
+    // canonical state and fails closed.
     if (!e || typeof e !== "object" || Array.isArray(e) ||
         typeof (e as Record<string, unknown>).key !== "string" ||
-        typeof (e as Record<string, unknown>).digest !== "string") {
+        !(e as Record<string, unknown>).key ||
+        typeof (e as Record<string, unknown>).digest !== "string" ||
+        !(e as Record<string, unknown>).digest) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_INTEGRITY", "ledger entry");
     }
+    const key = (e as Record<string, unknown>).key as string;
+    if (seen.has(key)) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_INTEGRITY", `duplicate ledger key ${key}`);
+    }
+    seen.add(key);
     return e as ObjectiveLedgerEntry;
   });
 }
@@ -437,7 +449,7 @@ export class ObjectiveAuthorityService {
         `${String(row.objective_id ?? row.entity_id)}:${String(row.schema_version ?? "absent")}`,
       );
     }
-    for (const f of ["objective_id", "business_id", "owner_authority_id"]) {
+    for (const f of ["objective_id", "business_id", "owner_authority_id", "create_semantic_digest"]) {
       assertStr(f, row[f]);
     }
     if (!(OBJECTIVE_STATUSES as readonly string[]).includes(String(row.status))) {
@@ -478,8 +490,13 @@ export class ObjectiveAuthorityService {
         throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_INTEGRITY", `duplicate kpi_id ${String(kk.kpi_id)}`);
       }
       kpiIds.add(String(kk.kpi_id));
-      if (!Number.isFinite(Number(kk.baseline)) || !Number.isFinite(Number(kk.target)) ||
-          (kk.current !== null && kk.current !== undefined && !Number.isFinite(Number(kk.current)))) {
+      // R3.D — strict runtime shape: baseline/target must be actual JS
+      // numbers (numeric strings like "10" are malformed canonical
+      // state); current may be null or a real number.
+      if (typeof kk.baseline !== "number" || !Number.isFinite(kk.baseline) ||
+          typeof kk.target !== "number" || !Number.isFinite(kk.target) ||
+          (kk.current !== null && kk.current !== undefined &&
+           (typeof kk.current !== "number" || !Number.isFinite(kk.current)))) {
         throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_INTEGRITY", `kpi ${String(kk.kpi_id)} numeric`);
       }
     }
@@ -700,8 +717,8 @@ export class ObjectiveAuthorityService {
       status: "ACTIVE" as ObjectiveStatus,
       status_reason: null,
       evidence_refs: [] as ObjectiveEvidence[],
-      applied_evidence_keys: [] as string[],
-      applied_spend_keys: [] as string[],
+      applied_evidence_keys: [] as ObjectiveLedgerEntry[],
+      applied_spend_keys: [] as ObjectiveLedgerEntry[],
       terms_version: 1,
       amendment_seq: 0,
       last_amendment: null,
@@ -715,6 +732,17 @@ export class ObjectiveAuthorityService {
       objective_id: id,
       business_id: businessId,
       terms_version: 1,
+      terms: termsOf(row),
+    });
+    // R3.B — immutable create semantics: bound at mint from the ORIGINAL
+    // create request terms and never rewritten by amendments. A replay of
+    // the exact original create converges even after legitimate amends;
+    // the same dedup identity carrying different terms conflicts.
+    row.create_semantic_digest = digest({
+      schema_version: OBJECTIVE_SCHEMA,
+      kind: "OBJECTIVE_CREATE_SEMANTICS",
+      objective_id: id,
+      business_id: businessId,
       terms: termsOf(row),
     });
     try {
@@ -731,15 +759,18 @@ export class ObjectiveAuthorityService {
         return saved;
       });
     } catch (err) {
-      // Duplicate/concurrent create — the identity converges, but only
-      // when semantics agree: same dedup identity + different protected
-      // terms is NOT a replay, it fails closed (R2.B.1).
+      // Duplicate/concurrent create — converge against the IMMUTABLE
+      // create semantic digest (R3.B): the winner may have since been
+      // legitimately amended, so comparing live terms is wrong. Same
+      // original-create semantics → exact replay returns the current
+      // canonical row; different semantics on the same dedup identity →
+      // CREATE_CONFLICT.
       if ((err as { code?: string }).code === "FAIL_CLOSED_VERSION_CONFLICT") {
         const winner = this.get(id);
-        if (digest(termsOf(winner)) !== digest(termsOf(row))) {
+        if (String(winner.create_semantic_digest ?? "") !== String(row.create_semantic_digest)) {
           throw new IntegrityError(
             "FAIL_CLOSED_OBJECTIVE_CREATE_CONFLICT",
-            `${id}: dedup identity reused with different terms`,
+            `${id}: dedup identity reused with different create semantics`,
           );
         }
         return winner;
@@ -749,14 +780,18 @@ export class ObjectiveAuthorityService {
   }
 
   /** Verified KPI progress — group-A mutation. `value` is an absolute
-   *  verified measurement bound by canonical evidence: a mission/artifact
-   *  verifier must resolve to a real, integrity-verified row in the same
-   *  business AND the evidence_key must locate a governed OBJECTIVE_PROGRESS
-   *  row under that mission whose payload binds this objective + kpi +
-   *  value. Operator measurements are owner-authorized only. The
-   *  evidence_key ledger binds the full semantic digest — a key reused
-   *  with different semantics conflicts fail-closed, never silently
-   *  replays or double-counts. */
+   *  verified measurement bound by canonical evidence. P15.1 supports
+   *  exactly one verification seam: the explicit owner-authorized
+   *  operator measurement (verifier === owner_authority_id, actor ===
+   *  owner). Automated mission/artifact KPI progress is DELIBERATELY
+   *  fail-closed: PAIR has no canonical business-outcome verifier that
+   *  proves a measurement, and generic governed-evidence persistence is
+   *  not outcome authority (R3.A). A future bounded outcome-verification
+   *  seam (P15.5) must bind business/objective/kpi/value/provenance/
+   *  immutable evidence identity before it may mint progress evidence.
+   *  The evidence_key ledger binds the full semantic digest — a key
+   *  reused with different semantics conflicts fail-closed, never
+   *  silently replays or double-counts. */
   recordProgress(
     objectiveId: string,
     input: {
@@ -792,10 +827,7 @@ export class ObjectiveAuthorityService {
       if (!kpi) {
         throw new NotFoundError(`objective ${objectiveId} kpi ${input.kpi_id}`);
       }
-      const resolution = this.resolveVerifier(row, ev, businessId, input.actor);
-      if (resolution.mission_id) {
-        this.assertMeasurementBound(resolution.mission_id, objectiveId, input.kpi_id, value, ev.evidence_key);
-      }
+      this.assertOwnerProgressVerifier(row, ev, input.actor);
       if (ledger.length >= LEDGER_CAP) {
         throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_LEDGER_FULL", objectiveId);
       }
@@ -830,10 +862,14 @@ export class ObjectiveAuthorityService {
     });
   }
 
-  /** Attach verified evidence without a KPI write — the verifier still
-   *  resolves canonically (mission/artifact must exist and bind this
-   *  business; the evidence_key must locate a real governed evidence row
-   *  under the resolved mission; operator attaches are owner-only). */
+  /** Attach verified evidence without a KPI write — provenance
+   *  referencing, not measurement. The verifier still resolves
+   *  canonically (R3.A): a mission must be a canonical mission row (not a
+   *  minimally shaped store.put row) with unanimous business provenance;
+   *  an artifact must be a canonical ACCEPTED PAIR artifact with
+   *  ARTIFACT_ACCEPTED provenance binding artifact_id+execution_id+sha256;
+   *  operator attaches are owner-only. The evidence_key must locate a
+   *  real governed evidence row under the resolved mission. */
   attachEvidence(
     objectiveId: string,
     input: {
@@ -861,7 +897,7 @@ export class ObjectiveAuthorityService {
           `${objectiveId}:${ev.evidence_key} reused with different semantics`,
         );
       }
-      const resolution = this.resolveVerifier(row, ev, businessId, input.actor);
+      const resolution = this.resolveAttachVerifier(row, ev, businessId, input.actor);
       if (resolution.mission_id) {
         this.assertEvidenceExists(resolution.mission_id, ev.evidence_key);
       }
@@ -1102,21 +1138,41 @@ export class ObjectiveAuthorityService {
     return this.get(objectiveId);
   }
 
+  /** KPI progress is owner-authorized measurement only in P15.1 (R3.A):
+   *  PAIR has no canonical business-outcome verifier capable of proving
+   *  an automated KPI measurement, so mission/artifact/self-report and
+   *  every other verifier kind fail closed rather than pretend
+   *  verification. The explicit owner seam remains: verifier must equal
+   *  owner_authority_id AND the actor must be the owner. */
+  private assertOwnerProgressVerifier(row: Row, ev: ObjectiveEvidence, actor: string): void {
+    if (verifierKind(ev.verifier) === "operator" &&
+        ev.verifier === String(row.owner_authority_id) &&
+        actor === String(row.owner_authority_id)) {
+      return;
+    }
+    throw new IntegrityError(
+      "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+      `verifier ${ev.verifier}: automated KPI progress is deliberately fail-closed in P15.1 — only the owner-authorized operator seam is supported`,
+    );
+  }
+
   /**
-   * Resolve a verifier string to canonical authority — a prefix alone is
-   * never authority (R2.A):
-   *  - operator:<id> — explicit owner-authorized measurement: verifier
-   *    must equal owner_authority_id AND actor must be the owner. Not
-   *    disguised as mission/artifact verification.
-   *  - mission:<id>  — the mission row must exist (store verify-on-read
-   *    covers integrity) and bind to this business via
-   *    metadata.business_id / mission_origin.businessId / project row.
-   *  - artifact:<id> — the artifact row must exist, integrity-verified,
-   *    and resolve through its mission to this business.
-   *  Returns the resolved mission_id for measurement/evidence binding,
-   *  or null for the owner-authorized operator path.
+   * Resolve an attachEvidence verifier to canonical authority — a prefix
+   * alone is never authority, and store-row existence is persistence
+   * integrity, not domain authority (R3.A):
+   *  - operator:<id> — verifier must equal owner_authority_id AND actor
+   *    must be the owner.
+   *  - mission:<id>  — the mission must be a CANONICAL mission row
+   *    (ingress provenance pin + goal + status), not a minimally shaped
+   *    store.put row, and its business provenance must be unanimous and
+   *    equal this objective's business.
+   *  - artifact:<id> — the artifact must be a canonical ACCEPTED PAIR
+   *    artifact (contract + CAS storage + acceptance evidence) whose
+   *    mission canonically binds this business.
+   *  Returns the resolved mission_id for evidence binding, or null for
+   *  the owner-authorized operator path.
    */
-  private resolveVerifier(
+  private resolveAttachVerifier(
     row: Row,
     ev: ObjectiveEvidence,
     businessId: string,
@@ -1133,75 +1189,128 @@ export class ObjectiveAuthorityService {
         `operator verifier ${ev.verifier} is not the owner ${String(row.owner_authority_id)} or actor is not owner`,
       );
     }
-    let missionId: string;
     if (kind === "mission") {
-      missionId = ref;
-    } else if (kind === "artifact") {
-      const artifact = this.store.tryGet("artifact", ref);
-      if (!artifact) {
-        throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_UNVERIFIED", `artifact ${ref} does not exist`);
-      }
-      missionId = String(artifact.mission_id ?? "");
-      if (!missionId) {
-        throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_UNVERIFIED", `artifact ${ref} has no mission`);
-      }
-    } else {
-      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_UNVERIFIED", `verifier ${ev.verifier}`);
+      const mission = this.assertCanonicalMission(ref, ev.verifier);
+      this.assertMissionBusiness(mission, businessId, ev.verifier);
+      return { mission_id: ref };
     }
+    if (kind === "artifact") {
+      return this.assertCanonicalArtifact(ref, businessId, ev.verifier);
+    }
+    throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_UNVERIFIED", `verifier ${ev.verifier}`);
+  }
+
+  /** A canonical mission row — integrity-verified by the store on read
+   *  AND carrying the canonical ingress shape (non-empty goal, status,
+   *  and the metadata.mission_origin provenance pin written at
+   *  MISSION_INGRESS). A minimally shaped store.put row is NOT domain
+   *  authority (R3.A.4). */
+  private assertCanonicalMission(missionId: string, verifier: string): Record<string, unknown> {
     const mission = this.store.tryGet("mission", missionId);
     if (!mission) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_UNVERIFIED", `mission ${missionId} does not exist`);
     }
-    this.assertMissionBusiness(mission, businessId, ev.verifier);
+    const md = (mission.metadata ?? {}) as Record<string, unknown>;
+    const origin = md.mission_origin as Record<string, unknown> | undefined;
+    if (typeof mission.goal !== "string" || !mission.goal ||
+        typeof mission.status !== "string" || !mission.status ||
+        !origin || typeof origin !== "object" || Array.isArray(origin) ||
+        typeof origin.provenance !== "string" || !origin.provenance) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+        `mission ${missionId} is not a canonical mission row (verifier ${verifier})`,
+      );
+    }
+    return mission;
+  }
+
+  /** A canonical ACCEPTED PAIR artifact (R3.A.2): contract +
+   *  PAIR_ARTIFACT_CAS storage + the canonical ARTIFACT_ACCEPTED
+   *  governed-evidence row under its mission binding exactly this
+   *  artifact_id + execution_id + sha256 — the same provenance the
+   *  artifact subsystem mints on acceptance. A fabricated row fails. */
+  private assertCanonicalArtifact(
+    artifactId: string,
+    businessId: string,
+    verifier: string,
+  ): { mission_id: string } {
+    const artifact = this.store.tryGet("artifact", artifactId);
+    if (!artifact) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_UNVERIFIED", `artifact ${artifactId} does not exist`);
+    }
+    const storage = artifact.storage as Record<string, unknown> | undefined;
+    if (String(artifact.contract ?? "") !== ARTIFACT_CONTRACT ||
+        String(artifact.state ?? "") !== "ACCEPTED" ||
+        String(artifact.artifact_id ?? "") !== artifactId ||
+        typeof artifact.sha256 !== "string" || !artifact.sha256 ||
+        typeof artifact.execution_id !== "string" || !artifact.execution_id ||
+        typeof artifact.governed_task_id !== "string" || !artifact.governed_task_id ||
+        typeof artifact.logical_name !== "string" || !artifact.logical_name ||
+        !storage || typeof storage !== "object" ||
+        String(storage.kind ?? "") !== "PAIR_ARTIFACT_CAS" ||
+        String(storage.sha256 ?? "") !== String(artifact.sha256)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+        `artifact ${artifactId} is not a canonical accepted PAIR artifact (verifier ${verifier})`,
+      );
+    }
+    const missionId = String(artifact.mission_id ?? "");
+    if (!missionId) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_UNVERIFIED", `artifact ${artifactId} has no mission`);
+    }
+    const mission = this.assertCanonicalMission(missionId, verifier);
+    this.assertMissionBusiness(mission, businessId, verifier);
+    // Canonical acceptance provenance: an ARTIFACT_ACCEPTED governed
+    // evidence row under the mission must bind exactly this artifact —
+    // the same record the artifact subsystem mints on acceptance. Row
+    // shape alone is never authority.
+    const accepted = this.store.listEvidence(missionId).some((r) => {
+      if (String(r.kind) !== ARTIFACT_ACCEPTED_EVIDENCE_KIND) return false;
+      const p = ((r.payload as Record<string, unknown> | undefined)?.payload ?? {}) as Record<string, unknown>;
+      return String(p.artifact_id ?? "") === artifactId &&
+             String(p.execution_id ?? "") === String(artifact.execution_id) &&
+             String(p.sha256 ?? "") === String(artifact.sha256);
+    });
+    if (!accepted) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+        `artifact ${artifactId} lacks canonical acceptance provenance (verifier ${verifier})`,
+      );
+    }
     return { mission_id: missionId };
   }
 
-  /** The mission must canonically bind the objective's business:
-   *  metadata.business_id, mission_origin.businessId, or the mission's
-   *  project row — at least one must match. */
+  /** The mission's business provenance must be UNANIMOUS (R3.C):
+   *  collect every present authoritative binding — metadata.business_id,
+   *  metadata.business_context.business_id, and the pinned
+   *  metadata.agent_contract.business_id. None provable → fail closed;
+   *  all agree → that business must equal the objective's; any
+   *  contradiction → FAIL CLOSED — never valid for either side. */
   private assertMissionBusiness(mission: Record<string, unknown>, businessId: string, verifier: string): void {
     const md = (mission.metadata ?? {}) as Record<string, unknown>;
-    if (md.business_id !== undefined && md.business_id !== null && String(md.business_id) === businessId) return;
-    const origin = (md.mission_origin ?? {}) as Record<string, unknown>;
-    if (origin.businessId !== undefined && origin.businessId !== null && String(origin.businessId) === businessId) return;
-    const project = mission.project_id
-      ? this.store.tryGet("project", String(mission.project_id))
-      : null;
-    if (project && project.business_id !== undefined && String(project.business_id) === businessId) return;
-    throw new IntegrityError(
-      "FAIL_CLOSED_OBJECTIVE_SCOPE",
-      `verifier ${verifier}: mission not bound to business ${businessId}`,
-    );
-  }
-
-  /** For KPI progress, the evidence_key must locate a real governed
-   *  evidence row under the resolved mission whose OBJECTIVE_PROGRESS
-   *  payload binds exactly this objective + kpi + value — a caller cannot
-   *  point at a real mission and claim an unrelated measurement (R2.A.5). */
-  private assertMeasurementBound(
-    missionId: string,
-    objectiveId: string,
-    kpiId: string,
-    value: number,
-    evidenceKey: string,
-  ): void {
-    const rows = this.store.listEvidence(missionId); // digest-verified on read
-    const rec = rows.find((r) => String(r.evidence_id) === evidenceKey);
-    if (!rec || String(rec.kind) !== OBJECTIVE_PROGRESS_EVIDENCE_KIND) {
+    const bindings: string[] = [];
+    const push = (v: unknown) => {
+      if (v !== undefined && v !== null && String(v) !== "") bindings.push(String(v));
+    };
+    push(md.business_id);
+    push((md.business_context as Record<string, unknown> | undefined)?.business_id);
+    push((md.agent_contract as Record<string, unknown> | undefined)?.business_id);
+    if (bindings.length === 0) {
       throw new IntegrityError(
-        "FAIL_CLOSED_OBJECTIVE_MEASUREMENT",
-        `${evidenceKey} is not an ${OBJECTIVE_PROGRESS_EVIDENCE_KIND} row under mission ${missionId}`,
+        "FAIL_CLOSED_OBJECTIVE_SCOPE",
+        `verifier ${verifier}: mission proves no business binding`,
       );
     }
-    // governed_evidence.payload nests the caller payload under .payload
-    // (the column stores the whole {evidence_id,mission_id,kind,payload} body)
-    const p = ((rec.payload as Record<string, unknown> | undefined)?.payload ?? {}) as Record<string, unknown>;
-    if (String(p.objective_id ?? "") !== objectiveId ||
-        String(p.kpi_id ?? "") !== kpiId ||
-        Number(p.value) !== value) {
+    if (new Set(bindings).size > 1) {
       throw new IntegrityError(
-        "FAIL_CLOSED_OBJECTIVE_MEASUREMENT",
-        `${evidenceKey} binds ${String(p.objective_id)}/${String(p.kpi_id)}/${String(p.value)} not ${objectiveId}/${kpiId}/${value}`,
+        "FAIL_CLOSED_OBJECTIVE_PROVENANCE",
+        `verifier ${verifier}: contradictory business bindings ${[...new Set(bindings)].join(" vs ")}`,
+      );
+    }
+    if (bindings[0] !== businessId) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_SCOPE",
+        `verifier ${verifier}: mission bound to ${bindings[0]} not ${businessId}`,
       );
     }
   }
