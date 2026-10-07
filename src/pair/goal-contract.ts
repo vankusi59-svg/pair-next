@@ -370,17 +370,29 @@ const SOURCE_PREP_WORDS = new Set(["from", "từ", "of"]);
 const DEST_PREP_WORDS = new Set([
   "to", "into", "onto", "as", "vào", "thành", "ra",
 ]);
-/** Ambiguous locatives — destination-capable, so they pass through the
- *  scan, BUT their left neighbour decides the file's role: when the
- *  nearest meaningful word is a non-file produced object, the locative
- *  marks that object's location ("create PR in src/foo.ts" — the file
- *  is where the PR lives, not the deliverable). */
+/** Ambiguous locatives — destination-capable, so they may pass through
+ *  the scan, BUT only on positive evidence (R3): the produced object
+ *  left of the locative must be a file-content noun — "write results
+ *  in report.md" mints report.md because results live INSIDE the file.
+ *  Anything else (PR/function/class/endpoint/hàm/...) is a produced
+ *  object that merely LOCATES the file — no mint. A denylist of such
+ *  objects can never close this class; positive evidence can. */
 const LOCATIVE_PREP_WORDS = new Set(["in", "trong", "on", "at", "trên"]);
-/** Produced objects that live in a location rather than inside a file —
- *  deliberately small: code-review/repo artifacts only, no ontology. */
-const NONFILE_PRODUCED_OBJECT_WORDS = new Set([
-  "pr", "pull", "request", "issue", "ticket", "branch", "commit",
-  "repo", "repository", "test", "mr",
+/** Positive file-content vocabulary — things that live inside a file
+ *  rather than locating one. Deliberately small and auditable; an
+ *  unknown object simply fails closed. */
+const FILE_CONTENT_OBJECT_WORDS = new Set([
+  // English output/file-content nouns
+  "result", "results", "report", "reports", "summary", "output",
+  "outputs", "data", "content", "document", "documents", "doc", "docs",
+  "documentation", "file", "files", "text", "note", "notes", "analysis",
+  "findings", "code", "source", "spec", "plan", "plans", "draft",
+  "log", "chart", "diagram", "guide",
+  // Vietnamese equivalents (syllable-tokenized)
+  "kết", "quả", "báo", "cáo", "nội", "dung", "dữ", "liệu", "tài",
+  "văn", "bản", "ghi", "chú", "phân", "tích", "mã", "nguồn", "đặc",
+  "tả", "kế", "hoạch", "tóm", "tắt", "nháp", "hướng", "dẫn", "biểu",
+  "đồ",
 ]);
 /** Fillers that may sit between the locative and its object — articles
  *  and near-article quantifiers only. */
@@ -404,7 +416,7 @@ function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
       while (j >= 0 && LOCATIVE_OBJECT_FILLER_WORDS.has(words[j].toLowerCase())) {
         j--;
       }
-      if (j >= 0 && NONFILE_PRODUCED_OBJECT_WORDS.has(words[j].toLowerCase())) {
+      if (j < 0 || !FILE_CONTENT_OBJECT_WORDS.has(words[j].toLowerCase())) {
         return false;
       }
       continue;

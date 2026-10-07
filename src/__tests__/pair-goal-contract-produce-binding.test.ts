@@ -172,3 +172,44 @@ describe("goal contract — produce→object binding R2: locative object class",
     expect(dels("Tạo test trong src/foo.ts")).toEqual([]);
   });
 });
+
+/** R3 audit — the generic root cause behind in/trong: any non-file
+ *  produced object can sit before the locative, so a denylist can never
+ *  close it. The locative may only lead to a mint when positive bounded
+ *  evidence shows FILE-content semantics (results/report/kết quả/báo
+ *  cáo/...). Everything else → no mint: the produced object merely
+ *  locates the file. All six first cases minted pre-patch
+ *  (non-vacuous). */
+describe("goal contract — produce→object binding R3: positive file-content evidence", () => {
+  it("Create function in src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Create function in src/foo.ts")).toEqual([]);
+  });
+
+  it("Tạo hàm trong src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Tạo hàm trong src/foo.ts")).toEqual([]);
+  });
+
+  it("Create class Foo in src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Create class Foo in src/foo.ts")).toEqual([]);
+  });
+
+  it("Create method in src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Create method in src/foo.ts")).toEqual([]);
+  });
+
+  it("Create API endpoint in src/server.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Create API endpoint in src/server.ts")).toEqual([]);
+  });
+
+  it("Tạo endpoint trong src/server.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Tạo endpoint trong src/server.ts")).toEqual([]);
+  });
+
+  it("Write the results in report.md → DEL report.md (positive evidence survives fillers)", () => {
+    expect(dels("Write the results in report.md")).toEqual(["report.md"]);
+  });
+
+  it("Write docs in docs.md → DEL docs.md (doc-family content)", () => {
+    expect(dels("Write docs in docs.md")).toEqual(["docs.md"]);
+  });
+});
