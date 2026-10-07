@@ -42,6 +42,66 @@ import {
 
 type Row = Record<string, unknown> & { version: number };
 
+/** CEO model eligibility (§"CRITICAL MODEL-ROLE COMPATIBILITY"):
+ *  canonical model_entry exists, is usable through the shared
+ *  providerModelEligibility projection, and is NOT canonically
+ *  DSH_EXECUTION (directly or by proven alias). PLANNER_COORDINATOR is
+ *  NOT required — a model may serve CEO without holding any exclusive
+ *  role. Authority violations throw; availability degradations reject
+ *  the attempt before any invocation. Exported as the single gate the
+ *  runtime wiring seam (ceo-runtime.ts) must reuse verbatim — no
+ *  second eligibility authority. */
+export function assertCeoModelUsable(
+  store: PairEvidenceStore,
+  modelEntryId: string,
+): Record<string, unknown> {
+  const model = store.tryGet("model_entry", modelEntryId);
+  if (!model) {
+    throw new IntegrityError("FAIL_CLOSED_CEO_MODEL_UNRESOLVED", `model_entry ${modelEntryId}`);
+  }
+  const conditions = (model.conditions ?? []) as string[];
+  if (conditions.some((c) => ["REMOVED", "DEPRECATED", "BLOCKED"].includes(c))) {
+    throw new IntegrityError("FAIL_CLOSED_CEO_MODEL_UNRESOLVED", `model ${modelEntryId} revoked`);
+  }
+  // Direct role check + alias-aware disjointness — a canonically
+  // DSH_EXECUTION model (or an entry that is canonically the SAME
+  // model as a DSH assignment) may never serve CEO_DECISION.
+  if (modelRoleOf(store, modelEntryId) === MODEL_ROLE.DSH_EXECUTION) {
+    throw new IntegrityError("FAIL_CLOSED_CEO_DSH_OVERLAP", `model ${modelEntryId} is DSH_EXECUTION`);
+  }
+  for (const asn of listModelRoleAssignments(store)) {
+    if (asn.role !== MODEL_ROLE.DSH_EXECUTION) continue;
+    const other = store.tryGet("model_entry", String(asn.model_entry_id));
+    if (other && sameCanonicalModel(model, other)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CEO_DSH_OVERLAP",
+        `model ${modelEntryId} is canonically a DSH_EXECUTION model`,
+      );
+    }
+  }
+  const elig = providerModelEligibility(
+    store, String(model.provider_id ?? model.provider_family ?? ""), modelEntryId);
+  if (!elig.eligible) {
+    const failed = Object.keys(elig.gates).filter((g) => elig.gates[g] === "FAIL");
+    const AUTHORITY = new Set([
+      "PROVIDER_QUALIFIED", "PROVIDER_AUTH_OK", "PROVIDER_NOT_BLOCKED",
+      "PROVIDER_RECEIPT_CURRENT", "MODEL_RECEIPT_CURRENT",
+      "MODEL_PROVIDER_MATCH", "MODEL_PROVIDER_IDENTITY_CONSISTENT",
+    ]);
+    if (failed.some((g) => AUTHORITY.has(g))) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CEO_PROVIDER_INELIGIBLE",
+        JSON.stringify({ model_entry_id: modelEntryId, failed_gates: failed }),
+      );
+    }
+    throw new IntegrityError(
+      "FAIL_CLOSED_CEO_MODEL_UNAVAILABLE",
+      JSON.stringify({ model_entry_id: modelEntryId, failed_gates: failed }),
+    );
+  }
+  return model;
+}
+
 export const CEO_DECISION_ENTITY = "ceo_decision";
 export const CEO_DECISION_ATTEMPT_ENTITY = "ceo_decision_attempt";
 export const CEO_DECISION_SCHEMA_VERSION = "pair.os.vnext.ceo-decision.v1";
@@ -699,59 +759,8 @@ export class CeoPlanningCycleService {
     }
   }
 
-  /** CEO model eligibility (§"CRITICAL MODEL-ROLE COMPATIBILITY"):
-   *  canonical model_entry exists, is usable through the shared
-   *  providerModelEligibility projection, and is NOT canonically
-   *  DSH_EXECUTION (directly or by proven alias). PLANNER_COORDINATOR is
-   *  NOT required — a model may serve CEO without holding any exclusive
-   *  role. Authority violations throw; availability degradations reject
-   *  the attempt before any invocation. */
   private assertCeoModelUsable(modelEntryId: string): Record<string, unknown> {
-    const model = this.store.tryGet("model_entry", modelEntryId);
-    if (!model) {
-      throw new IntegrityError("FAIL_CLOSED_CEO_MODEL_UNRESOLVED", `model_entry ${modelEntryId}`);
-    }
-    const conditions = (model.conditions ?? []) as string[];
-    if (conditions.some((c) => ["REMOVED", "DEPRECATED", "BLOCKED"].includes(c))) {
-      throw new IntegrityError("FAIL_CLOSED_CEO_MODEL_UNRESOLVED", `model ${modelEntryId} revoked`);
-    }
-    // Direct role check + alias-aware disjointness — a canonically
-    // DSH_EXECUTION model (or an entry that is canonically the SAME
-    // model as a DSH assignment) may never serve CEO_DECISION.
-    if (modelRoleOf(this.store, modelEntryId) === MODEL_ROLE.DSH_EXECUTION) {
-      throw new IntegrityError("FAIL_CLOSED_CEO_DSH_OVERLAP", `model ${modelEntryId} is DSH_EXECUTION`);
-    }
-    for (const asn of listModelRoleAssignments(this.store)) {
-      if (asn.role !== MODEL_ROLE.DSH_EXECUTION) continue;
-      const other = this.store.tryGet("model_entry", String(asn.model_entry_id));
-      if (other && sameCanonicalModel(model, other)) {
-        throw new IntegrityError(
-          "FAIL_CLOSED_CEO_DSH_OVERLAP",
-          `model ${modelEntryId} is canonically a DSH_EXECUTION model`,
-        );
-      }
-    }
-    const elig = providerModelEligibility(
-      this.store, String(model.provider_id ?? model.provider_family ?? ""), modelEntryId);
-    if (!elig.eligible) {
-      const failed = Object.keys(elig.gates).filter((g) => elig.gates[g] === "FAIL");
-      const AUTHORITY = new Set([
-        "PROVIDER_QUALIFIED", "PROVIDER_AUTH_OK", "PROVIDER_NOT_BLOCKED",
-        "PROVIDER_RECEIPT_CURRENT", "MODEL_RECEIPT_CURRENT",
-        "MODEL_PROVIDER_MATCH", "MODEL_PROVIDER_IDENTITY_CONSISTENT",
-      ]);
-      if (failed.some((g) => AUTHORITY.has(g))) {
-        throw new IntegrityError(
-          "FAIL_CLOSED_CEO_PROVIDER_INELIGIBLE",
-          JSON.stringify({ model_entry_id: modelEntryId, failed_gates: failed }),
-        );
-      }
-      throw new IntegrityError(
-        "FAIL_CLOSED_CEO_MODEL_UNAVAILABLE",
-        JSON.stringify({ model_entry_id: modelEntryId, failed_gates: failed }),
-      );
-    }
-    return model;
+    return assertCeoModelUsable(this.store, modelEntryId);
   }
 
   /**
