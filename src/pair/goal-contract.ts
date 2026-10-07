@@ -370,6 +370,23 @@ const SOURCE_PREP_WORDS = new Set(["from", "từ", "of"]);
 const DEST_PREP_WORDS = new Set([
   "to", "into", "onto", "as", "vào", "thành", "ra",
 ]);
+/** Ambiguous locatives — destination-capable, so they pass through the
+ *  scan, BUT their left neighbour decides the file's role: when the
+ *  nearest meaningful word is a non-file produced object, the locative
+ *  marks that object's location ("create PR in src/foo.ts" — the file
+ *  is where the PR lives, not the deliverable). */
+const LOCATIVE_PREP_WORDS = new Set(["in", "trong", "on", "at", "trên"]);
+/** Produced objects that live in a location rather than inside a file —
+ *  deliberately small: code-review/repo artifacts only, no ontology. */
+const NONFILE_PRODUCED_OBJECT_WORDS = new Set([
+  "pr", "pull", "request", "issue", "ticket", "branch", "commit",
+  "repo", "repository", "test", "mr",
+]);
+/** Fillers that may sit between the locative and its object — articles
+ *  and near-article quantifiers only. */
+const LOCATIVE_OBJECT_FILLER_WORDS = new Set([
+  "a", "an", "the", "một", "cái", "new", "mới",
+]);
 const GOVERNING_WORD_RE = /[\p{L}\p{N}_]+/gu;
 function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
   const words = clause.slice(0, fileIndex).match(GOVERNING_WORD_RE) ?? [];
@@ -382,6 +399,16 @@ function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
     if (NON_PRODUCE_ACTION_WORDS.has(w)) return false;
     if (SOURCE_PREP_WORDS.has(w) && destBound) continue;
     if (CONTEXT_PREP_WORDS.has(w)) return false;
+    if (LOCATIVE_PREP_WORDS.has(w)) {
+      let j = i - 1;
+      while (j >= 0 && LOCATIVE_OBJECT_FILLER_WORDS.has(words[j].toLowerCase())) {
+        j--;
+      }
+      if (j >= 0 && NONFILE_PRODUCED_OBJECT_WORDS.has(words[j].toLowerCase())) {
+        return false;
+      }
+      continue;
+    }
   }
   return false;
 }

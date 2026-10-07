@@ -121,3 +121,54 @@ describe("goal contract — produce→object binding R1: no legitimate DEL lost"
     expect(dels("Phân tích a.txt và tạo b.md")).toEqual(["b.md"]);
   });
 });
+
+/** R2 audit — in/trong ambiguity. Passthrough locatives must distinguish
+ *  `produce FILE-content in FILE` (file = deliverable) from
+ *  `produce NON-FILE object in FILE` (file = the object's location).
+ *  The first four no-mint cases all minted on the pre-R2 build
+ *  (non-vacuous). */
+describe("goal contract — produce→object binding R2: locative object class", () => {
+  it("Write results in report.md → DEL report.md (file-content object)", () => {
+    expect(dels("Write results in report.md")).toEqual(["report.md"]);
+  });
+
+  it("Viết kết quả trong report.md → DEL report.md (file-content object)", () => {
+    expect(dels("Viết kết quả trong report.md")).toEqual(["report.md"]);
+  });
+
+  it("Create PR in src/foo.ts → NO DEL (non-vacuous: minted pre-patch — PR is the produced object, file is its location)", () => {
+    expect(dels("Create PR in src/foo.ts")).toEqual([]);
+  });
+
+  it("Tạo PR trong src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Tạo PR trong src/foo.ts")).toEqual([]);
+  });
+
+  it("Create report in report.md → DEL report.md ('report' is file-content, not a non-file object)", () => {
+    expect(dels("Create report in report.md")).toEqual(["report.md"]);
+  });
+
+  it("Tạo báo cáo trong report.md → DEL report.md", () => {
+    expect(dels("Tạo báo cáo trong report.md")).toEqual(["report.md"]);
+  });
+
+  it("Create issue in src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Create issue in src/foo.ts")).toEqual([]);
+  });
+
+  it("Tạo commit trong src/foo.ts → NO DEL (non-vacuous: minted pre-patch)", () => {
+    expect(dels("Tạo commit trong src/foo.ts")).toEqual([]);
+  });
+
+  it("Create a PR in src/foo.ts → NO DEL (article filler does not hide the non-file object)", () => {
+    expect(dels("Create a PR in src/foo.ts")).toEqual([]);
+  });
+
+  it("Create pull request in src/foo.ts → NO DEL (multi-word non-file object)", () => {
+    expect(dels("Create pull request in src/foo.ts")).toEqual([]);
+  });
+
+  it("Tạo test trong src/foo.ts → NO DEL ('test' produced object locates the file)", () => {
+    expect(dels("Tạo test trong src/foo.ts")).toEqual([]);
+  });
+});
