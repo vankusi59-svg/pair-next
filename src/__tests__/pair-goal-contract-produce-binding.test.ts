@@ -82,3 +82,42 @@ describe("goal contract — produce→object binding: modify/source files never 
     expect(dels(M3)).toEqual([]);
   });
 });
+
+/** R1 audit — over-narrowing adversarial cases. The binding must not
+ *  lose legitimate deliverables: noun-phrase modifiers ("báo cáo phân
+ *  tích", "test report") and destination-capable prepositions ("in",
+ *  "trong") are NOT file-boundary evidence. All four mint cases below
+ *  failed on the first binding iteration (non-vacuous). */
+describe("goal contract — produce→object binding R1: no legitimate DEL lost", () => {
+  it("Tạo báo cáo phân tích report.md → DEL report.md ('phân tích' is noun-phrase material, not a governing verb)", () => {
+    expect(dels("Tạo báo cáo phân tích report.md")).toEqual(["report.md"]);
+  });
+
+  it("Create test report.md → DEL report.md ('test' modifies the noun, does not govern the file)", () => {
+    expect(dels("Create test report.md")).toEqual(["report.md"]);
+  });
+
+  it("Write results in report.md → DEL report.md ('in' is destination-capable, not a source boundary)", () => {
+    expect(dels("Write results in report.md")).toEqual(["report.md"]);
+  });
+
+  it("Viết kết quả trong report.md → DEL report.md ('trong' destination usage mints)", () => {
+    expect(dels("Viết kết quả trong report.md")).toEqual(["report.md"]);
+  });
+
+  it("Viết từ notes.md ra report.md → DEL report.md only (source phrase does not hide the governing verb from a destination file)", () => {
+    expect(dels("Viết từ notes.md ra report.md")).toEqual(["report.md"]);
+  });
+
+  it("Tạo biểu đồ từ dữ liệu trong data.csv → NO DEL (source-locative 'trong' phrase: 'từ' still bounds the file)", () => {
+    expect(dels("Tạo biểu đồ từ dữ liệu trong data.csv")).toEqual([]);
+  });
+
+  it("Sửa lỗi trong src/foo.test.ts để tạo PR → NO DEL ('trong' removal stays safe: 'sửa' still governs)", () => {
+    expect(dels("Sửa lỗi trong src/foo.test.ts để tạo PR")).toEqual([]);
+  });
+
+  it("Phân tích a.txt và tạo b.md → DEL b.md only (fragment removal: clause-start still bounds the analysis input)", () => {
+    expect(dels("Phân tích a.txt và tạo b.md")).toEqual(["b.md"]);
+  });
+});

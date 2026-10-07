@@ -289,8 +289,17 @@ const FILE_EDGE_HEAD_RE = new RegExp(
   "i",
 );
 
-const PRODUCE_VERB_RE =
-  /\b(?:create|write|produce|generate|save|draft|export|render|emit|build|tạo|viết|soạn|lưu|xuất|sinh|render)/iu;
+/** Canonical produce vocabulary — the single source feeding both the
+ *  clause-level PRODUCE_VERB_RE (obligation dedup below) and the
+ *  governing-token set used by produce→object binding. One list so the
+ *  two authorities can never drift apart. */
+const PRODUCE_WORDS = [
+  "create", "write", "produce", "generate", "save", "draft", "export",
+  "render", "emit", "build",
+  "tạo", "viết", "soạn", "lưu", "xuất", "sinh",
+] as const;
+const PRODUCE_VERB_RE = new RegExp(`\\b(?:${PRODUCE_WORDS.join("|")})\\b`, "iu");
+const PRODUCE_GOVERNING_WORDS = new Set<string>(PRODUCE_WORDS);
 
 /** Produce→object binding (M3 CASE_B): a filename mints DEL_* only when
  *  its leftward governing token is a produce verb. Clause-level
@@ -304,49 +313,75 @@ const PRODUCE_VERB_RE =
  *  non-produce action verbs stop the scan with NO mint — the file is an
  *  input, a modify-target, or a contextual mention. Reaching clause
  *  start without a governing verb → no mint: conservative incompleteness
- *  beats a fabricated requirement. */
-const PRODUCE_GOVERNING_WORDS = new Set([
-  "create", "write", "produce", "generate", "save", "draft", "export",
-  "render", "emit", "build",
-  "tạo", "viết", "soạn", "lưu", "xuất", "sinh",
-]);
+ *  beats a fabricated requirement.
+ *
+ *  R1 refinements (over-narrow audit):
+ *  - Only tokens that can govern a file BY THEMSELVES stop the scan.
+ *    Vietnamese disyllabic-verb fragments (phân/tích, kiểm/tra,
+ *    nghiên/cứu, ...) never govern alone and routinely appear inside
+ *    noun phrases ("báo cáo phân tích" = analysis report) — treating
+ *    them as boundaries false-blocked the real produce verb further
+ *    left. Same for bare "test" ("test report"). They pass through.
+ *  - Ambiguous locatives (in/on/at/trên/trong) double as destination
+ *    markers ("write results in report.md", "viết kết quả trong
+ *    report.md") — they pass through; locative uses inside modify
+ *    clauses stay protected by the modify verb further left.
+ *  - A source preposition (from/từ/of) mid-scan still bounds the file
+ *    — unless the file's own immediate preposition is an unambiguous
+ *    destination marker ("viết từ notes.md ra report.md"), in which
+ *    case the source phrase binds a different noun and the scan
+ *    continues to the governing verb. */
 const NON_PRODUCE_ACTION_WORDS = new Set([
   // Modify/delete class — the file is the object being changed or removed.
   "fix", "edit", "modify", "patch", "update", "change", "refactor",
   "rename", "move", "delete", "remove", "drop", "replace", "revert",
   "amend", "adjust", "tweak",
   "sửa", "chỉnh", "đổi", "thay", "xóa", "gỡ", "loại", "bỏ", "vá",
-  "huỷ", "hủy", "cập", "nhật", "điều",
+  "huỷ", "hủy",
   // Read/consume/inspect class — the file is an input being used.
   "read", "open", "load", "parse", "inspect", "review", "analyze",
   "analyse", "study", "survey", "check", "verify", "validate", "monitor",
   "fetch", "retrieve", "collect", "gather", "download", "scrape",
   "extract", "compare", "contrast", "assess", "evaluate", "use", "apply",
-  "consume", "reference", "cite", "import", "merge", "watch", "test",
-  "đọc", "xem", "mở", "kiểm", "tra", "phân", "tích", "khảo", "sát",
-  "đối", "chiếu", "sánh", "nghiên", "cứu", "tải", "thu", "thập", "lấy",
-  "tìm", "đánh", "giá", "dùng", "dụng", "áp", "trích", "dẫn", "nhập",
-  "gộp",
+  "consume", "reference", "cite", "import", "merge", "watch",
+  "đọc", "xem", "mở", "tải", "lấy", "tìm", "dùng", "nhập", "gộp",
 ]);
-const NON_OBJECT_PREP_WORDS = new Set([
-  "from", "từ", "of", "trong", "within", "inside", "in", "on", "at",
-  "trên", "about", "về", "like", "như", "theo", "per", "based",
-  "against", "với", "for", "cho", "because", "vì", "by", "bởi", "via",
-  "through", "qua", "over", "under", "behind", "before", "after", "sau",
-  "trước", "giữa", "between", "among", "ngoài", "outside", "except",
-  "trừ", "without", "để", "during", "khi", "lúc", "while", "since",
-  "kể", "until", "beyond", "around", "near", "beside", "along", "kèm",
-  "cùng", "vs", "versus",
+/** Context prepositions — a file reached through one of these is a
+ *  source, topic or circumstance object, never the produced thing. */
+const CONTEXT_PREP_WORDS = new Set([
+  "from", "từ", "of", "within", "inside",
+  "about", "về", "like", "như", "theo", "per", "based",
+  "against", "với", "with", "for", "cho", "because", "vì", "by", "bởi",
+  "via", "through", "qua", "over", "under", "behind", "before", "after",
+  "sau", "trước", "giữa", "between", "among", "ngoài", "outside",
+  "except", "trừ", "without", "để", "during", "khi", "lúc", "while",
+  "since", "kể", "until", "beyond", "around", "near", "beside", "along",
+  "kèm", "cùng", "vs", "versus",
+]);
+/** The subset whose phrase names the file's origin. When the file's own
+ *  immediate preposition is an unambiguous destination marker, a source
+ *  phrase elsewhere in the scan is binding a different noun — pass it. */
+const SOURCE_PREP_WORDS = new Set(["from", "từ", "of"]);
+/** Unambiguous destination markers — evidence the file sits in a
+ *  destination slot governed by the produce verb further left. The
+ *  ambiguous locatives (in/trong/on/at/trên) are deliberately absent:
+ *  they pass through the scan but are not strong enough to float a
+ *  source phrase. */
+const DEST_PREP_WORDS = new Set([
+  "to", "into", "onto", "as", "vào", "thành", "ra",
 ]);
 const GOVERNING_WORD_RE = /[\p{L}\p{N}_]+/gu;
 function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
   const words = clause.slice(0, fileIndex).match(GOVERNING_WORD_RE) ?? [];
+  const destBound =
+    words.length > 0 &&
+    DEST_PREP_WORDS.has(words[words.length - 1].toLowerCase());
   for (let i = words.length - 1; i >= 0; i--) {
     const w = words[i].toLowerCase();
     if (PRODUCE_GOVERNING_WORDS.has(w)) return true;
-    if (NON_PRODUCE_ACTION_WORDS.has(w) || NON_OBJECT_PREP_WORDS.has(w)) {
-      return false;
-    }
+    if (NON_PRODUCE_ACTION_WORDS.has(w)) return false;
+    if (SOURCE_PREP_WORDS.has(w) && destBound) continue;
+    if (CONTEXT_PREP_WORDS.has(w)) return false;
   }
   return false;
 }
