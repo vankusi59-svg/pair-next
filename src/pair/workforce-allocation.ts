@@ -22,8 +22,17 @@
  */
 
 import { digest, utcnow } from "./canonical.js";
-import { delegationRowId } from "./graph-authority.js";
-import { IntegrityError } from "./errors.js";
+import {
+  assertCanonicalAuthorityBinding,
+  assertCanonicalDependencySet,
+  assertCanonicalMembership,
+  authorityBindingRowId,
+  delegationRowId,
+  dependencySetRowId,
+  membershipRowId,
+  type GraphAuthorityDeps,
+} from "./graph-authority.js";
+import { IntegrityError, NotFoundError } from "./errors.js";
 import type { BusinessLayer } from "./business.js";
 import { TERMINAL_WORK_ITEM_STATUSES } from "./business.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
@@ -137,8 +146,16 @@ function probeEligibility(
   try {
     resolved = deps.business.agentContracts.resolve(agentId, {
       materialize: false, actor: ctx.actor });
-  } catch {
-    return null; // missing/malformed contract — ineligible, never minted
+  } catch (err) {
+    // R2.D — only expected ABSENCE/no-authority means "ineligible".
+    // Integrity/provenance corruption (malformed row, digest mismatch,
+    // business mismatch, invalid schema/version) must propagate fail
+    // closed — it can never silently demote a candidate.
+    if (err instanceof NotFoundError ||
+        (err as { code?: string }).code === "FAIL_CLOSED_AGENT_CONTRACT_MISSING") {
+      return null;
+    }
+    throw err;
   }
   const { agent, contract } = resolved;
   if (String(agent.business_id) !== ctx.businessId) return null;
@@ -215,12 +232,17 @@ function buildAllocationObservation(
   //  unlock allocation.
   const depsProven = deps.workforce.dependenciesProven(wi) === true;
   const projectId = String(deps.business.getBusiness(businessId).project_id);
-  // Canonical workload: non-terminal assigned work items in-business.
+  // R2.C — canonical workload authority: every counted row must pass
+  // the existing P14 graph-authority proof (membership ↔ WDEL/WDEC ↔
+  // WDS re-validation). A forged/malformed work_item QUARANTINES and
+  // fails the whole allocation closed — it can never silently move the
+  // ranking against a clean candidate.
   const workloadByAgent = new Map<string, number>();
   for (const w of deps.business.listWorkItems(businessId)) {
     const assignee = String(w.assignee_agent_id ?? "");
     if (!assignee) continue;
     if (TERMINAL_WORK_ITEM_STATUSES.has(String(w.status))) continue;
+    deps.business.assertGraphAuthority(w);
     workloadByAgent.set(assignee, (workloadByAgent.get(assignee) ?? 0) + 1);
   }
   const reqCap = wi.required_capability ? String(wi.required_capability) : null;
@@ -308,10 +330,16 @@ export function assertCanonicalWorkforceAllocation(
     selected_agent_id: String(row.selected_agent_id),
     delegated_child_work_item_id: String(row.delegated_child_work_item_id),
     delegation_id: String(row.delegation_id),
+    delegation_mode: "OPERATOR",
+    delegated_by_operator: String(row.created_by),
     allocation_observation_digest: String(row.allocation_observation_digest),
     allocation_digest: String(row.allocation_digest),
   })) {
     if (md[k] !== v) allocFail(`anchor ${k} mismatch`);
+  }
+  // R2.B — the pinned policy version is itself authority.
+  if (String(row.selection_policy_version) !== ALLOCATION_SELECTION_POLICY) {
+    allocFail(`selection_policy_version ${String(row.selection_policy_version)}`);
   }
   // Re-prove the full provenance chain — the receipt is NEVER a second
   // graph authority.
@@ -322,13 +350,21 @@ export function assertCanonicalWorkforceAllocation(
         objectiveWorkstreamBindingDigest(binding)) {
     allocFail("binding identity/digest mismatch");
   }
+  if (String(binding.business_id) !== String(row.business_id)) {
+    allocFail("binding business mismatch");
+  }
   const wsEntry = (binding.workstreams as Array<Record<string, unknown>>).find(
     (w) => String(w.workstream_key) === String(row.workstream_key));
   if (!wsEntry || String(wsEntry.work_item_id) !== String(row.workstream_work_item_id)) {
     allocFail("workstream not bound");
   }
-  // WDEL + delegated child must exist canonically and claim the exact
-  // slot/provenance this receipt pins.
+  const parent = deps.store.tryGet(
+    "work_item", String(row.workstream_work_item_id)) as Row | null;
+  if (!parent || String(parent.business_id) !== String(row.business_id)) {
+    allocFail("workstream work item business mismatch");
+  }
+  // Canonical WDEL — state COMMITTED, OPERATOR mode, and the operator
+  // provenance must equal the receipt's creator.
   const wdel = deps.store.tryGet("work_delegation", String(row.delegation_id)) as Row | null;
   if (!wdel) allocFail("delegation missing");
   if (String(row.delegation_id) !== delegationRowId(String(row.delegated_child_work_item_id)) ||
@@ -336,7 +372,12 @@ export function assertCanonicalWorkforceAllocation(
       String(wdel.child_work_item_id ?? "") !== String(row.delegated_child_work_item_id) ||
       String(wdel.parent_work_item_id ?? "") !== String(row.workstream_work_item_id) ||
       String(wdel.delegation_key ?? "") !==
-        allocationDelegationKey(String(row.objective_id), String(row.workstream_work_item_id))) {
+        allocationDelegationKey(String(row.objective_id), String(row.workstream_work_item_id)) ||
+      String(wdel.state ?? "") !== "COMMITTED" ||
+      String(wdel.delegation_mode ?? "") !== "OPERATOR" ||
+      String(wdel.delegated_by_operator ?? "") !== String(row.created_by) ||
+      String(wdel.created_by ?? "") !== String(row.created_by) ||
+      String(wdel.business_id ?? "") !== String(row.business_id)) {
     allocFail("delegation provenance mismatch");
   }
   const child = deps.store.tryGet(
@@ -345,11 +386,55 @@ export function assertCanonicalWorkforceAllocation(
   if (String(child.assignee_agent_id ?? "") !== String(row.selected_agent_id) ||
       String(child.parent_work_item_id ?? "") !== String(row.workstream_work_item_id) ||
       String(child.delegation_key ?? "") !==
-        allocationDelegationKey(String(row.objective_id), String(row.workstream_work_item_id))) {
+        allocationDelegationKey(String(row.objective_id), String(row.workstream_work_item_id)) ||
+      String(child.business_id ?? "") !== String(row.business_id)) {
     allocFail("child provenance mismatch");
   }
-  // The selected org_agent must still exist.
-  deps.store.get("org_agent", String(row.selected_agent_id));
+  // R2.B — full P14 canonical re-proof of the delegated child through
+  // the existing validators, never partial field compares.
+  const gdeps: GraphAuthorityDeps = {
+    store: deps.store,
+    getBusiness: (b: string) => deps.business.getBusiness(b),
+    agentContracts: deps.business.agentContracts,
+  };
+  const membership = deps.store.tryGet(
+    "work_graph_membership", membershipRowId(String(child.work_item_id))) as Row | null;
+  if (!membership) allocFail("delegated-child membership missing");
+  try {
+    assertCanonicalMembership(gdeps, membership);
+  } catch (err) {
+    allocFail(`membership invalid: ${(err as Error).message}`);
+  }
+  if (String(membership.membership_type) !== "DELEGATED_CHILD" ||
+      String(membership.parent_work_item_id ?? "") !== String(row.workstream_work_item_id) ||
+      String(membership.delegation_id ?? "") !== String(row.delegation_id)) {
+    allocFail("membership provenance mismatch");
+  }
+  const wds = deps.store.tryGet(
+    "work_dependency_set", dependencySetRowId(String(child.work_item_id))) as Row | null;
+  if (!wds) allocFail("delegated-child dependency manifest missing");
+  try {
+    assertCanonicalDependencySet(gdeps, wds);
+  } catch (err) {
+    allocFail(`dependency manifest invalid: ${(err as Error).message}`);
+  }
+  // Authority binding is required only when a ceiling agent exists
+  // (OPERATOR allocation on an unassigned container has none by design).
+  const wab = deps.store.tryGet(
+    "authority_binding", authorityBindingRowId(String(child.work_item_id))) as Row | null;
+  if (wdel.authority_ceiling_agent != null) {
+    if (!wab) allocFail("authority binding missing for ceiling-bearing delegation");
+    try {
+      assertCanonicalAuthorityBinding(gdeps, wab);
+    } catch (err) {
+      allocFail(`authority binding invalid: ${(err as Error).message}`);
+    }
+  }
+  // The selected org_agent must still exist and be same-business.
+  const agent = deps.store.get("org_agent", String(row.selected_agent_id));
+  if (String(agent.business_id) !== String(row.business_id)) {
+    allocFail("selected agent cross-business");
+  }
 }
 
 export type AllocationStatus =
@@ -387,11 +472,24 @@ export class WorkforceAllocationService {
     const objectiveId = String(input.objective_id ?? "");
     const key = String(input.workstream_key ?? "");
     if (!objectiveId || !key) allocFail("objective_id/workstream_key malformed");
-    // P15.1 deadline semantics, consistent with P15.2/P15.3 admission.
-    this.deps.objectives.evaluateDeadline(objectiveId);
-
-    const obs = buildAllocationObservation(this.deps, objectiveId, key, actor);
-    const allocationId = workforceAllocationId(objectiveId, obs.workstream_work_item_id);
+    // R2.E — slot resolution first: derive the deterministic WAL id
+    // from the canonical binding alone (no admission checks). A
+    // committed allocation is historical authority — replay survives
+    // later Objective deadline/status/workload changes.
+    const binding0 = this.deps.workstreams.getBinding(objectiveId);
+    if (!binding0) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_WORKFORCE_ALLOCATION",
+        `objective ${objectiveId} has no canonical workstream binding`,
+      );
+    }
+    const ws0 = (binding0.workstreams as Array<Record<string, unknown>>).find(
+      (w) => String(w.workstream_key) === key);
+    if (!ws0) {
+      allocFail(`workstream ${key} is not a member of binding ${String(binding0.binding_id)}`);
+    }
+    const workItemId = String(ws0.work_item_id);
+    const allocationId = workforceAllocationId(objectiveId, workItemId);
     const prior = this.store.tryGet(WORKFORCE_ALLOCATION_ENTITY, allocationId) as Row | null;
     if (prior) {
       // Replay/adopt only after full provenance validation.
@@ -402,6 +500,11 @@ export class WorkforceAllocationService {
         selected_agent_id: String(prior.selected_agent_id),
       };
     }
+    // P15.1 deadline semantics, consistent with P15.2/P15.3 admission —
+    // new admission only, never blocks replay of the committed slot.
+    this.deps.objectives.evaluateDeadline(objectiveId);
+
+    const obs = buildAllocationObservation(this.deps, objectiveId, key, actor);
     if (!obs.dependencies_proven) {
       return { status: "dependency_blocked", workstream_key: key };
     }
@@ -411,6 +514,17 @@ export class WorkforceAllocationService {
     const selected = obs.eligible[0]!;
 
     return this.store.immediate(() => {
+      // R2.E — a canonical WAL committed by a concurrent winner converges
+      // this loser to replay BEFORE the fresh-observation stale gate.
+      const cur = this.store.tryGet(WORKFORCE_ALLOCATION_ENTITY, allocationId) as Row | null;
+      if (cur) {
+        assertCanonicalWorkforceAllocation(this.deps, cur);
+        return {
+          status: "replayed" as const, allocation: cur, workstream_key: key,
+          delegated_child_work_item_id: String(cur.delegated_child_work_item_id),
+          selected_agent_id: String(cur.selected_agent_id),
+        };
+      }
       // J — re-observe under the commit transaction: binding, workstream
       // state, dependency proof, eligible set, workload inputs must all
       // be identical to the decision snapshot.
@@ -420,17 +534,6 @@ export class WorkforceAllocationService {
           "FAIL_CLOSED_P15_4_STALE_ALLOCATION",
           `observation drifted for ${key}`,
         );
-      }
-      // Same-slot concurrent commit loses the CAS here; an existing WAL
-      // is validated + adopted, never duplicated.
-      const cur = this.store.tryGet(WORKFORCE_ALLOCATION_ENTITY, allocationId) as Row | null;
-      if (cur) {
-        assertCanonicalWorkforceAllocation(this.deps, cur);
-        return {
-          status: "replayed" as const, allocation: cur, workstream_key: key,
-          delegated_child_work_item_id: String(cur.delegated_child_work_item_id),
-          selected_agent_id: String(cur.selected_agent_id),
-        };
       }
       // The EXISTING P14 delegation seam — OPERATOR mode (no forged
       // delegated_by_agent_id). The deterministic slot key makes a
@@ -495,6 +598,8 @@ export class WorkforceAllocationService {
           selected_agent_id: selected.agent_id,
           delegated_child_work_item_id: String(child.work_item_id),
           delegation_id: String(body.delegation_id),
+          delegation_mode: "OPERATOR",
+          delegated_by_operator: actor,
           allocation_observation_digest: obs.digest,
           allocation_digest: String(body.allocation_digest),
         },

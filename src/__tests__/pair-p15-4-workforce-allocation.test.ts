@@ -41,6 +41,7 @@ import {
   WORKFORCE_ALLOCATION_ENTITY,
 } from "../pair/index.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
+import { execFileSync } from "node:child_process";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p154-"));
 let counter = 0;
@@ -354,7 +355,7 @@ describe("P15.4 B — dependency gating", () => {
     s.store.close();
   });
 
-  it("6. canonical WCP unlocks dependent allocation", () => {
+  it("6. canonical WCP unlocks dependent allocation — via the delegated child", () => {
     const s = freshFullStack("b3");
     const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
     const bid = String(b.business_id);
@@ -367,13 +368,19 @@ describe("P15.4 B — dependency gating", () => {
     mkAgent(s, bid);
     expect(s.alloc.allocateWorkstream(
       { objective_id: oid, workstream_key: "wb", actor: OP }).status).toBe("dependency_blocked");
-    // Canonical completion chain on the UPSTREAM workstream — real
-    // open → bound mission → governed evidence → DONE + WCP.
-    const wa = wsWorkItemId(binding, "wa");
-    s.biz.openWorkItem(wa, OP);
-    const mid = String((s.store.get("work_item", wa).mission_ids as string[])[0]);
+    // Allocate upstream → open the DELEGATED CHILD (the executable
+    // surface — the container itself stays non-executable) → real
+    // canonical completion chain → parent cascade proves wa DONE+WCP.
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "wa", actor: OP });
+    expect(a.status).toBe("allocated");
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP); // delegated child stays openable
+    const mid = String((s.store.get("work_item", childId).mission_ids as string[])[0]);
     canonicallyCompleteMission(s.store, s.service, mid);
-    s.biz.syncWorkItem(wa);
+    s.biz.syncWorkItem(childId);
+    s.biz.advanceCompletionCascade(childId);
+    const wa = wsWorkItemId(binding, "wa");
+    expect(String(s.store.get("work_item", wa).status)).toBe("DONE");
     const r = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "wb", actor: OP });
     expect(r.status).toBe("allocated");
     s.store.close();
@@ -539,27 +546,26 @@ describe("P15.4 E — slot semantics", () => {
     s.store.close();
   });
 
-  it("16. concurrent allocation of the same slot → exactly one winner", async () => {
+  it("16. REAL concurrency — two independent store connections race the slot", async () => {
     const { s, oid } = seeded("e3");
-    const store = s.store;
-    // Two in-process services racing on the same DB — the slot CAS is
-    // the arbiter; serialized immediate() turns the loser into replay.
-    const alloc2 = new WorkforceAllocationService({
-      store, business: s.biz, workforce: s.wf,
-      objectives: s.biz.objectives, workstreams: s.workstreams,
-    });
-    void store;
-    const p1 = Promise.resolve().then(() =>
-      s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP }));
-    const p2 = Promise.resolve().then(() =>
-      alloc2.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP }));
-    const [r1, r2] = await Promise.all([p1, p2]);
-    const allocated = [r1, r2].filter((r) => r.status === "allocated");
-    const replayed = [r1, r2].filter((r) => r.status === "replayed");
-    expect(allocated.length + replayed.length).toBe(2);
-    expect(allocated.length === 1 || allocated.length === 2).toBe(true);
-    // Exactly one slot, one WDEL, one receipt.
+    const out = await runAllocRace([
+      { dbPath: s.dbPath, args: { objective_id: oid, workstream_key: "w1", actor: OP } },
+      { dbPath: s.dbPath, args: { objective_id: oid, workstream_key: "w1", actor: OP } },
+    ]);
+    // Exactly one WAL / one WDEL / one delegated child / one anchor —
+    // the loser converges to canonical replay or a deterministic typed
+    // fail-closed outcome, never two children/receipts.
+    const statuses = out.map((o) => o.ok ? o.status : `FAIL:${o.code}`);
+    const winners = statuses.filter((x) => x === "allocated");
+    expect(winners).toHaveLength(1);
     expect(rowCount(s.store, WORKFORCE_ALLOCATION_ENTITY)).toBe(1);
+    expect(rowCount(s.store, "work_delegation")).toBe(1);
+    const wal = s.store.get(WORKFORCE_ALLOCATION_ENTITY,
+      workforceAllocationId(oid, wsWorkItemId(s.workstreams.getBinding(oid)!, "w1")));
+    assertCanonicalWorkforceAllocation(s.alloc["deps"], wal);
+    expect(s.store.listEvents(WORKFORCE_ALLOCATION_ENTITY, String(wal.allocation_id))
+      .filter((e) => String(e.event_type) === WORKFORCE_ALLOCATION_COMMITTED_EVENT))
+      .toHaveLength(1);
     s.store.close();
   });
 
@@ -730,6 +736,312 @@ describe("P15.4 H — authority boundary", () => {
     decompose(s, oid, ["w1"]);
     expectFail(() => s.alloc.allocateWorkstream(
       { objective_id: oid, workstream_key: "nope", actor: OP }),
+      "FAIL_CLOSED_WORKFORCE_ALLOCATION");
+    s.store.close();
+  });
+});
+
+/* ==================== R2 — authority closure ==================== */
+
+// R2.F machinery — REAL multi-connection race via worker_threads over
+// the same SQLite file (never two services sharing one connection).
+const R2_CACHE = path.join(process.cwd(), "node_modules", ".cache", "pair-p154-r2");
+const R2_BUNDLE = path.join(R2_CACHE, "pair-bundle.mjs");
+const R2_WORKER = path.join(R2_CACHE, "r2-worker.mjs");
+
+const R2_WORKER_SOURCE = `
+import { workerData, parentPort } from "node:worker_threads";
+import * as PAIR from "./pair-bundle.mjs";
+
+const { dbPath, barrier, args } = workerData;
+const store = new PAIR.PairEvidenceStore(dbPath);
+const biz = new PAIR.BusinessLayer({
+  store,
+  control: { projects: () => [{ project_id: "PRJ_TEST" }] },
+  schedules: {},
+});
+const wf = new PAIR.WorkforceService({ store, business: biz });
+const workstreams = new PAIR.ObjectiveWorkstreamService({
+  store, business: biz, workforce: wf, objectives: biz.objectives,
+});
+const alloc = new PAIR.WorkforceAllocationService({
+  store, business: biz, workforce: wf, objectives: biz.objectives, workstreams,
+});
+parentPort.postMessage({ ready: true });
+Atomics.wait(barrier, 0, 0);
+try {
+  const r = alloc.allocateWorkstream(args);
+  parentPort.postMessage({ ok: true, status: r.status, agent: r.selected_agent_id ?? null });
+} catch (e) {
+  parentPort.postMessage({ ok: false, code: e && e.code ? e.code : String(e) });
+}
+`;
+
+function ensureAllocBundle() {
+  fs.mkdirSync(R2_CACHE, { recursive: true });
+  const esbuild = fs
+    .readdirSync("node_modules/.pnpm")
+    .filter((d) => d.startsWith("esbuild@"))
+    .map((d) => path.join("node_modules/.pnpm", d, "node_modules/esbuild/bin/esbuild"))
+    .filter((p) => fs.existsSync(p))
+    .sort()
+    .at(-1);
+  if (!esbuild) throw new Error("esbuild binary not found");
+  // Always rebuild — a stale bundle would test old source silently.
+  execFileSync(esbuild, [
+    "src/pair/index.ts", "--bundle", "--format=esm", "--platform=node",
+    "--external:better-sqlite3", "--external:ulid", "--external:yaml",
+    `--outfile=${R2_BUNDLE}`,
+  ], { cwd: process.cwd(), stdio: "pipe" });
+  fs.writeFileSync(R2_WORKER, R2_WORKER_SOURCE);
+}
+
+type AllocOutcome =
+  | { ok: true; status: string; agent: string | null }
+  | { ok: false; code: string };
+
+async function runAllocRace(
+  ops: Array<{ dbPath: string; args: Record<string, unknown> }>,
+): Promise<AllocOutcome[]> {
+  ensureAllocBundle();
+  const sab = new SharedArrayBuffer(4);
+  const gate = new Int32Array(sab);
+  let readyCount = 0;
+  return Promise.all(
+    ops.map((o) => new Promise<AllocOutcome>((resolve, reject) => {
+      const w = new Worker(R2_WORKER, {
+        workerData: { dbPath: o.dbPath, barrier: gate, args: o.args },
+      });
+      w.on("message", (msg: Record<string, unknown>) => {
+        if (msg.ready === true) {
+          readyCount += 1;
+          if (readyCount === ops.length) {
+            Atomics.store(gate, 0, 1);
+            Atomics.notify(gate, 0);
+          }
+          return;
+        }
+        resolve(msg as unknown as AllocOutcome);
+      });
+      w.on("error", reject);
+    })),
+  );
+}
+
+describe("P15.4 R2.A — workstream container non-executable", () => {
+  it("R2.A-1 direct open of a P15.2 workstream → fail closed, zero WOB/mission", () => {
+    const s = freshFullStack("r2a-1");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    const binding = decompose(s, oid, ["w1"]);
+    const w1 = wsWorkItemId(binding, "w1");
+    // The container is a graph-bound DC_* child of the OWI_* root —
+    // canonical identity, not mutable source/title.
+    expectFail(() => s.biz.openWorkItem(w1, OP),
+      "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_CONTAINER_NON_EXECUTABLE");
+    expect(rowCount(s.store, "work_open_binding")).toBe(0);
+    expect(rowCount(s.store, "mission")).toBe(0);
+    s.store.close();
+  });
+
+  it("R2.A-2 the P15.4 delegated child remains executable", () => {
+    const s = freshFullStack("r2a-2");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const childId = String(a.delegated_child_work_item_id);
+    const opened = s.biz.openWorkItem(childId, OP);
+    expect(String(opened.status)).toBe("IN_PROGRESS");
+    expect(rowCount(s.store, "mission")).toBe(1);
+    s.store.close();
+  });
+});
+
+describe("P15.4 R2.B — full P14 chain re-proof", () => {
+  const strict = (s: Stack, oid: string, wid: string) =>
+    assertCanonicalWorkforceAllocation(s.alloc["deps"],
+      s.store.get(WORKFORCE_ALLOCATION_ENTITY, workforceAllocationId(oid, wid)));
+
+  it("R2.B-1 WDEL state flipped off COMMITTED → strict read fails", () => {
+    const { s, oid, binding } = seeded("r2b-1");
+    const w1 = wsWorkItemId(binding, "w1");
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const wal = s.store.get(WORKFORCE_ALLOCATION_ENTITY, workforceAllocationId(oid, w1));
+    sqlRewriteEntity(s.store, "work_delegation", String(wal.delegation_id),
+      (b) => { b.state = "REVOKED"; });
+    expectFail(() => strict(s, oid, w1), "FAIL_CLOSED_WORKFORCE_ALLOCATION");
+    s.store.close();
+  });
+
+  it("R2.B-2 corrupted delegated-child membership / WDS → strict read fails", () => {
+    const { s, oid, binding } = seeded("r2b-2");
+    const w1 = wsWorkItemId(binding, "w1");
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const wal = s.store.get(WORKFORCE_ALLOCATION_ENTITY, workforceAllocationId(oid, w1));
+    const childId = String(wal.delegated_child_work_item_id);
+    // Corrupt the membership row's canonical parent — validator re-proves.
+    sqlRewriteEntity(s.store, "work_graph_membership", `WGM_${childId}`,
+      (b) => { b.parent_work_item_id = "WI_FORGED"; });
+    expectFail(() => strict(s, oid, w1), "FAIL_CLOSED_WORKFORCE_ALLOCATION");
+    s.store.close();
+  });
+
+  it("R2.B-3 WAL business_id self-rehashed + anchor re-pinned → fails", () => {
+    const { s, oid, binding } = seeded("r2b-3");
+    const w1 = wsWorkItemId(binding, "w1");
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const walId = workforceAllocationId(oid, w1);
+    sqlRewriteEntity(s.store, WORKFORCE_ALLOCATION_ENTITY, walId, (b) => {
+      b.business_id = "BIZ_FORGED";
+      b.allocation_digest = workforceAllocationDigest(b);
+    });
+    expectFail(() => strict(s, oid, w1), "FAIL_CLOSED_WORKFORCE_ALLOCATION");
+    s.store.close();
+  });
+
+  it("R2.B-4 WAL selection_policy_version self-rehashed → fails", () => {
+    const { s, oid, binding } = seeded("r2b-4");
+    const w1 = wsWorkItemId(binding, "w1");
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const walId = workforceAllocationId(oid, w1);
+    sqlRewriteEntity(s.store, WORKFORCE_ALLOCATION_ENTITY, walId, (b) => {
+      b.selection_policy_version = "attacker-policy";
+      b.allocation_digest = workforceAllocationDigest(b);
+    });
+    expectFail(() => strict(s, oid, w1), "FAIL_CLOSED_WORKFORCE_ALLOCATION");
+    s.store.close();
+  });
+
+  it("R2.B-5 created_by + anchor actor forged consistently, WDEL keeps original operator → fails", () => {
+    const { s, oid, binding } = seeded("r2b-5");
+    const w1 = wsWorkItemId(binding, "w1");
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const walId = workforceAllocationId(oid, w1);
+    sqlRewriteEntity(s.store, WORKFORCE_ALLOCATION_ENTITY, walId, (b) => {
+      b.created_by = "attacker-op";
+      b.allocation_digest = workforceAllocationDigest(b);
+    });
+    // Forge the anchor self-consistently for the attacker + recompute
+    // event_hash — the WDEL row still names the original operator.
+    sqlRewriteEvent(s.store, WORKFORCE_ALLOCATION_ENTITY, walId,
+      WORKFORCE_ALLOCATION_COMMITTED_EVENT, (md) => {
+        md.delegated_by_operator = "attacker-op";
+      });
+    dbOf(s.store).prepare(
+      "UPDATE events SET actor=? WHERE entity_type=? AND entity_id=? AND event_type=?")
+      .run("operator:attacker-op", WORKFORCE_ALLOCATION_ENTITY, walId,
+        WORKFORCE_ALLOCATION_COMMITTED_EVENT);
+    expectFail(() => strict(s, oid, w1), /FAIL_CLOSED/);
+    s.store.close();
+  });
+});
+
+describe("P15.4 R2.C — canonical workload authority", () => {
+  it("R2.C forged workload input → allocation fails closed, never silently picks the clean agent", () => {
+    const s = freshStack("r2c");
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    const busy = mkAgent(s, bid, { title: "busy" });
+    const clean = mkAgent(s, bid, { title: "clean" });
+    // Forge a "busy" workload row claiming graph provenance with NO
+    // canonical membership — assertGraphAuthority quarantines it.
+    s.biz.createWorkItem({
+      business_id: bid, title: "t", goal: "g",
+      assignee_agent_id: String(busy.agent_id), operator_id: OP,
+    });
+    const forged = s.biz.createWorkItem({
+      business_id: bid, title: "forged", goal: "g",
+      assignee_agent_id: String(busy.agent_id), operator_id: OP,
+    });
+    sqlRewriteEntity(s.store, "work_item", String(forged.work_item_id),
+      (b) => { b.delegation_key = "forged-graph-claim"; });
+    expectFail(() => s.alloc.allocateWorkstream(
+      { objective_id: oid, workstream_key: "w1", actor: OP }),
+      /FAIL_CLOSED_WORK_PROVENANCE_CORRUPT|FAIL_CLOSED_WORKFORCE_ALLOCATION/);
+    expect(rowCount(s.store, WORKFORCE_ALLOCATION_ENTITY)).toBe(0);
+    s.store.close();
+  });
+});
+
+describe("P15.4 R2.D — contract corruption propagates", () => {
+  it("R2.D malformed contract for one candidate → fail closed, not silent pick of the other", () => {
+    const s = freshStack("r2d");
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    const corrupt = mkAgent(s, bid, { title: "corrupt" });
+    const clean = mkAgent(s, bid, { title: "clean" });
+    // Corrupt the contract payload — digest mismatch propagates.
+    const contract = s.biz.agentContracts.get(String(corrupt.agent_id))!;
+    sqlRewriteEntity(s.store, "agent_execution_contract",
+      String(contract.contract_id), (b) => { b.status = "GARBAGE"; });
+    expectFail(() => s.alloc.allocateWorkstream(
+      { objective_id: oid, workstream_key: "w1", actor: OP }),
+      /FAIL_CLOSED_AGENT_CONTRACT|FAIL_CLOSED_WORKFORCE_ALLOCATION/);
+    expect(rowCount(s.store, WORKFORCE_ALLOCATION_ENTITY)).toBe(0);
+    void clean;
+    s.store.close();
+  });
+});
+
+describe("P15.4 R2.E — historical replay", () => {
+  it("R2.E-1 committed slot replays even after the workstream completes", () => {
+    const s = freshFullStack("r2e-1");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    const a1 = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    // Advance the work: open child → canonical completion → wa DONE.
+    const childId = String(a1.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP);
+    const mid = String((s.store.get("work_item", childId).mission_ids as string[])[0]);
+    canonicallyCompleteMission(s.store, s.service, mid);
+    s.biz.syncWorkItem(childId);
+    s.biz.advanceCompletionCascade(childId);
+    // The committed slot still replays — a terminal workstream is
+    // history, not a re-admission.
+    const r2 = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    expect(r2.status).toBe("replayed");
+    expect(r2.allocation!.allocation_id).toBe(a1.allocation!.allocation_id);
+    s.store.close();
+  });
+
+  it("R2.E-2 committed slot replays after Objective goes terminal", () => {
+    const { s, oid, agent } = seeded("r2e-2");
+    const a1 = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    // Objective → terminal via deadline evaluation past the deadline.
+    sqlRewriteEntity(s.store, "objective", oid, (b) => {
+      b.status = "CANCELLED";
+    });
+    const r2 = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    expect(r2.status).toBe("replayed");
+    expect(r2.selected_agent_id).toBe(String(agent.agent_id));
+    s.store.close();
+  });
+
+  it("R2.E-3 malformed existing WAL still fails closed (no blind adopt)", () => {
+    const { s, oid, binding } = seeded("r2e-3");
+    const w1 = wsWorkItemId(binding, "w1");
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const walId = workforceAllocationId(oid, w1);
+    sqlRewriteEntity(s.store, WORKFORCE_ALLOCATION_ENTITY, walId, (b) => {
+      b.state = "GARBAGE"; // unknown field value — self-consistent digest still fails shape
+      b.allocation_digest = workforceAllocationDigest(b);
+    });
+    expectFail(() => s.alloc.allocateWorkstream(
+      { objective_id: oid, workstream_key: "w1", actor: OP }),
       "FAIL_CLOSED_WORKFORCE_ALLOCATION");
     s.store.close();
   });
