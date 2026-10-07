@@ -78,6 +78,8 @@ export * from "./selfmod-bootstrap.js";
 export * from "./promotion-service.js";
 export * from "./work-graph.js";
 export * from "./objective-workstream.js";
+export * from "./ceo-decision.js";
+export * from "./ceo-planning-cycle.js";
 export * from "./work-coordination.js";
 export * from "./work-completion.js";
 export * from "./routine-mirror.js";
