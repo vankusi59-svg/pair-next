@@ -25,6 +25,7 @@ import {
   type AgentContractPolicy,
   type AgentContractStatus,
 } from "./agent-contract.js";
+import { ObjectiveAuthorityService } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
@@ -190,6 +191,7 @@ function periodStart(period: BudgetPeriod, now: Date): string {
 
 export class BusinessLayer {
   private _agentContracts: AgentContractService | null = null;
+  private _objectives: ObjectiveAuthorityService | null = null;
 
   constructor(private readonly deps: BusinessLayerDeps) {
     // Routines are business-originated work: a schedule fire carrying
@@ -325,6 +327,13 @@ export class BusinessLayer {
   get agentContracts(): AgentContractService {
     this._agentContracts ??= new AgentContractService(this.store);
     return this._agentContracts;
+  }
+
+  /** P15.1 canonical objective-authority service (same store) — the
+   *  single writer for governed objective rows. */
+  get objectives(): ObjectiveAuthorityService {
+    this._objectives ??= new ObjectiveAuthorityService(this.store);
+    return this._objectives;
   }
 
   // ---------- agent execution contract (P12) ----------
@@ -3651,6 +3660,11 @@ export class BusinessLayer {
 
   // ---------- objective (goal tree) ----------
 
+  /**
+   * P15.1 — objective creation delegates to the canonical authority so
+   *  there is exactly one writer for `objective` rows: the full schema
+   *  (KPIs, budget, protected terms, dedup identity) is always applied.
+   */
   createObjective(input: {
     business_id: string;
     title: string;
@@ -3660,43 +3674,11 @@ export class BusinessLayer {
     target?: string;
     operator_id: string;
   }): Row {
-    if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "objective.create");
-    if (!String(input.title ?? "").trim()) {
-      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_TITLE", "objective title required");
-    }
-    this.getBusiness(input.business_id);
-    if (input.parent_objective_id) {
-      const parent = this.store.get("objective", input.parent_objective_id);
-      if (String(parent.business_id) !== input.business_id) {
-        throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_SCOPE", `parent outside business ${input.business_id}`);
-      }
-    }
-    const id = newId("OBJ");
-    const row = {
-      objective_id: id,
-      business_id: input.business_id,
-      title: input.title,
-      description: input.description ?? "",
-      parent_objective_id: input.parent_objective_id ?? null,
-      metric: input.metric ?? "",
-      target: input.target ?? "",
-      status: "ACTIVE",
-      created_at: utcnow(),
-      version: 0,
-    };
-    const saved = this.store.put("objective", id, row, 0);
-    this.store.event({
-      entity_type: "objective", entity_id: id, event_type: "OBJECTIVE_CREATED",
-      new_state: "ACTIVE", actor: `operator:${input.operator_id}`,
-      metadata: { business_id: input.business_id, title: input.title },
-    });
-    return saved;
+    return this.objectives.create(input);
   }
 
   listObjectives(businessId?: string): Row[] {
-    const all = this.store.list("objective");
-    return (businessId ? all.filter((o) => String(o.business_id) === businessId) : all)
-      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    return this.objectives.list(businessId);
   }
 
   // ---------- aggregate read ----------
