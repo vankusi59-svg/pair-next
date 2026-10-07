@@ -17,6 +17,16 @@ import { IntegrityError } from "./errors.js";
 import { extractPlanJson } from "./llm-planner.js";
 import { providerEntryId } from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  CODEX_CLI_WARNING,
+  classifyCodexCliExit,
+  invokeCodexCli,
+  resolveCodexExecutable,
+  type CodexCliEnv,
+} from "./codex-cli-transport.js";
 
 export const CEO_DECISION_SCHEMA = "pair.ceo-decision.v1";
 export const CEO_OBSERVATION_SCHEMA = "pair.ceo-observation.v1";
@@ -62,7 +72,15 @@ export const CEO_FORBIDDEN_DECISION_KINDS = new Set<string>([
 
 export const CEO_MAX_SUMMARY_LEN = 512;
 export const CEO_MAX_OUTPUT_BYTES = 64 * 1024;
+/** Serialized observation/user-prompt bound BEFORE any invocation —
+ *  UTF-8 bytes, never JS character count. Oversized state fails closed
+ *  (never truncated to fit). */
+export const CEO_MAX_OBSERVATION_BYTES = 96 * 1024;
 export const CEO_DEFAULT_TIMEOUT_MS = 20000;
+/** Default CEO reasoning model on the codex-cli provider (P15.3 R2
+ *  addendum §D) — the same canonical `codex-cli:<model>` entry may serve
+ *  PLANNER_COORDINATOR and CEO_DECISION without a second authority. */
+export const CEO_CODEX_DEFAULT_MODEL = "gpt-6.1-sol";
 
 export interface CeoProposalWorkstream {
   workstream_key: string;
@@ -103,28 +121,36 @@ const WORKSTREAM_KEYS = new Set([
 ]);
 
 /**
- * raw model text → JSON parse → strict shape → discriminated-union
- * validation. Any unknown field, malformed member, forbidden kind, or
- * contradictory authority-bearing field rejects the WHOLE proposal.
+ * THE ONE canonical proposal-shape authority (R2.B) — consumed
+ * identically by the raw-LLM path and the stored receipt strict read.
+ *
+ * Two entry shapes:
+ *   raw model JSON    → requireSchema: true  (top-level `schema` key
+ *                       required and must equal CEO_DECISION_SCHEMA)
+ *   stored canonical  → requireSchema: false (`schema` is NOT stored in
+ *                       the canonical proposal; a stored `schema` key
+ *                       is an unknown field and fails)
+ *
+ * The proposal must contain EXACTLY the fields of its discriminated
+ * variant — required fields present, every other variant's fields
+ * absent, no unknown keys, no contradictory fields silently dropped.
+ * Any forbidden decision kind rejects the WHOLE proposal.
  */
-export function parseCeoDecisionText(raw: string): CeoProposal {
-  if (typeof raw !== "string" || !raw.trim() || raw.length > CEO_MAX_OUTPUT_BYTES) {
-    invalid("raw output empty or oversized");
+export function validateCanonicalCeoProposal(
+  input: unknown,
+  opts: { requireSchema?: boolean } = {},
+): CeoProposal {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    invalid("proposal is not an object");
   }
-  let parsed: unknown;
-  try {
-    parsed = extractPlanJson(raw);
-  } catch {
-    invalid("no balanced JSON object in model output");
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    invalid("output is not an object");
-  }
-  const o = parsed as Record<string, unknown>;
+  const o = input as Record<string, unknown>;
   for (const k of Object.keys(o)) {
     if (!TOP_LEVEL_KEYS.has(k)) invalid(`unknown top-level field ${k}`);
+    if (!opts.requireSchema && k === "schema") {
+      invalid("canonical proposal must not carry a schema field");
+    }
   }
-  if (o.schema !== CEO_DECISION_SCHEMA) {
+  if (opts.requireSchema && o.schema !== CEO_DECISION_SCHEMA) {
     invalid(`schema ${String(o.schema)} != ${CEO_DECISION_SCHEMA}`);
   }
   const kind = o.decision_kind;
@@ -154,7 +180,9 @@ export function parseCeoDecisionText(raw: string): CeoProposal {
         if (!WORKSTREAM_KEYS.has(k)) invalid(`workstreams[${i}] unknown field ${k}`);
       }
       for (const f of ["workstream_key", "title", "goal"] as const) {
-        if (typeof we[f] !== "string") invalid(`workstreams[${i}].${f} required`);
+        if (typeof we[f] !== "string" || !we[f]) {
+          invalid(`workstreams[${i}].${f} required`);
+        }
       }
       if (we.depends_on_keys !== undefined &&
           (!Array.isArray(we.depends_on_keys) ||
@@ -184,6 +212,9 @@ export function parseCeoDecisionText(raw: string): CeoProposal {
 
   switch (kind as CeoDecisionKind) {
     case "INITIALIZE_WORKSTREAMS": {
+      if (o.wait_reason !== undefined) {
+        invalid("INITIALIZE_WORKSTREAMS must not carry wait_reason");
+      }
       const workstreams = readWorkstreams();
       const priority_order = readPriorityOrder();
       // Priority order is exact-permutation provenance only in R1 — it
@@ -205,6 +236,9 @@ export function parseCeoDecisionText(raw: string): CeoProposal {
       if (o.workstreams !== undefined) {
         invalid("PRIORITIZE_EXISTING must not submit workstreams");
       }
+      if (o.wait_reason !== undefined) {
+        invalid("PRIORITIZE_EXISTING must not carry wait_reason");
+      }
       const priority_order = readPriorityOrder();
       return {
         decision_kind: "PRIORITIZE_EXISTING",
@@ -225,6 +259,24 @@ export function parseCeoDecisionText(raw: string): CeoProposal {
       };
     }
   }
+}
+
+/**
+ * raw model text → JSON parse → strict shape → discriminated-union
+ * validation. Any unknown field, malformed member, forbidden kind, or
+ * contradictory authority-bearing field rejects the WHOLE proposal.
+ */
+export function parseCeoDecisionText(raw: string): CeoProposal {
+  if (typeof raw !== "string" || !raw.trim() || raw.length > CEO_MAX_OUTPUT_BYTES) {
+    invalid("raw output empty or oversized");
+  }
+  let parsed: unknown;
+  try {
+    parsed = extractPlanJson(raw);
+  } catch {
+    invalid("no balanced JSON object in model output");
+  }
+  return validateCanonicalCeoProposal(parsed, { requireSchema: true });
 }
 
 /** Canonical digest of a validated proposal — decision receipt identity. */
@@ -274,21 +326,23 @@ export function buildCeoUserPrompt(observation: Record<string, unknown>): string
 // Model transport resolution + invoker seam
 // ---------------------------------------------------------------------
 
+/** Resolved CEO transport = canonical model/provider IDENTITY only.
+ *  CEO_DECISION has NO HTTP endpoint or credential lane (P15.3 R2
+ *  addendum §A) — the only production transport is Codex CLI. */
 export interface CeoModelTransport {
   model_entry_id: string;
   provider_id: string;
   provider_family: string;
   model_id: string;
-  /** Provider chat/completions base (no /chat/completions suffix). */
-  endpoint: string;
-  /** Env var NAME holding the credential — never the value. */
-  credential_env: string;
+  /** Provider protocol family (e.g. CODEX_CLI for codex-cli rows). */
+  protocol_family: string;
 }
 
 /**
- * Resolve the canonical transport for a configured CEO model_entry.
- * Pure read of the existing catalog/provider rows — no competing
- * model-catalog authority.
+ * Resolve the canonical transport identity for a configured CEO
+ * model_entry. Pure read of the existing catalog/provider rows — no
+ * competing model-catalog authority. No endpoint/credential requirement:
+ * the CEO lane never authenticates over HTTP.
  */
 export function resolveCeoModelTransport(
   store: PairEvidenceStore,
@@ -311,25 +365,12 @@ export function resolveCeoModelTransport(
       `provider ${providerId} for model_entry ${String(modelEntryId)} does not exist`,
     );
   }
-  const endpoint =
-    String(provider.configured_endpoint_identity ?? "") ||
-    String(provider.endpoint_reference ?? "");
-  const envs = (provider.credential_envs as string[] | undefined) ?? [];
-  const credentialEnv =
-    String(provider.credential_reference_name ?? "") || String(envs[0] ?? "");
-  if (!endpoint || !credentialEnv) {
-    throw new IntegrityError(
-      "FAIL_CLOSED_CEO_MODEL_UNRESOLVED",
-      `provider ${providerId} lacks endpoint/credential reference`,
-    );
-  }
   return {
     model_entry_id: String(model.model_entry_id),
     provider_id: providerId,
     provider_family: String(model.provider_family ?? providerId),
     model_id: String(model.model_id),
-    endpoint,
-    credential_env: credentialEnv,
+    protocol_family: String(provider.protocol_family ?? ""),
   };
 }
 
@@ -353,69 +394,175 @@ export interface CeoDecisionInvoker {
   invoke(input: CeoInvokeInput): Promise<CeoInvokeResult>;
 }
 
+// ---------------------------------------------------------------------
+// Codex CLI CEO invoker — the ONLY production CEO_DECISION transport
+// (P15.3 R2 addendum §B). Reasoning rides the persisted Codex CLI /
+// ChatGPT subscription session (`codex exec -m <model>`). There is NO
+// API fallback: OPENAI_API_KEY/CODEX_API_KEY are stripped from the child
+// environment by the shared transport; CLI missing / logged out / rate
+// limited / model unavailable / timeout / malformed output all fail
+// closed with typed codes.
+// ---------------------------------------------------------------------
+
+/** Strict schema-constrained output for `codex exec --output-schema`.
+ *  OpenAI strict structured output requires `additionalProperties:false`
+ *  and all properties in `required` — variant-conditional fields are
+ *  therefore required-but-nullable; the canonical contract parse
+ *  (validateCanonicalCeoProposal) remains the authority on variant
+ *  discipline. */
+export const CEO_DECISION_JSON_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["schema", "decision_kind", "workstreams", "priority_order", "wait_reason", "summary"],
+  properties: {
+    schema: { type: "string", enum: [CEO_DECISION_SCHEMA] },
+    decision_kind: {
+      type: "string",
+      enum: [
+        CEO_DECISION_KIND.INITIALIZE_WORKSTREAMS,
+        CEO_DECISION_KIND.PRIORITIZE_EXISTING,
+        CEO_DECISION_KIND.WAIT,
+      ],
+    },
+    workstreams: {
+      type: ["array", "null"],
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["workstream_key", "title", "goal", "depends_on_keys"],
+        properties: {
+          workstream_key: { type: "string" },
+          title: { type: "string" },
+          goal: { type: "string" },
+          depends_on_keys: { type: ["array", "null"], items: { type: "string" } },
+        },
+      },
+    },
+    priority_order: { type: ["array", "null"], items: { type: "string" } },
+    wait_reason: { type: ["string", "null"] },
+    summary: { type: ["string", "null"] },
+  },
+};
+
+/** CEO argv — same hard isolation profile as the Planner transport
+ *  (--ephemeral, --ignore-user-config/--ignore-rules/--strict-config,
+ *  approval_policy=never, web_search disabled, network off, read-only
+ *  workspace bounded to the scratch run dir) under a distinct
+ *  `pair_ceo` permission profile. The Codex process is a model transport
+ *  only — no governed-executor flags, no workspace mutation authority. */
+export function ceoCliArgv(
+  model: string,
+  runDir: string,
+  schemaPath: string,
+  finalPath: string,
+): string[] {
+  return [
+    "exec",
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--strict-config",
+    "--color", "never",
+    "--config", "approval_policy=never",
+    "--config", "web_search=disabled",
+    "--config", "default_permissions=pair_ceo",
+    "--config", "permissions.pair_ceo.extends=:workspace",
+    "--config", `permissions.pair_ceo.filesystem={':minimal'='read','${runDir}'='read'}`,
+    "--config", "permissions.pair_ceo.network.enabled=false",
+    "--config", `permissions.pair_ceo.workspace_roots={'${runDir}'=true}`,
+    "-m", model,
+    "-C", runDir,
+    "--output-schema", schemaPath,
+    "--output-last-message", finalPath,
+    "--json",
+  ];
+}
+
 /**
- * OpenAI-compatible chat/completions implementation. Reuses only generic
- * low-level mechanics (fetch injection, env credential lookup, bounded
- * timeout) — never llmPlan, never Planner prompts/contracts.
+ * The production CEO invoker: `codex exec` under the `pair_ceo`
+ * read-only profile. Reuses the ONE generic auth-safe transport
+ * (codex-cli-transport.ts) — never codexPlannerPlan() (that is the
+ * Planner contract). Output stays UNTRUSTED: schema-constrained or not,
+ * it still flows through parseCeoDecisionText → the deterministic gate.
+ * Never persists raw output; the caller pins only response_digest.
  */
-export class OpenAiCeoDecisionInvoker implements CeoDecisionInvoker {
+export class CodexCliCeoDecisionInvoker implements CeoDecisionInvoker {
   constructor(
     private readonly opts: {
-      env?: NodeJS.ProcessEnv | ((name: string) => string | undefined);
-      fetchFn?: typeof fetch;
+      env?: CodexCliEnv;
+      /** Absolute codex executable (default: PAIR_CODEX_EXECUTABLE /
+       *  PAIR_CODEX_PLANNER_EXECUTABLE / `which codex`). */
+      executable?: string;
+      /** Scratch root for per-invocation run dirs. */
+      scratchDir?: string;
     } = {},
   ) {}
 
-  private envGet(name: string): string | undefined {
-    const env = this.opts.env;
-    if (!env) return process.env[name];
-    return typeof env === "function" ? env(name) : env[name];
-  }
-
   async invoke(input: CeoInvokeInput): Promise<CeoInvokeResult> {
-    const apiKey = this.envGet(input.transport.credential_env);
-    if (!apiKey) {
+    const exe = this.opts.executable ?? resolveCodexExecutable(this.opts.env);
+    if (!exe) {
       throw new IntegrityError(
-        "FAIL_CLOSED_CEO_INVOCATION",
-        `credential env ${input.transport.credential_env} not resolvable`,
+        "FAIL_CLOSED_CEO_CLI_MISSING",
+        "codex executable not resolvable",
       );
     }
-    const fetchImpl = this.opts.fetchFn ?? fetch;
-    const resp = await fetchImpl(`${input.transport.endpoint}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: input.transport.model_id,
-        messages: [
-          { role: "system", content: input.system_prompt },
-          { role: "user", content: input.user_prompt },
-        ],
-        temperature: 0.2,
-        max_tokens: 2048,
-      }),
-      signal: AbortSignal.timeout(input.timeout_ms ?? CEO_DEFAULT_TIMEOUT_MS),
-    });
-    if (!resp.ok) {
+    const scratchDir =
+      this.opts.scratchDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "pair-ceo-"));
+    const prompt = `${input.system_prompt}\n\n${input.user_prompt}`;
+    let out: Awaited<ReturnType<typeof invokeCodexCli>>;
+    try {
+      out = await invokeCodexCli(
+        {
+          executable: exe,
+          model: input.transport.model_id,
+          timeoutMs: input.timeout_ms ?? CEO_DEFAULT_TIMEOUT_MS,
+          scratchDir,
+          schema: CEO_DECISION_JSON_SCHEMA,
+          runPrefix: "ceo",
+          argv: (runDir, schemaPath, finalPath) =>
+            ceoCliArgv(input.transport.model_id, runDir, schemaPath, finalPath),
+        },
+        prompt,
+        this.opts.env,
+      );
+    } catch (e) {
       throw new IntegrityError(
-        "FAIL_CLOSED_CEO_INVOCATION",
-        `provider HTTP ${resp.status}`,
+        "FAIL_CLOSED_CEO_CLI_UNAVAILABLE",
+        `spawn error ${String(e).slice(0, 120)}`,
       );
     }
-    const data = (await resp.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const text = String(data.choices?.[0]?.message?.content ?? "");
-    if (text.length > CEO_MAX_OUTPUT_BYTES) {
-      throw new IntegrityError("FAIL_CLOSED_CEO_INVOCATION", "output oversized");
+    const { result, finalText } = out;
+    if (result.status === "TIMEOUT") {
+      throw new IntegrityError("FAIL_CLOSED_CEO_CLI_TIMEOUT", result.error ?? "codex timeout");
+    }
+    if (result.status === "SPAWN_FAILED") {
+      const missing = /ENOENT|not found/i.test(result.error ?? "");
+      throw new IntegrityError(
+        missing ? "FAIL_CLOSED_CEO_CLI_MISSING" : "FAIL_CLOSED_CEO_CLI_UNAVAILABLE",
+        (result.error ?? "spawn failed").slice(0, 160),
+      );
+    }
+    if (result.status === "FAILED") {
+      const warn = classifyCodexCliExit(result.code, result.stderrTail);
+      const code =
+        warn === CODEX_CLI_WARNING.AUTH_FAILED ? "FAIL_CLOSED_CEO_CLI_AUTH_FAILED"
+        : warn === CODEX_CLI_WARNING.MODEL_UNAVAILABLE ? "FAIL_CLOSED_CEO_CLI_MODEL_UNAVAILABLE"
+        : warn === CODEX_CLI_WARNING.RATE_LIMITED ? "FAIL_CLOSED_CEO_CLI_RATE_LIMITED"
+        : "FAIL_CLOSED_CEO_CLI_UNAVAILABLE";
+      throw new IntegrityError(code, `${warn}:${(result.stderrTail || "").slice(0, 120)}`);
+    }
+    if (!finalText || !finalText.trim()) {
+      throw new IntegrityError("FAIL_CLOSED_CEO_CLI_OUTPUT_INVALID", "empty final message");
+    }
+    if (Buffer.byteLength(finalText, "utf8") > CEO_MAX_OUTPUT_BYTES) {
+      throw new IntegrityError("FAIL_CLOSED_CEO_CLI_OUTPUT_INVALID", "output oversized");
     }
     return {
       model_entry_id: input.transport.model_entry_id,
       provider_id: input.transport.provider_id,
       model_id: input.transport.model_id,
-      raw_text: text,
+      raw_text: finalText,
     };
   }
 }

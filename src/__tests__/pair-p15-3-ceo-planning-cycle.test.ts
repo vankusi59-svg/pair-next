@@ -24,33 +24,56 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  ApprovalQueue,
   BusinessLayer,
+  assertCanonicalCeoAttempt,
   assertCanonicalCeoDecision,
   IntegrityError,
   ModelEvidenceCatalog,
+  MissionControl,
+  MissionObservability,
+  MissionRouter,
+  MissionRuntime,
+  MissionScheduleService,
+  MissionScheduler,
+  MissionSupervisor,
   ObjectiveAuthorityService,
   ObjectiveWorkstreamService,
+  PairControlPlane,
   PairEvidenceStore,
   ProviderCatalog,
+  ExecutorRegistry,
+  GovernedTaskGate,
+  ReconciliationService,
+  RecoveryController,
   WorkforceService,
   assignModelRole,
   MODEL_ROLE,
   modelRoleOf,
   providerEntryId,
   qualifyModel,
+  CodexCliCeoDecisionInvoker,
   CeoPlanningCycleService,
   buildCeoObservation,
+  ceoAttemptId,
+  ceoAttemptStartDigest,
   ceoCycleId,
   ceoDecisionId,
+  ceoCliArgv,
   digest,
+  ensureCodexCliCatalog,
   objectiveWorkstreamBindingDigest,
   objectiveWorkstreamBindingId,
+  CODEX_CLI_PROVIDER_ID,
+  CEO_CODEX_DEFAULT_MODEL,
   type CeoDecisionInvoker,
   type CeoInvokeInput,
   type CeoInvokeResult,
 } from "../pair/index.js";
+import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p153-"));
+const ROOT_DIR2 = path.resolve(import.meta.dirname, "..", "..");
 let counter = 0;
 const OP = "1882810918";
 
@@ -171,6 +194,8 @@ type Stack = {
   wf: WorkforceService;
   objectives: ObjectiveAuthorityService;
   workstreams: ObjectiveWorkstreamService;
+  /** R2.A — the ONE P14 canonical completion proof seam. */
+  proveWorkItemDone: (row: Record<string, unknown>) => boolean;
 };
 
 function freshStack(name: string): Stack {
@@ -186,7 +211,10 @@ function freshStack(name: string): Stack {
   const wf = new WorkforceService({ store, business: biz });
   const objectives = biz.objectives;
   const workstreams = new ObjectiveWorkstreamService({ store, business: biz, workforce: wf, objectives });
-  return { dbPath, store, biz, wf, objectives, workstreams };
+  return {
+    dbPath, store, biz, wf, objectives, workstreams,
+    proveWorkItemDone: (row) => biz.proveWorkItemDone(row as never),
+  };
 }
 
 /** Stack + canonical model/provider + CEO service with a canned invoker. */
@@ -204,7 +232,7 @@ function freshCeo(name: string, raw: string | ((i: CeoInvokeInput) => CeoInvokeR
     }));
   const svc = new CeoPlanningCycleService({
     store: s.store, objectives: s.objectives, workstreams: s.workstreams,
-    invoker, model_entry_id: me, ...extraDeps,
+    proveWorkItemDone: s.proveWorkItemDone, invoker, model_entry_id: me, ...extraDeps,
   });
   return { ...s, svc, invoker, me };
 }
@@ -231,6 +259,63 @@ function mkObjective(svc: ObjectiveAuthorityService, businessId: string, extra: 
     operator_id: OP,
     ...extra,
   });
+}
+
+/** Mint a CANONICAL STARTED attempt — deterministic id + row + the
+ *  immutable CEO_DECISION_ATTEMPT_STARTED anchor, byte-identical to the
+ *  claim transaction's write. Anything less is a generic store row with
+ *  ZERO attempt authority (R2.C). */
+function mintStartedAttempt(s: Stack, opts: {
+  objective_id: string;
+  observation_digest: string;
+  n?: number;
+  model_entry_id: string;
+  provider_id: string;
+  model_id: string;
+  business_id: string;
+  started_at?: string;
+  actor?: string;
+}): string {
+  const cycleId = ceoCycleId(opts.objective_id, opts.observation_digest);
+  const n = opts.n ?? 1;
+  const attemptId = ceoAttemptId(opts.objective_id, cycleId, n);
+  const actor = opts.actor ?? OP;
+  const startFields = {
+    attempt_id: attemptId,
+    cycle_id: cycleId,
+    objective_id: opts.objective_id,
+    business_id: opts.business_id,
+    observation_digest: opts.observation_digest,
+    attempt_number: n,
+    model_entry_id: opts.model_entry_id,
+    provider_id: opts.provider_id,
+    model_id: opts.model_id,
+    started_at: opts.started_at ?? new Date().toISOString(),
+  };
+  s.store.put("ceo_decision_attempt", attemptId, {
+    schema_version: "pair.os.vnext.ceo-decision-attempt.v1",
+    ...startFields,
+    state: "STARTED",
+    started_by: actor,
+    settled_at: null,
+    response_digest: null,
+    canonical_proposal_digest: null,
+    failure_code: null,
+    version: 0,
+  } as never, 0);
+  s.store.event({
+    entity_type: "ceo_decision_attempt",
+    entity_id: attemptId,
+    event_type: "CEO_DECISION_ATTEMPT_STARTED",
+    old_state: null,
+    new_state: "STARTED",
+    actor: `operator:${actor}`,
+    metadata: {
+      ...startFields,
+      start_identity_digest: ceoAttemptStartDigest(startFields),
+    },
+  });
+  return attemptId;
 }
 
 async function expectFail(fn: () => unknown | Promise<unknown>, code: string) {
@@ -293,7 +378,7 @@ describe("P15.3 A — canonical observation", () => {
       const oid = String(o.objective_id);
       s.store.put("objective_workstream_binding", objectiveWorkstreamBindingId(oid), { fake: true, version: 0 } as never, 0);
       const inv = new FakeInvoker(() => { throw new Error("must not invoke"); });
-      const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: "x" });
+      const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: "x" });
       await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_BINDING");
       expect(inv.calls).toBe(0);
       s.store.close();
@@ -307,7 +392,7 @@ describe("P15.3 A — canonical observation", () => {
       const row = s.store.get("objective", oid);
       s.store.put("objective", oid, { ...row, objective_digest: "forged" }, Number(row.version));
       const inv = new FakeInvoker(() => { throw new Error("must not invoke"); });
-      const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: "x" });
+      const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: "x" });
       await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_OBJECTIVE_DIGEST");
       expect(inv.calls).toBe(0);
       s.store.close();
@@ -325,7 +410,7 @@ describe("P15.3 B — invocation gates", () => {
       const o = mkObjective(s.objectives, bid, { deadline: "2000-01-01T00:00:00.000Z" });
       const oid = String(o.objective_id);
       const inv = new FakeInvoker(() => { throw new Error("must not invoke"); });
-      const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: "x" });
+      const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: "x" });
       await expectFail(() => svc.runCycle({ objective_id: oid, actor: bad as unknown as string }), "FAIL_CLOSED_OPERATOR_ID_REQUIRED");
       expect(inv.calls).toBe(0);
       expect(attemptsOf(s.store)).toHaveLength(0);
@@ -362,14 +447,14 @@ describe("P15.3 B — invocation gates", () => {
     mkProvider(s.store, pid);
     assignModelRole(s.store, meDsh, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
     const inv = new FakeInvoker(() => { throw new Error("must not invoke"); });
-    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: meDsh });
+    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: meDsh });
     const bid = mkBusiness(s.store);
     const o = mkObjective(s.objectives, bid);
     await expectFail(() => svc.runCycle({ objective_id: String(o.objective_id), actor: OP }), "FAIL_CLOSED_CEO_DSH_OVERLAP");
     expect(attemptsOf(s.store)).toHaveLength(0);
     // alias-proven same canonical model → also overlap
     const meAlias = mkModel(s.store, pid, "other", { aliases: ["dsh-m"] });
-    const svc2 = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: meAlias });
+    const svc2 = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: meAlias });
     await expectFail(() => svc2.runCycle({ objective_id: String(o.objective_id), actor: OP }), "FAIL_CLOSED_CEO_DSH_OVERLAP");
     s.store.close();
   });
@@ -446,7 +531,7 @@ describe("P15.3 B — invocation gates", () => {
     const inv = new FakeInvoker(() => ({
       model_entry_id: me, provider_id: pid, model_id: "different-model", raw_text: decisionJson(),
     }));
-    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: me });
+    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me });
     const bid = mkBusiness(s.store);
     const o = mkObjective(s.objectives, bid);
     await expectFail(() => svc.runCycle({ objective_id: String(o.objective_id), actor: OP }), "FAIL_CLOSED_CEO_INVOCATION");
@@ -734,6 +819,7 @@ describe("P15.3 H — crash safety", () => {
     let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
     const svc = new CeoPlanningCycleService({
       store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone,
       invoker: inv, model_entry_id: me, now: () => new Date(nowMs).toISOString(),
     });
     await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_COMMIT");
@@ -762,20 +848,20 @@ describe("P15.3 H — crash safety", () => {
     }));
     const svc = new CeoPlanningCycleService({
       store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone,
       invoker: inv, model_entry_id: me,
       stale_grace_ms: 60_000, now: () => new Date(nowMs).toISOString(),
     });
     // simulate a crashed STARTED attempt for THIS observation
     const obs = buildCeoObservation(s, oid);
-    const cycleId = ceoCycleId(oid, obs.observation_digest);
-    s.store.put("ceo_decision_attempt", "CCA_x1", {
-      schema_version: "pair.os.vnext.ceo-decision-attempt.v1",
-      attempt_id: "CCA_x1", cycle_id: cycleId, objective_id: oid, business_id: bid,
-      observation_digest: obs.observation_digest, attempt_number: 1, state: "STARTED",
+    // R2.C — the crash-window fixture must be a CANONICAL attempt
+    // (deterministic id + START anchor); a bare store.put row is never
+    // attempt authority.
+    mintStartedAttempt(s, {
+      objective_id: oid, observation_digest: obs.observation_digest,
       model_entry_id: me, provider_id: pid, model_id: "m1",
-      started_at: new Date(nowMs).toISOString(), settled_at: null,
-      response_digest: null, canonical_proposal_digest: null, failure_code: null, version: 0,
-    } as never, 0);
+      business_id: bid, started_at: new Date(nowMs).toISOString(),
+    });
     await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_DECISION_INFLIGHT");
     // before grace expires — no reconciliation
     expect(svc.reconcileStaleAttempts(oid)).toBe(0);
@@ -806,7 +892,7 @@ describe("P15.3 I — concurrency", () => {
       while (!gate.release) await new Promise((r) => setTimeout(r, 1));
       return { model_entry_id: i.transport.model_entry_id, provider_id: i.transport.provider_id, model_id: i.transport.model_id, raw_text: decisionJson() };
     });
-    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: me });
+    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me });
     const p1 = svc.runCycle({ objective_id: oid, actor: OP });
     await new Promise((r) => setTimeout(r, 10)); // let p1 commit STARTED
     await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_DECISION_INFLIGHT");
@@ -897,7 +983,7 @@ describe("P15.3 J — tamper", () => {
     const dec = s.store.get("ceo_decision", did);
     const att = s.store.get("ceo_decision_attempt", String(dec.attempt_id));
     s.store.put("ceo_decision_attempt", String(dec.attempt_id), { ...att, model_id: "forged-model" }, Number(att.version));
-    await expectFail(() => strictRead(s, oid, did), "FAIL_CLOSED_CEO_DECISION");
+    await expectFail(() => strictRead(s, oid, did), "FAIL_CLOSED_CEO_DECISION_ATTEMPT");
     s.store.close();
   });
 
@@ -953,7 +1039,7 @@ describe("P15.3 R — model-role regression (§27)", () => {
       model_entry_id: i.transport.model_entry_id, provider_id: i.transport.provider_id,
       model_id: i.transport.model_id, raw_text: decisionJson(),
     }));
-    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, invoker: inv, model_entry_id: mePlanner });
+    const svc = new CeoPlanningCycleService({ store: s.store, objectives: s.objectives, workstreams: s.workstreams, proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: mePlanner });
     const bid = mkBusiness(s.store);
     const o = mkObjective(s.objectives, bid);
     const r = await svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
@@ -963,6 +1049,727 @@ describe("P15.3 R — model-role regression (§27)", () => {
     expect(modelRoleOf(s.store, meDsh)).toBe(MODEL_ROLE.DSH_EXECUTION);
     // only the two configured assignments exist — CEO minted none
     expect(s.store.list("model_role_assignment")).toHaveLength(2);
+    s.store.close();
+  });
+});
+
+/* ============================ R2.A — canonical P14 completion authority ============================ */
+
+/** Full governed-runtime stack (MissionControl + runtime + canonical
+ *  completion seam) — used ONLY by the R2.A canonical-completion test:
+ *  the CEO observation must bind to the REAL P14 proof, not status. */
+function freshFullCtx(name: string) {
+  const dir = path.join(ROOT, `${counter++}-${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const dbPath = path.join(dir, "pair.db");
+  const store = new PairEvidenceStore(dbPath);
+  const service = new PairControlPlane(store);
+  const gate = new GovernedTaskGate(service);
+  const registry = new ExecutorRegistry(service);
+  const router = new MissionRouter(service, gate);
+  const recovery = new RecoveryController(service);
+  const recon = new ReconciliationService(service, new Map());
+  const approvals = new ApprovalQueue(service);
+  const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
+  const planner = () => ({
+    tasks: [{ task_key: "T1", title: "t1", task_instruction: "t1", required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+  });
+  const runtime = new MissionRuntime({
+    service, gate, router, adapters: new Map(), scheduler, approvals,
+    reconciliation: recon, recovery, planner,
+  });
+  const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
+  const observability = new MissionObservability(service);
+  const control = new MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability, planner,
+  });
+  const schedules = new MissionScheduleService(service);
+  for (const c of ["FILE_OPERATIONS", "REASONING", "NETWORK_ACCESS"]) {
+    service.registerCapability(c, { risk_class: "LOW" });
+  }
+  const project = service.createProject({ name: "biz", root_location: workspace });
+  const biz = new BusinessLayer({ store, control, schedules });
+  const wf = new WorkforceService({ store, business: biz });
+  const objectives = biz.objectives;
+  const workstreams = new ObjectiveWorkstreamService({ store, business: biz, workforce: wf, objectives });
+  const obs = (oid: string) => buildCeoObservation(
+    { store, objectives, workstreams, proveWorkItemDone: (r: never) => biz.proveWorkItemDone(r) },
+    oid,
+  );
+  return { dir, store, service, biz, wf, objectives, workstreams, projectId: String(project.project_id), obs };
+}
+
+describe("P15.3 R2.A — canonical P14 completion authority", () => {
+  it("status=DONE claim with zero canonical evidence → completion_proven=false (never authority)", async () => {
+    const s = freshCeo("r2a-1", initProposalJson(["w1"]));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const binding = s.workstreams.getBinding(oid)!;
+    const wid = String((binding.workstreams as Array<Record<string, unknown>>)[0]!.work_item_id);
+    // Forge the mutable status claim — no WCP, no mission lineage.
+    const row = s.store.get("work_item", wid);
+    s.store.put("work_item", wid, { ...row, status: "DONE" }, Number(row.version));
+    const obs = buildCeoObservation(s, oid);
+    const ws = (obs.observation.workstreams as Array<Record<string, unknown>>)[0]!;
+    expect(String(ws.status)).toBe("DONE"); // status stays a distinct field
+    expect(ws.completion_proven).toBe(false); // but proof is false — never conflated
+    s.store.close();
+  });
+
+  it("status=DONE + fabricated WCP row → completion_proven=false (fabrication rejected by P14 proof)", async () => {
+    const s = freshCeo("r2a-2", initProposalJson(["w1"]));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const binding = s.workstreams.getBinding(oid)!;
+    const wid = String((binding.workstreams as Array<Record<string, unknown>>)[0]!.work_item_id);
+    const row = s.store.get("work_item", wid);
+    s.store.put("work_item", wid, { ...row, status: "DONE" }, Number(row.version));
+    // A generic work_completion row is fabrication — digest/anchor/lineage fail.
+    s.store.put("work_completion", `WCP_${wid}`, {
+      schema_version: "pair.os.vnext.work-completion.v1", fake: true, version: 0,
+    } as never, 0);
+    const obs = buildCeoObservation(s, oid);
+    expect((obs.observation.workstreams as Array<Record<string, unknown>>)[0]!.completion_proven).toBe(false);
+    s.store.close();
+  });
+
+  it('literal non-vocabulary status ("COMPLETED") → observation fails closed BEFORE any model call', async () => {
+    const s = freshCeo("r2a-3", initProposalJson(["w1"]));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const binding = s.workstreams.getBinding(oid)!;
+    const wid = String((binding.workstreams as Array<Record<string, unknown>>)[0]!.work_item_id);
+    const row = s.store.get("work_item", wid);
+    s.store.put("work_item", wid, { ...row, status: "COMPLETED" }, Number(row.version));
+    await expectFail(() => s.svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_OBSERVATION");
+    expect(s.invoker.calls).toBe(1); // only the INITIALIZE call — no new invocation
+    s.store.close();
+  });
+
+  it("real P14 canonical completion chain (open → bound mission → full evidence → WCP) → completion_proven=true", async () => {
+    const ctx = freshFullCtx("r2a-4");
+    const b = ctx.biz.createBusiness({ name: "b", project_id: ctx.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(ctx.objectives, bid);
+    const oid = String(o.objective_id);
+    const obj = ctx.objectives.get(oid);
+    ctx.workstreams.decomposeObjective({
+      objective_id: oid,
+      expected_objective_version: Number(obj.version),
+      expected_terms_version: Number(obj.terms_version),
+      expected_objective_digest: String(obj.objective_digest),
+      workstreams: [{ workstream_key: "w1", title: "w", goal: "g" }],
+      actor: OP,
+    });
+    const binding = ctx.workstreams.getBinding(oid)!;
+    const wid = String((binding.workstreams as Array<Record<string, unknown>>)[0]!.work_item_id);
+    // Before any completion evidence: proven=false.
+    let ws = (ctx.obs(oid).observation.workstreams as Array<Record<string, unknown>>)[0]!;
+    expect(ws.completion_proven).toBe(false);
+    // The real canonical seam: open → bound mission → full governed
+    // completion evidence → sync fold → DONE + WCP + anchor.
+    ctx.biz.openWorkItem(wid, OP);
+    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    const done = ctx.biz.syncWorkItem(wid);
+    expect(String(done.status)).toBe("DONE");
+    ws = (ctx.obs(oid).observation.workstreams as Array<Record<string, unknown>>)[0]!;
+    expect(String(ws.status)).toBe("DONE");
+    expect(ws.completion_proven).toBe(true);
+    ctx.store.close();
+  });
+});
+
+/* ============================ R2.B — receipt re-proves identity ============================ */
+
+describe("P15.3 R2.B — decision receipt re-proves identity", () => {
+  const strictRead = (s: ReturnType<typeof freshCeo>, did: string) =>
+    assertCanonicalCeoDecision(s, s.store.get("ceo_decision", did));
+
+  it("forged cycle_id / decision_id → strict read fails even with recomputed self-digest", async () => {
+    const s = freshCeo("r2b-1", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const did = String(r.decision.decision_id);
+    // forged cycle_id (identity recompute catches it before the anchor)
+    const row = s.store.get("ceo_decision", did);
+    s.store.put("ceo_decision", did, { ...row, cycle_id: "CCY_forged" }, Number(row.version));
+    await expectFail(() => strictRead(s, did), "FAIL_CLOSED_CEO_DECISION");
+    s.store.close();
+  });
+
+  it("stored proposal mutated (kind/digest incoherent or invalid shape) → fail closed", async () => {
+    const s = freshCeo("r2b-2", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const did = String(r.decision.decision_id);
+    // WAIT proposal rewritten to carry a contradictory priority_order.
+    const row = s.store.get("ceo_decision", did);
+    const tampered = JSON.parse(JSON.stringify(row.proposal));
+    tampered.priority_order = ["w1"];
+    s.store.put("ceo_decision", did, { ...row, proposal: tampered }, Number(row.version));
+    await expectFail(() => strictRead(s, did), "FAIL_CLOSED_CEO_DECISION");
+    s.store.close();
+  });
+
+  it("PRIORITIZE proposal with wait_reason / INITIALIZE with wait_reason → whole proposal dies", async () => {
+    const s = freshCeo("r2b-3", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    // direct validator assertions — contradictory fields are never dropped
+    const { validateCanonicalCeoProposal } = await import("../pair/index.js");
+    expect(() => validateCanonicalCeoProposal({
+      decision_kind: "PRIORITIZE_EXISTING", priority_order: ["a"], wait_reason: "AWAITING_PROGRESS",
+    })).toThrow();
+    expect(() => validateCanonicalCeoProposal({
+      decision_kind: "INITIALIZE_WORKSTREAMS",
+      workstreams: [{ workstream_key: "a", title: "t", goal: "g" }],
+      priority_order: ["a"], wait_reason: "AWAITING_PROGRESS",
+    })).toThrow();
+    // and the stored `schema` key is an unknown field in canonical storage
+    expect(() => validateCanonicalCeoProposal({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT", wait_reason: "AWAITING_PROGRESS",
+    })).toThrow();
+    s.store.close();
+  });
+
+  it("receipt bound to a foreign business → strict read fails", async () => {
+    const s = freshCeo("r2b-4", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const did = String(r.decision.decision_id);
+    const row = s.store.get("ceo_decision", did);
+    s.store.put("ceo_decision", did, { ...row, business_id: "BIZ_foreign" }, Number(row.version));
+    await expectFail(() => strictRead(s, did), "FAIL_CLOSED_CEO_DECISION");
+    s.store.close();
+  });
+
+  it("objective amended AFTER commit → receipt still strict-reads (historical pins, not current)", async () => {
+    const s = freshCeo("r2b-5", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const did = String(r.decision.decision_id);
+    s.objectives.amend(oid, { business_id: bid, patch: { target: "99" }, reason: "bump", actor: `operator:${OP}` });
+    // historical version/digest pins differ from current — anchor is the
+    // immutable proof; strict read still passes.
+    strictRead(s, did);
+    s.store.close();
+  });
+});
+
+/* ============================ R2.C — canonical attempt authority ============================ */
+
+describe("P15.3 R2.C — canonical attempt authority", () => {
+  it("a bare store.put row (CCA_x1) is ZERO attempt authority → cap/INFLIGHT reads fail closed", async () => {
+    const s = freshStack("r2c-1");
+    const pid = `p${counter}`;
+    const me = mkModel(s.store, pid, "m1");
+    mkProvider(s.store, pid);
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const obs = buildCeoObservation(s, oid);
+    const cycleId = ceoCycleId(oid, obs.observation_digest);
+    // arbitrary id + no START anchor — a generic persistence row
+    s.store.put("ceo_decision_attempt", "CCA_x1", {
+      schema_version: "pair.os.vnext.ceo-decision-attempt.v1",
+      attempt_id: "CCA_x1", cycle_id: cycleId, objective_id: oid, business_id: bid,
+      observation_digest: obs.observation_digest, attempt_number: 1, state: "STARTED",
+      model_entry_id: me, provider_id: pid, model_id: "m1",
+      started_at: new Date().toISOString(), settled_at: null,
+      response_digest: null, canonical_proposal_digest: null, failure_code: null, version: 0,
+    } as never, 0);
+    const inv = new FakeInvoker(() => ({ model_entry_id: me, provider_id: pid, model_id: "m1", raw_text: decisionJson() }));
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+    });
+    // deterministic-id identity fails → the corrupt row is never INFLIGHT
+    // authority, never silently skipped.
+    await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_DECISION_ATTEMPT");
+    expect(inv.calls).toBe(0);
+    s.store.close();
+  });
+
+  it("canonical-shaped row WITHOUT the START anchor → zero authority", async () => {
+    const s = freshStack("r2c-2");
+    const pid = `p${counter}`;
+    const me = mkModel(s.store, pid, "m1");
+    mkProvider(s.store, pid);
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const obs = buildCeoObservation(s, oid);
+    const cycleId = ceoCycleId(oid, obs.observation_digest);
+    const aid = ceoAttemptId(oid, cycleId, 1);
+    s.store.put("ceo_decision_attempt", aid, {
+      schema_version: "pair.os.vnext.ceo-decision-attempt.v1",
+      attempt_id: aid, cycle_id: cycleId, objective_id: oid, business_id: bid,
+      observation_digest: obs.observation_digest, attempt_number: 1, state: "STARTED",
+      model_entry_id: me, provider_id: pid, model_id: "m1",
+      started_at: new Date().toISOString(), started_by: OP, settled_at: null,
+      response_digest: null, canonical_proposal_digest: null, failure_code: null, version: 0,
+    } as never, 0); // no START event → non-canonical
+    expect(() => assertCanonicalCeoAttempt(s.store, s.store.get("ceo_decision_attempt", aid))).toThrowError(/FAIL_CLOSED_CEO_DECISION_ATTEMPT/);
+    s.store.close();
+  });
+
+  it("START anchor tampered (started_at rewritten, hash recomputed) → strict read fails", async () => {
+    const s = freshCeo("r2c-3", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const att = attemptsOf(s.store)[0]!;
+    const aid = String(att.attempt_id);
+    const ev = s.store.listEvents("ceo_decision_attempt", aid).find((e) => String(e.event_type) === "CEO_DECISION_ATTEMPT_STARTED")!;
+    const body = {
+      event_id: ev.event_id, entity_type: ev.entity_type, entity_id: ev.entity_id,
+      event_type: ev.event_type, old_state: ev.old_state ?? null, new_state: ev.new_state,
+      actor: ev.actor, correlation_id: ev.correlation_id ?? null,
+      metadata: { ...(ev.metadata as Record<string, unknown>), started_at: "1970-01-01T00:00:00.000Z" },
+      created_at: ev.created_at,
+    };
+    dbOf(s.store).prepare("UPDATE events SET metadata_json=?, event_hash=? WHERE event_id=?")
+      .run(JSON.stringify(body.metadata), eventHash(body), String(ev.event_id));
+    expect(() => assertCanonicalCeoAttempt(s.store, s.store.get("ceo_decision_attempt", aid))).toThrowError(/FAIL_CLOSED_CEO_DECISION_ATTEMPT/);
+    s.store.close();
+  });
+
+  it("terminal attempt without SETTLE anchor / duplicated anchor → fail closed", async () => {
+    // strip the SETTLE anchor off a canonically settled attempt
+    const s = freshCeo("r2c-4", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await s.svc.runCycle({ objective_id: oid, actor: OP });
+    const att = attemptsOf(s.store)[0]!;
+    expect(String(att.state)).toBe("ACCEPTED");
+    const settle = s.store.listEvents("ceo_decision_attempt", String(att.attempt_id))
+      .find((e) => String(e.event_type) === "CEO_DECISION_ATTEMPT_SETTLED")!;
+    dbOf(s.store).prepare("DELETE FROM events WHERE event_id=?").run(String(settle.event_id));
+    expect(() => assertCanonicalCeoAttempt(s.store, att)).toThrowError(/FAIL_CLOSED_CEO_DECISION_ATTEMPT/);
+    s.store.close();
+  });
+
+  it("reconcile settle is canonical: crashed STARTED → UNKNOWN carries the SETTLE anchor", async () => {
+    const s = freshCeo("r2c-5", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const obs = buildCeoObservation(s, oid);
+    mintStartedAttempt(s, {
+      objective_id: oid, observation_digest: obs.observation_digest,
+      model_entry_id: s.me, provider_id: String(s.store.get("model_entry", s.me).provider_id),
+      model_id: String(s.store.get("model_entry", s.me).model_id),
+      business_id: bid, started_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+    expect(s.svc.reconcileStaleAttempts(oid)).toBe(1);
+    const att = attemptsOf(s.store)[0]!;
+    expect(String(att.state)).toBe("UNKNOWN");
+    assertCanonicalCeoAttempt(s.store, att); // canonical, settles proven
+    s.store.close();
+  });
+
+  it("a canonical live STARTED attempt still blocks a second invocation (INFLIGHT)", async () => {
+    const s = freshCeo("r2c-6", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const obs = buildCeoObservation(s, oid);
+    mintStartedAttempt(s, {
+      objective_id: oid, observation_digest: obs.observation_digest,
+      model_entry_id: s.me, provider_id: String(s.store.get("model_entry", s.me).provider_id),
+      model_id: String(s.store.get("model_entry", s.me).model_id),
+      business_id: bid,
+    });
+    await expectFail(() => s.svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_DECISION_INFLIGHT");
+    expect(s.invoker.calls).toBe(0);
+    s.store.close();
+  });
+});
+
+/* ============================ R2.D — re-proof before invocation ============================ */
+
+describe("P15.3 R2.D — model authority re-proof after STARTED commit", () => {
+  it("provider authority revoked between claim and invoke → REJECTED attempt, ZERO calls, no decision", async () => {
+    const s2 = freshStack("r2d-1");
+    const pid2 = `p${counter}`;
+    const me2 = mkModel(s2.store, pid2, "m2");
+    mkProvider(s2.store, pid2);
+    const bid2 = mkBusiness(s2.store);
+    const o2 = mkObjective(s2.objectives, bid2);
+    const oid2 = String(o2.objective_id);
+    const inv = new FakeInvoker(() => { throw new Error("MUST NOT INVOKE"); });
+    const svc = new CeoPlanningCycleService({
+      store: s2.store, objectives: s2.objectives, workstreams: s2.workstreams,
+      proveWorkItemDone: s2.proveWorkItemDone,
+      invoker: inv, model_entry_id: me2,
+      // Post-claim seam: revoke provider health the instant STARTED
+      // commits — re-proof must refuse the provider call.
+      after_attempt_claim: () => {
+        const pid2r = String(s2.store.get("model_entry", me2).provider_id);
+        const p = s2.store.get("provider", providerEntryId(pid2r));
+        s2.store.put("provider", String(p.entry_id), { ...p, health_state: "DOWN" }, Number(p.version));
+      },
+    });
+    await expectFail(() => svc.runCycle({ objective_id: oid2, actor: OP }), "FAIL_CLOSED_CEO_MODEL_UNAVAILABLE");
+    expect(inv.calls).toBe(0); // zero provider calls
+    expect(decisionsOf(s2.store)).toHaveLength(0);
+    expect(attemptsOf(s2.store)[0]!.state).toBe("REJECTED");
+    expect(String(attemptsOf(s2.store)[0]!.failure_code)).toBe("CEO_MODEL_UNAVAILABLE");
+    // the REJECTED settle is canonical
+    assertCanonicalCeoAttempt(s2.store, attemptsOf(s2.store)[0]!);
+    s2.store.close();
+  });
+
+  it("model replaced with a DSH_EXECUTION-aliased entry between claim and invoke → re-proof fails closed", async () => {
+    const s = freshStack("r2d-2");
+    const pid = `p${counter}`;
+    const me = mkModel(s.store, pid, "m1");
+    const dsh = mkModel(s.store, pid, "dsh-m");
+    mkProvider(s.store, pid);
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const inv = new FakeInvoker(() => { throw new Error("MUST NOT INVOKE"); });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone,
+      invoker: inv, model_entry_id: me,
+      after_attempt_claim: () => {
+        // an alias-bound DSH assignment appears mid-flight: the DSH entry
+        // claims the CEO model's id in model_alias_ids → sameCanonicalModel
+        // proves the overlap at re-proof time.
+        const m = s.store.get("model_entry", dsh);
+        s.store.put("model_entry", dsh, { ...m, model_alias_ids: ["m1"] }, Number(m.version));
+        assignModelRole(s.store, dsh, MODEL_ROLE.DSH_EXECUTION, { actor: "t" });
+      },
+    });
+    await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_DSH_OVERLAP");
+    expect(inv.calls).toBe(0);
+    expect(decisionsOf(s.store)).toHaveLength(0);
+    s.store.close();
+  });
+});
+
+/* ============================ R2.E — canonical cycle counting ============================ */
+
+describe("P15.3 R2.E — canonical-only cycle counting", () => {
+  it("a malformed ceo_decision row attributed to the objective fails the cycle (never silently skipped)", async () => {
+    const s = freshCeo("r2e-1", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    // garbage row carrying this objective's id — corrupt authority
+    s.store.put("ceo_decision", "CCD_garbage", {
+      schema_version: "pair.os.vnext.ceo-decision.v1",
+      decision_id: "CCD_garbage", cycle_id: "CCY_x", objective_id: oid,
+      business_id: bid, fake: true, version: 0,
+    } as never, 0);
+    await expectFail(() => s.svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_DECISION");
+    expect(s.invoker.calls).toBe(0);
+    s.store.close();
+  });
+});
+
+/* ============================ R2.F — observation byte bound ============================ */
+
+describe("P15.3 R2.F — observation byte bound", () => {
+  it("oversized observation → FAIL_CLOSED_CEO_OBSERVATION_TOO_LARGE, zero attempt, zero call", async () => {
+    const s = freshCeo("r2f-1", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid, { statement: "x".repeat(200 * 1024) });
+    const oid = String(o.objective_id);
+    await expectFail(() => s.svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_OBSERVATION_TOO_LARGE");
+    expect(s.invoker.calls).toBe(0);
+    expect(attemptsOf(s.store)).toHaveLength(0);
+    expect(decisionsOf(s.store)).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("observation under the byte bound (multibyte UTF-8 counted) → proceeds", async () => {
+    const s = freshCeo("r2f-2", decisionJson());
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid, { statement: "d".repeat(1024) + "".repeat(512) });
+    const oid = String(o.objective_id);
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("WAIT");
+    s.store.close();
+  });
+});
+
+/* ============================ R2 ADDENDUM — Codex CLI subscription transport ============================ */
+
+/** Fake codex CLI honoring the planner test seam (FAKE_CODEX_BEHAVIOR /
+ *  FAKE_CODEX_ENVFILE / FAKE_CODEX_INVOKELOG) plus CEO decision output. */
+const FAKE_CODEX_CEO_JS = `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+const outIdx = argv.indexOf("--output-last-message");
+const out = outIdx >= 0 ? argv[outIdx + 1] : null;
+const b = process.env.FAKE_CODEX_BEHAVIOR || "ceo_ok";
+let prompt = "";
+process.stdin.on("data", (d) => (prompt += d));
+process.stdin.on("end", () => {
+  const invokeLog = process.env.FAKE_CODEX_INVOKELOG;
+  if (invokeLog) fs.appendFileSync(invokeLog, "CEO\\n");
+  const envFile = process.env.FAKE_CODEX_ENVFILE;
+  if (envFile) {
+    fs.writeFileSync(envFile, JSON.stringify({
+      CODEX_HOME: process.env.CODEX_HOME != null,
+      CODEX_API_KEY: process.env.CODEX_API_KEY != null,
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY != null,
+      argv,
+    }));
+  }
+  if (b === "sleep") { setTimeout(() => {}, 120000); return; }
+  if (b === "authfail") { process.stderr.write("error: 401 unauthorized — login required\\n"); process.exit(1); }
+  if (b === "modelunavail") { process.stderr.write("error: model gpt-6.1-sol is not available for this account\\n"); process.exit(1); }
+  if (b === "ratelimit") { process.stderr.write("error: 429 rate limit exceeded\\n"); process.exit(1); }
+  if (!out) { process.stderr.write("missing --output-last-message\\n"); process.exit(1); }
+  if (b === "garbage") { fs.writeFileSync(out, "not json at all"); process.exit(0); }
+  if (b === "ceo_init") {
+    fs.writeFileSync(out, JSON.stringify({
+      schema: "pair.ceo-decision.v1", decision_kind: "INITIALIZE_WORKSTREAMS",
+      workstreams: [{ workstream_key: "w1", title: "T", goal: "G" }],
+      priority_order: ["w1"], summary: "init",
+    }));
+    process.exit(0);
+  }
+  fs.writeFileSync(out, JSON.stringify({
+    schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+    wait_reason: "AWAITING_PROGRESS", summary: "wait",
+  }));
+  process.exit(0);
+});
+`;
+
+function makeFakeCeoCodex(dir: string): string {
+  fs.mkdirSync(dir, { recursive: true });
+  const exe = path.join(dir, "fake-codex-ceo.cjs");
+  fs.writeFileSync(exe, FAKE_CODEX_CEO_JS);
+  fs.chmodSync(exe, 0o755);
+  return exe;
+}
+
+/** Canonical codex-cli provider + model, qualified through the real
+ *  provider/model evidence seams (mirrors the planner test's canonical
+ *  seed). Returns the model_entry_id. */
+function seedCeoCodex(s: Stack, model = CEO_CODEX_DEFAULT_MODEL) {
+  const meId = ensureCodexCliCatalog(s.store, model, "TEST");
+  const pc = new ProviderCatalog(s.store);
+  const p = pc.getProvider(CODEX_CLI_PROVIDER_ID)!;
+  s.store.put("provider", String(p.entry_id), {
+    ...p,
+    lifecycle_state: "QUALIFIED",
+    auth_state: "AUTH_OK",
+    health_state: "READY",
+    probe_state: "PROBED",
+    conditions: [],
+  }, Number(p.version));
+  new ProviderCatalog(s.store).issueQualificationReceipt(CODEX_CLI_PROVIDER_ID, { policy_version: "test", actor: "t" });
+  const mcat = new ModelEvidenceCatalog(s.store);
+  mcat.recordProbeReceipt({
+    probe_id: "PRB_codex_ceo", model_entry_id: meId, provider_id: CODEX_CLI_PROVIDER_ID,
+    result: "PASS", probe_type: "text_inference",
+    capability_evidence: { text_inference: "PASS" }, latency_ms: 1,
+  });
+  const q = qualifyModel(s.store, meId, { capability_scope: ["text_inference"], actor: "t" });
+  if (!q.qualified) throw new Error(`seedCeoCodex failed: ${JSON.stringify(q.gates)}`);
+  return meId;
+}
+
+describe("P15.3 R2-CLI — Codex CLI subscription transport (addendum)", () => {
+  it("J1/J14 — production invoker is CodexCliCeoDecisionInvoker on the canonical codex-cli:gpt-6.1-sol entry", async () => {
+    const s = freshStack("cli-1");
+    const me = seedCeoCodex(s);
+    const meRow = s.store.get("model_entry", me);
+    expect(String(meRow.provider_id)).toBe(CODEX_CLI_PROVIDER_ID);
+    expect(String(meRow.model_id)).toBe("gpt-6.1-sol");
+    // The SAME canonical entry serves Planner routes — no second authority.
+    expect(ensureCodexCliCatalog(s.store, "gpt-6.1-sol", "TEST")).toBe(me);
+    const invoker = new CodexCliCeoDecisionInvoker({ scratchDir: s.dbPath + "-scr" });
+    expect(typeof invoker.invoke).toBe("function");
+    s.store.close();
+  });
+
+  it("J2 — no /chat/completions or Bearer/API credential path exists in CEO sources", () => {
+    for (const f of ["src/pair/ceo-decision.ts", "src/pair/ceo-planning-cycle.ts", "src/pair/codex-cli-transport.ts"]) {
+      const src = fs.readFileSync(path.join(ROOT_DIR2, f), "utf8");
+      expect(src.includes("/chat/completions"), f).toBe(false);
+      expect(/Bearer\s/i.test(src), f).toBe(false);
+      expect(/authorization\s*:/i.test(src), f).toBe(false);
+    }
+  });
+
+  it("J3/J4 — ambient OPENAI_API_KEY/CODEX_API_KEY never reach the child; CODEX_HOME forwarded", async () => {
+    const s = freshStack("cli-3");
+    const me = seedCeoCodex(s);
+    const exe = makeFakeCeoCodex(s.dbPath + "-d");
+    const envFile = path.join(ROOT, `env-${counter}.json`);
+    const invoker = new CodexCliCeoDecisionInvoker({
+      executable: exe,
+      scratchDir: s.dbPath + "-scr",
+      env: {
+        PAIR_CODEX_EXECUTABLE: exe,
+        CODEX_HOME: "/home/test/.codex",
+        OPENAI_API_KEY: "sk-secret",
+        CODEX_API_KEY: "ck-secret",
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        FAKE_CODEX_BEHAVIOR: "ceo_ok",
+        FAKE_CODEX_ENVFILE: envFile,
+      },
+    });
+    const res = await invoker.invoke({
+      transport: {
+        model_entry_id: me, provider_id: CODEX_CLI_PROVIDER_ID,
+        provider_family: CODEX_CLI_PROVIDER_ID, model_id: "gpt-6.1-sol",
+        protocol_family: "CODEX_CLI",
+      },
+      system_prompt: "sys", user_prompt: "user", observation_digest: "d",
+    });
+    expect(res.model_id).toBe("gpt-6.1-sol");
+    const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8"));
+    expect(childEnv.OPENAI_API_KEY).toBe(false);
+    expect(childEnv.CODEX_API_KEY).toBe(false);
+    expect(childEnv.CODEX_HOME).toBe(true);
+    s.store.close();
+  });
+
+  it("J5 — CLI missing → FAIL_CLOSED_CEO_CLI_MISSING, zero fallback", async () => {
+    const s = freshStack("cli-5");
+    const me = seedCeoCodex(s);
+    const invoker = new CodexCliCeoDecisionInvoker({
+      executable: path.join(ROOT, "nonexistent-codex"), scratchDir: s.dbPath + "-scr",
+      env: { PATH: "" },
+    });
+    await expectFail(() => invoker.invoke({
+      transport: {
+        model_entry_id: me, provider_id: CODEX_CLI_PROVIDER_ID,
+        provider_family: CODEX_CLI_PROVIDER_ID, model_id: "gpt-6.1-sol",
+        protocol_family: "CODEX_CLI",
+      },
+      system_prompt: "s", user_prompt: "u", observation_digest: "d",
+    }), "FAIL_CLOSED_CEO_CLI_MISSING");
+    s.store.close();
+  });
+
+  it("J6/J7/J8 — authfail / modelunavail / timeout each fail closed with typed codes, zero fallback", async () => {
+    const mk = async (behavior: string) => {
+      const s = freshStack(`cli-${behavior}`);
+      const me = seedCeoCodex(s);
+      const exe = makeFakeCeoCodex(s.dbPath + "-d");
+      const invoker = new CodexCliCeoDecisionInvoker({
+        executable: exe, scratchDir: s.dbPath + "-scr",
+        env: { PATH: process.env.PATH ?? "", FAKE_CODEX_BEHAVIOR: behavior },
+      });
+      const input = {
+        transport: {
+          model_entry_id: me, provider_id: CODEX_CLI_PROVIDER_ID,
+          provider_family: CODEX_CLI_PROVIDER_ID, model_id: "gpt-6.1-sol",
+          protocol_family: "CODEX_CLI",
+        },
+        system_prompt: "s", user_prompt: "u", observation_digest: "d",
+        timeout_ms: 3_000,
+      };
+      return { s, invoker, input };
+    };
+    const auth = await mk("authfail");
+    await expectFail(() => auth.invoker.invoke(auth.input), "FAIL_CLOSED_CEO_CLI_AUTH_FAILED");
+    auth.s.store.close();
+    const mu = await mk("modelunavail");
+    await expectFail(() => mu.invoker.invoke(mu.input), "FAIL_CLOSED_CEO_CLI_MODEL_UNAVAILABLE");
+    mu.s.store.close();
+    const to = await mk("sleep");
+    await expectFail(() => to.invoker.invoke(to.input), "FAIL_CLOSED_CEO_CLI_TIMEOUT");
+    to.s.store.close();
+  });
+
+  it("J9 — malformed CEO JSON → attempt REJECTED, no decision mutation", async () => {
+    const s = freshStack("cli-9");
+    const me = seedCeoCodex(s);
+    const exe = makeFakeCeoCodex(s.dbPath + "-d");
+    const invoker = new CodexCliCeoDecisionInvoker({
+      executable: exe, scratchDir: s.dbPath + "-scr",
+      env: { PATH: process.env.PATH ?? "", FAKE_CODEX_BEHAVIOR: "garbage" },
+    });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone,
+      invoker, model_entry_id: me,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CEO_DECISION_INVALID");
+    expect(decisionsOf(s.store)).toHaveLength(0);
+    expect(attemptsOf(s.store)[0]!.state).toBe("REJECTED");
+    s.store.close();
+  });
+
+  it("J10/J13 — valid Codex CLI CEO JSON passes the deterministic gate; ZERO mission/dispatch side effects", async () => {
+    const s = freshStack("cli-10");
+    const me = seedCeoCodex(s);
+    const exe = makeFakeCeoCodex(s.dbPath + "-d");
+    const invoker = new CodexCliCeoDecisionInvoker({
+      executable: exe, scratchDir: s.dbPath + "-scr",
+      env: { PATH: process.env.PATH ?? "", FAKE_CODEX_BEHAVIOR: "ceo_init" },
+    });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone,
+      invoker, model_entry_id: me,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const r = await svc.runCycle({ objective_id: oid, actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("INITIALIZE_WORKSTREAMS");
+    for (const ent of ["mission", "work_open_binding", "executor_execution", "planner_attempt"]) {
+      expect(s.store.list(ent), ent).toHaveLength(0);
+    }
+    s.store.close();
+  });
+
+  it("J11 — Planner model assignment stays PLANNER_COORDINATOR after serving CEO_DECISION", async () => {
+    const s = freshStack("cli-11");
+    const me = seedCeoCodex(s);
+    assignModelRole(s.store, me, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "t" });
+    const exe = makeFakeCeoCodex(s.dbPath + "-d");
+    const invoker = new CodexCliCeoDecisionInvoker({
+      executable: exe, scratchDir: s.dbPath + "-scr",
+      env: { PATH: process.env.PATH ?? "", FAKE_CODEX_BEHAVIOR: "ceo_ok" },
+    });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone,
+      invoker, model_entry_id: me,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const r = await svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("WAIT");
+    expect(modelRoleOf(s.store, me)).toBe(MODEL_ROLE.PLANNER_COORDINATOR);
     s.store.close();
   });
 });

@@ -25,14 +25,17 @@ import {
   objectiveWorkstreamBindingId,
 } from "./objective-workstream.js";
 import type { PairEvidenceStore } from "./store.js";
+import { WORK_ITEM_STATUSES } from "./business.js";
 import {
   CEO_DECISION_KIND,
+  CEO_MAX_OBSERVATION_BYTES,
   CEO_OBSERVATION_SCHEMA,
   buildCeoUserPrompt,
   ceoDecisionSystemPrompt,
   ceoProposalDigest,
   parseCeoDecisionText,
   resolveCeoModelTransport,
+  validateCanonicalCeoProposal,
   type CeoDecisionInvoker,
   type CeoProposal,
 } from "./ceo-decision.js";
@@ -46,6 +49,12 @@ export const CEO_ATTEMPT_SCHEMA_VERSION = "pair.os.vnext.ceo-decision-attempt.v1
 
 export const CEO_CYCLE_MAX_PER_OBJECTIVE = 64;
 export const CEO_MAX_ATTEMPTS_PER_OBSERVATION = 2;
+/** Immutable attempt-lifecycle anchors (R2.C): a generic persistence
+ *  row is never attempt authority — every canonical attempt carries
+ *  exactly one START anchor, and exactly one SETTLE anchor per
+ *  terminal state. */
+export const CEO_ATTEMPT_STARTED_EVENT = "CEO_DECISION_ATTEMPT_STARTED";
+export const CEO_ATTEMPT_SETTLED_EVENT = "CEO_DECISION_ATTEMPT_SETTLED";
 /** Grace before a crashed STARTED attempt may be reconciled to UNKNOWN —
  *  one invocation timeout plus margin; never assume the provider was
  *  not called. */
@@ -70,6 +79,10 @@ export interface CeoObservationDeps {
   store: PairEvidenceStore;
   objectives: ObjectiveAuthorityService;
   workstreams: ObjectiveWorkstreamService;
+  /** The ONE P14 canonical completion proof (R2.A) — bound to
+   *  BusinessLayer.proveWorkItemDone. A mutable status claim is NEVER
+   *  completion authority; the observation only exposes the proof bit. */
+  proveWorkItemDone: (row: Row) => boolean;
 }
 
 /**
@@ -89,16 +102,26 @@ export function buildCeoObservation(
   if (binding) {
     for (const w of binding.workstreams as Array<Record<string, unknown>>) {
       const wi = deps.store.get("work_item", String(w.work_item_id)) as Row;
+      // The observed status must be a member of the canonical P14
+      // vocabulary — arbitrary strings are never strategic state.
+      if (!(WORK_ITEM_STATUSES as readonly string[]).includes(String(wi.status ?? ""))) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_CEO_OBSERVATION",
+          `work_item ${String(w.work_item_id)} status ${String(wi.status)} is not canonical`,
+        );
+      }
       workstreams.push({
         workstream_key: String(w.workstream_key),
         work_item_id: String(w.work_item_id),
-        status: String(wi.status ?? ""),
+        status: String(wi.status),
         version: Number(wi.version),
         assignee_agent_id: wi.assignee_agent_id ?? null,
         blocked_code: wi.blocked_code ?? null,
-        // Canonical completion = the work item's own canonical status;
-        // mutable mission_ids alone are never proof.
-        completion_proven: String(wi.status) === "COMPLETED",
+        // R2.A — completion authority is P14's canonical proof
+        // (status DONE + work_completion WCP_<id> + anchor + full
+        // provenance chain), never the mutable status claim. Status
+        // and proof remain distinct fields.
+        completion_proven: deps.proveWorkItemDone(wi) === true,
       });
     }
   }
@@ -182,17 +205,146 @@ export function ceoDecisionDigest(r: Record<string, unknown>): string {
   });
 }
 
+/** Immutable START-identity digest — pins every field that fixes the
+ *  attempt's identity at claim time (R2.C). */
+export function ceoAttemptStartDigest(f: {
+  attempt_id: string; cycle_id: string; objective_id: string;
+  business_id: string; observation_digest: string; attempt_number: number;
+  model_entry_id: string; provider_id: string; model_id: string;
+  started_at: string;
+}): string {
+  return digest({ ceo_attempt_start: 1, ...f });
+}
+
+/** Immutable SETTLE transition digest — pins the narrow STARTED→*
+ *  transition fields (R2.C). */
+export function ceoAttemptSettleDigest(f: {
+  attempt_id: string; to: string; settled_at: string;
+  response_digest: string | null; canonical_proposal_digest: string | null;
+  failure_code: string | null;
+}): string {
+  return digest({ ceo_attempt_settle: 1, from: "STARTED", ...f });
+}
+
+function attemptFail(detail: string): never {
+  throw new IntegrityError("FAIL_CLOSED_CEO_DECISION_ATTEMPT", detail);
+}
+
+/**
+ * Canonical attempt authority (R2.C). A generic store.put row is NOT an
+ *  attempt: identity is deterministic, and every attempt must carry
+ *  exactly one immutable START anchor (pinning all start fields +
+ *  `start_identity_digest`) plus — for terminal states — exactly one
+ *  SETTLE anchor (pinning from=STARTED, to, settled_at, response_digest,
+ *  canonical_proposal_digest, failure_code + `settle_digest`). Row
+ *  fields must equal the anchored transition fields.
+ */
 export function assertCanonicalCeoAttempt(store: PairEvidenceStore, row: Row): void {
-  if (String(row.schema_version ?? "") !== CEO_ATTEMPT_SCHEMA_VERSION) fail("attempt schema_version");
-  for (const f of ["attempt_id", "cycle_id", "objective_id", "observation_digest",
-    "state", "model_entry_id", "provider_id", "model_id", "started_at"] as const) {
-    if (typeof row[f] !== "string" || !(row[f] as string)) fail(`attempt ${f} malformed`);
+  if (String(row.schema_version ?? "") !== CEO_ATTEMPT_SCHEMA_VERSION) attemptFail("attempt schema_version");
+  for (const f of ["attempt_id", "cycle_id", "objective_id", "business_id",
+    "observation_digest", "state", "model_entry_id", "provider_id",
+    "model_id", "started_at"] as const) {
+    if (typeof row[f] !== "string" || !(row[f] as string)) attemptFail(`attempt ${f} malformed`);
   }
   if (!Number.isInteger(row.attempt_number) || Number(row.attempt_number) < 1) {
-    fail("attempt_number malformed");
+    attemptFail("attempt_number malformed");
   }
-  if (!["STARTED", "ACCEPTED", "REJECTED", "STALE", "UNKNOWN"].includes(String(row.state))) {
-    fail(`attempt state ${String(row.state)}`);
+  const state = String(row.state);
+  if (!["STARTED", "ACCEPTED", "REJECTED", "STALE", "UNKNOWN"].includes(state)) {
+    attemptFail(`attempt state ${state}`);
+  }
+  // Deterministic identity — the row must name the id/cycle its own
+  // pinned fields recompute to.
+  if (String(row.cycle_id) !==
+      ceoCycleId(String(row.objective_id), String(row.observation_digest))) {
+    attemptFail("attempt cycle_id identity mismatch");
+  }
+  if (String(row.attempt_id) !== ceoAttemptId(
+    String(row.objective_id), String(row.cycle_id), Number(row.attempt_number))) {
+    attemptFail("attempt_id identity mismatch");
+  }
+  const events = store.listEvents(CEO_DECISION_ATTEMPT_ENTITY, String(row.attempt_id));
+  const starts = events.filter((e) => String(e.event_type) === CEO_ATTEMPT_STARTED_EVENT);
+  const settles = events.filter((e) => String(e.event_type) === CEO_ATTEMPT_SETTLED_EVENT);
+  if (starts.length !== 1) attemptFail(`attempt ${String(row.attempt_id)}: ${starts.length} START anchors`);
+  const s = starts[0]!;
+  if (String(s.new_state ?? "") !== "STARTED" || (s.old_state ?? null) !== null) {
+    attemptFail("START anchor header mismatch");
+  }
+  const smd = (s.metadata ?? {}) as Record<string, unknown>;
+  const startFields = {
+    attempt_id: String(row.attempt_id),
+    cycle_id: String(row.cycle_id),
+    objective_id: String(row.objective_id),
+    business_id: String(row.business_id),
+    observation_digest: String(row.observation_digest),
+    attempt_number: Number(row.attempt_number),
+    model_entry_id: String(row.model_entry_id),
+    provider_id: String(row.provider_id),
+    model_id: String(row.model_id),
+    started_at: String(row.started_at),
+  };
+  for (const [k, v] of Object.entries(startFields)) {
+    if (smd[k] !== v) attemptFail(`START anchor ${k} mismatch`);
+  }
+  if (String(smd.start_identity_digest ?? "") !== ceoAttemptStartDigest(startFields)) {
+    attemptFail("START anchor identity digest mismatch");
+  }
+  // Transition evidence per state — one narrow seam, immutable anchor.
+  const settleField = (r: Row, f: string): string | null =>
+    r[f] === null || r[f] === undefined ? null : String(r[f]);
+  if (state === "STARTED") {
+    if (settles.length !== 0) attemptFail("STARTED attempt carries a settle anchor");
+    if (row.settled_at !== null && row.settled_at !== undefined) {
+      attemptFail("STARTED attempt has settled_at");
+    }
+    return;
+  }
+  if (settles.length !== 1) attemptFail(`attempt ${String(row.attempt_id)}: ${settles.length} SETTLE anchors`);
+  const st = settles[0]!;
+  if (String(st.old_state ?? "") !== "STARTED" || String(st.new_state ?? "") !== state) {
+    attemptFail("SETTLE anchor header mismatch");
+  }
+  const tmd = (st.metadata ?? {}) as Record<string, unknown>;
+  if (String(tmd.attempt_id ?? "") !== String(row.attempt_id) ||
+      String(tmd.from ?? "") !== "STARTED" || String(tmd.to ?? "") !== state) {
+    attemptFail("SETTLE anchor transition mismatch");
+  }
+  if (row.settled_at === null || row.settled_at === undefined ||
+      String(tmd.settled_at ?? "") !== String(row.settled_at)) {
+    attemptFail("SETTLE settled_at mismatch");
+  }
+  for (const f of ["response_digest", "canonical_proposal_digest", "failure_code"] as const) {
+    if ((tmd[f] ?? null) !== settleField(row, f)) attemptFail(`SETTLE anchor ${f} mismatch`);
+  }
+  if (String(tmd.settle_digest ?? "") !== ceoAttemptSettleDigest({
+    attempt_id: String(row.attempt_id),
+    to: state,
+    settled_at: String(row.settled_at),
+    response_digest: settleField(row, "response_digest"),
+    canonical_proposal_digest: settleField(row, "canonical_proposal_digest"),
+    failure_code: settleField(row, "failure_code"),
+  })) {
+    attemptFail("SETTLE anchor digest mismatch");
+  }
+  // Per-state required evidence.
+  if (state === "ACCEPTED") {
+    if (settleField(row, "response_digest") === null ||
+        settleField(row, "canonical_proposal_digest") === null ||
+        settleField(row, "failure_code") !== null) {
+      attemptFail("ACCEPTED attempt missing response/proposal digest or carries failure_code");
+    }
+  } else if (state === "REJECTED") {
+    if (settleField(row, "failure_code") === null) attemptFail("REJECTED attempt missing failure_code");
+  } else if (state === "STALE") {
+    if (settleField(row, "failure_code") !== "CEO_OBSERVATION_STALE" ||
+        settleField(row, "canonical_proposal_digest") === null) {
+      attemptFail("STALE attempt evidence mismatch");
+    }
+  } else if (state === "UNKNOWN") {
+    if (settleField(row, "failure_code") !== "CEO_ATTEMPT_RECONCILED") {
+      attemptFail("UNKNOWN attempt must carry CEO_ATTEMPT_RECONCILED");
+    }
   }
 }
 
@@ -218,8 +370,38 @@ export function assertCanonicalCeoDecision(deps: CeoObservationDeps, row: Row): 
     fail(`decision_kind ${String(row.decision_kind)}`);
   }
   if (String(row.state) !== "COMMITTED") fail("state != COMMITTED");
-  if (!row.proposal || typeof row.proposal !== "object" || Array.isArray(row.proposal)) {
-    fail("proposal malformed");
+  // R2.B — the receipt must re-prove its own identity: cycle/decision
+  // ids are deterministic functions of the pinned fields, and the
+  // stored proposal must pass the ONE canonical proposal validator
+  // (exact discriminated-variant fields — no contradictory leftovers).
+  if (String(row.cycle_id) !==
+      ceoCycleId(String(row.objective_id), String(row.observation_digest))) {
+    fail("cycle_id identity mismatch");
+  }
+  if (String(row.decision_id) !==
+      ceoDecisionId(String(row.objective_id), String(row.cycle_id))) {
+    fail("decision_id identity mismatch");
+  }
+  let canonicalProposal: CeoProposal;
+  try {
+    canonicalProposal = validateCanonicalCeoProposal(row.proposal);
+  } catch (err) {
+    fail(`proposal invalid: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (String(row.decision_kind) !== canonicalProposal.decision_kind) {
+    fail("decision_kind != proposal decision_kind");
+  }
+  if (String(row.canonical_proposal_digest) !== ceoProposalDigest(canonicalProposal)) {
+    fail("canonical_proposal_digest mismatch");
+  }
+  // Strict-read the canonical Objective — it must exist and the
+  // receipt's business binding must agree with it (a foreign business
+  // never counts). Historical version/digest pins are NOT required to
+  // equal current state after a legitimate amendment — the immutable
+  // anchor preserves the historical snapshot identity.
+  const obj = deps.objectives.get(String(row.objective_id));
+  if (String(obj.business_id) !== String(row.business_id)) {
+    fail("receipt business_id foreign to canonical Objective");
   }
   if (String(row.decision_digest ?? "") !== ceoDecisionDigest(row)) {
     fail("decision_digest mismatch");
@@ -256,9 +438,11 @@ export function assertCanonicalCeoDecision(deps: CeoObservationDeps, row: Row): 
   const attempt = store.tryGet(CEO_DECISION_ATTEMPT_ENTITY, String(row.attempt_id)) as Row | null;
   if (!attempt) fail("attempt missing");
   assertCanonicalCeoAttempt(store, attempt);
-  if (String(attempt.state) !== "ACCEPTED" ||
+  if (String(attempt.attempt_id) !== String(row.attempt_id) ||
+      String(attempt.state) !== "ACCEPTED" ||
       String(attempt.cycle_id) !== String(row.cycle_id) ||
       String(attempt.objective_id) !== String(row.objective_id) ||
+      String(attempt.business_id) !== String(row.business_id) ||
       String(attempt.observation_digest) !== String(row.observation_digest) ||
       String(attempt.model_entry_id) !== String(row.model_entry_id) ||
       String(attempt.provider_id) !== String(row.provider_id) ||
@@ -306,6 +490,10 @@ export interface CeoPlanningCycleDeps extends CeoObservationDeps {
   timeout_ms?: number;
   stale_grace_ms?: number;
   now?: () => string;
+  /** Post-claim seam (tests / instrumentation): fires after the
+   *  STARTED attempt commits and BEFORE the canonical model-authority
+   *  re-proof + provider call. */
+  after_attempt_claim?: () => void;
 }
 
 export class CeoPlanningCycleService {
@@ -320,14 +508,92 @@ export class CeoPlanningCycleService {
       .sort((a, b) => Number(a.attempt_number) - Number(b.attempt_number));
   }
 
-  private settleAttempt(attempt: Row, state: string, extra: Record<string, unknown> = {}): void {
+  /** The ONE narrow transition seam (R2.C): apply the terminal state
+   *  + emit the immutable CEO_DECISION_ATTEMPT_SETTLED anchor pinning
+   *  every transition field. Must run inside an open transaction. */
+  private applyAttemptSettle(
+    cur: Row,
+    to: "ACCEPTED" | "REJECTED" | "STALE" | "UNKNOWN",
+    fields: {
+      response_digest?: string | null;
+      canonical_proposal_digest?: string | null;
+      failure_code?: string | null;
+    },
+    actor: string,
+  ): void {
+    const attemptId = String(cur.attempt_id);
+    const settled_at = this.now();
+    const next: Row = {
+      ...cur,
+      state: to,
+      settled_at,
+      response_digest: fields.response_digest !== undefined ? fields.response_digest : cur.response_digest,
+      canonical_proposal_digest: fields.canonical_proposal_digest !== undefined
+        ? fields.canonical_proposal_digest : cur.canonical_proposal_digest,
+      failure_code: fields.failure_code !== undefined ? fields.failure_code : cur.failure_code,
+    };
+    this.store.put(CEO_DECISION_ATTEMPT_ENTITY, attemptId, next, Number(cur.version));
+    const pins = {
+      attempt_id: attemptId,
+      from: "STARTED",
+      to,
+      settled_at,
+      response_digest: (next.response_digest as string | null) ?? null,
+      canonical_proposal_digest: (next.canonical_proposal_digest as string | null) ?? null,
+      failure_code: (next.failure_code as string | null) ?? null,
+    };
+    this.store.event({
+      entity_type: CEO_DECISION_ATTEMPT_ENTITY,
+      entity_id: attemptId,
+      event_type: CEO_ATTEMPT_SETTLED_EVENT,
+      old_state: "STARTED",
+      new_state: to,
+      actor: `operator:${actor}`,
+      metadata: {
+        ...pins,
+        settle_digest: ceoAttemptSettleDigest({
+          attempt_id: pins.attempt_id,
+          to: pins.to,
+          settled_at: pins.settled_at,
+          response_digest: pins.response_digest,
+          canonical_proposal_digest: pins.canonical_proposal_digest,
+          failure_code: pins.failure_code,
+        }),
+      },
+    });
+  }
+
+  private settleAttempt(
+    attempt: Row,
+    state: "ACCEPTED" | "REJECTED" | "STALE" | "UNKNOWN",
+    extra: {
+      response_digest?: string | null;
+      canonical_proposal_digest?: string | null;
+      failure_code?: string | null;
+    },
+    actor: string,
+  ): void {
     this.store.immediate(() => {
       const cur = this.store.get(CEO_DECISION_ATTEMPT_ENTITY, String(attempt.attempt_id)) as Row;
       if (String(cur.state) !== "STARTED") return; // already settled — converged
-      this.store.put(CEO_DECISION_ATTEMPT_ENTITY, String(attempt.attempt_id), {
-        ...cur, ...extra, state, settled_at: this.now(),
-      }, Number(cur.version));
+      this.applyAttemptSettle(cur, state, extra, actor);
     });
+  }
+
+  /** R2.D — fresh canonical CEO-model proof run AFTER the STARTED
+   *  attempt commits and immediately before the provider call. Zero
+   *  write-transaction is held during the network call. */
+  private reproveModelAuthority(attempt: Row): void {
+    this.assertCeoModelUsable(this.deps.model_entry_id);
+    const transport = resolveCeoModelTransport(this.store, this.deps.model_entry_id);
+    if (transport.model_entry_id !== String(attempt.model_entry_id) ||
+        transport.provider_id !== String(attempt.provider_id) ||
+        transport.model_id !== String(attempt.model_id)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CEO_MODEL_UNRESOLVED",
+        "configured CEO model identity drifted since attempt claim",
+      );
+    }
   }
 
   /** CEO model eligibility (§"CRITICAL MODEL-ROLE COMPATIBILITY"):
@@ -418,6 +684,16 @@ export class CeoPlanningCycleService {
     }
     // 4. Canonical observation.
     const first = buildCeoObservation(this.deps, objectiveId);
+    // R2.F — serialized model-input bound (UTF-8 bytes): oversized
+    // observation fails closed BEFORE any attempt/invocation; the
+    // canonical state is never truncated to fit.
+    const userPrompt = buildCeoUserPrompt(first.observation);
+    if (Buffer.byteLength(userPrompt, "utf8") > CEO_MAX_OBSERVATION_BYTES) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CEO_OBSERVATION_TOO_LARGE",
+        `observation exceeds ${CEO_MAX_OBSERVATION_BYTES} bytes`,
+      );
+    }
     const cycleId = ceoCycleId(objectiveId, first.observation_digest);
     const decisionId = ceoDecisionId(objectiveId, cycleId);
     // 5. Replay — same canonical state already has an ACCEPTED decision.
@@ -427,9 +703,15 @@ export class CeoPlanningCycleService {
       const binding = this.deps.workstreams.getBinding(objectiveId);
       return { decision: existing, binding, attempt_id: String(existing.attempt_id), replayed: true };
     }
-    // 6. Hard cycle bound — canonical decisions only.
-    const cycles = (this.store.list(CEO_DECISION_ENTITY) as Row[])
-      .filter((d) => String(d.objective_id) === objectiveId).length;
+    // 6. Hard cycle bound (R2.E) — counts CANONICAL decision cycles
+    //    only; a malformed row attributed to this objective is corrupt
+    //    authority and fails closed, never silently skipped.
+    let cycles = 0;
+    for (const d of this.store.list(CEO_DECISION_ENTITY) as Row[]) {
+      if (String(d.objective_id) !== objectiveId) continue;
+      assertCanonicalCeoDecision(this.deps, d);
+      cycles++;
+    }
     if (cycles >= CEO_CYCLE_MAX_PER_OBJECTIVE) {
       throw new IntegrityError("FAIL_CLOSED_CEO_CYCLE_LIMIT", objectiveId);
     }
@@ -437,10 +719,20 @@ export class CeoPlanningCycleService {
     const model = this.assertCeoModelUsable(this.deps.model_entry_id);
     const transport = resolveCeoModelTransport(this.store, this.deps.model_entry_id);
     // 8. Claim the attempt inside a serializing transaction — at most
-    //    ONE live invocation per observation; ≤2 attempts ever.
+    //    ONE live invocation per observation; ≤2 attempts ever. Only
+    //    canonical attempts count; a malformed attempt row is corrupt
+    //    authority and fails closed. The immutable START anchor pins
+    //    the claim-time identity in the same transaction.
+    const businessId0 = String(
+      (first.observation.objective as Record<string, unknown>).business_id);
     const attemptNumber = this.store.immediate(() => {
       const attempts = this.attemptsFor(cycleId);
-      for (const a of attempts) assertCanonicalCeoAttempt(this.store, a);
+      for (const a of attempts) {
+        assertCanonicalCeoAttempt(this.store, a);
+        if (String(a.business_id) !== businessId0) {
+          fail("attempt business_id foreign to objective");
+        }
+      }
       if (attempts.some((a) => String(a.state) === "STARTED")) {
         throw new IntegrityError("FAIL_CLOSED_CEO_DECISION_INFLIGHT", cycleId);
       }
@@ -449,29 +741,65 @@ export class CeoPlanningCycleService {
       }
       const n = attempts.length + 1;
       const attemptId = ceoAttemptId(objectiveId, cycleId, n);
-      this.store.put(CEO_DECISION_ATTEMPT_ENTITY, attemptId, {
-        schema_version: CEO_ATTEMPT_SCHEMA_VERSION,
+      const startedAt = this.now();
+      const startFields = {
         attempt_id: attemptId,
         cycle_id: cycleId,
         objective_id: objectiveId,
-        business_id: String((first.observation.objective as Record<string, unknown>).business_id),
+        business_id: businessId0,
         observation_digest: first.observation_digest,
         attempt_number: n,
-        state: "STARTED",
         model_entry_id: transport.model_entry_id,
         provider_id: transport.provider_id,
         model_id: transport.model_id,
-        started_at: this.now(),
+        started_at: startedAt,
+      };
+      this.store.put(CEO_DECISION_ATTEMPT_ENTITY, attemptId, {
+        schema_version: CEO_ATTEMPT_SCHEMA_VERSION,
+        ...startFields,
+        state: "STARTED",
+        started_by: actor,
         settled_at: null,
         response_digest: null,
         canonical_proposal_digest: null,
         failure_code: null,
         version: 0,
       } as Row, 0);
+      this.store.event({
+        entity_type: CEO_DECISION_ATTEMPT_ENTITY,
+        entity_id: attemptId,
+        event_type: CEO_ATTEMPT_STARTED_EVENT,
+        old_state: null,
+        new_state: "STARTED",
+        actor: `operator:${actor}`,
+        metadata: {
+          ...startFields,
+          start_identity_digest: ceoAttemptStartDigest(startFields),
+        },
+      });
       return n;
     });
     const attemptId = ceoAttemptId(objectiveId, cycleId, attemptNumber);
     const attempt = this.store.get(CEO_DECISION_ATTEMPT_ENTITY, attemptId) as Row;
+
+    // Post-claim seam (R2.D ordering): any authority mutation between
+    // observation and invocation lands here — the re-proof below then
+    // refuses the provider call.
+    this.deps.after_attempt_claim?.();
+
+    // R2.D — fresh canonical eligibility proof immediately BEFORE the
+    // provider call; failure settles the attempt REJECTED with zero
+    // invocations.
+    try {
+      this.reproveModelAuthority(attempt);
+    } catch (err) {
+      this.settleAttempt(attempt, "REJECTED", {
+        failure_code: err instanceof IntegrityError
+          ? String(err.code).replace(/^FAIL_CLOSED_/, "")
+          : "CEO_MODEL_REPROOF_FAILED",
+      }, actor);
+      throw err;
+    }
 
     // 9. Invoke — exactly ONE provider call per attempt, no retries,
     //    no synthetic fallback.
@@ -501,7 +829,7 @@ export class CeoPlanningCycleService {
           ? String(err.code).replace(/^FAIL_CLOSED_/, "")
           : "CEO_INVOCATION_FAILED",
         ...(responseDigest !== null ? { response_digest: responseDigest } : {}),
-      });
+      }, actor);
       // Invocation-layer failures surface as ONE deterministic typed code —
       // never raw exception text or provider details (§28).
       if (err instanceof IntegrityError) throw err;
@@ -520,14 +848,14 @@ export class CeoPlanningCycleService {
       const fresh = buildCeoObservation(this.deps, objectiveId);
       if (fresh.observation_digest !== first.observation_digest) {
         // TOCTOU — the model decided against stale state. Settle STALE
-        // (committed) and let the caller run a fresh cycle.
+        // (committed, with its immutable settle anchor) and let the
+        // caller run a fresh cycle.
         const cur = this.store.get(CEO_DECISION_ATTEMPT_ENTITY, attemptId) as Row;
-        this.store.put(CEO_DECISION_ATTEMPT_ENTITY, attemptId, {
-          ...cur, state: "STALE", settled_at: this.now(),
+        this.applyAttemptSettle(cur, "STALE", {
           response_digest: responseDigest,
           canonical_proposal_digest: proposalDigest,
           failure_code: "CEO_OBSERVATION_STALE",
-        }, Number(cur.version));
+        }, actor);
         return { stale: true as const };
       }
       const freshObj = this.deps.objectives.get(objectiveId);
@@ -637,11 +965,11 @@ export class CeoPlanningCycleService {
         },
       });
       const cur = this.store.get(CEO_DECISION_ATTEMPT_ENTITY, attemptId) as Row;
-      this.store.put(CEO_DECISION_ATTEMPT_ENTITY, attemptId, {
-        ...cur, state: "ACCEPTED", settled_at: this.now(),
+      this.applyAttemptSettle(cur, "ACCEPTED", {
         response_digest: responseDigest,
         canonical_proposal_digest: proposalDigest,
-      }, Number(cur.version));
+        failure_code: null,
+      }, actor);
       const binding = this.deps.workstreams.getBinding(objectiveId);
       return { stale: false as const, decision, binding };
       });
@@ -652,7 +980,7 @@ export class CeoPlanningCycleService {
           : "CEO_COMMIT_FAILED",
         ...(responseDigest !== null ? { response_digest: responseDigest } : {}),
         canonical_proposal_digest: proposalDigest,
-      });
+      }, actor);
       if (err instanceof IntegrityError) throw err;
       throw new IntegrityError("FAIL_CLOSED_CEO_COMMIT", "commit failed");
     }
@@ -680,14 +1008,11 @@ export class CeoPlanningCycleService {
       if (String(a.state) !== "STARTED") continue;
       const started = Date.parse(String(a.started_at));
       if (!Number.isFinite(started) || now - started <= grace) continue;
-      this.store.immediate(() => {
-        const cur = this.store.get(CEO_DECISION_ATTEMPT_ENTITY, String(a.attempt_id)) as Row;
-        if (String(cur.state) !== "STARTED") return;
-        this.store.put(CEO_DECISION_ATTEMPT_ENTITY, String(a.attempt_id), {
-          ...cur, state: "UNKNOWN", settled_at: this.now(),
-          failure_code: "CEO_ATTEMPT_RECONCILED",
-        }, Number(cur.version));
-      });
+      // The same narrow transition seam emits the canonical SETTLE
+      // anchor — a direct row mutation is never canonical authority.
+      this.settleAttempt(a, "UNKNOWN", {
+        failure_code: "CEO_ATTEMPT_RECONCILED",
+      }, "system");
       count++;
     }
     return count;
