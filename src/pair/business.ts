@@ -1516,6 +1516,19 @@ export class BusinessLayer {
     // canonical open seam — forged rows and unmet dependencies never
     // reach binding/mission creation.
     this.assertGraphAuthority(row);
+    // P15.4 R2.A — a P15.2 Objective WORKSTREAM container is likewise
+    // non-executable: work only flows through governed P15.4 allocation
+    // (the delegated child), never a direct open that would mint an
+    // unassigned mission. Canonical identity only — a decomposed child
+    // whose canonical (assertGraphAuthority-proved) parent is the
+    // deterministic OWI_* objective root. DL_* delegated children and
+    // ordinary P14 nodes keep their semantics.
+    if (String(row.parent_work_item_id ?? "").startsWith("OWI_")) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_CONTAINER_NON_EXECUTABLE",
+        `objective workstream container ${workItemId} is allocated, not opened directly`,
+      );
+    }
     this.assertDependenciesSatisfied(row);
     // R2 §4 — persisted-ceiling ∩ current-parent ∩ current-child
     // authority must still hold at open, before any binding/mission is

@@ -46,6 +46,7 @@ import {
   GovernedTaskGate,
   ReconciliationService,
   RecoveryController,
+  WorkforceAllocationService,
   WorkforceService,
   assignModelRole,
   MODEL_ROLE,
@@ -1202,11 +1203,24 @@ describe("P15.3 R2.A — canonical P14 completion authority", () => {
     // Before any completion evidence: proven=false.
     let ws = (ctx.obs(oid).observation.workstreams as Array<Record<string, unknown>>)[0]!;
     expect(ws.completion_proven).toBe(false);
-    // The real canonical seam: open → bound mission → full governed
-    // completion evidence → sync fold → DONE + WCP + anchor.
-    ctx.biz.openWorkItem(wid, OP);
-    const mid = String((ctx.store.get("work_item", wid).mission_ids as string[])[0]);
+    // The real canonical seam: P15.4 allocation mints the delegated
+    // child → open → bound mission → full governed completion evidence →
+    // sync fold → parent cascade → DONE + WCP + anchor. (P15.4 R2.A —
+    // the workstream container itself is non-executable.)
+    const allocSvc = new WorkforceAllocationService({
+      store: ctx.store, business: ctx.biz, workforce: ctx.wf,
+      objectives: ctx.objectives, workstreams: ctx.workstreams,
+    });
+    ctx.biz.createOrgAgent({
+      business_id: bid, title: "a", department: "ops", operator_id: OP,
+    });
+    const ar = allocSvc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const childId = String(ar.delegated_child_work_item_id);
+    ctx.biz.openWorkItem(childId, OP);
+    const mid = String((ctx.store.get("work_item", childId).mission_ids as string[])[0]);
     canonicallyCompleteMission(ctx.store, ctx.service, mid);
+    ctx.biz.syncWorkItem(childId);
+    ctx.biz.advanceCompletionCascade(childId);
     const done = ctx.biz.syncWorkItem(wid);
     expect(String(done.status)).toBe("DONE");
     ws = (ctx.obs(oid).observation.workstreams as Array<Record<string, unknown>>)[0]!;
