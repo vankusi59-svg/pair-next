@@ -364,8 +364,9 @@ function ledgerOf(value: unknown): ObjectiveLedgerEntry[] {
 
 /** Semantic digest of a progress application: same evidence_key bound to
  *  different objective/kpi/value/verifier is NOT a replay — it is a
- *  conflict. */
-function progressSemantics(objectiveId: string, input: {
+ *  conflict. Exported so downstream strict proofs (P15.5) reuse the ONE
+ *  digest rule rather than duplicating it. */
+export function progressSemantics(objectiveId: string, input: {
   kpi_id: string; value: number;
   evidence: { evidence_key: string; verifier: string; source: string };
 }): string {
