@@ -289,8 +289,166 @@ const FILE_EDGE_HEAD_RE = new RegExp(
   "i",
 );
 
-const PRODUCE_VERB_RE =
-  /\b(?:create|write|produce|generate|save|draft|export|render|emit|build|tạo|viết|soạn|lưu|xuất|sinh|render)/iu;
+/** Canonical produce vocabulary — the single source feeding both the
+ *  clause-level PRODUCE_VERB_RE (obligation dedup below) and the
+ *  governing-token set used by produce→object binding. One list so the
+ *  two authorities can never drift apart. */
+const PRODUCE_WORDS = [
+  "create", "write", "produce", "generate", "save", "draft", "export",
+  "render", "emit", "build",
+  "tạo", "viết", "soạn", "lưu", "xuất", "sinh",
+] as const;
+const PRODUCE_VERB_RE = new RegExp(`\\b(?:${PRODUCE_WORDS.join("|")})\\b`, "iu");
+const PRODUCE_GOVERNING_WORDS = new Set<string>(PRODUCE_WORDS);
+
+/** Produce→object binding (M3 CASE_B): a filename mints DEL_* only when
+ *  its leftward governing token is a produce verb. Clause-level
+ *  co-occurrence of a produce verb and a filename is NOT binding —
+ *  "tạo PR ... sửa src/foo.test.ts" must not fabricate a deliverable for
+ *  the modify-target file. The backward scan stops at the first
+ *  governing token; connectives, other filenames, filler and unknown
+ *  words pass through; destination prepositions (to/vào/into/thành/ra)
+ *  pass through — the verb before them governs ("write results to
+ *  report.md" produces report.md). Source/context prepositions and
+ *  non-produce action verbs stop the scan with NO mint — the file is an
+ *  input, a modify-target, or a contextual mention. Reaching clause
+ *  start without a governing verb → no mint: conservative incompleteness
+ *  beats a fabricated requirement.
+ *
+ *  R1 refinements (over-narrow audit):
+ *  - Only tokens that can govern a file BY THEMSELVES stop the scan.
+ *    Vietnamese disyllabic-verb fragments (phân/tích, kiểm/tra,
+ *    nghiên/cứu, ...) never govern alone and routinely appear inside
+ *    noun phrases ("báo cáo phân tích" = analysis report) — treating
+ *    them as boundaries false-blocked the real produce verb further
+ *    left. Same for bare "test" ("test report"). They pass through.
+ *  - Ambiguous locatives (in/on/at/trên/trong) double as destination
+ *    markers ("write results in report.md", "viết kết quả trong
+ *    report.md") — they pass through; locative uses inside modify
+ *    clauses stay protected by the modify verb further left.
+ *  - A source preposition (from/từ/of) mid-scan still bounds the file
+ *    — unless the file's own immediate preposition is an unambiguous
+ *    destination marker ("viết từ notes.md ra report.md"), in which
+ *    case the source phrase binds a different noun and the scan
+ *    continues to the governing verb. */
+const NON_PRODUCE_ACTION_WORDS = new Set([
+  // Modify/delete class — the file is the object being changed or removed.
+  "fix", "edit", "modify", "patch", "update", "change", "refactor",
+  "rename", "move", "delete", "remove", "drop", "replace", "revert",
+  "amend", "adjust", "tweak",
+  "sửa", "chỉnh", "đổi", "thay", "xóa", "gỡ", "loại", "bỏ", "vá",
+  "huỷ", "hủy",
+  // Read/consume/inspect class — the file is an input being used.
+  "read", "open", "load", "parse", "inspect", "review", "analyze",
+  "analyse", "study", "survey", "check", "verify", "validate", "monitor",
+  "fetch", "retrieve", "collect", "gather", "download", "scrape",
+  "extract", "compare", "contrast", "assess", "evaluate", "use", "apply",
+  "consume", "reference", "cite", "import", "merge", "watch",
+  "đọc", "xem", "mở", "tải", "lấy", "tìm", "dùng", "nhập", "gộp",
+]);
+/** Context prepositions — a file reached through one of these is a
+ *  source, topic or circumstance object, never the produced thing. */
+const CONTEXT_PREP_WORDS = new Set([
+  "from", "từ", "of", "within", "inside",
+  "about", "về", "like", "như", "theo", "per", "based",
+  "against", "với", "with", "for", "cho", "because", "vì", "by", "bởi",
+  "via", "through", "qua", "over", "under", "behind", "before", "after",
+  "sau", "trước", "giữa", "between", "among", "ngoài", "outside",
+  "except", "trừ", "without", "để", "during", "khi", "lúc", "while",
+  "since", "kể", "until", "beyond", "around", "near", "beside", "along",
+  "kèm", "cùng", "vs", "versus",
+]);
+/** The subset whose phrase names the file's origin. When the file's own
+ *  immediate preposition is an unambiguous destination marker, a source
+ *  phrase elsewhere in the scan is binding a different noun — pass it. */
+const SOURCE_PREP_WORDS = new Set(["from", "từ", "of"]);
+/** Unambiguous destination markers — evidence the file sits in a
+ *  destination slot governed by the produce verb further left. The
+ *  ambiguous locatives (in/trong/on/at/trên) are deliberately absent:
+ *  they pass through the scan but are not strong enough to float a
+ *  source phrase. */
+const DEST_PREP_WORDS = new Set([
+  "to", "into", "onto", "as", "vào", "thành", "ra",
+]);
+/** Ambiguous locatives — destination-capable, so they may pass through
+ *  the scan, BUT only on positive evidence (R3): the produced object
+ *  left of the locative must be a file-content noun — "write results
+ *  in report.md" mints report.md because results live INSIDE the file.
+ *  Anything else (PR/function/class/endpoint/hàm/...) is a produced
+ *  object that merely LOCATES the file — no mint. A denylist of such
+ *  objects can never close this class; positive evidence can. */
+const LOCATIVE_PREP_WORDS = new Set(["in", "trong", "on", "at", "trên"]);
+/** Positive file-content vocabulary — things that live inside a file
+ *  rather than locating one. Deliberately small and auditable; an
+ *  unknown object simply fails closed. */
+const FILE_CONTENT_OBJECT_WORDS = new Set([
+  // English output/file-content nouns
+  "result", "results", "report", "reports", "summary", "output",
+  "outputs", "data", "content", "document", "documents", "doc", "docs",
+  "documentation", "file", "files", "text", "note", "notes", "analysis",
+  "findings", "code", "source", "spec", "plan", "plans", "draft",
+  "log", "chart", "diagram", "guide",
+  // Vietnamese equivalents (syllable-tokenized)
+  "kết", "quả", "báo", "cáo", "nội", "dung", "dữ", "liệu", "tài",
+  "văn", "bản", "ghi", "chú", "phân", "tích", "mã", "nguồn", "đặc",
+  "tả", "kế", "hoạch", "tóm", "tắt", "nháp", "hướng", "dẫn", "biểu",
+  "đồ",
+]);
+/** Fillers that may sit between the locative and its object — articles
+ *  and near-article quantifiers only. */
+const LOCATIVE_OBJECT_FILLER_WORDS = new Set([
+  "a", "an", "the", "một", "cái", "new", "mới",
+]);
+const GOVERNING_WORD_RE = /[\p{L}\p{N}_]+/gu;
+function isProduceGovernedFile(clause: string, fileIndex: number): boolean {
+  const words = clause.slice(0, fileIndex).match(GOVERNING_WORD_RE) ?? [];
+  const destBound =
+    words.length > 0 &&
+    DEST_PREP_WORDS.has(words[words.length - 1].toLowerCase());
+  for (let i = words.length - 1; i >= 0; i--) {
+    const w = words[i].toLowerCase();
+    if (PRODUCE_GOVERNING_WORDS.has(w)) return true;
+    if (NON_PRODUCE_ACTION_WORDS.has(w)) return false;
+    if (SOURCE_PREP_WORDS.has(w) && destBound) continue;
+    if (CONTEXT_PREP_WORDS.has(w)) return false;
+    if (LOCATIVE_PREP_WORDS.has(w)) {
+      // R4: judge the whole object phrase between the governing verb
+      // and the locative — a single positive tail token is not enough
+      // ("hàm phân tích" = coding-object head + content modifier; the
+      // file still only locates the produced object). Every non-filler
+      // word of the phrase must be file-content evidence.
+      let j = i - 1;
+      let sawContent = false;
+      let pure = true;
+      while (j >= 0) {
+        const pw = words[j].toLowerCase();
+        if (LOCATIVE_OBJECT_FILLER_WORDS.has(pw)) {
+          j--;
+          continue;
+        }
+        if (
+          PRODUCE_GOVERNING_WORDS.has(pw) ||
+          NON_PRODUCE_ACTION_WORDS.has(pw) ||
+          CONTEXT_PREP_WORDS.has(pw) ||
+          SOURCE_PREP_WORDS.has(pw) ||
+          DEST_PREP_WORDS.has(pw) ||
+          LOCATIVE_PREP_WORDS.has(pw)
+        ) {
+          break;
+        }
+        if (!FILE_CONTENT_OBJECT_WORDS.has(pw)) {
+          pure = false;
+          break;
+        }
+        sawContent = true;
+        j--;
+      }
+      if (!sawContent || !pure) return false;
+      continue;
+    }
+  }
+  return false;
+}
 
 /** Work verbs that make a clause an obligation. Delivery verbs (send /
  *  gửi / deliver) are deliberately absent — delivery is governed by the
@@ -524,12 +682,17 @@ export function extractGoalContract(goal: string): GoalContract {
     if (!deadline && DEADLINE_RE.test(clause)) {
       deadline = { id: "DDL_001", text: clause.slice(0, 500) };
     }
+    // A filename mints DEL_* only when its leftward governing token is a
+    // produce verb — clause-level co-occurrence of a produce verb and a
+    // filename is not binding (M3 CASE_B: `tạo` governed "PR" while the
+    // modify-target .test.ts in the same clause minted a fabricated
+    // DEL_001). See isProduceGovernedFile.
     const files: string[] = [];
-    if (PRODUCE_VERB_RE.test(clause)) {
-      FILE_RE.lastIndex = 0;
-      let fm: RegExpExecArray | null;
-      while ((fm = FILE_RE.exec(clause)) !== null) {
-        if (!files.includes(fm[1])) files.push(fm[1]);
+    FILE_RE.lastIndex = 0;
+    let fm: RegExpExecArray | null;
+    while ((fm = FILE_RE.exec(clause)) !== null) {
+      if (!files.includes(fm[1]) && isProduceGovernedFile(clause, fm.index)) {
+        files.push(fm[1]);
       }
     }
     for (const f of files.slice(0, 8)) {
