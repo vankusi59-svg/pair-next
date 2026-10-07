@@ -1497,6 +1497,19 @@ export class BusinessLayer {
    */
   openWorkItem(workItemId: string, operatorId: string): Row {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
+    // P15.2 R2.B — the deterministic Objective-root namespace (OWI_*)
+    // is permanently non-executable: an Objective root is a P14 graph
+    // container only, never an openable work item. Guard sits at the
+    // canonical open seam BEFORE pending-open resolution, budget
+    // reservation, work_open_binding or mission creation; it keys on
+    // deterministic namespace identity, never the mutable `source`
+    // field. Ordinary P14 graph parents keep their existing semantics.
+    if (workItemId.startsWith("OWI_")) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_ROOT_NON_EXECUTABLE",
+        `objective root ${workItemId} is a graph container, not executable work`,
+      );
+    }
     const row = this.resolvePendingOpenBeforeMutation(workItemId, operatorId);
     this.assertWorkItemNotQuarantined(row);
     // WFV2 §5/§7: graph provenance + dependency gating at the single

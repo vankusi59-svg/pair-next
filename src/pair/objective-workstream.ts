@@ -99,6 +99,18 @@ export function objectiveWorkstreamDecompositionId(
 /** Canonical self-consistency digest of a binding row — covers every
  *  pinned field; a tampered row fails strict read. Exported so tests
  *  and future read-models can recompute exactly. */
+/** Canonical digest of the binding's workstream_key→child map —
+ *  pinned in the immutable commit anchor so a key-swap + recomputed
+ *  binding_digest cannot pass. */
+export function objectiveWorkstreamMapDigest(
+  workstreams: Array<Record<string, unknown>>,
+): string {
+  return digest(workstreams.map((w) => ({
+    workstream_key: String(w.workstream_key),
+    work_item_id: String(w.work_item_id),
+  })));
+}
+
 export function objectiveWorkstreamBindingDigest(b: Record<string, unknown>): string {
   return digest({
     schema_version: OBJECTIVE_WORKSTREAM_BINDING_SCHEMA,
@@ -242,12 +254,18 @@ export function normalizeObjectiveWorkstreamProposal(input: {
   const byKey = new Map(specs.map((s) => [s.workstream_key, s]));
   const normalizedWorkstreams = order.map((k) => {
     const s = byKey.get(k)!;
+    // R2.C — canonicalize dependency keys FIRST: both the stored key
+    // list and the derived indices come from the same sorted set, so
+    // semantically identical proposals digest identically regardless
+    // of dependency list order.
+    const canonicalDeps = [...(s.depends_on_keys ?? [])]
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     return {
       workstream_key: k,
       title: s.title,
       goal: s.goal,
-      depends_on_keys: [...(s.depends_on_keys ?? [])].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
-      depends_on_indices: (s.depends_on_keys ?? []).map((d) => position.get(d)!),
+      depends_on_keys: canonicalDeps,
+      depends_on_indices: canonicalDeps.map((d) => position.get(d)!),
     };
   });
   const normalized = {
@@ -302,12 +320,14 @@ export function assertCanonicalObjectiveWorkstreamBinding(
       fail(`missing ${f}`);
     }
   }
-  if (!Number.isInteger(Number(row.objective_version_at_commit)) ||
-      Number(row.objective_version_at_commit) < 0 ||
-      !Number.isInteger(Number(row.objective_terms_version)) ||
-      Number(row.objective_terms_version) < 0 ||
-      !Number.isInteger(Number(row.version)) || Number(row.version) < 0) {
-    fail("version fields malformed");
+  // R2.E — canonical authority shape requires actual JS integers;
+  // numeric strings never coerce through.
+  for (const f of [
+    "objective_version_at_commit", "objective_terms_version", "version",
+  ]) {
+    if (typeof row[f] !== "number" || !Number.isInteger(row[f]) || Number(row[f]) < 0) {
+      fail(`${f} malformed`);
+    }
   }
   if (String(row.state) !== "COMMITTED") fail(`state ${String(row.state)}`);
   if (String(row.binding_id) !== objectiveWorkstreamBindingId(String(row.objective_id))) {
@@ -371,6 +391,39 @@ export function assertCanonicalObjectiveWorkstreamBinding(
   if (String(row.decomposition_id) !==
       objectiveWorkstreamDecompositionId(objectiveId, String(row.normalized_proposal_digest))) {
     fail("decomposition_id does not bind the normalized proposal digest");
+  }
+  // R2.A — the immutable commit anchor: EXACTLY ONE
+  // OBJECTIVE_WORKSTREAM_COMMITTED event pins the binding's identity
+  // fields and the committed workstream map. Events are append-only —
+  // a tampered row with a recomputed "valid" digest still fails
+  // against the anchored original.
+  const anchors = deps.store
+    .listEvents(OBJECTIVE_WORKSTREAM_BINDING_ENTITY, String(row.binding_id))
+    .filter((e) => String(e.event_type) === "OBJECTIVE_WORKSTREAM_COMMITTED");
+  if (anchors.length !== 1) {
+    fail(`expected exactly 1 OBJECTIVE_WORKSTREAM_COMMITTED anchor, got ${anchors.length}`);
+  }
+  const md = (anchors[0]!.metadata ?? {}) as Record<string, unknown>;
+  const wsRows = (row.workstreams as Array<Record<string, unknown>> | undefined) ?? [];
+  const expectedAnchor: Record<string, unknown> = {
+    binding_id: String(row.binding_id),
+    binding_digest: objectiveWorkstreamBindingDigest(row),
+    objective_id: objectiveId,
+    business_id: businessId,
+    objective_version_at_commit: Number(row.objective_version_at_commit),
+    objective_terms_version: Number(row.objective_terms_version),
+    objective_digest: String(row.objective_digest),
+    root_work_item_id: String(row.root_work_item_id),
+    decomposition_row_id: String(row.decomposition_row_id),
+    decomposition_id: String(row.decomposition_id),
+    normalized_proposal_digest: String(row.normalized_proposal_digest),
+    workstream_map_digest: objectiveWorkstreamMapDigest(wsRows),
+    workstream_count: wsRows.length,
+  };
+  for (const [k, v] of Object.entries(expectedAnchor)) {
+    if (md[k] !== v) {
+      fail(`anchor ${k} mismatch: ${String(md[k])} != ${String(v)}`);
+    }
   }
   // Workstream map — must equal the WDEC's committed child set exactly,
   // in the normalized order; each child must be a canonical
@@ -494,44 +547,45 @@ export class ObjectiveWorkstreamService {
       }
       const businessId = String(obj.business_id);
       this.business.getBusiness(businessId); // fail-closed: real business
+      // R2.E — expected pins must be actual finite integers; a numeric
+      // string is not canonical authority shape.
       const snapshotOk =
-        Number(input.expected_objective_version) === Number(obj.version) &&
-        Number(input.expected_terms_version) === Number(obj.terms_version) &&
-        String(input.expected_objective_digest) === String(obj.objective_digest);
+        typeof input.expected_objective_version === "number" &&
+        Number.isInteger(input.expected_objective_version) &&
+        typeof input.expected_terms_version === "number" &&
+        Number.isInteger(input.expected_terms_version) &&
+        input.expected_objective_version === Number(obj.version) &&
+        input.expected_terms_version === Number(obj.terms_version) &&
+        typeof input.expected_objective_digest === "string" &&
+        input.expected_objective_digest === String(obj.objective_digest);
       if (!snapshotOk) {
         throw new IntegrityError(
           "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_SNAPSHOT",
           `stale objective snapshot for ${objectiveId}`,
         );
       }
-      // Deterministic root — converge to the same container; a residue
-      // must carry exact provenance to be adopted (never invented).
+      // R2.D — orphan-root fail-closed: the commit transaction writes
+      // root + decomposition + binding + anchor atomically, so a
+      // canonical Objective root can never legitimately exist WITHOUT
+      // its binding. An existing OWI_* residue — however "fresh" it
+      // looks — is unprovable residue, never adoptable freshness.
       const rootId = objectiveRootWorkItemId(objectiveId);
-      let root = this.store.tryGet("work_item", rootId) as Row | null;
-      if (root) {
-        if (String(root.business_id) !== businessId ||
-            String(root.objective_id ?? "") !== objectiveId ||
-            String(root.source ?? "") !== OBJECTIVE_ROOT_SOURCE ||
-            (root.assignee_agent_id ?? null) !== null ||
-            (root.delegated_from_work_item_id ?? null) !== null ||
-            ((root.mission_ids as string[] | undefined) ?? []).length !== 0) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_ROOT",
-            `root ${rootId} has mismatched provenance`,
-          );
-        }
-        this.business.assertWorkItemNotQuarantined(root);
-      } else {
-        root = this.business.createWorkItem({
-          business_id: businessId,
-          title: `[objective] ${String(obj.title)}`,
-          goal: String(obj.statement ?? obj.title),
-          objective_id: objectiveId,
-          source: OBJECTIVE_ROOT_SOURCE,
-          work_item_id: rootId,
-          operator_id: input.actor,
-        });
+      const existingRoot = this.store.tryGet("work_item", rootId) as Row | null;
+      if (existingRoot) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_ROOT_CONFLICT",
+          `deterministic root ${rootId} exists without a canonical binding`,
+        );
       }
+      const root = this.business.createWorkItem({
+        business_id: businessId,
+        title: `[objective] ${String(obj.title)}`,
+        goal: String(obj.statement ?? obj.title),
+        objective_id: objectiveId,
+        source: OBJECTIVE_ROOT_SOURCE,
+        work_item_id: rootId,
+        operator_id: input.actor,
+      });
       // Existing P14 authority — children + WDEC + WGE + WDS + membership
       // materialize inside this same outer transaction.
       let childrenRows: Row[];
@@ -582,10 +636,22 @@ export class ObjectiveWorkstreamService {
         event_type: "OBJECTIVE_WORKSTREAM_COMMITTED",
         new_state: "COMMITTED",
         actor: `operator:${input.actor}`,
+        // R2.A — immutable commit anchor: pins every authority field
+        // the binding claims (identity fields only — P14 owns topology).
         metadata: {
+          binding_id: bindingId,
+          binding_digest: String(bindingBody.binding_digest),
           objective_id: objectiveId,
+          business_id: businessId,
+          objective_version_at_commit: Number(obj.version),
+          objective_terms_version: Number(obj.terms_version),
+          objective_digest: String(obj.objective_digest),
           root_work_item_id: rootId,
+          decomposition_row_id: decompositionRowId(rootId),
           decomposition_id: decompositionId,
+          normalized_proposal_digest: normalizedProposalDigest,
+          workstream_map_digest: objectiveWorkstreamMapDigest(
+            bindingBody.workstreams as Array<Record<string, unknown>>),
           workstream_count: childrenRows.length,
         },
       });

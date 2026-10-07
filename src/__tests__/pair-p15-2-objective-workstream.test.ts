@@ -753,3 +753,296 @@ describe("P15.2 H — binding tamper", () => {
     store.close();
   });
 });
+
+/* ============================ R2 — remediation ============================ */
+
+/** Compute the store-level event hash for an event body — mirrors
+ *  PairEvidenceStore.event()'s integrity domain so tests can produce
+ *  a COHERENT forged anchor (metadata + matching hash). */
+function eventHash(body: Record<string, unknown>): string {
+  return digest({
+    event_id: body.event_id,
+    entity_type: body.entity_type,
+    entity_id: body.entity_id,
+    event_type: body.event_type,
+    old_state: body.old_state ?? null,
+    new_state: body.new_state ?? null,
+    actor: body.actor,
+    correlation_id: body.correlation_id ?? null,
+    metadata: body.metadata ?? null,
+    created_at: body.created_at,
+  });
+}
+
+function dbOf(store: PairEvidenceStore) {
+  return (store as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown; get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[] } } }).db;
+}
+
+describe("P15.2 R2.A — immutable anchor authority", () => {
+  function committed(name: string) {
+    const s = freshStack(name);
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    s.svc.decomposeObjective({
+      objective_id: oid, ...pins(o),
+      ...proposal([
+        { workstream_key: "a", title: "A", goal: "g" },
+        { workstream_key: "b", title: "B", goal: "g", depends_on_keys: ["a"] },
+      ]),
+    });
+    return { ...s, bid, oid, o };
+  }
+
+  it("tampered row fields + recomputed binding_digest still fail — anchor pins the original", () => {
+    const cases: Array<(r: Record<string, unknown>) => void> = [
+      (r) => { r.objective_version_at_commit = Number(r.objective_version_at_commit) + 1; },
+      (r) => { r.objective_terms_version = Number(r.objective_terms_version) + 1; },
+      (r) => { r.objective_digest = digest("forged-objective"); },
+      (r) => { r.created_by = "attacker"; },
+      (r) => { r.created_at = "2020-01-01T00:00:00.000Z"; },
+      (r) => {
+        const ws = r.workstreams as Array<Record<string, unknown>>;
+        const t = ws[0].workstream_key;
+        ws[0].workstream_key = ws[1].workstream_key;
+        ws[1].workstream_key = t;
+      },
+    ];
+    for (const [i, mutate] of cases.entries()) {
+      const { store, oid, svc } = committed(`r2a-field-${i}`);
+      const row = JSON.parse(JSON.stringify(
+        store.get("objective_workstream_binding", objectiveWorkstreamBindingId(oid))));
+      mutate(row);
+      row.binding_digest = objectiveWorkstreamBindingDigest(row); // valid-looking
+      store.put("objective_workstream_binding", objectiveWorkstreamBindingId(oid), row, Number(row.version));
+      expectFail(() => svc.getBinding(oid), "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_BINDING");
+      store.close();
+    }
+  });
+
+  it("deleted anchor → fail; duplicated anchor → fail; altered anchor field → fail", () => {
+    // DELETE the anchor
+    {
+      const { store, oid, svc } = committed("r2a-del");
+      const bid = objectiveWorkstreamBindingId(oid);
+      dbOf(store).prepare(
+        "DELETE FROM events WHERE entity_type=? AND entity_id=? AND event_type=?")
+        .run("objective_workstream_binding", bid, "OBJECTIVE_WORKSTREAM_COMMITTED");
+      expectFail(() => svc.getBinding(oid), "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_BINDING");
+      store.close();
+    }
+    // DUPLICATE the anchor
+    {
+      const { store, oid, svc } = committed("r2a-dup");
+      const bid = objectiveWorkstreamBindingId(oid);
+      const anchor = store.listEvents("objective_workstream_binding", bid)[0]!;
+      store.event({
+        entity_type: "objective_workstream_binding", entity_id: bid,
+        event_type: "OBJECTIVE_WORKSTREAM_COMMITTED", new_state: "COMMITTED",
+        actor: "operator:x", metadata: anchor.metadata as Record<string, unknown>,
+      });
+      expectFail(() => svc.getBinding(oid), "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_BINDING");
+      store.close();
+    }
+    // ALTER one anchored field coherently (metadata + event hash)
+    {
+      const { store, oid, svc } = committed("r2a-alter");
+      const bid = objectiveWorkstreamBindingId(oid);
+      const anchor = store.listEvents("objective_workstream_binding", bid)[0]!;
+      const md = { ...(anchor.metadata as Record<string, unknown>), workstream_count: 99 };
+      const body = {
+        event_id: anchor.event_id, entity_type: anchor.entity_type, entity_id: anchor.entity_id,
+        event_type: anchor.event_type, old_state: anchor.old_state ?? null,
+        new_state: anchor.new_state, actor: anchor.actor,
+        correlation_id: anchor.correlation_id ?? null, metadata: md, created_at: anchor.created_at,
+      };
+      dbOf(store).prepare("UPDATE events SET metadata_json=?, event_hash=? WHERE event_id=?")
+        .run(JSON.stringify(md), eventHash(body), String(anchor.event_id));
+      expectFail(() => svc.getBinding(oid), "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_BINDING");
+      store.close();
+    }
+  });
+
+  it("binding stays canonical after legitimate Objective amendment + replay converges", () => {
+    const { store, objectives, oid, bid, svc, o } = committed("r2a-amend");
+    objectives.amend(oid, { business_id: bid, patch: { target: "12" }, reason: "r", actor: `operator:${OP}` });
+    // binding remains canonical — the anchor pins the COMMIT snapshot,
+    // the current objective_digest legitimately differs.
+    const b = svc.getBinding(oid)!;
+    expect(String(b.objective_digest)).toBe(String(o.objective_digest));
+    expect(String(b.objective_digest)).not.toBe(String(objectives.get(oid).objective_digest));
+    const r = svc.decomposeObjective({
+      objective_id: oid, ...pins(o),
+      ...proposal([
+        { workstream_key: "a", title: "A", goal: "g" },
+        { workstream_key: "b", title: "B", goal: "g", depends_on_keys: ["a"] },
+      ]),
+    });
+    expect(String(r.binding.binding_id)).toBe(String(b.binding_id));
+    store.close();
+  });
+});
+
+describe("P15.2 R2.B — objective root is non-executable", () => {
+  it("openWorkItem(objective root) fails closed BEFORE any authority-bearing write", () => {
+    const { store, biz, objectives, svc } = freshStack("r2b-root");
+    const bid = mkBusiness(store);
+    const o = mkObjective(objectives, bid);
+    const oid = String(o.objective_id);
+    const res = svc.decomposeObjective({
+      objective_id: oid, ...pins(o),
+      ...proposal([{ workstream_key: "a", title: "A", goal: "g" }]),
+    });
+    const rootId = String(res.root.work_item_id);
+    expect(rootId.startsWith("OWI_")).toBe(true);
+    expectFail(() => biz.openWorkItem(rootId, OP), "FAIL_CLOSED_OBJECTIVE_ROOT_NON_EXECUTABLE");
+    expect(rowCount(store, "work_open_binding")).toBe(0);
+    expect(rowCount(store, "mission")).toBe(0);
+    expect(rowCount(store, "executor_execution")).toBe(0);
+    const root = store.get("work_item", rootId);
+    expect(root.status).toBe("BACKLOG");
+    expect(root.pending_open_id ?? null).toBeNull();
+    store.close();
+  });
+
+  it("guard is OWI_-namespaced — normal work items and P14 parents unaffected", () => {
+    const { store, biz, wf } = freshStack("r2b-normal");
+    const bid = mkBusiness(store);
+    // unknown non-OWI id fails differently (not the namespace guard)
+    try {
+      biz.openWorkItem("WI_NOPE", OP);
+      throw new Error("expected failure");
+    } catch (e) {
+      expect(String((e as { code?: string }).code))
+        .not.toBe("FAIL_CLOSED_OBJECTIVE_ROOT_NON_EXECUTABLE");
+    }
+    // a manual P14 decomposed parent reaches the SAME normal open path —
+    // the OWI_ guard never fires for it
+    const parent = biz.createWorkItem({
+      business_id: bid, title: "manual parent", goal: "g", source: "manual", operator_id: OP,
+    });
+    wf.decomposeWorkItem(String(parent.work_item_id), {
+      decomposition_id: `D_${digest("m").slice(0, 8)}`,
+      children: [{ title: "c", goal: "g" }],
+    }, OP);
+    try {
+      biz.openWorkItem(String(parent.work_item_id), OP);
+    } catch (e) {
+      expect(String((e as { code?: string }).code))
+        .not.toBe("FAIL_CLOSED_OBJECTIVE_ROOT_NON_EXECUTABLE");
+    }
+    store.close();
+  });
+});
+
+describe("P15.2 R2.C — dependency-order canonicalization", () => {
+  it('["A","B"] ≡ ["B","A"] — identical digest, replay not conflict', () => {
+    const { store, objectives, svc } = freshStack("r2c-deps");
+    const bid = mkBusiness(store);
+    const o = mkObjective(objectives, bid);
+    const oid = String(o.objective_id);
+    const mk = (deps: string[], order: string[]) => ({
+      objective_id: oid, ...pins(o),
+      workstreams: order.map((k) => ({
+        workstream_key: k, title: `T_${k}`, goal: "g",
+        depends_on_keys: k === "c" ? deps : k === "a" || k === "b" ? [] : undefined,
+      })),
+      actor: OP,
+    });
+    const r1 = svc.decomposeObjective(mk(["a", "b"], ["a", "b", "c"]));
+    const r2 = svc.decomposeObjective(mk(["b", "a"], ["b", "c", "a"]));
+    expect(String(r2.binding.binding_id)).toBe(String(r1.binding.binding_id));
+    expect(String(r2.binding.normalized_proposal_digest))
+      .toBe(String(r1.binding.normalized_proposal_digest));
+    expect(rowCount(store, "work_item")).toBe(4);
+    expect(rowCount(store, "objective_workstream_binding")).toBe(1);
+    store.close();
+  });
+});
+
+describe("P15.2 R2.D — orphan root fail-closed", () => {
+  it("pre-created OWI-compatible root → admission fails closed", () => {
+    const { store, biz, objectives, svc } = freshStack("r2d-orphan");
+    const bid = mkBusiness(store);
+    const o = mkObjective(objectives, bid);
+    const oid = String(o.objective_id);
+    const rootId = objectiveRootWorkItemId(oid);
+    // an OWI_-shaped residue that LOOKS fresh — still unprovable.
+    biz.createWorkItem({
+      business_id: bid, title: "[objective] forged", goal: "g",
+      objective_id: oid, source: "objective", work_item_id: rootId, operator_id: OP,
+    });
+    expectFail(
+      () => svc.decomposeObjective({
+        objective_id: oid, ...pins(o),
+        ...proposal([{ workstream_key: "a", title: "A", goal: "g" }]),
+      }),
+      "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_ROOT_CONFLICT",
+    );
+    expect(rowCount(store, "objective_workstream_binding")).toBe(0);
+    store.close();
+  });
+
+  it("orphan root with cleared mutable mission_ids still fails — no freshness inference", () => {
+    const { store, biz, objectives, svc } = freshStack("r2d-hist");
+    const bid = mkBusiness(store);
+    const o = mkObjective(objectives, bid);
+    const oid = String(o.objective_id);
+    const rootId = objectiveRootWorkItemId(oid);
+    const row = biz.createWorkItem({
+      business_id: bid, title: "x", goal: "g",
+      objective_id: oid, source: "objective", work_item_id: rootId, operator_id: OP,
+    });
+    // simulate "historical" residue: mutable projection cleared
+    const r = JSON.parse(JSON.stringify(row));
+    r.mission_ids = [];
+    store.put("work_item", rootId, r, Number(row.version));
+    expectFail(
+      () => svc.decomposeObjective({
+        objective_id: oid, ...pins(o),
+        ...proposal([{ workstream_key: "a", title: "A", goal: "g" }]),
+      }),
+      "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_ROOT_CONFLICT",
+    );
+    store.close();
+  });
+});
+
+describe("P15.2 R2.E — strict integer shape", () => {
+  it("numeric-string expected pins reject before mint", () => {
+    const { store, objectives, svc } = freshStack("r2e-ints");
+    const bid = mkBusiness(store);
+    const o = mkObjective(objectives, bid);
+    const oid = String(o.objective_id);
+    expectFail(
+      () => svc.decomposeObjective({
+        objective_id: oid,
+        expected_objective_version: String(o.version) as unknown as number,
+        expected_terms_version: String(o.terms_version) as unknown as number,
+        expected_objective_digest: String(o.objective_digest),
+        workstreams: [{ workstream_key: "a", title: "t", goal: "g" }], actor: OP,
+      }),
+      "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_SNAPSHOT",
+    );
+    expect(rowCount(store, "work_item")).toBe(0);
+    store.close();
+  });
+
+  it("numeric-string binding fields fail strict validation", () => {
+    const s = freshStack("r2e-row");
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    s.svc.decomposeObjective({
+      objective_id: oid, ...pins(o),
+      ...proposal([{ workstream_key: "a", title: "A", goal: "g" }]),
+    });
+    const row = JSON.parse(JSON.stringify(
+      s.store.get("objective_workstream_binding", objectiveWorkstreamBindingId(oid))));
+    row.objective_version_at_commit = String(row.objective_version_at_commit);
+    row.binding_digest = objectiveWorkstreamBindingDigest(row);
+    s.store.put("objective_workstream_binding", objectiveWorkstreamBindingId(oid), row, Number(row.version));
+    expectFail(() => s.svc.getBinding(oid), "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_BINDING");
+    s.store.close();
+  });
+});
