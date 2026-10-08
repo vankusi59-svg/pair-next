@@ -636,54 +636,95 @@ describe("P15.8-A conversation authority", () => {
     ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
   });
 
-  /* ---------------- R3.B — safe correlation ids ---------------- */
+  /* ---------------- R4.A — derived correlation ids ---------------- */
 
-  it("correlation_id is bounded opaque — bcap/freeform/secrets rejected on all three paths", () => {
+  it("correlation_id is server-derived — raw caller text never reaches events", () => {
     const ctx = fresh("corr");
-    const bcap = `bcap1.${"a".repeat(32)}.${"b".repeat(32)}`;
-    const secretish = "Authorization: Bearer tok_live_9x";
-    const prose = "gửi báo cáo lên telegram ngay";
-    for (const bad of [bcap, secretish, prose]) {
-      // Path 1 — session create.
-      expect(
-        code(() => ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: bad })),
-      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
-    }
-    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
-    for (const bad of [bcap, secretish, prose]) {
-      // Path 2 — message append (operator seam AND internal writer).
-      expect(
-        code(() =>
-          ctx.conv.appendMessage({
-            session_id: s.session_id, operator_id: OWNER, body: "x", correlation_id: bad,
-          }),
-        ),
-      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
-      expect(
-        code(() =>
-          ctx.conv.internalWriter().appendMessage({
-            session_id: s.session_id, role: "assistant", body: "x", correlation_id: bad,
-          }),
-        ),
-      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
-      // Path 3 — close.
-      expect(
-        code(() => ctx.conv.closeSession(s.session_id, { operator_id: OWNER, correlation_id: bad })),
-      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
-    }
-    // Nothing minted and no events written under the bad ids.
-    expect(ctx.conv.getSession(s.session_id, OWNER).message_count).toBe(0);
-    expect(ctx.conv.getSession(s.session_id, OWNER).state).toBe("OPEN");
-    const all = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s.session_id);
-    expect(all.every((e) => e.correlation_id === null || CORR_OK.test(String(e.correlation_id)))).toBe(true);
-    // Legit opaque ids still flow through all three paths.
-    const s2 = ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: "req:create-1" });
+    const secretShapes = [
+      `bcap1.${"a".repeat(32)}.${"b".repeat(32)}`,
+      "AKIAIOSFODNN7EXAMPLE",
+      "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz123456",
+      "sk_live_4eC39HqLyjWDarjtT1zdp7dc",
+      "Authorization: Bearer tok_live_9x",
+      "gửi báo cáo lên telegram ngay",
+    ];
+    // Every shape flows through — but what persists is `corr_<sha256>`,
+    // and the raw text is absent from the whole events table.
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: secretShapes[0] });
     ctx.conv.appendMessage({
-      session_id: s2.session_id, operator_id: OWNER, body: "m", correlation_id: "req:msg-2.turn-1",
+      session_id: s.session_id, operator_id: OWNER, body: "m1",
+      correlation_id: secretShapes[1],
     });
-    ctx.conv.closeSession(s2.session_id, { operator_id: OWNER, correlation_id: "req:close-3" });
-    const ev2 = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s2.session_id);
-    expect(ev2.map((e) => e.correlation_id)).toEqual(["req:create-1", "req:msg-2.turn-1", "req:close-3"]);
+    ctx.conv.internalWriter().appendMessage({
+      session_id: s.session_id, role: "assistant", body: "m2",
+      correlation_id: secretShapes[2],
+    });
+    ctx.conv.closeSession(s.session_id, { operator_id: OWNER, correlation_id: secretShapes[3] });
+    const events = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s.session_id);
+    expect(events).toHaveLength(4); // created + 2 appends + closed
+    for (const e of events) {
+      expect(String(e.correlation_id)).toMatch(/^corr_[0-9a-f]{64}$/);
+    }
+    // Raw caller text is nowhere — not in correlation_id, not anywhere in
+    // the serialized event row.
+    const dumped = JSON.stringify(events);
+    for (const raw of secretShapes) {
+      expect(dumped).not.toContain(raw);
+    }
+    // Correlation still works: identical inputs mint the SAME derived id
+    // (deterministic — a retried request correlates to its own events),
+    // different inputs mint different ids.
+    const c1 = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s.session_id)
+      .find((e) => e.event_type === "CONVERSATION_SESSION_CREATED")!.correlation_id;
+    const s2 = ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: secretShapes[0] });
+    const c2 = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s2.session_id)
+      .find((e) => e.event_type === "CONVERSATION_SESSION_CREATED")!.correlation_id;
+    expect(c2).toBe(c1);
+    const s3 = ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: "different-input" });
+    const c3 = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s3.session_id)
+      .find((e) => e.event_type === "CONVERSATION_SESSION_CREATED")!.correlation_id;
+    expect(c3).not.toBe(c1);
+    // Bounded: unreasonably long input fails closed rather than hashing forever.
+    expect(
+      code(() =>
+        ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: "x".repeat(5000) }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_LIMIT");
+    expect(code(() => ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: 7 }))).toBe(
+      "FAIL_CLOSED_CONVERSATION_FIELD",
+    );
+  });
+
+  /* ---------------- R4.B — duplicate physical rows ---------------- */
+
+  it("a cloned physical row under a second entity key fails closed", () => {
+    const ctx = fresh("clone");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const m = ctx.conv.appendMessage({
+      session_id: s.session_id, operator_id: OWNER, body: "original",
+    });
+    // Deterministic adversarial: INSERT a second physical row at a
+    // DIFFERENT entity key carrying the exact same payload — identical
+    // digest, identical hash, byte-for-byte coherent.
+    const row = dbOf(ctx.store)
+      .prepare("SELECT payload, payload_hash FROM entities WHERE entity_type=? AND entity_id=?")
+      .get(CONVERSATION_MESSAGE_ENTITY, m.message_id) as { payload: string; payload_hash: string };
+    dbOf(ctx.store)
+      .prepare("INSERT INTO entities (entity_type, entity_id, version, payload, payload_hash, updated_at) VALUES (?,?,?,?,?,?)")
+      .run(CONVERSATION_MESSAGE_ENTITY, "MSG_CLONE_PHYSICAL", 1, row.payload, row.payload_hash, new Date().toISOString());
+    // History read sees TWO physical rows claiming one canonical
+    // identity + one sequence — integrity failure, not silent return.
+    expect(
+      code(() => ctx.conv.listMessages(s.session_id, { operator_id: OWNER })),
+    ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
+    // Remove the clone and reads pass again — the check is on persisted
+    // state, not a cached flag.
+    dbOf(ctx.store)
+      .prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+      .run(CONVERSATION_MESSAGE_ENTITY, "MSG_CLONE_PHYSICAL");
+    expect(
+      ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages,
+    ).toHaveLength(1);
   });
 
   it("idempotent retry converges — same key, same row, no duplicate", () => {

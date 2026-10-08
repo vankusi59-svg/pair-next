@@ -58,7 +58,7 @@ export const CONVERSATION_MAX_BODY_CHARS = 16_000;
 export const CONVERSATION_MAX_TITLE_CHARS = 200;
 export const CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS = 200;
 export const CONVERSATION_MAX_MESSAGES_PER_SESSION = 10_000;
-export const CONVERSATION_MAX_CORRELATION_ID_CHARS = 128;
+export const CONVERSATION_MAX_CORRELATION_INPUT_CHARS = 4096;
 export const CONVERSATION_MAX_SESSIONS_PER_OWNER = 1_000;
 export const CONVERSATION_MAX_PAGE_SIZE = 200;
 
@@ -97,22 +97,18 @@ function assertStr(field: string, value: unknown, { empty = false } = {}): strin
   return value;
 }
 
-/** R3.B — audit correlation ids must be bounded opaque identifiers,
- *  never arbitrary caller text: a `bcap1.*` capability token, a secret
- *  payload or freeform prose cannot ride into the durable event log.
- *  Charset allows alnum + `_ . : -` (real correlation-id shapes); the
- *  `bcap1.` capability prefix is denied outright. */
-const CORRELATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-function assertCorrelationId(value: unknown): string | null {
+/** R4.A — caller-supplied correlation text is NEVER persisted. Every
+ *  value is hashed into a server-derived opaque identity
+ *  `corr_<sha256>`: identical inputs correlate identically, but no raw
+ *  caller text — secrets, tokens, capability strings, prose — can reach
+ *  the durable event log. There is no charset judgement to bypass. */
+function deriveCorrelationId(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  const v = assertStr("correlation_id", value, { empty: true });
-  if (v.length > CONVERSATION_MAX_CORRELATION_ID_CHARS) {
+  const v = assertStr("correlation_id", value);
+  if (v.length > CONVERSATION_MAX_CORRELATION_INPUT_CHARS) {
     throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "correlation_id");
   }
-  if (!CORRELATION_ID_PATTERN.test(v) || v.startsWith("bcap1.")) {
-    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_FIELD", "correlation_id");
-  }
-  return v;
+  return `corr_${digest({ contract: "pair-conversation-correlation.v1", value: v })}`;
 }
 
 function assertOptStr(field: string, value: unknown): string | null {
@@ -309,7 +305,7 @@ export class ConversationSessionService {
     if (clientRequestId !== null && clientRequestId.length > CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "client_request_id");
     }
-    const corrId = assertCorrelationId(input.correlation_id);
+    const corrId = deriveCorrelationId(input.correlation_id);
     const sessionId = clientRequestId
       ? conversationSessionIdFor(owner, clientRequestId)
       : newId("CSESS");
@@ -429,7 +425,7 @@ export class ConversationSessionService {
   }): ConversationSessionRow {
     const op = assertStr("operator_id", input.operator_id);
     const id = assertStr("session_id", sessionId);
-    const corrId = assertCorrelationId(input.correlation_id);
+    const corrId = deriveCorrelationId(input.correlation_id);
     return this.store.immediate(() => {
       const session = this.ownedSession(id, op);
       if (session.state === "CLOSED") return session; // idempotent close
@@ -595,7 +591,7 @@ export class ConversationSessionService {
     if (idemKey !== null && idemKey.length > CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "idempotency_key");
     }
-    const corrId = assertCorrelationId(input.correlation_id);
+    const corrId = deriveCorrelationId(input.correlation_id);
     const role = input.role;
     const messageId = idemKey ? conversationMessageIdFor(sessionId, idemKey) : newId("MSG");
     // Session resolution differs by seam: the operator path enforces
@@ -733,6 +729,17 @@ export class ConversationSessionService {
           throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", String(r.message_id));
         }
         return r as unknown as ConversationMessageRow;
+      })
+      .map((r, _i, all) => {
+        // Physical-row uniqueness (R4.B): two persisted rows claiming the
+        // same canonical identity (message_id) or the same position (seq)
+        // — even byte-identical clones under different entity keys — are
+        // an integrity violation, never silently deduplicated.
+        if (all.filter((o) => o.message_id === r.message_id).length > 1 ||
+            all.filter((o) => o.seq === r.seq).length > 1) {
+          throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", String(r.message_id));
+        }
+        return r;
       })
       .sort((a, b) => a.seq - b.seq)
       .filter((m) => m.seq > afterSeq);
