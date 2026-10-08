@@ -2444,3 +2444,128 @@ describe("P15.3 R4.C — decision created_by == attempt started_by", () => {
     s.store.close();
   });
 });
+
+/* ==================== P15.7-FIX1 — per-kind output contract ==================== */
+
+describe("P15.7-FIX1 — system prompt expresses the per-kind null contract", () => {
+  it("prompt pins all-six-required, per-kind null placement, 3 variants + examples", async () => {
+    const { ceoDecisionSystemPrompt, CEO_DECISION_SCHEMA, CEO_DECISION_JSON_SCHEMA } =
+      await import("../pair/ceo-decision.js");
+    const p = ceoDecisionSystemPrompt();
+    // Schema identity + all six required properties named.
+    expect(p).toContain(CEO_DECISION_SCHEMA);
+    for (const k of CEO_DECISION_JSON_SCHEMA.required as string[]) {
+      expect(p).toContain(`"${k}"`);
+    }
+    expect(p).toContain("ALL SIX");
+    // Per-kind null rules — verbatim enough to steer the model.
+    expect(p).toMatch(/PRIORITIZE_EXISTING[\s\S]*"workstreams": null/);
+    expect(p).toMatch(/WAIT[\s\S]*"priority_order": null/);
+    expect(p).toMatch(/INITIALIZE_WORKSTREAMS[\s\S]*"wait_reason": null/);
+    // Canonical-workstream redefinition ban.
+    expect(p).toMatch(/NEVER\s+resubmit|never\s+resubmit/);
+    // One valid example per kind.
+    expect((p.match(/"decision_kind":"INITIALIZE_WORKSTREAMS"/g) ?? []).length).toBeGreaterThan(0);
+    expect((p.match(/"decision_kind":"PRIORITIZE_EXISTING"/g) ?? []).length).toBeGreaterThan(0);
+    expect((p.match(/"decision_kind":"WAIT"/g) ?? []).length).toBeGreaterThan(0);
+  });
+
+  it("every JSON example embedded in the prompt parses through the strict validator", async () => {
+    const { ceoDecisionSystemPrompt, parseCeoDecisionText } =
+      await import("../pair/ceo-decision.js");
+    const p = ceoDecisionSystemPrompt();
+    const examples = p.split("\n")
+      .filter((l) => l.startsWith('{"schema":"pair.ceo-decision.v1"'));
+    expect(examples.length).toBe(3);
+    const kinds = examples.map((e) => parseCeoDecisionText(e).decision_kind);
+    expect(kinds).toEqual(
+      expect.arrayContaining(["INITIALIZE_WORKSTREAMS", "PRIORITIZE_EXISTING", "WAIT"]),
+    );
+  });
+});
+
+describe("P15.7-FIX1 — strict-schema parse matrix", () => {
+  const J = (o: unknown) => JSON.stringify(o);
+
+  it("valid INITIALIZE/PRIORITIZE/WAIT proposals pass the full parse path", async () => {
+    const { parseCeoDecisionText } = await import("../pair/ceo-decision.js");
+    const init = parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "INITIALIZE_WORKSTREAMS",
+      workstreams: [{ workstream_key: "w1", title: "t", goal: "g", depends_on_keys: null }],
+      priority_order: ["w1"], wait_reason: null, summary: null,
+    }));
+    expect(init.decision_kind).toBe("INITIALIZE_WORKSTREAMS");
+    expect(init.workstreams).toHaveLength(1);
+
+    const prio = parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "PRIORITIZE_EXISTING",
+      workstreams: null, priority_order: ["w1", "w2"], wait_reason: null, summary: null,
+    }));
+    expect(prio.decision_kind).toBe("PRIORITIZE_EXISTING");
+    expect(prio.priority_order).toEqual(["w1", "w2"]);
+    expect("workstreams" in prio).toBe(false); // only canonical fields retained
+
+    const wait = parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+      workstreams: null, priority_order: null, wait_reason: "DEPENDENCIES_BLOCKED", summary: null,
+    }));
+    expect(wait.decision_kind).toBe("WAIT");
+    expect(wait.wait_reason).toBe("DEPENDENCIES_BLOCKED");
+  });
+
+  it("populated contradictions still reject whole-proposal (PRIORITIZE+workstreams, WAIT+workstreams/order)", async () => {
+    const { parseCeoDecisionText } = await import("../pair/ceo-decision.js");
+    expect(() => parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "PRIORITIZE_EXISTING",
+      workstreams: [{ workstream_key: "x", title: "t", goal: "g", depends_on_keys: null }],
+      priority_order: ["x"], wait_reason: null, summary: null,
+    }))).toThrowError(/PRIORITIZE_EXISTING must not submit workstreams/);
+    expect(() => parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+      workstreams: [{ workstream_key: "x", title: "t", goal: "g", depends_on_keys: null }],
+      priority_order: null, wait_reason: "AWAITING_PROGRESS", summary: null,
+    }))).toThrowError(/INVALID/);
+    expect(() => parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT",
+      workstreams: null, priority_order: ["w1"], wait_reason: "AWAITING_PROGRESS", summary: null,
+    }))).toThrowError(/WAIT must not submit priority_order/);
+  });
+
+  it("missing/invalid required fields reject (kind, schema, order, wait_reason)", async () => {
+    const { parseCeoDecisionText } = await import("../pair/ceo-decision.js");
+    expect(() => parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", workstreams: null, priority_order: ["a"],
+      wait_reason: null, summary: null,
+    }))).toThrowError(/INVALID/);
+    expect(() => parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "REORDER", workstreams: null,
+      priority_order: ["a"], wait_reason: null, summary: null,
+    }))).toThrowError(/INVALID/);
+    expect(() => parseCeoDecisionText(J({
+      decision_kind: "WAIT", workstreams: null, priority_order: null,
+      wait_reason: "AWAITING_PROGRESS", summary: null,
+    }))).toThrowError(/INVALID/);
+    expect(() => parseCeoDecisionText(J({
+      schema: "pair.ceo-decision.v1", decision_kind: "WAIT", workstreams: null,
+      priority_order: null, wait_reason: "MAYBE_LATER", summary: null,
+    }))).toThrowError(/INVALID/);
+  });
+
+  it("invalid proposals mint ZERO decision/strategy/workstream rows (through runCycle)", async () => {
+    const s = freshCeo("fix1-mint", JSON.stringify({
+      schema: "pair.ceo-decision.v1", decision_kind: "PRIORITIZE_EXISTING",
+      workstreams: [{ workstream_key: "x", title: "t", goal: "g", depends_on_keys: null }],
+      priority_order: ["x"], wait_reason: null, summary: null,
+    }));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await expectFail(
+      () => s.svc.runCycle({ objective_id: String(o.objective_id), actor: OP }),
+      "FAIL_CLOSED_CEO_DECISION_INVALID",
+    );
+    expect(decisionsOf(s.store)).toHaveLength(0);
+    expect(s.store.list("work_item").length).toBe(0);
+    expect(s.store.list("objective_strategy_revision").length).toBe(0);
+    s.store.close();
+  });
+});
