@@ -54,3 +54,72 @@ export interface RoutingProjection {
   routes: Array<Record<string, unknown>>;
   bindings: Array<Record<string, unknown>>;
 }
+
+/** P15.7 — canonical P15.1 Objective row (immutable terms + runtime state). */
+export interface ObjectiveKpi {
+  kpi_id: string;
+  name: string;
+  unit: string;
+  direction: "AT_LEAST" | "AT_MOST" | "EXACT";
+  baseline: number;
+  target: number;
+  current: number | null;
+  [k: string]: unknown;
+}
+
+export interface CanonicalObjective {
+  objective_id: string;
+  business_id: string;
+  status: string;
+  title?: string | null;
+  statement?: string | null;
+  description?: string | null;
+  owner_authority_id?: string;
+  deadline?: string | null;
+  currency?: string;
+  hard_constraints?: string[];
+  success_conditions?: string[];
+  kpis?: ObjectiveKpi[];
+  budget?: { ceiling_microusd?: number; consumed_microusd?: number; [k: string]: unknown } | null;
+  created_at?: string;
+  version?: number;
+  [k: string]: unknown;
+}
+
+export interface VnextObjectiveInput {
+  business_id: string;
+  title?: string;
+  statement?: string;
+  description?: string;
+  deadline?: string | null;
+  budget_ceiling_microusd?: number;
+  currency?: string;
+  kpis?: Array<{
+    kpi_id?: string;
+    name: string;
+    unit?: string;
+    direction?: string;
+    baseline?: number;
+    target?: number;
+  }>;
+  hard_constraints?: string[];
+  success_conditions?: string[];
+  dedup_key?: string;
+}
+
+export interface OperatingPassResult {
+  outcome: string;
+  objective_id: string;
+  owner_action_required?: boolean;
+  binding_id?: string;
+  workstream_key?: string;
+  allocation_id?: string;
+  delegated_child_work_item_id?: string;
+  mission_id?: string;
+  review_id?: string;
+  strategy_revision_id?: string;
+  ceo_decision_id?: string;
+  blocked_workstream_keys?: string[];
+  no_eligible_workstream_keys?: string[];
+  detail?: string;
+}

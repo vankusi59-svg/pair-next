@@ -109,4 +109,21 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ reason: reason ?? "", scope }),
     }),
+  businesses: () => req<{ businesses: Array<Record<string, unknown>> }>("/businesses"),
+  // P15.7 — canonical vnext objectives (P15.1 authority)
+  vnextObjectives: (businessId?: string) =>
+    req<{ objectives: import("./types").CanonicalObjective[] }>(
+      `/vnext/objectives${businessId ? `?business_id=${encodeURIComponent(businessId)}` : ""}`,
+    ),
+  vnextObjective: (id: string) => req<import("./types").CanonicalObjective>(`/vnext/objectives/${id}`),
+  createVnextObjective: (input: import("./types").VnextObjectiveInput) =>
+    req<import("./types").CanonicalObjective>("/vnext/objectives", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  runCeoCycle: (id: string) =>
+    req<import("./types").OperatingPassResult>(`/vnext/objectives/${id}/ceo-cycle`, {
+      method: "POST",
+      body: "{}",
+    }),
 };
