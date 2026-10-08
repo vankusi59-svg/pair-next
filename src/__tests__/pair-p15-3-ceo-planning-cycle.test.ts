@@ -2748,3 +2748,94 @@ describe("P15.7-FIX1-R2 — invocation timeout vs stale reconciliation", () => {
     expect(CEO_MAX_ATTEMPTS_PER_OBSERVATION).toBe(2);
   });
 });
+
+/* ============ P15.7-FIX1-R3 — pre-claim timeout resolution ============ */
+
+describe("P15.7-FIX1-R3 — invalid config never burns an attempt", () => {
+  const ENV_NAME = "PAIR_CEO_CLI_TIMEOUT_MS";
+  const savedEnv = process.env[ENV_NAME];
+  const restoreEnv = () => {
+    if (savedEnv === undefined) delete process.env[ENV_NAME];
+    else process.env[ENV_NAME] = savedEnv;
+  };
+  afterEach(restoreEnv);
+
+  it("invalid env → CONFIG_INVALID, zero invocations, ZERO attempt rows + ZERO STARTED events", async () => {
+    process.env[ENV_NAME] = "not-a-number";
+    const s = freshStack("r3-badenv");
+    const me = mkModel(s.store, "codex-cli", "m1");
+    mkProvider(s.store, "codex-cli");
+    const inv = new FakeInvoker((i) => ({
+      model_entry_id: i.transport.model_entry_id, provider_id: i.transport.provider_id,
+      model_id: i.transport.model_id, raw_text: decisionJson(),
+    }));
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await expectFail(
+      () => svc.runCycle({ objective_id: String(o.objective_id), actor: OP }),
+      "FAIL_CLOSED_CONFIG_INVALID",
+    );
+    expect(inv.calls).toBe(0);
+    expect(attemptsOf(s.store)).toHaveLength(0);
+    expect(
+      s.store.listEvents("ceo_decision_attempt")
+        .filter((e) => String(e.event_type) === "CEO_DECISION_ATTEMPT_STARTED"),
+    ).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("after fixing the config, the same observation still claims attempt 1", async () => {
+    const s = freshStack("r3-retry");
+    const me = mkModel(s.store, "codex-cli", "m1");
+    mkProvider(s.store, "codex-cli");
+    const inv = new FakeInvoker((i) => ({
+      model_entry_id: i.transport.model_entry_id, provider_id: i.transport.provider_id,
+      model_id: i.transport.model_id, raw_text: decisionJson(),
+    }));
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    process.env[ENV_NAME] = "900001"; // out of bounds → rejected pre-claim
+    await expectFail(() => svc.runCycle({ objective_id: oid, actor: OP }), "FAIL_CLOSED_CONFIG_INVALID");
+    expect(attemptsOf(s.store)).toHaveLength(0);
+    process.env[ENV_NAME] = "300000"; // corrected → attempt #1 must be claimable
+    const r = await svc.runCycle({ objective_id: oid, actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("WAIT");
+    const attempts = attemptsOf(s.store);
+    expect(attempts).toHaveLength(1);
+    expect(Number(attempts[0]!.attempt_number)).toBe(1);
+    expect(String(attempts[0]!.state)).toBe("ACCEPTED");
+    s.store.close();
+  });
+
+  it("valid default and explicit-override paths unchanged post-R3", async () => {
+    delete process.env[ENV_NAME];
+    const seen: number[] = [];
+    const s = freshStack("r3-ok");
+    const me = mkModel(s.store, "codex-cli", "m1");
+    mkProvider(s.store, "codex-cli");
+    const inv = new FakeInvoker((i) => {
+      seen.push(Number(i.timeout_ms));
+      return { model_entry_id: i.transport.model_entry_id, provider_id: i.transport.provider_id,
+        model_id: i.transport.model_id, raw_text: decisionJson() };
+    });
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+      timeout_ms: 77_000,
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
+    expect(seen).toEqual([77_000]); // explicit override still wins
+    s.store.close();
+  });
+});

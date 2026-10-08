@@ -839,6 +839,11 @@ export class CeoPlanningCycleService {
     // 7. Model eligibility — before claiming any attempt.
     const model = this.assertCeoModelUsable(this.deps.model_entry_id);
     const transport = resolveCeoModelTransport(this.store, this.deps.model_entry_id);
+    // R3 — resolve AND validate the effective invocation timeout BEFORE
+    //    any durable attempt is claimed: an invalid PAIR_CEO_CLI_TIMEOUT_MS
+    //    must fail closed with ZERO attempt rows, never burn an attempt
+    //    slot inside the 2-attempt budget.
+    const effectiveTimeoutMs = this.deps.timeout_ms ?? ceoCliTimeoutMs();
     // 8. Claim the attempt inside a serializing transaction — at most
     //    ONE live invocation per observation; ≤2 attempts ever. Only
     //    canonical attempts count; a malformed attempt row is corrupt
@@ -932,7 +937,7 @@ export class CeoPlanningCycleService {
         system_prompt: ceoDecisionSystemPrompt(),
         user_prompt: buildCeoUserPrompt(first.observation),
         observation_digest: first.observation_digest,
-        timeout_ms: this.deps.timeout_ms ?? ceoCliTimeoutMs(),
+        timeout_ms: effectiveTimeoutMs,
       });
       responseDigest = digest(res.raw_text);
       // The configured/injected model_entry must equal the identity the
