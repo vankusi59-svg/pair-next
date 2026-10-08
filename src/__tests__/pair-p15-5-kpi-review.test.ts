@@ -30,8 +30,12 @@ import {
   digest,
   ensureCodexCliCatalog,
   MissionControl,
+  MissionObservability,
   MissionRouter,
+  MissionRuntime,
+  MissionScheduleService,
   MissionScheduler,
+  MissionSupervisor,
   ModelEvidenceCatalog,
   ObjectiveAdaptiveReviewService,
   objectiveWorkstreamBindingDigest,
@@ -115,6 +119,7 @@ function freshStack(name: string): Stack {
 
 type FullStack = Stack & {
   service: PairControlPlane;
+  control: MissionControl;
   projectId: string;
 };
 
@@ -138,14 +143,18 @@ function freshFullStack(name: string): FullStack {
     tasks: [{ task_key: "T1", title: "t1", task_instruction: "t1",
       required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
   });
-  const control = new MissionControl({
-    service, gate, registry, router, recovery, reconciliation: recon,
-    approvals, scheduler, planner: planner as never,
-    approvalConfig: {} as never,
-    workspaceRoot: workspace, journalDir: dir, workdir: workspace,
-    operator_id: OP,
+  const runtime = new MissionRuntime({
+    service, gate, router, adapters: new Map(), scheduler, approvals,
+    reconciliation: recon, recovery, planner,
   });
-  const biz = new BusinessLayer({ store, control, schedules: {} as never });
+  const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
+  const observability = new MissionObservability(service);
+  const control = new MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability, planner,
+  });
+  const schedules = new MissionScheduleService(service);
+  const biz = new BusinessLayer({ store, control, schedules });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });
@@ -153,7 +162,7 @@ function freshFullStack(name: string): FullStack {
     { store, business: biz, workforce: wf, objectives: biz.objectives, workstreams });
   const project = service.createProject({ name: "p", root_location: workspace });
   return { dbPath, dir, store, biz, wf, workstreams, alloc, service,
-    projectId: String(project.project_id) };
+    control, projectId: String(project.project_id) };
 }
 
 function mkBusiness(store: PairEvidenceStore, id = `BIZ_${counter}`) {
@@ -1360,6 +1369,220 @@ describe("P15.5 R2.E — entity_id + bounded predecessor chain", () => {
       });
     expectFail(() => review.getLatestStrategy(oid),
       "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+});
+
+describe("P15.5 R3.A — canonical work-lifecycle proof", () => {
+  it("42. canonical block → raw rewrite READY → fail closed (never AWAITING)", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r3a1", inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.blockWorkItem(childId, "blocked by test", OP); // canonical BLOCKED
+    // Attacker rewrites the container status to READY — no UNBLOCKED event.
+    sqlRewriteEntity(s.store, "work_item", childId, (b) => { b.status = "READY"; });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    expect(inv.inputs.length).toBe(0);
+    expect(rowCount(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY)).toBe(0);
+    s.store.close();
+  });
+
+  it("43. canonical block → canonical unblock → READY accepted (AWAITING ok)", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r3a2", inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.blockWorkItem(childId, "blocked by test", OP);
+    s.biz.unblockWorkItem(childId, OP); // canonical WORK_ITEM_UNBLOCKED
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("AWAITING_PROGRESS");
+    s.store.close();
+  });
+
+  it("44. raw container BLOCKED without block/fold evidence → fail before CEO", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, review } = seeded("r3a3", inv);
+    const w1 = wsWorkItemId(binding, "w1");
+    sqlRewriteEntity(s.store, "work_item", w1, (b) => { b.status = "BLOCKED"; });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("45. canonical BLOCKED child → non-active intervention (not AWAITING)", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r3a4", inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.blockWorkItem(childId, "operator blocked", OP); // canonical
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    // Blocked child + unallocated w2 → intervention, not progress → CEO path.
+    expect(r.outcome).toBe("WAIT");
+    expect(inv.inputs.length).toBe(1); // model reached — canonical, not failed
+    s.store.close();
+  });
+
+  it("46. canonical open + mission PAUSED + IN_PROGRESS → not AWAITING", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const s = freshFullStack("r3a5");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const review = reviewStack(s, inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP); // canonical open → bound mission CREATED
+    const mid = String((s.store.get("work_item", childId).mission_ids as string[])[0]);
+    // Canonical path to PAUSED: CREATED→READY→RUNNING→pause.
+    s.service.transitionMission(mid, "READY", `OPERATOR:${OP}`);
+    s.service.transitionMission(mid, "RUNNING", `OPERATOR:${OP}`);
+    s.control.pauseMission(mid, OP);
+    const m = s.store.get("mission", mid);
+    expect(String(m.status)).toBe("PAUSED");
+    // The work item still claims IN_PROGRESS — mission PAUSED is not
+    // active progress → intervention, never AWAITING.
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("AWAITING_PROGRESS");
+    expect(r.outcome).toBe("WAIT"); // CEO path reached canonically
+    s.store.close();
+  });
+
+  it("47. real READY allocation + real open/RUNNING paths stay valid", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const s = freshFullStack("r3a6");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const review = reviewStack(s, inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    // READY allocation → AWAITING
+    const r1 = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r1.outcome).toBe("AWAITING_PROGRESS");
+    // Canonical open → IN_PROGRESS + bound mission → AWAITING
+    s.biz.openWorkItem(childId, OP);
+    const r2 = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r2.outcome).toBe("AWAITING_PROGRESS");
+    // Mission live RUNNING → AWAITING still
+    const mid = String((s.store.get("work_item", childId).mission_ids as string[])[0]);
+    s.service.transitionMission(mid, "READY", `OPERATOR:${OP}`);
+    s.service.transitionMission(mid, "RUNNING", `OPERATOR:${OP}`);
+    const r3 = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r3.outcome).toBe("AWAITING_PROGRESS");
+    expect(inv.inputs.length).toBe(0); // never reached the model
+    s.store.close();
+  });
+});
+
+describe("P15.5 R3.B — source review must be canonical", () => {
+  async function twoRevisionsB(tag: string) {
+    const inv = new FakeInvoker(
+      decisionJson({
+        decision_kind: "PRIORITIZE_EXISTING", wait_reason: null,
+        priority_order: ["w2", "w1"],
+      }),
+      decisionJson({
+        decision_kind: "PRIORITIZE_EXISTING", wait_reason: null,
+        priority_order: ["w1", "w2"],
+      }));
+    const { s, oid, review } = seeded(tag, inv);
+    const r1 = await review.runReview({ objective_id: oid, actor: OP });
+    recordKpi(s, oid, "KPI_1", 3, `ev-${tag}`);
+    const r2 = await review.runReview({ objective_id: oid, actor: OP });
+    return { s, oid, review, r1, r2 };
+  }
+
+  it("48. shadow selected_executor on source review → getLatestStrategy fails", async () => {
+    const { s, oid, review, r1 } = await twoRevisionsB("b48");
+    sqlRewriteEntity(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+      String(r1.review.review_id), (b) => {
+        b.selected_executor = "ex-forged";
+        b.review_digest = adaptiveReviewDigest(b);
+      });
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+
+  it("49. deleted source-review anchor → getLatestStrategy fails", async () => {
+    const { s, oid, review, r1 } = await twoRevisionsB("b49");
+    sqlDeleteEvent(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+      String(r1.review.review_id), OBJECTIVE_ADAPTIVE_REVIEW_COMMITTED_EVENT);
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+
+  it("50. forged source-review entity_id → fails", async () => {
+    const { s, oid, review, r1 } = await twoRevisionsB("b50");
+    sqlRewriteEntity(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+      String(r1.review.review_id), (b) => { b.entity_id = "FORGED"; });
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+
+  it("51. review.strategy_revision_id forged to another strategy (coherent recompute) → fails", async () => {
+    const { s, oid, review, r1, r2 } = await twoRevisionsB("b51");
+    const r1Id = String(r1.review.review_id);
+    const r2Id = String(r2.review.review_id);
+    const s1Id = String(r1.strategy_revision!.strategy_revision_id);
+    // Forge r2's review to claim S1 as its pinned strategy — fully
+    // self-consistent: digest recomputed AND the anchor rewritten.
+    sqlRewriteEntity(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, r2Id, (b) => {
+      b.strategy_revision_id = s1Id;
+      b.review_digest = adaptiveReviewDigest(b);
+    });
+    const forged = s.store.get(
+      OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, r2Id) as Record<string, unknown>;
+    sqlRewriteEvent(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, r2Id,
+      OBJECTIVE_ADAPTIVE_REVIEW_COMMITTED_EVENT, (md) => {
+        md.review_digest = String(forged.review_digest);
+        md.strategy_revision_id = s1Id;
+      });
+    // getReview path: S1 names r1 as source, not r2 → fails.
+    expectFail(() => review.getReview(r2Id),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    // getLatestStrategy path: r2's review no longer pins S2 → fails.
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    // r1's own review is untouched and still validates.
+    expect(() => review.getReview(r1Id)).not.toThrow();
+    s.store.close();
+  });
+
+  it("52. valid chain passes getReview + getLatestStrategy", async () => {
+    const { s, oid, review, r1, r2 } = await twoRevisionsB("b52");
+    const rev1 = review.getReview(String(r1.review.review_id));
+    const rev2 = review.getReview(String(r2.review.review_id));
+    expect(String(rev1.review_id)).toBe(String(r1.review.review_id));
+    expect(String(rev2.outcome)).toBe("PRIORITIZE_EXISTING");
+    const strat = review.getLatestStrategy(oid);
+    expect(String(strat.strategy_revision_id)).toBe(
+      String(r2.strategy_revision!.strategy_revision_id));
     s.store.close();
   });
 });

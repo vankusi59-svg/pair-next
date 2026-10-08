@@ -674,6 +674,14 @@ export class BusinessLayer {
     return { ready, mission, childIds, basisDigest, rejected };
   }
 
+  /** Read-only completion-basis projection — the canonical grounding a
+   *  REVIEW_REQUIRED/DONE claim must satisfy (basis ready + not
+   *  rejected). Never mutates; corrupt rows evaluate unready. */
+  completionBasisProof(row: Row): { ready: boolean; rejected: boolean } {
+    const b = this.completionBasisSafe(row);
+    return { ready: b.ready, rejected: b.rejected };
+  }
+
   /** Basis that never throws — corrupt child rows evaluate unready. */
   private completionBasisSafe(row: Row): ReturnType<BusinessLayer["completionBasis"]> {
     try {

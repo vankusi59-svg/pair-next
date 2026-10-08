@@ -33,7 +33,11 @@ import { canonicalJson, digest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import type { BusinessLayer } from "./business.js";
 import { TERMINAL_MISSION_STATUSES } from "./business.js";
-import { canonicalBoundAttemptsForWorkItem } from "./work-completion.js";
+import {
+  assertCanonicalMissionLifecycle,
+  canonicalBoundAttemptsForWorkItem,
+  WORK_REVIEW_ACCEPTED_EVENT,
+} from "./work-completion.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
 import {
@@ -336,18 +340,82 @@ interface ReviewWorkstreamProjection {
   /** Canonical open/binding lineage exists for the delegated child
    *  (boundMissionForWorkItem non-null) — never status text. */
   delegated_child_bound_mission: boolean;
+  /** R3.A — canonical lifecycle class of the delegated child: ACTIVE
+   *  (genuine in-flight / review-pending), INTERVENTION (canonically
+   *  BLOCKED, PAUSED-bound or terminal-mission fold pending),
+   *  EXHAUSTED (DONE+WCP / CANCELLED). */
+  delegated_child_class: LifecycleClass | null;
 }
 
-/** Canonical cancellation authority = a WORK_ITEM_CANCELLED event with
- *  new_state CANCELLED (event hashes are re-verified on read). A row
- *  claiming CANCELLED without it is contradictory canonical state. */
-function hasCanonicalCancellation(
+/** Work-item lifecycle classification used strategically by the
+ *  review — ACTIVE = legitimate in-flight/review-pending work;
+ *  INTERVENTION = canonical non-active state needing intervention
+ *  (BLOCKED, PAUSED mission, terminal-mission fold pending);
+ *  EXHAUSTED = canonically finished (DONE+WCP or CANCELLED). */
+type LifecycleClass = "ACTIVE" | "INTERVENTION" | "EXHAUSTED";
+
+/** Status-defining lifecycle events on a work_item — every canonical
+ *  status writer emits one. Replaying them is the ONLY honest read of
+ *  the projected status: a row whose claim diverges is a raw rewrite. */
+const WORK_ITEM_STATUS_EVENTS = new Set([
+  "WORK_ITEM_CREATED", "WORK_ITEM_ASSIGNED", "WORK_ITEM_OPENED",
+  "WORK_ITEM_OPEN_RECONCILED", "WORK_ITEM_OPEN_ROLLED_BACK",
+  "WORK_ITEM_SYNCED", "WORK_ITEM_STATUS_SYNCED",
+  "WORK_ITEM_BLOCKED", "WORK_ITEM_UNBLOCKED", "WORK_ITEM_CANCELLED",
+  WORK_REVIEW_ACCEPTED_EVENT, "WORK_REWORK_REQUESTED",
+]);
+
+/** The status the immutable lifecycle evidence chain proves — derived
+ *  by replay, never by trusting `row.status`. */
+function canonicalDerivedWorkStatus(
   store: PairEvidenceStore,
-  workItemId: string,
-): boolean {
-  return store.listEvents("work_item", workItemId).some((e) =>
-    String(e.event_type) === "WORK_ITEM_CANCELLED" &&
-    String(e.new_state) === "CANCELLED");
+  workItem: Row,
+): string {
+  let derived: string | null = null;
+  for (const e of store.listEvents("work_item", String(workItem.work_item_id))) {
+    if (WORK_ITEM_STATUS_EVENTS.has(String(e.event_type)) &&
+        e.new_state !== null && e.new_state !== undefined) {
+      derived = String(e.new_state);
+    }
+  }
+  // Zero lifecycle evidence: only the mint rule may stand —
+  // assigned ⇒ READY, unassigned ⇒ BACKLOG (business.createWorkItem).
+  return derived ??
+    (workItem.assignee_agent_id ? "READY" : "BACKLOG");
+}
+
+/** The work-item's claimed status must equal the derived canonical
+ *  state — any raw rewrite (BLOCKED→READY, CANCELLED→READY,
+ *  text-only BLOCKED/IN_PROGRESS) fails closed here. */
+function assertCanonicalWorkStatus(
+  store: PairEvidenceStore,
+  workItem: Row,
+): string {
+  const derived = canonicalDerivedWorkStatus(store, workItem);
+  const claimed = String(workItem.status);
+  if (claimed !== derived) {
+    reviewFail(
+      `work item ${String(workItem.work_item_id)} claims ${claimed} ` +
+      `but canonical lifecycle derives ${derived}`);
+  }
+  return derived;
+}
+
+/** The mission's claimed status derived from its own immutable
+ *  MISSION_CREATED/MISSION_TRANSITION spine. */
+function canonicalDerivedMissionStatus(
+  store: PairEvidenceStore,
+  mission: Row,
+): string {
+  let derived = "CREATED";
+  for (const e of store.listEvents("mission", String(mission.mission_id))) {
+    const t = String(e.event_type);
+    if ((t === "MISSION_CREATED" || t === "MISSION_TRANSITION") &&
+        e.new_state !== null && e.new_state !== undefined) {
+      derived = String(e.new_state);
+    }
+  }
+  return derived;
 }
 
 interface KpiAssessmentProjection {
@@ -450,37 +518,42 @@ export function buildReviewObservation(
     if (canonicalBoundAttemptsForWorkItem(deps.store, wid).length > 0) {
       reviewFail(`workstream container ${wid} carries bound open attempts`);
     }
+    // §R3.A — the claimed status must equal the canonical
+    // event-derived lifecycle state BEFORE any strategic use. A raw
+    // rewrite of ANY status (BLOCKED→READY, text-only BLOCKED/
+    // CANCELLED/IN_PROGRESS) fails closed here.
+    const wsStatus = assertCanonicalWorkStatus(deps.store, row);
     const completionProven = deps.business.proveWorkItemDone(row);
     // Status DONE without the canonical completion proof is a
     // contradictory canonical state — the only authority path that
     // mints DONE also mints the WCP. Fail closed rather than reason
     // over tampered state.
-    if (String(row.status) === "DONE" && !completionProven) {
+    if (wsStatus === "DONE" && !completionProven) {
       reviewFail(
         `workstream ${wid} claims DONE without canonical completion proof`);
     }
-    // CANCELLED only carries strategic meaning with canonical
-    // cancellation authority — a status-text claim alone never makes a
-    // workstream "exhausted".
-    if (String(row.status) === "CANCELLED" &&
-        !hasCanonicalCancellation(deps.store, wid)) {
-      reviewFail(
-        `workstream ${wid} claims CANCELLED without canonical cancellation authority`);
+    // REVIEW_REQUIRED needs the canonical completion/review basis —
+    // mere bound-mission existence is not sufficient grounding.
+    if (wsStatus === "REVIEW_REQUIRED") {
+      const basis = deps.business.completionBasisProof(row);
+      if (!basis.ready || basis.rejected) {
+        reviewFail(
+          `workstream ${wid} claims REVIEW_REQUIRED without canonical review basis`);
+      }
     }
     const walId = workforceAllocationId(objectiveId, wid);
     const wal = deps.store.tryGet(WORKFORCE_ALLOCATION_ENTITY, walId) as Row | null;
     if (!wal) {
       // An unallocated container can never legitimately progress —
       // statuses that imply delegated work fail closed.
-      if (String(row.status) === "IN_PROGRESS" ||
-          String(row.status) === "REVIEW_REQUIRED") {
+      if (wsStatus === "IN_PROGRESS" || wsStatus === "REVIEW_REQUIRED") {
         reviewFail(
-          `unallocated workstream ${wid} claims ${String(row.status)}`);
+          `unallocated workstream ${wid} claims ${wsStatus}`);
       }
       workstreams.push({
         workstream_key: String(w.workstream_key),
         work_item_id: wid,
-        workstream_status: String(row.status),
+        workstream_status: wsStatus,
         completion_proven: completionProven,
         allocation_state: "NONE",
         selected_agent_id: null,
@@ -488,6 +561,7 @@ export function buildReviewObservation(
         delegated_child_status: null,
         delegated_child_completion_proven: false,
         delegated_child_bound_mission: false,
+        delegated_child_class: null,
       });
       continue;
     }
@@ -496,51 +570,108 @@ export function buildReviewObservation(
     assertCanonicalWorkforceAllocation(wdeps, wal);
     const childId = String(wal.delegated_child_work_item_id);
     const child = deps.store.get("work_item", childId) as Row;
+    // §R3.A — child's claimed status must equal canonical
+    // event-derived state before any strategic use.
+    const childStatus = assertCanonicalWorkStatus(deps.store, child);
     const childProven = deps.business.proveWorkItemDone(child);
-    if (String(child.status) === "DONE" && !childProven) {
+    if (childStatus === "DONE" && !childProven) {
       reviewFail(
         `delegated child ${childId} claims DONE without canonical completion proof`);
-    }
-    if (String(child.status) === "CANCELLED" &&
-        !hasCanonicalCancellation(deps.store, childId)) {
-      reviewFail(
-        `delegated child ${childId} claims CANCELLED without canonical cancellation authority`);
     }
     // Canonical open/binding lineage for the delegated child — the
     // ONLY proof a child was ever opened.
     const childBoundMission = deps.business.boundMissionForWorkItem(child);
-    const childLiveMission = childBoundMission !== null &&
-      !TERMINAL_MISSION_STATUSES.has(String(childBoundMission.status));
-    if (String(child.status) === "IN_PROGRESS" && !childLiveMission) {
+    const childMissionStatus = childBoundMission === null ? null
+      : canonicalDerivedMissionStatus(deps.store, childBoundMission);
+    if (childBoundMission !== null &&
+        String(childBoundMission.status) !== childMissionStatus) {
       reviewFail(
-        `delegated child ${childId} claims IN_PROGRESS without a live bound mission`);
+        `delegated child ${childId} bound mission claims ` +
+        `${String(childBoundMission.status)} but canonical lifecycle derives ${childMissionStatus}`);
     }
-    if (String(child.status) === "READY" && childLiveMission) {
-      reviewFail(
-        `delegated child ${childId} claims READY while a live bound mission exists`);
+    // Lifecycle classification from canonical evidence only.
+    let childClass: LifecycleClass;
+    switch (childStatus) {
+      case "DONE":
+      case "CANCELLED":
+        // derived ⇒ canonical completion (WCP checked above) or
+        // cancellation/fold evidence exists.
+        childClass = "EXHAUSTED";
+        break;
+      case "BLOCKED":
+        // derived ⇒ canonical WORK_ITEM_BLOCKED/fold evidence —
+        // a non-active intervention state.
+        childClass = "INTERVENTION";
+        break;
+      case "REVIEW_REQUIRED": {
+        const basis = deps.business.completionBasisProof(child);
+        if (!basis.ready || basis.rejected) {
+          reviewFail(
+            `delegated child ${childId} claims REVIEW_REQUIRED without canonical review basis`);
+        }
+        childClass = "ACTIVE";
+        break;
+      }
+      case "READY": {
+        if (childBoundMission === null) {
+          childClass = "ACTIVE"; // fresh delegated allocation
+        } else if (childMissionStatus !== null &&
+                   !TERMINAL_MISSION_STATUSES.has(childMissionStatus) &&
+                   childMissionStatus !== "PAUSED") {
+          // Live bound mission while claiming READY is contradictory.
+          reviewFail(
+            `delegated child ${childId} claims READY while a live bound mission exists`);
+        } else {
+          // Bound mission terminal (or canonically PAUSED) — fold
+          // pending: intervention, not fresh progress.
+          if (childMissionStatus === "PAUSED" ||
+              TERMINAL_MISSION_STATUSES.has(childMissionStatus!)) {
+            assertCanonicalMissionLifecycle(
+              deps.store, childBoundMission!, childMissionStatus!);
+          }
+          childClass = "INTERVENTION";
+        }
+        break;
+      }
+      case "IN_PROGRESS": {
+        if (childBoundMission === null) {
+          reviewFail(
+            `delegated child ${childId} claims IN_PROGRESS without a bound mission`);
+        }
+        if (childMissionStatus === "PAUSED" ||
+            TERMINAL_MISSION_STATUSES.has(childMissionStatus!)) {
+          // PAUSED is not active progress; a terminal mission pending
+          // its fold is intervention — both need canonical proof.
+          assertCanonicalMissionLifecycle(
+            deps.store, childBoundMission, childMissionStatus!);
+          childClass = "INTERVENTION";
+        } else {
+          childClass = "ACTIVE"; // genuine in-flight bound work
+        }
+        break;
+      }
+      default:
+        reviewFail(`delegated child ${childId} status ${childStatus} outside canonical vocabulary`);
     }
     // Container lifecycle consistency: a container in IN_PROGRESS /
     // REVIEW_REQUIRED is only canonical via cascade from the delegated
     // child — never from raw status text.
-    if (String(row.status) === "IN_PROGRESS" && !childLiveMission) {
+    if (wsStatus === "IN_PROGRESS" && childClass !== "ACTIVE") {
       reviewFail(
         `workstream ${wid} claims IN_PROGRESS without live delegated work`);
-    }
-    if (String(row.status) === "REVIEW_REQUIRED" && childBoundMission === null) {
-      reviewFail(
-        `workstream ${wid} claims REVIEW_REQUIRED without any delegated lineage`);
     }
     workstreams.push({
       workstream_key: String(w.workstream_key),
       work_item_id: wid,
-      workstream_status: String(row.status),
+      workstream_status: wsStatus,
       completion_proven: completionProven,
       allocation_state: "ALLOCATED",
       selected_agent_id: String(wal.selected_agent_id),
       delegated_child_work_item_id: childId,
-      delegated_child_status: String(child.status),
+      delegated_child_status: childStatus,
       delegated_child_completion_proven: childProven,
       delegated_child_bound_mission: childBoundMission !== null,
+      delegated_child_class: childClass,
     });
   }
 
@@ -726,10 +857,14 @@ function proveSingleAnchor(
   return { event: a, metadata: md };
 }
 
-/** Strict read of a canonical review receipt: exact shape, self-digest,
- *  immutable anchor pinning, and re-proof of every referenced authority
- *  (objective, binding, CEO decision, strategy revision). */
-export function assertCanonicalAdaptiveReview(
+/** §R3.B — NON-RECURSIVE strict read of one review receipt: exact
+ *  allowlist shape, schema/entity/identity, create-only version/state,
+ *  self-digest, exactly-one immutable anchor, objective+business
+ *  equality, binding identity/digest, CEO-decision provenance and
+ *  outcome shape — but NEVER recursively validates the pinned strategy
+ *  revision (review⇄strategy mutual proof stays acyclic: the
+ *  strategy's local read calls THIS function). */
+export function assertCanonicalAdaptiveReviewLocal(
   deps: ObjectiveAdaptiveReviewDeps,
   row: Row,
 ): void {
@@ -843,13 +978,10 @@ export function assertCanonicalAdaptiveReview(
     if (stratId === null || stratId === undefined) {
       reviewFail("PRIORITIZE outcome missing strategy_revision_id");
     }
-    const strat = deps.store.tryGet(
-      OBJECTIVE_STRATEGY_REVISION_ENTITY, String(stratId)) as Row | null;
-    if (!strat) reviewFail("pinned strategy revision missing");
-    assertCanonicalStrategyRevision(deps, strat);
-    if (String(strat.source_review_id) !== String(row.review_id)) {
-      reviewFail("strategy revision does not name this review as source");
-    }
+    // §R3.B — the pinned strategy is NOT re-validated inside the local
+    // read: review⇄strategy mutual proof stays acyclic because the
+    // strategy's own local read calls THIS local function, never the
+    // recursive public one.
   } else if (stratId !== null && stratId !== undefined) {
     reviewFail("strategy_revision_id pinned on non-PRIORITIZE outcome");
   }
@@ -864,6 +996,26 @@ export function assertCanonicalAdaptiveReview(
     }
     if (row.owner_action_required !== false) {
       reviewFail("owner_action_required pinned on non-TARGET_MET outcome");
+    }
+  }
+}
+
+/** Full strict read of a canonical review receipt: the non-recursive
+ *  local read PLUS — for PRIORITIZE_EXISTING — resolution and strict
+ *  validation of the pinned strategy revision. */
+export function assertCanonicalAdaptiveReview(
+  deps: ObjectiveAdaptiveReviewDeps,
+  row: Row,
+): void {
+  assertCanonicalAdaptiveReviewLocal(deps, row);
+  if (String(row.outcome) === "PRIORITIZE_EXISTING") {
+    const strat = deps.store.tryGet(
+      OBJECTIVE_STRATEGY_REVISION_ENTITY,
+      String(row.strategy_revision_id)) as Row | null;
+    if (!strat) reviewFail("pinned strategy revision missing");
+    assertCanonicalStrategyRevision(deps, strat);
+    if (String(strat.source_review_id) !== String(row.review_id)) {
+      reviewFail("strategy revision does not name this review as source");
     }
   }
 }
@@ -953,15 +1105,25 @@ function assertCanonicalStrategyRevisionLocal(
     const actual = anchorMd[k] ?? null;
     if (actual !== v) reviewFail(`revision anchor ${k} mismatch`);
   }
-  // Source review + CEO decision must exist canonically.
+  // §R3.B — the source review is re-proven through the FULL
+  // non-recursive strict validator: exact shape, self-digest, its own
+  // immutable anchor, objective/binding/CEO-decision provenance and
+  // outcome shape — then cross-pinned to THIS revision.
   const review = deps.store.tryGet(
     OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, String(row.source_review_id)) as Row | null;
   if (!review) reviewFail("source review missing");
-  // Recursion guard: the review's own strict read re-proves THIS row
-  // only through strategy_revision_id; recompute digests directly here
-  // to keep the proof acyclic.
+  assertCanonicalAdaptiveReviewLocal(deps, review);
+  if (String(review.review_id) !== String(row.source_review_id)) {
+    reviewFail("source review identity mismatch");
+  }
   if (adaptiveReviewDigest(review) !== String(row.source_review_digest)) {
     reviewFail("source review digest mismatch");
+  }
+  if (String(review.strategy_revision_id) !== String(row.strategy_revision_id)) {
+    reviewFail("source review does not pin this revision");
+  }
+  if (String(review.outcome) !== "PRIORITIZE_EXISTING") {
+    reviewFail("source review is not PRIORITIZE_EXISTING");
   }
   if (String(review.objective_id) !== String(row.objective_id) ||
       String(review.business_id) !== String(row.business_id) ||
@@ -1100,18 +1262,15 @@ export class ObjectiveAdaptiveReviewService {
     // Deterministic checkpoint — before ANY model call (§8/§9/§10).
     // Activity/exhaustion are derived from canonical lifecycle evidence
     // re-proven inside buildReviewObservation (never raw status text).
-    const anyActive = observation.workstreams.some((w) => {
-      if (w.allocation_state !== "ALLOCATED" ||
-          w.delegated_child_status === null) {
-        return false;
-      }
-      const cs = w.delegated_child_status;
-      if (cs === "READY" || cs === "IN_PROGRESS") return true; // lineage proven
-      // REVIEW_REQUIRED counts as active only with canonical
-      // review/completion-basis lineage — never from text alone.
-      if (cs === "REVIEW_REQUIRED") return w.delegated_child_bound_mission;
-      return false;
-    });
+    const anyActive = observation.workstreams.some((w) =>
+      // §R3.A — activity is derived ONLY from the canonical lifecycle
+      // class proven at observation build: ACTIVE = in-flight or
+      // review-pending work. INTERVENTION (BLOCKED / PAUSED-bound /
+      // terminal-fold pending) is never progress; EXHAUSTED never is.
+      w.delegated_child_class === "ACTIVE" ||
+      w.workstream_status === "IN_PROGRESS" ||
+      w.workstream_status === "REVIEW_REQUIRED" ||
+      w.workstream_status === "READY");
     const allExhausted = observation.workstreams.length > 0 &&
       observation.workstreams.every((w) =>
         w.completion_proven ||
