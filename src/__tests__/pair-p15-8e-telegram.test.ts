@@ -556,3 +556,90 @@ describe("P15.8-E R1 — inbound outcome durability + full presentation", () => 
     expect(missionsOf(s)).toHaveLength(0);
   });
 });
+
+describe("P15.8-E R2 — reply-bound ACK replays its committed outcome", () => {
+  it("replay of update_id after ref CONSUMED returns the original ack_confirmed receipt — zero new messages, zero model calls, one mission", async () => {
+    const s = freshStack("ackreplay");
+    const inv = new MockInvoker("pair ack");
+    const d = convDeps(s, inv);
+    const { draft, ref } = d.telegram.prepareDraft({
+      operator_id: OP, chat_id: CHAT, project_id: s.projectId,
+      goal: "ack replay draft", update_id: 499 });
+    d.telegram.bindPromptMessage({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, message_id: 700 });
+    const msgs = () => s.store.list("conversation_message");
+    const msgCountBefore = msgs().length;
+
+    const r1 = await d.telegram.ingress({
+      operator_id: OP, chat_id: CHAT, chat_type: "private",
+      update_id: 500, text: "vâng", reply_to_message_id: 700 });
+    expect(r1).toMatchObject({ kind: "ack_confirmed",
+      draft_id: draft.draft_id });
+    expect(missionsOf(s)).toHaveLength(1);
+    const missionId = (r1 as { mission_id: string }).mission_id;
+
+    // Replay the EXACT update after the ref is CONSUMED — identical
+    // receipt, no new turn, no model call, still one mission.
+    const replay = await d.telegram.ingress({
+      operator_id: OP, chat_id: CHAT, chat_type: "private",
+      update_id: 500, text: "vâng", reply_to_message_id: 700 });
+    expect(replay).toMatchObject({ kind: "ack_confirmed",
+      draft_id: draft.draft_id, mission_id: missionId, reused: true });
+    expect(msgs().length).toBe(msgCountBefore);
+    expect(inv.calls).toHaveLength(0);
+    expect(missionsOf(s)).toHaveLength(1);
+
+    // Fresh service over the same store — replay is durable across restart.
+    const d2 = convDeps(s, inv);
+    const replay2 = await d2.telegram.ingress({
+      operator_id: OP, chat_id: CHAT, chat_type: "private",
+      update_id: 500, text: "vâng", reply_to_message_id: 700 });
+    expect(replay2).toMatchObject({ kind: "ack_confirmed",
+      mission_id: missionId, reused: true });
+    expect(msgs().length).toBe(msgCountBefore);
+    expect(inv.calls).toHaveLength(0);
+    expect(missionsOf(s)).toHaveLength(1);
+
+    // A DISTINCT update replying to the same prompt is an unbound ack —
+    // it gains NO execution authority and stays ordinary conversation.
+    const other = await d2.telegram.ingress({
+      operator_id: OP, chat_id: CHAT, chat_type: "private",
+      update_id: 501, text: "vâng", reply_to_message_id: 700 });
+    expect(other.kind).toBe("reply");
+    expect(missionsOf(s)).toHaveLength(1);
+    expect(inv.calls).toHaveLength(1); // the ordinary turn's model call
+  });
+
+  it("replay binding cannot be redirected — mismatched prompt or tampered record fails closed", async () => {
+    const s = freshStack("ackforge");
+    const d = convDeps(s, new MockInvoker());
+    const { ref } = d.telegram.prepareDraft({
+      operator_id: OP, chat_id: CHAT, project_id: s.projectId,
+      goal: "forge draft", update_id: 600 });
+    d.telegram.bindPromptMessage({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, message_id: 800 });
+    const r = await d.telegram.ingress({
+      operator_id: OP, chat_id: CHAT, chat_type: "private",
+      update_id: 601, text: "OK", reply_to_message_id: 800 });
+    expect(r.kind).toBe("ack_confirmed");
+
+    // Same update_id replayed against a DIFFERENT prompt message → the
+    // replayed gesture does not match the recorded one → fail closed.
+    await expect(d.telegram.ingress({
+      operator_id: OP, chat_id: CHAT, chat_type: "private",
+      update_id: 601, text: "OK", reply_to_message_id: 999,
+    })).rejects.toThrow(/FAIL_CLOSED_TELEGRAM_INTEGRITY/);
+
+    // Tampered outcome record → digest mismatch → fail closed.
+    const key = `tgupd:${CHAT}:601`;
+    const row = s.store.get("telegram_update", key) as Record<string, unknown>;
+    s.store.put("telegram_update", key,
+      { ...row, outcome: { ...(row.outcome as object), mission_id: "MSN_forged" } },
+      Number(row.version ?? 0));
+    await expect(d.telegram.ingress({
+      operator_id: OP, chat_id: CHAT, chat_type: "private",
+      update_id: 601, text: "OK", reply_to_message_id: 800,
+    })).rejects.toThrow(/FAIL_CLOSED_TELEGRAM_INTEGRITY/);
+    expect(missionsOf(s)).toHaveLength(1);
+  });
+});

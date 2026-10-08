@@ -506,4 +506,49 @@ describe("P15.8-E bridge e2e — real bridge × mock Bot API × real MC", () => 
     const err = tg.sent(CHAT).map((c) => String(c.body.text)).join("");
     expect(err).toContain("chưa được trình bày");
   }, 25000);
+
+  it("R2: crash between confirm and cursor commit — redelivered ACK replays the receipt, no new turn/model call, one mission", async () => {
+    const dir = path.join(ROOT, `s${counter++}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "telegram-allow.json"), JSON.stringify([CHAT]));
+    const st = stack(dir);
+    const mcPort = await new Promise<number>((r) =>
+      st.server.listen(0, () => r((st.server.address() as AddressInfo).port)));
+    servers.push(st.server);
+    const tg = new MockTgApi();
+    const tgPort = await tg.listen();
+    const log: string[] = [];
+    const child = await spawnBridge(mcPort, tgPort, dir, log);
+
+    // draft → bound prompt → reply-bound "vâng" ack → one mission.
+    tg.push(msgUpdate(70, CHAT, `/draft ${st.projectId} ack replay e2e`));
+    await waitFor(() => tg.delivered(CHAT).some((c) => c.body.reply_markup));
+    const promptMid = tg.mid;
+    tg.push(msgUpdate(71, CHAT, "vâng", {
+      reply_to_message: { message_id: promptMid, chat: { id: Number(CHAT) } },
+    }));
+    await waitFor(() => st.store.list("mission").length === 1);
+    const ackSend = (c: TgCall) => String(c.body.text).includes("đã xác nhận");
+    await waitFor(() => tg.sent(CHAT).some(ackSend));
+    const msgCount = () => st.store.list("conversation_message").length;
+    const before = msgCount();
+
+    // Crash + rewind cursor — Telegram redelivers update 71. The ref is
+    // already CONSUMED: the recorded outcome must replay, NOT
+    // reclassify into an ordinary turn.
+    child.kill("SIGKILL");
+    fs.rmSync(path.join(dir, "telegram-offset.json"), { force: true });
+    const log2: string[] = [];
+    await spawnBridge(mcPort, tgPort, dir, log2);
+    // A second (replayed) ack notification may re-send — that's at-least-
+    // once delivery — but there must be NO new conversation turn and NO
+    // model reply ("PAIR trả lời mô phỏng" is the invoker's text).
+    await waitFor(() => tg.sent(CHAT).filter(ackSend).length >= 2, 8000);
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(st.store.list("mission")).toHaveLength(1);
+    expect(msgCount()).toBe(before);
+    expect(tg.sent(CHAT).some((c) =>
+      String(c.body.text).includes("PAIR trả lời mô phỏng") &&
+      String(c.body.text).includes("vâng"))).toBe(false);
+  }, 25000);
 });

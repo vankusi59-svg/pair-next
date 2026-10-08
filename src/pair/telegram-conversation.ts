@@ -484,6 +484,48 @@ export class TelegramConversationService {
     if (!text || text.length > TG_MAX_TEXT_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_TELEGRAM_FIELD", "text empty/oversize");
     }
+    const updateId = Number(input.update_id);
+
+    // R2 — processed-update replay: a reply-bound ack whose confirmation
+    // committed records its outcome keyed by (chat_id, update_id). The
+    // same redelivered update replays that receipt VERBATIM — even after
+    // the ref moved to CONSUMED — instead of reclassifying into an
+    // ordinary turn (which would mint messages and re-invoke the model).
+    const updKey = `tgupd:${chatId}:${updateId}`;
+    const prior = this.deps.store.tryGet(TELEGRAM_UPDATE_ENTITY, updKey);
+    if (prior) {
+      if (String(prior.update_digest) !== telegramUpdateDigest({
+        update_key: String(prior.update_key), chat_id: String(prior.chat_id),
+        update_id: Number(prior.update_id), kind: String(prior.kind),
+        outcome: prior.outcome as Record<string, unknown>,
+      })) {
+        throw new IntegrityError("FAIL_CLOSED_TELEGRAM_INTEGRITY", updKey);
+      }
+      if (String(prior.kind) !== "ack" || String(prior.chat_id) !== chatId) {
+        throw new IntegrityError("FAIL_CLOSED_TELEGRAM_INTEGRITY",
+          `update ${updateId} kind ${String(prior.kind)}`);
+      }
+      const o = prior.outcome as {
+        session_id: string; draft_id: string; mission_id: string;
+        ref_id: string; prompt_message_id: number;
+      };
+      // The replay binding is durable and cannot be redirected: the
+      // recorded session must canonically exist and belong to THIS
+      // operator, and the recorded prompt message is the exact one the
+      // original ack replied to — never "another draft/prompt/session".
+      if (Number(o.prompt_message_id) !== Number(input.reply_to_message_id ?? NaN)) {
+        throw new IntegrityError("FAIL_CLOSED_TELEGRAM_INTEGRITY",
+          `update ${updateId} prompt mismatch`);
+      }
+      const boundSession = this.deps.conversation.getSession(
+        String(o.session_id), operatorId);
+      return {
+        kind: "ack_confirmed", session_id: boundSession.session_id,
+        draft_id: String(o.draft_id), mission_id: String(o.mission_id),
+        reused: true,
+      };
+    }
+
     const { session } = this.resolveChatSession({ operator_id: operatorId, chat_id: chatId });
 
     // Reply-bound natural-language ack? The ref must be ACTIVE, bound to
@@ -503,7 +545,8 @@ export class TelegramConversationService {
         );
       if (ref) {
         const c = await this.confirmByRef({
-          operator_id: operatorId, chat_id: chatId, ref_id: ref.ref_id, kind: "ack",
+          operator_id: operatorId, chat_id: chatId, ref_id: ref.ref_id,
+          kind: "ack", update_id: updateId,
         });
         return {
           kind: "ack_confirmed", session_id: session.session_id,
@@ -676,6 +719,11 @@ export class TelegramConversationService {
     chat_type?: string | null;
     ref_id: string;
     kind: "explicit" | "ack";
+    /** R2 — the triggering Telegram update id. When present, the
+     *  ack_confirmed outcome is recorded in the SAME transaction that
+     *  consumes the ref, so a redelivered update replays the receipt
+     *  even after the ref is CONSUMED (no reclassification into a turn). */
+    update_id?: number;
   }): Promise<{ draft: MissionDraftRow; mission_id: string; mission: Record<string, unknown>; reused: boolean }> {
     const operatorId = assertField("operator_id", input.operator_id);
     const chatId = assertField("chat_id", input.chat_id);
@@ -711,17 +759,60 @@ export class TelegramConversationService {
     });
     // Mark the ref consumed after the governed submission converged —
     // repeat callbacks still replay the same receipt via the draft.
-    if (ref.state === "ACTIVE") {
-      this.deps.store.immediate(() => {
-        const cur = this.canonicalRef(ref.ref_id);
-        if (cur.state !== "ACTIVE") return;
+    // R2: when a Telegram update drove this confirmation, its outcome is
+    // recorded in the SAME transaction — a redelivery replays the
+    // receipt, never reclassifies into an ordinary turn.
+    this.deps.store.immediate(() => {
+      const cur = this.canonicalRef(ref.ref_id);
+      if (cur.state === "ACTIVE") {
         this.deps.store.put(
           TELEGRAM_CONFIRM_REF_ENTITY, ref.ref_id,
           { ...cur, state: "CONSUMED" },
           Number((cur as unknown as { version?: number }).version ?? 0),
         );
-      });
-    }
+      }
+      if (input.update_id !== undefined) {
+        const updateId = Number(input.update_id);
+        const updateKey = `tgupd:${chatId}:${updateId}`;
+        const prior = this.deps.store.tryGet(TELEGRAM_UPDATE_ENTITY, updateKey);
+        const outcome = {
+          session_id: ref.session_id,
+          draft_id: ref.draft_id,
+          mission_id: result.mission_id,
+          ref_id: ref.ref_id,
+          prompt_message_id: ref.prompt_message_id,
+        };
+        if (prior) {
+          // Already recorded — it must be the IDENTICAL outcome, else a
+          // redirect attempt fails closed.
+          const same =
+            String(prior.kind) === "ack" &&
+            String(prior.chat_id) === chatId &&
+            JSON.stringify(prior.outcome) === JSON.stringify(outcome);
+          if (!same ||
+              String(prior.update_digest) !== telegramUpdateDigest({
+                update_key: String(prior.update_key), chat_id: String(prior.chat_id),
+                update_id: Number(prior.update_id), kind: String(prior.kind),
+                outcome: prior.outcome as Record<string, unknown> })) {
+            throw new IntegrityError("FAIL_CLOSED_TELEGRAM_INTEGRITY", updateKey);
+          }
+          return;
+        }
+        const outcomeRow: TelegramUpdateRow = {
+          update_key: updateKey,
+          chat_id: chatId,
+          update_id: updateId,
+          kind: "ack",
+          outcome,
+          update_digest: "",
+          created_at: this.now(),
+        };
+        outcomeRow.update_digest = telegramUpdateDigest(outcomeRow);
+        this.deps.store.put(
+          TELEGRAM_UPDATE_ENTITY, updateKey,
+          outcomeRow as unknown as Record<string, unknown>);
+      }
+    });
     return result;
   }
 
