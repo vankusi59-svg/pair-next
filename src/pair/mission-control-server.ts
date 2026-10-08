@@ -1168,9 +1168,12 @@ export function createMissionControlServer(
           deadline: body.deadline === undefined ? undefined : body.deadline as string | null,
           budget_ceiling_microusd: body.budget_ceiling_microusd === undefined ? undefined : Number(body.budget_ceiling_microusd),
           currency: body.currency === undefined ? undefined : String(body.currency),
-          hard_constraints: Array.isArray(body.hard_constraints) ? body.hard_constraints.map(String) : undefined,
-          success_conditions: Array.isArray(body.success_conditions) ? body.success_conditions.map(String) : undefined,
-          stop_conditions: Array.isArray(body.stop_conditions) ? body.stop_conditions.map(String) : undefined,
+          // Pass-through, never coerced: P15.1 normalizeStringList is the
+          // canonical validator — a scalar or non-string element rejects
+          // the whole create (F1).
+          hard_constraints: body.hard_constraints as string[] | undefined,
+          success_conditions: body.success_conditions as string[] | undefined,
+          stop_conditions: body.stop_conditions as string[] | undefined,
           dedup_key: body.dedup_key === undefined ? undefined : String(body.dedup_key),
           operator_id: String(operator),
         }));

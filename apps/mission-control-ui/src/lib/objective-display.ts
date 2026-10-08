@@ -1,0 +1,63 @@
+/**
+ * P15.7 F2/F3 — pure display semantics for the Objectives page.
+ * Extracted so the exact unit/interaction contracts are unit-testable
+ * without a DOM harness.
+ */
+
+/** USD → integer microusd. Rejects non-finite, negative, or unsafe-integer results. */
+export function usdToMicrousd(raw: string): number | null {
+  if (!raw.trim()) return null; // blank is "no budget input", not $0 input
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < 0) return null;
+  const micro = Math.round(v * 1_000_000);
+  return Number.isSafeInteger(micro) ? micro : null;
+}
+
+export function fmtMicro(micro: unknown): string {
+  const v = Number(micro);
+  if (!Number.isFinite(v)) return "—";
+  return `$${(v / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+}
+
+export interface BudgetView {
+  /** Integer microusd ceiling — P15.1 treats absent budget as 0. */
+  ceiling_micro: number;
+  consumed_micro: number;
+  remaining_micro: number;
+  /** consumed < ceiling — P15.6 exhausts at consumed >= ceiling. */
+  can_dispatch: boolean;
+  /** Human label — NEVER "uncapped": zero ceiling is a hard bound. */
+  label: string;
+}
+
+export function budgetView(
+  budget: { ceiling_microusd?: unknown; consumed_microusd?: unknown } | null | undefined,
+): BudgetView {
+  const ceiling = Number(budget?.ceiling_microusd ?? 0);
+  const consumed = Number(budget?.consumed_microusd ?? 0);
+  const safeCeiling = Number.isFinite(ceiling) && ceiling > 0 ? ceiling : 0;
+  const safeConsumed = Number.isFinite(consumed) && consumed > 0 ? consumed : 0;
+  const can_dispatch = safeConsumed < safeCeiling;
+  const label = can_dispatch
+    ? `consumed ${fmtMicro(safeConsumed)} / ceiling ${fmtMicro(safeCeiling)} (remaining ${fmtMicro(safeCeiling - safeConsumed)})`
+    : `consumed ${fmtMicro(safeConsumed)} / ceiling ${fmtMicro(safeCeiling)} — zero budget, cannot dispatch new work`;
+  return {
+    ceiling_micro: safeCeiling,
+    consumed_micro: safeConsumed,
+    remaining_micro: safeCeiling - safeConsumed,
+    can_dispatch,
+    label,
+  };
+}
+
+/** Tri-state for canonical list views — a failed fetch is an error
+ *  state with a retry affordance, NEVER an "empty list", and stale
+ *  rows are suppressed once a strict read has failed. */
+export function listState<T>(
+  data: T[] | null,
+  error: unknown,
+): "loading" | "error" | "empty" | "rows" {
+  if (error) return "error";
+  if (data === null) return "loading";
+  return data.length === 0 ? "empty" : "rows";
+}

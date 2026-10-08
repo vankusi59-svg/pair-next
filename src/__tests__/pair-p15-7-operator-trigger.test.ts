@@ -44,6 +44,11 @@ import {
   RecoveryController,
   WorkforceService,
 } from "../pair/index.js";
+import {
+  budgetView,
+  listState,
+  usdToMicrousd,
+} from "../../apps/mission-control-ui/src/lib/objective-display.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p157-"));
 let counter = 0;
@@ -326,6 +331,50 @@ describe("P15.7 §A — canonical objective API", () => {
     expect((await r2.json()).error).toBe("FAIL_CLOSED_OPERATOR_ID_REQUIRED");
   });
 
+  it("A7. F1 — malformed constraint lists reject with typed 409, zero objective created", async () => {
+    const s = freshFullStack("a7");
+    const bid = mkBusiness(s);
+    const port = await serve(s);
+
+    // Scalar (not an array) — previously silently dropped by the route.
+    const rScalar = await post(port, "/api/vnext/objectives",
+      OBJ_BODY(bid, { hard_constraints: "Chỉ bán qua MQL5" }));
+    expect(rScalar.status).toBe(409);
+    expect((await rScalar.json()).error).toBe("FAIL_CLOSED_OBJECTIVE_FIELD");
+
+    // Non-string element — previously String()-coerced into authority.
+    const rElem = await post(port, "/api/vnext/objectives",
+      OBJ_BODY(bid, { success_conditions: ["ok", 42, null] }));
+    expect(rElem.status).toBe(409);
+    expect((await rElem.json()).error).toBe("FAIL_CLOSED_OBJECTIVE_FIELD");
+
+    const rEmpty = await post(port, "/api/vnext/objectives",
+      OBJ_BODY(bid, { stop_conditions: ["  "] }));
+    expect(rEmpty.status).toBe(409);
+
+    // Nothing was minted through the failures.
+    expect(s.store.list("objective").length).toBe(0);
+    const list = await get(port, `/api/vnext/objectives?business_id=${bid}`).then((r) => r.json());
+    expect((list.objectives as unknown[]).length).toBe(0);
+  });
+
+  it("A8. F1 — valid constraint arrays round-trip verbatim", async () => {
+    const s = freshFullStack("a8");
+    const bid = mkBusiness(s);
+    const port = await serve(s);
+
+    const created = await post(port, "/api/vnext/objectives", OBJ_BODY(bid, {
+      hard_constraints: ["Chỉ bán qua MQL5", "no paid ads"],
+      success_conditions: ["10 orders", "refund rate < 5%"],
+      stop_conditions: ["2 consecutive failed reviews"],
+    }));
+    expect(created.status).toBe(200);
+    const row = await created.json();
+    expect(row.hard_constraints).toEqual(["Chỉ bán qua MQL5", "no paid ads"]);
+    expect(row.success_conditions).toEqual(["10 orders", "refund rate < 5%"]);
+    expect(row.stop_conditions).toEqual(["2 consecutive failed reviews"]);
+  });
+
   it("A6. corrupt canonical row → strict list/detail reject (never silently serve)", async () => {
     const s = freshFullStack("a6");
     const bid = mkBusiness(s);
@@ -459,5 +508,47 @@ describe("P15.7 §B — CEO operating trigger", () => {
     expect(r.status).toBe(200);
     // Awaiting an in-flight mission consumes NO additional CEO call.
     expect(inv.inputs.length).toBe(calls);
+  });
+});
+
+describe("P15.7 R2 — display semantics (F2 zero-budget, F3 error states)", () => {
+  it("F2-a. usdToMicrousd — exact integer microusd, rejects non-finite/negative/unsafe", () => {
+    expect(usdToMicrousd("500.25")).toBe(500_250_000);
+    expect(usdToMicrousd("0")).toBe(0);
+    expect(usdToMicrousd("1")).toBe(1_000_000);
+    expect(usdToMicrousd("0.000001")).toBe(1);
+    expect(usdToMicrousd("abc")).toBeNull();
+    expect(usdToMicrousd("-1")).toBeNull();
+    expect(usdToMicrousd("1e30")).toBeNull(); // unsafe integer → reject, never silent
+    expect(usdToMicrousd("")).toBeNull();
+  });
+
+  it("F2-b. budgetView — absent/zero ceiling is 'zero budget, cannot dispatch', NEVER 'uncapped'", () => {
+    const absent = budgetView(null);
+    expect(absent.ceiling_micro).toBe(0);
+    expect(absent.can_dispatch).toBe(false);
+    expect(absent.label).not.toContain("uncapped");
+    expect(absent.label).toContain("zero budget");
+
+    const zero = budgetView({ ceiling_microusd: 0, consumed_microusd: 0 });
+    expect(zero.can_dispatch).toBe(false);
+    expect(zero.label).not.toContain("uncapped");
+
+    const exhausted = budgetView({ ceiling_microusd: 500_000_000, consumed_microusd: 500_000_000 });
+    expect(exhausted.can_dispatch).toBe(false);
+    expect(exhausted.remaining_micro).toBe(0);
+
+    const live = budgetView({ ceiling_microusd: 500_250_000, consumed_microusd: 100_000_000 });
+    expect(live.can_dispatch).toBe(true);
+    expect(live.remaining_micro).toBe(400_250_000);
+  });
+
+  it("F3-a. listState — failed fetch is error (never empty); stale rows suppressed", () => {
+    expect(listState(null, null)).toBe("loading");
+    expect(listState([], null)).toBe("empty");
+    expect(listState([{ id: 1 }], null)).toBe("rows");
+    // Stale data + error → error wins; rows are not rendered as valid.
+    expect(listState([{ id: 1 }], new Error("boom"))).toBe("error");
+    expect(listState(null, new Error("boom"))).toBe("error");
   });
 });

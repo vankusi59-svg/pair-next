@@ -3,20 +3,7 @@ import { Link } from "react-router-dom";
 import { api, getOperatorId } from "../api";
 import { useApi } from "../hooks/useApi";
 import type { CanonicalObjective, OperatingPassResult } from "../types";
-
-/** USD → integer microusd. Rejects non-finite or unsafe results. */
-function usdToMicrousd(raw: string): number | null {
-  const v = Number(raw);
-  if (!Number.isFinite(v) || v < 0) return null;
-  const micro = Math.round(v * 1_000_000);
-  return Number.isSafeInteger(micro) ? micro : null;
-}
-
-function fmtMicro(micro: unknown): string {
-  const v = Number(micro);
-  if (!Number.isFinite(v)) return "—";
-  return `$${(v / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-}
+import { budgetView, listState, usdToMicrousd } from "../lib/objective-display";
 
 interface KpiRow {
   name: string;
@@ -107,9 +94,9 @@ export function Objectives() {
     }
   };
 
-  const budget = selected?.budget as { ceiling_microusd?: number; consumed_microusd?: number } | null | undefined;
-  const ceiling = Number(budget?.ceiling_microusd ?? 0);
-  const consumed = Number(budget?.consumed_microusd ?? 0);
+  const bv = budgetView(selected?.budget as { ceiling_microusd?: number; consumed_microusd?: number } | null | undefined);
+  const bizState = listState(businesses.data?.businesses ?? null, businesses.error);
+  const objState = listState(bizId ? (objs.data?.objectives ?? null) : [], objs.error);
 
   return (
     <div className="page">
@@ -123,13 +110,19 @@ export function Objectives() {
         <label htmlFor="objbiz">Business</label>
         <select id="objbiz" value={bizId} onChange={(e) => { setBizId(e.target.value); setSelected(null); setCycle(null); }}>
           <option value="">— select business —</option>
-          {(businesses.data?.businesses ?? []).map((b) => (
+          {bizState === "rows" && (businesses.data?.businesses ?? []).map((b) => (
             <option key={String(b.business_id)} value={String(b.business_id)}>
               {String(b.name ?? b.business_id)}
             </option>
           ))}
         </select>
-        {businesses.data && (businesses.data.businesses ?? []).length === 0 && (
+        {bizState === "error" && (
+          <div className="state err">
+            Failed to load businesses: {String(businesses.error)}{" "}
+            <button className="ghost" onClick={() => businesses.reload()}>Retry</button>
+          </div>
+        )}
+        {bizState === "empty" && (
           <div className="state">No businesses yet — create one on the legacy Business page first.</div>
         )}
       </section>
@@ -150,6 +143,10 @@ export function Objectives() {
             <div>
               <label htmlFor="obudget">Budget ceiling USD (optional)</label>
               <input id="obudget" value={budgetUsd} onChange={(e) => setBudgetUsd(e.target.value)} placeholder="500" inputMode="decimal" />
+              <div className="muted" style={{ fontSize: 12 }}>
+                Leave blank for a <strong>zero-budget</strong> objective: it is created with
+                ceiling $0 and cannot dispatch new work until funded.
+              </div>
             </div>
           </div>
 
@@ -184,7 +181,13 @@ export function Objectives() {
         </section>
       )}
 
-      {bizId && (
+      {bizId && objState === "error" && (
+        <div className="state err">
+          Failed to load objectives: {String(objs.error)}{" "}
+          <button className="ghost" onClick={() => objs.reload()}>Retry</button>
+        </div>
+      )}
+      {bizId && objState === "rows" && (
         <table className="tbl">
           <thead>
             <tr><th>objective</th><th>status</th><th>kpis</th><th>deadline</th><th>created</th></tr>
@@ -199,9 +202,11 @@ export function Objectives() {
                 <td className="muted">{o.created_at ? String(o.created_at).slice(0, 10) : ""}</td>
               </tr>
             ))}
-            {list.length === 0 && <tr><td colSpan={5} className="muted">No canonical objectives yet.</td></tr>}
           </tbody>
         </table>
+      )}
+      {bizId && objState === "empty" && (
+        <div className="state muted">No canonical objectives yet.</div>
       )}
 
       {selected && (
@@ -226,10 +231,15 @@ export function Objectives() {
           )}
 
           <p className="muted">
-            budget: consumed {fmtMicro(consumed)} / ceiling {ceiling ? fmtMicro(ceiling) : "uncapped"}
-            {ceiling ? ` (remaining ${fmtMicro(ceiling - consumed)})` : ""}
+            budget: {bv.label}
             {selected.deadline ? ` · deadline ${String(selected.deadline)}` : ""}
           </p>
+          {!bv.can_dispatch && (
+            <p className="state">
+              Zero-budget objective — CEO cycles will stop at OBJECTIVE_BUDGET_EXHAUSTED
+              instead of dispatching new work.
+            </p>
+          )}
           {(selected.hard_constraints ?? []).length > 0 && (
             <p><strong>constraints:</strong> {(selected.hard_constraints ?? []).join(" · ")}</p>
           )}
