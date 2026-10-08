@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { api, getOperatorId } from "../api";
 import { useApi } from "../hooks/useApi";
 import type { CanonicalObjective, OperatingPassResult } from "../types";
-import { budgetView, listState, usdToMicrousd } from "../lib/objective-display";
+import { budgetView, listState, showObjectiveDetail, usdToMicrousd } from "../lib/objective-display";
 
 interface KpiRow {
   name: string;
@@ -209,7 +209,7 @@ export function Objectives() {
         <div className="state muted">No canonical objectives yet.</div>
       )}
 
-      {selected && (
+      {selected && showObjectiveDetail(objState) && (
         <section className="card">
           <h2>{selected.title ?? selected.objective_id}</h2>
           <p className="muted mono">{selected.objective_id} · status {selected.status}</p>
@@ -234,9 +234,15 @@ export function Objectives() {
             budget: {bv.label}
             {selected.deadline ? ` · deadline ${String(selected.deadline)}` : ""}
           </p>
-          {!bv.can_dispatch && (
+          {bv.state === "ZERO_BUDGET" && (
             <p className="state">
               Zero-budget objective — CEO cycles will stop at OBJECTIVE_BUDGET_EXHAUSTED
+              instead of dispatching new work.
+            </p>
+          )}
+          {bv.state === "BUDGET_EXHAUSTED" && (
+            <p className="state">
+              Budget exhausted — CEO cycles will stop at OBJECTIVE_BUDGET_EXHAUSTED
               instead of dispatching new work.
             </p>
           )}

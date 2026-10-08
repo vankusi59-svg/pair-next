@@ -47,6 +47,7 @@ import {
 import {
   budgetView,
   listState,
+  showObjectiveDetail,
   usdToMicrousd,
 } from "../../apps/mission-control-ui/src/lib/objective-display.js";
 
@@ -523,24 +524,39 @@ describe("P15.7 R2 — display semantics (F2 zero-budget, F3 error states)", () 
     expect(usdToMicrousd("")).toBeNull();
   });
 
-  it("F2-b. budgetView — absent/zero ceiling is 'zero budget, cannot dispatch', NEVER 'uncapped'", () => {
+  it("F2-b/R3.A. budgetView — three states, exhausted positive is never 'zero budget', never 'uncapped'", () => {
+    // Case 1: ceiling = 0 → ZERO_BUDGET
     const absent = budgetView(null);
+    expect(absent.state).toBe("ZERO_BUDGET");
     expect(absent.ceiling_micro).toBe(0);
     expect(absent.can_dispatch).toBe(false);
-    expect(absent.label).not.toContain("uncapped");
     expect(absent.label).toContain("zero budget");
+    expect(absent.label).not.toContain("uncapped");
 
     const zero = budgetView({ ceiling_microusd: 0, consumed_microusd: 0 });
+    expect(zero.state).toBe("ZERO_BUDGET");
     expect(zero.can_dispatch).toBe(false);
-    expect(zero.label).not.toContain("uncapped");
 
+    // Case 2: ceiling > 0 && consumed >= ceiling → BUDGET_EXHAUSTED —
+    // NEVER labeled zero budget.
     const exhausted = budgetView({ ceiling_microusd: 500_000_000, consumed_microusd: 500_000_000 });
+    expect(exhausted.state).toBe("BUDGET_EXHAUSTED");
     expect(exhausted.can_dispatch).toBe(false);
     expect(exhausted.remaining_micro).toBe(0);
+    expect(exhausted.label).toContain("exhausted");
+    expect(exhausted.label).not.toContain("zero budget");
 
+    const overSpent = budgetView({ ceiling_microusd: 100, consumed_microusd: 500 });
+    expect(overSpent.state).toBe("BUDGET_EXHAUSTED");
+    expect(overSpent.label).not.toContain("zero budget");
+
+    // Case 3: consumed < ceiling → AVAILABLE
     const live = budgetView({ ceiling_microusd: 500_250_000, consumed_microusd: 100_000_000 });
+    expect(live.state).toBe("AVAILABLE");
     expect(live.can_dispatch).toBe(true);
     expect(live.remaining_micro).toBe(400_250_000);
+    expect(live.label).not.toContain("zero budget");
+    expect(live.label).not.toContain("exhausted");
   });
 
   it("F3-a. listState — failed fetch is error (never empty); stale rows suppressed", () => {
@@ -550,5 +566,12 @@ describe("P15.7 R2 — display semantics (F2 zero-budget, F3 error states)", () 
     // Stale data + error → error wins; rows are not rendered as valid.
     expect(listState([{ id: 1 }], new Error("boom"))).toBe("error");
     expect(listState(null, new Error("boom"))).toBe("error");
+  });
+
+  it("F3-b/R3.B — stale detail + cycle action hidden when the list read is in error", () => {
+    expect(showObjectiveDetail("error")).toBe(false);
+    expect(showObjectiveDetail("rows")).toBe(true);
+    expect(showObjectiveDetail("empty")).toBe(true);
+    expect(showObjectiveDetail("loading")).toBe(true);
   });
 });

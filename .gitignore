@@ -12,3 +12,4 @@ dist
 .automaton/state.db
 
 .pair-mc
+tsconfig.tsbuildinfo
