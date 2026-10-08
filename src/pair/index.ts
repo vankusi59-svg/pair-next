@@ -87,3 +87,4 @@ export * from "./work-coordination.js";
 export * from "./work-completion.js";
 export * from "./routine-mirror.js";
 export * from "./objective-adaptive-review.js";
+export * from "./objective-operating-loop.js";
