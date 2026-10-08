@@ -107,6 +107,65 @@ export interface VnextObjectiveInput {
   dedup_key?: string;
 }
 
+/* ---- P15.8-D — conversation layer read models ---- */
+
+export interface ConversationSession {
+  session_id: string;
+  owner_operator_id: string;
+  entry_mode: "CONVERSATION" | "TASK_ENTRY";
+  state: "OPEN" | "CLOSED";
+  title?: string | null;
+  message_count: number;
+  next_seq: number;
+  closed_at?: string | null;
+  created_at: string;
+  updated_at: string;
+  [k: string]: unknown;
+}
+
+export interface ConversationMessage {
+  message_id: string;
+  session_id: string;
+  seq: number;
+  role: "operator" | "assistant" | "system";
+  body: string;
+  created_at: string;
+  [k: string]: unknown;
+}
+
+export interface ConversationTurnResult {
+  message: ConversationMessage;
+  reply: ConversationMessage;
+  reused: boolean;
+}
+
+export interface MissionDraft {
+  draft_id: string;
+  session_id: string;
+  owner_operator_id: string;
+  project_id: string;
+  goal: string;
+  granted_permissions: string[];
+  authorized_workspaces: string[] | null;
+  risk_ceiling: string | null;
+  draft_digest: string;
+  state: "PENDING_CONFIRMATION" | "SUBMITTING" | "CONFIRMED" | "REJECTED" | "EXPIRED" | "SUBMISSION_EXPIRED";
+  created_at: string;
+  expires_at: string;
+  supersedes_draft_id?: string | null;
+  preview_id?: string | null;
+  plan_digest?: string | null;
+  mission_id?: string | null;
+  [k: string]: unknown;
+}
+
+export interface DraftConfirmResult {
+  draft: MissionDraft;
+  mission_id: string;
+  mission: Record<string, unknown>;
+  reused: boolean;
+}
+
 export interface OperatingPassResult {
   outcome: string;
   objective_id: string;
