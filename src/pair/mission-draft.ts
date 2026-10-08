@@ -58,6 +58,10 @@ export const MISSION_DRAFT_STATES = [
   "CONFIRMED",
   "REJECTED",
   "EXPIRED",
+  // R1.B — the pinned preview's canonical TTL lapsed while the draft
+  // was claimed; terminal and truthful: the presented confirmation is
+  // spent. A new draft is required — nothing replans silently.
+  "SUBMISSION_EXPIRED",
 ] as const;
 export type MissionDraftState = (typeof MISSION_DRAFT_STATES)[number];
 
@@ -614,6 +618,37 @@ export class MissionDraftService {
           `draft ${draftId} state ${row.state} is not confirmable`,
         );
       }
+      if (input.kind === "ack") {
+        // R1.A — ack uniqueness is enforced AT the authority boundary,
+        // not by Phase D/E callers: exactly ONE live pending draft may
+        // exist for this session+owner and it must be the named draft.
+        // kind:"explicit" never enters this path. Runs inside the claim
+        // txn AFTER the named draft is proven PENDING — receipt/resume
+        // replays above never need uniqueness.
+        const now = (this.deps.now ?? utcnow)();
+        const pending = this.deps.store.list(MISSION_DRAFT_ENTITY)
+          .filter((d) =>
+            String(d.session_id) === sessionId &&
+            String(d.owner_operator_id) === operatorId)
+          .map((d) => {
+            this.assertCanonicalDraft(d);
+            return this.expireIfDue(
+              d as unknown as MissionDraftRow & { version: number }, now);
+          })
+          .filter((d) => String(d.state) === "PENDING_CONFIRMATION");
+        if (pending.length === 0) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_CONVERSATION_ACK_NONE",
+            `no pending draft in session ${sessionId}`,
+          );
+        }
+        if (pending.length > 1 || String(pending[0].draft_id) !== draftId) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_CONVERSATION_ACK_AMBIGUOUS",
+            `${pending.length} pending draft(s) — acknowledgement cannot pick ${draftId}`,
+          );
+        }
+      }
       // 7: authority re-proof — project still canonical; constraints were
       // canonicalized at creation and revalidated by the digest.
       if (!this.deps.store.tryGet("project", String(row.project_id))) {
@@ -685,10 +720,55 @@ export class MissionDraftService {
       row = pinned;
     }
 
+    /* ---- R1.B — pinned-preview recoverability ----------------------- */
+    // A claimed draft can outlive its pinned READY preview. Before
+    // declaring it unrecoverable check CANONICAL consumption: a consumed
+    // preview still replays its mission receipt; an expired unconsumed
+    // one can never legally confirm → close the draft truthfully.
+    const previewRow = this.deps.store.tryGet(
+      "mission_plan_preview", String(row.preview_id)) as Record<string, unknown> | null;
+    if (!previewRow) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CONVERSATION_DRAFT_INTEGRITY",
+        `pinned preview ${String(row.preview_id)} missing`,
+      );
+    }
+    if (String(previewRow.state) !== "CONSUMED") {
+      const expired =
+        (this.deps.now ?? utcnow)() > String(previewRow.expires_at ?? "");
+      if (expired) {
+        this.deps.store.immediate(() => {
+          const fresh = this.canonicalDraft(draftId);
+          if (fresh.state !== "SUBMITTING") return; // racing settle won
+          this.deps.store.put(MISSION_DRAFT_ENTITY, draftId,
+            { ...fresh, state: "SUBMISSION_EXPIRED" } as unknown as Record<string, unknown>,
+            Number(fresh.version ?? 0));
+          this.deps.store.event({
+            entity_type: MISSION_DRAFT_ENTITY,
+            entity_id: draftId,
+            event_type: "MISSION_DRAFT_SUBMISSION_EXPIRED",
+            old_state: "SUBMITTING",
+            new_state: "SUBMISSION_EXPIRED",
+            actor: "conversation-mission-draft",
+            metadata: {
+              draft_id: draftId, session_id: sessionId,
+              preview_id: String(row.preview_id),
+              preview_expires_at: String(previewRow.expires_at),
+            },
+          });
+        });
+        throw new IntegrityError(
+          "FAIL_CLOSED_CONVERSATION_DRAFT_SUBMISSION_EXPIRED",
+          `draft ${draftId} pinned preview ${String(row.preview_id)} expired — confirm a new draft`,
+        );
+      }
+    }
+
     /* ---- Governed submission — canonical confirm, atomic consume ---- */
     // confirmPlanPreview: digest/expiry/authority re-proof → mission mint
     // + preview consume in ONE store.immediate; supervisor wake happens
-    // only after the durable commit (its own contract).
+    // only after the durable commit (its own contract). A consumed
+    // preview replays ALREADY_CONSUMED → the existing mission.
     const mission = this.deps.control.confirmPlanPreview({
       preview_id: String(row.preview_id),
       plan_digest: String(row.plan_digest),

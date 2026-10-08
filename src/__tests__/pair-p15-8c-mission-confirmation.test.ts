@@ -4,7 +4,7 @@
  * mints ONE mission through the canonical preview path, every failure
  * mode closes, and direct Task Entry is untouched.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -486,5 +486,169 @@ describe("P15.8-C — mission confirmation", () => {
       session_id: sid, operator_id: OP, project_id: ctx.projectId,
       goal: "different", client_request_id: "req-1",
     }))).toContain("FAIL_CLOSED_CONVERSATION_DRAFT_IDEMPOTENCY_CONFLICT");
+  });
+
+  /* ---------------- R1.A — ack uniqueness at the authority boundary --- */
+
+  it("R1.A — two pending drafts cannot be confirmed via kind:'ack' (valid id+digest)", async () => {
+    const ctx = makeCtx("ack-boundary");
+    const sid = mkSession(ctx);
+    const d1 = mkDraft(ctx, sid, "việc A");
+    const d2 = mkDraft(ctx, sid, "việc B");
+    // A valid draft_id + valid digest is NOT enough — the ack kind
+    // independently requires a unique pending target inside the txn.
+    expect(await codeAsync(() => ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d1.draft_id, expected_digest: d1.draft_digest, kind: "ack",
+    }))).toContain("FAIL_CLOSED_CONVERSATION_ACK_AMBIGUOUS");
+    expect(missionCount(ctx)).toBe(0);
+    // kind:"explicit" still confirms a specifically selected draft.
+    const r = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d1.draft_id, expected_digest: d1.draft_digest,
+    });
+    expect(missionCount(ctx)).toBe(1);
+    // Now d2 is the sole pending draft — ack binds it.
+    const r2 = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d2.draft_id, expected_digest: d2.draft_digest, kind: "ack",
+    });
+    expect(r2.mission.goal).toBe("việc B");
+    expect(missionCount(ctx)).toBe(2);
+  });
+
+  it("R1.A — ack on a non-pending named draft → typed state error, never a mission", async () => {
+    const ctx = makeCtx("ack-terminal");
+    const sid = mkSession(ctx);
+    const d = mkDraft(ctx, sid);
+    ctx.drafts.rejectDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id });
+    expect(await codeAsync(() => ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest, kind: "ack",
+    }))).toContain("FAIL_CLOSED_CONVERSATION_DRAFT_STATE");
+    expect(missionCount(ctx)).toBe(0);
+  });
+
+  /* ---------------- R1.B — expired pinned previews -------------------- */
+
+  /** Force a SUBMITTING+pinned draft by failing the canonical confirm
+   *  once — deterministic post-pin / pre-mission crash. */
+  function crashAfterPin(ctx: ReturnType<typeof makeCtx>) {
+    return vi.spyOn(ctx.control, "confirmPlanPreview").mockImplementationOnce(() => {
+      throw new Error("transport lost mid-submit");
+    });
+  }
+
+  function expirePreview(ctx: ReturnType<typeof makeCtx>, previewId: string) {
+    const pv = ctx.store.get("mission_plan_preview", previewId);
+    ctx.store.put("mission_plan_preview", previewId,
+      { ...pv, expires_at: "2000-01-01T00:00:00.000Z" },
+      Number(pv.version ?? 0));
+    return pv;
+  }
+
+  it("R1.B — crash after preview pin: pinned READY preview expires → truthful terminal, zero missions", async () => {
+    const ctx = makeCtx("pin-expire");
+    const sid = mkSession(ctx);
+    const d = mkDraft(ctx, sid);
+    const spy = crashAfterPin(ctx);
+    await expect(ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    })).rejects.toThrow("transport lost");
+    spy.mockRestore();
+    const mid = ctx.drafts.getDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id });
+    expect(mid.state).toBe("SUBMITTING");
+    expect(mid.preview_id).not.toBeNull();
+
+    expirePreview(ctx, String(mid.preview_id));
+    // Retry: preview expired + unconsumed → draft closes truthfully.
+    expect(await codeAsync(() => ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    }))).toContain("FAIL_CLOSED_CONVERSATION_DRAFT_SUBMISSION_EXPIRED");
+    const done = ctx.drafts.getDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id });
+    expect(done.state).toBe("SUBMISSION_EXPIRED");
+    expect(missionCount(ctx)).toBe(0);
+    // Terminal — no stale confirmation can regenerate a different plan.
+    expect(await codeAsync(() => ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    }))).toContain("FAIL_CLOSED_CONVERSATION_DRAFT_STATE");
+    // A NEW draft is required — and works.
+    const d2 = mkDraft(ctx, sid, "lần hai");
+    const r = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d2.draft_id, expected_digest: d2.draft_digest,
+    });
+    expect(r.mission.goal).toBe("lần hai");
+    expect(missionCount(ctx)).toBe(1);
+  });
+
+  it("R1.B — already-consumed preview converges to the original mission", async () => {
+    const ctx = makeCtx("consumed-converge");
+    const sid = mkSession(ctx);
+    const d = mkDraft(ctx, sid);
+    const r1 = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    });
+    expect(missionCount(ctx)).toBe(1);
+    // Simulate post-mission-commit / pre-settle crash: regress the draft
+    // to SUBMITTING while the preview is already CONSUMED.
+    const row = ctx.store.get(MISSION_DRAFT_ENTITY, d.draft_id);
+    ctx.store.put(MISSION_DRAFT_ENTITY, d.draft_id,
+      { ...row, state: "SUBMITTING", mission_id: null, submitted_at: null },
+      Number(row.version));
+    const r2 = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    });
+    expect(r2.mission_id).toBe(r1.mission_id);
+    expect(missionCount(ctx)).toBe(1);
+    expect(ctx.plannerCalls.length).toBe(1);
+    const after = ctx.drafts.getDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id });
+    expect(after.state).toBe("CONFIRMED");
+    expect(after.mission_id).toBe(r1.mission_id);
+  });
+
+  it("R1.B — expired BUT consumed preview still converges (consumption checked first)", async () => {
+    const ctx = makeCtx("consumed-expired");
+    const sid = mkSession(ctx);
+    const d = mkDraft(ctx, sid);
+    const r1 = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    });
+    const row = ctx.store.get(MISSION_DRAFT_ENTITY, d.draft_id);
+    expirePreview(ctx, String(row.preview_id));
+    ctx.store.put(MISSION_DRAFT_ENTITY, d.draft_id,
+      { ...row, state: "SUBMITTING", mission_id: null, submitted_at: null },
+      Number(row.version));
+    const r2 = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    });
+    expect(r2.mission_id).toBe(r1.mission_id);
+    expect(missionCount(ctx)).toBe(1);
+  });
+
+  it("R1.B — concurrent resume cannot create a second mission", async () => {
+    const ctx = makeCtx("resume-conc");
+    const sid = mkSession(ctx);
+    const d = mkDraft(ctx, sid);
+    const spy = crashAfterPin(ctx);
+    await expect(ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    })).rejects.toThrow("transport lost");
+    spy.mockRestore();
+    const [a, b] = await Promise.all([
+      ctx.drafts.confirmDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id, expected_digest: d.draft_digest }),
+      ctx.drafts.confirmDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id, expected_digest: d.draft_digest }),
+    ]);
+    expect(a.mission_id).toBe(b.mission_id);
+    expect(missionCount(ctx)).toBe(1);
+    expect(ctx.plannerCalls.length).toBe(1);
   });
 });
