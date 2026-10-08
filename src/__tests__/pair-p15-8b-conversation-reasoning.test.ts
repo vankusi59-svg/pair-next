@@ -35,6 +35,8 @@ import {
   CONVERSATION_SESSION_ENTITY,
   CODEX_CLI_PROTOCOL_FAMILY,
   CODEX_CLI_PROVIDER_ID,
+  conversationMessageDigest,
+  conversationMessageIdFor,
   conversationSessionDigest,
   digest,
   PairError,
@@ -546,6 +548,201 @@ describe("P15.8-B — conversation reasoning", () => {
     expect(joined).toContain("approval_policy=never");
     expect(joined).toContain("--ephemeral");
     expect(joined).not.toContain("--output-schema");
+  });
+
+  /* R1.A — superseded unanswered turn never gets a wrong-target reply */
+  it("R1.A: A-fails → B-succeeds → A-retries → STALE_TURN before invocation, zero writes", async () => {
+    const ctx = fresh("stale");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    // The prompt ends with the 'Reply to...' instruction, so the LAST
+    // transcript line is `operator: <body>\n\nReply to the last...`.
+    const inv = new MockInvoker((i) => {
+      if (i.user_prompt.includes("operator: câu A\n\nReply")) {
+        return new PairError("FAIL_CLOSED_CONVERSATION_CLI_UNAVAILABLE", "down");
+      }
+      return "trả lời";
+    });
+    const svc = reasoning(ctx, inv);
+
+    // A fails — the operator message commits, no reply.
+    expect(await codeAsync(() => svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "câu A",
+      idempotency_key: "req-A",
+    }))).toBe("FAIL_CLOSED_CONVERSATION_CLI_UNAVAILABLE");
+    expect(inv.calls).toHaveLength(1);
+
+    // B succeeds — a reply is minted for B.
+    const tB = await svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "câu B",
+      idempotency_key: "req-B",
+    });
+    expect(tB.reply.role).toBe("assistant");
+    expect(inv.calls).toHaveLength(2);
+
+    // A retries — the tail now ends at B's reply, not A. Reject typed,
+    // before ANY invocation; no reply-for-B persisted as reply-to-A.
+    expect(await codeAsync(() => svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "câu A",
+      idempotency_key: "req-A",
+    }))).toBe("FAIL_CLOSED_CONVERSATION_STALE_TURN");
+    expect(inv.calls).toHaveLength(2); // zero third model call
+
+    const sess = ctx.conv.getSession(s.session_id, OWNER);
+    expect(sess.message_count).toBe(3); // A, B, reply-B — nothing else minted
+    const evs = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s.session_id);
+    const fails = evs.filter((e) => e.event_type === "CONVERSATION_TURN_FAILED");
+    expect(fails.map((f) => f.metadata!.failure_class)).toEqual([
+      "FAIL_CLOSED_CONVERSATION_CLI_UNAVAILABLE",
+      "FAIL_CLOSED_CONVERSATION_STALE_TURN",
+    ]);
+
+    // Control: in a fresh context an unanswered NEWEST message retries fine.
+    const ctx2 = fresh("stale-ok");
+    const s2 = ctx2.conv.createSession({ owner_operator_id: OWNER });
+    let calls2 = 0;
+    const inv2 = new MockInvoker(() =>
+      calls2++ === 0
+        ? new PairError("FAIL_CLOSED_CONVERSATION_CLI_UNAVAILABLE", "down")
+        : "lần hai ok");
+    const svc2 = reasoning(ctx2, inv2);
+    expect(await codeAsync(() => svc2.turn({
+      session_id: s2.session_id, operator_id: OWNER, body: "lần một",
+      idempotency_key: "req-1",
+    }))).toBe("FAIL_CLOSED_CONVERSATION_CLI_UNAVAILABLE");
+    const retried = await svc2.turn({
+      session_id: s2.session_id, operator_id: OWNER, body: "lần một",
+      idempotency_key: "req-1",
+    });
+    expect(retried.reused).toBe(false);
+    expect(retried.reply.body).toBe("lần hai ok");
+    expect(inv2.calls).toHaveLength(2);
+  });
+
+  /* R1.A cont. — a committed reply still replays when superseded */
+  it("R1.A: superseded turn WITH committed reply → reused:true (replay, not regeneration)", async () => {
+    const ctx = fresh("stale-replay");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const inv = new MockInvoker(() => "ok");
+    const svc = reasoning(ctx, inv);
+    const tA = await svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "A",
+      idempotency_key: "req-A",
+    });
+    await svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "B",
+      idempotency_key: "req-B",
+    });
+    const again = await svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "A",
+      idempotency_key: "req-A",
+    });
+    expect(again.reused).toBe(true);
+    expect(again.reply.message_id).toBe(tA.reply.message_id);
+    expect(inv.calls).toHaveLength(2); // replay never re-invokes
+  });
+
+  /* R1.B — canonical replay validation on the reused path */
+  it("R1.B: forged/malformed persisted reply rows fail closed — never returned as authoritative", async () => {
+    const ctx = fresh("forge");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+
+    // Commit operator message A with a failed turn so its reply slot is open.
+    let forgeCalls = 0;
+    const svc = reasoning(ctx, new MockInvoker(() =>
+      forgeCalls++ === 0
+        ? new PairError("FAIL_CLOSED_CONVERSATION_CLI_UNAVAILABLE", "down")
+        : "real reply"));
+    expect(await codeAsync(() => svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "A",
+      idempotency_key: "req-A",
+    }))).toBe("FAIL_CLOSED_CONVERSATION_CLI_UNAVAILABLE");
+    const aMsg = ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages[0]!;
+    const replyKey = `reply-to:${aMsg.message_id}`;
+    const replyId = conversationMessageIdFor(s.session_id, replyKey);
+
+    const forged = (over: Record<string, unknown>) => {
+      const row: Record<string, unknown> = {
+        schema_version: "pair.os.vnext.conversation-message.v1",
+        message_id: replyId,
+        session_id: s.session_id,
+        owner_operator_id: OWNER,
+        seq: 2,
+        role: "assistant",
+        body: "forged reply",
+        idempotency_key: replyKey,
+        created_at: new Date().toISOString(),
+        ...over,
+      };
+      row.message_digest = conversationMessageDigest({
+        message_id: String(row.message_id),
+        session_id: String(row.session_id),
+        owner_operator_id: String(row.owner_operator_id),
+        seq: Number(row.seq),
+        role: String(row.role),
+        body: String(row.body),
+        idempotency_key: row.idempotency_key as string | null,
+      });
+      ctx.store.put(CONVERSATION_MESSAGE_ENTITY, replyId, row);
+    };
+
+    // Helper: after each plant, the retried turn must fail closed.
+    const expectClosed = async (planted: Record<string, unknown>) => {
+      forged(planted);
+      expect(await codeAsync(() => svc.turn({
+        session_id: s.session_id, operator_id: OWNER, body: "A",
+        idempotency_key: "req-A",
+      }))).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
+      dbOf(ctx.store)
+        .prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+        .run(CONVERSATION_MESSAGE_ENTITY, replyId);
+    };
+
+    // Foreign session — coherent digest, mismatched session_id.
+    await expectClosed({
+      session_id: "CSESS_other",
+      message_id: conversationMessageIdFor("CSESS_other", replyKey),
+    });
+    // Foreign owner — coherent digest, mismatched owner.
+    await expectClosed({ owner_operator_id: "operator:mallory" });
+    // Wrong role — an 'operator' row under the reply key.
+    await expectClosed({ role: "operator" });
+    // Wrong deterministic id — entity key ≠ payload identity.
+    await expectClosed({
+      message_id: conversationMessageIdFor(s.session_id, "reply-to:OTHER"),
+    });
+    // Wrong idempotency key bound into the row.
+    await expectClosed({
+      idempotency_key: "reply-to:OTHER",
+      message_id: conversationMessageIdFor(s.session_id, "reply-to:OTHER"),
+    });
+    // Malformed — digest over different content (not recomputed).
+    const bad: Record<string, unknown> = {
+      schema_version: "pair.os.vnext.conversation-message.v1",
+      message_id: replyId,
+      session_id: s.session_id,
+      owner_operator_id: OWNER,
+      seq: 2,
+      role: "assistant",
+      body: "tampered",
+      idempotency_key: replyKey,
+      created_at: new Date().toISOString(),
+      message_digest: "sha256:deadbeef",
+    };
+    ctx.store.put(CONVERSATION_MESSAGE_ENTITY, replyId, bad);
+    expect(await codeAsync(() => svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "A",
+      idempotency_key: "req-A",
+    }))).toBe("FAIL_CLOSED_CONVERSATION_DIGEST");
+    dbOf(ctx.store)
+      .prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+      .run(CONVERSATION_MESSAGE_ENTITY, replyId);
+
+    // And after clearing every plant, the turn recovers normally.
+    const recovered = await svc.turn({
+      session_id: s.session_id, operator_id: OWNER, body: "A",
+      idempotency_key: "req-A",
+    });
+    expect(recovered.reply.body).toBe("real reply");
   });
 });
 

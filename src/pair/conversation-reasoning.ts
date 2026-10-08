@@ -468,17 +468,47 @@ export class ConversationReasoningService {
     const replyId = conversationMessageIdFor(sessionId, replyKey);
     const prior = this.deps.store.tryGet(CONVERSATION_MESSAGE_ENTITY, replyId);
     if (prior) {
-      return {
-        message,
-        reply: prior as unknown as ConversationMessageRow,
-        reused: true,
-      };
+      // R1.B — a reused reply is authoritative only after canonical
+      // proof: Phase A read authority (schema + digest + canonical
+      // identity), then exact binding to THIS session, THIS owner, the
+      // deterministic reply id + key and role assistant. Anything else
+      // fails closed — a raw tryGet row is never returned as-is.
+      conv.assertMessageCanonical(prior);
+      const p = prior as unknown as ConversationMessageRow;
+      if (p.message_id !== replyId ||
+          p.session_id !== sessionId ||
+          p.owner_operator_id !== session.owner_operator_id ||
+          p.idempotency_key !== replyKey ||
+          p.role !== "assistant") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_CONVERSATION_INTEGRITY",
+          `reply row under ${replyId} fails canonical binding`,
+        );
+      }
+      return { message, reply: p, reused: true };
     }
 
     // 3. Bounded context — the canonical tail: jump straight to the last
     //    K messages via seq (next_seq-1 is the last minted), then bound by
     //    total characters. No summarization, no fabricated context.
     const fresh = conv.getSession(sessionId, operatorId);
+
+    // R1.A — stale-turn fail-closed: only the NEWEST committed message
+    //    may be answered. If this operator message has been superseded
+    //    by newer committed turns, the tail would end at a different
+    //    operator message — a generated reply would answer B but persist
+    //    as the reply to A. Reject with a typed code BEFORE any model
+    //    invocation; no pending-turn workflow is introduced. Retrying
+    //    the newest message (normal failure→retry) is unaffected.
+    if (Number(message.seq) !== Number(fresh.next_seq) - 1) {
+      const err = new IntegrityError(
+        "FAIL_CLOSED_CONVERSATION_STALE_TURN",
+        `message seq ${String(message.seq)} superseded by seq ${String(Number(fresh.next_seq) - 1)}`,
+      );
+      this.emitTurnFailed(sessionId, err);
+      throw err;
+    }
+
     const afterSeq = Math.max(
       0, Number(fresh.next_seq) - 1 - CONVERSATION_CONTEXT_MAX_MESSAGES);
     const { messages } = conv.listMessages(sessionId, {
@@ -487,6 +517,19 @@ export class ConversationReasoningService {
       limit: CONVERSATION_CONTEXT_MAX_MESSAGES,
     });
     const tail = boundContext(messages);
+    // R1.A cont. — the context MUST end at the operator message this
+    //    turn answers. A cross-process append racing between the seq
+    //    check and this read would otherwise put a NEWER message at the
+    //    tail's head; the model would answer it while the reply would
+    //    persist under THIS message's key. Same fail-closed rejection.
+    if (tail.length === 0 || tail[tail.length - 1]!.message_id !== message.message_id) {
+      const err = new IntegrityError(
+        "FAIL_CLOSED_CONVERSATION_STALE_TURN",
+        `context tail does not end at message ${message.message_id}`,
+      );
+      this.emitTurnFailed(sessionId, err);
+      throw err;
+    }
     const transcript = tail
       .map((m) => `${m.role}: ${m.body}`)
       .join("\n");
@@ -505,7 +548,7 @@ export class ConversationReasoningService {
       });
     } catch (e) {
       // Fixed diagnostic fields only — never raw provider text.
-      this.emitTurnFailed(sessionId, e, transport);
+      this.emitTurnFailed(sessionId, e);
       throw e;
     }
 
@@ -515,7 +558,7 @@ export class ConversationReasoningService {
         "FAIL_CLOSED_CONVERSATION_REPLY_INVALID",
         replyText ? "reply oversized" : "empty reply",
       );
-      this.emitTurnFailed(sessionId, err, transport);
+      this.emitTurnFailed(sessionId, err);
       throw err;
     }
 
@@ -538,7 +581,6 @@ export class ConversationReasoningService {
   private emitTurnFailed(
     sessionId: string,
     e: unknown,
-    transport: ConversationModelTransport,
   ): void {
     const failureClass =
       e instanceof IntegrityError && /^FAIL_CLOSED_CONVERSATION_/.test(e.code)
@@ -552,7 +594,7 @@ export class ConversationReasoningService {
         actor: "conversation-reasoning",
         metadata: {
           failure_class: failureClass,
-          model_entry_id: transport.model_entry_id,
+          model_entry_id: this.deps.model_entry_id,
         },
       });
     } catch {

@@ -194,6 +194,15 @@ export class ConversationSessionService {
     return raw as unknown as ConversationMessageRow;
   }
 
+  /** R1.B — canonical message read authority for trusted internal
+   *  consumers (P15.8-B reused-reply validation): proves schema,
+   *  immutable-terms digest and canonical identity of a raw persisted
+   *  row. Throws IntegrityError on ANY deviation — never returns
+   *  malformed or forged data as authoritative. */
+  public assertMessageCanonical(row: Record<string, unknown>): void {
+    this.assertCanonicalMessage(row);
+  }
+
   private assertCanonicalSession(row: Record<string, unknown>): void {
     if (String(row.schema_version) !== CONVERSATION_SESSION_SCHEMA) {
       throw new IntegrityError(
