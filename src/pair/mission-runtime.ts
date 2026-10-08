@@ -2080,13 +2080,13 @@ export class MissionRuntime {
         // The pending read itself failed — there may still be an
         // actionable recovery. Terminalize via the emergency path (its own
         // read decides whether anything durable is possible) rather than
-        // feeding a stub pending into the decision machinery. Fixed-label
-        // reason only — a freeform err.message may carry secrets into the
-        // durable row/event; canonical code or TRANSITION_FAULT, never
-        // untrusted text.
+        // feeding a stub pending into the decision machinery. Fixed label
+        // only — R2 audit: even an allowlisted-looking PairError.code may
+        // itself carry a secret (e.g. FAIL_CLOSED_AKIA...). This boundary
+        // persists NO err field at all: not code, message, stack or cause.
         this.forceAbortRuntime(
           missionId,
-          `recovery_boundary_defect:${faultLabel(err)}`,
+          `recovery_boundary_defect:${TRANSITION_FAULT_LABEL}`,
         );
         return;
       }
@@ -2121,11 +2121,11 @@ export class MissionRuntime {
     try {
       this.handleRecoveryApplyFailure(missionId, pending, action, err, now);
     } catch (inner) {
-      // Same rule: only a canonical code or the fixed TRANSITION_FAULT
-      // label reaches the durable reason — never freeform exception text.
+      // Same rule: fixed TRANSITION_FAULT only — no inner.code/message/
+      // stack/cause is ever persisted from this boundary.
       this.forceAbortRuntime(
         missionId,
-        `recovery_boundary_defect:${faultLabel(inner)}`,
+        `recovery_boundary_defect:${TRANSITION_FAULT_LABEL}`,
       );
     }
   }

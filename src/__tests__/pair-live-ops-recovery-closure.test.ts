@@ -845,29 +845,78 @@ describe("HOTFIX B — recovery boundary persists no freeform exception text", (
     ctx.store.close();
   });
 
-  it("allowlisted PairError code persists as canonical code — still zero freeform text", () => {
-    const ctx = makeCtx("rb3");
+  it("path 1 — even a namespaced PairError.code is never persisted (secret-bearing code)", () => {
+    const ctx = makeCtx("rb3a");
     const mid = startMission(ctx);
     ctx.runtime.tick(mid, FAR);
     ctx.runtime.tick(mid, FAR);
-    const pending = seedPending(ctx, mid, "RCV_rb3");
+    seedPending(ctx, mid, "RCV_rb3a");
+    const rtAny = ctx.runtime as unknown as Record<string, unknown>;
+    const origRE = (rtAny.runtimeEntity as (id: string) => unknown).bind(ctx.runtime);
+    let failNext = false;
+    rtAny.runtimeEntity = (id: string) => {
+      if (failNext) { failNext = false; throw new Error("store_read_corrupt"); }
+      return origRE(id);
+    };
+    // The CODE ITSELF carries a secret — an allowlist-regex namespace
+    // cannot prove a code is safe; this boundary emits the fixed label.
+    const secretCodeErr = new PairError(
+      "FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE",
+      "sensitive diagnostic message",
+    );
+    (rtAny.recoveryGuard as (m: string, fn: () => void, n?: string) => void)(
+      mid,
+      () => { failNext = true; throw secretCodeErr; },
+      FAR,
+    );
+    const ent = rt(ctx, mid);
+    const evs = ctx.store.listEvents("mission_runtime", `MRT_${mid}`);
+    expect(String(ent.state)).toBe("ABORTED");
+    expect(String(ent.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    expect(String(
+      (ent.aborted_recovery as Record<string, unknown>).aborted_reason,
+    )).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    for (const s of ["AKIAIOSFODNN7EXAMPLE", "sensitive diagnostic message"]) {
+      expect(JSON.stringify(ent)).not.toContain(s);
+      expect(JSON.stringify(evs)).not.toContain(s);
+    }
+    const reopened = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const after = reopened.get("mission_runtime", `MRT_${mid}`);
+    expect(String(after.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    expect(JSON.stringify(after)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    reopened.close();
+    ctx.store.close();
+  });
+
+  it("path 2 — secret-bearing PairError.code inside inner error also collapses to TRANSITION_FAULT", () => {
+    const ctx = makeCtx("rb3b");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    const pending = seedPending(ctx, mid, "RCV_rb3b");
     const rtAny = ctx.runtime as unknown as Record<string, unknown>;
     rtAny.handleRecoveryApplyFailure = () => {
       throw new PairError(
-        "FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR",
-        `canonical code but leaky message\n${secretText()}`,
+        "FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE",
+        "sensitive diagnostic message",
       );
     };
     (rtAny.recoveryFailureBoundary as (
       m: string, p: Record<string, unknown>, a: string, e: unknown, n?: string,
     ) => void)(mid, pending, "RE_ROUTE", new Error("outer"), FAR);
-    const ent = assertSecretFreeEverywhere(ctx, mid);
+    const ent = rt(ctx, mid);
+    const evs = ctx.store.listEvents("mission_runtime", `MRT_${mid}`);
     expect(String(ent.state)).toBe("ABORTED");
-    // Canonical namespaced code survives as the diagnostic label...
-    expect(String(ent.reason)).toBe(
-      "recovery_boundary_defect:FAIL_CLOSED_NO_ELIGIBLE_EXECUTOR",
-    );
-    // ...while the secret-bearing message text survives nowhere.
+    expect(String(ent.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    for (const s of ["AKIAIOSFODNN7EXAMPLE", "sensitive diagnostic message"]) {
+      expect(JSON.stringify(ent)).not.toContain(s);
+      expect(JSON.stringify(evs)).not.toContain(s);
+    }
+    const reopened = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    expect(String(
+      reopened.get("mission_runtime", `MRT_${mid}`).reason,
+    )).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    reopened.close();
     ctx.store.close();
   });
 });
