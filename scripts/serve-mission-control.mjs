@@ -893,6 +893,9 @@ const server = createMissionControlServer({
   // always on; entities live in the canonical store alongside missions.
   business,
   workforce,
+  // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
+  // the P15.6 operating service lazily on first trigger (P15.7).
+  store,
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

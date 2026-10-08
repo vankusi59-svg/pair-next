@@ -19,6 +19,13 @@ import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
 import type { BusinessLayer } from "./business.js";
 import type { WorkforceService } from "./work-graph.js";
+import type { PairEvidenceStore } from "./store.js";
+import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import { ObjectiveWorkstreamService } from "./objective-workstream.js";
+import {
+  createDefaultObjectiveOperatingService,
+  type ObjectiveOperatingService,
+} from "./objective-operating-loop.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -82,6 +89,14 @@ export interface MissionControlServerDeps {
    *  work items (P14 Workforce V2 Phase 1). Coordinates only — never
    *  dispatches. */
   workforce?: WorkforceService;
+  /** Canonical evidence store — needed to compose the P15.6 operating
+   *  service for /api/vnext/objectives/:id/ceo-cycle (P15.7). */
+  store?: PairEvidenceStore;
+  /** TEST-ONLY: deterministic CEO decision transport for the
+   *  lazily-composed operating service. Production bootstrap never
+   *  sets it (the route resolves the real codex-cli model); HTTP
+   *  callers can never inject it — it is a server-wiring dep only. */
+  ceoInvoker?: CeoDecisionInvoker;
 }
 
 const MIME: Record<string, string> = {
@@ -315,6 +330,11 @@ export function createMissionControlServer(
   deps: MissionControlServerDeps,
 ): http.Server {
   const c = deps.control;
+  // P15.7 — lazily-composed CEO operating service: built on the FIRST
+  // ceo-cycle call so an unavailable/unqualified CEO model fails
+  // closed on that route alone and can never take the server down at
+  // boot. Resolved once, then cached for the process lifetime.
+  let ceoOps: { service: ObjectiveOperatingService; model_entry_id: string } | null = null;
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
@@ -1120,6 +1140,70 @@ export function createMissionControlServer(
           target: String(body.target ?? "") || undefined,
           operator_id: String(operator),
         }));
+      }
+      // ----- P15.7 — canonical vnext Objective API (P15.1 authority) -----
+      // Distinct namespace from the legacy /api/objectives compat API;
+      // both delegate to the same P15.1 ObjectiveAuthorityService.
+      if (method === "GET" && p === "/api/vnext/objectives") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const bid = url.searchParams.get("business_id") ?? undefined;
+        const rows = biz.objectives.list(bid);
+        // Strict canonical read — a corrupt row rejects the whole list
+        // rather than being silently trusted or silently discarded.
+        for (const r of rows) biz.objectives.assertCanonicalRow(r);
+        return void json(res, 200, { objectives: rows });
+      }
+      if (method === "POST" && p === "/api/vnext/objectives") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.objectives.create({
+          business_id: String(body.business_id ?? ""),
+          title: body.title === undefined ? undefined : String(body.title),
+          description: body.description === undefined ? undefined : String(body.description),
+          statement: body.statement === undefined ? undefined : String(body.statement),
+          parent_objective_id: body.parent_objective_id === undefined ? undefined : String(body.parent_objective_id),
+          owner_authority_id: body.owner_authority_id === undefined ? undefined : String(body.owner_authority_id),
+          metric: body.metric === undefined ? undefined : String(body.metric),
+          target: body.target === undefined || body.target === null ? undefined : String(body.target),
+          kpis: body.kpis === undefined ? undefined : body.kpis as Array<Record<string, unknown>>,
+          deadline: body.deadline === undefined ? undefined : body.deadline as string | null,
+          budget_ceiling_microusd: body.budget_ceiling_microusd === undefined ? undefined : Number(body.budget_ceiling_microusd),
+          currency: body.currency === undefined ? undefined : String(body.currency),
+          // Pass-through, never coerced: P15.1 normalizeStringList is the
+          // canonical validator — a scalar or non-string element rejects
+          // the whole create (F1).
+          hard_constraints: body.hard_constraints as string[] | undefined,
+          success_conditions: body.success_conditions as string[] | undefined,
+          stop_conditions: body.stop_conditions as string[] | undefined,
+          dedup_key: body.dedup_key === undefined ? undefined : String(body.dedup_key),
+          operator_id: String(operator),
+        }));
+      }
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)$/);
+      if (method === "GET" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.objectives.get(m[1]));
+      }
+      // ----- P15.7 — CEO operating trigger (ONE bounded pass) -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/ceo-cycle$/);
+      if (method === "POST" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "OPERATING_LOOP_DISABLED" });
+        }
+        ceoOps ??= createDefaultObjectiveOperatingService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          invoker: deps.ceoInvoker,
+        });
+        const out = await ceoOps.service.runObjectivePass({
+          objective_id: m[1], actor: String(operator),
+        });
+        return void json(res, 200, out);
       }
       if (method === "GET" && p === "/api/budgets") {
         const bid = url.searchParams.get("business_id") ?? undefined;
