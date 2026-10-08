@@ -1263,14 +1263,16 @@ export class ObjectiveAdaptiveReviewService {
     // Activity/exhaustion are derived from canonical lifecycle evidence
     // re-proven inside buildReviewObservation (never raw status text).
     const anyActive = observation.workstreams.some((w) =>
-      // §R3.A — activity is derived ONLY from the canonical lifecycle
-      // class proven at observation build: ACTIVE = in-flight or
-      // review-pending work. INTERVENTION (BLOCKED / PAUSED-bound /
-      // terminal-fold pending) is never progress; EXHAUSTED never is.
+      // §R4.A — activity is ONLY actual canonical executable progress:
+      // the P15.4 delegated child's proven lifecycle class. A P15.2
+      // container is non-executable — its READY status (even canonically
+      // derived, e.g. after a block→unblock cycle) never proves work is
+      // flowing. Container IN_PROGRESS is already proven to require an
+      // ACTIVE child at observation build (else fail closed), so it
+      // adds nothing the class doesn't carry. A canonically grounded
+      // REVIEW_REQUIRED container genuinely awaits governed review.
       w.delegated_child_class === "ACTIVE" ||
-      w.workstream_status === "IN_PROGRESS" ||
-      w.workstream_status === "REVIEW_REQUIRED" ||
-      w.workstream_status === "READY");
+      w.workstream_status === "REVIEW_REQUIRED");
     const allExhausted = observation.workstreams.length > 0 &&
       observation.workstreams.every((w) =>
         w.completion_proven ||

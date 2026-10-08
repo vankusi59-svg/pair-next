@@ -1586,3 +1586,106 @@ describe("P15.5 R3.B — source review must be canonical", () => {
     s.store.close();
   });
 });
+
+describe("P15.5 R4.A — container READY is not active work", () => {
+  it("53. unallocated container BACKLOG→block→unblock→READY → NOT AWAITING (CEO path)", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, review } = seeded("r4a1", inv);
+    const w1 = wsWorkItemId(binding, "w1");
+    // Canonical block/unblock cycle on the NON-EXECUTABLE container.
+    s.biz.blockWorkItem(w1, "container pause", OP);
+    s.biz.unblockWorkItem(w1, OP); // canonical READY — derived, but not work
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("AWAITING_PROGRESS");
+    expect(r.outcome).toBe("WAIT"); // normal CEO path reached
+    expect(inv.inputs.length).toBe(1);
+    s.store.close();
+  });
+
+  it("54. child BLOCKED + container canonical block→unblock READY → NOT AWAITING", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, review } = seeded("r4a2", inv);
+    const w1 = wsWorkItemId(binding, "w1");
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.blockWorkItem(childId, "child blocked", OP); // child INTERVENTION
+    s.biz.blockWorkItem(w1, "container pause", OP);    // container BLOCKED
+    s.biz.unblockWorkItem(w1, OP);                     // container READY
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("AWAITING_PROGRESS");
+    expect(r.outcome).toBe("WAIT"); // CEO path still reachable
+    s.store.close();
+  });
+
+  it("55. fresh delegated child READY → still AWAITING_PROGRESS", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r4a3", inv);
+    await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("AWAITING_PROGRESS");
+    s.store.close();
+  });
+
+  it("56. real delegated child IN_PROGRESS + RUNNING mission → still AWAITING", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const s = freshFullStack("r4a4");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const review = reviewStack(s, inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP);
+    const mid = String((s.store.get("work_item", childId).mission_ids as string[])[0]);
+    s.service.transitionMission(mid, "READY", `OPERATOR:${OP}`);
+    s.service.transitionMission(mid, "RUNNING", `OPERATOR:${OP}`);
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("AWAITING_PROGRESS");
+    s.store.close();
+  });
+
+  it("57. REVIEW_REQUIRED grounding enforced — forged claims fail closed", async () => {
+    // A P15.2 container cannot mint REVIEW_REQUIRED canonically today
+    // (decomposeObjective carries no requires_review). The intended
+    // behavior that IS reachable: any REVIEW_REQUIRED claim must carry
+    // the canonical derivation + completion-basis grounding — a raw
+    // claim fails closed instead of faking "awaiting review" activity.
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, review } = seeded("r4a5", inv);
+    const w1 = wsWorkItemId(binding, "w1");
+    sqlRewriteEntity(s.store, "work_item", w1, (b) => {
+      b.status = "REVIEW_REQUIRED";
+    });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("58. forged child REVIEW_REQUIRED → fail closed", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r4a6", inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    sqlRewriteEntity(s.store, "work_item",
+      String(a.delegated_child_work_item_id), (b) => {
+        b.status = "REVIEW_REQUIRED";
+      });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    s.store.close();
+  });
+});
