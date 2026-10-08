@@ -155,7 +155,7 @@ const OPEN_RECONCILE_GRACE_MS = Number(process.env.PAIR_OPEN_RECONCILE_GRACE_MS 
 /** A HELD budget reservation stops counting after this long — covers the
  *  crash gap between reserve and mission create. */
 const RESERVATION_TTL_MS = Number(process.env.PAIR_BUDGET_RESERVATION_MS ?? 10 * 60 * 1000);
-const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+export const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 /** Terminal work-item statuses — no transition out exists. */
 export const TERMINAL_WORK_ITEM_STATUSES: ReadonlySet<string> = new Set(["DONE", "CANCELLED"]);
 /** Context notes kept per org_agent; newest kept, oldest trimmed. */
@@ -672,6 +672,14 @@ export class BusinessLayer {
     const ready = childrenDone &&
       (missionDone === true || (missionDone === null && childIds.length > 0));
     return { ready, mission, childIds, basisDigest, rejected };
+  }
+
+  /** Read-only completion-basis projection — the canonical grounding a
+   *  REVIEW_REQUIRED/DONE claim must satisfy (basis ready + not
+   *  rejected). Never mutates; corrupt rows evaluate unready. */
+  completionBasisProof(row: Row): { ready: boolean; rejected: boolean } {
+    const b = this.completionBasisSafe(row);
+    return { ready: b.ready, rejected: b.rejected };
   }
 
   /** Basis that never throws — corrupt child rows evaluate unready. */
