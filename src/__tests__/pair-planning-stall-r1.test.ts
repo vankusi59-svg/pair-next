@@ -617,10 +617,12 @@ describe("R2.A — terminal pair commits atomically or not at all", () => {
     expect(() =>
       assertCanonicalMissionLifecycle(ctx.store, mission, "FAILED"),
     ).not.toThrow();
-    // Evidence was re-persisted inside the fallback commit.
+    // Evidence was re-persisted inside the fallback commit, marked
+    // with the canonical-fallback terminal class.
     const pf = rt.planning_failure as Record<string, unknown>;
     expect(String(pf.code)).toBe("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED");
     expect(Number(pf.attempts)).toBe(1);
+    expect(String(pf.terminal_class)).toBe("ABORTED_FALLBACK");
     ctx.store.close();
   });
 
@@ -667,17 +669,36 @@ describe("R2.A — terminal pair commits atomically or not at all", () => {
     );
     spy.mockRestore();
     const rt = rtOf(ctx, mid);
+    const mission = ctx.service.getMission(mid);
     // The fallback transaction rolled back too (its mission-sync call
     // faulted) — the last-resort EMERGENCY row stands. Nothing half-
     // committed: ZERO phantom FAILED transitions on either spine, and
     // the abort is operator-visible forensic evidence.
     expect(String(rt.state)).toBe("ABORTED");
+    // Mission could NOT be moved — and nothing claims otherwise: the
+    // evidence is explicitly marked as a BLOCKED_TRANSITION degraded
+    // terminal, not a proven canonical pairing (R3.A).
+    expect(String(mission.status)).toBe("CREATED");
+    const pf = rt.planning_failure as Record<string, unknown>;
+    expect(String(pf.terminal_class)).toBe("BLOCKED_TRANSITION");
+    expect(String(rt.reason)).toBe(
+      "planning_failure_boundary_defect:TRANSITION_FAULT",
+    );
     expect(rtTransitions(ctx, mid, "FAILED")).toHaveLength(0);
     expect(mTransitions(ctx, mid, "FAILED")).toHaveLength(0);
     const aborts = ctx.store
       .listEvents("mission_runtime", `MRT_${mid}`)
       .filter((e) => String(e.event_type) === "MISSION_RUNTIME_EMERGENCY_ABORT");
     expect(aborts.length).toBeGreaterThanOrEqual(1);
+    // Restart-durable: a fresh store connection over the same DB sees
+    // the same degraded terminal marker — no replay, no re-planning.
+    const reopened = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const rtAfter = reopened.get("mission_runtime", `MRT_${mid}`);
+    expect(String(rtAfter.state)).toBe("ABORTED");
+    expect(String(
+      (rtAfter.planning_failure as Record<string, unknown>).terminal_class,
+    )).toBe("BLOCKED_TRANSITION");
+    reopened.close();
     ctx.store.close();
   });
 });
@@ -702,64 +723,79 @@ describe("R2.B — sanitized bounded failure evidence", () => {
     ctx.store.close();
   });
 
-  it("secret-shaped material in the error is redacted before persistence", () => {
-    const SECRET = "sk_live_51AbCDeFgHiJkLmN0pQrStUvWxYz";
-    const ctx = makeCtx("secret", () => {
+  it("no freeform error text ever persists — canonical fields only (R3.B)", () => {
+    const SECRETS = [
+      "AKIAIOSFODNN7EXAMPLE", // unlabelled uppercase opaque secret
+      "ghp_x9Ab3KlmN8pQr2sTuvW7yZ", // mixed-case token
+      "hunter2hunter2hunter2", // sensitive freeform text
+    ];
+    const ctx = makeCtx("no-freeform", () => {
       throw new IntegrityError(
         "FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED",
-        `planner exploded: Bearer ${SECRET} token=${SECRET}`,
+        `planner exploded: ${SECRETS.join(" ")} ` + "x".repeat(400) + "\x00\x1f",
       );
     });
     const mid = newMission(ctx, "anything");
     ctx.runtime.tick(mid);
     expect(() => ctx.runtime.tick(mid)).toThrow();
-    const pf = rtOf(ctx, mid).planning_failure as Record<string, unknown>;
-    const persisted = String(pf.message);
-    expect(persisted).not.toContain(SECRET);
-    expect(persisted).toContain("[REDACTED]");
-    // The MISSION_PLANNING_FAILED event metadata is sanitized too.
-    const ev = planningEvents(ctx, mid)[0];
-    expect(JSON.stringify(ev)).not.toContain(SECRET);
-    ctx.store.close();
-  });
-
-  it("opaque token runs redact; uppercase domain identifiers survive", () => {
-    const BLOB = "Ab9xK2mN7pQ4rT8vW1yZ3eF6gH0jL5"; // 28-char mixed-case blob
-    const ctx = makeCtx("tokenrun", () => {
-      throw new IntegrityError(
-        "FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED",
-        `task FILE_OPERATIONS rejected; opaque ${BLOB} blob`,
-      );
-    });
-    const mid = newMission(ctx, "anything");
-    ctx.runtime.tick(mid);
-    expect(() => ctx.runtime.tick(mid)).toThrow();
-    const persisted = String(
-      (rtOf(ctx, mid).planning_failure as Record<string, unknown>).message,
+    const rt = rtOf(ctx, mid);
+    const pf = rt.planning_failure as Record<string, unknown>;
+    // The persisted record carries ONLY canonical fields — no message
+    // field exists at all; secret-freedom is by construction.
+    for (const s of SECRETS) {
+      expect(JSON.stringify(pf)).not.toContain(s);
+      expect(JSON.stringify(rt)).not.toContain(s);
+    }
+    expect(pf).not.toHaveProperty("message");
+    expect(Object.keys(pf).sort()).toEqual(
+      ["attempts", "code", "failure_class", "first_at", "last_at", "terminal_class"].sort(),
     );
-    // Capability-token-like domain identifiers are NOT treated as
-    // secrets — they stay operator-readable.
-    expect(persisted).toContain("FILE_OPERATIONS");
-    expect(persisted).not.toContain(BLOB);
+    expect(String(pf.code)).toBe("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED");
+    expect(String(pf.terminal_class)).toBe("FAILED");
+    // Event metadata carries the same canonical-only fields.
+    const ev = planningEvents(ctx, mid)[0];
+    for (const s of SECRETS) {
+      expect(JSON.stringify(ev)).not.toContain(s);
+    }
+    expect(JSON.stringify(ev)).not.toContain("message");
     ctx.store.close();
   });
 
-  it("message is bounded and control-stripped; code stays canonical", () => {
-    const ctx = makeCtx("bounded", () => {
+  it("fallback inner-error text never persists in rows, events or reasons", () => {
+    const SECRET = "sk_live_51AbCDeFgHiJkLmN0pQrStUvWxYz";
+    const ctx = makeCtx("fallback-secret", () => {
       throw new IntegrityError(
         "FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED",
-        `boom\x00\x1f ${"x".repeat(400)}`,
+        "planning blew up",
       );
     });
     const mid = newMission(ctx, "anything");
+    // Persistent mission-transition fault whose message carries a
+    // secret — reasons + evidence must carry a fixed label only.
+    vi.spyOn(ctx.service, "transitionMission").mockImplementation(() => {
+      throw new Error(`transition died: Bearer ${SECRET}`);
+    });
     ctx.runtime.tick(mid);
-    expect(() => ctx.runtime.tick(mid)).toThrow();
-    const pf = rtOf(ctx, mid).planning_failure as Record<string, unknown>;
-    const persisted = String(pf.message);
-    expect(persisted.length).toBeLessThanOrEqual(160);
-    expect(persisted).not.toContain("\x00");
-    expect(persisted).not.toContain("\x1f");
-    expect(String(pf.code)).toBe("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED");
+    expect(() => ctx.runtime.tick(mid)).toThrow(
+      /FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED/,
+    );
+    const rt = rtOf(ctx, mid);
+    expect(String(rt.state)).toBe("ABORTED");
+    // Reason is a fixed-label diagnostic — never the inner message.
+    expect(String(rt.reason)).toBe(
+      "planning_failure_boundary_defect:TRANSITION_FAULT",
+    );
+    const pf = rt.planning_failure as Record<string, unknown>;
+    expect(String(pf.terminal_class)).toBe("BLOCKED_TRANSITION");
+    expect(pf).not.toHaveProperty("message");
+    // Nothing anywhere persisted carries the inner text or the secret.
+    for (const s of [SECRET, "transition died", "Bearer"]) {
+      expect(JSON.stringify(rt)).not.toContain(s);
+    }
+    const all = ctx.store.listEvents("mission_runtime", `MRT_${mid}`);
+    for (const e of all) {
+      expect(JSON.stringify(e)).not.toContain(SECRET);
+    }
     ctx.store.close();
   });
 

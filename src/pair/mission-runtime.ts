@@ -143,36 +143,22 @@ const PLANNING_RETRYABLE_CODES = new Set(["FAIL_CLOSED_PLANNER_EXHAUSTED"]);
 const PLANNING_SAFE_CODE =
   /^(?:FAIL_CLOSED|ACP|CEO|DEVIN|LLM|CREDENTIAL|NOT_FOUND)(?:_[A-Z0-9_:.\-]*)?$/;
 const PLANNING_EVIDENCE_CODE_UNKNOWN = "PLANNING_UNCLASSIFIED";
-const PLANNING_MESSAGE_MAX = 160;
+/** Fixed diagnostic labels for persisted evidence — the ONLY values
+ *  that may carry the "why" of a terminalization. No freeform
+ *  err.message/inner.message is ever persisted (regex sanitization
+ *  alone cannot prove secret-freedom — R3.B). */
+const PLANNING_TERMINAL_FAILED = "FAILED";
+const PLANNING_TERMINAL_ABORTED_FALLBACK = "ABORTED_FALLBACK";
+const PLANNING_TERMINAL_BLOCKED = "BLOCKED_TRANSITION";
+const TRANSITION_FAULT_LABEL = "TRANSITION_FAULT";
 
-/** Credential-shaped material redacted from persisted failure
- *  fragments — applied BEFORE the bound so a redacted tail cannot leak
- *  past the slice. `PLANNING_TOKEN_RUN` skips all-uppercase domain
- *  identifiers (capability tokens, FAIL_CLOSED_* codes) — those are
- *  operator-meaningful, not secrets — and catches only mixed-case /
- *  base64-ish opaque blobs. The sanitizer is total: it never throws
- *  and never fails on capability-token-like strings. */
-const PLANNING_SECRET_LABEL =
-  /\b(?:token|secret|password|passwd|credential|authorization|bearer|apikey|api[_ -]?key)\b[\s:="'`]{0,12}[A-Za-z0-9+/=._~-]{4,}/gi;
-const PLANNING_TOKEN_RUN = /\b(?![A-Z0-9_]+\b)[A-Za-z0-9+/=_~-]{24,}\b/g;
-const PLANNING_HEX_RUN = /\b[0-9a-f]{32,}\b/gi;
-
-function sanitizePlanningMessage(err: unknown): string {
-  let s = String((err as { message?: string })?.message ?? err ?? "")
-    .normalize("NFC")
-    .replace(/[^\p{L}\p{N}\p{P}\p{Zs}]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  s = s
-    .replace(PLANNING_SECRET_LABEL, (_m: string, label: string) =>
-      `${label}=[REDACTED]`,
-    )
-    .replace(PLANNING_HEX_RUN, "[REDACTED_HEX]")
-    .replace(PLANNING_TOKEN_RUN, "[REDACTED_TOKEN]");
-  if (s.length > PLANNING_MESSAGE_MAX) {
-    s = s.slice(0, PLANNING_MESSAGE_MAX).trimEnd();
-  }
-  return s;
+/** Canonicalize a thrown fault to a fixed diagnostic label: the
+ *  error's canonical code when it is a namespaced PairError, else the
+ *  fixed TRANSITION_FAULT label. Never returns message text. */
+function faultLabel(err: unknown): string {
+  return err instanceof PairError && PLANNING_SAFE_CODE.test(err.code)
+    ? err.code
+    : TRANSITION_FAULT_LABEL;
 }
 
 export const RUNTIME_TRANSITIONS: Record<MissionRuntimeState, MissionRuntimeState[]> = {
@@ -1132,15 +1118,18 @@ export class MissionRuntime {
     const retryable =
       !code.startsWith("FAIL_CLOSED_") || PLANNING_RETRYABLE_CODES.has(code);
     const failureClass = retryable ? "TRANSIENT_CANDIDATE" : "DETERMINISTIC";
-    const message = sanitizePlanningMessage(err);
 
-    // Bounded, sanitized, deduplicated evidence — the rt.planning_failure
-    // record + its ONE-per-code MISSION_PLANNING_FAILED event are written
-    // inside every commit below, so evidence and any transition it
-    // accompanies persist atomically (CAS on the row version fails closed
-    // against a concurrent writer; a rolled-back attempt leaves zero
-    // phantom events or counter bumps).
-    const writeEvidence = (): void => {
+    // Bounded, deduplicated evidence — canonical fields ONLY: the safe
+    // code, failure class, attempt counts, timestamps and (on a
+    // terminalization commit) a fixed terminal_class label. No freeform
+    // error text is ever persisted — the evidence is secret-free by
+    // construction, not by regex. The rt.planning_failure record + its
+    // ONE-per-code MISSION_PLANNING_FAILED event are written inside
+    // every commit below, so evidence and any transition it accompanies
+    // persist atomically (CAS on the row version fails closed against a
+    // concurrent writer; a rolled-back attempt leaves zero phantom
+    // events or counter bumps).
+    const writeEvidence = (terminalClass?: string): void => {
       const rt = this.runtimeEntity(missionId);
       const prev = rt.planning_failure as Record<string, unknown> | null;
       const attempts = Number(prev?.attempts ?? 0) + 1;
@@ -1150,7 +1139,7 @@ export class MissionRuntime {
         attempts,
         first_at: String(prev?.first_at ?? utcnow()),
         last_at: utcnow(),
-        message,
+        ...(terminalClass ? { terminal_class: terminalClass } : {}),
       };
       this.store.put(
         "mission_runtime",
@@ -1169,7 +1158,7 @@ export class MissionRuntime {
             code,
             failure_class: failureClass,
             attempts,
-            message,
+            ...(terminalClass ? { terminal_class: terminalClass } : {}),
           },
         });
       }
@@ -1202,7 +1191,7 @@ export class MissionRuntime {
       // terminal pair (runtime FAILED while mission stayed CREATED) can
       // never be persisted.
       this.store.immediate(() => {
-        writeEvidence();
+        writeEvidence(PLANNING_TERMINAL_FAILED);
         this.transitionRuntime(missionId, "FAILED", `planning_failed:${code}`);
         this.deps.service.transitionMission(missionId, "FAILED", this.actor);
       });
@@ -1235,24 +1224,27 @@ export class MissionRuntime {
     missionId: string,
     code: string,
     inner: unknown,
-    writeEvidence: () => void,
+    writeEvidence: (terminalClass?: string) => void,
   ): void {
-    const msg = String((inner as { message?: string })?.message ?? inner)
-      .replace(/\s+/g, " ")
-      .slice(0, 120);
+    // Fixed diagnostic label for WHY the canonical pair failed — the
+    // inner error's canonical code when namespaced, else a fixed
+    // TRANSITION_FAULT label. Freeform inner.message is never persisted
+    // in rows, event metadata or transition reasons (R3.B).
+    const innerLabel = faultLabel(inner);
     try {
       this.store.immediate(() => {
         // The rolled-back evidence write must not be lost either —
         // operator-visible proof of WHY the mission aborted, persisted
-        // atomically with the fallback pair.
-        writeEvidence();
+        // atomically with the fallback pair. terminal_class records
+        // that this ABORTED pairing is the proven canonical result.
+        writeEvidence(PLANNING_TERMINAL_ABORTED_FALLBACK);
         const rt = this.runtimeEntity(missionId);
         const from = String(rt.state) as MissionRuntimeState;
         if ((RUNTIME_TRANSITIONS[from] ?? []).includes("ABORTED")) {
           this.transitionRuntime(
             missionId,
             "ABORTED",
-            `planning_failed_fallback:${code}:${msg}`,
+            `planning_failed_fallback:${code}:${innerLabel}`,
           );
         }
         const mission = this.deps.service.getMission(missionId);
@@ -1262,10 +1254,26 @@ export class MissionRuntime {
         }
       });
     } catch {
+      // The fallback commit itself could not land — e.g. the mission
+      // transition layer faulted persistently and rolled the whole
+      // transaction back. The runtime must still terminalize (never
+      // re-plan, never duplicate execution) but the pair is NOT a
+      // proven canonical pairing: a mission still CREATED under an
+      // ABORTED runtime is a degraded terminal. Report it honestly —
+      // durable BLOCKED_TRANSITION evidence + an EMERGENCY_ABORT row —
+      // never claim canonical completion.
+      try {
+        this.store.immediate(() => {
+          writeEvidence(PLANNING_TERMINAL_BLOCKED);
+        });
+      } catch {
+        /* even the evidence write cannot commit — store dead; the
+           EMERGENCY row attempt below is all that remains */
+      }
       try {
         this.forceAbortRuntime(
           missionId,
-          `planning_failure_boundary_defect:${msg}`,
+          `planning_failure_boundary_defect:${innerLabel}`,
         );
       } catch {
         /* the store cannot commit at all — the original planning error
