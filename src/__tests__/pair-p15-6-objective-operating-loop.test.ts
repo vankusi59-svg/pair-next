@@ -1,0 +1,1027 @@
+/**
+ * P15.6 — OBJECTIVE OPERATING LOOP — adversarial + restart + race matrix.
+ *
+ * Convention: "forging" = raw SQL rewrite of persisted rows/events,
+ * never a new service seam. Every service call that succeeds is REAL —
+ * FakeInvoker is only ever the transport boundary of the EXISTING
+ * P15.3 CEO cycle. The pass mints real WOB/missions through
+ * BusinessLayer.openWorkItem on a REAL MissionControl stack.
+ */
+
+import { describe, it, expect } from "vitest";
+import { Worker } from "node:worker_threads";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  ApprovalQueue,
+  BusinessLayer,
+  CEO_CODEX_DEFAULT_MODEL,
+  CeoDecisionInvoker,
+  type CeoInvokeInput,
+  type CeoInvokeResult,
+  CODEX_CLI_PROVIDER_ID,
+  createDefaultObjectiveOperatingService,
+  digest,
+  ensureCodexCliCatalog,
+  ExecutorRegistry,
+  GovernedTaskGate,
+  MissionControl,
+  MissionObservability,
+  MissionRouter,
+  MissionRuntime,
+  MissionScheduleService,
+  MissionScheduler,
+  MissionSupervisor,
+  ModelEvidenceCatalog,
+  OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+  OBJECTIVE_STRATEGY_REVISION_ENTITY,
+  ObjectiveAdaptiveReviewService,
+  ObjectiveWorkstreamService,
+  PairControlPlane,
+  PairEvidenceStore,
+  ProviderCatalog,
+  providerEntryId,
+  qualifyModel,
+  ReconciliationService,
+  RecoveryController,
+  WorkforceAllocationService,
+  WorkforceService,
+  WORKFORCE_ALLOCATION_ENTITY,
+} from "../pair/index.js";
+import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
+
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p156-"));
+let counter = 0;
+const OP = "1882810918";
+const OWNER = `operator:${OP}`;
+
+function dbOf(store: PairEvidenceStore) {
+  return (store as unknown as { db: import("better-sqlite3").Database }).db;
+}
+
+function sqlRewriteEntity(
+  store: PairEvidenceStore,
+  entityType: string,
+  entityId: string,
+  fn: (body: Record<string, unknown>) => void,
+): void {
+  const row = dbOf(store)
+    .prepare("SELECT payload FROM entities WHERE entity_type=? AND entity_id=?")
+    .get(entityType, entityId) as { payload: string } | undefined;
+  if (!row) throw new Error(`entity ${entityType}:${entityId} absent`);
+  const body = JSON.parse(row.payload) as Record<string, unknown>;
+  fn(body);
+  dbOf(store)
+    .prepare("UPDATE entities SET payload=?, payload_hash=? WHERE entity_type=? AND entity_id=?")
+    .run(JSON.stringify(body), digest(body), entityType, entityId);
+}
+
+type Stack = {
+  dbPath: string;
+  dir: string;
+  store: PairEvidenceStore;
+  biz: BusinessLayer;
+  wf: WorkforceService;
+  workstreams: ObjectiveWorkstreamService;
+  alloc: WorkforceAllocationService;
+};
+
+type FullStack = Stack & {
+  service: PairControlPlane;
+  control: MissionControl;
+  projectId: string;
+};
+
+/** Full governed stack — real MissionControl so openWorkItem mints
+ *  canonical bound missions. */
+function freshFullStack(name: string): FullStack {
+  const dir = path.join(ROOT, `${counter++}-${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const dbPath = path.join(dir, "pair.db");
+  const store = new PairEvidenceStore(dbPath);
+  const service = new PairControlPlane(store);
+  const gate = new GovernedTaskGate(service);
+  const registry = new ExecutorRegistry(service);
+  const router = new MissionRouter(service, gate);
+  const recovery = new RecoveryController(service);
+  const recon = new ReconciliationService(service, new Map());
+  const approvals = new ApprovalQueue(service);
+  const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
+  const planner = () => ({
+    tasks: [{ task_key: "T1", title: "t1", task_instruction: "t1",
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+  });
+  const runtime = new MissionRuntime({
+    service, gate, router, adapters: new Map(), scheduler, approvals,
+    reconciliation: recon, recovery, planner,
+  });
+  const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
+  const observability = new MissionObservability(service);
+  const control = new MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability, planner,
+  });
+  const schedules = new MissionScheduleService(service);
+  const biz = new BusinessLayer({ store, control, schedules });
+  const wf = new WorkforceService({ store, business: biz });
+  const workstreams = new ObjectiveWorkstreamService(
+    { store, business: biz, workforce: wf, objectives: biz.objectives });
+  const alloc = new WorkforceAllocationService(
+    { store, business: biz, workforce: wf, objectives: biz.objectives, workstreams });
+  const project = service.createProject({ name: "p", root_location: workspace });
+  return { dbPath, dir, store, biz, wf, workstreams, alloc, service,
+    control, projectId: String(project.project_id) };
+}
+
+function mkBusiness(s: FullStack) {
+  const b = s.biz.createBusiness({ name: `b${counter}`, project_id: s.projectId, operator_id: OP });
+  return String(b.business_id);
+}
+
+function mkObjective(
+  s: Stack, businessId: string,
+  kpis: Array<Record<string, unknown>> = [
+    { name: "ea_orders", unit: "orders", baseline: 2, target: 10 }],
+) {
+  return s.biz.objectives.create({
+    business_id: businessId,
+    title: "Tăng đơn EA trên MQL5 từ 2 lên ít nhất 10",
+    statement: "Grow EA orders on MQL5",
+    kpis,
+    deadline: "2999-01-01T00:00:00.000Z",
+    budget_ceiling_microusd: 500_000_000,
+    hard_constraints: ["Chỉ bán qua MQL5"],
+    success_conditions: ["10 orders"],
+    dedup_key: `dk-${counter}`,
+    operator_id: OP,
+  });
+}
+
+function decompose(s: Stack, oid: string, keys: string[] | Array<Record<string, unknown>>) {
+  const o = s.biz.objectives.get(oid);
+  const workstreams = keys.map((k) => typeof k === "string"
+    ? { workstream_key: k, title: `ws ${k}`, goal: `g ${k}` }
+    : k);
+  s.workstreams.decomposeObjective({
+    objective_id: oid,
+    expected_objective_version: Number(o.version),
+    expected_terms_version: Number(o.terms_version),
+    expected_objective_digest: String(o.objective_digest),
+    workstreams: workstreams as never,
+    actor: OP,
+  });
+  return s.workstreams.getBinding(oid)!;
+}
+
+function wsWorkItemId(binding: Record<string, unknown>, key: string): string {
+  const ws = (binding.workstreams as Array<Record<string, unknown>>)
+    .find((w) => String(w.workstream_key) === key)!;
+  return String(ws.work_item_id);
+}
+
+function mkAgent(s: Stack, businessId: string, opts: Record<string, unknown> = {}) {
+  return s.biz.createOrgAgent({
+    business_id: businessId,
+    title: `agent ${counter}`,
+    department: "ops",
+    operator_id: OP,
+    ...opts,
+  });
+}
+
+function recordKpi(
+  s: Stack, oid: string, kpiId: string, value: number, key?: string,
+) {
+  const bid = String(s.biz.objectives.get(oid).business_id);
+  return s.biz.objectives.recordProgress(oid, {
+    business_id: bid,
+    kpi_id: kpiId,
+    value,
+    evidence: {
+      evidence_key: key ?? `ev-${counter}`,
+      verifier: OWNER,
+      source: "operator:console",
+    },
+    actor: OWNER,
+  });
+}
+
+function expectFail(fn: () => unknown, code: string | RegExp) {
+  try {
+    fn();
+  } catch (e) {
+    if (code instanceof RegExp) {
+      expect(String((e as { code?: string }).code)).toMatch(code);
+    } else {
+      expect((e as { code?: string }).code).toBe(code);
+    }
+    return;
+  }
+  throw new Error(`expected ${String(code)} — call succeeded`);
+}
+
+function rowCount(store: PairEvidenceStore, entity: string): number {
+  return store.list(entity).length;
+}
+
+/* ---------------- CEO model seeding + fake transport ---------------- */
+
+function qualifyCodexProvider(store: PairEvidenceStore) {
+  const id = providerEntryId(CODEX_CLI_PROVIDER_ID);
+  const existing = store.tryGet("provider", id) as Record<string, unknown> | null;
+  store.put("provider", id, {
+    ...(existing ?? { provider_id: CODEX_CLI_PROVIDER_ID, entry_id: id }),
+    lifecycle_state: "QUALIFIED",
+    auth_state: "AUTH_OK",
+    health_state: "READY",
+    conditions: [],
+    probe_state: "PROBED",
+    provider_type: "LOCAL_CLI",
+    protocol_family: "CODEX_CLI",
+    endpoint_reference: "codex-cli://local",
+    configured_endpoint_identity: "codex-cli://local",
+    credential_envs: [],
+    credential_reference_name: null,
+  }, existing ? Number(existing.version) : 0);
+  new ProviderCatalog(store).issueQualificationReceipt(
+    CODEX_CLI_PROVIDER_ID, { policy_version: "test-policy", actor: "test" });
+}
+
+function seedDefaultCeoModel(store: PairEvidenceStore): string {
+  const meId = ensureCodexCliCatalog(store, CEO_CODEX_DEFAULT_MODEL, "t");
+  qualifyCodexProvider(store);
+  const mcat = new ModelEvidenceCatalog(store);
+  mcat.recordProbeReceipt({
+    probe_id: `PRB_ceo_${counter++}`,
+    model_entry_id: meId,
+    provider_id: CODEX_CLI_PROVIDER_ID,
+    result: "PASS",
+    probe_type: "text_inference",
+    capability_evidence: { text_inference: "PASS" },
+    latency_ms: 1,
+  });
+  const q = qualifyModel(store, meId, { capability_scope: ["text_inference"], actor: "t" });
+  if (!q.qualified) throw new Error(`model qualification failed: ${JSON.stringify(q.gates)}`);
+  return meId;
+}
+
+class FakeInvoker implements CeoDecisionInvoker {
+  inputs: CeoInvokeInput[] = [];
+  private queue: Array<string | ((i: CeoInvokeInput) => CeoInvokeResult | Promise<CeoInvokeResult>)>;
+  constructor(...raw: Array<string | ((i: CeoInvokeInput) => CeoInvokeResult | Promise<CeoInvokeResult>)>) {
+    this.queue = raw;
+  }
+  async invoke(input: CeoInvokeInput): Promise<CeoInvokeResult> {
+    this.inputs.push(input);
+    const item = this.queue.length > 1 ? this.queue.shift()! : this.queue[0]!;
+    const out = typeof item === "function" ? await item(input) : {
+      model_entry_id: input.transport.model_entry_id,
+      provider_id: input.transport.provider_id,
+      model_id: input.transport.model_id,
+      raw_text: item,
+    };
+    return out;
+  }
+}
+
+const decisionJson = (over: Record<string, unknown> = {}): string =>
+  JSON.stringify({
+    schema: "pair.ceo-decision.v1",
+    decision_kind: "WAIT",
+    workstreams: null,
+    priority_order: null,
+    wait_reason: "AWAITING_PROGRESS",
+    summary: null,
+    ...over,
+  });
+
+const INIT_JSON = (keys: string[] = ["w1", "w2"]) =>
+  decisionJson({
+    decision_kind: "INITIALIZE_WORKSTREAMS",
+    wait_reason: null,
+    workstreams: keys.map((k) => ({
+      workstream_key: k, title: `ws ${k}`, goal: `g ${k}`, depends_on_keys: [],
+    })),
+    priority_order: keys,
+    summary: "initialize workstreams",
+  });
+
+const WAIT_JSON = decisionJson();
+const PRIORITIZE_JSON = (order: string[]) =>
+  decisionJson({
+    decision_kind: "PRIORITIZE_EXISTING",
+    wait_reason: null,
+    priority_order: order,
+  });
+
+/** Compose the operating service through §30 wiring — ONE shared CEO
+ *  cycle for both P15.6 bootstrap and P15.5 review. */
+function opStack(s: FullStack, invoker: CeoDecisionInvoker) {
+  return createDefaultObjectiveOperatingService({
+    store: s.store, business: s.biz, workforce: s.wf,
+    objectives: s.biz.objectives, workstreams: s.workstreams,
+    invoker,
+  }).service;
+}
+
+function seeded(
+  name: string,
+  invoker: CeoDecisionInvoker,
+  keys: Array<string | Record<string, unknown>> = [
+    "w1", { workstream_key: "w2", title: "w2", goal: "g2", depends_on_keys: ["w1"] }],
+  kpis?: Array<Record<string, unknown>>,
+) {
+  const s = freshFullStack(name);
+  const bid = mkBusiness(s);
+  const o = mkObjective(s, bid, kpis);
+  const oid = String(o.objective_id);
+  const binding = decompose(s, oid, keys as never);
+  const agent = mkAgent(s, bid);
+  seedDefaultCeoModel(s.store);
+  const ops = opStack(s, invoker);
+  return { s, oid, bid, binding, agent, ops, invoker };
+}
+
+/** The delegated child pinned by a workstream's canonical WAL. */
+function childOfKey(
+  s: Stack, binding: Record<string, unknown>, key: string,
+): string {
+  const wid = wsWorkItemId(binding, key);
+  const wal = s.store.list(WORKFORCE_ALLOCATION_ENTITY)
+    .find((r) =>
+      String((r as Record<string, unknown>).workstream_work_item_id) === wid) as
+      Record<string, unknown> | undefined;
+  if (!wal) throw new Error(`no WAL for ${key}`);
+  return String(wal.delegated_child_work_item_id);
+}
+
+function boundMissionId(s: Stack, childId: string): string {
+  const row = s.store.get("work_item", childId);
+  const mission = s.biz.boundMissionForWorkItem(row);
+  if (!mission) throw new Error(`no bound mission for ${childId}`);
+  return String(mission.mission_id);
+}
+
+/** Drive mission mid to canonical RUNNING. */
+function missionRunning(s: FullStack, mid: string) {
+  if (String(s.store.get("mission", mid).status) === "CREATED") {
+    s.service.transitionMission(mid, "READY", `OPERATOR:${OP}`);
+  }
+  s.service.transitionMission(mid, "RUNNING", `OPERATOR:${OP}`);
+}
+
+/** Fold a workstream's delegated child to canonical DONE: open,
+ *  complete the bound mission, sync + cascade through the real seams. */
+function completeWorkstream(s: FullStack, binding: Record<string, unknown>, key: string) {
+  const cid = childOfKey(s, binding, key);
+  const row = s.store.get("work_item", cid);
+  if (String(row.status) === "READY") {
+    s.biz.openWorkItem(cid, OP);
+  }
+  const mid = boundMissionId(s, cid);
+  canonicallyCompleteMission(s.store, s.service, mid);
+  s.biz.syncWorkItem(cid);
+  s.biz.advanceCompletionCascade(cid);
+  return cid;
+}
+
+/* ============================ TESTS ============================ */
+
+describe("P15.6 §31 — end-to-end initial objective", () => {
+  it("1. ACTIVE objective → CEO INITIALIZE → binding → allocate → open → ONE mission", async () => {
+    const inv = new FakeInvoker(INIT_JSON(["w1", "w2"]));
+    const s = freshFullStack("e2e");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const ops = opStack(s, inv);
+
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(r.workstream_key).toBe("w1");
+    expect(inv.inputs.length).toBe(1); // exactly ONE CEO call
+
+    const binding = s.workstreams.getBinding(oid)!;
+    expect(binding).toBeTruthy();
+    // Root + containers never opened
+    const root = s.store.get("work_item", String(binding.root_work_item_id));
+    expect(String(root.status)).not.toBe("IN_PROGRESS");
+    const w1id = wsWorkItemId(binding, "w1");
+    const w1 = s.store.get("work_item", w1id);
+    expect(String(w1.status)).not.toBe("IN_PROGRESS"); // container — never opened
+    // Exactly one WAL / WDEL / WOB / Mission for the child
+    const wals = s.store.list(WORKFORCE_ALLOCATION_ENTITY)
+      .filter((x) => String((x as Record<string, unknown>).objective_id) === oid);
+    expect(wals.length).toBe(1);
+    const childId = String((wals[0] as Record<string, unknown>).delegated_child_work_item_id);
+    expect(childId.startsWith("DL_")).toBe(true);
+    const child = s.store.get("work_item", childId);
+    expect(String(child.status)).toBe("IN_PROGRESS");
+    expect(String(child.assignee_agent_id)).toBeTruthy();
+    const wobs = s.store.list("work_open_binding")
+      .filter((x) => String((x as Record<string, unknown>).work_item_id) === childId);
+    expect(wobs.length).toBe(1);
+    const missions = s.store.list("mission");
+    expect(missions.length).toBe(1);
+    const mid = boundMissionId(s, childId);
+    expect(String(r.mission_id)).toBe(mid);
+    const mission = s.store.get("mission", mid);
+    expect(String((mission.metadata as Record<string, unknown>).work_item_id)).toBe(childId);
+    // Zero executor routing / telegram writes by the pass itself
+    expect(rowCount(s.store, "routing_decision")).toBe(0);
+    expect(rowCount(s.store, "telegram_delivery")).toBe(0);
+    s.store.close();
+  });
+});
+
+describe("P15.6 §32 — restart convergence", () => {
+  it("2. restart-A: INITIALIZE committed, no allocation → continue, no 2nd CEO call", async () => {
+    const inv = new FakeInvoker(INIT_JSON());
+    const s = freshFullStack("ra");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const ops = opStack(s, inv);
+    // Simulate: CEO INITIALIZE already committed by an earlier pass.
+    const cycle = await (await import("../pair/index.js")).createDefaultCeoPlanningCycle({
+      store: s.store, business: s.biz, workforce: s.wf, invoker: inv,
+    }).service.runCycle({ objective_id: oid, actor: OP });
+    expect(String(cycle.decision.decision_kind)).toBe("INITIALIZE_WORKSTREAMS");
+    expect(inv.inputs.length).toBe(1);
+    // Crash — next pass continues from the binding, zero new CEO call.
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(inv.inputs.length).toBe(1); // no second CEO initialization
+    expect(s.store.list("mission").length).toBe(1);
+    s.store.close();
+  });
+
+  it("3. restart-B: WAL + canonical READY child, no mission → open exact same child", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, ops } = seeded("rb", inv);
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const childId = String(a.delegated_child_work_item_id);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(r.delegated_child_work_item_id).toBe(childId); // exact child
+    expect(inv.inputs.length).toBe(0); // zero CEO/model calls — §13
+    expect(s.store.list("mission").length).toBe(1);
+    s.store.close();
+  });
+
+  it("4. restart-C: live bound mission → AWAITING_EXECUTION, zero new Mission", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, ops } = seeded("rc", inv);
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP);
+    const mid = boundMissionId(s, childId);
+    missionRunning(s, mid);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("AWAITING_EXECUTION");
+    expect(r.mission_id).toBe(mid);
+    expect(s.store.list("mission").length).toBe(1);
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("5. restart-D: terminal mission, child IN_PROGRESS → fold + cascade → dispatch w2", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, ops } = seeded("rd", inv);
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP);
+    const mid = boundMissionId(s, childId);
+    canonicallyCompleteMission(s.store, s.service, mid);
+    // Crash BEFORE sync — child still IN_PROGRESS with terminal mission.
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    // fold happened through existing sync/cascade; w1 exhausted → w2
+    // (depends w1) is now unlockable → non-bootstrap → P15.5 review runs
+    // first per §12; FakeInvoker WAIT → WAITING.
+    expect(["DISPATCHED", "WAITING", "AWAITING_EXECUTION"]).toContain(r.outcome);
+    const c1 = s.store.get("work_item", childId);
+    expect(String(c1.status)).not.toBe("IN_PROGRESS"); // folded
+    // No duplicate mission for child 1
+    const wobs = s.store.list("work_open_binding")
+      .filter((x) => String((x as Record<string, unknown>).work_item_id) === childId);
+    expect(wobs.length).toBe(1);
+    s.store.close();
+  });
+
+  it("6. restart-E: committed PRIORITIZE strategy → pass consumes same strategy order", async () => {
+    const inv = new FakeInvoker(PRIORITIZE_JSON(["w2", "w1"]));
+    const { s, oid, binding, ops } = seeded("re", inv, ["w1", "w2"]); // both independent
+    // Commit the strategy through the canonical P15.5 path.
+    const review = new ObjectiveAdaptiveReviewService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      ceoCycle: (await import("../pair/index.js")).createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: inv,
+      }).service,
+    });
+    const rev = await review.runReview({ objective_id: oid, actor: OP });
+    expect(rev.outcome).toBe("PRIORITIZE_EXISTING");
+    expect(rev.strategy_revision).toBeTruthy();
+    // Crash before launch — next pass consumes the SAME strategy.
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(r.workstream_key).toBe("w2"); // actionable_order [w2,w1]
+    expect(s.store.list("mission").length).toBe(1);
+    s.store.close();
+  });
+});
+
+describe("P15.6 §33 — strategy application", () => {
+  it("7. strategy [w2,w1] both ready → w2 opens first, w1 does not (max dispatch 1)", async () => {
+    const inv = new FakeInvoker(PRIORITIZE_JSON(["w2", "w1"]));
+    const { s, oid, ops } = seeded("st1", inv, ["w1", "w2"]);
+    // Allocate w2 only — WAL exists → launchable path opens w2.
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w2", actor: OP });
+    // Commit strategy w2>w1 via canonical review.
+    const review = new ObjectiveAdaptiveReviewService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      ceoCycle: (await import("../pair/index.js")).createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: inv,
+      }).service,
+    });
+    await review.runReview({ objective_id: oid, actor: OP });
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(r.workstream_key === undefined || r.workstream_key === "w2").toBe(true);
+    expect(s.store.list("mission").length).toBe(1); // w1 never dispatched
+    s.store.close();
+  });
+
+  it("8. no strategy → canonical binding order dispatch", async () => {
+    const inv = new FakeInvoker(INIT_JSON(["w1", "w2"]));
+    const s = freshFullStack("st2");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const ops = opStack(s, inv);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    const binding = s.workstreams.getBinding(oid)!;
+    const first = String((binding.workstreams as Array<Record<string, unknown>>)[0]!.workstream_key);
+    expect(r.workstream_key).toBe(first);
+    s.store.close();
+  });
+
+  it("9. strategy head dependency_blocked → next independent item dispatches", async () => {
+    const inv = new FakeInvoker(PRIORITIZE_JSON(["w2", "w1"]));
+    const { s, oid, binding, ops } = seeded("st3", inv,
+      ["w1", { workstream_key: "w2", title: "w2", goal: "g2", depends_on_keys: ["w1"] }]);
+    const review = new ObjectiveAdaptiveReviewService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      ceoCycle: (await import("../pair/index.js")).createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: inv,
+      }).service,
+    });
+    const rev = await review.runReview({ objective_id: oid, actor: OP });
+    expect(rev.outcome).toBe("PRIORITIZE_EXISTING");
+    expect(rev.strategy_revision!.actionable_order).toEqual(["w2", "w1"]);
+    // w2 depends on incomplete w1 → dependency_blocked → w1 dispatches.
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(r.workstream_key).toBe("w1");
+    expect(r.blocked_workstream_keys).toEqual(["w2"]);
+    s.store.close();
+  });
+
+  it("10. forged latest strategy → fail closed", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, ops } = seeded("st4", inv);
+    // Forge a strategy revision row attributed to this objective.
+    s.store.put(OBJECTIVE_STRATEGY_REVISION_ENTITY, "SR_FORGED", {
+      schema: "pair.os.vnext.strategy-revision.v1",
+      strategy_revision_id: "SR_FORGED",
+      objective_id: oid,
+      review_id: "REV_FAKE",
+      previous_revision_id: null,
+      priority_order: ["w2", "w1"],
+      actionable_order: ["w2", "w1"],
+      reason: "forged",
+      created_at: "t", created_by: "x", version: 0,
+    }, 0);
+    await expect(
+      ops.runObjectivePass({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: /FAIL_CLOSED/ });
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("11. strategy changes only through canonical P15.5 → next pass follows it", async () => {
+    const inv = new FakeInvoker(
+      PRIORITIZE_JSON(["w2", "w1"]),
+      PRIORITIZE_JSON(["w1", "w2"]),
+    );
+    const { s, oid, ops } = seeded("st5", inv, ["w1", "w2"]);
+    const review = new ObjectiveAdaptiveReviewService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      ceoCycle: (await import("../pair/index.js")).createDefaultCeoPlanningCycle({
+        store: s.store, business: s.biz, workforce: s.wf, invoker: inv,
+      }).service,
+    });
+    const r1 = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r1.outcome).toBe("PRIORITIZE_EXISTING");
+    const pass1 = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(pass1.outcome).toBe("DISPATCHED");
+    expect(pass1.workstream_key).toBe("w2");
+    // w2 now has a live bound mission → AWAITING; move state forward:
+    // complete w2 canonically, then a NEW canonical P15.5 review flips
+    // priority to w1 (different observation → new model call).
+    completeWorkstream(s, s.workstreams.getBinding(oid)!, "w2");
+    const r2 = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r2.outcome).toBe("PRIORITIZE_EXISTING");
+    const pass2 = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(pass2.outcome).toBe("DISPATCHED");
+    expect(pass2.workstream_key).toBe("w1");
+    s.store.close();
+  });
+});
+
+describe("P15.6 §34 — stop boundaries", () => {
+  it("12. all KPI targets canonically MET → TARGET_MET_CANDIDATE, zero alloc/open", async () => {
+    const inv = new FakeInvoker(INIT_JSON());
+    const { s, oid, ops } = seeded("sb1", inv);
+    recordKpi(s, oid, "KPI_1", 10, "ev-met");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("TARGET_MET_CANDIDATE");
+    expect(r.owner_action_required).toBe(true);
+    // Committed via the canonical P15.5 review
+    expect(rowCount(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY)).toBe(1);
+    expect(s.store.list("mission").length).toBe(0);
+    expect(s.store.list(WORKFORCE_ALLOCATION_ENTITY).length).toBe(0);
+    s.store.close();
+  });
+
+  it("12b. targets MET pre-binding → non-authoritative TARGET_MET, zero CEO call", async () => {
+    const inv = new FakeInvoker(INIT_JSON());
+    const s = freshFullStack("sb1b");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    recordKpi(s, oid, "KPI_1", 10, "ev-met2");
+    const ops = opStack(s, inv);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("TARGET_MET_CANDIDATE");
+    expect(inv.inputs.length).toBe(0); // ZERO CEO initialization
+    expect(s.workstreams.getBinding(oid)).toBeNull();
+    s.store.close();
+  });
+
+  it("13. budget exhausted → OBJECTIVE_BUDGET_EXHAUSTED, zero Mission/CEO", async () => {
+    const inv = new FakeInvoker(INIT_JSON());
+    const s = freshFullStack("sb2");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    // Canonical spend up to the ceiling.
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-x",
+      amount_microusd: 500_000_000, actor: "op",
+    });
+    const ops = opStack(s, inv);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("OBJECTIVE_BUDGET_EXHAUSTED");
+    expect(inv.inputs.length).toBe(0);
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("14. P15.5 WAIT → zero new Mission", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, ops } = seeded("sb3", inv);
+    // Bootstrap exception does NOT apply — seed a review so the pass
+    // must consult P15.5 before allocating (binding + zero launchable).
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    // child BLOCKED → intervention; nothing launchable; WAL exists → not bootstrap.
+    const wal = s.store.list(WORKFORCE_ALLOCATION_ENTITY)
+      .find((x) => String((x as Record<string, unknown>).objective_id) === oid)!;
+    const cid = String((wal as Record<string, unknown>).delegated_child_work_item_id);
+    s.biz.blockWorkItem(cid, "op block", OP);
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("WAITING");
+    expect(inv.inputs.length).toBe(1); // one bounded review model call
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("15. TOPOLOGY_CHANGE_REQUIRED → zero graph mutation / zero Mission", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, ops } = seeded("sb4", inv, ["w1"]);
+    // Complete w1 canonically while KPIs still GAP → exhausted+gap → TOPOLOGY.
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    completeWorkstream(s, binding, "w1");
+    const bindingBefore = s.workstreams.getBinding(oid)!;
+    recordKpi(s, oid, "KPI_1", 5, "ev-gap"); // verified GAP (5 < 10)
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("TOPOLOGY_CHANGE_REQUIRED");
+    expect(s.store.list("mission").length).toBe(1); // only the completed one
+    const bindingAfter = s.workstreams.getBinding(oid)!;
+    expect(String(bindingAfter.binding_id)).toBe(String(bindingBefore.binding_id));
+    s.store.close();
+  });
+
+  it("16. INSUFFICIENT_VERIFIED_PROGRESS → zero Mission", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, ops } = seeded("sb5", inv, ["w1"], [
+      { name: "a", unit: "u", baseline: 0, target: 10 },
+      { name: "b", unit: "u", baseline: 0, target: 5 },
+    ]);
+    // w1 complete; KPI_1 met, KPI_2 UNVERIFIED (no evidence) → INSUFFICIENT.
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    completeWorkstream(s, binding, "w1");
+    recordKpi(s, oid, "KPI_1", 10, "ev-a");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("INSUFFICIENT_VERIFIED_PROGRESS");
+    expect(s.store.list("mission").length).toBe(1);
+    s.store.close();
+  });
+
+  it("17. REVIEW_REQUIRED claim → never auto-ACCEPT/REWORK (forged claim fails closed)", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, ops } = seeded("sb6", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = childOfKey(s, s.workstreams.getBinding(oid)!, "w1");
+    s.biz.openWorkItem(cid, OP);
+    const mid = boundMissionId(s, cid);
+    canonicallyCompleteMission(s.store, s.service, mid);
+    s.biz.syncWorkItem(cid); // honest fold → DONE
+    // A forged REVIEW_REQUIRED claim contradicts the derived DONE state
+    // — the strict observation fails closed BEFORE any auto action.
+    sqlRewriteEntity(s.store, "work_item", cid, (b) => { b.status = "REVIEW_REQUIRED"; });
+    await expect(
+      ops.runObjectivePass({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: /FAIL_CLOSED/ });
+    s.store.close();
+  });
+
+  it("18. OBJECTIVE_NOT_ACTIVE → zero CEO/allocation/open", async () => {
+    const inv = new FakeInvoker(INIT_JSON());
+    const { s, oid, bid, ops } = seeded("sb7", inv);
+    const o = s.biz.objectives.get(oid);
+    s.biz.objectives.transitionStatus(oid, {
+      business_id: bid, to: "CANCELLED",
+      expected_objective_version: Number(o.version),
+      expected_objective_digest: String(o.objective_digest),
+      actor: OWNER, reason: "op cancel",
+    });
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("OBJECTIVE_NOT_ACTIVE");
+    expect(inv.inputs.length).toBe(0);
+    expect(s.store.list(WORKFORCE_ALLOCATION_ENTITY).length).toBe(0);
+    s.store.close();
+  });
+});
+
+describe("P15.6 §35 — execution lifecycle states", () => {
+  it("19. PAUSED bound mission → not active progress, no duplicate open", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, ops } = seeded("lc1", inv, ["w1"]);
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(cid, OP);
+    const mid = boundMissionId(s, cid);
+    missionRunning(s, mid);
+    s.control.pauseMission(mid, OP);
+    expect(String(s.store.get("mission", mid).status)).toBe("PAUSED");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("AWAITING_EXECUTION"); // PAUSED ≠ progress
+    expect(r.outcome).not.toBe("DISPATCHED");
+    expect(s.store.list("mission").length).toBe(1); // no duplicate
+    s.store.close();
+  });
+
+  it("20. forged child READY→IN_PROGRESS claim without mission → fail closed", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, ops } = seeded("lc2", inv, ["w1"]);
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = String(a.delegated_child_work_item_id);
+    sqlRewriteEntity(s.store, "work_item", cid, (b) => { b.status = "IN_PROGRESS"; });
+    await expect(
+      ops.runObjectivePass({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: /FAIL_CLOSED/ });
+    s.store.close();
+  });
+
+  it("21. forged child DONE without WCP → fail closed; deps never unlock", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, ops } = seeded("lc3", inv);
+    const a = s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = String(a.delegated_child_work_item_id);
+    sqlRewriteEntity(s.store, "work_item", cid, (b) => { b.status = "DONE"; });
+    await expect(
+      ops.runObjectivePass({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: /FAIL_CLOSED/ });
+    // w2 still dependency-blocked — forged DONE never unlocks.
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+});
+
+describe("P15.6 §20/§38 — race convergence + no executor bypass", () => {
+  it("22. production diff never references router/executor seams", () => {
+    const raw = fs.readFileSync(
+      path.join(process.cwd(), "src/pair/objective-operating-loop.ts"), "utf8");
+    // Strip comments — the doc header legitimately NAMES the seams it
+    // must never call; what matters is code, not prose.
+    const src = raw
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
+    for (const forbidden of [
+      "MissionRouter", "CapabilityRouter", ".route(",
+      "CodexExecutor", "DevinExecutor", "DshExecutor", "Hermes",
+      "executor_id", "selected_executor",
+      "startMission(", "telegram", "Telegram",
+    ]) {
+      expect(src.includes(forbidden), `source contains ${forbidden}`).toBe(false);
+    }
+    // The ONLY execution crossing.
+    expect(src.includes("openWorkItem")).toBe(true);
+  });
+});
+
+/* ---------- §37 — REAL concurrency: two worker_threads, two stores ---------- */
+
+const RACE_CACHE = path.join(process.cwd(), "node_modules", ".cache", "pair-p156-race");
+const RACE_BUNDLE = path.join(RACE_CACHE, "pair-bundle.mjs");
+const RACE_WORKER = path.join(RACE_CACHE, "race-worker.mjs");
+
+const RACE_WORKER_SOURCE = `
+import { workerData, parentPort } from "node:worker_threads";
+import * as PAIR from "./pair-bundle.mjs";
+
+const { dbPath, barrier, args, projectId } = workerData;
+const store = new PAIR.PairEvidenceStore(dbPath);
+const service = new PAIR.PairControlPlane(store);
+const gate = new PAIR.GovernedTaskGate(service);
+const registry = new PAIR.ExecutorRegistry(service);
+const router = new PAIR.MissionRouter(service, gate);
+const recovery = new PAIR.RecoveryController(service);
+const recon = new PAIR.ReconciliationService(service, new Map());
+const approvals = new PAIR.ApprovalQueue(service);
+const scheduler = new PAIR.MissionScheduler(service, { mission_concurrency: 2 });
+const planner = () => ({ tasks: [] });
+const runtime = new PAIR.MissionRuntime({
+  service, gate, router, adapters: new Map(), scheduler, approvals,
+  reconciliation: recon, recovery, planner,
+});
+const supervisor = new PAIR.MissionSupervisor(service, runtime, recovery, recon);
+const observability = new PAIR.MissionObservability(service);
+const control = new PAIR.MissionControl({
+  service, runtime, supervisor, scheduler, approvals,
+  reconciliation: recon, observability, planner,
+});
+const schedules = new PAIR.MissionScheduleService(service);
+const biz = new PAIR.BusinessLayer({ store, control, schedules });
+const wf = new PAIR.WorkforceService({ store, business: biz });
+const workstreams = new PAIR.ObjectiveWorkstreamService({
+  store, business: biz, workforce: wf, objectives: biz.objectives,
+});
+const { service: ops } = PAIR.createDefaultObjectiveOperatingService({
+  store, business: biz, workforce: wf,
+  objectives: biz.objectives, workstreams,
+  invoker: { invoke: async (input) => ({
+    model_entry_id: input.transport.model_entry_id,
+    provider_id: input.transport.provider_id,
+    model_id: input.transport.model_id,
+    raw_text: JSON.stringify(args.ceoJson),
+  }) },
+});
+parentPort.postMessage({ ready: true });
+Atomics.wait(barrier, 0, 0);
+try {
+  const r = await ops.runObjectivePass({ objective_id: args.objective_id, actor: args.actor });
+  parentPort.postMessage({ ok: true, outcome: r.outcome, mission_id: r.mission_id ?? null });
+} catch (e) {
+  parentPort.postMessage({ ok: false, code: e && e.code ? e.code : String(e) });
+}
+`;
+
+function ensureRaceBundle() {
+  fs.mkdirSync(RACE_CACHE, { recursive: true });
+  const esbuild = fs
+    .readdirSync("node_modules/.pnpm")
+    .filter((d) => d.startsWith("esbuild@"))
+    .map((d) => path.join("node_modules/.pnpm", d, "node_modules/esbuild/bin/esbuild"))
+    .filter((p) => fs.existsSync(p))
+    .sort()
+    .at(-1);
+  if (!esbuild) throw new Error("esbuild binary not found");
+  execFileSync(esbuild, [
+    "src/pair/index.ts", "--bundle", "--format=esm", "--platform=node",
+    "--external:better-sqlite3", "--external:ulid", "--external:yaml",
+    `--outfile=${RACE_BUNDLE}`,
+  ], { cwd: process.cwd(), stdio: "pipe" });
+  fs.writeFileSync(RACE_WORKER, RACE_WORKER_SOURCE);
+}
+
+type PassOutcome2 =
+  | { ok: true; outcome: string; mission_id: string | null }
+  | { ok: false; code: string };
+
+async function runPassRace(
+  ops: Array<{ dbPath: string; projectId: string; args: Record<string, unknown> }>,
+): Promise<PassOutcome2[]> {
+  ensureRaceBundle();
+  const sab = new SharedArrayBuffer(4);
+  const gate = new Int32Array(sab);
+  let readyCount = 0;
+  return Promise.all(
+    ops.map((o) => new Promise<PassOutcome2>((resolve, reject) => {
+      const w = new Worker(RACE_WORKER, {
+        workerData: { dbPath: o.dbPath, projectId: o.projectId, barrier: gate, args: o.args },
+      });
+      w.on("message", (msg: Record<string, unknown>) => {
+        if (msg.ready === true) {
+          readyCount += 1;
+          if (readyCount === ops.length) {
+            Atomics.store(gate, 0, 1);
+            Atomics.notify(gate, 0);
+          }
+          return;
+        }
+        resolve(msg as unknown as PassOutcome2);
+      });
+      w.on("error", reject);
+    })),
+  );
+}
+
+describe("P15.6 §37 — real concurrency", () => {
+  it("23. two passes race one READY allocated child → at most ONE mission", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid } = seeded("race1", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const results = await runPassRace([
+      { dbPath: s.dbPath, projectId: s.projectId,
+        args: { objective_id: oid, actor: OP, ceoJson: JSON.parse(WAIT_JSON) } },
+      { dbPath: s.dbPath, projectId: s.projectId,
+        args: { objective_id: oid, actor: OP, ceoJson: JSON.parse(WAIT_JSON) } },
+    ]);
+    const missions = s.store.list("mission");
+    expect(missions.length).toBe(1); // never duplicate mission authority
+    // §21 — exactly one DISPATCHED; the loser either converged through
+    // canonical authority (AWAITING_EXECUTION) or failed closed through
+    // an existing canonical gate — never a duplicate Mission.
+    const dispatched = results.filter((r) => r.ok && r.outcome === "DISPATCHED");
+    expect(dispatched.length).toBe(1);
+    for (const r of results) {
+      if (!r.ok) {
+        expect(String(r.code), `loser error ${String(r.code)}`).toMatch(/^FAIL_CLOSED/);
+      } else {
+        expect(["DISPATCHED", "AWAITING_EXECUTION"]).toContain(r.outcome);
+      }
+    }
+    expect(s.store.list(WORKFORCE_ALLOCATION_ENTITY).length).toBe(1);
+    s.store.close();
+  });
+
+  it("24. two passes race INITIALIZE+allocate+open on fresh objective → single binding/WAL/child/mission", async () => {
+    const inv = new FakeInvoker(INIT_JSON(["w1"]));
+    const s = freshFullStack("race2");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const results = await runPassRace([
+      { dbPath: s.dbPath, projectId: s.projectId,
+        args: { objective_id: oid, actor: OP,
+          ceoJson: JSON.parse(INIT_JSON(["w1"])) } },
+      { dbPath: s.dbPath, projectId: s.projectId,
+        args: { objective_id: oid, actor: OP,
+          ceoJson: JSON.parse(INIT_JSON(["w1"])) } },
+    ]);
+    expect(s.store.list("mission").length).toBe(1);
+    expect(s.store.list(WORKFORCE_ALLOCATION_ENTITY)
+      .filter((x) => String((x as Record<string, unknown>).objective_id) === oid).length).toBe(1);
+    expect(s.store.list("work_item").filter((x) =>
+      String((x as Record<string, unknown>).work_item_id ?? "").startsWith("DL_")).length).toBe(1);
+    // Loser may converge or fail closed through a canonical gate
+    // (e.g. FAIL_CLOSED_CEO_DECISION_INFLIGHT) — never duplicate authority.
+    for (const r of results) {
+      if (!r.ok) {
+        expect(String(r.code), `loser error ${String(r.code)}`).toMatch(/^FAIL_CLOSED/);
+      }
+    }
+    s.store.close();
+  });
+});

@@ -92,6 +92,21 @@ export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 export const KPI_ASSESSMENTS = ["MET", "GAP", "UNVERIFIED"] as const;
 export type KpiAssessment = (typeof KPI_ASSESSMENTS)[number];
 
+/** Shared read-only KPI assessment (P15.5/P15.6 §6): exact same
+ *  deterministic semantics — UNVERIFIED when no canonically-proven
+ *  current, else direction comparison against target. The caller must
+ *  prove `current` canonical BEFORE calling (assertCanonicalObjectiveKpiProgress). */
+export function objectiveKpiAssessment(k: ObjectiveKpi): KpiAssessment {
+  const current = k.current === null || k.current === undefined ? null : Number(k.current);
+  if (current === null) return "UNVERIFIED";
+  switch (String(k.direction)) {
+    case "AT_LEAST": return current >= Number(k.target) ? "MET" : "GAP";
+    case "AT_MOST": return current <= Number(k.target) ? "MET" : "GAP";
+    case "EXACT": return current === Number(k.target) ? "MET" : "GAP";
+    default: reviewFail(`kpi ${k.kpi_id}: unknown direction ${String(k.direction)}`);
+  }
+}
+
 function reviewFail(detail: string): never {
   throw new IntegrityError("FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW", detail);
 }
@@ -327,7 +342,7 @@ function deps_listAccounted(store: PairEvidenceStore, oid: string) {
 // §12 — REVIEW OBSERVATION
 // ---------------------------------------------------------------------
 
-interface ReviewWorkstreamProjection {
+export interface ReviewWorkstreamProjection {
   workstream_key: string;
   work_item_id: string;
   workstream_status: string;
@@ -418,7 +433,7 @@ function canonicalDerivedMissionStatus(
   return derived;
 }
 
-interface KpiAssessmentProjection {
+export interface KpiAssessmentProjection {
   kpi_id: string;
   name: string;
   direction: string;
@@ -677,15 +692,7 @@ export function buildReviewObservation(
 
   const kpis: KpiAssessmentProjection[] = (objective.kpis as ObjectiveKpi[]).map((k) => {
     const current = k.current === null || k.current === undefined ? null : Number(k.current);
-    let assessment: KpiAssessment = "UNVERIFIED";
-    if (current !== null) {
-      switch (String(k.direction)) {
-        case "AT_LEAST": assessment = current >= Number(k.target) ? "MET" : "GAP"; break;
-        case "AT_MOST": assessment = current <= Number(k.target) ? "MET" : "GAP"; break;
-        case "EXACT": assessment = current === Number(k.target) ? "MET" : "GAP"; break;
-        default: reviewFail(`kpi ${k.kpi_id}: unknown direction ${String(k.direction)}`);
-      }
-    }
+    const assessment = objectiveKpiAssessment(k);
     return {
       kpi_id: k.kpi_id,
       name: k.name,
