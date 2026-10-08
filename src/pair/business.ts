@@ -1503,7 +1503,21 @@ export class BusinessLayer {
    * budget check (fail-closed) → enriched goal → canonical startMission →
    * work_item IN_PROGRESS with mission_id recorded.
    */
-  openWorkItem(workItemId: string, operatorId: string): Row {
+  openWorkItem(
+    workItemId: string,
+    operatorId: string,
+    admission?: {
+      /** P15.6 R2.C — optional objective-version admission pin: when
+       *  the caller is an objective-driven dispatcher, it observed an
+       *  exact canonical objective version and that authority must
+       *  still be live at the dedup write. Progress/budget/status
+       *  mutations all bump the objective version, so any drift aborts
+       *  the open atomically inside the same transaction — before any
+       *  intent/binding/mission write. */
+      objective_id?: string;
+      expected_objective_version?: number;
+    },
+  ): Row {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
     // P15.2 R2.B — the deterministic Objective-root namespace (OWI_*)
     // is permanently non-executable: an Objective root is a P14 graph
@@ -1633,7 +1647,18 @@ export class BusinessLayer {
     // P2 §8 — open mints NO bearer token: claimed_by/claim_expires_at
     // stay observability mirrors of the canonical lease only.
     row.updated_at = utcnow();
-    this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.immediate(() => {
+      if (admission?.objective_id) {
+        const ob = this.store.get("objective", admission.objective_id) as Row;
+        if (Number(ob.version) !== Number(admission.expected_objective_version)) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_STALE_FOR_OPEN",
+            `objective ${admission.objective_id} drifted before open admission`,
+          );
+        }
+      }
+      this.store.put("work_item", workItemId, row, Number(row.version));
+    });
 
     let reservationId: string | null = null;
     try {

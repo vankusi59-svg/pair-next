@@ -402,7 +402,7 @@ function canonicalDerivedWorkStatus(
 /** The work-item's claimed status must equal the derived canonical
  *  state — any raw rewrite (BLOCKED→READY, CANCELLED→READY,
  *  text-only BLOCKED/IN_PROGRESS) fails closed here. */
-function assertCanonicalWorkStatus(
+export function assertCanonicalWorkStatus(
   store: PairEvidenceStore,
   workItem: Row,
 ): string {
@@ -463,6 +463,53 @@ export interface ReviewObservation {
   gap_kpi_count: number;
   workstreams: ReviewWorkstreamProjection[];
 }
+/** R2.B — candidate rows canonical history attributes to
+ *  `objectiveId`: rows currently CLAIMING the objective UNION rows an
+ *  immutable COMMITTED anchor pins to it. Mutable row attribution can
+ *  never hide an anchored row from the strict read — a row whose
+ *  objective_id was rewritten away still appears through its anchor
+ *  and fails strict validation, never silently disappearing. An anchor
+ *  without a row is corrupt authority: fail closed. */
+function anchorAttributedCandidates(
+  store: PairEvidenceStore,
+  entity: string,
+  committedEvent: string,
+  objectiveId: string,
+): Row[] {
+  const byId = new Map<string, Row>();
+  for (const r of store.list(entity) as Row[]) {
+    if (String(r.objective_id ?? "") === objectiveId) {
+      byId.set(String(r.entity_id), r);
+    }
+  }
+  for (const e of store.listEvents(entity).filter((x) =>
+      String(x.event_type ?? "") === committedEvent &&
+      String(
+        (x.metadata as Record<string, unknown> | undefined)?.objective_id ?? "",
+      ) === objectiveId)) {
+    const row = store.tryGet(entity, String(e.entity_id)) as Row | null;
+    if (!row) {
+      reviewFail(
+        `${entity} ${String(e.entity_id)}: committed anchor pins a missing row`);
+    }
+    byId.set(String(row.entity_id), row);
+  }
+  return [...byId.values()];
+}
+
+/** Every canonical P15.5 review row attributed to `objectiveId`,
+ *  strict-validated — the ONLY history a bootstrap decision may trust.
+ *  Exported for P15.6 (§8). */
+export function canonicalAdaptiveReviewsFor(
+  deps: ObjectiveAdaptiveReviewDeps,
+  objectiveId: string,
+): Row[] {
+  const rows = anchorAttributedCandidates(
+    deps.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+    OBJECTIVE_ADAPTIVE_REVIEW_COMMITTED_EVENT, objectiveId);
+  for (const r of rows) assertCanonicalAdaptiveReview(deps, r);
+  return rows;
+}
 
 /** The latest canonical strategy revision for an objective — the chain
  *  head (a revision no other canonical revision names as its
@@ -472,8 +519,9 @@ function canonicalStrategyChain(
   deps: ObjectiveAdaptiveReviewDeps,
   objectiveId: string,
 ): { head: Row | null; all: Row[] } {
-  const all = (deps.store.list(OBJECTIVE_STRATEGY_REVISION_ENTITY) as Row[])
-    .filter((r) => String(r.objective_id) === objectiveId);
+  const all = anchorAttributedCandidates(
+    deps.store, OBJECTIVE_STRATEGY_REVISION_ENTITY,
+    OBJECTIVE_STRATEGY_REVISION_COMMITTED_EVENT, objectiveId);
   for (const r of all) assertCanonicalStrategyRevision(deps, r);
   if (all.length === 0) return { head: null, all };
   const referencedPrev = new Set(

@@ -618,6 +618,107 @@ export function assertCanonicalMissionLifecycle(
   }
 }
 
+/** Mission states that mean "execution in flight" — PAUSED and every
+ *  terminal state are explicitly NOT in-flight. */
+const IN_FLIGHT_MISSION_STATES: ReadonlySet<string> =
+  new Set(["CREATED", "READY", "RUNNING"]);
+
+/** Runtime states compatible with an in-flight mission: live, never
+ *  paused, never terminal. */
+const IN_FLIGHT_RUNTIME_STATES: ReadonlySet<string> = new Set([
+  "CREATED", "PLANNING", "READY", "RUNNING",
+  "WAITING", "WAITING_BACKOFF", "WAITING_APPROVAL",
+  "RECONCILING", "REPLANNING", "RECOVERING",
+]);
+
+/**
+ * Prove one mission is canonically IN FLIGHT — the smallest canonical
+ * ACTIVE-mission proof (P15.6 R2.A):
+ *   - claimed status is a real in-flight state — PAUSED and every
+ *     terminal state can NEVER converge as "awaiting execution";
+ *   - the immutable mission spine replays legally: exactly one
+ *     MISSION_CREATED anchor, every MISSION_TRANSITION legal per the
+ *     canonical transition table and continuous from CREATED, with the
+ *     replayed head equal to the claimed status;
+ *   - when `forWorkItem` is given, the WOB identity: exactly one
+ *     canonical BOUND `work_open_binding` pins this mission to that
+ *     work item, and the mission's `bound_open_id` origin proof agrees;
+ *   - compatible runtime state: `MRT_<id>` must be in a live
+ *     (non-paused, non-terminal) runtime state; a missing runtime row
+ *     is only acceptable while the mission is still CREATED (the
+ *     runtime entity materializes lazily on first dispatch touch).
+ * Anything else fails closed — a race loser may only converge through
+ * this proof, never through a claimed status alone.
+ */
+export function assertCanonicalMissionInFlight(
+  store: PairEvidenceStore, mission: Row, forWorkItem?: Row,
+): void {
+  const mid = String(mission.mission_id ?? "");
+  if (!mid) fail("mission: missing mission_id");
+  const claimed = String(mission.status);
+  if (!IN_FLIGHT_MISSION_STATES.has(claimed)) {
+    fail(`mission ${mid}: ${claimed} is not an in-flight state`);
+  }
+  // Immutable spine — exactly one creation anchor + legal continuous
+  // transitions; a forged or missing transition evidence fails.
+  const mEvs = store.listEvents("mission", mid);
+  const created = mEvs.filter((e) =>
+    String(e.event_type ?? "") === "MISSION_CREATED");
+  if (created.length !== 1) {
+    fail(`mission ${mid}: ${created.length} creation anchors`);
+  }
+  let derived = "CREATED";
+  for (const e of mEvs.filter((e) =>
+    String(e.event_type ?? "") === "MISSION_TRANSITION")) {
+    const from = String(e.old_state ?? "");
+    const to = String(e.new_state ?? "");
+    if (from !== derived) {
+      fail(`mission ${mid}: transition from ${from} but spine at ${derived}`);
+    }
+    if (!(MISSION_STATUS_TRANSITIONS[from] ?? []).includes(to)) {
+      fail(`mission ${mid}: illegal transition ${from}->${to}`);
+    }
+    derived = to;
+  }
+  if (derived !== claimed) {
+    fail(`mission ${mid}: claims ${claimed} but spine derives ${derived}`);
+  }
+  // WOB identity — the mission must be the canonical bound attempt of
+  // the claimed work item, with the non-forgeable origin pin agreeing.
+  if (forWorkItem) {
+    const wobs = canonicalBoundAttemptsForWorkItem(
+      store, String(forWorkItem.work_item_id));
+    const bound = wobs.filter((b) => String(b.mission_id ?? "") === mid);
+    if (bound.length !== 1) {
+      fail(`mission ${mid}: ${bound.length} canonical bound WOBs pin it to ${String(forWorkItem.work_item_id)}`);
+    }
+    const v = validateWorkOpenBindingById(store, String(bound[0]!.open_id), {
+      forWorkItem, forMission: mission, requireState: "BOUND",
+      mode: "PROVENANCE_HISTORICAL",
+    });
+    if (!v.ok) {
+      fail(`mission ${mid}: bound WOB proof: ${v.reason}`);
+    }
+    if (String(mission.bound_open_id ?? "") !== String(bound[0]!.open_id)) {
+      fail(`mission ${mid}: bound_open_id origin pin mismatch`);
+    }
+  }
+  // Compatible runtime — live non-terminal non-paused state only.
+  const rt = store.tryGet("mission_runtime", `MRT_${mid}`) as Row | null;
+  if (!rt) {
+    if (claimed !== "CREATED") {
+      fail(`mission ${mid}: ${claimed} without canonical runtime row`);
+    }
+    return;
+  }
+  if (String(rt.mission_id ?? "") !== mid) {
+    fail(`mission ${mid}: runtime identity mismatch`);
+  }
+  if (!IN_FLIGHT_RUNTIME_STATES.has(String(rt.state ?? ""))) {
+    fail(`mission ${mid}: runtime state ${String(rt.state)} incompatible with in-flight`);
+  }
+}
+
 /** Non-throwing lifecycle proof for one claimed state. */
 export function proveCanonicalMissionLifecycle(
   store: PairEvidenceStore, mission: Row, claimed: string,

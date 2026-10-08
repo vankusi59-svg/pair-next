@@ -27,21 +27,28 @@
 import { IntegrityError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { BusinessLayer } from "./business.js";
+import {
+  assertCanonicalMissionInFlight,
+} from "./work-completion.js";
 import { TERMINAL_MISSION_STATUSES } from "./business.js";
-import { assertCanonicalMissionLifecycle } from "./work-completion.js";
 import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { WorkforceService } from "./work-graph.js";
 import type { CeoPlanningCycleService } from "./ceo-planning-cycle.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
 import { createDefaultCeoPlanningCycle } from "./ceo-runtime.js";
-import { WorkforceAllocationService } from "./workforce-allocation.js";
 import {
-  assertCanonicalAdaptiveReview,
+  assertCanonicalWorkforceAllocation,
+  WORKFORCE_ALLOCATION_ENTITY,
+  workforceAllocationId,
+  WorkforceAllocationService,
+} from "./workforce-allocation.js";
+import {
+  assertCanonicalWorkStatus,
   assertCanonicalObjectiveBudget,
   assertCanonicalObjectiveKpiProgress,
   buildReviewObservation,
-  OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+  canonicalAdaptiveReviewsFor,
   objectiveKpiAssessment,
   ObjectiveAdaptiveReviewService,
   type ObjectiveAdaptiveReviewDeps,
@@ -99,6 +106,13 @@ export interface ObjectiveOperatingDeps extends ObjectiveAdaptiveReviewDeps {
   allocation: WorkforceAllocationService;
 }
 
+/** R2.D — invocation-local step budget: a pass NEVER shares or resets
+ *  another pass's counter; concurrent passes on one service instance
+ *  each own an independent 8-step allowance. */
+interface PassCtx {
+  steps_used: number;
+}
+
 function operatingFail(detail: string): never {
   throw new IntegrityError("FAIL_CLOSED_P15_6_OPERATING_LOOP", detail);
 }
@@ -107,14 +121,12 @@ function operatingFail(detail: string): never {
 class PassBoundExceeded extends Error {}
 
 export class ObjectiveOperatingService {
-  private stepsUsed = 0;
-
   constructor(private readonly deps: ObjectiveOperatingDeps) {}
 
   private get store(): PairEvidenceStore { return this.deps.store; }
 
-  private tick(): void {
-    if (++this.stepsUsed > OBJECTIVE_OPERATING_MAX_INTERNAL_STEPS) {
+  private tick(ctx: PassCtx): void {
+    if (++ctx.steps_used > OBJECTIVE_OPERATING_MAX_INTERNAL_STEPS) {
       throw new PassBoundExceeded();
     }
   }
@@ -136,8 +148,9 @@ export class ObjectiveOperatingService {
     if (!objectiveId || objectiveId.length > 256) {
       operatingFail("objective_id malformed");
     }
+    const ctx: PassCtx = { steps_used: 0 };
     try {
-      return await this.pass(objectiveId, actor);
+      return await this.pass(ctx, objectiveId, actor);
     } catch (e) {
       if (e instanceof PassBoundExceeded) {
         // Deterministic external-wait boundary: the committed seams
@@ -148,8 +161,7 @@ export class ObjectiveOperatingService {
     }
   }
 
-  private async pass(objectiveId: string, actor: string): Promise<OperatingPassResult> {
-    this.stepsUsed = 0;
+  private async pass(ctx: PassCtx, objectiveId: string, actor: string): Promise<OperatingPassResult> {
     const result = (o: OperatingOutcome, extra?: Partial<OperatingPassResult>): OperatingPassResult => ({
       outcome: o, objective_id: objectiveId, ...extra,
     });
@@ -179,7 +191,7 @@ export class ObjectiveOperatingService {
     // the recommendation; pre-binding the result is non-authoritative.
     if (allTargetsMet) {
       if (binding) {
-        this.tick();
+        this.tick(ctx);
         const review = await this.deps.review.runReview({ objective_id: objectiveId, actor });
         return result("TARGET_MET_CANDIDATE", {
           owner_action_required: true,
@@ -194,7 +206,7 @@ export class ObjectiveOperatingService {
     // cycle only (never another CEO path, never Planner/Brain/executor).
     if (!binding) {
       if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
-      this.tick();
+      this.tick(ctx);
       const cycle = await this.deps.ceoCycle.runCycle({ objective_id: objectiveId, actor });
       if (String(cycle.decision.decision_kind) === "WAIT") {
         return result("WAITING_FOR_CEO", { ceo_decision_id: String(cycle.decision.decision_id) });
@@ -208,7 +220,7 @@ export class ObjectiveOperatingService {
     // §9 — reconcile existing objective work BEFORE any new action.
     //    One strict projection re-derives every lifecycle fact.
     let obs = this.observe(objectiveId);
-    const synced = this.reconcileDelegatedChildren(obs, actor);
+    const synced = this.reconcileDelegatedChildren(ctx, obs, actor);
     if (synced) obs = this.observe(objectiveId); // fresh canonical classes
 
     // §17 — classify from canonical lifecycle evidence only.
@@ -246,35 +258,62 @@ export class ObjectiveOperatingService {
 
     // §13 — an already-committed allocation (canonical READY child, no
     // bound Mission) is previously authorized work: open it directly,
-    // never ask the CEO again for crash continuation.
+    // never ask the CEO again for crash continuation. When several
+    // children are launchable, the committed strategy order still
+    // governs which one opens first (R2.E) — strategy is ordering
+    // authority here, not a new model call.
     if (launchable.length > 0) {
       if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
       launchable.sort((a, b) => rankOf(a.workstream_key) - rankOf(b.workstream_key));
-      const opened = this.openDelegatedChild(
-        launchable[0]!.delegated_child_work_item_id!, actor, result);
-      return opened;
+      return this.openDelegatedChild(
+        ctx, objectiveId, launchable[0]!.delegated_child_work_item_id!,
+        launchable[0]!.work_item_id, actor, result, {
+          workstream_key: launchable[0]!.workstream_key,
+        });
     }
 
     // §12 — binding + nothing launchable + no active execution → the
     //    canonical P15.5 review decides BEFORE any NEW allocation.
     //    §8 bootstrap exception: binding + zero WALs + zero reviews →
-    //    execute the canonical P15.2 binding order directly.
+    //    execute the canonical P15.2 binding order directly. R2.B —
+    //    review history is discovered through immutable attribution
+    //    (row claim UNION committed anchors), never mutable row fields.
     const bootstrap = obs.workstreams.every((w) => w.allocation_state === "NONE") &&
-      this.canonicalReviewCount(objectiveId) === 0;
+      canonicalAdaptiveReviewsFor(this.deps, objectiveId).length === 0;
     let order: string[];
+    let appliedStrategyId: string | null = null;
     if (bootstrap) {
       order = (binding.workstreams as Array<Record<string, unknown>>)
         .map((w) => String(w.workstream_key));
     } else {
       if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
-      this.tick();
+      this.tick(ctx);
       const reviewRes = await this.deps.review.runReview({ objective_id: objectiveId, actor });
       const reviewId = String(reviewRes.review.review_id);
       switch (reviewRes.outcome) {
         case "PRIORITIZE_EXISTING": {
-          const head = reviewRes.strategy_revision ?? this.deps.review.getLatestStrategy(objectiveId);
-          if (!head) operatingFail("PRIORITIZE_EXISTING without a canonical strategy revision");
-          order = (head.actionable_order as string[]).map(String);
+          // R2.C — never trust the returned strategy merely because the
+          // call produced it: strict re-read the committed latest
+          // strategy and require it to be the one pinned by THIS
+          // canonical review. Tampering anywhere in the chain fails
+          // inside the strict read; a superseded head means external
+          // canonical state drifted — bounded wait, next pass reviews
+          // fresh state.
+          const latest = this.deps.review.getLatestStrategy(objectiveId);
+          const applied = reviewRes.strategy_revision;
+          if (!latest || !applied ||
+              String(latest.strategy_revision_id) !==
+                String(applied.strategy_revision_id) ||
+              String(latest.strategy_revision_id) !==
+                String(reviewRes.review.strategy_revision_id ?? "") ||
+              String(latest.source_review_id) !== reviewId) {
+            return result("WAITING", {
+              review_id: reviewId,
+              detail: "strategy drifted since review — next pass re-reads",
+            });
+          }
+          appliedStrategyId = String(latest.strategy_revision_id);
+          order = (latest.actionable_order as string[]).map(String);
           break;
         }
         case "TARGET_MET_CANDIDATE":
@@ -314,7 +353,7 @@ export class ObjectiveOperatingService {
       // allocated children were already classified above.
       if (this.workstreamExhausted(w) || w.allocation_state !== "NONE" ||
           w.workstream_status === "BLOCKED") continue;
-      this.tick();
+      this.tick(ctx);
       const alloc = this.deps.allocation.allocateWorkstream({
         objective_id: objectiveId, workstream_key: key, actor,
       });
@@ -323,13 +362,15 @@ export class ObjectiveOperatingService {
       // allocated | replayed — use the EXACT delegated child. §27:
       // a dispatch still carries the blocked keys as observability.
       const childId = String(alloc.delegated_child_work_item_id);
-      return this.openDelegatedChild(childId, actor, result, {
-        workstream_key: key,
-        allocation_id: String(alloc.allocation!.workforce_allocation_id ??
-                              alloc.allocation!.allocation_id ?? ""),
-        ...(blocked.length ? { blocked_workstream_keys: [...blocked] } : {}),
-        ...(noEligible.length ? { no_eligible_workstream_keys: [...noEligible] } : {}),
-      });
+      return this.openDelegatedChild(
+        ctx, objectiveId, childId, w.work_item_id, actor, result, {
+          workstream_key: key,
+          allocation_id: String(alloc.allocation!.workforce_allocation_id ??
+                                alloc.allocation!.allocation_id ?? ""),
+          strategy_revision_id: appliedStrategyId ?? undefined,
+          ...(blocked.length ? { blocked_workstream_keys: [...blocked] } : {}),
+          ...(noEligible.length ? { no_eligible_workstream_keys: [...noEligible] } : {}),
+        });
     }
     if (blocked.length > 0) {
       return result("DEPENDENCY_BLOCKED", { blocked_workstream_keys: blocked });
@@ -344,7 +385,9 @@ export class ObjectiveOperatingService {
    *  reconcileWorkLifecycle): fold canonically-terminal bound Missions
    *  of IN_PROGRESS delegated children, then resume the interrupted
    *  parent cascade through the existing authority. */
-  private reconcileDelegatedChildren(obs: ReviewObservation, actor: string): boolean {
+  private reconcileDelegatedChildren(
+    ctx: PassCtx, obs: ReviewObservation, actor: string,
+  ): boolean {
     let synced = false;
     for (const w of obs.workstreams) {
       if (w.delegated_child_class !== "INTERVENTION" ||
@@ -356,7 +399,7 @@ export class ObjectiveOperatingService {
       // syncWorkItem is the canonical fold authority; it re-validates
       // the WOB/mission lineage itself and materializes DONE/WCP or
       // REVIEW_REQUIRED — never a direct status write.
-      this.tick();
+      this.tick(ctx);
       this.deps.business.syncWorkItem(w.delegated_child_work_item_id);
       this.deps.business.advanceCompletionCascade(w.delegated_child_work_item_id, actor);
       synced = true;
@@ -364,27 +407,109 @@ export class ObjectiveOperatingService {
     return synced;
   }
 
+  /** R2.C — final dispatch authority re-proof, run immediately before
+   *  the openWorkItem crossing and NEVER trusting an earlier
+   *  observation or the in-memory AllocationResult:
+   *   1. deadline evaluated, 2. strict objective read, 3. still ACTIVE,
+   *   4. strict KPI proof, 5. targets still NOT all MET, 6. strict
+   *   budget proof, 7. consumed < ceiling, 8. the exact P15.4 WAL
+   *   exists + strict-validates, 9. the WAL still pins this exact
+   *   child/workstream, 10. the child is canonically READY with no
+   *   bound Mission. Returns the objective version that the open
+   *   seam's admission guard then pins atomically. */
+  private proveDispatchAuthority(
+    objectiveId: string, childId: string, workstreamWorkItemId: string,
+  ): { objective_version: number } |
+     { abort: "OBJECTIVE_NOT_ACTIVE" | "TARGET_MET_CANDIDATE" |
+              "OBJECTIVE_BUDGET_EXHAUSTED" | "AWAITING_EXECUTION";
+       mission_id?: string } {
+    this.deps.objectives.evaluateDeadline(objectiveId);
+    const objective = this.deps.objectives.get(objectiveId); // strict
+    if (String(objective.status) !== "ACTIVE") {
+      return { abort: "OBJECTIVE_NOT_ACTIVE" };
+    }
+    assertCanonicalObjectiveKpiProgress(this.store, objective);
+    const kpis = objective.kpis as ObjectiveKpi[];
+    if (kpis.length > 0 &&
+        kpis.every((k) => objectiveKpiAssessment(k) === "MET")) {
+      return { abort: "TARGET_MET_CANDIDATE" };
+    }
+    assertCanonicalObjectiveBudget(this.store, objective);
+    const budget = objective.budget as Record<string, unknown>;
+    if (Number(budget.consumed_microusd) >= Number(budget.ceiling_microusd)) {
+      return { abort: "OBJECTIVE_BUDGET_EXHAUSTED" };
+    }
+    const wal = this.store.tryGet(
+      WORKFORCE_ALLOCATION_ENTITY,
+      workforceAllocationId(objectiveId, workstreamWorkItemId)) as Row | null;
+    if (!wal) {
+      operatingFail(`dispatch WAL missing for workstream ${workstreamWorkItemId}`);
+    }
+    assertCanonicalWorkforceAllocation(this.deps, wal);
+    if (String(wal.workstream_work_item_id) !== workstreamWorkItemId ||
+        String(wal.delegated_child_work_item_id) !== childId ||
+        String(wal.objective_id) !== objectiveId) {
+      operatingFail(`dispatch WAL does not pin child ${childId}`);
+    }
+    const child = this.store.get("work_item", childId) as Row;
+    if (assertCanonicalWorkStatus(this.store, child) !== "READY") {
+      operatingFail(`delegated child ${childId} not canonically READY`);
+    }
+    const mission = this.deps.business.boundMissionForWorkItem(child);
+    if (mission) {
+      // R2.A — converge only through a proven in-flight mission.
+      assertCanonicalMissionInFlight(this.store, mission, child);
+      return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
+    }
+    return { objective_version: Number(objective.version) };
+  }
+
   /** §15/§16 — the SINGLE governed execution crossing. Every final
-   *  execution gate is re-proven inside openWorkItem; the open race
-   *  converges ONLY through a fully-proven canonical bound Mission
-   *  (§20) — anything else propagates. */
+   *  execution gate is re-proven inside openWorkItem, PLUS the
+   *  objective-version admission pin (R2.C) bound atomically into the
+   *  dedup write; the open race converges ONLY through a fully-proven
+   *  canonical in-flight bound Mission (§20/R2.A) — PAUSED, terminal or
+   *  unproven claims propagate, never become AWAITING_EXECUTION. */
   private openDelegatedChild(
+    ctx: PassCtx,
+    objectiveId: string,
     childId: string,
+    workstreamWorkItemId: string,
     actor: string,
     result: (o: OperatingOutcome, extra?: Partial<OperatingPassResult>) => OperatingPassResult,
     extra?: Partial<OperatingPassResult>,
   ): OperatingPassResult {
-    this.tick();
+    this.tick(ctx);
+    const proof = this.proveDispatchAuthority(
+      objectiveId, childId, workstreamWorkItemId);
+    if ("abort" in proof) {
+      if (proof.abort === "AWAITING_EXECUTION") {
+        return result("AWAITING_EXECUTION", {
+          delegated_child_work_item_id: childId,
+          mission_id: proof.mission_id,
+          ...extra,
+        });
+      }
+      return result(proof.abort, {
+        owner_action_required: proof.abort === "TARGET_MET_CANDIDATE" ? true : undefined,
+        ...extra,
+      });
+    }
     let saved: Row;
     try {
-      saved = this.deps.business.openWorkItem(childId, actor) as Row;
+      saved = this.deps.business.openWorkItem(childId, actor, {
+        objective_id: objectiveId,
+        expected_objective_version: proof.objective_version,
+      }) as Row;
     } catch (err) {
       // An open loser converges only when the canonical bound Mission
-      // is fully proven (§20); every other failure propagates.
+      // is fully proven in flight (§20/R2.A): spine replay + WOB
+      // identity + compatible runtime — PAUSED/terminal/unproven all
+      // propagate fail-closed.
       const child = this.store.tryGet("work_item", childId) as Row | null;
       const mission = child ? this.deps.business.boundMissionForWorkItem(child) : null;
-      if (mission && !TERMINAL_MISSION_STATUSES.has(String(mission.status))) {
-        assertCanonicalMissionLifecycle(this.store, mission, String(mission.status));
+      if (mission && child) {
+        assertCanonicalMissionInFlight(this.store, mission, child);
         return result("AWAITING_EXECUTION", {
           delegated_child_work_item_id: childId,
           mission_id: String(mission.mission_id),
@@ -403,16 +528,6 @@ export class ObjectiveOperatingService {
 
   private observe(objectiveId: string): ReviewObservation {
     return buildReviewObservation(this.deps, objectiveId).observation;
-  }
-
-  /** §8 bootstrap proof — every objective-attributed P15.5 row is
-   *  strict-validated; a malformed review history is corrupt authority
-   *  and fails closed, never silently counted absent. */
-  private canonicalReviewCount(objectiveId: string): number {
-    const rows = (this.store.list(OBJECTIVE_ADAPTIVE_REVIEW_ENTITY) as Row[])
-      .filter((r) => String(r.objective_id) === objectiveId);
-    for (const r of rows) assertCanonicalAdaptiveReview(this.deps, r);
-    return rows.length;
   }
 
   private workstreamExhausted(w: ReviewWorkstreamProjection): boolean {
@@ -447,10 +562,10 @@ export class ObjectiveOperatingService {
 }
 
 /**
- * §30 — default composition: ONE createDefaultCeoPlanningCycle instance
- * shared between the P15.6 bootstrap path and the P15.5 review
- * service. No caller-supplied model_entry_id — canonical resolution
- * stays inside P15.3W.
+ * §30 — production wiring: ONE existing default CeoPlanningCycleService
+ * resolved through the canonical runtime seam is SHARED by the P15.6
+ * bootstrap path and the P15.5 review — never a caller-supplied
+ * model_entry_id, never a second CEO path.
  */
 export function createDefaultObjectiveOperatingService(deps: {
   store: PairEvidenceStore;
@@ -460,11 +575,38 @@ export function createDefaultObjectiveOperatingService(deps: {
   workstreams: ObjectiveWorkstreamService;
   invoker?: CeoDecisionInvoker;
 }): { service: ObjectiveOperatingService; model_entry_id: string } {
-  const { service: ceoCycle, model_entry_id } = createDefaultCeoPlanningCycle(deps);
-  const review = new ObjectiveAdaptiveReviewService({ ...deps, ceoCycle });
-  const allocation = new WorkforceAllocationService(deps);
+  const { service: ceoCycle, model_entry_id } = createDefaultCeoPlanningCycle({
+    store: deps.store,
+    business: deps.business,
+    workforce: deps.workforce,
+    invoker: deps.invoker,
+  });
+  const review = new ObjectiveAdaptiveReviewService({
+    store: deps.store,
+    business: deps.business,
+    workforce: deps.workforce,
+    objectives: deps.objectives,
+    workstreams: deps.workstreams,
+    ceoCycle,
+  });
+  const allocation = new WorkforceAllocationService({
+    store: deps.store,
+    business: deps.business,
+    workforce: deps.workforce,
+    objectives: deps.objectives,
+    workstreams: deps.workstreams,
+  });
   return {
-    service: new ObjectiveOperatingService({ ...deps, ceoCycle, review, allocation }),
+    service: new ObjectiveOperatingService({
+      store: deps.store,
+      business: deps.business,
+      workforce: deps.workforce,
+      objectives: deps.objectives,
+      workstreams: deps.workstreams,
+      ceoCycle,
+      review,
+      allocation,
+    }),
     model_entry_id,
   };
 }
