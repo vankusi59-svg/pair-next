@@ -37,6 +37,10 @@ import {
 } from "./routine-mirror.js";
 import { validateWorkOpenBinding } from "./work-open-binding.js";
 import {
+  WORKFORCE_ALLOCATION_ENTITY,
+  assertCanonicalWorkforceAllocationProvenance,
+} from "./workforce-allocation-evidence.js";
+import {
   assertAuthoritySubset,
   assertCanonicalDecomposition,
   assertCanonicalDelegation,
@@ -1656,25 +1660,34 @@ export class BusinessLayer {
             `objective ${admission.objective_id} drifted before open admission`,
           );
         }
-        // P15.6 F2 — the pinned objective must be the work item's
+        // P15.6 F2/R4 — the pinned objective must be the work item's
         // canonical Objective lineage: exactly one P15.4
         // workforce_allocation may name this work item as its
-        // delegated child, and its objective_id must equal the
-        // admission pin. A caller pinning a foreign objective (even
-        // with a matching version) fails closed before any intent /
+        // delegated child, it must satisfy the canonical provenance
+        // proof (receipt shape + self-digest + exactly-one committed
+        // anchor pinning objective/child/workstream — mutable row
+        // fields alone are never authority), and its objective_id
+        // must equal the admission pin. A caller pinning a foreign
+        // objective (even with a matching version, even after a
+        // coherent row re-hash) fails closed before any intent /
         // WOB / mission write. P14 callers pass no admission and are
-        // unaffected. (Entity name inlined to avoid a runtime import
-        // cycle with workforce-allocation.ts.)
-        const wals = this.store.list("workforce_allocation")
+        // unaffected.
+        const wals = this.store.list(WORKFORCE_ALLOCATION_ENTITY)
           .filter((r) => String(
             (r as Record<string, unknown>).delegated_child_work_item_id)
             === workItemId);
-        if (wals.length !== 1 ||
-            String((wals[0] as Record<string, unknown>).objective_id) !==
-              admission.objective_id) {
+        if (wals.length !== 1) {
           throw new IntegrityError(
             "FAIL_CLOSED_OBJECTIVE_LINEAGE_FOR_OPEN",
             `work item ${workItemId} is not canonically pinned to objective ${admission.objective_id} (found ${wals.length} allocation rows)`,
+          );
+        }
+        assertCanonicalWorkforceAllocationProvenance(this.store, wals[0] as Row);
+        if (String((wals[0] as Record<string, unknown>).objective_id) !==
+              admission.objective_id) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_LINEAGE_FOR_OPEN",
+            `work item ${workItemId} is not canonically pinned to objective ${admission.objective_id}`,
           );
         }
       }

@@ -51,6 +51,8 @@ import {
   WorkforceAllocationService,
   WorkforceService,
   WORKFORCE_ALLOCATION_ENTITY,
+  WORKFORCE_ALLOCATION_COMMITTED_EVENT,
+  workforceAllocationDigest,
 } from "../pair/index.js";
 import { canonicallyCompleteMission } from "./canonical-mission-completion.js";
 
@@ -1702,6 +1704,91 @@ describe("P15.6 F2 — objective admission bound to the child lineage", () => {
     });
     expect(String(row.status)).toBe("IN_PROGRESS");
     expect(s.store.list("mission").length).toBe(1);
+    s.store.close();
+  });
+
+  /** Locate the single WAL row + its committed anchor for a child. */
+  function walOf(
+    s: { store: PairEvidenceStore }, childId: string) {
+    const row = s.store.list(WORKFORCE_ALLOCATION_ENTITY).find((r) =>
+      String((r as Record<string, unknown>).delegated_child_work_item_id)
+        === childId) as Record<string, unknown>;
+    const anchor = s.store
+      .listEvents(WORKFORCE_ALLOCATION_ENTITY, String(row.allocation_id))
+      .find((e) => String(e.event_type) === WORKFORCE_ALLOCATION_COMMITTED_EVENT)!;
+    return { row, anchor };
+  }
+
+  it("R4-a. WAL objective_id rewritten to B (anchor untouched) → admission B FAIL CLOSED", () => {
+    const { s, bid, binding } = seeded("r4-forge", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const oidA = String(binding.objective_id);
+    s.alloc.allocateWorkstream({ objective_id: oidA, workstream_key: "w1", actor: OP });
+    const cid = childOfKey(s, binding, "w1");
+    const oB = mkObjective(s, bid);
+    const oidB = String(oB.objective_id);
+    const { row } = walOf(s, cid);
+    // Rewrite the mutable pin — the immutable anchor keeps saying A.
+    sqlRewriteEntity(s.store, WORKFORCE_ALLOCATION_ENTITY,
+      String(row.allocation_id), (b) => { b.objective_id = oidB; });
+    expect(() => s.biz.openWorkItem(cid, OP, {
+      objective_id: oidB,
+      expected_objective_version: Number(oB.version),
+    })).toThrow(/FAIL_CLOSED/);
+    expect(s.store.list("work_open_binding").length).toBe(0);
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("R4-b. coherent re-hash forgery (objective→B + recomputed allocation_digest) → still FAIL", () => {
+    const { s, bid, binding } = seeded("r4-rehash", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const oidA = String(binding.objective_id);
+    s.alloc.allocateWorkstream({ objective_id: oidA, workstream_key: "w1", actor: OP });
+    const cid = childOfKey(s, binding, "w1");
+    const oB = mkObjective(s, bid);
+    const oidB = String(oB.objective_id);
+    const { row } = walOf(s, cid);
+    // Fully self-consistent mutable forgery: payload_hash AND
+    // allocation_digest recomputed — only the immutable anchor
+    // disagrees. On audited HEAD this passed F2's row-field check.
+    sqlRewriteEntity(s.store, WORKFORCE_ALLOCATION_ENTITY,
+      String(row.allocation_id), (b) => {
+        b.objective_id = oidB;
+        b.allocation_digest = workforceAllocationDigest(b);
+      });
+    expect(() => s.biz.openWorkItem(cid, OP, {
+      objective_id: oidB,
+      expected_objective_version: Number(oB.version),
+    })).toThrow(/FAIL_CLOSED/);
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("R4-c. WAL committed anchor deleted → FAIL CLOSED", () => {
+    const { s, binding } = seeded("r4-noanchor", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const oid = String(binding.objective_id);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = childOfKey(s, binding, "w1");
+    const { anchor } = walOf(s, cid);
+    dbOf(s.store).prepare("DELETE FROM events WHERE event_id=?")
+      .run(String(anchor.event_id));
+    const o = s.biz.objectives.get(oid);
+    expect(() => s.biz.openWorkItem(cid, OP, {
+      objective_id: oid,
+      expected_objective_version: Number(o.version),
+    })).toThrow(/FAIL_CLOSED/);
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("R4-d. P14 open WITHOUT objective admission still works (unchanged)", () => {
+    const { s, bid } = seeded("r4-p14", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const agent = mkAgent(s, bid, { title: "p14-agent" });
+    const wi = s.biz.createWorkItem({
+      business_id: bid, title: "p14 item", goal: "g",
+      assignee_agent_id: String(agent.agent_id), operator_id: OP,
+    });
+    const row = s.biz.openWorkItem(String(wi.work_item_id), OP);
+    expect(String(row.status)).toBe("IN_PROGRESS");
     s.store.close();
   });
 });
