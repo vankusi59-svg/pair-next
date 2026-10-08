@@ -633,6 +633,45 @@ describe("P15.8-C — mission confirmation", () => {
     expect(missionCount(ctx)).toBe(1);
   });
 
+  it("R2 — A claimed+pinned; B consumed+settled first → A converges to B's mission, never terminalizes", async () => {
+    const ctx = makeCtx("r2-interleave");
+    const sid = mkSession(ctx);
+    const d = mkDraft(ctx, sid);
+    // A claims + pins, then "crashes" before canonical confirm.
+    const spy = crashAfterPin(ctx);
+    await expect(ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    })).rejects.toThrow("transport lost");
+    spy.mockRestore();
+    // B — a second service over the same store — resumes and settles.
+    const convB = new ConversationSessionService(ctx.store);
+    const draftsB = new MissionDraftService({ conversation: convB, control: ctx.control, store: ctx.store });
+    const rb = await draftsB.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    });
+    expect(rb.reused).toBe(false);
+    expect(missionCount(ctx)).toBe(1);
+    // A now retries — its stale SUBMITTING view must converge to B's
+    // settled receipt, not attempt terminalization.
+    const ra = await ctx.drafts.confirmDraft({
+      session_id: sid, operator_id: OP,
+      draft_id: d.draft_id, expected_digest: d.draft_digest,
+    });
+    expect(ra.mission_id).toBe(rb.mission_id);
+    expect(ra.reused).toBe(true);
+    expect(missionCount(ctx)).toBe(1);
+    expect(ctx.plannerCalls.length).toBe(1);
+    const after = ctx.drafts.getDraft({ session_id: sid, operator_id: OP, draft_id: d.draft_id });
+    expect(after.state).toBe("CONFIRMED");
+    expect(after.mission_id).toBe(rb.mission_id);
+    // No SUBMISSION_EXPIRED event was ever committed.
+    const events = ctx.store.list("event").filter(
+      (e) => String(e.event_type) === "MISSION_DRAFT_SUBMISSION_EXPIRED");
+    expect(events.length).toBe(0);
+  });
+
   it("R1.B — concurrent resume cannot create a second mission", async () => {
     const ctx = makeCtx("resume-conc");
     const sid = mkSession(ctx);

@@ -720,49 +720,70 @@ export class MissionDraftService {
       row = pinned;
     }
 
-    /* ---- R1.B — pinned-preview recoverability ----------------------- */
-    // A claimed draft can outlive its pinned READY preview. Before
-    // declaring it unrecoverable check CANONICAL consumption: a consumed
-    // preview still replays its mission receipt; an expired unconsumed
-    // one can never legally confirm → close the draft truthfully.
-    const previewRow = this.deps.store.tryGet(
-      "mission_plan_preview", String(row.preview_id)) as Record<string, unknown> | null;
-    if (!previewRow) {
-      throw new IntegrityError(
-        "FAIL_CLOSED_CONVERSATION_DRAFT_INTEGRITY",
-        `pinned preview ${String(row.preview_id)} missing`,
-      );
-    }
-    if (String(previewRow.state) !== "CONSUMED") {
-      const expired =
-        (this.deps.now ?? utcnow)() > String(previewRow.expires_at ?? "");
-      if (expired) {
-        this.deps.store.immediate(() => {
-          const fresh = this.canonicalDraft(draftId);
-          if (fresh.state !== "SUBMITTING") return; // racing settle won
-          this.deps.store.put(MISSION_DRAFT_ENTITY, draftId,
-            { ...fresh, state: "SUBMISSION_EXPIRED" } as unknown as Record<string, unknown>,
-            Number(fresh.version ?? 0));
-          this.deps.store.event({
-            entity_type: MISSION_DRAFT_ENTITY,
-            entity_id: draftId,
-            event_type: "MISSION_DRAFT_SUBMISSION_EXPIRED",
-            old_state: "SUBMITTING",
-            new_state: "SUBMISSION_EXPIRED",
-            actor: "conversation-mission-draft",
-            metadata: {
-              draft_id: draftId, session_id: sessionId,
-              preview_id: String(row.preview_id),
-              preview_expires_at: String(previewRow.expires_at),
-            },
-          });
-        });
+    /* ---- R1.B + R2 — pinned-preview recoverability ------------------- */
+    // R2 — the recoverability decision is ATOMIC: draft + pinned preview
+    // are re-read inside ONE transaction. A stale "READY" observation can
+    // never terminalize a draft whose preview a racing process already
+    // consumed — consumption is rechecked against the LIVE row.
+    const gate2 = this.deps.store.immediate(() => {
+      const fresh = this.canonicalDraft(draftId);
+      if (fresh.state === "CONFIRMED" && fresh.mission_id) {
+        // Another process already settled — converge to its receipt.
+        return { mode: "settled" as const, row: fresh };
+      }
+      if (fresh.state !== "SUBMITTING") {
         throw new IntegrityError(
-          "FAIL_CLOSED_CONVERSATION_DRAFT_SUBMISSION_EXPIRED",
-          `draft ${draftId} pinned preview ${String(row.preview_id)} expired — confirm a new draft`,
+          "FAIL_CLOSED_CONVERSATION_DRAFT_STATE",
+          `draft ${draftId} left SUBMITTING (${fresh.state}) mid-claim`,
         );
       }
+      const pv = this.deps.store.tryGet(
+        "mission_plan_preview", String(fresh.preview_id)) as Record<string, unknown> | null;
+      if (!pv) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_CONVERSATION_DRAFT_INTEGRITY",
+          `pinned preview ${String(fresh.preview_id)} missing`,
+        );
+      }
+      if (String(pv.state) === "CONSUMED") {
+        // A consumed preview still replays its mission receipt — expiry
+        // is irrelevant once consumption is canonical.
+        return { mode: "confirm" as const, row: fresh };
+      }
+      if ((this.deps.now ?? utcnow)() > String(pv.expires_at ?? "")) {
+        // Expired + unconsumed: can never legally confirm — commit the
+        // terminal outcome atomically, THEN throw.
+        const next = { ...fresh, state: "SUBMISSION_EXPIRED" as const };
+        this.deps.store.put(MISSION_DRAFT_ENTITY, draftId,
+          next as unknown as Record<string, unknown>, Number(fresh.version ?? 0));
+        this.deps.store.event({
+          entity_type: MISSION_DRAFT_ENTITY,
+          entity_id: draftId,
+          event_type: "MISSION_DRAFT_SUBMISSION_EXPIRED",
+          old_state: "SUBMITTING",
+          new_state: "SUBMISSION_EXPIRED",
+          actor: "conversation-mission-draft",
+          metadata: {
+            draft_id: draftId, session_id: sessionId,
+            preview_id: String(fresh.preview_id),
+            preview_expires_at: String(pv.expires_at),
+          },
+        });
+        return { mode: "expired" as const, row: fresh };
+      }
+      return { mode: "confirm" as const, row: fresh };
+    });
+    if (gate2.mode === "settled") {
+      const mission = this.deps.store.get("mission", String(gate2.row.mission_id));
+      return { draft: gate2.row, mission_id: String(gate2.row.mission_id), mission, reused: true };
     }
+    if (gate2.mode === "expired") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CONVERSATION_DRAFT_SUBMISSION_EXPIRED",
+        `draft ${draftId} pinned preview ${String(row.preview_id)} expired — confirm a new draft`,
+      );
+    }
+    row = gate2.row;
 
     /* ---- Governed submission — canonical confirm, atomic consume ---- */
     // confirmPlanPreview: digest/expiry/authority re-proof → mission mint
