@@ -50,7 +50,10 @@ if (!TG_TOKEN) {
 fs.mkdirSync(path.dirname(ALLOW_FILE), { recursive: true });
 fs.mkdirSync(path.dirname(HALT_FILE), { recursive: true });
 
-const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
+// PAIR_TG_API_BASE — TEST-ONLY seam pointing the bot transport at a
+// mocked Telegram API (e2e drives the real bridge against a local
+// recorder). Never set it in production.
+const TG_API = (process.env.PAIR_TG_API_BASE ?? `https://api.telegram.org/bot${TG_TOKEN}`).replace(/\/+$/, "");
 
 // ---- Telegram transport ----------------------------------------------------
 // Errors are classified: definite (Telegram API said no → bounded retry)
@@ -84,11 +87,23 @@ async function tg(method, params = {}) {
   return data.result;
 }
 
-function send(chatId, text) {
+function send(chatId, text, extra = {}) {
   const s = String(text).slice(0, 4000); // telegram hard limit is 4096
-  return tg("sendMessage", { chat_id: chatId, text: s, disable_web_page_preview: true }).catch((e) =>
+  return tg("sendMessage", { chat_id: chatId, text: s, disable_web_page_preview: true, ...extra }).catch((e) =>
     console.error("send fail", chatId, String(e)),
   );
+}
+
+// Conversation replies are bounded and chunked — a model reply never
+// becomes an unbounded wall of messages and never carries parse_mode.
+function sendReply(chatId, text) {
+  const s = String(text ?? "");
+  const chunks = [];
+  for (let i = 0; i < s.length && chunks.length < 3; i += 3800) {
+    chunks.push(s.slice(i, i + 3800));
+  }
+  if (s.length > 3 * 3800) chunks[2] = chunks[2].slice(0, 3790) + "…(rút gọn)";
+  return chunks.reduce((p, c) => p.then(() => send(chatId, c)), Promise.resolve());
 }
 
 const IMG_EXT = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
@@ -198,10 +213,12 @@ const trunc = (s, n) => {
 const uiLink = (missionId) => (UI_BASE ? `\n${UI_BASE}/missions/${missionId}` : "");
 
 // ---- command handlers -------------------------------------------------------
-async function handleCommand(chatId, text) {
+async function handleCommand(chatId, text, ctx = {}) {
   const [cmd, ...rest] = text.trim().split(/\s+/);
   const arg = rest.join(" ");
   const op = `telegram:${chatId}`;
+  const updateId = ctx.updateId;
+  const replyTo = ctx.replyTo ?? null;
 
   switch (cmd.toLowerCase()) {
     case "/start":
@@ -209,8 +226,12 @@ async function handleCommand(chatId, text) {
       return send(
         chatId,
         [
-          "PAIR OS — ra lệnh bằng tin nhắn thường = tạo mission.",
+          "PAIR OS — trò chuyện bằng tin nhắn thường. Mission chỉ chạy qua draft + xác nhận.",
           "",
+          "/draft <project_id> <goal> — chuẩn bị mission draft (không chạy gì)",
+          "/drafts — các draft đang chờ xác nhận",
+          "/projects — danh sách project để chọn",
+          "/new — bắt đầu phiên trò chuyện mới",
           "/status — tổng quan (missions, spend, approvals)",
           "/missions — 5 mission gần nhất",
           "/approvals — yêu cầu đang chờ duyệt",
@@ -292,21 +313,186 @@ async function handleCommand(chatId, text) {
       fs.rmSync(HALT_FILE, { force: true });
       return send(chatId, "COST HALT tắt — remote dispatch hoạt động lại (trong trần ngân sách ngày).");
     }
+    // ---- P15.8-E — conversation layer commands ------------------------
+    case "/new": {
+      const r = await mc("POST", "/api/telegram/conversation/new", { chat_id: String(chatId) }, op);
+      return send(chatId, `Phiên trò chuyện mới: ${r.session.session_id.slice(0, 14)}…`);
+    }
+    case "/projects": {
+      const projects = await mc("GET", "/api/projects").catch(() => []);
+      const xs = Array.isArray(projects) ? projects : projects.projects ?? [];
+      if (!xs.length) return send(chatId, "Chưa có project canonical nào.");
+      return send(
+        chatId,
+        "Projects:\n" + xs.map((x) => `${x.project_id} — ${trunc(x.name ?? "", 60)}`).join("\n"),
+      );
+    }
+    case "/drafts": {
+      const d = await mc("GET", `/api/telegram/conversation/pending?chat_id=${encodeURIComponent(String(chatId))}`, undefined, op);
+      const list = d.drafts ?? [];
+      if (!list.length) return send(chatId, "Không có draft nào đang chờ xác nhận.");
+      return send(chatId, list.map((x) => `${x.draft_id}\n  goal: ${trunc(x.goal, 70)}\n  project: ${x.project_id} · hết hạn ${x.expires_at}`).join("\n\n"));
+    }
+    case "/draft": {
+      // /draft <project_id> <goal>  — explicit draft prep (ZERO missions).
+      // Reply-bound form: reply to your own message with "/draft <project_id>"
+      // → the replied text becomes the goal.
+      const [projArg, ...goalParts] = arg.split(/\s+/).filter(Boolean);
+      const replyGoal = replyTo?.text ? String(replyTo.text).trim() : "";
+      const goal = (goalParts.join(" ") || replyGoal).trim();
+      if (!projArg || !goal) {
+        const projects = await mc("GET", "/api/projects").catch(() => []);
+        const xs = Array.isArray(projects) ? projects : projects.projects ?? [];
+        return send(
+          chatId,
+          "Dùng: /draft <project_id> <goal>\n(hoặc reply một tin nhắn của bạn bằng /draft <project_id>)\n\nProjects:\n" +
+            (xs.length ? xs.map((x) => `  ${x.project_id} — ${trunc(x.name ?? "", 50)}`).join("\n") : "  (chưa có project)"),
+        );
+      }
+      const d = await mc("POST", "/api/telegram/conversation/draft", {
+        chat_id: String(chatId),
+        project_id: projArg,
+        goal,
+        // The update id makes a replayed /draft converge onto the same
+        // draft server-side; a missing id (shouldn't happen) falls back
+        // to a random — never deduped worse than before.
+        update_id: updateId ?? Math.floor(Math.random() * 1e9),
+      }, op);
+      // The confirmation prompt — inline buttons carry ONLY the opaque
+      // ref id; the full draft digest lives server-side (callback_data
+      // is 64 bytes — never enough for a digest, by design).
+      const prompt = await tg("sendMessage", {
+        chat_id: chatId,
+        text: [
+          "GOVERNED MISSION DRAFT — chờ xác nhận",
+          `draft: ${d.draft.draft_id}`,
+          `project: ${d.draft.project_id}`,
+          `goal: ${trunc(d.draft.goal, 200)}`,
+          `permissions: ${(d.draft.granted_permissions ?? []).join(", ") || "—"}`,
+          `workspaces: ${(d.draft.authorized_workspaces ?? []).join(", ") || "—"}`,
+          `risk ceiling: ${d.draft.risk_ceiling ?? "system default"}`,
+          `hết hạn: ${d.draft.expires_at}`,
+          "",
+          "Bấm Confirm để submit đúng draft này — hoặc reply tin nhắn này bằng \"OK\"/\"xác nhận\".",
+        ].join("\n"),
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ Confirm", callback_data: `c:${d.ref.ref_id}` },
+            { text: "❌ Reject", callback_data: `r:${d.ref.ref_id}` },
+          ]],
+        },
+      });
+      if (prompt?.message_id) {
+        await mc("POST", `/api/telegram/conversation/refs/${d.ref.ref_id}/prompt-sent`,
+          { chat_id: String(chatId), message_id: prompt.message_id }, op).catch(() => {});
+      }
+      return;
+    }
     default:
       return send(chatId, `Lệnh không hiểu: ${cmd}. /help để xem danh sách.`);
   }
 }
 
-async function handleMessage(chatId, text) {
-  const t = String(text ?? "").trim();
-  if (!t) return;
-  if (t.startsWith("/")) return handleCommand(chatId, t);
+// ---- P15.8-E — conversation ingress -----------------------------------
+// Ordinary text NEVER creates a mission. Each message goes to the
+// canonical ingress: deterministic classification (reply-bound ack vs
+// conversation), session binding and dedup live server-side. Errors map
+// to honest bounded messages — internals never leak into the chat.
+const ERR_TEXT = {
+  FAIL_CLOSED_TELEGRAM_CHAT_TYPE: "Chat nhóm không hỗ trợ — chỉ private chat (V1).",
+  FAIL_CLOSED_TELEGRAM_REF_EXPIRED: "Draft đã hết hạn — tạo draft mới bằng /draft.",
+  FAIL_CLOSED_TELEGRAM_REF_STATE: "Prompt này đã được xử lý — không còn hiệu lực.",
+  FAIL_CLOSED_TELEGRAM_REF_NOT_FOUND: "Không tìm thấy quyền xác nhận tương ứng.",
+  FAIL_CLOSED_TELEGRAM_REF_OWNERSHIP: "Quyền xác nhận không thuộc chat này.",
+  FAIL_CLOSED_CONVERSATION_ACK_NONE: "Không có draft nào đang chờ để xác nhận.",
+  FAIL_CLOSED_CONVERSATION_ACK_AMBIGUOUS: "Có nhiều hơn một draft đang chờ — dùng nút Confirm để chọn đúng draft.",
+  FAIL_CLOSED_CONVERSATION_DRAFT_DIGEST: "Điều khoản draft đã thay đổi — xác nhận bị từ chối.",
+  FAIL_CLOSED_CONVERSATION_DRAFT_STATE: "Draft không còn ở trạng thái chờ xác nhận.",
+  FAIL_CLOSED_CONVERSATION_DRAFT_SUBMISSION_EXPIRED: "Preview đã hết hạn trước khi submit — tạo draft mới.",
+};
 
-  // Free text = mission goal.
-  const projects = await mc("GET", "/api/projects").catch(() => []);
-  const projectId = projects?.[0]?.project_id ?? "";
-  const d = await mc("POST", "/api/missions", { goal: t, project_id: projectId }, `telegram:${chatId}`);
-  await send(chatId, `Mission tạo xong: ${d.mission_id}\n${trunc(t, 120)}${uiLink(d.mission_id)}`);
+function friendlyErr(e) {
+  const s = String(e);
+  for (const [code, txt] of Object.entries(ERR_TEXT)) {
+    if (s.includes(code)) return txt;
+  }
+  return `Lỗi: ${trunc(s.replace(/https?:\/\/\S+/g, ""), 160)}`;
+}
+
+// The update being processed — set by the poll loop before dispatch so
+// every downstream call (turn, draft) dedups on the stable update id.
+let currentUpdateId = 0;
+
+async function handleMessage(chatId, msg) {
+  const text = String(msg?.text ?? "").trim();
+  if (!text) return;
+  const op = `telegram:${chatId}`;
+  const chatType = msg?.chat?.type ?? "private";
+  if (text.startsWith("/")) {
+    return handleCommand(chatId, text, {
+      updateId: currentUpdateId,
+      replyTo: msg?.reply_to_message ?? null,
+    });
+  }
+  try {
+    const r = await mc("POST", "/api/telegram/conversation/ingress", {
+      chat_id: String(chatId),
+      chat_type: chatType,
+      update_id: currentUpdateId,
+      text,
+      reply_to_message_id: msg?.reply_to_message?.message_id ?? undefined,
+    }, op);
+    if (r.kind === "ack_confirmed") {
+      return send(chatId, `✅ Draft ${r.draft_id} đã xác nhận → mission ${r.mission_id}${uiLink(r.mission_id)}`);
+    }
+    if (r.kind === "reasoning_unavailable") {
+      return send(chatId, "AI reasoning hiện không khả dụng — thử lại sau. (Mission/draft vẫn hoạt động bình thường qua /draft.)");
+    }
+    return sendReply(chatId, r.reply ?? "");
+  } catch (e) {
+    return send(chatId, friendlyErr(e));
+  }
+}
+
+// callback_query — inline Confirm/Reject. callback_data = c:<ref> |
+// r:<ref>; the ref resolves to the FULL draft digest server-side.
+async function handleCallback(cb) {
+  const chatId = cb?.message?.chat?.id;
+  const data = String(cb?.data ?? "");
+  const answer = (text) =>
+    tg("answerCallbackQuery", { callback_query_id: cb.id, text: String(text).slice(0, 190) }).catch(() => {});
+  if (chatId === undefined || !data) return;
+  const allow = allowedChats();
+  if (!allow.has(String(chatId))) {
+    return answer("Không có quyền.");
+  }
+  const op = `telegram:${chatId}`;
+  const chatType = cb?.message?.chat?.type ?? "private";
+  const ref = data.slice(2);
+  try {
+    if (data.startsWith("c:")) {
+      const r = await mc("POST", `/api/telegram/conversation/refs/${ref}/confirm`,
+        { chat_id: String(chatId), chat_type: chatType }, op);
+      // Remove the buttons — a consumed prompt can never confirm twice.
+      await tg("editMessageReplyMarkup", {
+        chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] },
+      }).catch(() => {});
+      await answer("Đã xác nhận.");
+      return send(chatId, `✅ Draft ${r.draft.draft_id} → mission ${r.mission_id}${uiLink(r.mission_id)}`);
+    }
+    if (data.startsWith("r:")) {
+      await mc("POST", `/api/telegram/conversation/refs/${ref}/reject`,
+        { chat_id: String(chatId) }, op);
+      await tg("editMessageReplyMarkup", {
+        chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] },
+      }).catch(() => {});
+      await answer("Đã từ chối.");
+      return send(chatId, "❌ Draft đã bị từ chối — không mission nào được tạo.");
+    }
+    return answer("callback không hiểu");
+  } catch (e) {
+    return answer(friendlyErr(e));
+  }
 }
 
 // ---- notification watcher ----------------------------------------------------
@@ -423,12 +609,36 @@ async function main() {
       { command: "halt", description: "chặn remote dispatch" },
       { command: "unhalt", description: "mở lại remote dispatch" },
       { command: "id", description: "chat id của bạn" },
+      { command: "new", description: "phiên chat mới" },
+      { command: "draft", description: "chuẩn bị mission draft" },
+      { command: "drafts", description: "draft chờ xác nhận" },
+      { command: "projects", description: "danh sách project" },
     ],
   }).catch((e) => console.error("setMyCommands:", String(e)));
   console.log(`telegram-bridge: bot @${me.username} (${me.id}) → ${MC_URL}`);
   console.log(`telegram-bridge: allow file ${ALLOW_FILE}; halt lever ${HALT_FILE}`);
 
-  let offset = 0;
+  // Durable poll cursor — a restart resumes AFTER the last processed
+  // update instead of replaying Telegram's 24h backlog. This is ONLY a
+  // delivery cursor (bridge state dir), never mission authority; a lost
+  // file still converges through server-side update-id dedup.
+  const OFFSET_FILE = process.env.PAIR_TG_OFFSET_FILE ?? path.join(MC_DIR, "telegram-offset.json");
+  const loadOffset = () => {
+    try {
+      const n = Number(JSON.parse(fs.readFileSync(OFFSET_FILE, "utf8")).offset);
+      return Number.isSafeInteger(n) && n > 0 ? n : 0;
+    } catch {
+      return 0;
+    }
+  };
+  let offset = loadOffset();
+  const saveOffset = () => {
+    try {
+      fs.writeFileSync(OFFSET_FILE, JSON.stringify({ offset }) + "\n");
+    } catch (e) {
+      console.error("offset save:", String(e).slice(0, 120));
+    }
+  };
   // R6 §6 — defense-in-depth: an interval tick while the previous
   // notifyLoop is still in flight is skipped. The DURABLE SENDING lease
   // (attempt_started_at + PAIR_TG_DELIVERY_STALE_AFTER_MS) remains the
@@ -439,7 +649,7 @@ async function main() {
   for (;;) {
     let updates;
     try {
-      updates = await tg("getUpdates", { offset, timeout: 30, allowed_updates: ["message"] });
+      updates = await tg("getUpdates", { offset, timeout: 30, allowed_updates: ["message", "callback_query"] });
     } catch (e) {
       console.error("getUpdates:", String(e).slice(0, 200));
       await new Promise((r) => setTimeout(r, 5000));
@@ -447,6 +657,17 @@ async function main() {
     }
     for (const u of updates ?? []) {
       offset = Math.max(offset, u.update_id + 1);
+      saveOffset();
+      currentUpdateId = u.update_id;
+      const cb = u.callback_query;
+      if (cb) {
+        try {
+          await handleCallback(cb);
+        } catch (e) {
+          console.error("callback:", String(e).slice(0, 300));
+        }
+        continue;
+      }
       const msg = u.message;
       const chatId = msg?.chat?.id;
       const text = msg?.text;
@@ -460,7 +681,7 @@ async function main() {
         } else if (!allow.has(String(chatId))) {
           await send(chatId, "Bạn không có quyền điều khiển PAIR (chat_id không trong allowlist).");
         } else {
-          await handleMessage(String(chatId), text);
+          await handleMessage(String(chatId), msg);
         }
       } catch (e) {
         console.error("handle:", String(e).slice(0, 300));

@@ -102,6 +102,7 @@ import {
   CodexCliConversationInvoker,
   ensureConversationModel,
   MissionDraftService,
+  TelegramConversationService,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
   telegramDeliveryTransportTimeoutMs,
@@ -453,6 +454,15 @@ try {
     String(e).slice(0, 160),
   );
 }
+// P15.8-E — telegram ingress authority over the same canonical
+// services. Pure composition — when reasoning is absent only the
+// reply path degrades; binding/draft/confirm keep working.
+const telegramConversation = new TelegramConversationService({
+  store,
+  conversation: conversationSessions,
+  drafts: missionDrafts,
+  reasoning: conversationReasoning ?? undefined,
+});
 // WFV2 §8: restart reconcile — forged/incompletely-materialized graph
 // provenance is quarantined before any work item can open.
 {
@@ -952,6 +962,8 @@ const server = createMissionControlServer({
     sessions: conversationSessions,
     reasoning: conversationReasoning ?? undefined,
     drafts: missionDrafts,
+    // P15.8-E — telegram ingress authority.
+    telegram: telegramConversation,
   },
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
