@@ -27,6 +27,7 @@ import {
   CONVERSATION_MAX_SESSIONS_PER_OWNER,
   CONVERSATION_MAX_TITLE_CHARS,
   CONVERSATION_MESSAGE_ENTITY,
+  CONVERSATION_MESSAGE_SCHEMA,
   CONVERSATION_SESSION_ENTITY,
   CONVERSATION_SESSION_SCHEMA,
   ConversationSessionService,
@@ -409,6 +410,193 @@ describe("P15.8-A conversation authority", () => {
       code(() => w.appendMessage({ session_id: s.session_id, role: "assistant", body: "late" })),
     ).toBe("FAIL_CLOSED_CONVERSATION_CLOSED");
     expect(a.owner_operator_id).toBe(OWNER);
+  });
+
+  /* ---------------- R2.A — replay before new-write admission ---------------- */
+
+  it("identical replay converges through a raced CLOSE — no CLOSED error", () => {
+    const ctx = fresh("race-close");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const input = {
+      session_id: s.session_id, operator_id: OWNER, role: "operator" as const,
+      body: "committed", idempotency_key: "close-race",
+    };
+    const other = new ConversationSessionService(ctx.store);
+    // Between our pre-check and our txn: the racing append commits AND the
+    // session closes. Our write is a retry of committed state — converge.
+    raceOnce(ctx.store, () => {
+      other.appendMessage(input);
+      other.closeSession(s.session_id, { operator_id: OWNER });
+    });
+    const out = ctx.conv.appendMessage(input);
+    expect(out.seq).toBe(1);
+    expect(ctx.conv.getSession(s.session_id, OWNER).message_count).toBe(1);
+    expect(ctx.conv.getSession(s.session_id, OWNER).state).toBe("CLOSED");
+    // One append event + one close event, never two appends.
+    const ev = ctx.store
+      .listEvents(CONVERSATION_SESSION_ENTITY, s.session_id)
+      .filter((e) => e.event_type === "CONVERSATION_MESSAGE_APPENDED");
+    expect(ev).toHaveLength(1);
+    // And a NEW message (different key) still fails CLOSED.
+    expect(
+      code(() =>
+        ctx.conv.appendMessage({
+          session_id: s.session_id, operator_id: OWNER, role: "operator",
+          body: "new", idempotency_key: "after-close",
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_CLOSED");
+  });
+
+  it("identical replay converges through a raced capacity fill — no LIMIT error", () => {
+    const ctx = fresh("race-cap");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const input = {
+      session_id: s.session_id, operator_id: OWNER, role: "operator" as const,
+      body: "committed", idempotency_key: "cap-race",
+    };
+    const other = new ConversationSessionService(ctx.store);
+    // Raced append commits, then the session row is coherently advanced to
+    // the cap (digest rebuilt — the row is canonical, just full).
+    raceOnce(ctx.store, () => {
+      other.appendMessage(input);
+      sqlRewriteEntity(ctx.store, CONVERSATION_SESSION_ENTITY, s.session_id, (b) => {
+        b.message_count = CONVERSATION_MAX_MESSAGES_PER_SESSION;
+        b.next_seq = CONVERSATION_MAX_MESSAGES_PER_SESSION + 1;
+      });
+    });
+    const out = ctx.conv.appendMessage(input);
+    expect(out.seq).toBe(1);
+    // Still exactly one message row — the cap did not mint or reject the replay.
+    expect(
+      ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages,
+    ).toHaveLength(1);
+    // A genuinely new message hits the cap.
+    expect(
+      code(() =>
+        ctx.conv.appendMessage({
+          session_id: s.session_id, operator_id: OWNER, role: "operator",
+          body: "overflow", idempotency_key: "cap-new",
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_LIMIT");
+    // sqlRewriteEntity left the session digest stale — restore it so the
+    // context teardown/store checks stay clean for other assertions.
+    sqlRewriteEntity(ctx.store, CONVERSATION_SESSION_ENTITY, s.session_id, (b) => {
+      b.message_count = 1;
+      b.next_seq = 2;
+    });
+  });
+
+  it("raced DIFFERENT-payload replay on a closed session still conflicts", () => {
+    const ctx = fresh("race-close-diff");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const other = new ConversationSessionService(ctx.store);
+    raceOnce(ctx.store, () => {
+      other.appendMessage({
+        session_id: s.session_id, operator_id: OWNER, role: "operator",
+        body: "winner", idempotency_key: "k",
+      });
+      other.closeSession(s.session_id, { operator_id: OWNER });
+    });
+    expect(
+      code(() =>
+        ctx.conv.appendMessage({
+          session_id: s.session_id, operator_id: OWNER, role: "operator",
+          body: "loser", idempotency_key: "k",
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT");
+  });
+
+  /* ---------------- R2.B — membership / owner consistency ---------------- */
+
+  it("a persisted row with mismatched owner fails closed on history reads", () => {
+    const ctx = fresh("owner-mismatch");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const mid = conversationMessageIdFor(s.session_id, "planted");
+    // Plant a row that is INTERNALLY consistent — valid schema, valid
+    // recomputed digest over its own (wrong) fields, store hash coherent.
+    const body = {
+      schema_version: CONVERSATION_MESSAGE_SCHEMA,
+      message_id: mid,
+      session_id: s.session_id,
+      owner_operator_id: OTHER, // planted foreign owner
+      seq: 1,
+      role: "operator",
+      body: "injected",
+      idempotency_key: "planted",
+      created_at: new Date().toISOString(),
+    };
+    (body as Record<string, unknown>).message_digest = digest({
+      contract: "pair-conversation-message.v1",
+      message_id: mid,
+      session_id: s.session_id,
+      owner_operator_id: OTHER,
+      seq: 1,
+      role: "operator",
+      body: "injected",
+      idempotency_key: "planted",
+    });
+    ctx.store.put(CONVERSATION_MESSAGE_ENTITY, mid, body);
+    // History read must not return it — and must fail closed, not skip it.
+    expect(
+      code(() => ctx.conv.listMessages(s.session_id, { operator_id: OWNER })),
+    ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
+    // Replay of the same deterministic id also fails as integrity, not
+    // as a converged row.
+    expect(
+      code(() =>
+        ctx.conv.appendMessage({
+          session_id: s.session_id, operator_id: OWNER, role: "operator",
+          body: "injected", idempotency_key: "planted",
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
+  });
+
+  it("a persisted row claiming a different session fails closed via replay", () => {
+    const ctx = fresh("session-mismatch");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const other = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const mid = conversationMessageIdFor(s.session_id, "crossed");
+    // Row's entity key says session s; its payload claims `other` session.
+    const rowBody = {
+      schema_version: CONVERSATION_MESSAGE_SCHEMA,
+      message_id: mid,
+      session_id: other.session_id, // mismatched membership
+      owner_operator_id: OWNER,
+      seq: 1,
+      role: "operator",
+      body: "cross-session",
+      idempotency_key: "crossed",
+      created_at: new Date().toISOString(),
+    };
+    (rowBody as Record<string, unknown>).message_digest = digest({
+      contract: "pair-conversation-message.v1",
+      message_id: mid,
+      session_id: other.session_id,
+      owner_operator_id: OWNER,
+      seq: 1,
+      role: "operator",
+      body: "cross-session",
+      idempotency_key: "crossed",
+    });
+    ctx.store.put(CONVERSATION_MESSAGE_ENTITY, mid, rowBody);
+    // Replay against session s hits the membership check.
+    expect(
+      code(() =>
+        ctx.conv.appendMessage({
+          session_id: s.session_id, operator_id: OWNER, role: "operator",
+          body: "cross-session", idempotency_key: "crossed",
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
+    // listMessages(s) never sees it — the filter keys off session_id.
+    // The entity-key/payload disagreement is what the replay path proves.
+    expect(
+      ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages,
+    ).toHaveLength(0);
   });
 
   it("idempotent retry converges — same key, same row, no duplicate", () => {

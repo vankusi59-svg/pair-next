@@ -515,6 +515,15 @@ export class ConversationSessionService {
     },
   ): ConversationMessageRow {
     this.assertCanonicalMessage(row);
+    // Membership/owner consistency (R2.B): the stored row must name THIS
+    // session and THIS owner. A planted row whose own message_digest and
+    // store hash are internally consistent — but whose session_id or
+    // owner_operator_id disagree with the canonical session — is an
+    // integrity violation, not an idempotency conflict.
+    if (String(row.session_id) !== input.sessionId ||
+        String(row.owner_operator_id) !== input.ownerOperatorId) {
+      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", input.messageId);
+    }
     const expected = conversationMessageDigest({
       message_id: String(row.message_id),
       session_id: input.sessionId,
@@ -575,21 +584,21 @@ export class ConversationSessionService {
 
     return this.store.immediate(() => {
       const session = resolveSession();
-      if (session.state !== "OPEN") {
-        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_CLOSED", sessionId);
-      }
-      if (session.message_count >= CONVERSATION_MAX_MESSAGES_PER_SESSION) {
-        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "messages_per_session");
-      }
-      // Re-check inside the txn: a racing commit may have minted the
-      // same deterministic id between the pre-check and here. It is
-      // judged by the SAME equivalence rule — identical retry converges
-      // (no seq advance, no second event), different payload conflicts.
+      // Replay check runs BEFORE new-write admission (R2.A): an identical
+      // committed message converges even when the session closed or hit
+      // its cap after the pre-check — it is a retry of committed state,
+      // not a new write. A different-payload collision still conflicts.
       const raced = this.store.tryGet(CONVERSATION_MESSAGE_ENTITY, messageId);
       if (raced) {
         return this.replayOrConflict(raced, {
           sessionId, ownerOperatorId, role, body, idemKey, messageId,
         }) as ConversationMessageRow & { version: number };
+      }
+      if (session.state !== "OPEN") {
+        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_CLOSED", sessionId);
+      }
+      if (session.message_count >= CONVERSATION_MAX_MESSAGES_PER_SESSION) {
+        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "messages_per_session");
       }
       const seq = Number(session.next_seq);
       const now = utcnow();
@@ -649,7 +658,7 @@ export class ConversationSessionService {
   }): { messages: ConversationMessageRow[]; next_after_seq: number | null } {
     const op = assertStr("operator_id", input.operator_id);
     const id = assertStr("session_id", sessionId);
-    this.ownedSession(id, op);
+    const session = this.ownedSession(id, op);
     if (input.after_seq !== null && input.after_seq !== undefined &&
         !Number.isFinite(Number(input.after_seq))) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_FIELD", "after_seq");
@@ -670,6 +679,13 @@ export class ConversationSessionService {
       .filter((r) => String(r.session_id) === id)
       .map((r) => {
         this.assertCanonicalMessage(r);
+        // Membership/owner consistency (R2.B): a persisted row may pass
+        // its own message_digest and store-hash check yet still name a
+        // different owner than the canonical session — planted foreign
+        // rows are an integrity violation, never silently returned.
+        if (String(r.owner_operator_id) !== String(session.owner_operator_id)) {
+          throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", String(r.message_id));
+        }
         return r as unknown as ConversationMessageRow;
       })
       .sort((a, b) => a.seq - b.seq)
