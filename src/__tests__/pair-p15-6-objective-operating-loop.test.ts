@@ -1594,3 +1594,114 @@ describe("P15.6 R3.B — injected drift at real between-seam boundaries", () => 
     s.store.close();
   });
 });
+
+/* ---------- R3 followup F1 — every AWAITING_EXECUTION is proven ---------- */
+
+describe("P15.6 F1 — early AWAITING_EXECUTION must be proven", () => {
+  /** child IN_PROGRESS + canonical RUNNING mission (spine + runtime). */
+  function runningChild(name: string) {
+    const { s, oid, binding, ops } = seeded(name, new FakeInvoker(WAIT_JSON), ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = childOfKey(s, binding, "w1");
+    s.biz.openWorkItem(cid, OP);
+    const mid = boundMissionId(s, cid);
+    missionRunning(s, mid);
+    s.runtime.transitionRuntime(mid, "READY", "f1");
+    s.runtime.transitionRuntime(mid, "RUNNING", "f1");
+    return { s, oid, ops, cid, mid };
+  }
+
+  it("F1-control: canonical in-flight child → proven AWAITING_EXECUTION", async () => {
+    const { s, oid, ops } = runningChild("f1-ok");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("AWAITING_EXECUTION");
+    s.store.close();
+  });
+
+  it("F1-a. runtime row rewritten after canonical RUNNING spine → FAIL CLOSED, not AWAITING", async () => {
+    const { s, oid, ops, mid } = runningChild("f1-rewrite");
+    sqlRewriteEntity(s.store, "mission_runtime", `MRT_${mid}`,
+      (b) => { b.state = "FAILED"; });
+    await expect(ops.runObjectivePass({ objective_id: oid, actor: OP }))
+      .rejects.toMatchObject({ code: /FAIL_CLOSED/ });
+    s.store.close();
+  });
+
+  it("F1-b. runtime transition evidence forged → FAIL CLOSED, not AWAITING", async () => {
+    const { s, oid, ops, mid } = runningChild("f1-evforge");
+    s.store.event({
+      entity_type: "mission_runtime", entity_id: `MRT_${mid}`,
+      event_type: "MISSION_RUNTIME_TRANSITION",
+      old_state: "FAILED", new_state: "RUNNING",
+      actor: "forged", metadata: { mission_id: mid },
+    });
+    await expect(ops.runObjectivePass({ objective_id: oid, actor: OP }))
+      .rejects.toMatchObject({ code: /FAIL_CLOSED/ });
+    s.store.close();
+  });
+
+  it("F1-c. runtime evidence orphaned (row deleted) → FAIL CLOSED", async () => {
+    const { s, oid, ops, mid } = runningChild("f1-orphan");
+    dbOf(s.store)
+      .prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+      .run("mission_runtime", `MRT_${mid}`);
+    await expect(ops.runObjectivePass({ objective_id: oid, actor: OP }))
+      .rejects.toMatchObject({ code: /FAIL_CLOSED/ });
+    s.store.close();
+  });
+});
+
+/* ---------- R3 followup F2 — admission pins the actual child lineage ---------- */
+
+describe("P15.6 F2 — objective admission bound to the child lineage", () => {
+  it("F2-a. admission pinned to a FOREIGN objective (same version) → FAIL before WOB/mission", async () => {
+    const { s, bid, binding } = seeded("f2-lineage", new FakeInvoker(WAIT_JSON), ["w1"]);
+    // Objective A (the child's canonical lineage) and foreign B.
+    const oA = s.biz.objectives.get(
+      String(binding.objective_id));
+    const oidA = String(oA.objective_id);
+    s.alloc.allocateWorkstream({ objective_id: oidA, workstream_key: "w1", actor: OP });
+    const cidA = childOfKey(s, binding, "w1");
+    const oB = mkObjective(s, bid);
+    const oidB = String(oB.objective_id);
+    // Deliberately pin objective B on child of A — even a matching
+    // version can never be its lineage.
+    expect(() => s.biz.openWorkItem(cidA, OP, {
+      objective_id: oidB,
+      expected_objective_version: Number(oB.version),
+    })).toThrow(/FAIL_CLOSED_OBJECTIVE_LINEAGE_FOR_OPEN/);
+    expect(s.store.list("work_open_binding").length).toBe(0);
+    expect(s.store.list("mission").length).toBe(0);
+    expect(String(s.store.get("work_item", cidA).status)).toBe("READY");
+    s.store.close();
+  });
+
+  it("F2-b. admission without any WAL lineage → FAIL closed", () => {
+    const { s, bid } = seeded("f2-nowal", new FakeInvoker(WAIT_JSON), ["w1"]);
+    // Plain P14 work item with zero objective lineage.
+    const wi = s.biz.createWorkItem({
+      business_id: bid, title: "p14 item", goal: "g", operator_id: OP,
+    });
+    const oB = mkObjective(s, bid);
+    expect(() => s.biz.openWorkItem(String(wi.work_item_id), OP, {
+      objective_id: String(oB.objective_id),
+      expected_objective_version: Number(oB.version),
+    })).toThrow(/FAIL_CLOSED_OBJECTIVE_LINEAGE_FOR_OPEN/);
+    s.store.close();
+  });
+
+  it("F2-c. correct lineage admission still opens (control)", () => {
+    const { s, binding } = seeded("f2-ok", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const oid = String(binding.objective_id);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = childOfKey(s, binding, "w1");
+    const o = s.biz.objectives.get(oid);
+    const row = s.biz.openWorkItem(cid, OP, {
+      objective_id: oid,
+      expected_objective_version: Number(o.version),
+    });
+    expect(String(row.status)).toBe("IN_PROGRESS");
+    expect(s.store.list("mission").length).toBe(1);
+    s.store.close();
+  });
+});

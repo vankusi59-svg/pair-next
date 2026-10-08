@@ -257,11 +257,26 @@ export class ObjectiveOperatingService {
       });
     }
     if (activeExecution) {
+      // R3-F1 — AWAITING_EXECUTION is itself a claim about execution
+      // authority: it must be PROVEN, never read from the lifecycle
+      // projection. The projection located the candidate child; the
+      // canonical bound Mission must independently satisfy the full
+      // in-flight proof (mission spine + WOB identity + runtime
+      // event replay). Corrupt runtime evidence or a missing binding
+      // fails closed — never a free AWAITING_EXECUTION.
+      const child = this.store.get(
+        "work_item", activeExecution.delegated_child_work_item_id!) as Row;
+      const mission = this.deps.business.boundMissionForWorkItem(child);
+      if (!mission) {
+        operatingFail(
+          `IN_PROGRESS delegated child ${activeExecution.delegated_child_work_item_id} has no canonical bound mission`);
+      }
+      assertCanonicalMissionInFlight(this.store, mission, child);
       return result("AWAITING_EXECUTION", {
         binding_id: String(binding.binding_id),
         workstream_key: activeExecution.workstream_key,
         delegated_child_work_item_id: activeExecution.delegated_child_work_item_id ?? undefined,
-        mission_id: this.boundMissionId(activeExecution),
+        mission_id: String(mission.mission_id),
       });
     }
 
@@ -589,13 +604,6 @@ export class ObjectiveOperatingService {
       w.workstream_status === "CANCELLED" ||
       w.delegated_child_status === "DONE" ||
       w.delegated_child_status === "CANCELLED";
-  }
-
-  private boundMissionId(w: ReviewWorkstreamProjection): string | undefined {
-    if (!w.delegated_child_work_item_id) return undefined;
-    const child = this.store.tryGet("work_item", w.delegated_child_work_item_id) as Row | null;
-    const mission = child ? this.deps.business.boundMissionForWorkItem(child) : null;
-    return mission ? String(mission.mission_id) : undefined;
   }
 
   /** Rank a workstream key by the latest canonical strategy's
