@@ -42,6 +42,7 @@ import type { MissionDraftService, MissionDraftRow } from "./mission-draft.js";
 
 export const TELEGRAM_CHAT_BINDING_ENTITY = "telegram_chat_binding";
 export const TELEGRAM_CONFIRM_REF_ENTITY = "telegram_confirm_ref";
+export const TELEGRAM_UPDATE_ENTITY = "telegram_update";
 
 /* Natural-language ack set — matched case-insensitively on the trimmed
  * message. An ack text is confirmation authority ONLY when reply-bound
@@ -53,6 +54,14 @@ export const TELEGRAM_ACK_WORDS = new Set([
 
 const TG_MAX_TEXT_CHARS = 3500;
 const TELEGRAM_PRIVATE_ONLY = "private";
+/** Telegram caps a message at 4096 chars — hold headroom so markup and
+ *  future fields never push a rendered part over the wire limit. */
+const TG_MSG_SAFE_CHARS = 4000;
+/** Presentation bound: header + goal chunks + final confirmation block.
+ *  Canonical terms (goal ≤ 3500 + fixed metadata) always fit within 4 —
+ *  anything larger means inconsistent inputs → fail closed, never
+ *  partially present. */
+const TG_MAX_PRESENTATION_MESSAGES = 4;
 
 export interface TelegramChatBindingRow {
   binding_id: string;
@@ -117,6 +126,87 @@ export function telegramRefDigest(row: {
  *  onto the same ref instead of minting parallel authorities. */
 export function telegramRefIdFor(draftId: string): string {
   return `TGR_${digest(`telegram-confirm-ref:${draftId}`).slice(0, 22)}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Processed-update outcome records (R1.A)                              */
+/*                                                                      */
+/* Telegram's delivery is at-least-once; the bridge's durable cursor is  */
+/* only a hint. The COMMITTED outcome of a mutating inbound action is    */
+/* recorded here INSIDE the same transaction that performs it — a       */
+/* replayed update converges onto the recorded outcome no matter what   */
+/* the cursor says.                                                     */
+export interface TelegramUpdateRow {
+  update_key: string;       // `tgupd:<chat_id>:<update_id>` — entity key
+  chat_id: string;
+  update_id: number;
+  kind: string;             // the action committed (currently "new")
+  /** Recorded outcome summary — returned verbatim on replay. */
+  outcome: Record<string, unknown>;
+  update_digest: string;
+  created_at: string;
+}
+
+export function telegramUpdateDigest(row: {
+  update_key: string; chat_id: string; update_id: number;
+  kind: string; outcome: Record<string, unknown>;
+}): string {
+  return digest({
+    contract: "pair-telegram-update.v1",
+    update_key: row.update_key,
+    chat_id: row.chat_id,
+    update_id: row.update_id,
+    kind: row.kind,
+    outcome: row.outcome,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Draft presentation (R1.B)                                            */
+/*                                                                      */
+/* Confirmation authority requires the operator to SEE the exact        */
+/* canonical terms. Presentation segments are built here — the bridge   */
+/* may attach the Confirm markup ONLY to the last segment and may only  */
+/* call prompt-sent after it delivered. A draft whose terms cannot be   */
+/* fully presented within the bounded segment count fails closed with   */
+/* zero confirmation authority (the ref is never minted).               */
+export function telegramDraftPresentation(draft: MissionDraftRow): string[] {
+  const header = [
+    "GOVERNED MISSION DRAFT — chờ xác nhận",
+    `draft: ${draft.draft_id}`,
+    "",
+    "goal:",
+  ].join("\n");
+  const goal = String(draft.goal ?? "");
+  const confirmBlock = [
+    "ĐIỀU KHOẢN — kiểm tra trước khi xác nhận:",
+    `draft: ${draft.draft_id}`,
+    `project: ${draft.project_id}`,
+    `permissions: ${(draft.granted_permissions ?? []).join(", ") || "—"}`,
+    `workspaces: ${(draft.authorized_workspaces ?? []).join(", ") || "—"}`,
+    `risk ceiling: ${draft.risk_ceiling ?? "system default"}`,
+    `hết hạn: ${draft.expires_at}`,
+    "",
+    "Bấm Confirm để submit đúng draft này — hoặc reply tin nhắn này bằng \"OK\"/\"xác nhận\".",
+  ].join("\n");
+  const full = [header, goal, "", confirmBlock].join("\n");
+  // Single-message when everything fits — identical shape to the
+  // pre-R1 prompt for ordinary short drafts.
+  if (full.length <= TG_MSG_SAFE_CHARS) return [full];
+  // Otherwise chunk the COMPLETE content — the last segment always ends
+  // with the confirmation instructions and is the ONLY segment that may
+  // carry Confirm markup.
+  const parts: string[] = [];
+  for (let i = 0; i < full.length; i += TG_MSG_SAFE_CHARS) {
+    parts.push(full.slice(i, i + TG_MSG_SAFE_CHARS));
+  }
+  if (parts.length > TG_MAX_PRESENTATION_MESSAGES) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_TELEGRAM_PRESENTATION",
+      `terms need ${parts.length} messages (cap ${TG_MAX_PRESENTATION_MESSAGES})`,
+    );
+  }
+  return parts;
 }
 
 function assertField(field: string, v: unknown): string {
@@ -269,12 +359,40 @@ export class TelegramConversationService {
 
   /** "/new" — close the bound session and mint a fresh one. Pending
    *  drafts on the old session become unreachable for acks (they belong
-   *  to the closed session), which is exactly the operator intent. */
-  newChatSession(input: { operator_id: string; chat_id: string }): ConversationSessionRow {
+   *  to the closed session), which is exactly the operator intent.
+   *
+   *  Idempotent by (chat_id, update_id): the rotation AND its outcome
+   *  record commit in the SAME transaction — a replayed /new update
+   *  returns the originally minted session (`reused: true`) and never
+   *  rotates again. */
+  newChatSession(input: {
+    operator_id: string; chat_id: string; update_id: number;
+  }): { session: ConversationSessionRow; reused: boolean } {
     const operatorId = assertField("operator_id", input.operator_id);
     const chatId = assertField("chat_id", input.chat_id);
     this.assertChatOperator(operatorId, chatId);
+    if (!Number.isSafeInteger(Number(input.update_id)) || Number(input.update_id) <= 0) {
+      throw new IntegrityError("FAIL_CLOSED_TELEGRAM_FIELD", "update_id invalid");
+    }
+    const updateId = Number(input.update_id);
+    const updateKey = `tgupd:${chatId}:${updateId}`;
     return this.deps.store.immediate(() => {
+      const prior = this.deps.store.tryGet(TELEGRAM_UPDATE_ENTITY, updateKey);
+      if (prior) {
+        if (String(prior.update_digest) !== telegramUpdateDigest({
+          update_key: String(prior.update_key), chat_id: String(prior.chat_id),
+          update_id: Number(prior.update_id), kind: String(prior.kind),
+          outcome: prior.outcome as Record<string, unknown>,
+        })) {
+          throw new IntegrityError("FAIL_CLOSED_TELEGRAM_INTEGRITY", updateKey);
+        }
+        if (String(prior.kind) !== "new" || String(prior.chat_id) !== chatId) {
+          throw new IntegrityError("FAIL_CLOSED_TELEGRAM_INTEGRITY", `kind ${String(prior.kind)}`);
+        }
+        const recorded = this.deps.conversation.getSession(
+          String((prior.outcome as { session_id: string }).session_id), operatorId);
+        return { session: recorded, reused: true };
+      }
       const existing = this.deps.store
         .list(TELEGRAM_CHAT_BINDING_ENTITY)
         .find((r) => String(r.chat_id) === chatId);
@@ -312,8 +430,25 @@ export class TelegramConversationService {
         row,
         existing ? Number(existing.version ?? 0) : undefined,
       );
-      return session;
-    }) as unknown as ConversationSessionRow;
+      // Atomic outcome record — same transaction as the rotation.
+      const outcomeRow: TelegramUpdateRow = {
+        update_key: updateKey,
+        chat_id: chatId,
+        update_id: updateId,
+        kind: "new",
+        outcome: {
+          session_id: session.session_id,
+          previous_session_id: existing ? String(existing.session_id) : null,
+        },
+        update_digest: "",
+        created_at: this.now(),
+      };
+      outcomeRow.update_digest = telegramUpdateDigest(outcomeRow);
+      this.deps.store.put(
+        TELEGRAM_UPDATE_ENTITY, updateKey,
+        outcomeRow as unknown as Record<string, unknown>);
+      return { session, reused: false };
+    }) as unknown as { session: ConversationSessionRow; reused: boolean };
   }
 
   /* ------------------------------------------------------------------ */
@@ -402,7 +537,13 @@ export class TelegramConversationService {
   /** "/draft <project> <goal>" — explicit draft preparation. The caller
    *  MUST name a canonical project; the service never picks one. Draft
    *  creation mints ZERO missions; the ACTIVE ref is what the bot's
-   *  Confirm/Reject buttons and the prompt message bind to. */
+   *  Confirm/Reject buttons and the prompt message bind to.
+   *
+   *  `presentation` (R1.B): the COMPLETE canonical terms split into
+   *  Telegram-safe segments — the bridge must deliver all of them in
+   *  order and may attach Confirm markup ONLY to the last one. When the
+   *  terms cannot be fully presented, this throws before the ref is
+   *  minted: no ref, no prompt, zero confirmation authority. */
   prepareDraft(input: {
     operator_id: string;
     chat_id: string;
@@ -412,7 +553,7 @@ export class TelegramConversationService {
     granted_permissions?: string[];
     authorized_workspaces?: string[];
     risk_ceiling?: string;
-  }): { session: ConversationSessionRow; draft: MissionDraftRow; ref: TelegramConfirmRefRow } {
+  }): { session: ConversationSessionRow; draft: MissionDraftRow; ref: TelegramConfirmRefRow; presentation: string[] } {
     const operatorId = assertField("operator_id", input.operator_id);
     const chatId = assertField("chat_id", input.chat_id);
     this.assertChatOperator(operatorId, chatId);
@@ -434,7 +575,13 @@ export class TelegramConversationService {
       // the same draft rather than minting duplicates.
       client_request_id: `tg:draft:${Number(input.update_id)}`,
     });
-    return { session, draft, ref: this.mintRef({ operatorId, chatId, sessionId: session.session_id, draft }) };
+    // Build the full presentation BEFORE the ref exists — an
+    // unpresentable draft mints no ref and holds no confirm authority.
+    const presentation = telegramDraftPresentation(draft);
+    return {
+      session, draft, presentation,
+      ref: this.mintRef({ operatorId, chatId, sessionId: session.session_id, draft }),
+    };
   }
 
   private mintRef(input: {
@@ -540,11 +687,20 @@ export class TelegramConversationService {
     if (ref.operator_id !== operatorId || ref.chat_id !== chatId) {
       throw new IntegrityError("FAIL_CLOSED_TELEGRAM_REF_OWNERSHIP", ref.ref_id);
     }
-    if (ref.expires_at <= this.now()) {
-      throw new IntegrityError("FAIL_CLOSED_TELEGRAM_REF_EXPIRED", ref.ref_id);
-    }
     if (ref.state !== "ACTIVE" && ref.state !== "CONSUMED") {
       throw new IntegrityError("FAIL_CLOSED_TELEGRAM_REF_STATE", `ref ${ref.ref_id} ${ref.state}`);
+    }
+    // R1.B — a ref grants confirmation authority ONLY after the complete
+    // terms presentation was durably delivered: the recorded prompt
+    // message is the proof that every segment reached the operator. An
+    // unbound ref (prompt never sent, partial delivery) cannot confirm.
+    if (ref.prompt_message_id == null) {
+      throw new IntegrityError("FAIL_CLOSED_TELEGRAM_REF_NOT_PRESENTED", ref.ref_id);
+    }
+    // Expiry binds only live prompts — a CONSUMED ref replays its
+    // receipt regardless so duplicate taps converge deterministically.
+    if (ref.state === "ACTIVE" && ref.expires_at <= this.now()) {
+      throw new IntegrityError("FAIL_CLOSED_TELEGRAM_REF_EXPIRED", ref.ref_id);
     }
     const result = await this.deps.drafts.confirmDraft({
       session_id: ref.session_id,

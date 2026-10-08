@@ -1414,9 +1414,12 @@ export function createMissionControlServer(
           }));
         }
         if (method === "POST" && p === "/api/telegram/conversation/new") {
-          return void json(res, 200, {
-            session: tg.newChatSession({ operator_id: operator, chat_id: chatId }),
-          });
+          // update_id binds the rotation to Telegram's update identity —
+          // a replayed /new update converges onto the recorded session.
+          return void json(res, 200, tg.newChatSession({
+            operator_id: operator, chat_id: chatId,
+            update_id: Number(body.update_id),
+          }));
         }
         if (method === "GET" && p === "/api/telegram/conversation/pending") {
           return void json(res, 200, {

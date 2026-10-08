@@ -272,7 +272,8 @@ describe("P15.8-E §1 — ordinary text becomes conversation, never a mission", 
     const r = await json(await ingress(port, "hello"));
     expect((r.body as { kind: string }).kind).toBe("reasoning_unavailable");
     // /new + /draft still work
-    const nw = await json(await post(port, "/api/telegram/conversation/new", { chat_id: CHAT }));
+    const nw = await json(await post(port, "/api/telegram/conversation/new",
+      { chat_id: CHAT, update_id: ++upd }));
     expect(nw.status).toBe(200);
     expect(missionsOf(s)).toHaveLength(0);
   });
@@ -422,6 +423,10 @@ describe("P15.8-E §3 — durability + tamper", () => {
     expect(again.session.session_id).toBe(session.session_id);
     const pending = d2.telegram.listPending({ operator_id: OP, chat_id: CHAT });
     expect(pending.map((x) => x.draft_id)).toContain(draft.draft_id);
+    // R1.B — confirmation authority requires the recorded prompt: the
+    // restarted bridge re-delivers the prompt and binds its message id.
+    d2.telegram.bindPromptMessage({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, message_id: 990001 });
     // confirm through the restarted service converges to one mission
     const c = await d2.telegram.confirmByRef({
       operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, kind: "explicit" });
@@ -444,6 +449,110 @@ describe("P15.8-E §3 — durability + tamper", () => {
     await expect(d.telegram.confirmByRef({
       operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, kind: "explicit",
     })).rejects.toThrow(/FAIL_CLOSED/);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+});
+
+describe("P15.8-E R1 — inbound outcome durability + full presentation", () => {
+  it("R1.A: /new is idempotent by (chat_id, update_id) — replay returns the recorded session, binding stable", () => {
+    const s = freshStack("newdedup");
+    const d = convDeps(s, new MockInvoker());
+    const first = d.telegram.newChatSession({ operator_id: OP, chat_id: CHAT, update_id: 501 });
+    expect(first.reused).toBe(false);
+    // Replay the SAME update — recorded outcome replays; NO new session.
+    const replay = d.telegram.newChatSession({ operator_id: OP, chat_id: CHAT, update_id: 501 });
+    expect(replay.reused).toBe(true);
+    expect(replay.session.session_id).toBe(first.session.session_id);
+    // Binding still points at the originally minted session.
+    const bound = d.telegram.resolveChatSession({ operator_id: OP, chat_id: CHAT });
+    expect(bound.session.session_id).toBe(first.session.session_id);
+    const sessions = s.store.list("conversation_session")
+      .filter((x) => String(x.owner_operator_id) === OP);
+    expect(sessions).toHaveLength(1);
+    // A DIFFERENT update id is a new intent — rotates once more.
+    const second = d.telegram.newChatSession({ operator_id: OP, chat_id: CHAT, update_id: 502 });
+    expect(second.reused).toBe(false);
+    expect(second.session.session_id).not.toBe(first.session.session_id);
+    const bound2 = d.telegram.resolveChatSession({ operator_id: OP, chat_id: CHAT });
+    expect(bound2.session.session_id).toBe(second.session.session_id);
+  });
+
+  it("R1.B: a ref never bound to a delivered prompt grants NO confirm authority", async () => {
+    const s = freshStack("noprompt");
+    const d = convDeps(s, new MockInvoker());
+    const { ref } = d.telegram.prepareDraft({
+      operator_id: OP, chat_id: CHAT, project_id: s.projectId, goal: "g", update_id: 8 });
+    // Terms were never presented → confirm fails closed.
+    await expect(d.telegram.confirmByRef({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, kind: "explicit",
+    })).rejects.toThrow(/FAIL_CLOSED_TELEGRAM_REF_NOT_PRESENTED/);
+    expect(missionsOf(s)).toHaveLength(0);
+    // After the recorded prompt exists, the same ref confirms once.
+    d.telegram.bindPromptMessage({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, message_id: 123001 });
+    const c = await d.telegram.confirmByRef({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, kind: "explicit" });
+    expect(c.mission_id).toMatch(/^MSN_/);
+    expect(missionsOf(s)).toHaveLength(1);
+  });
+
+  it("R1.B: a 1,000-char goal is presented COMPLETE before confirm; mission holds the exact goal", async () => {
+    const s = freshStack("longgoal");
+    const d = convDeps(s, new MockInvoker());
+    const goal = "viết báo cáo " + "x".repeat(987); // 1,000 chars total
+    const { draft, presentation, ref } = d.telegram.prepareDraft({
+      operator_id: OP, chat_id: CHAT, project_id: s.projectId, goal, update_id: 9 });
+    expect(presentation.length).toBeGreaterThanOrEqual(1);
+    for (const part of presentation) {
+      expect(part.length).toBeLessThanOrEqual(4000);
+    }
+    // The COMPLETE canonical terms are what the operator sees.
+    const rendered = presentation.join("");
+    expect(rendered).toContain(goal);
+    expect(rendered).toContain(s.projectId);
+    expect(rendered).toContain(draft.draft_id);
+    expect(rendered).toContain(draft.expires_at);
+    // Confirm binds the FINAL presented message → exact goal submitted.
+    d.telegram.bindPromptMessage({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, message_id: 456001 });
+    const c = await d.telegram.confirmByRef({
+      operator_id: OP, chat_id: CHAT, ref_id: ref.ref_id, kind: "explicit" });
+    const mission = s.store.get("mission", c.mission_id) as { goal: string };
+    expect(mission.goal).toBe(goal);
+  });
+
+  it("R1.B: terms exceeding one message → bounded multi-part presentation; overflow mints NO ref", () => {
+    const s = freshStack("multipart");
+    const d = convDeps(s, new MockInvoker());
+    // Long workspace list pushes terms past a single Telegram message.
+    const ws = Array.from({ length: 24 }, (_, i) =>
+      `/workspace/${"segment".repeat(30)}-${i}`);
+    const { presentation, ref } = d.telegram.prepareDraft({
+      operator_id: OP, chat_id: CHAT, project_id: s.projectId,
+      goal: "multi-part draft", update_id: 10,
+      authorized_workspaces: ws });
+    expect(presentation.length).toBeGreaterThan(1);
+    expect(presentation.length).toBeLessThanOrEqual(4);
+    for (const part of presentation) {
+      expect(part.length).toBeLessThanOrEqual(4000);
+    }
+    const rendered = presentation.join("");
+    for (const w of ws) expect(rendered).toContain(w);
+    expect(rendered).toContain("Bấm Confirm");
+    // The LAST part is the only one that may carry Confirm markup — and
+    // its message id is the only valid prompt binding.
+    expect(ref.prompt_message_id).toBeNull();
+
+    // Terms that cannot fit the bounded presentation fail closed and
+    // mint NO confirmation ref at all.
+    const huge = Array.from({ length: 32 }, (_, i) => `/ws/${"w".repeat(600)}-${i}`);
+    expect(() => d.telegram.prepareDraft({
+      operator_id: OP, chat_id: CHAT, project_id: s.projectId,
+      goal: "g", update_id: 11, authorized_workspaces: huge,
+    })).toThrow(/FAIL_CLOSED_TELEGRAM_PRESENTATION/);
+    // No orphaned ref grants authority for the failed draft.
+    const refs = s.store.list("telegram_confirm_ref");
+    expect(refs.filter((r) => String(r.chat_id) === CHAT)).toHaveLength(1); // only the successful one
     expect(missionsOf(s)).toHaveLength(0);
   });
 });

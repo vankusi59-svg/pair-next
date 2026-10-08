@@ -52,11 +52,14 @@ afterAll(() => {
 });
 
 /* ---- mock Telegram Bot API ------------------------------------------------ */
-interface TgCall { method: string; body: Record<string, unknown> }
+interface TgCall { method: string; body: Record<string, unknown>; failed?: boolean }
 class MockTgApi {
   calls: TgCall[] = [];
   updates: Record<string, unknown>[] = [];
   mid = 90000;
+  /** When >0, the next `failNextSends` sendMessage calls return HTTP 500 —
+   *  simulates a presentation send dying mid-sequence. */
+  failNextSends = 0;
   server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (d) => (body += d));
@@ -73,10 +76,21 @@ class MockTgApi {
         case "setMyCommands": return ok(true);
         case "getUpdates": {
           const off = Number(parsed.offset ?? 0);
+          // Telegram semantics: updates stay until the offset confirms
+          // them — an unconfirmed update is re-delivered.
           return ok(this.updates.filter((u) =>
-            Number(u.update_id) >= off).splice(0));
+            Number(u.update_id) >= off));
         }
-        case "sendMessage": return ok({ message_id: ++this.mid });
+        case "sendMessage": {
+          if (this.failNextSends > 0) {
+            this.failNextSends -= 1;
+            this.calls[this.calls.length - 1]!.failed = true;
+            res.statusCode = 500;
+            res.end(JSON.stringify({ ok: false, description: "boom" }));
+            return;
+          }
+          return ok({ message_id: ++this.mid });
+        }
         case "answerCallbackQuery": return ok(true);
         case "editMessageReplyMarkup": return ok(true);
         default: return ok(true);
@@ -87,6 +101,11 @@ class MockTgApi {
   sent(chatId: string): TgCall[] {
     return this.calls.filter(
       (c) => c.method === "sendMessage" && String(c.body.chat_id) === String(chatId));
+  }
+  /** sendMessage calls that actually got a 200 — buttons only exist on
+   *  these; a 500 attempt recorded in `calls` delivered nothing. */
+  delivered(chatId: string): TgCall[] {
+    return this.sent(chatId).filter((c) => !c.failed);
   }
   async listen(): Promise<number> {
     await new Promise<void>((r) => this.server.listen(0, r));
@@ -329,5 +348,162 @@ describe("P15.8-E bridge e2e — real bridge × mock Bot API × real MC", () => 
       String(c.body.text).includes("không có quyền")));
     expect(st.store.list("conversation_session").filter(
       (x) => String(x.owner_operator_id).includes("555444")).length).toBe(0);
+  }, 25000);
+
+  it("R1.A: crash between receive and ingress — the offset never passes the update; restart processes it exactly once", async () => {
+    const dir = path.join(ROOT, `s${counter++}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "telegram-allow.json"), JSON.stringify([CHAT]));
+    const st = stack(dir);
+    // Spawn the bridge against a DEAD mission-control endpoint: every
+    // dispatch is an ambiguous outcome — bounded retry, then the cursor
+    // must NOT advance past the update.
+    const deadPort = await new Promise<number>((r) => {
+      const s = http.createServer().listen(0, () => {
+        const p = (s.address() as AddressInfo).port; s.close(() => r(p));
+      });
+    });
+    const tg = new MockTgApi();
+    const tgPort = await tg.listen();
+    const log: string[] = [];
+    const dead = await spawnBridge(deadPort, tgPort, dir, log);
+    tg.push(msgUpdate(1, CHAT, "tin nhắn trước crash"));
+    await waitFor(() => log.join("").includes("ambiguous"), 8000);
+    // give the bounded-retry window time to exhaust
+    await new Promise((r) => setTimeout(r, 2500));
+    expect(fs.existsSync(path.join(dir, "telegram-offset.json"))).toBe(false);
+    dead.kill("SIGKILL");
+
+    // Restart against live MC — the uncommitted update is redelivered
+    // and processed exactly once.
+    const mcPort = await new Promise<number>((r) =>
+      st.server.listen(0, () => r((st.server.address() as AddressInfo).port)));
+    servers.push(st.server);
+    const log2: string[] = [];
+    await spawnBridge(mcPort, tgPort, dir, log2);
+    await waitFor(() => tg.sent(CHAT).some((c) =>
+      String(c.body.text).includes("PAIR trả lời mô phỏng")));
+    const ops = st.store.list("conversation_message").filter(
+      (m) => m.role === "operator" && String(m.body).includes("trước crash"));
+    const ast = st.store.list("conversation_message").filter(
+      (m) => m.role === "assistant");
+    expect(ops).toHaveLength(1);
+    expect(ast).toHaveLength(1);
+    expect(st.store.list("mission")).toHaveLength(0);
+    expect(fs.existsSync(path.join(dir, "telegram-offset.json"))).toBe(true);
+  }, 30000);
+
+  it("R1.A: replayed /new update replays the recorded outcome — one new session, stable binding", async () => {
+    const dir = path.join(ROOT, `s${counter++}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "telegram-allow.json"), JSON.stringify([CHAT]));
+    const st = stack(dir);
+    const mcPort = await new Promise<number>((r) =>
+      st.server.listen(0, () => r((st.server.address() as AddressInfo).port)));
+    servers.push(st.server);
+    const tg = new MockTgApi();
+    const tgPort = await tg.listen();
+    const log: string[] = [];
+    const child = await spawnBridge(mcPort, tgPort, dir, log);
+
+    tg.push(msgUpdate(40, CHAT, "/new"));
+    await waitFor(() => tg.sent(CHAT).some((c) =>
+      String(c.body.text).includes("Phiên trò chuyện mới")));
+    const boundAfterNew = String(
+      (st.store.list("telegram_chat_binding")[0] as never as { session_id: string }).session_id);
+    const sessions = () => st.store.list("conversation_session")
+      .filter((x) => String(x.owner_operator_id) === `telegram:${CHAT}`).length;
+    expect(sessions()).toBe(1); // fresh chat: the rotated session IS the only one
+
+    // Crash + rewind the durable cursor → the SAME update redelivers.
+    child.kill("SIGKILL");
+    fs.rmSync(path.join(dir, "telegram-offset.json"), { force: true });
+    const log2: string[] = [];
+    await spawnBridge(mcPort, tgPort, dir, log2);
+    await waitFor(() => tg.sent(CHAT).filter((c) =>
+      String(c.body.text).includes("Phiên trò chuyện mới")).length >= 2);
+    await new Promise((r) => setTimeout(r, 1000));
+    // Recorded outcome replayed — NO extra session, binding unchanged.
+    expect(sessions()).toBe(1);
+    expect(String(
+      (st.store.list("telegram_chat_binding")[0] as never as { session_id: string }).session_id))
+      .toBe(boundAfterNew);
+  }, 25000);
+
+  it("R1.B: a 1,000-char goal is fully presented before Confirm exists; confirm submits the exact goal", async () => {
+    const dir = path.join(ROOT, `s${counter++}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "telegram-allow.json"), JSON.stringify([CHAT]));
+    const st = stack(dir);
+    const mcPort = await new Promise<number>((r) =>
+      st.server.listen(0, () => r((st.server.address() as AddressInfo).port)));
+    servers.push(st.server);
+    const tg = new MockTgApi();
+    const tgPort = await tg.listen();
+    const log: string[] = [];
+    await spawnBridge(mcPort, tgPort, dir, log);
+
+    const goal = "viết báo cáo " + "x".repeat(987); // 1,000 chars
+    tg.push(msgUpdate(50, CHAT, `/draft ${st.projectId} ${goal}`));
+    await waitFor(() => tg.sent(CHAT).some((c) => c.body.reply_markup));
+    // Every presented part together contains the COMPLETE goal.
+    const parts = tg.sent(CHAT).map((c) => String(c.body.text)).join("");
+    expect(parts).toContain(goal);
+    expect(parts).toContain("risk ceiling");
+    const prompt = tg.sent(CHAT).filter((c) => c.body.reply_markup).at(-1)!;
+    const kb = (prompt.body.reply_markup as { inline_keyboard: { callback_data: string }[][] })
+      .inline_keyboard[0]!;
+    tg.push({
+      update_id: 51,
+      callback_query: {
+        id: "cbqL", data: kb[0]!.callback_data,
+        message: { chat: { id: Number(CHAT), type: "private" },
+          message_id: Number(prompt.body.message_id ?? 0) || 1 },
+      },
+    });
+    await waitFor(() => st.store.list("mission").length === 1);
+    const mission = st.store.list("mission")[0] as never as { goal: string };
+    expect(mission.goal).toBe(goal);
+  }, 25000);
+
+  it("R1.B: presentation send failure mints no confirm authority — a forged callback cannot confirm", async () => {
+    const dir = path.join(ROOT, `s${counter++}`);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "telegram-allow.json"), JSON.stringify([CHAT]));
+    const st = stack(dir);
+    const mcPort = await new Promise<number>((r) =>
+      st.server.listen(0, () => r((st.server.address() as AddressInfo).port)));
+    servers.push(st.server);
+    const tg = new MockTgApi();
+    const tgPort = await tg.listen();
+    const log: string[] = [];
+    await spawnBridge(mcPort, tgPort, dir, log);
+
+    // The first (and only) presentation send dies → no buttons are ever
+    // shown → the operator never saw complete terms.
+    tg.failNextSends = 1;
+    tg.push(msgUpdate(60, CHAT, `/draft ${st.projectId} draft sẽ không hiển thị`));
+    await waitFor(() => log.join("").includes("deliver:") ||
+      st.store.list("telegram_confirm_ref").length === 1);
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(tg.delivered(CHAT).some((c) => c.body.reply_markup)).toBe(false);
+    // The minted ref stays unbound to any delivered prompt.
+    const ref = st.store.list("telegram_confirm_ref")[0] as never as {
+      ref_id: string; prompt_message_id: number | null };
+    expect(ref.prompt_message_id).toBeNull();
+    // Even a forged callback on that ref gets no authority.
+    tg.push({
+      update_id: 61,
+      callback_query: {
+        id: "cbqF", data: `c:${ref.ref_id}`,
+        message: { chat: { id: Number(CHAT), type: "private" }, message_id: 1 },
+      },
+    });
+    await waitFor(() =>
+      tg.calls.some((c) => c.method === "answerCallbackQuery"), 8000);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(st.store.list("mission")).toHaveLength(0);
+    const err = tg.sent(CHAT).map((c) => String(c.body.text)).join("");
+    expect(err).toContain("chưa được trình bày");
   }, 25000);
 });
