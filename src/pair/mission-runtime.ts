@@ -2080,11 +2080,14 @@ export class MissionRuntime {
         // The pending read itself failed — there may still be an
         // actionable recovery. Terminalize via the emergency path (its own
         // read decides whether anything durable is possible) rather than
-        // feeding a stub pending into the decision machinery.
-        const msg = String(
-          (err as { message?: string })?.message ?? err,
-        ).replace(/\s+/g, " ").slice(0, 120);
-        this.forceAbortRuntime(missionId, `recovery_boundary_defect:${msg}`);
+        // feeding a stub pending into the decision machinery. Fixed-label
+        // reason only — a freeform err.message may carry secrets into the
+        // durable row/event; canonical code or TRANSITION_FAULT, never
+        // untrusted text.
+        this.forceAbortRuntime(
+          missionId,
+          `recovery_boundary_defect:${faultLabel(err)}`,
+        );
         return;
       }
       if (!pending) throw err;
@@ -2118,10 +2121,12 @@ export class MissionRuntime {
     try {
       this.handleRecoveryApplyFailure(missionId, pending, action, err, now);
     } catch (inner) {
-      const msg = String(
-        (inner as { message?: string })?.message ?? inner,
-      ).replace(/\s+/g, " ").slice(0, 120);
-      this.forceAbortRuntime(missionId, `recovery_boundary_defect:${msg}`);
+      // Same rule: only a canonical code or the fixed TRANSITION_FAULT
+      // label reaches the durable reason — never freeform exception text.
+      this.forceAbortRuntime(
+        missionId,
+        `recovery_boundary_defect:${faultLabel(inner)}`,
+      );
     }
   }
 
