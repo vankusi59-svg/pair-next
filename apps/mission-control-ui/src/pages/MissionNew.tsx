@@ -110,10 +110,12 @@ export function MissionNew() {
 
   return (
     <div className="page narrow">
-      <h1>New mission</h1>
+      <h1>Task entry</h1>
       <p className="muted">
-        Submit is two steps: the governed planner proposes a plan, you review it, then confirm —
-        the server rejects the submit if the plan digest changed since preview.
+        Direct governed mission submission — no chat, no mission draft, no
+        conversational confirmation involved. Submit is two steps: the governed
+        planner proposes a plan, you review it, then confirm — the server
+        rejects the submit if the plan digest changed since preview.
       </p>
       <label htmlFor="goal">Goal</label>
       <textarea id="goal" rows={5} value={goal} onChange={(e) => { setGoal(e.target.value); setPreview(null); }} placeholder="e.g. record this objective in the workspace" />

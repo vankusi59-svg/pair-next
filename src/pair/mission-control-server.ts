@@ -21,6 +21,9 @@ import type { BusinessLayer } from "./business.js";
 import type { WorkforceService } from "./work-graph.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import type { ConversationSessionService } from "./conversation-session.js";
+import type { ConversationReasoningService } from "./conversation-reasoning.js";
+import type { MissionDraftService } from "./mission-draft.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import {
   createDefaultObjectiveOperatingService,
@@ -97,6 +100,17 @@ export interface MissionControlServerDeps {
    *  sets it (the route resolves the real codex-cli model); HTTP
    *  callers can never inject it — it is a server-wiring dep only. */
   ceoInvoker?: CeoDecisionInvoker;
+  /** P15.8-D — conversation layer composition (chat + governed mission
+   *  drafts). Absent entirely → every /api/conversations* route is
+   *  CONVERSATION_DISABLED; `reasoning` absent → only the /turns route
+   *  is unavailable (sessions/history/drafts keep working); `drafts`
+   *  absent → draft routes unavailable. Unrelated Mission Control
+   *  routes are never affected. */
+  conversation?: {
+    sessions: ConversationSessionService;
+    reasoning?: ConversationReasoningService;
+    drafts?: MissionDraftService;
+  };
 }
 
 const MIME: Record<string, string> = {
@@ -1220,6 +1234,154 @@ export function createMissionControlServer(
           hard_stop: body.hard_stop !== false,
           operator_id: String(operator),
         }));
+      }
+      // ----- P15.8-D — conversation layer (Chat + governed drafts) -----
+      // Every route delegates to the canonical services; the handler
+      // never writes store rows directly. Operator identity comes ONLY
+      // from the trusted request boundary (`x-operator-id`, falling back
+      // to body.operator_id per the existing model) — never from a
+      // caller-chosen session owner field.
+      if (p === "/api/conversations" || p.startsWith("/api/conversations/")) {
+        const conv = deps.conversation;
+        if (!conv) return void json(res, 404, { error: "CONVERSATION_DISABLED" });
+        if (!operator) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        if (method === "GET" && p === "/api/conversations") {
+          const state = url.searchParams.get("state");
+          return void json(res, 200, {
+            sessions: conv.sessions.listSessions({
+              operator_id: operator,
+              state: (state as never) ?? null,
+            }),
+          });
+        }
+        if (method === "POST" && p === "/api/conversations") {
+          return void json(res, 200, {
+            session: conv.sessions.createSession({
+              owner_operator_id: operator,
+              title: body.title === undefined ? undefined : String(body.title),
+              client_request_id: body.client_request_id === undefined
+                ? undefined : String(body.client_request_id),
+              correlation_id: body.correlation_id === undefined
+                ? undefined : String(body.correlation_id),
+            }),
+          });
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)$/);
+        if (method === "GET" && m) {
+          return void json(res, 200, {
+            session: conv.sessions.getSession(m[1]!, operator),
+          });
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/messages$/);
+        if (method === "GET" && m) {
+          const afterSeq = url.searchParams.get("after_seq");
+          const limit = url.searchParams.get("limit");
+          return void json(res, 200, conv.sessions.listMessages(m[1]!, {
+            operator_id: operator,
+            after_seq: afterSeq === null ? null : Number(afterSeq),
+            limit: limit === null ? null : Number(limit),
+          }));
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/turns$/);
+        if (method === "POST" && m) {
+          if (!conv.reasoning) {
+            return void json(res, 404, { error: "CONVERSATION_REASONING_DISABLED" });
+          }
+          const out = await conv.reasoning.turn({
+            session_id: m[1]!,
+            operator_id: operator,
+            body: String(body.body ?? ""),
+            idempotency_key: body.idempotency_key === undefined
+              ? undefined : String(body.idempotency_key),
+            correlation_id: body.correlation_id === undefined
+              ? undefined : String(body.correlation_id),
+          });
+          return void json(res, 200, out);
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/close$/);
+        if (method === "POST" && m) {
+          return void json(res, 200, {
+            session: conv.sessions.closeSession(m[1]!, {
+              operator_id: operator,
+              correlation_id: body.correlation_id === undefined
+                ? undefined : String(body.correlation_id),
+            }),
+          });
+        }
+        // ---- governed mission drafts (P15.8-C bridge; the ONLY
+        //      conversation→mission path — Task Entry is untouched) ----
+        m = p.match(/^\/api\/conversations\/([^/]+)\/drafts$/);
+        if (m) {
+          if (!conv.drafts) {
+            return void json(res, 404, { error: "CONVERSATION_DRAFTS_DISABLED" });
+          }
+          if (method === "GET") {
+            const state = url.searchParams.get("state");
+            return void json(res, 200, {
+              drafts: conv.drafts.listDrafts({
+                session_id: m[1]!, operator_id: operator,
+                state: state ?? undefined,
+              }),
+            });
+          }
+          if (method === "POST") {
+            return void json(res, 200, {
+              draft: conv.drafts.createDraft({
+                session_id: m[1]!, operator_id: operator,
+                project_id: String(body.project_id ?? ""),
+                goal: String(body.goal ?? ""),
+                // Pass-through, never coerced — the canonical validator
+                // owns list/risk semantics (same contract as vnext).
+                granted_permissions: body.granted_permissions as string[] | undefined,
+                authorized_workspaces: body.authorized_workspaces as string[] | undefined,
+                risk_ceiling: body.risk_ceiling === undefined ? undefined : String(body.risk_ceiling),
+                client_request_id: body.client_request_id === undefined
+                  ? undefined : String(body.client_request_id),
+                supersedes_draft_id: body.supersedes_draft_id === undefined
+                  ? undefined : String(body.supersedes_draft_id),
+                correlation_id: body.correlation_id === undefined
+                  ? undefined : String(body.correlation_id),
+              }),
+            });
+          }
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/drafts\/([^/]+)$/);
+        if (method === "GET" && m) {
+          if (!conv.drafts) {
+            return void json(res, 404, { error: "CONVERSATION_DRAFTS_DISABLED" });
+          }
+          return void json(res, 200, {
+            draft: conv.drafts.getDraft({
+              session_id: m[1]!, operator_id: operator, draft_id: m[2]!,
+            }),
+          });
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/drafts\/([^/]+)\/(confirm|reject)$/);
+        if (method === "POST" && m) {
+          if (!conv.drafts) {
+            return void json(res, 404, { error: "CONVERSATION_DRAFTS_DISABLED" });
+          }
+          if (m[3] === "reject") {
+            return void json(res, 200, {
+              draft: conv.drafts.rejectDraft({
+                session_id: m[1]!, operator_id: operator, draft_id: m[2]!,
+                correlation_id: body.correlation_id === undefined
+                  ? undefined : String(body.correlation_id),
+              }),
+            });
+          }
+          // Confirm binds the EXACT draft identity + digest the operator
+          // was shown — never a re-resolved "latest" proposal.
+          const out = await conv.drafts.confirmDraft({
+            session_id: m[1]!, operator_id: operator, draft_id: m[2]!,
+            expected_digest: String(body.expected_digest ?? body.draft_digest ?? ""),
+            kind: body.kind === undefined ? undefined : String(body.kind),
+          });
+          return void json(res, 200, out);
+        }
+        return void json(res, 404, { error: "NOT_FOUND", path: p });
       }
       json(res, 404, { error: "NOT_FOUND", path: p });
     } catch (error) {

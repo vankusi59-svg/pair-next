@@ -126,4 +126,57 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  // ---- P15.8-D — conversation layer ----
+  conversations: (state?: string) =>
+    req<{ sessions: import("./types").ConversationSession[] }>(
+      `/conversations${state ? `?state=${encodeURIComponent(state)}` : ""}`),
+  createConversation: (input: { title?: string; client_request_id?: string }) =>
+    req<{ session: import("./types").ConversationSession }>("/conversations", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  conversation: (id: string) =>
+    req<{ session: import("./types").ConversationSession }>(`/conversations/${id}`),
+  conversationMessages: (id: string, opts?: { after_seq?: number; limit?: number }) =>
+    req<{ messages: import("./types").ConversationMessage[]; next_after_seq: number | null }>(
+      `/conversations/${id}/messages${
+        opts?.after_seq !== undefined || opts?.limit !== undefined
+          ? `?${[
+              opts.after_seq !== undefined ? `after_seq=${opts.after_seq}` : "",
+              opts.limit !== undefined ? `limit=${opts.limit}` : "",
+            ].filter(Boolean).join("&")}`
+          : ""}`),
+  conversationTurn: (id: string, input: { body: string; idempotency_key?: string }) =>
+    req<import("./types").ConversationTurnResult>(`/conversations/${id}/turns`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  closeConversation: (id: string) =>
+    req<{ session: import("./types").ConversationSession }>(`/conversations/${id}/close`, {
+      method: "POST",
+      body: "{}",
+    }),
+  conversationDrafts: (id: string) =>
+    req<{ drafts: import("./types").MissionDraft[] }>(`/conversations/${id}/drafts`),
+  createDraft: (id: string, input: {
+    project_id: string;
+    goal: string;
+    granted_permissions?: string[];
+    authorized_workspaces?: string[];
+    risk_ceiling?: string;
+    client_request_id?: string;
+    supersedes_draft_id?: string;
+  }) =>
+    req<{ draft: import("./types").MissionDraft }>(`/conversations/${id}/drafts`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  confirmDraft: (id: string, draftId: string, expectedDigest: string) =>
+    req<import("./types").DraftConfirmResult>(
+      `/conversations/${id}/drafts/${draftId}/confirm`,
+      { method: "POST", body: JSON.stringify({ expected_digest: expectedDigest }) }),
+  rejectDraft: (id: string, draftId: string) =>
+    req<{ draft: import("./types").MissionDraft }>(
+      `/conversations/${id}/drafts/${draftId}/reject`,
+      { method: "POST", body: "{}" }),
 };

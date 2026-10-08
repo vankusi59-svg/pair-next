@@ -97,6 +97,11 @@ import {
   validatePlanProposal,
   makeServePlanner,
   SERVE_LLM_WORK_CAPS,
+  ConversationSessionService,
+  ConversationReasoningService,
+  CodexCliConversationInvoker,
+  ensureConversationModel,
+  MissionDraftService,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
   telegramDeliveryTransportTimeoutMs,
@@ -410,6 +415,44 @@ const control = new MissionControl({
 });
 const business = new BusinessLayer({ store, control, schedules });
 const workforce = new WorkforceService({ store, business });
+
+// P15.8-D — conversation layer composition. Session/draft services are
+// pure canonical-store services — always wired. The reasoning turn
+// needs the governed codex-cli conversation transport; when the model
+// entry cannot be seeded/resolved at boot, ONLY the turn endpoint is
+// unavailable — every other Mission Control surface keeps serving.
+const conversationSessions = new ConversationSessionService(store);
+const missionDrafts = new MissionDraftService({
+  conversation: conversationSessions, control, store,
+});
+let conversationReasoning = null;
+try {
+  // TEST-ONLY seam: PAIR_CONVERSATION_STUB_REPLY replaces the codex-cli
+  // invoker with a deterministic echo so Playwright/CI never calls a
+  // paid/real model. Never set it in production.
+  const stubReply = process.env.PAIR_CONVERSATION_STUB_REPLY;
+  const convInvoker = stubReply === undefined
+    ? new CodexCliConversationInvoker({ env: process.env })
+    : {
+        invoke: async (input) => ({
+          model_entry_id: input.transport.model_entry_id,
+          provider_id: input.transport.provider_id,
+          model_id: input.transport.model_id,
+          raw_text: stubReply,
+        }),
+      };
+  conversationReasoning = new ConversationReasoningService({
+    conversation: conversationSessions,
+    store,
+    invoker: convInvoker,
+    model_entry_id: ensureConversationModel(store),
+  });
+} catch (e) {
+  console.error(
+    "CONVERSATION: reasoning unavailable — turns disabled:",
+    String(e).slice(0, 160),
+  );
+}
 // WFV2 §8: restart reconcile — forged/incompletely-materialized graph
 // provenance is quarantined before any work item can open.
 {
@@ -700,6 +743,14 @@ sup.resume();
 const knownCapabilityIds = () =>
   new Set(store.list("capability").map((c) => String(c.capability_id)));
 const planExpander = async (input) => {
+  // TEST-ONLY seam: PAIR_MC_TEMPLATE_PLANNER=1 skips the LLM planner
+  // edge entirely — the request falls back to the deterministic template
+  // planner inside the SAME canonical preview/confirm path (digest
+  // binding, gates, evidence unchanged). For e2e/CI where no qualified
+  // paid/CLI provider exists. Never set it in production.
+  if (process.env.PAIR_MC_TEMPLATE_PLANNER === "1") {
+    return { input };
+  }
   const candidates = dedupePlannerCandidates(plannerCandidates);
   if (typeof input.goal !== "string" || !input.goal.trim()) {
     return { input };
@@ -896,6 +947,12 @@ const server = createMissionControlServer({
   // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
   // the P15.6 operating service lazily on first trigger (P15.7).
   store,
+  // P15.8-D — conversation layer (chat turns + governed mission drafts).
+  conversation: {
+    sessions: conversationSessions,
+    reasoning: conversationReasoning ?? undefined,
+    drafts: missionDrafts,
+  },
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

@@ -10,6 +10,7 @@ import { Schedules } from "./pages/Schedules";
 import { Providers } from "./pages/Providers";
 import { Observability } from "./pages/Observability";
 import { Objectives } from "./pages/Objectives";
+import { Chat } from "./pages/Chat";
 import "./styles/app.css";
 
 const router = createBrowserRouter([
@@ -24,6 +25,7 @@ const router = createBrowserRouter([
       { path: "/providers", element: <Providers /> },
       { path: "/observability", element: <Observability /> },
       { path: "/objectives", element: <Objectives /> },
+      { path: "/chat", element: <Chat /> },
     ],
   },
 ]);
