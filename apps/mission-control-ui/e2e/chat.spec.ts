@@ -61,6 +61,46 @@ test("chat: mobile viewport keeps sessions + composer usable", async ({ page }) 
   await expect(page.getByText("PAIR trả lời mô phỏng").first()).toBeVisible({ timeout: 15_000 });
 });
 
+test("chat: >200 messages — tail window renders newest, earlier reachable, no dups after reload", async ({ page, request }) => {
+  test.setTimeout(60_000);
+  // Seed a deterministic >200-message session through the real API —
+  // replies come from the server's stub seam, never a real model call.
+  const headers = {
+    "content-type": "application/json",
+    "x-operator-id": "op:e2e",
+    authorization: `Bearer ${mcToken()}`,
+  };
+  const create = await request.post("/api/conversations", { headers, data: {} });
+  const sid = (await create.json()).session.session_id as string;
+  for (let i = 0; i < 101; i++) { // 202 committed messages
+    const r = await request.post(`/api/conversations/${sid}/turns`, {
+      headers, data: { body: `seed-${i}` },
+    });
+    if (!r.ok()) throw new Error(`seed turn ${i} → ${r.status()}`);
+  }
+  await page.goto(`/chat?s=${sid}`);
+  // Tail window opens at the NEWEST end: the last operator message (seq
+  // 201) and its assistant reply are visible immediately — earlier rows
+  // (seq 1-2) are NOT in this window.
+  await expect(page.getByText("seed-100")).toBeVisible();
+  await expect(page.getByText("PAIR trả lời mô phỏng").last()).toBeVisible();
+  await expect(page.getByText("seed-0")).toBeHidden();
+  // Bounded earlier-history walk: one click loads the previous page.
+  await page.getByRole("button", { name: /Load earlier/ }).click();
+  await expect(page.getByText("seed-0")).toBeVisible();
+  await expect(page.getByText("seed-100")).toBeVisible(); // tail still there
+  // No duplicates: every seeded body text appears exactly once.
+  for (const i of [0, 50, 100]) {
+    await expect(page.getByText(`seed-${i}`, { exact: true })).toHaveCount(1);
+  }
+  // Reload restores the same tail window — newest reply still visible,
+  // earlier rows collapsed again (bounded default fetch).
+  await page.reload();
+  await expect(page.getByText("seed-100")).toBeVisible();
+  await expect(page.getByText("PAIR trả lời mô phỏng").last()).toBeVisible();
+  await expect(page.getByText("seed-0")).toBeHidden();
+});
+
 test("task entry: reachable from nav and submits without any chat/draft", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("link", { name: "Task Entry" }).click();

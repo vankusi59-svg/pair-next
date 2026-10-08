@@ -15,6 +15,12 @@ import type {
  * operator explicitly confirms a displayed draft (exact id + digest). */
 
 const RISK_LEVELS = ["", "LOW", "MEDIUM", "HIGH", "CRITICAL"] as const;
+/* Canonical page size — mirrors CONVERSATION_MAX_PAGE_SIZE server-side.
+ * The thread window is the TAIL page: sessions with >PAGE messages
+ * open at the newest end (session.next_seq tells us where it is), and
+ * earlier history is reachable through the bounded "Load earlier"
+ * walk — never an unbounded full-history fetch. */
+const MSG_PAGE = 200;
 
 function DraftCard({
   draft,
@@ -119,6 +125,8 @@ export function Chat() {
   const [err, setErr] = useState<string | null>(null);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [loadingThread, setLoadingThread] = useState(false);
+  const [oldestSeq, setOldestSeq] = useState<number | null>(null);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [draftForm, setDraftForm] = useState<DraftForm | null>(null);
 
   const showErr = (e: unknown) =>
@@ -142,21 +150,56 @@ export function Chat() {
     setLoadingThread(true);
     setErr(null);
     try {
-      const [s, ms, ds] = await Promise.all([
+      const [s, ds] = await Promise.all([
         api.conversation(id),
-        api.conversationMessages(id),
         api.conversationDrafts(id),
       ]);
       setActive(s.session);
+      // Tail window: open at the NEWEST committed page (session.next_seq-1
+      // is the last seq), so long histories never trigger an unbounded
+      // fetch and the newest operator/assistant rows always render.
+      const lastSeq = Math.max(0, s.session.next_seq - 1);
+      const after = Math.max(0, lastSeq - MSG_PAGE);
+      const ms = await api.conversationMessages(id, { after_seq: after, limit: MSG_PAGE });
       setMessages(ms.messages);
+      setOldestSeq(ms.messages.length > 0 ? ms.messages[0]!.seq : null);
       setDrafts(ds.drafts);
     } catch (e) {
       setActive(null);
       setMessages([]);
+      setOldestSeq(null);
       setDrafts([]);
       showErr(e);
     } finally {
       setLoadingThread(false);
+    }
+  };
+
+  const loadEarlier = async () => {
+    if (!activeId || oldestSeq === null || oldestSeq <= 1 || loadingEarlier) return;
+    setLoadingEarlier(true);
+    setErr(null);
+    try {
+      // The canonical pagination contract is strictly forward-only
+      // (seq > after_seq, bounded pages): asking for the page that ENDS
+      // just before our oldest row yields the previous window.
+      const ms = await api.conversationMessages(activeId, {
+        after_seq: Math.max(0, oldestSeq - 1 - MSG_PAGE),
+        limit: MSG_PAGE,
+      });
+      setMessages((cur) => {
+        const seen = new Set(cur.map((m) => m.message_id));
+        const earlier = ms.messages.filter((m) => m.seq < oldestSeq && !seen.has(m.message_id));
+        return [...earlier, ...cur];
+      });
+      setOldestSeq((cur) => {
+        const earlier = ms.messages.filter((m) => cur !== null && m.seq < cur);
+        return earlier.length > 0 ? Math.min(...earlier.map((m) => m.seq)) : cur;
+      });
+    } catch (e) {
+      showErr(e);
+    } finally {
+      setLoadingEarlier(false);
     }
   };
 
@@ -321,14 +364,26 @@ export function Chat() {
                 ) : messages.length === 0 ? (
                   <div className="state empty">No messages — say something.</div>
                 ) : (
-                  messages.map((m) => (
+                  <>
+                    {oldestSeq !== null && oldestSeq > 1 && (
+                      <button
+                        className="ghost"
+                        style={{ alignSelf: "center" }}
+                        disabled={loadingEarlier}
+                        onClick={loadEarlier}
+                      >
+                        {loadingEarlier ? "Loading…" : `Load earlier (before seq ${oldestSeq})`}
+                      </button>
+                    )}
+                    {messages.map((m) => (
                     <div key={m.message_id} className={`msg role-${m.role}`}>
                       <div className="msg-meta muted mono">
                         {m.role === "assistant" ? "PAIR · assistant" : m.role === "system" ? "system" : "you"} · seq {m.seq}
                       </div>
                       <div className="msg-body">{m.body}</div>
                     </div>
-                  ))
+                    ))}
+                  </>
                 )}
                 {busy && <div className="state">PAIR is thinking…</div>}
               </div>
