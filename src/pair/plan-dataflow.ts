@@ -174,6 +174,25 @@ const NEGATION_RE =
 const CLAUSE_SPAN = 160;
 const CLAUSE_LIST_SPAN = 200;
 const CLAUSE_NEGATION_LOOKBACK = 48;
+// `post` is BOTH an English delivery verb and a Vietnamese marketing
+// noun ("bài post Telegram" = a post FOR Telegram — content to WRITE,
+// never a send instruction). It is a delivery verb only in verb
+// position: an object or a preposition must sit between it and the
+// channel ("post report.txt to telegram", "post it on telegram").
+// A directly adjacent channel mention ("post telegram", "telegram
+// post") or a governing article/classifier/write-verb ("3 bài post",
+// "a post", "viết post") makes it a noun — content scope, never send
+// authority. The noun-left list is deliberately short: determiners,
+// classifiers, numerals, content-type nouns and write-governing verbs
+// only — anything else leaves `post` a verb (fail-safe toward the
+// established delivery grammar, and an adjacent-mention noun phrase
+// is caught by POST_MENTION_GAP regardless).
+const POST_NOUN_LEFT_RE =
+  /(?<![\p{L}\p{N}\p{M}_])(?:bài\s+viết|nội\s+dung|thông\s+báo|bài|bản|cái|đoạn|loại|kiểu|dạng|số|content|article|story|status|update|caption|blog|thread|threads|tweet|announcement|video|clip|reel|reels|vlog|a|an|the|this|that|these|those|một|vài|các|những|mỗi|mọi|some|any|all|each|every|write|viết|soạn|draft|compose|create|tạo|làm|prepare|produce|generate|author|craft|pen|schedule|scheduled|plan|\d+)(?![\p{L}\p{N}\p{M}_])\s*$/iu;
+// Only separators may sit between a noun `post` and the channel
+// mention — any real word (an object, a preposition) keeps the verb
+// reading alive.
+const POST_MENTION_GAP = /^[\s,;:.!?'"()\-–—/]*$/u;
 // Filler consumed between consecutive artifact names inside a delivery
 // clause: list separators, prepositions, articles, and the Telegram
 // mention itself (covers "gửi telegram file a.txt" and "send a.txt to
@@ -245,11 +264,11 @@ export function detectTelegramDeliveryIntent(
   // NFC-normalize so decomposed Vietnamese text ("g\u01B0\u0309i")
   // matches the same clause grammar as precomposed input.
   const text = String(goal ?? "").normalize("NFC").slice(0, 4096);
-  const mentions: number[] = [];
+  const mentions: Array<{ start: number; end: number }> = [];
   let m: RegExpExecArray | null;
   TELEGRAM_MENTION_RE.lastIndex = 0;
   while ((m = TELEGRAM_MENTION_RE.exec(text)) !== null) {
-    mentions.push(m.index);
+    mentions.push({ start: m.index, end: m.index + m[0].length });
   }
   if (!mentions.length) return { requested: false, artifacts: [], mode: "TEXT" };
   const artifacts: string[] = [];
@@ -261,8 +280,29 @@ export function detectTelegramDeliveryIntent(
     // the Vietnamese verb. Fail closed toward NO SEND: reject only when
     // the matched token is exactly all-caps GUI; `gui`/`Gui` stay valid.
     if (m[0] === "GUI") continue;
+    // `post` — see POST_NOUN_LEFT_RE: in Vietnamese marketing text it is
+    // overwhelmingly a NOUN ("3 bài post Telegram", "viết bài post").
+    // Reject it as a delivery verb when a determiner/classifier/
+    // write-verb governs it or when the channel mention is directly
+    // adjacent in either direction (noun compounds). "post report.txt
+    // to telegram" / "post it on telegram" keep an object or a
+    // preposition between verb and channel — those still authorize.
     const v = m.index;
-    const clause = mentions.some((p) => Math.abs(p - v) <= CLAUSE_SPAN);
+    if (/^post$/iu.test(m[0])) {
+      const vEnd = v + m[0].length;
+      if (POST_NOUN_LEFT_RE.test(text.slice(Math.max(0, v - 48), v))) {
+        continue;
+      }
+      const adjacent = mentions.some((mn) =>
+        mn.start > vEnd
+          ? POST_MENTION_GAP.test(text.slice(vEnd, mn.start))
+          : mn.end < v
+            ? POST_MENTION_GAP.test(text.slice(mn.end, v))
+            : false,
+      );
+      if (adjacent) continue;
+    }
+    const clause = mentions.some((p) => Math.abs(p.start - v) <= CLAUSE_SPAN);
     if (!clause || clauseNegated(text, v)) continue;
     requested = true;
     for (const a of clauseArtifacts(text, v + m[0].length)) {

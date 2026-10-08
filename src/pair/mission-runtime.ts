@@ -122,6 +122,16 @@ const TERMINAL_RUNTIME = new Set<MissionRuntimeState>([
 export const TERMINAL_EXECUTION = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 const SETTLED_TASK = new Set(["COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "SUPERSEDED"]);
 
+/** Bounded durable retry budget for potentially-transient planning
+ *  failures before the canonical PLANNING→FAILED terminalization. */
+export const PLANNING_MAX_ATTEMPTS = 3;
+/** Codes that may wrap transient provider failure (the pool already
+ *  applied its own failover + bounded re-ask before giving up). Every
+ *  other FAIL_CLOSED_* is a deterministic contract/governance/config
+ *  failure — replay is a guaranteed identical throw → non-retryable. */
+const PLANNING_RETRYABLE_CODES = new Set(["FAIL_CLOSED_PLANNER_EXHAUSTED"]);
+const PLANNING_SAFE_CODE = /^[A-Z0-9_:.\-]{1,80}$/;
+
 export const RUNTIME_TRANSITIONS: Record<MissionRuntimeState, MissionRuntimeState[]> = {
   CREATED: ["PLANNING", "READY", "CANCELLED", "ABORTED"],
   PLANNING: ["READY", "FAILED", "WAITING_APPROVAL", "CANCELLED", "ABORTED"],
@@ -941,7 +951,11 @@ export class MissionRuntime {
         break;
       }
       case "PLANNING": {
-        this.runPlanning(missionId);
+        try {
+          this.runPlanning(missionId);
+        } catch (err) {
+          this.planningFailureBoundary(missionId, err);
+        }
         break;
       }
       case "READY": {
@@ -1040,6 +1054,105 @@ export class MissionRuntime {
   }
 
   /* ---------------- PLANNING -------------------------------------------- */
+
+  /**
+   * Bounded, durable planning-failure handling. Before this boundary a
+   * deterministic planning throw escaped to the supervisor's silent
+   * per-mission catch and replayed identically every tick — infinite
+   * PLANNING with zero evidence (the MSN_01M4D7W8 stall incident).
+   *
+   * Classification: FAIL_CLOSED_* contract/governance/config codes are
+   * DETERMINISTIC — replay is a guaranteed identical throw, so the
+   * mission terminalizes immediately through the canonical
+   * PLANNING→FAILED / CREATED→FAILED transitions. Codes that may wrap
+   * transient provider failure (FAIL_CLOSED_PLANNER_EXHAUSTED) and any
+   * non-typed throw are TRANSIENT_CANDIDATE — they get a bounded,
+   * durable retry budget (PLANNING_MAX_ATTEMPTS) before the same
+   * terminal path.
+   *
+   * Evidence is deduplicated: ONE bounded record refreshed in place on
+   * the mission_runtime row plus ONE MISSION_PLANNING_FAILED event per
+   * distinct failure code — never a per-tick event/log flood. The
+   * counter lives on the row so the bound survives process restarts
+   * (crash/restart idempotent). No new public mission status: the
+   * terminal pairing is mission FAILED ↔ runtime FAILED, exactly the
+   * pairing LIFECYCLE_PAIRINGS already proves. The original error is
+   * rethrown after handling — tick()'s caller contract is unchanged;
+   * what changed is that the throw can no longer replay silently
+   * forever.
+   */
+  private planningFailureBoundary(missionId: string, err: unknown): void {
+    const code =
+      err instanceof PairError && PLANNING_SAFE_CODE.test(err.code)
+        ? err.code
+        : "PLANNING_UNCLASSIFIED";
+    const retryable =
+      !code.startsWith("FAIL_CLOSED_") || PLANNING_RETRYABLE_CODES.has(code);
+    const rt = this.runtimeEntity(missionId);
+    const prev = rt.planning_failure as Record<string, unknown> | null;
+    const attempts = Number(prev?.attempts ?? 0) + 1;
+    const message = String((err as { message?: string })?.message ?? err)
+      .replace(/\s+/g, " ")
+      .slice(0, 160);
+    rt.planning_failure = {
+      code,
+      failure_class: retryable ? "TRANSIENT_CANDIDATE" : "DETERMINISTIC",
+      attempts,
+      first_at: String(prev?.first_at ?? utcnow()),
+      last_at: utcnow(),
+      message,
+    };
+    this.store.put(
+      "mission_runtime",
+      String(rt.mission_runtime_id),
+      rt,
+      Number(rt.version),
+    );
+    // Deduplicated event evidence — one per distinct failure code, so a
+    // mission can never flood the journal by replaying the same throw.
+    if (String(prev?.code ?? "") !== code) {
+      this.store.event({
+        entity_type: "mission_runtime",
+        entity_id: String(rt.mission_runtime_id),
+        event_type: "MISSION_PLANNING_FAILED",
+        actor: this.actor,
+        metadata: {
+          mission_id: missionId,
+          code,
+          failure_class: (rt.planning_failure as Record<string, unknown>)
+            .failure_class,
+          attempts,
+          message,
+        },
+      });
+    }
+    if (retryable && attempts < PLANNING_MAX_ATTEMPTS) {
+      // Bounded retry: stay PLANNING. The original error still
+      // propagates — tick()'s pre-existing contract is that a planning
+      // failure surfaces to the caller (the supervisor swallows it per
+      // mission as before); the durable counter is what now bounds the
+      // replay.
+      throw err;
+    }
+    try {
+      this.transitionRuntime(missionId, "FAILED", `planning_failed:${code}`);
+      try {
+        this.deps.service.transitionMission(missionId, "FAILED", this.actor);
+      } catch {
+        /* mission already terminal/moved — runtime FAILED stands */
+      }
+    } catch (inner) {
+      const msg = String(
+        (inner as { message?: string })?.message ?? inner,
+      ).replace(/\s+/g, " ").slice(0, 120);
+      this.forceAbortRuntime(missionId, `planning_failure_boundary_defect:${msg}`);
+    }
+    // Preserve the pre-boundary observable contract: callers still see
+    // the original throw — the difference is the failure is now durable
+    // (recorded, bounded, and where required terminalized) instead of
+    // silently replayable forever.
+    throw err;
+  }
 
   private runPlanning(missionId: string): void {
     const mission = this.deps.service.getMission(missionId);

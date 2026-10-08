@@ -24,7 +24,14 @@ import { RouteRegistry } from "./route-registry.js";
 import type { PairEvidenceStore } from "./store.js";
 
 export const MISSION_STATUS_TRANSITIONS: Record<string, string[]> = {
-  CREATED: ["READY", "CANCELLED"],
+  // CREATED→FAILED is the canonical terminalization of a mission whose
+  // planning failed non-retryably or exhausted its bounded retry budget
+  // (mission-runtime PLANNING→FAILED pairs with it). Consumers derive
+  // legality from this table: work-completion predsOf/pairings,
+  // observability terminal sets, business TERMINAL_MISSION_STATUSES —
+  // all already treat FAILED as terminal, so the extension converges
+  // safely with no replay-path changes.
+  CREATED: ["READY", "CANCELLED", "FAILED"],
   READY: ["RUNNING", "PAUSED", "CANCELLED"],
   RUNNING: ["PAUSED", "COMPLETED", "FAILED", "CANCELLED"],
   PAUSED: ["RUNNING", "CANCELLED", "FAILED"],
