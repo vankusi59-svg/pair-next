@@ -24,6 +24,7 @@ import type { CeoDecisionInvoker } from "./ceo-decision.js";
 import type { ConversationSessionService } from "./conversation-session.js";
 import type { ConversationReasoningService } from "./conversation-reasoning.js";
 import type { MissionDraftService } from "./mission-draft.js";
+import type { TelegramConversationService } from "./telegram-conversation.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import {
   createDefaultObjectiveOperatingService,
@@ -110,6 +111,10 @@ export interface MissionControlServerDeps {
     sessions: ConversationSessionService;
     reasoning?: ConversationReasoningService;
     drafts?: MissionDraftService;
+    /** P15.8-E — telegram ingress authority. Absent → every
+     *  /api/telegram/conversation* route is TELEGRAM_CONVERSATION_
+     *  DISABLED; unrelated routes unaffected. */
+    telegram?: TelegramConversationService;
   };
 }
 
@@ -1380,6 +1385,83 @@ export function createMissionControlServer(
             kind: body.kind === undefined ? undefined : String(body.kind),
           });
           return void json(res, 200, out);
+        }
+        return void json(res, 404, { error: "NOT_FOUND", path: p });
+      }
+      // ---- Telegram conversation ingress (P15.8-E) ------------------
+      // The bridge forwards each update to ONE endpoint; ALL authority
+      // decisions live in TelegramConversationService against the
+      // canonical conversation/draft services. The boundary operator
+      // must equal `telegram:<chat_id>` — the service re-enforces it.
+      if (p === "/api/telegram/conversation" || p.startsWith("/api/telegram/conversation/")) {
+        const tg = deps.conversation?.telegram;
+        if (!tg) {
+          return void json(res, 404, { error: "TELEGRAM_CONVERSATION_DISABLED" });
+        }
+        if (!operator) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const chatId = String(body.chat_id ?? url.searchParams.get("chat_id") ?? "");
+        if (method === "POST" && p === "/api/telegram/conversation/ingress") {
+          return void json(res, 200, await tg.ingress({
+            operator_id: operator,
+            chat_id: chatId,
+            chat_type: body.chat_type === undefined ? undefined : String(body.chat_type),
+            update_id: Number(body.update_id),
+            text: String(body.text ?? ""),
+            reply_to_message_id: body.reply_to_message_id === undefined
+              ? undefined : Number(body.reply_to_message_id),
+          }));
+        }
+        if (method === "POST" && p === "/api/telegram/conversation/new") {
+          // update_id binds the rotation to Telegram's update identity —
+          // a replayed /new update converges onto the recorded session.
+          return void json(res, 200, tg.newChatSession({
+            operator_id: operator, chat_id: chatId,
+            update_id: Number(body.update_id),
+          }));
+        }
+        if (method === "GET" && p === "/api/telegram/conversation/pending") {
+          return void json(res, 200, {
+            drafts: tg.listPending({ operator_id: operator, chat_id: chatId }),
+          });
+        }
+        if (method === "POST" && p === "/api/telegram/conversation/draft") {
+          return void json(res, 200, tg.prepareDraft({
+            operator_id: operator,
+            chat_id: chatId,
+            project_id: String(body.project_id ?? ""),
+            goal: String(body.goal ?? ""),
+            update_id: Number(body.update_id),
+            granted_permissions: body.granted_permissions as string[] | undefined,
+            authorized_workspaces: body.authorized_workspaces as string[] | undefined,
+            risk_ceiling: body.risk_ceiling === undefined ? undefined : String(body.risk_ceiling),
+          }));
+        }
+        m = p.match(/^\/api\/telegram\/conversation\/refs\/([^/]+)\/(prompt-sent|confirm|reject)$/);
+        if (method === "POST" && m) {
+          if (m[2] === "prompt-sent") {
+            return void json(res, 200, {
+              ref: tg.bindPromptMessage({
+                operator_id: operator, chat_id: chatId, ref_id: m[1]!,
+                message_id: Number(body.message_id),
+              }),
+            });
+          }
+          if (m[2] === "reject") {
+            return void json(res, 200, {
+              draft: tg.rejectByRef({
+                operator_id: operator, chat_id: chatId, ref_id: m[1]!,
+              }),
+            });
+          }
+          return void json(res, 200, await tg.confirmByRef({
+            operator_id: operator,
+            chat_id: chatId,
+            chat_type: body.chat_type === undefined ? undefined : String(body.chat_type),
+            ref_id: m[1]!,
+            kind: "explicit",
+          }));
         }
         return void json(res, 404, { error: "NOT_FOUND", path: p });
       }
