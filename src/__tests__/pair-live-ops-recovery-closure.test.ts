@@ -36,6 +36,7 @@ import {
   MissionScheduler,
   MissionSupervisor,
   PairControlPlane,
+  PairError,
   PairEvidenceStore,
   PolicyError,
   ReconciliationService,
@@ -734,5 +735,188 @@ describe("LORC B — governed completion protocol", () => {
     });
     expect(prompt).toContain("PAIR_EXECUTION_COMPLETE");
     expect(prompt).toContain("on its own line");
+  });
+});
+
+/* ==================== HOTFIX B — recovery boundary secret-free evidence ==================== */
+
+describe("HOTFIX B — recovery boundary persists no freeform exception text", () => {
+  const SECRETS = [
+    "AKIAIOSFODNN7EXAMPLE", // unlabelled uppercase opaque secret
+    "ghp_AbC123xYzMixedCase0099", // mixed-case token
+    "postgres://deploy:Sup3rSecretPwd9@db.internal:5432/app", // credential URI
+  ];
+  // One fault payload carrying every adversarial class: secrets, multiline,
+  // >120 chars — the old code sliced-and-persisted exactly this text.
+  const secretText = () => `${SECRETS.join("\n")}\n${"x".repeat(200)}`;
+
+  const assertSecretFreeEverywhere = (
+    ctx: ReturnType<typeof makeCtx>,
+    mid: string,
+  ) => {
+    const ent = rt(ctx, mid);
+    const evs = ctx.store.listEvents("mission_runtime", `MRT_${mid}`);
+    for (const s of SECRETS) {
+      expect(JSON.stringify(ent)).not.toContain(s);
+      expect(JSON.stringify(evs)).not.toContain(s);
+    }
+    return ent;
+  };
+
+  const seedPending = (ctx: ReturnType<typeof makeCtx>, mid: string, rcv: string) => {
+    const rtEnt = rt(ctx, mid);
+    rtEnt.pending_recovery = {
+      recovery_id: rcv, action: "RE_ROUTE",
+      task_id: null, execution_id: null, governed_task_id: null,
+      executor_id: "EX_A", failure_class: "TRANSIENT_TRANSPORT",
+      backoff_ms: 0, infeasible_actions: [],
+    };
+    ctx.store.put("mission_runtime", `MRT_${mid}`, rtEnt, Number(rtEnt.version));
+    return rtEnt.pending_recovery as Record<string, unknown>;
+  };
+
+  it("path 1 — pending-read failure inside recoveryGuard: faulting exception text never persists", () => {
+    const ctx = makeCtx("rb1");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    seedPending(ctx, mid, "RCV_rb1");
+    // Break runtimeEntity exactly once — the pending read inside the
+    // guard's catch — while the faulting leg throws a secret-bearing error.
+    const rtAny = ctx.runtime as unknown as Record<string, unknown>;
+    const origRE = (rtAny.runtimeEntity as (id: string) => unknown).bind(ctx.runtime);
+    let failNext = false;
+    rtAny.runtimeEntity = (id: string) => {
+      if (failNext) { failNext = false; throw new Error("store_read_corrupt"); }
+      return origRE(id);
+    };
+    const secretErr = new Error(`apply leg exploded\n${secretText()}`);
+    (rtAny.recoveryGuard as (m: string, fn: () => void, n?: string) => void)(
+      mid,
+      () => { failNext = true; throw secretErr; },
+      FAR,
+    );
+    const ent = assertSecretFreeEverywhere(ctx, mid);
+    expect(String(ent.state)).toBe("ABORTED");
+    expect(String(ent.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    const aborted = ent.aborted_recovery as Record<string, unknown>;
+    expect(String(aborted.aborted_reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    expect(String(aborted.recovery_id)).toBe("RCV_rb1");
+    expect(JSON.stringify(ent)).not.toContain("store_read_corrupt");
+    const aborts = ctx.store
+      .listEvents("mission_runtime", `MRT_${mid}`)
+      .filter((e) => String(e.event_type) === "MISSION_RUNTIME_EMERGENCY_ABORT");
+    expect(aborts.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(aborts)).toContain("recovery_boundary_defect:TRANSITION_FAULT");
+    // Restart-durable: reopened store sees terminal ABORTED, pending cleared,
+    // evidence secret-free — nothing re-drives the dead recovery.
+    const reopened = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const after = reopened.get("mission_runtime", `MRT_${mid}`);
+    expect(String(after.state)).toBe("ABORTED");
+    expect(after.pending_recovery).toBeNull();
+    for (const s of SECRETS) {
+      expect(JSON.stringify(after)).not.toContain(s);
+    }
+    reopened.close();
+    ctx.store.close();
+  });
+
+  it("path 2 — recoveryFailureBoundary inner throw: secret-bearing inner error never persists", () => {
+    const ctx = makeCtx("rb2");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    const pending = seedPending(ctx, mid, "RCV_rb2");
+    const rtAny = ctx.runtime as unknown as Record<string, unknown>;
+    const secretInner = new Error(`failure handler exploded\n${secretText()}`);
+    rtAny.handleRecoveryApplyFailure = () => { throw secretInner; };
+    (rtAny.recoveryFailureBoundary as (
+      m: string, p: Record<string, unknown>, a: string, e: unknown, n?: string,
+    ) => void)(mid, pending, "RE_ROUTE", new Error("outer apply fault"), FAR);
+    const ent = assertSecretFreeEverywhere(ctx, mid);
+    expect(String(ent.state)).toBe("ABORTED");
+    expect(String(ent.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    expect(String(
+      (ent.aborted_recovery as Record<string, unknown>).aborted_reason,
+    )).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    const reopened = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    expect(String(reopened.get("mission_runtime", `MRT_${mid}`).state)).toBe("ABORTED");
+    reopened.close();
+    ctx.store.close();
+  });
+
+  it("path 1 — even a namespaced PairError.code is never persisted (secret-bearing code)", () => {
+    const ctx = makeCtx("rb3a");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    seedPending(ctx, mid, "RCV_rb3a");
+    const rtAny = ctx.runtime as unknown as Record<string, unknown>;
+    const origRE = (rtAny.runtimeEntity as (id: string) => unknown).bind(ctx.runtime);
+    let failNext = false;
+    rtAny.runtimeEntity = (id: string) => {
+      if (failNext) { failNext = false; throw new Error("store_read_corrupt"); }
+      return origRE(id);
+    };
+    // The CODE ITSELF carries a secret — an allowlist-regex namespace
+    // cannot prove a code is safe; this boundary emits the fixed label.
+    const secretCodeErr = new PairError(
+      "FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE",
+      "sensitive diagnostic message",
+    );
+    (rtAny.recoveryGuard as (m: string, fn: () => void, n?: string) => void)(
+      mid,
+      () => { failNext = true; throw secretCodeErr; },
+      FAR,
+    );
+    const ent = rt(ctx, mid);
+    const evs = ctx.store.listEvents("mission_runtime", `MRT_${mid}`);
+    expect(String(ent.state)).toBe("ABORTED");
+    expect(String(ent.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    expect(String(
+      (ent.aborted_recovery as Record<string, unknown>).aborted_reason,
+    )).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    for (const s of ["AKIAIOSFODNN7EXAMPLE", "sensitive diagnostic message"]) {
+      expect(JSON.stringify(ent)).not.toContain(s);
+      expect(JSON.stringify(evs)).not.toContain(s);
+    }
+    const reopened = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    const after = reopened.get("mission_runtime", `MRT_${mid}`);
+    expect(String(after.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    expect(JSON.stringify(after)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    reopened.close();
+    ctx.store.close();
+  });
+
+  it("path 2 — secret-bearing PairError.code inside inner error also collapses to TRANSITION_FAULT", () => {
+    const ctx = makeCtx("rb3b");
+    const mid = startMission(ctx);
+    ctx.runtime.tick(mid, FAR);
+    ctx.runtime.tick(mid, FAR);
+    const pending = seedPending(ctx, mid, "RCV_rb3b");
+    const rtAny = ctx.runtime as unknown as Record<string, unknown>;
+    rtAny.handleRecoveryApplyFailure = () => {
+      throw new PairError(
+        "FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE",
+        "sensitive diagnostic message",
+      );
+    };
+    (rtAny.recoveryFailureBoundary as (
+      m: string, p: Record<string, unknown>, a: string, e: unknown, n?: string,
+    ) => void)(mid, pending, "RE_ROUTE", new Error("outer"), FAR);
+    const ent = rt(ctx, mid);
+    const evs = ctx.store.listEvents("mission_runtime", `MRT_${mid}`);
+    expect(String(ent.state)).toBe("ABORTED");
+    expect(String(ent.reason)).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    for (const s of ["AKIAIOSFODNN7EXAMPLE", "sensitive diagnostic message"]) {
+      expect(JSON.stringify(ent)).not.toContain(s);
+      expect(JSON.stringify(evs)).not.toContain(s);
+    }
+    const reopened = new PairEvidenceStore(path.join(ctx.dir, "pair.db"));
+    expect(String(
+      reopened.get("mission_runtime", `MRT_${mid}`).reason,
+    )).toBe("recovery_boundary_defect:TRANSITION_FAULT");
+    reopened.close();
+    ctx.store.close();
   });
 });

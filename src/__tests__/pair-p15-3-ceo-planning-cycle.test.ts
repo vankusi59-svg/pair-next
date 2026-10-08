@@ -2839,3 +2839,104 @@ describe("P15.7-FIX1-R3 — invalid config never burns an attempt", () => {
     s.store.close();
   });
 });
+
+/* ==================== HOTFIX A — priority_order full-permutation prompt contract ==================== */
+
+describe("HOTFIX A — prompt pins the full-permutation contract for priority_order", () => {
+  it("prompt states exact permutation for BOTH kinds, DONE workstreams included, non-actionable semantics", async () => {
+    const { ceoDecisionSystemPrompt } = await import("../pair/ceo-decision.js");
+    const p = ceoDecisionSystemPrompt();
+    // INITIALIZE: exact permutation of ALL proposed keys.
+    expect(p).toMatch(/exact permutation of ALL proposed workstream_keys/);
+    // PRIORITIZE: EVERY canonical key EXACTLY ONCE — DONE/completed/terminal included.
+    expect(p).toMatch(/EVERY canonical[\s\S]{0,20}workstream_key EXACTLY ONCE/);
+    expect(p).toMatch(/DONE,\s+completed or terminal/);
+    // Not the actionable-only subset — the control plane derives that itself.
+    expect(p).toMatch(/never the actionable-only subset/);
+    expect(p).toMatch(/actionable\s+subset itself/);
+    // Canonical redefinition ban retained.
+    expect(p).toMatch(/NEVER\s+resubmit/);
+  });
+
+  it("PRIORITIZE_EXISTING example is a 4-key full permutation documenting a DONE workstream", async () => {
+    const { ceoDecisionSystemPrompt, parseCeoDecisionText } =
+      await import("../pair/ceo-decision.js");
+    const p = ceoDecisionSystemPrompt();
+    const line = p.split("\n").find((l) =>
+      l.startsWith('{"schema":"pair.ceo-decision.v1"') &&
+      l.includes('"PRIORITIZE_EXISTING"'));
+    expect(line).toBeDefined();
+    const parsed = parseCeoDecisionText(line!);
+    expect(parsed.decision_kind).toBe("PRIORITIZE_EXISTING");
+    expect(parsed.priority_order).toHaveLength(4);
+    expect(new Set(parsed.priority_order).size).toBe(4);
+    expect(line).toMatch(/DONE/); // example self-documents a completed workstream still listed
+    // Every embedded example still parses through the strict validator.
+    const examples = p.split("\n")
+      .filter((l) => l.startsWith('{"schema":"pair.ceo-decision.v1"'));
+    expect(examples.length).toBe(3);
+    for (const e of examples) parseCeoDecisionText(e);
+  });
+
+  it("gate: a canonical workstream dropped from priority_order still rejects (DONE or not)", async () => {
+    // The gate never consults completion state — an order omitting ANY
+    // canonical key (e.g. one the model believed DONE) is malformed.
+    const s = freshCeo("ha-drop", decisionJson({
+      decision_kind: "PRIORITIZE_EXISTING",
+      wait_reason: undefined,
+      priority_order: ["a"], // 'b' omitted
+    }));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const ob = s.objectives.get(oid);
+    s.workstreams.decomposeObjective({
+      objective_id: oid,
+      expected_objective_version: Number(ob.version),
+      expected_terms_version: Number(ob.terms_version),
+      expected_objective_digest: String(ob.objective_digest),
+      workstreams: [
+        { workstream_key: "a", title: "A", goal: "g" },
+        { workstream_key: "b", title: "B", goal: "g" },
+      ],
+      actor: OP,
+    });
+    await expectFail(
+      () => s.svc.runCycle({ objective_id: oid, actor: OP }),
+      "FAIL_CLOSED_CEO_GATE",
+    );
+    expect(decisionsOf(s.store)).toHaveLength(0);
+    s.store.close();
+  });
+
+  it("valid full permutation (reordered, all keys once) is still ACCEPTED with zero topology mutation", async () => {
+    const s = freshCeo("ha-ok", decisionJson({
+      decision_kind: "PRIORITIZE_EXISTING",
+      wait_reason: undefined,
+      priority_order: ["b", "a"],
+      summary: "re-rank",
+    }));
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    const ob = s.objectives.get(oid);
+    s.workstreams.decomposeObjective({
+      objective_id: oid,
+      expected_objective_version: Number(ob.version),
+      expected_terms_version: Number(ob.terms_version),
+      expected_objective_digest: String(ob.objective_digest),
+      workstreams: [
+        { workstream_key: "a", title: "A", goal: "g" },
+        { workstream_key: "b", title: "B", goal: "g" },
+      ],
+      actor: OP,
+    });
+    const before = (s.store.list("work_item") as Array<Record<string, unknown>>)
+      .map((w) => ({ id: w.work_item_id, v: w.version }));
+    const r = await s.svc.runCycle({ objective_id: oid, actor: OP });
+    expect(String(r.decision.decision_kind)).toBe("PRIORITIZE_EXISTING");
+    expect((s.store.list("work_item") as Array<Record<string, unknown>>)
+      .map((w) => ({ id: w.work_item_id, v: w.version }))).toEqual(before);
+    s.store.close();
+  });
+});

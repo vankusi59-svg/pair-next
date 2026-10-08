@@ -370,14 +370,21 @@ Choose exactly ONE decision_kind and follow its field layout exactly:
    workstreams exist yet:
    "workstreams": nonempty array of NEW workstream objects
    [{"workstream_key":"snake_key","title":"...","goal":"...","depends_on_keys":[]}],
-   "priority_order": exact permutation of the proposed workstream_keys,
+   "priority_order": exact permutation of ALL proposed workstream_keys —
+   every new key exactly once,
    "wait_reason": null.
 
 2) decision_kind "PRIORITIZE_EXISTING" — when canonical workstreams
    already exist and only the ORDER matters:
    "workstreams": null,
-   "priority_order": nonempty array of ALREADY-EXISTING canonical
-   workstream_keys only,
+   "priority_order": FULL canonical ordering — EVERY canonical
+   workstream_key EXACTLY ONCE, including workstreams already DONE,
+   completed or terminal. This is an exact permutation of ALL existing
+   keys — never the actionable-only subset, never a partial list, and
+   never keys that do not exist. Completed workstreams must still
+   appear in the ordering. The control plane computes the actionable
+   subset itself from completion proof; ranking a completed workstream
+   does not re-open it.
    "wait_reason": null.
    Canonical workstream definitions are committed authority — NEVER
    resubmit, redefine, rename or restate them in "workstreams" through
@@ -391,7 +398,7 @@ Choose exactly ONE decision_kind and follow its field layout exactly:
 
 Valid examples:
 {"schema":"${CEO_DECISION_SCHEMA}","decision_kind":"INITIALIZE_WORKSTREAMS","workstreams":[{"workstream_key":"research","title":"Gather facts","goal":"...","depends_on_keys":[]}],"priority_order":["research"],"wait_reason":null,"summary":"Initial decomposition."}
-{"schema":"${CEO_DECISION_SCHEMA}","decision_kind":"PRIORITIZE_EXISTING","workstreams":null,"priority_order":["build","verify"],"wait_reason":null,"summary":"Build before verify."}
+{"schema":"${CEO_DECISION_SCHEMA}","decision_kind":"PRIORITIZE_EXISTING","workstreams":null,"priority_order":["launch_posts","delivery_review","product_facts","faq_pack"],"wait_reason":null,"summary":"All four existing keys ranked once — product_facts and faq_pack are DONE but still appear; full canonical ordering, not the actionable-only list."}
 {"schema":"${CEO_DECISION_SCHEMA}","decision_kind":"WAIT","workstreams":null,"priority_order":null,"wait_reason":"AWAITING_PROGRESS","summary":"Waiting for verified progress."}`;
 }
 
