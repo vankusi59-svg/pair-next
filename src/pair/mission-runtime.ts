@@ -36,6 +36,7 @@ import {
   newId,
   utcnow,
 } from "./canonical.js";
+import { MISSION_STATUS_TRANSITIONS } from "./service.js";
 import type { PairControlPlane } from "./service.js";
 import type { GovernedTaskGate } from "./gate.js";
 import type { MissionRouter } from "./mission-router.js";
@@ -121,6 +122,44 @@ const TERMINAL_RUNTIME = new Set<MissionRuntimeState>([
 ]);
 export const TERMINAL_EXECUTION = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 const SETTLED_TASK = new Set(["COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "SUPERSEDED"]);
+
+/** Bounded durable retry budget for potentially-transient planning
+ *  failures before the canonical PLANNING→FAILED terminalization. */
+export const PLANNING_MAX_ATTEMPTS = 3;
+/** Codes that may wrap transient provider failure (the pool already
+ *  applied its own failover + bounded re-ask before giving up). Every
+ *  other FAIL_CLOSED_* is a deterministic contract/governance/config
+ *  failure — replay is a guaranteed identical throw → non-retryable. */
+const PLANNING_RETRYABLE_CODES = new Set(["FAIL_CLOSED_PLANNER_EXHAUSTED"]);
+
+/** Canonical error-code namespaces admitted into persisted planning
+ *  evidence — a bounded POSITIVE allowlist of the code families thrown
+ *  through the planner/dataflow seam. A capability-token-like string
+ *  (FILE_OPERATIONS, TELEGRAM_DELIVERY, PYTHON_EXECUTION — SCREAMING
+ *  SNAKE but not an error claim) does NOT match, so it can never be
+ *  persisted as a canonical failure code; unknown shapes collapse to
+ *  PLANNING_EVIDENCE_CODE_UNKNOWN instead. Conservative incompleteness
+ *  over fabricated authority. */
+const PLANNING_SAFE_CODE =
+  /^(?:FAIL_CLOSED|ACP|CEO|DEVIN|LLM|CREDENTIAL|NOT_FOUND)(?:_[A-Z0-9_:.\-]*)?$/;
+const PLANNING_EVIDENCE_CODE_UNKNOWN = "PLANNING_UNCLASSIFIED";
+/** Fixed diagnostic labels for persisted evidence — the ONLY values
+ *  that may carry the "why" of a terminalization. No freeform
+ *  err.message/inner.message is ever persisted (regex sanitization
+ *  alone cannot prove secret-freedom — R3.B). */
+const PLANNING_TERMINAL_FAILED = "FAILED";
+const PLANNING_TERMINAL_ABORTED_FALLBACK = "ABORTED_FALLBACK";
+const PLANNING_TERMINAL_BLOCKED = "BLOCKED_TRANSITION";
+const TRANSITION_FAULT_LABEL = "TRANSITION_FAULT";
+
+/** Canonicalize a thrown fault to a fixed diagnostic label: the
+ *  error's canonical code when it is a namespaced PairError, else the
+ *  fixed TRANSITION_FAULT label. Never returns message text. */
+function faultLabel(err: unknown): string {
+  return err instanceof PairError && PLANNING_SAFE_CODE.test(err.code)
+    ? err.code
+    : TRANSITION_FAULT_LABEL;
+}
 
 export const RUNTIME_TRANSITIONS: Record<MissionRuntimeState, MissionRuntimeState[]> = {
   CREATED: ["PLANNING", "READY", "CANCELLED", "ABORTED"],
@@ -941,7 +980,11 @@ export class MissionRuntime {
         break;
       }
       case "PLANNING": {
-        this.runPlanning(missionId);
+        try {
+          this.runPlanning(missionId);
+        } catch (err) {
+          this.planningFailureBoundary(missionId, err);
+        }
         break;
       }
       case "READY": {
@@ -1040,6 +1083,204 @@ export class MissionRuntime {
   }
 
   /* ---------------- PLANNING -------------------------------------------- */
+
+  /**
+   * Bounded, durable planning-failure handling. Before this boundary a
+   * deterministic planning throw escaped to the supervisor's silent
+   * per-mission catch and replayed identically every tick — infinite
+   * PLANNING with zero evidence (the MSN_01M4D7W8 stall incident).
+   *
+   * Classification: FAIL_CLOSED_* contract/governance/config codes are
+   * DETERMINISTIC — replay is a guaranteed identical throw, so the
+   * mission terminalizes immediately through the canonical
+   * PLANNING→FAILED / CREATED→FAILED transitions. Codes that may wrap
+   * transient provider failure (FAIL_CLOSED_PLANNER_EXHAUSTED) and any
+   * non-typed throw are TRANSIENT_CANDIDATE — they get a bounded,
+   * durable retry budget (PLANNING_MAX_ATTEMPTS) before the same
+   * terminal path.
+   *
+   * Evidence is deduplicated: ONE bounded record refreshed in place on
+   * the mission_runtime row plus ONE MISSION_PLANNING_FAILED event per
+   * distinct failure code — never a per-tick event/log flood. The
+   * counter lives on the row so the bound survives process restarts
+   * (crash/restart idempotent). No new public mission status: the
+   * terminal pairing is mission FAILED ↔ runtime FAILED, exactly the
+   * pairing LIFECYCLE_PAIRINGS already proves. The original error is
+   * rethrown after handling — tick()'s caller contract is unchanged;
+   * what changed is that the throw can no longer replay silently
+   * forever.
+   */
+  private planningFailureBoundary(missionId: string, err: unknown): void {
+    const code =
+      err instanceof PairError && PLANNING_SAFE_CODE.test(err.code)
+        ? err.code
+        : PLANNING_EVIDENCE_CODE_UNKNOWN;
+    const retryable =
+      !code.startsWith("FAIL_CLOSED_") || PLANNING_RETRYABLE_CODES.has(code);
+    const failureClass = retryable ? "TRANSIENT_CANDIDATE" : "DETERMINISTIC";
+
+    // Bounded, deduplicated evidence — canonical fields ONLY: the safe
+    // code, failure class, attempt counts, timestamps and (on a
+    // terminalization commit) a fixed terminal_class label. No freeform
+    // error text is ever persisted — the evidence is secret-free by
+    // construction, not by regex. The rt.planning_failure record + its
+    // ONE-per-code MISSION_PLANNING_FAILED event are written inside
+    // every commit below, so evidence and any transition it accompanies
+    // persist atomically (CAS on the row version fails closed against a
+    // concurrent writer; a rolled-back attempt leaves zero phantom
+    // events or counter bumps).
+    const writeEvidence = (terminalClass?: string): void => {
+      const rt = this.runtimeEntity(missionId);
+      const prev = rt.planning_failure as Record<string, unknown> | null;
+      const attempts = Number(prev?.attempts ?? 0) + 1;
+      rt.planning_failure = {
+        code,
+        failure_class: failureClass,
+        attempts,
+        first_at: String(prev?.first_at ?? utcnow()),
+        last_at: utcnow(),
+        ...(terminalClass ? { terminal_class: terminalClass } : {}),
+      };
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
+      );
+      if (String(prev?.code ?? "") !== code) {
+        this.store.event({
+          entity_type: "mission_runtime",
+          entity_id: String(rt.mission_runtime_id),
+          event_type: "MISSION_PLANNING_FAILED",
+          actor: this.actor,
+          metadata: {
+            mission_id: missionId,
+            code,
+            failure_class: failureClass,
+            attempts,
+            ...(terminalClass ? { terminal_class: terminalClass } : {}),
+          },
+        });
+      }
+    };
+
+    // Retry-vs-terminal is decided on the durable counter before commit.
+    const attemptsNow =
+      Number(
+        (this.runtimeEntity(missionId).planning_failure as
+          | Record<string, unknown>
+          | null)?.attempts ?? 0,
+      ) + 1;
+
+    if (retryable && attemptsNow < PLANNING_MAX_ATTEMPTS) {
+      // Bounded retry: stay PLANNING. Evidence commits atomically; the
+      // original error still propagates — tick()'s caller contract is
+      // unchanged; the durable counter bounds the replay.
+      this.store.immediate(() => {
+        writeEvidence();
+      });
+      throw err;
+    }
+
+    try {
+      // Atomic terminalization: the deduplicated evidence, the
+      // PLANNING→FAILED runtime transition AND the CREATED→FAILED mission
+      // transition — including both canonical MISSION_*_TRANSITION
+      // evidence rows — commit in ONE BEGIN IMMEDIATE transaction. A
+      // fault between them rolls ALL of it back: an inconsistent
+      // terminal pair (runtime FAILED while mission stayed CREATED) can
+      // never be persisted.
+      this.store.immediate(() => {
+        writeEvidence(PLANNING_TERMINAL_FAILED);
+        this.transitionRuntime(missionId, "FAILED", `planning_failed:${code}`);
+        this.deps.service.transitionMission(missionId, "FAILED", this.actor);
+      });
+    } catch (inner) {
+      // Nothing above persisted — produce the canonical ABORTED pairing
+      // instead. Mission transition errors are NEVER silently swallowed
+      // after terminalizing: under atomicity the runtime cannot have
+      // terminalized while the mission transition failed.
+      this.planningTerminalizationFallback(missionId, code, inner, writeEvidence);
+    }
+    // Preserve the pre-boundary observable contract: callers still see
+    // the original throw — the difference is the failure is now durable
+    // (recorded, bounded, and where required terminalized) instead of
+    // silently replayable forever.
+    throw err;
+  }
+
+  /** Canonical fallback when the atomic FAILED pair cannot commit —
+   *  e.g. the mission was concurrently terminalized (CANCELLED/FAILED
+   *  rejects a further transition), or a write faulted mid-transaction.
+   *  Runtime transitions to ABORTED through the legal transition table
+   *  (a real MISSION_RUNTIME_TRANSITION event, so the canonical
+   *  lifecycle proof still holds) and the mission is synced to FAILED
+   *  inside the SAME transaction wherever FAILED is reachable —
+   *  ABORTED pairs with every terminal mission state, so an already
+   *  terminal mission is left untouched. If even that commit fails, the
+   *  last-resort EMERGENCY_ABORT row still stands as forensic evidence
+   *  — never a silent swallow. */
+  private planningTerminalizationFallback(
+    missionId: string,
+    code: string,
+    inner: unknown,
+    writeEvidence: (terminalClass?: string) => void,
+  ): void {
+    // Fixed diagnostic label for WHY the canonical pair failed — the
+    // inner error's canonical code when namespaced, else a fixed
+    // TRANSITION_FAULT label. Freeform inner.message is never persisted
+    // in rows, event metadata or transition reasons (R3.B).
+    const innerLabel = faultLabel(inner);
+    try {
+      this.store.immediate(() => {
+        // The rolled-back evidence write must not be lost either —
+        // operator-visible proof of WHY the mission aborted, persisted
+        // atomically with the fallback pair. terminal_class records
+        // that this ABORTED pairing is the proven canonical result.
+        writeEvidence(PLANNING_TERMINAL_ABORTED_FALLBACK);
+        const rt = this.runtimeEntity(missionId);
+        const from = String(rt.state) as MissionRuntimeState;
+        if ((RUNTIME_TRANSITIONS[from] ?? []).includes("ABORTED")) {
+          this.transitionRuntime(
+            missionId,
+            "ABORTED",
+            `planning_failed_fallback:${code}:${innerLabel}`,
+          );
+        }
+        const mission = this.deps.service.getMission(missionId);
+        const mFrom = String(mission.status);
+        if ((MISSION_STATUS_TRANSITIONS[mFrom] ?? []).includes("FAILED")) {
+          this.deps.service.transitionMission(missionId, "FAILED", this.actor);
+        }
+      });
+    } catch {
+      // The fallback commit itself could not land — e.g. the mission
+      // transition layer faulted persistently and rolled the whole
+      // transaction back. The runtime must still terminalize (never
+      // re-plan, never duplicate execution) but the pair is NOT a
+      // proven canonical pairing: a mission still CREATED under an
+      // ABORTED runtime is a degraded terminal. Report it honestly —
+      // durable BLOCKED_TRANSITION evidence + an EMERGENCY_ABORT row —
+      // never claim canonical completion.
+      try {
+        this.store.immediate(() => {
+          writeEvidence(PLANNING_TERMINAL_BLOCKED);
+        });
+      } catch {
+        /* even the evidence write cannot commit — store dead; the
+           EMERGENCY row attempt below is all that remains */
+      }
+      try {
+        this.forceAbortRuntime(
+          missionId,
+          `planning_failure_boundary_defect:${innerLabel}`,
+        );
+      } catch {
+        /* the store cannot commit at all — the original planning error
+           still propagates to the caller */
+      }
+    }
+  }
 
   private runPlanning(missionId: string): void {
     const mission = this.deps.service.getMission(missionId);
@@ -1944,9 +2185,12 @@ export class MissionRuntime {
       }
     }
     // Best-effort mission sync AFTER runtime is durably terminal.
+    // CREATED included: a mission whose runtime emergency-aborted during
+    // PLANNING must not linger CREATED forever (CREATED→FAILED is a
+    // legal canonical transition — pairing FAILED:{FAILED,ABORTED}).
     try {
       const mission = this.deps.service.getMission(missionId);
-      if (["READY", "RUNNING", "PAUSED"].includes(String(mission.status))) {
+      if (["CREATED", "READY", "RUNNING", "PAUSED"].includes(String(mission.status))) {
         this.deps.service.transitionMission(missionId, "FAILED", this.actor);
       }
     } catch {
