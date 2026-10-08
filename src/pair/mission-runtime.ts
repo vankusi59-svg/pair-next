@@ -36,6 +36,7 @@ import {
   newId,
   utcnow,
 } from "./canonical.js";
+import { MISSION_STATUS_TRANSITIONS } from "./service.js";
 import type { PairControlPlane } from "./service.js";
 import type { GovernedTaskGate } from "./gate.js";
 import type { MissionRouter } from "./mission-router.js";
@@ -130,7 +131,49 @@ export const PLANNING_MAX_ATTEMPTS = 3;
  *  other FAIL_CLOSED_* is a deterministic contract/governance/config
  *  failure — replay is a guaranteed identical throw → non-retryable. */
 const PLANNING_RETRYABLE_CODES = new Set(["FAIL_CLOSED_PLANNER_EXHAUSTED"]);
-const PLANNING_SAFE_CODE = /^[A-Z0-9_:.\-]{1,80}$/;
+
+/** Canonical error-code namespaces admitted into persisted planning
+ *  evidence — a bounded POSITIVE allowlist of the code families thrown
+ *  through the planner/dataflow seam. A capability-token-like string
+ *  (FILE_OPERATIONS, TELEGRAM_DELIVERY, PYTHON_EXECUTION — SCREAMING
+ *  SNAKE but not an error claim) does NOT match, so it can never be
+ *  persisted as a canonical failure code; unknown shapes collapse to
+ *  PLANNING_EVIDENCE_CODE_UNKNOWN instead. Conservative incompleteness
+ *  over fabricated authority. */
+const PLANNING_SAFE_CODE =
+  /^(?:FAIL_CLOSED|ACP|CEO|DEVIN|LLM|CREDENTIAL|NOT_FOUND)(?:_[A-Z0-9_:.\-]*)?$/;
+const PLANNING_EVIDENCE_CODE_UNKNOWN = "PLANNING_UNCLASSIFIED";
+const PLANNING_MESSAGE_MAX = 160;
+
+/** Credential-shaped material redacted from persisted failure
+ *  fragments — applied BEFORE the bound so a redacted tail cannot leak
+ *  past the slice. `PLANNING_TOKEN_RUN` skips all-uppercase domain
+ *  identifiers (capability tokens, FAIL_CLOSED_* codes) — those are
+ *  operator-meaningful, not secrets — and catches only mixed-case /
+ *  base64-ish opaque blobs. The sanitizer is total: it never throws
+ *  and never fails on capability-token-like strings. */
+const PLANNING_SECRET_LABEL =
+  /\b(?:token|secret|password|passwd|credential|authorization|bearer|apikey|api[_ -]?key)\b[\s:="'`]{0,12}[A-Za-z0-9+/=._~-]{4,}/gi;
+const PLANNING_TOKEN_RUN = /\b(?![A-Z0-9_]+\b)[A-Za-z0-9+/=_~-]{24,}\b/g;
+const PLANNING_HEX_RUN = /\b[0-9a-f]{32,}\b/gi;
+
+function sanitizePlanningMessage(err: unknown): string {
+  let s = String((err as { message?: string })?.message ?? err ?? "")
+    .normalize("NFC")
+    .replace(/[^\p{L}\p{N}\p{P}\p{Zs}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  s = s
+    .replace(PLANNING_SECRET_LABEL, (_m: string, label: string) =>
+      `${label}=[REDACTED]`,
+    )
+    .replace(PLANNING_HEX_RUN, "[REDACTED_HEX]")
+    .replace(PLANNING_TOKEN_RUN, "[REDACTED_TOKEN]");
+  if (s.length > PLANNING_MESSAGE_MAX) {
+    s = s.slice(0, PLANNING_MESSAGE_MAX).trimEnd();
+  }
+  return s;
+}
 
 export const RUNTIME_TRANSITIONS: Record<MissionRuntimeState, MissionRuntimeState[]> = {
   CREATED: ["PLANNING", "READY", "CANCELLED", "ABORTED"],
@@ -1085,73 +1128,150 @@ export class MissionRuntime {
     const code =
       err instanceof PairError && PLANNING_SAFE_CODE.test(err.code)
         ? err.code
-        : "PLANNING_UNCLASSIFIED";
+        : PLANNING_EVIDENCE_CODE_UNKNOWN;
     const retryable =
       !code.startsWith("FAIL_CLOSED_") || PLANNING_RETRYABLE_CODES.has(code);
-    const rt = this.runtimeEntity(missionId);
-    const prev = rt.planning_failure as Record<string, unknown> | null;
-    const attempts = Number(prev?.attempts ?? 0) + 1;
-    const message = String((err as { message?: string })?.message ?? err)
-      .replace(/\s+/g, " ")
-      .slice(0, 160);
-    rt.planning_failure = {
-      code,
-      failure_class: retryable ? "TRANSIENT_CANDIDATE" : "DETERMINISTIC",
-      attempts,
-      first_at: String(prev?.first_at ?? utcnow()),
-      last_at: utcnow(),
-      message,
+    const failureClass = retryable ? "TRANSIENT_CANDIDATE" : "DETERMINISTIC";
+    const message = sanitizePlanningMessage(err);
+
+    // Bounded, sanitized, deduplicated evidence — the rt.planning_failure
+    // record + its ONE-per-code MISSION_PLANNING_FAILED event are written
+    // inside every commit below, so evidence and any transition it
+    // accompanies persist atomically (CAS on the row version fails closed
+    // against a concurrent writer; a rolled-back attempt leaves zero
+    // phantom events or counter bumps).
+    const writeEvidence = (): void => {
+      const rt = this.runtimeEntity(missionId);
+      const prev = rt.planning_failure as Record<string, unknown> | null;
+      const attempts = Number(prev?.attempts ?? 0) + 1;
+      rt.planning_failure = {
+        code,
+        failure_class: failureClass,
+        attempts,
+        first_at: String(prev?.first_at ?? utcnow()),
+        last_at: utcnow(),
+        message,
+      };
+      this.store.put(
+        "mission_runtime",
+        String(rt.mission_runtime_id),
+        rt,
+        Number(rt.version),
+      );
+      if (String(prev?.code ?? "") !== code) {
+        this.store.event({
+          entity_type: "mission_runtime",
+          entity_id: String(rt.mission_runtime_id),
+          event_type: "MISSION_PLANNING_FAILED",
+          actor: this.actor,
+          metadata: {
+            mission_id: missionId,
+            code,
+            failure_class: failureClass,
+            attempts,
+            message,
+          },
+        });
+      }
     };
-    this.store.put(
-      "mission_runtime",
-      String(rt.mission_runtime_id),
-      rt,
-      Number(rt.version),
-    );
-    // Deduplicated event evidence — one per distinct failure code, so a
-    // mission can never flood the journal by replaying the same throw.
-    if (String(prev?.code ?? "") !== code) {
-      this.store.event({
-        entity_type: "mission_runtime",
-        entity_id: String(rt.mission_runtime_id),
-        event_type: "MISSION_PLANNING_FAILED",
-        actor: this.actor,
-        metadata: {
-          mission_id: missionId,
-          code,
-          failure_class: (rt.planning_failure as Record<string, unknown>)
-            .failure_class,
-          attempts,
-          message,
-        },
+
+    // Retry-vs-terminal is decided on the durable counter before commit.
+    const attemptsNow =
+      Number(
+        (this.runtimeEntity(missionId).planning_failure as
+          | Record<string, unknown>
+          | null)?.attempts ?? 0,
+      ) + 1;
+
+    if (retryable && attemptsNow < PLANNING_MAX_ATTEMPTS) {
+      // Bounded retry: stay PLANNING. Evidence commits atomically; the
+      // original error still propagates — tick()'s caller contract is
+      // unchanged; the durable counter bounds the replay.
+      this.store.immediate(() => {
+        writeEvidence();
       });
-    }
-    if (retryable && attempts < PLANNING_MAX_ATTEMPTS) {
-      // Bounded retry: stay PLANNING. The original error still
-      // propagates — tick()'s pre-existing contract is that a planning
-      // failure surfaces to the caller (the supervisor swallows it per
-      // mission as before); the durable counter is what now bounds the
-      // replay.
       throw err;
     }
+
     try {
-      this.transitionRuntime(missionId, "FAILED", `planning_failed:${code}`);
-      try {
+      // Atomic terminalization: the deduplicated evidence, the
+      // PLANNING→FAILED runtime transition AND the CREATED→FAILED mission
+      // transition — including both canonical MISSION_*_TRANSITION
+      // evidence rows — commit in ONE BEGIN IMMEDIATE transaction. A
+      // fault between them rolls ALL of it back: an inconsistent
+      // terminal pair (runtime FAILED while mission stayed CREATED) can
+      // never be persisted.
+      this.store.immediate(() => {
+        writeEvidence();
+        this.transitionRuntime(missionId, "FAILED", `planning_failed:${code}`);
         this.deps.service.transitionMission(missionId, "FAILED", this.actor);
-      } catch {
-        /* mission already terminal/moved — runtime FAILED stands */
-      }
+      });
     } catch (inner) {
-      const msg = String(
-        (inner as { message?: string })?.message ?? inner,
-      ).replace(/\s+/g, " ").slice(0, 120);
-      this.forceAbortRuntime(missionId, `planning_failure_boundary_defect:${msg}`);
+      // Nothing above persisted — produce the canonical ABORTED pairing
+      // instead. Mission transition errors are NEVER silently swallowed
+      // after terminalizing: under atomicity the runtime cannot have
+      // terminalized while the mission transition failed.
+      this.planningTerminalizationFallback(missionId, code, inner, writeEvidence);
     }
     // Preserve the pre-boundary observable contract: callers still see
     // the original throw — the difference is the failure is now durable
     // (recorded, bounded, and where required terminalized) instead of
     // silently replayable forever.
     throw err;
+  }
+
+  /** Canonical fallback when the atomic FAILED pair cannot commit —
+   *  e.g. the mission was concurrently terminalized (CANCELLED/FAILED
+   *  rejects a further transition), or a write faulted mid-transaction.
+   *  Runtime transitions to ABORTED through the legal transition table
+   *  (a real MISSION_RUNTIME_TRANSITION event, so the canonical
+   *  lifecycle proof still holds) and the mission is synced to FAILED
+   *  inside the SAME transaction wherever FAILED is reachable —
+   *  ABORTED pairs with every terminal mission state, so an already
+   *  terminal mission is left untouched. If even that commit fails, the
+   *  last-resort EMERGENCY_ABORT row still stands as forensic evidence
+   *  — never a silent swallow. */
+  private planningTerminalizationFallback(
+    missionId: string,
+    code: string,
+    inner: unknown,
+    writeEvidence: () => void,
+  ): void {
+    const msg = String((inner as { message?: string })?.message ?? inner)
+      .replace(/\s+/g, " ")
+      .slice(0, 120);
+    try {
+      this.store.immediate(() => {
+        // The rolled-back evidence write must not be lost either —
+        // operator-visible proof of WHY the mission aborted, persisted
+        // atomically with the fallback pair.
+        writeEvidence();
+        const rt = this.runtimeEntity(missionId);
+        const from = String(rt.state) as MissionRuntimeState;
+        if ((RUNTIME_TRANSITIONS[from] ?? []).includes("ABORTED")) {
+          this.transitionRuntime(
+            missionId,
+            "ABORTED",
+            `planning_failed_fallback:${code}:${msg}`,
+          );
+        }
+        const mission = this.deps.service.getMission(missionId);
+        const mFrom = String(mission.status);
+        if ((MISSION_STATUS_TRANSITIONS[mFrom] ?? []).includes("FAILED")) {
+          this.deps.service.transitionMission(missionId, "FAILED", this.actor);
+        }
+      });
+    } catch {
+      try {
+        this.forceAbortRuntime(
+          missionId,
+          `planning_failure_boundary_defect:${msg}`,
+        );
+      } catch {
+        /* the store cannot commit at all — the original planning error
+           still propagates to the caller */
+      }
+    }
   }
 
   private runPlanning(missionId: string): void {
@@ -2057,9 +2177,12 @@ export class MissionRuntime {
       }
     }
     // Best-effort mission sync AFTER runtime is durably terminal.
+    // CREATED included: a mission whose runtime emergency-aborted during
+    // PLANNING must not linger CREATED forever (CREATED→FAILED is a
+    // legal canonical transition — pairing FAILED:{FAILED,ABORTED}).
     try {
       const mission = this.deps.service.getMission(missionId);
-      if (["READY", "RUNNING", "PAUSED"].includes(String(mission.status))) {
+      if (["CREATED", "READY", "RUNNING", "PAUSED"].includes(String(mission.status))) {
         this.deps.service.transitionMission(missionId, "FAILED", this.actor);
       }
     } catch {

@@ -17,7 +17,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
@@ -31,6 +31,7 @@ import {
   MissionScheduler,
   MissionSupervisor,
   PairControlPlane,
+  PairError,
   PairEvidenceStore,
   PLANNING_MAX_ATTEMPTS,
   ReconciliationService,
@@ -556,6 +557,233 @@ describe("R1.B — planning failures terminalize canonically, never loop silentl
       .filter((e) => String(e.event_type) === "MISSION_PLANNING_FAILED");
     expect(evs).toHaveLength(1);
     store.close();
+  });
+});
+
+/* ==================== R2.A — atomic planning terminalization ==================== */
+
+describe("R2.A — terminal pair commits atomically or not at all", () => {
+  const detFail = () =>
+    new IntegrityError("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED", "d");
+
+  const rtTransitions = (ctx: Ctx, mid: string, into: string) =>
+    ctx.store
+      .listEvents("mission_runtime", `MRT_${mid}`)
+      .filter(
+        (e) =>
+          String(e.event_type) === "MISSION_RUNTIME_TRANSITION" &&
+          String(e.new_state) === into,
+      );
+  const mTransitions = (ctx: Ctx, mid: string, into: string) =>
+    ctx.store
+      .listEvents("mission", mid)
+      .filter(
+        (e) =>
+          String(e.event_type) === "MISSION_TRANSITION" &&
+          String(e.new_state) === into,
+      );
+
+  it("fault between terminal transitions → rollback, then consistent FAILED+ABORTED pair", () => {
+    const ctx = makeCtx("atomic-fault", () => {
+      throw detFail();
+    });
+    const mid = newMission(ctx, "gửi report.txt lên telegram");
+    // Fault injected exactly BETWEEN the two terminal transitions: the
+    // runtime side commits-within-transaction, the mission side throws.
+    const spy = vi
+      .spyOn(ctx.service, "transitionMission")
+      .mockImplementationOnce(() => {
+        throw new Error("injected mid-pair fault");
+      });
+    ctx.runtime.tick(mid); // CREATED → PLANNING
+    // The original planning error still propagates (caller contract).
+    expect(() => ctx.runtime.tick(mid)).toThrow(
+      /FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED/,
+    );
+    spy.mockRestore();
+    const rt = rtOf(ctx, mid);
+    const mission = ctx.service.getMission(mid);
+    // The FAILED pair rolled back atomically — the canonical ABORTED
+    // fallback produced a consistent terminal pair instead.
+    expect(String(rt.state)).toBe("ABORTED");
+    expect(String(rt.reason)).toContain("planning_failed_fallback:");
+    expect(String(mission.status)).toBe("FAILED");
+    // The rolled-back runtime FAILED transition left ZERO phantom
+    // evidence; exactly one legal transition into each final state.
+    expect(rtTransitions(ctx, mid, "FAILED")).toHaveLength(0);
+    expect(rtTransitions(ctx, mid, "ABORTED")).toHaveLength(1);
+    expect(mTransitions(ctx, mid, "FAILED")).toHaveLength(1);
+    // Canonical lifecycle proof holds on the resulting pair.
+    expect(() =>
+      assertCanonicalMissionLifecycle(ctx.store, mission, "FAILED"),
+    ).not.toThrow();
+    // Evidence was re-persisted inside the fallback commit.
+    const pf = rt.planning_failure as Record<string, unknown>;
+    expect(String(pf.code)).toBe("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED");
+    expect(Number(pf.attempts)).toBe(1);
+    ctx.store.close();
+  });
+
+  it("mission concurrently terminalized (CANCELLED) → consistent CANCELLED+ABORTED pair", () => {
+    const ctx = makeCtx("concurrent-cancel", () => {
+      throw detFail();
+    });
+    const mid = newMission(ctx, "gửi report.txt lên telegram");
+    ctx.runtime.tick(mid); // CREATED → PLANNING
+    // Operator cancels while the mission sits in PLANNING — the
+    // FAILED-pair commit then cannot legally transition the mission.
+    ctx.service.transitionMission(mid, "CANCELLED");
+    expect(() => ctx.runtime.tick(mid)).toThrow(
+      /FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED/,
+    );
+    const rt = rtOf(ctx, mid);
+    const mission = ctx.service.getMission(mid);
+    // ABORTED pairs with CANCELLED canonically — mission left untouched.
+    expect(String(rt.state)).toBe("ABORTED");
+    expect(String(mission.status)).toBe("CANCELLED");
+    expect(rtTransitions(ctx, mid, "FAILED")).toHaveLength(0);
+    expect(rtTransitions(ctx, mid, "ABORTED")).toHaveLength(1);
+    expect(() =>
+      assertCanonicalMissionLifecycle(ctx.store, mission, "CANCELLED"),
+    ).not.toThrow();
+    ctx.store.close();
+  });
+
+  it("a second mid-pair fault still ends canonically — never an inconsistent pair", () => {
+    const ctx = makeCtx("atomic-fault-2", () => {
+      throw detFail();
+    });
+    const mid = newMission(ctx, "gửi report.txt lên telegram");
+    // Persistently break mission transitions — even the fallback's
+    // mission sync must fail → last-resort EMERGENCY path.
+    const spy = vi
+      .spyOn(ctx.service, "transitionMission")
+      .mockImplementation(() => {
+        throw new Error("persistent transition fault");
+      });
+    ctx.runtime.tick(mid);
+    expect(() => ctx.runtime.tick(mid)).toThrow(
+      /FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED/,
+    );
+    spy.mockRestore();
+    const rt = rtOf(ctx, mid);
+    // The fallback transaction rolled back too (its mission-sync call
+    // faulted) — the last-resort EMERGENCY row stands. Nothing half-
+    // committed: ZERO phantom FAILED transitions on either spine, and
+    // the abort is operator-visible forensic evidence.
+    expect(String(rt.state)).toBe("ABORTED");
+    expect(rtTransitions(ctx, mid, "FAILED")).toHaveLength(0);
+    expect(mTransitions(ctx, mid, "FAILED")).toHaveLength(0);
+    const aborts = ctx.store
+      .listEvents("mission_runtime", `MRT_${mid}`)
+      .filter((e) => String(e.event_type) === "MISSION_RUNTIME_EMERGENCY_ABORT");
+    expect(aborts.length).toBeGreaterThanOrEqual(1);
+    ctx.store.close();
+  });
+});
+
+/* ==================== R2.B — safe planning failure evidence ==================== */
+
+describe("R2.B — sanitized bounded failure evidence", () => {
+  it("capability-token-like codes never persist as canonical codes", () => {
+    const ctx = makeCtx("cap-code", () => {
+      throw new PairError("FILE_OPERATIONS", "capability token leaked into the code slot");
+    });
+    const mid = newMission(ctx, "anything");
+    ctx.runtime.tick(mid); // CREATED → PLANNING
+    expect(() => ctx.runtime.tick(mid)).toThrow(/FILE_OPERATIONS/);
+    const rt = rtOf(ctx, mid);
+    const pf = rt.planning_failure as Record<string, unknown>;
+    // Reporting did not fail — evidence persisted — but the token was
+    // not minted into a canonical code slot.
+    expect(String(pf.code)).toBe("PLANNING_UNCLASSIFIED");
+    expect(String(pf.failure_class)).toBe("TRANSIENT_CANDIDATE");
+    expect(Number(pf.attempts)).toBe(1);
+    ctx.store.close();
+  });
+
+  it("secret-shaped material in the error is redacted before persistence", () => {
+    const SECRET = "sk_live_51AbCDeFgHiJkLmN0pQrStUvWxYz";
+    const ctx = makeCtx("secret", () => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED",
+        `planner exploded: Bearer ${SECRET} token=${SECRET}`,
+      );
+    });
+    const mid = newMission(ctx, "anything");
+    ctx.runtime.tick(mid);
+    expect(() => ctx.runtime.tick(mid)).toThrow();
+    const pf = rtOf(ctx, mid).planning_failure as Record<string, unknown>;
+    const persisted = String(pf.message);
+    expect(persisted).not.toContain(SECRET);
+    expect(persisted).toContain("[REDACTED]");
+    // The MISSION_PLANNING_FAILED event metadata is sanitized too.
+    const ev = planningEvents(ctx, mid)[0];
+    expect(JSON.stringify(ev)).not.toContain(SECRET);
+    ctx.store.close();
+  });
+
+  it("opaque token runs redact; uppercase domain identifiers survive", () => {
+    const BLOB = "Ab9xK2mN7pQ4rT8vW1yZ3eF6gH0jL5"; // 28-char mixed-case blob
+    const ctx = makeCtx("tokenrun", () => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED",
+        `task FILE_OPERATIONS rejected; opaque ${BLOB} blob`,
+      );
+    });
+    const mid = newMission(ctx, "anything");
+    ctx.runtime.tick(mid);
+    expect(() => ctx.runtime.tick(mid)).toThrow();
+    const persisted = String(
+      (rtOf(ctx, mid).planning_failure as Record<string, unknown>).message,
+    );
+    // Capability-token-like domain identifiers are NOT treated as
+    // secrets — they stay operator-readable.
+    expect(persisted).toContain("FILE_OPERATIONS");
+    expect(persisted).not.toContain(BLOB);
+    ctx.store.close();
+  });
+
+  it("message is bounded and control-stripped; code stays canonical", () => {
+    const ctx = makeCtx("bounded", () => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED",
+        `boom\x00\x1f ${"x".repeat(400)}`,
+      );
+    });
+    const mid = newMission(ctx, "anything");
+    ctx.runtime.tick(mid);
+    expect(() => ctx.runtime.tick(mid)).toThrow();
+    const pf = rtOf(ctx, mid).planning_failure as Record<string, unknown>;
+    const persisted = String(pf.message);
+    expect(persisted.length).toBeLessThanOrEqual(160);
+    expect(persisted).not.toContain("\x00");
+    expect(persisted).not.toContain("\x1f");
+    expect(String(pf.code)).toBe("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED");
+    ctx.store.close();
+  });
+
+  it("dedup is per-code: a code change across attempts emits one event each", () => {
+    let n = 0;
+    const ctx = makeCtx("code-switch", () => {
+      n++;
+      // Attempt 1: retryable pool exhaustion; attempt 2: deterministic.
+      throw n === 1
+        ? new IntegrityError("FAIL_CLOSED_PLANNER_EXHAUSTED", "pool gave up")
+        : new IntegrityError("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED", "d");
+    });
+    const mid = newMission(ctx, "anything");
+    ctx.runtime.tick(mid); // CREATED → PLANNING
+    expect(() => ctx.runtime.tick(mid)).toThrow(/PLANNER_EXHAUSTED/); // attempt 1
+    expect(() => ctx.runtime.tick(mid)).toThrow(/DATAFLOW/); // attempt 2 → terminal
+    const rt = rtOf(ctx, mid);
+    expect(String(rt.state)).toBe("FAILED");
+    // One event per DISTINCT code — exactly two, never a per-tick flood.
+    expect(planningEvents(ctx, mid)).toHaveLength(2);
+    const pf = rt.planning_failure as Record<string, unknown>;
+    expect(String(pf.code)).toBe("FAIL_CLOSED_PLAN_DATAFLOW_DELIVERY_REQUIRED");
+    expect(Number(pf.attempts)).toBe(2);
+    ctx.store.close();
   });
 });
 
