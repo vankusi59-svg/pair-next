@@ -1122,6 +1122,101 @@ describe("P15.6 R2.A — assertCanonicalMissionInFlight", () => {
     s.store.close();
   });
 
+  it("A2b. mission RUNNING + canonical runtime PAUSED → FAIL in-flight", () => {
+    const { s, cid, mid } = openedChild("r2a-rtp");
+    missionRunning(s, mid);
+    s.runtime.transitionRuntime(mid, "READY", "r2a");
+    s.runtime.transitionRuntime(mid, "RUNNING", "r2a");
+    s.runtime.transitionRuntime(mid, "PAUSED", "r2a"); // canonical runtime spine
+    const mission = s.store.get("mission", mid);
+    const child = s.store.get("work_item", cid);
+    expect(() =>
+      assertCanonicalMissionInFlight(s.store, mission, child))
+      .toThrow(/runtime state PAUSED incompatible/);
+    s.store.close();
+  });
+
+  it("A2c. mission RUNNING + canonical runtime terminal (FAILED) → FAIL in-flight", () => {
+    const { s, cid, mid } = openedChild("r2a-rtf");
+    missionRunning(s, mid);
+    s.runtime.transitionRuntime(mid, "READY", "r2a");
+    s.runtime.transitionRuntime(mid, "RUNNING", "r2a");
+    s.runtime.transitionRuntime(mid, "FAILED", "r2a");
+    const mission = s.store.get("mission", mid);
+    const child = s.store.get("work_item", cid);
+    expect(() =>
+      assertCanonicalMissionInFlight(s.store, mission, child))
+      .toThrow(/incompatible|REPLAY|replays? to|runtime/);
+    s.store.close();
+  });
+
+  it("A2d. canonical PAUSED runtime + forged row.state=RUNNING (recomputed hash) → FAIL", () => {
+    const { s, cid, mid } = openedChild("r2a-rtforge");
+    missionRunning(s, mid);
+    s.runtime.transitionRuntime(mid, "READY", "r2a");
+    s.runtime.transitionRuntime(mid, "RUNNING", "r2a");
+    s.runtime.transitionRuntime(mid, "PAUSED", "r2a");
+    sqlRewriteEntity(s.store, "mission_runtime", `MRT_${mid}`,
+      (b) => { b.state = "RUNNING"; });
+    const mission = s.store.get("mission", mid);
+    const child = s.store.get("work_item", cid);
+    expect(() =>
+      assertCanonicalMissionInFlight(s.store, mission, child))
+      .toThrow(/claims runtime RUNNING but replay derives PAUSED/);
+    s.store.close();
+  });
+
+  it("A2e. canonical terminal runtime + forged row.state=RUNNING → FAIL", () => {
+    const { s, cid, mid } = openedChild("r2a-rtforge2");
+    missionRunning(s, mid);
+    s.runtime.transitionRuntime(mid, "READY", "r2a");
+    s.runtime.transitionRuntime(mid, "RUNNING", "r2a");
+    s.runtime.transitionRuntime(mid, "FAILED", "r2a");
+    sqlRewriteEntity(s.store, "mission_runtime", `MRT_${mid}`,
+      (b) => { b.state = "RUNNING"; });
+    const mission = s.store.get("mission", mid);
+    const child = s.store.get("work_item", cid);
+    expect(() =>
+      assertCanonicalMissionInFlight(s.store, mission, child))
+      .toThrow(/claims runtime RUNNING but replay derives FAILED/);
+    s.store.close();
+  });
+
+  it("A2f. forged runtime transition without valid predecessor → FAIL", () => {
+    const { s, cid, mid } = openedChild("r2a-rtpred");
+    missionRunning(s, mid);
+    // Runtime row exists only as CREATED; inject a transition whose
+    // old_state does not follow the replayed state.
+    s.runtime.transitionRuntime(mid, "READY", "r2a");
+    s.store.event({
+      entity_type: "mission_runtime", entity_id: `MRT_${mid}`,
+      event_type: "MISSION_RUNTIME_TRANSITION",
+      old_state: "FAILED", new_state: "RUNNING",
+      actor: "forged", metadata: { mission_id: mid },
+    });
+    const mission = s.store.get("mission", mid);
+    const child = s.store.get("work_item", cid);
+    expect(() =>
+      assertCanonicalMissionInFlight(s.store, mission, child))
+      .toThrow(/runtime transition from FAILED but replay at READY/);
+    s.store.close();
+  });
+
+  it("A2g. runtime evidence without a runtime row → FAIL (no silent orphan evidence)", () => {
+    const { s, cid, mid } = openedChild("r2a-rtorphan");
+    s.runtime.transitionRuntime(mid, "READY", "r2a");
+    // Delete the row, leave the committed evidence — corrupt authority.
+    dbOf(s.store)
+      .prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
+      .run("mission_runtime", `MRT_${mid}`);
+    const mission = s.store.get("mission", mid); // claimed CREATED
+    const child = s.store.get("work_item", cid);
+    expect(() =>
+      assertCanonicalMissionInFlight(s.store, mission, child))
+      .toThrow(/runtime evidence exists but the row is missing/);
+    s.store.close();
+  });
+
   it("A3. PAUSED mission is NEVER in-flight → converge must fail closed", () => {
     const { s, cid, mid } = openedChild("r2a-paused");
     missionRunning(s, mid);
@@ -1369,6 +1464,133 @@ describe("P15.6 R2.D — independent per-pass bounds", () => {
       expect(r.outcome).toBe("AWAITING_EXECUTION");
       expect(r.detail ?? "").not.toBe("internal step bound reached");
     }
+    s.store.close();
+  });
+});
+
+/* ---------- R3.B — stale strategy / injected-drift closure ---------- */
+
+describe("P15.6 R3.B — injected drift at real between-seam boundaries", () => {
+  /** Exit bootstrap: commit ONE canonical WAIT review, then move KPI
+   *  so the pass's own review is fresh → PRIORITIZE path reached. */
+  async function nonBootstrap(name: string, invoker: CeoDecisionInvoker,
+      keys: Array<string | Record<string, unknown>> = ["w1", "w2"]) {
+    const first = new FakeInvoker(WAIT_JSON);
+    const { s, oid, bid, binding, ops } = seeded(name, invoker, keys);
+    await reviewSvc(s, first).runReview({ objective_id: oid, actor: OP });
+    // move canonical external state so the next review is new
+    recordKpi(s, oid, "KPI_1", 3, `ev-nb-${counter}`);
+    return { s, oid, bid, binding, ops };
+  }
+
+  it("A. KPI drift AFTER review BEFORE allocation → stale strategy not applied, zero Mission", async () => {
+    const { s, oid, ops } = await nonBootstrap(
+      "r3b-drift", new FakeInvoker(PRIORITIZE_JSON(["w2", "w1"])));
+    const r = await ops.runObjectivePass({
+      objective_id: oid, actor: OP,
+      hooks: { afterReview: () => {
+        // still-GAP but materially different measurement
+        recordKpi(s, oid, "KPI_1", 4, `ev-drift-${counter}`);
+      } },
+    });
+    expect(r.outcome).toBe("WAITING");
+    expect(String(r.detail ?? "")).toContain("drifted");
+    expect(s.store.list("mission").length).toBe(0);
+    expect(s.store.list(WORKFORCE_ALLOCATION_ENTITY).length).toBe(0);
+    s.store.close();
+  });
+
+  it("B. newer valid strategy committed after review → old order cannot dispatch", async () => {
+    const { s, oid, ops } = await nonBootstrap(
+      "r3b-newstrat", new FakeInvoker(PRIORITIZE_JSON(["w2", "w1"])));
+    const r = await ops.runObjectivePass({
+      objective_id: oid, actor: OP,
+      hooks: { afterReview: () => {
+        // Canonical external change + a NEWER committed strategy.
+        recordKpi(s, oid, "KPI_1", 4, `ev-ns-${counter}`);
+        void reviewSvc(s, new FakeInvoker(PRIORITIZE_JSON(["w1", "w2"])))
+          .runReview({ objective_id: oid, actor: OP });
+      } },
+    });
+    expect(r.outcome).toBe("WAITING");
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("C. KPI target reached AFTER allocation BEFORE open → zero Mission", async () => {
+    const { s, oid, ops } = seeded(
+      "r3b-kpi", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const r = await ops.runObjectivePass({
+      objective_id: oid, actor: OP,
+      hooks: { beforeOpen: () => {
+        recordKpi(s, oid, "KPI_1", 10, `ev-met-bo-${counter}`);
+      } },
+    });
+    expect(r.outcome).toBe("TARGET_MET_CANDIDATE");
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("D. objective CANCELLED after allocation before open → zero Mission", async () => {
+    const { s, oid, bid, ops } = seeded(
+      "r3b-cancel", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const r = await ops.runObjectivePass({
+      objective_id: oid, actor: OP,
+      hooks: { beforeOpen: () => {
+        const o = s.biz.objectives.get(oid);
+        s.biz.objectives.transitionStatus(oid, {
+          business_id: bid, to: "CANCELLED",
+          expected_objective_version: Number(o.version),
+          expected_objective_digest: String(o.objective_digest),
+          actor: OWNER, reason: "cancelled between allocate and open",
+        });
+      } },
+    });
+    expect(r.outcome).toBe("OBJECTIVE_NOT_ACTIVE");
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("E. budget reaches ceiling after allocation before open → zero Mission", async () => {
+    const { s, oid, bid, ops } = seeded(
+      "r3b-budget", new FakeInvoker(WAIT_JSON), ["w1"]);
+    const r = await ops.runObjectivePass({
+      objective_id: oid, actor: OP,
+      hooks: { beforeOpen: () => {
+        s.biz.objectives.accountBudget(oid, {
+          business_id: bid, spend_key: `sp-bo-${counter}`,
+          amount_microusd: 500_000_000, actor: OWNER,
+        });
+      } },
+    });
+    expect(r.outcome).toBe("OBJECTIVE_BUDGET_EXHAUSTED");
+    expect(s.store.list("mission").length).toBe(0);
+    s.store.close();
+  });
+
+  it("F. normal PRIORITIZE → allocate → open PASS; own WAL write does not false-trip", async () => {
+    const { s, oid, ops } = await nonBootstrap(
+      "r3b-normal", new FakeInvoker(PRIORITIZE_JSON(["w2", "w1"])));
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(r.workstream_key).toBe("w2");
+    expect(s.store.list("mission").length).toBe(1);
+    s.store.close();
+  });
+
+  it("G. restart with existing canonical WAL READY → same child opens via governed seam, no duplicate allocation", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding } = seeded("r3b-restart", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    const cid = childOfKey(s, binding, "w1");
+    const walBefore = s.store.list(WORKFORCE_ALLOCATION_ENTITY).length;
+    // Fresh operating service over the same durable store — restart.
+    const ops2 = opStack(s, new FakeInvoker(WAIT_JSON));
+    const r = await ops2.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(r.delegated_child_work_item_id).toBe(cid);
+    expect(s.store.list(WORKFORCE_ALLOCATION_ENTITY).length).toBe(walBefore); // zero duplicate
+    expect(s.store.list("mission").length).toBe(1);
     s.store.close();
   });
 });

@@ -34,6 +34,7 @@ import type { GraphAuthorityDeps } from "./graph-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import { MISSION_STATUS_TRANSITIONS } from "./service.js";
 import { RUNTIME_TRANSITIONS, TERMINAL_EXECUTION } from "./mission-runtime.js";
+import type { MissionRuntimeState } from "./mission-runtime.js";
 import {
   assertCanonicalDecomposition,
   assertCanonicalDelegation,
@@ -703,19 +704,65 @@ export function assertCanonicalMissionInFlight(
       fail(`mission ${mid}: bound_open_id origin pin mismatch`);
     }
   }
-  // Compatible runtime — live non-terminal non-paused state only.
-  const rt = store.tryGet("mission_runtime", `MRT_${mid}`) as Row | null;
+  // Compatible runtime — the claimed row state is a mutable
+  // projection: replay the immutable MISSION_RUNTIME_* evidence to
+  // derive the canonical latest state first (R3.A), then apply the
+  // in-flight compatibility gate.
+  const rtId = `MRT_${mid}`;
+  const rt = store.tryGet("mission_runtime", rtId) as Row | null;
+  const rtEvs = store.listEvents("mission_runtime", rtId);
+  const rtCreated = rtEvs.filter((e) =>
+    String(e.event_type ?? "") === "MISSION_RUNTIME_CREATED");
+  const rtTrans = rtEvs.filter((e) =>
+    String(e.event_type ?? "") === "MISSION_RUNTIME_TRANSITION");
+  const rtMissionId = (e: Record<string, unknown>): string =>
+    String((e.metadata as Record<string, unknown> | undefined)?.mission_id ?? "");
   if (!rt) {
+    // Legitimate case: a CREATED mission whose lazy runtime row was
+    // never minted — but then there must be ZERO runtime evidence for
+    // this mission (a deleted row over committed evidence is corrupt).
     if (claimed !== "CREATED") {
       fail(`mission ${mid}: ${claimed} without canonical runtime row`);
+    }
+    if (rtCreated.length > 0 || rtTrans.length > 0) {
+      fail(`mission ${mid}: runtime evidence exists but the row is missing`);
     }
     return;
   }
   if (String(rt.mission_id ?? "") !== mid) {
     fail(`mission ${mid}: runtime identity mismatch`);
   }
-  if (!IN_FLIGHT_RUNTIME_STATES.has(String(rt.state ?? ""))) {
-    fail(`mission ${mid}: runtime state ${String(rt.state)} incompatible with in-flight`);
+  if (rtCreated.length !== 1) {
+    fail(`mission ${mid}: ${rtCreated.length} runtime creation anchors`);
+  }
+  const rtAnchor = rtCreated[0]!;
+  if (rtMissionId(rtAnchor) !== mid ||
+      String(rtAnchor.new_state ?? "") !== "CREATED") {
+    fail(`mission ${mid}: malformed runtime creation anchor`);
+  }
+  // Replayed state must equal the claimed row state — every transition
+  // continuous, legal, and mission-bound.
+  let rtDerived = "CREATED";
+  for (const e of rtTrans) {
+    if (rtMissionId(e) !== mid) {
+      fail(`mission ${mid}: runtime transition carries foreign mission identity`);
+    }
+    const from = String(e.old_state ?? "");
+    const to = String(e.new_state ?? "");
+    if (from !== rtDerived) {
+      fail(`mission ${mid}: runtime transition from ${from} but replay at ${rtDerived}`);
+    }
+    if (!(RUNTIME_TRANSITIONS[from as MissionRuntimeState] ?? [])
+        .includes(to as MissionRuntimeState)) {
+      fail(`mission ${mid}: illegal runtime transition ${from}->${to}`);
+    }
+    rtDerived = to;
+  }
+  if (rtDerived !== String(rt.state ?? "")) {
+    fail(`mission ${mid}: claims runtime ${String(rt.state)} but replay derives ${rtDerived}`);
+  }
+  if (!IN_FLIGHT_RUNTIME_STATES.has(rtDerived)) {
+    fail(`mission ${mid}: runtime state ${rtDerived} incompatible with in-flight`);
   }
 }
 

@@ -113,6 +113,15 @@ interface PassCtx {
   steps_used: number;
 }
 
+/** TEST-ONLY injection points at REAL between-seam boundaries — used
+ *  by the R3 injected-drift tests; production callers never pass them. */
+export interface OperatingPassHooks {
+  /** Fires after a committed PRIORITIZE review, before NEW allocation. */
+  afterReview?: () => void;
+  /** Fires after allocation resolved, before the openWorkItem crossing. */
+  beforeOpen?: () => void;
+}
+
 function operatingFail(detail: string): never {
   throw new IntegrityError("FAIL_CLOSED_P15_6_OPERATING_LOOP", detail);
 }
@@ -139,6 +148,8 @@ export class ObjectiveOperatingService {
   async runObjectivePass(input: {
     objective_id: string;
     actor: string;
+    /** TEST-ONLY — never set in production. */
+    hooks?: OperatingPassHooks;
   }): Promise<OperatingPassResult> {
     if (typeof input.actor !== "string" || !input.actor.trim() || input.actor.length > 256) {
       throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "operating.runObjectivePass");
@@ -150,7 +161,7 @@ export class ObjectiveOperatingService {
     }
     const ctx: PassCtx = { steps_used: 0 };
     try {
-      return await this.pass(ctx, objectiveId, actor);
+      return await this.pass(ctx, objectiveId, actor, input.hooks);
     } catch (e) {
       if (e instanceof PassBoundExceeded) {
         // Deterministic external-wait boundary: the committed seams
@@ -161,7 +172,10 @@ export class ObjectiveOperatingService {
     }
   }
 
-  private async pass(ctx: PassCtx, objectiveId: string, actor: string): Promise<OperatingPassResult> {
+  private async pass(
+    ctx: PassCtx, objectiveId: string, actor: string,
+    hooks?: OperatingPassHooks,
+  ): Promise<OperatingPassResult> {
     const result = (o: OperatingOutcome, extra?: Partial<OperatingPassResult>): OperatingPassResult => ({
       outcome: o, objective_id: objectiveId, ...extra,
     });
@@ -269,7 +283,7 @@ export class ObjectiveOperatingService {
         ctx, objectiveId, launchable[0]!.delegated_child_work_item_id!,
         launchable[0]!.work_item_id, actor, result, {
           workstream_key: launchable[0]!.workstream_key,
-        });
+        }, hooks);
     }
 
     // §12 — binding + nothing launchable + no active execution → the
@@ -282,6 +296,11 @@ export class ObjectiveOperatingService {
       canonicalAdaptiveReviewsFor(this.deps, objectiveId).length === 0;
     let order: string[];
     let appliedStrategyId: string | null = null;
+    /** R3.B — the canonical review/strategy checkpoint this pass is
+     *  allowed to act on: source review identity + the immutable
+     *  observation digest the decision was made against. */
+    let sourceReviewId: string | null = null;
+    let sourceObsDigest: string | null = null;
     if (bootstrap) {
       order = (binding.workstreams as Array<Record<string, unknown>>)
         .map((w) => String(w.workstream_key));
@@ -292,13 +311,10 @@ export class ObjectiveOperatingService {
       const reviewId = String(reviewRes.review.review_id);
       switch (reviewRes.outcome) {
         case "PRIORITIZE_EXISTING": {
-          // R2.C — never trust the returned strategy merely because the
-          // call produced it: strict re-read the committed latest
-          // strategy and require it to be the one pinned by THIS
-          // canonical review. Tampering anywhere in the chain fails
-          // inside the strict read; a superseded head means external
-          // canonical state drifted — bounded wait, next pass reviews
-          // fresh state.
+          // R2.C/R3.B — never trust the returned strategy merely
+          // because the call produced it: strict re-read the committed
+          // latest strategy and require it to be the one pinned by THIS
+          // canonical review (identity + digest + obs checkpoint).
           const latest = this.deps.review.getLatestStrategy(objectiveId);
           const applied = reviewRes.strategy_revision;
           if (!latest || !applied ||
@@ -313,6 +329,8 @@ export class ObjectiveOperatingService {
             });
           }
           appliedStrategyId = String(latest.strategy_revision_id);
+          sourceReviewId = reviewId;
+          sourceObsDigest = String(reviewRes.review.review_observation_digest);
           order = (latest.actionable_order as string[]).map(String);
           break;
         }
@@ -329,6 +347,24 @@ export class ObjectiveOperatingService {
           return result("WAITING", { review_id: reviewId });
         default:
           operatingFail(`review outcome ${String(reviewRes.outcome)} outside operating vocabulary`);
+      }
+    }
+
+    // R3.B — before any NEW allocation, verify the canonical external
+    //    state still agrees with the review's decision checkpoint: the
+    //    strict observation digest must equal the digest the source
+    //    review committed. Any external drift (KPI progress, lifecycle
+    //    evidence, WAL writes, budget) → bounded WAITING, never stale
+    //    dispatch. Rows committed by THIS pass's own review are not in
+    //    the observation identity (P15.5 R2.A), so the check is exact.
+    if (sourceObsDigest !== null && appliedStrategyId !== null) {
+      hooks?.afterReview?.();
+      const nowDigest = buildReviewObservation(this.deps, objectiveId).digest;
+      if (nowDigest !== sourceObsDigest) {
+        return result("WAITING", {
+          review_id: sourceReviewId ?? undefined,
+          detail: "canonical state drifted since review — stale strategy not applied",
+        });
       }
     }
 
@@ -361,6 +397,21 @@ export class ObjectiveOperatingService {
       if (alloc.status === "no_eligible_agent") { noEligible.push(key); continue; }
       // allocated | replayed — use the EXACT delegated child. §27:
       // a dispatch still carries the blocked keys as observability.
+      // R3.B — before opening, re-prove the applied strategy is STILL
+      // the canonical head pinned by the source review: a newer valid
+      // strategy committed since the review makes the old actionable
+      // order stale authority.
+      if (appliedStrategyId !== null) {
+        const head = this.deps.review.getLatestStrategy(objectiveId);
+        if (!head ||
+            String(head.strategy_revision_id) !== appliedStrategyId ||
+            String(head.source_review_id) !== sourceReviewId) {
+          return result("WAITING", {
+            review_id: sourceReviewId ?? undefined,
+            detail: "newer canonical strategy superseded this pass's ordering",
+          });
+        }
+      }
       const childId = String(alloc.delegated_child_work_item_id);
       return this.openDelegatedChild(
         ctx, objectiveId, childId, w.work_item_id, actor, result, {
@@ -370,7 +421,8 @@ export class ObjectiveOperatingService {
           strategy_revision_id: appliedStrategyId ?? undefined,
           ...(blocked.length ? { blocked_workstream_keys: [...blocked] } : {}),
           ...(noEligible.length ? { no_eligible_workstream_keys: [...noEligible] } : {}),
-        });
+        },
+        hooks);
     }
     if (blocked.length > 0) {
       return result("DEPENDENCY_BLOCKED", { blocked_workstream_keys: blocked });
@@ -478,8 +530,10 @@ export class ObjectiveOperatingService {
     actor: string,
     result: (o: OperatingOutcome, extra?: Partial<OperatingPassResult>) => OperatingPassResult,
     extra?: Partial<OperatingPassResult>,
+    hooks?: OperatingPassHooks,
   ): OperatingPassResult {
     this.tick(ctx);
+    hooks?.beforeOpen?.(); // TEST-ONLY drift injection at the real boundary
     const proof = this.proveDispatchAuthority(
       objectiveId, childId, workstreamWorkItemId);
     if ("abort" in proof) {
