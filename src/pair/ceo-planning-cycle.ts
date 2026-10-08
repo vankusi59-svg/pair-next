@@ -16,6 +16,7 @@
 
 import { digest, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { CEO_CLI_TIMEOUT, ceoCliTimeoutMs } from "./env-config.js";
 import { modelRoleOf, sameCanonicalModel, MODEL_ROLE, listModelRoleAssignments } from "./model-role.js";
 import { providerModelEligibility } from "./model-routable.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
@@ -119,7 +120,7 @@ export const CEO_ATTEMPT_SETTLED_EVENT = "CEO_DECISION_ATTEMPT_SETTLED";
  *  one invocation timeout plus margin; never assume the provider was
  *  not called. */
 export const CEO_ATTEMPT_STALE_GRACE_MS = 5 * 60_000;
-export const CEO_INVOKE_TIMEOUT_MS = 20_000;
+export const CEO_INVOKE_TIMEOUT_MS = CEO_CLI_TIMEOUT.defaultValue;
 
 export function ceoCycleId(objectiveId: string, observationDigest: string): string {
   return `CCY_${digest(`ceo-cycle:${objectiveId}:${observationDigest}`).slice(0, 24)}`;
@@ -923,7 +924,7 @@ export class CeoPlanningCycleService {
         system_prompt: ceoDecisionSystemPrompt(),
         user_prompt: buildCeoUserPrompt(first.observation),
         observation_digest: first.observation_digest,
-        timeout_ms: this.deps.timeout_ms ?? CEO_INVOKE_TIMEOUT_MS,
+        timeout_ms: this.deps.timeout_ms ?? ceoCliTimeoutMs(),
       });
       responseDigest = digest(res.raw_text);
       // The configured/injected model_entry must equal the identity the

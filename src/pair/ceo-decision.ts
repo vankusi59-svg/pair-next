@@ -14,6 +14,7 @@
 
 import { digest } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
+import { CEO_CLI_TIMEOUT, ceoCliTimeoutMs } from "./env-config.js";
 import { extractPlanJson } from "./llm-planner.js";
 import { providerEntryId } from "./provider-catalog.js";
 import type { PairEvidenceStore } from "./store.js";
@@ -79,7 +80,7 @@ export const CEO_MAX_OUTPUT_BYTES = 64 * 1024;
  *  UTF-8 bytes, never JS character count. Oversized state fails closed
  *  (never truncated to fit). */
 export const CEO_MAX_OBSERVATION_BYTES = 96 * 1024;
-export const CEO_DEFAULT_TIMEOUT_MS = 20000;
+export const CEO_DEFAULT_TIMEOUT_MS = CEO_CLI_TIMEOUT.defaultValue;
 /** Default CEO reasoning model on the codex-cli provider (P15.3 R2
  *  addendum §D) — the same canonical `codex-cli:<model>` entry may serve
  *  PLANNER_COORDINATOR and CEO_DECISION without a second authority. */
@@ -627,7 +628,7 @@ export class CodexCliCeoDecisionInvoker implements CeoDecisionInvoker {
         {
           executable: exe,
           model: input.transport.model_id,
-          timeoutMs: input.timeout_ms ?? CEO_DEFAULT_TIMEOUT_MS,
+          timeoutMs: input.timeout_ms ?? ceoCliTimeoutMs(),
           scratchDir,
           schema: CEO_DECISION_JSON_SCHEMA,
           runPrefix: "ceo",
