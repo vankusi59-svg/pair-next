@@ -58,6 +58,7 @@ export const CONVERSATION_MAX_BODY_CHARS = 16_000;
 export const CONVERSATION_MAX_TITLE_CHARS = 200;
 export const CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS = 200;
 export const CONVERSATION_MAX_MESSAGES_PER_SESSION = 10_000;
+export const CONVERSATION_MAX_CORRELATION_ID_CHARS = 128;
 export const CONVERSATION_MAX_SESSIONS_PER_OWNER = 1_000;
 export const CONVERSATION_MAX_PAGE_SIZE = 200;
 
@@ -94,6 +95,24 @@ function assertStr(field: string, value: unknown, { empty = false } = {}): strin
     throw new IntegrityError("FAIL_CLOSED_CONVERSATION_FIELD", `${field} invalid`);
   }
   return value;
+}
+
+/** R3.B — audit correlation ids must be bounded opaque identifiers,
+ *  never arbitrary caller text: a `bcap1.*` capability token, a secret
+ *  payload or freeform prose cannot ride into the durable event log.
+ *  Charset allows alnum + `_ . : -` (real correlation-id shapes); the
+ *  `bcap1.` capability prefix is denied outright. */
+const CORRELATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+function assertCorrelationId(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const v = assertStr("correlation_id", value, { empty: true });
+  if (v.length > CONVERSATION_MAX_CORRELATION_ID_CHARS) {
+    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "correlation_id");
+  }
+  if (!CORRELATION_ID_PATTERN.test(v) || v.startsWith("bcap1.")) {
+    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_FIELD", "correlation_id");
+  }
+  return v;
 }
 
 function assertOptStr(field: string, value: unknown): string | null {
@@ -231,6 +250,15 @@ export class ConversationSessionService {
         typeof row.idempotency_key !== "string") {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "idempotency_key");
     }
+    // R3.A — canonical message identity: a keyed message's persisted id
+    // must equal the deterministic id derived from ITS pinned session and
+    // key. A planted row carrying a foreign session_id but an id minted
+    // for another session fails here — cross-session inconsistency is an
+    // integrity violation on every canonical read.
+    if (typeof row.idempotency_key === "string" &&
+        String(row.message_id) !== conversationMessageIdFor(String(row.session_id), row.idempotency_key)) {
+      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "message_id");
+    }
     const rebuilt = conversationMessageDigest({
       message_id: String(row.message_id),
       session_id: String(row.session_id),
@@ -281,6 +309,7 @@ export class ConversationSessionService {
     if (clientRequestId !== null && clientRequestId.length > CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "client_request_id");
     }
+    const corrId = assertCorrelationId(input.correlation_id);
     const sessionId = clientRequestId
       ? conversationSessionIdFor(owner, clientRequestId)
       : newId("CSESS");
@@ -350,7 +379,7 @@ export class ConversationSessionService {
         old_state: null,
         new_state: "OPEN",
         actor: owner,
-        correlation_id: input.correlation_id ?? null,
+        correlation_id: corrId,
         metadata: { owner_operator_id: owner, entry_mode: "CONVERSATION" },
       });
       return written as unknown as ConversationSessionRow;
@@ -400,6 +429,7 @@ export class ConversationSessionService {
   }): ConversationSessionRow {
     const op = assertStr("operator_id", input.operator_id);
     const id = assertStr("session_id", sessionId);
+    const corrId = assertCorrelationId(input.correlation_id);
     return this.store.immediate(() => {
       const session = this.ownedSession(id, op);
       if (session.state === "CLOSED") return session; // idempotent close
@@ -418,7 +448,7 @@ export class ConversationSessionService {
         old_state: "OPEN",
         new_state: "CLOSED",
         actor: op,
-        correlation_id: input.correlation_id ?? null,
+        correlation_id: corrId,
         metadata: { message_count: session.message_count },
       });
       return written as unknown as ConversationSessionRow;
@@ -515,6 +545,11 @@ export class ConversationSessionService {
     },
   ): ConversationMessageRow {
     this.assertCanonicalMessage(row);
+    // Entity-key/payload binding (R3.A): the row was fetched by entity
+    // key `input.messageId` — its payload must claim that same id.
+    if (String(row.message_id) !== input.messageId) {
+      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", input.messageId);
+    }
     // Membership/owner consistency (R2.B): the stored row must name THIS
     // session and THIS owner. A planted row whose own message_digest and
     // store hash are internally consistent — but whose session_id or
@@ -560,6 +595,7 @@ export class ConversationSessionService {
     if (idemKey !== null && idemKey.length > CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "idempotency_key");
     }
+    const corrId = assertCorrelationId(input.correlation_id);
     const role = input.role;
     const messageId = idemKey ? conversationMessageIdFor(sessionId, idemKey) : newId("MSG");
     // Session resolution differs by seam: the operator path enforces
@@ -642,7 +678,7 @@ export class ConversationSessionService {
         old_state: null,
         new_state: null,
         actor: input.actor,
-        correlation_id: input.correlation_id ?? null,
+        correlation_id: corrId,
         metadata: { message_id: messageId, seq, role, body_chars: body.length },
       });
       return written as unknown as ConversationMessageRow;
@@ -684,6 +720,16 @@ export class ConversationSessionService {
         // different owner than the canonical session — planted foreign
         // rows are an integrity violation, never silently returned.
         if (String(r.owner_operator_id) !== String(session.owner_operator_id)) {
+          throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", String(r.message_id));
+        }
+        // Entity-key/payload binding (R3.A): the message payload's id
+        // must itself be a live entity key holding the SAME payload — a
+        // row planted under a foreign entity key cannot borrow a
+        // canonical identity.
+        const byId = this.store.tryGet(CONVERSATION_MESSAGE_ENTITY, String(r.message_id));
+        const { version: _v1, ...listed } = r;
+        const { version: _v2, ...byIdPayload } = (byId ?? {}) as Record<string, unknown>;
+        if (byId === null || digest(listed) !== digest(byIdPayload)) {
           throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", String(r.message_id));
         }
         return r as unknown as ConversationMessageRow;

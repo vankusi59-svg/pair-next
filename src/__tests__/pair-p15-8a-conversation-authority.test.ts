@@ -42,6 +42,7 @@ const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p158a-"));
 let counter = 0;
 const OWNER = "operator:owner-1";
 const OTHER = "operator:owner-2";
+const CORR_OK = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 
 type Ctx = { dir: string; dbPath: string; store: PairEvidenceStore; conv: ConversationSessionService };
 
@@ -593,10 +594,96 @@ describe("P15.8-A conversation authority", () => {
       ),
     ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
     // listMessages(s) never sees it — the filter keys off session_id.
-    // The entity-key/payload disagreement is what the replay path proves.
     expect(
       ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages,
     ).toHaveLength(0);
+    // R3.A: the session it CLAIMS (`other`) must reject it — the payload's
+    // id was minted for session s, violating canonical message identity.
+    expect(
+      code(() => ctx.conv.listMessages(other.session_id, { operator_id: OWNER })),
+    ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
+  });
+
+  it("a row planted under a foreign entity key fails entity/payload binding", () => {
+    const ctx = fresh("entity-key-split");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const legit = conversationMessageIdFor(s.session_id, "k-legit");
+    // Row at entity key `legit` but payload claims a different message_id.
+    const rowBody = {
+      schema_version: CONVERSATION_MESSAGE_SCHEMA,
+      message_id: "MSG_PLANTED-FOREIGN-KEY",
+      session_id: s.session_id,
+      owner_operator_id: OWNER,
+      seq: 1,
+      role: "operator",
+      body: "ghost",
+      idempotency_key: null,
+      created_at: new Date().toISOString(),
+    };
+    (rowBody as Record<string, unknown>).message_digest = digest({
+      contract: "pair-conversation-message.v1",
+      message_id: "MSG_PLANTED-FOREIGN-KEY",
+      session_id: s.session_id,
+      owner_operator_id: OWNER,
+      seq: 1,
+      role: "operator",
+      body: "ghost",
+      idempotency_key: null,
+    });
+    ctx.store.put(CONVERSATION_MESSAGE_ENTITY, legit, rowBody);
+    expect(
+      code(() => ctx.conv.listMessages(s.session_id, { operator_id: OWNER })),
+    ).toBe("FAIL_CLOSED_CONVERSATION_INTEGRITY");
+  });
+
+  /* ---------------- R3.B — safe correlation ids ---------------- */
+
+  it("correlation_id is bounded opaque — bcap/freeform/secrets rejected on all three paths", () => {
+    const ctx = fresh("corr");
+    const bcap = `bcap1.${"a".repeat(32)}.${"b".repeat(32)}`;
+    const secretish = "Authorization: Bearer tok_live_9x";
+    const prose = "gửi báo cáo lên telegram ngay";
+    for (const bad of [bcap, secretish, prose]) {
+      // Path 1 — session create.
+      expect(
+        code(() => ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: bad })),
+      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
+    }
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    for (const bad of [bcap, secretish, prose]) {
+      // Path 2 — message append (operator seam AND internal writer).
+      expect(
+        code(() =>
+          ctx.conv.appendMessage({
+            session_id: s.session_id, operator_id: OWNER, body: "x", correlation_id: bad,
+          }),
+        ),
+      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
+      expect(
+        code(() =>
+          ctx.conv.internalWriter().appendMessage({
+            session_id: s.session_id, role: "assistant", body: "x", correlation_id: bad,
+          }),
+        ),
+      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
+      // Path 3 — close.
+      expect(
+        code(() => ctx.conv.closeSession(s.session_id, { operator_id: OWNER, correlation_id: bad })),
+      ).toBe("FAIL_CLOSED_CONVERSATION_FIELD");
+    }
+    // Nothing minted and no events written under the bad ids.
+    expect(ctx.conv.getSession(s.session_id, OWNER).message_count).toBe(0);
+    expect(ctx.conv.getSession(s.session_id, OWNER).state).toBe("OPEN");
+    const all = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s.session_id);
+    expect(all.every((e) => e.correlation_id === null || CORR_OK.test(String(e.correlation_id)))).toBe(true);
+    // Legit opaque ids still flow through all three paths.
+    const s2 = ctx.conv.createSession({ owner_operator_id: OWNER, correlation_id: "req:create-1" });
+    ctx.conv.appendMessage({
+      session_id: s2.session_id, operator_id: OWNER, body: "m", correlation_id: "req:msg-2.turn-1",
+    });
+    ctx.conv.closeSession(s2.session_id, { operator_id: OWNER, correlation_id: "req:close-3" });
+    const ev2 = ctx.store.listEvents(CONVERSATION_SESSION_ENTITY, s2.session_id);
+    expect(ev2.map((e) => e.correlation_id)).toEqual(["req:create-1", "req:msg-2.turn-1", "req:close-3"]);
   });
 
   it("idempotent retry converges — same key, same row, no duplicate", () => {
