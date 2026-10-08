@@ -89,3 +89,4 @@ export * from "./routine-mirror.js";
 export * from "./objective-adaptive-review.js";
 export * from "./objective-operating-loop.js";
 export * from "./conversation-session.js";
+export * from "./conversation-reasoning.js";
