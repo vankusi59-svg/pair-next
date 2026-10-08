@@ -136,25 +136,46 @@ describe("P15.8-A conversation authority", () => {
     expect(c.session_id).not.toBe(a.session_id);
   });
 
-  it("tampered session/message payloads fail closed on read", () => {
-    const ctx = fresh("tamper");
+  it("session tamper fails on session digest (independent proof)", () => {
+    const ctx = fresh("tamper-session");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    sqlRewriteEntity(ctx.store, CONVERSATION_SESSION_ENTITY, s.session_id, (b) => {
+      b.owner_operator_id = OTHER;
+    });
+    // Fails on the SESSION digest — the field carries a different owner
+    // than the digest pins, before any ownership check can even run.
+    expect(code(() => ctx.conv.getSession(s.session_id, OWNER))).toBe(
+      "FAIL_CLOSED_CONVERSATION_DIGEST",
+    );
+    // Restore the ORIGINAL terms — recompute then matches again.
+    sqlRewriteEntity(ctx.store, CONVERSATION_SESSION_ENTITY, s.session_id, (b) => {
+      b.owner_operator_id = OWNER;
+    });
+    expect(ctx.conv.getSession(s.session_id, OWNER).owner_operator_id).toBe(OWNER);
+  });
+
+  it("message tamper fails on message digest (independent proof)", () => {
+    const ctx = fresh("tamper-message");
     const s = ctx.conv.createSession({ owner_operator_id: OWNER });
     const m = ctx.conv.appendMessage({
       session_id: s.session_id, operator_id: OWNER, role: "operator", body: "hello",
     });
-    sqlRewriteEntity(ctx.store, CONVERSATION_SESSION_ENTITY, s.session_id, (b) => {
-      b.owner_operator_id = OTHER;
-    });
-    expect(code(() => ctx.conv.getSession(s.session_id, OWNER))).toBe(
-      "FAIL_CLOSED_CONVERSATION_DIGEST",
-    );
-    sqlRewriteEntity(ctx.store, CONVERSATION_SESSION_ENTITY, s.session_id, () => {});
     sqlRewriteEntity(ctx.store, CONVERSATION_MESSAGE_ENTITY, m.message_id, (b) => {
       b.body = "rewritten";
     });
+    // Session itself is still canonical — reads fine.
+    expect(ctx.conv.getSession(s.session_id, OWNER).session_id).toBe(s.session_id);
+    // The MESSAGE digest is what catches the rewrite.
     expect(code(() =>
       ctx.conv.listMessages(s.session_id, { operator_id: OWNER })
     )).toBe("FAIL_CLOSED_CONVERSATION_DIGEST");
+    // Restore the original body — read passes again.
+    sqlRewriteEntity(ctx.store, CONVERSATION_MESSAGE_ENTITY, m.message_id, (b) => {
+      b.body = "hello";
+    });
+    expect(
+      ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages[0]!.body,
+    ).toBe("hello");
   });
 
   it("a row with a foreign schema cannot mint a canonical session", () => {
@@ -199,11 +220,12 @@ describe("P15.8-A conversation authority", () => {
     const ctx = fresh("writers");
     const svcA = ctx.conv;
     const svcB = new ConversationSessionService(ctx.store);
+    const writerB = svcB.internalWriter();
     const s = svcA.createSession({ owner_operator_id: OWNER });
     svcA.appendMessage({ session_id: s.session_id, operator_id: OWNER, role: "operator", body: "a1" });
-    svcB.appendMessage({ session_id: s.session_id, operator_id: OWNER, role: "assistant", body: "b1" });
+    writerB.appendMessage({ session_id: s.session_id, role: "assistant", body: "b1" });
     svcA.appendMessage({ session_id: s.session_id, operator_id: OWNER, role: "operator", body: "a2" });
-    svcB.appendMessage({ session_id: s.session_id, operator_id: OWNER, role: "assistant", body: "b2" });
+    writerB.appendMessage({ session_id: s.session_id, role: "assistant", body: "b2" });
     const { messages } = svcA.listMessages(s.session_id, { operator_id: OWNER });
     expect(messages.map((m) => m.seq)).toEqual([1, 2, 3, 4]);
     expect(messages.map((m) => m.body)).toEqual(["a1", "b1", "a2", "b2"]);
@@ -218,7 +240,7 @@ describe("P15.8-A conversation authority", () => {
     expect(seen.state).toBe("OPEN");
     // Interleaved appends across connections stay gap-free.
     ctx.conv.appendMessage({ session_id: s.session_id, operator_id: OWNER, role: "operator", body: "one" });
-    conv2.appendMessage({ session_id: s.session_id, operator_id: OWNER, role: "assistant", body: "two" });
+    conv2.internalWriter().appendMessage({ session_id: s.session_id, role: "assistant", body: "two" });
     expect(
       ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages.map((m) => m.seq),
     ).toEqual([1, 2]);
@@ -233,7 +255,161 @@ describe("P15.8-A conversation authority", () => {
     store2.close();
   });
 
-  /* ---------------- idempotency ---------------- */
+  /* ---------------- R1.A — raced-path equivalence ---------------- */
+
+  /** Deterministic interleave: commit a full competing write between the
+   *  service's pre-transaction check and its in-transaction re-check.
+   *  The injector runs a REAL service call on the same store, so the raced
+   *  row carries genuine counters/events — not a fabricated row. */
+  function raceOnce(store: PairEvidenceStore, inject: () => void): void {
+    const orig = store.immediate.bind(store);
+    let armed = true;
+    (store as unknown as { immediate: typeof orig }).immediate = <T>(fn: () => T): T => {
+      if (armed) {
+        armed = false;
+        inject();
+      }
+      return orig(fn);
+    };
+  }
+
+  it("raced identical append converges — stored row, no seq advance, no second event", () => {
+    const ctx = fresh("race-append-same");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const input = {
+      session_id: s.session_id, operator_id: OWNER, role: "operator" as const,
+      body: "identical", idempotency_key: "race-k",
+    };
+    const other = new ConversationSessionService(ctx.store);
+    raceOnce(ctx.store, () => other.appendMessage(input));
+    const out = ctx.conv.appendMessage(input);
+    // Converged onto the raced row — the retry minted nothing new.
+    expect(ctx.conv.getSession(s.session_id, OWNER).message_count).toBe(1);
+    expect(out.seq).toBe(1);
+    const events = ctx.store
+      .listEvents(CONVERSATION_SESSION_ENTITY, s.session_id)
+      .filter((e) => e.event_type === "CONVERSATION_MESSAGE_APPENDED");
+    expect(events).toHaveLength(1);
+  });
+
+  it("raced different append fails closed — IDEMPOTENCY_CONFLICT", () => {
+    const ctx = fresh("race-append-diff");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const other = new ConversationSessionService(ctx.store);
+    raceOnce(ctx.store, () =>
+      other.appendMessage({
+        session_id: s.session_id, operator_id: OWNER, role: "operator",
+        body: "winner", idempotency_key: "race-k",
+      }));
+    expect(
+      code(() =>
+        ctx.conv.appendMessage({
+          session_id: s.session_id, operator_id: OWNER, role: "operator",
+          body: "loser", idempotency_key: "race-k",
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT");
+    // Loser minted nothing.
+    expect(ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages).toHaveLength(1);
+    expect(ctx.conv.listMessages(s.session_id, { operator_id: OWNER }).messages[0]!.body).toBe("winner");
+  });
+
+  it("raced identical create converges; raced different create conflicts", () => {
+    const ctx = fresh("race-create");
+    const other = new ConversationSessionService(ctx.store);
+    // Same owner + same request id + same title → converge.
+    raceOnce(ctx.store, () =>
+      other.createSession({ owner_operator_id: OWNER, client_request_id: "rc", title: "t" }));
+    const a = ctx.conv.createSession({ owner_operator_id: OWNER, client_request_id: "rc", title: "t" });
+    expect(ctx.conv.listSessions({ operator_id: OWNER })).toHaveLength(1);
+    expect(a.session_id).toBe(conversationSessionIdFor(OWNER, "rc"));
+    // Same request id + DIFFERENT title → conflict, not silent reuse.
+    const ctx2 = fresh("race-create-diff");
+    const other2 = new ConversationSessionService(ctx2.store);
+    raceOnce(ctx2.store, () =>
+      other2.createSession({ owner_operator_id: OWNER, client_request_id: "rc", title: "first" }));
+    expect(
+      code(() =>
+        ctx2.conv.createSession({ owner_operator_id: OWNER, client_request_id: "rc", title: "second" }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT");
+  });
+
+  it("same request id + different terms conflicts on the non-raced path too", () => {
+    const ctx = fresh("create-diff");
+    ctx.conv.createSession({ owner_operator_id: OWNER, client_request_id: "rc", title: "t1" });
+    expect(
+      code(() =>
+        ctx.conv.createSession({ owner_operator_id: OWNER, client_request_id: "rc", title: "t2" }),
+      ),
+    ).toBe("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT");
+    // Identical replay still converges.
+    const again = ctx.conv.createSession({ owner_operator_id: OWNER, client_request_id: "rc", title: "t1" });
+    expect(again.title).toBe("t1");
+  });
+
+  /* ---------------- R1.B — role provenance ---------------- */
+
+  it("an operator cannot forge assistant or system messages", () => {
+    const ctx = fresh("role-spoof");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    for (const role of ["assistant", "system", "user", "admin"]) {
+      expect(
+        code(() =>
+          ctx.conv.appendMessage({
+            session_id: s.session_id, operator_id: OWNER,
+            role: role as never, body: "forged",
+          }),
+        ),
+      ).toBe("FAIL_CLOSED_CONVERSATION_ROLE");
+    }
+    // Minted nothing.
+    expect(ctx.conv.getSession(s.session_id, OWNER).message_count).toBe(0);
+    // Operator writes still work — default and explicit.
+    const a = ctx.conv.appendMessage({ session_id: s.session_id, operator_id: OWNER, body: "hi" });
+    const b = ctx.conv.appendMessage({ session_id: s.session_id, operator_id: OWNER, role: "operator", body: "hi2" });
+    expect(a.role).toBe("operator");
+    expect(b.role).toBe("operator");
+  });
+
+  it("internal writer mints assistant/system bound to the session owner", () => {
+    const ctx = fresh("internal");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const w = ctx.conv.internalWriter();
+    const a = w.appendMessage({ session_id: s.session_id, role: "assistant", body: "trả lời" });
+    expect(a.role).toBe("assistant");
+    expect(a.owner_operator_id).toBe(OWNER); // ownership = parent session owner
+    const b = w.appendMessage({ session_id: s.session_id, role: "system", body: "note" });
+    expect(b.role).toBe("system");
+    // Internal writer cannot impersonate an operator.
+    expect(
+      code(() => w.appendMessage({ session_id: s.session_id, role: "operator" as never, body: "x" })),
+    ).toBe("FAIL_CLOSED_CONVERSATION_ROLE");
+    // Owner sees them on canonical reads; the audit actor is internal.
+    const { messages } = ctx.conv.listMessages(s.session_id, { operator_id: OWNER });
+    expect(messages.map((m) => m.role)).toEqual(["assistant", "system"]);
+    const ev = ctx.store
+      .listEvents(CONVERSATION_SESSION_ENTITY, s.session_id)
+      .filter((e) => e.event_type === "CONVERSATION_MESSAGE_APPENDED");
+    expect(ev.map((e) => e.actor)).toEqual(["conversation-internal", "conversation-internal"]);
+  });
+
+  it("internal writer is still owner-consistent and closed-session denied", () => {
+    const ctx = fresh("internal-owner");
+    const s = ctx.conv.createSession({ owner_operator_id: OWNER });
+    const w = ctx.conv.internalWriter();
+    const a = w.appendMessage({ session_id: s.session_id, role: "assistant", body: "x" });
+    // Foreign operator cannot read it — owner pinning holds.
+    expect(code(() => ctx.conv.listMessages(s.session_id, { operator_id: OTHER }))).toBe(
+      "FAIL_CLOSED_CONVERSATION_FORBIDDEN",
+    );
+    // And the internal writer cannot mint into a CLOSED session.
+    ctx.conv.closeSession(s.session_id, { operator_id: OWNER });
+    expect(
+      code(() => w.appendMessage({ session_id: s.session_id, role: "assistant", body: "late" })),
+    ).toBe("FAIL_CLOSED_CONVERSATION_CLOSED");
+    expect(a.owner_operator_id).toBe(OWNER);
+  });
 
   it("idempotent retry converges — same key, same row, no duplicate", () => {
     const ctx = fresh("idem");
@@ -508,7 +684,7 @@ describe("P15.8-A conversation authority", () => {
     const s1 = ctx.conv.createSession({ owner_operator_id: OWNER });
     const s2 = ctx.conv.createSession({ owner_operator_id: OTHER });
     ctx.conv.appendMessage({ session_id: s1.session_id, operator_id: OWNER, role: "operator", body: "gửi file lên Telegram nhé" });
-    ctx.conv.appendMessage({ session_id: s1.session_id, operator_id: OWNER, role: "assistant", body: "Đã ghi nhận — không thực thi gì." });
+    ctx.conv.internalWriter().appendMessage({ session_id: s1.session_id, role: "assistant", body: "Đã ghi nhận — không thực thi gì." });
     ctx.conv.appendMessage({ session_id: s2.session_id, operator_id: OTHER, role: "operator", body: "run codex --exec deploy" });
     ctx.conv.closeSession(s2.session_id, { operator_id: OTHER });
     const types = new Set(governedEntities(ctx.store).map((e) => e.entity_type));

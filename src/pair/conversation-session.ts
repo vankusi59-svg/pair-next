@@ -284,17 +284,39 @@ export class ConversationSessionService {
     const sessionId = clientRequestId
       ? conversationSessionIdFor(owner, clientRequestId)
       : newId("CSESS");
+    // Equivalence for a deterministic-id replay: same owner + same title
+    // (the only caller-variable terms) + fixed entry_mode/state.
+    const createEquivalent = (row: Record<string, unknown>): boolean =>
+      String(row.owner_operator_id) === owner && (row.title ?? null) === title;
     const existing = this.store.tryGet(CONVERSATION_SESSION_ENTITY, sessionId);
     if (existing) {
       this.assertCanonicalSession(existing);
       if (existing.owner_operator_id !== owner) {
         throw new IntegrityError("FAIL_CLOSED_CONVERSATION_FORBIDDEN", sessionId);
       }
+      if (!createEquivalent(existing)) {
+        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT", sessionId);
+      }
       return existing as unknown as ConversationSessionRow;
     }
     // Per-owner session cap — counted inside the transaction so a racing
     // create cannot exceed it.
     return this.store.immediate(() => {
+      // Identical concurrent create under the same client_request_id
+      // converges onto the raced row — it is a retry, not a conflict.
+      // Different terms under one request id fail closed instead of
+      // silently reusing the row.
+      const raced = this.store.tryGet(CONVERSATION_SESSION_ENTITY, sessionId);
+      if (raced) {
+        this.assertCanonicalSession(raced);
+        if (String(raced.owner_operator_id) !== owner) {
+          throw new IntegrityError("FAIL_CLOSED_CONVERSATION_FORBIDDEN", sessionId);
+        }
+        if (!createEquivalent(raced)) {
+          throw new IntegrityError("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT", sessionId);
+        }
+        return raced as unknown as ConversationSessionRow;
+      }
       const ownerSessions = this.store
         .list(CONVERSATION_SESSION_ENTITY)
         .filter((r) => String(r.owner_operator_id) === owner);
@@ -407,20 +429,119 @@ export class ConversationSessionService {
    *  messages                                                            *
    * ------------------------------------------------------------------ */
 
+  /** Operator message seam — the ONLY message write the future
+   *  operator-facing surfaces may call. `role` is pinned to "operator":
+   *  an ordinary operator can never mint assistant/system rows by
+   *  supplying a role field. Non-operator roles are reserved for
+   *  `internalWriter()` — a capability object only server-side code holds. */
   appendMessage(input: {
     session_id: string;
     operator_id: string;
-    role: ConversationMessageRole;
+    /** Must be "operator" when present; absent defaults to it. */
+    role?: "operator";
     body: string;
     idempotency_key?: string | null;
     correlation_id?: string | null;
   }): ConversationMessageRow {
     const op = assertStr("operator_id", input.operator_id);
-    const sessionId = assertStr("session_id", input.session_id);
-    const role = input.role;
-    if (!(CONVERSATION_MESSAGE_ROLES as readonly string[]).includes(String(role))) {
-      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_FIELD", `role=${String(role)}`);
+    if (input.role !== undefined && input.role !== "operator") {
+      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_ROLE", String(input.role));
     }
+    return this.appendCore({
+      session_id: input.session_id,
+      caller_operator_id: op,
+      actor: op,
+      role: "operator",
+      body: input.body,
+      idempotency_key: input.idempotency_key,
+      correlation_id: input.correlation_id,
+    });
+  }
+
+  /** Trusted internal writer — assistant/system records minted only by
+   *  server-side integration code (e.g. the P15.8-B response pipeline).
+   *  The capability object is obtainable only through this method, which
+   *  is the auditable boundary: entry surfaces expose `appendMessage` to
+   *  operators and never hand out the internal writer. The writer binds
+   *  each message's owner to the parent session's owner and records actor
+   *  `conversation-internal` — it cannot impersonate an operator. */
+  internalWriter(): {
+    appendMessage(input: {
+      session_id: string;
+      role: "assistant" | "system";
+      body: string;
+      idempotency_key?: string | null;
+      correlation_id?: string | null;
+    }): ConversationMessageRow;
+  } {
+    const svc = this;
+    return {
+      appendMessage(input: {
+        session_id: string;
+        role: "assistant" | "system";
+        body: string;
+        idempotency_key?: string | null;
+        correlation_id?: string | null;
+      }): ConversationMessageRow {
+        if (input.role !== "assistant" && input.role !== "system") {
+          throw new IntegrityError("FAIL_CLOSED_CONVERSATION_ROLE", String(input.role));
+        }
+        return svc.appendCore({
+          session_id: input.session_id,
+          caller_operator_id: null,
+          actor: "conversation-internal",
+          role: input.role,
+          body: input.body,
+          idempotency_key: input.idempotency_key,
+          correlation_id: input.correlation_id,
+        });
+      },
+    };
+  }
+
+  /** Idempotent replay equivalence — identical deterministic id + same
+   *  session/owner/role/body/key digest → the stored row; any drift →
+   *  conflict. Shared by the pre-transaction and in-transaction checks so
+   *  a raced commit is judged by exactly the same rule as a plain retry. */
+  private replayOrConflict(
+    row: Record<string, unknown>,
+    input: {
+      sessionId: string;
+      ownerOperatorId: string;
+      role: ConversationMessageRole;
+      body: string;
+      idemKey: string | null;
+      messageId: string;
+    },
+  ): ConversationMessageRow {
+    this.assertCanonicalMessage(row);
+    const expected = conversationMessageDigest({
+      message_id: String(row.message_id),
+      session_id: input.sessionId,
+      owner_operator_id: input.ownerOperatorId,
+      seq: Number(row.seq),
+      role: input.role,
+      body: input.body,
+      idempotency_key: input.idemKey,
+    });
+    if (expected !== row.message_digest) {
+      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT", input.messageId);
+    }
+    return row as unknown as ConversationMessageRow;
+  }
+
+  private appendCore(input: {
+    session_id: string;
+    /** Non-null → the operator owner gate applies. Null → internal
+     *  writer; the session's pinned owner supplies message ownership. */
+    caller_operator_id: string | null;
+    actor: string;
+    role: ConversationMessageRole;
+    body: string;
+    idempotency_key?: string | null;
+    correlation_id?: string | null;
+  }): ConversationMessageRow {
+    const sessionId = assertStr("session_id", input.session_id);
     const body = assertStr("body", input.body);
     if (body.length > CONVERSATION_MAX_BODY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "body_chars");
@@ -430,46 +551,45 @@ export class ConversationSessionService {
     if (idemKey !== null && idemKey.length > CONVERSATION_MAX_IDEMPOTENCY_KEY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "idempotency_key");
     }
+    const role = input.role;
     const messageId = idemKey ? conversationMessageIdFor(sessionId, idemKey) : newId("MSG");
-
-    // Ownership is enforced BEFORE any replay path — a foreign operator
-    // gets FORBIDDEN, never an oracle about which message ids exist.
-    this.ownedSession(sessionId, op);
+    // Session resolution differs by seam: the operator path enforces
+    // owner equality (foreign operator → FORBIDDEN before any oracle);
+    // the internal path resolves canonically — its authority is the
+    // writer capability itself, and ownership comes from the session row.
+    const resolveSession = () =>
+      input.caller_operator_id === null
+        ? this.canonicalSession(sessionId)
+        : this.ownedSession(sessionId, input.caller_operator_id);
+    const preSession = resolveSession();
+    const ownerOperatorId = preSession.owner_operator_id;
 
     // Idempotent replay BEFORE mutating: same deterministic id + same
     // provenance digest → return the stored row untouched.
     const prior = this.store.tryGet(CONVERSATION_MESSAGE_ENTITY, messageId);
     if (prior) {
-      this.assertCanonicalMessage(prior);
-      const expected = conversationMessageDigest({
-        message_id: String(prior.message_id),
-        session_id: sessionId,
-        owner_operator_id: op,
-        seq: Number(prior.seq),
-        role,
-        body,
-        idempotency_key: idemKey,
+      return this.replayOrConflict(prior, {
+        sessionId, ownerOperatorId, role, body, idemKey, messageId,
       });
-      if (expected !== prior.message_digest) {
-        throw new IntegrityError("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT", messageId);
-      }
-      return prior as unknown as ConversationMessageRow;
     }
 
     return this.store.immediate(() => {
-      const session = this.ownedSession(sessionId, op);
+      const session = resolveSession();
       if (session.state !== "OPEN") {
         throw new IntegrityError("FAIL_CLOSED_CONVERSATION_CLOSED", sessionId);
       }
       if (session.message_count >= CONVERSATION_MAX_MESSAGES_PER_SESSION) {
         throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "messages_per_session");
       }
-      // Re-check inside the txn: a racing replay may have committed the
-      // same deterministic id between the pre-check and here.
+      // Re-check inside the txn: a racing commit may have minted the
+      // same deterministic id between the pre-check and here. It is
+      // judged by the SAME equivalence rule — identical retry converges
+      // (no seq advance, no second event), different payload conflicts.
       const raced = this.store.tryGet(CONVERSATION_MESSAGE_ENTITY, messageId);
       if (raced) {
-        this.assertCanonicalMessage(raced);
-        return raced as unknown as ConversationMessageRow;
+        return this.replayOrConflict(raced, {
+          sessionId, ownerOperatorId, role, body, idemKey, messageId,
+        }) as ConversationMessageRow & { version: number };
       }
       const seq = Number(session.next_seq);
       const now = utcnow();
@@ -478,7 +598,7 @@ export class ConversationSessionService {
         schema_version: CONVERSATION_MESSAGE_SCHEMA,
         message_id: messageId,
         session_id: sessionId,
-        owner_operator_id: op,
+        owner_operator_id: ownerOperatorId,
         seq,
         role,
         body,
@@ -486,7 +606,7 @@ export class ConversationSessionService {
         message_digest: conversationMessageDigest({
           message_id: messageId,
           session_id: sessionId,
-          owner_operator_id: op,
+          owner_operator_id: ownerOperatorId,
           seq,
           role,
           body,
@@ -512,7 +632,7 @@ export class ConversationSessionService {
         event_type: "CONVERSATION_MESSAGE_APPENDED",
         old_state: null,
         new_state: null,
-        actor: op,
+        actor: input.actor,
         correlation_id: input.correlation_id ?? null,
         metadata: { message_id: messageId, seq, role, body_chars: body.length },
       });
