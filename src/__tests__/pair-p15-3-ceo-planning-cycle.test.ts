@@ -22,7 +22,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   ApprovalQueue,
   BusinessLayer,
@@ -68,6 +68,7 @@ import {
   objectiveWorkstreamBindingId,
   CODEX_CLI_PROVIDER_ID,
   CEO_CODEX_DEFAULT_MODEL,
+  CEO_MAX_ATTEMPTS_PER_OBSERVATION,
   type CeoDecisionInvoker,
   type CeoInvokeInput,
   type CeoInvokeResult,
@@ -2567,5 +2568,183 @@ describe("P15.7-FIX1 — strict-schema parse matrix", () => {
     expect(s.store.list("work_item").length).toBe(0);
     expect(s.store.list("objective_strategy_revision").length).toBe(0);
     s.store.close();
+  });
+});
+
+/* ============ P15.7-FIX1-R2 — timeout ↔ stale-grace alignment ============ */
+
+describe("P15.7-FIX1-R2 — invocation timeout vs stale reconciliation", () => {
+  const ENV_NAME = "PAIR_CEO_CLI_TIMEOUT_MS";
+  const savedEnv = process.env[ENV_NAME];
+  const restoreEnv = () => {
+    if (savedEnv === undefined) delete process.env[ENV_NAME];
+    else process.env[ENV_NAME] = savedEnv;
+  };
+  afterEach(restoreEnv);
+
+  const captureTimeout = (raw: string = decisionJson()) => {
+    let captured: number | undefined;
+    return {
+      captured: () => captured,
+      produce: (me: string, pid: string, mid: string) => (i: CeoInvokeInput) => {
+        captured = i.timeout_ms;
+        return { model_entry_id: me, provider_id: pid, model_id: mid, raw_text: raw };
+      },
+    };
+  };
+
+  it("default cycle → invoker timeout is exactly 300_000ms", async () => {
+    delete process.env[ENV_NAME];
+    const s = freshStack("r2-def");
+    const me = mkModel(s.store, "codex-cli", "m1");
+    mkProvider(s.store, "codex-cli");
+    const pid = String(s.store.get("model_entry", me).provider_id);
+    const mid = String(s.store.get("model_entry", me).model_id);
+    const cap = captureTimeout();
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, model_entry_id: me,
+      invoker: new FakeInvoker(cap.produce(me, pid, mid)),
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
+    expect(cap.captured()).toBe(300_000);
+    s.store.close();
+  });
+
+  it("valid env override flows through the full cycle invocation path", async () => {
+    process.env[ENV_NAME] = "450000";
+    const s = freshStack("r2-env");
+    const me = mkModel(s.store, "codex-cli", "m1");
+    mkProvider(s.store, "codex-cli");
+    const pid = String(s.store.get("model_entry", me).provider_id);
+    const mid = String(s.store.get("model_entry", me).model_id);
+    const cap = captureTimeout();
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, model_entry_id: me,
+      invoker: new FakeInvoker(cap.produce(me, pid, mid)),
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
+    expect(cap.captured()).toBe(450_000);
+    s.store.close();
+  });
+
+  it("invalid env values fail closed (non-int / out-of-bounds)", async () => {
+    for (const bad of ["abc", "0", "-5", "4999", "900001", "1.5"]) {
+      process.env[ENV_NAME] = bad;
+      const s = freshStack(`r2-bad-${bad}`);
+      const me = mkModel(s.store, "codex-cli", "m1");
+      mkProvider(s.store, "codex-cli");
+      const inv = new FakeInvoker((i) => ({
+        model_entry_id: i.transport.model_entry_id, provider_id: i.transport.provider_id,
+        model_id: i.transport.model_id, raw_text: decisionJson(),
+      }));
+      const svc = new CeoPlanningCycleService({
+        store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+        proveWorkItemDone: s.proveWorkItemDone, invoker: inv, model_entry_id: me,
+      });
+      const bid = mkBusiness(s.store);
+      const o = mkObjective(s.objectives, bid);
+      await expectFail(
+        () => svc.runCycle({ objective_id: String(o.objective_id), actor: OP }),
+        "FAIL_CLOSED_CONFIG_INVALID",
+      );
+      expect(inv.calls).toBe(0); // never invoked with invalid config
+      s.store.close();
+    }
+  });
+
+  it("explicit timeout_ms injection keeps precedence over env", async () => {
+    process.env[ENV_NAME] = "450000";
+    const s = freshStack("r2-exp");
+    const me = mkModel(s.store, "codex-cli", "m1");
+    mkProvider(s.store, "codex-cli");
+    const pid = String(s.store.get("model_entry", me).provider_id);
+    const mid = String(s.store.get("model_entry", me).model_id);
+    const cap = captureTimeout();
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, model_entry_id: me,
+      timeout_ms: 111_111,
+      invoker: new FakeInvoker(cap.produce(me, pid, mid)),
+    });
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    await svc.runCycle({ objective_id: String(o.objective_id), actor: OP });
+    expect(cap.captured()).toBe(111_111);
+    s.store.close();
+  });
+
+  it("stale reconciliation never fires before effective timeout + margin (incl. env >300s)", async () => {
+    for (const [envV, effective] of [[undefined, 300_000], ["600000", 600_000]] as const) {
+      if (envV === undefined) delete process.env[ENV_NAME]; else process.env[ENV_NAME] = envV;
+      const s = freshStack(`r2-grace-${envV}`);
+      const me = mkModel(s.store, "codex-cli", "m1");
+      mkProvider(s.store, "codex-cli");
+      const bid = mkBusiness(s.store);
+      const o = mkObjective(s.objectives, bid);
+      const oid = String(o.objective_id);
+      let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+      const svc = new CeoPlanningCycleService({
+        store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+        proveWorkItemDone: s.proveWorkItemDone, model_entry_id: me,
+        invoker: new FakeInvoker(() => ({ model_entry_id: me, provider_id: "codex-cli", model_id: "m1", raw_text: decisionJson() })),
+        now: () => new Date(nowMs).toISOString(),
+      });
+      const obs = buildCeoObservation(s, oid);
+      mintStartedAttempt(s, {
+        objective_id: oid, observation_digest: obs.observation_digest,
+        model_entry_id: me, provider_id: "codex-cli", model_id: "m1",
+        business_id: bid, started_at: new Date(nowMs).toISOString(),
+      });
+      // inside the invocation window (age < effective timeout) → never reconcile
+      nowMs += effective - 1;
+      expect(svc.reconcileStaleAttempts(oid)).toBe(0);
+      // inside the safety margin (timeout < age <= timeout+margin) → still no
+      nowMs += 60_000;
+      expect(svc.reconcileStaleAttempts(oid)).toBe(0);
+      // past timeout + margin → reconciled UNKNOWN
+      nowMs += 2;
+      expect(svc.reconcileStaleAttempts(oid)).toBe(1);
+      const row = s.store.get("ceo_decision_attempt",
+        ceoAttemptId(oid, ceoCycleId(oid, obs.observation_digest), 1));
+      expect(String(row.state)).toBe("UNKNOWN");
+      expect(String(row.failure_code)).toBe("CEO_ATTEMPT_RECONCILED");
+      s.store.close();
+    }
+  });
+
+  it("explicit stale_grace_ms remains authoritative over derived grace", async () => {
+    process.env[ENV_NAME] = "600000";
+    const s = freshStack("r2-injgrace");
+    const me = mkModel(s.store, "codex-cli", "m1");
+    mkProvider(s.store, "codex-cli");
+    const bid = mkBusiness(s.store);
+    const o = mkObjective(s.objectives, bid);
+    const oid = String(o.objective_id);
+    let nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const svc = new CeoPlanningCycleService({
+      store: s.store, objectives: s.objectives, workstreams: s.workstreams,
+      proveWorkItemDone: s.proveWorkItemDone, model_entry_id: me,
+      invoker: new FakeInvoker(() => ({ model_entry_id: me, provider_id: "codex-cli", model_id: "m1", raw_text: decisionJson() })),
+      stale_grace_ms: 30_000, now: () => new Date(nowMs).toISOString(),
+    });
+    const obs = buildCeoObservation(s, oid);
+    mintStartedAttempt(s, {
+      objective_id: oid, observation_digest: obs.observation_digest,
+      model_entry_id: me, provider_id: "codex-cli", model_id: "m1",
+      business_id: bid, started_at: new Date(nowMs).toISOString(),
+    });
+    nowMs += 30_001;
+    expect(svc.reconcileStaleAttempts(oid)).toBe(1);
+    s.store.close();
+  });
+
+  it("two-attempt budget unchanged", () => {
+    expect(CEO_MAX_ATTEMPTS_PER_OBSERVATION).toBe(2);
   });
 });

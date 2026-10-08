@@ -116,10 +116,18 @@ export const CEO_MAX_ATTEMPTS_PER_OBSERVATION = 2;
  *  terminal state. */
 export const CEO_ATTEMPT_STARTED_EVENT = "CEO_DECISION_ATTEMPT_STARTED";
 export const CEO_ATTEMPT_SETTLED_EVENT = "CEO_DECISION_ATTEMPT_SETTLED";
-/** Grace before a crashed STARTED attempt may be reconciled to UNKNOWN —
- *  one invocation timeout plus margin; never assume the provider was
- *  not called. */
-export const CEO_ATTEMPT_STALE_GRACE_MS = 5 * 60_000;
+/** Bounded safety margin added to the effective CEO invocation timeout
+ *  when computing the stale-attempt reconciliation grace — the grace
+ *  must be STRICTLY greater than the longest permitted invocation
+ *  window so a STARTED attempt is never reconciled UNKNOWN while its
+ *  invocation may still be in flight. */
+export const CEO_ATTEMPT_STALE_MARGIN_MS = 60_000;
+/** Default stale grace = default invocation timeout + margin. An env or
+ *  injected timeout above the default derives a larger effective grace
+ *  at runtime — see {@link CeoPlanningCycleService.effectiveGraceMs}.
+ *  Never assume the provider was not called. */
+export const CEO_ATTEMPT_STALE_GRACE_MS =
+  CEO_CLI_TIMEOUT.defaultValue + CEO_ATTEMPT_STALE_MARGIN_MS;
 export const CEO_INVOKE_TIMEOUT_MS = CEO_CLI_TIMEOUT.defaultValue;
 
 export function ceoCycleId(objectiveId: string, observationDigest: string): string {
@@ -1106,13 +1114,26 @@ export class CeoPlanningCycleService {
     };
   }
 
+  /** Effective stale-attempt reconciliation grace. An explicit
+   *  `stale_grace_ms` injection (tests/tooling) is authoritative and is
+   *  NOT widened — callers opting into a custom grace own the margin.
+   *  Otherwise the grace derives from the effective invocation timeout
+   *  (`deps.timeout_ms` ?? `PAIR_CEO_CLI_TIMEOUT_MS` ?? default) plus
+   *  {@link CEO_ATTEMPT_STALE_MARGIN_MS}, so a timeout configured above
+   *  300s can never be reconciled UNKNOWN mid-invocation. */
+  private effectiveGraceMs(): number {
+    if (this.deps.stale_grace_ms !== undefined) return this.deps.stale_grace_ms;
+    return (this.deps.timeout_ms ?? ceoCliTimeoutMs()) + CEO_ATTEMPT_STALE_MARGIN_MS;
+  }
+
   /** Bounded stale-attempt reconciliation: a STARTED attempt older than
    *  the explicit grace may become UNKNOWN (never assumed un-invoked);
    *  only then may one bounded retry be admitted under the attempt
    *  ceiling. Returns the number reconciled. */
   reconcileStaleAttempts(objectiveId?: string): number {
-    const grace = this.deps.stale_grace_ms ?? CEO_ATTEMPT_STALE_GRACE_MS;
+    const grace = this.effectiveGraceMs();
     const now = Date.parse(this.now());
+
     let count = 0;
     for (const a of this.store.list(CEO_DECISION_ATTEMPT_ENTITY) as Row[]) {
       if (objectiveId && String(a.objective_id) !== objectiveId) continue;
