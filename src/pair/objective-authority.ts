@@ -391,7 +391,7 @@ function evidenceSemantics(objectiveId: string, ev: ObjectiveEvidence): string {
   });
 }
 
-function spendSemantics(objectiveId: string, input: {
+export function spendSemantics(objectiveId: string, input: {
   spend_key: string; amount_microusd: number; note?: string;
 }): string {
   return digest({

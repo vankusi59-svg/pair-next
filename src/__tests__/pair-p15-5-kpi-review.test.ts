@@ -233,6 +233,71 @@ function recordKpi(
   });
 }
 
+function sqlRewriteEvent(
+  store: PairEvidenceStore,
+  entityType: string,
+  entityId: string,
+  eventType: string,
+  fn: (ev: Record<string, unknown>) => void,
+): void {
+  const row = dbOf(store)
+    .prepare(
+      "SELECT * FROM events WHERE entity_type=? AND entity_id=? AND event_type=? ORDER BY seq LIMIT 1")
+    .get(entityType, entityId, eventType) as Record<string, unknown> | undefined;
+  if (!row) throw new Error(`event ${eventType} absent`);
+  const metadata = row.metadata_json
+    ? JSON.parse(String(row.metadata_json)) as Record<string, unknown> : null;
+  fn(metadata ?? {});
+  const body = {
+    event_id: row.event_id, entity_type: row.entity_type,
+    entity_id: row.entity_id, event_type: row.event_type,
+    old_state: row.old_state, new_state: row.new_state,
+    actor: row.actor, correlation_id: row.correlation_id,
+    metadata, created_at: row.created_at,
+  };
+  dbOf(store)
+    .prepare("UPDATE events SET metadata_json=?, event_hash=? WHERE event_id=?")
+    .run(metadata ? JSON.stringify(metadata) : null, digest(body), String(row.event_id));
+}
+
+function sqlDeleteEvent(
+  store: PairEvidenceStore,
+  entityType: string,
+  entityId: string,
+  eventType: string,
+): void {
+  dbOf(store)
+    .prepare("DELETE FROM events WHERE entity_type=? AND entity_id=? AND event_type=?")
+    .run(entityType, entityId, eventType);
+}
+
+function sqlInsertEvent(
+  store: PairEvidenceStore,
+  entityType: string,
+  entityId: string,
+  ev: Record<string, unknown>,
+): void {
+  const body = {
+    event_id: `EV_FORGED_${counter++}`,
+    entity_type: entityType, entity_id: entityId,
+    event_type: String(ev.event_type),
+    old_state: ev.old_state ?? null,
+    new_state: ev.new_state ?? null,
+    actor: String(ev.actor ?? "operator:x"),
+    correlation_id: ev.correlation_id ?? null,
+    metadata: ev.metadata ?? null,
+    created_at: String(ev.created_at ?? "t"),
+  };
+  dbOf(store)
+    .prepare(
+      "INSERT INTO events (event_id, entity_type, entity_id, event_type, old_state, new_state, actor, correlation_id, metadata_json, created_at, event_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+    .run(body.event_id, entityType, entityId, body.event_type,
+      body.old_state as never, body.new_state as never, body.actor,
+      body.correlation_id as never,
+      body.metadata ? JSON.stringify(body.metadata) : null,
+      body.created_at, digest(body));
+}
+
 function expectFail(fn: () => unknown, code: string | RegExp) {
   try {
     fn();
@@ -440,7 +505,7 @@ describe("P15.5 — deterministic checkpoint (§8/§9/§10)", () => {
     s.store.close();
   });
 
-  it("6. all workstreams canonically complete but gap remains → TOPOLOGY_CHANGE_REQUIRED", async () => {
+  it("6. all workstreams canonically complete with a verified gap → TOPOLOGY_CHANGE_REQUIRED", async () => {
     const inv = new FakeInvoker(WAIT_JSON);
     const s = freshFullStack("c2");
     const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
@@ -460,7 +525,9 @@ describe("P15.5 — deterministic checkpoint (§8/§9/§10)", () => {
     canonicallyCompleteMission(s.store, s.service, mid);
     s.biz.syncWorkItem(childId);
     s.biz.advanceCompletionCascade(childId);
-    // KPI gap remains (current never recorded → all UNVERIFIED → gap).
+    // A verified GAP is required for TOPOLOGY (R2.D) — unverified
+    // progress alone can never claim the target was missed.
+    recordKpi(s, oid, "KPI_1", 3, "ev-gap"); // target 10 → GAP
     const r = await review.runReview({ objective_id: oid, actor: OP });
     expect(r.outcome).toBe("TOPOLOGY_CHANGE_REQUIRED");
     expect(r.review.owner_action_required).toBe(false);
@@ -515,36 +582,46 @@ describe("P15.5 — CEO adaptive decision (§11/§13/§15/§16)", () => {
     s.store.close();
   });
 
-  it("9. WAIT replay → same receipt, zero extra model call; PRIORITIZE advance → bounded chain", async () => {
-    // (a) Identical checkpoint (no strategy minted) → deterministic replay.
-    const invW = new FakeInvoker(WAIT_JSON);
-    const a = seeded("d2a", invW);
-    const w1 = await a.review.runReview({ objective_id: a.oid, actor: OP });
-    const w2 = await a.review.runReview({ objective_id: a.oid, actor: OP });
-    expect(w2.status).toBe("replayed");
-    expect(w2.review.review_id).toBe(w1.review.review_id);
-    expect(invW.inputs.length).toBe(1);
-    a.s.store.close();
-    // (b) After a PRIORITIZE review, the observation legitimately
-    // advances (it pins the prior strategy revision identity per §12)
-    // → a NEW review + chained revision, still zero extra model calls
-    // because the CEO decision replays.
-    const invP = new FakeInvoker(decisionJson({
-      decision_kind: "PRIORITIZE_EXISTING",
-      wait_reason: null,
-      priority_order: ["w2", "w1"],
-    }));
-    const b = seeded("d2b", invP);
-    const r1 = await b.review.runReview({ objective_id: b.oid, actor: OP });
-    const r2 = await b.review.runReview({ objective_id: b.oid, actor: OP });
+  it("9. R2.A — zero external change MUST NOT churn strategy; only canonical change advances the checkpoint", async () => {
+    const inv = new FakeInvoker(
+      decisionJson({
+        decision_kind: "PRIORITIZE_EXISTING",
+        wait_reason: null,
+        priority_order: ["w2", "w1"],
+      }),
+      decisionJson({
+        decision_kind: "PRIORITIZE_EXISTING",
+        wait_reason: null,
+        priority_order: ["w1", "w2"],
+      }));
+    const { s, oid, review } = seeded("d2", inv);
+    const r1 = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r1.outcome).toBe("PRIORITIZE_EXISTING");
+    // 2nd/3rd/10th run with zero external change → same review + same
+    // strategy, zero extra model call, zero new revision. P15.5's own
+    // output can never become a reason to mint another revision.
+    for (let i = 0; i < 3; i++) {
+      const r = await review.runReview({ objective_id: oid, actor: OP });
+      expect(r.status).toBe("replayed");
+      expect(r.review.review_id).toBe(r1.review.review_id);
+      expect(String(r.strategy_revision!.strategy_revision_id))
+        .toBe(String(r1.strategy_revision!.strategy_revision_id));
+    }
+    expect(rowCount(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY)).toBe(1);
+    expect(rowCount(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY)).toBe(1);
+    expect(inv.inputs.length).toBe(1);
+    // Canonical external change (verified KPI progress) advances the
+    // checkpoint → a NEW review may occur, and only then may a chained
+    // revision exist.
+    recordKpi(s, oid, "KPI_1", 3, "ev-progress");
+    const r2 = await review.runReview({ objective_id: oid, actor: OP });
     expect(r2.status).toBe("reviewed");
     expect(r2.review.review_id).not.toBe(r1.review.review_id);
     expect(String(r2.strategy_revision!.previous_revision_id))
       .toBe(String(r1.strategy_revision!.strategy_revision_id));
-    expect(String(r2.review.source_ceo_decision_id))
-      .toBe(String(r1.review.source_ceo_decision_id)); // decision replayed
-    expect(invP.inputs.length).toBe(1); // model invoked exactly once
-    b.s.store.close();
+    expect(rowCount(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY)).toBe(2);
+    expect(inv.inputs.length).toBe(2); // KPI change alters CEO obs → new call
+    s.store.close();
   });
 
   it("10. CEO WAIT → review only, zero strategy revision, wait_reason preserved", async () => {
@@ -799,7 +876,7 @@ describe("P15.5 — boundaries (§19/§20/§21)", () => {
     const r = await review.runReview({ objective_id: oid, actor: OP });
     expect(r.status).toBe("reviewed");
     // No execution authority exercised.
-    for (const et of ["mission", "executor_execution", "router_decision",
+    for (const et of ["mission", "executor_execution", "routing_decision",
       "work_open_binding", "telegram_delivery"]) {
       expect(rowCount(s.store, et)).toBe(0);
     }
@@ -944,3 +1021,345 @@ async function runReviewRace(
     })),
   );
 }
+
+describe("P15.5 R2.B — canonical budget proof", () => {
+  it("24. canonical spend → review sees verified consumed, CEO reached", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, bid, review } = seeded("r2b1", inv);
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-1", amount_microusd: 100, actor: "op",
+    });
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("WAIT"); // checkpoint reached the CEO gate
+    expect(inv.inputs.length).toBe(1);
+    s.store.close();
+  });
+
+  it("25. forged budget.consumed_microusd → fail before any model call", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, bid, review } = seeded("r2b2", inv);
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-1", amount_microusd: 100, actor: "op",
+    });
+    sqlRewriteEntity(s.store, "objective", oid, (b) => {
+      (b.budget as Record<string, unknown>).consumed_microusd = 9_999;
+    });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    expect(inv.inputs.length).toBe(0);
+    expect(rowCount(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY)).toBe(0);
+    s.store.close();
+  });
+
+  it("26. ledger spend key without its OBJECTIVE_BUDGET_ACCOUNTED event → fail", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, bid, review } = seeded("r2b3", inv);
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-1", amount_microusd: 100, actor: "op",
+    });
+    sqlDeleteEvent(s.store, "objective", oid, "OBJECTIVE_BUDGET_ACCOUNTED");
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("27. altered accounted amount → cumulative mismatch → fail", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, bid, review } = seeded("r2b4", inv);
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-1", amount_microusd: 100, actor: "op",
+    });
+    sqlRewriteEvent(s.store, "objective", oid, "OBJECTIVE_BUDGET_ACCOUNTED",
+      (md) => { md.amount_microusd = 55; }); // cumulative no longer honest
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("28. duplicate/conflicting spend identity → fail", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, bid, review } = seeded("r2b5", inv);
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-1", amount_microusd: 100, actor: "op",
+    });
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-2", amount_microusd: 200, actor: "op",
+    });
+    // Forge the second event to claim the FIRST spend_key — duplicate.
+    const rows = dbOf(s.store)
+      .prepare(
+        "SELECT * FROM events WHERE entity_type='objective' AND entity_id=? AND event_type='OBJECTIVE_BUDGET_ACCOUNTED' ORDER BY seq")
+      .all(oid) as Array<Record<string, unknown>>;
+    const dup = rows[1]!;
+    const md = JSON.parse(String(dup.metadata_json)) as Record<string, unknown>;
+    md.spend_key = "sp-1";
+    const body = {
+      event_id: dup.event_id, entity_type: dup.entity_type,
+      entity_id: dup.entity_id, event_type: dup.event_type,
+      old_state: dup.old_state, new_state: dup.new_state,
+      actor: dup.actor, correlation_id: dup.correlation_id,
+      metadata: md, created_at: dup.created_at,
+    };
+    dbOf(s.store)
+      .prepare("UPDATE events SET metadata_json=?, event_hash=? WHERE event_id=?")
+      .run(JSON.stringify(md), digest(body), String(dup.event_id));
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("29. note-bearing spend is unprovable (note never persisted) → fail closed", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, bid, review } = seeded("r2b6", inv);
+    s.biz.objectives.accountBudget(oid, {
+      business_id: bid, spend_key: "sp-n", amount_microusd: 10,
+      note: "annotated spend", actor: "op",
+    });
+    // The ledger digest binds the note; the persisted event does not —
+    // the spend is therefore unprovable and must fail closed.
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    s.store.close();
+  });
+});
+
+describe("P15.5 R2.C — canonical lifecycle evidence (never status text)", () => {
+  it("30. forged child IN_PROGRESS without open/binding → fail closed (not AWAITING)", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r2c1", inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    // Forge status text — no canonical open, no binding, no mission.
+    sqlRewriteEntity(s.store, "work_item", childId, (b) => {
+      b.status = "IN_PROGRESS";
+    });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    s.store.close();
+  });
+
+  it("31. real open + bound mission lineage → AWAITING_PROGRESS", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const s = freshFullStack("r2c2");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const review = reviewStack(s, inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP); // canonical open → bound mission
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("AWAITING_PROGRESS");
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("32. forged workstream CANCELLED without canonical cancel authority → fail closed", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding, review } = seeded("r2c3", inv);
+    const w1 = wsWorkItemId(binding, "w1");
+    sqlRewriteEntity(s.store, "work_item", w1, (b) => {
+      b.status = "CANCELLED"; // text only — zero WORK_ITEM_CANCELLED event
+    });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    s.store.close();
+  });
+
+  it("33. forged child CANCELLED without authority → fail closed", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r2c4", inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    sqlRewriteEntity(s.store, "work_item",
+      String(a.delegated_child_work_item_id), (b) => { b.status = "CANCELLED"; });
+    await expect(
+      review.runReview({ objective_id: oid, actor: OP }),
+    ).rejects.toMatchObject({ code: "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" });
+    s.store.close();
+  });
+
+  it("34. canonically cancelled child + verified gap → TOPOLOGY still reachable", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, review } = seeded("r2c5", inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.cancelWorkItem(childId, OP); // canonical WORK_ITEM_CANCELLED
+    // w2 has no allocation and is unexhausted → not allExhausted → CEO
+    // path... w2 is READY though: not allocated, no child → not active.
+    // allExhausted = false (w2 plain READY) → reaches CEO gate.
+    recordKpi(s, oid, "KPI_1", 3, "ev-g");
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    // w2 BACKLOG + w1 child CANCELLED → CEO path (WAIT proposal).
+    expect(r.outcome).toBe("WAIT");
+    s.store.close();
+  });
+});
+
+describe("P15.5 R2.D — UNVERIFIED is not a gap", () => {
+  it("35. all UNVERIFIED + all work complete → INSUFFICIENT_VERIFIED_PROGRESS", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const s = freshFullStack("r2d1");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const review = reviewStack(s, inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP);
+    const mid = String((s.store.get("work_item", childId).mission_ids as string[])[0]);
+    canonicallyCompleteMission(s.store, s.service, mid);
+    s.biz.syncWorkItem(childId);
+    s.biz.advanceCompletionCascade(childId);
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("INSUFFICIENT_VERIFIED_PROGRESS");
+    expect(r.review.gap_kpi_count).toBe(0);
+    expect(r.review.unverified_kpi_count).toBe(1);
+    expect(r.strategy_revision).toBeNull();
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+
+  it("36. MET + UNVERIFIED + complete → INSUFFICIENT (unverified alone never claims miss)", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const s = freshFullStack("r2d2");
+    const b = s.biz.createBusiness({ name: "b", project_id: s.projectId, operator_id: OP });
+    const bid = String(b.business_id);
+    const o = mkObjective(s, bid, [
+      { name: "sales", unit: "u", baseline: 0, target: 10, direction: "AT_LEAST" },
+      { name: "refs", unit: "u", baseline: 0, target: 1, direction: "AT_LEAST" },
+    ]);
+    const oid = String(o.objective_id);
+    decompose(s, oid, ["w1"]);
+    mkAgent(s, bid);
+    seedDefaultCeoModel(s.store);
+    const review = reviewStack(s, inv);
+    const a = await s.alloc.allocateWorkstream({
+      objective_id: oid, workstream_key: "w1", actor: OP,
+    });
+    const childId = String(a.delegated_child_work_item_id);
+    s.biz.openWorkItem(childId, OP);
+    const mid = String((s.store.get("work_item", childId).mission_ids as string[])[0]);
+    canonicallyCompleteMission(s.store, s.service, mid);
+    s.biz.syncWorkItem(childId);
+    s.biz.advanceCompletionCascade(childId);
+    recordKpi(s, oid, "KPI_1", 10, "ev-met"); // MET; KPI_2 stays UNVERIFIED
+    const r = await review.runReview({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("INSUFFICIENT_VERIFIED_PROGRESS");
+    expect(inv.inputs.length).toBe(0);
+    s.store.close();
+  });
+});
+
+describe("P15.5 R2.E — entity_id + bounded predecessor chain", () => {
+  async function twoRevisions(tag: string) {
+    const inv = new FakeInvoker(
+      decisionJson({
+        decision_kind: "PRIORITIZE_EXISTING", wait_reason: null,
+        priority_order: ["w2", "w1"],
+      }),
+      decisionJson({
+        decision_kind: "PRIORITIZE_EXISTING", wait_reason: null,
+        priority_order: ["w1", "w2"],
+      }));
+    const { s, oid, review } = seeded(tag, inv);
+    const r1 = await review.runReview({ objective_id: oid, actor: OP });
+    recordKpi(s, oid, "KPI_1", 3, `ev-${tag}`); // external canonical change
+    const r2 = await review.runReview({ objective_id: oid, actor: OP });
+    return { s, oid, review, r1, r2 };
+  }
+
+  it("37. forged review entity_id → strict read fails", async () => {
+    const { s, review, r1 } = await twoRevisions("e37");
+    sqlRewriteEntity(s.store, OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+      String(r1.review.review_id), (b) => { b.entity_id = "FORGED"; });
+    expectFail(
+      () => review.getReview(String(r1.review.review_id)),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+
+  it("38. forged strategy entity_id → chain strict read fails", async () => {
+    const { s, oid, review, r1 } = await twoRevisions("e38");
+    sqlRewriteEntity(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY,
+      String(r1.strategy_revision!.strategy_revision_id),
+      (b) => { b.entity_id = "FORGED"; });
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+
+  it("39. predecessor shadow field → whole chain fails closed", async () => {
+    const { s, oid, review, r1 } = await twoRevisions("e39");
+    sqlRewriteEntity(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY,
+      String(r1.strategy_revision!.strategy_revision_id), (b) => {
+        b.executor_id = "ex-forged"; // shadow authority on the predecessor
+        b.strategy_digest = strategyRevisionDigest(b);
+      });
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+
+  it("40. predecessor missing / anchor missing → chain fails", async () => {
+    const { s, oid, review, r1 } = await twoRevisions("e40");
+    sqlDeleteEvent(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY,
+      String(r1.strategy_revision!.strategy_revision_id),
+      OBJECTIVE_STRATEGY_REVISION_COMMITTED_EVENT);
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+
+  it("41. predecessor cycle → chain fails closed", async () => {
+    const { s, oid, review, r1, r2 } = await twoRevisions("e41");
+    // Forge r1 to point BACK at r2 (cycle), fully self-consistent:
+    // rewrite its prev pins, recompute its digest, fix the anchor.
+    const r1Id = String(r1.strategy_revision!.strategy_revision_id);
+    const r2Row = s.store.get(
+      OBJECTIVE_STRATEGY_REVISION_ENTITY,
+      String(r2.strategy_revision!.strategy_revision_id)) as Record<string, unknown>;
+    sqlRewriteEntity(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY, r1Id, (b) => {
+      b.previous_revision_id = String(r2Row.strategy_revision_id);
+      b.previous_revision_digest = String(r2Row.strategy_digest);
+      b.strategy_digest = strategyRevisionDigest(b);
+    });
+    const forged = s.store.get(
+      OBJECTIVE_STRATEGY_REVISION_ENTITY, r1Id) as Record<string, unknown>;
+    sqlRewriteEvent(s.store, OBJECTIVE_STRATEGY_REVISION_ENTITY, r1Id,
+      OBJECTIVE_STRATEGY_REVISION_COMMITTED_EVENT, (md) => {
+        md.strategy_digest = String(forged.strategy_digest);
+        md.previous_revision_id = String(r2Row.strategy_revision_id);
+      });
+    expectFail(() => review.getLatestStrategy(oid),
+      "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW");
+    s.store.close();
+  });
+});

@@ -155,7 +155,7 @@ const OPEN_RECONCILE_GRACE_MS = Number(process.env.PAIR_OPEN_RECONCILE_GRACE_MS 
 /** A HELD budget reservation stops counting after this long — covers the
  *  crash gap between reserve and mission create. */
 const RESERVATION_TTL_MS = Number(process.env.PAIR_BUDGET_RESERVATION_MS ?? 10 * 60 * 1000);
-const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+export const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 /** Terminal work-item statuses — no transition out exists. */
 export const TERMINAL_WORK_ITEM_STATUSES: ReadonlySet<string> = new Set(["DONE", "CANCELLED"]);
 /** Context notes kept per org_agent; newest kept, oldest trimmed. */

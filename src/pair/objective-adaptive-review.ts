@@ -32,10 +32,15 @@
 import { canonicalJson, digest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
 import type { BusinessLayer } from "./business.js";
-import { TERMINAL_WORK_ITEM_STATUSES } from "./business.js";
+import { TERMINAL_MISSION_STATUSES } from "./business.js";
+import { canonicalBoundAttemptsForWorkItem } from "./work-completion.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
-import { OBJECTIVE_ENTITY, progressSemantics } from "./objective-authority.js";
+import {
+  OBJECTIVE_ENTITY,
+  progressSemantics,
+  spendSemantics,
+} from "./objective-authority.js";
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { objectiveWorkstreamBindingDigest } from "./objective-workstream.js";
 import type { WorkforceService } from "./work-graph.js";
@@ -73,6 +78,7 @@ export const REVIEW_OUTCOMES = [
   "AWAITING_PROGRESS",
   "TARGET_MET_CANDIDATE",
   "TOPOLOGY_CHANGE_REQUIRED",
+  "INSUFFICIENT_VERIFIED_PROGRESS",
   "PRIORITIZE_EXISTING",
   "WAIT",
 ] as const;
@@ -81,14 +87,6 @@ export type ReviewOutcome = (typeof REVIEW_OUTCOMES)[number];
 /** KPI assessment vocabulary — deterministic, no fuzzy tolerance. */
 export const KPI_ASSESSMENTS = ["MET", "GAP", "UNVERIFIED"] as const;
 export type KpiAssessment = (typeof KPI_ASSESSMENTS)[number];
-
-/** Work statuses that count as "legitimate work still actively
- *  progressing" (§8). BLOCKED is deliberately NOT active: it is a
- *  canonical blocking condition requiring intervention. BACKLOG is not
- *  active either — an allocated child is READY on creation. */
-const ACTIVE_PROGRESS_STATUSES = new Set([
-  "READY", "IN_PROGRESS", "REVIEW_REQUIRED",
-]);
 
 function reviewFail(detail: string): never {
   throw new IntegrityError("FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW", detail);
@@ -213,6 +211,115 @@ export function assertCanonicalObjectiveKpiProgress(
 }
 
 // ---------------------------------------------------------------------
+// §B — STRICT BUDGET RUNTIME AUTHORITY
+// ---------------------------------------------------------------------
+
+/** Re-prove that `budget.consumed_microusd` on a strict-read Objective is
+ *  canonical runtime authority, not a mutable field claim. The strict
+ *  read already bounds the field; this binds it to the immutable spend
+ *  evidence chain:
+ *
+ *  - every OBJECTIVE_BUDGET_ACCOUNTED event pins {spend_key, integer
+ *    amount_microusd, consumed_microusd} where consumed equals the
+ *    running cumulative sum in event order;
+ *  - spend_key identity is unique across the event chain;
+ *  - the applied_spend_keys ledger mirrors the event chain exactly
+ *    (no missing spend, no extra key);
+ *  - each ledger digest recomputes the exact P15.1 spend semantics
+ *    (objective+key+amount+note). A spend recorded with a note is
+ *    unprovable from persisted evidence — fail closed, never trust it;
+ *  - the cumulative sum equals the current consumed_microusd.
+ *
+ *  Anything inconsistent fails closed — a payload-consistent rewrite of
+ *  consumed_microusd cannot affect P15.5/CEO reasoning. */
+export function assertCanonicalObjectiveBudget(
+  store: PairEvidenceStore,
+  objective: Row,
+): void {
+  const oid = String(objective.objective_id);
+  const budget = objective.budget as Record<string, unknown> | undefined;
+  if (!budget ||
+      !Number.isInteger(budget.ceiling_microusd) ||
+      !Number.isInteger(budget.consumed_microusd) ||
+      Number(budget.ceiling_microusd) < 0 ||
+      Number(budget.consumed_microusd) < 0 ||
+      Number(budget.consumed_microusd) > Number(budget.ceiling_microusd)) {
+    reviewFail(`objective ${oid}: budget shape/ceiling invalid`);
+  }
+  const rawLedger = objective.applied_spend_keys;
+  const ledger: Array<{ key: string; digest: string }> = [];
+  if (rawLedger !== undefined && rawLedger !== null) {
+    if (!Array.isArray(rawLedger)) {
+      reviewFail(`objective ${oid}: applied_spend_keys malformed`);
+    }
+    for (const e of rawLedger as Array<Record<string, unknown>>) {
+      if (typeof e !== "object" || e === null ||
+          typeof e.key !== "string" || e.key === "" ||
+          typeof e.digest !== "string" || e.digest === "") {
+        reviewFail(`objective ${oid}: applied_spend_keys entry malformed`);
+      }
+      ledger.push({ key: e.key, digest: e.digest });
+    }
+  }
+  const events = deps_listAccounted(store, oid);
+  // Every spend_key is unique and cumulative consumed is monotone
+  // consistent through the immutable event chain.
+  const byKey = new Map<string, { amount: number; consumed: number }>();
+  let running = 0;
+  for (const e of events) {
+    const md = e.metadata as Record<string, unknown> | null;
+    if (!md || typeof md.spend_key !== "string" || md.spend_key === "" ||
+        !Number.isInteger(md.amount_microusd) ||
+        Number(md.amount_microusd) < 0 ||
+        !Number.isInteger(md.consumed_microusd)) {
+      reviewFail(`objective ${oid}: malformed spend event authority`);
+    }
+    const key = String(md.spend_key);
+    if (byKey.has(key)) {
+      reviewFail(`objective ${oid}: duplicate spend_key authority ${key}`);
+    }
+    running += Number(md.amount_microusd);
+    if (Number(md.consumed_microusd) !== running) {
+      reviewFail(
+        `objective ${oid}: spend event cumulative mismatch at ${key}`);
+    }
+    byKey.set(key, { amount: Number(md.amount_microusd), consumed: running });
+  }
+  if (running !== Number(budget.consumed_microusd)) {
+    reviewFail(
+      `objective ${oid}: consumed=${String(budget.consumed_microusd)} ` +
+      `but canonical spend chain totals ${running}`);
+  }
+  // The ledger must mirror the event chain exactly — no missing spend
+  // authority, no extra keys.
+  if (ledger.length !== events.length) {
+    reviewFail(`objective ${oid}: spend ledger/event count mismatch`);
+  }
+  for (const entry of ledger) {
+    const e = byKey.get(entry.key);
+    if (!e) {
+      reviewFail(`objective ${oid}: ledger key ${entry.key} has no spend event`);
+    }
+    const expected = spendSemantics(oid, {
+      spend_key: entry.key,
+      amount_microusd: e!.amount,
+      // A note is not part of persisted event evidence — a spend that
+      // used one cannot be re-proven here and fails closed.
+      note: undefined,
+    });
+    if (entry.digest !== expected) {
+      reviewFail(`objective ${oid}: spend digest mismatch for ${entry.key}`);
+    }
+  }
+}
+
+function deps_listAccounted(store: PairEvidenceStore, oid: string) {
+  // listEvents already orders by the immutable seq column.
+  return store.listEvents(OBJECTIVE_ENTITY, oid)
+    .filter((e) => String(e.event_type) === "OBJECTIVE_BUDGET_ACCOUNTED");
+}
+
+// ---------------------------------------------------------------------
 // §12 — REVIEW OBSERVATION
 // ---------------------------------------------------------------------
 
@@ -226,6 +333,21 @@ interface ReviewWorkstreamProjection {
   delegated_child_work_item_id: string | null;
   delegated_child_status: string | null;
   delegated_child_completion_proven: boolean;
+  /** Canonical open/binding lineage exists for the delegated child
+   *  (boundMissionForWorkItem non-null) — never status text. */
+  delegated_child_bound_mission: boolean;
+}
+
+/** Canonical cancellation authority = a WORK_ITEM_CANCELLED event with
+ *  new_state CANCELLED (event hashes are re-verified on read). A row
+ *  claiming CANCELLED without it is contradictory canonical state. */
+function hasCanonicalCancellation(
+  store: PairEvidenceStore,
+  workItemId: string,
+): boolean {
+  return store.listEvents("work_item", workItemId).some((e) =>
+    String(e.event_type) === "WORK_ITEM_CANCELLED" &&
+    String(e.new_state) === "CANCELLED");
 }
 
 interface KpiAssessmentProjection {
@@ -257,9 +379,6 @@ export interface ReviewObservation {
   unverified_kpi_count: number;
   gap_kpi_count: number;
   workstreams: ReviewWorkstreamProjection[];
-  latest_strategy_revision_id: string | null;
-  latest_strategy_revision_digest: string | null;
-  strategy_revision_count: number;
 }
 
 /** The latest canonical strategy revision for an objective — the chain
@@ -303,6 +422,9 @@ export function buildReviewObservation(
   const objective = deps.objectives.get(objectiveId); // strict P15.1 read
   // §4 — strategic KPI authority requires the strict progress proof.
   assertCanonicalObjectiveKpiProgress(deps.store, objective);
+  // §R2.B — budget.consumed_microusd enters strategic reasoning only
+  // after the canonical spend-accounting chain re-proves it.
+  assertCanonicalObjectiveBudget(deps.store, objective);
   const binding = deps.workstreams.getBinding(objectiveId);
   if (!binding) {
     // P15.5 reviews existing workstreams; no binding means there is no
@@ -322,6 +444,12 @@ export function buildReviewObservation(
     if (String(row.business_id) !== String(objective.business_id)) {
       reviewFail(`workstream ${wid} foreign to objective business`);
     }
+    // §R2.C — a P15.2 workstream container can never carry an open
+    // binding of its own (openWorkItem fails closed on containers);
+    // a bound attempt on the container is forged authority.
+    if (canonicalBoundAttemptsForWorkItem(deps.store, wid).length > 0) {
+      reviewFail(`workstream container ${wid} carries bound open attempts`);
+    }
     const completionProven = deps.business.proveWorkItemDone(row);
     // Status DONE without the canonical completion proof is a
     // contradictory canonical state — the only authority path that
@@ -331,9 +459,24 @@ export function buildReviewObservation(
       reviewFail(
         `workstream ${wid} claims DONE without canonical completion proof`);
     }
+    // CANCELLED only carries strategic meaning with canonical
+    // cancellation authority — a status-text claim alone never makes a
+    // workstream "exhausted".
+    if (String(row.status) === "CANCELLED" &&
+        !hasCanonicalCancellation(deps.store, wid)) {
+      reviewFail(
+        `workstream ${wid} claims CANCELLED without canonical cancellation authority`);
+    }
     const walId = workforceAllocationId(objectiveId, wid);
     const wal = deps.store.tryGet(WORKFORCE_ALLOCATION_ENTITY, walId) as Row | null;
     if (!wal) {
+      // An unallocated container can never legitimately progress —
+      // statuses that imply delegated work fail closed.
+      if (String(row.status) === "IN_PROGRESS" ||
+          String(row.status) === "REVIEW_REQUIRED") {
+        reviewFail(
+          `unallocated workstream ${wid} claims ${String(row.status)}`);
+      }
       workstreams.push({
         workstream_key: String(w.workstream_key),
         work_item_id: wid,
@@ -344,6 +487,7 @@ export function buildReviewObservation(
         delegated_child_work_item_id: null,
         delegated_child_status: null,
         delegated_child_completion_proven: false,
+        delegated_child_bound_mission: false,
       });
       continue;
     }
@@ -357,6 +501,35 @@ export function buildReviewObservation(
       reviewFail(
         `delegated child ${childId} claims DONE without canonical completion proof`);
     }
+    if (String(child.status) === "CANCELLED" &&
+        !hasCanonicalCancellation(deps.store, childId)) {
+      reviewFail(
+        `delegated child ${childId} claims CANCELLED without canonical cancellation authority`);
+    }
+    // Canonical open/binding lineage for the delegated child — the
+    // ONLY proof a child was ever opened.
+    const childBoundMission = deps.business.boundMissionForWorkItem(child);
+    const childLiveMission = childBoundMission !== null &&
+      !TERMINAL_MISSION_STATUSES.has(String(childBoundMission.status));
+    if (String(child.status) === "IN_PROGRESS" && !childLiveMission) {
+      reviewFail(
+        `delegated child ${childId} claims IN_PROGRESS without a live bound mission`);
+    }
+    if (String(child.status) === "READY" && childLiveMission) {
+      reviewFail(
+        `delegated child ${childId} claims READY while a live bound mission exists`);
+    }
+    // Container lifecycle consistency: a container in IN_PROGRESS /
+    // REVIEW_REQUIRED is only canonical via cascade from the delegated
+    // child — never from raw status text.
+    if (String(row.status) === "IN_PROGRESS" && !childLiveMission) {
+      reviewFail(
+        `workstream ${wid} claims IN_PROGRESS without live delegated work`);
+    }
+    if (String(row.status) === "REVIEW_REQUIRED" && childBoundMission === null) {
+      reviewFail(
+        `workstream ${wid} claims REVIEW_REQUIRED without any delegated lineage`);
+    }
     workstreams.push({
       workstream_key: String(w.workstream_key),
       work_item_id: wid,
@@ -367,6 +540,7 @@ export function buildReviewObservation(
       delegated_child_work_item_id: childId,
       delegated_child_status: String(child.status),
       delegated_child_completion_proven: childProven,
+      delegated_child_bound_mission: childBoundMission !== null,
     });
   }
 
@@ -397,7 +571,6 @@ export function buildReviewObservation(
   const unverified = kpis.length - verified;
   const allMet = kpis.length > 0 && kpis.every((k) => k.assessment === "MET");
 
-  const chain = canonicalStrategyChain(deps, objectiveId);
   const budget = objective.budget as { ceiling_microusd: number; consumed_microusd: number; currency: string };
 
   const observation: ReviewObservation = {
@@ -423,11 +596,6 @@ export function buildReviewObservation(
     unverified_kpi_count: unverified,
     gap_kpi_count: gap,
     workstreams,
-    latest_strategy_revision_id: chain.head
-      ? String(chain.head.strategy_revision_id) : null,
-    latest_strategy_revision_digest: chain.head
-      ? String(chain.head.strategy_digest) : null,
-    strategy_revision_count: chain.all.length,
   };
   const serialized = canonicalJson(observation);
   if (Buffer.byteLength(serialized, "utf8") > REVIEW_OBSERVATION_MAX_BYTES) {
@@ -579,6 +747,9 @@ export function assertCanonicalAdaptiveReview(
   if (!REVIEW_OUTCOMES.includes(row.outcome as ReviewOutcome)) {
     reviewFail(`review outcome ${String(row.outcome)}`);
   }
+  if (String(row.entity_id ?? "") !== String(row.review_id)) {
+    reviewFail("review entity_id does not equal review_id");
+  }
   if (String(row.review_id) !==
       adaptiveReviewId(String(row.objective_id), String(row.review_observation_digest))) {
     reviewFail("review_id does not recompute");
@@ -697,10 +868,49 @@ export function assertCanonicalAdaptiveReview(
   }
 }
 
-/** Strict read of a canonical strategy revision: exact shape,
- *  self-digest, immutable anchor, and full provenance re-proof against
- *  its source review + CEO decision + P15.2 binding. */
+/** Strict read of a canonical strategy revision: every per-row check
+ *  PLUS a bounded (≤32), acyclic walk re-proving the whole previous
+ *  chain — a malformed predecessor fails the latest revision closed. */
 export function assertCanonicalStrategyRevision(
+  deps: ObjectiveAdaptiveReviewDeps,
+  row: Row,
+): void {
+  assertCanonicalStrategyRevisionLocal(deps, row);
+  // Previous-revision chain — bounded, acyclic, every ancestor held to
+  // the same per-row strict standard.
+  const seen = new Set<string>([String(row.strategy_revision_id)]);
+  let cur: Row = row;
+  while (cur.previous_revision_id !== null &&
+         cur.previous_revision_id !== undefined) {
+    if (seen.size > STRATEGY_REVISION_MAX_PER_OBJECTIVE) {
+      reviewFail("previous revision chain exceeds bound");
+    }
+    const prevId = String(cur.previous_revision_id);
+    if (seen.has(prevId)) {
+      reviewFail("previous revision chain cycle");
+    }
+    const prevRow = deps.store.tryGet(
+      OBJECTIVE_STRATEGY_REVISION_ENTITY, prevId) as Row | null;
+    if (!prevRow) reviewFail("previous revision missing");
+    if (String(prevRow.entity_id ?? "") !== prevId ||
+        String(prevRow.strategy_revision_id) !== prevId ||
+        String(prevRow.objective_id) !== String(row.objective_id) ||
+        String(prevRow.business_id) !== String(row.business_id) ||
+        strategyRevisionDigest(prevRow) !==
+          String(cur.previous_revision_digest)) {
+      reviewFail("previous revision provenance mismatch");
+    }
+    seen.add(prevId);
+    assertCanonicalStrategyRevisionLocal(deps, prevRow);
+    cur = prevRow;
+  }
+}
+
+/** Per-row strict checks for one canonical strategy revision: exact
+ *  shape, self-digest, immutable anchor, and full provenance re-proof
+ *  against its source review + CEO decision + P15.2 binding. The
+ *  previous-chain walk lives in the public validator. */
+function assertCanonicalStrategyRevisionLocal(
   deps: ObjectiveAdaptiveReviewDeps,
   row: Row,
 ): void {
@@ -715,6 +925,9 @@ export function assertCanonicalStrategyRevision(
   }
   if (String(row.state) !== "COMMITTED") reviewFail(`revision state ${String(row.state)}`);
   if (Number(row.version) !== 1) reviewFail("revision version"); // create-only
+  if (String(row.entity_id ?? "") !== String(row.strategy_revision_id)) {
+    reviewFail("revision entity_id does not equal strategy_revision_id");
+  }
   if (String(row.strategy_revision_id) !== strategyRevisionId(
       String(row.objective_id), String(row.source_review_id),
       String(row.source_ceo_decision_id))) {
@@ -811,17 +1024,6 @@ export function assertCanonicalStrategyRevision(
       reviewFail(`actionable_order excludes ${k} without canonical completion`);
     }
   }
-  // Previous-revision chain, when pinned.
-  const prev = row.previous_revision_id;
-  if (prev !== null && prev !== undefined) {
-    const prevRow = deps.store.tryGet(
-      OBJECTIVE_STRATEGY_REVISION_ENTITY, String(prev)) as Row | null;
-    if (!prevRow) reviewFail("previous revision missing");
-    if (String(prevRow.objective_id) !== String(row.objective_id) ||
-        strategyRevisionDigest(prevRow) !== String(row.previous_revision_digest)) {
-      reviewFail("previous revision provenance mismatch");
-    }
-  }
 }
 
 // ---------------------------------------------------------------------
@@ -896,14 +1098,27 @@ export class ObjectiveAdaptiveReviewService {
     }
 
     // Deterministic checkpoint — before ANY model call (§8/§9/§10).
-    const anyActive = observation.workstreams.some((w) =>
-      w.allocation_state === "ALLOCATED" &&
-      w.delegated_child_status !== null &&
-      ACTIVE_PROGRESS_STATUSES.has(w.delegated_child_status));
+    // Activity/exhaustion are derived from canonical lifecycle evidence
+    // re-proven inside buildReviewObservation (never raw status text).
+    const anyActive = observation.workstreams.some((w) => {
+      if (w.allocation_state !== "ALLOCATED" ||
+          w.delegated_child_status === null) {
+        return false;
+      }
+      const cs = w.delegated_child_status;
+      if (cs === "READY" || cs === "IN_PROGRESS") return true; // lineage proven
+      // REVIEW_REQUIRED counts as active only with canonical
+      // review/completion-basis lineage — never from text alone.
+      if (cs === "REVIEW_REQUIRED") return w.delegated_child_bound_mission;
+      return false;
+    });
     const allExhausted = observation.workstreams.length > 0 &&
       observation.workstreams.every((w) =>
         w.completion_proven ||
-        TERMINAL_WORK_ITEM_STATUSES.has(w.workstream_status));
+        // CANCELLED was re-proven against canonical cancellation
+        // authority at observation build — it never counted on text.
+        w.workstream_status === "CANCELLED" ||
+        w.delegated_child_status === "CANCELLED");
 
     let outcome: ReviewOutcome;
     let decision: Row | null = null;
@@ -911,8 +1126,12 @@ export class ObjectiveAdaptiveReviewService {
       outcome = "TARGET_MET_CANDIDATE";
     } else if (anyActive) {
       outcome = "AWAITING_PROGRESS";
-    } else if (allExhausted) {
+    } else if (allExhausted && observation.gap_kpi_count > 0) {
       outcome = "TOPOLOGY_CHANGE_REQUIRED";
+    } else if (allExhausted) {
+      // Work exhausted but NO verified gap — unverified progress is
+      // not a gap and cannot claim the target missed (§R2.D).
+      outcome = "INSUFFICIENT_VERIFIED_PROGRESS";
     } else {
       // CEO path — the EXISTING P15.3 cycle. Never a second model path.
       const res = await this.deps.ceoCycle.runCycle({
