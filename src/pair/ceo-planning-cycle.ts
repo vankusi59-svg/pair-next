@@ -777,7 +777,18 @@ export class CeoPlanningCycleService {
    * canonical state returns the existing committed decision with ZERO
    * model calls.
    */
-  async runCycle(input: { objective_id: string; actor: string }): Promise<{
+  async runCycle(input: {
+    objective_id: string;
+    actor: string;
+    /** P15.10-C R1: optional fenced commit guard for autonomous callers.
+     * When provided it is invoked inside the serialized write transaction
+     * that performs the final post-await commit — before any decision row,
+     * workstream decomposition, or attempt settlement. A thrown error
+     * rolls the whole commit back; the invoked attempt is then settled
+     * REJECTED by the existing terminal settle path. Manual callers that
+     * omit it behave exactly as before. */
+    autonomous_commit_guard?: () => void;
+  }): Promise<{
     decision: Row;
     binding: Row | null;
     attempt_id: string;
@@ -971,6 +982,11 @@ export class CeoPlanningCycleService {
     let outcome: { stale: true } | { stale: false; decision: Row; binding: Row | null };
     try {
       outcome = this.store.immediate(() => {
+      // P15.10-C R1 F1-C: fenced commit guard runs inside the same
+      // serialized write transaction as the side effects it protects —
+      // a revoked/expired autonomous authority can never commit a new
+      // decision, workstream, or downstream mission post-await.
+      input.autonomous_commit_guard?.();
       const fresh = buildCeoObservation(this.deps, objectiveId);
       if (fresh.observation_digest !== first.observation_digest) {
         // TOCTOU — the model decided against stale state. Settle STALE

@@ -302,8 +302,9 @@ describe("P15.10-C R1 — heartbeat + fenced commit guard", () => {
       return { model_entry_id: i.transport.model_entry_id,
         provider_id: i.transport.provider_id, model_id: i.transport.model_id,
         raw_text: decisionJson({ decision_kind: "INITIALIZE_WORKSTREAMS",
+          wait_reason: undefined,
           workstreams: [{ workstream_key: "alpha", title: "T", goal: "G" }],
-          priority_order: ["alpha"] }) };
+          priority_order: ["alpha"], summary: "init" }) };
     });
     let guardCalls = 0;
     const guard = () => {
@@ -345,9 +346,22 @@ describe("P15.10-C R1 — heartbeat + fenced commit guard", () => {
     s.scheduler.reconcileLeases();
     const lAfter = lease(s, oid(o));
     expect(lAfter!.state).not.toBe("ACTIVE");
+    // Permanent authority loss quarantines — the owner de-quarantines
+    // explicitly (pause→resume), exactly like production recovery.
+    expect(readSchedulerRow<Record<string, unknown>>(s.store, WAKE_STATE, oid(o))!
+      .queue_state).toBe("QUARANTINED");
+    let v = s.policy.status(oid(o), OWNER).policy_version;
+    s.policy.control({ objective_id: oid(o), actor: OWNER,
+      action: "pause", policy_version: v, idempotency_key: "p-c" });
+    v = s.policy.status(oid(o), OWNER).policy_version;
+    s.policy.control({ objective_id: oid(o), actor: OWNER,
+      action: "resume", policy_version: v, idempotency_key: "r-c" });
+    wake(s, oid(o));
     // New worker (new boot) reclaims the same pending generation.
+    // First tick only completes the fairness round; second rescans.
     const b = mkDriver(s, { workerId: "w-b", bootId: "b-b", heartbeatMs: 5 });
-    const outB = await b.driver.tick();
+    let outB = await b.driver.tick();
+    if (outB.driven.length === 0) outB = await b.driver.tick();
     expect(outB.driven[0]!.settled).toBe(true);
     const settled = (s.store.list(SCHEDULER_RECEIPT) as Array<Record<string, unknown>>)
       .filter((r) => r.operation === "SETTLE");
@@ -366,9 +380,12 @@ describe("P15.10-C R1 — heartbeat + fenced commit guard", () => {
     const outA = await a.driver.tick();
     expect(outA.driven[0]!.settled).not.toBe(true);
     s.scheduler.reconcileLeases();
-    // Worker B on a SECOND connection claims a new fence.
+    // Worker B on a SECOND connection (its own service stack) claims a
+    // new fence — no nested cross-connection transactions.
     const s2store = new PairEvidenceStore(s.dbPath);
-    const s2sched = new ObjectiveAutoScheduler(s2store, s.objectives, s.policy, s.now);
+    const s2objectives = new ObjectiveAuthorityService(s2store);
+    const s2policy = new ObjectiveAutoPolicyService(s2store, s2objectives, s.now);
+    const s2sched = new ObjectiveAutoScheduler(s2store, s2objectives, s2policy, s.now);
     const oldFence = Number(lease(s, oid(o))!.fence);
     const handleB = s2sched.claim(oid(o), "w-b", "b-b", "reclaim");
     expect(Number(handleB.fence)).toBeGreaterThan(oldFence);
@@ -377,8 +394,8 @@ describe("P15.10-C R1 — heartbeat + fenced commit guard", () => {
       token: "0".repeat(64), fence: oldFence,
       claimed_generation: Number(handleB.claimed_generation),
       checkpoint_digest: String(handleB.checkpoint_digest) };
-    expect(() => s.scheduler.renew(staleHandle)).toThrow();
-    expect(() => s.scheduler.settle(staleHandle, "WAITING", "op-stale")).toThrow();
+    expect(() => s.scheduler.renew(staleHandle as never)).toThrow();
+    expect(() => s.scheduler.settle(staleHandle as never, "WAITING", "op-stale")).toThrow();
     // B settles normally.
     s2sched.settle(handleB, "WAITING", "op-b");
     expect(lease(s, oid(o))!.state).toBe("SETTLED");
@@ -416,28 +433,33 @@ describe("P15.10-C R1 — heartbeat + fenced commit guard", () => {
     const o = mkObjective(s, mkBiz(s.store));
     enable(s, oid(o));
     wake(s, oid(o));
-    const { driver } = mkDriver(s, { heartbeatMs: 60_000, ceoTimeoutMs: 900_000,
-      onPass: async () => { /* gate never fired — we drive claim manually below */ } });
-    // Inspect the driver's claim-time bound directly.
-    void driver;
     const handle = s.scheduler.claim(oid(o), "drv", "boot", "m1");
     const l = lease(s, oid(o));
     // Default bound = 300s lifetime (P15.10-B compat) when unspecified.
     expect(Number(l!.max_lifetime_ms ?? 300_000)).toBe(300_000);
-    // Renew across a normal horizon works until started_at + lifetime.
-    s.setNow(s.now() + 200_000);
+    // Renew under the 60s TTL keeps the lease alive across the horizon;
+    // renewal past started_at + 300s default lifetime fails closed.
+    for (const step of [50_000, 50_000, 50_000, 50_000]) {
+      s.setNow(s.now() + step);
+      s.scheduler.renew(handle); // +50,+100,+150,+200 — all < 300s
+    }
+    s.setNow(s.now() + 50_000); // +250 — still under TTL, inside lifetime
     s.scheduler.renew(handle);
-    s.setNow(s.now() + 120_000); // now past 300s default lifetime
+    s.setNow(s.now() + 55_000); // +305 — past default 300s lifetime
     expect(() => s.scheduler.renew(handle)).toThrow();
-    // Driver-bound lease carries its own validated bound.
+    // Driver-bound lease carries its own validated bound (960s).
     const o2 = mkObjective(s, mkBiz(s.store));
     enable(s, oid(o2));
     wake(s, oid(o2));
     const h2 = s.scheduler.claim(oid(o2), "drv", "boot", "m2",
       { max_lifetime_ms: 900_000 + 60_000 });
-    s.setNow(s.now() + 400_000);
-    s.scheduler.renew(h2); // still inside 960s bound — valid
-    s.setNow(s.now() + 600_000); // past 960s → rejected
+    for (let i = 0; i < 10; i++) { // +50..+500 — inside 960s, under TTL each step
+      s.setNow(s.now() + 50_000);
+      s.scheduler.renew(h2);
+    }
+    s.setNow(s.now() + 55_000); // +555 — renew still valid (<960s)
+    s.scheduler.renew(h2);
+    s.setNow(s.now() + 420_000); // +975 — past 960s bound
     expect(() => s.scheduler.renew(h2)).toThrow();
     // Bad bounds fail closed at claim.
     const o3 = mkObjective(s, mkBiz(s.store));
@@ -445,6 +467,9 @@ describe("P15.10-C R1 — heartbeat + fenced commit guard", () => {
     wake(s, oid(o3));
     expect(() => s.scheduler.claim(oid(o3), "d", "b", "m3", { max_lifetime_ms: 30_000 })).toThrow();
     expect(() => s.scheduler.claim(oid(o3), "d", "b", "m3", { max_lifetime_ms: 961_000 })).toThrow();
+    // Driver constructor rejects an unvalidated CEO timeout.
+    expect(() => mkDriver(s, { ceoTimeoutMs: 3_000 })).toThrow();
+    expect(() => mkDriver(s, { ceoTimeoutMs: 901_000 })).toThrow();
   });
 
   it("R1-F1e2 heartbeat stops after pass fault; expired-policy renew records permanent loss", async () => {

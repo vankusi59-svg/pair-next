@@ -123,8 +123,16 @@ type Lease = Row & {
   worker_id: string | null; boot_id: string | null; expires_at: number | null;
   renewed_at: number | null; claimed_generation: number; checkpoint_digest: string;
   policy_version: number; terms_digest: string; objective_version: number;
-  owner_authority_id: string;
+  owner_authority_id: string; max_lifetime_ms?: number;
 };
+
+/** P15.10-C R1: claim-time lease lifetime bounds. The default preserves
+ * P15.10-B behavior (300s); consumers bound it to their awaited work
+ * (e.g. driver CEO timeout + finalization allowance) at claim, never
+ * beyond an absolute cap. TTL stays 60s regardless — only lifetime moves. */
+export const LEASE_MAX_LIFETIME_CAP_MS = 960_000;
+export const LEASE_MAX_LIFETIME_DEFAULT_MS = 300_000;
+export const LEASE_MAX_LIFETIME_MIN_MS = 60_000;
 export type LeaseHandle = {
   objective_id: string; worker_id: string; boot_id: string; token: string;
   fence: number; claimed_generation: number; checkpoint_digest: string;
@@ -647,10 +655,14 @@ export class ObjectiveAutoScheduler {
   }
 
   /** Test-only preparation contract. This does not call the operating loop. */
-  claim(objectiveId: string, workerId: string, bootId: string, opportunity: string): LeaseHandle {
+  claim(objectiveId: string, workerId: string, bootId: string, opportunity: string,
+      opts?: { max_lifetime_ms?: number }): LeaseHandle {
     const result = this.proof(() => {
       if (!workerId || workerId.length > 128 || !bootId || bootId.length > 128 ||
           !opportunity || opportunity.length > 128) invalid("invalid worker/opportunity");
+      const maxLifetime = opts?.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS;
+      if (!Number.isFinite(maxLifetime) || maxLifetime < LEASE_MAX_LIFETIME_MIN_MS ||
+          maxLifetime > LEASE_MAX_LIFETIME_CAP_MS) invalid("invalid max lease lifetime bound");
       const q = this.queue(objectiveId);
       if (!q || q.queue_state !== "WAITING_CONSUMER" ||
           (q.pending_generation <= q.claimed_generation && q.claimed_generation <= q.settled_generation) ||
@@ -685,7 +697,7 @@ export class ObjectiveAutoScheduler {
         objective_id: objectiveId, state: "ACTIVE", fence,
         token_hash: digest(token), worker_id: workerId, boot_id: bootId,
         expires_at: this.instant() + 60_000, renewed_at: this.instant(),
-        started_at: this.instant(),
+        started_at: this.instant(), max_lifetime_ms: maxLifetime,
         claimed_generation: q.pending_generation, checkpoint_digest: q.checkpoint_digest,
         policy_version: q.policy_version, terms_digest: q.terms_digest,
         owner_authority_id: q.owner_authority_id, objective_version: q.objective_version,
@@ -733,7 +745,8 @@ export class ObjectiveAutoScheduler {
   renew(handle: LeaseHandle): void {
     this.proof(() => {
       const { lease } = this.currentLease(handle);
-      if (Number(lease.started_at) + 300_000 < this.instant()) invalid("max lease lifetime");
+      const maxLifetime = Number(lease.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS);
+      if (Number(lease.started_at) + maxLifetime < this.instant()) invalid("max lease lifetime");
       if (Number(lease.renewed_at) + 15_000 > this.instant()) return;
       writeSchedulerRow(this.store, LEASE_STATE, handle.objective_id, {
         ...fields(lease), renewed_at: this.instant(), expires_at: this.instant() + 60_000,

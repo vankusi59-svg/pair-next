@@ -46,10 +46,12 @@
 
 import { utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { isSqliteContentionError } from "./store.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
 import type { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import {
+  LEASE_MAX_LIFETIME_CAP_MS,
   LEASE_STATE,
   SCHEDULER_RECEIPT,
   faultCode,
@@ -74,6 +76,18 @@ export const DRIVER_SCHEMA = "pair.os.vnext.objective-auto-driver.v1";
 /** How many passes one driver tick may drain; bounded so a tick always
  *  finishes and fairness (persisted rank order) is visited every pass. */
 export const DRIVER_MAX_PASSES_PER_TICK = 4;
+/** P15.10-C R1: lease heartbeat cadence — renew every 20s against the
+ *  fixed 60s lease TTL so an awaited pass (CEO model call up to the
+ *  configured 900s bound) keeps its exclusive authority. */
+export const DRIVER_HEARTBEAT_MS = 20_000;
+/** P15.10-C R1: bounded finalization allowance added to the CEO timeout
+ *  when binding lease max_lifetime at claim — covers settle/commit
+ *  work after the model resolves, never an unconditional TTL raise. */
+export const DRIVER_FINALIZATION_ALLOWANCE_MS = 60_000;
+/** P15.10-C R1: sane bounds for an injected CEO timeout — mirrors
+ *  PAIR_CEO_CLI_TIMEOUT_MS validation (5000..900000). */
+const CEO_TIMEOUT_MIN_MS = 5_000;
+const CEO_TIMEOUT_MAX_MS = 900_000;
 /** Bounded history kept in the durable driver state row. */
 const HISTORY_LIMIT = 32;
 
@@ -159,6 +173,22 @@ export interface DriverDeps {
   bootId: string;
   now?: () => number;
   maxPassesPerTick?: number;
+  /** P15.10-C R1: heartbeat renew interval. Default DRIVER_HEARTBEAT_MS;
+   *  `0` disables the heartbeat entirely (deterministic tests only —
+   *  production never wires 0). */
+  heartbeatMs?: number;
+  /** P15.10-C R1: the CEO invocation timeout this driver's awaited
+   *  passes may run. Bound-validated at construction (5000..900000);
+   *  claim-time lease max_lifetime = ceoTimeout + finalization
+   *  allowance, capped at LEASE_MAX_LIFETIME_CAP_MS. Default 300_000
+   *  (the PAIR_CEO_CLI_TIMEOUT_MS default). */
+  ceoTimeoutMs?: number;
+  /** P15.10-C R1 F1-D: before admitting a pass the driver reconciles
+   *  STARTED/UNKNOWN CEO attempts scoped to this objective — a restart
+   *  can never re-invoke a model call the previous worker already
+   *  made; recovery resolves through canonical settle anchors only.
+   *  Production wires ceoCycle.reconcileStaleAttempts. */
+  reconcileStaleAttempts?: (objectiveId: string) => void;
 }
 
 interface LeaseRow {
@@ -171,11 +201,64 @@ interface LeaseRow {
 export class ObjectiveAutoDriverService {
   private readonly now: () => number;
   private readonly maxPassesPerTick: number;
+  private readonly heartbeatMs: number;
+  private readonly ceoTimeoutMs: number;
 
   constructor(private readonly deps: DriverDeps) {
     this.now = deps.now ?? (() => Date.now());
     this.maxPassesPerTick = Math.max(
       1, Math.min(DRIVER_MAX_PASSES_PER_TICK, deps.maxPassesPerTick ?? 1));
+    this.heartbeatMs = deps.heartbeatMs ?? DRIVER_HEARTBEAT_MS;
+    if (!Number.isSafeInteger(this.heartbeatMs) || this.heartbeatMs < 0) {
+      invalid("invalid heartbeatMs");
+    }
+    this.ceoTimeoutMs = deps.ceoTimeoutMs ?? 300_000;
+    if (!Number.isFinite(this.ceoTimeoutMs) ||
+        this.ceoTimeoutMs < CEO_TIMEOUT_MIN_MS ||
+        this.ceoTimeoutMs > CEO_TIMEOUT_MAX_MS) {
+      invalid("invalid ceoTimeoutMs bound");
+    }
+  }
+
+  /** P15.10-C R1 F1-B: lease lifetime bound decided AT CLAIM from the
+   *  validated CEO timeout + bounded finalization allowance — never a
+   *  global TTL raise, never infinite renewal, never unvalidated. */
+  private leaseLifetimeBoundMs(): number {
+    return Math.min(
+      this.ceoTimeoutMs + DRIVER_FINALIZATION_ALLOWANCE_MS,
+      LEASE_MAX_LIFETIME_CAP_MS);
+  }
+
+  /** P15.10-C R1 F1-A: bounded lease heartbeat. Started ONLY after a
+   *  valid claim; every renewal re-proves token/fence/worker-boot
+   *  identity/generation/expiry/policy inside scheduler.renew — the
+   *  heartbeat itself never creates authority. Retryable DB
+   *  contention defers to the next tick; any other failure marks the
+   *  worker unauthorized (it is NEVER assumed the external model call
+   *  stopped). stop() in `finally` guarantees no timer leaks past
+   *  settle/release/exception. */
+  private startHeartbeat(handle: LeaseHandle): {
+    fault: () => unknown;
+    stop: () => void;
+  } {
+    let stopped = false;
+    let lost: unknown = null;
+    const timer = setInterval(() => {
+      if (stopped) return;
+      try {
+        this.deps.scheduler.renew(handle);
+      } catch (e) {
+        if (isSqliteContentionError(e)) return; // retryable — next tick
+        stopped = true;
+        lost = e;
+        clearInterval(timer);
+      }
+    }, this.heartbeatMs);
+    timer.unref();
+    return {
+      fault: () => lost,
+      stop: () => { stopped = true; clearInterval(timer); },
+    };
   }
 
   private instant(): number {
@@ -425,7 +508,8 @@ export class ObjectiveAutoDriverService {
     let handle: LeaseHandle;
     try {
       handle = this.deps.scheduler.claim(
-        objectiveId, this.deps.workerId, this.deps.bootId, opportunity);
+        objectiveId, this.deps.workerId, this.deps.bootId, opportunity,
+        { max_lifetime_ms: this.leaseLifetimeBoundMs() });
     } catch (e) {
       // Claim refusal is never an objective fault — the durable reason
       // (cooldown, race loser, retry exhaustion, roster cap, global
@@ -435,6 +519,10 @@ export class ObjectiveAutoDriverService {
     }
     const opId = `drive-pass:${objectiveId}:${handle.fence}`;
     try {
+      // F1-D: reconcile any STARTED/UNKNOWN CEO attempt the previous
+      // worker left behind BEFORE admitting a new pass — never a
+      // blind re-invocation.
+      this.deps.reconcileStaleAttempts?.(objectiveId);
       this.admit(handle);
     } catch (e) {
       if (e instanceof DriverDenial) {
@@ -453,6 +541,11 @@ export class ObjectiveAutoDriverService {
       return { objective_id: objectiveId, denied: "DRIVER_PASS_FAULT",
         transient: true, fault: faultCode(e) };
     }
+    // F1-A: heartbeat starts only after the valid claim; it stops in
+    // `finally` — never before claim, never past settle/release/fault.
+    const hb = this.heartbeatMs === 0
+      ? { fault: () => null as unknown, stop: () => {} }
+      : this.startHeartbeat(handle);
     let result: OperatingPassResult;
     try {
       result = await this.deps.runPass({
@@ -460,6 +553,13 @@ export class ObjectiveAutoDriverService {
         actor: DRIVER_ACTOR,
         authority_gate: this.authorityGate(handle),
       });
+      // F1-A: a renewal fault means this worker is deemed unauthorized
+      // — the outcome is never settled under a lost lease.
+      const hbFault = hb.fault();
+      if (hbFault !== null) {
+        throw new DriverDenial("DRIVER_AUTHORITY_LOST",
+          `lease heartbeat lost mid-pass: ${faultCode(hbFault)}`, false);
+      }
     } catch (e) {
       // Pass aborted — fail closed. The claimed generation stays
       // unsettled for a later reclaim UNLESS the fault is durable:
@@ -478,6 +578,8 @@ export class ObjectiveAutoDriverService {
         outcome: "FAULT",
         fault: faultCode(e),
       };
+    } finally {
+      hb.stop();
     }
     try {
       this.deps.scheduler.settle(handle, result.outcome, opId);

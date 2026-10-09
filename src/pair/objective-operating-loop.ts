@@ -219,7 +219,8 @@ export class ObjectiveOperatingService {
       if (binding) {
         this.tick(ctx);
         authorityGate?.();
-        const review = await this.deps.review.runReview({ objective_id: objectiveId, actor });
+        const review = await this.deps.review.runReview({ objective_id: objectiveId, actor,
+          autonomous_commit_guard: authorityGate });
         return result("TARGET_MET_CANDIDATE", {
           owner_action_required: true,
           binding_id: String(binding.binding_id),
@@ -235,7 +236,8 @@ export class ObjectiveOperatingService {
       if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
       this.tick(ctx);
       authorityGate?.();
-      const cycle = await this.deps.ceoCycle.runCycle({ objective_id: objectiveId, actor });
+      const cycle = await this.deps.ceoCycle.runCycle({ objective_id: objectiveId, actor,
+        autonomous_commit_guard: authorityGate });
       if (String(cycle.decision.decision_kind) === "WAIT") {
         return result("WAITING_FOR_CEO", { ceo_decision_id: String(cycle.decision.decision_id) });
       }
@@ -337,7 +339,8 @@ export class ObjectiveOperatingService {
       if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
       this.tick(ctx);
       authorityGate?.();
-      const reviewRes = await this.deps.review.runReview({ objective_id: objectiveId, actor });
+      const reviewRes = await this.deps.review.runReview({ objective_id: objectiveId, actor,
+        autonomous_commit_guard: authorityGate });
       const reviewId = String(reviewRes.review.review_id);
       switch (reviewRes.outcome) {
         case "PRIORITIZE_EXISTING": {
@@ -658,7 +661,8 @@ export function createDefaultObjectiveOperatingService(deps: {
   objectives: ObjectiveAuthorityService;
   workstreams: ObjectiveWorkstreamService;
   invoker?: CeoDecisionInvoker;
-}): { service: ObjectiveOperatingService; model_entry_id: string } {
+}): { service: ObjectiveOperatingService; model_entry_id: string;
+  ceoCycle: CeoPlanningCycleService } {
   const { service: ceoCycle, model_entry_id } = createDefaultCeoPlanningCycle({
     store: deps.store,
     business: deps.business,
@@ -692,5 +696,7 @@ export function createDefaultObjectiveOperatingService(deps: {
       allocation,
     }),
     model_entry_id,
+    ceoCycle, // P15.10-C R1 F1-D: lets the driver reconcile STARTED/UNKNOWN
+              // attempts scoped to the objective before any new pass.
   };
 }

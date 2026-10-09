@@ -1278,7 +1278,14 @@ export class ObjectiveAdaptiveReviewService {
    * existing P15.3 CEO cycle → stale gate → ONE atomic commit
    * (receipt + optional strategy revision + anchors). Replay-safe.
    */
-  async runReview(input: { objective_id: string; actor: string }): Promise<ReviewResult> {
+  async runReview(input: {
+    objective_id: string;
+    actor: string;
+    /** P15.10-C R1: forwarded verbatim to ceoCycle.runCycle — the
+     * fenced commit guard fires inside the CEO commit transaction,
+     * so a review-driven cycle gets identical post-await protection. */
+    autonomous_commit_guard?: () => void;
+  }): Promise<ReviewResult> {
     if (typeof input.actor !== "string" || !input.actor.trim() || input.actor.length > 256) {
       throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "adaptive-review.runReview");
     }
@@ -1352,6 +1359,7 @@ export class ObjectiveAdaptiveReviewService {
       // CEO path — the EXISTING P15.3 cycle. Never a second model path.
       const res = await this.deps.ceoCycle.runCycle({
         objective_id: objectiveId, actor,
+        autonomous_commit_guard: input.autonomous_commit_guard,
       });
       decision = res.decision;
       const kind = String(decision.decision_kind);

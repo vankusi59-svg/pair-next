@@ -71,6 +71,7 @@ import {
   modelDiscoveryTimeoutMs,
   llmPlannerTimeoutMs,
   codexPlannerTimeoutMs,
+  ceoCliTimeoutMs,
   codexPlannerPlan,
   assertCodexPlannerCandidateEligibleWithRefresh,
   refreshCodexPlannerQualification,
@@ -458,7 +459,7 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
   // resolving the pass runner must not require it at driver-construction
   // time (mirrors the ceo-cycle route's lazy ceoOps pattern).
   let objectiveCeoOps = null;
-  const objectivePassRunner = (input) => {
+  const resolveObjectiveCeoOps = () => {
     objectiveCeoOps ??= createDefaultObjectiveOperatingService({
       store, business, workforce,
       objectives: business.objectives,
@@ -466,8 +467,15 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
         store, business, workforce, objectives: business.objectives,
       }),
     });
-    return objectiveCeoOps.service.runObjectivePass(input);
+    return objectiveCeoOps;
   };
+  const objectivePassRunner = (input) =>
+    resolveObjectiveCeoOps().service.runObjectivePass(input);
+  // P15.10-C R1 — the CEO invocation timeout bounds the driver's
+  // claim-time lease lifetime (timeout + 60s finalization, ≤960s cap);
+  // the value is env-validated here so a bad PAIR_CEO_CLI_TIMEOUT_MS
+  // fails boot closed rather than binding an unvalidated bound.
+  const objectiveCeoTimeoutMs = ceoCliTimeoutMs();
   objectiveAutoDriver = createObjectiveAutoDriver({
     store,
     objectives: business.objectives,
@@ -481,6 +489,12 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
     workerId: `objective-auto-driver:${process.pid}`,
     bootId: crypto.randomUUID(),
     intervalMs: objectiveDriverMs,
+    ceoTimeoutMs: objectiveCeoTimeoutMs,
+    // F1-D — before each admitted pass, stale STARTED/UNKNOWN CEO
+    // attempts scoped to that objective settle through canonical
+    // recovery; a restart never re-invokes an invocation already made.
+    reconcileStaleAttempts: (objectiveId) =>
+      resolveObjectiveCeoOps().ceoCycle.reconcileStaleAttempts(objectiveId),
     onError: (e) => console.error("objective-auto-driver:", String(e).slice(0, 200)),
   });
   objectiveAutoDriver.runtime.start();

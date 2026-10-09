@@ -1,19 +1,22 @@
 {
-  "claim_id": "P15_10_C_AUTONOMOUS_DRIVER",
-  "title": "P15.10-C: governed autonomous Objective driver — scheduler claim → delegated runObjectivePass → settle, with CAS cost admission and fail-closed delegation",
+  "claim_id": "P15_10_C_R1_HEARTBEAT_FENCED_COMMIT",
+  "title": "P15.10-C R1: lease heartbeat + bounded claim-time lease lifetime + fenced post-await autonomous commit guard (F1 remediation)",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
     "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10c-r1.test.ts",
     "src/__tests__/pair-p15-10c.test.ts",
     "src/__tests__/pair-p15-10b-r1.test.ts",
     "src/__tests__/pair-p15-10b.test.ts",
     "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-3-ceo-planning-cycle.test.ts",
+    "src/__tests__/pair-p15-5-kpi-review.test.ts",
     "src/__tests__/pair-p15-6-objective-operating-loop.test.ts"
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "P15.10-C closes the RECONCILE_ONLY gap left by P15.10-B (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3, the PR #86 merge). Adds src/pair/objective-auto-driver.ts: a bounded production driver that consumes durable wakes through the existing fair-scheduler claim/lease machinery, revalidates the owner's effective auto-policy at every authority boundary (claim, pre-pass admission, and a new optional authority_gate inside runObjectivePass fired before the CEO model call, each review commit, allocation, openWorkItem and delegated-child reconcile write), enforces policy caps (max_ceo_calls, max_missions, budget_microusd_cap incl. in-flight reservation liability, expires_at via evaluate(), retry bound already inside claim()) with CAS pre-spend admission receipts and canonically-derived usage attribution (ceo attempts by started_by, work_open_bindings by created_by, cost_reservation microusd by mission lineage; unbounded/UNKNOWN billing marks cost binding unverified and blocks), honors PAIR_COST_HALT/COST_HALT_FILE, settles every pass through the existing settle()+outcomeContinuation contract, and projects truthful driver readiness into the scheduler status surface (optional injected driver state; default OFF is unchanged). serve-mission-control.mjs wires the driver ONLY under explicit PAIR_OBJECTIVE_AUTO_DRIVER=1 opt-in (driver_ready stays false otherwise); mission-control-server exposes driver status on the existing owner-scoped auto-scheduler route plus a new read-only auto-driver status route. No new CEO engine, no new planner, no direct executor calls, no merge/deploy — driver defaults OFF everywhere."
+  "description": "R1 remediation on the same PR #87 branch (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3): a CEO model invocation can outlive the 60s lease TTL, and nothing revalidated autonomous authority inside the serialized post-await commit transaction. F1-B: scheduler.claim accepts an optional claim-time max_lifetime_ms bound (default 300s = P15.10-B behavior, min 60s, absolute cap 960s) persisted on the lease row and enforced by renew(); TTL stays 60s — never an unconditional raise. F1-A: the driver starts a bounded heartbeat ONLY after a valid claim — setInterval at DRIVER_HEARTBEAT_MS=20_000 (unref'd) calling the existing scheduler.renew(), which re-proves token/fence/worker-boot identity/claimed generation/expiry/policy-owner-terms-objective pins on every renewal; no heartbeat before claim, no lease creation, no DB write inside the 15s no-op window; retryable SQLite contention defers to the next tick while any other renewal fault marks the worker unauthorized (never assumes the external model call stopped) and aborts settlement; the timer is always stopped in `finally` so nothing leaks past settle/release/exception. F1-C: ceoCycle.runCycle accepts optional autonomous_commit_guard invoked FIRST inside the serialized store.immediate commit transaction — before re-observe, decision put, workstream decomposition, and attempt settle — so a revoke/pause/expiry landing mid-invocation rolls the entire commit back and the invoked attempt settles REJECTED through the existing canonical path (accounting preserved, terminal/UNKNOWN recovery semantics intact, no blind replay); runReview forwards it verbatim, pass() wires authorityGate into both CEO boundaries, and manual CEO callers are unchanged. F1-D: driver deps gain ceoTimeoutMs (env-validated 5_000..900_000 → claim bound = timeout+60s finalization allowance, capped 960s) and reconcileStaleAttempts(objectiveId) invoked pre-admission so a restart never re-invokes while an attempt is STARTED/UNKNOWN; serve-mission-control.mjs wires both from ceoCliTimeoutMs() + the lazily-composed default operating service's ceoCycle (createDefaultObjectiveOperatingService now also returns ceoCycle). Two-connection fencing proof: a stale handle cannot renew or settle after a new fence is claimed. No new CEO engine, no merge, no deploy — driver remains opt-in OFF."
 }
