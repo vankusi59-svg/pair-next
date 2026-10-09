@@ -30,6 +30,19 @@ export function Objectives() {
   const [success, setSuccess] = useState("");
   const [selected, setSelected] = useState<CanonicalObjective | null>(null);
   const [cycle, setCycle] = useState<OperatingPassResult | null>(null);
+  // P15.10-A — auto-policy status for the selected objective. Polls
+  // the canonical owner-scoped endpoint; a non-owner gets 403 → the
+  // block renders "unavailable", never guessed state.
+  const policy = useApi(
+    () => (selected ? api.autoPolicyStatus(selected.objective_id) : Promise.resolve(null)),
+    [selected?.objective_id],
+    15000,
+  );
+  const [policyBusy, setPolicyBusy] = useState(false);
+  const [policyErr, setPolicyErr] = useState<string | null>(null);
+  const [polExpires, setPolExpires] = useState("");
+  const [polCeoCalls, setPolCeoCalls] = useState("");
+  const [polMissions, setPolMissions] = useState("");
   const [busy, setBusy] = useState(false);
   const [cycleBusy, setCycleBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -252,6 +265,103 @@ export function Objectives() {
           {(selected.success_conditions ?? []).length > 0 && (
             <p><strong>success:</strong> {(selected.success_conditions ?? []).join(" · ")}</p>
           )}
+
+          <section className="card" style={{ marginTop: 12 }}>
+            <h3>Auto policy (P15.10-A)</h3>
+            {policy.error && (
+              <p className="state muted">auto policy unavailable for this operator.</p>
+            )}
+            {!policy.error && policy.data === null && !policy.loading && (
+              <p className="state muted">auto policy status unavailable.</p>
+            )}
+            {!policy.error && policy.data && (() => {
+              const ap = policy.data.auto_policy;
+              const act = async (action: string, limits?: import("../types").AutoPolicyStatus["limits"], haltReason?: string) => {
+                setPolicyBusy(true); setPolicyErr(null);
+                try {
+                  await api.autoPolicyControl(selected.objective_id, {
+                    action,
+                    policy_version: ap.configured ? (ap.policy_version ?? undefined) : undefined,
+                    limits,
+                    idempotency_key: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                    halt_reason: haltReason,
+                  });
+                  policy.reload();
+                } catch (e) { setPolicyErr(e instanceof Error ? e.message : String(e)); }
+                finally { setPolicyBusy(false); }
+              };
+              const caps = ap.limits
+                ? [
+                    ap.limits.max_ceo_calls != null ? `ceo≤${ap.limits.max_ceo_calls}` : null,
+                    ap.limits.max_missions != null ? `missions≤${ap.limits.max_missions}` : null,
+                    ap.limits.budget_microusd_cap != null ? `µusd≤${ap.limits.budget_microusd_cap}` : null,
+                    ap.limits.max_retries != null ? `retries≤${ap.limits.max_retries}` : null,
+                  ].filter(Boolean).join(" ")
+                : "";
+              const canConfigure = ap.state === "DISABLED" || ap.state === "EXPIRED";
+              return (
+                <>
+                  <p className="muted mono">
+                    state {ap.state} · effective {String(ap.effective)}
+                    {ap.policy_version != null ? ` · v${ap.policy_version}` : ""}
+                    {ap.expires_at ? ` · expires ${String(ap.expires_at)}` : ""}
+                  </p>
+                  {caps && <p className="muted mono">limits: {caps}</p>}
+                  {ap.reasons.length > 0 && (
+                    <p className="muted">reasons: {ap.reasons.join(", ")}</p>
+                  )}
+                  {ap.halt && (
+                    <p className="state">HALTED by {ap.halt.actor} at {ap.halt.at} — {ap.halt.reason}</p>
+                  )}
+                  <p className="muted">
+                    driver: {ap.driver_ready ? "integrated" : "not integrated"}
+                    {" "}— policy configured does not mean autonomous CEO runs.
+                  </p>
+                  {canConfigure && (
+                    <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+                      <input type="datetime-local" value={polExpires} onChange={(e) => setPolExpires(e.target.value)} />
+                      <input placeholder="max CEO calls" value={polCeoCalls} onChange={(e) => setPolCeoCalls(e.target.value)} style={{ width: 110 }} />
+                      <input placeholder="max missions" value={polMissions} onChange={(e) => setPolMissions(e.target.value)} style={{ width: 110 }} />
+                      <button
+                        disabled={policyBusy}
+                        onClick={() => {
+                          const limits: Record<string, unknown> = {};
+                          if (polExpires) limits.expires_at = new Date(polExpires).toISOString();
+                          if (polCeoCalls.trim()) limits.max_ceo_calls = Number(polCeoCalls);
+                          if (polMissions.trim()) limits.max_missions = Number(polMissions);
+                          void act("configure", limits as never);
+                        }}
+                      >configure</button>
+                    </div>
+                  )}
+                  <div className="row" style={{ marginTop: 8 }}>
+                    {ap.state === "DISABLED" && ap.configured && ap.limits && (
+                      <button disabled={policyBusy} onClick={() => void act("enable")}>enable</button>
+                    )}
+                    {ap.state === "ENABLED" && (
+                      <button disabled={policyBusy} onClick={() => void act("pause")}>pause</button>
+                    )}
+                    {ap.state === "PAUSED" && (
+                      <button disabled={policyBusy} onClick={() => void act("resume")}>resume</button>
+                    )}
+                    {(ap.state === "ENABLED" || ap.state === "PAUSED" || ap.state === "HALTED") && (
+                      <>
+                        <button disabled={policyBusy} onClick={() => void act("disable")}>disable</button>
+                        <button disabled={policyBusy} onClick={() => void act("revoke")}>revoke</button>
+                      </>
+                    )}
+                    {(ap.state === "ENABLED" || ap.state === "PAUSED") && (
+                      <button disabled={policyBusy} onClick={() => void act("halt", undefined, "operator halt from Objectives UI")}>halt</button>
+                    )}
+                    {ap.state === "HALTED" && (
+                      <button disabled={policyBusy} onClick={() => void act("reset_halt")}>reset halt</button>
+                    )}
+                  </div>
+                  {policyErr && <p className="state">{policyErr}</p>}
+                </>
+              );
+            })()}
+          </section>
 
           <div className="row">
             <button disabled={cycleBusy} onClick={runCycle}>

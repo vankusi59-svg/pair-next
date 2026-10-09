@@ -1,10 +1,14 @@
 {
-  "claim_id": "DEV_VERIFICATION_HARNESS_V1",
-  "title": "Deterministic repo-local development verification harness: classify/risk/claim/invariants/packs -> tsc/build -> report",
-  "affected_surfaces": ["DEV_INFRA"],
+  "claim_id": "P15_10_A_AUTO_POLICY",
+  "title": "Objective auto-policy authority (P15.10-A): owner opt-in control plane, finite limits, transitions+receipts, kill-scope OBJECTIVE; no driver",
+  "affected_surfaces": [
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "UI"
+  ],
   "required_tests": [
-    "src/__tests__/dev-verification.test.ts"
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts"
   ],
   "invariants": [],
-  "description": "Adds npm run verify:change -- --base <sha>: deterministic change classification into PAIR surfaces, HIGH/MEDIUM/LOW risk rules, a permanent invariant registry (~11) mapped to existing tests, patch-claim manifest enforcement (required tests must exist and pass — mandatory on any non-empty diff since R1), module test-pack selection, tsc/build gates, and a deterministic .pair-verification/report.md|json verdict. R1 hardening: per-invocation result paths (no stale JSON reuse), zero-executed-test and unaccounted-exit fail closed, scripts/ unknown files classify conservatively HIGH, mission-control/telegram runtime seams are HIGH. No CI, no server, no LLM judgment, no production-authority change."
+  "description": "Adds objective_auto_policy authority (owner-scoped, CAS-versioned, event-anchored): default OFF incl. legacy, finite limits required (expires_at+>=1 cap), transitions DISABLED/ENABLED/PAUSED/REVOKED/EXPIRED/HALTED with idempotent convergent retries, terms_digest_binding = objective_digest invalidation on amend/owner change, lazy EXPIRED, OBJECTIVE-scope halt+reset only (no business/global authority seam). evaluate() re-proves binding live and always reports driver_ready:false + missing AUTO_DRIVER_NOT_INTEGRATED/COST_BINDING_UNVERIFIED. API: owner-only GET/POST /api/vnext/objectives/:id/auto-policy with header-only actor. UI: Objectives page auto-policy block, no optimistic state. Cost lineage: no cost binding written in A; enforcement deferred to B/C. No model/executor/mission/Telegram calls anywhere in the change."
 }
