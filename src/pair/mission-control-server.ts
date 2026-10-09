@@ -29,6 +29,7 @@ import type { TelegramConversationService } from "./telegram-conversation.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import type { ObjectiveAutoScheduler } from "./objective-auto-scheduler.js";
+import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
 import {
   createDefaultObjectiveOperatingService,
   type ObjectiveOperatingService,
@@ -101,6 +102,12 @@ export interface MissionControlServerDeps {
   store?: PairEvidenceStore;
   /** P15.10-B owner-scoped RECONCILE_ONLY scheduler projection. */
   autoScheduler?: ObjectiveAutoScheduler;
+  /** P15.10-C — the production autonomous driver. Present ONLY when
+   *  the deployment explicitly opted in (PAIR_OBJECTIVE_AUTO_DRIVER=1
+   *  in the serve script); absent → scheduler status keeps reporting
+   *  driver_ready:false and the auto-driver route 404s. Read-only
+   *  surface — no mutating driver route exists. */
+  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "driverStatus" | "readiness">;
   /** TEST-ONLY: deterministic CEO decision transport for the
    *  lazily-composed operating service. Production bootstrap never
    *  sets it (the route resolves the real codex-cli model); HTTP
@@ -1246,8 +1253,36 @@ export function createMissionControlServer(
         const schedulerActor = rawSchedulerActor.startsWith("operator:")
           ? rawSchedulerActor
           : `operator:${rawSchedulerActor}`;
+        // P15.10-C R3 F3 — readiness is the driver's OWN truthful
+        // proof for THIS objective, not a deployment flag.
+        const r = deps.autoDriver?.readiness(m[1]!, schedulerActor);
         return void json(res, 200, {
-          auto_scheduler: deps.autoScheduler.status(m[1]!, schedulerActor),
+          auto_scheduler: deps.autoScheduler.status(m[1]!, schedulerActor,
+            deps.autoDriver
+              ? { enabled: true, driver_missing: [],
+                  runnable: r?.objective_runnable === true,
+                  reasons: (r?.reasons as string[] | undefined) ?? [] }
+              : undefined),
+        });
+      }
+      // ----- P15.10-C — owner-scoped autonomous driver status (read-only) -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-driver$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.autoDriver) {
+          return void json(res, 404, { error: "AUTO_DRIVER_DISABLED" });
+        }
+        const rawDriverActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawDriverActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        // Owner-scope proof runs inside the same owner revalidation
+        // the auto-policy status route enforces — a non-owner actor
+        // fails closed there before any driver state is read.
+        const driverActor = rawDriverActor.startsWith("operator:")
+          ? rawDriverActor
+          : `operator:${rawDriverActor}`;
+        return void json(res, 200, {
+          auto_driver: deps.autoDriver.status(m[1]!, driverActor),
         });
       }
       // ----- P15.10-A — objective auto-policy control plane -----
@@ -1268,9 +1303,23 @@ export function createMissionControlServer(
           ? rawPolicyActor
           : `operator:${rawPolicyActor}`;
         autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
+        // P15.10-C R3 F3 — truthful readiness: the driver's own
+        // canonical proof for this objective (scheduler READY + policy
+        // effective + no quarantine + provable cost binding + budget
+        // room), never just "a driver process exists".
+        const policyObjectiveId = m[1]!;
+        const policyWithDriver = (st: ReturnType<ObjectiveAutoPolicyService["status"]>) => {
+          if (!deps.autoDriver) return st;
+          const r = deps.autoDriver.readiness(policyObjectiveId, policyActor);
+          return { ...st,
+            driver_ready: r.objective_runnable === true,
+            objective_runnable: r.objective_runnable === true,
+            driver_integrated: true,
+            driver_missing: ((r.reasons as string[] | undefined) ?? []) };
+        };
         if (method === "GET") {
           return void json(res, 200, {
-            auto_policy: autoPolicySvc.status(m[1]!, policyActor),
+            auto_policy: policyWithDriver(autoPolicySvc.status(m[1]!, policyActor)),
           });
         }
         // F3 — strict boundary typing: NO coercion of authority fields.
@@ -1288,7 +1337,7 @@ export function createMissionControlServer(
           return void json(res, 400, { error: "FAIL_CLOSED_POLICY_SCHEMA" });
         }
         return void json(res, 200, {
-          auto_policy: autoPolicySvc.control({
+          auto_policy: policyWithDriver(autoPolicySvc.control({
             objective_id: m[1]!,
             actor: policyActor,
             action: body.action as string,
@@ -1297,7 +1346,7 @@ export function createMissionControlServer(
             idempotency_key: body.idempotency_key as string,
             halt_scope: body.halt_scope,
             halt_reason: body.halt_reason,
-          }),
+          })),
         });
       }
       if (method === "GET" && p === "/api/budgets") {

@@ -78,9 +78,14 @@ const SAFE_FAULT_CODES = new Set<string>([
   "FAIL_CLOSED_ASYNC_READ_BUDGET",
 ]);
 
-/** Fixed classification labels — the complete durable fault vocabulary. */
+/** Fixed classification labels — the complete durable fault vocabulary.
+ *  P15.10-C adds the DRIVER_* labels the production driver's typed
+ *  denials produce (still a closed set — raw error text and arbitrary
+ *  error.code values can never persist). */
 const FAULT_LABELS = new Set<string>([
   "SQLITE_CONTENTION", "NOT_FOUND", "INTEGRITY_FAULT", "UNEXPECTED_FAULT",
+  "DRIVER_CAP_EXHAUSTED", "DRIVER_COST_UNVERIFIED", "DRIVER_COST_HALTED",
+  "DRIVER_AUTHORITY_LOST", "DRIVER_PASS_FAULT", "DRIVER_ADMISSION_DENIED",
 ]);
 
 /** Typed, bounded fault label for durable state. Raw exception text and
@@ -118,8 +123,16 @@ type Lease = Row & {
   worker_id: string | null; boot_id: string | null; expires_at: number | null;
   renewed_at: number | null; claimed_generation: number; checkpoint_digest: string;
   policy_version: number; terms_digest: string; objective_version: number;
-  owner_authority_id: string;
+  owner_authority_id: string; max_lifetime_ms?: number;
 };
+
+/** P15.10-C R1: claim-time lease lifetime bounds. The default preserves
+ * P15.10-B behavior (300s); consumers bound it to their awaited work
+ * (e.g. driver CEO timeout + finalization allowance) at claim, never
+ * beyond an absolute cap. TTL stays 60s regardless — only lifetime moves. */
+export const LEASE_MAX_LIFETIME_CAP_MS = 960_000;
+export const LEASE_MAX_LIFETIME_DEFAULT_MS = 300_000;
+export const LEASE_MAX_LIFETIME_MIN_MS = 60_000;
 export type LeaseHandle = {
   objective_id: string; worker_id: string; boot_id: string; token: string;
   fence: number; claimed_generation: number; checkpoint_digest: string;
@@ -218,6 +231,56 @@ export class ObjectiveAutoScheduler {
     return { row, status };
   }
 
+  /** P15.10-C R4 F3 — the canonical per-objective claim predicate.
+   *  claim() and the readiness projection share THIS evaluation so a
+   *  status read can never drift from what a real claim enforces.
+   *  Returns the typed ineligibility reason, or null when the queue
+   *  alone would permit a claim attempt right now. */
+  private queueEligibility(q: Queue | null): string | null {
+    if (!q) return "NO_QUEUE";
+    if (q.queue_state !== "WAITING_CONSUMER") return `QUEUE_${q.queue_state}`;
+    if (q.pending_generation <= q.claimed_generation &&
+        q.claimed_generation <= q.settled_generation) {
+      return "NO_PENDING_GENERATION";
+    }
+    if (q.next_due !== null && q.next_due > this.instant()) return "NOT_DUE_YET";
+    if (Number(q.last_attempt_at ?? -30_000) + 30_000 > this.instant()) {
+      return "ATTEMPT_COOLDOWN";
+    }
+    return null;
+  }
+
+  /** Read-only canonical claim-eligibility proof: the same queue
+   *  predicate claim() enforces, plus the objective-level authority and
+   *  lease conditions a real claim requires. Global contention checks
+   *  (roster cap, rate window) stay in claim() — they are transient,
+   *  never an objective-readiness fact. Never mutates: no wake, no
+   *  lease, no invalidation. */
+  claimable(objectiveId: string): { eligible: boolean; reason: string | null } {
+    return this.proof(() => {
+      const q = this.queue(objectiveId);
+      const qr = this.queueEligibility(q);
+      if (qr !== null) return { eligible: false, reason: qr };
+      const a = this.authority(objectiveId);
+      if (!a.status.configured || !a.status.effective) {
+        return { eligible: false, reason: "POLICY_NOT_EFFECTIVE" };
+      }
+      if (!a.status.terms_current ||
+          a.status.policy_version !== q!.policy_version ||
+          a.status.terms_digest_binding !== q!.terms_digest ||
+          a.status.owner_authority_id !== q!.owner_authority_id ||
+          a.status.business_id !== q!.business_id ||
+          Number(a.row.version) !== q!.objective_version) {
+        return { eligible: false, reason: "STALE_BINDING" };
+      }
+      const prior = this.lease(objectiveId);
+      if (prior?.state === "ACTIVE" && Number(prior.expires_at) > this.instant()) {
+        return { eligible: false, reason: "LEASE_HELD" };
+      }
+      return { eligible: true, reason: null };
+    });
+  }
+
   private queue(objectiveId: string): Queue | null {
     return readSchedulerRow<Queue>(this.store, WAKE_STATE, objectiveId);
   }
@@ -237,16 +300,34 @@ export class ObjectiveAutoScheduler {
     }
   }
 
-  status(objectiveId: string, actor: string): Record<string, unknown> {
+  status(objectiveId: string, actor: string,
+    driver?: {
+      enabled: boolean; driver_missing: string[];
+      /** P15.10-C R3 F3 — optional truthful per-objective runnable
+       *  proof from the wired driver's readiness(). When absent the
+       *  projection stays deployment-level honest: integrated but
+       *  runnable unproven. */
+      runnable?: boolean; reasons?: string[];
+    },
+  ): Record<string, unknown> {
     return this.proof(() => {
       const status = this.policy.status(objectiveId, actor);
       const q = this.queue(objectiveId);
       const lease = this.lease(objectiveId);
       const cursor = readSchedulerRow<Row>(this.store, SCHEDULER_CURSOR, GLOBAL);
+      const integrated = driver?.enabled === true;
+      const runnable = integrated && driver?.runnable === true;
       return {
         objective_id: objectiveId, scheduler_mode: OBJECTIVE_SCHEDULER_MODE,
         scheduler_ready: cursor ? cursor.health === "READY" : false,
-        consumer_ready: false, driver_ready: false, driver_missing: status.driver_missing,
+        // Deployment integration vs objective-level runnable truth —
+        // READY is only claimed when canonical evidence proves both.
+        driver_integrated: integrated,
+        consumer_ready: runnable, driver_ready: runnable,
+        objective_runnable: runnable,
+        driver_missing: integrated
+          ? (driver?.reasons ?? [])
+          : (driver?.driver_missing ?? status.driver_missing),
         policy_effective: status.effective, policy_version: status.policy_version,
         terms_current: status.terms_current,
         queue_state: q?.queue_state ?? "UNREGISTERED",
@@ -638,19 +719,21 @@ export class ObjectiveAutoScheduler {
   }
 
   /** Test-only preparation contract. This does not call the operating loop. */
-  claim(objectiveId: string, workerId: string, bootId: string, opportunity: string): LeaseHandle {
+  claim(objectiveId: string, workerId: string, bootId: string, opportunity: string,
+      opts?: { max_lifetime_ms?: number }): LeaseHandle {
     const result = this.proof(() => {
       if (!workerId || workerId.length > 128 || !bootId || bootId.length > 128 ||
           !opportunity || opportunity.length > 128) invalid("invalid worker/opportunity");
-      const q = this.queue(objectiveId);
-      if (!q || q.queue_state !== "WAITING_CONSUMER" ||
-          (q.pending_generation <= q.claimed_generation && q.claimed_generation <= q.settled_generation) ||
-          (q.next_due !== null && q.next_due > this.instant()) ||
-          (Number(q.last_attempt_at ?? -30_000) + 30_000 > this.instant())) {
+      const maxLifetime = opts?.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS;
+      if (!Number.isFinite(maxLifetime) || maxLifetime < LEASE_MAX_LIFETIME_MIN_MS ||
+          maxLifetime > LEASE_MAX_LIFETIME_CAP_MS) invalid("invalid max lease lifetime bound");
+      const qRaw = this.queue(objectiveId);
+      if (this.queueEligibility(qRaw) !== null) {
         invalid("no pending eligible wake or attempt cooling down");
       }
+      const q = qRaw!;
       const a = this.authority(objectiveId);
-      this.requireCurrent(q, a);
+      this.requireCurrent(q!, a);
       const { f, active } = this.activeRoster();
       if (active.length >= MAX_ACTIVE || active.includes(objectiveId)) invalid("global/Objective lease cap");
       const rateWindowStart = Number(f.rate_window_start ?? 0);
@@ -676,7 +759,7 @@ export class ObjectiveAutoScheduler {
         objective_id: objectiveId, state: "ACTIVE", fence,
         token_hash: digest(token), worker_id: workerId, boot_id: bootId,
         expires_at: this.instant() + 60_000, renewed_at: this.instant(),
-        started_at: this.instant(),
+        started_at: this.instant(), max_lifetime_ms: maxLifetime,
         claimed_generation: q.pending_generation, checkpoint_digest: q.checkpoint_digest,
         policy_version: q.policy_version, terms_digest: q.terms_digest,
         owner_authority_id: q.owner_authority_id, objective_version: q.objective_version,
@@ -712,6 +795,13 @@ export class ObjectiveAutoScheduler {
         lease.claimed_generation !== handle.claimed_generation ||
         lease.checkpoint_digest !== handle.checkpoint_digest ||
         Number(lease.expires_at) <= this.instant()) invalid("stale lease fence/expiry");
+    // P15.10-C R2 F1.3: absolute lifetime is a canonical validation
+    // boundary, not just a renew-time hint — past the claim-time bound
+    // the lease cannot authorize ANY mutation (renew/settle/assert).
+    const maxLifetime = Number(lease.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS);
+    if (Number(lease.started_at) + maxLifetime <= this.instant()) {
+      invalid("stale lease lifetime");
+    }
     const a = this.authority(handle.objective_id);
     this.requireCurrent(q, a);
     if (lease.policy_version !== a.status.policy_version ||
@@ -721,13 +811,30 @@ export class ObjectiveAutoScheduler {
     return { q, lease };
   }
 
+  /** P15.10-C R2: narrow read-only authority assertion — the SINGLE
+   *  lease/fence/binding proof other components (driver commit guard)
+   *  may invoke. Re-validates state, fence, worker/boot identity,
+   *  token digest, claimed generation, checkpoint, expiry, absolute
+   *  lifetime, policy version, terms digest, owner and objective
+   *  version through the existing currentLease path — never a second
+   *  validator. */
+  assertLeaseAuthority(handle: LeaseHandle): void {
+    this.proof(() => { this.currentLease(handle); });
+  }
+
   renew(handle: LeaseHandle): void {
     this.proof(() => {
       const { lease } = this.currentLease(handle);
-      if (Number(lease.started_at) + 300_000 < this.instant()) invalid("max lease lifetime");
+      const maxLifetime = Number(lease.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS);
+      // F1.3: the lifetime check already ran inside currentLease; the
+      // renewed expiry is additionally CLAMPED at the absolute deadline
+      // so a lease can never outlive its bound between validations.
       if (Number(lease.renewed_at) + 15_000 > this.instant()) return;
       writeSchedulerRow(this.store, LEASE_STATE, handle.objective_id, {
-        ...fields(lease), renewed_at: this.instant(), expires_at: this.instant() + 60_000,
+        ...fields(lease), renewed_at: this.instant(),
+        expires_at: Math.min(
+          this.instant() + 60_000,
+          Number(lease.started_at) + maxLifetime),
       }, "RENEW", `renew:${handle.fence}:${this.instant()}`);
       writeSchedulerRow(this.store, SCHEDULER_RECEIPT,
         `renew:${handle.objective_id}:${handle.fence}:${this.instant()}`, {

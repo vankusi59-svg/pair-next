@@ -1278,7 +1278,14 @@ export class ObjectiveAdaptiveReviewService {
    * existing P15.3 CEO cycle → stale gate → ONE atomic commit
    * (receipt + optional strategy revision + anchors). Replay-safe.
    */
-  async runReview(input: { objective_id: string; actor: string }): Promise<ReviewResult> {
+  async runReview(input: {
+    objective_id: string;
+    actor: string;
+    /** P15.10-C R1: forwarded verbatim to ceoCycle.runCycle — the
+     * fenced commit guard fires inside the CEO commit transaction,
+     * so a review-driven cycle gets identical post-await protection. */
+    autonomous_commit_guard?: () => void;
+  }): Promise<ReviewResult> {
     if (typeof input.actor !== "string" || !input.actor.trim() || input.actor.length > 256) {
       throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "adaptive-review.runReview");
     }
@@ -1352,6 +1359,7 @@ export class ObjectiveAdaptiveReviewService {
       // CEO path — the EXISTING P15.3 cycle. Never a second model path.
       const res = await this.deps.ceoCycle.runCycle({
         objective_id: objectiveId, actor,
+        autonomous_commit_guard: input.autonomous_commit_guard,
       });
       decision = res.decision;
       const kind = String(decision.decision_kind);
@@ -1376,12 +1384,17 @@ export class ObjectiveAdaptiveReviewService {
     }
 
     return this.commitReview(
-      objectiveId, actor, reviewId, obsDigest, observation, outcome, decision);
+      objectiveId, actor, reviewId, obsDigest, observation, outcome, decision,
+      input.autonomous_commit_guard);
   }
 
   /** ONE serializing transaction: replay check → stale gate → receipt
    *  → optional strategy revision → immutable anchors. Anything that
-   *  throws rolls the whole authority chain back (§17). */
+   *  throws rolls the whole authority chain back (§17). The optional
+   *  autonomous commit guard fires FIRST inside the transaction so a
+   *  revoke landing between the CEO decision commit and this review
+   *  commit rolls back every review side effect (receipt + strategy
+   *  revision + anchors) — P15.10-C R2 F1.2. */
   private commitReview(
     objectiveId: string,
     actor: string,
@@ -1390,8 +1403,10 @@ export class ObjectiveAdaptiveReviewService {
     observation: ReviewObservation,
     outcome: ReviewOutcome,
     decision: Row | null,
+    autonomousCommitGuard?: () => void,
   ): ReviewResult {
     return this.store.immediate(() => {
+      autonomousCommitGuard?.();
       const cur = this.store.tryGet(OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, reviewId) as Row | null;
       if (cur) {
         // Concurrent winner committed the same canonical observation —

@@ -95,3 +95,4 @@ export * from "./telegram-conversation.js";
 export * from "./objective-auto-scheduler.js";
 export * from "./objective-auto-wakeup.js";
 export * from "./objective-auto-policy.js";
+export * from "./objective-auto-driver.js";
