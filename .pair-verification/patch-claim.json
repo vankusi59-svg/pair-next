@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_10_B_R1_AUDIT_REMEDIATION",
-  "title": "P15.10-B R1: remediate four audited findings — durable blocked dispositions, canonical wake binding, idle-write elimination, typed fault persistence; production stays RECONCILE_ONLY",
+  "claim_id": "P15_10_B_R2_F4_SECURITY_CLOSURE",
+  "title": "P15.10-B R2: close residual F4 hole — faultCode/sanitizeFaultReason exact allowlists; production stays RECONCILE_ONLY",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
@@ -13,5 +13,5 @@
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "Independent-audit remediation on PR #86 (audited HEAD 3b3d1dfccb17fd507fd3c9f4173a484e64068cff, BASE 88cdf85b99080b5b2da9dda13c9fae5154108c70). All four findings reproduced with executable tests before patching (5/6 new tests failed prepatch). F1: intake cursor no longer advances past events lacking a durable disposition — retryable faults (SQLITE contention, read-budget exhaustion, unexpected errors) stop the page at the last durable event and replay next tick; permanent faults write a deterministic intake-blocked SCHEDULER_RECEIPT plus best-effort sanitized quarantine. F2: accountWake now requires a WakeBinding whose canonical chain is re-verified hop-by-hop at write time (objective/auto_policy/objective_ref/work_item/agent/mission/approval); forged cross-objective sources fail closed, legitimate indirect Mission/Work-Item/Approval sources remain. Also completes the whitelist: objective_strategy_revision events now resolve (previously silently skipped). F3: reconcile/due progress rows persist only on real position changes or anomalies — idle ticks append zero scheduler commits. F4: durable state stores only typed fault codes (markDegraded last_error, quarantine blocked_reason); raw exception text never persists. Production wiring remains RECONCILE_ONLY: no consumer, no claim loop, no CEO/model/planner/controller/executor calls, no missions, no Telegram; driver_ready/consumer_ready false; COST_BINDING_UNVERIFIED deferred to P15.10-C. No merge/deploy."
+  "description": "R2 independent-audit remediation on PR #86 (audited HEAD 160907e0cd7eb12a53ff896a3d05cb313ea3e2a3, BASE 88cdf85b99080b5b2da9dda13c9fae5154108c70). Residual F4 finding reproduced with 3 adversarial tests before patching (3/3 failed prepatch): error.code values like FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE and uppercase reasons like SECRET_XYZ_CANARY passed the shape regex and persisted verbatim. faultCode now admits only an exact allowlist of internal codes (the five FAIL_CLOSED_* codes this module produces/classifies on) and otherwise returns a fixed classification label (SQLITE_CONTENTION/NOT_FOUND/INTEGRITY_FAULT/UNEXPECTED_FAULT); regex/prefix/namespace checks are no longer used as trust proof. sanitizeFaultReason admits only allowlisted codes or classification labels, else UNSPECIFIED_FAULT. Retry classification (retryableFault reads the original error.code directly), F1 durable cursor/replay, F2 canonical WakeBinding, F3 idle-write elimination, lease/CAS/fairness and production RECONCILE_ONLY are unchanged. No merge/deploy."
 }

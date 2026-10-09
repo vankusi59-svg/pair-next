@@ -65,24 +65,43 @@ export type WakeBinding =
   | { kind: "approval"; allocation_id: string; mission_id: string;
       open_id: string; work_item_id: string };
 
-const FAULT_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,63}$/;
-/** Typed, bounded fault label for durable state. Raw exception text is
- * untrusted and may carry secrets/canaries — never persist it. */
+/** Exact allowlist of internal fault codes that may persist verbatim.
+ * error.code is attacker-controlled: a shape check (regex, prefix or
+ * namespace) is not proof of trust, so only codes this module actually
+ * produces or classifies on are admitted; everything else collapses to a
+ * fixed classification label below. */
+const SAFE_FAULT_CODES = new Set<string>([
+  "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF",
+  "FAIL_CLOSED_OBJECTIVE_WAKEUP",
+  "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT",
+  "FAIL_CLOSED_READ_BUDGET_SCHEMA",
+  "FAIL_CLOSED_ASYNC_READ_BUDGET",
+]);
+
+/** Fixed classification labels — the complete durable fault vocabulary. */
+const FAULT_LABELS = new Set<string>([
+  "SQLITE_CONTENTION", "NOT_FOUND", "INTEGRITY_FAULT", "UNEXPECTED_FAULT",
+]);
+
+/** Typed, bounded fault label for durable state. Raw exception text and
+ * arbitrary error.code values are untrusted and may carry
+ * secrets/canaries — never persist them. */
 export function faultCode(e: unknown): string {
   const code = String((e as { code?: unknown } | null | undefined)?.code ?? "");
-  if (FAULT_CODE_PATTERN.test(code)) return code;
+  if (SAFE_FAULT_CODES.has(code)) return code;
   if (isSqliteContentionError(e)) return "SQLITE_CONTENTION";
   if (e instanceof NotFoundError) return "NOT_FOUND";
   if (e instanceof IntegrityError) return "INTEGRITY_FAULT";
   return "UNEXPECTED_FAULT";
 }
 
-const SAFE_REASON_PATTERN = /^[A-Z0-9_,:.\-]{1,256}$/;
-/** Durable reason fields only carry enum-style codes. Anything else —
- * including raw error strings — collapses to a fixed label. */
+/** Durable reason fields only carry allowlisted codes. Anything else —
+ * including raw error strings or forged uppercase tokens — collapses to a
+ * fixed label. */
 export function sanitizeFaultReason(reason: unknown): string {
   const text = String(reason ?? "");
-  return SAFE_REASON_PATTERN.test(text) ? text : "UNSPECIFIED_FAULT";
+  if (SAFE_FAULT_CODES.has(text) || FAULT_LABELS.has(text)) return text;
+  return "UNSPECIFIED_FAULT";
 }
 
 type Queue = Row & {

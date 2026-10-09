@@ -16,7 +16,7 @@ import {
   WAKE_STATE,
   digest,
 } from "../pair/index.js";
-import { IntegrityError } from "../pair/errors.js";
+import { IntegrityError, NotFoundError } from "../pair/errors.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p1510b-r1-"));
 const OP = "1882810918";
@@ -216,5 +216,81 @@ describe("P15.10-B R1 — audit remediation", () => {
     expect(String(lease.state)).toBe("ACTIVE");
     expect(String(lease.worker_id)).toBe("w1");
     store2.close();
+  });
+});
+
+describe("P15.10-B R2 — F4 security closure", () => {
+  it("R2-F4a forged error.code collapses to a fixed label in durable state", () => {
+    const s = fresh("r2f4a");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o));
+    s.wakeup.intakePage();
+    // markDegraded cursor path — an attacker-controlled uppercase code that
+    // passes the shape regex must never persist verbatim.
+    s.wakeup.markDegraded(Object.assign(new Error("x"),
+      { code: "FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE" }));
+    const cursor = s.store.tryGet(SCHEDULER_CURSOR, "LOCAL_PAIR_DB") as
+      Record<string, unknown>;
+    expect(String(cursor.last_error)).toBe("UNEXPECTED_FAULT");
+    expect(JSON.stringify(cursor)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    // intake blocked-receipt path — a permanent fault carrying the forged
+    // code must persist a fixed label in the receipt and the queue row.
+    const evId = s.store.event({ entity_type: "objective", entity_id: oid(o),
+      event_type: "OBJECTIVE_STATUS", actor: OWNER });
+    const sched = s.scheduler as unknown as
+      { accountWake: (i: unknown) => unknown };
+    sched.accountWake = () => {
+      throw new IntegrityError("FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE", "x");
+    };
+    const res = s.wakeup.intakePage();
+    expect(res.blocked).toBe(1);
+    const receipt = s.store.tryGet(SCHEDULER_RECEIPT,
+      `intake-blocked:${evId}:${oid(o)}`) as Record<string, unknown>;
+    expect(receipt).toBeTruthy();
+    expect(String(receipt.fault)).toBe("INTEGRITY_FAULT");
+    expect(JSON.stringify(receipt)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    const q = s.store.tryGet(WAKE_STATE, oid(o)) as Record<string, unknown>;
+    expect(String(q.queue_state)).toBe("QUARANTINED");
+    expect(String(q.blocked_reason)).toBe("INTEGRITY_FAULT");
+    expect(JSON.stringify(q)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+  });
+
+  it("R2-F4b uppercase reason cannot bypass sanitizeFaultReason", () => {
+    const s = fresh("r2f4b");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o));
+    s.scheduler.quarantine(oid(o), "SECRET_XYZ_CANARY");
+    const q = s.store.tryGet(WAKE_STATE, oid(o)) as Record<string, unknown>;
+    expect(String(q.queue_state)).toBe("QUARANTINED");
+    expect(String(q.blocked_reason)).not.toContain("SECRET");
+    expect(String(q.blocked_reason)).toBe("UNSPECIFIED_FAULT");
+  });
+
+  it("R2-F4c legitimate faults keep classification labels; unknown faults never persist raw payloads", () => {
+    const s = fresh("r2f4c");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o));
+    s.wakeup.intakePage();
+    const lastError = () => String((s.store.tryGet(SCHEDULER_CURSOR,
+      "LOCAL_PAIR_DB") as Record<string, unknown>).last_error);
+    // SQLite contention → fixed contention label (retry classification is
+    // exercised end-to-end by R1-F1a replay, re-run in this same suite).
+    s.wakeup.markDegraded(Object.assign(new Error("database is locked"),
+      { code: "SQLITE_BUSY" }));
+    expect(lastError()).toBe("SQLITE_CONTENTION");
+    // Allowlisted canonical read-budget code survives verbatim.
+    s.wakeup.markDegraded(
+      new IntegrityError("FAIL_CLOSED_READ_BUDGET_SCHEMA", "x"));
+    expect(lastError()).toBe("FAIL_CLOSED_READ_BUDGET_SCHEMA");
+    // Genuine integrity faults collapse to the fixed integrity label.
+    s.wakeup.markDegraded(
+      new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", "x"));
+    expect(lastError()).toBe("INTEGRITY_FAULT");
+    s.wakeup.markDegraded(new NotFoundError("secret=CANARY_F4C"));
+    expect(lastError()).toBe("NOT_FOUND");
+    // Unknown errors persist the generic label — never raw payloads.
+    s.wakeup.markDegraded(new Error("boom apikey=CANARY_F4C"));
+    expect(lastError()).toBe("UNEXPECTED_FAULT");
+    expect(lastError()).not.toContain("CANARY");
   });
 });
