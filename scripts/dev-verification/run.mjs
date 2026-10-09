@@ -192,7 +192,10 @@ function runFullSuite(exec, root = ROOT) {
   const failedNames = [];
   let knownBaseline = 0;
   for (const tr of results?.testResults ?? []) {
-    const tol = TOLERATED_FAILURES.filter((t) => tr.name === t.file);
+    // vitest reports absolute paths in testResults[].name — match the
+    // registered relative file by suffix.
+    const tol = TOLERATED_FAILURES.filter((t) =>
+      tr.name === t.file || String(tr.name).endsWith(`/${t.file}`));
     for (const a of tr.assertionResults ?? []) {
       if (a.status !== "failed") continue;
       const nm = `${a.title ?? a.fullName ?? "?"}`;
