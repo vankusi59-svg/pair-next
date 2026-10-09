@@ -275,3 +275,23 @@ Targeted audit remediation; every fix proven by **prepatch FAIL → postpatch PA
 **Readiness truth table (driver ON):** SCHEDULER_NOT_READY → cursor not READY; POLICY_NOT_EFFECTIVE → DISABLED/PAUSED/real-EXPIRED; NO_QUEUE / QUEUE_BLOCKED_RETRY_EXHAUSTED / QUEUE_WAITING_EVIDENCE / QUEUE_BLOCKED_AUTHORITY / QUEUE_QUARANTINED / NOT_DUE_YET / NO_PENDING_GENERATION / ATTEMPT_COOLDOWN / STALE_BINDING / LEASE_HELD → per claim() predicate; COST_UNVERIFIED → UNKNOWN/unbounded attributed usage; COST_BINDING_UNVERIFIED → no provable dispatch bound; BUDGET_EXHAUSTED → usage + bound > cap; runnable=true only when all checks clear.
 
 **Verify:** `verify:change --base 0e27bc6 --full` → **READY_FOR_INDEPENDENT_AUDIT** — claim `P15_10_C_R4_FINAL_READINESS_COST_PROOF` PASS, invariants 5/5, claim tests 11/11, regression 23/23, tsc+build PASS, full suite +3 known baseline. R4 17/17, R3 15/15, R2 10/10, R1 10/10, 10c 19/19. Diff R4: +739/−70, 8 files. R1/R2 audited code kept verbatim.
+
+---
+
+## FINAL — Cost halt TOCTOU hotfix (`46da4ce`)
+
+Independent final verification (read-only audit @ `26a7312`) produced two verdicts:
+
+**Finding A — objective lineage**: `SAFE_BY_EXISTING_PROOF_WITH_TWO_INCONCLUSIVE_TAMPER_EDGES`. Canonical enforcement proven (manual→allowed, wob→objective→capped, mismatch→BROKEN, cycle→BROKEN, deep chain+alloc→enforced). Two hardening notes recorded — `wob.mission_id` consistency not re-verified in the cost path (A2a) and the 8-hop parent-walk bound with missing leaf allocation treats the item as manual (A3b). Both require non-canonical row writes to reach (canonical binding/allocation paths prevent them); `objectiveScopeFor` intentionally unchanged.
+
+**Finding B — cost halt TOCTOU**: **CONFIRMED → FIXED**. `assertAndReserve` evaluated the halt against the *advisory* `billingPre.mode` resolved before `store.immediate`. A `FREE → METERED_API` profile flip landing in that gap produced a paid reservation under an active halt (prepatch: `HELD billing_mode=METERED_API reserved=400000` with `PAIR_COST_HALT=1`).
+
+Fix (this boundary only): inside the atomic txn, after the authoritative `billingFor` re-resolve and after the resId adopt/deny re-check (adopting a committed reservation is not new spend), `haltActive()` is re-evaluated against the real in-txn `billing.mode` → `FAIL_CLOSED_COST_HALT` violation, no reservation row, denial evidence on the mission evidence stream. FREE/SUBSCRIPTION/UNMETERED semantics unchanged.
+
+Tests (`pair-p15-10c-final-audit.test.ts`, 9 tests, committed as evidence):
+- B1: halt ON + FREE→METERED flip mid-gap → **DENY** `FAIL_CLOSED_COST_HALT`, zero reservation rows, `COST_DISPATCH_DENIED` evidence with consistent reason (prepatch FAIL → postpatch PASS)
+- B2: halt ON + stable METERED → DENY (control)
+- B3: halt OFF + flip → reservation pins the NEW price correctly (400k)
+- A1/A2a/A2b/A3a/A3b/A4: lineage matrix above, all consistent with verdicts
+
+**Verify**: `verify:change --base 0e27bc6 --full` → **READY_FOR_INDEPENDENT_AUDIT** — claim `P15_10_C_FINAL_COST_HALT_HOTFIX` PASS, invariants 5/5, claim tests 12/12, regression 23/23, tsc+build PASS, full suite +3 known baseline. Diff: +410/−26, 3 files.
