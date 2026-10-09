@@ -1086,6 +1086,68 @@ describe("F7-concurrency — expiry across two connections", () => {
   });
 });
 
+/* ==== F11 — canonical creator actor (objective actor + event actor) == */
+
+describe("F11 — creator actor provenance", () => {
+  it("canonical operator_id → actor canonicalized once; owner/actor/event all proven", () => {
+    const { store, objectives } = fresh("f11");
+    const o = mkObjective(objectives, mkBiz(store), { operator_id: "operator:alice" });
+    expect(String(o.owner_authority_id)).toBe("operator:alice");
+    expect(String(o.actor)).toBe("operator:alice");
+    expect(String(o.actor)).not.toContain("operator:operator:");
+    const evs = store.listEvents("objective", String(o.objective_id));
+    const created = evs.find((e) => e.event_type === "OBJECTIVE_CREATED");
+    expect(String(created?.actor)).toBe("operator:alice");
+  });
+
+  it("explicit owner_authority_id stays distinct from canonical creator actor", () => {
+    const { store, objectives } = fresh("f11b");
+    const o = mkObjective(objectives, mkBiz(store), {
+      operator_id: "operator:alice",
+      owner_authority_id: "operator:owner-bob",
+    });
+    expect(String(o.owner_authority_id)).toBe("operator:owner-bob");
+    expect(String(o.actor)).toBe("operator:alice"); // creator ≠ owner preserved
+    const created = store.listEvents("objective", String(o.objective_id))
+      .find((e) => e.event_type === "OBJECTIVE_CREATED");
+    expect(String(created?.actor)).toBe("operator:alice");
+    expect((created?.metadata as { owner_authority_id?: string })?.owner_authority_id)
+      .toBe("operator:owner-bob");
+  });
+});
+
+/* ==== F12 — business eligibility inside evaluate ==== */
+
+describe("F12 — business eligibility", () => {
+  it("non-ACTIVE business → effective=false, fail-closed reason", () => {
+    const { store, objectives, policy } = fresh("f12");
+    const bid = mkBiz(store);
+    const o = mkObjective(objectives, bid);
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    expect(policy.evaluate(oid(o)).effective).toBe(true);
+    const biz = store.get("business", bid);
+    store.put("business", bid, { ...biz, status: "SUSPENDED" }, Number(biz.version));
+    const st = policy.evaluate(oid(o));
+    expect(st.effective).toBe(false);
+    expect(st.reasons).toContain("BUSINESS_SUSPENDED");
+  });
+
+  it("missing business row → effective=false BUSINESS_MISSING", () => {
+    const { store, objectives, policy } = fresh("f12b");
+    const bid = mkBiz(store);
+    const o = mkObjective(objectives, bid);
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    store.db
+      .prepare("DELETE FROM entities WHERE entity_type='business' AND entity_id=?")
+      .run(bid);
+    const st = policy.evaluate(oid(o));
+    expect(st.effective).toBe(false);
+    expect(st.reasons).toContain("BUSINESS_MISSING");
+  });
+});
+
 /* ===== O1 — effective honors the objective lifecycle ===== */
 
 describe("O1 — effective = auto eligibility (lifecycle guard)", () => {

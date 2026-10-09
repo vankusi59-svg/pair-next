@@ -443,6 +443,14 @@ export class ObjectiveAutoPolicyService {
         const deadline = typeof obj.deadline === "string" ? Date.parse(obj.deadline) : NaN;
         if (!Number.isNaN(deadline) && deadline <= this.now())
           reasons.push("OBJECTIVE_DEADLINE_PASSED");
+        // F12 — business eligibility, re-proved in the same txn: the
+        // canonical contract mints `business.status === "ACTIVE"` at
+        // create and has no lifecycle — a missing row (direct removal)
+        // or any non-ACTIVE status ⇒ the policy cannot be effective.
+        const biz = this.store.tryGet("business", String(obj.business_id));
+        if (biz == null) reasons.push("BUSINESS_MISSING");
+        else if (String(biz.status) !== "ACTIVE")
+          reasons.push(`BUSINESS_${String(biz.status)}`);
         effective = reasons.length === 0;
       }
     }
