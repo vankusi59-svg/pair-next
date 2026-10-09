@@ -647,8 +647,10 @@ export class ConversationReasoningService {
     //    assistant/system rows. A raced mint of the same reply key is
     //    judged by the canonical replay/conflict rule inside appendCore.
     // F-R1 — the proposal commits ATOMICALLY with the reply row: the
-    // crash window "reply committed → proposal lost" is closed. It is
-    // descriptive state on the row, not digest-bearing authority.
+    // crash window "reply committed → proposal lost" is closed. F-R2 —
+    // it is digest-bearing descriptive state: still zero authority, but
+    // a raced commit with a different proposal cannot silently adopt
+    // this row.
     const reply = conv.internalWriter().appendMessage({
       session_id: sessionId,
       role: "assistant",
@@ -657,8 +659,13 @@ export class ConversationReasoningService {
       correlation_id: input.correlation_id,
       proposal,
     });
-    return proposal
-      ? { message, reply, reused: false, proposal }
+    // F-R2 — return the COMMITTED row's proposal, not the local model
+    // variable. A raced convergent append returns the canonical row;
+    // a divergent proposal conflicts inside appendCore before this
+    // point, so `reply.proposal` is provably the canonical winner the
+    // caller may materialize.
+    return reply.proposal
+      ? { message, reply, reused: false, proposal: reply.proposal }
       : { message, reply, reused: false };
   }
 

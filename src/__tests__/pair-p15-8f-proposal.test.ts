@@ -17,6 +17,7 @@ import {
   BusinessLayer,
   ConversationReasoningService,
   ConversationSessionService,
+  conversationMessageDigest,
   createMissionControlServer,
   ensureConversationModel,
   ExecutorRegistry,
@@ -638,5 +639,164 @@ describe("P15.8-F R1 — expiry + regression pins", () => {
     expect(missionsOf(s)).toHaveLength(1);
     // No conversation entities were needed or created.
     expect(s.store.list("conversation_mission_draft")).toHaveLength(0);
+  });
+});
+
+/* ====================== R2 — canonical proposal race ====================== */
+
+describe("P15.8-F R2 — canonical proposal race closure", () => {
+  it("raced writers with divergent proposals → typed conflict; only the committed winner exists; retry replays it", async () => {
+    const s = freshStack("r2race");
+    const sessions = new ConversationSessionService(s.store);
+    const sid = sessions.createSession({ owner_operator_id: WEBOP }).session_id;
+
+    // Deferred invokers: BOTH models run before EITHER reply commits.
+    const defer = <T,>() => { let r!: (v: T) => void;
+      const p = new Promise<T>((res) => { r = res; }); return { p, r }; };
+    const gA = defer<string>(), gB = defer<string>();
+    const invA = new MockInvoker(() => gA.p);
+    const invB = new MockInvoker(() => gB.p);
+    const mk = (inv: MockInvoker) => new ConversationReasoningService({
+      conversation: sessions, store: s.store, invoker: inv,
+      model_entry_id: s.modelEntryId });
+    const rA = mk(invA);
+    const rB = mk(invB);
+
+    const turnInput = { session_id: sid, operator_id: WEBOP,
+      body: "viết file a.txt", idempotency_key: "race-k", correlation_id: null };
+    const pA = rA.turn(turnInput);
+    const pB = rB.turn(turnInput);
+    // Wait until both invokers were entered (both model calls ran).
+    while (invA.calls.length < 1 || invB.calls.length < 1) {
+      await new Promise((r) => setImmediate(r));
+    }
+    // Same human reply text, DIFFERENT proposal goals.
+    const body = (g: string) =>
+      `Tôi có thể chuẩn bị mission draft.\nPAIR_PROPOSAL: {"goal":"${g}"}`;
+    gA.r(body("goal-alpha"));
+    gB.r(body("goal-beta"));
+    const [a, b] = await Promise.allSettled([pA, pB]);
+
+    // Exactly one writer wins; the other gets a typed conflict — never
+    // a silent adoption of the committed row with a divergent proposal.
+    const wins = [a, b].filter((r) => r.status === "fulfilled");
+    const loses = [a, b].filter((r) => r.status === "rejected");
+    expect(wins).toHaveLength(1);
+    expect(loses).toHaveLength(1);
+    expect(String((loses[0] as PromiseRejectedResult).reason))
+      .toContain("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT");
+
+    const winner = (wins[0] as PromiseFulfilledResult<{
+      message: { message_id: string };
+      reply: { message_id: string; proposal?: { goal: string } };
+      proposal?: { goal: string };
+    }>).value;
+    expect(winner.proposal).toBeDefined();
+
+    // Exactly ONE canonical assistant reply identity; the returned
+    // proposal is the COMMITTED row's, not the local model output.
+    const rows = s.store.list("conversation_message")
+      .filter((m) => String(m.session_id) === sid && String(m.role) === "assistant");
+    expect(rows).toHaveLength(1);
+    expect(String(rows[0]!.message_id)).toBe(winner.reply.message_id);
+    expect((rows[0]!.proposal as { goal: string }).goal).toBe(winner.proposal!.goal);
+
+    // A draft materialized from the returned proposal carries the
+    // committed goal — callers cannot reach the divergent local value.
+    const drafts = new MissionDraftService({
+      conversation: sessions, control: s.control, store: s.store });
+    const d = drafts.createDraft({
+      session_id: sid, operator_id: WEBOP, project_id: s.projectId,
+      goal: winner.proposal!.goal,
+      client_request_id: `proposal:${winner.message.message_id}` });
+    expect(d.goal).toBe((rows[0]!.proposal as { goal: string }).goal);
+
+    // Retry of the same turn replays the committed proposal — no third
+    // model call anywhere, zero missions before confirmation.
+    const invC = new MockInvoker(() => "unreachable");
+    const rC = mk(invC);
+    const retry = await rC.turn(turnInput);
+    expect(retry.reused).toBe(true);
+    expect(retry.proposal?.goal).toBe(winner.proposal!.goal);
+    expect(invC.calls).toHaveLength(0);
+    expect(invA.calls.length + invB.calls.length).toBe(2);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+
+  it("tamper: proposal goal rewritten leaving old digest → canonical read fails closed", async () => {
+    const s = freshStack("r2tamper");
+    const sessions = new ConversationSessionService(s.store);
+    const inv = proposingInvoker();
+    const reasoning = new ConversationReasoningService({
+      conversation: sessions, store: s.store, invoker: inv,
+      model_entry_id: s.modelEntryId });
+    const sid = sessions.createSession({ owner_operator_id: WEBOP }).session_id;
+    const out = await reasoning.turn({ session_id: sid, operator_id: WEBOP,
+      body: "viết file a.txt", idempotency_key: "t1", correlation_id: null });
+    expect(out.proposal).toBeDefined();
+
+    // Rewrite the stored proposal goal, keep the ORIGINAL digest —
+    // the store-level hash stays valid; only message_digest is stale.
+    const raw = s.store.get("conversation_message", out.reply.message_id);
+    s.store.put("conversation_message", out.reply.message_id, {
+      ...raw, proposal: { goal: "tampered-goal" } });
+    expect(() => sessions.listMessages(sid, { operator_id: WEBOP }))
+      .toThrow(/FAIL_CLOSED_CONVERSATION_DIGEST/);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+
+  it("tamper: proposal injected into operator/system rows + malformed shapes → all fail closed", async () => {
+    const s = freshStack("r2inject");
+    const sessions = new ConversationSessionService(s.store);
+    const sid = sessions.createSession({ owner_operator_id: WEBOP }).session_id;
+    const base = {
+      message_id: "MSG_x", session_id: sid, owner_operator_id: WEBOP,
+      seq: 1, body: "b", idempotency_key: null, created_at: "2026-10-09T00:00:00Z",
+    };
+    const digestFor = (r: Record<string, unknown>) => ({
+      ...r, schema_version: "pair.os.vnext.conversation-message.v1",
+      message_digest: conversationMessageDigest({
+        message_id: String(r.message_id), session_id: String(r.session_id),
+        owner_operator_id: String(r.owner_operator_id), seq: Number(r.seq),
+        role: String(r.role), body: String(r.body),
+        idempotency_key: null,
+        proposal: r.proposal as { goal: string } | undefined }) });
+    // Operator + system rows carrying ANY proposal → INTEGRITY, even
+    // when their own digest is self-consistent.
+    for (const role of ["operator", "system"]) {
+      const row = digestFor({ ...base, role, proposal: { goal: "forged" } });
+      expect(() => sessions.assertMessageCanonical(row))
+        .toThrow(/FAIL_CLOSED_CONVERSATION_INTEGRITY/);
+    }
+    // Malformed proposal shapes on assistant rows → INTEGRITY.
+    for (const bad of ["str", { goal: "" }, { goal: "g", extra: 1 }, { nogoal: 1 }, [1], 7]) {
+      const row = digestFor({ ...base, role: "assistant", proposal: bad });
+      expect(() => sessions.assertMessageCanonical(row))
+        .toThrow(/FAIL_CLOSED_CONVERSATION_INTEGRITY/);
+    }
+    // And the operator write seam rejects an injected proposal key.
+    expect(() => sessions.appendMessage({
+      session_id: sid, operator_id: WEBOP, body: "hi",
+      proposal: { goal: "x" } } as never))
+      .toThrow(/FAIL_CLOSED_CONVERSATION_INTEGRITY/);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+
+  it("R1 proofs preserved: no-proposal replay + digest semantics unchanged for ordinary rows", async () => {
+    const s = freshStack("r2compat");
+    const sessions = new ConversationSessionService(s.store);
+    const sid = sessions.createSession({ owner_operator_id: WEBOP }).session_id;
+    // Ordinary operator + assistant rows without proposal keep the
+    // original v1 digest bytes — the key is absent, not null.
+    const m = sessions.appendMessage({ session_id: sid, operator_id: WEBOP,
+      body: "hello", idempotency_key: "ord" });
+    const legacy = conversationMessageDigest({
+      message_id: m.message_id, session_id: sid, owner_operator_id: WEBOP,
+      seq: m.seq, role: "operator", body: "hello", idempotency_key: "ord" });
+    expect(m.message_digest).toBe(legacy);
+    // Replay converges identically.
+    const again = sessions.appendMessage({ session_id: sid, operator_id: WEBOP,
+      body: "hello", idempotency_key: "ord" });
+    expect(again.message_id).toBe(m.message_id);
   });
 });
