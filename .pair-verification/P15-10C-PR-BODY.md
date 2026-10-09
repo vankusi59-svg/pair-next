@@ -249,3 +249,29 @@ Owner-scoped read proven; non-owner denied `FAIL_CLOSED_POLICY_FORBIDDEN` before
 - R1/R2 audited patches kept verbatim; driver remains opt-in OFF.
 
 **No merge. No deploy. `PAIR_OBJECTIVE_AUTO_DRIVER` not enabled in production.**
+
+---
+
+## R4 — Final readiness & cost proof (`b67f108`)
+
+Targeted audit remediation; every fix proven by **prepatch FAIL → postpatch PASS** (12/17 R4 tests failed pre-patch against R3 code).
+
+| Finding | Verdict | Evidence |
+|---|---|---|
+| F3 readiness vs claim() | **CONFIRMED → FIXED** | readiness() checked only quarantine/blocked queue state; claim() also requires WAITING_CONSUMER + pending generation + next_due + cooldown + authority pins + no active lease. Prepatch: 8 cases reported READY while claim() would deny. |
+| F2-A broken lineage fail-open | **CONFIRMED → FIXED** | wob row gone / work_item gone / item-claim vs allocation mismatch → treated as manual → objective cap skipped. 3 prepatch FAILs. |
+| F2-B pricing outside txn | **CONFIRMED → FIXED** | billingFor() resolved before the atomic txn — a profile edit committed in the gap could slip a stale price. Prepatch: reservation pinned stale 100k instead of in-txn 500k. |
+| F2-C concurrent over-cap | **SAFE_BY_EXISTING_PROOF** | R3's in-txn objective-cap sum already sees siblings; NEW real cross-connection race test (conn2 commits HELD at conn1's txn entry → conn1 denied, exactly 1 reservation) + in-txn resId re-check added. |
+
+**Fixes (minimal):**
+- `scheduler.queueEligibility(q)` — claim()'s own queue predicate (WAITING_CONSUMER, pending>claimed>settled, next_due, 30s attempt cooldown); `claim()` now consumes it verbatim.
+- `scheduler.claimable(objectiveId)` — public read-only eligibility proof: queue predicate + policy-effective + binding pins + active lease. Intentionally excludes global roster/rate (transient, never an objective-readiness fact).
+- `driver.readiness()` consumes `claimable()` — `driver_integrated` (deployment) vs `objective_runnable`/`driver_ready` (claimable now + cost binding); `driver_missing` carries typed reasons: `NO_QUEUE, QUEUE_<state>, NO_PENDING_GENERATION, NOT_DUE_YET, ATTEMPT_COOLDOWN, POLICY_NOT_EFFECTIVE, STALE_BINDING, LEASE_HELD` + `SCHEDULER_NOT_READY, COST_UNVERIFIED, COST_BINDING_UNVERIFIED, BUDGET_EXHAUSTED`.
+- `cost.ts` F2-A: `objectiveScopeFor` returns `{oid,cap} | "BROKEN" | null` — binding-claim via `work_item.objective_id` or bounded parent-chain walk (≤8 hops; cycle/mid-chain-missing → BROKEN) + allocation linkage; BROKEN → `FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED` inside txn; truly manual (no claim anywhere) → `null` unaffected.
+- `cost.ts` F2-B: `billingFor` + `requested` re-resolved **inside** `store.immediate` — in-txn UNKNOWN/unbounded deny mirrors outer fast-path; in-txn resId re-check (COMMITTED/SETTLED adopt, unexpected HELD → AMBIGUOUS).
+
+**Test hygiene per mandate:** F3f split into `F3f-quarantined` / `F3f-exhausted` (name matches assertions); EXPIRED proof uses a real `expires_at` deadline that passes (never a 2999 fixture + nudge); every denial path leaves canonical DB evidence.
+
+**Readiness truth table (driver ON):** SCHEDULER_NOT_READY → cursor not READY; POLICY_NOT_EFFECTIVE → DISABLED/PAUSED/real-EXPIRED; NO_QUEUE / QUEUE_BLOCKED_RETRY_EXHAUSTED / QUEUE_WAITING_EVIDENCE / QUEUE_BLOCKED_AUTHORITY / QUEUE_QUARANTINED / NOT_DUE_YET / NO_PENDING_GENERATION / ATTEMPT_COOLDOWN / STALE_BINDING / LEASE_HELD → per claim() predicate; COST_UNVERIFIED → UNKNOWN/unbounded attributed usage; COST_BINDING_UNVERIFIED → no provable dispatch bound; BUDGET_EXHAUSTED → usage + bound > cap; runnable=true only when all checks clear.
+
+**Verify:** `verify:change --base 0e27bc6 --full` → **READY_FOR_INDEPENDENT_AUDIT** — claim `P15_10_C_R4_FINAL_READINESS_COST_PROOF` PASS, invariants 5/5, claim tests 11/11, regression 23/23, tsc+build PASS, full suite +3 known baseline. R4 17/17, R3 15/15, R2 10/10, R1 10/10, 10c 19/19. Diff R4: +739/−70, 8 files. R1/R2 audited code kept verbatim.
