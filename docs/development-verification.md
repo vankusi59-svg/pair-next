@@ -16,12 +16,20 @@ root.
    know what the patch claims, so `VERIFY_PATCH_CLAIM_REQUIRED` fails
    closed. A docs-only change still uses a minimal claim.
 2. Implement the change.
-3. Run `npm run verify:change -- --base <BASE_SHA>`.
-4. Fix until it exits 0 (`READY_FOR_INDEPENDENT_AUDIT`).
-5. For HIGH-risk changes the full suite runs automatically; `--full`
+3. Self-audit the `BASE..HEAD` diff across the categories in
+   `AGENTS.md` (Self-Audit & Auto-Repair Contract) and record evidence
+   in `.pair-verification/self-audit.json` — **mandatory on any
+   non-empty diff** (`VERIFY_AUDIT_REQUIRED`). Like the claim, the file
+   must itself be inside the current diff (`VERIFY_AUDIT_STALE`); every
+   audit category must be either reviewed or explicitly skipped with a
+   reason, and unresolved `P0`/`P1` findings or a `BLOCKED` verdict make
+   the run `NOT_READY`.
+4. Run `npm run verify:change -- --base <BASE_SHA>`.
+5. Fix until it exits 0 (`READY_FOR_INDEPENDENT_AUDIT`).
+6. For HIGH-risk changes the full suite runs automatically; `--full`
    forces it for any risk level.
-6. Push the PR and attach `.pair-verification/report.md`.
-7. Independent audit → merge only after audit PASS.
+7. Push the PR and attach `.pair-verification/report.md`.
+8. Independent audit → merge only after audit PASS.
 
 A zero-change diff is a typed `VERIFY_EMPTY_DIFF` failure — the harness
 never certifies a patch that does not exist.
@@ -53,6 +61,14 @@ and must be recreated by it; PASS requires ≥1 executed assertion, zero
 unaccounted failures, and any non-zero exit explained only by registered
 known-baseline failures. Stale JSON, zero-match patterns, malformed
 JSON, crashes, and unaccounted exits are all FAIL — never PASS.
+- **Self-audit evidence** (`.pair-verification/self-audit.json`):
+  structural + consistency checks — category coverage (all 7 accounted
+  for), finding severity/provenance/reproduction, fixes bound to real
+  finding ids, `repair_rounds ≤ 3`, and a verdict gate: `PASS` is
+  rejected while `P0`/`P1` findings are unresolved and `BLOCKED` is
+  always `NOT_READY`. Regression test paths named in `fixes` must
+  exist. The file is self-attestation — structure/freshness only, never
+  independent proof.
 - **tsc + build** gates.
 
 ## Risk

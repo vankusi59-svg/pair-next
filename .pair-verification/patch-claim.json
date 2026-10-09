@@ -1,10 +1,11 @@
 {
-  "claim_id": "DEV_WORKFLOW_POLICY_V1",
-  "title": "Root AGENTS.md makes the Development Verification Harness the mandatory completion contract for agents",
+  "claim_id": "SELF_AUDIT_AUTO_REPAIR_V1",
+  "title": "Self-audit & auto-repair contract: AGENTS.md policy + harness audit-evidence gate",
   "affected_surfaces": ["DEV_INFRA"],
   "required_tests": [
+    "src/__tests__/dev-verification.test.ts",
     "src/__tests__/dev-workflow-policy.test.ts"
   ],
   "invariants": [],
-  "description": "Adds repository-root AGENTS.md: every code/config change must record its BASE SHA, update the current .pair-verification/patch-claim.json inside the BASE..HEAD diff, run npm run verify:change -- --base <BASE_SHA>, and fix until READY_FOR_INDEPENDENT_AUDIT before reporting complete; NOT_READY forbids completion claims; no self-merge without explicit operator instruction after independent audit. Failure contract and stale-claim prohibition documented. Proof: src/__tests__/dev-workflow-policy.test.ts asserts the contract text exists at the repo root. Docs-only/dev-infra change — no production PAIR runtime behavior altered."
+  "description": "Extends the development workflow policy: agents must self-audit BASE..HEAD across 7 categories (logic/auth/state/replay/concurrency/edge/UI-API), repair self-found defects via regression-first minimal fixes (max 3 rounds, else BLOCKED/NOT_READY with evidence), and record structured audit evidence at .pair-verification/self-audit.json bound to the current diff. Harness validates the evidence schema (coverage, severities, found_by, fix->finding binding, regression paths exist), rejects missing/stale/wrong-diff evidence (VERIFY_AUDIT_REQUIRED/STALE/SCHEMA/PATH), and gates the verdict: unresolved P0/P1, BLOCKED verdict, or FIXED-without-regression -> NOT_READY. Preserves claim binding, invariant/pack selection, tsc/build/full-suite gates. Dev tooling only — no production PAIR authority/runtime change."
 }

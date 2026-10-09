@@ -12,9 +12,9 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
-  HarnessError, INVARIANTS, PACKS,
-  classifyFiles, parseSelector, planVerification,
-  validateClaim,
+  AUDIT_CATEGORIES, HarnessError, INVARIANTS, MAX_REPAIR_ROUNDS, PACKS,
+  auditConsistency, classifyFiles, parseSelector, planVerification,
+  validateAuditEvidence, validateClaim,
 } from "../../scripts/dev-verification/lib.mjs";
 import { executePlan, verify } from "../../scripts/dev-verification/run.mjs";
 
@@ -615,6 +615,18 @@ describe("dev-verification harness V1 R2", () => {
       required_tests: [`${T}dev-verification.test.ts`], invariants: [],
     }));
   };
+  const writeAudit = (root: string, rel = ".pair-verification/self-audit.json") => {
+    mkdirSync(join(root, rel.split("/").slice(0, -1).join("/")),
+      { recursive: true });
+    writeFileSync(join(root, rel), JSON.stringify({
+      audit_id: "SA_X1",
+      categories_reviewed: AUDIT_CATEGORIES,
+      categories_skipped: [],
+      findings: [], fixes: [], remaining_risks: [],
+      repair_rounds: 0, verdict: "PASS",
+    }));
+  };
+  const AUDIT_DIFF = ".pair-verification/self-audit.json\n";
   const gitDiff =
     (out: string) =>
     (...a: string[]) =>
@@ -639,10 +651,12 @@ describe("dev-verification harness V1 R2", () => {
     const root = mkdtempSync(join(tmpdir(), "dv-"));
     try {
       writeClaim(root);
+      writeAudit(root);
       const res = verify({
         baseArg: "a".repeat(40),
         git: gitDiff(
-          ".pair-verification/patch-claim.json\nsrc/pair/x.ts\n") as never,
+          ".pair-verification/patch-claim.json\n" + AUDIT_DIFF +
+          "src/pair/x.ts\n") as never,
         exec: passExec(root) as never, root,
       });
       expect(res.plan.claim?.claim_id).toBe("X_1");
@@ -672,11 +686,13 @@ describe("dev-verification harness V1 R2", () => {
     const root = mkdtempSync(join(tmpdir(), "dv-"));
     try {
       writeClaim(root, "custom-claim.json");
+      writeAudit(root, "custom-audit.json");
       const res = verify({
         baseArg: "a".repeat(40),
-        git: gitDiff("custom-claim.json\nsrc/pair/x.ts\n") as never,
+        git: gitDiff(
+          "custom-claim.json\ncustom-audit.json\nsrc/pair/x.ts\n") as never,
         exec: passExec(root) as never, root,
-        claimPath: "custom-claim.json",
+        claimPath: "custom-claim.json", auditPath: "custom-audit.json",
       });
       expect(res.plan.claim?.claim_id).toBe("X_1");
     } finally {
@@ -944,4 +960,207 @@ describe("dev-verification harness V1 R3", () => {
         rmSync(root, { recursive: true, force: true });
       }
     });
+});
+
+/** R4 — Self-Audit & Auto-Repair evidence gate (mandate §5 acceptance).
+ *  Structural validation is pure; freshness/missing checks go through
+ *  verify() with injected git/exec exactly like the claim binding. */
+describe("dev-verification harness V1 R4 — self-audit evidence", () => {
+  const okAudit = (extra: object = {}) => ({
+    audit_id: "SA_X1",
+    categories_reviewed: [...AUDIT_CATEGORIES],
+    categories_skipped: [],
+    findings: [], fixes: [], remaining_risks: [],
+    repair_rounds: 0, verdict: "PASS", ...extra,
+  });
+  const AUDIT_REL = ".pair-verification/self-audit.json";
+  const CLAIM_REL = ".pair-verification/patch-claim.json";
+  const write = (root: string, rel: string, body: object) => {
+    mkdirSync(join(root, rel.split("/").slice(0, -1).join("/")),
+      { recursive: true });
+    writeFileSync(join(root, rel), JSON.stringify(body));
+  };
+  const writeClaimA = (root: string) => write(root, CLAIM_REL, {
+    claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
+    required_tests: [`${T}dev-verification.test.ts`], invariants: [],
+  });
+  const PASS_JSON = {
+    numTotalTests: 1, numPassedTests: 1, numFailedTests: 0,
+    numFailedTestSuites: 0, numTotalTestSuites: 1,
+    testResults: [{ name: "x", status: "passed",
+      assertionResults: [{ title: "ok", status: "passed" }] }],
+  };
+  const passExec = (root: string) => (_b: string, argv: string[]) => {
+    const oi = argv.findIndex((a) => String(a).startsWith("--outputFile="));
+    if (oi >= 0) {
+      writeFileSync(join(root, String(argv[oi]).slice(13)),
+        JSON.stringify(PASS_JSON));
+    }
+    return { status: 0 };
+  };
+  const gitDiff =
+    (out: string) =>
+    (...a: string[]) =>
+      a[0] === "rev-parse" ? "a".repeat(40) : a[0] === "diff" ? out : "";
+  const FULL_DIFF = `${CLAIM_REL}\n${AUDIT_REL}\nsrc/pair/x.ts\n`;
+
+  it("R4-1. valid minimal evidence validates", () => {
+    const e = validateAuditEvidence(okAudit());
+    expect(e?.audit_id).toBe("SA_X1");
+    expect(e?.verdict).toBe("PASS");
+    expect(validateAuditEvidence(null)).toBeNull();
+  });
+
+  it("R4-2. schema rejects malformed evidence", () => {
+    for (const bad of [
+      42, "x", [{ a: 1 }],
+      { categories_reviewed: [...AUDIT_CATEGORIES], verdict: "PASS" }, // no audit_id
+      okAudit({ audit_id: "!!" }),
+      okAudit({ verdict: "MAYBE" }),
+      okAudit({ repair_rounds: MAX_REPAIR_ROUNDS + 1 }),
+      okAudit({ extra_field: 1 }),
+      okAudit({ findings: "nope" }),
+      okAudit({ categories_reviewed: ["LOGIC_INVARIANTS"],
+        categories_skipped: [] }), // unaccounted categories
+      okAudit({ categories_reviewed: [...AUDIT_CATEGORIES, "UI_API"] }), // dup
+      okAudit({ categories_reviewed: ["BOGUS"] }),
+      okAudit({ categories_skipped: [{ category: "UI_API" }] }), // no reason
+      okAudit({ categories_skipped: [{ category: "UI_API", reason: " " }] }),
+      okAudit({ categories_reviewed: AUDIT_CATEGORIES,
+        categories_skipped: [{ category: "UI_API", reason: "x" }] }), // overlap
+      okAudit({ findings: [{ id: "F1", severity: "P5", description: "d",
+        repro: "r", found_by: "SELF", status: "OPEN" }] }),
+      okAudit({ findings: [{ id: "F1", severity: "P1", description: "d",
+        repro: " ", found_by: "SELF", status: "OPEN" }] }), // empty repro
+      okAudit({ findings: [{ id: "F1", severity: "P1", description: "d",
+        repro: "r", found_by: "MAGIC", status: "OPEN" }] }),
+      okAudit({ findings: [{ id: "F1", severity: "P1", description: "d",
+        repro: "r", found_by: "SELF", status: "OPEN" }],
+        fixes: [{ finding_id: "GHOST", regression_tests: ["t"] }] }), // dangling ref
+      okAudit({ findings: [{ id: "F1", severity: "P1", description: "d",
+        repro: "r", found_by: "SELF", status: "OPEN" }],
+        fixes: [{ finding_id: "F1", regression_tests: [] }] }), // no tests
+      okAudit({ findings: [
+        { id: "F1", severity: "P2", description: "d", repro: "r",
+          found_by: "SELF", status: "OPEN" },
+        { id: "F1", severity: "P2", description: "d", repro: "r",
+          found_by: "SELF", status: "OPEN" },
+      ] }), // duplicate ids
+    ]) {
+      expect(() => validateAuditEvidence(bad)).toThrow(/VERIFY_AUDIT_SCHEMA/);
+    }
+  });
+
+  it("R4-3. unresolved P0/P1 makes the audit gate FAIL — never READY", () => {
+    const ev = validateAuditEvidence(okAudit({
+      findings: [{ id: "F1", severity: "P1", description: "d", repro: "r",
+        found_by: "SELF", status: "OPEN" }],
+    }));
+    const g = auditConsistency(ev!);
+    expect(g.ok).toBe(false);
+    expect(g.failures[0]).toContain("P0/P1");
+    // a fixed critical with proof does not block
+    const ok = validateAuditEvidence(okAudit({
+      findings: [{ id: "F1", severity: "P1", description: "d", repro: "r",
+        found_by: "SELF", status: "FIXED" }],
+      fixes: [{ finding_id: "F1",
+        regression_tests: [`${T}dev-verification.test.ts`] }],
+      repair_rounds: 1,
+    }));
+    expect(auditConsistency(ok!).ok).toBe(true);
+  });
+
+  it("R4-4. BLOCKED verdict → gate FAIL; FIXED w/o regression → FAIL", () => {
+    const blocked = validateAuditEvidence(okAudit({ verdict: "BLOCKED" }));
+    expect(auditConsistency(blocked!).ok).toBe(false);
+    const noProof = validateAuditEvidence(okAudit({
+      findings: [{ id: "F1", severity: "P2", description: "d", repro: "r",
+        found_by: "EXTERNAL", status: "FIXED" }],
+      fixes: [],
+    }));
+    const g2 = auditConsistency(noProof!);
+    expect(g2.ok).toBe(false);
+    expect(g2.failures[0]).toContain("without a fix");
+    // missing regression file on disk is also a gate failure
+    const missing = validateAuditEvidence(okAudit({
+      findings: [{ id: "F1", severity: "P2", description: "d", repro: "r",
+        found_by: "SELF", status: "FIXED" }],
+      fixes: [{ finding_id: "F1", regression_tests: ["nope.test.ts"] }],
+    }));
+    expect(auditConsistency(missing!, ["nope.test.ts"]).ok).toBe(false);
+  });
+
+  it("R4-5. non-empty diff without self-audit → VERIFY_AUDIT_REQUIRED", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaimA(root);
+      expect(() =>
+        verify({
+          baseArg: "a".repeat(40),
+          git: gitDiff(`${CLAIM_REL}\nsrc/pair/x.ts\n`) as never,
+          exec: passExec(root) as never, root,
+          auditPath: "does-not-exist-audit.json",
+        }),
+      ).toThrow(/VERIFY_AUDIT_REQUIRED/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R4-6. audit evidence absent from BASE..HEAD → VERIFY_AUDIT_STALE", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaimA(root);
+      write(root, AUDIT_REL, okAudit()); // exists but NOT in diff
+      expect(() =>
+        verify({
+          baseArg: "a".repeat(40),
+          git: gitDiff(`${CLAIM_REL}\nsrc/pair/x.ts\n`) as never,
+          exec: passExec(root) as never, root,
+        }),
+      ).toThrow(/VERIFY_AUDIT_STALE/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R4-7. open P1 in current diff → NOT_READY (never READY)", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaimA(root);
+      write(root, AUDIT_REL, okAudit({
+        findings: [{ id: "F1", severity: "P1", description: "d",
+          repro: "r", found_by: "SELF", status: "OPEN" }],
+      }));
+      const res = verify({
+        baseArg: "a".repeat(40), git: gitDiff(FULL_DIFF) as never,
+        exec: passExec(root) as never, root,
+      });
+      expect(res.groups.audit.ok).toBe(false);
+      expect(res.verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R4-8. clean evidence in diff → READY path preserved", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaimA(root);
+      write(root, AUDIT_REL, okAudit({
+        categories_reviewed: ["LOGIC_INVARIANTS", "EDGE_COMPAT"],
+        categories_skipped: AUDIT_CATEGORIES
+          .filter((c) => !["LOGIC_INVARIANTS", "EDGE_COMPAT"].includes(c))
+          .map((c) => ({ category: c, reason: "docs-only change" })),
+      }));
+      const res = verify({
+        baseArg: "a".repeat(40), git: gitDiff(FULL_DIFF) as never,
+        exec: passExec(root) as never, root,
+      });
+      expect(res.groups.audit.ok).toBe(true);
+      expect(res.verdict).toBe("READY_FOR_INDEPENDENT_AUDIT");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

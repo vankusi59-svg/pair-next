@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // PAIR Development Verification Harness V1 — deterministic runner.
-// `npm run verify:change -- --base <sha> [--full] [--claim <path>]`
+// `npm run verify:change -- --base <sha> [--full] [--claim <path>] [--audit <path>]`
 // Exit 0 = READY_FOR_INDEPENDENT_AUDIT; non-zero = NOT_READY.
 // Development tooling only — never consulted by production PAIR.
 
@@ -10,11 +10,13 @@ import {
 } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
-  HarnessError, TOLERATED_FAILURES, planVerification, validateClaim,
+  HarnessError, TOLERATED_FAILURES, auditConsistency, planVerification,
+  validateAuditEvidence, validateClaim,
 } from "./lib.mjs";
 
 export const ROOT = new URL("../..", import.meta.url).pathname;
 const DEFAULT_CLAIM = ".pair-verification/patch-claim.json";
+const DEFAULT_AUDIT = ".pair-verification/self-audit.json";
 const OUT_DIR = ".pair-verification";
 
 export function createGit(root = ROOT) {
@@ -274,6 +276,31 @@ function buildReport(ctx, verdict) {
   g("INVARIANT TESTS", ctx.groups.invariants);
   g("AFFECTED REGRESSION", ctx.groups.modules);
   L.push("");
+  L.push("## SELF-AUDIT");
+  const au = ctx.groups.audit;
+  if (au?.evidence) {
+    const ev = au.evidence;
+    const sev = {};
+    for (const f of ev.findings) sev[f.severity] = (sev[f.severity] ?? 0) + 1;
+    const sevStr = Object.keys(sev).sort().map((k) => `${k}:${sev[k]}`)
+      .join(" ") || "none";
+    L.push(`- audit_id: ${ev.audit_id}`);
+    L.push(`- verdict: ${ev.verdict}`);
+    L.push(`- categories_reviewed: ${ev.categories_reviewed.join(", ") || "(none)"}`);
+    L.push(`- categories_skipped: ${ev.categories_skipped
+      .map((s) => `${s.category}(${s.reason.slice(0, 60)})`)
+      .join(", ") || "(none)"}`);
+    L.push(`- findings: ${ev.findings.length} [${sevStr}] ` +
+      `self:${ev.findings.filter((f) => f.found_by === "SELF").length} ` +
+      `external:${ev.findings.filter((f) => f.found_by === "EXTERNAL").length}`);
+    L.push(`- repair_rounds: ${ev.repair_rounds}`);
+    L.push(`- remaining_risks: ${ev.remaining_risks.length}`);
+    L.push(`- status: ${au.ok ? "PASS" : "FAIL"}`);
+    for (const f of au.failures) L.push(`    - ${f}`);
+  } else {
+    L.push(`- ${au?.failures?.[0] ?? "no audit evidence"}`);
+  }
+  L.push("");
   L.push(`## TSC: ${ctx.groups.tsc.status}`);
   L.push(`## BUILD: ${ctx.groups.build.status}`);
   L.push(`## FULL SUITE: ${ctx.groups.full.status}` +
@@ -385,13 +412,59 @@ export function verify(opts = {}) {
       `${claimRel} is not added/modified in ${base}..${head} — ` +
       "a stale claim cannot certify the current change");
   }
+  // Self-audit evidence (V2): same repo-local resolution, mandatory on a
+  // non-empty diff, and bound to the CURRENT BASE..HEAD diff exactly like
+  // the patch claim — stale/missing/wrong-diff evidence is rejected.
+  const auditArg = opts.auditPath ?? DEFAULT_AUDIT;
+  const auditAbs = resolve(root, auditArg);
+  const auditRel = relative(root, auditAbs);
+  if (auditRel === "" || auditRel.startsWith("..") || isAbsolute(auditRel)) {
+    throw new HarnessError("VERIFY_AUDIT_PATH",
+      `audit path must resolve inside the repository: ${auditArg}`);
+  }
+  let auditRaw = null;
+  if (existsSync(auditAbs)) {
+    try {
+      auditRaw = JSON.parse(readFileSync(auditAbs, "utf8"));
+    } catch (e) {
+      throw new HarnessError("VERIFY_AUDIT_SCHEMA",
+        `unparseable audit file: ${e.message}`);
+    }
+  }
+  const audit = opts.audit !== undefined
+    ? opts.audit : validateAuditEvidence(auditRaw);
+  if (!audit) {
+    throw new HarnessError("VERIFY_AUDIT_REQUIRED",
+      `non-empty diff requires ${auditRel} ` +
+      "recording the agent's self-audit of this change");
+  }
+  if (!files.includes(auditRel)) {
+    throw new HarnessError("VERIFY_AUDIT_STALE",
+      `${auditRel} is not added/modified in ${base}..${head} — ` +
+      "stale audit evidence cannot certify the current change");
+  }
+  // Regression proof must be executable: every test file named in a fix
+  // entry must exist in the real repository (same ROOT rule as selectors).
+  const regPaths = new Set();
+  for (const f of audit.fixes) {
+    for (const t of f.regression_tests) regPaths.add(t);
+  }
+  const missingRegression = [...regPaths]
+    .filter((p) => !existsSync(join(ROOT, p)));
+  const auditGate = auditConsistency(audit, missingRegression);
   const plan = planVerification({
     changedFiles: files, claim, full: opts.full ?? false,
   });
   const { groups, verdict } = executePlan({ plan, exec, root });
+  groups.audit = {
+    ok: auditGate.ok, failures: auditGate.failures,
+    evidence: audit,
+  };
+  const finalVerdict = verdict === "READY_FOR_INDEPENDENT_AUDIT" &&
+    auditGate.ok ? "READY_FOR_INDEPENDENT_AUDIT" : "NOT_READY";
   const reportMd = buildReport(
     { generatedAt: new Date().toISOString(), base, head, files, plan, groups },
-    verdict);
+    finalVerdict);
   const outDir = join(root, OUT_DIR);
   mkdirSync(outDir, { recursive: true });
   writeFileSync(join(outDir, "report.md"), reportMd);
@@ -403,12 +476,13 @@ export function verify(opts = {}) {
       claim: groups.claim.ok ? "PASS" : "FAIL",
       invariants: groups.invariants.ok ? "PASS" : "FAIL",
       modules: groups.modules.ok ? "PASS" : "FAIL",
+      audit: groups.audit.ok ? "PASS" : "FAIL",
       tsc: groups.tsc.status, build: groups.build.status,
       full: groups.full.status,
     },
-    verdict,
+    verdict: finalVerdict,
   }, null, 2));
-  return { verdict, reportMd, base, head, plan, groups };
+  return { verdict: finalVerdict, reportMd, base, head, plan, groups };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -419,6 +493,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       baseArg: a("--base"),
       full: cli.includes("--full"),
       claimPath: a("--claim"),
+      auditPath: a("--audit"),
       baseBranch: a("--base-branch"),
     });
     console.log(`\n=== PAIR DEVELOPMENT VERIFICATION: ${verdict} ===`);

@@ -381,7 +381,7 @@ export const PACKS = {
     "pair-p15-8e-bridge-e2e.test.ts",
   ],
   UI: [], // covered by tsc + build; no focused vitest pack in V1
-  DEV_INFRA: ["dev-verification.test.ts"],
+  DEV_INFRA: ["dev-verification.test.ts", "dev-workflow-policy.test.ts"],
   // Conservative fallback for unmapped production files.
   UNKNOWN_BROAD: [
     "pair-planner-dataflow-incident.test.ts",
@@ -495,6 +495,230 @@ export function validateClaim(raw) {
     description: c.description ?? "",
     risk_override: c.risk_override ?? null,
   };
+}
+
+/* ---------------- self-audit evidence schema ---------------- */
+
+/** The self-audit categories an agent must account for — each is either
+ *  reviewed or explicitly skipped with a reason (never silently absent). */
+export const AUDIT_CATEGORIES = [
+  "LOGIC_INVARIANTS", "AUTH_SECURITY", "STATE_LIFECYCLE",
+  "IDEMPOTENCY_REPLAY", "CONCURRENCY_CAS", "EDGE_COMPAT", "UI_API",
+];
+/** Max auto-repair rounds per handoff — a 4th round means stop+report. */
+export const MAX_REPAIR_ROUNDS = 3;
+
+const AUDIT_FIELDS = [
+  "audit_id", "categories_reviewed", "categories_skipped", "findings",
+  "fixes", "remaining_risks", "repair_rounds", "verdict",
+];
+const FINDING_FIELDS = [
+  "id", "severity", "area", "description", "repro", "found_by", "status",
+];
+const FIX_FIELDS = ["finding_id", "regression_tests", "note"];
+const SKIP_FIELDS = ["category", "reason"];
+const AUDIT_SEVS = ["P0", "P1", "P2", "P3"];
+const AUDIT_STATUS = ["OPEN", "FIXED", "ACCEPTED_RISK"];
+const AUDIT_FOUND_BY = ["SELF", "EXTERNAL"];
+const AUDIT_VERDICTS = ["PASS", "BLOCKED"];
+
+export function validateAuditEvidence(raw) {
+  const bad = (d) => {
+    throw new HarnessError("VERIFY_AUDIT_SCHEMA", d);
+  };
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    bad("evidence must be an object");
+  }
+  const e = raw;
+  for (const k of Object.keys(e)) {
+    if (!AUDIT_FIELDS.includes(k)) bad(`unknown field ${k}`);
+  }
+  if (typeof e.audit_id !== "string" ||
+      !/^[A-Za-z0-9_.-]{3,80}$/.test(e.audit_id)) {
+    bad("audit_id must be 3-80 [A-Za-z0-9_.-]");
+  }
+  const strArr = (v, name, max, len) => {
+    if (v === undefined) return [];
+    if (!Array.isArray(v)) bad(`${name} must be an array`);
+    if (v.length > max) bad(`${name} >${max} entries`);
+    for (const x of v) {
+      if (typeof x !== "string" || x.length > len) bad(`${name} bad entry`);
+    }
+    return v;
+  };
+  // Category coverage: every audit category is either reviewed or skipped
+  // with a reason — an unmentioned category means the audit forgot it.
+  if (!Array.isArray(e.categories_reviewed)) {
+    bad("categories_reviewed must be an array");
+  }
+  const reviewed = [...e.categories_reviewed];
+  for (const c of reviewed) {
+    if (!AUDIT_CATEGORIES.includes(c)) bad(`unknown category ${c}`);
+  }
+  if (new Set(reviewed).size !== reviewed.length) {
+    bad("categories_reviewed has duplicates");
+  }
+  const skippedArr = e.categories_skipped ?? [];
+  if (!Array.isArray(skippedArr) || skippedArr.length > 20) {
+    bad("categories_skipped must be an array <=20");
+  }
+  const skipped = [];
+  for (const s of skippedArr) {
+    if (typeof s !== "object" || s === null || Array.isArray(s)) {
+      bad("categories_skipped entries must be objects");
+    }
+    for (const k of Object.keys(s)) {
+      if (!SKIP_FIELDS.includes(k)) bad(`categories_skipped field ${k}`);
+    }
+    if (!AUDIT_CATEGORIES.includes(s.category)) {
+      bad(`unknown skipped category ${s.category}`);
+    }
+    if (typeof s.reason !== "string" || !s.reason.trim() ||
+        s.reason.length > 300) {
+      bad(`skipped category ${s.category} needs a non-empty reason`);
+    }
+    skipped.push(s.category);
+  }
+  if (new Set(skipped).size !== skipped.length) {
+    bad("categories_skipped has duplicates");
+  }
+  const overlap = reviewed.filter((c) => skipped.includes(c));
+  if (overlap.length) {
+    bad(`categories both reviewed and skipped: ${overlap.join(", ")}`);
+  }
+  const covered = new Set([...reviewed, ...skipped]);
+  const missing = AUDIT_CATEGORIES.filter((c) => !covered.has(c));
+  if (missing.length) {
+    bad(`audit must account for every category — unaccounted: ` +
+      missing.join(", "));
+  }
+  // Findings: every defect records severity, reproduction and provenance
+  // (self-found vs externally reported).
+  const findings = e.findings ?? [];
+  if (!Array.isArray(findings) || findings.length > 50) {
+    bad("findings must be an array <=50");
+  }
+  const ids = new Set();
+  const normFindings = findings.map((f, i) => {
+    if (typeof f !== "object" || f === null || Array.isArray(f)) {
+      bad(`findings[${i}] must be an object`);
+    }
+    for (const k of Object.keys(f)) {
+      if (!FINDING_FIELDS.includes(k)) bad(`findings[${i}] field ${k}`);
+    }
+    if (typeof f.id !== "string" || !f.id.trim() || f.id.length > 40) {
+      bad(`findings[${i}].id must be non-empty <=40`);
+    }
+    if (ids.has(f.id)) bad(`duplicate finding id ${f.id}`);
+    ids.add(f.id);
+    if (!AUDIT_SEVS.includes(f.severity)) {
+      bad(`findings[${i}].severity must be ${AUDIT_SEVS.join("/")}`);
+    }
+    if (f.area !== undefined &&
+        (typeof f.area !== "string" || f.area.length > 160)) {
+      bad(`findings[${i}].area must be string <=160`);
+    }
+    if (typeof f.description !== "string" || !f.description.trim() ||
+        f.description.length > 800) {
+      bad(`findings[${i}].description must be non-empty <=800`);
+    }
+    if (typeof f.repro !== "string" || !f.repro.trim() ||
+        f.repro.length > 800) {
+      bad(`findings[${i}].repro must record how to reproduce <=800`);
+    }
+    if (!AUDIT_FOUND_BY.includes(f.found_by)) {
+      bad(`findings[${i}].found_by must be ${AUDIT_FOUND_BY.join("/")}`);
+    }
+    if (!AUDIT_STATUS.includes(f.status)) {
+      bad(`findings[${i}].status must be ${AUDIT_STATUS.join("/")}`);
+    }
+    return f;
+  });
+  // Fixes bind to real finding ids and name executable regression proof.
+  const fixes = e.fixes ?? [];
+  if (!Array.isArray(fixes) || fixes.length > 50) {
+    bad("fixes must be an array <=50");
+  }
+  const normFixes = fixes.map((f, i) => {
+    if (typeof f !== "object" || f === null || Array.isArray(f)) {
+      bad(`fixes[${i}] must be an object`);
+    }
+    for (const k of Object.keys(f)) {
+      if (!FIX_FIELDS.includes(k)) bad(`fixes[${i}] field ${k}`);
+    }
+    if (typeof f.finding_id !== "string" || !ids.has(f.finding_id)) {
+      bad(`fixes[${i}].finding_id must reference a finding id`);
+    }
+    if (!Array.isArray(f.regression_tests) ||
+        f.regression_tests.length === 0 || f.regression_tests.length > 10) {
+      bad(`fixes[${i}].regression_tests must be 1-10 paths`);
+    }
+    for (const t of f.regression_tests) {
+      if (typeof t !== "string" || !t.trim() || t.length > 300) {
+        bad(`fixes[${i}].regression_tests bad path`);
+      }
+    }
+    if (f.note !== undefined &&
+        (typeof f.note !== "string" || f.note.length > 400)) {
+      bad(`fixes[${i}].note must be string <=400`);
+    }
+    return f;
+  });
+  const remainingRisks = strArr(e.remaining_risks, "remaining_risks",
+    20, 400);
+  if (e.repair_rounds !== undefined &&
+      (!Number.isInteger(e.repair_rounds) || e.repair_rounds < 0)) {
+    bad("repair_rounds must be a non-negative integer");
+  }
+  if ((e.repair_rounds ?? 0) > MAX_REPAIR_ROUNDS) {
+    bad(`repair_rounds exceeds max ${MAX_REPAIR_ROUNDS} — stop and ` +
+      "report BLOCKED instead");
+  }
+  if (!AUDIT_VERDICTS.includes(e.verdict)) {
+    bad(`verdict must be ${AUDIT_VERDICTS.join("/")}`);
+  }
+  return {
+    audit_id: e.audit_id,
+    categories_reviewed: reviewed,
+    categories_skipped: skippedArr,
+    findings: normFindings,
+    fixes: normFixes,
+    remaining_risks: remainingRisks,
+    repair_rounds: e.repair_rounds ?? 0,
+    verdict: e.verdict,
+  };
+}
+
+/**
+ * Consistency gate over validated evidence — pure. The harness supplies
+ * `missingRegressionFiles` (paths named in fixes that do not exist).
+ * The agent may NOT mark PASS while critical findings stay unresolved.
+ */
+export function auditConsistency(evidence, missingRegressionFiles = []) {
+  const failures = [];
+  const openCrit = evidence.findings.filter(
+    (f) => (f.severity === "P0" || f.severity === "P1") &&
+      f.status !== "FIXED");
+  if (openCrit.length) {
+    failures.push(`unresolved P0/P1 findings: ` +
+      openCrit.map((f) => `${f.id}(${f.severity},${f.status})`).join(", "));
+  }
+  if (evidence.verdict === "BLOCKED") {
+    failures.push("audit verdict BLOCKED — agent reports a critical " +
+      "issue it could not repair");
+  }
+  const fixedNoProof = evidence.findings.filter((f) =>
+    f.status === "FIXED" &&
+    !evidence.fixes.some((x) => x.finding_id === f.id));
+  if (fixedNoProof.length) {
+    failures.push("FIXED findings without a fix/regression-test entry: " +
+      fixedNoProof.map((f) => f.id).join(", "));
+  }
+  for (const m of missingRegressionFiles) {
+    failures.push(`regression test file does not exist: ${m}`);
+  }
+  return { ok: failures.length === 0, failures };
 }
 
 /** Selector: "path" or "path#pattern" (pattern → vitest -t). */
