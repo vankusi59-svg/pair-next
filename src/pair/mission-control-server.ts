@@ -1236,27 +1236,45 @@ export function createMissionControlServer(
         if (!biz || !deps.store) {
           return void json(res, 404, { error: "AUTO_POLICY_DISABLED" });
         }
-        const policyActor = String(req.headers["x-operator-id"] ?? "");
-        if (!policyActor) {
+        const rawPolicyActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawPolicyActor) {
           throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
         }
+        // Canonical actor derivation — same convention the Objective
+        // create path uses (`operator:<id>`), so an owner who created
+        // the objective with a raw header can operate its policy with
+        // the same raw header. Body-declared identity never consulted.
+        const policyActor = rawPolicyActor.startsWith("operator:")
+          ? rawPolicyActor
+          : `operator:${rawPolicyActor}`;
         autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
         if (method === "GET") {
           return void json(res, 200, {
             auto_policy: autoPolicySvc.status(m[1]!, policyActor),
           });
         }
+        // F3 — strict boundary typing: NO coercion of authority fields.
+        // Malformed types are rejected with zero mutation before the
+        // service sees them; the service re-validates independently.
+        const malformed =
+          typeof body.action !== "string" ||
+          typeof body.idempotency_key !== "string" ||
+          (body.policy_version !== undefined && !Number.isInteger(body.policy_version)) ||
+          (body.limits !== undefined &&
+            (typeof body.limits !== "object" || body.limits === null || Array.isArray(body.limits))) ||
+          (body.halt_scope !== undefined && typeof body.halt_scope !== "string") ||
+          (body.halt_reason !== undefined && typeof body.halt_reason !== "string");
+        if (malformed) {
+          return void json(res, 400, { error: "FAIL_CLOSED_POLICY_SCHEMA" });
+        }
         return void json(res, 200, {
           auto_policy: autoPolicySvc.control({
             objective_id: m[1]!,
             actor: policyActor,
-            action: String(body.action ?? ""),
-            policy_version:
-              body.policy_version === undefined
-                ? undefined
-                : Number(body.policy_version),
+            action: body.action as string,
+            policy_version: body.policy_version as number | undefined,
             limits: body.limits,
-            idempotency_key: String(body.idempotency_key ?? ""),
+            idempotency_key: body.idempotency_key as string,
             halt_scope: body.halt_scope,
             halt_reason: body.halt_reason,
           }),

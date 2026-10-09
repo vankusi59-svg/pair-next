@@ -276,6 +276,13 @@ export function Objectives() {
             )}
             {!policy.error && policy.data && (() => {
               const ap = policy.data.auto_policy;
+              // O2 — stale-projection guard: only render/act on a policy
+              // row that provably belongs to the selected objective. A
+              // lagging response for the previous selection is never
+              // projected onto this one.
+              if (!ap || ap.objective_id !== selected?.objective_id) {
+                return <p className="state muted">auto policy loading…</p>;
+              }
               const act = async (action: string, limits?: import("../types").AutoPolicyStatus["limits"], haltReason?: string) => {
                 setPolicyBusy(true); setPolicyErr(null);
                 try {

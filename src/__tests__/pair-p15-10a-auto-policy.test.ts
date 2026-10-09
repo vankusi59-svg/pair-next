@@ -57,12 +57,12 @@ const TOK = "tok-p1510a";
 const FUTURE = "2999-01-01T00:00:00.000Z";
 const PAST = "2000-01-01T00:00:00.000Z";
 
-function fresh(name: string) {
+function fresh(name: string, now?: () => number) {
   const dir = path.join(ROOT, `${counter++}-${name}`);
   fs.mkdirSync(dir, { recursive: true });
   const store = new PairEvidenceStore(path.join(dir, "pair.db"));
   const objectives = new ObjectiveAuthorityService(store);
-  const policy = new ObjectiveAutoPolicyService(store, objectives);
+  const policy = new ObjectiveAutoPolicyService(store, objectives, now);
   return { dir, store, objectives, policy };
 }
 
@@ -250,16 +250,68 @@ describe("A03 — integrity + binding re-proof on read", () => {
     );
   });
 
-  it("stale/digest-mismatched last_op replay still verifies canonical row", () => {
+  it("self-rehashed row rewrite (state ENABLED + forged digest) fails via anchor", async () => {
     const { store, objectives, policy } = fresh("a03b");
     const o = mkObjective(objectives, mkBiz(store));
-    configure(policy, oid(o));
-    // Surgical tamper that keeps policy_digest valid is impossible
-    // without recomputing — flip state instead.
+    configure(policy, oid(o)); // v1 DISABLED + CONFIGURE anchor only
     const row = store.get("objective_auto_policy", `oap:${oid(o)}`);
-    store.put("objective_auto_policy", `oap:${oid(o)}`,
-      { ...row, state: "ENABLED" }, Number(row.version));
+    // Attacker: state=ENABLED + forged terms binding + rehashed digest —
+    // but CANNOT mint an ENABLE anchor via store.put.
+    const forged = {
+      ...row,
+      state: "ENABLED",
+      terms_digest_binding: String(o.objective_digest),
+    };
+    const { digest } = await import("../pair/canonical.js");
+    forged.policy_digest = digest({
+      schema: row.schema_version, entity_id: row.entity_id,
+      objective_id: row.objective_id, business_id: row.business_id,
+      owner_authority_id: row.owner_authority_id, state: "ENABLED",
+      state_reason: null, policy_version: row.policy_version,
+      limits: row.limits,
+      terms_digest_binding: String(o.objective_digest),
+      halt: null, applied_ops: row.applied_ops,
+      last_op: row.last_op, last_receipt: row.last_receipt,
+    });
+    store.put("objective_auto_policy", `oap:${oid(o)}`, forged, Number(row.version));
+    // Row self-verifies its own hash — the ANCHOR proof is what catches it.
     expectFail(() => policy.evaluate(oid(o)), "FAIL_CLOSED_POLICY_INTEGRITY");
+    expectFail(() => policy.status(oid(o), OWNER), "FAIL_CLOSED_POLICY_INTEGRITY");
+  });
+
+  it("last_op/last_receipt tamper is anchor-caught BEFORE replay shortcut", async () => {
+    const { store, objectives, policy } = fresh("a03c");
+    const o = mkObjective(objectives, mkBiz(store));
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    // Tamper replay metadata to mimic an already-applied revoke; keep
+    // policy_digest consistent so only the anchor proof can catch it.
+    const row = store.get("objective_auto_policy", `oap:${oid(o)}`);
+    const { digest } = await import("../pair/canonical.js");
+    const fakeOp = { key: "k-revoke", action: "revoke", op_digest: digest({ action: "revoke", limits: null, halt_scope: null, halt_reason: null }) };
+    const tampered = {
+      ...row, last_op: fakeOp,
+      last_receipt: { action: "revoke", to_state: "REVOKED" },
+    };
+    tampered.policy_digest = digest({
+      schema: row.schema_version, entity_id: row.entity_id,
+      objective_id: row.objective_id, business_id: row.business_id,
+      owner_authority_id: row.owner_authority_id, state: row.state,
+      state_reason: row.state_reason, policy_version: row.policy_version,
+      limits: row.limits, terms_digest_binding: row.terms_digest_binding,
+      halt: row.halt, applied_ops: row.applied_ops,
+      last_op: fakeOp, last_receipt: tampered.last_receipt,
+    });
+    store.put("objective_auto_policy", `oap:${oid(o)}`, tampered, Number(row.version));
+    // Real revoke by the owner must NOT be swallowed by forged replay
+    // metadata — anchor proof fails first, row untouched.
+    expectFail(
+      () => act(policy, oid(o), "revoke", OWNER, { policy_version: 2, idempotency_key: "k-revoke" }),
+      "FAIL_CLOSED_POLICY_INTEGRITY",
+    );
+    // Tampered row untouched — mutation never ran (raw store read).
+    const stored = store.get("objective_auto_policy", `oap:${oid(o)}`);
+    expect(stored.state).toBe("ENABLED");
   });
 });
 
@@ -322,6 +374,36 @@ describe("A04 — transition table + retry semantics", () => {
     expect(policy.evaluate(oid(o)).state).toBe("ENABLED");
   });
 
+  it("F4 — durable idempotency: used key converges across intervening ops", () => {
+    const { store, objectives, policy } = fresh("a04e");
+    const o = mkObjective(objectives, mkBiz(store));
+    configure(policy, oid(o)); // v1
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 }); // v2
+    act(policy, oid(o), "pause", OWNER, { policy_version: 2 }); // v3
+    const kReuse = `reuse-${counter}`;
+    act(policy, oid(o), "resume", OWNER, {
+      policy_version: 3, idempotency_key: kReuse,
+    }); // v4
+    act(policy, oid(o), "pause", OWNER, { policy_version: 4 }); // v5
+    // Resend the SAME resume op — must converge with zero mutation even
+    // though a pause intervened (durable ledger, not last-op-only).
+    const replay = policy.control({
+      objective_id: oid(o), actor: OWNER, action: "resume",
+      policy_version: 5, idempotency_key: kReuse,
+    });
+    expect(replay.policy_version).toBe(5);
+    expect(replay.state).toBe("PAUSED");
+    // Same key + different payload → typed conflict, still zero mutation.
+    expectFail(
+      () => policy.control({
+        objective_id: oid(o), actor: OWNER, action: "resume",
+        idempotency_key: kReuse, halt_reason: "tampered",
+      }),
+      "FAIL_CLOSED_POLICY_IDEMPOTENCY_CONFLICT",
+    );
+    expect(policy.evaluate(oid(o)).policy_version).toBe(5);
+  });
+
   it("REVOKED is terminal — no action resurrects it", () => {
     const { store, objectives, policy } = fresh("a04d");
     const o = mkObjective(objectives, mkBiz(store));
@@ -373,39 +455,61 @@ describe("A05 — binding invalidation", () => {
     expect(st.reasons).toContain("BINDING_OWNER_MISMATCH");
   });
 
-  it("expiry is lazy + committed once; expired window cannot resume", () => {
-    const { store, objectives, policy } = fresh("a05c");
+  it("ENABLED past expires_at → lazy EXPIRED committed once + anchor", () => {
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const { store, objectives, policy } = fresh("a05-clock", () => nowMs);
     const o = mkObjective(objectives, mkBiz(store));
     policy.control({
       objective_id: oid(o), actor: OWNER, action: "configure",
-      limits: { expires_at: PAST, max_ceo_calls: 1 }, idempotency_key: "c",
+      limits: { expires_at: "2030-01-02T00:00:00.000Z", max_ceo_calls: 1 },
+      idempotency_key: "c",
     });
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    expect(policy.evaluate(oid(o)).effective).toBe(true);
+    // Time passes beyond the window.
+    nowMs = Date.parse("2030-01-03T00:00:00.000Z");
+    const st = policy.evaluate(oid(o));
+    expect(st.state).toBe("EXPIRED");
+    expect(st.effective).toBe(false);
+    const v1 = policy.evaluate(oid(o)).policy_version;
+    // Committed once — second evaluate must NOT bump version again.
+    expect(v1).toBe(3);
+    expect(policy.evaluate(oid(o)).policy_version).toBe(3);
+  });
+
+  it("configure with an already-lapsed window is rejected at configure", () => {
+    const { store, objectives, policy } = fresh("a05-lapsed");
+    const o = mkObjective(objectives, mkBiz(store));
     expectFail(
-      () => act(policy, oid(o), "enable", OWNER, { policy_version: 1 }),
+      () => policy.control({
+        objective_id: oid(o), actor: OWNER, action: "configure",
+        limits: { expires_at: PAST, max_ceo_calls: 1 }, idempotency_key: "x",
+      }),
       "FAIL_CLOSED_POLICY_LIMITS",
     );
-    // Configure a future window, enable, then forge expiry by rewriting
-    // expires_at to the past via a fresh configure cycle? EXPIRED is
-    // reached via evaluate() only — direct write is needed to simulate
-    // a row minted earlier. Use configure on EXPIRED semantics instead:
+    expect(store.tryGet("objective_auto_policy", `oap:${oid(o)}`)).toBeFalsy();
+  });
+
+  it("expired/resume boundary: EXPIRED can reconfigure to DISABLED, never re-enables silently", () => {
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const { store, objectives, policy } = fresh("a05-exp", () => nowMs);
+    const o = mkObjective(objectives, mkBiz(store));
     policy.control({
       objective_id: oid(o), actor: OWNER, action: "configure",
-      limits: LIMITS(), idempotency_key: "c2", policy_version: 1,
+      limits: { expires_at: "2030-01-02T00:00:00.000Z", max_ceo_calls: 1 },
+      idempotency_key: "c",
     });
-    act(policy, oid(o), "enable", OWNER, { policy_version: 2 });
-    // Simulate time passing: rewrite expires_at through configure→EXPIRED
-    // is not allowed; use a row at its limit — direct store write of a
-    // valid-but-expired row is tamper territory, so instead verify the
-    // lazy path: mint a second objective whose limits expire instantly.
-    const o2 = mkObjective(objectives, String(o.business_id));
-    policy.control({
-      objective_id: oid(o2), actor: OWNER, action: "configure",
-      limits: { expires_at: new Date(Date.now() - 1000).toISOString(), max_ceo_calls: 1 },
-      idempotency_key: "c3",
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    nowMs = Date.parse("2030-01-03T00:00:00.000Z");
+    expect(policy.evaluate(oid(o)).state).toBe("EXPIRED");
+    // Reconfigure lands DISABLED — a fresh explicit enable is required.
+    const rec = policy.control({
+      objective_id: oid(o), actor: OWNER, action: "configure",
+      limits: { expires_at: "2030-02-01T00:00:00.000Z", max_ceo_calls: 1 },
+      idempotency_key: "c2", policy_version: 3,
     });
-    // The row was minted DISABLED — expiry applies to ENABLED only;
-    // enable of a lapsed window rejects (above). Proven fail-closed.
-    expect(policy.evaluate(oid(o2)).state).toBe("DISABLED");
+    expect(rec.state).toBe("DISABLED");
+    expect(rec.effective).toBe(false);
   });
 });
 
@@ -455,12 +559,29 @@ describe("A07 — kill scope OBJECTIVE only", () => {
     expect(reset.state).toBe("DISABLED");
     expect(reset.halt).toBeNull();
   });
+
+  it("non-OBJECTIVE halt scope rejected while ENABLED (HALT_SCOPE branch)", () => {
+    const { store, objectives, policy } = fresh("a07b");
+    const o = mkObjective(objectives, mkBiz(store));
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    for (const scope of ["BUSINESS", "GLOBAL", 42, null]) {
+      expectFail(
+        () => policy.control({
+          objective_id: oid(o), actor: OWNER, action: "halt",
+          policy_version: 2, halt_scope: scope, idempotency_key: `h-${scope}-${counter}`,
+        }),
+        "FAIL_CLOSED_POLICY_HALT_SCOPE",
+      );
+    }
+    expect(policy.evaluate(oid(o)).state).toBe("ENABLED");
+  });
 });
 
 /* ========= A08 — zero side effects (no model/executor calls) ========== */
 
 describe("A08 — no model/executor/mission/telegram side effects", () => {
-  it("global fetch + child_process never touched by policy paths", () => {
+  it("global fetch + child_process never touched by policy paths", async () => {
     const { store, objectives, policy } = fresh("a08");
     const o = mkObjective(objectives, mkBiz(store));
     const fetchSpy = vi.spyOn(globalThis, "fetch");
@@ -469,7 +590,10 @@ describe("A08 — no model/executor/mission/telegram side effects", () => {
     policy.evaluate(oid(o));
     act(policy, oid(o), "halt", OWNER, { policy_version: 2 });
     expect(fetchSpy).not.toHaveBeenCalled();
-    // No mission/governed_task/telegram rows minted.
+    // No mission/governed_task/telegram rows minted. (The service module
+    // statically imports zero child_process/planner/executor deps —
+    // ESM namespace exports are not spy-able, so the fetch spy + row
+    // checks cover the dynamic surface.)
     expect(store.list("mission")).toHaveLength(0);
     expect(store.list("governed_task")).toHaveLength(0);
     expect(store.list("telegram_delivery_request")).toHaveLength(0);
@@ -578,6 +702,82 @@ describe("A10 — HTTP boundary", () => {
     expect(denyPost.status).toBe(403);
   });
 
+  it("F2 — raw-header create → policy round trip (canonical actor derived)", async () => {
+    const { store, objectives } = fresh("a10c");
+    const bid = mkBiz(store);
+    const port = await serveMini(objectives, store);
+    const rawHdr = {
+      "content-type": "application/json",
+      "x-operator-id": "audit-owner", // RAW id, no operator: prefix
+      authorization: `Bearer ${TOK}`,
+    };
+    const c = await fetch(`http://127.0.0.1:${port}/api/vnext/objectives`, {
+      method: "POST", headers: rawHdr,
+      body: JSON.stringify({
+        business_id: bid, title: "t", statement: "s",
+        kpis: [{ name: "k", unit: "u", baseline: 0, target: 1 }],
+        deadline: FUTURE, budget_ceiling_microusd: 1,
+      }),
+    });
+    expect(c.status).toBe(200);
+    const cj = (await c.json()) as { objective_id: string; owner_authority_id: string };
+    expect(cj.owner_authority_id).toBe("operator:audit-owner");
+    const base = `http://127.0.0.1:${port}/api/vnext/objectives/${cj.objective_id}/auto-policy`;
+    // Same raw header is owner-canonical for policy ops too.
+    const g = await fetch(base, { headers: rawHdr });
+    expect(g.status).toBe(200);
+    const cfg = await fetch(base, {
+      method: "POST", headers: rawHdr,
+      body: JSON.stringify({ action: "configure", limits: LIMITS(), idempotency_key: "k1" }),
+    });
+    expect(cfg.status).toBe(200);
+    const cfgj = (await cfg.json()) as { auto_policy: { policy_version: number } };
+    const en = await fetch(base, {
+      method: "POST", headers: rawHdr,
+      body: JSON.stringify({ action: "enable", policy_version: cfgj.auto_policy.policy_version, idempotency_key: "k2" }),
+    });
+    expect(en.status).toBe(200);
+    const enj = (await en.json()) as { auto_policy: { state: string; effective: boolean } };
+    expect(enj.auto_policy.state).toBe("ENABLED");
+    expect(enj.auto_policy.effective).toBe(true);
+    // Prefixed canonical form of the SAME raw id also works both ways.
+    const g2 = await fetch(base, { headers: hdr("operator:audit-owner") });
+    expect(g2.status).toBe(200);
+    // A DIFFERENT owner (prefix or not) is still rejected.
+    const deny = await fetch(base, { headers: hdr("random-owner") });
+    expect(deny.status).toBe(403);
+    const deny2 = await fetch(base, { headers: hdr("operator:random-owner") });
+    expect(deny2.status).toBe(403);
+  });
+
+  it("F3 — malformed authority fields → 400, zero mutation, zero events", async () => {
+    const { store, objectives } = fresh("a10d");
+    const o = mkObjective(objectives, mkBiz(store));
+    const port = await serveMini(objectives, store);
+    const base = `http://127.0.0.1:${port}/api/vnext/objectives/${oid(o)}/auto-policy`;
+    const before = store.listEvents("objective_auto_policy", `oap:${oid(o)}`).length;
+    const badBodies = [
+      { action: ["enable"], policy_version: true, idempotency_key: 123 },
+      { action: { $ne: "enable" }, idempotency_key: "k" },
+      { action: "configure", limits: [{ expires_at: FUTURE }], idempotency_key: "k" },
+      { action: "configure", limits: LIMITS(), idempotency_key: ["k"] },
+      { action: "enable", policy_version: "2", idempotency_key: "k" },
+      { action: "halt", halt_scope: ["BUSINESS"], idempotency_key: "k" },
+    ];
+    for (const b of badBodies) {
+      const r = await fetch(base, {
+        method: "POST", headers: hdr(),
+        body: JSON.stringify(b),
+      });
+      expect(r.status).toBe(400);
+      const j = (await r.json()) as { error?: string };
+      expect(j.error).toBe("FAIL_CLOSED_POLICY_SCHEMA");
+    }
+    // Zero row, zero events minted by any malformed request.
+    expect(store.tryGet("objective_auto_policy", `oap:${oid(o)}`)).toBeFalsy();
+    expect(store.listEvents("objective_auto_policy", `oap:${oid(o)}`)).toHaveLength(before);
+  });
+
   it("POST owner configure → enable round-trip over HTTP", async () => {
     const { store, objectives } = fresh("a10b");
     const o = mkObjective(objectives, mkBiz(store));
@@ -597,6 +797,25 @@ describe("A10 — HTTP boundary", () => {
     const ej = (await e.json()) as { auto_policy: { state: string; effective: boolean } };
     expect(ej.auto_policy.state).toBe("ENABLED");
     expect(ej.auto_policy.effective).toBe(true);
+  });
+});
+
+/* ===== O1 — effective honors the objective lifecycle ===== */
+
+describe("O1 — effective = auto eligibility (lifecycle guard)", () => {
+  it("CANCELLED objective → effective=false even with ENABLED policy", () => {
+    const { store, objectives, policy } = fresh("o1");
+    const o = mkObjective(objectives, mkBiz(store));
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    expect(policy.evaluate(oid(o)).effective).toBe(true);
+    objectives.transitionStatus(oid(o), {
+      business_id: String(o.business_id), to: "CANCELLED", actor: OWNER,
+    });
+    const st = policy.evaluate(oid(o));
+    expect(st.state).toBe("ENABLED");
+    expect(st.effective).toBe(false);
+    expect(st.reasons).toContain("OBJECTIVE_CANCELLED");
   });
 });
 

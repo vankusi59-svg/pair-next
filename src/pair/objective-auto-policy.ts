@@ -32,6 +32,13 @@ import type { ObjectiveAuthorityService } from "./objective-authority.js";
 
 export const AUTO_POLICY_ENTITY = "objective_auto_policy";
 export const AUTO_POLICY_SCHEMA = "pair.os.vnext.objective-auto-policy.v1";
+/** Immutable transition anchors — every version bump mints exactly one
+ *  event carrying a `pins_digest` of the committed row. A rewritten
+ *  row (even self-rehashed) diverges from the newest anchor and fails
+ *  closed; a missing/duplicate anchor fails closed too. The `events`
+ *  table is append-only INSERT through store.event — entity writers
+ *  cannot mint anchors via store.put. */
+export const AUTO_POLICY_EVENT_KIND = "OBJECTIVE_AUTO_POLICY_OP";
 
 export const AUTO_POLICY_STATES = [
   "DISABLED",
@@ -91,7 +98,12 @@ interface PolicyRow {
   /** objectiveDigest() captured at enable — ANY terms_version bump
    *  invalidates authorization on next evaluate (no silent re-auth). */
   terms_digest_binding: string | null;
-  /** Last idempotent op — replay converges to its receipt. */
+  /** Durable per-key operation ledger (objective-authority
+   *  applied_spend_keys pattern): same key + same op_digest is an
+   *  idempotent replay ACROSS ALL past operations, same key + different
+   *  digest fails closed. Never shrinks to "last op only". */
+  applied_ops: { key: string; action: string; op_digest: string }[];
+  /** Last idempotent op — receipt projection of the newest applied op. */
   last_op: { key: string; action: string; op_digest: string } | null;
   last_receipt: Record<string, unknown> | null;
   halt: { scope: "OBJECTIVE"; actor: string; at: string; reason: string } | null;
@@ -174,10 +186,35 @@ function policyDigestOf(r: Omit<PolicyRow, "policy_digest">): string {
     business_id: r.business_id,
     owner_authority_id: r.owner_authority_id,
     state: r.state,
+    state_reason: r.state_reason,
     policy_version: r.policy_version,
     limits: r.limits,
     terms_digest_binding: r.terms_digest_binding,
     halt: r.halt,
+    applied_ops: r.applied_ops,
+    last_op: r.last_op,
+    last_receipt: r.last_receipt,
+  });
+}
+
+/** Consent/provenance pins committed in each transition anchor — the
+ *  immutable record of WHAT the owner authorized at that version.
+ *  Re-proved against the live row on every read/control/replay. */
+function pinsDigestOf(r: PolicyRow): string {
+  return digest({
+    entity_id: r.entity_id,
+    objective_id: r.objective_id,
+    business_id: r.business_id,
+    owner_authority_id: r.owner_authority_id,
+    state: r.state,
+    state_reason: r.state_reason,
+    policy_version: r.policy_version,
+    limits: r.limits,
+    terms_digest_binding: r.terms_digest_binding,
+    halt: r.halt,
+    applied_ops: r.applied_ops,
+    last_op: r.last_op,
+    last_receipt: r.last_receipt,
   });
 }
 
@@ -185,6 +222,9 @@ export class ObjectiveAutoPolicyService {
   constructor(
     private readonly store: PairEvidenceStore,
     private readonly objectives: ObjectiveAuthorityService,
+    /** Injectable clock — deterministic expiry tests; production uses
+     *  Date.now. */
+    private readonly now: () => number = () => Date.now(),
   ) {}
 
   private policyId(objectiveId: string): string {
@@ -222,12 +262,109 @@ export class ObjectiveAutoPolicyService {
       fail("FAIL_CLOSED_POLICY_INTEGRITY", "limits shape");
     }
     if (p.limits) assertLimits(p.limits);
+    // applied_ops — strict durable-ledger shape (same rules as
+    // objective-authority applied_spend_keys): {key, action, op_digest}
+    // entries, unique keys — even a duplicate key/digest is malformed.
+    if (!Array.isArray(p.applied_ops)) {
+      fail("FAIL_CLOSED_POLICY_INTEGRITY", "applied_ops shape");
+    }
+    const seenKeys = new Set<string>();
+    for (const e of p.applied_ops as unknown[]) {
+      if (!e || typeof e !== "object") {
+        fail("FAIL_CLOSED_POLICY_INTEGRITY", "applied_ops entry");
+      }
+      const ee = e as Record<string, unknown>;
+      if (
+        typeof ee.key !== "string" || !ee.key ||
+        !(AUTO_POLICY_ACTIONS as readonly string[]).includes(String(ee.action)) ||
+        typeof ee.op_digest !== "string" || !ee.op_digest ||
+        seenKeys.has(String(ee.key))
+      ) {
+        fail("FAIL_CLOSED_POLICY_INTEGRITY", "applied_ops entry invalid");
+      }
+      seenKeys.add(String(ee.key));
+    }
     if (
       p.policy_digest !==
       policyDigestOf({ ...(p as unknown as PolicyRow) })
     ) {
       fail("FAIL_CLOSED_POLICY_INTEGRITY", "policy_digest mismatch");
     }
+  }
+
+  /** F1 — anchor re-proof: the live row must be consistent with the
+   *  immutable committed anchors in the events table. Exactly one
+   *  anchor per policy_version, an unbroken from_state chain, and the
+   *  newest anchor's pins_digest equal to the row's recomputed pins.
+   *  A store.put row rewrite — self-rehashed or not — cannot mint an
+   *  anchor, so tampered state/limits/last_op/last_receipt/applied_ops
+   *  is caught here BEFORE any replay shortcut or status projection. */
+  private assertAnchorProof(row: PolicyRow): void {
+    const events = this.store.listEvents(AUTO_POLICY_ENTITY, row.entity_id);
+    const anchors = events.filter((e) => {
+      const m = e.metadata as Record<string, unknown> | null;
+      return m && m.kind === AUTO_POLICY_EVENT_KIND;
+    });
+    if (anchors.length !== row.policy_version) {
+      fail(
+        "FAIL_CLOSED_POLICY_INTEGRITY",
+        `anchor count ${anchors.length} != policy_version ${row.policy_version}`,
+      );
+    }
+    let prevTo: string | null = null;
+    for (let i = 0; i < anchors.length; i++) {
+      const m = anchors[i]!.metadata as Record<string, unknown>;
+      if (
+        m.policy_version !== i + 1 ||
+        typeof m.pins_digest !== "string" ||
+        typeof m.to_state !== "string" ||
+        (i > 0 && m.from_state !== prevTo)
+      ) {
+        fail("FAIL_CLOSED_POLICY_INTEGRITY", `anchor chain broken at v${i + 1}`);
+      }
+      prevTo = String(m.to_state);
+    }
+    const newest = anchors[anchors.length - 1]!.metadata as Record<string, unknown>;
+    if (
+      newest.pins_digest !== pinsDigestOf(row) ||
+      newest.to_state !== row.state
+    ) {
+      fail(
+        "FAIL_CLOSED_POLICY_INTEGRITY",
+        "row diverges from committed anchor pins",
+      );
+    }
+  }
+
+  private mintAnchor(
+    id: string,
+    action: string,
+    fromState: string | null,
+    next: PolicyRow,
+    idem: string | null,
+    opDigest: string | null,
+    actor: string,
+    objectiveId: string,
+  ): void {
+    this.store.event({
+      entity_type: AUTO_POLICY_ENTITY,
+      entity_id: id,
+      event_type: `OBJECTIVE_AUTO_POLICY_${action.toUpperCase()}`,
+      old_state: fromState,
+      new_state: next.state,
+      actor: `operator:${actor}`,
+      correlation_id: objectiveId,
+      metadata: {
+        kind: AUTO_POLICY_EVENT_KIND,
+        action,
+        policy_version: next.policy_version,
+        from_state: fromState,
+        to_state: next.state,
+        idempotency_key: idem,
+        op_digest: opDigest,
+        pins_digest: pinsDigestOf(next),
+      },
+    });
   }
 
   private getObjectiveRow(objectiveId: string) {
@@ -289,8 +426,16 @@ export class ObjectiveAutoPolicyService {
           reasons.push("TERMS_CHANGED");
         }
         const exp = row.limits?.expires_at;
-        if (!exp || Date.parse(exp) <= Date.now())
+        if (!exp || Date.parse(exp) <= this.now())
           reasons.push("EXPIRED_OR_NO_EXPIRY");
+        // O1 — effective means actual auto eligibility, not merely a
+        // valid binding: the objective's own lifecycle must still
+        // permit autonomous work (ACTIVE) and its deadline unpassed.
+        const objStatus = String(obj.status ?? "");
+        if (objStatus !== "ACTIVE") reasons.push(`OBJECTIVE_${objStatus}`);
+        const deadline = typeof obj.deadline === "string" ? Date.parse(obj.deadline) : NaN;
+        if (!Number.isNaN(deadline) && deadline <= this.now())
+          reasons.push("OBJECTIVE_DEADLINE_PASSED");
         effective = reasons.length === 0;
       }
     }
@@ -321,14 +466,17 @@ export class ObjectiveAutoPolicyService {
         AUTO_POLICY_ENTITY,
         this.policyId(objectiveId),
       ) as unknown as PolicyRow | null;
-      if (row != null) this.assertCanonicalRow(row);
+      if (row != null) {
+        this.assertCanonicalRow(row);
+        this.assertAnchorProof(row);
+      }
       // Lazy expiry — ENABLED/PAUSED past expires_at commit EXPIRED
       // once, with an event receipt. Never a silent auto-renew.
       if (
         row &&
         (row.state === "ENABLED" || row.state === "PAUSED") &&
         row.limits &&
-        Date.parse(row.limits.expires_at) <= Date.now()
+        Date.parse(row.limits.expires_at) <= this.now()
       ) {
         const expired = { ...row, version: Number(row.version) } as PolicyRow;
         expired.state = "EXPIRED";
@@ -337,15 +485,10 @@ export class ObjectiveAutoPolicyService {
         expired.updated_at = utcnow();
         expired.policy_digest = policyDigestOf(expired);
         this.store.put(AUTO_POLICY_ENTITY, expired.entity_id, expired as unknown as Record<string, unknown> & { version: number }, Number(row.version));
-        this.store.event({
-          entity_type: AUTO_POLICY_ENTITY,
-          entity_id: expired.entity_id,
-          event_type: "OBJECTIVE_AUTO_POLICY_EXPIRED",
-          old_state: row.state,
-          new_state: "EXPIRED",
-          actor: `system:auto-policy`,
-          metadata: { objective_id: objectiveId },
-        });
+        this.mintAnchor(
+          expired.entity_id, "expire", row.state, expired,
+          null, null, "system:auto-policy", objectiveId,
+        );
         row = expired;
       }
       return this.toStatus(objectiveId, obj, row);
@@ -363,7 +506,10 @@ export class ObjectiveAutoPolicyService {
         AUTO_POLICY_ENTITY,
         this.policyId(objectiveId),
       ) as unknown as PolicyRow | null;
-      if (row != null) this.assertCanonicalRow(row);
+      if (row != null) {
+        this.assertCanonicalRow(row);
+        this.assertAnchorProof(row);
+      }
       // Reuse toStatus but WITHOUT lazy-expiry write — reads never
       // mutate; evaluate() performs expiry, status reports state.
       return this.toStatus(objectiveId, obj, row);
@@ -398,18 +544,24 @@ export class ObjectiveAutoPolicyService {
       const id = this.policyId(objectiveId);
       let row = this.store.tryGet(AUTO_POLICY_ENTITY, id) as
         unknown as PolicyRow | null;
-      if (row != null) this.assertCanonicalRow(row);
+      if (row != null) {
+        this.assertCanonicalRow(row);
+        this.assertAnchorProof(row);
+      }
 
-      // Idempotent replay: same key + same operation → the recorded
-      // receipt; same key + different payload → typed conflict.
+      // Durable idempotent replay across ALL recorded operations (F4):
+      // a previously-applied key converges with no new mutation no
+      // matter how many operations intervened; same key + different
+      // payload fails closed.
       const opDigest = digest({
         action,
         limits: input.limits ?? null,
         halt_scope: input.halt_scope ?? null,
         halt_reason: input.halt_reason ?? null,
       });
-      if (row?.last_op && row.last_op.key === idem) {
-        if (row.last_op.op_digest === opDigest && row.last_receipt) {
+      const seen = row?.applied_ops.find((o) => o.key === idem);
+      if (seen) {
+        if (seen.op_digest === opDigest) {
           return this.toStatus(objectiveId, obj, row);
         }
         fail("FAIL_CLOSED_POLICY_IDEMPOTENCY_CONFLICT", idem);
@@ -433,6 +585,7 @@ export class ObjectiveAutoPolicyService {
           policy_version: 0,
           limits: null,
           terms_digest_binding: null,
+          applied_ops: [],
           last_op: null,
           last_receipt: null,
           halt: null,
@@ -461,8 +614,14 @@ export class ObjectiveAutoPolicyService {
         case "configure": {
           // DISABLED or EXPIRED → (re)arm with a fresh finite limit
           // set. EXPIRED reconfigure lands back on DISABLED — an
-          // expired window never silently re-enables.
-          next.limits = assertLimits(input.limits);
+          // expired window never silently re-enables. A window that is
+          // already lapsed is not a finite authorization — reject it
+          // here rather than at some later transition.
+          const limits = assertLimits(input.limits);
+          if (Date.parse(limits.expires_at) <= this.now()) {
+            fail("FAIL_CLOSED_POLICY_LIMITS", "expires_at already lapsed");
+          }
+          next.limits = limits;
           next.state = "DISABLED";
           next.state_reason = null;
           break;
@@ -471,7 +630,7 @@ export class ObjectiveAutoPolicyService {
           if (!row.limits) {
             fail("FAIL_CLOSED_POLICY_LIMITS", "configure limits first");
           }
-          if (Date.parse(row.limits.expires_at) <= Date.now()) {
+          if (Date.parse(row.limits.expires_at) <= this.now()) {
             fail("FAIL_CLOSED_POLICY_LIMITS", "limits already expired");
           }
           next.state = "ENABLED";
@@ -487,7 +646,7 @@ export class ObjectiveAutoPolicyService {
         case "resume":
           // Stale resume never resurrects an expired/revoked window —
           // PAUSED→ENABLED still requires limits unexpired.
-          if (!row.limits || Date.parse(row.limits.expires_at) <= Date.now()) {
+          if (!row.limits || Date.parse(row.limits.expires_at) <= this.now()) {
             fail("FAIL_CLOSED_POLICY_LIMITS", "window expired — reconfigure");
           }
           next.state = "ENABLED";
@@ -540,22 +699,13 @@ export class ObjectiveAutoPolicyService {
       };
       next.last_op = { key: idem, action, op_digest: opDigest };
       next.last_receipt = receipt;
+      next.applied_ops = [...row.applied_ops, { key: idem, action, op_digest: opDigest }];
       next.policy_digest = policyDigestOf(next);
 
       this.store.put(AUTO_POLICY_ENTITY, id, next as unknown as Record<string, unknown> & { version: number }, Number(row.version));
-      this.store.event({
-        entity_type: AUTO_POLICY_ENTITY,
-        entity_id: id,
-        event_type: `OBJECTIVE_AUTO_POLICY_${action.toUpperCase()}`,
-        old_state: row === undefined ? null : row.state,
-        new_state: next.state,
-        actor: `operator:${actor}`,
-        correlation_id: objectiveId,
-        metadata: {
-          policy_version: next.policy_version,
-          idempotency_key: idem,
-        },
-      });
+      this.mintAnchor(
+        id, action, row.state, next, idem, opDigest, actor, objectiveId,
+      );
       return this.toStatus(objectiveId, obj, next);
     });
   }
