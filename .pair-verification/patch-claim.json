@@ -4,8 +4,7 @@
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "RECOVERY_REPLAY",
-    "COST_GOVERNANCE"
+    "RECOVERY_REPLAY"
   ],
   "required_tests": [
     "src/__tests__/pair-p15-10c.test.ts",
