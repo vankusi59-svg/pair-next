@@ -39,6 +39,7 @@ import type {
 } from "./conversation-session.js";
 import type { ConversationReasoningService, ConversationTurnResult } from "./conversation-reasoning.js";
 import type { MissionDraftService, MissionDraftRow } from "./mission-draft.js";
+import { resolveProposalProject } from "./mission-draft.js";
 
 export const TELEGRAM_CHAT_BINDING_ENTITY = "telegram_chat_binding";
 export const TELEGRAM_CONFIRM_REF_ENTITY = "telegram_confirm_ref";
@@ -229,7 +230,11 @@ export interface TelegramIngressDeps {
 export type TelegramIngressResult =
   | { kind: "reply"; session_id: string; reply: string; reused: boolean }
   | { kind: "ack_confirmed"; session_id: string; draft_id: string; mission_id: string; reused: boolean }
-  | { kind: "reasoning_unavailable"; session_id: string };
+  | { kind: "reasoning_unavailable"; session_id: string }
+  | { kind: "draft_proposal"; session_id: string; reply: string;
+      draft: MissionDraftRow; ref: TelegramConfirmRefRow; presentation: string[] }
+  | { kind: "project_candidates"; session_id: string; reply: string; goal: string;
+      candidates: Array<{ project_id: string; name: string }> };
 
 export class TelegramConversationService {
   constructor(private readonly deps: TelegramIngressDeps) {}
@@ -565,6 +570,37 @@ export class TelegramConversationService {
       body: text,
       idempotency_key: `tg:upd:${Number(input.update_id)}`,
     });
+    // P15.8-F — actionable text may carry a model PROPOSAL. The proposal
+    // itself authorizes nothing; materialization runs through the same
+    // canonical prepareDraft seam as /draft (deterministic project
+    // resolution, update-bound idempotency, ref + bounded presentation).
+    // Ambiguous or absent projects mint NOTHING — the bridge presents
+    // the candidate list and the operator chooses via /draft.
+    if (turn.proposal && !turn.reused) {
+      const res = resolveProposalProject(this.deps.store);
+      if (res.kind === "resolved") {
+        const prepared = this.prepareDraft({
+          operator_id: operatorId, chat_id: chatId,
+          project_id: res.project_id, goal: turn.proposal.goal,
+          update_id: updateId,
+        });
+        return {
+          kind: "draft_proposal",
+          session_id: session.session_id,
+          reply: String(turn.reply.body ?? ""),
+          draft: prepared.draft,
+          ref: prepared.ref,
+          presentation: prepared.presentation,
+        };
+      }
+      return {
+        kind: "project_candidates",
+        session_id: session.session_id,
+        reply: String(turn.reply.body ?? ""),
+        goal: turn.proposal.goal,
+        candidates: res.candidates,
+      };
+    }
     return {
       kind: "reply",
       session_id: session.session_id,

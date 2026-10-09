@@ -385,50 +385,54 @@ async function processCommand(chatId, text, ctx = {}) {
         // back to a random — never deduped worse than before.
         update_id: updateId ?? Math.floor(Math.random() * 1e9),
       }, op);
-      // R1.B — the server returns the COMPLETE canonical presentation:
-      // every segment must be delivered, in order, and the Confirm
-      // markup may ride ONLY on the last one. callback_data carries
-      // nothing but the opaque ref id; the full digest is server-side.
-      const parts = Array.isArray(d.presentation) ? d.presentation : null;
-      if (!parts?.length) {
-        throw new Error("draft presentation missing — refusing to grant confirm authority");
-      }
-      const refId = d.ref.ref_id;
-      return async () => {
-        let lastMid;
-        for (let i = 0; i < parts.length; i++) {
-          const last = i === parts.length - 1;
-          const extra = last
-            ? {
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: "✅ Confirm", callback_data: `c:${refId}` },
-                    { text: "❌ Reject", callback_data: `r:${refId}` },
-                  ]],
-                },
-              }
-            : {};
-          // Propagating send — a mid-presentation failure aborts the
-          // sequence BEFORE any buttons exist, so partial terms can
-          // never be confirmed (R1.B).
-          const sent = await tg("sendMessage", {
-            chat_id: chatId,
-            text: String(parts[i]).slice(0, 4000),
-            disable_web_page_preview: true,
-            ...extra,
-          });
-          if (last) lastMid = sent?.message_id;
-        }
-        if (Number.isSafeInteger(Number(lastMid))) {
-          await mc("POST", `/api/telegram/conversation/refs/${refId}/prompt-sent`,
-            { chat_id: String(chatId), message_id: Number(lastMid) }, op)
-            .catch((e) => console.error("prompt-sent:", String(e).slice(0, 160)));
-        }
-      };
+      return deliverDraftPresentation(chatId, d.presentation, d.ref?.ref_id, op);
     }
     default:
       return () => send(chatId, `Lệnh không hiểu: ${cmd}. /help để xem danh sách.`);
   }
+}
+
+// ---- draft presentation delivery (R1.B, shared by /draft + proposals) --
+// The server returns the COMPLETE canonical presentation: every segment
+// must be delivered, in order, and the Confirm markup may ride ONLY on
+// the last one. callback_data carries nothing but the opaque ref id;
+// the full digest is server-side. Returns a DELIVER thunk.
+function deliverDraftPresentation(chatId, presentation, refId, op) {
+  const parts = Array.isArray(presentation) ? presentation : null;
+  if (!parts?.length || !refId) {
+    throw new Error("draft presentation missing — refusing to grant confirm authority");
+  }
+  return async () => {
+    let lastMid;
+    for (let i = 0; i < parts.length; i++) {
+      const last = i === parts.length - 1;
+      const extra = last
+        ? {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "✅ Confirm", callback_data: `c:${refId}` },
+                { text: "❌ Reject", callback_data: `r:${refId}` },
+              ]],
+            },
+          }
+        : {};
+      // Propagating send — a mid-presentation failure aborts the
+      // sequence BEFORE any buttons exist, so partial terms can
+      // never be confirmed (R1.B).
+      const sent = await tg("sendMessage", {
+        chat_id: chatId,
+        text: String(parts[i]).slice(0, 4000),
+        disable_web_page_preview: true,
+        ...extra,
+      });
+      if (last) lastMid = sent?.message_id;
+    }
+    if (Number.isSafeInteger(Number(lastMid))) {
+      await mc("POST", `/api/telegram/conversation/refs/${refId}/prompt-sent`,
+        { chat_id: String(chatId), message_id: Number(lastMid) }, op)
+        .catch((e) => console.error("prompt-sent:", String(e).slice(0, 160)));
+    }
+  };
 }
 
 // ---- P15.8-E — conversation ingress -----------------------------------
@@ -490,6 +494,33 @@ async function processMessage(chatId, msg) {
   }
   if (r.kind === "reasoning_unavailable") {
     return () => send(chatId, "AI reasoning hiện không khả dụng — thử lại sau. (Mission/draft vẫn hoạt động bình thường qua /draft.)");
+  }
+  // P15.8-F — an actionable message produced a governed draft proposal.
+  // Deliver the conversational reply first, then the FULL canonical
+  // presentation with Confirm/Reject bound to the server-issued ref —
+  // same delivery contract as /draft.
+  if (r.kind === "draft_proposal") {
+    const deliver = deliverDraftPresentation(chatId, r.presentation, r.ref?.ref_id, op);
+    return async () => {
+      const replyText = String(r.reply ?? "").trim();
+      if (replyText) await sendReply(chatId, replyText);
+      await deliver();
+    };
+  }
+  // Ambiguous/absent project — the draft cannot be minted; present the
+  // deterministic candidate list and the explicit way to resolve it.
+  if (r.kind === "project_candidates") {
+    return () => {
+      const replyText = String(r.reply ?? "").trim();
+      const list = (r.candidates ?? []).map(
+        (x) => `  ${x.project_id} — ${trunc(x.name ?? "", 50)}`).join("\n");
+      const body =
+        (replyText ? `${replyText}\n\n` : "") +
+        (list
+          ? `Tôi có thể chuẩn bị mission này nhưng cần chọn project. Reply TIN NHẮN GỐC của bạn bằng /draft <project_id>:\n${list}`
+          : `Tôi có thể chuẩn bị mission này nhưng chưa có project nào trong hệ thống — tạo project trên Mission Control trước.`);
+      return send(chatId, body);
+    };
   }
   return () => sendReply(chatId, r.reply ?? "");
 }

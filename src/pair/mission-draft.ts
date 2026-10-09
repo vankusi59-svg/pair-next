@@ -840,3 +840,29 @@ export class MissionDraftService {
     return this.deps.draft_ttl_s ?? MISSION_DRAFT_DEFAULT_TTL_S;
   }
 }
+
+/* ------------------------------------------------------------------ *
+ *  P15.8-F — proposal project resolution (deterministic)               *
+ * ------------------------------------------------------------------ */
+
+/** Resolve which canonical project a conversational proposal may bind
+ *  to. The rule is fixed and server-side — the model NEVER names a
+ *  project: exactly one canonical project → it is used; more than one →
+ *  ambiguous and the operator must choose before a confirmable draft
+ *  may be minted; zero → no draft possible. */
+export type ProposalProjectResolution =
+  | { kind: "resolved"; project_id: string }
+  | { kind: "ambiguous"; candidates: Array<{ project_id: string; name: string }> }
+  | { kind: "none"; candidates: [] };
+
+export function resolveProposalProject(store: PairEvidenceStore): ProposalProjectResolution {
+  const projects = store.list("project")
+    .map((p) => ({
+      project_id: String(p.project_id ?? ""),
+      name: String(p.name ?? p.project_id ?? ""),
+    }))
+    .filter((p) => p.project_id !== "");
+  if (projects.length === 0) return { kind: "none", candidates: [] };
+  if (projects.length === 1) return { kind: "resolved", project_id: projects[0]!.project_id };
+  return { kind: "ambiguous", candidates: projects };
+}

@@ -137,6 +137,15 @@ export interface ConversationTurnResult {
   message: ConversationMessage;
   reply: ConversationMessage;
   reused: boolean;
+  /** P15.8-F — validated model mission proposal: never authority.
+   *  `draft` when it materialized canonically, `project_candidates`
+   *  when project choice is ambiguous (no draft minted). */
+  proposal?: {
+    goal: string;
+    draft?: MissionDraft;
+    project_candidates?: { project_id: string; name: string }[];
+    rejected?: string;
+  };
 }
 
 export interface MissionDraft {
