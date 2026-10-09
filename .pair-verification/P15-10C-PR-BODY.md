@@ -200,3 +200,52 @@ Independent-audit remediation for residual F1 findings. All three classified **C
 `verify:change --base 0e27bc6 --full` → **READY_FOR_INDEPENDENT_AUDIT** (HIGH). tsc + build PASS. Full suite +3 known baseline. Regression: p15-10c 19/19, R1 10/10, p15-3 102/102, p15-5 58/58, p15-6 69/69, p15-10a/10b PASS.
 
 Remaining: F2 (route-level cost bound), F3 (readiness projection) — out of R2 scope, pending audit.
+
+---
+
+## P15.10-C R3 — COST AUTHORITY & READINESS CLOSURE (HEAD `d6b7c52`)
+
+Mandate: verify + minimal-patch F2 (route/task-level cost liability), F3 (truthful readiness), correct one F1b coverage gap. Prepatch repro: **12/14 R3 tests FAILED** before any fix — both defects CONFIRMED, not suspected.
+
+### Finding verdicts
+
+| Finding | Verdict | Root cause | Fix |
+|---|---|---|---|
+| F2 route/task liability | **CONFIRMED → FIXED** | `assertAndReserve` knew the governed task's real route/executor identity but summed only business/department/agent/mission scopes — the objective cap never bound at the real pre-spend boundary. Driver bound was executor-only (`billingFor(executorId, null)`), missing pricier route/model profiles. | Objective cap enforced **inside the same atomic check-and-reserve transaction**: lineage resolved fresh in-txn (`mission.bound_open_id → work_open_binding → workforce_allocation → oap:<oid>.limits.budget_microusd_cap`); attributed liability (HELD/COMMITTED @reserved, SETTLED @settled, RELEASED skipped) + new reservation > cap → `FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED`; UNKNOWN/unbounded under cap → `FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED` (never $0). Driver `dispatchCostBound` now route-aware over every reachable executor→route/model profile; remains a **preliminary** admission check. No second cost engine; P13 hard-stops untouched. |
+| F3 truthful readiness | **CONFIRMED → FIXED** | `driver_ready` was `driver?.enabled === true` — wiring, not evidence. | New `driver.readiness(objectiveId, actor)` derives runnable truth **only from canonical evidence**: scheduler cursor READY + policy effective + queue not QUARANTINED/BLOCKED_AUTHORITY + provable cost binding + budget room, with typed reasons. `scheduler.status` and both MC routes consume it. `driver_integrated` added (deployment fact); `driver_ready`/`objective_runnable` = runnable; `driver_missing` carries real reason codes. Backward compatible. |
+| F1b coverage | **CONFIRMED → CORRECTED** | R2 drift test called `configure` on ENABLED policy — invalid transition, vacuous. | Test now uses the only legitimate re-bind path (`disable→configure→enable` mid-await) — real policy_version bump + fresh terms pin while the old worker is in-flight; commit guard still fences it. F1 impl untouched. |
+
+### F2 test evidence (prepatch FAIL → postpatch PASS)
+
+- **F2a** route profile (300k) pricier than executor (50k) under 200k cap → denied at reserve; executor-bound alone would have admitted.
+- **F2b** two tasks on one mission: 300k + 300k > 600k cap → second denied; first stays HELD.
+- **F2c** two **separate SQLite connections** race the same budget → exactly one HELD reservation, loser denied atomically.
+- **F2d** UNKNOWN/unbounded billing under cap → `FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED`, never $0.
+- **F2e** HELD retry → `FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS` (no new authority); COMMITTED → idempotent adopt same row; SETTLED 300k still counts → next 300k denied over 500k cap.
+- **F2f** objective A's 300k never charges B — B reserves under its own cap; A's second task denied.
+
+### F3 readiness truth table (all PASS)
+
+| driver | scheduler | policy | cost binding | runnable |
+|---|---|---|---|---|
+| OFF | — | — | — | false, `AUTO_DRIVER_NOT_INTEGRATED` |
+| ON | not READY | — | — | false, `SCHEDULER_NOT_READY` |
+| ON | READY | DISABLED/PAUSED/EXPIRED | — | false, `POLICY_NOT_EFFECTIVE` |
+| ON | READY | effective | unprovable | false, `COST_BINDING_UNVERIFIED` |
+| ON | READY | effective | provable + room | **true** |
+| ON | READY | effective | quarantined / cap exhausted | false, `OBJECTIVE_QUARANTINED` / `BUDGET_EXHAUSTED` |
+
+Owner-scoped read proven; non-owner denied `FAIL_CLOSED_POLICY_FORBIDDEN` before any driver state is read.
+
+### Diff (R3 delta on `60ae17e`)
+
+`+250/−49`, 8 files: `cost.ts` (+122: in-txn objective scope check + 2 lineage helpers + objective violation path), `objective-auto-driver.ts` (route-aware bound + `readiness()`), `objective-auto-scheduler.ts` (status runnable semantics), `mission-control-server.ts` (both routes consume real readiness), `pair-p15-10c-r3.test.ts` (+450 new repro suite), R2-F1b + C24 test corrections, patch-claim/notes.
+
+### Verification
+
+- `verify:change --base 0e27bc6 --full` → **READY_FOR_INDEPENDENT_AUDIT** (claim `P15_10_C_R3_COST_READINESS_CLOSURE`)
+- Focused: r3 **14/14**, 10c+r1+r2+p13 **106/106**, p15-3/5/6/10* **360/360**
+- tsc PASS, build PASS, full suite PASS_WITH_KNOWN_BASELINE (+3 pre-existing)
+- R1/R2 audited patches kept verbatim; driver remains opt-in OFF.
+
+**No merge. No deploy. `PAIR_OBJECTIVE_AUTO_DRIVER` not enabled in production.**

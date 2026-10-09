@@ -231,6 +231,56 @@ export class ObjectiveAutoScheduler {
     return { row, status };
   }
 
+  /** P15.10-C R4 F3 — the canonical per-objective claim predicate.
+   *  claim() and the readiness projection share THIS evaluation so a
+   *  status read can never drift from what a real claim enforces.
+   *  Returns the typed ineligibility reason, or null when the queue
+   *  alone would permit a claim attempt right now. */
+  private queueEligibility(q: Queue | null): string | null {
+    if (!q) return "NO_QUEUE";
+    if (q.queue_state !== "WAITING_CONSUMER") return `QUEUE_${q.queue_state}`;
+    if (q.pending_generation <= q.claimed_generation &&
+        q.claimed_generation <= q.settled_generation) {
+      return "NO_PENDING_GENERATION";
+    }
+    if (q.next_due !== null && q.next_due > this.instant()) return "NOT_DUE_YET";
+    if (Number(q.last_attempt_at ?? -30_000) + 30_000 > this.instant()) {
+      return "ATTEMPT_COOLDOWN";
+    }
+    return null;
+  }
+
+  /** Read-only canonical claim-eligibility proof: the same queue
+   *  predicate claim() enforces, plus the objective-level authority and
+   *  lease conditions a real claim requires. Global contention checks
+   *  (roster cap, rate window) stay in claim() — they are transient,
+   *  never an objective-readiness fact. Never mutates: no wake, no
+   *  lease, no invalidation. */
+  claimable(objectiveId: string): { eligible: boolean; reason: string | null } {
+    return this.proof(() => {
+      const q = this.queue(objectiveId);
+      const qr = this.queueEligibility(q);
+      if (qr !== null) return { eligible: false, reason: qr };
+      const a = this.authority(objectiveId);
+      if (!a.status.configured || !a.status.effective) {
+        return { eligible: false, reason: "POLICY_NOT_EFFECTIVE" };
+      }
+      if (!a.status.terms_current ||
+          a.status.policy_version !== q!.policy_version ||
+          a.status.terms_digest_binding !== q!.terms_digest ||
+          a.status.owner_authority_id !== q!.owner_authority_id ||
+          a.status.business_id !== q!.business_id ||
+          Number(a.row.version) !== q!.objective_version) {
+        return { eligible: false, reason: "STALE_BINDING" };
+      }
+      const prior = this.lease(objectiveId);
+      if (prior?.state === "ACTIVE" && Number(prior.expires_at) > this.instant()) {
+        return { eligible: false, reason: "LEASE_HELD" };
+      }
+      return { eligible: true, reason: null };
+    });
+  }
+
   private queue(objectiveId: string): Queue | null {
     return readSchedulerRow<Queue>(this.store, WAKE_STATE, objectiveId);
   }
@@ -677,15 +727,13 @@ export class ObjectiveAutoScheduler {
       const maxLifetime = opts?.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS;
       if (!Number.isFinite(maxLifetime) || maxLifetime < LEASE_MAX_LIFETIME_MIN_MS ||
           maxLifetime > LEASE_MAX_LIFETIME_CAP_MS) invalid("invalid max lease lifetime bound");
-      const q = this.queue(objectiveId);
-      if (!q || q.queue_state !== "WAITING_CONSUMER" ||
-          (q.pending_generation <= q.claimed_generation && q.claimed_generation <= q.settled_generation) ||
-          (q.next_due !== null && q.next_due > this.instant()) ||
-          (Number(q.last_attempt_at ?? -30_000) + 30_000 > this.instant())) {
+      const qRaw = this.queue(objectiveId);
+      if (this.queueEligibility(qRaw) !== null) {
         invalid("no pending eligible wake or attempt cooling down");
       }
+      const q = qRaw!;
       const a = this.authority(objectiveId);
-      this.requireCurrent(q, a);
+      this.requireCurrent(q!, a);
       const { f, active } = this.activeRoster();
       if (active.length >= MAX_ACTIVE || active.includes(objectiveId)) invalid("global/Objective lease cap");
       const rateWindowStart = Number(f.rate_window_start ?? 0);

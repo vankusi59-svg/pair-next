@@ -308,22 +308,25 @@ export class ObjectiveAutoDriverService {
   readiness(objectiveId: string, actor: string): Record<string, unknown> {
     return this.deps.store.immediate(() => {
       const st = this.deps.policy.status(objectiveId, actor); // owner proof
-      const reasons: string[] = [];
+      const reasons = new Set<string>();
+      const push = (r: string | null | undefined) => { if (r) reasons.add(r); };
       const cursor = readSchedulerRow<Row>(this.deps.store, SCHEDULER_CURSOR, "LOCAL_PAIR_DB");
-      if (!cursor || cursor.health !== "READY") reasons.push("SCHEDULER_NOT_READY");
-      if (!st.effective) reasons.push("POLICY_NOT_EFFECTIVE");
-      const q = readSchedulerRow<Row>(this.deps.store, WAKE_STATE, objectiveId) as
-        Record<string, unknown> | null;
-      if (q?.queue_state === "QUARANTINED") reasons.push("OBJECTIVE_QUARANTINED");
-      else if (q?.queue_state === "BLOCKED_AUTHORITY") reasons.push("BLOCKED_AUTHORITY");
+      if (!cursor || cursor.health !== "READY") push("SCHEDULER_NOT_READY");
+      if (!st.effective) push("POLICY_NOT_EFFECTIVE");
+      // R4 F3 — objective-level runnable truth comes from the scheduler's
+      // OWN claim predicate (queue state, pending generation, next_due,
+      // cooldown, authority pins, active lease), never a re-implemented
+      // check in the driver.
+      const claim = this.deps.scheduler.claimable(objectiveId);
+      if (!claim.eligible) push(String(claim.reason));
       const limits = st.limits as { budget_microusd_cap?: number } | null;
       if (limits?.budget_microusd_cap != null) {
         const usage = this.usage(objectiveId);
-        if (usage.cost_unverified) reasons.push("COST_UNVERIFIED");
+        if (usage.cost_unverified) push("COST_UNVERIFIED");
         const bound = this.dispatchCostBound();
-        if (bound === null) reasons.push("COST_BINDING_UNVERIFIED");
+        if (bound === null) push("COST_BINDING_UNVERIFIED");
         else if (usage.microusd + bound > limits.budget_microusd_cap) {
-          reasons.push("BUDGET_EXHAUSTED");
+          push("BUDGET_EXHAUSTED");
         }
       }
       return {
@@ -333,9 +336,9 @@ export class ObjectiveAutoDriverService {
         enabled: true,
         integrated: true,
         driver_missing: [],
-        runnable: reasons.length === 0,
-        objective_runnable: reasons.length === 0,
-        reasons,
+        runnable: reasons.size === 0,
+        objective_runnable: reasons.size === 0,
+        reasons: [...reasons],
       };
     });
   }

@@ -330,10 +330,20 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     st = s.scheduler.status(oid, OWNER, driver.readiness(oid, OWNER));
     expect(st.objective_runnable).toBe(false);
     expect(st.driver_missing).toContain("POLICY_NOT_EFFECTIVE");
-    // EXPIRED: reconfigure past-due window then enable → evaluate marks EXPIRED.
-    s.setNow(s.now() + 100_000);
-    st = s.scheduler.status(oid, OWNER, driver.readiness(oid, OWNER));
+    // EXPIRED — real expiry: configure a window ending 30s out, enable,
+    // then pass the deadline for real (never a 2999 fixture + nudge).
+    const oidX = mkObjective(s);
+    const soon = new Date(s.now() + 30_000).toISOString();
+    s.policy.control({ objective_id: oidX, actor: OWNER,
+      action: "configure", limits: LIMITS({ expires_at: soon }),
+      idempotency_key: `cfg-x-${counter}` });
+    s.policy.control({ objective_id: oidX, actor: OWNER,
+      action: "enable", policy_version: 1, idempotency_key: `en-x-${counter}` });
+    s.setNow(s.now() + 31_000); // past expires_at — evaluate marks EXPIRED
+    st = s.scheduler.status(oidX, OWNER, driver.readiness(oidX, OWNER));
     expect(st.objective_runnable).toBe(false);
+    expect(st.driver_missing).toContain("POLICY_NOT_EFFECTIVE");
+    expect(s.policy.status(oidX, OWNER).effective).toBe(false);
   });
 
   it("R3-F3d driver ON + policy effective + no provable cost binding → not runnable", () => {
@@ -360,8 +370,19 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     expect(st.driver_missing).toHaveLength(0);
   });
 
-  it("R3-F3f quarantined / budget-exhausted objective → not runnable", () => {
-    const s = fresh("f3f");
+  it("R3-F3f-quarantined quarantined objective → not runnable", () => {
+    const s = fresh("f3fq");
+    const oid = mkObjective(s);
+    enable(s, oid, { budget_microusd_cap: 5_000_000 });
+    profile(s, "executor", "EXEC_D", { reserve_microusd: 100_000 });
+    s.scheduler.quarantine(oid, "op-quarantine");
+    const st = s.scheduler.status(oid, OWNER, mkDriver(s).readiness(oid, OWNER));
+    expect(st.objective_runnable).toBe(false);
+    expect(st.driver_missing).toContain("QUEUE_QUARANTINED");
+  });
+
+  it("R3-F3f-exhausted budget-exhausted objective → not runnable", () => {
+    const s = fresh("f3fx");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 200_000 });
     profile(s, "executor", "EXEC_D", { reserve_microusd: 300_000 });
