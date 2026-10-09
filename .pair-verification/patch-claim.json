@@ -1,14 +1,17 @@
 {
-  "claim_id": "P15_10_A_AUTO_POLICY",
-  "title": "Objective auto-policy authority (P15.10-A): owner opt-in control plane, finite limits, transitions+receipts, kill-scope OBJECTIVE; no driver",
+  "claim_id": "P15_10_B_R2_F4_SECURITY_CLOSURE",
+  "title": "P15.10-B R2: close residual F4 hole — faultCode/sanitizeFaultReason exact allowlists; production stays RECONCILE_ONLY",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "UI"
+    "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10b-r1.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts",
     "src/__tests__/pair-p15-10a-auto-policy.test.ts"
   ],
   "invariants": [],
-  "description": "Adds objective_auto_policy authority (owner-scoped, CAS-versioned, event-anchored): default OFF incl. legacy, finite limits required (expires_at+>=1 cap), transitions DISABLED/ENABLED/PAUSED/REVOKED/EXPIRED/HALTED with idempotent convergent retries, terms_digest_binding = objective_digest invalidation on amend/owner change, immutable per-version transition anchors (pins_digest) re-proved on every read/control/replay, durable applied_ops idempotency ledger, lazy EXPIRED, OBJECTIVE-scope halt+reset only (no business/global authority seam). evaluate() re-proves binding live and always reports driver_ready:false + missing AUTO_DRIVER_NOT_INTEGRATED/COST_BINDING_UNVERIFIED. API: owner-only GET/POST /api/vnext/objectives/:id/auto-policy with header-only actor (canonical operator:<id> derivation, strict boundary typing — no coercion). UI: Objectives page auto-policy block, no optimistic state. Cost lineage: no cost binding written in A; enforcement deferred to B/C. No model/executor/mission/Telegram calls anywhere in the change."
+  "risk_override": "HIGH",
+  "description": "R2 independent-audit remediation on PR #86 (audited HEAD 160907e0cd7eb12a53ff896a3d05cb313ea3e2a3, BASE 88cdf85b99080b5b2da9dda13c9fae5154108c70). Residual F4 finding reproduced with 3 adversarial tests before patching (3/3 failed prepatch): error.code values like FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE and uppercase reasons like SECRET_XYZ_CANARY passed the shape regex and persisted verbatim. faultCode now admits only an exact allowlist of internal codes (the five FAIL_CLOSED_* codes this module produces/classifies on) and otherwise returns a fixed classification label (SQLITE_CONTENTION/NOT_FOUND/INTEGRITY_FAULT/UNEXPECTED_FAULT); regex/prefix/namespace checks are no longer used as trust proof. sanitizeFaultReason admits only allowlisted codes or classification labels, else UNSPECIFIED_FAULT. Retry classification (retryableFault reads the original error.code directly), F1 durable cursor/replay, F2 canonical WakeBinding, F3 idle-write elimination, lease/CAS/fairness and production RECONCILE_ONLY are unchanged. No merge/deploy."
 }

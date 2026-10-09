@@ -28,6 +28,7 @@ import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
+import type { ObjectiveAutoScheduler } from "./objective-auto-scheduler.js";
 import {
   createDefaultObjectiveOperatingService,
   type ObjectiveOperatingService,
@@ -98,6 +99,8 @@ export interface MissionControlServerDeps {
   /** Canonical evidence store — needed to compose the P15.6 operating
    *  service for /api/vnext/objectives/:id/ceo-cycle (P15.7). */
   store?: PairEvidenceStore;
+  /** P15.10-B owner-scoped RECONCILE_ONLY scheduler projection. */
+  autoScheduler?: ObjectiveAutoScheduler;
   /** TEST-ONLY: deterministic CEO decision transport for the
    *  lazily-composed operating service. Production bootstrap never
    *  sets it (the route resolves the real codex-cli model); HTTP
@@ -1229,6 +1232,23 @@ export function createMissionControlServer(
           objective_id: m[1], actor: String(operator),
         });
         return void json(res, 200, out);
+      }
+      // ----- P15.10-B — owner-scoped RECONCILE_ONLY scheduler status -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-scheduler$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.autoScheduler) {
+          return void json(res, 404, { error: "AUTO_SCHEDULER_DISABLED" });
+        }
+        const rawSchedulerActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawSchedulerActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const schedulerActor = rawSchedulerActor.startsWith("operator:")
+          ? rawSchedulerActor
+          : `operator:${rawSchedulerActor}`;
+        return void json(res, 200, {
+          auto_scheduler: deps.autoScheduler.status(m[1]!, schedulerActor),
+        });
       }
       // ----- P15.10-A — objective auto-policy control plane -----
       m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-policy$/);
