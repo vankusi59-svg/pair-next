@@ -1,10 +1,14 @@
 {
-  "claim_id": "DEV_WORKFLOW_POLICY_V1",
-  "title": "Root AGENTS.md makes the Development Verification Harness the mandatory completion contract for agents",
-  "affected_surfaces": ["DEV_INFRA"],
+  "claim_id": "P15_10_A_AUTO_POLICY",
+  "title": "Objective auto-policy authority (P15.10-A): owner opt-in control plane, finite limits, transitions+receipts, kill-scope OBJECTIVE; no driver",
+  "affected_surfaces": [
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "UI"
+  ],
   "required_tests": [
-    "src/__tests__/dev-workflow-policy.test.ts"
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts"
   ],
   "invariants": [],
-  "description": "Adds repository-root AGENTS.md: every code/config change must record its BASE SHA, update the current .pair-verification/patch-claim.json inside the BASE..HEAD diff, run npm run verify:change -- --base <BASE_SHA>, and fix until READY_FOR_INDEPENDENT_AUDIT before reporting complete; NOT_READY forbids completion claims; no self-merge without explicit operator instruction after independent audit. Failure contract and stale-claim prohibition documented. Proof: src/__tests__/dev-workflow-policy.test.ts asserts the contract text exists at the repo root. Docs-only/dev-infra change — no production PAIR runtime behavior altered."
+  "description": "Adds objective_auto_policy authority (owner-scoped, CAS-versioned, event-anchored): default OFF incl. legacy, finite limits required (expires_at+>=1 cap), transitions DISABLED/ENABLED/PAUSED/REVOKED/EXPIRED/HALTED with idempotent convergent retries, terms_digest_binding = objective_digest invalidation on amend/owner change, immutable per-version transition anchors (pins_digest) re-proved on every read/control/replay, durable applied_ops idempotency ledger, lazy EXPIRED, OBJECTIVE-scope halt+reset only (no business/global authority seam). evaluate() re-proves binding live and always reports driver_ready:false + missing AUTO_DRIVER_NOT_INTEGRATED/COST_BINDING_UNVERIFIED. API: owner-only GET/POST /api/vnext/objectives/:id/auto-policy with header-only actor (canonical operator:<id> derivation, strict boundary typing — no coercion). UI: Objectives page auto-policy block, no optimistic state. Cost lineage: no cost binding written in A; enforcement deferred to B/C. No model/executor/mission/Telegram calls anywhere in the change."
 }

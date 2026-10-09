@@ -666,9 +666,23 @@ export class ObjectiveAuthorityService {
     if (!title && !statement) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "title or statement required");
     }
+    // F10 — canonicalize the operator identity exactly once: raw
+    // `alice` → `operator:alice`; an already-canonical `operator:alice`
+    // is stored as-is (never double-prefixed). Objectives already
+    // persisted under the old double-prefix convention are NOT
+    // silently re-aliased — their stored owner stays canonical truth.
+    const rawOperator = assertStr("operator_id", input.operator_id);
     const ownerAuthority = input.owner_authority_id
       ? assertStr("owner_authority_id", input.owner_authority_id)
-      : `operator:${input.operator_id}`;
+      : rawOperator.startsWith("operator:")
+        ? rawOperator
+        : `operator:${rawOperator}`;
+    // F11 — the creator actor canonicalizes on the same once-only rule,
+    // kept DISTINCT from ownerAuthority: an explicit owner_authority_id
+    // must not leak into `actor` (creator ≠ owner is a real contract).
+    const creatorActor = rawOperator.startsWith("operator:")
+      ? rawOperator
+      : `operator:${rawOperator}`;
     const dedupKey = input.dedup_key ?? this.defaultDedupKey({ title, statement, description: input.description });
     const id = this.objectiveIdFor(businessId, dedupKey);
     let parentId: string | null = null;
@@ -724,7 +738,7 @@ export class ObjectiveAuthorityService {
       amendment_seq: 0,
       last_amendment: null,
       schema_version: OBJECTIVE_SCHEMA,
-      actor: `operator:${input.operator_id}`,
+      actor: creatorActor,
       created_at: utcnow(),
       updated_at: utcnow(),
       version: 0,
@@ -757,7 +771,7 @@ export class ObjectiveAuthorityService {
           entity_id: id,
           event_type: "OBJECTIVE_CREATED",
           new_state: "ACTIVE",
-          actor: `operator:${input.operator_id}`,
+          actor: creatorActor,
           metadata: { business_id: businessId, title, owner_authority_id: ownerAuthority },
         });
         return saved;

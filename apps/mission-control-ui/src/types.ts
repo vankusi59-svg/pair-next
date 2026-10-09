@@ -191,3 +191,30 @@ export interface OperatingPassResult {
   no_eligible_workstream_keys?: string[];
   detail?: string;
 }
+
+/** P15.10-A — objective auto-policy canonical status (control plane;
+ *  `driver_ready` is always false until a later phase integrates an
+ *  auto driver — "configured policy" never means "running autonomy"). */
+export interface AutoPolicyStatus {
+  objective_id: string;
+  configured: boolean;
+  state: "DISABLED" | "ENABLED" | "PAUSED" | "REVOKED" | "EXPIRED" | "HALTED";
+  effective: boolean;
+  reasons: string[];
+  policy_version: number | null;
+  expires_at: string | null;
+  limits: {
+    expires_at: string;
+    max_ceo_calls?: number;
+    max_missions?: number;
+    max_retries?: number;
+    budget_microusd_cap?: number;
+  } | null;
+  halt: { scope: string; actor: string; at: string; reason: string } | null;
+  owner_authority_id: string;
+  business_id: string;
+  driver_ready: false;
+  driver_missing: string[];
+  terms_digest_binding: string | null;
+  terms_current: boolean;
+}

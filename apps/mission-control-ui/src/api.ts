@@ -126,6 +126,25 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  // P15.10-A — objective auto-policy (owner-scoped; non-owner → 403)
+  autoPolicyStatus: (id: string) =>
+    req<{ auto_policy: import("./types").AutoPolicyStatus }>(
+      `/vnext/objectives/${id}/auto-policy`,
+    ),
+  autoPolicyControl: (
+    id: string,
+    body: {
+      action: string;
+      policy_version?: number;
+      limits?: import("./types").AutoPolicyStatus["limits"];
+      idempotency_key: string;
+      halt_reason?: string;
+    },
+  ) =>
+    req<{ auto_policy: import("./types").AutoPolicyStatus }>(
+      `/vnext/objectives/${id}/auto-policy`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
   // ---- P15.8-D — conversation layer ----
   conversations: (state?: string) =>
     req<{ sessions: import("./types").ConversationSession[] }>(

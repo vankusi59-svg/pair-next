@@ -56,6 +56,7 @@ const SURFACE_FILES = {
   "src/pair/store.ts": ["RECOVERY_REPLAY"],
   "src/pair/business.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-authority.ts": ["BUSINESS_OBJECTIVE"],
+  "src/pair/objective-auto-policy.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-workstream.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-operating-loop.ts": ["BUSINESS_OBJECTIVE"],
   "src/pair/objective-adaptive-review.ts": ["BUSINESS_OBJECTIVE"],

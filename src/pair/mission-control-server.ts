@@ -27,6 +27,7 @@ import type { MissionDraftService } from "./mission-draft.js";
 import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
+import { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import {
   createDefaultObjectiveOperatingService,
   type ObjectiveOperatingService,
@@ -355,6 +356,10 @@ export function createMissionControlServer(
   // closed on that route alone and can never take the server down at
   // boot. Resolved once, then cached for the process lifetime.
   let ceoOps: { service: ObjectiveOperatingService; model_entry_id: string } | null = null;
+  // P15.10-A — objective auto-policy authority (control plane only;
+  // no driver). Owner proof comes ONLY from the trusted x-operator-id
+  // header — a body-declared owner field is never authority here.
+  let autoPolicySvc: ObjectiveAutoPolicyService | null = null;
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
@@ -1225,6 +1230,56 @@ export function createMissionControlServer(
         });
         return void json(res, 200, out);
       }
+      // ----- P15.10-A — objective auto-policy control plane -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-policy$/);
+      if (m && (method === "GET" || method === "POST")) {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "AUTO_POLICY_DISABLED" });
+        }
+        const rawPolicyActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawPolicyActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        // Canonical actor derivation — same convention the Objective
+        // create path uses (`operator:<id>`), so an owner who created
+        // the objective with a raw header can operate its policy with
+        // the same raw header. Body-declared identity never consulted.
+        const policyActor = rawPolicyActor.startsWith("operator:")
+          ? rawPolicyActor
+          : `operator:${rawPolicyActor}`;
+        autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
+        if (method === "GET") {
+          return void json(res, 200, {
+            auto_policy: autoPolicySvc.status(m[1]!, policyActor),
+          });
+        }
+        // F3 — strict boundary typing: NO coercion of authority fields.
+        // Malformed types are rejected with zero mutation before the
+        // service sees them; the service re-validates independently.
+        const malformed =
+          typeof body.action !== "string" ||
+          typeof body.idempotency_key !== "string" ||
+          (body.policy_version !== undefined && !Number.isInteger(body.policy_version)) ||
+          (body.limits !== undefined &&
+            (typeof body.limits !== "object" || body.limits === null || Array.isArray(body.limits))) ||
+          (body.halt_scope !== undefined && typeof body.halt_scope !== "string") ||
+          (body.halt_reason !== undefined && typeof body.halt_reason !== "string");
+        if (malformed) {
+          return void json(res, 400, { error: "FAIL_CLOSED_POLICY_SCHEMA" });
+        }
+        return void json(res, 200, {
+          auto_policy: autoPolicySvc.control({
+            objective_id: m[1]!,
+            actor: policyActor,
+            action: body.action as string,
+            policy_version: body.policy_version as number | undefined,
+            limits: body.limits,
+            idempotency_key: body.idempotency_key as string,
+            halt_scope: body.halt_scope,
+            halt_reason: body.halt_reason,
+          }),
+        });
+      }
       if (method === "GET" && p === "/api/budgets") {
         const bid = url.searchParams.get("business_id") ?? undefined;
         return void json(res, 200, { budgets: biz ? biz.listBudgetPolicies(bid) : [] });
@@ -1509,7 +1564,9 @@ export function createMissionControlServer(
     } catch (error) {
       const e = error as { code?: string; message?: string };
       const status =
-        e.code === "FAIL_CLOSED_OPERATOR_ID_REQUIRED" ? 403
+        e.code === "FAIL_CLOSED_OPERATOR_ID_REQUIRED" ||
+        e.code === "FAIL_CLOSED_POLICY_FORBIDDEN" ||
+        e.code === "FAIL_CLOSED_POLICY_OWNER" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
         : 500;
