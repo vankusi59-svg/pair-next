@@ -148,6 +148,14 @@ export class ObjectiveOperatingService {
   async runObjectivePass(input: {
     objective_id: string;
     actor: string;
+    /** P15.10-C — optional delegated-authority gate, fired by the
+     *  autonomous driver immediately BEFORE every external authority
+     *  crossing inside the pass (CEO model call, review commit,
+     *  allocation, mission open, delegated-child reconcile). The gate
+     *  is a caller-supplied fail-closed revalidation: when it throws,
+     *  the pass aborts and the fault propagates. Manual/operator
+     *  callers never set it — semantics are byte-identical to before. */
+    authority_gate?: () => void;
     /** TEST-ONLY — never set in production. */
     hooks?: OperatingPassHooks;
   }): Promise<OperatingPassResult> {
@@ -159,9 +167,12 @@ export class ObjectiveOperatingService {
     if (!objectiveId || objectiveId.length > 256) {
       operatingFail("objective_id malformed");
     }
+    if (input.authority_gate !== undefined && typeof input.authority_gate !== "function") {
+      operatingFail("authority_gate malformed");
+    }
     const ctx: PassCtx = { steps_used: 0 };
     try {
-      return await this.pass(ctx, objectiveId, actor, input.hooks);
+      return await this.pass(ctx, objectiveId, actor, input.hooks, input.authority_gate);
     } catch (e) {
       if (e instanceof PassBoundExceeded) {
         // Deterministic external-wait boundary: the committed seams
@@ -175,6 +186,7 @@ export class ObjectiveOperatingService {
   private async pass(
     ctx: PassCtx, objectiveId: string, actor: string,
     hooks?: OperatingPassHooks,
+    authorityGate?: () => void,
   ): Promise<OperatingPassResult> {
     const result = (o: OperatingOutcome, extra?: Partial<OperatingPassResult>): OperatingPassResult => ({
       outcome: o, objective_id: objectiveId, ...extra,
@@ -206,6 +218,7 @@ export class ObjectiveOperatingService {
     if (allTargetsMet) {
       if (binding) {
         this.tick(ctx);
+        authorityGate?.();
         const review = await this.deps.review.runReview({ objective_id: objectiveId, actor });
         return result("TARGET_MET_CANDIDATE", {
           owner_action_required: true,
@@ -221,6 +234,7 @@ export class ObjectiveOperatingService {
     if (!binding) {
       if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
       this.tick(ctx);
+      authorityGate?.();
       const cycle = await this.deps.ceoCycle.runCycle({ objective_id: objectiveId, actor });
       if (String(cycle.decision.decision_kind) === "WAIT") {
         return result("WAITING_FOR_CEO", { ceo_decision_id: String(cycle.decision.decision_id) });
@@ -234,7 +248,7 @@ export class ObjectiveOperatingService {
     // §9 — reconcile existing objective work BEFORE any new action.
     //    One strict projection re-derives every lifecycle fact.
     let obs = this.observe(objectiveId);
-    const synced = this.reconcileDelegatedChildren(ctx, obs, actor);
+    const synced = this.reconcileDelegatedChildren(ctx, obs, actor, authorityGate);
     if (synced) obs = this.observe(objectiveId); // fresh canonical classes
 
     // §17 — classify from canonical lifecycle evidence only.
@@ -298,7 +312,7 @@ export class ObjectiveOperatingService {
         ctx, objectiveId, launchable[0]!.delegated_child_work_item_id!,
         launchable[0]!.work_item_id, actor, result, {
           workstream_key: launchable[0]!.workstream_key,
-        }, hooks);
+        }, hooks, authorityGate);
     }
 
     // §12 — binding + nothing launchable + no active execution → the
@@ -322,6 +336,7 @@ export class ObjectiveOperatingService {
     } else {
       if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
       this.tick(ctx);
+      authorityGate?.();
       const reviewRes = await this.deps.review.runReview({ objective_id: objectiveId, actor });
       const reviewId = String(reviewRes.review.review_id);
       switch (reviewRes.outcome) {
@@ -405,6 +420,7 @@ export class ObjectiveOperatingService {
       if (this.workstreamExhausted(w) || w.allocation_state !== "NONE" ||
           w.workstream_status === "BLOCKED") continue;
       this.tick(ctx);
+      authorityGate?.();
       const alloc = this.deps.allocation.allocateWorkstream({
         objective_id: objectiveId, workstream_key: key, actor,
       });
@@ -437,7 +453,7 @@ export class ObjectiveOperatingService {
           ...(blocked.length ? { blocked_workstream_keys: [...blocked] } : {}),
           ...(noEligible.length ? { no_eligible_workstream_keys: [...noEligible] } : {}),
         },
-        hooks);
+        hooks, authorityGate);
     }
     if (blocked.length > 0) {
       return result("DEPENDENCY_BLOCKED", { blocked_workstream_keys: blocked });
@@ -454,6 +470,7 @@ export class ObjectiveOperatingService {
    *  parent cascade through the existing authority. */
   private reconcileDelegatedChildren(
     ctx: PassCtx, obs: ReviewObservation, actor: string,
+    authorityGate?: () => void,
   ): boolean {
     let synced = false;
     for (const w of obs.workstreams) {
@@ -467,6 +484,7 @@ export class ObjectiveOperatingService {
       // the WOB/mission lineage itself and materializes DONE/WCP or
       // REVIEW_REQUIRED — never a direct status write.
       this.tick(ctx);
+      authorityGate?.();
       this.deps.business.syncWorkItem(w.delegated_child_work_item_id);
       this.deps.business.advanceCompletionCascade(w.delegated_child_work_item_id, actor);
       synced = true;
@@ -546,9 +564,13 @@ export class ObjectiveOperatingService {
     result: (o: OperatingOutcome, extra?: Partial<OperatingPassResult>) => OperatingPassResult,
     extra?: Partial<OperatingPassResult>,
     hooks?: OperatingPassHooks,
+    authorityGate?: () => void,
   ): OperatingPassResult {
     this.tick(ctx);
     hooks?.beforeOpen?.(); // TEST-ONLY drift injection at the real boundary
+    // P15.10-C — delegated authority re-proven AT the mission-open
+    // boundary: the last checkpoint before a bound Mission can exist.
+    authorityGate?.();
     const proof = this.proveDispatchAuthority(
       objectiveId, childId, workstreamWorkItemId);
     if ("abort" in proof) {

@@ -105,6 +105,9 @@ import {
   TelegramConversationService,
   ObjectiveAutoPolicyService,
   createObjectiveAutoReconcile,
+  createObjectiveAutoDriver,
+  createDefaultObjectiveOperatingService,
+  ObjectiveWorkstreamService,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
   telegramDeliveryTransportTimeoutMs,
@@ -435,6 +438,47 @@ const objectiveAutoReconcile = createObjectiveAutoReconcile({
   intervalMs: objectiveReconcileMs,
 });
 objectiveAutoReconcile.runtime.start();
+
+// P15.10-C — governed autonomous Objective driver. Explicit deployment
+// opt-in ONLY (PAIR_OBJECTIVE_AUTO_DRIVER=1): the driver consumes the
+// durable wake schedule through the existing claim → admission →
+// runObjectivePass → settle authority chain, with the owner's effective
+// auto-policy revalidated at every boundary and canonical usage
+// derivation gating the configured caps. Default OFF — with the flag
+// unset no driver exists, nothing claims generations, and readiness
+// keeps reporting driver_ready:false.
+let objectiveAutoDriver = null;
+if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
+  const objectiveDriverMs = Number(process.env.PAIR_OBJECTIVE_DRIVER_MS ?? 5_000);
+  if (!Number.isSafeInteger(objectiveDriverMs) ||
+      objectiveDriverMs < 1_000 || objectiveDriverMs > 300_000) {
+    throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_DRIVER_MS", String(objectiveDriverMs));
+  }
+  const objectiveCeoOps = createDefaultObjectiveOperatingService({
+    store, business, workforce,
+    objectives: business.objectives,
+    workstreams: new ObjectiveWorkstreamService({
+      store, business, workforce, objectives: business.objectives,
+    }),
+  });
+  objectiveAutoDriver = createObjectiveAutoDriver({
+    store,
+    objectives: business.objectives,
+    policy: objectiveAutoPolicy,
+    scheduler: objectiveAutoReconcile.scheduler,
+    runPass: (input) => objectiveCeoOps.service.runObjectivePass(input),
+    executors: [...governed.keys()],
+    billingFor: (executorId, routeId) => service.cost.billingFor(executorId, routeId),
+    costHaltActive: () =>
+      process.env.PAIR_COST_HALT === "1" || fs.existsSync(COST_HALT_FILE),
+    workerId: `objective-auto-driver:${process.pid}`,
+    bootId: crypto.randomUUID(),
+    intervalMs: objectiveDriverMs,
+    onError: (e) => console.error("objective-auto-driver:", String(e).slice(0, 200)),
+  });
+  objectiveAutoDriver.runtime.start();
+  console.log(`OBJECTIVE AUTO DRIVER: ENABLED (interval=${objectiveDriverMs}ms, worker=objective-auto-driver:${process.pid})`);
+}
 
 // P15.8-D — conversation layer composition. Session/draft services are
 // pure canonical-store services — always wired. The reasoning turn
@@ -987,6 +1031,10 @@ const server = createMissionControlServer({
   // the P15.6 operating service lazily on first trigger (P15.7).
   store,
   autoScheduler: objectiveAutoReconcile.scheduler,
+  // P15.10-C — present only under PAIR_OBJECTIVE_AUTO_DRIVER=1;
+  // absent keeps scheduler status driver_ready:false and 404s the
+  // read-only auto-driver status route.
+  autoDriver: objectiveAutoDriver?.driver ?? undefined,
   // P15.8-D — conversation layer (chat turns + governed mission drafts).
   conversation: {
     sessions: conversationSessions,

@@ -1,17 +1,20 @@
 {
-  "claim_id": "P15_10_B_R2_F4_SECURITY_CLOSURE",
-  "title": "P15.10-B R2: close residual F4 hole — faultCode/sanitizeFaultReason exact allowlists; production stays RECONCILE_ONLY",
+  "claim_id": "P15_10_C_AUTONOMOUS_DRIVER",
+  "title": "P15.10-C: governed autonomous Objective driver — scheduler claim → delegated runObjectivePass → settle, with CAS cost admission and fail-closed delegation",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "RECOVERY_REPLAY"
+    "RECOVERY_REPLAY",
+    "COST_GOVERNANCE"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10c.test.ts",
     "src/__tests__/pair-p15-10b-r1.test.ts",
     "src/__tests__/pair-p15-10b.test.ts",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts"
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts"
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "R2 independent-audit remediation on PR #86 (audited HEAD 160907e0cd7eb12a53ff896a3d05cb313ea3e2a3, BASE 88cdf85b99080b5b2da9dda13c9fae5154108c70). Residual F4 finding reproduced with 3 adversarial tests before patching (3/3 failed prepatch): error.code values like FAIL_CLOSED_AKIAIOSFODNN7EXAMPLE and uppercase reasons like SECRET_XYZ_CANARY passed the shape regex and persisted verbatim. faultCode now admits only an exact allowlist of internal codes (the five FAIL_CLOSED_* codes this module produces/classifies on) and otherwise returns a fixed classification label (SQLITE_CONTENTION/NOT_FOUND/INTEGRITY_FAULT/UNEXPECTED_FAULT); regex/prefix/namespace checks are no longer used as trust proof. sanitizeFaultReason admits only allowlisted codes or classification labels, else UNSPECIFIED_FAULT. Retry classification (retryableFault reads the original error.code directly), F1 durable cursor/replay, F2 canonical WakeBinding, F3 idle-write elimination, lease/CAS/fairness and production RECONCILE_ONLY are unchanged. No merge/deploy."
+  "description": "P15.10-C closes the RECONCILE_ONLY gap left by P15.10-B (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3, the PR #86 merge). Adds src/pair/objective-auto-driver.ts: a bounded production driver that consumes durable wakes through the existing fair-scheduler claim/lease machinery, revalidates the owner's effective auto-policy at every authority boundary (claim, pre-pass admission, and a new optional authority_gate inside runObjectivePass fired before the CEO model call, each review commit, allocation, openWorkItem and delegated-child reconcile write), enforces policy caps (max_ceo_calls, max_missions, budget_microusd_cap incl. in-flight reservation liability, expires_at via evaluate(), retry bound already inside claim()) with CAS pre-spend admission receipts and canonically-derived usage attribution (ceo attempts by started_by, work_open_bindings by created_by, cost_reservation microusd by mission lineage; unbounded/UNKNOWN billing marks cost binding unverified and blocks), honors PAIR_COST_HALT/COST_HALT_FILE, settles every pass through the existing settle()+outcomeContinuation contract, and projects truthful driver readiness into the scheduler status surface (optional injected driver state; default OFF is unchanged). serve-mission-control.mjs wires the driver ONLY under explicit PAIR_OBJECTIVE_AUTO_DRIVER=1 opt-in (driver_ready stays false otherwise); mission-control-server exposes driver status on the existing owner-scoped auto-scheduler route plus a new read-only auto-driver status route. No new CEO engine, no new planner, no direct executor calls, no merge/deploy — driver defaults OFF everywhere."
 }

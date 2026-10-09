@@ -29,6 +29,7 @@ import type { TelegramConversationService } from "./telegram-conversation.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import type { ObjectiveAutoScheduler } from "./objective-auto-scheduler.js";
+import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
 import {
   createDefaultObjectiveOperatingService,
   type ObjectiveOperatingService,
@@ -101,6 +102,12 @@ export interface MissionControlServerDeps {
   store?: PairEvidenceStore;
   /** P15.10-B owner-scoped RECONCILE_ONLY scheduler projection. */
   autoScheduler?: ObjectiveAutoScheduler;
+  /** P15.10-C — the production autonomous driver. Present ONLY when
+   *  the deployment explicitly opted in (PAIR_OBJECTIVE_AUTO_DRIVER=1
+   *  in the serve script); absent → scheduler status keeps reporting
+   *  driver_ready:false and the auto-driver route 404s. Read-only
+   *  surface — no mutating driver route exists. */
+  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "driverStatus">;
   /** TEST-ONLY: deterministic CEO decision transport for the
    *  lazily-composed operating service. Production bootstrap never
    *  sets it (the route resolves the real codex-cli model); HTTP
@@ -1247,7 +1254,30 @@ export function createMissionControlServer(
           ? rawSchedulerActor
           : `operator:${rawSchedulerActor}`;
         return void json(res, 200, {
-          auto_scheduler: deps.autoScheduler.status(m[1]!, schedulerActor),
+          auto_scheduler: deps.autoScheduler.status(m[1]!, schedulerActor,
+            deps.autoDriver
+              ? { enabled: true, driver_missing: [] }
+              : undefined),
+        });
+      }
+      // ----- P15.10-C — owner-scoped autonomous driver status (read-only) -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-driver$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.autoDriver) {
+          return void json(res, 404, { error: "AUTO_DRIVER_DISABLED" });
+        }
+        const rawDriverActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawDriverActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        // Owner-scope proof runs inside the same owner revalidation
+        // the auto-policy status route enforces — a non-owner actor
+        // fails closed there before any driver state is read.
+        const driverActor = rawDriverActor.startsWith("operator:")
+          ? rawDriverActor
+          : `operator:${rawDriverActor}`;
+        return void json(res, 200, {
+          auto_driver: deps.autoDriver.status(m[1]!, driverActor),
         });
       }
       // ----- P15.10-A — objective auto-policy control plane -----

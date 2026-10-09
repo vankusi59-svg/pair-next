@@ -78,9 +78,14 @@ const SAFE_FAULT_CODES = new Set<string>([
   "FAIL_CLOSED_ASYNC_READ_BUDGET",
 ]);
 
-/** Fixed classification labels — the complete durable fault vocabulary. */
+/** Fixed classification labels — the complete durable fault vocabulary.
+ *  P15.10-C adds the DRIVER_* labels the production driver's typed
+ *  denials produce (still a closed set — raw error text and arbitrary
+ *  error.code values can never persist). */
 const FAULT_LABELS = new Set<string>([
   "SQLITE_CONTENTION", "NOT_FOUND", "INTEGRITY_FAULT", "UNEXPECTED_FAULT",
+  "DRIVER_CAP_EXHAUSTED", "DRIVER_COST_UNVERIFIED", "DRIVER_COST_HALTED",
+  "DRIVER_AUTHORITY_LOST", "DRIVER_PASS_FAULT", "DRIVER_ADMISSION_DENIED",
 ]);
 
 /** Typed, bounded fault label for durable state. Raw exception text and
@@ -237,16 +242,20 @@ export class ObjectiveAutoScheduler {
     }
   }
 
-  status(objectiveId: string, actor: string): Record<string, unknown> {
+  status(objectiveId: string, actor: string,
+    driver?: { enabled: boolean; driver_missing: string[] },
+  ): Record<string, unknown> {
     return this.proof(() => {
       const status = this.policy.status(objectiveId, actor);
       const q = this.queue(objectiveId);
       const lease = this.lease(objectiveId);
       const cursor = readSchedulerRow<Row>(this.store, SCHEDULER_CURSOR, GLOBAL);
+      const driverReady = driver?.enabled === true;
       return {
         objective_id: objectiveId, scheduler_mode: OBJECTIVE_SCHEDULER_MODE,
         scheduler_ready: cursor ? cursor.health === "READY" : false,
-        consumer_ready: false, driver_ready: false, driver_missing: status.driver_missing,
+        consumer_ready: driverReady, driver_ready: driverReady,
+        driver_missing: driverReady ? [] : (driver?.driver_missing ?? status.driver_missing),
         policy_effective: status.effective, policy_version: status.policy_version,
         terms_current: status.terms_current,
         queue_state: q?.queue_state ?? "UNREGISTERED",
