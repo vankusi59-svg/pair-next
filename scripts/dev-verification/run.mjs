@@ -130,38 +130,52 @@ function evaluateRun({ proc, resultPath, file }) {
       failures: ["selector matched zero executed tests — a selector or " +
         "pattern with no coverage is never a PASS"] };
   }
-  // Reconcile reporter counters with parsed evidence — a crash/failure
-  // that produced no failed assertion still counts; a tolerated baseline
-  // can never hide unrelated failure evidence (R2.F). Suite-level errors
+  // Exact accounting (R3): when the reporter exposes numFailedTests it
+  // must EQUAL the parsed failed evidence in BOTH directions — never
+  // silently prefer either source when they disagree. Suite-level errors
   // are proven locally: tr.status==="failed" with zero failed assertions.
   const assertionFailed = failedNames.length + knownBaseline;
   const counterFailed = typeof results.numFailedTests === "number"
     ? results.numFailedTests : assertionFailed;
+  const counterMismatch = counterFailed !== assertionFailed;
   const unaccounted = failedNames.length +
     Math.max(0, counterFailed - assertionFailed) +
     zeroAssertFailedSuites;
-  if (unaccounted > 0) {
-    return { status: "FAIL", executed, failed: unaccounted, knownBaseline,
+  if (unaccounted > 0 || counterMismatch) {
+    return { status: "FAIL", executed,
+      failed: Math.max(unaccounted, 1), knownBaseline,
       failures: [
         ...failedNames.slice(0, 8),
+        ...(counterMismatch
+          ? [`reporter numFailedTests=${counterFailed} ≠ parsed ` +
+            `failures=${assertionFailed} — counter evidence does not ` +
+            "reconcile in both directions"]
+          : []),
         ...(unaccounted > failedNames.length
           ? [`${unaccounted - failedNames.length} failure(s) reported by ` +
-            "vitest counters with no matching failed assertion — " +
+            "vitest with no matching failed assertion — " +
             "unaccounted suite/process failure"]
           : []),
       ] };
   }
-  if (proc.status !== 0 && knownBaseline === 0) {
-    // Non-zero exit with no recorded failed assertion = unaccounted
-    // process failure — never a PASS.
-    return { status: "FAIL", executed, failed: 1, knownBaseline,
-      failures: [`vitest exit ${proc.status} with zero recorded failed ` +
-        "assertions — unaccounted process failure"] };
+  // Process-exit reconciliation (R3): PASS requires status 0.
+  // PASS_WITH_KNOWN_BASELINE requires the ORDINARY vitest failed-test
+  // exit (1) with every failed assertion exactly tolerated — a baseline
+  // never authorizes abnormal termination (status 2/null/signal/spawn
+  // error → FAIL).
+  const VITEST_FAILURE_EXIT = 1;
+  if (proc.status === 0 && knownBaseline === 0) {
+    return { status: "PASS", executed, failed: 0, knownBaseline,
+      failures: [] };
+  }
+  if (proc.status === VITEST_FAILURE_EXIT && knownBaseline > 0) {
+    return { status: "PASS_WITH_KNOWN_BASELINE", executed, failed: 0,
+      knownBaseline, failures: [] };
   }
   return {
-    status: knownBaseline > 0 ? "PASS_WITH_KNOWN_BASELINE" : "PASS",
-    executed, failed: 0, knownBaseline,
-    failures: [],
+    status: "FAIL", executed, failed: 1, knownBaseline,
+    failures: [`vitest process status ${proc.status} is not the ordinary ` +
+      "failed-test exit — abnormal termination is never tolerated"],
   };
 }
 

@@ -414,7 +414,7 @@ describe("dev-verification harness V1 R1", () => {
         }), root);
       expect(groups.claim.results[0].status).toBe("FAIL");
       expect(groups.claim.results[0].failures[0])
-        .toContain("unaccounted process failure");
+        .toContain("not the ordinary failed-test exit");
       expect(verdict).toBe("NOT_READY");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -817,4 +817,131 @@ describe("dev-verification harness V1 R2", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+/** R3 — process-exit reconciliation + failed-counter equality. */
+describe("dev-verification harness V1 R3", () => {
+  const CRASH3 = "R5.1-crash: a fault between evidence append and row write";
+  const planF4 = () =>
+    planFor([`${T}dev-verification.test.ts`], {
+      claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
+      required_tests: [`${T}pair-f4-delivery-provenance.test.ts`],
+      invariants: [],
+    });
+  const execFor =
+    (root: string, assertions: { title: string; status: string }[],
+      status: number | null, counters: object = {}) =>
+    (_b: string, argv: string[]) => {
+      const oi = argv.findIndex((a) => String(a).startsWith("--outputFile="));
+      if (oi < 0) return { status: 0 };
+      const isF4 = String(argv[2]).includes("pair-f4");
+      if (!isF4) {
+        writeFileSync(join(root, String(argv[oi]).slice(13)), JSON.stringify({
+          numTotalTests: 1, numPassedTests: 1, numFailedTests: 0,
+          testResults: [{ name: "o", status: "passed",
+            assertionResults: [{ title: "ok", status: "passed" }] }],
+        }));
+        return { status: 0 };
+      }
+      writeFileSync(join(root, String(argv[oi]).slice(13)), JSON.stringify({
+        numTotalTests: assertions.length,
+        numPassedTests: assertions.filter((a) => a.status === "passed").length,
+        numFailedTests: assertions.filter((a) => a.status === "failed").length,
+        testResults: [{
+          name: `${T}pair-f4-delivery-provenance.test.ts`,
+          status: assertions.some((a) => a.status === "failed")
+            ? "failed" : "passed",
+          assertionResults: assertions,
+        }],
+        ...counters,
+      }));
+      return { status };
+    };
+
+  it("R3-1. baseline + proc.status=1 (ordinary vitest fail exit) reconciles",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      try {
+        const { groups, verdict } = executePlan({
+          plan: planF4(),
+          exec: execFor(root, [{ title: CRASH3, status: "failed" },
+            { title: "ok", status: "passed" }], 1) as never,
+          root,
+        });
+        expect(groups.claim.results[0].status)
+          .toBe("PASS_WITH_KNOWN_BASELINE");
+        expect(verdict).toBe("READY_FOR_INDEPENDENT_AUDIT");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+  it("R3-2. baseline + proc.status=2 → FAIL (abnormal exit)", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const { groups, verdict } = executePlan({
+        plan: planF4(),
+        exec: execFor(root, [{ title: CRASH3, status: "failed" },
+          { title: "ok", status: "passed" }], 2) as never,
+        root,
+      });
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(groups.claim.results[0].failures[0])
+        .toContain("not the ordinary failed-test exit");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-3. baseline + proc.status=null (signal/spawn kill) → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const { groups, verdict } = executePlan({
+        plan: planF4(),
+        exec: execFor(root, [{ title: CRASH3, status: "failed" },
+          { title: "ok", status: "passed" }], null) as never,
+        root,
+      });
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-4. numFailedTests > parsed failures → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const { groups, verdict } = executePlan({
+        plan: planF4(),
+        exec: execFor(root, [{ title: CRASH3, status: "failed" }], 1,
+          { numFailedTests: 2 }) as never,
+        root,
+      });
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R3-5. numFailedTests < parsed failures → FAIL (both directions)",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      try {
+        const { groups, verdict } = executePlan({
+          plan: planF4(),
+          exec: execFor(root, [{ title: CRASH3, status: "failed" }], 1,
+            { numFailedTests: 0 }) as never,
+          root,
+        });
+        expect(groups.claim.results[0].status).toBe("FAIL");
+        expect(groups.claim.results[0].failures.join(" "))
+          .toContain("reconcile");
+        expect(verdict).toBe("NOT_READY");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
 });
