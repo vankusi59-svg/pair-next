@@ -51,6 +51,7 @@ import {
   detectTelegramDeliveryIntent,
   CANONICAL_BOOKKEEPING_INSTRUCTION,
   isDeliveryTask,
+  rawDeliveryEmissionCount,
   PAIR_DELIVERY_INJECTION_KEY,
   type DeliveryInjectionRecord,
 } from "./plan-dataflow.js";
@@ -157,7 +158,15 @@ export function makeServeCanonicalizer(deps: {
 }): (
   rawTasks: Array<Record<string, unknown>>,
   goal: string,
-  ctx?: { provenance?: "fresh" | "persisted" },
+  ctx?: {
+    provenance?: "fresh" | "persisted";
+    /** HOTFIX 1 R1 — TRUE raw TELEGRAM_DELIVERY emission count captured
+     *  on the parsed provider JSON BEFORE the transport's own
+     *  sanitize/drop pass, threaded through runPlannerFailover for THIS
+     *  exact invocation. When absent the caller vouches that `rawTasks`
+     *  IS the unsanitized emission (direct/replan seams). */
+    raw_delivery_emission_count?: number;
+  },
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal, ctx) => {
     // HOTFIX 1 — delivery omission provenance is measured on the RAW
@@ -165,10 +174,13 @@ export function makeServeCanonicalizer(deps: {
     // never attempted a delivery task) can be told apart from a
     // malformed emission that canonical preparation dropped. The
     // operator request remains the ONLY delivery authority.
+    // R1 — `ctx.raw_delivery_emission_count` is the REAL raw evidence
+    // captured inside the planner transport (llmPlan/codexPlannerPlan)
+    // BEFORE its own sanitizePlan; the incoming task list has already
+    // survived that first drop and can no longer prove it.
     const deliveryIntent = detectTelegramDeliveryIntent(String(goal ?? ""));
-    const rawDeliveryCount = (rawTasks ?? []).filter((t) =>
-      isDeliveryTask((t ?? {}) as Record<string, unknown>),
-    ).length;
+    const rawDeliveryCount = ctx?.raw_delivery_emission_count ??
+      rawDeliveryEmissionCount(rawTasks);
     // PRV2-A §D — the model emits WORK tasks only; PAIR owns bookkeeping.
     // A model-emitted bookkeeping-shaped task (filtered caps ⊆
     // {AUTOMATON_TASK_EXECUTION}) is deterministically normalized away so
@@ -211,17 +223,42 @@ export function makeServeCanonicalizer(deps: {
     );
     const canonicalDeliveryCount = (tasks as Array<Record<string, unknown>>)
       .filter(isDeliveryTask).length;
+    const freshPlan = ctx?.provenance !== "persisted";
+    if (freshPlan && !deliveryIntent.requested && rawDeliveryCount > 0) {
+      // R1 truth table — the model ATTEMPTED unauthorized delivery
+      // semantics. The same fail-closed verdict the reconcile gate
+      // already gives on a surviving delivery task, now also provable
+      // when the transport sanitize dropped every attempt first.
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT",
+        JSON.stringify({ raw_delivery: rawDeliveryCount }),
+      );
+    }
+    if (freshPlan && deliveryIntent.requested && rawDeliveryCount > 1) {
+      // R1 truth table — exactly-one semantics hold on the RAW emission:
+      // a duplicate delivery attempt never becomes valid just because
+      // the transport sanitize silently dropped all but one.
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_TASK_AMBIGUOUS",
+        JSON.stringify({
+          raw_delivery: rawDeliveryCount,
+          canonical_delivery: canonicalDeliveryCount,
+        }),
+      );
+    }
     if (
-      ctx?.provenance !== "persisted" &&
+      freshPlan &&
       deliveryIntent.requested &&
-      canonicalDeliveryCount === 0 &&
-      rawDeliveryCount > 0
+      rawDeliveryCount > 0 &&
+      canonicalDeliveryCount < rawDeliveryCount
     ) {
       // HOTFIX 1 §F — the planner TRIED to emit a delivery task but it
       // was malformed/unservable/dropped: NOT a true omission. PAIR must
       // never "repair into validity" a failed planner emission by
       // swapping in a clean one — fail closed instead of silently
-      // injecting.
+      // injecting. R1 — evidence lost during preparation (C < R) is the
+      // same class, whether dropped by the transport sanitize or by the
+      // canonical one.
       throw new IntegrityError(
         "FAIL_CLOSED_DELIVERY_TASK_INVALIDATED",
         JSON.stringify({
@@ -424,7 +461,11 @@ export function makeServeCanonicalizer(deps: {
           delete md[PAIR_DELIVERY_INJECTION_KEY];
         }
       }
-      if (deliveryIntent.requested && canonicalDeliveryCount === 0) {
+      if (
+        deliveryIntent.requested &&
+        canonicalDeliveryCount === 0 &&
+        rawDeliveryCount === 0
+      ) {
         const servable =
           SERVE_LLM_WORK_CAPS.includes("TELEGRAM_DELIVERY") &&
           deps

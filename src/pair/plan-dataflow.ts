@@ -655,6 +655,43 @@ const isRemoteTask = (task: Record<string, unknown>): boolean =>
 export const isDeliveryTask = (task: Record<string, unknown>): boolean =>
   ((task.required_capabilities as string[]) ?? []).includes(DELIVERY_CAPABILITY);
 
+/** HOTFIX 1 R1 — TRUE raw delivery-emission evidence, captured at the
+ *  FIRST point where parsed provider JSON still holds the actual raw
+ *  task array (before ANY sanitize/drop/truncate/remap). Unlike
+ *  `isDeliveryTask`, this detector is safe on arbitrary malformed
+ *  provider output: `required_capabilities` may be an array, a scalar
+ *  string, an object, a number, null — every shape is walked with
+ *  bounded depth and EXACT-token semantics only (a substring like
+ *  "NOT_TELEGRAM_DELIVERY" never matches). A malformed emission attempt
+ *  still counts as an emission: the canonicalizer must then prove
+ *  malformed-drop (fail closed), never classify it as a true omission.
+ *  Never throws; descriptive planner provenance, zero authority. */
+const containsDeliveryToken = (v: unknown, depth: number): boolean => {
+  if (depth > 8 || v === null || v === undefined) return false;
+  if (typeof v === "string") return v === DELIVERY_CAPABILITY;
+  if (Array.isArray(v)) {
+    return v.some((x) => containsDeliveryToken(x, depth + 1));
+  }
+  if (typeof v === "object") {
+    return Object.values(v as Record<string, unknown>).some((x) =>
+      containsDeliveryToken(x, depth + 1),
+    );
+  }
+  return false;
+};
+export const rawDeliveryEmissionCount = (rawTasks: unknown): number => {
+  if (!Array.isArray(rawTasks)) return 0;
+  let n = 0;
+  for (const t of rawTasks) {
+    const caps =
+      t !== null && typeof t === "object"
+        ? (t as Record<string, unknown>)["required_capabilities"]
+        : undefined;
+    if (containsDeliveryToken(caps, 0)) n++;
+  }
+  return n;
+};
+
 /** HOTFIX 1 — PAIR-owned provenance stamp on a delivery task that PAIR
  *  itself injected (true planner omission), e.g.
  *  `{reason:"DELIVERY_TASK_INJECTED", task_key:"T4", mode:"TEXT",

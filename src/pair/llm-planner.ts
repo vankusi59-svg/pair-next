@@ -13,6 +13,7 @@ import { PolicyError } from "./errors.js";
 import {
   extractTaskDataflow,
   isPureBookkeepingTask,
+  rawDeliveryEmissionCount,
 } from "./plan-dataflow.js";
 import { extractGoalContract } from "./goal-contract.js";
 import {
@@ -525,6 +526,11 @@ export interface LlmPlanResult {
   source: "LLM" | "FALLBACK";
   model?: string;
   warnings: string[];
+  /** HOTFIX 1 R1 — TRUE raw delivery-emission evidence captured on the
+   *  parsed provider JSON BEFORE sanitizePlan: the exact count of tasks
+   *  that carried a TELEGRAM_DELIVERY token in ANY shape. Descriptive
+   *  planner provenance only — zero delivery authority. */
+  raw_delivery_emission_count?: number;
 }
 
 type RawTask = {
@@ -1048,7 +1054,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
   const userPrompt = buildPlannerUserPrompt(goal, cfg);
 
   // One attempt: fetch + parse + sanitize into a task DAG (or warnings).
-  const attempt = async (): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }> => {
+  const attempt = async (): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number }> => {
     let text: string;
     try {
       const resp = await fetchImpl(cfg.endpoint, {
@@ -1089,10 +1095,14 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     // PRV2-A R1.A — reserved-capability misuse (AUTOMATON outside pure
     // bookkeeping shape) fails the candidate deterministically; it is
     // never stripped-and-pretended into a different request.
+    // HOTFIX 1 R1 — TRUE raw emission evidence BEFORE the transport's
+    // own sanitize/drop pass: a malformed TELEGRAM_DELIVERY emission
+    // dropped here still counted as a planner attempt.
+    const rawDeliveryEmissions = rawDeliveryEmissionCount(rawTasks);
     const reservedKey = reservedAutomatonMisuseKey(rawTasks as Array<Record<string, unknown>>);
-    if (reservedKey) return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${reservedKey}`] };
+    if (reservedKey) return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${reservedKey}`], raw_delivery_emission_count: rawDeliveryEmissions };
     const { tasks, warnings } = sanitizePlan(rawTasks as RawTask[], sanitizeCaps, maxTasks, cfg.capabilitySets);
-    if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
+    if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings], raw_delivery_emission_count: rawDeliveryEmissions };
     // Bounded repair BEFORE the canonical network gates: a fetch-shaped task
     // missing NETWORK_ACCESS gets it added deterministically (same helper the
     // codex planner lane uses) instead of dying on the annotation omission.
@@ -1101,7 +1111,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
       allowedCapabilities: cfg.allowedCapabilities,
       capabilitySets: cfg.capabilitySets,
     });
-    return { tasks: repair.tasks, warnings: [...warnings, ...repair.warnings] };
+    return { tasks: repair.tasks, warnings: [...warnings, ...repair.warnings], raw_delivery_emission_count: rawDeliveryEmissions };
   };
 
   // Degenerate output (ZERO usable work tasks — a bookkeeping-only plan
@@ -1120,7 +1130,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
       (t) => !isBookkeepingShapedTask(t, sanitizeCaps),
     );
     if (usable.length >= LLM_PLANNER_MIN_TASKS) {
-      return { tasks: a.tasks, source: "LLM", model: cfg.model, warnings: [...warnings, ...a.warnings] };
+      return { tasks: a.tasks, source: "LLM", model: cfg.model, warnings: [...warnings, ...a.warnings], raw_delivery_emission_count: a.raw_delivery_emission_count };
     }
     warnings.push(...a.warnings, "LLM_PLAN_DEGENERATE");
   }

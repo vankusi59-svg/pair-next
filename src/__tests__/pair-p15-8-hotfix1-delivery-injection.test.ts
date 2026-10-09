@@ -41,8 +41,17 @@ import {
   detectTelegramDeliveryIntent,
   assertPlanDataflow,
   assertDeliveryTaskPresence,
+  rawDeliveryEmissionCount,
   type TelegramDeliveryIntent,
 } from "../pair/plan-dataflow.js";
+import { sanitizePlan } from "../pair/llm-planner.js";
+import {
+  runPlannerFailover,
+  type PlannerCandidate,
+  type PlannerInvocation,
+  type PlannerAttemptRecord,
+  type PlannerFailoverResult,
+} from "../pair/planner-pool.js";
 import {
   PAIR_OUTPUT_LANGUAGE_KEY,
   detectOutputLanguage,
@@ -64,6 +73,12 @@ import {
   ReconciliationService,
   RecoveryController,
   validatePlanProposal,
+  TRANSPORT_IN_PROCESS,
+  transportTelegramDelivery,
+  pendingTelegramDeliveries,
+  sha256Hex,
+  type ExecutorAdapter,
+  type GovernedTelegramTransport,
 } from "../pair/index.js";
 
 /* ---------- canonicalizer harness (same composition production runs) -------- */
@@ -550,5 +565,558 @@ describe("P15.8-HF1 E2E", () => {
         intent,
       ),
     ).toThrow(/AMBIGUOUS/);
+  });
+});
+
+/* ==================== R1 — TRUE raw delivery provenance ==================== */
+
+describe("P15.8-HF1-R1 raw delivery emission detector", () => {
+  it("exact-token semantics across every malformed shape — never throws", () => {
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: ["TELEGRAM_DELIVERY"] },
+    ])).toBe(1);
+    // malformed scalar — still a planner delivery ATTEMPT
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: "TELEGRAM_DELIVERY" },
+    ])).toBe(1);
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: ["FILE_OPERATIONS", "TELEGRAM_DELIVERY"] },
+    ])).toBe(1);
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: ["REASONING", "FILE_OPERATIONS"] },
+    ])).toBe(0);
+    // malformed object shape containing the exact token — an attempt
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: { 0: "x", cap: "TELEGRAM_DELIVERY" } },
+    ])).toBe(1);
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: [["nested", "TELEGRAM_DELIVERY"]] },
+    ])).toBe(1);
+    // malformed unrelated shapes — deterministic safe handling
+    expect(rawDeliveryEmissionCount([{ required_capabilities: 123 }])).toBe(0);
+    expect(rawDeliveryEmissionCount([{ required_capabilities: null }])).toBe(0);
+    expect(rawDeliveryEmissionCount([{}])).toBe(0);
+    expect(rawDeliveryEmissionCount([null, 42, "TELEGRAM_DELIVERY"])).toBe(0);
+    expect(rawDeliveryEmissionCount("garbage")).toBe(0);
+    expect(rawDeliveryEmissionCount(undefined)).toBe(0);
+    expect(rawDeliveryEmissionCount(null)).toBe(0);
+    // NO substring matching
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: ["NOT_TELEGRAM_DELIVERY"] },
+    ])).toBe(0);
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: ["TELEGRAM_DELIVERY_X"] },
+    ])).toBe(0);
+    // per-task count, not per-token
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: ["TELEGRAM_DELIVERY", "TELEGRAM_DELIVERY"] },
+    ])).toBe(1);
+    expect(rawDeliveryEmissionCount([
+      { required_capabilities: ["TELEGRAM_DELIVERY"] },
+      { required_capabilities: "TELEGRAM_DELIVERY" },
+    ])).toBe(2);
+  });
+});
+
+/* ---- production-shape failover harness (§7) ---- */
+
+const CAND_A: PlannerCandidate = {
+  model_entry_id: "me-a", ref: "gemini:test-a", provider: "gemini",
+  model: "test-a", endpoint: "http://a", credentialEnv: "K_A",
+};
+const CAND_B: PlannerCandidate = {
+  model_entry_id: "me-b", ref: "codex:test-b", provider: "codex",
+  model: "test-b", endpoint: "", credentialEnv: "K_B", transport: "codex_cli",
+};
+
+/** Mimics BOTH planner transports exactly: parsed provider JSON → FIRST
+ *  sanitizePlan drop (the transport's own pass) → bounded raw-emission
+ *  evidence returned alongside the already-sanitized task list. */
+const transportShaped = (raw: Array<Record<string, unknown>>) => {
+  const { tasks, warnings } = sanitizePlan(
+    raw as never[],
+    SERVE_LLM_PLANNER_CAPS.slice(),
+    12,
+    FULL_SETS,
+  );
+  return {
+    tasks: tasks as Array<Record<string, unknown>>,
+    warnings,
+    raw_delivery_emission_count: rawDeliveryEmissionCount(raw),
+  };
+};
+
+/** A delivery emission the transport sanitize provably drops
+ *  (scalar required_capabilities → DROP_NO_ALLOWED_CAPS). */
+const malformedDeliv = (key: string) => ({
+  task_key: key,
+  title: key,
+  task_instruction: "gửi kết quả tới telegram",
+  required_capabilities: "TELEGRAM_DELIVERY",
+  depends_on: [],
+  metadata: {},
+});
+
+const runFail = async (
+  goal: string,
+  planByRef: Record<string, (inv: PlannerInvocation) => Array<Record<string, unknown>>>,
+) => {
+  const seen: Array<{ ref: string; r: number | undefined }> = [];
+  const calls: Array<{ ref: string; kind: string }> = [];
+  const attempts: PlannerAttemptRecord[] = [];
+  const canonFresh = makeServeCanonicalizer({ executorCapSets: () => FULL_SETS });
+  const candidates = [CAND_A, CAND_B].filter((c) => planByRef[c.ref]);
+  let result: PlannerFailoverResult | null = null;
+  let error: { code?: string } | null = null;
+  try {
+    result = await runPlannerFailover({
+      candidates,
+      assertEligible: () => {},
+      planFn: async (c, inv) => {
+        calls.push({ ref: c.ref, kind: inv.kind });
+        return transportShaped(planByRef[c.ref](inv));
+      },
+      canonicalize: (tasks, c, ev) => {
+        seen.push({ ref: c.ref, r: ev?.raw_delivery_emission_count });
+        const canon = canonFresh(tasks, goal, {
+          provenance: "fresh",
+          raw_delivery_emission_count: ev?.raw_delivery_emission_count,
+        });
+        validatePlanProposal({ tasks: canon }, new Set(SERVE_LLM_PLANNER_CAPS));
+        return canon;
+      },
+      onAttemptEnd: (_t, rec) => attempts.push(rec),
+      now: () => "2026-10-09T00:00:00.000Z",
+    });
+  } catch (e) {
+    error = e as { code?: string };
+  }
+  return { result, error, seen, calls, attempts };
+};
+
+const attemptWarnings = (attempts: PlannerAttemptRecord[]) =>
+  attempts.flatMap((a) => (a.warnings as string[]) ?? []);
+
+describe("P15.8-HF1-R1 production-shape raw provenance", () => {
+  it("R1.A raw malformed delivery dropped BEFORE canonicalizer → INVALIDATED, zero injection", async () => {
+    const raw = () => [
+      work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+      malformedDeliv("T9"),
+    ];
+    // prove the transport sanitize drops it
+    const shaped = transportShaped(raw());
+    expect(shaped.tasks.map((t) => t.task_key)).toEqual(["T1"]);
+    expect(shaped.raw_delivery_emission_count).toBe(1);
+
+    const { result, error, seen, attempts } = await runFail(TEXT_GOAL, {
+      "gemini:test-a": () => raw(),
+    });
+    expect(result).toBeNull();
+    expect(String(error?.code)).toBe("FAIL_CLOSED_PLANNER_EXHAUSTED");
+    // canonicalize saw R=1 evidence on EVERY invocation (INITIAL + REASK)
+    expect(seen.every((s) => s.r === 1)).toBe(true);
+    expect(attemptWarnings(attempts)).toContain(
+      "VALIDATION_CODE:FAIL_CLOSED_DELIVERY_TASK_INVALIDATED",
+    );
+  });
+
+  it("R1.B TRUE omission: provider raw has no delivery → exactly one PAIR injection", async () => {
+    const { result, error, seen } = await runFail(TEXT_GOAL, {
+      "gemini:test-a": () => RAW_TEXT_OMITTING(),
+    });
+    expect(error).toBeNull();
+    expect(seen[0].r).toBe(0);
+    const del = deliveries(result!.tasks);
+    expect(del).toHaveLength(1);
+    const md = del[0].metadata as Record<string, unknown>;
+    expect((md[PAIR_DELIVERY_INJECTION_KEY] as { reason: string }).reason)
+      .toBe("DELIVERY_TASK_INJECTED");
+  });
+
+  it("R1.C raw duplicate delivery, one survives sanitize → AMBIGUOUS, never silently valid", async () => {
+    const raw = () => [
+      work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+      work("T8", "gửi bản tóm tắt đến telegram", ["TELEGRAM_DELIVERY"], ["T1"]),
+      malformedDeliv("T9"),
+    ];
+    const shaped = transportShaped(raw());
+    // sanitize keeps the valid one, drops the malformed → C=1 BUT R=2
+    expect(shaped.raw_delivery_emission_count).toBe(2);
+    expect(deliveries(shaped.tasks)).toHaveLength(1);
+
+    const { result, error, seen, attempts } = await runFail(TEXT_GOAL, {
+      "gemini:test-a": () => raw(),
+    });
+    expect(result).toBeNull();
+    expect(String(error?.code)).toBe("FAIL_CLOSED_PLANNER_EXHAUSTED");
+    expect(seen.every((s) => s.r === 2)).toBe(true);
+    expect(attemptWarnings(attempts)).toContain(
+      "VALIDATION_CODE:FAIL_CLOSED_DELIVERY_TASK_AMBIGUOUS",
+    );
+  });
+
+  it("R1.D no operator intent + unauthorized raw delivery dropped → INTENT fail, plan never accepted", async () => {
+    const NO_INTENT_GOAL = "đọc dữ liệu bán hàng rồi tổng hợp báo cáo";
+    const raw = () => [
+      work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+      malformedDeliv("T9"),
+    ];
+    const shaped = transportShaped(raw());
+    expect(shaped.tasks).toHaveLength(1); // attempt dropped by transport
+
+    const { result, error, seen, attempts } = await runFail(NO_INTENT_GOAL, {
+      "gemini:test-a": () => raw(),
+    });
+    expect(result).toBeNull();
+    expect(String(error?.code)).toBe("FAIL_CLOSED_PLANNER_EXHAUSTED");
+    expect(seen.every((s) => s.r === 1)).toBe(true);
+    expect(attemptWarnings(attempts)).toContain(
+      "VALIDATION_CODE:FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT",
+    );
+  });
+
+  it("R1.E REASK isolation: canonicalize receives the evidence of the EXACT invocation", async () => {
+    const rawFor = (inv: PlannerInvocation) =>
+      inv.kind === "REASK"
+        ? RAW_TEXT_OMITTING()                    // re-ask: true omission
+        : [work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]), malformedDeliv("T9")];
+    const { result, error, seen, calls } = await runFail(TEXT_GOAL, {
+      "gemini:test-a": rawFor,
+    });
+    expect(error).toBeNull();
+    expect(calls.map((c) => c.kind)).toEqual(["INITIAL", "REASK"]);
+    // evidence belongs to the invocation: INITIAL saw R=1, REASK saw R=0
+    expect(seen.map((s) => s.r)).toEqual([1, 0]);
+    // REASK plan was canonicalized with ITS OWN count → omission → injected
+    const del = deliveries(result!.tasks);
+    expect(del).toHaveLength(1);
+    const md = del[0].metadata as Record<string, unknown>;
+    expect((md[PAIR_DELIVERY_INJECTION_KEY] as { reason: string }).reason)
+      .toBe("DELIVERY_TASK_INJECTED");
+  });
+
+  it("R1.F candidate failover isolation: evidence from candidate A never contaminates B", async () => {
+    const { result, error, seen } = await runFail(TEXT_GOAL, {
+      "gemini:test-a": () => [
+        work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+        malformedDeliv("T9"),
+      ],
+      "codex:test-b": () => RAW_TEXT_OMITTING(),
+    });
+    expect(error).toBeNull();
+    // A: INITIAL+REASK both R=1 (INVALIDATED) → B: R=0 → injected
+    expect(seen).toEqual([
+      { ref: "gemini:test-a", r: 1 },
+      { ref: "gemini:test-a", r: 1 },
+      { ref: "codex:test-b", r: 0 },
+    ]);
+    expect(result!.winner.route).toBe("codex:test-b");
+    expect(deliveries(result!.tasks)).toHaveLength(1);
+  });
+});
+
+/* ---- §8 re-canonicalization / provenance determinism pins ---- */
+
+describe("P15.8-HF1-R1 replay determinism", () => {
+  it("persisted replay: canonical injected plan is byte-identical incl. injection record", () => {
+    const first = canon(RAW_TEXT_OMITTING(), TEXT_GOAL);
+    const replay = canon(first, TEXT_GOAL, FULL_SETS, "persisted");
+    expect(replay).toEqual(first);
+    const md = deliveries(replay)[0].metadata as Record<string, unknown>;
+    expect((md[PAIR_DELIVERY_INJECTION_KEY] as { reason: string }).reason)
+      .toBe("DELIVERY_TASK_INJECTED");
+  });
+
+  it("fresh re-canonicalization of an injected plan is NOT the replay contract — record stripped", () => {
+    // Explicit pin per mandate §8: the ONLY supported replay path for a
+    // canonical plan is ctx.provenance="persisted". Feeding a canonical
+    // injected list through the FRESH seam strips the PAIR-owned stamp
+    // (planner-forgery defense) while the task itself survives intact.
+    const first = canon(RAW_TEXT_OMITTING(), TEXT_GOAL);
+    const recanon = canon(first, TEXT_GOAL);
+    const del = deliveries(recanon);
+    expect(del).toHaveLength(1);
+    const md = del[0].metadata as Record<string, unknown>;
+    expect(md[PAIR_DELIVERY_INJECTION_KEY]).toBeUndefined();
+    expect(md[TELEGRAM_MANIFEST_FIELD]).toBeDefined();
+  });
+});
+
+/* ==================== §9 real delivery-pipeline E2E ==================== */
+
+/** Minimal scripted executor (same contract as the f4 harness adapter):
+ *  dispatch → RUNNING; collect_result declares the artifacts the
+ *  execution really wrote (canonical ingest seam). */
+class E2EAdapter implements ExecutorAdapter {
+  readonly executor_id: string;
+  caps: string[];
+  dispatched: string[] = [];
+  wroteTaskKeys: string[] = [];
+  fileContent: Record<string, string> = {};
+  workspace = "";
+  store?: PairEvidenceStore;
+  constructor(id: string, caps: string[]) {
+    this.executor_id = id;
+    this.caps = caps;
+  }
+  probe() {
+    return { executor_id: this.executor_id, available: true, state: "READY" };
+  }
+  qualify() {
+    return { qualified: true, dispatch_enabled: true };
+  }
+  capabilities() {
+    return { capability_ids: this.caps };
+  }
+  prepare_task(task: Record<string, unknown>) {
+    return task;
+  }
+  dispatch(task: Record<string, unknown>) {
+    const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
+    this.dispatched.push(eid);
+    const taskRow = this.store?.tryGet("task", String(task.task_id));
+    const key = String(taskRow?.task_key ?? "");
+    const df = (taskRow?.metadata as Record<string, unknown> | undefined)
+      ?.pair_dataflow as Record<string, unknown> | undefined;
+    for (const f of (df?.produces as string[]) ?? []) {
+      const fp = path.join(this.workspace, f);
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, this.fileContent[key] ?? `delivery text for ${key}`);
+      this.wroteTaskKeys.push(`${key}:${f}`);
+    }
+    const box = (this as { _last?: Record<string, unknown> })._last ??
+      ((this as { _last?: Record<string, unknown> })._last = {});
+    box[eid] = {
+      status: "COMPLETED",
+      mission_id: task.mission_id,
+      task_id: task.task_id,
+      governed_task_id: task.governed_task_id,
+      summary: `done ${key}`,
+    };
+    return { execution_id: eid, status: "RUNNING", run_root: null, workspace: task.workspace };
+  }
+  observe(executionId: string) {
+    const last = (this as { _last?: Record<string, { status: string }> })._last;
+    return { status: String(last?.[executionId]?.status ?? "RUNNING") };
+  }
+  cancel() {
+    return { status: "CANCELLED" };
+  }
+  collect_result(executionId: string) {
+    const last = (this as { _last?: Record<string, Record<string, unknown>> })._last;
+    const r = last?.[executionId] ?? { status: "FAILED", error: { class: "MISSING" } };
+    const taskRow = this.store?.tryGet("task", String((r as { task_id?: string }).task_id));
+    const df = (taskRow?.metadata as Record<string, unknown> | undefined)
+      ?.pair_dataflow as Record<string, unknown> | undefined;
+    const artifacts = ((df?.produces as string[]) ?? [])
+      .map((f) => {
+        const fp = path.join(this.workspace, f);
+        if (!fs.existsSync(fp)) return null;
+        const bytes = fs.readFileSync(fp);
+        return { path: f, sha256: sha256Hex(bytes), byte_size: bytes.length };
+      })
+      .filter((a): a is NonNullable<typeof a> => a !== null);
+    return { execution_id: executionId, artifacts, ...r };
+  }
+}
+
+interface PipeStack extends ReturnType<typeof freshStack> {
+  adapters: Map<string, ExecutorAdapter>;
+  adapter: E2EAdapter;
+  runtime: MissionRuntime;
+  workspace: string;
+}
+
+function pipeStack(name: string, rawForGoal: (goal: string) => Array<Record<string, unknown>>): PipeStack {
+  const dir = path.join(ROOT, `${counter++}-${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+  const service = new PairControlPlane(store);
+  for (const c of SERVE_LLM_PLANNER_CAPS) {
+    service.registerCapability(c, { risk_class: "LOW" });
+  }
+  const gate = new GovernedTaskGate(service);
+  const registry = new ExecutorRegistry(service);
+  const router = new MissionRouter(service, gate);
+  const recovery = new RecoveryController(service);
+  const recon = new ReconciliationService(service, new Map());
+  const approvals = new ApprovalQueue(service);
+  const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
+  const adapters = new Map<string, ExecutorAdapter>();
+  const canonicalize = makeServeCanonicalizer({ executorCapSets: () => FULL_SETS });
+  // Planner = production seam: TRUE raw evidence computed over the canned
+  // raw candidate (as the transports do) then canonicalize fresh.
+  const planner = (input: { mission?: { goal?: unknown; metadata?: Record<string, unknown> } }) => {
+    const pinned = input.mission?.metadata?.pinned_plan_tasks as Array<Record<string, unknown>> | undefined;
+    if (Array.isArray(pinned) && pinned.length) return { tasks: pinned };
+    const goal = String(input.mission?.goal ?? "");
+    const raw = rawForGoal(goal);
+    return {
+      tasks: canonicalize(raw, goal, {
+        provenance: "fresh",
+        raw_delivery_emission_count: rawDeliveryEmissionCount(raw),
+      }),
+    };
+  };
+  const runtime = new MissionRuntime({
+    service, gate, router, adapters: adapters as never, scheduler, approvals,
+    reconciliation: recon, recovery, planner: planner as never,
+    telegramDeliveryDefaultChatId: "111",
+  });
+  const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
+  const control = new MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability: new MissionObservability(service),
+    planner: planner as never,
+  });
+  const project = service.createProject({ name: "p", root_location: workspace });
+  const adapter = new E2EAdapter("EX_E2E", [
+    "FILE_OPERATIONS", "REASONING", "TELEGRAM_DELIVERY",
+    "AUTOMATON_TASK_EXECUTION", "NETWORK_ACCESS",
+  ]);
+  adapter.workspace = workspace;
+  adapter.store = store;
+  registry.register({
+    executor_id: adapter.executor_id,
+    executor_type: "EXTERNAL",
+    capabilities: adapter.caps,
+    health_state: "READY",
+    status: "ENABLED",
+    metadata: {
+      routing_priority: 50,
+      transport_type: TRANSPORT_IN_PROCESS,
+      qualification_state: "QUALIFIED",
+      permission_modes: ["READ", "WRITE", "FILE_READ", "FILE_WRITE"],
+      workspace_modes: ["EXPLICIT_WORKSPACE"],
+      supports_cancel: true,
+      max_concurrency: 4,
+    },
+  });
+  service.routes.registerRoute({
+    route_id: `RTE_${adapter.executor_id}`,
+    route_kind: "IN_PROCESS_RUNTIME",
+    enabled: true,
+    eligibility_state: "QUALIFIED",
+    qualification_state: "QUALIFIED",
+    direct_callable: true,
+    capabilities: adapter.caps,
+    priority: 50,
+    executor_hint: adapter.executor_id,
+  });
+  service.routes.registerBinding({
+    executor_id: adapter.executor_id,
+    route_id: `RTE_${adapter.executor_id}`,
+    mechanism: "SPAWN_ENV",
+    qualification_state: "QUALIFIED",
+    capabilities: adapter.caps,
+  });
+  adapters.set(adapter.executor_id, adapter);
+  return {
+    store, control, runtime, adapters, adapter, workspace,
+    biz: new BusinessLayer({ store, control, schedules: new MissionScheduleService(service) }),
+    projectId: String(project.project_id), projectRoot: workspace,
+  };
+}
+
+const missionState = (s: PipeStack, mid: string) =>
+  String((s.store.get("mission_runtime", `MRT_${mid}`) as { state: string }).state);
+
+function driveToTerminal(s: PipeStack, mid: string, max = 200) {
+  let t = Date.parse("2026-01-01T00:00:00Z");
+  for (let i = 0; i < max; i++) {
+    t += 120_000;
+    s.runtime.tick(mid, new Date(t).toISOString());
+    const st = missionState(s, mid);
+    if (["COMPLETED", "FAILED", "ABORTED", "WAITING_APPROVAL", "CANCELLED"].includes(st)) return st;
+  }
+  return missionState(s, mid);
+}
+
+describe("P15.8-HF1-R1 §9 real delivery pipeline", () => {
+  it("true omission → injected task routes to delivery executor → staging → governed send", async () => {
+    const s = pipeStack("pipe", () => RAW_TEXT_OMITTING());
+    s.adapter.fileContent["T4"] = "BÁO CÁO TÓM TẮT: doanh thu tăng";
+    // goal → planner true omission → canonical injection → preview → confirm
+    const preview = s.control.createPlanPreview({
+      project_id: s.projectId,
+      goal: TEXT_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [s.workspace],
+      risk_ceiling: "LOW",
+      operator_id: OP,
+    });
+    const pinned = preview.plan.tasks as Array<Record<string, unknown>>;
+    const injected = deliveries(pinned)[0];
+    const md = injected.metadata as Record<string, unknown>;
+    expect((md[PAIR_DELIVERY_INJECTION_KEY] as { reason: string }).reason)
+      .toBe("DELIVERY_TASK_INJECTED");
+    const mission = s.control.confirmPlanPreview({
+      preview_id: String(preview.preview_id),
+      plan_digest: String(preview.plan_digest),
+      operator_id: OP,
+    });
+    const mid = String(mission.mission_id);
+    // normal routing → delivery preparation executor runs → staging occurs
+    const terminal = driveToTerminal(s, mid);
+    expect(terminal).toBe("COMPLETED");
+    // the injected task was REALLY dispatched to the delivery executor
+    const taskRows = (s.store.list("task") as Array<Record<string, unknown>>)
+      .filter((t) => String(t.mission_id) === mid);
+    const delRow = taskRows.find((t) =>
+      ((t.required_capabilities as string[]) ?? []).includes("TELEGRAM_DELIVERY"));
+    expect(delRow).toBeDefined();
+    expect(String(delRow!.status)).toBe("COMPLETED");
+    expect(s.adapter.dispatched.length).toBeGreaterThan(0);
+    // governed outbox staging: the delivery execution wrote the staged file
+    expect(s.adapter.wroteTaskKeys.some((k) => k.endsWith(":outbox/report.txt"))).toBe(true);
+    // a governed delivery request was minted (outbox staging boundary)
+    const pend = pendingTelegramDeliveries(s.store) as Array<Record<string, unknown>>;
+    expect(pend.length).toBe(1);
+    // injected task is downstream-indistinguishable: same minted request,
+    // same text_source_artifact staging as a planner-emitted delivery task
+    const req = pend[0];
+    expect(String(req.text_source_artifact)).toBe("outbox/report.txt");
+    // governed transport path engages (mock transport at the real seam)
+    const calls: Array<{ chatId: string; text?: string }> = [];
+    const transport: GovernedTelegramTransport = {
+      send: async (a: { chatId: string; text?: string }) => {
+        calls.push(a);
+        return { kind: "ok", message_id: 4242 };
+      },
+    };
+    const backend = {
+      begin: (artifact: string | null) => {
+        const rr = s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "SENDING" }) as { acquired: boolean };
+        return { acquired: rr.acquired === true };
+      },
+      sent: (artifact: string | null, ev: { message_id?: string | number | null }) =>
+        s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "SENT", message_id: ev?.message_id ?? null }),
+      failed: (artifact: string | null, err: string) =>
+        s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "FAILED", error: err }),
+      unknown: (artifact: string | null, err: string) =>
+        s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "UNKNOWN", error: err }),
+      unsendable: (reason: string) =>
+        s.control.transitionTelegramDelivery(String(req.delivery_id), { to: "UNSENDABLE", error: reason }),
+    };
+    const r = await transportTelegramDelivery({
+      request: req,
+      transport,
+      isAllowed: () => true,
+      backend,
+      readText: (p) => fs.readFileSync(p, "utf8"),
+    });
+    if (!r.sent.length) {
+      console.log("REQ", JSON.stringify({
+        mode: req.mode, text_state: req.text_state,
+        textLen: String(req.text ?? "").length,
+        dest: req.destination, delivery_id: req.delivery_id,
+      }));
+      console.log("RES", JSON.stringify(r));
+    }
+    expect(r.sent.length).toBe(1);
+    expect(calls).toHaveLength(1);
+    expect(String(calls[0].chatId)).toBe("111");
+    expect(String(calls[0].text)).toContain("BÁO CÁO TÓM TẮT");
   });
 });

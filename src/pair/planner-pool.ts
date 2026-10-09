@@ -360,7 +360,7 @@ export async function runPlannerFailover(opts: {
   planFn: (
     c: PlannerCandidate,
     invocation: PlannerInvocation,
-  ) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>;
+  ) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number }>;
   /** Canonical per-invocation eligibility proof (role + lifecycle).
    *  Throw = authority failure (propagates); return {reject:true,...} =
    *  failover-eligible availability rejection. May be async (CPL-1 R1 —
@@ -373,8 +373,17 @@ export async function runPlannerFailover(opts: {
     | { reject: true; failure_class: PlannerFailureClass; reason: string }
     | Promise<void | { reject: true; failure_class: PlannerFailureClass; reason: string }>;
   /** The one canonical task-preparation seam — returns the exact canonical
-   *  task list the preview will pin; any throw → PLAN_INVALID failover. */
-  canonicalize?: (tasks: Array<Record<string, unknown>>, c: PlannerCandidate) => Array<Record<string, unknown>>;
+   *  task list the preview will pin; any throw → PLAN_INVALID failover.
+   *  `evidence` carries bounded provenance belonging to THIS exact planFn
+   *  invocation (INITIAL vs REASK vs another candidate): the true raw
+   *  TELEGRAM_DELIVERY emission count captured on the parsed provider JSON
+   *  before the transport's own sanitize pass (HOTFIX 1 R1). Descriptive
+   *  only — never authority. */
+  canonicalize?: (
+    tasks: Array<Record<string, unknown>>,
+    c: PlannerCandidate,
+    evidence?: { raw_delivery_emission_count?: number },
+  ) => Array<Record<string, unknown>>;
   onAttemptStart?: (base: Omit<PlannerAttemptRecord, "outcome">) => unknown;
   onAttemptEnd?: (token: unknown, record: PlannerAttemptRecord) => void;
   /** P-REASK R4 — fires AFTER eligibility re-proof and BEFORE the second
@@ -477,7 +486,9 @@ export async function runPlannerFailover(opts: {
       let canonical = res.tasks;
       if (opts.canonicalize) {
         try {
-          canonical = opts.canonicalize(res.tasks, c);
+          canonical = opts.canonicalize(res.tasks, c, {
+            raw_delivery_emission_count: res.raw_delivery_emission_count,
+          });
         } catch (e) {
           // P-GRAMMAR2 §3 — bounded typed observability: surface the
           // thrown canonical-validation code on the attempt alongside
@@ -563,7 +574,9 @@ export async function runPlannerFailover(opts: {
               if (Array.isArray(res2.tasks) && res2.tasks.length) {
                 try {
                   const canonical2 = opts.canonicalize
-                    ? opts.canonicalize(res2.tasks, c)
+                    ? opts.canonicalize(res2.tasks, c, {
+                        raw_delivery_emission_count: res2.raw_delivery_emission_count,
+                      })
                     : res2.tasks;
                   if (!canonical2.length) {
                     settle({

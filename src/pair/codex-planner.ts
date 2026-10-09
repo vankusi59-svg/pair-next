@@ -51,6 +51,7 @@ import {
   type PlannerRejectionContext,
 } from "./llm-planner.js";
 import { assertPlannerCandidateEligible, assertPlannerRoleAndDisjoint } from "./model-role.js";
+import { rawDeliveryEmissionCount } from "./plan-dataflow.js";
 import { providerModelEligibility } from "./model-routable.js";
 import type { PairEvidenceStore } from "./store.js";
 import { ProviderCatalog } from "./provider-catalog.js";
@@ -266,7 +267,7 @@ export async function codexPlannerProbe(opts: {
 export async function codexPlannerPlan(
   goal: string,
   cfg: CodexPlannerInvokeConfig,
-): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }> {
+): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number }> {
   const exe = cfg.executable ?? resolveExecutable(cfg.env);
   if (!exe) return { tasks: [], warnings: [CODEX_PLANNER_WARNING.CLI_MISSING] };
   const timeoutMs = cfg.timeoutMs ?? CODEX_PLANNER_DEFAULT_TIMEOUT_MS;
@@ -306,11 +307,15 @@ export async function codexPlannerPlan(
   if (!Array.isArray(rawTasks) || !rawTasks.length) {
     return { tasks: [], warnings: ["LLM_PLAN_NO_TASKS"] };
   }
+  // HOTFIX 1 R1 — TRUE raw emission evidence BEFORE the transport's
+  // own sanitize/drop pass: a malformed TELEGRAM_DELIVERY emission
+  // dropped here still counted as a planner attempt.
+  const rawDeliveryEmissions = rawDeliveryEmissionCount(rawTasks);
   // PRV2-A R1.A — reserved-capability misuse fails the candidate typed;
   // AUTOMATON is never stripped off a mixed task and pretended away.
   const misuseKey = reservedAutomatonMisuseKey(rawTasks as Array<Record<string, unknown>>);
   if (misuseKey) {
-    return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${misuseKey}`] };
+    return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${misuseKey}`], raw_delivery_emission_count: rawDeliveryEmissions };
   }
   // R1.A — sanitize keeps the PAIR-reserved AUTOMATON key ONLY so a pure
   // bookkeeping-shaped emission survives to the canonicalize seam for
@@ -325,7 +330,7 @@ export async function codexPlannerPlan(
     workBudget,
     cfg.capabilitySets,
   );
-  if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
+  if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings], raw_delivery_emission_count: rawDeliveryEmissions };
   // Bounded repair BEFORE the canonical network gates — the SAME helper the
   // HTTP/Gemini lane uses, at the equivalent post-sanitize seam.
   const netRepair = repairNetworkCapabilityBinding(tasks, {
@@ -339,9 +344,9 @@ export async function codexPlannerPlan(
     (t) => !isBookkeepingShapedTask(t, sanitizeCaps),
   );
   if (usable.length < LLM_PLANNER_MIN_TASKS) {
-    return { tasks: [], warnings: [...warnings, ...netRepair.warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE] };
+    return { tasks: [], warnings: [...warnings, ...netRepair.warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE], raw_delivery_emission_count: rawDeliveryEmissions };
   }
-  return { tasks: netRepair.tasks, warnings: [...warnings, ...netRepair.warnings] };
+  return { tasks: netRepair.tasks, warnings: [...warnings, ...netRepair.warnings], raw_delivery_emission_count: rawDeliveryEmissions };
 }
 
 /** argv the planner child runs under — exposed for evidence/tests: proves
