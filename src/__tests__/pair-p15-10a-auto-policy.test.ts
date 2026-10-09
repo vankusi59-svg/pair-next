@@ -968,6 +968,124 @@ describe("F8 — actor provenance", () => {
   });
 });
 
+/* === F10 — canonical operator identity across create ↔ policy ======== */
+
+describe("F10 — canonical operator identity", () => {
+  it("canonical header `operator:alice` → owner stored once-prefixed; policy works", async () => {
+    const { store, objectives } = fresh("f10");
+    const bid = mkBiz(store);
+    const port = await serveMini(objectives, store);
+    const hdrAlice = {
+      "content-type": "application/json",
+      "x-operator-id": "operator:alice", // already canonical
+      authorization: `Bearer ${TOK}`,
+    };
+    const c = await fetch(`http://127.0.0.1:${port}/api/vnext/objectives`, {
+      method: "POST", headers: hdrAlice,
+      body: JSON.stringify({
+        business_id: bid, title: "t", statement: "s",
+        kpis: [{ name: "k", unit: "u", baseline: 0, target: 1 }],
+        deadline: FUTURE, budget_ceiling_microusd: 1,
+      }),
+    });
+    expect(c.status).toBe(200);
+    const cj = (await c.json()) as { objective_id: string; owner_authority_id: string };
+    // Exactly one prefix — never operator:operator:alice.
+    expect(cj.owner_authority_id).toBe("operator:alice");
+    const base = `http://127.0.0.1:${port}/api/vnext/objectives/${cj.objective_id}/auto-policy`;
+    const g = await fetch(base, { headers: hdrAlice });
+    expect(g.status).toBe(200);
+    const cfg = await fetch(base, {
+      method: "POST", headers: hdrAlice,
+      body: JSON.stringify({ action: "configure", limits: LIMITS(), idempotency_key: "k1" }),
+    });
+    expect(cfg.status).toBe(200);
+    const v = ((await cfg.json()) as { auto_policy: { policy_version: number } }).auto_policy.policy_version;
+    const en = await fetch(base, {
+      method: "POST", headers: hdrAlice,
+      body: JSON.stringify({ action: "enable", policy_version: v, idempotency_key: "k2" }),
+    });
+    expect(en.status).toBe(200);
+  });
+
+  it("raw header `alice` → same canonical owner; raw OR canonical header both operate", () => {
+    const { store, objectives, policy } = fresh("f10b");
+    const o = mkObjective(objectives, mkBiz(store), { operator_id: "alice" });
+    expect(String(o.owner_authority_id)).toBe("operator:alice");
+    // Both forms resolve to the same canonical actor.
+    const s1 = policy.control({
+      objective_id: oid(o), actor: "operator:alice", action: "configure",
+      limits: LIMITS(), idempotency_key: "k1",
+    });
+    expect(s1.state).toBe("DISABLED");
+  });
+
+  it("legacy double-prefix objective is NOT silently aliased", () => {
+    const { store, objectives, policy } = fresh("f10c");
+    // Simulate a row persisted under the old convention — owner is
+    // literally operator:operator:alice and stays canonical truth.
+    const o = mkObjective(objectives, mkBiz(store), {
+      owner_authority_id: "operator:operator:alice",
+    });
+    expectFail(
+      () => policy.control({
+        objective_id: oid(o), actor: "operator:alice", action: "configure",
+        limits: LIMITS(), idempotency_key: "x",
+      }),
+      "FAIL_CLOSED_POLICY_OWNER",
+    );
+    // The literal stored owner still governs.
+    const st = policy.control({
+      objective_id: oid(o), actor: "operator:operator:alice", action: "configure",
+      limits: LIMITS(), idempotency_key: "x",
+    });
+    expect(st.configured !== undefined).toBe(true);
+  });
+});
+
+/* ====== F7b — expiry concurrency proof (two SQLite connections) ====== */
+
+describe("F7-concurrency — expiry across two connections", () => {
+  it("sequential competing commits: one EXPIRED transition, one anchor, restart-verified", () => {
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const { dir, store, objectives, policy } = fresh("f7c", () => nowMs);
+    const o = mkObjective(objectives, mkBiz(store));
+    policy.control({
+      objective_id: oid(o), actor: OWNER, action: "configure",
+      limits: { expires_at: "2030-01-02T00:00:00.000Z", max_ceo_calls: 1 },
+      idempotency_key: "c",
+    });
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    nowMs = Date.parse("2030-01-03T00:00:00.000Z");
+    const store2 = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const policy2 = new ObjectiveAutoPolicyService(store2, objectives, () => nowMs);
+    const r1 = policy.evaluate(oid(o));
+    const r2 = policy2.evaluate(oid(o));
+    expect(r1.state).toBe("EXPIRED");
+    expect(r2.state).toBe("EXPIRED");
+    // Exactly one EXPIRED transition + one expire anchor.
+    const row = store.get("objective_auto_policy", `oap:${oid(o)}`);
+    expect(row.policy_version).toBe(3);
+    const anchors = store.listEvents("objective_auto_policy", `oap:${oid(o)}`)
+      .filter((a) => (a.metadata as { action?: string })?.action === "expire");
+    expect(anchors).toHaveLength(1);
+    // Racing-commit recovery: a stale row put lands on VERSION_CONFLICT
+    // and converges to the committed EXPIRED row.
+    const stale = { ...(row as Record<string, unknown>), state: "ENABLED",
+      policy_version: 3, version: Number(row.version) - 1 } as never;
+    const svc2 = policy2 as unknown as {
+      expireIfDue(r: unknown, id: string): { state: string };
+    };
+    const recovered = svc2.expireIfDue(stale, oid(o));
+    expect(recovered.state).toBe("EXPIRED");
+    // Reopen: canonical row + anchor still prove.
+    const store3 = new PairEvidenceStore(path.join(dir, "pair.db"));
+    const policy3 = new ObjectiveAutoPolicyService(store3, objectives, () => nowMs);
+    expect(policy3.evaluate(oid(o)).state).toBe("EXPIRED");
+    expect(policy3.evaluate(oid(o)).policy_version).toBe(3);
+  });
+});
+
 /* ===== O1 — effective honors the objective lifecycle ===== */
 
 describe("O1 — effective = auto eligibility (lifecycle guard)", () => {

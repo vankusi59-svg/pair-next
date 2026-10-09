@@ -666,9 +666,17 @@ export class ObjectiveAuthorityService {
     if (!title && !statement) {
       throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_FIELD", "title or statement required");
     }
+    // F10 — canonicalize the operator identity exactly once: raw
+    // `alice` → `operator:alice`; an already-canonical `operator:alice`
+    // is stored as-is (never double-prefixed). Objectives already
+    // persisted under the old double-prefix convention are NOT
+    // silently re-aliased — their stored owner stays canonical truth.
+    const rawOperator = assertStr("operator_id", input.operator_id);
     const ownerAuthority = input.owner_authority_id
       ? assertStr("owner_authority_id", input.owner_authority_id)
-      : `operator:${input.operator_id}`;
+      : rawOperator.startsWith("operator:")
+        ? rawOperator
+        : `operator:${rawOperator}`;
     const dedupKey = input.dedup_key ?? this.defaultDedupKey({ title, statement, description: input.description });
     const id = this.objectiveIdFor(businessId, dedupKey);
     let parentId: string | null = null;
