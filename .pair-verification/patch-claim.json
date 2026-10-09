@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_10_C_R4_FINAL_READINESS_COST_PROOF",
-  "title": "P15.10-C R4: final readiness & cost proof — claim() predicate shared with readiness, broken-lineage fail-close, in-txn pricing identity",
+  "claim_id": "P15_10_C_FINAL_COST_HALT_HOTFIX",
+  "title": "P15.10-C FINAL hotfix: cost halt TOCTOU \u2014 in-txn halt re-check on authoritative billing",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
@@ -8,6 +8,7 @@
     "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10c-final-audit.test.ts",
     "src/__tests__/pair-p15-10c-r4.test.ts",
     "src/__tests__/pair-p15-10c-r3.test.ts",
     "src/__tests__/pair-p15-10c-r2.test.ts",
@@ -22,5 +23,5 @@
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "R4 remediation on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3): targeted audit fixes proven by prepatch FAIL -> postpatch PASS (12/17 R4 tests failed pre-fix). F3: readiness() could report READY while claim() would deny — it checked only queue-state quarantine/blocked. New scheduler.queueEligibility() is claim()'s OWN predicate (queue state, pending generation, next_due, attempt cooldown) and public claimable() adds the authority pins (effective policy, binding pins) plus active-lease check; driver.readiness() consumes claimable() — no second scheduler; read-only, owner-scoped, no wake/lease side effects. Reasons: NO_QUEUE, QUEUE_<state>, NO_PENDING_GENERATION, NOT_DUE_YET, ATTEMPT_COOLDOWN, POLICY_NOT_EFFECTIVE, STALE_BINDING, LEASE_HELD + SCHEDULER_NOT_READY/COST_UNVERIFIED/COST_BINDING_UNVERIFIED/BUDGET_EXHAUSTED; driver_integrated vs objective_runnable distinguished; driver_missing carries real reasons. F2-A: mission with objective-binding lineage missing/contradictory (wob row gone, work_item gone, item-claim vs allocation mismatch) -> FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED, never treated as manual; truly manual missions unaffected. objectiveScopeFor resolves binding-claim via work_item.objective_id then bounded parent-chain walk (cycle/mid-chain-missing -> BROKEN) plus allocation linkage. F2-B: billingFor/requested re-resolved INSIDE the atomic check-and-reserve txn — a profile/route edit committed after the advisory outer read can never slip a stale price; in-txn UNKNOWN/unbounded deny mirrors outer fast-path; in-txn resId re-check (COMMITTED/SETTLED adopt, unexpected HELD -> AMBIGUOUS). F2-C: real cross-connection race proof — sibling reservation committed at txn entry is seen and denied (never double-reserve over cap). Test hygiene per mandate: F3f split into quarantined vs budget-exhausted; EXPIRED proof now uses a real expires_at deadline, never a 2999 fixture bump. R1/R2 audited code verbatim. No merge/deploy; driver OFF."
+  "description": "FINAL hotfix on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3): Finding B CONFIRMED by prepatch FAIL \u2014 PAIR_COST_HALT=1, profile FREE flipped to METERED_API between the advisory billingFor() and the atomic txn produced a PAID reservation (HELD 400k) under an active halt; the halt check evaluated the stale advisory mode. Fix (only this boundary): inside store.immediate, after the authoritative in-txn billing re-resolve and after the resId adopt/deny re-check (adopting an already-committed reservation is not new spend), haltActive() is re-checked against the REAL in-txn billing.mode \u2014 METERED_API or UNKNOWN under halt -> FAIL_CLOSED_COST_HALT violation, no reservation row, denial evidence on the mission evidence stream. FREE/SUBSCRIPTION/UNMETERED semantics unchanged; advisory pre-check kept. Finding A verdict held: SAFE_BY_EXISTING_PROOF_WITH_TWO_INCONCLUSIVE_TAMPER_EDGES (A2a wob.mission_id unverified, A3b >8-hop claim + missing leaf alloc -> manual; both need non-canonical row writes \u2014 hardening notes only, objectiveScopeFor unchanged). Tests: B1 deny+no-row+evidence, B2 stable-metered deny, B3 no-halt flip pins new price; audit test file committed as evidence. No merge/deploy; driver OFF."
 }

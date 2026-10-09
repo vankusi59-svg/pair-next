@@ -677,6 +677,21 @@ export class CostService {
           used_microusd: null, requested_microusd: null, max_microusd: null }],
           warnings: [], saved: null };
       }
+      // FINAL HOTFIX — halt re-checked against the AUTHORITATIVE
+      // in-txn billing: the advisory check above can see FREE while a
+      // concurrent edit flipped the profile to METERED_API/UNKNOWN in
+      // the gap; the halt must still block the cost-bearing dispatch.
+      // Adoption of an already-committed reservation above is not new
+      // spend and stays allowed under halt. FREE/SUBSCRIPTION/
+      // UNMETERED semantics are unchanged.
+      if (this.haltActive() &&
+          (billing.mode === "METERED_API" || billing.mode === "UNKNOWN")) {
+        violations.push({
+          scope_type: "pricing", scope_id: routeId ?? params.executorId,
+          reason: "FAIL_CLOSED_COST_HALT",
+          used_microusd: null, requested_microusd: null, max_microusd: null,
+        });
+      }
       for (const p of applicable) {
         const since = costPeriodStart(p.period as CostPeriod, new Date());
         const matches = (r: Record<string, unknown>) => {
