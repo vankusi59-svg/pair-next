@@ -812,8 +812,18 @@ const planExpander = async (input) => {
       // contract enrichment + the same validatePlanProposal the preview
       // pins. A non-empty raw plan failing canonical validation is
       // FAILED/PLAN_INVALID and the next candidate is tried.
-      canonicalize: (tasks) => {
-        const canon = canonicalizeLlmTasks(tasks, goal);
+      canonicalize: (tasks, _c, evidence) => {
+        // HOTFIX 1 R1 — true raw emission evidence captured inside the
+        // planner transport BEFORE its own sanitize pass; threaded from
+        // THIS invocation's planFn result (INITIAL/REASK/candidate
+        // isolated by runPlannerFailover).
+        const canon = canonicalizeLlmTasks(tasks, goal, {
+          provenance: "fresh",
+          raw_delivery_emission_count:
+            evidence?.raw_delivery_emission_count,
+          raw_delivery_emission_state:
+            evidence?.raw_delivery_emission_state,
+        });
         validatePlanProposal({ tasks: canon }, knownCapabilityIds());
         return canon;
       },
