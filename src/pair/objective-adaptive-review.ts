@@ -1384,12 +1384,17 @@ export class ObjectiveAdaptiveReviewService {
     }
 
     return this.commitReview(
-      objectiveId, actor, reviewId, obsDigest, observation, outcome, decision);
+      objectiveId, actor, reviewId, obsDigest, observation, outcome, decision,
+      input.autonomous_commit_guard);
   }
 
   /** ONE serializing transaction: replay check → stale gate → receipt
    *  → optional strategy revision → immutable anchors. Anything that
-   *  throws rolls the whole authority chain back (§17). */
+   *  throws rolls the whole authority chain back (§17). The optional
+   *  autonomous commit guard fires FIRST inside the transaction so a
+   *  revoke landing between the CEO decision commit and this review
+   *  commit rolls back every review side effect (receipt + strategy
+   *  revision + anchors) — P15.10-C R2 F1.2. */
   private commitReview(
     objectiveId: string,
     actor: string,
@@ -1398,8 +1403,10 @@ export class ObjectiveAdaptiveReviewService {
     observation: ReviewObservation,
     outcome: ReviewOutcome,
     decision: Row | null,
+    autonomousCommitGuard?: () => void,
   ): ReviewResult {
     return this.store.immediate(() => {
+      autonomousCommitGuard?.();
       const cur = this.store.tryGet(OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, reviewId) as Row | null;
       if (cur) {
         // Concurrent winner committed the same canonical observation —

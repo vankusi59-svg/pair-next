@@ -733,6 +733,13 @@ export class ObjectiveAutoScheduler {
         lease.claimed_generation !== handle.claimed_generation ||
         lease.checkpoint_digest !== handle.checkpoint_digest ||
         Number(lease.expires_at) <= this.instant()) invalid("stale lease fence/expiry");
+    // P15.10-C R2 F1.3: absolute lifetime is a canonical validation
+    // boundary, not just a renew-time hint — past the claim-time bound
+    // the lease cannot authorize ANY mutation (renew/settle/assert).
+    const maxLifetime = Number(lease.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS);
+    if (Number(lease.started_at) + maxLifetime <= this.instant()) {
+      invalid("stale lease lifetime");
+    }
     const a = this.authority(handle.objective_id);
     this.requireCurrent(q, a);
     if (lease.policy_version !== a.status.policy_version ||
@@ -742,14 +749,30 @@ export class ObjectiveAutoScheduler {
     return { q, lease };
   }
 
+  /** P15.10-C R2: narrow read-only authority assertion — the SINGLE
+   *  lease/fence/binding proof other components (driver commit guard)
+   *  may invoke. Re-validates state, fence, worker/boot identity,
+   *  token digest, claimed generation, checkpoint, expiry, absolute
+   *  lifetime, policy version, terms digest, owner and objective
+   *  version through the existing currentLease path — never a second
+   *  validator. */
+  assertLeaseAuthority(handle: LeaseHandle): void {
+    this.proof(() => { this.currentLease(handle); });
+  }
+
   renew(handle: LeaseHandle): void {
     this.proof(() => {
       const { lease } = this.currentLease(handle);
       const maxLifetime = Number(lease.max_lifetime_ms ?? LEASE_MAX_LIFETIME_DEFAULT_MS);
-      if (Number(lease.started_at) + maxLifetime < this.instant()) invalid("max lease lifetime");
+      // F1.3: the lifetime check already ran inside currentLease; the
+      // renewed expiry is additionally CLAMPED at the absolute deadline
+      // so a lease can never outlive its bound between validations.
       if (Number(lease.renewed_at) + 15_000 > this.instant()) return;
       writeSchedulerRow(this.store, LEASE_STATE, handle.objective_id, {
-        ...fields(lease), renewed_at: this.instant(), expires_at: this.instant() + 60_000,
+        ...fields(lease), renewed_at: this.instant(),
+        expires_at: Math.min(
+          this.instant() + 60_000,
+          Number(lease.started_at) + maxLifetime),
       }, "RENEW", `renew:${handle.fence}:${this.instant()}`);
       writeSchedulerRow(this.store, SCHEDULER_RECEIPT,
         `renew:${handle.objective_id}:${handle.fence}:${this.instant()}`, {

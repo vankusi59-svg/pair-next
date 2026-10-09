@@ -1,12 +1,13 @@
 {
-  "claim_id": "P15_10_C_R1_HEARTBEAT_FENCED_COMMIT",
-  "title": "P15.10-C R1: lease heartbeat + bounded claim-time lease lifetime + fenced post-await autonomous commit guard (F1 remediation)",
+  "claim_id": "P15_10_C_R2_FENCED_AUTHORITY_CLOSURE",
+  "title": "P15.10-C R2: fenced authority closure — claimed-version commit guard, guarded review commit, absolute lease lifetime at the canonical validation boundary",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
     "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10c-r2.test.ts",
     "src/__tests__/pair-p15-10c-r1.test.ts",
     "src/__tests__/pair-p15-10c.test.ts",
     "src/__tests__/pair-p15-10b-r1.test.ts",
@@ -18,5 +19,5 @@
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "R1 remediation on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3): a CEO model call can outlive the 60s lease TTL and nothing revalidated autonomous authority inside the post-await commit transaction. F1-B: scheduler.claim accepts optional max_lifetime_ms (default 300s = P15.10-B compat, min 60s, cap 960s) persisted on the lease and enforced by renew(); TTL stays 60s. F1-A: driver starts a heartbeat ONLY after a valid claim — 20s unref'd interval calling existing scheduler.renew() (each renewal re-proves token/fence/worker-boot/generation/expiry/policy-owner-terms pins); none before claim, no renew inside the 15s no-op window; retryable SQLite contention defers a tick, other faults mark the worker unauthorized and abort settlement; timer always stopped in finally. F1-C: ceoCycle.runCycle takes optional autonomous_commit_guard fired FIRST inside the serialized commit transaction — before re-observe, decision put, workstream decomposition, attempt settle — so mid-call revoke/pause/expiry rolls the whole commit back and the attempt settles REJECTED canonically; runReview forwards it, pass() wires authorityGate, manual callers unchanged. F1-D: driver deps gain ceoTimeoutMs (validated 5s..900s; claim bound=timeout+60s finalization, cap 960s) and pre-admission reconcileStaleAttempts(objectiveId) — restart never re-invokes a STARTED/UNKNOWN attempt; serve wires ceoCliTimeoutMs()+lazy ceoCycle (createDefaultObjectiveOperatingService now returns ceoCycle). Two-connection fencing proven: stale handle cannot renew/settle. No merge, no deploy, driver stays opt-in OFF."
+  "description": "R2 remediation on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3), closing residual F1 audit findings — all three CONFIRMED by pre-patch repro tests. F1.1: driver authorityGate checked only lease state/fence/expiry + evaluate().effective — a PAUSE->RESUME mid-await produced an effective policy at version V+2 that was NOT the claimed authorization. Fix: new scheduler.assertLeaseAuthority(handle) — a narrow read-only assertion that re-proves state, fence, worker/boot identity, token digest, claimed generation, checkpoint, expiry, absolute lifetime, and the captured policy_version/terms_digest/owner/objective_version pins through the single existing currentLease path (no parallel validator); authorityGate calls it first and wraps any refusal as DRIVER_AUTHORITY_LOST. F1.2: commitReview ran its own store.immediate writing the review receipt, optional strategy revision and anchors with no guard — the guard now fires FIRST inside that transaction (forwarded from runReview input), so a revoke landing between the CEO decision commit and the review commit rolls back every review side effect; deterministic checkpoints (zero model calls) get the same protection; manual callers unchanged. F1.3: renew() stamped expires_at=now+60s past the absolute lifetime and currentLease never checked lifetime — post-deadline settle/assert still passed. Fix: absolute lifetime (started_at+max_lifetime_ms) enforced inside currentLease — every renew/settle/assert path; renewed expires_at additionally CLAMPED at the deadline so a lease can never outlive its bound. TTL stays 60s, heartbeat stays 20s, claim-bound semantics and P15.10-B defaults unchanged. R2-F1a..j tests prove: pause->resume mid-await zero new decision, terms drift blocked, stale-fence handle cannot assert/renew/settle, review commit rolls back after revoke with decision legitimately committed, strategy revision never lands on authority loss, deterministic checkpoint guarded, renew cannot extend past deadline, post-deadline settle/assert blocked, two-SQLite-connection fencing, manual regression. No merge, no deploy, driver stays opt-in OFF."
 }

@@ -106,3 +106,9 @@ Auto Policy (ENABLED+effective) → Wake (WAKE_STATE via wakeup tick) → Fair S
 - Test file imports: all from ../pair/index.js (star exports); ObjectiveAdaptiveReviewService+ObjectiveOperatingService need direct module import or index export check.
 - Node: export PATH=$HOME/.nvm/versions/node/v22.23.3/bin:$PATH. Isolated E2E stack :8799 still running (PID 42479).
 - After impl: tsc+build+new tests+existing 19 p15-10c tests+regressions+verify:change --base 0e27bc6 --full → commit→push→report code PAIR_NEXT_P15_10_C_R1_HEARTBEAT_PENDING_FINAL_AUDIT.
+
+## R2 STATE CHECKPOINT
+- HEAD pushed f3abd00 (R1 complete, verify READY). R2 mandate: /home/ubuntu/attachments/f7fadbae-29ca-4da2-a26a-fb10632f3b52/pasted-1791554321046.txt — claim P15_10_C_R2_FENCED_AUTHORITY_CLOSURE, completion code PAIR_NEXT_P15_10_C_R2_PENDING_FINAL_AUDIT.
+- Classified: F1.1 CONFIRMED (authorityGate lacks policy_version/terms/objective_version pin check — pause→resume mid-call effective=true passes), F1.2 CONFIRMED (commitReview txn line ~1402 has no guard), F1.3 CONFIRMED (renew stamps expires_at=now+60s past deadline; currentLease never checks lifetime).
+- R2 test file written: src/__tests__/pair-p15-10c-r2.test.ts (10 tests F1a..j). Currently failing on seedCeoModel — provider auth_state UNVALIDATED; fix = use p15-5 qualifyCodexProvider shape (lines 330-352 of p15-5 test).
+- Fixes to implement: (1) scheduler.assertLeaseAuthority(handle) public narrow wrapper → proof(()=>currentLease(handle)); currentLease += lifetime check started_at+max_lifetime<=now; renew clamps expires_at=min(now+60s, started_at+lifetime). (2) driver authorityGate → try{assertLeaseAuthority}catch→DriverDenial AUTHORITY_LOST permanent, keep evaluate+halt. (3) commitReview gains guard param fired first inside txn; runReview forwards.

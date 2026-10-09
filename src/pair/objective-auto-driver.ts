@@ -484,11 +484,18 @@ export class ObjectiveAutoDriverService {
    */
   private authorityGate(handle: LeaseHandle): () => void {
     return () => {
-      const lease = readSchedulerRow<Row>(this.deps.store, LEASE_STATE, handle.objective_id) as
-        unknown as LeaseRow | null;
-      if (!lease || lease.state !== "ACTIVE" || lease.fence !== handle.fence ||
-          Number(lease.expires_at) <= this.instant()) {
-        throw new DriverDenial("DRIVER_AUTHORITY_LOST", "lease no longer live", false);
+      // P15.10-C R2 F1.1: the commit guard must re-prove the CLAIMED
+      // authorization — state, fence, worker/boot, token, generation,
+      // checkpoint, expiry, absolute lifetime, and the captured
+      // policy_version / terms_digest / owner / objective_version pins —
+      // through the scheduler's single canonical lease assertion. A
+      // PAUSE→RESUME lands an effective policy at version V+2 that is
+      // NOT the version this worker was claimed under.
+      try {
+        this.deps.scheduler.assertLeaseAuthority(handle);
+      } catch (e) {
+        throw new DriverDenial("DRIVER_AUTHORITY_LOST",
+          `lease authority lost mid-pass: ${e instanceof Error ? e.message : e}`, false);
       }
       const st = this.deps.policy.evaluate(handle.objective_id);
       if (!st.effective) {
