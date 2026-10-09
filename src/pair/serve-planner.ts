@@ -51,7 +51,8 @@ import {
   detectTelegramDeliveryIntent,
   CANONICAL_BOOKKEEPING_INSTRUCTION,
   isDeliveryTask,
-  rawDeliveryEmissionCount,
+  inspectRawDeliveryEmissions,
+  type RawDeliveryEmissionState,
   PAIR_DELIVERY_INJECTION_KEY,
   type DeliveryInjectionRecord,
 } from "./plan-dataflow.js";
@@ -160,12 +161,17 @@ export function makeServeCanonicalizer(deps: {
   goal: string,
   ctx?: {
     provenance?: "fresh" | "persisted";
-    /** HOTFIX 1 R1 — TRUE raw TELEGRAM_DELIVERY emission count captured
-     *  on the parsed provider JSON BEFORE the transport's own
+    /** HOTFIX 1 R1/R2 — TRUE raw TELEGRAM_DELIVERY emission evidence
+     *  captured on the parsed provider JSON BEFORE the transport's own
      *  sanitize/drop pass, threaded through runPlannerFailover for THIS
      *  exact invocation. When absent the caller vouches that `rawTasks`
      *  IS the unsanitized emission (direct/replan seams). */
     raw_delivery_emission_count?: number;
+    /** R2 — tri-state verdict for the count: ABSENT = proven omission,
+     *  PRESENT = proven emission, INDETERMINATE = detector budget
+     *  exhausted before all capability content was inspected (NEVER a
+     *  proven R=0 — fail closed). */
+    raw_delivery_emission_state?: RawDeliveryEmissionState;
   },
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal, ctx) => {
@@ -179,8 +185,25 @@ export function makeServeCanonicalizer(deps: {
     // BEFORE its own sanitizePlan; the incoming task list has already
     // survived that first drop and can no longer prove it.
     const deliveryIntent = detectTelegramDeliveryIntent(String(goal ?? ""));
-    const rawDeliveryCount = ctx?.raw_delivery_emission_count ??
-      rawDeliveryEmissionCount(rawTasks);
+    // R2 — evidence is the tri-state inspection: an explicit
+    // `raw_delivery_emission_state`/`_count` pair wins (production
+    // failover always supplies it); absent evidence means the caller
+    // vouches `rawTasks` is the unsanitized emission, so it is inspected
+    // HERE — never inferred from sanitized tasks and never substituted
+    // with a fallback count that could launder uncertainty into a
+    // proven omission.
+    const rawInspection =
+      ctx?.raw_delivery_emission_count !== undefined ||
+      ctx?.raw_delivery_emission_state !== undefined
+        ? {
+            state: ctx?.raw_delivery_emission_state ??
+              ((ctx?.raw_delivery_emission_count ?? 0) > 0
+                ? "PRESENT"
+                : "ABSENT"),
+            count: ctx?.raw_delivery_emission_count ?? 0,
+          }
+        : inspectRawDeliveryEmissions(rawTasks);
+    const rawDeliveryCount = rawInspection.count;
     // PRV2-A §D — the model emits WORK tasks only; PAIR owns bookkeeping.
     // A model-emitted bookkeeping-shaped task (filtered caps ⊆
     // {AUTOMATON_TASK_EXECUTION}) is deterministically normalized away so
@@ -224,6 +247,30 @@ export function makeServeCanonicalizer(deps: {
     const canonicalDeliveryCount = (tasks as Array<Record<string, unknown>>)
       .filter(isDeliveryTask).length;
     const freshPlan = ctx?.provenance !== "persisted";
+    if (freshPlan && rawInspection.state === "INDETERMINATE") {
+      // R2 defect B — the detector could not inspect every capability
+      // field (depth/node budget): omission is UNPROVEN, never R=0.
+      // A deterministic typed fail-closed verdict at this boundary —
+      // no injection, no silent pass.
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_EMISSION_INDETERMINATE",
+        JSON.stringify({ emissions_seen: rawInspection.count }),
+      );
+    }
+    if (freshPlan && canonicalDeliveryCount > rawDeliveryCount) {
+      // R2 defect C — impossible raw/canonical relationship: every
+      // canonical delivery task descends from a raw capability token
+      // the detector must have seen. C > R means the evidence itself
+      // is inconsistent (buggy/forged transport evidence) — never
+      // repaired, never converted into a fallback count.
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_COUNT_INCONSISTENT",
+        JSON.stringify({
+          raw_delivery: rawDeliveryCount,
+          canonical_delivery: canonicalDeliveryCount,
+        }),
+      );
+    }
     if (freshPlan && !deliveryIntent.requested && rawDeliveryCount > 0) {
       // R1 truth table — the model ATTEMPTED unauthorized delivery
       // semantics. The same fail-closed verdict the reconcile gate

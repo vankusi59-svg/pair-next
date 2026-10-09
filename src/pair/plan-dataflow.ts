@@ -655,41 +655,88 @@ const isRemoteTask = (task: Record<string, unknown>): boolean =>
 export const isDeliveryTask = (task: Record<string, unknown>): boolean =>
   ((task.required_capabilities as string[]) ?? []).includes(DELIVERY_CAPABILITY);
 
-/** HOTFIX 1 R1 — TRUE raw delivery-emission evidence, captured at the
+/** HOTFIX 1 R1/R2 — TRUE raw delivery-emission evidence, captured at the
  *  FIRST point where parsed provider JSON still holds the actual raw
  *  task array (before ANY sanitize/drop/truncate/remap). Unlike
  *  `isDeliveryTask`, this detector is safe on arbitrary malformed
  *  provider output: `required_capabilities` may be an array, a scalar
  *  string, an object, a number, null — every shape is walked with
- *  bounded depth and EXACT-token semantics only (a substring like
- *  "NOT_TELEGRAM_DELIVERY" never matches). A malformed emission attempt
- *  still counts as an emission: the canonicalizer must then prove
- *  malformed-drop (fail closed), never classify it as a true omission.
+ *  bounded depth + a shared node budget and EXACT-token semantics only
+ *  (a substring like "NOT_TELEGRAM_DELIVERY" never matches; an object
+ *  KEY carrying the exact token still counts — R2 defect A). A
+ *  malformed emission attempt still counts as an emission: the
+ *  canonicalizer must then prove malformed-drop (fail closed), never
+ *  classify it as a true omission.
+ *
+ *  R2 — TRI-STATE, never boolean: the result is ABSENT (every task's
+ *  capability field fully inspected, no token), PRESENT (fully
+ *  inspected, ≥1 emitting task), or INDETERMINATE (depth/node budget
+ *  exhausted before all content was inspected — a buried token was
+ *  never disproven). Budget exhaustion must NEVER masquerade as a
+ *  proven R=0; the caller must fail closed on INDETERMINATE.
  *  Never throws; descriptive planner provenance, zero authority. */
-const containsDeliveryToken = (v: unknown, depth: number): boolean => {
-  if (depth > 8 || v === null || v === undefined) return false;
-  if (typeof v === "string") return v === DELIVERY_CAPABILITY;
-  if (Array.isArray(v)) {
-    return v.some((x) => containsDeliveryToken(x, depth + 1));
-  }
-  if (typeof v === "object") {
-    return Object.values(v as Record<string, unknown>).some((x) =>
-      containsDeliveryToken(x, depth + 1),
-    );
-  }
-  return false;
+export type RawDeliveryEmissionState = "ABSENT" | "PRESENT" | "INDETERMINATE";
+export type RawDeliveryEmissionInspection = {
+  state: RawDeliveryEmissionState;
+  /** Tasks carrying an exact TELEGRAM_DELIVERY token in
+   *  `required_capabilities`. Exact when state is ABSENT/PRESENT; a
+   *  LOWER BOUND when INDETERMINATE — never a proven count. */
+  count: number;
 };
-export const rawDeliveryEmissionCount = (rawTasks: unknown): number => {
-  if (!Array.isArray(rawTasks)) return 0;
-  let n = 0;
+const RAW_DELIVERY_DEPTH_LIMIT = 8;
+const RAW_DELIVERY_NODE_BUDGET = 4000;
+
+const inspectCapsValue = (
+  v: unknown,
+  depth: number,
+  budget: { left: number },
+): RawDeliveryEmissionState => {
+  if (v === null || v === undefined) return "ABSENT";
+  if (budget.left <= 0) return "INDETERMINATE";
+  budget.left -= 1;
+  if (typeof v === "string") {
+    return v === DELIVERY_CAPABILITY ? "PRESENT" : "ABSENT";
+  }
+  if (typeof v !== "object") return "ABSENT"; // number/boolean — safely not a token
+  const entries = Array.isArray(v)
+    ? v.map((x) => [null, x] as const)
+    : Object.entries(v as Record<string, unknown>);
+  if (entries.length === 0) return "ABSENT";
+  // Any container content beyond the depth limit was never inspected —
+  // a token could be buried there: INDETERMINATE, never proven ABSENT.
+  if (depth >= RAW_DELIVERY_DEPTH_LIMIT) return "INDETERMINATE";
+  let sawIndeterminate = false;
+  for (const [k, x] of entries) {
+    // R2-A — a malformed object may carry the exact capability token as
+    // a KEY ({TELEGRAM_DELIVERY: true}): still a delivery emission.
+    if (typeof k === "string" && k === DELIVERY_CAPABILITY) return "PRESENT";
+    const r = inspectCapsValue(x, depth + 1, budget);
+    if (r === "PRESENT") return "PRESENT";
+    if (r === "INDETERMINATE") sawIndeterminate = true;
+  }
+  return sawIndeterminate ? "INDETERMINATE" : "ABSENT";
+};
+
+export const inspectRawDeliveryEmissions = (
+  rawTasks: unknown,
+): RawDeliveryEmissionInspection => {
+  if (!Array.isArray(rawTasks)) return { state: "ABSENT", count: 0 };
+  const budget = { left: RAW_DELIVERY_NODE_BUDGET };
+  let count = 0;
+  let indeterminate = false;
   for (const t of rawTasks) {
     const caps =
       t !== null && typeof t === "object"
         ? (t as Record<string, unknown>)["required_capabilities"]
         : undefined;
-    if (containsDeliveryToken(caps, 0)) n++;
+    const r = inspectCapsValue(caps, 0, budget);
+    if (r === "PRESENT") count += 1;
+    else if (r === "INDETERMINATE") indeterminate = true;
   }
-  return n;
+  return {
+    state: indeterminate ? "INDETERMINATE" : count > 0 ? "PRESENT" : "ABSENT",
+    count,
+  };
 };
 
 /** HOTFIX 1 — PAIR-owned provenance stamp on a delivery task that PAIR

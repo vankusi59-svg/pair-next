@@ -41,7 +41,8 @@ import {
   detectTelegramDeliveryIntent,
   assertPlanDataflow,
   assertDeliveryTaskPresence,
-  rawDeliveryEmissionCount,
+  inspectRawDeliveryEmissions,
+  type RawDeliveryEmissionState,
   type TelegramDeliveryIntent,
 } from "../pair/plan-dataflow.js";
 import { sanitizePlan } from "../pair/llm-planner.js";
@@ -570,48 +571,52 @@ describe("P15.8-HF1 E2E", () => {
 
 /* ==================== R1 — TRUE raw delivery provenance ==================== */
 
+const inspect = inspectRawDeliveryEmissions;
+const emCount = (raw: unknown) => inspect(raw).count;
+const emState = (raw: unknown) => inspect(raw).state;
+
 describe("P15.8-HF1-R1 raw delivery emission detector", () => {
   it("exact-token semantics across every malformed shape — never throws", () => {
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: ["TELEGRAM_DELIVERY"] },
     ])).toBe(1);
     // malformed scalar — still a planner delivery ATTEMPT
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: "TELEGRAM_DELIVERY" },
     ])).toBe(1);
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: ["FILE_OPERATIONS", "TELEGRAM_DELIVERY"] },
     ])).toBe(1);
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: ["REASONING", "FILE_OPERATIONS"] },
     ])).toBe(0);
     // malformed object shape containing the exact token — an attempt
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: { 0: "x", cap: "TELEGRAM_DELIVERY" } },
     ])).toBe(1);
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: [["nested", "TELEGRAM_DELIVERY"]] },
     ])).toBe(1);
     // malformed unrelated shapes — deterministic safe handling
-    expect(rawDeliveryEmissionCount([{ required_capabilities: 123 }])).toBe(0);
-    expect(rawDeliveryEmissionCount([{ required_capabilities: null }])).toBe(0);
-    expect(rawDeliveryEmissionCount([{}])).toBe(0);
-    expect(rawDeliveryEmissionCount([null, 42, "TELEGRAM_DELIVERY"])).toBe(0);
-    expect(rawDeliveryEmissionCount("garbage")).toBe(0);
-    expect(rawDeliveryEmissionCount(undefined)).toBe(0);
-    expect(rawDeliveryEmissionCount(null)).toBe(0);
+    expect(emCount([{ required_capabilities: 123 }])).toBe(0);
+    expect(emCount([{ required_capabilities: null }])).toBe(0);
+    expect(emCount([{}])).toBe(0);
+    expect(emCount([null, 42, "TELEGRAM_DELIVERY"])).toBe(0);
+    expect(emCount("garbage")).toBe(0);
+    expect(emCount(undefined)).toBe(0);
+    expect(emCount(null)).toBe(0);
     // NO substring matching
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: ["NOT_TELEGRAM_DELIVERY"] },
     ])).toBe(0);
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: ["TELEGRAM_DELIVERY_X"] },
     ])).toBe(0);
     // per-task count, not per-token
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: ["TELEGRAM_DELIVERY", "TELEGRAM_DELIVERY"] },
     ])).toBe(1);
-    expect(rawDeliveryEmissionCount([
+    expect(emCount([
       { required_capabilities: ["TELEGRAM_DELIVERY"] },
       { required_capabilities: "TELEGRAM_DELIVERY" },
     ])).toBe(2);
@@ -633,6 +638,7 @@ const CAND_B: PlannerCandidate = {
  *  sanitizePlan drop (the transport's own pass) → bounded raw-emission
  *  evidence returned alongside the already-sanitized task list. */
 const transportShaped = (raw: Array<Record<string, unknown>>) => {
+  const insp = inspect(raw);
   const { tasks, warnings } = sanitizePlan(
     raw as never[],
     SERVE_LLM_PLANNER_CAPS.slice(),
@@ -642,7 +648,8 @@ const transportShaped = (raw: Array<Record<string, unknown>>) => {
   return {
     tasks: tasks as Array<Record<string, unknown>>,
     warnings,
-    raw_delivery_emission_count: rawDeliveryEmissionCount(raw),
+    raw_delivery_emission_count: insp.count,
+    raw_delivery_emission_state: insp.state,
   };
 };
 
@@ -661,7 +668,7 @@ const runFail = async (
   goal: string,
   planByRef: Record<string, (inv: PlannerInvocation) => Array<Record<string, unknown>>>,
 ) => {
-  const seen: Array<{ ref: string; r: number | undefined }> = [];
+  const seen: Array<{ ref: string; r: number | undefined; s?: string }> = [];
   const calls: Array<{ ref: string; kind: string }> = [];
   const attempts: PlannerAttemptRecord[] = [];
   const canonFresh = makeServeCanonicalizer({ executorCapSets: () => FULL_SETS });
@@ -677,10 +684,11 @@ const runFail = async (
         return transportShaped(planByRef[c.ref](inv));
       },
       canonicalize: (tasks, c, ev) => {
-        seen.push({ ref: c.ref, r: ev?.raw_delivery_emission_count });
+        seen.push({ ref: c.ref, r: ev?.raw_delivery_emission_count, s: ev?.raw_delivery_emission_state });
         const canon = canonFresh(tasks, goal, {
           provenance: "fresh",
           raw_delivery_emission_count: ev?.raw_delivery_emission_count,
+          raw_delivery_emission_state: ev?.raw_delivery_emission_state,
         });
         validatePlanProposal({ tasks: canon }, new Set(SERVE_LLM_PLANNER_CAPS));
         return canon;
@@ -707,6 +715,7 @@ describe("P15.8-HF1-R1 production-shape raw provenance", () => {
     const shaped = transportShaped(raw());
     expect(shaped.tasks.map((t) => t.task_key)).toEqual(["T1"]);
     expect(shaped.raw_delivery_emission_count).toBe(1);
+    expect(shaped.raw_delivery_emission_state).toBe("PRESENT");
 
     const { result, error, seen, attempts } = await runFail(TEXT_GOAL, {
       "gemini:test-a": () => raw(),
@@ -804,11 +813,11 @@ describe("P15.8-HF1-R1 production-shape raw provenance", () => {
       "codex:test-b": () => RAW_TEXT_OMITTING(),
     });
     expect(error).toBeNull();
-    // A: INITIAL+REASK both R=1 (INVALIDATED) → B: R=0 → injected
-    expect(seen).toEqual([
-      { ref: "gemini:test-a", r: 1 },
-      { ref: "gemini:test-a", r: 1 },
-      { ref: "codex:test-b", r: 0 },
+    // A: INITIAL+REASK both R=1/PRESENT (INVALIDATED) → B: R=0/ABSENT → injected
+    expect(seen.map(({ ref, r, s }) => ({ ref, r, s }))).toEqual([
+      { ref: "gemini:test-a", r: 1, s: "PRESENT" },
+      { ref: "gemini:test-a", r: 1, s: "PRESENT" },
+      { ref: "codex:test-b", r: 0, s: "ABSENT" },
     ]);
     expect(result!.winner.route).toBe("codex:test-b");
     expect(deliveries(result!.tasks)).toHaveLength(1);
@@ -952,10 +961,12 @@ function pipeStack(name: string, rawForGoal: (goal: string) => Array<Record<stri
     if (Array.isArray(pinned) && pinned.length) return { tasks: pinned };
     const goal = String(input.mission?.goal ?? "");
     const raw = rawForGoal(goal);
+    const insp = inspect(raw);
     return {
       tasks: canonicalize(raw, goal, {
         provenance: "fresh",
-        raw_delivery_emission_count: rawDeliveryEmissionCount(raw),
+        raw_delivery_emission_count: insp.count,
+        raw_delivery_emission_state: insp.state,
       }),
     };
   };
@@ -1118,5 +1129,250 @@ describe("P15.8-HF1-R1 §9 real delivery pipeline", () => {
     expect(calls).toHaveLength(1);
     expect(String(calls[0].chatId)).toBe("111");
     expect(String(calls[0].text)).toContain("BÁO CÁO TÓM TẮT");
+  });
+});
+
+/* ==================== R2 — provenance hardening ==================== */
+
+import { llmPlan } from "../pair/llm-planner.js";
+import { codexPlannerPlan } from "../pair/codex-planner.js";
+
+/** Caps field nested this deep exceeds the bounded detector depth — a
+ *  token inside was never inspected → INDETERMINATE, never ABSENT. */
+const DEEP_CAPS = {
+  a: { a: { a: { a: { a: { a: { a: { a: { a: "TELEGRAM_DELIVERY" } } } } } } } },
+};
+
+describe("P15.8-HF1-R2 defect A — object-key token bypass closed", () => {
+  it("exact token as OBJECT KEY → PRESENT; substring keys never match", () => {
+    expect(inspect([{ required_capabilities: { TELEGRAM_DELIVERY: true } }]))
+      .toEqual({ state: "PRESENT", count: 1 });
+    // nested object key
+    expect(inspect([
+      { required_capabilities: { caps: { TELEGRAM_DELIVERY: 1 } } },
+    ])).toEqual({ state: "PRESENT", count: 1 });
+    // substring keys are never the capability token
+    for (const caps of [
+      { NOT_TELEGRAM_DELIVERY: true },
+      { TELEGRAM_DELIVERY_X: true },
+      { XTELEGRAM_DELIVERY: true },
+      { " TELEGRAM_DELIVERY": true },
+      { "TELEGRAM_DELIVERY ": true },
+    ]) {
+      expect(inspect([{ required_capabilities: caps }])).toEqual({
+        state: "ABSENT", count: 0,
+      });
+    }
+    // key token AND value token in one task still counts the task ONCE
+    expect(inspect([
+      { required_capabilities: { TELEGRAM_DELIVERY: ["TELEGRAM_DELIVERY"] } },
+    ])).toEqual({ state: "PRESENT", count: 1 });
+  });
+
+  it("unrelated fields never become capability evidence", () => {
+    // token in title/instruction/metadata is NOT a capability emission
+    expect(inspect([
+      {
+        task_key: "T1", title: "TELEGRAM_DELIVERY",
+        task_instruction: "gửi TELEGRAM_DELIVERY",
+        required_capabilities: ["REASONING"],
+        metadata: { note: "TELEGRAM_DELIVERY" },
+      },
+    ])).toEqual({ state: "ABSENT", count: 0 });
+  });
+
+  it("object-key emission dropped by sanitize → INVALIDATED, never injected", () => {
+    const raw = () => [
+      work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+      {
+        task_key: "T9", title: "T9",
+        task_instruction: "gửi tới telegram",
+        required_capabilities: { TELEGRAM_DELIVERY: true },
+        depends_on: ["T1"], metadata: {},
+      },
+    ];
+    const shaped = transportShaped(raw());
+    expect(shaped.tasks.map((t) => t.task_key)).toEqual(["T1"]); // dropped
+    expect(shaped.raw_delivery_emission_state).toBe("PRESENT");
+    expect(() =>
+      canon(raw(), TEXT_GOAL, FULL_SETS, "fresh")
+    ).toThrow(/FAIL_CLOSED_DELIVERY_TASK_INVALIDATED/);
+    // through the failover seam too — INVALIDATED on every invocation
+    return runFail(TEXT_GOAL, { "gemini:test-a": raw }).then(({ error, seen }) => {
+      expect(String(error?.code)).toBe("FAIL_CLOSED_PLANNER_EXHAUSTED");
+      expect(seen.every((s) => s.r === 1 && s.s === "PRESENT")).toBe(true);
+    });
+  });
+});
+
+describe("P15.8-HF1-R2 defect B — depth limit can never fake R=0", () => {
+  it("token beyond supported depth → INDETERMINATE (not ABSENT)", () => {
+    expect(inspect([{ required_capabilities: DEEP_CAPS }]).state)
+      .toBe("INDETERMINATE");
+    // array nest equally deep
+    const deepArr: unknown[] = [];
+    let cur: unknown = deepArr;
+    for (let i = 0; i < 12; i++) {
+      const nx: unknown[] = [];
+      (cur as unknown[]).push(nx);
+      cur = nx;
+    }
+    (cur as unknown[]).push("TELEGRAM_DELIVERY");
+    expect(inspect([{ required_capabilities: deepArr }]).state)
+      .toBe("INDETERMINATE");
+    // a genuinely shallow ABSENT stays ABSENT
+    expect(inspect([{ required_capabilities: ["REASONING"] }]))
+      .toEqual({ state: "ABSENT", count: 0 });
+  });
+
+  it("indeterminate evidence → typed fail-closed at the canonicalize boundary", () => {
+    const raw = () => [
+      work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+      { task_key: "T9", title: "T9", task_instruction: "x",
+        required_capabilities: DEEP_CAPS, depends_on: [], metadata: {} },
+    ];
+    // with intent — never treated as proven omission → no injection
+    expect(() => canon(raw(), TEXT_GOAL, FULL_SETS, "fresh"))
+      .toThrow(/FAIL_CLOSED_DELIVERY_EMISSION_INDETERMINATE/);
+    // without intent — same typed verdict (unproven ≠ authorized)
+    expect(() => canon(raw(), "đọc dữ liệu bán hàng rồi tổng hợp", FULL_SETS, "fresh"))
+      .toThrow(/FAIL_CLOSED_DELIVERY_EMISSION_INDETERMINATE/);
+    // persisted replay unaffected: raw evidence only governs FRESH
+    // plans (a persisted canonical plan is replayed verbatim — the §8
+    // byte-identical replay pin above covers it).
+  });
+});
+
+describe("P15.8-HF1-R2 defect C — canonical count consistency", () => {
+  it("C > R is an impossible relationship → typed rejection, never repaired", () => {
+    const canonFresh = makeServeCanonicalizer({ executorCapSets: () => FULL_SETS });
+    // evidence claims ABSENT/R=0 but the (already-sanitized) task list
+    // carries a live canonical delivery task → impossible → reject.
+    expect(() =>
+      canonFresh(
+        [
+          work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+          work("T2", "gửi bản tóm tắt đến telegram", ["TELEGRAM_DELIVERY"], ["T1"]),
+        ],
+        TEXT_GOAL,
+        {
+          provenance: "fresh",
+          raw_delivery_emission_count: 0,
+          raw_delivery_emission_state: "ABSENT",
+        },
+      ),
+    ).toThrow(/FAIL_CLOSED_DELIVERY_COUNT_INCONSISTENT/);
+    // persisted provenance never re-judges evidence: replay a
+    // previously-canonical plan verbatim, impossible ctx evidence
+    // attached — the replay contract ignores raw evidence entirely.
+    const canonical = canonFresh(
+      [work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"])],
+      "đọc dữ liệu bán hàng rồi tổng hợp",
+      { provenance: "fresh" },
+    );
+    const persisted = canonFresh(canonical, "đọc dữ liệu bán hàng rồi tổng hợp", {
+      provenance: "persisted",
+      raw_delivery_emission_count: 0,
+      raw_delivery_emission_state: "ABSENT",
+    });
+    expect(persisted).toEqual(canonical);
+  });
+
+  it("verified R=0/C=0 omission still injects exactly once (sole valid condition)", () => {
+    const out = canon(RAW_TEXT_OMITTING(), TEXT_GOAL);
+    expect(deliveries(out)).toHaveLength(1);
+  });
+
+  it("valid R=1/C=1 planner emission passes untouched", () => {
+    const out = canon(
+      [
+        work("T1", "đọc dữ liệu bán hàng và tổng hợp", ["REASONING"]),
+        work("T2", "gửi bản tóm tắt đến telegram", ["TELEGRAM_DELIVERY"], ["T1"]),
+      ],
+      TEXT_GOAL,
+    );
+    const del = deliveries(out);
+    expect(del).toHaveLength(1);
+    expect((del[0].metadata as Record<string, unknown>)[PAIR_DELIVERY_INJECTION_KEY])
+      .toBeUndefined();
+  });
+});
+
+describe("P15.8-HF1-R2 direct transport boundaries", () => {
+  const TRANSPORT_CAPS = SERVE_LLM_PLANNER_CAPS.slice();
+  const mkPlan = (caps: unknown) => JSON.stringify({
+    tasks: [
+      { task_key: "T1", title: "w", task_instruction: "đọc dữ liệu bán hàng rồi viết file vào workspace, xong reply DONE",
+        required_capabilities: ["FILE_OPERATIONS"], depends_on: [],
+        metadata: { network_requirement: NETREQ_LOCAL } },
+      { task_key: "T9", title: "d", task_instruction: "gửi tới telegram",
+        required_capabilities: caps, depends_on: ["T1"], metadata: {} },
+    ],
+  });
+  const okFetch = (content: string) =>
+    (async () => new Response(
+      JSON.stringify({ choices: [{ message: { content } }] }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as typeof fetch;
+
+  it("llmPlan (HTTP transport): evidence captured BEFORE its own sanitize", async () => {
+    const dir = fs.mkdtempSync(path.join(ROOT, "llm-"));
+    const r = await llmPlan("gửi báo cáo tới telegram", {
+      endpoint: "https://example.invalid/chat/completions",
+      credentialEnv: "TEST_LLM_KEY",
+      model: "test-model",
+      allowedCapabilities: TRANSPORT_CAPS,
+      capabilitySets: FULL_SETS,
+      env: { TEST_LLM_KEY: "k" } as NodeJS.ProcessEnv,
+      fetchFn: okFetch(mkPlan({ TELEGRAM_DELIVERY: true })),
+      scratchDir: dir,
+    } as never);
+    // object-key emission: sanitize dropped the task, evidence PRESENT
+    expect(r.tasks.every((t) => t.task_key !== "T9")).toBe(true);
+    expect(r.raw_delivery_emission_state).toBe("PRESENT");
+    expect(r.raw_delivery_emission_count).toBe(1);
+    // deep caps → INDETERMINATE evidence, never a clean R=0
+    const r2 = await llmPlan("gửi báo cáo tới telegram", {
+      endpoint: "https://example.invalid/chat/completions",
+      credentialEnv: "TEST_LLM_KEY",
+      model: "test-model",
+      allowedCapabilities: TRANSPORT_CAPS,
+      capabilitySets: FULL_SETS,
+      env: { TEST_LLM_KEY: "k" } as NodeJS.ProcessEnv,
+      fetchFn: okFetch(mkPlan(DEEP_CAPS)),
+      scratchDir: dir,
+    } as never);
+    expect(r2.raw_delivery_emission_state).toBe("INDETERMINATE");
+  });
+
+  it("codexPlannerPlan (CLI transport): identical boundary semantics", async () => {
+    const dir = fs.mkdtempSync(path.join(ROOT, "cx-"));
+    const exe = path.join(dir, "fake-codex.cjs");
+    fs.writeFileSync(exe, `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+const out = argv.indexOf("--output-last-message") >= 0
+  ? argv[argv.indexOf("--output-last-message") + 1] : null;
+let prompt = "";
+process.stdin.on("data", (d) => (prompt += d));
+process.stdin.on("end", () => {
+  if (!out) process.exit(1);
+  fs.writeFileSync(out, JSON.stringify({ tasks: [
+    { task_key: "T1", title: "w", task_instruction: "đọc dữ liệu rồi viết file vào workspace, xong reply DONE", required_capabilities: ["FILE_OPERATIONS"], depends_on: [], metadata: { network_requirement: { source_kind: "LOCAL", access_intent: "READ", freshness: "NOT_REQUIRED" } } },
+    { task_key: "T9", title: "d", task_instruction: "gửi tới telegram", required_capabilities: ${JSON.stringify(DEEP_CAPS)}, depends_on: ["T1"], metadata: {} },
+  ] }));
+  process.exit(0);
+});
+`);
+    fs.chmodSync(exe, 0o755);
+    const r = await codexPlannerPlan("gửi báo cáo tới telegram", {
+      executable: exe,
+      model: "test-model",
+      timeoutMs: 30_000,
+      scratchDir: dir,
+      allowedCapabilities: TRANSPORT_CAPS,
+      capabilitySets: FULL_SETS,
+    });
+    expect(r.raw_delivery_emission_state).toBe("INDETERMINATE");
   });
 });

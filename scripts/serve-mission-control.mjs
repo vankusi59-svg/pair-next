@@ -821,6 +821,8 @@ const planExpander = async (input) => {
           provenance: "fresh",
           raw_delivery_emission_count:
             evidence?.raw_delivery_emission_count,
+          raw_delivery_emission_state:
+            evidence?.raw_delivery_emission_state,
         });
         validatePlanProposal({ tasks: canon }, knownCapabilityIds());
         return canon;

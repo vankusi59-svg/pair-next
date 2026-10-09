@@ -25,6 +25,7 @@
 
 import { IntegrityError } from "./errors.js";
 import type { PlannerRejectionContext } from "./llm-planner.js";
+import type { RawDeliveryEmissionState } from "./plan-dataflow.js";
 
 /** P-REASK — bounded invocation context passed to every planFn call so
  *  all transports share ONE contract. INITIAL carries kind only (the
@@ -360,7 +361,7 @@ export async function runPlannerFailover(opts: {
   planFn: (
     c: PlannerCandidate,
     invocation: PlannerInvocation,
-  ) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number }>;
+  ) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number; raw_delivery_emission_state?: RawDeliveryEmissionState }>;
   /** Canonical per-invocation eligibility proof (role + lifecycle).
    *  Throw = authority failure (propagates); return {reject:true,...} =
    *  failover-eligible availability rejection. May be async (CPL-1 R1 —
@@ -382,7 +383,13 @@ export async function runPlannerFailover(opts: {
   canonicalize?: (
     tasks: Array<Record<string, unknown>>,
     c: PlannerCandidate,
-    evidence?: { raw_delivery_emission_count?: number },
+    evidence?: {
+      raw_delivery_emission_count?: number;
+      /** R2 — tri-state verdict for the count: ABSENT = proven omission,
+       *  PRESENT = proven emission, INDETERMINATE = uninspected content
+       *  (never a proven R=0 — the canonicalizer must fail closed). */
+      raw_delivery_emission_state?: RawDeliveryEmissionState;
+    },
   ) => Array<Record<string, unknown>>;
   onAttemptStart?: (base: Omit<PlannerAttemptRecord, "outcome">) => unknown;
   onAttemptEnd?: (token: unknown, record: PlannerAttemptRecord) => void;
@@ -488,6 +495,7 @@ export async function runPlannerFailover(opts: {
         try {
           canonical = opts.canonicalize(res.tasks, c, {
             raw_delivery_emission_count: res.raw_delivery_emission_count,
+            raw_delivery_emission_state: res.raw_delivery_emission_state,
           });
         } catch (e) {
           // P-GRAMMAR2 §3 — bounded typed observability: surface the
@@ -576,6 +584,7 @@ export async function runPlannerFailover(opts: {
                   const canonical2 = opts.canonicalize
                     ? opts.canonicalize(res2.tasks, c, {
                         raw_delivery_emission_count: res2.raw_delivery_emission_count,
+                        raw_delivery_emission_state: res2.raw_delivery_emission_state,
                       })
                     : res2.tasks;
                   if (!canonical2.length) {
