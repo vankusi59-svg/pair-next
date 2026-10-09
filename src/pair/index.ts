@@ -92,3 +92,6 @@ export * from "./conversation-session.js";
 export * from "./conversation-reasoning.js";
 export * from "./mission-draft.js";
 export * from "./telegram-conversation.js";
+export * from "./objective-auto-scheduler.js";
+export * from "./objective-auto-wakeup.js";
+export * from "./objective-auto-policy.js";

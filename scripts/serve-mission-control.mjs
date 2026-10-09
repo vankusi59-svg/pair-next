@@ -103,6 +103,8 @@ import {
   ensureConversationModel,
   MissionDraftService,
   TelegramConversationService,
+  ObjectiveAutoPolicyService,
+  createObjectiveAutoReconcile,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
   telegramDeliveryTransportTimeoutMs,
@@ -416,6 +418,23 @@ const control = new MissionControl({
 });
 const business = new BusinessLayer({ store, control, schedules });
 const workforce = new WorkforceService({ store, business });
+
+// P15.10-B — durable Objective wake/reconcile intake only. The scheduler
+// never claims a generation, calls a consumer, mints a mission or invokes
+// CEO/model/executor authority while cost binding remains unverified.
+const objectiveAutoPolicy = new ObjectiveAutoPolicyService(store, business.objectives);
+const objectiveReconcileMs = Number(process.env.PAIR_OBJECTIVE_RECONCILE_MS ?? 60_000);
+if (!Number.isSafeInteger(objectiveReconcileMs) ||
+    objectiveReconcileMs < 10_000 || objectiveReconcileMs > 300_000) {
+  throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_RECONCILE_MS", String(objectiveReconcileMs));
+}
+const objectiveAutoReconcile = createObjectiveAutoReconcile({
+  store,
+  objectives: business.objectives,
+  policy: objectiveAutoPolicy,
+  intervalMs: objectiveReconcileMs,
+});
+objectiveAutoReconcile.runtime.start();
 
 // P15.8-D — conversation layer composition. Session/draft services are
 // pure canonical-store services — always wired. The reasoning turn
@@ -967,6 +986,7 @@ const server = createMissionControlServer({
   // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
   // the P15.6 operating service lazily on first trigger (P15.7).
   store,
+  autoScheduler: objectiveAutoReconcile.scheduler,
   // P15.8-D — conversation layer (chat turns + governed mission drafts).
   conversation: {
     sessions: conversationSessions,

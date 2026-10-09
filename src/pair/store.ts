@@ -64,6 +64,7 @@ export function isSqliteContentionError(e: unknown): boolean {
 
 export class PairEvidenceStore {
   readonly db: Database.Database;
+  private readBudget: { entities: number; events: number } | null = null;
   /** Directory holding pair.db — canonical deployment root for
    *  co-located durable state (F1 artifact blob store). */
   readonly dbDir: string;
@@ -129,7 +130,126 @@ export class PairEvidenceStore {
         payload_hash TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS pair_events_scope_seq ON events(entity_type, entity_id, seq);
+      CREATE INDEX IF NOT EXISTS pair_events_topic_seq ON events(event_type, seq);
+      CREATE UNIQUE INDEX IF NOT EXISTS pair_objective_scheduler_revision
+        ON events(entity_type, entity_id, json_extract(metadata_json, '$.revision'))
+        WHERE event_type = 'OBJECTIVE_AUTO_SCHEDULER_COMMIT';
     `);
+  }
+
+  withReadBudget<T>(limits: { entities: number; events: number }, fn: () => T): T {
+    for (const n of [limits.entities, limits.events]) {
+      if (!Number.isSafeInteger(n) || n < 1 || n > 100_000) {
+        throw new IntegrityError("FAIL_CLOSED_READ_BUDGET_SCHEMA", "limits");
+      }
+    }
+    if (this.readBudget) return fn();
+    this.readBudget = { ...limits };
+    try {
+      const result = fn();
+      if (result && typeof (result as { then?: unknown }).then === "function") {
+        throw new IntegrityError("FAIL_CLOSED_ASYNC_READ_BUDGET", "synchronous scope required");
+      }
+      return result;
+    } finally {
+      this.readBudget = null;
+    }
+  }
+
+  private charge(kind: "entities" | "events", count: number): void {
+    if (!this.readBudget) return;
+    if (count > this.readBudget[kind]) {
+      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT", kind);
+    }
+    this.readBudget[kind] -= count;
+  }
+
+  private pageLimit(limit: number): number {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024) {
+      throw new IntegrityError("FAIL_CLOSED_STORE_PAGE_SCHEMA", "limit");
+    }
+    return limit;
+  }
+
+  private verifiedEvent(row: Record<string, unknown>): Record<string, unknown> {
+    const metadata = row.metadata_json ? JSON.parse(String(row.metadata_json)) : null;
+    const body = {
+      event_id: row.event_id, entity_type: row.entity_type, entity_id: row.entity_id,
+      event_type: row.event_type, old_state: row.old_state, new_state: row.new_state,
+      actor: row.actor, correlation_id: row.correlation_id, metadata, created_at: row.created_at,
+    };
+    if (digest(body) !== row.event_hash) {
+      throw new IntegrityError("FAIL_CLOSED_EVENT_HASH_MISMATCH", String(row.event_id));
+    }
+    return { ...row, metadata };
+  }
+
+  eventPage(input: {
+    after_seq: number; limit: number; topics: readonly string[];
+    upper_seq?: number; entity_type?: string; entity_id?: string; descending?: boolean;
+  }): Array<Record<string, unknown>> {
+    const limit = this.pageLimit(input.limit);
+    if (!Number.isSafeInteger(input.after_seq) || input.after_seq < 0 ||
+        !input.topics.length || input.topics.length > 128 ||
+        input.topics.some(t => typeof t !== "string" || !t || t.length > 128) ||
+        (input.upper_seq !== undefined && (!Number.isSafeInteger(input.upper_seq) || input.upper_seq < 0))) {
+      throw new IntegrityError("FAIL_CLOSED_STORE_PAGE_SCHEMA", "event cursor/topics");
+    }
+    const where = [`seq > ?`, `event_type IN (${input.topics.map(() => "?").join(",")})`];
+    const args: unknown[] = [input.after_seq, ...input.topics];
+    if (input.upper_seq !== undefined) { where.push("seq <= ?"); args.push(input.upper_seq); }
+    if (input.entity_type) { where.push("entity_type = ?"); args.push(input.entity_type); }
+    if (input.entity_id) { where.push("entity_id = ?"); args.push(input.entity_id); }
+    const materialize = this.readBudget ? Math.min(limit, this.readBudget.events + 1) : limit;
+    args.push(materialize);
+    const rows = this.db.prepare(`SELECT * FROM events WHERE ${where.join(" AND ")}
+      ORDER BY seq ${input.descending ? "DESC" : "ASC"} LIMIT ?`).all(...args) as Record<string, unknown>[];
+    this.charge("events", rows.length);
+    return rows.map(row => this.verifiedEvent(row));
+  }
+
+  getEvent(eventId: string): Record<string, unknown> {
+    this.charge("events", 1);
+    const row = this.db.prepare("SELECT * FROM events WHERE event_id=?").get(eventId) as Record<string, unknown> | undefined;
+    if (!row) throw new NotFoundError(`event:${eventId}`);
+    return this.verifiedEvent(row);
+  }
+
+  entityPage<T extends Record<string, unknown> = Record<string, unknown>>(input: {
+    entity_type: string; after_id: string; limit: number; upper_id?: string;
+  }): Array<T & { version: number }> {
+    const limit = this.pageLimit(input.limit);
+    const materialize = this.readBudget ? Math.min(limit, this.readBudget.entities + 1) : limit;
+    const where = ["entity_type=?", "entity_id>?"];
+    const args: unknown[] = [input.entity_type, input.after_id];
+    if (input.upper_id !== undefined) { where.push("entity_id<=?"); args.push(input.upper_id); }
+    args.push(materialize);
+    const rows = this.db.prepare(`SELECT * FROM entities WHERE ${where.join(" AND ")} ORDER BY entity_id LIMIT ?`)
+      .all(...args) as Record<string, unknown>[];
+    this.charge("entities", rows.length);
+    return rows.map(row => {
+      const payload = JSON.parse(String(row.payload)) as T & { version: number };
+      if (digest(payload) !== row.payload_hash || payload.entity_id !== row.entity_id ||
+          payload.entity_type !== input.entity_type || payload.version !== row.version) {
+        throw new IntegrityError("FAIL_CLOSED_ENTITY_HASH_MISMATCH", String(row.entity_id));
+      }
+      return payload;
+    });
+  }
+
+  /** Structural index proof only; callers must also verify the current
+   *  commit hash and protected pins before using a scheduler row. */
+  schedulerRevisionSummary(entityType: string, entityId: string): {
+    count: number; first: number | null; last: number | null; invalid: number;
+  } {
+    return this.db.prepare(`SELECT COUNT(*) AS count,
+      MIN(json_extract(metadata_json,'$.revision')) AS first,
+      MAX(json_extract(metadata_json,'$.revision')) AS last,
+      COALESCE(SUM(CASE WHEN json_type(metadata_json,'$.revision')='integer'
+        AND json_extract(metadata_json,'$.revision')>0 THEN 0 ELSE 1 END),0) AS invalid
+      FROM events WHERE entity_type=? AND entity_id=? AND event_type='OBJECTIVE_AUTO_SCHEDULER_COMMIT'`)
+      .get(entityType, entityId) as { count: number; first: number | null; last: number | null; invalid: number };
   }
 
   close(): void {
@@ -228,6 +348,7 @@ export class PairEvidenceStore {
     entityType: string,
     entityId: string,
   ): T & { version: number } {
+    this.charge("entities", 1);
     const row = this.db
       .prepare("SELECT payload, payload_hash FROM entities WHERE entity_type=? AND entity_id=?")
       .get(entityType, entityId) as { payload: string; payload_hash: string } | undefined;
@@ -262,8 +383,9 @@ export class PairEvidenceStore {
     entityType: string,
   ): Array<T & { version: number }> {
     const rows = this.db
-      .prepare("SELECT payload, payload_hash FROM entities WHERE entity_type=?")
-      .all(entityType) as Array<{ payload: string; payload_hash: string }>;
+      .prepare("SELECT payload, payload_hash FROM entities WHERE entity_type=?" + (this.readBudget ? " LIMIT ?" : ""))
+      .all(...(this.readBudget ? [entityType, this.readBudget.entities + 1] : [entityType])) as Array<{ payload: string; payload_hash: string }>;
+    this.charge("entities", rows.length);
     return rows.map((row) => {
       const payload = JSON.parse(row.payload) as T;
       if (digest(payload) !== row.payload_hash) {
@@ -342,26 +464,10 @@ export class PairEvidenceStore {
       sql += " WHERE " + conds.join(" AND ");
     }
     sql += " ORDER BY seq";
+    if (this.readBudget) sql += ` LIMIT ${this.readBudget.events + 1}`;
     const rows = this.db.prepare(sql).all(...args) as Array<Record<string, unknown>>;
-    return rows.map((row) => {
-      const metadata = row.metadata_json ? JSON.parse(String(row.metadata_json)) : null;
-      const body = {
-        event_id: row.event_id,
-        entity_type: row.entity_type,
-        entity_id: row.entity_id,
-        event_type: row.event_type,
-        old_state: row.old_state,
-        new_state: row.new_state,
-        actor: row.actor,
-        correlation_id: row.correlation_id,
-        metadata,
-        created_at: row.created_at,
-      };
-      if (digest(body) !== row.event_hash) {
-        throw new IntegrityError("FAIL_CLOSED_EVENT_HASH_MISMATCH", String(row.event_id));
-      }
-      return { ...row, metadata };
-    });
+    this.charge("events", rows.length);
+    return rows.map(row => this.verifiedEvent(row));
   }
 
   appendEvidence(
