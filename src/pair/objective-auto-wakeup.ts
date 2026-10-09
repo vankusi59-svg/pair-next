@@ -1,14 +1,19 @@
 import { digest, utcnow } from "./canonical.js";
 import { IntegrityError, NotFoundError } from "./errors.js";
+import { isSqliteContentionError } from "./store.js";
 import type { PairEvidenceStore } from "./store.js";
 import {
   ObjectiveAutoScheduler,
+  OBJECTIVE_WAKE_INPUT_TOPICS,
   SCHEDULER_CURSOR,
   SCHEDULER_PROGRESS,
+  SCHEDULER_RECEIPT,
   WAKE_STATE,
+  faultCode,
   readSchedulerRow,
   writeSchedulerRow,
 } from "./objective-auto-scheduler.js";
+import type { WakeBinding } from "./objective-auto-scheduler.js";
 import { AUTO_POLICY_ENTITY } from "./objective-auto-policy.js";
 import {
   WORKFORCE_ALLOCATION_ENTITY,
@@ -22,31 +27,34 @@ const ENTITY_PAGE = 64;
 const FANOUT_LIMIT = 64;
 
 type Row = Record<string, unknown> & { version: number };
-type WakeTarget = { objective_id: string; reason: string; source_scope: string };
+type WakeTarget = { objective_id: string; reason: string; source_scope: string;
+  binding: WakeBinding };
 type TickResult = { processed: number; skipped: number; blocked: number };
 
-/** Versioned input-topic whitelist. Scheduler-owned commit/checkpoint events
- * are deliberately absent so intake cannot chase its own tail forever. */
-export const OBJECTIVE_WAKE_INPUT_TOPICS = [
-  "OBJECTIVE_CREATED", "OBJECTIVE_STATUS", "OBJECTIVE_AMENDED",
-  "OBJECTIVE_PROGRESS", "OBJECTIVE_EVIDENCE_ATTACHED", "OBJECTIVE_BUDGET_ACCOUNTED",
-  "OBJECTIVE_AUTO_POLICY_CONFIGURE", "OBJECTIVE_AUTO_POLICY_ENABLE",
-  "OBJECTIVE_AUTO_POLICY_PAUSE", "OBJECTIVE_AUTO_POLICY_RESUME",
-  "OBJECTIVE_AUTO_POLICY_DISABLE", "OBJECTIVE_AUTO_POLICY_REVOKE",
-  "OBJECTIVE_AUTO_POLICY_HALT", "OBJECTIVE_AUTO_POLICY_RESET_HALT",
-  "OBJECTIVE_AUTO_POLICY_EXPIRE",
-  "MISSION_TRANSITION", "WORK_ITEM_STATUS_SYNCED", "WORK_ITEM_OPEN_RECONCILED",
-  "WORK_ITEM_CANCELLED", "WORK_ITEM_UNBLOCKED", "WORK_REVIEW_ACCEPTED",
-  "WORK_REWORK_REQUESTED", "APPROVAL_GRANTED", "APPROVAL_DENIED",
-  "APPROVAL_SUPERSEDED", "APPROVAL_EXPIRED", "APPROVAL_EXERCISED",
-  "OBJECTIVE_ADAPTIVE_REVIEW_COMMITTED", "OBJECTIVE_STRATEGY_REVISION_COMMITTED",
-  "ORG_AGENT_STATUS", "AGENT_EXECUTION_CONTRACT_ENABLED",
-  "AGENT_EXECUTION_CONTRACT_DISABLED", "AGENT_EXECUTION_CONTRACT_UPDATED",
-  "WORK_CLAIM_RELEASED",
-] as const;
+export { OBJECTIVE_WAKE_INPUT_TOPICS };
 
 function invalid(reason: string): never {
   throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_WAKEUP", reason);
+}
+
+/** Capacity/position-dependent faults are retryable: replaying the same event
+ * with a fresh read budget or after lock contention succeeds later. Canonical
+ * IntegrityError/NotFoundError faults are permanent for that event — they are
+ * blocked with a durable receipt, never silently dropped. */
+const RETRYABLE_CODES = new Set([
+  "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT",
+  "FAIL_CLOSED_READ_BUDGET_SCHEMA",
+  "FAIL_CLOSED_ASYNC_READ_BUDGET",
+]);
+
+function retryableFault(e: unknown): boolean {
+  if (isSqliteContentionError(e)) return true;
+  const code = String((e as { code?: unknown } | null | undefined)?.code ?? "");
+  if (RETRYABLE_CODES.has(code)) return true;
+  if (e instanceof IntegrityError || e instanceof NotFoundError) return false;
+  // Unknown/unexpected faults: never silently skip — leave the event pending
+  // for the next tick rather than risk a permanent drop.
+  return true;
 }
 
 function fields(row: Row): Row {
@@ -101,7 +109,9 @@ export class ObjectiveAutoWakeupService {
         const cursor = this.ensureCursor();
         writeSchedulerRow(this.store, SCHEDULER_CURSOR, GLOBAL, {
           ...fields(cursor), health: "DEGRADED",
-          last_error: String(error instanceof Error ? error.message : error).slice(0, 512),
+          // R1-F4 — durable state only carries a typed fault code; raw
+          // exception text is untrusted and may embed secrets/canaries.
+          last_error: faultCode(error),
           updated_at: utcnow(),
         }, "DEGRADED", String(this.now()));
       });
@@ -117,10 +127,13 @@ export class ObjectiveAutoWakeupService {
     if (!objectiveId || correlation !== objectiveId) return [];
     const action = String((ev.metadata as Record<string, unknown> | null)?.action ?? "TRANSITION");
     return [{ objective_id: objectiveId, reason: "POLICY_" + action.toUpperCase(),
-      source_scope: "auto_policy:" + entityId }];
+      source_scope: "auto_policy:" + entityId, binding: { kind: "auto_policy" } }];
   }
 
-  private allocationTargets(workItemId: string, reason: string, scope: string): WakeTarget[] {
+  /** Fan out over canonical allocations matched by `match`; each target
+   * carries the binding witness `accountWake` re-verifies at write time. */
+  private allocationTargets(match: (row: Row) => boolean,
+      bindingFor: (row: Row) => WakeBinding, reason: string, scope: string): WakeTarget[] {
     const targets: WakeTarget[] = [];
     let after = "";
     for (;;) {
@@ -128,11 +141,11 @@ export class ObjectiveAutoWakeupService {
         entity_type: WORKFORCE_ALLOCATION_ENTITY, after_id: after, limit: ENTITY_PAGE,
       });
       for (const row of page) {
-        if (String(row.delegated_child_work_item_id) !== workItemId &&
-            String(row.workstream_work_item_id) !== workItemId) continue;
+        if (!match(row)) continue;
         assertCanonicalWorkforceAllocationProvenance(this.store, row);
         targets.push({ objective_id: String(row.objective_id), reason,
-          source_scope: scope + "->allocation:" + String(row.allocation_id) });
+          source_scope: scope + "->allocation:" + String(row.allocation_id),
+          binding: bindingFor(row) });
         if (targets.length > FANOUT_LIMIT) invalid("wake fanout limit");
       }
       if (page.length < ENTITY_PAGE) return targets;
@@ -140,7 +153,8 @@ export class ObjectiveAutoWakeupService {
     }
   }
 
-  private missionTargets(missionId: string, reason: string): WakeTarget[] {
+  private missionTargets(missionId: string, reason: string,
+      kind: "mission" | "approval" = "mission"): WakeTarget[] {
     const mission = this.store.tryGet("mission", missionId) as Row | null;
     const openId = String(mission?.bound_open_id ?? "");
     if (!mission || !openId) return [];
@@ -148,8 +162,13 @@ export class ObjectiveAutoWakeupService {
       forMission: mission, requireState: "BOUND", mode: "PROVENANCE",
     });
     if (!bound.ok || !bound.binding) return [];
-    return this.allocationTargets(String(bound.binding.work_item_id), reason,
-      "mission:" + missionId + "->open:" + openId);
+    const workItemId = String(bound.binding.work_item_id);
+    return this.allocationTargets(
+      (row) => String(row.delegated_child_work_item_id) === workItemId ||
+        String(row.workstream_work_item_id) === workItemId,
+      (row) => ({ kind, allocation_id: String(row.allocation_id),
+        mission_id: missionId, open_id: openId, work_item_id: workItemId }),
+      reason, "mission:" + missionId + "->open:" + openId);
   }
 
   private approvalTargets(ev: Row): WakeTarget[] {
@@ -157,7 +176,8 @@ export class ObjectiveAutoWakeupService {
     const meta = ev.metadata as Record<string, unknown> | null;
     const missionId = String(row?.mission_id ?? meta?.mission_id ?? "");
     return missionId
-      ? this.missionTargets(missionId, "APPROVAL_" + String(ev.event_type).replace(/^APPROVAL_/, ""))
+      ? this.missionTargets(missionId, "APPROVAL_" + String(ev.event_type).replace(/^APPROVAL_/, ""),
+        "approval")
       : [];
   }
 
@@ -168,22 +188,11 @@ export class ObjectiveAutoWakeupService {
       agentId = String(contract?.org_agent_id ?? "");
     }
     if (!agentId) return [];
-    const targets: WakeTarget[] = [];
-    let after = "";
-    for (;;) {
-      const page = this.store.entityPage<Row>({
-        entity_type: WORKFORCE_ALLOCATION_ENTITY, after_id: after, limit: ENTITY_PAGE,
-      });
-      for (const row of page) {
-        if (String(row.selected_agent_id) !== agentId) continue;
-        assertCanonicalWorkforceAllocationProvenance(this.store, row);
-        targets.push({ objective_id: String(row.objective_id), reason: "AGENT_" + String(ev.event_type),
-          source_scope: "agent:" + agentId + "->allocation:" + String(row.allocation_id) });
-        if (targets.length > FANOUT_LIMIT) invalid("wake fanout limit");
-      }
-      if (page.length < ENTITY_PAGE) return targets;
-      after = String(page[page.length - 1]!.entity_id);
-    }
+    return this.allocationTargets(
+      (row) => String(row.selected_agent_id) === agentId,
+      (row) => ({ kind: "agent", allocation_id: String(row.allocation_id),
+        agent_id: agentId }),
+      "AGENT_" + String(ev.event_type), "agent:" + agentId);
   }
 
   private resolve(ev: Row): WakeTarget[] {
@@ -191,27 +200,51 @@ export class ObjectiveAutoWakeupService {
     if (String(ev.entity_type) === AUTO_POLICY_ENTITY) return this.objectiveFromPolicyEvent(ev);
     if (String(ev.entity_type) === "objective") {
       return [{ objective_id: String(ev.entity_id), reason: "OBJECTIVE_" + type.replace(/^OBJECTIVE_/, ""),
-        source_scope: "objective:" + String(ev.entity_id) }];
+        source_scope: "objective:" + String(ev.entity_id), binding: { kind: "objective" } }];
     }
     if (String(ev.entity_type) === "mission" && type === "MISSION_TRANSITION") {
       return this.missionTargets(String(ev.entity_id), "MISSION_" + String(ev.new_state ?? "CHANGED"));
     }
     if (String(ev.entity_type) === "work_item") {
-      return this.allocationTargets(String(ev.entity_id), "WORK_" + type, "work_item:" + String(ev.entity_id));
+      const wi = String(ev.entity_id);
+      return this.allocationTargets(
+        (row) => String(row.delegated_child_work_item_id) === wi ||
+          String(row.workstream_work_item_id) === wi,
+        (row) => ({ kind: "work_item", allocation_id: String(row.allocation_id),
+          work_item_id: wi }),
+        "WORK_" + type, "work_item:" + wi);
     }
     if (String(ev.entity_type) === "approval_request" || String(ev.entity_type) === "approval_exercise") {
       return this.approvalTargets(ev);
     }
-    if (String(ev.entity_type) === "objective_adaptive_review") {
+    if (String(ev.entity_type) === "objective_adaptive_review" ||
+        String(ev.entity_type) === "objective_strategy_revision") {
       const row = this.store.tryGet(String(ev.entity_type), String(ev.entity_id)) as Row | null;
       const objectiveId = String(row?.objective_id ?? "");
       return objectiveId ? [{ objective_id: objectiveId, reason: "REVIEW_" + type,
-        source_scope: "adaptive_review:" + String(ev.entity_id) }] : [];
+        source_scope: String(ev.entity_type) + ":" + String(ev.entity_id),
+        binding: { kind: "objective_ref" } }] : [];
     }
     if (String(ev.entity_type) === "org_agent" || String(ev.entity_type).includes("contract")) {
       return this.agentTargets(ev);
     }
     return [];
+  }
+
+  /** R1-F1 — durable per-event blocked disposition. The intake cursor may
+   * only advance past an event once every one of its outcomes is durable:
+   * a wake receipt, a resolved-empty skip, or this blocked receipt. The id
+   * is deterministic so replays stay idempotent. */
+  private recordBlockedEvent(ev: Row, objectiveId: string | null, e: unknown): void {
+    const scope = objectiveId ?? "resolve";
+    const receiptId = `intake-blocked:${String(ev.event_id)}:${scope}`;
+    if (readSchedulerRow(this.store, SCHEDULER_RECEIPT, receiptId)) return;
+    writeSchedulerRow(this.store, SCHEDULER_RECEIPT, receiptId, {
+      objective_id: objectiveId, source_event_id: String(ev.event_id),
+      source_seq: Number(ev.seq), event_type: String(ev.event_type),
+      entity_type: String(ev.entity_type), entity_id: String(ev.entity_id),
+      fault: faultCode(e), blocked_at: utcnow(), disposition: "BLOCKED_PERMANENT",
+    }, "INTAKE_BLOCKED", receiptId);
   }
 
   private writeCursor(cursor: Row, last: Row | null, result: TickResult): Row {
@@ -227,8 +260,12 @@ export class ObjectiveAutoWakeupService {
     }, "INTAKE", last ? String(last.event_id) : "idle");
   }
 
-  /** One bounded canonical event page. Cursor and all wake/skip effects in
-   * the page commit together; a failure before COMMIT leaves the page replayable. */
+  /** One bounded canonical event page. The cursor may only advance past an
+   * event whose every outcome is durable: a wake receipt, a resolved-empty
+   * skip, or a per-event blocked receipt. Retryable faults stop the page at
+   * the last durable event — committed progress is kept and the pending
+   * event replays next tick, so a transient failure can never silently lose
+   * a wake. */
   intakePage(): TickResult {
     return this.proof(() => {
       let cursor = this.ensureCursor();
@@ -238,17 +275,17 @@ export class ObjectiveAutoWakeupService {
       }) as Row[];
       const result: TickResult = { processed: 0, skipped: 0, blocked: 0 };
       let last: Row | null = null;
+      page:
       for (const ev of events) {
         let targets: WakeTarget[];
         try {
           targets = this.resolve(ev);
         } catch (e) {
-          if (e instanceof NotFoundError || e instanceof IntegrityError) {
-            result.blocked++;
-            last = ev;
-            continue;
-          }
-          throw e;
+          if (retryableFault(e)) break page;
+          this.recordBlockedEvent(ev, null, e);
+          result.blocked++;
+          last = ev;
+          continue;
         }
         if (!targets.length) {
           result.skipped++;
@@ -262,11 +299,18 @@ export class ObjectiveAutoWakeupService {
               source_event_id: String(ev.event_id),
               reason: target.reason,
               source_scope: target.source_scope,
+              binding: target.binding,
             });
             result.processed++;
           } catch (e) {
+            if (retryableFault(e)) break page;
+            this.recordBlockedEvent(ev, target.objective_id, e);
+            // Best-effort operator signal; the receipt above is the durable
+            // disposition even when quarantine itself cannot write.
+            try {
+              this.scheduler.quarantine(target.objective_id, faultCode(e));
+            } catch { /* blocked receipt is already durable */ }
             result.blocked++;
-            try { this.scheduler.quarantine(target.objective_id, String(e)); } catch { /* keep blocked */ }
           }
         }
         last = ev;
@@ -293,15 +337,22 @@ export class ObjectiveAutoWakeupService {
         catch { skipped++; }
       }
       const complete = page.length < ENTITY_PAGE;
-      writeSchedulerRow(this.store, SCHEDULER_PROGRESS, GLOBAL, {
-        ...fields(progress), health: "READY",
-        sweep_after_id: complete ? "" : String(page[page.length - 1]!.entity_id),
-        sweep: complete ? Number(progress.sweep) + 1 : Number(progress.sweep),
-        processed_total: Number(progress.processed_total) + page.length - skipped,
-        skipped_total: Number(progress.skipped_total) + skipped,
-        last_completed_sweep_at: complete ? utcnow() : progress.last_completed_sweep_at,
-        last_tick_at: utcnow(), last_error: null,
-      }, complete ? "SWEEP_COMPLETE" : "SWEEP_PAGE", String(progress.sweep));
+      // R1-F3 — only persist when the durable resume position actually
+      // changes (mid-sweep page advance or completing a multi-page sweep)
+      // or an anomaly was skipped. A fully idle single-page sweep writes
+      // nothing: the position is already "" and there is nothing to resume.
+      const positionChanged = !complete || String(progress.sweep_after_id ?? "") !== "";
+      if (positionChanged || skipped > 0) {
+        writeSchedulerRow(this.store, SCHEDULER_PROGRESS, GLOBAL, {
+          ...fields(progress), health: "READY",
+          sweep_after_id: complete ? "" : String(page[page.length - 1]!.entity_id),
+          sweep: complete ? Number(progress.sweep) + 1 : Number(progress.sweep),
+          processed_total: Number(progress.processed_total) + page.length - skipped,
+          skipped_total: Number(progress.skipped_total) + skipped,
+          last_completed_sweep_at: complete ? utcnow() : progress.last_completed_sweep_at,
+          last_tick_at: utcnow(), last_error: null,
+        }, complete ? "SWEEP_COMPLETE" : "SWEEP_PAGE", String(progress.sweep));
+      }
       return { scanned: page.length, skipped, complete };
     });
   }
@@ -318,10 +369,15 @@ export class ObjectiveAutoWakeupService {
       for (const row of page) this.scheduler.markDue(String(row.entity_id));
       const leases = this.scheduler.reconcileLeases(ENTITY_PAGE);
       const complete = page.length < ENTITY_PAGE;
-      writeSchedulerRow(this.store, SCHEDULER_PROGRESS, GLOBAL, {
-        ...fields(progress), due_after_id: complete ? "" : String(page[page.length - 1]!.entity_id),
-        last_tick_at: utcnow(),
-      }, "DUE_PAGE", String(this.now()));
+      // R1-F3 — persist only on a real position change (mid-scan advance or
+      // completing a multi-page scan) or when leases were actually reaped.
+      const positionChanged = !complete || String(progress.due_after_id ?? "") !== "";
+      if (positionChanged || leases.expired > 0) {
+        writeSchedulerRow(this.store, SCHEDULER_PROGRESS, GLOBAL, {
+          ...fields(progress), due_after_id: complete ? "" : String(page[page.length - 1]!.entity_id),
+          last_tick_at: utcnow(),
+        }, "DUE_PAGE", String(this.now()));
+      }
       return { scanned: page.length, expired_leases: leases.expired };
     });
   }

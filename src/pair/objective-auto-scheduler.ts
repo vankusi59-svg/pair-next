@@ -1,10 +1,17 @@
 import { randomBytes } from "node:crypto";
 import { digest } from "./canonical.js";
-import { IntegrityError } from "./errors.js";
+import { IntegrityError, NotFoundError } from "./errors.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
+import { AUTO_POLICY_ENTITY } from "./objective-auto-policy.js";
 import type { ObjectiveAutoPolicyService, AutoPolicyStatus } from "./objective-auto-policy.js";
 import type { OperatingOutcome } from "./objective-operating-loop.js";
+import { isSqliteContentionError } from "./store.js";
 import type { PairEvidenceStore } from "./store.js";
+import {
+  WORKFORCE_ALLOCATION_ENTITY,
+  assertCanonicalWorkforceAllocationProvenance,
+} from "./workforce-allocation-evidence.js";
+import { validateWorkOpenBindingById } from "./work-open-binding.js";
 
 export const OBJECTIVE_SCHEDULER_MODE = "RECONCILE_ONLY" as const;
 export const SCHEDULER_COMMIT = "OBJECTIVE_AUTO_SCHEDULER_COMMIT";
@@ -21,6 +28,63 @@ const MAX_ACTIVE = 4;
 const PAGE = 64;
 
 type Row = Record<string, unknown> & { version: number };
+
+/** Versioned input-topic whitelist. Scheduler-owned commit/checkpoint events
+ * are deliberately absent so intake cannot chase its own tail forever. The
+ * write seam re-enforces this list inside accountWake: a wake may only ever
+ * be sourced from one of these canonical topics. */
+export const OBJECTIVE_WAKE_INPUT_TOPICS = [
+  "OBJECTIVE_CREATED", "OBJECTIVE_STATUS", "OBJECTIVE_AMENDED",
+  "OBJECTIVE_PROGRESS", "OBJECTIVE_EVIDENCE_ATTACHED", "OBJECTIVE_BUDGET_ACCOUNTED",
+  "OBJECTIVE_AUTO_POLICY_CONFIGURE", "OBJECTIVE_AUTO_POLICY_ENABLE",
+  "OBJECTIVE_AUTO_POLICY_PAUSE", "OBJECTIVE_AUTO_POLICY_RESUME",
+  "OBJECTIVE_AUTO_POLICY_DISABLE", "OBJECTIVE_AUTO_POLICY_REVOKE",
+  "OBJECTIVE_AUTO_POLICY_HALT", "OBJECTIVE_AUTO_POLICY_RESET_HALT",
+  "OBJECTIVE_AUTO_POLICY_EXPIRE",
+  "MISSION_TRANSITION", "WORK_ITEM_STATUS_SYNCED", "WORK_ITEM_OPEN_RECONCILED",
+  "WORK_ITEM_CANCELLED", "WORK_ITEM_UNBLOCKED", "WORK_REVIEW_ACCEPTED",
+  "WORK_REWORK_REQUESTED", "APPROVAL_GRANTED", "APPROVAL_DENIED",
+  "APPROVAL_SUPERSEDED", "APPROVAL_EXPIRED", "APPROVAL_EXERCISED",
+  "OBJECTIVE_ADAPTIVE_REVIEW_COMMITTED", "OBJECTIVE_STRATEGY_REVISION_COMMITTED",
+  "ORG_AGENT_STATUS", "AGENT_EXECUTION_CONTRACT_ENABLED",
+  "AGENT_EXECUTION_CONTRACT_DISABLED", "AGENT_EXECUTION_CONTRACT_UPDATED",
+  "WORK_CLAIM_RELEASED",
+] as const;
+
+/** Canonical provenance a caller must supply for a source-event wake. The
+ * scheduler does not trust the claim: every hop is re-verified against the
+ * canonical store inside the write transaction. */
+export type WakeBinding =
+  | { kind: "objective" }
+  | { kind: "auto_policy" }
+  | { kind: "objective_ref" }
+  | { kind: "work_item"; allocation_id: string; work_item_id: string }
+  | { kind: "agent"; allocation_id: string; agent_id: string }
+  | { kind: "mission"; allocation_id: string; mission_id: string;
+      open_id: string; work_item_id: string }
+  | { kind: "approval"; allocation_id: string; mission_id: string;
+      open_id: string; work_item_id: string };
+
+const FAULT_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,63}$/;
+/** Typed, bounded fault label for durable state. Raw exception text is
+ * untrusted and may carry secrets/canaries — never persist it. */
+export function faultCode(e: unknown): string {
+  const code = String((e as { code?: unknown } | null | undefined)?.code ?? "");
+  if (FAULT_CODE_PATTERN.test(code)) return code;
+  if (isSqliteContentionError(e)) return "SQLITE_CONTENTION";
+  if (e instanceof NotFoundError) return "NOT_FOUND";
+  if (e instanceof IntegrityError) return "INTEGRITY_FAULT";
+  return "UNEXPECTED_FAULT";
+}
+
+const SAFE_REASON_PATTERN = /^[A-Z0-9_,:.\-]{1,256}$/;
+/** Durable reason fields only carry enum-style codes. Anything else —
+ * including raw error strings — collapses to a fixed label. */
+export function sanitizeFaultReason(reason: unknown): string {
+  const text = String(reason ?? "");
+  return SAFE_REASON_PATTERN.test(text) ? text : "UNSPECIFIED_FAULT";
+}
+
 type Queue = Row & {
   objective_id: string; business_id: string; owner_authority_id: string;
   policy_version: number; terms_digest: string; objective_version: number;
@@ -209,12 +273,129 @@ export class ObjectiveAutoScheduler {
     return q;
   }
 
+  private allocFor(objectiveId: string, allocationId: string): Row {
+    if (typeof allocationId !== "string" || !allocationId) {
+      invalid("wake binding: allocation reference missing");
+    }
+    const row = this.store.tryGet(WORKFORCE_ALLOCATION_ENTITY, allocationId) as Row | null;
+    if (!row) invalid("wake binding: allocation does not resolve");
+    assertCanonicalWorkforceAllocationProvenance(this.store, row);
+    if (String(row.objective_id) !== objectiveId) {
+      invalid("wake binding: allocation/objective mismatch");
+    }
+    return row;
+  }
+
+  private static allocItems(row: Row): Set<string> {
+    return new Set([String(row.workstream_work_item_id),
+      String(row.delegated_child_work_item_id)]);
+  }
+
+  /** R1-F2 — canonical provenance re-proof. accountWake can only write a
+   * wake whose source event is provably bound to the Objective by the
+   * caller-supplied binding chain, re-verified hop by hop against the
+   * canonical store. A forged cross-objective source fails closed. */
+  private verifyWakeBinding(ev: Row, objectiveId: string, b: WakeBinding): void {
+    if (!b || typeof b !== "object") invalid("wake binding missing");
+    if (!OBJECTIVE_WAKE_INPUT_TOPICS.includes(
+      String(ev.event_type) as typeof OBJECTIVE_WAKE_INPUT_TOPICS[number])) {
+      invalid("wake source topic is not wake-eligible");
+    }
+    const et = String(ev.entity_type);
+    const verifyMissionChain = (missionId: string, openId: string, workItemId: string,
+        alloc: Row): void => {
+      const mission = this.store.tryGet("mission", missionId) as Row | null;
+      if (!mission || String(mission.bound_open_id ?? "") !== openId) {
+        invalid("wake binding: mission/open origin proof missing");
+      }
+      const bound = validateWorkOpenBindingById(this.store, openId, {
+        forMission: mission, requireState: "BOUND", mode: "PROVENANCE",
+      });
+      if (!bound.ok || !bound.binding ||
+          String(bound.binding.work_item_id ?? "") !== workItemId) {
+        invalid("wake binding: open/work-item chain broken");
+      }
+      if (!ObjectiveAutoScheduler.allocItems(alloc).has(workItemId)) {
+        invalid("wake binding: work item outside allocation");
+      }
+    };
+    switch (b.kind) {
+      case "objective":
+        if (et !== "objective" || String(ev.entity_id) !== objectiveId) {
+          invalid("wake binding: event is not on this objective");
+        }
+        return;
+      case "auto_policy":
+        if (et !== AUTO_POLICY_ENTITY ||
+            String(ev.entity_id) !== `oap:${objectiveId}` ||
+            String(ev.correlation_id ?? "") !== objectiveId) {
+          invalid("wake binding: policy/objective mismatch");
+        }
+        return;
+      case "objective_ref": {
+        if (et !== "objective_adaptive_review" && et !== "objective_strategy_revision") {
+          invalid("wake binding: not an objective-ref entity");
+        }
+        const row = this.store.tryGet(et, String(ev.entity_id)) as Row | null;
+        if (!row || String(row.objective_id) !== objectiveId) {
+          invalid("wake binding: entity/objective mismatch");
+        }
+        return;
+      }
+      case "work_item": {
+        const alloc = this.allocFor(objectiveId, b.allocation_id);
+        if (et !== "work_item" || String(ev.entity_id) !== b.work_item_id ||
+            !ObjectiveAutoScheduler.allocItems(alloc).has(b.work_item_id)) {
+          invalid("wake binding: work item link broken");
+        }
+        return;
+      }
+      case "agent": {
+        const alloc = this.allocFor(objectiveId, b.allocation_id);
+        if (String(alloc.selected_agent_id) !== b.agent_id) {
+          invalid("wake binding: agent outside allocation");
+        }
+        const agentId = et === "org_agent" ? String(ev.entity_id)
+          : String((this.store.tryGet(et, String(ev.entity_id)) as Row | null)
+              ?.org_agent_id ?? "");
+        if (agentId !== b.agent_id) invalid("wake binding: agent link broken");
+        return;
+      }
+      case "mission": {
+        const alloc = this.allocFor(objectiveId, b.allocation_id);
+        if (et !== "mission" || String(ev.entity_id) !== b.mission_id) {
+          invalid("wake binding: mission link broken");
+        }
+        verifyMissionChain(b.mission_id, b.open_id, b.work_item_id, alloc);
+        return;
+      }
+      case "approval": {
+        const alloc = this.allocFor(objectiveId, b.allocation_id);
+        if (et !== "approval_request" && et !== "approval_exercise") {
+          invalid("wake binding: not an approval source");
+        }
+        const row = this.store.tryGet("approval_request",
+          String(ev.entity_id)) as Row | null;
+        const meta = ev.metadata as Record<string, unknown> | null;
+        const derivedMission = String(row?.mission_id ?? meta?.mission_id ?? "");
+        if (derivedMission !== b.mission_id) {
+          invalid("wake binding: approval/mission mismatch");
+        }
+        verifyMissionChain(b.mission_id, b.open_id, b.work_item_id, alloc);
+        return;
+      }
+      default:
+        invalid("wake binding: unknown kind");
+    }
+  }
+
   /** Persist one canonical-source wake hint. The source MUST be an existing
-   * hash-verified store event; callers resolve the Objective scope outside,
-   * while this seam re-proves the source body and the CURRENT authority
-   * binding before it writes. */
+   * hash-verified store event whose binding chain to the Objective is
+   * re-proven canonically at write time; this seam also re-proves the
+   * CURRENT authority binding before it writes. */
   accountWake(input: { objective_id: string; source_event_id: string;
-    reason: string; checkpoint?: string; source_scope?: string }): Queue | null {
+    reason: string; checkpoint?: string; source_scope?: string;
+    binding: WakeBinding }): Queue | null {
     return this.proof(() => {
       const a = this.authority(input.objective_id);
       const q = this.register(input.objective_id, a);
@@ -227,6 +408,7 @@ export class ObjectiveAutoScheduler {
             (!input.source_scope || input.source_scope.length > 256))) {
         invalid("unverified wake source schema");
       }
+      this.verifyWakeBinding(ev as Row, input.objective_id, input.binding);
       const sourceDigest = String(ev.event_hash);
       const sourceKey = `event:${input.source_event_id}`;
       const key = digest({ id: input.objective_id, source: sourceKey,
@@ -311,7 +493,7 @@ export class ObjectiveAutoScheduler {
       if (!q) return null;
       return writeSchedulerRow<Queue>(this.store, WAKE_STATE, objectiveId, {
         ...fields(q), queue_state: "QUARANTINED",
-        blocked_reason: reason.slice(0, 512),
+        blocked_reason: sanitizeFaultReason(reason),
       }, "QUARANTINE", `${objectiveId}:${digest(reason)}`);
     });
   }

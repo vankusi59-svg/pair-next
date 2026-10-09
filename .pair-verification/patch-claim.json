@@ -1,16 +1,17 @@
 {
-  "claim_id": "P15_10_B_RECONCILE_ONLY",
-  "title": "P15.10-B: durable canonical wake intake, restart reconciliation and fenced lease/fairness metadata; production RECONCILE_ONLY",
+  "claim_id": "P15_10_B_R1_AUDIT_REMEDIATION",
+  "title": "P15.10-B R1: remediate four audited findings — durable blocked dispositions, canonical wake binding, idle-write elimination, typed fault persistence; production stays RECONCILE_ONLY",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
     "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10b-r1.test.ts",
     "src/__tests__/pair-p15-10b.test.ts",
     "src/__tests__/pair-p15-10a-auto-policy.test.ts"
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "Integration BASE 88cdf85b99080b5b2da9dda13c9fae5154108c70. Adds versioned canonical input-topic intake, durable cursor/progress/wake segments, restart observation/due reconciliation, anchored scheduler rows, isolated claim/renew/settle/release fencing, retry/backoff and deterministic multi-Objective fairness plus owner-scoped read-only status. Production wiring only runs RECONCILE_ONLY intake/reconcile; it never claims a generation, calls runObjectivePass, CEO/model/planner/controller/executor, creates missions or sends Telegram. driver_ready and consumer_ready remain false and COST_BINDING_UNVERIFIED is unchanged. B01-B15 are covered by executable focused tests plus P15.10-A regression; C controller wiring, monetary reservation/settlement and live autonomous E2E remain deferred. No merge/deploy."
+  "description": "Independent-audit remediation on PR #86 (audited HEAD 3b3d1dfccb17fd507fd3c9f4173a484e64068cff, BASE 88cdf85b99080b5b2da9dda13c9fae5154108c70). All four findings reproduced with executable tests before patching (5/6 new tests failed prepatch). F1: intake cursor no longer advances past events lacking a durable disposition — retryable faults (SQLITE contention, read-budget exhaustion, unexpected errors) stop the page at the last durable event and replay next tick; permanent faults write a deterministic intake-blocked SCHEDULER_RECEIPT plus best-effort sanitized quarantine. F2: accountWake now requires a WakeBinding whose canonical chain is re-verified hop-by-hop at write time (objective/auto_policy/objective_ref/work_item/agent/mission/approval); forged cross-objective sources fail closed, legitimate indirect Mission/Work-Item/Approval sources remain. Also completes the whitelist: objective_strategy_revision events now resolve (previously silently skipped). F3: reconcile/due progress rows persist only on real position changes or anomalies — idle ticks append zero scheduler commits. F4: durable state stores only typed fault codes (markDegraded last_error, quarantine blocked_reason); raw exception text never persists. Production wiring remains RECONCILE_ONLY: no consumer, no claim loop, no CEO/model/planner/controller/executor calls, no missions, no Telegram; driver_ready/consumer_ready false; COST_BINDING_UNVERIFIED deferred to P15.10-C. No merge/deploy."
 }
