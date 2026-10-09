@@ -232,15 +232,25 @@ describe("P15.10-C R2 — fenced authority closure", () => {
     expect(settleReceipts(s)).toHaveLength(0); // old worker never settles
   });
 
-  it("R2-F1b terms/limits drift mid-await blocks commit", async () => {
+  it("R2-F1b terms/limits drift mid-await blocks commit (R3-corrected: legit disable→configure→enable)", async () => {
     const s = freshSvc("f1b");
     enable(s);
     const ceo = ceoSvc(s, async (i) => {
-      // Owner reconfigures limits mid-invocation → terms_digest + version drift.
-      const v = s.policy.status(s.oid, OWNER).policy_version;
+      // R3 correction: `configure` while ENABLED is an INVALID transition
+      // (throws) — it never produced a real drift and the old test only
+      // passed via the invoker's own error. The legitimate re-bind path
+      // is disable→configure→enable: real policy_version bump + fresh
+      // terms_digest pin while the policy becomes effective again.
+      const v1 = s.policy.status(s.oid, OWNER).policy_version;
+      s.policy.control({ objective_id: s.oid, actor: OWNER, action: "disable",
+        policy_version: v1, idempotency_key: `d-${counter}` });
+      const v2 = s.policy.status(s.oid, OWNER).policy_version;
       s.policy.control({ objective_id: s.oid, actor: OWNER, action: "configure",
-        limits: LIMITS({ max_ceo_calls: 5 }), policy_version: v,
+        limits: LIMITS({ max_ceo_calls: 5 }), policy_version: v2,
         idempotency_key: `cfg2-${counter}` });
+      const v3 = s.policy.status(s.oid, OWNER).policy_version;
+      s.policy.control({ objective_id: s.oid, actor: OWNER, action: "enable",
+        policy_version: v3, idempotency_key: `en2-${counter}` });
       return waitResult(i);
     });
     const driver = mkDriver(s, async (input) => {

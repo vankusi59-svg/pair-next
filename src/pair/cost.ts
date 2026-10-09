@@ -445,6 +445,61 @@ export class CostService {
     }
   }
 
+  /* ---------------- P15.10-C R3 — objective-scope lineage ---------------
+   * The objective budget cap binds at THIS reservation boundary, with
+   * the governed task's real route/executor identity. Canonical lineage
+   * (all reads inside the caller's transaction):
+   *   mission.bound_open_id → work_open_binding.work_item_id →
+   *   workforce_allocation (workstream or delegated child) → objective
+   *   → objective_auto_policy limits.budget_microusd_cap. */
+  private objectiveScopeFor(missionId: string): { objective_id: string; cap: number | null } | null {
+    const mission = this.store.tryGet("mission", missionId);
+    const openId = mission?.bound_open_id;
+    if (!openId) return null;
+    const wob = this.store.tryGet("work_open_binding", String(openId));
+    const wi = wob?.work_item_id;
+    if (!wi) return null;
+    for (const a of this.store.list("workforce_allocation")) {
+      if (String(a.workstream_work_item_id ?? "") === String(wi) ||
+          String(a.delegated_child_work_item_id ?? "") === String(wi)) {
+        const oid = String(a.objective_id);
+        const pol = this.store.tryGet("objective_auto_policy", `oap:${oid}`);
+        const cap = (pol?.limits as Record<string, unknown> | null | undefined)
+          ?.budget_microusd_cap;
+        return { objective_id: oid, cap: cap == null ? null : Number(cap) };
+      }
+    }
+    return null;
+  }
+
+  /** Sum of every live reservation traceable to the objective — HELD /
+   *  COMMITTED at reserved, SETTLED at settled, RELEASED skipped. */
+  private objectiveAttributedMicrousd(objectiveId: string, reservations: Array<Record<string, unknown>>): number {
+    const wis = new Set<string>();
+    for (const a of this.store.list("workforce_allocation")) {
+      if (String(a.objective_id) === objectiveId) {
+        if (a.workstream_work_item_id) wis.add(String(a.workstream_work_item_id));
+        if (a.delegated_child_work_item_id) wis.add(String(a.delegated_child_work_item_id));
+      }
+    }
+    const mids = new Set<string>();
+    for (const wob of this.store.list("work_open_binding")) {
+      if (wis.has(String(wob.work_item_id ?? "")) && wob.mission_id) {
+        mids.add(String(wob.mission_id));
+      }
+    }
+    let total = 0;
+    for (const r of reservations) {
+      if (!mids.has(String(r.mission_id ?? ""))) continue;
+      const st = String(r.status);
+      if (st === "RELEASED") continue;
+      total += st === "SETTLED"
+        ? Number(r.settled_microusd ?? 0)
+        : Number(r.reserved_microusd ?? 0);
+    }
+    return total;
+  }
+
   /* ---------------- atomic pre-dispatch authority ------------------------ */
 
   /**
@@ -603,6 +658,38 @@ export class CostService {
           });
         }
       }
+      // P15.10-C R3 F2 — objective-level budget authority at the REAL
+      // pre-spend boundary. The driver's admission-time bound is only a
+      // preliminary check: the reservation THIS governed task creates
+      // has a concrete route/model identity, so the objective cap binds
+      // it here — inside the same atomic check-and-reserve transaction,
+      // against lineage resolved fresh (never the caller's snapshot).
+      const objScope = this.objectiveScopeFor(missionId);
+      if (objScope && objScope.cap !== null) {
+        if (billing.mode === "UNKNOWN" || billing.unbounded) {
+          // An unprovable charge under an objective cap is never $0.
+          violations.push({
+            scope_type: "objective",
+            scope_id: objScope.objective_id,
+            reason: "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+            used_microusd: null,
+            requested_microusd: requested,
+            max_microusd: objScope.cap,
+          });
+        } else {
+          const attributed = this.objectiveAttributedMicrousd(objScope.objective_id, reservations);
+          if (attributed + requested > objScope.cap) {
+            violations.push({
+              scope_type: "objective",
+              scope_id: objScope.objective_id,
+              reason: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED",
+              used_microusd: attributed,
+              requested_microusd: requested,
+              max_microusd: objScope.cap,
+            });
+          }
+        }
+      }
       if (violations.length) return { violations, warnings, saved: null };
       // R1 §2: pin the authoritative pricing evidence into the
       // reservation at authorization time — settlement later uses THIS
@@ -671,23 +758,26 @@ export class CostService {
     }
     if (outcome.violations.length) {
       for (const v of outcome.violations) {
-        this.store.event({
-          entity_type: "cost_policy",
-          entity_id: String(v.cost_policy_id),
-          event_type: "COST_BUDGET_EXCEEDED",
-          actor: "PAIR_COST_GOVERNANCE",
-          metadata: {
-            scope_type: v.scope_type,
-            scope_id: v.scope_id,
-            used_microusd: v.used_microusd,
-            requested_microusd: v.requested_microusd,
-            max_microusd: v.max_microusd,
-          },
-        });
+        if (v.cost_policy_id != null) {
+          this.store.event({
+            entity_type: "cost_policy",
+            entity_id: String(v.cost_policy_id),
+            event_type: "COST_BUDGET_EXCEEDED",
+            actor: "PAIR_COST_GOVERNANCE",
+            metadata: {
+              scope_type: v.scope_type,
+              scope_id: v.scope_id,
+              used_microusd: v.used_microusd,
+              requested_microusd: v.requested_microusd,
+              max_microusd: v.max_microusd,
+            },
+          });
+        }
         this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
-          reason: "FAIL_CLOSED_COST_BUDGET_EXCEEDED",
+          reason: String(v.reason ?? "FAIL_CLOSED_COST_BUDGET_EXCEEDED"),
           governed_task_id: governedTaskId,
-          cost_policy_id: v.cost_policy_id,
+          cost_policy_id: v.cost_policy_id ?? null,
+          objective_id: v.scope_type === "objective" ? v.scope_id : null,
           used_microusd: v.used_microusd,
           requested_microusd: v.requested_microusd,
           max_microusd: v.max_microusd,
@@ -695,7 +785,7 @@ export class CostService {
       }
       const v = outcome.violations[0];
       throw new PolicyError(
-        "FAIL_CLOSED_COST_BUDGET_EXCEEDED",
+        String(v.reason ?? "FAIL_CLOSED_COST_BUDGET_EXCEEDED"),
         `${String(v.scope_type)}:${String(v.scope_id)} ${String(v.used_microusd)}+${String(v.requested_microusd)}>${String(v.max_microusd)}`,
       );
     }

@@ -371,10 +371,23 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     enable(s, oid(o));
     const off = s.scheduler.status(oid(o), OWNER);
     expect(off.driver_ready).toBe(false);
-    const on = s.scheduler.status(oid(o), OWNER, { enabled: true, driver_missing: [] });
+    // R3 F3 — wired ≠ runnable: a driver that reports integration
+    // without a proven runnable state still projects NOT ready.
+    const wiredOnly = s.scheduler.status(oid(o), OWNER,
+      { enabled: true, driver_missing: [] });
+    expect(wiredOnly.driver_integrated).toBe(true);
+    expect(wiredOnly.driver_ready).toBe(false);
+    expect(wiredOnly.objective_runnable).toBe(false);
+    const on = s.scheduler.status(oid(o), OWNER, { enabled: true,
+      driver_missing: [], runnable: true, reasons: [] });
     expect(on.driver_ready).toBe(true);
     expect(on.consumer_ready).toBe(true);
     expect(on.driver_missing).toEqual([]);
+    // A runnable:false report with reasons flows through truthfully.
+    const blocked = s.scheduler.status(oid(o), OWNER, { enabled: true,
+      driver_missing: [], runnable: false, reasons: ["BUDGET_EXHAUSTED"] });
+    expect(blocked.driver_ready).toBe(false);
+    expect(blocked.driver_missing).toContain("BUDGET_EXHAUSTED");
   });
 
   it("C22/C23 provenance: admissions + results carry driver identity, never owner", async () => {

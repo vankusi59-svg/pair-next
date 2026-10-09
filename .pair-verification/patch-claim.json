@@ -1,16 +1,18 @@
 {
-  "claim_id": "P15_10_C_R2_FENCED_AUTHORITY_CLOSURE",
-  "title": "P15.10-C R2: fenced authority closure \u2014 claimed-version commit guard, guarded review commit, absolute lease lifetime at the canonical validation boundary",
+  "claim_id": "P15_10_C_R3_COST_READINESS_CLOSURE",
+  "title": "P15.10-C R3: cost authority & readiness closure \u2014 objective cap at the atomic reserve boundary, truthful runnable readiness, F1b coverage correction",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
+    "GATE_ROUTER",
     "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10c-r3.test.ts",
     "src/__tests__/pair-p15-10c-r2.test.ts",
     "src/__tests__/pair-p15-10c-r1.test.ts",
     "src/__tests__/pair-p15-10c.test.ts",
-    "src/__tests__/pair-p15-10b-r1.test.ts",
+    "src/__tests__/pair-p13.test.ts",
     "src/__tests__/pair-p15-10b.test.ts",
     "src/__tests__/pair-p15-10a-auto-policy.test.ts",
     "src/__tests__/pair-p15-3-ceo-planning-cycle.test.ts",
@@ -19,5 +21,5 @@
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "R2 remediation on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3) closing residual F1 findings, all CONFIRMED by pre-patch repro tests. F1.1: driver authorityGate checked only lease state/fence/expiry + evaluate().effective, so PAUSE->RESUME mid-await produced an effective policy at version V+2 that was NOT the claimed authorization. Fix: scheduler.assertLeaseAuthority(handle) \u2014 narrow read-only assertion re-proving state, fence, worker/boot, token, generation, checkpoint, expiry, absolute lifetime, and captured policy_version/terms_digest/owner/objective_version pins through the single currentLease path (no parallel validator); authorityGate calls it first, refusal -> DRIVER_AUTHORITY_LOST. F1.2: commitReview's own store.immediate (receipt + optional strategy revision + anchors) had no guard \u2014 guard now fires FIRST inside that txn (forwarded from runReview input); revoke between CEO decision commit and review commit rolls back every review side effect; deterministic zero-model checkpoints equally guarded; manual callers unchanged. F1.3: renew() stamped expires_at=now+60s past absolute lifetime and currentLease never checked lifetime \u2014 post-deadline settle/assert passed. Fix: absolute lifetime (started_at+max_lifetime_ms) enforced inside currentLease for renew/settle/assert; expires_at clamped at deadline. TTL 60s, heartbeat 20s, claim-bound and P15.10-B defaults unchanged. R2-F1a..j prove: pause->resume mid-await zero decision, terms drift blocked, stale-fence assert/renew/settle blocked, review rollback after revoke with legit decision, no strategy on authority loss, deterministic checkpoint guarded, no post-deadline extend/settle, two-connection fencing, manual regression. No merge, no deploy, driver opt-in OFF."
+  "description": "R3 remediation on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3): F2/F3 CONFIRMED by prepatch repro (12/14 R3 tests failed pre-fix). F2: objective budget_microusd_cap was never bound at the real pre-spend boundary \u2014 assertAndReserve sees the governed task's actual route/executor identity but only summed business/department/agent/mission scopes. Fix inside the same atomic check-and-reserve txn: lineage resolved fresh (mission.bound_open_id -> work_open_binding -> workforce_allocation -> oap:<oid> cap); attributed liability (HELD/COMMITTED @reserved, SETTLED @settled, RELEASED skipped) + new reservation > cap -> FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED; UNKNOWN/unbounded under a cap -> FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED (never $0). P13 hard-stops untouched; no second cost engine. Driver dispatchCostBound now route-aware (max over reachable executor/route/model profiles); stays a preliminary admission check only. F3: wired driver reported READY. New driver.readiness() derives runnable solely from canonical evidence (cursor READY + policy effective + queue not quarantined/blocked + provable cost binding + budget room); scheduler.status and both MC routes consume it \u2014 driver_integrated added, driver_ready/objective_runnable mean runnable, driver_missing carries real reasons, backward compatible. F1b: corrected R2 drift test to legitimate disable->configure->enable mid-await instead of invalid configure-on-ENABLED; F1 impl untouched. R1/R2 audited patches kept. No merge/deploy; driver opt-in OFF."
 }

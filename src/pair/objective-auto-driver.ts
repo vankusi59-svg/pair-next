@@ -53,7 +53,9 @@ import type { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import {
   LEASE_MAX_LIFETIME_CAP_MS,
   LEASE_STATE,
+  SCHEDULER_CURSOR,
   SCHEDULER_RECEIPT,
+  WAKE_STATE,
   faultCode,
   readSchedulerRow,
   sanitizeFaultReason,
@@ -297,6 +299,47 @@ export class ObjectiveAutoDriverService {
     }, op, key);
   }
 
+  /** P15.10-C R3 F3 — truthful objective-level readiness: the driver
+   *  being WIRED is a deployment fact, not proof the objective can be
+   *  driven. Runnable is derived only from canonical evidence: scheduler
+   *  cursor READY, policy effective, queue not quarantined/blocked,
+   *  provable cost binding + budget room under a money cap. Owner
+   *  revalidation runs first — a non-owner never learns readiness. */
+  readiness(objectiveId: string, actor: string): Record<string, unknown> {
+    return this.deps.store.immediate(() => {
+      const st = this.deps.policy.status(objectiveId, actor); // owner proof
+      const reasons: string[] = [];
+      const cursor = readSchedulerRow<Row>(this.deps.store, SCHEDULER_CURSOR, "LOCAL_PAIR_DB");
+      if (!cursor || cursor.health !== "READY") reasons.push("SCHEDULER_NOT_READY");
+      if (!st.effective) reasons.push("POLICY_NOT_EFFECTIVE");
+      const q = readSchedulerRow<Row>(this.deps.store, WAKE_STATE, objectiveId) as
+        Record<string, unknown> | null;
+      if (q?.queue_state === "QUARANTINED") reasons.push("OBJECTIVE_QUARANTINED");
+      else if (q?.queue_state === "BLOCKED_AUTHORITY") reasons.push("BLOCKED_AUTHORITY");
+      const limits = st.limits as { budget_microusd_cap?: number } | null;
+      if (limits?.budget_microusd_cap != null) {
+        const usage = this.usage(objectiveId);
+        if (usage.cost_unverified) reasons.push("COST_UNVERIFIED");
+        const bound = this.dispatchCostBound();
+        if (bound === null) reasons.push("COST_BINDING_UNVERIFIED");
+        else if (usage.microusd + bound > limits.budget_microusd_cap) {
+          reasons.push("BUDGET_EXHAUSTED");
+        }
+      }
+      return {
+        // Both the canonical readiness record (integrated/runnable/
+        // reasons) and the exact shape scheduler.status consumes —
+        // this object feeds the status projection directly.
+        enabled: true,
+        integrated: true,
+        driver_missing: [],
+        runnable: reasons.length === 0,
+        objective_runnable: reasons.length === 0,
+        reasons,
+      };
+    });
+  }
+
   /** Read-only status — never mutates. Owner-scoped: the policy
    *  status call re-proves actor === owner_authority_id and throws
    *  FAIL_CLOSED_POLICY_FORBIDDEN before any driver state is read. */
@@ -380,19 +423,28 @@ export class ObjectiveAutoDriverService {
   }
 
   /** Provable worst-case microusd bound for ONE new dispatch — the max
-   *  reserve over eligible executors. An executor whose billing is
-   *  UNKNOWN or unbounded makes the bound unprovable → fail closed. */
+   *  reserve over every (executor, route) pairing the governed task
+   *  could take: billingFor resolves route profile → model profile →
+   *  executor profile, so executor-only (route=null) bounds would miss
+   *  a pricier route override (R3 F2). Any UNKNOWN or unbounded billing
+   *  on a reachable pairing makes the bound unprovable → fail closed.
+   *  The admission bound stays a PRELIMINARY check — the real cap
+   *  enforcement lives inside assertAndReserve per governed task. */
   private dispatchCostBound(): number | null {
     let bound = 0;
+    const routeIds = (this.deps.store.list("route") as Row[])
+      .map((r) => String(r.route_id));
     for (const executorId of this.deps.executors) {
-      const b = this.deps.billingFor(executorId, null);
-      if (b.mode === "UNKNOWN" || b.unbounded) return null;
-      if (b.mode === "METERED_API") {
-        const reserve = Number(b.profile?.reserve_microusd ?? 0);
-        const fixed = Number(b.profile?.fixed_microusd ?? 0);
-        bound = Math.max(bound, reserve > 0 ? reserve : fixed);
+      for (const routeId of [null, ...routeIds] as Array<string | null>) {
+        const b = this.deps.billingFor(executorId, routeId);
+        if (b.mode === "UNKNOWN" || b.unbounded) return null;
+        if (b.mode === "METERED_API") {
+          const reserve = Number(b.profile?.reserve_microusd ?? 0);
+          const fixed = Number(b.profile?.fixed_microusd ?? 0);
+          bound = Math.max(bound, reserve > 0 ? reserve : fixed);
+        }
+        // SUBSCRIPTION/FREE/UNMETERED: provably no per-dispatch money.
       }
-      // SUBSCRIPTION/FREE/UNMETERED: provably no per-dispatch money.
     }
     return bound;
   }

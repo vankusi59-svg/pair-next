@@ -251,19 +251,33 @@ export class ObjectiveAutoScheduler {
   }
 
   status(objectiveId: string, actor: string,
-    driver?: { enabled: boolean; driver_missing: string[] },
+    driver?: {
+      enabled: boolean; driver_missing: string[];
+      /** P15.10-C R3 F3 — optional truthful per-objective runnable
+       *  proof from the wired driver's readiness(). When absent the
+       *  projection stays deployment-level honest: integrated but
+       *  runnable unproven. */
+      runnable?: boolean; reasons?: string[];
+    },
   ): Record<string, unknown> {
     return this.proof(() => {
       const status = this.policy.status(objectiveId, actor);
       const q = this.queue(objectiveId);
       const lease = this.lease(objectiveId);
       const cursor = readSchedulerRow<Row>(this.store, SCHEDULER_CURSOR, GLOBAL);
-      const driverReady = driver?.enabled === true;
+      const integrated = driver?.enabled === true;
+      const runnable = integrated && driver?.runnable === true;
       return {
         objective_id: objectiveId, scheduler_mode: OBJECTIVE_SCHEDULER_MODE,
         scheduler_ready: cursor ? cursor.health === "READY" : false,
-        consumer_ready: driverReady, driver_ready: driverReady,
-        driver_missing: driverReady ? [] : (driver?.driver_missing ?? status.driver_missing),
+        // Deployment integration vs objective-level runnable truth —
+        // READY is only claimed when canonical evidence proves both.
+        driver_integrated: integrated,
+        consumer_ready: runnable, driver_ready: runnable,
+        objective_runnable: runnable,
+        driver_missing: integrated
+          ? (driver?.reasons ?? [])
+          : (driver?.driver_missing ?? status.driver_missing),
         policy_effective: status.effective, policy_version: status.policy_version,
         terms_current: status.terms_current,
         queue_state: q?.queue_state ?? "UNREGISTERED",

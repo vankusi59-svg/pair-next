@@ -107,7 +107,7 @@ export interface MissionControlServerDeps {
    *  in the serve script); absent → scheduler status keeps reporting
    *  driver_ready:false and the auto-driver route 404s. Read-only
    *  surface — no mutating driver route exists. */
-  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "driverStatus">;
+  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "driverStatus" | "readiness">;
   /** TEST-ONLY: deterministic CEO decision transport for the
    *  lazily-composed operating service. Production bootstrap never
    *  sets it (the route resolves the real codex-cli model); HTTP
@@ -1253,10 +1253,15 @@ export function createMissionControlServer(
         const schedulerActor = rawSchedulerActor.startsWith("operator:")
           ? rawSchedulerActor
           : `operator:${rawSchedulerActor}`;
+        // P15.10-C R3 F3 — readiness is the driver's OWN truthful
+        // proof for THIS objective, not a deployment flag.
+        const r = deps.autoDriver?.readiness(m[1]!, schedulerActor);
         return void json(res, 200, {
           auto_scheduler: deps.autoScheduler.status(m[1]!, schedulerActor,
             deps.autoDriver
-              ? { enabled: true, driver_missing: [] }
+              ? { enabled: true, driver_missing: [],
+                  runnable: r?.objective_runnable === true,
+                  reasons: (r?.reasons as string[] | undefined) ?? [] }
               : undefined),
         });
       }
@@ -1298,15 +1303,20 @@ export function createMissionControlServer(
           ? rawPolicyActor
           : `operator:${rawPolicyActor}`;
         autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
-        // Truthful driver readiness (C7): when a real driver is wired the
-        // deployment-level AUTO_DRIVER_NOT_INTEGRATED marker is stale — the
-        // policy service predates the driver and cannot see it. COST_BINDING
-        // is not resolved by the driver's presence alone, so it stays.
-        const policyWithDriver = (st: ReturnType<ObjectiveAutoPolicyService["status"]>) => deps.autoDriver
-          ? { ...st, driver_ready: true,
-              driver_missing: ((st.driver_missing as string[] | undefined) ?? [])
-                .filter((x) => x !== "AUTO_DRIVER_NOT_INTEGRATED") }
-          : st;
+        // P15.10-C R3 F3 — truthful readiness: the driver's own
+        // canonical proof for this objective (scheduler READY + policy
+        // effective + no quarantine + provable cost binding + budget
+        // room), never just "a driver process exists".
+        const policyObjectiveId = m[1]!;
+        const policyWithDriver = (st: ReturnType<ObjectiveAutoPolicyService["status"]>) => {
+          if (!deps.autoDriver) return st;
+          const r = deps.autoDriver.readiness(policyObjectiveId, policyActor);
+          return { ...st,
+            driver_ready: r.objective_runnable === true,
+            objective_runnable: r.objective_runnable === true,
+            driver_integrated: true,
+            driver_missing: ((r.reasons as string[] | undefined) ?? []) };
+        };
         if (method === "GET") {
           return void json(res, 200, {
             auto_policy: policyWithDriver(autoPolicySvc.status(m[1]!, policyActor)),
