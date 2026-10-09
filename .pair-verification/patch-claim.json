@@ -1,10 +1,10 @@
 {
-  "claim_id": "DEV_VERIFICATION_HARNESS_V1",
-  "title": "Deterministic repo-local development verification harness: classify/risk/claim/invariants/packs -> tsc/build -> report",
+  "claim_id": "DEV_WORKFLOW_POLICY_V1",
+  "title": "Root AGENTS.md makes the Development Verification Harness the mandatory completion contract for agents",
   "affected_surfaces": ["DEV_INFRA"],
   "required_tests": [
-    "src/__tests__/dev-verification.test.ts"
+    "src/__tests__/dev-workflow-policy.test.ts"
   ],
   "invariants": [],
-  "description": "Adds npm run verify:change -- --base <sha>: deterministic change classification into PAIR surfaces, HIGH/MEDIUM/LOW risk rules, a permanent invariant registry (~11) mapped to existing tests, patch-claim manifest enforcement (required tests must exist and pass — mandatory on any non-empty diff since R1), module test-pack selection, tsc/build gates, and a deterministic .pair-verification/report.md|json verdict. R1 hardening: per-invocation result paths (no stale JSON reuse), zero-executed-test and unaccounted-exit fail closed, scripts/ unknown files classify conservatively HIGH, mission-control/telegram runtime seams are HIGH. No CI, no server, no LLM judgment, no production-authority change."
+  "description": "Adds repository-root AGENTS.md: every code/config change must record its BASE SHA, update the current .pair-verification/patch-claim.json inside the BASE..HEAD diff, run npm run verify:change -- --base <BASE_SHA>, and fix until READY_FOR_INDEPENDENT_AUDIT before reporting complete; NOT_READY forbids completion claims; no self-merge without explicit operator instruction after independent audit. Failure contract and stale-claim prohibition documented. Proof: src/__tests__/dev-workflow-policy.test.ts asserts the contract text exists at the repo root. Docs-only/dev-infra change — no production PAIR runtime behavior altered."
 }

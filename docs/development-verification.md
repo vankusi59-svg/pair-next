@@ -4,6 +4,10 @@ Deterministic repo-local verification for PAIR Next changes. It is
 **development tooling only** — it has no production authority and never
 touches Planner/Gate/Executor behavior.
 
+Agent policy: running this harness is the mandatory completion contract
+for agents working in this repository — see `AGENTS.md` at the repo
+root.
+
 ## Normal patch workflow
 
 1. Write/update `.pair-verification/patch-claim.json` describing what the
