@@ -727,7 +727,10 @@ describe("dev-verification harness V1 R2", () => {
         numFailedTestSuites:
           assertions.some((a) => a.status === "failed") ? 1 : 0,
         numTotalTestSuites: 1,
-        testResults: [{ name: "x", status: "failed",
+        testResults: [{
+          name: "x",
+          status: assertions.some((a) => a.status === "failed")
+            ? "failed" : "passed",
           assertionResults: assertions }],
         ...counters,
       }));

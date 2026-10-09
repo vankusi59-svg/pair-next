@@ -100,12 +100,13 @@ function evaluateRun({ proc, resultPath, file }) {
   const failedNames = [];
   let knownBaseline = 0;
   let executed = 0;
-  let suitesFailed = 0;
+  let zeroAssertFailedSuites = 0;
   for (const tr of results.testResults ?? []) {
-    if (tr.status === "failed") suitesFailed += 1;
+    let suiteFailed = 0;
     for (const a of tr.assertionResults ?? []) {
       executed += 1;
       if (a.status !== "failed") continue;
+      suiteFailed += 1;
       const name = `${a.title ?? a.fullName ?? "?"}`;
       const ent = matchTol(tr.name, name);
       if (ent) {
@@ -116,6 +117,13 @@ function evaluateRun({ proc, resultPath, file }) {
           file ? name : `${tr.name}: ${name}`.slice(0, 160));
       }
     }
+    // A suite marked failed with zero failed assertions is a crash/
+    // collect/hook failure — real failure evidence with no assertion
+    // record, so it must count as unaccounted, never hide behind a
+    // tolerated baseline.
+    if (tr.status === "failed" && suiteFailed === 0) {
+      zeroAssertFailedSuites += 1;
+    }
   }
   if (executed === 0) {
     return { status: "FAIL", executed, failed: 1, knownBaseline,
@@ -124,15 +132,14 @@ function evaluateRun({ proc, resultPath, file }) {
   }
   // Reconcile reporter counters with parsed evidence — a crash/failure
   // that produced no failed assertion still counts; a tolerated baseline
-  // can never hide unrelated failure evidence (R2.F).
+  // can never hide unrelated failure evidence (R2.F). Suite-level errors
+  // are proven locally: tr.status==="failed" with zero failed assertions.
   const assertionFailed = failedNames.length + knownBaseline;
   const counterFailed = typeof results.numFailedTests === "number"
     ? results.numFailedTests : assertionFailed;
-  const counterSuites = typeof results.numFailedTestSuites === "number"
-    ? results.numFailedTestSuites : suitesFailed;
   const unaccounted = failedNames.length +
     Math.max(0, counterFailed - assertionFailed) +
-    Math.max(0, counterSuites - suitesFailed);
+    zeroAssertFailedSuites;
   if (unaccounted > 0) {
     return { status: "FAIL", executed, failed: unaccounted, knownBaseline,
       failures: [
