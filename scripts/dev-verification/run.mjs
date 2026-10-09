@@ -8,7 +8,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   HarnessError, TOLERATED_FAILURES, planVerification, validateClaim,
 } from "./lib.mjs";
@@ -62,18 +62,18 @@ const readFreshResults = (path) => {
   }
 };
 
-// Tolerated failures for one vitest testResults entry. Selector runs match
-// the relative file; full-suite runs report absolute paths → suffix match.
-const toleratedFor = (trName, file) =>
-  TOLERATED_FAILURES.filter((t) =>
-    t.file === file || t.file === trName ||
-    String(trName).endsWith(`/${t.file}`));
-
 /**
  * Non-vacuous verdict rules for one vitest invocation. PASS requires ALL:
  * fresh result JSON from THIS invocation (path deleted before the run),
  * ≥1 executed assertion, zero unaccounted failures, and any non-zero exit
  * explained only by registered known-baseline failures.
+ *
+ * Exact accounting (R2): each tolerated failure is consumed against a
+ * per-entry `max` budget (default 1) — a registered baseline occurring
+ * more times than expected becomes ordinary FAIL. Reporter counters
+ * (numFailedTests/numFailedTestSuites) must reconcile with the failed
+ * evidence actually parsed; counters beyond accounted evidence are
+ * unaccounted suite/process failures → FAIL. UNACCOUNTED == 0 always.
  */
 function evaluateRun({ proc, resultPath, file }) {
   const noResult = !existsSync(resultPath);
@@ -89,18 +89,32 @@ function evaluateRun({ proc, resultPath, file }) {
     return { status: "FAIL", executed: 0, failed: 1, knownBaseline: 0,
       failures: [error] };
   }
+  // Per-entry budget: a baseline signature may be consumed at most `max`
+  // times per invocation; beyond that it is ordinary failure (R2.G).
+  const budget = TOLERATED_FAILURES.map((t) => ({ t, left: t.max ?? 1 }));
+  const matchTol = (trName, name) =>
+    budget.find((b) => b.left > 0 &&
+      (b.t.file === file || b.t.file === trName ||
+        String(trName).endsWith(`/${b.t.file}`)) &&
+      b.t.pattern.test(name));
   const failedNames = [];
   let knownBaseline = 0;
   let executed = 0;
+  let suitesFailed = 0;
   for (const tr of results.testResults ?? []) {
-    const tol = toleratedFor(tr.name, file);
+    if (tr.status === "failed") suitesFailed += 1;
     for (const a of tr.assertionResults ?? []) {
       executed += 1;
       if (a.status !== "failed") continue;
       const name = `${a.title ?? a.fullName ?? "?"}`;
-      if (tol.some((t) => t.pattern.test(name))) knownBaseline += 1;
-      else failedNames.push(
-        file ? name : `${tr.name}: ${name}`.slice(0, 160));
+      const ent = matchTol(tr.name, name);
+      if (ent) {
+        ent.left -= 1;
+        knownBaseline += 1;
+      } else {
+        failedNames.push(
+          file ? name : `${tr.name}: ${name}`.slice(0, 160));
+      }
     }
   }
   if (executed === 0) {
@@ -108,9 +122,27 @@ function evaluateRun({ proc, resultPath, file }) {
       failures: ["selector matched zero executed tests — a selector or " +
         "pattern with no coverage is never a PASS"] };
   }
-  if (failedNames.length) {
-    return { status: "FAIL", executed, failed: failedNames.length,
-      knownBaseline, failures: failedNames.slice(0, 8) };
+  // Reconcile reporter counters with parsed evidence — a crash/failure
+  // that produced no failed assertion still counts; a tolerated baseline
+  // can never hide unrelated failure evidence (R2.F).
+  const assertionFailed = failedNames.length + knownBaseline;
+  const counterFailed = typeof results.numFailedTests === "number"
+    ? results.numFailedTests : assertionFailed;
+  const counterSuites = typeof results.numFailedTestSuites === "number"
+    ? results.numFailedTestSuites : suitesFailed;
+  const unaccounted = failedNames.length +
+    Math.max(0, counterFailed - assertionFailed) +
+    Math.max(0, counterSuites - suitesFailed);
+  if (unaccounted > 0) {
+    return { status: "FAIL", executed, failed: unaccounted, knownBaseline,
+      failures: [
+        ...failedNames.slice(0, 8),
+        ...(unaccounted > failedNames.length
+          ? [`${unaccounted - failedNames.length} failure(s) reported by ` +
+            "vitest counters with no matching failed assertion — " +
+            "unaccounted suite/process failure"]
+          : []),
+      ] };
   }
   if (proc.status !== 0 && knownBaseline === 0) {
     // Non-zero exit with no recorded failed assertion = unaccounted
@@ -296,11 +328,19 @@ export function verify(opts = {}) {
     throw new HarnessError("VERIFY_EMPTY_DIFF",
       `no changed files between ${base} and ${head} — nothing to verify`);
   }
+  // The claim path must be repo-local — no traversal, no absolute path
+  // outside the repository (R2.B).
+  const claimArg = opts.claimPath ?? DEFAULT_CLAIM;
+  const claimAbs = resolve(root, claimArg);
+  const claimRel = relative(root, claimAbs);
+  if (claimRel === "" || claimRel.startsWith("..") || isAbsolute(claimRel)) {
+    throw new HarnessError("VERIFY_CLAIM_PATH",
+      `claim path must resolve inside the repository: ${claimArg}`);
+  }
   let claimRaw = null;
-  const claimFile = join(root, opts.claimPath ?? DEFAULT_CLAIM);
-  if (existsSync(claimFile)) {
+  if (existsSync(claimAbs)) {
     try {
-      claimRaw = JSON.parse(readFileSync(claimFile, "utf8"));
+      claimRaw = JSON.parse(readFileSync(claimAbs, "utf8"));
     } catch (e) {
       throw new HarnessError("VERIFY_CLAIM_SCHEMA",
         `unparseable claim file: ${e.message}`);
@@ -312,8 +352,17 @@ export function verify(opts = {}) {
   // ever be produced. Fails closed before any test execution.
   if (!claim) {
     throw new HarnessError("VERIFY_PATCH_CLAIM_REQUIRED",
-      `non-empty diff requires ${DEFAULT_CLAIM} ` +
+      `non-empty diff requires ${claimRel} ` +
       "declaring what the patch claims to prove");
+  }
+  // The claim must belong to the CURRENT change: the claim file itself
+  // must be added/modified inside the resolved BASE..HEAD diff. A claim
+  // committed by an earlier PR is stale and can never certify this one —
+  // freshness authority is the diff, never mtime/claim_id/title (R2.A/E).
+  if (!files.includes(claimRel)) {
+    throw new HarnessError("VERIFY_PATCH_CLAIM_STALE",
+      `${claimRel} is not added/modified in ${base}..${head} — ` +
+      "a stale claim cannot certify the current change");
   }
   const plan = planVerification({
     changedFiles: files, claim, full: opts.full ?? false,

@@ -6,7 +6,9 @@
  */
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import {
+  existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -586,4 +588,230 @@ describe("dev-verification harness V1 R1", () => {
         rmSync(root, { recursive: true, force: true });
       }
     });
+});
+
+/** R2 — current-diff claim binding, non-vacuous claims, exact
+ *  known-baseline accounting. */
+describe("dev-verification harness V1 R2", () => {
+  const PASS_JSON = {
+    numTotalTests: 1, numPassedTests: 1, numFailedTests: 0,
+    numFailedTestSuites: 0, numTotalTestSuites: 1,
+    testResults: [{ name: "x", status: "passed",
+      assertionResults: [{ title: "ok", status: "passed" }] }],
+  };
+  const passExec = (root: string) => (_b: string, argv: string[]) => {
+    const oi = argv.findIndex((a) => String(a).startsWith("--outputFile="));
+    if (oi >= 0) {
+      writeFileSync(join(root, String(argv[oi]).slice(13)),
+        JSON.stringify(PASS_JSON));
+    }
+    return { status: 0 };
+  };
+  const writeClaim = (root: string, rel = ".pair-verification/patch-claim.json") => {
+    mkdirSync(join(root, rel.split("/").slice(0, -1).join("/")),
+      { recursive: true });
+    writeFileSync(join(root, rel), JSON.stringify({
+      claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
+      required_tests: [`${T}dev-verification.test.ts`], invariants: [],
+    }));
+  };
+  const gitDiff =
+    (out: string) =>
+    (...a: string[]) =>
+      a[0] === "rev-parse" ? "a".repeat(40) : a[0] === "diff" ? out : "";
+
+  it("R2-1. stale tracked claim from BASE → VERIFY_PATCH_CLAIM_STALE", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaim(root); // valid claim exists but NOT in the diff
+      expect(() =>
+        verify({
+          baseArg: "a".repeat(40), git: gitDiff("src/pair/x.ts\n") as never,
+          exec: passExec(root) as never, root,
+        }),
+      ).toThrow(/VERIFY_PATCH_CLAIM_STALE/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-2. claim modified inside BASE..HEAD → accepted as current", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaim(root);
+      const res = verify({
+        baseArg: "a".repeat(40),
+        git: gitDiff(
+          ".pair-verification/patch-claim.json\nsrc/pair/x.ts\n") as never,
+        exec: passExec(root) as never, root,
+      });
+      expect(res.plan.claim?.claim_id).toBe("X_1");
+      expect(res.verdict).toBe("READY_FOR_INDEPENDENT_AUDIT");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-3. custom --claim path not in diff → VERIFY_PATCH_CLAIM_STALE", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaim(root, "custom-claim.json");
+      expect(() =>
+        verify({
+          baseArg: "a".repeat(40), git: gitDiff("src/pair/x.ts\n") as never,
+          exec: passExec(root) as never, root,
+          claimPath: "custom-claim.json",
+        }),
+      ).toThrow(/VERIFY_PATCH_CLAIM_STALE/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-4. custom repo-local claim in diff → accepted", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      writeClaim(root, "custom-claim.json");
+      const res = verify({
+        baseArg: "a".repeat(40),
+        git: gitDiff("custom-claim.json\nsrc/pair/x.ts\n") as never,
+        exec: passExec(root) as never, root,
+        claimPath: "custom-claim.json",
+      });
+      expect(res.plan.claim?.claim_id).toBe("X_1");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-5. outside-repo / traversal claim path → typed failure", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      for (const p of ["../evil.json", "/tmp/evil.json", "sub/../../x.json"]) {
+        expect(() =>
+          verify({
+            baseArg: "a".repeat(40), git: gitDiff("src/pair/x.ts\n") as never,
+            exec: passExec(root) as never, root, claimPath: p,
+          }),
+        ).toThrow(/VERIFY_CLAIM_PATH/);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-6/7/8. required_tests must exist and contain ≥1 selector", () => {
+    expect(() =>
+      validateClaim({ claim_id: "X_1", title: "x" }),
+    ).toThrow(/VERIFY_CLAIM_SCHEMA/);
+    expect(() =>
+      validateClaim({ claim_id: "X_1", title: "x", required_tests: [] }),
+    ).toThrow(/VERIFY_CLAIM_SCHEMA/);
+    const ok = validateClaim({
+      claim_id: "X_1", title: "x",
+      required_tests: [`${T}dev-verification.test.ts`],
+    });
+    expect(ok?.required_tests).toHaveLength(1);
+  });
+
+  const execWithAssertions =
+    (root: string, assertions: { title: string; status: string }[],
+      counters: object = {}) =>
+    (_b: string, argv: string[]) => {
+      const oi = argv.findIndex((a) => String(a).startsWith("--outputFile="));
+      if (oi < 0) return { status: 0 };
+      writeFileSync(join(root, String(argv[oi]).slice(13)), JSON.stringify({
+        numTotalTests: assertions.length,
+        numPassedTests: assertions.filter((a) => a.status === "passed").length,
+        numFailedTests: assertions.filter((a) => a.status === "failed").length,
+        numFailedTestSuites:
+          assertions.some((a) => a.status === "failed") ? 1 : 0,
+        numTotalTestSuites: 1,
+        testResults: [{ name: "x", status: "failed",
+          assertionResults: assertions }],
+        ...counters,
+      }));
+      return { status: assertions.some((a) => a.status === "failed") ? 1 : 0 };
+    };
+  const planForF4 = () =>
+    planFor([`${T}dev-verification.test.ts`], {
+      claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
+      required_tests: [`${T}pair-f4-delivery-provenance.test.ts`],
+      invariants: [],
+    });
+  const CRASH = "R5.1-crash: a fault between evidence append and row write";
+
+  it("R2-11. known baseline + unrelated failed assertion → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const { groups, verdict } = executePlan({
+        plan: planForF4(),
+        exec: execWithAssertions(root, [
+          { title: CRASH, status: "failed" },
+          { title: "unrelated real regression", status: "failed" },
+        ]) as never,
+        root,
+      });
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-12. baseline + unaccounted suite-level failure → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const { groups, verdict } = executePlan({
+        plan: planForF4(),
+        exec: execWithAssertions(root, [
+          { title: CRASH, status: "failed" },
+        ], { numFailedTests: 2 }) as never, // counter beyond evidence
+        root,
+      });
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(groups.claim.results[0].failures.join(" "))
+        .toContain("unaccounted");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-13. baseline multiplicity above registered max → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const { groups, verdict } = executePlan({
+        plan: planForF4(),
+        exec: execWithAssertions(root, [
+          { title: CRASH, status: "failed" },
+          { title: CRASH, status: "failed" }, // second occurrence exceeds max:1
+        ], { numFailedTests: 2 }) as never,
+        root,
+      });
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(groups.claim.results[0].knownBaseline).toBe(1);
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R2-14. baseline disappears → normal PASS (no phantom tolerance)", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const { groups, verdict } = executePlan({
+        plan: planForF4(),
+        exec: execWithAssertions(root, [
+          { title: "ok", status: "passed" },
+        ]) as never,
+        root,
+      });
+      expect(groups.claim.results[0].status).toBe("PASS");
+      expect(groups.claim.results[0].knownBaseline).toBe(0);
+      expect(verdict).toBe("READY_FOR_INDEPENDENT_AUDIT");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

@@ -399,10 +399,13 @@ export const PACKS = {
  *  reported as KNOWN_BASELINE, never counted as FAIL. */
 export const TOLERATED_FAILURES = [
   { file: `${T}pair-f4-delivery-provenance.test.ts`,
-    pattern: /R5\.1-crash/,
+    pattern: /R5\.1-crash/, max: 1,
     note: "documented flake — fault-injection timing on this sandbox" },
   { file: `${T}pair-p5.test.ts`,
-    pattern: /DSH registration|CODEX registration/,
+    pattern: /DSH registration/, max: 1,
+    note: "probe expects executables absent; sandbox has them installed" },
+  { file: `${T}pair-p5.test.ts`,
+    pattern: /CODEX registration/, max: 1,
     note: "probe expects executables absent; sandbox has them installed" },
 ];
 
@@ -463,6 +466,12 @@ export function validateClaim(raw) {
     }
   }
   const requiredTests = arr(c.required_tests, "required_tests");
+  // A patch claim without executable proof is vacuous: required_tests
+  // must name at least one selector the harness can actually run.
+  if (requiredTests.length === 0) {
+    throw new HarnessError("VERIFY_CLAIM_SCHEMA",
+      "required_tests must declare at least one executable selector");
+  }
   const invariants = arr(c.invariants, "invariants");
   const invIds = new Set(INVARIANTS.map((i) => i.id));
   for (const i of invariants) {
