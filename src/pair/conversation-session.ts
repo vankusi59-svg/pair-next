@@ -88,6 +88,12 @@ export type ConversationMessageRow = {
   idempotency_key: string | null;
   message_digest: string;
   created_at: string;
+  /** P15.8-F R1 — durable, NON-authority proposal outcome attached to
+   *  the assistant reply. Descriptive model output only (untrusted):
+   *  it is NOT part of message_digest, carries no execution authority,
+   *  and exists solely so a replayed turn can recover the same proposal
+   *  without a second model call. Only the internal writer may set it. */
+  proposal?: { goal: string } | null;
 };
 
 function assertStr(field: string, value: unknown, { empty = false } = {}): string {
@@ -511,6 +517,9 @@ export class ConversationSessionService {
       body: string;
       idempotency_key?: string | null;
       correlation_id?: string | null;
+      /** P15.8-F R1 — descriptive proposal outcome, atomically bound to
+       *  the reply row. Assistant role only; never authority. */
+      proposal?: { goal: string } | null;
     }): ConversationMessageRow;
   } {
     const svc = this;
@@ -521,6 +530,7 @@ export class ConversationSessionService {
         body: string;
         idempotency_key?: string | null;
         correlation_id?: string | null;
+        proposal?: { goal: string } | null;
       }): ConversationMessageRow {
         if (input.role !== "assistant" && input.role !== "system") {
           throw new IntegrityError("FAIL_CLOSED_CONVERSATION_ROLE", String(input.role));
@@ -533,6 +543,7 @@ export class ConversationSessionService {
           body: input.body,
           idempotency_key: input.idempotency_key,
           correlation_id: input.correlation_id,
+          proposal: input.proposal,
         });
       },
     };
@@ -593,9 +604,17 @@ export class ConversationSessionService {
     body: string;
     idempotency_key?: string | null;
     correlation_id?: string | null;
+    proposal?: { goal: string } | null;
   }): ConversationMessageRow {
     const sessionId = assertStr("session_id", input.session_id);
     const body = assertStr("body", input.body);
+    // Descriptive proposal outcome — bounded, untrusted, non-authority.
+    const proposal = input.proposal === undefined || input.proposal === null
+      ? null
+      : { goal: assertStr("proposal.goal", input.proposal.goal) };
+    if (proposal !== null && proposal.goal.length > CONVERSATION_MAX_BODY_CHARS) {
+      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "proposal_goal_chars");
+    }
     if (body.length > CONVERSATION_MAX_BODY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "body_chars");
     }
@@ -667,6 +686,7 @@ export class ConversationSessionService {
           idempotency_key: idemKey,
         }),
         created_at: now,
+        ...(proposal !== null ? { proposal } : {}),
       };
       const written = this.store.put(CONVERSATION_MESSAGE_ENTITY, messageId, msg);
       this.store.put(

@@ -576,7 +576,11 @@ export class TelegramConversationService {
     // resolution, update-bound idempotency, ref + bounded presentation).
     // Ambiguous or absent projects mint NOTHING — the bridge presents
     // the candidate list and the operator chooses via /draft.
-    if (turn.proposal && !turn.reused) {
+    // R1 — the durable proposal replays after crash too: prepareDraft
+    // converges onto the SAME draft (tg:draft:<upd> request id) and the
+    // SAME deterministic ref id, so a redelivered update never
+    // downgrades a committed proposal into ordinary chat.
+    if (turn.proposal) {
       const res = resolveProposalProject(this.deps.store);
       if (res.kind === "resolved") {
         const prepared = this.prepareDraft({
@@ -671,6 +675,12 @@ export class TelegramConversationService {
       const existing = this.deps.store.tryGet(TELEGRAM_CONFIRM_REF_ENTITY, refId);
       if (existing) {
         this.assertCanonicalRef(existing);
+        // R1 — a CONSUMED ref is terminal: never resurrect confirm
+        // authority on a redelivery (replay converges onto the same
+        // consumed row instead).
+        if (String(existing.state) === "CONSUMED") {
+          return existing as unknown as TelegramConfirmRefRow;
+        }
         // Re-mint of the same draft's ref resets it ACTIVE with no prompt
         // binding — convergent, one ref authority per draft.
         const next = {

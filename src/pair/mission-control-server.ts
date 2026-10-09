@@ -1308,8 +1308,10 @@ export function createMissionControlServer(
           // the reasoning service: deterministic project resolution then
           // the canonical MissionDraftService mints the draft. Bound to
           // the operator message id → a replayed turn converges onto the
-          // same draft; ambiguous/no project mints nothing.
-          if (out.proposal && conv.drafts && !out.reused) {
+          // same draft; ambiguous/no project mints nothing. R1: the
+          // durable proposal replays too — a crash before the first
+          // materialization is recovered by the idempotent mint below.
+          if (out.proposal && conv.drafts) {
             const projRes = resolveProposalProject(deps.store!);
             if (projRes.kind === "resolved") {
               try {

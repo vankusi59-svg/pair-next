@@ -467,3 +467,176 @@ describe("P15.8-F — parser edge cases", () => {
     expect(draftsOf(s)).toHaveLength(0);
   });
 });
+
+/* ====================== R1 — durable replay ====================== */
+
+describe("P15.8-F R1 — durable proposal outcome (A1/A2 crash windows)", () => {
+  it("A1: crash before draft mint → replayed turn recovers proposal → exactly one draft, zero missions", async () => {
+    const s = freshStack("a1");
+    const inv = proposingInvoker();
+    const deps = convDeps(s, inv);
+    const sid = deps.sessions.createSession({ owner_operator_id: WEBOP }).session_id;
+
+    // Turn commits reply + durable proposal; caller "crashes" before
+    // materialization (service-level call — no /turns route).
+    const first = await deps.reasoning.turn({
+      session_id: sid, operator_id: WEBOP, body: "viết file a.txt",
+      idempotency_key: "k1", correlation_id: null });
+    expect(first.proposal?.goal).toContain("viết file");
+    expect(draftsOf(s)).toHaveLength(0);
+
+    // Fresh services over the same store = process restart. Retrying
+    // the same turn replays — proposal recovered from the reply row,
+    // ZERO second model call.
+    const deps2 = convDeps(s, inv);
+    const again = await deps2.reasoning.turn({
+      session_id: sid, operator_id: WEBOP, body: "viết file a.txt",
+      idempotency_key: "k1", correlation_id: null });
+    expect(again.reused).toBe(true);
+    expect(again.proposal?.goal).toBe(first.proposal?.goal);
+    expect(inv.calls).toHaveLength(1);
+
+    // Materialization converges onto ONE canonical draft.
+    const d1 = deps2.drafts.createDraft({
+      session_id: sid, operator_id: WEBOP, project_id: s.projectId,
+      goal: again.proposal!.goal, client_request_id: `proposal:${again.message.message_id}` });
+    const d2 = deps2.drafts.createDraft({
+      session_id: sid, operator_id: WEBOP, project_id: s.projectId,
+      goal: again.proposal!.goal, client_request_id: `proposal:${again.message.message_id}` });
+    expect(d2.draft_id).toBe(d1.draft_id);
+    expect(draftsOf(s)).toHaveLength(1);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+
+  it("A2: telegram crash after draft+ref commit → same update replays draft_proposal, same draft_id+ref_id", async () => {
+    const s = freshStack("a2");
+    const inv = proposingInvoker();
+    const deps = convDeps(s, inv);
+    const port = await serve(s, deps);
+
+    const rid = ++upd;
+    const first = await json(await post(port, "/api/telegram/conversation/ingress", {
+      chat_id: CHAT, chat_type: "private", update_id: rid,
+      text: "TRUY CẬP cafef.vn thống kê 5 bài" }, hdrTg()));
+    expect((first.body as { kind: string }).kind).toBe("draft_proposal");
+    const d1 = first.body as { draft: { draft_id: string }; ref: { ref_id: string } };
+    expect(draftsOf(s)).toHaveLength(1);
+    // Simulated bridge crash: presentation/cursor never completed.
+
+    // Redeliver the SAME update — semantic replay, not a downgrade.
+    const second = await json(await post(port, "/api/telegram/conversation/ingress", {
+      chat_id: CHAT, chat_type: "private", update_id: rid,
+      text: "TRUY CẬP cafef.vn thống kê 5 bài" }, hdrTg()));
+    expect(second.status).toBe(200);
+    const r2 = second.body as { kind: string; draft: { draft_id: string }; ref: { ref_id: string } };
+    expect(r2.kind).toBe("draft_proposal");
+    expect(r2.draft.draft_id).toBe(d1.draft.draft_id);
+    expect(r2.ref.ref_id).toBe(d1.ref.ref_id);
+    expect(draftsOf(s)).toHaveLength(1);
+    expect(inv.calls).toHaveLength(1);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+});
+
+describe("P15.8-F R1 — web idempotency (B1/B2/B3)", () => {
+  it("B1: same turn request + same idempotency key twice → 1 msg/reply/model call/draft", async () => {
+    const s = freshStack("b1");
+    const inv = proposingInvoker();
+    const deps = convDeps(s, inv);
+    const port = await serve(s, deps);
+    const sid = await webSession(port);
+
+    const t1 = await json(await post(port, `/api/conversations/${sid}/turns`,
+      { body: "viết file a.txt", idempotency_key: "submit-1" }, hdrWeb()));
+    const t2 = await json(await post(port, `/api/conversations/${sid}/turns`,
+      { body: "viết file a.txt", idempotency_key: "submit-1" }, hdrWeb()));
+    expect(t1.status).toBe(200);
+    expect(t2.status).toBe(200);
+    const b1 = t1.body as { message: { message_id: string }; reused: boolean;
+      proposal?: { draft?: { draft_id: string } } };
+    const b2 = t2.body as { message: { message_id: string }; reused: boolean;
+      proposal?: { draft?: { draft_id: string } } };
+    expect(b1.message.message_id).toBe(b2.message.message_id);
+    expect(b2.reused).toBe(true);
+    expect(b2.proposal?.draft?.draft_id).toBe(b1.proposal?.draft?.draft_id);
+    expect(inv.calls).toHaveLength(1);
+    expect(draftsOf(s)).toHaveLength(1);
+    // Exactly one operator + one assistant message in the session.
+    expect(s.store.list("conversation_message")
+      .filter((m) => String(m.session_id) === sid)).toHaveLength(2);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+
+  it("B2: ambiguous selection replayed → one draft; B3: new submit same text → new turn", async () => {
+    const s = freshStack("b23", true);
+    const inv = proposingInvoker();
+    const deps = convDeps(s, inv);
+    const port = await serve(s, deps);
+    const sid = await webSession(port);
+
+    const t = await json(await post(port, `/api/conversations/${sid}/turns`,
+      { body: "viết file a.txt", idempotency_key: "submit-amb" }, hdrWeb()));
+    const msgId = (t.body as { message: { message_id: string } }).message.message_id;
+    expect(draftsOf(s)).toHaveLength(0);
+
+    // Picker replay: same client_request_id → same draft, no dup.
+    const pick = () => post(port, `/api/conversations/${sid}/drafts`, {
+      project_id: s.projectId2, goal: "viết file a.txt",
+      client_request_id: `proposal:${msgId}` }, hdrWeb());
+    const p1 = await json(await pick());
+    const p2 = await json(await pick());
+    expect(p1.status).toBe(200);
+    expect((p2.body as { draft: { draft_id: string } }).draft.draft_id)
+      .toBe((p1.body as { draft: { draft_id: string } }).draft.draft_id);
+    expect(draftsOf(s)).toHaveLength(1);
+
+    // B3 — a NEW submit with identical text is a new intentional turn:
+    // idempotency binds request identity, not text equality.
+    const t3 = await json(await post(port, `/api/conversations/${sid}/turns`,
+      { body: "viết file a.txt", idempotency_key: "submit-amb-2" }, hdrWeb()));
+    expect(t3.status).toBe(200);
+    const b3 = t3.body as { message: { message_id: string }; reused: boolean };
+    expect(b3.reused).toBe(false);
+    expect(b3.message.message_id).not.toBe(msgId);
+    expect(inv.calls).toHaveLength(2);
+  });
+});
+
+describe("P15.8-F R1 — expiry + regression pins", () => {
+  it("expired PENDING_CONFIRMATION proposal draft cannot confirm → zero missions", async () => {
+    const s = freshStack("exp");
+    const sessions = new ConversationSessionService(s.store);
+    let nowMs = Date.parse("2026-10-09T00:00:00Z");
+    const drafts = new MissionDraftService({
+      conversation: sessions, control: s.control, store: s.store,
+      now: () => new Date(nowMs).toISOString(), draft_ttl_s: 60 });
+    const sid = sessions.createSession({ owner_operator_id: WEBOP }).session_id;
+    const d = drafts.createDraft({
+      session_id: sid, operator_id: WEBOP, project_id: s.projectId,
+      goal: "viết file a.txt", client_request_id: "proposal:exp" });
+    // Advance past TTL → the draft is terminally expired.
+    nowMs += 120_000;
+    await expect(drafts.confirmDraft({
+      session_id: sid, operator_id: WEBOP, draft_id: d.draft_id,
+      expected_digest: d.draft_digest, kind: "explicit" } as never))
+      .rejects.toThrow(/EXPIRED|FAIL_CLOSED/);
+    expect(missionsOf(s)).toHaveLength(0);
+  });
+
+  it("pins: Task Entry direct path needs NO conversational confirmation; composition without conversation still serves missions", async () => {
+    const s = freshStack("pins");
+    // Conversation deps entirely absent — same composition as before F.
+    const port = await serve(s, {});
+    const prev = await json(await post(port, "/api/missions/preview", {
+      project_id: s.projectId, goal: "direct task entry",
+      granted_permissions: ["FILE_OPERATIONS"] }, hdrWeb()));
+    expect(prev.status).toBe(200);
+    const pv = prev.body as { preview_id: string; plan_digest: string };
+    const conf = await json(await post(port, "/api/missions", {
+      confirm_plan: { preview_id: pv.preview_id, digest: pv.plan_digest } }, hdrWeb()));
+    expect(conf.status).toBe(200);
+    expect(missionsOf(s)).toHaveLength(1);
+    // No conversation entities were needed or created.
+    expect(s.store.list("conversation_mission_draft")).toHaveLength(0);
+  });
+});

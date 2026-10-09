@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError, getOperatorId } from "../api";
 import { useApi } from "../hooks/useApi";
@@ -133,9 +133,17 @@ export function Chat() {
   // mints it. A resolved proposal already landed as a real draft below.
   const [pendingProposal, setPendingProposal] = useState<{
     goal: string;
+    /** operator message id of the proposing turn — the picker's
+     *  client_request_id binds to it so a retried selection converges
+     *  onto one canonical draft. */
+    message_id: string;
     candidates: { project_id: string; name: string }[];
     project_id: string;
   } | null>(null);
+  // P15.8-F R1-B — one submit owns ONE idempotency key, reused across a
+  // retry of THAT submit (e.g. a dropped connection). A later
+  // intentional send — even of identical text — gets a fresh key.
+  const pendingSubmit = useRef<{ key: string; body: string } | null>(null);
 
   const showErr = (e: unknown) =>
     setErr(e instanceof ApiError ? `${e.code}: ${e.detail}` : String(e));
@@ -250,11 +258,21 @@ export function Chat() {
       // One canonical turn: the operator message and the assistant reply
       // are committed by the reasoning service — a retry of the same
       // request replays the same rows (turn idempotency).
-      const r = await api.conversationTurn(activeId, { body: text });
+      const key =
+        pendingSubmit.current && pendingSubmit.current.body === text
+          ? pendingSubmit.current.key
+          : crypto.randomUUID();
+      pendingSubmit.current = { key, body: text };
+      const r = await api.conversationTurn(activeId, {
+        body: text,
+        idempotency_key: key,
+      });
+      pendingSubmit.current = null;
       setBody("");
       if (r.proposal?.project_candidates && r.proposal.project_candidates.length > 0) {
         setPendingProposal({
           goal: r.proposal.goal,
+          message_id: r.message.message_id,
           candidates: r.proposal.project_candidates,
           project_id: "",
         });
@@ -441,6 +459,10 @@ export function Chat() {
                             goal: pendingProposal.goal,
                             granted_permissions: ["FILE_WRITE", "FILE_READ"],
                             authorized_workspaces: proj ? [String(proj.root_location)] : [],
+                            // R1-B — bound to the proposing turn: a retried
+                            // or duplicated selection request converges
+                            // onto ONE canonical draft.
+                            client_request_id: `proposal:${pendingProposal.message_id}`,
                           });
                           setPendingProposal(null);
                           await loadThread(activeId);

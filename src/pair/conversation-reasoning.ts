@@ -556,7 +556,12 @@ export class ConversationReasoningService {
           `reply row under ${replyId} fails canonical binding`,
         );
       }
-      return { message, reply: p, reused: true };
+      // F-R1 — the proposal outcome is DURABLE on the reply row, so a
+      // replay recovers the same proposal without a second model call.
+      // It is untrusted descriptive state — never authority.
+      return p.proposal
+        ? { message, reply: p, reused: true, proposal: p.proposal }
+        : { message, reply: p, reused: true };
     }
 
     // 3. Bounded context — the canonical tail: jump straight to the last
@@ -641,12 +646,16 @@ export class ConversationReasoningService {
     // 5. Persist through the trusted writer — the ONLY mint of
     //    assistant/system rows. A raced mint of the same reply key is
     //    judged by the canonical replay/conflict rule inside appendCore.
+    // F-R1 — the proposal commits ATOMICALLY with the reply row: the
+    // crash window "reply committed → proposal lost" is closed. It is
+    // descriptive state on the row, not digest-bearing authority.
     const reply = conv.internalWriter().appendMessage({
       session_id: sessionId,
       role: "assistant",
       body: replyText,
       idempotency_key: replyKey,
       correlation_id: input.correlation_id,
+      proposal,
     });
     return proposal
       ? { message, reply, reused: false, proposal }
