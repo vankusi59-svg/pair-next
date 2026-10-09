@@ -106,3 +106,97 @@ Outcome progression observed live: claim → pass → `EXECUTION_EVIDENCE`/`AWAI
 7. De-quarantine after fixing the root cause: `pause` → `resume` (bumps policy_version → new observation → `WAITING_CONSUMER`).
 
 Completion code: `PAIR_NEXT_P15_10_C_READY_FOR_INDEPENDENT_AUDIT`
+
+---
+
+---
+
+## R1 remediation — F1: lease heartbeat + fenced post-await commit (HEAD f3abd00)
+
+**Root cause (verified by failing tests before patching — commit dee91f9):** the autonomous lease expired 60s after claim while a CEO model invocation may run up to the configured 900s timeout; nothing renewed it, and nothing revalidated autonomous authority inside the serialized commit transaction after the model await — a PAUSE/REVOKE/expiry landing mid-call still committed the decision, workstream decomposition, and downstream mission authority.
+
+### F1-A — bounded lease heartbeat
+- Driver starts an unref'd `setInterval` at **20_000ms** ONLY after a valid claim, calling the existing `scheduler.renew(handle)` — every renewal re-proves token hash, fence, worker/boot identity, claimed generation, expiry, and policy/owner/terms/objective pins inside `currentLease`. No heartbeat before claim, no lease creation, no DB write inside the existing 15s no-op window.
+- Retryable SQLite contention (`isSqliteContentionError`) defers to the next tick; any other renewal fault marks the worker unauthorized and aborts settlement — the pass is never settled under a lost lease, and the external model call is never assumed stopped.
+- The timer is stopped in `finally` on every exit path — no leak past settle/release/exception, no renew after stop or fence loss.
+
+### F1-B — bounded claim-time lease lifetime (not a TTL raise)
+- `claim(..., { max_lifetime_ms })` — optional bound persisted on the lease row; **default 300_000** (exact P15.10-B behavior), min 60_000, absolute cap **960_000**; invalid values fail closed at claim.
+- Driver binds `ceoTimeoutMs + 60_000 finalization allowance` (validated 5_000–900_000, mirrors `PAIR_CEO_CLI_TIMEOUT_MS` bounds) → default bound **360_000**, max **960_000** — covers the configured CEO timeout + bounded finalization, never infinite renewal, never a global 300s TTL for all leases.
+- `renew()` enforces the per-lease bound; expiry/TTL still 60s.
+
+### F1-C — fenced commit guard inside the commit transaction (mandatory)
+- `ceoCycle.runCycle` accepts optional `autonomous_commit_guard` invoked **FIRST inside the same serialized `store.immediate` transaction** that performs the final post-await commit — before re-observe, decision `put`, workstream decomposition, and attempt settle. A throw rolls the whole commit back; the invoked attempt then settles **REJECTED** through the existing canonical path — canonical attempt accounting + terminal/UNKNOWN semantics preserved, no blind replay, zero new decision/binding/mission.
+- `runReview` forwards the guard verbatim (identical protection on the review-driven CEO path); `pass()` wires `authorityGate` into both CEO boundaries; manual CEO callers omitting the param are unchanged.
+
+### F1-D — await-boundary audit
+- New driver deps: `ceoTimeoutMs` (env-validated at boot via `ceoCliTimeoutMs()`) and `reconcileStaleAttempts(objectiveId)` — invoked pre-admission so a restart never re-invokes while an attempt is STARTED/UNKNOWN (recovery only through canonical settle anchors). `createDefaultObjectiveOperatingService` now also returns `ceoCycle`; serve wires both lazily.
+- Two-connection fencing proof: after worker A's lease expires and worker B (separate SQLite connection, separate service stack) claims fence+1, A's handle cannot renew or settle. Heartbeat of worker A cannot renew B's lease (token/fence/identity re-proof). Settle dedup stays per-fence — no double settle.
+
+### R1 test evidence — `src/__tests__/pair-p15-10c-r1.test.ts` (10 tests, all PASS)
+| Test | Proof |
+|---|---|
+| R1-F1a | >60s model call keeps lease alive via heartbeat; exactly-once settle; ≥2 RENEW receipts on canonical rows |
+| R1-F1b (driver) | owner pause mid-await → pass aborts, objective QUARANTINED, zero SETTLE receipts |
+| R1-F1b (service) | guard fires inside commit txn → post-revoke commit blocked; attempt REJECTED; zero decision/binding rows |
+| R1-F1c | missed heartbeat → lease expires → late worker cannot settle; owner de-quarantine → new worker reclaims; exactly one SETTLE |
+| R1-F1d | two independent SQLite connections: A loses lease → B claims fence+1 → A cannot renew/settle |
+| R1-F1e | heartbeat lifecycle: contention retryable, zero renews after settle, no timer leak |
+| R1-F1e2 | heartbeat stops after pass fault; stale-authority renew → permanent loss path |
+| R1-F1f | bounded lifetime: default 300s enforced; driver bound 960s enforced; bad bounds fail at claim; invalid ceoTimeout rejected |
+| R1-F1d2 | worker A's heartbeat cannot renew B's lease |
+| R1-F1d3 | restart re-run while invocation in flight → `CEO_DECISION_INFLIGHT`, zero second model call |
+
+Deterministic clock + fault injection; every proof reads canonical DB rows (lease/wake/receipt/decision/attempt), not timers alone.
+
+### Verification (R1)
+`npm run verify:change -- --base 0e27bc6ee236d82633d4aee321ba9cd264adc0c3 --full`
+→ **READY_FOR_INDEPENDENT_AUDIT** — claim PASS, invariants 4/4, claim tests 8/8, regression 21/21, tsc+build PASS, full suite PASS_WITH_KNOWN_BASELINE (+3 pre-existing).
+Regression: p15-10c 19/19, p15-10b 14/14 + r1, p15-10a 44/44, p15-3 102/102, p15-5 58/58, p15-6 69/69.
+
+**Baseline:** audited HEAD `7ea35b2` → R1 HEAD `f3abd00`. BASE `0e27bc6`.
+**Remaining risks:** F2 (route-level cost bound) and F3 (readiness projection) — explicitly out of scope per mandate, still pending independent audit findings.
+
+**Completion code:** `PAIR_NEXT_P15_10_C_R1_HEARTBEAT_PENDING_FINAL_AUDIT`
+**DO NOT MERGE. DO NOT DEPLOY. DO NOT ENABLE AUTONOMOUS DRIVER IN PRODUCTION.**
+
+---
+
+## P15.10-C R2 — FENCED AUTHORITY CLOSURE (HEAD `7f4c4aa`)
+
+Independent-audit remediation for residual F1 findings. All three classified **CONFIRMED** by pre-patch reproduction (6 R2 tests failing on `f3abd00`), then fixed minimally and re-proven.
+
+### Per-finding verdict
+
+| Finding | Verdict | Pre-patch evidence | Fix |
+|---|---|---|---|
+| F1.1 — commit guard lacks claimed-version binding | **CONFIRMED** | R2-F1a: PAUSE→RESUME mid-await → effective policy at V+2 → decision committed under stale authority | `scheduler.assertLeaseAuthority(handle)` — narrow read-only assertion reusing the single `currentLease` proof (state/fence/worker/boot/token/generation/checkpoint/expiry/lifetime + policy_version/terms_digest/owner/objective_version pins); `authorityGate` calls it first |
+| F1.2 — review commit txn unguarded | **CONFIRMED** | R2-F1d/e/f: revoke between CEO decision commit and `commitReview` → review receipt + strategy revision still landed | `commitReview` accepts the same `autonomous_commit_guard`, fired FIRST inside its `store.immediate`; forwarded from `runReview` input; deterministic zero-model checkpoints equally covered |
+| F1.3 — lease outlives absolute lifetime | **CONFIRMED** | R2-F1g/h: renew at T−10s stamped `expires_at` = T+50s past the 60s bound; post-deadline settle passed | absolute lifetime enforced inside `currentLease` (covers renew/settle/assert); `expires_at` clamped at `started_at + max_lifetime_ms` |
+
+### R2 tests (`src/__tests__/pair-p15-10c-r2.test.ts` — 10/10 PASS, canonical DB evidence)
+
+- **F1a** pause→resume mid-await → FAULT, zero decisions, attempt REJECTED, zero settles
+- **F1b** terms/limits drift mid-await → FAULT, zero decisions (pre-existing stale-observation catch, regression proof)
+- **F1c** genuine stale-fence handle → assert/renew/settle all throw
+- **F1d** review rolls back after mid-commit revoke; earlier decision remains legitimately committed; guard invoked in BOTH txns
+- **F1e** strategy revision never lands on authority loss
+- **F1f** deterministic checkpoint (AWAITING_PROGRESS, zero model calls) guarded
+- **F1g** renew cannot stamp expiry past absolute deadline
+- **F1h** post-deadline assert/renew/settle all blocked even with pending expiry
+- **F1i** two independent SQLite connections — genuine fencing
+- **F1j** manual CEO/review callers without guard unchanged
+
+### Invariants
+
+- Old fence / old policy_version / old terms_digest cannot commit — pinned at claim, re-proven inside every commit txn.
+- Revoke or pause blocks new side effects at BOTH commit boundaries (decision + review).
+- Absolute lifetime bound enforced at the canonical lease validation boundary — no unbounded lifetime; TTL stays 60s, heartbeat 20s.
+- Manual (non-guard) callers byte-identical semantics.
+- No parallel validator — `assertLeaseAuthority` wraps `currentLease` only.
+
+### Verification
+
+`verify:change --base 0e27bc6 --full` → **READY_FOR_INDEPENDENT_AUDIT** (HIGH). tsc + build PASS. Full suite +3 known baseline. Regression: p15-10c 19/19, R1 10/10, p15-3 102/102, p15-5 58/58, p15-6 69/69, p15-10a/10b PASS.
+
+Remaining: F2 (route-level cost bound), F3 (readiness projection) — out of R2 scope, pending audit.
