@@ -336,6 +336,9 @@ export class ObjectiveAutoPolicyService {
     }
   }
 
+  /** F8 — anchor actor provenance: operator actors are already
+   *  canonical (`operator:<id>`); system transitions carry a distinct
+   *  `system:<component>` identity. Never double-prefix. */
   private mintAnchor(
     id: string,
     action: string,
@@ -346,13 +349,17 @@ export class ObjectiveAutoPolicyService {
     actor: string,
     objectiveId: string,
   ): void {
+    const actorId =
+      actor.startsWith("operator:") || actor.startsWith("system:")
+        ? actor
+        : `operator:${actor}`;
     this.store.event({
       entity_type: AUTO_POLICY_ENTITY,
       entity_id: id,
       event_type: `OBJECTIVE_AUTO_POLICY_${action.toUpperCase()}`,
       old_state: fromState,
       new_state: next.state,
-      actor: `operator:${actor}`,
+      actor: actorId,
       correlation_id: objectiveId,
       metadata: {
         kind: AUTO_POLICY_EVENT_KIND,
@@ -458,6 +465,45 @@ export class ObjectiveAutoPolicyService {
     };
   }
 
+  /** F7 — single expiry commit path shared by evaluate() and the
+   *  owner-scoped status read (HTTP GET). Commits exactly once with an
+   *  immutable anchor; a racing commit on the same version converges
+   *  to the already-EXPIRED row instead of duplicating. */
+  private expireIfDue(
+    row: PolicyRow,
+    objectiveId: string,
+  ): PolicyRow {
+    if (
+      !(row.state === "ENABLED" || row.state === "PAUSED") ||
+      !row.limits ||
+      Date.parse(row.limits.expires_at) > this.now()
+    ) {
+      return row;
+    }
+    const expired = { ...row, version: Number(row.version) } as PolicyRow;
+    expired.state = "EXPIRED";
+    expired.state_reason = `expires_at ${row.limits.expires_at} passed`;
+    expired.policy_version = row.policy_version + 1;
+    expired.updated_at = utcnow();
+    expired.policy_digest = policyDigestOf(expired);
+    try {
+      this.store.put(AUTO_POLICY_ENTITY, expired.entity_id, expired as unknown as Record<string, unknown> & { version: number }, Number(row.version));
+    } catch (e) {
+      // A concurrent commit won the CAS race — re-read; if it landed
+      // the same EXPIRED state the expiry is still committed once.
+      if ((e as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT") throw e;
+      const cur = this.store.tryGet(AUTO_POLICY_ENTITY, row.entity_id) as
+        unknown as PolicyRow | null;
+      if (cur && cur.state === "EXPIRED") return cur;
+      throw e;
+    }
+    this.mintAnchor(
+      expired.entity_id, "expire", row.state, expired,
+      null, null, "system:auto-policy", objectiveId,
+    );
+    return expired;
+  }
+
   /** Lazy expiry + live binding proof; returns canonical status. */
   evaluate(objectiveId: string): AutoPolicyStatus {
     return this.store.immediate(() => {
@@ -469,27 +515,7 @@ export class ObjectiveAutoPolicyService {
       if (row != null) {
         this.assertCanonicalRow(row);
         this.assertAnchorProof(row);
-      }
-      // Lazy expiry — ENABLED/PAUSED past expires_at commit EXPIRED
-      // once, with an event receipt. Never a silent auto-renew.
-      if (
-        row &&
-        (row.state === "ENABLED" || row.state === "PAUSED") &&
-        row.limits &&
-        Date.parse(row.limits.expires_at) <= this.now()
-      ) {
-        const expired = { ...row, version: Number(row.version) } as PolicyRow;
-        expired.state = "EXPIRED";
-        expired.state_reason = `expires_at ${row.limits.expires_at} passed`;
-        expired.policy_version = row.policy_version + 1;
-        expired.updated_at = utcnow();
-        expired.policy_digest = policyDigestOf(expired);
-        this.store.put(AUTO_POLICY_ENTITY, expired.entity_id, expired as unknown as Record<string, unknown> & { version: number }, Number(row.version));
-        this.mintAnchor(
-          expired.entity_id, "expire", row.state, expired,
-          null, null, "system:auto-policy", objectiveId,
-        );
-        row = expired;
+        row = this.expireIfDue(row, objectiveId);
       }
       return this.toStatus(objectiveId, obj, row);
     });
@@ -502,16 +528,18 @@ export class ObjectiveAutoPolicyService {
       if (!actor || String(actor) !== String(obj.owner_authority_id)) {
         fail("FAIL_CLOSED_POLICY_FORBIDDEN", objectiveId);
       }
-      const row = this.store.tryGet(
+      let row = this.store.tryGet(
         AUTO_POLICY_ENTITY,
         this.policyId(objectiveId),
       ) as unknown as PolicyRow | null;
       if (row != null) {
         this.assertCanonicalRow(row);
         this.assertAnchorProof(row);
+        // F7 — the owner-scoped status read (HTTP GET) applies the same
+        // once-only lazy expiry; reading a policy never mints one and
+        // never mints two EXPIRED commits.
+        row = this.expireIfDue(row, objectiveId);
       }
-      // Reuse toStatus but WITHOUT lazy-expiry write — reads never
-      // mutate; evaluate() performs expiry, status reports state.
       return this.toStatus(objectiveId, obj, row);
     });
   }
@@ -609,6 +637,16 @@ export class ObjectiveAutoPolicyService {
       const next = { ...row } as PolicyRow;
       next.policy_version = row.policy_version + 1;
       next.updated_at = utcnow();
+      // F5 — explicit rebind on any committed owner transition: the
+      // owner proof above already ran against the OBJECTIVE's current
+      // owner_authority_id, so this transition rebinds the policy to
+      // that owner/business and the anchor records it. A reassigned
+      // objective's new owner can thus recover the policy explicitly —
+      // never automatically, never silently ENABLED (state machine
+      // still requires the full transition path). The displaced old
+      // owner fails assertOwner before reaching this point.
+      next.owner_authority_id = String(obj.owner_authority_id);
+      next.business_id = String(obj.business_id);
 
       switch (action) {
         case "configure": {
@@ -654,6 +692,12 @@ export class ObjectiveAutoPolicyService {
         case "disable":
           next.state = "DISABLED";
           next.terms_digest_binding = null;
+          // F6 — HALT lifecycle contract: reset_halt is NOT required
+          // before reactivation; disable also clears the halt record,
+          // so a DISABLED row never carries contradictory stale halt
+          // metadata.
+          next.halt = null;
+          next.state_reason = null;
           break;
         case "revoke":
           next.state = "REVOKED";

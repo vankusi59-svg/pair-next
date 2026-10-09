@@ -800,6 +800,174 @@ describe("A10 — HTTP boundary", () => {
   });
 });
 
+/* ============= F5 — ownership transfer explicit rebind ================ */
+
+describe("F5 — ownership transfer recovery", () => {
+  it("A→B transfer: old owner rejected, new owner rebinds explicitly to ENABLED", () => {
+    const { store, objectives, policy } = fresh("f5");
+    const o = mkObjective(objectives, mkBiz(store));
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    // Owner transfers the objective itself A → B.
+    objectives.amend(oid(o), {
+      business_id: String(o.business_id),
+      patch: { owner_authority_id: "operator:new-owner" },
+      actor: OWNER,
+    });
+    // Old owner can no longer touch the policy.
+    expectFail(
+      () => act(policy, oid(o), "disable", OWNER, { policy_version: 2 }),
+      "FAIL_CLOSED_POLICY_OWNER",
+    );
+    // Policy is not auto-transferred: effective stays false until the
+    // new owner explicitly walks the transition path.
+    const mid = policy.evaluate(oid(o));
+    expect(mid.effective).toBe(false);
+    // New owner rebinds explicitly: disable (allowed from ENABLED) →
+    // row owner rebinds to B via committed anchor, never auto-ENABLED.
+    const d = policy.control({
+      objective_id: oid(o), actor: "operator:new-owner", action: "disable",
+      policy_version: 2, idempotency_key: "b-disable",
+    });
+    expect(d.state).toBe("DISABLED");
+    expect(d.owner_authority_id).toBe("operator:new-owner");
+    const c = policy.control({
+      objective_id: oid(o), actor: "operator:new-owner", action: "configure",
+      policy_version: 3, limits: LIMITS(), idempotency_key: "b-config",
+    });
+    const e = policy.control({
+      objective_id: oid(o), actor: "operator:new-owner", action: "enable",
+      policy_version: 4, idempotency_key: "b-enable",
+    });
+    expect(e.state).toBe("ENABLED");
+    expect(e.effective).toBe(true); // fresh terms binding recaptured
+    // Anchor pins record the new owner — restart re-proof covered by A12.
+    const anchors = store.listEvents("objective_auto_policy", `oap:${oid(o)}`);
+    const enableAnchor = anchors.filter(
+      (a) => (a.metadata as { action?: string })?.action === "enable",
+    );
+    expect(enableAnchor).toHaveLength(2); // original A enable + B enable
+  });
+
+  it("transfer without explicit rebind keeps stale binding — no silent authority", () => {
+    const { store, objectives, policy } = fresh("f5b");
+    const o = mkObjective(objectives, mkBiz(store));
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    objectives.amend(oid(o), {
+      business_id: String(o.business_id),
+      patch: { owner_authority_id: "operator:new-owner" },
+      actor: OWNER,
+    });
+    const st = policy.evaluate(oid(o));
+    expect(st.effective).toBe(false);
+    expect(st.reasons).toContain("BINDING_OWNER_MISMATCH");
+    // Direct re-enable attempt by new owner lands on transition table:
+    // resume/enable from ENABLED is not a legal transition anyway.
+    expectFail(
+      () => policy.control({
+        objective_id: oid(o), actor: "operator:new-owner", action: "enable",
+        policy_version: 2, idempotency_key: "x",
+      }),
+      "FAIL_CLOSED_POLICY_TRANSITION",
+    );
+  });
+});
+
+/* ================== F6 — HALT lifecycle ============================== */
+
+describe("F6 — HALT lifecycle", () => {
+  it("HALTED → disable → configure → enable works; halt metadata never stale", () => {
+    const { store, objectives, policy } = fresh("f6");
+    const o = mkObjective(objectives, mkBiz(store));
+    configure(policy, oid(o));
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    act(policy, oid(o), "halt", OWNER, { policy_version: 2, halt_reason: "stop" });
+    // Contract: reset_halt NOT required — disable also clears halt.
+    const d = act(policy, oid(o), "disable", OWNER, { policy_version: 3 });
+    expect(d.state).toBe("DISABLED");
+    expect(d.halt).toBeNull();
+    const c = act(policy, oid(o), "configure", OWNER, {
+      policy_version: 4, limits: LIMITS(),
+    });
+    const e = act(policy, oid(o), "enable", OWNER, { policy_version: 5 });
+    expect(e.state).toBe("ENABLED");
+    expect(e.effective).toBe(true);
+    expect(e.halt).toBeNull();
+  });
+});
+
+/* ====== F7 — expiry authority over HTTP + concurrency ================ */
+
+describe("F7 — expiry authority", () => {
+  it("owner-scoped status read lazily commits EXPIRED once (HTTP GET path)", () => {
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const { store, objectives, policy } = fresh("f7", () => nowMs);
+    const o = mkObjective(objectives, mkBiz(store));
+    policy.control({
+      objective_id: oid(o), actor: OWNER, action: "configure",
+      limits: { expires_at: "2030-01-02T00:00:00.000Z", max_ceo_calls: 1 },
+      idempotency_key: "c",
+    });
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    nowMs = Date.parse("2030-01-03T00:00:00.000Z");
+    // status() — the HTTP GET path — performs the same once-only commit.
+    const st = policy.status(oid(o), OWNER);
+    expect(st.state).toBe("EXPIRED");
+    expect(st.policy_version).toBe(3);
+    expect(policy.status(oid(o), OWNER).policy_version).toBe(3);
+    const anchors = store.listEvents("objective_auto_policy", `oap:${oid(o)}`)
+      .filter((a) => (a.metadata as { action?: string })?.action === "expire");
+    expect(anchors).toHaveLength(1);
+  });
+
+  it("expired window cannot resume/enable via old path; EXPIRED → configure only", () => {
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const { store, objectives, policy } = fresh("f7b", () => nowMs);
+    const o = mkObjective(objectives, mkBiz(store));
+    policy.control({
+      objective_id: oid(o), actor: OWNER, action: "configure",
+      limits: { expires_at: "2030-01-02T00:00:00.000Z", max_ceo_calls: 1 },
+      idempotency_key: "c",
+    });
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    act(policy, oid(o), "pause", OWNER, { policy_version: 2 });
+    nowMs = Date.parse("2030-01-03T00:00:00.000Z");
+    // resume on a lapsed PAUSED window → typed limits rejection first.
+    expectFail(
+      () => policy.control({
+        objective_id: oid(o), actor: OWNER, action: "resume",
+        policy_version: 3, idempotency_key: "r",
+      }),
+      "FAIL_CLOSED_POLICY_LIMITS",
+    );
+  });
+});
+
+/* ============= F8 — canonical actor provenance ====================== */
+
+describe("F8 — actor provenance", () => {
+  it("anchor actor is canonical exactly once; system expiry distinct", () => {
+    let nowMs = Date.parse("2030-01-01T00:00:00.000Z");
+    const { store, objectives, policy } = fresh("f8", () => nowMs);
+    const o = mkObjective(objectives, mkBiz(store));
+    policy.control({
+      objective_id: oid(o), actor: OWNER, action: "configure",
+      limits: { expires_at: "2030-01-02T00:00:00.000Z", max_ceo_calls: 1 },
+      idempotency_key: "c",
+    });
+    act(policy, oid(o), "enable", OWNER, { policy_version: 1 });
+    nowMs = Date.parse("2030-01-03T00:00:00.000Z");
+    policy.evaluate(oid(o));
+    const anchors = store.listEvents("objective_auto_policy", `oap:${oid(o)}`);
+    const cfg = anchors.find((a) => (a.metadata as { action?: string })?.action === "configure");
+    const exp = anchors.find((a) => (a.metadata as { action?: string })?.action === "expire");
+    expect(cfg?.actor).toBe(OWNER);            // already canonical — no double prefix
+    expect(cfg?.actor).not.toContain("operator:operator:");
+    expect(exp?.actor).toBe("system:auto-policy"); // distinct system identity
+  });
+});
+
 /* ===== O1 — effective honors the objective lifecycle ===== */
 
 describe("O1 — effective = auto eligibility (lifecycle guard)", () => {
