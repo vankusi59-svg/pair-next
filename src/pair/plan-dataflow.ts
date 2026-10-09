@@ -649,8 +649,28 @@ const isRemoteTask = (task: Record<string, unknown>): boolean =>
     REMOTE_CAPABILITY_SET.has(String(c)),
   );
 
-const isDeliveryTask = (task: Record<string, unknown>): boolean =>
+/** HOTFIX 1 — exported so the canonicalize seam (serve-planner) can
+ *  prove raw-vs-canonical delivery omission with the SAME predicate the
+ *  reconcile uses. One definition, one authority. */
+export const isDeliveryTask = (task: Record<string, unknown>): boolean =>
   ((task.required_capabilities as string[]) ?? []).includes(DELIVERY_CAPABILITY);
+
+/** HOTFIX 1 — PAIR-owned provenance stamp on a delivery task that PAIR
+ *  itself injected (true planner omission), e.g.
+ *  `{reason:"DELIVERY_TASK_INJECTED", task_key:"T4", mode:"TEXT",
+ *    authority:"OPERATOR_TELEGRAM_INTENT"}`. Digest-covered, bounded,
+ *  replay byte-stable (preserved verbatim like pair_dataflow_original_
+ *  deps — deliberately NOT in RESERVED_TASK_METADATA_KEYS). A planner
+ *  cannot forge it: the canonicalize seam strips it from every
+ *  planner-emitted task under fresh provenance before re-stamping it on
+ *  the task it actually injected. */
+export const PAIR_DELIVERY_INJECTION_KEY = "pair_delivery_injection";
+export interface DeliveryInjectionRecord {
+  reason: "DELIVERY_TASK_INJECTED";
+  task_key: string;
+  mode: "FILES" | "TEXT";
+  authority: "OPERATOR_TELEGRAM_INTENT";
+}
 
 /** A pure bookkeeping task (goal record) is not content the operator
  *  asked to receive — TEXT-mode delivery never depends on it. */
