@@ -24,6 +24,7 @@ import type { CeoDecisionInvoker } from "./ceo-decision.js";
 import type { ConversationSessionService } from "./conversation-session.js";
 import type { ConversationReasoningService } from "./conversation-reasoning.js";
 import type { MissionDraftService } from "./mission-draft.js";
+import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import {
@@ -1303,6 +1304,45 @@ export function createMissionControlServer(
             correlation_id: body.correlation_id === undefined
               ? undefined : String(body.correlation_id),
           });
+          // P15.8-F — a model proposal is materialized HERE, never inside
+          // the reasoning service: deterministic project resolution then
+          // the canonical MissionDraftService mints the draft. Bound to
+          // the operator message id → a replayed turn converges onto the
+          // same draft; ambiguous/no project mints nothing. R1: the
+          // durable proposal replays too — a crash before the first
+          // materialization is recovered by the idempotent mint below.
+          if (out.proposal && conv.drafts) {
+            const projRes = resolveProposalProject(deps.store!);
+            if (projRes.kind === "resolved") {
+              try {
+                const draft = conv.drafts.createDraft({
+                  session_id: m[1]!,
+                  operator_id: operator,
+                  project_id: projRes.project_id,
+                  goal: out.proposal.goal,
+                  client_request_id: `proposal:${out.message.message_id}`,
+                });
+                return void json(res, 200, {
+                  ...out,
+                  proposal: { goal: out.proposal.goal, draft },
+                });
+              } catch (e) {
+                // A proposal that cannot mint a canonical draft is
+                // surfaced honestly — still zero missions.
+                return void json(res, 200, {
+                  ...out,
+                  proposal: {
+                    goal: out.proposal.goal,
+                    rejected: e instanceof IntegrityError ? e.code : "ERROR",
+                  },
+                });
+              }
+            }
+            return void json(res, 200, {
+              ...out,
+              proposal: { goal: out.proposal.goal, project_candidates: projRes.candidates },
+            });
+          }
           return void json(res, 200, out);
         }
         m = p.match(/^\/api\/conversations\/([^/]+)\/close$/);

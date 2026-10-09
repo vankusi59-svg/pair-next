@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError, getOperatorId } from "../api";
 import { useApi } from "../hooks/useApi";
@@ -128,6 +128,22 @@ export function Chat() {
   const [oldestSeq, setOldestSeq] = useState<number | null>(null);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [draftForm, setDraftForm] = useState<DraftForm | null>(null);
+  // P15.8-F — a model proposal that could not resolve a project: the
+  // operator picks one here, then the existing canonical POST /drafts
+  // mints it. A resolved proposal already landed as a real draft below.
+  const [pendingProposal, setPendingProposal] = useState<{
+    goal: string;
+    /** operator message id of the proposing turn — the picker's
+     *  client_request_id binds to it so a retried selection converges
+     *  onto one canonical draft. */
+    message_id: string;
+    candidates: { project_id: string; name: string }[];
+    project_id: string;
+  } | null>(null);
+  // P15.8-F R1-B — one submit owns ONE idempotency key, reused across a
+  // retry of THAT submit (e.g. a dropped connection). A later
+  // intentional send — even of identical text — gets a fresh key.
+  const pendingSubmit = useRef<{ key: string; body: string } | null>(null);
 
   const showErr = (e: unknown) =>
     setErr(e instanceof ApiError ? `${e.code}: ${e.detail}` : String(e));
@@ -242,10 +258,31 @@ export function Chat() {
       // One canonical turn: the operator message and the assistant reply
       // are committed by the reasoning service — a retry of the same
       // request replays the same rows (turn idempotency).
-      const r = await api.conversationTurn(activeId, { body: text });
+      const key =
+        pendingSubmit.current && pendingSubmit.current.body === text
+          ? pendingSubmit.current.key
+          : crypto.randomUUID();
+      pendingSubmit.current = { key, body: text };
+      const r = await api.conversationTurn(activeId, {
+        body: text,
+        idempotency_key: key,
+      });
+      pendingSubmit.current = null;
       setBody("");
+      if (r.proposal?.project_candidates && r.proposal.project_candidates.length > 0) {
+        setPendingProposal({
+          goal: r.proposal.goal,
+          message_id: r.message.message_id,
+          candidates: r.proposal.project_candidates,
+          project_id: "",
+        });
+      } else {
+        setPendingProposal(null);
+      }
+      if (r.proposal?.rejected) {
+        setErr(`Proposal could not become a draft: ${r.proposal.rejected}`);
+      }
       await loadThread(activeId);
-      void r;
     } catch (e) {
       showErr(e);
     } finally {
@@ -387,6 +424,63 @@ export function Chat() {
                 )}
                 {busy && <div className="state">PAIR is thinking…</div>}
               </div>
+              {pendingProposal && (
+                <div className="draft-card st-pending_confirmation">
+                  <strong>MISSION PROPOSAL — chọn project</strong>
+                  <p className="muted" style={{ margin: "6px 0" }}>
+                    The assistant proposed a mission but multiple projects exist.
+                    Pick the project to mint a governed draft — nothing runs yet.
+                  </p>
+                  <p className="goal">{pendingProposal.goal}</p>
+                  <div className="row">
+                    <select
+                      value={pendingProposal.project_id}
+                      onChange={(e) =>
+                        setPendingProposal({ ...pendingProposal, project_id: e.target.value })}
+                    >
+                      <option value="">— pick a project —</option>
+                      {pendingProposal.candidates.map((c) => (
+                        <option key={c.project_id} value={c.project_id}>
+                          {c.name} ({c.project_id})
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      disabled={busy || !pendingProposal.project_id}
+                      onClick={async () => {
+                        if (!activeId || !pendingProposal.project_id) return;
+                        setBusy(true);
+                        setErr(null);
+                        try {
+                          const proj = (projects.data ?? []).find(
+                            (p) => String(p.project_id) === pendingProposal.project_id);
+                          await api.createDraft(activeId, {
+                            project_id: pendingProposal.project_id,
+                            goal: pendingProposal.goal,
+                            granted_permissions: ["FILE_WRITE", "FILE_READ"],
+                            authorized_workspaces: proj ? [String(proj.root_location)] : [],
+                            // R1-B — bound to the proposing turn: a retried
+                            // or duplicated selection request converges
+                            // onto ONE canonical draft.
+                            client_request_id: `proposal:${pendingProposal.message_id}`,
+                          });
+                          setPendingProposal(null);
+                          await loadThread(activeId);
+                        } catch (e) {
+                          showErr(e);
+                        } finally {
+                          setBusy(false);
+                        }
+                      }}
+                    >
+                      Create draft
+                    </button>
+                    <button className="ghost" onClick={() => setPendingProposal(null)}>
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              )}
               {drafts.length > 0 && (
                 <div className="chat-drafts">
                   <h2 style={{ marginTop: 8 }}>Mission drafts</h2>

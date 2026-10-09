@@ -88,6 +88,14 @@ export type ConversationMessageRow = {
   idempotency_key: string | null;
   message_digest: string;
   created_at: string;
+  /** P15.8-F R2 — durable, NON-authority proposal outcome attached to
+   *  the assistant reply. Descriptive model output only (untrusted), but
+   *  now bound into message_digest: the canonical committed row is the
+   *  ONLY proposal a caller may materialize, and a raced divergent
+   *  proposal conflicts instead of silently converging. No execution
+   *  authority — proposal → draft → explicit confirmation → mission.
+   *  Only the internal writer may set it. */
+  proposal?: { goal: string } | null;
 };
 
 function assertStr(field: string, value: unknown, { empty = false } = {}): string {
@@ -137,7 +145,13 @@ export function conversationSessionDigest(row: {
 }
 
 /** Message provenance — binds session membership, position, author and
- *  content. Self-verified on every read like objective rows. */
+ *  content. Self-verified on every read like objective rows.
+ *  F-R2 — a present proposal participates in the digest: two commits of
+ *  the same deterministic reply identity carrying different proposals
+ *  can never silently converge. Rows WITHOUT proposal digest exactly as
+ *  before (the key is absent, not null) — pre-existing P15.8-A/B rows
+ *  keep their digests. Proposal stays NON-authority: binding it into
+ *  integrity is not execution authority. */
 export function conversationMessageDigest(row: {
   message_id: string;
   session_id: string;
@@ -146,6 +160,7 @@ export function conversationMessageDigest(row: {
   role: string;
   body: string;
   idempotency_key: string | null;
+  proposal?: { goal: string } | null;
 }): string {
   return digest({
     contract: "pair-conversation-message.v1",
@@ -156,7 +171,37 @@ export function conversationMessageDigest(row: {
     role: row.role,
     body: row.body,
     idempotency_key: row.idempotency_key,
+    ...(row.proposal ? { proposal_goal: row.proposal.goal } : {}),
   });
+}
+
+/** Canonical proposal normalizer — the ONLY shape a persisted proposal
+ *  may take. `undefined`/`null` → absent; anything else must be an
+ *  object holding exactly one non-empty bounded `goal` string, and a
+ *  proposal may exist only on an assistant row. Fails closed. */
+export function canonicalProposal(
+  role: string,
+  value: unknown,
+): { goal: string } | null {
+  if (value === undefined || value === null) return null;
+  if (role !== "assistant") {
+    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "proposal_role");
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "proposal_shape");
+  }
+  const keys = Object.keys(value as Record<string, unknown>);
+  if (keys.length !== 1 || keys[0] !== "goal") {
+    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "proposal_keys");
+  }
+  const goal = (value as Record<string, unknown>).goal;
+  if (typeof goal !== "string" || !goal.trim()) {
+    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "proposal_goal");
+  }
+  if (goal.length > CONVERSATION_MAX_BODY_CHARS) {
+    throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "proposal_goal_chars");
+  }
+  return { goal };
 }
 
 /** Deterministic message identity when the caller supplies an idempotency
@@ -268,6 +313,11 @@ export class ConversationSessionService {
         String(row.message_id) !== conversationMessageIdFor(String(row.session_id), row.idempotency_key)) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "message_id");
     }
+    // F-R2 — proposal is part of the integrity contract: assistant-only,
+    // exact single-`goal` shape, bounded; malformed/tampered fails closed
+    // BEFORE the digest check so the failure is typed, not a bare digest
+    // mismatch.
+    const proposal = canonicalProposal(String(row.role), row.proposal);
     const rebuilt = conversationMessageDigest({
       message_id: String(row.message_id),
       session_id: String(row.session_id),
@@ -276,6 +326,7 @@ export class ConversationSessionService {
       role: String(row.role),
       body: String(row.body),
       idempotency_key: row.idempotency_key === undefined ? null : (row.idempotency_key as string | null),
+      proposal,
     });
     if (rebuilt !== row.message_digest) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_DIGEST", String(row.message_id));
@@ -486,6 +537,11 @@ export class ConversationSessionService {
     if (input.role !== undefined && input.role !== "operator") {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_ROLE", String(input.role));
     }
+    // F-R2 — the operator seam never carries a proposal: an injected
+    // field fails closed rather than being silently dropped.
+    if ("proposal" in input) {
+      throw new IntegrityError("FAIL_CLOSED_CONVERSATION_INTEGRITY", "proposal_role");
+    }
     return this.appendCore({
       session_id: input.session_id,
       caller_operator_id: op,
@@ -511,6 +567,9 @@ export class ConversationSessionService {
       body: string;
       idempotency_key?: string | null;
       correlation_id?: string | null;
+      /** P15.8-F R1 — descriptive proposal outcome, atomically bound to
+       *  the reply row. Assistant role only; never authority. */
+      proposal?: { goal: string } | null;
     }): ConversationMessageRow;
   } {
     const svc = this;
@@ -521,6 +580,7 @@ export class ConversationSessionService {
         body: string;
         idempotency_key?: string | null;
         correlation_id?: string | null;
+        proposal?: { goal: string } | null;
       }): ConversationMessageRow {
         if (input.role !== "assistant" && input.role !== "system") {
           throw new IntegrityError("FAIL_CLOSED_CONVERSATION_ROLE", String(input.role));
@@ -533,6 +593,7 @@ export class ConversationSessionService {
           body: input.body,
           idempotency_key: input.idempotency_key,
           correlation_id: input.correlation_id,
+          proposal: input.proposal,
         });
       },
     };
@@ -550,6 +611,7 @@ export class ConversationSessionService {
       role: ConversationMessageRole;
       body: string;
       idemKey: string | null;
+      proposal: { goal: string } | null;
       messageId: string;
     },
   ): ConversationMessageRow {
@@ -576,7 +638,11 @@ export class ConversationSessionService {
       role: input.role,
       body: input.body,
       idempotency_key: input.idemKey,
+      proposal: input.proposal,
     });
+    // F-R2 — same reply identity + divergent proposal → different digest
+    // → typed conflict; a raced writer's local proposal can never be
+    // silently adopted in place of the committed canonical one.
     if (expected !== row.message_digest) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_IDEMPOTENCY_CONFLICT", input.messageId);
     }
@@ -593,9 +659,14 @@ export class ConversationSessionService {
     body: string;
     idempotency_key?: string | null;
     correlation_id?: string | null;
+    proposal?: { goal: string } | null;
   }): ConversationMessageRow {
     const sessionId = assertStr("session_id", input.session_id);
     const body = assertStr("body", input.body);
+    // Descriptive proposal outcome — canonical shape, assistant-only,
+    // untrusted, non-authority. It rides the message digest (F-R2) so a
+    // raced commit carrying a different proposal conflicts loudly.
+    const proposal = canonicalProposal(input.role, input.proposal);
     if (body.length > CONVERSATION_MAX_BODY_CHARS) {
       throw new IntegrityError("FAIL_CLOSED_CONVERSATION_LIMIT", "body_chars");
     }
@@ -623,7 +694,7 @@ export class ConversationSessionService {
     const prior = this.store.tryGet(CONVERSATION_MESSAGE_ENTITY, messageId);
     if (prior) {
       return this.replayOrConflict(prior, {
-        sessionId, ownerOperatorId, role, body, idemKey, messageId,
+        sessionId, ownerOperatorId, role, body, idemKey, proposal, messageId,
       });
     }
 
@@ -636,7 +707,7 @@ export class ConversationSessionService {
       const raced = this.store.tryGet(CONVERSATION_MESSAGE_ENTITY, messageId);
       if (raced) {
         return this.replayOrConflict(raced, {
-          sessionId, ownerOperatorId, role, body, idemKey, messageId,
+          sessionId, ownerOperatorId, role, body, idemKey, proposal, messageId,
         }) as ConversationMessageRow & { version: number };
       }
       if (session.state !== "OPEN") {
@@ -665,8 +736,10 @@ export class ConversationSessionService {
           role,
           body,
           idempotency_key: idemKey,
+          proposal,
         }),
         created_at: now,
+        ...(proposal !== null ? { proposal } : {}),
       };
       const written = this.store.put(CONVERSATION_MESSAGE_ENTITY, messageId, msg);
       this.store.put(
