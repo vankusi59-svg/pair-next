@@ -14,7 +14,7 @@ import {
   classifyFiles, parseSelector, planVerification,
   validateClaim,
 } from "../../scripts/dev-verification/lib.mjs";
-import { executePlan } from "../../scripts/dev-verification/run.mjs";
+import { executePlan, verify } from "../../scripts/dev-verification/run.mjs";
 
 const T = "src/__tests__/";
 const packHas = (plan: { moduleTests: { file: string }[] }, name: string) =>
@@ -24,31 +24,49 @@ const packHas = (plan: { moduleTests: { file: string }[] }, name: string) =>
  *  vitest run it writes a canned --outputFile JSON so runSelector can read
  *  per-test results. `fails` = basename of files whose vitest should fail. */
 const fakeExec =
-  (root: string, opts: { fails?: string[]; toolFails?: string[] } = {}) =>
+  (root: string, opts: {
+    fails?: string[]; toolFails?: string[];
+    vitest?: {
+      assertions?: { title: string; status: string }[];
+      status?: number; write?: boolean; name?: string; for?: string;
+    };
+  } = {}) =>
   (_bin: string, argv: string[]) => {
     const jsonIdx = argv.findIndex((a) =>
       String(a).startsWith("--outputFile="),
     );
     if (jsonIdx >= 0) {
+      const v = opts.vitest ?? {};
       const file = String(argv[2] ?? "");
       const base = file.split("/").pop() ?? "";
+      if (v.write === false && (v.for === undefined || v.for === base)) {
+        return { status: v.status ?? 1 };
+      }
       const fails = (opts.fails ?? []).includes(base);
-      writeFileSync(join(root, argv[jsonIdx].slice(13)), JSON.stringify({
-        numTotalTests: 3,
-        numPassedTests: fails ? 2 : 3,
-        numFailedTests: fails ? 1 : 0,
-        testResults: [{
-          name: file,
-          status: fails ? "failed" : "passed",
-          assertionResults: fails
-            ? [
-              { title: "good test", status: "passed" },
-              { title: "claim-broken regression", status: "failed" },
-            ]
-            : [{ title: "ok", status: "passed" }],
-        }],
-      }));
-      return { status: fails ? 1 : 0 };
+      // `for` scopes scripted vitest output to one file; other selectors
+      // get the default passing result.
+      const scoped = v.for === undefined || v.for === base;
+      const assertions = (scoped ? v.assertions : undefined) ?? (fails
+        ? [
+          { title: "good test", status: "passed" },
+          { title: "claim-broken regression", status: "failed" },
+        ]
+        : [{ title: "ok", status: "passed" }]);
+      const anyFailed = assertions.some((a) => a.status === "failed");
+      writeFileSync(join(root, String(argv[jsonIdx]).slice(13)),
+        JSON.stringify({
+          numTotalTests: assertions.length,
+          numPassedTests:
+            assertions.filter((a) => a.status === "passed").length,
+          numFailedTests:
+            assertions.filter((a) => a.status === "failed").length,
+          testResults: [{
+            name: v.name ?? file,
+            status: anyFailed ? "failed" : "passed",
+            assertionResults: assertions,
+          }],
+        }));
+      return { status: v.status ?? (anyFailed ? 1 : 0) };
     }
     const cmd = `${_bin} ${argv[0] ?? ""}`;
     return {
@@ -304,4 +322,268 @@ describe("dev-verification harness V1", () => {
       }
     }
   });
+});
+
+/** R1 adversarial hardening tests — freshness, non-vacuous proof,
+ *  mandatory patch claim, and conservative script classification. */
+describe("dev-verification harness V1 R1", () => {
+  const claimFor = (required_tests: string[], extra: object = {}) => ({
+    claim_id: "X_1", title: "x", affected_surfaces: ["DEV_INFRA"],
+    required_tests, invariants: [], ...extra,
+  });
+  const runPlan = (plan: object, exec: unknown, root: string) =>
+    executePlan({ plan: plan as never, exec: exec as never, root });
+
+  it("R1-A1. zero-match -t pattern → FAIL (never vacuous PASS)", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const plan = planFor([`${T}dev-verification.test.ts`], claimFor(
+        [`${T}dev-verification.test.ts#NO_SUCH_TEST_PATTERN`]));
+      const { groups, verdict } = runPlan(plan,
+        fakeExec(root, { vitest: { assertions: [] } }), root);
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(groups.claim.results[0].failures[0])
+        .toContain("zero executed tests");
+      expect(groups.tsc.status).toBe("PASS"); // green tsc/build cannot override
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R1-A2. stale JSON from a previous selector can never be reused", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      let vitestCalls = 0;
+      const exec = (_b: string, argv: string[]) => {
+        const oi = argv.findIndex((a) =>
+          String(a).startsWith("--outputFile="));
+        if (oi < 0) return { status: 0 };
+        vitestCalls += 1;
+        if (vitestCalls === 1) {
+          writeFileSync(join(root, String(argv[oi]).slice(13)),
+            JSON.stringify({
+              numTotalTests: 1, numPassedTests: 1, numFailedTests: 0,
+              testResults: [{ name: "x", status: "passed",
+                assertionResults: [{ title: "ok", status: "passed" }] }],
+            }));
+          return { status: 0 };
+        }
+        return { status: 1 }; // crashes before writing JSON
+      };
+      const plan = planFor([`${T}dev-verification.test.ts`], claimFor([
+        `${T}dev-verification.test.ts`,
+        `${T}pair-p15-8b-conversation-reasoning.test.ts`,
+      ]));
+      const { groups, verdict } = runPlan(plan, exec, root);
+      expect(groups.claim.results[0].status).toBe("PASS");
+      expect(groups.claim.results[1].status).toBe("FAIL");
+      expect(groups.claim.results[1].failures[0])
+        .toContain("no result JSON");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R1-A3. result JSON with zero executed assertions → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const plan = planFor([`${T}dev-verification.test.ts`],
+        claimFor([`${T}dev-verification.test.ts`]));
+      const { groups, verdict } = runPlan(plan,
+        fakeExec(root, { vitest: { assertions: [] } }), root);
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R1-A4. non-zero exit with zero recorded failed assertions → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const plan = planFor([`${T}dev-verification.test.ts`],
+        claimFor([`${T}dev-verification.test.ts`]));
+      const { groups, verdict } = runPlan(plan,
+        fakeExec(root, {
+          vitest: { assertions: [{ title: "ok", status: "passed" }],
+            status: 1 },
+        }), root);
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(groups.claim.results[0].failures[0])
+        .toContain("unaccounted process failure");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R1-A5. malformed result JSON → FAIL", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const exec = (_b: string, argv: string[]) => {
+        const oi = argv.findIndex((a) =>
+          String(a).startsWith("--outputFile="));
+        if (oi < 0) return { status: 0 };
+        writeFileSync(join(root, String(argv[oi]).slice(13)),
+          "this is not json{");
+        return { status: 1 };
+      };
+      const plan = planFor([`${T}dev-verification.test.ts`],
+        claimFor([`${T}dev-verification.test.ts`]));
+      const { groups, verdict } = runPlan(plan, exec, root);
+      expect(groups.claim.results[0].status).toBe("FAIL");
+      expect(groups.claim.results[0].failures[0])
+        .toContain("unparseable");
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  const fakeGit = (diffOut: string) =>
+    (...a: string[]) => {
+      if (a[0] === "rev-parse") return "a".repeat(40);
+      if (a[0] === "diff") return diffOut;
+      return "";
+    };
+  const okExec = () => ({ status: 0 });
+
+  it("R1-C1. non-empty diff without patch claim → VERIFY_PATCH_CLAIM_REQUIRED",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      try {
+        expect(() =>
+          verify({
+            baseArg: "a".repeat(40), git: fakeGit("src/pair/x.ts\n") as never,
+            exec: okExec as never, root,
+            claimPath: "does-not-exist.json",
+          }),
+        ).toThrow(/VERIFY_PATCH_CLAIM_REQUIRED/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+  it("R1-C2. zero diff → typed VERIFY_EMPTY_DIFF (never certifies nothing)",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      try {
+        expect(() =>
+          verify({
+            baseArg: "a".repeat(40), git: fakeGit("") as never,
+            exec: okExec as never, root,
+          }),
+        ).toThrow(/VERIFY_EMPTY_DIFF/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+  it("R1-D1. unknown production script → conservative HIGH + broad pack", () => {
+    const p = planFor(["scripts/new-runtime.mjs"]);
+    expect(p.unknownProduction).toContain("scripts/new-runtime.mjs");
+    expect(p.risk).toBe("HIGH");
+    for (const f of PACKS.UNKNOWN_BROAD) expect(packHas(p, f)).toBe(true);
+  });
+
+  it("R1-D2. serve-mission-control + telegram-bridge → HIGH", () => {
+    const mc = planFor(["scripts/serve-mission-control.mjs"]);
+    expect(mc.risk).toBe("HIGH");
+    expect(mc.surfaces).toContain("MISSION_CONTROL");
+    const tg = planFor(["scripts/telegram-bridge.mjs"]);
+    expect(tg.risk).toBe("HIGH");
+    expect(tg.surfaces).toContain("TELEGRAM_INGRESS");
+  });
+
+  it("R1-D3. known dev-only script stays DEV_INFRA (may remain LOW)", () => {
+    const p = planFor(["scripts/dev-verification/lib.mjs"]);
+    expect(p.unknownProduction).toHaveLength(0);
+    expect(p.surfaces).toEqual(["DEV_INFRA"]);
+    expect(p.risk).toBe("LOW");
+  });
+
+  it("R1-D4. mission-control authority seams → HIGH", () => {
+    for (const f of [
+      "src/pair/mission-control.ts",
+      "src/pair/mission-control-server.ts",
+      "src/pair/service.ts",
+      "src/pair/promotion-service.ts",
+    ]) {
+      expect(planFor([f]).risk, f).toBe("HIGH");
+    }
+  });
+
+  it("R1-E. renamed/no-match invariant selector cannot pass vacuously", () => {
+    const root = mkdtempSync(join(tmpdir(), "dv-"));
+    try {
+      const plan = planFor(["src/pair/plan-dataflow.ts"]); // selects -t patterns
+      const { groups, verdict } = runPlan(plan,
+        fakeExec(root, { vitest: { assertions: [] } }), root);
+      expect(groups.invariants.ok).toBe(false);
+      expect(groups.invariants.results.every((r) => r.status === "FAIL"))
+        .toBe(true);
+      expect(verdict).toBe("NOT_READY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("R1-B1. full suite requires fresh result — no JSON after run → FAIL",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      try {
+        // stale leftover from a previous full run must not be reused
+        writeFileSync(join(root, ".vitest-result-full.json"),
+          JSON.stringify({ numTotalTests: 1, testResults: [{ name: "old",
+            assertionResults: [{ title: "x", status: "passed" }] }] }));
+        const exec = (_b: string, argv: string[]) => {
+          const oi = argv.findIndex((a) =>
+            String(a).startsWith("--outputFile="));
+          if (oi < 0) return { status: 0 };
+          const isFull = String(argv[2]).startsWith("--");
+          if (isFull) return { status: 0 }; // exits 0 but writes nothing
+          writeFileSync(join(root, String(argv[oi]).slice(13)),
+            JSON.stringify({ numTotalTests: 1, numPassedTests: 1,
+              numFailedTests: 0, testResults: [{ name: "x",
+                status: "passed",
+                assertionResults: [{ title: "ok", status: "passed" }] }] }));
+          return { status: 0 };
+        };
+        const plan = planFor(["docs/x.md"], claimFor([]), true);
+        const { groups, verdict } = runPlan(plan, exec, root);
+        expect(groups.full.status).toBe("FAIL");
+        expect(groups.full.ok).toBe(false);
+        expect(verdict).toBe("NOT_READY");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+  it("R1-B2. registered known-baseline failure → PASS_WITH_KNOWN_BASELINE",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "dv-"));
+      try {
+        const plan = planFor([`${T}dev-verification.test.ts`], claimFor(
+          [`${T}pair-f4-delivery-provenance.test.ts`]));
+        const { groups, verdict } = runPlan(plan,
+          fakeExec(root, {
+            vitest: {
+              for: "pair-f4-delivery-provenance.test.ts",
+              assertions: [
+                { title: "R5.1-crash: a fault between evidence append " +
+                    "and row write rolls back both", status: "failed" },
+                { title: "ok", status: "passed" },
+              ],
+            },
+          }), root);
+        expect(groups.claim.results[0].status)
+          .toBe("PASS_WITH_KNOWN_BASELINE");
+        expect(groups.claim.results[0].knownBaseline).toBe(1);
+        expect(verdict).toBe("READY_FOR_INDEPENDENT_AUDIT");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
 });

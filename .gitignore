@@ -19,3 +19,4 @@ tsconfig.tsbuildinfo
 .pair-verification/report.json
 .pair-verification/.vitest-result.json
 .vitest-result.json
+.vitest-result-*.json

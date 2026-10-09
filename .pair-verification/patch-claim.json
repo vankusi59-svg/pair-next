@@ -6,5 +6,5 @@
     "src/__tests__/dev-verification.test.ts"
   ],
   "invariants": [],
-  "description": "Adds npm run verify:change -- --base <sha>: deterministic change classification into PAIR surfaces, HIGH/MEDIUM/LOW risk rules, a permanent invariant registry (~11) mapped to existing tests, patch-claim manifest enforcement (required tests must exist and pass), module test-pack selection, tsc/build gates, and a deterministic .pair-verification/report.md|json verdict. No CI, no server, no LLM judgment, no production-authority change."
+  "description": "Adds npm run verify:change -- --base <sha>: deterministic change classification into PAIR surfaces, HIGH/MEDIUM/LOW risk rules, a permanent invariant registry (~11) mapped to existing tests, patch-claim manifest enforcement (required tests must exist and pass — mandatory on any non-empty diff since R1), module test-pack selection, tsc/build gates, and a deterministic .pair-verification/report.md|json verdict. R1 hardening: per-invocation result paths (no stale JSON reuse), zero-executed-test and unaccounted-exit fail closed, scripts/ unknown files classify conservatively HIGH, mission-control/telegram runtime seams are HIGH. No CI, no server, no LLM judgment, no production-authority change."
 }

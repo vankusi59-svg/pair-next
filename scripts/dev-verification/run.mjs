@@ -5,7 +5,9 @@
 // Development tooling only — never consulted by production PAIR.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   HarnessError, TOLERATED_FAILURES, planVerification, validateClaim,
@@ -47,9 +49,84 @@ export function changedFiles(git, base, head) {
 
 /* ---------------- executing a group of test selectors ---------------- */
 
-const RESULT_JSON = ".vitest-result.json";
+// Every invocation gets its OWN deterministic result path, deleted before
+// the run and required to exist afterwards — a stale JSON left over from a
+// previous selector can never be reused as fresh evidence.
+const resultName = (tag) => `.vitest-result-${tag}.json`;
 
-function runSelector(sel, exec, root = ROOT) {
+const readFreshResults = (path) => {
+  try {
+    return { results: JSON.parse(readFileSync(path, "utf8")) };
+  } catch {
+    return { results: null, error: "unparseable vitest result JSON" };
+  }
+};
+
+// Tolerated failures for one vitest testResults entry. Selector runs match
+// the relative file; full-suite runs report absolute paths → suffix match.
+const toleratedFor = (trName, file) =>
+  TOLERATED_FAILURES.filter((t) =>
+    t.file === file || t.file === trName ||
+    String(trName).endsWith(`/${t.file}`));
+
+/**
+ * Non-vacuous verdict rules for one vitest invocation. PASS requires ALL:
+ * fresh result JSON from THIS invocation (path deleted before the run),
+ * ≥1 executed assertion, zero unaccounted failures, and any non-zero exit
+ * explained only by registered known-baseline failures.
+ */
+function evaluateRun({ proc, resultPath, file }) {
+  const noResult = !existsSync(resultPath);
+  const { results, error } = noResult
+    ? { results: null, error: null }
+    : readFreshResults(resultPath);
+  if (noResult) {
+    return { status: "FAIL", executed: 0, failed: 1, knownBaseline: 0,
+      failures: [`vitest produced no result JSON (exit ${proc.status}) — ` +
+        "crash or startup failure"] };
+  }
+  if (!results) {
+    return { status: "FAIL", executed: 0, failed: 1, knownBaseline: 0,
+      failures: [error] };
+  }
+  const failedNames = [];
+  let knownBaseline = 0;
+  let executed = 0;
+  for (const tr of results.testResults ?? []) {
+    const tol = toleratedFor(tr.name, file);
+    for (const a of tr.assertionResults ?? []) {
+      executed += 1;
+      if (a.status !== "failed") continue;
+      const name = `${a.title ?? a.fullName ?? "?"}`;
+      if (tol.some((t) => t.pattern.test(name))) knownBaseline += 1;
+      else failedNames.push(
+        file ? name : `${tr.name}: ${name}`.slice(0, 160));
+    }
+  }
+  if (executed === 0) {
+    return { status: "FAIL", executed, failed: 1, knownBaseline,
+      failures: ["selector matched zero executed tests — a selector or " +
+        "pattern with no coverage is never a PASS"] };
+  }
+  if (failedNames.length) {
+    return { status: "FAIL", executed, failed: failedNames.length,
+      knownBaseline, failures: failedNames.slice(0, 8) };
+  }
+  if (proc.status !== 0 && knownBaseline === 0) {
+    // Non-zero exit with no recorded failed assertion = unaccounted
+    // process failure — never a PASS.
+    return { status: "FAIL", executed, failed: 1, knownBaseline,
+      failures: [`vitest exit ${proc.status} with zero recorded failed ` +
+        "assertions — unaccounted process failure"] };
+  }
+  return {
+    status: knownBaseline > 0 ? "PASS_WITH_KNOWN_BASELINE" : "PASS",
+    executed, failed: 0, knownBaseline,
+    failures: [],
+  };
+}
+
+function runSelector(sel, exec, root = ROOT, tag = "x") {
   const file = sel.file.startsWith("src/") || sel.file.startsWith("apps/")
     ? sel.file : `src/__tests__/${sel.file}`;
   // Test files always live in the real repo; `root` only controls where
@@ -58,40 +135,18 @@ function runSelector(sel, exec, root = ROOT) {
     return { selector: sel, file, status: "MISSING", tests: 0, failed: 1,
       failures: [`selector file not found: ${file}`] };
   }
+  const resultPath = join(root, resultName(tag));
+  rmSync(resultPath, { force: true });
   const argv = ["vitest", "run", file, "--reporter=json",
-    `--outputFile=${RESULT_JSON}`];
+    `--outputFile=${resultName(tag)}`];
   if (sel.pattern) argv.push("-t", sel.pattern);
   const r = exec("npx", argv);
-  let results = null;
-  try {
-    results = JSON.parse(readFileSync(join(root, RESULT_JSON), "utf8"));
-  } catch { /* runner itself failed → exit code is the truth */ }
-  if (!results) {
-    return { selector: sel, file,
-      status: r.status === 0 ? "PASS" : "FAIL",
-      tests: 0, failed: r.status === 0 ? 0 : 1,
-      failures: r.status === 0 ? [] : [`vitest exit ${r.status}`] };
-  }
-  const tolerated = TOLERATED_FAILURES.filter((t) => t.file === file);
-  const failedNames = [];
-  let knownBaseline = 0;
-  for (const tr of results.testResults ?? []) {
-    for (const a of tr.assertionResults ?? []) {
-      if (a.status !== "failed") continue;
-      const name = `${a.title ?? a.fullName ?? "?"}`;
-      if (tolerated.some((t) => t.pattern.test(name))) knownBaseline += 1;
-      else failedNames.push(name);
-    }
-  }
+  const ev = evaluateRun({ proc: r, resultPath, file });
   return {
-    selector: sel, file,
-    status: failedNames.length === 0
-      ? (knownBaseline > 0 ? "PASS_WITH_KNOWN_BASELINE" : "PASS")
-      : "FAIL",
-    tests: results.numTotalTests ?? 0,
-    failed: failedNames.length,
-    knownBaseline,
-    failures: failedNames.slice(0, 8), // bounded summary — never raw stderr
+    selector: sel, file, status: ev.status,
+    tests: ev.executed, failed: ev.failed,
+    knownBaseline: ev.knownBaseline,
+    failures: ev.failures.slice(0, 8), // bounded summary — never raw stderr
   };
 }
 
@@ -183,34 +238,20 @@ function buildReport(ctx, verdict) {
 /* ---------------- orchestration ---------------- */
 
 function runFullSuite(exec, root = ROOT) {
+  const resultPath = join(root, resultName("full"));
+  rmSync(resultPath, { force: true }); // fresh proof — no stale reuse
   const r = exec("npx", ["vitest", "run", "--reporter=json",
-    `--outputFile=${RESULT_JSON}`]);
-  let results = null;
-  try {
-    results = JSON.parse(readFileSync(join(root, RESULT_JSON), "utf8"));
-  } catch { /* noop */ }
-  const failedNames = [];
-  let knownBaseline = 0;
-  for (const tr of results?.testResults ?? []) {
-    // vitest reports absolute paths in testResults[].name — match the
-    // registered relative file by suffix.
-    const tol = TOLERATED_FAILURES.filter((t) =>
-      tr.name === t.file || String(tr.name).endsWith(`/${t.file}`));
-    for (const a of tr.assertionResults ?? []) {
-      if (a.status !== "failed") continue;
-      const nm = `${a.title ?? a.fullName ?? "?"}`;
-      if (tol.some((t) => t.pattern.test(nm))) knownBaseline += 1;
-      else failedNames.push(`${tr.name}: ${nm}`.slice(0, 160));
-    }
-  }
+    `--outputFile=${resultName("full")}`]);
+  const ev = evaluateRun({ proc: r, resultPath, file: null });
   return {
-    status: results && failedNames.length === 0 && r.status !== null
-      ? "PASS" : results ? (failedNames.length ? "FAIL" : "FAIL") : "FAIL",
-    knownBaseline,
-    failures: failedNames,
-    total: results?.numTotalTests ?? 0,
-    pass: results?.numPassedTests ?? 0,
-    ok: !!results && failedNames.length === 0,
+    status: ev.status,
+    knownBaseline: ev.knownBaseline,
+    failures: ev.failures,
+    total: ev.executed,
+    pass: ev.executed - ev.failed - ev.knownBaseline >= 0
+      ? ev.executed - ev.failed - ev.knownBaseline
+      : ev.executed,
+    ok: ev.status === "PASS" || ev.status === "PASS_WITH_KNOWN_BASELINE",
   };
 }
 
@@ -221,11 +262,12 @@ function runFullSuite(exec, root = ROOT) {
  */
 export function executePlan({ plan, exec = defaultExec, root = ROOT }) {
   const groups = {
-    claim: summarize(plan.claimTests.map((s) => runSelector(s, exec, root))),
-    invariants: summarize(plan.invariantTests.map((s) =>
-      runSelector(s, exec, root))),
-    modules: summarize(plan.moduleTests.map((s) =>
-      runSelector(s, exec, root))),
+    claim: summarize(plan.claimTests.map((s, i) =>
+      runSelector(s, exec, root, `c${i}`))),
+    invariants: summarize(plan.invariantTests.map((s, i) =>
+      runSelector(s, exec, root, `i${i}`))),
+    modules: summarize(plan.moduleTests.map((s, i) =>
+      runSelector(s, exec, root, `m${i}`))),
     tsc: runTool("tsc", ["npx", "tsc", "-b"], exec),
     build: runTool("build", ["pnpm", "build"], exec),
     full: plan.fullSuite === "RUN"
@@ -248,6 +290,12 @@ export function verify(opts = {}) {
   const base = resolveBase(git, opts);
   const head = git("rev-parse", "HEAD");
   const files = changedFiles(git, base, head);
+  // Explicit empty-diff policy: the harness never certifies a patch that
+  // does not exist — zero changed files is a typed fail-closed verdict.
+  if (!files.length) {
+    throw new HarnessError("VERIFY_EMPTY_DIFF",
+      `no changed files between ${base} and ${head} — nothing to verify`);
+  }
   let claimRaw = null;
   const claimFile = join(root, opts.claimPath ?? DEFAULT_CLAIM);
   if (existsSync(claimFile)) {
@@ -259,6 +307,14 @@ export function verify(opts = {}) {
     }
   }
   const claim = opts.claim !== undefined ? opts.claim : validateClaim(claimRaw);
+  // Patch Claim is mandatory for a real change: without it the harness
+  // does not know what the patch claims to prove, so no READY verdict can
+  // ever be produced. Fails closed before any test execution.
+  if (!claim) {
+    throw new HarnessError("VERIFY_PATCH_CLAIM_REQUIRED",
+      `non-empty diff requires ${DEFAULT_CLAIM} ` +
+      "declaring what the patch claims to prove");
+  }
   const plan = planVerification({
     changedFiles: files, claim, full: opts.full ?? false,
   });

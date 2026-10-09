@@ -103,7 +103,8 @@ const SURFACE_FILES = {
   "src/pair/secret-policy.ts": ["MISSION_CONTROL"],
   "src/pair/network-requirement.ts": ["PLANNER", "GATE_ROUTER"],
   "src/pair/spec-harness.ts": ["ARTIFACT"],
-  "scripts/serve-mission-control.mjs": ["MISSION_CONTROL"],
+  "scripts/serve-mission-control.mjs":
+    ["MISSION_CONTROL", "MISSION_DRAFT", "CONVERSATION", "TELEGRAM_INGRESS"],
   "scripts/start-pair-live.sh": ["MISSION_CONTROL"],
   "scripts/pair-bootstrap.sh": ["DEV_INFRA"],
   "scripts/telegram-bridge.mjs": ["TELEGRAM_INGRESS"],
@@ -174,6 +175,15 @@ const HIGH_RISK_FILES = new Set([
   "src/pair/goal-contract.ts",
   "src/pair/network-requirement.ts",
   "src/pair/spec-harness.ts",
+  // mission control plane — endpoints mint/confirm/bind missions
+  "src/pair/mission-control.ts",
+  "src/pair/mission-control-server.ts",
+  "src/pair/service.ts",
+  "src/pair/promotion-service.ts",
+  // runtime boundary scripts compose the live authority seams
+  "scripts/serve-mission-control.mjs",
+  "scripts/telegram-bridge.mjs",
+  "scripts/start-pair-live.sh",
 ]);
 const HIGH_RISK_PREFIXES = [
   "src/pair/artifact-", "src/pair/recovery-", "src/pair/conversation-",
@@ -202,8 +212,17 @@ export function classifyFiles(changedFiles) {
       hit.forEach((s) => surfaces.add(s));
       continue;
     }
-    if (isTestOrDocOnly(f) || f.startsWith("scripts/")) {
+    if (isTestOrDocOnly(f)) {
       surfaces.add(f.startsWith("apps/") ? "UI" : "DEV_INFRA");
+      continue;
+    }
+    // Unknown scripts are NOT assumed dev-only: scripts/ also hosts real
+    // runtime seams (serve-mission-control, telegram-bridge, bootstrap).
+    // Unmapped script files get the same conservative treatment as
+    // unmapped production — broad pack + HIGH risk, never silent LOW.
+    if (f.startsWith("scripts/") || f.startsWith("bin/")) {
+      unknownProduction.push(f);
+      surfaces.add("DEV_INFRA");
       continue;
     }
     if (f.startsWith("src/") || f.startsWith("packages/")) {
