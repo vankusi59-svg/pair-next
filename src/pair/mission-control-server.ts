@@ -1298,9 +1298,18 @@ export function createMissionControlServer(
           ? rawPolicyActor
           : `operator:${rawPolicyActor}`;
         autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
+        // Truthful driver readiness (C7): when a real driver is wired the
+        // deployment-level AUTO_DRIVER_NOT_INTEGRATED marker is stale — the
+        // policy service predates the driver and cannot see it. COST_BINDING
+        // is not resolved by the driver's presence alone, so it stays.
+        const policyWithDriver = (st: ReturnType<ObjectiveAutoPolicyService["status"]>) => deps.autoDriver
+          ? { ...st, driver_ready: true,
+              driver_missing: ((st.driver_missing as string[] | undefined) ?? [])
+                .filter((x) => x !== "AUTO_DRIVER_NOT_INTEGRATED") }
+          : st;
         if (method === "GET") {
           return void json(res, 200, {
-            auto_policy: autoPolicySvc.status(m[1]!, policyActor),
+            auto_policy: policyWithDriver(autoPolicySvc.status(m[1]!, policyActor)),
           });
         }
         // F3 — strict boundary typing: NO coercion of authority fields.
@@ -1318,7 +1327,7 @@ export function createMissionControlServer(
           return void json(res, 400, { error: "FAIL_CLOSED_POLICY_SCHEMA" });
         }
         return void json(res, 200, {
-          auto_policy: autoPolicySvc.control({
+          auto_policy: policyWithDriver(autoPolicySvc.control({
             objective_id: m[1]!,
             actor: policyActor,
             action: body.action as string,
@@ -1327,7 +1336,7 @@ export function createMissionControlServer(
             idempotency_key: body.idempotency_key as string,
             halt_scope: body.halt_scope,
             halt_reason: body.halt_reason,
-          }),
+          })),
         });
       }
       if (method === "GET" && p === "/api/budgets") {

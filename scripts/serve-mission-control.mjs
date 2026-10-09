@@ -454,19 +454,26 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
       objectiveDriverMs < 1_000 || objectiveDriverMs > 300_000) {
     throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_DRIVER_MS", String(objectiveDriverMs));
   }
-  const objectiveCeoOps = createDefaultObjectiveOperatingService({
-    store, business, workforce,
-    objectives: business.objectives,
-    workstreams: new ObjectiveWorkstreamService({
-      store, business, workforce, objectives: business.objectives,
-    }),
-  });
+  // Lazy composition — the CEO model catalog is seeded later in boot;
+  // resolving the pass runner must not require it at driver-construction
+  // time (mirrors the ceo-cycle route's lazy ceoOps pattern).
+  let objectiveCeoOps = null;
+  const objectivePassRunner = (input) => {
+    objectiveCeoOps ??= createDefaultObjectiveOperatingService({
+      store, business, workforce,
+      objectives: business.objectives,
+      workstreams: new ObjectiveWorkstreamService({
+        store, business, workforce, objectives: business.objectives,
+      }),
+    });
+    return objectiveCeoOps.service.runObjectivePass(input);
+  };
   objectiveAutoDriver = createObjectiveAutoDriver({
     store,
     objectives: business.objectives,
     policy: objectiveAutoPolicy,
     scheduler: objectiveAutoReconcile.scheduler,
-    runPass: (input) => objectiveCeoOps.service.runObjectivePass(input),
+    runPass: (input) => objectivePassRunner(input),
     executors: [...governed.keys()],
     billingFor: (executorId, routeId) => service.cost.billingFor(executorId, routeId),
     costHaltActive: () =>

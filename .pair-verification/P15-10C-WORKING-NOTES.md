@@ -72,3 +72,17 @@ Auto Policy (ENABLED+effective) → Wake (WAKE_STATE via wakeup tick) → Fair S
 ### OPEN questions being resolved while coding
 - Whether settle() also revalidates policy effective — yes via currentLease→requireCurrent (driver handles: settle failure → try release → else markDegraded; lease expiry + requireRebind INVALIDATED covers revoked mid-flight).
 - Driver BLOCKED cost states write to driver_state row + quarantine label; add labels DRIVER_* to FAULT_LABELS if tests allow, else UNSPECIFIED_FAULT + detail in driver_state row.
+
+## LIVE E2E STATE (Layer 2, in progress)
+- Verify: READY_FOR_INDEPENDENT_AUDIT @ HEAD 58863030cb92 (full suite PASS +3 known baseline). 19/19 p15-10c tests + 381/381 regression pass.
+- Isolated test stack: PID via `pgrep -f "PAIR_MC_PORT=8799"` (log shows worker=objective-auto-driver:37393), PAIR_MC_DIR=/home/ubuntu/pair-mc-p15c-test, port 8799, token=e2e-p15c-test, driver ON (PAIR_OBJECTIVE_AUTO_DRIVER=1, DRIVER_MS=2000, RECONCILE_MS=10000), CODEX_HOME=~/.codex QUALIFIED, DSH=groq+cloudflare, NO telegram.
+- Test entities: BIZ_01M4GBR2DTBJA1SAMZ75KXPTN2, AGT_01M4GBR60DDFWEVYZSDZZYD6KX (executor_binding=CODEX, caps=["*"]), OBJ_A=OBJ_1c21dc9e6ebdd61d20da0fb1, OBJ_B=OBJ_e73fd0aca52c17212bd0e69b (both ACTIVE, owner=operator:e2e-owner).
+- NEXT: enable auto-policy on both (configure limits expires_at+max_ceo_calls:4+max_missions:4+max_retries:2+budget_microusd_cap:5000000 then enable policy_version:1) via POST /api/vnext/objectives/:id/auto-policy x-operator-id:e2e-owner → watch driver claim→pass→CEO codex→mission → check 9 proofs incl B-continues-when-A-paused + restart no-dup.
+- Commit on branch so far: b1ec731 impl + claim-fix commit 58863030 (verify HEAD). Lazy-ceoOps fix in serve-mission-control.mjs is UNCOMMITTED — must commit.
+
+## LIVE E2E RESULTS (Layer 2 — all 9 proofs PASS)
+- Policy enabled on both objectives (v2→4). Cost profiles seeded: DSH=METERED_API reserve 100000, CODEX=SUBSCRIPTION, DEVIN=SUBSCRIPTION.
+- Driver ran full chain live: claim→admit→pass→CEO(codex-cli:gpt-6.1-sol ACCEPTED, state=ACCEPTED)→work_open_binding(by=objective-auto-driver)→mission COMPLETED x2 (MSN_01M4GBWS3Q03D3HP9P10ZYT46M for A, MSN_01M4GBZAQW6F5D2ZMSBYS6ZWZ9 for B)→settle→INSUFFICIENT_VERIFIED_PROGRESS.
+- #1 driver start: boot log "OBJECTIVE AUTO DRIVER: ENABLED" both boots. #2 wake intake: STARTUP_RECONCILE+POLICY_* wakes registered. #4 CEO via qualified transport: attempts model_id=gpt-6.1-sol provider=codex-cli. #5 governed mission seam: OPI binding by driver. #6 cost: CRSV COMMITTED reserved=100000 executor=DEEPSEEK_HARNESS mission_id=MSN...46M + admit receipts auto-driver-admit:<obj>:<fence 3..6>. #7 B-continues-A-paused: A PAUSED→BLOCKED_AUTHORITY while B claimed/passed/dispatched independently. #8 restart no-dup: kill→restart (worker 37393→41530→42479); fences monotonic per obj, no dup receipts, no replayed missions. #9 pause persists across restart (A still BLOCKED_AUTHORITY post-restart).
+- Known env quirk (pre-existing repo, not driver): DSH settings.yaml renamed to .imported after first boot → restart marks DSH providers STALE→boot crash. Fix: cp .imported back to settings.yaml before restart.
+- Truthfulness patch: auto-policy route now overrides driver_ready=true/driver_missing minus AUTO_DRIVER_NOT_INTEGRATED when autoDriver wired; COST_BINDING_UNVERIFIED correctly remains (separate claim).
