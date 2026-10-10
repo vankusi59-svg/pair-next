@@ -141,6 +141,47 @@ export const api = {
       signal ? { signal } : undefined,
       { noAuthPrompt: true },
     ),
+  /* P15.9-B3 — objective detail + reviews + B3 mutations. All
+     suppress the legacy 401 prompt (same mechanism as B2); legacy
+     methods above keep their behavior unchanged. */
+  objectiveCockpit: (id: string, signal?: AbortSignal) =>
+    req<{ cockpit: import("./app/types").CockpitPayload }>(
+      `/vnext/objectives/${encodeURIComponent(id)}/cockpit`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  objectiveReviews: (id: string, limit: number, signal?: AbortSignal) =>
+    req<import("./app/types").ReviewsPage>(
+      `/vnext/objectives/${encodeURIComponent(id)}/reviews?limit=${limit}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  createObjectiveApp: (input: import("./types").VnextObjectiveInput) =>
+    req<import("./types").CanonicalObjective>("/vnext/objectives", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }, { noAuthPrompt: true }),
+  ceoCycleApp: (id: string) =>
+    req<import("./types").OperatingPassResult>(`/vnext/objectives/${id}/ceo-cycle`, {
+      method: "POST",
+      body: "{}",
+    }, { noAuthPrompt: true }),
+  autoPolicyControlApp: (
+    id: string,
+    body: {
+      action: string;
+      policy_version?: number;
+      limits?: import("./types").AutoPolicyStatus["limits"];
+      idempotency_key: string;
+      halt_reason?: string;
+      halt_scope?: string;
+    },
+  ) =>
+    req<{ auto_policy: import("./types").AutoPolicyStatus }>(
+      `/vnext/objectives/${id}/auto-policy`,
+      { method: "POST", body: JSON.stringify(body) },
+      { noAuthPrompt: true },
+    ),
   // P15.10-A — objective auto-policy (owner-scoped; non-owner → 403)
   autoPolicyStatus: (id: string) =>
     req<{ auto_policy: import("./types").AutoPolicyStatus }>(
@@ -154,6 +195,7 @@ export const api = {
       limits?: import("./types").AutoPolicyStatus["limits"];
       idempotency_key: string;
       halt_reason?: string;
+      halt_scope?: string;
     },
   ) =>
     req<{ auto_policy: import("./types").AutoPolicyStatus }>(

@@ -301,3 +301,23 @@
 
 .appshell :focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
 .aside .skip:focus { left: 8px; }
+
+/* ---- P15.9-B3 additions ---- */
+.sech { font-size: 14px; font-weight: 600; color: var(--text-1); margin: 18px 0 8px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 767px) { .grid2 { grid-template-columns: 1fr; } }
+.oform { background: var(--surf-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin: 12px 0; display: flex; flex-direction: column; gap: 10px; }
+.ofrow { display: flex; flex-direction: column; gap: 4px; }
+.ofrow label { font-size: 12px; color: var(--text-3); }
+.ofrow input, .ofrow textarea, .ofrow select { background: var(--surf-1); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; color: var(--text-1); font: inherit; }
+.ofrow2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.kpirow { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.kpirow input, .kpirow select { background: var(--surf-1); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; color: var(--text-1); font: inherit; flex: 1; min-width: 0; }
+.rvrow { flex-direction: column; align-items: flex-start !important; gap: 3px; }
+.cdlg-wrap { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 60; }
+.cdlg { background: var(--surf-2); border: 1px solid var(--line); border-radius: 10px; width: min(440px, 92vw); padding: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.35); }
+.cdlg-h { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.cdlg-x { background: none; border: none; color: var(--text-2); font-size: 15px; cursor: pointer; padding: 4px 8px; }
+.cdlg-b { font-size: 13px; color: var(--text-2); margin: 0 0 14px; }
+.cdlg-f { display: flex; justify-content: flex-end; gap: 8px; }

@@ -1,6 +1,9 @@
 import { AppShell } from "./AppShell";
 import { Company } from "./pages/Company";
+import { ObjectiveDetail } from "./pages/ObjectiveDetail";
+import { ObjectiveList } from "./pages/ObjectiveList";
 import { PlannedPage } from "./pages/Planned";
+import { Reviews } from "./pages/Reviews";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
    honest placeholder so navigation, deep links and mobile nav are real;
@@ -36,33 +39,15 @@ export const appRoute = {
     },
     {
       path: "objectives",
-      element: (
-        <PlannedPage
-          title="Objectives"
-          detail="Owned objective list for the selected business with proven-KPI chips and lifecycle badges."
-          phase="B3"
-        />
-      ),
+      element: <ObjectiveList />,
     },
     {
       path: "objectives/:id",
-      element: (
-        <PlannedPage
-          title="Objective Detail"
-          detail="KPI evidence, budget, lifecycle band, CEO workstreams, bound missions, verified artifacts and review history from GET /api/vnext/objectives/:id/cockpit + /reviews."
-          phase="B3"
-        />
-      ),
+      element: <ObjectiveDetail />,
     },
     {
       path: "objectives/:id/reviews",
-      element: (
-        <PlannedPage
-          title="Objective Reviews"
-          detail="Full canonical review history — historical owner_action flags, never presented as current pending."
-          phase="B3"
-        />
-      ),
+      element: <Reviews />,
     },
     {
       path: "ceo",

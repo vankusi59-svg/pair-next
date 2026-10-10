@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_9B2_COMPANY_COCKPIT",
-  "title": "P15.9-B2: /app/company Company Cockpit on canonical businessCompany read",
+  "claim_id": "P15_9B3_OBJECTIVE_COCKPIT_UI",
+  "title": "P15.9-B3: /app/objectives* \u2014 objective list, detail & reviews on canonical cockpit reads",
   "affected_surfaces": [
     "UI"
   ],
@@ -9,5 +9,5 @@
     "src/__tests__/pair-p15-10d-met-branch-fold.test.ts"
   ],
   "invariants": [],
-  "description": "B2 of approved P15.9-B0 plan (PR #92): /app/company renders the real Company Cockpit reading only GET /api/vnext/businesses/:id/company via useSelectedBusiness() — never enumerates /api/businesses, AbortController blocks stale-response overwrite, prior business data dropped on switch/failure. Dashboard: header, stat cards (owned/pending exact, breakdown + spend labeled over returned page), truncation banner, Needs Your Attention (fresh pending via latest_review.owner_action_required; global approvals labeled; HALT=API_MISSING no count), EntityCard grid (UNVERIFIED when canonically_proven=false; proven|claimed budget), Recent reviews labeled not-a-full-feed. Audit R1: money() always USD (microusd is USD; VND fixture proves $10.00 not '10 VND'); req() noAuthPrompt opt-out used by businessCompany AND a Company-only approvalsNoPrompt read — 401 on either shows credential-rejected/degraded state with no prompt/reload, legacy api.approvals prompt behavior unchanged (proven on /); truncation fixture contract-consistent (230 owned / 200 returned / objectives.length==200; proven=false case has met=0, unverified=total, all_targets_met=false); Schedules.tsx cast fixed so tsc clean. States: no-business/loading/401/403 Denied/FAIL_CLOSED integrity — never error-to-empty. Zero backend/authority change, zero new deps. Proof: cockpit+met-fold vitest unchanged-green; tsc PASS, vite build PASS, playwright 32/32 PASS (app 12 + company 10 + smoke 5 + chat 5) on real :8790 server."
+  "description": "R3 residual fix on B3. R3-F1: ObjectiveList creation now holds ONE dedup_key per logical attempt (attemptKey+attemptTerms refs) \u2014 an identical retry after a lost/ambiguous response reuses the same key and canonical terms so ObjectiveAuthorityService's exact-create replay converges to the same objective_id; the key rotates only when request terms change (deliberate new operation) and resets after confirmed canonical success or business switch; ConfirmDialog flow, biz isolation and prior R1/R2 guards unchanged. Adversarial e2e: real UI submit \u2192 backend commits \u2192 response poisoned to 502 \u2192 identical retry \u2192 both POSTs carry the SAME dedup_key \u2192 replay returns the SAME objective_id \u2192 business company shows exactly 1 objective \u2192 deliberate new creation gets a fresh key. Zero backend/deps. Proof: tsc+vite PASS; playwright 52/52 (objectives 20 + company 10 + app 12 + smoke 5 + chat 5) on real :8790."
 }
