@@ -1,13 +1,13 @@
 {
-  "claim_id": "P15_9B4_INBOX_CEO",
-  "title": "P15.9-B4: /app/inbox Owner Inbox + /app/ceo CEO Workspace",
+  "claim_id": "P15_9B5_1_WORKFORCE",
+  "title": "P15.9-B5.1: /app/workforce + /app/workforce/:id AI Workforce & Agent Detail",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10d-met-branch-fold.test.ts"
+    "src/__tests__/pair-p14-workforce-v2.test.ts",
+    "src/__tests__/pair-p12.test.ts"
   ],
   "invariants": [],
-  "description": "B4 R3 residual. R3-F1 ABA lifecycle binding: every business transition starts a NEW request lifecycle \u2014 reqGen increments synchronously during render (derived-state pattern, no one-frame stale window) on every biz change, including A\u2192B\u2192A. Resolved counts bind {forBiz, forReq, forEpoch}; the render guard suppresses anything not produced by the current lifecycle, so an old A resolution can never repaint under A's later lifecycle, late/aborted responses never overwrite newer generations, previous-generation counts hide during invalidation refetches, and failed refetches render '!' (never stale/zero). One provider, canonical refetch, aborts, mobile parity, aria-live preserved; no polling, no new backend calls. Proof: tsc+vite PASS; playwright 75/75 (inbox-ceo 23 incl. ABA adversarial A(10)\u2192B-delayed\u2192A converging to new canonical 8 with late-B overwrite impossible, desktop+mobile parity) on real :8790."
+  "description": "B5.1 R4 — AgentDetail inbox fail-closed hardening. The inbox read now validates the ENVELOPE before touching messages: null/non-object 200 body or non-array messages → 'malformed' (MALFORMED badge, 'messages withheld, never rendered as empty'); {state:\"CORRUPT\"} → CORRUPT panel. Any null/primitive/non-object ELEMENT marks the whole inbox malformed — never silently filtered into a false 'No messages'. Only a proven canonical envelope renders messages; per-message, unknown/missing receipt_status → UNVERIFIED badge + body withheld (unified isCorruptMessage predicate preserved: corrupt flag / state=CORRUPT / receipt_status=CORRUPT → CORRUPT badge + withheld body); PENDING/ACKNOWLEDGED render unchanged. New e2e: 7-case detail matrix (null envelope, [null], [\"bad\"], mixed valid+null, unknown status, missing status, real canonical empty) asserting no false empty, no leaked bodies, no indefinite skeleton. R1–R3 preserved (two-phase identity prefetch, tri-state contract, per-element workforce validation, truthful terminate copy). Proof: tsc+vite PASS; playwright 94/94 full suite on real :8790 — clean."
 }

@@ -344,3 +344,7 @@
 .dmeta dt { color: var(--text-2, #aab); }
 .dmeta dd { margin: 0; word-break: break-all; }
 .warn { color: var(--danger, #e5534b); }
+
+/* B5.1 — agent action bar + danger action affordance */
+.actbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 14px; }
+.tbtn.danger { border-color: var(--danger); color: var(--danger); }

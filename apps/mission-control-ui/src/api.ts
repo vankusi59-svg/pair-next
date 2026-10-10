@@ -192,6 +192,61 @@ export const api = {
       { method: "POST", body: JSON.stringify(body) },
       { noAuthPrompt: true },
     ),
+  /* P15.9-B5.1 — AI Workforce reads + agent lifecycle mutations.
+     All suppress the legacy 401 prompt. orgAgents is an UNFILTERED
+     global read (E.6 API_MISSING: no server-side business filter) —
+     callers filter client-side by business_id and label it; it is
+     never a server-side authorization or owner-scoped enumeration. */
+  orgAgents: (signal?: AbortSignal) =>
+    req<{ agents: import("./app/types").OrgAgentRow[] }>(
+      "/org-agents",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  workItems: (businessId: string, signal?: AbortSignal) =>
+    req<{ work_items: import("./app/types").WorkItemRow[] }>(
+      `/work-items?business_id=${encodeURIComponent(businessId)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  businessWorkGraph: (businessId: string, signal?: AbortSignal) =>
+    req<import("./app/types").WorkGraphPayload>(
+      `/businesses/${encodeURIComponent(businessId)}/work-graph`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  agentContract: (id: string, signal?: AbortSignal) =>
+    req<{ contract: import("./app/types").AgentContractRow | null }>(
+      `/org-agents/${encodeURIComponent(id)}/contract`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  agentEffectivePolicy: (id: string, signal?: AbortSignal) =>
+    req<import("./app/types").AgentEffectivePolicy>(
+      `/org-agents/${encodeURIComponent(id)}/effective-policy`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  agentInbox: (id: string, signal?: AbortSignal) =>
+    req<{ messages: import("./app/types").AgentInboxMessage[] }>(
+      `/org-agents/${encodeURIComponent(id)}/inbox`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  /* Canonical agent lifecycle mutations — the backend owns status
+     transitions (pause→PAUSED, resume→ACTIVE, terminate→TERMINATED)
+     and contract status (enable→ACTIVE, disable→DISABLED). No body
+     fields are invented; the contract matches existing POSTs. */
+  orgAgentAction: (id: string, action: "pause" | "resume" | "terminate") =>
+    req<Record<string, unknown>>(`/org-agents/${encodeURIComponent(id)}/${action}`, {
+      method: "POST",
+      body: "{}",
+    }, { noAuthPrompt: true }),
+  agentContractAction: (id: string, action: "enable" | "disable") =>
+    req<Record<string, unknown>>(`/org-agents/${encodeURIComponent(id)}/contract/${action}`, {
+      method: "POST",
+      body: "{}",
+    }, { noAuthPrompt: true }),
   // P15.10-A — objective auto-policy (owner-scoped; non-owner → 403)
   autoPolicyStatus: (id: string) =>
     req<{ auto_policy: import("./types").AutoPolicyStatus }>(

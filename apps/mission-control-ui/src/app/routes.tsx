@@ -6,6 +6,8 @@ import { PlannedPage } from "./pages/Planned";
 import { Inbox } from "./pages/Inbox";
 import { Ceo } from "./pages/Ceo";
 import { Reviews } from "./pages/Reviews";
+import { Workforce } from "./pages/Workforce";
+import { AgentDetail } from "./pages/AgentDetail";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
    honest placeholder so navigation, deep links and mobile nav are real;
@@ -51,23 +53,11 @@ export const appRoute = {
     },
     {
       path: "workforce",
-      element: (
-        <PlannedPage
-          title="AI Workforce"
-          detail="Org agents, contracts, effective policy, inboxes and work items for the selected business — plus the legacy admin functions ported from UI_HTML."
-          phase="B5"
-        />
-      ),
+      element: <Workforce />,
     },
     {
       path: "workforce/:id",
-      element: (
-        <PlannedPage
-          title="Agent Detail"
-          detail="Contract version, effective-policy summary, current work items and messages for one org agent."
-          phase="B5"
-        />
-      ),
+      element: <AgentDetail />,
     },
     {
       path: "missions",
