@@ -68,6 +68,7 @@ import {
   qualifyModel,
   ReconciliationService,
   RecoveryController,
+  utcnow,
   WorkforceAllocationService,
   WorkforceService,
   WORKFORCE_ALLOCATION_ENTITY,
@@ -264,6 +265,72 @@ function completeDeliverable(s: FullStack, binding: Row, key: string): string {
   return cid;
 }
 
+/** Drive a bound mission to canonically-RUNNING: legal mission
+ *  transitions + the mission_runtime row/transitions — the same rows
+ *  the governed runtime emits (mirrors canonical-mission-completion's
+ *  own writer shape; it is reused by canonicallyCompleteMission below). */
+function canonicallyStartMission(s: FullStack, missionId: string): void {
+  const mid = missionId;
+  const rtId = `MRT_${mid}`;
+  if (!s.store.tryGet("mission_runtime", rtId)) {
+    s.store.put("mission_runtime", rtId, {
+      mission_runtime_id: rtId,
+      mission_id: mid,
+      state: "CREATED",
+      entered_at: utcnow(),
+      reason: "mission_runtime_created",
+      barriers: {},
+      pending_recovery: null,
+      pending_approval_id: null,
+      pending_remediation: null,
+      budget_extension: { attempts_per_task: 0, attempts_per_mission: 0 },
+      version: 0,
+    }, 0);
+    s.store.event({
+      entity_type: "mission_runtime", entity_id: rtId,
+      event_type: "MISSION_RUNTIME_CREATED",
+      new_state: "CREATED", actor: "PAIR_MISSION_RUNTIME",
+      metadata: { mission_id: mid },
+    });
+  }
+  const transitionRt = (to: string, reason: string) => {
+    const cur = s.store.get("mission_runtime", rtId);
+    const from = String(cur.state);
+    if (from === to) return;
+    cur.state = to;
+    cur.entered_at = utcnow();
+    cur.reason = reason;
+    s.store.put("mission_runtime", rtId, cur, Number(cur.version));
+    s.store.event({
+      entity_type: "mission_runtime", entity_id: rtId,
+      event_type: "MISSION_RUNTIME_TRANSITION",
+      old_state: from, new_state: to, actor: "PAIR_MISSION_RUNTIME",
+      metadata: { mission_id: mid, reason },
+    });
+  };
+  const status = () => String(s.store.get("mission", mid).status);
+  if (status() === "CREATED") s.service.transitionMission(mid, "READY", "PAIR_MISSION_RUNTIME");
+  if (String(s.store.get("mission_runtime", rtId).state) === "CREATED") {
+    transitionRt("READY", "plan_committed");
+  }
+  if (status() === "READY") s.service.transitionMission(mid, "RUNNING", "PAIR_MISSION_RUNTIME");
+  if (String(s.store.get("mission_runtime", rtId).state) === "READY") {
+    transitionRt("RUNNING", "tasks_dispatched");
+  }
+}
+
+/** The mission's canonical lifecycle status derived from its immutable
+ *  MISSION_CREATED/MISSION_TRANSITION spine — mirrors the observer's
+ *  canonicalDerivedMissionStatus, proving row claims equal evidence. */
+function derivedMissionStatus(s: FullStack, missionId: string): string {
+  const evs = dbOf(s.store)
+    .prepare("SELECT new_state FROM events WHERE entity_id=? AND event_type IN ('MISSION_CREATED','MISSION_TRANSITION') ORDER BY seq")
+    .all(missionId) as Array<{ new_state: string | null }>;
+  let derived = "CREATED";
+  for (const e of evs) if (e.new_state != null) derived = String(e.new_state);
+  return derived;
+}
+
 /** Open a child + complete its bound mission WITHOUT folding — the exact
  *  stuck shape the audit observed (IN_PROGRESS + terminal mission). */
 function terminalUnfoldedChild(s: FullStack, binding: Row, key: string): { cid: string; mid: string } {
@@ -385,14 +452,23 @@ describe("P15.10 MET-branch delegated-child fold (audit hotfix)", () => {
     expect(s.kpiSvc.advance(oid)[0]!.outcome).toBe("PROGRESS_RECORDED");
     expect(objectiveKpiAssessment(kpiRow(s, oid))).toBe("MET");
 
-    // Third delegated child: open → bound mission exists, still live
-    // (mission/runtime row as minted by openWorkItem — not terminal).
+    // Third delegated child: open → canonically RUNNING bound mission
+    // (legal MISSION_TRANSITION spine + mission_runtime evidence), the
+    // exact shape the audit observed in the live run.
     const cidC = childOfKey(s, binding, "c");
     s.biz.openWorkItem(cidC, OP);
     const midC = boundMissionId(s, cidC);
+    canonicallyStartMission(s, midC);
+    // Canonical proof the mission is RUNNING: row claim equals the
+    // immutable transition spine's derived state, and the runtime row
+    // agrees — the same read the observer performs.
+    expect(String(s.store.get("mission", midC).status)).toBe("RUNNING");
+    expect(derivedMissionStatus(s, midC)).toBe("RUNNING");
+    expect(String(s.store.get("mission_runtime", `MRT_${midC}`).state)).toBe("RUNNING");
     const missionsBefore = s.store.list<Row>("mission").length;
 
-    const { ops } = mkOps(s);
+    const inv = new CountingInvoker();
+    const { ops } = mkOps(s, inv);
     const r1 = await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
     expect(r1.outcome).toBe("TARGET_MET_CANDIDATE");
     expect(r1.owner_action_required).toBe(true);
@@ -412,6 +488,8 @@ describe("P15.10 MET-branch delegated-child fold (audit hotfix)", () => {
     expect(String(s.store.get("work_item", wsWorkItemId(binding, "c")).status)).toBe("DONE");
     // Still zero new Missions — the fold consumed the already-bound one.
     expect(s.store.list<Row>("mission").length).toBe(missionsBefore);
+    // And zero CEO model calls across every pass — MET never re-plans.
+    expect(inv.calls).toBe(0);
     s.store.close();
   });
 
