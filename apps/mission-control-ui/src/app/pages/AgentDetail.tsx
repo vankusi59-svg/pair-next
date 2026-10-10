@@ -31,6 +31,12 @@ const WI_TONE: Record<string, Tone> = {
 
 type Section<T> = { kind: "ready"; data: T } | { kind: "unavailable"; code: string };
 
+/* Single corruption predicate — badge classification AND body
+   withholding MUST use the same test so a state="CORRUPT" message
+   never exposes its body even when other markers are absent. */
+const isCorruptMessage = (m: AgentInboxMessage): boolean =>
+  m.corrupt === true || m.state === "CORRUPT" || m.receipt_status === "CORRUPT";
+
 type Ready = {
   forBiz: string;
   forId: string;
@@ -159,9 +165,11 @@ export function AgentDetail() {
           agent,
           contract: sect(contractR, (v) => v.contract),
           policy: sect(policyR, (v) => v),
-          inbox: sect(inboxR, (v) => (Array.isArray(v.messages) ? v.messages : null)),
+          inbox: sect(inboxR, (v) =>
+            Array.isArray(v.messages) ? v.messages.filter((m) => !!m && typeof m === "object") : null),
           /* inbox read may return {state:"CORRUPT",corrupt:true} with no
-             messages array — null marks the whole section corrupt */
+             messages array — null marks the whole section corrupt;
+             non-object elements are dropped so rows never crash */
           items: sect(itemsR, (v) => (Array.isArray(v.work_items) ? v.work_items : null)),
           graph: sect(graphR, (v) => v),
         },
@@ -473,12 +481,12 @@ export function AgentDetail() {
           messages.slice(0, 50).map((m) => (
             <div className="nrow" key={m.message_id}>
               <StatusBadge
-                tone={m.corrupt || m.state === "CORRUPT" || m.receipt_status === "CORRUPT" ? "danger" : m.receipt_status === "PENDING" ? "warn" : "ok"}
-                label={m.corrupt || m.state === "CORRUPT" || m.receipt_status === "CORRUPT" ? "CORRUPT" : (m.receipt_status ?? "—")}
+                tone={isCorruptMessage(m) ? "danger" : m.receipt_status === "PENDING" ? "warn" : "ok"}
+                label={isCorruptMessage(m) ? "CORRUPT" : (m.receipt_status ?? "—")}
               />
               <span className="tt">{m.kind || "message"}</span>
               <span className="note">
-                {m.corrupt || m.receipt_status === "CORRUPT" ? "canonical message corrupt — body withheld" : m.body}
+                {isCorruptMessage(m) ? "canonical message corrupt — body withheld" : m.body}
                 {" · "}
                 {String(m.created_at).slice(0, 19).replace("T", " ")}
                 {m.work_item_id ? ` · wi ${String(m.work_item_id).slice(0, 14)}` : ""}

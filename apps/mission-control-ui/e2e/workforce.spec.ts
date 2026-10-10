@@ -466,3 +466,73 @@ test("workforce: R2-F2 inbox states — empty/pending/corrupt/malformed", async 
   await expect(cardMalformed).toContainText("unavailable (malformed payload)");
   await expect(page.locator(".srcnote")).toBeVisible();
 });
+
+test("workforce: R3 inbox element validation — malformed/indeterminate never exact", async ({ page }) => {
+  /* Per-element validation: null/primitive/{} entries, missing or
+     unknown receipt_status, and every CORRUPT marker all refuse an
+     exact count — no crash, no skeleton, no fabricated number. */
+  const biz = await mkBusiness(page, "wf-r3i");
+  await mkObjective(page, biz);
+  const aNull = await mkAgent(page, biz, "Null Elem");
+  const aObj = await mkAgent(page, biz, "Empty Obj");
+  const aBad = await mkAgent(page, biz, "Bad Elem");
+  const aUnk = await mkAgent(page, biz, "Unknown Status");
+  const aState = await mkAgent(page, biz, "State Corrupt");
+  const aFlag = await mkAgent(page, biz, "Flag Corrupt");
+  const aAck = await mkAgent(page, biz, "Acked Only");
+  const T = "2026-10-10T00:00:00Z";
+  const payloads: Record<string, unknown> = {
+    [aNull]: { messages: [null] },
+    [aObj]: { messages: [{}] },
+    [aBad]: { messages: ["bad"] },
+    [aUnk]: { messages: [{ message_id: "m1", receipt_status: "MYSTERY", kind: "NOTE", body: "b", created_at: T }] },
+    [aState]: { messages: [{ message_id: "m2", state: "CORRUPT", kind: "NOTE", body: "hidden", created_at: T }] },
+    [aFlag]: { messages: [{ message_id: "m3", corrupt: true, kind: "NOTE", body: "hidden2", created_at: T }] },
+    [aAck]: { messages: [
+      { message_id: "m4", receipt_status: "ACKNOWLEDGED", kind: "NOTE", body: "ok", created_at: T },
+      { message_id: "m5", receipt_status: "PENDING", kind: "NOTE", body: "p", created_at: T },
+    ] },
+  };
+  for (const [id, body] of Object.entries(payloads)) {
+    await page.route(`**/api/org-agents/${id}/inbox`, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) }));
+  }
+  await seedBiz(page, biz);
+  await page.goto("/app/workforce");
+  await expect(page.locator(".ecard")).toHaveCount(7);
+  for (const [title, pat] of [
+    ["Null Elem", "unavailable (malformed payload)"],
+    ["Empty Obj", "indeterminate"],
+    ["Bad Elem", "unavailable (malformed payload)"],
+    ["Unknown Status", "indeterminate"],
+    ["State Corrupt", "indeterminate"],
+    ["Flag Corrupt", "indeterminate"],
+    ["Acked Only", "inbox 1 pending"],
+  ]) {
+    await expect(page.locator(".ecard", { hasText: title }), title).toContainText(pat);
+  }
+  // no fabricated exact counts on any uncertain card
+  for (const title of ["Null Elem", "Empty Obj", "Bad Elem", "Unknown Status", "State Corrupt", "Flag Corrupt"]) {
+    const card = page.locator(".ecard", { hasText: title });
+    await expect(card, title).not.toContainText("0 pending");
+    await expect(card, title).not.toContainText("1 pending");
+  }
+  await expect(page.locator(".srcnote")).toBeVisible(); // page fully rendered — never stuck loading
+});
+
+test("agent detail: R3 corruption predicate — body withheld under every marker", async ({ page }) => {
+  /* state="CORRUPT" with no other markers must still badge CORRUPT and
+     withhold the body — same predicate drives both. */
+  const biz = await mkBusiness(page, "wf-r3d");
+  await mkObjective(page, biz);
+  const agent = await mkAgent(page, biz, "Detail Corrupt");
+  await page.route(`**/api/org-agents/${agent}/inbox`, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      messages: [{ message_id: "m-c", state: "CORRUPT", kind: "NOTE", body: "SECRET-BODY-STRING", created_at: "2026-10-10T00:00:00Z" }],
+    }) }));
+  await seedBiz(page, biz);
+  await page.goto(`/app/workforce/${agent}`);
+  await expect(page.locator(".sbadge.t-danger")).toContainText("CORRUPT");
+  await expect(page.getByText("canonical message corrupt")).toBeVisible();
+  await expect(page.getByText("SECRET-BODY-STRING")).toHaveCount(0);
+});

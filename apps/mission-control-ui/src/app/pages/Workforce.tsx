@@ -32,6 +32,7 @@ type AgentExtras = {
   inbox:
     | { kind: "count"; n: number }
     | { kind: "corrupt"; corrupt: number }
+    | { kind: "indeterminate" }
     | { kind: "malformed" }
     | { kind: "unavailable"; code: string };
   failedReads: string[];
@@ -109,6 +110,7 @@ export function Workforce() {
       const extras: Record<string, AgentExtras> = {};
       await Promise.all(agents.map(async (a) => {
         const id = String(a.agent_id);
+        try {
         const failedReads: string[] = [];
         const [c, p, i] = await Promise.allSettled([
           api.agentContract(id, ctl.signal),
@@ -130,11 +132,28 @@ export function Workforce() {
             return { kind: "unavailable" as const, code: i.reason instanceof ApiError ? i.reason.code : "ERROR" };
           const msgs = i.value.messages;
           if (!Array.isArray(msgs)) return { kind: "malformed" as const };
-          const corrupt = msgs.filter(
-            (m) => m.corrupt || m.state === "CORRUPT" || m.receipt_status === "CORRUPT",
-          ).length;
+          /* Per-element validation — a malformed element can never
+             fabricate an exact count:
+             - null / primitives / non-objects -> malformed
+             - missing / unknown / invalid receipt_status -> indeterminate
+             - CORRUPT via any marker -> indeterminate family
+             - only fully valid canonical receipts count; PENDING and
+               ACKNOWLEDGED are the backend receipt vocabulary */
+          let corrupt = 0;
+          let pending = 0;
+          for (const el of msgs) {
+            if (!el || typeof el !== "object") return { kind: "malformed" as const };
+            const m = el as unknown as Record<string, unknown>;
+            if (m.corrupt === true || m.state === "CORRUPT" || m.receipt_status === "CORRUPT") {
+              corrupt++;
+              continue;
+            }
+            const rs = m.receipt_status;
+            if (rs === "PENDING") { pending++; continue; }
+            if (rs !== "ACKNOWLEDGED") return { kind: "indeterminate" as const };
+          }
           if (corrupt > 0) return { kind: "corrupt" as const, corrupt };
-          return { kind: "count" as const, n: msgs.filter((m) => m.receipt_status === "PENDING").length };
+          return { kind: "count" as const, n: pending };
         })();
         if (i.status === "rejected") failedReads.push("inbox");
         extras[id] = {
@@ -143,6 +162,16 @@ export function Workforce() {
           inbox,
           failedReads,
         };
+        } catch {
+          /* defensive: one malformed per-agent result can never reject
+             the enclosing aggregation and wedge the page on skeleton */
+          extras[id] = {
+            contract: { kind: "unavailable", code: "ERROR" },
+            policyLine: null,
+            inbox: { kind: "malformed" },
+            failedReads: ["contract", "effective-policy", "inbox"],
+          };
+        }
       }));
       if (ctl.signal.aborted) return;
       setSt({
@@ -313,6 +342,8 @@ export function Workforce() {
                       <span className="note">
                         indeterminate — {ex.inbox.corrupt} corrupt receipt(s), pending count unproven
                       </span>
+                    ) : ex.inbox.kind === "indeterminate" ? (
+                      <span className="note">indeterminate — unverified receipt status, pending count unproven</span>
                     ) : ex.inbox.kind === "malformed" ? (
                       <span className="note">unavailable (malformed payload)</span>
                     ) : (
