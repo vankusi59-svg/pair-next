@@ -5,7 +5,8 @@
     "UI"
   ],
   "required_tests": [
-    "apps/mission-control-ui/e2e/workforce.spec.ts"
+    "src/__tests__/pair-p14-workforce-v2.test.ts",
+    "src/__tests__/pair-p12.test.ts"
   ],
   "invariants": [],
   "description": "B5.1 — real functional Workforce pages replacing placeholders. /app/workforce: selected-business agent overview — GET /api/org-agents is an UNFILTERED global read; rows are filtered CLIENT-SIDE by business_id with an explicit disclosure (never described as server-side authorization); the owner-scoped company projection verifies selected-business context (403 → 'owner context unverified' banner, list still honest); per-agent contract/policy/inbox extras settle independently (failed reads labeled, never zero/unrestricted); workload from server-filtered work-items (read failure → unavailable, never 0). /app/workforce/:id: 6 canonical reads each failing independently (contract, effective-policy, inbox, work-items, work-graph + org-agents identity); foreign-business agent → DeniedState without rendering fields; synchronous render-boundary guard {forBiz,forId}+business_id/agent_id recheck; lifecycle ops (pause/resume/terminate) + contract enable/disable only when legal per backend transitions, all via ConfirmDialog pinning {op,agent,biz} opened-context, invalidated on identity change, dup-submit protected, canonical refetch on success, errors non-optimistic, terminate labeled high-risk; contract editing deferred to B5.2. No new backend endpoint/dependency; B1–B4 preserved. Proof: tsc+vite PASS; playwright 88/88 (workforce 13 + objectives 20 + inbox-ceo 23 + company 10 + app 12 + smoke 5 + chat 5 — app.spec placeholder list updated for workforce going real) on real :8790 backend."
