@@ -57,15 +57,24 @@ export function BusinessAdmin() {
         setSt({ kind: "error", err: e instanceof ApiError ? e : new ApiError(0, "ERROR", String(e)) });
         return;
       }
+      /* R2 — row-level validation: an array containing null/primitive/
+         identity-less rows is MALFORMED (unavailable), never silently
+         filtered down to a fake "complete" list. */
+      const rowsOk = (v: unknown, idField: string): boolean =>
+        Array.isArray(v) && v.every((e) => e !== null && typeof e === "object" && (e as Record<string, unknown>)[idField] != null);
       setSt({
         kind: "ready",
-        projects: projR.status === "fulfilled" && Array.isArray(projR.value) ? projR.value : null,
-        businesses: bizR.status === "fulfilled" && Array.isArray(bizR.value.businesses) ? bizR.value.businesses : null,
+        projects: projR.status === "fulfilled" && rowsOk(projR.value, "project_id") ? projR.value : null,
+        businesses: bizR.status === "fulfilled" && rowsOk(bizR.value?.businesses, "business_id") ? bizR.value.businesses : null,
         detail: null,
         detailFor: null,
         detailErr: null,
-        projectsErr: projR.status === "rejected" ? (projR.reason instanceof ApiError ? projR.reason.code : "ERROR") : null,
-        businessesErr: bizR.status === "rejected" ? (bizR.reason instanceof ApiError ? bizR.reason.code : "ERROR") : null,
+        projectsErr: projR.status === "rejected"
+          ? (projR.reason instanceof ApiError ? projR.reason.code : "ERROR")
+          : !rowsOk(projR.value, "project_id") ? "MALFORMED" : null,
+        businessesErr: bizR.status === "rejected"
+          ? (bizR.reason instanceof ApiError ? bizR.reason.code : "ERROR")
+          : !rowsOk(bizR.value?.businesses, "business_id") ? "MALFORMED" : null,
       });
     })();
     return () => ctl.abort();
@@ -87,6 +96,23 @@ export function BusinessAdmin() {
         setSt((s) =>
           s.kind === "ready" && s.detailFor === forId
             ? { ...s, detail: null, detailErr: `identity mismatch — response for a different business discarded` }
+            : s,
+        );
+        return;
+      }
+      /* R2 — validate child collections before rendering: agents/
+         objectives/routines must be arrays of objects with identity,
+         board must be {status: rows of objects with work_item_id}. A
+         malformed child collection → error, never partial-rendered. */
+      const rowsOk = (v: unknown, idField: string): boolean =>
+        Array.isArray(v) && v.every((e) => e !== null && typeof e === "object" && (e as Record<string, unknown>)[idField] != null);
+      const boardOk = d.board && typeof d.board === "object"
+        && Object.values(d.board).every((col) => rowsOk(col, "work_item_id"));
+      if (!rowsOk(d.agents, "agent_id") || !rowsOk(d.objectives, "objective_id")
+        || !rowsOk(d.routines, "routine_id") || !boardOk) {
+        setSt((s) =>
+          s.kind === "ready" && s.detailFor === forId
+            ? { ...s, detail: null, detailErr: "malformed detail payload — child collection contains invalid rows" }
             : s,
         );
         return;

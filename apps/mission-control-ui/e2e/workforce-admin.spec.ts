@@ -486,3 +486,84 @@ test("workforce-admin: malformed 200 payloads fail closed — no crash, no fake 
   await expect(page.locator(".page")).toContainText("malformed payload", { timeout: 15000 });
   await expect(page.getByLabel("agent title")).toHaveCount(0);
 });
+
+/* R2-F1: malformed COLLECTION ELEMENTS — arrays containing null/
+   primitives/identity-less rows are MALFORMED, never silently filtered
+   to a fake complete list, never crash/wedge, zero unsafe POSTs. */
+test("R2: malformed collection elements fail closed per-section", async ({ page }) => {
+  const biz = await mkBusiness(page, "r2");
+  const posts: string[] = [];
+  await seedBiz(page, biz);
+
+  // --- secondary collections: each malformed independently ---
+  await page.route("**/api/**", (route) => {
+    if (route.request().method() === "POST") posts.push(route.request().url());
+    return route.continue();
+  });
+  await page.route("**/api/work-items*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ work_items: [null] }) }));
+  await page.route("**/api/routines*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ routines: [null] }) }));
+  await page.route("**/api/objectives*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ objectives: [null] }) }));
+  await page.goto("/app/workforce/admin");
+  await expect(page.locator("h1")).toHaveText("Workforce Administration");
+  await expect(page.locator(".page")).toContainText("work-item read unavailable (MALFORMED)");
+  await expect(page.locator(".page")).toContainText("routine read unavailable (MALFORMED)");
+  await expect(page.locator(".page")).toContainText("objective list unavailable");
+  await expect(page.getByText("No work items")).toHaveCount(0);
+  await expect(page.getByText("No routines")).toHaveCount(0);
+  await expect(posts).toEqual([]);
+  await page.unroute("**/api/work-items*");
+  await page.unroute("**/api/routines*");
+  await page.unroute("**/api/objectives*");
+
+  // --- primary collection: [null] and [{}] are both fatal, not empty ---
+  for (const body of [JSON.stringify({ agents: [null] }), JSON.stringify({ agents: [{}] })]) {
+    await page.route("**/api/org-agents*", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body }));
+    await page.reload();
+    await expect(page.locator(".page")).toContainText("malformed payload", { timeout: 15000 });
+    await expect(page.getByLabel("agent title")).toHaveCount(0);
+    await page.unroute("**/api/org-agents*");
+  }
+
+  // --- valid EMPTY arrays remain genuinely empty ---
+  await page.route("**/api/work-items*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ work_items: [] }) }));
+  await page.route("**/api/routines*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ routines: [] }) }));
+  await page.reload();
+  await expect(page.getByText("No work items")).toBeVisible({ timeout: 15000 });
+  await expect(page.getByText("No routines").first()).toBeVisible();
+  await page.unroute("**/api/work-items*");
+  await page.unroute("**/api/routines*");
+
+  // --- projects [null] blocks business creation; businesses [null] → unavailable list ---
+  await page.route("**/api/projects", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "[null]" }));
+  await page.route("**/api/businesses", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ businesses: [null] }) }));
+  await page.goto("/app/system/business-admin");
+  await expect(page.locator(".page")).toContainText("project list unavailable (MALFORMED)");
+  await expect(page.getByLabel("business name")).toHaveCount(0);
+  await expect(page.locator(".page")).toContainText("global list unavailable (MALFORMED)");
+  await page.unroute("**/api/projects");
+  await page.unroute("**/api/businesses");
+
+  // --- business-detail child collection malformed → detail error, no partial render ---
+  const target = await mkBusiness(page, "r2-detail");
+  await page.route(`**/api/businesses/${target}`, (route) =>
+    route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({
+        business: { business_id: target, name: "X", project_id: "p", status: "ACTIVE", currency: "USD" },
+        agents: [null], objectives: [], routines: [], board: {}, budgets: [],
+      }),
+    }));
+  await page.getByLabel("business id to inspect").fill(target);
+  await page.getByRole("button", { name: "Inspect", exact: true }).click();
+  await expect(page.locator(".page")).toContainText("malformed detail payload", { timeout: 15000 });
+  await expect(page.locator(".inspectbundle")).toHaveCount(0);
+  await expect(posts).toEqual([]);
+});

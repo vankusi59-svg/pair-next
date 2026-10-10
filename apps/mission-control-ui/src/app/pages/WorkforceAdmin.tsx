@@ -138,10 +138,16 @@ export function WorkforceAdmin() {
         setSt({ kind: "error", err: e instanceof ApiError ? e : new ApiError(0, "ERROR", String(e)) });
         return;
       }
-      /* F3 — envelope validation before nested reads: null/primitive/
-         missing/malformed 200 payloads → UNAVAILABLE, never an empty
-         canonical list, never a thrown wedge. pick() runs once. */
-      const sect = <I, O>(r: PromiseSettledResult<I>, pick: (v: I) => O | null): Section<O> => {
+      /* F3+R2 — envelope AND element validation before nested reads:
+         null/primitive/non-array payloads, and arrays containing
+         non-object or identity-less rows, → UNAVAILABLE (MALFORMED).
+         Never silently drop invalid rows and claim a complete list;
+         never a thrown wedge. pick() runs once. */
+      const rowOk = (e: unknown, idField: string): boolean =>
+        e !== null && typeof e === "object" && (e as Record<string, unknown>)[idField] != null;
+      const sect = <I, O extends unknown[]>(
+        r: PromiseSettledResult<I>, pick: (v: I) => O | null, idField: string,
+      ): Section<O> => {
         if (r.status === "rejected") {
           return { kind: "unavailable", code: r.reason instanceof ApiError ? r.reason.code : "ERROR" };
         }
@@ -149,17 +155,17 @@ export function WorkforceAdmin() {
           const v = r.value;
           if (v === null || typeof v !== "object") return { kind: "unavailable", code: "MALFORMED" };
           const out = pick(v);
-          return out === null || !Array.isArray(out)
+          return out === null || !Array.isArray(out) || !out.every((e) => rowOk(e, idField))
             ? { kind: "unavailable", code: "MALFORMED" }
             : { kind: "ready", data: out };
         } catch {
           return { kind: "unavailable", code: "MALFORMED" };
         }
       };
-      /* identity read is primary: a malformed envelope is fatal — never
-         fabricate an empty global agent list */
+      /* identity read is primary: a malformed envelope OR any invalid
+         element is fatal — never fabricate an empty global agent list */
       const av = agentsR.value;
-      if (av === null || typeof av !== "object" || !Array.isArray(av.agents)) {
+      if (av === null || typeof av !== "object" || !Array.isArray(av.agents) || !av.agents.every((e: unknown) => rowOk(e, "agent_id") && (e as Record<string, unknown>).business_id != null)) {
         setSt({ kind: "error", err: new ApiError(200, "MALFORMED", "GET /api/org-agents returned a malformed payload") });
         return;
       }
@@ -169,9 +175,9 @@ export function WorkforceAdmin() {
         forBiz,
         agents: all.filter((a) => a.business_id === forBiz),
         filteredOut: all.length - all.filter((a) => a.business_id === forBiz).length,
-        items: sect(itemsR, (v) => (Array.isArray(v.work_items) ? v.work_items : null)),
-        routines: sect(routinesR, (v) => (Array.isArray(v.routines) ? v.routines : null)),
-        objectives: sect(objectivesR, (v) => (Array.isArray(v.objectives) ? v.objectives : null)),
+        items: sect(itemsR, (v) => (Array.isArray(v.work_items) ? v.work_items : null), "work_item_id"),
+        routines: sect(routinesR, (v) => (Array.isArray(v.routines) ? v.routines : null), "routine_id"),
+        objectives: sect(objectivesR, (v) => (Array.isArray(v.objectives) ? v.objectives : null), "objective_id"),
       });
     })();
     return () => ctl.abort();
