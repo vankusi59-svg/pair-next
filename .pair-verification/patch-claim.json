@@ -1,14 +1,13 @@
 {
-  "claim_id": "P15_9B0_UI_UX_REDESIGN_MASTER_PLAN",
-  "title": "P15.9-B0: full UI/UX redesign master plan \u2014 docs only",
+  "claim_id": "P15_9B1_APP_SHELL_DESIGN_SYSTEM",
+  "title": "P15.9-B1: app shell + design tokens + parallel /app route tree",
   "affected_surfaces": [
-    "UI",
-    "DEV_INFRA"
+    "UI"
   ],
   "required_tests": [
     "src/__tests__/pair-p15-9a-company-cockpit.test.ts",
     "src/__tests__/pair-p15-10d-met-branch-fold.test.ts"
   ],
   "invariants": [],
-  "description": "P15.9-B0 master plan docs + design-review R1/R2 contract corrections (BASE 2232955, post-PR#91). docs/P15_9_B0/ holds README + A\u2013H. R1: /ui serves SPA (not UI_HTML) under staticDir \u2014 UI_HTML only on bare-server runs; inbox truthfulness (exact counts vs <=200 returned list); scope boundaries (unfiltered businesses/approvals/org-agents; header-only vnext actor vs legacy body fallback). R2 residuals: field-name corrections \u2014 fresh pending = lifecycle.owner_action_required + company objectives[].latest_review.owner_action_required (pin-checked); cockpit latest_review.owner_action_required and /reviews rows are historical (same field name, different semantics); source_ceo_decision_id replaces nonexistent ceo_decision_id. HALT truthfulness \u2014 company summaries carry NO auto_policy field and no enumeration route exists: HALT lane/badge render an unavailable explanation only, never a count or scan claim; HALT aggregation stays API_MISSING. Docs-only: no code, no deps, no routes. Executable proof: cockpit + met-fold suites green."
+  "description": "B1 of the approved P15.9-B0 master plan (PR #92, BASE b662914): new AppShell (sidebar groups Overview/Business/Operations/System per B.3, business switcher manual/last-used business_id contract B.5.3 \u2014 no /api/businesses enumeration, operator chip, theme toggle, breadcrumb topbar, mobile <768 bottom tab bar + More drawer, 768-1199 icon rail), semantic CSS tokens (tokens.css dark/light incl. --unknown for unverifiable), gloss map lib/gloss.ts (C.6), shared components (StatusBadge, ProofChip, EmptyState/ErrorState/DeniedState/UnverifiedPanel/Skeleton), /app/* parallel route tree with honest PlannedPage placeholders for all B2-B6 destinations. Old route tree untouched \u2014 / still serves the legacy Dashboard; no backend/auth/API/dependency change, no fake data, no redirects. Harness-executable proof: cockpit + met-fold vitest suites unchanged-green (zero backend diff). UI proof reported with PR: tsc PASS, vite build PASS, playwright e2e app.spec 12/12 + smoke 5/5 + chat 5/5 PASS against the real :8790 server."
 }
