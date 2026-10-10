@@ -132,8 +132,8 @@ export function Company() {
         <div className="sub">{biz}</div>
         {err.status === 401 ? (
           <ErrorState
-            code="UNAUTHORIZED"
-            detail="The server rejected your session token. Update it in Settings and retry."
+            code={err.code || "UNAUTHORIZED"}
+            detail={`Your credentials were rejected — the session token is missing or invalid. Update it in Settings, then retry. ${err.detail}`}
             onRetry={retry}
           />
         ) : err.status === 403 ? (
@@ -203,7 +203,7 @@ export function Company() {
         <div className="stat">
           <div className="k">Reported spend</div>
           <div className="v" style={{ fontSize: 18, lineHeight: 1.6 }}>
-            {money(spend, b.currency)}
+            {money(spend)}
           </div>
           <div className="n">aggregate over {counts.objectives_returned} returned</div>
         </div>
@@ -261,7 +261,7 @@ export function Company() {
       ) : (
         <div className="ecards">
           {objectives.map((o) => (
-            <EntityCard key={o.objective_id} o={o} currency={b.currency} />
+            <EntityCard key={o.objective_id} o={o} />
           ))}
         </div>
       )}

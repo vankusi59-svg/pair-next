@@ -141,15 +141,15 @@ test("pending review + truncation (contract-shaped fixture)", async ({ page }) =
       ],
       objectives_total_owned: 230,
       objectives_truncated: true,
-      counts: { objectives_owned: 230, objectives_returned: 200, targets_met_pending: 1 },
+      counts: { objectives_owned: 230, objectives_returned: 2, targets_met_pending: 1 },
     },
   };
   await page.route(`**/api/vnext/businesses/${biz}/company`, (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(payload) }));
   await seedBiz(page, biz);
   await page.goto("/app/company");
-  // truncation banner: exact counts, partial list
-  await expect(page.getByText(/Showing 200 of 230 owned objectives/)).toBeVisible();
+  // truncation banner: exact counts, partial list (returned == array length)
+  await expect(page.getByText(/Showing 2 of 230 owned objectives/)).toBeVisible();
   await expect(page.locator(".stat", { hasText: "Pending reviews" }).getByText("1")).toBeVisible();
   // fresh pending flag only: OBJ_pend in needs-you, OBJ_hist (historical) NOT
   const need = page.locator(".need").first();
@@ -193,4 +193,61 @@ test("no unexpected API mutations from the cockpit page", async ({ page }) => {
   await page.goto("/app/company");
   await expect(page.getByRole("heading", { name: biz.name })).toBeVisible();
   expect(methods.filter((m) => m !== "GET")).toEqual([]);
+});
+
+test("microusd always displays as USD, never business.currency (audit F1)", async ({ page }) => {
+  const biz = "BIZ_vnd";
+  const payload = {
+    company: {
+      business: { business_id: biz, name: "Foreign Ccy Co", description: null, currency: "VND", status: "ACTIVE", project_id: "p", created_at: "2026-01-01T00:00:00Z" },
+      objectives: [
+        {
+          objective_id: "OBJ_vnd", title: "Money check", status: "RUNNING", deadline: null, created_at: "2026-01-01T00:00:00Z",
+          budget: { ceiling_microusd: 20000000, consumed_microusd: 10000000, canonically_proven: true },
+          kpi_summary: { total: 0, met: 0, gap: 0, unverified: 0, all_targets_met: false, canonically_proven: true },
+          latest_review: null,
+          review_count: 0,
+        },
+      ],
+      objectives_total_owned: 1,
+      objectives_truncated: false,
+      counts: { objectives_owned: 1, objectives_returned: 1, targets_met_pending: 0 },
+    },
+  };
+  await page.route(`**/api/vnext/businesses/${biz}/company`, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(payload) }));
+  await seedBiz(page, biz);
+  await page.goto("/app/company");
+  // 10_000_000 microusd == USD 10.00 — never "10 VND", even with currency=VND
+  await expect(page.getByText("$10.00 / $20.00")).toBeVisible();
+  await expect(page.locator(".stat", { hasText: "Reported spend" }).getByText("$10.00")).toBeVisible();
+  expect(await page.getByText(/VND/).count()).toBe(0);
+});
+
+test("401 -> honest Unauthorized state; no legacy prompt/reload, no prior data", async ({ page }) => {
+  const bizA = await mkBusiness(page, "pre401");
+  await mkObjective(page, bizA.id, "Obj Before");
+  await page.addInitScript(() => {
+    (window as unknown as { __prompted: boolean }).__prompted = false;
+    const orig = window.prompt;
+    window.prompt = (...a) => { (window as unknown as { __prompted: boolean }).__prompted = true; return orig.call(window, ...a); };
+  });
+  await page.route("**/api/vnext/businesses/BIZ_401/company", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json",
+      body: JSON.stringify({ error: "UNAUTHORIZED", detail: "invalid token" }) }));
+  await seedBiz(page, bizA.id);
+  await page.goto("/app/company");
+  await expect(page.getByRole("heading", { name: bizA.name })).toBeVisible();
+  // switch to a business whose read returns 401
+  await page.locator(".aside").getByRole("button", { name: "business switcher" }).click();
+  await page.locator(".aside").getByLabel("business id").fill("BIZ_401");
+  await page.locator(".aside").getByRole("button", { name: "Use" }).click();
+  // honest credential-failure explanation, no legacy prompt, no forced reload
+  await expect(page.getByText(/credentials were rejected/)).toBeVisible();
+  await expect(page.getByText("UNAUTHORIZED").first()).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __prompted: boolean }).__prompted)).toBe(false);
+  expect(page.url()).toContain("/app/company");
+  // previous business's data fully discarded
+  await expect(page.locator(".ecard")).toHaveCount(0);
+  await expect(page.getByText(bizA.name)).toHaveCount(0);
 });

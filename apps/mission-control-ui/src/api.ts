@@ -24,7 +24,10 @@ export function withTokenQuery(url: string): string {
 
 let lastTokenPromptAt = 0;
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+/* New /app/* surfaces may suppress the legacy 401 window.prompt + reload
+   (audit R1-F2): they render their own Unauthorized state instead. The
+   prompt behavior is unchanged for every other caller. */
+async function req<T>(path: string, init?: RequestInit, opts?: { noAuthPrompt?: boolean }): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   const op = getOperatorId();
   if (op) headers["x-operator-id"] = op;
@@ -40,7 +43,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!r.ok) {
     const e = body as { error?: string; detail?: string };
-    if (r.status === 401 && Date.now() - lastTokenPromptAt > 5000) {
+    if (r.status === 401 && !opts?.noAuthPrompt && Date.now() - lastTokenPromptAt > 5000) {
       lastTokenPromptAt = Date.now();
       const t = window.prompt("Mission Control access token:");
       if (t !== null) { setAuthToken(t); window.location.reload(); }
@@ -132,6 +135,7 @@ export const api = {
     req<{ company: import("./app/types").CompanyPayload }>(
       `/vnext/businesses/${encodeURIComponent(id)}/company`,
       signal ? { signal } : undefined,
+      { noAuthPrompt: true },
     ),
   // P15.10-A — objective auto-policy (owner-scoped; non-owner → 403)
   autoPolicyStatus: (id: string) =>

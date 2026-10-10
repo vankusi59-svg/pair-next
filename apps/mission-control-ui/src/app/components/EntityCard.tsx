@@ -14,16 +14,18 @@ const STATUS_TONE: Record<string, Tone> = {
   EXPIRED: "warn",
 };
 
-export function money(microusd: number, currency: string): string {
+/* *_microusd fields are USD micro-units by contract — always display in
+   USD regardless of business.currency (no FX conversion, audit F1). */
+export function money(microusd: number): string {
   const v = microusd / 1e6;
   const s = v >= 1000 ? v.toLocaleString(undefined, { maximumFractionDigits: 0 }) : v.toFixed(2);
-  return currency === "USD" ? `$${s}` : `${s} ${currency}`;
+  return `$${s}`;
 }
 
 /* Objective entity card for the Company Cockpit grid (D.2). Renders the
    canonical summary verbatim; KPI/budget carry their own proven chips. */
-export function EntityCard(props: { o: ObjectiveSummary; currency: string }) {
-  const { o, currency } = props;
+export function EntityCard(props: { o: ObjectiveSummary }) {
+  const { o } = props;
   const k = o.kpi_summary;
   const b = o.budget;
   const pct = b.ceiling_microusd > 0 ? Math.min(100, (b.consumed_microusd / b.ceiling_microusd) * 100) : 0;
@@ -42,7 +44,7 @@ export function EntityCard(props: { o: ObjectiveSummary; currency: string }) {
           <span className="m-info" style={{ width: `${pct}%` }} />
         </div>
         <span className="knum">
-          {money(b.consumed_microusd, currency)} / {money(b.ceiling_microusd, currency)}
+          {money(b.consumed_microusd)} / {money(b.ceiling_microusd)}
         </span>
         <StatusBadge tone={b.canonically_proven ? "ok" : "unknown"} label={b.canonically_proven ? "proven" : "claimed"} />
       </div>
