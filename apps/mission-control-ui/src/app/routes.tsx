@@ -13,6 +13,7 @@ import { BusinessAdmin } from "./pages/BusinessAdmin";
 import { Missions } from "./pages/Missions";
 import { MissionNew } from "./pages/MissionNew";
 import { MissionDetailPage } from "./pages/MissionDetail";
+import Chat from "./pages/Chat";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
    honest placeholder so navigation, deep links and mobile nav are real;
@@ -82,13 +83,7 @@ export const appRoute = {
     },
     {
       path: "chat",
-      element: (
-        <PlannedPage
-          title="Chat"
-          detail="Conversation layer — turns, mission-draft proposals, confirm/reject; ported verbatim."
-          phase="B5"
-        />
-      ),
+      element: <Chat />,
     },
     {
       path: "system/business-admin",
