@@ -95,7 +95,16 @@ export type KpiDirection = (typeof KPI_DIRECTIONS)[number];
  *  outcome/provenance seam must delegate to real canonical authority,
  *  not reimplement shape checks here.
  */
-const VERIFIER_KINDS = new Set(["operator", "mission", "artifact"]);
+const VERIFIER_KINDS = new Set(["operator", "mission", "artifact", "kpi-verifier"]);
+
+// P15.10-D — delegated verifier contract: verifier `kpi-verifier:<auth_id>`
+// is authority ONLY through the grant+receipt proof in
+// objective-kpi-verifier-authority.ts — never through the actor string.
+import {
+  KPI_VERIFIER_KIND,
+  KPI_VERIFIER_WRITER,
+  assertKpiVerifierAuthority,
+} from "./objective-kpi-verifier-authority.js";
 
 /** On-row dedup ledgers are bounded — an overflow fails closed rather
  *  than letting the row grow without limit. */
@@ -845,7 +854,10 @@ export class ObjectiveAuthorityService {
       if (!kpi) {
         throw new NotFoundError(`objective ${objectiveId} kpi ${input.kpi_id}`);
       }
-      this.assertOwnerVerifier(row, ev, input.actor);
+      this.assertOwnerVerifier(row, ev, input.actor, {
+        kpi_id: String(kpi.kpi_id),
+        value,
+      });
       if (ledger.length >= LEDGER_CAP) {
         throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_LEDGER_FULL", objectiveId);
       }
@@ -1171,10 +1183,36 @@ export class ObjectiveAuthorityService {
    *  a future bounded outcome/provenance-verification seam (P15.5) must
    *  bind business/objective/kpi/value/provenance/immutable evidence
    *  identity before it may mint evidence. */
-  private assertOwnerVerifier(row: Row, ev: ObjectiveEvidence, actor: string): void {
+  private assertOwnerVerifier(
+    row: Row,
+    ev: ObjectiveEvidence,
+    actor: string,
+    claim?: { kpi_id?: string; value?: number },
+  ): void {
     if (verifierKind(ev.verifier) === "operator" &&
         ev.verifier === String(row.owner_authority_id) &&
         actor === String(row.owner_authority_id)) {
+      return;
+    }
+    // P15.10-D — delegated auto-verification: a real grant + digest-bound
+    // receipt prove authority; the writer identity is the ONE canonical
+    // writer, never a forged owner string. Same checks run again at the
+    // P15.5 strict read.
+    if (verifierKind(ev.verifier) === KPI_VERIFIER_KIND) {
+      if (actor !== KPI_VERIFIER_WRITER) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_OBJECTIVE_UNVERIFIED",
+          `actor ${actor} is not the canonical KPI verification writer`,
+        );
+      }
+      assertKpiVerifierAuthority({
+        store: this.store,
+        objective: row,
+        kpi_id: claim?.kpi_id,
+        verifier: ev.verifier,
+        evidence_key: ev.evidence_key,
+        value: claim?.value,
+      });
       return;
     }
     throw new IntegrityError(

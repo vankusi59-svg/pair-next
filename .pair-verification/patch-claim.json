@@ -1,27 +1,26 @@
 {
-  "claim_id": "P15_10_C_FINAL_COST_HALT_HOTFIX",
-  "title": "P15.10-C FINAL hotfix: cost halt TOCTOU \u2014 in-txn halt re-check on authoritative billing",
+  "claim_id": "P15_10_D_KPI_EVIDENCE_VERIFICATION",
+  "title": "P15.10-D: autonomous KPI evidence verification — owner-opt-in delegated verifier grant + receipt-bound canonical progress writes",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "GATE_ROUTER",
-    "RECOVERY_REPLAY"
+    "WORK_COMPLETION"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10c-final-audit.test.ts",
-    "src/__tests__/pair-p15-10c-r4.test.ts",
-    "src/__tests__/pair-p15-10c-r3.test.ts",
-    "src/__tests__/pair-p15-10c-r2.test.ts",
-    "src/__tests__/pair-p15-10c-r1.test.ts",
-    "src/__tests__/pair-p15-10c.test.ts",
-    "src/__tests__/pair-p13.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-3-ceo-planning-cycle.test.ts",
+    "src/__tests__/pair-p15-10d.test.ts",
+    "src/__tests__/pair-p15-1-objective-authority.test.ts",
     "src/__tests__/pair-p15-5-kpi-review.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts"
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts",
+    "src/__tests__/pair-p15-10c.test.ts",
+    "src/__tests__/pair-p15-10c-r1.test.ts",
+    "src/__tests__/pair-p15-10c-r2.test.ts",
+    "src/__tests__/pair-p15-10c-r3.test.ts",
+    "src/__tests__/pair-p15-10c-r4.test.ts",
+    "src/__tests__/pair-p15-10c-final-audit.test.ts"
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "FINAL hotfix on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3): Finding B CONFIRMED by prepatch FAIL \u2014 PAIR_COST_HALT=1, profile FREE flipped to METERED_API between the advisory billingFor() and the atomic txn produced a PAID reservation (HELD 400k) under an active halt; the halt check evaluated the stale advisory mode. Fix (only this boundary): inside store.immediate, after the authoritative in-txn billing re-resolve and after the resId adopt/deny re-check (adopting an already-committed reservation is not new spend), haltActive() is re-checked against the REAL in-txn billing.mode \u2014 METERED_API or UNKNOWN under halt -> FAIL_CLOSED_COST_HALT violation, no reservation row, denial evidence on the mission evidence stream. FREE/SUBSCRIPTION/UNMETERED semantics unchanged; advisory pre-check kept. Finding A verdict held: SAFE_BY_EXISTING_PROOF_WITH_TWO_INCONCLUSIVE_TAMPER_EDGES (A2a wob.mission_id unverified, A3b >8-hop claim + missing leaf alloc -> manual; both need non-canonical row writes \u2014 hardening notes only, objectiveScopeFor unchanged). Tests: B1 deny+no-row+evidence, B2 stable-metered deny, B3 no-halt flip pins new price; audit test file committed as evidence. No merge/deploy; driver OFF."
+  "description": "Closes the P15.10-C KPI-UNVERIFIED gap proven on the live op-test: mission COMPLETED + artifact ACCEPTED never produced KPI progress. Adds ONE delegated verifier contract: owner-scoped grant entity objective_kpi_auto_authorization (KVA_) pinning business+objective+kpi+DELIVERABLE_BUNDLE rule+terms_version+expires_at (default OFF, ONE enabled grant per (objective,kpi), revocable/disabling, non-owner create denied). New verifier kind kpi-verifier:<auth_id> inside objective-authority assertOwnerVerifier — never operator:<owner> impersonation; writer identity is the single canonical PAIR_KPI_VERIFIER. ObjectiveKpiVerificationService re-derives every fact in one transaction: workstream child folded DONE + WAL lineage + business.boundMissionForWorkItem + assertCanonicalMissionCompletion + >=1 ACCEPTED artifact bound through its governed_task/mission — filename/path/executor self-report/LLM opinion never count. On satisfaction it writes immutable kpi_verification_receipt (KVR_, digest-bound units/value/terms) and calls the EXISTING recordProgress seam with evidence_key kva:<auth>:<receipt_id> — the P15.1 ledger gives idempotent replay and same-key-different-semantics conflict. P15.5 assertCanonicalObjectiveKpiProgress re-validates the same grant+receipt proof (expires/terms/revoke/terms-drift all fail closed, including retroactively). Operating pass calls kpiVerification.advance once per ACTIVE pass before §6 — TARGET_MET_CANDIDATE unchanged, never auto-ACHIEVED. MC route POST /api/vnext/objectives/:id/kpi-verification owner-scoped grant/revoke/disable/status. Tests: acceptance reproduces the P15.10-C gap (pre UNVERIFIED → partial UNVERIFIED → all verified MET → TARGET_MET_CANDIDATE + owner gate) + 15 adversarial vectors (forged/unaccepted/tampered artifact, cross-mission/business evidence, executor self-report, replay, key-conflict, racing verifiers, revoke/terms-drift/terminal, foreign-kpi claim, out-of-scope KPI type) + grant contract edges. No merge/deploy; driver unchanged OFF."
 }

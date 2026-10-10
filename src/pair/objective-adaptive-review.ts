@@ -41,6 +41,11 @@ import {
 import type { PairEvidenceStore } from "./store.js";
 import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
 import {
+  KPI_VERIFIER_KIND,
+  assertKpiVerifierAuthority,
+  verifierRefOf,
+} from "./objective-kpi-verifier-authority.js";
+import {
   OBJECTIVE_ENTITY,
   progressSemantics,
   spendSemantics,
@@ -191,10 +196,32 @@ export function assertCanonicalObjectiveKpiProgress(
     if (!evRef) {
       reviewFail(`kpi ${kpi.kpi_id}: last_evidence_key ${lek} has no PROGRESS ref`);
     }
-    // P15.1 owner-verifier semantics — the only canonical verifier is
-    // the owner-authorized operator. Never weaken this.
-    if (String(evRef.verifier) !== String(objective.owner_authority_id)) {
-      reviewFail(`kpi ${kpi.kpi_id}: progress verifier is not the owner authority`);
+    // P15.1 owner-verifier semantics — the only canonical verifiers are
+    // the owner-authorized operator, or (P15.10-D) a live scoped grant +
+    // digest-bound receipt the shared validator can fully re-derive. Any
+    // other verifier identity fails closed — owner impersonation cannot
+    // produce a valid kpi-verifier chain.
+    const evVerifier = String(evRef.verifier);
+    if (evVerifier !== String(objective.owner_authority_id)) {
+      if (!evVerifier.startsWith(`${KPI_VERIFIER_KIND}:`) ||
+          !verifierRefOf(evVerifier, KPI_VERIFIER_KIND)) {
+        reviewFail(`kpi ${kpi.kpi_id}: progress verifier is not the owner authority`);
+      }
+      try {
+        assertKpiVerifierAuthority({
+          store,
+          objective,
+          kpi_id: String(kpi.kpi_id),
+          verifier: evVerifier,
+          evidence_key: lek,
+          value: current,
+        });
+      } catch (err) {
+        reviewFail(
+          `kpi ${kpi.kpi_id}: delegated verifier re-validation failed ` +
+            `(${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
     }
     const ledgerEntry = ledger.find((e) => String(e.key) === lek);
     if (!ledgerEntry) {

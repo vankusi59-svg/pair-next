@@ -365,7 +365,7 @@ export function createMissionControlServer(
   // ceo-cycle call so an unavailable/unqualified CEO model fails
   // closed on that route alone and can never take the server down at
   // boot. Resolved once, then cached for the process lifetime.
-  let ceoOps: { service: ObjectiveOperatingService; model_entry_id: string } | null = null;
+  let ceoOps: ReturnType<typeof createDefaultObjectiveOperatingService> | null = null;
   // P15.10-A — objective auto-policy authority (control plane only;
   // no driver). Owner proof comes ONLY from the trusted x-operator-id
   // header — a body-declared owner field is never authority here.
@@ -1239,6 +1239,55 @@ export function createMissionControlServer(
           objective_id: m[1], actor: String(operator),
         });
         return void json(res, 200, out);
+      }
+      // ----- P15.10-D — owner-scoped KPI auto-verification grants -----
+      // grant/revoke/disable/status: owner-only, fails closed via the
+      // service's authority contract. Grants are the ONLY opt-in path for
+      // delegated KPI progress writes; default OFF everywhere else.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/kpi-verification$/);
+      if (method === "POST" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "OPERATING_LOOP_DISABLED" });
+        }
+        ceoOps ??= createDefaultObjectiveOperatingService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          invoker: deps.ceoInvoker,
+        });
+        const svc = ceoOps.kpiVerification;
+        const rawActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const kpiActor = rawActor.startsWith("operator:")
+          ? rawActor : `operator:${rawActor}`;
+        const action = String(body.action ?? "");
+        if (action === "status") {
+          return void json(res, 200, svc.status(m[1]!, kpiActor));
+        }
+        if (action === "grant") {
+          return void json(res, 200, svc.grant(m[1]!, {
+            actor: kpiActor,
+            kpi_id: String(body.kpi_id ?? ""),
+            rule: body.rule,
+            expires_at: String(body.expires_at ?? ""),
+            idempotency_key: String(body.idempotency_key ?? crypto.randomUUID()),
+          }));
+        }
+        if (action === "revoke" || action === "disable") {
+          return void json(res, 200, svc.control(m[1]!, String(body.authorization_id ?? ""), {
+            actor: kpiActor,
+            action,
+            idempotency_key: String(body.idempotency_key ?? crypto.randomUUID()),
+          }));
+        }
+        throw new IntegrityError("FAIL_CLOSED_KPI_VERIFY", `action ${action} unsupported`);
       }
       // ----- P15.10-B — owner-scoped RECONCILE_ONLY scheduler status -----
       m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-scheduler$/);
