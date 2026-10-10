@@ -5,9 +5,6 @@
     "UI"
   ],
   "required_tests": [
-    "apps/mission-control-ui/e2e/workforce-admin.spec.ts",
-    "apps/mission-control-ui/e2e/workforce.spec.ts",
-    "apps/mission-control-ui/e2e/app.spec.ts",
     "src/__tests__/pair-p14-workforce-v2.test.ts",
     "src/__tests__/pair-p12.test.ts"
   ],
