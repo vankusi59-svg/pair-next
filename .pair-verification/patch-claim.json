@@ -1,20 +1,20 @@
 {
-  "claim_id": "P15_10_MET_BRANCH_LIFECYCLE_FOLD_HOTFIX",
-  "title": "P15.10 MET-branch hotfix: fold delegated children before TARGET_MET_CANDIDATE review",
+  "claim_id": "P15_9A_COMPANY_COCKPIT_READ_PROJECTIONS",
+  "title": "P15.9-A1: canonical read-only Company Cockpit projections (cockpit + reviews + company) on owner-scoped vnext routes",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
-    "RECOVERY_REPLAY"
+    "MISSION_CONTROL"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-9a-company-cockpit.test.ts",
     "src/__tests__/pair-p15-10d-met-branch-fold.test.ts",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
     "src/__tests__/pair-p15-10d.test.ts",
     "src/__tests__/pair-p15-10d-r1.test.ts",
     "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-p15-5-kpi-review.test.ts",
-    "src/__tests__/pair-p15-10c.test.ts",
-    "src/__tests__/pair-p14-wfv2-p3.test.ts"
+    "src/__tests__/pair-p15-5-kpi-review.test.ts"
   ],
   "invariants": [],
   "risk_override": "MEDIUM",
-  "description": "Forensic-confirmed defect on BASE 95c7a71: ObjectiveOperatingLoop.pass() early-returns TARGET_MET_CANDIDATE at the allTargetsMet gate (§6) BEFORE §9 reconcileDelegatedChildren — the only runtime fold seam for IN_PROGRESS delegated children with terminal bound missions. Once KPI is MET the seam is unreachable; a child left IN_PROGRESS with a COMPLETED bound mission never folds at runtime (live evidence: DL_aec59cae in P15.10-D Core E2E V3; KPI MET 04:43:15Z, mission terminal 04:44:25Z — fold window never existed). Fix (minimal, audit-proposed): inside the allTargetsMet+binding branch, re-derive the canonical observation and call the EXISTING reconcileDelegatedChildren BEFORE the deterministic P15.5 review commits. Reconcile only touches INTERVENTION+IN_PROGRESS children whose bound missions are canonically terminal; syncWorkItem re-proves lineage and materializes WCP only when provable (FAILED→BLOCKED, review-required→REVIEW_REQUIRED, forged claims→quarantine/fail-closed). Non-MET flow byte-identical. Suite pair-p15-10d-met-branch-fold.test.ts: 8 tests (T1-T6) — MET-while-RUNNING, terminal-unfolded fold, idempotency, forged-claim fail-closed, FAILED→BLOCKED, non-MET §9 regression + MET-blocks-allocation + step-bound convergence. All green; P15.6/P15.10-D/P15.10-C/P15.5/WFV2-P3 regressions green. No merge/deploy."
+  "description": "P15.9-A1 on BASE e24e334 (post PR #90): backend canonical read-only projections for the Company Cockpit — no UI, no owner mutations (A2 deferred by owner decision). ObjectiveCockpitService composes EXISTING strict reads only: objectives.get + buildReviewObservation (KPI/budget/binding/WAL/mission re-proved, throws on corruption) + canonicalAdaptiveReviewsFor + boundMissionForWorkItem + filtered artifact refs. New GET routes: /api/vnext/objectives/:id/cockpit, /:id/reviews?limit=, /api/vnext/businesses/:id/company. Authority = same owner-scope contract as auto-policy routes: actor from x-operator-id only; owner_authority_id match required; foreign objective -> FAIL_CLOSED_COCKPIT_AUTHORITY (403); actor owning nothing in business -> FAIL_CLOSED_COMPANY_SCOPE (403); missing header -> 403; tampered canonical state -> FAIL_CLOSED* (409). Read-only: no store.put/event reachable; board()/detail() avoided (they fold on read). Selective fields only — no raw rows, no storage paths/secrets. buildReviewObservation narrowed to Omit<deps,'ceoCycle'> (never read on read path; no semantic change). TARGET_MET_CANDIDATE never conflated with objective.status ACHIEVED. Suite pair-p15-9a-company-cockpit.test.ts: 11 tests — projection truth, multi-objective scope, foreign/non-owner denial, tamper fail-closed, ordering/bounds, CANDIDATE!=ACHIEVED, MET+incomplete-workstream honesty, no-write invariant, real-server 403s. Regressions 211 green. No merge/deploy."
 }
