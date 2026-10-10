@@ -302,6 +302,23 @@ export function detectTelegramDeliveryIntent(
       );
       if (adjacent) continue;
     }
+    // `báo` — same compound-noun trap as `post`: in Vietnamese it is a
+    // delivery verb only as a free word ("báo kết quả qua telegram"),
+    // never inside the compound nouns `báo cáo` (report), `chỉ báo`
+    // (indicator) or `quảng bá` (promotion). Without this guard every
+    // research goal mentioning a report/indicator near "Telegram" mints
+    // unauthorized send authority and plan validation fails closed
+    // (P15.10-D E2E: 3 governed missions died on
+    // FAIL_CLOSED_DELIVERY_TASK_MISSING).
+    if (/^báo$/iu.test(m[0])) {
+      const vEnd = v + m[0].length;
+      if (
+        /^\s+cáo(?![\p{L}\p{N}\p{M}_])/iu.test(text.slice(vEnd)) ||
+        /(?:chỉ|quảng)\s+$/iu.test(text.slice(0, v))
+      ) {
+        continue;
+      }
+    }
     const clause = mentions.some((p) => Math.abs(p.start - v) <= CLAUSE_SPAN);
     if (!clause || clauseNegated(text, v)) continue;
     requested = true;

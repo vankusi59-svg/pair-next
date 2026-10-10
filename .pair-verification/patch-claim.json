@@ -1,28 +1,24 @@
 {
-  "claim_id": "P15_10_D_R1_AUTHORITY_PROOF_HARDENING",
-  "title": "P15.10-D R1: artifact CAS re-verification + grant dedup + receipt-auth binding",
+  "claim_id": "TELEGRAM_DELIVERY_INTENT_BAO_COMPOUND_HOTFIX",
+  "title": "Delivery intent hotfix: bare `báo` inside compound nouns (báo cáo/chỉ báo/quảng bá) must not authorize a send",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL",
-    "ARTIFACT",
+    "DELIVERY",
+    "TELEGRAM_INGRESS",
     "GATE_ROUTER"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10d-r1.test.ts",
-    "src/__tests__/pair-p15-10d.test.ts",
-    "src/__tests__/pair-p15-1-objective-authority.test.ts",
-    "src/__tests__/pair-p15-5-kpi-review.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts",
-    "src/__tests__/pair-p15-10c.test.ts",
-    "src/__tests__/pair-p15-10c-r1.test.ts",
-    "src/__tests__/pair-p15-10c-r2.test.ts",
-    "src/__tests__/pair-p15-10c-r3.test.ts",
-    "src/__tests__/pair-p15-10c-r4.test.ts",
-    "src/__tests__/pair-p15-10c-final-audit.test.ts"
+    "src/__tests__/pair-delivery-intent-compound.test.ts",
+    "src/__tests__/pair-planner-dataflow-incident.test.ts",
+    "src/__tests__/pair-ops-telegram-delivery.test.ts",
+    "src/__tests__/pair-output-delivery-contract.test.ts",
+    "src/__tests__/pair-f4-delivery-provenance.test.ts",
+    "src/__tests__/pair-p15-8e-telegram.test.ts",
+    "src/__tests__/pair-p15-8-hotfix1-delivery-injection.test.ts",
+    "src/__tests__/pair-planner-contract-simplify.test.ts",
+    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
+    "src/__tests__/pair-pgrammar2-remote-edge.test.ts"
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "R1 on PR #88 (BASE 88470ee). F1 CONFIRMED+FIXED: verifiedUnits trusted artifact.state==ACCEPTED rows only — deleted/tampered retained CAS bytes still minted progress. Fix: the service takes ArtifactAuthority (canonical blobDir = PAIR_ARTIFACT_DIR ?? dbDir/artifacts/blobs, same resolver as telegram-delivery) and re-verifies every candidate via verifyArtifactForConsumption (acceptance history + canonical shape + retained bytes NOW) inside the same txn; corruption fails closed. F2 CONFIRMED+FIXED: grant() stored dedup_key but never consulted it — replay after revoke minted a fresh ENABLED grant. Fix: dedup scan inside the txn before the enabled-check — same (objective,key)+same semantics (business,kpi,rule_digest,expires_at,owner,created_by) returns the stored row (REVOKE durable), different semantics fails closed, dups converge. F3 CONFIRMED+FIXED in shared assertKpiVerifierAuthority: added receipt.authorization_id===verifier auth, receipt.evidence_key===claim key, receipt.rule_digest===grant.rule_digest — revoked-grant receipts and tampered grant rules no longer satisfy new verifiers; write path and P15.5 strict read share the contract. F4 VERIFIED (no change): revoke/expire after progress makes strict read fail closed FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW; persisted value untouched; owner re-verification recovers. F5 VERIFIED (documented): DELIVERABLE_BUNDLE proves canonical deliverable completion only; receipt.verified_units binds workstream/work_item/mission/artifact ids — no content semantics, no AI judge. R1 suite: 10 tests, prepatch FAIL→postpatch PASS; 22 original + 340 regressions green. No merge/deploy."
+  "description": "Owner-approved minimal hotfix (BASE 95c7a71). CONFIRMED on the P15.10-D post-merge E2E stack: three real governed mission goals (Vietnamese, CEO-authored) died on FAIL_CLOSED_DELIVERY_TASK_MISSING because DELIVERY_VERB_RE matched bare `báo` inside compound nouns `báo cáo` (report), `chỉ báo` (indicator), `quảng bá` (promotion), each within CLAUSE_SPAN of a Telegram mention, unnegated -> requested:true minted unauthorized send authority and the planner correctly emitted no delivery task. Fix in detectTelegramDeliveryIntent only, mirroring the existing `post` special-case: a bare `báo` match is skipped when the next word is `cáo` or the previous word is `chỉ`/`quảng` (Unicode-safe bounded context checks). Grammar unchanged otherwise; negation, clause span, artifact manifest and the pinned true-positive `báo kết quả qua telegram` -> requested:true all preserved. New suite pair-delivery-intent-compound.test.ts pins the 3 real E2E goals plus N1-N8 negatives and P1-P6 positives: prepatch 8 FAIL -> postpatch 17/17 PASS. Regressions: planner-dataflow-incident (incl. R3 intent contract), ops-telegram-delivery, output-delivery-contract, f4-delivery-provenance, p15-8e-telegram, p15-8-hotfix1, contract-simplify, prv2b-goal-coverage, pgrammar2 all green except ONE pre-existing baseline failure (f4-delivery-provenance R5.1-crash) which fails identically on unmodified BASE. tsc clean, build green. Known limitation documented for owner: a genuinely intended send phrased `báo cáo ...` is now skipped (fail-closed toward no-send; operators use gửi/đăng/đẩy). No merge, no deploy."
 }
