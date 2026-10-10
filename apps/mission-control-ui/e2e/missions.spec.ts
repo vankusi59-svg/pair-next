@@ -363,3 +363,171 @@ test("canonical failure codes surface honestly", async ({ page }) => {
   await page.goto("/app/missions/MIS_DOES_NOT_EXIST_e2e");
   await expect(page.getByText(/404|NOT_FOUND|FAIL_CLOSED|MALFORMED/).first()).toBeVisible();
 });
+
+/* ================= R1 audit findings ================= */
+
+const detPayload = (over: Record<string, unknown> = {}) => JSON.stringify({
+  mission: { mission_id: "MSN_x", goal: "adversarial", status: "RUNNING",
+    bound_open_id: null, metadata: {}, ...((over.mission ?? {}) as object) },
+  runtime: { state: "RUNNING" },
+  task_count: 0, tasks: [], executions: [], approvals_pending: [],
+  ...over,
+});
+
+const interceptDetail = async (page: Page, mid: string, over: Record<string, unknown> = {}) => {
+  await page.route(`**/api/missions/${mid}`, (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: detPayload({ ...over, mission: { mission_id: mid, goal: "adversarial", status: "RUNNING", bound_open_id: null, metadata: {}, ...((over.mission ?? {}) as object) } }) }));
+};
+
+/* R1-F1: bound_open_id is an open_id, never an objective_id — backlink
+   only when mission→binding→work item→objective fully verifies. */
+test("R1-F1: objective backlink requires full canonical chain", async ({ page }) => {
+  const mid = "MSN_lin1";
+  /* fully proven chain → link rendered */
+  await interceptDetail(page, mid, { mission: {
+    bound_open_id: "OPEN_a1",
+    metadata: { work_item_id: "WI_a1", work_item_open_id: "OPEN_a1", business_id: "BIZ_a1" } } });
+  await page.route("**/api/work-items?business_id=BIZ_a1", (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: '{"work_items":[{"work_item_id":"WI_a1","objective_id":"OBJ_proven","business_id":"BIZ_a1"}]}' }));
+  await page.goto(`/app/missions/${mid}`);
+  const link = page.getByRole("link", { name: /← Objective/ });
+  await expect(link).toBeVisible();
+  await expect(link).toHaveAttribute("href", "/app/objectives/OBJ_proven");
+});
+
+test("R1-F1: non-objective bound_open_id never becomes an Objective URL", async ({ page }) => {
+  const mid = "MSN_lin2";
+  /* bound_open_id set but metadata chain absent → omit, document */
+  await interceptDetail(page, mid, { mission: { bound_open_id: "OPEN_NOPE" } });
+  await page.goto(`/app/missions/${mid}`);
+  await expect(page.locator("h1")).toContainText(mid);
+  await expect(page.getByRole("link", { name: /← Objective/ })).toHaveCount(0);
+  await expect(page.getByText(/lineage unproven/)).toBeVisible();
+  expect(page.url()).not.toContain("/app/objectives/OPEN_NOPE");
+});
+
+test("R1-F1: bound_open_id + WI without objective → still no link", async ({ page }) => {
+  const mid = "MSN_lin3";
+  await interceptDetail(page, mid, { mission: {
+    bound_open_id: "OPEN_b1",
+    metadata: { work_item_id: "WI_b1", work_item_open_id: "OPEN_b1", business_id: "BIZ_b1" } } });
+  await page.route("**/api/work-items?business_id=BIZ_b1", (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: '{"work_items":[{"work_item_id":"WI_b1","business_id":"BIZ_b1"}]}' }));
+  await page.goto(`/app/missions/${mid}`);
+  await expect(page.getByRole("link", { name: /← Objective/ })).toHaveCount(0);
+  await expect(page.getByText(/lineage unproven/)).toBeVisible();
+});
+
+/* R1-F2: late preview response for old inputs never renders/commits. */
+test("R1-F2: delayed preview for goal A discarded after edit to B", async ({ page }) => {
+  let release: ((r: Route) => void) | null = null;
+  await page.route("**/api/missions/preview", (r: Route) => { release = () => r.fulfill({
+    status: 200, contentType: "application/json",
+    body: JSON.stringify({ preview_id: "PV_A", plan_digest: "a".repeat(64),
+      plan: { tasks: [{ task_key: "T1", title: "t", task_instruction: "i", depends_on: [], required_capabilities: [] }] },
+      plan_source: null, plan_model: null }) }); });
+  const confirms: string[] = [];
+  await countPosts(page, confirms);
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill("goal-A");
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  /* edit inputs while the preview is in flight */
+  await page.getByLabel("goal").fill("goal-B");
+  release!();
+  await page.waitForTimeout(300);
+  await expect(page.getByText("Proposed plan")).toHaveCount(0);
+  expect(confirms.filter((u) => u.includes("confirm"))).toEqual([]);
+});
+
+test("R1-F2: auto-confirm toggled OFF mid-flight → manual preview, zero confirm POSTs", async ({ page }) => {
+  let release: ((r: Route) => void) | null = null;
+  await page.route("**/api/missions/preview", (r: Route) => { release = () => r.fulfill({
+    status: 200, contentType: "application/json",
+    body: JSON.stringify({ preview_id: "PV_A2", plan_digest: "b".repeat(64),
+      plan: { tasks: [{ task_key: "T1", title: "t", task_instruction: "i" }] },
+      plan_source: null, plan_model: null }) }); });
+  const confirms: string[] = [];
+  await countPosts(page, confirms);
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill("goal-auto");
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.locator("#autoc").check();
+  await page.getByRole("button", { name: /Preview & execute/ }).click();
+  await page.locator("#autoc").uncheck();
+  release!();
+  await page.waitForTimeout(300);
+  /* late response renders as manual preview — never auto-commits */
+  await expect(page.getByText("Proposed plan")).toBeVisible();
+  expect(confirms.filter((u) => u.includes("/missions/confirm"))).toEqual([]);
+});
+
+/* R1-F3: malformed detail collections → per-section MALFORMED. */
+test("R1-F3: malformed detail collections fail per-section", async ({ page }) => {
+  const mid = "MSN_coll";
+  await interceptDetail(page, mid, {
+    tasks: [null], executions: [null], approvals_pending: null });
+  await page.goto(`/app/missions/${mid}`);
+  await expect(page.locator("h1")).toContainText(mid);
+  await expect(page.getByText(/tasks collection unavailable/)).toBeVisible();
+  await expect(page.getByText(/executions collection unavailable/)).toBeVisible();
+  await expect(page.getByText(/approvals collection unavailable/)).toBeVisible();
+  /* never a fabricated "(0)" canonical count */
+  await expect(page.getByRole("heading", { name: "Tasks (0)" })).toHaveCount(0);
+});
+
+test("R1-F3: preview task with invalid caps/deps → INVALID_PREVIEW", async ({ page }) => {
+  await page.route("**/api/missions/preview", (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ preview_id: "PV_c", plan_digest: "c".repeat(64),
+        plan: { tasks: [{ task_key: "T1", required_capabilities: "not-an-array" }] } }) }));
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill(`e2e-r1f3-${uniq()}`);
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  await expect(page.getByText(/INVALID_PREVIEW/)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Confirm & run/ })).toHaveCount(0);
+});
+
+/* R1-F4: delayed file read on A never lands on B's page. */
+test("R1-F4: late file result for A never lands on B", async ({ page }) => {
+  const a = await mkMission(page, `e2e-r1f4-a-${uniq()}`);
+  const b = await mkMission(page, `e2e-r1f4-b-${uniq()}`);
+  let release: ((r: Route) => void) | null = null;
+  await page.route(`**/api/missions/${a}/files?path=*`, (r: Route) => { release = () => r.fulfill({
+    status: 200, contentType: "application/json",
+    body: JSON.stringify({ path: "a-secret.txt", content: "A-CONTENT-MARKER", truncated: false }) }); });
+  await page.route(`**/api/missions/${a}/files`, (r: Route) =>
+    r.request().url().includes("?path=") ? undefined : r.fulfill({
+      status: 200, contentType: "application/json",
+      body: '{"files":[{"path":"a-secret.txt","size":10,"modified_at":"2026-01-01T00:00:00Z"}]}' }));
+  await page.route(`**/api/missions/${b}/files`, (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: '{"files":[]}' }));
+  await page.goto(`/app/missions/${a}`);
+  await page.getByText("a-secret.txt").click();
+  await page.goto(`/app/missions/${b}`);
+  release!();
+  await page.waitForTimeout(400);
+  await expect(page.getByText("A-CONTENT-MARKER")).toHaveCount(0);
+  await expect(page.locator("h1")).toContainText(b);
+});
+
+/* R1 deterministic lifecycle failure: intercepted RUNNING + failed
+   pause → AMBIGUOUS, no optimistic flip, no auto-retry. */
+test("R1: failed pause on verified RUNNING state → ambiguous, no optimistic flip", async ({ page }) => {
+  const mid = "MSN_run1";
+  await interceptDetail(page, mid, { runtime: { state: "RUNNING" } });
+  const posts: string[] = [];
+  await countPosts(page, posts);
+  await page.route(`**/api/missions/${mid}/pause`, (r: Route) =>
+    r.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' }));
+  await page.goto(`/app/missions/${mid}`);
+  await page.getByRole("button", { name: "Pause…" }).click();
+  await page.getByRole("dialog").locator("button.primary").click();
+  await expect(page.locator(".trunc[role='status']")).toContainText(/AMBIGUOUS/);
+  await expect(page.getByText("RUNNING").first()).toBeVisible(); // state never flipped
+  expect(posts.filter((u) => u.endsWith("/pause"))).toHaveLength(1);
+});

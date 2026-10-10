@@ -30,9 +30,17 @@ type Pinned = {
 };
 
 function taskRows(tasks: Array<Record<string, unknown>>) {
-  return tasks.every(
-    (t) => t !== null && typeof t === "object" && t.task_key != null,
-  );
+  /* R1-F3: every task needs a task_key; capabilities/depends_on, when
+     present, must be arrays of strings — malformed structure is never
+     silently coerced into a valid-looking plan. */
+  return tasks.every((t) => {
+    if (t === null || typeof t !== "object" || t.task_key == null) return false;
+    if (t.required_capabilities != null
+      && !(Array.isArray(t.required_capabilities) && t.required_capabilities.every((c) => typeof c === "string"))) return false;
+    if (t.depends_on != null
+      && !(Array.isArray(t.depends_on) && t.depends_on.every((d) => typeof d === "string"))) return false;
+    return true;
+  });
 }
 
 export function MissionNew() {
@@ -47,6 +55,10 @@ export function MissionNew() {
   const [confirming, setConfirming] = useState(false);
   const [autoConfirm, setAutoConfirm] = useState(false); /* opt-in, default OFF */
   const seq = useRef(0);
+  /* R1-F2: refs mirror live state so async continuations compare against
+     CURRENT inputs — a stale render closure can never validate a stale pin. */
+  const inputsRef = useRef({ projectId: "", goal: "", auto: false });
+  inputsRef.current = { projectId, goal, auto: autoConfirm };
 
   useEffect(() => {
     const ctl = new AbortController();
@@ -76,7 +88,9 @@ export function MissionNew() {
   );
   const inputsValid = st.kind === "ready" && goal.trim().length > 0 && projectId.length > 0 && project !== undefined;
 
-  const invalidate = () => { setPreview(null); setConfirming(false); };
+  /* R1-F2: bump the generation so any in-flight preview belonging to
+     previous inputs is ignored when it lands. */
+  const invalidate = () => { seq.current++; setPreview(null); setConfirming(false); };
 
   const payload = () => ({
     project_id: projectId,
@@ -92,12 +106,18 @@ export function MissionNew() {
       return;
     }
     const s = ++seq.current;
+    /* R1-F2: pin the exact request inputs — a late response is applied
+       only if they still match the current effective inputs. */
+    const pinnedInputs = { project_id: projectId, goal: goal.trim() };
+    const wasAuto = autoConfirm;
     setBusy(true);
     setPreviewErr(null);
     setMutNote(null);
     try {
       const r: MissionPreview = await apiAdmin.previewMission(payload());
       if (s !== seq.current) return;
+      if (pinnedInputs.project_id !== inputsRef.current.projectId
+        || pinnedInputs.goal !== inputsRef.current.goal.trim()) return;
       /* persisted-preview validation: needs preview_id + digest + a
          non-empty valid task list — else it is an invalid preview, never
          rendered as a valid empty plan */
@@ -117,8 +137,9 @@ export function MissionNew() {
         project_id: projectId,
         goal: goal.trim(),
       };
-      if (autoConfirm) {
-        /* opt-in parity mode: same single confirm seam, still explicit */
+      /* auto-confirm toggled OFF while the request was in flight → the
+         late response renders as a normal manual preview, never commits */
+      if (wasAuto && inputsRef.current.auto) {
         await commit(pinned);
         return;
       }
@@ -133,6 +154,14 @@ export function MissionNew() {
   };
 
   const commit = async (p: Pinned) => {
+    /* R1-F2/F3: re-verify the pinned inputs still match before the POST —
+       a stale pin must never execute an outdated mission. */
+    if (p.project_id !== inputsRef.current.projectId || p.goal !== inputsRef.current.goal.trim()) {
+      setMutNote("Preview is stale — inputs changed. Request a fresh preview.");
+      setPreview(null);
+      setConfirming(false);
+      return;
+    }
     const s = ++seq.current;
     setBusy(true);
     setMutNote(null);

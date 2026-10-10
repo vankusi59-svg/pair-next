@@ -15,6 +15,18 @@ import type { Dag, MissionDetail as Detail, MissionFileRow, TimelineEntry } from
    state, canonical refetch after success. */
 
 type Section<T> = { kind: "ready"; data: T } | { kind: "unavailable"; code: string };
+type Lineage = { objective_id: string; work_item_id: string; open_id: string };
+
+/* R1-F3: validate a mission-detail collection before rendering —
+   non-array / non-object / identity-less elements = MALFORMED, never a
+   fabricated canonical empty list. */
+function collSec(v: unknown, idf: (e: Record<string, unknown>) => boolean): Section<Array<Record<string, unknown>>> {
+  if (!Array.isArray(v)) return { kind: "unavailable", code: "MALFORMED" };
+  if (!v.every((e) => e !== null && typeof e === "object" && idf(e as Record<string, unknown>))) {
+    return { kind: "unavailable", code: "MALFORMED" };
+  }
+  return { kind: "ready", data: v as Array<Record<string, unknown>> };
+}
 type Dlg = { op: "pause" | "resume" | "cancel" | "acknowledge"; mission: string; state: string };
 
 type St =
@@ -27,6 +39,7 @@ type St =
       timeline: Section<TimelineEntry[]>;
       evidence: Section<Array<Record<string, unknown>>>;
       files: Section<MissionFileRow[]>;
+      lineage: Lineage | null;
     }
   | { kind: "error"; err: ApiError };
 
@@ -66,6 +79,9 @@ export function MissionDetailPage() {
   useEffect(() => {
     const identChanged = lastIdent.current !== id;
     lastIdent.current = id;
+    /* R1-F4: mission switch invalidates every outstanding mutation/file
+       generation — an in-flight result for A can never land on B. */
+    if (identChanged) seq.current++;
     setDlg(null); setMutBusy(false); setFileView(null); setFileErr(null);
     if (identChanged) setMutNote(null); /* post-mutation notes survive a canonical refetch */
     setSt({ kind: "loading" });
@@ -89,13 +105,38 @@ export function MissionDetailPage() {
         return;
       }
       /* identity verified → subordinate reads settle independently */
-      const [dagR, tlR, evR, fR] = await Promise.allSettled([
+      const miMeta = (d.mission.metadata ?? {}) as Record<string, unknown>;
+      /* R1-F1 canonical lineage chain (no new backend route):
+         mission.bound_open_id is a work_open_binding.open_id — NOT an
+         objective_id. Proven chain: bound_open_id === the mission's own
+         server-stamped metadata.work_item_open_id mirror AND
+         metadata.work_item_id resolves via GET /api/work-items (scoped
+         by the stamped business_id when present) to a row whose
+         objective_id is real. Any break → omit the backlink. */
+      const openId = String((d.mission.bound_open_id as string | undefined) ?? "");
+      const wiId = String(miMeta.work_item_id ?? "");
+      const wiOpen = String(miMeta.work_item_open_id ?? "");
+      const bizId = String(miMeta.business_id ?? "");
+      /* business_id mirror must exist for the scoped work-items read —
+         without it the chain cannot be proven, so the backlink is
+         omitted (never an unfiltered guess). */
+      const wantLineage = openId !== "" && wiOpen === openId && wiId !== "" && bizId !== "";
+      const [dagR, tlR, evR, fR, wiR] = await Promise.allSettled([
         apiAdmin.missionDag(id, ctl.signal),
         apiAdmin.missionTimeline(id, ctl.signal),
         apiAdmin.missionEvidence(id, ctl.signal),
         apiAdmin.missionFiles(id, ctl.signal),
+        wantLineage ? apiAdmin.workItems(bizId, ctl.signal) : Promise.resolve(null),
       ]);
       if (ctl.signal.aborted) return;
+      let lineage: Lineage | null = null;
+      if (wantLineage && wiR.status === "fulfilled" && wiR.value) {
+        const wis = (wiR.value as { work_items?: unknown[] }).work_items;
+        const warr = (Array.isArray(wis) ? wis : []) as Array<Record<string, unknown>>;
+        const wi = warr.find((w) => String(w.work_item_id) === wiId);
+        const objId = wi && typeof wi === "object" ? String(wi.objective_id ?? "") : "";
+        if (objId) lineage = { objective_id: objId, work_item_id: wiId, open_id: openId };
+      }
       const dagSec = (() => {
         const s = sect(dagR, (v) => (v && Array.isArray(v.nodes) && Array.isArray(v.edges) ? [v as Dag] : null));
         /* deeper: every node needs task_id+task_key; edges need from/to */
@@ -115,6 +156,7 @@ export function MissionDetailPage() {
         timeline: sect(tlR, (v) => (Array.isArray(v) ? v : null), "at"),
         evidence: sect(evR, (v) => (Array.isArray(v) ? v : null), "kind"),
         files: sect(fR, (v) => (v && Array.isArray(v.files) ? v.files : null), "path"),
+        lineage,
       });
     })();
     return () => ctl.abort();
@@ -128,18 +170,21 @@ export function MissionDetailPage() {
     setMutNote(null);
     try {
       await apiAdmin.missionAction(d.mission, d.op);
-      if (s !== seq.current) return;
+      /* R1-F4: a mutation result for mission A must never land on B */
+      if (s !== seq.current || d.mission !== lastIdent.current) return;
       setMutNote(`${d.op} accepted by the backend — canonical state refetched.`);
       setTick((t) => t + 1);
     } catch (e) {
       if (s !== seq.current) return;
-      setMutNote(
-        e instanceof ApiError
-          ? e.status === 0 || e.status >= 500
-            ? `${d.op} result AMBIGUOUS (${e.code}) — may have committed; canonical state refetch required before retrying.`
-            : `${d.op} failed: ${e.detail || e.message} (${e.code})`
-          : `${d.op} result AMBIGUOUS — ${String(e)}`,
-      );
+      if (s === seq.current && d.mission === lastIdent.current) {
+        setMutNote(
+          e instanceof ApiError
+            ? e.status === 0 || e.status >= 500
+              ? `${d.op} result AMBIGUOUS (${e.code}) — may have committed; canonical state refetch required before retrying.`
+              : `${d.op} failed: ${e.detail || e.message} (${e.code})`
+            : `${d.op} result AMBIGUOUS — ${String(e)}`,
+        );
+      }
     } finally {
       if (s === seq.current) setMutBusy(false);
     }
@@ -155,10 +200,15 @@ export function MissionDetailPage() {
   const mission = d.mission as Record<string, unknown>;
   const rt = (d.runtime ?? {}) as Record<string, unknown>;
   const state = String(rt.state ?? mission.state ?? mission.status ?? "");
-  const tasks = Array.isArray(d.tasks) ? d.tasks : [];
-  const execs = Array.isArray(d.executions) ? d.executions : [];
-  const approvals = Array.isArray(d.approvals_pending) ? d.approvals_pending : [];
-  const openId = mission.bound_open_id ? String(mission.bound_open_id) : null;
+  /* R1-F3: collection integrity — malformed rows never render as a
+     canonical empty list; sections stay independent. */
+  const tasksSec = collSec(d.tasks, (e) => e.task_key != null || e.task_id != null);
+  const execsSec = collSec(d.executions, (e) => e.execution_id != null);
+  const apprSec = collSec(d.approvals_pending, (e) => e.approval_id != null || e.entity_id != null);
+  const tasks = tasksSec.kind === "ready" ? tasksSec.data : [];
+  const execs = execsSec.kind === "ready" ? execsSec.data : [];
+  const approvals = apprSec.kind === "ready" ? apprSec.data : [];
+  const lineage = st.lineage;
 
   const unv = (label: string, code: string) => (
     <div className="need"><div className="nrow"><StatusBadge tone="warn" label="UNAVAILABLE" /><span className="note">{label} unavailable ({code}) — not shown as empty.</span></div></div>
@@ -169,10 +219,14 @@ export function MissionDetailPage() {
       <h1>Mission <span className="mono">{id}</span></h1>
       <p className="sub srcnote">Canonical reads only — every action below POSTs through the existing lifecycle endpoints after an explicit confirmation.</p>
 
-      {openId ? (
+      {lineage ? (
         <div className="nrow" style={{ margin: "6px 0" }}>
-          <Link className="lnk" to={`/app/objectives/${encodeURIComponent(openId)}`}>← Objective {openId}</Link>
-          <span className="note">(canonical bound_open_id lineage — not inferred)</span>
+          <Link className="lnk" to={`/app/objectives/${encodeURIComponent(lineage.objective_id)}`}>← Objective {lineage.objective_id}</Link>
+          <span className="note">(verified via bound_open_id → work item {lineage.work_item_id} → objective — never constructed from the open id alone)</span>
+        </div>
+      ) : mission.bound_open_id ? (
+        <div className="nrow" style={{ margin: "6px 0" }}>
+          <span className="note">bound_open_id present but objective lineage unproven — backlink omitted (no guessing).</span>
         </div>
       ) : null}
 
@@ -195,21 +249,27 @@ export function MissionDetailPage() {
       <h2 className="sech">Task graph</h2>
       {st.dag.kind === "unavailable" ? unv("DAG", st.dag.code) : <DagView dag={st.dag.data} />}
 
-      <h2 className="sech">Tasks ({tasks.length})</h2>
-      <div className="need">
-        {tasks.map((t) => (
-          <div className="nrow" key={String(t.task_id ?? t.task_key)}>
-            <code className="mono">{String(t.task_key ?? "")}</code>
-            <span style={{ flex: 1 }}>{String(t.task_instruction ?? t.title ?? "")}</span>
-            <span className="note">{t.selected_executor ? `→ ${String(t.selected_executor)}` : ""}</span>
-            <StatusBadge tone="info" label={String(t.status ?? "—")} />
+      {tasksSec.kind === "unavailable" ? unv("tasks collection", tasksSec.code) : (
+        <>
+          <h2 className="sech">Tasks ({tasks.length})</h2>
+          <div className="need">
+            {tasks.map((t) => (
+              <div className="nrow" key={String(t.task_id ?? t.task_key)}>
+                <code className="mono">{String(t.task_key ?? "")}</code>
+                <span style={{ flex: 1 }}>{String(t.task_instruction ?? t.title ?? "")}</span>
+                <span className="note">{t.selected_executor ? `→ ${String(t.selected_executor)}` : ""}</span>
+                <StatusBadge tone="info" label={String(t.status ?? "—")} />
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </>
+      )}
 
-      <h2 className="sech">Executions ({execs.length})</h2>
-      <div className="need">
-        {execs.map((x) => {
+      {execsSec.kind === "unavailable" ? unv("executions collection", execsSec.code) : (
+        <>
+          <h2 className="sech">Executions ({execs.length})</h2>
+          <div className="need">
+            {execs.map((x) => {
           const arts = Array.isArray(((x.result ?? {}) as Record<string, unknown>).artifacts)
             ? (((x.result ?? {}) as Record<string, unknown>).artifacts as Array<Record<string, unknown>>) : [];
           return (
@@ -221,7 +281,9 @@ export function MissionDetailPage() {
             </div>
           );
         })}
-      </div>
+          </div>
+        </>
+      )}
 
       <h2 className="sech">Workspace files</h2>
       {st.files.kind === "unavailable" ? unv("file listing", st.files.code) : st.files.data.length === 0 ? (
@@ -232,13 +294,23 @@ export function MissionDetailPage() {
             <div className="nrow" key={String(f.path)}>
               <button className="lnk mono" style={{ background: "none", border: 0, cursor: "pointer", padding: 0 }}
                 onClick={async () => {
+                  /* R1-F4: pin the read to mission + generation — a late
+                     result for A never lands on B's page or another file. */
+                  const fs = ++seq.current;
+                  const forId = id;
+                  const forPath = String(f.path);
                   setFileErr(null);
+                  setFileView(null);
                   try {
-                    const r = await apiAdmin.missionFile(id, String(f.path));
+                    const r = await apiAdmin.missionFile(forId, forPath);
+                    if (fs !== seq.current || forId !== lastIdent.current) return;
                     if (r && typeof r === "object" && typeof r.content === "string") {
-                      setFileView({ path: String(r.path ?? f.path), content: r.content, truncated: r.truncated === true });
+                      setFileView({ path: String(r.path ?? forPath), content: r.content, truncated: r.truncated === true });
                     } else setFileErr("malformed file response");
-                  } catch (e) { setFileView(null); setFileErr(e instanceof ApiError ? `${e.detail || e.message} (${e.code})` : String(e)); }
+                  } catch (e) {
+                    if (fs !== seq.current || forId !== lastIdent.current) return;
+                    setFileErr(e instanceof ApiError ? `${e.detail || e.message} (${e.code})` : String(e));
+                  }
                 }}>{String(f.path)}</button>
               <span className="note">{Number(f.size)} B · {String(f.modified_at ?? "").replace("T", " ").slice(0, 19)}</span>
             </div>
@@ -256,7 +328,7 @@ export function MissionDetailPage() {
         </div>
       ) : null}
 
-      {approvals.length > 0 ? (
+      {apprSec.kind === "unavailable" ? unv("approvals collection", apprSec.code) : approvals.length > 0 ? (
         <>
           <h2 className="sech">Pending approvals ({approvals.length})</h2>
           <div className="need">
