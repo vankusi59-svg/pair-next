@@ -309,7 +309,7 @@ export function ObjectiveDetail() {
                   {w.delegated_child ? ` → ${w.delegated_child.work_item_id} ${w.delegated_child.status}` : " (no delegated child)"}
                 </span>
                 {w.delegated_child?.mission ? (
-                  <Link className="go" to={`/missions/${encodeURIComponent(w.delegated_child.mission.mission_id)}`}>
+                  <Link className="go" to={`/app/missions/${encodeURIComponent(w.delegated_child.mission.mission_id)}`}>
                     {w.delegated_child.mission.mission_id.slice(0, 12)}… {w.delegated_child.mission.status}
                   </Link>
                 ) : null}
@@ -327,7 +327,7 @@ export function ObjectiveDetail() {
             <span className="tt">{m.mission_id}</span>
             <StatusBadge tone={S_TONE[m.status] ?? "unknown"} label={m.status} />
             <span className="note">runtime {m.runtime_state ?? "—"}</span>
-            <Link className="go" to={`/missions/${encodeURIComponent(m.mission_id)}`}>open mission →</Link>
+            <Link className="go" to={`/app/missions/${encodeURIComponent(m.mission_id)}`}>open mission →</Link>
           </div>
         ))}
       </div>
