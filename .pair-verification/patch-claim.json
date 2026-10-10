@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_9B5_1_WORKFORCE",
-  "title": "P15.9-B5.1: /app/workforce + /app/workforce/:id AI Workforce & Agent Detail",
+  "claim_id": "P15_9B5_2_ADMIN_PARITY",
+  "title": "P15.9-B5.2: /app/system/business-admin + /app/workforce/admin legacy admin parity",
   "affected_surfaces": [
     "UI"
   ],
@@ -9,5 +9,5 @@
     "src/__tests__/pair-p12.test.ts"
   ],
   "invariants": [],
-  "description": "B5.1 R4 — AgentDetail inbox fail-closed hardening. The inbox read now validates the ENVELOPE before touching messages: null/non-object 200 body or non-array messages → 'malformed' (MALFORMED badge, 'messages withheld, never rendered as empty'); {state:\"CORRUPT\"} → CORRUPT panel. Any null/primitive/non-object ELEMENT marks the whole inbox malformed — never silently filtered into a false 'No messages'. Only a proven canonical envelope renders messages; per-message, unknown/missing receipt_status → UNVERIFIED badge + body withheld (unified isCorruptMessage predicate preserved: corrupt flag / state=CORRUPT / receipt_status=CORRUPT → CORRUPT badge + withheld body); PENDING/ACKNOWLEDGED render unchanged. New e2e: 7-case detail matrix (null envelope, [null], [\"bad\"], mixed valid+null, unknown status, missing status, real canonical empty) asserting no false empty, no leaked bodies, no indefinite skeleton. R1–R3 preserved (two-phase identity prefetch, tri-state contract, per-element workforce validation, truthful terminate copy). Proof: tsc+vite PASS; playwright 94/94 full suite on real :8790 — clean."
+  "description": "Legacy Business-tab parity on canonical APIs only (zero backend changes). /app/system/business-admin: create business (project_id verified via GET /api/projects, fail-closed when unavailable), inspect-by-id rendering biz.detail() bundle, global list labeled unfiltered. /app/workforce/admin bound to selected business: create org-agent (auto-contract), create work-item (never auto-opened), open/block/unblock/comment via pinned dialogs (open = HIGH-IMPACT), routine create+enable/disable, legacy objective labeled LEGACY compat. Dialogs pin {op,biz,target,payload}, invalidate on business change, dup-submit guarded, ambiguous wording on transport/5xx, same-business-only selects (backend FAIL_CLOSED_*_SCOPE authoritative). E2E workforce-admin.spec.ts covers the 19-item list. R1: SPA business switch wipes all business-dependent forms + submit() revalidates reports_to/assignee/objective_id; inspect clears stale detail + verifies returned id; sect() validates envelopes. R2: rowsOk() element-level validation on all collection boundaries — arrays with null/primitive/identity-less rows → MALFORMED, never silently filtered into a fake complete list; agents (primary) → fatal error; work_items/routines/objectives → per-section UNAVAILABLE; projects/businesses → blocks creation + unavailable list; businessDetail validates child collections (agents/objectives/routines/board) before render. Proof: tsc+vite PASS; playwright workforce-admin 12/12."
 }
