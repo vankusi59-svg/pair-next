@@ -187,7 +187,7 @@ test("app-chat: ambiguous proposal → verified picker → draft via proposal:<m
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        message: { message_id: "m-prop", session_id: sid, seq: 1, role: "operator", body: "x", created_at: "t" },
+        message: { message_id: "m-prop", session_id: sid, seq: 1, role: "operator", body: String(route.request().postDataJSON()?.body), created_at: "t" },
         reply: { message_id: "m-rep", session_id: sid, seq: 2, role: "assistant", body: "r", created_at: "t" },
         reused: false,
         proposal: { goal: "verify candidate flow", project_candidates: [{ project_id: proj.project_id, name: proj.name ?? proj.project_id }] },
@@ -218,7 +218,7 @@ test("app-chat: malformed proposal candidates → blocked note, no picker, no dr
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        message: { message_id: "m-bad", session_id: sid, seq: 1, role: "operator", body: "x", created_at: "t" },
+        message: { message_id: "m-bad", session_id: sid, seq: 1, role: "operator", body: String(route.request().postDataJSON()?.body), created_at: "t" },
         reply: { message_id: "m-rep2", session_id: sid, seq: 2, role: "assistant", body: "r", created_at: "t" },
         reused: false,
         proposal: { goal: "g", project_candidates: [{}] },
@@ -243,7 +243,7 @@ test("app-chat: proposal rejected → canonical reason, zero drafts", async ({ p
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        message: { message_id: "m-rej", session_id: sid, seq: 1, role: "operator", body: "x", created_at: "t" },
+        message: { message_id: "m-rej", session_id: sid, seq: 1, role: "operator", body: String(route.request().postDataJSON()?.body), created_at: "t" },
         reply: { message_id: "m-rep3", session_id: sid, seq: 2, role: "assistant", body: "r", created_at: "t" },
         reused: false,
         proposal: { goal: "g", rejected: "FAIL_CLOSED_X" },
@@ -578,7 +578,7 @@ test("app-chat R1-F2: new proposal resets the pick; held validation keeps Create
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({
-        message: { message_id: msgId, session_id: sid, seq: turn * 2 - 1, role: "operator", body: "x", created_at: "t" },
+        message: { message_id: msgId, session_id: sid, seq: turn * 2 - 1, role: "operator", body: String(route.request().postDataJSON()?.body), created_at: "t" },
         reply: { message_id: `${msgId}-r`, session_id: sid, seq: turn * 2, role: "assistant", body: "r", created_at: "t" },
         reused: false,
         proposal: {
@@ -663,5 +663,141 @@ test("app-chat R1-F3: malformed 200 on a committed turn → unverified outcome; 
   const mr = await page.request.get(`/api/conversations/${sid}/messages?after_seq=0`, { headers: HEADERS() });
   const msgs = ((await mr.json()).messages ?? []) as { role?: string; body?: string }[];
   expect(msgs.filter((m) => m.role === "operator" && m.body === "f3-turn")).toHaveLength(1);
+  expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(1);
+});
+
+/* ---------- R2-F1: per-session turn idempotency ---------- */
+
+test("app-chat R2-F1: ambiguous A keeps its key across a completed B turn — retry replays K_A, K_A != K_B, one canonical pair", async ({ page }) => {
+  const a = await mkSession(page);
+  const b = await mkSession(page);
+  await page.goto(`/app/chat?s=${a}`);
+  const keysA: string[] = [];
+  const keysB: string[] = [];
+  let callsA = 0;
+  /* A's first turn: REAL backend commits, client sees a 500 → ambiguous. */
+  await page.route(`**/api/conversations/${a}/turns`, async (route) => {
+    callsA++;
+    keysA.push(String(route.request().postDataJSON()?.idempotency_key));
+    if (callsA === 1) {
+      const resp = await route.fetch(); // committed server-side
+      expect(resp.ok()).toBeTruthy();
+      return route.fulfill({ status: 500, body: `{"error":"ambiguous"}` });
+    }
+    return route.continue();
+  });
+  await page.route(`**/api/conversations/${b}/turns`, async (route) => {
+    keysB.push(String(route.request().postDataJSON()?.idempotency_key));
+    return route.continue();
+  });
+  await page.locator(".chatcomposer textarea").fill("r2-turn-a");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText(/outcome is unknown.*may have committed/)).toBeVisible();
+  // SPA switch to B — A's unresolved key must survive
+  await page.locator(".chatitem", { hasText: b }).first().click();
+  await page.waitForURL(new RegExp(`s=${b}`));
+  await page.locator(".chatcomposer textarea").fill("r2-turn-b");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("PAIR trả lời mô phỏng").first()).toBeVisible({ timeout: 15_000 });
+  expect(keysB).toHaveLength(1); // B completed with K_B
+  // Back on A — composer cleared by policy; retype the SAME body → K_A replay
+  await page.locator(".chatitem", { hasText: a }).first().click();
+  await page.waitForURL(new RegExp(`s=${a}`));
+  await page.locator(".chatcomposer textarea").fill("r2-turn-a");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("PAIR trả lời mô phỏng").first()).toBeVisible({ timeout: 15_000 });
+  expect(callsA).toBe(2);
+  expect(keysA[0]).toBeTruthy();
+  expect(keysA[0]).toBe(keysA[1]);       // K_A reused on the deliberate retry
+  expect(keysA[0]).not.toBe(keysB[0]);   // K_A != K_B — keys never cross sessions
+  // canonical proof: exactly ONE operator/assistant pair exists under A
+  const mr = await page.request.get(`/api/conversations/${a}/messages?after_seq=0`, { headers: HEADERS() });
+  const msgs = ((await mr.json()).messages ?? []) as { role?: string; body?: string }[];
+  expect(msgs.filter((m) => m.role === "operator" && m.body === "r2-turn-a")).toHaveLength(1);
+  expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(1);
+});
+
+/* ---------- R2-F2: strict response identity + consistency ---------- */
+
+test("app-chat R2-F2: GET returning a different session fails closed — B's metadata never renders under A", async ({ page }) => {
+  const a = await mkSession(page);
+  const b = await mkSession(page, `B-${uniq()}`);
+  // Intercept A's detail: valid-looking envelope carrying session B
+  await page.route(`**/api/conversations/${a}`, async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    const resp = await route.fetch();
+    const j = await resp.json();
+    j.session.session_id = b; // identity contradiction
+    return route.fulfill({ response: resp, body: JSON.stringify(j) });
+  });
+  await page.goto(`/app/chat?s=${a}`);
+  await expect(page.getByText("IDENTITY_MISMATCH", { exact: true })).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator(".chatmsg")).toHaveCount(0); // no foreign content rendered
+});
+
+test("app-chat R2-F2: committed turn whose returned operator body contradicts the submission → unverified; retry replays key, one pair", async ({ page }) => {
+  const sid = await mkSession(page);
+  await page.goto(`/app/chat?s=${sid}`);
+  let calls = 0;
+  const keys: string[] = [];
+  await page.route(`**/api/conversations/${sid}/turns`, async (route) => {
+    calls++;
+    keys.push(String(route.request().postDataJSON()?.idempotency_key));
+    if (calls === 1) {
+      const resp = await route.fetch(); // committed
+      const j = await resp.json();
+      j.message.body = "TAMPERED-BODY"; // contradicts the submitted body
+      return route.fulfill({ response: resp, body: JSON.stringify(j) });
+    }
+    return route.continue();
+  });
+  await page.locator(".chatcomposer textarea").fill("r2b-turn");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText(/could not be verified.*malformed/)).toBeVisible();
+  await expect(page.locator(".chatcomposer textarea")).toHaveValue("r2b-turn");
+  await page.waitForTimeout(400);
+  expect(calls).toBe(1); // no auto-retry
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.waitForTimeout(800);
+  expect(calls).toBe(2);
+  expect(keys[0]).toBe(keys[1]);
+  const mr = await page.request.get(`/api/conversations/${sid}/messages?after_seq=0`, { headers: HEADERS() });
+  const msgs = ((await mr.json()).messages ?? []) as { role?: string; body?: string }[];
+  expect(msgs.filter((m) => m.role === "operator" && m.body === "r2b-turn")).toHaveLength(1);
+  expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(1);
+});
+
+test("app-chat R2-F2: committed turn with contradictory identities/ordering → unverified; retry replays key, no duplicate pair", async ({ page }) => {
+  const sid = await mkSession(page);
+  await page.goto(`/app/chat?s=${sid}`);
+  let calls = 0;
+  const keys: string[] = [];
+  await page.route(`**/api/conversations/${sid}/turns`, async (route) => {
+    calls++;
+    keys.push(String(route.request().postDataJSON()?.idempotency_key));
+    if (calls === 1) {
+      const resp = await route.fetch(); // committed
+      const j = await resp.json();
+      // Contradict legal canonical ordering + identity distinctness:
+      // reply must be a DIFFERENT message exactly one seq after the operator.
+      j.reply.message_id = j.message.message_id;
+      j.reply.seq = j.message.seq;
+      return route.fulfill({ response: resp, body: JSON.stringify(j) });
+    }
+    return route.continue();
+  });
+  await page.locator(".chatcomposer textarea").fill("r2c-turn");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText(/could not be verified.*malformed/)).toBeVisible();
+  await expect(page.locator(".chatcomposer textarea")).toHaveValue("r2c-turn");
+  await page.waitForTimeout(400);
+  expect(calls).toBe(1);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.waitForTimeout(800);
+  expect(calls).toBe(2);
+  expect(keys[0]).toBe(keys[1]);
+  const mr = await page.request.get(`/api/conversations/${sid}/messages?after_seq=0`, { headers: HEADERS() });
+  const msgs = ((await mr.json()).messages ?? []) as { role?: string; body?: string }[];
+  expect(msgs.filter((m) => m.role === "operator" && m.body === "r2c-turn")).toHaveLength(1);
   expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(1);
 });

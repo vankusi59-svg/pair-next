@@ -204,8 +204,11 @@ export default function Chat() {
   const [turnBusy, setTurnBusy] = useState(false);
   const [turnNote, setTurnNote] = useState<string | null>(null);
   const turnFlight = useRef<{ sessionId: string; g: number; key: string } | null>(null);
-  /* Retained across navigation: retry reuses original key+body+session. */
-  const pendingSubmit = useRef<{ sessionId: string; body: string; key: string } | null>(null);
+  /* R2-F1 — unresolved turn identity tracked PER SESSION: an ambiguous
+     turn in A keeps its {body,key} across SPA switches and can never be
+     overwritten or cleared by a turn in B. A new body under the same
+     session is an intentional new request → fresh key. */
+  const pendingTurns = useRef<Map<string, { body: string; key: string }>>(new Map());
 
   /* ---- proposal + draft form ---- */
   const [proposal, setProposal] = useState<PendingProposal | null>(null);
@@ -287,7 +290,12 @@ export default function Chat() {
       .conversation(sessionId, ctl.signal)
       .then(async (r) => {
         if (gen.current !== g || activeRef.current !== sessionId) return;
+        /* R2-F2 — a valid-looking envelope whose session_id differs from
+           the requested one is an IDENTITY_MISMATCH: fail closed, never
+           render another session's metadata/messages. */
         if (!isObj(r) || !validSession(r.session)) return setThread({ kind: "error", err: MALFORMED });
+        if (r.session.session_id !== sessionId)
+          return setThread({ kind: "error", err: { code: "IDENTITY_MISMATCH", detail: "Response session_id does not match the requested session." } });
         const session = r.session;
         const lastSeq = session.next_seq - 1;
         const after = Math.max(0, lastSeq - MSG_PAGE);
@@ -325,7 +333,7 @@ export default function Chat() {
     setMutNote(null);
     /* F1 — composer text belongs to a session: switching sessions clears
        it so A's unsent text is never displayed or sent under B. The
-       pendingSubmit {sessionId,body,key} survives — an ambiguous in-flight
+       per-session pendingTurns entries survive — an ambiguous in-flight
        turn keeps its idempotent retry identity for when A is revisited. */
     setBody("");
     setProp(null);
@@ -436,11 +444,9 @@ export default function Chat() {
     /* Idempotency: retrying the same body on the same session reuses the
        original key; a new message gets a fresh key; the key never crosses
        sessions. */
-    const prev = pendingSubmit.current;
-    const key = prev && prev.sessionId === sessionId && prev.body === text
-      ? prev.key
-      : crypto.randomUUID();
-    pendingSubmit.current = { sessionId, body: text, key };
+    const prev = pendingTurns.current.get(sessionId);
+    const key = prev && prev.body === text ? prev.key : crypto.randomUUID();
+    pendingTurns.current.set(sessionId, { body: text, key });
     turnFlight.current = { sessionId, g, key };
     setTurnBusy(true);
     setTurnNote(null);
@@ -450,18 +456,24 @@ export default function Chat() {
         if (turnFlight.current?.key === key) { turnFlight.current = null; setTurnBusy(false); }
         /* The result may paint only on the session it was sent to. */
         if (gen.current !== g || activeRef.current !== sessionId) return;
-        /* F3 — a malformed HTTP 200 is NOT a proven successful turn:
-           validate the whole canonical response (operator message +
-           assistant reply, session-bound, integer seqs, proposal shape)
-           BEFORE clearing composer or pendingSubmit. */
+        /* F3+R2-F2 — a malformed/contradictory HTTP 200 is NOT a proven
+           successful turn: validate the envelope BEFORE nested access —
+           operator message + assistant reply, both session-bound, the
+           returned operator body identical to what was submitted,
+           distinct message identities and the canonical user→reply
+           adjacency (reply.seq === message.seq + 1). */
         const ok =
+          isObj(r) &&
           validMessage(r.message, sessionId) && r.message.role === "operator" &&
           validMessage(r.reply, sessionId) && r.reply.role === "assistant" &&
+          r.message.message_id !== r.reply.message_id &&
+          r.message.body === text &&
+          Number(r.reply.seq) === Number(r.message.seq) + 1 &&
           (r.reused === undefined || typeof r.reused === "boolean") &&
           (r.proposal === undefined ||
             (isObj(r.proposal) && typeof r.proposal.goal === "string"));
         if (!ok) {
-          /* Keep composer + pendingSubmit — the turn may still have
+          /* Keep composer + pendingTurns — the turn may still have
              committed. Canonical refetch reconciles; a deliberate retry
              replays the SAME key+body+session. Never auto-retry, never
              mint a second turn. */
@@ -473,7 +485,7 @@ export default function Chat() {
           loadSessions();
           return;
         }
-        pendingSubmit.current = null;
+        pendingTurns.current.delete(sessionId);
         setBody("");
         const prop = r.proposal;
         if (prop && isObj(prop) && typeof prop.goal === "string") {
@@ -538,7 +550,7 @@ export default function Chat() {
            retains the retry identity for a revisit). */
         if (gen.current !== g || activeRef.current !== sessionId) return;
         const f = failOf(e);
-        /* The POST may have committed — keep composer + pendingSubmit so a
+        /* The POST may have committed — keep composer + pendingTurns so a
            deliberate retry replays the SAME key+body+session. */
         setTurnNote(
           `Turn outcome is unknown (${f.code}) — the request may have committed. The composer was kept; Send again replays the same idempotency key.`,
