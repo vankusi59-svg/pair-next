@@ -21,10 +21,10 @@ test("/app/company renders new shell + honest no-business state", async ({ page 
 });
 
 test("placeholder pages exist for every unimplemented B4-B6 route", async ({ page }) => {
-  /* /app/company, /app/objectives*, /app/inbox, /app/ceo are real
-     B2–B4 pages now — only destinations still placeholder-honest. */
+  /* /app/company, /app/objectives*, /app/inbox, /app/ceo, /app/workforce*
+     are real B2–B5.1 pages now — only destinations still
+     placeholder-honest. */
   const routes: Array<[string, string]> = [
-    ["/app/workforce", "AI Workforce"],
     ["/app/missions", "Mission Operations"],
     ["/app/missions/new", "Task Entry"],
     ["/app/chat", "Chat"],

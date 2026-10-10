@@ -1,13 +1,12 @@
 {
-  "claim_id": "P15_9B4_INBOX_CEO",
-  "title": "P15.9-B4: /app/inbox Owner Inbox + /app/ceo CEO Workspace",
+  "claim_id": "P15_9B5_1_WORKFORCE",
+  "title": "P15.9-B5.1: /app/workforce + /app/workforce/:id AI Workforce & Agent Detail",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10d-met-branch-fold.test.ts"
+    "apps/mission-control-ui/e2e/workforce.spec.ts"
   ],
   "invariants": [],
-  "description": "B4 R3 residual. R3-F1 ABA lifecycle binding: every business transition starts a NEW request lifecycle \u2014 reqGen increments synchronously during render (derived-state pattern, no one-frame stale window) on every biz change, including A\u2192B\u2192A. Resolved counts bind {forBiz, forReq, forEpoch}; the render guard suppresses anything not produced by the current lifecycle, so an old A resolution can never repaint under A's later lifecycle, late/aborted responses never overwrite newer generations, previous-generation counts hide during invalidation refetches, and failed refetches render '!' (never stale/zero). One provider, canonical refetch, aborts, mobile parity, aria-live preserved; no polling, no new backend calls. Proof: tsc+vite PASS; playwright 75/75 (inbox-ceo 23 incl. ABA adversarial A(10)\u2192B-delayed\u2192A converging to new canonical 8 with late-B overwrite impossible, desktop+mobile parity) on real :8790."
+  "description": "B5.1 — real functional Workforce pages replacing placeholders. /app/workforce: selected-business agent overview — GET /api/org-agents is an UNFILTERED global read; rows are filtered CLIENT-SIDE by business_id with an explicit disclosure (never described as server-side authorization); the owner-scoped company projection verifies selected-business context (403 → 'owner context unverified' banner, list still honest); per-agent contract/policy/inbox extras settle independently (failed reads labeled, never zero/unrestricted); workload from server-filtered work-items (read failure → unavailable, never 0). /app/workforce/:id: 6 canonical reads each failing independently (contract, effective-policy, inbox, work-items, work-graph + org-agents identity); foreign-business agent → DeniedState without rendering fields; synchronous render-boundary guard {forBiz,forId}+business_id/agent_id recheck; lifecycle ops (pause/resume/terminate) + contract enable/disable only when legal per backend transitions, all via ConfirmDialog pinning {op,agent,biz} opened-context, invalidated on identity change, dup-submit protected, canonical refetch on success, errors non-optimistic, terminate labeled high-risk; contract editing deferred to B5.2. No new backend endpoint/dependency; B1–B4 preserved. Proof: tsc+vite PASS; playwright 88/88 (workforce 13 + objectives 20 + inbox-ceo 23 + company 10 + app 12 + smoke 5 + chat 5 — app.spec placeholder list updated for workforce going real) on real :8790 backend."
 }
