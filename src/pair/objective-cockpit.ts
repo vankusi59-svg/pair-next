@@ -33,6 +33,8 @@ import type { ObjectiveAuthorityService } from "./objective-authority.js";
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
+import type { ArtifactAuthority } from "./artifact-authority.js";
+import { TERMINAL_OBJECTIVE_STATUSES, type ObjectiveStatus } from "./objective-authority.js";
 import {
   buildReviewObservation,
   canonicalAdaptiveReviewsFor,
@@ -49,11 +51,20 @@ const MAX_LIST = 200;
 type CockpitReadDeps = Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">;
 
 export interface ObjectiveCockpitDeps extends CockpitReadDeps {
-  autoPolicy?: Pick<ObjectiveAutoPolicyService, "status">;
-  autoDriver?: Pick<
-    ObjectiveAutoDriverService,
-    "status" | "readiness"
-  >;
+  /** F1 — MUST be the read-only seams: status()/readiness() commit the
+   *  lazy EXPIRED transition on read (and readiness goes through
+   *  scheduler.claimable → policy.evaluate, also expiry-committing).
+   *  This projection may not write at all, so it uses statusReadOnly
+   *  (expiry surfaced as expiry_pending:true) and does NOT expose
+   *  driver readiness — that claim predicate is only reachable through
+   *  the expiry-committing path. */
+  autoPolicy?: Pick<ObjectiveAutoPolicyService, "statusReadOnly">;
+  autoDriver?: Pick<ObjectiveAutoDriverService, "statusReadOnly">;
+  /** F3 — canonical artifact verification authority: re-proves the
+   *  producer/execution/mission binding AND retained CAS bytes NOW;
+   *  an unverifiable artifact is dropped from the projection, never
+   *  shown as canonical evidence. */
+  artifacts?: Pick<ArtifactAuthority, "verifyArtifactForConsumption">;
 }
 
 function bounded<T>(xs: T[], cap = MAX_LIST): T[] {
@@ -129,6 +140,49 @@ export class ObjectiveCockpitService {
         String(a.review_id).localeCompare(String(b.review_id)));
   }
 
+  /** F4 — owner action is only pending while the objective can still
+   *  take a transition; a terminal objective (ACHIEVED/INFEASIBLE/
+   *  EXPIRED/CANCELLED) may carry a historical TARGET_MET_CANDIDATE
+   *  review, but nothing is actionable anymore. */
+  private static ownerActionPending(
+    objectiveStatus: string,
+    latest: Row | null,
+  ): boolean {
+    return (
+      latest != null &&
+      latest.owner_action_required === true &&
+      !TERMINAL_OBJECTIVE_STATUSES.has(objectiveStatus as ObjectiveStatus)
+    );
+  }
+
+  /** F3 — verify a candidate artifact against the proven bound
+   *  mission NOW (canonical id, execution/governed/executor linkage,
+   *  storage contract, retained CAS bytes). Returns the safe
+   *  projection, or null when verification fails — the artifact is
+   *  dropped, never rendered as canonical evidence. */
+  private verifiedArtifact(a: Row, missionId: string): Record<string, unknown> | null {
+    if (!this.deps.artifacts) return null;
+    try {
+      const row = this.deps.artifacts.verifyArtifactForConsumption(
+        String(a.artifact_id),
+        { execution_id: String(a.execution_id), mission_id: missionId },
+      );
+      return {
+        artifact_id: String(row.artifact_id),
+        logical_name: String(row.logical_name),
+        mission_id: String(row.mission_id),
+        execution_id: String(row.execution_id),
+        state: String(row.state),
+        artifact_class: String(row.artifact_class),
+        sha256: String(row.sha256),
+        byte_size: Number(row.byte_size ?? 0),
+        created_at: String(row.created_at),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   private kpiProjection(obj: Row): Array<Record<string, unknown>> {
     return ((obj.kpis as Array<Record<string, unknown>>) ?? []).map((k) => ({
       kpi_id: String(k.kpi_id),
@@ -149,15 +203,24 @@ export class ObjectiveCockpitService {
    *  failure (tampered work item, forged mission status, corrupt WAL)
    *  propagates: the projection fails closed rather than serving
    *  unverifiable state as truth. */
-  private observationOrNull(objectiveId: string): {
+  private observationOrNull(objectiveId: string, objStatus: string): {
     observation: ReviewObservation;
     digest: string;
-  } | null {
+  } | { observation_error: string } | null {
     try {
       return buildReviewObservation(this.deps, objectiveId);
     } catch (err) {
       if ((err as IntegrityError).code === "FAIL_CLOSED_P15_5_BINDING_REQUIRED") {
         return null;
+      }
+      // A TERMINAL objective (e.g. ACHIEVED) canonically outlives its
+      // runtime grants: KPI verifier authorization, WALs and bindings
+      // legitimately end — re-validation failing there is expected
+      // state, not corruption. Render the projection without the
+      // observation block (observation_error reports the code); a
+      // LIVE objective still fails closed on any re-validation error.
+      if (TERMINAL_OBJECTIVE_STATUSES.has(objStatus as ObjectiveStatus)) {
+        return { observation_error: String((err as IntegrityError).code ?? "ERROR") };
       }
       throw err;
     }
@@ -199,12 +262,18 @@ export class ObjectiveCockpitService {
    *  projection behind the Objective Detail design. */
   objectiveCockpit(objectiveId: string, actor: string): Record<string, unknown> {
     const obj = this.ownedObjective(objectiveId, actor);
-    const reviews = bounded(this.canonicalReviews(objectiveId));
+    // F4 — never cap before picking: latest/count must come from the
+    // FULL canonical history, sorted, not from a prefix slice.
+    const reviews = this.canonicalReviews(objectiveId);
     const latest = reviews.length ? reviews[reviews.length - 1]! : null;
-    const obs = this.observationOrNull(objectiveId);
+    const objStatus = String(obj.status);
+    const obs = this.observationOrNull(objectiveId, objStatus);
 
-    const workstreams = obs
-      ? obs.observation.workstreams.map((w) => this.workstreamProjection(w))
+    const obsOk = obs !== null && !("observation_error" in obs) ? obs : null;
+    const obsError =
+      obs !== null && "observation_error" in obs ? obs.observation_error : null;
+    const workstreams = obsOk
+      ? obsOk.observation.workstreams.map((w) => this.workstreamProjection(w))
       : [];
     const missionIds = new Set<string>();
     const classes = { active: 0, intervention: 0, exhausted: 0 };
@@ -218,22 +287,21 @@ export class ObjectiveCockpitService {
       else if (cls === "INTERVENTION") classes.intervention++;
       else if (cls === "EXHAUSTED") classes.exhausted++;
     }
-    const artifacts = bounded(
-      (this.store.list("artifact") as Row[])
-        .filter((a) => missionIds.has(String(a.mission_id)))
-        .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)))
-        .map((a) => ({
-          artifact_id: String(a.artifact_id),
-          logical_name: String(a.logical_name),
-          mission_id: String(a.mission_id),
-          execution_id: String(a.execution_id),
-          state: String(a.state),
-          artifact_class: String(a.artifact_class),
-          sha256: String(a.sha256),
-          byte_size: Number(a.byte_size ?? 0),
-          created_at: String(a.created_at),
-        })),
-    );
+    // F3 — artifact candidates are only CLAIMS until the canonical
+    // authority re-proves producer/execution/mission binding + retained
+    // CAS bytes NOW. Unverifiable rows are dropped (counted), never
+    // rendered as canonical evidence.
+    let droppedUnverified = 0;
+    const verifiedArtifacts: Array<Record<string, unknown>> = [];
+    for (const a of (this.store.list("artifact") as Row[])
+      .filter((x) => missionIds.has(String(x.mission_id)))
+      .sort((x, y) => String(x.created_at).localeCompare(String(y.created_at)))) {
+      const v = this.verifiedArtifact(a, String(a.mission_id));
+      if (v === null) droppedUnverified++;
+      else verifiedArtifacts.push(v);
+    }
+    const artifactsTruncated = verifiedArtifacts.length > MAX_LIST;
+    const artifacts = bounded(verifiedArtifacts);
 
     return {
       objective: {
@@ -263,38 +331,46 @@ export class ObjectiveCockpitService {
       // the objective status. ACHIEVED can only be claimed by
       // objective.status after an owner transition; keep them distinct.
       lifecycle: {
-        objective_status: String(obj.status),
-        all_targets_met: obs ? obs.observation.all_targets_met : false,
+        objective_status: objStatus,
+        all_targets_met: obsOk ? obsOk.observation.all_targets_met : false,
         latest_review_outcome: latest ? String(latest.outcome) : null,
-        owner_action_required: latest ? latest.owner_action_required === true : false,
+        // F4 — a terminal objective's historical CANDIDATE review is not
+        // an actionable inbox item.
+        owner_action_required:
+          ObjectiveCockpitService.ownerActionPending(objStatus, latest),
         recommended_status: latest ? (latest.recommended_status ?? null) : null,
       },
-      binding: obs
+      binding: obsOk
         ? {
-            binding_id: String(obs.observation.binding_id),
-            binding_digest: String(obs.observation.binding_digest),
+            binding_id: String(obsOk.observation.binding_id),
+            binding_digest: String(obsOk.observation.binding_digest),
           }
         : null,
+      observation_error: obsError,
       kpi_summary: {
-        all_targets_met: obs ? obs.observation.all_targets_met : false,
-        verified_kpi_count: obs ? obs.observation.verified_kpi_count : 0,
-        unverified_kpi_count: obs ? obs.observation.unverified_kpi_count : 0,
-        gap_kpi_count: obs ? obs.observation.gap_kpi_count : 0,
+        all_targets_met: obsOk ? obsOk.observation.all_targets_met : false,
+        verified_kpi_count: obsOk ? obsOk.observation.verified_kpi_count : 0,
+        unverified_kpi_count: obsOk ? obsOk.observation.unverified_kpi_count : 0,
+        gap_kpi_count: obsOk ? obsOk.observation.gap_kpi_count : 0,
       },
       workstreams,
       observer: classes,
       missions: [...missionIds].sort().map((mid) =>
         missionSummary(this.store, this.store.get("mission", mid) as Row)),
       artifacts,
+      artifacts_truncated: artifactsTruncated,
+      artifacts_dropped_unverified: droppedUnverified,
       latest_review: latest ? reviewSummary(latest) : null,
       review_count: reviews.length,
       auto_policy: this.deps.autoPolicy
-        ? (this.deps.autoPolicy.status(objectiveId, actor) as unknown)
+        ? (this.deps.autoPolicy.statusReadOnly(objectiveId, actor) as unknown)
         : null,
       auto_driver: this.deps.autoDriver
         ? {
-            status: this.deps.autoDriver.status(objectiveId, actor) as unknown,
-            readiness: this.deps.autoDriver.readiness(objectiveId, actor) as unknown,
+            status: this.deps.autoDriver.statusReadOnly(objectiveId, actor) as unknown,
+            // readiness intentionally absent: the canonical claim
+            // predicate (scheduler.claimable) commits lazy policy
+            // expiry — unreachable without a write; see F1 note on deps.
           }
         : null,
     };
@@ -305,15 +381,24 @@ export class ObjectiveCockpitService {
     objectiveId: string,
     actor: string,
     limit = 50,
-  ): { reviews: Array<Record<string, unknown>> } {
+  ): {
+    reviews: Array<Record<string, unknown>>;
+    total: number;
+    returned: number;
+    truncated: boolean;
+  } {
     this.ownedObjective(objectiveId, actor);
     const cap = Math.min(Math.max(1, Math.trunc(limit)), MAX_LIST);
     const rows = this.canonicalReviews(objectiveId);
     return {
+      // F4 — newest-first page + truthful totals.
       reviews: rows
         .slice(-cap)
         .map((r) => reviewSummary(r))
         .reverse(),
+      total: rows.length,
+      returned: Math.min(cap, rows.length),
+      truncated: rows.length > cap,
     };
   }
 
@@ -322,10 +407,16 @@ export class ObjectiveCockpitService {
    *  gets nothing: FAIL_CLOSED_COMPANY_SCOPE. */
   businessCompany(businessId: string, actor: string): Record<string, unknown> {
     const biz = this.store.get("business", businessId) as Row;
+    // F2 — objectives.list() is an explicitly TOLERANT display-path
+    // read ("never used for authority decisions"). Re-validate every
+    // candidate through the strict read before projecting: a tampered
+    // or legacy row fails the whole company read closed rather than
+    // silently entering the response.
+    const ownedAll = (this.deps.objectives.list(businessId) as Row[]).filter(
+      (o) => String(o.owner_authority_id) === actor,
+    );
     const owned = bounded(
-      (this.deps.objectives.list(businessId) as Row[]).filter(
-        (o) => String(o.owner_authority_id) === actor,
-      ),
+      ownedAll.map((o) => this.deps.objectives.get(String(o.objective_id)) as Row),
     );
     if (owned.length === 0) {
       throw new IntegrityError(
@@ -361,7 +452,10 @@ export class ObjectiveCockpitService {
           ? {
               review_id: String(latest.review_id),
               outcome: String(latest.outcome),
-              owner_action_required: latest.owner_action_required === true,
+              // F4 — no pending inbox on terminal objectives.
+              owner_action_required:
+                ObjectiveCockpitService.ownerActionPending(
+                  String(o.status), latest),
               recommended_status: latest.recommended_status ?? null,
               created_at: String(latest.created_at),
             }
@@ -380,6 +474,10 @@ export class ObjectiveCockpitService {
         created_at: String(biz.created_at ?? ""),
       },
       objectives: summaries,
+      // F4 — truncation is reported, never silently treated as the
+      // true total.
+      objectives_total_owned: ownedAll.length,
+      objectives_truncated: ownedAll.length > summaries.length,
       counts: {
         objectives_owned: summaries.length,
         targets_met_pending: summaries.filter(

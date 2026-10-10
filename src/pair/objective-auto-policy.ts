@@ -130,6 +130,11 @@ export interface AutoPolicyStatus {
   driver_missing: string[];
   terms_digest_binding: string | null;
   terms_current: boolean;
+  /** P15.9-A1 R1 F1 — set ONLY by statusReadOnly: the stored row is due
+   *  for lazy EXPIRED commit (state ENABLED/PAUSED, expires_at <= now)
+   *  but no write happened on this read. Omitted by the mutating/
+   *  expiry-committing reads. */
+  expiry_pending?: boolean;
 }
 
 function fail(code: string, msg: string): never {
@@ -549,6 +554,37 @@ export class ObjectiveAutoPolicyService {
         row = this.expireIfDue(row, objectiveId);
       }
       return this.toStatus(objectiveId, obj, row);
+    });
+  }
+
+  /** P15.9-A1 R1 F1 — owner-scoped read with ZERO writes: identical
+   *  proof surface to status() (objective strict read, owner check,
+   *  canonical row + anchor validation) but NEVER commits the lazy
+   *  expiry. A due row is reported as stored (ENABLED/PAUSED) with
+   *  `expiry_pending: true` — the EXPIRED transition still lands
+   *  exactly once, only on a real mutation path (control/evaluate/
+   *  status). Read-only projections (Company Cockpit) use this seam;
+   *  the canonical expiry contract is unchanged. */
+  statusReadOnly(objectiveId: string, actor: string): AutoPolicyStatus {
+    return this.store.immediate(() => {
+      const obj = this.getObjectiveRow(objectiveId);
+      if (!actor || String(actor) !== String(obj.owner_authority_id)) {
+        fail("FAIL_CLOSED_POLICY_FORBIDDEN", objectiveId);
+      }
+      const row = this.store.tryGet(
+        AUTO_POLICY_ENTITY,
+        this.policyId(objectiveId),
+      ) as unknown as PolicyRow | null;
+      if (row != null) {
+        this.assertCanonicalRow(row);
+        this.assertAnchorProof(row);
+      }
+      const expiryPending =
+        row != null &&
+        (row.state === "ENABLED" || row.state === "PAUSED") &&
+        !!row.limits &&
+        Date.parse(row.limits.expires_at) <= this.now();
+      return { ...this.toStatus(objectiveId, obj, row), expiry_pending: expiryPending };
     });
   }
 

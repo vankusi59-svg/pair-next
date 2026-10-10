@@ -1056,6 +1056,9 @@ const server = createMissionControlServer({
   // absent keeps scheduler status driver_ready:false and 404s the
   // read-only auto-driver status route.
   autoDriver: objectiveAutoDriver?.driver ?? undefined,
+  // P15.9-A1 — canonical artifact authority for cockpit artifact
+  // verification (producer binding + retained CAS bytes re-proved NOW).
+  artifacts: service.artifacts,
   // P15.8-D — conversation layer (chat turns + governed mission drafts).
   conversation: {
     sessions: conversationSessions,

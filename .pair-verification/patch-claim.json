@@ -1,14 +1,14 @@
 {
-  "claim_id": "P15_9A_COMPANY_COCKPIT_READ_PROJECTIONS",
-  "title": "P15.9-A1: canonical read-only Company Cockpit projections (cockpit + reviews + company) on owner-scoped vnext routes",
+  "claim_id": "P15_9A_COMPANY_COCKPIT_READ_PROJECTIONS_R1",
+  "title": "P15.9-A1 R1: zero GET side effects, strict company reads, verified artifacts, truthful pagination/inbox",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL"
   ],
   "required_tests": [
     "src/__tests__/pair-p15-9a-company-cockpit.test.ts",
-    "src/__tests__/pair-p15-10d-met-branch-fold.test.ts",
     "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-10d-met-branch-fold.test.ts",
     "src/__tests__/pair-p15-10d.test.ts",
     "src/__tests__/pair-p15-10d-r1.test.ts",
     "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
@@ -16,5 +16,5 @@
   ],
   "invariants": [],
   "risk_override": "MEDIUM",
-  "description": "P15.9-A1 on BASE e24e334 (post PR #90): backend canonical read-only projections for the Company Cockpit — no UI, no owner mutations (A2 deferred by owner decision). ObjectiveCockpitService composes EXISTING strict reads only: objectives.get + buildReviewObservation (KPI/budget/binding/WAL/mission re-proved, throws on corruption) + canonicalAdaptiveReviewsFor + boundMissionForWorkItem + filtered artifact refs. New GET routes: /api/vnext/objectives/:id/cockpit, /:id/reviews?limit=, /api/vnext/businesses/:id/company. Authority = same owner-scope contract as auto-policy routes: actor from x-operator-id only; owner_authority_id match required; foreign objective -> FAIL_CLOSED_COCKPIT_AUTHORITY (403); actor owning nothing in business -> FAIL_CLOSED_COMPANY_SCOPE (403); missing header -> 403; tampered canonical state -> FAIL_CLOSED* (409). Read-only: no store.put/event reachable; board()/detail() avoided (they fold on read). Selective fields only — no raw rows, no storage paths/secrets. buildReviewObservation narrowed to Omit<deps,'ceoCycle'> (never read on read path; no semantic change). TARGET_MET_CANDIDATE never conflated with objective.status ACHIEVED. Suite pair-p15-9a-company-cockpit.test.ts: 11 tests — projection truth, multi-objective scope, foreign/non-owner denial, tamper fail-closed, ordering/bounds, CANDIDATE!=ACHIEVED, MET+incomplete-workstream honesty, no-write invariant, real-server 403s. Regressions 211 green. No merge/deploy."
+  "description": "R1 fixes on PR #91 (BASE e24e334) for 4 audited findings on read-only cockpit projections. F1 GET side effects: new statusReadOnly on ObjectiveAutoPolicyService/ObjectiveAutoDriverService — same owner proof + canonical row/anchor validation but never calls expireIfDue; due rows report expiry_pending=true. Canonical expiry contract unchanged (evaluate/status still expire lazily). auto_driver readiness dropped from cockpit: claimable->evaluate->expireIfDue has no read-only path (documented limitation). F2 strict company read: businessCompany no longer trusts raw objectives.list() rows — each candidate re-read via objectives.get (canonical row + digest + anchor proof); forged/tampered rows fail the whole projection closed. F3 artifact provenance: each listed artifact re-proved via ArtifactAuthority.verifyArtifactForConsumption against execution_id + mission_id binding and retained CAS bytes; unverifiable artifacts dropped, counted in artifacts_dropped_unverified, never shown as verified. F4 pagination/inbox: latest_review + review_count computed on FULL canonical history (no 200-cap prefix); objectiveReviews returns {reviews,total,returned,truncated}; owner_action_required suppressed on terminal objectives in cockpit lifecycle and company latest_review; businessCompany reports objectives_total_owned + objectives_truncated truthfully. Terminal objectives whose observation re-validation fails (grants/WAL legitimately ended) render with observation_error instead of 409 — live objectives still fail closed. No CEO/Router/Executor/KPI/Telegram changes; no new permissions; no UI/A2. Tests: 17/17 incl. all required negatives (zero-write expired policy, forged objective fail-closed, tampered binding + corrupt CAS dropped, >200 reviews exact latest/count, >200 objectives truthful truncation, ACHIEVED no pending inbox, HTTP denial preserved). No merge/deploy."
 }

@@ -71,6 +71,13 @@ import {
 import {
   canonicallyCompleteMission,
 } from "./canonical-mission-completion.js";
+import { ObjectiveAutoPolicyService } from "../pair/objective-auto-policy.js";
+import {
+  adaptiveReviewDigest,
+  adaptiveReviewId,
+  OBJECTIVE_ADAPTIVE_REVIEW_COMMITTED_EVENT,
+  OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+} from "../pair/objective-adaptive-review.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p159-cockpit-"));
 let counter = 0;
@@ -105,6 +112,7 @@ function sqlRewriteEntity(
 }
 
 type FullStack = {
+  dir: string;
   store: PairEvidenceStore; biz: BusinessLayer; wf: WorkforceService;
   workstreams: ObjectiveWorkstreamService; alloc: WorkforceAllocationService;
   authority: ArtifactAuthority; service: PairControlPlane;
@@ -155,8 +163,9 @@ function freshFullStack(name: string): FullStack {
   const cockpit = new ObjectiveCockpitService({
     store, business: biz, workforce: wf,
     objectives: biz.objectives, workstreams,
+    artifacts: authority,
   });
-  return { store, biz, wf, workstreams, alloc, authority, service,
+  return { dir, store, biz, wf, workstreams, alloc, authority, service,
     control, projectId: String(project.project_id), kpiSvc, cockpit };
 }
 
@@ -475,6 +484,180 @@ describe("P15.9-A1 Company Cockpit read projections", () => {
       String(o.objective_id), OWNER) as Record<string, never>;
     expect(c.binding).toBeNull();
     expect((c.workstreams as Row[]).length).toBe(0);
+    s.store.close();
+  });
+});
+
+/* ============== R1 audit findings — negative tests ============== */
+
+/** Mint a VALID cloned canonical review row (same commit shape the
+ *  production seam writes): unique observation digest → recomputed
+ *  review_id/review_digest/entity_id + matching immutable anchor
+ *  event. Used only to build a >MAX history honestly — every clone
+ *  still passes full strict validation. */
+function cloneReview(
+  s: FullStack, base: Row, i: number,
+): void {
+  const body = { ...base } as Record<string, unknown>;
+  const obsDigest = digest({ clone_obs: body.review_observation_digest, i });
+  const rid = adaptiveReviewId(String(body.objective_id), obsDigest);
+  body.review_observation_digest = obsDigest;
+  body.review_id = rid;
+  body.entity_id = rid;
+  body.created_at = new Date(Date.parse(String(body.created_at)) + i * 1000)
+    .toISOString();
+  body.version = 0; // create-only rows: stored version bumps to 1 on put
+  body.review_digest = adaptiveReviewDigest(body);
+  s.store.put(OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, rid, body as Row, 0);
+  s.store.event({
+    entity_type: OBJECTIVE_ADAPTIVE_REVIEW_ENTITY,
+    entity_id: rid,
+    event_type: OBJECTIVE_ADAPTIVE_REVIEW_COMMITTED_EVENT,
+    old_state: null, new_state: "COMMITTED",
+    actor: `operator:${String(body.created_by)}`,
+    metadata: {
+      review_id: rid,
+      review_digest: String(body.review_digest),
+      objective_id: String(body.objective_id),
+      business_id: String(body.business_id),
+      outcome: String(body.outcome),
+      review_observation_digest: obsDigest,
+      source_ceo_decision_id: body.source_ceo_decision_id ?? null,
+      strategy_revision_id: body.strategy_revision_id ?? null,
+    },
+  });
+}
+
+describe("P15.9-A1 R1 — audit findings", () => {
+  it("R1-F1 expired auto-policy: GET cockpit mints ZERO writes; expiry surfaced as pending", async () => {
+    const { s, oid } = seeded("rf1", ["a"]);
+    const policy = new ObjectiveAutoPolicyService(s.store, s.biz.objectives);
+    policy.control({ objective_id: oid, actor: OWNER, action: "configure",
+      limits: { expires_at: new Date(Date.now() + 60_000).toISOString(),
+        max_ceo_calls: 4 }, idempotency_key: `cfg-${counter}` });
+    policy.control({ objective_id: oid, actor: OWNER, action: "enable",
+      policy_version: 1, idempotency_key: `en-${counter}` });
+    const polId = `oap:${oid}`;
+    expect(String((s.store.get("objective_auto_policy", polId) as Row).state))
+      .toBe("ENABLED");
+    // Cockpit wired with a policy service whose clock is past
+    // expires_at — the stored row is due for lazy EXPIRED commit.
+    const expiredClock = new ObjectiveAutoPolicyService(
+      s.store, s.biz.objectives, () => Date.now() + 120_000);
+    const cockpit = new ObjectiveCockpitService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      artifacts: s.authority, autoPolicy: expiredClock,
+    });
+    const before = dbOf(s.store)
+      .prepare("SELECT COUNT(*) c FROM events").get() as { c: number };
+    const c = cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    const after = dbOf(s.store)
+      .prepare("SELECT COUNT(*) c FROM events").get() as { c: number };
+    expect(after.c).toBe(before.c);
+    // Canonical row still ENABLED — the lazy commit did NOT happen.
+    expect(String((s.store.get("objective_auto_policy", polId) as Row).state))
+      .toBe("ENABLED");
+    const ap = c.auto_policy as Row;
+    expect(ap.expiry_pending).toBe(true);
+    s.store.close();
+  });
+
+  it("R1-F2 forged objective row in company list → whole read fails closed", () => {
+    const s = freshFullStack("rf2");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const o2 = mkObjective(s, bid);
+    // Forge o2 into a non-canonical shape (invalid enum status).
+    sqlRewriteEntity(s.store, "objective", String(o2.objective_id), (b) => {
+      b.status = "FORGED";
+    });
+    expect(() => s.cockpit.businessCompany(bid, OWNER)).toThrowError();
+    expect(() => s.cockpit.objectiveCockpit(String(o.objective_id), OWNER))
+      .not.toThrowError();
+    s.store.close();
+  });
+
+  it("R1-F3 tampered artifact binding + corrupt CAS → dropped, never verified", async () => {
+    const { s, oid, binding } = seeded("rf3", ["a", "b"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding, "a");
+    const c0 = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect((c0.artifacts as Row[]).length).toBe(1);
+    const artId = String((c0.artifacts as Row[])[0]!.artifact_id);
+    // Tamper the binding claim: point mission_id at a foreign mission.
+    sqlRewriteEntity(s.store, "artifact", artId, (b) => {
+      b.mission_id = "MSN_FOREIGN";
+    });
+    const c1 = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect((c1.artifacts as Row[]).length).toBe(0);
+    expect(c1.artifacts_dropped_unverified).toBe(0); // never a candidate: binding gone
+    // Corrupt retained CAS bytes: artifact claims stay, bytes fail.
+    const { s: s2, oid: oid2, binding: b2 } = seeded("rf3b", ["a"]);
+    grantBundle(s2, oid2, { required_count: 1 });
+    completeDeliverable(s2, b2, "a");
+    const blobDir = path.join(s2.dir, "artifacts", "blobs");
+    const cc = s2.cockpit.objectiveCockpit(oid2, OWNER) as Record<string, never>;
+    const art = (cc.artifacts as Row[])[0]!;
+    fs.writeFileSync(path.join(blobDir, String(art.sha256)), "tampered bytes");
+    const c2 = s2.cockpit.objectiveCockpit(oid2, OWNER) as Record<string, never>;
+    expect((c2.artifacts as Row[]).length).toBe(0);
+    expect(c2.artifacts_dropped_unverified).toBe(1);
+    s.store.close(); s2.store.close();
+  });
+
+  it("R1-F4a >200 reviews: latest + count exact, ordering newest-first", async () => {
+    const { s, oid, binding, ops } = seeded("rf4a", ["a"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding, "a");
+    s.kpiSvc.advance(oid);
+    const pass = await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+    const base = s.store.get(
+      OBJECTIVE_ADAPTIVE_REVIEW_ENTITY, pass.review_id) as Row;
+    for (let i = 1; i <= 205; i++) cloneReview(s, base, i);
+    const res = s.cockpit.objectiveReviews(oid, OWNER, 50);
+    expect(res.total).toBe(206);
+    expect(res.truncated).toBe(true);
+    expect(res.reviews).toHaveLength(50);
+    // newest clone (i=205) is latest; the REAL review is not misreported.
+    const c = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect(c.review_count).toBe(206);
+    const times = res.reviews.map((r) => String(r.created_at));
+    expect([...times].sort().reverse()).toEqual(times);
+    s.store.close();
+  });
+
+  it("R1-F4b >200 owned objectives: truncation metadata truthful", () => {
+    const s = freshFullStack("rf4b");
+    const bid = mkBusiness(s);
+    for (let i = 0; i < 205; i++) mkObjective(s, bid);
+    const company = s.cockpit.businessCompany(bid, OWNER) as Record<string, never>;
+    expect(company.objectives_total_owned).toBe(205);
+    expect(company.objectives_truncated).toBe(true);
+    expect((company.objectives as Row[]).length).toBe(200);
+    expect((company.counts as Row).objectives_owned).toBe(200);
+    s.store.close();
+  });
+
+  it("R1-F4c ACHIEVED objective + historical CANDIDATE review → no pending inbox", async () => {
+    const { s, oid, bid, binding, ops } = seeded("rf4c", ["a"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding, "a");
+    s.kpiSvc.advance(oid);
+    await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+    const before = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect((before.lifecycle as Row).owner_action_required).toBe(true);
+    // Owner accepts → ACHIEVED.
+    s.biz.objectives.transitionStatus(oid, {
+      business_id: bid, to: "ACHIEVED", actor: OWNER,
+      reason: "owner accepted targets" });
+    const after = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect((after.lifecycle as Row).objective_status).toBe("ACHIEVED");
+    expect((after.lifecycle as Row).owner_action_required).toBe(false);
+    // Historical review fields stay truthful (raw record kept).
+    expect((after.latest_review as Row).owner_action_required).toBe(true);
+    const company = s.cockpit.businessCompany(bid, OWNER) as Record<string, never>;
+    expect((company.counts as Row).targets_met_pending).toBe(0);
     s.store.close();
   });
 });

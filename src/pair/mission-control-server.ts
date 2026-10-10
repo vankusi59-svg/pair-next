@@ -35,6 +35,7 @@ import {
   type ObjectiveOperatingService,
 } from "./objective-operating-loop.js";
 import { ObjectiveCockpitService } from "./objective-cockpit.js";
+import type { ArtifactAuthority } from "./artifact-authority.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -108,7 +109,12 @@ export interface MissionControlServerDeps {
    *  in the serve script); absent → scheduler status keeps reporting
    *  driver_ready:false and the auto-driver route 404s. Read-only
    *  surface — no mutating driver route exists. */
-  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "driverStatus" | "readiness">;
+  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "statusReadOnly" | "driverStatus" | "readiness">;
+  /** P15.9-A1 — canonical artifact verification authority used by the
+   *  cockpit projection to re-prove producer/execution/mission binding
+   *  + retained CAS bytes NOW (service.artifacts). Absent → artifacts
+   *  render as unverified-dropped in the cockpit. */
+  artifacts?: ArtifactAuthority;
   /** TEST-ONLY: deterministic CEO decision transport for the
    *  lazily-composed operating service. Production bootstrap never
    *  sets it (the route resolves the real codex-cli model); HTTP
@@ -1428,6 +1434,7 @@ export function createMissionControlServer(
           autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
             deps.store, biz.objectives),
           autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
         });
         const cockpitActor = actor.startsWith("operator:")
           ? actor : `operator:${actor}`;
@@ -1456,6 +1463,7 @@ export function createMissionControlServer(
           autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
             deps.store, biz.objectives),
           autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
         });
         const reviewsActor = actor.startsWith("operator:")
           ? actor : `operator:${actor}`;
@@ -1488,6 +1496,7 @@ export function createMissionControlServer(
           autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
             deps.store, biz.objectives),
           autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
         });
         const companyActor = actor.startsWith("operator:")
           ? actor : `operator:${actor}`;
