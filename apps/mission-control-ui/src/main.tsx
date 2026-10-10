@@ -11,9 +11,12 @@ import { Providers } from "./pages/Providers";
 import { Observability } from "./pages/Observability";
 import { Objectives } from "./pages/Objectives";
 import { Chat } from "./pages/Chat";
+import { appRoute } from "./app/routes";
 import "./styles/app.css";
+import "./styles/tokens.css";
 
 const router = createBrowserRouter([
+  appRoute,
   {
     element: <Layout />,
     children: [
