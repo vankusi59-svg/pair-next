@@ -37,15 +37,26 @@ type Section<T> = { kind: "ready"; data: T } | { kind: "unavailable"; code: stri
 const isCorruptMessage = (m: AgentInboxMessage): boolean =>
   m.corrupt === true || m.state === "CORRUPT" || m.receipt_status === "CORRUPT";
 
+/* Inbox payload after envelope + per-element validation:
+   - "messages": canonical envelope, every element a valid object
+     (empty array = PROVEN canonical empty inbox)
+   - "corrupt": backend declared the inbox CORRUPT ({state:"CORRUPT"})
+   - "malformed": 200 body that is not the canonical shape — never
+     rendered as empty, never silently dropped */
+type InboxPayload =
+  | { kind: "messages"; messages: AgentInboxMessage[] }
+  | { kind: "corrupt" }
+  | { kind: "malformed" };
+
+const VALID_RECEIPT_STATUSES = new Set(["PENDING", "ACKNOWLEDGED", "CORRUPT"]);
+
 type Ready = {
   forBiz: string;
   forId: string;
   agent: OrgAgentRow;
   contract: Section<AgentContractRow | null>;
   policy: Section<AgentEffectivePolicy>;
-  /* null = payload present but malformed/corrupt — honest marker,
-     never rendered as empty/unrestricted */
-  inbox: Section<AgentInboxMessage[] | null>;
+  inbox: Section<InboxPayload>;
   items: Section<WorkItemRow[] | null>;
   graph: Section<WorkGraphPayload>;
 };
@@ -165,11 +176,22 @@ export function AgentDetail() {
           agent,
           contract: sect(contractR, (v) => v.contract),
           policy: sect(policyR, (v) => v),
-          inbox: sect(inboxR, (v) =>
-            Array.isArray(v.messages) ? v.messages.filter((m) => !!m && typeof m === "object") : null),
-          /* inbox read may return {state:"CORRUPT",corrupt:true} with no
-             messages array — null marks the whole section corrupt;
-             non-object elements are dropped so rows never crash */
+          inbox: sect(inboxR, (v): InboxPayload => {
+            /* envelope validation FIRST — a null/primitive body or a
+               non-array messages field can never become "empty"; any
+               null/primitive/invalid element marks the WHOLE inbox
+               malformed rather than silently dropping entries */
+            if (!v || typeof v !== "object") return { kind: "malformed" };
+            const raw = (v as { messages?: unknown; state?: unknown }).messages;
+            if (!Array.isArray(raw))
+              return (v as { state?: unknown }).state === "CORRUPT"
+                ? { kind: "corrupt" }
+                : { kind: "malformed" };
+            for (const el of raw) {
+              if (!el || typeof el !== "object") return { kind: "malformed" };
+            }
+            return { kind: "messages", messages: raw as AgentInboxMessage[] };
+          }),
           items: sect(itemsR, (v) => (Array.isArray(v.work_items) ? v.work_items : null)),
           graph: sect(graphR, (v) => v),
         },
@@ -288,9 +310,8 @@ export function AgentDetail() {
   const delegatedOut = graph.kind === "ready"
     ? graph.data.delegations.filter((d) => String(d.delegated_by_agent_id) === id)
     : [];
-  const inboxCorrupt = inbox.kind === "ready" && inbox.data === null;
-  const messages = inbox.kind === "ready" && Array.isArray(inbox.data)
-    ? [...inbox.data].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+  const messages = inbox.kind === "ready" && inbox.data.kind === "messages"
+    ? [...inbox.data.messages].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
     : [];
   const pol = policy.kind === "ready" ? policy.data : null;
 
@@ -470,10 +491,15 @@ export function AgentDetail() {
       <div className="need">
         {inbox.kind === "unavailable" ? (
           <SectMissing code={inbox.code} what="Inbox read" />
-        ) : inboxCorrupt ? (
+        ) : inbox.data.kind === "corrupt" ? (
           <div className="nrow">
             <StatusBadge tone="danger" label="CORRUPT" />
             <span className="note">canonical inbox corrupt — messages withheld, never rendered as empty</span>
+          </div>
+        ) : inbox.data.kind === "malformed" ? (
+          <div className="nrow">
+            <StatusBadge tone="warn" label="MALFORMED" />
+            <span className="note">inbox payload malformed — messages withheld, never rendered as empty</span>
           </div>
         ) : messages.length === 0 ? (
           <div className="nrow"><span className="note">No messages in this agent's durable inbox.</span></div>
@@ -481,12 +507,18 @@ export function AgentDetail() {
           messages.slice(0, 50).map((m) => (
             <div className="nrow" key={m.message_id}>
               <StatusBadge
-                tone={isCorruptMessage(m) ? "danger" : m.receipt_status === "PENDING" ? "warn" : "ok"}
-                label={isCorruptMessage(m) ? "CORRUPT" : (m.receipt_status ?? "—")}
+                tone={isCorruptMessage(m) ? "danger" : m.receipt_status === "PENDING" ? "warn"
+                  : m.receipt_status === "ACKNOWLEDGED" ? "ok" : "unknown"}
+                label={isCorruptMessage(m) ? "CORRUPT"
+                  : VALID_RECEIPT_STATUSES.has(String(m.receipt_status)) ? String(m.receipt_status) : "UNVERIFIED"}
               />
               <span className="tt">{m.kind || "message"}</span>
               <span className="note">
-                {isCorruptMessage(m) ? "canonical message corrupt — body withheld" : m.body}
+                {isCorruptMessage(m)
+                  ? "canonical message corrupt — body withheld"
+                  : VALID_RECEIPT_STATUSES.has(String(m.receipt_status))
+                    ? m.body
+                    : "unverified receipt status — body withheld, never rendered as normal"}
                 {" · "}
                 {String(m.created_at).slice(0, 19).replace("T", " ")}
                 {m.work_item_id ? ` · wi ${String(m.work_item_id).slice(0, 14)}` : ""}

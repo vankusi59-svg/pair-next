@@ -536,3 +536,56 @@ test("agent detail: R3 corruption predicate — body withheld under every marker
   await expect(page.getByText("canonical message corrupt")).toBeVisible();
   await expect(page.getByText("SECRET-BODY-STRING")).toHaveCount(0);
 });
+
+test("agent detail: R4 malformed inbox — never empty, never skeleton, bodies withheld", async ({ page }) => {
+  /* Every non-canonical inbox payload must fail closed on the detail
+     page: no false "No messages", no unverified bodies, no indefinite
+     skeleton. Canonical empty/proven messages still render honestly. */
+  const biz = await mkBusiness(page, "wf-r4d");
+  await mkObjective(page, biz);
+  const T = "2026-10-10T00:00:00Z";
+  const mk = (t: string) => mkAgent(page, biz, t);
+  const cases: Array<{ id: string; title: string; body: string | null }> = [
+    { id: "", title: "Null Envelope", body: "null" },
+    { id: "", title: "Null Elem", body: JSON.stringify({ messages: [null] }) },
+    { id: "", title: "Bad Elem", body: JSON.stringify({ messages: ["bad"] }) },
+    { id: "", title: "Mixed Elem", body: JSON.stringify({ messages: [
+      { message_id: "ok-1", receipt_status: "PENDING", kind: "NOTE", body: "VISIBLE-OK", created_at: T },
+      null,
+    ] }) },
+    { id: "", title: "Unknown Status", body: JSON.stringify({ messages: [
+      { message_id: "u-1", receipt_status: "MYSTERY", kind: "NOTE", body: "UNVERIFIED-BODY", created_at: T },
+    ] }) },
+    { id: "", title: "Missing Status", body: JSON.stringify({ messages: [
+      { message_id: "u-2", kind: "NOTE", body: "NOSTATUS-BODY", created_at: T },
+    ] }) },
+  ];
+  for (const c of cases) c.id = await mk(c.title);
+  const realEmpty = await mk("Real Empty");
+  for (const c of cases) {
+    const id = c.id;
+    await page.route(`**/api/org-agents/${id}/inbox`, (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: c.body ?? "null" }));
+  }
+  await seedBiz(page, biz);
+
+  // malformed cases → MALFORMED badge, never "No messages", page renders
+  for (const c of cases.slice(0, 4)) {
+    await page.goto(`/app/workforce/${c.id}`);
+    await expect(page.locator("h1")).toHaveText(c.title);
+    await expect(page.locator(".sbadge", { hasText: "MALFORMED" })).toBeVisible();
+    await expect(page.getByText("never rendered as empty")).toBeVisible();
+    await expect(page.getByText("No messages in this agent")).toHaveCount(0);
+    await expect(page.getByText("VISIBLE-OK")).toHaveCount(0); // mixed: valid elem's body also withheld (whole inbox malformed)
+  }
+  // unknown/missing receipt_status → UNVERIFIED badge + body withheld
+  for (const c of cases.slice(4)) {
+    await page.goto(`/app/workforce/${c.id}`);
+    await expect(page.locator(".sbadge", { hasText: "UNVERIFIED" })).toBeVisible();
+    await expect(page.getByText("unverified receipt status — body withheld")).toBeVisible();
+    await expect(page.getByText(/UNVERIFIED-BODY|NOSTATUS-BODY/)).toHaveCount(0);
+  }
+  // canonical empty (real backend) → genuine "No messages"
+  await page.goto(`/app/workforce/${realEmpty}`);
+  await expect(page.getByText("No messages in this agent's durable inbox.")).toBeVisible();
+});
