@@ -494,4 +494,12 @@ export const apiAdmin = {
       method: "POST",
       body: "{}",
     }, { noAuthPrompt: true }),
+  /* Scoped work-items read — used to prove mission→binding→work item→
+     objective lineage (R1-F1). business_id always required. */
+  workItems: (businessId: string, signal?: AbortSignal) =>
+    req<{ work_items: import("./app/types").WorkItemRow[] }>(
+      `/work-items?business_id=${encodeURIComponent(businessId)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
 };
