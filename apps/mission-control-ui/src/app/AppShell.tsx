@@ -46,6 +46,7 @@ const NAV: Array<{ group: string; items: Array<{ to: string; icon: string; label
       { to: "/app/objectives", icon: "◎", label: "Objectives" },
       { to: "/app/ceo", icon: "◈", label: "CEO Workspace" },
       { to: "/app/workforce", icon: "◍", label: "Workforce" },
+      { to: "/app/workforce/admin", icon: "◍", label: "Workforce Admin" },
     ],
   },
   {
@@ -58,6 +59,7 @@ const NAV: Array<{ group: string; items: Array<{ to: string; icon: string; label
   {
     group: "System",
     items: [
+      { to: "/app/system/business-admin", icon: "▣", label: "Business Admin" },
       { to: "/app/system/providers", icon: "▦", label: "Providers & Models" },
       { to: "/app/system/observability", icon: "◔", label: "Observability" },
       { to: "/app/system/schedules", icon: "◷", label: "Schedules" },
@@ -72,6 +74,8 @@ const CRUMB: Array<[string, string]> = [
   ["/app/inbox", "Owner Inbox"],
   ["/app/objectives", "Objectives"],
   ["/app/ceo", "CEO Workspace"],
+  ["/app/workforce/admin", "Workforce Admin"],
+  ["/app/system/business-admin", "Business Admin"],
   ["/app/workforce", "AI Workforce"],
   ["/app/missions", "Mission Operations"],
   ["/app/chat", "Chat"],

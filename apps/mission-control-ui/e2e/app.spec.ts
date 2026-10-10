@@ -15,8 +15,11 @@ test("/app/company renders new shell + honest no-business state", async ({ page 
   for (const g of ["Overview", "Business", "Operations", "System"]) {
     await expect(page.locator(".anav .group", { hasText: g })).toBeVisible();
   }
-  for (const l of ["Company Cockpit", "Owner Inbox", "Objectives", "CEO Workspace", "Workforce", "Missions", "Chat"]) {
-    await expect(page.locator(".anav a", { hasText: l })).toBeVisible();
+  for (const l of [
+    "Company Cockpit", "Owner Inbox", "Objectives", "CEO Workspace",
+    "Workforce", "Workforce Admin", "Missions", "Chat", "Business Admin",
+  ]) {
+    await expect(page.locator(".anav").getByRole("link", { name: l, exact: true })).toBeVisible();
   }
 });
 
