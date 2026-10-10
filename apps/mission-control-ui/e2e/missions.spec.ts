@@ -664,3 +664,84 @@ test("R2-C: preview task missing caps/deps → INVALID_PREVIEW, 0 POSTs", async 
   await page.getByRole("button", { name: /Preview plan/ }).click();
   await expect(page.getByText("Proposed plan")).toBeVisible();
 });
+
+/* ---------- R3 ---------- */
+
+/* R3-F1 exact ordering: hold A → edit to B → Preview B enabled while A
+   UNRESOLVED → B renders + confirms once → settle A → never overwrites. */
+test("R3-F1: preview B proceeds while obsolete A is still unresolved", async ({ page }) => {
+  let calls = 0;
+  let releaseA: ((r: Route) => void) | null = null;
+  await page.route("**/api/missions/preview", (r: Route) => {
+    calls++;
+    if (calls === 1) {
+      releaseA = () => r.fulfill({ status: 200, contentType: "application/json",
+        body: JSON.stringify({ preview_id: "PV_A", plan_digest: "a".repeat(64),
+          plan: { tasks: [{ task_key: "T1", title: "A-task", task_instruction: "ia", depends_on: [], required_capabilities: [] }] },
+          plan_source: null, plan_model: null }) });
+      return;
+    }
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ preview_id: "PV_B", plan_digest: "b".repeat(64),
+        plan: { tasks: [{ task_key: "T1", title: "B-task", task_instruction: "ib", depends_on: [], required_capabilities: [] }] },
+        plan_source: null, plan_model: null }) });
+  });
+  await page.route("**/api/missions/confirm", (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: '{"mission_id":"MSN_R3_DONE","status":"CREATED"}' }));
+  const posts: string[] = [];
+  await countPosts(page, posts);
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill("goal-A");
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  expect(calls).toBe(1);
+  /* change inputs while A is unresolved → invalidate aborts A, frees UI */
+  await page.getByLabel("goal").fill("goal-B");
+  const btn = page.getByRole("button", { name: /Preview plan/ });
+  await expect(btn).toBeEnabled(); /* NOT wedged by the pending A */
+  await btn.click(); /* start B while A is still unresolved */
+  await expect.poll(() => calls).toBe(2);
+  await expect(page.getByText("Proposed plan")).toBeVisible();
+  await expect(page.getByText("B-task")).toBeVisible();
+  await expect(page.getByText("A-task")).toHaveCount(0);
+  await page.getByRole("button", { name: /Confirm & run/ }).click();
+  await page.getByRole("dialog").locator("button.primary").click();
+  await page.waitForURL(/\/app\/missions\/MSN_R3_DONE/);
+  expect(posts.filter((u) => u.includes("/missions/confirm"))).toHaveLength(1);
+  /* settle A afterward (may already be aborted client-side) */
+  try { releaseA?.(); } catch { /* aborted route — expected */ }
+  await page.waitForTimeout(300);
+  expect(posts.filter((u) => u.includes("/missions/confirm"))).toHaveLength(1);
+});
+
+/* R3-F1: an obsolete preview error arriving after B starts never
+   corrupts B's state. */
+test("R3-F1: obsolete preview error after B starts → B intact", async ({ page }) => {
+  let calls = 0;
+  let releaseA: ((r: Route) => void) | null = null;
+  await page.route("**/api/missions/preview", (r: Route) => {
+    calls++;
+    if (calls === 1) {
+      releaseA = () => r.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' });
+      return;
+    }
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ preview_id: "PV_B2", plan_digest: "c".repeat(64),
+        plan: { tasks: [{ task_key: "T1", title: "B2-task", task_instruction: "i", depends_on: [], required_capabilities: [] }] },
+        plan_source: null, plan_model: null }) });
+  });
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill("goal-A");
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  await page.getByLabel("goal").fill("goal-B"); /* invalidate/abort A */
+  await page.getByRole("button", { name: /Preview plan/ }).click(); /* B starts */
+  await expect(page.getByText("Proposed plan")).toBeVisible();
+  /* late error from obsolete A arrives → swallowed, never corrupts B */
+  try { releaseA?.(); } catch { /* route already aborted */ }
+  await page.waitForTimeout(300);
+  await expect(page.getByText("B2-task")).toBeVisible();
+  await expect(page.getByText(/boom|ERROR/).first()).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Confirm & run/ })).toBeEnabled();
+});

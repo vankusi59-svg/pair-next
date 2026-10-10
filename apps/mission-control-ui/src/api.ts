@@ -471,10 +471,10 @@ export const apiAdmin = {
     project_id: string; goal: string;
     granted_permissions?: string[]; authorized_workspaces?: string[];
     risk_ceiling?: string; metadata?: Record<string, unknown>;
-  }) =>
+  }, signal?: AbortSignal) =>
     req<import("./app/types").MissionPreview>(
       "/missions/preview",
-      { method: "POST", body: JSON.stringify(body) },
+      { method: "POST", body: JSON.stringify(body), ...(signal ? { signal } : {}) },
       { noAuthPrompt: true },
     ),
   confirmMission: (body: { preview_id: string; plan_digest: string }) =>

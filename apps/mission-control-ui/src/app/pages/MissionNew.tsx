@@ -53,7 +53,8 @@ export function MissionNew() {
   const [projectId, setProjectId] = useState("");
   const [preview, setPreview] = useState<Pinned | null>(null);
   const [previewErr, setPreviewErr] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const [mutNote, setMutNote] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [autoConfirm, setAutoConfirm] = useState(false); /* opt-in, default OFF */
@@ -62,12 +63,12 @@ export function MissionNew() {
      CURRENT inputs — a stale render closure can never validate a stale pin. */
   const inputsRef = useRef({ projectId: "", goal: "", auto: false });
   inputsRef.current = { projectId, goal, auto: autoConfirm };
-  /* R2-A: busy is a per-request counter, not a shared boolean — a stale
-     request's finally clears ONLY its own slot and can never overwrite
-     a newer in-flight request's state. */
-  const pending = useRef(0);
+  /* R3-F1: the ACTIVE preview request owns previewBusy — obsolete requests
+     are aborted on invalidation and can never render, commit, or clear a
+     newer request's busy state. Confirmation is deliberately separate: a
+     potentially committed POST is never aborted or silently forgotten. */
+  const previewReq = useRef<{ id: number; ctl: AbortController } | null>(null);
   const confirmFlight = useRef(false); /* confirm single-flight */
-  const bump = (d: number) => { pending.current += d; setBusy(pending.current > 0); };
 
   useEffect(() => {
     const ctl = new AbortController();
@@ -105,6 +106,11 @@ export function MissionNew() {
      invite an unsafe duplicate submission). No automatic retries. */
   const invalidate = () => {
     seq.current++;
+    /* R3-F1: cancel the obsolete preview fetch and release its UI lock
+       immediately — a fresh preview may start while A is unresolved. */
+    previewReq.current?.ctl.abort();
+    previewReq.current = null;
+    setPreviewBusy(false);
     setPreview(null);
     setConfirming(false);
     if (confirmFlight.current) {
@@ -120,21 +126,27 @@ export function MissionNew() {
   });
 
   const doPreview = async () => {
-    if (!inputsValid || busy) return;
+    if (!inputsValid || previewBusy || confirmFlight.current) return;
     if (!getOperatorId()) {
       setMutNote("operator id required — set one in the legacy header before preview/submit.");
       return;
     }
+    /* R3-F1: cancel any obsolete preview still in flight, then own the
+       preview slot — its id identifies the one request allowed to apply. */
+    previewReq.current?.ctl.abort();
+    const ctl = new AbortController();
     const s = ++seq.current;
+    const mine = { id: s, ctl };
+    previewReq.current = mine;
     /* R1-F2: pin the exact request inputs — a late response is applied
        only if they still match the current effective inputs. */
     const pinnedInputs = { project_id: projectId, goal: goal.trim() };
     const wasAuto = autoConfirm;
-    bump(1);
+    setPreviewBusy(true);
     setPreviewErr(null);
     setMutNote(null);
     try {
-      const r: MissionPreview = await apiAdmin.previewMission(payload());
+      const r: MissionPreview = await apiAdmin.previewMission(payload(), ctl.signal);
       if (s !== seq.current) return;
       if (pinnedInputs.project_id !== inputsRef.current.projectId
         || pinnedInputs.goal !== inputsRef.current.goal.trim()) return;
@@ -169,8 +181,12 @@ export function MissionNew() {
       setPreview(null);
       setPreviewErr(e instanceof ApiError ? `${e.detail || e.message} (${e.code})` : String(e));
     } finally {
-      bump(-1); /* R2-A: clear this request's own slot only — a stale
-                   response can never wedge or clear B's in-flight state */
+      /* R3-F1: only the request still owning the slot may clear it — an
+         aborted/obsolete request never touches a newer request's state */
+      if (previewReq.current === mine) {
+        previewReq.current = null;
+        setPreviewBusy(false);
+      }
     }
   };
 
@@ -186,7 +202,7 @@ export function MissionNew() {
     if (confirmFlight.current) return; /* R2-A: single-flight — no duplicate POST */
     confirmFlight.current = true;
     const s = ++seq.current;
-    bump(1);
+    setConfirmBusy(true);
     setMutNote(null);
     try {
       const m = await apiAdmin.confirmMission({ preview_id: p.preview_id, plan_digest: p.plan_digest });
@@ -213,7 +229,7 @@ export function MissionNew() {
       }
     } finally {
       confirmFlight.current = false;
-      bump(-1);
+      setConfirmBusy(false);
     }
   };
 
@@ -274,8 +290,8 @@ export function MissionNew() {
 
       {st.kind === "ready" && !preview ? (
         <div className="actbar">
-          <button className="tbtn" disabled={busy || !inputsValid} onClick={doPreview}>
-            {busy ? "Planning…" : autoConfirm ? "Preview & execute" : "Preview plan"}
+          <button className="tbtn" disabled={previewBusy || confirmBusy || !inputsValid} onClick={doPreview}>
+            {previewBusy ? "Planning…" : autoConfirm ? "Preview & execute" : "Preview plan"}
           </button>
           <span className="note">preview only — no mission is created until you confirm.</span>
         </div>
@@ -311,10 +327,10 @@ export function MissionNew() {
               (Array.isArray(t.depends_on) ? t.depends_on : []).map((d) => ({ from: String(d), to: String(t.task_key) }))),
           } as Dag} />
           <div className="actbar">
-            <button className="tbtn" disabled={busy} onClick={() => setConfirming(true)}>
-              {busy ? "Submitting…" : "Confirm & run…"}
+            <button className="tbtn" disabled={confirmBusy} onClick={() => setConfirming(true)}>
+              {confirmBusy ? "Submitting…" : "Confirm & run…"}
             </button>
-            <button className="tbtn danger" disabled={busy} onClick={invalidate}>Discard</button>
+            <button className="tbtn danger" disabled={confirmBusy} onClick={invalidate}>Discard</button>
             <span className="note">confirm consumes exactly this pinned preview — digest is server-verified.</span>
           </div>
         </>
@@ -325,7 +341,7 @@ export function MissionNew() {
         title="Confirm mission"
         body={preview ? `Commit mission on project ${preview.project_id}? Pinned preview ${preview.preview_id} (digest ${preview.plan_digest.slice(0, 16)}…). HIGH-IMPACT: starts governed execution.` : ""}
         confirmLabel="Confirm & run"
-        busy={busy}
+        busy={confirmBusy}
         onConfirm={() => preview && commit(preview)}
         onCancel={() => setConfirming(false)}
       />
