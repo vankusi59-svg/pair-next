@@ -10,6 +10,9 @@ import { Workforce } from "./pages/Workforce";
 import { AgentDetail } from "./pages/AgentDetail";
 import { WorkforceAdmin } from "./pages/WorkforceAdmin";
 import { BusinessAdmin } from "./pages/BusinessAdmin";
+import { Missions } from "./pages/Missions";
+import { MissionNew } from "./pages/MissionNew";
+import { MissionDetailPage } from "./pages/MissionDetail";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
    honest placeholder so navigation, deep links and mobile nav are real;
@@ -66,34 +69,16 @@ export const appRoute = {
       element: <AgentDetail />,
     },
     {
-      path: "missions",
-      element: (
-        <PlannedPage
-          title="Mission Operations"
-          detail="Mission list with routing and runtime state — ported verbatim from the current dashboard."
-          phase="B5"
-        />
-      ),
-    },
-    {
       path: "missions/new",
-      element: (
-        <PlannedPage
-          title="Task Entry"
-          detail="The golden path — preview → confirm → run, ported verbatim."
-          phase="B5"
-        />
-      ),
+      element: <MissionNew />,
     },
     {
       path: "missions/:id",
-      element: (
-        <PlannedPage
-          title="Mission Detail"
-          detail="DAG, timeline, evidence, files and mission actions — ported verbatim with an objective backlink where lineage proves one."
-          phase="B5"
-        />
-      ),
+      element: <MissionDetailPage />,
+    },
+    {
+      path: "missions",
+      element: <Missions />,
     },
     {
       path: "chat",

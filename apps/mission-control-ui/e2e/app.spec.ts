@@ -28,8 +28,6 @@ test("placeholder pages exist for every unimplemented B4-B6 route", async ({ pag
      are real B2–B5.1 pages now — only destinations still
      placeholder-honest. */
   const routes: Array<[string, string]> = [
-    ["/app/missions", "Mission Operations"],
-    ["/app/missions/new", "Task Entry"],
     ["/app/chat", "Chat"],
     ["/app/system/providers", "Providers & Models"],
     ["/app/system/observability", "Observability"],
