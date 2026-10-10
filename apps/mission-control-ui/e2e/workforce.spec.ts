@@ -394,3 +394,75 @@ test("workforce: no mutation POSTs on pure reads; mobile viewport parity", async
   await expect(page.locator(".atabbar")).toBeVisible();
   expect(posts).toHaveLength(0);
 });
+
+test("workforce: R2-F1 foreign agent — fail closed with ZERO agent-specific GETs", async ({ page }) => {
+  /* Network-level proof: for a foreign or missing agent the page must
+     resolve identity FIRST and never fire contract/effective-policy/
+     inbox requests (client-side guard, not server authz). */
+  const bizA = await mkBusiness(page, "wf-r2a");
+  const bizB = await mkBusiness(page, "wf-r2b");
+  await mkObjective(page, bizA);
+  await mkObjective(page, bizB);
+  const foreignAgent = await mkAgent(page, bizA, "Foreign Agent");
+  const hits: string[] = [];
+  await page.route("**/api/org-agents/*/*", (route) => {
+    hits.push(route.request().url());
+    return route.continue();
+  });
+  await seedBiz(page, bizB); // selected business = B, agent belongs to A
+  await page.goto(`/app/workforce/${foreignAgent}`);
+  await expect(page.locator(".pstate.denied")).toContainText("does not belong to the selected business");
+  const agentSpecific = hits.filter((u) => /\/(contract|effective-policy|inbox)(\?|$)/.test(u));
+  expect(agentSpecific, `agent-specific GETs leaked: ${agentSpecific}`).toHaveLength(0);
+  // missing agent — same fail-closed contract
+  hits.length = 0;
+  await page.goto(`/app/workforce/missing-${uniq()}`);
+  await expect(page.getByText("Agent not found")).toBeVisible();
+  expect(hits.filter((u) => /\/(contract|effective-policy|inbox)(\?|$)/.test(u))).toHaveLength(0);
+});
+
+test("workforce: R2-F2 inbox states — empty/pending/corrupt/malformed", async ({ page }) => {
+  /* Adversarial: corrupt receipts make any exact pending count unproven;
+     malformed payloads must fail closed without crashing the page. */
+  const biz = await mkBusiness(page, "wf-r2i");
+  await mkObjective(page, biz);
+  const empty = await mkAgent(page, biz, "Empty Inbox");
+  const pend = await mkAgent(page, biz, "Pending Inbox", { executor_binding: "codex" });
+  const corrupt = await mkAgent(page, biz, "Corrupt Inbox");
+  const malformed = await mkAgent(page, biz, "Malformed Inbox");
+  // real pending message for `pend`
+  const wi = await mkWorkItem(page, biz, "Task", pend);
+  await apiPost(page, `/work-items/${wi}/messages`, {
+    business_id: biz,
+    sender_type: "OPERATOR",
+    recipient_agent_id: pend,
+    kind: "NOTE",
+    body: "do the thing",
+  });
+  await page.route(`**/api/org-agents/${corrupt}/inbox`, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      messages: [
+        { message_id: "m-ok", receipt_status: "PENDING", kind: "TASK", body: "x", created_at: "2026-10-10T00:00:00Z" },
+        { message_id: "m-corrupt", corrupt: true, receipt_status: "CORRUPT", kind: "EVENT", body: "y", created_at: "2026-10-10T00:01:00Z" },
+      ],
+    }) }));
+  await page.route(`**/api/org-agents/${malformed}/inbox`, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ state: "CORRUPT", corrupt: true }) }));
+  await seedBiz(page, biz);
+  await page.goto("/app/workforce");
+  await expect(page.locator(".ecard")).toHaveCount(4);
+  const cardEmpty = page.locator(".ecard", { hasText: "Empty Inbox" });
+  await expect(cardEmpty).toContainText("inbox 0 pending");
+  const cardPend = page.locator(".ecard", { hasText: "Pending Inbox" });
+  await expect(cardPend).toContainText("inbox 1 pending");
+  // corrupt receipt → indeterminate, NEVER an exact fabricated count
+  const cardCorrupt = page.locator(".ecard", { hasText: "Corrupt Inbox" });
+  await expect(cardCorrupt).toContainText("indeterminate");
+  await expect(cardCorrupt).toContainText("corrupt receipt");
+  await expect(cardCorrupt).not.toContainText("0 pending");
+  await expect(cardCorrupt).not.toContainText("1 pending");
+  // malformed 200 → fail-closed label, page still renders
+  const cardMalformed = page.locator(".ecard", { hasText: "Malformed Inbox" });
+  await expect(cardMalformed).toContainText("unavailable (malformed payload)");
+  await expect(page.locator(".srcnote")).toBeVisible();
+});

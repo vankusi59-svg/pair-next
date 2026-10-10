@@ -27,7 +27,13 @@ type AgentExtras = {
     | { kind: "none" }
     | { kind: "unavailable"; code: string };
   policyLine: string | null;
-  inboxPending: number | null;
+  /* corrupt receipts / malformed payloads make any exact pending count
+     UNPROVEN — render indeterminate, never a fabricated exact number */
+  inbox:
+    | { kind: "count"; n: number }
+    | { kind: "corrupt"; corrupt: number }
+    | { kind: "malformed" }
+    | { kind: "unavailable"; code: string };
   failedReads: string[];
 };
 
@@ -119,15 +125,22 @@ export function Workforce() {
         if (c.status === "rejected") failedReads.push("contract");
         const policyTxt = p.status === "fulfilled" ? policyLine(p.value.policy) : null;
         if (p.status === "rejected") failedReads.push("effective-policy");
-        const inboxPending =
-          i.status === "fulfilled"
-            ? i.value.messages.filter((m) => m.receipt_status === "PENDING").length
-            : null;
+        const inbox: AgentExtras["inbox"] = (() => {
+          if (i.status === "rejected")
+            return { kind: "unavailable" as const, code: i.reason instanceof ApiError ? i.reason.code : "ERROR" };
+          const msgs = i.value.messages;
+          if (!Array.isArray(msgs)) return { kind: "malformed" as const };
+          const corrupt = msgs.filter(
+            (m) => m.corrupt || m.state === "CORRUPT" || m.receipt_status === "CORRUPT",
+          ).length;
+          if (corrupt > 0) return { kind: "corrupt" as const, corrupt };
+          return { kind: "count" as const, n: msgs.filter((m) => m.receipt_status === "PENDING").length };
+        })();
         if (i.status === "rejected") failedReads.push("inbox");
         extras[id] = {
           contract,
           policyLine: policyTxt,
-          inboxPending,
+          inbox,
           failedReads,
         };
       }));
@@ -290,7 +303,22 @@ export function Workforce() {
                     )}
                   </span>
                   <span>workload {load === null ? "—" : `${load.length} active`}</span>
-                  <span>inbox {ex?.inboxPending === null || ex?.inboxPending === undefined ? "—" : `${ex.inboxPending} pending`}</span>
+                  <span>
+                    inbox{" "}
+                    {!ex ? (
+                      "—"
+                    ) : ex.inbox.kind === "count" ? (
+                      `${ex.inbox.n} pending`
+                    ) : ex.inbox.kind === "corrupt" ? (
+                      <span className="note">
+                        indeterminate — {ex.inbox.corrupt} corrupt receipt(s), pending count unproven
+                      </span>
+                    ) : ex.inbox.kind === "malformed" ? (
+                      <span className="note">unavailable (malformed payload)</span>
+                    ) : (
+                      <span className="note">unavailable ({ex.inbox.code})</span>
+                    )}
+                  </span>
                 </div>
                 <div className="efoot">
                   <span>policy: {ex?.policyLine ?? "unavailable — not unrestricted"}</span>

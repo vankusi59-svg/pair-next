@@ -115,11 +115,13 @@ export function AgentDetail() {
     const forBiz = biz;
     const forId = id;
     (async () => {
-      const [agentsR, contractR, policyR, inboxR, itemsR, graphR] = await Promise.allSettled([
+      /* Phase 1 — identity resolution FIRST (client-side guard, never
+         server-enforced authorization): the global org-agents read plus
+         the selected-business reads. A missing or foreign agent fails
+         closed here and NEVER triggers agent-specific GETs (contract,
+         effective-policy, inbox). */
+      const [agentsR, itemsR, graphR] = await Promise.allSettled([
         api.orgAgents(ctl.signal),
-        api.agentContract(forId, ctl.signal),
-        api.agentEffectivePolicy(forId, ctl.signal),
-        api.agentInbox(forId, ctl.signal),
         api.workItems(forBiz, ctl.signal),
         api.businessWorkGraph(forBiz, ctl.signal),
       ]);
@@ -135,10 +137,20 @@ export function AgentDetail() {
         return;
       }
       if (String(agent.business_id) !== forBiz) {
-        /* foreign agent under this business — never render its fields */
+        /* foreign agent under this business — fail closed: zero
+           agent-specific detail requests are issued */
         setSt({ kind: "foreign" });
         return;
       }
+      /* Phase 2 — identity verified for the selected business: now the
+         agent-specific canonical reads may fire, each settling
+         independently. */
+      const [contractR, policyR, inboxR] = await Promise.allSettled([
+        api.agentContract(forId, ctl.signal),
+        api.agentEffectivePolicy(forId, ctl.signal),
+        api.agentInbox(forId, ctl.signal),
+      ]);
+      if (ctl.signal.aborted) return;
       setSt({
         kind: "ready",
         r: {
@@ -461,12 +473,12 @@ export function AgentDetail() {
           messages.slice(0, 50).map((m) => (
             <div className="nrow" key={m.message_id}>
               <StatusBadge
-                tone={m.corrupt || m.state === "CORRUPT" ? "danger" : m.receipt_status === "PENDING" ? "warn" : "ok"}
-                label={m.corrupt || m.state === "CORRUPT" ? "CORRUPT" : (m.receipt_status ?? "—")}
+                tone={m.corrupt || m.state === "CORRUPT" || m.receipt_status === "CORRUPT" ? "danger" : m.receipt_status === "PENDING" ? "warn" : "ok"}
+                label={m.corrupt || m.state === "CORRUPT" || m.receipt_status === "CORRUPT" ? "CORRUPT" : (m.receipt_status ?? "—")}
               />
               <span className="tt">{m.kind || "message"}</span>
               <span className="note">
-                {m.corrupt ? "canonical message corrupt — body withheld" : m.body}
+                {m.corrupt || m.receipt_status === "CORRUPT" ? "canonical message corrupt — body withheld" : m.body}
                 {" · "}
                 {String(m.created_at).slice(0, 19).replace("T", " ")}
                 {m.work_item_id ? ` · wi ${String(m.work_item_id).slice(0, 14)}` : ""}
