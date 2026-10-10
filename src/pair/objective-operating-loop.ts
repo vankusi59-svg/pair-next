@@ -24,8 +24,10 @@
  *    every committed authority is re-derived, never trusted.
  */
 
+import path from "node:path";
 import { IntegrityError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
+import { ArtifactAuthority } from "./artifact-authority.js";
 import type { BusinessLayer } from "./business.js";
 import {
   assertCanonicalMissionInFlight,
@@ -705,6 +707,13 @@ export function createDefaultObjectiveOperatingService(deps: {
     objectives: deps.objectives,
     workstreams: deps.workstreams,
     business: deps.business,
+    artifacts: new ArtifactAuthority(deps.store, {
+      blobDir: path.join(
+        process.env.PAIR_ARTIFACT_DIR ??
+          path.join(deps.store.dbDir, "artifacts"),
+        "blobs",
+      ),
+    }),
   });
   return {
     service: new ObjectiveOperatingService({

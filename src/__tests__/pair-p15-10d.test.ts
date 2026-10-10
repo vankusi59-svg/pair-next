@@ -151,10 +151,11 @@ function freshFullStack(name: string): FullStack {
     { store, business: biz, workforce: wf, objectives: biz.objectives });
   const alloc = new WorkforceAllocationService(
     { store, business: biz, workforce: wf, objectives: biz.objectives, workstreams });
-  const kpiSvc = new ObjectiveKpiVerificationService({
-    store, objectives: biz.objectives, workstreams, business: biz });
   const authority = new ArtifactAuthority(store, {
     blobDir: path.join(dir, "artifacts", "blobs") });
+  const kpiSvc = new ObjectiveKpiVerificationService({
+    store, objectives: biz.objectives, workstreams, business: biz,
+    artifacts: authority });
   const project = service.createProject({ name: "p", root_location: workspace });
   return { dbPath, dir, store, biz, wf, workstreams, alloc, service,
     control, runtime, projectId: String(project.project_id), kpiSvc,
@@ -551,7 +552,7 @@ describe("P15.10-D §B — adversarial authority matrix", () => {
     // A second service instance over the same store — racing callers.
     const svc2 = new ObjectiveKpiVerificationService({
       store: s.store, objectives: s.biz.objectives,
-      workstreams: s.workstreams, business: s.biz });
+      workstreams: s.workstreams, business: s.biz, artifacts: s.authority });
     const r1 = s.kpiSvc.advance(oid)[0]!;
     const r2 = svc2.advance(oid)[0]!;
     expect([r1.outcome, r2.outcome].sort()).toEqual(["PROGRESS_RECORDED", "REPLAYED"]);

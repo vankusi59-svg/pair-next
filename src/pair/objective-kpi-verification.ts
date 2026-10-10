@@ -29,6 +29,7 @@ import type { PairEvidenceStore } from "./store.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { BusinessLayer } from "./business.js";
+import { ArtifactAuthority } from "./artifact-authority.js";
 import { assertCanonicalMissionCompletion } from "./work-completion.js";
 import {
   KPI_AUTH_ENTITY,
@@ -82,6 +83,11 @@ export class ObjectiveKpiVerificationService {
       objectives: ObjectiveAuthorityService;
       workstreams: ObjectiveWorkstreamService;
       business: BusinessLayer;
+      /** F1 — the canonical artifact verification seam. ACCEPTED row
+       *  state is never trusted: every candidate artifact is re-proven
+       *  (acceptance history + canonical shape + retained CAS bytes)
+       *  through this authority inside the same transaction. */
+      artifacts: ArtifactAuthority;
       now?: () => number;
     },
   ) {}
@@ -132,6 +138,32 @@ export class ObjectiveKpiVerificationService {
       kpiAuthFail(`objective ${objectiveId} status ${String(objective.status)} is terminal`);
     }
     return this.store.immediate(() => {
+      // F2 — durable idempotency, resolved INSIDE the transaction so a
+      // retried/replayed request can never mint a second grant nor undo
+      // a revoke: same key + same semantics returns the stored row
+      // (whatever its state); same key + different semantics fails
+      // closed; concurrent duplicates converge on the first mint.
+      const ruleDigest = digest(rule);
+      for (const prior of this.store.list<Row>(KPI_AUTH_ENTITY)) {
+        if (
+          String(prior.objective_id) === objectiveId &&
+          String(prior.dedup_key) === input.idempotency_key
+        ) {
+          const sameSemantics =
+            String(prior.business_id) === String(objective.business_id) &&
+            String(prior.kpi_id) === String(input.kpi_id) &&
+            String(prior.rule_digest) === ruleDigest &&
+            String(prior.expires_at) === new Date(exp).toISOString() &&
+            String(prior.owner_authority_id) === String(objective.owner_authority_id) &&
+            String(prior.created_by) === input.actor;
+          if (!sameSemantics) {
+            kpiAuthFail(
+              `idempotency_key ${input.idempotency_key} replays with different semantics`,
+            );
+          }
+          return prior;
+        }
+      }
       // ONE enabled grant per (objective,kpi) — competing measurements on
       // the same KPI are structurally impossible.
       for (const g of this.store.list<Row>(KPI_AUTH_ENTITY)) {
@@ -154,7 +186,7 @@ export class ObjectiveKpiVerificationService {
         kpi_id: String(input.kpi_id),
         owner_authority_id: String(objective.owner_authority_id),
         rule,
-        rule_digest: digest(rule),
+        rule_digest: ruleDigest,
         progress_value: rule.progress_value,
         objective_terms_version: Number(objective.terms_version),
         expires_at: new Date(exp).toISOString(),
@@ -333,7 +365,12 @@ export class ObjectiveKpiVerificationService {
       }
       // ≥1 ACCEPTED artifact attributed to THIS mission via its governed
       // task — rows carry mission_id directly; cross-mission rows are
-      // structurally excluded.
+      // structurally excluded. F1: ACCEPTED row state alone is not
+      // proof — each candidate is re-verified through the canonical
+      // artifact authority (acceptance history + canonical shape +
+      // retained CAS bytes verified NOW). A deleted/tampered blob or a
+      // row drifted from its acceptance facts fails the whole read
+      // closed rather than silently de-scoping the unit.
       const artifactIds = this.store
         .list<Row>("artifact")
         .filter(
@@ -346,6 +383,18 @@ export class ObjectiveKpiVerificationService {
         )
         .map((a) => String(a.artifact_id))
         .sort();
+      for (const artifactId of artifactIds) {
+        const a = this.store.get<Row>("artifact", artifactId);
+        this.deps.artifacts.verifyArtifactForConsumption(artifactId, {
+          execution_id: String(a.execution_id),
+          mission_id: String(mission.mission_id),
+          governed_task_id: String(a.governed_task_id),
+          producer_executor_id: String(a.producer_executor_id),
+          sha256: String(a.sha256),
+          byte_size: Number(a.byte_size),
+          logical_name: String(a.logical_name),
+        });
+      }
       if (artifactIds.length === 0) continue;
       out.push({
         workstream_key: key,

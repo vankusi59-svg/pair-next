@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_10_D_KPI_EVIDENCE_VERIFICATION",
-  "title": "P15.10-D: autonomous KPI evidence verification — owner-opt-in delegated verifier grant + receipt-bound canonical progress writes",
+  "claim_id": "P15_10_D_R1_AUTHORITY_PROOF_HARDENING",
+  "title": "P15.10-D R1: artifact CAS re-verification + grant dedup + receipt-auth binding",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
@@ -8,6 +8,7 @@
     "GATE_ROUTER"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-10d-r1.test.ts",
     "src/__tests__/pair-p15-10d.test.ts",
     "src/__tests__/pair-p15-1-objective-authority.test.ts",
     "src/__tests__/pair-p15-5-kpi-review.test.ts",
@@ -23,5 +24,5 @@
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "Closes the P15.10-C KPI-UNVERIFIED gap: mission COMPLETED + artifact ACCEPTED never produced KPI progress. Adds ONE delegated verifier contract: owner-scoped grant objective_kpi_auto_authorization (KVA_) pinning business+objective+kpi+DELIVERABLE_BUNDLE rule+terms_version+expires_at (default OFF, ONE enabled grant per (objective,kpi), revocable, non-owner denied). New verifier kind kpi-verifier:<auth_id> in objective-authority assertOwnerVerifier — never owner impersonation; writer is the single canonical PAIR_KPI_VERIFIER. ObjectiveKpiVerificationService re-derives facts in ONE txn: workstream child folded DONE + WAL lineage + boundMissionForWorkItem + assertCanonicalMissionCompletion + >=1 ACCEPTED artifact bound via governed_task/mission; filename/self-report/LLM never count. On satisfaction writes immutable kpi_verification_receipt (KVR_) then calls EXISTING recordProgress with evidence_key kva:<auth>:<receipt_id>; P15.1 ledger gives replay idempotency + conflict. P15.5 assertCanonicalObjectiveKpiProgress re-validates grant+receipt (expiry/revoke/terms-drift/terminal fail closed). Operating pass calls advance once before §6 — TARGET_MET_CANDIDATE unchanged, never auto-ACHIEVED. MC route POST .../kpi-verification owner-scoped grant/revoke/disable/status. Tests: acceptance reproduces the gap end-to-end + 15 adversarial + contract edges. No merge/deploy; driver OFF."
+  "description": "R1 on PR #88 (BASE 88470ee). F1 CONFIRMED+FIXED: verifiedUnits trusted artifact.state==ACCEPTED rows only — deleted/tampered retained CAS bytes still minted progress. Fix: the service takes ArtifactAuthority (canonical blobDir = PAIR_ARTIFACT_DIR ?? dbDir/artifacts/blobs, same resolver as telegram-delivery) and re-verifies every candidate via verifyArtifactForConsumption (acceptance history + canonical shape + retained bytes NOW) inside the same txn; corruption fails closed. F2 CONFIRMED+FIXED: grant() stored dedup_key but never consulted it — replay after revoke minted a fresh ENABLED grant. Fix: dedup scan inside the txn before the enabled-check — same (objective,key)+same semantics (business,kpi,rule_digest,expires_at,owner,created_by) returns the stored row (REVOKE durable), different semantics fails closed, dups converge. F3 CONFIRMED+FIXED in shared assertKpiVerifierAuthority: added receipt.authorization_id===verifier auth, receipt.evidence_key===claim key, receipt.rule_digest===grant.rule_digest — revoked-grant receipts and tampered grant rules no longer satisfy new verifiers; write path and P15.5 strict read share the contract. F4 VERIFIED (no change): revoke/expire after progress makes strict read fail closed FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW; persisted value untouched; owner re-verification recovers. F5 VERIFIED (documented): DELIVERABLE_BUNDLE proves canonical deliverable completion only; receipt.verified_units binds workstream/work_item/mission/artifact ids — no content semantics, no AI judge. R1 suite: 10 tests, prepatch FAIL→postpatch PASS; 22 original + 340 regressions green. No merge/deploy."
 }

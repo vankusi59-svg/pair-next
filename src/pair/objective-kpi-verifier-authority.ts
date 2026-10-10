@@ -225,6 +225,26 @@ export function assertKpiVerifierAuthority(args: {
   if (!receipt) {
     kpiAuthFail(`evidence_key ${evidence_key}: receipt ${parts[2]} missing`);
   }
+  // F3 — strict receipt↔authorization binding: the receipt must be the
+  // one THIS authorization minted, under THIS authorization's current
+  // rule, carrying its own immutable evidence key. A receipt minted by
+  // a revoked/other grant, a grant whose rule was tampered after mint,
+  // or a key string that is not the receipt's minted key all fail.
+  if (String(receipt.authorization_id) !== authId) {
+    kpiAuthFail(
+      `receipt ${parts[2]}: binds authorization ${String(receipt.authorization_id)}, not ${authId}`,
+    );
+  }
+  if (String(receipt.evidence_key) !== evidence_key) {
+    kpiAuthFail(
+      `receipt ${parts[2]}: evidence_key ${evidence_key} is not the minted key`,
+    );
+  }
+  if (String(receipt.rule_digest) !== String(grant!.rule_digest)) {
+    kpiAuthFail(
+      `receipt ${parts[2]}: rule_digest does not bind grant rule_digest`,
+    );
+  }
   if (String(receipt.produced_by) !== KPI_VERIFIER_WRITER) {
     kpiAuthFail(`receipt ${parts[2]}: produced_by ${String(receipt.produced_by)} is not the canonical writer`);
   }
