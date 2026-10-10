@@ -4,7 +4,8 @@
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "WORK_COMPLETION"
+    "ARTIFACT",
+    "GATE_ROUTER"
   ],
   "required_tests": [
     "src/__tests__/pair-p15-10d.test.ts",
