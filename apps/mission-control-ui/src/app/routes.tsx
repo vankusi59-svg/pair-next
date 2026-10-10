@@ -8,6 +8,8 @@ import { Ceo } from "./pages/Ceo";
 import { Reviews } from "./pages/Reviews";
 import { Workforce } from "./pages/Workforce";
 import { AgentDetail } from "./pages/AgentDetail";
+import { WorkforceAdmin } from "./pages/WorkforceAdmin";
+import { BusinessAdmin } from "./pages/BusinessAdmin";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
    honest placeholder so navigation, deep links and mobile nav are real;
@@ -50,6 +52,10 @@ export const appRoute = {
     {
       path: "ceo",
       element: <Ceo />,
+    },
+    {
+      path: "workforce/admin",
+      element: <WorkforceAdmin />,
     },
     {
       path: "workforce",
@@ -98,6 +104,10 @@ export const appRoute = {
           phase="B5"
         />
       ),
+    },
+    {
+      path: "system/business-admin",
+      element: <BusinessAdmin />,
     },
     {
       path: "system/providers",

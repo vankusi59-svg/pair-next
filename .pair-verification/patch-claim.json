@@ -1,13 +1,16 @@
 {
-  "claim_id": "P15_9B5_1_WORKFORCE",
-  "title": "P15.9-B5.1: /app/workforce + /app/workforce/:id AI Workforce & Agent Detail",
+  "claim_id": "P15_9B5_2_ADMIN_PARITY",
+  "title": "P15.9-B5.2: /app/system/business-admin + /app/workforce/admin legacy admin parity",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
+    "apps/mission-control-ui/e2e/workforce-admin.spec.ts",
+    "apps/mission-control-ui/e2e/workforce.spec.ts",
+    "apps/mission-control-ui/e2e/app.spec.ts",
     "src/__tests__/pair-p14-workforce-v2.test.ts",
     "src/__tests__/pair-p12.test.ts"
   ],
   "invariants": [],
-  "description": "B5.1 R4 — AgentDetail inbox fail-closed hardening. The inbox read now validates the ENVELOPE before touching messages: null/non-object 200 body or non-array messages → 'malformed' (MALFORMED badge, 'messages withheld, never rendered as empty'); {state:\"CORRUPT\"} → CORRUPT panel. Any null/primitive/non-object ELEMENT marks the whole inbox malformed — never silently filtered into a false 'No messages'. Only a proven canonical envelope renders messages; per-message, unknown/missing receipt_status → UNVERIFIED badge + body withheld (unified isCorruptMessage predicate preserved: corrupt flag / state=CORRUPT / receipt_status=CORRUPT → CORRUPT badge + withheld body); PENDING/ACKNOWLEDGED render unchanged. New e2e: 7-case detail matrix (null envelope, [null], [\"bad\"], mixed valid+null, unknown status, missing status, real canonical empty) asserting no false empty, no leaked bodies, no indefinite skeleton. R1–R3 preserved (two-phase identity prefetch, tri-state contract, per-element workforce validation, truthful terminate copy). Proof: tsc+vite PASS; playwright 94/94 full suite on real :8790 — clean."
+  "description": "Legacy Business-tab parity on existing canonical APIs only (zero backend/schema/dependency changes). /app/system/business-admin: create business with project_id verified against GET /api/projects (fail-closed when the project list is unavailable — never guessed), pinned ConfirmDialog on the exact payload, ambiguous-outcome wording on transport/5xx failure (no auto-retry, no fabricated success), inspect-by-id rendering the biz.detail() bundle (business/agents/objectives/routines/board work-item columns), global business list labeled global+unfiltered with select/inspect actions. /app/workforce/admin (bound to selected business, EmptyState when none): create org-agent (title+department+role+reports_to+executor_binding; backend auto-materializes baseline contract), create work-item (title+goal+department+assignee+objective+priority; never auto-opened), per-row open/block/unblock/comment through pinned dialogs (open labeled HIGH-IMPACT governed trigger), routine create + enable/disable (canonical mission_schedule seam), legacy objective create explicitly labeled LEGACY compat vs vnext. All mutation dialogs pin {op,biz,target,payload} at open, are invalidated on business change, dup-submit guarded (dblclick → exactly 1 POST), canonical refetch after success, ambiguous wording on transport failure. Same-business-only selects make cross-business reports_to/assignee/objective un-submittable from the UI (backend FAIL_CLOSED_*_SCOPE still authoritative). apiAdmin wrappers added (projects raw array shape verified against server; noAuthPrompt everywhere; reads take AbortSignal). New e2e spec workforce-admin.spec.ts (8 tests) covering the 19-item verification list incl. network-level proof that /app/company reads the newly selected business_id and unauthenticated fail-closed. Proof: tsc+vite PASS; playwright workforce-admin 8/8."
 }

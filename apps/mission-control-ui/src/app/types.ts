@@ -311,3 +311,63 @@ export interface WorkGraphPayload {
   decompositions: Array<Record<string, unknown>>;
   dependency_sets: Array<Record<string, unknown>>;
 }
+
+/* ---- P15.9-B5.2 — legacy admin parity types ---- */
+
+export interface ProjectRow {
+  project_id: string;
+  name?: string;
+  [k: string]: unknown;
+}
+
+export interface BusinessRow {
+  business_id: string;
+  name: string;
+  description?: string;
+  project_id: string;
+  currency?: string;
+  status?: string;
+  created_at?: string;
+  version?: number;
+  [k: string]: unknown;
+}
+
+/* GET /api/businesses/:id — the canonical detail bundle. */
+export interface BusinessDetail {
+  business: BusinessRow;
+  agents: OrgAgentRow[];
+  objectives: LegacyObjectiveRow[];
+  board: Record<string, unknown>;
+  routines: RoutineRow[];
+  budgets: Array<Record<string, unknown>>;
+}
+
+export interface RoutineRow {
+  routine_id: string;
+  business_id: string;
+  name: string;
+  goal_template: string;
+  cron: string;
+  department?: string;
+  assignee_agent_id?: string | null;
+  schedule_id?: string;
+  enabled?: boolean;
+  created_at?: string;
+  version?: number;
+  [k: string]: unknown;
+}
+
+/* Legacy compat objective (POST /api/objectives) — DISTINCT from the
+   canonical vnext objective contract; same store, different API shape. */
+export interface LegacyObjectiveRow {
+  objective_id: string;
+  business_id: string;
+  title: string;
+  description?: string;
+  parent_objective_id?: string | null;
+  metric?: string;
+  target?: string;
+  status?: string;
+  created_at?: string;
+  [k: string]: unknown;
+}

@@ -321,3 +321,96 @@ export const api = {
       `/conversations/${id}/drafts/${draftId}/reject`,
       { method: "POST", body: "{}" }),
 };
+
+/* ---- P15.9-B5.2 — legacy admin parity wrappers ----
+   All suppress the legacy 401 prompt; reads take an AbortSignal.
+   GET /api/businesses and GET /api/org-agents are GLOBAL unfiltered
+   reads — callers must label, never present as owner-scoped. */
+export const apiAdmin = {
+  /* GET /api/projects returns the raw array (verified against the
+     mission-control-server route). */
+  projects: (signal?: AbortSignal) =>
+    req<import("./app/types").ProjectRow[]>(
+      "/projects",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  businesses: (signal?: AbortSignal) =>
+    req<{ businesses: import("./app/types").BusinessRow[] }>(
+      "/businesses",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  businessDetail: (id: string, signal?: AbortSignal) =>
+    req<import("./app/types").BusinessDetail>(
+      `/businesses/${id}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  createBusiness: (body: { name: string; project_id: string; description?: string; currency?: string }) =>
+    req<import("./app/types").BusinessRow>("/businesses", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  createOrgAgent: (body: {
+    business_id: string; title: string; department: string;
+    role?: string; reports_to?: string; executor_binding?: string;
+  }) =>
+    req<import("./app/types").OrgAgentRow>("/org-agents", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  createWorkItem: (body: {
+    business_id: string; title: string; goal: string;
+    department?: string; assignee_agent_id?: string;
+    objective_id?: string; priority?: number;
+  }) =>
+    req<import("./app/types").WorkItemRow>("/work-items", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  /* open is a high-impact governed trigger — explicit confirmation only. */
+  workItemAction: (id: string, action: "open" | "block" | "unblock", body?: { reason?: string }) =>
+    req<import("./app/types").WorkItemRow>(`/work-items/${id}/${action}`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+    }, { noAuthPrompt: true }),
+  workItemComment: (id: string, body: string) =>
+    req<import("./app/types").WorkItemRow>(`/work-items/${id}/comment`, {
+      method: "POST",
+      body: JSON.stringify({ body }),
+    }, { noAuthPrompt: true }),
+  routines: (businessId: string, signal?: AbortSignal) =>
+    req<{ routines: import("./app/types").RoutineRow[] }>(
+      `/routines?business_id=${encodeURIComponent(businessId)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  createRoutine: (body: {
+    business_id: string; name: string; goal_template: string; cron: string;
+    department?: string; assignee_agent_id?: string;
+  }) =>
+    req<import("./app/types").RoutineRow>("/routines", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  routineAction: (id: string, action: "enable" | "disable") =>
+    req<import("./app/types").RoutineRow>(`/routines/${id}/${action}`, {
+      method: "POST",
+      body: "{}",
+    }, { noAuthPrompt: true }),
+  legacyObjectives: (businessId: string, signal?: AbortSignal) =>
+    req<{ objectives: import("./app/types").LegacyObjectiveRow[] }>(
+      `/objectives?business_id=${encodeURIComponent(businessId)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  createLegacyObjective: (body: {
+    business_id: string; title: string; description?: string;
+    metric?: string; target?: string; parent_objective_id?: string;
+  }) =>
+    req<import("./app/types").LegacyObjectiveRow>("/objectives", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+};
