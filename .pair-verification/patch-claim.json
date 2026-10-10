@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_9B1_APP_SHELL_DESIGN_SYSTEM",
-  "title": "P15.9-B1: app shell + design tokens + parallel /app route tree",
+  "claim_id": "P15_9B2_COMPANY_COCKPIT",
+  "title": "P15.9-B2: /app/company Company Cockpit on canonical businessCompany read",
   "affected_surfaces": [
     "UI"
   ],
@@ -9,5 +9,5 @@
     "src/__tests__/pair-p15-10d-met-branch-fold.test.ts"
   ],
   "invariants": [],
-  "description": "B1 of the approved P15.9-B0 master plan (PR #92, BASE b662914): new AppShell (sidebar groups Overview/Business/Operations/System per B.3, business switcher manual/last-used business_id contract B.5.3 \u2014 no /api/businesses enumeration, operator chip, theme toggle, breadcrumb topbar, mobile <768 bottom tab bar + More drawer, 768-1199 icon rail), semantic CSS tokens (tokens.css dark/light incl. --unknown for unverifiable), gloss map lib/gloss.ts (C.6), shared components (StatusBadge, ProofChip, EmptyState/ErrorState/DeniedState/UnverifiedPanel/Skeleton), /app/* parallel route tree with honest PlannedPage placeholders for all B2-B6 destinations. Old route tree untouched \u2014 / still serves the legacy Dashboard; no backend/auth/API/dependency change, no fake data, no redirects. Harness-executable proof: cockpit + met-fold vitest suites unchanged-green (zero backend diff). UI proof reported with PR: tsc PASS, vite build PASS, playwright e2e app.spec 12/12 + smoke 5/5 + chat 5/5 PASS against the real :8790 server."
+  "description": "B2 of the approved P15.9-B0 master plan (PR #92): /app/company renders the real Company Cockpit reading only GET /api/vnext/businesses/:id/company via useSelectedBusiness() (B1 BizContext) — never enumerates /api/businesses, AbortController guards stale-response overwrite on business switch, prior business data dropped on switch/failure. Dashboard: company header (name/description/status), 4 stat cards (objectives_owned + targets_met_pending exact counts, status breakdown labeled 'of N returned', reported spend labeled aggregate over returned page), objectives_truncated warning banner, Needs Your Attention lane (fresh pending via company-side latest_review.owner_action_required only; global /api/approvals rows labeled 'global queue — not business-scoped'; HALT row states API_MISSING, no count), EntityCard grid (title/status/deadline/KpiBar with canonically_proven=false -> UNVERIFIED + unverifiable chip never MET-as-evidence, budget consumed/ceiling + proven|claimed badge, latest_review outcome + review_count), Recent reviews labeled 'not a full activity feed (API_MISSING)'. Honest states: no-business EmptyState, loading Skeletons, 401/403/DeniedState, FAIL_CLOSED_* integrity ErrorState with gloss, never error-to-empty. Zero backend/authority change, zero new deps. Harness-executable proof: cockpit + met-fold vitest suites unchanged-green. UI proof reported with PR: tsc PASS, vite build PASS, playwright e2e 29/29 PASS (app.spec 12 + company.spec 7 + smoke 5 + chat 5) against the real :8790 server."
 }

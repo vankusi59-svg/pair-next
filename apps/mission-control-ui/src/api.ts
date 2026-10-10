@@ -126,6 +126,13 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  // P15.9-A1 — owner-scoped company projection (non-owner → 403
+  // FAIL_CLOSED_COMPANY_SCOPE; integrity → 500 FAIL_CLOSED_*)
+  businessCompany: (id: string, signal?: AbortSignal) =>
+    req<{ company: import("./app/types").CompanyPayload }>(
+      `/vnext/businesses/${encodeURIComponent(id)}/company`,
+      signal ? { signal } : undefined,
+    ),
   // P15.10-A — objective auto-policy (owner-scoped; non-owner → 403)
   autoPolicyStatus: (id: string) =>
     req<{ auto_policy: import("./types").AutoPolicyStatus }>(
