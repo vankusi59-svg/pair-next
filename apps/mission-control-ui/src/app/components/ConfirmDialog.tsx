@@ -9,6 +9,9 @@ export function ConfirmDialog(props: {
   body: string;
   confirmLabel: string;
   busy?: boolean;
+  /* B4 R1-F2: fail-closed confirmations (e.g. missing canonical scope)
+     disable confirm independently of in-flight busy state. */
+  confirmDisabled?: boolean;
   children?: ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
@@ -70,7 +73,7 @@ export function ConfirmDialog(props: {
         {props.children}
         <div className="cdlg-f">
           <button className="ghost" onClick={props.onCancel} disabled={props.busy}>Cancel</button>
-          <button className="primary" onClick={props.onConfirm} disabled={props.busy}>
+          <button className="primary" onClick={props.onConfirm} disabled={props.busy || props.confirmDisabled}>
             {props.busy ? "Working…" : props.confirmLabel}
           </button>
         </div>

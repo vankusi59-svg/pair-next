@@ -82,6 +82,16 @@ export const api = {
      endpoint, only the auth-prompt UX differs (audit R1 residual). */
   approvalsNoPrompt: () =>
     req<Array<Record<string, unknown>>>("/approvals", undefined, { noAuthPrompt: true }),
+  approveNoPrompt: (id: string, scope: Record<string, unknown>, reason?: string) =>
+    req<Record<string, unknown>>(`/approvals/${id}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ?? "", scope }),
+    }, { noAuthPrompt: true }),
+  denyNoPrompt: (id: string, scope: Record<string, unknown>, reason?: string) =>
+    req<Record<string, unknown>>(`/approvals/${id}/deny`, {
+      method: "POST",
+      body: JSON.stringify({ reason: reason ?? "", scope }),
+    }, { noAuthPrompt: true }),
   previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; metadata?: Record<string, unknown> }) =>
     req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null }>("/missions/preview", {
       method: "POST",
