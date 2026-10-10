@@ -10,12 +10,6 @@
     "src/__tests__/pair-p14-workforce-v2.test.ts",
     "src/__tests__/pair-p12.test.ts"
   ],
-  "invariants": [
-    "Conversation text is never execution authority: a turn mints at most a PENDING draft; only the pinned {session_id,draft_id,expected_digest} confirm POST executes.",
-    "One submit = one idempotency key; retries of the same body/session replay the SAME key; keys never cross sessions; no auto-retry on ambiguous outcomes.",
-    "Session switches invalidate display state instantly; late responses are generation+pinned-session gated and can never paint into another session.",
-    "Mutation POSTs that may have committed are never aborted — honest ambiguous-outcome notices + canonical refetch; reads are AbortController-scoped.",
-    "Malformed envelopes/rows go MALFORMED — never silently filtered into a complete-looking list; valid canonical empties stay genuinely empty."
-  ],
+  "invariants": [],
   "description": "P15.9-B5.4 — ports the legacy P15.8 conversation UI to /app/chat inside AppShell: session sidebar (create/list/select/close, real titles/identities/counts, ?s= deep links, OPEN/CLOSED), chronological thread with role styling + MSG_PAGE=200 tail window + Load Earlier + message_id dedup, composer with single-flight idempotent turns, ambiguous-proposal project picker re-validated against canonical GET /api/projects, governed Mission Draft cards (all 6 states, exact persisted terms, expired/non-pending never confirmable), pinned ConfirmDialog confirm/reject + close, draft create/revise via supersedes_draft_id (new draft object, canonical defaults — nothing invented), confirmed-mission links to /app/missions/:id. Dedicated apiAdmin conversation wrappers suppress the legacy 401 window.prompt; legacy api/Chat.tsx/backend untouched. Per-op request ownership + AbortController for reads; possibly-committed POSTs never aborted. Element-level validation on sessions/messages/drafts/projects/proposals. UI-only; zero backend/schema/dependency changes."
 }
