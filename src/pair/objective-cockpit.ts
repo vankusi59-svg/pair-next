@@ -471,17 +471,22 @@ export class ObjectiveCockpitService {
     // or legacy row fails the whole company read closed rather than
     // silently entering the response.
     // F2/R3 — the tolerant list supplies candidate IDs ONLY. Filtering
-    // by owner on raw rows would silently omit a tampered objective
-    // (owner rewritten to someone else → filtered out before strict
-    // validation → company returns successfully with missing data).
-    // Strict-read EVERY objective in the business first — any corrupt
-    // row fails the whole read closed — then filter by the canonical
-    // owner claim.
-    const allStrict = (this.deps.objectives.list(businessId) as Row[]).map(
+    // by owner or business on raw rows would silently omit a tampered
+    // objective (owner rewritten → filtered before validation;
+    // business_id rewritten → never enumerated under this business at
+    // all). Enumerate ALL objective rows, strict-read every one via
+    // objectives.get (canonical row + digest + anchor proof — a row
+    // whose business_id/owner was forged fails closed), then filter by
+    // the PROVEN canonical claims. Scope consequence: this read is
+    // org-wide fail-closed — a corrupt objective anywhere fails every
+    // company read; that is the price of an honest scope proof, and
+    // the only alternative is trusting raw business_id again.
+    const allStrict = (this.deps.objectives.list() as Row[]).map(
       (o) => this.deps.objectives.get(String(o.objective_id)) as Row,
     );
     const ownedStrict = allStrict.filter(
-      (o) => String(o.owner_authority_id) === actor,
+      (o) => String(o.business_id) === businessId &&
+        String(o.owner_authority_id) === actor,
     );
     if (ownedStrict.length === 0) {
       throw new IntegrityError(

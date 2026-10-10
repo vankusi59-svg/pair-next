@@ -831,6 +831,28 @@ describe("P15.9-A1 R3 — final targeted closure", () => {
     s.store.close();
   });
 
+  it("R3-F1b business_id-tampered objective → company detects corruption, never silently omits", () => {
+    const s = freshFullStack("r3f1b");
+    const bid = mkBusiness(s);
+    const other = mkBusiness(s);
+    const o1 = mkObjective(s, bid);
+    const o2 = mkObjective(s, bid);
+    // Tamper the raw business claim — o2 vanishes from list(bid) before
+    // any validation under the old prefilter.
+    sqlRewriteEntity(s.store, "objective", String(o2.objective_id), (b) => {
+      b.business_id = other;
+    });
+    // Global enumeration + strict read: the forged row is still found
+    // and fails closed instead of being silently omitted.
+    expect(() => s.cockpit.businessCompany(bid, OWNER)).toThrowError();
+    // The target-side read is equally protected — tampered rows can
+    // never sneak into a different business' projection either.
+    expect(() => s.cockpit.businessCompany(other, OWNER)).toThrowError();
+    expect(() => s.cockpit.objectiveCockpit(String(o1.objective_id), OWNER))
+      .not.toThrowError();
+    s.store.close();
+  });
+
   it("R3-F2 owner amend after CANDIDATE → stale pins: pending false, history retained", async () => {
     const { s, oid, bid, binding, ops } = seeded("r3f2", ["a"]);
     completeDeliverable(s, binding, "a");
