@@ -113,6 +113,12 @@ export function WorkforceAdmin() {
       setMutNote(null);
       setMutBusy(false);
       setCreatedAgent(null);
+      /* F1 — business switch wipes every business-dependent form:
+         no A-specific reports_to/assignee/objective may survive under B */
+      setAgentForm(EMPTY_AGENT);
+      setWiForm(EMPTY_WI);
+      setRtForm(EMPTY_RT);
+      setObjForm(EMPTY_OBJ);
       ++opSeq.current;
     }
     setSt(biz ? { kind: "loading" } : { kind: "no-business" });
@@ -132,13 +138,32 @@ export function WorkforceAdmin() {
         setSt({ kind: "error", err: e instanceof ApiError ? e : new ApiError(0, "ERROR", String(e)) });
         return;
       }
-      const all = Array.isArray(agentsR.value.agents) ? agentsR.value.agents : [];
-      const sect = <I, O>(r: PromiseSettledResult<I>, pick: (v: I) => O | null): Section<O> =>
-        r.status === "rejected"
-          ? { kind: "unavailable", code: r.reason instanceof ApiError ? r.reason.code : "ERROR" }
-          : pick(r.value) === null
+      /* F3 — envelope validation before nested reads: null/primitive/
+         missing/malformed 200 payloads → UNAVAILABLE, never an empty
+         canonical list, never a thrown wedge. pick() runs once. */
+      const sect = <I, O>(r: PromiseSettledResult<I>, pick: (v: I) => O | null): Section<O> => {
+        if (r.status === "rejected") {
+          return { kind: "unavailable", code: r.reason instanceof ApiError ? r.reason.code : "ERROR" };
+        }
+        try {
+          const v = r.value;
+          if (v === null || typeof v !== "object") return { kind: "unavailable", code: "MALFORMED" };
+          const out = pick(v);
+          return out === null || !Array.isArray(out)
             ? { kind: "unavailable", code: "MALFORMED" }
-            : { kind: "ready", data: pick(r.value) as O };
+            : { kind: "ready", data: out };
+        } catch {
+          return { kind: "unavailable", code: "MALFORMED" };
+        }
+      };
+      /* identity read is primary: a malformed envelope is fatal — never
+         fabricate an empty global agent list */
+      const av = agentsR.value;
+      if (av === null || typeof av !== "object" || !Array.isArray(av.agents)) {
+        setSt({ kind: "error", err: new ApiError(200, "MALFORMED", "GET /api/org-agents returned a malformed payload") });
+        return;
+      }
+      const all = av.agents;
       setSt({
         kind: "ready",
         forBiz,
@@ -165,6 +190,35 @@ export function WorkforceAdmin() {
   const submit = async () => {
     if (!dlg || mutBusy || dlg.biz !== biz) return;
     const d = dlg;
+    /* F1 — revalidate relationship evidence against the CURRENT
+       selected-business lists before submission; fail closed when it is
+       stale or unavailable. Backend scope checks stay authoritative. */
+    if (st.kind !== "ready" || st.forBiz !== d.biz) {
+      setMutNote("Submit blocked: business-scoped evidence is stale — the page is refetching. No request sent.");
+      setDlg(null);
+      return;
+    }
+    const rejectRel = (what: string) => {
+      setMutNote(`Submit blocked: ${what} is not in the current ${d.biz} lists — stale or cross-business selection rejected client-side. No request sent.`);
+      setDlg(null);
+    };
+    switch (d.op) {
+      case "create-agent":
+        if (d.payload.reports_to && !st.agents.some((a) => String(a.agent_id) === d.payload.reports_to)) return rejectRel("reports_to");
+        break;
+      case "create-wi":
+        if (d.payload.assignee && !st.agents.some((a) => String(a.agent_id) === d.payload.assignee && a.status === "ACTIVE"))
+          return rejectRel("assignee_agent_id");
+        if (d.payload.objective) {
+          if (st.objectives.kind !== "ready") return rejectRel("objective evidence (list unavailable)");
+          if (!st.objectives.data.some((o) => String(o.objective_id) === d.payload.objective)) return rejectRel("objective_id");
+        }
+        break;
+      case "create-routine":
+        if (d.payload.assignee && !st.agents.some((a) => String(a.agent_id) === d.payload.assignee)) return rejectRel("assignee_agent_id");
+        break;
+      default: break;
+    }
     const seq = ++opSeq.current;
     setMutBusy(true);
     setMutNote(null);

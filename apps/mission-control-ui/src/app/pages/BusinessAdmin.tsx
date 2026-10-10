@@ -75,10 +75,22 @@ export function BusinessAdmin() {
     const forId = id.trim();
     if (!forId) return;
     const seq = ++opSeq.current;
-    setSt((s) => (s.kind === "ready" ? { ...s, detailFor: forId, detailErr: null } : s));
+    /* F2 — clear the previous detail payload synchronously: a stale
+       inspection must never render under a new target id. */
+    setSt((s) => (s.kind === "ready" ? { ...s, detailFor: forId, detail: null, detailErr: null } : s));
     try {
       const d = await apiAdmin.businessDetail(forId);
       if (seq !== opSeq.current) return;
+      /* verify the returned identity matches the requested id before
+         rendering — a mismatched payload is an error, never shown */
+      if (!d || String(d?.business?.business_id) !== forId) {
+        setSt((s) =>
+          s.kind === "ready" && s.detailFor === forId
+            ? { ...s, detail: null, detailErr: `identity mismatch — response for a different business discarded` }
+            : s,
+        );
+        return;
+      }
       setSt((s) => (s.kind === "ready" && s.detailFor === forId ? { ...s, detail: d, detailErr: null } : s));
     } catch (e) {
       if (seq !== opSeq.current) return;
@@ -250,6 +262,12 @@ export function BusinessAdmin() {
         </div>
         {st.detailErr ? (
           <div className="nrow"><StatusBadge tone="danger" label="ERROR" /><span className="note">{st.detailErr}</span></div>
+        ) : null}
+        {st.detailFor && !st.detail && !st.detailErr ? (
+          <div className="nrow" data-testid="inspect-loading">
+            <StatusBadge tone="info" label="LOADING" />
+            <span className="note">inspecting <code>{st.detailFor}</code>…</span>
+          </div>
         ) : null}
         {st.detail && st.detailFor ? (
           <div className="nrow" style={{ display: "block" }}>

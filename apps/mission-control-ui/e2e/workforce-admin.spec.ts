@@ -344,3 +344,145 @@ test("workforce-admin: selects offer only same-business candidates", async ({ pa
   await expect(reports).toContainText(aTitle);
   await expect(reports.locator("option")).toHaveCount(2);
 });
+
+/* R1-F1: SPA business switch (NO reload) wipes every business-dependent
+   form — A-specific reports_to/assignee/objective can never be
+   submitted under B, and no mutation fires during the switch. */
+test("workforce-admin: SPA business switch resets forms — stale selections unsubmittable", async ({ page }) => {
+  const bizA = await mkBusiness(page, "f1-a");
+  const bizB = await mkBusiness(page, "f1-b");
+  const aTitle = `AgentA-${uniq()}`;
+  const agentA = await mkAgent(page, bizA, aTitle);
+  await apiPost(page, "/objectives", { business_id: bizA, title: `ObjA-${uniq()}`, metric: "m", target: "1" });
+  const posts: string[] = [];
+  await page.route("**/api/**", (route) => {
+    if (route.request().method() === "POST") posts.push(route.request().url());
+    return route.continue();
+  });
+  await seedBiz(page, bizA);
+  await page.goto("/app/workforce/admin");
+  await expect(page.locator("h1")).toHaveText("Workforce Administration");
+
+  // populate every business-dependent field under A (no submit)
+  await page.getByLabel("agent title").fill("StaleA");
+  await page.getByLabel("agent department").fill("ops");
+  await page.getByLabel("reports to").selectOption(agentA);
+  await page.getByLabel("work item title").fill("StaleWI");
+  await page.getByLabel("work item goal").fill("g");
+  await page.getByLabel("assignee", { exact: true }).selectOption(agentA);
+  const objSel = page.getByLabel("objective", { exact: true });
+  const objVal = await objSel.locator("option").nth(1).getAttribute("value");
+  await objSel.selectOption(objVal!);
+  await page.getByLabel("routine name").fill("StaleRT");
+  await page.getByLabel("goal template").fill("t");
+  await page.getByLabel("cron").fill("0 9 * * *");
+  await page.getByLabel("routine assignee").selectOption(agentA);
+  await page.getByLabel("legacy objective title").fill("StaleObj");
+  const before = posts.length;
+
+  // switch to B through the REAL switcher — SPA navigation, no reload
+  await page.getByRole("button", { name: "business switcher" }).first().click();
+  await page.getByLabel("business id").fill(bizB);
+  await page.getByRole("button", { name: "Use" }).click();
+  await expect(page.locator("h1")).toHaveText("Workforce Administration");
+  await expect(page.locator(".srcnote")).toContainText(bizB);
+
+  // every business-dependent form is reset — nothing stale survives
+  await expect(page.getByLabel("agent title")).toHaveValue("");
+  await expect(page.getByLabel("agent department")).toHaveValue("");
+  await expect(page.getByLabel("reports to")).toHaveValue("");
+  await expect(page.getByLabel("work item title")).toHaveValue("");
+  await expect(page.getByLabel("work item goal")).toHaveValue("");
+  await expect(page.getByLabel("assignee", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("objective", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("routine assignee")).toHaveValue("");
+  await expect(page.getByLabel("legacy objective title")).toHaveValue("");
+  // A's agent/objective are not selectable under B at all
+  await expect(page.getByLabel("reports to").locator("option")).toHaveCount(1);
+  await expect(page.getByLabel("assignee", { exact: true }).locator("option")).toHaveCount(1);
+  // the switch itself issued zero mutations
+  expect(posts.length).toBe(before);
+});
+
+/* R1-F2: delayed A→B inspect — stale A detail can never render as B;
+   out-of-order responses and failures handled; identity verified. */
+test("business-admin: inspect clears stale detail — out-of-order + failure proof", async ({ page }) => {
+  const nameA = `InspA-${uniq()}`;
+  const nameB = `InspB-${uniq()}`;
+  const b = await apiPost(page, "/businesses", { name: nameA, project_id: await firstProjectId(page) });
+  const bizA = String(b.business_id ?? b.entity_id);
+  const b2 = await apiPost(page, "/businesses", { name: nameB, project_id: await firstProjectId(page) });
+  const bizB = String(b2.business_id ?? b2.entity_id);
+
+  const aDone: string[] = [];
+  await page.route(`**/api/businesses/${bizA}`, async (route) => {
+    await new Promise((r) => setTimeout(r, 700)); // A resolves LATE
+    aDone.push("a");
+    return route.continue();
+  });
+  await page.goto("/app/system/business-admin");
+  await expect(page.locator("h1")).toHaveText("Business Administration");
+
+  // start A's inspect → loading row pinned to A's id
+  await page.getByLabel("business id to inspect").fill(bizA);
+  await page.getByRole("button", { name: "Inspect", exact: true }).click();
+  await expect(page.getByTestId("inspect-loading")).toContainText(bizA);
+
+  // switch target to B before A resolves
+  await page.getByLabel("business id to inspect").fill(bizB);
+  await page.getByRole("button", { name: "Inspect", exact: true }).click();
+  await expect(page.getByTestId("inspect-loading")).toContainText(bizB);
+  await expect(page.locator(".inspectbundle")).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".page")).toContainText(nameB);
+
+  // A resolves late — its payload must NEVER render under B's inspection
+  // (nameA still legitimately appears in the global list — scope the
+  // check to the detail block itself)
+  await expect.poll(() => aDone.length, { timeout: 15000 }).toBe(1);
+  const detail = page.locator(".nrow", { has: page.locator(".inspectbundle") });
+  await expect(detail).toContainText(nameB);
+  await expect(detail).not.toContainText(nameA);
+
+  // failure on a third inspect: error replaces — B's stale detail is gone
+  await page.getByLabel("business id to inspect").fill("BIZ_missing_e2e");
+  await page.getByRole("button", { name: "Inspect", exact: true }).click();
+  await expect(page.getByTestId("inspect-loading")).toContainText("BIZ_missing_e2e");
+  await expect(page.locator(".page")).toContainText(/NOT_FOUND|unavailable|ERROR/i, { timeout: 15000 });
+  await expect(page.locator(".inspectbundle")).toHaveCount(0);
+});
+
+/* R1-F3: malformed 200 envelopes → UNAVAILABLE sections, never a
+   fabricated empty canonical list, no crash, no indefinite skeleton. */
+test("workforce-admin: malformed 200 payloads fail closed — no crash, no fake empty", async ({ page }) => {
+  const biz = await mkBusiness(page, "f3");
+  await seedBiz(page, biz);
+  const posts: string[] = [];
+  await page.route("**/api/**", (route) => {
+    if (route.request().method() === "POST") posts.push(route.request().url());
+    return route.continue();
+  });
+  await page.route("**/api/work-items*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ work_items: "corrupt" }) }));
+  await page.route("**/api/routines*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "null" }));
+  await page.route("**/api/objectives*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ objectives: "bad" }) }));
+  await page.goto("/app/workforce/admin");
+
+  // page settles ready (agents read is real); malformed reads are labeled
+  await expect(page.locator("h1")).toHaveText("Workforce Administration");
+  await expect(page.locator(".page")).toContainText("work-item read unavailable (MALFORMED)");
+  await expect(page.locator(".page")).toContainText("routine read unavailable (MALFORMED)");
+  await expect(page.locator(".page")).toContainText("objective list unavailable");
+  // never rendered as empty canonical lists
+  await expect(page.getByText("No work items")).toHaveCount(0);
+  await expect(page.getByText("No routines")).toHaveCount(0);
+  await expect(posts).toEqual([]);
+
+  // malformed PRIMARY read → honest error, never an empty agent list
+  await page.route("**/api/org-agents*", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "null" }));
+  await page.reload();
+  await expect(page.locator(".page")).toContainText("malformed payload", { timeout: 15000 });
+  await expect(page.getByLabel("agent title")).toHaveCount(0);
+});
