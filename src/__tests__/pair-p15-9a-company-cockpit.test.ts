@@ -311,6 +311,27 @@ function seeded(name: string, keys: string[]) {
   return { s, oid, bid, binding, ops, inv };
 }
 
+/** Build a fully operational objective inside an EXISTING stack and
+ *  drive it to a pending TARGET_MET_CANDIDATE review — same canonical
+ *  flow as `seeded` + the pass, for tests that need the objective to
+ *  live among other objectives in one business. */
+async function pendingCandidateObjective(s: FullStack, bid: string): Promise<string> {
+  const o = mkObjective(s, bid);
+  const oid = String(o.objective_id);
+  const binding = decompose(s, oid, ["a"]);
+  s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "a", actor: OP });
+  qualifyCeo(s.store);
+  const inv = new CountingInvoker();
+  const ops = createDefaultObjectiveOperatingService({
+    store: s.store, business: s.biz, workforce: s.wf,
+    objectives: s.biz.objectives, workstreams: s.workstreams, invoker: inv });
+  grantBundle(s, oid, { required_count: 1 });
+  completeDeliverable(s, binding, "a");
+  s.kpiSvc.advance(oid);
+  await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+  return oid;
+}
+
 /* ----------------------------- tests ----------------------------- */
 
 describe("P15.9-A1 Company Cockpit read projections", () => {
@@ -635,7 +656,29 @@ describe("P15.9-A1 R1 — audit findings", () => {
     expect(company.objectives_total_owned).toBe(205);
     expect(company.objectives_truncated).toBe(true);
     expect((company.objectives as Row[]).length).toBe(200);
-    expect((company.counts as Row).objectives_owned).toBe(200);
+    // R2-3 — counts are exact over ALL owned objectives.
+    expect((company.counts as Row).objectives_owned).toBe(205);
+    expect((company.counts as Row).objectives_returned).toBe(200);
+    s.store.close();
+  });
+
+  it("R2-3 pending beyond the 200-cap still counts: targets_met_pending exact", async () => {
+    const s = freshFullStack("rf4d");
+    const bid = mkBusiness(s);
+    s.biz.createOrgAgent({ business_id: bid, title: `a${counter}`,
+      department: "growth", operator_id: OP });
+    for (let i = 0; i < 205; i++) mkObjective(s, bid);
+    // Created last → sorts last by created_at → beyond the display cap.
+    const pendingOid = await pendingCandidateObjective(s, bid);
+    const company = s.cockpit.businessCompany(bid, OWNER) as Record<string, never>;
+    expect(company.objectives_total_owned).toBe(206);
+    expect((company.objectives as Row[]).length).toBe(200);
+    expect(
+      (company.objectives as Row[]).some(
+        (o) => String(o.objective_id) === pendingOid),
+    ).toBe(false);
+    // The pending objective is NOT on the page — the count is still exact.
+    expect((company.counts as Row).targets_met_pending).toBe(1);
     s.store.close();
   });
 
@@ -656,8 +699,114 @@ describe("P15.9-A1 R1 — audit findings", () => {
     expect((after.lifecycle as Row).owner_action_required).toBe(false);
     // Historical review fields stay truthful (raw record kept).
     expect((after.latest_review as Row).owner_action_required).toBe(true);
+    // R2-2 — the delegated verifier grant legitimately ended with the
+    // terminal objective → observation degrades to a labeled error and
+    // every KPI/budget claim renders UNVERIFIED, never MET.
+    expect(after.observation_error).toBeTruthy();
+    const kpis = (after.objective as Row).kpis as Row[];
+    expect(kpis[0]!.canonically_proven).toBe(false);
+    expect(kpis[0]!.assessment).toBe("UNVERIFIED");
+    expect(((after.objective as Row).budget as Row).canonically_proven)
+      .toBe(false);
     const company = s.cockpit.businessCompany(bid, OWNER) as Record<string, never>;
     expect((company.counts as Row).targets_met_pending).toBe(0);
+    // Company summary on the same terminal objective: unverifiable,
+    // not MET.
+    const so = (company.objectives as Row[])[0]!;
+    expect((so.kpi_summary as Row).canonically_proven).toBe(false);
+    expect((so.kpi_summary as Row).all_targets_met).toBe(false);
+    expect((so.kpi_summary as Row).met).toBe(0);
+    s.store.close();
+  });
+});
+
+describe("P15.9-A1 R2 — audit closure", () => {
+  it("R2-1 forged kpi.current + last_evidence_key on live objective → company fails closed, never MET", () => {
+    const s = freshFullStack("r21a");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    const oid = String(o.objective_id);
+    // Well-typed forge: plausible current + evidence key with ZERO
+    // canonical progress evidence behind them.
+    sqlRewriteEntity(s.store, "objective", oid, (b) => {
+      (b.kpis as Row[])[0]!.current = 5;
+      (b.kpis as Row[])[0]!.last_evidence_key = `ek-${digest({ f: 1 })}`;
+    });
+    expect(() => s.cockpit.businessCompany(bid, OWNER)).toThrowError();
+    expect(() => s.cockpit.objectiveCockpit(oid, OWNER)).toThrowError();
+    s.store.close();
+  });
+
+  it("R2-1 forged budget.consumed_microusd → company fails closed", () => {
+    const s = freshFullStack("r21b");
+    const bid = mkBusiness(s);
+    const o = mkObjective(s, bid);
+    sqlRewriteEntity(s.store, "objective", String(o.objective_id), (b) => {
+      (b.budget as Row).consumed_microusd = 100; // no spend events
+    });
+    expect(() => s.cockpit.businessCompany(bid, OWNER)).toThrowError();
+    s.store.close();
+  });
+
+  it("R2-1 proven claims still render: MET + budget truthful on canonical objective", async () => {
+    const { s, oid, bid, binding, ops } = seeded("r21c", ["a"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding, "a");
+    s.kpiSvc.advance(oid);
+    await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+    const company = s.cockpit.businessCompany(bid, OWNER) as Record<string, never>;
+    const so = (company.objectives as Row[])[0]!;
+    expect((so.kpi_summary as Row).canonically_proven).toBe(true);
+    expect((so.kpi_summary as Row).met).toBe(1);
+    expect((so.kpi_summary as Row).all_targets_met).toBe(true);
+    expect((so.budget as Row).canonically_proven).toBe(true);
+    s.store.close();
+  });
+
+  it("R2-2 forged KPI progress on TERMINAL objective → fails closed, never UNVERIFIED-as-MET", async () => {
+    const { s, oid, bid, binding, ops } = seeded("r22a", ["a"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding, "a");
+    s.kpiSvc.advance(oid);
+    await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+    s.biz.objectives.transitionStatus(oid, {
+      business_id: bid, to: "ACHIEVED", actor: OWNER,
+      reason: "owner accepted" });
+    // Forge a different current value on the terminal objective —
+    // the lek is real but the claim diverges from the receipt/event.
+    // The delegated-grant check short-circuits first (OBJECTIVE_TERMINAL),
+    // so the classified end renders UNVERIFIABLE — never MET.
+    sqlRewriteEntity(s.store, "objective", oid, (b) => {
+      (b.kpis as Row[])[0]!.current = 99;
+    });
+    const c = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect(c.observation_error).toBeTruthy();
+    const kpis = (c.objective as Row).kpis as Row[];
+    expect(kpis[0]!.assessment).toBe("UNVERIFIED");
+    expect(kpis[0]!.canonically_proven).toBe(false);
+    const company = s.cockpit.businessCompany(bid, OWNER) as Record<string, never>;
+    const so = (company.objectives as Row[])[0]!;
+    expect((so.kpi_summary as Row).met).toBe(0);
+    expect((so.kpi_summary as Row).all_targets_met).toBe(false);
+    s.store.close();
+  });
+
+  it("R2-2 unknown-lek forge on TERMINAL objective → fails closed (unclassified tamper)", async () => {
+    const { s, oid, bid, binding, ops } = seeded("r22b", ["a"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding, "a");
+    s.kpiSvc.advance(oid);
+    await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+    s.biz.objectives.transitionStatus(oid, {
+      business_id: bid, to: "ACHIEVED", actor: OWNER,
+      reason: "owner accepted" });
+    // Forge a lek with no PROGRESS ref anywhere — fails BEFORE the
+    // grant check with an unclassified tamper error → hard fail.
+    sqlRewriteEntity(s.store, "objective", oid, (b) => {
+      (b.kpis as Row[])[0]!.last_evidence_key = `ek-${digest({ forged: 1 })}`;
+    });
+    expect(() => s.cockpit.objectiveCockpit(oid, OWNER)).toThrowError();
+    expect(() => s.cockpit.businessCompany(bid, OWNER)).toThrowError();
     s.store.close();
   });
 });

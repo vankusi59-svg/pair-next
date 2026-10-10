@@ -36,6 +36,8 @@ import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
 import type { ArtifactAuthority } from "./artifact-authority.js";
 import { TERMINAL_OBJECTIVE_STATUSES, type ObjectiveStatus } from "./objective-authority.js";
 import {
+  assertCanonicalObjectiveBudget,
+  assertCanonicalObjectiveKpiProgress,
   buildReviewObservation,
   canonicalAdaptiveReviewsFor,
   objectiveKpiAssessment,
@@ -183,7 +185,32 @@ export class ObjectiveCockpitService {
     }
   }
 
-  private kpiProjection(obj: Row): Array<Record<string, unknown>> {
+  /** R2 — the ONE classification of "re-validation ended legitimately":
+   *  the objective is terminal AND the only failure is the delegated
+   *  KPI verifier grant reporting OBJECTIVE_TERMINAL (a grant pinned to
+   *  a live objective canonically ends when the objective achieves /
+   *  cancels / expires — historical progress is real but no longer
+   *  re-provable NOW). Every other error — forged progress, digest
+   *  mismatch, expired-but-not-terminal grant, unclassified — is
+   *  corruption or an honest gap and must fail closed. */
+  private static isLegitimateTerminalGrantEnd(
+    err: unknown,
+    objStatus: string,
+  ): boolean {
+    return (
+      TERMINAL_OBJECTIVE_STATUSES.has(objStatus as ObjectiveStatus) &&
+      err instanceof IntegrityError &&
+      String(err.code) === "FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW" &&
+      /authorization not effective \(OBJECTIVE_TERMINAL\)/.test(String(err.message))
+    );
+  }
+
+  /** KPI entries — `canonically_proven` marks whether `current` was
+   *  re-proven against the progress evidence chain in THIS read. When
+   *  not proven the claim is still shown (it is data the owner may
+   *  want) but the assessment is UNVERIFIED: the projection never
+   *  asserts MET/GAP from an unproven `current`. */
+  private kpiProjection(obj: Row, proven: boolean): Array<Record<string, unknown>> {
     return ((obj.kpis as Array<Record<string, unknown>>) ?? []).map((k) => ({
       kpi_id: String(k.kpi_id),
       name: String(k.name),
@@ -192,10 +219,30 @@ export class ObjectiveCockpitService {
       baseline: Number(k.baseline),
       current: k.current === null || k.current === undefined ? null : Number(k.current),
       target: Number(k.target),
-      assessment: objectiveKpiAssessment(k as never),
+      assessment: proven ? objectiveKpiAssessment(k as never) : "UNVERIFIED",
+      canonically_proven: proven,
       last_evidence_key: k.last_evidence_key ?? null,
       updated_at: k.updated_at ?? null,
     }));
+  }
+
+  /** R2 — prove the objective's KPI progress + budget ledger against
+   *  the canonical evidence chains NOW (the same validators the
+   *  operating loop and buildReviewObservation run). Returns true when
+   *  proven; false only for the classified legitimate terminal-grant
+   *  end; anything else propagates (fail closed). */
+  private proveObjectiveClaims(obj: Row): boolean {
+    try {
+      assertCanonicalObjectiveKpiProgress(this.store, obj);
+      assertCanonicalObjectiveBudget(this.store, obj);
+      return true;
+    } catch (err) {
+      if (ObjectiveCockpitService.isLegitimateTerminalGrantEnd(
+        err, String(obj.status))) {
+        return false;
+      }
+      throw err;
+    }
   }
 
   /** The strict review observation — or `null` when the objective has
@@ -213,13 +260,12 @@ export class ObjectiveCockpitService {
       if ((err as IntegrityError).code === "FAIL_CLOSED_P15_5_BINDING_REQUIRED") {
         return null;
       }
-      // A TERMINAL objective (e.g. ACHIEVED) canonically outlives its
-      // runtime grants: KPI verifier authorization, WALs and bindings
-      // legitimately end — re-validation failing there is expected
-      // state, not corruption. Render the projection without the
-      // observation block (observation_error reports the code); a
-      // LIVE objective still fails closed on any re-validation error.
-      if (TERMINAL_OBJECTIVE_STATUSES.has(objStatus as ObjectiveStatus)) {
+      // R2 — degrade ONLY for the classified legitimate terminal
+      // grant end (delegated verifier grant ended because the
+      // objective went terminal). Tampered evidence, forged
+      // progress or any unclassified failure still fails closed —
+      // the projection never renders an unproven claim as verified.
+      if (ObjectiveCockpitService.isLegitimateTerminalGrantEnd(err, objStatus)) {
         return { observation_error: String((err as IntegrityError).code ?? "ERROR") };
       }
       throw err;
@@ -322,10 +368,15 @@ export class ObjectiveCockpitService {
             Number((obj.budget as Row | undefined)?.ceiling_microusd ?? 0),
           consumed_microusd:
             Number((obj.budget as Row | undefined)?.consumed_microusd ?? 0),
+          // R2 — the spend claim is only canonical when the
+          // observation's ledger re-proof succeeded this read.
+          canonically_proven: obsOk !== null,
         },
         hard_constraints: obj.hard_constraints ?? [],
         success_conditions: obj.success_conditions ?? [],
-        kpis: this.kpiProjection(obj),
+        // R2 — obsOk proves kpi.current inside buildReviewObservation;
+        // without it the entries are claims, never MET.
+        kpis: this.kpiProjection(obj, obsOk !== null),
       },
       // TARGET_MET_CANDIDATE lives on the review/pass outcome — never
       // the objective status. ACHIEVED can only be claimed by
@@ -415,19 +466,33 @@ export class ObjectiveCockpitService {
     const ownedAll = (this.deps.objectives.list(businessId) as Row[]).filter(
       (o) => String(o.owner_authority_id) === actor,
     );
-    const owned = bounded(
-      ownedAll.map((o) => this.deps.objectives.get(String(o.objective_id)) as Row),
+    // Every owned objective is strict-read — including the ones beyond
+    // the display cap, so the aggregate counts below are exact and a
+    // forged row anywhere in the business still fails closed.
+    const ownedStrict = ownedAll.map(
+      (o) => this.deps.objectives.get(String(o.objective_id)) as Row,
     );
-    if (owned.length === 0) {
+    if (ownedStrict.length === 0) {
       throw new IntegrityError(
         "FAIL_CLOSED_COMPANY_SCOPE",
         `actor ${actor} owns no objectives in ${businessId}`,
       );
     }
-    const summaries = owned.map((o) => {
-      const kpis = this.kpiProjection(o);
+    // Review history + latest per objective — computed for ALL owned
+    // objectives so the pending count is exact even when the display
+    // list truncates (R2-3).
+    const enriched = ownedStrict.map((o) => {
       const reviews = this.canonicalReviews(String(o.objective_id));
       const latest = reviews.length ? reviews[reviews.length - 1]! : null;
+      return { o, reviews, latest };
+    });
+    const summaries = bounded(enriched).map(({ o, reviews, latest }) => {
+      // R2-1 — re-prove kpi.current + budget ledger against the
+      // canonical evidence chains before they may render as MET /
+      // accounted. The classified legitimate terminal-grant end
+      // renders as unverifiable, never as verified.
+      const proven = this.proveObjectiveClaims(o);
+      const kpis = this.kpiProjection(o, proven);
       const met = kpis.filter((k) => k.assessment === "MET").length;
       return {
         objective_id: String(o.objective_id),
@@ -440,6 +505,7 @@ export class ObjectiveCockpitService {
             Number((o.budget as Row | undefined)?.ceiling_microusd ?? 0),
           consumed_microusd:
             Number((o.budget as Row | undefined)?.consumed_microusd ?? 0),
+          canonically_proven: proven,
         },
         kpi_summary: {
           total: kpis.length,
@@ -447,6 +513,7 @@ export class ObjectiveCockpitService {
           gap: kpis.filter((k) => k.assessment === "GAP").length,
           unverified: kpis.filter((k) => k.assessment === "UNVERIFIED").length,
           all_targets_met: kpis.length > 0 && met === kpis.length,
+          canonically_proven: proven,
         },
         latest_review: latest
           ? {
@@ -476,12 +543,17 @@ export class ObjectiveCockpitService {
       objectives: summaries,
       // F4 — truncation is reported, never silently treated as the
       // true total.
-      objectives_total_owned: ownedAll.length,
-      objectives_truncated: ownedAll.length > summaries.length,
+      objectives_total_owned: ownedStrict.length,
+      objectives_truncated: ownedStrict.length > summaries.length,
       counts: {
-        objectives_owned: summaries.length,
-        targets_met_pending: summaries.filter(
-          (s) => s.latest_review?.owner_action_required === true,
+        // R2-3 — totals are exact over ALL owned objectives, not the
+        // truncated display page.
+        objectives_owned: ownedStrict.length,
+        objectives_returned: summaries.length,
+        targets_met_pending: enriched.filter(
+          (e) =>
+            ObjectiveCockpitService.ownerActionPending(
+              String(e.o.status), e.latest),
         ).length,
       },
     };
