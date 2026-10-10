@@ -191,6 +191,70 @@
   color: var(--purple); background: var(--purple-soft); border-radius: 6px; padding: 3px 9px;
 }
 
+/* ---------- B2 Company Cockpit ---------- */
+.chead { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 16px; }
+.chead h1 { margin: 0 0 4px; }
+.trunc {
+  border: 1px dashed var(--warn); background: var(--warn-soft); color: var(--warn);
+  border-radius: 8px; padding: 8px 12px; font-size: 12px; margin-bottom: 14px;
+}
+.stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+.stat {
+  background: var(--bg-surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 16px; min-width: 130px; flex: 0 0 auto;
+}
+.stat .k { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.05em; }
+.stat .v { font-size: 22px; font-weight: 700; margin-top: 2px; }
+.stat .n { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.need {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--bg-surface);
+  margin-bottom: 20px; overflow: hidden;
+}
+.need > .h {
+  padding: 10px 16px; border-bottom: 1px solid var(--border); font-weight: 650;
+  font-size: 13px; display: flex; gap: 8px; align-items: center;
+}
+.need > .h .cnt {
+  background: var(--purple-soft); color: var(--purple); font-size: 11px; font-weight: 700;
+  border-radius: 999px; padding: 0 7px;
+}
+.need .nrow {
+  display: flex; gap: 10px; align-items: center; padding: 9px 16px;
+  border-top: 1px solid var(--border); font-size: 13px; flex-wrap: wrap;
+}
+.need .nrow:first-of-type { border-top: none; }
+.need .nrow .tt { font-weight: 600; }
+.need .nrow .note { color: var(--text-3); font-size: 11.5px; }
+.need .nrow .go { margin-left: auto; font-size: 12px; color: var(--accent-strong); }
+.sech { font-size: 12px; font-weight: 650; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin: 22px 0 8px; }
+.ecards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+.ecard {
+  display: block; background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; color: inherit; text-decoration: none;
+}
+.ecard:hover { border-color: var(--border-strong); }
+.ecard .eh { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; margin-bottom: 8px; }
+.ecard .t { font-weight: 650; font-size: 14px; }
+.ecard .oid { font-family: ui-monospace, monospace; font-size: 11px; color: var(--text-3); margin-top: 2px; }
+.kpibar { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.brow { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.meter { flex: 1; height: 6px; border-radius: 4px; background: var(--bg-inset); overflow: hidden; display: flex; }
+.meter > span { display: block; height: 100%; }
+.meter .m-ok { background: var(--ok); }
+.meter .m-gap { background: var(--warn); }
+.meter .m-unv { background: var(--unknown); }
+.meter .m-info { background: var(--info); }
+.knum { font-size: 11px; color: var(--text-2); white-space: nowrap; }
+.efoot {
+  display: flex; justify-content: space-between; gap: 8px; margin-top: 10px;
+  font-size: 11px; color: var(--text-3); flex-wrap: wrap;
+}
+@media (max-width: 640px) {
+  .stats { gap: 8px; }
+  .stat { min-width: calc(50% - 4px); flex: 1; }
+  .ecards { grid-template-columns: 1fr; }
+}
+
 /* ---------- responsive ---------- */
 @media (min-width: 768px) and (max-width: 1199px) {
   .atobiz { display: block; }

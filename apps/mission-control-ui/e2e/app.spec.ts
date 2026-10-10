@@ -7,11 +7,10 @@ test.beforeEach(async ({ page }) => {
   await seedSession(page);
 });
 
-test("/app/company renders new shell + placeholder, no fake data", async ({ page }) => {
+test("/app/company renders new shell + honest no-business state", async ({ page }) => {
   await page.goto("/app/company");
   await expect(page.getByRole("heading", { name: "Company Cockpit" })).toBeVisible();
-  await expect(page.getByText("Not implemented yet")).toBeVisible();
-  await expect(page.getByText(/lands in B2/)).toBeVisible();
+  await expect(page.locator(".pstate .t")).toHaveText("No business selected");
   // sidebar groups + links per B.3
   for (const g of ["Overview", "Business", "Operations", "System"]) {
     await expect(page.locator(".anav .group", { hasText: g })).toBeVisible();

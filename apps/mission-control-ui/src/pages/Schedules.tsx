@@ -35,7 +35,7 @@ export function Schedules() {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const schedules = ((data?.schedules ?? []) as Schedule[]).filter((s) => !s.deleted);
+  const schedules = ((data?.schedules ?? []) as unknown as Schedule[]).filter((s) => !s.deleted);
 
   const create = async () => {
     if (!getOperatorId()) {
