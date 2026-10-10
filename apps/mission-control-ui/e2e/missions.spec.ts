@@ -418,7 +418,7 @@ test("R1-F1: bound_open_id + WI without objective → still no link", async ({ p
       body: '{"work_items":[{"work_item_id":"WI_b1","business_id":"BIZ_b1"}]}' }));
   await page.goto(`/app/missions/${mid}`);
   await expect(page.getByRole("link", { name: /← Objective/ })).toHaveCount(0);
-  await expect(page.getByText(/lineage unproven/)).toBeVisible();
+  await expect(page.getByText(/no objective_id — backlink omitted/)).toBeVisible();
 });
 
 /* R1-F2: late preview response for old inputs never renders/commits. */
@@ -448,7 +448,7 @@ test("R1-F2: auto-confirm toggled OFF mid-flight → manual preview, zero confir
   await page.route("**/api/missions/preview", (r: Route) => { release = () => r.fulfill({
     status: 200, contentType: "application/json",
     body: JSON.stringify({ preview_id: "PV_A2", plan_digest: "b".repeat(64),
-      plan: { tasks: [{ task_key: "T1", title: "t", task_instruction: "i" }] },
+      plan: { tasks: [{ task_key: "T1", title: "t", task_instruction: "i", depends_on: [], required_capabilities: [] }] },
       plan_source: null, plan_model: null }) }); });
   const confirms: string[] = [];
   await countPosts(page, confirms);
@@ -530,4 +530,137 @@ test("R1: failed pause on verified RUNNING state → ambiguous, no optimistic fl
   await expect(page.locator(".trunc[role='status']")).toContainText(/AMBIGUOUS/);
   await expect(page.getByText("RUNNING").first()).toBeVisible(); // state never flipped
   expect(posts.filter((u) => u.endsWith("/pause"))).toHaveLength(1);
+});
+
+/* ---------- R2 ---------- */
+
+/* R2-A: invalidating a stale preview frees the entry; fresh B previews and
+   confirms — exactly one valid confirmation POST. */
+test("R2-A: stale preview invalidated → fresh B preview + confirm (1 POST)", async ({ page }) => {
+  let releaseA: ((r: Route) => void) | null = null;
+  let calls = 0;
+  await page.route("**/api/missions/preview", (r: Route) => {
+    calls++;
+    if (calls === 1) { releaseA = () => r.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({ preview_id: "PV_A", plan_digest: "a".repeat(64),
+        plan: { tasks: [{ task_key: "T1", title: "t", task_instruction: "i", depends_on: [], required_capabilities: [] }] },
+        plan_source: null, plan_model: null }) }); return; }
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ preview_id: "PV_B", plan_digest: "b".repeat(64),
+        plan: { tasks: [{ task_key: "T1", title: "t2", task_instruction: "i2", depends_on: [], required_capabilities: [] }] },
+        plan_source: null, plan_model: null }) });
+  });
+  await page.route("**/api/missions/confirm", (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: '{"mission_id":"MSN_R2A_DONE","status":"CREATED"}' }));
+  const posts: string[] = [];
+  await countPosts(page, posts);
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill("goal-A");
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  await page.getByLabel("goal").fill("goal-B"); /* invalidate mid-flight */
+  releaseA!();
+  await page.waitForTimeout(300);
+  /* busy recovered: the Preview button is usable again, no stale render */
+  await expect(page.getByText("Proposed plan")).toHaveCount(0);
+  const btn = page.getByRole("button", { name: /Preview plan/ });
+  await expect(btn).toBeEnabled();
+  await btn.click(); /* fresh preview B */
+  await expect(page.getByText("Proposed plan")).toBeVisible();
+  await page.getByRole("button", { name: /Confirm & run/ }).click();
+  await page.getByRole("dialog").locator("button.primary").click();
+  await page.waitForURL(/\/app\/missions\/(?!new)/);
+  expect(posts.filter((u) => u.includes("/missions/confirm"))).toHaveLength(1);
+});
+
+/* R2-A: input change during an in-flight confirmation → honest unknown
+   outcome; no silent duplicate submission. */
+test("R2-A: confirm in-flight + input change → unknown outcome, no dup POST", async ({ page }) => {
+  const goal = `e2e-r2a-${uniq()}`;
+  let release: ((r: Route) => void) | null = null;
+  await page.route("**/api/missions/confirm", (r: Route) => { release = () => r.continue(); });
+  const posts: string[] = [];
+  await countPosts(page, posts);
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill(goal);
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  await expect(page.getByText("Proposed plan")).toBeVisible();
+  await page.getByRole("button", { name: /Confirm & run/ }).click();
+  await page.getByRole("dialog").locator("button.primary").click();
+  await page.getByLabel("goal").fill(`${goal}-edited`); /* inputs change mid-confirm */
+  await expect(page.locator(".trunc[role='status']")).toContainText(/outcome unknown|may have been committed/);
+  release!();
+  await page.waitForTimeout(300);
+  expect(posts.filter((u) => u.includes("/missions/confirm"))).toHaveLength(1);
+});
+
+/* R2-B: malformed/foreign/unavailable lineage evidence → no backlink,
+   honest unproven note, other sections intact. */
+test("R2-B: malformed work-items rows → lineage unproven, sections live", async ({ page }) => {
+  const mid = "MSN_linB";
+  await interceptDetail(page, mid, { mission: {
+    bound_open_id: "OPEN_b1",
+    metadata: { work_item_id: "WI_b1", work_item_open_id: "OPEN_b1", business_id: "BIZ_b1" } } });
+  await page.route("**/api/work-items?business_id=BIZ_b1", (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: '{"work_items":[null,{}]}' }));
+  await page.goto(`/app/missions/${mid}`);
+  await expect(page.getByRole("link", { name: /← Objective/ })).toHaveCount(0);
+  await expect(page.getByText(/invalid work-item rows/)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Tasks (0)" })).toBeVisible();
+});
+
+test("R2-B: wrong-business work item → scope unproven, no link", async ({ page }) => {
+  const mid = "MSN_linC";
+  await interceptDetail(page, mid, { mission: {
+    bound_open_id: "OPEN_b2",
+    metadata: { work_item_id: "WI_b2", work_item_open_id: "OPEN_b2", business_id: "BIZ_b2" } } });
+  await page.route("**/api/work-items?business_id=BIZ_b2", (r: Route) =>
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: '{"work_items":[{"work_item_id":"WI_b2","business_id":"BIZ_OTHER","objective_id":"OBJ_x"}]}' }));
+  await page.goto(`/app/missions/${mid}`);
+  await expect(page.getByRole("link", { name: /← Objective/ })).toHaveCount(0);
+  await expect(page.getByText(/scope unproven/)).toBeVisible();
+});
+
+test("R2-B: work-items API down → evidence unavailable, no link", async ({ page }) => {
+  const mid = "MSN_linD";
+  await interceptDetail(page, mid, { mission: {
+    bound_open_id: "OPEN_b3",
+    metadata: { work_item_id: "WI_b3", work_item_open_id: "OPEN_b3", business_id: "BIZ_b3" } } });
+  await page.route("**/api/work-items?business_id=BIZ_b3", (r: Route) =>
+    r.fulfill({ status: 500, contentType: "application/json", body: '{"error":"down"}' }));
+  await page.goto(`/app/missions/${mid}`);
+  await expect(page.getByRole("link", { name: /← Objective/ })).toHaveCount(0);
+  await expect(page.getByText(/lineage evidence unavailable/)).toBeVisible();
+});
+
+/* R2-C: missing mandatory task fields → INVALID_PREVIEW, zero confirm POSTs;
+   genuine empty arrays stay valid. */
+test("R2-C: preview task missing caps/deps → INVALID_PREVIEW, 0 POSTs", async ({ page }) => {
+  let calls = 0;
+  await page.route("**/api/missions/preview", (r: Route) => {
+    calls++;
+    const task = calls === 1
+      ? { task_key: "T1", title: "t" } /* missing both mandatory arrays */
+      : { task_key: "T1", title: "t", task_instruction: "i", depends_on: [], required_capabilities: [] };
+    r.fulfill({ status: 200, contentType: "application/json",
+      body: JSON.stringify({ preview_id: `PV_${calls}`, plan_digest: "d".repeat(64),
+        plan: { tasks: [task] }, plan_source: null, plan_model: null }) });
+  });
+  const posts: string[] = [];
+  await countPosts(page, posts);
+  await page.goto("/app/missions/new");
+  await page.getByLabel("goal").fill(`e2e-r2c-${uniq()}`);
+  await page.getByLabel("project").selectOption({ index: 1 });
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  await expect(page.getByText(/INVALID_PREVIEW/)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Confirm & run/ })).toHaveCount(0);
+  /* empty-string task_key also invalid */
+  expect(posts.filter((u) => u.includes("/missions/confirm"))).toHaveLength(0);
+  /* genuine empty arrays → valid preview */
+  await page.getByRole("button", { name: /Preview plan/ }).click();
+  await expect(page.getByText("Proposed plan")).toBeVisible();
 });

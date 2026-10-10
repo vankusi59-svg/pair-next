@@ -15,7 +15,11 @@ import type { Dag, MissionDetail as Detail, MissionFileRow, TimelineEntry } from
    state, canonical refetch after success. */
 
 type Section<T> = { kind: "ready"; data: T } | { kind: "unavailable"; code: string };
-type Lineage = { objective_id: string; work_item_id: string; open_id: string };
+/* R2-B: lineage evidence is tri-state — a proven canonical chain yields the
+   backlink; anything else is an honest unproven note (never a guess). */
+type Lineage =
+  | { kind: "proven"; objective_id: string; work_item_id: string; open_id: string }
+  | { kind: "unproven"; reason: string };
 
 /* R1-F3: validate a mission-detail collection before rendering —
    non-array / non-object / identity-less elements = MALFORMED, never a
@@ -129,13 +133,41 @@ export function MissionDetailPage() {
         wantLineage ? apiAdmin.workItems(bizId, ctl.signal) : Promise.resolve(null),
       ]);
       if (ctl.signal.aborted) return;
+      /* R2-B: the scoped work-items response is lineage EVIDENCE —
+         envelope, array and every row are validated. Malformed rows
+         (null / primitive / missing identity or scope) or a wrong-business
+         row fail closed: the backlink is omitted with an honest unproven
+         note; other sections stay available. */
       let lineage: Lineage | null = null;
-      if (wantLineage && wiR.status === "fulfilled" && wiR.value) {
-        const wis = (wiR.value as { work_items?: unknown[] }).work_items;
-        const warr = (Array.isArray(wis) ? wis : []) as Array<Record<string, unknown>>;
-        const wi = warr.find((w) => String(w.work_item_id) === wiId);
-        const objId = wi && typeof wi === "object" ? String(wi.objective_id ?? "") : "";
-        if (objId) lineage = { objective_id: objId, work_item_id: wiId, open_id: openId };
+      if (wantLineage) {
+        if (wiR.status === "rejected" || !wiR.value) {
+          const code = wiR.status === "rejected"
+            ? (wiR.reason instanceof ApiError ? wiR.reason.code : "ERROR")
+            : "EMPTY";
+          lineage = { kind: "unproven", reason: `lineage evidence unavailable (${code}) — backlink omitted` };
+        } else {
+          const env = wiR.value as Record<string, unknown>;
+          const wis = env !== null && typeof env === "object" ? (env as { work_items?: unknown }).work_items : undefined;
+          if (!Array.isArray(wis)) {
+            lineage = { kind: "unproven", reason: "lineage evidence malformed (work_items not an array) — backlink omitted" };
+          } else if (!wis.every((w) => w !== null && typeof w === "object"
+            && (w as Record<string, unknown>).work_item_id != null
+            && (w as Record<string, unknown>).business_id != null)) {
+            lineage = { kind: "unproven", reason: "lineage evidence malformed (invalid work-item rows) — backlink omitted" };
+          } else {
+            const wi = (wis as Array<Record<string, unknown>>).find((w) => String(w.work_item_id) === wiId);
+            if (!wi) {
+              lineage = { kind: "unproven", reason: `work item ${wiId} not resolved by the scoped read — backlink omitted` };
+            } else if (String(wi.business_id) !== bizId) {
+              lineage = { kind: "unproven", reason: `work item ${wiId} resolved outside business ${bizId} — scope unproven, backlink omitted` };
+            } else {
+              const objId = String(wi.objective_id ?? "");
+              lineage = objId
+                ? { kind: "proven", objective_id: objId, work_item_id: wiId, open_id: openId }
+                : { kind: "unproven", reason: `work item ${wiId} carries no objective_id — backlink omitted` };
+            }
+          }
+        }
       }
       const dagSec = (() => {
         const s = sect(dagR, (v) => (v && Array.isArray(v.nodes) && Array.isArray(v.edges) ? [v as Dag] : null));
@@ -219,14 +251,16 @@ export function MissionDetailPage() {
       <h1>Mission <span className="mono">{id}</span></h1>
       <p className="sub srcnote">Canonical reads only — every action below POSTs through the existing lifecycle endpoints after an explicit confirmation.</p>
 
-      {lineage ? (
+      {lineage?.kind === "proven" ? (
         <div className="nrow" style={{ margin: "6px 0" }}>
           <Link className="lnk" to={`/app/objectives/${encodeURIComponent(lineage.objective_id)}`}>← Objective {lineage.objective_id}</Link>
           <span className="note">(verified via bound_open_id → work item {lineage.work_item_id} → objective — never constructed from the open id alone)</span>
         </div>
       ) : mission.bound_open_id ? (
         <div className="nrow" style={{ margin: "6px 0" }}>
-          <span className="note">bound_open_id present but objective lineage unproven — backlink omitted (no guessing).</span>
+          <span className="note">{lineage?.kind === "unproven"
+            ? lineage.reason
+            : "bound_open_id present but objective lineage unproven — backlink omitted (no guessing)."}</span>
         </div>
       ) : null}
 

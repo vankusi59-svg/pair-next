@@ -30,15 +30,18 @@ type Pinned = {
 };
 
 function taskRows(tasks: Array<Record<string, unknown>>) {
-  /* R1-F3: every task needs a task_key; capabilities/depends_on, when
-     present, must be arrays of strings — malformed structure is never
-     silently coerced into a valid-looking plan. */
+  /* R2-C strict preview task structure (canonical planner contract):
+     every task needs a nonempty task_key plus required_capabilities and
+     depends_on as arrays of strings. Missing/null fields are never
+     silently coerced to empty arrays — the whole preview is INVALID.
+     Genuine empty arrays remain valid (the planner emits [] deps). */
   return tasks.every((t) => {
-    if (t === null || typeof t !== "object" || t.task_key == null) return false;
-    if (t.required_capabilities != null
-      && !(Array.isArray(t.required_capabilities) && t.required_capabilities.every((c) => typeof c === "string"))) return false;
-    if (t.depends_on != null
-      && !(Array.isArray(t.depends_on) && t.depends_on.every((d) => typeof d === "string"))) return false;
+    if (t === null || typeof t !== "object") return false;
+    if (typeof t.task_key !== "string" || t.task_key.trim() === "") return false;
+    if (!Array.isArray(t.required_capabilities)
+      || !t.required_capabilities.every((c) => typeof c === "string")) return false;
+    if (!Array.isArray(t.depends_on)
+      || !t.depends_on.every((d) => typeof d === "string")) return false;
     return true;
   });
 }
@@ -59,6 +62,12 @@ export function MissionNew() {
      CURRENT inputs — a stale render closure can never validate a stale pin. */
   const inputsRef = useRef({ projectId: "", goal: "", auto: false });
   inputsRef.current = { projectId, goal, auto: autoConfirm };
+  /* R2-A: busy is a per-request counter, not a shared boolean — a stale
+     request's finally clears ONLY its own slot and can never overwrite
+     a newer in-flight request's state. */
+  const pending = useRef(0);
+  const confirmFlight = useRef(false); /* confirm single-flight */
+  const bump = (d: number) => { pending.current += d; setBusy(pending.current > 0); };
 
   useEffect(() => {
     const ctl = new AbortController();
@@ -89,8 +98,19 @@ export function MissionNew() {
   const inputsValid = st.kind === "ready" && goal.trim().length > 0 && projectId.length > 0 && project !== undefined;
 
   /* R1-F2: bump the generation so any in-flight preview belonging to
-     previous inputs is ignored when it lands. */
-  const invalidate = () => { seq.current++; setPreview(null); setConfirming(false); };
+     previous inputs is ignored when it lands.
+     R2-A: if inputs change while a confirmation POST is in flight, the
+     outcome is honestly unknown — the mission may have been committed.
+     Surface that instead of silently dropping the result (which would
+     invite an unsafe duplicate submission). No automatic retries. */
+  const invalidate = () => {
+    seq.current++;
+    setPreview(null);
+    setConfirming(false);
+    if (confirmFlight.current) {
+      setMutNote("Inputs changed while a confirmation was in flight — outcome unknown; the mission may have been committed. Check Mission Operations before resubmitting. No automatic retry.");
+    }
+  };
 
   const payload = () => ({
     project_id: projectId,
@@ -110,7 +130,7 @@ export function MissionNew() {
        only if they still match the current effective inputs. */
     const pinnedInputs = { project_id: projectId, goal: goal.trim() };
     const wasAuto = autoConfirm;
-    setBusy(true);
+    bump(1);
     setPreviewErr(null);
     setMutNote(null);
     try {
@@ -149,7 +169,8 @@ export function MissionNew() {
       setPreview(null);
       setPreviewErr(e instanceof ApiError ? `${e.detail || e.message} (${e.code})` : String(e));
     } finally {
-      if (s === seq.current) setBusy(false);
+      bump(-1); /* R2-A: clear this request's own slot only — a stale
+                   response can never wedge or clear B's in-flight state */
     }
   };
 
@@ -162,8 +183,10 @@ export function MissionNew() {
       setConfirming(false);
       return;
     }
+    if (confirmFlight.current) return; /* R2-A: single-flight — no duplicate POST */
+    confirmFlight.current = true;
     const s = ++seq.current;
-    setBusy(true);
+    bump(1);
     setMutNote(null);
     try {
       const m = await apiAdmin.confirmMission({ preview_id: p.preview_id, plan_digest: p.plan_digest });
@@ -189,7 +212,8 @@ export function MissionNew() {
         setMutNote("Submission outcome unknown — the mission may have been committed. Check canonical state before retrying.");
       }
     } finally {
-      if (s === seq.current) setBusy(false);
+      confirmFlight.current = false;
+      bump(-1);
     }
   };
 
