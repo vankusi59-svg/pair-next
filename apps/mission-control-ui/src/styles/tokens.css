@@ -348,3 +348,36 @@
 /* B5.1 — agent action bar + danger action affordance */
 .actbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 14px; }
 .tbtn.danger { border-color: var(--danger); color: var(--danger); }
+
+/* P15.9-B5.4 — /app/chat conversation surface */
+.chatgrid { display: grid; grid-template-columns: 260px 1fr; gap: 16px; align-items: start; }
+.chatside { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--surf-1); }
+.chatlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 60vh; overflow-y: auto; }
+.chatitem { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 6px 8px; color: var(--text-1); cursor: pointer; font: inherit; }
+.chatitem:hover { border-color: var(--border); }
+.chatitem.on { background: var(--surf-2); border-color: var(--border-strong); }
+.chatitem .meta { color: var(--text-3); font-size: 11px; }
+.chathead { display: flex; flex-direction: column; gap: 6px; border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 10px; }
+.chathead-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chathead .tbtn { align-self: flex-start; }
+.chatthread { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.chatloadmore { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chatmsg { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--surf-1); }
+.chatmsg.operator { border-left: 3px solid var(--accent, #3b82f6); }
+.chatmsg.assistant { border-left: 3px solid var(--ok, #3fb68b); }
+.chatmsg.system { border-left: 3px solid var(--text-3); opacity: .85; }
+.chatmsg-h { display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; flex-wrap: wrap; }
+.chatrole { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
+.chatrole.operator { color: var(--accent, #3b82f6); }
+.chatrole.assistant { color: var(--ok, #3fb68b); }
+.chatrole.system { color: var(--text-3); }
+.chatmsg-b { white-space: pre-wrap; word-break: break-word; font-size: 13.5px; }
+.chatprop { border: 1px solid var(--border-strong); border-radius: 8px; padding: 12px; margin: 12px 0; background: var(--surf-2); }
+.draftcard { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; background: var(--surf-1); }
+.draftcard-h { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.chatcomposer { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 8px; }
+.chatcomposer textarea { width: 100%; background: var(--surf-1); border: 1px solid var(--line); border-radius: 6px; padding: 8px 9px; color: var(--text-1); font: inherit; resize: vertical; }
+@media (max-width: 800px) {
+  .chatgrid { grid-template-columns: 1fr; }
+  .chatlist { max-height: 30vh; }
+}

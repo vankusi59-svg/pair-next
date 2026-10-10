@@ -502,4 +502,62 @@ export const apiAdmin = {
       signal ? { signal } : undefined,
       { noAuthPrompt: true },
     ),
+  /* ---- P15.9-B5.4 — conversation layer (canonical P15.8 endpoints,
+     same Bearer token + x-operator-id; noAuthPrompt only). Reads take an
+     AbortSignal; mutation POSTs never get one — a possibly-committed
+     POST is never aborted. ---- */
+  conversations: (signal?: AbortSignal) =>
+    req<{ sessions: import("./types").ConversationSession[] }>(
+      "/conversations", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  createConversation: (input: { title?: string; client_request_id?: string }) =>
+    req<{ session: import("./types").ConversationSession }>("/conversations", {
+      method: "POST", body: JSON.stringify(input),
+    }, { noAuthPrompt: true }),
+  conversation: (id: string, signal?: AbortSignal) =>
+    req<{ session: import("./types").ConversationSession }>(
+      `/conversations/${encodeURIComponent(id)}`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  conversationMessages: (id: string, opts?: { after_seq?: number; limit?: number }, signal?: AbortSignal) =>
+    req<{ messages: import("./types").ConversationMessage[]; next_after_seq: number | null }>(
+      `/conversations/${encodeURIComponent(id)}/messages${
+        opts?.after_seq !== undefined || opts?.limit !== undefined
+          ? `?${[
+              opts.after_seq !== undefined ? `after_seq=${opts.after_seq}` : "",
+              opts.limit !== undefined ? `limit=${opts.limit}` : "",
+            ].filter(Boolean).join("&")}`
+          : ""}`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  conversationTurn: (id: string, input: { body: string; idempotency_key?: string }) =>
+    req<import("./types").ConversationTurnResult>(
+      `/conversations/${encodeURIComponent(id)}/turns`,
+      { method: "POST", body: JSON.stringify(input) }, { noAuthPrompt: true }),
+  closeConversation: (id: string) =>
+    req<{ session: import("./types").ConversationSession }>(
+      `/conversations/${encodeURIComponent(id)}/close`,
+      { method: "POST", body: "{}" }, { noAuthPrompt: true }),
+  conversationDrafts: (id: string, signal?: AbortSignal) =>
+    req<{ drafts: import("./types").MissionDraft[] }>(
+      `/conversations/${encodeURIComponent(id)}/drafts`,
+      signal ? { signal } : undefined, { noAuthPrompt: true }),
+  createDraft: (id: string, input: {
+    project_id: string;
+    goal: string;
+    granted_permissions?: string[];
+    authorized_workspaces?: string[];
+    risk_ceiling?: string;
+    client_request_id?: string;
+    supersedes_draft_id?: string;
+  }) =>
+    req<{ draft: import("./types").MissionDraft }>(
+      `/conversations/${encodeURIComponent(id)}/drafts`,
+      { method: "POST", body: JSON.stringify(input) }, { noAuthPrompt: true }),
+  confirmDraft: (id: string, draftId: string, expectedDigest: string) =>
+    req<import("./types").DraftConfirmResult>(
+      `/conversations/${encodeURIComponent(id)}/drafts/${encodeURIComponent(draftId)}/confirm`,
+      { method: "POST", body: JSON.stringify({ expected_digest: expectedDigest }) },
+      { noAuthPrompt: true }),
+  rejectDraft: (id: string, draftId: string) =>
+    req<{ draft: import("./types").MissionDraft }>(
+      `/conversations/${encodeURIComponent(id)}/drafts/${encodeURIComponent(draftId)}/reject`,
+      { method: "POST", body: "{}" }, { noAuthPrompt: true }),
 };
