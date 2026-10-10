@@ -20,8 +20,12 @@ const TERMINAL = new Set(["DONE", "CANCELLED"]);
 const AGENT_TONE: Record<string, Tone> = { ACTIVE: "ok", PAUSED: "warn", TERMINATED: "unknown" };
 
 type AgentExtras = {
-  contractStatus: string | null; /* null = unavailable or unmaterialized */
-  contractVersion: number | null;
+  /* tri-state: canonical row | successful read returning null |
+     failed read — a failed GET is NEVER rendered as not-materialized */
+  contract:
+    | { kind: "row"; status: string; version: number | null }
+    | { kind: "none" }
+    | { kind: "unavailable"; code: string };
   policyLine: string | null;
   inboxPending: number | null;
   failedReads: string[];
@@ -106,10 +110,12 @@ export function Workforce() {
           api.agentInbox(id, ctl.signal),
         ]);
         if (ctl.signal.aborted) return;
-        const contractStatus =
-          c.status === "fulfilled" ? (c.value.contract ? String(c.value.contract.status) : null) : null;
-        const contractVersion =
-          c.status === "fulfilled" && c.value.contract ? Number(c.value.contract.contract_version) : null;
+        const contract: AgentExtras["contract"] =
+          c.status === "rejected"
+            ? { kind: "unavailable", code: c.reason instanceof ApiError ? c.reason.code : "ERROR" }
+            : c.value.contract
+              ? { kind: "row", status: String(c.value.contract.status), version: Number(c.value.contract.contract_version) }
+              : { kind: "none" };
         if (c.status === "rejected") failedReads.push("contract");
         const policyTxt = p.status === "fulfilled" ? policyLine(p.value.policy) : null;
         if (p.status === "rejected") failedReads.push("effective-policy");
@@ -119,8 +125,7 @@ export function Workforce() {
             : null;
         if (i.status === "rejected") failedReads.push("inbox");
         extras[id] = {
-          contractStatus,
-          contractVersion,
+          contract,
           policyLine: policyTxt,
           inboxPending,
           failedReads,
@@ -271,13 +276,17 @@ export function Workforce() {
                 <div className="efoot">
                   <span>
                     contract{" "}
-                    {ex?.contractStatus ? (
+                    {!ex ? (
+                      <span className="note">—</span>
+                    ) : ex.contract.kind === "row" ? (
                       <>
-                        <code>{ex.contractStatus}</code>
-                        {ex.contractVersion !== null ? ` v${ex.contractVersion}` : ""}
+                        <code>{ex.contract.status}</code>
+                        {ex.contract.version !== null ? ` v${ex.contract.version}` : ""}
                       </>
-                    ) : (
+                    ) : ex.contract.kind === "none" ? (
                       <span className="note">not materialized</span>
+                    ) : (
+                      <span className="note">unavailable ({ex.contract.code})</span>
                     )}
                   </span>
                   <span>workload {load === null ? "—" : `${load.length} active`}</span>

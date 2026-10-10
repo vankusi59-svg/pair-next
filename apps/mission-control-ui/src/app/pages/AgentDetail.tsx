@@ -311,7 +311,7 @@ export function AgentDetail() {
         </div>
       ) : (
         <div className="sub" style={{ marginBottom: 10 }}>
-          {agent.status === "TERMINATED" ? "Agent terminated — no lifecycle operations remain." : "No lifecycle operations available."}
+          {agent.status === "TERMINATED" ? "Agent terminated — lifecycle controls hidden by this UI (UI-level gating only: the backend enforces status membership, not irreversibility)." : "No lifecycle operations available."}
         </div>
       )}
 
@@ -480,7 +480,7 @@ export function AgentDetail() {
         open={dlg !== null && dlg.biz === biz && dlg.agentId === id}
         title={dlg?.label ?? ""}
         body={dlg?.op === "terminate"
-          ? `TERMINATE ${dlg.agentId}? High-risk: this is the canonical terminate mutation — the agent cannot be resumed afterward. Backend authority remains final.`
+          ? `TERMINATE ${dlg.agentId}? High-risk: commits the canonical terminate mutation. This UI hides lifecycle actions for a TERMINATED agent — UI-level gating only: the backend enforces status membership, NOT an irreversible transition (a resume POST remains a valid backend call). Backend authority remains final.`
           : `${dlg?.label} on ${dlg?.agentId ?? ""}? This commits the existing canonical mutation on the backend — no client-side state is assumed beforehand.`}
         confirmLabel={dlg?.op === "terminate" ? "Terminate" : "Confirm"}
         busy={mutBusy}

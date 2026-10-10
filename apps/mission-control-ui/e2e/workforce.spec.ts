@@ -190,10 +190,15 @@ test("workforce: pause/resume/terminate via pinned confirm; failure surfaced; no
   await page.getByRole("button", { name: "Confirm" }).click();
   await expect(page.locator(".trunc[role=status]")).toContainText("Resume agent committed");
   await expect(page.locator(".sbadge.t-ok").first()).toHaveText("ACTIVE");
-  // terminate — high-risk copy + irreversible
+  // terminate — high-risk copy describing the ACTUAL backend contract:
+  // setOrgAgentStatus enforces status membership only, no irreversible
+  // transition graph. The UI must not claim otherwise.
   await page.getByRole("button", { name: "Terminate agent" }).click();
   await expect(page.locator(".cdlg")).toContainText("TERMINATE");
-  await expect(page.locator(".cdlg")).toContainText("cannot be resumed");
+  await expect(page.locator(".cdlg")).toContainText("High-risk");
+  await expect(page.locator(".cdlg")).toContainText("UI-level gating only");
+  await expect(page.locator(".cdlg")).toContainText("NOT an irreversible transition");
+  await expect(page.locator(".cdlg")).not.toContainText("cannot be resumed");
   await page.locator(".cdlg").getByRole("button", { name: "Terminate" }).click();
   await expect(page.locator(".trunc[role=status]")).toContainText("Terminate agent committed");
   await expect(page.locator(".sbadge").first()).toHaveText("TERMINATED");
@@ -234,6 +239,38 @@ test("workforce: contract enable/disable via pinned confirm", async ({ page }) =
   await page.getByRole("button", { name: "Enable execution contract" }).click();
   await page.getByRole("button", { name: "Confirm" }).click();
   await expect(page.locator(".need").nth(0)).toContainText("ACTIVE");
+});
+
+test("workforce: contract read states — success-null vs failed-GET vs canonical row", async ({ page }) => {
+  /* F2 adversarial: three agents in one business. createOrgAgent
+     auto-materializes, so divergent contract states are driven by
+     interception on the canonical read — each label must be distinct. */
+  const biz = await mkBusiness(page, "wf-q");
+  await mkObjective(page, biz);
+  const okRow = await mkAgent(page, biz, "Row Contract");
+  const okNull = await mkAgent(page, biz, "Null Contract");
+  const failed = await mkAgent(page, biz, "Failed Contract");
+  await page.route(`**/api/org-agents/${okNull}/contract`, (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ contract: null }) }));
+  await page.route(`**/api/org-agents/${failed}/contract`, (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY" }) }));
+  await seedBiz(page, biz);
+  await page.goto("/app/workforce");
+  await expect(page.locator(".ecard")).toHaveCount(3);
+  // canonical row → real status/version
+  const cardRow = page.locator(".ecard", { hasText: "Row Contract" });
+  await expect(cardRow).toContainText("contract ACTIVE");
+  await expect(cardRow).toContainText("v1");
+  // successful GET returning null → not materialized (never unavailable)
+  const cardNull = page.locator(".ecard", { hasText: "Null Contract" });
+  await expect(cardNull).toContainText("not materialized");
+  await expect(cardNull).not.toContainText("unavailable");
+  // failed GET → unavailable + error code, never not-materialized
+  const cardFail = page.locator(".ecard", { hasText: "Failed Contract" });
+  await expect(cardFail).toContainText("unavailable (FAIL_CLOSED_AGENT_CONTRACT_INTEGRITY)");
+  await expect(cardFail).not.toContainText("not materialized");
+  await expect(cardFail).toContainText("failed reads: contract");
+  expect(okRow).toBeTruthy();
 });
 
 test("workforce: business switch during pending reads — stale agents never paint", async ({ page }) => {
