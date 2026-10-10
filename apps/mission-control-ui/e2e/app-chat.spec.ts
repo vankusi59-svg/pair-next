@@ -473,3 +473,195 @@ test("app-chat: different session → fresh idempotency key", async ({ page }) =
   expect(keys).toHaveLength(2);
   expect(keys[0]).not.toBe(keys[1]); // key never crosses sessions
 });
+
+/* ---------- R1-F1: cross-session composer + mutation isolation ---------- */
+
+test("app-chat R1-F1: unsent composer text never crosses into another session", async ({ page }) => {
+  const a = await mkSession(page);
+  const b = await mkSession(page);
+  await page.goto(`/app/chat?s=${a}`);
+  await page.locator(".chatcomposer textarea").fill("unsent-a-text");
+  await page.goto(`/app/chat?s=${b}`);
+  await expect(page.locator(".chathead")).toContainText(b, { timeout: 10_000 });
+  // B's composer must not display A's unsent text
+  await expect(page.locator(".chatcomposer textarea")).toHaveValue("");
+  // …and never sends it
+  let sentBody: string | null = null;
+  await page.route(`**/api/conversations/${b}/turns`, async (route) => {
+    sentBody = (route.request().postDataJSON() as { body?: string }).body ?? null;
+    await route.continue();
+  });
+  await page.locator(".chatcomposer textarea").fill("b-text");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("PAIR trả lời mô phỏng").first()).toBeVisible({ timeout: 15_000 });
+  expect(sentBody).toBe("b-text");
+});
+
+test("app-chat R1-F1: late failing turn paints only on its own session; deliberate retry on return replays the same key", async ({ page }) => {
+  const a = await mkSession(page);
+  const b = await mkSession(page);
+  await page.goto(`/app/chat?s=${a}`);
+  let release: (() => void) | null = null;
+  let calls = 0;
+  const keys: string[] = [];
+  await page.route(`**/api/conversations/${a}/turns`, async (route) => {
+    calls++;
+    keys.push(String(route.request().postDataJSON()?.idempotency_key));
+    if (calls === 1) {
+      await new Promise<void>((res) => { release = res; });
+      return route.fulfill({ status: 500, body: `{"error":"Boom"}` });
+    }
+    return route.continue();
+  });
+  await page.locator(".chatcomposer textarea").fill("turn-a");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.waitForTimeout(400); // turn A still in-flight
+  /* SPA navigation (sidebar) keeps refs — pendingSubmit survives for the
+     deliberate retry; a full reload would legitimately reset it. */
+  await page.locator(".chatitem", { hasText: b }).first().click();
+  await page.waitForURL(new RegExp(`s=${b}`));
+  await expect(page.locator(".chathead")).toContainText(b, { timeout: 10_000 });
+  try { release?.(); } catch { /* route released */ }
+  await page.waitForTimeout(800); // let the late failure land
+  await expect(page.locator(".warn.note")).toHaveCount(0); // no A-specific error inside B
+  // Return to A — composer was cleared by policy, but the retry keeps its identity
+  await page.locator(".chatitem", { hasText: a }).first().click();
+  await page.waitForURL(new RegExp(`s=${a}`));
+  await expect(page.locator(".chatcomposer textarea")).toHaveValue("");
+  await page.locator(".chatcomposer textarea").fill("turn-a");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("PAIR trả lời mô phỏng").first()).toBeVisible({ timeout: 15_000 });
+  expect(calls).toBe(2);
+  expect(keys[0]).toBeTruthy();
+  expect(keys[0]).toBe(keys[1]); // SAME key replayed
+});
+
+test("app-chat R1-F1: late failing confirm paints no A-specific note or dialog inside B", async ({ page }) => {
+  const a = await mkSession(page);
+  const b = await mkSession(page);
+  await mkDraft(page, a, `cfl-${uniq()}`);
+  await page.goto(`/app/chat?s=${a}`);
+  await page.locator(".draftcard").getByRole("button", { name: "Confirm…" }).click();
+  let release: (() => void) | null = null;
+  await page.route(`**/api/conversations/${a}/drafts/*/confirm`, async (route) => {
+    await new Promise<void>((res) => { release = res; });
+    return route.fulfill({ status: 500, body: `{"error":"Boom"}` });
+  });
+  await page.locator(".cdlg").getByRole("button", { name: "Confirm draft" }).click();
+  /* SPA switch while the confirm POST is in-flight — the modal blocks
+     sidebar clicks by design, so drive the same code path via history
+     navigation (React Router handles popstate without a reload; refs and
+     guards stay live, unlike page.goto which reloads everything). */
+  await page.evaluate((sid) => {
+    history.pushState({}, "", `/app/chat?s=${sid}`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, b);
+  await expect(page.locator(".chathead")).toContainText(b, { timeout: 10_000 });
+  try { release?.(); } catch { /* released */ }
+  await page.waitForTimeout(900);
+  await expect(page.locator(".warn.note")).toHaveCount(0);
+  await expect(page.locator(".cdlg")).toHaveCount(0);
+  await expect(page.getByText(/Confirmation outcome is unknown/)).toHaveCount(0);
+});
+
+/* ---------- R1-F2: proposal project binding ---------- */
+
+test("app-chat R1-F2: new proposal resets the pick; held validation keeps Create disabled; verified pick → exactly one draft POST", async ({ page }) => {
+  const sid = await mkSession(page);
+  const proj = await firstProject(page);
+  await page.goto(`/app/chat?s=${sid}`);
+  let turn = 0;
+  await page.route(`**/api/conversations/${sid}/turns`, (route) => {
+    turn++;
+    const msgId = `m-prop-${turn}`;
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        message: { message_id: msgId, session_id: sid, seq: turn * 2 - 1, role: "operator", body: "x", created_at: "t" },
+        reply: { message_id: `${msgId}-r`, session_id: sid, seq: turn * 2, role: "assistant", body: "r", created_at: "t" },
+        reused: false,
+        proposal: {
+          goal: `proposal-${turn}`,
+          project_candidates: [{ project_id: proj.project_id, name: proj.name ?? proj.project_id }],
+        },
+      }),
+    });
+  });
+  const drafts = countPosts(page, /\/conversations\/[^/]+\/drafts/);
+  const createBtn = page.getByRole("button", { name: /Create draft \(pending confirmation\)/ });
+  // Proposal A → pick the candidate, validation ready
+  await page.locator(".chatcomposer textarea").fill("prop a");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("client_request_id: proposal:m-prop-1")).toBeVisible();
+  await page.locator("#projsel").selectOption(proj.project_id);
+  await expect(createBtn).toBeEnabled();
+  // Register a HELD projects route BEFORE proposal B arrives — B's
+  // canonical validation must not resolve until released.
+  let releaseProjects: (() => void) | null = null;
+  await page.route("**/api/projects", async (route) => {
+    await new Promise<void>((res) => { releaseProjects = res; });
+    return route.continue();
+  });
+  // Proposal B arrives — the previous pick MUST reset (bound to its own message)
+  await page.locator(".chatcomposer textarea").fill("prop b");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText("client_request_id: proposal:m-prop-2")).toBeVisible();
+  // B's project validation is held → Create disabled (the select only
+  // renders once canonical evidence is proven), zero POSTs
+  await expect(createBtn).toBeDisabled();
+  await page.waitForTimeout(400);
+  expect(drafts()).toBe(0);
+  // Release valid canonical evidence → select reappears with NO stale
+  // pick carried over → explicit re-selection → exactly one POST
+  try { releaseProjects?.(); } catch { /* released */ }
+  await expect(page.locator("#projsel")).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator("#projsel")).toHaveValue("");
+  await page.locator("#projsel").selectOption(proj.project_id);
+  await expect(createBtn).toBeEnabled();
+  await createBtn.click();
+  await expect(page.locator(".draftcard", { hasText: "proposal-2" })).toBeVisible({ timeout: 10_000 });
+  expect(drafts()).toBe(1);
+});
+
+/* ---------- R1-F3: malformed 200 preserves turn idempotency ---------- */
+
+test("app-chat R1-F3: malformed 200 on a committed turn → unverified outcome; deliberate retry replays same key, one canonical pair", async ({ page }) => {
+  const sid = await mkSession(page);
+  await page.goto(`/app/chat?s=${sid}`);
+  let calls = 0;
+  const keys: string[] = [];
+  await page.route(`**/api/conversations/${sid}/turns`, async (route) => {
+    calls++;
+    keys.push(String(route.request().postDataJSON()?.idempotency_key));
+    if (calls === 1) {
+      const resp = await route.fetch(); // REAL backend commits the turn
+      expect(resp.ok()).toBeTruthy();
+      // Corrupt the 200 the client sees — a malformed success is NOT proof
+      return route.fulfill({ response: resp, body: `{"message":null}` });
+    }
+    return route.continue();
+  });
+  await page.locator(".chatcomposer textarea").fill("f3-turn");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await expect(page.getByText(/could not be verified.*malformed/)).toBeVisible();
+  // recoverability retained: composer + pendingSubmit kept
+  await expect(page.locator(".chatcomposer textarea")).toHaveValue("f3-turn");
+  // canonical reconciliation refetched — the committed pair shows in-thread
+  await expect(page.locator(".chatmsg-b", { hasText: "f3-turn" })).toHaveCount(1);
+  await expect(page.locator(".chatmsg-b", { hasText: "PAIR trả lời mô phỏng" })).toHaveCount(1);
+  // no auto-retry was attempted
+  await page.waitForTimeout(500);
+  expect(calls).toBe(1);
+  // deliberate retry → SAME key, never a second turn
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await page.waitForTimeout(1000);
+  expect(calls).toBe(2);
+  expect(keys[0]).toBeTruthy();
+  expect(keys[0]).toBe(keys[1]);
+  // canonical proof: exactly ONE operator+assistant pair exists
+  const mr = await page.request.get(`/api/conversations/${sid}/messages?after_seq=0`, { headers: HEADERS() });
+  const msgs = ((await mr.json()).messages ?? []) as { role?: string; body?: string }[];
+  expect(msgs.filter((m) => m.role === "operator" && m.body === "f3-turn")).toHaveLength(1);
+  expect(msgs.filter((m) => m.role === "assistant")).toHaveLength(1);
+});

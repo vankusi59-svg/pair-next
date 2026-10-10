@@ -209,6 +209,13 @@ export default function Chat() {
 
   /* ---- proposal + draft form ---- */
   const [proposal, setProposal] = useState<PendingProposal | null>(null);
+  /* F2 — ref mirror so in-flight project validation can gate on the
+     EXACT proposing message it was fetched for. */
+  const proposalRef = useRef<PendingProposal | null>(null);
+  const setProp = useCallback((p: PendingProposal | null) => {
+    proposalRef.current = p;
+    setProposal(p);
+  }, []);
   const [proposalProjects, setProposalProjects] = useState<Sec<{ project_id: string; name?: string }[]> | null>(null);
   const [proposalPick, setProposalPick] = useState("");
   const projectsReq = useRef<AbortController | null>(null);
@@ -316,7 +323,12 @@ export default function Chat() {
     setEarlierErr(null);
     setTurnNote(null);
     setMutNote(null);
-    setProposal(null);
+    /* F1 — composer text belongs to a session: switching sessions clears
+       it so A's unsent text is never displayed or sent under B. The
+       pendingSubmit {sessionId,body,key} survives — an ambiguous in-flight
+       turn keeps its idempotent retry identity for when A is revisited. */
+    setBody("");
+    setProp(null);
     setProposalProjects(null);
     setProposalPick("");
     setConfirmedMission(null);
@@ -438,11 +450,31 @@ export default function Chat() {
         if (turnFlight.current?.key === key) { turnFlight.current = null; setTurnBusy(false); }
         /* The result may paint only on the session it was sent to. */
         if (gen.current !== g || activeRef.current !== sessionId) return;
+        /* F3 — a malformed HTTP 200 is NOT a proven successful turn:
+           validate the whole canonical response (operator message +
+           assistant reply, session-bound, integer seqs, proposal shape)
+           BEFORE clearing composer or pendingSubmit. */
+        const ok =
+          validMessage(r.message, sessionId) && r.message.role === "operator" &&
+          validMessage(r.reply, sessionId) && r.reply.role === "assistant" &&
+          (r.reused === undefined || typeof r.reused === "boolean") &&
+          (r.proposal === undefined ||
+            (isObj(r.proposal) && typeof r.proposal.goal === "string"));
+        if (!ok) {
+          /* Keep composer + pendingSubmit — the turn may still have
+             committed. Canonical refetch reconciles; a deliberate retry
+             replays the SAME key+body+session. Never auto-retry, never
+             mint a second turn. */
+          setTurnNote(
+            "Turn outcome could not be verified — the response was malformed and the turn may still have committed. Canonical history was refreshed; a deliberate retry replays the same idempotency key.",
+          );
+          loadThread(sessionId);
+          loadDrafts(sessionId);
+          loadSessions();
+          return;
+        }
         pendingSubmit.current = null;
         setBody("");
-        if (!isObj(r) || !isObj(r.message) || !isObj(r.reply)) {
-          return setTurnNote("Turn response was malformed — the message may still have been stored; refreshing the thread.");
-        }
         const prop = r.proposal;
         if (prop && isObj(prop) && typeof prop.goal === "string") {
           if (prop.draft && isObj(prop.draft)) {
@@ -455,7 +487,12 @@ export default function Chat() {
             if (cands.length !== prop.project_candidates.length || cands.length === 0) {
               setTurnNote("Proposal candidates were malformed — no project was chosen; no draft created.");
             } else {
-              setProposal({ messageId: String(r.message.message_id), goal: prop.goal, candidates: cands });
+              const msgId = String(r.message.message_id);
+              /* F2 — a new proposal RESETS any previous selection and
+                 obsolete validation; the pick is bound to this exact
+                 proposing message and candidate set. */
+              setProp({ messageId: msgId, goal: prop.goal, candidates: cands });
+              setProposalPick("");
               /* Verify candidates against the canonical projects read —
                  never infer identity, never fall back to AppShell business. */
               projectsReq.current?.abort();
@@ -467,6 +504,7 @@ export default function Chat() {
                 .projects(ctl.signal)
                 .then((rows) => {
                   if (gen.current !== gg || activeRef.current !== sessionId) return;
+                  if (proposalRef.current?.messageId !== msgId) return; // obsolete proposal
                   if (!Array.isArray(rows) || !rows.every(validProject))
                     return setProposalProjects({ kind: "error", err: MALFORMED });
                   const known = new Set(rows.map((p) => p.project_id));
@@ -480,6 +518,7 @@ export default function Chat() {
                 .catch((e) => {
                   if (gen.current !== gg || activeRef.current !== sessionId) return;
                   if (ctl.signal.aborted) return;
+                  if (proposalRef.current?.messageId !== msgId) return;
                   setProposalProjects({ kind: "error", err: failOf(e) });
                 });
             }
@@ -494,6 +533,10 @@ export default function Chat() {
       })
       .catch((e) => {
         if (turnFlight.current?.key === key) { turnFlight.current = null; setTurnBusy(false); }
+        /* F1 — a late turn failure paints only on the session it was sent
+           to; on another session it is silently dropped (pendingSubmit
+           retains the retry identity for a revisit). */
+        if (gen.current !== g || activeRef.current !== sessionId) return;
         const f = failOf(e);
         /* The POST may have committed — keep composer + pendingSubmit so a
            deliberate retry replays the SAME key+body+session. */
@@ -574,26 +617,35 @@ export default function Chat() {
       .catch((e) => {
         mutFlight.current = null;
         setMutBusy(null);
-        setMutNote(`Draft creation may not have committed (${failOf(e).code}) — no substitute draft is minted; refresh before retrying.`);
-        if (activeRef.current === sessionId) loadDrafts(sessionId);
+        if (activeRef.current === sessionId) {
+          setMutNote(`Draft creation may not have committed (${failOf(e).code}) — no substitute draft is minted; refresh before retrying.`);
+          loadDrafts(sessionId);
+        }
       });
   };
 
   const submitProposalDraft = () => {
     const sessionId = activeId;
-    if (!sessionId || !proposal || mutFlight.current) return;
-    if (!proposalPick) return;
-    const flights = `proposal-draft:${proposal.messageId}`;
+    if (!sessionId || mutFlight.current) return;
+    /* F2 — immediately before POST, re-check: the proposing message is
+       still the current one, the pick is inside ITS candidate set, and
+       canonical project validation has succeeded on a verified list. */
+    const prop = proposalRef.current;
+    if (!prop || !proposalPick) return;
+    if (!prop.candidates.some((c) => c.project_id === proposalPick)) return;
+    if (proposalProjects?.kind !== "ready") return;
+    if (!proposalProjects.value.some((p) => p.project_id === proposalPick)) return;
+    const flights = `proposal-draft:${prop.messageId}`;
     mutFlight.current = flights;
     setMutBusy(flights);
     setMutNote(null);
     apiAdmin
       .createDraft(sessionId, {
         project_id: proposalPick,
-        goal: proposal.goal,
+        goal: prop.goal,
         /* Mirrors the server's own auto-mint: permissions/workspaces/risk
            are left to canonical defaults — none are invented here. */
-        client_request_id: `proposal:${proposal.messageId}`,
+        client_request_id: `proposal:${prop.messageId}`,
       })
       .then((r) => {
         mutFlight.current = null;
@@ -602,7 +654,7 @@ export default function Chat() {
           if (!isObj(r) || !validDraft(r.draft, sessionId)) {
             setMutNote("Proposal draft response was malformed — refreshing the canonical draft list.");
           } else {
-            setProposal(null);
+            setProp(null);
             setProposalPick("");
           }
           loadDrafts(sessionId);
@@ -611,8 +663,10 @@ export default function Chat() {
       .catch((e) => {
         mutFlight.current = null;
         setMutBusy(null);
-        setMutNote(`Proposal draft creation may not have committed (${failOf(e).code}) — refresh before retrying; no substitute draft is minted.`);
-        if (activeRef.current === sessionId) loadDrafts(sessionId);
+        if (activeRef.current === sessionId) {
+          setMutNote(`Proposal draft creation may not have committed (${failOf(e).code}) — refresh before retrying; no substitute draft is minted.`);
+          loadDrafts(sessionId);
+        }
       });
   };
 
@@ -649,11 +703,14 @@ export default function Chat() {
           mutFlight.current = null;
           setMutBusy(null);
           setDialog(null);
-          /* Possibly committed — honest ambiguous notice + refresh offer. */
-          setMutNote(
-            `Confirmation outcome is unknown (${failOf(e).code}) — the POST may have committed. No auto-retry was attempted; refresh the draft list to inspect canonical state before any deliberate retry.`,
-          );
-          if (activeRef.current === d.sessionId) loadDrafts(d.sessionId);
+          /* F1 — an A-specific failure note never paints into session B. */
+          if (activeRef.current === d.sessionId) {
+            /* Possibly committed — honest ambiguous notice + refresh offer. */
+            setMutNote(
+              `Confirmation outcome is unknown (${failOf(e).code}) — the POST may have committed. No auto-retry was attempted; refresh the draft list to inspect canonical state before any deliberate retry.`,
+            );
+            loadDrafts(d.sessionId);
+          }
           loadSessions();
         });
       return;
@@ -675,8 +732,10 @@ export default function Chat() {
           mutFlight.current = null;
           setMutBusy(null);
           setDialog(null);
-          setMutNote(`Rejection outcome is unknown (${failOf(e).code}) — the POST may have committed. No auto-retry was attempted; refresh canonical state first.`);
-          if (activeRef.current === d.sessionId) loadDrafts(d.sessionId);
+          if (activeRef.current === d.sessionId) {
+            setMutNote(`Rejection outcome is unknown (${failOf(e).code}) — the POST may have committed. No auto-retry was attempted; refresh canonical state first.`);
+            loadDrafts(d.sessionId);
+          }
         });
       return;
     }
@@ -701,7 +760,9 @@ export default function Chat() {
         mutFlight.current = null;
         setMutBusy(null);
         setDialog(null);
-        setMutNote(`Close may not have committed (${failOf(e).code}) — refresh canonical state before retrying.`);
+        if (activeRef.current === d.sessionId) {
+          setMutNote(`Close may not have committed (${failOf(e).code}) — refresh canonical state before retrying.`);
+        }
         loadSessions();
       });
   };
@@ -923,14 +984,14 @@ export default function Chat() {
                   <div className="actbar">
                     <button
                       className="tbtn"
-                      disabled={!proposalPick || mutBusy !== null}
+                      disabled={!proposalPick || mutBusy !== null || proposalProjects?.kind !== "ready"}
                       onClick={submitProposalDraft}
                     >
                       {mutBusy?.startsWith("proposal-draft:") ? "Creating…" : "Create draft (pending confirmation)"}
                     </button>
                     <button
                       className="tbtn"
-                      onClick={() => { setProposal(null); setProposalPick(""); }}
+                      onClick={() => { setProp(null); setProposalPick(""); }}
                       disabled={mutBusy !== null}
                     >
                       Dismiss — create no draft
