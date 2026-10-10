@@ -1,28 +1,20 @@
 {
-  "claim_id": "P15_10_D_R1_AUTHORITY_PROOF_HARDENING",
-  "title": "P15.10-D R1: artifact CAS re-verification + grant dedup + receipt-auth binding",
+  "claim_id": "P15_10_MET_BRANCH_LIFECYCLE_FOLD_HOTFIX",
+  "title": "P15.10 MET-branch hotfix: fold delegated children before TARGET_MET_CANDIDATE review",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL",
-    "ARTIFACT",
-    "GATE_ROUTER"
+    "RECOVERY_REPLAY"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10d-r1.test.ts",
+    "src/__tests__/pair-p15-10d-met-branch-fold.test.ts",
     "src/__tests__/pair-p15-10d.test.ts",
-    "src/__tests__/pair-p15-1-objective-authority.test.ts",
-    "src/__tests__/pair-p15-5-kpi-review.test.ts",
+    "src/__tests__/pair-p15-10d-r1.test.ts",
     "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts",
+    "src/__tests__/pair-p15-5-kpi-review.test.ts",
     "src/__tests__/pair-p15-10c.test.ts",
-    "src/__tests__/pair-p15-10c-r1.test.ts",
-    "src/__tests__/pair-p15-10c-r2.test.ts",
-    "src/__tests__/pair-p15-10c-r3.test.ts",
-    "src/__tests__/pair-p15-10c-r4.test.ts",
-    "src/__tests__/pair-p15-10c-final-audit.test.ts"
+    "src/__tests__/pair-p14-wfv2-p3.test.ts"
   ],
   "invariants": [],
-  "risk_override": "HIGH",
-  "description": "R1 on PR #88 (BASE 88470ee). F1 CONFIRMED+FIXED: verifiedUnits trusted artifact.state==ACCEPTED rows only — deleted/tampered retained CAS bytes still minted progress. Fix: the service takes ArtifactAuthority (canonical blobDir = PAIR_ARTIFACT_DIR ?? dbDir/artifacts/blobs, same resolver as telegram-delivery) and re-verifies every candidate via verifyArtifactForConsumption (acceptance history + canonical shape + retained bytes NOW) inside the same txn; corruption fails closed. F2 CONFIRMED+FIXED: grant() stored dedup_key but never consulted it — replay after revoke minted a fresh ENABLED grant. Fix: dedup scan inside the txn before the enabled-check — same (objective,key)+same semantics (business,kpi,rule_digest,expires_at,owner,created_by) returns the stored row (REVOKE durable), different semantics fails closed, dups converge. F3 CONFIRMED+FIXED in shared assertKpiVerifierAuthority: added receipt.authorization_id===verifier auth, receipt.evidence_key===claim key, receipt.rule_digest===grant.rule_digest — revoked-grant receipts and tampered grant rules no longer satisfy new verifiers; write path and P15.5 strict read share the contract. F4 VERIFIED (no change): revoke/expire after progress makes strict read fail closed FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW; persisted value untouched; owner re-verification recovers. F5 VERIFIED (documented): DELIVERABLE_BUNDLE proves canonical deliverable completion only; receipt.verified_units binds workstream/work_item/mission/artifact ids — no content semantics, no AI judge. R1 suite: 10 tests, prepatch FAIL→postpatch PASS; 22 original + 340 regressions green. No merge/deploy."
+  "risk_override": "MEDIUM",
+  "description": "Forensic-confirmed defect on BASE 95c7a71: ObjectiveOperatingLoop.pass() early-returns TARGET_MET_CANDIDATE at the allTargetsMet gate (§6) BEFORE §9 reconcileDelegatedChildren — the only runtime fold seam for IN_PROGRESS delegated children with terminal bound missions. Once KPI is MET the seam is unreachable; a child left IN_PROGRESS with a COMPLETED bound mission never folds at runtime (live evidence: DL_aec59cae in P15.10-D Core E2E V3; KPI MET 04:43:15Z, mission terminal 04:44:25Z — fold window never existed). Fix (minimal, audit-proposed): inside the allTargetsMet+binding branch, re-derive the canonical observation and call the EXISTING reconcileDelegatedChildren BEFORE the deterministic P15.5 review commits. Reconcile only touches INTERVENTION+IN_PROGRESS children whose bound missions are canonically terminal; syncWorkItem re-proves lineage and materializes WCP only when provable (FAILED→BLOCKED, review-required→REVIEW_REQUIRED, forged claims→quarantine/fail-closed). Non-MET flow byte-identical. Suite pair-p15-10d-met-branch-fold.test.ts: 8 tests (T1-T6) — MET-while-RUNNING, terminal-unfolded fold, idempotency, forged-claim fail-closed, FAILED→BLOCKED, non-MET §9 regression + MET-blocks-allocation + step-bound convergence. All green; P15.6/P15.10-D/P15.10-C/P15.5/WFV2-P3 regressions green. No merge/deploy."
 }

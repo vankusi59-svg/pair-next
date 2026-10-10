@@ -234,6 +234,14 @@ export class ObjectiveOperatingService {
     // the recommendation; pre-binding the result is non-authoritative.
     if (allTargetsMet) {
       if (binding) {
+        // P15.10 fold fix — MET short-circuits NEW work, never the
+        // bookkeeping of work already committed: fold IN_PROGRESS
+        // delegated children whose bound Missions are canonically
+        // terminal through the EXISTING §9 reconcile seam BEFORE the
+        // review observes the state. No allocation, no CEO call;
+        // syncWorkItem itself re-proves lineage and fails closed.
+        const obsMet = this.observe(objectiveId);
+        this.reconcileDelegatedChildren(ctx, obsMet, actor, authorityGate);
         this.tick(ctx);
         authorityGate?.();
         const review = await this.deps.review.runReview({ objective_id: objectiveId, actor,
