@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_9B5_2_ADMIN_PARITY",
-  "title": "P15.9-B5.2: /app/system/business-admin + /app/workforce/admin legacy admin parity",
+  "claim_id": "P15_9_B5_3_MISSION_OPS_TASK_ENTRY",
+  "title": "P15.9-B5.3: /app/missions* Mission Operations + Task Entry + Mission Detail (canonical reads)",
   "affected_surfaces": [
     "UI"
   ],
@@ -9,5 +9,5 @@
     "src/__tests__/pair-p12.test.ts"
   ],
   "invariants": [],
-  "description": "Legacy Business-tab parity on canonical APIs only (zero backend changes). /app/system/business-admin: create business (project_id verified via GET /api/projects, fail-closed when unavailable), inspect-by-id rendering biz.detail() bundle, global list labeled unfiltered. /app/workforce/admin bound to selected business: create org-agent (auto-contract), create work-item (never auto-opened), open/block/unblock/comment via pinned dialogs (open = HIGH-IMPACT), routine create+enable/disable, legacy objective labeled LEGACY compat. Dialogs pin {op,biz,target,payload}, invalidate on business change, dup-submit guarded, ambiguous wording on transport/5xx, same-business-only selects (backend FAIL_CLOSED_*_SCOPE authoritative). E2E workforce-admin.spec.ts covers the 19-item list. R1: SPA business switch wipes all business-dependent forms + submit() revalidates reports_to/assignee/objective_id; inspect clears stale detail + verifies returned id; sect() validates envelopes. R2: rowsOk() element-level validation on all collection boundaries — arrays with null/primitive/identity-less rows → MALFORMED, never silently filtered into a fake complete list; agents (primary) → fatal error; work_items/routines/objectives → per-section UNAVAILABLE; projects/businesses → blocks creation + unavailable list; businessDetail validates child collections (agents/objectives/routines/board) before render. Proof: tsc+vite PASS; playwright workforce-admin 12/12."
+  "description": "P15.9-B5.3 R1+R2+R3 \u2014 R1: lineage provenance, preview epoch pinning, collection validation, identity-pinned mutations. R2: per-request busy slots, lineage evidence validation, strict preview task contract. R3-F1: the ACTIVE preview request owns previewBusy via previewReq{id,AbortController} \u2014 invalidation aborts the obsolete fetch and releases the UI lock immediately so a fresh preview B starts while A is unresolved; aborted/obsolete requests never render, commit, or clear a newer request's busy state; confirmation POSTs are separate (never aborted/forgotten \u2014 single-flight confirmFlight + honest unknown outcome on mid-flight input change); exact pinned preview_id/plan_digest seam preserved; no automatic retries. UI-only; no backend/schema/dependency changes."
 }

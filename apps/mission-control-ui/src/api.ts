@@ -413,4 +413,93 @@ export const apiAdmin = {
       method: "POST",
       body: JSON.stringify(body),
     }, { noAuthPrompt: true }),
+
+  /* ---- P15.9-B5.3 — mission operations / task entry ---- */
+  /* GET /api/missions is a GLOBAL unfiltered listing — label, never
+     present as business-scoped. */
+  missions: (signal?: AbortSignal) =>
+    req<{ missions: import("./app/types").MissionRow[] }>(
+      "/missions",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  routing: (signal?: AbortSignal) =>
+    req<import("./app/types").RoutingProjection>(
+      "/routing",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  missionDetail: (id: string, signal?: AbortSignal) =>
+    req<import("./app/types").MissionDetail>(
+      `/missions/${encodeURIComponent(id)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  missionDag: (id: string, signal?: AbortSignal) =>
+    req<import("./app/types").Dag>(
+      `/missions/${encodeURIComponent(id)}/dag`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  missionTimeline: (id: string, signal?: AbortSignal) =>
+    req<import("./app/types").TimelineEntry[]>(
+      `/missions/${encodeURIComponent(id)}/timeline`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  missionEvidence: (id: string, signal?: AbortSignal) =>
+    req<Array<Record<string, unknown>>>(
+      `/missions/${encodeURIComponent(id)}/evidence`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  missionFiles: (id: string, signal?: AbortSignal) =>
+    req<{ files: import("./app/types").MissionFileRow[] }>(
+      `/missions/${encodeURIComponent(id)}/files`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  missionFile: (id: string, path: string, signal?: AbortSignal) =>
+    req<{ path: string; content: string; truncated: boolean }>(
+      `/missions/${encodeURIComponent(id)}/files?path=${encodeURIComponent(path)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  /* Preview persists a mission_plan_preview (READY). Confirm consumes
+     exactly that persisted preview — ONE seam, never both endpoints. */
+  previewMission: (body: {
+    project_id: string; goal: string;
+    granted_permissions?: string[]; authorized_workspaces?: string[];
+    risk_ceiling?: string; metadata?: Record<string, unknown>;
+  }, signal?: AbortSignal) =>
+    req<import("./app/types").MissionPreview>(
+      "/missions/preview",
+      { method: "POST", body: JSON.stringify(body), ...(signal ? { signal } : {}) },
+      { noAuthPrompt: true },
+    ),
+  confirmMission: (body: { preview_id: string; plan_digest: string }) =>
+    req<Record<string, unknown>>(
+      "/missions/confirm",
+      { method: "POST", body: JSON.stringify({ preview_id: body.preview_id, plan_digest: body.plan_digest }) },
+      { noAuthPrompt: true },
+    ),
+  planPreview: (id: string, signal?: AbortSignal) =>
+    req<Record<string, unknown>>(
+      `/plan-previews/${encodeURIComponent(id)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  missionAction: (id: string, action: "pause" | "resume" | "cancel" | "acknowledge") =>
+    req<Record<string, unknown>>(`/missions/${encodeURIComponent(id)}/${action}`, {
+      method: "POST",
+      body: "{}",
+    }, { noAuthPrompt: true }),
+  /* Scoped work-items read — used to prove mission→binding→work item→
+     objective lineage (R1-F1). business_id always required. */
+  workItems: (businessId: string, signal?: AbortSignal) =>
+    req<{ work_items: import("./app/types").WorkItemRow[] }>(
+      `/work-items?business_id=${encodeURIComponent(businessId)}`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
 };
