@@ -1,13 +1,21 @@
 {
-  "claim_id": "P15_9_B5_3_MISSION_OPS_TASK_ENTRY",
-  "title": "P15.9-B5.3: /app/missions* Mission Operations + Task Entry + Mission Detail (canonical reads)",
+  "claim_id": "P15_9_B5_4_CHAT_MODERNIZATION",
+  "title": "P15.9-B5.4: /app/chat — Conversation layer on the canonical P15.8 contract (AppShell)",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-8a-conversation-authority.test.ts",
+    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
     "src/__tests__/pair-p14-workforce-v2.test.ts",
     "src/__tests__/pair-p12.test.ts"
   ],
-  "invariants": [],
-  "description": "P15.9-B5.3 R1+R2+R3 \u2014 R1: lineage provenance, preview epoch pinning, collection validation, identity-pinned mutations. R2: per-request busy slots, lineage evidence validation, strict preview task contract. R3-F1: the ACTIVE preview request owns previewBusy via previewReq{id,AbortController} \u2014 invalidation aborts the obsolete fetch and releases the UI lock immediately so a fresh preview B starts while A is unresolved; aborted/obsolete requests never render, commit, or clear a newer request's busy state; confirmation POSTs are separate (never aborted/forgotten \u2014 single-flight confirmFlight + honest unknown outcome on mid-flight input change); exact pinned preview_id/plan_digest seam preserved; no automatic retries. UI-only; no backend/schema/dependency changes."
+  "invariants": [
+    "Conversation text is never execution authority: a turn mints at most a PENDING draft; only the pinned {session_id,draft_id,expected_digest} confirm POST executes.",
+    "One submit = one idempotency key; retries of the same body/session replay the SAME key; keys never cross sessions; no auto-retry on ambiguous outcomes.",
+    "Session switches invalidate display state instantly; late responses are generation+pinned-session gated and can never paint into another session.",
+    "Mutation POSTs that may have committed are never aborted — honest ambiguous-outcome notices + canonical refetch; reads are AbortController-scoped.",
+    "Malformed envelopes/rows go MALFORMED — never silently filtered into a complete-looking list; valid canonical empties stay genuinely empty."
+  ],
+  "description": "P15.9-B5.4 — ports the legacy P15.8 conversation UI to /app/chat inside AppShell: session sidebar (create/list/select/close, real titles/identities/counts, ?s= deep links, OPEN/CLOSED), chronological thread with role styling + MSG_PAGE=200 tail window + Load Earlier + message_id dedup, composer with single-flight idempotent turns, ambiguous-proposal project picker re-validated against canonical GET /api/projects, governed Mission Draft cards (all 6 states, exact persisted terms, expired/non-pending never confirmable), pinned ConfirmDialog confirm/reject + close, draft create/revise via supersedes_draft_id (new draft object, canonical defaults — nothing invented), confirmed-mission links to /app/missions/:id. Dedicated apiAdmin conversation wrappers suppress the legacy 401 window.prompt; legacy api/Chat.tsx/backend untouched. Per-op request ownership + AbortController for reads; possibly-committed POSTs never aborted. Element-level validation on sessions/messages/drafts/projects/proposals. UI-only; zero backend/schema/dependency changes."
 }
