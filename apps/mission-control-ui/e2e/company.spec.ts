@@ -75,9 +75,11 @@ test("company with real objectives: header, exact stats, unverified chips", asyn
   await expect(page.getByText("0/1 MET").first()).toBeVisible();
   // HALT lane: unavailable explanation, never a count
   await expect(page.getByText(/no HALT enumeration exists/)).toBeVisible();
-  // no owner-scoped enumeration, no mutations from the page
+  // no owner-scoped enumeration, no mutations from the page.
+  // company endpoint is read twice: the page itself + the B4 Inbox
+  // badge (proven pending count) — still no unscoped enumeration.
   expect(calls.filter((u) => u.includes("/api/businesses") && !u.includes("/company"))).toEqual([]);
-  expect(calls.filter((u) => u.includes("/api/vnext/businesses/"))).toHaveLength(1);
+  expect(calls.filter((u) => u.includes("/api/vnext/businesses/"))).toHaveLength(2);
 });
 
 test("non-owner business -> DeniedState (FAIL_CLOSED_COMPANY_SCOPE)", async ({ page }) => {
