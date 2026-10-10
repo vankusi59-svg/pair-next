@@ -142,18 +142,25 @@ export class ObjectiveCockpitService {
         String(a.review_id).localeCompare(String(b.review_id)));
   }
 
-  /** F4 — owner action is only pending while the objective can still
-   *  take a transition; a terminal objective (ACHIEVED/INFEASIBLE/
-   *  EXPIRED/CANCELLED) may carry a historical TARGET_MET_CANDIDATE
-   *  review, but nothing is actionable anymore. */
+  /** F4 + R3-F2 — owner action is pending only while the objective can
+   *  still take a transition AND the latest review still pins the
+   *  CURRENT objective authority. A terminal objective's historical
+   *  CANDIDATE review is not actionable; a review minted before an
+   *  owner amendment (terms_version bump / digest rebind / version
+   *  bump) is historical evidence, not a live approval request — its
+   *  pins provably diverge from the strict-read objective. */
   private static ownerActionPending(
-    objectiveStatus: string,
+    obj: Row,
     latest: Row | null,
   ): boolean {
+    if (latest === null || latest.owner_action_required !== true) return false;
+    if (TERMINAL_OBJECTIVE_STATUSES.has(String(obj.status) as ObjectiveStatus)) {
+      return false;
+    }
     return (
-      latest != null &&
-      latest.owner_action_required === true &&
-      !TERMINAL_OBJECTIVE_STATUSES.has(objectiveStatus as ObjectiveStatus)
+      Number(latest.objective_version) === Number(obj.version) &&
+      Number(latest.objective_terms_version) === Number(obj.terms_version) &&
+      String(latest.objective_digest) === String(obj.objective_digest)
     );
   }
 
@@ -388,7 +395,7 @@ export class ObjectiveCockpitService {
         // F4 — a terminal objective's historical CANDIDATE review is not
         // an actionable inbox item.
         owner_action_required:
-          ObjectiveCockpitService.ownerActionPending(objStatus, latest),
+          ObjectiveCockpitService.ownerActionPending(obj, latest),
         recommended_status: latest ? (latest.recommended_status ?? null) : null,
       },
       binding: obsOk
@@ -463,14 +470,18 @@ export class ObjectiveCockpitService {
     // candidate through the strict read before projecting: a tampered
     // or legacy row fails the whole company read closed rather than
     // silently entering the response.
-    const ownedAll = (this.deps.objectives.list(businessId) as Row[]).filter(
-      (o) => String(o.owner_authority_id) === actor,
-    );
-    // Every owned objective is strict-read — including the ones beyond
-    // the display cap, so the aggregate counts below are exact and a
-    // forged row anywhere in the business still fails closed.
-    const ownedStrict = ownedAll.map(
+    // F2/R3 — the tolerant list supplies candidate IDs ONLY. Filtering
+    // by owner on raw rows would silently omit a tampered objective
+    // (owner rewritten to someone else → filtered out before strict
+    // validation → company returns successfully with missing data).
+    // Strict-read EVERY objective in the business first — any corrupt
+    // row fails the whole read closed — then filter by the canonical
+    // owner claim.
+    const allStrict = (this.deps.objectives.list(businessId) as Row[]).map(
       (o) => this.deps.objectives.get(String(o.objective_id)) as Row,
+    );
+    const ownedStrict = allStrict.filter(
+      (o) => String(o.owner_authority_id) === actor,
     );
     if (ownedStrict.length === 0) {
       throw new IntegrityError(
@@ -521,8 +532,7 @@ export class ObjectiveCockpitService {
               outcome: String(latest.outcome),
               // F4 — no pending inbox on terminal objectives.
               owner_action_required:
-                ObjectiveCockpitService.ownerActionPending(
-                  String(o.status), latest),
+                ObjectiveCockpitService.ownerActionPending(o, latest),
               recommended_status: latest.recommended_status ?? null,
               created_at: String(latest.created_at),
             }
@@ -552,8 +562,7 @@ export class ObjectiveCockpitService {
         objectives_returned: summaries.length,
         targets_met_pending: enriched.filter(
           (e) =>
-            ObjectiveCockpitService.ownerActionPending(
-              String(e.o.status), e.latest),
+            ObjectiveCockpitService.ownerActionPending(e.o, e.latest),
         ).length,
       },
     };

@@ -811,6 +811,59 @@ describe("P15.9-A1 R2 — audit closure", () => {
   });
 });
 
+describe("P15.9-A1 R3 — final targeted closure", () => {
+  it("R3-F1 owner-tampered objective row → company detects corruption, never silently omits", () => {
+    const s = freshFullStack("r3f1");
+    const bid = mkBusiness(s);
+    const o1 = mkObjective(s, bid);
+    const o2 = mkObjective(s, bid);
+    // Tamper the raw owner claim — digest-bound term → strict read fails.
+    sqlRewriteEntity(s.store, "objective", String(o2.objective_id), (b) => {
+      b.owner_authority_id = "operator:intruder";
+    });
+    // Before the fix: the raw owner filter dropped o2 BEFORE validation
+    // → company returned 1 objective, silently incomplete. Now the
+    // whole read fails closed.
+    expect(() => s.cockpit.businessCompany(bid, OWNER)).toThrowError();
+    // The clean objective's own read is unaffected.
+    expect(() => s.cockpit.objectiveCockpit(String(o1.objective_id), OWNER))
+      .not.toThrowError();
+    s.store.close();
+  });
+
+  it("R3-F2 owner amend after CANDIDATE → stale pins: pending false, history retained", async () => {
+    const { s, oid, bid, binding, ops } = seeded("r3f2", ["a"]);
+    completeDeliverable(s, binding, "a");
+    // Owner-verified progress (no delegated grant) so the post-amend
+    // observation still re-proves — this test isolates pin staleness.
+    s.biz.objectives.recordProgress(oid, {
+      business_id: bid, kpi_id: KPI, value: 1,
+      evidence: { evidence_key: `ev-${counter}`, verifier: OWNER,
+        source: "operator:console" },
+      actor: OWNER });
+    await ops.service.runObjectivePass({ objective_id: oid, actor: OP });
+    const before = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect((before.lifecycle as Row).owner_action_required).toBe(true);
+    // Owner amends protected terms → terms_version/version/digest bump.
+    s.biz.objectives.amend(oid, {
+      business_id: bid, patch: { title: "revised scope" },
+      reason: "owner refined terms", actor: OWNER });
+    const after = s.cockpit.objectiveCockpit(oid, OWNER) as Record<string, never>;
+    expect((after.objective as Row).status).toBe("ACTIVE");
+    // The historical CANDIDATE review is retained verbatim…
+    expect(after.review_count).toBe(1);
+    expect((after.latest_review as Row).outcome).toBe("TARGET_MET_CANDIDATE");
+    expect((after.latest_review as Row).owner_action_required).toBe(true);
+    // …but its pins no longer match the objective → NOT pending.
+    expect((after.lifecycle as Row).owner_action_required).toBe(false);
+    const company = s.cockpit.businessCompany(bid, OWNER) as Record<string, never>;
+    expect((company.counts as Row).targets_met_pending).toBe(0);
+    const so = (company.objectives as Row[])[0]!;
+    expect((so.latest_review as Row).owner_action_required).toBe(false);
+    s.store.close();
+  });
+});
+
 /* ================= HTTP boundary ================= */
 
 const servers: Server[] = [];
