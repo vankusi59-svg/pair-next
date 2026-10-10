@@ -1,27 +1,28 @@
 {
-  "claim_id": "P15_10_C_FINAL_COST_HALT_HOTFIX",
-  "title": "P15.10-C FINAL hotfix: cost halt TOCTOU \u2014 in-txn halt re-check on authoritative billing",
+  "claim_id": "P15_10_D_R1_AUTHORITY_PROOF_HARDENING",
+  "title": "P15.10-D R1: artifact CAS re-verification + grant dedup + receipt-auth binding",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
-    "GATE_ROUTER",
-    "RECOVERY_REPLAY"
+    "ARTIFACT",
+    "GATE_ROUTER"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-10c-final-audit.test.ts",
-    "src/__tests__/pair-p15-10c-r4.test.ts",
-    "src/__tests__/pair-p15-10c-r3.test.ts",
-    "src/__tests__/pair-p15-10c-r2.test.ts",
-    "src/__tests__/pair-p15-10c-r1.test.ts",
-    "src/__tests__/pair-p15-10c.test.ts",
-    "src/__tests__/pair-p13.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-3-ceo-planning-cycle.test.ts",
+    "src/__tests__/pair-p15-10d-r1.test.ts",
+    "src/__tests__/pair-p15-10d.test.ts",
+    "src/__tests__/pair-p15-1-objective-authority.test.ts",
     "src/__tests__/pair-p15-5-kpi-review.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts"
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts",
+    "src/__tests__/pair-p15-10c.test.ts",
+    "src/__tests__/pair-p15-10c-r1.test.ts",
+    "src/__tests__/pair-p15-10c-r2.test.ts",
+    "src/__tests__/pair-p15-10c-r3.test.ts",
+    "src/__tests__/pair-p15-10c-r4.test.ts",
+    "src/__tests__/pair-p15-10c-final-audit.test.ts"
   ],
   "invariants": [],
   "risk_override": "HIGH",
-  "description": "FINAL hotfix on PR #87 (BASE 0e27bc6ee236d82633d4aee321ba9cd264adc0c3): Finding B CONFIRMED by prepatch FAIL \u2014 PAIR_COST_HALT=1, profile FREE flipped to METERED_API between the advisory billingFor() and the atomic txn produced a PAID reservation (HELD 400k) under an active halt; the halt check evaluated the stale advisory mode. Fix (only this boundary): inside store.immediate, after the authoritative in-txn billing re-resolve and after the resId adopt/deny re-check (adopting an already-committed reservation is not new spend), haltActive() is re-checked against the REAL in-txn billing.mode \u2014 METERED_API or UNKNOWN under halt -> FAIL_CLOSED_COST_HALT violation, no reservation row, denial evidence on the mission evidence stream. FREE/SUBSCRIPTION/UNMETERED semantics unchanged; advisory pre-check kept. Finding A verdict held: SAFE_BY_EXISTING_PROOF_WITH_TWO_INCONCLUSIVE_TAMPER_EDGES (A2a wob.mission_id unverified, A3b >8-hop claim + missing leaf alloc -> manual; both need non-canonical row writes \u2014 hardening notes only, objectiveScopeFor unchanged). Tests: B1 deny+no-row+evidence, B2 stable-metered deny, B3 no-halt flip pins new price; audit test file committed as evidence. No merge/deploy; driver OFF."
+  "description": "R1 on PR #88 (BASE 88470ee). F1 CONFIRMED+FIXED: verifiedUnits trusted artifact.state==ACCEPTED rows only — deleted/tampered retained CAS bytes still minted progress. Fix: the service takes ArtifactAuthority (canonical blobDir = PAIR_ARTIFACT_DIR ?? dbDir/artifacts/blobs, same resolver as telegram-delivery) and re-verifies every candidate via verifyArtifactForConsumption (acceptance history + canonical shape + retained bytes NOW) inside the same txn; corruption fails closed. F2 CONFIRMED+FIXED: grant() stored dedup_key but never consulted it — replay after revoke minted a fresh ENABLED grant. Fix: dedup scan inside the txn before the enabled-check — same (objective,key)+same semantics (business,kpi,rule_digest,expires_at,owner,created_by) returns the stored row (REVOKE durable), different semantics fails closed, dups converge. F3 CONFIRMED+FIXED in shared assertKpiVerifierAuthority: added receipt.authorization_id===verifier auth, receipt.evidence_key===claim key, receipt.rule_digest===grant.rule_digest — revoked-grant receipts and tampered grant rules no longer satisfy new verifiers; write path and P15.5 strict read share the contract. F4 VERIFIED (no change): revoke/expire after progress makes strict read fail closed FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW; persisted value untouched; owner re-verification recovers. F5 VERIFIED (documented): DELIVERABLE_BUNDLE proves canonical deliverable completion only; receipt.verified_units binds workstream/work_item/mission/artifact ids — no content semantics, no AI judge. R1 suite: 10 tests, prepatch FAIL→postpatch PASS; 22 original + 340 regressions green. No merge/deploy."
 }

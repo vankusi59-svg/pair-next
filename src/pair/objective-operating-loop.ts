@@ -24,8 +24,10 @@
  *    every committed authority is re-derived, never trusted.
  */
 
+import path from "node:path";
 import { IntegrityError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
+import { ArtifactAuthority } from "./artifact-authority.js";
 import type { BusinessLayer } from "./business.js";
 import {
   assertCanonicalMissionInFlight,
@@ -36,6 +38,7 @@ import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { WorkforceService } from "./work-graph.js";
 import type { CeoPlanningCycleService } from "./ceo-planning-cycle.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import { ObjectiveKpiVerificationService } from "./objective-kpi-verification.js";
 import { createDefaultCeoPlanningCycle } from "./ceo-runtime.js";
 import {
   assertCanonicalWorkforceAllocation,
@@ -104,6 +107,11 @@ export interface ObjectiveOperatingDeps extends ObjectiveAdaptiveReviewDeps {
   ceoCycle: CeoPlanningCycleService;
   review: ObjectiveAdaptiveReviewService;
   allocation: WorkforceAllocationService;
+  /** P15.10-D — canonical KPI verification seam. When present the pass
+   *  re-derives deliverable evidence ONCE per pass (bounded to existing
+   *  grants) before evaluating §6 targets. Absent = auto-verification
+   *  structurally off; nothing about the loop semantics changes. */
+  kpiVerification?: { advance(objectiveId: string): unknown };
 }
 
 /** R2.D — invocation-local step budget: a pass NEVER shares or resets
@@ -195,9 +203,18 @@ export class ObjectiveOperatingService {
     // §5 — pre-flight objective authority. P15.1 deadline semantics
     // only; never auto-transition ACHIEVED/INFEASIBLE/CANCELLED.
     this.deps.objectives.evaluateDeadline(objectiveId);
-    const objective = this.deps.objectives.get(objectiveId); // strict P15.1
+    let objective = this.deps.objectives.get(objectiveId); // strict P15.1
     if (String(objective.status) !== "ACTIVE") {
       return result("OBJECTIVE_NOT_ACTIVE");
+    }
+
+    // P15.10-D — re-derive verified deliverable evidence once per pass,
+    // BEFORE the §6 proofs read the KPI projection. Bounded to the
+    // grants already committed for this objective; throws on canonical
+    // corruption (fail closed, propagates like any §6 proof).
+    if (this.deps.kpiVerification) {
+      this.deps.kpiVerification.advance(objectiveId);
+      objective = this.deps.objectives.get(objectiveId); // strict re-read
     }
 
     // §6 — strict KPI + budget pre-flight: the EXACT P15.5 proofs.
@@ -662,7 +679,8 @@ export function createDefaultObjectiveOperatingService(deps: {
   workstreams: ObjectiveWorkstreamService;
   invoker?: CeoDecisionInvoker;
 }): { service: ObjectiveOperatingService; model_entry_id: string;
-  ceoCycle: CeoPlanningCycleService } {
+  ceoCycle: CeoPlanningCycleService;
+  kpiVerification: ObjectiveKpiVerificationService } {
   const { service: ceoCycle, model_entry_id } = createDefaultCeoPlanningCycle({
     store: deps.store,
     business: deps.business,
@@ -684,6 +702,19 @@ export function createDefaultObjectiveOperatingService(deps: {
     objectives: deps.objectives,
     workstreams: deps.workstreams,
   });
+  const kpiVerification = new ObjectiveKpiVerificationService({
+    store: deps.store,
+    objectives: deps.objectives,
+    workstreams: deps.workstreams,
+    business: deps.business,
+    artifacts: new ArtifactAuthority(deps.store, {
+      blobDir: path.join(
+        process.env.PAIR_ARTIFACT_DIR ??
+          path.join(deps.store.dbDir, "artifacts"),
+        "blobs",
+      ),
+    }),
+  });
   return {
     service: new ObjectiveOperatingService({
       store: deps.store,
@@ -694,7 +725,9 @@ export function createDefaultObjectiveOperatingService(deps: {
       ceoCycle,
       review,
       allocation,
+      kpiVerification,
     }),
+    kpiVerification,
     model_entry_id,
     ceoCycle, // P15.10-C R1 F1-D: lets the driver reconcile STARTED/UNKNOWN
               // attempts scoped to the objective before any new pass.
