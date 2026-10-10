@@ -3,6 +3,8 @@ import { Company } from "./pages/Company";
 import { ObjectiveDetail } from "./pages/ObjectiveDetail";
 import { ObjectiveList } from "./pages/ObjectiveList";
 import { PlannedPage } from "./pages/Planned";
+import { Inbox } from "./pages/Inbox";
+import { Ceo } from "./pages/Ceo";
 import { Reviews } from "./pages/Reviews";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
@@ -29,13 +31,7 @@ export const appRoute = {
     },
     {
       path: "inbox",
-      element: (
-        <PlannedPage
-          title="Owner Inbox"
-          detail="Three lanes — objective reviews pending sign-off, permission approvals, policy halts. HALT aggregation stays unavailable until a backend enumeration exists (API_MISSING — never a fabricated count)."
-          phase="B4"
-        />
-      ),
+      element: <Inbox />,
     },
     {
       path: "objectives",
@@ -51,13 +47,7 @@ export const appRoute = {
     },
     {
       path: "ceo",
-      element: (
-        <PlannedPage
-          title="CEO Workspace"
-          detail="Explains the autonomous layer: latest pass outcome, strategy revision, decisions via review rows (no dedicated decisions endpoint exists)."
-          phase="B4"
-        />
-      ),
+      element: <Ceo />,
     },
     {
       path: "workforce",

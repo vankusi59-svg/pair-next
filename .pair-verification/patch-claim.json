@@ -1,13 +1,13 @@
 {
-  "claim_id": "P15_9B3_OBJECTIVE_COCKPIT_UI",
-  "title": "P15.9-B3: /app/objectives* \u2014 objective list, detail & reviews on canonical cockpit reads",
+  "claim_id": "P15_9B4_INBOX_CEO",
+  "title": "P15.9-B4: /app/inbox Owner Inbox + /app/ceo CEO Workspace",
   "affected_surfaces": [
     "UI"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-9a-company-cockpit.test.ts",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
     "src/__tests__/pair-p15-10d-met-branch-fold.test.ts"
   ],
   "invariants": [],
-  "description": "R3 residual fix on B3. R3-F1: ObjectiveList creation now holds ONE dedup_key per logical attempt (attemptKey+attemptTerms refs) \u2014 an identical retry after a lost/ambiguous response reuses the same key and canonical terms so ObjectiveAuthorityService's exact-create replay converges to the same objective_id; the key rotates only when request terms change (deliberate new operation) and resets after confirmed canonical success or business switch; ConfirmDialog flow, biz isolation and prior R1/R2 guards unchanged. Adversarial e2e: real UI submit \u2192 backend commits \u2192 response poisoned to 502 \u2192 identical retry \u2192 both POSTs carry the SAME dedup_key \u2192 replay returns the SAME objective_id \u2192 business company shows exactly 1 objective \u2192 deliberate new creation gets a fresh key. Zero backend/deps. Proof: tsc+vite PASS; playwright 52/52 (objectives 20 + company 10 + app 12 + smoke 5 + chat 5) on real :8790."
+  "description": "B4 R3 residual. R3-F1 ABA lifecycle binding: every business transition starts a NEW request lifecycle \u2014 reqGen increments synchronously during render (derived-state pattern, no one-frame stale window) on every biz change, including A\u2192B\u2192A. Resolved counts bind {forBiz, forReq, forEpoch}; the render guard suppresses anything not produced by the current lifecycle, so an old A resolution can never repaint under A's later lifecycle, late/aborted responses never overwrite newer generations, previous-generation counts hide during invalidation refetches, and failed refetches render '!' (never stale/zero). One provider, canonical refetch, aborts, mobile parity, aria-live preserved; no polling, no new backend calls. Proof: tsc+vite PASS; playwright 75/75 (inbox-ceo 23 incl. ABA adversarial A(10)\u2192B-delayed\u2192A converging to new canonical 8 with late-B overwrite impossible, desktop+mobile parity) on real :8790."
 }
