@@ -24,7 +24,10 @@ export function withTokenQuery(url: string): string {
 
 let lastTokenPromptAt = 0;
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
+/* New /app/* surfaces may suppress the legacy 401 window.prompt + reload
+   (audit R1-F2): they render their own Unauthorized state instead. The
+   prompt behavior is unchanged for every other caller. */
+async function req<T>(path: string, init?: RequestInit, opts?: { noAuthPrompt?: boolean }): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json" };
   const op = getOperatorId();
   if (op) headers["x-operator-id"] = op;
@@ -40,7 +43,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!r.ok) {
     const e = body as { error?: string; detail?: string };
-    if (r.status === 401 && Date.now() - lastTokenPromptAt > 5000) {
+    if (r.status === 401 && !opts?.noAuthPrompt && Date.now() - lastTokenPromptAt > 5000) {
       lastTokenPromptAt = Date.now();
       const t = window.prompt("Mission Control access token:");
       if (t !== null) { setAuthToken(t); window.location.reload(); }
@@ -75,6 +78,10 @@ export const api = {
   routes: () => req<{ routes: Array<Record<string, unknown>>; model_bindings: Array<Record<string, unknown>>; routable_models: Array<Record<string, unknown>>; route_decisions: Array<Record<string, unknown>>; routing_decisions: Array<Record<string, unknown>> }>("/routes"),
   recovery: () => req<Record<string, unknown>>("/recovery"),
   approvals: () => req<Array<Record<string, unknown>>>("/approvals"),
+  /* /app/* surfaces suppress the legacy 401 prompt — same headers, same
+     endpoint, only the auth-prompt UX differs (audit R1 residual). */
+  approvalsNoPrompt: () =>
+    req<Array<Record<string, unknown>>>("/approvals", undefined, { noAuthPrompt: true }),
   previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; metadata?: Record<string, unknown> }) =>
     req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null }>("/missions/preview", {
       method: "POST",
@@ -126,6 +133,14 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  // P15.9-A1 — owner-scoped company projection (non-owner → 403
+  // FAIL_CLOSED_COMPANY_SCOPE; integrity → 500 FAIL_CLOSED_*)
+  businessCompany: (id: string, signal?: AbortSignal) =>
+    req<{ company: import("./app/types").CompanyPayload }>(
+      `/vnext/businesses/${encodeURIComponent(id)}/company`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
   // P15.10-A — objective auto-policy (owner-scoped; non-owner → 403)
   autoPolicyStatus: (id: string) =>
     req<{ auto_policy: import("./types").AutoPolicyStatus }>(

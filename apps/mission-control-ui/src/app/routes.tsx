@@ -1,4 +1,5 @@
 import { AppShell } from "./AppShell";
+import { Company } from "./pages/Company";
 import { PlannedPage } from "./pages/Planned";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
@@ -21,13 +22,7 @@ export const appRoute = {
     },
     {
       path: "company",
-      element: (
-        <PlannedPage
-          title="Company Cockpit"
-          detail="The owner's home: business + objective summaries, pending reviews, needs-you lanes. Reads GET /api/vnext/businesses/:id/company (owner-scoped, merged in A1)."
-          phase="B2"
-        />
-      ),
+      element: <Company />,
     },
     {
       path: "inbox",
