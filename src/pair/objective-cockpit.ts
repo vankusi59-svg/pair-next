@@ -34,7 +34,11 @@ import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import type { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
 import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
 import type { ArtifactAuthority } from "./artifact-authority.js";
-import { TERMINAL_OBJECTIVE_STATUSES, type ObjectiveStatus } from "./objective-authority.js";
+import {
+  OBJECTIVE_ENTITY,
+  TERMINAL_OBJECTIVE_STATUSES,
+  type ObjectiveStatus,
+} from "./objective-authority.js";
 import {
   assertCanonicalObjectiveBudget,
   assertCanonicalObjectiveKpiProgress,
@@ -470,24 +474,54 @@ export class ObjectiveCockpitService {
     // candidate through the strict read before projecting: a tampered
     // or legacy row fails the whole company read closed rather than
     // silently entering the response.
-    // F2/R3 — the tolerant list supplies candidate IDs ONLY. Filtering
-    // by owner or business on raw rows would silently omit a tampered
+    // F2/R3 — raw-claim filtering would silently omit a tampered
     // objective (owner rewritten → filtered before validation;
     // business_id rewritten → never enumerated under this business at
-    // all). Enumerate ALL objective rows, strict-read every one via
-    // objectives.get (canonical row + digest + anchor proof — a row
-    // whose business_id/owner was forged fails closed), then filter by
-    // the PROVEN canonical claims. Scope consequence: this read is
-    // org-wide fail-closed — a corrupt objective anywhere fails every
-    // company read; that is the price of an honest scope proof, and
-    // the only alternative is trusting raw business_id again.
-    const allStrict = (this.deps.objectives.list() as Row[]).map(
-      (o) => this.deps.objectives.get(String(o.objective_id)) as Row,
-    );
-    const ownedStrict = allStrict.filter(
-      (o) => String(o.business_id) === businessId &&
-        String(o.owner_authority_id) === actor,
-    );
+    // all; objective_id rewritten → get() fetches the VICTIM row
+    // twice and the forged row is never validated). Enumerate by
+    // PERSISTED entity key instead: entityPage proves the stored
+    // entity_id column ↔ payload.entity_id ↔ payload_hash ↔ version
+    // are consistent, so a forged entity_id claim fails closed at
+    // enumeration. Then strict-read EVERY actual stored row by its
+    // proven key (never by the payload-claimed objective_id) and
+    // require objective_id === key — a payload identity alias fails
+    // closed even if its digest was recomputed to self-verify.
+    // Scope consequence: org-wide fail-closed — one corrupt objective
+    // anywhere fails every company read; that is the price of an
+    // honest scope proof and there is no smaller honest alternative.
+    const allStrict: Row[] = [];
+    let after = "";
+    for (;;) {
+      const page = this.store.entityPage<Row>({
+        entity_type: OBJECTIVE_ENTITY,
+        after_id: after,
+        limit: 1024,
+      });
+      if (page.length === 0) break;
+      for (const p of page) {
+        const key = String(p.entity_id); // proven === persisted key
+        const strict = this.deps.objectives.get(key) as Row;
+        if (String(strict.objective_id) !== key) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_COCKPIT_IDENTITY",
+            `${key}: payload objective_id=${String(strict.objective_id)}`,
+          );
+        }
+        allStrict.push(strict);
+      }
+      after = String(page[page.length - 1]!.entity_id);
+    }
+    const ownedStrict = allStrict
+      .filter(
+        (o) => String(o.business_id) === businessId &&
+          String(o.owner_authority_id) === actor,
+      )
+      // Preserve the previous created_at ordering (entityPage yields
+      // entity_id order) so the display page is deterministic.
+      .sort((a, b) =>
+        String(a.created_at).localeCompare(String(b.created_at)) ||
+        String(a.objective_id).localeCompare(String(b.objective_id)),
+      );
     if (ownedStrict.length === 0) {
       throw new IntegrityError(
         "FAIL_CLOSED_COMPANY_SCOPE",

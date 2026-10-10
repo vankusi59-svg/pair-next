@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_9A_COMPANY_COCKPIT_READ_PROJECTIONS_R3B",
-  "title": "P15.9-A1 R3b: org-wide strict-read enumeration \u2014 raw business_id prefilter bypass closed",
+  "claim_id": "P15_9A_COMPANY_COCKPIT_READ_PROJECTIONS_R3C",
+  "title": "P15.9-A1 R3c: entity-key enumeration \u2014 raw objective_id alias bypass closed",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL"
@@ -16,5 +16,5 @@
   ],
   "invariants": [],
   "risk_override": "MEDIUM",
-  "description": "R3 residual on PR #91 (BASE e24e334); R1/R2/R3 preserved. businessCompany previously called objectives.list(businessId) \u2014 a raw business_id prefilter BEFORE strict validation, so an objective whose business_id was tampered vanished from the company read without failing closed. Now the projection enumerates ALL objective rows unscoped, strict-reads every one via objectives.get (canonical row + digest + anchor proof; business_id is digest-bound so a forge fails closed), and only then filters by the PROVEN canonical business_id + owner. Scope consequence (documented, no smaller honest alternative): the read is org-wide fail-closed \u2014 one corrupt objective anywhere fails every company read. R3-F2 pin-freshness unchanged. Tests 26/26 incl. adversarial business_id tamper between two businesses \u2014 both source and target company reads fail closed; all prior negatives preserved. No authority-semantics change; no UI/A2; no CEO/Router/Executor/KPI/Telegram. No merge/deploy."
+  "description": "R3b residual on PR #91 (BASE e24e334); R1/R2/R3 preserved. businessCompany previously enumerated objectives.list() and called objectives.get(o.objective_id) on the raw payload claim: rewriting OBJ_B.payload.objective_id to OBJ_A made get fetch the victim row twice and the forged row was never validated. Now enumeration runs through store.entityPage (proves persisted entity_id key == payload.entity_id == payload_hash == version), every actual stored row is strict-read by its PROVEN key via objectives.get, and the row's claimed objective_id must equal that key \u2014 a payload identity alias fails closed even with a recomputed digest. Scope: org-wide fail-closed (documented). Adversarial tests: objective_id alias to victim, forged entity_id, plus all prior R1-R3 negatives. Tests 28/28; regressions 211; tsc+build+verify:change READY. No authority-semantics change; no UI/A2; no CEO/Router/Executor/KPI/Telegram. No merge/deploy."
 }

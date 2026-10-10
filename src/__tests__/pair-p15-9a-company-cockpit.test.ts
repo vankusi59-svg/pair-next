@@ -853,6 +853,42 @@ describe("P15.9-A1 R3 — final targeted closure", () => {
     s.store.close();
   });
 
+  it("R3-F1c objective_id alias forgery → company fails closed, never validates victim twice", () => {
+    const s = freshFullStack("r3f1c");
+    const bid = mkBusiness(s);
+    const o1 = mkObjective(s, bid);
+    const o2 = mkObjective(s, bid);
+    // Attacker rewrites OBJ_B's claimed identity to OBJ_A. Under the
+    // old path list() would hand us "o1" twice — get(o1) fetches the
+    // real row both times and o2's forged row is never validated.
+    sqlRewriteEntity(s.store, "objective", String(o2.objective_id), (b) => {
+      b.objective_id = String(o1.objective_id);
+    });
+    // entityPage enumerates by the PERSISTED key (o2's real entity_id):
+    // get(o2key) strict-reads the forged row — objective_id claim
+    // mismatches the proven key → fail closed, not duplicate o1.
+    expect(() => s.cockpit.businessCompany(bid, OWNER)).toThrowError();
+    expect(() => s.cockpit.objectiveCockpit(String(o1.objective_id), OWNER))
+      .not.toThrowError();
+    s.store.close();
+  });
+
+  it("R3-F1d payload entity_id forgery → enumeration itself fails closed", () => {
+    const s = freshFullStack("r3f1d");
+    const bid = mkBusiness(s);
+    const o1 = mkObjective(s, bid);
+    mkObjective(s, bid);
+    // payload.entity_id is injected by store.put and proven === the
+    // persisted entity key by entityPage — a forged claim breaks the
+    // enumeration-level hash/identity check before any strict read.
+    sqlRewriteEntity(s.store, "objective", String(o1.objective_id), (b) => {
+      b.entity_id = "OBJ_FORGED_ALIAS";
+    });
+    expect(() => s.cockpit.businessCompany(bid, OWNER))
+      .toThrowError(/ENTITY_HASH_MISMATCH|FAIL_CLOSED/);
+    s.store.close();
+  });
+
   it("R3-F2 owner amend after CANDIDATE → stale pins: pending false, history retained", async () => {
     const { s, oid, bid, binding, ops } = seeded("r3f2", ["a"]);
     completeDeliverable(s, binding, "a");
