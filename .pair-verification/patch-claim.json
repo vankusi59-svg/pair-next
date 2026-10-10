@@ -1,20 +1,20 @@
 {
-  "claim_id": "P15_10_MET_BRANCH_LIFECYCLE_FOLD_HOTFIX",
-  "title": "P15.10 MET-branch hotfix: fold delegated children before TARGET_MET_CANDIDATE review",
+  "claim_id": "P15_9A_COMPANY_COCKPIT_READ_PROJECTIONS_R3C",
+  "title": "P15.9-A1 R3c: entity-key enumeration \u2014 raw objective_id alias bypass closed",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
-    "RECOVERY_REPLAY"
+    "MISSION_CONTROL"
   ],
   "required_tests": [
+    "src/__tests__/pair-p15-9a-company-cockpit.test.ts",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
     "src/__tests__/pair-p15-10d-met-branch-fold.test.ts",
     "src/__tests__/pair-p15-10d.test.ts",
     "src/__tests__/pair-p15-10d-r1.test.ts",
     "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-p15-5-kpi-review.test.ts",
-    "src/__tests__/pair-p15-10c.test.ts",
-    "src/__tests__/pair-p14-wfv2-p3.test.ts"
+    "src/__tests__/pair-p15-5-kpi-review.test.ts"
   ],
   "invariants": [],
   "risk_override": "MEDIUM",
-  "description": "Forensic-confirmed defect on BASE 95c7a71: ObjectiveOperatingLoop.pass() early-returns TARGET_MET_CANDIDATE at the allTargetsMet gate (§6) BEFORE §9 reconcileDelegatedChildren — the only runtime fold seam for IN_PROGRESS delegated children with terminal bound missions. Once KPI is MET the seam is unreachable; a child left IN_PROGRESS with a COMPLETED bound mission never folds at runtime (live evidence: DL_aec59cae in P15.10-D Core E2E V3; KPI MET 04:43:15Z, mission terminal 04:44:25Z — fold window never existed). Fix (minimal, audit-proposed): inside the allTargetsMet+binding branch, re-derive the canonical observation and call the EXISTING reconcileDelegatedChildren BEFORE the deterministic P15.5 review commits. Reconcile only touches INTERVENTION+IN_PROGRESS children whose bound missions are canonically terminal; syncWorkItem re-proves lineage and materializes WCP only when provable (FAILED→BLOCKED, review-required→REVIEW_REQUIRED, forged claims→quarantine/fail-closed). Non-MET flow byte-identical. Suite pair-p15-10d-met-branch-fold.test.ts: 8 tests (T1-T6) — MET-while-RUNNING, terminal-unfolded fold, idempotency, forged-claim fail-closed, FAILED→BLOCKED, non-MET §9 regression + MET-blocks-allocation + step-bound convergence. All green; P15.6/P15.10-D/P15.10-C/P15.5/WFV2-P3 regressions green. No merge/deploy."
+  "description": "R3b residual on PR #91 (BASE e24e334); R1/R2/R3 preserved. businessCompany previously enumerated objectives.list() and called objectives.get(o.objective_id) on the raw payload claim: rewriting OBJ_B.payload.objective_id to OBJ_A made get fetch the victim row twice and the forged row was never validated. Now enumeration runs through store.entityPage (proves persisted entity_id key == payload.entity_id == payload_hash == version), every actual stored row is strict-read by its PROVEN key via objectives.get, and the row's claimed objective_id must equal that key \u2014 a payload identity alias fails closed even with a recomputed digest. Scope: org-wide fail-closed (documented). Adversarial tests: objective_id alias to victim, forged entity_id, plus all prior R1-R3 negatives. Tests 28/28; regressions 211; tsc+build+verify:change READY. No authority-semantics change; no UI/A2; no CEO/Router/Executor/KPI/Telegram. No merge/deploy."
 }

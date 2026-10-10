@@ -367,6 +367,31 @@ export class ObjectiveAutoDriverService {
     });
   }
 
+  /** P15.9-A1 R1 F1 — read-only status: identical projection to
+   *  status() but the owner proof goes through policy.statusReadOnly,
+   *  so NO lazy expiry write can be triggered by a GET. Driver state
+   *  itself carries no expiry semantics — only the policy call wrote. */
+  statusReadOnly(objectiveId: string, actor: string): Record<string, unknown> {
+    return this.deps.store.immediate(() => {
+      this.deps.policy.statusReadOnly(objectiveId, actor); // owner proof, no writes
+      const st = this.readState(objectiveId);
+      const lease = readSchedulerRow<Row>(this.deps.store, LEASE_STATE, objectiveId) as
+        unknown as LeaseRow | null;
+      return {
+        objective_id: objectiveId,
+        enabled: true,
+        last_outcome: st?.last_outcome ?? null,
+        last_result: st?.last_result ?? null,
+        last_fence: st?.last_fence ?? null,
+        admissions: (st?.admissions as unknown[])?.slice(-8) ?? [],
+        denials: (st?.denials as unknown[])?.slice(-8) ?? [],
+        lease: lease
+          ? { state: lease.state, fence: lease.fence, expires_at: lease.expires_at }
+          : null,
+      };
+    });
+  }
+
   /** Deployment-level status for readiness projections. */
   driverStatus(): Record<string, unknown> {
     return {

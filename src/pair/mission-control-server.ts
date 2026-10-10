@@ -34,6 +34,8 @@ import {
   createDefaultObjectiveOperatingService,
   type ObjectiveOperatingService,
 } from "./objective-operating-loop.js";
+import { ObjectiveCockpitService } from "./objective-cockpit.js";
+import type { ArtifactAuthority } from "./artifact-authority.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -107,7 +109,12 @@ export interface MissionControlServerDeps {
    *  in the serve script); absent → scheduler status keeps reporting
    *  driver_ready:false and the auto-driver route 404s. Read-only
    *  surface — no mutating driver route exists. */
-  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "driverStatus" | "readiness">;
+  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "statusReadOnly" | "driverStatus" | "readiness">;
+  /** P15.9-A1 — canonical artifact verification authority used by the
+   *  cockpit projection to re-prove producer/execution/mission binding
+   *  + retained CAS bytes NOW (service.artifacts). Absent → artifacts
+   *  render as unverified-dropped in the cockpit. */
+  artifacts?: ArtifactAuthority;
   /** TEST-ONLY: deterministic CEO decision transport for the
    *  lazily-composed operating service. Production bootstrap never
    *  sets it (the route resolves the real codex-cli model); HTTP
@@ -370,6 +377,7 @@ export function createMissionControlServer(
   // no driver). Owner proof comes ONLY from the trusted x-operator-id
   // header — a body-declared owner field is never authority here.
   let autoPolicySvc: ObjectiveAutoPolicyService | null = null;
+  let cockpitSvc: ObjectiveCockpitService | null = null;
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
@@ -1398,6 +1406,104 @@ export function createMissionControlServer(
           })),
         });
       }
+      // ----- P15.9-A1 — Company Cockpit canonical read projections ----
+      // READ-ONLY: selective fields composed through existing strict
+      // reads. Same owner-scope contract as auto-policy/kpi-verification:
+      // actor is derived from x-operator-id (never a body field), and the
+      // projection serves only owner_authority_id matches — foreign
+      // objectives/businesses fail closed. MC token remains the transport
+      // credential; no new authorization mechanism is claimed here.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/cockpit$/);
+      if (method === "GET" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "COCKPIT_DISABLED" });
+        }
+        const actor = String(req.headers["x-operator-id"] ?? "");
+        if (!actor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        cockpitSvc ??= new ObjectiveCockpitService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
+            deps.store, biz.objectives),
+          autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
+        });
+        const cockpitActor = actor.startsWith("operator:")
+          ? actor : `operator:${actor}`;
+        return void json(res, 200, {
+          cockpit: cockpitSvc.objectiveCockpit(m[1]!, cockpitActor),
+        });
+      }
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/reviews$/);
+      if (method === "GET" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "COCKPIT_DISABLED" });
+        }
+        const actor = String(req.headers["x-operator-id"] ?? "");
+        if (!actor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        cockpitSvc ??= new ObjectiveCockpitService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
+            deps.store, biz.objectives),
+          autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
+        });
+        const reviewsActor = actor.startsWith("operator:")
+          ? actor : `operator:${actor}`;
+        const limitParam = url.searchParams.get("limit");
+        const limit = limitParam === null ? 50 : Number(limitParam);
+        if (!Number.isFinite(limit) || limit < 1) {
+          return void json(res, 400, { error: "FAIL_CLOSED_COCKPIT_LIMIT" });
+        }
+        return void json(res, 200,
+          cockpitSvc.objectiveReviews(m[1]!, reviewsActor, limit));
+      }
+      m = p.match(/^\/api\/vnext\/businesses\/([^/]+)\/company$/);
+      if (method === "GET" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "COCKPIT_DISABLED" });
+        }
+        const actor = String(req.headers["x-operator-id"] ?? "");
+        if (!actor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        cockpitSvc ??= new ObjectiveCockpitService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
+            deps.store, biz.objectives),
+          autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
+        });
+        const companyActor = actor.startsWith("operator:")
+          ? actor : `operator:${actor}`;
+        return void json(res, 200, {
+          company: cockpitSvc.businessCompany(m[1]!, companyActor),
+        });
+      }
       if (method === "GET" && p === "/api/budgets") {
         const bid = url.searchParams.get("business_id") ?? undefined;
         return void json(res, 200, { budgets: biz ? biz.listBudgetPolicies(bid) : [] });
@@ -1684,7 +1790,9 @@ export function createMissionControlServer(
       const status =
         e.code === "FAIL_CLOSED_OPERATOR_ID_REQUIRED" ||
         e.code === "FAIL_CLOSED_POLICY_FORBIDDEN" ||
-        e.code === "FAIL_CLOSED_POLICY_OWNER" ? 403
+        e.code === "FAIL_CLOSED_POLICY_OWNER" ||
+        e.code === "FAIL_CLOSED_COCKPIT_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_COMPANY_SCOPE" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
         : 500;

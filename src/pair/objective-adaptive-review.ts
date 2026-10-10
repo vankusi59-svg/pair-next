@@ -528,7 +528,7 @@ function anchorAttributedCandidates(
  *  strict-validated — the ONLY history a bootstrap decision may trust.
  *  Exported for P15.6 (§8). */
 export function canonicalAdaptiveReviewsFor(
-  deps: ObjectiveAdaptiveReviewDeps,
+  deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">,
   objectiveId: string,
 ): Row[] {
   const rows = anchorAttributedCandidates(
@@ -543,7 +543,7 @@ export function canonicalAdaptiveReviewsFor(
  *  previous). Every attributed row is strict-validated; a malformed
  *  one is corrupt authority and fails closed, never skipped. */
 function canonicalStrategyChain(
-  deps: ObjectiveAdaptiveReviewDeps,
+  deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">,
   objectiveId: string,
 ): { head: Row | null; all: Row[] } {
   const all = anchorAttributedCandidates(
@@ -560,7 +560,7 @@ function canonicalStrategyChain(
   return { head: heads[0]!, all };
 }
 
-function walDeps(deps: ObjectiveAdaptiveReviewDeps): WorkforceAllocationDeps {
+function walDeps(deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">): WorkforceAllocationDeps {
   return {
     store: deps.store,
     business: deps.business,
@@ -574,7 +574,10 @@ function walDeps(deps: ObjectiveAdaptiveReviewDeps): WorkforceAllocationDeps {
  *  produced through canonical strict reads/proofs — nothing trusts a
  *  mutable mirror. Throws fail-closed on any corrupt authority. */
 export function buildReviewObservation(
-  deps: ObjectiveAdaptiveReviewDeps,
+  // Read-only seam: the observation never invokes the CEO cycle, so
+  // callers without a model path (e.g. the A1 cockpit projection) may
+  // pass read deps lacking `ceoCycle`. Full deps still satisfy this.
+  deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">,
   objectiveId: string,
 ): { observation: ReviewObservation; digest: string } {
   const objective = deps.objectives.get(objectiveId); // strict P15.1 read
@@ -947,7 +950,7 @@ function proveSingleAnchor(
  *  revision (review⇄strategy mutual proof stays acyclic: the
  *  strategy's local read calls THIS function). */
 export function assertCanonicalAdaptiveReviewLocal(
-  deps: ObjectiveAdaptiveReviewDeps,
+  deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">,
   row: Row,
 ): void {
   for (const k of Object.keys(row)) {
@@ -1086,7 +1089,7 @@ export function assertCanonicalAdaptiveReviewLocal(
  *  local read PLUS — for PRIORITIZE_EXISTING — resolution and strict
  *  validation of the pinned strategy revision. */
 export function assertCanonicalAdaptiveReview(
-  deps: ObjectiveAdaptiveReviewDeps,
+  deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">,
   row: Row,
 ): void {
   assertCanonicalAdaptiveReviewLocal(deps, row);
@@ -1106,7 +1109,7 @@ export function assertCanonicalAdaptiveReview(
  *  PLUS a bounded (≤32), acyclic walk re-proving the whole previous
  *  chain — a malformed predecessor fails the latest revision closed. */
 export function assertCanonicalStrategyRevision(
-  deps: ObjectiveAdaptiveReviewDeps,
+  deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">,
   row: Row,
 ): void {
   assertCanonicalStrategyRevisionLocal(deps, row);
@@ -1145,7 +1148,7 @@ export function assertCanonicalStrategyRevision(
  *  against its source review + CEO decision + P15.2 binding. The
  *  previous-chain walk lives in the public validator. */
 function assertCanonicalStrategyRevisionLocal(
-  deps: ObjectiveAdaptiveReviewDeps,
+  deps: Omit<ObjectiveAdaptiveReviewDeps, "ceoCycle">,
   row: Row,
 ): void {
   for (const k of Object.keys(row)) {
