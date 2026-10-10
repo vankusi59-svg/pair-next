@@ -191,3 +191,123 @@ export interface CockpitPayload {
   } | null;
   auto_driver: { status: unknown } | null;
 }
+
+/* ---- P15.9-B5.1 — AI Workforce payloads.
+   Mirrors business.ts org_agent / work_item rows, agent-contract.ts
+   inspect(), inboxForAgent() and work-graph.ts workGraph(). */
+
+export interface OrgAgentRow {
+  agent_id: string;
+  business_id: string;
+  title: string;
+  department: string;
+  role: string;
+  reports_to: string | null;
+  executor_binding: string | null;
+  capabilities: string[];
+  status: string; /* ACTIVE | PAUSED | TERMINATED */
+  context_notes?: unknown[];
+  created_at: string;
+  version: number;
+}
+
+export interface WorkItemRow {
+  work_item_id: string;
+  business_id: string;
+  title: string;
+  goal: string;
+  department: string;
+  assignee_agent_id: string | null;
+  objective_id: string | null;
+  routine_id: string | null;
+  priority: number;
+  source: string;
+  required_capability: string | null;
+  parent_work_item_id: string | null;
+  delegated_from_work_item_id: string | null;
+  delegated_by_agent_id: string | null;
+  delegation_reason: string | null;
+  delegation_depth: number;
+  decomposition_id: string | null;
+  requires_review: boolean;
+  reviewer_agent_id: string | null;
+  blocked_code: string | null;
+  status: string; /* BACKLOG|READY|IN_PROGRESS|REVIEW_REQUIRED|BLOCKED|DONE|CANCELLED */
+  mission_ids: string[];
+  claimed_by: string | null;
+  claim_expires_at: string | null;
+  result_summary: string | null;
+  created_at: string;
+  updated_at: string;
+  version: number;
+  /* server strips claim_token on every non-claim response — never render it */
+  claim_token?: string | null;
+  dependencies_satisfied?: boolean;
+}
+
+export interface AgentContractPolicy {
+  allowed_capabilities: string[] | null;
+  denied_capabilities: string[];
+  allowed_executor_ids: string[] | null;
+  denied_executor_ids: string[];
+  preferred_executor_ids: string[];
+  executor_fallback_allowed: boolean;
+  preferred_route_ids: string[];
+  denied_route_ids: string[];
+  route_fallback_allowed: boolean;
+  allowed_project_ids: string[] | null;
+  allowed_context_scopes: string[];
+}
+
+export interface AgentContractRow {
+  contract_id: string;
+  org_agent_id: string;
+  business_id: string;
+  contract_version: number;
+  contract_digest: string;
+  schema_version?: string;
+  status: string; /* ACTIVE | DISABLED */
+  policy: AgentContractPolicy;
+  version: number;
+  updated_at?: string;
+}
+
+/* GET /api/org-agents/:id/effective-policy — inspect() shape;
+   500 FAIL_CLOSED_AGENT_CONTRACT_MISSING when unmaterialized. */
+export interface AgentEffectivePolicy {
+  org_agent_id: string;
+  agent_status: string;
+  business_id: string;
+  contract_id: string;
+  status: string;
+  contract_version: number;
+  contract_digest: string;
+  policy: AgentContractPolicy;
+  version: number;
+  updated_at: string;
+}
+
+export interface AgentInboxMessage {
+  message_id: string;
+  business_id: string;
+  work_item_id: string | null;
+  sender_type: string; /* AGENT | OPERATOR */
+  sender_agent_id: string | null;
+  sender_operator_id: string | null;
+  recipient_agent_id: string;
+  kind: string;
+  body: string;
+  correlation_id: string | null;
+  created_at: string;
+  receipt_status?: string; /* PENDING | ACKED | CORRUPT */
+  state?: string;
+  corrupt?: boolean;
+}
+
+export interface WorkGraphPayload {
+  nodes: WorkItemRow[];
+  edges: Array<Record<string, unknown>>;
+  delegations: Array<Record<string, unknown>>;
+  decompositions: Array<Record<string, unknown>>;
+  dependency_sets: Array<Record<string, unknown>>;
+}
