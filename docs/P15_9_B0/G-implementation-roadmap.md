@@ -6,9 +6,11 @@ doc) is the only design-only PR.
 
 ## PR B1 — New shell + design tokens (foundation)
 
-- **Scope**: `AppShell` (sidebar, business switcher stub, inbox badge stub,
-  operator chip, theme toggle), CSS token file, `/app/*` route tree with
-  placeholder pages, gloss map `lib/gloss.ts`, responsive grid.
+- **Scope**: `AppShell` (sidebar, business switcher per seed contract B.5.3,
+  inbox badge stub, operator chip, theme toggle), CSS token file, `/app/*`
+  route tree with placeholder pages, gloss map `lib/gloss.ts`, responsive
+  grid. Switcher persists a manual/last-used `business_id` — no
+  `/api/businesses` enumeration (unfiltered).
 - **Files**: `apps/mission-control-ui/src/{app/AppShell.tsx, app/routes.tsx,
   styles/tokens.css, lib/gloss.ts}`; `main.tsx` mounts both trees.
 - **Deps**: none. **Risks**: route-tree regression → e2e smoke covers old
@@ -61,18 +63,33 @@ doc) is the only design-only PR.
   (owner-scoped, canonical `transitionStatus`/`amend` only — no new authority).
 - **Note**: independent of B-PRs; Inbox/Detail enable buttons when it merges.
 
+## Backend gaps named by B0 (NOT built in B — separate backend PRs)
+
+Owner-scoped business enumeration, business-scoped approvals queue, server-side
+`business_id` filter on `/api/org-agents`, HALT/policy-state aggregation across
+owned objectives, business-scoped activity feed, ledger-row drill-down,
+CEO-decision browse. Until each ships, the UI renders the verified
+partial-scoped behavior in E — labeled, never faked.
+
 ## PR B5 — Workforce + Mission Ops port + System pages
 
-- **Scope**: `/app/workforce` (agents, contracts, inbox, work-items),
-  `/app/missions*` port, `/app/system/*` ports (providers, observability,
-  schedules, cost read, settings incl. token editor).
-- **Deps**: B4. **Risks**: porting parity — matrix checklist.
+- **Scope**: `/app/workforce` (agents — client-side `business_id` filter,
+  contracts, inbox, work-items), `/app/missions*` port, `/app/system/*`
+  ports (providers, observability, schedules, cost read, settings incl.
+  token editor) **+ legacy `UI_HTML` admin port** (business/org-agent/
+  work-item creation — the parity precondition that lets a staticDir
+  deployment live without a second bare-server instance).
+- **Deps**: B4. **Risks**: porting parity — matrix checklist; `UI_HTML` is
+  unreachable in the SPA deployment today, so parity failure = a documented
+  second no-`staticDir` instance, not silent loss.
 - **Verify**: existing e2e moved to `/app/*` equivalents + old-route smoke.
 
 ## PR B6 — Cutover preparation + polish
 
-- **Scope**: preservation-matrix sign-off page(s), redirects from old routes
-  → new (opt-in behind flag), visual/accessibility pass, final E2E matrix.
+- **Scope**: preservation-matrix sign-off page(s) — INCLUDING the `UI_HTML`
+  admin parity verdict (ported / second bare-server documented), redirects
+  from old routes → new (opt-in behind flag), visual/accessibility pass,
+  final E2E matrix.
 - **Deps**: B5. Cutover itself = separate Owner decision post-acceptance.
 
 ## Cross-cutting verification

@@ -8,11 +8,19 @@ Baseline: `staging/pr59-safe` @ `2232955` (post PR #91).
    statically when `deps.staticDir` is set; deep-link fallback serves the SPA
    for any non-`/api` GET. This is the production operator UI.
 2. **Legacy `UI_HTML`** — a ~250-line server-rendered single-page app embedded in
-   `src/pair/mission-control-server.ts` (served at `/` and `/ui` when no
-   `staticDir`). It implements Business/org-agent/work-item CRUD inline
-   (`mkBiz`, `mkAg`, `mkWi`, `openWi`, `wiBlock`, …). It is the ONLY UI today
-   that can create businesses, org agents, and work items — capabilities the
-   React SPA never gained.
+   `src/pair/mission-control-server.ts` (served at `/` and `/ui` **only when
+   `deps.staticDir` is unset**). It implements Business/org-agent/work-item CRUD
+   inline (`mkBiz`, `mkAg`, `mkWi`, `openWi`, `wiBlock`, …). It is the ONLY UI
+   today that can create businesses, org agents, and work items — capabilities
+   the React SPA never gained.
+
+   **Verified serving behavior (design review R1):** when `staticDir` is set,
+   `tryStatic("/ui")` finds no file and falls back to `index.html` — `/ui`
+   serves the **SPA**, not `UI_HTML`. The legacy HTML UI is only reachable on a
+   server run *without* `staticDir` (bare-server mode). Do not promise
+   simultaneous access to legacy HTML in the SPA deployment: today that means
+   running a second no-`staticDir` instance; long-term it means porting the
+   admin capabilities (porting debt is a cutover precondition, not optional).
 
 > Audit consequence: the migration plan must port the business-admin capabilities
 > out of `UI_HTML` into the new UI (or declare them intentionally dropped), and
@@ -56,6 +64,17 @@ Full API surface verified in `mission-control-server.ts`:
 - **P15.9-A1 cockpit (merged PR #91, owner-scoped read-only)**:
   `GET /api/vnext/objectives/:id/cockpit`, `/reviews?limit=`,
   `GET /api/vnext/businesses/:id/company`.
+
+**Scope boundaries (verified R1 — no multi-tenant claims):**
+- `GET /api/businesses` → `biz.listBusinesses()` **unfiltered** — NOT an
+  owner-scoped list; never use it to enumerate "owner's businesses".
+- `GET /api/approvals` → `c.approvals()` **global queue**, not business-scoped.
+- `GET /api/org-agents` → `biz.listOrgAgents()` **unfiltered** — the route does
+  NOT implement a `?business_id` query filter.
+- Actor source split: legacy routes derive `operator` = `x-operator-id` header
+  **with `body.operator_id` fallback**; the new `/api/vnext/*` cockpit routes
+  require the **header only** and reject otherwise
+  (`FAIL_CLOSED_OPERATOR_ID_REQUIRED`).
 - **Workforce messages**, **schedules**, **cost** (+policies/profiles),
   **secret-policies**, **credentials**, **budgets**, **conversations**
   (+messages/turns/drafts/confirm/reject/close), **events SSE**, **artifacts**,
@@ -100,7 +119,10 @@ in H-acceptance-matrix). Highlights that constrain the new shell:
   but must not invent new auth semantics.
 - SSE `/api/events` subscription via `eventBus` — keep; a company-scoped feed
   must NOT reuse the global stream (see E).
-- Legacy `UI_HTML` route `/ui` — keep reachable until cutover acceptance.
+- Legacy `UI_HTML` — reachable ONLY on a no-`staticDir` server run; in the SPA
+  deployment `/ui` already serves the SPA. Preservation = keep the code path +
+  document the operating mode; porting admin features is required before
+  declaring parity.
 
 ## A.6 Feature classification
 
@@ -115,13 +137,16 @@ in H-acceptance-matrix). Highlights that constrain the new shell:
 | Business/org-agent/work-item admin | **EXISTS** (legacy `UI_HTML` only — must port) |
 | Company dashboard (business + objective summaries + pending inbox) | **API_READY** — `GET /api/vnext/businesses/:id/company` |
 | Objective detail (KPI proof, budget, workstreams, missions, artifacts, reviews) | **API_READY** — `GET /api/vnext/objectives/:id/cockpit` |
-| Review history page | **API_READY** — `GET /api/vnext/objectives/:id/reviews` |
-| Workforce view (org agents, work items, inbox, effective policy) | **API_READY** — existing `/api/org-agents`, `/api/work-items`, `/api/businesses/:id/work-graph` |
+| Review history page | **API_READY** — `GET /api/vnext/objectives/:id/reviews` (per-row `owner_action_required` is a *historical* flag; fresh actionable pending = `latest_review.owner_action_required` on company + `lifecycle.owner_action_pending` on cockpit) |
+| Workforce view (org agents, work items, inbox, effective policy) | **API_READY-partial** — `/api/org-agents` returns ALL agents (no business filter); `/api/work-items`, `/api/businesses/:id/work-graph` are business-scoped; filter client-side within the selected business's work-graph, not via org-agents query |
 | Owner approve/transition objective (CANDIDATE→ACHIEVED), amend | **API_MISSING** — A2 routes approved-in-principle, separate PR |
 | Scoped company activity feed | **API_MISSING** — global `/api/events` SSE is unscoped; needs scoped filter route |
+| Owner-scoped business enumeration ("my companies") | **API_MISSING** — `/api/businesses` is unfiltered; switcher must seed business_id from remembered/manual entry then prove via `/company` |
+| Business-scoped approvals queue | **API_MISSING** — approvals are global; inbox shows the global queue honestly labeled |
 | Real session/login, multi-tenant isolation | **API_MISSING** — same MC-token contract as today; must not be claimed |
 | CEO decision history browsing | **API_READY-partial** — reviews carry `ceo_decision_id` links; a dedicated decisions endpoint does not exist |
-| Budget ledger drill-down per objective | **API_READY** — `consumed_microusd` + `canonically_proven` in cockpit |
+| Aggregate budget display per objective | **API_READY** — `consumed_microusd` + `canonically_proven` in cockpit |
+| Budget ledger row drill-down | **API_MISSING** — `runtime.ledger()` exists internally but no route exposes ledger rows |
 | Owner automation console (auto-policy across all owned objectives) | **API_READY-partial** — per-objective `auto-policy` endpoints exist; a cross-objective enumeration endpoint does not |
 | P18 cross-objective coordination UI | **FUTURE** |
 | Telegram conversation surface | **FUTURE** (explicitly out of scope) |

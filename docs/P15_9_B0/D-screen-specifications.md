@@ -76,9 +76,12 @@ MOBILE
 ```
 
 Acceptance: stat chips = exact company counts (`objectives_owned`,
-`targets_met_pending`, MET/CANDIDATE/ACHIEVED bands); cards show
-`canonically_proven` chips — an unproven KPI never renders "MET"; zero-owned
-state renders DeniedState (403 contract), not an empty dashboard.
+`targets_met_pending` — both exact across ALL owned objectives per the R2
+contract; MET/CANDIDATE/ACHIEVED bands over the returned page);
+`objectives_truncated:true` → banner "showing N of M owned objectives —
+counts exact, list partial". Cards show `canonically_proven` chips — an
+unproven KPI never renders "MET"; zero-owned state renders DeniedState
+(403 contract), not an empty dashboard.
 
 ## D.3 Objective Detail — `/app/objectives/:id`
 
@@ -97,6 +100,7 @@ DESKTOP
 │ │ (A2 buttons disabled with gloss until owner routes ship)     │ │
 │ └───────────────────────────────────────────────────────────────┘
 │ ┌ Plan & workstreams (CEO) ─────────────────────────────────────┐
+│ │ binding via CEO decision source_ceo_decision_id CD_..8        │ │
 │ │ ws:content  ●DONE    ◐proven → DL_..3 → MSN_..9 ●COMPLETED    │ │
 │ │ ws:distrib  ●IN_PROGRESS          → DL_..7 → MSN_..4 ●RUNNING │ │
 │ │ ws:legal    ●BACKLOG  (no allocation)                         │ │
@@ -109,6 +113,14 @@ DESKTOP
 │ auto_policy: ENABLED v2 exp 11/01 ◐   auto_driver: status —      │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+Field semantics (verified R1): `latest_review.owner_action_required` and
+`lifecycle.owner_action_pending` are the FRESH actionable signals (pins
+checked against current terms/digest); `owner_action_required` on each row
+inside `/reviews` history is a historical flag — the reviews band shows
+history, the lifecycle band shows current pending. Budget band is
+aggregate display only; ledger-row drill-down is API_MISSING. Workstream
+binding provenance renders `source_ceo_decision_id` when present.
 
 Edge renders (all spec'd, none invented):
 - `expiry_pending:true` → warn chip "policy expired — awaiting canonical commit".
@@ -138,8 +150,11 @@ workstreams → artifacts → reviews → policy. Table→card collapse per C.3.
 
 Honest framing: the workspace *explains* the autonomous layer — it is not a
 CEO control panel. `runCeoCycle` button keeps existing semantics (manual pass,
-owner-scoped). API_MISSING marker: a dedicated CEO-decision browse endpoint
-doesn't exist; decisions render only as far as review rows carry them.
+owner-scoped). The **pass outcome** (from the `ceo-cycle` call result) and
+**review outcomes** (from `/reviews`) are separate sources — never render one
+as the other. API_MISSING marker: a dedicated CEO-decision browse endpoint
+doesn't exist; decisions render only as far as review rows carry them
+(`ceo_decision_id` links).
 
 ## D.5 AI Workforce — `/app/workforce`
 
@@ -148,7 +163,8 @@ doesn't exist; decisions render only as far as review rows carry them.
 │ ┌ Agents ────────────────────────────────────────────────────────┐
 │ │ Ava Chen    dept:growth   contract ON   active 3   inbox 1      │
 │ │ Devin Sol   dept:eng      contract ON   active 5   inbox 0      │
-│ │ (rows from /api/org-agents + /api/businesses/:id/work-graph)    │
+│ │ (rows: /api/org-agents — UNFILTERED, filtered client-side by    │
+│ │  business_id on each agent + /api/businesses/:id/work-graph)    │
 │ └────────────────────────────────────────────────────────────────┘
 │ ┌ Agent detail (drawer/route) ────────────────────────────────────┐
 │ │ contract v4 · effective-policy summary · current work items ·   │
@@ -157,7 +173,10 @@ doesn't exist; decisions render only as far as review rows carry them.
 └────────────────────────────────────────────��─────────────────────┘
 ```
 
-All API_READY. Contract/effective-policy detail keeps authority semantics:
+API_READY-partial: `/api/org-agents` returns all agents (no server-side
+business filter — verified R1); the page filters rows by `business_id`
+client-side within the selected business and never claims server scope.
+Contract/effective-policy detail keeps authority semantics:
 pause/resume/terminate actions reuse existing POSTs inside ConfirmDialog.
 
 ## D.6 Owner Control Center — `/app/inbox`
@@ -169,18 +188,23 @@ pause/resume/terminate actions reuse existing POSTs inside ConfirmDialog.
 │ │ OBJ-7 TARGET_MET_CANDIDATE  "all KPIs met"  pins fresh ◐        │
 │ │   [open objective]   [Accept ACHIEVED ⟡A2]  [Request changes ⟡A2]│
 │ └─────────────────────────────────────────────────────────────────┘
-│ ┌ APPROVALS (permissions) ────────────────────────────────────────┐
+│ ┌ APPROVALS (permissions) — global queue, not business-scoped ──┐
 │ │ MSN_..2 asks: shell.write on ws:repo  [approve] [deny]          │
 │ └─────────────────────────────────────────────────────────────────┘
-│ ┌ HALTS / policy ─────────────────────────────────────────────────┐
+│ ┌ HALTS / policy — from returned objective page only (partial) ──┐
 │ │ OBJ-4 auto-policy HALTED — "budget cap hit" [resume ⟡policy]    │
 │ └─────────────────────────────────────────────────────────────────┘
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 Pin-staleness rule (R3-F2 contract): a CANDIDATE whose pins no longer match
-the objective shows as **history**, never as pending — the inbox only counts
-`owner_action_pending` rows the API already filtered.
+the objective shows as **history**, never as pending — the REVIEWS lane
+sources `latest_review.owner_action_required` / `owner_action_pending`
+(fresh pin check), never the historical per-row flag inside `/reviews`.
+HALTS lane completeness: halted auto-policies are only visible for the ≤200
+returned objective summaries (HALT enumeration is API_MISSING); when
+`objectives_truncated`, the lane is labeled "partial — N of M objectives
+scanned" instead of implying a complete halt list.
 
 ## D.7 Mission Operations — `/app/missions*`
 

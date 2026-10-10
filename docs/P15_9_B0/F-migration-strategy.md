@@ -9,9 +9,12 @@
   choice (which route the root serves), not a code rewrite.
 - No business logic duplicated in frontend: the new pages call the same
   canonical endpoints; components are new, logic isn't reimplemented.
-- Legacy `UI_HTML` stays reachable at `/ui` until cutover acceptance —
-  it's the only UI that can create businesses/org-agents today; the new UI
-  replaces that role via proper pages before cutover.
+- Legacy `UI_HTML` is reachable ONLY on a server run **without** `staticDir`
+  (bare-server mode) — verified: with `staticDir` active, `/ui` falls back to
+  `index.html` and serves the SPA. Simultaneous access to legacy HTML is NOT
+  possible in the SPA deployment; until admin is ported, a second
+  no-`staticDir` instance is the only way to reach it, and porting those
+  capabilities is a hard cutover precondition (H), not a nicety.
 - Rollback = revert to serving the old route tree / old staticDir. The old
   code paths are never deleted inside a feature PR.
 
@@ -34,7 +37,9 @@ createBrowserRouter([
 ## F.3 Static-serving / build facts (verified)
 
 - Server serves `deps.staticDir` if present; falls back to `UI_HTML` at
-  `/` & `/ui` when not. Non-API GETs get SPA fallback — deep links work.
+  `/` & `/ui` ONLY when `staticDir` is unset. With `staticDir` set, `/ui`
+  resolves no file → SPA `index.html` fallback. Non-API GETs get SPA
+  fallback — deep links work.
 - New `/app/*` deep links work through the SAME fallback — no server change.
 - The UI bundle lives in `apps/mission-control-ui` (pnpm workspace); no new
   dependency allowed at B0; router version already supports nested routes.
@@ -65,7 +70,7 @@ route added.
 | Risk | Mitigation |
 |---|---|
 | Two shells diverge (old edited, new forgotten) | Old pages are frozen — no new features land there; fixes go to new shell only except critical bugs |
-| `UI_HTML` still sole admin UI at cutover | Workforce/System admin pages are an acceptance gate (H) |
+| `UI_HTML` still sole admin UI at cutover (unreachable in SPA deployment — needs second bare-server run) | Workforce/System admin pages are an acceptance gate (H); if parity isn't met, keep a documented second no-`staticDir` instance — never silently lose the admin surface |
 | Deep-link 404s on old bookmarks | `/missions/:id` etc. keep working during coexistence; cutover adds redirects |
 | localStorage key conflict | Same keys by design (F.4); new shell never writes new session semantics |
 | SSE global stream temptation for company feed | Explicitly forbidden (E.6); feed waits for scoped endpoint |

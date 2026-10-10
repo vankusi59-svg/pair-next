@@ -45,7 +45,7 @@ the SPA and lets `/` keep serving today's app until acceptance.
 PAIR ▮ Company OS
 ├─ Overview
 │   ├─ Company Cockpit        /app/company
-│   └─ Owner Inbox  (badge)   /app/inbox          ← count = approvals + pending reviews
+│   └─ Owner Inbox  (badge)   /app/inbox          ← count = approvals + pending reviews (HALT = labeled partial, see B.5.2)
 ├─ Business
 │   ├─ Objectives             /app/objectives
 │   ├─ CEO Workspace          /app/ceo
@@ -78,7 +78,7 @@ Mobile: sidebar collapses to a bottom tab bar
 | `/observability` | `/app/system/observability` | Moved under System. |
 | `/objectives` | `/app/objectives` + `/app/objectives/:id` | List/detail split; create form retained. |
 | `/chat` | `/app/chat` | Ported verbatim. |
-| `/ui` (legacy UI_HTML) | `/app/system/…` + `/app/workforce` | Business/org-agent/work-item admin re-implemented in new shell; `/ui` stays reachable until cutover acceptance (H). |
+| `/ui` (legacy UI_HTML) | `/app/system/…` + `/app/workforce` | Business/org-agent/work-item admin re-implemented in new shell. `/ui` is reachable ONLY on a no-`staticDir` server run — in the SPA deployment it already serves the SPA (verified). Preservation = second bare-server instance until admin parity; porting is a cutover precondition (H). |
 | `/` old app | unchanged until cutover | Old app stays at `/`; cutover = staticDir switch, not code removal (F). |
 
 ## B.5 Owner-first navigation rules
@@ -86,10 +86,22 @@ Mobile: sidebar collapses to a bottom tab bar
 1. Any page reachable in ≤2 clicks from Cockpit for its parent concept;
    System pages exempted.
 2. `Owner Inbox` badge = `pending approvals` + `targets_met_pending` +
-   HALTED policies — the three real "needs you" signals the APIs can prove.
+   HALTED policies — with honest scope: `targets_met_pending` is exact across
+   all owned objectives; HALT aggregation is API_MISSING (no enumeration
+   route), so the badge counts halted auto-policies only among the ≤200
+   objective summaries the company API returns and must be labeled as
+   partial when `objectives_truncated` or when the lane is rendered from
+   the page slice. Never present a fabricated org-wide HALT count.
 3. Business switcher is global (top of sidebar) — every Business-section page
    re-queries with the selected `business_id`; no cross-business aggregation
    (single-business scope, locked in P15.9-A1 owner decision).
+   **Seed contract (verified R1)**: no owner-scoped business enumeration exists
+   (`/api/businesses` is unfiltered — never list it as "my companies"). The
+   switcher offers the last-used / manually entered `business_id` (persisted in
+   localStorage like the token) and proves access via
+   `GET /api/vnext/businesses/:id/company` (403 → DeniedState). An
+   owner-scoped enumeration route is API_MISSING — a named backend
+   dependency, not a UI workaround.
 4. Deep links everywhere: every card/row that shows an entity links to its
    canonical detail route (`/app/objectives/:id`, `/app/missions/:id`,
    `/app/workforce/:agentId`).

@@ -10,14 +10,15 @@ verifiable check; "n/a" must be justified in the PR, not skipped.
 | Dashboard missions + routing + cost chips | `/app/missions`, `/app/company`, `/app/system/cost` | e2e smoke |
 | Mission preview→confirm→run | `/app/missions/new` | e2e golden path |
 | Mission detail + DAG/timeline/evidence/files + pause/resume/cancel/ack | `/app/missions/:id` | e2e |
-| Approvals approve/deny | `/app/inbox` | e2e |
+| Approvals approve/deny | `/app/inbox` (global queue, labeled) | e2e |
 | Schedules CRUD | `/app/system/schedules` | e2e |
 | Providers/models/routes | `/app/system/providers` | e2e |
 | Observability + SSE stream | `/app/system/observability` | e2e |
 | Objectives list/create + ceo-cycle + auto-policy | `/app/objectives*` | e2e |
 | Chat turns + drafts + confirm/reject | `/app/chat` | existing chat spec ported |
-| Business/org-agent/work-item admin (legacy `UI_HTML`) | `/app/workforce` + `/app/system` admin forms | manual matrix — port BEFORE cutover |
+| Business/org-agent/work-item admin (legacy `UI_HTML` — unreachable in the staticDir SPA deployment; only on a no-`staticDir` run) | `/app/workforce` + `/app/system` admin forms | manual matrix — port BEFORE cutover, else documented second bare-server instance |
 | Token + operator session | `/app/system/settings` (+same localStorage keys) | manual |
+| Truthful partial data | truncation banners, partial HALT lane, global-queue labels | e2e + visual — never a fabricated complete count |
 
 ## H.2 UI visual consistency
 
@@ -59,11 +60,12 @@ verifiable check; "n/a" must be justified in the PR, not skipped.
 
 | Rule | Gate |
 |---|---|
-| `x-operator-id` is sole actor source; no body-field actor anywhere | code review |
+| `x-operator-id` is sole actor source on new vnext routes (header-only, `FAIL_CLOSED_OPERATOR_ID_REQUIRED`); UI never uses the legacy `body.operator_id` fallback | code review |
 | No UI-invented permissions; every button maps to an existing POST | E-mapping review |
 | No new authority semantics; disabled-until-A2 buttons are honest | code review |
 | No secrets/tokens rendered; credential state = configured/unconfigured | visual + review |
 | No company feed from global SSE | code review |
+| No owner-scoped enumeration faked: switcher seeds business_id manually/last-used; `/api/businesses` never listed as "my companies"; org-agents client-filtered and labeled | code review |
 | Optimistic UI: none — canonical refetch after every POST | code review |
 
 ## H.7 No regression to existing operations
@@ -71,7 +73,7 @@ verifiable check; "n/a" must be justified in the PR, not skipped.
 | Check | Gate |
 |---|---|
 | Backend untouched by B-PRs (UI-only diffs) except new read routes explicitly approved | diff review |
-| `UI_HTML` reachable until cutover sign-off | manual |
+| `UI_HTML` admin parity met (ported) OR a documented second no-`staticDir` instance is the standing operating mode | manual |
 | Old routes work during coexistence | e2e each PR |
 | verify:change READY_FOR_INDEPENDENT_AUDIT on every PR | harness |
 | Independent audit + Owner approval before any merge | process |
