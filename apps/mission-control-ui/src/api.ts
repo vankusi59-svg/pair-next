@@ -78,6 +78,10 @@ export const api = {
   routes: () => req<{ routes: Array<Record<string, unknown>>; model_bindings: Array<Record<string, unknown>>; routable_models: Array<Record<string, unknown>>; route_decisions: Array<Record<string, unknown>>; routing_decisions: Array<Record<string, unknown>> }>("/routes"),
   recovery: () => req<Record<string, unknown>>("/recovery"),
   approvals: () => req<Array<Record<string, unknown>>>("/approvals"),
+  /* /app/* surfaces suppress the legacy 401 prompt — same headers, same
+     endpoint, only the auth-prompt UX differs (audit R1 residual). */
+  approvalsNoPrompt: () =>
+    req<Array<Record<string, unknown>>>("/approvals", undefined, { noAuthPrompt: true }),
   previewMission: (input: { project_id: string; goal: string; granted_permissions?: string[]; authorized_workspaces?: string[]; risk_ceiling?: string; metadata?: Record<string, unknown> }) =>
     req<{ plan: { tasks: Array<Record<string, unknown>> }; plan_digest: string; preview_id: string; plan_source: string | null; plan_model: string | null }>("/missions/preview", {
       method: "POST",

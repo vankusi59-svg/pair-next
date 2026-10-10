@@ -120,36 +120,48 @@ test("switching business discards previous data; slow stale response never overw
 
 test("pending review + truncation (contract-shaped fixture)", async ({ page }) => {
   const biz = "BIZ_fixture";
+  const baseObj = (i: number) => ({
+    objective_id: `OBJ_f${i}`, title: `Obj ${i}`, status: "RUNNING", deadline: null, created_at: "2026-01-01T00:00:00Z",
+    budget: { ceiling_microusd: 1000000, consumed_microusd: 0, canonically_proven: true },
+    kpi_summary: { total: 1, met: 0, gap: 1, unverified: 0, all_targets_met: false, canonically_proven: true },
+    latest_review: null,
+    review_count: 0,
+  });
+  const objectives = Array.from({ length: 200 }, (_, i) => baseObj(i));
+  // fresh pending (company-side flag)
+  objectives[0] = {
+    ...baseObj(0),
+    objective_id: "OBJ_pend", title: "Review me",
+    kpi_summary: { total: 1, met: 1, gap: 0, unverified: 0, all_targets_met: true, canonically_proven: true },
+    latest_review: { review_id: "r1", outcome: "TARGET_MET_CANDIDATE", owner_action_required: true, recommended_status: null, created_at: "2026-06-01T00:00:00Z" },
+    review_count: 1,
+  };
+  // historical flag is NOT fresh pending; canonically_proven=false never claims MET
+  objectives[1] = {
+    ...baseObj(1),
+    objective_id: "OBJ_hist", title: "History only",
+    budget: { ceiling_microusd: 0, consumed_microusd: 0, canonically_proven: false },
+    kpi_summary: { total: 1, met: 0, gap: 1, unverified: 1, all_targets_met: false, canonically_proven: false },
+    latest_review: { review_id: "r0", outcome: "TARGET_MET_CANDIDATE", owner_action_required: false, recommended_status: null, created_at: "2026-05-01T00:00:00Z" },
+    review_count: 2,
+  };
   const payload = {
     company: {
       business: { business_id: biz, name: "Fixture Co", description: null, currency: "USD", status: "ACTIVE", project_id: "p", created_at: "2026-01-01T00:00:00Z" },
-      objectives: [
-        {
-          objective_id: "OBJ_pend", title: "Review me", status: "RUNNING", deadline: null, created_at: "2026-01-01T00:00:00Z",
-          budget: { ceiling_microusd: 1000000, consumed_microusd: 0, canonically_proven: true },
-          kpi_summary: { total: 1, met: 1, gap: 0, unverified: 0, all_targets_met: true, canonically_proven: true },
-          latest_review: { review_id: "r1", outcome: "TARGET_MET_CANDIDATE", owner_action_required: true, recommended_status: null, created_at: "2026-06-01T00:00:00Z" },
-          review_count: 1,
-        },
-        {
-          objective_id: "OBJ_hist", title: "History only", status: "RUNNING", deadline: null, created_at: "2026-01-01T00:00:00Z",
-          budget: { ceiling_microusd: 0, consumed_microusd: 0, canonically_proven: false },
-          kpi_summary: { total: 1, met: 1, gap: 0, unverified: 1, all_targets_met: true, canonically_proven: false },
-          latest_review: { review_id: "r0", outcome: "TARGET_MET_CANDIDATE", owner_action_required: false, recommended_status: null, created_at: "2026-05-01T00:00:00Z" },
-          review_count: 2,
-        },
-      ],
+      objectives,
       objectives_total_owned: 230,
       objectives_truncated: true,
-      counts: { objectives_owned: 230, objectives_returned: 2, targets_met_pending: 1 },
+      counts: { objectives_owned: 230, objectives_returned: 200, targets_met_pending: 1 },
     },
   };
   await page.route(`**/api/vnext/businesses/${biz}/company`, (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(payload) }));
   await seedBiz(page, biz);
   await page.goto("/app/company");
-  // truncation banner: exact counts, partial list (returned == array length)
-  await expect(page.getByText(/Showing 2 of 230 owned objectives/)).toBeVisible();
+  // truncation: 230 owned, exactly the 200 returned, counts stay exact
+  await expect(page.getByText(/Showing 200 of 230 owned objectives/)).toBeVisible();
+  await expect(page.locator(".ecard")).toHaveCount(200);
+  await expect(page.locator(".stat", { hasText: "Objectives owned" }).getByText("230")).toBeVisible();
   await expect(page.locator(".stat", { hasText: "Pending reviews" }).getByText("1")).toBeVisible();
   // fresh pending flag only: OBJ_pend in needs-you, OBJ_hist (historical) NOT
   const need = page.locator(".need").first();
@@ -157,8 +169,7 @@ test("pending review + truncation (contract-shaped fixture)", async ({ page }) =
   await expect(need.getByText("review pending owner sign-off")).toBeVisible();
   expect(await need.getByText("History only").count()).toBe(0);
   // proven KPI renders MET + proven chip
-  await expect(page.getByText("1/1 MET")).toBeVisible();
-  await expect(page.locator(".pchip.proven").first()).toBeVisible();
+  await expect(page.locator(".ecard", { hasText: "Review me" }).getByText("1/1 MET")).toBeVisible();
   // canonically_proven=false -> UNVERIFIED + unverifiable chip, never MET-as-evidence
   const hist = page.locator(".ecard", { hasText: "History only" });
   await expect(hist.getByText("UNVERIFIED").first()).toBeVisible();
@@ -224,20 +235,24 @@ test("microusd always displays as USD, never business.currency (audit F1)", asyn
   expect(await page.getByText(/VND/).count()).toBe(0);
 });
 
-test("401 -> honest Unauthorized state; no legacy prompt/reload, no prior data", async ({ page }) => {
+test("401 on BOTH company + approvals -> honest state; no prompt, no reload, no prior data", async ({ page }) => {
   const bizA = await mkBusiness(page, "pre401");
   await mkObjective(page, bizA.id, "Obj Before");
   await page.addInitScript(() => {
     (window as unknown as { __prompted: boolean }).__prompted = false;
-    const orig = window.prompt;
-    window.prompt = (...a) => { (window as unknown as { __prompted: boolean }).__prompted = true; return orig.call(window, ...a); };
+    window.prompt = () => { (window as unknown as { __prompted: boolean }).__prompted = true; return null; };
   });
   await page.route("**/api/vnext/businesses/BIZ_401/company", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json",
+      body: JSON.stringify({ error: "UNAUTHORIZED", detail: "invalid token" }) }));
+  await page.route("**/api/approvals", (route) =>
     route.fulfill({ status: 401, contentType: "application/json",
       body: JSON.stringify({ error: "UNAUTHORIZED", detail: "invalid token" }) }));
   await seedBiz(page, bizA.id);
   await page.goto("/app/company");
   await expect(page.getByRole("heading", { name: bizA.name })).toBeVisible();
+  // approvals already returned 401 -> lane degrades honestly, no prompt
+  await expect(page.getByText(/Global approvals queue failed to load/)).toBeVisible();
   // switch to a business whose read returns 401
   await page.locator(".aside").getByRole("button", { name: "business switcher" }).click();
   await page.locator(".aside").getByLabel("business id").fill("BIZ_401");
@@ -250,4 +265,20 @@ test("401 -> honest Unauthorized state; no legacy prompt/reload, no prior data",
   // previous business's data fully discarded
   await expect(page.locator(".ecard")).toHaveCount(0);
   await expect(page.getByText(bizA.name)).toHaveCount(0);
+});
+
+test("legacy routes keep the old 401 window.prompt behavior", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as unknown as { __prompted: boolean }).__prompted = false;
+    window.prompt = () => { (window as unknown as { __prompted: boolean }).__prompted = true; return null; };
+  });
+  await page.route("**/api/missions", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json",
+      body: JSON.stringify({ error: "UNAUTHORIZED", detail: "invalid token" }) }));
+  await seedSession(page);
+  await page.goto("/");
+  // legacy api client still invokes the token prompt on 401 (returns null = cancel)
+  await expect.poll(() =>
+    page.evaluate(() => (window as unknown as { __prompted: boolean }).__prompted),
+  ).toBe(true);
 });

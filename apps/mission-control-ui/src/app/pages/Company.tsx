@@ -76,7 +76,7 @@ export function Company() {
   useEffect(() => {
     let dead = false;
     api
-      .approvals()
+      .approvalsNoPrompt()
       .then((a) => !dead && setApprovals(Array.isArray(a) ? a : []))
       .catch(() => !dead && setApprovalsErr(true));
     return () => {
