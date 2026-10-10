@@ -18,7 +18,7 @@ verifiable check; "n/a" must be justified in the PR, not skipped.
 | Chat turns + drafts + confirm/reject | `/app/chat` | existing chat spec ported |
 | Business/org-agent/work-item admin (legacy `UI_HTML` — unreachable in the staticDir SPA deployment; only on a no-`staticDir` run) | `/app/workforce` + `/app/system` admin forms | manual matrix — port BEFORE cutover, else documented second bare-server instance |
 | Token + operator session | `/app/system/settings` (+same localStorage keys) | manual |
-| Truthful partial data | truncation banners, partial HALT lane, global-queue labels | e2e + visual — never a fabricated complete count |
+| Truthful partial data | truncation banners, HALT lane = unavailable explanation (no count, no scan claim), global-queue labels | e2e + visual — never a fabricated complete count |
 
 ## H.2 UI visual consistency
 

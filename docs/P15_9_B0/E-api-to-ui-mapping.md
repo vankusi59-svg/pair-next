@@ -11,9 +11,9 @@ permissions; every API error code renders via the gloss convention (C.6).
 |---|---|---|
 | Business switcher | NO owner-scoped list exists — `/api/businesses` is **unfiltered** (never enumerate as "my companies") | seed = last-used/manual `business_id` (localStorage), then prove via `/company`; empty/denied → DeniedState. Owner-scoped enumeration = API_MISSING (E.6) |
 | Stat chips + objective cards + pending count | `GET /api/vnext/businesses/:id/company` | owner-scoped (`owner_authority_id`); 403 `FAIL_CLOSED_COMPANY_SCOPE` → DeniedState; counts are exact (`objectives_owned`, `targets_met_pending`); KPI cards show `canonically_proven` chips verbatim |
-| Needs-you lane (reviews lane) | same payload, `latest_review.owner_action_required` + `objectives[].status` | only API-pending rows count (stale pins already excluded server-side) |
+| Needs-you lane (reviews lane) | `objectives[].latest_review.owner_action_required` + `objectives[].status` | company-side flag is FRESH (pin-checked); only API-pending rows count (stale pins already excluded server-side) |
 | Approvals lane | `GET /api/approvals` | **global queue**, not business-scoped — displayed labeled "all pending approvals" |
-| HALT lane | halted `auto_policy` status only among the ≤200 objective summaries `/company` returns — **API_MISSING for cross-objective enumeration** (see E.6) | lane + badge labeled "partial — N of M objectives scanned" when `objectives_truncated`; never fabricate an org-wide HALT count |
+| HALT lane | **unavailable** — company summaries carry NO `auto_policy` field and no enumeration route exists — **API_MISSING** (see E.6) | lane renders an unavailable/partial-information explanation; NEVER a count, a badge component, or any claim that policies were scanned |
 | Activity feed | **API_MISSING** — global `/api/events` is unscoped; R1 audit forbids it as company feed | until a scoped route exists: "recent reviews" fallback list |
 
 ## E.2 Objective Detail
@@ -26,7 +26,7 @@ permissions; every API error code renders via the gloss convention (C.6).
 | Lifecycle band | `lifecycle` block | CANDIDATE vs ACHIEVED vs MET distinction normative |
 | Workstreams → child → mission | `workstreams[]` + `missions[]` | `completion_proven` verbatim; mission link → `/app/missions/:id` |
 | Artifacts | `artifacts[]` + `artifacts_dropped_unverified` | verified-only list + drop counter chip |
-| Reviews list | `latest_review` + `GET /api/vnext/objectives/:id/reviews?limit=` | `latest_review.owner_action_required` + `lifecycle.owner_action_pending` = FRESH (pin-checked vs current terms/digest); `owner_action_required` per `/reviews` history row = historical flag — history tab shows it, pending counts never use it |
+| Reviews list | `latest_review` + `GET /api/vnext/objectives/:id/reviews?limit=` | `lifecycle.owner_action_required` = FRESH (pin-checked vs current terms/digest); `latest_review.owner_action_required` (cockpit) and `owner_action_required` per `/reviews` history row = historical flags — history tab shows them, pending counts never use them (same field name, different semantics) |
 | `observation_error` | same payload | UnverifiedPanel replaces verified-claim sections |
 | `expiry_pending` | `auto_policy` block | warn chip, advisory only |
 | Run CEO pass | `POST /api/vnext/objectives/:id/ceo-cycle` | existing contract; ConfirmDialog states it's a real CEO call |
@@ -38,7 +38,7 @@ permissions; every API error code renders via the gloss convention (C.6).
 | Component | API | Notes |
 |---|---|---|
 | Pass outcome | `POST …/ceo-cycle` response (latest) | CEO pass outcome is a separate source from review outcomes — never conflate |
-| Decisions/reviews | `GET …/reviews` | review rows carry `ceo_decision_id`/`strategy_revision_id`; binding provenance uses `source_ceo_decision_id` where the payload carries it; no dedicated decisions endpoint → decisions tab lists reviews only (**API_MISSING marker**) |
+| Decisions/reviews | `GET …/reviews` | review rows carry `source_ceo_decision_id`/`strategy_revision_id` (there is no `ceo_decision_id` field); no dedicated decisions endpoint → decisions tab lists reviews only (**API_MISSING marker**) |
 | Manual pass | `POST …/ceo-cycle` | same as detail page |
 
 ## E.4 AI Workforce
@@ -55,9 +55,9 @@ permissions; every API error code renders via the gloss convention (C.6).
 
 | Lane | API | Notes |
 |---|---|---|
-| Reviews pending | `GET /api/vnext/businesses/:id/company` → `targets_met_pending` (exact count across ALL owned) + `latest_review.owner_action_required` rows (fresh pins) | count truthful; item list bounded to ≤200 summaries → label when `objectives_truncated` |
+| Reviews pending | `GET /api/vnext/businesses/:id/company` → `targets_met_pending` (exact count across ALL owned) + `objectives[].latest_review.owner_action_required` rows (fresh pins — different semantics than cockpit `latest_review`) | count truthful; item list bounded to ≤200 summaries → label when `objectives_truncated` |
 | Approvals | `GET /api/approvals` + approve/deny | global queue, not business-scoped — labeled |
-| Halts | halted `auto_policy` among returned objectives only | **API_MISSING** aggregate enumeration (E.6); labeled partial when truncated |
+| Halts | **unavailable** — no `auto_policy` in summaries, no enumeration route | **API_MISSING** (E.6); lane shows explanation only — no count, no scan claim |
 
 ## E.6 API_MISSING register (backend gaps the design needs — not built in B)
 

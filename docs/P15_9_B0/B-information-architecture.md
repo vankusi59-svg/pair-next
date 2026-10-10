@@ -45,7 +45,7 @@ the SPA and lets `/` keep serving today's app until acceptance.
 PAIR ▮ Company OS
 ├─ Overview
 │   ├─ Company Cockpit        /app/company
-│   └─ Owner Inbox  (badge)   /app/inbox          ← count = approvals + pending reviews (HALT = labeled partial, see B.5.2)
+│   └─ Owner Inbox  (badge)   /app/inbox          ← count = approvals + pending reviews (HALT unavailable — see B.5.2)
 ├─ Business
 │   ├─ Objectives             /app/objectives
 │   ├─ CEO Workspace          /app/ceo
@@ -85,13 +85,12 @@ Mobile: sidebar collapses to a bottom tab bar
 
 1. Any page reachable in ≤2 clicks from Cockpit for its parent concept;
    System pages exempted.
-2. `Owner Inbox` badge = `pending approvals` + `targets_met_pending` +
-   HALTED policies — with honest scope: `targets_met_pending` is exact across
-   all owned objectives; HALT aggregation is API_MISSING (no enumeration
-   route), so the badge counts halted auto-policies only among the ≤200
-   objective summaries the company API returns and must be labeled as
-   partial when `objectives_truncated` or when the lane is rendered from
-   the page slice. Never present a fabricated org-wide HALT count.
+2. `Owner Inbox` badge = `pending approvals` + `targets_met_pending` only.
+   HALTED policies are NOT countable today: the company summary carries no
+   `auto_policy` field and no enumeration route exists (API_MISSING). The
+   badge therefore carries NO HALT component for B1–B4 — the HALT lane shows
+   an unavailable/partial-information explanation instead of any count, and
+   nothing claims policies were scanned.
 3. Business switcher is global (top of sidebar) — every Business-section page
    re-queries with the selected `business_id`; no cross-business aggregation
    (single-business scope, locked in P15.9-A1 owner decision).

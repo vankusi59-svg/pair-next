@@ -48,7 +48,7 @@ DESKTOP
 │ ┌ Needs you ●3 ────────────────────────────────────────────────┐ │
 │ │ ⟡ OBJ-7  TARGET_MET_CANDIDATE  "all KPIs met — sign off"      │ │
 │ │ ⟡ OBJ-2  approval pending     mission MSN_..9 asks for repo    │ │
-│ │ ⟡ OBJ-4  policy HALTED        "budget cap hit"                │ │
+│ │ (HALT rows: unavailable — no data source; see D.6 lane rule)    │ │
 │ └───────────────────────────────────────────────────────────────┘
 │ ┌ Objectives ───────────────────────────────────────────[→ all]─┐│
 │ │ EntityCard ×N:                                                ││
@@ -114,13 +114,15 @@ DESKTOP
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-Field semantics (verified R1): `latest_review.owner_action_required` and
-`lifecycle.owner_action_pending` are the FRESH actionable signals (pins
-checked against current terms/digest); `owner_action_required` on each row
-inside `/reviews` history is a historical flag — the reviews band shows
-history, the lifecycle band shows current pending. Budget band is
-aggregate display only; ledger-row drill-down is API_MISSING. Workstream
-binding provenance renders `source_ceo_decision_id` when present.
+Field semantics (verified R1): `lifecycle.owner_action_required` is the FRESH
+actionable signal (pins checked against current terms/digest); the company
+payload's `objectives[].latest_review.owner_action_required` is also fresh
+(pin-checked server-side) — but cockpit's own `latest_review` block carries
+the raw *historical* flag, as does each `/reviews` history row: the reviews
+band shows history, the lifecycle band shows current pending — same field
+name, different semantics per surface. Budget band is aggregate display
+only; ledger-row drill-down is API_MISSING. Workstream binding provenance
+renders `source_ceo_decision_id` when present.
 
 Edge renders (all spec'd, none invented):
 - `expiry_pending:true` → warn chip "policy expired — awaiting canonical commit".
@@ -154,7 +156,7 @@ owner-scoped). The **pass outcome** (from the `ceo-cycle` call result) and
 **review outcomes** (from `/reviews`) are separate sources — never render one
 as the other. API_MISSING marker: a dedicated CEO-decision browse endpoint
 doesn't exist; decisions render only as far as review rows carry them
-(`ceo_decision_id` links).
+(`source_ceo_decision_id` links).
 
 ## D.5 AI Workforce — `/app/workforce`
 
@@ -191,20 +193,21 @@ pause/resume/terminate actions reuse existing POSTs inside ConfirmDialog.
 │ ┌ APPROVALS (permissions) — global queue, not business-scoped ──┐
 │ │ MSN_..2 asks: shell.write on ws:repo  [approve] [deny]          │
 │ └─────────────────────────────────────────────────────────────────┘
-│ ┌ HALTS / policy — from returned objective page only (partial) ──┐
-│ │ OBJ-4 auto-policy HALTED — "budget cap hit" [resume ⟡policy]    │
+│ ┌ HALTS / policy ────────────────────────────────────────────────┐
+│ │ ⓘ unavailable — no enumeration source exists yet (API_MISSING) │
+│ │   per-objective policy state lives on Objective Detail         │
 │ └─────────────────────────────────────────────────────────────────┘
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 Pin-staleness rule (R3-F2 contract): a CANDIDATE whose pins no longer match
 the objective shows as **history**, never as pending — the REVIEWS lane
-sources `latest_review.owner_action_required` / `owner_action_pending`
-(fresh pin check), never the historical per-row flag inside `/reviews`.
-HALTS lane completeness: halted auto-policies are only visible for the ≤200
-returned objective summaries (HALT enumeration is API_MISSING); when
-`objectives_truncated`, the lane is labeled "partial — N of M objectives
-scanned" instead of implying a complete halt list.
+sources `company.objectives[].latest_review.owner_action_required` (fresh
+pin check) and, on detail pages, `lifecycle.owner_action_required`; never
+the historical per-row flag inside `/reviews` or cockpit `latest_review`.
+HALTS lane completeness: company summaries carry no `auto_policy` field and
+no enumeration route exists, so the lane renders an unavailable/partial-
+information explanation for B1–B4 — never a count, never a scan claim.
 
 ## D.7 Mission Operations — `/app/missions*`
 

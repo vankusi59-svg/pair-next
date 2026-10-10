@@ -137,14 +137,14 @@ in H-acceptance-matrix). Highlights that constrain the new shell:
 | Business/org-agent/work-item admin | **EXISTS** (legacy `UI_HTML` only — must port) |
 | Company dashboard (business + objective summaries + pending inbox) | **API_READY** — `GET /api/vnext/businesses/:id/company` |
 | Objective detail (KPI proof, budget, workstreams, missions, artifacts, reviews) | **API_READY** — `GET /api/vnext/objectives/:id/cockpit` |
-| Review history page | **API_READY** — `GET /api/vnext/objectives/:id/reviews` (per-row `owner_action_required` is a *historical* flag; fresh actionable pending = `latest_review.owner_action_required` on company + `lifecycle.owner_action_pending` on cockpit) |
+| Review history page | **API_READY** — `GET /api/vnext/objectives/:id/reviews` (per-row `owner_action_required` is a *historical* flag; fresh actionable pending = `company.objectives[].latest_review.owner_action_required` (pin-checked) + `cockpit.lifecycle.owner_action_required`; cockpit's own `latest_review.owner_action_required` is the raw historical flag — same name, different semantics per surface) |
 | Workforce view (org agents, work items, inbox, effective policy) | **API_READY-partial** — `/api/org-agents` returns ALL agents (no business filter); `/api/work-items`, `/api/businesses/:id/work-graph` are business-scoped; filter client-side within the selected business's work-graph, not via org-agents query |
 | Owner approve/transition objective (CANDIDATE→ACHIEVED), amend | **API_MISSING** — A2 routes approved-in-principle, separate PR |
 | Scoped company activity feed | **API_MISSING** — global `/api/events` SSE is unscoped; needs scoped filter route |
 | Owner-scoped business enumeration ("my companies") | **API_MISSING** — `/api/businesses` is unfiltered; switcher must seed business_id from remembered/manual entry then prove via `/company` |
 | Business-scoped approvals queue | **API_MISSING** — approvals are global; inbox shows the global queue honestly labeled |
 | Real session/login, multi-tenant isolation | **API_MISSING** — same MC-token contract as today; must not be claimed |
-| CEO decision history browsing | **API_READY-partial** — reviews carry `ceo_decision_id` links; a dedicated decisions endpoint does not exist |
+| CEO decision history browsing | **API_READY-partial** — reviews carry `source_ceo_decision_id` links; a dedicated decisions endpoint does not exist |
 | Aggregate budget display per objective | **API_READY** — `consumed_microusd` + `canonically_proven` in cockpit |
 | Budget ledger row drill-down | **API_MISSING** — `runtime.ledger()` exists internally but no route exposes ledger rows |
 | Owner automation console (auto-policy across all owned objectives) | **API_READY-partial** — per-objective `auto-policy` endpoints exist; a cross-objective enumeration endpoint does not |
