@@ -1,20 +1,14 @@
 {
-  "claim_id": "P15_9A_COMPANY_COCKPIT_READ_PROJECTIONS_R3C",
-  "title": "P15.9-A1 R3c: entity-key enumeration \u2014 raw objective_id alias bypass closed",
+  "claim_id": "P15_9B0_UI_UX_REDESIGN_MASTER_PLAN",
+  "title": "P15.9-B0: full UI/UX redesign master plan \u2014 docs only",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL"
+    "UI",
+    "DEV_INFRA"
   ],
   "required_tests": [
     "src/__tests__/pair-p15-9a-company-cockpit.test.ts",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10d-met-branch-fold.test.ts",
-    "src/__tests__/pair-p15-10d.test.ts",
-    "src/__tests__/pair-p15-10d-r1.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-p15-5-kpi-review.test.ts"
+    "src/__tests__/pair-p15-10d-met-branch-fold.test.ts"
   ],
   "invariants": [],
-  "risk_override": "MEDIUM",
-  "description": "R3b residual on PR #91 (BASE e24e334); R1/R2/R3 preserved. businessCompany previously enumerated objectives.list() and called objectives.get(o.objective_id) on the raw payload claim: rewriting OBJ_B.payload.objective_id to OBJ_A made get fetch the victim row twice and the forged row was never validated. Now enumeration runs through store.entityPage (proves persisted entity_id key == payload.entity_id == payload_hash == version), every actual stored row is strict-read by its PROVEN key via objectives.get, and the row's claimed objective_id must equal that key \u2014 a payload identity alias fails closed even with a recomputed digest. Scope: org-wide fail-closed (documented). Adversarial tests: objective_id alias to victim, forged entity_id, plus all prior R1-R3 negatives. Tests 28/28; regressions 211; tsc+build+verify:change READY. No authority-semantics change; no UI/A2; no CEO/Router/Executor/KPI/Telegram. No merge/deploy."
+  "description": "P15.9-B0 master plan docs + design-review R1/R2 contract corrections (BASE 2232955, post-PR#91). docs/P15_9_B0/ holds README + A\u2013H. R1: /ui serves SPA (not UI_HTML) under staticDir \u2014 UI_HTML only on bare-server runs; inbox truthfulness (exact counts vs <=200 returned list); scope boundaries (unfiltered businesses/approvals/org-agents; header-only vnext actor vs legacy body fallback). R2 residuals: field-name corrections \u2014 fresh pending = lifecycle.owner_action_required + company objectives[].latest_review.owner_action_required (pin-checked); cockpit latest_review.owner_action_required and /reviews rows are historical (same field name, different semantics); source_ceo_decision_id replaces nonexistent ceo_decision_id. HALT truthfulness \u2014 company summaries carry NO auto_policy field and no enumeration route exists: HALT lane/badge render an unavailable explanation only, never a count or scan claim; HALT aggregation stays API_MISSING. Docs-only: no code, no deps, no routes. Executable proof: cockpit + met-fold suites green."
 }
