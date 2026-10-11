@@ -58,3 +58,19 @@ Evidence: `app.spec.ts` keyboard/a11y tests + B6 manual pass. Existing tooling o
 | Hit targets | min 40×40 via `.nav a`/`.tbtn` padding tokens |
 
 **Unresolved:** no axe-core scan (new dependency not allowed by the mandate); automated contrast is computed, not instrumented — flagged as honest limitation, not claimed as a pass beyond what was verified.
+
+## Screenshot evidence — provenance & labels (B6 R1-F3)
+
+All 16 PNGs under `screenshots/` were **regenerated** after R1 against an explicitly isolated synthetic fixture env: dedicated `serve-mission-control.mjs` on `:8791` with `PAIR_MC_DIR=/tmp/pair-b6-shotenv` (fresh dir), stub conversation replies, template planner, fixture token from `~/pair-mc-token` (local dev credential — never a production credential, and never visible in any shot since the UI masks it). One synthetic business `BIZ_01M4M9A65MJ8RG6SX3N78J6Y67` ("b6-fixture-demo") was created inside that env via canonical `POST /api/businesses`. No real operator/business/mission data exists in the fixture env. `scripts/b6-shots.mjs` documents this in-source.
+
+| Shot (×light/dark) | Viewport | What it proves | State |
+|---|---|---|---|
+| `company-*` | 1440 + 390 | cockpit layout, sidebar/tab bar, KPI chip layout, theme tokens | populated (1 fixture business, empty objectives) |
+| `objectives-*` | 1440 | objective list states + honest empty lane | populated business, empty objectives |
+| `inbox-*` | 768 | tablet layout, lanes, badge | empty inbox lanes |
+| `missions-*` | 1440 | mission list + global-unfiltered label | empty mission table |
+| `system-cost-*` | 1024 | tablet cost page, policy/profile tables | empty canonical tables |
+| `system-providers-*` | 1440 | catalogs + gate labels | populated provider catalog from fixture env |
+| `chat-mobile-*` | 390 | mobile chat layout, composer reachability | empty conversation list |
+
+**Scope of proof:** these 8 views × 2 themes are a **subset**, not all routes and not all interactive states — deep-link coverage of all 15 routes is proven by `b6-acceptance.spec.ts` (executable), and interactive states by the B5.x suites. Visual states NOT evidenced by screenshots (dialogs, confirmations, error panels, populated-with-data tables, hover/focus rings) remain covered only by tests — recorded as **INSUFFICIENT** static-visual evidence rather than claimed.

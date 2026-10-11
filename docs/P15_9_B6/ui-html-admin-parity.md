@@ -42,8 +42,26 @@ Source: `src/pair/mission-control-server.ts` `UI_HTML` (~L163–420). Reachabili
 | Routine toggle (`rtTog`) | `POST /api/routines/:id/enable|disable` | enable/disable per row, labeled legacy-parity surface | ported + proven | same |
 | Legacy objective create (`mkObj`) | `POST /api/objectives` | `WorkforceAdmin` "Legacy objectives (compat API)" — **labeled distinct from vnext objectives** | ported + proven | same |
 
-## B5 — Verdict
+## B5 — Technical read panes (B6 R1-F1, audited individually — distinct from admin parity)
 
-Every UI_HTML administrative capability is **ported and proven** in `/app/system/business-admin` + `/app/workforce/admin` — confirmed by `workforce-admin.spec.ts` (merged B5.2 suite, still green in this branch's full regression). Improvements over UI_HTML are labeling-only (global/unfiltered reads marked; legacy vs vnext surfaces distinguished). No capability was silently dropped; none intentionally removed except the unlabeled global panes covered in the functional matrix.
+The UI_HTML nav exposes 9 read panes, each a thin viewer over one GET (`mission-control-server.ts` L180–183). Admin mutations above are fully ported; the read panes split differently — **4 panes have no consumer in the entire React SPA** (verified by grep: `health(`, `metrics(`, `experience`, `selfmod`/`selfImprove` have zero callers under `src/app/` and `src/pages/`):
 
-**No-staticDir operating mode:** when `serve-mission-control.mjs` runs without `deps.staticDir`, the same UI_HTML document still serves at `/` and `/ui` — that operating mode is **untouched and continues to exist** outside the SPA deployment. B6 verified this in code (`deps.staticDir ? serveStatic : UI_HTML` seam); running a second live server to re-prove it was out of scope per the mandate ("do not start, deploy or expose another server").
+| Pane | Endpoint | Modern destination | Verdict |
+|---|---|---|---|
+| Missions | `/api/missions` | `/app/missions` + detail | ported + proven |
+| Routing | `/api/routing` | `/app/system/observability` routing section | ported + proven |
+| Recovery | `/api/recovery` | `/app/system/observability` recovery explorer | ported + proven |
+| Approvals | `/api/approvals` | `/app/inbox` approvals lane | ported + proven |
+| Business | `/api/businesses` | `/app/system/business-admin` + scoped `/app/company` | ported + proven |
+| **Health** | `/api/health` | **none** | **NOT_PORTED** |
+| **Metrics** | `/api/metrics` | **none** | **NOT_PORTED** |
+| **Experience** | `/api/experience` | **none** | **NOT_PORTED** |
+| **Self-Improvement** | `/api/selfmod` | **none** | **NOT_PORTED** |
+
+These are technical operator views (subsystem health, runtime metrics, experience aggregates, selfmod status). They were never part of the React UI — only of UI_HTML. Porting them was deliberately not done in B6 (mandate: no new technical pages merely to green the matrix). **Supported alternative:** the endpoints remain live, and the no-staticDir operating mode below still serves the full UI_HTML document. Whether these panes are required in `/app` is an explicit Owner decision (C5 in cutover-preparation §H3).
+
+## B6 — Verdict
+
+Every UI_HTML **administrative** capability is **ported and proven** (`workforce-admin.spec.ts`, green in this branch's full regression). Of the **read panes**, 5/9 are ported and proven; **4 technical panes (Health, Metrics, Experience, Self-Improvement) are NOT_PORTED** — endpoints and the no-staticDir mode remain intact; porting them is an Owner decision, not implemented here.
+
+**No-staticDir operating mode:** when `serve-mission-control.mjs` runs without `deps.staticDir`, the same UI_HTML document still serves at `/` and `/ui` — that operating mode is **untouched and continues to exist** outside the SPA deployment. Verified in code (`deps.staticDir ? serveStatic : UI_HTML` seam); running a second live server to re-prove it was out of scope per the mandate ("do not start, deploy or expose another server").

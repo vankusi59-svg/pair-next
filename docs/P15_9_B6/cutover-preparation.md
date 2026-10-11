@@ -46,5 +46,8 @@ Not implemented (by design): `/` → `/app/company` (chosen target is `/app/miss
 - C2 — Owner decision on whether a real axe-core a11y scan (new dependency) is wanted before cutover, or accepted as an A2 follow-up.
 - C3 — Owner chooses the cutover mechanism: per-browser opt-in flag (ready now) vs. a later server-side default flip at A2. B6 deliberately did not build a runtime config system for this.
 - C4 — Remaining `API_MISSING` items (B0-E§6) are acknowledged; none regress vs. legacy.
+- C5 — **4 NOT_PORTED technical read panes** (UI_HTML Health `/api/health`, Metrics `/api/metrics`, Experience `/api/experience`, Self-Improvement `/api/selfmod`): no React UI consumer ever existed; endpoints remain reachable and the supported no-staticDir mode keeps them. Owner decides: port them (A2 scope), accept endpoint/no-staticDir access, or retire them.
+- C6 — **SSE token-in-query** (inherited transport: `EventSource` + `withTokenQuery`) — documented limitation in `authority-security-review.md` F2. Changing SSE auth architecture requires a separate authorized security decision; not a B6 regression.
+- C7 — 3 pre-existing environment vitest failures (`pair-p5` ×2 executable probes, `pair-f4` R5.1 spy fault-injection) — proven byte-identical on untouched BASE; Owner may want them fixed independently of cutover.
 
-No NO-GO item was found: no P0/P1 defect open; all shipped suites green on this branch.
+No NO-GO item was found: no P0/P1 defect open; the E2E Playwright regression is green on this branch (200/201, 0 fail) and the 3 vitest failures are proven environment-specific.

@@ -8,8 +8,18 @@ const mcToken = () =>
   process.env.PAIR_MC_TOKEN ||
   fs.readFileSync(path.join(process.env.PAIR_HOME ?? os.homedir(), "pair-mc-token"), "utf8").trim();
 
-const base = process.env.BASE_URL || "http://localhost:8790";
+/* Provenance (B6 R1-F3): captures run ONLY against an explicitly isolated
+ * synthetic fixture env — a dedicated `serve-mission-control.mjs` instance
+ * with `PAIR_MC_DIR=/tmp/pair-b6-shotenv` (fresh dir created for this
+ * purpose), stub conversation replies, template planner, and the fixture
+ * token from ~/pair-mc-token (a local dev credential, never a production
+ * one). The single business `BIZ_01M4M9A65MJ8RG6SX3N78J6Y67`
+ * ("b6-fixture-demo") was created through the canonical POST /api/businesses
+ * inside that env so populated states are provably synthetic. No real
+ * operator, business, mission or credential data exists in this env. */
+const base = process.env.BASE_URL || "http://localhost:8791";
 const out = "../../docs/P15_9_B6/screenshots";
+const FIXTURE_BIZ = "BIZ_01M4M9A65MJ8RG6SX3N78J6Y67";
 const shots = [
   ["/app/company", "company", 1440, 900],
   ["/app/objectives", "objectives", 1440, 900],
@@ -29,7 +39,7 @@ for (const theme of ["light", "dark"]) {
     await page.addInitScript((t) => {
       localStorage.setItem("pair.mc_token", t);
       localStorage.setItem("pair.operator_id", "op:e2e");
-      localStorage.setItem("pair.theme", document.documentElement.dataset.theme || "light");
+      localStorage.setItem("pair.business_id", FIXTURE_BIZ);
     }, mcToken());
     await page.addInitScript((th) => localStorage.setItem("pair.theme", th), theme);
     await page.goto(base + path, { waitUntil: "networkidle" }).catch(() => {});

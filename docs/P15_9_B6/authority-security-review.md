@@ -9,8 +9,9 @@
 
 ## F2 — Operator/auth continuity
 
-- Transport unchanged: `pair.mc_token` → `Authorization: Bearer`, `pair.operator_id` → `x-operator-id`. No new auth surface.
-- Token never rendered after save (masked input; only `configured/unconfigured` indicator); never in URLs, query strings, logs, or DOM attributes.
+- HTTP API transport unchanged: `pair.mc_token` → `Authorization: Bearer` header, `pair.operator_id` → `x-operator-id` header. No new auth surface was added in B6.
+- Token never rendered after save (masked input; only `configured/unconfigured` indicator); never written to logs or DOM attributes.
+- **Inherited limitation — SSE token-in-query (B6 R1-F2 correction):** `EventSource` cannot send custom headers, so `eventBus.ts` passes `withTokenQuery("/api/events")` → the token travels as `?token=…` in the SSE request URL. This pattern predates B6 (shared SSE transport; the legacy code path uses the same `withTokenQuery` helper). Exposure: the token may appear in HTTP request logs / proxy logs / browser history-like URL records wherever request URLs are recorded. The UI does **not** guarantee token secrecy for the SSE leg — an honest limitation, recorded here rather than claimed away. Changing SSE authentication architecture (e.g. cookie session, backend header bridge, short-lived stream token) is out of B6 scope and requires a separate authorized security decision.
 - `pair.theme` key preserved; theme toggle goes through `localStorage` source-of-truth + `pair.theme-changed` (B5.5 R1-F2) — same-tab consumers converge, no loop.
 - Credential change (`pair.operator-changed`, `pair.credentials-changed`) invalidates stale reads: `InboxCountsProvider` epoch guard drops old-credential resolutions at the render boundary; `reconnectStream()` clears the SSE buffer of old-token-authenticated events before re-creating the single shared EventSource (B5.5 R1-F3, e2e proven).
 
