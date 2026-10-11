@@ -922,6 +922,33 @@ describe("HOTFIX-B governed redispatch after WORK_ITEM_UNBLOCKED", () => {
     expect(boundMissionId(s, w1c)).toBe(m1);
     expect(missionCount(s)).toBe(1);
   });
+
+  /** R4 positive pairing: `assertCanonicalMissionLifecycle` permits
+   *  mission FAILED ↔ runtime ABORTED (abortMission). The canonical
+   *  fold + operator unblock must yield exactly one redispatch — the
+   *  ordering check's runtime terminal vocabulary now includes it. */
+  it("HB16: mission FAILED + runtime ABORTED → canonical fold + unblock → exactly one reopen", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding: b, ops } = seeded("hb16", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    const w1c = childOfKey(s, b, "w1");
+    const m1 = boundMissionId(s, w1c);
+    missionRunning(s, m1);
+    s.service.transitionMission(m1, "FAILED", `EXECUTOR:${m1}`);
+    s.runtime.transitionRuntime(m1, "ABORTED", "t");
+    expect(String(s.store.get("mission", m1).status)).toBe("FAILED");
+    expect(String(s.store.get("mission_runtime", `MRT_${m1}`).state))
+      .toBe("ABORTED");
+    s.biz.syncWorkItem(w1c);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("BLOCKED");
+    s.biz.unblockWorkItem(w1c, OP);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("READY");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).toBe("DISPATCHED");
+    expect(boundMissionId(s, w1c)).not.toBe(m1);
+    expect(missionCount(s)).toBe(2);
+  });
 });
 
 /* ---------------- Hotfix-A artifact fixture (adapted ctx) -------------- */

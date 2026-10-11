@@ -485,6 +485,16 @@ export function assertCanonicalWorkStatus(
  *  Returns null instead of throwing: provenance absence is a
  *  classification fact, and claim-vs-derived corruption is already
  *  caught by assertCanonicalWorkStatus. */
+/** HOTFIX-B/R4 — runtime terminal vocabulary for the ordering check:
+ *  the mission terminal set PLUS canonical `ABORTED` — the runtime
+ *  state `assertCanonicalMissionLifecycle` legitimately pairs with
+ *  FAILED/CANCELLED (`abortMission`). An arbitrary ABORTED row still
+ *  cannot authorize: the mission-spine check, fold binding and the
+ *  callers' `assertCanonicalMissionLifecycle` re-proof are unchanged. */
+const TERMINAL_RUNTIME_STATUSES: ReadonlySet<string> = new Set([
+  ...TERMINAL_MISSION_STATUSES, "ABORTED",
+]);
+
 export function proveCanonicalUnblockProvenance(
   store: PairEvidenceStore,
   workItem: Row,
@@ -553,7 +563,7 @@ export function proveCanonicalUnblockProvenance(
       e.new_state !== null && e.new_state !== undefined);
   const runtimeLast = runtimeSpine[runtimeSpine.length - 1];
   if (!runtimeLast ||
-      !TERMINAL_MISSION_STATUSES.has(String(runtimeLast.new_state)) ||
+      !TERMINAL_RUNTIME_STATUSES.has(String(runtimeLast.new_state)) ||
       !(Number(episode.seq) > Number(runtimeLast.seq))) {
     return null;
   }
