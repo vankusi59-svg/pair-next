@@ -1,7 +1,12 @@
 {
   "claim_id": "HOTFIX_A_CROSS_MISSION_ARTIFACT_INPUT",
-  "title": "Cross-mission canonical artifact input binding — governed consume of ACCEPTED artifacts from sibling missions",
-  "affected_surfaces": ["PLANNER", "ARTIFACT", "GATE_ROUTER", "RECOVERY_REPLAY"],
+  "title": "Cross-mission canonical artifact input binding \u2014 governed consume of ACCEPTED artifacts from sibling missions",
+  "affected_surfaces": [
+    "PLANNER",
+    "ARTIFACT",
+    "GATE_ROUTER",
+    "RECOVERY_REPLAY"
+  ],
   "required_tests": [
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
     "src/__tests__/pair-f2-artifact-handoff.test.ts",
@@ -10,5 +15,5 @@
     "src/__tests__/pair-f2-r1-remediation.test.ts"
   ],
   "invariants": [],
-  "description": "Fixes FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT for bound missions consuming artifacts ACCEPTED by earlier sibling missions. New seam: ArtifactDependencyResolver.listEligibleExternalInputSources(mission) — ACCEPTED+re-verified artifacts from missions sharing the consumer's Objective lineage (WOB->work item->WAL->objective->siblings; none/cross-objective/own = empty, CAP-bound). bindPlanExternalInputs stamps reserved pair_dataflow_sources (contract pair-external-artifact-input.v1) pinning consume_name + immutable source identity: one match binds, zero stays UNBOUND, >1 AMBIGUOUS_SOURCE; planner stamps stripped; drift/conflict SOURCE_BINDING. requiredEdges exempts only source-bound consumes (in-plan rule unchanged); assert seams prove stamp shape + CURRENT eligibility. Reconcile/runPlanning/replan thread input_artifact_sources; resolveForConsumer re-proves eligibility NOW -> canonical DependencyArtifactEntry pins; materializeForConsumer derives expected producer mission from durable execution row. 17 focused tests: positive bind, replay, byte-exact materialization, adversarial (absent/ambiguous/no-lineage/cross-objective/forged/tampered/corrupt-CAS/revoked/out-of-scope), in-plan + same-mission rules preserved. Regression: f2 53 + dataflow-incident 125 + f1 20 + f2-r1 43 + delivery suites pass; baseline flake f4 R5.1-crash fails identically on BASE 1f6d4af."
+  "description": "Fixes FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT for bound missions consuming artifacts ACCEPTED by earlier sibling missions. Seam: ArtifactDependencyResolver.listEligibleExternalInputSources \u2014 CANONICAL lineage proof via validateWorkOpenBindingById (consumer mission<->BOUND WOB<->delegated work item, PROVENANCE) + assertCanonicalWorkforceAllocationProvenance (exactly-one WAL<->objective<->business; malformed/forged/cross-business/non-BOUND sibling lineage throws FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE, never row-membership auth). F2 producer terminal authority: producerPassAnchored requires COMPLETED execution + governed linkage + exactly-one anchored RESULT_VALIDATED PASS whose artifact_ids contain the artifact; RUNNING/FAILED/unvalidated producers excluded. F3: cap enforced on ELIGIBLE set only (after all filters), 63/64/65 boundary + unrelated-artifact tests. bindPlanExternalInputs stamps reserved pair_dataflow_sources pinning consume_name+immutable identity: 1 match binds, 0 UNBOUND, >1 AMBIGUOUS; stamps stripped; drift/conflict SOURCE_BINDING. requiredEdges exempts only source-bound consumes; assert re-proves CURRENT eligibility. Reconcile/runPlanning/replan thread input_artifact_sources; resolveForConsumer re-proves NOW -> canonical pins; materialize derives producer mission from durable exec row. 25 tests on canonical fixtures (real objectives/workstreams/WAL/openWorkItem mint) + INT1 production-path (real MissionRuntime tick: planner receives eligible set, plan commits bound stamps). Regression: f2 53 + dataflow-incident 125 + f1 20 + f2-r1 43 pass; baseline flake f4 R5.1-crash fails identically on BASE 1f6d4af."
 }

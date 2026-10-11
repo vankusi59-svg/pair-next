@@ -58,7 +58,11 @@ import {
   REMOTE_CAPABILITY_SET,
   type ExternalInputArtifactSource,
 } from "./plan-dataflow.js";
-import { WORKFORCE_ALLOCATION_ENTITY } from "./workforce-allocation-evidence.js";
+import {
+  assertCanonicalWorkforceAllocationProvenance,
+  WORKFORCE_ALLOCATION_ENTITY,
+} from "./workforce-allocation-evidence.js";
+import { validateWorkOpenBindingById } from "./work-open-binding.js";
 
 export const DEPENDENCY_ARTIFACT_CONTRACT = "pair-artifact-dependency.v1";
 export const HANDOFF_CONTRACT = "pair-artifact-handoff.v1";
@@ -546,55 +550,140 @@ export class ArtifactDependencyResolver {
     mission: Record<string, unknown>,
   ): ExternalInputArtifactSource[] {
     const CAP = 64;
+    const lineageFail = (detail: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        detail,
+      );
+    };
     const consumerMissionId = String(mission.mission_id ?? "");
     const openId = String(mission.bound_open_id ?? "");
-    if (!openId) return [];
-    const binding = this.store.tryGet("work_open_binding", openId) as
-      | Record<string, unknown>
-      | null;
-    if (!binding) return [];
+    if (!openId) return []; // unbound mission — no authorized scope
+    // F1 — the consumer's own lineage must validate through the
+    // canonical work-open-binding authority: mission ↔ BOUND WOB ↔
+    // delegated work item ↔ business/project. A forged, rolled-back
+    // or mismatched binding fails closed, never "no scope".
+    const own = validateWorkOpenBindingById(this.store, openId, {
+      forMission: mission as never,
+      requireState: "BOUND",
+      mode: "PROVENANCE",
+    });
+    if (!own.ok || !own.binding) lineageFail(`consumer_binding:${own.reason}`);
+    const binding = own.binding as Record<string, unknown>;
     const workItemId = String(binding.work_item_id ?? "");
-    if (!workItemId) return [];
-    const allocs = (this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []).filter(
-      (r) => String(r.delegated_child_work_item_id ?? "") === workItemId,
+    // F1 — the work item's objective pin must be the canonical P15.4
+    // receipt: exactly one allocation, full provenance proof, and the
+    // same business as the binding.
+    const allocs = (
+      this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []
+    ).filter(
+      (r) =>
+        String((r as Record<string, unknown>).delegated_child_work_item_id ?? "") ===
+        workItemId,
     );
-    const objectiveIds = new Set(
-      allocs.map((r) => String(r.objective_id ?? "")).filter(Boolean),
-    );
-    // Exactly one objective may own the work item — zero means no
-    // authorized scope; more than one is contradictory lineage.
-    if (objectiveIds.size !== 1) return [];
-    const objectiveId = [...objectiveIds][0]!;
-    const siblingWorkItems = new Set(
-      (this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? [])
-        .filter((r) => String(r.objective_id ?? "") === objectiveId)
-        .map((r) => String(r.delegated_child_work_item_id ?? ""))
-        .filter(Boolean),
-    );
+    if (allocs.length !== 1) {
+      lineageFail(`work_item_allocation_count:${allocs.length}`);
+    }
+    try {
+      assertCanonicalWorkforceAllocationProvenance(
+        this.store,
+        allocs[0] as never,
+      );
+    } catch (err) {
+      lineageFail(
+        `work_item_allocation_invalid:${String((err as Error)?.message ?? err)}`,
+      );
+    }
+    const alloc = allocs[0] as Record<string, unknown>;
+    if (
+      String(alloc.business_id ?? "") !==
+      String((binding as Record<string, unknown>).business_id ?? "")
+    ) {
+      lineageFail("allocation_business_mismatch");
+    }
+    const objectiveId = String(alloc.objective_id ?? "");
+    const objective = this.store.tryGet("objective", objectiveId) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (!objective) lineageFail("objective_missing");
+    const obj = objective as Record<string, unknown>;
+    if (
+      String(obj.business_id ?? "") !==
+      String(binding.business_id ?? "")
+    ) {
+      lineageFail("objective_business_mismatch");
+    }
+    // F1 — sibling scope: every allocation of the objective must itself
+    // satisfy canonical provenance; every bound mission binding under
+    // those work items must validate against its real mission row.
+    const siblingWorkItems = new Set<string>();
+    for (const r of this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []) {
+      if (String(r.objective_id ?? "") !== objectiveId) continue;
+      try {
+        assertCanonicalWorkforceAllocationProvenance(
+          this.store,
+          r as never,
+        );
+      } catch (err) {
+        lineageFail(
+          `sibling_allocation_invalid:${String(r.allocation_id ?? "")}`,
+        );
+      }
+      const cid = String(r.delegated_child_work_item_id ?? "");
+      if (cid) siblingWorkItems.add(cid);
+    }
     const missionIds = new Set<string>([consumerMissionId]);
     for (const b of this.store.list("work_open_binding") ?? []) {
       const wid = String(b.work_item_id ?? "");
       const mid = String(b.mission_id ?? "");
-      if (wid && siblingWorkItems.has(wid) && mid) missionIds.add(mid);
+      if (!wid || !mid || !siblingWorkItems.has(wid)) continue;
+      const srcMission = this.store.tryGet("mission", mid) as
+        | Record<string, unknown>
+        | null;
+      if (!srcMission) continue; // binding reserves a mission not yet minted
+      const res = validateWorkOpenBindingById(
+        this.store,
+        String(b.open_id ?? ""),
+        {
+          forMission: srcMission as never,
+          requireState: "BOUND",
+          mode: "PROVENANCE",
+        },
+      );
+      if (!res.ok) {
+        lineageFail(
+          `sibling_binding_invalid:${String(b.open_id ?? "")}:${res.reason}`,
+        );
+      }
+      missionIds.add(mid);
     }
     const out: ExternalInputArtifactSource[] = [];
     for (const a of this.store.list("artifact") ?? []) {
+      const mid = String(a.mission_id ?? "");
+      if (!mid || mid === consumerMissionId || !missionIds.has(mid)) continue;
+      if (String(a.state ?? "") !== "ACCEPTED") continue;
+      const executionId = String(a.execution_id ?? "");
+      if (!executionId) continue;
+      // F2 — producer terminal validation: the pinned execution must be
+      // a COMPLETED execution carrying an anchored RESULT_VALIDATED PASS
+      // whose artifact_ids contain THIS artifact (F2 authority pattern).
+      if (!this.producerPassAnchored(executionId, String(a.artifact_id))) {
+        continue;
+      }
+      // Deep re-proof NOW — identity, acceptance history, retained bytes.
+      const row = this.service.artifacts.verifyArtifactForConsumption(
+        String(a.artifact_id),
+        { execution_id: executionId },
+      );
+      // F3 — the cap binds the ELIGIBLE set only; unrelated global
+      // artifacts never consume the bound.
       if (out.length >= CAP) {
         throw new IntegrityError(
           "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
           "external_input_eligible_bound_exceeded",
         );
       }
-      const mid = String(a.mission_id ?? "");
-      if (!mid || mid === consumerMissionId || !missionIds.has(mid)) continue;
-      if (String(a.state ?? "") !== "ACCEPTED") continue;
-      const executionId = String(a.execution_id ?? "");
-      if (!executionId) continue;
-      // Deep re-proof NOW — identity, acceptance history, retained bytes.
-      const row = this.service.artifacts.verifyArtifactForConsumption(
-        String(a.artifact_id),
-        { execution_id: executionId },
-      );
       out.push({
         contract: "pair-external-artifact-input.v1" as const,
         artifact_id: String(row.artifact_id),
@@ -609,6 +698,89 @@ export class ArtifactDependencyResolver {
       });
     }
     return out;
+  }
+
+  /**
+   * F2 — producer terminal-validation authority for a candidate source
+   * artifact: the pinned producer execution must be COMPLETED (row +
+   * result status), carry a durable correlation, and have EXACTLY ONE
+   * PASS execution_validation row that (a) binds the execution's
+   * mission/governed ids, (b) lists the artifact in artifact_ids, and
+   * (c) is anchored by an immutable RESULT_VALIDATED event under the
+   * execution's correlation. Contradictory anchors fail closed; a
+   * RUNNING/FAILED/unvalidated producer is simply not a source.
+   */
+  private producerPassAnchored(
+    executionId: string,
+    artifactId: string,
+  ): boolean {
+    const exec = this.store.tryGet("executor_execution", executionId) as
+      | Record<string, unknown>
+      | null;
+    if (!exec) return false;
+    if (String(exec.execution_state ?? "") !== "COMPLETED") return false;
+    if (
+      String(
+        (exec.result as Record<string, unknown> | undefined)?.status ?? "",
+      ) !== "COMPLETED"
+    ) {
+      return false;
+    }
+    if (!exec.correlation_id) return false;
+    const gov = this.store.tryGet(
+      "governed_task",
+      String(exec.governed_task_id),
+    ) as Record<string, unknown> | null;
+    if (
+      !gov ||
+      String(gov.mission_id) !== String(exec.mission_id) ||
+      String(gov.task_id) !== String(exec.task_id) ||
+      String(gov.executor_id) !== String(exec.executor_id)
+    ) {
+      return false;
+    }
+    const execEvents = this.store.listEvents(
+      "executor_execution",
+      String(exec.execution_id),
+    );
+    const anchored = (this.store.list("execution_validation") ?? []).filter(
+      (v) => {
+        if (String(v.execution_id) !== String(exec.execution_id)) return false;
+        if (String(v.status) !== "PASS") return false;
+        const vid = String(v.validation_id ?? "");
+        if (!vid) return false;
+        if (
+          String(v.mission_id) !== String(exec.mission_id) ||
+          String(v.governed_task_id) !== String(exec.governed_task_id)
+        ) {
+          return false;
+        }
+        if (!Array.isArray(v.artifact_ids)) return false;
+        if (
+          !(v.artifact_ids as unknown[]).map(String).includes(artifactId)
+        ) {
+          return false;
+        }
+        return execEvents.some(
+          (ev) =>
+            String(ev.event_type) === "RESULT_VALIDATED" &&
+            String(ev.new_state) === "PASS" &&
+            String(ev.correlation_id ?? "") ===
+              String(exec.correlation_id ?? "") &&
+            String(
+              (ev.metadata as Record<string, unknown> | undefined)
+                ?.validation_id ?? "",
+            ) === vid,
+        );
+      },
+    );
+    if (anchored.length > 1) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+        `contradictory_validations:${executionId}`,
+      );
+    }
+    return anchored.length === 1;
   }
 
   /**
