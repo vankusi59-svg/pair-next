@@ -215,6 +215,23 @@ const CLAUSE_NEGATION_LOOKBACK = 48;
 // is caught by POST_MENTION_GAP regardless).
 const POST_NOUN_LEFT_RE =
   /(?<![\p{L}\p{N}\p{M}_])(?:bài\s+viết|nội\s+dung|thông\s+báo|bài|bản|cái|đoạn|loại|kiểu|dạng|số|content|article|story|status|update|caption|blog|thread|threads|tweet|announcement|video|clip|reel|reels|vlog|a|an|the|this|that|these|those|một|vài|các|những|mỗi|mọi|some|any|all|each|every|write|viết|soạn|draft|compose|create|tạo|làm|prepare|produce|generate|author|craft|pen|schedule|scheduled|plan|\d+)(?![\p{L}\p{N}\p{M}_])\s*$/iu;
+// `đăng` is BOTH a Vietnamese delivery verb ("đăng bài lên kênh" =
+// post an article to the channel) and the head of content-production
+// noun compounds whose head sits BEFORE it ("bài đăng" = the post,
+// "lịch đăng" = the posting schedule, "gói bài đăng" = the post
+// bundle). Only a bounded left-neighbor class — Vietnamese classifiers/
+// content nouns, determiners, numerals and write/schedule-governing
+// verbs — makes it a noun; anything else keeps the verb reading
+// (fail-safe toward the delivery grammar, exactly like `post`).
+// Object-after-verb order is untouched: "đăng bài", "đăng lên",
+// "đăng các file" still authorize.
+const DANG_NOUN_LEFT_RE =
+  /(?<![\p{L}\p{N}\p{M}_])(?:bài|lịch|gói|bản|tin|nội\s+dung|thông\s+báo|danh\s+sách|chuỗi|số|video|clip|story|stories|reel|reels|vlog|blog|thread|threads|tweet|caption|post|bài\s+viết|article|content|status|update|announcement|schedule|scheduled|plan|draft|một|vài|các|những|mỗi|mọi|nhiều|ít|a|an|the|this|that|these|those|some|any|all|each|every|write|viết|soạn|compose|create|tạo|làm|prepare|produce|sản\s+xuất|generate|author|craft|pen|\d+)(?![\p{L}\p{N}\p{M}_])\s*$/iu;
+// `đăng ký` is the compound verb "subscribe/register" — never a send
+// instruction ("đăng ký kênh Telegram" = subscribe to the channel).
+// `đăng tải`/`đăng lên` ARE real publish/send verbs and must not be
+// suppressed — only `ký` is a noun-compound forgery to skip.
+const DANG_KY_RIGHT_RE = /^\s*ký(?![\p{L}\p{N}\p{M}_])/iu;
 // Only separators may sit between a noun `post` and the channel
 // mention — any real word (an object, a preposition) keeps the verb
 // reading alive.
@@ -327,6 +344,19 @@ export function detectTelegramDeliveryIntent(
             : false,
       );
       if (adjacent) continue;
+    }
+    // `đăng` — Vietnamese noun compounds put the head BEFORE the word
+    // ("bài đăng", "lịch đăng", "gói bài đăng"); a bounded left neighbor
+    // makes it content-production scope, never send authority. The
+    // compound verb `đăng ký` (subscribe) is likewise never a send.
+    // Verb-object order ("đăng bài lên kênh") is untouched.
+    if (/^đăng$/iu.test(m[0])) {
+      if (DANG_NOUN_LEFT_RE.test(text.slice(Math.max(0, v - 48), v))) {
+        continue;
+      }
+      if (DANG_KY_RIGHT_RE.test(text.slice(v + m[0].length))) {
+        continue;
+      }
     }
     const clause = mentions.some((p) => Math.abs(p.start - v) <= CLAUSE_SPAN);
     if (!clause || clauseNegated(text, v)) continue;
