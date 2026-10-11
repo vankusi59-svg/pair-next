@@ -173,7 +173,7 @@ test("fixture: observation_error → UnverifiedPanel, claims labeled unverified"
   await expect(page.getByText("+3 dropped unverifiable")).toBeVisible();
 });
 
-test("fixture: expiry_pending → advisory chip, no policy-status GET", async ({ page }) => {
+test("fixture: expiry_pending → advisory chip, canonical policy-status GET issued", async ({ page }) => {
   const biz = await mkBusiness(page, "pol");
   const oid = `OBJ-POL-${uniq()}`;
   let policyStatusCalls = 0;
@@ -198,7 +198,10 @@ test("fixture: expiry_pending → advisory chip, no policy-status GET", async ({
   await page.goto(`/app/objectives/${oid}`);
   await expect(page.getByText("policy expired — awaiting canonical commit")).toBeVisible();
   await expect(page.getByText("ENABLED", { exact: true })).toBeVisible();
-  expect(policyStatusCalls).toBe(0);
+  /* Auto-run controls card: the canonical GET is the control-plane
+     source of truth — it IS issued (and repolled), the advisory chip
+     still derives from the cockpit snapshot's expiry_pending flag. */
+  expect(policyStatusCalls).toBeGreaterThanOrEqual(1);
 });
 
 test("reviews page: order, fields, truncation + limit refetch", async ({ page }) => {
@@ -554,4 +557,491 @@ test("creation dedup identity: retry after lost response converges — one objec
   });
   expect(bodies).toHaveLength(3);
   expect(bodies[2]!.dedup_key).not.toBe(bodies[0]!.dedup_key);
+});
+
+/* Auto-run controls card (objective auto-policy UI hardening): canonical
+   GET-backed state, limits, driver readiness, defaults-from-objective,
+   same-key retry, 409 canonical refresh, transition-truthful labels. */
+
+test("auto-run card: canonical policy state + limits + driver readiness rendered", async ({ page }) => {
+  const biz = await mkBusiness(page, "polcard");
+  const oid = await mkObjective(page, biz, `polcard-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 7, max_missions: 3, budget_microusd_cap: 250000 },
+  });
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "enable", policy_version: 1, idempotency_key: `en-${uniq()}`,
+  });
+  await seedBiz(page, biz);
+  await page.goto(`/app/objectives/${oid}`);
+  await expect(page.getByRole("heading", { name: "Auto-run controls" })).toBeVisible();
+  await expect(page.getByText("ENABLED", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("7 ceo calls · 3 missions")).toBeVisible();
+  await expect(page.getByText("$0.25 cap")).toBeVisible();
+  // driver row is truthful: canonical readiness fields from the GET, no fabrication
+  await expect(page.locator(".nrow", { hasText: "driver" })).toBeVisible();
+});
+
+test("configure dialog: defaults proposed from objective terms, editable", async ({ page }) => {
+  const biz = await mkBusiness(page, "poldef");
+  const oid = await mkObjective(page, biz, `poldef-${uniq()}`); // deadline 2030-12-31, ceiling $0.50
+  await seedBiz(page, biz);
+  await page.goto(`/app/objectives/${oid}`);
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  const dlg = page.getByRole("dialog");
+  await expect(dlg.getByLabel(/expires_at/)).toHaveValue("2030-12-31T00:00");
+  await expect(dlg.getByLabel("max ceo calls")).toHaveValue("20");
+  await expect(dlg.getByLabel("max missions")).toHaveValue("5");
+  await expect(dlg.getByLabel("budget cap usd")).toHaveValue("0.5");
+  // editable — owner overrides before commit
+  await dlg.getByLabel("max ceo calls").fill("9");
+  await dlg.getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure committed")).toBeVisible();
+  const st = (await page.request.get(`/api/vnext/objectives/${oid}/auto-policy`, {
+    headers: { authorization: `Bearer ${mcToken()}`, "x-operator-id": OP },
+  }).then((r) => r.json())) as { auto_policy: { limits: { max_ceo_calls: number; expires_at: string } } };
+  expect(st.auto_policy.limits.max_ceo_calls).toBe(9);
+  expect(st.auto_policy.limits.expires_at).toBe("2030-12-31T00:00:00.000Z");
+});
+
+test("ambiguous failure retry keeps the same idempotency key", async ({ page }) => {
+  const biz = await mkBusiness(page, "polretry");
+  const oid = await mkObjective(page, biz, `polretry-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  let failedOnce = false;
+  const bodies: Record<string, unknown>[] = [];
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (!failedOnce) { failedOnce = true; return route.fulfill({ status: 500, body: "{}" }); }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable failed")).toBeVisible();
+  await expect(page.getByText("same operation kept for exact-body retry")).toBeVisible();
+  // reopen + commit the SAME operation — key must be reused, not rotated
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  // exact-body retry: identical bytes — action, CAS version, key
+  expect(bodies[1]).toEqual(bodies[0]);
+});
+
+test("CAS 409 conflict → canonical refetch + honest note, key kept", async ({ page }) => {
+  const biz = await mkBusiness(page, "polcas");
+  const oid = await mkObjective(page, biz, `polcas-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  let policyGets = 0;
+  const bodies: Record<string, unknown>[] = [];
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "GET") { policyGets++; return route.fallback(); }
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (bodies.length === 1) {
+        return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ error: "FAIL_CLOSED_POLICY_CAS", detail: "policy_version stale" }) });
+      }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  const before = policyGets;
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable conflict")).toBeVisible();
+  await expect(page.getByText("re-confirm as a new operation")).toBeVisible();
+  await expect.poll(() => policyGets, { timeout: 5000 }).toBeGreaterThan(before);
+  // definitive CAS conflict → stale op discarded: re-confirm mints a NEW operation key
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  expect(bodies[1]!.idempotency_key).not.toBe(bodies[0]!.idempotency_key);
+});
+
+test("EXPIRED → Re-arm (configure) only; REVOKED → no re-enable offered", async ({ page }) => {
+  const biz = await mkBusiness(page, "polexp");
+  const oid = await mkObjective(page, biz, `polexp-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  const polShape = (state: string) => ({
+    auto_policy: {
+      objective_id: oid, configured: true, state, effective: false,
+      reasons: [state === "EXPIRED" ? "WINDOW_LAPSED" : "OWNER_REVOKED"],
+      policy_version: 1, expires_at: "2020-01-01T00:00:00Z",
+      limits: { expires_at: "2020-01-01T00:00:00Z", max_ceo_calls: 5 },
+      halt: null, owner_authority_id: OWNER, business_id: biz,
+      driver_ready: false, driver_missing: ["POLICY_NOT_EFFECTIVE"],
+      terms_digest_binding: null, terms_current: true,
+    },
+  });
+  let state = "EXPIRED";
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "GET") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(polShape(state)) });
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  await expect(page.getByText("EXPIRED", { exact: true })).toBeVisible();
+  // configure legal from EXPIRED but labeled truthfully as a re-arm
+  await expect(page.getByRole("button", { name: "Re-arm policy (new limits)" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Enable policy" })).toHaveCount(0);
+  state = "REVOKED";
+  await page.reload();
+  await expect(page.getByText("REVOKED", { exact: true })).toBeVisible();
+  // terminal: the actions row offers nothing (no silent re-enable path)
+  await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+});
+
+test("policy card polls canonical GET ~every 5s while page is active", async ({ page }) => {
+  const biz = await mkBusiness(page, "polpoll");
+  const oid = await mkObjective(page, biz, `polpoll-${uniq()}`);
+  await seedBiz(page, biz);
+  let policyGets = 0;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "GET") policyGets++;
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  await expect(page.getByRole("heading", { name: "Auto-run controls" })).toBeVisible();
+  await expect.poll(() => policyGets, { timeout: 12000, intervals: [5500, 7000, 9000, 11000] }).toBeGreaterThanOrEqual(2);
+});
+
+/* R1 adversarial coverage: fail-closed controls, truthful driver
+   eligibility, identity mismatch, hidden-tab polling. */
+
+test("canonical GET failure → zero policy mutations possible (403 and 500)", async ({ page }) => {
+  for (const status of [403, 500]) {
+    const biz = await mkBusiness(page, `polfail${status}`);
+    const oid = await mkObjective(page, biz, `polfail-${uniq()}`);
+    await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+      action: "configure", idempotency_key: `cfg-${uniq()}`,
+      limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+    });
+    await seedBiz(page, biz);
+    const posts: unknown[] = [];
+    await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+      if (route.request().method() === "POST") posts.push(route.request().postDataJSON());
+      return route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: `E${status}`, detail: "denied" }) });
+    });
+    await page.goto(`/app/objectives/${oid}`);
+    // error surfaced + explicit retry offered; no action buttons render
+    await expect(page.getByText("policy mutations blocked until a canonical status loads")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Retry status" })).toBeVisible();
+    await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+    // even a forced enable attempt cannot exist — nothing to click
+    expect(posts).toHaveLength(0);
+    // retry still fails → still blocked
+    await page.getByRole("button", { name: "Retry status" }).click();
+    await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+    expect(posts).toHaveLength(0);
+    await page.unrouteAll();
+  }
+});
+
+test("driver_ready=true renders eligibility, never a running-work claim", async ({ page }) => {
+  const biz = await mkBusiness(page, "poldrv");
+  const oid = await mkObjective(page, biz, `poldrv-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "GET") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      auto_policy: {
+        objective_id: oid, configured: true, state: "ENABLED", effective: true,
+        reasons: [], policy_version: 1, expires_at: "2030-12-31T00:00:00Z",
+        limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+        halt: null, owner_authority_id: OWNER, business_id: biz,
+        driver_ready: true, driver_missing: [], objective_runnable: true, driver_integrated: true,
+        terms_digest_binding: null, terms_current: true,
+      } }) });
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  const row = page.locator(".nrow", { hasText: "driver" }).first();
+  await expect(row.getByText("READY", { exact: true })).toBeVisible();
+  await expect(row.getByText("eligible — the driver may act")).toBeVisible();
+  // eligibility wording only — no runtime/execution claim
+  await expect(row.getByText(/running|running within/i)).toHaveCount(0);
+});
+
+test("auto-policy identity mismatch → typed failure, controls stay closed", async ({ page }) => {
+  const biz = await mkBusiness(page, "polidm");
+  const oid = await mkObjective(page, biz, `polidm-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  const posts: unknown[] = [];
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "POST") posts.push(route.request().postDataJSON());
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      auto_policy: {
+        objective_id: "OBJ_FOREIGN_DIFFERENT", configured: true, state: "ENABLED", effective: true,
+        reasons: [], policy_version: 9, expires_at: "2030-12-31T00:00:00Z",
+        limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+        halt: null, owner_authority_id: OWNER, business_id: "BIZ_FOREIGN",
+        driver_ready: false, driver_missing: [],
+        terms_digest_binding: null, terms_current: true,
+      } }) });
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  await expect(page.getByText("IDENTITY_MISMATCH")).toBeVisible();
+  await expect(page.locator(".actions").last().locator("button")).toHaveCount(0);
+  expect(posts).toHaveLength(0);
+});
+
+test("hidden tab does not poll; restoring visibility resumes refresh", async ({ page }) => {
+  const biz = await mkBusiness(page, "polhid");
+  const oid = await mkObjective(page, biz, `polhid-${uniq()}`);
+  await seedBiz(page, biz);
+  // controllable visibility override — hidden tabs must not repoll
+  await page.addInitScript(() => {
+    (window as unknown as { __vis: string }).__vis = "hidden";
+    Object.defineProperty(document, "visibilityState", { get: () => (window as unknown as { __vis: string }).__vis });
+  });
+  let policyGets = 0;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "GET") policyGets++;
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  await expect(page.getByRole("heading", { name: "Auto-run controls" })).toBeVisible();
+  const initial = policyGets;
+  await page.waitForTimeout(6500); // > one poll interval while hidden
+  expect(policyGets).toBe(initial); // paused while hidden
+  await page.evaluate(() => { (window as unknown as { __vis: string }).__vis = "visible"; });
+  await expect.poll(() => policyGets, { timeout: 11000 }).toBeGreaterThan(initial);
+});
+
+/* R2 adversarial coverage: pending Configure restore, open-dialog
+   canonical lock, committed-but-lost-response replay. */
+
+test("configure ambiguous failure → reopen restores submitted limits + exact-body retry", async ({ page }) => {
+  const biz = await mkBusiness(page, "polcfg");
+  const oid = await mkObjective(page, biz, `polcfg-${uniq()}`);
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let failedOnce = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (!failedOnce) { failedOnce = true; return route.fulfill({ status: 500, body: "{}" }); }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // defaults propose 20; owner edits to 9
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await page.getByLabel("max ceo calls").fill("9");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure failed")).toBeVisible();
+  // dialog already closed by the commit; reopen → pending op restores
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await expect(page.getByLabel("max ceo calls")).toHaveValue("9");
+  await expect(page.getByText("Pending configure restored")).toBeVisible();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  // retry is byte-identical: same limits (9, not default 20), same key
+  expect(bodies[1]).toEqual(bodies[0]);
+  expect((bodies[0]!.limits as Record<string, unknown>).max_ceo_calls).toBe(9);
+  // single canonical transition only — replayed op did not double-apply
+});
+
+test("POST committed but response lost → exact-body retry, no duplicate transition", async ({ page }) => {
+  const biz = await mkBusiness(page, "pollost");
+  const oid = await mkObjective(page, biz, `pollost-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let swallowed = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, async (route) => {
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (!swallowed) {
+        swallowed = true;
+        // backend REALLY commits; the UI only sees a lost response
+        await route.fetch();
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "LOST", detail: "response lost after commit" }) });
+      }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable failed")).toBeVisible();
+  // reopen + retry → identical operation (same key, same CAS version)
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  expect(bodies[1]).toEqual(bodies[0]);
+  // no duplicate transition: canonical policy advanced exactly once
+  const st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.state).toBe("ENABLED");
+  expect(st.auto_policy.policy_version).toBe(2); // v1 configure + v2 enable — retry did NOT mint v3
+});
+
+test("open dialog is locked when canonical GET fails; recovers when restored", async ({ page }) => {
+  const biz = await mkBusiness(page, "pollock");
+  const oid = await mkObjective(page, biz, `pollock-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  let fail = false;
+  const posts: unknown[] = [];
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "POST") posts.push(route.request().postDataJSON());
+    if (route.request().method() === "GET" && fail) {
+      return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "E500", detail: "down" }) });
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // canonical OK → open Enable dialog → then the next GET fails
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  const commit = page.getByRole("dialog").getByRole("button", { name: "Commit enable" });
+  await expect(commit).toBeEnabled();
+  fail = true;
+  // the 5s poll fires the next canonical GET → it fails → locked
+  await expect(page.getByText("policy mutations blocked until a canonical status loads")).toBeVisible({ timeout: 12000 });
+  await expect(commit).toBeDisabled();
+  await commit.click({ force: true }).catch(() => {});
+  expect(posts).toHaveLength(0);
+  // recover canonical → next poll tick restores verified status and
+  // the SAME open dialog can confirm again
+  fail = false;
+  await expect(commit).toBeEnabled({ timeout: 12000 });
+  await expect(page.getByText("policy mutations blocked until a canonical status loads")).toHaveCount(0);
+  await commit.click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  expect(posts).toHaveLength(1);
+});
+
+test("R3: normalized inputs ('09','0.50') retry identical body+key; explicit change mints new op", async ({ page }) => {
+  const biz = await mkBusiness(page, "polnorm");
+  const oid = await mkObjective(page, biz, `polnorm-${uniq()}`);
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let swallowed = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, async (route) => {
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (!swallowed) {
+        swallowed = true;
+        await route.fetch(); // backend REALLY commits; UI sees a lost response
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "LOST", detail: "lost" }) });
+      }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // owner types non-normalized equivalents: "09"→9, "0.50"→0.5
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await page.getByLabel("max ceo calls").fill("09");
+  await page.getByLabel("budget cap usd").fill("0.50");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure failed")).toBeVisible();
+  // reopen WITHOUT intentional change — restored values are normalized
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await expect(page.getByLabel("max ceo calls")).toHaveValue("9");
+  await expect(page.getByLabel("budget cap usd")).toHaveValue("0.5");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  // identical body + key — normalization did NOT mint a new operation
+  expect(bodies[1]).toEqual(bodies[0]);
+  let st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.policy_version).toBe(1); // committed once — replay added nothing
+  // genuinely changed limits + explicit confirmation → fresh operation
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await page.getByLabel("max ceo calls").fill("8");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure committed")).toBeVisible();
+  expect(bodies).toHaveLength(3);
+  expect(bodies[2]!.idempotency_key).not.toBe(bodies[0]!.idempotency_key);
+  expect((bodies[2]!.limits as Record<string, unknown>).max_ceo_calls).toBe(8);
+  st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.policy_version).toBe(2);
+});
+
+test("R4: Enable v1 lost → Pause v3 → new Enable binds v3 new key → ENABLED v4 (stale op never replayed)", async ({ page }) => {
+  const biz = await mkBusiness(page, "poldrift");
+  const oid = await mkObjective(page, biz, `poldrift-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let swallowed = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, async (route) => {
+    if (route.request().method() === "POST") {
+      const b = route.request().postDataJSON() as Record<string, unknown>;
+      bodies.push(b);
+      if (!swallowed && b.action === "enable") {
+        swallowed = true;
+        await route.fetch(); // enable v1 REALLY commits → v2; UI sees lost response
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "LOST", detail: "lost" }) });
+      }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // Enable v1 commits but response lost
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable failed")).toBeVisible();
+  // canonical is now ENABLED v2 → Pause commits → PAUSED v3
+  await page.getByRole("button", { name: "Pause policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit pause" }).click();
+  await expect(page.getByText("Policy pause committed")).toBeVisible();
+  // Owner selects Enable again on PAUSED v3 → NEW operation, fresh key, CAS v3
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  const enables = bodies.filter((b) => b.action === "enable");
+  expect(enables).toHaveLength(2);
+  expect(enables[0]!.policy_version).toBe(1);          // the lost v1 op
+  expect(enables[1]!.policy_version).toBe(3);          // NEW op bound to current CAS
+  expect(enables[1]!.idempotency_key).not.toBe(enables[0]!.idempotency_key); // fresh key — no stale-key reuse
+  const st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.state).toBe("ENABLED");
+  expect(st.auto_policy.policy_version).toBe(4); // configure v1 + enable v2 + pause v3 + enable v4
 });

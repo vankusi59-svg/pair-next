@@ -1,13 +1,11 @@
 {
-  "claim_id": "P15_10_A2_OWNER_REVIEW_SIGNOFF",
-  "title": "P15.10-A2: owner review sign-off — accept TARGET_MET_CANDIDATE → ACHIEVED",
-  "affected_surfaces": ["MISSION_CONTROL", "BUSINESS_OBJECTIVE", "UI"],
+  "claim_id": "P15_10_AUTORUN_CONTROLS_UI",
+  "title": "Objective Auto-run controls UI hardening — fail-closed canonical controls + versioned exact-body idempotency",
+  "affected_surfaces": ["UI"],
   "required_tests": [
-    "src/__tests__/pair-p15-a2-review-signoff.test.ts",
-    "src/__tests__/pair-p15-10d.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-p15-9a-company-cockpit.test.ts"
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-a2-review-signoff.test.ts"
   ],
   "invariants": [],
-  "description": "Closes the A2 gap proven on a live stack (objective OBJ_836946b48dc51100550aeda6 parked at OWNER_SIGN_OFF_REQUIRED with buttons disabled 'API_MISSING'). New POST /api/vnext/objectives/:id/review-signoff (action:'accept' only) → new ObjectiveReviewSignoffService (src/pair/objective-review-signoff.ts) → existing transitionStatus(). Durable receipt entity objective_review_signoff + OBJECTIVE_REVIEW_SIGNED_OFF event. UI: Owner Inbox 'Accept ACHIEVED' wired through the existing ConfirmDialog pattern pinning review_id; 'Request changes' stays disabled, truthfully labeled. R1 audit-closure corrections: F1 normalized reason bound into idempotency semantics (same key + changed reason rejects); F2 strict HTTP request schema — non-string action/review_id/idempotency_key/reason → typed 400 FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST with zero mutation; F3 work-item guard uses canonical proof — assertCanonicalWorkStatus + proveWorkItemDone (forged DONE / unproven CANCELLED rejects); F4 non-owner → HTTP 403, first response returns the persisted put() row (version ≥1), replay revalidates the receipt against its OBJECTIVE_REVIEW_SIGNED_OFF anchor, UI call uses noAuthPrompt and keeps one idempotency key per opened dialog so retries replay the same operation. R1-F5: 7 new focused tests incl. real HTTP-boundary suite and a second-connection SQLite contention case. No lifecycle/review/scheduler/auto-driver/planner/executor/schema changes; no request_changes; no merge/deploy/cutover."
+  "description": "Owner-facing Auto-run controls on /app/objectives/:id, canonical GET /auto-policy polled 5s while visible (abort-per-tick). R1: READY/NOT READY eligibility + driver_missing verbatim; controls only on verified canonical status (cockpit snapshot labeled non-authoritative, never authorizes); IDENTITY_MISMATCH typed failure. R2: pendingCfg restores unresolved Configure limits/version/key on reopen (no default reset); ConfirmDialog.confirmDisabled + in-runPolicy canonical/context guard locks open dialogs on GET failure (zero POST, incl. force-click). R3: limits canonicalized to serialized object before signing — 09/0.50 replay identical bytes+key. R4: operation identity = action+objective+CAS policy_version+canonical limits; unresolved ops preserved under their own keys (pending Configure retried verbatim via limits-equality match even across version drift); new op on newer canonical mints fresh key bound to current CAS; committed response validated vs expected post-action state+identity else discarded+refetched (INCONSISTENT_RESPONSE — never reports committed on inconsistent state). Adversarial e2e: 403/500 zero-POST, driver_ready≠running, lost-response replay no duplicate transition, CAS→new key, identity mismatch, hidden-tab pause/resume, open-dialog lock/recover, normalized-input replay, v1-lost→pause→v3-enable new-key→ENABLED v4. Zero backend/scheduler/schema changes. objectives.spec.ts 35/35 pass full suite (baseline 'policy HALT' flake did not reproduce; documented P15.9-B5.4, passes isolated); tsc+vite clean."
 }
