@@ -59,18 +59,20 @@ Evidence: `app.spec.ts` keyboard/a11y tests + B6 manual pass. Existing tooling o
 
 **Unresolved:** no axe-core scan (new dependency not allowed by the mandate); automated contrast is computed, not instrumented — flagged as honest limitation, not claimed as a pass beyond what was verified.
 
-## Screenshot evidence — provenance & labels (B6 R1-F3)
+## Screenshot evidence — provenance & labels (B6 R2)
 
-All 16 PNGs under `screenshots/` were **regenerated** after R1 against an explicitly isolated synthetic fixture env: dedicated `serve-mission-control.mjs` on `:8791` with `PAIR_MC_DIR=/tmp/pair-b6-shotenv` (fresh dir), stub conversation replies, template planner, fixture token from `~/pair-mc-token` (local dev credential — never a production credential, and never visible in any shot since the UI masks it). One synthetic business `BIZ_01M4M9A65MJ8RG6SX3N78J6Y67` ("b6-fixture-demo") was created inside that env via canonical `POST /api/businesses`. No real operator/business/mission data exists in the fixture env. `scripts/b6-shots.mjs` documents this in-source.
+All 16 PNGs under `screenshots/` were **regenerated** at R2 by `scripts/b6-shots.mjs`, which now spawns its **own** `serve-mission-control.mjs` inside the run: fresh `PAIR_MC_DIR` per run (`mkdtemp /tmp/pair-b6-shots-*`), synthetic token `b6-fixture-token` via `PAIR_MC_TOKEN` (the real dev credential is never read — nothing in shots, console, or committed files is a real secret), stub conversation replies, template planner. Isolation is **affirmatively verified at runtime**, not asserted by comments: the script asserts `GET /api/businesses` returns an empty list before seeding (aborts otherwise), creates exactly one synthetic business (`b6-fixture-demo`, id `BIZ_01M4M9QK8TEZ8CYYS7Z2PAZPB0` in the R2 run) via canonical `POST /api/businesses`, serializes it into `addInitScript` as an argument, and **before every capture** asserts `localStorage["pair.business_id"]` equals it; populated shots additionally fail if "No business selected" renders or if the fixture business is absent from the page text. Navigation errors are no longer swallowed — a non-OK response aborts the run.
+
+Runtime log (R2 run): `fixture env: PAIR_MC_DIR=/tmp/pair-b6-shots-0GNAkb PORT=8792 token=synthetic` → `fixture business: BIZ_01M4M9QK8TEZ8CYYS7Z2PAZPB0` → `shot … OK (business rendered)` for all populated shots → `done — all captures verified`.
 
 | Shot (×light/dark) | Viewport | What it proves | State |
 |---|---|---|---|
-| `company-*` | 1440 + 390 | cockpit layout, sidebar/tab bar, KPI chip layout, theme tokens | populated (1 fixture business, empty objectives) |
-| `objectives-*` | 1440 | objective list states + honest empty lane | populated business, empty objectives |
+| `company-*`, `company-mobile-*` | 1440 + 390 | cockpit layout, sidebar/tab bar, KPI chips, theme tokens | **populated, asserted** — fixture business rendered (asserted by script) |
+| `objectives-*` | 1440 | objective list for a selected business with zero objectives — distinctly a selected-empty state, not no-business | **populated business, empty objectives** (asserted: business rendered AND no "No business selected") |
 | `inbox-*` | 768 | tablet layout, lanes, badge | empty inbox lanes |
 | `missions-*` | 1440 | mission list + global-unfiltered label | empty mission table |
 | `system-cost-*` | 1024 | tablet cost page, policy/profile tables | empty canonical tables |
-| `system-providers-*` | 1440 | catalogs + gate labels | populated provider catalog from fixture env |
+| `system-providers-*` | 1440 | catalogs + gate labels | provider catalog from fixture env |
 | `chat-mobile-*` | 390 | mobile chat layout, composer reachability | empty conversation list |
 
 **Scope of proof:** these 8 views × 2 themes are a **subset**, not all routes and not all interactive states — deep-link coverage of all 15 routes is proven by `b6-acceptance.spec.ts` (executable), and interactive states by the B5.x suites. Visual states NOT evidenced by screenshots (dialogs, confirmations, error panels, populated-with-data tables, hover/focus rings) remain covered only by tests — recorded as **INSUFFICIENT** static-visual evidence rather than claimed.

@@ -18,10 +18,10 @@ BASE `7791800cc764974d659f335d1e0e569a97106411` → HEAD (see verification-repor
 | G-rollback | documented procedure | `rollback-plan.md` | doc review; Level-1 proven by e2e | **PASS** (documentation deliverable; execution deferred to real cutover) |
 | G-docs | 8 deliverables present, observed-behavior-only | `docs/P15_9_B6/*` | file inventory | **PASS** |
 | G-verification | harness READY + real counts | `verification-report.md` | `verify:change --base 7791800` | **PASS** — READY_FOR_INDEPENDENT_AUDIT |
-| G-screenshot-evidence | deterministic sanitized captures with provenance | `visual-responsive-accessibility.md` screenshot section | regenerated on isolated fixture env `/tmp/pair-b6-shotenv`; labeled per-shot | **PASS (subset)** — 8 views × 2 themes proven; unevidenced interactive states recorded INSUFFICIENT, not claimed |
+| G-screenshot-evidence | deterministic sanitized captures with runtime-verified provenance | `visual-responsive-accessibility.md` screenshot section + `verification-report.md` | R2: `b6-shots.mjs` self-spawns the fixture server (fresh mkdtemp `PAIR_MC_DIR`, synthetic `PAIR_MC_TOKEN`), asserts empty env + `localStorage` + business-render before every capture; nav errors abort | **PASS (subset)** — 8 views × 2 themes verified captures; unevidenced interactive states recorded INSUFFICIENT, not claimed |
 | G-owner-signoff | Owner approves intentional differences | — | Owner decision | **INSUFFICIENT** — by design awaiting Owner (C1 in cutover-preparation) |
 | G-axe-scan | automated a11y scanner run | — | not run | **N/A** — new dependency out of B6 scope; flagged for A2 |
 
 **Verdict definitions**: GO = all gates PASS, no conditions. CONDITIONAL = gates pass with documented Owner-decision conditions. NO-GO = any FAIL or unresolvable INSUFFICIENT.
 
-**Verdict: CONDITIONAL** — G-parity and G-vitest carry honest CONDITIONAL verdicts (4 unported technical panes needing Owner decision; 3 pre-existing environment test failures proven identical on BASE); G-owner-signoff awaits Owner by design; G-axe-scan N/A. No FAIL gate: conditions C1–C5 in `cutover-preparation.md` §H3 are decisions/evidence items, not code defects.
+**Verdict: CONDITIONAL** — G-parity and G-vitest carry honest CONDITIONAL verdicts (4 unported technical panes needing Owner decision; 3 pre-existing environment test failures proven identical on BASE); G-owner-signoff awaits Owner by design; G-axe-scan N/A. No FAIL gate: conditions C1–C7 in `cutover-preparation.md` §H3 are decisions/evidence items, not code defects.
