@@ -944,3 +944,56 @@ test("open dialog is locked when canonical GET fails; recovers when restored", a
   await expect(page.getByText("Policy enable committed")).toBeVisible();
   expect(posts).toHaveLength(1);
 });
+
+test("R3: normalized inputs ('09','0.50') retry identical body+key; explicit change mints new op", async ({ page }) => {
+  const biz = await mkBusiness(page, "polnorm");
+  const oid = await mkObjective(page, biz, `polnorm-${uniq()}`);
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let swallowed = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, async (route) => {
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (!swallowed) {
+        swallowed = true;
+        await route.fetch(); // backend REALLY commits; UI sees a lost response
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "LOST", detail: "lost" }) });
+      }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // owner types non-normalized equivalents: "09"→9, "0.50"→0.5
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await page.getByLabel("max ceo calls").fill("09");
+  await page.getByLabel("budget cap usd").fill("0.50");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure failed")).toBeVisible();
+  // reopen WITHOUT intentional change — restored values are normalized
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await expect(page.getByLabel("max ceo calls")).toHaveValue("9");
+  await expect(page.getByLabel("budget cap usd")).toHaveValue("0.5");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  // identical body + key — normalization did NOT mint a new operation
+  expect(bodies[1]).toEqual(bodies[0]);
+  let st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.policy_version).toBe(1); // committed once — replay added nothing
+  // genuinely changed limits + explicit confirmation → fresh operation
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await page.getByLabel("max ceo calls").fill("8");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure committed")).toBeVisible();
+  expect(bodies).toHaveLength(3);
+  expect(bodies[2]!.idempotency_key).not.toBe(bodies[0]!.idempotency_key);
+  expect((bodies[2]!.limits as Record<string, unknown>).max_ceo_calls).toBe(8);
+  st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.policy_version).toBe(2);
+});

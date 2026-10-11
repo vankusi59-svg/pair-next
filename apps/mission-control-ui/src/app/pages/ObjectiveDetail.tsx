@@ -193,10 +193,25 @@ export function ObjectiveDetail() {
       return;
     }
     const seq = ++opSeq.current;
-    /* Operation signature: action + identity + CAS version + limit
-       semantics. A retry of the SAME operation replays the stored
-       body verbatim; any changed field is a different operation. */
-    const sig = `${action}:${ctx.oid}:${policyVersion ?? "none"}:${action === "configure" ? JSON.stringify(polLimits) : ""}`;
+    /* Canonicalize limits FIRST: the operation signature derives from
+       request semantics (serialized limits), never raw input strings —
+       "09" and "9" are the same operation, so an unchanged retry
+       always replays the stored body and idempotency key. */
+    let canonLimits: { expires_at: string; max_ceo_calls?: number; max_missions?: number; budget_microusd_cap?: number } | undefined;
+    if (action === "configure") {
+      const limits: { expires_at: string; max_ceo_calls?: number; max_missions?: number; budget_microusd_cap?: number } = {
+        expires_at: polLimits.expires ? new Date(polLimits.expires).toISOString() : "",
+      };
+      if (polLimits.ceo.trim()) limits.max_ceo_calls = Number(polLimits.ceo);
+      if (polLimits.missions.trim()) limits.max_missions = Number(polLimits.missions);
+      if (polLimits.budget.trim()) limits.budget_microusd_cap = Math.round(Number(polLimits.budget) * 1e6);
+      if (!limits.expires_at || (limits.max_ceo_calls === undefined && limits.max_missions === undefined && limits.budget_microusd_cap === undefined)) {
+        setMutNote("Configure rejected: limits need expires_at plus at least one cap (max_ceo_calls | max_missions | budget_microusd_cap).");
+        return;
+      }
+      canonLimits = limits;
+    }
+    const sig = `${action}:${ctx.oid}:${action === "configure" ? JSON.stringify(canonLimits) : ""}`;
     let body = pendingOps.current[sig];
     if (!body) {
       body = { action, idempotency_key: crypto.randomUUID() };
@@ -208,19 +223,7 @@ export function ObjectiveDetail() {
         body.halt_scope = "OBJECTIVE";
         body.halt_reason = "owner halt via company cockpit";
       }
-      if (action === "configure") {
-        const limits: { expires_at: string; max_ceo_calls?: number; max_missions?: number; budget_microusd_cap?: number } = {
-          expires_at: polLimits.expires ? new Date(polLimits.expires).toISOString() : "",
-        };
-        if (polLimits.ceo.trim()) limits.max_ceo_calls = Number(polLimits.ceo);
-        if (polLimits.missions.trim()) limits.max_missions = Number(polLimits.missions);
-        if (polLimits.budget.trim()) limits.budget_microusd_cap = Math.round(Number(polLimits.budget) * 1e6);
-        if (!limits.expires_at || (limits.max_ceo_calls === undefined && limits.max_missions === undefined && limits.budget_microusd_cap === undefined)) {
-          setMutNote("Configure rejected: limits need expires_at plus at least one cap (max_ceo_calls | max_missions | budget_microusd_cap).");
-          return;
-        }
-        body.limits = limits;
-      }
+      if (canonLimits) body.limits = canonLimits;
       /* An intentional different configure body supersedes the older
          pending one — an explicit new operation, never an implicit
          reset of the stored retry. */
@@ -353,7 +356,10 @@ export function ObjectiveDetail() {
       action: a,
       biz: biz!,
       oid: id,
-      policyVersion: pc ? (pc.policy_version ?? null) : (polCtl?.configured ? (polCtl.policy_version ?? null) : null),
+      /* CAS binding for a NEW operation always comes from current
+         canonical state; a pending op's own version stays sealed
+         inside its stored body and is replayed verbatim on retry. */
+      policyVersion: polCtl?.configured ? (polCtl.policy_version ?? null) : null,
     });
   };
 
