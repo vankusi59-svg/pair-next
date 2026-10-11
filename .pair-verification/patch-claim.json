@@ -1,7 +1,7 @@
 {
   "claim_id": "HOTFIX_A_CROSS_MISSION_ARTIFACT_INPUT",
   "title": "Cross-mission canonical artifact input binding — governed consume of ACCEPTED artifacts from sibling missions",
-  "affected_surfaces": ["BACKEND"],
+  "affected_surfaces": ["PLANNER", "ARTIFACT", "GATE_ROUTER", "RECOVERY_REPLAY"],
   "required_tests": [
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
     "src/__tests__/pair-f2-artifact-handoff.test.ts",
