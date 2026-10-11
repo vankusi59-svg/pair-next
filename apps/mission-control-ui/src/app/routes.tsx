@@ -1,8 +1,8 @@
+import { Navigate } from "react-router-dom";
 import { AppShell } from "./AppShell";
 import { Company } from "./pages/Company";
 import { ObjectiveDetail } from "./pages/ObjectiveDetail";
 import { ObjectiveList } from "./pages/ObjectiveList";
-import { PlannedPage } from "./pages/Planned";
 import { Inbox } from "./pages/Inbox";
 import { Ceo } from "./pages/Ceo";
 import { Reviews } from "./pages/Reviews";
@@ -30,13 +30,9 @@ export const appRoute = {
   children: [
     {
       index: true,
-      element: (
-        <PlannedPage
-          title="Company OS"
-          detail="Select a section — Company Cockpit is the owner home and lands in B2."
-          phase="B2"
-        />
-      ),
+      // B6: the tree is complete — /app lands on the owner home instead of
+      // a stale "lands in B2" placeholder.
+      element: <Navigate to="/app/company" replace />,
     },
     {
       path: "company",
