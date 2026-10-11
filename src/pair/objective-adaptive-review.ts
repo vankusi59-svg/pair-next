@@ -452,9 +452,67 @@ export function assertCanonicalWorkStatus(
   return derived;
 }
 
+/** HOTFIX-B/R1-F1 — the exact unblock-event provenance contract behind
+ *  REOPENABLE, shared by review classification AND the final dispatch
+ *  boundary (one authority, never two interpretations).
+ *
+ *  Returns the authentic WORK_ITEM_UNBLOCKED event iff the work item's
+ *  CURRENT READY state was produced by a canonical unblock that
+ *  follows the LATEST bound predecessor:
+ *   1. a BOUND work-open binding exists (the predecessor it must
+ *      follow — never a stale attempt);
+ *   2. the LAST status-producing event is WORK_ITEM_UNBLOCKED in the
+ *      exact shape unblockWorkItem mints — old_state BLOCKED,
+ *      new_state READY, actor `operator:<id>` (operator provenance);
+ *   3. the derived status immediately BEFORE that event is honestly
+ *      BLOCKED (the transition is correctly ordered, not synthetic);
+ *   4. an earlier BLOCKED-producing status event references the
+ *      latest bound mission — the terminal fold's WORK_ITEM_SYNCED /
+ *      WORK_ITEM_STATUS_SYNCED (metadata.mission_id) or an operator
+ *      WORK_ITEM_BLOCKED that paused it (metadata.mission_paused).
+ *  READY produced by WORK_REWORK_REQUESTED, WORK_ITEM_OPEN_ROLLED_BACK,
+ *  a malformed/mis-ordered unblock, or any unrelated status event is
+ *  NOT reopenable — the caller classifies INTERVENTION / fails closed.
+ *  Returns null instead of throwing: provenance absence is a
+ *  classification fact, and claim-vs-derived corruption is already
+ *  caught by assertCanonicalWorkStatus. */
+export function proveCanonicalUnblockProvenance(
+  store: PairEvidenceStore,
+  workItem: Row,
+): Row | null {
+  const wid = String(workItem.work_item_id);
+  const attempts = canonicalBoundAttemptsForWorkItem(store, wid);
+  if (attempts.length === 0) return null;
+  const boundMissionId =
+    String(attempts[attempts.length - 1]!.mission_id ?? "");
+  if (!boundMissionId) return null;
+  const events = store.listEvents("work_item", wid)
+    .filter((e) => WORK_ITEM_STATUS_EVENTS.has(String(e.event_type)) &&
+      e.new_state !== null && e.new_state !== undefined);
+  const last = events[events.length - 1];
+  if (!last || String(last.event_type) !== "WORK_ITEM_UNBLOCKED" ||
+      String(last.old_state) !== "BLOCKED" ||
+      String(last.new_state) !== "READY" ||
+      !String(last.actor ?? "").startsWith("operator:")) {
+    return null;
+  }
+  const prior = events.slice(0, -1);
+  const derivedPrior = prior.length === 0
+    ? null
+    : String(prior[prior.length - 1]!.new_state);
+  if (derivedPrior !== "BLOCKED") return null;
+  const linked = prior.some((e) => {
+    if (String(e.new_state) !== "BLOCKED") return false;
+    const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
+    return String(md.mission_id ?? "") === boundMissionId ||
+      String(md.mission_paused ?? "") === boundMissionId;
+  });
+  return linked ? (last as Row) : null;
+}
+
 /** The mission's claimed status derived from its own immutable
  *  MISSION_CREATED/MISSION_TRANSITION spine. */
-function canonicalDerivedMissionStatus(
+export function canonicalDerivedMissionStatus(
   store: PairEvidenceStore,
   mission: Row,
 ): string {
@@ -731,11 +789,13 @@ export function buildReviewObservation(
             deps.store, childBoundMission!, childMissionStatus!);
           if (childMissionStatus !== "PAUSED" &&
               TERMINAL_MISSION_STATUSES.has(childMissionStatus!)) {
-            // HOTFIX-B — READY is itself the canonical
-            // WORK_ITEM_UNBLOCKED derivation. Reopenable requires
-            // EVERY bound attempt proven canonically terminal: a
-            // PAUSED / live / unproven predecessor keeps intervention
-            // semantics and is never silently reopened.
+            // HOTFIX-B/R1-F1 — READY must ITSELF be the product of an
+            // authentic WORK_ITEM_UNBLOCKED following the latest bound
+            // predecessor (proveCanonicalUnblockProvenance), AND every
+            // bound attempt must be proven canonically terminal:
+            // PAUSED / live / unproven predecessors — and READY derived
+            // from rework, rolled-back opens or any other event — keep
+            // intervention semantics and are never silently reopened.
             let allAttemptsTerminal = true;
             for (const att of canonicalBoundAttemptsForWorkItem(
                 deps.store, childId)) {
@@ -752,7 +812,8 @@ export function buildReviewObservation(
               }
               assertCanonicalMissionLifecycle(deps.store, am, ams);
             }
-            childClass = allAttemptsTerminal
+            childClass = allAttemptsTerminal &&
+                proveCanonicalUnblockProvenance(deps.store, child) !== null
               ? "REOPENABLE"
               : "INTERVENTION";
           } else {

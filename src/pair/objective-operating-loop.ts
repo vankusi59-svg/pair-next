@@ -32,6 +32,7 @@ import type { BusinessLayer } from "./business.js";
 import {
   assertCanonicalMissionInFlight,
   assertCanonicalMissionLifecycle,
+  canonicalBoundAttemptsForWorkItem,
 } from "./work-completion.js";
 import { TERMINAL_MISSION_STATUSES } from "./business.js";
 import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
@@ -53,8 +54,10 @@ import {
   assertCanonicalObjectiveKpiProgress,
   buildReviewObservation,
   canonicalAdaptiveReviewsFor,
+  canonicalDerivedMissionStatus,
   objectiveKpiAssessment,
   ObjectiveAdaptiveReviewService,
+  proveCanonicalUnblockProvenance,
   type ObjectiveAdaptiveReviewDeps,
   type ReviewObservation,
   type ReviewWorkstreamProjection,
@@ -577,11 +580,37 @@ export class ObjectiveOperatingService {
     if (mission) {
       const ms = String(mission.status);
       if (TERMINAL_MISSION_STATUSES.has(ms)) {
-        // HOTFIX-B — a canonically terminal bound attempt does NOT
-        // authorize a reopen by itself; it only permits the open seam
-        // to mint a new attempt. The terminal claim must carry full
-        // canonical lifecycle evidence (forged status + missing
-        // runtime proof fail closed here, before any write).
+        // HOTFIX-B/R1-F2 — final dispatch-boundary re-proof of the
+        // REOPENABLE contract, run AT the openWorkItem crossing and
+        // never trusting the earlier review observation:
+        //  a) the current READY must derive from an authentic
+        //     WORK_ITEM_UNBLOCKED event following THIS latest bound
+        //     predecessor — the same single authority the review used;
+        //  b) EVERY bound attempt in immutable WOB history must be
+        //     canonically terminal (mirroring openWorkItem's own
+        //     admission loop — a live earlier attempt is corrupt
+        //     authority, never converged);
+        //  c) the latest bound mission identity + lifecycle is
+        //     re-proven through its own immutable spine.
+        if (proveCanonicalUnblockProvenance(this.store, child) === null) {
+          operatingFail(
+            `delegated child ${childId} terminal-bound READY lacks canonical WORK_ITEM_UNBLOCKED provenance`);
+        }
+        for (const att of canonicalBoundAttemptsForWorkItem(
+            this.store, childId)) {
+          const am = this.store.tryGet(
+            "mission", String(att.mission_id)) as Row | null;
+          if (!am) {
+            operatingFail(
+              `bound attempt ${String(att.open_id)} mission missing`);
+          }
+          const ams = canonicalDerivedMissionStatus(this.store, am);
+          if (!TERMINAL_MISSION_STATUSES.has(ams)) {
+            operatingFail(
+              `bound attempt mission ${String(am.mission_id)} not canonically terminal`);
+          }
+          assertCanonicalMissionLifecycle(this.store, am, ams);
+        }
         assertCanonicalMissionLifecycle(this.store, mission, ms);
         return { objective_version: Number(objective.version) };
       }

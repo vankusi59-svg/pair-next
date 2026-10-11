@@ -550,7 +550,7 @@ describe("HOTFIX-B governed redispatch after WORK_ITEM_UNBLOCKED", () => {
     expect(missionCount(s)).toBe(1);
   });
 
-  it("HB7: revoked auto-policy — scheduler never dispatches a redispatch", async () => {
+  it("HB7: actual scheduler admission — real unblock wake claims once, revoked policy + stale binding denied", async () => {
     const inv = new FakeInvoker(WAIT_JSON);
     const { s, oid, binding: b, ops } = seeded("hb7", inv);
     s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
@@ -558,20 +558,54 @@ describe("HOTFIX-B governed redispatch after WORK_ITEM_UNBLOCKED", () => {
     const w1c = childOfKey(s, b, "w1");
     const m1 = boundMissionId(s, w1c);
     await failThenUnblock(s, w1c, m1);
-    // Owner consent: configure + enable, then REVOKE.
     let t = Date.now();
     const policy = new ObjectiveAutoPolicyService(s.store, s.biz.objectives, () => t);
     const scheduler = new ObjectiveAutoScheduler(s.store, s.biz.objectives, policy, () => t);
-    new ObjectiveAutoWakeupService(s.store, scheduler, () => t);
+    const wakeup = new ObjectiveAutoWakeupService(s.store, scheduler, () => t);
     policy.control({ objective_id: oid, actor: OWNER, action: "configure",
       limits: { expires_at: "2999-01-01T00:00:00.000Z", max_ceo_calls: 4 },
       idempotency_key: `cfg-${oid}` });
     policy.control({ objective_id: oid, actor: OWNER, action: "enable",
       policy_version: 1, idempotency_key: `en-${oid}` });
+    // REAL intake seam: the canonical WORK_ITEM_UNBLOCKED event is
+    // paged in, resolved to the allocation-bound work_item witness,
+    // re-proven hop-by-hop in accountWake, and lands as a pending
+    // generation the admission predicate can actually claim.
+    wakeup.tick();
+    const eligible = scheduler.claimable(oid);
+    expect(eligible.eligible).toBe(true);
+    const handle = scheduler.claim(oid, "w1", "boot1", "hb7-claim");
+    expect(handle.objective_id).toBe(oid);
+    expect(handle.claimed_generation).toBeGreaterThan(0);
+    // STALE/UNBOUND WAKE — a binding whose work item sits outside the
+    // pinned allocation fails closed inside verifyWakeBinding before
+    // any queue write.
+    const unblockEv = s.store.listEvents("work_item", w1c)
+      .find((e) => String(e.event_type) === "WORK_ITEM_UNBLOCKED")!;
+    const wal = s.store.list(WORKFORCE_ALLOCATION_ENTITY)
+      .find((r) =>
+        String((r as Record<string, unknown>).delegated_child_work_item_id) === w1c)!;
+    const bad = errCode(() => scheduler.accountWake({
+      objective_id: oid,
+      source_event_id: String((unblockEv as Record<string, unknown>).event_id),
+      reason: "WORK_ITEM_UNBLOCKED",
+      binding: { kind: "work_item",
+        allocation_id: String((wal as Record<string, unknown>).allocation_id),
+        work_item_id: "WI_FORGED_STALE" },
+    }));
+    expect(bad).not.toBeNull();
+    // REVOKED auto-policy — the admission seam re-reads the CURRENT
+    // effective authority: claimable flips to POLICY_NOT_EFFECTIVE and
+    // claim() never mints a lease.
     policy.control({ objective_id: oid, actor: OWNER, action: "revoke",
       policy_version: 2, idempotency_key: `rv-${oid}` });
-    const st = scheduler.status(oid, OWNER) as Record<string, unknown>;
-    expect(st.objective_runnable).toBe(false);
+    t += 31_000; // past the 30s attempt cooldown — the denial below
+    // reads CURRENT policy authority, never a timing artifact.
+    const afterRevoke = scheduler.claimable(oid);
+    expect(afterRevoke.eligible).toBe(false);
+    expect(afterRevoke.reason).toBe("POLICY_NOT_EFFECTIVE");
+    expect(errCode(() =>
+      scheduler.claim(oid, "w2", "boot2", "hb7-claim2"))).not.toBeNull();
     expect(missionCount(s)).toBe(1);
   });
 
@@ -652,6 +686,142 @@ describe("HOTFIX-B governed redispatch after WORK_ITEM_UNBLOCKED", () => {
     const dest = path.join(s.workspace, entries[0]!.consumer_relative_path);
     expect(fs.readFileSync(dest).toString()).toBe("# brief — canonical bytes");
     expect(sha256Hex(fs.readFileSync(dest))).toBe(String(art.artifact.sha256));
+  });
+
+  /* ---------- R1-F1: exact WORK_ITEM_UNBLOCKED provenance ---------- */
+
+  /** READY derived from WORK_REWORK_REQUESTED — never an unblock —
+   *  must NOT classify REOPENABLE even with a terminal bound mission. */
+  it("HB9: READY from WORK_REWORK_REQUESTED without unblock → not REOPENABLE", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding: b, ops } = seeded("hb9", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    const w1c = childOfKey(s, b, "w1");
+    const m1 = boundMissionId(s, w1c);
+    missionRunning(s, m1);
+    missionFailed(s, m1);
+    s.biz.syncWorkItem(w1c);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("BLOCKED");
+    // A READY claim produced by a REVIEW-REWORK event — no unblock.
+    s.store.event({
+      entity_type: "work_item", entity_id: w1c,
+      event_type: "WORK_REWORK_REQUESTED",
+      old_state: "REVIEW_REQUIRED", new_state: "READY",
+      actor: OWNER, metadata: { decision: "REWORK" },
+    });
+    sqlRewriteEntity(s.store, "work_item", w1c, (row) => { row.status = "READY"; });
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("DISPATCHED");
+    expect(boundMissionId(s, w1c)).toBe(m1);
+    expect(missionCount(s)).toBe(1);
+  });
+
+  /** READY derived from a rolled-back open — never an unblock —
+   *  must NOT classify REOPENABLE. */
+  it("HB10: READY from WORK_ITEM_OPEN_ROLLED_BACK without qualifying unblock → not REOPENABLE", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding: b, ops } = seeded("hb10", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    const w1c = childOfKey(s, b, "w1");
+    const m1 = boundMissionId(s, w1c);
+    missionRunning(s, m1);
+    missionFailed(s, m1);
+    s.biz.syncWorkItem(w1c);
+    // A READY claim produced by an open-rollback audit event.
+    s.store.event({
+      entity_type: "work_item", entity_id: w1c,
+      event_type: "WORK_ITEM_OPEN_ROLLED_BACK",
+      old_state: "IN_PROGRESS", new_state: "READY",
+      actor: "PAIR_BUSINESS_LAYER", metadata: { open_id: "OPN_FORGED" },
+    });
+    sqlRewriteEntity(s.store, "work_item", w1c, (row) => { row.status = "READY"; });
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("DISPATCHED");
+    expect(boundMissionId(s, w1c)).toBe(m1);
+    expect(missionCount(s)).toBe(1);
+  });
+
+  /** Malformed unblock (wrong old_state) and a superseded unblock
+   *  (a later READY-producing event stole the provenance) — both
+   *  fail closed. */
+  it("HB11: malformed / incorrectly-ordered unblock events → fail closed", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    // (a) malformed shape: WORK_ITEM_UNBLOCKED claiming READY→READY.
+    {
+      const { s, oid, binding: b, ops } = seeded("hb11a", inv, ["w1"]);
+      s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+      await ops.runObjectivePass({ objective_id: oid, actor: OP });
+      const w1c = childOfKey(s, b, "w1");
+      const m1 = boundMissionId(s, w1c);
+      await failThenUnblock(s, w1c, m1);
+      s.store.event({
+        entity_type: "work_item", entity_id: w1c,
+        event_type: "WORK_ITEM_UNBLOCKED",
+        old_state: "READY", new_state: "READY", actor: OWNER,
+      });
+      const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+      expect(r.outcome).not.toBe("DISPATCHED");
+      expect(boundMissionId(s, w1c)).toBe(m1);
+      expect(missionCount(s)).toBe(1);
+    }
+    // (b) the authentic unblock exists but is NOT the current READY
+    // provenance — a later READY-producing event supersedes it.
+    {
+      const { s, oid, binding: b, ops } = seeded("hb11b", inv, ["w1"]);
+      s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+      await ops.runObjectivePass({ objective_id: oid, actor: OP });
+      const w1c = childOfKey(s, b, "w1");
+      const m1 = boundMissionId(s, w1c);
+      await failThenUnblock(s, w1c, m1);
+      s.store.event({
+        entity_type: "work_item", entity_id: w1c,
+        event_type: "WORK_ITEM_ASSIGNED",
+        old_state: "READY", new_state: "READY", actor: "PAIR_BUSINESS_LAYER",
+      });
+      const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+      expect(r.outcome).not.toBe("DISPATCHED");
+      expect(boundMissionId(s, w1c)).toBe(m1);
+      expect(missionCount(s)).toBe(1);
+    }
+  });
+
+  /* ---------- R1-F2: re-proof AT the final dispatch boundary ---------- */
+
+  /** Provenance drift injected between review classification and the
+   *  openWorkItem crossing — a REWORK event lands after REOPENABLE was
+   *  observed, so READY no longer derives from the unblock. The
+   *  boundary re-proof must fail closed with ZERO new attempts. */
+  it("HB12: status-provenance drift between review and beforeOpen → zero new attempts", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding: b, ops } = seeded("hb12", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    const w1c = childOfKey(s, b, "w1");
+    const m1 = boundMissionId(s, w1c);
+    await failThenUnblock(s, w1c, m1);
+    let code: string | null = null;
+    try {
+      await ops.runObjectivePass({
+        objective_id: oid, actor: OP,
+        hooks: { beforeOpen: () => {
+          // Drift: READY's provenance becomes WORK_REWORK_REQUESTED
+          // between the earlier observation and this exact crossing.
+          s.store.event({
+            entity_type: "work_item", entity_id: w1c,
+            event_type: "WORK_REWORK_REQUESTED",
+            old_state: "REVIEW_REQUIRED", new_state: "READY",
+            actor: OWNER, metadata: { decision: "REWORK" },
+          });
+        } },
+      });
+    } catch (e) {
+      code = String((e as { code?: string }).code ?? e);
+    }
+    expect(code).not.toBeNull();
+    expect(boundMissionId(s, w1c)).toBe(m1);
+    expect(missionCount(s)).toBe(1);
   });
 });
 
