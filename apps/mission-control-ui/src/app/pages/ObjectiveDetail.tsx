@@ -211,8 +211,23 @@ export function ObjectiveDetail() {
       }
       canonLimits = limits;
     }
-    const sig = `${action}:${ctx.oid}:${action === "configure" ? JSON.stringify(canonLimits) : ""}`;
+    /* Operation identity = action + objective + CAS version + canonical
+       request semantics. A new operation on a NEWER policy version is a
+       different operation (fresh key, current CAS bind); retry of the
+       SAME operation identity replays its stored body verbatim.
+       Unresolved ops are preserved separately — a pending Configure
+       reopened by the owner is an explicit retry of THAT op even when
+       canonical version has since drifted. */
+    const sig = `${action}:${ctx.oid}:${policyVersion ?? "none"}:${action === "configure" ? JSON.stringify(canonLimits) : ""}`;
+    let bodySig = sig;
     let body = pendingOps.current[sig];
+    if (!body && action === "configure" && pendingCfg.current && pendingCfg.current.oid === ctx.oid) {
+      const ps = pendingCfg.current.sig;
+      const pc = pendingOps.current[ps];
+      if (pc && JSON.stringify(pc.limits) === JSON.stringify(canonLimits)) {
+        body = pc; bodySig = ps;
+      }
+    }
     if (!body) {
       body = { action, idempotency_key: crypto.randomUUID() };
       /* CAS: the version captured when the dialog opened. First
@@ -232,12 +247,29 @@ export function ObjectiveDetail() {
       }
       pendingOps.current[sig] = body;
     }
-    if (action === "configure") pendingCfg.current = { oid: ctx.oid, sig };
+    if (action === "configure") pendingCfg.current = { oid: ctx.oid, sig: bodySig };
     setDlg(null); setMutBusy(true); setMutNote(null);
     api.autoPolicyControlApp(ctx.oid, body)
-      .then(() => {
-        delete pendingOps.current[sig];
-        if (pendingCfg.current?.sig === sig) pendingCfg.current = null;
+      .then((r) => {
+        /* A 'committed' report requires the returned canonical state
+           to be consistent with this operation's result — otherwise
+           discard the op, refetch, and make the owner re-confirm. */
+        const EXPECTED: Record<string, string[] | undefined> = {
+          configure: ["DISABLED", "EXPIRED"], enable: ["ENABLED"], resume: ["ENABLED"],
+          pause: ["PAUSED"], disable: ["DISABLED"], revoke: ["REVOKED"],
+          halt: ["HALTED"], reset_halt: ["ENABLED", "PAUSED", "DISABLED"],
+        };
+        const rp = r?.auto_policy;
+        const okStates = EXPECTED[action];
+        if (!rp || String(rp.objective_id) !== ctx.oid || (okStates !== undefined && !okStates.includes(String(rp.state)))) {
+          delete pendingOps.current[bodySig];
+          if (pendingCfg.current?.sig === bodySig) pendingCfg.current = null;
+          refetch(); setPolTick((n) => n + 1);
+          settle(seq, ctx, "", `Policy ${action} response inconsistent with the requested operation — canonical state refreshed, re-confirm`)(new ApiError(0, "INCONSISTENT_RESPONSE", rp ? `state=${String(rp.state)}` : "no auto_policy in response"), true);
+          return;
+        }
+        delete pendingOps.current[bodySig];
+        if (pendingCfg.current?.sig === bodySig) pendingCfg.current = null;
         setPolTick((n) => n + 1);
         settle(seq, ctx, `Policy ${action} committed — projection refreshed.`, "")(null, false);
       })
@@ -246,8 +278,8 @@ export function ObjectiveDetail() {
            refetch canonical state — the next attempt requires a new
            confirmation (and mints a new operation). */
         if (e instanceof ApiError && e.status === 409) {
-          delete pendingOps.current[sig];
-          if (pendingCfg.current?.sig === sig) pendingCfg.current = null;
+          delete pendingOps.current[bodySig];
+          if (pendingCfg.current?.sig === bodySig) pendingCfg.current = null;
           refetch();
           setPolTick((n) => n + 1);
           settle(seq, ctx, "", `Policy ${action} conflict — canonical state refreshed, re-confirm as a new operation`)(e, true);

@@ -997,3 +997,51 @@ test("R3: normalized inputs ('09','0.50') retry identical body+key; explicit cha
   }, [oid, mcToken()] as const);
   expect(st.auto_policy.policy_version).toBe(2);
 });
+
+test("R4: Enable v1 lost → Pause v3 → new Enable binds v3 new key → ENABLED v4 (stale op never replayed)", async ({ page }) => {
+  const biz = await mkBusiness(page, "poldrift");
+  const oid = await mkObjective(page, biz, `poldrift-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let swallowed = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, async (route) => {
+    if (route.request().method() === "POST") {
+      const b = route.request().postDataJSON() as Record<string, unknown>;
+      bodies.push(b);
+      if (!swallowed && b.action === "enable") {
+        swallowed = true;
+        await route.fetch(); // enable v1 REALLY commits → v2; UI sees lost response
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "LOST", detail: "lost" }) });
+      }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // Enable v1 commits but response lost
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable failed")).toBeVisible();
+  // canonical is now ENABLED v2 → Pause commits → PAUSED v3
+  await page.getByRole("button", { name: "Pause policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit pause" }).click();
+  await expect(page.getByText("Policy pause committed")).toBeVisible();
+  // Owner selects Enable again on PAUSED v3 → NEW operation, fresh key, CAS v3
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  const enables = bodies.filter((b) => b.action === "enable");
+  expect(enables).toHaveLength(2);
+  expect(enables[0]!.policy_version).toBe(1);          // the lost v1 op
+  expect(enables[1]!.policy_version).toBe(3);          // NEW op bound to current CAS
+  expect(enables[1]!.idempotency_key).not.toBe(enables[0]!.idempotency_key); // fresh key — no stale-key reuse
+  const st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.state).toBe("ENABLED");
+  expect(st.auto_policy.policy_version).toBe(4); // configure v1 + enable v2 + pause v3 + enable v4
+});
