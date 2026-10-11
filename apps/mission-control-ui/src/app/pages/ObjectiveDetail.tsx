@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../../api";
 import { useSelectedBusiness } from "../AppShell";
 import type { CockpitPayload } from "../types";
+import type { AutoPolicyStatus } from "../../types";
 import { StatusBadge, ProofChip, type Tone } from "../components/StatusBadge";
 import { DeniedState, EmptyState, ErrorState, Skeleton, UnverifiedPanel } from "../components/states";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -61,6 +62,16 @@ export function ObjectiveDetail() {
   const [dlg, setDlg] = useState<DlgCtx | null>(null);
   const [mutBusy, setMutBusy] = useState(false);
   const [mutNote, setMutNote] = useState<string | null>(null);
+  /* Canonical auto-policy control state — fetched via the dedicated
+     GET (not the cockpit snapshot) and refreshed every 5s while the
+     page is visible; each new tick aborts the previous request so a
+     stale response can never overwrite a fresher one. */
+  const [polSt, setPolSt] = useState<
+    | { kind: "loading" }
+    | { kind: "ready"; data: AutoPolicyStatus; forId: string }
+    | { kind: "error"; err: ApiError }
+  >({ kind: "loading" });
+  const [polTick, setPolTick] = useState(0);
   /* idempotency keys live per logical operation, keyed by
      action:objective — a retry of the SAME operation reuses the key;
      a different action or a route change gets a fresh one. */
@@ -78,6 +89,7 @@ export function ObjectiveDetail() {
     setMutNote(null);
     setDlg(null);
     setMutBusy(false);
+    setPolSt({ kind: "loading" });
     idemKeys.current = {};
     opSeq.current++;
   }, [biz, id]);
@@ -103,6 +115,29 @@ export function ObjectiveDetail() {
   }, [biz, id, tick]);
 
   const refetch = () => setTick((n) => n + 1);
+
+  useEffect(() => {
+    if (!biz || !id) return;
+    const ctl = new AbortController();
+    api
+      .autoPolicyStatusApp(id, ctl.signal)
+      .then((r) => {
+        if (ctl.signal.aborted) return;
+        setPolSt({ kind: "ready", data: r.auto_policy, forId: id });
+      })
+      .catch((e: unknown) => {
+        if (ctl.signal.aborted) return;
+        setPolSt({ kind: "error", err: e instanceof ApiError ? e : new ApiError(0, "ERROR", String(e)) });
+      });
+    return () => ctl.abort();
+  }, [biz, id, polTick]);
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (document.visibilityState === "visible") setPolTick((n) => n + 1);
+    }, 5000);
+    return () => clearInterval(iv);
+  }, []);
 
   /* Resolve a mutation only while its captured context is still the
      active view. The commit itself is never cancelled — only the
@@ -130,13 +165,7 @@ export function ObjectiveDetail() {
     const ctx = { biz: dlg.biz, oid: dlg.oid };
     const { action, policyVersion } = dlg;
     const seq = ++opSeq.current;
-    setDlg(null); setMutBusy(true); setMutNote(null);
-    const key = `${action}:${ctx.oid}`;
-    if (!idemKeys.current[key]) idemKeys.current[key] = `app-${action}-${ctx.oid}-${Date.now()}`;
-    const body: Parameters<typeof api.autoPolicyControlApp>[1] = {
-      action,
-      idempotency_key: idemKeys.current[key],
-    };
+    const body: Parameters<typeof api.autoPolicyControlApp>[1] = { action, idempotency_key: "" };
     /* CAS: the version captured when the dialog opened. First
        configure on an absent policy is the only call allowed to
        omit policy_version. */
@@ -153,18 +182,34 @@ export function ObjectiveDetail() {
       if (polLimits.missions.trim()) limits.max_missions = Number(polLimits.missions);
       if (polLimits.budget.trim()) limits.budget_microusd_cap = Math.round(Number(polLimits.budget) * 1e6);
       if (!limits.expires_at || (limits.max_ceo_calls === undefined && limits.max_missions === undefined && limits.budget_microusd_cap === undefined)) {
-        setMutBusy(false);
         setMutNote("Configure rejected: limits need expires_at plus at least one cap (max_ceo_calls | max_missions | budget_microusd_cap).");
         return;
       }
       body.limits = limits;
     }
+    /* Idempotency binding: a logical operation = action + identity +
+       request semantics. Retrying the SAME op reuses the key; editing
+       limits or choosing another action mints a fresh operation. */
+    const sig = `${action}:${ctx.oid}:${action === "configure" ? JSON.stringify(body.limits) : ""}`;
+    if (!idemKeys.current[sig]) idemKeys.current[sig] = crypto.randomUUID();
+    body.idempotency_key = idemKeys.current[sig];
+    setDlg(null); setMutBusy(true); setMutNote(null);
     api.autoPolicyControlApp(ctx.oid, body)
       .then(() => {
-        delete idemKeys.current[key];
+        delete idemKeys.current[sig];
+        setPolTick((n) => n + 1);
         settle(seq, ctx, `Policy ${action} committed — projection refreshed.`, "")(null, false);
       })
-      .catch((e: unknown) => settle(seq, ctx, "", `Policy ${action} failed (same idempotency key kept for retry)`)(e, true));
+      .catch((e: unknown) => {
+        /* CAS conflict: the stored policy moved — pull canonical state
+           so the card re-derives legal actions from truth, then leave
+           the operation's key in place for a same-body retry. */
+        if (e instanceof ApiError && e.status === 409) {
+          refetch();
+          setPolTick((n) => n + 1);
+        }
+        settle(seq, ctx, "", `Policy ${action} failed (same idempotency key kept for retry)`)(e, true);
+      });
   };
 
   if (st.kind === "no-business") {
@@ -206,7 +251,38 @@ export function ObjectiveDetail() {
   const obsErr = c.observation_error !== null;
   const kpisMet = c.kpi_summary.all_targets_met;
   const converging = kpisMet && c.workstreams.some((w) => w.workstream_status === "BACKLOG" || w.workstream_status === "IN_PROGRESS");
-  const pol = c.auto_policy;
+  /* Control state = canonical polled GET when loaded; the cockpit
+     snapshot is only the loading fallback. Button legality and CAS
+     version always derive from this merged view. */
+  const polCanon = polSt.kind === "ready" && polSt.forId === id ? polSt.data : null;
+  const pol = polCanon ?? c.auto_policy;
+
+  /* datetime-local needs "YYYY-MM-DDTHH:mm" — prefill the configure
+     window from the objective deadline only when it is a real future
+     instant; an absent/past deadline never fabricates a window. */
+  const toLocalInput = (d: Date) => {
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+  const openPolicyDlg = (a: string) => {
+    if (a === "configure") {
+      const dl = o.deadline ? new Date(o.deadline) : null;
+      const okDl = dl !== null && !Number.isNaN(dl.getTime()) && dl.getTime() > Date.now();
+      setPolLimits({
+        expires: okDl ? toLocalInput(dl as Date) : "",
+        ceo: "20",
+        missions: "5",
+        budget: o.budget.ceiling_microusd > 0 ? String(o.budget.ceiling_microusd / 1e6) : "",
+      });
+    }
+    setDlg({
+      kind: "policy",
+      action: a,
+      biz: biz!,
+      oid: id,
+      policyVersion: pol?.configured ? (pol.policy_version ?? null) : null,
+    });
+  };
 
   return (
     <>
@@ -256,20 +332,6 @@ export function ObjectiveDetail() {
       <h2 className="sech">Owner actions</h2>
       <div className="actions">
         <button className="primary" disabled={mutBusy} onClick={() => setDlg({ kind: "ceo", biz: biz!, oid: id })}>Run CEO pass</button>
-        {/* Canonical auto-policy controls (B0): only actions legal from
-            the current stored state are offered — configure allowed
-            when unconfigured; every action still CAS-validates
-            server-side. */}
-        {(!pol?.configured ? ["configure"] : []).concat(
-          pol?.configured
-            ? Object.keys(POLICY_TRANSITIONS).filter((a) => POLICY_TRANSITIONS[a].includes(String(pol.state)))
-            : [],
-        ).map((a) => (
-          <button key={a} className="ghost" disabled={mutBusy}
-            onClick={() => setDlg({ kind: "policy", action: a, biz: biz!, oid: id, policyVersion: pol?.configured ? (pol.policy_version ?? null) : null })}>
-            {POLICY_LABELS[a]}
-          </button>
-        ))}
         <button className="ghost" disabled title="Owner transition route ships in A2 — disabled, not a fake action">Accept ACHIEVED (A2)</button>
         <button className="ghost" disabled title="Amend route ships in A2 — disabled, not a fake action">Amend objective (A2)</button>
       </div>
@@ -361,25 +423,65 @@ export function ObjectiveDetail() {
         </section>
       </div>
 
-      <h2 className="sech">Auto policy & driver</h2>
+      <h2 className="sech">Auto-run controls</h2>
       <div className="need">
         <div className="nrow">
-          <span className="tt">auto_policy</span>
-          {pol === null ? <span className="note">not configured</span> : (
+          <span className="tt">policy</span>
+          {!pol?.configured ? (
+            <span className="note">not configured — owner must enable before the driver may act</span>
+          ) : (
             <>
               <StatusBadge tone={S_TONE[String(pol.state)] ?? "unknown"} label={String(pol.state)} />
               <span className="note">
-                v{pol.policy_version ?? "—"} · effective {String(pol.effective)}{pol.expires_at ? ` · expires ${String(pol.expires_at).slice(0, 10)}` : ""}
-                {Array.isArray(pol.reasons) && pol.reasons.length ? ` · ${pol.reasons.join(", ")}` : ""}
+                v{pol.policy_version ?? "—"} · effective {String(pol.effective)}
+                {pol.expires_at ? ` · expires ${String(pol.expires_at).slice(0, 16).replace("T", " ")}` : ""}
               </span>
             </>
           )}
-          {pol?.expiry_pending ? <StatusBadge tone="warn" label="policy expired — awaiting canonical commit" /> : null}
+          {pol && "expiry_pending" in pol && pol.expiry_pending ? <StatusBadge tone="warn" label="policy expired — awaiting canonical commit" /> : null}
         </div>
+        {pol?.configured ? (
+          <div className="nrow">
+            <span className="tt">limits</span>
+            <span className="note">
+              {pol.limits
+                ? `${pol.limits.max_ceo_calls ?? "—"} ceo calls · ${pol.limits.max_missions ?? "—"} missions · ${pol.limits.max_retries ?? "—"} retries · ${pol.limits.budget_microusd_cap != null ? money(Number(pol.limits.budget_microusd_cap)) : "—"} cap` + (pol.limits.expires_at ? ` · until ${String(pol.limits.expires_at).slice(0, 16).replace("T", " ")}` : "")
+                : "no limits recorded"}
+            </span>
+          </div>
+        ) : null}
         <div className="nrow">
-          <span className="tt">auto_driver</span>
-          <span className="note">{c.auto_driver ? `status: ${JSON.stringify(c.auto_driver.status)}` : "not configured"}</span>
+          <span className="tt">driver</span>
+          {polCanon ? (
+            polCanon.driver_ready ? (
+              <><StatusBadge tone="ok" label="READY" /><span className="note">driver admitted this objective — running within the policy window</span></>
+            ) : (
+              <><StatusBadge tone="warn" label="NOT RUNNING" /><span className="note">{(polCanon.driver_missing ?? []).join(", ") || "driver not ready"}</span></>
+            )
+          ) : (
+            <span className="note">{c.auto_driver ? `status: ${JSON.stringify(c.auto_driver.status)}` : "not configured"}</span>
+          )}
         </div>
+        {pol?.configured && "halt" in pol && pol.halt ? (
+          <div className="nrow">
+            <span className="tt">halt</span>
+            <StatusBadge tone="danger" label={pol.halt.scope} />
+            <span className="note">{pol.halt.reason} · {pol.halt.actor} · {String(pol.halt.at).slice(0, 16).replace("T", " ")}</span>
+          </div>
+        ) : null}
+        {pol?.configured && Array.isArray(pol.reasons) && pol.reasons.length ? (
+          <div className="nrow"><span className="tt">reasons</span><span className="note">{pol.reasons.join(", ")}</span></div>
+        ) : null}
+        {polSt.kind === "error" ? (
+          <div className="nrow"><span className="tt">status fetch</span><span className="note">{polSt.err.code}: {polSt.err.detail}</span></div>
+        ) : null}
+      </div>
+      <div className="actions">
+        {(!pol?.configured ? ["configure"] : Object.keys(POLICY_TRANSITIONS).filter((a) => POLICY_TRANSITIONS[a].includes(String(pol.state)))).map((a) => (
+          <button key={a} className="ghost" disabled={mutBusy} onClick={() => openPolicyDlg(a)}>
+            {a === "configure" && pol?.state === "EXPIRED" ? "Re-arm policy (new limits)" : (POLICY_LABELS[a] ?? a)}
+          </button>
+        ))}
       </div>
 
       <ConfirmDialog

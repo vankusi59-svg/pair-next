@@ -1,13 +1,11 @@
 {
-  "claim_id": "P15_10_A2_OWNER_REVIEW_SIGNOFF",
-  "title": "P15.10-A2: owner review sign-off — accept TARGET_MET_CANDIDATE → ACHIEVED",
-  "affected_surfaces": ["MISSION_CONTROL", "BUSINESS_OBJECTIVE", "UI"],
+  "claim_id": "P15_10_AUTORUN_CONTROLS_UI",
+  "title": "Objective Auto-run controls UI hardening — canonical status card, defaults-from-terms, idempotent retries",
+  "affected_surfaces": ["UI"],
   "required_tests": [
-    "src/__tests__/pair-p15-a2-review-signoff.test.ts",
-    "src/__tests__/pair-p15-10d.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-p15-9a-company-cockpit.test.ts"
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-a2-review-signoff.test.ts"
   ],
   "invariants": [],
-  "description": "Closes the A2 gap proven on a live stack (objective OBJ_836946b48dc51100550aeda6 parked at OWNER_SIGN_OFF_REQUIRED with buttons disabled 'API_MISSING'). New POST /api/vnext/objectives/:id/review-signoff (action:'accept' only) → new ObjectiveReviewSignoffService (src/pair/objective-review-signoff.ts) → existing transitionStatus(). Durable receipt entity objective_review_signoff + OBJECTIVE_REVIEW_SIGNED_OFF event. UI: Owner Inbox 'Accept ACHIEVED' wired through the existing ConfirmDialog pattern pinning review_id; 'Request changes' stays disabled, truthfully labeled. R1 audit-closure corrections: F1 normalized reason bound into idempotency semantics (same key + changed reason rejects); F2 strict HTTP request schema — non-string action/review_id/idempotency_key/reason → typed 400 FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST with zero mutation; F3 work-item guard uses canonical proof — assertCanonicalWorkStatus + proveWorkItemDone (forged DONE / unproven CANCELLED rejects); F4 non-owner → HTTP 403, first response returns the persisted put() row (version ≥1), replay revalidates the receipt against its OBJECTIVE_REVIEW_SIGNED_OFF anchor, UI call uses noAuthPrompt and keeps one idempotency key per opened dialog so retries replay the same operation. R1-F5: 7 new focused tests incl. real HTTP-boundary suite and a second-connection SQLite contention case. No lifecycle/review/scheduler/auto-driver/planner/executor/schema changes; no request_changes; no merge/deploy/cutover."
+  "description": "Owner-facing Auto-run controls on /app/objectives/:id (ObjectiveDetail.tsx). Control state now comes from the canonical GET /auto-policy polled every 5s while the page is visible (each tick aborts the prior request — no stale overwrite, no overlapping reads); cockpit snapshot is only the loading fallback. Card shows policy state+effective+reasons, limits (ceo calls/missions/retries/budget cap USD/window), truthful driver readiness (driver_ready + driver_missing), halt record, and per-transition action buttons mirrored from the backend TRANSITIONS table — EXPIRED offers 'Re-arm policy (new limits)' (configure only, never a silent re-enable), HALTED offers reset_halt, REVOKED offers nothing. Configure dialog prefills editable defaults derived from the objective's own terms (deadline→expires_at when a valid future instant, budget ceiling→USD cap, 20 calls/5 missions); Configure and Enable remain separate owner actions — no auto-enable. Idempotency hardening: new logical operations use crypto.randomUUID(); the key is bound to action+objective+limits signature so an ambiguous-failure retry replays the SAME key while changed semantics mint a fresh operation; CAS 409 refetches canonical state. New /app api seam autoPolicyStatusApp carries noAuthPrompt and AbortSignal. Zero backend/service/scheduler/schema changes. e2e: objectives.spec.ts 26/26 pass incl. 6 new focused tests (card, defaults, same-key retry, 409 refetch, EXPIRED/REVOKED labels, 5s poll); the pre-existing 'policy HALT' double-click flake documented in P15.9-B5.4 remains a known baseline (passes isolated)."
 }

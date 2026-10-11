@@ -213,8 +213,13 @@ export interface AutoPolicyStatus {
   halt: { scope: string; actor: string; at: string; reason: string } | null;
   owner_authority_id: string;
   business_id: string;
-  driver_ready: false;
+  driver_ready: boolean;
   driver_missing: string[];
+  /** Present once an auto-driver is integrated: the driver's own
+   *  canonical runnable verdict + integration marker for this
+   *  objective — never implied by "a driver process exists". */
+  objective_runnable?: boolean;
+  driver_integrated?: boolean;
   terms_digest_binding: string | null;
   terms_current: boolean;
 }
