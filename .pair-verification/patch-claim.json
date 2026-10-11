@@ -1,19 +1,20 @@
 {
-  "claim_id": "HOTFIX_A_CROSS_MISSION_ARTIFACT_INPUT",
-  "title": "Cross-mission canonical artifact input binding — governed consume of ACCEPTED artifacts from sibling missions",
+  "claim_id": "HOTFIX_B_GOVERNED_REDISPATCH_AFTER_UNBLOCK",
+  "title": "Governed redispatch after WORK_ITEM_UNBLOCKED — READY + canonically-terminal bound predecessor becomes eligible for ONE new mission attempt",
   "affected_surfaces": [
-    "PLANNER",
-    "ARTIFACT",
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
     "GATE_ROUTER",
+    "ARTIFACT",
     "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-hotfix-b-redispatch-after-unblock.test.ts",
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
-    "src/__tests__/pair-f2-artifact-handoff.test.ts",
-    "src/__tests__/pair-planner-dataflow-incident.test.ts",
-    "src/__tests__/pair-f1-artifact-authority.test.ts",
-    "src/__tests__/pair-f2-r1-remediation.test.ts"
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts"
   ],
   "invariants": [],
-  "description": "Fixes FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT for bound missions consuming artifacts ACCEPTED by earlier sibling missions. listEligibleExternalInputSources proves canonical lineage: validateWorkOpenBindingById (BOUND WOB<->delegated work item) + FULL assertCanonicalWorkforceAllocation on consumer and every sibling allocation (receipt + binding + WDEL + child graph + agent contract); tampered WDEL/forged membership/broken binding/cross-business/non-BOUND all throw FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE. Reuse via late-bound registration (bindWorkforceAllocationProver/bindObjectiveWorkstreamCtor at owning-module eval; unbound = fail closed) — static import would pull business.ts into service.ts's import phase and crash work-completion's module-level MISSION_STATUS_TRANSITIONS read. F2: producerPassAnchored counts ALL anchored PASS validations (>1 = contradictory, closed) then requires the unique PASS artifact_ids contain the artifact; RUNNING/FAILED/unvalidated excluded. F3: cap on ELIGIBLE set only after filters; 63/64/65 boundary. F5: authorizeConsumeFetch resolves producer mission from the pinned producer execution row. F6: BOTH byte-consumption points (materializeForConsumer + authorizeConsumeFetch) re-prove CURRENT eligibility via the same seam before bytes are served/written — exact pinned identity match (artifact_id + producer exec/governed/task + producer mission + sha256), never filename; revoked lineage = zero bytes / zero writes; same-mission F2 untouched. Stamps pair_dataflow_sources (1 binds, 0 UNBOUND, >1 AMBIGUOUS, drift/conflict SOURCE_BINDING); assert re-proves CURRENT eligibility. 35 tests on canonical fixtures + adversarial (mid-flight revocation, contradictory PASS, wrong producer) + INT2 production path (real tick->commit->resolve/pin->REMOTE_FETCH bytes; governed rows fabricated — dispatch stays simulation) + cold-start smoke (dist index loads; bindings live). Regression 287 pass; baseline f4 R5.1-crash identical on BASE 1f6d4af."
+  "description": "Root cause: a work item unblocked to READY after a canonically terminal bound mission could never be redispatched autonomously — adaptive review classified READY+terminal-bound as INTERVENTION and the operating loop's launchable filter required no bound mission, while manual openWorkItem worked (it already re-proves every prior attempt terminal). Fix adds lifecycle class REOPENABLE: READY + bound latest mission canonically terminal + EVERY WOB attempt proven terminal via assertCanonicalMissionLifecycle + READY itself derived from the canonical WORK_ITEM_UNBLOCKED event (PAUSED/live/missing/unproven predecessor keeps INTERVENTION; live+READY contradiction still reviewFails). Operating loop: launchable admits REOPENABLE alongside fresh ACTIVE allocations; proveDispatchAuthority's bound-mission branch now re-proves the claim canonically — terminal claim must carry full lifecycle evidence (forged status fails before any write), then falls through to BusinessLayer.openWorkItem which remains the ONLY open authority and itself iterates every prior attempt (non-terminal => FAIL_CLOSED_MISSION_ACTIVE); PAUSED/non-terminal still converges via assertCanonicalMissionInFlight => AWAITING_EXECUTION. Immutable WOB history/mission evidence untouched; concurrent ticks/restart dedup via existing pending-open + bound-mission convergence; review never auto-ACCEPTed, intervention semantics preserved for genuinely stuck states; Hotfix A seams untouched (F6 consume-time re-proof exercised by reopened attempt). 8 canonical-fixture tests: eligible reopen, forged READY, forged lifecycle (status-only FAILED claim), tampered WOB, concurrent tick + store-reopen restart (exactly one attempt), mission-cap hard stop, revoked auto-policy, A+B cross-mission artifact consume through pinned LOCAL_MATERIALIZATION. 104+58 regression pass; baseline pair-f4 R5.1-crash identical on BASE."
 }

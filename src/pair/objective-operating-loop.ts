@@ -31,6 +31,7 @@ import { ArtifactAuthority } from "./artifact-authority.js";
 import type { BusinessLayer } from "./business.js";
 import {
   assertCanonicalMissionInFlight,
+  assertCanonicalMissionLifecycle,
 } from "./work-completion.js";
 import { TERMINAL_MISSION_STATUSES } from "./business.js";
 import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
@@ -279,10 +280,14 @@ export class ObjectiveOperatingService {
     if (synced) obs = this.observe(objectiveId); // fresh canonical classes
 
     // §17 — classify from canonical lifecycle evidence only.
+    // HOTFIX-B — REOPENABLE: READY + every bound attempt canonically
+    // terminal + canonical WORK_ITEM_UNBLOCKED evidence — eligible for
+    // one new governed attempt through the same openWorkItem seam.
     const launchable = obs.workstreams.filter((w) =>
-      w.delegated_child_class === "ACTIVE" &&
-      w.delegated_child_status === "READY" &&
-      !w.delegated_child_bound_mission);
+      (w.delegated_child_class === "ACTIVE" &&
+       w.delegated_child_status === "READY" &&
+       !w.delegated_child_bound_mission) ||
+      w.delegated_child_class === "REOPENABLE");
     const activeExecution = obs.workstreams.find((w) =>
       w.delegated_child_class === "ACTIVE" &&
       w.delegated_child_status === "IN_PROGRESS");
@@ -570,7 +575,18 @@ export class ObjectiveOperatingService {
     }
     const mission = this.deps.business.boundMissionForWorkItem(child);
     if (mission) {
+      const ms = String(mission.status);
+      if (TERMINAL_MISSION_STATUSES.has(ms)) {
+        // HOTFIX-B — a canonically terminal bound attempt does NOT
+        // authorize a reopen by itself; it only permits the open seam
+        // to mint a new attempt. The terminal claim must carry full
+        // canonical lifecycle evidence (forged status + missing
+        // runtime proof fail closed here, before any write).
+        assertCanonicalMissionLifecycle(this.store, mission, ms);
+        return { objective_version: Number(objective.version) };
+      }
       // R2.A — converge only through a proven in-flight mission.
+      // PAUSED / live / unproven claims propagate — never a reopen.
       assertCanonicalMissionInFlight(this.store, mission, child);
       return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
     }

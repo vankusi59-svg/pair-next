@@ -394,7 +394,16 @@ export interface ReviewWorkstreamProjection {
  *  INTERVENTION = canonical non-active state needing intervention
  *  (BLOCKED, PAUSED mission, terminal-mission fold pending);
  *  EXHAUSTED = canonically finished (DONE+WCP or CANCELLED). */
-type LifecycleClass = "ACTIVE" | "INTERVENTION" | "EXHAUSTED";
+type LifecycleClass =
+  | "ACTIVE"
+  | "INTERVENTION"
+  | "EXHAUSTED"
+  /** HOTFIX-B — canonically READY + every bound mission attempt
+   *  canonically terminal + the READY state itself derived from a
+   *  canonical WORK_ITEM_UNBLOCKED event: eligible for one new
+   *  governed mission attempt through the existing openWorkItem
+   *  authority. PAUSED / live / unproven predecessors never qualify. */
+  | "REOPENABLE";
 
 /** Status-defining lifecycle events on a work_item — every canonical
  *  status writer emits one. Replaying them is the ONLY honest read of
@@ -715,14 +724,42 @@ export function buildReviewObservation(
           reviewFail(
             `delegated child ${childId} claims READY while a live bound mission exists`);
         } else {
-          // Bound mission terminal (or canonically PAUSED) — fold
-          // pending: intervention, not fresh progress.
-          if (childMissionStatus === "PAUSED" ||
+          // Bound mission terminal (or canonically PAUSED) — the
+          // latest attempt's lifecycle is proven canonically either
+          // way before any classification.
+          assertCanonicalMissionLifecycle(
+            deps.store, childBoundMission!, childMissionStatus!);
+          if (childMissionStatus !== "PAUSED" &&
               TERMINAL_MISSION_STATUSES.has(childMissionStatus!)) {
-            assertCanonicalMissionLifecycle(
-              deps.store, childBoundMission!, childMissionStatus!);
+            // HOTFIX-B — READY is itself the canonical
+            // WORK_ITEM_UNBLOCKED derivation. Reopenable requires
+            // EVERY bound attempt proven canonically terminal: a
+            // PAUSED / live / unproven predecessor keeps intervention
+            // semantics and is never silently reopened.
+            let allAttemptsTerminal = true;
+            for (const att of canonicalBoundAttemptsForWorkItem(
+                deps.store, childId)) {
+              const am = deps.store.tryGet(
+                "mission", String(att.mission_id)) as Row | null;
+              if (!am) {
+                allAttemptsTerminal = false;
+                break;
+              }
+              const ams = canonicalDerivedMissionStatus(deps.store, am);
+              if (!TERMINAL_MISSION_STATUSES.has(ams)) {
+                allAttemptsTerminal = false;
+                break;
+              }
+              assertCanonicalMissionLifecycle(deps.store, am, ams);
+            }
+            childClass = allAttemptsTerminal
+              ? "REOPENABLE"
+              : "INTERVENTION";
+          } else {
+            // PAUSED bound mission — fold/resume pending:
+            // intervention, never an auto-reopen.
+            childClass = "INTERVENTION";
           }
-          childClass = "INTERVENTION";
         }
         break;
       }
