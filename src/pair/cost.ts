@@ -445,6 +445,98 @@ export class CostService {
     }
   }
 
+  /* ---------------- P15.10-C R3 — objective-scope lineage ---------------
+   * The objective budget cap binds at THIS reservation boundary, with
+   * the governed task's real route/executor identity. Canonical lineage
+   * (all reads inside the caller's transaction):
+   *   mission.bound_open_id → work_open_binding.work_item_id →
+   *   workforce_allocation (workstream or delegated child) → objective
+   *   → objective_auto_policy limits.budget_microusd_cap. */
+  /** R4 F2-A: returns the objective scope, "BROKEN" when the mission
+   *  claims an objective binding whose canonical lineage is missing or
+   *  contradictory (never silently treated as a manual mission), or
+   *  null when no objective claim exists at all. The work_item's own
+   *  objective_id is the binding-claim authority; the allocation row
+   *  is the objective linkage authority. */
+  private objectiveScopeFor(missionId: string):
+      { objective_id: string; cap: number | null } | "BROKEN" | null {
+    const mission = this.store.tryGet("mission", missionId);
+    const openId = mission?.bound_open_id;
+    if (!openId) return null; // no binding claim → genuinely manual
+    const wob = this.store.tryGet("work_open_binding", String(openId));
+    if (!wob) return "BROKEN"; // binding claimed but the binding row is gone
+    const wi = wob.work_item_id;
+    if (!wi) return "BROKEN";
+    // Binding-claim authority: the work_item's own objective_id, or the
+    // objective_id inherited through its parent chain (delegated
+    // children carry parent_work_item_id, not their own marker). Walk
+    // at most 8 hops; a cycle or a mid-chain missing parent means the
+    // graph contradicts itself → BROKEN.
+    let claimed: string | null = null;
+    let cur: string | null = String(wi);
+    const seen = new Set<string>();
+    let leafExists = false;
+    for (let hop = 0; cur && hop < 8; hop++) {
+      if (seen.has(cur)) return "BROKEN";
+      seen.add(cur);
+      const item = this.store.tryGet("work_item", cur) as Record<string, unknown> | null;
+      if (!item) {
+        if (hop === 0) break; // leaf missing — undecidable here, allocs decide below
+        return "BROKEN";      // parent pointer to a deleted row = tampered graph
+      }
+      if (hop === 0) leafExists = true;
+      const oid = String(item.objective_id ?? "");
+      if (oid) { claimed = oid; break; }
+      cur = item.parent_work_item_id ? String(item.parent_work_item_id) : null;
+    }
+    const allocs = (this.store.list("workforce_allocation") as Array<Record<string, unknown>>)
+      .filter((a) => String(a.workstream_work_item_id ?? "") === String(wi) ||
+                    String(a.delegated_child_work_item_id ?? "") === String(wi));
+    if (allocs.length === 0) {
+      // No objective linkage anywhere: an item that CLAIMS an
+      // objective (or one that cannot be resolved at all) is broken
+      // lineage, not a manual mission.
+      return (claimed !== null || !leafExists) ? "BROKEN" : null;
+    }
+    const a = claimed !== null
+      ? allocs.find((x) => String(x.objective_id) === claimed)
+      : allocs[0]!;
+    if (!a) return "BROKEN"; // allocation exists but for a different objective → mismatch
+    const oid = String(a.objective_id);
+    const pol = this.store.tryGet("objective_auto_policy", `oap:${oid}`);
+    const cap = (pol?.limits as Record<string, unknown> | null | undefined)
+      ?.budget_microusd_cap;
+    return { objective_id: oid, cap: cap == null ? null : Number(cap) };
+  }
+
+  /** Sum of every live reservation traceable to the objective — HELD /
+   *  COMMITTED at reserved, SETTLED at settled, RELEASED skipped. */
+  private objectiveAttributedMicrousd(objectiveId: string, reservations: Array<Record<string, unknown>>): number {
+    const wis = new Set<string>();
+    for (const a of this.store.list("workforce_allocation")) {
+      if (String(a.objective_id) === objectiveId) {
+        if (a.workstream_work_item_id) wis.add(String(a.workstream_work_item_id));
+        if (a.delegated_child_work_item_id) wis.add(String(a.delegated_child_work_item_id));
+      }
+    }
+    const mids = new Set<string>();
+    for (const wob of this.store.list("work_open_binding")) {
+      if (wis.has(String(wob.work_item_id ?? "")) && wob.mission_id) {
+        mids.add(String(wob.mission_id));
+      }
+    }
+    let total = 0;
+    for (const r of reservations) {
+      if (!mids.has(String(r.mission_id ?? ""))) continue;
+      const st = String(r.status);
+      if (st === "RELEASED") continue;
+      total += st === "SETTLED"
+        ? Number(r.settled_microusd ?? 0)
+        : Number(r.reserved_microusd ?? 0);
+    }
+    return total;
+  }
+
   /* ---------------- atomic pre-dispatch authority ------------------------ */
 
   /**
@@ -494,15 +586,20 @@ export class CostService {
     // complete CURRENT cost decision again — halt, billing, policy caps
     // and re-pricing all apply at retry time.
     const reusingReleased = existing && String(existing.status) === "RELEASED";
-    const billing = this.billingFor(params.executorId, routeId);
+    // F2-B R4: this pre-txn resolution is an ADVISORY snapshot only —
+    // the authoritative pricing identity is re-resolved inside the
+    // atomic check-and-reserve transaction below so a concurrent
+    // profile/route edit can never slip spending authority through
+    // a stale price.
+    const billingPre = this.billingFor(params.executorId, routeId);
 
     // §18: halt blocks cost-bearing NEW dispatch (METERED_API and UNKNOWN —
     // UNKNOWN may carry cost). FREE/SUBSCRIPTION/UNMETERED remain allowed.
-    if (this.haltActive() && (billing.mode === "METERED_API" || billing.mode === "UNKNOWN")) {
+    if (this.haltActive() && (billingPre.mode === "METERED_API" || billingPre.mode === "UNKNOWN")) {
       this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
         reason: "FAIL_CLOSED_COST_HALT",
         governed_task_id: governedTaskId,
-        billing_mode: billing.mode,
+        billing_mode: billingPre.mode,
       });
       throw new PolicyError("FAIL_CLOSED_COST_HALT", governedTaskId);
     }
@@ -523,7 +620,7 @@ export class CostService {
     // UNKNOWN billing mode at all — UNKNOWN may be a paid external route,
     // so a hard cap requires knowing the cost shape. Fail closed; never
     // fabricate $0.
-    if (billing.mode === "UNKNOWN" && hard.length > 0) {
+    if (billingPre.mode === "UNKNOWN" && hard.length > 0) {
       this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
         reason: "FAIL_CLOSED_COST_UNKNOWN",
         governed_task_id: governedTaskId,
@@ -531,7 +628,7 @@ export class CostService {
       });
       throw new PolicyError("FAIL_CLOSED_COST_UNKNOWN", governedTaskId);
     }
-    if (billing.mode === "METERED_API" && billing.unbounded && hard.length > 0) {
+    if (billingPre.mode === "METERED_API" && billingPre.unbounded && hard.length > 0) {
       this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
         reason: "FAIL_CLOSED_COST_UNBOUNDED",
         governed_task_id: governedTaskId,
@@ -540,12 +637,61 @@ export class CostService {
       throw new PolicyError("FAIL_CLOSED_COST_UNBOUNDED", governedTaskId);
     }
 
-    const requested = billing.unbounded ? 0 : this.reserveAmount(billing.profile);
-
     const outcome = this.store.immediate(() => {
+      // F2-B R4: pricing identity + amount are re-resolved INSIDE the
+      // atomic transaction — the advisory outer read is never trusted.
+      const billing = this.billingFor(params.executorId, routeId);
+      const requested = billing.unbounded ? 0 : this.reserveAmount(billing.profile);
       const reservations = this.store.list("cost_reservation");
       const violations: Array<Record<string, unknown>> = [];
       const warnings: Array<Record<string, unknown>> = [];
+      // In-txn pricing deny paths (mirror the advisory pre-checks): a
+      // profile that flipped to UNKNOWN/unbounded between the outer
+      // read and this txn still fails closed.
+      if (billing.mode === "UNKNOWN" && hard.length > 0) {
+        violations.push({
+          scope_type: "pricing", scope_id: routeId ?? params.executorId,
+          reason: "FAIL_CLOSED_COST_UNKNOWN",
+          used_microusd: null, requested_microusd: null, max_microusd: null,
+        });
+      }
+      if (billing.mode === "METERED_API" && billing.unbounded && hard.length > 0) {
+        violations.push({
+          scope_type: "pricing", scope_id: routeId ?? params.executorId,
+          reason: "FAIL_CLOSED_COST_UNBOUNDED",
+          used_microusd: null, requested_microusd: null, max_microusd: null,
+        });
+      }
+      // F2-C R4: the governed-task reservation slot is re-checked
+      // inside the transaction — a sibling connection that committed
+      // this resId between the outer fast-path and here is adopted,
+      // denied, or re-held exactly once, never double-counted.
+      const existingNow = this.store.tryGet("cost_reservation", resId);
+      const inTxnStatus = existingNow ? String(existingNow.status) : null;
+      if (inTxnStatus === "COMMITTED" || inTxnStatus === "SETTLED") {
+        return { violations: [], warnings: [], saved: existingNow };
+      }
+      if (inTxnStatus === "HELD" && !reusingReleased) {
+        return { violations: [{ scope_type: "reservation", scope_id: resId,
+          reason: "FAIL_CLOSED_COST_RESERVATION_AMBIGUOUS",
+          used_microusd: null, requested_microusd: null, max_microusd: null }],
+          warnings: [], saved: null };
+      }
+      // FINAL HOTFIX — halt re-checked against the AUTHORITATIVE
+      // in-txn billing: the advisory check above can see FREE while a
+      // concurrent edit flipped the profile to METERED_API/UNKNOWN in
+      // the gap; the halt must still block the cost-bearing dispatch.
+      // Adoption of an already-committed reservation above is not new
+      // spend and stays allowed under halt. FREE/SUBSCRIPTION/
+      // UNMETERED semantics are unchanged.
+      if (this.haltActive() &&
+          (billing.mode === "METERED_API" || billing.mode === "UNKNOWN")) {
+        violations.push({
+          scope_type: "pricing", scope_id: routeId ?? params.executorId,
+          reason: "FAIL_CLOSED_COST_HALT",
+          used_microusd: null, requested_microusd: null, max_microusd: null,
+        });
+      }
       for (const p of applicable) {
         const since = costPeriodStart(p.period as CostPeriod, new Date());
         const matches = (r: Record<string, unknown>) => {
@@ -601,6 +747,48 @@ export class CostService {
             used_microusd: used + requested,
             max_microusd: max,
           });
+        }
+      }
+      // P15.10-C R3 F2 — objective-level budget authority at the REAL
+      // pre-spend boundary. The driver's admission-time bound is only a
+      // preliminary check: the reservation THIS governed task creates
+      // has a concrete route/model identity, so the objective cap binds
+      // it here — inside the same atomic check-and-reserve transaction,
+      // against lineage resolved fresh (never the caller's snapshot).
+      const objScope = this.objectiveScopeFor(missionId);
+      if (objScope === "BROKEN") {
+        // F2-A R4: the mission carries an objective-binding claim
+        // (bound_open_id) but the canonical lineage cannot be resolved
+        // or contradicts itself — never treated as a manual mission.
+        violations.push({
+          scope_type: "objective",
+          scope_id: "UNRESOLVED",
+          reason: "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+          used_microusd: null, requested_microusd: null, max_microusd: null,
+        });
+      } else if (objScope && objScope.cap !== null) {
+        if (billing.mode === "UNKNOWN" || billing.unbounded) {
+          // An unprovable charge under an objective cap is never $0.
+          violations.push({
+            scope_type: "objective",
+            scope_id: objScope.objective_id,
+            reason: "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+            used_microusd: null,
+            requested_microusd: requested,
+            max_microusd: objScope.cap,
+          });
+        } else {
+          const attributed = this.objectiveAttributedMicrousd(objScope.objective_id, reservations);
+          if (attributed + requested > objScope.cap) {
+            violations.push({
+              scope_type: "objective",
+              scope_id: objScope.objective_id,
+              reason: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED",
+              used_microusd: attributed,
+              requested_microusd: requested,
+              max_microusd: objScope.cap,
+            });
+          }
         }
       }
       if (violations.length) return { violations, warnings, saved: null };
@@ -671,23 +859,26 @@ export class CostService {
     }
     if (outcome.violations.length) {
       for (const v of outcome.violations) {
-        this.store.event({
-          entity_type: "cost_policy",
-          entity_id: String(v.cost_policy_id),
-          event_type: "COST_BUDGET_EXCEEDED",
-          actor: "PAIR_COST_GOVERNANCE",
-          metadata: {
-            scope_type: v.scope_type,
-            scope_id: v.scope_id,
-            used_microusd: v.used_microusd,
-            requested_microusd: v.requested_microusd,
-            max_microusd: v.max_microusd,
-          },
-        });
+        if (v.cost_policy_id != null) {
+          this.store.event({
+            entity_type: "cost_policy",
+            entity_id: String(v.cost_policy_id),
+            event_type: "COST_BUDGET_EXCEEDED",
+            actor: "PAIR_COST_GOVERNANCE",
+            metadata: {
+              scope_type: v.scope_type,
+              scope_id: v.scope_id,
+              used_microusd: v.used_microusd,
+              requested_microusd: v.requested_microusd,
+              max_microusd: v.max_microusd,
+            },
+          });
+        }
         this.store.appendEvidence(missionId, "COST_DISPATCH_DENIED", {
-          reason: "FAIL_CLOSED_COST_BUDGET_EXCEEDED",
+          reason: String(v.reason ?? "FAIL_CLOSED_COST_BUDGET_EXCEEDED"),
           governed_task_id: governedTaskId,
-          cost_policy_id: v.cost_policy_id,
+          cost_policy_id: v.cost_policy_id ?? null,
+          objective_id: v.scope_type === "objective" ? v.scope_id : null,
           used_microusd: v.used_microusd,
           requested_microusd: v.requested_microusd,
           max_microusd: v.max_microusd,
@@ -695,7 +886,7 @@ export class CostService {
       }
       const v = outcome.violations[0];
       throw new PolicyError(
-        "FAIL_CLOSED_COST_BUDGET_EXCEEDED",
+        String(v.reason ?? "FAIL_CLOSED_COST_BUDGET_EXCEEDED"),
         `${String(v.scope_type)}:${String(v.scope_id)} ${String(v.used_microusd)}+${String(v.requested_microusd)}>${String(v.max_microusd)}`,
       );
     }

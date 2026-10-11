@@ -71,6 +71,7 @@ import {
   modelDiscoveryTimeoutMs,
   llmPlannerTimeoutMs,
   codexPlannerTimeoutMs,
+  ceoCliTimeoutMs,
   codexPlannerPlan,
   assertCodexPlannerCandidateEligibleWithRefresh,
   refreshCodexPlannerQualification,
@@ -97,6 +98,17 @@ import {
   validatePlanProposal,
   makeServePlanner,
   SERVE_LLM_WORK_CAPS,
+  ConversationSessionService,
+  ConversationReasoningService,
+  CodexCliConversationInvoker,
+  ensureConversationModel,
+  MissionDraftService,
+  TelegramConversationService,
+  ObjectiveAutoPolicyService,
+  createObjectiveAutoReconcile,
+  createObjectiveAutoDriver,
+  createDefaultObjectiveOperatingService,
+  ObjectiveWorkstreamService,
   telegramDeliveryMaxAttempts,
   telegramDeliveryStaleAfterMs,
   telegramDeliveryTransportTimeoutMs,
@@ -410,6 +422,131 @@ const control = new MissionControl({
 });
 const business = new BusinessLayer({ store, control, schedules });
 const workforce = new WorkforceService({ store, business });
+
+// P15.10-B — durable Objective wake/reconcile intake only. The scheduler
+// never claims a generation, calls a consumer, mints a mission or invokes
+// CEO/model/executor authority while cost binding remains unverified.
+const objectiveAutoPolicy = new ObjectiveAutoPolicyService(store, business.objectives);
+const objectiveReconcileMs = Number(process.env.PAIR_OBJECTIVE_RECONCILE_MS ?? 60_000);
+if (!Number.isSafeInteger(objectiveReconcileMs) ||
+    objectiveReconcileMs < 10_000 || objectiveReconcileMs > 300_000) {
+  throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_RECONCILE_MS", String(objectiveReconcileMs));
+}
+const objectiveAutoReconcile = createObjectiveAutoReconcile({
+  store,
+  objectives: business.objectives,
+  policy: objectiveAutoPolicy,
+  intervalMs: objectiveReconcileMs,
+});
+objectiveAutoReconcile.runtime.start();
+
+// P15.10-C — governed autonomous Objective driver. Explicit deployment
+// opt-in ONLY (PAIR_OBJECTIVE_AUTO_DRIVER=1): the driver consumes the
+// durable wake schedule through the existing claim → admission →
+// runObjectivePass → settle authority chain, with the owner's effective
+// auto-policy revalidated at every boundary and canonical usage
+// derivation gating the configured caps. Default OFF — with the flag
+// unset no driver exists, nothing claims generations, and readiness
+// keeps reporting driver_ready:false.
+let objectiveAutoDriver = null;
+if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
+  const objectiveDriverMs = Number(process.env.PAIR_OBJECTIVE_DRIVER_MS ?? 5_000);
+  if (!Number.isSafeInteger(objectiveDriverMs) ||
+      objectiveDriverMs < 1_000 || objectiveDriverMs > 300_000) {
+    throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_DRIVER_MS", String(objectiveDriverMs));
+  }
+  // Lazy composition — the CEO model catalog is seeded later in boot;
+  // resolving the pass runner must not require it at driver-construction
+  // time (mirrors the ceo-cycle route's lazy ceoOps pattern).
+  let objectiveCeoOps = null;
+  const resolveObjectiveCeoOps = () => {
+    objectiveCeoOps ??= createDefaultObjectiveOperatingService({
+      store, business, workforce,
+      objectives: business.objectives,
+      workstreams: new ObjectiveWorkstreamService({
+        store, business, workforce, objectives: business.objectives,
+      }),
+    });
+    return objectiveCeoOps;
+  };
+  const objectivePassRunner = (input) =>
+    resolveObjectiveCeoOps().service.runObjectivePass(input);
+  // P15.10-C R1 — the CEO invocation timeout bounds the driver's
+  // claim-time lease lifetime (timeout + 60s finalization, ≤960s cap);
+  // the value is env-validated here so a bad PAIR_CEO_CLI_TIMEOUT_MS
+  // fails boot closed rather than binding an unvalidated bound.
+  const objectiveCeoTimeoutMs = ceoCliTimeoutMs();
+  objectiveAutoDriver = createObjectiveAutoDriver({
+    store,
+    objectives: business.objectives,
+    policy: objectiveAutoPolicy,
+    scheduler: objectiveAutoReconcile.scheduler,
+    runPass: (input) => objectivePassRunner(input),
+    executors: [...governed.keys()],
+    billingFor: (executorId, routeId) => service.cost.billingFor(executorId, routeId),
+    costHaltActive: () =>
+      process.env.PAIR_COST_HALT === "1" || fs.existsSync(COST_HALT_FILE),
+    workerId: `objective-auto-driver:${process.pid}`,
+    bootId: crypto.randomUUID(),
+    intervalMs: objectiveDriverMs,
+    ceoTimeoutMs: objectiveCeoTimeoutMs,
+    // F1-D — before each admitted pass, stale STARTED/UNKNOWN CEO
+    // attempts scoped to that objective settle through canonical
+    // recovery; a restart never re-invokes an invocation already made.
+    reconcileStaleAttempts: (objectiveId) =>
+      resolveObjectiveCeoOps().ceoCycle.reconcileStaleAttempts(objectiveId),
+    onError: (e) => console.error("objective-auto-driver:", String(e).slice(0, 200)),
+  });
+  objectiveAutoDriver.runtime.start();
+  console.log(`OBJECTIVE AUTO DRIVER: ENABLED (interval=${objectiveDriverMs}ms, worker=objective-auto-driver:${process.pid})`);
+}
+
+// P15.8-D — conversation layer composition. Session/draft services are
+// pure canonical-store services — always wired. The reasoning turn
+// needs the governed codex-cli conversation transport; when the model
+// entry cannot be seeded/resolved at boot, ONLY the turn endpoint is
+// unavailable — every other Mission Control surface keeps serving.
+const conversationSessions = new ConversationSessionService(store);
+const missionDrafts = new MissionDraftService({
+  conversation: conversationSessions, control, store,
+});
+let conversationReasoning = null;
+try {
+  // TEST-ONLY seam: PAIR_CONVERSATION_STUB_REPLY replaces the codex-cli
+  // invoker with a deterministic echo so Playwright/CI never calls a
+  // paid/real model. Never set it in production.
+  const stubReply = process.env.PAIR_CONVERSATION_STUB_REPLY;
+  const convInvoker = stubReply === undefined
+    ? new CodexCliConversationInvoker({ env: process.env })
+    : {
+        invoke: async (input) => ({
+          model_entry_id: input.transport.model_entry_id,
+          provider_id: input.transport.provider_id,
+          model_id: input.transport.model_id,
+          raw_text: stubReply,
+        }),
+      };
+  conversationReasoning = new ConversationReasoningService({
+    conversation: conversationSessions,
+    store,
+    invoker: convInvoker,
+    model_entry_id: ensureConversationModel(store),
+  });
+} catch (e) {
+  console.error(
+    "CONVERSATION: reasoning unavailable — turns disabled:",
+    String(e).slice(0, 160),
+  );
+}
+// P15.8-E — telegram ingress authority over the same canonical
+// services. Pure composition — when reasoning is absent only the
+// reply path degrades; binding/draft/confirm keep working.
+const telegramConversation = new TelegramConversationService({
+  store,
+  conversation: conversationSessions,
+  drafts: missionDrafts,
+  reasoning: conversationReasoning ?? undefined,
+});
 // WFV2 §8: restart reconcile — forged/incompletely-materialized graph
 // provenance is quarantined before any work item can open.
 {
@@ -700,6 +837,14 @@ sup.resume();
 const knownCapabilityIds = () =>
   new Set(store.list("capability").map((c) => String(c.capability_id)));
 const planExpander = async (input) => {
+  // TEST-ONLY seam: PAIR_MC_TEMPLATE_PLANNER=1 skips the LLM planner
+  // edge entirely — the request falls back to the deterministic template
+  // planner inside the SAME canonical preview/confirm path (digest
+  // binding, gates, evidence unchanged). For e2e/CI where no qualified
+  // paid/CLI provider exists. Never set it in production.
+  if (process.env.PAIR_MC_TEMPLATE_PLANNER === "1") {
+    return { input };
+  }
   const candidates = dedupePlannerCandidates(plannerCandidates);
   if (typeof input.goal !== "string" || !input.goal.trim()) {
     return { input };
@@ -751,8 +896,18 @@ const planExpander = async (input) => {
       // contract enrichment + the same validatePlanProposal the preview
       // pins. A non-empty raw plan failing canonical validation is
       // FAILED/PLAN_INVALID and the next candidate is tried.
-      canonicalize: (tasks) => {
-        const canon = canonicalizeLlmTasks(tasks, goal);
+      canonicalize: (tasks, _c, evidence) => {
+        // HOTFIX 1 R1 — true raw emission evidence captured inside the
+        // planner transport BEFORE its own sanitize pass; threaded from
+        // THIS invocation's planFn result (INITIAL/REASK/candidate
+        // isolated by runPlannerFailover).
+        const canon = canonicalizeLlmTasks(tasks, goal, {
+          provenance: "fresh",
+          raw_delivery_emission_count:
+            evidence?.raw_delivery_emission_count,
+          raw_delivery_emission_state:
+            evidence?.raw_delivery_emission_state,
+        });
         validatePlanProposal({ tasks: canon }, knownCapabilityIds());
         return canon;
       },
@@ -893,6 +1048,25 @@ const server = createMissionControlServer({
   // always on; entities live in the canonical store alongside missions.
   business,
   workforce,
+  // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
+  // the P15.6 operating service lazily on first trigger (P15.7).
+  store,
+  autoScheduler: objectiveAutoReconcile.scheduler,
+  // P15.10-C — present only under PAIR_OBJECTIVE_AUTO_DRIVER=1;
+  // absent keeps scheduler status driver_ready:false and 404s the
+  // read-only auto-driver status route.
+  autoDriver: objectiveAutoDriver?.driver ?? undefined,
+  // P15.9-A1 — canonical artifact authority for cockpit artifact
+  // verification (producer binding + retained CAS bytes re-proved NOW).
+  artifacts: service.artifacts,
+  // P15.8-D — conversation layer (chat turns + governed mission drafts).
+  conversation: {
+    sessions: conversationSessions,
+    reasoning: conversationReasoning ?? undefined,
+    drafts: missionDrafts,
+    // P15.8-E — telegram ingress authority.
+    telegram: telegramConversation,
+  },
 });
 const port = Number(process.env.PAIR_MC_PORT ?? 8788);
 server.listen(port, () => {

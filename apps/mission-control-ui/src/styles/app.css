@@ -124,3 +124,34 @@ button.ghost { background: transparent; border: 1px solid var(--line); color: va
 .filter { max-width: 340px; }
 .badge.b-fail { background: #7f1d1d; color: #fecaca; }
 section h2 { font-size: 15px; margin: 18px 0 8px; }
+
+/* ---- P15.8-D — chat layout ---- */
+.chat-page { max-width: 1180px; margin: 0 auto; padding: 16px 20px; width: 100%; }
+.chat-wrap { display: flex; gap: 16px; align-items: stretch; min-height: 0; }
+.chat-sessions { width: 240px; flex: 0 0 240px; }
+.session-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.session-item { width: 100%; text-align: left; display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; }
+.session-item.on { border-color: var(--accent); color: var(--fg); }
+.session-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.chat-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.chat-thread { display: flex; flex-direction: column; gap: 10px; min-height: 160px; max-height: 55vh; overflow-y: auto; padding: 4px 0; }
+.msg { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; max-width: 88%; }
+.msg.role-operator { align-self: flex-end; border-color: var(--accent); }
+.msg.role-assistant { align-self: flex-start; }
+.msg.role-system { align-self: center; border-style: dashed; color: var(--muted); }
+.msg-meta { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; }
+.msg-body { white-space: pre-wrap; word-break: break-word; font-size: 13.5px; }
+.composer textarea { width: 100%; margin: 10px 0 6px; }
+.chat-drafts { margin-top: 4px; }
+.draft-card { background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; padding: 12px 14px; margin: 10px 0; }
+.draft-card.st-rejected, .draft-card.st-expired, .draft-card.st-submission_expired { border-color: var(--line); opacity: 0.75; }
+.badge.b-waiting { background: #713f12; color: #fde68a; }
+@media (max-width: 720px) {
+  .chat-wrap { flex-direction: column; }
+  .chat-sessions { width: 100%; flex: none; }
+  .session-list { flex-direction: row; overflow-x: auto; }
+  .session-item { min-width: 150px; }
+  .chat-thread { max-height: 50vh; }
+  .msg { max-width: 96%; }
+}

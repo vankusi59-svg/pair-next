@@ -25,6 +25,7 @@ import {
   type AgentContractPolicy,
   type AgentContractStatus,
 } from "./agent-contract.js";
+import { ObjectiveAuthorityService } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { MissionControl } from "./mission-control.js";
 import type { MissionScheduleService } from "./mission-schedule.js";
@@ -35,6 +36,10 @@ import {
   routineMirrorRowId,
 } from "./routine-mirror.js";
 import { validateWorkOpenBinding } from "./work-open-binding.js";
+import {
+  WORKFORCE_ALLOCATION_ENTITY,
+  assertCanonicalWorkforceAllocationProvenance,
+} from "./workforce-allocation-evidence.js";
 import {
   assertAuthoritySubset,
   assertCanonicalDecomposition,
@@ -154,7 +159,7 @@ const OPEN_RECONCILE_GRACE_MS = Number(process.env.PAIR_OPEN_RECONCILE_GRACE_MS 
 /** A HELD budget reservation stops counting after this long — covers the
  *  crash gap between reserve and mission create. */
 const RESERVATION_TTL_MS = Number(process.env.PAIR_BUDGET_RESERVATION_MS ?? 10 * 60 * 1000);
-const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+export const TERMINAL_MISSION_STATUSES = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 /** Terminal work-item statuses — no transition out exists. */
 export const TERMINAL_WORK_ITEM_STATUSES: ReadonlySet<string> = new Set(["DONE", "CANCELLED"]);
 /** Context notes kept per org_agent; newest kept, oldest trimmed. */
@@ -190,6 +195,7 @@ function periodStart(period: BudgetPeriod, now: Date): string {
 
 export class BusinessLayer {
   private _agentContracts: AgentContractService | null = null;
+  private _objectives: ObjectiveAuthorityService | null = null;
 
   constructor(private readonly deps: BusinessLayerDeps) {
     // Routines are business-originated work: a schedule fire carrying
@@ -325,6 +331,13 @@ export class BusinessLayer {
   get agentContracts(): AgentContractService {
     this._agentContracts ??= new AgentContractService(this.store);
     return this._agentContracts;
+  }
+
+  /** P15.1 canonical objective-authority service (same store) — the
+   *  single writer for governed objective rows. */
+  get objectives(): ObjectiveAuthorityService {
+    this._objectives ??= new ObjectiveAuthorityService(this.store);
+    return this._objectives;
   }
 
   // ---------- agent execution contract (P12) ----------
@@ -663,6 +676,14 @@ export class BusinessLayer {
     const ready = childrenDone &&
       (missionDone === true || (missionDone === null && childIds.length > 0));
     return { ready, mission, childIds, basisDigest, rejected };
+  }
+
+  /** Read-only completion-basis projection — the canonical grounding a
+   *  REVIEW_REQUIRED/DONE claim must satisfy (basis ready + not
+   *  rejected). Never mutates; corrupt rows evaluate unready. */
+  completionBasisProof(row: Row): { ready: boolean; rejected: boolean } {
+    const b = this.completionBasisSafe(row);
+    return { ready: b.ready, rejected: b.rejected };
   }
 
   /** Basis that never throws — corrupt child rows evaluate unready. */
@@ -1486,14 +1507,54 @@ export class BusinessLayer {
    * budget check (fail-closed) → enriched goal → canonical startMission →
    * work_item IN_PROGRESS with mission_id recorded.
    */
-  openWorkItem(workItemId: string, operatorId: string): Row {
+  openWorkItem(
+    workItemId: string,
+    operatorId: string,
+    admission?: {
+      /** P15.6 R2.C — optional objective-version admission pin: when
+       *  the caller is an objective-driven dispatcher, it observed an
+       *  exact canonical objective version and that authority must
+       *  still be live at the dedup write. Progress/budget/status
+       *  mutations all bump the objective version, so any drift aborts
+       *  the open atomically inside the same transaction — before any
+       *  intent/binding/mission write. */
+      objective_id?: string;
+      expected_objective_version?: number;
+    },
+  ): Row {
     if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
+    // P15.2 R2.B — the deterministic Objective-root namespace (OWI_*)
+    // is permanently non-executable: an Objective root is a P14 graph
+    // container only, never an openable work item. Guard sits at the
+    // canonical open seam BEFORE pending-open resolution, budget
+    // reservation, work_open_binding or mission creation; it keys on
+    // deterministic namespace identity, never the mutable `source`
+    // field. Ordinary P14 graph parents keep their existing semantics.
+    if (workItemId.startsWith("OWI_")) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_ROOT_NON_EXECUTABLE",
+        `objective root ${workItemId} is a graph container, not executable work`,
+      );
+    }
     const row = this.resolvePendingOpenBeforeMutation(workItemId, operatorId);
     this.assertWorkItemNotQuarantined(row);
     // WFV2 §5/§7: graph provenance + dependency gating at the single
     // canonical open seam — forged rows and unmet dependencies never
     // reach binding/mission creation.
     this.assertGraphAuthority(row);
+    // P15.4 R2.A — a P15.2 Objective WORKSTREAM container is likewise
+    // non-executable: work only flows through governed P15.4 allocation
+    // (the delegated child), never a direct open that would mint an
+    // unassigned mission. Canonical identity only — a decomposed child
+    // whose canonical (assertGraphAuthority-proved) parent is the
+    // deterministic OWI_* objective root. DL_* delegated children and
+    // ordinary P14 nodes keep their semantics.
+    if (String(row.parent_work_item_id ?? "").startsWith("OWI_")) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_OBJECTIVE_WORKSTREAM_CONTAINER_NON_EXECUTABLE",
+        `objective workstream container ${workItemId} is allocated, not opened directly`,
+      );
+    }
     this.assertDependenciesSatisfied(row);
     // R2 §4 — persisted-ceiling ∩ current-parent ∩ current-child
     // authority must still hold at open, before any binding/mission is
@@ -1590,7 +1651,48 @@ export class BusinessLayer {
     // P2 §8 — open mints NO bearer token: claimed_by/claim_expires_at
     // stay observability mirrors of the canonical lease only.
     row.updated_at = utcnow();
-    this.store.put("work_item", workItemId, row, Number(row.version));
+    this.store.immediate(() => {
+      if (admission?.objective_id) {
+        const ob = this.store.get("objective", admission.objective_id) as Row;
+        if (Number(ob.version) !== Number(admission.expected_objective_version)) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_STALE_FOR_OPEN",
+            `objective ${admission.objective_id} drifted before open admission`,
+          );
+        }
+        // P15.6 F2/R4 — the pinned objective must be the work item's
+        // canonical Objective lineage: exactly one P15.4
+        // workforce_allocation may name this work item as its
+        // delegated child, it must satisfy the canonical provenance
+        // proof (receipt shape + self-digest + exactly-one committed
+        // anchor pinning objective/child/workstream — mutable row
+        // fields alone are never authority), and its objective_id
+        // must equal the admission pin. A caller pinning a foreign
+        // objective (even with a matching version, even after a
+        // coherent row re-hash) fails closed before any intent /
+        // WOB / mission write. P14 callers pass no admission and are
+        // unaffected.
+        const wals = this.store.list(WORKFORCE_ALLOCATION_ENTITY)
+          .filter((r) => String(
+            (r as Record<string, unknown>).delegated_child_work_item_id)
+            === workItemId);
+        if (wals.length !== 1) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_LINEAGE_FOR_OPEN",
+            `work item ${workItemId} is not canonically pinned to objective ${admission.objective_id} (found ${wals.length} allocation rows)`,
+          );
+        }
+        assertCanonicalWorkforceAllocationProvenance(this.store, wals[0] as Row);
+        if (String((wals[0] as Record<string, unknown>).objective_id) !==
+              admission.objective_id) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_OBJECTIVE_LINEAGE_FOR_OPEN",
+            `work item ${workItemId} is not canonically pinned to objective ${admission.objective_id}`,
+          );
+        }
+      }
+      this.store.put("work_item", workItemId, row, Number(row.version));
+    });
 
     let reservationId: string | null = null;
     try {
@@ -3651,6 +3753,11 @@ export class BusinessLayer {
 
   // ---------- objective (goal tree) ----------
 
+  /**
+   * P15.1 — objective creation delegates to the canonical authority so
+   *  there is exactly one writer for `objective` rows: the full schema
+   *  (KPIs, budget, protected terms, dedup identity) is always applied.
+   */
   createObjective(input: {
     business_id: string;
     title: string;
@@ -3660,43 +3767,11 @@ export class BusinessLayer {
     target?: string;
     operator_id: string;
   }): Row {
-    if (!input.operator_id) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "objective.create");
-    if (!String(input.title ?? "").trim()) {
-      throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_TITLE", "objective title required");
-    }
-    this.getBusiness(input.business_id);
-    if (input.parent_objective_id) {
-      const parent = this.store.get("objective", input.parent_objective_id);
-      if (String(parent.business_id) !== input.business_id) {
-        throw new IntegrityError("FAIL_CLOSED_OBJECTIVE_SCOPE", `parent outside business ${input.business_id}`);
-      }
-    }
-    const id = newId("OBJ");
-    const row = {
-      objective_id: id,
-      business_id: input.business_id,
-      title: input.title,
-      description: input.description ?? "",
-      parent_objective_id: input.parent_objective_id ?? null,
-      metric: input.metric ?? "",
-      target: input.target ?? "",
-      status: "ACTIVE",
-      created_at: utcnow(),
-      version: 0,
-    };
-    const saved = this.store.put("objective", id, row, 0);
-    this.store.event({
-      entity_type: "objective", entity_id: id, event_type: "OBJECTIVE_CREATED",
-      new_state: "ACTIVE", actor: `operator:${input.operator_id}`,
-      metadata: { business_id: input.business_id, title: input.title },
-    });
-    return saved;
+    return this.objectives.create(input);
   }
 
   listObjectives(businessId?: string): Row[] {
-    const all = this.store.list("objective");
-    return (businessId ? all.filter((o) => String(o.business_id) === businessId) : all)
-      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    return this.objectives.list(businessId);
   }
 
   // ---------- aggregate read ----------

@@ -1,0 +1,788 @@
+/**
+ * P15.6 — OBJECTIVE OPERATING LOOP / OPERATIONAL CLOSURE.
+ *
+ * ONE bounded controller that composes the existing governed seams so
+ * an operator no longer drives CEO → allocation → open → completion
+ * sync → KPI review → strategy → next work by hand:
+ *
+ *   Objective → P15.3 CEO → P15.2/P14 graph → P15.4 allocation →
+ *   delegated child → BusinessLayer.openWorkItem → Mission runtime →
+ *   canonical completion → P15.5 review/strategy → next decision.
+ *
+ * P15.6 IS A CONTROLLER — NOT A NEW AUTHORITY:
+ *  - zero new durable authority tables; every fact it consumes comes
+ *    from strict canonical reads of the owning seam (P15.1 objective,
+ *    P15.2 binding, P15.4 WAL, P14 lifecycle evidence, P15.5 review).
+ *  - the ONLY execution crossing is BusinessLayer.openWorkItem() —
+ *    never MissionControl/MissionRouter/CapabilityRouter/executor.
+ *  - at most ONE CEO decision (binding absent) and at most ONE P15.5
+ *    review per pass; at most ONE new Mission dispatch per pass.
+ *  - no transaction is ever held across model/executor work — crash
+ *    safety comes from deterministic replay/adoption of the seams.
+ *  - no daemon, scheduler, polling, Telegram loop or mutable
+ *    current_step row: the pass is restart-safe by construction —
+ *    every committed authority is re-derived, never trusted.
+ */
+
+import path from "node:path";
+import { IntegrityError } from "./errors.js";
+import type { PairEvidenceStore } from "./store.js";
+import { ArtifactAuthority } from "./artifact-authority.js";
+import type { BusinessLayer } from "./business.js";
+import {
+  assertCanonicalMissionInFlight,
+  assertCanonicalMissionLifecycle,
+  canonicalBoundAttemptsForWorkItem,
+} from "./work-completion.js";
+import { TERMINAL_MISSION_STATUSES } from "./business.js";
+import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
+import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
+import type { WorkforceService } from "./work-graph.js";
+import type { CeoPlanningCycleService } from "./ceo-planning-cycle.js";
+import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import { ObjectiveKpiVerificationService } from "./objective-kpi-verification.js";
+import { createDefaultCeoPlanningCycle } from "./ceo-runtime.js";
+import {
+  assertCanonicalWorkforceAllocation,
+  WORKFORCE_ALLOCATION_ENTITY,
+  workforceAllocationId,
+  WorkforceAllocationService,
+} from "./workforce-allocation.js";
+import {
+  assertCanonicalWorkStatus,
+  assertCanonicalObjectiveBudget,
+  assertCanonicalObjectiveKpiProgress,
+  buildReviewObservation,
+  canonicalAdaptiveReviewsFor,
+  canonicalDerivedMissionStatus,
+  objectiveKpiAssessment,
+  ObjectiveAdaptiveReviewService,
+  proveCanonicalUnblockProvenance,
+  type ObjectiveAdaptiveReviewDeps,
+  type ReviewObservation,
+  type ReviewWorkstreamProjection,
+} from "./objective-adaptive-review.js";
+
+type Row = Record<string, unknown> & { version: number };
+
+/** A pass may perform several immediately-convergent internal steps
+ *  but always stops at an EXTERNAL wait boundary — never a while(true). */
+export const OBJECTIVE_OPERATING_MAX_INTERNAL_STEPS = 8;
+/** R1: at most ONE new Mission dispatch per pass — bounded cost,
+ *  meaningful priority semantics, understandable retries, safe live use. */
+export const OBJECTIVE_OPERATING_MAX_DISPATCHES_PER_PASS = 1;
+
+export const OPERATING_OUTCOMES = [
+  "DISPATCHED",
+  "AWAITING_EXECUTION",
+  "REVIEW_REQUIRED",
+  "WAITING_FOR_CEO",
+  "WAITING",
+  "TARGET_MET_CANDIDATE",
+  "TOPOLOGY_CHANGE_REQUIRED",
+  "INSUFFICIENT_VERIFIED_PROGRESS",
+  "OBJECTIVE_BUDGET_EXHAUSTED",
+  "NO_ELIGIBLE_AGENT",
+  "DEPENDENCY_BLOCKED",
+  "OBJECTIVE_NOT_ACTIVE",
+] as const;
+export type OperatingOutcome = (typeof OPERATING_OUTCOMES)[number];
+
+/** Observability/control-flow result — NOT a competing authority. */
+export interface OperatingPassResult {
+  outcome: OperatingOutcome;
+  objective_id: string;
+  owner_action_required?: boolean;
+  binding_id?: string;
+  workstream_key?: string;
+  allocation_id?: string;
+  delegated_child_work_item_id?: string;
+  mission_id?: string;
+  review_id?: string;
+  strategy_revision_id?: string;
+  ceo_decision_id?: string;
+  blocked_workstream_keys?: string[];
+  no_eligible_workstream_keys?: string[];
+  detail?: string;
+}
+
+export interface ObjectiveOperatingDeps extends ObjectiveAdaptiveReviewDeps {
+  /** ONE P15.3 cycle shared with the review service — never two paths. */
+  ceoCycle: CeoPlanningCycleService;
+  review: ObjectiveAdaptiveReviewService;
+  allocation: WorkforceAllocationService;
+  /** P15.10-D — canonical KPI verification seam. When present the pass
+   *  re-derives deliverable evidence ONCE per pass (bounded to existing
+   *  grants) before evaluating §6 targets. Absent = auto-verification
+   *  structurally off; nothing about the loop semantics changes. */
+  kpiVerification?: { advance(objectiveId: string): unknown };
+}
+
+/** R2.D — invocation-local step budget: a pass NEVER shares or resets
+ *  another pass's counter; concurrent passes on one service instance
+ *  each own an independent 8-step allowance. */
+interface PassCtx {
+  steps_used: number;
+}
+
+/** TEST-ONLY injection points at REAL between-seam boundaries — used
+ *  by the R3 injected-drift tests; production callers never pass them. */
+export interface OperatingPassHooks {
+  /** Fires after a committed PRIORITIZE review, before NEW allocation. */
+  afterReview?: () => void;
+  /** Fires after allocation resolved, before the openWorkItem crossing. */
+  beforeOpen?: () => void;
+}
+
+function operatingFail(detail: string): never {
+  throw new IntegrityError("FAIL_CLOSED_P15_6_OPERATING_LOOP", detail);
+}
+
+/** Internal bound trip — converted to a typed WAITING result. */
+class PassBoundExceeded extends Error {}
+
+export class ObjectiveOperatingService {
+  constructor(private readonly deps: ObjectiveOperatingDeps) {}
+
+  private get store(): PairEvidenceStore { return this.deps.store; }
+
+  private tick(ctx: PassCtx): void {
+    if (++ctx.steps_used > OBJECTIVE_OPERATING_MAX_INTERNAL_STEPS) {
+      throw new PassBoundExceeded();
+    }
+  }
+
+  /**
+   * ONE bounded operating pass over the canonical Objective state.
+   * Restart-safe: every decision is re-derived from committed
+   * authority; a crash anywhere leaves the next pass convergent.
+   */
+  async runObjectivePass(input: {
+    objective_id: string;
+    actor: string;
+    /** P15.10-C — optional delegated-authority gate, fired by the
+     *  autonomous driver immediately BEFORE every external authority
+     *  crossing inside the pass (CEO model call, review commit,
+     *  allocation, mission open, delegated-child reconcile). The gate
+     *  is a caller-supplied fail-closed revalidation: when it throws,
+     *  the pass aborts and the fault propagates. Manual/operator
+     *  callers never set it — semantics are byte-identical to before. */
+    authority_gate?: () => void;
+    /** TEST-ONLY — never set in production. */
+    hooks?: OperatingPassHooks;
+  }): Promise<OperatingPassResult> {
+    if (typeof input.actor !== "string" || !input.actor.trim() || input.actor.length > 256) {
+      throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "operating.runObjectivePass");
+    }
+    const actor = input.actor;
+    const objectiveId = String(input.objective_id ?? "");
+    if (!objectiveId || objectiveId.length > 256) {
+      operatingFail("objective_id malformed");
+    }
+    if (input.authority_gate !== undefined && typeof input.authority_gate !== "function") {
+      operatingFail("authority_gate malformed");
+    }
+    const ctx: PassCtx = { steps_used: 0 };
+    try {
+      return await this.pass(ctx, objectiveId, actor, input.hooks, input.authority_gate);
+    } catch (e) {
+      if (e instanceof PassBoundExceeded) {
+        // Deterministic external-wait boundary: the committed seams
+        // already made progress; the next pass continues from them.
+        return { outcome: "WAITING", objective_id: objectiveId, detail: "internal step bound reached" };
+      }
+      throw e;
+    }
+  }
+
+  private async pass(
+    ctx: PassCtx, objectiveId: string, actor: string,
+    hooks?: OperatingPassHooks,
+    authorityGate?: () => void,
+  ): Promise<OperatingPassResult> {
+    const result = (o: OperatingOutcome, extra?: Partial<OperatingPassResult>): OperatingPassResult => ({
+      outcome: o, objective_id: objectiveId, ...extra,
+    });
+
+    // §5 — pre-flight objective authority. P15.1 deadline semantics
+    // only; never auto-transition ACHIEVED/INFEASIBLE/CANCELLED.
+    this.deps.objectives.evaluateDeadline(objectiveId);
+    let objective = this.deps.objectives.get(objectiveId); // strict P15.1
+    if (String(objective.status) !== "ACTIVE") {
+      return result("OBJECTIVE_NOT_ACTIVE");
+    }
+
+    // P15.10-D — re-derive verified deliverable evidence once per pass,
+    // BEFORE the §6 proofs read the KPI projection. Bounded to the
+    // grants already committed for this objective; throws on canonical
+    // corruption (fail closed, propagates like any §6 proof).
+    if (this.deps.kpiVerification) {
+      this.deps.kpiVerification.advance(objectiveId);
+      objective = this.deps.objectives.get(objectiveId); // strict re-read
+    }
+
+    // §6 — strict KPI + budget pre-flight: the EXACT P15.5 proofs.
+    assertCanonicalObjectiveKpiProgress(this.store, objective);
+    assertCanonicalObjectiveBudget(this.store, objective);
+    const kpis = objective.kpis as ObjectiveKpi[];
+    const allTargetsMet = kpis.length > 0 &&
+      kpis.every((k) => objectiveKpiAssessment(k) === "MET");
+    const budget = objective.budget as Record<string, unknown>;
+    const budgetExhausted =
+      Number(budget.consumed_microusd) >= Number(budget.ceiling_microusd);
+
+    let binding = this.deps.workstreams.getBinding(objectiveId); // strict
+
+    // All targets canonically MET → ZERO new work. With a binding, the
+    // canonical P15.5 review (deterministic, zero model call) commits
+    // the recommendation; pre-binding the result is non-authoritative.
+    if (allTargetsMet) {
+      if (binding) {
+        // P15.10 fold fix — MET short-circuits NEW work, never the
+        // bookkeeping of work already committed: fold IN_PROGRESS
+        // delegated children whose bound Missions are canonically
+        // terminal through the EXISTING §9 reconcile seam BEFORE the
+        // review observes the state. No allocation, no CEO call;
+        // syncWorkItem itself re-proves lineage and fails closed.
+        const obsMet = this.observe(objectiveId);
+        this.reconcileDelegatedChildren(ctx, obsMet, actor, authorityGate);
+        this.tick(ctx);
+        authorityGate?.();
+        const review = await this.deps.review.runReview({ objective_id: objectiveId, actor,
+          autonomous_commit_guard: authorityGate });
+        return result("TARGET_MET_CANDIDATE", {
+          owner_action_required: true,
+          binding_id: String(binding.binding_id),
+          review_id: String(review.review.review_id),
+        });
+      }
+      return result("TARGET_MET_CANDIDATE", { owner_action_required: true });
+    }
+
+    // §7 — initial objective bootstrap through the EXISTING P15.3
+    // cycle only (never another CEO path, never Planner/Brain/executor).
+    if (!binding) {
+      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      this.tick(ctx);
+      authorityGate?.();
+      const cycle = await this.deps.ceoCycle.runCycle({ objective_id: objectiveId, actor,
+        autonomous_commit_guard: authorityGate });
+      if (String(cycle.decision.decision_kind) === "WAIT") {
+        return result("WAITING_FOR_CEO", { ceo_decision_id: String(cycle.decision.decision_id) });
+      }
+      // INITIALIZE materialized through P15.2 inside runCycle; any
+      // impossible PRIORITIZE without binding fails closed inside P15.3.
+      binding = cycle.binding ?? this.deps.workstreams.getBinding(objectiveId);
+      if (!binding) operatingFail("INITIALIZE committed without a canonical binding");
+    }
+
+    // §9 — reconcile existing objective work BEFORE any new action.
+    //    One strict projection re-derives every lifecycle fact.
+    let obs = this.observe(objectiveId);
+    const synced = this.reconcileDelegatedChildren(ctx, obs, actor, authorityGate);
+    if (synced) obs = this.observe(objectiveId); // fresh canonical classes
+
+    // §17 — classify from canonical lifecycle evidence only.
+    // HOTFIX-B — REOPENABLE: READY + every bound attempt canonically
+    // terminal + canonical WORK_ITEM_UNBLOCKED evidence — eligible for
+    // one new governed attempt through the same openWorkItem seam.
+    const launchable = obs.workstreams.filter((w) =>
+      (w.delegated_child_class === "ACTIVE" &&
+       w.delegated_child_status === "READY" &&
+       !w.delegated_child_bound_mission) ||
+      w.delegated_child_class === "REOPENABLE");
+    const activeExecution = obs.workstreams.find((w) =>
+      w.delegated_child_class === "ACTIVE" &&
+      w.delegated_child_status === "IN_PROGRESS");
+    const reviewPending = obs.workstreams.find((w) =>
+      w.workstream_status === "REVIEW_REQUIRED" ||
+      w.delegated_child_status === "REVIEW_REQUIRED");
+    if (reviewPending) {
+      // Governed review is a human gate — no auto ACCEPT/REWORK.
+      return result("REVIEW_REQUIRED", {
+        binding_id: String(binding.binding_id),
+        workstream_key: reviewPending.workstream_key,
+        delegated_child_work_item_id: reviewPending.delegated_child_work_item_id ?? undefined,
+      });
+    }
+    if (activeExecution) {
+      // R3-F1 — AWAITING_EXECUTION is itself a claim about execution
+      // authority: it must be PROVEN, never read from the lifecycle
+      // projection. The projection located the candidate child; the
+      // canonical bound Mission must independently satisfy the full
+      // in-flight proof (mission spine + WOB identity + runtime
+      // event replay). Corrupt runtime evidence or a missing binding
+      // fails closed — never a free AWAITING_EXECUTION.
+      const child = this.store.get(
+        "work_item", activeExecution.delegated_child_work_item_id!) as Row;
+      const mission = this.deps.business.boundMissionForWorkItem(child);
+      if (!mission) {
+        operatingFail(
+          `IN_PROGRESS delegated child ${activeExecution.delegated_child_work_item_id} has no canonical bound mission`);
+      }
+      assertCanonicalMissionInFlight(this.store, mission, child);
+      return result("AWAITING_EXECUTION", {
+        binding_id: String(binding.binding_id),
+        workstream_key: activeExecution.workstream_key,
+        delegated_child_work_item_id: activeExecution.delegated_child_work_item_id ?? undefined,
+        mission_id: String(mission.mission_id),
+      });
+    }
+
+    // Latest canonical strategy drives the operating order (§11); a
+    // forged revision fails closed inside the strict chain read.
+    const strategy = this.deps.review.getLatestStrategy(objectiveId);
+    const rankOf = this.orderRanker(obs, strategy);
+
+    // §13 — an already-committed allocation (canonical READY child, no
+    // bound Mission) is previously authorized work: open it directly,
+    // never ask the CEO again for crash continuation. When several
+    // children are launchable, the committed strategy order still
+    // governs which one opens first (R2.E) — strategy is ordering
+    // authority here, not a new model call.
+    if (launchable.length > 0) {
+      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      launchable.sort((a, b) => rankOf(a.workstream_key) - rankOf(b.workstream_key));
+      return this.openDelegatedChild(
+        ctx, objectiveId, launchable[0]!.delegated_child_work_item_id!,
+        launchable[0]!.work_item_id, actor, result, {
+          workstream_key: launchable[0]!.workstream_key,
+        }, hooks, authorityGate);
+    }
+
+    // §12 — binding + nothing launchable + no active execution → the
+    //    canonical P15.5 review decides BEFORE any NEW allocation.
+    //    §8 bootstrap exception: binding + zero WALs + zero reviews →
+    //    execute the canonical P15.2 binding order directly. R2.B —
+    //    review history is discovered through immutable attribution
+    //    (row claim UNION committed anchors), never mutable row fields.
+    const bootstrap = obs.workstreams.every((w) => w.allocation_state === "NONE") &&
+      canonicalAdaptiveReviewsFor(this.deps, objectiveId).length === 0;
+    let order: string[];
+    let appliedStrategyId: string | null = null;
+    /** R3.B — the canonical review/strategy checkpoint this pass is
+     *  allowed to act on: source review identity + the immutable
+     *  observation digest the decision was made against. */
+    let sourceReviewId: string | null = null;
+    let sourceObsDigest: string | null = null;
+    if (bootstrap) {
+      order = (binding.workstreams as Array<Record<string, unknown>>)
+        .map((w) => String(w.workstream_key));
+    } else {
+      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      this.tick(ctx);
+      authorityGate?.();
+      const reviewRes = await this.deps.review.runReview({ objective_id: objectiveId, actor,
+        autonomous_commit_guard: authorityGate });
+      const reviewId = String(reviewRes.review.review_id);
+      switch (reviewRes.outcome) {
+        case "PRIORITIZE_EXISTING": {
+          // R2.C/R3.B — never trust the returned strategy merely
+          // because the call produced it: strict re-read the committed
+          // latest strategy and require it to be the one pinned by THIS
+          // canonical review (identity + digest + obs checkpoint).
+          const latest = this.deps.review.getLatestStrategy(objectiveId);
+          const applied = reviewRes.strategy_revision;
+          if (!latest || !applied ||
+              String(latest.strategy_revision_id) !==
+                String(applied.strategy_revision_id) ||
+              String(latest.strategy_revision_id) !==
+                String(reviewRes.review.strategy_revision_id ?? "") ||
+              String(latest.source_review_id) !== reviewId) {
+            return result("WAITING", {
+              review_id: reviewId,
+              detail: "strategy drifted since review — next pass re-reads",
+            });
+          }
+          appliedStrategyId = String(latest.strategy_revision_id);
+          sourceReviewId = reviewId;
+          sourceObsDigest = String(reviewRes.review.review_observation_digest);
+          order = (latest.actionable_order as string[]).map(String);
+          break;
+        }
+        case "TARGET_MET_CANDIDATE":
+          return result("TARGET_MET_CANDIDATE", { owner_action_required: true, review_id: reviewId });
+        case "TOPOLOGY_CHANGE_REQUIRED":
+          return result("TOPOLOGY_CHANGE_REQUIRED", { review_id: reviewId });
+        case "INSUFFICIENT_VERIFIED_PROGRESS":
+          return result("INSUFFICIENT_VERIFIED_PROGRESS", { review_id: reviewId });
+        case "WAIT":
+          return result("WAITING", { review_id: reviewId });
+        case "AWAITING_PROGRESS":
+          // Review re-proved canonical activity — respect it.
+          return result("WAITING", { review_id: reviewId });
+        default:
+          operatingFail(`review outcome ${String(reviewRes.outcome)} outside operating vocabulary`);
+      }
+    }
+
+    // R3.B — before any NEW allocation, verify the canonical external
+    //    state still agrees with the review's decision checkpoint: the
+    //    strict observation digest must equal the digest the source
+    //    review committed. Any external drift (KPI progress, lifecycle
+    //    evidence, WAL writes, budget) → bounded WAITING, never stale
+    //    dispatch. Rows committed by THIS pass's own review are not in
+    //    the observation identity (P15.5 R2.A), so the check is exact.
+    if (sourceObsDigest !== null && appliedStrategyId !== null) {
+      hooks?.afterReview?.();
+      const nowDigest = buildReviewObservation(this.deps, objectiveId).digest;
+      if (nowDigest !== sourceObsDigest) {
+        return result("WAITING", {
+          review_id: sourceReviewId ?? undefined,
+          detail: "canonical state drifted since review — stale strategy not applied",
+        });
+      }
+    }
+
+    // §14/§18 — at most ONE new Mission: walk the operating order,
+    //    skip exhausted/allocated/blocked, allocate the rest through
+    //    the EXISTING P15.4 seam and open the exact delegated child.
+    const blocked: string[] = [];
+    const noEligible: string[] = [];
+    const byKey = new Map(obs.workstreams.map((w) => [w.workstream_key, w]));
+    // Canonical binding order appends any keys absent from the
+    // strategy's actionable subset (actionable_order ⊆ binding keys).
+    const fullOrder = [
+      ...order,
+      ...(binding.workstreams as Array<Record<string, unknown>>)
+        .map((w) => String(w.workstream_key))
+        .filter((k) => !order.includes(k)),
+    ];
+    for (const key of fullOrder) {
+      const w = byKey.get(key);
+      if (!w) continue;
+      // Skip canonically exhausted or operator-intervened workstreams;
+      // allocated children were already classified above.
+      if (this.workstreamExhausted(w) || w.allocation_state !== "NONE" ||
+          w.workstream_status === "BLOCKED") continue;
+      this.tick(ctx);
+      authorityGate?.();
+      const alloc = this.deps.allocation.allocateWorkstream({
+        objective_id: objectiveId, workstream_key: key, actor,
+      });
+      if (alloc.status === "dependency_blocked") { blocked.push(key); continue; }
+      if (alloc.status === "no_eligible_agent") { noEligible.push(key); continue; }
+      // allocated | replayed — use the EXACT delegated child. §27:
+      // a dispatch still carries the blocked keys as observability.
+      // R3.B — before opening, re-prove the applied strategy is STILL
+      // the canonical head pinned by the source review: a newer valid
+      // strategy committed since the review makes the old actionable
+      // order stale authority.
+      if (appliedStrategyId !== null) {
+        const head = this.deps.review.getLatestStrategy(objectiveId);
+        if (!head ||
+            String(head.strategy_revision_id) !== appliedStrategyId ||
+            String(head.source_review_id) !== sourceReviewId) {
+          return result("WAITING", {
+            review_id: sourceReviewId ?? undefined,
+            detail: "newer canonical strategy superseded this pass's ordering",
+          });
+        }
+      }
+      const childId = String(alloc.delegated_child_work_item_id);
+      return this.openDelegatedChild(
+        ctx, objectiveId, childId, w.work_item_id, actor, result, {
+          workstream_key: key,
+          allocation_id: String(alloc.allocation!.workforce_allocation_id ??
+                                alloc.allocation!.allocation_id ?? ""),
+          strategy_revision_id: appliedStrategyId ?? undefined,
+          ...(blocked.length ? { blocked_workstream_keys: [...blocked] } : {}),
+          ...(noEligible.length ? { no_eligible_workstream_keys: [...noEligible] } : {}),
+        },
+        hooks, authorityGate);
+    }
+    if (blocked.length > 0) {
+      return result("DEPENDENCY_BLOCKED", { blocked_workstream_keys: blocked });
+    }
+    if (noEligible.length > 0) {
+      return result("NO_ELIGIBLE_AGENT", { no_eligible_workstream_keys: noEligible });
+    }
+    return result("WAITING", { detail: "no actionable workstream this pass" });
+  }
+
+  /** §9 objective-scoped reconciliation ONLY (never the global
+   *  reconcileWorkLifecycle): fold canonically-terminal bound Missions
+   *  of IN_PROGRESS delegated children, then resume the interrupted
+   *  parent cascade through the existing authority. */
+  private reconcileDelegatedChildren(
+    ctx: PassCtx, obs: ReviewObservation, actor: string,
+    authorityGate?: () => void,
+  ): boolean {
+    let synced = false;
+    for (const w of obs.workstreams) {
+      if (w.delegated_child_class !== "INTERVENTION" ||
+          w.delegated_child_status !== "IN_PROGRESS" ||
+          !w.delegated_child_work_item_id) continue;
+      const child = this.store.get("work_item", w.delegated_child_work_item_id) as Row;
+      const mission = this.deps.business.boundMissionForWorkItem(child);
+      if (!mission || !TERMINAL_MISSION_STATUSES.has(String(mission.status))) continue;
+      // syncWorkItem is the canonical fold authority; it re-validates
+      // the WOB/mission lineage itself and materializes DONE/WCP or
+      // REVIEW_REQUIRED — never a direct status write.
+      this.tick(ctx);
+      authorityGate?.();
+      this.deps.business.syncWorkItem(w.delegated_child_work_item_id);
+      this.deps.business.advanceCompletionCascade(w.delegated_child_work_item_id, actor);
+      synced = true;
+    }
+    return synced;
+  }
+
+  /** R2.C — final dispatch authority re-proof, run immediately before
+   *  the openWorkItem crossing and NEVER trusting an earlier
+   *  observation or the in-memory AllocationResult:
+   *   1. deadline evaluated, 2. strict objective read, 3. still ACTIVE,
+   *   4. strict KPI proof, 5. targets still NOT all MET, 6. strict
+   *   budget proof, 7. consumed < ceiling, 8. the exact P15.4 WAL
+   *   exists + strict-validates, 9. the WAL still pins this exact
+   *   child/workstream, 10. the child is canonically READY with no
+   *   bound Mission. Returns the objective version that the open
+   *   seam's admission guard then pins atomically. */
+  private proveDispatchAuthority(
+    objectiveId: string, childId: string, workstreamWorkItemId: string,
+  ): { objective_version: number } |
+     { abort: "OBJECTIVE_NOT_ACTIVE" | "TARGET_MET_CANDIDATE" |
+              "OBJECTIVE_BUDGET_EXHAUSTED" | "AWAITING_EXECUTION";
+       mission_id?: string } {
+    this.deps.objectives.evaluateDeadline(objectiveId);
+    const objective = this.deps.objectives.get(objectiveId); // strict
+    if (String(objective.status) !== "ACTIVE") {
+      return { abort: "OBJECTIVE_NOT_ACTIVE" };
+    }
+    assertCanonicalObjectiveKpiProgress(this.store, objective);
+    const kpis = objective.kpis as ObjectiveKpi[];
+    if (kpis.length > 0 &&
+        kpis.every((k) => objectiveKpiAssessment(k) === "MET")) {
+      return { abort: "TARGET_MET_CANDIDATE" };
+    }
+    assertCanonicalObjectiveBudget(this.store, objective);
+    const budget = objective.budget as Record<string, unknown>;
+    if (Number(budget.consumed_microusd) >= Number(budget.ceiling_microusd)) {
+      return { abort: "OBJECTIVE_BUDGET_EXHAUSTED" };
+    }
+    const wal = this.store.tryGet(
+      WORKFORCE_ALLOCATION_ENTITY,
+      workforceAllocationId(objectiveId, workstreamWorkItemId)) as Row | null;
+    if (!wal) {
+      operatingFail(`dispatch WAL missing for workstream ${workstreamWorkItemId}`);
+    }
+    assertCanonicalWorkforceAllocation(this.deps, wal);
+    if (String(wal.workstream_work_item_id) !== workstreamWorkItemId ||
+        String(wal.delegated_child_work_item_id) !== childId ||
+        String(wal.objective_id) !== objectiveId) {
+      operatingFail(`dispatch WAL does not pin child ${childId}`);
+    }
+    const child = this.store.get("work_item", childId) as Row;
+    if (assertCanonicalWorkStatus(this.store, child) !== "READY") {
+      operatingFail(`delegated child ${childId} not canonically READY`);
+    }
+    const mission = this.deps.business.boundMissionForWorkItem(child);
+    if (mission) {
+      const ms = String(mission.status);
+      if (TERMINAL_MISSION_STATUSES.has(ms)) {
+        // HOTFIX-B/R1-F2 — final dispatch-boundary re-proof of the
+        // REOPENABLE contract, run AT the openWorkItem crossing and
+        // never trusting the earlier review observation:
+        //  a) the current READY must derive from an authentic
+        //     WORK_ITEM_UNBLOCKED event following THIS latest bound
+        //     predecessor — the same single authority the review used;
+        //  b) EVERY bound attempt in immutable WOB history must be
+        //     canonically terminal (mirroring openWorkItem's own
+        //     admission loop — a live earlier attempt is corrupt
+        //     authority, never converged);
+        //  c) the latest bound mission identity + lifecycle is
+        //     re-proven through its own immutable spine.
+        if (proveCanonicalUnblockProvenance(this.store, child) === null) {
+          operatingFail(
+            `delegated child ${childId} terminal-bound READY lacks canonical WORK_ITEM_UNBLOCKED provenance`);
+        }
+        for (const att of canonicalBoundAttemptsForWorkItem(
+            this.store, childId)) {
+          const am = this.store.tryGet(
+            "mission", String(att.mission_id)) as Row | null;
+          if (!am) {
+            operatingFail(
+              `bound attempt ${String(att.open_id)} mission missing`);
+          }
+          const ams = canonicalDerivedMissionStatus(this.store, am);
+          if (!TERMINAL_MISSION_STATUSES.has(ams)) {
+            operatingFail(
+              `bound attempt mission ${String(am.mission_id)} not canonically terminal`);
+          }
+          assertCanonicalMissionLifecycle(this.store, am, ams);
+        }
+        assertCanonicalMissionLifecycle(this.store, mission, ms);
+        return { objective_version: Number(objective.version) };
+      }
+      // R2.A — converge only through a proven in-flight mission.
+      // PAUSED / live / unproven claims propagate — never a reopen.
+      assertCanonicalMissionInFlight(this.store, mission, child);
+      return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
+    }
+    return { objective_version: Number(objective.version) };
+  }
+
+  /** §15/§16 — the SINGLE governed execution crossing. Every final
+   *  execution gate is re-proven inside openWorkItem, PLUS the
+   *  objective-version admission pin (R2.C) bound atomically into the
+   *  dedup write; the open race converges ONLY through a fully-proven
+   *  canonical in-flight bound Mission (§20/R2.A) — PAUSED, terminal or
+   *  unproven claims propagate, never become AWAITING_EXECUTION. */
+  private openDelegatedChild(
+    ctx: PassCtx,
+    objectiveId: string,
+    childId: string,
+    workstreamWorkItemId: string,
+    actor: string,
+    result: (o: OperatingOutcome, extra?: Partial<OperatingPassResult>) => OperatingPassResult,
+    extra?: Partial<OperatingPassResult>,
+    hooks?: OperatingPassHooks,
+    authorityGate?: () => void,
+  ): OperatingPassResult {
+    this.tick(ctx);
+    hooks?.beforeOpen?.(); // TEST-ONLY drift injection at the real boundary
+    // P15.10-C — delegated authority re-proven AT the mission-open
+    // boundary: the last checkpoint before a bound Mission can exist.
+    authorityGate?.();
+    const proof = this.proveDispatchAuthority(
+      objectiveId, childId, workstreamWorkItemId);
+    if ("abort" in proof) {
+      if (proof.abort === "AWAITING_EXECUTION") {
+        return result("AWAITING_EXECUTION", {
+          delegated_child_work_item_id: childId,
+          mission_id: proof.mission_id,
+          ...extra,
+        });
+      }
+      return result(proof.abort, {
+        owner_action_required: proof.abort === "TARGET_MET_CANDIDATE" ? true : undefined,
+        ...extra,
+      });
+    }
+    let saved: Row;
+    try {
+      saved = this.deps.business.openWorkItem(childId, actor, {
+        objective_id: objectiveId,
+        expected_objective_version: proof.objective_version,
+      }) as Row;
+    } catch (err) {
+      // An open loser converges only when the canonical bound Mission
+      // is fully proven in flight (§20/R2.A): spine replay + WOB
+      // identity + compatible runtime — PAUSED/terminal/unproven all
+      // propagate fail-closed.
+      const child = this.store.tryGet("work_item", childId) as Row | null;
+      const mission = child ? this.deps.business.boundMissionForWorkItem(child) : null;
+      if (mission && child) {
+        assertCanonicalMissionInFlight(this.store, mission, child);
+        return result("AWAITING_EXECUTION", {
+          delegated_child_work_item_id: childId,
+          mission_id: String(mission.mission_id),
+          ...extra,
+        });
+      }
+      throw err;
+    }
+    const mission = this.deps.business.boundMissionForWorkItem(saved);
+    return result("DISPATCHED", {
+      delegated_child_work_item_id: childId,
+      mission_id: mission ? String(mission.mission_id) : undefined,
+      ...extra,
+    });
+  }
+
+  private observe(objectiveId: string): ReviewObservation {
+    return buildReviewObservation(this.deps, objectiveId).observation;
+  }
+
+  private workstreamExhausted(w: ReviewWorkstreamProjection): boolean {
+    return w.completion_proven ||
+      w.workstream_status === "CANCELLED" ||
+      w.delegated_child_status === "DONE" ||
+      w.delegated_child_status === "CANCELLED";
+  }
+
+  /** Rank a workstream key by the latest canonical strategy's
+   *  actionable_order; keys outside it fall back to canonical P15.2
+   *  binding position. Never copies priority into mutable rows. */
+  private orderRanker(
+    obs: ReviewObservation, strategy: Row | null,
+  ): (key: string) => number {
+    const actionable = strategy
+      ? (strategy.actionable_order as string[]).map(String)
+      : [];
+    const stratRank = new Map(actionable.map((k, i) => [k, i] as const));
+    const bindingRank = new Map(
+      obs.workstreams.map((w, i) => [w.workstream_key, i] as const));
+    return (key: string) =>
+      (stratRank.get(key) ?? 1_000_000) * 1_000_000 + (bindingRank.get(key) ?? 0);
+  }
+}
+
+/**
+ * §30 — production wiring: ONE existing default CeoPlanningCycleService
+ * resolved through the canonical runtime seam is SHARED by the P15.6
+ * bootstrap path and the P15.5 review — never a caller-supplied
+ * model_entry_id, never a second CEO path.
+ */
+export function createDefaultObjectiveOperatingService(deps: {
+  store: PairEvidenceStore;
+  business: BusinessLayer;
+  workforce: WorkforceService;
+  objectives: ObjectiveAuthorityService;
+  workstreams: ObjectiveWorkstreamService;
+  invoker?: CeoDecisionInvoker;
+}): { service: ObjectiveOperatingService; model_entry_id: string;
+  ceoCycle: CeoPlanningCycleService;
+  kpiVerification: ObjectiveKpiVerificationService } {
+  const { service: ceoCycle, model_entry_id } = createDefaultCeoPlanningCycle({
+    store: deps.store,
+    business: deps.business,
+    workforce: deps.workforce,
+    invoker: deps.invoker,
+  });
+  const review = new ObjectiveAdaptiveReviewService({
+    store: deps.store,
+    business: deps.business,
+    workforce: deps.workforce,
+    objectives: deps.objectives,
+    workstreams: deps.workstreams,
+    ceoCycle,
+  });
+  const allocation = new WorkforceAllocationService({
+    store: deps.store,
+    business: deps.business,
+    workforce: deps.workforce,
+    objectives: deps.objectives,
+    workstreams: deps.workstreams,
+  });
+  const kpiVerification = new ObjectiveKpiVerificationService({
+    store: deps.store,
+    objectives: deps.objectives,
+    workstreams: deps.workstreams,
+    business: deps.business,
+    artifacts: new ArtifactAuthority(deps.store, {
+      blobDir: path.join(
+        process.env.PAIR_ARTIFACT_DIR ??
+          path.join(deps.store.dbDir, "artifacts"),
+        "blobs",
+      ),
+    }),
+  });
+  return {
+    service: new ObjectiveOperatingService({
+      store: deps.store,
+      business: deps.business,
+      workforce: deps.workforce,
+      objectives: deps.objectives,
+      workstreams: deps.workstreams,
+      ceoCycle,
+      review,
+      allocation,
+      kpiVerification,
+    }),
+    kpiVerification,
+    model_entry_id,
+    ceoCycle, // P15.10-C R1 F1-D: lets the driver reconcile STARTED/UNKNOWN
+              // attempts scoped to the objective before any new pass.
+  };
+}

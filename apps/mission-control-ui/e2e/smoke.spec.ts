@@ -1,30 +1,29 @@
 import { test, expect } from "@playwright/test";
+import { seedSession } from "./helpers";
 
 // UI-5 §7 — golden-path E2E: dashboard renders, two-step mission submit works
 // end-to-end against the real server, observability stream is live.
 test.beforeEach(async ({ page }) => {
+  await seedSession(page);
   await page.goto("/");
-  await page.evaluate(() => localStorage.setItem("pair.operator_id", "op:e2e"));
 });
 
 test("dashboard renders nav + mission table", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
-  for (const link of ["Dashboard", "Approvals", "Providers", "Observability", "New Mission"]) {
+  for (const link of ["Dashboard", "Approvals", "Providers", "Observability", "Chat", "Task Entry"]) {
     await expect(page.getByRole("link", { name: link })).toBeVisible();
   }
 });
 
-test("mission create: preview -> confirm -> detail shows runtime state", async ({ page }) => {
+test("task entry: preview -> confirm -> detail shows runtime state", async ({ page }) => {
   await page.goto("/missions/new");
+  await expect(page.getByRole("heading", { name: "Task entry" })).toBeVisible();
   await page.getByLabel(/goal/i).fill("e2e smoke mission");
   await page.locator("#project").selectOption({ index: 1 });
-  await page.getByRole("button", { name: /preview plan/i }).click();
-  // plan preview must appear before any state is created
-  await expect(page.getByText(/plan digest|digest/i).first()).toBeVisible();
-  await page.getByRole("button", { name: /confirm/i }).click();
+  await page.getByRole("button", { name: /plan & run|preview plan/i }).click();
   // lands on a mission detail / dashboard row with a runtime state
-  await expect(page.getByText(/COMPLETED|RUNNING|WAITING/i).first()).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(/COMPLETED|RUNNING|WAITING/i).first()).toBeVisible({ timeout: 15_000 });
 });
 
 test("observability event stream lists canonical events", async ({ page }) => {

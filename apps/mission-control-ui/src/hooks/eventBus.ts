@@ -19,27 +19,34 @@ const BUFFER = 300;
 const recent: EntityEvent[] = [];
 const listeners = new Set<(e: EntityEvent) => void>();
 const resyncListeners = new Set<() => void>();
+/* B5.5 R1-F3 — stream status is a SUBSCRIPTION SET, not a single mutable
+   callback: every mounted consumer observes the same status, and an
+   unmounted subscriber stops receiving updates. */
+const statusListeners = new Set<(s: "open" | "closed") => void>();
+const bufferListeners = new Set<() => void>();
 let es: EventSource | null = null;
-let onStatus: ((s: "open" | "closed") => void) | null = null;
 let status: "open" | "closed" = "closed";
+
+const setStatus = (s: "open" | "closed") => {
+  status = s;
+  for (const l of statusListeners) l(s);
+};
+const notifyBuffer = () => {
+  for (const l of bufferListeners) l();
+};
 
 function ensure() {
   if (es) return;
   es = new EventSource(withTokenQuery("/api/events"));
-  es.onopen = () => {
-    status = "open";
-    onStatus?.(status);
-  };
-  es.onerror = () => {
-    status = "closed";
-    onStatus?.(status); // EventSource auto-reconnects; UI keeps slow polling
-  };
+  es.onopen = () => setStatus("open");
+  es.onerror = () => setStatus("closed"); // EventSource auto-reconnects; UI keeps slow polling
   es.onmessage = (m) => {
     try {
       const e = JSON.parse(m.data as string) as EntityEvent;
       recent.push(e);
       if (recent.length > BUFFER) recent.splice(0, recent.length - BUFFER);
       for (const l of listeners) l(e);
+      notifyBuffer();
     } catch {
       /* malformed frame — ignore */
     }
@@ -57,8 +64,48 @@ export function streamStatus(): "open" | "closed" {
   return status;
 }
 
-export function onStreamStatus(cb: (s: "open" | "closed") => void) {
-  onStatus = cb;
+/* P15.9-B5.5 Settings E5 / R1-F3 — reconnect the shared stream after a
+   credential change so the token-query URL picks up the new token.
+   Events buffered under the PREVIOUS credential are cleared first —
+   they were authenticated under a different identity and are never
+   presented as current data under the new one. Buffer subscribers and
+   resync listeners are both notified so rendered streams empty and
+   live-refreshed projections refetch under the new credential. Same
+   single canonical EventSource; no new SSE backend. */
+export function reconnectStream() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+  recent.length = 0;
+  notifyBuffer();
+  for (const l of resyncListeners) l();
+  setStatus("closed");
+  ensure();
+}
+
+/* Subscribe to stream status. The listener fires immediately with the
+   current status so a late-mounting consumer converges, then on every
+   transition. Returns the unsubscribe function — an unmounted
+   subscriber stops receiving updates. */
+export function onStreamStatus(cb: (s: "open" | "closed") => void): () => void {
+  ensure();
+  statusListeners.add(cb);
+  cb(status);
+  return () => {
+    statusListeners.delete(cb);
+  };
+}
+
+/* Buffer-change notifications: fired on every appended event AND when
+   the buffer is cleared by a credential reconnect, so the rendered
+   stream view always reflects the buffer of the CURRENT credential. */
+export function subscribeBuffer(cb: () => void): () => void {
+  ensure();
+  bufferListeners.add(cb);
+  return () => {
+    bufferListeners.delete(cb);
+  };
 }
 
 export function subscribeEvents(cb: (e: EntityEvent) => void): () => void {
@@ -97,12 +144,14 @@ export function useLiveRefresh(reload: () => void) {
   }, []);
 }
 
-/** Rolling event buffer for the observability stream view. */
+/** Rolling event buffer for the observability stream view. Re-renders
+ *  on appends AND on credential-change clears — never keeps showing
+ *  events authenticated under a previous token as current data. */
 export function useEventBuffer(entityTypes?: string[]) {
   const [events, setEvents] = useState<EntityEvent[]>(() => recent);
   useEffect(() => {
     const cb = () => setEvents([...recent]);
-    const u = subscribeEvents(cb);
+    const u = subscribeBuffer(cb);
     cb();
     return u;
   }, []);

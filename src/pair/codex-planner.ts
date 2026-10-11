@@ -20,11 +20,22 @@
  * seams — config presence alone never counts as eligibility.
  */
 
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import { IntegrityError } from "./errors.js";
+import {
+  CODEX_CLI_PROVIDER_ID,
+  CODEX_CLI_PROTOCOL_FAMILY,
+  CODEX_CLI_ENDPOINT,
+  CODEX_CLI_WARNING,
+  type CodexCliEnv,
+  resolveCodexExecutable,
+  codexCliChildEnv,
+  classifyCodexCliExit,
+  invokeCodexCli,
+  codexCliProviderCandidate,
+  ensureCodexCliCatalog,
+} from "./codex-cli-transport.js";
 import { PLANNER_FAILURE_CLASS, type PlannerFailureClass } from "./planner-pool.js";
 import {
   buildPlannerUserPrompt,
@@ -40,6 +51,10 @@ import {
   type PlannerRejectionContext,
 } from "./llm-planner.js";
 import { assertPlannerCandidateEligible, assertPlannerRoleAndDisjoint } from "./model-role.js";
+import {
+  inspectRawDeliveryEmissions,
+  type RawDeliveryEmissionState,
+} from "./plan-dataflow.js";
 import { providerModelEligibility } from "./model-routable.js";
 import type { PairEvidenceStore } from "./store.js";
 import { ProviderCatalog } from "./provider-catalog.js";
@@ -50,31 +65,28 @@ import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import type { PlannerCandidate } from "./planner-pool.js";
 import type { PlannerEligibilityRejection } from "./model-role.js";
 
-export const CODEX_CLI_PROVIDER_ID = "codex-cli";
-export const CODEX_CLI_PROTOCOL_FAMILY = "CODEX_CLI";
-export const CODEX_CLI_ENDPOINT = "codex-cli://local";
+// The canonical codex-cli provider identity + the generic spawn/auth/
+// scratch mechanics live in codex-cli-transport.ts (P15.3 R2 addendum §C —
+// one auth-safe primitive shared by Planner and CEO_DECISION role
+// transports; contracts never merge). Re-exported here so existing
+// codex-planner imports keep working.
+export {
+  CODEX_CLI_PROVIDER_ID,
+  CODEX_CLI_PROTOCOL_FAMILY,
+  CODEX_CLI_ENDPOINT,
+};
 export const CODEX_PLANNER_DEFAULT_MODEL = "gpt-6.1-sol";
 export const CODEX_PLANNER_DEFAULT_TIMEOUT_MS = 900_000;
 
-/** Codex-transport warning codes — mapped onto PlannerFailureClass in
- *  classifyPlannerFailure (planner-pool.ts). */
+/** Codex-transport warning codes — the shared CODEX_CLI_WARNING
+ *  vocabulary mapped onto PlannerFailureClass in classifyPlannerFailure
+ *  (planner-pool.ts). */
 export const CODEX_PLANNER_WARNING = {
-  CLI_MISSING: "CODEX_CLI_MISSING",
-  AUTH_FAILED: "CODEX_AUTH_FAILED",
-  MODEL_UNAVAILABLE: "CODEX_MODEL_UNAVAILABLE",
-  TIMEOUT: "CODEX_TIMEOUT",
-  RATE_LIMITED: "CODEX_RATE_LIMITED",
-  OUTPUT_INVALID: "CODEX_OUTPUT_INVALID",
-  SPAWN_ERROR: "CODEX_SPAWN_ERROR",
+  ...CODEX_CLI_WARNING,
   PLAN_DEGENERATE: "CODEX_PLAN_DEGENERATE",
 } as const;
 
-export type CodexPlannerEnv = NodeJS.ProcessEnv | ((name: string) => string | undefined);
-
-function envGet(env: CodexPlannerEnv | undefined, name: string): string | undefined {
-  if (!env) return process.env[name];
-  return typeof env === "function" ? env(name) : env[name];
-}
+export type CodexPlannerEnv = CodexCliEnv;
 
 export interface CodexPlannerInvokeConfig {
   /** Absolute codex executable (default: `which codex`). */
@@ -96,35 +108,7 @@ export interface CodexPlannerInvokeConfig {
   rejectionContext?: PlannerRejectionContext;
 }
 
-function resolveExecutable(env: CodexPlannerEnv | undefined): string | null {
-  const configured = envGet(env, "PAIR_CODEX_PLANNER_EXECUTABLE") ?? envGet(env, "PAIR_CODEX_EXECUTABLE");
-  if (configured) return configured;
-  try {
-    const resolved = execFileSync("which", ["codex"], { encoding: "utf8" }).trim();
-    return resolved || null;
-  } catch {
-    return null;
-  }
-}
-
-/** Child env: minimal inherited surface only; CODEX_HOME pins the
- *  persisted ChatGPT session. CODEX_API_KEY/OPENAI_API_KEY are
- *  deliberately NOT forwarded (R1.B): `codex exec` env API-key auth can
- *  take precedence over the persisted ChatGPT session — an ambient key in
- *  the PAIR parent must never silently flip the planner onto API billing.
- *  Nothing is logged or persisted from it. */
-function childEnv(env: CodexPlannerEnv | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const k of [
-    "PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH",
-    // test-only fake-executable controls — inert for the real binary
-    "FAKE_CODEX_BEHAVIOR", "FAKE_CODEX_PIDFILE", "FAKE_CODEX_INVOKELOG", "FAKE_CODEX_ENVFILE",
-  ]) {
-    const v = envGet(env, k);
-    if (v) out[k] = v;
-  }
-  return out;
-}
+const resolveExecutable = resolveCodexExecutable;
 
 /**
  * Planner argv — mirrors the governed executor's hard isolation profile
@@ -157,78 +141,7 @@ function plannerArgv(model: string, runDir: string, schemaPath: string, finalPat
   ];
 }
 
-interface SpawnResult {
-  status: "COMPLETED" | "FAILED" | "TIMEOUT" | "SPAWN_FAILED";
-  code: number | null;
-  stderrTail: string;
-  error?: string;
-}
 
-async function spawnCodex(
-  command: string,
-  args: string[],
-  prompt: string,
-  runDir: string,
-  timeoutMs: number,
-  env: CodexPlannerEnv | undefined,
-): Promise<SpawnResult> {
-  let child: ChildProcess;
-  try {
-    child = spawn(command, args, {
-      cwd: runDir,
-      env: childEnv(env),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch (e) {
-    return { status: "SPAWN_FAILED", code: null, stderrTail: "", error: String(e).slice(0, 200) };
-  }
-  let stderrBuf = "";
-  child.stderr?.on("data", (d: Buffer) => {
-    stderrBuf = (stderrBuf + d.toString("utf8")).slice(-8192); // bounded tail only
-  });
-  child.stdout?.resume(); // planner output is the --output-last-message file; stdout events are discarded
-  try {
-    child.stdin?.write(prompt);
-    child.stdin?.end();
-  } catch {
-    /* child may exit before stdin flush */
-  }
-  return await new Promise<SpawnResult>((resolve) => {
-    const tail = () => stderrBuf.slice(-4000);
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        /* noop */
-      }
-      resolve({ status: "TIMEOUT", code: null, stderrTail: tail(), error: "CODEX_TIMEOUT" });
-    }, timeoutMs);
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve({ status: "SPAWN_FAILED", code: null, stderrTail: tail(), error: String(e).slice(0, 200) });
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve({
-        status: code === 0 ? "COMPLETED" : "FAILED",
-        code,
-        stderrTail: tail(),
-      });
-    });
-  });
-}
-
-/** stderr/exit classifier → the mandate's failure vocabulary. */
-function classifyCodexExit(code: number | null, stderr: string): string {
-  const s = stderr.toLowerCase();
-  if (/401|403|unauthoriz|authentication|not logged in|login required|invalid api key|access denied|forbidden/.test(s))
-    return CODEX_PLANNER_WARNING.AUTH_FAILED;
-  if (/model.*(not found|not available|unavailable|does not exist|unsupported|unknown|no longer available)|unknown model|no access to|404/.test(s))
-    return CODEX_PLANNER_WARNING.MODEL_UNAVAILABLE;
-  if (/429|rate.?limit|quota|insufficient_quota|usage limit|too many requests/.test(s))
-    return CODEX_PLANNER_WARNING.RATE_LIMITED;
-  return `${CODEX_PLANNER_WARNING.SPAWN_ERROR}${code != null ? `:${code}` : ""}`;
-}
 
 // OpenAI strict structured outputs: every object level needs
 // additionalProperties:false and required covering all properties.
@@ -269,21 +182,26 @@ const PING_SCHEMA = {
   properties: { ok: { type: "boolean" } },
 };
 
-/** Real non-interactive codex invocation — returns one typed outcome. */
+/** Real non-interactive codex invocation via the generic transport —
+ *  planner argv profile + planner schema; returns one typed outcome. */
 async function invokeRaw(
   cfg: { executable: string; model: string; timeoutMs: number; scratchDir: string; schema?: Record<string, unknown> },
   prompt: string,
   env: CodexPlannerEnv | undefined,
-): Promise<{ result: SpawnResult; finalText: string | null }> {
-  const runDir = path.join(cfg.scratchDir, `pl-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`);
-  fs.mkdirSync(runDir, { recursive: true });
-  const schemaPath = path.join(runDir, "schema.json");
-  const finalPath = path.join(runDir, "final.txt");
-  fs.writeFileSync(schemaPath, JSON.stringify(cfg.schema ?? PLAN_SCHEMA));
-  const args = plannerArgv(cfg.model, runDir, schemaPath, finalPath);
-  const result = await spawnCodex(cfg.executable, args, prompt, runDir, cfg.timeoutMs, env);
-  const finalText = fs.existsSync(finalPath) ? fs.readFileSync(finalPath, "utf8") : null;
-  return { result, finalText };
+): Promise<{ result: import("./codex-cli-transport.js").CodexCliSpawnResult; finalText: string | null }> {
+  return invokeCodexCli(
+    {
+      executable: cfg.executable,
+      model: cfg.model,
+      timeoutMs: cfg.timeoutMs,
+      scratchDir: cfg.scratchDir,
+      schema: cfg.schema ?? PLAN_SCHEMA,
+      runPrefix: "pl",
+      argv: (runDir, schemaPath, finalPath) => plannerArgv(cfg.model, runDir, schemaPath, finalPath),
+    },
+    prompt,
+    env,
+  );
 }
 
 /**
@@ -327,7 +245,7 @@ export async function codexPlannerProbe(opts: {
     return { outcome: warn, latency_ms: Date.now() - t0, detail: (result.error ?? "spawn failed").slice(0, 160) };
   }
   if (result.status === "FAILED") {
-    const warn = classifyCodexExit(result.code, result.stderrTail);
+    const warn = classifyCodexCliExit(result.code, result.stderrTail);
     const outcome =
       warn === CODEX_PLANNER_WARNING.AUTH_FAILED ? "AUTH_FAILED"
       : warn === CODEX_PLANNER_WARNING.MODEL_UNAVAILABLE ? "MODEL_UNAVAILABLE"
@@ -352,7 +270,7 @@ export async function codexPlannerProbe(opts: {
 export async function codexPlannerPlan(
   goal: string,
   cfg: CodexPlannerInvokeConfig,
-): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }> {
+): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number; raw_delivery_emission_state?: RawDeliveryEmissionState }> {
   const exe = cfg.executable ?? resolveExecutable(cfg.env);
   if (!exe) return { tasks: [], warnings: [CODEX_PLANNER_WARNING.CLI_MISSING] };
   const timeoutMs = cfg.timeoutMs ?? CODEX_PLANNER_DEFAULT_TIMEOUT_MS;
@@ -377,7 +295,7 @@ export async function codexPlannerPlan(
     return { tasks: [], warnings: [`${CODEX_PLANNER_WARNING.SPAWN_ERROR}:${(result.error ?? "").slice(0, 80)}`] };
   }
   if (result.status === "FAILED") {
-    return { tasks: [], warnings: [classifyCodexExit(result.code, result.stderrTail)] };
+    return { tasks: [], warnings: [classifyCodexCliExit(result.code, result.stderrTail)] };
   }
   if (!finalText || !finalText.trim()) {
     return { tasks: [], warnings: [CODEX_PLANNER_WARNING.OUTPUT_INVALID] };
@@ -392,11 +310,19 @@ export async function codexPlannerPlan(
   if (!Array.isArray(rawTasks) || !rawTasks.length) {
     return { tasks: [], warnings: ["LLM_PLAN_NO_TASKS"] };
   }
+  // HOTFIX 1 R1 — TRUE raw emission evidence BEFORE the transport's
+  // own sanitize/drop pass: a malformed TELEGRAM_DELIVERY emission
+  // dropped here still counted as a planner attempt.
+  const rawDeliveryEmissions = inspectRawDeliveryEmissions(rawTasks);
+  const em = {
+    raw_delivery_emission_count: rawDeliveryEmissions.count,
+    raw_delivery_emission_state: rawDeliveryEmissions.state,
+  };
   // PRV2-A R1.A — reserved-capability misuse fails the candidate typed;
   // AUTOMATON is never stripped off a mixed task and pretended away.
   const misuseKey = reservedAutomatonMisuseKey(rawTasks as Array<Record<string, unknown>>);
   if (misuseKey) {
-    return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${misuseKey}`] };
+    return { tasks: [], warnings: [`${LLM_PLAN_RESERVED_CAPABILITY_WARNING}:${misuseKey}`], ...em };
   }
   // R1.A — sanitize keeps the PAIR-reserved AUTOMATON key ONLY so a pure
   // bookkeeping-shaped emission survives to the canonicalize seam for
@@ -411,7 +337,7 @@ export async function codexPlannerPlan(
     workBudget,
     cfg.capabilitySets,
   );
-  if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings] };
+  if (!tasks.length) return { tasks: [], warnings: ["LLM_PLAN_ALL_INVALID", ...warnings], ...em };
   // Bounded repair BEFORE the canonical network gates — the SAME helper the
   // HTTP/Gemini lane uses, at the equivalent post-sanitize seam.
   const netRepair = repairNetworkCapabilityBinding(tasks, {
@@ -425,9 +351,9 @@ export async function codexPlannerPlan(
     (t) => !isBookkeepingShapedTask(t, sanitizeCaps),
   );
   if (usable.length < LLM_PLANNER_MIN_TASKS) {
-    return { tasks: [], warnings: [...warnings, ...netRepair.warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE] };
+    return { tasks: [], warnings: [...warnings, ...netRepair.warnings, CODEX_PLANNER_WARNING.PLAN_DEGENERATE], ...em };
   }
-  return { tasks: netRepair.tasks, warnings: [...warnings, ...netRepair.warnings] };
+  return { tasks: netRepair.tasks, warnings: [...warnings, ...netRepair.warnings], ...em };
 }
 
 /** argv the planner child runs under — exposed for evidence/tests: proves
@@ -802,44 +728,14 @@ const POST_REFRESH_STRUCTURAL_GATES = new Set([
  * configured-route seam (resolveConfiguredModelRoleRoute) — the candidate
  * then carries a real model_entry_id that role assignment, disjointness
  * enforcement, eligibility, and planner_attempt evidence all bind to.
+ * Wraps the role-neutral `ensureCodexCliCatalog` (codex-cli-transport.ts):
+ * the SAME `codex-cli:<model>` entry may also serve CEO_DECISION
+ * invocation — no second provider/model authority.
  */
-/** The ONE canonical candidate identity for the codex-cli planner
- *  provider — used by seeding AND by STALE re-observation (R2.B) so the
- *  re-observed identity is byte-identical: provider_id=codex-cli,
- *  LOCAL_CLI, CODEX_CLI protocol family, codex-cli://local endpoint. */
-function codexCliProviderCandidate(): Record<string, unknown> {
-  return {
-    provider_native_id: CODEX_CLI_PROVIDER_ID,
-    provider_id: CODEX_CLI_PROVIDER_ID,
-    provider_type: "LOCAL_CLI",
-    protocol_family: CODEX_CLI_PROTOCOL_FAMILY,
-    provider_family: CODEX_CLI_PROVIDER_ID,
-    configured_endpoint_identity: CODEX_CLI_ENDPOINT,
-    endpoint_reference: CODEX_CLI_ENDPOINT,
-    credential_reference_name: null,
-    credential_envs: [],
-    capabilities: [],
-    source_id: "PAIR_PROVIDER_REGISTRY",
-  };
-}
-
 export function ensureCodexCliPlannerCatalog(
   store: PairEvidenceStore,
   model: string,
   actor = "PAIR_MC",
 ): string {
-  const pc = new ProviderCatalog(store);
-  pc.upsertCandidate(codexCliProviderCandidate(), actor);
-  const mcat = new ModelEvidenceCatalog(store);
-  mcat.upsertModelClaim(
-    {
-      provider_id: CODEX_CLI_PROVIDER_ID,
-      provider_family: CODEX_CLI_PROVIDER_ID,
-      model_id: model,
-      display_name: `Codex CLI ${model}`,
-      capability_hints: ["text_inference"],
-    },
-    actor,
-  );
-  return canonicalModelId(CODEX_CLI_PROVIDER_ID, model);
+  return ensureCodexCliCatalog(store, model, actor);
 }

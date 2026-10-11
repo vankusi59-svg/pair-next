@@ -114,9 +114,35 @@ export const PAIR_DATAFLOW_ORIGINAL_DEPS = "pair_dataflow_original_deps";
 export const PAIR_PLAN_CONTRACT_KEY = "pair_plan_contract";
 export const PAIR_PLAN_CONTRACT_VERSION = 2;
 
+/** HOTFIX-A — PAIR-owned cross-mission input binding ledger. Stamped by
+ *  `bindPlanExternalInputs` when a consumed artifact has no in-plan
+ *  producer but resolves to exactly one canonical artifact the mission's
+ *  authorized lineage may consume. PAIR-reserved: the planner can never
+ *  mint source authority; it is stripped + recomputed at reconcile. */
+export const PAIR_DATAFLOW_SOURCES = "pair_dataflow_sources";
+export const EXTERNAL_INPUT_CONTRACT = "pair-external-artifact-input.v1";
+
+/** One pinned external input: the consume name bound to the immutable
+ *  canonical identity of an ACCEPTED artifact produced by a mission in
+ *  the consumer mission's authorized lineage (objective/business scope,
+ *  resolved by trusted PAIR code — never by planner-supplied fields). */
+export interface ExternalInputArtifactSource {
+  contract: typeof EXTERNAL_INPUT_CONTRACT;
+  artifact_id: string;
+  logical_name: string;
+  sha256: string;
+  byte_size: number;
+  source_mission_id: string;
+  source_task_id: string;
+  source_governed_task_id: string;
+  source_execution_id: string;
+  source_executor_id: string;
+}
+
 export const RESERVED_TASK_METADATA_KEYS = [
   "pair_dataflow",
   "pair_dataflow_repairs",
+  PAIR_DATAFLOW_SOURCES,
   "pair_telegram_delivery",
   "telegram_delivery",
   "telegram_delivery_requested",
@@ -174,6 +200,42 @@ const NEGATION_RE =
 const CLAUSE_SPAN = 160;
 const CLAUSE_LIST_SPAN = 200;
 const CLAUSE_NEGATION_LOOKBACK = 48;
+// `post` is BOTH an English delivery verb and a Vietnamese marketing
+// noun ("bài post Telegram" = a post FOR Telegram — content to WRITE,
+// never a send instruction). It is a delivery verb only in verb
+// position: an object or a preposition must sit between it and the
+// channel ("post report.txt to telegram", "post it on telegram").
+// A directly adjacent channel mention ("post telegram", "telegram
+// post") or a governing article/classifier/write-verb ("3 bài post",
+// "a post", "viết post") makes it a noun — content scope, never send
+// authority. The noun-left list is deliberately short: determiners,
+// classifiers, numerals, content-type nouns and write-governing verbs
+// only — anything else leaves `post` a verb (fail-safe toward the
+// established delivery grammar, and an adjacent-mention noun phrase
+// is caught by POST_MENTION_GAP regardless).
+const POST_NOUN_LEFT_RE =
+  /(?<![\p{L}\p{N}\p{M}_])(?:bài\s+viết|nội\s+dung|thông\s+báo|bài|bản|cái|đoạn|loại|kiểu|dạng|số|content|article|story|status|update|caption|blog|thread|threads|tweet|announcement|video|clip|reel|reels|vlog|a|an|the|this|that|these|those|một|vài|các|những|mỗi|mọi|some|any|all|each|every|write|viết|soạn|draft|compose|create|tạo|làm|prepare|produce|generate|author|craft|pen|schedule|scheduled|plan|\d+)(?![\p{L}\p{N}\p{M}_])\s*$/iu;
+// `đăng` is BOTH a Vietnamese delivery verb ("đăng bài lên kênh" =
+// post an article to the channel) and the head of content-production
+// noun compounds whose head sits BEFORE it ("bài đăng" = the post,
+// "lịch đăng" = the posting schedule, "gói bài đăng" = the post
+// bundle). Only a bounded left-neighbor class — Vietnamese classifiers/
+// content nouns, determiners, numerals and write/schedule-governing
+// verbs — makes it a noun; anything else keeps the verb reading
+// (fail-safe toward the delivery grammar, exactly like `post`).
+// Object-after-verb order is untouched: "đăng bài", "đăng lên",
+// "đăng các file" still authorize.
+const DANG_NOUN_LEFT_RE =
+  /(?<![\p{L}\p{N}\p{M}_])(?:bài|lịch|gói|bản|tin|nội\s+dung|thông\s+báo|danh\s+sách|chuỗi|số|video|clip|story|stories|reel|reels|vlog|blog|thread|threads|tweet|caption|post|bài\s+viết|article|content|status|update|announcement|schedule|scheduled|plan|draft|một|vài|các|những|mỗi|mọi|nhiều|ít|a|an|the|this|that|these|those|some|any|all|each|every|write|viết|soạn|compose|create|tạo|làm|prepare|produce|sản\s+xuất|generate|author|craft|pen|\d+)(?![\p{L}\p{N}\p{M}_])\s*$/iu;
+// `đăng ký` is the compound verb "subscribe/register" — never a send
+// instruction ("đăng ký kênh Telegram" = subscribe to the channel).
+// `đăng tải`/`đăng lên` ARE real publish/send verbs and must not be
+// suppressed — only `ký` is a noun-compound forgery to skip.
+const DANG_KY_RIGHT_RE = /^\s*ký(?![\p{L}\p{N}\p{M}_])/iu;
+// Only separators may sit between a noun `post` and the channel
+// mention — any real word (an object, a preposition) keeps the verb
+// reading alive.
+const POST_MENTION_GAP = /^[\s,;:.!?'"()\-–—/]*$/u;
 // Filler consumed between consecutive artifact names inside a delivery
 // clause: list separators, prepositions, articles, and the Telegram
 // mention itself (covers "gửi telegram file a.txt" and "send a.txt to
@@ -245,11 +307,11 @@ export function detectTelegramDeliveryIntent(
   // NFC-normalize so decomposed Vietnamese text ("g\u01B0\u0309i")
   // matches the same clause grammar as precomposed input.
   const text = String(goal ?? "").normalize("NFC").slice(0, 4096);
-  const mentions: number[] = [];
+  const mentions: Array<{ start: number; end: number }> = [];
   let m: RegExpExecArray | null;
   TELEGRAM_MENTION_RE.lastIndex = 0;
   while ((m = TELEGRAM_MENTION_RE.exec(text)) !== null) {
-    mentions.push(m.index);
+    mentions.push({ start: m.index, end: m.index + m[0].length });
   }
   if (!mentions.length) return { requested: false, artifacts: [], mode: "TEXT" };
   const artifacts: string[] = [];
@@ -261,8 +323,42 @@ export function detectTelegramDeliveryIntent(
     // the Vietnamese verb. Fail closed toward NO SEND: reject only when
     // the matched token is exactly all-caps GUI; `gui`/`Gui` stay valid.
     if (m[0] === "GUI") continue;
+    // `post` — see POST_NOUN_LEFT_RE: in Vietnamese marketing text it is
+    // overwhelmingly a NOUN ("3 bài post Telegram", "viết bài post").
+    // Reject it as a delivery verb when a determiner/classifier/
+    // write-verb governs it or when the channel mention is directly
+    // adjacent in either direction (noun compounds). "post report.txt
+    // to telegram" / "post it on telegram" keep an object or a
+    // preposition between verb and channel — those still authorize.
     const v = m.index;
-    const clause = mentions.some((p) => Math.abs(p - v) <= CLAUSE_SPAN);
+    if (/^post$/iu.test(m[0])) {
+      const vEnd = v + m[0].length;
+      if (POST_NOUN_LEFT_RE.test(text.slice(Math.max(0, v - 48), v))) {
+        continue;
+      }
+      const adjacent = mentions.some((mn) =>
+        mn.start > vEnd
+          ? POST_MENTION_GAP.test(text.slice(vEnd, mn.start))
+          : mn.end < v
+            ? POST_MENTION_GAP.test(text.slice(mn.end, v))
+            : false,
+      );
+      if (adjacent) continue;
+    }
+    // `đăng` — Vietnamese noun compounds put the head BEFORE the word
+    // ("bài đăng", "lịch đăng", "gói bài đăng"); a bounded left neighbor
+    // makes it content-production scope, never send authority. The
+    // compound verb `đăng ký` (subscribe) is likewise never a send.
+    // Verb-object order ("đăng bài lên kênh") is untouched.
+    if (/^đăng$/iu.test(m[0])) {
+      if (DANG_NOUN_LEFT_RE.test(text.slice(Math.max(0, v - 48), v))) {
+        continue;
+      }
+      if (DANG_KY_RIGHT_RE.test(text.slice(v + m[0].length))) {
+        continue;
+      }
+    }
+    const clause = mentions.some((p) => Math.abs(p.start - v) <= CLAUSE_SPAN);
     if (!clause || clauseNegated(text, v)) continue;
     requested = true;
     for (const a of clauseArtifacts(text, v + m[0].length)) {
@@ -609,8 +705,112 @@ const isRemoteTask = (task: Record<string, unknown>): boolean =>
     REMOTE_CAPABILITY_SET.has(String(c)),
   );
 
-const isDeliveryTask = (task: Record<string, unknown>): boolean =>
+/** HOTFIX 1 — exported so the canonicalize seam (serve-planner) can
+ *  prove raw-vs-canonical delivery omission with the SAME predicate the
+ *  reconcile uses. One definition, one authority. */
+export const isDeliveryTask = (task: Record<string, unknown>): boolean =>
   ((task.required_capabilities as string[]) ?? []).includes(DELIVERY_CAPABILITY);
+
+/** HOTFIX 1 R1/R2 — TRUE raw delivery-emission evidence, captured at the
+ *  FIRST point where parsed provider JSON still holds the actual raw
+ *  task array (before ANY sanitize/drop/truncate/remap). Unlike
+ *  `isDeliveryTask`, this detector is safe on arbitrary malformed
+ *  provider output: `required_capabilities` may be an array, a scalar
+ *  string, an object, a number, null — every shape is walked with
+ *  bounded depth + a shared node budget and EXACT-token semantics only
+ *  (a substring like "NOT_TELEGRAM_DELIVERY" never matches; an object
+ *  KEY carrying the exact token still counts — R2 defect A). A
+ *  malformed emission attempt still counts as an emission: the
+ *  canonicalizer must then prove malformed-drop (fail closed), never
+ *  classify it as a true omission.
+ *
+ *  R2 — TRI-STATE, never boolean: the result is ABSENT (every task's
+ *  capability field fully inspected, no token), PRESENT (fully
+ *  inspected, ≥1 emitting task), or INDETERMINATE (depth/node budget
+ *  exhausted before all content was inspected — a buried token was
+ *  never disproven). Budget exhaustion must NEVER masquerade as a
+ *  proven R=0; the caller must fail closed on INDETERMINATE.
+ *  Never throws; descriptive planner provenance, zero authority. */
+export type RawDeliveryEmissionState = "ABSENT" | "PRESENT" | "INDETERMINATE";
+export type RawDeliveryEmissionInspection = {
+  state: RawDeliveryEmissionState;
+  /** Tasks carrying an exact TELEGRAM_DELIVERY token in
+   *  `required_capabilities`. Exact when state is ABSENT/PRESENT; a
+   *  LOWER BOUND when INDETERMINATE — never a proven count. */
+  count: number;
+};
+const RAW_DELIVERY_DEPTH_LIMIT = 8;
+const RAW_DELIVERY_NODE_BUDGET = 4000;
+
+const inspectCapsValue = (
+  v: unknown,
+  depth: number,
+  budget: { left: number },
+): RawDeliveryEmissionState => {
+  if (v === null || v === undefined) return "ABSENT";
+  if (budget.left <= 0) return "INDETERMINATE";
+  budget.left -= 1;
+  if (typeof v === "string") {
+    return v === DELIVERY_CAPABILITY ? "PRESENT" : "ABSENT";
+  }
+  if (typeof v !== "object") return "ABSENT"; // number/boolean — safely not a token
+  const entries = Array.isArray(v)
+    ? v.map((x) => [null, x] as const)
+    : Object.entries(v as Record<string, unknown>);
+  if (entries.length === 0) return "ABSENT";
+  // Any container content beyond the depth limit was never inspected —
+  // a token could be buried there: INDETERMINATE, never proven ABSENT.
+  if (depth >= RAW_DELIVERY_DEPTH_LIMIT) return "INDETERMINATE";
+  let sawIndeterminate = false;
+  for (const [k, x] of entries) {
+    // R2-A — a malformed object may carry the exact capability token as
+    // a KEY ({TELEGRAM_DELIVERY: true}): still a delivery emission.
+    if (typeof k === "string" && k === DELIVERY_CAPABILITY) return "PRESENT";
+    const r = inspectCapsValue(x, depth + 1, budget);
+    if (r === "PRESENT") return "PRESENT";
+    if (r === "INDETERMINATE") sawIndeterminate = true;
+  }
+  return sawIndeterminate ? "INDETERMINATE" : "ABSENT";
+};
+
+export const inspectRawDeliveryEmissions = (
+  rawTasks: unknown,
+): RawDeliveryEmissionInspection => {
+  if (!Array.isArray(rawTasks)) return { state: "ABSENT", count: 0 };
+  const budget = { left: RAW_DELIVERY_NODE_BUDGET };
+  let count = 0;
+  let indeterminate = false;
+  for (const t of rawTasks) {
+    const caps =
+      t !== null && typeof t === "object"
+        ? (t as Record<string, unknown>)["required_capabilities"]
+        : undefined;
+    const r = inspectCapsValue(caps, 0, budget);
+    if (r === "PRESENT") count += 1;
+    else if (r === "INDETERMINATE") indeterminate = true;
+  }
+  return {
+    state: indeterminate ? "INDETERMINATE" : count > 0 ? "PRESENT" : "ABSENT",
+    count,
+  };
+};
+
+/** HOTFIX 1 — PAIR-owned provenance stamp on a delivery task that PAIR
+ *  itself injected (true planner omission), e.g.
+ *  `{reason:"DELIVERY_TASK_INJECTED", task_key:"T4", mode:"TEXT",
+ *    authority:"OPERATOR_TELEGRAM_INTENT"}`. Digest-covered, bounded,
+ *  replay byte-stable (preserved verbatim like pair_dataflow_original_
+ *  deps — deliberately NOT in RESERVED_TASK_METADATA_KEYS). A planner
+ *  cannot forge it: the canonicalize seam strips it from every
+ *  planner-emitted task under fresh provenance before re-stamping it on
+ *  the task it actually injected. */
+export const PAIR_DELIVERY_INJECTION_KEY = "pair_delivery_injection";
+export interface DeliveryInjectionRecord {
+  reason: "DELIVERY_TASK_INJECTED";
+  task_key: string;
+  mode: "FILES" | "TEXT";
+  authority: "OPERATOR_TELEGRAM_INTENT";
+}
 
 /** A pure bookkeeping task (goal record) is not content the operator
  *  asked to receive — TEXT-mode delivery never depends on it. */
@@ -893,6 +1093,198 @@ export function extractTaskDataflow(task: Record<string, unknown>): TaskDataflow
   };
 }
 
+/** HOTFIX-A — the consume names carrying a canonical external-source
+ *  binding on this task (the PAIR-stamped pair_dataflow_sources ledger).
+ *  Entries are never trusted as authority themselves: they only exempt
+ *  a consume from the in-plan-producer rule; the binding they claim is
+ *  fully re-proven against durable authority before any byte moves. */
+function externalSourceBoundConsumes(
+  task: Record<string, unknown>,
+): Set<string> {
+  const md = task.metadata as Record<string, unknown> | undefined;
+  const rows = md?.[PAIR_DATAFLOW_SOURCES];
+  const out = new Set<string>();
+  if (!Array.isArray(rows)) return out;
+  for (const r of rows) {
+    const name = normalizeArtifactPath(
+      (r as Record<string, unknown>)?.consume_name,
+    );
+    if (name) out.add(name);
+  }
+  return out;
+}
+
+/**
+ * HOTFIX-A — cross-mission input binding at THE canonical seams.
+ *
+ * For every task's declared consumes, any artifact with NO producer
+ * inside this plan's task array is resolved against the bounded
+ * `sources` set — canonical ACCEPTED artifacts the consumer mission's
+ * authorized lineage makes eligible (computed by trusted PAIR code,
+ * never from planner fields):
+ *
+ *   - exactly one eligible artifact (canonical name-equivalence) →
+ *     stamp `pair_dataflow_sources` pinning consume_name + the
+ *     immutable source identity (artifact_id, sha256, byte_size,
+ *     source mission/task/governed/execution/executor);
+ *   - zero matches → consume stays unbound: requiredEdges emits the
+ *     ordinary FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT;
+ *   - >1 distinct artifact identities → FAIL_CLOSED ambiguous source;
+ *     a consume name can never pick lexically between artifacts.
+ *
+ * A consume the plan ALSO produces in-plan keeps its in-plan producer
+ * edge — an external source never displaces same-mission provenance,
+ * and a stamped entry on a self-produced consume is a contradiction
+ * (fail closed). Idempotent: re-running on an already-stamped list
+ * recomputes the identical ledger (or fails on conflict).
+ */
+export function bindPlanExternalInputs(
+  tasks: Array<Record<string, unknown>>,
+  sources: ExternalInputArtifactSource[],
+): void {
+  const producerIndex = new Map<string, number>();
+  for (const [i, t] of tasks.entries()) {
+    for (const p of extractTaskDataflow(t).produces) {
+      if (!producerIndex.has(p)) producerIndex.set(p, i);
+    }
+  }
+  for (const [i, task] of tasks.entries()) {
+    const model = extractTaskDataflow(task);
+    const produces = new Set(model.produces);
+    const bound: Array<Record<string, unknown>> = [];
+    for (const rawName of model.consumes) {
+      const name = normalizeArtifactPath(rawName);
+      if (!name || produces.has(name)) continue;
+      if (producerIndex.has(name)) continue; // in-plan producer owns it
+      const matches = new Map<string, ExternalInputArtifactSource>();
+      for (const s of sources) {
+        // The consume name must equal the canonical logical name —
+        // eligibility by identity, never by filename heuristics alone.
+        if (s.logical_name === name || artifactNamesEquivalentCompat(s.logical_name, name)) {
+          if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
+        }
+      }
+      if (matches.size > 1) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE",
+          JSON.stringify({ task: String(task.task_key ?? ""), artifact: name }),
+        );
+      }
+      const src = [...matches.values()][0];
+      if (!src) continue; // stays unbound — requiredEdges fails it
+      bound.push({
+        contract: EXTERNAL_INPUT_CONTRACT,
+        consume_name: name,
+        artifact_id: src.artifact_id,
+        logical_name: src.logical_name,
+        sha256: src.sha256,
+        byte_size: src.byte_size,
+        source_mission_id: src.source_mission_id,
+        source_task_id: src.source_task_id,
+        source_governed_task_id: src.source_governed_task_id,
+        source_execution_id: src.source_execution_id,
+        source_executor_id: src.source_executor_id,
+      });
+    }
+    const md = (task.metadata ??= {}) as Record<string, unknown>;
+    const prev = md[PAIR_DATAFLOW_SOURCES];
+    if (prev !== undefined) {
+      // Replay/idempotency: a prior stamp must equal the recomputed
+      // ledger byte-for-byte — drift means the binding context moved
+      // and the plan must be re-planned, never silently re-pinned.
+      if (canonicalJson(prev) !== canonicalJson(bound)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? "") }),
+        );
+      }
+    } else if (bound.length) {
+      md[PAIR_DATAFLOW_SOURCES] = bound;
+    }
+  }
+}
+
+/** Local equivalence shim — the canonical spelling rule lives in
+ *  artifact-authority (imported lazily-free: this module must stay
+ *  dependency-light; the rule is the X ≡ outbox/<basename> pair). */
+function artifactNamesEquivalentCompat(a: string, b: string): boolean {
+  if (a === b) return true;
+  const base = (n: string) => n.split("/").pop() ?? n;
+  return (
+    (a.startsWith("outbox/") && a === `outbox/${base(b)}`) ||
+    (b.startsWith("outbox/") && b === `outbox/${base(a)}`)
+  );
+}
+
+/** HOTFIX-A — structural proof for stamped external bindings on an
+ *  already-canonical task list: every stamped entry must be well-formed
+ *  (all immutable identity fields present, consume_name declared in the
+ *  task's consumes) and must not collide with an in-plan producer (a
+ *  double-bound artifact is forged/stale authority). Full eligibility
+ *  and byte integrity are re-proven at dispatch resolution — this check
+ *  only rejects malformed/unsound stamped shapes. */
+function assertExternalSourceStamps(
+  tasks: Array<Record<string, unknown>>,
+  models: TaskDataflow[],
+): void {
+  const producedBy = new Map<string, number>();
+  for (const [i, m] of models.entries()) {
+    for (const p of m.produces) {
+      if (!producedBy.has(p)) producedBy.set(p, i);
+    }
+  }
+  for (const [i, task] of tasks.entries()) {
+    const md = task.metadata as Record<string, unknown> | undefined;
+    const rows = md?.[PAIR_DATAFLOW_SOURCES];
+    if (rows === undefined) continue;
+    if (!Array.isArray(rows)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+        JSON.stringify({ task: String(task.task_key ?? ""), malformed: true }),
+      );
+    }
+    const consumes = new Set(models[i].consumes);
+    const seen = new Set<string>();
+    for (const r of rows) {
+      const e = r as Record<string, unknown>;
+      const name = normalizeArtifactPath(e?.consume_name);
+      const fieldsOk =
+        name &&
+        typeof e.artifact_id === "string" && e.artifact_id.length > 0 &&
+        typeof e.logical_name === "string" && e.logical_name.length > 0 &&
+        typeof e.sha256 === "string" && e.sha256.length > 0 &&
+        Number.isInteger(Number(e.byte_size)) && Number(e.byte_size) >= 0 &&
+        typeof e.source_mission_id === "string" && e.source_mission_id.length > 0 &&
+        typeof e.source_task_id === "string" && e.source_task_id.length > 0 &&
+        typeof e.source_governed_task_id === "string" && e.source_governed_task_id.length > 0 &&
+        typeof e.source_execution_id === "string" && e.source_execution_id.length > 0 &&
+        typeof e.source_executor_id === "string" && e.source_executor_id.length > 0;
+      if (!fieldsOk || !consumes.has(name!)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? ""), malformed: true }),
+        );
+      }
+      if (seen.has(name!)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? ""), duplicate: name }),
+        );
+      }
+      seen.add(name!);
+      const producerIdx = producedBy.get(name!);
+      if (producerIdx !== undefined && producerIdx !== i) {
+        // The artifact has a real in-plan producer — an external stamp
+        // on top is a contradiction (stale or forged authority).
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? ""), double_bound: name }),
+        );
+      }
+    }
+  }
+}
+
 /**
  * For each task, the set of task_keys it MUST depend on under the
  * data-flow rules: the unique earlier producer of every consumed artifact
@@ -931,8 +1323,14 @@ function requiredEdges(
     // Self-produced artifacts are normally excluded — but a manifest
     // artifact must ALWAYS bind its producer (the delivery stages a copy;
     // the instruction-grammar may also name it as a produce).
+    // HOTFIX-A — a consume carrying a canonical PAIR-stamped external
+    // source binding is an authorized cross-mission input, NOT an in-plan
+    // producer dependency: it never requires an earlier producer edge.
+    const sourceBound = externalSourceBoundConsumes(task);
     const needed = model.consumes.filter(
-      (a) => !model.produces.includes(a) || manifestNames.has(a),
+      (a) =>
+        (!model.produces.includes(a) || manifestNames.has(a)) &&
+        !sourceBound.has(a),
     );
     for (const artifact of needed) {
       // Manifest artifacts bind producers of the named file OR of its
@@ -1098,6 +1496,12 @@ export interface ReconcileOptions {
   /** Operator-request authority — when omitted the plan cannot carry a
    *  TELEGRAM_DELIVERY task (it fails closed on INTENT). */
   telegramIntent?: TelegramDeliveryIntent;
+  /** HOTFIX-A — the bounded set of canonical ACCEPTED artifacts this
+   *  plan's mission may consume cross-mission, resolved by trusted PAIR
+   *  code from the mission's authorized lineage. Unproduced consumes
+   *  matching exactly one entry bind it (PAIR-stamped); zero matches
+   *  stay ordinary unbound inputs; >1 fails closed ambiguous. */
+  external_input_artifacts?: ExternalInputArtifactSource[];
   /** Canonical output-language authority derived from the effective
    *  operator goal. Stamped onto the delivery task's reserved metadata
    *  (digest-covered) and injected into manifested-artifact producer
@@ -1171,6 +1575,11 @@ export function reconcilePlanDataflow(
   // a valid candidate rather than normalizing silently).
   assertTaskDeliveryHygiene(tasks);
   const models = tasks.map((t) => extractTaskDataflow(t));
+  // HOTFIX-A — bind authorized cross-mission inputs BEFORE edge
+  // resolution: an unproduced consume that resolves to exactly one
+  // eligible canonical artifact is stamped (digest-covered); an
+  // unmatched consume stays an ordinary unbound input and fails below.
+  bindPlanExternalInputs(tasks, opts.external_input_artifacts ?? []);
   const required = requiredEdges(tasks, models);
   // Output-language authority propagates to the producers of manifested
   // TEXT deliverables — a FILES-mode report written upstream must be
@@ -1277,6 +1686,12 @@ export interface AssertPlanDataflowOptions {
    *  still require the PAIR-stamped manifest via the edge rules, and
    *  instruction hygiene ALWAYS runs. */
   telegramIntent?: TelegramDeliveryIntent;
+  /** HOTFIX-A — when the caller can prove the eligible cross-mission set,
+   *  every stamped external binding must still resolve to a CURRENT
+   *  eligible source with the identical pinned identity (revocation/
+   *  drift fails closed). Omitted = structural checks only; the dispatch
+   *  resolver re-proves authority NOW before any byte is read. */
+  external_input_artifacts?: ExternalInputArtifactSource[];
   /** Canonical output-language authority re-derived from the effective
    *  goal: a stamped pair_output_language that differs from the
    *  goal-derived contract — or sits on a non-delivery task — fails
@@ -1383,6 +1798,43 @@ export function assertPlanDataflow(
   // R8 §2 — a persisted/bypassed non-delivery task carrying affirmative
   // delivery semantics fails closed at validation, before dispatch.
   assertTaskDeliveryHygiene(tasks);
+  // HOTFIX-A — revocation/drift re-proof when the caller holds the
+  // eligible-set authority: every stamped source identity must still be
+  // exactly one CURRENT eligible artifact. A stale or reshaped binding
+  // fails closed; the plan must be re-planned under the live set.
+  if (opts.external_input_artifacts) {
+    const eligible = new Map(
+      opts.external_input_artifacts.map((s) => [s.artifact_id, s]),
+    );
+    for (const t of tasks) {
+      const md = t.metadata as Record<string, unknown> | undefined;
+      const rows = md?.[PAIR_DATAFLOW_SOURCES];
+      if (!Array.isArray(rows)) continue;
+      for (const r of rows as Array<Record<string, unknown>>) {
+        const cur = eligible.get(String(r.artifact_id ?? ""));
+        if (
+          !cur ||
+          cur.logical_name !== r.logical_name ||
+          cur.sha256 !== r.sha256 ||
+          Number(cur.byte_size) !== Number(r.byte_size) ||
+          cur.source_mission_id !== r.source_mission_id ||
+          cur.source_task_id !== r.source_task_id ||
+          cur.source_governed_task_id !== r.source_governed_task_id ||
+          cur.source_execution_id !== r.source_execution_id ||
+          cur.source_executor_id !== r.source_executor_id
+        ) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+            JSON.stringify({
+              task: String(t.task_key ?? ""),
+              artifact: String(r.consume_name ?? ""),
+              stale: true,
+            }),
+          );
+        }
+      }
+    }
+  }
   assertPlanArtifactStructure(tasks);
 }
 
@@ -1401,6 +1853,9 @@ export function assertPlanArtifactStructure(
   tasks: Array<Record<string, unknown>>,
 ): void {
   const models = tasks.map((t) => extractTaskDataflow(t));
+  // HOTFIX-A — stamped external-source bindings must be well-formed and
+  // un-double-bound before they exempt a consume from the producer rule.
+  assertExternalSourceStamps(tasks, models);
   const required = requiredEdges(tasks, models);
   const depsByKey = new Map<string, string[]>();
   for (const [i, task] of tasks.entries()) {

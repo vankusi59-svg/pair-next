@@ -1,0 +1,20 @@
+{
+  "claim_id": "HOTFIX_C_TELEGRAM_CONTENT_PRODUCTION_VS_DELIVERY_INTENT",
+  "title": "Telegram delivery-intent grammar: VN noun compounds (bài đăng, lịch đăng, gói bài đăng) and `đăng ký` no longer mint send authority",
+  "affected_surfaces": [
+    "PLANNER",
+    "DELIVERY",
+    "TELEGRAM_INGRESS",
+    "MISSION_DRAFT"
+  ],
+  "required_tests": [
+    "src/__tests__/pair-hotfix-c-telegram-intent.test.ts",
+    "src/__tests__/pair-planner-dataflow-incident.test.ts",
+    "src/__tests__/pair-p15-8-hotfix1-delivery-injection.test.ts",
+    "src/__tests__/pair-p15-8e-telegram.test.ts",
+    "src/__tests__/pair-output-delivery-contract.test.ts",
+    "src/__tests__/pair-ops-telegram-delivery.test.ts"
+  ],
+  "invariants": [],
+  "description": "Live goal 'Sản xuất gói bài đăng Telegram ... lịch đăng, playbook phân phối' made detectTelegramDeliveryIntent return requested=true — two `đăng` tokens inside CLAUSE_SPAN were read as delivery verbs, so assertDeliveryTaskPresence threw FAIL_CLOSED_DELIVERY_TASK_MISSING on a pure production plan (mission MSN_01M4MXEHH failed at planning). Fix: bounded positive grammar, mirroring the existing `post` noun rule — VN noun heads sit BEFORE the token, so a bounded left-neighbor class (classifiers/content nouns bài|lịch|gói|tin|bản|nội dung|thông báo|danh sách|chuỗi|số|video|clip|story|reel|vlog|blog|thread|tweet|caption|post|article|content|status|update|announcement|schedule|plan|draft, determiners một|vài|các|những|mỗi|mọi|nhiều|ít|a|an|the|this|that|some|any|all|each|every, write-verbs viết|soạn|tạo|làm|sản xuất|prepare|produce|generate|..., numerals) makes `đăng` a noun compound; `đăng ký` (subscribe) skipped via bounded right check. Verb-object order untouched (đăng bài/tin/lên still authorize); independent send clauses in the same goal still authorize; negation/clause-scoping unchanged; no global blacklist, no planner-prompt change, no delivery-gate weakening. Tests 18/18: exact live goal + VN/EN production phrasings -> requested=false; Đăng bài lên Telegram / Gửi kết quả lên kênh / Post the report to Telegram / viết 5 bài đăng rồi gửi lên -> true; production plan passes reconcile + serve canonicalizer with zero delivery tasks; true intent with 0 tasks still MISSING; genuine-omission injection preserved (DELIVERY_TASK_INJECTED stamp); unauthorized emission still INTENT fail-closed. Counterfactual on BASE: 7 negatives + 2 integrations fail identically (requested=true), positives pass — non-vacuous. 257 regression pass."
+}

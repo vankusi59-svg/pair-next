@@ -21,6 +21,13 @@ export default defineConfig({
       PAIR_MC_DIR: "/tmp/pair-mc-e2e",
       PAIR_DSH_HOME: process.env.PAIR_DSH_HOME ?? "",
       CODEX_HOME: process.env.CODEX_HOME ?? "",
+      // P15.8-D — e2e never calls a real/paid model: deterministic
+      // conversation replies come from the server's test-only stub seam.
+      PAIR_CONVERSATION_STUB_REPLY:
+        "PAIR trả lời mô phỏng: đây là phản hồi thử nghiệm.",
+      // Same reason: e2e has no qualified LLM provider — the governed
+      // preview/confirm path still runs, plans come from the template.
+      PAIR_MC_TEMPLATE_PLANNER: "1",
     },
     reuseExistingServer: false,
     timeout: 20_000,

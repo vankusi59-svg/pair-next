@@ -19,6 +19,24 @@ import type { MissionControl } from "./mission-control.js";
 import type { CredentialBroker } from "./credential-broker.js";
 import type { BusinessLayer } from "./business.js";
 import type { WorkforceService } from "./work-graph.js";
+import type { PairEvidenceStore } from "./store.js";
+import type { CeoDecisionInvoker } from "./ceo-decision.js";
+import type { ConversationSessionService } from "./conversation-session.js";
+import type { ConversationReasoningService } from "./conversation-reasoning.js";
+import type { MissionDraftService } from "./mission-draft.js";
+import { resolveProposalProject } from "./mission-draft.js";
+import type { TelegramConversationService } from "./telegram-conversation.js";
+import { ObjectiveWorkstreamService } from "./objective-workstream.js";
+import { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
+import { ObjectiveReviewSignoffService } from "./objective-review-signoff.js";
+import type { ObjectiveAutoScheduler } from "./objective-auto-scheduler.js";
+import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
+import {
+  createDefaultObjectiveOperatingService,
+  type ObjectiveOperatingService,
+} from "./objective-operating-loop.js";
+import { ObjectiveCockpitService } from "./objective-cockpit.js";
+import type { ArtifactAuthority } from "./artifact-authority.js";
 
 export interface MissionControlServerDeps {
   control: MissionControl;
@@ -82,6 +100,42 @@ export interface MissionControlServerDeps {
    *  work items (P14 Workforce V2 Phase 1). Coordinates only — never
    *  dispatches. */
   workforce?: WorkforceService;
+  /** Canonical evidence store — needed to compose the P15.6 operating
+   *  service for /api/vnext/objectives/:id/ceo-cycle (P15.7). */
+  store?: PairEvidenceStore;
+  /** P15.10-B owner-scoped RECONCILE_ONLY scheduler projection. */
+  autoScheduler?: ObjectiveAutoScheduler;
+  /** P15.10-C — the production autonomous driver. Present ONLY when
+   *  the deployment explicitly opted in (PAIR_OBJECTIVE_AUTO_DRIVER=1
+   *  in the serve script); absent → scheduler status keeps reporting
+   *  driver_ready:false and the auto-driver route 404s. Read-only
+   *  surface — no mutating driver route exists. */
+  autoDriver?: Pick<ObjectiveAutoDriverService, "status" | "statusReadOnly" | "driverStatus" | "readiness">;
+  /** P15.9-A1 — canonical artifact verification authority used by the
+   *  cockpit projection to re-prove producer/execution/mission binding
+   *  + retained CAS bytes NOW (service.artifacts). Absent → artifacts
+   *  render as unverified-dropped in the cockpit. */
+  artifacts?: ArtifactAuthority;
+  /** TEST-ONLY: deterministic CEO decision transport for the
+   *  lazily-composed operating service. Production bootstrap never
+   *  sets it (the route resolves the real codex-cli model); HTTP
+   *  callers can never inject it — it is a server-wiring dep only. */
+  ceoInvoker?: CeoDecisionInvoker;
+  /** P15.8-D — conversation layer composition (chat + governed mission
+   *  drafts). Absent entirely → every /api/conversations* route is
+   *  CONVERSATION_DISABLED; `reasoning` absent → only the /turns route
+   *  is unavailable (sessions/history/drafts keep working); `drafts`
+   *  absent → draft routes unavailable. Unrelated Mission Control
+   *  routes are never affected. */
+  conversation?: {
+    sessions: ConversationSessionService;
+    reasoning?: ConversationReasoningService;
+    drafts?: MissionDraftService;
+    /** P15.8-E — telegram ingress authority. Absent → every
+     *  /api/telegram/conversation* route is TELEGRAM_CONVERSATION_
+     *  DISABLED; unrelated routes unaffected. */
+    telegram?: TelegramConversationService;
+  };
 }
 
 const MIME: Record<string, string> = {
@@ -315,6 +369,16 @@ export function createMissionControlServer(
   deps: MissionControlServerDeps,
 ): http.Server {
   const c = deps.control;
+  // P15.7 — lazily-composed CEO operating service: built on the FIRST
+  // ceo-cycle call so an unavailable/unqualified CEO model fails
+  // closed on that route alone and can never take the server down at
+  // boot. Resolved once, then cached for the process lifetime.
+  let ceoOps: ReturnType<typeof createDefaultObjectiveOperatingService> | null = null;
+  // P15.10-A — objective auto-policy authority (control plane only;
+  // no driver). Owner proof comes ONLY from the trusted x-operator-id
+  // header — a body-declared owner field is never authority here.
+  let autoPolicySvc: ObjectiveAutoPolicyService | null = null;
+  let cockpitSvc: ObjectiveCockpitService | null = null;
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const p = url.pathname;
@@ -1121,6 +1185,393 @@ export function createMissionControlServer(
           operator_id: String(operator),
         }));
       }
+      // ----- P15.7 — canonical vnext Objective API (P15.1 authority) -----
+      // Distinct namespace from the legacy /api/objectives compat API;
+      // both delegate to the same P15.1 ObjectiveAuthorityService.
+      if (method === "GET" && p === "/api/vnext/objectives") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        const bid = url.searchParams.get("business_id") ?? undefined;
+        const rows = biz.objectives.list(bid);
+        // Strict canonical read — a corrupt row rejects the whole list
+        // rather than being silently trusted or silently discarded.
+        for (const r of rows) biz.objectives.assertCanonicalRow(r);
+        return void json(res, 200, { objectives: rows });
+      }
+      if (method === "POST" && p === "/api/vnext/objectives") {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.objectives.create({
+          business_id: String(body.business_id ?? ""),
+          title: body.title === undefined ? undefined : String(body.title),
+          description: body.description === undefined ? undefined : String(body.description),
+          statement: body.statement === undefined ? undefined : String(body.statement),
+          parent_objective_id: body.parent_objective_id === undefined ? undefined : String(body.parent_objective_id),
+          owner_authority_id: body.owner_authority_id === undefined ? undefined : String(body.owner_authority_id),
+          metric: body.metric === undefined ? undefined : String(body.metric),
+          target: body.target === undefined || body.target === null ? undefined : String(body.target),
+          kpis: body.kpis === undefined ? undefined : body.kpis as Array<Record<string, unknown>>,
+          deadline: body.deadline === undefined ? undefined : body.deadline as string | null,
+          budget_ceiling_microusd: body.budget_ceiling_microusd === undefined ? undefined : Number(body.budget_ceiling_microusd),
+          currency: body.currency === undefined ? undefined : String(body.currency),
+          // Pass-through, never coerced: P15.1 normalizeStringList is the
+          // canonical validator — a scalar or non-string element rejects
+          // the whole create (F1).
+          hard_constraints: body.hard_constraints as string[] | undefined,
+          success_conditions: body.success_conditions as string[] | undefined,
+          stop_conditions: body.stop_conditions as string[] | undefined,
+          dedup_key: body.dedup_key === undefined ? undefined : String(body.dedup_key),
+          operator_id: String(operator),
+        }));
+      }
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)$/);
+      if (method === "GET" && m) {
+        if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
+        return void json(res, 200, biz.objectives.get(m[1]));
+      }
+      // ----- P15.7 — CEO operating trigger (ONE bounded pass) -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/ceo-cycle$/);
+      if (method === "POST" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "OPERATING_LOOP_DISABLED" });
+        }
+        ceoOps ??= createDefaultObjectiveOperatingService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          invoker: deps.ceoInvoker,
+        });
+        const out = await ceoOps.service.runObjectivePass({
+          objective_id: m[1], actor: String(operator),
+        });
+        return void json(res, 200, out);
+      }
+      // ----- P15.10-D — owner-scoped KPI auto-verification grants -----
+      // grant/revoke/disable/status: owner-only, fails closed via the
+      // service's authority contract. Grants are the ONLY opt-in path for
+      // delegated KPI progress writes; default OFF everywhere else.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/kpi-verification$/);
+      if (method === "POST" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "OPERATING_LOOP_DISABLED" });
+        }
+        ceoOps ??= createDefaultObjectiveOperatingService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          invoker: deps.ceoInvoker,
+        });
+        const svc = ceoOps.kpiVerification;
+        const rawActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const kpiActor = rawActor.startsWith("operator:")
+          ? rawActor : `operator:${rawActor}`;
+        const action = String(body.action ?? "");
+        if (action === "status") {
+          return void json(res, 200, svc.status(m[1]!, kpiActor));
+        }
+        if (action === "grant") {
+          return void json(res, 200, svc.grant(m[1]!, {
+            actor: kpiActor,
+            kpi_id: String(body.kpi_id ?? ""),
+            rule: body.rule,
+            expires_at: String(body.expires_at ?? ""),
+            idempotency_key: String(body.idempotency_key ?? crypto.randomUUID()),
+          }));
+        }
+        if (action === "revoke" || action === "disable") {
+          return void json(res, 200, svc.control(m[1]!, String(body.authorization_id ?? ""), {
+            actor: kpiActor,
+            action,
+            idempotency_key: String(body.idempotency_key ?? crypto.randomUUID()),
+          }));
+        }
+        throw new IntegrityError("FAIL_CLOSED_KPI_VERIFY", `action ${action} unsupported`);
+      }
+      // ----- P15.10-B — owner-scoped RECONCILE_ONLY scheduler status -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-scheduler$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.autoScheduler) {
+          return void json(res, 404, { error: "AUTO_SCHEDULER_DISABLED" });
+        }
+        const rawSchedulerActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawSchedulerActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const schedulerActor = rawSchedulerActor.startsWith("operator:")
+          ? rawSchedulerActor
+          : `operator:${rawSchedulerActor}`;
+        // P15.10-C R3 F3 — readiness is the driver's OWN truthful
+        // proof for THIS objective, not a deployment flag.
+        const r = deps.autoDriver?.readiness(m[1]!, schedulerActor);
+        return void json(res, 200, {
+          auto_scheduler: deps.autoScheduler.status(m[1]!, schedulerActor,
+            deps.autoDriver
+              ? { enabled: true, driver_missing: [],
+                  runnable: r?.objective_runnable === true,
+                  reasons: (r?.reasons as string[] | undefined) ?? [] }
+              : undefined),
+        });
+      }
+      // ----- P15.10-C — owner-scoped autonomous driver status (read-only) -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-driver$/);
+      if (m && method === "GET") {
+        if (!biz || !deps.autoDriver) {
+          return void json(res, 404, { error: "AUTO_DRIVER_DISABLED" });
+        }
+        const rawDriverActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawDriverActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        // Owner-scope proof runs inside the same owner revalidation
+        // the auto-policy status route enforces — a non-owner actor
+        // fails closed there before any driver state is read.
+        const driverActor = rawDriverActor.startsWith("operator:")
+          ? rawDriverActor
+          : `operator:${rawDriverActor}`;
+        return void json(res, 200, {
+          auto_driver: deps.autoDriver.status(m[1]!, driverActor),
+        });
+      }
+      // ----- P15.10-A — objective auto-policy control plane -----
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/auto-policy$/);
+      if (m && (method === "GET" || method === "POST")) {
+        if (!biz || !deps.store) {
+          return void json(res, 404, { error: "AUTO_POLICY_DISABLED" });
+        }
+        const rawPolicyActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawPolicyActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        // Canonical actor derivation — same convention the Objective
+        // create path uses (`operator:<id>`), so an owner who created
+        // the objective with a raw header can operate its policy with
+        // the same raw header. Body-declared identity never consulted.
+        const policyActor = rawPolicyActor.startsWith("operator:")
+          ? rawPolicyActor
+          : `operator:${rawPolicyActor}`;
+        autoPolicySvc ??= new ObjectiveAutoPolicyService(deps.store, biz.objectives);
+        // P15.10-C R3 F3 — truthful readiness: the driver's own
+        // canonical proof for this objective (scheduler READY + policy
+        // effective + no quarantine + provable cost binding + budget
+        // room), never just "a driver process exists".
+        const policyObjectiveId = m[1]!;
+        const policyWithDriver = (st: ReturnType<ObjectiveAutoPolicyService["status"]>) => {
+          if (!deps.autoDriver) return st;
+          const r = deps.autoDriver.readiness(policyObjectiveId, policyActor);
+          return { ...st,
+            driver_ready: r.objective_runnable === true,
+            objective_runnable: r.objective_runnable === true,
+            driver_integrated: true,
+            driver_missing: ((r.reasons as string[] | undefined) ?? []) };
+        };
+        if (method === "GET") {
+          return void json(res, 200, {
+            auto_policy: policyWithDriver(autoPolicySvc.status(m[1]!, policyActor)),
+          });
+        }
+        // F3 — strict boundary typing: NO coercion of authority fields.
+        // Malformed types are rejected with zero mutation before the
+        // service sees them; the service re-validates independently.
+        const malformed =
+          typeof body.action !== "string" ||
+          typeof body.idempotency_key !== "string" ||
+          (body.policy_version !== undefined && !Number.isInteger(body.policy_version)) ||
+          (body.limits !== undefined &&
+            (typeof body.limits !== "object" || body.limits === null || Array.isArray(body.limits))) ||
+          (body.halt_scope !== undefined && typeof body.halt_scope !== "string") ||
+          (body.halt_reason !== undefined && typeof body.halt_reason !== "string");
+        if (malformed) {
+          return void json(res, 400, { error: "FAIL_CLOSED_POLICY_SCHEMA" });
+        }
+        return void json(res, 200, {
+          auto_policy: policyWithDriver(autoPolicySvc.control({
+            objective_id: m[1]!,
+            actor: policyActor,
+            action: body.action as string,
+            policy_version: body.policy_version as number | undefined,
+            limits: body.limits,
+            idempotency_key: body.idempotency_key as string,
+            halt_scope: body.halt_scope,
+            halt_reason: body.halt_reason,
+          })),
+        });
+      }
+      // ----- P15.9-A1 — Company Cockpit canonical read projections ----
+      // READ-ONLY: selective fields composed through existing strict
+      // reads. Same owner-scope contract as auto-policy/kpi-verification:
+      // actor is derived from x-operator-id (never a body field), and the
+      // projection serves only owner_authority_id matches — foreign
+      // objectives/businesses fail closed. MC token remains the transport
+      // credential; no new authorization mechanism is claimed here.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/cockpit$/);
+      if (method === "GET" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "COCKPIT_DISABLED" });
+        }
+        const actor = String(req.headers["x-operator-id"] ?? "");
+        if (!actor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        cockpitSvc ??= new ObjectiveCockpitService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
+            deps.store, biz.objectives),
+          autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
+        });
+        const cockpitActor = actor.startsWith("operator:")
+          ? actor : `operator:${actor}`;
+        return void json(res, 200, {
+          cockpit: cockpitSvc.objectiveCockpit(m[1]!, cockpitActor),
+        });
+      }
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/reviews$/);
+      if (method === "GET" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "COCKPIT_DISABLED" });
+        }
+        const actor = String(req.headers["x-operator-id"] ?? "");
+        if (!actor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        cockpitSvc ??= new ObjectiveCockpitService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
+            deps.store, biz.objectives),
+          autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
+        });
+        const reviewsActor = actor.startsWith("operator:")
+          ? actor : `operator:${actor}`;
+        const limitParam = url.searchParams.get("limit");
+        const limit = limitParam === null ? 50 : Number(limitParam);
+        if (!Number.isFinite(limit) || limit < 1) {
+          return void json(res, 400, { error: "FAIL_CLOSED_COCKPIT_LIMIT" });
+        }
+        return void json(res, 200,
+          cockpitSvc.objectiveReviews(m[1]!, reviewsActor, limit));
+      }
+      // ----- P15.10-A2 — owner review sign-off (accept ACHIEVED) -----
+      // The ONE mutation seam that lets the objective owner accept a
+      // TARGET_MET_CANDIDATE review. All authority/pin/active-work
+      // validation lives in ObjectiveReviewSignoffService; the route
+      // only binds the operator actor. "request_changes" is NOT
+      // implemented — no owner feedback seam exists yet.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/review-signoff$/);
+      if (method === "POST" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "OPERATING_LOOP_DISABLED" });
+        }
+        const rawSignoffActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawSignoffActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const signoffActor = rawSignoffActor.startsWith("operator:")
+          ? rawSignoffActor : `operator:${rawSignoffActor}`;
+        // R1-F2 — strict request schema BEFORE any coercion: wrong JSON
+        // types (arrays/objects/numbers) are a typed 400 client error
+        // with zero mutation — String(body.action) must never turn
+        // ["accept"] into "accept".
+        for (const [f, v] of [
+          ["action", body.action],
+          ["review_id", body.review_id],
+          ["idempotency_key", body.idempotency_key],
+        ] as const) {
+          if (typeof v !== "string" || !v.trim()) {
+            return void json(res, 400, {
+              error: "FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST",
+              detail: `${f} must be a non-empty string`,
+            });
+          }
+        }
+        if (
+          body.reason !== undefined && body.reason !== null &&
+          typeof body.reason !== "string"
+        ) {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST",
+            detail: "reason must be a string when present",
+          });
+        }
+        const signoffSvc = new ObjectiveReviewSignoffService({
+          store: deps.store,
+          objectives: biz.objectives,
+          reviewDeps: {
+            store: deps.store,
+            business: biz,
+            workforce: wf,
+            objectives: biz.objectives,
+            workstreams: new ObjectiveWorkstreamService({
+              store: deps.store, business: biz, workforce: wf,
+              objectives: biz.objectives,
+            }),
+          },
+        });
+        return void json(res, 200, {
+          signoff: signoffSvc.signoff(m[1]!, {
+            actor: signoffActor,
+            action: body.action as string,
+            review_id: body.review_id as string,
+            idempotency_key: body.idempotency_key as string,
+            reason: body.reason === undefined || body.reason === null
+              ? undefined : (body.reason as string),
+          }),
+        });
+      }
+      m = p.match(/^\/api\/vnext\/businesses\/([^/]+)\/company$/);
+      if (method === "GET" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "COCKPIT_DISABLED" });
+        }
+        const actor = String(req.headers["x-operator-id"] ?? "");
+        if (!actor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        cockpitSvc ??= new ObjectiveCockpitService({
+          store: deps.store,
+          business: biz,
+          workforce: wf,
+          objectives: biz.objectives,
+          workstreams: new ObjectiveWorkstreamService({
+            store: deps.store, business: biz, workforce: wf,
+            objectives: biz.objectives,
+          }),
+          autoPolicy: autoPolicySvc ??= new ObjectiveAutoPolicyService(
+            deps.store, biz.objectives),
+          autoDriver: deps.autoDriver,
+          artifacts: deps.artifacts,
+        });
+        const companyActor = actor.startsWith("operator:")
+          ? actor : `operator:${actor}`;
+        return void json(res, 200, {
+          company: cockpitSvc.businessCompany(m[1]!, companyActor),
+        });
+      }
       if (method === "GET" && p === "/api/budgets") {
         const bid = url.searchParams.get("business_id") ?? undefined;
         return void json(res, 200, { budgets: biz ? biz.listBudgetPolicies(bid) : [] });
@@ -1137,11 +1588,280 @@ export function createMissionControlServer(
           operator_id: String(operator),
         }));
       }
+      // ----- P15.8-D — conversation layer (Chat + governed drafts) -----
+      // Every route delegates to the canonical services; the handler
+      // never writes store rows directly. Operator identity comes ONLY
+      // from the trusted request boundary (`x-operator-id`, falling back
+      // to body.operator_id per the existing model) — never from a
+      // caller-chosen session owner field.
+      if (p === "/api/conversations" || p.startsWith("/api/conversations/")) {
+        const conv = deps.conversation;
+        if (!conv) return void json(res, 404, { error: "CONVERSATION_DISABLED" });
+        if (!operator) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        if (method === "GET" && p === "/api/conversations") {
+          const state = url.searchParams.get("state");
+          return void json(res, 200, {
+            sessions: conv.sessions.listSessions({
+              operator_id: operator,
+              state: (state as never) ?? null,
+            }),
+          });
+        }
+        if (method === "POST" && p === "/api/conversations") {
+          return void json(res, 200, {
+            session: conv.sessions.createSession({
+              owner_operator_id: operator,
+              title: body.title === undefined ? undefined : String(body.title),
+              client_request_id: body.client_request_id === undefined
+                ? undefined : String(body.client_request_id),
+              correlation_id: body.correlation_id === undefined
+                ? undefined : String(body.correlation_id),
+            }),
+          });
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)$/);
+        if (method === "GET" && m) {
+          return void json(res, 200, {
+            session: conv.sessions.getSession(m[1]!, operator),
+          });
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/messages$/);
+        if (method === "GET" && m) {
+          const afterSeq = url.searchParams.get("after_seq");
+          const limit = url.searchParams.get("limit");
+          return void json(res, 200, conv.sessions.listMessages(m[1]!, {
+            operator_id: operator,
+            after_seq: afterSeq === null ? null : Number(afterSeq),
+            limit: limit === null ? null : Number(limit),
+          }));
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/turns$/);
+        if (method === "POST" && m) {
+          if (!conv.reasoning) {
+            return void json(res, 404, { error: "CONVERSATION_REASONING_DISABLED" });
+          }
+          const out = await conv.reasoning.turn({
+            session_id: m[1]!,
+            operator_id: operator,
+            body: String(body.body ?? ""),
+            idempotency_key: body.idempotency_key === undefined
+              ? undefined : String(body.idempotency_key),
+            correlation_id: body.correlation_id === undefined
+              ? undefined : String(body.correlation_id),
+          });
+          // P15.8-F — a model proposal is materialized HERE, never inside
+          // the reasoning service: deterministic project resolution then
+          // the canonical MissionDraftService mints the draft. Bound to
+          // the operator message id → a replayed turn converges onto the
+          // same draft; ambiguous/no project mints nothing. R1: the
+          // durable proposal replays too — a crash before the first
+          // materialization is recovered by the idempotent mint below.
+          if (out.proposal && conv.drafts) {
+            const projRes = resolveProposalProject(deps.store!);
+            if (projRes.kind === "resolved") {
+              try {
+                const draft = conv.drafts.createDraft({
+                  session_id: m[1]!,
+                  operator_id: operator,
+                  project_id: projRes.project_id,
+                  goal: out.proposal.goal,
+                  client_request_id: `proposal:${out.message.message_id}`,
+                });
+                return void json(res, 200, {
+                  ...out,
+                  proposal: { goal: out.proposal.goal, draft },
+                });
+              } catch (e) {
+                // A proposal that cannot mint a canonical draft is
+                // surfaced honestly — still zero missions.
+                return void json(res, 200, {
+                  ...out,
+                  proposal: {
+                    goal: out.proposal.goal,
+                    rejected: e instanceof IntegrityError ? e.code : "ERROR",
+                  },
+                });
+              }
+            }
+            return void json(res, 200, {
+              ...out,
+              proposal: { goal: out.proposal.goal, project_candidates: projRes.candidates },
+            });
+          }
+          return void json(res, 200, out);
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/close$/);
+        if (method === "POST" && m) {
+          return void json(res, 200, {
+            session: conv.sessions.closeSession(m[1]!, {
+              operator_id: operator,
+              correlation_id: body.correlation_id === undefined
+                ? undefined : String(body.correlation_id),
+            }),
+          });
+        }
+        // ---- governed mission drafts (P15.8-C bridge; the ONLY
+        //      conversation→mission path — Task Entry is untouched) ----
+        m = p.match(/^\/api\/conversations\/([^/]+)\/drafts$/);
+        if (m) {
+          if (!conv.drafts) {
+            return void json(res, 404, { error: "CONVERSATION_DRAFTS_DISABLED" });
+          }
+          if (method === "GET") {
+            const state = url.searchParams.get("state");
+            return void json(res, 200, {
+              drafts: conv.drafts.listDrafts({
+                session_id: m[1]!, operator_id: operator,
+                state: state ?? undefined,
+              }),
+            });
+          }
+          if (method === "POST") {
+            return void json(res, 200, {
+              draft: conv.drafts.createDraft({
+                session_id: m[1]!, operator_id: operator,
+                project_id: String(body.project_id ?? ""),
+                goal: String(body.goal ?? ""),
+                // Pass-through, never coerced — the canonical validator
+                // owns list/risk semantics (same contract as vnext).
+                granted_permissions: body.granted_permissions as string[] | undefined,
+                authorized_workspaces: body.authorized_workspaces as string[] | undefined,
+                risk_ceiling: body.risk_ceiling === undefined ? undefined : String(body.risk_ceiling),
+                client_request_id: body.client_request_id === undefined
+                  ? undefined : String(body.client_request_id),
+                supersedes_draft_id: body.supersedes_draft_id === undefined
+                  ? undefined : String(body.supersedes_draft_id),
+                correlation_id: body.correlation_id === undefined
+                  ? undefined : String(body.correlation_id),
+              }),
+            });
+          }
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/drafts\/([^/]+)$/);
+        if (method === "GET" && m) {
+          if (!conv.drafts) {
+            return void json(res, 404, { error: "CONVERSATION_DRAFTS_DISABLED" });
+          }
+          return void json(res, 200, {
+            draft: conv.drafts.getDraft({
+              session_id: m[1]!, operator_id: operator, draft_id: m[2]!,
+            }),
+          });
+        }
+        m = p.match(/^\/api\/conversations\/([^/]+)\/drafts\/([^/]+)\/(confirm|reject)$/);
+        if (method === "POST" && m) {
+          if (!conv.drafts) {
+            return void json(res, 404, { error: "CONVERSATION_DRAFTS_DISABLED" });
+          }
+          if (m[3] === "reject") {
+            return void json(res, 200, {
+              draft: conv.drafts.rejectDraft({
+                session_id: m[1]!, operator_id: operator, draft_id: m[2]!,
+                correlation_id: body.correlation_id === undefined
+                  ? undefined : String(body.correlation_id),
+              }),
+            });
+          }
+          // Confirm binds the EXACT draft identity + digest the operator
+          // was shown — never a re-resolved "latest" proposal.
+          const out = await conv.drafts.confirmDraft({
+            session_id: m[1]!, operator_id: operator, draft_id: m[2]!,
+            expected_digest: String(body.expected_digest ?? body.draft_digest ?? ""),
+            kind: body.kind === undefined ? undefined : String(body.kind),
+          });
+          return void json(res, 200, out);
+        }
+        return void json(res, 404, { error: "NOT_FOUND", path: p });
+      }
+      // ---- Telegram conversation ingress (P15.8-E) ------------------
+      // The bridge forwards each update to ONE endpoint; ALL authority
+      // decisions live in TelegramConversationService against the
+      // canonical conversation/draft services. The boundary operator
+      // must equal `telegram:<chat_id>` — the service re-enforces it.
+      if (p === "/api/telegram/conversation" || p.startsWith("/api/telegram/conversation/")) {
+        const tg = deps.conversation?.telegram;
+        if (!tg) {
+          return void json(res, 404, { error: "TELEGRAM_CONVERSATION_DISABLED" });
+        }
+        if (!operator) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const chatId = String(body.chat_id ?? url.searchParams.get("chat_id") ?? "");
+        if (method === "POST" && p === "/api/telegram/conversation/ingress") {
+          return void json(res, 200, await tg.ingress({
+            operator_id: operator,
+            chat_id: chatId,
+            chat_type: body.chat_type === undefined ? undefined : String(body.chat_type),
+            update_id: Number(body.update_id),
+            text: String(body.text ?? ""),
+            reply_to_message_id: body.reply_to_message_id === undefined
+              ? undefined : Number(body.reply_to_message_id),
+          }));
+        }
+        if (method === "POST" && p === "/api/telegram/conversation/new") {
+          // update_id binds the rotation to Telegram's update identity —
+          // a replayed /new update converges onto the recorded session.
+          return void json(res, 200, tg.newChatSession({
+            operator_id: operator, chat_id: chatId,
+            update_id: Number(body.update_id),
+          }));
+        }
+        if (method === "GET" && p === "/api/telegram/conversation/pending") {
+          return void json(res, 200, {
+            drafts: tg.listPending({ operator_id: operator, chat_id: chatId }),
+          });
+        }
+        if (method === "POST" && p === "/api/telegram/conversation/draft") {
+          return void json(res, 200, tg.prepareDraft({
+            operator_id: operator,
+            chat_id: chatId,
+            project_id: String(body.project_id ?? ""),
+            goal: String(body.goal ?? ""),
+            update_id: Number(body.update_id),
+            granted_permissions: body.granted_permissions as string[] | undefined,
+            authorized_workspaces: body.authorized_workspaces as string[] | undefined,
+            risk_ceiling: body.risk_ceiling === undefined ? undefined : String(body.risk_ceiling),
+          }));
+        }
+        m = p.match(/^\/api\/telegram\/conversation\/refs\/([^/]+)\/(prompt-sent|confirm|reject)$/);
+        if (method === "POST" && m) {
+          if (m[2] === "prompt-sent") {
+            return void json(res, 200, {
+              ref: tg.bindPromptMessage({
+                operator_id: operator, chat_id: chatId, ref_id: m[1]!,
+                message_id: Number(body.message_id),
+              }),
+            });
+          }
+          if (m[2] === "reject") {
+            return void json(res, 200, {
+              draft: tg.rejectByRef({
+                operator_id: operator, chat_id: chatId, ref_id: m[1]!,
+              }),
+            });
+          }
+          return void json(res, 200, await tg.confirmByRef({
+            operator_id: operator,
+            chat_id: chatId,
+            chat_type: body.chat_type === undefined ? undefined : String(body.chat_type),
+            ref_id: m[1]!,
+            kind: "explicit",
+          }));
+        }
+        return void json(res, 404, { error: "NOT_FOUND", path: p });
+      }
       json(res, 404, { error: "NOT_FOUND", path: p });
     } catch (error) {
       const e = error as { code?: string; message?: string };
       const status =
-        e.code === "FAIL_CLOSED_OPERATOR_ID_REQUIRED" ? 403
+        e.code === "FAIL_CLOSED_OPERATOR_ID_REQUIRED" ||
+        e.code === "FAIL_CLOSED_POLICY_FORBIDDEN" ||
+        e.code === "FAIL_CLOSED_POLICY_OWNER" ||
+        e.code === "FAIL_CLOSED_COCKPIT_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_OBJECTIVE_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_COMPANY_SCOPE" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409
         : 500;

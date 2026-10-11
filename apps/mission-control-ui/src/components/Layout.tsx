@@ -30,7 +30,9 @@ export function Layout() {
           <NavLink to="/schedules">Schedules</NavLink>
           <NavLink to="/providers">Providers</NavLink>
           <NavLink to="/observability">Observability</NavLink>
-          <NavLink to="/missions/new">New Mission</NavLink>
+          <NavLink to="/chat">Chat</NavLink>
+          <NavLink to="/objectives">Objectives</NavLink>
+          <NavLink to="/missions/new">Task Entry</NavLink>
         </nav>
         <button className="ghost" onClick={toggleTheme} aria-label="toggle theme" title="Toggle dark/light">
           {theme === "dark" ? "☾" : "☀"}

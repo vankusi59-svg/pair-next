@@ -50,6 +50,12 @@ import {
   reconcilePlanDataflow,
   detectTelegramDeliveryIntent,
   CANONICAL_BOOKKEEPING_INSTRUCTION,
+  isDeliveryTask,
+  inspectRawDeliveryEmissions,
+  type RawDeliveryEmissionState,
+  PAIR_DELIVERY_INJECTION_KEY,
+  type DeliveryInjectionRecord,
+  type ExternalInputArtifactSource,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
 import { extractGoalContract } from "./goal-contract.js";
@@ -154,9 +160,55 @@ export function makeServeCanonicalizer(deps: {
 }): (
   rawTasks: Array<Record<string, unknown>>,
   goal: string,
-  ctx?: { provenance?: "fresh" | "persisted" },
+  ctx?: {
+    provenance?: "fresh" | "persisted";
+    /** HOTFIX 1 R1/R2 — TRUE raw TELEGRAM_DELIVERY emission evidence
+     *  captured on the parsed provider JSON BEFORE the transport's own
+     *  sanitize/drop pass, threaded through runPlannerFailover for THIS
+     *  exact invocation. When absent the caller vouches that `rawTasks`
+     *  IS the unsanitized emission (direct/replan seams). */
+    raw_delivery_emission_count?: number;
+    /** R2 — tri-state verdict for the count: ABSENT = proven omission,
+     *  PRESENT = proven emission, INDETERMINATE = detector budget
+     *  exhausted before all capability content was inspected (NEVER a
+     *  proven R=0 — fail closed). */
+    raw_delivery_emission_state?: RawDeliveryEmissionState;
+    /** HOTFIX-A — the bounded cross-mission eligible set computed by
+     *  trusted PAIR code for this mission (empty/absent = no
+     *  cross-mission consumption is authorized). */
+    external_input_artifacts?: ExternalInputArtifactSource[];
+  },
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal, ctx) => {
+    // HOTFIX 1 — delivery omission provenance is measured on the RAW
+    // candidate BEFORE sanitize/drop/remap so a TRUE omission (planner
+    // never attempted a delivery task) can be told apart from a
+    // malformed emission that canonical preparation dropped. The
+    // operator request remains the ONLY delivery authority.
+    // R1 — `ctx.raw_delivery_emission_count` is the REAL raw evidence
+    // captured inside the planner transport (llmPlan/codexPlannerPlan)
+    // BEFORE its own sanitizePlan; the incoming task list has already
+    // survived that first drop and can no longer prove it.
+    const deliveryIntent = detectTelegramDeliveryIntent(String(goal ?? ""));
+    // R2 — evidence is the tri-state inspection: an explicit
+    // `raw_delivery_emission_state`/`_count` pair wins (production
+    // failover always supplies it); absent evidence means the caller
+    // vouches `rawTasks` is the unsanitized emission, so it is inspected
+    // HERE — never inferred from sanitized tasks and never substituted
+    // with a fallback count that could launder uncertainty into a
+    // proven omission.
+    const rawInspection =
+      ctx?.raw_delivery_emission_count !== undefined ||
+      ctx?.raw_delivery_emission_state !== undefined
+        ? {
+            state: ctx?.raw_delivery_emission_state ??
+              ((ctx?.raw_delivery_emission_count ?? 0) > 0
+                ? "PRESENT"
+                : "ABSENT"),
+            count: ctx?.raw_delivery_emission_count ?? 0,
+          }
+        : inspectRawDeliveryEmissions(rawTasks);
+    const rawDeliveryCount = rawInspection.count;
     // PRV2-A §D — the model emits WORK tasks only; PAIR owns bookkeeping.
     // A model-emitted bookkeeping-shaped task (filtered caps ⊆
     // {AUTOMATON_TASK_EXECUTION}) is deterministically normalized away so
@@ -197,6 +249,76 @@ export function makeServeCanonicalizer(deps: {
       workBudget,
       deps.executorCapSets() as never[],
     );
+    const canonicalDeliveryCount = (tasks as Array<Record<string, unknown>>)
+      .filter(isDeliveryTask).length;
+    const freshPlan = ctx?.provenance !== "persisted";
+    if (freshPlan && rawInspection.state === "INDETERMINATE") {
+      // R2 defect B — the detector could not inspect every capability
+      // field (depth/node budget): omission is UNPROVEN, never R=0.
+      // A deterministic typed fail-closed verdict at this boundary —
+      // no injection, no silent pass.
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_EMISSION_INDETERMINATE",
+        JSON.stringify({ emissions_seen: rawInspection.count }),
+      );
+    }
+    if (freshPlan && canonicalDeliveryCount > rawDeliveryCount) {
+      // R2 defect C — impossible raw/canonical relationship: every
+      // canonical delivery task descends from a raw capability token
+      // the detector must have seen. C > R means the evidence itself
+      // is inconsistent (buggy/forged transport evidence) — never
+      // repaired, never converted into a fallback count.
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_COUNT_INCONSISTENT",
+        JSON.stringify({
+          raw_delivery: rawDeliveryCount,
+          canonical_delivery: canonicalDeliveryCount,
+        }),
+      );
+    }
+    if (freshPlan && !deliveryIntent.requested && rawDeliveryCount > 0) {
+      // R1 truth table — the model ATTEMPTED unauthorized delivery
+      // semantics. The same fail-closed verdict the reconcile gate
+      // already gives on a surviving delivery task, now also provable
+      // when the transport sanitize dropped every attempt first.
+      throw new IntegrityError(
+        "FAIL_CLOSED_TELEGRAM_DELIVERY_INTENT",
+        JSON.stringify({ raw_delivery: rawDeliveryCount }),
+      );
+    }
+    if (freshPlan && deliveryIntent.requested && rawDeliveryCount > 1) {
+      // R1 truth table — exactly-one semantics hold on the RAW emission:
+      // a duplicate delivery attempt never becomes valid just because
+      // the transport sanitize silently dropped all but one.
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_TASK_AMBIGUOUS",
+        JSON.stringify({
+          raw_delivery: rawDeliveryCount,
+          canonical_delivery: canonicalDeliveryCount,
+        }),
+      );
+    }
+    if (
+      freshPlan &&
+      deliveryIntent.requested &&
+      rawDeliveryCount > 0 &&
+      canonicalDeliveryCount < rawDeliveryCount
+    ) {
+      // HOTFIX 1 §F — the planner TRIED to emit a delivery task but it
+      // was malformed/unservable/dropped: NOT a true omission. PAIR must
+      // never "repair into validity" a failed planner emission by
+      // swapping in a clean one — fail closed instead of silently
+      // injecting. R1 — evidence lost during preparation (C < R) is the
+      // same class, whether dropped by the transport sanitize or by the
+      // canonical one.
+      throw new IntegrityError(
+        "FAIL_CLOSED_DELIVERY_TASK_INVALIDATED",
+        JSON.stringify({
+          raw_delivery: rawDeliveryCount,
+          canonical_delivery: canonicalDeliveryCount,
+        }),
+      );
+    }
     if (!tasks.length) return [] as Array<Record<string, unknown>>;
     // PRV2-A R2 + NETWORK-REQ R1/R2 + PLANNER-CONTRACT SIMPLIFICATION —
     // deterministic network authority at the canonical seam (prompt
@@ -373,6 +495,67 @@ export function makeServeCanonicalizer(deps: {
         },
       };
     }
+    // HOTFIX 1 — deterministic delivery-omission repair at THE canonical
+    // preparation seam (fresh provenance only; persisted plans are
+    // historical authority and replay verbatim). Three proofs before
+    // injection: operator intent (requested), TRUE omission (the RAW
+    // candidate attempted zero delivery tasks — a dropped malformed
+    // emission already failed closed above), and executor servability
+    // (TELEGRAM_DELIVERY inside the canonical work vocabulary AND
+    // routable by a currently-qualified executor capability set).
+    if (ctx?.provenance !== "persisted") {
+      // A planner may never forge "PAIR injected" evidence — strip the
+      // PAIR-owned stamp from every candidate task; it is re-stamped
+      // only on the task this run actually injects.
+      for (const t of allTasks) {
+        const md = t.metadata as Record<string, unknown> | undefined;
+        if (md && md[PAIR_DELIVERY_INJECTION_KEY] !== undefined) {
+          delete md[PAIR_DELIVERY_INJECTION_KEY];
+        }
+      }
+      if (
+        deliveryIntent.requested &&
+        canonicalDeliveryCount === 0 &&
+        rawDeliveryCount === 0
+      ) {
+        const servable =
+          SERVE_LLM_WORK_CAPS.includes("TELEGRAM_DELIVERY") &&
+          deps
+            .executorCapSets()
+            .some((set) =>
+              (set as string[]).includes("TELEGRAM_DELIVERY"),
+            );
+        if (!servable) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE",
+            JSON.stringify({ requested: true, servable: false }),
+          );
+        }
+        const deliveryKey = `T${allTasks.length + 1}`;
+        const injected: Record<string, unknown> = {
+          task_key: deliveryKey,
+          title: "governed telegram delivery",
+          // Placeholder only — reconcile rewrites the canonical
+          // delivery instruction and stamps the manifest/contract/
+          // output-language/edges exactly as for a planner-emitted task.
+          task_instruction:
+            "Stage the manifested artifacts into outbox/ unchanged, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"],
+          depends_on: [],
+          metadata: {},
+        };
+        const record: DeliveryInjectionRecord = {
+          reason: "DELIVERY_TASK_INJECTED",
+          task_key: deliveryKey,
+          mode: deliveryIntent.mode,
+          authority: "OPERATOR_TELEGRAM_INTENT",
+        };
+        (injected.metadata as Record<string, unknown>)[
+          PAIR_DELIVERY_INJECTION_KEY
+        ] = record;
+        allTasks.push(injected);
+      }
+    }
     // Incident R1/R2 — deterministic artifact data-flow reconciliation
     // at THE canonical seam, before validatePlanProposal + plan_digest:
     // a task consuming an artifact must depend on its unique earlier
@@ -380,8 +563,9 @@ export function makeServeCanonicalizer(deps: {
     // FAIL_CLOSED_PLAN_DATAFLOW_*. The telegram delivery authority is
     // the operator REQUEST alone.
     reconcilePlanDataflow(allTasks as never[], {
-      telegramIntent: detectTelegramDeliveryIntent(String(goal ?? "")),
+      telegramIntent: deliveryIntent,
       outputLanguage: detectOutputLanguage(String(goal ?? "")),
+      external_input_artifacts: ctx?.external_input_artifacts,
     });
     // PRV2-B — Goal Contract coverage authority, AFTER dataflow
     // reconcile and remap so the check binds the canonical task keys
@@ -425,7 +609,9 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         const raw = candidate?.tasks;
         if (Array.isArray(raw) && raw.length) {
           try {
-            const tasks = canonicalizeLlmTasks(raw, goal);
+            const tasks = canonicalizeLlmTasks(raw, goal, {
+              external_input_artifacts: input.input_artifact_sources,
+            });
             if (tasks.length) return { tasks };
           } catch (err) {
             throw new IntegrityError(
@@ -465,7 +651,10 @@ export function makeServePlanner(deps: ServePlannerDeps): {
       const tasks = canonicalizeLlmTasks(
         llm as Array<Record<string, unknown>>,
         goal,
-        { provenance: "persisted" },
+        {
+          provenance: "persisted",
+          external_input_artifacts: input.input_artifact_sources,
+        },
       );
       if (tasks.length) return { tasks };
     }

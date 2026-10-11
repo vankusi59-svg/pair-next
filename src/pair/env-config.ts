@@ -82,6 +82,24 @@ export const MODEL_DISCOVERY_TIMEOUT = {
   bounds: { min: 500, max: 120_000, unit: "ms" },
 } as const;
 
+/** CEO_DECISION Codex CLI invocation budget (a real `codex exec`
+ *  decision call can take tens of seconds; the previous 20s default
+ *  timed out live attempts). Unit: milliseconds. Bounds 5s–900s. */
+export const CEO_CLI_TIMEOUT = {
+  name: "PAIR_CEO_CLI_TIMEOUT_MS",
+  defaultValue: 300_000,
+  bounds: { min: 5_000, max: 900_000, unit: "ms" },
+} as const;
+
+/** Conversation-reasoning Codex CLI invocation budget (P15.8-B) — a
+ *  conversational reply should resolve in chat latency, far below the
+ *  planning-cycle budget. Unit: milliseconds. Bounds 5s–900s. */
+export const CONVERSATION_CLI_TIMEOUT = {
+  name: "PAIR_CONVERSATION_CLI_TIMEOUT_MS",
+  defaultValue: 120_000,
+  bounds: { min: 5_000, max: 900_000, unit: "ms" },
+} as const;
+
 /** LLM planner request budget. Unit: milliseconds. Bounds 2s–900s. */
 export const LLM_PLANNER_TIMEOUT = {
   name: "PAIR_LLM_PLANNER_TIMEOUT_MS",
@@ -153,6 +171,14 @@ export function llmPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): numb
 
 export function codexPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(CODEX_PLANNER_TIMEOUT.name, CODEX_PLANNER_TIMEOUT.defaultValue, CODEX_PLANNER_TIMEOUT.bounds, env);
+}
+
+export function ceoCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(CEO_CLI_TIMEOUT.name, CEO_CLI_TIMEOUT.defaultValue, CEO_CLI_TIMEOUT.bounds, env);
+}
+
+export function conversationCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(CONVERSATION_CLI_TIMEOUT.name, CONVERSATION_CLI_TIMEOUT.defaultValue, CONVERSATION_CLI_TIMEOUT.bounds, env);
 }
 
 export function taskTimeoutSeconds(env: EnvLike = process.env as EnvLike): number {

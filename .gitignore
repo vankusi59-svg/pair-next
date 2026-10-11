@@ -12,3 +12,11 @@ dist
 .automaton/state.db
 
 .pair-mc
+tsconfig.tsbuildinfo
+
+# dev-verification generated artifacts (report is regenerated, claim stays tracked)
+.pair-verification/report.md
+.pair-verification/report.json
+.pair-verification/.vitest-result.json
+.vitest-result.json
+.vitest-result-*.json
