@@ -1,13 +1,13 @@
 {
-  "claim_id": "P15_9_B6_R3_POPULATED_EVIDENCE",
-  "title": "P15.9-B6 R3: valid owner-scoped populated screenshot evidence",
-  "affected_surfaces": ["UI"],
+  "claim_id": "P15_10_A2_OWNER_REVIEW_SIGNOFF",
+  "title": "P15.10-A2: owner review sign-off — accept TARGET_MET_CANDIDATE → ACHIEVED",
+  "affected_surfaces": ["MISSION_CONTROL", "BUSINESS_OBJECTIVE", "UI"],
   "required_tests": [
-    "src/__tests__/pair-p15-8a-conversation-authority.test.ts",
-    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
-    "src/__tests__/pair-p14-workforce-v2.test.ts",
-    "src/__tests__/pair-p12.test.ts"
+    "src/__tests__/pair-p15-a2-review-signoff.test.ts",
+    "src/__tests__/pair-p15-10d.test.ts",
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
+    "src/__tests__/pair-p15-9a-company-cockpit.test.ts"
   ],
   "invariants": [],
-  "description": "R3 populated-evidence closure on PR #102 (R1 + R2 isolation accepted, not reworked). R3-F1: b6-shots.mjs now seeds ONE synthetic objective via canonical POST /api/vnext/objectives — owner_authority_id derived by backend from x-operator-id (operator:op:e2e), never forged; asserts owner + business_id + GET /api/vnext/businesses/:id/company returns HTTP 200 containing the objective BEFORE browser launch. Per-capture: populated shots wait for marker text ('b6-fixture-demo' / 'B6 fixture objective') inside main.amain — real data render, not shell presence; EVERY shot rejects /access denied|fail_closed_*|no business selected/i; nav non-OK aborts. R3-F2: all 16 PNGs regenerated on /tmp/pair-b6-shots-lc0mas with business BIZ_01M4MA4X32BZ97B3PCZF3HKZ9M + objective OBJ_191d8c187e215e8100dd55e7; PNGs visually inspected — Company shows OBJECTIVES OWNED 1 + objective card, Objectives shows seeded card (real populated evidence, not the R2 FAIL_CLOSED_COMPANY_SCOPE 403 captures which are documented as a corrected false-pass). Docs + matrix updated; CONDITIONAL verdict + C1-C7 + NOT_PORTED panes preserved. Zero runtime/backend/schema/authority changes; no CEO cycle/mission/executor/paid model; no merge/deploy/cutover/A2."
+  "description": "Closes the A2 gap proven on a live stack (objective OBJ_836946b48dc51100550aeda6 parked at OWNER_SIGN_OFF_REQUIRED with buttons disabled 'API_MISSING'). New POST /api/vnext/objectives/:id/review-signoff (action:'accept' only) → new ObjectiveReviewSignoffService (src/pair/objective-review-signoff.ts) → existing transitionStatus(). Durable receipt entity objective_review_signoff + OBJECTIVE_REVIEW_SIGNED_OFF event. UI: Owner Inbox 'Accept ACHIEVED' wired through the existing ConfirmDialog pattern pinning review_id; 'Request changes' stays disabled, truthfully labeled. No lifecycle/review/scheduler/auto-driver/planner/executor/schema changes; no request_changes; no merge/deploy/cutover."
 }

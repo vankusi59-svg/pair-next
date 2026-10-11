@@ -60,6 +60,17 @@ export function Inbox() {
     reason: string | null;
     requested: string | null;
   } | null>(null);
+  /* A2 — review sign-off dialog. The canonical review pin (review_id,
+     outcome, recommended_status) is captured verbatim from the
+     company projection when the dialog opens; backend re-validation
+     remains authoritative (fresh pins, latest review, active work). */
+  const [rdlg, setRdlg] = useState<{
+    objectiveId: string;
+    title: string;
+    reviewId: string;
+    outcome: string;
+    recommended: string | null;
+  } | null>(null);
   const opSeq = useRef(0);
 
   const openDecide = (a: Record<string, unknown>, action: "approve" | "deny") => {
@@ -133,6 +144,36 @@ export function Inbox() {
         if (seq !== opSeq.current) return;
         setMutBusy(false);
         setMutNote(`${action} failed: ${e instanceof ApiError ? `${e.code}: ${e.detail}` : String(e)}`);
+      });
+  };
+
+  const acceptReview = () => {
+    if (!rdlg) return;
+    const { objectiveId, reviewId } = rdlg;
+    const seq = ++opSeq.current;
+    setRdlg(null);
+    setMutBusy(true);
+    setMutNote(null);
+    api
+      .objectiveReviewSignoff(objectiveId, {
+        review_id: reviewId,
+        idempotency_key: crypto.randomUUID(),
+      })
+      .then((r) => {
+        if (seq !== opSeq.current) return;
+        setMutBusy(false);
+        setMutNote(
+          r.signoff.replayed
+            ? `ACHIEVED already committed on ${objectiveId.slice(0, 18)} (idempotent replay).`
+            : `ACHIEVED committed on ${objectiveId.slice(0, 18)} — objective finalized.`,
+        );
+        setTick((n) => n + 1);
+        invalidateInboxCounts();
+      })
+      .catch((e: unknown) => {
+        if (seq !== opSeq.current) return;
+        setMutBusy(false);
+        setMutNote(`accept failed: ${e instanceof ApiError ? `${e.code}: ${e.detail}` : String(e)}`);
       });
   };
 
@@ -216,8 +257,16 @@ export function Inbox() {
                     </span>
                     <Link className="go" to={`/app/objectives/${encodeURIComponent(o.objective_id)}`}>open objective →</Link>
                     <span className="note">
-                      <button className="ghost" disabled title="API_MISSING — A2 owner routes not built yet">Accept ACHIEVED (A2)</button>
-                      <button className="ghost" disabled title="API_MISSING — A2 owner routes not built yet">Request changes (A2)</button>
+                      <button className="ghost" disabled={mutBusy || !o.latest_review?.review_id}
+                        title={o.latest_review?.review_id ? undefined : "no canonical review pinned"}
+                        onClick={() => setRdlg({
+                          objectiveId: o.objective_id,
+                          title: o.title || o.objective_id,
+                          reviewId: String(o.latest_review!.review_id),
+                          outcome: String(o.latest_review!.outcome ?? "—"),
+                          recommended: o.latest_review!.recommended_status ?? null,
+                        })}>Accept ACHIEVED (A2)</button>
+                      <button className="ghost" disabled title="API_MISSING — owner feedback seam not built yet">Request changes (A2)</button>
                     </span>
                   </div>
                 ))}
@@ -315,6 +364,25 @@ export function Inbox() {
               </p>
             ) : null}
           </>
+        ) : null}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={rdlg !== null}
+        title="Accept ACHIEVED"
+        body="Finalize this objective as ACHIEVED? This commits the existing canonical owner sign-off against the pinned review below — backend re-checks freshness, latest-review and active-work invariants and remains authoritative."
+        confirmLabel="Accept ACHIEVED"
+        busy={mutBusy}
+        onConfirm={acceptReview}
+        onCancel={() => setRdlg(null)}
+      >
+        {rdlg ? (
+          <dl className="dmeta">
+            <dt>objective</dt><dd><code>{rdlg.objectiveId}</code></dd>
+            <dt>title</dt><dd>{rdlg.title}</dd>
+            <dt>review</dt><dd><code>{rdlg.reviewId}</code></dd>
+            <dt>outcome</dt><dd>{rdlg.outcome}{rdlg.recommended ? ` → ${rdlg.recommended}` : ""}</dd>
+          </dl>
         ) : null}
       </ConfirmDialog>
     </>
