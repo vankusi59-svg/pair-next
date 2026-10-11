@@ -823,6 +823,62 @@ describe("HOTFIX-B governed redispatch after WORK_ITEM_UNBLOCKED", () => {
     expect(boundMissionId(s, w1c)).toBe(m1);
     expect(missionCount(s)).toBe(1);
   });
+
+  /* ---------- R2-F3: strict causal ordering of the BLOCKED episode ---------- */
+
+  /** Audit A: an unblock issued while the bound mission was still
+   *  PAUSED can never authorize redispatch after the mission later
+   *  goes terminal — the episode preceding the unblock is the
+   *  operator BLOCK (pre-terminal), not a canonical fold. */
+  it("HB13: pre-terminal unblock — operator BLOCK pauses mission, unblock while PAUSED, mission later CANCELLED → never redispatches", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding: b, ops } = seeded("hb13", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    const w1c = childOfKey(s, b, "w1");
+    const m1 = boundMissionId(s, w1c);
+    missionRunning(s, m1);
+    // Operator blocks the in-flight item — canonically pauses m1.
+    s.biz.blockWorkItem(w1c, "operator hold", OP);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("BLOCKED");
+    expect(String(s.store.get("mission", m1).status)).toBe("PAUSED");
+    // Unblock while m1 still PAUSED → READY (pre-terminal unblock).
+    s.biz.unblockWorkItem(w1c, OP);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("READY");
+    // The bound mission only reaches terminal AFTER that unblock.
+    s.service.transitionMission(m1, "CANCELLED", `OPERATOR:${OP}`);
+    s.runtime.transitionRuntime(m1, "CANCELLED", "t");
+    expect(String(s.store.get("mission", m1).status)).toBe("CANCELLED");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("DISPATCHED");
+    expect(boundMissionId(s, w1c)).toBe(m1);
+    expect(missionCount(s)).toBe(1);
+  });
+
+  /** Audit B: an OLDER mission-linked BLOCKED fold exists in history,
+   *  but the BLOCKED episode immediately preceding the CURRENT unblock
+   *  is an unrelated operator block — the old event cannot be reused. */
+  it("HB14: older linked BLOCKED exists but latest episode is unrelated → not REOPENABLE", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding: b, ops } = seeded("hb14", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    const w1c = childOfKey(s, b, "w1");
+    const m1 = boundMissionId(s, w1c);
+    await failThenUnblock(s, w1c, m1);
+    // READY + terminal-bound → operator blocks from READY (no mission
+    // paused — the bound predecessor is already terminal), then
+    // unblocks. The episode immediately before THIS unblock is the
+    // operator block, not the m1 fold deeper in history.
+    s.biz.blockWorkItem(w1c, "operator re-hold", OP);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("BLOCKED");
+    s.biz.unblockWorkItem(w1c, OP);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("READY");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("DISPATCHED");
+    expect(boundMissionId(s, w1c)).toBe(m1);
+    expect(missionCount(s)).toBe(1);
+  });
 });
 
 /* ---------------- Hotfix-A artifact fixture (adapted ctx) -------------- */

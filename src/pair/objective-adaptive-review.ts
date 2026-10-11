@@ -452,24 +452,33 @@ export function assertCanonicalWorkStatus(
   return derived;
 }
 
-/** HOTFIX-B/R1-F1 — the exact unblock-event provenance contract behind
+/** HOTFIX-B/R2-F3 — the exact unblock-event provenance contract behind
  *  REOPENABLE, shared by review classification AND the final dispatch
  *  boundary (one authority, never two interpretations).
  *
  *  Returns the authentic WORK_ITEM_UNBLOCKED event iff the work item's
  *  CURRENT READY state was produced by a canonical unblock that
- *  follows the LATEST bound predecessor:
- *   1. a BOUND work-open binding exists (the predecessor it must
- *      follow — never a stale attempt);
+ *  causally FOLLOWS the terminal fold of the LATEST bound mission:
+ *   1. a BOUND work-open binding exists — its latest attempt pins the
+ *      mission the episode must reference (never a stale attempt);
  *   2. the LAST status-producing event is WORK_ITEM_UNBLOCKED in the
  *      exact shape unblockWorkItem mints — old_state BLOCKED,
  *      new_state READY, actor `operator:<id>` (operator provenance);
- *   3. the derived status immediately BEFORE that event is honestly
- *      BLOCKED (the transition is correctly ordered, not synthetic);
- *   4. an earlier BLOCKED-producing status event references the
- *      latest bound mission — the terminal fold's WORK_ITEM_SYNCED /
- *      WORK_ITEM_STATUS_SYNCED (metadata.mission_id) or an operator
- *      WORK_ITEM_BLOCKED that paused it (metadata.mission_paused).
+ *   3. the status event IMMEDIATELY preceding it — the BLOCKED episode
+ *      the unblock transitioned out of — is a canonical terminal fold:
+ *      WORK_ITEM_SYNCED or WORK_ITEM_STATUS_SYNCED produced by
+ *      `PAIR_BUSINESS_LAYER` with metadata.mission_id pinned to the
+ *      latest bound mission and metadata.mission_status already
+ *      terminal. An operator WORK_ITEM_BLOCKED, an unrelated BLOCKED,
+ *      or any other producer never authorizes;
+ *   4. strict causal ordering on the durable GLOBAL event sequence
+ *      (never wall-clock): the fold's seq must exceed BOTH the seq of
+ *      the bound mission's own terminal-deriving spine transition and
+ *      the last mission_runtime spine event — a pre-terminal unblock
+ *      or a fold predating the terminal transition cannot authorize
+ *      post-terminal redispatch;
+ *   5. no arbitrary earlier match may be reused — only the episode
+ *      immediately preceding the current unblock counts.
  *  READY produced by WORK_REWORK_REQUESTED, WORK_ITEM_OPEN_ROLLED_BACK,
  *  a malformed/mis-ordered unblock, or any unrelated status event is
  *  NOT reopenable — the caller classifies INTERVENTION / fails closed.
@@ -485,7 +494,9 @@ export function proveCanonicalUnblockProvenance(
   if (attempts.length === 0) return null;
   const boundMissionId =
     String(attempts[attempts.length - 1]!.mission_id ?? "");
-  if (!boundMissionId) return null;
+  if (!boundMissionId || !store.tryGet("mission", boundMissionId)) {
+    return null;
+  }
   const events = store.listEvents("work_item", wid)
     .filter((e) => WORK_ITEM_STATUS_EVENTS.has(String(e.event_type)) &&
       e.new_state !== null && e.new_state !== undefined);
@@ -496,18 +507,45 @@ export function proveCanonicalUnblockProvenance(
       !String(last.actor ?? "").startsWith("operator:")) {
     return null;
   }
-  const prior = events.slice(0, -1);
-  const derivedPrior = prior.length === 0
-    ? null
-    : String(prior[prior.length - 1]!.new_state);
-  if (derivedPrior !== "BLOCKED") return null;
-  const linked = prior.some((e) => {
-    if (String(e.new_state) !== "BLOCKED") return false;
-    const md = (e.metadata as Record<string, unknown> | undefined) ?? {};
-    return String(md.mission_id ?? "") === boundMissionId ||
-      String(md.mission_paused ?? "") === boundMissionId;
-  });
-  return linked ? (last as Row) : null;
+  // The BLOCKED episode the unblock transitioned out of is by
+  // construction the immediately preceding status event — anything
+  // else rewrites what the derived prior really was.
+  const episode = events[events.length - 2];
+  if (!episode || String(episode.new_state) !== "BLOCKED") {
+    return null;
+  }
+  const et = String(episode.event_type);
+  if ((et !== "WORK_ITEM_SYNCED" && et !== "WORK_ITEM_STATUS_SYNCED") ||
+      String(episode.actor) !== "PAIR_BUSINESS_LAYER") {
+    return null;
+  }
+  const md = (episode.metadata as Record<string, unknown> | undefined) ?? {};
+  if (String(md.mission_id ?? "") !== boundMissionId ||
+      !TERMINAL_MISSION_STATUSES.has(String(md.mission_status ?? ""))) {
+    return null;
+  }
+  // Durable global ordering: the terminal spine transition of the
+  // latest bound mission must COMPLETE before the fold (and therefore
+  // before the unblock). A status event sequence below or equal to the
+  // terminal transition is a pre-terminal or fabricated episode.
+  const missionSpine = store.listEvents("mission", boundMissionId)
+    .filter((e) =>
+      (String(e.event_type) === "MISSION_CREATED" ||
+       String(e.event_type) === "MISSION_TRANSITION") &&
+      e.new_state !== null && e.new_state !== undefined);
+  const terminalTransition = missionSpine[missionSpine.length - 1];
+  if (!terminalTransition ||
+      !TERMINAL_MISSION_STATUSES.has(String(terminalTransition.new_state)) ||
+      !(Number(episode.seq) > Number(terminalTransition.seq))) {
+    return null;
+  }
+  const runtimeSpine = store.listEvents("mission_runtime", boundMissionId)
+    .filter((e) => e.new_state !== null && e.new_state !== undefined);
+  const runtimeLast = runtimeSpine[runtimeSpine.length - 1];
+  if (runtimeLast && !(Number(episode.seq) > Number(runtimeLast.seq))) {
+    return null;
+  }
+  return last as Row;
 }
 
 /** The mission's claimed status derived from its own immutable
