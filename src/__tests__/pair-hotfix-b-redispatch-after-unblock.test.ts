@@ -879,6 +879,49 @@ describe("HOTFIX-B governed redispatch after WORK_ITEM_UNBLOCKED", () => {
     expect(boundMissionId(s, w1c)).toBe(m1);
     expect(missionCount(s)).toBe(1);
   });
+
+  /** Audit R3-F4: a BLOCKED fold minted AFTER the mission's terminal
+   *  transition but BEFORE the runtime's terminal event is a real
+   *  canonical fold with a real shape — yet sits out of order vs the
+   *  runtime spine. Ordering proof must reject redispatch even though
+   *  mission and runtime rows both read terminal now. */
+  it("HB15: fold between mission-terminal and runtime-terminal → not REOPENABLE despite terminal rows", async () => {
+    const inv = new FakeInvoker(WAIT_JSON);
+    const { s, oid, binding: b, ops } = seeded("hb15", inv, ["w1"]);
+    s.alloc.allocateWorkstream({ objective_id: oid, workstream_key: "w1", actor: OP });
+    await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    const w1c = childOfKey(s, b, "w1");
+    const m1 = boundMissionId(s, w1c);
+    missionRunning(s, m1);
+    // Mission reaches terminal while runtime still RUNNING — a real
+    // fold cannot be minted here (syncWorkItem itself requires the
+    // canonical lifecycle), so the episode is adversarially injected
+    // in the exact fold shape.
+    s.service.transitionMission(m1, "FAILED", `EXECUTOR:${m1}`);
+    expect(String(s.store.get("mission", m1).status)).toBe("FAILED");
+    expect(String(s.store.get("mission_runtime", `MRT_${m1}`).state))
+      .toBe("RUNNING");
+    // Injected fold-shaped event — correct type, producer and mission
+    // binding, but sequenced BEFORE the runtime's terminal event.
+    s.store.event({
+      entity_type: "work_item", entity_id: w1c,
+      event_type: "WORK_ITEM_SYNCED",
+      old_state: "IN_PROGRESS", new_state: "BLOCKED",
+      actor: "PAIR_BUSINESS_LAYER",
+      metadata: { mission_id: m1, mission_status: "FAILED" },
+    });
+    sqlRewriteEntity(s.store, "work_item", w1c, (row) => { row.status = "BLOCKED"; });
+    // Runtime only now reaches terminal — AFTER the injected fold.
+    s.runtime.transitionRuntime(m1, "FAILED", "t");
+    expect(String(s.store.get("mission_runtime", `MRT_${m1}`).state))
+      .toBe("FAILED");
+    s.biz.unblockWorkItem(w1c, OP);
+    expect(String(s.store.get("work_item", w1c).status)).toBe("READY");
+    const r = await ops.runObjectivePass({ objective_id: oid, actor: OP });
+    expect(r.outcome).not.toBe("DISPATCHED");
+    expect(boundMissionId(s, w1c)).toBe(m1);
+    expect(missionCount(s)).toBe(1);
+  });
 });
 
 /* ---------------- Hotfix-A artifact fixture (adapted ctx) -------------- */

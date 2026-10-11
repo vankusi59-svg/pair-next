@@ -539,10 +539,22 @@ export function proveCanonicalUnblockProvenance(
       !(Number(episode.seq) > Number(terminalTransition.seq))) {
     return null;
   }
-  const runtimeSpine = store.listEvents("mission_runtime", boundMissionId)
-    .filter((e) => e.new_state !== null && e.new_state !== undefined);
+  // Runtime evidence uses the canonical entity id `MRT_<missionId>`
+  // (MissionRuntime.runtimeEntity, consistent with
+  // assertCanonicalMissionLifecycle) and only its canonical
+  // creation/transition event types. A proven TERMINAL runtime event
+  // must precede the fold — the fold sitting between mission-terminal
+  // and runtime-terminal cannot authorize.
+  const runtimeSpine = store.listEvents(
+    "mission_runtime", `MRT_${boundMissionId}`)
+    .filter((e) =>
+      (String(e.event_type) === "MISSION_RUNTIME_CREATED" ||
+       String(e.event_type) === "MISSION_RUNTIME_TRANSITION") &&
+      e.new_state !== null && e.new_state !== undefined);
   const runtimeLast = runtimeSpine[runtimeSpine.length - 1];
-  if (runtimeLast && !(Number(episode.seq) > Number(runtimeLast.seq))) {
+  if (!runtimeLast ||
+      !TERMINAL_MISSION_STATUSES.has(String(runtimeLast.new_state)) ||
+      !(Number(episode.seq) > Number(runtimeLast.seq))) {
     return null;
   }
   return last as Row;
