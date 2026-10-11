@@ -1,0 +1,393 @@
+import { test, expect, type Page } from "@playwright/test";
+import { seedSession, mcToken } from "./helpers";
+
+// P15.9-B5.5 — System UI: providers / observability / schedules / cost /
+// settings. Golden paths run on the REAL backend; interceptions are
+// labeled adversarial cases (malformed/delayed/failed responses). No
+// real paid model calls — the e2e env uses the template planner.
+
+const OP = "op:e2e";
+
+async function api(page: Page, method: string, path: string, body?: Record<string, unknown>) {
+  const r = await page.request.fetch(`/api${path}`, {
+    method,
+    headers: { authorization: `Bearer ${mcToken()}`, "x-operator-id": OP },
+    data: body,
+  });
+  return { ok: r.ok(), status: r.status(), json: await r.json().catch(() => null) };
+}
+
+let seq = 0;
+const uniq = () => `${Date.now().toString(36)}-${(seq++).toString(36)}`;
+
+function trackPosts(page: Page) {
+  const posts: string[] = [];
+  page.on("request", (r) => { if (r.method() === "POST") posts.push(`${r.method()} ${r.url()}`); });
+  return posts;
+}
+
+/* ---------------- Providers & Models ---------------- */
+
+test("providers: renders all four sections on the real backend; zero mutation POSTs", async ({ page }) => {
+  const posts = trackPosts(page);
+  await seedSession(page);
+  await page.goto("/app/system/providers");
+  await expect(page.getByRole("heading", { name: "Providers & Models" })).toBeVisible();
+  await expect(page.getByText(/GET \/api\/providers/)).toBeVisible();
+  // all three canonical reads settle — provider + model tables render
+  await expect(page.locator("section[aria-label='provider catalog'] .tbl")).toBeVisible();
+  await expect(page.locator("section[aria-label='model catalog'] .tbl")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Recent routing decisions" })).toBeVisible();
+  expect(posts).toEqual([]); // read-only page — no mutations
+});
+
+test("providers: 401 on one read shows honest error, never window.prompt, other sections intact", async ({ page }) => {
+  const posts = trackPosts(page);
+  await seedSession(page);
+  await page.route("**/api/models", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "UNAUTHORIZED", detail: "bad token" }) }));
+  let promptSeen = false;
+  page.on("dialog", (d) => { promptSeen = true; void d.dismiss(); });
+  await page.goto("/app/system/providers");
+  await expect(page.locator("section[aria-label='model catalog']").getByText(/UNAUTHORIZED/i)).toBeVisible();
+  // providers + routes still render independently
+  await expect(page.locator("section[aria-label='provider catalog'] .tbl")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Recent routing decisions" })).toBeVisible();
+  await page.waitForTimeout(400);
+  expect(promptSeen).toBe(false);
+  expect(posts).toEqual([]);
+});
+
+test("providers: failed models read does not fabricate an empty catalog", async ({ page }) => {
+  await seedSession(page);
+  await page.route("**/api/models", (route) =>
+    route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "INTERNAL", detail: "boom" }) }));
+  await page.goto("/app/system/providers");
+  await expect(page.locator("section[aria-label='model catalog']").getByText("Canonical code: INTERNAL")).toBeVisible();
+  // no "No model entries" empty-state fabrication
+  await expect(page.locator("section[aria-label='model catalog']").getByText("No model entries")).toHaveCount(0);
+});
+
+test("providers: route bindings show canonical gate values — non-PASS never rendered as PASS", async ({ page }) => {
+  await seedSession(page);
+  // labeled interception — deterministic gate fixture: one routable
+  // binding, one failing gate, one binding with NO gate evidence.
+  await page.route("**/api/routes", (route) =>
+    route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify({
+        routes: [], model_bindings: [], route_decisions: [], routing_decisions: [],
+        routable_models: [
+          { binding_id: "B1", provider_id: "prov-a", executor_id: "DEVIN", routable: true, gates: { CREDENTIAL: "PASS", HEALTH: "PASS" } },
+          { binding_id: "B2", provider_id: "prov-b", executor_id: "DEVIN", routable: false, gates: { CREDENTIAL: "PASS", QUALIFICATION: "FAIL" }, reason_not_routable: "QUALIFICATION" },
+          { binding_id: "B3", provider_id: "prov-c", executor_id: "DEVIN", routable: false, gates: {} },
+        ],
+      }),
+    }));
+  await page.goto("/app/system/providers");
+  const sec = page.locator("section[aria-label='route bindings']");
+  await expect(sec.getByText("ROUTABLE", { exact: true })).toBeVisible();
+  await expect(sec.getByText("NOT ROUTABLE").first()).toBeVisible();
+  await expect(sec.getByText("QUALIFICATION: FAIL")).toBeVisible();
+  await expect(sec.getByText(/first failing gate:/)).toBeVisible();
+  // B3 has no gate evidence — never presented as PASS
+  await expect(sec.getByText(/no gate evidence/i)).toBeVisible();
+});
+
+/* ---------------- Observability ---------------- */
+
+test("observability: global event stream labeled global, live badge, never business-scoped", async ({ page }) => {
+  await seedSession(page);
+  await page.goto("/app/system/observability");
+  await expect(page.getByText(/global system event stream/i)).toBeVisible();
+  await expect(page.getByText(/not the business-scoped/i)).toBeVisible();
+  await expect(page.getByText("live").first()).toBeVisible({ timeout: 10000 });
+});
+
+test("observability: routing and recovery tabs render independently", async ({ page }) => {
+  await seedSession(page);
+  await page.goto("/app/system/observability");
+  await page.getByRole("tab", { name: "Routing" }).click();
+  await expect(page.getByRole("heading", { name: /Routing decisions/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Route decisions/ })).toBeVisible();
+  await page.getByRole("tab", { name: "Recovery" }).click();
+  await expect(page.getByRole("heading", { name: /Recovery decisions/ })).toBeVisible();
+  await expect(page.getByText(/not.*mission schedules/i)).toBeVisible();
+});
+
+async function mkMission(page: Page, goal: string): Promise<string> {
+  const prjs = (await api(page, "GET", "/projects")).json as Array<Record<string, unknown>>;
+  const p = prjs[0];
+  const pv = await api(page, "POST", "/missions/preview", {
+    project_id: String(p.project_id), goal,
+    granted_permissions: ["FILE_WRITE", "FILE_READ"],
+    authorized_workspaces: [String(p.root_location ?? "")],
+  });
+  expect(pv.ok).toBeTruthy();
+  const cf = await api(page, "POST", "/missions/confirm", {
+    preview_id: String(pv.json.preview_id), plan_digest: String(pv.json.plan_digest),
+  });
+  expect(cf.ok).toBeTruthy();
+  return String(cf.json.mission_id ?? cf.json.mission?.mission_id);
+}
+
+test("observability: evidence pinned to selected mission; late response A never overwrites B; export carries selected id", async ({ page }) => {
+  await seedSession(page);
+  const a = await mkMission(page, `e2e-evidence-A-${uniq()}`);
+  const b = await mkMission(page, `e2e-evidence-B-${uniq()}`);
+  // hold A's evidence response until B has rendered — labeled interception
+  let holdA: ((v: unknown) => void) | null = null;
+  const gateA = new Promise((res) => { holdA = res; });
+  await page.route(`**/api/missions/${a}/evidence`, async (route) => {
+    await gateA;
+    return route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify([{ kind: "AAA_STALE", payload: { mark: "A" }, evidence_hash: "h1", created_at: "2026-01-01T00:00:00" }]),
+    });
+  });
+  await page.route(`**/api/missions/${b}/evidence`, (route) =>
+    route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify([{ kind: "BBB_FRESH", payload: { mark: "B" }, evidence_hash: "h2", created_at: "2026-01-01T00:00:00" }]),
+    }));
+  await page.goto("/app/system/observability");
+  await page.getByRole("tab", { name: "Evidence" }).click();
+  const sel = page.getByLabel("select mission");
+  await sel.selectOption({ value: a });
+  await sel.selectOption({ value: b }); // switch before A resolves
+  await expect(page.getByText("BBB_FRESH")).toBeVisible();
+  holdA?.(null); // release A now
+  await page.waitForTimeout(500);
+  await expect(page.getByText("BBB_FRESH")).toBeVisible();
+  await expect(page.getByText("AAA_STALE")).toHaveCount(0);
+  // export carries the selected canonical mission id
+  const dl = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export evidence JSON" }).click();
+  const f = await dl;
+  const text = await (await import("node:fs")).promises.readFile(await f.path()!, "utf8");
+  expect(text).toContain(`"mission_id": "${b}"`);
+  expect(text).toContain("BBB_FRESH");
+  expect(text).not.toContain("AAA_STALE");
+});
+
+/* ---------------- Schedules ---------------- */
+
+test("schedules: global list renders, UTC label, zero tick calls", async ({ page }) => {
+  const posts = trackPosts(page);
+  const ticks: string[] = [];
+  page.on("request", (r) => { if (r.url().includes("/api/tick")) ticks.push(r.url()); });
+  await seedSession(page);
+  const g = `e2e-schedule-${uniq()}`;
+  const c = await api(page, "POST", "/schedules", { goal: g, cron: "0 9 * * *", name: `sched-${uniq()}` });
+  expect(c.ok).toBeTruthy();
+  await page.goto("/app/system/schedules");
+  await expect(page.getByText(/global, unfiltered/i)).toBeVisible();
+  await expect(page.getByText(/Cron semantics are/i)).toBeVisible();
+  await expect(page.getByText(g).first()).toBeVisible();
+  await expect(page.locator("section[aria-label='schedule list'] .tbl")).toBeVisible();
+  expect(ticks).toEqual([]);
+  expect(posts.filter((p) => !p.includes("/missions/"))).toEqual([]);
+});
+
+test("schedules: create requires confirmation; double-click = exactly one POST; refetch shows row", async ({ page }) => {
+  await seedSession(page);
+  const posts: string[] = [];
+  page.on("request", (r) => { if (r.method() === "POST" && r.url().endsWith("/api/schedules")) posts.push(r.url()); });
+  // hold the create POST in-flight so we can race a second click against
+  // the single-flight guard, then release it to the real backend.
+  let release: (() => void) | null = null;
+  const gate = new Promise<void>((res) => { release = res; });
+  await page.route("**/api/schedules", async (route, req) => {
+    if (req.method() === "POST") { await gate; return route.continue(); }
+    return route.continue();
+  });
+  const g = `e2e-schedule-create-${uniq()}`;
+  await page.goto("/app/system/schedules");
+  await page.getByLabel("Goal").fill(g);
+  await page.getByLabel("Cron (UTC)").fill("0 12 * * *");
+  const btn = page.getByRole("button", { name: "Create schedule…" });
+  await btn.click();
+  // explicit ConfirmDialog with the consequence text
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByText(/REAL mission/i)).toBeVisible();
+  const confirm = page.getByRole("button", { name: "Create schedule", exact: true });
+  // two synchronous clicks on the same node while the POST is held
+  // in-flight — the single-flight guard must drop the second.
+  await confirm.evaluate((el) => { (el as HTMLButtonElement).click(); (el as HTMLButtonElement).click(); });
+  release?.();
+  await expect(page.getByText(g).first()).toBeVisible({ timeout: 15000 });
+  expect(posts.length).toBe(1);
+});
+
+test("schedules: enable/disable/delete use pinned schedule identity + confirmation", async ({ page }) => {
+  await seedSession(page);
+  const g = `e2e-schedule-act-${uniq()}`;
+  const c = await api(page, "POST", "/schedules", { goal: g, cron: "0 10 * * *" });
+  expect(c.ok).toBeTruthy();
+  const sid = String((c.json.schedule ?? c.json).schedule_id);
+  const urls: string[] = [];
+  page.on("request", (r) => { if (r.method() === "POST") urls.push(r.url()); });
+  await page.goto("/app/system/schedules");
+  const row = page.locator("tr", { hasText: g });
+  // disable
+  await row.getByRole("button", { name: "Disable" }).click();
+  await expect(page.getByText(`DISABLE schedule ${sid}`)).toBeVisible();
+  await page.getByRole("button", { name: "Apply" }).click();
+  await expect(row.getByText("DISABLED")).toBeVisible({ timeout: 10000 });
+  // enable
+  await row.getByRole("button", { name: "Enable" }).click();
+  await expect(page.getByText(`ENABLE schedule ${sid}`)).toBeVisible();
+  await page.getByRole("button", { name: "Apply" }).click();
+  await expect(row.getByText("ENABLED")).toBeVisible({ timeout: 10000 });
+  // delete — destructive, pinned id
+  await row.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByText(`DELETE schedule ${sid}`)).toBeVisible();
+  await expect(page.getByText(/destructive/i)).toBeVisible();
+  await page.getByRole("button", { name: "Delete schedule" }).click();
+  await expect(page.getByText(g).first()).toHaveCount(0, { timeout: 10000 });
+  expect(urls.some((u) => u.includes(`/api/schedules/${sid}/disable`))).toBeTruthy();
+  expect(urls.some((u) => u.includes(`/api/schedules/${sid}/enable`))).toBeTruthy();
+  expect(urls.some((u) => u.includes(`/api/schedules/${sid}/delete`))).toBeTruthy();
+});
+
+test("schedules: failed mutation shows honest outcome, no auto-retry, canonical refetch", async ({ page }) => {
+  await seedSession(page);
+  const g = `e2e-schedule-fail-${uniq()}`;
+  const c = await api(page, "POST", "/schedules", { goal: g, cron: "0 11 * * *" });
+  expect(c.ok).toBeTruthy();
+  const sid = String((c.json.schedule ?? c.json).schedule_id);
+  let attempts = 0;
+  await page.route(`**/api/schedules/${sid}/disable`, (route) => {
+    attempts++;
+    return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "INTERNAL", detail: "boom" }) });
+  });
+  await page.goto("/app/system/schedules");
+  const row = page.locator("tr", { hasText: g });
+  await row.getByRole("button", { name: "Disable" }).click();
+  await page.getByRole("button", { name: "Apply" }).click();
+  await expect(page.getByText(/outcome not confirmed/i)).toBeVisible();
+  await page.waitForTimeout(600);
+  expect(attempts).toBe(1); // never auto-retried
+});
+
+/* ---------------- Cost & Usage ---------------- */
+
+test("cost: guard + monetary + policies + profiles render; zero POSTs; no secrets", async ({ page }) => {
+  const posts = trackPosts(page);
+  await seedSession(page);
+  await page.goto("/app/system/cost");
+  await expect(page.getByText("Remote dispatches today", { exact: true })).toBeVisible({ timeout: 10000 });
+  await expect(page.getByText(/executor_execution records/i)).toBeVisible();
+  await expect(page.getByText(/Cost halt/i).first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Cost policies" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Cost profiles" })).toBeVisible();
+  await expect(page.getByText(/a reservation is not spent money/i)).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
+test("cost: malformed policies read = error state, never fabricated empty", async ({ page }) => {
+  await seedSession(page);
+  await page.route("**/api/cost-policies", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ cost_policies: [null, {}] }) }));
+  await page.goto("/app/system/cost");
+  await expect(page.locator("section[aria-label='cost policies']").getByText("Canonical code: MALFORMED")).toBeVisible();
+  await expect(page.locator("section[aria-label='cost policies']").getByText("No cost policies")).toHaveCount(0);
+});
+
+/* ---------------- Settings ---------------- */
+
+test("settings: masked token editor, save → new requests use it, no token in DOM", async ({ page }) => {
+  await seedSession(page);
+  const seen: string[] = [];
+  page.on("request", (r) => seen.push(r.headers()["authorization"] ?? ""));
+  await page.goto("/app/system/settings");
+  const inp = page.getByLabel(/New token/i);
+  await expect(inp).toHaveAttribute("type", "password");
+  await expect(inp).toHaveValue(""); // stored token never rendered
+  await expect(page.getByText("configured")).toBeVisible();
+  await inp.fill("fresh-token-xyz");
+  await page.getByRole("button", { name: "Save token" }).click();
+  await expect(page.getByText(/Token saved/i)).toBeVisible();
+  // subsequent requests carry the new token
+  await page.getByRole("link", { name: "Schedules" }).click();
+  await expect(page.getByRole("heading", { name: "Schedules" })).toBeVisible();
+  expect(seen.some((a) => a === "Bearer fresh-token-xyz")).toBeTruthy();
+  // token never leaks into the rendered DOM
+  await expect(page.getByText("fresh-token-xyz")).toHaveCount(0);
+});
+
+test("settings: invalid token → honest Unauthorized state, never a prompt", async ({ page }) => {
+  await seedSession(page);
+  await page.goto("/app/system/settings");
+  let promptSeen = false;
+  page.on("dialog", (d) => { promptSeen = true; void d.dismiss(); });
+  await page.getByLabel(/New token/i).fill("bad-token");
+  await page.getByRole("button", { name: "Save token" }).click();
+  await page.getByRole("link", { name: "Schedules" }).click();
+  await expect(page.getByText("UNAUTHORIZED_MC_TOKEN", { exact: true }).first()).toBeVisible({ timeout: 10000 });
+  await page.waitForTimeout(300);
+  expect(promptSeen).toBe(false);
+});
+
+test("settings: operator id propagates to header + shell chip; theme stays synced", async ({ page }) => {
+  test.setTimeout(60000);
+  await seedSession(page);
+  const ops: string[] = [];
+  page.on("request", (r) => ops.push(r.headers()["x-operator-id"] ?? ""));
+  await page.goto("/app/system/settings");
+  await page.getByLabel(/x-operator-id/i).fill("op:settings-test");
+  await page.getByRole("button", { name: "Save operator id" }).click();
+  // AppShell chip reflects it immediately
+  await expect(page.getByText("op:settings-test").first()).toBeVisible();
+  // theme toggle syncs with the shell button's pair.theme contract
+  // (still on the Settings page — the control lives here)
+  await page.getByRole("button", { name: "toggle theme in settings" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  expect(await page.evaluate(() => localStorage.getItem("pair.theme"))).toBe("light");
+  await page.getByRole("button", { name: "toggle theme in settings" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  // subsequent requests carry the new operator id
+  await page.getByRole("link", { name: "Cost" }).click();
+  await expect(page.getByText("Remote dispatches today", { exact: true })).toBeVisible({ timeout: 10000 });
+  expect(ops.some((o) => o === "op:settings-test")).toBeTruthy();
+});
+
+test("settings: clear token requires confirmation; legacy link present; no credential backend POSTs", async ({ page }) => {
+  const posts = trackPosts(page);
+  await seedSession(page);
+  await page.goto("/app/system/settings");
+  await page.getByRole("button", { name: "Clear token…" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByText(/401 fail-closed/i)).toBeVisible();
+  await page.getByRole("button", { name: "Clear token", exact: true }).click();
+  await expect(page.getByText("unconfigured")).toBeVisible();
+  await expect(page.getByRole("link", { name: /legacy dashboard/i })).toBeVisible();
+  expect(posts.filter((p) => p.includes("/api/credentials"))).toEqual([]);
+});
+
+/* ---------------- Regression ---------------- */
+
+test("regression: legacy /providers /observability /schedules /chat still work", async ({ page }) => {
+  await seedSession(page);
+  await page.goto("/providers");
+  await expect(page.getByRole("heading", { name: "Providers & models" })).toBeVisible();
+  await page.goto("/observability");
+  await expect(page.getByRole("heading", { name: /Observability/ })).toBeVisible();
+  await page.goto("/schedules");
+  await expect(page.getByRole("heading", { name: "Schedules" })).toBeVisible();
+  await page.goto("/chat");
+  await expect(page.getByText(/Conversation|session/i).first()).toBeVisible();
+});
+
+test("regression: other /app routes unaffected + mobile layouts usable", async ({ page }) => {
+  await seedSession(page);
+  await page.goto("/app/missions");
+  await expect(page.getByRole("heading", { name: "Mission Operations" })).toBeVisible();
+  await page.goto("/app/chat");
+  await expect(page.getByText(/Conversation/i).first()).toBeVisible({ timeout: 10000 });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/app/system/providers");
+  await expect(page.getByRole("heading", { name: "Providers & Models" })).toBeVisible();
+  await page.goto("/app/system/schedules");
+  await expect(page.getByRole("heading", { name: "Schedules" })).toBeVisible();
+});

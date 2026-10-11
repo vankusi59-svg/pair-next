@@ -23,10 +23,9 @@ test("/app/company renders new shell + honest no-business state", async ({ page 
   }
 });
 
-test("placeholder pages exist for every unimplemented B4-B6 route", async ({ page }) => {
-  /* /app/company, /app/objectives*, /app/inbox, /app/ceo, /app/workforce*,
-     /app/missions*, /app/chat are real B2–B5 pages now — only
-     destinations still placeholder-honest. */
+test("no placeholder pages remain on the /app route tree", async ({ page }) => {
+  /* B5.5 implemented the last placeholder routes — every /app/system/*
+     destination is a real page now; assert none render the placeholder. */
   const routes: Array<[string, string]> = [
     ["/app/system/providers", "Providers & Models"],
     ["/app/system/observability", "Observability"],
@@ -37,7 +36,7 @@ test("placeholder pages exist for every unimplemented B4-B6 route", async ({ pag
   for (const [path, title] of routes) {
     await page.goto(path);
     await expect(page.getByRole("heading", { name: title })).toBeVisible();
-    await expect(page.getByText("Not implemented yet")).toBeVisible();
+    await expect(page.getByText("Not implemented yet")).toHaveCount(0);
   }
 });
 

@@ -14,6 +14,11 @@ import { Missions } from "./pages/Missions";
 import { MissionNew } from "./pages/MissionNew";
 import { MissionDetailPage } from "./pages/MissionDetail";
 import Chat from "./pages/Chat";
+import { SystemProviders } from "./pages/SystemProviders";
+import { SystemObservability } from "./pages/SystemObservability";
+import { SystemSchedules } from "./pages/SystemSchedules";
+import { SystemCost } from "./pages/SystemCost";
+import { SystemSettings } from "./pages/SystemSettings";
 
 /* /app/* route tree (B.2 sitemap). Every B2–B6 destination exists now as an
    honest placeholder so navigation, deep links and mobile nav are real;
@@ -91,53 +96,23 @@ export const appRoute = {
     },
     {
       path: "system/providers",
-      element: (
-        <PlannedPage
-          title="Providers & Models"
-          detail="Provider, model and routing views — ported from the current System surfaces."
-          phase="B5"
-        />
-      ),
+      element: <SystemProviders />,
     },
     {
       path: "system/observability",
-      element: (
-        <PlannedPage
-          title="Observability"
-          detail="Recovery, route decisions and the global event stream — a technical surface, never the company activity feed."
-          phase="B5"
-        />
-      ),
+      element: <SystemObservability />,
     },
     {
       path: "system/schedules",
-      element: (
-        <PlannedPage
-          title="Schedules"
-          detail="Mission schedules CRUD — ported verbatim."
-          phase="B5"
-        />
-      ),
+      element: <SystemSchedules />,
     },
     {
       path: "system/cost",
-      element: (
-        <PlannedPage
-          title="Cost & Usage"
-          detail="Cost counters and policy reads — controls land when their backend routes do."
-          phase="B5"
-        />
-      ),
+      element: <SystemCost />,
     },
     {
       path: "system/settings",
-      element: (
-        <PlannedPage
-          title="Settings"
-          detail="Session token + operator id editor (replaces the 401 window.prompt flow) and theme preference — same localStorage keys, no new auth semantics."
-          phase="B5"
-        />
-      ),
+      element: <SystemSettings />,
     },
   ],
 };

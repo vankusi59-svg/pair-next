@@ -57,6 +57,19 @@ export function streamStatus(): "open" | "closed" {
   return status;
 }
 
+/* P15.9-B5.5 Settings E5 — reconnect the shared stream after a credential
+   change so the token-query URL picks up the new token. Same single
+   canonical EventSource; no new SSE backend. */
+export function reconnectStream() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+  status = "closed";
+  onStatus?.(status);
+  ensure();
+}
+
 export function onStreamStatus(cb: (s: "open" | "closed") => void) {
   onStatus = cb;
 }

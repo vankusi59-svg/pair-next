@@ -135,7 +135,14 @@ function BusinessSwitcher() {
 }
 
 function OperatorChip() {
-  const op = getOperatorId();
+  /* B5.5 Settings E2 — the chip reflects a saved operator id immediately,
+     not just on next mount. */
+  const [op, setOp] = useState(getOperatorId);
+  useEffect(() => {
+    const sync = () => setOp(getOperatorId());
+    window.addEventListener("pair.operator-changed", sync);
+    return () => window.removeEventListener("pair.operator-changed", sync);
+  }, []);
   const label = op || "no operator";
   const initials = (op.replace(/^operator:/, "").slice(0, 2) || "?").toUpperCase();
   return (
