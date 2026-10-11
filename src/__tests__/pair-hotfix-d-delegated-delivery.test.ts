@@ -34,24 +34,54 @@
  * validatePlanProposal → bindPlanExternalInputs → assertPlanDataflow.
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, it, expect } from "vitest";
+import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
+  ApprovalQueue,
   assertPlanDataflow,
   assertTaskDeliverySemantic,
   bindPlanExternalInputs,
   canonicalBookkeepingTask,
   detectOutputLanguage,
   detectTelegramDeliveryIntent,
+  digest,
+  ExecutorRegistry,
   EXTERNAL_INPUT_CONTRACT,
+  GovernedTaskGate,
   injectDeliveryTaskForTrueOmission,
   isDeliveryTask,
   makeServePlanner,
+  MissionControl,
+  MissionObservability,
+  MissionRouter,
+  MissionRuntime,
+  MissionScheduler,
+  MissionSupervisor,
+  PAIR_DATAFLOW_SOURCES,
   PAIR_DELIVERY_INJECTION_KEY,
   PAIR_OUTPUT_LANGUAGE_KEY,
   PAIR_PLAN_CONTRACT_KEY,
+  PairControlPlane,
+  PairEvidenceStore,
+  pendingTelegramDeliveries,
+  ReconciliationService,
+  RecoveryController,
+  sha256Hex,
+  TELEGRAM_DELIVERY_ATTEMPT_RESOLVED,
+  TELEGRAM_DELIVERY_ATTEMPT_STARTED,
+  TELEGRAM_DELIVERY_MINTED,
   TELEGRAM_MANIFEST_FIELD,
+  TRANSPORT_IN_PROCESS,
+  transportTelegramDelivery,
+  utcnow,
   validatePlanProposal,
+  type DeliveryBackend,
   type ExternalInputArtifactSource,
+  type GovernedSendResult,
+  type GovernedTelegramTransport,
   type RuntimePlannerInput,
 } from "../pair/index.js";
 
@@ -498,5 +528,615 @@ describe("HOTFIX-D — delegated template path delivery planning", () => {
     expect(stampOf(viaTemplate)).toEqual(["DELIVERY_TASK_INJECTED"]);
     expect(deliveryTasks(viaCanon).length).toBe(1);
     expect(deliveryTasks(viaTemplate).length).toBe(1);
+  });
+});
+
+/* ==================== R1 AUDIT — evidence gaps F1/F2/F3 ==================== */
+
+/**
+ * AUDIT FOLLOW-UP R1 — three evidence gaps closed test-side only:
+ *  F1 — full integration: delegated mission planning (template fallback
+ *       + injection) → governed dispatch → assertDeliveryDeliverable →
+ *       mint → governed bridge transport against a RECORDING fake
+ *       (authorization callback + durable receipt proven, zero real send).
+ *  F2 — cross-mission dataflow: external artifact source binding,
+ *       consumed artifacts, producer edges, manifest and post-validation
+ *       plan integrity asserted field-by-field.
+ *  F3 — forged PAIR_DELIVERY_INJECTION_KEY through the REAL
+ *       canonicalizeLlmTasks seam, never the helper in isolation.
+ */
+
+const F1_CAPS = [
+  "AUTOMATON_TASK_EXECUTION",
+  "FILE_OPERATIONS",
+  "REASONING",
+  "TELEGRAM_DELIVERY",
+];
+
+/** Minimal production-shaped adapter: dispatches every task, writes the
+ *  files its dataflow `produces` declares, declares those bytes back as
+ *  canonical result artifacts through collect_result — the REAL ingest
+ *  seam the delivery gate consumes. */
+class F1Adapter implements ExecutorAdapter {
+  readonly executor_id: string;
+  caps: string[];
+  dispatched: string[] = [];
+  behavior: Record<string, "COMPLETE" | "WRITE"> = {};
+  fileContent: Record<string, string> = {};
+  workspace = "";
+  store?: PairEvidenceStore;
+  private wrote: Record<string, string[]> = {};
+  private collected: Record<string, Record<string, unknown>> = {};
+
+  constructor(id: string, caps: string[]) {
+    this.executor_id = id;
+    this.caps = caps;
+  }
+  probe() {
+    return { executor_id: this.executor_id, available: true, state: "READY" };
+  }
+  qualify() {
+    return { qualified: true, dispatch_enabled: true };
+  }
+  capabilities() {
+    return { capability_ids: this.caps };
+  }
+  health() {
+    return { state: "READY" };
+  }
+  prepare_task(task: Record<string, unknown>) {
+    return task;
+  }
+  dispatch(task: Record<string, unknown>) {
+    const eid = `EXEC_${this.executor_id}_${this.dispatched.length}`;
+    this.dispatched.push(eid);
+    // The governed-task payload carries task_id, not task_key — resolve
+    // the canonical task row for the key (production adapters do this).
+    const taskRow = this.store?.tryGet("task", String(task.task_id)) as
+      | Record<string, unknown>
+      | undefined;
+    const key = String(taskRow?.task_key ?? "");
+    // An honest executor produces every declared output — consumers of
+    // produced artifacts resolve them through canonical ingest. (Skipping
+    // produces makes downstream consumes unbound → DEPENDENCY_FAILURE.)
+    if (this.workspace) {
+      const df = (taskRow?.metadata as Record<string, unknown> | undefined)
+        ?.pair_dataflow as Record<string, unknown> | undefined;
+      for (const f of (df?.produces as string[]) ?? []) {
+        const fp = path.join(this.workspace, f);
+        fs.mkdirSync(path.dirname(fp), { recursive: true });
+        fs.writeFileSync(fp, this.fileContent[key] ?? `content of ${f}`);
+        (this.wrote[eid] ??= []).push(f);
+      }
+    }
+    this.collected[eid] = {
+      status: "COMPLETED",
+      mission_id: task.mission_id,
+      task_id: task.task_id,
+      governed_task_id: task.governed_task_id,
+      summary: `done ${key}`,
+    };
+    return { execution_id: eid, status: "RUNNING", run_root: null };
+  }
+  observe(executionId: string) {
+    return { status: String(this.collected[executionId]?.status ?? "RUNNING") };
+  }
+  cancel() {
+    return { status: "CANCELLED" };
+  }
+  collect_result(executionId: string) {
+    const r = this.collected[executionId] ?? {
+      status: "FAILED",
+      error: { class: "MISSING" },
+    };
+    const artifacts = (this.wrote[executionId] ?? [])
+      .map((f) => {
+        const fp = path.join(this.workspace, f);
+        if (!fs.existsSync(fp)) return null;
+        const bytes = fs.readFileSync(fp);
+        return { path: f, sha256: sha256Hex(bytes), byte_size: bytes.length };
+      })
+      .filter((a): a is NonNullable<typeof a> => a !== null);
+    return { execution_id: executionId, artifacts, ...r };
+  }
+  collect_artifacts() {
+    return [] as Array<Record<string, unknown>>;
+  }
+}
+
+const F1_VI_TEXT =
+  "Bản tóm tắt thị trường XAUUSD.\n" +
+  "Giá vàng biến động mạnh trong tuần qua với xu hướng tăng ngắn hạn.\n" +
+  "Nguồn dữ liệu đã được kiểm chứng trước khi đăng.";
+
+/** A full governed stack whose ONLY planner is the production
+ *  makeServePlanner — the delegated mission carries no pinned plan and
+ *  no llm_plan, so planning takes the template-fallback injection path
+ *  end-to-end for real. */
+function f1Stack(name: string) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pair-hotfixd-f1-${name}-`));
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+  const service = new PairControlPlane(store);
+  const gate = new GovernedTaskGate(service);
+  const registry = new ExecutorRegistry(service);
+  const router = new MissionRouter(service, gate);
+  const recovery = new RecoveryController(service);
+  const recon = new ReconciliationService(service, new Map());
+  const approvals = new ApprovalQueue(service);
+  const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
+  const adapters = new Map<string, ExecutorAdapter>();
+  const { planner } = makeServePlanner({
+    hasExecutor: () => true,
+    executorCapSets: () => [F1_CAPS],
+  });
+  const runtime = new MissionRuntime({
+    service, gate, router, adapters: adapters as never, scheduler,
+    approvals, reconciliation: recon, recovery, planner: planner as never,
+    telegramDeliveryDefaultChatId: "111",
+  });
+  const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
+  const control = new MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability: new MissionObservability(service),
+    planner: planner as never,
+  });
+  for (const cap of F1_CAPS) {
+    service.registerCapability(cap, { risk_class: "LOW" });
+  }
+  const projectId = String(
+    service.createProject({ name, root_location: workspace }).project_id,
+  );
+  return {
+    dir, workspace, store, service, gate, registry, router, recovery,
+    recon, approvals, scheduler, runtime, supervisor, control, adapters,
+    projectId,
+  };
+}
+
+function f1RegisterAdapter(
+  ctx: ReturnType<typeof f1Stack>,
+  adapter: F1Adapter,
+) {
+  adapter.workspace = ctx.workspace;
+  adapter.store = ctx.store;
+  ctx.registry.register({
+    executor_id: adapter.executor_id,
+    executor_type: "EXTERNAL",
+    capabilities: adapter.caps,
+    health_state: "READY",
+    status: "ENABLED",
+    metadata: {
+      routing_priority: 50,
+      transport_type: TRANSPORT_IN_PROCESS,
+      qualification_state: "QUALIFIED",
+      permission_modes: ["READ", "WRITE", "FILE_READ", "FILE_WRITE"],
+      workspace_modes: ["EXPLICIT_WORKSPACE"],
+      supports_cancel: true,
+      max_concurrency: 4,
+    },
+  });
+  const routeId = `RTE_${adapter.executor_id}`;
+  ctx.service.routes.registerRoute({
+    route_id: routeId,
+    route_kind: "IN_PROCESS_RUNTIME",
+    enabled: true,
+    eligibility_state: "QUALIFIED",
+    qualification_state: "QUALIFIED",
+    direct_callable: true,
+    capabilities: adapter.caps,
+    priority: 50,
+    executor_hint: adapter.executor_id,
+  });
+  ctx.service.routes.registerBinding({
+    executor_id: adapter.executor_id,
+    route_id: routeId,
+    mechanism: "SPAWN_ENV",
+    qualification_state: "QUALIFIED",
+    capabilities: adapter.caps,
+  });
+  ctx.adapters.set(adapter.executor_id, adapter);
+}
+
+function f1Drive(ctx: ReturnType<typeof f1Stack>, mid: string, max = 160) {
+  let t = Date.parse("2026-01-01T00:00:00Z");
+  for (let i = 0; i < max; i++) {
+    t += 120_000;
+    ctx.runtime.tick(mid, new Date(t).toISOString());
+    const s = String(
+      (ctx.store.get("mission_runtime", `MRT_${mid}`) as Record<
+        string,
+        unknown
+      >).state,
+    );
+    if (
+      ["COMPLETED", "FAILED", "ABORTED", "WAITING_APPROVAL", "CANCELLED"]
+        .includes(s)
+    ) {
+      return s;
+    }
+  }
+  return "TIMEOUT";
+}
+
+const f1Deliveries = (ctx: ReturnType<typeof f1Stack>) =>
+  ctx.store.list("telegram_delivery_request");
+const f1Evidence = (
+  ctx: ReturnType<typeof f1Stack>,
+  mid: string,
+  kind: string,
+) =>
+  ctx.store.listEvidence(mid).filter((e) => String(e.kind) === kind);
+
+interface F1SendCall {
+  chatId: string;
+  text?: string;
+  filePath?: string;
+  fileBytes?: Uint8Array;
+  name?: string;
+}
+function f1RecordingTransport() {
+  const calls: F1SendCall[] = [];
+  const transport: GovernedTelegramTransport = {
+    send: async (a: F1SendCall): Promise<GovernedSendResult> => {
+      calls.push({ ...a });
+      return { kind: "ok", message_id: 4242 };
+    },
+  };
+  return { calls, transport };
+}
+
+function f1Backend(ctx: ReturnType<typeof f1Stack>, req: Record<string, unknown>) {
+  const t = (artifact: string | null | undefined, body: Record<string, unknown>) =>
+    ctx.control.transitionTelegramDelivery(String(req.delivery_id), {
+      artifact,
+      ...body,
+    });
+  const backend: DeliveryBackend = {
+    begin: (a) => {
+      const r = t(a, { to: "SENDING" }) as { acquired: boolean };
+      return { acquired: r.acquired === true };
+    },
+    sent: (a, ev) => t(a, { to: "SENT", message_id: ev?.message_id ?? null }),
+    failed: (a, err) => t(a, { to: "FAILED", error: err }),
+    unknown: (a, err) => t(a, { to: "UNKNOWN", error: err }),
+    unsendable: (reason) => t(null, { to: "UNSENDABLE", error: reason }),
+  };
+  return backend;
+}
+
+describe("HOTFIX-D R1 — audit evidence gaps", () => {
+  it("F1. delegated TRUE-intent mission runs planning→dispatch→mint→governed bridge end-to-end: authorization consulted, canonical payload sent, durable receipt minted — zero real network", async () => {
+    const ctx = f1Stack("send");
+    const adapter = new F1Adapter("EX_D", F1_CAPS);
+    // The injected T3 composes outbox/report.txt (DELIVERY_TEXT_ARTIFACT)
+    // exactly as its canonical instruction prescribes.
+    adapter.behavior = { T3: "WRITE" };
+    adapter.fileContent = { T3: F1_VI_TEXT };
+    f1RegisterAdapter(ctx, adapter);
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: BUG4_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: {}, // delegated shape — no pinned_plan_tasks, no llm_plan
+    });
+    const mid = String(m.mission_id);
+    expect(f1Drive(ctx, mid)).toBe("COMPLETED");
+
+    // The plan that committed came from the template+injection path:
+    // exactly one delivery task T3 was dispatched and settled.
+    const tasks = ctx.store
+      .list("task")
+      .filter((t) => String(t.mission_id) === mid);
+    const t3 = tasks.find(
+      (t) =>
+        (t.required_capabilities as string[]).includes("TELEGRAM_DELIVERY"),
+    )!;
+    expect(String(t3.status)).toBe("COMPLETED");
+    expect(
+      String(
+        ((t3.metadata as Record<string, unknown>)[
+          PAIR_DELIVERY_INJECTION_KEY
+        ] as Record<string, unknown>).reason,
+      ),
+    ).toBe("DELIVERY_TASK_INJECTED");
+
+    // Governed mint: exactly one canonical send authorization, TEXT mode,
+    // payload = the staged artifact bytes, provenance bound.
+    const reqs = f1Deliveries(ctx);
+    expect(reqs).toHaveLength(1);
+    const req = reqs[0]!;
+    expect(String(req.mode)).toBe("TEXT");
+    // VALIDATED === SENT: the persisted payload digests itself and
+    // carries the staged Vietnamese content end-to-end.
+    const reqText = String(req.text);
+    expect(reqText).toContain("Bản tóm tắt thị trường XAUUSD");
+    expect(String(req.text_sha256)).toBe(digest(reqText));
+    expect(Number(req.text_length)).toBe(reqText.length);
+    expect(String(req.text_source_artifact)).toBe("outbox/report.txt");
+    expect(
+      f1Evidence(ctx, mid, TELEGRAM_DELIVERY_MINTED).length,
+    ).toBeGreaterThan(0);
+
+    // Governed bridge pass — a recording transport, never real Telegram.
+    const rec = f1RecordingTransport();
+    const allowed: string[] = [];
+    const pending = pendingTelegramDeliveries(ctx.store) as Array<
+      Record<string, unknown>
+    >;
+    expect(pending).toHaveLength(1);
+    const r = await transportTelegramDelivery({
+      request: pending[0]!,
+      transport: rec.transport,
+      isAllowed: (chatId: string) => {
+        allowed.push(chatId);
+        return chatId === "111"; // allowlist semantics under test
+      },
+      backend: f1Backend(ctx, pending[0]!),
+      readText: (p) => fs.readFileSync(p, "utf8"),
+    });
+    // Authorization WAS consulted for the bound destination.
+    expect(allowed).toEqual(["111"]);
+    // Exactly one send, the canonical payload, to the bound chat.
+    expect(r.sent).toEqual([`TEXT:${String(req.delivery_id)}`]);
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.chatId).toBe("111");
+    expect(String(rec.calls[0]!.text)).toContain(
+      "Bản tóm tắt thị trường XAUUSD",
+    );
+    // Durable receipt: request SENT with acceptance message_id and the
+    // immutable attempt ledger records STARTED→RESOLVED(SENT).
+    const after = ctx.store.get(
+      "telegram_delivery_request",
+      String(req.delivery_id),
+    );
+    expect(String(after.status)).toBe("SENT");
+    expect(Number(after.message_id)).toBe(4242);
+    expect(
+      f1Evidence(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_STARTED).length,
+    ).toBeGreaterThan(0);
+    const resolved = f1Evidence(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED);
+    expect(resolved.length).toBeGreaterThan(0);
+    expect(
+      String(
+        (resolved[0]!.payload as Record<string, unknown>).outcome ??
+          JSON.stringify(resolved[0]!.payload),
+      ),
+    ).toContain("SENT");
+    // Idempotent: a second projection pass sends nothing.
+    const again = pendingTelegramDeliveries(ctx.store);
+    expect(again).toHaveLength(0);
+  });
+
+  it("F1b. the same request through a DENYING authorization gate → unsendable, zero transport calls", async () => {
+    const ctx = f1Stack("deny");
+    const adapter = new F1Adapter("EX_D", F1_CAPS);
+    adapter.behavior = { T3: "WRITE" };
+    adapter.fileContent = { T3: F1_VI_TEXT };
+    f1RegisterAdapter(ctx, adapter);
+    const m = ctx.control.startMission({
+      project_id: ctx.projectId,
+      goal: BUG4_GOAL,
+      granted_permissions: ["FILE_WRITE", "FILE_READ"],
+      authorized_workspaces: [ctx.workspace],
+      metadata: {},
+    });
+    const mid = String(m.mission_id);
+    expect(f1Drive(ctx, mid)).toBe("COMPLETED");
+    const pending = pendingTelegramDeliveries(ctx.store) as Array<
+      Record<string, unknown>
+    >;
+    expect(pending).toHaveLength(1);
+    const rec = f1RecordingTransport();
+    const r = await transportTelegramDelivery({
+      request: pending[0]!,
+      transport: rec.transport,
+      isAllowed: () => false, // destination denied — bridge must hold
+      backend: f1Backend(ctx, pending[0]!),
+      readText: (p) => fs.readFileSync(p, "utf8"),
+    });
+    expect(r.sent).toEqual([]);
+    expect(r.held).toBe(true);
+    expect(rec.calls).toHaveLength(0);
+    const after = ctx.store.get(
+      "telegram_delivery_request",
+      String(pending[0]!.delivery_id),
+    );
+    expect(String(after.status)).toBe("UNSENDABLE");
+    expect(
+      f1Evidence(ctx, mid, TELEGRAM_DELIVERY_ATTEMPT_RESOLVED).length,
+    ).toBe(0);
+  });
+
+  it("F2. cross-mission external input through the injected path — binding provenance, consumed artifact, producer edges, manifest and post-validation integrity", () => {
+    const external: ExternalInputArtifactSource = {
+      contract: EXTERNAL_INPUT_CONTRACT,
+      artifact_id: "ART_SRC_1",
+      logical_name: "producer_report.txt",
+      sha256: "a".repeat(64),
+      byte_size: 128,
+      source_mission_id: "MSN_PRODUCER",
+      source_task_id: "TSK_PRODUCER",
+      source_governed_task_id: "GTSK_PRODUCER",
+      source_execution_id: "EXE_PRODUCER",
+      source_executor_id: "EX_PRODUCER",
+    };
+    // A planner-emitted consumer whose instruction references the
+    // external artifact by canonical logical name — the REAL
+    // canonicalize seam derives the consume and stamps the binding.
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    const out = canonicalizeLlmTasks(
+      [
+        {
+          task_key: "T2",
+          title: "verify input",
+          task_instruction:
+            "read producer_report.txt, verify it, write analysis.txt, then reply DONE.",
+          required_capabilities: ["REASONING"],
+          depends_on: ["T1"],
+          metadata: {},
+        },
+      ],
+      SIMPLE_TRUE_GOAL,
+      { external_input_artifacts: [external] },
+    ) as Array<Record<string, unknown>>;
+
+    // Source binding: the consuming task carries the full provenance
+    // ledger — artifact identity, digest and complete producer lineage.
+    const t2 = out.find((t) => String(t.task_key) === "T2")!;
+    const t2df = (t2.metadata as Record<string, unknown>)
+      .pair_dataflow as Record<string, unknown>;
+    expect(t2df.consumes).toEqual(["producer_report.txt"]);
+    const stamps = (t2.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES
+    ] as Array<Record<string, unknown>>;
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]).toMatchObject({
+      contract: EXTERNAL_INPUT_CONTRACT,
+      consume_name: "producer_report.txt",
+      artifact_id: "ART_SRC_1",
+      logical_name: "producer_report.txt",
+      sha256: "a".repeat(64),
+      byte_size: 128,
+      source_mission_id: "MSN_PRODUCER",
+      source_task_id: "TSK_PRODUCER",
+      source_governed_task_id: "GTSK_PRODUCER",
+      source_execution_id: "EXE_PRODUCER",
+      source_executor_id: "EX_PRODUCER",
+    });
+
+    // Producer edges: the injected delivery task still hangs off the
+    // content-bearing producer — DAG: T1 → T2 → T3 (delivery leaf).
+    const t3 = deliveryTasks(out)[0]!;
+    expect(t3.depends_on).toEqual(["T2"]);
+    const t3df = (t3.metadata as Record<string, unknown>)
+      .pair_dataflow as Record<string, unknown>;
+    expect(t3df.produces).toEqual(["outbox/report.txt"]);
+
+    // Manifest: governed delivery manifest stamped on the injected task.
+    const manifest = (t3.metadata as Record<string, unknown>)[
+      TELEGRAM_MANIFEST_FIELD
+    ] as Record<string, unknown>;
+    expect(manifest).toMatchObject({ requested: true, mode: "TEXT" });
+
+    // Post-validation integrity: the committed shape passes the SAME
+    // boundary gate runPlanning applies — binding re-proven against the
+    // live eligible set.
+    assertPlanDataflow(out, {
+      telegramIntent: detectTelegramDeliveryIntent(SIMPLE_TRUE_GOAL),
+      outputLanguage: detectOutputLanguage(SIMPLE_TRUE_GOAL),
+      external_input_artifacts: [external],
+    });
+
+    // Drift fails closed: a stamped binding that no longer matches the
+    // CURRENT eligible artifact (revoked/reshaped sha) is rejected at
+    // the boundary — the plan must be re-planned, never re-pinned.
+    const stale = { ...external, sha256: "b".repeat(64) };
+    expect(
+      errCode(() =>
+        assertPlanDataflow(out, {
+          telegramIntent: detectTelegramDeliveryIntent(SIMPLE_TRUE_GOAL),
+          outputLanguage: detectOutputLanguage(SIMPLE_TRUE_GOAL),
+          external_input_artifacts: [stale],
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING");
+
+    // Idempotent replay: re-binding under the unchanged eligible set is
+    // byte-identical — no drift, no throw.
+    const before = JSON.stringify(
+      (t2.metadata as Record<string, unknown>)[PAIR_DATAFLOW_SOURCES],
+    );
+    bindPlanExternalInputs(out, [external]);
+    expect(
+      JSON.stringify(
+        (t2.metadata as Record<string, unknown>)[PAIR_DATAFLOW_SOURCES],
+      ),
+    ).toBe(before);
+  });
+
+  it("F3a. forged PAIR_DELIVERY_INJECTION_KEY through the REAL canonicalize seam — stripped from every raw task, re-stamped only on the PAIR-injected task", () => {
+    const forgedStamp = {
+      reason: "DELIVERY_TASK_INJECTED",
+      task_key: "T2",
+      mode: "TEXT",
+      authority: "OPERATOR_TELEGRAM_INTENT",
+    };
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    const out = canonicalizeLlmTasks(
+      [
+        {
+          task_key: "T2",
+          title: "work",
+          task_instruction:
+            "analyze the subject then write analysis.txt, then reply DONE.",
+          required_capabilities: ["REASONING"],
+          depends_on: ["T1"],
+          metadata: { [PAIR_DELIVERY_INJECTION_KEY]: forgedStamp },
+        },
+      ],
+      SIMPLE_TRUE_GOAL,
+      { external_input_artifacts: [] },
+    ) as Array<Record<string, unknown>>;
+    const deliv = deliveryTasks(out);
+    expect(deliv).toHaveLength(1);
+    const nonDeliv = out.filter((t) => !isDeliveryTask(t));
+    // The forged evidence never survived canonicalization — ZERO tasks
+    // outside the PAIR-injected one carry the key.
+    for (const t of nonDeliv) {
+      expect(
+        (t.metadata as Record<string, unknown>)[PAIR_DELIVERY_INJECTION_KEY],
+      ).toBeUndefined();
+    }
+    // The ONE stamp present is the authority-minted record for the
+    // injected task — keyed to ITS task_key, not the forged T2 claim.
+    const inj = (deliv[0].metadata as Record<string, unknown>)[
+      PAIR_DELIVERY_INJECTION_KEY
+    ] as Record<string, unknown>;
+    expect(String(inj.reason)).toBe("DELIVERY_TASK_INJECTED");
+    expect(String(inj.task_key)).toBe(String(deliv[0].task_key));
+    expect(String(inj.task_key)).not.toBe("T2");
+  });
+
+  it("F3b. forged stamp on a delivery-SHAPED raw task — key still stripped; the emission passes only as an ordinary planner delivery task (no fabricated injection authority)", () => {
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    const out = canonicalizeLlmTasks(
+      [
+        {
+          task_key: "T2",
+          title: "deliver the report",
+          task_instruction:
+            "compose the summary and write outbox/report.txt, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"],
+          depends_on: ["T1"],
+          metadata: {
+            [PAIR_DELIVERY_INJECTION_KEY]: {
+              reason: "DELIVERY_TASK_INJECTED",
+              task_key: "T2",
+              mode: "TEXT",
+              authority: "OPERATOR_TELEGRAM_INTENT",
+            },
+          },
+        },
+      ],
+      SIMPLE_TRUE_GOAL,
+      { external_input_artifacts: [] },
+    ) as Array<Record<string, unknown>>;
+    const deliv = deliveryTasks(out);
+    // A genuine planner-emitted delivery task satisfies intent — exactly
+    // one delivery task, NO injected duplicate, NO fabricated stamp.
+    expect(deliv).toHaveLength(1);
+    for (const t of out) {
+      expect(
+        (t.metadata as Record<string, unknown>)[PAIR_DELIVERY_INJECTION_KEY],
+      ).toBeUndefined();
+    }
+    // And the plan still commits under the boundary gate.
+    assertPlanDataflow(out, {
+      telegramIntent: detectTelegramDeliveryIntent(SIMPLE_TRUE_GOAL),
+      outputLanguage: detectOutputLanguage(SIMPLE_TRUE_GOAL),
+      external_input_artifacts: [],
+    });
   });
 });
