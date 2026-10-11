@@ -135,7 +135,14 @@ function BusinessSwitcher() {
 }
 
 function OperatorChip() {
-  const op = getOperatorId();
+  /* B5.5 Settings E2 — the chip reflects a saved operator id immediately,
+     not just on next mount. */
+  const [op, setOp] = useState(getOperatorId);
+  useEffect(() => {
+    const sync = () => setOp(getOperatorId());
+    window.addEventListener("pair.operator-changed", sync);
+    return () => window.removeEventListener("pair.operator-changed", sync);
+  }, []);
   const label = op || "no operator";
   const initials = (op.replace(/^operator:/, "").slice(0, 2) || "?").toUpperCase();
   return (
@@ -196,6 +203,21 @@ function InboxCountsProvider(props: { children: ReactNode }) {
   }
 
   useEffect(() => onInboxInvalidate(() => setEpoch((n) => n + 1)), []);
+
+  /* B5.5 R1-F3 — credential changes are credential-scoped invalidation:
+     a saved operator id or a saved/cleared token bumps the epoch, so a
+     resolution fetched under the previous credential can never repaint
+     (its forEpoch is stale at the render boundary) and the badge
+     refetches under the new header. */
+  useEffect(() => {
+    const bump = () => setEpoch((n) => n + 1);
+    window.addEventListener("pair.operator-changed", bump);
+    window.addEventListener("pair.credentials-changed", bump);
+    return () => {
+      window.removeEventListener("pair.operator-changed", bump);
+      window.removeEventListener("pair.credentials-changed", bump);
+    };
+  }, []);
 
   useEffect(() => {
     const ctl = new AbortController();
