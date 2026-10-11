@@ -72,10 +72,13 @@ export function ObjectiveDetail() {
     | { kind: "error"; err: ApiError }
   >({ kind: "loading" });
   const [polTick, setPolTick] = useState(0);
-  /* idempotency keys live per logical operation, keyed by
-     action:objective — a retry of the SAME operation reuses the key;
-     a different action or a route change gets a fresh one. */
-  const idemKeys = useRef<Record<string, string>>({});
+  /* Exact-body retry store: the submitted mutation body is kept
+     verbatim (action, policy_version, limits, halt params,
+     idempotency key) keyed by operation signature. An ambiguous
+     transport failure retries the identical bytes; a definitive CAS
+     conflict or a committed result discards the stored op so the next
+     confirmation mints a fresh operation. */
+  const pendingOps = useRef<Record<string, Parameters<typeof api.autoPolicyControlApp>[1]>>({});
   /* Monotonic op token: a resolution whose token is no longer current
      (dialog context invalidated by navigation) never touches this
      view's state — the committed backend mutation stands, but this
@@ -90,7 +93,7 @@ export function ObjectiveDetail() {
     setDlg(null);
     setMutBusy(false);
     setPolSt({ kind: "loading" });
-    idemKeys.current = {};
+    pendingOps.current = {};
     opSeq.current++;
   }, [biz, id]);
 
@@ -123,7 +126,15 @@ export function ObjectiveDetail() {
       .autoPolicyStatusApp(id, ctl.signal)
       .then((r) => {
         if (ctl.signal.aborted) return;
-        setPolSt({ kind: "ready", data: r.auto_policy, forId: id });
+        /* Fail-closed identity: a status whose canonical identity is
+           not THIS objective/business can never authorize controls —
+           render as a typed failure, same contract as the cockpit. */
+        const ap = r.auto_policy;
+        if (String(ap.objective_id) !== id || String(ap.business_id) !== biz) {
+          setPolSt({ kind: "error", err: new ApiError(0, "IDENTITY_MISMATCH", "auto-policy response identity does not match this objective/business — controls stay blocked.") });
+        } else {
+          setPolSt({ kind: "ready", data: ap, forId: id });
+        }
       })
       .catch((e: unknown) => {
         if (ctl.signal.aborted) return;
@@ -165,50 +176,55 @@ export function ObjectiveDetail() {
     const ctx = { biz: dlg.biz, oid: dlg.oid };
     const { action, policyVersion } = dlg;
     const seq = ++opSeq.current;
-    const body: Parameters<typeof api.autoPolicyControlApp>[1] = { action, idempotency_key: "" };
-    /* CAS: the version captured when the dialog opened. First
-       configure on an absent policy is the only call allowed to
-       omit policy_version. */
-    if (policyVersion !== null) body.policy_version = policyVersion;
-    if (action === "halt") {
-      body.halt_scope = "OBJECTIVE";
-      body.halt_reason = "owner halt via company cockpit";
-    }
-    if (action === "configure") {
-      const limits: { expires_at: string; max_ceo_calls?: number; max_missions?: number; budget_microusd_cap?: number } = {
-        expires_at: polLimits.expires ? new Date(polLimits.expires).toISOString() : "",
-      };
-      if (polLimits.ceo.trim()) limits.max_ceo_calls = Number(polLimits.ceo);
-      if (polLimits.missions.trim()) limits.max_missions = Number(polLimits.missions);
-      if (polLimits.budget.trim()) limits.budget_microusd_cap = Math.round(Number(polLimits.budget) * 1e6);
-      if (!limits.expires_at || (limits.max_ceo_calls === undefined && limits.max_missions === undefined && limits.budget_microusd_cap === undefined)) {
-        setMutNote("Configure rejected: limits need expires_at plus at least one cap (max_ceo_calls | max_missions | budget_microusd_cap).");
-        return;
+    /* Operation signature: action + identity + CAS version + limit
+       semantics. A retry of the SAME operation replays the stored
+       body verbatim; any changed field is a different operation. */
+    const sig = `${action}:${ctx.oid}:${policyVersion ?? "none"}:${action === "configure" ? JSON.stringify(polLimits) : ""}`;
+    let body = pendingOps.current[sig];
+    if (!body) {
+      body = { action, idempotency_key: crypto.randomUUID() };
+      /* CAS: the version captured when the dialog opened. First
+         configure on an absent policy is the only call allowed to
+         omit policy_version. */
+      if (policyVersion !== null) body.policy_version = policyVersion;
+      if (action === "halt") {
+        body.halt_scope = "OBJECTIVE";
+        body.halt_reason = "owner halt via company cockpit";
       }
-      body.limits = limits;
+      if (action === "configure") {
+        const limits: { expires_at: string; max_ceo_calls?: number; max_missions?: number; budget_microusd_cap?: number } = {
+          expires_at: polLimits.expires ? new Date(polLimits.expires).toISOString() : "",
+        };
+        if (polLimits.ceo.trim()) limits.max_ceo_calls = Number(polLimits.ceo);
+        if (polLimits.missions.trim()) limits.max_missions = Number(polLimits.missions);
+        if (polLimits.budget.trim()) limits.budget_microusd_cap = Math.round(Number(polLimits.budget) * 1e6);
+        if (!limits.expires_at || (limits.max_ceo_calls === undefined && limits.max_missions === undefined && limits.budget_microusd_cap === undefined)) {
+          setMutNote("Configure rejected: limits need expires_at plus at least one cap (max_ceo_calls | max_missions | budget_microusd_cap).");
+          return;
+        }
+        body.limits = limits;
+      }
+      pendingOps.current[sig] = body;
     }
-    /* Idempotency binding: a logical operation = action + identity +
-       request semantics. Retrying the SAME op reuses the key; editing
-       limits or choosing another action mints a fresh operation. */
-    const sig = `${action}:${ctx.oid}:${action === "configure" ? JSON.stringify(body.limits) : ""}`;
-    if (!idemKeys.current[sig]) idemKeys.current[sig] = crypto.randomUUID();
-    body.idempotency_key = idemKeys.current[sig];
     setDlg(null); setMutBusy(true); setMutNote(null);
     api.autoPolicyControlApp(ctx.oid, body)
       .then(() => {
-        delete idemKeys.current[sig];
+        delete pendingOps.current[sig];
         setPolTick((n) => n + 1);
         settle(seq, ctx, `Policy ${action} committed — projection refreshed.`, "")(null, false);
       })
       .catch((e: unknown) => {
-        /* CAS conflict: the stored policy moved — pull canonical state
-           so the card re-derives legal actions from truth, then leave
-           the operation's key in place for a same-body retry. */
+        /* Definitive CAS conflict: discard the stale operation,
+           refetch canonical state — the next attempt requires a new
+           confirmation (and mints a new operation). */
         if (e instanceof ApiError && e.status === 409) {
+          delete pendingOps.current[sig];
           refetch();
           setPolTick((n) => n + 1);
+          settle(seq, ctx, "", `Policy ${action} conflict — canonical state refreshed, re-confirm as a new operation`)(e, true);
+          return;
         }
-        settle(seq, ctx, "", `Policy ${action} failed (same idempotency key kept for retry)`)(e, true);
+        settle(seq, ctx, "", `Policy ${action} failed (same operation kept for exact-body retry)`)(e, true);
       });
   };
 
@@ -255,7 +271,12 @@ export function ObjectiveDetail() {
      snapshot is only the loading fallback. Button legality and CAS
      version always derive from this merged view. */
   const polCanon = polSt.kind === "ready" && polSt.forId === id ? polSt.data : null;
+  /* `pol` = observation only (canonical when loaded, else cockpit
+     snapshot — labeled non-authoritative). `polCtl` = the only thing
+     allowed to authorize a mutation button: a verified canonical
+     status for THIS identity. Until it exists, controls stay closed. */
   const pol = polCanon ?? c.auto_policy;
+  const polCtl = polCanon;
 
   /* datetime-local needs "YYYY-MM-DDTHH:mm" — prefill the configure
      window from the objective deadline only when it is a real future
@@ -280,7 +301,7 @@ export function ObjectiveDetail() {
       action: a,
       biz: biz!,
       oid: id,
-      policyVersion: pol?.configured ? (pol.policy_version ?? null) : null,
+      policyVersion: polCtl?.configured ? (polCtl.policy_version ?? null) : null,
     });
   };
 
@@ -435,6 +456,7 @@ export function ObjectiveDetail() {
               <span className="note">
                 v{pol.policy_version ?? "—"} · effective {String(pol.effective)}
                 {pol.expires_at ? ` · expires ${String(pol.expires_at).slice(0, 16).replace("T", " ")}` : ""}
+                {!polCanon ? " · snapshot — canonical status still loading" : ""}
               </span>
             </>
           )}
@@ -454,9 +476,9 @@ export function ObjectiveDetail() {
           <span className="tt">driver</span>
           {polCanon ? (
             polCanon.driver_ready ? (
-              <><StatusBadge tone="ok" label="READY" /><span className="note">driver admitted this objective — running within the policy window</span></>
+              <><StatusBadge tone="ok" label="READY" /><span className="note">eligible — the driver may act on this objective</span></>
             ) : (
-              <><StatusBadge tone="warn" label="NOT RUNNING" /><span className="note">{(polCanon.driver_missing ?? []).join(", ") || "driver not ready"}</span></>
+              <><StatusBadge tone="warn" label="NOT READY" /><span className="note">{(polCanon.driver_missing ?? []).join(", ") || "driver reports no missing reasons"}</span></>
             )
           ) : (
             <span className="note">{c.auto_driver ? `status: ${JSON.stringify(c.auto_driver.status)}` : "not configured"}</span>
@@ -473,13 +495,22 @@ export function ObjectiveDetail() {
           <div className="nrow"><span className="tt">reasons</span><span className="note">{pol.reasons.join(", ")}</span></div>
         ) : null}
         {polSt.kind === "error" ? (
-          <div className="nrow"><span className="tt">status fetch</span><span className="note">{polSt.err.code}: {polSt.err.detail}</span></div>
+          <div className="nrow">
+            <span className="tt">status fetch</span>
+            <span className="note">{polSt.err.code}: {polSt.err.detail} — policy mutations blocked until a canonical status loads.</span>
+            <button className="ghost" onClick={() => setPolTick((n) => n + 1)}>Retry status</button>
+          </div>
+        ) : null}
+        {polSt.kind === "loading" ? (
+          <div className="nrow"><span className="tt">status fetch</span><span className="note">loading canonical status — controls stay closed until verified.</span></div>
         ) : null}
       </div>
       <div className="actions">
-        {(!pol?.configured ? ["configure"] : Object.keys(POLICY_TRANSITIONS).filter((a) => POLICY_TRANSITIONS[a].includes(String(pol.state)))).map((a) => (
+        {polCtl === null ? null : (
+          !polCtl.configured ? ["configure"] : Object.keys(POLICY_TRANSITIONS).filter((a) => POLICY_TRANSITIONS[a].includes(String(polCtl.state)))
+        ).map((a) => (
           <button key={a} className="ghost" disabled={mutBusy} onClick={() => openPolicyDlg(a)}>
-            {a === "configure" && pol?.state === "EXPIRED" ? "Re-arm policy (new limits)" : (POLICY_LABELS[a] ?? a)}
+            {a === "configure" && polCtl.state === "EXPIRED" ? "Re-arm policy (new limits)" : (POLICY_LABELS[a] ?? a)}
           </button>
         ))}
       </div>
