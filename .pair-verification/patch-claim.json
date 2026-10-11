@@ -1,20 +1,20 @@
 {
-  "claim_id": "HOTFIX_B_GOVERNED_REDISPATCH_AFTER_UNBLOCK",
-  "title": "Governed redispatch after WORK_ITEM_UNBLOCKED — READY with exact unblock-event provenance + canonically-terminal bound predecessors becomes eligible for ONE new mission attempt",
+  "claim_id": "HOTFIX_C_TELEGRAM_CONTENT_PRODUCTION_VS_DELIVERY_INTENT",
+  "title": "Telegram delivery-intent grammar: VN noun compounds (bài đăng, lịch đăng, gói bài đăng) and `đăng ký` no longer mint send authority",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL",
-    "GATE_ROUTER",
-    "ARTIFACT",
-    "RECOVERY_REPLAY"
+    "PLANNER",
+    "DELIVERY",
+    "TELEGRAM_INGRESS",
+    "MISSION_DRAFT"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-b-redispatch-after-unblock.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
-    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts"
+    "src/__tests__/pair-hotfix-c-telegram-intent.test.ts",
+    "src/__tests__/pair-planner-dataflow-incident.test.ts",
+    "src/__tests__/pair-p15-8-hotfix1-delivery-injection.test.ts",
+    "src/__tests__/pair-p15-8e-telegram.test.ts",
+    "src/__tests__/pair-output-delivery-contract.test.ts",
+    "src/__tests__/pair-ops-telegram-delivery.test.ts"
   ],
   "invariants": [],
-  "description": "READY+terminal-bound items could never be redispatched autonomously (always INTERVENTION). REOPENABLE requires proveCanonicalUnblockProvenance (ONE authority shared by review + dispatch boundary): CURRENT READY must come from authentic WORK_ITEM_UNBLOCKED (exact mint shape BLOCKED->READY, actor operator:*, LAST status event) AND the status event IMMEDIATELY preceding it must be a canonical TERMINAL FOLD — WORK_ITEM_SYNCED/{,STATUS_} produced by PAIR_BUSINESS_LAYER, metadata.mission_id pinned to the LATEST bound mission, metadata.mission_status terminal — with strict causal ordering on durable GLOBAL seq: fold.seq > bound-mission terminal-transition seq AND > last mission_runtime spine seq. An operator WORK_ITEM_BLOCKED episode, unrelated BLOCKED, older-linked-fold reuse, or pre-terminal unblock never authorizes. R3-F4: runtime evidence uses canonical MRT_<missionId> id; spine restricted to CREATED/TRANSITION; proven terminal runtime event (seq < fold seq) required. R4: runtime terminal vocab includes canonical ABORTED (legal FAILED/CANCELLED pairing). REWORK/ROLLED_BACK/malformed/mis-ordered/superseded unblocks -> INTERVENTION; fresh READY stays ACTIVE; derived-status validator unweakened. proveDispatchAuthority re-proves the SAME corrected contract AT the openWorkItem crossing+ every WOB attempt canonically terminal + latest bound lifecycle. Tests 16/16: HB15 fold between mission-terminal/runtime-terminal rejected; HB16 FAILED+ABORTED->fold->unblock->1 reopen; HB13 pre-terminal unblock (BLOCK pauses, unblock while PAUSED, mission later CANCELLED) never redispatches; HB14 older linked fold vs unrelated latest episode rejected; HB1 valid terminal fold->unblock->1 attempt; HB9-12 REWORK/ROLLED_BACK/malformed/superseded/beforeOpen-drift fail closed; HB7 real scheduler admission (tick->claimable->claim; forged binding denied; revoked->POLICY_NOT_EFFECTIVE); dup tick+restart=1; mission-cap; A+B consume. 162 regression pass; baseline f4 R5.1-crash identical on BASE."
+  "description": "Live goal 'Sản xuất gói bài đăng Telegram ... lịch đăng, playbook phân phối' made detectTelegramDeliveryIntent return requested=true — two `đăng` tokens inside CLAUSE_SPAN were read as delivery verbs, so assertDeliveryTaskPresence threw FAIL_CLOSED_DELIVERY_TASK_MISSING on a pure production plan (mission MSN_01M4MXEHH failed at planning). Fix: bounded positive grammar, mirroring the existing `post` noun rule — VN noun heads sit BEFORE the token, so a bounded left-neighbor class (classifiers/content nouns bài|lịch|gói|tin|bản|nội dung|thông báo|danh sách|chuỗi|số|video|clip|story|reel|vlog|blog|thread|tweet|caption|post|article|content|status|update|announcement|schedule|plan|draft, determiners một|vài|các|những|mỗi|mọi|nhiều|ít|a|an|the|this|that|some|any|all|each|every, write-verbs viết|soạn|tạo|làm|sản xuất|prepare|produce|generate|..., numerals) makes `đăng` a noun compound; `đăng ký` (subscribe) skipped via bounded right check. Verb-object order untouched (đăng bài/tin/lên still authorize); independent send clauses in the same goal still authorize; negation/clause-scoping unchanged; no global blacklist, no planner-prompt change, no delivery-gate weakening. Tests 18/18: exact live goal + VN/EN production phrasings -> requested=false; Đăng bài lên Telegram / Gửi kết quả lên kênh / Post the report to Telegram / viết 5 bài đăng rồi gửi lên -> true; production plan passes reconcile + serve canonicalizer with zero delivery tasks; true intent with 0 tasks still MISSING; genuine-omission injection preserved (DELIVERY_TASK_INJECTED stamp); unauthorized emission still INTENT fail-closed. Counterfactual on BASE: 7 negatives + 2 integrations fail identically (requested=true), positives pass — non-vacuous. 257 regression pass."
 }
