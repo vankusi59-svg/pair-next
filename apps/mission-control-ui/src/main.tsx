@@ -1,6 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { createBrowserRouter, RouterProvider } from "react-router-dom";
+import { createBrowserRouter, Navigate, RouterProvider, useLocation, useParams } from "react-router-dom";
 import { Layout } from "./components/Layout";
 import { Dashboard } from "./pages/Dashboard";
 import { MissionDetail } from "./pages/MissionDetail";
@@ -15,20 +15,38 @@ import { appRoute } from "./app/routes";
 import "./styles/app.css";
 import "./styles/tokens.css";
 
+/* P15.9-B6 Scope H — dormant, opt-in legacy→/app redirect. The flag is a
+   browser-local opt-in ONLY: localStorage "pair.legacy_redirect" === "app".
+   Default is OFF — no deployment config changes, no auto-enable, "/" keeps
+   rendering the legacy Dashboard. Targets are proven-parity destinations;
+   dynamic IDs and query/hash are preserved; unmapped routes never redirect
+   (no loops — /app/* is outside the legacy tree). Reverting the flag
+   restores legacy behavior. */
+const LEGACY_REDIRECT_FLAG = "pair.legacy_redirect";
+const legacyRedirectOn = () => localStorage.getItem(LEGACY_REDIRECT_FLAG) === "app";
+
+function OptInRedirect({ to, children }: { to: string | ((id: string | undefined) => string); children: React.ReactNode }) {
+  const loc = useLocation();
+  const params = useParams();
+  if (!legacyRedirectOn()) return <>{children}</>;
+  const target = typeof to === "function" ? to(params.id) : to;
+  return <Navigate to={target + loc.search + loc.hash} replace />;
+}
+
 const router = createBrowserRouter([
   appRoute,
   {
     element: <Layout />,
     children: [
-      { path: "/", element: <Dashboard /> },
-      { path: "/missions/new", element: <MissionNew /> },
-      { path: "/missions/:id", element: <MissionDetail /> },
-      { path: "/approvals", element: <Approvals /> },
-      { path: "/schedules", element: <Schedules /> },
-      { path: "/providers", element: <Providers /> },
-      { path: "/observability", element: <Observability /> },
-      { path: "/objectives", element: <Objectives /> },
-      { path: "/chat", element: <Chat /> },
+      { path: "/", element: <OptInRedirect to="/app/missions"><Dashboard /></OptInRedirect> },
+      { path: "/missions/new", element: <OptInRedirect to="/app/missions/new"><MissionNew /></OptInRedirect> },
+      { path: "/missions/:id", element: <OptInRedirect to={(id) => `/app/missions/${id}`}><MissionDetail /></OptInRedirect> },
+      { path: "/approvals", element: <OptInRedirect to="/app/inbox"><Approvals /></OptInRedirect> },
+      { path: "/schedules", element: <OptInRedirect to="/app/system/schedules"><Schedules /></OptInRedirect> },
+      { path: "/providers", element: <OptInRedirect to="/app/system/providers"><Providers /></OptInRedirect> },
+      { path: "/observability", element: <OptInRedirect to="/app/system/observability"><Observability /></OptInRedirect> },
+      { path: "/objectives", element: <OptInRedirect to="/app/objectives"><Objectives /></OptInRedirect> },
+      { path: "/chat", element: <OptInRedirect to="/app/chat"><Chat /></OptInRedirect> },
     ],
   },
 ]);
