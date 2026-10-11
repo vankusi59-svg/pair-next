@@ -114,9 +114,35 @@ export const PAIR_DATAFLOW_ORIGINAL_DEPS = "pair_dataflow_original_deps";
 export const PAIR_PLAN_CONTRACT_KEY = "pair_plan_contract";
 export const PAIR_PLAN_CONTRACT_VERSION = 2;
 
+/** HOTFIX-A — PAIR-owned cross-mission input binding ledger. Stamped by
+ *  `bindPlanExternalInputs` when a consumed artifact has no in-plan
+ *  producer but resolves to exactly one canonical artifact the mission's
+ *  authorized lineage may consume. PAIR-reserved: the planner can never
+ *  mint source authority; it is stripped + recomputed at reconcile. */
+export const PAIR_DATAFLOW_SOURCES = "pair_dataflow_sources";
+export const EXTERNAL_INPUT_CONTRACT = "pair-external-artifact-input.v1";
+
+/** One pinned external input: the consume name bound to the immutable
+ *  canonical identity of an ACCEPTED artifact produced by a mission in
+ *  the consumer mission's authorized lineage (objective/business scope,
+ *  resolved by trusted PAIR code — never by planner-supplied fields). */
+export interface ExternalInputArtifactSource {
+  contract: typeof EXTERNAL_INPUT_CONTRACT;
+  artifact_id: string;
+  logical_name: string;
+  sha256: string;
+  byte_size: number;
+  source_mission_id: string;
+  source_task_id: string;
+  source_governed_task_id: string;
+  source_execution_id: string;
+  source_executor_id: string;
+}
+
 export const RESERVED_TASK_METADATA_KEYS = [
   "pair_dataflow",
   "pair_dataflow_repairs",
+  PAIR_DATAFLOW_SOURCES,
   "pair_telegram_delivery",
   "telegram_delivery",
   "telegram_delivery_requested",
@@ -1037,6 +1063,198 @@ export function extractTaskDataflow(task: Record<string, unknown>): TaskDataflow
   };
 }
 
+/** HOTFIX-A — the consume names carrying a canonical external-source
+ *  binding on this task (the PAIR-stamped pair_dataflow_sources ledger).
+ *  Entries are never trusted as authority themselves: they only exempt
+ *  a consume from the in-plan-producer rule; the binding they claim is
+ *  fully re-proven against durable authority before any byte moves. */
+function externalSourceBoundConsumes(
+  task: Record<string, unknown>,
+): Set<string> {
+  const md = task.metadata as Record<string, unknown> | undefined;
+  const rows = md?.[PAIR_DATAFLOW_SOURCES];
+  const out = new Set<string>();
+  if (!Array.isArray(rows)) return out;
+  for (const r of rows) {
+    const name = normalizeArtifactPath(
+      (r as Record<string, unknown>)?.consume_name,
+    );
+    if (name) out.add(name);
+  }
+  return out;
+}
+
+/**
+ * HOTFIX-A — cross-mission input binding at THE canonical seams.
+ *
+ * For every task's declared consumes, any artifact with NO producer
+ * inside this plan's task array is resolved against the bounded
+ * `sources` set — canonical ACCEPTED artifacts the consumer mission's
+ * authorized lineage makes eligible (computed by trusted PAIR code,
+ * never from planner fields):
+ *
+ *   - exactly one eligible artifact (canonical name-equivalence) →
+ *     stamp `pair_dataflow_sources` pinning consume_name + the
+ *     immutable source identity (artifact_id, sha256, byte_size,
+ *     source mission/task/governed/execution/executor);
+ *   - zero matches → consume stays unbound: requiredEdges emits the
+ *     ordinary FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT;
+ *   - >1 distinct artifact identities → FAIL_CLOSED ambiguous source;
+ *     a consume name can never pick lexically between artifacts.
+ *
+ * A consume the plan ALSO produces in-plan keeps its in-plan producer
+ * edge — an external source never displaces same-mission provenance,
+ * and a stamped entry on a self-produced consume is a contradiction
+ * (fail closed). Idempotent: re-running on an already-stamped list
+ * recomputes the identical ledger (or fails on conflict).
+ */
+export function bindPlanExternalInputs(
+  tasks: Array<Record<string, unknown>>,
+  sources: ExternalInputArtifactSource[],
+): void {
+  const producerIndex = new Map<string, number>();
+  for (const [i, t] of tasks.entries()) {
+    for (const p of extractTaskDataflow(t).produces) {
+      if (!producerIndex.has(p)) producerIndex.set(p, i);
+    }
+  }
+  for (const [i, task] of tasks.entries()) {
+    const model = extractTaskDataflow(task);
+    const produces = new Set(model.produces);
+    const bound: Array<Record<string, unknown>> = [];
+    for (const rawName of model.consumes) {
+      const name = normalizeArtifactPath(rawName);
+      if (!name || produces.has(name)) continue;
+      if (producerIndex.has(name)) continue; // in-plan producer owns it
+      const matches = new Map<string, ExternalInputArtifactSource>();
+      for (const s of sources) {
+        // The consume name must equal the canonical logical name —
+        // eligibility by identity, never by filename heuristics alone.
+        if (s.logical_name === name || artifactNamesEquivalentCompat(s.logical_name, name)) {
+          if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
+        }
+      }
+      if (matches.size > 1) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE",
+          JSON.stringify({ task: String(task.task_key ?? ""), artifact: name }),
+        );
+      }
+      const src = [...matches.values()][0];
+      if (!src) continue; // stays unbound — requiredEdges fails it
+      bound.push({
+        contract: EXTERNAL_INPUT_CONTRACT,
+        consume_name: name,
+        artifact_id: src.artifact_id,
+        logical_name: src.logical_name,
+        sha256: src.sha256,
+        byte_size: src.byte_size,
+        source_mission_id: src.source_mission_id,
+        source_task_id: src.source_task_id,
+        source_governed_task_id: src.source_governed_task_id,
+        source_execution_id: src.source_execution_id,
+        source_executor_id: src.source_executor_id,
+      });
+    }
+    const md = (task.metadata ??= {}) as Record<string, unknown>;
+    const prev = md[PAIR_DATAFLOW_SOURCES];
+    if (prev !== undefined) {
+      // Replay/idempotency: a prior stamp must equal the recomputed
+      // ledger byte-for-byte — drift means the binding context moved
+      // and the plan must be re-planned, never silently re-pinned.
+      if (canonicalJson(prev) !== canonicalJson(bound)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? "") }),
+        );
+      }
+    } else if (bound.length) {
+      md[PAIR_DATAFLOW_SOURCES] = bound;
+    }
+  }
+}
+
+/** Local equivalence shim — the canonical spelling rule lives in
+ *  artifact-authority (imported lazily-free: this module must stay
+ *  dependency-light; the rule is the X ≡ outbox/<basename> pair). */
+function artifactNamesEquivalentCompat(a: string, b: string): boolean {
+  if (a === b) return true;
+  const base = (n: string) => n.split("/").pop() ?? n;
+  return (
+    (a.startsWith("outbox/") && a === `outbox/${base(b)}`) ||
+    (b.startsWith("outbox/") && b === `outbox/${base(a)}`)
+  );
+}
+
+/** HOTFIX-A — structural proof for stamped external bindings on an
+ *  already-canonical task list: every stamped entry must be well-formed
+ *  (all immutable identity fields present, consume_name declared in the
+ *  task's consumes) and must not collide with an in-plan producer (a
+ *  double-bound artifact is forged/stale authority). Full eligibility
+ *  and byte integrity are re-proven at dispatch resolution — this check
+ *  only rejects malformed/unsound stamped shapes. */
+function assertExternalSourceStamps(
+  tasks: Array<Record<string, unknown>>,
+  models: TaskDataflow[],
+): void {
+  const producedBy = new Map<string, number>();
+  for (const [i, m] of models.entries()) {
+    for (const p of m.produces) {
+      if (!producedBy.has(p)) producedBy.set(p, i);
+    }
+  }
+  for (const [i, task] of tasks.entries()) {
+    const md = task.metadata as Record<string, unknown> | undefined;
+    const rows = md?.[PAIR_DATAFLOW_SOURCES];
+    if (rows === undefined) continue;
+    if (!Array.isArray(rows)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+        JSON.stringify({ task: String(task.task_key ?? ""), malformed: true }),
+      );
+    }
+    const consumes = new Set(models[i].consumes);
+    const seen = new Set<string>();
+    for (const r of rows) {
+      const e = r as Record<string, unknown>;
+      const name = normalizeArtifactPath(e?.consume_name);
+      const fieldsOk =
+        name &&
+        typeof e.artifact_id === "string" && e.artifact_id.length > 0 &&
+        typeof e.logical_name === "string" && e.logical_name.length > 0 &&
+        typeof e.sha256 === "string" && e.sha256.length > 0 &&
+        Number.isInteger(Number(e.byte_size)) && Number(e.byte_size) >= 0 &&
+        typeof e.source_mission_id === "string" && e.source_mission_id.length > 0 &&
+        typeof e.source_task_id === "string" && e.source_task_id.length > 0 &&
+        typeof e.source_governed_task_id === "string" && e.source_governed_task_id.length > 0 &&
+        typeof e.source_execution_id === "string" && e.source_execution_id.length > 0 &&
+        typeof e.source_executor_id === "string" && e.source_executor_id.length > 0;
+      if (!fieldsOk || !consumes.has(name!)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? ""), malformed: true }),
+        );
+      }
+      if (seen.has(name!)) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? ""), duplicate: name }),
+        );
+      }
+      seen.add(name!);
+      const producerIdx = producedBy.get(name!);
+      if (producerIdx !== undefined && producerIdx !== i) {
+        // The artifact has a real in-plan producer — an external stamp
+        // on top is a contradiction (stale or forged authority).
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+          JSON.stringify({ task: String(task.task_key ?? ""), double_bound: name }),
+        );
+      }
+    }
+  }
+}
+
 /**
  * For each task, the set of task_keys it MUST depend on under the
  * data-flow rules: the unique earlier producer of every consumed artifact
@@ -1075,8 +1293,14 @@ function requiredEdges(
     // Self-produced artifacts are normally excluded — but a manifest
     // artifact must ALWAYS bind its producer (the delivery stages a copy;
     // the instruction-grammar may also name it as a produce).
+    // HOTFIX-A — a consume carrying a canonical PAIR-stamped external
+    // source binding is an authorized cross-mission input, NOT an in-plan
+    // producer dependency: it never requires an earlier producer edge.
+    const sourceBound = externalSourceBoundConsumes(task);
     const needed = model.consumes.filter(
-      (a) => !model.produces.includes(a) || manifestNames.has(a),
+      (a) =>
+        (!model.produces.includes(a) || manifestNames.has(a)) &&
+        !sourceBound.has(a),
     );
     for (const artifact of needed) {
       // Manifest artifacts bind producers of the named file OR of its
@@ -1242,6 +1466,12 @@ export interface ReconcileOptions {
   /** Operator-request authority — when omitted the plan cannot carry a
    *  TELEGRAM_DELIVERY task (it fails closed on INTENT). */
   telegramIntent?: TelegramDeliveryIntent;
+  /** HOTFIX-A — the bounded set of canonical ACCEPTED artifacts this
+   *  plan's mission may consume cross-mission, resolved by trusted PAIR
+   *  code from the mission's authorized lineage. Unproduced consumes
+   *  matching exactly one entry bind it (PAIR-stamped); zero matches
+   *  stay ordinary unbound inputs; >1 fails closed ambiguous. */
+  external_input_artifacts?: ExternalInputArtifactSource[];
   /** Canonical output-language authority derived from the effective
    *  operator goal. Stamped onto the delivery task's reserved metadata
    *  (digest-covered) and injected into manifested-artifact producer
@@ -1315,6 +1545,11 @@ export function reconcilePlanDataflow(
   // a valid candidate rather than normalizing silently).
   assertTaskDeliveryHygiene(tasks);
   const models = tasks.map((t) => extractTaskDataflow(t));
+  // HOTFIX-A — bind authorized cross-mission inputs BEFORE edge
+  // resolution: an unproduced consume that resolves to exactly one
+  // eligible canonical artifact is stamped (digest-covered); an
+  // unmatched consume stays an ordinary unbound input and fails below.
+  bindPlanExternalInputs(tasks, opts.external_input_artifacts ?? []);
   const required = requiredEdges(tasks, models);
   // Output-language authority propagates to the producers of manifested
   // TEXT deliverables — a FILES-mode report written upstream must be
@@ -1421,6 +1656,12 @@ export interface AssertPlanDataflowOptions {
    *  still require the PAIR-stamped manifest via the edge rules, and
    *  instruction hygiene ALWAYS runs. */
   telegramIntent?: TelegramDeliveryIntent;
+  /** HOTFIX-A — when the caller can prove the eligible cross-mission set,
+   *  every stamped external binding must still resolve to a CURRENT
+   *  eligible source with the identical pinned identity (revocation/
+   *  drift fails closed). Omitted = structural checks only; the dispatch
+   *  resolver re-proves authority NOW before any byte is read. */
+  external_input_artifacts?: ExternalInputArtifactSource[];
   /** Canonical output-language authority re-derived from the effective
    *  goal: a stamped pair_output_language that differs from the
    *  goal-derived contract — or sits on a non-delivery task — fails
@@ -1527,6 +1768,43 @@ export function assertPlanDataflow(
   // R8 §2 — a persisted/bypassed non-delivery task carrying affirmative
   // delivery semantics fails closed at validation, before dispatch.
   assertTaskDeliveryHygiene(tasks);
+  // HOTFIX-A — revocation/drift re-proof when the caller holds the
+  // eligible-set authority: every stamped source identity must still be
+  // exactly one CURRENT eligible artifact. A stale or reshaped binding
+  // fails closed; the plan must be re-planned under the live set.
+  if (opts.external_input_artifacts) {
+    const eligible = new Map(
+      opts.external_input_artifacts.map((s) => [s.artifact_id, s]),
+    );
+    for (const t of tasks) {
+      const md = t.metadata as Record<string, unknown> | undefined;
+      const rows = md?.[PAIR_DATAFLOW_SOURCES];
+      if (!Array.isArray(rows)) continue;
+      for (const r of rows as Array<Record<string, unknown>>) {
+        const cur = eligible.get(String(r.artifact_id ?? ""));
+        if (
+          !cur ||
+          cur.logical_name !== r.logical_name ||
+          cur.sha256 !== r.sha256 ||
+          Number(cur.byte_size) !== Number(r.byte_size) ||
+          cur.source_mission_id !== r.source_mission_id ||
+          cur.source_task_id !== r.source_task_id ||
+          cur.source_governed_task_id !== r.source_governed_task_id ||
+          cur.source_execution_id !== r.source_execution_id ||
+          cur.source_executor_id !== r.source_executor_id
+        ) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING",
+            JSON.stringify({
+              task: String(t.task_key ?? ""),
+              artifact: String(r.consume_name ?? ""),
+              stale: true,
+            }),
+          );
+        }
+      }
+    }
+  }
   assertPlanArtifactStructure(tasks);
 }
 
@@ -1545,6 +1823,9 @@ export function assertPlanArtifactStructure(
   tasks: Array<Record<string, unknown>>,
 ): void {
   const models = tasks.map((t) => extractTaskDataflow(t));
+  // HOTFIX-A — stamped external-source bindings must be well-formed and
+  // un-double-bound before they exempt a consume from the producer rule.
+  assertExternalSourceStamps(tasks, models);
   const required = requiredEdges(tasks, models);
   const depsByKey = new Map<string, string[]>();
   for (const [i, task] of tasks.entries()) {

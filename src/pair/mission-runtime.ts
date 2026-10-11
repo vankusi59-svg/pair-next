@@ -53,9 +53,11 @@ import { classifyFailure } from "./recovery-controller.js";
 import {
   assertPlanDataflow,
   assertTaskDeliverySemantic,
+  bindPlanExternalInputs,
   deliveryManifest,
   detectTelegramDeliveryIntent,
   missingConsumedArtifact,
+  type ExternalInputArtifactSource,
 } from "./plan-dataflow.js";
 import {
   DependencyResolutionError,
@@ -206,6 +208,12 @@ export interface RuntimePlannerInput {
   /** Tasks of the superseded revision, for replans (informational). */
   superseded_tasks?: Array<Record<string, unknown>>;
   reason: string;
+  /** HOTFIX-A — the bounded set of canonical ACCEPTED artifacts this
+   *  mission's authorized lineage makes eligible as cross-mission
+   *  inputs, computed by trusted PAIR code. The planner may declare a
+   *  consume naming one; it can never mint source authority — binding
+   *  is resolved + stamped by PAIR before the plan commits. */
+  input_artifact_sources?: ExternalInputArtifactSource[];
   /** F3 — structured failure context + rejected-candidate digests the
    *  planner MUST honor on replans: propose a feasible ALTERNATIVE, never
    *  a semantic re-emission of the failed plan. */
@@ -1288,20 +1296,41 @@ export class MissionRuntime {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", missionId);
     }
-    const proposal = this.deps.planner({ mission, advice, reason: "initial" });
+    // HOTFIX-A — canonical cross-mission input authority for this
+    // mission: ACCEPTED artifacts from sibling missions in the same
+    // authorized Objective lineage, computed by trusted PAIR code. The
+    // bounded set is presented to the planner AND re-checked before the
+    // plan commits (revocation/drift fails closed).
+    const externalInputs =
+      this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
+    const proposal = this.deps.planner({
+      mission,
+      advice,
+      reason: "initial",
+      input_artifact_sources: externalInputs,
+    });
     const knownCaps = new Set(
       this.store.list("capability").map((c) => String(c.capability_id)),
     );
     const tasks = validatePlanProposal(proposal, knownCaps);
+    // HOTFIX-A — bind authorized cross-mission inputs on planner paths
+    // that never pass through reconcile (template/sync planners): the
+    // stamped binding is digest-covered with the committed plan.
+    bindPlanExternalInputs(
+      tasks as unknown as Array<Record<string, unknown>>,
+      externalInputs,
+    );
     // Incident R1 — pinned plans must be data-flow sound at the commit
     // boundary: every consumed artifact requires its producer edge. A
     // planner path that bypassed the canonicalize seam still fails closed.
     // R8 — the intent↔presence invariant and instruction hygiene are
     // re-proven here with the operator request (mission.goal) as the
-    // only delivery authority.
+    // only delivery authority. Stamped external bindings re-prove the
+    // CURRENT eligible set NOW.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
       telegramIntent: detectTelegramDeliveryIntent(mission.goal),
       outputLanguage: detectOutputLanguage(mission.goal),
+      external_input_artifacts: externalInputs,
     });
     this.deps.service.commitPlan({
       mission_id: missionId,
@@ -3490,6 +3519,10 @@ export class MissionRuntime {
       return;
     }
 
+    // HOTFIX-A — replan candidates bind the same canonical cross-mission
+    // input authority as the initial plan (computed once per tick).
+    const externalInputs =
+      this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
     while (
       ledger.attemptsUsed(recoveryId) < MAX_REPLAN_CANDIDATES_PER_DECISION
     ) {
@@ -3501,6 +3534,7 @@ export class MissionRuntime {
           advice: advice ?? null,
           superseded_tasks: oldTasks,
           reason: "replan",
+          input_artifact_sources: externalInputs,
           replan_context: {
             recovery_id: recoveryId,
             failure_signature:
@@ -3534,6 +3568,12 @@ export class MissionRuntime {
       let rejectionReason: string | null = null;
       try {
         const validated = validatePlanProposal(proposal, knownCaps);
+        // HOTFIX-A — replan candidates bind cross-mission inputs and
+        // re-prove stamped bindings against the current eligible set.
+        bindPlanExternalInputs(
+          validated as unknown as Array<Record<string, unknown>>,
+          externalInputs,
+        );
         // Same data-flow + delivery plan-shape proof as the initial plan
         // (R1/R8) — feasibility for candidate accounting is structural.
         assertPlanDataflow(
@@ -3541,6 +3581,7 @@ export class MissionRuntime {
           {
             telegramIntent: detectTelegramDeliveryIntent(mission.goal),
             outputLanguage: detectOutputLanguage(mission.goal),
+            external_input_artifacts: externalInputs,
           },
         );
         tasks = validated as unknown as Array<Record<string, unknown>>;
