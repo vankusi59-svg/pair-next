@@ -394,7 +394,16 @@ export interface ReviewWorkstreamProjection {
  *  INTERVENTION = canonical non-active state needing intervention
  *  (BLOCKED, PAUSED mission, terminal-mission fold pending);
  *  EXHAUSTED = canonically finished (DONE+WCP or CANCELLED). */
-type LifecycleClass = "ACTIVE" | "INTERVENTION" | "EXHAUSTED";
+type LifecycleClass =
+  | "ACTIVE"
+  | "INTERVENTION"
+  | "EXHAUSTED"
+  /** HOTFIX-B — canonically READY + every bound mission attempt
+   *  canonically terminal + the READY state itself derived from a
+   *  canonical WORK_ITEM_UNBLOCKED event: eligible for one new
+   *  governed mission attempt through the existing openWorkItem
+   *  authority. PAUSED / live / unproven predecessors never qualify. */
+  | "REOPENABLE";
 
 /** Status-defining lifecycle events on a work_item — every canonical
  *  status writer emits one. Replaying them is the ONLY honest read of
@@ -443,9 +452,127 @@ export function assertCanonicalWorkStatus(
   return derived;
 }
 
+/** HOTFIX-B/R2-F3 — the exact unblock-event provenance contract behind
+ *  REOPENABLE, shared by review classification AND the final dispatch
+ *  boundary (one authority, never two interpretations).
+ *
+ *  Returns the authentic WORK_ITEM_UNBLOCKED event iff the work item's
+ *  CURRENT READY state was produced by a canonical unblock that
+ *  causally FOLLOWS the terminal fold of the LATEST bound mission:
+ *   1. a BOUND work-open binding exists — its latest attempt pins the
+ *      mission the episode must reference (never a stale attempt);
+ *   2. the LAST status-producing event is WORK_ITEM_UNBLOCKED in the
+ *      exact shape unblockWorkItem mints — old_state BLOCKED,
+ *      new_state READY, actor `operator:<id>` (operator provenance);
+ *   3. the status event IMMEDIATELY preceding it — the BLOCKED episode
+ *      the unblock transitioned out of — is a canonical terminal fold:
+ *      WORK_ITEM_SYNCED or WORK_ITEM_STATUS_SYNCED produced by
+ *      `PAIR_BUSINESS_LAYER` with metadata.mission_id pinned to the
+ *      latest bound mission and metadata.mission_status already
+ *      terminal. An operator WORK_ITEM_BLOCKED, an unrelated BLOCKED,
+ *      or any other producer never authorizes;
+ *   4. strict causal ordering on the durable GLOBAL event sequence
+ *      (never wall-clock): the fold's seq must exceed BOTH the seq of
+ *      the bound mission's own terminal-deriving spine transition and
+ *      the last mission_runtime spine event — a pre-terminal unblock
+ *      or a fold predating the terminal transition cannot authorize
+ *      post-terminal redispatch;
+ *   5. no arbitrary earlier match may be reused — only the episode
+ *      immediately preceding the current unblock counts.
+ *  READY produced by WORK_REWORK_REQUESTED, WORK_ITEM_OPEN_ROLLED_BACK,
+ *  a malformed/mis-ordered unblock, or any unrelated status event is
+ *  NOT reopenable — the caller classifies INTERVENTION / fails closed.
+ *  Returns null instead of throwing: provenance absence is a
+ *  classification fact, and claim-vs-derived corruption is already
+ *  caught by assertCanonicalWorkStatus. */
+/** HOTFIX-B/R4 — runtime terminal vocabulary for the ordering check:
+ *  the mission terminal set PLUS canonical `ABORTED` — the runtime
+ *  state `assertCanonicalMissionLifecycle` legitimately pairs with
+ *  FAILED/CANCELLED (`abortMission`). An arbitrary ABORTED row still
+ *  cannot authorize: the mission-spine check, fold binding and the
+ *  callers' `assertCanonicalMissionLifecycle` re-proof are unchanged. */
+const TERMINAL_RUNTIME_STATUSES: ReadonlySet<string> = new Set([
+  ...TERMINAL_MISSION_STATUSES, "ABORTED",
+]);
+
+export function proveCanonicalUnblockProvenance(
+  store: PairEvidenceStore,
+  workItem: Row,
+): Row | null {
+  const wid = String(workItem.work_item_id);
+  const attempts = canonicalBoundAttemptsForWorkItem(store, wid);
+  if (attempts.length === 0) return null;
+  const boundMissionId =
+    String(attempts[attempts.length - 1]!.mission_id ?? "");
+  if (!boundMissionId || !store.tryGet("mission", boundMissionId)) {
+    return null;
+  }
+  const events = store.listEvents("work_item", wid)
+    .filter((e) => WORK_ITEM_STATUS_EVENTS.has(String(e.event_type)) &&
+      e.new_state !== null && e.new_state !== undefined);
+  const last = events[events.length - 1];
+  if (!last || String(last.event_type) !== "WORK_ITEM_UNBLOCKED" ||
+      String(last.old_state) !== "BLOCKED" ||
+      String(last.new_state) !== "READY" ||
+      !String(last.actor ?? "").startsWith("operator:")) {
+    return null;
+  }
+  // The BLOCKED episode the unblock transitioned out of is by
+  // construction the immediately preceding status event — anything
+  // else rewrites what the derived prior really was.
+  const episode = events[events.length - 2];
+  if (!episode || String(episode.new_state) !== "BLOCKED") {
+    return null;
+  }
+  const et = String(episode.event_type);
+  if ((et !== "WORK_ITEM_SYNCED" && et !== "WORK_ITEM_STATUS_SYNCED") ||
+      String(episode.actor) !== "PAIR_BUSINESS_LAYER") {
+    return null;
+  }
+  const md = (episode.metadata as Record<string, unknown> | undefined) ?? {};
+  if (String(md.mission_id ?? "") !== boundMissionId ||
+      !TERMINAL_MISSION_STATUSES.has(String(md.mission_status ?? ""))) {
+    return null;
+  }
+  // Durable global ordering: the terminal spine transition of the
+  // latest bound mission must COMPLETE before the fold (and therefore
+  // before the unblock). A status event sequence below or equal to the
+  // terminal transition is a pre-terminal or fabricated episode.
+  const missionSpine = store.listEvents("mission", boundMissionId)
+    .filter((e) =>
+      (String(e.event_type) === "MISSION_CREATED" ||
+       String(e.event_type) === "MISSION_TRANSITION") &&
+      e.new_state !== null && e.new_state !== undefined);
+  const terminalTransition = missionSpine[missionSpine.length - 1];
+  if (!terminalTransition ||
+      !TERMINAL_MISSION_STATUSES.has(String(terminalTransition.new_state)) ||
+      !(Number(episode.seq) > Number(terminalTransition.seq))) {
+    return null;
+  }
+  // Runtime evidence uses the canonical entity id `MRT_<missionId>`
+  // (MissionRuntime.runtimeEntity, consistent with
+  // assertCanonicalMissionLifecycle) and only its canonical
+  // creation/transition event types. A proven TERMINAL runtime event
+  // must precede the fold — the fold sitting between mission-terminal
+  // and runtime-terminal cannot authorize.
+  const runtimeSpine = store.listEvents(
+    "mission_runtime", `MRT_${boundMissionId}`)
+    .filter((e) =>
+      (String(e.event_type) === "MISSION_RUNTIME_CREATED" ||
+       String(e.event_type) === "MISSION_RUNTIME_TRANSITION") &&
+      e.new_state !== null && e.new_state !== undefined);
+  const runtimeLast = runtimeSpine[runtimeSpine.length - 1];
+  if (!runtimeLast ||
+      !TERMINAL_RUNTIME_STATUSES.has(String(runtimeLast.new_state)) ||
+      !(Number(episode.seq) > Number(runtimeLast.seq))) {
+    return null;
+  }
+  return last as Row;
+}
+
 /** The mission's claimed status derived from its own immutable
  *  MISSION_CREATED/MISSION_TRANSITION spine. */
-function canonicalDerivedMissionStatus(
+export function canonicalDerivedMissionStatus(
   store: PairEvidenceStore,
   mission: Row,
 ): string {
@@ -715,14 +842,45 @@ export function buildReviewObservation(
           reviewFail(
             `delegated child ${childId} claims READY while a live bound mission exists`);
         } else {
-          // Bound mission terminal (or canonically PAUSED) — fold
-          // pending: intervention, not fresh progress.
-          if (childMissionStatus === "PAUSED" ||
+          // Bound mission terminal (or canonically PAUSED) — the
+          // latest attempt's lifecycle is proven canonically either
+          // way before any classification.
+          assertCanonicalMissionLifecycle(
+            deps.store, childBoundMission!, childMissionStatus!);
+          if (childMissionStatus !== "PAUSED" &&
               TERMINAL_MISSION_STATUSES.has(childMissionStatus!)) {
-            assertCanonicalMissionLifecycle(
-              deps.store, childBoundMission!, childMissionStatus!);
+            // HOTFIX-B/R1-F1 — READY must ITSELF be the product of an
+            // authentic WORK_ITEM_UNBLOCKED following the latest bound
+            // predecessor (proveCanonicalUnblockProvenance), AND every
+            // bound attempt must be proven canonically terminal:
+            // PAUSED / live / unproven predecessors — and READY derived
+            // from rework, rolled-back opens or any other event — keep
+            // intervention semantics and are never silently reopened.
+            let allAttemptsTerminal = true;
+            for (const att of canonicalBoundAttemptsForWorkItem(
+                deps.store, childId)) {
+              const am = deps.store.tryGet(
+                "mission", String(att.mission_id)) as Row | null;
+              if (!am) {
+                allAttemptsTerminal = false;
+                break;
+              }
+              const ams = canonicalDerivedMissionStatus(deps.store, am);
+              if (!TERMINAL_MISSION_STATUSES.has(ams)) {
+                allAttemptsTerminal = false;
+                break;
+              }
+              assertCanonicalMissionLifecycle(deps.store, am, ams);
+            }
+            childClass = allAttemptsTerminal &&
+                proveCanonicalUnblockProvenance(deps.store, child) !== null
+              ? "REOPENABLE"
+              : "INTERVENTION";
+          } else {
+            // PAUSED bound mission — fold/resume pending:
+            // intervention, never an auto-reopen.
+            childClass = "INTERVENTION";
           }
-          childClass = "INTERVENTION";
         }
         break;
       }
