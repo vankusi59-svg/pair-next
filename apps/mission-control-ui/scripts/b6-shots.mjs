@@ -78,23 +78,63 @@ const BIZ = created.business_id;
 if (!/^BIZ_/.test(BIZ ?? "")) { console.error("business create failed", created); server.kill(); process.exit(1); }
 console.log(`fixture business: ${BIZ} (synthetic, created in ${MC_DIR})`);
 
+// seed ONE synthetic objective via the canonical contract — backend derives
+// owner_authority_id from x-operator-id (operator:op:e2e); never forged.
+// Company scope requires the actor to own >=1 objective in the business.
+const OBJ_TITLE = "B6 fixture objective";
+const objRes = await api("/api/vnext/objectives", {
+  method: "POST",
+  body: JSON.stringify({
+    business_id: BIZ,
+    title: OBJ_TITLE,
+    statement: "Seed objective for B6 populated-state screenshot evidence.",
+    kpis: [{ kpi_id: "KPI_B6_SHOTS", name: "deliverables", unit: "count",
+      direction: "AT_LEAST", baseline: 0, target: 1 }],
+    deadline: "2999-01-01T00:00:00.000Z",
+    budget_ceiling_microusd: 500000,
+    dedup_key: "b6-fixture-objective",
+  }),
+});
+const createdObj = await objRes.json();
+const OID = createdObj.objective_id;
+if (!objRes.ok || !/^OBJ_/.test(OID ?? "")) { console.error("objective create failed", objRes.status, createdObj); server.kill(); process.exit(1); }
+// verify backend-derived ownership + canonical company read BEFORE capturing
+if (String(createdObj.owner_authority_id) !== `operator:${OPERATOR}`) {
+  console.error(`objective owner ${createdObj.owner_authority_id} !== operator:${OPERATOR}`); server.kill(); process.exit(1);
+}
+if (String(createdObj.business_id) !== BIZ) {
+  console.error(`objective business_id ${createdObj.business_id} !== ${BIZ}`); server.kill(); process.exit(1);
+}
+const compRes = await api(`/api/vnext/businesses/${BIZ}/company`);
+const company = await compRes.json();
+if (!compRes.ok || String(company.company?.business?.business_id) !== BIZ) {
+  console.error("company API not 200/populated", compRes.status, company); server.kill(); process.exit(1);
+}
+if (!(company.company?.objectives ?? []).some((o) => String(o.objective_id) === OID)) {
+  console.error("company read missing seeded objective", company.company?.objectives); server.kill(); process.exit(1);
+}
+console.log(`fixture objective: ${OID} owner=operator:${OPERATOR} company=200 verified`);
+
+// shots: [path, name, w, h, marker] — marker = text that MUST render for a
+// valid populated-state capture (real data, not an error string).
 const shots = [
-  ["/app/company", "company", 1440, 900, true],
-  ["/app/objectives", "objectives", 1440, 900, true],
-  ["/app/inbox", "inbox", 768, 1024, false],
-  ["/app/missions", "missions", 1440, 900, false],
-  ["/app/system/cost", "system-cost", 1024, 768, false],
-  ["/app/system/providers", "system-providers", 1440, 900, false],
-  ["/app/company", "company-mobile", 390, 844, true],
-  ["/app/chat", "chat-mobile", 390, 844, false],
+  ["/app/company", "company", 1440, 900, "b6-fixture-demo"],
+  ["/app/objectives", "objectives", 1440, 900, OBJ_TITLE],
+  ["/app/inbox", "inbox", 768, 1024, null],
+  ["/app/missions", "missions", 1440, 900, null],
+  ["/app/system/cost", "system-cost", 1024, 768, null],
+  ["/app/system/providers", "system-providers", 1440, 900, null],
+  ["/app/company", "company-mobile", 390, 844, "b6-fixture-demo"],
+  ["/app/chat", "chat-mobile", 390, 844, null],
 ];
+const ERROR_RE = /access denied|fail_closed_[a-z_]+|no business selected/i;
 
 const browser = await chromium.launch({
   executablePath: process.env.CHROME_BIN ?? "/home/ubuntu/.local/bin/google-chrome",
 });
 try {
   for (const theme of ["light", "dark"]) {
-    for (const [pathName, name, w, h, expectsBiz] of shots) {
+    for (const [pathName, name, w, h, marker] of shots) {
       const page = await browser.newPage({ viewport: { width: w, height: h } });
       // serialize credentials + business id explicitly into the page context
       await page.addInitScript(
@@ -112,20 +152,27 @@ try {
       // affirmative assertions before capture
       const stored = await page.evaluate(() => localStorage.getItem("pair.business_id"));
       if (stored !== BIZ) throw new Error(`${name}: pair.business_id=${stored}, expected ${BIZ}`);
+      // wait for real data rendering — not just main.amain presence:
+      // populated shots must show the marker text; every shot must be
+      // free of canonical error/denied states before capture.
       await page.waitForSelector("main.amain", { timeout: 15000 });
-      await page.waitForTimeout(1200);
+      if (marker) {
+        await page.waitForFunction(
+          (m) => document.querySelector("main.amain")?.textContent?.includes(m),
+          marker, { timeout: 15000 },
+        ).catch(() => { throw new Error(`${name}: marker "${marker}" never rendered — populated state not proven`); });
+      }
+      await page.waitForTimeout(800);
       const bodyText = await page.locator("main.amain").innerText();
-      if (expectsBiz) {
-        if (/no business selected/i.test(bodyText)) {
-          throw new Error(`${name}: populated shot shows "No business selected" — environment not seeded`);
-        }
-        if (!bodyText.includes(BIZ) && !/b6-fixture-demo/i.test(bodyText)) {
-          throw new Error(`${name}: fixture business not rendered in page text`);
-        }
+      if (ERROR_RE.test(bodyText)) {
+        throw new Error(`${name}: canonical error/denied state rendered — not valid evidence`);
+      }
+      if (marker && !bodyText.includes(marker)) {
+        throw new Error(`${name}: marker "${marker}" absent at capture`);
       }
       await page.screenshot({ path: `${OUT}${name}-${theme}.png` });
       await page.close();
-      console.log(`shot ${name}-${theme} OK${expectsBiz ? " (business rendered)" : ""}`);
+      console.log(`shot ${name}-${theme} OK${marker ? ` (verified "${marker}")` : ""}`);
     }
   }
 } finally {

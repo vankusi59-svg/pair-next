@@ -1,6 +1,6 @@
 {
-  "claim_id": "P15_9_B6_R2_SCREENSHOT_EVIDENCE",
-  "title": "P15.9-B6 R2: screenshot evidence closure — runtime-verified isolated fixture provenance",
+  "claim_id": "P15_9_B6_R3_POPULATED_EVIDENCE",
+  "title": "P15.9-B6 R3: valid owner-scoped populated screenshot evidence",
   "affected_surfaces": ["UI"],
   "required_tests": [
     "src/__tests__/pair-p15-8a-conversation-authority.test.ts",
@@ -9,5 +9,5 @@
     "src/__tests__/pair-p12.test.ts"
   ],
   "invariants": [],
-  "description": "R2 screenshot-evidence closure on PR #102 (R1 F1/F2/F4 accepted, not reworked). R2-F1: b6-shots.mjs rewritten — fixture business id serialized into addInitScript as an argument (R1 free-variable bug: pair.business_id was never set); script SPAWNS its own serve-mission-control.mjs on fresh mkdtemp PAIR_MC_DIR (/tmp/pair-b6-shots-*) with synthetic PAIR_MC_TOKEN=b6-fixture-token (real dev credential never read), stub replies, template planner; runtime isolation asserted (GET /api/businesses must return EMPTY before seeding, else abort); one synthetic business via canonical POST; before every capture asserts localStorage['pair.business_id']===BIZ + main.amain present; populated shots FAIL on 'No business selected' or missing fixture business; navigation non-OK aborts — no .catch() suppression. R2-F2: all 16 PNGs regenerated & verified (company/objectives/company-mobile asserted business-rendered); verification-report.md carries env/commands/assertions/results; visual doc labels evidence-only. R2-F3: final-acceptance-matrix reconciled — CONDITIONAL verdict preserved, C1-C7 intact, NOT_PORTED panes unchanged. Zero runtime/backend/schema changes; no merge/deploy/cutover/A2."
+  "description": "R3 populated-evidence closure on PR #102 (R1 + R2 isolation accepted, not reworked). R3-F1: b6-shots.mjs now seeds ONE synthetic objective via canonical POST /api/vnext/objectives — owner_authority_id derived by backend from x-operator-id (operator:op:e2e), never forged; asserts owner + business_id + GET /api/vnext/businesses/:id/company returns HTTP 200 containing the objective BEFORE browser launch. Per-capture: populated shots wait for marker text ('b6-fixture-demo' / 'B6 fixture objective') inside main.amain — real data render, not shell presence; EVERY shot rejects /access denied|fail_closed_*|no business selected/i; nav non-OK aborts. R3-F2: all 16 PNGs regenerated on /tmp/pair-b6-shots-lc0mas with business BIZ_01M4MA4X32BZ97B3PCZF3HKZ9M + objective OBJ_191d8c187e215e8100dd55e7; PNGs visually inspected — Company shows OBJECTIVES OWNED 1 + objective card, Objectives shows seeded card (real populated evidence, not the R2 FAIL_CLOSED_COMPANY_SCOPE 403 captures which are documented as a corrected false-pass). Docs + matrix updated; CONDITIONAL verdict + C1-C7 + NOT_PORTED panes preserved. Zero runtime/backend/schema/authority changes; no CEO cycle/mission/executor/paid model; no merge/deploy/cutover/A2."
 }
