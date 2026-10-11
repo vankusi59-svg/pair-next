@@ -79,6 +79,12 @@ export function ObjectiveDetail() {
      conflict or a committed result discards the stored op so the next
      confirmation mints a fresh operation. */
   const pendingOps = useRef<Record<string, Parameters<typeof api.autoPolicyControlApp>[1]>>({});
+  /* Latest pending Configure op for THIS objective: lets a reopened
+     dialog restore the originally submitted limits instead of
+     resetting to defaults. Superseded only when the owner confirms a
+     genuinely different configure body — an explicit new operation. */
+  const pendingCfg = useRef<{ oid: string; sig: string } | null>(null);
+  const [polPending, setPolPending] = useState<string | null>(null);
   /* Monotonic op token: a resolution whose token is no longer current
      (dialog context invalidated by navigation) never touches this
      view's state — the committed backend mutation stands, but this
@@ -94,6 +100,7 @@ export function ObjectiveDetail() {
     setMutBusy(false);
     setPolSt({ kind: "loading" });
     pendingOps.current = {};
+    pendingCfg.current = null;
     opSeq.current++;
   }, [biz, id]);
 
@@ -175,6 +182,16 @@ export function ObjectiveDetail() {
     if (!dlg || dlg.kind !== "policy") return;
     const ctx = { biz: dlg.biz, oid: dlg.oid };
     const { action, policyVersion } = dlg;
+    /* Fail-closed even with the dialog already open: a mutation is
+       only lawful while a canonical status for THIS identity is
+       verified and the dialog context still matches the route. An
+       unavailable/unverified status locks the operation in place —
+       never silently closed, retry resumes when status recovers. */
+    const canonNow = polSt.kind === "ready" && polSt.forId === id ? polSt.data : null;
+    if (!canonNow || ctx.biz !== biz || ctx.oid !== id) {
+      setMutNote(`Policy ${action} blocked — canonical policy status is not verified for this objective/business; the confirmation is locked until status recovers.`);
+      return;
+    }
     const seq = ++opSeq.current;
     /* Operation signature: action + identity + CAS version + limit
        semantics. A retry of the SAME operation replays the stored
@@ -204,12 +221,20 @@ export function ObjectiveDetail() {
         }
         body.limits = limits;
       }
+      /* An intentional different configure body supersedes the older
+         pending one — an explicit new operation, never an implicit
+         reset of the stored retry. */
+      if (action === "configure" && pendingCfg.current && pendingCfg.current.oid === ctx.oid && pendingCfg.current.sig !== sig) {
+        delete pendingOps.current[pendingCfg.current.sig];
+      }
       pendingOps.current[sig] = body;
     }
+    if (action === "configure") pendingCfg.current = { oid: ctx.oid, sig };
     setDlg(null); setMutBusy(true); setMutNote(null);
     api.autoPolicyControlApp(ctx.oid, body)
       .then(() => {
         delete pendingOps.current[sig];
+        if (pendingCfg.current?.sig === sig) pendingCfg.current = null;
         setPolTick((n) => n + 1);
         settle(seq, ctx, `Policy ${action} committed — projection refreshed.`, "")(null, false);
       })
@@ -219,6 +244,7 @@ export function ObjectiveDetail() {
            confirmation (and mints a new operation). */
         if (e instanceof ApiError && e.status === 409) {
           delete pendingOps.current[sig];
+          if (pendingCfg.current?.sig === sig) pendingCfg.current = null;
           refetch();
           setPolTick((n) => n + 1);
           settle(seq, ctx, "", `Policy ${action} conflict — canonical state refreshed, re-confirm as a new operation`)(e, true);
@@ -286,22 +312,48 @@ export function ObjectiveDetail() {
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
   };
   const openPolicyDlg = (a: string) => {
+    /* A pending Configure operation restores its ORIGINAL submitted
+       values on reopen — defaults never overwrite an unresolved
+       operation. Only a first-time configure falls back to
+       terms-derived proposals. */
+    const pc = a === "configure" && pendingCfg.current && pendingCfg.current.oid === id
+      ? pendingOps.current[pendingCfg.current.sig] : undefined;
     if (a === "configure") {
-      const dl = o.deadline ? new Date(o.deadline) : null;
-      const okDl = dl !== null && !Number.isNaN(dl.getTime()) && dl.getTime() > Date.now();
-      setPolLimits({
-        expires: okDl ? toLocalInput(dl as Date) : "",
-        ceo: "20",
-        missions: "5",
-        budget: o.budget.ceiling_microusd > 0 ? String(o.budget.ceiling_microusd / 1e6) : "",
-      });
+      if (pc?.limits) {
+        const l = pc.limits;
+        setPolLimits({
+          expires: l.expires_at ? toLocalInput(new Date(l.expires_at)) : "",
+          ceo: l.max_ceo_calls !== undefined ? String(l.max_ceo_calls) : "",
+          missions: l.max_missions !== undefined ? String(l.max_missions) : "",
+          budget: l.budget_microusd_cap !== undefined ? String(l.budget_microusd_cap / 1e6) : "",
+        });
+        const canonV = polCtl?.configured ? polCtl.policy_version ?? null : null;
+        setPolPending(
+          "Pending configure restored — retry submits the identical limits, version and idempotency key." +
+          (canonV !== null && pc.policy_version !== undefined && pc.policy_version !== canonV
+            ? ` Canonical policy_version is now v${canonV} while this operation was bound to v${String(pc.policy_version)} — a conflict refreshes canonical state and requires a fresh confirmation.`
+            : "")
+        );
+      } else {
+        const dl = o.deadline ? new Date(o.deadline) : null;
+        const okDl = dl !== null && !Number.isNaN(dl.getTime()) && dl.getTime() > Date.now();
+        setPolLimits({
+          expires: okDl ? toLocalInput(dl as Date) : "",
+          ceo: "20",
+          missions: "5",
+          budget: o.budget.ceiling_microusd > 0 ? String(o.budget.ceiling_microusd / 1e6) : "",
+        });
+        setPolPending(null);
+      }
+    } else {
+      setPolPending(null);
     }
     setDlg({
       kind: "policy",
       action: a,
       biz: biz!,
       oid: id,
-      policyVersion: polCtl?.configured ? (polCtl.policy_version ?? null) : null,
+      policyVersion: pc ? (pc.policy_version ?? null) : (polCtl?.configured ? (polCtl.policy_version ?? null) : null),
     });
   };
 
@@ -532,9 +584,16 @@ export function ObjectiveDetail() {
           : ""}
         confirmLabel={dlg?.kind === "policy" ? `Commit ${dlg.action}` : "Commit"}
         busy={mutBusy}
+        confirmDisabled={polSt.kind !== "ready" || polSt.forId !== id}
         onConfirm={runPolicy}
         onCancel={() => setDlg(null)}
       >
+        {dlg?.kind === "policy" && (polSt.kind !== "ready" || polSt.forId !== id) ? (
+          <div className="note">Canonical policy status unavailable — this confirmation is locked until the status GET recovers; no request is sent.</div>
+        ) : null}
+        {dlg?.kind === "policy" && polPending ? (
+          <div className="note">{polPending}</div>
+        ) : null}
         {dlg?.kind === "policy" && dlg.action === "configure" ? (
           <div className="ofrow" aria-label="policy limits">
             <label htmlFor="pex">expires_at (required)</label>

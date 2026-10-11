@@ -830,3 +830,117 @@ test("hidden tab does not poll; restoring visibility resumes refresh", async ({ 
   await page.evaluate(() => { (window as unknown as { __vis: string }).__vis = "visible"; });
   await expect.poll(() => policyGets, { timeout: 11000 }).toBeGreaterThan(initial);
 });
+
+/* R2 adversarial coverage: pending Configure restore, open-dialog
+   canonical lock, committed-but-lost-response replay. */
+
+test("configure ambiguous failure → reopen restores submitted limits + exact-body retry", async ({ page }) => {
+  const biz = await mkBusiness(page, "polcfg");
+  const oid = await mkObjective(page, biz, `polcfg-${uniq()}`);
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let failedOnce = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (!failedOnce) { failedOnce = true; return route.fulfill({ status: 500, body: "{}" }); }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // defaults propose 20; owner edits to 9
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await page.getByLabel("max ceo calls").fill("9");
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure failed")).toBeVisible();
+  // dialog already closed by the commit; reopen → pending op restores
+  await page.getByRole("button", { name: "Configure policy" }).click();
+  await expect(page.getByLabel("max ceo calls")).toHaveValue("9");
+  await expect(page.getByText("Pending configure restored")).toBeVisible();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit configure" }).click();
+  await expect(page.getByText("Policy configure committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  // retry is byte-identical: same limits (9, not default 20), same key
+  expect(bodies[1]).toEqual(bodies[0]);
+  expect((bodies[0]!.limits as Record<string, unknown>).max_ceo_calls).toBe(9);
+  // single canonical transition only — replayed op did not double-apply
+});
+
+test("POST committed but response lost → exact-body retry, no duplicate transition", async ({ page }) => {
+  const biz = await mkBusiness(page, "pollost");
+  const oid = await mkObjective(page, biz, `pollost-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  const bodies: Record<string, unknown>[] = [];
+  let swallowed = false;
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, async (route) => {
+    if (route.request().method() === "POST") {
+      bodies.push(route.request().postDataJSON() as Record<string, unknown>);
+      if (!swallowed) {
+        swallowed = true;
+        // backend REALLY commits; the UI only sees a lost response
+        await route.fetch();
+        return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "LOST", detail: "response lost after commit" }) });
+      }
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable failed")).toBeVisible();
+  // reopen + retry → identical operation (same key, same CAS version)
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Commit enable" }).click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  expect(bodies[1]).toEqual(bodies[0]);
+  // no duplicate transition: canonical policy advanced exactly once
+  const st = await page.evaluate(async ([id, tok]) => {
+    const r = await fetch(`/api/vnext/objectives/${id}/auto-policy`, { headers: { authorization: `Bearer ${tok}`, "x-operator-id": "op:e2e" } });
+    return r.json();
+  }, [oid, mcToken()] as const);
+  expect(st.auto_policy.state).toBe("ENABLED");
+  expect(st.auto_policy.policy_version).toBe(2); // v1 configure + v2 enable — retry did NOT mint v3
+});
+
+test("open dialog is locked when canonical GET fails; recovers when restored", async ({ page }) => {
+  const biz = await mkBusiness(page, "pollock");
+  const oid = await mkObjective(page, biz, `pollock-${uniq()}`);
+  await apiPost(page, `/vnext/objectives/${oid}/auto-policy`, {
+    action: "configure", idempotency_key: `cfg-${uniq()}`,
+    limits: { expires_at: "2030-12-31T00:00:00Z", max_ceo_calls: 5 },
+  });
+  await seedBiz(page, biz);
+  let fail = false;
+  const posts: unknown[] = [];
+  await page.route(`**/api/vnext/objectives/${oid}/auto-policy`, (route) => {
+    if (route.request().method() === "POST") posts.push(route.request().postDataJSON());
+    if (route.request().method() === "GET" && fail) {
+      return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "E500", detail: "down" }) });
+    }
+    return route.fallback();
+  });
+  await page.goto(`/app/objectives/${oid}`);
+  // canonical OK → open Enable dialog → then the next GET fails
+  await page.getByRole("button", { name: "Enable policy" }).click();
+  const commit = page.getByRole("dialog").getByRole("button", { name: "Commit enable" });
+  await expect(commit).toBeEnabled();
+  fail = true;
+  // the 5s poll fires the next canonical GET → it fails → locked
+  await expect(page.getByText("policy mutations blocked until a canonical status loads")).toBeVisible({ timeout: 12000 });
+  await expect(commit).toBeDisabled();
+  await commit.click({ force: true }).catch(() => {});
+  expect(posts).toHaveLength(0);
+  // recover canonical → next poll tick restores verified status and
+  // the SAME open dialog can confirm again
+  fail = false;
+  await expect(commit).toBeEnabled({ timeout: 12000 });
+  await expect(page.getByText("policy mutations blocked until a canonical status loads")).toHaveCount(0);
+  await commit.click();
+  await expect(page.getByText("Policy enable committed")).toBeVisible();
+  expect(posts).toHaveLength(1);
+});
