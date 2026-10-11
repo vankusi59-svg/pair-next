@@ -1,19 +1,20 @@
 {
-  "claim_id": "HOTFIX_A_CROSS_MISSION_ARTIFACT_INPUT",
-  "title": "Cross-mission canonical artifact input binding — governed consume of ACCEPTED artifacts from sibling missions",
+  "claim_id": "HOTFIX_B_GOVERNED_REDISPATCH_AFTER_UNBLOCK",
+  "title": "Governed redispatch after WORK_ITEM_UNBLOCKED — READY with exact unblock-event provenance + canonically-terminal bound predecessors becomes eligible for ONE new mission attempt",
   "affected_surfaces": [
-    "PLANNER",
-    "ARTIFACT",
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
     "GATE_ROUTER",
+    "ARTIFACT",
     "RECOVERY_REPLAY"
   ],
   "required_tests": [
+    "src/__tests__/pair-hotfix-b-redispatch-after-unblock.test.ts",
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
-    "src/__tests__/pair-f2-artifact-handoff.test.ts",
-    "src/__tests__/pair-planner-dataflow-incident.test.ts",
-    "src/__tests__/pair-f1-artifact-authority.test.ts",
-    "src/__tests__/pair-f2-r1-remediation.test.ts"
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts"
   ],
   "invariants": [],
-  "description": "Fixes FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT for bound missions consuming artifacts ACCEPTED by earlier sibling missions. listEligibleExternalInputSources proves canonical lineage: validateWorkOpenBindingById (BOUND WOB<->delegated work item) + FULL assertCanonicalWorkforceAllocation on consumer and every sibling allocation (receipt + binding + WDEL + child graph + agent contract); tampered WDEL/forged membership/broken binding/cross-business/non-BOUND all throw FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE. Reuse via late-bound registration (bindWorkforceAllocationProver/bindObjectiveWorkstreamCtor at owning-module eval; unbound = fail closed) — static import would pull business.ts into service.ts's import phase and crash work-completion's module-level MISSION_STATUS_TRANSITIONS read. F2: producerPassAnchored counts ALL anchored PASS validations (>1 = contradictory, closed) then requires the unique PASS artifact_ids contain the artifact; RUNNING/FAILED/unvalidated excluded. F3: cap on ELIGIBLE set only after filters; 63/64/65 boundary. F5: authorizeConsumeFetch resolves producer mission from the pinned producer execution row. F6: BOTH byte-consumption points (materializeForConsumer + authorizeConsumeFetch) re-prove CURRENT eligibility via the same seam before bytes are served/written — exact pinned identity match (artifact_id + producer exec/governed/task + producer mission + sha256), never filename; revoked lineage = zero bytes / zero writes; same-mission F2 untouched. Stamps pair_dataflow_sources (1 binds, 0 UNBOUND, >1 AMBIGUOUS, drift/conflict SOURCE_BINDING); assert re-proves CURRENT eligibility. 35 tests on canonical fixtures + adversarial (mid-flight revocation, contradictory PASS, wrong producer) + INT2 production path (real tick->commit->resolve/pin->REMOTE_FETCH bytes; governed rows fabricated — dispatch stays simulation) + cold-start smoke (dist index loads; bindings live). Regression 287 pass; baseline f4 R5.1-crash identical on BASE 1f6d4af."
+  "description": "READY+terminal-bound items could never be redispatched autonomously (always INTERVENTION). REOPENABLE requires proveCanonicalUnblockProvenance (ONE authority shared by review + dispatch boundary): CURRENT READY must come from authentic WORK_ITEM_UNBLOCKED (exact mint shape BLOCKED->READY, actor operator:*, LAST status event) AND the status event IMMEDIATELY preceding it must be a canonical TERMINAL FOLD — WORK_ITEM_SYNCED/{,STATUS_} produced by PAIR_BUSINESS_LAYER, metadata.mission_id pinned to the LATEST bound mission, metadata.mission_status terminal — with strict causal ordering on durable GLOBAL seq: fold.seq > bound-mission terminal-transition seq AND > last mission_runtime spine seq. An operator WORK_ITEM_BLOCKED episode, unrelated BLOCKED, older-linked-fold reuse, or pre-terminal unblock never authorizes. R3-F4: runtime evidence uses canonical MRT_<missionId> id; spine restricted to CREATED/TRANSITION; proven terminal runtime event (seq < fold seq) required. R4: runtime terminal vocab includes canonical ABORTED (legal FAILED/CANCELLED pairing). REWORK/ROLLED_BACK/malformed/mis-ordered/superseded unblocks -> INTERVENTION; fresh READY stays ACTIVE; derived-status validator unweakened. proveDispatchAuthority re-proves the SAME corrected contract AT the openWorkItem crossing+ every WOB attempt canonically terminal + latest bound lifecycle. Tests 16/16: HB15 fold between mission-terminal/runtime-terminal rejected; HB16 FAILED+ABORTED->fold->unblock->1 reopen; HB13 pre-terminal unblock (BLOCK pauses, unblock while PAUSED, mission later CANCELLED) never redispatches; HB14 older linked fold vs unrelated latest episode rejected; HB1 valid terminal fold->unblock->1 attempt; HB9-12 REWORK/ROLLED_BACK/malformed/superseded/beforeOpen-drift fail closed; HB7 real scheduler admission (tick->claimable->claim; forged binding denied; revoked->POLICY_NOT_EFFECTIVE); dup tick+restart=1; mission-cap; A+B consume. 162 regression pass; baseline f4 R5.1-crash identical on BASE."
 }

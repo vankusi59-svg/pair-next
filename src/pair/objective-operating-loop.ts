@@ -31,6 +31,8 @@ import { ArtifactAuthority } from "./artifact-authority.js";
 import type { BusinessLayer } from "./business.js";
 import {
   assertCanonicalMissionInFlight,
+  assertCanonicalMissionLifecycle,
+  canonicalBoundAttemptsForWorkItem,
 } from "./work-completion.js";
 import { TERMINAL_MISSION_STATUSES } from "./business.js";
 import type { ObjectiveAuthorityService, ObjectiveKpi } from "./objective-authority.js";
@@ -52,8 +54,10 @@ import {
   assertCanonicalObjectiveKpiProgress,
   buildReviewObservation,
   canonicalAdaptiveReviewsFor,
+  canonicalDerivedMissionStatus,
   objectiveKpiAssessment,
   ObjectiveAdaptiveReviewService,
+  proveCanonicalUnblockProvenance,
   type ObjectiveAdaptiveReviewDeps,
   type ReviewObservation,
   type ReviewWorkstreamProjection,
@@ -279,10 +283,14 @@ export class ObjectiveOperatingService {
     if (synced) obs = this.observe(objectiveId); // fresh canonical classes
 
     // §17 — classify from canonical lifecycle evidence only.
+    // HOTFIX-B — REOPENABLE: READY + every bound attempt canonically
+    // terminal + canonical WORK_ITEM_UNBLOCKED evidence — eligible for
+    // one new governed attempt through the same openWorkItem seam.
     const launchable = obs.workstreams.filter((w) =>
-      w.delegated_child_class === "ACTIVE" &&
-      w.delegated_child_status === "READY" &&
-      !w.delegated_child_bound_mission);
+      (w.delegated_child_class === "ACTIVE" &&
+       w.delegated_child_status === "READY" &&
+       !w.delegated_child_bound_mission) ||
+      w.delegated_child_class === "REOPENABLE");
     const activeExecution = obs.workstreams.find((w) =>
       w.delegated_child_class === "ACTIVE" &&
       w.delegated_child_status === "IN_PROGRESS");
@@ -570,7 +578,44 @@ export class ObjectiveOperatingService {
     }
     const mission = this.deps.business.boundMissionForWorkItem(child);
     if (mission) {
+      const ms = String(mission.status);
+      if (TERMINAL_MISSION_STATUSES.has(ms)) {
+        // HOTFIX-B/R1-F2 — final dispatch-boundary re-proof of the
+        // REOPENABLE contract, run AT the openWorkItem crossing and
+        // never trusting the earlier review observation:
+        //  a) the current READY must derive from an authentic
+        //     WORK_ITEM_UNBLOCKED event following THIS latest bound
+        //     predecessor — the same single authority the review used;
+        //  b) EVERY bound attempt in immutable WOB history must be
+        //     canonically terminal (mirroring openWorkItem's own
+        //     admission loop — a live earlier attempt is corrupt
+        //     authority, never converged);
+        //  c) the latest bound mission identity + lifecycle is
+        //     re-proven through its own immutable spine.
+        if (proveCanonicalUnblockProvenance(this.store, child) === null) {
+          operatingFail(
+            `delegated child ${childId} terminal-bound READY lacks canonical WORK_ITEM_UNBLOCKED provenance`);
+        }
+        for (const att of canonicalBoundAttemptsForWorkItem(
+            this.store, childId)) {
+          const am = this.store.tryGet(
+            "mission", String(att.mission_id)) as Row | null;
+          if (!am) {
+            operatingFail(
+              `bound attempt ${String(att.open_id)} mission missing`);
+          }
+          const ams = canonicalDerivedMissionStatus(this.store, am);
+          if (!TERMINAL_MISSION_STATUSES.has(ams)) {
+            operatingFail(
+              `bound attempt mission ${String(am.mission_id)} not canonically terminal`);
+          }
+          assertCanonicalMissionLifecycle(this.store, am, ams);
+        }
+        assertCanonicalMissionLifecycle(this.store, mission, ms);
+        return { objective_version: Number(objective.version) };
+      }
       // R2.A — converge only through a proven in-flight mission.
+      // PAUSED / live / unproven claims propagate — never a reopen.
       assertCanonicalMissionInFlight(this.store, mission, child);
       return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
     }
