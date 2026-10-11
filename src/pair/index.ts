@@ -100,3 +100,4 @@ export * from "./objective-cockpit.js";
 
 export * from "./objective-kpi-verifier-authority.js";
 export * from "./objective-kpi-verification.js";
+export * from "./objective-review-signoff.js";

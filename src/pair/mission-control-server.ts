@@ -28,6 +28,7 @@ import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
 import { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { ObjectiveAutoPolicyService } from "./objective-auto-policy.js";
+import { ObjectiveReviewSignoffService } from "./objective-review-signoff.js";
 import type { ObjectiveAutoScheduler } from "./objective-auto-scheduler.js";
 import type { ObjectiveAutoDriverService } from "./objective-auto-driver.js";
 import {
@@ -1475,6 +1476,73 @@ export function createMissionControlServer(
         return void json(res, 200,
           cockpitSvc.objectiveReviews(m[1]!, reviewsActor, limit));
       }
+      // ----- P15.10-A2 — owner review sign-off (accept ACHIEVED) -----
+      // The ONE mutation seam that lets the objective owner accept a
+      // TARGET_MET_CANDIDATE review. All authority/pin/active-work
+      // validation lives in ObjectiveReviewSignoffService; the route
+      // only binds the operator actor. "request_changes" is NOT
+      // implemented — no owner feedback seam exists yet.
+      m = p.match(/^\/api\/vnext\/objectives\/([^/]+)\/review-signoff$/);
+      if (method === "POST" && m) {
+        if (!biz || !wf || !deps.store) {
+          return void json(res, 404, { error: "OPERATING_LOOP_DISABLED" });
+        }
+        const rawSignoffActor = String(req.headers["x-operator-id"] ?? "");
+        if (!rawSignoffActor) {
+          throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", p);
+        }
+        const signoffActor = rawSignoffActor.startsWith("operator:")
+          ? rawSignoffActor : `operator:${rawSignoffActor}`;
+        // R1-F2 — strict request schema BEFORE any coercion: wrong JSON
+        // types (arrays/objects/numbers) are a typed 400 client error
+        // with zero mutation — String(body.action) must never turn
+        // ["accept"] into "accept".
+        for (const [f, v] of [
+          ["action", body.action],
+          ["review_id", body.review_id],
+          ["idempotency_key", body.idempotency_key],
+        ] as const) {
+          if (typeof v !== "string" || !v.trim()) {
+            return void json(res, 400, {
+              error: "FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST",
+              detail: `${f} must be a non-empty string`,
+            });
+          }
+        }
+        if (
+          body.reason !== undefined && body.reason !== null &&
+          typeof body.reason !== "string"
+        ) {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST",
+            detail: "reason must be a string when present",
+          });
+        }
+        const signoffSvc = new ObjectiveReviewSignoffService({
+          store: deps.store,
+          objectives: biz.objectives,
+          reviewDeps: {
+            store: deps.store,
+            business: biz,
+            workforce: wf,
+            objectives: biz.objectives,
+            workstreams: new ObjectiveWorkstreamService({
+              store: deps.store, business: biz, workforce: wf,
+              objectives: biz.objectives,
+            }),
+          },
+        });
+        return void json(res, 200, {
+          signoff: signoffSvc.signoff(m[1]!, {
+            actor: signoffActor,
+            action: body.action as string,
+            review_id: body.review_id as string,
+            idempotency_key: body.idempotency_key as string,
+            reason: body.reason === undefined || body.reason === null
+              ? undefined : (body.reason as string),
+          }),
+        });
+      }
       m = p.match(/^\/api\/vnext\/businesses\/([^/]+)\/company$/);
       if (method === "GET" && m) {
         if (!biz || !wf || !deps.store) {
@@ -1792,6 +1860,7 @@ export function createMissionControlServer(
         e.code === "FAIL_CLOSED_POLICY_FORBIDDEN" ||
         e.code === "FAIL_CLOSED_POLICY_OWNER" ||
         e.code === "FAIL_CLOSED_COCKPIT_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_OBJECTIVE_AUTHORITY" ||
         e.code === "FAIL_CLOSED_COMPANY_SCOPE" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409

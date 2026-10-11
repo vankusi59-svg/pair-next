@@ -160,6 +160,15 @@ export const api = {
       signal ? { signal } : undefined,
       { noAuthPrompt: true },
     ),
+  /* P15.10-A2 — owner review sign-off: accept the pinned
+     TARGET_MET_CANDIDATE review → objective ACHIEVED. Idempotent via
+     caller-supplied key. */
+  objectiveReviewSignoff: (id: string, input: { review_id: string; idempotency_key: string; reason?: string }) =>
+    req<{ signoff: { replayed: boolean; objective: Record<string, unknown>; signoff: Record<string, unknown> } }>(
+      `/vnext/objectives/${encodeURIComponent(id)}/review-signoff`, {
+        method: "POST",
+        body: JSON.stringify({ action: "accept", ...input }),
+      }, { noAuthPrompt: true }),
   objectiveReviews: (id: string, limit: number, signal?: AbortSignal) =>
     req<import("./app/types").ReviewsPage>(
       `/vnext/objectives/${encodeURIComponent(id)}/reviews?limit=${limit}`,
