@@ -25,9 +25,16 @@ export function SystemSettings() {
     setAuthToken(tok);
     setTok("");
     setConfigured(true);
+    /* R1-F3 — a credential change invalidates credential-scoped state:
+       the SSE stream is reconnected (its previously-authenticated event
+       buffer is cleared, never shown as current data), live-refreshed
+       projections refetch under the new token, and Inbox Counts are
+       invalidated via pair.credentials-changed (in-flight responses
+       fetched under the old credential can never repaint as current). */
     reconnectStream();
+    window.dispatchEvent(new Event("pair.credentials-changed"));
     setNote(
-      "Token saved. New API requests use it immediately; pages already on screen may still show results fetched under the previous credential — navigate to refresh. The event stream was reconnected.",
+      "Token saved. New API requests use it immediately; inbox counts and live-refreshed projections were invalidated and refetch under the new credential; the event stream was reconnected with a cleared buffer.",
     );
   };
 
@@ -35,15 +42,20 @@ export function SystemSettings() {
     setAuthToken("");
     setConfigured(false);
     reconnectStream();
+    window.dispatchEvent(new Event("pair.credentials-changed"));
     setConfirmClear(false);
-    setNote("Token cleared — subsequent requests are unauthenticated and will fail closed (401).");
+    setNote("Token cleared — subsequent requests are unauthenticated and will fail closed (401); the event stream buffer was cleared and reconnected.");
   };
 
   const saveOp = () => {
     setOperatorId(op);
+    /* R1-F3 — the operator id feeds the x-operator-id header of
+       subsequent requests AND invalidates owner-dependent Inbox Counts
+       (pair.operator-changed bumps the provider's invalidation epoch so
+       a response fetched under the old operator never repaints). */
     window.dispatchEvent(new Event("pair.operator-changed"));
     setNote(
-      `Operator id saved (${getOperatorId() || "none"}) — subsequent requests send x-operator-id. This is a request identity header, not proof of multi-tenant authorization.`,
+      `Operator id saved (${getOperatorId() || "none"}) — subsequent requests send x-operator-id; inbox counts were invalidated and refetch under the new identity. This is a request identity header, not proof of multi-tenant authorization.`,
     );
   };
 

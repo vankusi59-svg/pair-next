@@ -28,5 +28,19 @@ export function useTheme(): [string, () => void] {
       window.removeEventListener("storage", sync);
     };
   }, []);
-  return [theme, () => setTheme((t) => (t === "dark" ? "light" : "dark"))];
+  const toggle = () => {
+    /* B5.5 R1-F2 — compute the next value from the shared source of
+       truth (localStorage), not from this instance's possibly-stale
+       state, so a stale consumer can never overwrite a newer selection
+       and one toggle is always one actual transition. Then notify every
+       other same-tab useTheme consumer via pair.theme-changed — the
+       event they already listen for — keeping a single theme authority
+       (no loops: listeners set the same value and React bails out). */
+    const cur = localStorage.getItem("pair.theme") === "light" ? "light" : "dark";
+    const next = cur === "dark" ? "light" : "dark";
+    localStorage.setItem("pair.theme", next);
+    setTheme(next);
+    window.dispatchEvent(new Event("pair.theme-changed"));
+  };
+  return [theme, toggle];
 }

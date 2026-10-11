@@ -365,6 +365,174 @@ test("settings: clear token requires confirmation; legacy link present; no crede
   expect(posts.filter((p) => p.includes("/api/credentials"))).toEqual([]);
 });
 
+/* ---------------- B5.5 R1 ---------------- */
+
+test("cost R1-F1: canonical P13 fields — max_microusd, scope triple, profile pricing; null/noncanonical never $0", async ({ page }) => {
+  await seedSession(page);
+  // labeled interception — canonical P13-shaped fixtures (src/pair/cost.ts row shapes)
+  await page.route("**/api/cost-policies", (route) => route.fulfill({
+    status: 200, contentType: "application/json",
+    body: JSON.stringify({ cost_policies: [
+      { cost_policy_id: "CPOL_a1", business_id: "biz-9", scope_type: "DEPARTMENT", scope_id: "trading", period: "daily", max_microusd: 2500000, warning_threshold_pct: 80, enabled: true, status: "ACTIVE", version: 4 },
+      { cost_policy_id: "CPOL_b2", business_id: "biz-3", scope_type: "MISSION", scope_id: "msn-7", period: "monthly", max_microusd: null, enabled: false, status: "DISABLED", version: 1 },
+      { cost_policy_id: "CPOL_c3", business_id: "biz-5", scope_type: "AGENT", scope_id: "agt-2", max_microusd: "500000", enabled: true, status: "ACTIVE", version: 2 },
+    ] }),
+  }));
+  await page.route("**/api/cost-profiles", (route) => route.fulfill({
+    status: 200, contentType: "application/json",
+    body: JSON.stringify({ cost_profiles: [
+      { cost_profile_id: "CPRO_1", ref_type: "model", ref_id: "gpt-5", billing_mode: "PER_TOKEN", fixed_microusd: 125000, input_microusd_per_mtok: 2400, output_microusd_per_mtok: 9600, reserve_microusd: 50000, currency: "USD", status: "ACTIVE", version: 2 },
+      { cost_profile_id: "CPRO_2", ref_type: "route", ref_id: "r-1", billing_mode: "FIXED", fixed_microusd: null, input_microusd_per_mtok: null, output_microusd_per_mtok: null, reserve_microusd: 0, currency: "USD", status: "ACTIVE", version: 1 },
+    ] }),
+  }));
+  await page.goto("/app/system/cost");
+  const pol = page.locator("section[aria-label='cost policies']");
+  const rowA = pol.locator("tr", { hasText: "CPOL_a1" });
+  await expect(rowA.getByText("biz-9", { exact: true })).toBeVisible();
+  await expect(rowA.getByText("DEPARTMENT")).toBeVisible();
+  await expect(rowA.getByText("trading")).toBeVisible();
+  await expect(rowA.getByText("$2.5")).toBeVisible(); // 2,500,000 µUSD
+  const rowB = pol.locator("tr", { hasText: "CPOL_b2" });
+  await expect(rowB.getByText("MISSION")).toBeVisible();
+  await expect(rowB.getByText("msn-7")).toBeVisible();
+  await expect(rowB.getByText("unknown")).toBeVisible(); // null limit ≠ $0
+  const rowC = pol.locator("tr", { hasText: "CPOL_c3" });
+  await expect(rowC.getByText("AGENT")).toBeVisible();
+  await expect(rowC.getByText("unknown")).toBeVisible(); // string amount is noncanonical — not $0, not $0.5
+  const prof = page.locator("section[aria-label='cost profiles']");
+  const r1 = prof.locator("tr", { hasText: "model:gpt-5" });
+  await expect(r1.getByText("model:gpt-5")).toBeVisible();
+  await expect(r1.getByText("PER_TOKEN")).toBeVisible();
+  await expect(r1.getByText("$0.125")).toBeVisible();  // fixed
+  await expect(r1.getByText("$0.0024")).toBeVisible(); // input /Mtok
+  await expect(r1.getByText("$0.0096")).toBeVisible(); // output /Mtok
+  await expect(r1.getByText("$0.05")).toBeVisible();   // reserve
+  const r2 = prof.locator("tr", { hasText: "route:r-1" });
+  await expect(r2.getByText("route:r-1")).toBeVisible();
+  await expect(r2.getByText("$0", { exact: true })).toBeVisible(); // reserve 0 IS a real zero
+  await expect(r2.getByText("unknown").first()).toBeVisible();     // the three nulls are unknown
+});
+
+test("settings R1-F2: theme alternates across shell + settings — one transition each; reload preserves", async ({ page }) => {
+  await seedSession(page);
+  await page.goto("/app/system/settings");
+  const settingsBtn = page.getByRole("button", { name: "toggle theme in settings" });
+  const shellBtn = page.getByRole("button", { name: "toggle theme", exact: true });
+  // colorScheme dark → settings toggle → light; the SHELL hook must
+  // already reflect light (its button + state synced via pair.theme-changed)
+  await settingsBtn.click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  // shell toggle → dark — and the SETTINGS hook reflects it (badge text)
+  await shellBtn.click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(page.getByText("dark", { exact: true }).first()).toBeVisible();
+  // alternate again — each toggle is exactly one transition
+  await settingsBtn.click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await shellBtn.click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  expect(await page.evaluate(() => localStorage.getItem("pair.theme"))).toBe("dark");
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.getByRole("button", { name: "toggle theme in settings" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  expect(await page.evaluate(() => localStorage.getItem("pair.theme"))).toBe("light");
+});
+
+test("settings R1-F3: operator change invalidates inbox counts — A's count never presented under B", async ({ page }) => {
+  // labeled interception — the badge's global approvals read returns
+  // rows scoped to the x-operator-id header it actually sent.
+  await page.route("**/api/approvals", (route, req) => {
+    const op = req.headers()["x-operator-id"] ?? "";
+    return route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify(op === "op:e2e"
+        ? [{ approval_id: "a1", status: "PENDING" }, { approval_id: "a2", status: "PENDING" }]
+        : []),
+    });
+  });
+  await seedSession(page);
+  await page.goto("/app/company");
+  await expect(page.locator(".ibadge", { hasText: "2" }).first()).toBeVisible({ timeout: 10000 });
+  // SPA navigation only — page.goto would full-reload and re-seed credentials
+  await page.getByRole("link", { name: "Settings" }).click();
+  await page.getByLabel(/x-operator-id sent with API requests/).fill("op:other");
+  await page.getByRole("button", { name: "Save operator id" }).click();
+  await page.getByRole("link", { name: "Company Cockpit" }).click();
+  await page.waitForTimeout(500);
+  // A's "2" must not remain presented; B's count (0+) is what shows, or nothing while refetching
+  await expect(page.locator(".ibadge", { hasText: "2" })).toHaveCount(0);
+});
+
+test("settings R1-F3: delayed old-operator inbox read never repaints after identity switch", async ({ page }) => {
+  let held = true;
+  let release: (() => void) | null = null;
+  const gate = new Promise<void>((res) => { release = res; });
+  await page.route("**/api/approvals", async (route, req) => {
+    const op = req.headers()["x-operator-id"] ?? "";
+    if (held && op === "op:e2e") await gate; // hold A's read
+    return route.fulfill({
+      status: 200, contentType: "application/json",
+      body: JSON.stringify(op === "op:e2e"
+        ? [{ approval_id: "a1", status: "PENDING" }, { approval_id: "a2", status: "PENDING" }]
+        : []),
+    });
+  });
+  await seedSession(page);
+  await page.goto("/app/company"); // badge read under op:e2e is held in-flight
+  // SPA navigation only — page.goto would full-reload and re-seed credentials
+  await page.getByRole("link", { name: "Settings" }).click();
+  await page.getByLabel(/x-operator-id sent with API requests/).fill("op:other");
+  await page.getByRole("button", { name: "Save operator id" }).click();
+  held = false;
+  release?.(); // the stale A response now resolves — its epoch is old, must not paint
+  await page.getByRole("link", { name: "Company Cockpit" }).click();
+  await page.waitForTimeout(500);
+  await expect(page.locator(".ibadge", { hasText: "2" })).toHaveCount(0);
+});
+
+test("settings R1-F3: token save clears the previously-authenticated SSE buffer; clear fails closed, never stale-live", async ({ page }) => {
+  await seedSession(page);
+  const g = `e2e-sse-ev-${uniq()}`;
+  await mkMission(page, g); // emits canonical entity events into the stream
+  await page.goto("/app/system/observability");
+  const stream = page.locator("section[aria-label='global event stream']");
+  await expect(stream.getByText("live")).toBeVisible({ timeout: 15000 });
+  await expect(stream.locator("tbody tr").first()).toBeVisible({ timeout: 15000 });
+  const marker = stream.locator("tbody tr").first();
+  // a credential save must drop the previously-authenticated buffer:
+  // make the reconnect fail so the cleared state is deterministic —
+  // the old rows must be gone, not shown as current data.
+  await page.route("**/api/events", (route) => route.abort());
+  await page.getByRole("link", { name: "Settings" }).click();
+  await page.getByLabel("New token (masked — the stored value is never shown)").fill("12");
+  await page.getByRole("button", { name: "Save token" }).click();
+  await page.getByRole("link", { name: "Observability" }).click();
+  await expect(stream.locator("tbody tr")).toHaveCount(0, { timeout: 5000 });
+  await expect(marker).toHaveCount(0);
+  await expect(stream.getByText("live", { exact: true })).toHaveCount(0);
+  await expect(stream.getByText(/reconnecting|STREAM_DISCONNECTED/i).first()).toBeVisible();
+});
+
+test("observability R1-F3: stream status is a shared subscription — consumers converge; unmount stops observation", async ({ page }) => {
+  await seedSession(page);
+  await page.goto("/app/system/observability");
+  const stream = page.locator("section[aria-label='global event stream']");
+  await expect(stream.getByText("live")).toBeVisible({ timeout: 15000 });
+  // unmount → remount: a fresh subscriber converges to the same status
+  await page.getByRole("link", { name: "Schedules" }).click();
+  await expect(page.getByRole("heading", { name: "Schedules" })).toBeVisible();
+  await page.getByRole("link", { name: "Observability" }).click();
+  await expect(stream.getByText("live")).toBeVisible({ timeout: 15000 });
+  // a failed stream is presented consistently as reconnecting, not live
+  await page.route("**/api/events", (route) => route.abort());
+  await page.getByRole("link", { name: "Settings" }).click();
+  await page.getByLabel("New token (masked — the stored value is never shown)").fill("12");
+  await page.getByRole("button", { name: "Save token" }).click();
+  await page.getByRole("link", { name: "Observability" }).click();
+  await expect(stream.getByText("reconnecting", { exact: true })).toBeVisible({ timeout: 10000 });
+});
+
 /* ---------------- Regression ---------------- */
 
 test("regression: legacy /providers /observability /schedules /chat still work", async ({ page }) => {

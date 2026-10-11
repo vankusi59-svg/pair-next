@@ -20,12 +20,14 @@ const isObj = (v: unknown): v is Row => v !== null && typeof v === "object" && !
 const errOf = (e: unknown): ApiError =>
   e instanceof ApiError ? e : new ApiError(0, "ERROR", String(e));
 
-/* micro-USD → exact USD label (integer math, never float rounding). */
+/* micro-USD → exact USD label. R1-F1: only verified integer micro-USD
+   amounts within safe numeric bounds convert — null, missing, floats,
+   strings, booleans and out-of-range values render "unknown", never $0
+   (a noncanonical value is not a price, never fabricated as one). */
 const usd = (microusd: unknown): string => {
-  const n = Number(microusd);
-  if (!Number.isFinite(n)) return "unknown";
-  const neg = n < 0;
-  const abs = Math.abs(Math.trunc(n));
+  if (typeof microusd !== "number" || !Number.isSafeInteger(microusd)) return "unknown";
+  const neg = microusd < 0;
+  const abs = Math.abs(microusd);
   const dollars = Math.floor(abs / 1e6);
   const frac = String(abs % 1e6).padStart(6, "0").replace(/0+$/, "");
   return `${neg ? "-" : ""}$${dollars}${frac ? "." + frac : ""}`;
@@ -167,17 +169,19 @@ export function SystemCost() {
           <EmptyState title="No cost policies" detail="The canonical cost_policy collection is empty." />
         ) : (
           <div className="tbl-wrap"><table className="tbl">
-            <thead><tr><th>Policy</th><th>Scope</th><th>Limit</th><th>Enabled</th><th>Hard stop</th><th>Status</th><th>Version</th></tr></thead>
+            <thead><tr><th>Policy</th><th>Business</th><th>Scope type</th><th>Scope id</th><th>Max limit</th><th>Enabled</th><th>Warn %</th><th>Status</th><th>Version</th></tr></thead>
             <tbody>
               {policies.data.map((p, i) => (
-                <tr key={field(p, ["cost_policy_id", "policy_id"]) !== "—" ? field(p, ["cost_policy_id", "policy_id"]) : String(i)}>
-                  <td className="mono">{field(p, ["cost_policy_id", "policy_id", "name"])}</td>
-                  <td className="mono">{field(p, ["scope", "business_id", "ref_id"])}</td>
-                  <td className="mono" title={p.limit_microusd != null ? `${String(p.limit_microusd)} micro-USD` : undefined}>
-                    {p.limit_microusd != null ? `${usd(p.limit_microusd)}` : field(p, ["limit", "cap"])}
+                <tr key={field(p, ["cost_policy_id"]) !== "—" ? field(p, ["cost_policy_id"]) : String(i)}>
+                  <td className="mono">{field(p, ["cost_policy_id"])}</td>
+                  <td className="mono">{field(p, ["business_id"])}</td>
+                  <td className="mono">{field(p, ["scope_type"])}</td>
+                  <td className="mono">{field(p, ["scope_id"])}</td>
+                  <td className="mono" title={typeof p.max_microusd === "number" ? `${String(p.max_microusd)} micro-USD` : undefined}>
+                    {usd(p.max_microusd)}
                   </td>
                   <td>{p.enabled === undefined ? "—" : p.enabled ? "yes" : "no"}</td>
-                  <td>{p.hard_stop === undefined ? "—" : p.hard_stop ? "yes" : "no"}</td>
+                  <td className="mono">{field(p, ["warning_threshold_pct"])}</td>
                   <td>{field(p, ["status"])}</td>
                   <td className="mono">{field(p, ["version"])}</td>
                 </tr>
@@ -195,15 +199,16 @@ export function SystemCost() {
           <EmptyState title="No cost profiles" detail="The canonical cost_profile collection is empty." />
         ) : (
           <div className="tbl-wrap"><table className="tbl">
-            <thead><tr><th>Ref</th><th>Billing mode</th><th>Unit price</th><th>Currency</th><th>Status</th><th>Version</th></tr></thead>
+            <thead><tr><th>Ref</th><th>Billing mode</th><th>Fixed</th><th>Input /Mtok</th><th>Output /Mtok</th><th>Reserve</th><th>Currency</th><th>Status</th><th>Version</th></tr></thead>
             <tbody>
               {profiles.data.map((p, i) => (
-                <tr key={field(p, ["cost_profile_id", "profile_id"]) !== "—" ? field(p, ["cost_profile_id", "profile_id"]) : String(i)}>
+                <tr key={field(p, ["cost_profile_id"]) !== "—" ? field(p, ["cost_profile_id"]) : String(i)}>
                   <td className="mono">{field(p, ["ref_type"])}:{field(p, ["ref_id"]).slice(0, 24)}</td>
                   <td>{field(p, ["billing_mode"])}</td>
-                  <td className="mono" title={p.unit_microusd != null ? `${String(p.unit_microusd)} micro-USD` : undefined}>
-                    {p.unit_microusd != null ? `${usd(p.unit_microusd)}/unit` : field(p, ["unit_price", "price"])}
-                  </td>
+                  <td className="mono" title={typeof p.fixed_microusd === "number" ? `${String(p.fixed_microusd)} micro-USD` : undefined}>{usd(p.fixed_microusd)}</td>
+                  <td className="mono" title={typeof p.input_microusd_per_mtok === "number" ? `${String(p.input_microusd_per_mtok)} micro-USD/Mtok` : undefined}>{usd(p.input_microusd_per_mtok)}</td>
+                  <td className="mono" title={typeof p.output_microusd_per_mtok === "number" ? `${String(p.output_microusd_per_mtok)} micro-USD/Mtok` : undefined}>{usd(p.output_microusd_per_mtok)}</td>
+                  <td className="mono" title={typeof p.reserve_microusd === "number" ? `${String(p.reserve_microusd)} micro-USD` : undefined}>{usd(p.reserve_microusd)}</td>
                   <td className="mono">{field(p, ["currency"])}</td>
                   <td>{field(p, ["status"])}</td>
                   <td className="mono">{field(p, ["version"])}</td>
