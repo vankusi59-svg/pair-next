@@ -1266,10 +1266,76 @@ export type HandoffMode = "LOCAL_MATERIALIZATION" | "REMOTE_FETCH";
  *     F1 re-verification NOW → exact CAS bytes.
  */
 export class ArtifactHandoffService {
+  private _resolver: ArtifactDependencyResolver | null = null;
+
   constructor(
     private readonly store: PairEvidenceStore,
     private readonly artifacts: ArtifactAuthority,
   ) {}
+
+  /** The canonical eligibility authority — SAME seam that proves
+   *  cross-mission sources at plan time. The resolver only consumes
+   *  `service.store` and `service.artifacts`; the shim carries the
+   *  identical instances this service was built with. */
+  private resolver(): ArtifactDependencyResolver {
+    this._resolver ??= new ArtifactDependencyResolver({
+      store: this.store,
+      artifacts: this.artifacts,
+    } as unknown as PairControlPlane);
+    return this._resolver;
+  }
+
+  /** F6 — cross-mission byte consumption RE-PROVES current canonical
+   *  eligibility at the point bytes are served or written. The pin
+   *  proved eligibility at plan time; this proves it NOW: a lineage
+   *  revocation between pin and consumption (WOB unbound, WAL tamper,
+   *  sibling non-BOUND, producer PASS anchor gone) closes the byte
+   *  path. Same-mission entries skip — the F2 same-mission contract
+   *  is untouched. The match is on the PINNED identity: artifact_id,
+   *  producer execution/governed/task, producer mission and sha256 —
+   *  never merely the logical filename. */
+  private assertCrossMissionEligibleNow(
+    governed: Record<string, unknown>,
+    entry: DependencyArtifactEntry,
+    srcExec: Record<string, unknown> | null,
+  ): void {
+    const consumerMissionId = String(governed.mission_id);
+    const producerMissionId = srcExec
+      ? String(srcExec.mission_id ?? "")
+      : consumerMissionId;
+    if (producerMissionId === consumerMissionId) return;
+    const consumerMission = this.store.tryGet(
+      "mission",
+      consumerMissionId,
+    ) as Record<string, unknown> | null;
+    if (!consumerMission) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        `consumer mission ${consumerMissionId} missing`,
+        { dependency_reason: "EXTERNAL_INPUT_LINEAGE" },
+      );
+    }
+    const eligible = this.resolver().listEligibleExternalInputSources(
+      consumerMission,
+    );
+    const hit = eligible.find(
+      (s) =>
+        String(s.artifact_id) === entry.artifact_id &&
+        String(s.source_execution_id) === entry.producer_execution_id &&
+        String(s.source_governed_task_id) ===
+          entry.producer_governed_task_id &&
+        String(s.source_task_id) === entry.producer_task_id &&
+        String(s.source_mission_id) === producerMissionId &&
+        String(s.sha256) === entry.sha256,
+    );
+    if (!hit) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        `${entry.artifact_id}:cross_mission_eligibility_revoked`,
+        { dependency_reason: "EXTERNAL_INPUT_LINEAGE" },
+      );
+    }
+  }
 
   /** PIN each resolved dependency onto the governed consumer task —
    *  called inside governed-task creation so the pin exists BEFORE any
@@ -1401,6 +1467,9 @@ export class ArtifactHandoffService {
         "executor_execution",
         e.producer_execution_id,
       ) as Record<string, unknown> | null;
+      // F6 — re-prove CURRENT canonical eligibility for cross-mission
+      // sources BEFORE a single byte lands in the consumer workspace.
+      this.assertCrossMissionEligibleNow(governed, e, srcExec);
       const { bytes } = this.artifacts.readForConsumption(e.artifact_id, {
         execution_id: e.producer_execution_id,
         mission_id: srcExec
@@ -1666,6 +1735,14 @@ export class ArtifactHandoffService {
       "executor_execution",
       String(entry!.producer_execution_id),
     ) as Record<string, unknown> | null;
+    // F6 — the SAME re-proof at the remote fetch boundary: a revoked
+    // lineage between pin and fetch serves zero bytes.
+    try {
+      this.assertCrossMissionEligibleNow(governed!, entry!, srcExec);
+    } catch {
+      this.rejectHandoffEvent(governed!, artifactId, "lineage_revoked");
+      reject("lineage_revoked");
+    }
     const { artifact, bytes } = this.artifacts.readForConsumption(
       entry!.artifact_id,
       {
