@@ -185,6 +185,15 @@ export const api = {
       method: "POST",
       body: "{}",
     }, { noAuthPrompt: true }),
+  /* Canonical auto-policy status for the /app surface — polled by the
+     Auto-run controls card; abortable so the newest poll wins and a
+     stale response can never overwrite a fresher one. */
+  autoPolicyStatusApp: (id: string, signal?: AbortSignal) =>
+    req<{ auto_policy: import("./types").AutoPolicyStatus }>(
+      `/vnext/objectives/${id}/auto-policy`,
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
   autoPolicyControlApp: (
     id: string,
     body: {
