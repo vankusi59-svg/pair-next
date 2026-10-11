@@ -169,7 +169,7 @@ export function SystemCost() {
           <EmptyState title="No cost policies" detail="The canonical cost_policy collection is empty." />
         ) : (
           <div className="tbl-wrap"><table className="tbl">
-            <thead><tr><th>Policy</th><th>Business</th><th>Scope type</th><th>Scope id</th><th>Max limit</th><th>Enabled</th><th>Warn %</th><th>Status</th><th>Version</th></tr></thead>
+            <thead><tr><th>Policy</th><th>Business</th><th>Scope type</th><th>Scope id</th><th>Period</th><th>Max limit</th><th>Enabled</th><th>Hard stop</th><th>Warn %</th><th>Status</th><th>Version</th></tr></thead>
             <tbody>
               {policies.data.map((p, i) => (
                 <tr key={field(p, ["cost_policy_id"]) !== "—" ? field(p, ["cost_policy_id"]) : String(i)}>
@@ -177,10 +177,15 @@ export function SystemCost() {
                   <td className="mono">{field(p, ["business_id"])}</td>
                   <td className="mono">{field(p, ["scope_type"])}</td>
                   <td className="mono">{field(p, ["scope_id"])}</td>
+                  <td className="mono">{field(p, ["period"])}</td>
                   <td className="mono" title={typeof p.max_microusd === "number" ? `${String(p.max_microusd)} micro-USD` : undefined}>
                     {usd(p.max_microusd)}
                   </td>
                   <td>{p.enabled === undefined ? "—" : p.enabled ? "yes" : "no"}</td>
+                  {/* R2-F1: hard_stop is its own canonical boolean — never inferred
+                      from enabled/status/limit. Only strict true/false render as
+                      yes/no; missing or noncanonical values show "unknown". */}
+                  <td>{p.hard_stop === true ? "yes" : p.hard_stop === false ? "no" : "unknown"}</td>
                   <td className="mono">{field(p, ["warning_threshold_pct"])}</td>
                   <td>{field(p, ["status"])}</td>
                   <td className="mono">{field(p, ["version"])}</td>

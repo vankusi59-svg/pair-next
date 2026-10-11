@@ -367,50 +367,80 @@ test("settings: clear token requires confirmation; legacy link present; no crede
 
 /* ---------------- B5.5 R1 ---------------- */
 
-test("cost R1-F1: canonical P13 fields — max_microusd, scope triple, profile pricing; null/noncanonical never $0", async ({ page }) => {
+test("cost R1-F1+R2-F1: canonical P13 fields — max_microusd, scope triple, period, hard_stop, profile pricing; null/noncanonical never $0", async ({ page }) => {
   await seedSession(page);
-  // labeled interception — canonical P13-shaped fixtures (src/pair/cost.ts row shapes)
+  const mutations: string[] = [];
+  // labeled interception — canonical P13-shaped fixtures (src/pair/cost.ts:
+  // scope_type ∈ business/department/agent/mission; period ∈ DAY/WEEK/MONTH/
+  // MISSION_LIFETIME; billing_mode ∈ METERED_API/SUBSCRIPTION/FREE/UNMETERED/
+  // UNKNOWN; hard_stop is a boolean governance flag).
   await page.route("**/api/cost-policies", (route) => route.fulfill({
     status: 200, contentType: "application/json",
     body: JSON.stringify({ cost_policies: [
-      { cost_policy_id: "CPOL_a1", business_id: "biz-9", scope_type: "DEPARTMENT", scope_id: "trading", period: "daily", max_microusd: 2500000, warning_threshold_pct: 80, enabled: true, status: "ACTIVE", version: 4 },
-      { cost_policy_id: "CPOL_b2", business_id: "biz-3", scope_type: "MISSION", scope_id: "msn-7", period: "monthly", max_microusd: null, enabled: false, status: "DISABLED", version: 1 },
-      { cost_policy_id: "CPOL_c3", business_id: "biz-5", scope_type: "AGENT", scope_id: "agt-2", max_microusd: "500000", enabled: true, status: "ACTIVE", version: 2 },
+      // a1/a2: equal monetary limits, different hard_stop → must stay distinguishable
+      { cost_policy_id: "CPOL_a1", business_id: "biz-9", scope_type: "department", scope_id: "trading", period: "DAY", max_microusd: 2500000, hard_stop: true, warning_threshold_pct: 80, enabled: true, status: "ACTIVE", version: 4 },
+      { cost_policy_id: "CPOL_a2", business_id: "biz-9", scope_type: "department", scope_id: "analytics", period: "DAY", max_microusd: 2500000, hard_stop: false, warning_threshold_pct: 80, enabled: true, status: "ACTIVE", version: 1 },
+      { cost_policy_id: "CPOL_b2", business_id: "biz-3", scope_type: "business", scope_id: "biz-3", period: "MONTH", max_microusd: null, enabled: false, status: "DISABLED", version: 1 }, // hard_stop missing → unknown
+      { cost_policy_id: "CPOL_c3", business_id: "biz-5", scope_type: "agent", scope_id: "agt-2", period: "WEEK", max_microusd: "500000", hard_stop: "yes", enabled: true, status: "ACTIVE", version: 2 }, // string amount + string hard_stop → both unknown
+      { cost_policy_id: "CPOL_d4", business_id: "biz-7", scope_type: "mission", scope_id: "msn-7", period: "MISSION_LIFETIME", max_microusd: 1000000, hard_stop: true, enabled: true, status: "ACTIVE", version: 1 },
     ] }),
   }));
   await page.route("**/api/cost-profiles", (route) => route.fulfill({
     status: 200, contentType: "application/json",
     body: JSON.stringify({ cost_profiles: [
-      { cost_profile_id: "CPRO_1", ref_type: "model", ref_id: "gpt-5", billing_mode: "PER_TOKEN", fixed_microusd: 125000, input_microusd_per_mtok: 2400, output_microusd_per_mtok: 9600, reserve_microusd: 50000, currency: "USD", status: "ACTIVE", version: 2 },
-      { cost_profile_id: "CPRO_2", ref_type: "route", ref_id: "r-1", billing_mode: "FIXED", fixed_microusd: null, input_microusd_per_mtok: null, output_microusd_per_mtok: null, reserve_microusd: 0, currency: "USD", status: "ACTIVE", version: 1 },
+      { cost_profile_id: "CPRO_1", ref_type: "model", ref_id: "gpt-5", billing_mode: "METERED_API", fixed_microusd: 125000, input_microusd_per_mtok: 2400, output_microusd_per_mtok: 9600, reserve_microusd: 50000, currency: "USD", status: "ACTIVE", version: 2 },
+      { cost_profile_id: "CPRO_2", ref_type: "route", ref_id: "r-1", billing_mode: "SUBSCRIPTION", fixed_microusd: null, input_microusd_per_mtok: null, output_microusd_per_mtok: null, reserve_microusd: 0, currency: "USD", status: "ACTIVE", version: 1 },
     ] }),
   }));
+  // registered last → consulted first: records any non-GET to /api/cost*
+  // before the GET fulfillers above handle reads (strictly read-only proof)
+  await page.route("**/api/cost*", (route, req) => {
+    if (req.method() !== "GET") mutations.push(req.method() + " " + req.url());
+    return route.fallback();
+  });
   await page.goto("/app/system/cost");
   const pol = page.locator("section[aria-label='cost policies']");
+  // a1 vs a2: identical $2.5 limit, hard_stop yes vs no — distinguishable
   const rowA = pol.locator("tr", { hasText: "CPOL_a1" });
-  await expect(rowA.getByText("biz-9", { exact: true })).toBeVisible();
-  await expect(rowA.getByText("DEPARTMENT")).toBeVisible();
-  await expect(rowA.getByText("trading")).toBeVisible();
-  await expect(rowA.getByText("$2.5")).toBeVisible(); // 2,500,000 µUSD
+  await expect(rowA.getByText("biz-9").first()).toBeVisible();
+  await expect(rowA.getByText("department", { exact: true })).toBeVisible();
+  await expect(rowA.getByText("trading", { exact: true })).toBeVisible();
+  await expect(rowA.locator("td").nth(4)).toHaveText("DAY");
+  await expect(rowA.locator("td").nth(5)).toHaveText("$2.5"); // 2,500,000 µUSD
+  await expect(rowA.locator("td").nth(7)).toHaveText("yes"); // hard_stop === true
+  const rowA2 = pol.locator("tr", { hasText: "CPOL_a2" });
+  await expect(rowA2.getByText("analytics", { exact: true })).toBeVisible();
+  await expect(rowA2.locator("td").nth(5)).toHaveText("$2.5"); // same limit as a1
+  await expect(rowA2.locator("td").nth(7)).toHaveText("no"); // hard_stop === false — not inferred
+  // DAY vs MONTH vs MISSION_LIFETIME are visibly different periods
   const rowB = pol.locator("tr", { hasText: "CPOL_b2" });
-  await expect(rowB.getByText("MISSION")).toBeVisible();
-  await expect(rowB.getByText("msn-7")).toBeVisible();
-  await expect(rowB.getByText("unknown")).toBeVisible(); // null limit ≠ $0
+  await expect(rowB.getByText("business", { exact: true })).toBeVisible();
+  await expect(rowB.locator("td").nth(4)).toHaveText("MONTH");
+  await expect(rowB.locator("td").nth(5)).toHaveText("unknown"); // null limit ≠ $0
+  await expect(rowB.locator("td").nth(7)).toHaveText("unknown"); // missing hard_stop ≠ true/false
   const rowC = pol.locator("tr", { hasText: "CPOL_c3" });
-  await expect(rowC.getByText("AGENT")).toBeVisible();
-  await expect(rowC.getByText("unknown")).toBeVisible(); // string amount is noncanonical — not $0, not $0.5
+  await expect(rowC.getByText("agent", { exact: true })).toBeVisible();
+  await expect(rowC.locator("td").nth(4)).toHaveText("WEEK");
+  await expect(rowC.locator("td").nth(5)).toHaveText("unknown"); // string amount noncanonical — not $0, not $0.5
+  await expect(rowC.locator("td").nth(7)).toHaveText("unknown"); // "yes" string is not boolean true
+  const rowD = pol.locator("tr", { hasText: "CPOL_d4" });
+  await expect(rowD.getByText("mission", { exact: true })).toBeVisible();
+  await expect(rowD.locator("td").nth(4)).toHaveText("MISSION_LIFETIME");
+  await expect(rowD.locator("td").nth(7)).toHaveText("yes");
   const prof = page.locator("section[aria-label='cost profiles']");
   const r1 = prof.locator("tr", { hasText: "model:gpt-5" });
   await expect(r1.getByText("model:gpt-5")).toBeVisible();
-  await expect(r1.getByText("PER_TOKEN")).toBeVisible();
+  await expect(r1.getByText("METERED_API")).toBeVisible();
   await expect(r1.getByText("$0.125")).toBeVisible();  // fixed
   await expect(r1.getByText("$0.0024")).toBeVisible(); // input /Mtok
   await expect(r1.getByText("$0.0096")).toBeVisible(); // output /Mtok
   await expect(r1.getByText("$0.05")).toBeVisible();   // reserve
   const r2 = prof.locator("tr", { hasText: "route:r-1" });
   await expect(r2.getByText("route:r-1")).toBeVisible();
+  await expect(r2.getByText("SUBSCRIPTION")).toBeVisible();
   await expect(r2.getByText("$0", { exact: true })).toBeVisible(); // reserve 0 IS a real zero
   await expect(r2.getByText("unknown").first()).toBeVisible();     // the three nulls are unknown
+  expect(mutations).toEqual([]); // strictly read-only — zero cost mutation POSTs
 });
 
 test("settings R1-F2: theme alternates across shell + settings — one transition each; reload preserves", async ({ page }) => {
