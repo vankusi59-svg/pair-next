@@ -560,4 +560,41 @@ export const apiAdmin = {
     req<{ draft: import("./types").MissionDraft }>(
       `/conversations/${encodeURIComponent(id)}/drafts/${encodeURIComponent(draftId)}/reject`,
       { method: "POST", body: "{}" }, { noAuthPrompt: true }),
+
+  /* ---- P15.9-B5.5 — system surface reads + schedule mutations.
+     Same canonical endpoints, Bearer token + x-operator-id; noAuthPrompt
+     only. Reads take an AbortSignal; POSTs never get one — a possibly-
+     committed POST is never aborted. All are GLOBAL unfiltered reads. */
+  providers: (signal?: AbortSignal) =>
+    req<{ providers: Array<Record<string, unknown>>; qualifications: Array<Record<string, unknown>> }>(
+      "/providers", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  models: (signal?: AbortSignal) =>
+    req<{ models: Array<Record<string, unknown>>; bindings: Array<Record<string, unknown>>; qualifications: Array<Record<string, unknown>>; role_assignments: Array<Record<string, unknown>> }>(
+      "/models", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  routes: (signal?: AbortSignal) =>
+    req<{ routes: Array<Record<string, unknown>>; model_bindings: Array<Record<string, unknown>>; routable_models: Array<Record<string, unknown>>; route_decisions: Array<Record<string, unknown>>; routing_decisions: Array<Record<string, unknown>> }>(
+      "/routes", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  recovery: (signal?: AbortSignal) =>
+    req<{ decisions: Array<Record<string, unknown>>; attempts: Array<Record<string, unknown>>; scheduled: Array<Record<string, unknown>> }>(
+      "/recovery", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  schedules: (signal?: AbortSignal) =>
+    req<{ schedules: import("./app/types").ScheduleRow[] }>(
+      "/schedules", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  createSchedule: (body: { goal: string; cron: string; name?: string; project_id?: string }) =>
+    req<Record<string, unknown>>("/schedules", {
+      method: "POST", body: JSON.stringify(body),
+    }, { noAuthPrompt: true }),
+  scheduleAction: (id: string, action: "enable" | "disable" | "delete") =>
+    req<Record<string, unknown>>(`/schedules/${encodeURIComponent(id)}/${action}`, {
+      method: "POST", body: "{}",
+    }, { noAuthPrompt: true }),
+  cost: (signal?: AbortSignal) =>
+    req<import("./app/types").CostRead>(
+      "/cost", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  costPolicies: (signal?: AbortSignal) =>
+    req<{ cost_policies: Array<Record<string, unknown>> }>(
+      "/cost-policies", signal ? { signal } : undefined, { noAuthPrompt: true }),
+  costProfiles: (signal?: AbortSignal) =>
+    req<{ cost_profiles: Array<Record<string, unknown>> }>(
+      "/cost-profiles", signal ? { signal } : undefined, { noAuthPrompt: true }),
 };

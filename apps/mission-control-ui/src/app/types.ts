@@ -435,3 +435,44 @@ export interface MissionPreview {
   plan_source: string | null;
   plan_model: string | null;
 }
+
+/* ---- P15.9-B5.5 — system surface row types (canonical payloads,
+   passthrough index signatures for unverified fields). ---- */
+export interface ScheduleRow {
+  schedule_id: string;
+  name?: string | null;
+  goal?: string;
+  cron?: string;
+  project_id?: string;
+  operator_id?: string;
+  enabled?: boolean;
+  deleted?: boolean;
+  next_due_at?: string | null;
+  last_fired_at?: string | null;
+  last_mission_id?: string | null;
+  last_error?: string | null;
+  run_count?: number;
+  created_at?: string;
+  [k: string]: unknown;
+}
+export interface MonetaryPosition {
+  policies?: Array<Record<string, unknown>>;
+  profiles?: Array<Record<string, unknown>>;
+  reservations_held?: Array<Record<string, unknown>>;
+  reservations_committed?: Array<Record<string, unknown>>;
+  held_microusd?: number;
+  committed_microusd?: number;
+  settled_microusd?: number;
+  billing_mode_breakdown?: Record<string, number>;
+  unpriced_dispatches?: number;
+  cost_halt?: boolean;
+  [k: string]: unknown;
+}
+export interface CostRead {
+  remote_dispatches_today: number;
+  remote_daily_limit: number;
+  cost_halt: boolean;
+  schedules_active: number;
+  monetary?: MonetaryPosition;
+  [k: string]: unknown;
+}
