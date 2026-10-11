@@ -70,6 +70,10 @@ export function Inbox() {
     reviewId: string;
     outcome: string;
     recommended: string | null;
+    // R1-F4 — generated once when the dialog opens so a retried
+    // request after an ambiguous failure (timeout/5xx) replays the
+    // SAME operation instead of silently minting a new one.
+    idempotencyKey: string;
   } | null>(null);
   const opSeq = useRef(0);
 
@@ -149,7 +153,7 @@ export function Inbox() {
 
   const acceptReview = () => {
     if (!rdlg) return;
-    const { objectiveId, reviewId } = rdlg;
+    const { objectiveId, reviewId, idempotencyKey } = rdlg;
     const seq = ++opSeq.current;
     setRdlg(null);
     setMutBusy(true);
@@ -157,7 +161,7 @@ export function Inbox() {
     api
       .objectiveReviewSignoff(objectiveId, {
         review_id: reviewId,
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: idempotencyKey,
       })
       .then((r) => {
         if (seq !== opSeq.current) return;
@@ -265,6 +269,7 @@ export function Inbox() {
                           reviewId: String(o.latest_review!.review_id),
                           outcome: String(o.latest_review!.outcome ?? "—"),
                           recommended: o.latest_review!.recommended_status ?? null,
+                          idempotencyKey: crypto.randomUUID(),
                         })}>Accept ACHIEVED (A2)</button>
                       <button className="ghost" disabled title="API_MISSING — owner feedback seam not built yet">Request changes (A2)</button>
                     </span>

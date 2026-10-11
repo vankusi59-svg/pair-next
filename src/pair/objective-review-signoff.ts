@@ -33,11 +33,11 @@ import { newId, utcnow } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
 import {
+  assertCanonicalWorkStatus,
   canonicalAdaptiveReviewsFor,
   type ObjectiveAdaptiveReviewDeps,
 } from "./objective-adaptive-review.js";
 import type { ObjectiveAuthorityService } from "./objective-authority.js";
-import { TERMINAL_WORK_ITEM_STATUSES } from "./business.js";
 
 export const OBJECTIVE_REVIEW_SIGNOFF_ENTITY = "objective_review_signoff";
 export const OBJECTIVE_REVIEW_SIGNOFF_SCHEMA =
@@ -91,6 +91,10 @@ export class ObjectiveReviewSignoffService {
     if (typeof input.idempotency_key !== "string" || !input.idempotency_key.trim()) {
       signoffFail("idempotency_key required");
     }
+    // R1-F1 — the normalized reason is PART of the idempotency
+    // semantics: same key + different rationale must conflict, never
+    // silently replay.
+    const reason = input.reason === undefined ? null : String(input.reason);
     // Strict canonical objective read (throws NOT_FOUND if absent or
     // non-canonical). Deadline/terminal rules are preserved inside
     // transitionStatus (expireIfDue runs there first).
@@ -117,10 +121,31 @@ export class ObjectiveReviewSignoffService {
             String(prior.review_id) === reviewId &&
             String(prior.decision) === "accept" &&
             String(prior.actor) === input.actor &&
-            String(prior.business_id) === String(objective.business_id);
+            String(prior.business_id) === String(objective.business_id) &&
+            (prior.reason ?? null) === reason;
           if (!sameSemantics) {
             signoffFail(
               `idempotency_key ${input.idempotency_key} replays with different semantics`,
+            );
+          }
+          // R1-F4 — never trust a persisted receipt at face value:
+          // revalidate it against its canonical OBJECTIVE_REVIEW_SIGNED_OFF
+          // event anchor carrying the same decision bindings.
+          const anchored = this.deps.store
+            .listEvents(OBJECTIVE_REVIEW_SIGNOFF_ENTITY, String(prior.entity_id))
+            .some((e) => {
+              if (String(e.event_type) !== OBJECTIVE_REVIEW_SIGNED_OFF_EVENT) return false;
+              const md = (e.metadata ?? {}) as Record<string, unknown>;
+              return (
+                String(md.objective_id ?? "") === objectiveId &&
+                String(md.review_id ?? "") === String(prior.review_id) &&
+                String(md.decision ?? "") === String(prior.decision) &&
+                String(md.resulting_status ?? "") === String(prior.decision_status)
+              );
+            });
+          if (!anchored) {
+            signoffFail(
+              `sign-off receipt ${String(prior.entity_id)} fails canonical anchor revalidation`,
             );
           }
           return { signoff: prior, objective, replayed: true };
@@ -175,16 +200,34 @@ export class ObjectiveReviewSignoffService {
           `review ${reviewId} pins are stale — objective drifted since review`,
         );
       }
-      // No active work: every work_item bound to this objective must be
-      // terminal. DONE already implies its bound mission completed
-      // (work-completion contract), so the mission level is covered.
+      // R1-F3 — no active work, CANONICALLY proven: the claimed status
+      // must equal the event-derived lifecycle state, a DONE item must
+      // carry a validated work_completion record (a forged DONE field
+      // or missing WCP fails closed), and a CANCELLED item is terminal
+      // only when canonical derivation proves the cancellation — never
+      // trust raw row fields.
       for (const w of this.deps.store.list<Row>("work_item")) {
         if (String(w.objective_id) !== objectiveId) continue;
-        if (!TERMINAL_WORK_ITEM_STATUSES.has(String(w.status))) {
+        let wsStatus: string;
+        try {
+          wsStatus = assertCanonicalWorkStatus(this.deps.store, w);
+        } catch (err) {
           signoffFail(
-            `work item ${String(w.work_item_id)} status ${String(w.status)} is still active`,
+            `work item ${String(w.work_item_id)} fails canonical status proof: ${(err as Error).message}`,
           );
         }
+        if (wsStatus === "DONE") {
+          if (!this.deps.reviewDeps.business.proveWorkItemDone(w)) {
+            signoffFail(
+              `work item ${String(w.work_item_id)} claims DONE without canonical completion proof`,
+            );
+          }
+          continue;
+        }
+        if (wsStatus === "CANCELLED") continue; // derived ⇒ proven cancellation
+        signoffFail(
+          `work item ${String(w.work_item_id)} status ${wsStatus} is still active`,
+        );
       }
       // The ONE canonical transition — owner-authorized, table-bounded,
       // terminal-safe, atomic, evented. Nested inside this immediate
@@ -197,6 +240,7 @@ export class ObjectiveReviewSignoffService {
       });
       const id = newId("RSO");
       const receipt: Row = {
+        version: 0,
         entity_type: OBJECTIVE_REVIEW_SIGNOFF_ENTITY,
         entity_id: id,
         schema_version: OBJECTIVE_REVIEW_SIGNOFF_SCHEMA,
@@ -215,9 +259,11 @@ export class ObjectiveReviewSignoffService {
         dedup_key: input.idempotency_key,
         created_at: utcnow(),
         updated_at: utcnow(),
-        version: 0,
       };
-      this.deps.store.put(OBJECTIVE_REVIEW_SIGNOFF_ENTITY, id, receipt, 0);
+      // R1-F4 — return the PERSISTED row (version already bumped), so
+      // first response and later replay expose identical receipt data.
+      const persisted = this.deps.store.put(
+        OBJECTIVE_REVIEW_SIGNOFF_ENTITY, id, receipt, 0);
       this.deps.store.event({
         entity_type: OBJECTIVE_REVIEW_SIGNOFF_ENTITY,
         entity_id: id,
@@ -230,7 +276,7 @@ export class ObjectiveReviewSignoffService {
           resulting_status: "ACHIEVED",
         },
       });
-      return { signoff: receipt, objective: saved, replayed: false };
+      return { signoff: persisted, objective: saved, replayed: false };
     });
   }
 }

@@ -1493,6 +1493,31 @@ export function createMissionControlServer(
         }
         const signoffActor = rawSignoffActor.startsWith("operator:")
           ? rawSignoffActor : `operator:${rawSignoffActor}`;
+        // R1-F2 — strict request schema BEFORE any coercion: wrong JSON
+        // types (arrays/objects/numbers) are a typed 400 client error
+        // with zero mutation — String(body.action) must never turn
+        // ["accept"] into "accept".
+        for (const [f, v] of [
+          ["action", body.action],
+          ["review_id", body.review_id],
+          ["idempotency_key", body.idempotency_key],
+        ] as const) {
+          if (typeof v !== "string" || !v.trim()) {
+            return void json(res, 400, {
+              error: "FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST",
+              detail: `${f} must be a non-empty string`,
+            });
+          }
+        }
+        if (
+          body.reason !== undefined && body.reason !== null &&
+          typeof body.reason !== "string"
+        ) {
+          return void json(res, 400, {
+            error: "FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST",
+            detail: "reason must be a string when present",
+          });
+        }
         const signoffSvc = new ObjectiveReviewSignoffService({
           store: deps.store,
           objectives: biz.objectives,
@@ -1510,11 +1535,11 @@ export function createMissionControlServer(
         return void json(res, 200, {
           signoff: signoffSvc.signoff(m[1]!, {
             actor: signoffActor,
-            action: String(body.action ?? ""),
-            review_id: String(body.review_id ?? ""),
-            idempotency_key: String(body.idempotency_key ?? ""),
+            action: body.action as string,
+            review_id: body.review_id as string,
+            idempotency_key: body.idempotency_key as string,
             reason: body.reason === undefined || body.reason === null
-              ? undefined : String(body.reason),
+              ? undefined : (body.reason as string),
           }),
         });
       }
@@ -1835,6 +1860,7 @@ export function createMissionControlServer(
         e.code === "FAIL_CLOSED_POLICY_FORBIDDEN" ||
         e.code === "FAIL_CLOSED_POLICY_OWNER" ||
         e.code === "FAIL_CLOSED_COCKPIT_AUTHORITY" ||
+        e.code === "FAIL_CLOSED_OBJECTIVE_AUTHORITY" ||
         e.code === "FAIL_CLOSED_COMPANY_SCOPE" ? 403
         : e.code === "NOT_FOUND" ? 404
         : e.code?.startsWith("FAIL_CLOSED") ? 409

@@ -18,6 +18,8 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { AddressInfo } from "node:net";
+import { createMissionControlServer } from "../pair/mission-control-server.js";
 import {
   ApprovalQueue,
   ArtifactAuthority,
@@ -71,6 +73,7 @@ type Row = Record<string, unknown> & { version: number };
 type FullStack = {
   dir: string;
   store: PairEvidenceStore;
+  control: MissionControl;
   biz: BusinessLayer;
   wf: WorkforceService;
   workstreams: ObjectiveWorkstreamService;
@@ -120,8 +123,8 @@ function freshFullStack(name: string): FullStack {
     store, objectives: biz.objectives, workstreams, business: biz,
     artifacts: authority });
   const project = service.createProject({ name: "p", root_location: workspace });
-  return { dir, store, biz, wf, workstreams, alloc, authority, service,
-    kpiSvc, projectId: String(project.project_id) };
+  return { dir, store, control, biz, wf, workstreams, alloc, authority,
+    service, kpiSvc, projectId: String(project.project_id) };
 }
 
 function mkBusiness(s: FullStack) {
@@ -359,6 +362,7 @@ describe("P15.10-A2 — owner review sign-off", () => {
       actor: OWNER, action: "accept",
       review_id: String(review.review_id),
       idempotency_key: "so-a1",
+      reason: "looks good", // R1-F1 — replay must repeat the reason too
     });
     expect(r2.replayed).toBe(true);
     expect(String(r2.signoff.entity_id)).toBe(String(r1.signoff.entity_id));
@@ -509,6 +513,224 @@ describe("P15.10-A2 — owner review sign-off", () => {
       actor: "", action: "accept",
       review_id: String(review.review_id), idempotency_key: "so-a9",
     }), "FAIL_CLOSED_OPERATOR_ID_REQUIRED");
+    s.store.close();
+  });
+
+  /* ---------------- R1 audit-closure regressions ---------------- */
+
+  it("R1-F1 same key + changed reason → reject; identical reason → replay", async () => {
+    const { s, oid, binding } = seeded("r1f1");
+    const review = await candidateReview(s, oid, binding);
+    const svc = signoffSvc(s);
+    svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f1",
+      reason: "first reason",
+    });
+    // Changed rationale under the same key conflicts — never replays.
+    expectFail(() => svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f1",
+      reason: "different rationale",
+    }), "FAIL_CLOSED_REVIEW_SIGNOFF");
+    expectFail(() => svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f1",
+    }), "FAIL_CLOSED_REVIEW_SIGNOFF"); // reason dropped ⇒ different semantics
+    const replay = svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f1",
+      reason: "first reason",
+    });
+    expect(replay.replayed).toBe(true);
+    s.store.close();
+  });
+
+  it("R1-F3a forged DONE without WCP → reject (raw status is never trusted)", async () => {
+    const { s, oid, binding } = seeded("r1f3a", ["report", "channels"]);
+    grantBundle(s, oid, { required_count: 1 });
+    completeDeliverable(s, binding, "report");
+    s.kpiSvc.advance(oid);
+    qualifyCeo(s.store);
+    const ops = createDefaultObjectiveOperatingService({
+      store: s.store, business: s.biz, workforce: s.wf,
+      objectives: s.biz.objectives, workstreams: s.workstreams,
+      invoker: FAKE_INVOKER,
+    });
+    expect((await ops.service.runObjectivePass({
+      objective_id: oid, actor: OP })).outcome).toBe("TARGET_MET_CANDIDATE");
+    const reviews = canonicalAdaptiveReviewsFor(
+      { store: s.store, business: s.biz, workforce: s.wf,
+        objectives: s.biz.objectives, workstreams: s.workstreams }, oid);
+    const latest = reviews.at(-1)!;
+    // Forge: flip the still-active workstream item's raw status to
+    // DONE — no WORK_ITEM_COMPLETED event, no WCP. Canonical
+    // derivation exposes the lie → sign-off refuses.
+    const extraWid = wsWorkItemId(binding, "channels");
+    const w = s.store.get("work_item", extraWid);
+    s.store.put("work_item", extraWid, { ...w, status: "DONE" }, w.version);
+    expectFail(() => signoffSvc(s).signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(latest.review_id), idempotency_key: "so-r1f3a",
+    }), "FAIL_CLOSED_REVIEW_SIGNOFF");
+    expect(String(s.biz.objectives.get(oid).status)).toBe("ACTIVE");
+    s.store.close();
+  });
+
+  it("R1-F3b legitimately DONE work items still allow the happy path", async () => {
+    const { s, oid, binding } = seeded("r1f3b", ["a", "b", "c"]);
+    const review = await candidateReview(s, oid, binding, ["a", "b", "c"]);
+    const r = signoffSvc(s).signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f3b",
+    });
+    expect(String(r.objective.status)).toBe("ACHIEVED");
+    s.store.close();
+  });
+
+  it("R1-F4a persisted receipt parity — put() row has version ≥1 and replay returns the same persisted data", async () => {
+    const { s, oid, binding } = seeded("r1f4a");
+    const review = await candidateReview(s, oid, binding);
+    const svc = signoffSvc(s);
+    const r1 = svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f4a",
+      reason: "ok",
+    });
+    expect(Number(r1.signoff.version)).toBeGreaterThanOrEqual(1);
+    const stored = s.store.get<Row>(
+      OBJECTIVE_REVIEW_SIGNOFF_ENTITY, String(r1.signoff.entity_id));
+    expect(stored).toEqual(r1.signoff);
+    const r2 = svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f4a",
+      reason: "ok",
+    });
+    expect(r2.replayed).toBe(true);
+    expect(r2.signoff).toEqual(r1.signoff);
+    s.store.close();
+  });
+
+  it("R1-F4b tampered persisted receipt → replay rejects on anchor/semantics", async () => {
+    const { s, oid, binding } = seeded("r1f4b");
+    const review = await candidateReview(s, oid, binding);
+    const svc = signoffSvc(s);
+    const r1 = svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f4b",
+      reason: "ok",
+    });
+    // Tamper the persisted receipt's decision_status — the canonical
+    // OBJECTIVE_REVIEW_SIGNED_OFF anchor still says ACHIEVED, so the
+    // receipt now fails anchor revalidation and must never be trusted.
+    const sid = String(r1.signoff.entity_id);
+    const row = s.store.get<Row>(OBJECTIVE_REVIEW_SIGNOFF_ENTITY, sid);
+    s.store.put(OBJECTIVE_REVIEW_SIGNOFF_ENTITY, sid,
+      { ...row, decision_status: "INFEASIBLE" }, row.version);
+    expectFail(() => svc.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f4b",
+      reason: "ok",
+    }), "FAIL_CLOSED_REVIEW_SIGNOFF");
+    s.store.close();
+  });
+
+  it("R1-F4c second store connection on the same DB — loser of the race fails closed", async () => {
+    const { s, oid, binding } = seeded("r1f4c");
+    const review = await candidateReview(s, oid, binding);
+    // Independently connected SQLite connection to the same file —
+    // the cross-process contention case the audit asked for.
+    const store2 = new PairEvidenceStore(path.join(s.dir, "pair.db"));
+    const biz2 = new BusinessLayer({ store: store2, control: s.control,
+      schedules: new MissionScheduleService(s.service) });
+    const wf2 = new WorkforceService({ store: store2, business: biz2 });
+    const ws2 = new ObjectiveWorkstreamService(
+      { store: store2, business: biz2, workforce: wf2, objectives: biz2.objectives });
+    const svc2 = new ObjectiveReviewSignoffService({
+      store: store2, objectives: biz2.objectives,
+      reviewDeps: { store: store2, business: biz2, workforce: wf2,
+        objectives: biz2.objectives, workstreams: ws2 },
+    });
+    const r1 = signoffSvc(s).signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f4c",
+    });
+    expect(String(r1.objective.status)).toBe("ACHIEVED");
+    // The losing connection sees the committed ACHIEVED row and fails
+    // closed — at most one transition exists system-wide.
+    expectFail(() => svc2.signoff(oid, {
+      actor: OWNER, action: "accept",
+      review_id: String(review.review_id), idempotency_key: "so-r1f4c-other",
+    }), "FAIL_CLOSED_REVIEW_SIGNOFF");
+    store2.close();
+    s.store.close();
+  });
+
+  it("R1-F2/F4 HTTP boundary — strict schema 400, non-owner 403, no-token 401, valid accept 200", async () => {
+    const { s, oid, binding } = seeded("r1http");
+    const review = await candidateReview(s, oid, binding);
+    const srv = createMissionControlServer({
+      control: s.control, business: s.biz, workforce: s.wf,
+      store: s.store, authToken: "tok",
+    });
+    await new Promise<void>((r) => srv.listen(0, r));
+    const port = (srv.address() as AddressInfo).port;
+    const url = `http://127.0.0.1:${port}/api/vnext/objectives/${oid}/review-signoff`;
+    const post = (body: unknown, headers: Record<string, string> = {}) =>
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json",
+          authorization: "Bearer tok", "x-operator-id": OWNER, ...headers },
+        body: JSON.stringify(body),
+      });
+    try {
+      // 401 without the bearer token.
+      const noAuth = await fetch(url, {
+        method: "POST", headers: { "content-type": "application/json",
+          "x-operator-id": OWNER }, body: "{}" });
+      expect(noAuth.status).toBe(401);
+      // 400 typed client errors for non-string JSON fields — ZERO
+      // mutation must result (objective stays ACTIVE).
+      for (const bad of [
+        { action: ["accept"], review_id: "x", idempotency_key: "k" },
+        { action: "accept", review_id: 123, idempotency_key: "k" },
+        { action: "accept", review_id: "x", idempotency_key: { k: 1 } },
+        { action: "accept", review_id: "x", idempotency_key: "k",
+          reason: 42 },
+      ]) {
+        const res = await post(bad);
+        expect(res.status).toBe(400);
+        const j = await res.json() as { error?: string };
+        expect(j.error).toBe("FAIL_CLOSED_REVIEW_SIGNOFF_REQUEST");
+      }
+      expect(String(s.biz.objectives.get(oid).status)).toBe("ACTIVE");
+      // 403 for a non-owner.
+      const nonOwner = await post(
+        { action: "accept", review_id: String(review.review_id),
+          idempotency_key: "k-nonowner" },
+        { "x-operator-id": "operator:intruder" });
+      expect(nonOwner.status).toBe(403);
+      // Valid owner accept → 200, ACHIEVED, replayed=false; replay of
+      // the SAME operation returns identical persisted receipt.
+      const ok = await post(
+        { action: "accept", review_id: String(review.review_id),
+          idempotency_key: "k-ok", reason: "ship it" });
+      expect(ok.status).toBe(200);
+      const j1 = await ok.json() as {
+        signoff: { replayed: boolean; signoff: { entity_id: string; version: number } } };
+      expect(j1.signoff.replayed).toBe(false);
+      expect(Number(j1.signoff.signoff.version)).toBeGreaterThanOrEqual(1);
+      expect(String(s.biz.objectives.get(oid).status)).toBe("ACHIEVED");
+      const again = await post(
+        { action: "accept", review_id: String(review.review_id),
+          idempotency_key: "k-ok", reason: "ship it" });
+      expect(again.status).toBe(200);
+      const j2 = await again.json() as typeof j1;
+      expect(j2.signoff.replayed).toBe(true);
+      expect(j2.signoff.signoff).toEqual(j1.signoff.signoff);
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
     s.store.close();
   });
 });

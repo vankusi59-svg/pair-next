@@ -168,7 +168,7 @@ export const api = {
       `/vnext/objectives/${encodeURIComponent(id)}/review-signoff`, {
         method: "POST",
         body: JSON.stringify({ action: "accept", ...input }),
-      }),
+      }, { noAuthPrompt: true }),
   objectiveReviews: (id: string, limit: number, signal?: AbortSignal) =>
     req<import("./app/types").ReviewsPage>(
       `/vnext/objectives/${encodeURIComponent(id)}/reviews?limit=${limit}`,
