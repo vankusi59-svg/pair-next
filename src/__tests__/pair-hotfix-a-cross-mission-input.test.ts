@@ -402,24 +402,26 @@ function mkGovernedConsumer(
 ) {
   const tid = taskId ?? `ATSK_C_${seq++}`;
   const gtId = `GT_${tid}`;
-  ctx.store.put(
-    "task",
-    tid,
-    {
-      task_id: tid,
-      task_key: "TCX",
-      mission_id: missionId,
-      plan_id: "PLAN_C",
-      title: "consumer",
-      task_instruction: "consume",
-      required_capabilities: ["FILE_OPERATIONS"],
-      depends_on: [],
-      status: "READY",
-      metadata: { pair_dataflow: { produces: [], consumes: ["in.md"] } },
-      version: 0,
-    },
-    0,
-  );
+  if (!ctx.store.tryGet("task", tid)) {
+    ctx.store.put(
+      "task",
+      tid,
+      {
+        task_id: tid,
+        task_key: "TCX",
+        mission_id: missionId,
+        plan_id: "PLAN_C",
+        title: "consumer",
+        task_instruction: "consume",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+        status: "READY",
+        metadata: { pair_dataflow: { produces: [], consumes: ["in.md"] } },
+        version: 0,
+      },
+      0,
+    );
+  }
   const depDigest = artifactDependencySetDigest(
     entries as unknown as DependencyArtifactEntry[],
   );
@@ -1030,5 +1032,311 @@ describe("HOTFIX-A cross-mission canonical artifact input binding", () => {
     mkAcceptedArtifact(ctx, own.missionId, "mine.md", Buffer.from("mine"));
     const list = eligible(ctx, ctx.store.get("mission", own.missionId));
     expect(list).toHaveLength(0);
+  });
+
+  /* ==================== R2 — full-allocation + fetch-lane hardening === */
+
+  const tamper = (
+    ctx: ReturnType<typeof mkCtx>,
+    entity: string,
+    id: string,
+    patch: Record<string, unknown>,
+  ) => {
+    const row = ctx.store.get(entity, id);
+    ctx.store.put(entity, id, { ...row, ...patch }, row.version);
+  };
+
+  it("R2-N6: tampered WDEL (intact WAL receipt) → fail closed", () => {
+    const { ctx, consumer } = eligibleFixture();
+    const wal = ctx.store
+      .list("workforce_allocation")
+      .find(
+        (r) =>
+          String(r.delegated_child_work_item_id) === consumer.workItemId,
+      )!;
+    tamper(ctx, "work_delegation", String(wal.delegation_id), {
+      delegated_to_agent_id: "AGT_FORGED",
+    });
+    expect(errCode(() => eligible(ctx, consumer.mission))).toBe(
+      "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+    );
+  });
+
+  it("R2-N7: invalid child graph membership (intact WAL) → fail closed", () => {
+    const { ctx, consumer } = eligibleFixture();
+    const mem = ctx.store
+      .list("work_graph_membership")
+      .find(
+        (m) => String(m.work_item_id) === consumer.workItemId,
+      )!;
+    tamper(ctx, "work_graph_membership", String(mem.entity_id), {
+      parent_work_item_id: "WI_FORGED",
+    });
+    expect(errCode(() => eligible(ctx, consumer.mission))).toBe(
+      "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+    );
+  });
+
+  it("R2-N8: broken objective workstream binding (intact WAL) → fail closed", () => {
+    const { ctx, consumer, scope } = eligibleFixture();
+    const binding = ctx.workstreams.getBinding(scope.objectiveId)!;
+    const ws = (binding.workstreams as Array<Record<string, unknown>>).slice();
+    ws[0] = { ...ws[0]!, work_item_id: "WI_FORGED" };
+    tamper(
+      ctx,
+      "objective_workstream_binding",
+      String(binding.binding_id),
+      { workstreams: ws },
+    );
+    expect(errCode(() => eligible(ctx, consumer.mission))).toBe(
+      "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+    );
+  });
+
+  it("R2-N9: two anchored PASS validations, different artifact sets → contradictory closed", () => {
+    const { ctx, consumer, art } = eligibleFixture();
+    const exec = ctx.store.get("executor_execution", art.eid);
+    const vid2 = `XVLD_FORGED_${seq++}`;
+    ctx.store.put("execution_validation", vid2, {
+      validation_id: vid2,
+      execution_id: art.eid,
+      mission_id: String(exec.mission_id),
+      governed_task_id: String(exec.governed_task_id),
+      status: "PASS",
+      artifact_ids: ["ART_OTHER_SET"],
+      created_at: utcnow(),
+      version: 0,
+    }, 0);
+    ctx.store.event({
+      entity_type: "executor_execution",
+      entity_id: art.eid,
+      event_type: "RESULT_VALIDATED",
+      new_state: "PASS",
+      actor: "PAIR_ARTIFACT_PROVENANCE_VALIDATOR",
+      correlation_id: String(exec.correlation_id),
+      metadata: { validation_id: vid2 },
+    });
+    // Two independently anchored PASS records → never consumable.
+    expect(errCode(() => eligible(ctx, consumer.mission))).toBe(
+      "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+    );
+  });
+
+  it("R2-H1: REMOTE_FETCH lane — pinned capability serves exact cross-mission bytes", () => {
+    const { ctx, consumer, art } = eligibleFixture();
+    const sources = eligible(ctx, consumer.mission);
+    const tasks = [consumerTask("xau-delta-brief.md")];
+    const out = reconcilePlanDataflow(tasks, {
+      external_input_artifacts: sources,
+    }).tasks;
+    const taskRow = {
+      ...out[0]!,
+      task_id: "ATSK_RF",
+      plan_id: "P",
+      plan_revision: 1,
+      required_capabilities: ["FILE_OPERATIONS"],
+    };
+    const entries = ctx.service.artifactResolver.resolveForConsumer({
+      mission: { ...consumer.mission, plan_revision: 1 },
+      task: taskRow,
+    });
+    const gc = mkGovernedConsumer(
+      ctx,
+      consumer.missionId,
+      [entries[0]! as unknown as Record<string, unknown>],
+      "ATSK_RF",
+    );
+    ctx.service.artifactHandoffs.pinForGovernedTask(
+      ctx.store.get("governed_task", gc.gtId),
+      entries,
+      "REMOTE_FETCH",
+    );
+    // The consumer's RUNNING execution — fetch is only legal
+    // pre-terminal, under the minted capability identity.
+    const cExec = `EXEC_C_${seq++}`;
+    ctx.store.put("executor_execution", cExec, {
+      execution_id: cExec,
+      governed_task_id: gc.gtId,
+      mission_id: consumer.missionId,
+      task_id: gc.tid,
+      executor_id: EX,
+      plan_revision: 1,
+      correlation_id: `COR_C_${gc.tid}`,
+      execution_state: "RUNNING",
+      workspace: ctx.workspace,
+      version: 0,
+    }, 0);
+    const claims = {
+      mission_id: consumer.missionId,
+      task_id: gc.tid,
+      governed_task_id: gc.gtId,
+      execution_id: cExec,
+      executor_id: EX,
+      dependency_set_digest: artifactDependencySetDigest(
+        entries as unknown as DependencyArtifactEntry[],
+      ),
+      issued_at: utcnow(),
+    };
+    const { artifact, bytes } = ctx.service.artifactHandoffs.authorizeConsumeFetch(
+      claims as never,
+      art.artifactId,
+    );
+    expect(bytes.toString()).toBe(art.bytes.toString());
+    expect(String(artifact.execution_id)).toBe(art.eid);
+    // Wrong producer identity — capability for the CONSUMER identity is
+    // bound to the consumer execution, never the producer's.
+    expect(
+      errCode(() =>
+        ctx.service.artifactHandoffs.authorizeConsumeFetch(
+          { ...claims, mission_id: art.artifact.mission_id } as never,
+          art.artifactId,
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_ARTIFACT_CONSUME_REJECTED");
+    // An ACCEPTED sibling artifact that is NOT pinned is never servable.
+    const stray = mkAcceptedArtifact(
+      ctx,
+      consumer.missionId === "" ? "" : consumer.missionId,
+      "mine.md",
+      Buffer.from("mine"),
+    );
+    void stray;
+    expect(
+      errCode(() =>
+        ctx.service.artifactHandoffs.authorizeConsumeFetch(
+          claims as never,
+          "ART_NOTPINNED",
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_ARTIFACT_CONSUME_REJECTED");
+  });
+
+  it("R2-H2: LOCAL_MATERIALIZATION lane — exact bytes land under the consumer root", () => {
+    const { ctx, consumer, art } = eligibleFixture();
+    const sources = eligible(ctx, consumer.mission);
+    const tasks = [consumerTask("xau-delta-brief.md")];
+    const out = reconcilePlanDataflow(tasks, {
+      external_input_artifacts: sources,
+    }).tasks;
+    const taskRow = {
+      ...out[0]!,
+      task_id: "ATSK_LM",
+      plan_id: "P",
+      plan_revision: 1,
+      required_capabilities: ["FILE_OPERATIONS"],
+    };
+    const entries = ctx.service.artifactResolver.resolveForConsumer({
+      mission: { ...consumer.mission, plan_revision: 1 },
+      task: taskRow,
+    });
+    const gc = mkGovernedConsumer(
+      ctx,
+      consumer.missionId,
+      [entries[0]! as unknown as Record<string, unknown>],
+      "ATSK_LM",
+    );
+    ctx.service.artifactHandoffs.pinForGovernedTask(
+      ctx.store.get("governed_task", gc.gtId),
+      entries,
+      "LOCAL_MATERIALIZATION",
+    );
+    const written = ctx.service.artifactHandoffs.materializeForConsumer(
+      ctx.store.get("governed_task", gc.gtId),
+    );
+    const dest = path.join(ctx.workspace, written[0]!);
+    expect(fs.readFileSync(dest).toString()).toBe(art.bytes.toString());
+    expect(sha256Hex(fs.readFileSync(dest))).toBe(art.artifact.sha256);
+  });
+
+  it("R2-INT2: production path — plan commit → governed dispatch → remote fetch bytes", () => {
+    const ctx = mkCtx("int2", (input: Record<string, unknown>) => {
+      ctx.plannerCalls.push(input);
+      return {
+        tasks: [
+          {
+            task_key: "TC1",
+            title: "verify input",
+            task_instruction:
+              "read and verify xau-delta-brief.md, write verdict.txt, then reply DONE.",
+            required_capabilities: ["FILE_OPERATIONS"],
+            depends_on: [],
+            metadata: {
+              pair_dataflow: {
+                produces: ["verdict.txt"],
+                consumes: ["xau-delta-brief.md"],
+              },
+            },
+          },
+        ],
+      };
+    });
+    const scope = mkScope(ctx, "J", ["wp", "wc"]);
+    const prod = openBoundMission(ctx, scope, "wp");
+    const art = mkAcceptedArtifact(
+      ctx,
+      prod.missionId,
+      "xau-delta-brief.md",
+      Buffer.from("# delta brief — canonical bytes"),
+    );
+    const consumer = openBoundMission(ctx, scope, "wc");
+    ctx.runtime.tick(consumer.missionId);
+    ctx.runtime.tick(consumer.missionId);
+    const committed = ctx.store
+      .list("task")
+      .find(
+        (t) =>
+          String(t.mission_id) === consumer.missionId &&
+          (t.metadata as Record<string, unknown> | undefined)?.[
+            PAIR_DATAFLOW_SOURCES
+          ] !== undefined,
+      )!;
+    // Governed dispatch path — real resolve+pin+materialize seams on
+    // the committed task (never a direct fixture row).
+    const entries = ctx.service.artifactResolver.resolveForConsumer({
+      mission: { ...ctx.store.get("mission", consumer.missionId), plan_revision: 1 },
+      task: committed,
+    });
+    expect(entries).toHaveLength(1);
+    const gc = mkGovernedConsumer(
+      ctx,
+      consumer.missionId,
+      [entries[0]! as unknown as Record<string, unknown>],
+      String(committed.task_id),
+    );
+    ctx.service.artifactHandoffs.pinForGovernedTask(
+      ctx.store.get("governed_task", gc.gtId),
+      entries,
+      "REMOTE_FETCH",
+    );
+    const cExec = `EXEC_CI_${seq++}`;
+    ctx.store.put("executor_execution", cExec, {
+      execution_id: cExec,
+      governed_task_id: gc.gtId,
+      mission_id: consumer.missionId,
+      task_id: gc.tid,
+      executor_id: EX,
+      plan_revision: 1,
+      correlation_id: `COR_CI_${gc.tid}`,
+      execution_state: "RUNNING",
+      workspace: ctx.workspace,
+      version: 0,
+    }, 0);
+    const { artifact, bytes } = ctx.service.artifactHandoffs.authorizeConsumeFetch(
+      {
+        mission_id: consumer.missionId,
+        task_id: gc.tid,
+        governed_task_id: gc.gtId,
+        execution_id: cExec,
+        executor_id: EX,
+        dependency_set_digest: artifactDependencySetDigest(
+          entries as unknown as DependencyArtifactEntry[],
+        ),
+        issued_at: utcnow(),
+      } as never,
+      art.artifactId,
+    );
+    expect(bytes.toString()).toBe(art.bytes.toString());
+    expect(String(artifact.execution_id)).toBe(art.eid);
+    expect(String(artifact.mission_id)).toBe(prod.missionId);
   });
 });

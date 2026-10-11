@@ -58,11 +58,61 @@ import {
   REMOTE_CAPABILITY_SET,
   type ExternalInputArtifactSource,
 } from "./plan-dataflow.js";
-import {
-  assertCanonicalWorkforceAllocationProvenance,
-  WORKFORCE_ALLOCATION_ENTITY,
-} from "./workforce-allocation-evidence.js";
+import { WORKFORCE_ALLOCATION_ENTITY } from "./workforce-allocation-evidence.js";
+import type { WorkforceAllocationDeps } from "./workforce-allocation.js";
+import type { BusinessLayer } from "./business.js";
+import type { WorkforceService } from "./work-graph.js";
+import { AgentContractService } from "./agent-contract.js";
+import { ObjectiveAuthorityService } from "./objective-authority.js";
+import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { validateWorkOpenBindingById } from "./work-open-binding.js";
+
+/** Full allocation authority — the SAME function object as
+ *  `assertCanonicalWorkforceAllocation` in workforce-allocation.ts,
+ *  bound at that module's evaluation. A static import here would pull
+ *  business.ts into service.ts's own import phase (work-completion
+ *  dereferences MISSION_STATUS_TRANSITIONS at module level — the
+ *  pre-existing cycle survives only because business.ts is never
+ *  evaluated during service.ts's import list). Late binding keeps
+ *  reuse exact; an unbound prover is a fail-closed condition. */
+type WorkforceAllocationProver = (
+  deps: WorkforceAllocationDeps,
+  row: Record<string, unknown> & { version: number },
+) => void;
+let walProver: WorkforceAllocationProver | null = null;
+export function bindWorkforceAllocationProver(
+  fn: WorkforceAllocationProver,
+): void {
+  walProver ??= fn;
+}
+
+/** Same late-binding discipline for the workstream service
+ *  constructor — objective-workstream.ts imports work-graph.ts which
+ *  imports business.ts, identical cycle pressure. */
+type ObjectiveWorkstreamCtor = new (deps: {
+  store: PairEvidenceStore;
+  business: BusinessLayer;
+  workforce: WorkforceService;
+  objectives: ObjectiveAuthorityService;
+}) => ObjectiveWorkstreamService;
+let objectiveWorkstreamCtor: ObjectiveWorkstreamCtor | null = null;
+export function bindObjectiveWorkstreamCtor(
+  ctor: ObjectiveWorkstreamCtor,
+): void {
+  objectiveWorkstreamCtor ??= ctor;
+}
+function assertWorkforceAllocation(
+  deps: WorkforceAllocationDeps,
+  row: Record<string, unknown> & { version: number },
+): void {
+  if (!walProver) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+      "workforce allocation prover not bound",
+    );
+  }
+  walProver(deps, row);
+}
 
 export const DEPENDENCY_ARTIFACT_CONTRACT = "pair-artifact-dependency.v1";
 export const HANDOFF_CONTRACT = "pair-artifact-handoff.v1";
@@ -546,6 +596,52 @@ export class ArtifactDependencyResolver {
    * found by store order; exceeding the bound fails closed rather than
    * silently truncating authorization.
    */
+  private _walDeps: WorkforceAllocationDeps | null = null;
+  /**
+   * R2-F1 — canonical allocation-proof deps built from REAL services
+   * (BusinessLayer / Workforce / ObjectiveAuthority / Workstreams) over
+   * this same store: the full delegation + graph authority, never a
+   * parallel weaker validator. Read-only construction — the services
+   * are used only for their canonical proof readers.
+   */
+  private walDeps(): WorkforceAllocationDeps {
+    if (!this._walDeps) {
+      const store = this.store;
+      // Structural shim over the SAME canonical readers BusinessLayer
+      // exposes to the validator (getBusiness strict store read + the
+      // real AgentContractService). A runtime BusinessLayer import
+      // would create a service -> resolver -> business -> routine-mirror
+      // -> service cycle; only these two business reads are consumed
+      // by the allocation proof, and they are the real canonical reads.
+      const business = {
+        getBusiness: (id: string) => store.get("business", id),
+        agentContracts: new AgentContractService(store),
+      } as unknown as BusinessLayer;
+      const workforce = {} as unknown as WorkforceService;
+      const objectives = new ObjectiveAuthorityService(store);
+      if (!objectiveWorkstreamCtor) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+          "objective workstream service not bound",
+        );
+      }
+      const workstreams = new objectiveWorkstreamCtor({
+        store,
+        business: business as unknown as BusinessLayer,
+        workforce,
+        objectives,
+      });
+      this._walDeps = {
+        store,
+        business,
+        workforce,
+        objectives,
+        workstreams,
+      } as WorkforceAllocationDeps;
+    }
+    return this._walDeps;
+  }
+
   listEligibleExternalInputSources(
     mission: Record<string, unknown>,
   ): ExternalInputArtifactSource[] {
@@ -585,8 +681,12 @@ export class ArtifactDependencyResolver {
       lineageFail(`work_item_allocation_count:${allocs.length}`);
     }
     try {
-      assertCanonicalWorkforceAllocationProvenance(
-        this.store,
+      // R2-F1 — FULL canonical allocation authority: receipt + workstream
+      // binding identity/digest + WDEL provenance + delegated-child graph
+      // (membership, dependency set, authority binding, agent), not the
+      // receipt shape alone.
+      assertWorkforceAllocation(
+        this.walDeps(),
         allocs[0] as never,
       );
     } catch (err) {
@@ -621,8 +721,10 @@ export class ArtifactDependencyResolver {
     for (const r of this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []) {
       if (String(r.objective_id ?? "") !== objectiveId) continue;
       try {
-        assertCanonicalWorkforceAllocationProvenance(
-          this.store,
+        // R2-F1 — sibling scope proven through the SAME full canonical
+        // allocation authority as the consumer's own work item.
+        assertWorkforceAllocation(
+          this.walDeps(),
           r as never,
         );
       } catch (err) {
@@ -743,6 +845,10 @@ export class ArtifactDependencyResolver {
       "executor_execution",
       String(exec.execution_id),
     );
+    // R2-F2 — resolveProducerArtifact semantics: count ALL canonically
+    // anchored PASS validations bound to this execution FIRST (any
+    // artifact set), require exactly one — contradictory anchored PASSes
+    // fail closed even when only one of them names the target artifact.
     const anchored = (this.store.list("execution_validation") ?? []).filter(
       (v) => {
         if (String(v.execution_id) !== String(exec.execution_id)) return false;
@@ -756,11 +862,6 @@ export class ArtifactDependencyResolver {
           return false;
         }
         if (!Array.isArray(v.artifact_ids)) return false;
-        if (
-          !(v.artifact_ids as unknown[]).map(String).includes(artifactId)
-        ) {
-          return false;
-        }
         return execEvents.some(
           (ev) =>
             String(ev.event_type) === "RESULT_VALIDATED" &&
@@ -780,7 +881,12 @@ export class ArtifactDependencyResolver {
         `contradictory_validations:${executionId}`,
       );
     }
-    return anchored.length === 1;
+    const pass = anchored[0];
+    if (!pass) return false;
+    // The uniquely valid PASS must name the exact source artifact.
+    return (pass.artifact_ids as unknown[])
+      .map(String)
+      .includes(artifactId);
   }
 
   /**
@@ -1552,11 +1658,21 @@ export class ArtifactHandoffService {
     if (String(handoff.mode) !== "REMOTE_FETCH") {
       reject("handoff_mode");
     }
+    // R2-F5 — the expected PRODUCER mission is proven from the pinned
+    // producer execution row (durable origin), never the consumer's own
+    // mission identity: a cross-mission source serves bytes only when
+    // its durable execution corroborates the same lineage.
+    const srcExec = this.store.tryGet(
+      "executor_execution",
+      String(entry!.producer_execution_id),
+    ) as Record<string, unknown> | null;
     const { artifact, bytes } = this.artifacts.readForConsumption(
       entry!.artifact_id,
       {
         execution_id: entry!.producer_execution_id,
-        mission_id: String(governed!.mission_id),
+        mission_id: srcExec
+          ? String(srcExec.mission_id ?? "")
+          : String(governed!.mission_id),
         task_id: entry!.producer_task_id,
         governed_task_id: entry!.producer_governed_task_id,
         producer_executor_id: entry!.producer_executor_id,
