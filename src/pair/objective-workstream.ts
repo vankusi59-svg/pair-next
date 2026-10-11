@@ -684,3 +684,9 @@ export class ObjectiveWorkstreamService {
     return row;
   }
 }
+
+// Late-bind the service constructor into the artifact resolver's
+// lineage gate (same cycle discipline as workforce-allocation.ts —
+// this module imports work-graph.ts which imports business.ts).
+import { bindObjectiveWorkstreamCtor } from "./artifact-handoff.js";
+bindObjectiveWorkstreamCtor(ObjectiveWorkstreamService);

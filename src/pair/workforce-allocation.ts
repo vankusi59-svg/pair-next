@@ -558,3 +558,12 @@ export class WorkforceAllocationService {
     return results;
   }
 }
+
+// Late-bind the full canonical proof into the artifact resolver's
+// lineage gate. A static import of this module from artifact-handoff.ts
+// would pull business.ts into service.ts's import phase — the existing
+// work-completion module-level MISSION_STATUS_TRANSITIONS read crashes
+// under that order. The binding carries the SAME function object; the
+// resolver fails closed if it is ever absent.
+import { bindWorkforceAllocationProver } from "./artifact-handoff.js";
+bindWorkforceAllocationProver(assertCanonicalWorkforceAllocation);

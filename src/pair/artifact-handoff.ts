@@ -54,8 +54,65 @@ import type { ArtifactConsumeCapabilityClaims } from "./artifact-consume-capabil
 import { artifactDependencySetDigest } from "./artifact-consume-capability.js";
 import {
   DELIVERY_CAPABILITY,
+  PAIR_DATAFLOW_SOURCES,
   REMOTE_CAPABILITY_SET,
+  type ExternalInputArtifactSource,
 } from "./plan-dataflow.js";
+import { WORKFORCE_ALLOCATION_ENTITY } from "./workforce-allocation-evidence.js";
+import type { WorkforceAllocationDeps } from "./workforce-allocation.js";
+import type { BusinessLayer } from "./business.js";
+import type { WorkforceService } from "./work-graph.js";
+import { AgentContractService } from "./agent-contract.js";
+import { ObjectiveAuthorityService } from "./objective-authority.js";
+import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
+import { validateWorkOpenBindingById } from "./work-open-binding.js";
+
+/** Full allocation authority — the SAME function object as
+ *  `assertCanonicalWorkforceAllocation` in workforce-allocation.ts,
+ *  bound at that module's evaluation. A static import here would pull
+ *  business.ts into service.ts's own import phase (work-completion
+ *  dereferences MISSION_STATUS_TRANSITIONS at module level — the
+ *  pre-existing cycle survives only because business.ts is never
+ *  evaluated during service.ts's import list). Late binding keeps
+ *  reuse exact; an unbound prover is a fail-closed condition. */
+type WorkforceAllocationProver = (
+  deps: WorkforceAllocationDeps,
+  row: Record<string, unknown> & { version: number },
+) => void;
+let walProver: WorkforceAllocationProver | null = null;
+export function bindWorkforceAllocationProver(
+  fn: WorkforceAllocationProver,
+): void {
+  walProver ??= fn;
+}
+
+/** Same late-binding discipline for the workstream service
+ *  constructor — objective-workstream.ts imports work-graph.ts which
+ *  imports business.ts, identical cycle pressure. */
+type ObjectiveWorkstreamCtor = new (deps: {
+  store: PairEvidenceStore;
+  business: BusinessLayer;
+  workforce: WorkforceService;
+  objectives: ObjectiveAuthorityService;
+}) => ObjectiveWorkstreamService;
+let objectiveWorkstreamCtor: ObjectiveWorkstreamCtor | null = null;
+export function bindObjectiveWorkstreamCtor(
+  ctor: ObjectiveWorkstreamCtor,
+): void {
+  objectiveWorkstreamCtor ??= ctor;
+}
+function assertWorkforceAllocation(
+  deps: WorkforceAllocationDeps,
+  row: Record<string, unknown> & { version: number },
+): void {
+  if (!walProver) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+      "workforce allocation prover not bound",
+    );
+  }
+  walProver(deps, row);
+}
 
 export const DEPENDENCY_ARTIFACT_CONTRACT = "pair-artifact-dependency.v1";
 export const HANDOFF_CONTRACT = "pair-artifact-handoff.v1";
@@ -392,6 +449,27 @@ export class ArtifactDependencyResolver {
         (t) => isDepPredecessor(t) && producesMatch(t).length > 0,
       );
       if (producers.length === 0) {
+        // HOTFIX-A — no in-plan producer: the consume may carry a
+        // canonical PAIR-stamped cross-mission source binding. That
+        // binding is fully re-proven HERE (authorization scope, accepted
+        // state, retained CAS bytes) before any byte moves.
+        const extEntry = this.resolveExternalSourceInput(
+          args.mission,
+          task,
+          name,
+        );
+        if (extEntry) {
+          totalBytes += extEntry.byte_size;
+          if (totalBytes > MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES) {
+            throw new DependencyResolutionError(
+              "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+              `dependency_bytes>${MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES}`,
+              { dependency_reason: "HANDOFF_CONTRACT_INVALID", consumer_task_id: String(task.task_id) },
+            );
+          }
+          entries.push(extEntry);
+          continue;
+        }
         // Declared consume with no producing predecessor: under the
         // committed plan model this state should never exist — treat as
         // unresolvable rather than guessing a source.
@@ -498,6 +576,406 @@ export class ArtifactDependencyResolver {
       });
     }
     return entries;
+  }
+
+  /**
+   * HOTFIX-A — the ONE canonical authorization scope for cross-mission
+   * artifact consumption: ACCEPTED artifacts produced by missions that
+   * share the consumer mission's authorized Objective lineage.
+   *
+   * Canonical chain: consumer mission.bound_open_id → work_open_binding
+   * → work_item → workforce_allocation (delegated_child_work_item_id)
+   * → objective_id → ALL allocations of that objective → sibling work
+   * items → their bound mission ids → artifact rows with state
+   * ACCEPTED (each re-verified NOW: identity, acceptance history,
+   * retained CAS bytes). No WAL → no objective scope → empty set: a
+   * mission without objective lineage may not consume cross-mission.
+   *
+   * The consumer's own artifacts are excluded (own artifacts bind only
+   * through in-plan producers). Bounded: at most CAP entries, first
+   * found by store order; exceeding the bound fails closed rather than
+   * silently truncating authorization.
+   */
+  private _walDeps: WorkforceAllocationDeps | null = null;
+  /**
+   * R2-F1 — canonical allocation-proof deps built from REAL services
+   * (BusinessLayer / Workforce / ObjectiveAuthority / Workstreams) over
+   * this same store: the full delegation + graph authority, never a
+   * parallel weaker validator. Read-only construction — the services
+   * are used only for their canonical proof readers.
+   */
+  private walDeps(): WorkforceAllocationDeps {
+    if (!this._walDeps) {
+      const store = this.store;
+      // Structural shim over the SAME canonical readers BusinessLayer
+      // exposes to the validator (getBusiness strict store read + the
+      // real AgentContractService). A runtime BusinessLayer import
+      // would create a service -> resolver -> business -> routine-mirror
+      // -> service cycle; only these two business reads are consumed
+      // by the allocation proof, and they are the real canonical reads.
+      const business = {
+        getBusiness: (id: string) => store.get("business", id),
+        agentContracts: new AgentContractService(store),
+      } as unknown as BusinessLayer;
+      const workforce = {} as unknown as WorkforceService;
+      const objectives = new ObjectiveAuthorityService(store);
+      if (!objectiveWorkstreamCtor) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+          "objective workstream service not bound",
+        );
+      }
+      const workstreams = new objectiveWorkstreamCtor({
+        store,
+        business: business as unknown as BusinessLayer,
+        workforce,
+        objectives,
+      });
+      this._walDeps = {
+        store,
+        business,
+        workforce,
+        objectives,
+        workstreams,
+      } as WorkforceAllocationDeps;
+    }
+    return this._walDeps;
+  }
+
+  listEligibleExternalInputSources(
+    mission: Record<string, unknown>,
+  ): ExternalInputArtifactSource[] {
+    const CAP = 64;
+    const lineageFail = (detail: string): never => {
+      throw new IntegrityError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        detail,
+      );
+    };
+    const consumerMissionId = String(mission.mission_id ?? "");
+    const openId = String(mission.bound_open_id ?? "");
+    if (!openId) return []; // unbound mission — no authorized scope
+    // F1 — the consumer's own lineage must validate through the
+    // canonical work-open-binding authority: mission ↔ BOUND WOB ↔
+    // delegated work item ↔ business/project. A forged, rolled-back
+    // or mismatched binding fails closed, never "no scope".
+    const own = validateWorkOpenBindingById(this.store, openId, {
+      forMission: mission as never,
+      requireState: "BOUND",
+      mode: "PROVENANCE",
+    });
+    if (!own.ok || !own.binding) lineageFail(`consumer_binding:${own.reason}`);
+    const binding = own.binding as Record<string, unknown>;
+    const workItemId = String(binding.work_item_id ?? "");
+    // F1 — the work item's objective pin must be the canonical P15.4
+    // receipt: exactly one allocation, full provenance proof, and the
+    // same business as the binding.
+    const allocs = (
+      this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []
+    ).filter(
+      (r) =>
+        String((r as Record<string, unknown>).delegated_child_work_item_id ?? "") ===
+        workItemId,
+    );
+    if (allocs.length !== 1) {
+      lineageFail(`work_item_allocation_count:${allocs.length}`);
+    }
+    try {
+      // R2-F1 — FULL canonical allocation authority: receipt + workstream
+      // binding identity/digest + WDEL provenance + delegated-child graph
+      // (membership, dependency set, authority binding, agent), not the
+      // receipt shape alone.
+      assertWorkforceAllocation(
+        this.walDeps(),
+        allocs[0] as never,
+      );
+    } catch (err) {
+      lineageFail(
+        `work_item_allocation_invalid:${String((err as Error)?.message ?? err)}`,
+      );
+    }
+    const alloc = allocs[0] as Record<string, unknown>;
+    if (
+      String(alloc.business_id ?? "") !==
+      String((binding as Record<string, unknown>).business_id ?? "")
+    ) {
+      lineageFail("allocation_business_mismatch");
+    }
+    const objectiveId = String(alloc.objective_id ?? "");
+    const objective = this.store.tryGet("objective", objectiveId) as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    if (!objective) lineageFail("objective_missing");
+    const obj = objective as Record<string, unknown>;
+    if (
+      String(obj.business_id ?? "") !==
+      String(binding.business_id ?? "")
+    ) {
+      lineageFail("objective_business_mismatch");
+    }
+    // F1 — sibling scope: every allocation of the objective must itself
+    // satisfy canonical provenance; every bound mission binding under
+    // those work items must validate against its real mission row.
+    const siblingWorkItems = new Set<string>();
+    for (const r of this.store.list(WORKFORCE_ALLOCATION_ENTITY) ?? []) {
+      if (String(r.objective_id ?? "") !== objectiveId) continue;
+      try {
+        // R2-F1 — sibling scope proven through the SAME full canonical
+        // allocation authority as the consumer's own work item.
+        assertWorkforceAllocation(
+          this.walDeps(),
+          r as never,
+        );
+      } catch (err) {
+        lineageFail(
+          `sibling_allocation_invalid:${String(r.allocation_id ?? "")}`,
+        );
+      }
+      const cid = String(r.delegated_child_work_item_id ?? "");
+      if (cid) siblingWorkItems.add(cid);
+    }
+    const missionIds = new Set<string>([consumerMissionId]);
+    for (const b of this.store.list("work_open_binding") ?? []) {
+      const wid = String(b.work_item_id ?? "");
+      const mid = String(b.mission_id ?? "");
+      if (!wid || !mid || !siblingWorkItems.has(wid)) continue;
+      const srcMission = this.store.tryGet("mission", mid) as
+        | Record<string, unknown>
+        | null;
+      if (!srcMission) continue; // binding reserves a mission not yet minted
+      const res = validateWorkOpenBindingById(
+        this.store,
+        String(b.open_id ?? ""),
+        {
+          forMission: srcMission as never,
+          requireState: "BOUND",
+          mode: "PROVENANCE",
+        },
+      );
+      if (!res.ok) {
+        lineageFail(
+          `sibling_binding_invalid:${String(b.open_id ?? "")}:${res.reason}`,
+        );
+      }
+      missionIds.add(mid);
+    }
+    const out: ExternalInputArtifactSource[] = [];
+    for (const a of this.store.list("artifact") ?? []) {
+      const mid = String(a.mission_id ?? "");
+      if (!mid || mid === consumerMissionId || !missionIds.has(mid)) continue;
+      if (String(a.state ?? "") !== "ACCEPTED") continue;
+      const executionId = String(a.execution_id ?? "");
+      if (!executionId) continue;
+      // F2 — producer terminal validation: the pinned execution must be
+      // a COMPLETED execution carrying an anchored RESULT_VALIDATED PASS
+      // whose artifact_ids contain THIS artifact (F2 authority pattern).
+      if (!this.producerPassAnchored(executionId, String(a.artifact_id))) {
+        continue;
+      }
+      // Deep re-proof NOW — identity, acceptance history, retained bytes.
+      const row = this.service.artifacts.verifyArtifactForConsumption(
+        String(a.artifact_id),
+        { execution_id: executionId },
+      );
+      // F3 — the cap binds the ELIGIBLE set only; unrelated global
+      // artifacts never consume the bound.
+      if (out.length >= CAP) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+          "external_input_eligible_bound_exceeded",
+        );
+      }
+      out.push({
+        contract: "pair-external-artifact-input.v1" as const,
+        artifact_id: String(row.artifact_id),
+        logical_name: String(row.logical_name),
+        sha256: String(row.sha256),
+        byte_size: Number(row.byte_size),
+        source_mission_id: String(row.mission_id),
+        source_task_id: String(row.task_id),
+        source_governed_task_id: String(row.governed_task_id),
+        source_execution_id: String(row.execution_id),
+        source_executor_id: String(row.producer_executor_id),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * F2 — producer terminal-validation authority for a candidate source
+   * artifact: the pinned producer execution must be COMPLETED (row +
+   * result status), carry a durable correlation, and have EXACTLY ONE
+   * PASS execution_validation row that (a) binds the execution's
+   * mission/governed ids, (b) lists the artifact in artifact_ids, and
+   * (c) is anchored by an immutable RESULT_VALIDATED event under the
+   * execution's correlation. Contradictory anchors fail closed; a
+   * RUNNING/FAILED/unvalidated producer is simply not a source.
+   */
+  private producerPassAnchored(
+    executionId: string,
+    artifactId: string,
+  ): boolean {
+    const exec = this.store.tryGet("executor_execution", executionId) as
+      | Record<string, unknown>
+      | null;
+    if (!exec) return false;
+    if (String(exec.execution_state ?? "") !== "COMPLETED") return false;
+    if (
+      String(
+        (exec.result as Record<string, unknown> | undefined)?.status ?? "",
+      ) !== "COMPLETED"
+    ) {
+      return false;
+    }
+    if (!exec.correlation_id) return false;
+    const gov = this.store.tryGet(
+      "governed_task",
+      String(exec.governed_task_id),
+    ) as Record<string, unknown> | null;
+    if (
+      !gov ||
+      String(gov.mission_id) !== String(exec.mission_id) ||
+      String(gov.task_id) !== String(exec.task_id) ||
+      String(gov.executor_id) !== String(exec.executor_id)
+    ) {
+      return false;
+    }
+    const execEvents = this.store.listEvents(
+      "executor_execution",
+      String(exec.execution_id),
+    );
+    // R2-F2 — resolveProducerArtifact semantics: count ALL canonically
+    // anchored PASS validations bound to this execution FIRST (any
+    // artifact set), require exactly one — contradictory anchored PASSes
+    // fail closed even when only one of them names the target artifact.
+    const anchored = (this.store.list("execution_validation") ?? []).filter(
+      (v) => {
+        if (String(v.execution_id) !== String(exec.execution_id)) return false;
+        if (String(v.status) !== "PASS") return false;
+        const vid = String(v.validation_id ?? "");
+        if (!vid) return false;
+        if (
+          String(v.mission_id) !== String(exec.mission_id) ||
+          String(v.governed_task_id) !== String(exec.governed_task_id)
+        ) {
+          return false;
+        }
+        if (!Array.isArray(v.artifact_ids)) return false;
+        return execEvents.some(
+          (ev) =>
+            String(ev.event_type) === "RESULT_VALIDATED" &&
+            String(ev.new_state) === "PASS" &&
+            String(ev.correlation_id ?? "") ===
+              String(exec.correlation_id ?? "") &&
+            String(
+              (ev.metadata as Record<string, unknown> | undefined)
+                ?.validation_id ?? "",
+            ) === vid,
+        );
+      },
+    );
+    if (anchored.length > 1) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+        `contradictory_validations:${executionId}`,
+      );
+    }
+    const pass = anchored[0];
+    if (!pass) return false;
+    // The uniquely valid PASS must name the exact source artifact.
+    return (pass.artifact_ids as unknown[])
+      .map(String)
+      .includes(artifactId);
+  }
+
+  /**
+   * HOTFIX-A — resolve a stamped cross-mission source binding to a
+   * pinned dependency entry, or return null when the consume carries
+   * no external binding (ordinary unbound input).
+   *
+   * Re-proof chain (nothing is trusted from the stamp alone):
+   *   1. the stamped entry is well-formed and names this consume;
+   *   2. the artifact_id is STILL in the mission's currently computed
+   *      eligible set, with every pinned identity field identical
+   *      (revocation/drift → FAIL_CLOSED before spend);
+   *   3. verifyArtifactForConsumption re-proves acceptance + retained
+   *      bytes against the pinned expectations NOW;
+   *   4. emit a canonical dependency entry: the source mission's
+   *      immutable producer identities are pinned verbatim.
+   */
+  private resolveExternalSourceInput(
+    mission: Record<string, unknown>,
+    task: Record<string, unknown>,
+    consumeName: string,
+  ): DependencyArtifactEntry | null {
+    const md = task.metadata as Record<string, unknown> | undefined;
+    const rows = md?.[PAIR_DATAFLOW_SOURCES];
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const match = (rows as Array<Record<string, unknown>>).find(
+      (r) =>
+        artifactNamesEquivalent(String(r?.consume_name ?? ""), consumeName) ||
+        String(r?.consume_name ?? "") === consumeName,
+    );
+    if (!match) return null;
+    const fail = (reason: string): never => {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_DEPENDENCY_RESOLUTION",
+        reason,
+        {
+          dependency_reason: "EXTERNAL_INPUT_UNAUTHORIZED",
+          artifact_name: consumeName,
+          consumer_task_id: String(task.task_id),
+        },
+      );
+    };
+    const artifactId = String(match.artifact_id ?? "");
+    if (!artifactId) fail("external_binding_malformed");
+    const eligible = this.listEligibleExternalInputSources(mission); // eslint-disable-line
+    const cur = eligible.find((s) => s.artifact_id === artifactId);
+    if (
+      !cur ||
+      cur.logical_name !== String(match.logical_name ?? "") ||
+      cur.sha256 !== String(match.sha256 ?? "") ||
+      Number(cur.byte_size) !== Number(match.byte_size) ||
+      cur.source_mission_id !== String(match.source_mission_id ?? "") ||
+      cur.source_task_id !== String(match.source_task_id ?? "") ||
+      cur.source_governed_task_id !== String(match.source_governed_task_id ?? "") ||
+      cur.source_execution_id !== String(match.source_execution_id ?? "") ||
+      cur.source_executor_id !== String(match.source_executor_id ?? "")
+    ) {
+      // Authorization revoked, artifact identity drifted, or the stamp
+      // was never minted from the canonical eligible set.
+      fail(`external_source_revoked:${consumeName}`);
+    }
+    // Pinned expectations re-verify the artifact NOW — acceptance
+    // history, CAS bytes, execution linkage — before spend.
+    this.service.artifacts.verifyArtifactForConsumption(artifactId, {
+      execution_id: cur!.source_execution_id,
+      mission_id: cur!.source_mission_id,
+      task_id: cur!.source_task_id,
+      governed_task_id: cur!.source_governed_task_id,
+      producer_executor_id: cur!.source_executor_id,
+      sha256: cur!.sha256,
+      byte_size: cur!.byte_size,
+      logical_name: cur!.logical_name,
+    });
+    return {
+      artifact_id: artifactId,
+      producer_task_id: cur!.source_task_id,
+      producer_governed_task_id: cur!.source_governed_task_id,
+      producer_execution_id: cur!.source_execution_id,
+      producer_executor_id: cur!.source_executor_id,
+      logical_name: cur!.logical_name,
+      sha256: cur!.sha256,
+      byte_size: cur!.byte_size,
+      consumer_relative_path: dependencyConsumerPath(
+        String(task.task_id),
+        artifactId,
+        cur!.logical_name,
+      ),
+      contract: DEPENDENCY_ARTIFACT_CONTRACT,
+    };
   }
 
   /**
@@ -788,10 +1266,76 @@ export type HandoffMode = "LOCAL_MATERIALIZATION" | "REMOTE_FETCH";
  *     F1 re-verification NOW → exact CAS bytes.
  */
 export class ArtifactHandoffService {
+  private _resolver: ArtifactDependencyResolver | null = null;
+
   constructor(
     private readonly store: PairEvidenceStore,
     private readonly artifacts: ArtifactAuthority,
   ) {}
+
+  /** The canonical eligibility authority — SAME seam that proves
+   *  cross-mission sources at plan time. The resolver only consumes
+   *  `service.store` and `service.artifacts`; the shim carries the
+   *  identical instances this service was built with. */
+  private resolver(): ArtifactDependencyResolver {
+    this._resolver ??= new ArtifactDependencyResolver({
+      store: this.store,
+      artifacts: this.artifacts,
+    } as unknown as PairControlPlane);
+    return this._resolver;
+  }
+
+  /** F6 — cross-mission byte consumption RE-PROVES current canonical
+   *  eligibility at the point bytes are served or written. The pin
+   *  proved eligibility at plan time; this proves it NOW: a lineage
+   *  revocation between pin and consumption (WOB unbound, WAL tamper,
+   *  sibling non-BOUND, producer PASS anchor gone) closes the byte
+   *  path. Same-mission entries skip — the F2 same-mission contract
+   *  is untouched. The match is on the PINNED identity: artifact_id,
+   *  producer execution/governed/task, producer mission and sha256 —
+   *  never merely the logical filename. */
+  private assertCrossMissionEligibleNow(
+    governed: Record<string, unknown>,
+    entry: DependencyArtifactEntry,
+    srcExec: Record<string, unknown> | null,
+  ): void {
+    const consumerMissionId = String(governed.mission_id);
+    const producerMissionId = srcExec
+      ? String(srcExec.mission_id ?? "")
+      : consumerMissionId;
+    if (producerMissionId === consumerMissionId) return;
+    const consumerMission = this.store.tryGet(
+      "mission",
+      consumerMissionId,
+    ) as Record<string, unknown> | null;
+    if (!consumerMission) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        `consumer mission ${consumerMissionId} missing`,
+        { dependency_reason: "EXTERNAL_INPUT_LINEAGE" },
+      );
+    }
+    const eligible = this.resolver().listEligibleExternalInputSources(
+      consumerMission,
+    );
+    const hit = eligible.find(
+      (s) =>
+        String(s.artifact_id) === entry.artifact_id &&
+        String(s.source_execution_id) === entry.producer_execution_id &&
+        String(s.source_governed_task_id) ===
+          entry.producer_governed_task_id &&
+        String(s.source_task_id) === entry.producer_task_id &&
+        String(s.source_mission_id) === producerMissionId &&
+        String(s.sha256) === entry.sha256,
+    );
+    if (!hit) {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_EXTERNAL_INPUT_LINEAGE",
+        `${entry.artifact_id}:cross_mission_eligibility_revoked`,
+        { dependency_reason: "EXTERNAL_INPUT_LINEAGE" },
+      );
+    }
+  }
 
   /** PIN each resolved dependency onto the governed consumer task —
    *  called inside governed-task creation so the pin exists BEFORE any
@@ -914,9 +1458,23 @@ export class ArtifactHandoffService {
       // expected producer binding (execution/task/governed/mission/
       // executor/logical_name/sha256/byte_size). A consumption
       // verification failure happens BEFORE any destination write.
+      // HOTFIX-A — the expected producer mission is the DURABLE mission
+      // of the pinned producer execution, never assumed to be the
+      // consumer's: same-mission entries resolve to the same value;
+      // cross-mission sources pin the producer mission truthfully. A
+      // missing execution row fails closed inside readForConsumption.
+      const srcExec = this.store.tryGet(
+        "executor_execution",
+        e.producer_execution_id,
+      ) as Record<string, unknown> | null;
+      // F6 — re-prove CURRENT canonical eligibility for cross-mission
+      // sources BEFORE a single byte lands in the consumer workspace.
+      this.assertCrossMissionEligibleNow(governed, e, srcExec);
       const { bytes } = this.artifacts.readForConsumption(e.artifact_id, {
         execution_id: e.producer_execution_id,
-        mission_id: String(governed.mission_id),
+        mission_id: srcExec
+          ? String(srcExec.mission_id ?? "")
+          : String(governed.mission_id),
         task_id: e.producer_task_id,
         governed_task_id: e.producer_governed_task_id,
         producer_executor_id: e.producer_executor_id,
@@ -1169,11 +1727,29 @@ export class ArtifactHandoffService {
     if (String(handoff.mode) !== "REMOTE_FETCH") {
       reject("handoff_mode");
     }
+    // R2-F5 — the expected PRODUCER mission is proven from the pinned
+    // producer execution row (durable origin), never the consumer's own
+    // mission identity: a cross-mission source serves bytes only when
+    // its durable execution corroborates the same lineage.
+    const srcExec = this.store.tryGet(
+      "executor_execution",
+      String(entry!.producer_execution_id),
+    ) as Record<string, unknown> | null;
+    // F6 — the SAME re-proof at the remote fetch boundary: a revoked
+    // lineage between pin and fetch serves zero bytes.
+    try {
+      this.assertCrossMissionEligibleNow(governed!, entry!, srcExec);
+    } catch {
+      this.rejectHandoffEvent(governed!, artifactId, "lineage_revoked");
+      reject("lineage_revoked");
+    }
     const { artifact, bytes } = this.artifacts.readForConsumption(
       entry!.artifact_id,
       {
         execution_id: entry!.producer_execution_id,
-        mission_id: String(governed!.mission_id),
+        mission_id: srcExec
+          ? String(srcExec.mission_id ?? "")
+          : String(governed!.mission_id),
         task_id: entry!.producer_task_id,
         governed_task_id: entry!.producer_governed_task_id,
         producer_executor_id: entry!.producer_executor_id,
