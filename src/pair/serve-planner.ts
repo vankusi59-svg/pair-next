@@ -55,6 +55,7 @@ import {
   type RawDeliveryEmissionState,
   PAIR_DELIVERY_INJECTION_KEY,
   type DeliveryInjectionRecord,
+  type ExternalInputArtifactSource,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
 import { extractGoalContract } from "./goal-contract.js";
@@ -172,6 +173,10 @@ export function makeServeCanonicalizer(deps: {
      *  exhausted before all capability content was inspected (NEVER a
      *  proven R=0 — fail closed). */
     raw_delivery_emission_state?: RawDeliveryEmissionState;
+    /** HOTFIX-A — the bounded cross-mission eligible set computed by
+     *  trusted PAIR code for this mission (empty/absent = no
+     *  cross-mission consumption is authorized). */
+    external_input_artifacts?: ExternalInputArtifactSource[];
   },
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal, ctx) => {
@@ -560,6 +565,7 @@ export function makeServeCanonicalizer(deps: {
     reconcilePlanDataflow(allTasks as never[], {
       telegramIntent: deliveryIntent,
       outputLanguage: detectOutputLanguage(String(goal ?? "")),
+      external_input_artifacts: ctx?.external_input_artifacts,
     });
     // PRV2-B — Goal Contract coverage authority, AFTER dataflow
     // reconcile and remap so the check binds the canonical task keys
@@ -603,7 +609,9 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         const raw = candidate?.tasks;
         if (Array.isArray(raw) && raw.length) {
           try {
-            const tasks = canonicalizeLlmTasks(raw, goal);
+            const tasks = canonicalizeLlmTasks(raw, goal, {
+              external_input_artifacts: input.input_artifact_sources,
+            });
             if (tasks.length) return { tasks };
           } catch (err) {
             throw new IntegrityError(
@@ -643,7 +651,10 @@ export function makeServePlanner(deps: ServePlannerDeps): {
       const tasks = canonicalizeLlmTasks(
         llm as Array<Record<string, unknown>>,
         goal,
-        { provenance: "persisted" },
+        {
+          provenance: "persisted",
+          external_input_artifacts: input.input_artifact_sources,
+        },
       );
       if (tasks.length) return { tasks };
     }
