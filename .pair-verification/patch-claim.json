@@ -1,20 +1,30 @@
 {
-  "claim_id": "HOTFIX_C_TELEGRAM_CONTENT_PRODUCTION_VS_DELIVERY_INTENT",
-  "title": "Telegram delivery-intent grammar: VN noun compounds (bài đăng, lịch đăng, gói bài đăng) and `đăng ký` no longer mint send authority",
+  "claim_id": "HOTFIX_D_TEMPLATE_FALLBACK_DELIVERY_INJECTION",
+  "title": "Deterministic template fallback runs through THE governed delivery-injection authority (delegated WOB-bound mission DL_4d48de10 no longer dies FAIL_CLOSED_DELIVERY_TASK_MISSING)",
   "affected_surfaces": [
     "PLANNER",
     "DELIVERY",
-    "TELEGRAM_INGRESS",
-    "MISSION_DRAFT"
+    "MISSION_CONTROL",
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-c-telegram-intent.test.ts",
-    "src/__tests__/pair-planner-dataflow-incident.test.ts",
+    "src/__tests__/pair-hotfix-d-delegated-delivery.test.ts",
     "src/__tests__/pair-p15-8-hotfix1-delivery-injection.test.ts",
-    "src/__tests__/pair-p15-8e-telegram.test.ts",
+    "src/__tests__/pair-planner-dataflow-incident.test.ts",
+    "src/__tests__/pair-hotfix-c-telegram-intent.test.ts",
     "src/__tests__/pair-output-delivery-contract.test.ts",
-    "src/__tests__/pair-ops-telegram-delivery.test.ts"
+    "src/__tests__/pair-ops-telegram-delivery.test.ts",
+    "src/__tests__/pair-f4-delivery-provenance.test.ts",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
+    "src/__tests__/pair-hotfix-b-redispatch-after-unblock.test.ts",
+    "src/__tests__/pair-llm-planner.test.ts",
+    "src/__tests__/pair-network-requirement.test.ts",
+    "src/__tests__/pair-network-requirement-r3.test.ts",
+    "src/__tests__/pair-network-binding-repair.test.ts",
+    "src/__tests__/pair-prv2a-planner-modernization.test.ts",
+    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
+    "src/__tests__/pair-runtime-hardening.test.ts"
   ],
   "invariants": [],
-  "description": "Live goal 'Sản xuất gói bài đăng Telegram ... lịch đăng, playbook phân phối' made detectTelegramDeliveryIntent return requested=true — two `đăng` tokens inside CLAUSE_SPAN were read as delivery verbs, so assertDeliveryTaskPresence threw FAIL_CLOSED_DELIVERY_TASK_MISSING on a pure production plan (mission MSN_01M4MXEHH failed at planning). Fix: bounded positive grammar, mirroring the existing `post` noun rule — VN noun heads sit BEFORE the token, so a bounded left-neighbor class (classifiers/content nouns bài|lịch|gói|tin|bản|nội dung|thông báo|danh sách|chuỗi|số|video|clip|story|reel|vlog|blog|thread|tweet|caption|post|article|content|status|update|announcement|schedule|plan|draft, determiners một|vài|các|những|mỗi|mọi|nhiều|ít|a|an|the|this|that|some|any|all|each|every, write-verbs viết|soạn|tạo|làm|sản xuất|prepare|produce|generate|..., numerals) makes `đăng` a noun compound; `đăng ký` (subscribe) skipped via bounded right check. Verb-object order untouched (đăng bài/tin/lên still authorize); independent send clauses in the same goal still authorize; negation/clause-scoping unchanged; no global blacklist, no planner-prompt change, no delivery-gate weakening. Tests 18/18: exact live goal + VN/EN production phrasings -> requested=false; Đăng bài lên Telegram / Gửi kết quả lên kênh / Post the report to Telegram / viết 5 bài đăng rồi gửi lên -> true; production plan passes reconcile + serve canonicalizer with zero delivery tasks; true intent with 0 tasks still MISSING; genuine-omission injection preserved (DELIVERY_TASK_INJECTED stamp); unauthorized emission still INTENT fail-closed. Counterfactual on BASE: 7 negatives + 2 integrations fail identically (requested=true), positives pass — non-vacuous. 257 regression pass."
+  "description": "Delegated WOB-bound missions hit the deterministic template fallback (BASE emitted T1+optional T2/T3, NEVER TELEGRAM_DELIVERY) -> FAIL_CLOSED_DELIVERY_TASK_MISSING (DL_4d48de10). ONE helper injectDeliveryTaskForTrueOmission shared by canonicalize seam AND template tail (forge-strip -> proven omission -> servable -> producer-proof -> stamped push). R1: next-FREE task key; template delivery enforces the canonical current-data contract (no legitimate NETWORK_ACCESS gatherer -> FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED); no-intent byte-exact; E6 real upstream bytes. R2: STRONG_CURRENCY_RE += 'tuần này|tuần hiện tại|this week'. R3 bounded detector fixes: F5 — bare 'file|tệp' dropped from LOCAL_SOURCE_RE; file suppresses ONLY in input context (local/cục bộ qualifier, source prep trong/từ/from/of/in/read/đọc, 'file input/data'), so 'tạo file báo cáo'/'save the output file' no longer cancels a current-data demand while 'trong file CSV cục bộ' keeps suppressing. F6 — week recency per clause: a week marker preceded by a schedule/deadline role word in the same clause (họp/meeting/lịch/nộp/bàn giao/giao!=dịch/deliver/send/đăng...) binds EVENT time not subject currency ('2020 trong buổi họp tuần này' FALSE; 'thị trường chứng khoán tuần này' TRUE; unbound marker in another clause survives). Evidence: E9f exact F5 goal -> typed fail at PLANNING, zero minted, zero sends; E11 matrix += all mandated F5/F6 cases; 45/45 focused. NO second detector, NO auto NETWORK_ACCESS, no invented gatherer. Untouched: external inputs, pinning, source-stamp, CAS, provenance, fail-closed. Baseline on cf2674c: f4 R5.1-crash."
 }
