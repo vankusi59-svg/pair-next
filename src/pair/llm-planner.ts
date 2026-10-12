@@ -151,7 +151,7 @@ export const LLM_PLAN_RESERVED_CAPABILITY_WARNING =
 /** Strong recency markers — unambiguous "newest/now" vocabulary that can
  *  lift a research or retrieval request into current-data territory. */
 const STRONG_CURRENCY_RE =
-  /\b(today|tonight|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now)\b|hôm nay|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay/iu;
+  /\b(today|tonight|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now|this\s+week)\b|hôm nay|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay|tuần này|tuần hiện tại/iu;
 
 /** Generic current-state markers — ambiguous LOCAL-or-EXTERNAL; never
  *  sufficient alone (see R3.A rules). */

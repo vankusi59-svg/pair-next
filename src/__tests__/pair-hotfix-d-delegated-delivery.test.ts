@@ -96,15 +96,29 @@ const NO_DELIVERY_SETS = [
 ];
 
 /** The delegated incident goal shape — operator Telegram intent,
- *  business-layer prefix included. */
+ *  business-layer prefix included. R2: "tuần này" is a current-week
+ *  external-data demand, so this EXACT goal is the negative
+ *  current-data fixture — it must fail closed at PLANNING, never
+ *  deliver. Happy-path delivery uses the historical variant below. */
 const INTENT_GOAL =
   "[BUSINESS PAIR HQ | DEPT GROWTH | AGENT Analyst (research)]\n" +
   "Phân tích thị trường chứng khoán tuần này, tạo bài tóm tắt bằng " +
   "tiếng Việt, sau đó đăng lên kênh Telegram được phép.";
+/** Same delegated intent shape over a FIXED PAST period — no
+ *  current/external-data demand: legitimate delivery planning. */
+const HISTORICAL_INTENT_GOAL =
+  "[BUSINESS PAIR HQ | DEPT GROWTH | AGENT Analyst (research)]\n" +
+  "Phân tích dữ liệu thị trường chứng khoán năm 2020, tạo bài tóm tắt " +
+  "bằng tiếng Việt, sau đó đăng lên kênh Telegram được phép.";
 const NO_INTENT_GOAL =
   "[BUSINESS PAIR HQ | DEPT GROWTH]\n" +
   "Phân tích thị trường chứng khoán tuần này, tạo bài tóm tắt bằng tiếng Việt.";
 const WS_INTENT_GOAL =
+  "Phân tích dữ liệu thị trường chứng khoán năm 2020, tạo bài tóm tắt " +
+  "bằng tiếng Việt, sau đó đăng lên kênh Telegram được phép.";
+/** The incident goal's workstream form — current-week demand, used only
+ *  by the negative integration test (planning must fail closed). */
+const WS_CURRENT_INTENT_GOAL =
   "Phân tích thị trường chứng khoán tuần này, tạo bài tóm tắt bằng " +
   "tiếng Việt, sau đó đăng lên kênh Telegram được phép.";
 
@@ -438,7 +452,7 @@ describe("E1 — BASE reproduction (counterfactual, non-vacuous)", () => {
 describe("E2 — delegated intent goal → exactly one canonical delivery task", () => {
   it("production planner emits T1,T2 + injected T3 with full PAIR stamps; gate passes", () => {
     const s = delegatedStack("e2");
-    const proposal = s.planner(plannerInput(INTENT_GOAL)) as {
+    const proposal = s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
       tasks: Array<Record<string, unknown>>;
     };
     const out = proposal.tasks;
@@ -461,7 +475,7 @@ describe("E2 — delegated intent goal → exactly one canonical delivery task",
     // instruction rewritten to the canonical delivery form, placeholder gone
     expect(String(d.task_instruction)).not.toContain("Stage the manifested");
     // THE downstream gate — the same assert that killed DL_4d48de10 — passes
-    runPlanningGate(out, INTENT_GOAL);
+    runPlanningGate(out, HISTORICAL_INTENT_GOAL);
   });
 });
 
@@ -470,7 +484,7 @@ describe("E2 — delegated intent goal → exactly one canonical delivery task",
 describe("E3 — injected task binds the REAL upstream producer", () => {
   it("TEXT-mode delivery depends on content-bearing T2, never on bookkeeping T1", () => {
     const s = delegatedStack("e3");
-    const out = (s.planner(plannerInput(INTENT_GOAL)) as {
+    const out = (s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
       tasks: Array<Record<string, unknown>>;
     }).tasks;
     const d = deliveries(out)[0];
@@ -506,13 +520,13 @@ describe("E4 — negatives still fail closed (or stay byte-identical)", () => {
   });
   it("E4b intent + no executor serves TELEGRAM_DELIVERY → UNSERVABLE", () => {
     const s = delegatedStack("e4b", { capSets: NO_DELIVERY_SETS });
-    expect(errCode(() => s.planner(plannerInput(INTENT_GOAL))))
+    expect(errCode(() => s.planner(plannerInput(HISTORICAL_INTENT_GOAL))))
       .toBe("FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE");
   });
   it("E4c intent + no content-bearing task → NO_PRODUCER (never fabricate)", () => {
     // DSH absent from `governed` → template emits only T1 bookkeeping.
     const s = delegatedStack("e4c", { governed: new Set() });
-    expect(errCode(() => s.planner(plannerInput(INTENT_GOAL))))
+    expect(errCode(() => s.planner(plannerInput(HISTORICAL_INTENT_GOAL))))
       .toBe("FAIL_CLOSED_DELIVERY_INJECTION_NO_PRODUCER");
   });
   it("E4d malformed raw delivery emission → existing INVALIDATED authority intact", () => {
@@ -538,7 +552,7 @@ describe("E4 — negatives still fail closed (or stay byte-identical)", () => {
           { task_key: "T1", title: "w", task_instruction: "tổng hợp kết quả", required_capabilities: ["REASONING"], depends_on: [], metadata: {} },
           bad as never,
         ],
-        INTENT_GOAL,
+        HISTORICAL_INTENT_GOAL,
         { provenance: "fresh" },
       ),
     )).toBe("FAIL_CLOSED_DELIVERY_TASK_INVALIDATED");
@@ -548,7 +562,7 @@ describe("E4 — negatives still fail closed (or stay byte-identical)", () => {
     s.adapter.fileContent["T2"] = "BÁO CÁO: denied-destination case";
     const preview = s.control.createPlanPreview({
       project_id: s.projectId,
-      goal: INTENT_GOAL,
+      goal: HISTORICAL_INTENT_GOAL,
       granted_permissions: ["FILE_WRITE", "FILE_READ"],
       authorized_workspaces: [s.workspace],
       risk_ceiling: "LOW",
@@ -607,10 +621,10 @@ describe("E4 — negatives still fail closed (or stay byte-identical)", () => {
 describe("E5 — idempotency", () => {
   it("re-plan on the same input is byte-identical; persisted replay adds nothing", () => {
     const s = delegatedStack("e5");
-    const first = (s.planner(plannerInput(INTENT_GOAL)) as {
+    const first = (s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
       tasks: Array<Record<string, unknown>>;
     }).tasks;
-    const second = (s.planner(plannerInput(INTENT_GOAL)) as {
+    const second = (s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
       tasks: Array<Record<string, unknown>>;
     }).tasks;
     expect(canonicalJson(second)).toBe(canonicalJson(first));
@@ -622,7 +636,7 @@ describe("E5 — idempotency", () => {
     // delivery task, no second stamp, still gate-clean.
     const pinnedInput = {
       mission: {
-        goal: INTENT_GOAL,
+        goal: HISTORICAL_INTENT_GOAL,
         metadata: { ...DELEGATED_MD, pinned_plan_tasks: first },
       },
       advice: null,
@@ -634,7 +648,7 @@ describe("E5 — idempotency", () => {
     }).tasks;
     expect(canonicalJson(replay)).toBe(canonicalJson(first));
     expect(deliveries(replay)).toHaveLength(1);
-    runPlanningGate(replay, INTENT_GOAL);
+    runPlanningGate(replay, HISTORICAL_INTENT_GOAL);
   });
 });
 
@@ -643,7 +657,10 @@ describe("E5 — idempotency", () => {
 /** THE real delegated chain: business → objective → workstream whose
  *  goal carries operator Telegram intent → allocation → delegated WOB
  *  child work item → INTENT→BOUND mission mint. Returns mission_id. */
-function openDelegatedIntentMission(s: ReturnType<typeof delegatedStack>) {
+function openDelegatedIntentMission(
+  s: ReturnType<typeof delegatedStack>,
+  wsGoal: string = WS_INTENT_GOAL,
+) {
   const businessId = `BIZ_${seq++}`;
   s.store.put("business", businessId, {
     business_id: businessId,
@@ -675,7 +692,7 @@ function openDelegatedIntentMission(s: ReturnType<typeof delegatedStack>) {
     workstreams: [{
       workstream_key: "ws-telegram",
       title: "ws telegram",
-      goal: WS_INTENT_GOAL,
+      goal: wsGoal,
     }] as never,
     actor: OP,
   });
@@ -879,6 +896,66 @@ describe("E9 — R1-F2 current/external-data contract on template delivery", () 
     }).tasks;
     expect(deliveries(out)).toHaveLength(1);
     runPlanningGate(out, LOCAL_INTENT_GOAL);
+  });
+  it("E9d R2 — THE EXACT incident goal (business prefix + 'tuần này') now trips the current-data gate, typed fail at PLANNING", () => {
+    expect(goalRequiresCurrentExternalData(INTENT_GOAL)).toBe(true);
+    expect(detectTelegramDeliveryIntent(INTENT_GOAL).requested).toBe(true);
+    const s = delegatedStack("e9d");
+    expect(errCode(() => s.planner(plannerInput(INTENT_GOAL))))
+      .toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+  });
+  it("E9e R2 integration — current-week delegated WOB mission FAILS at planning; zero minted requests, zero sends", async () => {
+    const s = delegatedStack("e9e");
+    const mid = openDelegatedIntentMission(s, WS_CURRENT_INTENT_GOAL);
+    // The planning boundary terminalizes the mission (PLANNING→FAILED
+    // durably) while preserving the observable throw to the caller.
+    let saw: string | null = null;
+    try {
+      await driveToTerminal(s, mid);
+    } catch (e) {
+      saw = String((e as { code?: string })?.code ?? "ERR");
+    }
+    expect(saw).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+    expect(missionState(s, mid)).toBe("FAILED");
+    // no delivery task, no minted delivery request, nothing sendable
+    const reqs = (s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
+      .filter((p) => String(p.mission_id) === mid);
+    expect(reqs).toHaveLength(0);
+    expect(pendingTelegramDeliveries(s.store)).toHaveLength(0);
+    // no transport channel was ever exercised for this mission
+    expect(s.adapter.wroteTaskKeys.filter((k) => k.startsWith("T"))).not.toContain("T3:outbox/report.txt");
+  });
+});
+
+/* ============================== E11 — R2 detector ============================== */
+
+describe("E11 — R2 current-week recency detection in goalRequiresCurrentExternalData", () => {
+  it.each([
+    "Phân tích thị trường chứng khoán tuần này, tạo bài tóm tắt bằng tiếng Việt, sau đó đăng lên kênh Telegram được phép.",
+    "Nghiên cứu thị trường vàng tuần này.",
+    "Analyze this week's stock market.",
+    // the exact delegated mission goal incl. business-layer prefix
+    INTENT_GOAL,
+    WS_CURRENT_INTENT_GOAL,
+    // detector judges the DATA demand, never delivery intent — the
+    // no-intent twin of the incident goal still requires current data
+    // (planning stays BASE because the gate only fires on delivery).
+    NO_INTENT_GOAL,
+  ])("detects current/external-data demand: %s", (goal) => {
+    expect(goalRequiresCurrentExternalData(goal)).toBe(true);
+  });
+  it.each([
+    // fixed PAST period — historical research, not current data
+    "Phân tích dữ liệu thị trường chứng khoán năm 2020, sau đó đăng lên kênh Telegram được phép.",
+    "Nghiên cứu diễn biến thị trường chứng khoán quý 1/2019.",
+    // local-file analysis — no external retrieval
+    "Phân tích dữ liệu trong file báo cáo local, sau đó đăng lên kênh Telegram được phép.",
+    // ordinary weekly scheduling — no research/retrieval + no ext subject
+    "Họp team và lên lịch công việc tuần này.",
+    "Soạn báo cáo tuần này cho phòng kinh doanh.",
+    "Schedule the team sync this week.",
+  ])("does NOT detect current/external-data demand: %s", (goal) => {
+    expect(goalRequiresCurrentExternalData(goal)).toBe(false);
   });
 });
 
