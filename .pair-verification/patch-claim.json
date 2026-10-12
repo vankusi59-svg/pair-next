@@ -1,20 +1,25 @@
 {
-  "claim_id": "HOTFIX_C_TELEGRAM_CONTENT_PRODUCTION_VS_DELIVERY_INTENT",
-  "title": "Telegram delivery-intent grammar: VN noun compounds (bài đăng, lịch đăng, gói bài đăng) and `đăng ký` no longer mint send authority",
+  "claim_id": "HOTFIX_D_TEMPLATE_FALLBACK_DELIVERY_INJECTION",
+  "title": "Deterministic template fallback runs through THE governed delivery-injection authority (delegated WOB-bound mission DL_4d48de10 no longer dies FAIL_CLOSED_DELIVERY_TASK_MISSING)",
   "affected_surfaces": [
     "PLANNER",
     "DELIVERY",
-    "TELEGRAM_INGRESS",
-    "MISSION_DRAFT"
+    "MISSION_CONTROL",
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-c-telegram-intent.test.ts",
-    "src/__tests__/pair-planner-dataflow-incident.test.ts",
+    "src/__tests__/pair-hotfix-d-delegated-delivery.test.ts",
     "src/__tests__/pair-p15-8-hotfix1-delivery-injection.test.ts",
-    "src/__tests__/pair-p15-8e-telegram.test.ts",
+    "src/__tests__/pair-planner-dataflow-incident.test.ts",
+    "src/__tests__/pair-hotfix-c-telegram-intent.test.ts",
     "src/__tests__/pair-output-delivery-contract.test.ts",
-    "src/__tests__/pair-ops-telegram-delivery.test.ts"
+    "src/__tests__/pair-ops-telegram-delivery.test.ts",
+    "src/__tests__/pair-f4-delivery-provenance.test.ts",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
+    "src/__tests__/pair-hotfix-b-redispatch-after-unblock.test.ts",
+    "src/__tests__/pair-llm-planner.test.ts",
+    "src/__tests__/pair-runtime-hardening.test.ts"
   ],
   "invariants": [],
-  "description": "Live goal 'Sản xuất gói bài đăng Telegram ... lịch đăng, playbook phân phối' made detectTelegramDeliveryIntent return requested=true — two `đăng` tokens inside CLAUSE_SPAN were read as delivery verbs, so assertDeliveryTaskPresence threw FAIL_CLOSED_DELIVERY_TASK_MISSING on a pure production plan (mission MSN_01M4MXEHH failed at planning). Fix: bounded positive grammar, mirroring the existing `post` noun rule — VN noun heads sit BEFORE the token, so a bounded left-neighbor class (classifiers/content nouns bài|lịch|gói|tin|bản|nội dung|thông báo|danh sách|chuỗi|số|video|clip|story|reel|vlog|blog|thread|tweet|caption|post|article|content|status|update|announcement|schedule|plan|draft, determiners một|vài|các|những|mỗi|mọi|nhiều|ít|a|an|the|this|that|some|any|all|each|every, write-verbs viết|soạn|tạo|làm|sản xuất|prepare|produce|generate|..., numerals) makes `đăng` a noun compound; `đăng ký` (subscribe) skipped via bounded right check. Verb-object order untouched (đăng bài/tin/lên still authorize); independent send clauses in the same goal still authorize; negation/clause-scoping unchanged; no global blacklist, no planner-prompt change, no delivery-gate weakening. Tests 18/18: exact live goal + VN/EN production phrasings -> requested=false; Đăng bài lên Telegram / Gửi kết quả lên kênh / Post the report to Telegram / viết 5 bài đăng rồi gửi lên -> true; production plan passes reconcile + serve canonicalizer with zero delivery tasks; true intent with 0 tasks still MISSING; genuine-omission injection preserved (DELIVERY_TASK_INJECTED stamp); unauthorized emission still INTENT fail-closed. Counterfactual on BASE: 7 negatives + 2 integrations fail identically (requested=true), positives pass — non-vacuous. 257 regression pass."
+  "description": "Delegated WOB-bound missions (no pinned_plan_tasks/llm_plan) hit the deterministic template fallback in makeServePlanner, which on BASE cf2674c emitted T1+optional T2/T3 but NEVER a TELEGRAM_DELIVERY task and never reached the canonicalize injection seam -> assertPlanDataflow threw FAIL_CLOSED_DELIVERY_TASK_MISSING -> PLANNING->FAILED (DL_4d48de10; reproduced live on BASE: [[T1 AUTOMATON],[T2 REASONING]] -> MISSING). Fix: extract true-omission injection into ONE helper injectDeliveryTaskForTrueOmission (forgery strip -> requested+zero-canonical+zero-raw -> executorCapSets servable -> producer-presence proof -> stamped push) shared by canonicalize seam AND template tail; template tail detects intent, injects, then reconcilePlanDataflow(telegramIntent/outputLanguage/input_artifact_sources) so the task gets identical canonical stamps. New typed code FAIL_CLOSED_DELIVERY_INJECTION_NO_PRODUCER when no content-bearing upstream exists (never fabricate a deliverable). T2 stops embedding the goal verbatim (hygiene/semantic re-proofs; goal stays in mission_goal.txt via T1 worker_spec). No-intent goals: byte-identical BASE output. Not touched: declared_external_inputs, alias pinning, source-stamp inheritance, CAS namespaces, provenance architecture, coverage on template path, no fail-closed weakening. E1-E6 in pair-hotfix-d-delegated-delivery.test.ts: E1 BASE shape -> MISSING; E2 one canonical T3 w/ full stamps, gate passes; E3 RESULT_TEXT edge T2 only; E4 no-intent identical / UNSERVABLE / NO_PRODUCER / INVALIDATED / denied UNSENDABLE zero transport; E5 byte-identical replan + pinned verbatim replay; E6 delegated objective->workstream->WOB mission COMPLETED, one request, mocked receipt chatId=111 carrying real analysis.txt bytes. BASE-known failure reproduced identically on cf2674c: f4 R5.1-crash."
 }

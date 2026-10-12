@@ -815,7 +815,7 @@ export interface DeliveryInjectionRecord {
 /** A pure bookkeeping task (goal record) is not content the operator
  *  asked to receive — TEXT-mode delivery never depends on it. */
 const BOOKKEEPING_CAP = "AUTOMATON_TASK_EXECUTION";
-const isContentBearing = (task: Record<string, unknown>): boolean =>
+export const isContentBearing = (task: Record<string, unknown>): boolean =>
   ((task.required_capabilities as string[]) ?? []).some(
     (c) => String(c) !== BOOKKEEPING_CAP,
   );

@@ -56,6 +56,8 @@ import {
   PAIR_DELIVERY_INJECTION_KEY,
   type DeliveryInjectionRecord,
   type ExternalInputArtifactSource,
+  type TelegramDeliveryIntent,
+  isContentBearing,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
 import { extractGoalContract } from "./goal-contract.js";
@@ -504,57 +506,15 @@ export function makeServeCanonicalizer(deps: {
     // (TELEGRAM_DELIVERY inside the canonical work vocabulary AND
     // routable by a currently-qualified executor capability set).
     if (ctx?.provenance !== "persisted") {
-      // A planner may never forge "PAIR injected" evidence — strip the
-      // PAIR-owned stamp from every candidate task; it is re-stamped
-      // only on the task this run actually injects.
-      for (const t of allTasks) {
-        const md = t.metadata as Record<string, unknown> | undefined;
-        if (md && md[PAIR_DELIVERY_INJECTION_KEY] !== undefined) {
-          delete md[PAIR_DELIVERY_INJECTION_KEY];
-        }
-      }
-      if (
-        deliveryIntent.requested &&
-        canonicalDeliveryCount === 0 &&
-        rawDeliveryCount === 0
-      ) {
-        const servable =
-          SERVE_LLM_WORK_CAPS.includes("TELEGRAM_DELIVERY") &&
-          deps
-            .executorCapSets()
-            .some((set) =>
-              (set as string[]).includes("TELEGRAM_DELIVERY"),
-            );
-        if (!servable) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE",
-            JSON.stringify({ requested: true, servable: false }),
-          );
-        }
-        const deliveryKey = `T${allTasks.length + 1}`;
-        const injected: Record<string, unknown> = {
-          task_key: deliveryKey,
-          title: "governed telegram delivery",
-          // Placeholder only — reconcile rewrites the canonical
-          // delivery instruction and stamps the manifest/contract/
-          // output-language/edges exactly as for a planner-emitted task.
-          task_instruction:
-            "Stage the manifested artifacts into outbox/ unchanged, then reply DONE.",
-          required_capabilities: ["TELEGRAM_DELIVERY"],
-          depends_on: [],
-          metadata: {},
-        };
-        const record: DeliveryInjectionRecord = {
-          reason: "DELIVERY_TASK_INJECTED",
-          task_key: deliveryKey,
-          mode: deliveryIntent.mode,
-          authority: "OPERATOR_TELEGRAM_INTENT",
-        };
-        (injected.metadata as Record<string, unknown>)[
-          PAIR_DELIVERY_INJECTION_KEY
-        ] = record;
-        allTasks.push(injected);
-      }
+      injectDeliveryTaskForTrueOmission(
+        allTasks,
+        deliveryIntent,
+        {
+          canonical: canonicalDeliveryCount,
+          raw: rawDeliveryCount,
+        },
+        deps.executorCapSets,
+      );
     }
     // Incident R1/R2 — deterministic artifact data-flow reconciliation
     // at THE canonical seam, before validatePlanProposal + plan_digest:
@@ -581,6 +541,88 @@ export function makeServeCanonicalizer(deps: {
     assertPlanCoverage(extractGoalContract(String(goal ?? "")), allTasks);
     return allTasks;
   };
+}
+
+/** HOTFIX-D — THE one governed delivery-omission injection authority.
+ *  Called from the canonicalize seam (LLM/persisted candidates, fresh
+ *  provenance only) AND from the deterministic template fallback tail —
+ *  never duplicated, never reimplemented per call site. Three proofs
+ *  before injection, in order:
+ *    1. planner-forgery defense — strip `PAIR_DELIVERY_INJECTION_KEY`
+ *       from every task; PAIR re-stamps only the task THIS run injects;
+ *    2. operator intent + TRUE omission — `requested` AND zero canonical
+ *       AND zero raw attempted delivery tasks (a dropped malformed
+ *       emission already failed closed upstream — never repair into
+ *       ambiguity);
+ *    3. servability — TELEGRAM_DELIVERY inside the canonical work
+ *       vocabulary AND routable by a currently-qualified executor
+ *       capability set — else `FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE`;
+ *    4. a real producer exists — no content-bearing task upstream means
+ *       nothing genuine to deliver — `FAIL_CLOSED_DELIVERY_INJECTION_NO_PRODUCER`
+ *       (never fabricate an empty deliverable just to satisfy presence).
+ *  The injected task is a canonical DAG leaf (`T${allTasks.length+1}`);
+ *  reconcilePlanDataflow (called by each caller) rewrites its
+ *  instruction, derives producer edges, and stamps the manifest /
+ *  plan-contract / output-language exactly as for a planner-emitted
+ *  delivery task. */
+function injectDeliveryTaskForTrueOmission(
+  allTasks: Array<Record<string, unknown>>,
+  deliveryIntent: TelegramDeliveryIntent,
+  counts: { canonical: number; raw: number },
+  executorCapSets: () => string[][],
+): void {
+  for (const t of allTasks) {
+    const md = t.metadata as Record<string, unknown> | undefined;
+    if (md && md[PAIR_DELIVERY_INJECTION_KEY] !== undefined) {
+      delete md[PAIR_DELIVERY_INJECTION_KEY];
+    }
+  }
+  if (
+    !deliveryIntent.requested ||
+    counts.canonical !== 0 ||
+    counts.raw !== 0
+  ) {
+    return;
+  }
+  const servable =
+    SERVE_LLM_WORK_CAPS.includes("TELEGRAM_DELIVERY") &&
+    executorCapSets()
+      .some((set) => (set as string[]).includes("TELEGRAM_DELIVERY"));
+  if (!servable) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE",
+      JSON.stringify({ requested: true, servable: false }),
+    );
+  }
+  if (!allTasks.some((t) => isContentBearing(t))) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_DELIVERY_INJECTION_NO_PRODUCER",
+      JSON.stringify({ requested: true, content_bearing_tasks: 0 }),
+    );
+  }
+  const deliveryKey = `T${allTasks.length + 1}`;
+  const injected: Record<string, unknown> = {
+    task_key: deliveryKey,
+    title: "governed telegram delivery",
+    // Placeholder only — reconcile rewrites the canonical
+    // delivery instruction and stamps the manifest/contract/
+    // output-language/edges exactly as for a planner-emitted task.
+    task_instruction:
+      "Stage the manifested artifacts into outbox/ unchanged, then reply DONE.",
+    required_capabilities: ["TELEGRAM_DELIVERY"],
+    depends_on: [],
+    metadata: {},
+  };
+  const record: DeliveryInjectionRecord = {
+    reason: "DELIVERY_TASK_INJECTED",
+    task_key: deliveryKey,
+    mode: deliveryIntent.mode,
+    authority: "OPERATOR_TELEGRAM_INTENT",
+  };
+  (injected.metadata as Record<string, unknown>)[
+    PAIR_DELIVERY_INJECTION_KEY
+  ] = record;
+  allTasks.push(injected);
 }
 
 /** Build the production runtime planner (the `planner` dep of
@@ -665,7 +707,12 @@ export function makeServePlanner(deps: ServePlannerDeps): {
       tasks.push({
         task_key: "T2",
         title: "llm analysis (dsh)",
-        task_instruction: `The workspace contains mission_goal.txt holding the operator's goal: "${goal}". Produce a genuine deliverable for that goal's subject matter — analyze the topic itself (never just restate or describe the goal) — write findings to analysis.txt, then reply DONE.`,
+        // No verbatim goal embed — an affirmative delivery clause inside
+        // the quoted goal would trip task-delivery hygiene/semantic
+        // re-proofs once a canonical delivery task exists. The goal
+        // stays durable in mission_goal.txt (T1's worker_spec).
+        task_instruction:
+          "The workspace contains mission_goal.txt holding the operator's goal (read it first). Produce a genuine deliverable for that goal's subject matter — analyze the topic itself (never just restate or describe the goal) — write findings to analysis.txt, then reply DONE.",
         required_capabilities: ["REASONING"],
         depends_on: ["T1"],
         metadata: {},
@@ -685,6 +732,34 @@ export function makeServePlanner(deps: ServePlannerDeps): {
           tasks.some((t) => t.task_key === k),
         ),
         metadata: {},
+      });
+    }
+    // HOTFIX-D — the deterministic template fallback runs through the
+    // SAME governed delivery-injection authority as every LLM/persisted
+    // candidate (delegated WOB-bound missions always land here: no
+    // pinned_plan_tasks, no metadata.llm_plan). The template list IS
+    // the unsanitized emission — a delivery omission is proven by
+    // construction, never by model confession. On a TRUE operator
+    // intent the canonical repair injects exactly one delivery task
+    // and reconcile stamps it exactly as for a planner-emitted one;
+    // without intent the BASE template bytes are unchanged.
+    const telegramIntent = detectTelegramDeliveryIntent(goal);
+    if (telegramIntent.requested) {
+      injectDeliveryTaskForTrueOmission(
+        tasks,
+        telegramIntent,
+        {
+          canonical: tasks.filter((t) => isDeliveryTask(t)).length,
+          // The deterministic template never emits a delivery task at
+          // all — there is no dropped/malformed emission to count.
+          raw: 0,
+        },
+        deps.executorCapSets,
+      );
+      reconcilePlanDataflow(tasks as never[], {
+        telegramIntent,
+        outputLanguage: detectOutputLanguage(String(goal ?? "")),
+        external_input_artifacts: input.input_artifact_sources,
       });
     }
     return { tasks };
