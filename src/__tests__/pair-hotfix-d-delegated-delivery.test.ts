@@ -925,6 +925,29 @@ describe("E9 — R1-F2 current/external-data contract on template delivery", () 
     // no transport channel was ever exercised for this mission
     expect(s.adapter.wroteTaskKeys.filter((k) => k.startsWith("T"))).not.toContain("T3:outbox/report.txt");
   });
+  it("E9f R3 — exact F5 goal ('tạo file báo cáo' OUTPUT wording) still trips the gate; no minted request, no sends", async () => {
+    const F5_GOAL =
+      "Phân tích thị trường chứng khoán tuần này, tạo file báo cáo bằng tiếng Việt, sau đó đăng lên kênh Telegram được phép.";
+    expect(goalRequiresCurrentExternalData(F5_GOAL)).toBe(true);
+    expect(detectTelegramDeliveryIntent(F5_GOAL).requested).toBe(true);
+    const s = delegatedStack("e9f");
+    expect(errCode(() => s.planner(plannerInput(F5_GOAL))))
+      .toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+    // and the delegated WOB mission carrying it fails at PLANNING too
+    const mid = openDelegatedIntentMission(s, `Bàn giao kết quả phân tích sau khi hoàn thành. ${F5_GOAL}`);
+    let saw: string | null = null;
+    try {
+      await driveToTerminal(s, mid);
+    } catch (e) {
+      saw = String((e as { code?: string })?.code ?? "ERR");
+    }
+    expect(saw).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+    expect(missionState(s, mid)).toBe("FAILED");
+    const reqs = (s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
+      .filter((p) => String(p.mission_id) === mid);
+    expect(reqs).toHaveLength(0);
+    expect(pendingTelegramDeliveries(s.store)).toHaveLength(0);
+  });
 });
 
 /* ============================== E11 — R2 detector ============================== */
@@ -941,6 +964,15 @@ describe("E11 — R2 current-week recency detection in goalRequiresCurrentExtern
     // no-intent twin of the incident goal still requires current data
     // (planning stays BASE because the gate only fires on delivery).
     NO_INTENT_GOAL,
+    // R3-F5 — output-file wording does not suppress the obligation
+    "Phân tích thị trường chứng khoán tuần này, tạo file báo cáo bằng tiếng Việt, sau đó đăng lên Telegram.",
+    "Nghiên cứu giá vàng tuần này và xuất kết quả ra report.txt, sau đó gửi Telegram.",
+    "Analyze this week's stock market, write the report to report.txt and post to Telegram.",
+    // R3-F6 — week recency bound to the RESEARCH subject survives a
+    // later meeting/delivery clause
+    "Research this week's market and deliver the result at a meeting.",
+    "Research current-week prices and save a report.",
+    "họp tuần này, nghiên cứu thị trường tuần này.",
   ])("detects current/external-data demand: %s", (goal) => {
     expect(goalRequiresCurrentExternalData(goal)).toBe(true);
   });
@@ -954,6 +986,14 @@ describe("E11 — R2 current-week recency detection in goalRequiresCurrentExtern
     "Họp team và lên lịch công việc tuần này.",
     "Soạn báo cáo tuần này cho phòng kinh doanh.",
     "Schedule the team sync this week.",
+    // R3-F5 — genuine local INPUT sources keep the suppression
+    "Phân tích dữ liệu trong file CSV cục bộ, tạo báo cáo rồi gửi Telegram.",
+    "Analyze the stock data from a local CSV file and send the report to Telegram.",
+    // R3-F6 — week recency bound to meeting/delivery deadline, not the
+    // researched subject
+    "Phân tích thị trường chứng khoán năm 2020 trong buổi họp tuần này, sau đó đăng kết quả lên Telegram.",
+    "Historical market research performed during a meeting this week.",
+    "Historical report delivered this week.",
   ])("does NOT detect current/external-data demand: %s", (goal) => {
     expect(goalRequiresCurrentExternalData(goal)).toBe(false);
   });

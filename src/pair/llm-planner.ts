@@ -151,7 +151,41 @@ export const LLM_PLAN_RESERVED_CAPABILITY_WARNING =
 /** Strong recency markers — unambiguous "newest/now" vocabulary that can
  *  lift a research or retrieval request into current-data territory. */
 const STRONG_CURRENCY_RE =
-  /\b(today|tonight|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now|this\s+week)\b|hôm nay|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay|tuần này|tuần hiện tại/iu;
+  /\b(today|tonight|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now|this\s+week|current[-\s]?week)\b|hôm nay|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay|tuần này|tuần hiện tại/iu;
+
+/** Non-week strong markers — always free recency. Week markers are
+ *  evaluated separately because "tuần này"/"this week" can also mark
+ *  WHEN work happens, not that the subject is current (R3-F6). */
+const STRONG_NONWEEK_CURRENCY_RE =
+  /\b(today|tonight|latest|newest|live|real[-\s]?time|up[-\s]?to[-\s]?date|breaking|right\s+now)\b|hôm nay|mới nhất|mới đây|gần đây|trực tiếp|bây giờ|lúc này|ngày hôm nay/iu;
+
+/** Current-week recency markers (global — scanned per clause). */
+const WEEK_CURRENCY_RE =
+  /\bthis\s+week\b|\bcurrent[-\s]?week\b|tuần\s+này|tuần\s+hiện\s+tại/giu;
+
+/** R3-F6 — schedule/meeting/delivery-deadline roles: when one of these
+ *  governs a week marker inside the same clause, the marker binds the
+ *  EVENT time ("buổi họp tuần này", "delivered this week"), not the
+ *  researched subject. Bounded rule — the schedule word must precede
+ *  the week marker inside the clause; a week marker in a clause
+ *  without a preceding schedule role keeps full recency authority. */
+const SCHEDULE_ROLE_RE =
+  /\b(họp|meeting|schedule[sd]?|lịch|deadline|hạn|nộp|bàn\s+giao|giao\s+(?!dịch)|deliver(?:ed|y|s|ing)?|submit(?:ted|s|ting)?|present(?:ed|s|ing|ation)?|trình\s+bày|gửi|send(?:s|t|ing)?|đăng|post(?:ed|s|ing)?|publish(?:ed|es|ing)?|share[sd]?)\b/iu;
+
+/** TRUE when the goal carries at least one week-recency marker that is
+ *  NOT governed by a schedule/deadline role within its own clause. */
+function hasUnboundWeekCurrency(goal: string): boolean {
+  const clauses = String(goal ?? "").split(/[,.;:!?\n]+/);
+  for (const clause of clauses) {
+    WEEK_CURRENCY_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = WEEK_CURRENCY_RE.exec(clause)) !== null) {
+      const before = clause.slice(Math.max(0, m.index - 32), m.index);
+      if (!SCHEDULE_ROLE_RE.test(before)) return true;
+    }
+  }
+  return false;
+}
 
 /** Generic current-state markers — ambiguous LOCAL-or-EXTERNAL; never
  *  sufficient alone (see R3.A rules). */
@@ -166,7 +200,7 @@ const ONLINE_RE =
  *  repo, not on the network. Presence suppresses the requirement unless
  *  an online marker coexists. */
 const LOCAL_SOURCE_RE =
-  /\b(repos?|repository|branch(?:es)?|workspace|files?|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|tệp|dự án|nhánh|cục bộ|\brepo\b/iu;
+  /\b(repos?|repository|branch(?:es)?|workspace|csv|source\s+code|codebase|code|project(?:\s+state)?|commits?|diffs?|modules?|director(?:y|ies)|folders?|logs?|local(?:ly)?|disk|filesystem|monorepo)\b|mã nguồn|thư mục|dự án|nhánh|cục bộ|\brepo\b|(?:local|cục\s+bộ)\s+(?:[\w.]+\s+){0,3}(?:files?|tệp(?:\s+tin)?)\b|\b(?:files?|tệp(?:\s+tin)?)\s+(?:cục\s+bộ|local|trên\s+disk|trong\s+repo|dữ\s+liệu|input)\b|\b(?:trong|từ|of|in|inside|within|from|on|read(?:ing)?|đọc|open(?:ing)?|mở)\s+(?:a\s+|an\s+|the\s+|this\s+|một\s+|các\s+|những\s+)?(?:files?|tệp(?:\s+tin)?)\b|(?:files?|tệp(?:\s+tin)?)\s+(?:input|data)\b/iu;
 
 /** Information-retrieval verbs. Word-bounded so "fetched", "scraper"
  *  do NOT match — only an explicit request to retrieve. */
@@ -193,7 +227,8 @@ const DATA_OBJECT_RE =
 export function goalRequiresCurrentExternalData(goal: string): boolean {
   const g = String(goal ?? "");
   const online = ONLINE_RE.test(g);
-  const strong = STRONG_CURRENCY_RE.test(g);
+  const strong =
+    STRONG_NONWEEK_CURRENCY_RE.test(g) || hasUnboundWeekCurrency(g);
   const generic = GENERIC_CURRENT_RE.test(g);
   if (!online && !strong && !generic) return false;
   // R3.A — LOCAL_CURRENT_STATE: an explicit local source without an
