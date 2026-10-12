@@ -54,6 +54,7 @@ import {
   inspectRawDeliveryEmissions,
   type RawDeliveryEmissionState,
   PAIR_DELIVERY_INJECTION_KEY,
+  normalizeArtifactPath,
   type DeliveryInjectionRecord,
   type TelegramDeliveryIntent,
   type ExternalInputArtifactSource,
@@ -200,7 +201,16 @@ export function injectDeliveryTaskForTrueOmission(args: {
       JSON.stringify({ requested: true, servable: false }),
     );
   }
-  const deliveryKey = `T${args.tasks.length + 1}`;
+  // R2-F2 — the injected key must be unique AND deterministic in every
+  // emission shape: `tasks.length + 1` collides when the emission skips
+  // a number (the codex-fallback emits a literal "T3" after "T1" when
+  // no T2 exists). Max T-suffix + 1 is always the next unused key.
+  let maxKey = 0;
+  for (const t of args.tasks) {
+    const m = /^T(\d+)$/.exec(String(t.task_key ?? ""));
+    if (m) maxKey = Math.max(maxKey, Number(m[1]));
+  }
+  const deliveryKey = `T${maxKey + 1}`;
   const injected: Record<string, unknown> = {
     task_key: deliveryKey,
     title: "governed telegram delivery",
@@ -700,6 +710,26 @@ export function makeServePlanner(deps: ServePlannerDeps): {
     const tasks: Array<Record<string, unknown>> = [
       canonicalBookkeepingTask(goal),
     ];
+    // R2-F3 — the template fallback IS the delegated-mission planning
+    // path: when trusted PAIR code resolved an eligible cross-mission
+    // input set for this mission, the work tasks must DECLARE those
+    // artifacts as consumes or the canonical binding seam
+    // (bindPlanExternalInputs) has nothing to bind and the governed
+    // dependency handoff silently never happens — the upstream bytes
+    // never reach the workspace. Naming the bounded eligible
+    // logical_names inside the PAIR-authored instruction mints
+    // instruction-derived consumes which the SAME canonical seam then
+    // binds by identity (zero new authority: a name absent from the
+    // eligible set can never appear here; unmatched or ambiguous
+    // bindings fail closed inside reconcile).
+    const upstreamNames = (input.input_artifact_sources ?? [])
+      .map((s) => String(s.logical_name ?? ""))
+      .filter((n) => Boolean(normalizeArtifactPath(n)));
+    const upstreamClause = upstreamNames.length
+      ? " The workspace provides canonical upstream artifacts: " +
+        upstreamNames.map((n) => `read ${n}`).join("; ") +
+        ". Use them as source material for the goal."
+      : "";
     if (deps.hasExecutor(DSH_EXECUTOR_ID)) {
       tasks.push({
         task_key: "T2",
@@ -714,7 +744,9 @@ export function makeServePlanner(deps: ServePlannerDeps): {
           "The workspace contains mission_goal.txt holding the operator's goal. " +
           "Read it and produce a genuine deliverable for that goal's subject matter — " +
           "analyze the topic itself (never just restate or describe the goal) — " +
-          "write findings to analysis.txt, then reply DONE.",
+          "write findings to analysis.txt." +
+          upstreamClause +
+          " Then reply DONE.",
         required_capabilities: ["REASONING"],
         depends_on: ["T1"],
         metadata: {},
@@ -728,7 +760,9 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         task_key: "T3",
         title: "codex step",
         task_instruction:
-          "Create codex_out.txt in the workspace containing a short note implementing or summarizing the mission goal, then reply DONE.",
+          "Create codex_out.txt in the workspace containing a short note implementing or summarizing the mission goal." +
+          upstreamClause +
+          " Then reply DONE.",
         required_capabilities: ["PYTHON_EXECUTION"],
         depends_on: ["T2"].filter((k) =>
           tasks.some((t) => t.task_key === k),
@@ -755,13 +789,23 @@ export function makeServePlanner(deps: ServePlannerDeps): {
       rawDeliveryCount: inspectRawDeliveryEmissions(tasks).count,
       executorCapSets: deps.executorCapSets,
     });
-    if (injected) {
-      reconcilePlanDataflow(tasks as never[], {
-        telegramIntent: detectTelegramDeliveryIntent(goal),
-        outputLanguage: detectOutputLanguage(String(goal ?? "")),
-        external_input_artifacts: input.input_artifact_sources,
-      });
-    }
+    // R2-F3 — run THE canonical mutation authority on EVERY template
+    // emission, not only when a delivery task was injected. Only
+    // reconcile stamps the canonical `metadata.pair_dataflow` model the
+    // dispatch-side dependency resolver consumes (resolveForConsumer
+    // reads pair_dataflow.consumes, never re-parses instructions): a
+    // plan leaving this path unreconciled could carry
+    // pair_dataflow_sources bindings but still materialize NOTHING at
+    // dispatch — the cross-mission handoff dead on arrival. Reconcile
+    // is idempotent by contract (re-running a canonical list is
+    // byte-identical) and its delivery/presence gates are no-ops on a
+    // FALSE-intent emission, so instruction text and depends_on stay
+    // exactly as before.
+    reconcilePlanDataflow(tasks as never[], {
+      telegramIntent: detectTelegramDeliveryIntent(goal),
+      outputLanguage: detectOutputLanguage(String(goal ?? "")),
+      external_input_artifacts: input.input_artifact_sources,
+    });
     return { tasks };
   };
   return { planner, canonicalizeLlmTasks };

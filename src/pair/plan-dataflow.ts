@@ -1387,6 +1387,17 @@ function requiredEdges(
         const content = tasks
           .map((t, j) => (j < i && isContentBearing(t) ? j : -1))
           .filter((j) => j >= 0);
+        if (!content.length) {
+          // R2-F1 — a TEXT-mode delivery with no content-bearing
+          // upstream has no legitimate payload to compose: the task
+          // would fabricate the operator-facing report from nothing.
+          // Fail closed as an unbound RESULT_TEXT input (same class as
+          // a manifested artifact without a producer).
+          throw new IntegrityError(
+            "FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT",
+            JSON.stringify({ task: key, artifact: "RESULT_TEXT" }),
+          );
+        }
         for (const j of content) {
           out[i].push({ producerIndex: j, artifact: "RESULT_TEXT" });
         }

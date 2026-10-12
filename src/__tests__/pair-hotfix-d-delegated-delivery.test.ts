@@ -41,9 +41,11 @@ import { describe, it, expect } from "vitest";
 import type { ExecutorAdapter } from "../pair/adapter.js";
 import {
   ApprovalQueue,
+  ArtifactProvenanceValidator,
   assertPlanDataflow,
   assertTaskDeliverySemantic,
   bindPlanExternalInputs,
+  BusinessLayer,
   canonicalBookkeepingTask,
   detectOutputLanguage,
   detectTelegramDeliveryIntent,
@@ -58,8 +60,10 @@ import {
   MissionObservability,
   MissionRouter,
   MissionRuntime,
+  MissionScheduleService,
   MissionScheduler,
   MissionSupervisor,
+  ObjectiveWorkstreamService,
   PAIR_DATAFLOW_SOURCES,
   PAIR_DELIVERY_INJECTION_KEY,
   PAIR_OUTPUT_LANGUAGE_KEY,
@@ -78,6 +82,9 @@ import {
   transportTelegramDelivery,
   utcnow,
   validatePlanProposal,
+  workerExecutionId,
+  WorkforceAllocationService,
+  WorkforceService,
   type DeliveryBackend,
   type ExternalInputArtifactSource,
   type GovernedSendResult,
@@ -1103,17 +1110,27 @@ describe("HOTFIX-D R1 — audit evidence gaps", () => {
     const { canonicalizeLlmTasks } = makeServePlanner(deps());
     const out = canonicalizeLlmTasks(
       [
+        // R2-F1 — a content-bearing task must precede the delivery
+        // task (delivery without an upstream producer fails closed).
         {
           task_key: "T2",
+          title: "analyze",
+          task_instruction: "analyze the local dataset, then reply DONE.",
+          required_capabilities: ["REASONING"],
+          depends_on: [],
+          metadata: {},
+        },
+        {
+          task_key: "T3",
           title: "deliver the report",
           task_instruction:
             "compose the summary and write outbox/report.txt, then reply DONE.",
           required_capabilities: ["TELEGRAM_DELIVERY"],
-          depends_on: ["T1"],
+          depends_on: ["T2"],
           metadata: {
             [PAIR_DELIVERY_INJECTION_KEY]: {
               reason: "DELIVERY_TASK_INJECTED",
-              task_key: "T2",
+              task_key: "T3",
               mode: "TEXT",
               authority: "OPERATOR_TELEGRAM_INTENT",
             },
@@ -1138,5 +1155,521 @@ describe("HOTFIX-D R1 — audit evidence gaps", () => {
       outputLanguage: detectOutputLanguage(SIMPLE_TRUE_GOAL),
       external_input_artifacts: [],
     });
+  });
+});
+
+/* ================= R2 AUDIT FINDINGS =================
+ *  F1 — TEXT delivery with ZERO content-bearing upstream must fail
+ *       closed (requiredEdges shared by reconcile + assert seam).
+ *  F2 — injected task key must be unique under skipped emission
+ *       numbers (codex-only fallback emitted a literal "T3").
+ *  F3 — the template fallback IS the delegated path: work tasks must
+ *       declare eligible upstream artifacts as consumes through the
+ *       canonical seams (instruction-derived consume →
+ *       bindPlanExternalInputs → pair_dataflow → dispatch
+ *       resolveForConsumer → materializeForConsumer), otherwise the
+ *       cross-mission handoff silently never happens.
+ */
+
+describe("HOTFIX-D R2 — audit findings F1/F2/F3", () => {
+  const PY_TRUE_GOAL =
+    "viết script python phân tích dữ liệu rồi gửi tóm tắt kết quả lên Telegram";
+
+  it("R2-F1a. TEXT delivery with no content-bearing producer FAILS CLOSED at planning — a delivery can never fabricate the payload", () => {
+    // DSH + Codex both unavailable: template emits T1 only. TRUE intent
+    // injects T2 delivery — but T2 has no upstream content.
+    const { planner } = makeServePlanner(
+      deps({ hasExecutor: () => false }),
+    );
+    expect(
+      errCode(() => planner(delegatedInput(SIMPLE_TRUE_GOAL)) as never),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT");
+    // A stored delivery-only plan (exactly the shape the injected
+    // authority would mint against a contentless task list) is rejected
+    // at the PURE structural seam too — replay can never smuggle it.
+    const withInjected = [canonicalBookkeepingTask(SIMPLE_TRUE_GOAL)] as
+      Array<Record<string, unknown>>;
+    injectDeliveryTaskForTrueOmission({
+      tasks: withInjected,
+      deliveryIntent: detectTelegramDeliveryIntent(SIMPLE_TRUE_GOAL),
+      canonicalDeliveryCount: 0,
+      rawDeliveryCount: 0,
+      executorCapSets: () => [CAPS],
+    });
+    expect(deliveryTasks(withInjected)).toHaveLength(1);
+    const replayCode = errCode(() =>
+      assertPlanDataflow(withInjected as never[], {
+        telegramIntent: detectTelegramDeliveryIntent(SIMPLE_TRUE_GOAL),
+        outputLanguage: detectOutputLanguage(SIMPLE_TRUE_GOAL),
+        external_input_artifacts: [],
+      }),
+    );
+    // Rejected at the pure structural seam by a fail-closed gate —
+    // the exact gate ordering is contract-internal; what matters is a
+    // stored delivery-without-content plan can never reach dispatch.
+    expect(replayCode?.startsWith("FAIL_CLOSED_")).toBe(true);
+  });
+
+  it("R2-F1b. single-producer and multi-producer TEXT delivery still plan canonically (legitimate delivery preserved)", () => {
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    const one = canonicalizeLlmTasks(
+      [
+        {
+          task_key: "T2",
+          title: "analyze",
+          task_instruction: "analyze the local dataset, then reply DONE.",
+          required_capabilities: ["REASONING"],
+          depends_on: [],
+          metadata: {},
+        },
+        {
+          task_key: "T3",
+          title: "deliver",
+          task_instruction: "compose the summary, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"],
+          depends_on: ["T2"],
+          metadata: {},
+        },
+      ],
+      SIMPLE_TRUE_GOAL,
+      { external_input_artifacts: [] },
+    ) as Array<Record<string, unknown>>;
+    const d1 = deliveryTasks(one)[0]!;
+    expect(d1.depends_on).toEqual(["T2"]);
+
+    const two = canonicalizeLlmTasks(
+      [
+        {
+          task_key: "T2",
+          title: "collect",
+          task_instruction: "collect local inputs, then reply DONE.",
+          required_capabilities: ["REASONING"],
+          depends_on: [],
+          metadata: {},
+        },
+        {
+          task_key: "T3",
+          title: "compose",
+          task_instruction: "write the digest file digest.md, then reply DONE.",
+          required_capabilities: ["REASONING"],
+          depends_on: ["T2"],
+          metadata: {},
+        },
+        {
+          task_key: "T4",
+          title: "deliver",
+          task_instruction: "compose the summary, then reply DONE.",
+          required_capabilities: ["TELEGRAM_DELIVERY"],
+          depends_on: ["T2", "T3"],
+          metadata: {},
+        },
+      ],
+      SIMPLE_TRUE_GOAL,
+      { external_input_artifacts: [] },
+    ) as Array<Record<string, unknown>>;
+    const d2 = deliveryTasks(two)[0]!;
+    // BOTH content-bearing upstreams bind RESULT_TEXT edges.
+    expect(d2.depends_on).toEqual(["T2", "T3"]);
+  });
+
+  it("R2-F2a. DSH absent + codex emitted: the injected delivery key is unique and deterministic — T4, not a second T3", () => {
+    const { planner } = makeServePlanner(
+      deps({ hasExecutor: (id) => id === "CODEX" }),
+    );
+    const out = (planner(delegatedInput(PY_TRUE_GOAL)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    expect(out.map((t) => String(t.task_key))).toEqual(["T1", "T3", "T4"]);
+    const d = deliveryTasks(out)[0]!;
+    expect(String(d.task_key)).toBe("T4");
+    // The codex step is the sole content producer — delivery binds it.
+    expect(d.depends_on).toEqual(["T3"]);
+    const keys = out.map((t) => String(t.task_key));
+    expect(new Set(keys).size).toBe(keys.length);
+    runPlanningChain({ tasks: out }, PY_TRUE_GOAL);
+  });
+
+  it("R2-F2b. DSH + codex both present: emission T1,T2,T3 then injected T4 — ordering and leaf preserved", () => {
+    const { planner } = makeServePlanner(deps());
+    const out = (planner(delegatedInput(PY_TRUE_GOAL)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    expect(out.map((t) => String(t.task_key))).toEqual(["T1", "T2", "T3", "T4"]);
+    const d = deliveryTasks(out)[0]!;
+    expect(String(d.task_key)).toBe("T4");
+    expect(d.depends_on).toEqual(["T2", "T3"]);
+    const keys = out.map((t) => String(t.task_key));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it("R2-F2c. replay determinism — same input emits the identical canonical list twice (no key drift, no duplicate injection)", () => {
+    const { planner } = makeServePlanner(
+      deps({ hasExecutor: (id) => id === "CODEX" }),
+    );
+    const a = (planner(delegatedInput(PY_TRUE_GOAL)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    const b = (planner(delegatedInput(PY_TRUE_GOAL)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+    expect(deliveryTasks(a)).toHaveLength(1);
+  });
+
+  /* ---- R2-F3: real delegated bound-mission handoff ---- */
+
+  const F3_OP = "op:r2";
+  let f3Seq = 0;
+
+  /** Real business scope + workstream decomposition (production seams). */
+  function f3Scope(ctx: ReturnType<typeof f1Stack>, wsKeys: string[]) {
+    const businessId = `BIZ_R2_${f3Seq++}`;
+    ctx.store.put("business", businessId, {
+      business_id: businessId,
+      name: "biz r2",
+      status: "ACTIVE",
+      currency: "USD",
+      project_id: ctx.projectId,
+      created_at: utcnow(),
+      version: 0,
+    }, 0);
+    const schedules = new MissionScheduleService(ctx.service);
+    const biz = new BusinessLayer({ store: ctx.store, control: ctx.control, schedules });
+    const wf = new WorkforceService({ store: ctx.store, business: biz });
+    const workstreams = new ObjectiveWorkstreamService(
+      { store: ctx.store, business: biz, workforce: wf, objectives: biz.objectives });
+    const alloc = new WorkforceAllocationService(
+      { store: ctx.store, business: biz, workforce: wf, objectives: biz.objectives, workstreams });
+    const obj = biz.objectives.create({
+      business_id: businessId,
+      title: "obj r2",
+      statement: "grow r2",
+      kpis: [{ name: "kpi", unit: "count", baseline: 0, target: 1 }],
+      deadline: "2999-01-01T00:00:00.000Z",
+      budget_ceiling_microusd: 500_000_000,
+      hard_constraints: [],
+      success_conditions: ["done"],
+      dedup_key: `dk-r2-${f3Seq++}`,
+      operator_id: F3_OP,
+    });
+    const objectiveId = String(obj.objective_id);
+    workstreams.decomposeObjective({
+      objective_id: objectiveId,
+      expected_objective_version: Number(obj.version),
+      expected_terms_version: Number(obj.terms_version),
+      expected_objective_digest: String(obj.objective_digest),
+      workstreams: wsKeys.map((k) => ({
+        workstream_key: k, title: `ws ${k}`, goal: `g ${k}`,
+      })) as never,
+      actor: F3_OP,
+    });
+    biz.createOrgAgent({
+      business_id: businessId,
+      title: "agent r2",
+      department: "ops",
+      operator_id: F3_OP,
+    });
+    return { objectiveId, businessId, biz, alloc };
+  }
+
+  /** Real delegated mission: allocateWorkstream → delegated child →
+   *  openWorkItem → WOB BOUND + mission mint (the exact production
+   *  delegated path, never a hand-built mission row). */
+  function f3BoundMission(
+    ctx: ReturnType<typeof f1Stack>,
+    scope: ReturnType<typeof f3Scope>,
+    wsKey: string,
+  ) {
+    scope.alloc.allocateWorkstream({
+      objective_id: scope.objectiveId,
+      workstream_key: wsKey,
+      actor: F3_OP,
+    });
+    const wal = ctx.store
+      .list("workforce_allocation")
+      .find(
+        (r) =>
+          String(r.objective_id) === scope.objectiveId &&
+          String(r.workstream_key ?? "") === wsKey,
+      )!;
+    const childId = String(wal.delegated_child_work_item_id);
+    scope.biz.openWorkItem(childId, F3_OP);
+    const wob = ctx.store
+      .list("work_open_binding")
+      .find((b) => String(b.work_item_id) === childId)!;
+    const missionId = String(wob.mission_id);
+    // Govern the mission into the shared governed workspace so the
+    // adapter + materialization share one root (production wiring does
+    // the same via allocation workspace).
+    const mission = ctx.store.get("mission", missionId);
+    ctx.store.put(
+      "mission",
+      missionId,
+      { ...mission, authorized_workspaces: [ctx.workspace] },
+      Number(mission.version),
+    );
+    return { missionId, workItemId: childId };
+  }
+
+  /** Producer mission's ACCEPTED canonical artifact — full mint chain. */
+  function f3AcceptedArtifact(
+    ctx: ReturnType<typeof f1Stack>,
+    missionId: string,
+    name: string,
+    bytes: Buffer,
+  ) {
+    const tid = `ATSK_R2_${f3Seq++}`;
+    const gtId = `GT_${tid}`;
+    const eid = workerExecutionId("EX_R2", gtId);
+    ctx.store.put("task", tid, {
+      task_id: tid, task_key: "TS1", mission_id: missionId,
+      plan_id: "PLAN_A", title: "ts", task_instruction: `produce ${name}`,
+      required_capabilities: ["FILE_OPERATIONS"], depends_on: [],
+      status: "COMPLETED",
+      metadata: { pair_dataflow: { produces: [name], consumes: [] } },
+      version: 0,
+    }, 0);
+    ctx.store.put("governed_task", gtId, {
+      governed_task_id: gtId, mission_id: missionId, task_id: tid,
+      correlation_id: `COR_${tid}`, executor_id: "EX_R2",
+      plan_id: "PLAN_A", plan_revision: 1,
+      workspace: ctx.workspace, allowed_paths: [ctx.workspace],
+      governance_state: "DISPATCH_AUTHORIZED", dispatch_enabled: true,
+      created_at: utcnow(), version: 0,
+    }, 0);
+    ctx.store.event({
+      entity_type: "governed_task", entity_id: gtId,
+      event_type: "GOVERNED_TASK_VALIDATED", new_state: "VALIDATED",
+      actor: "PAIR_GOVERNED_TASK_GATE", correlation_id: `COR_${tid}`,
+      metadata: {
+        mission_id: missionId, task_id: tid, executor_id: "EX_R2",
+        governed_task_id: gtId, plan_id: "PLAN_A", plan_revision: 1,
+        remote_produces_contract: false,
+        declared_produces: [name], declared_produces_digest: null,
+      },
+    });
+    ctx.store.event({
+      entity_type: "governed_task", entity_id: gtId,
+      event_type: "EXECUTION_PREPARED", old_state: "VALIDATED",
+      new_state: "DISPATCH_AUTHORIZED",
+      actor: "PAIR_GOVERNED_TASK_GATE", correlation_id: `COR_${tid}`,
+    });
+    ctx.store.put("executor_dispatch_intent", `INTENT_${gtId}`, {
+      intent_id: `INTENT_${gtId}`, governed_task_id: gtId,
+      executor_id: "EX_R2", state: "EXECUTION_PERSISTED",
+      execution_id: eid, created_at: utcnow(), version: 0,
+    }, 0);
+    fs.writeFileSync(path.join(ctx.workspace, name), bytes);
+    ctx.store.put("executor_execution", eid, {
+      execution_id: eid, governed_task_id: gtId, mission_id: missionId,
+      task_id: tid, executor_id: "EX_R2", plan_revision: 1,
+      correlation_id: `COR_${tid}`, execution_state: "COMPLETED",
+      dispatch_timestamp: utcnow(), run_root: `${ctx.workspace}/run`,
+      workspace: ctx.workspace,
+      result: {
+        status: "COMPLETED", output: "done",
+        artifacts: [{ path: name, sha256: sha256Hex(bytes), byte_size: bytes.length }],
+      },
+      version: 0,
+    }, 0);
+    ctx.store.event({
+      entity_type: "executor_execution", entity_id: eid,
+      event_type: "EXECUTION_DISPATCHED", new_state: "COMPLETED",
+      actor: "PAIR_GOVERNED_TASK_GATE", correlation_id: `COR_${tid}`,
+      metadata: { governed_task_id: gtId },
+    });
+    ctx.store.event({
+      entity_type: "executor_execution", entity_id: eid,
+      event_type: "RESULT_COLLECTED", new_state: "COMPLETED",
+      actor: "PAIR_GOVERNED_TASK_GATE", correlation_id: `COR_${tid}`,
+    });
+    const v = new ArtifactProvenanceValidator()
+      .validate_execution(ctx.service, eid) as Record<string, unknown>;
+    if (String(v.status) !== "PASS") {
+      throw new Error(`fixture validation: ${JSON.stringify(v.failures)}`);
+    }
+    const art = ctx.store
+      .list("artifact")
+      .find((a) => String(a.logical_name) === name)!;
+    return { artifactId: String(art.artifact_id), bytes, eid, tid, gtId };
+  }
+
+  it("R2-F3a. delegated bound mission consumes the upstream ACCEPTED artifact through the REAL template path — binding, provenance, dispatch resolution, byte materialization", () => {
+    const ctx = f1Stack("f3a");
+    const adapter = new F1Adapter("EX_R2", F1_CAPS);
+    f1RegisterAdapter(ctx, adapter);
+    const scope = f3Scope(ctx, ["w_src", "w_dst"]);
+    const producer = f3BoundMission(ctx, scope, "w_src");
+    const art = f3AcceptedArtifact(
+      ctx, producer.missionId, "upstream-brief.md",
+      Buffer.from("UPSTREAM CANONICAL BYTES"),
+    );
+    const consumer = f3BoundMission(ctx, scope, "w_dst");
+
+    // Eligible set (the production resolver the runtime feeds the
+    // planner) sees exactly the producer artifact.
+    const sources = ctx.service.artifactResolver
+      .listEligibleExternalInputSources(
+        ctx.store.get("mission", consumer.missionId) as never,
+      ) as Array<Record<string, unknown>>;
+    expect(sources.map((s) => String(s.artifact_id))).toEqual([art.artifactId]);
+
+    const state = f1Drive(ctx, consumer.missionId);
+    expect(state).toBe("COMPLETED");
+
+    // The consumer's T2 declared + bound the upstream artifact on the
+    // real template path — the audit's missing evidence.
+    const t2 = ctx.store
+      .list("task")
+      .find(
+        (t) =>
+          String(t.mission_id) === consumer.missionId &&
+          String(t.task_key) === "T2",
+      )!;
+    expect(String(t2.task_instruction)).toContain("upstream-brief.md");
+    const df = (t2.metadata as Record<string, unknown>)
+      .pair_dataflow as Record<string, unknown>;
+    expect(df.consumes).toContain("upstream-brief.md");
+    expect(df.consumes).toContain("mission_goal.txt");
+    const rows = (t2.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES
+    ] as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.contract).toBe(EXTERNAL_INPUT_CONTRACT);
+    expect(row.consume_name).toBe("upstream-brief.md");
+    expect(row.artifact_id).toBe(art.artifactId);
+    expect(row.logical_name).toBe("upstream-brief.md");
+    expect(row.sha256).toBe(sha256Hex(art.bytes));
+    expect(row.byte_size).toBe(art.bytes.length);
+    expect(row.source_mission_id).toBe(producer.missionId);
+    expect(row.source_task_id).toBe(art.tid);
+    expect(row.source_governed_task_id).toBe(art.gtId);
+    expect(row.source_execution_id).toBe(art.eid);
+
+    // Dispatch resolution pinned the cross-mission dependency entry and
+    // materialized the exact CAS bytes into the consumer workspace —
+    // the downstream task receives the real upstream artifact, never
+    // silently regenerated content.
+    const materialized = path.join(
+      ctx.workspace,
+      ".pair/dependency-artifacts",
+    );
+    const found: string[] = [];
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name === "upstream-brief.md") found.push(p);
+      }
+    };
+    if (fs.existsSync(materialized)) walk(materialized);
+    expect(found.length).toBe(1);
+    expect(fs.readFileSync(found[0]!).equals(art.bytes)).toBe(true);
+  });
+
+  it("R2-F3b. revoked upstream source → dispatch re-proof fails closed (stale binding never spends)", () => {
+    const ctx = f1Stack("f3b");
+    const adapter = new F1Adapter("EX_R2", F1_CAPS);
+    f1RegisterAdapter(ctx, adapter);
+    const scope = f3Scope(ctx, ["w_src", "w_dst"]);
+    const producer = f3BoundMission(ctx, scope, "w_src");
+    const art = f3AcceptedArtifact(
+      ctx, producer.missionId, "upstream-brief.md",
+      Buffer.from("UPSTREAM"),
+    );
+    const consumer = f3BoundMission(ctx, scope, "w_dst");
+
+    // Plan lands first (binding stamped), then revoke the source:
+    // mutate the artifact row so the eligible set no longer contains
+    // the pinned identity (sha drift = revocation class).
+    const t = Date.parse("2026-01-01T00:00:00Z");
+    let ticks = 0;
+    // Drive just past planning: tick until T2 task exists or cap.
+    for (let i = 0; i < 40; i++) {
+      ticks++;
+      ctx.runtime.tick(
+        consumer.missionId,
+        new Date(t + ticks * 120_000).toISOString(),
+      );
+      if (
+        ctx.store.list("task").some(
+          (x) =>
+            String(x.mission_id) === consumer.missionId &&
+            String(x.task_key) === "T2",
+        )
+      ) break;
+    }
+    const t2 = ctx.store
+      .list("task")
+      .find(
+        (x) =>
+          String(x.mission_id) === consumer.missionId &&
+          String(x.task_key) === "T2",
+      );
+    expect(t2).toBeTruthy();
+    // Revoke: the artifact's sha no longer equals the pinned binding.
+    const artRow = ctx.store.get("artifact", art.artifactId);
+    ctx.store.put(
+      "artifact",
+      art.artifactId,
+      { ...artRow, sha256: "0".repeat(64) },
+      Number(artRow.version),
+    );
+    // Stale binding is re-proven at dispatch — the consume resolution
+    // fails closed (verification/revocation code) instead of spending
+    // drifted bytes.
+    const code = errCode(() => f1Drive(ctx, consumer.missionId, 160));
+    expect(code.startsWith("FAIL_CLOSED_")).toBe(true);
+    // T2 never completed — it could not lawfully consume.
+    const t2Now = ctx.store.get("task", String(t2!.task_id));
+    expect(String(t2Now.status)).not.toBe("COMPLETED");
+  });
+
+  it("R2-F3c. missing upstream source (empty eligible set) — no binding minted, template tasks carry no fabricated consume", () => {
+    const ctx = f1Stack("f3c");
+    const adapter = new F1Adapter("EX_R2", F1_CAPS);
+    f1RegisterAdapter(ctx, adapter);
+    const scope = f3Scope(ctx, ["w_src", "w_dst"]);
+    f3BoundMission(ctx, scope, "w_src"); // produces nothing
+    const consumer = f3BoundMission(ctx, scope, "w_dst");
+    const sources = ctx.service.artifactResolver
+      .listEligibleExternalInputSources(
+        ctx.store.get("mission", consumer.missionId) as never,
+      ) as Array<Record<string, unknown>>;
+    expect(sources).toHaveLength(0);
+    const state = f1Drive(ctx, consumer.missionId);
+    expect(state).toBe("COMPLETED");
+    const t2 = ctx.store
+      .list("task")
+      .find(
+        (x) =>
+          String(x.mission_id) === consumer.missionId &&
+          String(x.task_key) === "T2",
+      )!;
+    expect(String(t2.task_instruction)).not.toContain("canonical upstream artifacts");
+    const df = (t2.metadata as Record<string, unknown>)
+      .pair_dataflow as Record<string, unknown>;
+    expect(df.consumes).toEqual(["mission_goal.txt"]);
+    expect(
+      (t2.metadata as Record<string, unknown>)[PAIR_DATAFLOW_SOURCES],
+    ).toBeUndefined();
+  });
+
+  it("R2-F3d. ambiguous same-name sources → the binding seam fails closed at plan time", () => {
+    const ctx = f1Stack("f3d");
+    const adapter = new F1Adapter("EX_R2", F1_CAPS);
+    f1RegisterAdapter(ctx, adapter);
+    const scope = f3Scope(ctx, ["w_a", "w_b", "w_c"]);
+    const p1 = f3BoundMission(ctx, scope, "w_a");
+    const p2 = f3BoundMission(ctx, scope, "w_b");
+    f3AcceptedArtifact(ctx, p1.missionId, "shared-up.md", Buffer.from("one"));
+    f3AcceptedArtifact(ctx, p2.missionId, "shared-up.md", Buffer.from("two"));
+    const consumer = f3BoundMission(ctx, scope, "w_c");
+    // Two eligible same-name sources make the consume ambiguous — the
+    // planner's binding seam fails closed rather than picking a source.
+    expect(errCode(() => f1Drive(ctx, consumer.missionId, 40))).toBe(
+      "FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE",
+    );
   });
 });
