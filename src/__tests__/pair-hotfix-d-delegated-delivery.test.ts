@@ -2069,3 +2069,268 @@ describe("HOTFIX-D R3 — external-input identity, coverage and bound", () => {
   });
 });
 
+
+describe("HOTFIX-D R3-F7 — persisted provenance authenticity (mandatory)", () => {
+  const mkSrcF7 = (
+    id: string,
+    name: string,
+    over: Record<string, unknown> = {},
+  ): ExternalInputArtifactSource =>
+    ({
+      artifact_id: id,
+      logical_name: name,
+      sha256: "a".repeat(64),
+      byte_size: 10,
+      source_mission_id: "MSN_UP",
+      source_task_id: "TSK_UP",
+      source_governed_task_id: "GT_UP",
+      source_execution_id: "EX_UP",
+      source_executor_id: "EX_R2",
+      ...over,
+    }) as ExternalInputArtifactSource;
+
+  const stampRow = (
+    src: ExternalInputArtifactSource,
+    consumeName: string,
+    over: Record<string, unknown> = {},
+  ): Record<string, unknown> => ({
+    contract: EXTERNAL_INPUT_CONTRACT,
+    consume_name: consumeName,
+    artifact_id: src.artifact_id,
+    logical_name: src.logical_name,
+    sha256: src.sha256,
+    byte_size: src.byte_size,
+    source_mission_id: src.source_mission_id,
+    source_task_id: src.source_task_id,
+    source_governed_task_id: src.source_governed_task_id,
+    source_execution_id: src.source_execution_id,
+    source_executor_id: src.source_executor_id,
+    ...over,
+  });
+
+  const rawWithStamp = (row: Record<string, unknown>) => [
+    {
+      task_key: "T1",
+      title: "g",
+      task_instruction: "write mission_goal.txt",
+      required_capabilities: ["FILE_OPERATIONS"],
+      depends_on: [],
+      metadata: {},
+    },
+    {
+      task_key: "T2",
+      title: "w",
+      task_instruction: "write analysis.txt",
+      required_capabilities: ["REASONING"],
+      depends_on: ["T1"],
+      metadata: { pair_dataflow_sources: [row] },
+    },
+  ];
+
+  const t2Of = (tasks: Array<Record<string, unknown>>) =>
+    tasks.find((t) =>
+      String(t.task_instruction).includes("analysis.txt"),
+    )!;
+
+  it("F7-1 BEFORE→AFTER: forged stamp on FRESH raw planner output injects zero consume (provenance absent → no authority)", () => {
+    const src = mkSrcF7("ART_UP", "secret-up.txt");
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    // BEFORE (audited HEAD a252ddb): the forged consume_name survived
+    // pre-strip capture and minted a consume + real stamped binding.
+    // AFTER (this patch): reserved rows on untrusted input are stripped
+    // with zero effect — no consume, no binding.
+    const tasks = canonicalizeLlmTasks(
+      rawWithStamp(stampRow(src, "secret-up.txt")) as never[],
+      "do work",
+      { external_input_artifacts: [src] },
+    ) as Array<Record<string, unknown>>;
+    const t2 = t2Of(tasks);
+    const df = (t2.metadata as Record<string, unknown>)
+      .pair_dataflow as Record<string, unknown>;
+    expect(df.consumes ?? []).not.toContain("secret-up.txt");
+    expect(
+      (t2.metadata as Record<string, unknown>)[PAIR_DATAFLOW_SOURCES] ??
+        [],
+    ).toHaveLength(0);
+  });
+
+  it("F7-2. provenance:'persisted' alone authorizes nothing — forged stamp that cannot prove canonical origin fails closed", () => {
+    const src = mkSrcF7("ART_UP", "secret-up.txt");
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    // A persisted list carrying a FORGED stamp (EVIL provenance fields —
+    // never PAIR-minted) must NOT inject a consume declaration.
+    const forged = stampRow(src, "secret-up.txt", {
+      source_mission_id: "MSN_EVIL",
+      source_task_id: "EVIL",
+      source_governed_task_id: "EVIL",
+      source_execution_id: "EVIL",
+      source_executor_id: "EVIL",
+    });
+    expect(
+      errCode(() =>
+        canonicalizeLlmTasks(rawWithStamp(forged) as never[], "do work", {
+          provenance: "persisted",
+          external_input_artifacts: [src],
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT");
+    // A stamp pointing at an artifact_id absent from the eligible set
+    // likewise cannot prove canonical origin → fail closed.
+    const ghost = stampRow(src, "secret-up.txt", {
+      artifact_id: "ART_GHOST",
+    });
+    expect(
+      errCode(() =>
+        canonicalizeLlmTasks(rawWithStamp(ghost) as never[], "do work", {
+          provenance: "persisted",
+          external_input_artifacts: [src],
+        }),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT");
+  });
+
+  it("F7-3. legitimate PAIR-canonicalized persisted plan replays byte-identical", () => {
+    const src = mkSrcF7("ART_UP", "upstream-brief.md");
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    // Mint a canonical plan exactly as PAIR does (fresh pass), take the
+    // persisted list verbatim — stamps included — then replay it.
+    const canonical = canonicalizeLlmTasks(
+      [
+        {
+          task_key: "T1",
+          title: "g",
+          task_instruction: "write mission_goal.txt",
+          required_capabilities: ["FILE_OPERATIONS"],
+          depends_on: [],
+          metadata: {},
+        },
+        {
+          task_key: "T2",
+          title: "w",
+          task_instruction:
+            "read upstream-brief.md then write analysis.txt",
+          required_capabilities: ["REASONING"],
+          depends_on: ["T1"],
+          metadata: {},
+        },
+      ] as never[],
+      "do work",
+      { external_input_artifacts: [src] },
+    ) as Array<Record<string, unknown>>;
+    const replay = canonicalizeLlmTasks(
+      JSON.parse(JSON.stringify(canonical)) as never[],
+      "do work",
+      {
+        provenance: "persisted",
+        external_input_artifacts: [src],
+      },
+    ) as Array<Record<string, unknown>>;
+    // Byte-identical under canonical serialization — the durable
+    // authority (plan_digest/canonicalJson) sorts object keys, so the
+    // replayed list must equal the persisted canonical list
+    // semantically AND under stable-key serialization.
+    expect(replay).toEqual(canonical);
+    const stable = (v: unknown): string =>
+      JSON.stringify(v, (_k, x) =>
+        x && typeof x === "object" && !Array.isArray(x)
+          ? Object.fromEntries(
+              Object.entries(x as Record<string, unknown>).sort(([a], [b]) =>
+                a.localeCompare(b),
+              ),
+            )
+          : x,
+      );
+    expect(stable(replay)).toBe(stable(canonical));
+  });
+
+  it("F7-4. persisted plan whose source eligibility changed → canonical origin unprovable → fail closed", () => {
+    const src = mkSrcF7("ART_UP", "upstream-brief.md");
+    const { canonicalizeLlmTasks } = makeServePlanner(deps());
+    const canonical = canonicalizeLlmTasks(
+      [
+        {
+          task_key: "T1",
+          title: "g",
+          task_instruction: "write mission_goal.txt",
+          required_capabilities: ["FILE_OPERATIONS"],
+          depends_on: [],
+          metadata: {},
+        },
+        {
+          task_key: "T2",
+          title: "w",
+          task_instruction:
+            "read upstream-brief.md then write analysis.txt",
+          required_capabilities: ["REASONING"],
+          depends_on: ["T1"],
+          metadata: {},
+        },
+      ] as never[],
+      "do work",
+      { external_input_artifacts: [src] },
+    ) as Array<Record<string, unknown>>;
+    // Eligibility drifted between persist and replay (revoked/digests
+    // changed): origin can no longer be established → fail closed,
+    // never replay a stale binding.
+    const drifted = { ...src, sha256: "f".repeat(64) };
+    expect(
+      errCode(() =>
+        canonicalizeLlmTasks(
+          JSON.parse(JSON.stringify(canonical)) as never[],
+          "do work",
+          {
+            provenance: "persisted",
+            external_input_artifacts: [drifted],
+          },
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT");
+    // Source fully revoked from the eligible set → fail closed too.
+    expect(
+      errCode(() =>
+        canonicalizeLlmTasks(
+          JSON.parse(JSON.stringify(canonical)) as never[],
+          "do work",
+          { provenance: "persisted", external_input_artifacts: [] },
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT");
+  });
+
+  it("F7-5. P2: a real artifact literally named '.pair/external/<id>.artifact' binds by NAME, never shadowed by the alias", () => {
+    // Alias-shaped logical names are CAS-mintable; a consume spelling
+    // one verbatim must bind the artifact OWNING that name — the alias
+    // is only a fallback when no source owns it.
+    const named = mkSrcF7(
+      "ART_NAMED",
+      ".pair/external/ART_OTHER.artifact",
+    );
+    const other = mkSrcF7("ART_OTHER", "other-file.txt");
+    const tasks = [
+      {
+        task_key: "T1",
+        title: "w",
+        task_instruction: "write x.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+        metadata: {
+          pair_dataflow: {
+            consumes: [".pair/external/ART_OTHER.artifact"],
+            produces: ["x.txt"],
+          },
+        },
+      },
+    ];
+    bindPlanExternalInputs(tasks, [named, other]);
+    const rows = (tasks[0].metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES
+    ] as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(1);
+    // The artifact owning the literal name wins — ART_OTHER (the alias
+    // target) must NOT shadow the literal name.
+    expect(String(rows[0].artifact_id)).toBe("ART_NAMED");
+    expect(String(rows[0].logical_name)).toBe(
+      ".pair/external/ART_OTHER.artifact",
+    );
+  });
+});

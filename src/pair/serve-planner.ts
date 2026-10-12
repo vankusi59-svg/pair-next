@@ -618,6 +618,10 @@ export function makeServeCanonicalizer(deps: {
       telegramIntent: deliveryIntent,
       outputLanguage: detectOutputLanguage(String(goal ?? "")),
       external_input_artifacts: ctx?.external_input_artifacts,
+      // R3-F7 — only an authenticated PAIR-canonicalized PERSISTED plan
+      // may re-derive consumes from prior stamped bindings; fresh raw
+      // planner output and replan candidates get no such authority.
+      trusted_persisted_plan: ctx?.provenance === "persisted",
     });
     // PRV2-B — Goal Contract coverage authority, AFTER dataflow
     // reconcile and remap so the check binds the canonical task keys

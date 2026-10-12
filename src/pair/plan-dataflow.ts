@@ -1208,21 +1208,23 @@ export function bindPlanExternalInputs(
       }
       if (producerIndex.has(name)) continue; // in-plan producer owns it
       const matches = new Map<string, ExternalInputArtifactSource>();
-      // R3-F5 — an identity-pinned alias consume resolves its source by
-      // artifact_id directly (the declaration is unambiguous by
-      // construction); an ordinary logical-name consume resolves by the
-      // canonical name-equivalence rule, never by filename heuristics.
-      const aliasMatch = EXTERNAL_CONSUME_ALIAS_RE.exec(name);
-      if (aliasMatch) {
-        for (const s of sources) {
-          if (s.artifact_id === aliasMatch[1]) matches.set(s.artifact_id, s);
+      // Canonical name-equivalence binding runs FIRST: an eligible
+      // source whose logical_name equals (or canonically spells) the
+      // consume name wins by identity. The identity-pinned alias is
+      // consulted only when NO eligible source owns the name —
+      // `.pair/external/<id>.artifact` is itself a CAS-mintable logical
+      // name, so alias interpretation must never shadow a real artifact
+      // carrying that name (R3 alias/CAS-namespace collision).
+      for (const s of sources) {
+        if (s.logical_name === name || artifactNamesEquivalentCompat(s.logical_name, name)) {
+          if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
         }
-      } else {
-        for (const s of sources) {
-          // The consume name must equal the canonical logical name —
-          // eligibility by identity, never by filename heuristics alone.
-          if (s.logical_name === name || artifactNamesEquivalentCompat(s.logical_name, name)) {
-            if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
+      }
+      if (matches.size === 0) {
+        const aliasMatch = EXTERNAL_CONSUME_ALIAS_RE.exec(name);
+        if (aliasMatch) {
+          for (const s of sources) {
+            if (s.artifact_id === aliasMatch[1]) matches.set(s.artifact_id, s);
           }
         }
       }
@@ -1592,6 +1594,20 @@ export interface ReconcileOptions {
    *  consume declarations — never inferred by parsing instruction
    *  prose. */
   declared_external_inputs?: DeclaredExternalInput[];
+  /** R3-F7 — only set for an authenticated PAIR-canonicalized PERSISTED
+   *  plan re-canonicalized on replay (`metadata.llm_plan` with
+   *  provenance "persisted"). Unset (fresh planner output, replan
+   *  candidates, PAIR-authored template tasks) `pair_dataflow_sources`
+   *  rows are stripped with ZERO effect — planner-controlled reserved
+   *  metadata can never mint a consume. When set, an incoming stamped
+   *  row still must prove its canonical origin against the CURRENT
+   *  durable eligible set: artifact_id present and EVERY pinned
+   *  identity field identical (logical_name, sha256, byte_size and all
+   *  source_* ids — the same re-proof `resolveExternalSourceInput`
+   *  performs at dispatch). A row that cannot establish proven PAIR
+   *  origin fails closed; one that verifies re-derives its consume
+   *  declaration so persisted plans replay byte-identically. */
+  trusted_persisted_plan?: boolean;
 }
 
 /** R3 — fold PAIR-owned external-input declarations into each task's
@@ -1700,20 +1716,56 @@ export function reconcilePlanDataflow(
   // R3 — consume names a PAIR-stamped binding ledger already proved on
   // a previous canonical pass: captured BEFORE the reserved-metadata
   // strip so re-reconciling a canonical list re-derives the identical
-  // consume set (a forged ledger can only declare consume INTENT —
-  // binding still re-proves the artifact against the bounded eligible
-  // set by identity, so preservation grants no source authority).
+  // consume set. R3-F7 — only on the authenticated PERSISTED replay
+  // path, and only for rows that re-prove canonical origin against the
+  // CURRENT eligible set (artifact_id + every pinned identity field):
+  // a forged or drifted stamp on any path either injects nothing or
+  // fails closed — never a silent consume declaration.
   const inheritedConsumes = new Map<number, string[]>();
-  for (const [i, t] of tasks.entries()) {
-    const rows = (
-      (t?.metadata as Record<string, unknown> | undefined)?.[
-        PAIR_DATAFLOW_SOURCES
-      ]
-    ) as Array<Record<string, unknown>> | undefined;
-    if (!Array.isArray(rows)) continue;
-    for (const r of rows) {
-      const n = normalizeArtifactPath(r?.consume_name);
-      if (n) (inheritedConsumes.get(i) ?? inheritedConsumes.set(i, []).get(i)!).push(n);
+  if (opts.trusted_persisted_plan) {
+    const sources = opts.external_input_artifacts ?? [];
+    for (const [i, t] of tasks.entries()) {
+      const rows = (
+        (t?.metadata as Record<string, unknown> | undefined)?.[
+          PAIR_DATAFLOW_SOURCES
+        ]
+      ) as Array<Record<string, unknown>> | undefined;
+      if (!Array.isArray(rows)) continue;
+      for (const r of rows) {
+        const e = r as Record<string, unknown>;
+        if (String(e?.contract ?? "") !== EXTERNAL_INPUT_CONTRACT) continue;
+        const n = normalizeArtifactPath(e?.consume_name);
+        if (!n) continue;
+        // Prove canonical origin NOW against the durable eligible set —
+        // same full-field re-proof the dispatch resolver performs.
+        const cur = sources.find(
+          (s) => s.artifact_id === String(e?.artifact_id ?? ""),
+        );
+        const ok =
+          cur &&
+          cur.logical_name === String(e?.logical_name ?? "") &&
+          cur.sha256 === String(e?.sha256 ?? "") &&
+          Number(cur.byte_size) === Number(e?.byte_size) &&
+          cur.source_mission_id === String(e?.source_mission_id ?? "") &&
+          cur.source_task_id === String(e?.source_task_id ?? "") &&
+          cur.source_governed_task_id ===
+            String(e?.source_governed_task_id ?? "") &&
+          cur.source_execution_id ===
+            String(e?.source_execution_id ?? "") &&
+          cur.source_executor_id === String(e?.source_executor_id ?? "");
+        if (!ok) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT",
+            JSON.stringify({
+              task: String(t.task_key ?? ""),
+              artifact_id: String(e?.artifact_id ?? ""),
+              reason: "persisted source stamp cannot prove canonical origin",
+            }),
+          );
+        }
+        (inheritedConsumes.get(i) ??
+          inheritedConsumes.set(i, []).get(i)!).push(n);
+      }
     }
   }
   // R2 §11 — PAIR-reserved fields are stripped from raw planner output
