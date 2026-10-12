@@ -55,6 +55,9 @@ import {
   type RawDeliveryEmissionState,
   PAIR_DELIVERY_INJECTION_KEY,
   normalizeArtifactPath,
+  extractTaskDataflow,
+  MAX_ARTIFACTS_PER_TASK,
+  type DeclaredExternalInput,
   type DeliveryInjectionRecord,
   type TelegramDeliveryIntent,
   type ExternalInputArtifactSource,
@@ -710,25 +713,64 @@ export function makeServePlanner(deps: ServePlannerDeps): {
     const tasks: Array<Record<string, unknown>> = [
       canonicalBookkeepingTask(goal),
     ];
-    // R2-F3 — the template fallback IS the delegated-mission planning
-    // path: when trusted PAIR code resolved an eligible cross-mission
-    // input set for this mission, the work tasks must DECLARE those
-    // artifacts as consumes or the canonical binding seam
-    // (bindPlanExternalInputs) has nothing to bind and the governed
-    // dependency handoff silently never happens — the upstream bytes
-    // never reach the workspace. Naming the bounded eligible
-    // logical_names inside the PAIR-authored instruction mints
-    // instruction-derived consumes which the SAME canonical seam then
-    // binds by identity (zero new authority: a name absent from the
-    // eligible set can never appear here; unmatched or ambiguous
-    // bindings fail closed inside reconcile).
-    const upstreamNames = (input.input_artifact_sources ?? [])
+    // R2-F3 / R3-F4+F5 — the template fallback IS the delegated-mission
+    // planning path: when trusted PAIR code resolved an eligible
+    // cross-mission input set, the work tasks must DECLARE those
+    // artifacts as consumes or the canonical binding seam has nothing
+    // to bind and the handoff silently never happens. The declaration
+    // travels through the PAIR-owned `declared_external_inputs`
+    // reconcile option (identity-pinned by artifact_id) — never through
+    // instruction text alone: valid canonical names the instruction
+    // grammar cannot express (spaces/unicode/nested dirs) or names that
+    // collide with an in-plan produce would silently truncate, omit, or
+    // shadow (R3-F4/F5). The instruction still mentions representable,
+    // non-colliding names as executor hints.
+    const eligible = input.input_artifact_sources ?? [];
+    // R3-F6 — every work task declares the FULL eligible set plus its
+    // own instruction-derived consumes (mission_goal.txt): a task can
+    // never carry more than MAX_ARTIFACTS_PER_TASK consumes, and the
+    // template cannot prove a task-relevant subset. Rejecting above the
+    // bound is the honest contract — never silently truncate a
+    // mandatory input, never widen the global limit.
+    if (eligible.length > MAX_ARTIFACTS_PER_TASK - 1) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_BOUNDS",
+        JSON.stringify({
+          reason: "delegated external-input budget exceeded",
+          eligible_inputs: eligible.length,
+          task_consume_budget: MAX_ARTIFACTS_PER_TASK - 1,
+          bound: MAX_ARTIFACTS_PER_TASK,
+        }),
+      );
+    }
+    // Names safe to mention verbatim: representable by the instruction
+    // path-token grammar (single-token segments) AND not produced by
+    // any task this template emits — naming a colliding or
+    // unrepresentable artifact in instruction prose would mint a
+    // truncated/shadowed consume (the declaration channel carries the
+    // authoritative consume either way; this clause is only a hint).
+    const templateProduces = new Set<string>(["mission_goal.txt"]);
+    if (deps.hasExecutor(DSH_EXECUTOR_ID)) templateProduces.add("analysis.txt");
+    if (
+      deps.hasExecutor(CODEX_EXECUTOR_ID) &&
+      /codex|python|script|code/i.test(goal)
+    ) {
+      templateProduces.add("codex_out.txt");
+    }
+    const mentionable = eligible
       .map((s) => String(s.logical_name ?? ""))
-      .filter((n) => Boolean(normalizeArtifactPath(n)));
-    const upstreamClause = upstreamNames.length
-      ? " The workspace provides canonical upstream artifacts: " +
-        upstreamNames.map((n) => `read ${n}`).join("; ") +
-        ". Use them as source material for the goal."
+      .filter(
+        (n) =>
+          /^[\w-]+(?:\/[\w-]+)*\.[\w-]+$/.test(n) && !templateProduces.has(n),
+      );
+    const upstreamClause = eligible.length
+      ? " Canonical upstream artifacts for this mission are staged " +
+        "under .pair/dependency-artifacts/ — use them as source material." +
+        (mentionable.length
+          ? " They include: " +
+            mentionable.map((n) => `read ${n}`).join("; ") +
+            "."
+          : "")
       : "";
     if (deps.hasExecutor(DSH_EXECUTOR_ID)) {
       tasks.push({
@@ -801,10 +843,28 @@ export function makeServePlanner(deps: ServePlannerDeps): {
     // byte-identical) and its delivery/presence gates are no-ops on a
     // FALSE-intent emission, so instruction text and depends_on stay
     // exactly as before.
+    // R3 — PAIR-owned declarations: every emitted work task consumes
+    // every eligible input (identity-pinned by artifact_id). The
+    // reconcile seam folds them into canonical consume declarations —
+    // logical_name verbatim when representable and uncolliding, else
+    // the deterministic externalConsumeAlias.
+    const workKeys = tasks
+      .filter((t) => t.task_key === "T2" || t.task_key === "T3")
+      .map((t) => String(t.task_key));
+    const declared_external_inputs: DeclaredExternalInput[] = [];
+    for (const k of workKeys) {
+      for (const s of eligible) {
+        declared_external_inputs.push({
+          task_key: k,
+          artifact_id: String(s.artifact_id),
+        });
+      }
+    }
     reconcilePlanDataflow(tasks as never[], {
       telegramIntent: detectTelegramDeliveryIntent(goal),
       outputLanguage: detectOutputLanguage(String(goal ?? "")),
       external_input_artifacts: input.input_artifact_sources,
+      declared_external_inputs,
     });
     return { tasks };
   };

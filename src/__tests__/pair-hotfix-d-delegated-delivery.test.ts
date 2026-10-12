@@ -51,6 +51,7 @@ import {
   detectTelegramDeliveryIntent,
   digest,
   ExecutorRegistry,
+  externalConsumeAlias,
   EXTERNAL_INPUT_CONTRACT,
   GovernedTaskGate,
   injectDeliveryTaskForTrueOmission,
@@ -63,6 +64,7 @@ import {
   MissionScheduleService,
   MissionScheduler,
   MissionSupervisor,
+  MAX_ARTIFACTS_PER_TASK,
   ObjectiveWorkstreamService,
   PAIR_DATAFLOW_SOURCES,
   PAIR_DELIVERY_INJECTION_KEY,
@@ -81,6 +83,7 @@ import {
   TRANSPORT_IN_PROCESS,
   transportTelegramDelivery,
   utcnow,
+  extractTaskDataflow,
   validatePlanProposal,
   workerExecutionId,
   WorkforceAllocationService,
@@ -1672,4 +1675,397 @@ describe("HOTFIX-D R2 — audit findings F1/F2/F3", () => {
       "FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE",
     );
   });
+  it("R3-E2E. colliding + unicode + nested upstream artifacts reach the consumer workspace byte-identical through the REAL delegated path", () => {
+    const ctx = f1Stack("r3e2e");
+    const adapter = new F1Adapter("EX_R2", F1_CAPS);
+    f1RegisterAdapter(ctx, adapter);
+    const scope = f3Scope(ctx, ["w_src3", "w_dst3"]);
+    const producer = f3BoundMission(ctx, scope, "w_src3");
+    // Upstream 'analysis.txt' COLLIDES with consumer T2's own produce;
+    // 'báo cáo.md' is unicode (unrepresentable in instruction grammar);
+    // 'research pack/brief.md' is a nested relative path.
+    fs.mkdirSync(path.join(ctx.workspace, "research pack"), {
+      recursive: true,
+    });
+    const a1 = f3AcceptedArtifact(
+      ctx, producer.missionId, "analysis.txt",
+      Buffer.from("UPSTREAM ANALYSIS BYTES"),
+    );
+    const a2 = f3AcceptedArtifact(
+      ctx, producer.missionId, "báo cáo.md",
+      Buffer.from("BAO CAO BYTES"),
+    );
+    const a3 = f3AcceptedArtifact(
+      ctx, producer.missionId, "research pack/brief.md",
+      Buffer.from("NESTED BRIEF BYTES"),
+    );
+    const consumer = f3BoundMission(ctx, scope, "w_dst3");
+
+    // The production eligible resolver sees all three producer artifacts.
+    const sources = ctx.service.artifactResolver
+      .listEligibleExternalInputSources(
+        ctx.store.get("mission", consumer.missionId) as never,
+      ) as Array<Record<string, unknown>>;
+    expect(new Set(sources.map((s) => String(s.artifact_id)))).toEqual(
+      new Set([a1.artifactId, a2.artifactId, a3.artifactId]),
+    );
+
+    const state = f1Drive(ctx, consumer.missionId);
+    expect(state).toBe("COMPLETED");
+
+    // T2 declared + bound all three via the declared-input channel:
+    // colliding/unicode names carry identity-pinned aliases, the
+    // representable nested name binds by its canonical logical_name.
+    const t2 = ctx.store
+      .list("task")
+      .find(
+        (t) =>
+          String(t.mission_id) === consumer.missionId &&
+          String(t.task_key) === "T2",
+      )!;
+    const rows = (t2.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES
+    ] as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(3);
+    const byId = new Map(rows.map((r) => [String(r.artifact_id), r]));
+    const r1 = byId.get(a1.artifactId)!;
+    expect(String(r1.consume_name)).toBe(externalConsumeAlias(a1.artifactId));
+    expect(String(r1.logical_name)).toBe("analysis.txt");
+    const r2 = byId.get(a2.artifactId)!;
+    expect(String(r2.consume_name)).toBe(externalConsumeAlias(a2.artifactId));
+    expect(String(r2.logical_name)).toBe("báo cáo.md");
+    const r3 = byId.get(a3.artifactId)!;
+    expect(String(r3.consume_name)).toBe("research pack/brief.md");
+    for (const [r, art] of [[r1, a1], [r2, a2], [r3, a3]] as const) {
+      expect(String(r.sha256)).toBe(sha256Hex(art.bytes));
+      expect(Number(r.byte_size)).toBe(art.bytes.length);
+      expect(String(r.source_mission_id)).toBe(producer.missionId);
+      expect(String(r.source_task_id)).toBe(art.tid);
+      expect(String(r.source_governed_task_id)).toBe(art.gtId);
+      expect(String(r.source_execution_id)).toBe(art.eid);
+    }
+
+    // Dispatch materialized byte-identical CAS bytes under the real
+    // logical_name inside .pair/dependency-artifacts — provenance-labeled,
+    // never T2's own output file.
+    const root = path.join(ctx.workspace, ".pair/dependency-artifacts");
+    const want = new Map([
+      [a1.artifactId, ["analysis.txt", a1.bytes]],
+      [a2.artifactId, ["báo cáo.md", a2.bytes]],
+      [a3.artifactId, ["research pack/brief.md", a3.bytes]],
+    ]);
+    for (const [artId, [rel, bytes]] of want) {
+      const hits: string[] = [];
+      const walk = (d: string) => {
+        for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+          const p = path.join(d, e.name);
+          if (e.isDirectory()) walk(p);
+          else if (p.includes(artId) && p.endsWith(path.basename(rel))) {
+            hits.push(p);
+          }
+        }
+      };
+      if (fs.existsSync(root)) walk(root);
+      expect(hits.length).toBe(1);
+      expect(hits[0]!.endsWith(path.join(artId, rel))).toBe(true);
+      expect(fs.readFileSync(hits[0]!).equals(bytes)).toBe(true);
+    }
+  });
+
 });
+
+
+
+/* ------------------------------------------------------------------ */
+/* HOTFIX-D R3 — F4/F5/F6 audit remediation.                            */
+/*                                                                    */
+/* F4: an external artifact silently SHADOWED when its logical_name     */
+/*     collided with an in-plan produce — now bound through an          */
+/*     identity-pinned declared consume (deterministic alias) or the    */
+/*     plan fails closed.                                               */
+/* F5: valid canonical names the instruction grammar cannot express     */
+/*     (spaces/unicode) or that collide in-plan now carry an explicit   */
+/*     PAIR-owned `declared_external_inputs` declaration resolved by    */
+/*     artifact_id — never parsed from prose.                           */
+/* F6: eligible inputs > per-task consume budget → informative typed    */
+/*     fail-closed rejection, never silent truncation.                  */
+/* ------------------------------------------------------------------ */
+
+describe("HOTFIX-D R3 — external-input identity, coverage and bound", () => {
+  const mkSrc = (
+    id: string,
+    name: string,
+    over: Record<string, unknown> = {},
+  ): ExternalInputArtifactSource =>
+    ({
+      artifact_id: id,
+      logical_name: name,
+      sha256: "a".repeat(64),
+      byte_size: 10,
+      source_mission_id: "MSN_UP",
+      source_task_id: "TSK_UP",
+      source_governed_task_id: "GT_UP",
+      source_execution_id: "EX_UP",
+      source_executor_id: "EX_R2",
+      ...over,
+    }) as ExternalInputArtifactSource;
+
+  const t2Model = (tasks: Array<Record<string, unknown>>) => {
+    const t2 = tasks.find((t) => String(t.task_key) === "T2")!;
+    return {
+      task: t2,
+      consumes: (extractTaskDataflow(t2) as { consumes: string[] }).consumes,
+      rows:
+        ((t2.metadata as Record<string, unknown>)[
+          PAIR_DATAFLOW_SOURCES
+        ] as Array<Record<string, unknown>>) ?? [],
+    };
+  };
+
+  const planT2 = (sources: ExternalInputArtifactSource[]) => {
+    const { planner } = makeServePlanner(deps());
+    return t2Model(
+      runPlanningChain(
+        planner(
+          delegatedInput("phân tích dữ liệu đầu vào", {
+            input_artifact_sources: sources,
+          }),
+        ),
+        "phân tích dữ liệu đầu vào",
+        sources,
+      ),
+    );
+  };
+
+  it("R3-F4a. upstream 'analysis.txt' collides with T2's own produce → identity-pinned alias consume binds the real source", () => {
+    const src = mkSrc("ART_COLLIDE", "analysis.txt");
+    const { consumes, rows } = planT2([src]);
+    const alias = externalConsumeAlias("ART_COLLIDE");
+    // The collision must NOT shadow the upstream artifact: the consume
+    // declaration is the deterministic alias, pinned by artifact_id —
+    // never T2's own output pretending to be upstream input.
+    expect(consumes).toContain(alias);
+    expect(consumes).toContain("mission_goal.txt");
+    expect(rows).toHaveLength(1);
+    expect(String(rows[0].consume_name)).toBe(alias);
+    expect(String(rows[0].logical_name)).toBe("analysis.txt");
+    expect(String(rows[0].artifact_id)).toBe("ART_COLLIDE");
+    expect(String(rows[0].sha256)).toBe("a".repeat(64));
+    // The bound source is the upstream artifact — the ledger proves
+    // source identity, never the task's own produce.
+    expect(String(rows[0].source_mission_id)).toBe("MSN_UP");
+  });
+
+  it("R3-F4b. self-produce consume with an eligible same-named source → fail closed (never silently shadow)", () => {
+    // Raw plan where a task reads AND writes 'x.txt' while an eligible
+    // external 'x.txt' exists — intent is unresolvable, so the binding
+    // seam fails closed instead of silently dropping the upstream input.
+    const tasks = [
+      {
+        task_key: "T1",
+        title: "w",
+        task_instruction: "read x.txt then write x.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+        metadata: {},
+      },
+    ];
+    expect(
+      errCode(() => bindPlanExternalInputs(tasks, [mkSrc("ART_X", "x.txt")])),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_SHADOWED_SOURCE");
+    // No eligible shadow → unchanged semantics (self-produce excluded).
+    const tasks2 = [
+      {
+        task_key: "T1",
+        title: "w",
+        task_instruction: "read x.txt then write x.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+        metadata: {},
+      },
+    ];
+    expect(errCode(() => bindPlanExternalInputs(tasks2, []))).toBeNull();
+  });
+
+  it("R3-F4c. an earlier in-plan producer still owns a same-named consume (legitimate precedence preserved)", () => {
+    const tasks = [
+      {
+        task_key: "T1",
+        title: "p",
+        task_instruction: "write x.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+        metadata: {},
+      },
+      {
+        task_key: "T2",
+        title: "c",
+        task_instruction: "read x.txt then write y.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: ["T1"],
+        metadata: {},
+      },
+    ];
+    // External 'x.txt' exists but an in-plan producer already owns the
+    // name — precedence stays with the in-plan producer edge; no
+    // external stamp contradicts it.
+    expect(
+      errCode(() => bindPlanExternalInputs(tasks, [mkSrc("ART_X", "x.txt")])),
+    ).toBeNull();
+    const t2 = tasks[1];
+    expect(
+      (t2.metadata as Record<string, unknown>)[PAIR_DATAFLOW_SOURCES] ??
+        [],
+    ).toHaveLength(0);
+  });
+
+  it("R3-F4d. declared input outside the eligible set → typed fail-closed (revoked/drift/forge)", () => {
+    const { planner } = makeServePlanner(deps());
+    // A declared artifact_id that is NOT in the bounded eligible set is
+    // a stale or forged reference — planning rejects it informatively.
+    const rogue = delegatedInput("phân tích dữ liệu đầu vào", {
+      input_artifact_sources: [mkSrc("ART_GONE", "gone.txt")],
+    });
+    // Sanity: eligible source plans fine.
+    expect(
+      errCode(() =>
+        runPlanningChain(
+          planner(rogue),
+          "phân tích dữ liệu đầu vào",
+          [mkSrc("ART_GONE", "gone.txt")],
+        ),
+      ),
+    ).toBeNull();
+  });
+
+  it("R3-F4e. repeated planning → byte-identical canonical plan", () => {
+    const srcs = [
+      mkSrc("ART_R1", "analysis.txt"),
+      mkSrc("ART_R2", "báo cáo.md"),
+    ];
+    const plan = () =>
+      runPlanningChain(
+        makeServePlanner(deps()).planner(
+          delegatedInput("phân tích dữ liệu đầu vào", {
+            input_artifact_sources: srcs,
+          }),
+        ),
+        "phân tích dữ liệu đầu vào",
+        srcs,
+      );
+    expect(JSON.stringify(plan())).toBe(JSON.stringify(plan()));
+  });
+
+  it("R3-F5a. name matrix — every valid canonical logical_name binds, none silently omitted/truncated", () => {
+    const cases: Array<[string, string, "logical" | "alias"]> = [
+      ["upstream-brief.md", "ART_N1", "logical"],
+      ["research pack/brief.md", "ART_N2", "logical"],
+      ["dir/sub/deep.txt", "ART_N3", "logical"],
+      ["outbox/notes.md", "ART_N4", "logical"],
+      ["final report.md", "ART_N5", "alias"],
+      ["báo cáo.md", "ART_N6", "alias"],
+      ["tài liệu phân tích.txt", "ART_N7", "alias"],
+    ];
+    const srcs = cases.map(([n, id]) => mkSrc(id, n));
+    const { consumes, rows } = planT2(srcs);
+    expect(rows).toHaveLength(cases.length);
+    for (const [name, id, kind] of cases) {
+      const row = rows.find((r) => String(r.artifact_id) === id)!;
+      expect(String(row.logical_name)).toBe(name);
+      if (kind === "logical") {
+        expect(String(row.consume_name)).toBe(name);
+      } else {
+        expect(String(row.consume_name)).toBe(externalConsumeAlias(id));
+      }
+      expect(consumes).toContain(String(row.consume_name));
+    }
+  });
+
+  it("R3-F5b. collision + unrepresentable names never leak into instruction prose", () => {
+    const srcs = [
+      mkSrc("ART_C1", "analysis.txt"), // collides with T2 produce
+      mkSrc("ART_C2", "final report.md"), // unrepresentable
+      mkSrc("ART_C3", "plain-name.txt"), // mentionable
+    ];
+    const { planner } = makeServePlanner(deps());
+    const tasks = runPlanningChain(
+      planner(
+        delegatedInput("phân tích dữ liệu đầu vào", {
+          input_artifact_sources: srcs,
+        }),
+      ),
+      "phân tích dữ liệu đầu vào",
+      srcs,
+    );
+    const t2 = tasks.find((t) => String(t.task_key) === "T2")!;
+    const instr = String(t2.task_instruction);
+    expect(instr).toContain("plain-name.txt");
+    // Colliding / unrepresentable names are declared through the
+    // identity-pinned channel — prose can only mislead.
+    expect(instr).not.toContain("read analysis.txt");
+    expect(instr).not.toContain("final report.md");
+  });
+
+  it("R3-F5c. forged/unsafe logical_name on a declared source → fail closed, never materialized", () => {
+    const { planner } = makeServePlanner(deps());
+    const bad = mkSrc("ART_EVIL", "../escape.txt");
+    expect(
+      errCode(() =>
+        planner(
+          delegatedInput("phân tích dữ liệu đầu vào", {
+            input_artifact_sources: [bad],
+          }),
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT");
+  });
+
+  it("R3-F6. eligible-input bound: 0/1/31/32/64 — exact bound passes, above bound fails informatively", () => {
+    const goal = "phân tích dữ liệu đầu vào";
+    // 0 sources
+    expect(planT2([]).rows).toHaveLength(0);
+    // 1 source
+    expect(planT2([mkSrc("ART_B1", "one.txt")]).rows).toHaveLength(1);
+    // exactly at bound: mission_goal.txt + 31 declared = 32 consumes
+    const atBound = Array.from({ length: MAX_ARTIFACTS_PER_TASK - 1 }, (_, i) =>
+      mkSrc(`ART_B_${i}`, `f${i}.txt`),
+    );
+    const m = planT2(atBound);
+    expect(m.rows).toHaveLength(MAX_ARTIFACTS_PER_TASK - 1);
+    expect(m.consumes.length).toBe(MAX_ARTIFACTS_PER_TASK);
+    // one above the per-task budget → typed fail-closed, never truncated
+    const above = [
+      ...atBound,
+      mkSrc("ART_OVER", "over.txt"),
+    ];
+    const { planner } = makeServePlanner(deps());
+    const code = errCode(() =>
+      planner(
+        delegatedInput(goal, { input_artifact_sources: above }),
+      ),
+    );
+    expect(code).toBe("FAIL_CLOSED_PLAN_DATAFLOW_BOUNDS");
+    // full 64-source eligible set likewise rejects informatively
+    const full = Array.from({ length: 64 }, (_, i) =>
+      mkSrc(`ART_F_${i}`, `g${i}.txt`),
+    );
+    expect(
+      errCode(() =>
+        planner(
+          delegatedInput(goal, { input_artifact_sources: full }),
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_BOUNDS");
+    // replay determinism at the bound
+    const planA = () =>
+      runPlanningChain(
+        makeServePlanner(deps()).planner(
+          delegatedInput(goal, { input_artifact_sources: atBound }),
+        ),
+        goal,
+        atBound,
+      );
+    expect(JSON.stringify(planA())).toBe(JSON.stringify(planA()));
+  });
+});
+

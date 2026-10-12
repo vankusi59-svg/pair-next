@@ -56,7 +56,9 @@ import {
   bindPlanExternalInputs,
   deliveryManifest,
   detectTelegramDeliveryIntent,
+  externalSourceBoundConsumes,
   missingConsumedArtifact,
+  normalizeArtifactPath,
   type ExternalInputArtifactSource,
 } from "./plan-dataflow.js";
 import {
@@ -1772,6 +1774,18 @@ export class MissionRuntime {
     // ized from CAS (not the producer's workspace path) — the source
     // path may legitimately be absent.
     const raw = (df.consumes as unknown[]).map(String);
+    // R3 — a consume carrying a canonical PAIR-stamped external source
+    // binding is served its bytes by CAS materialization through the
+    // pinned dependency_artifacts (proven inside requestFor) — never a
+    // local workspace path. The declared consume name may be an
+    // identity-pinned alias, so name-equivalence against pinned
+    // logical_names cannot cover it; the stamp itself is the coverage
+    // authority (requestFor already re-proved it or threw).
+    const sourceBound = externalSourceBoundConsumes(task);
+    const unboundRaw = raw.filter(
+      (n) => !sourceBound.has(normalizeArtifactPath(n) ?? n),
+    );
+    if (!unboundRaw.length) return null;
     // DSN-1 — resolved coverage is judged through the canonical
     // spelling rule (X ≡ outbox/<basename>), never raw strings: a
     // consume and the bound artifact may legitimately use different
@@ -1810,11 +1824,11 @@ export class MissionRuntime {
       }
     }
     const consumes = resolvedNames.size
-      ? raw.filter(
+      ? unboundRaw.filter(
           (n) =>
             ![...resolvedNames].some((r) => artifactNamesEquivalent(r, n)),
         )
-      : raw;
+      : unboundRaw;
     if (!consumes.length) return null;
     const md = (mission.metadata as Record<string, unknown>) ?? {};
     const workspace = String(

@@ -89,7 +89,7 @@ export interface DataflowRepair {
   resulting_depends_on: string[];
 }
 
-const MAX_ARTIFACTS_PER_TASK = 32;
+export const MAX_ARTIFACTS_PER_TASK = 32;
 const MAX_PATH_LEN = 240;
 const MAX_MANIFEST_ARTIFACTS = 16;
 
@@ -121,6 +121,33 @@ export const PAIR_PLAN_CONTRACT_VERSION = 2;
  *  mint source authority; it is stripped + recomputed at reconcile. */
 export const PAIR_DATAFLOW_SOURCES = "pair_dataflow_sources";
 export const EXTERNAL_INPUT_CONTRACT = "pair-external-artifact-input.v1";
+
+/** R3-F5 — deterministic consume name for an eligible external input
+ *  whose canonical `logical_name` cannot be expressed by the
+ *  plan-dataflow path grammar (spaces/unicode in the basename) or whose
+ *  name collides with an in-plan produced artifact (R3-F4: a same-named
+ *  in-plan produce must never silently shadow the external source — a
+ *  task cannot consume its own not-yet-produced output, so the
+ *  identity-pinned alias is the unambiguous declaration). The alias is
+ *  a pure function of the immutable artifact_id, always normalized by
+ *  `normalizeArtifactPath`, and can never collide with any in-plan
+ *  produce name. The stamped ledger still carries the real
+ *  `logical_name`; dispatch materializes under the real name inside the
+ *  namespaced `.pair/dependency-artifacts/` consumer path. */
+export function externalConsumeAlias(artifactId: string): string {
+  return `.pair/external/${artifactId}.artifact`;
+}
+const EXTERNAL_CONSUME_ALIAS_RE =
+  /^\.pair\/external\/([A-Za-z0-9_-]+)\.artifact$/;
+
+/** R3 — a PAIR-owned declaration that task `task_key` consumes the
+ *  eligible external input `artifact_id`. Passed only through
+ *  `ReconcileOptions.declared_external_inputs` — never through task
+ *  metadata, so planner-controlled fields can never mint it. */
+export interface DeclaredExternalInput {
+  task_key: string;
+  artifact_id: string;
+}
 
 /** One pinned external input: the consume name bound to the immutable
  *  canonical identity of an ACCEPTED artifact produced by a mission in
@@ -1098,7 +1125,7 @@ export function extractTaskDataflow(task: Record<string, unknown>): TaskDataflow
  *  Entries are never trusted as authority themselves: they only exempt
  *  a consume from the in-plan-producer rule; the binding they claim is
  *  fully re-proven against durable authority before any byte moves. */
-function externalSourceBoundConsumes(
+export function externalSourceBoundConsumes(
   task: Record<string, unknown>,
 ): Set<string> {
   const md = task.metadata as Record<string, unknown> | undefined;
@@ -1154,14 +1181,49 @@ export function bindPlanExternalInputs(
     const bound: Array<Record<string, unknown>> = [];
     for (const rawName of model.consumes) {
       const name = normalizeArtifactPath(rawName);
-      if (!name || produces.has(name)) continue;
+      if (!name) continue;
+      if (produces.has(name)) {
+        // R3-F4 — a consume colliding with the task's OWN produces can
+        // never prove it meant the external artifact rather than its own
+        // output (a task cannot consume a file it has not yet written):
+        // while an eligible source with that logical name exists the
+        // intent is unresolvable — fail closed instead of silently
+        // shadowing the upstream artifact. Explicit external intents are
+        // declared through the identity-pinned alias, never this name.
+        const shadowed = sources.some(
+          (s) =>
+            s.logical_name === name ||
+            artifactNamesEquivalentCompat(s.logical_name, name),
+        );
+        if (shadowed) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_PLAN_DATAFLOW_SHADOWED_SOURCE",
+            JSON.stringify({
+              task: String(task.task_key ?? ""),
+              artifact: name,
+            }),
+          );
+        }
+        continue;
+      }
       if (producerIndex.has(name)) continue; // in-plan producer owns it
       const matches = new Map<string, ExternalInputArtifactSource>();
-      for (const s of sources) {
-        // The consume name must equal the canonical logical name —
-        // eligibility by identity, never by filename heuristics alone.
-        if (s.logical_name === name || artifactNamesEquivalentCompat(s.logical_name, name)) {
-          if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
+      // R3-F5 — an identity-pinned alias consume resolves its source by
+      // artifact_id directly (the declaration is unambiguous by
+      // construction); an ordinary logical-name consume resolves by the
+      // canonical name-equivalence rule, never by filename heuristics.
+      const aliasMatch = EXTERNAL_CONSUME_ALIAS_RE.exec(name);
+      if (aliasMatch) {
+        for (const s of sources) {
+          if (s.artifact_id === aliasMatch[1]) matches.set(s.artifact_id, s);
+        }
+      } else {
+        for (const s of sources) {
+          // The consume name must equal the canonical logical name —
+          // eligibility by identity, never by filename heuristics alone.
+          if (s.logical_name === name || artifactNamesEquivalentCompat(s.logical_name, name)) {
+            if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
+          }
         }
       }
       if (matches.size > 1) {
@@ -1518,18 +1580,154 @@ export interface ReconcileOptions {
    *  (digest-covered) and injected into manifested-artifact producer
    *  instructions. Omitted → UNDETERMINED. */
   outputLanguage?: OutputLanguage;
+  /** R3 — PAIR-owned declarations "task_key consumes eligible input
+   *  artifact_id". Minted only by trusted PAIR code (the template
+   *  fallback) and carried through the options object — never through
+   *  task metadata, so planner-controlled fields can never mint or
+   *  forge a declaration. Each entry resolves its source strictly by
+   *  artifact_id inside the bounded eligible set (unresolvable → fail
+   *  closed) and is folded into the task's canonical consume
+   *  declarations BEFORE any model extraction: an explicit,
+   *  deterministic mapping from authorized eligible identities to
+   *  consume declarations — never inferred by parsing instruction
+   *  prose. */
+  declared_external_inputs?: DeclaredExternalInput[];
+}
+
+/** R3 — fold PAIR-owned external-input declarations into each task's
+ *  canonical consume declarations BEFORE any dataflow model is
+ *  extracted. Runs after the reserved-metadata strip, so what is folded
+ *  here is provably PAIR-authored: the declaration arrives through
+ *  `ReconcileOptions`, never through a task field.
+ *
+ *  Resolution rules (deterministic, fail-closed):
+ *   - `task_key` must name an existing task and `artifact_id` an entry
+ *     of the bounded eligible set — otherwise the declaration is stale
+ *     or forged and planning fails closed.
+ *   - consume_name = the canonical `logical_name` verbatim whenever the
+ *     plan-dataflow path grammar can express it AND no task in the plan
+ *     produces that name (an in-plan produce can never shadow an
+ *     external input — R3-F4).
+ *   - otherwise the identity-pinned `externalConsumeAlias` — unambiguous
+ *     by construction, still bound by artifact_id, materialized under
+ *     the real logical_name.
+ *
+ *  `inherited` re-injects consume names already proven by a prior
+ *  stamped ledger (re-canonicalized plans stay byte-identical). */
+function applyDeclaredExternalInputs(
+  tasks: Array<Record<string, unknown>>,
+  sources: ExternalInputArtifactSource[],
+  declared: DeclaredExternalInput[] | undefined,
+  inherited: Map<number, string[]>,
+): void {
+  const produced = new Set<string>();
+  for (const t of tasks) {
+    for (const p of extractTaskDataflow(t).produces) produced.add(p);
+  }
+  const add = (task: Record<string, unknown>, name: string) => {
+    const md = (task.metadata ??= {}) as Record<string, unknown>;
+    const df = (md.pair_dataflow ??= {}) as Record<string, unknown>;
+    const cons = Array.isArray(df.consumes)
+      ? (df.consumes as string[])
+      : (df.consumes = [] as string[]);
+    if (!cons.includes(name)) cons.push(name);
+  };
+  const byKey = new Map<string, Record<string, unknown>>();
+  for (const t of tasks) byKey.set(String(t.task_key ?? ""), t);
+  for (const d of declared ?? []) {
+    const task = byKey.get(String(d.task_key));
+    const src = sources.find((s) => s.artifact_id === d.artifact_id);
+    if (!task || !src) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT",
+        JSON.stringify({
+          task: String(d.task_key ?? ""),
+          artifact_id: String(d.artifact_id ?? ""),
+          reason: "declared input not an eligible source",
+        }),
+      );
+    }
+    // CAS identity sanity (same contract as artifact-authority's
+    // normalizeArtifactName): a logical_name carrying traversal,
+    // absolute, backslash or control bytes could never be minted — a
+    // source carrying one is forged/stale, and materializing it would
+    // widen the workspace path. Reject, never bind.
+    {
+      const ln = String(src.logical_name ?? "");
+      const segs = ln.split("/");
+      const unsafe =
+        !ln ||
+        /[\0-\x1f\\]/.test(ln) ||
+        path.isAbsolute(ln) ||
+        segs.some((s) => s === "" || s === "." || s === "..");
+      if (unsafe) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT",
+          JSON.stringify({
+            task: String(d.task_key ?? ""),
+            artifact_id: String(d.artifact_id ?? ""),
+            reason: "unsafe logical_name",
+          }),
+        );
+      }
+    }
+    const rep = normalizeArtifactPath(src.logical_name);
+    const name =
+      rep && !produced.has(rep) ? rep : externalConsumeAlias(src.artifact_id);
+    if (!normalizeArtifactPath(name)) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT",
+        JSON.stringify({
+          task: String(d.task_key ?? ""),
+          artifact_id: String(d.artifact_id ?? ""),
+          reason: "no representable consume name",
+        }),
+      );
+    }
+    add(task, name);
+  }
+  for (const [i, names] of inherited) {
+    const task = tasks[i];
+    if (!task) continue;
+    for (const n of names) add(task, n);
+  }
 }
 
 export function reconcilePlanDataflow(
   tasks: Array<Record<string, unknown>>,
   opts: ReconcileOptions = {},
 ): { tasks: Array<Record<string, unknown>>; repairs: DataflowRepair[] } {
+  // R3 — consume names a PAIR-stamped binding ledger already proved on
+  // a previous canonical pass: captured BEFORE the reserved-metadata
+  // strip so re-reconciling a canonical list re-derives the identical
+  // consume set (a forged ledger can only declare consume INTENT —
+  // binding still re-proves the artifact against the bounded eligible
+  // set by identity, so preservation grants no source authority).
+  const inheritedConsumes = new Map<number, string[]>();
+  for (const [i, t] of tasks.entries()) {
+    const rows = (
+      (t?.metadata as Record<string, unknown> | undefined)?.[
+        PAIR_DATAFLOW_SOURCES
+      ]
+    ) as Array<Record<string, unknown>> | undefined;
+    if (!Array.isArray(rows)) continue;
+    for (const r of rows) {
+      const n = normalizeArtifactPath(r?.consume_name);
+      if (n) (inheritedConsumes.get(i) ?? inheritedConsumes.set(i, []).get(i)!).push(n);
+    }
+  }
   // R2 §11 — PAIR-reserved fields are stripped from raw planner output
   // before any extraction: planner metadata never mints data-flow,
   // repair, or delivery authority. Re-running on an already-canonical
   // list strips the PAIR-stamped values and recomputes them identically
   // (idempotent).
   stripReservedTaskMetadata(tasks);
+  applyDeclaredExternalInputs(
+    tasks,
+    opts.external_input_artifacts ?? [],
+    opts.declared_external_inputs,
+    inheritedConsumes,
+  );
   const intent: TelegramDeliveryIntent = opts.telegramIntent ?? {
     requested: false,
     artifacts: [],
