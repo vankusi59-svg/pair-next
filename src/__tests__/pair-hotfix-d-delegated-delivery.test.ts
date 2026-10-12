@@ -73,6 +73,7 @@ import {
   PairControlPlane,
   PairEvidenceStore,
   pendingTelegramDeliveries,
+  reconcilePlanDataflow,
   ReconciliationService,
   RecoveryController,
   sha256Hex,
@@ -2297,15 +2298,15 @@ describe("HOTFIX-D R3-F7 — persisted provenance authenticity (mandatory)", () 
     ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT");
   });
 
-  it("F7-5. P2: a real artifact literally named '.pair/external/<id>.artifact' binds by NAME, never shadowed by the alias", () => {
-    // Alias-shaped logical names are CAS-mintable; a consume spelling
-    // one verbatim must bind the artifact OWNING that name — the alias
-    // is only a fallback when no source owns it.
+  it("T4. P2: a real artifact literally named '.pair/external/<id>.artifact' binds by NAME when resolution is unambiguous", () => {
+    // Alias-shaped logical names are CAS-mintable. The artifact owning
+    // the literal name binds normally when no artifact_id in the
+    // eligible set collides — only ONE identity resolves here (no
+    // ART_OTHER in the set, so the alias mechanism resolves nothing).
     const named = mkSrcF7(
       "ART_NAMED",
       ".pair/external/ART_OTHER.artifact",
     );
-    const other = mkSrcF7("ART_OTHER", "other-file.txt");
     const tasks = [
       {
         task_key: "T1",
@@ -2321,16 +2322,103 @@ describe("HOTFIX-D R3-F7 — persisted provenance authenticity (mandatory)", () 
         },
       },
     ];
-    bindPlanExternalInputs(tasks, [named, other]);
+    bindPlanExternalInputs(tasks, [named]);
     const rows = (tasks[0].metadata as Record<string, unknown>)[
       PAIR_DATAFLOW_SOURCES
     ] as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(1);
-    // The artifact owning the literal name wins — ART_OTHER (the alias
-    // target) must NOT shadow the literal name.
     expect(String(rows[0].artifact_id)).toBe("ART_NAMED");
     expect(String(rows[0].logical_name)).toBe(
       ".pair/external/ART_OTHER.artifact",
     );
+  });
+
+  it("T5. P2: artifact A's generated alias equals artifact B's real logical_name → typed FAIL_CLOSED, never a wrong-source binding", () => {
+    // Consume name ".pair/external/ART_A.artifact": the NAME mechanism
+    // resolves artifact B (whose literal logical_name it is) while the
+    // ALIAS mechanism resolves artifact A (artifact_id ART_A). Two
+    // different identities — never silently prefer either; fail closed.
+    const artA = mkSrcF7("ART_A", "a-file.txt");
+    const artB = mkSrcF7("ART_B", ".pair/external/ART_A.artifact");
+    const tasks = [
+      {
+        task_key: "T1",
+        title: "w",
+        task_instruction: "write x.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+        metadata: {
+          pair_dataflow: {
+            consumes: [".pair/external/ART_A.artifact"],
+            produces: ["x.txt"],
+          },
+        },
+      },
+    ];
+    expect(
+      errCode(() => bindPlanExternalInputs(tasks, [artA, artB])),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE");
+    expect(
+      (tasks[0].metadata as Record<string, unknown>)[
+        PAIR_DATAFLOW_SOURCES
+      ] ?? [],
+    ).toHaveLength(0);
+  });
+
+  it("T5b. P2: name and alias resolving the SAME identity bind normally", () => {
+    // Both mechanisms agree on one identity → accept (defense of the
+    // consistent case: the alias is only an alternate spelling of the
+    // same source).
+    const art = mkSrcF7("ART_SAME", ".pair/external/ART_SAME.artifact");
+    const tasks = [
+      {
+        task_key: "T1",
+        title: "w",
+        task_instruction: "write x.txt",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+        metadata: {
+          pair_dataflow: {
+            consumes: [".pair/external/ART_SAME.artifact"],
+            produces: ["x.txt"],
+          },
+        },
+      },
+    ];
+    bindPlanExternalInputs(tasks, [art]);
+    const rows = (tasks[0].metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES
+    ] as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(1);
+    expect(String(rows[0].artifact_id)).toBe("ART_SAME");
+  });
+
+  it("T6. declared artifact_id absent from the current eligible set → typed FAIL_CLOSED (genuine negative)", () => {
+    // The PAIR-owned declared channel resolves strictly inside the
+    // bounded eligible set — a declaration naming an artifact_id that
+    // is not currently eligible fails closed at declaration time.
+    const src = mkSrcF7("ART_UP", "ok.md");
+    expect(
+      errCode(() =>
+        reconcilePlanDataflow(
+          [
+            {
+              task_key: "T1",
+              title: "w",
+              task_instruction: "write x.txt",
+              required_capabilities: ["FILE_OPERATIONS"],
+              depends_on: [],
+              metadata: {},
+            },
+          ] as never[],
+          {
+            external_input_artifacts: [src],
+            declared_external_inputs: [
+              { task_key: "T1", artifact_id: "ART_GONE" },
+            ],
+          },
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_EXTERNAL_INPUT");
   });
 });

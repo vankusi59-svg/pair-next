@@ -1207,33 +1207,36 @@ export function bindPlanExternalInputs(
         continue;
       }
       if (producerIndex.has(name)) continue; // in-plan producer owns it
-      const matches = new Map<string, ExternalInputArtifactSource>();
-      // Canonical name-equivalence binding runs FIRST: an eligible
-      // source whose logical_name equals (or canonically spells) the
-      // consume name wins by identity. The identity-pinned alias is
-      // consulted only when NO eligible source owns the name —
-      // `.pair/external/<id>.artifact` is itself a CAS-mintable logical
-      // name, so alias interpretation must never shadow a real artifact
-      // carrying that name (R3 alias/CAS-namespace collision).
+      const nameMatches = new Map<string, ExternalInputArtifactSource>();
       for (const s of sources) {
+        // The consume name must equal the canonical logical name —
+        // eligibility by identity, never by filename heuristics alone.
         if (s.logical_name === name || artifactNamesEquivalentCompat(s.logical_name, name)) {
-          if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
+          if (!nameMatches.has(s.artifact_id)) nameMatches.set(s.artifact_id, s);
         }
       }
-      if (matches.size === 0) {
-        const aliasMatch = EXTERNAL_CONSUME_ALIAS_RE.exec(name);
-        if (aliasMatch) {
-          for (const s of sources) {
-            if (s.artifact_id === aliasMatch[1]) matches.set(s.artifact_id, s);
-          }
+      const aliasMatches = new Map<string, ExternalInputArtifactSource>();
+      const aliasMatch = EXTERNAL_CONSUME_ALIAS_RE.exec(name);
+      if (aliasMatch) {
+        for (const s of sources) {
+          if (s.artifact_id === aliasMatch[1]) aliasMatches.set(s.artifact_id, s);
         }
       }
-      if (matches.size > 1) {
+      // R4 P2 — `.pair/external/<id>.artifact` is itself a CAS-mintable
+      // logical name, so alias parsing and name matching must BOTH be
+      // evaluated. Both resolving to the same artifact → consistent,
+      // bind it. Resolving to different identities → typed fail closed:
+      // never silently prefer one mechanism over the other in an
+      // identity conflict (artifact A's alias vs artifact B's real
+      // name). Multiple matches under one mechanism → ambiguous.
+      const unionIds = new Set([...nameMatches.keys(), ...aliasMatches.keys()]);
+      if (unionIds.size > 1) {
         throw new IntegrityError(
           "FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE",
           JSON.stringify({ task: String(task.task_key ?? ""), artifact: name }),
         );
       }
+      const matches = nameMatches.size ? nameMatches : aliasMatches;
       const src = [...matches.values()][0];
       if (!src) continue; // stays unbound — requiredEdges fails it
       bound.push({
