@@ -74,6 +74,8 @@ import {
   WorkforceAllocationService,
   WorkforceService,
   DSH_EXECUTOR_ID,
+  CODEX_EXECUTOR_ID,
+  goalRequiresCurrentExternalData,
   PAIR_OUTPUT_LANGUAGE_KEY,
   type ExecutorAdapter,
   type GovernedTelegramTransport,
@@ -157,7 +159,13 @@ class E2EAdapter implements ExecutorAdapter {
   caps: string[];
   dispatched: string[] = [];
   wroteTaskKeys: string[] = [];
-  fileContent: Record<string, string> = {};
+  /** Scripted produce bytes — a string literal, or a DERIVATION read
+   *  from the real workspace at dispatch (F4: proves the consumer
+   *  actually read the materialized upstream artifact). */
+  fileContent: Record<
+    string,
+    string | ((workspace: string, task: Record<string, unknown>) => string)
+  > = {};
   workspace = "";
   store?: PairEvidenceStore;
   constructor(id: string, caps: string[]) {
@@ -186,7 +194,12 @@ class E2EAdapter implements ExecutorAdapter {
     for (const f of (df?.produces as string[]) ?? []) {
       const fp = path.join(this.workspace, f);
       fs.mkdirSync(path.dirname(fp), { recursive: true });
-      fs.writeFileSync(fp, this.fileContent[key] ?? `delivery text for ${key}`);
+      const spec = this.fileContent[key];
+      const content =
+        typeof spec === "function"
+          ? spec(this.workspace, task)
+          : (spec ?? `delivery text for ${key}`);
+      fs.writeFileSync(fp, content);
       this.wroteTaskKeys.push(`${key}:${f}`);
     }
     const box = (this as { _last?: Record<string, unknown> })._last ??
@@ -627,74 +640,122 @@ describe("E5 — idempotency", () => {
 
 /* ============================== E6 ============================== */
 
-describe("E6 — end-to-end delegated mission delivers real upstream content once", () => {
-  it("objective → workstream → delegated WOB mission → staged delivery → mocked receipt", async () => {
-    const s = delegatedStack("e6");
-    const MARKER = "BÁO CÁO TÓM TẮT: thị trường tăng điểm tuần này";
-    s.adapter.fileContent["T2"] = MARKER;
-    // The delivery executor stages a report composed FROM the upstream
-    // artifact bytes (production: the canonical instruction stages
-    // upstream outputs into outbox/ unchanged — scripted here).
-    s.adapter.fileContent["T3"] = `BÁO CÁO GỬI TELEGRAM\n\n${MARKER}`;
-    // Canonical business scope → objective → workstream whose goal
-    // carries the operator Telegram intent.
-    const businessId = `BIZ_${seq++}`;
-    s.store.put("business", businessId, {
-      business_id: businessId,
-      name: "pair hq",
-      status: "ACTIVE",
-      currency: "USD",
-      project_id: s.projectId,
-      created_at: utcnow(),
-      version: 0,
-    }, 0);
-    const obj = s.biz.objectives.create({
-      business_id: businessId,
-      title: "obj e6",
-      statement: "grow market intel",
-      kpis: [{ name: "kpi", unit: "count", baseline: 0, target: 1 }],
-      deadline: "2999-01-01T00:00:00.000Z",
-      budget_ceiling_microusd: 500_000_000,
-      hard_constraints: [],
-      success_conditions: ["done"],
-      dedup_key: `dk-${seq++}`,
-      operator_id: OP,
-    });
-    const objectiveId = String(obj.objective_id);
-    s.workstreams.decomposeObjective({
-      objective_id: objectiveId,
-      expected_objective_version: Number(obj.version),
-      expected_terms_version: Number(obj.terms_version),
-      expected_objective_digest: String(obj.objective_digest),
-      workstreams: [{
-        workstream_key: "ws-telegram",
-        title: "ws telegram",
-        goal: WS_INTENT_GOAL,
-      }] as never,
-      actor: OP,
-    });
-    s.biz.createOrgAgent({
-      business_id: businessId,
-      title: "analyst",
-      department: "ops",
-      operator_id: OP,
-    });
-    s.alloc.allocateWorkstream({
-      objective_id: objectiveId,
+/** THE real delegated chain: business → objective → workstream whose
+ *  goal carries operator Telegram intent → allocation → delegated WOB
+ *  child work item → INTENT→BOUND mission mint. Returns mission_id. */
+function openDelegatedIntentMission(s: ReturnType<typeof delegatedStack>) {
+  const businessId = `BIZ_${seq++}`;
+  s.store.put("business", businessId, {
+    business_id: businessId,
+    name: "pair hq",
+    status: "ACTIVE",
+    currency: "USD",
+    project_id: s.projectId,
+    created_at: utcnow(),
+    version: 0,
+  }, 0);
+  const obj = s.biz.objectives.create({
+    business_id: businessId,
+    title: "obj e6",
+    statement: "grow market intel",
+    kpis: [{ name: "kpi", unit: "count", baseline: 0, target: 1 }],
+    deadline: "2999-01-01T00:00:00.000Z",
+    budget_ceiling_microusd: 500_000_000,
+    hard_constraints: [],
+    success_conditions: ["done"],
+    dedup_key: `dk-${seq++}`,
+    operator_id: OP,
+  });
+  const objectiveId = String(obj.objective_id);
+  s.workstreams.decomposeObjective({
+    objective_id: objectiveId,
+    expected_objective_version: Number(obj.version),
+    expected_terms_version: Number(obj.terms_version),
+    expected_objective_digest: String(obj.objective_digest),
+    workstreams: [{
       workstream_key: "ws-telegram",
-      actor: OP,
-    });
-    const wal = s.store.list("workforce_allocation").find(
-      (r) => String(r.objective_id) === objectiveId &&
-        String(r.workstream_key ?? "") === "ws-telegram",
-    )!;
-    const childId = String(wal.delegated_child_work_item_id);
-    // THE delegated seam: WOB INTENT→BOUND + mission mint (bound id).
-    s.biz.openWorkItem(childId, OP);
-    const wob = s.store.list("work_open_binding").find(
-      (b) => String(b.work_item_id) === childId,
-    )!;
-    const mid = String(wob.mission_id);
+      title: "ws telegram",
+      goal: WS_INTENT_GOAL,
+    }] as never,
+    actor: OP,
+  });
+  s.biz.createOrgAgent({
+    business_id: businessId,
+    title: "analyst",
+    department: "ops",
+    operator_id: OP,
+  });
+  s.alloc.allocateWorkstream({
+    objective_id: objectiveId,
+    workstream_key: "ws-telegram",
+    actor: OP,
+  });
+  const wal = s.store.list("workforce_allocation").find(
+    (r) => String(r.objective_id) === objectiveId &&
+      String(r.workstream_key ?? "") === "ws-telegram",
+  )!;
+  const childId = String(wal.delegated_child_work_item_id);
+  // THE delegated seam: WOB INTENT→BOUND + mission mint (bound id).
+  s.biz.openWorkItem(childId, OP);
+  const wob = s.store.list("work_open_binding").find(
+    (b) => String(b.work_item_id) === childId,
+  )!;
+  return String(wob.mission_id);
+}
+
+/** Drive the minted delivery request through the governed bridge into a
+ *  mocked transport; returns the wire calls. Zero real Telegram. */
+async function sendMintedDelivery(
+  s: ReturnType<typeof delegatedStack>,
+): Promise<{ calls: Array<{ chatId: string; text?: string }> }> {
+  const pend = pendingTelegramDeliveries(s.store) as Array<Record<string, unknown>>;
+  expect(pend.length).toBe(1);
+  const req = pend[0];
+  const calls: Array<{ chatId: string; text?: string }> = [];
+  const transport: GovernedTelegramTransport = {
+    send: async (a: { chatId: string; text?: string }) => {
+      calls.push(a);
+      return { kind: "ok", message_id: 4242 };
+    },
+  };
+  const backend = {
+    begin: (artifact: string | null) => {
+      const rr = s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "SENDING" }) as { acquired: boolean };
+      return { acquired: rr.acquired === true };
+    },
+    sent: (artifact: string | null, ev: { message_id?: string | number | null }) =>
+      s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "SENT", message_id: ev?.message_id ?? null }),
+    failed: (artifact: string | null, err: string) =>
+      s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "FAILED", error: err }),
+    unknown: (artifact: string | null, err: string) =>
+      s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "UNKNOWN", error: err }),
+    unsendable: (reason: string) =>
+      s.control.transitionTelegramDelivery(String(req.delivery_id), { to: "UNSENDABLE", error: reason }),
+  };
+  const r = await transportTelegramDelivery({
+    request: req,
+    transport,
+    isAllowed: () => true,
+    backend,
+    readText: (p) => fs.readFileSync(p, "utf8"),
+  });
+  expect(r.sent.length).toBe(1);
+  return { calls };
+}
+
+describe("E6 — end-to-end delegated mission delivers real upstream content once", () => {
+  /** The staged report the delivery task produces is DERIVED at
+   *  dispatch from the upstream artifact physically present in the
+   *  workspace — the dependency handoff — never pre-seeded. */
+  const stageFromUpstream = (ws: string) =>
+    `BÁO CÁO GỬI TELEGRAM\n\n${fs.readFileSync(path.join(ws, "analysis.txt"), "utf8")}`;
+
+  it("objective → workstream → delegated WOB mission → staged delivery derived from real T2 bytes → mocked receipt", async () => {
+    const s = delegatedStack("e6");
+    const UPSTREAM = "PHÂN TÍCH SÂU: VN-Index +1.8% nhờ dòng tiền nhóm ngân hàng";
+    s.adapter.fileContent["T2"] = UPSTREAM;
+    s.adapter.fileContent["T3"] = stageFromUpstream;
+    const mid = openDelegatedIntentMission(s);
     expect(await driveToTerminal(s, mid)).toBe("COMPLETED");
     const taskRows = (s.store.list("task") as Array<Record<string, unknown>>)
       .filter((t) => String(t.mission_id) === mid);
@@ -702,52 +763,191 @@ describe("E6 — end-to-end delegated mission delivers real upstream content onc
       ((t.required_capabilities as string[]) ?? []).includes("TELEGRAM_DELIVERY"));
     expect(delRows).toHaveLength(1);
     expect(String(delRows[0].status)).toBe("COMPLETED");
-    // governed bridge: exactly one minted delivery request
-    const pend = pendingTelegramDeliveries(s.store) as Array<Record<string, unknown>>;
-    expect(pend.length).toBe(1);
-    const req = pend[0];
-    const calls: Array<{ chatId: string; text?: string }> = [];
-    const transport: GovernedTelegramTransport = {
-      send: async (a: { chatId: string; text?: string }) => {
-        calls.push(a);
-        return { kind: "ok", message_id: 4242 };
-      },
-    };
-    const backend = {
-      begin: (artifact: string | null) => {
-        const rr = s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "SENDING" }) as { acquired: boolean };
-        return { acquired: rr.acquired === true };
-      },
-      sent: (artifact: string | null, ev: { message_id?: string | number | null }) =>
-        s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "SENT", message_id: ev?.message_id ?? null }),
-      failed: (artifact: string | null, err: string) =>
-        s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "FAILED", error: err }),
-      unknown: (artifact: string | null, err: string) =>
-        s.control.transitionTelegramDelivery(String(req.delivery_id), { artifact, to: "UNKNOWN", error: err }),
-      unsendable: (reason: string) =>
-        s.control.transitionTelegramDelivery(String(req.delivery_id), { to: "UNSENDABLE", error: reason }),
-    };
-    const r = await transportTelegramDelivery({
-      request: req,
-      transport,
-      isAllowed: () => true,
-      backend,
-      readText: (p) => fs.readFileSync(p, "utf8"),
-    });
-    expect(r.sent.length).toBe(1);
+    const { calls } = await sendMintedDelivery(s);
     expect(calls).toHaveLength(1);
     expect(String(calls[0].chatId)).toBe("111");
-    // REAL upstream bytes reached the workspace — T2's own analysis.txt
-    // was produced and consumed by the delivery task (RESULT_TEXT edge),
-    // and the wire carries the staged report, not a fabricated summary.
+    // REAL handoff proven: the wire payload is built from T2's actual
+    // produced artifact bytes (analysis.txt on disk), so it carries the
+    // distinct upstream payload — a staged report T3 could only have
+    // written by consuming the T2 output.
     expect(fs.readFileSync(path.join(s.workspace, "analysis.txt"), "utf8"))
-      .toBe(MARKER);
-    expect(String(calls[0].text)).toContain(MARKER);
-    // no duplicate authority: exactly one delivery request exists for
-    // this mission at all, terminal SENT — never re-minted.
+      .toBe(UPSTREAM);
+    const stagedKey = s.adapter.wroteTaskKeys.find((k) => k.startsWith("T3:"))!;
+    const stagedPath = path.join(s.workspace, stagedKey.split(":")[1]!);
+    expect(fs.readFileSync(stagedPath, "utf8"))
+      .toBe(`BÁO CÁO GỬI TELEGRAM\n\n${UPSTREAM}`);
+    expect(String(calls[0].text)).toContain(UPSTREAM);
+    // no duplicate authority: exactly one delivery task and exactly one
+    // delivery request for this mission, terminal SENT — never re-minted.
     const allReqs = (s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
       .filter((p) => String(p.mission_id) === mid);
     expect(allReqs).toHaveLength(1);
     expect(String(allReqs[0].status)).toBe("SENT");
   });
+
+  it("E6b negative — a different upstream payload produces a different wire report; the expected one cannot pass", async () => {
+    const s = delegatedStack("e6b");
+    const DIFFERENT = "DỮ LIỆU KHÁC: thị trường đi ngang, không có điểm nhấn";
+    s.adapter.fileContent["T2"] = DIFFERENT;
+    s.adapter.fileContent["T3"] = stageFromUpstream;
+    const mid = openDelegatedIntentMission(s);
+    expect(await driveToTerminal(s, mid)).toBe("COMPLETED");
+    const { calls } = await sendMintedDelivery(s);
+    expect(calls).toHaveLength(1);
+    // The report tracks the REAL upstream bytes — a canned/pre-seeded
+    // expected payload would fail here.
+    expect(String(calls[0].text)).toContain(DIFFERENT);
+    expect(String(calls[0].text)).not.toContain("VN-Index");
+    const allReqs = (s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
+      .filter((p) => String(p.mission_id) === mid);
+    expect(allReqs).toHaveLength(1);
+    expect(String(allReqs[0].status)).toBe("SENT");
+  });
+});
+
+/* ============================== E8 — R1-F1 ============================== */
+
+describe("E8 — R1-F1 unique canonical task keys (DSH absent, Codex present)", () => {
+  const CODEX_INTENT_GOAL =
+    "Viết script Python phân tích dữ liệu mẫu, sau đó đăng lên kênh Telegram được phép.";
+  it("T1 bookkeeping + T3 codex + injected delivery takes next FREE key T4 — no duplicate", () => {
+    // sanity: the goal really does carry operator intent + codex shape
+    // without a current/external-data demand.
+    expect(detectTelegramDeliveryIntent(CODEX_INTENT_GOAL).requested).toBe(true);
+    expect(goalRequiresCurrentExternalData(CODEX_INTENT_GOAL)).toBe(false);
+    const s = delegatedStack("e8", { governed: new Set([CODEX_EXECUTOR_ID]) });
+    const out = (s.planner(plannerInput(CODEX_INTENT_GOAL)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    const keys = out.map((t) => t.task_key);
+    expect(keys).toEqual(["T1", "T3", "T4"]);
+    expect(new Set(keys).size).toBe(keys.length);
+    const del = deliveries(out);
+    expect(del).toHaveLength(1);
+    expect(del[0].task_key).toBe("T4");
+    const inj = (del[0].metadata as Record<string, unknown>)[
+      PAIR_DELIVERY_INJECTION_KEY] as Record<string, unknown>;
+    expect(inj.reason).toBe("DELIVERY_TASK_INJECTED");
+    expect(inj.task_key).toBe("T4");
+    // DAG correctness: delivery binds the content-bearing codex T3,
+    // never bookkeeping T1; T3's own edge list stays empty (no T2).
+    const deps = (del[0].depends_on as string[]) ?? [];
+    expect(deps).toContain("T3");
+    expect(deps).not.toContain("T1");
+    const t3 = out.find((t) => t.task_key === "T3")!;
+    expect(t3.depends_on).toEqual([]);
+    // validation + dataflow gates pass on the unique-key plan
+    runPlanningGate(out, CODEX_INTENT_GOAL);
+    // deterministic replay: identical input → byte-identical output
+    const again = (s.planner(plannerInput(CODEX_INTENT_GOAL)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    expect(canonicalJson(again)).toBe(canonicalJson(out));
+    expect(deliveries(again)).toHaveLength(1);
+  });
+});
+
+/* ============================== E9 — R1-F2 ============================== */
+
+describe("E9 — R1-F2 current/external-data contract on template delivery", () => {
+  const CURRENT_INTENT_GOAL =
+    "Nghiên cứu giá vàng hôm nay, sau đó đăng lên kênh Telegram được phép.";
+  it("intent + current-data demand + no legitimate NETWORK_ACCESS gatherer → FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED", () => {
+    expect(goalRequiresCurrentExternalData(CURRENT_INTENT_GOAL)).toBe(true);
+    expect(detectTelegramDeliveryIntent(CURRENT_INTENT_GOAL).requested).toBe(true);
+    const s = delegatedStack("e9");
+    expect(errCode(() => s.planner(plannerInput(CURRENT_INTENT_GOAL))))
+      .toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+  });
+  it("no-intent + same current-data demand → pre-existing fallback behavior preserved (plans, zero delivery)", () => {
+    const NO_INTENT_CURRENT = "Nghiên cứu giá vàng hôm nay.";
+    expect(goalRequiresCurrentExternalData(NO_INTENT_CURRENT)).toBe(true);
+    const s = delegatedStack("e9b");
+    const out = (s.planner(plannerInput(NO_INTENT_CURRENT)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    expect(out.map((t) => t.task_key)).toEqual(["T1", "T2"]);
+    expect(deliveries(out)).toHaveLength(0);
+  });
+  it("intent + local-source analysis (no external demand) → delivery plan still issues", () => {
+    const LOCAL_INTENT_GOAL =
+      "Phân tích dữ liệu trong file báo cáo local, sau đó đăng lên kênh Telegram được phép.";
+    expect(goalRequiresCurrentExternalData(LOCAL_INTENT_GOAL)).toBe(false);
+    const s = delegatedStack("e9c");
+    const out = (s.planner(plannerInput(LOCAL_INTENT_GOAL)) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    expect(deliveries(out)).toHaveLength(1);
+    runPlanningGate(out, LOCAL_INTENT_GOAL);
+  });
+});
+
+/* ============================== E10 — R1-F3 ============================== */
+
+describe("E10 — R1-F3 no-intent template output is byte-identical to BASE", () => {
+  // The EXACT BASE (cf2674c) task literals the template emitted for a
+  // no-intent goal — verbatim goal embed in T2, canonical codex T3.
+  const baseT2 = (goal: string) => ({
+    task_key: "T2",
+    title: "llm analysis (dsh)",
+    task_instruction:
+      `The workspace contains mission_goal.txt holding the operator's goal: "${goal}". ` +
+      "Produce a genuine deliverable for that goal's subject matter — analyze the topic " +
+      "itself (never just restate or describe the goal) — write findings to analysis.txt, " +
+      "then reply DONE.",
+    required_capabilities: ["REASONING"],
+    depends_on: ["T1"],
+    metadata: {},
+  });
+  const baseT3Codex = (deps: string[]) => ({
+    task_key: "T3",
+    title: "codex step",
+    task_instruction:
+      "Create codex_out.txt in the workspace containing a short note implementing or summarizing the mission goal, then reply DONE.",
+    required_capabilities: ["PYTHON_EXECUTION"],
+    depends_on: deps,
+    metadata: {},
+  });
+  const CODEX_NO_INTENT_GOAL = "Viết script Python tính tổng dữ liệu mẫu.";
+  const cases: Array<{
+    name: string;
+    governed: Set<string>;
+    goal: string;
+    expected: Array<Record<string, unknown>>;
+  }> = [
+    {
+      name: "dsh+codex, codex-matching goal",
+      governed: new Set([DSH_EXECUTOR_ID, CODEX_EXECUTOR_ID]),
+      goal: CODEX_NO_INTENT_GOAL,
+      expected: [undefined as never, baseT2(CODEX_NO_INTENT_GOAL), baseT3Codex(["T2"])],
+    },
+    {
+      name: "dsh only, plain goal",
+      governed: new Set([DSH_EXECUTOR_ID]),
+      goal: NO_INTENT_GOAL,
+      expected: [undefined as never, baseT2(NO_INTENT_GOAL)],
+    },
+    {
+      name: "codex only (no dsh), codex-matching goal — T2 gap",
+      governed: new Set([CODEX_EXECUTOR_ID]),
+      goal: CODEX_NO_INTENT_GOAL,
+      expected: [undefined as never, baseT3Codex([])],
+    },
+    {
+      name: "no governed executor",
+      governed: new Set(),
+      goal: NO_INTENT_GOAL,
+      expected: [undefined as never],
+    },
+  ];
+  for (const c of cases) {
+    it(`byte-identical: ${c.name}`, () => {
+      const s = delegatedStack(`e10-${c.governed.size}`, { governed: c.governed });
+      const out = (s.planner(plannerInput(c.goal)) as {
+        tasks: Array<Record<string, unknown>>;
+      }).tasks;
+      const expected = [canonicalBookkeepingTask(c.goal), ...c.expected.slice(1)];
+      expect(canonicalJson(out)).toBe(canonicalJson(expected));
+    });
+  }
 });
