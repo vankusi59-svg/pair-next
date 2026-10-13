@@ -84,6 +84,7 @@ import {
   devinBlockedGraceMs,
   resolveMcToken,
   runPlannerFailover,
+  plannerCandidateRequestBound,
   dedupePlannerCandidates,
   reconcileModelRoleAssignments,
   resolveConfiguredModelRoleRoute,
@@ -909,11 +910,16 @@ const planExpander = async (input, expandCtx) => {
       work_item_id: expandCtx?.work_item_id ?? null,
       est_microusd: candidates.reduce((sum, c) => {
         const bound = service.cost.plannerRequestBoundMicrousd(c);
-        // Provider-request bound per candidate: an HTTP candidate's
-        // INITIAL may emit up to 2 requests, codex_cli exactly 1; the
-        // bounded REASK adds at most one more for either.
-        const requestBound = (c.transport === "codex_cli" ? 1 : 2) + 1;
-        return sum + bound.per_request_microusd * requestBound;
+        // AUDIT R2 F1 — the monetary envelope must cover EVERY provider
+        // call a candidate can initiate, not just plan transports: for
+        // codex_cli the eligibility re-proof runs TWICE (pre-INITIAL +
+        // pre-REASK) and each may trigger ONE bounded canonical
+        // qualification refresh spawning up to 2 real probes
+        // (validateAccess + probeModel) → 6 worst case; HTTP/LLM
+        // candidates emit ≤2 requests inside INITIAL + 1 REASK → 3.
+        // plannerCandidateRequestBound encodes the structural bound in
+        // lockstep with runPlannerFailover — never re-derive it here.
+        return sum + bound.per_request_microusd * plannerCandidateRequestBound(c);
       }, 0),
       unbounded_unknown: candidates.some(
         (c) => service.cost.plannerRequestBoundMicrousd(c).billing.unbounded,
@@ -937,7 +943,7 @@ const planExpander = async (input, expandCtx) => {
       // counter: codex refresh probes count as real provider requests,
       // and both transports increment it at their invocation seam, so a
       // STARTED attempt row never masquerades as a made provider call.
-      assertEligible: (c, providerCounter) =>
+      assertEligible: (c, providerCounter, runCtx) =>
         c.transport === "codex_cli"
           ? assertCodexPlannerCandidateEligibleWithRefresh(store, c, {
               refresh: () =>
@@ -947,6 +953,11 @@ const planExpander = async (input, expandCtx) => {
                   model: c.model,
                   scratchDir: codexPlannerScratch,
                   timeoutMs: cfgProbeTimeoutMs,
+                  // AUDIT R2 F2 — the refresh's probes consume the SAME
+                  // run deadline as the plan invocations: no probe may
+                  // START after it and each probe's timeout is min()'d
+                  // to the remaining window.
+                  deadlineMs: runCtx?.deadlineMs ?? undefined,
                   actor: "PAIR_PLANNER",
                   providerCounter,
                 }),

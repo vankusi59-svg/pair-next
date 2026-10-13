@@ -525,6 +525,18 @@ export async function refreshCodexPlannerQualification(
      *  as a provider request on the owning planner attempt; the counter
      *  survives a later eligibility verdict or throw. */
     providerCounter?: { requests: number };
+    /** AUDIT R2 F2 — the owning planner run's absolute deadline (epoch
+     *  ms). No probe may START at/after it, and each probe's own timeout
+     *  is min()'d against the remaining window — the refresh can never
+     *  outlive the authority that invoked it. */
+    deadlineMs?: number;
+    /** TEST-ONLY seam — substitutes the probe transport so a test can
+     *  observe the effective per-probe timeout/deadline behavior without
+     *  spawning a real codex child. Never set in production wiring. */
+    probeImpl?: (o: {
+      model: string; timeoutMs: number; scratchDir: string;
+      env?: CodexPlannerEnv;
+    }) => Promise<{ outcome: string; latency_ms: number; detail: string }>;
   },
 ): Promise<{
   access_outcome: string;
@@ -533,14 +545,32 @@ export async function refreshCodexPlannerQualification(
   model_qualified: boolean;
 }> {
   const actor = opts.actor ?? "PAIR_PLANNER";
+  // AUDIT R2 F2 — every real codex probe this refresh spawns consumes
+  // the SAME absolute run deadline as the plan invocations: a probe may
+  // never START at/after it, and each probe's timeout is min()'d to the
+  // remaining window. A lapsed deadline is an authority failure — typed
+  // FAIL_CLOSED_PLANNER_DEADLINE, never a fabricated probe outcome.
+  const assertProbeWindow = () => {
+    if (opts.deadlineMs != null && Date.now() >= opts.deadlineMs) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_DEADLINE",
+        "codex planner refresh: run deadline lapsed before probe start",
+      );
+    }
+  };
+  const probeImpl = opts.probeImpl ?? codexPlannerProbe;
   const codexProbe = () => {
     // AUDIT R1 F4 — a probe is a real provider invocation; count it at
     // initiation on the owning attempt's counter.
+    assertProbeWindow();
     if (opts.providerCounter) opts.providerCounter.requests += 1;
-    return codexPlannerProbe({
+    return probeImpl({
       model: opts.model,
       scratchDir: opts.scratchDir,
-      timeoutMs: opts.timeoutMs,
+      timeoutMs:
+        opts.deadlineMs != null
+          ? Math.max(1, Math.min(opts.timeoutMs, opts.deadlineMs - Date.now()))
+          : opts.timeoutMs,
       env: opts.env,
     });
   };

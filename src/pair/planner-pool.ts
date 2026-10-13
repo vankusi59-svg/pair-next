@@ -376,6 +376,30 @@ export interface PlannerFailoverResult {
  * pool resolving to no eligible candidate must never silently degrade to
  * the deterministic/template path (§1 R1).
  */
+/** AUDIT R2 F1 — worst-case provider-request bound for ONE candidate
+ *  attempt: the number the monetary reservation envelope must cover.
+ *
+ *  - codex_cli: eligibility is re-proved TWICE per attempt (pre-INITIAL
+ *    and pre-REASK); each re-proof may trigger ONE bounded canonical
+ *    qualification refresh that spawns up to 2 real provider probes
+ *    (validateAccess probe + probeModel). Plus INITIAL + REASK calls:
+ *    2×2 probes + 1 + 1 = 6.
+ *  - all other transports (HTTP): eligibility is catalog-local — zero
+ *    provider calls. The INITIAL call's internal retry may emit up to
+ *    2 requests, plus the bounded REASK: 2 + 1 = 3.
+ *
+ * The bound is a structural constant derived from the same call-graph
+ * the pool executes — keep it in lockstep with runPlannerFailover /
+ * refreshCodexPlannerQualification; never hand-mirror it at call sites.
+ */
+export function plannerCandidateRequestBound(candidate: {
+  transport?: string;
+}): number {
+  return candidate.transport === "codex_cli"
+    ? 2 /* eligibility re-proofs */ * 2 /* probes per refresh */ + 1 /* INITIAL */ + 1 /* REASK */
+    : 2 /* INITIAL internal requests */ + 1 /* REASK */;
+}
+
 export async function runPlannerFailover(opts: {
   candidates: PlannerCandidate[];
   planFn: (
@@ -394,6 +418,10 @@ export async function runPlannerFailover(opts: {
      *  provider_requests reflects requests that actually ran even when
      *  the eligibility step rejects or throws afterwards. */
     providerCounter?: { requests: number },
+    /** AUDIT R2 F2 — run-level deadline context: eligibility paths that
+     *  spawn real provider probes MUST bound each probe's timeout by the
+     *  remaining window and never START one after deadlineMs. */
+    runCtx?: { deadlineMs: number | null },
   ) =>
     | void
     | { reject: true; failure_class: PlannerFailureClass; reason: string }
@@ -519,7 +547,7 @@ export async function runPlannerFailover(opts: {
     // must not look like a crashed in-flight invocation.
     let elig;
     try {
-      elig = await opts.assertEligible(c, providerCalls);
+      elig = await opts.assertEligible(c, providerCalls, { deadlineMs: deadlineAt });
     } catch (e) {
       settle({
         ...base,
@@ -634,7 +662,7 @@ export async function runPlannerFailover(opts: {
               // attempt_no) — no inner settle may precede it. An
               // availability rejection prevents the re-ask; normal
               // failover proceeds.
-              const elig2 = await opts.assertEligible(c, providerCalls);
+              const elig2 = await opts.assertEligible(c, providerCalls, { deadlineMs: deadlineAt });
               if (elig2 && elig2.reject) {
                 settle({
                   ...base,

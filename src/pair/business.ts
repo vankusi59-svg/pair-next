@@ -1668,7 +1668,19 @@ export class BusinessLayer {
     // provider request. The dedup transaction still re-proves every
     // gate at commit time, so a race between this preflight and the
     // open stays fail-closed.
-    this.openEligibilityRow(workItemId, operatorId);
+    const elig = this.openEligibilityRow(workItemId, operatorId);
+    // AUDIT R2 F3 — hard-stop headroom proof BEFORE the paid planner
+    // call: the SAME policy scan reserveBudget() applies (missions +
+    // live HELD reservations, period-scoped, per scope) but strictly
+    // read-only — no expiry sweep, no reservation write. A policy
+    // already saturated refuses planning spend here; the atomic
+    // reserveBudget() inside openWorkItem remains the final authority
+    // for the race between this preflight and the open.
+    this.assertBudgetHeadroom(
+      String(elig.row.business_id),
+      String(elig.row.department ?? ""),
+      elig.agentId,
+    );
     const ctx = this.delegatedGoalContext(workItemId);
     const expanded = await expander(
       {
@@ -3727,6 +3739,68 @@ export class BusinessLayer {
       throw new PolicyError("FAIL_CLOSED_BUDGET_EXCEEDED", result.hardStop.detail);
     }
     return result.rid;
+  }
+
+  /** AUDIT R2 F3 — read-only hard-stop headroom proof for the paid-
+   *  planning preflight. Applies the IDENTICAL scope/period/usage scan
+   *  reserveBudget() enforces, but writes nothing: expired HELD rows
+   *  are excluded by predicate (not by the expiry sweep) and no
+   *  budget_reservation is minted. Only hard-stop saturation is a
+   *  preflight refusal — soft-limit exceedances never blocked an open.
+   *  The BUDGET_EXCEEDED audit event is still emitted so the refusal
+   *  has the same durable evidence the canonical rejection produces. */
+  private assertBudgetHeadroom(
+    businessId: string,
+    department: string,
+    agentId: string | null,
+  ): void {
+    const policies = this.listBudgetPolicies(businessId).filter((p) => p.enabled !== false);
+    if (policies.length === 0) return;
+    const missions = this.store.list("mission");
+    const now = utcnow();
+    const held = this.store.list("budget_reservation").filter(
+      (r) => String(r.status) === "HELD" && String(r.expires_at ?? "") > now,
+    );
+    for (const p of policies) {
+      if (!p.hard_stop) continue;
+      const scopeType = String(p.scope_type);
+      const scopeId = String(p.scope_id);
+      const applies =
+        (scopeType === "business" && scopeId === businessId) ||
+        (scopeType === "department" && scopeId === department) ||
+        (scopeType === "agent" && scopeId === agentId);
+      if (!applies) continue;
+      const since = periodStart(p.period as BudgetPeriod, new Date());
+      const key =
+        scopeType === "agent" ? "org_agent_id" : scopeType === "department" ? "department" : "business_id";
+      const usedMissions = missions.filter((m) => {
+        const md = m.metadata as Record<string, unknown> | undefined;
+        return String(md?.[key] ?? "") === scopeId && String(m.created_at ?? "") >= since;
+      }).length;
+      const usedHeld = held.filter((r) => {
+        const match =
+          scopeType === "business"
+            ? String(r.business_id) === scopeId
+            : scopeType === "department"
+              ? String(r.business_id) === businessId && String(r.department) === scopeId
+              : String(r.agent_id) === scopeId;
+        return match && String(r.created_at ?? "") >= since;
+      }).length;
+      const used = usedMissions + usedHeld;
+      if (used < Number(p.max_missions)) continue;
+      this.store.event({
+        entity_type: "budget_policy", entity_id: String(p.budget_policy_id),
+        event_type: "BUDGET_EXCEEDED", actor: "PAIR_BUSINESS_LAYER",
+        metadata: {
+          scope_type: scopeType, scope_id: scopeId, used,
+          max_missions: p.max_missions, period: p.period,
+        },
+      });
+      throw new PolicyError(
+        "FAIL_CLOSED_BUDGET_EXCEEDED",
+        `${scopeType}:${scopeId} ${used}/${p.max_missions} per ${p.period}`,
+      );
+    }
   }
 
   private consumeBudgetReservation(reservationId: string): void {
