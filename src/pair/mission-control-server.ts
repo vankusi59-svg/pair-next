@@ -47,7 +47,9 @@ export interface MissionControlServerDeps {
    * API edge and returns { input, planner } where `input` carries the
    * winning sanitized task list (metadata.llm_plan) and `planner` is the
    * attempt/provenance evidence persisted with the durable preview.
-   * Absent → deterministic template planning only.
+   * Phase C — absent → the sync planner fails closed
+   * FAIL_CLOSED_PLAN_REQUIRED (no deterministic template remains), and
+   * delegated open/draft/schedule callers fail FAIL_CLOSED_NO_PLANNER.
    */
   planExpander?: (
     input: Record<string, unknown>,
@@ -1095,7 +1097,17 @@ export function createMissionControlServer(
         if (!biz) return void json(res, 404, { error: "BUSINESS_LAYER_DISABLED" });
         const [, wid, wact] = m;
         const out =
-          wact === "open" ? biz.openWorkItem(wid, String(operator))
+          wact === "open"
+            ? biz.openWorkItem(wid, String(operator), undefined, {
+                // Phase C — direct delegated opens run through the SAME
+                // shared async Planner Pool seam before the sole
+                // bound-mission authority commits. The awaited plan is
+                // authorized for the canonical enriched bound-mission
+                // goal; openWorkItem re-proves its goal digest inside
+                // the dedup write. Planner absent/exhausted propagates
+                // fail-closed — never a template mission.
+                prepared_plan: await biz.prepareDelegatedPlan(wid, String(operator)),
+              })
           : wact === "assign" ? biz.assignWorkItem(wid, String(body.assignee_agent_id ?? ""), String(operator))
           : wact === "review" ? biz.reviewWorkItem(wid, {
               reviewer_agent_id: String(body.reviewer_agent_id ?? ""),

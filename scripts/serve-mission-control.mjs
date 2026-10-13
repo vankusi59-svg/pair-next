@@ -71,6 +71,7 @@ import {
   modelDiscoveryTimeoutMs,
   llmPlannerTimeoutMs,
   codexPlannerTimeoutMs,
+  plannerRunDeadlineMs,
   ceoCliTimeoutMs,
   codexPlannerPlan,
   assertCodexPlannerCandidateEligibleWithRefresh,
@@ -145,6 +146,7 @@ const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_M
 const cfgDiscoveryTimeoutMs = modelDiscoveryTimeoutMs(); // PAIR_MODEL_DISCOVERY_TIMEOUT_MS (ms, 500..120000)
 const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
 const cfgCodexPlannerTimeoutMs = codexPlannerTimeoutMs(); // PAIR_CODEX_PLANNER_TIMEOUT_MS (ms, 5000..900000)
+const cfgPlannerRunDeadlineMs = plannerRunDeadlineMs(); // PAIR_PLANNER_RUN_DEADLINE_MS (ms, 5000..3600000)
 const cfgTaskTimeoutS = taskTimeoutSeconds();      // PAIR_TASK_TIMEOUT_S (s, 5..7200)
 const cfgPreviewTtlS = planPreviewTtlSeconds();    // PAIR_PLAN_PREVIEW_TTL_S (s, 30..86400)
 const cfgDevinBlockedGraceMs = devinBlockedGraceMs(); // PAIR_DEVIN_BLOCKED_GRACE_MS (ms, 5000..1800000) — blocked-clock only, never the task budget
@@ -308,11 +310,12 @@ const selfmod = new SelfImprovementController(service, {
   selfmodRoot: path.join(dir, "selfmod"),
 });
 // Planner (P-UI-6): when the mission carries metadata.llm_plan — a
-// sanitized task list produced by llmPlan() at the API edge — the planner
-// returns it verbatim (re-validated by validatePlanProposal downstream,
-// and pinned by the confirm digest). Without it, the template planner
-// below runs: T1 PAIR_NATIVE records the goal, T2 DSH/Gemini analysis,
-// optional T3 Codex when the goal mentions code/script/python.
+// sanitized task list produced by the Planner Pool at the API edge — the
+// planner returns it verbatim (re-validated by validatePlanProposal
+// downstream, and pinned by the confirm digest). Phase C removed the
+// deterministic template fallback: without llm_plan evidence there is NO
+// valid plan source — the mission fails closed as plan_less_legacy and
+// never mints generated tasks.
 // LLM plan capability allowlist lives in serve-planner.ts — one source.
 // PRV2-A R1.A — the model-visible planner vocabulary is WORK-only:
 // AUTOMATON_TASK_EXECUTION is PAIR-reserved (injected T1) and never
@@ -345,7 +348,6 @@ const executorCapSets = () =>
 // fresh bounded RecoveryController decision instead of replaying the
 // stored plan as a fake candidate.
 const { planner, canonicalizeLlmTasks } = makeServePlanner({
-  hasExecutor: (id) => governed.has(id),
   executorCapSets,
   replanProvider: null,
 });
@@ -420,7 +422,18 @@ const control = new MissionControl({
   // (PAIR_TG_DELIVERY_STALE_AFTER_MS, bounded, validated at startup).
   telegramDeliveryStaleAfterMs: cfgTgStaleAfterMs,
 });
-const business = new BusinessLayer({ store, control, schedules });
+// Phase C — the delegated-open planner seam: EVERY newly opened bound
+// mission plans through the SAME Planner Pool (llmPlan → planner_run /
+// planner_attempt durable evidence). The planExpander const is
+// declared below at planner-composition time; BusinessLayer invokes it
+// through a late-bound closure so construction order never creates a
+// second planning path.
+const business = new BusinessLayer({
+  store,
+  control,
+  schedules,
+  planExpander: (input, ctx) => planExpander(input, ctx),
+});
 const workforce = new WorkforceService({ store, business });
 
 // P15.10-B — durable Objective wake/reconcile intake only. The scheduler
@@ -438,7 +451,10 @@ const objectiveAutoReconcile = createObjectiveAutoReconcile({
   policy: objectiveAutoPolicy,
   intervalMs: objectiveReconcileMs,
 });
-objectiveAutoReconcile.runtime.start();
+// Phase C — the reconcile sweep is started AFTER the Planner Pool
+// composition below exists: delegated planning is planner-gated, and a
+// reconcile that woke before planExpander was initialized would have no
+// governed path to mint missions.
 
 // P15.10-C — governed autonomous Objective driver. Explicit deployment
 // opt-in ONLY (PAIR_OBJECTIVE_AUTO_DRIVER=1): the driver consumes the
@@ -497,8 +513,9 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
       resolveObjectiveCeoOps().ceoCycle.reconcileStaleAttempts(objectiveId),
     onError: (e) => console.error("objective-auto-driver:", String(e).slice(0, 200)),
   });
-  objectiveAutoDriver.runtime.start();
-  console.log(`OBJECTIVE AUTO DRIVER: ENABLED (interval=${objectiveDriverMs}ms, worker=objective-auto-driver:${process.pid})`);
+  // Phase C — deferred: the driver only mints missions through the
+  // delegated planner seam; it starts AFTER the Planner Pool exists.
+  console.log(`OBJECTIVE AUTO DRIVER: ENABLED pending planner init (interval=${objectiveDriverMs}ms, worker=objective-auto-driver:${process.pid})`);
 }
 
 // P15.8-D — conversation layer composition. Session/draft services are
@@ -509,6 +526,9 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
 const conversationSessions = new ConversationSessionService(store);
 const missionDrafts = new MissionDraftService({
   conversation: conversationSessions, control, store,
+  // Phase C — draft confirmation plans through the SAME Planner Pool
+  // (late-bound: the composition below exists before any request runs).
+  planExpander: (input, ctx) => planExpander(input, ctx),
 });
 let conversationReasoning = null;
 try {
@@ -826,6 +846,13 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
   }
 }
 sup.resume();
+// Phase C — autonomous Objective drivers (reconcile sweep + auto-driver)
+// start only AFTER the Planner Pool composition below is declared. Their
+// every delegated-open path is planner-gated through planExpander; a
+// driver that ran ahead of it could claim durable wake generations with
+// no governed plan path, so the starts are bound to boot order here.
+objectiveAutoReconcile.runtime.start();
+objectiveAutoDriver?.runtime.start();
 
 // Phase B plan proposer: runs the canonical Planner failover chain at the
 // API edge — deterministic order, one whole canonically-valid plan wins.
@@ -836,15 +863,10 @@ sup.resume();
 // FAIL_CLOSED_PLANNER_NO_ELIGIBLE — never a silent template/T1 fallback.
 const knownCapabilityIds = () =>
   new Set(store.list("capability").map((c) => String(c.capability_id)));
-const planExpander = async (input) => {
-  // TEST-ONLY seam: PAIR_MC_TEMPLATE_PLANNER=1 skips the LLM planner
-  // edge entirely — the request falls back to the deterministic template
-  // planner inside the SAME canonical preview/confirm path (digest
-  // binding, gates, evidence unchanged). For e2e/CI where no qualified
-  // paid/CLI provider exists. Never set it in production.
-  if (process.env.PAIR_MC_TEMPLATE_PLANNER === "1") {
-    return { input };
-  }
+const planExpander = async (input, expandCtx) => {
+  // Phase C — the ONE planner for every new-Mission ingress. The
+  // PAIR_MC_TEMPLATE_PLANNER bypass is gone: there is no environment
+  // switch that mints a plan without the Planner Pool.
   const candidates = dedupePlannerCandidates(plannerCandidates);
   if (typeof input.goal !== "string" || !input.goal.trim()) {
     return { input };
@@ -859,6 +881,16 @@ const planExpander = async (input) => {
     routes: candidates.map((c) => c.ref),
     actor: "PAIR_PLANNER",
   });
+  // Phase C — the ONE run-level deadline: absolute epoch, spanning every
+  // candidate's eligibility, INITIAL call, transport retries and REASK.
+  // A caller pin (delegated-open ctx.deadlineMs) may TIGHTEN the window;
+  // it can never widen past the env-validated bound.
+  const deadlineAt = Date.now() +
+    Math.min(cfgPlannerRunDeadlineMs, expandCtx?.deadlineMs ?? cfgPlannerRunDeadlineMs);
+  // Phase C — the admission row (when the invocation carries objective
+  // lineage) settles from canonical run evidence in BOTH the winner and
+  // the failure paths; hoisted so the catch can see it.
+  let admission = null;
   try {
     if (PLANNER_ROUTES.length && !candidates.length) {
       throw new IntegrityError(
@@ -866,6 +898,29 @@ const planExpander = async (input) => {
         JSON.stringify({ configured_routes: PLANNER_ROUTES }),
       );
     }
+    // Phase C — planner cost governance: when the invocation carries a
+    // delegated work_item_id, the SAME objective cap that binds governed
+    // dispatch binds this pre-spend boundary. The envelope reserves the
+    // full worst case (Σ per-request bound × request-count bound over
+    // every eligible candidate, INITIAL + REASK) atomically before the
+    // first call; the reservation settles from the canonical run outcome.
+    admission = service.cost.admitPlannerInvocation({
+      planner_run_id: String(run.planner_run_id),
+      work_item_id: expandCtx?.work_item_id ?? null,
+      est_microusd: candidates.reduce((sum, c) => {
+        const bound = service.cost.plannerRequestBoundMicrousd(c);
+        // Provider-request bound per candidate: an HTTP candidate's
+        // INITIAL may emit up to 2 requests, codex_cli exactly 1; the
+        // bounded REASK adds at most one more for either.
+        const requestBound = (c.transport === "codex_cli" ? 1 : 2) + 1;
+        return sum + bound.per_request_microusd * requestBound;
+      }, 0),
+      unbounded_unknown: candidates.some(
+        (c) => service.cost.plannerRequestBoundMicrousd(c).billing.unbounded,
+      ),
+      candidates: candidates.length,
+      actor: "PAIR_PLANNER",
+    });
     const res = await runPlannerFailover({
       candidates,
       // §9 — full canonical eligibility re-proved before EVERY invocation
@@ -974,6 +1029,8 @@ const planExpander = async (input) => {
           outcome: "EXHAUSTED",
           actor: "PAIR_PLANNER",
         }),
+      // Phase C — one absolute deadline across the whole failover chain.
+      deadlineMs: deadlineAt,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),
@@ -981,6 +1038,12 @@ const planExpander = async (input) => {
       winner_attempt_no: res.winner.attempt_no,
       actor: "PAIR_PLANNER",
     });
+    // Phase C — a selected winner proves at least one provider request
+    // ran; the planner reservation settles COMMITTED at reserved max
+    // (unaccounted usage stays reserved — never under-counted).
+    if (admission.reservation_id) {
+      service.cost.settlePlannerInvocation(admission.reservation_id, "CALLS_MADE", null);
+    }
     return {
       input: {
         ...input,
@@ -1009,6 +1072,18 @@ const planExpander = async (input) => {
         error_code: e instanceof IntegrityError || e instanceof PolicyError ? e.code : "REQUEST_ERROR",
         actor: "PAIR_PLANNER",
       });
+    }
+    // Phase C — settle the planner reservation from canonical run
+    // evidence: a terminal run with attempts provably invoked providers
+    // (COMMITTED at reserved); a terminal run with zero attempts
+    // provably spent nothing (RELEASED). The run row is the authority —
+    // the reservation never settles from memory.
+    if (admission?.reservation_id) {
+      const settled = store.tryGet("planner_run", String(run.planner_run_id));
+      service.cost.settlePlannerInvocation(
+        admission.reservation_id,
+        Number(settled?.attempts ?? 0) > 0 ? "CALLS_MADE" : "NO_CALLS",
+      );
     }
     throw e;
   }

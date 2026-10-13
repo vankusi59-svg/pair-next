@@ -573,51 +573,55 @@ export class ObjectiveOperatingService {
       operatingFail(`dispatch WAL does not pin child ${childId}`);
     }
     const child = this.store.get("work_item", childId) as Row;
+    const mission = this.deps.business.boundMissionForWorkItem(child);
+    // Phase C — a bound in-flight mission converges BEFORE the READY
+    // gate: the delegated-open race now interleaves at the planning
+    // await, so a losing pass re-proves AFTER the winner committed —
+    // the child is legitimately IN_PROGRESS and convergence must ride
+    // the canonical in-flight proof (§20/R2.A), never a raw READY gate.
+    if (mission && !TERMINAL_MISSION_STATUSES.has(String(mission.status))) {
+      assertCanonicalMissionInFlight(this.store, mission, child);
+      return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
+    }
     if (assertCanonicalWorkStatus(this.store, child) !== "READY") {
       operatingFail(`delegated child ${childId} not canonically READY`);
     }
-    const mission = this.deps.business.boundMissionForWorkItem(child);
+    // A surviving `mission` here is canonically terminal — the
+    // in-flight/PAUSED/live branches converged or propagated above.
     if (mission) {
       const ms = String(mission.status);
-      if (TERMINAL_MISSION_STATUSES.has(ms)) {
-        // HOTFIX-B/R1-F2 — final dispatch-boundary re-proof of the
-        // REOPENABLE contract, run AT the openWorkItem crossing and
-        // never trusting the earlier review observation:
-        //  a) the current READY must derive from an authentic
-        //     WORK_ITEM_UNBLOCKED event following THIS latest bound
-        //     predecessor — the same single authority the review used;
-        //  b) EVERY bound attempt in immutable WOB history must be
-        //     canonically terminal (mirroring openWorkItem's own
-        //     admission loop — a live earlier attempt is corrupt
-        //     authority, never converged);
-        //  c) the latest bound mission identity + lifecycle is
-        //     re-proven through its own immutable spine.
-        if (proveCanonicalUnblockProvenance(this.store, child) === null) {
-          operatingFail(
-            `delegated child ${childId} terminal-bound READY lacks canonical WORK_ITEM_UNBLOCKED provenance`);
-        }
-        for (const att of canonicalBoundAttemptsForWorkItem(
-            this.store, childId)) {
-          const am = this.store.tryGet(
-            "mission", String(att.mission_id)) as Row | null;
-          if (!am) {
-            operatingFail(
-              `bound attempt ${String(att.open_id)} mission missing`);
-          }
-          const ams = canonicalDerivedMissionStatus(this.store, am);
-          if (!TERMINAL_MISSION_STATUSES.has(ams)) {
-            operatingFail(
-              `bound attempt mission ${String(am.mission_id)} not canonically terminal`);
-          }
-          assertCanonicalMissionLifecycle(this.store, am, ams);
-        }
-        assertCanonicalMissionLifecycle(this.store, mission, ms);
-        return { objective_version: Number(objective.version) };
+      // HOTFIX-B/R1-F2 — final dispatch-boundary re-proof of the
+      // REOPENABLE contract, run AT the openWorkItem crossing and
+      // never trusting the earlier review observation:
+      //  a) the current READY must derive from an authentic
+      //     WORK_ITEM_UNBLOCKED event following THIS latest bound
+      //     predecessor — the same single authority the review used;
+      //  b) EVERY bound attempt in immutable WOB history must be
+      //     canonically terminal (mirroring openWorkItem's own
+      //     admission loop — a live earlier attempt is corrupt
+      //     authority, never converged);
+      //  c) the latest bound mission identity + lifecycle is
+      //     re-proven through its own immutable spine.
+      if (proveCanonicalUnblockProvenance(this.store, child) === null) {
+        operatingFail(
+          `delegated child ${childId} terminal-bound READY lacks canonical WORK_ITEM_UNBLOCKED provenance`);
       }
-      // R2.A — converge only through a proven in-flight mission.
-      // PAUSED / live / unproven claims propagate — never a reopen.
-      assertCanonicalMissionInFlight(this.store, mission, child);
-      return { abort: "AWAITING_EXECUTION", mission_id: String(mission.mission_id) };
+      for (const att of canonicalBoundAttemptsForWorkItem(
+          this.store, childId)) {
+        const am = this.store.tryGet(
+          "mission", String(att.mission_id)) as Row | null;
+        if (!am) {
+          operatingFail(
+            `bound attempt ${String(att.open_id)} mission missing`);
+        }
+        const ams = canonicalDerivedMissionStatus(this.store, am);
+        if (!TERMINAL_MISSION_STATUSES.has(ams)) {
+          operatingFail(
+            `bound attempt mission ${String(am.mission_id)} not canonically terminal`);
+        }
+        assertCanonicalMissionLifecycle(this.store, am, ams);
+      }
+      assertCanonicalMissionLifecycle(this.store, mission, ms);
     }
     return { objective_version: Number(objective.version) };
   }
@@ -627,8 +631,17 @@ export class ObjectiveOperatingService {
    *  objective-version admission pin (R2.C) bound atomically into the
    *  dedup write; the open race converges ONLY through a fully-proven
    *  canonical in-flight bound Mission (§20/R2.A) — PAUSED, terminal or
-   *  unproven claims propagate, never become AWAITING_EXECUTION. */
-  private openDelegatedChild(
+   *  unproven claims propagate, never become AWAITING_EXECUTION.
+   *
+   *  Phase C — the crossing is ASYNC now: genuine delegated planning
+   *  through the ONE shared Planner Pool seam runs AFTER the dispatch
+   *  authority proof and BEFORE openWorkItem. The plan is authorized
+   *  for the EXACT enriched bound-mission goal; the post-await re-proof
+   *  + objective-version CAS pin the authority the await could not hold,
+   *  and openWorkItem's dedup write re-checks the plan's goal digest.
+   *  Planner absent/exhausted propagates fail-closed — never a
+   *  deterministic template, never a fake successful DISPATCHED. */
+  private async openDelegatedChild(
     ctx: PassCtx,
     objectiveId: string,
     childId: string,
@@ -638,15 +651,16 @@ export class ObjectiveOperatingService {
     extra?: Partial<OperatingPassResult>,
     hooks?: OperatingPassHooks,
     authorityGate?: () => void,
-  ): OperatingPassResult {
+  ): Promise<OperatingPassResult> {
     this.tick(ctx);
     hooks?.beforeOpen?.(); // TEST-ONLY drift injection at the real boundary
     // P15.10-C — delegated authority re-proven AT the mission-open
     // boundary: the last checkpoint before a bound Mission can exist.
     authorityGate?.();
-    const proof = this.proveDispatchAuthority(
-      objectiveId, childId, workstreamWorkItemId);
-    if ("abort" in proof) {
+    const applyAbort = (
+      proof: ReturnType<ObjectiveOperatingService["proveDispatchAuthority"]>,
+    ): OperatingPassResult | null => {
+      if (!("abort" in proof)) return null;
       if (proof.abort === "AWAITING_EXECUTION") {
         return result("AWAITING_EXECUTION", {
           delegated_child_work_item_id: childId,
@@ -658,13 +672,39 @@ export class ObjectiveOperatingService {
         owner_action_required: proof.abort === "TARGET_MET_CANDIDATE" ? true : undefined,
         ...extra,
       });
+    };
+    const proof = this.proveDispatchAuthority(
+      objectiveId, childId, workstreamWorkItemId);
+    if ("abort" in proof) {
+      const aborted = applyAbort(proof);
+      if (aborted) return aborted;
     }
+    // Phase C — genuine delegated planning. The await is OUTSIDE any
+    // transaction; nothing committed yet. Planner unavailability or
+    // exhaustion propagates fail-closed — the pass reports the planner
+    // failure, never a DISPATCHED claim without an authorized plan.
+    const prepared = await this.deps.business.prepareDelegatedPlan(
+      childId, actor);
+    // Phase C — authority re-proven AFTER the asynchronous planning
+    // await: the driver lease may have lapsed mid-plan and the
+    // objective/strategy state may have drifted. The re-proven
+    // objective version below is what the dedup write CAS-pins.
+    authorityGate?.();
+    const reproof = this.proveDispatchAuthority(
+      objectiveId, childId, workstreamWorkItemId);
+    if ("abort" in reproof) {
+      const reaborted = applyAbort(reproof);
+      if (reaborted) return reaborted;
+    }
+    const expectedVersion = "objective_version" in reproof
+      ? reproof.objective_version
+      : ("objective_version" in proof ? proof.objective_version : undefined);
     let saved: Row;
     try {
       saved = this.deps.business.openWorkItem(childId, actor, {
         objective_id: objectiveId,
-        expected_objective_version: proof.objective_version,
-      }) as Row;
+        expected_objective_version: expectedVersion,
+      }, { prepared_plan: prepared }) as Row;
     } catch (err) {
       // An open loser converges only when the canonical bound Mission
       // is fully proven in flight (§20/R2.A): spine replay + WOB

@@ -111,7 +111,21 @@ function freshFullStack(name: string): FullStack {
     planner,
   });
   const biz = new BusinessLayer({ store, control,
-    schedules: new MissionScheduleService(service) });
+    schedules: new MissionScheduleService(service),
+    // Phase C — the shared async Planner Pool seam (canned canonical
+    // llm_plan; see pair-p15-6 for the same stub contract).
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata as Record<string, unknown> | undefined),
+          llm_plan: [{ task_key: "T2", title: "delegated", task_instruction: "work",
+            required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+          plan_source: "LLM", plan_model: "test-planner",
+        },
+      },
+      planner: { planner_run_id: "PLR_TEST", attempts: [], winner: { attempt_no: 1 } },
+    }) });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });
@@ -642,7 +656,19 @@ describe("P15.10-A2 — owner review sign-off", () => {
     // the cross-process contention case the audit asked for.
     const store2 = new PairEvidenceStore(path.join(s.dir, "pair.db"));
     const biz2 = new BusinessLayer({ store: store2, control: s.control,
-      schedules: new MissionScheduleService(s.service) });
+      schedules: new MissionScheduleService(s.service),
+      planExpander: async (input) => ({
+        input: {
+          ...input,
+          metadata: {
+            ...(input.metadata as Record<string, unknown> | undefined),
+            llm_plan: [{ task_key: "T2", title: "delegated", task_instruction: "work",
+              required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+            plan_source: "LLM", plan_model: "test-planner",
+          },
+        },
+        planner: { planner_run_id: "PLR_TEST", attempts: [], winner: { attempt_no: 1 } },
+      }) });
     const wf2 = new WorkforceService({ store: store2, business: biz2 });
     const ws2 = new ObjectiveWorkstreamService(
       { store: store2, business: biz2, workforce: wf2, objectives: biz2.objectives });

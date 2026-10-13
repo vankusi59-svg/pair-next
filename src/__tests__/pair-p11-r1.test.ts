@@ -85,7 +85,21 @@ function makeBizCtx(name: string) {
   const dir = freshDir(name);
   const ctx = makeCtxOn(path.join(dir, "pair.db"), dir);
   const schedules = new MissionScheduleService(ctx.service);
-  const biz = new BusinessLayer({ store: ctx.store, control: ctx.control, schedules });
+  // Phase C — HTTP /open plans through the shared async Planner Pool
+  // seam; tests stub it with a canonical llm_plan.
+  const biz = new BusinessLayer({
+    store: ctx.store, control: ctx.control, schedules,
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata ?? {}),
+          llm_plan: [{ task_id: "T1", title: "t", instructions: "t", required_capabilities: [] }],
+          plan_source: "LLM",
+        },
+      },
+    }),
+  });
   return { dir, ctx, biz, schedules };
 }
 

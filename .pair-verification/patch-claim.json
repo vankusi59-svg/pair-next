@@ -1,13 +1,31 @@
 {
-  "claim_id": "TEST_R51_CRASH_DETERMINISTIC_TIME",
-  "title": "R5.1-crash: stale reconcile now anchored to durable attempt_started_at (removes wall-clock dependence)",
+  "claim_id": "PHASE_C_UNIFIED_LLM_PLANNING",
+  "title": "Phase C — unified LLM planning & deterministic-template removal across every new-Mission ingress",
   "affected_surfaces": [
-    "DEV_INFRA",
-    "DELIVERY"
+    "PLANNER",
+    "DELIVERY",
+    "CONVERSATION",
+    "MISSION_DRAFT",
+    "MISSION_CONTROL",
+    "BUSINESS_OBJECTIVE",
+    "RECOVERY_REPLAY",
+    "TELEGRAM_INGRESS",
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-f4-delivery-provenance.test.ts"
+    "src/__tests__/pair-phase-c-unified-planner.test.ts",
+    "src/__tests__/pair-hotfix-d-delegated-delivery.test.ts",
+    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts"
   ],
-  "invariants": [],
-  "description": "R5.1-crash passed a hardcoded reconcile now (2026-10-05T02:00:00Z) while attempt_started_at is minted from real utcnow() at beginDeliveryAttemptEntity. Once wall clock moved past 2026-10-05 the SENDING attempt read as FRESH (negative age vs the 60s stale window), reconcileStaleDeliveryAttempts no-oped, and toThrow(/crash-after-append/) saw undefined — a date-dependent failure on any host, previously registered as a tolerated baseline. The reconcile now is now derived from the durable attempt_started_at +120s, so the attempt is deterministically stale on any date; all post-rollback assertions (state SENDING, started_at unchanged, zero RESOLVED evidence) are unchanged. Test-only change — zero production code touched."
+  "invariants": [
+    "INV_PLAN_001",
+    "INV_DELIVERY_001",
+    "INV_DELIVERY_002",
+    "INV_DELIVERY_RAW_001",
+    "INV_REPLAY_001",
+    "INV_MISSION_001"
+  ],
+  "description": "Phase C removes the deterministic task-template fallback from makeServePlanner and unifies every new-Mission ingress on the existing asynchronous LLM Planner Pool. serve-planner.ts: reason 'initial' now accepts ONLY persisted plan authority (pinned_plan_tasks or metadata.llm_plan) and throws FAIL_CLOSED_PLAN_REQUIRED otherwise; 'replan' requires a configured governed replan provider or throws FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE; PAIR_MC_TEMPLATE_PLANNER and the TEMPLATE plan_source are gone. business.ts: new shared async prepareDelegatedPlan seam re-derives the canonical enriched bound-mission goal, invokes deps.planExpander (the same pool expander the API preview/submit edge uses), rejects missing expander (FAIL_CLOSED_NO_PLANNER) and absent/empty llm_plan (FAIL_CLOSED_DELEGATED_PLAN_ABSENT); openWorkItem re-proves the plan's delegated_goal_digest inside the dedup transaction (FAIL_CLOSED_DELEGATED_PLAN_GOAL_DRIFT) and pins llm_plan + planner provenance onto the mission — sole bound-mission authority unchanged. objective-operating-loop.ts: openDelegatedChild plans asynchronously after the dispatch authority proof, re-proves authority + objective CAS after the await, then opens with the prepared plan; planner failure propagates, never a fake DISPATCHED. mission-draft.ts: confirmInner claims the draft then plans through the same planExpander — missing dep = typed NO_PLANNER with zero provider calls and durable SUBMITTING claim (retry-safe); pool exhaustion propagates durable attempt evidence. mission-control.ts: tickSchedules requires the expander per due schedule (FAIL_CLOSED_NO_PLANNER recorded as the schedule's own fire error). planner-pool.ts: ONE run-level deadlineMs spans eligibility, INITIAL calls, retries and REASK — expiry throws FAIL_CLOSED_PLANNER_DEADLINE and settles honest TIMEOUT evidence; late results are never winners. cost.ts: canonical planner billing resolution (model profile → executor profile → UNKNOWN, never coerced FREE), atomic pre-call admitPlannerInvocation bound to objective lineage resolved fresh (HELD planner reservations attributed through the delegated work item), settlePlannerInvocation (NO_CALLS → RELEASED, CALLS_MADE → exact settle or COMMITTED-at-reserved), reconcilePlannerInvocations sweeping HELD rows from canonical planner_run evidence only. serve-mission-control.mjs: template bypass env removed; planExpander wired with cost ctx + unified deadline; driver/reconcile startup deferred until planner deps exist. Persisted committed/pinned plans replay byte-identical; legacy plan-less missions terminalize FAILED with durable planning_failure evidence instead of executing a synthesized template. package.json/pnpm-lock.yaml: better-sqlite3 11.10.0 → 12.11.1 — Node v24 is officially supported only from v12; v11.10 workers crashed natively at env teardown (RemoveEnvironmentCleanupHook env!=nullptr assertion, Statement destructor during GC) which made the full Vitest suite non-completable on this platform. No API change (pragma/prepare/transaction/exec semantics identical); PAIR storage behavior unchanged.",
+  "risk_override": "HIGH"
 }

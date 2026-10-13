@@ -1134,7 +1134,8 @@ function ensureWorkerBundle() {
     .sort()
     .at(-1);
   if (!esbuild) throw new Error("esbuild binary not found under node_modules/.pnpm");
-  execFileSync(esbuild, [
+  execFileSync(process.execPath, [
+    esbuild,
     "src/pair/index.ts", "--bundle", "--format=esm", "--platform=node",
     "--external:better-sqlite3", "--external:ulid", "--external:yaml",
     `--outfile=${BUNDLE}`,

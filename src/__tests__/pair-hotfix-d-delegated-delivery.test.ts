@@ -1,14 +1,21 @@
 /**
- * HOTFIX-D (clean rebuild @ BASE cf2674c) — deterministic template
- * fallback runs through THE governed delivery-injection authority.
+ * HOTFIX-D (clean rebuild @ BASE cf2674c) — the governed
+ * delivery-injection authority exercised at THE canonicalize seam.
+ * Phase C update: the deterministic template fallback is REMOVED — a
+ * fresh plan now reaches the seam only as a Planner Pool winner's raw
+ * emission (fresh provenance), and a delegated mission carries that
+ * canonical plan as `metadata.llm_plan` minted BEFORE the bound
+ * mission exists (prepareDelegatedPlan → openWorkItem digest re-proof).
  *
- * Incident DL_4d48de10: a delegated WOB-bound mission (no
- * pinned_plan_tasks, no metadata.llm_plan) always lands on the
- * deterministic template fallback inside makeServePlanner — which on
- * BASE emitted T1 bookkeeping + optional T2/T3 work and NEVER a
- * TELEGRAM_DELIVERY task, and never reached the injection seam inside
- * makeServeCanonicalizer. runPlanning's assertPlanDataflow re-proof then
- * threw FAIL_CLOSED_DELIVERY_TASK_MISSING → PLANNING→FAILED.
+ * Incident DL_4d48de10: a delegated WOB-bound mission planned by the
+ * old template emitted T1 bookkeeping + optional T2/T3 work and NEVER
+ * a TELEGRAM_DELIVERY task, and never reached the injection seam
+ * inside makeServeCanonicalizer. runPlanning's assertPlanDataflow
+ * re-proof then threw FAIL_CLOSED_DELIVERY_TASK_MISSING →
+ * PLANNING→FAILED. Under Phase C the SAME injection seam runs inside
+ * fresh canonicalization, so a delegated mission's plan now arrives
+ * with the delivery task already canonical — and a plan-less mission
+ * fails closed FAIL_CLOSED_PLAN_REQUIRED, never a template.
  *
  * Mandatory matrix (operator mandate §4):
  *   E1  BASE counterfactual — the task list the pre-fix fallback
@@ -20,7 +27,7 @@
  *       TELEGRAM_DELIVERY task, fully stamped, gate passes
  *   E3  injected task binds the real upstream producer (RESULT_TEXT
  *       edge to T2, bookkeeping T1 excluded)
- *   E4  negatives — no intent / unservable / no producer / malformed
+ *   E4  negatives — no intent / unservable / no plan / malformed
  *       emission / denied destination all still fail closed
  *   E5  idempotency — re-plan byte-identical, persisted replay adds
  *       nothing, no duplicate delivery authority/sends
@@ -73,8 +80,6 @@ import {
   validatePlanProposal,
   WorkforceAllocationService,
   WorkforceService,
-  DSH_EXECUTOR_ID,
-  CODEX_EXECUTOR_ID,
   goalRequiresCurrentExternalData,
   PAIR_OUTPUT_LANGUAGE_KEY,
   type ExecutorAdapter,
@@ -113,6 +118,11 @@ const HISTORICAL_INTENT_GOAL =
 const NO_INTENT_GOAL =
   "[BUSINESS PAIR HQ | DEPT GROWTH]\n" +
   "Phân tích thị trường chứng khoán tuần này, tạo bài tóm tắt bằng tiếng Việt.";
+/** No delivery intent AND no current-data demand — the plan shape the
+ *  canonicalize seam emits for a historical no-intent goal. */
+const NO_INTENT_HIST_GOAL =
+  "[BUSINESS PAIR HQ | DEPT GROWTH]\n" +
+  "Phân tích thị trường chứng khoán năm 2020, tạo bài tóm tắt bằng tiếng Việt.";
 const WS_INTENT_GOAL =
   "Phân tích dữ liệu thị trường chứng khoán năm 2020, tạo bài tóm tắt " +
   "bằng tiếng Việt, sau đó đăng lên kênh Telegram được phép.";
@@ -138,6 +148,33 @@ const plannerInput = (goal: string) =>
     reason: "initial",
     input_artifact_sources: [],
   }) as never;
+
+/** Planner input carrying a persisted Planner Pool winner plan — the
+ *  Phase C replay path a bound mission exercises at runPlanning. */
+const plannerInputLlm = (goal: string, tasks: Array<Record<string, unknown>>) =>
+  ({
+    mission: { goal, metadata: { ...DELEGATED_MD, llm_plan: tasks } },
+    advice: null,
+    reason: "initial",
+    input_artifact_sources: [],
+  }) as never;
+
+/** The raw emission a governed pool candidate returns for the incident
+ *  goal family: one genuine work task covering the analysis + summary
+ *  obligations and producing the upstream report artifact. Fresh
+ *  canonicalization injects T1 bookkeeping and the delivery task. */
+const RAW_WORK = () => [
+  {
+    task_key: "T2",
+    title: "market analysis",
+    task_instruction:
+      "Phân tích dữ liệu thị trường chứng khoán năm 2020, tạo bài tóm tắt " +
+      "bằng tiếng Việt và ghi kết quả vào analysis.txt, rồi trả lời DONE.",
+    required_capabilities: ["REASONING"],
+    depends_on: [],
+    metadata: {},
+  },
+];
 
 const deliveries = (out: Array<Record<string, unknown>>) =>
   out.filter((t) => isDeliveryTask(t));
@@ -268,12 +305,16 @@ const noopCompute = {
 };
 
 /** Full governed stack with THE production `makeServePlanner` planner —
- *  delegated missions exercise the real template fallback, never a
- *  canned plan. governed = the production `governed` map seam
- *  (serve-mission-control.mjs): DSH present → T2 emitted. */
+ *  delegated missions exercise the real persisted-plan replay, and the
+ *  shared async `planExpander` seam canonicalizes a scripted pool
+ *  emission through THE production canonicalize function (fresh
+ *  provenance — the same call the failover canonicalize seam runs). */
 function delegatedStack(
   name: string,
-  opts?: { capSets?: string[][]; governed?: Set<string> },
+  opts?: {
+    capSets?: string[][];
+    rawForGoal?: (goal: string) => Array<Record<string, unknown>>;
+  },
 ) {
   const d = path.join(ROOT, `${counter++}-${name}`);
   fs.mkdirSync(d, { recursive: true });
@@ -291,12 +332,11 @@ function delegatedStack(
   const approvals = new ApprovalQueue(service);
   const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
   const adapters = new Map<string, ExecutorAdapter>();
-  const governed = opts?.governed ?? new Set([DSH_EXECUTOR_ID]);
   const capSets = opts?.capSets ?? FULL_SETS;
+  const rawForGoal = opts?.rawForGoal ?? (() => RAW_WORK());
   // THE production planner function object — same one
   // serve-mission-control.mjs wires.
-  const { planner } = makeServePlanner({
-    hasExecutor: (id) => governed.has(id),
+  const { planner, canonicalizeLlmTasks: canon } = makeServePlanner({
     executorCapSets: () => capSets,
     replanProvider: null,
   });
@@ -384,7 +424,32 @@ function delegatedStack(
   });
   adapters.set(adapter.executor_id, adapter);
   const schedules = new MissionScheduleService(service);
-  const biz = new BusinessLayer({ store, control, schedules });
+  const biz = new BusinessLayer({
+    store,
+    control,
+    schedules,
+    // Phase C — THE shared async Planner Pool seam. This stub plays the
+    // production expander's role: a pool winner's raw emission,
+    // canonicalized FRESH through the same `canonicalizeLlmTasks`
+    // function the failover seam invokes, carried as llm_plan —
+    // including governed delivery-injection for an intent goal.
+    planExpander: async (input) => {
+      const goal = String(input.goal ?? "");
+      const tasks = canon(rawForGoal(goal), goal, { provenance: "fresh" });
+      return {
+        input: {
+          ...input,
+          metadata: {
+            ...(input.metadata as Record<string, unknown> | undefined),
+            llm_plan: tasks,
+            plan_source: "LLM",
+            plan_model: "test-planner",
+          },
+        },
+        planner: { planner_run_id: "PLR_TEST", attempts: [], winner: { attempt_no: 1 } },
+      };
+    },
+  });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });
@@ -392,7 +457,7 @@ function delegatedStack(
     { store, business: biz, workforce: wf, objectives: biz.objectives, workstreams });
   return {
     d, workspace, store, service, control, runtime, adapters, adapter,
-    biz, wf, workstreams, alloc, planner,
+    biz, wf, workstreams, alloc, planner, canon,
     projectId: String(project.project_id),
   };
 }
@@ -450,12 +515,11 @@ describe("E1 — BASE reproduction (counterfactual, non-vacuous)", () => {
 /* ============================== E2 ============================== */
 
 describe("E2 — delegated intent goal → exactly one canonical delivery task", () => {
-  it("production planner emits T1,T2 + injected T3 with full PAIR stamps; gate passes", () => {
+  it("pool winner canonicalized FRESH emits T1,T2 + injected T3 with full PAIR stamps; gate passes", () => {
     const s = delegatedStack("e2");
-    const proposal = s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    };
-    const out = proposal.tasks;
+    const out = s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, {
+      provenance: "fresh",
+    });
     expect(out.map((t) => t.task_key)).toEqual(["T1", "T2", "T3"]);
     const del = deliveries(out);
     expect(del).toHaveLength(1);
@@ -484,9 +548,9 @@ describe("E2 — delegated intent goal → exactly one canonical delivery task",
 describe("E3 — injected task binds the REAL upstream producer", () => {
   it("TEXT-mode delivery depends on content-bearing T2, never on bookkeeping T1", () => {
     const s = delegatedStack("e3");
-    const out = (s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
+    const out = s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, {
+      provenance: "fresh",
+    });
     const d = deliveries(out)[0];
     // RESULT_TEXT edge derived to T2 (content-bearing); T1 excluded.
     const deps = (d.depends_on as string[]) ?? [];
@@ -496,48 +560,62 @@ describe("E3 — injected task binds the REAL upstream producer", () => {
     const orig = (d.metadata as Record<string, unknown>)[
       PAIR_DATAFLOW_ORIGINAL_DEPS] as string[];
     expect(orig).toEqual([]);
-    // and T2 keeps its own declared edge — the producer chain is genuine
+    // and T2 is the genuine producer the delivery stages from
     const t2 = out.find((t) => t.task_key === "T2")!;
-    expect(t2.depends_on).toEqual(["T1"]);
+    expect(t2.depends_on).toEqual([]);
   });
 });
 
 /* ============================== E4 ============================== */
 
 describe("E4 — negatives still fail closed (or stay byte-identical)", () => {
-  it("E4a no operator intent → zero delivery, template output unchanged", () => {
+  it("E4a no operator intent + no current-data demand → zero delivery", () => {
     const s = delegatedStack("e4a");
-    const out = (s.planner(plannerInput(NO_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
+    const out = s.canon(RAW_WORK(), NO_INTENT_HIST_GOAL, {
+      provenance: "fresh",
+    });
     expect(out.map((t) => [t.task_key, t.required_capabilities]))
       .toEqual([
         ["T1", ["AUTOMATON_TASK_EXECUTION"]],
         ["T2", ["REASONING"]],
       ]);
     expect(deliveries(out)).toHaveLength(0);
-    runPlanningGate(out, NO_INTENT_GOAL);
+    runPlanningGate(out, NO_INTENT_HIST_GOAL);
+    // Stronger Phase C invariant: the same no-intent goal WITH a
+    // current-data demand ("tuần này") never produces a plan — the
+    // canonical contract requires a legitimate NETWORK_ACCESS gatherer
+    // whether or not delivery was requested.
+    expect(errCode(() => s.canon(RAW_WORK(), NO_INTENT_GOAL, { provenance: "fresh" })))
+      .toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
   });
   it("E4b intent + no executor serves TELEGRAM_DELIVERY → UNSERVABLE", () => {
     const s = delegatedStack("e4b", { capSets: NO_DELIVERY_SETS });
-    expect(errCode(() => s.planner(plannerInput(HISTORICAL_INTENT_GOAL))))
-      .toBe("FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE");
+    expect(errCode(() =>
+      s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, { provenance: "fresh" }),
+    )).toBe("FAIL_CLOSED_DELIVERY_INJECTION_UNSERVABLE");
   });
-  it("E4c intent + no content-bearing task → NO_PRODUCER (never fabricate)", () => {
-    // DSH absent from `governed` → template emits only T1 bookkeeping.
-    const s = delegatedStack("e4c", { governed: new Set() });
-    expect(errCode(() => s.planner(plannerInput(HISTORICAL_INTENT_GOAL))))
-      .toBe("FAIL_CLOSED_DELIVERY_INJECTION_NO_PRODUCER");
+  it("E4c intent + planner emits zero work tasks → empty canonical list, never fabricated", async () => {
+    // A candidate that emitted nothing usable leaves an EMPTY canonical
+    // plan — the shared delegated-planning seam then fails closed
+    // FAIL_CLOSED_DELEGATED_PLAN_ABSENT instead of minting a T1-only
+    // "successful" plan (Phase C: no silent substitution, ever).
+    const s = delegatedStack("e4c", { rawForGoal: () => [] });
+    expect(s.canon([], HISTORICAL_INTENT_GOAL, { provenance: "fresh" }))
+      .toEqual([]);
+    let saw: string | null = null;
+    try {
+      await openDelegatedIntentMission(s);
+    } catch (e) {
+      saw = String((e as { code?: string })?.code ?? "ERR");
+    }
+    expect(saw).toBe("FAIL_CLOSED_DELEGATED_PLAN_ABSENT");
+    // And zero missions were minted for the failed open.
+    expect((s.store.list("mission") as Array<Record<string, unknown>>)
+      .length).toBe(0);
   });
   it("E4d malformed raw delivery emission → existing INVALIDATED authority intact", () => {
     const s = delegatedStack("e4d");
-    const canon = (s as never as {
-      canonicalizeLlmTasks: ReturnType<typeof makeServePlanner>["canonicalizeLlmTasks"];
-    }).canonicalizeLlmTasks ?? makeServePlanner({
-      hasExecutor: () => true,
-      executorCapSets: () => FULL_SETS,
-      replanProvider: null,
-    }).canonicalizeLlmTasks;
+    const canon = s.canon;
     const bad = {
       task_key: "T9",
       title: "bad",
@@ -563,6 +641,14 @@ describe("E4 — negatives still fail closed (or stay byte-identical)", () => {
     const preview = s.control.createPlanPreview({
       project_id: s.projectId,
       goal: HISTORICAL_INTENT_GOAL,
+      // Phase C — the preview carries the Pool winner's canonical plan
+      // exactly as the production expander edge delivers it.
+      metadata: {
+        llm_plan: s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, {
+          provenance: "fresh",
+        }),
+        plan_source: "LLM",
+      },
       granted_permissions: ["FILE_WRITE", "FILE_READ"],
       authorized_workspaces: [s.workspace],
       risk_ceiling: "LOW",
@@ -619,14 +705,14 @@ describe("E4 — negatives still fail closed (or stay byte-identical)", () => {
 /* ============================== E5 ============================== */
 
 describe("E5 — idempotency", () => {
-  it("re-plan on the same input is byte-identical; persisted replay adds nothing", () => {
+  it("re-canonicalize on the same raw emission is byte-identical; persisted replay adds nothing", () => {
     const s = delegatedStack("e5");
-    const first = (s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
-    const second = (s.planner(plannerInput(HISTORICAL_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
+    const first = s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, {
+      provenance: "fresh",
+    });
+    const second = s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, {
+      provenance: "fresh",
+    });
     expect(canonicalJson(second)).toBe(canonicalJson(first));
     // persisted replay through the canonicalize seam (the ONLY replay
     // path for a canonical plan): historical authority, verbatim — no
@@ -657,10 +743,10 @@ describe("E5 — idempotency", () => {
 /** THE real delegated chain: business → objective → workstream whose
  *  goal carries operator Telegram intent → allocation → delegated WOB
  *  child work item → INTENT→BOUND mission mint. Returns mission_id. */
-function openDelegatedIntentMission(
+async function openDelegatedIntentMission(
   s: ReturnType<typeof delegatedStack>,
   wsGoal: string = WS_INTENT_GOAL,
-) {
+): Promise<string> {
   const businessId = `BIZ_${seq++}`;
   s.store.put("business", businessId, {
     business_id: businessId,
@@ -712,8 +798,13 @@ function openDelegatedIntentMission(
       String(r.workstream_key ?? "") === "ws-telegram",
   )!;
   const childId = String(wal.delegated_child_work_item_id);
-  // THE delegated seam: WOB INTENT→BOUND + mission mint (bound id).
-  s.biz.openWorkItem(childId, OP);
+  // Phase C — THE shared delegated-planning seam: the Planner Pool
+  // plans the exact enriched bound-mission goal BEFORE the open
+  // authority boundary; openWorkItem re-proves the goal digest inside
+  // its dedup transaction, then mints the bound mission carrying the
+  // winner's canonical plan (WOB INTENT→BOUND, bound mission id).
+  const prepared = await s.biz.prepareDelegatedPlan(childId, OP);
+  s.biz.openWorkItem(childId, OP, undefined, { prepared_plan: prepared });
   const wob = s.store.list("work_open_binding").find(
     (b) => String(b.work_item_id) === childId,
   )!;
@@ -772,7 +863,7 @@ describe("E6 — end-to-end delegated mission delivers real upstream content onc
     const UPSTREAM = "PHÂN TÍCH SÂU: VN-Index +1.8% nhờ dòng tiền nhóm ngân hàng";
     s.adapter.fileContent["T2"] = UPSTREAM;
     s.adapter.fileContent["T3"] = stageFromUpstream;
-    const mid = openDelegatedIntentMission(s);
+    const mid = await openDelegatedIntentMission(s);
     expect(await driveToTerminal(s, mid)).toBe("COMPLETED");
     const taskRows = (s.store.list("task") as Array<Record<string, unknown>>)
       .filter((t) => String(t.mission_id) === mid);
@@ -807,7 +898,7 @@ describe("E6 — end-to-end delegated mission delivers real upstream content onc
     const DIFFERENT = "DỮ LIỆU KHÁC: thị trường đi ngang, không có điểm nhấn";
     s.adapter.fileContent["T2"] = DIFFERENT;
     s.adapter.fileContent["T3"] = stageFromUpstream;
-    const mid = openDelegatedIntentMission(s);
+    const mid = await openDelegatedIntentMission(s);
     expect(await driveToTerminal(s, mid)).toBe("COMPLETED");
     const { calls } = await sendMintedDelivery(s);
     expect(calls).toHaveLength(1);
@@ -824,41 +915,47 @@ describe("E6 — end-to-end delegated mission delivers real upstream content onc
 
 /* ============================== E8 — R1-F1 ============================== */
 
-describe("E8 — R1-F1 unique canonical task keys (DSH absent, Codex present)", () => {
+describe("E8 — R1-F1 unique canonical task keys on the fresh seam", () => {
   const CODEX_INTENT_GOAL =
     "Viết script Python phân tích dữ liệu mẫu, sau đó đăng lên kênh Telegram được phép.";
-  it("T1 bookkeeping + T3 codex + injected delivery takes next FREE key T4 — no duplicate", () => {
+  const RAW_PY = () => [
+    {
+      task_key: "T2",
+      title: "python analysis",
+      task_instruction:
+        "Viết script Python phân tích dữ liệu mẫu và ghi kết quả vào " +
+        "out.py, rồi trả lời DONE.",
+      required_capabilities: ["PYTHON_EXECUTION"],
+      depends_on: [],
+      metadata: {},
+    },
+  ];
+  it("T1 bookkeeping + T2 codex + injected delivery T3 — all keys unique, gate clean", () => {
     // sanity: the goal really does carry operator intent + codex shape
     // without a current/external-data demand.
     expect(detectTelegramDeliveryIntent(CODEX_INTENT_GOAL).requested).toBe(true);
     expect(goalRequiresCurrentExternalData(CODEX_INTENT_GOAL)).toBe(false);
-    const s = delegatedStack("e8", { governed: new Set([CODEX_EXECUTOR_ID]) });
-    const out = (s.planner(plannerInput(CODEX_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
+    const s = delegatedStack("e8", { rawForGoal: RAW_PY });
+    const out = s.canon(RAW_PY(), CODEX_INTENT_GOAL, { provenance: "fresh" });
     const keys = out.map((t) => t.task_key);
-    expect(keys).toEqual(["T1", "T3", "T4"]);
+    expect(keys).toEqual(["T1", "T2", "T3"]);
     expect(new Set(keys).size).toBe(keys.length);
     const del = deliveries(out);
     expect(del).toHaveLength(1);
-    expect(del[0].task_key).toBe("T4");
+    expect(del[0].task_key).toBe("T3");
     const inj = (del[0].metadata as Record<string, unknown>)[
       PAIR_DELIVERY_INJECTION_KEY] as Record<string, unknown>;
     expect(inj.reason).toBe("DELIVERY_TASK_INJECTED");
-    expect(inj.task_key).toBe("T4");
-    // DAG correctness: delivery binds the content-bearing codex T3,
-    // never bookkeeping T1; T3's own edge list stays empty (no T2).
+    expect(inj.task_key).toBe("T3");
+    // DAG correctness: delivery binds the content-bearing codex T2,
+    // never bookkeeping T1.
     const deps = (del[0].depends_on as string[]) ?? [];
-    expect(deps).toContain("T3");
+    expect(deps).toContain("T2");
     expect(deps).not.toContain("T1");
-    const t3 = out.find((t) => t.task_key === "T3")!;
-    expect(t3.depends_on).toEqual([]);
     // validation + dataflow gates pass on the unique-key plan
     runPlanningGate(out, CODEX_INTENT_GOAL);
-    // deterministic replay: identical input → byte-identical output
-    const again = (s.planner(plannerInput(CODEX_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
+    // deterministic replay: identical raw emission → byte-identical output
+    const again = s.canon(RAW_PY(), CODEX_INTENT_GOAL, { provenance: "fresh" });
     expect(canonicalJson(again)).toBe(canonicalJson(out));
     expect(deliveries(again)).toHaveLength(1);
   });
@@ -866,64 +963,89 @@ describe("E8 — R1-F1 unique canonical task keys (DSH absent, Codex present)", 
 
 /* ============================== E9 — R1-F2 ============================== */
 
-describe("E9 — R1-F2 current/external-data contract on template delivery", () => {
+describe("E9 — R1-F2 current/external-data contract on the canonicalize seam", () => {
   const CURRENT_INTENT_GOAL =
     "Nghiên cứu giá vàng hôm nay, sau đó đăng lên kênh Telegram được phép.";
   it("intent + current-data demand + no legitimate NETWORK_ACCESS gatherer → FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED", () => {
     expect(goalRequiresCurrentExternalData(CURRENT_INTENT_GOAL)).toBe(true);
     expect(detectTelegramDeliveryIntent(CURRENT_INTENT_GOAL).requested).toBe(true);
     const s = delegatedStack("e9");
-    expect(errCode(() => s.planner(plannerInput(CURRENT_INTENT_GOAL))))
-      .toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+    expect(errCode(() =>
+      s.canon(RAW_WORK(), CURRENT_INTENT_GOAL, { provenance: "fresh" }),
+    )).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
   });
-  it("no-intent + same current-data demand → pre-existing fallback behavior preserved (plans, zero delivery)", () => {
+  it("no-intent + same current-data demand → fail closed too (Phase C: no plan without a legitimate gatherer)", () => {
     const NO_INTENT_CURRENT = "Nghiên cứu giá vàng hôm nay.";
     expect(goalRequiresCurrentExternalData(NO_INTENT_CURRENT)).toBe(true);
     const s = delegatedStack("e9b");
-    const out = (s.planner(plannerInput(NO_INTENT_CURRENT)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
-    expect(out.map((t) => t.task_key)).toEqual(["T1", "T2"]);
-    expect(deliveries(out)).toHaveLength(0);
+    // Phase C — the old template could plan around the obligation; the
+    // canonical contract cannot: a current/external-data demand with no
+    // legitimate NETWORK_ACCESS gatherer fails closed regardless of
+    // delivery intent.
+    expect(errCode(() =>
+      s.canon(
+        [{
+          task_key: "T2", title: "w",
+          task_instruction: "Ghi bản tóm tắt dữ liệu có sẵn vào analysis.txt, rồi trả lời DONE.",
+          required_capabilities: ["REASONING"], depends_on: [], metadata: {},
+        }],
+        NO_INTENT_CURRENT,
+        { provenance: "fresh" },
+      ),
+    )).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
   });
   it("intent + local-source analysis (no external demand) → delivery plan still issues", () => {
     const LOCAL_INTENT_GOAL =
       "Phân tích dữ liệu trong file báo cáo local, sau đó đăng lên kênh Telegram được phép.";
     expect(goalRequiresCurrentExternalData(LOCAL_INTENT_GOAL)).toBe(false);
-    const s = delegatedStack("e9c");
-    const out = (s.planner(plannerInput(LOCAL_INTENT_GOAL)) as {
-      tasks: Array<Record<string, unknown>>;
-    }).tasks;
+    const s = delegatedStack("e9c", {
+      rawForGoal: () => [{
+        task_key: "T2", title: "w",
+        task_instruction: "Phân tích dữ liệu trong file báo cáo local và ghi tóm tắt vào analysis.txt, rồi trả lời DONE.",
+        required_capabilities: ["REASONING"], depends_on: [], metadata: {},
+      }],
+    });
+    const out = s.canon(
+      [{
+        task_key: "T2", title: "w",
+        task_instruction: "Phân tích dữ liệu trong file báo cáo local và ghi tóm tắt vào analysis.txt, rồi trả lời DONE.",
+        required_capabilities: ["REASONING"], depends_on: [], metadata: {},
+      }],
+      LOCAL_INTENT_GOAL,
+      { provenance: "fresh" },
+    );
     expect(deliveries(out)).toHaveLength(1);
     runPlanningGate(out, LOCAL_INTENT_GOAL);
   });
-  it("E9d R2 — THE EXACT incident goal (business prefix + 'tuần này') now trips the current-data gate, typed fail at PLANNING", () => {
+  it("E9d R2 — THE EXACT incident goal (business prefix + 'tuần này') trips the current-data gate at the planner edge", () => {
     expect(goalRequiresCurrentExternalData(INTENT_GOAL)).toBe(true);
     expect(detectTelegramDeliveryIntent(INTENT_GOAL).requested).toBe(true);
     const s = delegatedStack("e9d");
-    expect(errCode(() => s.planner(plannerInput(INTENT_GOAL))))
-      .toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+    expect(errCode(() =>
+      s.canon(RAW_WORK(), INTENT_GOAL, { provenance: "fresh" }),
+    )).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
   });
-  it("E9e R2 integration — current-week delegated WOB mission FAILS at planning; zero minted requests, zero sends", async () => {
+  it("E9e R2 integration — current-week delegated WOB open fails closed BEFORE mint; zero missions, zero requests, zero sends", async () => {
     const s = delegatedStack("e9e");
-    const mid = openDelegatedIntentMission(s, WS_CURRENT_INTENT_GOAL);
-    // The planning boundary terminalizes the mission (PLANNING→FAILED
-    // durably) while preserving the observable throw to the caller.
+    // Phase C — planning now runs at the delegated-planning seam BEFORE
+    // the open authority boundary: a contract violation rejects the
+    // prepare itself, so no open intent, no binding, no mission is ever
+    // minted (stronger than the old mint-then-FAILED-at-PLANNING path).
     let saw: string | null = null;
     try {
-      await driveToTerminal(s, mid);
+      await openDelegatedIntentMission(s, WS_CURRENT_INTENT_GOAL);
     } catch (e) {
       saw = String((e as { code?: string })?.code ?? "ERR");
     }
     expect(saw).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
-    expect(missionState(s, mid)).toBe("FAILED");
-    // no delivery task, no minted delivery request, nothing sendable
-    const reqs = (s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
-      .filter((p) => String(p.mission_id) === mid);
-    expect(reqs).toHaveLength(0);
+    // no delivery task, no mission, no minted delivery request
+    expect((s.store.list("mission") as Array<Record<string, unknown>>)
+      .length).toBe(0);
+    expect((s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
+      .length).toBe(0);
     expect(pendingTelegramDeliveries(s.store)).toHaveLength(0);
-    // no transport channel was ever exercised for this mission
-    expect(s.adapter.wroteTaskKeys.filter((k) => k.startsWith("T"))).not.toContain("T3:outbox/report.txt");
+    // no transport channel was ever exercised
+    expect(s.adapter.wroteTaskKeys.filter((k) => k.startsWith("T"))).toHaveLength(0);
   });
   it("E9f R3 — exact F5 goal ('tạo file báo cáo' OUTPUT wording) still trips the gate; no minted request, no sends", async () => {
     const F5_GOAL =
@@ -931,21 +1053,21 @@ describe("E9 — R1-F2 current/external-data contract on template delivery", () 
     expect(goalRequiresCurrentExternalData(F5_GOAL)).toBe(true);
     expect(detectTelegramDeliveryIntent(F5_GOAL).requested).toBe(true);
     const s = delegatedStack("e9f");
-    expect(errCode(() => s.planner(plannerInput(F5_GOAL))))
-      .toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
-    // and the delegated WOB mission carrying it fails at PLANNING too
-    const mid = openDelegatedIntentMission(s, `Bàn giao kết quả phân tích sau khi hoàn thành. ${F5_GOAL}`);
+    expect(errCode(() =>
+      s.canon(RAW_WORK(), F5_GOAL, { provenance: "fresh" }),
+    )).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
+    // and the delegated WOB open carrying it fails before mint too
     let saw: string | null = null;
     try {
-      await driveToTerminal(s, mid);
+      await openDelegatedIntentMission(s, `Bàn giao kết quả phân tích sau khi hoàn thành. ${F5_GOAL}`);
     } catch (e) {
       saw = String((e as { code?: string })?.code ?? "ERR");
     }
     expect(saw).toBe("FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED");
-    expect(missionState(s, mid)).toBe("FAILED");
-    const reqs = (s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
-      .filter((p) => String(p.mission_id) === mid);
-    expect(reqs).toHaveLength(0);
+    expect((s.store.list("mission") as Array<Record<string, unknown>>)
+      .length).toBe(0);
+    expect((s.store.list("telegram_delivery_request") as Array<Record<string, unknown>>)
+      .length).toBe(0);
     expect(pendingTelegramDeliveries(s.store)).toHaveLength(0);
   });
 });
@@ -1001,70 +1123,46 @@ describe("E11 — R2 current-week recency detection in goalRequiresCurrentExtern
 
 /* ============================== E10 — R1-F3 ============================== */
 
-describe("E10 — R1-F3 no-intent template output is byte-identical to BASE", () => {
-  // The EXACT BASE (cf2674c) task literals the template emitted for a
-  // no-intent goal — verbatim goal embed in T2, canonical codex T3.
-  const baseT2 = (goal: string) => ({
-    task_key: "T2",
-    title: "llm analysis (dsh)",
-    task_instruction:
-      `The workspace contains mission_goal.txt holding the operator's goal: "${goal}". ` +
-      "Produce a genuine deliverable for that goal's subject matter — analyze the topic " +
-      "itself (never just restate or describe the goal) — write findings to analysis.txt, " +
-      "then reply DONE.",
-    required_capabilities: ["REASONING"],
-    depends_on: ["T1"],
-    metadata: {},
+describe("E10 — Phase C template removal: persisted-plan authority only", () => {
+  it("a mission input with NO persisted plan fails closed FAIL_CLOSED_PLAN_REQUIRED — never a template", () => {
+    const s = delegatedStack("e10");
+    // The deterministic template tail is gone: no pinned_plan_tasks, no
+    // metadata.llm_plan → typed fail-closed, zero tasks emitted.
+    expect(errCode(() => s.planner(plannerInput(HISTORICAL_INTENT_GOAL))))
+      .toBe("FAIL_CLOSED_PLAN_REQUIRED");
+    expect(errCode(() => s.planner(plannerInput(NO_INTENT_HIST_GOAL))))
+      .toBe("FAIL_CLOSED_PLAN_REQUIRED");
   });
-  const baseT3Codex = (deps: string[]) => ({
-    task_key: "T3",
-    title: "codex step",
-    task_instruction:
-      "Create codex_out.txt in the workspace containing a short note implementing or summarizing the mission goal, then reply DONE.",
-    required_capabilities: ["PYTHON_EXECUTION"],
-    depends_on: deps,
-    metadata: {},
-  });
-  const CODEX_NO_INTENT_GOAL = "Viết script Python tính tổng dữ liệu mẫu.";
-  const cases: Array<{
-    name: string;
-    governed: Set<string>;
-    goal: string;
-    expected: Array<Record<string, unknown>>;
-  }> = [
-    {
-      name: "dsh+codex, codex-matching goal",
-      governed: new Set([DSH_EXECUTOR_ID, CODEX_EXECUTOR_ID]),
-      goal: CODEX_NO_INTENT_GOAL,
-      expected: [undefined as never, baseT2(CODEX_NO_INTENT_GOAL), baseT3Codex(["T2"])],
-    },
-    {
-      name: "dsh only, plain goal",
-      governed: new Set([DSH_EXECUTOR_ID]),
-      goal: NO_INTENT_GOAL,
-      expected: [undefined as never, baseT2(NO_INTENT_GOAL)],
-    },
-    {
-      name: "codex only (no dsh), codex-matching goal — T2 gap",
-      governed: new Set([CODEX_EXECUTOR_ID]),
-      goal: CODEX_NO_INTENT_GOAL,
-      expected: [undefined as never, baseT3Codex([])],
-    },
-    {
-      name: "no governed executor",
-      governed: new Set(),
-      goal: NO_INTENT_GOAL,
-      expected: [undefined as never],
-    },
-  ];
-  for (const c of cases) {
-    it(`byte-identical: ${c.name}`, () => {
-      const s = delegatedStack(`e10-${c.governed.size}`, { governed: c.governed });
-      const out = (s.planner(plannerInput(c.goal)) as {
-        tasks: Array<Record<string, unknown>>;
-      }).tasks;
-      const expected = [canonicalBookkeepingTask(c.goal), ...c.expected.slice(1)];
-      expect(canonicalJson(out)).toBe(canonicalJson(expected));
+  it("metadata.llm_plan replays through the persisted canonicalize seam verbatim — the delegated bound-mission path", () => {
+    const s = delegatedStack("e10b");
+    const canonical = s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, {
+      provenance: "fresh",
     });
-  }
+    const replay = (s.planner(
+      plannerInputLlm(HISTORICAL_INTENT_GOAL, canonical),
+    ) as { tasks: Array<Record<string, unknown>> }).tasks;
+    expect(canonicalJson(replay)).toBe(canonicalJson(canonical));
+    expect(deliveries(replay)).toHaveLength(1);
+    runPlanningGate(replay, HISTORICAL_INTENT_GOAL);
+  });
+  it("pinned_plan_tasks (confirmed preview) replays verbatim — committed-plan authority preserved", () => {
+    const s = delegatedStack("e10c");
+    const canonical = s.canon(RAW_WORK(), HISTORICAL_INTENT_GOAL, {
+      provenance: "fresh",
+    });
+    const pinnedInput = {
+      mission: {
+        goal: HISTORICAL_INTENT_GOAL,
+        metadata: { ...DELEGATED_MD, pinned_plan_tasks: canonical },
+      },
+      advice: null,
+      reason: "initial",
+      input_artifact_sources: [],
+    } as never;
+    const replay = (s.planner(pinnedInput) as {
+      tasks: Array<Record<string, unknown>>;
+    }).tasks;
+    expect(canonicalJson(replay)).toBe(canonicalJson(canonical));
+    expect(deliveries(replay)).toHaveLength(1);
+  });
 });

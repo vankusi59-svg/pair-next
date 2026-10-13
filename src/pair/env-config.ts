@@ -116,6 +116,21 @@ export const CODEX_PLANNER_TIMEOUT = {
   bounds: { min: 5_000, max: 900_000, unit: "ms" },
 } as const;
 
+/** Phase C — ONE run-level deadline for a planner pool run: it spans the
+ *  whole failover chain — every candidate's eligibility/qualification,
+ *  its INITIAL provider call (with transport-internal retries), and its
+ *  bounded REASK. Individual candidate/request budgets are min()'d
+ *  against the remaining run budget; a result landing past the deadline
+ *  is discarded and the run settles FAILED/deadline, never a winner.
+ *  The default (30m) comfortably covers the production chain
+ *  (codex 900s ceiling + HTTP candidates + a bounded re-ask each).
+ *  Unit: milliseconds. Bounds 5s–3600s. */
+export const PLANNER_RUN_DEADLINE = {
+  name: "PAIR_PLANNER_RUN_DEADLINE_MS",
+  defaultValue: 1_800_000,
+  bounds: { min: 5_000, max: 3_600_000, unit: "ms" },
+} as const;
+
 /** Governed task execution budget. Unit: seconds. Bounds 5s–7200s. */
 export const TASK_TIMEOUT = {
   name: "PAIR_TASK_TIMEOUT_S",
@@ -171,6 +186,10 @@ export function llmPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): numb
 
 export function codexPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(CODEX_PLANNER_TIMEOUT.name, CODEX_PLANNER_TIMEOUT.defaultValue, CODEX_PLANNER_TIMEOUT.bounds, env);
+}
+
+export function plannerRunDeadlineMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(PLANNER_RUN_DEADLINE.name, PLANNER_RUN_DEADLINE.defaultValue, PLANNER_RUN_DEADLINE.bounds, env);
 }
 
 export function ceoCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {

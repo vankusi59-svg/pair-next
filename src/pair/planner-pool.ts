@@ -402,6 +402,16 @@ export async function runPlannerFailover(opts: {
    *  re-ask runs with no budget limit (test seams); production wires the
    *  transport-derived ceiling so worst-case latency never grows. */
   latencyBudget?: (c: PlannerCandidate) => PlannerLatencyBudget;
+  /** Phase C — ONE run-level deadline spanning every candidate, every
+   *  eligibility/qualification step, the INITIAL model call, transport
+   *  retries and the bounded REASK. Absolute epoch ms. Each gate
+   *  recomputes the remaining budget; every provider request timeout is
+   *  min()'d against it; a result landing past the deadline is
+   *  discarded — never a winner, never an unauthorized Mission. Expiry
+   *  throws FAIL_CLOSED_PLANNER_DEADLINE (not failover-eligible): the
+   *  caller settles the run FAILED — never EXHAUSTED, since untried
+   *  candidates were denied by the deadline rather than by failure. */
+  deadlineMs?: number;
   onExhausted?: (attempts: PlannerAttemptRecord[]) => void;
   now?: () => string;
 }): Promise<PlannerFailoverResult> {
@@ -413,8 +423,39 @@ export async function runPlannerFailover(opts: {
     );
   }
   const attempts: PlannerAttemptRecord[] = [];
+  // Phase C — the single run-level deadline helpers: deadlineRemaining()
+  // folds the run budget into every downstream check; settleDeadline()
+  // persists honest TIMEOUT/RUN_DEADLINE evidence on an already-open
+  // attempt before the typed throw propagates.
+  const deadlineAt = opts.deadlineMs ?? null;
+  const deadlineRemaining = () =>
+    deadlineAt == null ? Number.MAX_SAFE_INTEGER : deadlineAt - Date.now();
+  const deadlineError = () =>
+    new IntegrityError(
+      "FAIL_CLOSED_PLANNER_DEADLINE",
+      JSON.stringify({ attempts: attempts.length, candidates_tried: n }),
+    );
+  const settleDeadline = (
+    base: Omit<PlannerAttemptRecord, "outcome">,
+    t0: number,
+    settle: (rec: PlannerAttemptRecord) => void,
+  ): never => {
+    settle({
+      ...base,
+      completed_at: now(),
+      latency_ms: Date.now() - t0,
+      outcome: "FAILED",
+      failure_class: PLANNER_FAILURE_CLASS.TIMEOUT,
+      warnings: ["RUN_DEADLINE_EXCEEDED"],
+    });
+    throw deadlineError();
+  };
   let n = 0;
   for (const c of opts.candidates) {
+    // Phase C — run deadline BEFORE a new attempt opens: an untried
+    // candidate leaves no STARTED row; the run dies DEADLINE, never
+    // EXHAUSTED.
+    if (deadlineRemaining() <= 0) throw deadlineError();
     n++;
     const started = now();
     const t0 = Date.now();
@@ -469,13 +510,30 @@ export async function runPlannerFailover(opts: {
       });
       continue;
     }
+    // Phase C — deadline re-proved AFTER the (possibly async)
+    // eligibility/qualification step; the INITIAL request timeout is
+    // bounded by whatever the run deadline left over.
+    if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
     // P-REASK — set only after the re-ask marker is durably persisted
     // (onAttemptReask). When the SECOND invocation itself dies, the outer
     // catch keeps `REASK:<code>` in the settled warnings so the durable
     // row still proves the re-ask began.
     let reaskInitiated: string | null = null;
     try {
-      const res = await opts.planFn(c, { kind: "INITIAL" });
+      const res = await opts.planFn(c, {
+        kind: "INITIAL",
+        ...(deadlineAt != null
+          ? {
+              timeoutMs: Math.min(
+                opts.latencyBudget?.(c)?.requestTimeoutMs ?? Number.MAX_SAFE_INTEGER,
+                Math.max(1, deadlineRemaining()),
+              ),
+            }
+          : {}),
+      });
+      // Phase C — a result landing past the run deadline is discarded:
+      // it can never become a winner or mint an unauthorized Mission.
+      if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
       const completed = now();
       if (!Array.isArray(res.tasks) || !res.tasks.length) {
         settle({
@@ -525,10 +583,14 @@ export async function runPlannerFailover(opts: {
           const reaskCode = extractReaskEligibleCode(e);
           if (reaskCode) {
             const budget = opts.latencyBudget?.(c);
-            const preReproofRemaining =
+            // Phase C — the re-ask may spend ONLY what the candidate
+            // ceiling AND the run deadline both leave over.
+            const preReproofRemaining = Math.min(
               budget == null
                 ? Number.MAX_SAFE_INTEGER
-                : budget.ceilingMs - (Date.now() - t0);
+                : budget.ceilingMs - (Date.now() - t0),
+              deadlineRemaining(),
+            );
             if (preReproofRemaining > 0) {
               // §9/R4 + R1.A — a second model invocation re-proves
               // canonical eligibility first. An authority throw falls
@@ -553,10 +615,18 @@ export async function runPlannerFailover(opts: {
               // re-proof consumed real time; a non-positive remainder
               // means no marker, no event, no second invocation — the
               // candidate settles on the ORIGINAL canonical rejection.
-              const remaining =
+              // Phase C — the remainder is min()'d against the run
+              // deadline; an expired deadline is a run failure, not a
+              // candidate rejection.
+              const remaining = Math.min(
                 budget == null
                   ? Number.MAX_SAFE_INTEGER
-                  : budget.ceilingMs - (Date.now() - t0);
+                  : budget.ceilingMs - (Date.now() - t0),
+                deadlineRemaining(),
+              );
+              if (remaining <= 0 && deadlineRemaining() <= 0) {
+                settleDeadline(base, t0, settle);
+              }
               if (remaining > 0) {
               // Durable BEFORE the second invocation: the STARTED row
               // records PAIR's re-ask so a crash mid-call can never make
@@ -579,6 +649,9 @@ export async function runPlannerFailover(opts: {
                   detail: extractReaskDetail(e, reaskCode),
                 },
               });
+              // Phase C — a re-ask result landing past the run deadline
+              // is discarded exactly like a late INITIAL result.
+              if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
               if (Array.isArray(res2.tasks) && res2.tasks.length) {
                 try {
                   const canonical2 = opts.canonicalize
@@ -665,6 +738,9 @@ export async function runPlannerFailover(opts: {
               }
             }
           }
+          // Phase C — expiry between the canonical rejection and the
+          // settle is a run-deadline failure, not a plan defect.
+          if (deadlineRemaining() <= 0) settleDeadline(base, t0, settle);
           settle({
             ...base,
             completed_at: now(),
@@ -699,6 +775,11 @@ export async function runPlannerFailover(opts: {
       // A re-ask already durably initiated keeps its marker on the row.
       const reaskMarker = reaskInitiated ? [`REASK:${reaskInitiated}`] : [];
       if (e instanceof IntegrityError) {
+        // Phase C — a run-deadline throw already settled this attempt
+        // honestly (RUN_DEADLINE_EXCEEDED); never settle it twice.
+        if (e.code === "FAIL_CLOSED_PLANNER_DEADLINE") {
+          throw e;
+        }
         settle({
           ...base,
           completed_at: now(),

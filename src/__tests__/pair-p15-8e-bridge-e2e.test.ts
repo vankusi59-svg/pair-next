@@ -161,7 +161,10 @@ function stack(dir: string) {
     conversation: sessions, store, invoker: mockInvoker,
     model_entry_id: ensureConversationModel(store, undefined, "t") });
   const drafts = new MissionDraftService({
-    conversation: sessions, control, store });
+    conversation: sessions, control, store,
+    // Phase C — same async Planner Pool seam; passthrough keeps the
+    // sync test planner as the preview's plan source.
+    planExpander: async (input) => ({ input }) });
   const telegram = new TelegramConversationService({
     store, conversation: sessions, drafts, reasoning });
   const server = createMissionControlServer({

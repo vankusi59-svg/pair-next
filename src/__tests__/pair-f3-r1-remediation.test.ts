@@ -355,7 +355,6 @@ const attempts = (store: PairEvidenceStore, mid: string) =>
 /* ============ A — production serve-planner composition (R1.1) ========= */
 describe("F3 R1 A — production serve/runtime planner seam", () => {
   const deps = (over: Partial<Parameters<typeof makeServePlanner>[0]> = {}) => ({
-    hasExecutor: () => false,
     executorCapSets: () => [
       ["FILE_OPERATIONS", "REASONING", REMOTE, "AUTOMATON_TASK_EXECUTION"],
     ],
@@ -387,11 +386,14 @@ describe("F3 R1 A — production serve/runtime planner seam", () => {
     expect(String(out.tasks[0].task_key)).toBe("T1");
   });
 
-  it("A3. initial — no pinned/llm → deterministic template", () => {
+  it("A3. initial — no pinned/llm → FAIL_CLOSED_PLAN_REQUIRED (Phase C: template removed)", () => {
     const { planner } = makeServePlanner(deps());
-    const out = planner(inputFor({}));
-    expect(String(out.tasks[0].task_key)).toBe("T1");
-    expect(String(out.tasks[0].required_capabilities?.[0])).toBe("AUTOMATON_TASK_EXECUTION");
+    // Phase C — the deterministic task-template tail is gone: a fresh
+    // initial planning call with no persisted plan authority fails
+    // closed before any task is emitted, never a synthesized T1 plan.
+    expect(() => planner(inputFor({}))).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_PLAN_REQUIRED" }) as never,
+    );
   });
 
   it("A4. replan + no provider → FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE — NEVER replays stored plans", () => {

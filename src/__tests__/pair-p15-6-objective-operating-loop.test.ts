@@ -130,7 +130,23 @@ function freshFullStack(name: string): FullStack {
     reconciliation: recon, observability, planner,
   });
   const schedules = new MissionScheduleService(service);
-  const biz = new BusinessLayer({ store, control, schedules });
+  const biz = new BusinessLayer({ store, control, schedules,
+    // Phase C — the shared async Planner Pool seam: this stub returns a
+    // canned canonical llm_plan so delegated opens plan "through the
+    // pool" exactly once per open (same shape the production expander
+    // yields after failover+canonicalize).
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata as Record<string, unknown> | undefined),
+          llm_plan: [{ task_key: "T2", title: "delegated", task_instruction: "work",
+            required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+          plan_source: "LLM", plan_model: "test-planner",
+        },
+      },
+      planner: { planner_run_id: "PLR_TEST", attempts: [], winner: { attempt_no: 1 } },
+    }) });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });
@@ -953,7 +969,22 @@ const control = new PAIR.MissionControl({
   reconciliation: recon, observability, planner,
 });
 const schedules = new PAIR.MissionScheduleService(service);
-const biz = new PAIR.BusinessLayer({ store, control, schedules });
+// Phase C — the delegated open needs an authorized plan: stub the shared
+// expander with a canonical llm_plan (the open seam only needs non-empty
+// plan authority; the race asserts dedup/convergence, not plan quality).
+const biz = new PAIR.BusinessLayer({
+  store, control, schedules,
+  planExpander: async (input) => ({
+    input: {
+      ...input,
+      metadata: {
+        ...(input.metadata ?? {}),
+        llm_plan: [{ task_id: "T1", title: "r", instructions: "r", required_capabilities: [] }],
+        plan_source: "LLM",
+      },
+    },
+  }),
+});
 const wf = new PAIR.WorkforceService({ store, business: biz });
 const workstreams = new PAIR.ObjectiveWorkstreamService({
   store, business: biz, workforce: wf, objectives: biz.objectives,
@@ -988,7 +1019,10 @@ function ensureRaceBundle() {
     .sort()
     .at(-1);
   if (!esbuild) throw new Error("esbuild binary not found");
-  execFileSync(esbuild, [
+  // bin/esbuild is a node launcher script (#!/usr/bin/env node) — spawn it
+  // through the interpreter so the bundle build is platform-portable.
+  execFileSync(process.execPath, [
+    esbuild,
     "src/pair/index.ts", "--bundle", "--format=esm", "--platform=node",
     "--external:better-sqlite3", "--external:ulid", "--external:yaml",
     `--outfile=${RACE_BUNDLE}`,

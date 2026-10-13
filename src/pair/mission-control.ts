@@ -786,8 +786,18 @@ export class MissionControl {
       planner_run_id: row.planner_run_id ?? null,
       expires_at: row.expires_at,
       state: row.state,
-      plan_source: plannerEvidence?.winner ? "LLM" : "TEMPLATE",
-      plan_model: plannerEvidence?.winner?.model ?? null,
+      // Phase C — the TEMPLATE source is gone: a preview that reached
+      // persistence was produced by authorized planning (pool winner
+      // evidence, or an authorized llm_plan carried in metadata — the
+      // sync planner fails closed on anything else above).
+      plan_source:
+        plannerEvidence?.winner || (input.metadata?.llm_plan as unknown[] | undefined)?.length
+          ? "LLM"
+          : ((input.metadata?.plan_source as string | undefined) ?? "LLM"),
+      plan_model:
+        plannerEvidence?.winner?.model ??
+        (input.metadata?.plan_model as string | undefined) ??
+        null,
       warnings: plannerEvidence?.warnings ?? [],
     };
   }
@@ -1489,10 +1499,11 @@ export class MissionControl {
   }
 
   /**
-   * Fire every due schedule through the canonical startMission path. When an
-   * expander is supplied (the serve script's LLM planner seam) each due goal
-   * is expanded into a real plan first — scheduled missions get the same plan
-   * quality as the UI's Plan & run instead of the minimal template fallback.
+   * Fire every due schedule through the canonical preview+confirm path.
+   * Phase C — scheduled Missions are planned by the SAME async LLM
+   * Planner Pool expander as every other ingress: no expander →
+   * FAIL_CLOSED_NO_PLANNER per due schedule (bounded, recorded as the
+   * schedule's own fire error), never a deterministic template.
    */
   async tickSchedules(
     now?: string,
@@ -1502,7 +1513,10 @@ export class MissionControl {
     const defaultProject = String(this.store.list("project")[0]?.project_id ?? "");
     return this.deps.schedules.fireDue(
       async (input) => {
-        const expanded = expander ? await expander(input as Record<string, unknown>) : { input };
+        if (!expander) {
+          throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "mission_control.schedules");
+        }
+        const expanded = await expander(input as Record<string, unknown>);
         const exInput = (expanded as { input?: unknown }).input ?? expanded;
         const plannerEvidence = (expanded as { planner?: never }).planner;
         const preview = this.createPlanPreview({

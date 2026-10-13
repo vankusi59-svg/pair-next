@@ -138,7 +138,21 @@ function wireStack(
     reconciliation: recon, observability, planner,
   });
   const schedules = new MissionScheduleService(service);
-  const biz = new BusinessLayer({ store, control, schedules });
+  const biz = new BusinessLayer({ store, control, schedules,
+    // Phase C — the shared async Planner Pool seam (canned canonical
+    // llm_plan; see pair-p15-6 for the same stub contract).
+    planExpander: async (input) => ({
+      input: {
+        ...input,
+        metadata: {
+          ...(input.metadata as Record<string, unknown> | undefined),
+          llm_plan: [{ task_key: "T2", title: "delegated", task_instruction: "work",
+            required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
+          plan_source: "LLM", plan_model: "test-planner",
+        },
+      },
+      planner: { planner_run_id: "PLR_TEST", attempts: [], winner: { attempt_no: 1 } },
+    }) });
   const wf = new WorkforceService({ store, business: biz });
   const workstreams = new ObjectiveWorkstreamService(
     { store, business: biz, workforce: wf, objectives: biz.objectives });

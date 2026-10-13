@@ -8,9 +8,13 @@
  * instantiates, never a reimplementation.
  *
  * F3 R1.1 — replan discipline:
- *   - `reason === "initial"` keeps the established behavior: confirmed
- *     `pinned_plan_tasks` verbatim → `metadata.llm_plan` through the
- *     canonicalize seam → deterministic template plan.
+ *   - `reason === "initial"` accepts ONLY authorized plan authority:
+ *     confirmed `pinned_plan_tasks` verbatim → `metadata.llm_plan`
+ *     through the canonicalize seam. Phase C — the deterministic
+ *     template plan is REMOVED: a mission reaching the planner without
+ *     a persisted plan fails closed FAIL_CLOSED_PLAN_REQUIRED. Genuine
+ *     planning happens ONLY in the async LLM Planner Pool at the
+ *     expander edge; its winner travels as `metadata.llm_plan`.
  *   - `reason === "replan"` NEVER silently replays a stored plan
  *     (pinned / llm_plan / unchanged template) as though it were a
  *     fresh alternative. A replan must come from a configured governed
@@ -63,8 +67,6 @@ import { detectOutputLanguage } from "./output-language.js";
 import { extractGoalContract } from "./goal-contract.js";
 import { assertPlanCoverage } from "./plan-coverage.js";
 import { IntegrityError } from "./errors.js";
-import { DSH_EXECUTOR_ID } from "./dsh-adapter.js";
-import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import type { RuntimePlanner, RuntimePlannerInput } from "./mission-runtime.js";
 
 /** Capability allowlist for LLM-derived plans (initial + replan). */
@@ -132,9 +134,6 @@ export function canonicalBookkeepingTask(goal: string): Record<string, unknown> 
 }
 
 export interface ServePlannerDeps {
-  /** Whether a governed executor id is registered + qualified (template
-   *  plan T2/T3 emission). Production: `(id) => governed.has(id)`. */
-  hasExecutor: (executorId: string) => boolean;
   /** Capability sets of the currently-qualified executors — sanitizePlan
    *  drops tasks no single executor can serve. */
   executorCapSets: () => string[][];
@@ -711,102 +710,19 @@ export function makeServePlanner(deps: ServePlannerDeps): {
       );
       if (tasks.length) return { tasks };
     }
-    // F3 — operator Telegram intent is detected BEFORE task emission so
-    // the no-intent template stays byte-identical to BASE: the verbatim
-    // goal embed is kept verbatim for goals without delivery intent and
-    // only replaced (by the read-from-workspace form) when a genuine
-    // intent exists — a quoted affirmative delivery clause would trip
-    // the task-delivery hygiene/semantic re-proofs once a canonical
-    // delivery task is injected. The goal stays durable in
-    // mission_goal.txt via T1's worker_spec either way.
-    const telegramIntent = detectTelegramDeliveryIntent(goal);
-    const tasks: Array<Record<string, unknown>> = [
-      canonicalBookkeepingTask(goal),
-    ];
-    if (deps.hasExecutor(DSH_EXECUTOR_ID)) {
-      tasks.push({
-        task_key: "T2",
-        title: "llm analysis (dsh)",
-        task_instruction: telegramIntent.requested
-          ? "The workspace contains mission_goal.txt holding the operator's goal (read it first). Produce a genuine deliverable for that goal's subject matter — analyze the topic itself (never just restate or describe the goal) — write findings to analysis.txt, then reply DONE."
-          : `The workspace contains mission_goal.txt holding the operator's goal: "${goal}". Produce a genuine deliverable for that goal's subject matter — analyze the topic itself (never just restate or describe the goal) — write findings to analysis.txt, then reply DONE.`,
-        required_capabilities: ["REASONING"],
-        depends_on: ["T1"],
-        metadata: {},
-      });
-    }
-    if (
-      deps.hasExecutor(CODEX_EXECUTOR_ID) &&
-      /codex|python|script|code/i.test(goal)
-    ) {
-      tasks.push({
-        task_key: "T3",
-        title: "codex step",
-        task_instruction:
-          "Create codex_out.txt in the workspace containing a short note implementing or summarizing the mission goal, then reply DONE.",
-        required_capabilities: ["PYTHON_EXECUTION"],
-        depends_on: ["T2"].filter((k) =>
-          tasks.some((t) => t.task_key === k),
-        ),
-        metadata: {},
-      });
-    }
-    // HOTFIX-D — the deterministic template fallback runs through the
-    // SAME governed delivery-injection authority as every LLM/persisted
-    // candidate (delegated WOB-bound missions always land here: no
-    // pinned_plan_tasks, no metadata.llm_plan). The template list IS
-    // the unsanitized emission — a delivery omission is proven by
-    // construction, never by model confession. On a TRUE operator
-    // intent the canonical repair injects exactly one delivery task
-    // and reconcile stamps it exactly as for a planner-emitted one;
-    // without intent the BASE template bytes are unchanged.
-    if (telegramIntent.requested) {
-      // F2 — the current/external-data contract applies to template
-      // delivery exactly as it does to canonical candidates: an
-      // executable Telegram delivery plan is unauthorized when the goal
-      // demands current/external data the plan cannot legitimately
-      // gather. The deterministic template never emits a NETWORK_ACCESS
-      // data-gathering task bound to the goal's subject — fail closed
-      // rather than fabricate a deliverable from the goal text. Only
-      // the DELIVERY exposure is gated: a no-intent goal on the same
-      // template keeps BASE behavior (pre-existing fallback
-      // limitation, unchanged by this fix).
-      if (goalRequiresCurrentExternalData(goal)) {
-        const legitimate = tasks.some((t) => {
-          const caps =
-            (t.required_capabilities as string[] | undefined) ?? [];
-          const instr = String(t.task_instruction ?? "");
-          return (
-            caps.includes("NETWORK_ACCESS") &&
-            instructionIsDataGathering(instr) &&
-            instructionSatisfiesGoalSubject(instr, goal)
-          );
-        });
-        if (!legitimate) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED",
-            "goal requires current/external data but no legitimate NETWORK_ACCESS data-gathering task",
-          );
-        }
-      }
-      injectDeliveryTaskForTrueOmission(
-        tasks,
-        telegramIntent,
-        {
-          canonical: tasks.filter((t) => isDeliveryTask(t)).length,
-          // The deterministic template never emits a delivery task at
-          // all — there is no dropped/malformed emission to count.
-          raw: 0,
-        },
-        deps.executorCapSets,
-      );
-      reconcilePlanDataflow(tasks as never[], {
-        telegramIntent,
-        outputLanguage: detectOutputLanguage(String(goal ?? "")),
-        external_input_artifacts: input.input_artifact_sources,
-      });
-    }
-    return { tasks };
+    // Phase C — deterministic mission-planning template REMOVED. A new
+    // Mission must carry authorized plan authority — a confirmed
+    // preview's `pinned_plan_tasks` or a Planner Pool winner persisted
+    // as `metadata.llm_plan` (produced by the shared async expander
+    // edge BEFORE mission creation, for direct/draft/scheduled and
+    // delegated opens alike). Reaching this tail means a mission was
+    // admitted without a persisted plan — typed fail-closed, never a
+    // synthesized task list, never a T1-only "successful" plan, never
+    // a silent substitution.
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLAN_REQUIRED",
+      "mission has no persisted plan authority — planning must run through the LLM Planner Pool before mission start",
+    );
   };
   return { planner, canonicalizeLlmTasks };
 }
