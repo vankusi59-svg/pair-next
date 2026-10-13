@@ -100,6 +100,15 @@ export const CONVERSATION_CLI_TIMEOUT = {
   bounds: { min: 5_000, max: 900_000, unit: "ms" },
 } as const;
 
+/** Phase 1 — serialized operational STATUS envelope bound (chars). The
+ *  query service drops whole sections to fit; output is always valid
+ *  JSON, never a truncated fragment. Unit: chars. Bounds 256–16000. */
+export const OPERATIONAL_STATUS_MAX = {
+  name: "PAIR_OPERATIONAL_STATUS_MAX_CHARS",
+  defaultValue: 2_000,
+  bounds: { min: 256, max: 16_000, unit: "chars" },
+} as const;
+
 /** LLM planner request budget. Unit: milliseconds. Bounds 2s–900s. */
 export const LLM_PLANNER_TIMEOUT = {
   name: "PAIR_LLM_PLANNER_TIMEOUT_MS",
@@ -198,6 +207,10 @@ export function ceoCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {
 
 export function conversationCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(CONVERSATION_CLI_TIMEOUT.name, CONVERSATION_CLI_TIMEOUT.defaultValue, CONVERSATION_CLI_TIMEOUT.bounds, env);
+}
+
+export function operationalStatusMaxChars(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(OPERATIONAL_STATUS_MAX.name, OPERATIONAL_STATUS_MAX.defaultValue, OPERATIONAL_STATUS_MAX.bounds, env);
 }
 
 export function taskTimeoutSeconds(env: EnvLike = process.env as EnvLike): number {

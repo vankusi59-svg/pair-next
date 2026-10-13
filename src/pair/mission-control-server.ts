@@ -23,6 +23,7 @@ import type { PairEvidenceStore } from "./store.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
 import type { ConversationSessionService } from "./conversation-session.js";
 import type { ConversationReasoningService } from "./conversation-reasoning.js";
+import { classifyRequestCredential } from "./operational-query.js";
 import type { MissionDraftService } from "./mission-draft.js";
 import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
@@ -66,6 +67,17 @@ export interface MissionControlServerDeps {
    * and ask for the token. Unset → no gate (local dev default).
    */
   authToken?: string;
+  /**
+   * Phase 1 R1 — the SEPARATE operational-status admin credential
+   * (PAIR_MC_ADMIN_TOKEN). Bearer-only (never `?token=`); it mints the
+   * `admin` principal for the conversation status hook and
+   * authenticates ONLY the operational-status boundary — conversation
+   * create/read/turns. It can NEVER satisfy the general /api gate:
+   * credentials, missions, budgets, drafts, confirms and every other
+   * mutation still require the MC token, and an admin-only turn is
+   * read_only (proposals can never materialize). Equal to the MC token
+   * → admin lane disabled outright. Unset → every caller is scoped. */
+  adminToken?: string;
   /**
    * Narrow-scope token for `POST /api/outbox` — remote executors push binary
    * deliverables (chart screenshots, report files) with
@@ -402,10 +414,36 @@ export function createMissionControlServer(
     const isOutboxUpload = method === "POST" && p === "/api/outbox";
     const isBrokerFetch = method === "POST" && p === "/api/broker/fetch";
     const isArtifactFetch = method === "POST" && p === "/api/artifacts/fetch";
+    const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+    const queryToken = url.searchParams.get("token") ?? "";
+    // Phase 1 R1 — credential classification. The admin credential is
+    // BEARER-ONLY and authenticates ONLY the operational-status boundary
+    // (conversation create/read/turns) — it is NOT a general Mission
+    // Control API credential and can never come in via ?token= (query
+    // tokens leak through logs/proxies). The MC token keeps its original
+    // OR-semantics across both channels.
+    const classOf = (credential: string) =>
+      classifyRequestCredential({
+        credential,
+        authToken: deps.authToken,
+        adminToken: deps.adminToken,
+      });
+    const adminBearer = classOf(bearer) === "admin";
+    const mcAuthenticated =
+      classOf(bearer) === "operator" || classOf(queryToken) === "operator";
+    const adminBoundary =
+      (method === "POST" &&
+        (p === "/api/conversations" ||
+          /^\/api\/conversations\/[^/]+\/turns$/.test(p))) ||
+      (method === "GET" &&
+        (p === "/api/conversations" ||
+          /^\/api\/conversations\/[^/]+(\/messages)?$/.test(p)));
     if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch && !isArtifactFetch) {
-      const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-      const q = url.searchParams.get("token") ?? "";
-      if (bearer !== deps.authToken && q !== deps.authToken) {
+      // The MC token remains the general API credential. The admin
+      // token unlocks ONLY the operational-status boundary — every
+      // other route (credentials, missions, budgets, config, drafts,
+      // confirms) still requires the MC token.
+      if (!mcAuthenticated && !(adminBearer && adminBoundary)) {
         res.writeHead(401, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "UNAUTHORIZED_MC_TOKEN" }));
         return;
@@ -1657,6 +1695,27 @@ export function createMissionControlServer(
           const out = await conv.reasoning.turn({
             session_id: m[1]!,
             operator_id: operator,
+            // Phase 1 — the verified principal for the status hook. Only
+            // the credential class minted at THIS boundary can produce
+            // "admin"; `x-operator-id` is a claimed identity used for
+            // session ownership/scoping, never for privilege.
+            principal: {
+              kind: adminBearer ? "admin" : "operator",
+              operator_id: operator,
+            },
+            // F2/F3 + R3 — read_only separates read-query purpose from
+            // mission-creation purpose. It is set when (a) the request
+            // is authenticated ONLY by the admin credential (status-read
+            // authority — it can never materialize a draft or any other
+            // write), or (b) the caller explicitly declares
+            // `read_only: true` in the request contract. The declared
+            // flag can only NARROW the caller's own authority — it can
+            // never widen it (OR-ed, never substituted for credential
+            // checks). (A caller who also presents the MC token keeps
+            // the normal proposal flow when it does not opt out.)
+            read_only:
+              (adminBearer && !mcAuthenticated) ||
+              body.read_only === true,
             body: String(body.body ?? ""),
             idempotency_key: body.idempotency_key === undefined
               ? undefined : String(body.idempotency_key),

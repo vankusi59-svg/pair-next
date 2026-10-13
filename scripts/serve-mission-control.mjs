@@ -118,6 +118,9 @@ import {
   modelRoleOf,
   MODEL_ROLE,
   utcnow,
+  resolveMcAdminToken,
+  operationalStatusMaxChars,
+  OperationalQueryService,
 } from "../dist/pair/index.js";
 
 // Phase E §15 — declared credential VALUES are registered with the
@@ -166,6 +169,22 @@ console.log(`EXEC_TIMEOUT: canonical governed budget PAIR_TASK_TIMEOUT_S=${cfgTa
 // (chmod 600). No static defaults anywhere; server + bridge share this seam.
 const mcToken = resolveMcToken();
 console.log(`MC_TOKEN: resolved via ${mcToken.source} (file=${mcToken.path})`);
+
+// Phase 1 — the SEPARATE operational-status admin credential. ENV-only:
+// never generated, never persisted — unset means NO admin principal can
+// exist (status queries stay scoped). It must be a distinct secret from
+// the MC token; an equal value disables the admin lane rather than
+// silently widening every MC-token holder into an admin.
+const mcAdminToken = resolveMcAdminToken({ env: process.env });
+const adminTokenEffective =
+  mcAdminToken && mcAdminToken !== mcToken.token ? mcAdminToken : undefined;
+if (mcAdminToken && !adminTokenEffective) {
+  console.error(
+    "PAIR_MC_ADMIN_TOKEN equals PAIR_MC_TOKEN — the MC token can never " +
+    "be an admin credential; operational-status admin lane DISABLED",
+  );
+}
+console.log(`MC_ADMIN_TOKEN: ${adminTokenEffective ? "configured (env)" : "unset — admin status queries disabled"}`);
 
 // Phase A — canonical model-role pools. PAIR_PLANNER_MODEL_ROUTE names the
 // planner's model route; PAIR_DSH_* routes name DSH_EXECUTION candidates.
@@ -533,6 +552,14 @@ const missionDrafts = new MissionDraftService({
 });
 let conversationReasoning = null;
 try {
+  // Phase 1 — the read-only operational query authority. Pure read
+  // composition over canonical rows + Mission Control projections; it
+  // holds no mutation surface at all.
+  const operationalQuery = new OperationalQueryService({
+    store,
+    control,
+    status_max_chars: operationalStatusMaxChars(),
+  });
   // TEST-ONLY seam: PAIR_CONVERSATION_STUB_REPLY replaces the codex-cli
   // invoker with a deterministic echo so Playwright/CI never calls a
   // paid/real model. Never set it in production.
@@ -552,6 +579,13 @@ try {
     store,
     invoker: convInvoker,
     model_entry_id: ensureConversationModel(store),
+    // Phase 1 — grounded operational status: the read-only evidence
+    // seam behind Chat. Authorization keys on the verified principal
+    // minted at the request boundary (admin token ⇒ global scope;
+    // MC-token operators ⇒ canonically-proven scope only; telegram ⇒
+    // scoped). The service composes canonical projections only — it
+    // can never mint missions/drafts or mutate state.
+    observeOperatorContext: (ctx) => operationalQuery.statusForConversation(ctx),
   });
 } catch (e) {
   console.error(
@@ -1124,6 +1158,10 @@ const server = createMissionControlServer({
   // SSE). Unset = open local mode; always set it when the port is reachable
   // by anyone but you (e.g. a public preview URL).
   authToken: mcToken.token,
+  // Phase 1 — the separate admin credential for operational-status
+  // reads (PAIR_MC_ADMIN_TOKEN). Absent → no admin principal exists;
+  // the MC token is never admin.
+  adminToken: adminTokenEffective,
   // Narrow-scope upload token for remote executor file deliverables
   // (POST /api/outbox). Separate from PAIR_MC_TOKEN on purpose — remote
   // agents see this value in their prompt, so it must not grant API access.
