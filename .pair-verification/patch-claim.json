@@ -1,30 +1,13 @@
 {
-  "claim_id": "HOTFIX_D_TEMPLATE_FALLBACK_DELIVERY_INJECTION",
-  "title": "Deterministic template fallback runs through THE governed delivery-injection authority (delegated WOB-bound mission DL_4d48de10 no longer dies FAIL_CLOSED_DELIVERY_TASK_MISSING)",
+  "claim_id": "TEST_R51_CRASH_DETERMINISTIC_TIME",
+  "title": "R5.1-crash: stale reconcile now anchored to durable attempt_started_at (removes wall-clock dependence)",
   "affected_surfaces": [
-    "PLANNER",
-    "DELIVERY",
-    "MISSION_CONTROL",
-    "BUSINESS_OBJECTIVE"
+    "DEV_INFRA",
+    "DELIVERY"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-d-delegated-delivery.test.ts",
-    "src/__tests__/pair-p15-8-hotfix1-delivery-injection.test.ts",
-    "src/__tests__/pair-planner-dataflow-incident.test.ts",
-    "src/__tests__/pair-hotfix-c-telegram-intent.test.ts",
-    "src/__tests__/pair-output-delivery-contract.test.ts",
-    "src/__tests__/pair-ops-telegram-delivery.test.ts",
-    "src/__tests__/pair-f4-delivery-provenance.test.ts",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts",
-    "src/__tests__/pair-hotfix-b-redispatch-after-unblock.test.ts",
-    "src/__tests__/pair-llm-planner.test.ts",
-    "src/__tests__/pair-network-requirement.test.ts",
-    "src/__tests__/pair-network-requirement-r3.test.ts",
-    "src/__tests__/pair-network-binding-repair.test.ts",
-    "src/__tests__/pair-prv2a-planner-modernization.test.ts",
-    "src/__tests__/pair-prv2b-goal-coverage.test.ts",
-    "src/__tests__/pair-runtime-hardening.test.ts"
+    "src/__tests__/pair-f4-delivery-provenance.test.ts"
   ],
   "invariants": [],
-  "description": "Delegated WOB-bound missions hit the deterministic template fallback (BASE emitted T1+optional T2/T3, NEVER TELEGRAM_DELIVERY) -> FAIL_CLOSED_DELIVERY_TASK_MISSING (DL_4d48de10). ONE helper injectDeliveryTaskForTrueOmission shared by canonicalize seam AND template tail (forge-strip -> proven omission -> servable -> producer-proof -> stamped push). R1: next-FREE task key; template delivery enforces the canonical current-data contract (no legitimate NETWORK_ACCESS gatherer -> FAIL_CLOSED_PLAN_NETWORK_CAPABILITY_REQUIRED); no-intent byte-exact; E6 real upstream bytes. R2: STRONG_CURRENCY_RE += 'tuần này|tuần hiện tại|this week'. R3 bounded detector fixes: F5 — bare 'file|tệp' dropped from LOCAL_SOURCE_RE; file suppresses ONLY in input context (local/cục bộ qualifier, source prep trong/từ/from/of/in/read/đọc, 'file input/data'), so 'tạo file báo cáo'/'save the output file' no longer cancels a current-data demand while 'trong file CSV cục bộ' keeps suppressing. F6 — week recency per clause: a week marker preceded by a schedule/deadline role word in the same clause (họp/meeting/lịch/nộp/bàn giao/giao!=dịch/deliver/send/đăng...) binds EVENT time not subject currency ('2020 trong buổi họp tuần này' FALSE; 'thị trường chứng khoán tuần này' TRUE; unbound marker in another clause survives). Evidence: E9f exact F5 goal -> typed fail at PLANNING, zero minted, zero sends; E11 matrix += all mandated F5/F6 cases; 45/45 focused. NO second detector, NO auto NETWORK_ACCESS, no invented gatherer. Untouched: external inputs, pinning, source-stamp, CAS, provenance, fail-closed. Baseline on cf2674c: f4 R5.1-crash."
+  "description": "R5.1-crash passed a hardcoded reconcile now (2026-10-05T02:00:00Z) while attempt_started_at is minted from real utcnow() at beginDeliveryAttemptEntity. Once wall clock moved past 2026-10-05 the SENDING attempt read as FRESH (negative age vs the 60s stale window), reconcileStaleDeliveryAttempts no-oped, and toThrow(/crash-after-append/) saw undefined — a date-dependent failure on any host, previously registered as a tolerated baseline. The reconcile now is now derived from the durable attempt_started_at +120s, so the attempt is deterministically stale on any date; all post-rollback assertions (state SENDING, started_at unchanged, zero RESOLVED evidence) are unchanged. Test-only change — zero production code touched."
 }
