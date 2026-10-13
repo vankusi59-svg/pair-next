@@ -11,24 +11,27 @@
  * derived only from canonical rows and the existing Mission Control read
  * projections.
  *
- * AUTHORIZATION MODEL (approved Phase-1 policy)
- * -------------------------------------------
+ * AUTHORIZATION MODEL (approved Phase-1 policy, audit-R1 hardened)
+ * --------------------------------------------------------------
  *   admin    — the separate PAIR_MC_ADMIN_TOKEN credential, minted into a
- *              `ConversationPrincipal` at the HTTP boundary. May read ALL
- *              operational state (global infra + every business scope).
+ *              `ConversationPrincipal` at the HTTP boundary (bearer only).
+ *              May read ALL operational state (global infra + every scope).
  *   operator — an MC-token caller carrying `x-operator-id`. The id is a
- *              CLAIMED identity, never admin proof: reads are limited to
- *              what canonical rows prove to the operator (owned objectives
- *              via owner_authority_id, businesses via the BUSINESS_CREATED
- *              event actor chain or owned-objective membership, missions
- *              bound to those businesses or created through the operator's
- *              own conversation drafts).
- *   telegram — the proven `telegram:<chat_id>` ingress identity; identical
- *              scoped permissions as `operator`. Telegram can never become
- *              admin.
+ *              CLAIMED identity and NOT verified authentication: scoped
+ *              rows (claimed session ownership, BUSINESS_CREATED actor
+ *              chains, objective owner_authority_id) prove things about a
+ *              claimed id but never prove WHO is asking — so every scoped
+ *              section is denied with `UNVERIFIED_IDENTITY`. Global-infra
+ *              sections stay `INSUFFICIENT_AUTHORITY`. A future verified-
+ *              identity mechanism can re-open scoped reads; until then the
+ *              audit-mandated posture is default-deny.
+ *   telegram — the proven `telegram:<chat_id>` ingress identity (the
+ *              bridge mints it from the real update, never a caller
+ *              claim): may read scope proven to that identity — its own
+ *              draft-minted missions and provably-owned rows. Telegram can
+ *              never become admin.
  *   Default deny: where no canonical authority chain exists the section is
- *   reported `unavailable` with INSUFFICIENT_AUTHORITY — never widened,
- *   never guessed.
+ *   reported `unavailable` — never widened, never guessed.
  *
  * HONESTY CONTRACT
  * ----------------
@@ -241,6 +244,11 @@ const TERMINAL_EXECUTION = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT
 
 const INSUFFICIENT_AUTHORITY = "INSUFFICIENT_AUTHORITY";
 const INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE";
+/** R1-F1 — the caller's claimed identity cannot be verified
+ *  (x-operator-id is a claim, never authentication): every scoped
+ *  section defaults to this denial. Distinct from INSUFFICIENT_AUTHORITY
+ *  so the model can say "I can't verify who you are" honestly. */
+const UNVERIFIED_IDENTITY = "UNVERIFIED_IDENTITY";
 
 /* ------------------------------------------------------------------ *
  *  bounded item helpers                                                 *
@@ -396,6 +404,12 @@ export class OperationalQueryService {
     asof: string,
   ): Record<string, unknown> {
     const isAdmin = ctx.principal.kind === "admin";
+    // R1-F1 — a caller-claimed `x-operator-id` is NOT verified identity:
+    // the `operator` kind gets NO scoped operational data at all (session
+    // ownership, BUSINESS_CREATED actors and objective ownership can only
+    // be proven to a VERIFIED identity). Only `admin` (separate credential)
+    // and `telegram` (ingress-proven `telegram:<chat_id>`) are verified.
+    const verified = isAdmin || ctx.principal.kind === "telegram";
     const intents = classifyOperationalIntents(ctx.latest_message.body);
     /** Section selector — intent keys plus the scope-context pseudo-section
      *  `objectives_owned` that grounds scoped principals. */
@@ -410,11 +424,21 @@ export class OperationalQueryService {
     const unavailable: Array<{ section: string; reason: string }> = [];
     const integrity: Array<{ section: string; error: string }> = [];
 
-    // Scoped operators always get their own footprint context — it is
-    // what makes an empty global answer honest instead of empty.
+    // Verified non-admin principals always get their own proven footprint
+    // context — what makes an empty global answer honest, not just empty.
     if (!isAdmin) want.add("objectives_owned");
 
-    const scope = isAdmin ? null : this.scopeFor(ctx.principal);
+    /** Unverified principals see an explicit denial on every requested
+     *  section — never silent emptiness, never foreign data. */
+    const deny = (name: string) => {
+      unavailable.push({
+        section: name,
+        reason: verified ? INSUFFICIENT_AUTHORITY : UNVERIFIED_IDENTITY,
+      });
+    };
+
+    const scope =
+      isAdmin || !verified ? null : this.scopeFor(ctx.principal);
 
     const guarded = (name: string, fn: () => unknown) => {
       try {
@@ -431,28 +455,34 @@ export class OperationalQueryService {
     };
 
     if (want.has("ACTIVE_WORK")) {
-      guarded("active_missions", () => this.activeMissions(scope));
-      guarded("running_executions", () => this.runningExecutions(scope));
+      if (!verified) {
+        deny("active_missions");
+        deny("running_executions");
+      } else {
+        guarded("active_missions", () => this.activeMissions(scope));
+        guarded("running_executions", () => this.runningExecutions(scope));
+      }
     }
     if (want.has("PROVIDER_STATUS")) {
       if (isAdmin) {
         guarded("providers", () => this.providers());
         guarded("executors", () => this.executors());
       } else {
-        unavailable.push({ section: "providers", reason: INSUFFICIENT_AUTHORITY });
-        unavailable.push({ section: "executors", reason: INSUFFICIENT_AUTHORITY });
+        deny("providers");
+        deny("executors");
       }
     }
     if (want.has("ATTENTION")) {
-      guarded("attention", () => this.attention(isAdmin, scope));
+      if (!verified) deny("attention");
+      else guarded("attention", () => this.attention(isAdmin, scope));
     }
     if (want.has("COST")) {
-      guarded("cost", () => this.cost(isAdmin, scope));
+      if (!verified) deny("cost");
+      else guarded("cost", () => this.cost(isAdmin, scope));
     }
     if (want.has("objectives_owned")) {
-      if (scope) {
-        guarded("objectives_owned", () => this.ownedObjectives(scope));
-      }
+      if (!verified) deny("objectives_owned");
+      else guarded("objectives_owned", () => this.ownedObjectives(scope!));
     }
 
     return {

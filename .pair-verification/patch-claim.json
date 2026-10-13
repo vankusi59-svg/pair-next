@@ -1,6 +1,6 @@
 {
   "claim_id": "PHASE1_OP_CHAT_AUTH_STATUS",
-  "title": "Phase 1 — trusted authorization + read-only operational status foundation for PAIR Chat",
+  "title": "Phase 1 — trusted authorization + read-only operational status foundation for PAIR Chat (Independent Audit R1 correction)",
   "affected_surfaces": [
     "MISSION_CONTROL",
     "CONVERSATION",
@@ -10,6 +10,7 @@
   ],
   "required_tests": [
     "src/__tests__/pair-phase1-operational-chat.test.ts",
+    "src/__tests__/pair-phase1-http-boundary.test.ts",
     "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
     "src/__tests__/pair-p15-8a-conversation-authority.test.ts",
     "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
@@ -23,6 +24,6 @@
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "BASE staging/pr59-safe@5b5ab73 (post Phase C merge). Adds the governed read-only status foundation behind ConversationReasoningService.observeOperatorContext: (1) TRUSTED BOUNDARY — mission-control-server classifies the presented credential via classifyRequestCredential(): the separate PAIR_MC_ADMIN_TOKEN (env-only via resolveMcAdminToken; never generated/persisted/defaulted; equal-to-MC-token disables the lane) mints an `admin` ConversationPrincipal, the MC token only ever mints `operator`, x-operator-id stays a claimed identity rebound to the verified session owner (normalizePrincipal), telegram ingress mints `telegram` — never admin. (2) NEW OperationalQueryService composes bounded STATUS envelopes over canonical store rows + MissionControl projections: intents (ACTIVE_WORK/PROVIDER_STATUS/ATTENTION/COST/GENERIC) via weighted bilingual phrase lexicon; admin gets global evidence, scoped principals get only canonically-proven scope (owner_authority_id objectives, BUSINESS_CREATED actor chain, work_open_binding-bound missions, own conversation drafts) — everything else reports unavailable:INSUFFICIENT_AUTHORITY; held/committed/settled microusd kept distinct, unpriced_dispatches never rendered as zero; integrity failures surface as integrity[] typed codes; sections capped before serialization and the prompt STATUS block is always valid JSON (over-bound → ENVELOPE_EXCEEDS_BOUND marker, never a sliced fragment). (3) INTEGRATION — hook receives {principal, session_id, committed latest_message, bounded context_tail}; it runs only after reply-idempotency replay and the stale-turn gate, mints zero missions/plans/drafts/executions, and mutates nothing. PAIR_PROPOSAL/draft/confirm/ack flows unchanged.",
+  "description": "R1 CORRECTION on BASE 5b5ab73 (audited HEAD 4c2118d; findings F1-F4). F1: scoped auth is default-deny — caller-claim-minted `operator` principals are UNVERIFIED (scoped sections report UNVERIFIED_IDENTITY); only admin (global) and telegram (ingress-verified own provenance) receive data. x-operator-id, session-owner claims, objective ownership and BUSINESS_CREATED chains are provenance inputs, never authority — forged-victim-id regression included. F2: PAIR_MC_ADMIN_TOKEN is bearer-only (never ?token=) and authenticates ONLY conversation create/read/turns; all other /api routes require the MC token (credentials/missions/budgets/config/drafts/confirms → 401). MC-token behavior unchanged. F3: ConversationTurnInput.read_only + status-intent check inside turn() structurally suppress proposal persistence before draft minting — proven over real HTTP with a PAIR_PROPOSAL-emitting model (zero drafts); normal proposal/confirm flows preserved. F4: resolveMcAdminToken requires explicit config, >=16 chars, entropy and non-static value; secret never logged/persisted. Bounded STATUS envelope semantics unchanged: bilingual intents, held/committed/settled distinct, integrity[] codes, valid-JSON ENVELOPE_EXCEEDS_BOUND degradation; hook runs only after replay + stale gates. New pair-phase1-http-boundary.test.ts proves F1-F3 over real HTTP.",
   "risk_override": "HIGH"
 }

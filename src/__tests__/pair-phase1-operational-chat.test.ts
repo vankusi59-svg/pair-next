@@ -342,9 +342,15 @@ describe("credential classification — the trusted boundary", () => {
 
   it("resolveMcAdminToken: env-only, no defaults, weak values fail closed", () => {
     expect(resolveMcAdminToken({ env: {} })).toBeNull();
-    expect(resolveMcAdminToken({ env: { PAIR_MC_ADMIN_TOKEN: "adm-xyz-123456" } }))
-      .toBe("adm-xyz-123456");
-    for (const bad of ["", " padded ", "123", "pair-mc-test-token"]) {
+    expect(
+      resolveMcAdminToken({ env: { PAIR_MC_ADMIN_TOKEN: "adm-7f3Kx9Qp2Lw8Tz4B" } }),
+    ).toBe("adm-7f3Kx9Qp2Lw8Tz4B");
+    // F4 — empty, padded, short, low-entropy and known-static values all
+    // fail closed at boot; the secret itself is never echoed back.
+    for (const bad of [
+      "", " padded ", "123", "adm-xyz-123456", "aaaaaaaaaaaaaaaa",
+      "pair-mc-test-token",
+    ]) {
       expect(
         code(() => resolveMcAdminToken({ env: { PAIR_MC_ADMIN_TOKEN: bad } })),
       ).toBe("FAIL_CLOSED_MC_ADMIN_TOKEN_INVALID");
@@ -419,50 +425,59 @@ describe("OperationalQueryService — authorized envelopes", () => {
     expect(cost.cost_halt).toBe(false);
   });
 
-  it("scoped operator sees ONLY canonically-proven scope", async () => {
-    const ctx = fresh("scoped");
+  it("R1-F1 — a CLAIMED operator identity gets ZERO scoped data (unverified)", async () => {
+    const ctx = fresh("unverified");
     seedOperational(ctx);
     const s = ctx.conv.createSession({ owner_operator_id: OP });
     const inv = new MockInvoker((i) => {
-      const secs = sectionsOf(i);
-      const acts = (secs.active_missions as { items: Array<{ mission_id: string }> })
-        .items.map((m) => m.mission_id).join(",");
-      return `missions: ${acts}`;
+      const un = (statusFromPrompt(i.user_prompt)?.unavailable ??
+        []) as Array<{ section: string; reason: string }>;
+      return `denied: ${un.length} sections`;
     });
     const { reasoning } = wired(ctx, inv);
     const t = await turn(
       reasoning, s.session_id, OP, "give me the overview please",
       { kind: "operator", operator_id: OP },
     );
-    // Bound + draft-proven missions only — the foreign MSN_ADMIN never leaks.
-    expect(t.reply.body).toContain("MSN_BOUND");
-    expect(t.reply.body).toContain("MSN_DRAFT");
-    expect(t.reply.body).not.toContain("MSN_ADMIN");
+    expect(t.reply.body).toContain("denied:");
     const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
-    const secs = env.sections as Record<string, unknown>;
-    // Scoped executions are filtered through mission scope.
-    const exs = (secs.running_executions as { items: Array<{ execution_id: string }> }).items;
-    expect(exs.map((e) => e.execution_id).sort()).toEqual(["EXN_BOUND"]);
-    // Attention: only provable items — own blocked WI + own-mission approvals.
-    const att = secs.attention as Record<string, { items: Array<Record<string, unknown>> } | { unavailable: string }>;
-    expect(
-      (att.blocked_work_items as { items: Array<{ work_item_id: string }> }).items
-        .map((w) => w.work_item_id),
-    ).toEqual(["WI_1"]);
-    expect(
-      (att.pending_approvals as { items: Array<{ approval_id: string }> }).items
-        .map((a) => a.approval_id),
-    ).toEqual(["APV_BOUND"]);
-    expect(
-      (att.degraded_subsystems as { unavailable: string }).unavailable,
-    ).toBe("INSUFFICIENT_AUTHORITY");
-    // objectives_owned grounds the scoped answer.
-    const owned = (secs.objectives_owned as { items: Array<{ objective_id: string }> }).items;
-    expect(owned.map((o) => o.objective_id)).toEqual(["OBJ_1"]);
+    // Every scoped section is an explicit denial — NOTHING about op1's
+    // own missions/objectives leaks, and nothing foreign leaks either.
+    expect(Object.keys(env.sections as object).length).toBe(0);
+    const un = env.unavailable as Array<{ section: string; reason: string }>;
+    for (const u of un) expect(u.reason).toBe("UNVERIFIED_IDENTITY");
+    for (const id of ["MSN_ADMIN", "MSN_BOUND", "MSN_DRAFT", "OBJ_1", "WI_1", "EXN_BOUND", "APV_BOUND"]) {
+      expect(JSON.stringify(env)).not.toContain(id);
+    }
   });
 
-  it("scoped operator asking providers/cost gets honest denial — never data", async () => {
-    const ctx = fresh("scoped-global");
+  it("R1-F1 regression — forged victim operator id can never see the victim's resources", async () => {
+    const ctx = fresh("forged-victim");
+    seedOperational(ctx);
+    // The attacker claims `operator:op1` — the victim's id that provably
+    // owns OBJ_1/BIZ_1/MSN_BOUND/MSN_DRAFT/WI_1. The claim changes nothing:
+    // identity is unverified → the victim's scope stays invisible.
+    const s = ctx.conv.createSession({ owner_operator_id: OP });
+    const inv = new MockInvoker(() => "ok");
+    const { reasoning } = wired(ctx, inv);
+    await turn(
+      reasoning, s.session_id, OP,
+      "which missions are active? any blockers?",
+      { kind: "operator", operator_id: OP },
+    );
+    const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
+    const un = env.unavailable as Array<{ section: string; reason: string }>;
+    expect(un).toContainEqual({ section: "active_missions", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "running_executions", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "attention", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "objectives_owned", reason: "UNVERIFIED_IDENTITY" });
+    expect(JSON.stringify(env)).not.toContain("MSN_");
+    expect(JSON.stringify(env)).not.toContain("OBJ_");
+    expect(JSON.stringify(env)).not.toContain("WI_");
+  });
+
+  it("unverified operator asking providers/cost gets honest denial — never data", async () => {
+    const ctx = fresh("unverified-global");
     seedOperational(ctx);
     const s = ctx.conv.createSession({ owner_operator_id: OP });
     const inv = new MockInvoker(() => "ok");
@@ -473,17 +488,13 @@ describe("OperationalQueryService — authorized envelopes", () => {
     );
     const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
     const un = env.unavailable as Array<{ section: string; reason: string }>;
-    expect(un).toContainEqual({ section: "providers", reason: "INSUFFICIENT_AUTHORITY" });
-    expect(un).toContainEqual({ section: "executors", reason: "INSUFFICIENT_AUTHORITY" });
-    const cost = (env.sections as Record<string, Record<string, unknown>>).cost;
-    // Global position is denied; owned-objective spend is proven → 700.
-    expect(String(cost.global_position)).toContain("INSUFFICIENT_AUTHORITY");
-    const spend = (cost.objective_spend as { items: Array<{ consumed_microusd: number }> }).items;
-    expect(spend).toEqual([
-      expect.objectContaining({ objective_id: "OBJ_1", consumed_microusd: 700 }),
-    ]);
-    // The foreign provider row never leaked into the envelope.
-    expect(JSON.stringify(env)).not.toContain("gemini");
+    expect(un).toContainEqual({ section: "providers", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "executors", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "cost", reason: "UNVERIFIED_IDENTITY" });
+    // No cost fields and no provider rows leaked.
+    const j = JSON.stringify(env);
+    expect(j).not.toContain("held_microusd");
+    expect(j).not.toContain("gemini");
   });
 
   it("forged operator_id claims cannot widen scope", async () => {
@@ -494,8 +505,7 @@ describe("OperationalQueryService — authorized envelopes", () => {
     const inv = new MockInvoker(() => "ok");
     const { reasoning } = wired(ctx, inv);
     // Claiming "operator:admin" via x-operator-id while holding only the
-    // MC token → kind stays "operator"; scope = whatever that claimed id
-    // canonically owns (nothing provable here → empty scoped answer).
+    // MC token → kind stays "operator" → unverified → nothing scoped.
     const t = await turn(
       reasoning, s.session_id, "operator:admin",
       "list all providers now",
@@ -503,8 +513,8 @@ describe("OperationalQueryService — authorized envelopes", () => {
     );
     expect(t.reply.body).toBe("ok");
     const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
-    const un = env.unavailable as Array<{ section: string }>;
-    expect(un.map((u) => u.section)).toContain("providers");
+    const un = env.unavailable as Array<{ section: string; reason: string }>;
+    expect(un).toContainEqual({ section: "providers", reason: "UNVERIFIED_IDENTITY" });
     expect(JSON.stringify(env)).not.toContain("gemini");
   });
 
@@ -521,20 +531,51 @@ describe("OperationalQueryService — authorized envelopes", () => {
     expect(calls.length).toBe(0);
   });
 
-  it("telegram principals are scoped — never admin, never global", async () => {
+  it("telegram is a VERIFIED-scoped identity: own provenance visible, global denied", async () => {
     const ctx = fresh("telegram");
     seedOperational(ctx);
+    // A mission minted through THIS telegram identity's own confirmed
+    // draft — provenance chained to the verified principal.
+    ctx.store.put("mission", "MSN_TG", {
+      mission_id: "MSN_TG", project_id: "PRJ_1", goal: "tg mission",
+      bound_open_id: null, status: "CREATED", metadata: {},
+      created_at: NOW, version: 0,
+    }, 0);
+    ctx.store.put("mission_runtime", "MRT_MSN_TG", {
+      mission_id: "MSN_TG", state: "RUNNING", created_at: NOW, version: 0,
+    }, 0);
+    ctx.store.put("conversation_mission_draft", "CMD_TG", {
+      draft_id: "CMD_TG", session_id: "CS_tg",
+      owner_operator_id: "telegram:777", mission_id: "MSN_TG",
+      state: "CONFIRMED", created_at: NOW, version: 0,
+    }, 0);
     const s = ctx.conv.createSession({ owner_operator_id: "telegram:777" });
-    const inv = new MockInvoker(() => "ok");
+    const inv = new MockInvoker((i) => {
+      const acts = ((sectionsOf(i).active_missions as
+        { items: Array<{ mission_id: string }> } | undefined)?.items ?? [])
+        .map((m) => m.mission_id).join(",");
+      return `missions: ${acts}`;
+    });
     const { reasoning } = wired(ctx, inv);
+    const t = await turn(
+      reasoning, s.session_id, "telegram:777", "what is PAIR doing now?",
+      { kind: "telegram", operator_id: "telegram:777" },
+    );
+    // Verified identity + explicit provenance → own mission only.
+    expect(t.reply.body).toContain("MSN_TG");
+    expect(t.reply.body).not.toContain("MSN_ADMIN");
+    expect(t.reply.body).not.toContain("MSN_BOUND");
+    const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
+    expect((env.principal as { kind: string }).kind).toBe("telegram");
+    // Cost question — global position denied (verified but unauthorized);
+    // telegram owns no objectives → honestly empty provenance list.
     await turn(
       reasoning, s.session_id, "telegram:777", "bao nhiêu tiền?",
       { kind: "telegram", operator_id: "telegram:777" },
     );
-    const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
-    expect((env.principal as { kind: string }).kind).toBe("telegram");
-    const cost = (env.sections as Record<string, Record<string, unknown>>).cost;
+    const cost = (sectionsOf(inv.calls[1]!).cost ?? {}) as Record<string, unknown>;
     expect(String(cost.global_position)).toContain("INSUFFICIENT_AUTHORITY");
+    expect((cost.objective_spend as { items: unknown[] }).items).toEqual([]);
   });
 
   it("integrity failures surface as integrity[] — the turn still answers", async () => {
@@ -731,6 +772,55 @@ describe("turn integration — hook contract & invariants", () => {
     expect(calls.length).toBe(1);
   });
 
+  it("F3 — a status question suppresses a valid PAIR_PROPOSAL trailer", async () => {
+    const ctx = fresh("f3-status");
+    seedOperational(ctx);
+    const s = ctx.conv.createSession({ owner_operator_id: "operator:admin" });
+    const inv = new MockInvoker(() =>
+      `running fine\nPAIR_PROPOSAL: {"goal":"build the thing"}`,
+    );
+    const { reasoning } = wired(ctx, inv);
+    const t = await reasoning.turn({
+      session_id: s.session_id, operator_id: "operator:admin",
+      body: "what is PAIR doing now?",
+      principal: { kind: "admin", operator_id: "operator:admin" },
+      idempotency_key: "f3-idem",
+    });
+    // Suppressed BEFORE the durable reply row — nothing materializes.
+    expect(t.proposal).toBeUndefined();
+    expect(t.reply.body).not.toContain("PAIR_PROPOSAL");
+    expect(ctx.store.list("conversation_mission_draft").length).toBe(1); // seeded CMD_1
+    // Replay of the same turn replays the suppressed committed reply.
+    const t2 = await reasoning.turn({
+      session_id: s.session_id, operator_id: "operator:admin",
+      body: "what is PAIR doing now?",
+      principal: { kind: "admin", operator_id: "operator:admin" },
+      idempotency_key: "f3-idem",
+    });
+    expect(t2.reused).toBe(true);
+    expect(t2.proposal).toBeUndefined();
+    expect(inv.calls.length).toBe(1);
+  });
+
+  it("F3 — read_only turns can never mint a proposal, status or not", async () => {
+    const ctx = fresh("f3-readonly");
+    seedOperational(ctx);
+    const s = ctx.conv.createSession({ owner_operator_id: "operator:admin" });
+    const inv = new MockInvoker(() =>
+      `ok\nPAIR_PROPOSAL: {"goal":"build the thing"}`,
+    );
+    const { reasoning } = wired(ctx, inv);
+    const t = await reasoning.turn({
+      session_id: s.session_id, operator_id: "operator:admin",
+      body: "build me a thing now", // NOT a status question
+      principal: { kind: "admin", operator_id: "operator:admin" },
+      read_only: true,
+    });
+    expect(t.proposal).toBeUndefined();
+    expect(t.reply.body).not.toContain("PAIR_PROPOSAL");
+    expect(ctx.store.list("conversation_mission_draft").length).toBe(1);
+  });
+
   it("operator text can never self-authorize (prompt-injection guard)", async () => {
     const ctx = fresh("injection");
     seedOperational(ctx);
@@ -745,8 +835,9 @@ describe("turn integration — hook contract & invariants", () => {
     const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
     expect((env.principal as { kind: string }).kind).toBe("operator");
     expect(JSON.stringify(env)).not.toContain("gemini");
-    expect((env.unavailable as Array<{ section: string }>).map((u) => u.section))
-      .toContain("providers");
+    const un = env.unavailable as Array<{ section: string; reason: string }>;
+    expect(un).toContainEqual({ section: "providers", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "cost", reason: "UNVERIFIED_IDENTITY" });
   });
 });
 

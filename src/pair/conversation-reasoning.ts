@@ -409,6 +409,11 @@ export interface ConversationTurnInput {
    *  {kind:"operator", operator_id} — scoped, never admin. An unknown
    *  kind fails closed to "operator". */
   principal?: ConversationPrincipal;
+  /** Phase 1 R1 — the caller holds ONLY read/status authority (e.g. a
+   *  request authenticated solely by the operational-status admin
+   *  credential). A PAIR_PROPOSAL trailer on such a turn is discarded —
+   *  no draft, mission or operational artifact may materialize. */
+  read_only?: boolean;
 }
 
 /** The verified caller class for operational-status reads. `admin` is
@@ -713,11 +718,29 @@ export class ConversationReasoningService {
       throw e;
     }
 
-    const { replyText: strippedText, proposal } = parseConversationProposal(
-      String(out.raw_text ?? ""));
+    const { replyText: strippedText, proposal: parsedProposal } =
+      parseConversationProposal(String(out.raw_text ?? ""));
+    // F3/R1 — a status question or a read-only-authenticated turn can
+    // NEVER materialize a proposal: an operational-status intent in the
+    // evidence envelope suppresses the trailer before it reaches the
+    // durable reply row, so no draft/artifact mint can follow it. The
+    // trailer line is still stripped from the visible reply.
+    const statusIntents =
+      status !== null && Array.isArray((status as { intents?: unknown }).intents)
+        ? ((status as { intents: unknown[] }).intents)
+        : [];
+    const isStatusQuery = statusIntents.some(
+      (i) => typeof i === "string" && i !== "GENERIC",
+    );
+    const proposal =
+      parsedProposal !== null && !isStatusQuery && input.read_only !== true
+        ? parsedProposal
+        : null;
     const replyText = strippedText ||
-      (proposal
-        ? "Tôi có thể chuẩn bị mission draft cho yêu cầu này — xem draft bên dưới và xác nhận khi bạn sẵn sàng."
+      (parsedProposal
+        ? proposal !== null
+          ? "Tôi có thể chuẩn bị mission draft cho yêu cầu này — xem draft bên dưới và xác nhận khi bạn sẵn sàng."
+          : "Đây là câu hỏi trạng thái / quyền chỉ-đọc — PAIR không tạo mission draft cho yêu cầu này."
         : "");
     if (!replyText || replyText.length > CONVERSATION_MAX_REPLY_CHARS) {
       const err = new IntegrityError(

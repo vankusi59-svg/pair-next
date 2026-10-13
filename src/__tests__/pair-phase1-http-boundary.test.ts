@@ -1,0 +1,390 @@
+/* Phase 1 R1 — HTTP-boundary proofs for the operational-status
+ * authorization contract, exercised through the REAL
+ * createMissionControlServer HTTP surface with a mocked conversation
+ * invoker (zero model calls).
+ *
+ * F1 — a forged `x-operator-id` naming a VICTIM who owns real canonical
+ *      resources can never read that victim's scope: the claimed identity
+ *      is unverified, so every scoped section is `UNVERIFIED_IDENTITY`.
+ * F2 — the PAIR_MC_ADMIN_TOKEN credential authenticates ONLY the
+ *      operational-status boundary (conversation create/read/turns).
+ *      Credentials/missions/budgets/drafts/confirms and every other /api
+ *      route still require the MC token; `?token=` can never carry the
+ *      admin credential.
+ * F3 — a pure status question can NEVER materialize a mission draft —
+ *      even when the model emits a valid PAIR_PROPOSAL trailer — and an
+ *      admin-only (read_only) turn can never mint one either, while the
+ *      normal proposal→draft flow on an MC-token turn still works.
+ */
+
+import { describe, it, expect, afterAll } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import {
+  ApprovalQueue,
+  BusinessLayer,
+  ConversationReasoningService,
+  ConversationSessionService,
+  createMissionControlServer,
+  ensureConversationModel,
+  ExecutorRegistry,
+  GovernedTaskGate,
+  MissionControl,
+  MissionDraftService,
+  MissionObservability,
+  MissionRouter,
+  MissionRuntime,
+  MissionScheduler,
+  MissionScheduleService,
+  MissionSupervisor,
+  OperationalQueryService,
+  PairControlPlane,
+  PairEvidenceStore,
+  ReconciliationService,
+  RecoveryController,
+  WorkforceService,
+  type ConversationInvokeInput,
+  type ConversationInvokeResult,
+  type ConversationInvoker,
+} from "../pair/index.js";
+
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-phase1-http-"));
+let counter = 0;
+const NOW = "2026-10-20T00:00:00.000Z";
+const OP = "op1"; // the VICTIM — owns real canonical resources
+const TOK = "mc-token-aaaaaaaaaaaaaaaa";
+const ADM = "adm-7f3Kx9Qp2Lw8Tz4B";
+const servers: Server[] = [];
+afterAll(() => {
+  for (const s of servers) s.close();
+});
+
+class MockInvoker implements ConversationInvoker {
+  calls: ConversationInvokeInput[] = [];
+  constructor(private fn: (i: ConversationInvokeInput) => string = () => "ok") {}
+  async invoke(input: ConversationInvokeInput): Promise<ConversationInvokeResult> {
+    this.calls.push(input);
+    return {
+      model_entry_id: input.transport.model_entry_id,
+      provider_id: input.transport.provider_id,
+      model_id: input.transport.model_id,
+      raw_text: this.fn(input),
+    };
+  }
+}
+
+function statusFromPrompt(userPrompt: string): Record<string, unknown> | null {
+  const m = userPrompt.match(
+    /STATUS \(authorized read-only evidence\):\n(\{[\s\S]*?\})\n\nCONVERSATION/,
+  );
+  return m ? (JSON.parse(m[1]!) as Record<string, unknown>) : null;
+}
+
+function fresh(name: string, responder?: (i: ConversationInvokeInput) => string) {
+  const dir = path.join(ROOT, `${counter++}-${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
+  const store = new PairEvidenceStore(path.join(dir, "pair.db"));
+  const service = new PairControlPlane(store);
+  const gate = new GovernedTaskGate(service);
+  const registry = new ExecutorRegistry(service);
+  const router = new MissionRouter(service, gate);
+  const recovery = new RecoveryController(service);
+  const recon = new ReconciliationService(service, new Map());
+  const approvals = new ApprovalQueue(service);
+  const scheduler = new MissionScheduler(service, { mission_concurrency: 2 });
+  const planner = () => ({
+    tasks: [
+      {
+        task_key: "T1",
+        title: "t1",
+        task_instruction: "t1",
+        required_capabilities: ["FILE_OPERATIONS"],
+        depends_on: [],
+      },
+    ],
+  });
+  const runtime = new MissionRuntime({
+    service, gate, router, adapters: new Map(), scheduler, approvals,
+    reconciliation: recon, recovery, planner,
+  });
+  const supervisor = new MissionSupervisor(service, runtime, recovery, recon);
+  const observability = new MissionObservability(service);
+  const control = new MissionControl({
+    service, runtime, supervisor, scheduler, approvals,
+    reconciliation: recon, observability, planner,
+  });
+  const schedules = new MissionScheduleService(service);
+  const biz = new BusinessLayer({ store, control, schedules });
+  const wf = new WorkforceService({ store, business: biz });
+  service.registerCapability("FILE_OPERATIONS", { risk_class: "LOW" });
+  service.createProject({ name: "p", root_location: workspace });
+  const sessions = new ConversationSessionService(store);
+  const invoker = new MockInvoker(responder);
+  const ops = new OperationalQueryService({
+    store, control, now: () => NOW,
+  });
+  const reasoning = new ConversationReasoningService({
+    conversation: sessions,
+    store,
+    invoker,
+    model_entry_id: ensureConversationModel(store),
+    observeOperatorContext: (req) => ops.statusForConversation(req),
+  });
+  const drafts = new MissionDraftService({
+    conversation: sessions, control, store,
+    planExpander: async (input) => ({ input }),
+  });
+  return {
+    store, control, biz, wf, invoker,
+    conversation: { sessions, reasoning, drafts },
+  };
+}
+
+/** The VICTIM's canonical footprint — real resources op1 provably owns. */
+function seedVictimResources(store: PairEvidenceStore) {
+  const put = (entity: string, id: string, row: Record<string, unknown>) =>
+    store.put(entity, id, { version: 0, ...row }, 0);
+  put("business", "BIZ_V", {
+    business_id: "BIZ_V", name: "victim co", project_id: "PRJ_1",
+    status: "ACTIVE", created_at: NOW,
+  });
+  store.event({
+    entity_type: "business", entity_id: "BIZ_V",
+    event_type: "BUSINESS_CREATED", new_state: "ACTIVE",
+    actor: `operator:${OP}`, metadata: { name: "victim co" },
+  });
+  put("objective", "OBJ_V", {
+    objective_id: "OBJ_V", business_id: "BIZ_V",
+    owner_authority_id: `operator:${OP}`, title: "victim objective",
+    status: "ACTIVE", created_at: NOW,
+    budget: { ceiling_microusd: 1000, consumed_microusd: 700 },
+  });
+  put("mission", "MSN_V", {
+    mission_id: "MSN_V", project_id: "PRJ_1", goal: "victim mission",
+    bound_open_id: "OPI_V", status: "CREATED", metadata: {}, created_at: NOW,
+  });
+  put("mission_runtime", "MRT_MSN_V", {
+    mission_id: "MSN_V", state: "RUNNING", created_at: NOW,
+  });
+  put("work_open_binding", "OPI_V", {
+    open_id: "OPI_V", mission_id: "MSN_V", work_item_id: "WI_V",
+    business_id: "BIZ_V", project_id: "PRJ_1", state: "BOUND",
+    created_at: NOW,
+  });
+  put("work_item", "WI_V", {
+    work_item_id: "WI_V", business_id: "BIZ_V", title: "victim blocked",
+    status: "BLOCKED", created_at: NOW,
+  });
+  put("provider", "PRV_V", {
+    provider_id: "gemini", lifecycle_state: "ACTIVE",
+    auth_state: "AUTH_OK", probe_state: "REACHABLE",
+    health_state: "READY", created_at: NOW,
+  });
+}
+
+async function serve(s: ReturnType<typeof fresh>) {
+  const server = createMissionControlServer({
+    control: s.control,
+    business: s.biz,
+    workforce: s.wf,
+    store: s.store,
+    authToken: TOK,
+    adminToken: ADM,
+    conversation: s.conversation,
+  });
+  await new Promise<void>((r) => server.listen(0, r));
+  servers.push(server);
+  return (server.address() as AddressInfo).port;
+}
+
+const hdr = (extra: Record<string, string> = {}) => ({
+  "content-type": "application/json",
+  "x-operator-id": OP,
+  authorization: `Bearer ${TOK}`,
+  ...extra,
+});
+const get = (port: number, p: string, h?: Record<string, string>) =>
+  fetch(`http://127.0.0.1:${port}${p}`, { headers: h ?? hdr() });
+const post = (
+  port: number,
+  p: string,
+  body: Record<string, unknown>,
+  h?: Record<string, string>,
+) =>
+  fetch(`http://127.0.0.1:${port}${p}`, {
+    method: "POST",
+    headers: h ?? hdr(),
+    body: JSON.stringify(body),
+  });
+const json = async (r: Response) => ({ status: r.status, body: await r.json() as never });
+
+async function newSession(port: number, h: Record<string, string>): Promise<string> {
+  const r = await post(port, "/api/conversations", {}, h);
+  const j = await json(r);
+  expect(j.status).toBe(200);
+  return String((j.body as { session: { session_id: string } }).session.session_id);
+}
+
+const adminHdr = (extra: Record<string, string> = {}) => ({
+  "content-type": "application/json",
+  "x-operator-id": "operator:admin",
+  authorization: `Bearer ${ADM}`,
+  ...extra,
+});
+
+/* ===================================================================== */
+
+describe("F2 — the admin credential is NOT a general API token", () => {
+  it("admin token authenticates ONLY the operational-status boundary", async () => {
+    const s = fresh("f2-boundary");
+    seedVictimResources(s.store);
+    const port = await serve(s);
+
+    // Boundary ALLOWED: conversation create + turns with the admin bearer.
+    const sid = await newSession(port, adminHdr());
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "what is PAIR doing now?" }, adminHdr()),
+    );
+    expect(t.status).toBe(200);
+    const env = statusFromPrompt(s.invoker.calls[0]!.user_prompt)!;
+    expect((env.principal as { kind: string }).kind).toBe("admin");
+    // Global evidence present: the victim's mission is admin-visible.
+    expect(JSON.stringify(env)).toContain("MSN_V");
+
+    // Boundary DENIED: every other route requires the MC token.
+    for (const p of ["/api/missions", "/api/cost", "/api/providers", "/api/credentials", "/api/approvals"]) {
+      const r = await get(port, p, adminHdr());
+      expect(r.status, `GET ${p}`).toBe(401);
+    }
+    for (const p of ["/api/missions", "/api/credentials", "/api/businesses", "/api/cost-policies"]) {
+      const r = await post(port, p, {}, adminHdr());
+      expect(r.status, `POST ${p}`).toBe(401);
+    }
+    // Draft/confirm surface is outside the status boundary too.
+    const rDraft = await post(port, `/api/conversations/${sid}/drafts`, { goal: "x" }, adminHdr());
+    expect(rDraft.status).toBe(401);
+    const rClose = await post(port, `/api/conversations/${sid}/close`, {}, adminHdr());
+    expect(rClose.status).toBe(401);
+
+    // MC token still authenticates the general surface (unchanged).
+    expect((await get(port, "/api/missions")).status).toBe(200);
+    expect((await get(port, "/api/cost")).status).toBe(200);
+    expect((await get(port, "/api/providers")).status).toBe(200);
+  });
+
+  it("the admin credential can NEVER arrive via ?token=", async () => {
+    const s = fresh("f2-query");
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port, adminHdr());
+    // Query-token alone (no bearer) — the gate sees no MC token → 401.
+    const noBearer = { "content-type": "application/json", "x-operator-id": "operator:admin" };
+    const r1 = await post(port, `/api/conversations/${sid}/turns?token=${ADM}`, { body: "status?" }, noBearer);
+    expect(r1.status).toBe(401);
+    // Valid MC bearer + admin token in the query → authenticated as
+    // OPERATOR; the query admin credential is ignored entirely.
+    const t2 = await post(
+      port, `/api/conversations/${sid}/turns?token=${ADM}`,
+      { body: "what is PAIR doing?" }, hdr({ "x-operator-id": "operator:admin" }),
+    );
+    const j2 = await json(t2);
+    expect(j2.status).toBe(200);
+    const env = statusFromPrompt(s.invoker.calls[0]!.user_prompt)!;
+    expect((env.principal as { kind: string }).kind).toBe("operator");
+    expect(JSON.stringify(env)).not.toContain("MSN_V");
+  });
+});
+
+describe("F1 — forged victim operator id can never see victim resources", () => {
+  it("claimed x-operator-id over HTTP gets zero scoped operational data", async () => {
+    const s = fresh("f1-forged");
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    // The attacker holds only the MC token and claims the victim's id.
+    const sid = await newSession(port);
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "which missions are active? any blockers?" }, hdr()),
+    );
+    expect(t.status).toBe(200);
+    const env = statusFromPrompt(s.invoker.calls[0]!.user_prompt)!;
+    const un = env.unavailable as Array<{ section: string; reason: string }>;
+    expect(un).toContainEqual({ section: "active_missions", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "attention", reason: "UNVERIFIED_IDENTITY" });
+    // Zero leakage of the victim's ids into the model-visible envelope.
+    const j = JSON.stringify(env);
+    for (const id of ["MSN_V", "OBJ_V", "WI_V", "BIZ_V", "OPI_V"]) {
+      expect(j).not.toContain(id);
+    }
+    // And the visible reply carries nothing either (model echoes 'ok').
+    expect((t.body as { reply: { body: string } }).reply.body).not.toContain("MSN_V");
+    // Zero writes beyond conversation rows.
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+    expect(s.store.list("mission").length).toBe(1); // only the seeded one
+  });
+});
+
+describe("F3 — a status turn can never materialize a mission draft", () => {
+  it("status question + valid PAIR_PROPOSAL trailer → proposal suppressed, zero drafts", async () => {
+    const s = fresh("f3-status", () =>
+      `running fine\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port, adminHdr());
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "what is PAIR doing now?" }, adminHdr()),
+    );
+    expect(t.status).toBe(200);
+    const body = t.body as { proposal?: unknown; reply: { body: string } };
+    // The trailer was parsed out of the visible reply — and the proposal
+    // was suppressed BEFORE persistence, so no draft materialized.
+    expect(body.reply.body).not.toContain("PAIR_PROPOSAL");
+    expect(body.proposal === undefined || body.proposal === null).toBe(true);
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+    expect(s.store.list("mission").length).toBe(1);
+  });
+
+  it("normal mission flow preserved — a non-status message still mints a draft", async () => {
+    const s = fresh("f3-normal", () =>
+      `vâng, chuẩn bị draft\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port);
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "hãy build một reporting pipeline cho tôi" }, hdr()),
+    );
+    expect(t.status).toBe(200);
+    const body = t.body as {
+      proposal?: { goal: string; draft?: { draft_id: string } };
+    };
+    expect(body.proposal?.goal).toBe("build a reporting pipeline");
+    expect(body.proposal?.draft?.draft_id).toMatch(/^MDR_/);
+    expect(s.store.list("conversation_mission_draft").length).toBe(1);
+  });
+
+  it("admin-only (read_only) turns suppress proposals even for actionable text", async () => {
+    const s = fresh("f3-admin-ro", () =>
+      `ok\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port, adminHdr());
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "build a reporting pipeline for me" }, adminHdr()),
+    );
+    expect(t.status).toBe(200);
+    const body = t.body as { proposal?: unknown };
+    expect(body.proposal === undefined || body.proposal === null).toBe(true);
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+  });
+});

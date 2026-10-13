@@ -108,6 +108,10 @@ export function resolveMcToken(
  * NOTE: the caller MUST verify the resolved value differs from the MC
  * token — the boundary classifier also refuses the equality case.
  */
+/** Minimum length for the operational-status admin credential — an
+ *  authority-bearing secret must never be trivially guessable. */
+export const MC_ADMIN_TOKEN_MIN_LEN = 16;
+
 export function resolveMcAdminToken(
   opts: { env?: EnvLike } = {},
 ): string | null {
@@ -115,10 +119,19 @@ export function resolveMcAdminToken(
   const raw = env[MC_ADMIN_TOKEN_ENV];
   if (raw === undefined) return null;
   const token = String(raw);
-  if (token.trim() === "" || token !== token.trim() || KNOWN_STATIC_TOKENS.has(token)) {
+  // F4 — fail closed on any weak/malformed value. The token itself is
+  // never logged, persisted or echoed — the error names the RULE, not
+  // the secret.
+  if (
+    token.trim() === "" ||
+    token !== token.trim() ||
+    token.length < MC_ADMIN_TOKEN_MIN_LEN ||
+    new Set(token).size < 4 ||
+    KNOWN_STATIC_TOKENS.has(token)
+  ) {
     throw new IntegrityError(
       "FAIL_CLOSED_MC_ADMIN_TOKEN_INVALID",
-      `${MC_ADMIN_TOKEN_ENV}: empty, whitespace-padded or known-static token`,
+      `${MC_ADMIN_TOKEN_ENV}: missing entropy — must be a distinct secret ≥${MC_ADMIN_TOKEN_MIN_LEN} chars`,
     );
   }
   return token;
