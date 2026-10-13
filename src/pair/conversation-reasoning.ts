@@ -409,10 +409,14 @@ export interface ConversationTurnInput {
    *  {kind:"operator", operator_id} — scoped, never admin. An unknown
    *  kind fails closed to "operator". */
   principal?: ConversationPrincipal;
-  /** Phase 1 R1 — the caller holds ONLY read/status authority (e.g. a
-   *  request authenticated solely by the operational-status admin
-   *  credential). A PAIR_PROPOSAL trailer on such a turn is discarded —
-   *  no draft, mission or operational artifact may materialize. */
+  /** Phase 1 R1/R3 — the turn holds ONLY read/status authority. Derived
+   *  by the trusted request boundary (e.g. a request authenticated solely
+   *  by the operational-status admin credential) OR declared explicitly
+   *  by the caller via the request contract (`read_only: true` — a
+   *  caller may only narrow its own authority, never widen it). The
+   *  flag suppresses actionable proposal authority on both fresh turns
+   *  and committed replays: a PAIR_PROPOSAL trailer is discarded — no
+   *  draft, mission or operational artifact may materialize. */
   read_only?: boolean;
 }
 
@@ -625,7 +629,12 @@ export class ConversationReasoningService {
       // F-R1 — the proposal outcome is DURABLE on the reply row, so a
       // replay recovers the same proposal without a second model call.
       // It is untrusted descriptive state — never authority.
-      return p.proposal
+      // R3-F1 — the read_only gate applies to the REPLAY too: a caller
+      // holding only read/status authority must not receive actionable
+      // proposal authority from a committed reply. The durable row is
+      // unchanged (history is not rewritten) — only the returned
+      // actionable surface is suppressed for this request.
+      return p.proposal && input.read_only !== true
         ? { message, reply: p, reused: true, proposal: p.proposal }
         : { message, reply: p, reused: true };
     }

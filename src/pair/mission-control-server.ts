@@ -1703,11 +1703,19 @@ export function createMissionControlServer(
               kind: adminBearer ? "admin" : "operator",
               operator_id: operator,
             },
-            // F2/F3 — a request authenticated ONLY by the admin
-            // credential is status-read authority: it can never
-            // materialize a mission draft or any other write. (A caller
-            // who also presents the MC token keeps the normal flow.)
-            read_only: adminBearer && !mcAuthenticated,
+            // F2/F3 + R3 — read_only separates read-query purpose from
+            // mission-creation purpose. It is set when (a) the request
+            // is authenticated ONLY by the admin credential (status-read
+            // authority — it can never materialize a draft or any other
+            // write), or (b) the caller explicitly declares
+            // `read_only: true` in the request contract. The declared
+            // flag can only NARROW the caller's own authority — it can
+            // never widen it (OR-ed, never substituted for credential
+            // checks). (A caller who also presents the MC token keeps
+            // the normal proposal flow when it does not opt out.)
+            read_only:
+              (adminBearer && !mcAuthenticated) ||
+              body.read_only === true,
             body: String(body.body ?? ""),
             idempotency_key: body.idempotency_key === undefined
               ? undefined : String(body.idempotency_key),

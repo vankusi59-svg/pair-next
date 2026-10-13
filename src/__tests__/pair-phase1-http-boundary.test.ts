@@ -24,6 +24,14 @@
  *      suppress for ANY wording (false-negative proof), and an MC-token
  *      mission request that merely MENTIONS provider/cost topics still
  *      mints its draft (false-positive proof).
+ *
+ * R3-F1 — the read_only gate covers the REPLAY path too: a committed
+ *      proposal-bearing reply retried under admin-only read authority
+ *      surfaces no actionable proposal and mints nothing, while an
+ *      authorized MC replay still performs crash-recovery minting.
+ * R3-F2 — `read_only: true` is the explicit request contract separating
+ *      read-query purpose from mission-creation purpose on the MC lane;
+ *      a caller may only narrow its own authority, never widen it.
  */
 
 import { describe, it, expect, afterAll } from "vitest";
@@ -482,6 +490,112 @@ describe("R2-F2 — proposal suppression is authority-derived, not topic-derived
     };
     expect(body.proposal?.goal).toBe("build a reporting pipeline via gemini");
     expect(body.proposal?.draft?.draft_id).toMatch(/^MDR_/);
+    expect(s.store.list("conversation_mission_draft").length).toBe(1);
+  });
+});
+
+describe("R3-F1 — a read-only retry can never resurrect committed proposal authority", () => {
+  it("crash window: committed proposal + admin-only replay → zero drafts; authorized replay still recovers", async () => {
+    const s = fresh("r3-replay", () =>
+      `ok\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port);
+    // CRASH WINDOW — the turn commits a proposal-bearing reply through
+    // the reasoning service directly, so the route's draft mint never ran.
+    const t0 = await s.conversation.reasoning.turn({
+      session_id: sid, operator_id: OP,
+      principal: { kind: "operator", operator_id: OP },
+      body: "build a reporting pipeline for me",
+      idempotency_key: "r3-k1",
+    });
+    expect(t0.proposal?.goal).toBe("build a reporting pipeline");
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+
+    // Replay the SAME session/message/key through admin-only read
+    // authority: the durable proposal must NOT be surfaced — no
+    // actionable authority, zero drafts, zero missions.
+    const r1 = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "build a reporting pipeline for me", idempotency_key: "r3-k1" },
+        adminHdr({ "x-operator-id": OP })),
+    );
+    expect(r1.status).toBe(200);
+    expect((r1.body as { reused?: boolean }).reused).toBe(true);
+    const p1 = (r1.body as { proposal?: unknown }).proposal;
+    expect(p1 === undefined || p1 === null).toBe(true);
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+    expect(s.store.list("mission").length).toBe(1); // seeded only
+
+    // Normal authorized crash-recovery preserved: an MC-token replay of
+    // the same turn still surfaces the proposal and the idempotent mint
+    // converges onto the draft.
+    const r2 = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "build a reporting pipeline for me", idempotency_key: "r3-k1" }, hdr()),
+    );
+    expect(r2.status).toBe(200);
+    const p2 = (r2.body as {
+      proposal?: { goal: string; draft?: { draft_id: string } };
+    }).proposal;
+    expect(p2?.goal).toBe("build a reporting pipeline");
+    expect(p2?.draft?.draft_id).toMatch(/^MDR_/);
+    expect(s.store.list("conversation_mission_draft").length).toBe(1);
+  });
+});
+
+describe("R3-F2 — explicit read_only request contract on the MC lane", () => {
+  it("pure status request with read_only:true + proposal trailer → zero drafts", async () => {
+    const s = fresh("r3-mc-ro", () =>
+      `all running\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port);
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "what is PAIR doing now?", read_only: true }, hdr()),
+    );
+    expect(t.status).toBe(200);
+    const b = t.body as { proposal?: unknown; reply: { body: string } };
+    expect(b.reply.body).not.toContain("PAIR_PROPOSAL");
+    expect(b.proposal === undefined || b.proposal === null).toBe(true);
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+    expect(s.store.list("mission").length).toBe(1);
+  });
+
+  it("declared read_only wins over actionable wording — purpose is the contract", async () => {
+    const s = fresh("r3-mc-ro2", () =>
+      `ok\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port);
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "build a reporting pipeline for me", read_only: true }, hdr()),
+    );
+    expect(t.status).toBe(200);
+    const b = t.body as { proposal?: unknown };
+    expect(b.proposal === undefined || b.proposal === null).toBe(true);
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+  });
+
+  it("absent read_only keeps the governed draft flow — mixed ops wording does not revoke", async () => {
+    const s = fresh("r3-mc-rw", () =>
+      `vâng\nPAIR_PROPOSAL: {"goal":"pipeline with gemini provider, watch cost"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port);
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "build a pipeline using the gemini provider and track cost" }, hdr()),
+    );
+    expect(t.status).toBe(200);
+    const b = t.body as { proposal?: { draft?: { draft_id: string } } };
+    expect(b.proposal?.draft?.draft_id).toMatch(/^MDR_/);
     expect(s.store.list("conversation_mission_draft").length).toBe(1);
   });
 });
