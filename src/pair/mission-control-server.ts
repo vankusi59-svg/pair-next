@@ -23,6 +23,7 @@ import type { PairEvidenceStore } from "./store.js";
 import type { CeoDecisionInvoker } from "./ceo-decision.js";
 import type { ConversationSessionService } from "./conversation-session.js";
 import type { ConversationReasoningService } from "./conversation-reasoning.js";
+import { classifyRequestCredential } from "./operational-query.js";
 import type { MissionDraftService } from "./mission-draft.js";
 import { resolveProposalProject } from "./mission-draft.js";
 import type { TelegramConversationService } from "./telegram-conversation.js";
@@ -66,6 +67,15 @@ export interface MissionControlServerDeps {
    * and ask for the token. Unset → no gate (local dev default).
    */
   authToken?: string;
+  /**
+   * Phase 1 — the SEPARATE operational-status admin credential
+   * (PAIR_MC_ADMIN_TOKEN). A request presenting it is minted an `admin`
+   * principal for the conversation status hook; the MC token alone can
+   * NEVER produce admin (when the two values are equal the admin lane is
+   * disabled outright). Unset → every caller is scoped. The token gates
+   * read-only status evidence only — it changes nothing else about the
+   * request's authority. */
+  adminToken?: string;
   /**
    * Narrow-scope token for `POST /api/outbox` — remote executors push binary
    * deliverables (chart screenshots, report files) with
@@ -402,10 +412,28 @@ export function createMissionControlServer(
     const isOutboxUpload = method === "POST" && p === "/api/outbox";
     const isBrokerFetch = method === "POST" && p === "/api/broker/fetch";
     const isArtifactFetch = method === "POST" && p === "/api/artifacts/fetch";
+    const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+    const queryToken = url.searchParams.get("token") ?? "";
+    // Phase 1 — credential class: "admin" (separate admin token),
+    // "operator" (MC token) or "anonymous". The MC token NEVER produces
+    // admin; when adminToken === authToken the admin lane is disabled
+    // inside the classifier itself. Either channel may carry the
+    // credential — the gate's original OR-semantics are preserved
+    // (a wrong bearer alongside a valid ?token= still authenticates).
+    const classOf = (credential: string) =>
+      classifyRequestCredential({
+        credential,
+        authToken: deps.authToken,
+        adminToken: deps.adminToken,
+      });
+    const bc = classOf(bearer);
+    const qc = classOf(queryToken);
+    const authClass =
+      bc === "admin" || qc === "admin" ? "admin"
+        : bc === "operator" || qc === "operator" ? "operator"
+          : "anonymous";
     if (deps.authToken && p.startsWith("/api/") && !isOutboxUpload && !isBrokerFetch && !isArtifactFetch) {
-      const bearer = String(req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-      const q = url.searchParams.get("token") ?? "";
-      if (bearer !== deps.authToken && q !== deps.authToken) {
+      if (authClass === "anonymous") {
         res.writeHead(401, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "UNAUTHORIZED_MC_TOKEN" }));
         return;
@@ -1657,6 +1685,14 @@ export function createMissionControlServer(
           const out = await conv.reasoning.turn({
             session_id: m[1]!,
             operator_id: operator,
+            // Phase 1 — the verified principal for the status hook. Only
+            // the credential class minted at THIS boundary can produce
+            // "admin"; `x-operator-id` is a claimed identity used for
+            // session ownership/scoping, never for privilege.
+            principal: {
+              kind: authClass === "admin" ? "admin" : "operator",
+              operator_id: operator,
+            },
             body: String(body.body ?? ""),
             idempotency_key: body.idempotency_key === undefined
               ? undefined : String(body.idempotency_key),

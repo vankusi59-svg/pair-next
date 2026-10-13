@@ -44,6 +44,7 @@ import {
   providerEntryId,
   type ConversationInvokeInput,
   type ConversationInvoker,
+  type OperatorContextRequest,
 } from "../pair/index.js";
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p158b-"));
@@ -95,7 +96,7 @@ function reasoning(
   ctx: Ctx,
   invoker: ConversationInvoker,
   extra: {
-    observeOperatorContext?: (op: string) => Record<string, unknown> | null;
+    observeOperatorContext?: (ctx: OperatorContextRequest) => Record<string, unknown> | null;
     timeout_ms?: number;
   } = {},
 ): ConversationReasoningService {

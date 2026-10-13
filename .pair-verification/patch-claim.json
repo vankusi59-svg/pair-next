@@ -1,24 +1,28 @@
 {
-  "claim_id": "PHASE_C_AUDIT_R2_CLOSURE",
-  "title": "Phase C audit R2 — three residual findings closed on top of the R1 audit fixes",
+  "claim_id": "PHASE1_OP_CHAT_AUTH_STATUS",
+  "title": "Phase 1 — trusted authorization + read-only operational status foundation for PAIR Chat",
   "affected_surfaces": [
-    "PLANNER",
-    "BUSINESS_OBJECTIVE",
-    "MISSION_CONTROL"
+    "MISSION_CONTROL",
+    "CONVERSATION",
+    "MISSION_DRAFT",
+    "TELEGRAM_INGRESS",
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-phase-c-audit-r2.test.ts",
-    "src/__tests__/pair-phase-c-audit-r1.test.ts",
-    "src/__tests__/pair-phase-c-unified-planner.test.ts",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts"
+    "src/__tests__/pair-phase1-operational-chat.test.ts",
+    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
+    "src/__tests__/pair-p15-8a-conversation-authority.test.ts",
+    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
+    "src/__tests__/pair-p15-8d-web-chat.test.ts",
+    "src/__tests__/pair-p15-8e-telegram.test.ts",
+    "src/__tests__/pair-p15-8f-proposal.test.ts",
+    "src/__tests__/pair-p15-8e-bridge-e2e.test.ts"
   ],
   "invariants": [
-    "INV_PLAN_001",
-    "INV_DELIVERY_001",
-    "INV_DELIVERY_002",
-    "INV_REPLAY_001",
-    "INV_MISSION_001"
+    "INV_CONV_001",
+    "INV_MISSION_001",
+    "INV_SECRETS_001"
   ],
-  "description": "Audit R2 closure for PR #113 (BASE staging/pr59-safe@69d1c9b, on top of R1 commit 2f2671c). R2-F1: planner monetary admission now prices the COMPLETE per-candidate provider-request envelope via the new shared plannerCandidateRequestBound() exported from planner-pool.ts — codex_cli candidates bound at 6 (INITIAL+REASK plan calls + 2 eligibility re-proofs x 2 possible qualification-refresh probes), HTTP/LLM candidates at 3 (2 internal INITIAL requests + 1 REASK); serve-mission-control.mjs replaces the legacy (INITIAL+REASK=2) hand-derived multiplier with this structural constant so a METERED_API reserve prices worst-case spend (100u x 6 = 600u) and admission can never under-reserve. R2-F2: codex qualification/refresh probes consume the ONE run deadline — runPlannerFailover passes its absolute deadlineMs as runCtx into assertEligible (both the pre-INITIAL and pre-REASK re-proof); serve-mission-control threads it into refreshCodexPlannerQualification, which fails closed with typed FAIL_CLOSED_PLANNER_DEADLINE before any probe can start at/after the deadline, min()s each probe timeout against the remaining window, and honestly counts only probes that provably initiated (partial spend); provider-validation.ts propagates FAIL_CLOSED_* authority-typed probe errors instead of fabricating UNREACHABLE probe_state evidence for a probe that never ran. R2-F3: BusinessLayer.prepareDelegatedPlan now runs assertBudgetHeadroom — a strictly read-only re-application of reserveBudget()'s scope/period/usage scan over missions + live HELD reservations — BEFORE deps.planExpander, so a definitely-exhausted hard-stop mission-count budget rejects with FAIL_CLOSED_BUDGET_EXCEEDED at zero planner calls and zero reservation writes; the atomic reserveBudget() inside openWorkItem remains the final authority against races. No Phase C R3 semantics changed; Telegram HOTFIX A-D untouched; tests: 10-case regression file pair-phase-c-audit-r2.test.ts.",
+  "description": "BASE staging/pr59-safe@5b5ab73 (post Phase C merge). Adds the governed read-only status foundation behind ConversationReasoningService.observeOperatorContext: (1) TRUSTED BOUNDARY — mission-control-server classifies the presented credential via classifyRequestCredential(): the separate PAIR_MC_ADMIN_TOKEN (env-only via resolveMcAdminToken; never generated/persisted/defaulted; equal-to-MC-token disables the lane) mints an `admin` ConversationPrincipal, the MC token only ever mints `operator`, x-operator-id stays a claimed identity rebound to the verified session owner (normalizePrincipal), telegram ingress mints `telegram` — never admin. (2) NEW OperationalQueryService composes bounded STATUS envelopes over canonical store rows + MissionControl projections: intents (ACTIVE_WORK/PROVIDER_STATUS/ATTENTION/COST/GENERIC) via weighted bilingual phrase lexicon; admin gets global evidence, scoped principals get only canonically-proven scope (owner_authority_id objectives, BUSINESS_CREATED actor chain, work_open_binding-bound missions, own conversation drafts) — everything else reports unavailable:INSUFFICIENT_AUTHORITY; held/committed/settled microusd kept distinct, unpriced_dispatches never rendered as zero; integrity failures surface as integrity[] typed codes; sections capped before serialization and the prompt STATUS block is always valid JSON (over-bound → ENVELOPE_EXCEEDS_BOUND marker, never a sliced fragment). (3) INTEGRATION — hook receives {principal, session_id, committed latest_message, bounded context_tail}; it runs only after reply-idempotency replay and the stale-turn gate, mints zero missions/plans/drafts/executions, and mutates nothing. PAIR_PROPOSAL/draft/confirm/ack flows unchanged.",
   "risk_override": "HIGH"
 }

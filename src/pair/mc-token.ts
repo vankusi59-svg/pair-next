@@ -22,6 +22,11 @@ import { IntegrityError } from "./errors.js";
 
 export const MC_TOKEN_ENV = "PAIR_MC_TOKEN";
 export const MC_TOKEN_FILE_NAME = "pair-mc-token";
+/** Phase 1 — the SEPARATE operational-status admin credential. ENV-ONLY:
+ *  never generated, never persisted to a file, never defaulted — admin
+ *  authority must come from explicit operator configuration. Unset →
+ *  null (no admin principal can exist; status queries stay scoped). */
+export const MC_ADMIN_TOKEN_ENV = "PAIR_MC_ADMIN_TOKEN";
 
 /** Values that must never be auto-produced or persisted as a default. */
 export const KNOWN_STATIC_TOKENS = new Set(["123", "pair-mc-test-token"]);
@@ -92,4 +97,29 @@ export function resolveMcToken(
     /* non-POSIX fs — best effort */
   }
   return { token: generated, source: "generated", path: file };
+}
+
+/**
+ * Resolve the operational-status admin token. Deliberately stricter than
+ * the MC token: environment-only (no file persistence, no generation) —
+ * a materialized default would silently grant admin to whoever holds it.
+ * Returns null when unset; a malformed/known-static configured value
+ * fails closed at boot (it is a configured credential, not a fallback).
+ * NOTE: the caller MUST verify the resolved value differs from the MC
+ * token — the boundary classifier also refuses the equality case.
+ */
+export function resolveMcAdminToken(
+  opts: { env?: EnvLike } = {},
+): string | null {
+  const env = opts.env ?? (process.env as EnvLike);
+  const raw = env[MC_ADMIN_TOKEN_ENV];
+  if (raw === undefined) return null;
+  const token = String(raw);
+  if (token.trim() === "" || token !== token.trim() || KNOWN_STATIC_TOKENS.has(token)) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_MC_ADMIN_TOKEN_INVALID",
+      `${MC_ADMIN_TOKEN_ENV}: empty, whitespace-padded or known-static token`,
+    );
+  }
+  return token;
 }

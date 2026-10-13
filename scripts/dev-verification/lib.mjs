@@ -32,6 +32,7 @@ const SURFACE_FILES = {
   "src/pair/output-language.ts": ["DELIVERY"],
   "src/pair/mission-control.ts": ["MISSION_CONTROL"],
   "src/pair/mission-control-server.ts": ["MISSION_CONTROL"],
+  "src/pair/operational-query.ts": ["MISSION_CONTROL", "CONVERSATION"],
   "src/pair/mission-observability.ts": ["MISSION_CONTROL"],
   "src/pair/mc-token.ts": ["MISSION_CONTROL"],
   "src/pair/mission-router.ts": ["GATE_ROUTER"],
