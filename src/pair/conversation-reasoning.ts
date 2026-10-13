@@ -419,8 +419,9 @@ export interface ConversationTurnInput {
 /** The verified caller class for operational-status reads. `admin` is
  *  minted ONLY by the request boundary when the separate admin credential
  *  is presented (PAIR_MC_ADMIN_TOKEN); the MC token and `x-operator-id`
- *  can never produce it. `operator`/`telegram` are scoped identities —
- *  what they may see is proven against canonical rows, never the claim. */
+ *  can never produce it. `operator`/`telegram` are UNVERIFIED identities
+ *  (caller claim / chat-id equality only) — they receive no scoped
+ *  operational data until an explicit verifiable grant exists (Phase 5). */
 export type ConversationPrincipalKind = "admin" | "operator" | "telegram";
 export interface ConversationPrincipal {
   kind: ConversationPrincipalKind;
@@ -720,27 +721,24 @@ export class ConversationReasoningService {
 
     const { replyText: strippedText, proposal: parsedProposal } =
       parseConversationProposal(String(out.raw_text ?? ""));
-    // F3/R1 — a status question or a read-only-authenticated turn can
-    // NEVER materialize a proposal: an operational-status intent in the
-    // evidence envelope suppresses the trailer before it reaches the
-    // durable reply row, so no draft/artifact mint can follow it. The
-    // trailer line is still stripped from the visible reply.
-    const statusIntents =
-      status !== null && Array.isArray((status as { intents?: unknown }).intents)
-        ? ((status as { intents: unknown[] }).intents)
-        : [];
-    const isStatusQuery = statusIntents.some(
-      (i) => typeof i === "string" && i !== "GENERIC",
-    );
+    // F3/R2 — proposal materialization is gated by the server-derived
+    // authority flag ONLY: a turn authenticated under status-read-only
+    // authority (read_only) can never materialize a proposal regardless
+    // of wording. Text/topic classification is NOT an authorization
+    // boundary — status intents drive which evidence is fetched, never
+    // whether a draft may mint. A caller under full conversation
+    // authority keeps the unchanged proposal flow (it already holds
+    // draft authority via POST /drafts). The trailer line is still
+    // stripped from the visible reply either way.
     const proposal =
-      parsedProposal !== null && !isStatusQuery && input.read_only !== true
+      parsedProposal !== null && input.read_only !== true
         ? parsedProposal
         : null;
     const replyText = strippedText ||
       (parsedProposal
         ? proposal !== null
           ? "Tôi có thể chuẩn bị mission draft cho yêu cầu này — xem draft bên dưới và xác nhận khi bạn sẵn sàng."
-          : "Đây là câu hỏi trạng thái / quyền chỉ-đọc — PAIR không tạo mission draft cho yêu cầu này."
+          : "Đây là quyền chỉ-đọc — PAIR không tạo mission draft cho yêu cầu này."
         : "");
     if (!replyText || replyText.length > CONVERSATION_MAX_REPLY_CHARS) {
       const err = new IntegrityError(

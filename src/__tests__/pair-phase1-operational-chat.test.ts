@@ -6,9 +6,10 @@
  *  - the admin principal is minted ONLY by the separate
  *    PAIR_MC_ADMIN_TOKEN credential; the MC token and `x-operator-id`
  *    can NEVER produce admin (incl. the equal-token misconfiguration);
- *  - scoped operators (incl. telegram) see only canonically-proven
- *    scope: owned objectives, created businesses, bound missions and
- *    draft-confirmed missions — everything else is `unavailable`;
+ *  - non-admin principals (operator AND telegram) are unverified:
+ *    every scoped section is denied `UNVERIFIED_IDENTITY` — claimed
+ *    ids, chat-id equality, ownership and creator chains are never
+ *    authority (R1-F1 + R2-F1 default-deny);
  *  - the status hook receives {principal, session, latest message,
  *    bounded tail}; it is never invoked for replayed/stale/foreign
  *    turns — idempotency and stale-turn protection hold;
@@ -531,11 +532,11 @@ describe("OperationalQueryService — authorized envelopes", () => {
     expect(calls.length).toBe(0);
   });
 
-  it("telegram is a VERIFIED-scoped identity: own provenance visible, global denied", async () => {
+  it("telegram is UNVERIFIED for operational data (R2-F1): ingress equality is not sender authenticity", async () => {
     const ctx = fresh("telegram");
     seedOperational(ctx);
-    // A mission minted through THIS telegram identity's own confirmed
-    // draft — provenance chained to the verified principal.
+    // A mission minted through a confirmed draft OWNED by telegram:777 —
+    // even own provenance cannot widen an unverified identity.
     ctx.store.put("mission", "MSN_TG", {
       mission_id: "MSN_TG", project_id: "PRJ_1", goal: "tg mission",
       bound_open_id: null, status: "CREATED", metadata: {},
@@ -550,32 +551,29 @@ describe("OperationalQueryService — authorized envelopes", () => {
       state: "CONFIRMED", created_at: NOW, version: 0,
     }, 0);
     const s = ctx.conv.createSession({ owner_operator_id: "telegram:777" });
-    const inv = new MockInvoker((i) => {
-      const acts = ((sectionsOf(i).active_missions as
-        { items: Array<{ mission_id: string }> } | undefined)?.items ?? [])
-        .map((m) => m.mission_id).join(",");
-      return `missions: ${acts}`;
-    });
+    const inv = new MockInvoker(() => "ok");
     const { reasoning } = wired(ctx, inv);
-    const t = await turn(
+    await turn(
       reasoning, s.session_id, "telegram:777", "what is PAIR doing now?",
       { kind: "telegram", operator_id: "telegram:777" },
     );
-    // Verified identity + explicit provenance → own mission only.
-    expect(t.reply.body).toContain("MSN_TG");
-    expect(t.reply.body).not.toContain("MSN_ADMIN");
-    expect(t.reply.body).not.toContain("MSN_BOUND");
     const env = statusFromPrompt(inv.calls[0]!.user_prompt)!;
     expect((env.principal as { kind: string }).kind).toBe("telegram");
-    // Cost question — global position denied (verified but unauthorized);
-    // telegram owns no objectives → honestly empty provenance list.
+    const un = env.unavailable as Array<{ section: string; reason: string }>;
+    // R2-F1 — every scoped section denied; zero victim/own data leaks —
+    // even the identity's own draft-minted mission stays invisible.
+    expect(un).toContainEqual({ section: "active_missions", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "running_executions", reason: "UNVERIFIED_IDENTITY" });
+    expect(un).toContainEqual({ section: "objectives_owned", reason: "UNVERIFIED_IDENTITY" });
+    expect(JSON.stringify(env)).not.toContain("MSN_TG");
+    // Cost question — denied with the same unverified posture.
     await turn(
       reasoning, s.session_id, "telegram:777", "bao nhiêu tiền?",
       { kind: "telegram", operator_id: "telegram:777" },
     );
-    const cost = (sectionsOf(inv.calls[1]!).cost ?? {}) as Record<string, unknown>;
-    expect(String(cost.global_position)).toContain("INSUFFICIENT_AUTHORITY");
-    expect((cost.objective_spend as { items: unknown[] }).items).toEqual([]);
+    const un2 = (statusFromPrompt(inv.calls[1]!.user_prompt)!
+      .unavailable) as Array<{ section: string; reason: string }>;
+    expect(un2).toContainEqual({ section: "cost", reason: "UNVERIFIED_IDENTITY" });
   });
 
   it("integrity failures surface as integrity[] — the turn still answers", async () => {
@@ -772,7 +770,7 @@ describe("turn integration — hook contract & invariants", () => {
     expect(calls.length).toBe(1);
   });
 
-  it("F3 — a status question suppresses a valid PAIR_PROPOSAL trailer", async () => {
+  it("F3/R2 — a status-read turn (read_only) suppresses a valid PAIR_PROPOSAL trailer", async () => {
     const ctx = fresh("f3-status");
     seedOperational(ctx);
     const s = ctx.conv.createSession({ owner_operator_id: "operator:admin" });
@@ -784,6 +782,9 @@ describe("turn integration — hook contract & invariants", () => {
       session_id: s.session_id, operator_id: "operator:admin",
       body: "what is PAIR doing now?",
       principal: { kind: "admin", operator_id: "operator:admin" },
+      // The HTTP boundary sets read_only for admin-only auth — the
+      // authority signal, not message wording, does the suppression.
+      read_only: true,
       idempotency_key: "f3-idem",
     });
     // Suppressed BEFORE the durable reply row — nothing materializes.
@@ -795,6 +796,7 @@ describe("turn integration — hook contract & invariants", () => {
       session_id: s.session_id, operator_id: "operator:admin",
       body: "what is PAIR doing now?",
       principal: { kind: "admin", operator_id: "operator:admin" },
+      read_only: true,
       idempotency_key: "f3-idem",
     });
     expect(t2.reused).toBe(true);

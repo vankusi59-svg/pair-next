@@ -15,6 +15,15 @@
  *      even when the model emits a valid PAIR_PROPOSAL trailer — and an
  *      admin-only (read_only) turn can never mint one either, while the
  *      normal proposal→draft flow on an MC-token turn still works.
+ *
+ * R2-F1 — a `telegram:` namespaced id claimed over the MC-token lane (or
+ *      the equality-only telegram ingress) is NOT verified identity: a
+ *      caller forging another chat's id receives zero victim data.
+ * R2-F2 — proposal suppression is keyed on the server-derived read_only
+ *      authority flag alone, never on topic/intent text: read_only turns
+ *      suppress for ANY wording (false-negative proof), and an MC-token
+ *      mission request that merely MENTIONS provider/cost topics still
+ *      mints its draft (false-positive proof).
  */
 
 import { describe, it, expect, afterAll } from "vitest";
@@ -386,5 +395,93 @@ describe("F3 — a status turn can never materialize a mission draft", () => {
     const body = t.body as { proposal?: unknown };
     expect(body.proposal === undefined || body.proposal === null).toBe(true);
     expect(s.store.list("conversation_mission_draft").length).toBe(0);
+  });
+});
+
+describe("R2-F1 — a forged telegram chat id over the MC lane is unverified", () => {
+  it("claiming telegram:<victim_chat> via x-operator-id yields zero victim data", async () => {
+    const s = fresh("r2-tg-forge");
+    seedVictimResources(s.store);
+    // A mission minted via a CONFIRMED draft owned by the victim chat id.
+    s.store.put("mission", "MSN_TGV", {
+      mission_id: "MSN_TGV", project_id: "PRJ_1", goal: "victim tg mission",
+      bound_open_id: null, status: "CREATED", metadata: {},
+      created_at: NOW, version: 0,
+    }, 0);
+    s.store.put("mission_runtime", "MRT_MSN_TGV", {
+      mission_id: "MSN_TGV", state: "RUNNING", created_at: NOW, version: 0,
+    }, 0);
+    s.store.put("conversation_mission_draft", "CMD_TGV", {
+      draft_id: "CMD_TGV", session_id: "CS_v",
+      owner_operator_id: "telegram:555", mission_id: "MSN_TGV",
+      state: "CONFIRMED", created_at: NOW, version: 0,
+    }, 0);
+    const port = await serve(s);
+    // The attacker holds the MC token and CLAIMS the victim's chat id —
+    // the claim mints only an `operator` principal (never `telegram`).
+    const sid = await newSession(port, hdr({ "x-operator-id": "telegram:555" }));
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "which missions are active? any blockers?" },
+        hdr({ "x-operator-id": "telegram:555" })),
+    );
+    expect(t.status).toBe(200);
+    const env = statusFromPrompt(s.invoker.calls[0]!.user_prompt)!;
+    expect((env.principal as { kind: string }).kind).toBe("operator");
+    const un = env.unavailable as Array<{ section: string; reason: string }>;
+    expect(un).toContainEqual({ section: "active_missions", reason: "UNVERIFIED_IDENTITY" });
+    const j = JSON.stringify(env);
+    for (const id of ["MSN_TGV", "CMD_TGV", "MSN_V", "OBJ_V", "BIZ_V"]) {
+      expect(j).not.toContain(id);
+    }
+    expect(s.store.list("conversation_mission_draft").length).toBe(1); // seeded only
+    expect(s.store.list("mission").length).toBe(2); // MSN_V + MSN_TGV
+  });
+});
+
+describe("R2-F2 — proposal suppression is authority-derived, not topic-derived", () => {
+  it("FALSE-NEGATIVE: read_only + unrecognized wording + trailer → zero drafts", async () => {
+    const s = fresh("r2-fn", () =>
+      `nothing special\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port, adminHdr());
+    // "sitrep" matches no lexicon phrase → intents [GENERIC] — but the
+    // read_only authority flag suppresses the trailer regardless.
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "give me a sitrep please" }, adminHdr()),
+    );
+    expect(t.status).toBe(200);
+    const env = statusFromPrompt(s.invoker.calls[0]!.user_prompt)!;
+    expect(env.intents).toEqual(["GENERIC"]);
+    const body = t.body as { proposal?: unknown };
+    expect(body.proposal === undefined || body.proposal === null).toBe(true);
+    expect(s.store.list("conversation_mission_draft").length).toBe(0);
+    expect(s.store.list("mission").length).toBe(1);
+  });
+
+  it("FALSE-POSITIVE: an MC mission request mentioning provider/cost still mints a draft", async () => {
+    const s = fresh("r2-fp", () =>
+      `vâng, chuẩn bị draft\nPAIR_PROPOSAL: {"goal":"build a reporting pipeline via gemini"}`,
+    );
+    seedVictimResources(s.store);
+    const port = await serve(s);
+    const sid = await newSession(port);
+    // Provider AND cost topics appear in the request — under the old
+    // intent-based gate this turn would have been suppressed.
+    const t = await json(
+      await post(port, `/api/conversations/${sid}/turns`,
+        { body: "build a reporting pipeline that calls the gemini provider and tracks the cost" },
+        hdr()),
+    );
+    expect(t.status).toBe(200);
+    const body = t.body as {
+      proposal?: { goal: string; draft?: { draft_id: string } };
+    };
+    expect(body.proposal?.goal).toBe("build a reporting pipeline via gemini");
+    expect(body.proposal?.draft?.draft_id).toMatch(/^MDR_/);
+    expect(s.store.list("conversation_mission_draft").length).toBe(1);
   });
 });

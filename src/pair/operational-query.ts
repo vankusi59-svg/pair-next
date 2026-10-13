@@ -11,7 +11,7 @@
  * derived only from canonical rows and the existing Mission Control read
  * projections.
  *
- * AUTHORIZATION MODEL (approved Phase-1 policy, audit-R1 hardened)
+ * AUTHORIZATION MODEL (approved Phase-1 policy, audit-R2 hardened)
  * --------------------------------------------------------------
  *   admin    — the separate PAIR_MC_ADMIN_TOKEN credential, minted into a
  *              `ConversationPrincipal` at the HTTP boundary (bearer only).
@@ -25,11 +25,14 @@
  *              sections stay `INSUFFICIENT_AUTHORITY`. A future verified-
  *              identity mechanism can re-open scoped reads; until then the
  *              audit-mandated posture is default-deny.
- *   telegram — the proven `telegram:<chat_id>` ingress identity (the
- *              bridge mints it from the real update, never a caller
- *              claim): may read scope proven to that identity — its own
- *              draft-minted missions and provably-owned rows. Telegram can
- *              never become admin.
+ *   telegram — a `telegram:<chat_id>` ingress identity. Audit R2-F1: the
+ *              ingress route authenticates only that the caller-proclaimed
+ *              operator id EQUALS `telegram:<chat_id>` — it proves channel
+ *              equality, not Telegram sender authenticity, and no
+ *              explicit verifiable read grant exists for chat ids yet.
+ *              So telegram is UNVERIFIED for operational data too: every
+ *              scoped section is denied `UNVERIFIED_IDENTITY` (explicit
+ *              grants are Phase 5 work). Telegram can never become admin.
  *   Default deny: where no canonical authority chain exists the section is
  *   reported `unavailable` — never widened, never guessed.
  *
@@ -404,12 +407,12 @@ export class OperationalQueryService {
     asof: string,
   ): Record<string, unknown> {
     const isAdmin = ctx.principal.kind === "admin";
-    // R1-F1 — a caller-claimed `x-operator-id` is NOT verified identity:
-    // the `operator` kind gets NO scoped operational data at all (session
-    // ownership, BUSINESS_CREATED actors and objective ownership can only
-    // be proven to a VERIFIED identity). Only `admin` (separate credential)
-    // and `telegram` (ingress-proven `telegram:<chat_id>`) are verified.
-    const verified = isAdmin || ctx.principal.kind === "telegram";
+    // R1-F1 + R2-F1 — the ONLY verified identity today is `admin` (separate
+    // bearer credential). An `operator` kind is a caller claim, and a
+    // `telegram` kind proves only chat-id equality — neither is verified
+    // sender identity, so both are default-deny for scoped operational
+    // data until an explicit verifiable grant mechanism exists (Phase 5).
+    const verified = isAdmin;
     const intents = classifyOperationalIntents(ctx.latest_message.body);
     /** Section selector — intent keys plus the scope-context pseudo-section
      *  `objectives_owned` that grounds scoped principals. */
@@ -424,8 +427,8 @@ export class OperationalQueryService {
     const unavailable: Array<{ section: string; reason: string }> = [];
     const integrity: Array<{ section: string; error: string }> = [];
 
-    // Verified non-admin principals always get their own proven footprint
-    // context — what makes an empty global answer honest, not just empty.
+    // Non-admin principals always get the (denied) own-footprint context —
+    // what makes an empty global answer honest, not just empty.
     if (!isAdmin) want.add("objectives_owned");
 
     /** Unverified principals see an explicit denial on every requested
@@ -437,8 +440,10 @@ export class OperationalQueryService {
       });
     };
 
+    // scopeFor exists for a future verified non-admin identity (Phase 5);
+    // today no non-admin kind is verified, so no scope is ever derived.
     const scope =
-      isAdmin || !verified ? null : this.scopeFor(ctx.principal);
+      verified && !isAdmin ? this.scopeFor(ctx.principal) : null;
 
     const guarded = (name: string, fn: () => unknown) => {
       try {
