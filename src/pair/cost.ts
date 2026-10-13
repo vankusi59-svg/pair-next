@@ -1284,10 +1284,18 @@ export class CostService {
   /**
    * Sweep planner-run reservations: a HELD row settles from its
    * canonical planner_run row — RUNNING stays HELD (still in flight, or
-   * crashed mid-call — never guessed); a terminal run with attempts
-   * proves calls → COMMITTED at reserved; a terminal run with zero
-   * attempts proves no spend → RELEASED; a missing run row stays
-   * conservatively HELD. Mirrors reconcileForTask's evidence-only rule.
+   * crashed mid-call — never guessed); a terminal run with proven
+   * provider requests → COMMITTED at reserved; a terminal run with
+   * zero proven provider requests proves no spend → RELEASED; a missing
+   * run row stays conservatively HELD. Mirrors reconcileForTask's
+   * evidence-only rule.
+   *
+   * AUDIT R1 F4 — the discriminator is `provider_requests` (transport-
+   * reported requests that PROVABLY initiated), never the STARTED
+   * attempt-row count: an eligibility-rejected attempt that never
+   * reached a provider provably spent nothing → RELEASED. Run rows
+   * predating the F4 field fall back to the conservative attempts>0
+   * semantics (never under-count ambiguous legacy evidence).
    */
   reconcilePlannerInvocations(): number {
     let touched = 0;
@@ -1296,7 +1304,7 @@ export class CostService {
       const run = this.store.tryGet("planner_run", String(r.planner_run_id));
       if (!run || String(run.state) === "RUNNING") continue;
       const resId = String(r.reservation_id);
-      if (Number(run.attempts ?? 0) > 0) {
+      if (Number(run.provider_requests ?? run.attempts ?? 0) > 0) {
         this.transitionIfCurrent(resId, ["HELD"], "COMMITTED", {
           usage_state: "ACTUAL_USAGE_UNKNOWN",
         });
@@ -1357,8 +1365,8 @@ export class CostService {
       if (before !== after) touched += 1;
     }
     // Phase C — planner-run reservations reconcile from their canonical
-    // planner_run evidence (terminal+attempts → COMMITTED, terminal+0 →
-    // RELEASED, RUNNING/missing → stays HELD).
+    // planner_run evidence (terminal+proven provider requests →
+    // COMMITTED, terminal+0 → RELEASED, RUNNING/missing → stays HELD).
     touched += this.reconcilePlannerInvocations();
     return touched;
   }

@@ -106,6 +106,10 @@ export interface CodexPlannerInvokeConfig {
    *  re-ask; rendered into the SAME canonical prompt builder as every
    *  other transport (MINIMAL-REPAIR, never F3 alternative-plan). */
   rejectionContext?: PlannerRejectionContext;
+  /** AUDIT R1 F4 — mutable counter the Planner Pool owns per attempt;
+   *  incremented at the spawn-initiation point so the settled attempt
+   *  row records a provider request that PROVABLY ran. */
+  providerCounter?: { requests: number };
 }
 
 const resolveExecutable = resolveCodexExecutable;
@@ -284,6 +288,9 @@ export async function codexPlannerPlan(
     })}`;
   let out: Awaited<ReturnType<typeof invokeRaw>>;
   try {
+    // AUDIT R1 F4 — counted at the initiation point: a spawn that then
+    // fails or times out still provably invoked the provider transport.
+    if (cfg.providerCounter) cfg.providerCounter.requests += 1;
     out = await invokeRaw({ executable: exe, model: cfg.model, timeoutMs, scratchDir: cfg.scratchDir }, prompt, cfg.env);
   } catch (e) {
     return { tasks: [], warnings: [`${CODEX_PLANNER_WARNING.SPAWN_ERROR}:${String(e).slice(0, 80)}`] };
@@ -514,6 +521,22 @@ export async function refreshCodexPlannerQualification(
     timeoutMs: number;
     env?: CodexPlannerEnv;
     actor?: string;
+    /** AUDIT R1 F4 — every real codex probe this refresh spawns counts
+     *  as a provider request on the owning planner attempt; the counter
+     *  survives a later eligibility verdict or throw. */
+    providerCounter?: { requests: number };
+    /** AUDIT R2 F2 — the owning planner run's absolute deadline (epoch
+     *  ms). No probe may START at/after it, and each probe's own timeout
+     *  is min()'d against the remaining window — the refresh can never
+     *  outlive the authority that invoked it. */
+    deadlineMs?: number;
+    /** TEST-ONLY seam — substitutes the probe transport so a test can
+     *  observe the effective per-probe timeout/deadline behavior without
+     *  spawning a real codex child. Never set in production wiring. */
+    probeImpl?: (o: {
+      model: string; timeoutMs: number; scratchDir: string;
+      env?: CodexPlannerEnv;
+    }) => Promise<{ outcome: string; latency_ms: number; detail: string }>;
   },
 ): Promise<{
   access_outcome: string;
@@ -522,13 +545,35 @@ export async function refreshCodexPlannerQualification(
   model_qualified: boolean;
 }> {
   const actor = opts.actor ?? "PAIR_PLANNER";
-  const codexProbe = () =>
-    codexPlannerProbe({
+  // AUDIT R2 F2 — every real codex probe this refresh spawns consumes
+  // the SAME absolute run deadline as the plan invocations: a probe may
+  // never START at/after it, and each probe's timeout is min()'d to the
+  // remaining window. A lapsed deadline is an authority failure — typed
+  // FAIL_CLOSED_PLANNER_DEADLINE, never a fabricated probe outcome.
+  const assertProbeWindow = () => {
+    if (opts.deadlineMs != null && Date.now() >= opts.deadlineMs) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_PLANNER_DEADLINE",
+        "codex planner refresh: run deadline lapsed before probe start",
+      );
+    }
+  };
+  const probeImpl = opts.probeImpl ?? codexPlannerProbe;
+  const codexProbe = () => {
+    // AUDIT R1 F4 — a probe is a real provider invocation; count it at
+    // initiation on the owning attempt's counter.
+    assertProbeWindow();
+    if (opts.providerCounter) opts.providerCounter.requests += 1;
+    return probeImpl({
       model: opts.model,
       scratchDir: opts.scratchDir,
-      timeoutMs: opts.timeoutMs,
+      timeoutMs:
+        opts.deadlineMs != null
+          ? Math.max(1, Math.min(opts.timeoutMs, opts.deadlineMs - Date.now()))
+          : opts.timeoutMs,
       env: opts.env,
     });
+  };
   const pc = new ProviderCatalog(store);
   // CPL-1 R3.A + R4 — structural pre-probe guard on a FRESH canonical read
   // at refresh start (closes the plan-time TOCTOU: marks installed after

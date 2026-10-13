@@ -1,31 +1,24 @@
 {
-  "claim_id": "PHASE_C_UNIFIED_LLM_PLANNING",
-  "title": "Phase C — unified LLM planning & deterministic-template removal across every new-Mission ingress",
+  "claim_id": "PHASE_C_AUDIT_R2_CLOSURE",
+  "title": "Phase C audit R2 — three residual findings closed on top of the R1 audit fixes",
   "affected_surfaces": [
     "PLANNER",
-    "DELIVERY",
-    "CONVERSATION",
-    "MISSION_DRAFT",
-    "MISSION_CONTROL",
     "BUSINESS_OBJECTIVE",
-    "RECOVERY_REPLAY",
-    "TELEGRAM_INGRESS",
-    "DEV_INFRA"
+    "MISSION_CONTROL"
   ],
   "required_tests": [
+    "src/__tests__/pair-phase-c-audit-r2.test.ts",
+    "src/__tests__/pair-phase-c-audit-r1.test.ts",
     "src/__tests__/pair-phase-c-unified-planner.test.ts",
-    "src/__tests__/pair-hotfix-d-delegated-delivery.test.ts",
-    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
     "src/__tests__/pair-p15-6-objective-operating-loop.test.ts"
   ],
   "invariants": [
     "INV_PLAN_001",
     "INV_DELIVERY_001",
     "INV_DELIVERY_002",
-    "INV_DELIVERY_RAW_001",
     "INV_REPLAY_001",
     "INV_MISSION_001"
   ],
-  "description": "Phase C removes the deterministic task-template fallback from makeServePlanner and unifies every new-Mission ingress on the existing async LLM Planner Pool. serve-planner.ts: 'initial' accepts ONLY persisted plan authority (pinned_plan_tasks or metadata.llm_plan) else FAIL_CLOSED_PLAN_REQUIRED; PAIR_MC_TEMPLATE_PLANNER and TEMPLATE plan_source removed. business.ts: shared async prepareDelegatedPlan re-derives the canonical bound-mission goal, calls deps.planExpander (same pool as the API edge); FAIL_CLOSED_NO_PLANNER on missing dep, FAIL_CLOSED_DELEGATED_PLAN_ABSENT on empty llm_plan; openWorkItem re-proves the plan goal digest inside the dedup transaction (FAIL_CLOSED_DELEGATED_PLAN_GOAL_DRIFT) and pins llm_plan+provenance on the mission. objective-operating-loop.ts: openDelegatedChild plans after the dispatch proof, re-proves authority+objective CAS post-await, converges in-flight bound missions AWAITING_EXECUTION before the READY gate. mission-draft.ts: confirmInner claims durably then plans via the same expander (missing dep = NO_PLANNER, zero provider calls, retry-safe SUBMITTING). mission-control.ts: tickSchedules requires the expander per due schedule. mission-control-server.ts: /open awaits prepareDelegatedPlan. planner-pool.ts: ONE run-level deadlineMs over eligibility+INITIAL+retries+REASK, FAIL_CLOSED_PLANNER_DEADLINE with TIMEOUT evidence. cost.ts: planner billing model->executor->UNKNOWN (never FREE), admitPlannerInvocation bound to objective lineage, settle+reconcile from canonical planner_run rows. serve-mission-control.mjs: pool expander wired with cost ctx+deadline, driver/reconcile start deferred until planner deps exist. better-sqlite3 11.10.0->12.11.1: v11 lacks Node 24 support (env-teardown assert crashed every suite worker); no API change. dev-verification: win32 platform baselines registered (verified BASE==HEAD, zero regressions).",
+  "description": "Audit R2 closure for PR #113 (BASE staging/pr59-safe@69d1c9b, on top of R1 commit 2f2671c). R2-F1: planner monetary admission now prices the COMPLETE per-candidate provider-request envelope via the new shared plannerCandidateRequestBound() exported from planner-pool.ts — codex_cli candidates bound at 6 (INITIAL+REASK plan calls + 2 eligibility re-proofs x 2 possible qualification-refresh probes), HTTP/LLM candidates at 3 (2 internal INITIAL requests + 1 REASK); serve-mission-control.mjs replaces the legacy (INITIAL+REASK=2) hand-derived multiplier with this structural constant so a METERED_API reserve prices worst-case spend (100u x 6 = 600u) and admission can never under-reserve. R2-F2: codex qualification/refresh probes consume the ONE run deadline — runPlannerFailover passes its absolute deadlineMs as runCtx into assertEligible (both the pre-INITIAL and pre-REASK re-proof); serve-mission-control threads it into refreshCodexPlannerQualification, which fails closed with typed FAIL_CLOSED_PLANNER_DEADLINE before any probe can start at/after the deadline, min()s each probe timeout against the remaining window, and honestly counts only probes that provably initiated (partial spend); provider-validation.ts propagates FAIL_CLOSED_* authority-typed probe errors instead of fabricating UNREACHABLE probe_state evidence for a probe that never ran. R2-F3: BusinessLayer.prepareDelegatedPlan now runs assertBudgetHeadroom — a strictly read-only re-application of reserveBudget()'s scope/period/usage scan over missions + live HELD reservations — BEFORE deps.planExpander, so a definitely-exhausted hard-stop mission-count budget rejects with FAIL_CLOSED_BUDGET_EXCEEDED at zero planner calls and zero reservation writes; the atomic reserveBudget() inside openWorkItem remains the final authority against races. No Phase C R3 semantics changed; Telegram HOTFIX A-D untouched; tests: 10-case regression file pair-phase-c-audit-r2.test.ts.",
   "risk_override": "HIGH"
 }

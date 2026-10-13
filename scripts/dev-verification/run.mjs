@@ -92,7 +92,11 @@ function evaluateRun({ proc, resultPath, file }) {
   }
   // Per-entry budget: a baseline signature may be consumed at most `max`
   // times per invocation; beyond that it is ordinary failure (R2.G).
-  const budget = TOLERATED_FAILURES.map((t) => ({ t, left: t.max ?? 1 }));
+  // AUDIT R1 F1 — platform-scoped entries are inert on other platforms:
+  // a win32 baseline can never mask a Linux failure (and vice versa).
+  const budget = TOLERATED_FAILURES
+    .filter((t) => t.platform == null || t.platform === process.platform)
+    .map((t) => ({ t, left: t.max ?? 1 }));
   const matchTol = (trName, name) =>
     budget.find((b) => b.left > 0 &&
       (b.t.file === file || b.t.file === trName ||
