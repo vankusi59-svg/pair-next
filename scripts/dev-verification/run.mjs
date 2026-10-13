@@ -9,11 +9,12 @@ import {
   existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   HarnessError, TOLERATED_FAILURES, planVerification, validateClaim,
 } from "./lib.mjs";
 
-export const ROOT = new URL("../..", import.meta.url).pathname;
+export const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const DEFAULT_CLAIM = ".pair-verification/patch-claim.json";
 const OUT_DIR = ".pair-verification";
 
@@ -203,8 +204,20 @@ function runSelector(sel, exec, root = ROOT, tag = "x") {
   };
 }
 
-export const defaultExec = (bin, argv) =>
-  spawnSync(bin, argv, { cwd: ROOT, encoding: "utf8", shell: false });
+export const defaultExec = (bin, argv) => {
+  // win32: npx/pnpm resolve to .cmd shims that cannot spawn without a
+  // shell. Wrap in cmd.exe with metachar-aware quoting so selector
+  // patterns (e.g. -t "a|b") stay literal — identical semantics on
+  // unix, which keeps the direct execFile path.
+  if (process.platform === "win32") {
+    const q = (s) =>
+      /[\s"&|<>^()%!]/.test(s) ? `"${s.replaceAll('"', '\\"')}"` : s;
+    return spawnSync("cmd.exe",
+      ["/d", "/s", "/c", [bin, ...argv.map(q)].join(" ")],
+      { cwd: ROOT, encoding: "utf8" });
+  }
+  return spawnSync(bin, argv, { cwd: ROOT, encoding: "utf8", shell: false });
+};
 
 function runTool(name, argv, exec) {
   const r = exec(argv[0], argv.slice(1));
@@ -358,6 +371,9 @@ export function verify(opts = {}) {
     throw new HarnessError("VERIFY_CLAIM_PATH",
       `claim path must resolve inside the repository: ${claimArg}`);
   }
+  // git diff --name-only emits forward slashes — normalize the repo-
+  // relative claim path so the freshness check compares like separators.
+  const claimRelGit = claimRel.replaceAll("\\", "/");
   let claimRaw = null;
   if (existsSync(claimAbs)) {
     try {
@@ -380,9 +396,9 @@ export function verify(opts = {}) {
   // must be added/modified inside the resolved BASE..HEAD diff. A claim
   // committed by an earlier PR is stale and can never certify this one —
   // freshness authority is the diff, never mtime/claim_id/title (R2.A/E).
-  if (!files.includes(claimRel)) {
+  if (!files.includes(claimRelGit)) {
     throw new HarnessError("VERIFY_PATCH_CLAIM_STALE",
-      `${claimRel} is not added/modified in ${base}..${head} — ` +
+      `${claimRelGit} is not added/modified in ${base}..${head} — ` +
       "a stale claim cannot certify the current change");
   }
   const plan = planVerification({
@@ -411,7 +427,8 @@ export function verify(opts = {}) {
   return { verdict, reportMd, base, head, plan, groups };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] != null &&
+    import.meta.url === pathToFileURL(process.argv[1]).href) {
   const cli = process.argv.slice(2);
   const a = (f) => cli.indexOf(f) >= 0 ? cli[cli.indexOf(f) + 1] : undefined;
   try {
