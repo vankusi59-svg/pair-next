@@ -168,6 +168,13 @@ export class ObjectiveOperatingService {
      *  the pass aborts and the fault propagates. Manual/operator
      *  callers never set it — semantics are byte-identical to before. */
     authority_gate?: () => void;
+    /** AUDIT R1 F5 — optional absolute epoch bound for any delegated
+     *  planning inside this pass (the auto-driver pins it to its lease's
+     *  canonical lifetime bound minus finalization allowance). Forwarded
+     *  into prepareDelegatedPlan so a planner run can never outlive the
+     *  authority that invoked it. Manual callers never set it —
+     *  semantics are byte-identical to before. */
+    planning_deadline_epoch_ms?: number;
     /** TEST-ONLY — never set in production. */
     hooks?: OperatingPassHooks;
   }): Promise<OperatingPassResult> {
@@ -184,7 +191,9 @@ export class ObjectiveOperatingService {
     }
     const ctx: PassCtx = { steps_used: 0 };
     try {
-      return await this.pass(ctx, objectiveId, actor, input.hooks, input.authority_gate);
+      return await this.pass(
+        ctx, objectiveId, actor, input.hooks, input.authority_gate,
+        input.planning_deadline_epoch_ms);
     } catch (e) {
       if (e instanceof PassBoundExceeded) {
         // Deterministic external-wait boundary: the committed seams
@@ -199,6 +208,7 @@ export class ObjectiveOperatingService {
     ctx: PassCtx, objectiveId: string, actor: string,
     hooks?: OperatingPassHooks,
     authorityGate?: () => void,
+    planningDeadlineEpochMs?: number,
   ): Promise<OperatingPassResult> {
     const result = (o: OperatingOutcome, extra?: Partial<OperatingPassResult>): OperatingPassResult => ({
       outcome: o, objective_id: objectiveId, ...extra,
@@ -347,7 +357,7 @@ export class ObjectiveOperatingService {
         ctx, objectiveId, launchable[0]!.delegated_child_work_item_id!,
         launchable[0]!.work_item_id, actor, result, {
           workstream_key: launchable[0]!.workstream_key,
-        }, hooks, authorityGate);
+        }, hooks, authorityGate, planningDeadlineEpochMs);
     }
 
     // §12 — binding + nothing launchable + no active execution → the
@@ -489,7 +499,7 @@ export class ObjectiveOperatingService {
           ...(blocked.length ? { blocked_workstream_keys: [...blocked] } : {}),
           ...(noEligible.length ? { no_eligible_workstream_keys: [...noEligible] } : {}),
         },
-        hooks, authorityGate);
+        hooks, authorityGate, planningDeadlineEpochMs);
     }
     if (blocked.length > 0) {
       return result("DEPENDENCY_BLOCKED", { blocked_workstream_keys: blocked });
@@ -651,6 +661,10 @@ export class ObjectiveOperatingService {
     extra?: Partial<OperatingPassResult>,
     hooks?: OperatingPassHooks,
     authorityGate?: () => void,
+    /** AUDIT R1 F5 — absolute epoch bound forwarded into
+     *  prepareDelegatedPlan; absent = the configured planner run
+     *  deadline alone governs (manual pass semantics). */
+    planningDeadlineEpochMs?: number,
   ): Promise<OperatingPassResult> {
     this.tick(ctx);
     hooks?.beforeOpen?.(); // TEST-ONLY drift injection at the real boundary
@@ -683,8 +697,34 @@ export class ObjectiveOperatingService {
     // transaction; nothing committed yet. Planner unavailability or
     // exhaustion propagates fail-closed — the pass reports the planner
     // failure, never a DISPATCHED claim without an authorized plan.
-    const prepared = await this.deps.business.prepareDelegatedPlan(
-      childId, actor);
+    // AUDIT R1 F2 — prepareDelegatedPlan now preflights the identical
+    // open-eligibility gates BEFORE paying for planning, so a losing
+    // race may surface an eligibility throw from EITHER the preflight
+    // or the open dedup. Both converge through the same canonical
+    // in-flight mission proof.
+    const convergeIfMissionInFlight = (): OperatingPassResult | null => {
+      const child = this.store.tryGet("work_item", childId) as Row | null;
+      const mission = child ? this.deps.business.boundMissionForWorkItem(child) : null;
+      if (mission && child) {
+        assertCanonicalMissionInFlight(this.store, mission, child);
+        return result("AWAITING_EXECUTION", {
+          delegated_child_work_item_id: childId,
+          mission_id: String(mission.mission_id),
+          ...extra,
+        });
+      }
+      return null;
+    };
+    let prepared: Awaited<
+      ReturnType<BusinessLayer["prepareDelegatedPlan"]>>;
+    try {
+      prepared = await this.deps.business.prepareDelegatedPlan(
+        childId, actor, { planningDeadlineEpochMs });
+    } catch (err) {
+      const conv = convergeIfMissionInFlight();
+      if (conv) return conv;
+      throw err;
+    }
     // Phase C — authority re-proven AFTER the asynchronous planning
     // await: the driver lease may have lapsed mid-plan and the
     // objective/strategy state may have drifted. The re-proven
@@ -710,16 +750,8 @@ export class ObjectiveOperatingService {
       // is fully proven in flight (§20/R2.A): spine replay + WOB
       // identity + compatible runtime — PAUSED/terminal/unproven all
       // propagate fail-closed.
-      const child = this.store.tryGet("work_item", childId) as Row | null;
-      const mission = child ? this.deps.business.boundMissionForWorkItem(child) : null;
-      if (mission && child) {
-        assertCanonicalMissionInFlight(this.store, mission, child);
-        return result("AWAITING_EXECUTION", {
-          delegated_child_work_item_id: childId,
-          mission_id: String(mission.mission_id),
-          ...extra,
-        });
-      }
+      const conv = convergeIfMissionInFlight();
+      if (conv) return conv;
       throw err;
     }
     const mission = this.deps.business.boundMissionForWorkItem(saved);

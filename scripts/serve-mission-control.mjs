@@ -933,7 +933,11 @@ const planExpander = async (input, expandCtx) => {
       // authoritative) then a full re-proof — PASS keeps codex #1,
       // still-fail settles the typed attempt and failover continues.
       // Authority violations throw before any refresh (never retried).
-      assertEligible: (c) =>
+      // AUDIT R1 F4 — `providerCounter` is the pool-owned per-attempt
+      // counter: codex refresh probes count as real provider requests,
+      // and both transports increment it at their invocation seam, so a
+      // STARTED attempt row never masquerades as a made provider call.
+      assertEligible: (c, providerCounter) =>
         c.transport === "codex_cli"
           ? assertCodexPlannerCandidateEligibleWithRefresh(store, c, {
               refresh: () =>
@@ -944,6 +948,7 @@ const planExpander = async (input, expandCtx) => {
                   scratchDir: codexPlannerScratch,
                   timeoutMs: cfgProbeTimeoutMs,
                   actor: "PAIR_PLANNER",
+                  providerCounter,
                 }),
             })
           : assertPlannerCandidateEligible(store, c.model_entry_id),
@@ -982,6 +987,7 @@ const planExpander = async (input, expandCtx) => {
               allowedCapabilities: LLM_PLANNER_CAPS,
               capabilitySets: executorCapSets(),
               rejectionContext: invocation?.rejectionContext,
+              providerCounter: invocation?.providerCounter,
             })
           : llmPlan(goal, {
               endpoint: `${c.endpoint}/chat/completions`,
@@ -992,6 +998,11 @@ const planExpander = async (input, expandCtx) => {
               capabilitySets: executorCapSets(),
               rejectionContext: invocation?.rejectionContext,
               maxProviderRequests: invocation?.maxProviderRequests,
+              // AUDIT R1 F3 — the pool's absolute run deadline so the
+              // transport's internal retry loop can never START a fresh
+              // provider request past it.
+              deadlineMs: invocation?.deadlineMs,
+              providerCounter: invocation?.providerCounter,
             }),
       // P-REASK R3 — hard per-candidate latency ceiling, measured from
       // attempt START: HTTP = 2×per-request timeout (its INITIAL call may
@@ -1073,16 +1084,21 @@ const planExpander = async (input, expandCtx) => {
         actor: "PAIR_PLANNER",
       });
     }
-    // Phase C — settle the planner reservation from canonical run
-    // evidence: a terminal run with attempts provably invoked providers
-    // (COMMITTED at reserved); a terminal run with zero attempts
-    // provably spent nothing (RELEASED). The run row is the authority —
-    // the reservation never settles from memory.
+    // Phase C + AUDIT R1 F4 — settle the planner reservation from
+    // canonical run evidence: a terminal run whose attempts provably
+    // invoked providers (provider_requests — transport-reported, never
+    // the STARTED-row count) stays COMMITTED at reserved; a terminal
+    // run with zero proven provider requests provably spent nothing
+    // (RELEASED — e.g. every attempt died at eligibility before any
+    // call). The run row is the authority; rows predating the F4 field
+    // fall back to the conservative attempts>0 semantics.
     if (admission?.reservation_id) {
       const settled = store.tryGet("planner_run", String(run.planner_run_id));
       service.cost.settlePlannerInvocation(
         admission.reservation_id,
-        Number(settled?.attempts ?? 0) > 0 ? "CALLS_MADE" : "NO_CALLS",
+        Number(settled?.provider_requests ?? settled?.attempts ?? 0) > 0
+          ? "CALLS_MADE"
+          : "NO_CALLS",
       );
     }
     throw e;

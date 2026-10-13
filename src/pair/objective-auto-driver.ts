@@ -160,6 +160,13 @@ export interface DriverDeps {
     objective_id: string;
     actor: string;
     authority_gate: () => void;
+    /** AUDIT R1 F5 — absolute epoch bound for any delegated planning
+     *  inside this pass, derived from the claimed lease's canonical
+     *  started_at + max_lifetime_ms minus the finalization allowance.
+     *  Always supplied by the driver; forwarded into the planner
+     *  invocation's deadline pin so paid planning can never outlive
+     *  the lease that authorizes it. */
+    planning_deadline_epoch_ms: number;
   }) => Promise<OperatingPassResult>;
   /** Eligible executor ids for the dispatch-cost bound (governed
    *  executor catalog — static composition, never per-pass lookups). */
@@ -605,6 +612,20 @@ export class ObjectiveAutoDriverService {
       return { objective_id: objectiveId, skipped: true, fault: faultCode(e) };
     }
     const opId = `drive-pass:${objectiveId}:${handle.fence}`;
+    // AUDIT R1 F5 — the pass's absolute planning deadline, derived from
+    // the SAME durable lease row the scheduler's lifetime gate enforces:
+    // started_at + max_lifetime_ms is the canonical authority bound, and
+    // the bounded finalization allowance is reserved for settle/commit.
+    // Threaded down into prepareDelegatedPlan → planExpander.deadlineMs
+    // so a planner run inside this pass can never outlive the lease —
+    // a too-long invocation fails PLANNER_DEADLINE (fail-closed) instead
+    // of running unauthorized after the lifetime gate kills the lease.
+    const leaseRow = readSchedulerRow<Row>(
+      this.deps.store, LEASE_STATE, objectiveId);
+    const planningDeadlineEpochMs =
+      Number(leaseRow?.started_at ?? this.instant()) +
+      Number(leaseRow?.max_lifetime_ms ?? this.leaseLifetimeBoundMs()) -
+      DRIVER_FINALIZATION_ALLOWANCE_MS;
     try {
       // F1-D: reconcile any STARTED/UNKNOWN CEO attempt the previous
       // worker left behind BEFORE admitting a new pass — never a
@@ -639,6 +660,7 @@ export class ObjectiveAutoDriverService {
         objective_id: objectiveId,
         actor: DRIVER_ACTOR,
         authority_gate: this.authorityGate(handle),
+        planning_deadline_epoch_ms: planningDeadlineEpochMs,
       });
       // F1-A: a renewal fault means this worker is deemed unauthorized
       // — the outcome is never settled under a lost lease.

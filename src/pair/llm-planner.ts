@@ -539,6 +539,18 @@ export interface LlmPlannerConfig {
    *  retry on degenerate output); a rejection-feedback re-ask passes 1 —
    *  exactly one provider request, never a recursive retry layer. */
   maxProviderRequests?: number;
+  /** AUDIT R1 F3 — absolute run deadline (epoch ms) propagated from the
+   *  Planner Pool invocation. `timeoutMs` bounds a single request measured
+   *  at call time, but the internal retry loop used to be able to START a
+   *  fresh provider request after the run deadline; a request may now only
+   *  begin while `Date.now() < deadlineMs`, and each request's clock is
+   *  min()'d against the remaining deadline. */
+  deadlineMs?: number;
+  /** AUDIT R1 F4 — mutable counter the Planner Pool owns per attempt;
+   *  incremented at the exact point this transport initiates a provider
+   *  request, so the settled attempt row records requests that PROVABLY
+   *  ran — never the attempt-row count. */
+  providerCounter?: { requests: number };
   /** F3 — bounded structured failure context on a REPLAN: the planner must
    *  propose a feasible ALTERNATIVE, never a semantic re-emission of the
    *  failed plan; the rejected digests are named in the prompt. */
@@ -1075,6 +1087,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     ? cfg.allowedCapabilities
     : [...cfg.allowedCapabilities, "AUTOMATON_TASK_EXECUTION"];
   const timeoutMs = cfg.timeoutMs ?? LLM_PLANNER_DEFAULT_TIMEOUT_MS;
+  const deadlineAt = cfg.deadlineMs;
   const apiKey = envGet(cfg.env, cfg.credentialEnv);
   const fetchImpl = cfg.fetchFn ?? fetch;
 
@@ -1097,6 +1110,9 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
   const attempt = async (): Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[]; raw_delivery_emission_count?: number; raw_delivery_emission_state?: RawDeliveryEmissionState }> => {
     let text: string;
     try {
+      // AUDIT R1 F4 — counted at the initiation point: a request that
+      // then fails/times out still provably reached the provider.
+      if (cfg.providerCounter) cfg.providerCounter.requests += 1;
       const resp = await fetchImpl(cfg.endpoint, {
         method: "POST",
         headers: {
@@ -1112,7 +1128,11 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
           temperature: 0.2,
           max_tokens: 2048,
         }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(
+          deadlineAt != null
+            ? Math.max(1, Math.min(timeoutMs, deadlineAt - Date.now()))
+            : timeoutMs,
+        ),
       });
       if (!resp.ok) return { tasks: [], warnings: [`LLM_PLANNER_HTTP_${resp.status}`] };
       const data = (await resp.json()) as {
@@ -1169,6 +1189,13 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     Math.min(2, cfg.maxProviderRequests ?? 2),
   );
   for (let i = 0; i < maxProviderRequests; i++) {
+    // AUDIT R1 F3 — never START a provider request once the run deadline
+    // has passed; the in-flight request's own timeout is additionally
+    // min()'d against the deadline inside `attempt`.
+    if (deadlineAt != null && Date.now() >= deadlineAt) {
+      warnings.push("LLM_PLANNER_RUN_DEADLINE_EXCEEDED");
+      break;
+    }
     const a = await attempt();
     const usable = a.tasks.filter(
       (t) => !isBookkeepingShapedTask(t, sanitizeCaps),

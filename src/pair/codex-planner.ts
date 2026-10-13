@@ -106,6 +106,10 @@ export interface CodexPlannerInvokeConfig {
    *  re-ask; rendered into the SAME canonical prompt builder as every
    *  other transport (MINIMAL-REPAIR, never F3 alternative-plan). */
   rejectionContext?: PlannerRejectionContext;
+  /** AUDIT R1 F4 — mutable counter the Planner Pool owns per attempt;
+   *  incremented at the spawn-initiation point so the settled attempt
+   *  row records a provider request that PROVABLY ran. */
+  providerCounter?: { requests: number };
 }
 
 const resolveExecutable = resolveCodexExecutable;
@@ -284,6 +288,9 @@ export async function codexPlannerPlan(
     })}`;
   let out: Awaited<ReturnType<typeof invokeRaw>>;
   try {
+    // AUDIT R1 F4 — counted at the initiation point: a spawn that then
+    // fails or times out still provably invoked the provider transport.
+    if (cfg.providerCounter) cfg.providerCounter.requests += 1;
     out = await invokeRaw({ executable: exe, model: cfg.model, timeoutMs, scratchDir: cfg.scratchDir }, prompt, cfg.env);
   } catch (e) {
     return { tasks: [], warnings: [`${CODEX_PLANNER_WARNING.SPAWN_ERROR}:${String(e).slice(0, 80)}`] };
@@ -514,6 +521,10 @@ export async function refreshCodexPlannerQualification(
     timeoutMs: number;
     env?: CodexPlannerEnv;
     actor?: string;
+    /** AUDIT R1 F4 — every real codex probe this refresh spawns counts
+     *  as a provider request on the owning planner attempt; the counter
+     *  survives a later eligibility verdict or throw. */
+    providerCounter?: { requests: number };
   },
 ): Promise<{
   access_outcome: string;
@@ -522,13 +533,17 @@ export async function refreshCodexPlannerQualification(
   model_qualified: boolean;
 }> {
   const actor = opts.actor ?? "PAIR_PLANNER";
-  const codexProbe = () =>
-    codexPlannerProbe({
+  const codexProbe = () => {
+    // AUDIT R1 F4 — a probe is a real provider invocation; count it at
+    // initiation on the owning attempt's counter.
+    if (opts.providerCounter) opts.providerCounter.requests += 1;
+    return codexPlannerProbe({
       model: opts.model,
       scratchDir: opts.scratchDir,
       timeoutMs: opts.timeoutMs,
       env: opts.env,
     });
+  };
   const pc = new ProviderCatalog(store);
   // CPL-1 R3.A + R4 — structural pre-probe guard on a FRESH canonical read
   // at refresh start (closes the plan-time TOCTOU: marks installed after

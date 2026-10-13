@@ -180,7 +180,14 @@ const COMMENT_CAP = 200;
  *  of the caller-controlled request body. */
 export type DelegatedPlanExpander = (
   input: Record<string, unknown>,
-  context?: { work_item_id?: string },
+  context?: {
+    work_item_id?: string;
+    /** AUDIT R1 F5 — caller-pinned planner-window bound (duration ms,
+     *  tighten-only): the expander min()'s it against the configured
+     *  run deadline so a planner invocation can never outlive the
+     *  authority that invoked it (auto-driver lease bound). */
+    deadlineMs?: number;
+  },
 ) => Promise<{
   input: Record<string, unknown>;
   planner?: Record<string, unknown> | null;
@@ -1634,6 +1641,15 @@ export class BusinessLayer {
   async prepareDelegatedPlan(
     workItemId: string,
     operatorId: string,
+    opts?: {
+      /** AUDIT R1 F5 — absolute epoch bound for the planner run, derived
+       *  by the Objective auto-driver from its claimed lease lifetime
+       *  (minus finalization allowance). Converted to the expandCtx
+       *  duration pin at invocation time so paid planning can never
+       *  outlive the authority that invoked it; absent = the configured
+       *  planner run deadline alone governs. */
+      planningDeadlineEpochMs?: number;
+    },
   ): Promise<DelegatedPlanPreparation> {
     if (!operatorId) {
       throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.prepareDelegatedPlan");
@@ -1645,6 +1661,14 @@ export class BusinessLayer {
       // preview seams' FAIL_CLOSED_NO_PLANNER contract).
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", "work_item.prepareDelegatedPlan");
     }
+    // AUDIT R1 F2 — the IDENTICAL open-eligibility gate sequence
+    // openWorkItem enforces, run BEFORE the paid planner invocation:
+    // an ineligible/dedup-blocked item fails closed here with the same
+    // typed error openWorkItem would raise — never after burning a
+    // provider request. The dedup transaction still re-proves every
+    // gate at commit time, so a race between this preflight and the
+    // open stays fail-closed.
+    this.openEligibilityRow(workItemId, operatorId);
     const ctx = this.delegatedGoalContext(workItemId);
     const expanded = await expander(
       {
@@ -1660,7 +1684,20 @@ export class BusinessLayer {
           delegated_goal_digest: ctx.goal_digest,
         },
       },
-      { work_item_id: workItemId },
+      {
+        work_item_id: workItemId,
+        // AUDIT R1 F5 — a caller-pinned absolute bound becomes the
+        // remaining-duration pin; the expander min()'s it against the
+        // configured run deadline (tighten-only). A lapsed pin yields a
+        // non-positive window → the pool fails PLANNER_DEADLINE before
+        // any provider request.
+        ...(opts?.planningDeadlineEpochMs != null
+          ? {
+              deadlineMs: Math.max(
+                0, opts.planningDeadlineEpochMs - Date.now()),
+            }
+          : {}),
+      },
     );
     const exInput = (expanded as { input?: Record<string, unknown> }).input ??
       (expanded as unknown as Record<string, unknown>);
@@ -1684,36 +1721,16 @@ export class BusinessLayer {
     };
   }
 
-  /**
-   * The single seam where business work enters the governed engine:
-   * budget check (fail-closed) → enriched goal → canonical startMission →
-   * work_item IN_PROGRESS with mission_id recorded.
-   */
-  openWorkItem(
+  /** AUDIT R1 F2 — the FULL pre-intent open-eligibility gate sequence,
+   *  shared verbatim by openWorkItem (before its dedup write) and
+   *  prepareDelegatedPlan (before any paid planner invocation). One
+   *  implementation, zero drift: an item that cannot open can never
+   *  burn a provider request, and the dedup transaction re-proves the
+   *  same gates at commit time. */
+  private openEligibilityRow(
     workItemId: string,
     operatorId: string,
-    admission?: {
-      /** P15.6 R2.C — optional objective-version admission pin: when
-       *  the caller is an objective-driven dispatcher, it observed an
-       *  exact canonical objective version and that authority must
-       *  still be live at the dedup write. Progress/budget/status
-       *  mutations all bump the objective version, so any drift aborts
-       *  the open atomically inside the same transaction — before any
-       *  intent/binding/mission write. */
-      objective_id?: string;
-      expected_objective_version?: number;
-    },
-    openOpts?: {
-      /** Phase C — a delegated plan prepared through prepareDelegatedPlan
-       *  (the shared async Planner Pool seam). When present, the digest
-       *  binding plan→goal is re-proved against the canonical enriched
-       *  mission goal INSIDE the dedup transaction — before any
-       *  intent/binding/mission write — so a plan authorized for a
-       *  different goal (or stale authority) can never commit. */
-      prepared_plan?: DelegatedPlanPreparation;
-    },
-  ): Row {
-    if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
+  ): { row: Row; from: string; business: Row; agentId: string | null; agent: Row | null; priorMissionIds: string[] } {
     // P15.2 R2.B — the deterministic Objective-root namespace (OWI_*)
     // is permanently non-executable: an Objective root is a P14 graph
     // container only, never an openable work item. Guard sits at the
@@ -1829,6 +1846,46 @@ export class BusinessLayer {
         throw new PolicyError("FAIL_CLOSED_AGENT_INACTIVE", agentId);
       }
     }
+    return { row, from, business, agentId, agent, priorMissionIds };
+  }
+
+  /**
+   * The single seam where business work enters the governed engine:
+   * budget check (fail-closed) → enriched goal → canonical startMission →
+   * work_item IN_PROGRESS with mission_id recorded.
+   */
+  openWorkItem(
+    workItemId: string,
+    operatorId: string,
+    admission?: {
+      /** P15.6 R2.C — optional objective-version admission pin: when
+       *  the caller is an objective-driven dispatcher, it observed an
+       *  exact canonical objective version and that authority must
+       *  still be live at the dedup write. Progress/budget/status
+       *  mutations all bump the objective version, so any drift aborts
+       *  the open atomically inside the same transaction — before any
+       *  intent/binding/mission write. */
+      objective_id?: string;
+      expected_objective_version?: number;
+    },
+    openOpts?: {
+      /** Phase C — a delegated plan prepared through prepareDelegatedPlan
+       *  (the shared async Planner Pool seam). When present, the digest
+       *  binding plan→goal is re-proved against the canonical enriched
+       *  mission goal INSIDE the dedup transaction — before any
+       *  intent/binding/mission write — so a plan authorized for a
+       *  different goal (or stale authority) can never commit. */
+      prepared_plan?: DelegatedPlanPreparation;
+    },
+  ): Row {
+    if (!operatorId) throw new IntegrityError("FAIL_CLOSED_OPERATOR_ID_REQUIRED", "work_item.open");
+    // AUDIT R1 F2 — the FULL pre-intent eligibility gate sequence is the
+    // one shared proof (extracted below): openWorkItem runs it before the
+    // dedup write; prepareDelegatedPlan runs the IDENTICAL gates before
+    // any paid planner invocation, so an ineligible or already-opened
+    // item can never burn a provider request.
+    const { row, from, business, agentId, agent, priorMissionIds } =
+      this.openEligibilityRow(workItemId, operatorId);
     // Durable open intent committed BEFORE mission creation: the transition
     // write is the dedup point, and the canonical `work_open_binding`
     // record ties this intent to the mission it will create — the binding

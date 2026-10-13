@@ -37,8 +37,22 @@ export interface PlannerInvocation {
   /** Effective per-request timeout for this call (REASK = min(normal
    *  per-request timeout, remaining candidate budget)). */
   timeoutMs?: number;
+  /** AUDIT R1 F3 — the ONE absolute run deadline (epoch ms). Per-request
+   *  `timeoutMs` bounds a single call measured at invocation time, but a
+   *  transport's INTERNAL retry loop starts fresh requests later; a
+   *  request must never begin after this point, and every internal
+   *  request timeout is min()'d against it. */
+  deadlineMs?: number;
   /** Hard provider-request bound for this call (REASK = 1). */
   maxProviderRequests?: number;
+  /** AUDIT R1 F4 — mutable provider-invocation counter shared across the
+   *  eligibility re-proof and every model invocation of ONE attempt. A
+   *  transport increments it at the exact point it initiates a real
+   *  provider request (HTTP call / CLI spawn / qualification probe), so
+   *  the settled attempt row records how many requests PROVABLY ran —
+   *  including partial counts when an invocation threw mid-flight. An
+   *  attempt that never reached a provider-touching seam settles 0. */
+  providerCounter?: { requests: number };
   /** Bounded deterministic rejection feedback — present iff kind=REASK. */
   rejectionContext?: PlannerRejectionContext;
 }
@@ -309,6 +323,12 @@ export interface PlannerAttemptRecord {
   failure_class?: PlannerFailureClass;
   /** Sanitized warning codes only — never raw LLM output. */
   warnings: string[];
+  /** AUDIT R1 F4 — provider requests this attempt PROVABLY initiated
+   *  (eligibility probes + INITIAL + REASK), reported by the code that
+   *  made them. This — never the attempt-row count — is the settlement
+   *  evidence for planner cost: an eligibility-rejected attempt that
+   *  never invoked a provider persists 0. */
+  provider_requests?: number;
   /** digest of the winning task list when this attempt won. */
   plan_digest?: string;
   /** Canonical grouping identity — every attempt belongs to a planner_run. */
@@ -369,6 +389,11 @@ export async function runPlannerFailover(opts: {
    *  refresh before settling an availability rejection). */
   assertEligible: (
     c: PlannerCandidate,
+    /** AUDIT R1 F4 — eligibility paths that spawn real provider probes
+     *  (codex canonical refresh) count them here so a STARTED attempt's
+     *  provider_requests reflects requests that actually ran even when
+     *  the eligibility step rejects or throws afterwards. */
+    providerCounter?: { requests: number },
   ) =>
     | void
     | { reject: true; failure_class: PlannerFailureClass; reason: string }
@@ -474,9 +499,17 @@ export async function runPlannerFailover(opts: {
     // §4 — durable STARTED evidence before ANY gate runs: even an
     // eligibility-rejected or authority-aborted invocation is auditable.
     const token = opts.onAttemptStart?.(base);
+    // AUDIT R1 F4 — the ONE provider-request counter for this attempt:
+    // threaded into the eligibility re-proof (codex refresh probes) and
+    // every model invocation (INITIAL + REASK). Every settle stamps the
+    // accumulated count — including a partial count after a mid-flight
+    // throw — so the durable row distinguishes "attempt persisted" from
+    // "provider provably invoked".
+    const providerCalls = { requests: 0 };
     const settle = (rec: PlannerAttemptRecord) => {
-      attempts.push(rec);
-      opts.onAttemptEnd?.(token, rec);
+      const stamped = { ...rec, provider_requests: providerCalls.requests };
+      attempts.push(stamped);
+      opts.onAttemptEnd?.(token, stamped);
     };
     // Runtime eligibility re-proof per invocation (§9/R2). Authority
     // failures throw and propagate — NOT failover-eligible; availability
@@ -486,7 +519,7 @@ export async function runPlannerFailover(opts: {
     // must not look like a crashed in-flight invocation.
     let elig;
     try {
-      elig = await opts.assertEligible(c);
+      elig = await opts.assertEligible(c, providerCalls);
     } catch (e) {
       settle({
         ...base,
@@ -522,12 +555,14 @@ export async function runPlannerFailover(opts: {
     try {
       const res = await opts.planFn(c, {
         kind: "INITIAL",
+        providerCounter: providerCalls,
         ...(deadlineAt != null
           ? {
               timeoutMs: Math.min(
                 opts.latencyBudget?.(c)?.requestTimeoutMs ?? Number.MAX_SAFE_INTEGER,
                 Math.max(1, deadlineRemaining()),
               ),
+              deadlineMs: deadlineAt,
             }
           : {}),
       });
@@ -599,7 +634,7 @@ export async function runPlannerFailover(opts: {
               // attempt_no) — no inner settle may precede it. An
               // availability rejection prevents the re-ask; normal
               // failover proceeds.
-              const elig2 = await opts.assertEligible(c);
+              const elig2 = await opts.assertEligible(c, providerCalls);
               if (elig2 && elig2.reject) {
                 settle({
                   ...base,
@@ -638,10 +673,12 @@ export async function runPlannerFailover(opts: {
               reaskInitiated = reaskCode;
               const res2 = await opts.planFn(c, {
                 kind: "REASK",
+                providerCounter: providerCalls,
                 timeoutMs: Math.min(
                   budget?.requestTimeoutMs ?? Number.MAX_SAFE_INTEGER,
                   remaining,
                 ),
+                ...(deadlineAt != null ? { deadlineMs: deadlineAt } : {}),
                 maxProviderRequests: 1,
                 rejectionContext: {
                   validation_code: reaskCode,
