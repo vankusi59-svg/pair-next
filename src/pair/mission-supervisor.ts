@@ -231,7 +231,15 @@ export class MissionSupervisor {
     // mid-uptime abort releases capacity without waiting for a restart.
     // The sweep's per-execution recheck throttle bounds reconcile calls
     // for rows that stay CONFIRMED_RUNNING / UNKNOWN_SIDE_EFFECT_STATE.
-    this.reconciliation.settleTerminalMissionOrphans();
+    // R1-F2 — the sweep must never block the supervisor: per-orphan
+    // faults are isolated inside it, and a systemic sweep fault here is
+    // confined to this call — mission ticking proceeds regardless.
+    try {
+      this.reconciliation.settleTerminalMissionOrphans();
+    } catch {
+      // fail-open for liveness only: settlement state is unchanged —
+      // orphans keep their reservations and converge on a later sweep.
+    }
     const runtimes = this.store
       .list("mission_runtime")
       .filter((rt) => NON_TERMINAL.has(String(rt.state)))

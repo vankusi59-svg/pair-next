@@ -347,6 +347,115 @@ describe("F1 — orphan executions under terminal missions", () => {
   });
 });
 
+/* ====== R1 — audit findings on the orphan sweep (R0 HEAD f7cb738) ====== */
+
+describe("R1-F1 — capacity release requires authoritative terminal evidence", () => {
+  it("R1-F1.a adapter unavailable (not bound) → never settles, slot stays reserved", () => {
+    const ctx = makeCtx("r1a");
+    const { execId } = seedOrphan(ctx); // no run_root
+    ctx.adapters.delete(EXEC_ID); // adapterFor → null → reconcile: CONFIRMED_FAILED (weak)
+    ctx.supervisor.resume();
+    const e = ctx.store.get("executor_execution", execId);
+    expect(e.terminal_outcome ?? null).toBeNull();
+    expect(dispatchCapacityReasons(ctx)).toContain("CAPACITY_EXHAUSTED:1/1");
+  });
+
+  it("R1-F1.b observe() throws → never settles, slot stays reserved", () => {
+    const ctx = makeCtx("r1b");
+    const { execId } = seedOrphan(ctx); // no run_root
+    ctx.adapter.observe = () => {
+      throw new Error("adapter observation channel down");
+    };
+    ctx.supervisor.resume();
+    const e = ctx.store.get("executor_execution", execId);
+    expect(e.terminal_outcome ?? null).toBeNull();
+    expect(dispatchCapacityReasons(ctx)).toContain("CAPACITY_EXHAUSTED:1/1");
+  });
+
+  it("R1-F1.c adapter reports non-terminal NOT_FOUND + no run_root → weak evidence stays reserved", () => {
+    const ctx = makeCtx("r1c");
+    const { execId } = seedOrphan(ctx, { observe: "NOT_FOUND" }); // run_root null
+    ctx.supervisor.resume();
+    const e = ctx.store.get("executor_execution", execId);
+    expect(e.terminal_outcome ?? null).toBeNull();
+    expect(dispatchCapacityReasons(ctx)).toContain("CAPACITY_EXHAUSTED:1/1");
+  });
+
+  it("R1-F1.d adapter-reported terminal remains the authoritative settle path", () => {
+    const ctx = makeCtx("r1d");
+    const { execId } = seedOrphan(ctx, { observe: "TIMEOUT" });
+    ctx.supervisor.resume();
+    const e = ctx.store.get("executor_execution", execId);
+    expect(String(e.terminal_outcome)).toBe("RECONCILED_CONFIRMED_FAILED");
+    expect(dispatchCapacityReasons(ctx)).not.toContain("CAPACITY_EXHAUSTED:1/1");
+  });
+});
+
+describe("R1-F2 — one orphan's fault never blocks the sweep or the supervisor", () => {
+  it("R1-F2.a concurrent write inside observation is absorbed — sweep survives, both orphans settle, foreign write preserved", () => {
+    const ctx = makeCtx("r2a");
+    const { execId: raced } = seedOrphan(ctx, { observe: "COMPLETED" });
+    const { execId: good } = seedOrphan(ctx, { observe: "COMPLETED" });
+    // A concurrent writer mutates `raced` inside the observation reconcile
+    // performs — the R0 sweep then put()s its stale snapshot and the
+    // VERSION_CONFLICT propagates out of resume(). R1 re-reads the row
+    // before mutating: the write is absorbed (never stomped), the orphan
+    // still settles, and resume() never throws.
+    const orig = ctx.adapter.observe.bind(ctx.adapter);
+    ctx.adapter.observe = (id: string) => {
+      if (id === raced) {
+        const row = ctx.store.get("executor_execution", raced);
+        row.concurrent_write = "external-writer";
+        ctx.store.put("executor_execution", raced, row, Number(row.version));
+      }
+      return orig(id);
+    };
+    ctx.supervisor.resume(); // must not throw
+    const r = ctx.store.get("executor_execution", raced);
+    expect(String(r.terminal_outcome)).toBe("RECONCILED_CONFIRMED_COMPLETED");
+    expect(String(r.concurrent_write)).toBe("external-writer"); // never stomped
+    const g = ctx.store.get("executor_execution", good);
+    expect(String(g.terminal_outcome)).toBe("RECONCILED_CONFIRMED_COMPLETED");
+  });
+
+  it("R1-F2.b an orphan concurrently neutralized mid-sweep is skipped, never stomped; tick() completes", () => {
+    const ctx = makeCtx("r2b");
+    const { execId } = seedOrphan(ctx, { observe: "COMPLETED" });
+    // Operator-acknowledgment path racing the sweep: terminal_outcome lands
+    // inside observe(). The re-read must see it and SKIP the settle — a
+    // blind put would overwrite OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY.
+    const orig = ctx.adapter.observe.bind(ctx.adapter);
+    ctx.adapter.observe = (id: string) => {
+      if (id === execId) {
+        const row = ctx.store.get("executor_execution", execId);
+        row.terminal_outcome = "OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY";
+        ctx.store.put("executor_execution", execId, row, Number(row.version));
+      }
+      return orig(id);
+    };
+    ctx.supervisor.start();
+    const { ticked, skipped } = ctx.supervisor.tick(); // must not throw
+    expect(Array.isArray(ticked)).toBe(true);
+    const e = ctx.store.get("executor_execution", execId);
+    expect(String(e.terminal_outcome)).toBe("OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY");
+    const settleEvents = ctx.store
+      .listEvents("executor_execution", execId)
+      .filter((ev) => String(ev.event_type) === "EXECUTION_ORPHAN_SETTLED");
+    expect(settleEvents.length).toBe(0); // never settled — operator owns it
+    // Repeated sweeps + restart: the acked row stays excluded — no
+    // duplicate settlement, no resurrected capacity claims.
+    ctx.adapter.observe = orig;
+    ctx.recon.settleTerminalMissionOrphans();
+    ctx.supervisor.resume();
+    const e2 = ctx.store.get("executor_execution", execId);
+    expect(String(e2.terminal_outcome)).toBe("OPERATOR_ACCEPTED_UNKNOWN_NO_REPLAY");
+    const settleEvents2 = ctx.store
+      .listEvents("executor_execution", execId)
+      .filter((ev) => String(ev.event_type) === "EXECUTION_ORPHAN_SETTLED");
+    expect(settleEvents2.length).toBe(0);
+  });
+});
+
 /* ================= F2 — empty DSH fallback route composition ================= */
 
 describe("F2 — configured DSH route composition", () => {

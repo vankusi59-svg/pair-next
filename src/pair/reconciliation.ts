@@ -58,18 +58,30 @@ export class ReconciliationService {
    *
    * For every unsettled execution whose mission is canonically terminal,
    * run the canonical reconcile() proof and apply the outcome:
-   *   CONFIRMED_COMPLETED / CONFIRMED_FAILED / CONFIRMED_NOT_EXECUTED —
-   *     authoritative: the row is durably settled via `terminal_outcome`
-   *     (the same marker operator acknowledgment uses) and the capacity
-   *     slot is released. `execution_state` itself is never rewritten —
-   *     it records what the process last reported, not a claimed result.
-   *   CONFIRMED_RUNNING / UNKNOWN_SIDE_EFFECT_STATE — the remote may
-   *     still be live or unknowable: the slot stays RESERVED. Re-probe on
-   *     a bounded cadence (`orphan_recheck_after`) so a later terminal
-   *     adapter observation still settles it; UNKNOWN additionally keeps
-   *     its only other release — explicit operator acknowledgment.
-   * Idempotent: settled rows are excluded by `terminal_outcome`, so a
-   * repeated sweep or restart writes no duplicate receipts/events.
+   *   adapter-observed TERMINAL status (COMPLETED/FAILED/CANCELLED/
+   *     TIMEOUT) — authoritative terminal evidence: the row is durably
+   *     settled via `terminal_outcome` (the same marker operator
+   *     acknowledgment uses) and the capacity slot is released.
+   *     `execution_state` itself is never rewritten — it records what
+   *     the process last reported, not a claimed result.
+   *   everything else — the slot stays RESERVED. "No observation + no
+   *     run_root" is NOT proof nothing ran (adapter may be unavailable,
+   *     observe may throw, run_root persistence may have been lost):
+   *     R1-F1 forbids releasing capacity on that weak evidence —
+   *     the case stays fail-closed like UNKNOWN_SIDE_EFFECT_STATE.
+   *     Reserved orphans re-probe on a bounded cadence
+   *     (`orphan_recheck_after`) so a later terminal adapter observation
+   *     still settles them; explicit operator acknowledgment remains the
+   *     other release path.
+   *
+   * R1-F2 — one orphan's failure never blocks the sweep or the
+   * supervisor: each orphan is isolated in its own try/catch, and the row
+   * is re-read before mutating so a concurrent writer (operator
+   * acknowledgment, in-flight barrier, another sweep) is absorbed — never
+   * stomped — while an actual version conflict simply converges on a
+   * later sweep. Idempotent: settled rows are excluded by
+   * `terminal_outcome`, so repeated sweeps/restarts write no duplicate
+   * receipts/events.
    */
   settleTerminalMissionOrphans(nowMs: number = Date.now()): { settled: string[] } {
     const TERMINAL_MISSION = new Set(["COMPLETED", "FAILED", "ABORTED", "CANCELLED"]);
@@ -87,37 +99,67 @@ export class ReconciliationService {
           Date.parse(String(e.orphan_recheck_after)) <= nowMs),
     );
     const settled: string[] = [];
-    for (const e of orphans) {
-      const receipt = this.reconcile({ execution_id: String(e.execution_id) });
-      const outcome = String(receipt.outcome);
-      if (outcome === "CONFIRMED_RUNNING" || outcome === "UNKNOWN_SIDE_EFFECT_STATE") {
-        e.orphan_recheck_after = new Date(
-          nowMs + ReconciliationService.ORPHAN_RECHECK_MS,
-        ).toISOString();
-        this.store.put(
-          "executor_execution", String(e.execution_id), e, Number(e.version),
+    for (const candidate of orphans) {
+      const executionId = String(candidate.execution_id);
+      try {
+        const receipt = this.reconcile({ execution_id: executionId });
+        const outcome = String(receipt.outcome);
+        const facts = (receipt.facts as Record<string, unknown>) ?? {};
+        // R1-F1 — release capacity ONLY on authoritative terminal
+        // evidence: the adapter itself must have reported a terminal
+        // status. reconcile()'s CONFIRMED_FAILED for "no observation +
+        // no run_root" is a weak heuristic, not proof of death.
+        const authoritative = TERMINAL.has(
+          String(facts.observed_status ?? ""),
         );
+        // R1-F2 — re-read before mutating: absorb benign concurrent
+        // writes, re-validate candidacy (an operator acknowledgment or
+        // barrier landing mid-sweep must never be overwritten).
+        const e = this.store.tryGet("executor_execution", executionId);
+        if (
+          !e ||
+          TERMINAL.has(String(e.execution_state)) ||
+          e.terminal_outcome ||
+          !TERMINAL_MISSION.has(
+            statusByMission.get(String(e.mission_id)) ?? "",
+          )
+        ) {
+          continue;
+        }
+        if (!authoritative) {
+          e.orphan_recheck_after = new Date(
+            nowMs + ReconciliationService.ORPHAN_RECHECK_MS,
+          ).toISOString();
+          this.store.put(
+            "executor_execution", executionId, e, Number(e.version),
+          );
+          continue;
+        }
+        e.terminal_outcome = `RECONCILED_${outcome}`;
+        e.settled_receipt_id = String(receipt.reconciliation_id);
+        e.orphan_recheck_after = null;
+        this.store.put(
+          "executor_execution", executionId, e, Number(e.version),
+        );
+        this.store.event({
+          entity_type: "executor_execution",
+          entity_id: executionId,
+          event_type: "EXECUTION_ORPHAN_SETTLED",
+          new_state: String(e.terminal_outcome),
+          actor: "PAIR_RECONCILIATION_SERVICE",
+          metadata: {
+            mission_id: e.mission_id,
+            receipt_id: receipt.reconciliation_id,
+            outcome,
+          },
+        });
+        settled.push(executionId);
+      } catch {
+        // Per-orphan failure (version race, adapter/store fault):
+        // converge on a later sweep — never block siblings, the resume
+        // path, or supervisor.tick().
         continue;
       }
-      e.terminal_outcome = `RECONCILED_${outcome}`;
-      e.settled_receipt_id = String(receipt.reconciliation_id);
-      e.orphan_recheck_after = null;
-      this.store.put(
-        "executor_execution", String(e.execution_id), e, Number(e.version),
-      );
-      this.store.event({
-        entity_type: "executor_execution",
-        entity_id: String(e.execution_id),
-        event_type: "EXECUTION_ORPHAN_SETTLED",
-        new_state: String(e.terminal_outcome),
-        actor: "PAIR_RECONCILIATION_SERVICE",
-        metadata: {
-          mission_id: e.mission_id,
-          receipt_id: receipt.reconciliation_id,
-          outcome,
-        },
-      });
-      settled.push(String(e.execution_id));
     }
     return { settled };
   }
