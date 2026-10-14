@@ -187,7 +187,8 @@ describe("A — native Windows codex executable resolution", () => {
       expect(val(argv, "--config")).toContain("windows.sandbox='elevated'");
       expect(argv[0]).toBe("exec");
     } else {
-      // POSIX: env seam still resolves; a missing file fails closed.
+      // POSIX: env seam still resolves; a missing file fails closed at
+      // qualification — dispatch throws, no process is ever spawned.
       const bogus = path.join(d, "env-provided-codex");
       const adapter = new CodexCliExecutorAdapter({
         journalRoot: path.join(d, "journal"),
@@ -196,9 +197,8 @@ describe("A — native Windows codex executable resolution", () => {
           : nm === "OPENAI_API_KEY" ? "test-key"
           : process.env[nm],
       });
-      const rec = adapter.dispatch(task);
-      const o = await waitTerminal(adapter, String(rec.execution_id), 15_000);
-      expect(o.status).toBe("FAILED");
+      expect(() => adapter.dispatch(task)).toThrow(
+        /FAIL_CLOSED_EXECUTOR_UNQUALIFIED/);
     }
   });
 

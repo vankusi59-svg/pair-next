@@ -1,5 +1,6 @@
-#!/usr/bin/env node
 // PAIR Development Verification Harness V1 — deterministic runner.
+// (No shebang: vite-node externalization does not strip `#!`, and a
+// shebang in an imported .mjs surfaces as SyntaxError on newer vite.)
 // `npm run verify:change -- --base <sha> [--full] [--claim <path>]`
 // Exit 0 = READY_FOR_INDEPENDENT_AUDIT; non-zero = NOT_READY.
 // Development tooling only — never consulted by production PAIR.
