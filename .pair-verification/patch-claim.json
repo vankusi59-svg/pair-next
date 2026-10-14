@@ -8,7 +8,8 @@
     "MISSION_DRAFT",
     "RECOVERY_REPLAY",
     "GATE_ROUTER",
-    "BUSINESS_OBJECTIVE"
+    "BUSINESS_OBJECTIVE",
+    "DEV_INFRA"
   ],
   "required_tests": [
     "src/__tests__/pair-goal-context-authority.test.ts",
