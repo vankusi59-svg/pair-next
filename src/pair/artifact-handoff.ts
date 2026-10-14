@@ -2308,16 +2308,18 @@ export class ArtifactHandoffService {
       if (!tmp.ok) fail(`tmp_open:${tmp.kind}`);
       const tobj = tmp.ok ? tmp.obj : (undefined as never);
       // Single ownership / single close: the temp handle is released
-      // exactly once. On the collision path the handle is closed BEFORE
-      // the raced destination is opened — otherwise a recycled handle
-      // value could alias the raced object and a second deleteOnClose
-      // would mark the DESTINATION for deletion.
+      // exactly once and release is ALWAYS attempted, including when
+      // arming delete-on-close fails. Returns false when required
+      // delete-on-close could not be armed — callers reaching the
+      // success path must then fail closed rather than mark the
+      // handoff MATERIALIZED with an unverified temp cleanup.
       let tmpLive = true;
-      const closeTmp = (markDelete: boolean): void => {
-        if (!tmpLive) return;
+      const closeTmp = (markDelete: boolean): boolean => {
+        if (!tmpLive) return true;
         tmpLive = false;
-        if (markDelete) w32.deleteOnClose(tobj);
+        const armed = markDelete ? w32.deleteOnClose(tobj) : true;
         w32.closeObject(tobj);
+        return armed;
       };
       let published = false;
       try {
@@ -2335,7 +2337,13 @@ export class ArtifactHandoffService {
           published = true;
           closeTmp(false); // the opened object IS the dest now
         } else if (pub === "exists") {
-          closeTmp(true); // publish lost the race — delete the temp
+          // Publish lost the race — delete the temp. If the
+          // delete-on-close could not be armed the temp object may
+          // linger in the consumer workspace; that cleanup failure is
+          // itself a fail-closed condition — never converge to
+          // MATERIALIZED on top of it. The raced destination is never
+          // touched by this branch.
+          if (!closeTmp(true)) fail("tmp_cleanup");
           const raced = w32.openChildObject(dirObj, base, {
             access: WIN32_READ_ONLY_ACCESS,
           });

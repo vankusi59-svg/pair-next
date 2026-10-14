@@ -39,13 +39,18 @@ import {
   workerExecutionId,
 } from "../pair/index.js";
 
-/** Deterministic publisher-collision seam (audit F2): when armed, the
- *  wrapped renameIntoDir behaves as if a racing publisher landed the
+/** Deterministic fault seam (audit F2/F5). `collide`: the wrapped
+ *  renameIntoDir behaves as if a racing publisher landed the
  *  destination BETWEEN the caller's existence check and the atomic
  *  no-replace rename — returning "exists" after planting the winner's
- *  bytes. Everything else delegates to the real FFI implementation. */
+ *  bytes. `failDeleteOnce`: the next deleteOnClose returns false
+ *  (cleanup cannot be verified). `tmpCloses` counts closeObject calls
+ *  on `.tmp-` handles so tests prove exactly-once release. Everything
+ *  else delegates to the real FFI implementation. */
 const w32Race = vi.hoisted(() => ({
   collide: null as null | { bytes: Buffer },
+  failDeleteOnce: false,
+  tmpCloses: 0,
 }));
 vi.mock("../pair/win32-object-io.js", async (importOriginal) => {
   const real =
@@ -69,6 +74,24 @@ vi.mock("../pair/win32-object-io.js", async (importOriginal) => {
         return "exists" as const;
       }
       return real.renameIntoDir(obj as never, dirObj as never, name);
+    },
+    deleteOnClose: (obj: unknown) => {
+      if (w32Race.failDeleteOnce) {
+        w32Race.failDeleteOnce = false;
+        return false;
+      }
+      return real.deleteOnClose(obj as never);
+    },
+    closeObject: (obj: unknown) => {
+      if (
+        obj !== null &&
+        typeof obj === "object" &&
+        typeof (obj as { finalPath?: unknown }).finalPath === "string" &&
+        (obj as { finalPath: string }).finalPath.includes(".tmp-")
+      ) {
+        w32Race.tmpCloses++;
+      }
+      return real.closeObject(obj as never);
     },
   };
 });
@@ -675,5 +698,58 @@ describe("C — handle-bound dependency materialization", () => {
     expect(
       fs.readdirSync(destDir).filter((f) => f.includes(".tmp-")),
     ).toEqual([]);
+  });
+
+  it("C11 collision + temp cleanup failure → fail closed, never MATERIALIZED, handle closed once (F5)", () => {
+    if (!isWin32) return;
+    const ctx = mkCtx("c11");
+    const { gc, entries, bytes } = setupHandoff(ctx);
+    const rel = entries[0]!.consumer_relative_path;
+    const dest = path.join(ctx.workspace, rel);
+    // Racer lands identical bytes AND the delete-on-close arming fails.
+    w32Race.collide = { bytes };
+    w32Race.failDeleteOnce = true;
+    w32Race.tmpCloses = 0;
+    expect(errCode(() =>
+      ctx.service.artifactHandoffs.materializeForConsumer(gc.governed),
+    )).toBe("DEP:FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE");
+    // Both faults actually fired.
+    expect(w32Race.collide).toBeNull();
+    expect(w32Race.failDeleteOnce).toBe(false);
+    // The temp HANDLE was released exactly once despite the failed
+    // cleanup arming — no leak, no double-close.
+    expect(w32Race.tmpCloses).toBe(1);
+    // Raced destination was never mutated by cleanup.
+    expect(fs.readFileSync(dest)).toEqual(bytes);
+    // Unverified cleanup must not converge to MATERIALIZED.
+    const h = ctx.store.get(
+      HANDOFF_ENTITY,
+      canonicalHandoffId(gc.gtId, entries[0]!.artifact_id, rel),
+    );
+    expect(String(h.state)).not.toBe("MATERIALIZED");
+  });
+
+  it("C12 divergent collision + temp cleanup failure → fail closed, raced dest unchanged (F5)", () => {
+    if (!isWin32) return;
+    const ctx = mkCtx("c12");
+    const { gc, entries } = setupHandoff(ctx);
+    const rel = entries[0]!.consumer_relative_path;
+    const dest = path.join(ctx.workspace, rel);
+    const foreign = Buffer.from("raced-attacker-bytes");
+    w32Race.collide = { bytes: foreign };
+    w32Race.failDeleteOnce = true;
+    w32Race.tmpCloses = 0;
+    expect(errCode(() =>
+      ctx.service.artifactHandoffs.materializeForConsumer(gc.governed),
+    )).toBe("DEP:FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE");
+    expect(w32Race.failDeleteOnce).toBe(false);
+    expect(w32Race.tmpCloses).toBe(1);
+    // Cleanup failure must never reach the raced destination.
+    expect(fs.readFileSync(dest)).toEqual(foreign);
+    const h = ctx.store.get(
+      HANDOFF_ENTITY,
+      canonicalHandoffId(gc.gtId, entries[0]!.artifact_id, rel),
+    );
+    expect(String(h.state)).not.toBe("MATERIALIZED");
   });
 });
