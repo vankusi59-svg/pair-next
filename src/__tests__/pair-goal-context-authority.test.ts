@@ -32,6 +32,7 @@ import {
   ApprovalQueue,
   BusinessLayer,
   canonicalJson,
+  secureReadContained,
   createMissionControlServer,
   detectTelegramDeliveryIntent,
   ExecutorRegistry,
@@ -682,20 +683,26 @@ const missionState = (s: ReturnType<typeof govStack>, mid: string) =>
   String((s.store.get("mission_runtime", `MRT_${mid}`) as { state: string }).state);
 
 /* `secureReadContained` (the ONE local-artifact ingest primitive) pins
- *  opened-object containment through /proc/self/fd — absent on Windows,
- *  where EVERY declared artifact fails closed with
- *  FAIL_CLOSED_ARTIFACT_UNRESOLVED (documented platform limitation,
- *  outside this patch). The injected T1 bookkeeping task always declares
- *  mission_goal.txt, so full-mission completion is only observable on
- *  hosts exposing /proc/self/fd. */
-const LOCAL_INGEST_SUPPORTED = fs.existsSync("/proc/self/fd");
+ *  opened-object containment — /proc/self/fd on POSIX, kernel-HANDLE
+ *  proof on Windows (P0). Probe it for real rather than guessing from
+ *  the platform name: a host where the seam cannot prove containment
+ *  fails every declared artifact closed at the ingest boundary, so
+ *  full-mission COMPLETED is only observable where the probe reads. */
+const LOCAL_INGEST_SUPPORTED = (() => {
+  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pair-ingest-probe-"));
+  const probeFile = path.join(probeRoot, "probe.txt");
+  fs.writeFileSync(probeFile, "probe");
+  return secureReadContained(probeFile, 1 << 20, [probeRoot]).kind === "ok";
+})();
 
 /** Terminal assertion that keeps the authority proof identical on every
- *  platform: on ingest-capable hosts the mission must COMPLETE; on hosts
- *  without /proc/self/fd it may only die at the ingest seam — every
- *  recorded validation failure must be FAIL_CLOSED_ARTIFACT_UNRESOLVED
- *  and every non-bookkeeping work task must still have COMPLETED (the
- *  plan minted, dispatched, and executed under operator authority). */
+ *  platform: on ingest-capable hosts the mission must COMPLETE — both
+ *  /proc-backed Linux and kernel-HANDLE Windows qualify; on a host where
+ *  the seam cannot prove containment it may only die at the ingest seam
+ *  — every recorded validation failure must be
+ *  FAIL_CLOSED_ARTIFACT_UNRESOLVED and every non-bookkeeping work task
+ *  must still have COMPLETED (the plan minted, dispatched, and executed
+ *  under operator authority). */
 function assertMissionTerminal(
   s: ReturnType<typeof govStack>,
   mid: string,
@@ -759,10 +766,9 @@ async function drive(s: ReturnType<typeof govStack>, mid: string, max = 200) {
 const LOCAL_GOAL = "Phân tích dữ liệu trong file báo cáo local.";
 /* Artifact-free completion plan: no file-output verb → no `produces`
  *  minted → the executor declares `artifacts: []`. Terminal validation
- *  then passes WITHOUT the local-ingest seam (`secureReadContained`
- *  needs /proc/self/fd — a Linux-only primitive, so any declared
- *  artifact aborts on Windows hosts; that platform limitation is
- *  outside this patch's scope). The authority boundary — what this
+ *  then passes WITHOUT exercising the local-ingest seam — keeping this
+ *  plan file-free isolates the authority boundary under test. The
+ *  authority boundary — what this
  *  file proves — is exercised before ingest and never depends on it. */
 const RAW_LOCAL = () => [
   {

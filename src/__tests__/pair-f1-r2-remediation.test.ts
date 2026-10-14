@@ -36,6 +36,17 @@ import {
 } from "../pair/index.js";
 import { resolveDeliveryArtifactPath } from "../pair/telegram-delivery.js";
 
+/* P0 — win32 test parity: directory junctions are the unprivileged
+ * reparse-point primitive (real "dir" symlinks need SeCreateSymbolicLink
+ * privilege this host lacks). The security property under test — a
+ * mid-path component bound to a different object — is identical. Tests
+ * that instrument POSIX fs internals (openSync O_DIRECTORY faults,
+ * readSync mutation injection, realpathSync on /proc/self/fd) cannot
+ * reach the win32 kernel-handle path; those are skipIf-gated below —
+ * their handle-level equivalents live in pair-p0-win32-runtime.test.ts. */
+const ON_WIN32 = process.platform === "win32";
+const dirLink = (target: string, link: string) =>
+  fs.symlinkSync(target, link, ON_WIN32 ? "junction" : "dir");
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-f1-r2-"));
 let n = 0;
 const dir = (s: string) => {
@@ -206,7 +217,7 @@ describe("R2-A opened-object containment binding", () => {
     fs.mkdirSync(outside);
     fs.writeFileSync(path.join(inside, "f.bin"), "INSIDE-A");
     fs.writeFileSync(path.join(outside, "f.bin"), "OUTSIDE-B");
-    fs.symlinkSync(inside, path.join(ctx.workspace, "link"), "dir");
+    dirLink(inside, path.join(ctx.workspace, "link"));
     // After openSync bound the fd to the inside object, swap the link to
     // outside — the open fd cannot be redirected, so INSIDE bytes are
     // the only possible canonical authority.
@@ -216,7 +227,7 @@ describe("R2-A opened-object containment binding", () => {
       if (String(pth).startsWith("/proc/self/fd/") && !swapped) {
         swapped = true;
         fs.unlinkSync(path.join(ctx.workspace, "link"));
-        fs.symlinkSync(outside, path.join(ctx.workspace, "link"), "dir");
+        dirLink(outside, path.join(ctx.workspace, "link"));
       }
       return (orig as (...a: unknown[]) => unknown).call(fs, pth, ...rest);
     }) as typeof fs.realpathSync);
@@ -244,10 +255,10 @@ describe("R2-A opened-object containment binding", () => {
     fs.mkdirSync(outside);
     fs.writeFileSync(path.join(inside, "f.bin"), "INSIDE-A");
     fs.writeFileSync(path.join(outside, "f.bin"), "OUTSIDE-B");
-    fs.symlinkSync(inside, path.join(ctx.workspace, "link"), "dir");
+    dirLink(inside, path.join(ctx.workspace, "link"));
     // swap BEFORE any open — the opened object resolves outside
     fs.unlinkSync(path.join(ctx.workspace, "link"));
-    fs.symlinkSync(outside, path.join(ctx.workspace, "link"), "dir");
+    dirLink(outside, path.join(ctx.workspace, "link"));
     expect(acceptPath(ctx, p.eid, "link/f.bin")).toBe("FAIL_CLOSED_ARTIFACT_PATH_OUTSIDE");
   });
 
@@ -295,7 +306,7 @@ describe("R2-A opened-object containment binding", () => {
     const outside = path.join(ctx.d, "outside");
     fs.mkdirSync(outside);
     fs.writeFileSync(path.join(outside, "s.bin"), "OUT");
-    fs.symlinkSync(outside, path.join(ctx.workspace, "out"), "dir");
+    dirLink(outside, path.join(ctx.workspace, "out"));
     expect(acceptPath(ctx, p.eid, "out/s.bin")).toBe("FAIL_CLOSED_ARTIFACT_PATH_OUTSIDE");
     fs.writeFileSync(path.join(ctx.workspace, "ok.bin"), "OK");
     expect(acceptPath(ctx, p.eid, "ok.bin")).toBe("NO_THROW");
@@ -656,14 +667,14 @@ describe("R2-F directory fsync error classification", () => {
     injectDirFsync(Object.assign(new Error("invalid"), { code: "EINVAL" }));
     expect(tryAccept(ctx, p.eid)).toBe("NO_THROW");
   });
-  it("R2-F2 EIO on dir fsync → FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY", () => {
+  it.skipIf(ON_WIN32)("R2-F2 EIO on dir fsync → FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY", () => {
     const ctx = mkCtx("f2");
     const p = mkProducer(ctx);
     injectDirFsync(Object.assign(new Error("io error"), { code: "EIO" }));
     expect(tryAccept(ctx, p.eid)).toBe("FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY");
     expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
   });
-  it("R2-F3 arbitrary unexpected error → FAIL CLOSED", () => {
+  it.skipIf(ON_WIN32)("R2-F3 arbitrary unexpected error → FAIL CLOSED", () => {
     const ctx = mkCtx("f3");
     const p = mkProducer(ctx);
     injectDirFsync(Object.assign(new Error("weird"), { code: "EWEIRD" }));
@@ -869,7 +880,7 @@ describe("R3-A CAS durability barrier on reuse", () => {
       }),
     );
 
-  it("R3-A1 fresh rename → dir fsync EIO → FAIL, zero ART rows", () => {
+  it.skipIf(ON_WIN32)("R3-A1 fresh rename → dir fsync EIO → FAIL, zero ART rows", () => {
     const ctx = mkCtx("r3a1");
     const p = mkProducer(ctx);
     const failRef = { fail: true, code: "EIO" };
@@ -877,7 +888,7 @@ describe("R3-A CAS durability barrier on reuse", () => {
     expect(tryAccept(ctx, p.eid)).toBe("FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY");
     expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
   });
-  it("R3-A2 retry while dir fsync still EIO → FAIL AGAIN, zero rows (no bypass)", () => {
+  it.skipIf(ON_WIN32)("R3-A2 retry while dir fsync still EIO → FAIL AGAIN, zero rows (no bypass)", () => {
     const ctx = mkCtx("r3a2");
     const p = mkProducer(ctx);
     const failRef = { fail: true, code: "EIO" };
@@ -888,7 +899,7 @@ describe("R3-A CAS durability barrier on reuse", () => {
     expect(tryAccept(ctx, p.eid)).toBe("FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY");
     expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
   });
-  it("R3-A3 retry after barrier succeeds → authority mints", () => {
+  it.skipIf(ON_WIN32)("R3-A3 retry after barrier succeeds → authority mints", () => {
     const ctx = mkCtx("r3a3");
     const p = mkProducer(ctx);
     const failRef = { fail: true, code: "EIO" };
@@ -1072,7 +1083,7 @@ describe("R3-C secure same-fd read stability", () => {
     }) as typeof fs.readSync);
   };
 
-  it("R3-C1 file grows after fstat → FAIL CLOSED (unresolved)", () => {
+  it.skipIf(ON_WIN32)("R3-C1 file grows after fstat → FAIL CLOSED (unresolved)", () => {
     const ctx = mkCtx("r3c1");
     const p = mkProducer(ctx);
     const fp = path.join(ctx.workspace, "grow.bin");
@@ -1081,7 +1092,7 @@ describe("R3-C secure same-fd read stability", () => {
     expect(acceptFile(ctx, p.eid, fp)).toBe("FAIL_CLOSED_ARTIFACT_UNRESOLVED");
     expect(ctx.authority.forExecution(p.eid)).toHaveLength(0);
   });
-  it("R3-C2 same-size content mutation → mutation metadata detected, FAIL CLOSED", () => {
+  it.skipIf(ON_WIN32)("R3-C2 same-size content mutation → mutation metadata detected, FAIL CLOSED", () => {
     const ctx = mkCtx("r3c2");
     const p = mkProducer(ctx);
     const fp = path.join(ctx.workspace, "mut.bin");
@@ -1096,7 +1107,7 @@ describe("R3-C secure same-fd read stability", () => {
     });
     expect(acceptFile(ctx, p.eid, fp)).toBe("FAIL_CLOSED_ARTIFACT_UNRESOLVED");
   });
-  it("R3-C3 rename-replacement after open → never becomes the bytes read", () => {
+  it.skipIf(ON_WIN32)("R3-C3 rename-replacement after open → never becomes the bytes read", () => {
     const ctx = mkCtx("r3c3");
     const p = mkProducer(ctx);
     const fp = path.join(ctx.workspace, "repl.bin");

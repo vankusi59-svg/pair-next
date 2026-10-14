@@ -1,18 +1,26 @@
 {
-  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY_R2_RESIDUAL",
-  "title": "Phase C R2 residual — pinned operator_goal never bypasses bound-provenance chain validation",
+  "claim_id": "P0_WINDOWS_NATIVE_RUNTIME",
+  "title": "P0 — Windows-native runtime: kernel-HANDLE artifact security + native Codex executor",
   "affected_surfaces": [
+    "ARTIFACT",
     "MISSION_CONTROL",
-    "RECOVERY_REPLAY",
+    "REMOTE_EXECUTION",
+    "GATE_ROUTER",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-goal-context-authority.test.ts"
+    "src/__tests__/pair-p0-win32-runtime.test.ts",
+    "src/__tests__/pair-p0-win32-codex.test.ts",
+    "src/__tests__/pair-goal-context-authority.test.ts",
+    "src/__tests__/pair-f1-r2-remediation.test.ts"
   ],
   "invariants": [
-    "INV_PLAN_001",
-    "INV_MISSION_001"
+    "INV_ARTIFACT_001",
+    "INV_ARTIFACT_002",
+    "INV_EXEC_001",
+    "INV_MISSION_001",
+    "INV_SECRETS_001"
   ],
-  "description": "Audit R2 residual on fd3534e: missionOperatorGoal returned a pinned operator_goal BEFORE validating bound provenance, letting bound missions bypass binding-consistency checks. FIX: bound_open_id now takes precedence — the canonical chain work_open_binding(mission_id-consistent) → work_item.goal is validated on EVERY resolution; the pinned field is the immutable snapshot of that goal (identical by construction — any divergence → FAIL_CLOSED_BOUND_GOAL_PROVENANCE); legacy rows without the pin recover the snapshot from the chain; direct missions keep pin/goal fallback. Immutable snapshot + digest/replay semantics preserved. +5 regressions: pinned × {missing binding, mismatched binding, missing work_item, pin divergence} all fail closed with DETERMINISTIC code; pinned + intact chain resolves normally. 43/43 focused green.",
+  "description": "P0 Windows-native runtime + R1 audit corrections. WS-A: win32-object-io.ts binds governed fs steps to kernel HANDLEs (NtCreateFile RootDirectory-relative = /proc/self/fd parity, opened-object path/identity, atomic no-replace publish, dir FlushFileBuffers, OPEN_REPARSE_POINT = O_NOFOLLOW). WS-B: native win32 codex resolution (.exe preferred over .cmd), windows.sandbox='elevated' verified on real codex (CodexSandboxOffline), async error→FAILED, timeout/cancel intact. WS-C: real-seam ingest gate; delegated mission COMPLETES on Windows. R1-F1: pnpm-lock.yaml carries koffi; frozen-lockfile install clean. R1-F2: materializeEntryWin32 temp HANDLE single-ownership closeTmp; collision branch deletes+closes temp BEFORE opening raced dest (no handle reuse); C9/C10 collision regressions (converge identical, fail closed divergent, dest survives). R1-F3: openObject file opens default GENERIC_READ|SYNCHRONIZE; dirs keep RW for fsync; A13 write-deny DACL file ingests, A14 readonly-attr file ingests, A15 deny-read control stays closed. R1-F4: WIN32_CMD_ARG_SAFE strips cmd metacharacters (&|<>'\"%^!()[];#$?* backtick newline); batch tokens per-token quoted under /d /s /c with /s-safe outer pair; spawn uses windowsVerbatimArguments; batch-lookalike/metachar paths (codex.cmd&calc) fail closed; native .exe bypasses COMSPEC. R2-F5: closeTmp reports whether delete-on-close was armed and always releases the HANDLE; the collision branch fails closed (tmp_cleanup) when cleanup is unverifiable — never MATERIALIZED on unverified cleanup; the unwind path keeps the original error dominant; the raced destination is never mutated by temp cleanup; C11/C12 fault-injection regressions (deleteOnClose=false → fail closed, dest unchanged, temp handle closed exactly once).",
   "risk_override": "HIGH"
 }

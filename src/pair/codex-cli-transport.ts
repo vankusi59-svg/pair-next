@@ -57,12 +57,127 @@ export function resolveCodexExecutable(env: CodexCliEnv | undefined): string | n
     codexCliEnvGet(env, "PAIR_CODEX_PLANNER_EXECUTABLE") ??
     codexCliEnvGet(env, "PAIR_CODEX_EXECUTABLE");
   if (configured) return configured;
+  return resolveCodexExecutableSystem(env);
+}
+
+/** Platform-native codex discovery with NO env-override reads — the
+ *  executor lane's resolution primitive (its own configured seam is
+ *  checked by the caller before falling through here). */
+export function resolveCodexExecutableSystem(env: CodexCliEnv | undefined): string | null {
+  if (process.platform === "win32") {
+    return resolveCodexExecutableWin32(env);
+  }
   try {
     const resolved = execFileSync("which", ["codex"], { encoding: "utf8" }).trim();
     return resolved || null;
   } catch {
     return null;
   }
+}
+
+/** Windows-native codex executable resolution — no `which`, no shell.
+ *
+ *  Order mirrors Windows command resolution, with the security-critical
+ *  preference that a REAL PE image always beats a batch shim:
+ *    1. PATHEXT-ordered PATH scan — first `codex<ext>` that exists as a
+ *       file wins within a directory; `.exe`/`.com` candidates are
+ *       remembered before `.cmd`/`.bat` shims.
+ *    2. The native install root — `%LOCALAPPDATA%\OpenAI\Codex\bin\<ver>\
+ *       codex.exe` — is scanned so an npm-installed `codex.cmd` shim on
+ *       PATH still resolves to its underlying PE image (spawning a
+ *       `.cmd` directly is rejected by modern Node without a shell).
+ *    3. If only a batch shim exists, it is returned and the caller
+ *       launches it through `windowsSpawnTarget`'s COMSPEC wrapper with
+ *       a strict argv whitelist — never `shell: true` free-form. */
+function resolveCodexExecutableWin32(env: CodexCliEnv | undefined): string | null {
+  const isFile = (p: string): boolean => {
+    try {
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const exts = (
+    codexCliEnvGet(env, "PATHEXT") ??
+    process.env.PATHEXT ??
+    ".COM;.EXE;.BAT;.CMD"
+  )
+    .split(";")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  let batchCandidate: string | null = null;
+  for (const dirEntry of (codexCliEnvGet(env, "PATH") ?? process.env.PATH ?? "").split(path.delimiter)) {
+    const dirName = dirEntry.trim();
+    if (!dirName) continue;
+    for (const ext of exts) {
+      const cand = path.join(dirName, `codex${ext}`);
+      if (!isFile(cand)) continue;
+      if (ext === ".exe" || ext === ".com") return cand;
+      batchCandidate ??= cand;
+    }
+  }
+  const localApp = codexCliEnvGet(env, "LOCALAPPDATA") ?? process.env.LOCALAPPDATA;
+  if (localApp) {
+    const binRoot = path.join(localApp, "OpenAI", "Codex", "bin");
+    try {
+      const versions = fs.readdirSync(binRoot).sort().reverse();
+      for (const v of versions) {
+        const cand = path.join(binRoot, v, "codex.exe");
+        if (isFile(cand)) return cand;
+      }
+    } catch {
+      /* install root absent — fall through to the batch shim */
+    }
+  }
+  return batchCandidate;
+}
+
+const WIN32_BATCH_EXT = new Set([".cmd", ".bat"]);
+/** argv fragments a COMSPEC-wrapped launch may carry. The grammar admits
+ *  only token characters (paths, `key='value'` config pairs, model ids,
+ *  TOML tables): every cmd metacharacter — `& | < > ^ % ! " ( ) [ ] ;`
+ *  `$ # ? *` backtick — is rejected, so nothing outside it can ever
+ *  reach the `cmd /c` line. `{}` are retained (TOML inline tables in
+ *  governed argv) — they are not cmd metacharacters and stay inert
+ *  inside the per-token quoting below. */
+const WIN32_CMD_ARG_SAFE = /^[A-Za-z0-9_./\\:=,'@+\-~{} ]*$/;
+
+/** Launch target for `spawn`/`execFileSync`: a real `.exe`/`.com` image is
+ *  spawned directly (CreateProcess — no shell involvement at all). A
+ *  `.cmd`/`.bat` shim can only run through `cmd.exe /d /s /c`, and every
+ *  token is additionally wrapped in double quotes so cmd cannot re-parse
+ *  metacharacter adjacency — `"` itself is rejected by the grammar so the
+ *  quoting cannot be escaped. Returns null when the launch cannot be made
+ *  safe — the caller fails closed rather than invoking an unsafe shell. */
+export function windowsSpawnTarget(
+  command: string,
+  args: string[],
+): { command: string; args: string[]; verbatim: boolean } | null {
+  if (process.platform !== "win32") return { command, args, verbatim: false };
+  const base = path.basename(command).toLowerCase();
+  const isBatch = WIN32_BATCH_EXT.has(path.extname(base));
+  if (!isBatch) {
+    // Ambiguous batch-lookalike names ("codex.cmd&calc", "codex.cmd
+    // evil", "codex.bat%PATH%") would bypass the extension check and
+    // reach CreateProcess as-is — reject rather than classify.
+    if (/\.(?:cmd|bat)/.test(base) || !WIN32_CMD_ARG_SAFE.test(base)) {
+      return null;
+    }
+    return { command, args, verbatim: false };
+  }
+  const comspec = process.env.COMSPEC ?? "C:\\Windows\\System32\\cmd.exe";
+  if (
+    !WIN32_CMD_ARG_SAFE.test(command) ||
+    args.some((a) => !WIN32_CMD_ARG_SAFE.test(a))
+  ) {
+    return null;
+  }
+  // cmd /s strips the first+last quote of the /c string — wrap the whole
+  // line in an outer quote pair so every token's own quotes survive. The
+  // caller must spawn with windowsVerbatimArguments so Node does not add
+  // its own quoting layer on top of this constructed line.
+  const line = `"${[command, ...args].map((t) => `"${t}"`).join(" ")}"`;
+  return { command: comspec, args: ["/d", "/s", "/c", line], verbatim: true };
 }
 
 /** Child env: minimal inherited surface only; CODEX_HOME pins the
@@ -73,6 +188,14 @@ export function codexCliChildEnv(env: CodexCliEnv | undefined): Record<string, s
   const out: Record<string, string> = {};
   for (const k of [
     "PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH",
+    // Windows process essentials — a stripped env leaves the child
+    // without SystemRoot (DNS/TLS/CreateProcess internals), a writable
+    // Temp, or its own install/config roots under LOCALAPPDATA and
+    // USERPROFILE. Each is still whitelist-forwarded, never ambient.
+    "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS",
+    "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME",
+    "USERDOMAIN", "APPDATA", "LOCALAPPDATA", "ProgramData", "PUBLIC",
+    "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
     // test-only fake-executable controls — inert for the real binary
     "FAKE_CODEX_BEHAVIOR", "FAKE_CODEX_PIDFILE", "FAKE_CODEX_INVOKELOG", "FAKE_CODEX_ENVFILE",
   ]) {
@@ -97,12 +220,20 @@ export async function spawnCodexCli(
   timeoutMs: number,
   env: CodexCliEnv | undefined,
 ): Promise<CodexCliSpawnResult> {
+  const target = windowsSpawnTarget(command, args);
+  if (!target) {
+    return {
+      status: "SPAWN_FAILED", code: null, stderrTail: "",
+      error: "CODEX_SPAWN_TARGET_UNSAFE",
+    };
+  }
   let child: ChildProcess;
   try {
-    child = spawn(command, args, {
+    child = spawn(target.command, target.args, {
       cwd: runDir,
       env: codexCliChildEnv(env),
       stdio: ["pipe", "pipe", "pipe"],
+      windowsVerbatimArguments: target.verbatim,
     });
   } catch (e) {
     return { status: "SPAWN_FAILED", code: null, stderrTail: "", error: String(e).slice(0, 200) };
