@@ -967,6 +967,9 @@ export function outcomeContinuation(outcome: OperatingOutcome): Continuation {
     case "TOPOLOGY_CHANGE_REQUIRED": return block("OWNER_TOPOLOGY_REVISION_REQUIRED");
     case "INSUFFICIENT_VERIFIED_PROGRESS": return wait("VERIFIED_KPI_EVIDENCE");
     case "OBJECTIVE_BUDGET_EXHAUSTED": return block("BUDGET_OWNER_ACTION_REQUIRED");
+    // P0-F3 — zero ceiling is a hard bound: same owner-action block as
+    // exhaustion (owner must provision budget), never silently continues.
+    case "OBJECTIVE_ZERO_BUDGET": return block("BUDGET_OWNER_ACTION_REQUIRED");
     case "NO_ELIGIBLE_AGENT": return wait("CANONICAL_WORKFORCE_CAPACITY", 60_000);
     case "DEPENDENCY_BLOCKED": return wait("CANONICAL_DEPENDENCY");
     case "OBJECTIVE_NOT_ACTIVE": return block("OBJECTIVE_LIFECYCLE_INACTIVE");

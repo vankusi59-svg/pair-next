@@ -111,7 +111,8 @@ const VOLATILE_FIELDS = new Set([
   "runtime_version",
 ]);
 
-const EXECUTION_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+// Canonical execution-terminal set — mirrors MissionRuntime.TERMINAL_EXECUTION.
+const EXECUTION_TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"]);
 
 function sortedStrList(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -131,7 +132,9 @@ export class ExecutorRegistry {
       .filter(
         (e) =>
           e.executor_id === executorId &&
-          !EXECUTION_TERMINAL.has(String(e.execution_state)),
+          !EXECUTION_TERMINAL.has(String(e.execution_state)) &&
+          // Phase D §5 / P0-F1 — terminal_outcome is durably settled.
+          !e.terminal_outcome,
       ).length;
   }
 

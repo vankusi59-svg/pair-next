@@ -33,6 +33,12 @@ export function reconciliationDigest(r: Record<string, unknown>): string {
 }
 
 export class ReconciliationService {
+  /** Orphan executions that can never auto-settle (still running or
+   *  unknown side effects) are re-observed at most this often — remote
+   *  work may legitimately reach a terminal adapter state later, but
+   *  per-sweep evidence growth stays bounded. */
+  static readonly ORPHAN_RECHECK_MS = 30_000;
+
   constructor(
     private readonly service: PairControlPlane,
     private readonly adapters: Map<string, ExecutorAdapter>,
@@ -40,6 +46,80 @@ export class ReconciliationService {
 
   private get store(): PairEvidenceStore {
     return this.service.store;
+  }
+
+  /**
+   * P0-F1 — orphan-execution settlement sweep. A mission that reaches a
+   * terminal status no longer has a live runtime driving its execution
+   * barriers, so any non-terminal `executor_execution` row it leaves
+   * behind would otherwise consume CapabilityRouter capacity forever.
+   * (planRestartRecovery scans only NON-terminal missions; abort is the
+   * one writer that legitimately leaves in-flight executions unresolved.)
+   *
+   * For every unsettled execution whose mission is canonically terminal,
+   * run the canonical reconcile() proof and apply the outcome:
+   *   CONFIRMED_COMPLETED / CONFIRMED_FAILED / CONFIRMED_NOT_EXECUTED —
+   *     authoritative: the row is durably settled via `terminal_outcome`
+   *     (the same marker operator acknowledgment uses) and the capacity
+   *     slot is released. `execution_state` itself is never rewritten —
+   *     it records what the process last reported, not a claimed result.
+   *   CONFIRMED_RUNNING / UNKNOWN_SIDE_EFFECT_STATE — the remote may
+   *     still be live or unknowable: the slot stays RESERVED. Re-probe on
+   *     a bounded cadence (`orphan_recheck_after`) so a later terminal
+   *     adapter observation still settles it; UNKNOWN additionally keeps
+   *     its only other release — explicit operator acknowledgment.
+   * Idempotent: settled rows are excluded by `terminal_outcome`, so a
+   * repeated sweep or restart writes no duplicate receipts/events.
+   */
+  settleTerminalMissionOrphans(nowMs: number = Date.now()): { settled: string[] } {
+    const TERMINAL_MISSION = new Set(["COMPLETED", "FAILED", "ABORTED", "CANCELLED"]);
+    const statusByMission = new Map(
+      this.store
+        .list("mission")
+        .map((m) => [String(m.mission_id), String(m.status)] as const),
+    );
+    const orphans = this.store.list("executor_execution").filter(
+      (e) =>
+        !TERMINAL.has(String(e.execution_state)) &&
+        !e.terminal_outcome &&
+        TERMINAL_MISSION.has(statusByMission.get(String(e.mission_id)) ?? "") &&
+        (!e.orphan_recheck_after ||
+          Date.parse(String(e.orphan_recheck_after)) <= nowMs),
+    );
+    const settled: string[] = [];
+    for (const e of orphans) {
+      const receipt = this.reconcile({ execution_id: String(e.execution_id) });
+      const outcome = String(receipt.outcome);
+      if (outcome === "CONFIRMED_RUNNING" || outcome === "UNKNOWN_SIDE_EFFECT_STATE") {
+        e.orphan_recheck_after = new Date(
+          nowMs + ReconciliationService.ORPHAN_RECHECK_MS,
+        ).toISOString();
+        this.store.put(
+          "executor_execution", String(e.execution_id), e, Number(e.version),
+        );
+        continue;
+      }
+      e.terminal_outcome = `RECONCILED_${outcome}`;
+      e.settled_receipt_id = String(receipt.reconciliation_id);
+      e.orphan_recheck_after = null;
+      this.store.put(
+        "executor_execution", String(e.execution_id), e, Number(e.version),
+      );
+      this.store.event({
+        entity_type: "executor_execution",
+        entity_id: String(e.execution_id),
+        event_type: "EXECUTION_ORPHAN_SETTLED",
+        new_state: String(e.terminal_outcome),
+        actor: "PAIR_RECONCILIATION_SERVICE",
+        metadata: {
+          mission_id: e.mission_id,
+          receipt_id: receipt.reconciliation_id,
+          outcome,
+        },
+      });
+      settled.push(String(e.execution_id));
+    }
+    return { settled };
   }
 
   /**

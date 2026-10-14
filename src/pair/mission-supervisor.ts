@@ -102,10 +102,21 @@ export class MissionSupervisor {
    * (reconcile unsettled executions, rebuild budgets) and wake each one.
    * Idempotent — safe to call on every boot.
    */
-  resume(): { missions: string[]; checkpoints: number; reconstructed: number } {
+  resume(): {
+    missions: string[];
+    checkpoints: number;
+    reconstructed: number;
+    orphans_settled: string[];
+  } {
     const checkpoints = this.recovery.planRestartRecovery((executionId) =>
       this.reconciliation.reconcile({ execution_id: executionId }),
     );
+    // P0-F1 — terminal missions are invisible to planRestartRecovery by
+    // design, but abort can leave their executions non-terminal. Reconcile
+    // + settle those orphans through the canonical authority before waking
+    // anything: confirmed-terminal releases capacity, CONFIRMED_RUNNING /
+    // UNKNOWN_SIDE_EFFECT_STATE keeps the slot reserved (fail closed).
+    const orphans = this.reconciliation.settleTerminalMissionOrphans();
     // Orphaned-mission rehydration (runtime-hardening B, R1): a mission
     // row can persist before its mission_runtime row — a crash in that
     // window leaves a live mission invisible to every runtime-scoped
@@ -147,7 +158,12 @@ export class MissionSupervisor {
       this.wake(missionId, "RESTART_REHYDRATE", { checkpoint: `MRCP_${missionId}` });
     }
     this.running = true;
-    return { missions, checkpoints: checkpoints.length, reconstructed };
+    return {
+      missions,
+      checkpoints: checkpoints.length,
+      reconstructed,
+      orphans_settled: orphans.settled,
+    };
   }
 
   /**
@@ -210,6 +226,12 @@ export class MissionSupervisor {
    */
   tick(now?: string): { ticked: string[]; skipped: string[] } {
     if (!this.running) this.start();
+    // P0-F1 — orphan executions under terminal missions have no live
+    // runtime to re-drive them: discover and settle them here too so a
+    // mid-uptime abort releases capacity without waiting for a restart.
+    // The sweep's per-execution recheck throttle bounds reconcile calls
+    // for rows that stay CONFIRMED_RUNNING / UNKNOWN_SIDE_EFFECT_STATE.
+    this.reconciliation.settleTerminalMissionOrphans();
     const runtimes = this.store
       .list("mission_runtime")
       .filter((rt) => NON_TERMINAL.has(String(rt.state)))

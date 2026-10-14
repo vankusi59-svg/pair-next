@@ -326,6 +326,36 @@ export interface ConfiguredRouteResolution extends ModelPoolRef {
  * empty provider, or empty model all fail closed. Safe diagnostics only:
  * role, configured ref, provider id, model id — never credentials.
  */
+/**
+ * Compose a configured role's route pool (P0-F2): primary first, then
+ * fallback, then comma-separated extras — each trimmed, in configured
+ * priority order, deduplicated by exact route spelling.
+ *
+ * Empty or whitespace-only candidates are "not configured" and dropped —
+ * an explicit `PAIR_*_FALLBACK_ROUTE=""` disables the fallback rather
+ * than injecting an invalid "" route into the pool. Malformed NON-empty
+ * candidates are preserved verbatim: strict resolution
+ * (resolveConfiguredModelRoleRoute) remains the fail-closed validator and
+ * composition never silently shrinks configured authority. The primary
+ * slot is likewise kept verbatim — an empty primary stays visible to
+ * fail-closed resolution instead of being silently replaced by the
+ * fallback.
+ */
+export function composeConfiguredRoleRoutes(opts: {
+  primary: string;
+  fallback?: string | null;
+  extras?: string | null;
+}): string[] {
+  const routes: string[] = [String(opts.primary ?? "").trim()];
+  const push = (candidate: unknown) => {
+    const r = String(candidate ?? "").trim();
+    if (r && !routes.includes(r)) routes.push(r);
+  };
+  if (opts.fallback !== undefined && opts.fallback !== null) push(opts.fallback);
+  for (const extra of String(opts.extras ?? "").split(",")) push(extra);
+  return routes;
+}
+
 export function resolveConfiguredModelRoleRoute(
   resolveEntry: (provider: string, model: string) => { model_entry_id?: unknown } | null | undefined,
   opts: { route: string; role: ModelRole },

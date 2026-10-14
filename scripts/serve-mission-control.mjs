@@ -88,6 +88,7 @@ import {
   dedupePlannerCandidates,
   reconcileModelRoleAssignments,
   resolveConfiguredModelRoleRoute,
+  composeConfiguredRoleRoutes,
   assertCanonicalModelRoleStateDisjoint,
   assertPlannerModelRole,
   assertPlannerCandidateEligible,
@@ -211,11 +212,15 @@ for (const extra of String(process.env.PAIR_PLANNER_EXTRA_ROUTES ?? "").split(",
 }
 const DSH_PRIMARY_ROUTE = String(process.env.PAIR_DSH_MODEL_ROUTE ?? "cloudflare:@cf/zai-org/glm-4.7-flash").trim();
 const DSH_FALLBACK_ROUTE = String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "groq:openai/gpt-oss-20b").trim();
-const DSH_ROUTES = [DSH_PRIMARY_ROUTE, DSH_FALLBACK_ROUTE];
-for (const extra of String(process.env.PAIR_DSH_EXTRA_ROUTES ?? "").split(",")) {
-  const r = extra.trim();
-  if (r && !DSH_ROUTES.includes(r)) DSH_ROUTES.push(r);
-}
+// P0-F2 — canonical composition: an explicit empty/whitespace fallback is
+// DISABLED (never an "" candidate reaching strict resolution); configured
+// routes dedupe without reordering; malformed non-empty routes still fail
+// closed at resolveConfiguredModelRoleRoute below.
+const DSH_ROUTES = composeConfiguredRoleRoutes({
+  primary: DSH_PRIMARY_ROUTE,
+  fallback: DSH_FALLBACK_ROUTE,
+  extras: process.env.PAIR_DSH_EXTRA_ROUTES,
+});
 // Cheap static pre-check: identical route spelling across pools fails fast;
 // the canonical model_entry_id overlap check runs after discovery.
 for (const pr of PLANNER_ROUTES) {
