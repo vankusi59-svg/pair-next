@@ -1,29 +1,18 @@
 {
-  "claim_id": "PHASE1_OP_CHAT_AUTH_STATUS",
-  "title": "Phase 1 — trusted authorization + read-only operational status foundation for PAIR Chat (Independent Audit R3 closure)",
+  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY",
+  "title": "Phase C — goal/agent-context authority boundary: non-authoritative sections may never mint Goal Contract requirements",
   "affected_surfaces": [
+    "PLANNER",
     "MISSION_CONTROL",
-    "CONVERSATION",
-    "MISSION_DRAFT",
-    "TELEGRAM_INGRESS",
-    "DEV_INFRA"
+    "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
-    "src/__tests__/pair-phase1-operational-chat.test.ts",
-    "src/__tests__/pair-phase1-http-boundary.test.ts",
-    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
-    "src/__tests__/pair-p15-8a-conversation-authority.test.ts",
-    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
-    "src/__tests__/pair-p15-8d-web-chat.test.ts",
-    "src/__tests__/pair-p15-8e-telegram.test.ts",
-    "src/__tests__/pair-p15-8f-proposal.test.ts",
-    "src/__tests__/pair-p15-8e-bridge-e2e.test.ts"
+    "src/__tests__/pair-goal-context-authority.test.ts"
   ],
   "invariants": [
-    "INV_CONV_001",
-    "INV_MISSION_001",
-    "INV_SECRETS_001"
+    "INV_PLAN_001",
+    "INV_MISSION_001"
   ],
-  "description": "R3 CORRECTION on BASE 5b5ab73 (audited HEAD fefb6b7; R2-F1/R2-F2 accepted). R3-F1: the idempotent-replay path returned a committed p.proposal without re-checking read_only — closed: replayed replies apply the same read_only gate (row unchanged, only the returned actionable surface suppressed). HTTP regression simulates the crash window (proposal committed via reasoning.turn, no draft), retries the same session/message/key under admin-only authority → zero drafts/missions/proposals, then proves authorized MC replay still recovers (proposal returned, idempotent draft mint). R3-F2: explicit request contract separates read-only query purpose from mission-creation purpose on the MC lane — the turns route now honors `body.read_only === true`, OR-ed with the credential-derived flag so a caller can only NARROW its own authority, never widen it. HTTP proofs: MC + read_only:true + proposal-emitting model → zero drafts; absent flag + actionable request → governed draft mints; declared read_only wins over actionable wording; mixed provider/cost wording neither grants nor revokes. Prior fixes retained: non-admin principals (operator AND telegram) are UNVERIFIED for scoped data (UNVERIFIED_IDENTITY, admin-only reads); admin credential bearer-only + boundary-scoped; strong admin secret fail-closed at boot; bounded valid-JSON envelopes; hook runs only after replay + stale-turn gates and mutates nothing.",
+  "description": "ROOT CAUSE on BASE 3737fc4: boundMissionGoal composes a delegated mission goal as '[BUSINESS …]' provenance + operator goal + an appended '[AGENT CONTEXT — last N outcomes]' section of history bullets. extractGoalContract parsed the whole enriched string, so a history bullet leading with a work verb ('- [delegated] Fetch and save GitHub Zen response') minted fabricated OBL_*/DEL_* requirements — observed live as OBL_001 'save GitHub Zen response' + DEL out.md/summary.txt → assertPlanCoverage FAIL_CLOSED_PLAN_INCOMPLETE → PLANNER_RUN_EXHAUSTED → Objective INTEGRITY_FAULT. FIX (structural, not lexical): extractGoalContract now derives requirements only from authoritativeGoalText() — the blank-line-separated first block (operator-authored text) plus any later block that is not a pure '[HEADER] + bullets' metadata section; whole-line bracketed section headers never mint requirements anywhere. The enriched goal still reaches the LLM prompt verbatim as supporting context; mission.goal text, goal_digest, plan digests, pinned plans, retry/idempotency, and fail-closed coverage semantics are unchanged — the same coverage machinery now sees the correct authority scope. detectTelegramDeliveryIntent/detectOutputLanguage call sites in serve-planner and mission-control (mission preview + confirm) evaluate the same authoritative projection so context notes cannot mint delivery intent or flip output language. boundMissionGoal collapses embedded whitespace inside emitted notes so the metadata section stays structurally bullet-only. Regressions pin: bare goals unchanged; bare vs enriched goals mint identical requirements; multiple EN/VI history notes mint nothing; genuine operator obligations/deliverables/prohibitions still mint and still fail closed when uncovered; the enriched text remains available to the planner prompt.",
   "risk_override": "HIGH"
 }

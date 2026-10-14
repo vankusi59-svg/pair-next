@@ -1579,7 +1579,11 @@ export class BusinessLayer {
     const notes = ctxScopes.has("agent")
       ? (((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
           .slice(-AGENT_CONTEXT_INJECT)
-          .map((n) => `- ${String(n.note)}`))
+          // Context lines stay single-line bullets: a note carrying raw
+          // newlines would break the appended section's bullet-only
+          // shape and leak non-authoritative text into goal-authority
+          // parsing (see authoritativeGoalText).
+          .map((n) => `- ${String(n.note).replace(/\s+/g, " ").trim()}`))
       : [];
     return (
       (ctxScopes.has("business") || !agentId

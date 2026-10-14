@@ -65,6 +65,75 @@ export interface GoalContract {
 }
 
 /* ------------------------------------------------------------------ */
+/* authority boundary                                                  */
+/* ------------------------------------------------------------------ */
+
+/** A delegated mission goal is an ENVELOPE, not flat operator text:
+ *  `boundMissionGoal` emits a `[BUSINESS … | DEPT … | AGENT …]`
+ *  provenance header, then the operator goal, then appended machine
+ *  sections such as `[AGENT CONTEXT — last N outcomes]` followed by
+ *  history bullets (`- [delegated] …`). The appended sections are
+ *  supporting context for the planner — they must never mint
+ *  obligations, deliverables, constraints, or prohibitions. Live
+ *  incident: a history bullet leading with a work verb minted a
+ *  fabricated OBL requirement, coverage failed closed
+ *  (FAIL_CLOSED_PLAN_INCOMPLETE), the planner run exhausted, and the
+ *  objective recorded INTEGRITY_FAULT.
+ *
+ *  The boundary is STRUCTURAL, never lexical. The goal is decomposed
+ *  into blank-line-separated blocks; a block after the first whose
+ *  every line is a whole-line section header (`[NAME …]`) or a list
+ *  bullet is appended machine context and carries no requirement
+ *  authority. Whole-line bracketed headers are section labels wherever
+ *  they appear and never mint requirements (the `[BUSINESS …]`
+ *  provenance line included — a business named "Write Co" must not
+ *  mint a "Write" obligation). The first block is always operator-
+ *  authored, so its own bullets remain real requirements even when the
+ *  goal is itself a list.
+ *
+ *  This projection governs ONLY authority derivation (contract +
+ *  intent/language detection at the planner and mission seams). The
+ *  raw enriched goal still reaches the planner prompt verbatim as
+ *  supporting context, and the persisted mission goal / goal_digest /
+ *  pinned-plan digests are untouched. */
+const SECTION_HEADER_RE = /^\s*\[[^\]\n]+\]\s*$/u;
+const LIST_ITEM_RE = /^\s*(?:[-*•–—]|\d{1,3}[.)])\s/u;
+
+/** Project a (possibly enriched) goal down to the text that may mint
+ *  authority: drops appended `[SECTION]` + bullet metadata sections and
+ *  standalone section-header lines; keeps operator text verbatim. */
+export function authoritativeGoalText(goal: string): string {
+  const blocks: string[][] = [];
+  let cur: string[] = [];
+  for (const line of String(goal ?? "").split(/\r?\n/)) {
+    if (line.trim() === "") {
+      if (cur.length > 0) {
+        blocks.push(cur);
+        cur = [];
+      }
+    } else {
+      cur.push(line);
+    }
+  }
+  if (cur.length > 0) blocks.push(cur);
+
+  const kept: string[][] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    const isMetadataSection =
+      i > 0 &&
+      block.some((l) => SECTION_HEADER_RE.test(l)) &&
+      block.every(
+        (l) => SECTION_HEADER_RE.test(l) || LIST_ITEM_RE.test(l),
+      );
+    if (isMetadataSection) continue;
+    const text = block.filter((l) => !SECTION_HEADER_RE.test(l));
+    if (text.length > 0) kept.push(text);
+  }
+  return kept.map((b) => b.join("\n")).join("\n\n");
+}
+
+/* ------------------------------------------------------------------ */
 /* clause splitting                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -624,9 +693,11 @@ function prohibitionPayload(clause: string): {
 }
 
 /** Extract the Goal Contract — the deterministic, append-only projection
- *  of the raw operator goal. Same input → same contract, always. */
+ *  of the authoritative operator goal. Same input → same contract,
+ *  always. Appended machine context (agent history, provenance headers)
+ *  is projected out first and can never mint a requirement. */
 export function extractGoalContract(goal: string): GoalContract {
-  const raw = String(goal ?? "");
+  const raw = authoritativeGoalText(goal);
   const clauses = splitClauses(raw);
   // A prohibition trigger opening mid-clause scopes only its own span —
   // "phân tích EA không dùng martingale" keeps the `phân tích EA`

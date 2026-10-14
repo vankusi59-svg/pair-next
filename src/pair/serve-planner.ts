@@ -64,7 +64,10 @@ import {
   isContentBearing,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
-import { extractGoalContract } from "./goal-contract.js";
+import {
+  authoritativeGoalText,
+  extractGoalContract,
+} from "./goal-contract.js";
 import { assertPlanCoverage } from "./plan-coverage.js";
 import { IntegrityError } from "./errors.js";
 import type { RuntimePlanner, RuntimePlannerInput } from "./mission-runtime.js";
@@ -190,7 +193,9 @@ export function makeServeCanonicalizer(deps: {
     // captured inside the planner transport (llmPlan/codexPlannerPlan)
     // BEFORE its own sanitizePlan; the incoming task list has already
     // survived that first drop and can no longer prove it.
-    const deliveryIntent = detectTelegramDeliveryIntent(String(goal ?? ""));
+    const deliveryIntent = detectTelegramDeliveryIntent(
+      authoritativeGoalText(String(goal ?? "")),
+    );
     // R2 — evidence is the tri-state inspection: an explicit
     // `raw_delivery_emission_state`/`_count` pair wins (production
     // failover always supplies it); absent evidence means the caller
@@ -523,7 +528,9 @@ export function makeServeCanonicalizer(deps: {
     // the operator REQUEST alone.
     reconcilePlanDataflow(allTasks as never[], {
       telegramIntent: deliveryIntent,
-      outputLanguage: detectOutputLanguage(String(goal ?? "")),
+      outputLanguage: detectOutputLanguage(
+        authoritativeGoalText(String(goal ?? "")),
+      ),
       external_input_artifacts: ctx?.external_input_artifacts,
     });
     // PRV2-B — Goal Contract coverage authority, AFTER dataflow
