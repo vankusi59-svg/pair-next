@@ -16,6 +16,7 @@ export * from "./proposal.js";
 export * from "./output-language.js";
 export * from "./plan-dataflow.js";
 export * from "./plan-feasibility.js";
+export * from "./replan-generation.js";
 export * from "./serve-planner.js";
 export * from "./telegram-delivery.js";
 export * from "./telegram-transport.js";

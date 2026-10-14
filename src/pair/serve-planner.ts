@@ -25,10 +25,15 @@
  *     falls through to the RecoveryController's next bounded action.
  *
  *   The production LLM planner (`llmPlan`) is asynchronous and cannot
- *   run inside the synchronous `RuntimePlanner` contract, so production
- *   wiring passes no `replanProvider`: live production replanning is
- *   explicitly UNSUPPORTED under the current sync contract and REPLAN
- *   fails closed rather than replaying the old plan.
+ *   run inside the synchronous `RuntimePlanner` contract. The governed
+ *   bridge (src/pair/replan-generation.ts) stages async Planner Pool
+ *   candidates in a durable `replan_generation` row and is wired here as
+ *   `replanProvider` behind `PAIR_ASYNC_REPLAN_PROVIDER=1`; a provider
+ *   that already canonicalized inside the pool returns `canonical:
+ *   true` and is forwarded verbatim (runReplan's committed gates still
+ *   apply). With no provider configured, live production replanning
+ *   remains explicitly UNSUPPORTED and REPLAN fails closed rather than
+ *   replaying the old plan.
  */
 import {
   isBookkeepingShapedTask,
@@ -143,11 +148,22 @@ export interface ServePlannerDeps {
   /** Optional SYNCHRONOUS governed replan provider. Receives the full
    *  RuntimePlannerInput including `replan_context`; its raw candidate
    *  still flows through the same canonicalize seam — no direct commit
-   *  from provider output. Absent → REPLAN reports unavailability. */
+   *  from provider output — UNLESS it returns `canonical: true`, meaning
+   *  the candidate already passed the canonical preparation seam inside
+   *  the async Planner Pool (the governed replan-generation bridge):
+   *  a second pass would double PAIR-owned structure, so it is forwarded
+   *  verbatim and runReplan's committed gates still apply. Absent →
+   *  REPLAN reports unavailability. */
   replanProvider?:
     | ((
         input: RuntimePlannerInput,
-      ) => { tasks?: Array<Record<string, unknown>> } | null | undefined)
+      ) =>
+        | {
+            tasks?: Array<Record<string, unknown>>;
+            canonical?: boolean;
+          }
+        | null
+        | undefined)
     | null;
 }
 
@@ -678,6 +694,14 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         const candidate = provider(input);
         const raw = candidate?.tasks;
         if (Array.isArray(raw) && raw.length) {
+          // Staged async-pool candidate (governed replan-generation
+          // bridge): canonicalization ran ONCE inside
+          // runPlannerFailover's winner-check — a second pass would
+          // double PAIR-owned structure. Forwarded verbatim; every
+          // committed runReplan gate still applies downstream.
+          if (candidate?.canonical === true) {
+            return { tasks: raw };
+          }
           try {
             const tasks = canonicalizeLlmTasks(raw, goal, {
               authorityGoal,

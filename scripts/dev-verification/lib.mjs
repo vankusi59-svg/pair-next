@@ -13,6 +13,7 @@ export const SURFACES = [
 /** Literal file → surfaces (exact path match wins over prefixes). */
 const SURFACE_FILES = {
   "src/pair/serve-planner.ts": ["PLANNER", "DELIVERY", "RECOVERY_REPLAY"],
+  "src/pair/replan-generation.ts": ["PLANNER", "RECOVERY_REPLAY"],
   "src/pair/plan-dataflow.ts": ["PLANNER", "DELIVERY"],
   "src/pair/llm-planner.ts": ["PLANNER"],
   "src/pair/codex-planner.ts": ["PLANNER"],
@@ -169,6 +170,7 @@ const HIGH_RISK_FILES = new Set([
   "src/pair/reconciliation.ts",
   "src/pair/persistence.ts",
   "src/pair/store.ts",
+  "src/pair/replan-generation.ts",
   "src/pair/mission-runtime.ts",
   "src/pair/mission-supervisor.ts",
   "src/pair/work-completion.ts",

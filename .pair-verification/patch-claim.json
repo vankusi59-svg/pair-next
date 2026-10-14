@@ -1,24 +1,27 @@
 {
-  "claim_id": "P0_REMAINING_LIVE_DEFECTS_R1",
-  "title": "P0 live defects — Audit R1 closure: capacity release requires authoritative terminal evidence; per-orphan fault isolation in supervisor sweep",
+  "claim_id": "GOVERNED_ASYNC_REPLAN_PROVIDER",
+  "title": "Governed async replan provider — durable candidate staging bridges the async Planner Pool to the synchronous RuntimePlanner REPLAN path (isolated feature flag, default OFF)",
   "affected_surfaces": [
-    "GATE_ROUTER",
+    "PLANNER",
     "RECOVERY_REPLAY",
-    "REMOTE_EXECUTION",
     "MISSION_CONTROL",
     "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
+    "src/__tests__/pair-async-replan-generation.test.ts",
+    "src/__tests__/pair-f3-replan-closure.test.ts",
+    "src/__tests__/pair-f3-r1-remediation.test.ts",
+    "src/__tests__/pair-f3-r2-remediation.test.ts",
     "src/__tests__/pair-p0-live-defects.test.ts",
-    "src/__tests__/pair-p0-live-defects.test.ts#R1-F1",
-    "src/__tests__/pair-p0-live-defects.test.ts#R1-F2",
-    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts#P0-F3"
+    "src/__tests__/pair-cpl1-codex-planner.test.ts",
+    "src/__tests__/pair-phase-c-unified-planner.test.ts",
+    "src/__tests__/pair-live-ops-recovery-closure.test.ts"
   ],
   "invariants": [
-    "INV_EXEC_001",
+    "INV_PLAN_001",
     "INV_REPLAY_001",
     "INV_MISSION_001"
   ],
-  "description": "Audit R1 closure of PR #117's orphan-settle sweep (F1 mechanism + F2/F3 unchanged). R1-F1: capacity released only on authoritative terminal evidence — settleTerminalMissionOrphans now requires facts.observed_status to be a canonical terminal state (adapter-observed COMPLETED/FAILED/CANCELLED/TIMEOUT). \"No observation + no run_root\" (adapter unbound, observe() threw, lost run_root) is weak evidence — stays RESERVED and re-probes on orphan_recheck_after; UNKNOWN_SIDE_EFFECT_STATE never auto-settles; operator acknowledgment remains the other release. R1-F2: each orphan is isolated in its own try/catch and re-read via tryGet before mutation — a concurrent writer (operator ack, barrier, sibling sweep) is absorbed not stomped, a version conflict skips that orphan and converges on a later sweep; supervisor.tick() wraps the sweep so even a systemic sweep fault cannot abort mission ticking. Idempotent: terminal_outcome excludes settled rows — repeated sweeps/restarts write no duplicate receipts, events, or slot releases. Regressions: 6 new R1 tests fail on R0 f7cb738 (weak-evidence settles + VERSION_CONFLICT escaping tick), pass on HEAD. F2 composeConfiguredRoleRoutes and F3 OBJECTIVE_ZERO_BUDGET unchanged.",
+  "description": "Production Mission Runtime previously failed closed FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE on every governed REPLAN decision because the LLM Planner Pool is async and the RuntimePlanner contract is sync. This change bridges the two through a NEW durable entity `replan_generation` (contract pair-replan-generation.v1): the sync bridge (wired as ServePlannerDeps.replanProvider under PAIR_ASYNC_REPLAN_PROVIDER=1, default OFF) mints/inspects a deterministic per-(recovery_id, attempt_index) generation row binding mission, recovery decision, superseded plan, failure-context snapshot and attempt index; it throws REPLAN_GENERATION_PENDING (distinct, non-FAIL_CLOSED code) while generation is in flight — MissionRuntime.runReplan treats that code as NOT a failure and consumes NO candidate slot, staying REPLANNING. An async driver (ReplanGenerationService claim/settle/reconcile + makeReplanGenerationDriver sweep, driven from the existing 1s supervisor interval) claims PENDING rows under a bounded lease+deadline (single-flight, restart-safe re-claim, bounded claim count), invokes the SAME runPlannerFailover composition (shared invokePlannerPool seam extracted verbatim from planExpander) with structured replan_context propagated into BOTH planner transports (llmPlan already accepts replanContext; CodexPlannerInvokeConfig gains the field and forwards it to the canonical buildPlannerUserPrompt), and settles the row STAGED or FAILED with typed outcome (PROVIDER_UNAVAILABLE/EXHAUSTED/TIMEOUT/ADMISSION_REJECTED/GENERATION_FAILED). The staged candidate re-enters runReplan through the EXISTING synchronous gates — validatePlanProposal + bindPlanExternalInputs + assertPlanDataflow + semantic dedup + ReplanAttemptLedger PREPARED → atomic commit — unchanged. Generation failures map onto the existing FAIL_CLOSED_REPLAN_PROVIDER_* prefix so provider unavailability/timeout/exhaustion/cost-admission rejection keep today's REPLAN-infeasible → fresh-decision semantics. Cost admission reuses service.cost.admitPlannerInvocation with canonical work_open_binding lineage resolution (zero-budget/broken-lineage fail closed before any model invocation). Flag OFF = byte-identical prior behavior.",
   "risk_override": "HIGH"
 }
