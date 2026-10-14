@@ -1,18 +1,24 @@
 {
-  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY_R2_RESIDUAL",
-  "title": "Phase C R2 residual — pinned operator_goal never bypasses bound-provenance chain validation",
+  "claim_id": "P0_WINDOWS_NATIVE_RUNTIME",
+  "title": "P0 — Windows-native runtime: kernel-HANDLE artifact security + native Codex executor",
   "affected_surfaces": [
     "MISSION_CONTROL",
-    "RECOVERY_REPLAY",
+    "EXECUTOR",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-goal-context-authority.test.ts"
+    "src/__tests__/pair-p0-win32-runtime.test.ts",
+    "src/__tests__/pair-p0-win32-codex.test.ts",
+    "src/__tests__/pair-goal-context-authority.test.ts",
+    "src/__tests__/pair-f1-r2-remediation.test.ts"
   ],
   "invariants": [
-    "INV_PLAN_001",
-    "INV_MISSION_001"
+    "INV_ARTIFACT_001",
+    "INV_ARTIFACT_002",
+    "INV_EXEC_001",
+    "INV_MISSION_001",
+    "INV_SECRETS_001"
   ],
-  "description": "Audit R2 residual on fd3534e: missionOperatorGoal returned a pinned operator_goal BEFORE validating bound provenance, letting bound missions bypass binding-consistency checks. FIX: bound_open_id now takes precedence — the canonical chain work_open_binding(mission_id-consistent) → work_item.goal is validated on EVERY resolution; the pinned field is the immutable snapshot of that goal (identical by construction — any divergence → FAIL_CLOSED_BOUND_GOAL_PROVENANCE); legacy rows without the pin recover the snapshot from the chain; direct missions keep pin/goal fallback. Immutable snapshot + digest/replay semantics preserved. +5 regressions: pinned × {missing binding, mismatched binding, missing work_item, pin divergence} all fail closed with DETERMINISTIC code; pinned + intact chain resolves normally. 43/43 focused green.",
+  "description": "Windows-native closure of the two post-PR#115 execution blockers. WS-A: new src/pair/win32-object-io.ts binds every governed filesystem step to the kernel HANDLE of the opened object (CreateFileW/NtCreateFile with RootDirectory-relative opens = literal /proc/self/fd/<fd>/<name> parity, GetFinalPathNameByHandleW for opened-object canonical path, FileIdInfo identity, FileRenameInformationEx atomic no-replace publish, FILE_DELETE_ON_CLOSE temp discipline, FlushFileBuffers real dir durability, OPEN_REPARSE_POINT = O_NOFOLLOW parity). Wired into secureReadContained (canonical.ts), CAS dir fsync (artifact-authority.ts), and dependency materialization (artifact-handoff.ts) — all POSIX paths unchanged. WS-B: codex-cli-transport resolves executables natively on win32 (PATHEXT scan + LOCALAPPDATA install dirs + env seams, prefers real .exe over .cmd shims), spawns .cmd only via COMSPEC with a metacharacter-strict argv whitelist; codex-adapter pins windows.sandbox='elevated' on win32 (real codex 0.162.0-alpha.17.2 verified: exec_command runs as CodexSandboxOffline under restricted token), adds async child error handling so spawn failures settle FAILED not TIMEOUT, preserves timeout/cancel, and supplies Windows essentials (SYSTEMROOT/USERPROFILE/LOCALAPPDATA/PATH) while still stripping ambient secrets and PAIR control flags. WS-C: LOCAL_INGEST_SUPPORTED now probes the real seam (HANDLE path qualifies win32); strict COMPLETED required — delegated-mission proof now COMPLETES on native Windows (previously ABORTED-only). POSIX-only fs-instrumentation tests in f1-r2 gated behind explicit platform skips; dir-symlink attacks use unprivileged junctions on win32. 25/25 win32-runtime adversarial + live codex file green; 43/43 goal-context green.",
   "risk_override": "HIGH"
 }

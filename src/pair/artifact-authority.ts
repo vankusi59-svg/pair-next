@@ -49,6 +49,7 @@ import {
 } from "./canonical.js";
 import { IntegrityError } from "./errors.js";
 import type { PairEvidenceStore } from "./store.js";
+import * as w32 from "./win32-object-io.js";
 
 /** F1 §9 — explicit artifact-layer bounds (a general workforce
  *  primitive, NOT Telegram-specific): 64 MiB canonical cap, 32 artifacts
@@ -1085,8 +1086,24 @@ export class ArtifactAuthority {
    *  fsync so a power-loss cannot drop a committed blob name. ONLY
    *  documented unsupported-platform/fs codes degrade; every other
    *  failure (EIO, EPERM, ...) fails closed — an uncommitted directory
-   *  entry must never masquerade as durable. */
+   *  entry must never masquerade as durable. On win32 node cannot fsync
+   *  a directory fd (EPERM) — the barrier runs on the REAL opened dir
+   *  HANDLE via FlushFileBuffers (win32-object-io). */
   private ensureBlobDirectoryDurable(dir: string, sha256: string): void {
+    if (process.platform === "win32") {
+      const opened = w32.openObject(dir, { directory: true, followReparse: true });
+      try {
+        if (!opened.ok || !opened.obj.isDir || !w32.flushObject(opened.obj)) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_ARTIFACT_BLOB_DURABILITY",
+            `${sha256}:win32_dir_fsync`,
+          );
+        }
+      } finally {
+        if (opened.ok) w32.closeObject(opened.obj);
+      }
+      return;
+    }
     try {
       const dfd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
       try {

@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ulid } from "ulid";
 import { IntegrityError } from "./errors.js";
+import * as w32 from "./win32-object-io.js";
 
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortValue(value) as JsonValue, undefined, 0).replace(
@@ -125,12 +126,15 @@ export function compatOutboxBasename(logicalName: string): string {
 /** R2.1 — secure contained file read: binds containment proof and byte
  *  materialization to the SAME opened file object. `realpath(check) →
  *  reopen(path)` is a TOCTOU — a parent symlink or directory entry can
- *  be swapped between resolution and read. Here the fd is opened once
- *  (O_NOFOLLOW on the final component), the OPENED object's real path
- *  is resolved through /proc/self/fd (Linux — fails closed where
- *  unavailable), proven under a governed allowed root, fstat'd, bounded,
- *  read and length-verified — all on that one fd. Parent-symlink swaps
- *  after open cannot redirect the already-bound file object. */
+ *  be swapped between resolution and read. Here the object is opened
+ *  once (final-component reparse points opened AS the link object —
+ *  O_NOFOLLOW parity), the OPENED object's real path is resolved by the
+ *  kernel (/proc/self/fd on Linux; GetFinalPathNameByHandleW on the same
+ *  HANDLE on Windows), proven under a governed allowed root, stat'd,
+ *  bounded, read and length-verified — all on that one open object.
+ *  Parent-symlink swaps after open cannot redirect the already-bound
+ *  file object. Fails closed where the platform cannot prove the opened
+ *  object. */
 export type SecureContainedReadResult =
   | { kind: "ok"; size: number; bytes: Buffer }
   | { kind: "too_large"; size: number }
@@ -139,6 +143,18 @@ export type SecureContainedReadResult =
   | { kind: "symlink" };
 
 export function secureReadContained(
+  p: string,
+  maxBytes: number,
+  allowedRoots: string[],
+): SecureContainedReadResult {
+  if (process.platform === "win32") {
+    return secureReadContainedWin32(p, maxBytes, allowedRoots);
+  }
+  return secureReadContainedPosix(p, maxBytes, allowedRoots);
+}
+
+/** POSIX contract — fd-anchored proof via /proc/self/fd. Unchanged. */
+function secureReadContainedPosix(
   p: string,
   maxBytes: number,
   allowedRoots: string[],
@@ -197,6 +213,68 @@ export function secureReadContained(
     return { kind: "ok", size, bytes };
   } finally {
     fs.closeSync(fd);
+  }
+}
+
+/** win32 contract — HANDLE-anchored proof (P0-A): the object is opened
+ *  once via kernel32 (FILE_FLAG_OPEN_REPARSE_POINT — a final-component
+ *  symlink/junction is opened AS the link → `symlink`, never followed),
+ *  its canonical path resolved by GetFinalPathNameByHandleW on that same
+ *  HANDLE, containment proven under a governed allowed root, size bound,
+ *  bytes read through ReadFile on the same handle, then identity +
+ *  stability re-probed on that same handle. Junctions/reparse points in
+ *  the ancestor chain are already resolved by the kernel in the opened
+ *  object's final path; UNC and cross-volume targets resolve to their
+ *  real canonical path and fail the root check. */
+function secureReadContainedWin32(
+  p: string,
+  maxBytes: number,
+  allowedRoots: string[],
+): SecureContainedReadResult {
+  const opened = w32.openObject(p);
+  if (!opened.ok) {
+    return { kind: "unresolved" };
+  }
+  const obj = opened.obj;
+  try {
+    // OPEN_REPARSE_POINT → the handle IS the reparse point object when
+    // the final component is a link (junction, symlink, mount point).
+    if (obj.isReparse) return { kind: "symlink" };
+    if (obj.isDir) return { kind: "unresolved" };
+    const inside = allowedRoots.some((ap) => {
+      try {
+        return w32.win32PathWithin(obj.finalPath, fs.realpathSync(ap));
+      } catch {
+        return false;
+      }
+    });
+    if (!inside) return { kind: "outside" };
+    if (obj.sizeBytes > BigInt(maxBytes)) {
+      return { kind: "too_large", size: Number(obj.sizeBytes) };
+    }
+    const size = Number(obj.sizeBytes);
+    const bytes = w32.readObject(obj, maxBytes);
+    if (bytes === null || bytes.length !== size) {
+      return { kind: "unresolved" };
+    }
+    // R3.3 parity — re-probe the SAME handle after the read: identity
+    // (volume + FileId) and mutation markers (size / last-write /
+    // change) must be identical — a torn or swapped object never
+    // silently passes.
+    const st2 = w32.objectInfo(obj);
+    if (
+      st2 === null ||
+      st2.volumeSerial !== obj.volumeSerial ||
+      st2.fileId !== obj.fileId ||
+      st2.sizeBytes !== obj.sizeBytes ||
+      st2.lastWriteTime !== obj.lastWriteTime ||
+      st2.changeTime !== obj.changeTime
+    ) {
+      return { kind: "unresolved" };
+    }
+    return { kind: "ok", size, bytes };
+  } finally {
+    w32.closeObject(obj);
   }
 }
 

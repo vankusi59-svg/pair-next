@@ -50,6 +50,7 @@ import {
 } from "./artifact-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
+import * as w32 from "./win32-object-io.js";
 import type { ArtifactConsumeCapabilityClaims } from "./artifact-consume-capability.js";
 import { artifactDependencySetDigest } from "./artifact-consume-capability.js";
 import {
@@ -125,6 +126,9 @@ export const DEPENDENCY_ARTIFACT_ROOT = ".pair/dependency-artifacts";
  *  bound) and a documented aggregate cap. */
 export const MAX_DEPENDENCY_ARTIFACTS_PER_TASK = 32;
 export const MAX_DEPENDENCY_ARTIFACT_TOTAL_BYTES = 256 * 1024 * 1024;
+
+/** P0-A — read-only access mask for handle-relative child opens on win32. */
+const WIN32_READ_ONLY_ACCESS = w32.W32.GENERIC_READ | w32.W32.SYNCHRONIZE;
 
 /** Dependency-resolution failures classify deterministically as
  *  DEPENDENCY_FAILURE (the recovery classifier maps the FAIL_CLOSED_
@@ -1491,6 +1495,25 @@ export class ArtifactHandoffService {
       }
       const { relParts, realWorkspace, realAllowedRoots } =
         this.resolveConsumerDest(workspace, allowedPaths, e);
+      // P0-A — Windows-native materialization bound to kernel HANDLEs:
+      // every name lookup is anchored to the proven directory object
+      // (NtCreateFile RootDirectory == /proc/self/fd/<dirfd>/<name>),
+      // publication is an atomic no-replace handle-relative rename
+      // (FileRenameInformation ReplaceIfExists=false == link() EEXIST),
+      // and dir durability is a real FlushFileBuffers on that handle.
+      if (process.platform === "win32") {
+        this.materializeEntryWin32(
+          handoff,
+          governed,
+          e,
+          bytes,
+          relParts,
+          realWorkspace,
+          realAllowedRoots,
+        );
+        materialized.push(e.consumer_relative_path);
+        continue;
+      }
       // R2.3 — the directory OBJECT proven inside the governed workspace
       // is the directory object used to create/write/rename the
       // dependency file. Everything below the bound fd is expressed as
@@ -2144,6 +2167,207 @@ export class ArtifactHandoffService {
       throw err;
     }
     return { fd: curFd, realPath: curReal! };
+  }
+
+  /**
+   * P0-A win32 — the `openContainedParentFd` equivalent on kernel
+   * HANDLEs: the workspace directory is opened once, each existing
+   * component is opened INSIDE the previously proven handle
+   * (NtCreateFile RootDirectory), each missing component is created
+   * inside the proven handle — a swapped pathname component can never
+   * redirect even the mkdir. A component that is a reparse point
+   * (junction/symlink) is opened AS the link object and fails closed —
+   * O_NOFOLLOW parity. Final component must live beneath a real allowed
+   * root. Fails closed when the platform cannot prove opened objects.
+   */
+  private openContainedParentWin32(
+    realWorkspace: string,
+    dirComponents: string[],
+    realAllowedRoots: string[],
+    rel: string,
+  ): { obj: w32.W32Object; realPath: string } {
+    const fail = (reason: string): never => {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+        `${rel}:${reason}`,
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
+    };
+    const openDir = (p: string): w32.W32Object => {
+      const r = w32.openObject(p, { directory: true });
+      if (!r.ok) fail("parent_open");
+      return r.ok ? r.obj : (undefined as never);
+    };
+    const prove = (obj: w32.W32Object, final: boolean): string => {
+      if (obj.isReparse || !obj.isDir) fail("parent_open");
+      if (!w32.win32PathWithin(obj.finalPath, realWorkspace)) {
+        fail("parent_outside_workspace");
+      }
+      if (
+        final &&
+        !realAllowedRoots.some((r) => w32.win32PathWithin(obj.finalPath, r))
+      ) {
+        fail("parent_outside_allowed_paths");
+      }
+      return obj.finalPath;
+    };
+    let cur = openDir(realWorkspace);
+    let curReal = prove(cur, false);
+    try {
+      for (let i = 0; i < dirComponents.length; i++) {
+        const comp = dirComponents[i]!;
+        // Open INSIDE the proven directory object — the name lookup is
+        // anchored to the handle, never to a mutable pathname.
+        let child = w32.openChildObject(cur, comp, { directory: true });
+        if (!child.ok && child.kind === "not_found") {
+          // mkdir INSIDE the proven directory object.
+          child = w32.openChildObject(cur, comp, {
+            directory: true,
+            create: "create",
+          });
+        }
+        if (!child.ok) fail("parent_open");
+        const childObj = child.ok ? child.obj : (undefined as never);
+        const childReal = prove(childObj, i === dirComponents.length - 1);
+        w32.closeObject(cur);
+        cur = childObj;
+        curReal = childReal;
+      }
+    } catch (err) {
+      w32.closeObject(cur);
+      throw err;
+    }
+    return { obj: cur, realPath: curReal };
+  }
+
+  /**
+   * P0-A win32 — materialize one pinned dependency artifact into the
+   * consumer workspace, bound entirely to kernel handles. Mirrors the
+   * Linux sequence exactly: bounded open-object verify → temp create
+   * inside the proven dir → write+fsync on the same handle → atomic
+   * no-replace publish (collision → converge-or-fail on the raced dest)
+   * → dir fsync → post-write re-probe of the MATERIALIZED object.
+   */
+  private materializeEntryWin32(
+    handoff: Record<string, unknown>,
+    governed: Record<string, unknown>,
+    e: DependencyArtifactEntry,
+    bytes: Buffer,
+    relParts: string[],
+    realWorkspace: string,
+    realAllowedRoots: string[],
+  ): void {
+    const fail = (reason: string): never => {
+      throw new DependencyResolutionError(
+        "FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE",
+        `${e.consumer_relative_path}:${reason}`,
+        { dependency_reason: "HANDOFF_MATERIALIZATION_FAILED" },
+      );
+    };
+    const parent = this.openContainedParentWin32(
+      realWorkspace,
+      relParts.slice(0, -1),
+      realAllowedRoots,
+      e.consumer_relative_path,
+    );
+    const dirObj = parent.obj;
+    try {
+      const base = relParts[relParts.length - 1]!;
+      const converged = (obj: w32.W32Object): boolean => {
+        const b = w32.readObject(obj, MAX_ARTIFACT_BYTES);
+        return (
+          b !== null &&
+          sha256Hex(b) === e.sha256 &&
+          b.length === e.byte_size
+        );
+      };
+      const existing = w32.openChildObject(dirObj, base, {
+        access: WIN32_READ_ONLY_ACCESS,
+      });
+      if (existing.ok) {
+        try {
+          if (existing.obj.isReparse || existing.obj.isDir) {
+            fail("conflict");
+          }
+          if (converged(existing.obj)) {
+            this.markState(handoff, "MATERIALIZED", governed);
+            return;
+          }
+          fail("existing_bytes_differ");
+        } finally {
+          w32.closeObject(existing.obj);
+        }
+      }
+      if (!existing.ok && existing.kind !== "not_found") {
+        fail(`dest_open:${existing.kind}`);
+      }
+      const tmpName = `.${base}.tmp-${process.pid}-${Math.random()
+        .toString(36)
+        .slice(2, 10)}`;
+      const tmp = w32.openChildObject(dirObj, tmpName, { create: "create" });
+      if (!tmp.ok) fail(`tmp_open:${tmp.kind}`);
+      const tobj = tmp.ok ? tmp.obj : (undefined as never);
+      let published = false;
+      try {
+        // Prove the OPENED temp object before a byte lands: a regular
+        // non-reparse file whose canonical path stays inside the proven
+        // dir — same check the Linux branch makes via /proc/self/fd.
+        if (tobj.isReparse || tobj.isDir) fail("tmp_object");
+        if (!w32.win32PathWithin(tobj.finalPath, parent.realPath)) {
+          fail("tmp_outside");
+        }
+        if (!w32.writeObject(tobj, bytes)) fail("tmp_write");
+        if (!w32.flushObject(tobj)) fail("tmp_fsync");
+        const pub = w32.renameIntoDir(tobj, dirObj, base);
+        if (pub === "ok") {
+          published = true;
+          w32.closeObject(tobj); // the opened object IS the dest now
+        } else if (pub === "exists") {
+          w32.deleteOnClose(tobj);
+          w32.closeObject(tobj);
+          const raced = w32.openChildObject(dirObj, base, {
+            access: WIN32_READ_ONLY_ACCESS,
+          });
+          if (!raced.ok) fail(`dest_open:${raced.kind}`);
+          const racedObj = raced.ok ? raced.obj : (undefined as never);
+          try {
+            if (converged(racedObj)) {
+              this.markState(handoff, "MATERIALIZED", governed);
+              return;
+            }
+            fail("existing_bytes_differ");
+          } finally {
+            w32.closeObject(racedObj);
+          }
+        } else {
+          fail(`publish:${pub.status.toString(16)}`);
+        }
+      } finally {
+        if (!published) {
+          w32.deleteOnClose(tobj);
+          w32.closeObject(tobj);
+        }
+      }
+      // Directory durability barrier on the SAME proven handle.
+      if (!w32.flushObject(dirObj)) {
+        fail("dir_fsync:win32");
+      }
+      // Post-write verification of the MATERIALIZED object bound to the
+      // proven directory — never the mutable root pathname.
+      const written = w32.openChildObject(dirObj, base, {
+        access: WIN32_READ_ONLY_ACCESS,
+      });
+      if (!written.ok) fail("post_write_mismatch");
+      const writtenObj = written.ok ? written.obj : (undefined as never);
+      try {
+        if (!converged(writtenObj)) fail("post_write_mismatch");
+      } finally {
+        w32.closeObject(writtenObj);
+      }
+      this.markState(handoff, "MATERIALIZED", governed);
+    } finally {
+      w32.closeObject(dirObj);
+    }
   }
 
   private markState(
