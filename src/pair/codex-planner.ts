@@ -110,6 +110,12 @@ export interface CodexPlannerInvokeConfig {
    *  incremented at the spawn-initiation point so the settled attempt
    *  row records a provider request that PROVABLY ran. */
   providerCounter?: { requests: number };
+  /** R1 — the provenance-bound operator goal: the ONLY text allowed to
+   *  mint Goal Contract requirements, host/network authorization, and
+   *  the work-task budget inside the prompt. `goal` remains the full
+   *  mission text the model reads (envelope context included); absent
+   *  → `goal` itself is the operator request. */
+  authorityGoal?: string;
 }
 
 const resolveExecutable = resolveCodexExecutable;
@@ -278,13 +284,17 @@ export async function codexPlannerPlan(
   const exe = cfg.executable ?? resolveExecutable(cfg.env);
   if (!exe) return { tasks: [], warnings: [CODEX_PLANNER_WARNING.CLI_MISSING] };
   const timeoutMs = cfg.timeoutMs ?? CODEX_PLANNER_DEFAULT_TIMEOUT_MS;
-  const workBudget = resolveWorkTaskBudget(goal, cfg.maxTasks);
+  // R1 — authority derivations bind the provenance-bound operator goal;
+  // the enriched mission text is context only.
+  const authorityGoal = cfg.authorityGoal ?? goal;
+  const workBudget = resolveWorkTaskBudget(authorityGoal, cfg.maxTasks);
   const prompt =
     `${plannerSystemPrompt()}\n\n${buildPlannerUserPrompt(goal, {
       allowedCapabilities: cfg.allowedCapabilities,
       capabilitySets: cfg.capabilitySets,
       maxTasks: cfg.maxTasks,
       rejectionContext: cfg.rejectionContext,
+      authorityGoal,
     })}`;
   let out: Awaited<ReturnType<typeof invokeRaw>>;
   try {
@@ -348,7 +358,7 @@ export async function codexPlannerPlan(
   // Bounded repair BEFORE the canonical network gates — the SAME helper the
   // HTTP/Gemini lane uses, at the equivalent post-sanitize seam.
   const netRepair = repairNetworkCapabilityBinding(tasks, {
-    goal,
+    goal: authorityGoal,
     allowedCapabilities: cfg.allowedCapabilities,
     capabilitySets: cfg.capabilitySets,
   });

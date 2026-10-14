@@ -294,7 +294,11 @@ describe("PC4–PC6 — delegated open carries persisted plan authority", () => 
     // The persisted plan replays through the planner tail — never a
     // fresh template, never a re-invocation of the pool.
     const replay = s.planner({
-      mission: { goal: String(mission.goal), metadata: md },
+      mission: {
+        goal: String(mission.goal),
+        operator_goal: mission.operator_goal,
+        metadata: md,
+      },
       advice: null, reason: "initial", input_artifact_sources: [],
     } as never) as { tasks: Array<Record<string, unknown>> };
     expect(canonicalJson(replay.tasks)).toBe(canonicalJson(prepared.tasks));
@@ -379,7 +383,11 @@ describe("PC7–PC8 — scheduler missions plan through the same expander", () =
     expect((pinned as unknown[]).length).toBeGreaterThan(0);
     // replay through the tail — pinned/llm plan authority, never a template
     const replay = s.planner({
-      mission: { goal: String(mission.goal), metadata: md },
+      mission: {
+        goal: String(mission.goal),
+        operator_goal: mission.operator_goal,
+        metadata: md,
+      },
       advice: null, reason: "initial", input_artifact_sources: [],
     } as never) as { tasks: Array<Record<string, unknown>> };
     expect(replay.tasks.length).toBeGreaterThan(0);

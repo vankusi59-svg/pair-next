@@ -37,7 +37,7 @@ import {
   detectTelegramDeliveryIntent,
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
-import { authoritativeGoalText } from "./goal-contract.js";
+import { operatorGoalOf } from "./goal-contract.js";
 import {
   pendingTelegramDeliveries,
   beginDeliveryAttempt as beginDeliveryAttemptEntity,
@@ -586,6 +586,8 @@ export class MissionControl {
   previewMission(input: {
     project_id: string;
     goal: string;
+    /** R1 — provenance-bound operator request (defaults to `goal`). */
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -606,6 +608,7 @@ export class MissionControl {
       mission_id: "__preview__",
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: operatorGoalOf(input),
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: workspaces,
@@ -685,6 +688,11 @@ export class MissionControl {
     input: {
       project_id: string;
       goal: string;
+      /** R1 — provenance-bound operator request: the only text that may
+       *  mint contract/delivery/language/network authority. Persisted
+       *  into `mission_input` and digest-bound so confirm replays the
+       *  same authority. Defaults to `goal` (direct submissions). */
+      operator_goal?: string | null;
       metadata?: Record<string, unknown>;
       granted_permissions?: string[];
       authorized_workspaces?: string[];
@@ -715,10 +723,16 @@ export class MissionControl {
     }
     const workspaces = this.normalizeMissionWorkspaces(input);
     const risk = canonicalRiskCeiling(input.risk_ceiling);
+    // R1 — resolve the operator authority ONCE: the same text drives
+    // planning (pseudoMission), the delivery/language re-proof below,
+    // the digest binding, and the persisted mission_input confirm
+    // replays. Never the envelope.
+    const operatorGoal = operatorGoalOf(input);
     const pseudoMission: Record<string, unknown> = {
       mission_id: "__preview__",
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: operatorGoal,
       metadata: input.metadata ?? {},
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: workspaces,
@@ -737,14 +751,13 @@ export class MissionControl {
     // (intent↔presence + instruction hygiene) is re-proven with the
     // operator request before the preview is pinned.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(
-        authoritativeGoalText(input.goal),
-      ),
-      outputLanguage: detectOutputLanguage(authoritativeGoalText(input.goal)),
+      telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+      outputLanguage: detectOutputLanguage(operatorGoal),
     });
     const eid = effectiveInputDigest({
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: operatorGoal,
       granted_permissions: input.granted_permissions,
       authorized_workspaces: workspaces,
       risk_ceiling: risk,
@@ -764,6 +777,7 @@ export class MissionControl {
       missionInput: {
         project_id: input.project_id,
         goal: input.goal,
+        operator_goal: operatorGoal,
         metadata: input.metadata ?? {},
         granted_permissions: input.granted_permissions ?? [],
         authorized_workspaces: workspaces,
@@ -848,12 +862,8 @@ export class MissionControl {
       assertPlanDataflow(
         v.preview.canonical_tasks as Array<Record<string, unknown>>,
         {
-          telegramIntent: detectTelegramDeliveryIntent(
-            authoritativeGoalText(String(mi.goal ?? "")),
-          ),
-          outputLanguage: detectOutputLanguage(
-            authoritativeGoalText(String(mi.goal ?? "")),
-          ),
+          telegramIntent: detectTelegramDeliveryIntent(operatorGoalOf(mi)),
+          outputLanguage: detectOutputLanguage(operatorGoalOf(mi)),
         },
       );
       // R5 — replay persisted authority VERBATIM. Normalization already ran
@@ -885,6 +895,10 @@ export class MissionControl {
       const mission = this.createMissionFromPreview({
         project_id: String(mi.project_id),
         goal: String(mi.goal),
+        // R1 — replay the digest-bound operator authority verbatim
+        // (pre-fix previews have no field → mission.goal is authority,
+        // identical to how it was planned).
+        operator_goal: mi.operator_goal != null ? String(mi.operator_goal) : null,
         metadata,
         granted_permissions: (mi.granted_permissions as string[] | undefined) ?? [],
         authorized_workspaces: authorizedWorkspaces,
@@ -910,6 +924,7 @@ export class MissionControl {
   private createMissionFromPreview(input: {
     project_id: string;
     goal: string;
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -999,6 +1014,7 @@ export class MissionControl {
     return this.deps.service.createMission({
       project_id: input.project_id,
       goal: input.goal,
+      operator_goal: input.operator_goal ?? null,
       metadata,
       granted_permissions: input.granted_permissions ?? [],
       authorized_workspaces: input.authorized_workspaces,
@@ -1024,6 +1040,8 @@ export class MissionControl {
   startMission(input: {
     project_id: string;
     goal: string;
+    /** R1 — provenance-bound operator request (defaults to `goal`). */
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -1059,6 +1077,10 @@ export class MissionControl {
     binding_open_id: string;
     project_id: string;
     goal: string;
+    /** R1 — the operator request of record for authority derivation.
+     *  The seam DERIVES it from the canonical work item the binding
+     *  references — a supplied value may mirror but never define it. */
+    operator_goal?: string | null;
     metadata?: Record<string, unknown>;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -1155,13 +1177,32 @@ export class MissionControl {
       }
       metadata[key] = canonical;
     }
-    return this.startMissionInternal({ ...input, metadata }, binding);
+    // R1 — the operator goal is canonical too: the bound work item's
+    // `goal` field, loaded from the store under this binding — never
+    // the enriched envelope and never a caller-supplied copy. Only this
+    // text may mint Goal Contract / network / delivery / language
+    // authority; the envelope remains context + committed goal.
+    const operatorGoal = String(workItem.goal ?? "");
+    if (
+      input.operator_goal != null &&
+      String(input.operator_goal) !== operatorGoal
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BINDING_CONTEXT_MISMATCH",
+        "operator_goal conflicts with canonical work_item.goal",
+      );
+    }
+    return this.startMissionInternal(
+      { ...input, operator_goal: operatorGoal, metadata },
+      binding,
+    );
   }
 
   private startMissionInternal(
     input: {
       project_id: string;
       goal: string;
+      operator_goal?: string | null;
       metadata?: Record<string, unknown>;
       granted_permissions?: string[];
       authorized_workspaces?: string[];
@@ -1288,6 +1329,7 @@ export class MissionControl {
       ? this.deps.service.createBoundMission(binding, {
           project_id: input.project_id,
           goal: input.goal,
+          operator_goal: input.operator_goal ?? null,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
           authorized_workspaces: workspaces,
@@ -1296,6 +1338,7 @@ export class MissionControl {
       : this.deps.service.createMission({
           project_id: input.project_id,
           goal: input.goal,
+          operator_goal: input.operator_goal ?? null,
           metadata,
           granted_permissions: input.granted_permissions ?? [],
           authorized_workspaces: workspaces,

@@ -98,6 +98,7 @@ import {
   markPlannerAttemptReask,
   finishPlannerRun,
   validatePlanProposal,
+  operatorGoalOf,
   makeServePlanner,
   SERVE_LLM_WORK_CAPS,
   ConversationSessionService,
@@ -907,6 +908,13 @@ const planExpander = async (input, expandCtx) => {
     return { input };
   }
   const goal = String(input.goal);
+  // R1 — the provenance-bound operator goal (input.operator_goal, set by
+  // the delegated WorkItem seam) is the ONLY text that may mint contract,
+  // network, delivery, or output-language authority; `goal` — the full
+  // envelope with appended agent context — stays informational in the
+  // prompt. Direct submissions carry no operator_goal → goal itself is
+  // the operator request.
+  const authorityGoal = operatorGoalOf(input);
   // The planner_run row opens before any candidate check so even a
   // zero-eligible request leaves durable canonical evidence (run FAILED
   // / FAIL_CLOSED_PLANNER_NO_ELIGIBLE), never a silent template fallback.
@@ -1008,6 +1016,7 @@ const planExpander = async (input, expandCtx) => {
         // isolated by runPlannerFailover).
         const canon = canonicalizeLlmTasks(tasks, goal, {
           provenance: "fresh",
+          authorityGoal,
           raw_delivery_emission_count:
             evidence?.raw_delivery_emission_count,
           raw_delivery_emission_state:
@@ -1025,6 +1034,7 @@ const planExpander = async (input, expandCtx) => {
         c.transport === "codex_cli"
           ? codexPlannerPlan(goal, {
               model: c.model,
+              authorityGoal,
               // P-REASK R3 — the re-ask runs inside the remaining
               // candidate budget, never a second full timeout.
               timeoutMs: invocation?.timeoutMs ?? cfgCodexPlannerTimeoutMs,
@@ -1038,6 +1048,7 @@ const planExpander = async (input, expandCtx) => {
               endpoint: `${c.endpoint}/chat/completions`,
               credentialEnv: c.credentialEnv,
               model: c.model,
+              authorityGoal,
               timeoutMs: invocation?.timeoutMs ?? cfgPlannerTimeoutMs,
               allowedCapabilities: LLM_PLANNER_CAPS,
               capabilitySets: executorCapSets(),

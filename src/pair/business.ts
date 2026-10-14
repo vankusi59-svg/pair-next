@@ -1579,11 +1579,7 @@ export class BusinessLayer {
     const notes = ctxScopes.has("agent")
       ? (((agent?.context_notes as Array<Record<string, unknown>> | undefined) ?? [])
           .slice(-AGENT_CONTEXT_INJECT)
-          // Context lines stay single-line bullets: a note carrying raw
-          // newlines would break the appended section's bullet-only
-          // shape and leak non-authoritative text into goal-authority
-          // parsing (see authoritativeGoalText).
-          .map((n) => `- ${String(n.note).replace(/\s+/g, " ").trim()}`))
+          .map((n) => `- ${String(n.note)}`))
       : [];
     return (
       (ctxScopes.has("business") || !agentId
@@ -1603,6 +1599,11 @@ export class BusinessLayer {
    *  its canonical digest. Pure read — never mutates, never admits. */
   delegatedGoalContext(workItemId: string): {
     goal: string;
+    /** R1 — the provenance-bound operator request (`work_item.goal`):
+     *  the only text that may mint contract/network/delivery/language
+     *  authority. `goal` is the full envelope for planner context +
+     *  mission commit; the two are never conflated. */
+    operator_goal: string;
     goal_digest: string;
     project_id: string;
     business_id: string;
@@ -1616,6 +1617,7 @@ export class BusinessLayer {
     const goal = this.boundMissionGoal(row, business, agentId, agent);
     return {
       goal,
+      operator_goal: String(row.goal),
       goal_digest: delegatedGoalDigest({
         work_item_id: workItemId,
         business_id: String(row.business_id),
@@ -1690,6 +1692,11 @@ export class BusinessLayer {
       {
         project_id: ctx.project_id,
         goal: ctx.goal,
+        // R1 — provenance-bound operator authority travels WITH the
+        // envelope: the pool canonicalizes/authorizes against THIS
+        // text while `goal` (envelope + agent context) stays available
+        // to the model as supporting information.
+        operator_goal: ctx.operator_goal,
         operator_id: operatorId,
         metadata: {
           business_id: ctx.business_id,

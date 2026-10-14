@@ -661,8 +661,10 @@ export class MissionRuntime {
     const md = (task.metadata as Record<string, unknown>) ?? {};
     // Language authority is re-derived from the effective operator goal —
     // a stamped metadata value can be tampered with, the goal cannot.
+    // R1 — the provenance-bound operator_goal, never the enriched
+    // envelope: appended agent context cannot change output language.
     const expectedLanguage =
-      detectOutputLanguage(mission.goal).code ?? null;
+      detectOutputLanguage(this.missionOperatorGoal(mission)).code ?? null;
     const languageViolation = (
       artifact: string,
       text: string,
@@ -1304,7 +1306,10 @@ export class MissionRuntime {
     const externalInputs =
       this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
     const proposal = this.deps.planner({
-      mission,
+      // R1 — hydrate the provenance-bound operator goal so the planner's
+      // authority derivations bind it (legacy bound missions recover
+      // through the binding; direct missions resolve to goal).
+      mission: { ...mission, operator_goal: this.missionOperatorGoal(mission) },
       advice,
       reason: "initial",
       input_artifact_sources: externalInputs,
@@ -1328,8 +1333,8 @@ export class MissionRuntime {
     // only delivery authority. Stamped external bindings re-prove the
     // CURRENT eligible set NOW.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(mission.goal),
-      outputLanguage: detectOutputLanguage(mission.goal),
+      telegramIntent: detectTelegramDeliveryIntent(this.missionOperatorGoal(mission)),
+      outputLanguage: detectOutputLanguage(this.missionOperatorGoal(mission)),
       external_input_artifacts: externalInputs,
     });
     this.deps.service.commitPlan({
@@ -3530,7 +3535,7 @@ export class MissionRuntime {
       let proposal: unknown;
       try {
         proposal = this.deps.planner({
-          mission,
+          mission: { ...mission, operator_goal: this.missionOperatorGoal(mission) },
           advice: advice ?? null,
           superseded_tasks: oldTasks,
           reason: "replan",
@@ -3579,8 +3584,8 @@ export class MissionRuntime {
         assertPlanDataflow(
           validated as unknown as Array<Record<string, unknown>>,
           {
-            telegramIntent: detectTelegramDeliveryIntent(mission.goal),
-            outputLanguage: detectOutputLanguage(mission.goal),
+            telegramIntent: detectTelegramDeliveryIntent(this.missionOperatorGoal(mission)),
+            outputLanguage: detectOutputLanguage(this.missionOperatorGoal(mission)),
             external_input_artifacts: externalInputs,
           },
         );
@@ -3886,6 +3891,36 @@ export class MissionRuntime {
       this.exerciseApprovedRecovery(missionId, approvalId, now);
       return;
     }
+  }
+
+  /** R1 — the mission's operator-goal authority text, resolved by
+   *  PROVENANCE (never by parsing the committed goal):
+   *    1. the pinned `operator_goal` field (every mission minted after
+   *       R1 carries it; bound missions pin `work_item.goal`);
+   *    2. legacy bound missions minted before the field — recovered
+   *       through `bound_open_id` → work_open_binding → the canonical
+   *       work item's goal;
+   *    3. direct missions (no binding) — `goal` itself is the operator
+   *       request.
+   *  This text — and only this text — may mint contract requirements,
+   *  network authorization, Telegram delivery intent, or output
+   *  language. The enriched envelope stays informational. */
+  private missionOperatorGoal(mission: Record<string, unknown>): string {
+    const og = mission.operator_goal;
+    if (typeof og === "string" && og.trim() !== "") return og;
+    const openId = mission.bound_open_id;
+    if (typeof openId === "string" && openId !== "") {
+      const binding = this.store.tryGet(
+        "work_open_binding", openId,
+      ) as Record<string, unknown> | null;
+      const wi = binding
+        ? (this.store.tryGet(
+            "work_item", String(binding.work_item_id),
+          ) as Record<string, unknown> | null)
+        : null;
+      if (wi?.goal != null) return String(wi.goal);
+    }
+    return String(mission.goal ?? "");
   }
 
   /** Advisory retrieval — a broken advisor can never break orchestration. */

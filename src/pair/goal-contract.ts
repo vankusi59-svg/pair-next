@@ -65,72 +65,50 @@ export interface GoalContract {
 }
 
 /* ------------------------------------------------------------------ */
-/* authority boundary                                                  */
+/* authority boundary — provenance, never formatting                   */
 /* ------------------------------------------------------------------ */
 
-/** A delegated mission goal is an ENVELOPE, not flat operator text:
- *  `boundMissionGoal` emits a `[BUSINESS … | DEPT … | AGENT …]`
- *  provenance header, then the operator goal, then appended machine
- *  sections such as `[AGENT CONTEXT — last N outcomes]` followed by
- *  history bullets (`- [delegated] …`). The appended sections are
- *  supporting context for the planner — they must never mint
- *  obligations, deliverables, constraints, or prohibitions. Live
- *  incident: a history bullet leading with a work verb minted a
- *  fabricated OBL requirement, coverage failed closed
- *  (FAIL_CLOSED_PLAN_INCOMPLETE), the planner run exhausted, and the
- *  objective recorded INTEGRITY_FAULT.
+/** A delegated mission carries TWO texts with different authority:
  *
- *  The boundary is STRUCTURAL, never lexical. The goal is decomposed
- *  into blank-line-separated blocks; a block after the first whose
- *  every line is a whole-line section header (`[NAME …]`) or a list
- *  bullet is appended machine context and carries no requirement
- *  authority. Whole-line bracketed headers are section labels wherever
- *  they appear and never mint requirements (the `[BUSINESS …]`
- *  provenance line included — a business named "Write Co" must not
- *  mint a "Write" obligation). The first block is always operator-
- *  authored, so its own bullets remain real requirements even when the
- *  goal is itself a list.
+ *  `goal` — the committed bound-mission envelope `boundMissionGoal`
+ *  emits: a `[BUSINESS … | DEPT … | AGENT …]` provenance header, then
+ *  the operator goal, then appended machine sections such as
+ *  `[AGENT CONTEXT — last N outcomes]` followed by history bullets
+ *  (`- [delegated] …`). The whole envelope is persisted as
+ *  `mission.goal`, reaches the planner prompt verbatim as supporting
+ *  context, and is digest-bound by `delegated_goal_digest`.
  *
- *  This projection governs ONLY authority derivation (contract +
- *  intent/language detection at the planner and mission seams). The
- *  raw enriched goal still reaches the planner prompt verbatim as
- *  supporting context, and the persisted mission goal / goal_digest /
- *  pinned-plan digests are untouched. */
-const SECTION_HEADER_RE = /^\s*\[[^\]\n]+\]\s*$/u;
-const LIST_ITEM_RE = /^\s*(?:[-*•–—]|\d{1,3}[.)])\s/u;
-
-/** Project a (possibly enriched) goal down to the text that may mint
- *  authority: drops appended `[SECTION]` + bullet metadata sections and
- *  standalone section-header lines; keeps operator text verbatim. */
-export function authoritativeGoalText(goal: string): string {
-  const blocks: string[][] = [];
-  let cur: string[] = [];
-  for (const line of String(goal ?? "").split(/\r?\n/)) {
-    if (line.trim() === "") {
-      if (cur.length > 0) {
-        blocks.push(cur);
-        cur = [];
-      }
-    } else {
-      cur.push(line);
-    }
-  }
-  if (cur.length > 0) blocks.push(cur);
-
-  const kept: string[][] = [];
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
-    const isMetadataSection =
-      i > 0 &&
-      block.some((l) => SECTION_HEADER_RE.test(l)) &&
-      block.every(
-        (l) => SECTION_HEADER_RE.test(l) || LIST_ITEM_RE.test(l),
-      );
-    if (isMetadataSection) continue;
-    const text = block.filter((l) => !SECTION_HEADER_RE.test(l));
-    if (text.length > 0) kept.push(text);
-  }
-  return kept.map((b) => b.join("\n")).join("\n\n");
+ *  `operator_goal` — the trusted operator request, provenance-bound at
+ *  the minting seam: the bound work item's canonical `goal` field
+ *  (derived inside `startBoundMission` from the loaded `work_item`
+ *  row, never caller-supplied). Only this text may mint obligations,
+ *  deliverables, constraints, prohibitions, network-source
+ *  authorization, Telegram delivery intent, or output-language
+ *  authority. Agent history is informational — it can never grant or
+ *  modify those authorities.
+ *
+ *  Live incident behind this boundary: an `[AGENT CONTEXT]` bullet
+ *  leading with a work verb minted a fabricated OBL requirement →
+ *  coverage failed closed (FAIL_CLOSED_PLAN_INCOMPLETE), the planner
+ *  run exhausted, the objective recorded INTEGRITY_FAULT. The earlier
+ *  fix inferred the boundary from Markdown formatting; audit R1/F1
+ *  rejected that — format is never evidence of authority. The boundary
+ *  here is recorded provenance, not parsing. */
+export function operatorGoalOf(
+  source:
+    | string
+    | { goal?: unknown; operator_goal?: unknown }
+    | null
+    | undefined,
+): string {
+  if (typeof source === "string") return source;
+  const og = source?.operator_goal;
+  if (typeof og === "string" && og.trim() !== "") return og;
+  // No recorded provenance → the committed goal itself IS the operator
+  // request (direct submissions, legacy rows minted before the field
+  // existed). This is authority-of-record fallback — never a widening:
+  // a bound mission always carries the explicit pin.
+  return String(source?.goal ?? "");
 }
 
 /* ------------------------------------------------------------------ */
@@ -693,12 +671,13 @@ function prohibitionPayload(clause: string): {
 }
 
 /** Extract the Goal Contract — the deterministic, append-only projection
- *  of the authoritative operator goal. Same input → same contract,
- *  always. Appended machine context (agent history, provenance headers)
- *  is projected out first and can never mint a requirement. */
+ *  of the text it is handed. Same input → same contract, always.
+ *  AUTHORITY BOUNDARY: callers must pass `operatorGoalOf(source)` —
+ *  the provenance-bound operator goal — never the enriched envelope.
+ *  Every operator-authored clause mints authority here, including
+ *  Markdown sections, bullet lists, and bracketed header lines. */
 export function extractGoalContract(goal: string): GoalContract {
-  const raw = authoritativeGoalText(goal);
-  const clauses = splitClauses(raw);
+  const clauses = splitClauses(goal);
   // A prohibition trigger opening mid-clause scopes only its own span —
   // "phân tích EA không dùng martingale" keeps the `phân tích EA`
   // obligation AND mints the `use` prohibition; the trigger must not
@@ -818,14 +797,14 @@ export function extractGoalContract(goal: string): GoalContract {
   }
 
   const contractBase = {
-    objective: clauses[0]?.slice(0, 400) ?? raw.slice(0, 400),
+    objective: clauses[0]?.slice(0, 400) ?? goal.slice(0, 400),
     obligations,
     deliverables,
     constraints,
     prohibitions,
     deadline,
-    delivery_intent: detectTelegramDeliveryIntent(raw),
-    output_language: detectOutputLanguage(raw),
+    delivery_intent: detectTelegramDeliveryIntent(goal),
+    output_language: detectOutputLanguage(goal),
   };
   const contractDigest = createHash("sha256")
     .update(JSON.stringify(canonicalizeForDigest(contractBase)))

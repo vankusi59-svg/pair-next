@@ -65,7 +65,7 @@ import {
 } from "./plan-dataflow.js";
 import { detectOutputLanguage } from "./output-language.js";
 import {
-  authoritativeGoalText,
+  operatorGoalOf,
   extractGoalContract,
 } from "./goal-contract.js";
 import { assertPlanCoverage } from "./plan-coverage.js";
@@ -181,9 +181,18 @@ export function makeServeCanonicalizer(deps: {
      *  trusted PAIR code for this mission (empty/absent = no
      *  cross-mission consumption is authorized). */
     external_input_artifacts?: ExternalInputArtifactSource[];
+    /** R1 — the provenance-bound operator goal: the ONLY text that may
+     *  mint contract requirements, network authority, delivery intent,
+     *  and output language. `goal` remains the committed mission text
+     *  (envelope for delegated missions — bookkeeping writes it, the
+     *  model sees it); absent → `goal` itself is operator-authored. */
+    authorityGoal?: string;
   },
 ) => Array<Record<string, unknown>> {
   return (rawTasks, goal, ctx) => {
+    // R1 — authority resolution is provenance, never parsing: this is
+    // the text every authority derivation below consumes.
+    const authorityGoal = ctx?.authorityGoal ?? String(goal ?? "");
     // HOTFIX 1 — delivery omission provenance is measured on the RAW
     // candidate BEFORE sanitize/drop/remap so a TRUE omission (planner
     // never attempted a delivery task) can be told apart from a
@@ -193,9 +202,7 @@ export function makeServeCanonicalizer(deps: {
     // captured inside the planner transport (llmPlan/codexPlannerPlan)
     // BEFORE its own sanitizePlan; the incoming task list has already
     // survived that first drop and can no longer prove it.
-    const deliveryIntent = detectTelegramDeliveryIntent(
-      authoritativeGoalText(String(goal ?? "")),
-    );
+    const deliveryIntent = detectTelegramDeliveryIntent(authorityGoal);
     // R2 — evidence is the tri-state inspection: an explicit
     // `raw_delivery_emission_state`/`_count` pair wins (production
     // failover always supplies it); absent evidence means the caller
@@ -248,7 +255,7 @@ export function makeServeCanonicalizer(deps: {
     });
     // PRV2-A §E — adaptive work-task budget bounds the work graph; the
     // injected bookkeeping task is not counted against it.
-    const workBudget = resolveWorkTaskBudget(goal, deps.maxWorkTasks);
+    const workBudget = resolveWorkTaskBudget(authorityGoal, deps.maxWorkTasks);
     const { tasks } = sanitizePlan(
       workRaw as never[],
       SERVE_LLM_WORK_CAPS,
@@ -348,10 +355,10 @@ export function makeServeCanonicalizer(deps: {
     //    verdict (resolveTaskNetworkAuthority) is preserved verbatim —
     //    LEGACY detectors, NOT_REQUIRED+claim → UNAUTHORIZED_CAPABILITY.
     const netFresh = ctx?.provenance !== "persisted";
-    const netGoalHosts = extractGoalHosts(goal);
-    const netGoalDemand = goalRequiresCurrentExternalData(goal);
+    const netGoalHosts = extractGoalHosts(authorityGoal);
+    const netGoalDemand = goalRequiresCurrentExternalData(authorityGoal);
     const netGoalHasSubject =
-      externalSubjectKeys(goal).size > 0 || subjectAnchors(goal).size > 0;
+      externalSubjectKeys(authorityGoal).size > 0 || subjectAnchors(authorityGoal).size > 0;
     const taskNetRes = (t: Record<string, unknown>) => {
       const md = (t.metadata ?? {}) as Record<string, unknown>;
       const instr = String(t.task_instruction ?? "");
@@ -364,7 +371,7 @@ export function makeServeCanonicalizer(deps: {
             goalRequiresExternalData: netGoalDemand,
             instructionMatchesGoalSubject:
               netGoalHasSubject &&
-              instructionSatisfiesGoalSubject(instr, goal),
+              instructionSatisfiesGoalSubject(instr, authorityGoal),
             instruction: instr,
           })
         : resolveTaskNetworkAuthority({
@@ -401,7 +408,7 @@ export function makeServeCanonicalizer(deps: {
     const anyDerivedRequired = tasks.some(
       (t) => taskNetRes(t).verdict === "REQUIRED",
     );
-    if (!anyDerivedRequired && goalRequiresCurrentExternalData(goal)) {
+    if (!anyDerivedRequired && goalRequiresCurrentExternalData(authorityGoal)) {
       const legitimate = tasks.some((t) => {
         const caps = (t.required_capabilities as string[] | undefined) ?? [];
         const instr = String(t.task_instruction ?? "");
@@ -411,7 +418,7 @@ export function makeServeCanonicalizer(deps: {
           // R4 — subject binding: the task must gather the subject the
           // goal's current-data obligation is about, not merely be a
           // legitimate gatherer of something unrelated.
-          instructionSatisfiesGoalSubject(instr, goal)
+          instructionSatisfiesGoalSubject(instr, authorityGoal)
         );
       });
       if (!legitimate) {
@@ -528,9 +535,7 @@ export function makeServeCanonicalizer(deps: {
     // the operator REQUEST alone.
     reconcilePlanDataflow(allTasks as never[], {
       telegramIntent: deliveryIntent,
-      outputLanguage: detectOutputLanguage(
-        authoritativeGoalText(String(goal ?? "")),
-      ),
+      outputLanguage: detectOutputLanguage(authorityGoal),
       external_input_artifacts: ctx?.external_input_artifacts,
     });
     // PRV2-B — Goal Contract coverage authority, AFTER dataflow
@@ -544,7 +549,10 @@ export function makeServeCanonicalizer(deps: {
     // (replanning changes HOW, never WHAT). A fabricated model
     // `pair_coverage` mapping is evidence, never authority: PAIR
     // verifies every requirement independently.
-    assertPlanCoverage(extractGoalContract(String(goal ?? "")), allTasks);
+    // R1 — coverage binds the operator authority text, never the
+    // enriched envelope: appended `[AGENT CONTEXT]` history cannot
+    // mint obligations/deliverables/constraints/prohibitions.
+    assertPlanCoverage(extractGoalContract(authorityGoal), allTasks);
     return allTasks;
   };
 }
@@ -654,6 +662,9 @@ export function makeServePlanner(deps: ServePlannerDeps): {
   });
   const planner: RuntimePlanner = (input) => {
     const goal = String(input.mission.goal);
+    // R1 — the provenance-bound operator goal pinned at mint is the
+    // only authority text (legacy/unpinned missions resolve to goal).
+    const authorityGoal = operatorGoalOf(input.mission);
     if (input.reason === "replan") {
       // F3 R1.1 — a replan must be generated by a configured governed
       // provider consuming the structured failure context. Stored plans
@@ -669,6 +680,7 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         if (Array.isArray(raw) && raw.length) {
           try {
             const tasks = canonicalizeLlmTasks(raw, goal, {
+              authorityGoal,
               external_input_artifacts: input.input_artifact_sources,
             });
             if (tasks.length) return { tasks };
@@ -712,6 +724,7 @@ export function makeServePlanner(deps: ServePlannerDeps): {
         goal,
         {
           provenance: "persisted",
+          authorityGoal,
           external_input_artifacts: input.input_artifact_sources,
         },
       );

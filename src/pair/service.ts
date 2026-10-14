@@ -132,6 +132,11 @@ export class PairControlPlane {
   createMission(params: {
     project_id: string;
     goal: string;
+    /** R1 — the provenance-bound operator request: the only text that may
+     *  mint Goal Contract/delivery/language/network authority. Absent →
+     *  `goal` itself is operator-authored (direct submit). A bound
+     *  mission always carries the work item's canonical goal. */
+    operator_goal?: string | null;
     policy_profile?: string;
     granted_permissions?: string[];
     authorized_workspaces?: string[];
@@ -157,6 +162,7 @@ export class PairControlPlane {
     params: {
       project_id: string;
       goal: string;
+      operator_goal?: string | null;
       policy_profile?: string;
       granted_permissions?: string[];
       authorized_workspaces?: string[];
@@ -172,6 +178,7 @@ export class PairControlPlane {
     params: {
       project_id: string;
       goal: string;
+      operator_goal?: string | null;
       policy_profile?: string;
       granted_permissions?: string[];
       authorized_workspaces?: string[];
@@ -193,10 +200,15 @@ export class PairControlPlane {
     // caller-controlled metadata: a conflicting duplicate fails closed, a
     // same-value duplicate is stripped to the single authoritative copy.
     const callerMetadata = { ...(params.metadata ?? {}) } as Record<string, unknown>;
+    const operatorGoal = params.operator_goal ?? null;
     const reservedAuthority: Array<[string, unknown]> = [
       ["authorized_workspaces", authorized],
       ["risk_ceiling", canonicalRisk],
       ["constraints", canonicalConstraints],
+      // R1 — the provenance-bound operator goal is top-level mission
+      // authority; a caller-supplied metadata shadow can never override
+      // it (conflict → fail closed, same value → stripped to canonical).
+      ["operator_goal", operatorGoal],
     ];
     for (const [key, canonical] of reservedAuthority) {
       if (!(key in callerMetadata)) continue;
@@ -212,6 +224,11 @@ export class PairControlPlane {
       mission_id: missionId,
       project_id: params.project_id,
       goal: params.goal,
+      // The ONLY text that may mint Goal Contract obligations,
+      // deliverables, constraints, prohibitions, network-source
+      // authorization, Telegram delivery intent, and output-language
+      // authority. null → `goal` itself is the operator request.
+      operator_goal: operatorGoal,
       bound_open_id: boundOpenId,
       status: "CREATED",
       plan_id: null,
