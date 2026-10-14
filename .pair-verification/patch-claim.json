@@ -3,8 +3,11 @@
   "title": "Phase C R1 — provenance-bound operator_goal: only the trusted operator goal may mint Goal Contract, network, delivery, and language authority",
   "affected_surfaces": [
     "PLANNER",
+    "DELIVERY",
     "MISSION_CONTROL",
-    "MISSION_RUNTIME",
+    "MISSION_DRAFT",
+    "RECOVERY_REPLAY",
+    "GATE_ROUTER",
     "BUSINESS_OBJECTIVE"
   ],
   "required_tests": [
