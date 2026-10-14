@@ -21,6 +21,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { IntegrityError } from "./errors.js";
 import { atomicWriteJson, digest, sha256File, utcnow, workerExecutionId } from "./canonical.js";
+import {
+  resolveCodexExecutableSystem,
+  windowsSpawnTarget,
+} from "./codex-cli-transport.js";
 import type { ExecutorAdapter } from "./adapter.js";
 import { buildGovernedPrompt, snapshotWorkspace } from "./acp-executor.js";
 
@@ -102,12 +106,11 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
         prefixArgs: this.deps.executableArgs ?? [],
       };
     }
-    try {
-      const resolved = execFileSync("which", ["codex"], { encoding: "utf8" }).trim();
-      return resolved ? { command: resolved, prefixArgs: [] } : null;
-    } catch {
-      return null;
-    }
+    // Executor lane seam: PAIR_CODEX_EXECUTABLE overrides discovery.
+    const configured = this.env("PAIR_CODEX_EXECUTABLE");
+    if (configured) return { command: configured, prefixArgs: [] };
+    const resolved = resolveCodexExecutableSystem((n) => this.env(n));
+    return resolved ? { command: resolved, prefixArgs: [] } : null;
   }
 
   probe(): Record<string, unknown> {
@@ -133,8 +136,10 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     }
     let version: string | null = null;
     try {
+      const vt = windowsSpawnTarget(exe.command, [...exe.prefixArgs, "--version"]);
+      if (!vt) throw new Error("spawn target unsafe");
       version =
-        execFileSync(exe.command, [...exe.prefixArgs, "--version"], {
+        execFileSync(vt.command, vt.args, {
           encoding: "utf8",
           timeout: 10_000,
         }).trim() || null;
@@ -315,6 +320,14 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       "--color", "never",
       "--config", "approval_policy=never",
       "--config", `web_search=${netAllowed ? "live" : "disabled"}`,
+      // Windows-native runtime: --ignore-user-config drops the user's
+      // `[windows] sandbox = "elevated"`, and without it every governed
+      // shell tool call is rejected by policy (CreateProcess blocked).
+      // Re-pinning it explicitly restores governed execution — the
+      // sandbox itself still enforces the permission profile below.
+      ...(process.platform === "win32"
+        ? ["--config", "windows.sandbox='elevated'"]
+        : []),
       ...this.permissionArgs(task, netAllowed),
       "-C", workspace,
       "--output-schema", schemaPath,
@@ -382,8 +395,13 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     const timeoutMs = Number(task.timeout ?? this.deps.timeoutSeconds ?? 300) * 1000;
     const events: string[] = [];
     let child: ChildProcess;
+    const target = windowsSpawnTarget(command, args);
+    if (!target) {
+      this.finish(rec, task, before, "FAILED", "CODEX_SPAWN_FAILED:spawn_target_unsafe");
+      return;
+    }
     try {
-      child = spawn(command, args, {
+      child = spawn(target.command, target.args, {
         cwd: String(task.workspace),
         env: this.childEnv(),
         stdio: ["pipe", "pipe", "pipe"],
@@ -420,6 +438,16 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
         }
         resolve({ status: "TIMEOUT", error: "CODEX_TIMEOUT" });
       }, timeoutMs);
+      // Async spawn failure (ENOENT/EACCES resolved AFTER spawn returns
+      // — the normal win32 miss path) must settle the outcome, not hang
+      // until TIMEOUT: settle FAILED immediately.
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        resolve({
+          status: "FAILED",
+          error: `CODEX_SPAWN_FAILED:${(error as Error).message}`.slice(0, 200),
+        });
+      });
       child.on("exit", (code, signal) => {
         clearTimeout(timer);
         if (rec.status === "CANCELLED") {
@@ -438,7 +466,16 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
 
   private childEnv(): Record<string, string> {
     const env: Record<string, string> = {};
-    for (const k of ["PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH"]) {
+    for (const k of [
+      "PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH",
+      // Windows process essentials — whitelist-forwarded (never ambient):
+      // the child needs SystemRoot for CreateProcess/DNS/TLS internals,
+      // a writable Temp, and its own install/config roots.
+      "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS",
+      "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "USERNAME",
+      "USERDOMAIN", "APPDATA", "LOCALAPPDATA", "ProgramData", "PUBLIC",
+      "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+    ]) {
       const v = this.env(k);
       if (v) env[k] = v;
     }

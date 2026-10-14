@@ -2,8 +2,10 @@
   "claim_id": "P0_WINDOWS_NATIVE_RUNTIME",
   "title": "P0 — Windows-native runtime: kernel-HANDLE artifact security + native Codex executor",
   "affected_surfaces": [
+    "ARTIFACT",
     "MISSION_CONTROL",
-    "EXECUTOR",
+    "REMOTE_EXECUTION",
+    "GATE_ROUTER",
     "DEV_INFRA"
   ],
   "required_tests": [
