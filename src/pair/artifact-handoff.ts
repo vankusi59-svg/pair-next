@@ -2307,6 +2307,18 @@ export class ArtifactHandoffService {
       const tmp = w32.openChildObject(dirObj, tmpName, { create: "create" });
       if (!tmp.ok) fail(`tmp_open:${tmp.kind}`);
       const tobj = tmp.ok ? tmp.obj : (undefined as never);
+      // Single ownership / single close: the temp handle is released
+      // exactly once. On the collision path the handle is closed BEFORE
+      // the raced destination is opened — otherwise a recycled handle
+      // value could alias the raced object and a second deleteOnClose
+      // would mark the DESTINATION for deletion.
+      let tmpLive = true;
+      const closeTmp = (markDelete: boolean): void => {
+        if (!tmpLive) return;
+        tmpLive = false;
+        if (markDelete) w32.deleteOnClose(tobj);
+        w32.closeObject(tobj);
+      };
       let published = false;
       try {
         // Prove the OPENED temp object before a byte lands: a regular
@@ -2321,10 +2333,9 @@ export class ArtifactHandoffService {
         const pub = w32.renameIntoDir(tobj, dirObj, base);
         if (pub === "ok") {
           published = true;
-          w32.closeObject(tobj); // the opened object IS the dest now
+          closeTmp(false); // the opened object IS the dest now
         } else if (pub === "exists") {
-          w32.deleteOnClose(tobj);
-          w32.closeObject(tobj);
+          closeTmp(true); // publish lost the race — delete the temp
           const raced = w32.openChildObject(dirObj, base, {
             access: WIN32_READ_ONLY_ACCESS,
           });
@@ -2343,10 +2354,7 @@ export class ArtifactHandoffService {
           fail(`publish:${pub.status.toString(16)}`);
         }
       } finally {
-        if (!published) {
-          w32.deleteOnClose(tobj);
-          w32.closeObject(tobj);
-        }
+        if (!published) closeTmp(true);
       }
       // Directory durability barrier on the SAME proven handle.
       if (!w32.flushObject(dirObj)) {

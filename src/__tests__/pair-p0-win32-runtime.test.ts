@@ -18,7 +18,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { describe, expect, it, vi } from "vitest";
 import {
   ArtifactDependencyResolver,
   ArtifactProvenanceValidator,
@@ -37,6 +38,40 @@ import {
   utcnow,
   workerExecutionId,
 } from "../pair/index.js";
+
+/** Deterministic publisher-collision seam (audit F2): when armed, the
+ *  wrapped renameIntoDir behaves as if a racing publisher landed the
+ *  destination BETWEEN the caller's existence check and the atomic
+ *  no-replace rename — returning "exists" after planting the winner's
+ *  bytes. Everything else delegates to the real FFI implementation. */
+const w32Race = vi.hoisted(() => ({
+  collide: null as null | { bytes: Buffer },
+}));
+vi.mock("../pair/win32-object-io.js", async (importOriginal) => {
+  const real =
+    await importOriginal<typeof import("../pair/win32-object-io.js")>();
+  const fsM = await import("node:fs");
+  const pathM = await import("node:path");
+  return {
+    ...real,
+    renameIntoDir: (
+      obj: { finalPath: string },
+      dirObj: unknown,
+      name: string,
+    ) => {
+      if (w32Race.collide) {
+        const { bytes } = w32Race.collide;
+        w32Race.collide = null;
+        fsM.writeFileSync(
+          pathM.join(pathM.dirname(obj.finalPath), name),
+          bytes,
+        );
+        return "exists" as const;
+      }
+      return real.renameIntoDir(obj as never, dirObj as never, name);
+    },
+  };
+});
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pair-p0-win32-"));
 let n = 0;
@@ -181,6 +216,58 @@ describe("A — secureReadContained opened-object contract", () => {
     expect(r1.kind).toBe("ok");
     expect(r2.kind).toBe("ok");
     expect(r2.kind === "ok" && r2.bytes.toString()).toBe("v2-changed");
+  });
+
+  it("A13 win32 read-only ACL (write-data denied) still ingests — minimum read access (F3)", () => {
+    if (!isWin32) return; // DACL semantics are win32-only
+    const d = dir("a13");
+    const p = path.join(d, "ro.bin");
+    fs.writeFileSync(p, "read-only-acl-bytes");
+    const user = `${process.env.USERDOMAIN ?? ""}\\${process.env.USERNAME ?? ""}`;
+    // Deny the granular WRITE bits only (write/append data, write EA,
+    // write attributes). This is the true "read-only artifact" DACL —
+    // READ_CONTROL + SYNCHRONIZE remain granted, so a GENERIC_READ|
+    // SYNCHRONIZE open succeeds while a GENERIC_WRITE request is denied.
+    // (Denying the composite (W) would also mask READ_CONTROL and
+    // SYNCHRONIZE, which even a pure read legitimately needs.)
+    execFileSync("icacls", [p, "/inheritance:d", "/deny", `${user}:(WD,AD,WA,WEA)`]);
+    try {
+      const r = secureReadContained(p, 1 << 20, [d]);
+      expect(r.kind).toBe("ok");
+      expect(r.kind === "ok" && r.bytes.toString()).toBe("read-only-acl-bytes");
+    } finally {
+      execFileSync("icacls", [p, "/reset"]);
+    }
+  });
+
+  it("A14 win32 read-only file ATTRIBUTE still ingests — no write access needed (F3)", () => {
+    if (!isWin32) return;
+    const d = dir("a14");
+    const p = path.join(d, "roattr.bin");
+    fs.writeFileSync(p, "ro-attr-bytes");
+    fs.chmodSync(p, 0o444); // FILE_ATTRIBUTE_READONLY
+    try {
+      const r = secureReadContained(p, 1 << 20, [d]);
+      expect(r.kind).toBe("ok");
+      expect(r.kind === "ok" && r.bytes.toString()).toBe("ro-attr-bytes");
+    } finally {
+      fs.chmodSync(p, 0o666);
+    }
+  });
+
+  it("A15 win32 ACL deny-read control proves the ACL is actually enforced (F3)", () => {
+    if (!isWin32) return;
+    const d = dir("a15");
+    const p = path.join(d, "nr.bin");
+    fs.writeFileSync(p, "no-read");
+    const user = `${process.env.USERDOMAIN ?? ""}\\${process.env.USERNAME ?? ""}`;
+    execFileSync("icacls", [p, "/inheritance:d", "/deny", `${user}:(R)`]);
+    try {
+      const r = secureReadContained(p, 1 << 20, [d]);
+      expect(r.kind).not.toBe("ok");
+    } finally {
+      execFileSync("icacls", [p, "/reset"]);
+    }
   });
 });
 
@@ -538,5 +625,55 @@ describe("C — handle-bound dependency materialization", () => {
       expect(fs.realpathSync.native(dest).toLowerCase())
         .toContain(fs.realpathSync.native(ctx.workspace).toLowerCase());
     }
+  });
+
+  it("C9 publish collision with identical raced bytes converges; temp handle owned once (F2)", () => {
+    if (!isWin32) return; // collision seam wraps the win32 FFI module
+    const ctx = mkCtx("c9");
+    const { gc, entries, bytes } = setupHandoff(ctx);
+    const rel = entries[0]!.consumer_relative_path;
+    const dest = path.join(ctx.workspace, rel);
+    const destDir = path.dirname(dest);
+    // A racing publisher lands byte-identical content between the
+    // early existence check and the atomic no-replace rename.
+    w32Race.collide = { bytes };
+    ctx.service.artifactHandoffs.materializeForConsumer(gc.governed);
+    expect(w32Race.collide).toBeNull(); // seam actually fired
+    // Converged: dest holds the raced bytes.
+    expect(fs.readFileSync(dest)).toEqual(bytes);
+    // F2 regression property: single ownership — the stale temp HANDLE
+    // must be closed exactly once and never reused; a recycled handle
+    // value would have marked THIS destination delete-on-close. Prove
+    // the destination survives and no tmp file lingers.
+    expect(
+      fs.readdirSync(destDir).filter((f) => f.includes(".tmp-")),
+    ).toEqual([]);
+    expect(fs.existsSync(dest)).toBe(true);
+    const h = ctx.store.get(
+      HANDOFF_ENTITY,
+      canonicalHandoffId(gc.gtId, entries[0]!.artifact_id, rel),
+    );
+    expect(String(h.state)).toBe("MATERIALIZED");
+  });
+
+  it("C10 publish collision with divergent raced bytes fails closed; dest untouched (F2)", () => {
+    if (!isWin32) return;
+    const ctx = mkCtx("c10");
+    const { gc, entries } = setupHandoff(ctx);
+    const rel = entries[0]!.consumer_relative_path;
+    const dest = path.join(ctx.workspace, rel);
+    const destDir = path.dirname(dest);
+    const foreign = Buffer.from("raced-by-attacker");
+    w32Race.collide = { bytes: foreign };
+    expect(errCode(() =>
+      ctx.service.artifactHandoffs.materializeForConsumer(gc.governed),
+    )).toBe("DEP:FAIL_CLOSED_ARTIFACT_HANDOFF_MATERIALIZE");
+    expect(w32Race.collide).toBeNull();
+    // The winning raced content is authoritative-looking but differs —
+    // it must remain (we don't delete others' files) and temp cleaned.
+    expect(fs.readFileSync(dest)).toEqual(foreign);
+    expect(
+      fs.readdirSync(destDir).filter((f) => f.includes(".tmp-")),
+    ).toEqual([]);
   });
 });

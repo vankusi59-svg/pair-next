@@ -133,23 +133,37 @@ function resolveCodexExecutableWin32(env: CodexCliEnv | undefined): string | nul
 }
 
 const WIN32_BATCH_EXT = new Set([".cmd", ".bat"]);
-/** argv fragments a COMSPEC-wrapped launch may carry. Rejects every
- *  cmd metacharacter that could alter parsing — an arg outside this
- *  grammar fails closed instead of reaching `cmd /c`. */
-const WIN32_CMD_ARG_SAFE = /^[A-Za-z0-9_./\\:;=,'@{}[\]()+\-*?~$# ]*$/;
+/** argv fragments a COMSPEC-wrapped launch may carry. The grammar admits
+ *  only token characters (paths, `key='value'` config pairs, model ids,
+ *  TOML tables): every cmd metacharacter — `& | < > ^ % ! " ( ) [ ] ;`
+ *  `$ # ? *` backtick — is rejected, so nothing outside it can ever
+ *  reach the `cmd /c` line. `{}` are retained (TOML inline tables in
+ *  governed argv) — they are not cmd metacharacters and stay inert
+ *  inside the per-token quoting below. */
+const WIN32_CMD_ARG_SAFE = /^[A-Za-z0-9_./\\:=,'@+\-~{} ]*$/;
 
-/** Launch target for `spawn`/`execFileSync`: on Windows a `.cmd`/`.bat`
- *  command can only run through `cmd.exe /d /s /c` — with a strict argv
- *  whitelist applied to EVERY argument (metacharacters never reach the
- *  command line). Returns null when the launch cannot be made safe —
- *  the caller fails closed rather than invoking an unsafe shell. */
+/** Launch target for `spawn`/`execFileSync`: a real `.exe`/`.com` image is
+ *  spawned directly (CreateProcess — no shell involvement at all). A
+ *  `.cmd`/`.bat` shim can only run through `cmd.exe /d /s /c`, and every
+ *  token is additionally wrapped in double quotes so cmd cannot re-parse
+ *  metacharacter adjacency — `"` itself is rejected by the grammar so the
+ *  quoting cannot be escaped. Returns null when the launch cannot be made
+ *  safe — the caller fails closed rather than invoking an unsafe shell. */
 export function windowsSpawnTarget(
   command: string,
   args: string[],
-): { command: string; args: string[] } | null {
-  if (process.platform !== "win32") return { command, args };
-  if (!WIN32_BATCH_EXT.has(path.extname(command).toLowerCase())) {
-    return { command, args };
+): { command: string; args: string[]; verbatim: boolean } | null {
+  if (process.platform !== "win32") return { command, args, verbatim: false };
+  const base = path.basename(command).toLowerCase();
+  const isBatch = WIN32_BATCH_EXT.has(path.extname(base));
+  if (!isBatch) {
+    // Ambiguous batch-lookalike names ("codex.cmd&calc", "codex.cmd
+    // evil", "codex.bat%PATH%") would bypass the extension check and
+    // reach CreateProcess as-is — reject rather than classify.
+    if (/\.(?:cmd|bat)/.test(base) || !WIN32_CMD_ARG_SAFE.test(base)) {
+      return null;
+    }
+    return { command, args, verbatim: false };
   }
   const comspec = process.env.COMSPEC ?? "C:\\Windows\\System32\\cmd.exe";
   if (
@@ -158,7 +172,12 @@ export function windowsSpawnTarget(
   ) {
     return null;
   }
-  return { command: comspec, args: ["/d", "/s", "/c", command, ...args] };
+  // cmd /s strips the first+last quote of the /c string — wrap the whole
+  // line in an outer quote pair so every token's own quotes survive. The
+  // caller must spawn with windowsVerbatimArguments so Node does not add
+  // its own quoting layer on top of this constructed line.
+  const line = `"${[command, ...args].map((t) => `"${t}"`).join(" ")}"`;
+  return { command: comspec, args: ["/d", "/s", "/c", line], verbatim: true };
 }
 
 /** Child env: minimal inherited surface only; CODEX_HOME pins the
@@ -214,6 +233,7 @@ export async function spawnCodexCli(
       cwd: runDir,
       env: codexCliChildEnv(env),
       stdio: ["pipe", "pipe", "pipe"],
+      windowsVerbatimArguments: target.verbatim,
     });
   } catch (e) {
     return { status: "SPAWN_FAILED", code: null, stderrTail: "", error: String(e).slice(0, 200) };

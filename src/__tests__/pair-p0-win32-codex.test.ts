@@ -211,20 +211,39 @@ describe("A — native Windows codex executable resolution", () => {
     expect(resolveCodexExecutable(envFn({ PAIR_CODEX_EXECUTABLE: "E.exe" }))).toBe("E.exe");
   });
 
-  it("A4 windowsSpawnTarget: .exe passthrough, .cmd wrapped via COMSPEC, metacharacters rejected", () => {
+  it("A4 windowsSpawnTarget: .exe passthrough, .cmd quoted via COMSPEC, metacharacters rejected", () => {
     if (!isWin32) return;
+    // Native PE image → direct spawn, never through a shell.
     expect(windowsSpawnTarget("C:\\x\\codex.exe", ["exec"]))
-      .toEqual({ command: "C:\\x\\codex.exe", args: ["exec"] });
+      .toEqual({ command: "C:\\x\\codex.exe", args: ["exec"], verbatim: false });
     const wrapped = windowsSpawnTarget("C:\\x\\codex.cmd", ["exec", "--json"]);
     expect(wrapped).not.toBeNull();
     expect(String(wrapped!.command).toLowerCase()).toContain("cmd.exe");
-    expect(wrapped!.args.slice(0, 4)).toEqual(["/d", "/s", "/c", "C:\\x\\codex.cmd"]);
-    // cmd metacharacters never reach the command line — fail closed.
-    for (const bad of ["a&b", "a|b", "a%b", 'a"b', "a^b", "a\nb"]) {
+    // /s /c carries ONE fully-quoted command line — outer pair for /s
+    // stripping, every token double-quoted against re-parsing; spawn must
+    // use verbatim args so Node adds no quoting layer of its own.
+    expect(wrapped!.verbatim).toBe(true);
+    expect(wrapped!.args.slice(0, 3)).toEqual(["/d", "/s", "/c"]);
+    expect(wrapped!.args[3]).toBe('""C:\\x\\codex.cmd" "exec" "--json""');
+    // cmd metacharacters — separators, redirects, expansion, command
+    // grouping, quotes — never reach the command line: fail closed.
+    for (const bad of [
+      "a&b", "a|b", "a>b", "a<b", "a%b", "a!b", 'a"b', "a^b",
+      "a(b", "a)b", "(exec)", "a[b", "a]b", "a;b", "a$b", "a#b",
+      "a?b", "a*b", "a`b", "a\nb", "a\rb",
+    ]) {
       expect(windowsSpawnTarget("C:\\x\\codex.cmd", ["exec", bad])).toBeNull();
     }
+    // Dangerous COMMAND forms too — a metachar in the executable path
+    // itself or an injected second command is equally closed.
+    for (const badCmd of [
+      "C:\\x\\co&dex.cmd", "C:\\x\\codex.cmd&calc",
+      "C:\\x\\codex.cmd|whoami", "C:\\x\\co(dex).cmd", "C:\\x\\\"codex.cmd",
+    ]) {
+      expect(windowsSpawnTarget(badCmd, ["exec"])).toBeNull();
+    }
     // The REAL argv grammar the adapter emits (single-quoted TOML
-    // literals, braces, path separators) stays admissible.
+    // literals, inline tables, path separators) stays admissible.
     const realArgs = [
       "exec", "--ephemeral", "--ignore-user-config",
       "--config", "windows.sandbox='elevated'",

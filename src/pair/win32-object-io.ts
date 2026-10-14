@@ -304,9 +304,14 @@ export function openObject(
 ): W32OpenResult {
   const L = libs();
   if (!L) return { ok: false, kind: "unavailable", status: 0 };
+  // Minimum access: file opens are read/probe-only → GENERIC_READ; a
+  // directory still needs write access so FlushFileBuffers can flush it
+  // (the handle carries no content-write intent — durability only).
   const access =
     opts.access ??
-    (W32.GENERIC_READ | W32.GENERIC_WRITE | W32.SYNCHRONIZE);
+    (opts.directory
+      ? W32.GENERIC_READ | W32.GENERIC_WRITE | W32.SYNCHRONIZE
+      : W32.GENERIC_READ | W32.SYNCHRONIZE);
   const options =
     (opts.directory ? W32.OPT_DIRECTORY_FILE | W32.OPT_OPEN_FOR_BACKUP_INTENT : W32.OPT_NON_DIRECTORY_FILE) |
     W32.OPT_SYNCHRONOUS_IO_NONALERT;

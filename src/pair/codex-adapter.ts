@@ -139,10 +139,15 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       const vt = windowsSpawnTarget(exe.command, [...exe.prefixArgs, "--version"]);
       if (!vt) throw new Error("spawn target unsafe");
       version =
+        // windowsVerbatimArguments is honored at runtime but absent from
+        // this @types/node's ExecFileSyncOptions — the .cmd COMSPEC line
+        // is pre-quoted and must not gain a Node quoting layer.
         execFileSync(vt.command, vt.args, {
           encoding: "utf8",
           timeout: 10_000,
-        }).trim() || null;
+          windowsVerbatimArguments: vt.verbatim,
+        } as import("node:child_process").ExecFileSyncOptionsWithStringEncoding,
+        ).trim() || null;
     } catch {
       limitations.push("CODEX_VERSION_CHECK_FAILED");
     }
@@ -405,6 +410,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
         cwd: String(task.workspace),
         env: this.childEnv(),
         stdio: ["pipe", "pipe", "pipe"],
+        windowsVerbatimArguments: target.verbatim,
       });
     } catch (error) {
       this.finish(rec, task, before, "FAILED", `CODEX_SPAWN_FAILED:${(error as Error).message}`);
