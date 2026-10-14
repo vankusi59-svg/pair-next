@@ -3899,32 +3899,36 @@ export class MissionRuntime {
     }
   }
 
-  /** R1 — the mission's operator-goal authority text, resolved by
+  /** R1/R2 — the mission's operator-goal authority text, resolved by
    *  PROVENANCE (never by parsing the committed goal):
-   *    1. the pinned `operator_goal` field (every mission minted after
-   *       R1 carries it; bound missions pin `work_item.goal`);
-   *    2. legacy bound missions minted before the field — recovered
-   *       through `bound_open_id` → work_open_binding → the canonical
-   *       work item's goal. R2-F2 — a bound mission whose provenance
-   *       chain is missing, mismatched, or goal-less FAILS CLOSED:
-   *       unrecoverable canonical authority can never silently widen to
-   *       the enriched envelope;
-   *    3. direct missions (no binding) — `goal` itself is the operator
-   *       request.
+   *    1. bound missions (bound_open_id set) — the canonical chain
+   *       work_open_binding → work_item.goal is validated on EVERY
+   *       resolution; a pinned `operator_goal` is the immutable snapshot
+   *       of that goal taken at mint (identical by construction — any
+   *       divergence fails closed), never a bypass around provenance.
+   *       Missing/mismatched binding, missing or goal-less work item, or
+   *       pin divergence all FAIL CLOSED: unrecoverable canonical
+   *       authority can never silently widen to the enriched envelope;
+   *    2. legacy bound rows minted before the field — same chain, the
+   *       canonical work item goal IS the recovered snapshot;
+   *    3. direct missions (no binding) — the persisted `operator_goal`
+   *       pin (preview/confirm path) or, for pre-R1 rows, `goal` itself.
    *  This text — and only this text — may mint contract requirements,
    *  network authorization, Telegram delivery intent, or output
    *  language. The enriched envelope stays informational. */
   private missionOperatorGoal(mission: Record<string, unknown>): string {
     const og = mission.operator_goal;
-    if (typeof og === "string" && og.trim() !== "") return og;
     const openId = mission.bound_open_id;
     if (typeof openId === "string" && openId !== "") {
-      // R2-F2 — a bound mission's operator authority is recoverable ONLY
+      // R2-F2 — a bound mission's operator authority is provable ONLY
       // through the canonical chain bound_open_id → work_open_binding →
-      // work_item.goal. A missing binding, a binding pinned to another
-      // mission, or a missing/goal-less work item means the operator text
-      // cannot be proven — fail closed: the enriched delegated envelope
-      // is NEVER promoted to authority merely because recovery failed.
+      // work_item.goal, and the chain is validated on EVERY resolution:
+      // a pinned operator_goal is an immutable snapshot of work_item.goal
+      // taken at mint, never a bypass around provenance. A missing
+      // binding, a binding pinned to another mission, a missing/goal-less
+      // work item, OR a pin diverging from canonical work_item.goal all
+      // mean the operator text cannot be proven — fail closed: the
+      // enriched delegated envelope is NEVER promoted to authority.
       const binding = this.store.tryGet(
         "work_open_binding", openId,
       ) as Record<string, unknown> | null;
@@ -3946,8 +3950,23 @@ export class MissionRuntime {
           `bound mission ${String(mission.mission_id)}: work_item ${String(binding.work_item_id ?? "")} missing or goal-less`,
         );
       }
-      return String(wi.goal);
+      const canonical = String(wi.goal);
+      if (typeof og === "string" && og.trim() !== "") {
+        if (og !== canonical) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+            `bound mission ${String(mission.mission_id)}: pinned operator_goal diverges from work_item.goal`,
+          );
+        }
+        return og;
+      }
+      // Legacy pre-R1 bound row (no pinned field): recover the snapshot.
+      return canonical;
     }
+    // Direct mission — no bound provenance to validate. A pinned
+    // operator_goal (persisted through preview/confirm) is authoritative;
+    // pre-R1 direct rows derive authority from the operator-submitted goal.
+    if (typeof og === "string" && og.trim() !== "") return og;
     return String(mission.goal ?? "");
   }
 

@@ -1108,14 +1108,18 @@ describe("K — HTTP mission-creation ingress reserves operator_goal", () => {
  *
  * missionOperatorGoal(): a bound mission (bound_open_id set) may ONLY
  * resolve authority through bound_open_id → work_open_binding →
- * work_item.goal — in that order, with mission_id consistency. Missing
- * binding, missing work item, or a binding pointing at another mission
- * must fail closed — the enriched envelope is NEVER authority. Direct
- * missions (no bound_open_id) keep the goal-as-authority fallback. */
+ * work_item.goal — in that order, with mission_id consistency, on EVERY
+ * resolution. A pinned operator_goal is the immutable snapshot of that
+ * goal taken at mint — it never bypasses chain validation, and any
+ * divergence from canonical work_item.goal fails closed. Missing
+ * binding, missing work item, mismatched binding, or pin divergence all
+ * fail closed — the enriched envelope is NEVER authority. Direct
+ * missions (no bound_open_id) keep the pin/goal fallback. */
 
 describe("L — bound-mission provenance recovery", () => {
   const bindCorrupt = async (
     corrupt: (s: ReturnType<typeof govStack>, mid: string) => void,
+    opts: { keepPin?: boolean } = {},
   ) => {
     const s = govStack("l", () => RAW_LOCAL());
     const { childId } = mkDelegatedItem(s, LOCAL_GOAL, HOSTILE_NOTES);
@@ -1123,10 +1127,12 @@ describe("L — bound-mission provenance recovery", () => {
     const row = s.biz.openWorkItem(childId, OP, undefined, { prepared_plan: prepared });
     const mid = String((row.mission_ids as string[])[0]);
     const mission = s.store.get("mission", mid) as Record<string, unknown>;
-    // Simulate a pre-R1 bound row: binding intact, pinned field absent.
-    const legacy = { ...mission };
-    delete legacy.operator_goal;
-    s.store.put("mission", mid, legacy, Number(mission.version));
+    if (!opts.keepPin) {
+      // Simulate a pre-R1 bound row: binding intact, pinned field absent.
+      const legacy = { ...mission };
+      delete legacy.operator_goal;
+      s.store.put("mission", mid, legacy, Number(mission.version));
+    }
     corrupt(s, mid);
     return { s, mid };
   };
@@ -1136,20 +1142,24 @@ describe("L — bound-mission provenance recovery", () => {
       .prepare("DELETE FROM entities WHERE entity_type=? AND entity_id=?")
       .run(entity, id);
 
-  it("missing work_open_binding → FAIL_CLOSED, envelope never becomes authority", async () => {
+  const planningCode = (s: ReturnType<typeof govStack>, mid: string) => {
+    const rt = s.store.get("mission_runtime", `MRT_${mid}`) as Record<string, unknown>;
+    return String((rt.planning_failure as Record<string, unknown>).code);
+  };
+
+  it("legacy pin (no operator_goal): missing work_open_binding → FAIL_CLOSED, envelope never becomes authority", async () => {
     const { s, mid } = await bindCorrupt((st, m) => {
       const mission = st.store.get("mission", m) as Record<string, unknown>;
       del(st, "work_open_binding", String(mission.bound_open_id));
     });
     const st = await drive(s, mid);
     expect(st).toBe("FAILED");
+    expect(planningCode(s, mid)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
     const rt = s.store.get("mission_runtime", `MRT_${mid}`) as Record<string, unknown>;
-    const pf = rt.planning_failure as Record<string, unknown>;
-    expect(String(pf.code)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
-    expect(String(pf.failure_class)).toBe("DETERMINISTIC");
+    expect(String((rt.planning_failure as Record<string, unknown>).failure_class)).toBe("DETERMINISTIC");
   });
 
-  it("binding → missing work_item → FAIL_CLOSED", async () => {
+  it("legacy pin (no operator_goal): binding → missing work_item → FAIL_CLOSED", async () => {
     const { s, mid } = await bindCorrupt((st, m) => {
       const mission = st.store.get("mission", m) as Record<string, unknown>;
       const binding = st.store.get("work_open_binding", String(mission.bound_open_id)) as Record<string, unknown>;
@@ -1157,12 +1167,10 @@ describe("L — bound-mission provenance recovery", () => {
     });
     const st = await drive(s, mid);
     expect(st).toBe("FAILED");
-    const rt = s.store.get("mission_runtime", `MRT_${mid}`) as Record<string, unknown>;
-    expect(String((rt.planning_failure as Record<string, unknown>).code))
-      .toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
+    expect(planningCode(s, mid)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
   });
 
-  it("binding pointing at a DIFFERENT mission → FAIL_CLOSED (consistency check)", async () => {
+  it("legacy pin (no operator_goal): binding pointing at a DIFFERENT mission → FAIL_CLOSED (consistency check)", async () => {
     const { s, mid } = await bindCorrupt((st, m) => {
       const mission = st.store.get("mission", m) as Record<string, unknown>;
       const binding = st.store.get("work_open_binding", String(mission.bound_open_id)) as Record<string, unknown>;
@@ -1171,13 +1179,66 @@ describe("L — bound-mission provenance recovery", () => {
     });
     const st = await drive(s, mid);
     expect(st).toBe("FAILED");
-    const rt = s.store.get("mission_runtime", `MRT_${mid}`) as Record<string, unknown>;
-    expect(String((rt.planning_failure as Record<string, unknown>).code))
-      .toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
+    expect(planningCode(s, mid)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
   });
 
-  it("intact binding + missing operator_goal field → recovers work_item.goal (legacy path)", async () => {
+  it("legacy pin (no operator_goal): intact binding → recovers work_item.goal", async () => {
     const { s, mid } = await bindCorrupt(() => {});
+    const st = await drive(s, mid);
+    assertMissionTerminal(s, mid, st);
+  });
+
+  /* R2 residual — a PINNED operator_goal is an immutable snapshot of
+   * work_item.goal, never a bypass around provenance: the binding chain
+   * is validated on every resolution even when the pin is present. */
+  it("pinned operator_goal + missing binding → FAIL_CLOSED (pin cannot bypass the chain)", async () => {
+    const { s, mid } = await bindCorrupt((st, m) => {
+      const mission = st.store.get("mission", m) as Record<string, unknown>;
+      del(st, "work_open_binding", String(mission.bound_open_id));
+    }, { keepPin: true });
+    const st = await drive(s, mid);
+    expect(st).toBe("FAILED");
+    expect(planningCode(s, mid)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
+  });
+
+  it("pinned operator_goal + mismatched binding → FAIL_CLOSED (pin cannot bypass the chain)", async () => {
+    const { s, mid } = await bindCorrupt((st, m) => {
+      const mission = st.store.get("mission", m) as Record<string, unknown>;
+      const binding = st.store.get("work_open_binding", String(mission.bound_open_id)) as Record<string, unknown>;
+      st.store.put("work_open_binding", String(mission.bound_open_id),
+        { ...binding, mission_id: "MSN_other" }, Number(binding.version));
+    }, { keepPin: true });
+    const st = await drive(s, mid);
+    expect(st).toBe("FAILED");
+    expect(planningCode(s, mid)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
+  });
+
+  it("pinned operator_goal + binding → missing work_item → FAIL_CLOSED", async () => {
+    const { s, mid } = await bindCorrupt((st, m) => {
+      const mission = st.store.get("mission", m) as Record<string, unknown>;
+      const binding = st.store.get("work_open_binding", String(mission.bound_open_id)) as Record<string, unknown>;
+      del(st, "work_item", String(binding.work_item_id));
+    }, { keepPin: true });
+    const st = await drive(s, mid);
+    expect(st).toBe("FAILED");
+    expect(planningCode(s, mid)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
+  });
+
+  it("pinned operator_goal diverging from work_item.goal → FAIL_CLOSED (tampered/stale snapshot)", async () => {
+    const { s, mid } = await bindCorrupt((st, m) => {
+      const mission = st.store.get("mission", m) as Record<string, unknown>;
+      const binding = st.store.get("work_open_binding", String(mission.bound_open_id)) as Record<string, unknown>;
+      const wi = st.store.get("work_item", String(binding.work_item_id)) as Record<string, unknown>;
+      st.store.put("work_item", String(wi.work_item_id),
+        { ...wi, goal: wi.goal + " — mutated post-mint" }, Number(wi.version));
+    }, { keepPin: true });
+    const st = await drive(s, mid);
+    expect(st).toBe("FAILED");
+    expect(planningCode(s, mid)).toBe("FAIL_CLOSED_BOUND_GOAL_PROVENANCE");
+  });
+
+  it("pinned operator_goal + intact chain → resolves (normal post-R1 bound mission)", async () => {
+    const { s, mid } = await bindCorrupt(() => {}, { keepPin: true });
     const st = await drive(s, mid);
     assertMissionTerminal(s, mid, st);
   });

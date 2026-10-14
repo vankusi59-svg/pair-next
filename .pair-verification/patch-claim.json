@@ -1,6 +1,6 @@
 {
-  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY_R2",
-  "title": "Phase C R2 — operator_goal ingress reservation + bound-provenance fail-closed recovery",
+  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY_R2_RESIDUAL",
+  "title": "Phase C R2 residual — pinned operator_goal never bypasses bound-provenance chain validation",
   "affected_surfaces": [
     "MISSION_CONTROL",
     "RECOVERY_REPLAY",
@@ -13,6 +13,6 @@
     "INV_PLAN_001",
     "INV_MISSION_001"
   ],
-  "description": "Audit R2 on 57fef29. F1: public /api/missions{,/preview,/confirm} bodies could carry caller operator_goal, letting forged authority reach planning — now rejected with FAIL_CLOSED_OPERATOR_GOAL_CALLER_SUPPLIED BEFORE planExpander runs (zero planning spend); direct authority derives from the authenticated goal; delegated seam keeps work_item.goal provenance. F2: missionOperatorGoal bound-path fallback promoted the enriched envelope when binding recovery failed — now bound_open_id missions resolve ONLY via work_open_binding(mission_id-consistent) → work_item.goal, else FAIL_CLOSED_BOUND_GOAL_PROVENANCE; resolution hoisted before external-input lineage so provenance precedes every derivation; direct missions keep goal fallback. F3: pair-phase-b catch-all tolerance replaced by 3 exact-name win32 path-canonicalization baselines (I/N/§16, verified identical on BASE). F4: delegated e2e proven COMPLETED on Linux (28/28, /proc/self/fd present). +10 regressions: 6 HTTP ingress, 4 bound-recovery matrix.",
+  "description": "Audit R2 residual on fd3534e: missionOperatorGoal returned a pinned operator_goal BEFORE validating bound provenance, letting bound missions bypass binding-consistency checks. FIX: bound_open_id now takes precedence — the canonical chain work_open_binding(mission_id-consistent) → work_item.goal is validated on EVERY resolution; the pinned field is the immutable snapshot of that goal (identical by construction — any divergence → FAIL_CLOSED_BOUND_GOAL_PROVENANCE); legacy rows without the pin recover the snapshot from the chain; direct missions keep pin/goal fallback. Immutable snapshot + digest/replay semantics preserved. +5 regressions: pinned × {missing binding, mismatched binding, missing work_item, pin divergence} all fail closed with DETERMINISTIC code; pinned + intact chain resolves normally. 43/43 focused green.",
   "risk_override": "HIGH"
 }
