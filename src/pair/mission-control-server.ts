@@ -379,6 +379,25 @@ async function readBody(
   }
 }
 
+/** R2-F1 — `operator_goal` is canonical provenance pinned ONLY by
+ *  trusted internal seams: `startBoundMission` derives it from the bound
+ *  work item, and the confirm seam replays the digest-bound value the
+ *  preview persisted. A public mission-creation body may NEVER name it —
+ *  direct-mission authority derives from the authenticated request's
+ *  `goal`. Rejected BEFORE any planner spend, at both the top level and
+ *  inside caller-controlled `metadata` (the mint-time shadow check would
+ *  catch the latter at confirm, but the request must never reach
+ *  planning carrying forged authority). */
+function rejectCallerOperatorGoal(body: Record<string, unknown>): void {
+  const md = body.metadata as Record<string, unknown> | undefined;
+  if (body.operator_goal != null || md?.operator_goal != null) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_OPERATOR_GOAL_CALLER_SUPPLIED",
+      "operator_goal is reserved canonical authority — direct submissions derive it from goal",
+    );
+  }
+}
+
 export function createMissionControlServer(
   deps: MissionControlServerDeps,
 ): http.Server {
@@ -909,6 +928,7 @@ export function createMissionControlServer(
       // Phase B two-step submit: preview persists a durable
       // mission_plan_preview (READY); confirm consumes exactly it.
       if (method === "POST" && p === "/api/missions/preview") {
+        rejectCallerOperatorGoal(body);
         const ex = deps.planExpander ? await deps.planExpander(body) : { input: body };
         const expanded = (ex as { input?: Record<string, unknown> }).input ?? (ex as Record<string, unknown>);
         const planner = (ex as { planner?: never }).planner;
@@ -921,12 +941,14 @@ export function createMissionControlServer(
       // Explicit confirmation seam: {preview_id, plan_digest} — consumes the
       // persisted preview and mints the mission, idempotently.
       if (method === "POST" && p === "/api/missions/confirm") {
+        rejectCallerOperatorGoal(body);
         const confirm = (body.confirm_plan ?? {}) as { preview_id?: string; digest?: string };
         const previewId = String(body.preview_id ?? confirm.preview_id ?? "");
         const planDigest = String(body.plan_digest ?? confirm.digest ?? "");
         return void json(res, 200, c.confirmPlanPreview({ preview_id: previewId, plan_digest: planDigest, operator_id: operator }));
       }
       if (method === "POST" && p === "/api/missions") {
+        rejectCallerOperatorGoal(body);
         // A confirm payload (preview_id+digest) consumes the persisted
         // preview — NEVER re-plans. A bare submit plans once through the
         // failover chain and immediately consumes its own preview, so every

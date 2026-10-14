@@ -1298,6 +1298,13 @@ export class MissionRuntime {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", missionId);
     }
+    // R1/R2-F2 — resolve provenance-bound operator authority FIRST: every
+    // downstream derivation (external inputs, planner prompt, dataflow
+    // revalidation) binds this text. A bound mission whose canonical
+    // chain (bound_open_id → work_open_binding → work_item.goal) is
+    // broken fails closed HERE — the enriched envelope is never promoted
+    // merely because recovery failed.
+    const operatorGoal = this.missionOperatorGoal(mission);
     // HOTFIX-A — canonical cross-mission input authority for this
     // mission: ACCEPTED artifacts from sibling missions in the same
     // authorized Objective lineage, computed by trusted PAIR code. The
@@ -1306,10 +1313,7 @@ export class MissionRuntime {
     const externalInputs =
       this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
     const proposal = this.deps.planner({
-      // R1 — hydrate the provenance-bound operator goal so the planner's
-      // authority derivations bind it (legacy bound missions recover
-      // through the binding; direct missions resolve to goal).
-      mission: { ...mission, operator_goal: this.missionOperatorGoal(mission) },
+      mission: { ...mission, operator_goal: operatorGoal },
       advice,
       reason: "initial",
       input_artifact_sources: externalInputs,
@@ -1329,12 +1333,12 @@ export class MissionRuntime {
     // boundary: every consumed artifact requires its producer edge. A
     // planner path that bypassed the canonicalize seam still fails closed.
     // R8 — the intent↔presence invariant and instruction hygiene are
-    // re-proven here with the operator request (mission.goal) as the
+    // re-proven here with the provenance-bound operator request as the
     // only delivery authority. Stamped external bindings re-prove the
     // CURRENT eligible set NOW.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(this.missionOperatorGoal(mission)),
-      outputLanguage: detectOutputLanguage(this.missionOperatorGoal(mission)),
+      telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+      outputLanguage: detectOutputLanguage(operatorGoal),
       external_input_artifacts: externalInputs,
     });
     this.deps.service.commitPlan({
@@ -3524,6 +3528,8 @@ export class MissionRuntime {
       return;
     }
 
+    // R2-F2 — provenance resolves once, before any replan derivation.
+    const operatorGoal = this.missionOperatorGoal(mission);
     // HOTFIX-A — replan candidates bind the same canonical cross-mission
     // input authority as the initial plan (computed once per tick).
     const externalInputs =
@@ -3535,7 +3541,7 @@ export class MissionRuntime {
       let proposal: unknown;
       try {
         proposal = this.deps.planner({
-          mission: { ...mission, operator_goal: this.missionOperatorGoal(mission) },
+          mission: { ...mission, operator_goal: operatorGoal },
           advice: advice ?? null,
           superseded_tasks: oldTasks,
           reason: "replan",
@@ -3584,8 +3590,8 @@ export class MissionRuntime {
         assertPlanDataflow(
           validated as unknown as Array<Record<string, unknown>>,
           {
-            telegramIntent: detectTelegramDeliveryIntent(this.missionOperatorGoal(mission)),
-            outputLanguage: detectOutputLanguage(this.missionOperatorGoal(mission)),
+            telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+            outputLanguage: detectOutputLanguage(operatorGoal),
             external_input_artifacts: externalInputs,
           },
         );
@@ -3899,7 +3905,10 @@ export class MissionRuntime {
    *       R1 carries it; bound missions pin `work_item.goal`);
    *    2. legacy bound missions minted before the field — recovered
    *       through `bound_open_id` → work_open_binding → the canonical
-   *       work item's goal;
+   *       work item's goal. R2-F2 — a bound mission whose provenance
+   *       chain is missing, mismatched, or goal-less FAILS CLOSED:
+   *       unrecoverable canonical authority can never silently widen to
+   *       the enriched envelope;
    *    3. direct missions (no binding) — `goal` itself is the operator
    *       request.
    *  This text — and only this text — may mint contract requirements,
@@ -3910,15 +3919,34 @@ export class MissionRuntime {
     if (typeof og === "string" && og.trim() !== "") return og;
     const openId = mission.bound_open_id;
     if (typeof openId === "string" && openId !== "") {
+      // R2-F2 — a bound mission's operator authority is recoverable ONLY
+      // through the canonical chain bound_open_id → work_open_binding →
+      // work_item.goal. A missing binding, a binding pinned to another
+      // mission, or a missing/goal-less work item means the operator text
+      // cannot be proven — fail closed: the enriched delegated envelope
+      // is NEVER promoted to authority merely because recovery failed.
       const binding = this.store.tryGet(
         "work_open_binding", openId,
       ) as Record<string, unknown> | null;
-      const wi = binding
-        ? (this.store.tryGet(
-            "work_item", String(binding.work_item_id),
-          ) as Record<string, unknown> | null)
-        : null;
-      if (wi?.goal != null) return String(wi.goal);
+      if (
+        !binding ||
+        String(binding.mission_id ?? "") !== String(mission.mission_id ?? "")
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+          `bound mission ${String(mission.mission_id)}: work_open_binding ${openId} missing or mission-mismatched`,
+        );
+      }
+      const wi = this.store.tryGet(
+        "work_item", String(binding.work_item_id ?? ""),
+      ) as Record<string, unknown> | null;
+      if (wi?.goal == null || String(wi.goal).trim() === "") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+          `bound mission ${String(mission.mission_id)}: work_item ${String(binding.work_item_id ?? "")} missing or goal-less`,
+        );
+      }
+      return String(wi.goal);
     }
     return String(mission.goal ?? "");
   }

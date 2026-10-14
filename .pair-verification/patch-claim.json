@@ -1,24 +1,18 @@
 {
-  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY_R1",
-  "title": "Phase C R1 — provenance-bound operator_goal: only the trusted operator goal may mint Goal Contract, network, delivery, and language authority",
+  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY_R2",
+  "title": "Phase C R2 — operator_goal ingress reservation + bound-provenance fail-closed recovery",
   "affected_surfaces": [
-    "PLANNER",
-    "DELIVERY",
     "MISSION_CONTROL",
-    "MISSION_DRAFT",
     "RECOVERY_REPLAY",
-    "GATE_ROUTER",
-    "BUSINESS_OBJECTIVE",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-goal-context-authority.test.ts",
-    "src/__tests__/pair-phase-c-unified-planner.test.ts"
+    "src/__tests__/pair-goal-context-authority.test.ts"
   ],
   "invariants": [
     "INV_PLAN_001",
     "INV_MISSION_001"
   ],
-  "description": "ROOT CAUSE on BASE 3737fc4: boundMissionGoal emits '[BUSINESS …]' + operator goal + an '[AGENT CONTEXT — last N outcomes]' bullet section; every authority-derivation site (extractGoalContract, extractGoalHosts, network-demand, detectTelegramDeliveryIntent, detectOutputLanguage, planner sanitize, runtime revalidation) consumed the whole enriched string, so history bullets minted fabricated OBL_*/DEL_*, authorized context URLs, and delivery/language intent → FAIL_CLOSED_PLAN_INCOMPLETE → PLANNER_RUN_EXHAUSTED → INTEGRITY_FAULT. Audit R1 rejected format-based inference (stripped genuine operator Markdown). FIX — provenance, not parsing: canonical mission field operator_goal is pinned at the seams — startBoundMission derives it from the loaded work_item row, preview/confirm digest-bind it into mission_input + effective_input_digest, service reserves it (metadata shadowing → FAIL_CLOSED_METADATA_AUTHORITY_SHADOWING), legacy bound rows recover it via bound_open_id → work_item.goal. All authority sites resolve operatorGoalOf(mission); the enriched envelope still reaches the planner prompt verbatim as context. Coverage/dataflow/source-auth/executor governance, digests, pinned plans, retry/idempotency unchanged. 28 regressions: bare/enriched parity, operator Markdown authority, context URL/Telegram/language non-authority, delegated e2e, preview/confirm/replay, legacy recovery, drift/shadowing fail closed.",
+  "description": "Audit R2 on 57fef29. F1: public /api/missions{,/preview,/confirm} bodies could carry caller operator_goal, letting forged authority reach planning — now rejected with FAIL_CLOSED_OPERATOR_GOAL_CALLER_SUPPLIED BEFORE planExpander runs (zero planning spend); direct authority derives from the authenticated goal; delegated seam keeps work_item.goal provenance. F2: missionOperatorGoal bound-path fallback promoted the enriched envelope when binding recovery failed — now bound_open_id missions resolve ONLY via work_open_binding(mission_id-consistent) → work_item.goal, else FAIL_CLOSED_BOUND_GOAL_PROVENANCE; resolution hoisted before external-input lineage so provenance precedes every derivation; direct missions keep goal fallback. F3: pair-phase-b catch-all tolerance replaced by 3 exact-name win32 path-canonicalization baselines (I/N/§16, verified identical on BASE). F4: delegated e2e proven COMPLETED on Linux (28/28, /proc/self/fd present). +10 regressions: 6 HTTP ingress, 4 bound-recovery matrix.",
   "risk_override": "HIGH"
 }
