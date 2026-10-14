@@ -567,6 +567,12 @@ export interface LlmPlannerConfig {
    *  re-ask: MINIMAL-REPAIR semantics (fix the named defect, preserve all
    *  other structure) — never F3's alternative-plan semantics. */
   rejectionContext?: PlannerRejectionContext;
+  /** R1 — the provenance-bound operator goal: the ONLY text allowed to
+   *  mint Goal Contract requirements, host/network authorization, and
+   *  the work-task budget inside the prompt. `goal` remains the full
+   *  mission text the model reads (envelope context included); absent
+   *  → `goal` itself is the operator request. */
+  authorityGoal?: string;
 }
 
 export interface LlmPlanResult {
@@ -919,6 +925,8 @@ export function sanitizePlan(
 export function repairNetworkCapabilityBinding(
   tasks: Array<Record<string, unknown>>,
   opts: {
+    /** R1 — the provenance-bound operator goal (authority text), never
+     *  the enriched envelope: hosts/network demand mint from it only. */
     goal: string;
     allowedCapabilities: string[];
     capabilitySets?: string[][];
@@ -1006,15 +1014,21 @@ export function buildPlannerUserPrompt(
     maxTasks?: number;
     replanContext?: LlmPlannerConfig["replanContext"];
     rejectionContext?: LlmPlannerConfig["rejectionContext"];
+    /** R1 — provenance-bound operator goal (defaults to `goal`). The
+     *  contract + work-task budget derive from it; the MISSION GOAL
+     *  block still renders `goal` verbatim so appended context stays
+     *  informational. */
+    authorityGoal?: string;
   },
 ): string {
-  const workTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
+  const authorityGoal = cfg.authorityGoal ?? goal;
+  const workTasks = resolveWorkTaskBudget(authorityGoal, cfg.maxTasks);
   // PRV2-B — the planner receives the canonical Goal Contract alongside
   // the raw goal. The contract is read-only authority: the model must
   // cover it, never mutate it, never invent requirements, and never
   // downgrade quantities — PAIR verifies every requirement
   // independently and a fabricated claim fails closed.
-  const contract = extractGoalContract(goal);
+  const contract = extractGoalContract(authorityGoal);
   const reqLines = [
     ...contract.obligations.map((r) => `${r.id} obligation: ${r.text}`),
     ...contract.deliverables.map((r) => `${r.id} deliverable: ${r.text}`),
@@ -1076,7 +1090,10 @@ export function plannerSystemPrompt(): string {
 }
 
 export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmPlanResult> {
-  const maxTasks = resolveWorkTaskBudget(goal, cfg.maxTasks);
+  // R1 — authority derivations bind the provenance-bound operator goal;
+  // the enriched mission text is context only.
+  const authorityGoal = cfg.authorityGoal ?? goal;
+  const maxTasks = resolveWorkTaskBudget(authorityGoal, cfg.maxTasks);
   // R1.A — sanitize keeps the PAIR-reserved AUTOMATON key ONLY so a pure
   // bookkeeping-shaped emission survives to the canonicalize seam for
   // deterministic normalization (drop + dependency remap onto injected
@@ -1171,7 +1188,7 @@ export async function llmPlan(goal: string, cfg: LlmPlannerConfig): Promise<LlmP
     // missing NETWORK_ACCESS gets it added deterministically (same helper the
     // codex planner lane uses) instead of dying on the annotation omission.
     const repair = repairNetworkCapabilityBinding(tasks, {
-      goal,
+      goal: authorityGoal,
       allowedCapabilities: cfg.allowedCapabilities,
       capabilitySets: cfg.capabilitySets,
     });

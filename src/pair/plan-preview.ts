@@ -334,6 +334,10 @@ export const DEFAULT_PREVIEW_TTL_S = 1800;
 export function effectiveInputDigest(input: {
   project_id: string;
   goal: string;
+  /** R1 — the provenance-bound operator request resolved at preview
+   *  time. Digest-bound so a drifted operator authority between preview
+   *  and confirm is unrepresentable (confirm replays mission_input). */
+  operator_goal?: string | null;
   granted_permissions?: unknown[];
   authorized_workspaces?: unknown[];
   risk_ceiling?: unknown;
@@ -346,6 +350,7 @@ export function effectiveInputDigest(input: {
     effective_planning_input: 1,
     project_id: String(input.project_id),
     goal: String(input.goal),
+    operator_goal: input.operator_goal ?? null,
     granted_permissions: input.granted_permissions ?? [],
     authorized_workspaces: input.authorized_workspaces ?? [],
     risk_ceiling: input.risk_ceiling ?? null,

@@ -661,8 +661,10 @@ export class MissionRuntime {
     const md = (task.metadata as Record<string, unknown>) ?? {};
     // Language authority is re-derived from the effective operator goal —
     // a stamped metadata value can be tampered with, the goal cannot.
+    // R1 — the provenance-bound operator_goal, never the enriched
+    // envelope: appended agent context cannot change output language.
     const expectedLanguage =
-      detectOutputLanguage(mission.goal).code ?? null;
+      detectOutputLanguage(this.missionOperatorGoal(mission)).code ?? null;
     const languageViolation = (
       artifact: string,
       text: string,
@@ -1296,6 +1298,13 @@ export class MissionRuntime {
     if (!this.deps.planner) {
       throw new PolicyError("FAIL_CLOSED_NO_PLANNER", missionId);
     }
+    // R1/R2-F2 — resolve provenance-bound operator authority FIRST: every
+    // downstream derivation (external inputs, planner prompt, dataflow
+    // revalidation) binds this text. A bound mission whose canonical
+    // chain (bound_open_id → work_open_binding → work_item.goal) is
+    // broken fails closed HERE — the enriched envelope is never promoted
+    // merely because recovery failed.
+    const operatorGoal = this.missionOperatorGoal(mission);
     // HOTFIX-A — canonical cross-mission input authority for this
     // mission: ACCEPTED artifacts from sibling missions in the same
     // authorized Objective lineage, computed by trusted PAIR code. The
@@ -1304,7 +1313,7 @@ export class MissionRuntime {
     const externalInputs =
       this.deps.service.artifactResolver.listEligibleExternalInputSources(mission);
     const proposal = this.deps.planner({
-      mission,
+      mission: { ...mission, operator_goal: operatorGoal },
       advice,
       reason: "initial",
       input_artifact_sources: externalInputs,
@@ -1324,12 +1333,12 @@ export class MissionRuntime {
     // boundary: every consumed artifact requires its producer edge. A
     // planner path that bypassed the canonicalize seam still fails closed.
     // R8 — the intent↔presence invariant and instruction hygiene are
-    // re-proven here with the operator request (mission.goal) as the
+    // re-proven here with the provenance-bound operator request as the
     // only delivery authority. Stamped external bindings re-prove the
     // CURRENT eligible set NOW.
     assertPlanDataflow(tasks as unknown as Array<Record<string, unknown>>, {
-      telegramIntent: detectTelegramDeliveryIntent(mission.goal),
-      outputLanguage: detectOutputLanguage(mission.goal),
+      telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+      outputLanguage: detectOutputLanguage(operatorGoal),
       external_input_artifacts: externalInputs,
     });
     this.deps.service.commitPlan({
@@ -3519,6 +3528,8 @@ export class MissionRuntime {
       return;
     }
 
+    // R2-F2 — provenance resolves once, before any replan derivation.
+    const operatorGoal = this.missionOperatorGoal(mission);
     // HOTFIX-A — replan candidates bind the same canonical cross-mission
     // input authority as the initial plan (computed once per tick).
     const externalInputs =
@@ -3530,7 +3541,7 @@ export class MissionRuntime {
       let proposal: unknown;
       try {
         proposal = this.deps.planner({
-          mission,
+          mission: { ...mission, operator_goal: operatorGoal },
           advice: advice ?? null,
           superseded_tasks: oldTasks,
           reason: "replan",
@@ -3579,8 +3590,8 @@ export class MissionRuntime {
         assertPlanDataflow(
           validated as unknown as Array<Record<string, unknown>>,
           {
-            telegramIntent: detectTelegramDeliveryIntent(mission.goal),
-            outputLanguage: detectOutputLanguage(mission.goal),
+            telegramIntent: detectTelegramDeliveryIntent(operatorGoal),
+            outputLanguage: detectOutputLanguage(operatorGoal),
             external_input_artifacts: externalInputs,
           },
         );
@@ -3886,6 +3897,77 @@ export class MissionRuntime {
       this.exerciseApprovedRecovery(missionId, approvalId, now);
       return;
     }
+  }
+
+  /** R1/R2 — the mission's operator-goal authority text, resolved by
+   *  PROVENANCE (never by parsing the committed goal):
+   *    1. bound missions (bound_open_id set) — the canonical chain
+   *       work_open_binding → work_item.goal is validated on EVERY
+   *       resolution; a pinned `operator_goal` is the immutable snapshot
+   *       of that goal taken at mint (identical by construction — any
+   *       divergence fails closed), never a bypass around provenance.
+   *       Missing/mismatched binding, missing or goal-less work item, or
+   *       pin divergence all FAIL CLOSED: unrecoverable canonical
+   *       authority can never silently widen to the enriched envelope;
+   *    2. legacy bound rows minted before the field — same chain, the
+   *       canonical work item goal IS the recovered snapshot;
+   *    3. direct missions (no binding) — the persisted `operator_goal`
+   *       pin (preview/confirm path) or, for pre-R1 rows, `goal` itself.
+   *  This text — and only this text — may mint contract requirements,
+   *  network authorization, Telegram delivery intent, or output
+   *  language. The enriched envelope stays informational. */
+  private missionOperatorGoal(mission: Record<string, unknown>): string {
+    const og = mission.operator_goal;
+    const openId = mission.bound_open_id;
+    if (typeof openId === "string" && openId !== "") {
+      // R2-F2 — a bound mission's operator authority is provable ONLY
+      // through the canonical chain bound_open_id → work_open_binding →
+      // work_item.goal, and the chain is validated on EVERY resolution:
+      // a pinned operator_goal is an immutable snapshot of work_item.goal
+      // taken at mint, never a bypass around provenance. A missing
+      // binding, a binding pinned to another mission, a missing/goal-less
+      // work item, OR a pin diverging from canonical work_item.goal all
+      // mean the operator text cannot be proven — fail closed: the
+      // enriched delegated envelope is NEVER promoted to authority.
+      const binding = this.store.tryGet(
+        "work_open_binding", openId,
+      ) as Record<string, unknown> | null;
+      if (
+        !binding ||
+        String(binding.mission_id ?? "") !== String(mission.mission_id ?? "")
+      ) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+          `bound mission ${String(mission.mission_id)}: work_open_binding ${openId} missing or mission-mismatched`,
+        );
+      }
+      const wi = this.store.tryGet(
+        "work_item", String(binding.work_item_id ?? ""),
+      ) as Record<string, unknown> | null;
+      if (wi?.goal == null || String(wi.goal).trim() === "") {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+          `bound mission ${String(mission.mission_id)}: work_item ${String(binding.work_item_id ?? "")} missing or goal-less`,
+        );
+      }
+      const canonical = String(wi.goal);
+      if (typeof og === "string" && og.trim() !== "") {
+        if (og !== canonical) {
+          throw new IntegrityError(
+            "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+            `bound mission ${String(mission.mission_id)}: pinned operator_goal diverges from work_item.goal`,
+          );
+        }
+        return og;
+      }
+      // Legacy pre-R1 bound row (no pinned field): recover the snapshot.
+      return canonical;
+    }
+    // Direct mission — no bound provenance to validate. A pinned
+    // operator_goal (persisted through preview/confirm) is authoritative;
+    // pre-R1 direct rows derive authority from the operator-submitted goal.
+    if (typeof og === "string" && og.trim() !== "") return og;
+    return String(mission.goal ?? "");
   }
 
   /** Advisory retrieval — a broken advisor can never break orchestration. */

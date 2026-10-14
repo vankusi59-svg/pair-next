@@ -65,6 +65,53 @@ export interface GoalContract {
 }
 
 /* ------------------------------------------------------------------ */
+/* authority boundary — provenance, never formatting                   */
+/* ------------------------------------------------------------------ */
+
+/** A delegated mission carries TWO texts with different authority:
+ *
+ *  `goal` — the committed bound-mission envelope `boundMissionGoal`
+ *  emits: a `[BUSINESS … | DEPT … | AGENT …]` provenance header, then
+ *  the operator goal, then appended machine sections such as
+ *  `[AGENT CONTEXT — last N outcomes]` followed by history bullets
+ *  (`- [delegated] …`). The whole envelope is persisted as
+ *  `mission.goal`, reaches the planner prompt verbatim as supporting
+ *  context, and is digest-bound by `delegated_goal_digest`.
+ *
+ *  `operator_goal` — the trusted operator request, provenance-bound at
+ *  the minting seam: the bound work item's canonical `goal` field
+ *  (derived inside `startBoundMission` from the loaded `work_item`
+ *  row, never caller-supplied). Only this text may mint obligations,
+ *  deliverables, constraints, prohibitions, network-source
+ *  authorization, Telegram delivery intent, or output-language
+ *  authority. Agent history is informational — it can never grant or
+ *  modify those authorities.
+ *
+ *  Live incident behind this boundary: an `[AGENT CONTEXT]` bullet
+ *  leading with a work verb minted a fabricated OBL requirement →
+ *  coverage failed closed (FAIL_CLOSED_PLAN_INCOMPLETE), the planner
+ *  run exhausted, the objective recorded INTEGRITY_FAULT. The earlier
+ *  fix inferred the boundary from Markdown formatting; audit R1/F1
+ *  rejected that — format is never evidence of authority. The boundary
+ *  here is recorded provenance, not parsing. */
+export function operatorGoalOf(
+  source:
+    | string
+    | { goal?: unknown; operator_goal?: unknown }
+    | null
+    | undefined,
+): string {
+  if (typeof source === "string") return source;
+  const og = source?.operator_goal;
+  if (typeof og === "string" && og.trim() !== "") return og;
+  // No recorded provenance → the committed goal itself IS the operator
+  // request (direct submissions, legacy rows minted before the field
+  // existed). This is authority-of-record fallback — never a widening:
+  // a bound mission always carries the explicit pin.
+  return String(source?.goal ?? "");
+}
+
+/* ------------------------------------------------------------------ */
 /* clause splitting                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -624,10 +671,13 @@ function prohibitionPayload(clause: string): {
 }
 
 /** Extract the Goal Contract — the deterministic, append-only projection
- *  of the raw operator goal. Same input → same contract, always. */
+ *  of the text it is handed. Same input → same contract, always.
+ *  AUTHORITY BOUNDARY: callers must pass `operatorGoalOf(source)` —
+ *  the provenance-bound operator goal — never the enriched envelope.
+ *  Every operator-authored clause mints authority here, including
+ *  Markdown sections, bullet lists, and bracketed header lines. */
 export function extractGoalContract(goal: string): GoalContract {
-  const raw = String(goal ?? "");
-  const clauses = splitClauses(raw);
+  const clauses = splitClauses(goal);
   // A prohibition trigger opening mid-clause scopes only its own span —
   // "phân tích EA không dùng martingale" keeps the `phân tích EA`
   // obligation AND mints the `use` prohibition; the trigger must not
@@ -747,14 +797,14 @@ export function extractGoalContract(goal: string): GoalContract {
   }
 
   const contractBase = {
-    objective: clauses[0]?.slice(0, 400) ?? raw.slice(0, 400),
+    objective: clauses[0]?.slice(0, 400) ?? goal.slice(0, 400),
     obligations,
     deliverables,
     constraints,
     prohibitions,
     deadline,
-    delivery_intent: detectTelegramDeliveryIntent(raw),
-    output_language: detectOutputLanguage(raw),
+    delivery_intent: detectTelegramDeliveryIntent(goal),
+    output_language: detectOutputLanguage(goal),
   };
   const contractDigest = createHash("sha256")
     .update(JSON.stringify(canonicalizeForDigest(contractBase)))

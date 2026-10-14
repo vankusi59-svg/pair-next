@@ -1,29 +1,18 @@
 {
-  "claim_id": "PHASE1_OP_CHAT_AUTH_STATUS",
-  "title": "Phase 1 — trusted authorization + read-only operational status foundation for PAIR Chat (Independent Audit R3 closure)",
+  "claim_id": "PHASE_C_GOAL_CONTEXT_AUTHORITY_R2_RESIDUAL",
+  "title": "Phase C R2 residual — pinned operator_goal never bypasses bound-provenance chain validation",
   "affected_surfaces": [
     "MISSION_CONTROL",
-    "CONVERSATION",
-    "MISSION_DRAFT",
-    "TELEGRAM_INGRESS",
+    "RECOVERY_REPLAY",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-phase1-operational-chat.test.ts",
-    "src/__tests__/pair-phase1-http-boundary.test.ts",
-    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
-    "src/__tests__/pair-p15-8a-conversation-authority.test.ts",
-    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
-    "src/__tests__/pair-p15-8d-web-chat.test.ts",
-    "src/__tests__/pair-p15-8e-telegram.test.ts",
-    "src/__tests__/pair-p15-8f-proposal.test.ts",
-    "src/__tests__/pair-p15-8e-bridge-e2e.test.ts"
+    "src/__tests__/pair-goal-context-authority.test.ts"
   ],
   "invariants": [
-    "INV_CONV_001",
-    "INV_MISSION_001",
-    "INV_SECRETS_001"
+    "INV_PLAN_001",
+    "INV_MISSION_001"
   ],
-  "description": "R3 CORRECTION on BASE 5b5ab73 (audited HEAD fefb6b7; R2-F1/R2-F2 accepted). R3-F1: the idempotent-replay path returned a committed p.proposal without re-checking read_only — closed: replayed replies apply the same read_only gate (row unchanged, only the returned actionable surface suppressed). HTTP regression simulates the crash window (proposal committed via reasoning.turn, no draft), retries the same session/message/key under admin-only authority → zero drafts/missions/proposals, then proves authorized MC replay still recovers (proposal returned, idempotent draft mint). R3-F2: explicit request contract separates read-only query purpose from mission-creation purpose on the MC lane — the turns route now honors `body.read_only === true`, OR-ed with the credential-derived flag so a caller can only NARROW its own authority, never widen it. HTTP proofs: MC + read_only:true + proposal-emitting model → zero drafts; absent flag + actionable request → governed draft mints; declared read_only wins over actionable wording; mixed provider/cost wording neither grants nor revokes. Prior fixes retained: non-admin principals (operator AND telegram) are UNVERIFIED for scoped data (UNVERIFIED_IDENTITY, admin-only reads); admin credential bearer-only + boundary-scoped; strong admin secret fail-closed at boot; bounded valid-JSON envelopes; hook runs only after replay + stale-turn gates and mutates nothing.",
+  "description": "Audit R2 residual on fd3534e: missionOperatorGoal returned a pinned operator_goal BEFORE validating bound provenance, letting bound missions bypass binding-consistency checks. FIX: bound_open_id now takes precedence — the canonical chain work_open_binding(mission_id-consistent) → work_item.goal is validated on EVERY resolution; the pinned field is the immutable snapshot of that goal (identical by construction — any divergence → FAIL_CLOSED_BOUND_GOAL_PROVENANCE); legacy rows without the pin recover the snapshot from the chain; direct missions keep pin/goal fallback. Immutable snapshot + digest/replay semantics preserved. +5 regressions: pinned × {missing binding, mismatched binding, missing work_item, pin divergence} all fail closed with DETERMINISTIC code; pinned + intact chain resolves normally. 43/43 focused green.",
   "risk_override": "HIGH"
 }
