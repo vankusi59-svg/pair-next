@@ -82,6 +82,7 @@ export const OPERATING_OUTCOMES = [
   "TOPOLOGY_CHANGE_REQUIRED",
   "INSUFFICIENT_VERIFIED_PROGRESS",
   "OBJECTIVE_BUDGET_EXHAUSTED",
+  "OBJECTIVE_ZERO_BUDGET",
   "NO_ELIGIBLE_AGENT",
   "DEPENDENCY_BLOCKED",
   "OBJECTIVE_NOT_ACTIVE",
@@ -238,8 +239,19 @@ export class ObjectiveOperatingService {
     const allTargetsMet = kpis.length > 0 &&
       kpis.every((k) => objectiveKpiAssessment(k) === "MET");
     const budget = objective.budget as Record<string, unknown>;
-    const budgetExhausted =
-      Number(budget.consumed_microusd) >= Number(budget.ceiling_microusd);
+    // P0-F3 — canonical budgetView semantics (objective-display R3.A):
+    // ceiling=0 is ZERO_BUDGET — a hard bound ("cannot dispatch new
+    // work"), NEVER uncapped and NEVER "exhausted". Positive ceilings
+    // still exhaust at consumed >= ceiling. Both block NEW spend-bearing
+    // work (CEO cycle, work open, new allocation); bookkeeping/observe
+    // paths above are unaffected.
+    const budgetCeiling = Number(budget.ceiling_microusd);
+    const budgetBlocked: OperatingOutcome | null =
+      budgetCeiling <= 0
+        ? "OBJECTIVE_ZERO_BUDGET"
+        : Number(budget.consumed_microusd) >= budgetCeiling
+          ? "OBJECTIVE_BUDGET_EXHAUSTED"
+          : null;
 
     let binding = this.deps.workstreams.getBinding(objectiveId); // strict
 
@@ -272,7 +284,7 @@ export class ObjectiveOperatingService {
     // §7 — initial objective bootstrap through the EXISTING P15.3
     // cycle only (never another CEO path, never Planner/Brain/executor).
     if (!binding) {
-      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      if (budgetBlocked) return result(budgetBlocked);
       this.tick(ctx);
       authorityGate?.();
       const cycle = await this.deps.ceoCycle.runCycle({ objective_id: objectiveId, actor,
@@ -351,7 +363,7 @@ export class ObjectiveOperatingService {
     // governs which one opens first (R2.E) — strategy is ordering
     // authority here, not a new model call.
     if (launchable.length > 0) {
-      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      if (budgetBlocked) return result(budgetBlocked);
       launchable.sort((a, b) => rankOf(a.workstream_key) - rankOf(b.workstream_key));
       return this.openDelegatedChild(
         ctx, objectiveId, launchable[0]!.delegated_child_work_item_id!,
@@ -379,7 +391,7 @@ export class ObjectiveOperatingService {
       order = (binding.workstreams as Array<Record<string, unknown>>)
         .map((w) => String(w.workstream_key));
     } else {
-      if (budgetExhausted) return result("OBJECTIVE_BUDGET_EXHAUSTED");
+      if (budgetBlocked) return result(budgetBlocked);
       this.tick(ctx);
       authorityGate?.();
       const reviewRes = await this.deps.review.runReview({ objective_id: objectiveId, actor,
@@ -552,7 +564,8 @@ export class ObjectiveOperatingService {
     objectiveId: string, childId: string, workstreamWorkItemId: string,
   ): { objective_version: number } |
      { abort: "OBJECTIVE_NOT_ACTIVE" | "TARGET_MET_CANDIDATE" |
-              "OBJECTIVE_BUDGET_EXHAUSTED" | "AWAITING_EXECUTION";
+              "OBJECTIVE_BUDGET_EXHAUSTED" | "OBJECTIVE_ZERO_BUDGET" |
+              "AWAITING_EXECUTION";
        mission_id?: string } {
     this.deps.objectives.evaluateDeadline(objectiveId);
     const objective = this.deps.objectives.get(objectiveId); // strict
@@ -567,6 +580,13 @@ export class ObjectiveOperatingService {
     }
     assertCanonicalObjectiveBudget(this.store, objective);
     const budget = objective.budget as Record<string, unknown>;
+    // P0-F3 — same three-state canonical classification as the pass
+    // gates: zero ceiling is a hard bound (ZERO_BUDGET), positive caps
+    // exhaust at consumed >= ceiling. A zero-budget objective can never
+    // be re-proven into dispatch authority.
+    if (Number(budget.ceiling_microusd) <= 0) {
+      return { abort: "OBJECTIVE_ZERO_BUDGET" };
+    }
     if (Number(budget.consumed_microusd) >= Number(budget.ceiling_microusd)) {
       return { abort: "OBJECTIVE_BUDGET_EXHAUSTED" };
     }
