@@ -226,3 +226,79 @@ describe("H3 — no-progress timed waits back off instead of spinning", () => {
     expect(Number(q.wait_streak)).toBe(0);
   });
 });
+
+describe("H4 — fresh canonical wake clears stale backoff (R1-F1)", () => {
+  it("a genuinely new observation resets next_due/wait_streak so fresh work is claimable now", () => {
+    const s = fresh("h4");
+    const bid = mkBiz(s.store);
+    const o = mkObjective(s, bid);
+    enable(s, oid(o));
+    s.scheduler.observe(oid(o));
+    // park the objective in WAITING_EVIDENCE carrying a stale streak
+    const t0 = s.now();
+    const h1 = s.scheduler.claim(oid(o), "w1", "b1", "h4-p1");
+    s.scheduler.settle(h1, "WAITING", "h4-p1");
+    s.setNow(t0 + 300_001);
+    s.scheduler.markDue(oid(o));
+    const h2 = s.scheduler.claim(oid(o), "w2", "b2", "h4-p2");
+    const t1 = s.now();
+    s.scheduler.settle(h2, "WAITING", "h4-p2");
+    let q = s.store.tryGet("objective_auto_state", oid(o)) as Record<string, unknown>;
+    expect(Number(q.wait_streak)).toBe(2);
+    expect(Number(q.next_due)).toBe(t1 + 600_000);
+    // a no-op observation must NOT touch the parked wait state
+    s.scheduler.observe(oid(o));
+    q = s.store.tryGet("objective_auto_state", oid(o)) as Record<string, unknown>;
+    expect(Number(q.wait_streak)).toBe(2);
+    expect(Number(q.next_due)).toBe(t1 + 600_000);
+    expect(s.scheduler.nextFairCandidate()).toBeNull(); // NOT_DUE_YET while parked
+    // owner-attached runtime evidence bumps objective_version without
+    // touching protected terms → policy stays effective, but observe()
+    // sees a genuinely new observation → new pending work must not
+    // inherit the stale deadline/streak
+    s.objectives.attachEvidence(oid(o), { business_id: bid,
+      evidence: { evidence_key: "r1f1-ev", verifier: OWNER,
+        source: "ops-note" },
+      note: "fresh evidence", actor: OWNER });
+    const pendingBefore = Number(q.pending_generation);
+    s.scheduler.observe(oid(o));
+    q = s.store.tryGet("objective_auto_state", oid(o)) as Record<string, unknown>;
+    expect(q.queue_state).toBe("WAITING_CONSUMER");
+    expect(Number(q.pending_generation)).toBe(pendingBefore + 1);
+    expect(q.next_due).toBeNull();
+    expect(Number(q.wait_streak)).toBe(0);
+    // immediately discoverable — not held back by the stale checkpoint
+    expect(s.scheduler.nextFairCandidate()).toBe(oid(o));
+  });
+});
+
+describe("H5 — full-page idle cohorts converge to silence (R1-F2)", () => {
+  for (const n of [64, 65, 128]) {
+    it(`cohort ${n}: repeated unchanged sweeps stop journaling once fully scanned`, () => {
+      const s = fresh("h5-" + n);
+      const bid = mkBiz(s.store);
+      for (let i = 0; i < n; i++) {
+        const o = mkObjective(s, bid);
+        configure(s, oid(o)); // registered, never usable
+        s.scheduler.observe(oid(o));
+      }
+      // warm-up: bound refresh + first full sweep may commit at most once
+      s.scheduler.nextFairCandidate();
+      s.scheduler.nextFairCandidate();
+      const base = commitCount(s.store);
+      for (let i = 0; i < 4; i++) {
+        expect(s.scheduler.nextFairCandidate()).toBeNull();
+      }
+      expect(commitCount(s.store) - base).toBe(0);
+      // newly usable work must still be discovered (bound refresh, then hit)
+      const o = mkObjective(s, bid);
+      enable(s, oid(o));
+      s.scheduler.observe(oid(o));
+      let found: string | null = null;
+      for (let i = 0; i < 3 && !found; i++) {
+        found = s.scheduler.nextFairCandidate();
+      }
+      expect(found).toBe(oid(o));
+    });
+  }
+});

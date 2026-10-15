@@ -26,6 +26,13 @@ export const FAIRNESS_STATE = "objective_auto_fairness";
 const GLOBAL = "LOCAL_PAIR_DB";
 const MAX_ACTIVE = 4;
 const PAGE = 64;
+/** R1-F2 — in-call cohort scan bound: up to SCAN_PAGES×PAGE rows per
+ *  nextFairCandidate call, sized so the per-candidate queue() reads stay
+ *  inside the proof read budget (entities 1024 / events 512). Cohorts of
+ *  ≤191 rows are fully scanned in one call and converge to silence; a
+ *  larger unchanged cohort still emits at most one progress commit per
+ *  call (cursor keeps moving — deterministic, never duplicated). */
+const SCAN_PAGES = 3;
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -550,6 +557,9 @@ export class ObjectiveAutoScheduler {
         source_refs: [...current.source_refs, receiptId].slice(-256),
         coalesced_count: Number(current.coalesced_count ?? 0) + (current.source_refs.length >= 256 ? 1 : 0),
         last_source_seq: Math.max(current.last_source_seq, Number(ev.seq)),
+        // R1-F1: a genuinely new verified wake creates new pending work —
+        // it must not inherit a stale no-progress checkpoint or streak
+        next_due: null, wait_streak: 0,
         queue_state: a.status.effective ? "WAITING_CONSUMER" : "BLOCKED_AUTHORITY",
         blocked_reason: a.status.effective ? null : a.status.reasons.join(",").slice(0, 512),
       }, "WAKE", key);
@@ -671,6 +681,9 @@ export class ObjectiveAutoScheduler {
         last_observation_digest: observation,
         source_refs: [...current.source_refs, `observation:${objectiveId}:${observation}`].slice(-256),
         reasons: [...new Set([...current.reasons, reason])].slice(0, 32),
+        // R1-F1: same reset as accountWake — a new observation digest means
+        // new pending work; the stale wait checkpoint must not suppress it
+        next_due: null, wait_streak: 0,
         queue_state: a.status.effective ? "WAITING_CONSUMER" : "BLOCKED_AUTHORITY",
         blocked_reason: a.status.effective ? null : a.status.reasons.join(",").slice(0, 512),
       }, "OBSERVE", key);
@@ -890,8 +903,11 @@ export class ObjectiveAutoScheduler {
       writeSchedulerRow(this.store, WAKE_STATE, handle.objective_id, {
         ...fields(q), settled_generation: Math.max(q.settled_generation, lease.claimed_generation),
         queue_state: leavesPending ? "WAITING_CONSUMER" : continuation.state,
-        wait_kind: continuation.wait_kind, next_due: continuation.next_due === null
-          ? null : this.instant() + continuation.next_due * backoff,
+        wait_kind: continuation.wait_kind,
+        // R1-F1: pending work left behind is already actionable — a stale
+        // wait deadline must not hold it back
+        next_due: leavesPending ? null : (continuation.next_due === null
+          ? null : this.instant() + continuation.next_due * backoff),
         wait_streak: timedWait && !leavesPending ? streak + 1 : 0,
         blocked_reason: continuation.blocked_reason,
       }, "SETTLED_GENERATION", operationId);
@@ -934,22 +950,32 @@ export class ObjectiveAutoScheduler {
       if (!f) return null;
       const last = Number(f.last_visited_rank);
       const upper = Number(f.cohort_high_rank);
-      const candidates = this.store.db.prepare(`SELECT entity_id FROM entities
-        WHERE entity_type=? AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)>?
-        AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)<=?
-        ORDER BY CAST(json_extract(payload,'$.registration_rank') AS INTEGER), entity_id LIMIT ?`)
-        .all(WAKE_STATE, last, upper, PAGE) as Array<{ entity_id: string }>;
+      // R1-F2: page through the remaining cohort inside this call (bounded)
+      // instead of one page per call — a fully scanned, unchanged cohort
+      // then converges to silence instead of alternating
+      // FAIR_VISIT/FAIR_ROUND commits on every pass. Cohorts larger than
+      // the scan bound still persist progress once per call.
       let furthest = last;
-      for (const item of candidates) {
-        const q = this.queue(item.entity_id);
-        if (!q) invalid("candidate disappeared");
-        const lease = this.lease(item.entity_id);
-        const activeLease = lease?.state === "ACTIVE" && Number(lease.expires_at) > this.instant();
-        const usable = q.queue_state === "WAITING_CONSUMER" && !activeLease &&
-          (q.pending_generation > q.claimed_generation || q.claimed_generation > q.settled_generation) &&
-          (q.next_due === null || q.next_due <= this.instant());
-        furthest = q.registration_rank;
-        if (usable) {
+      let exhausted = false;
+      for (let pages = 0; pages < SCAN_PAGES && !exhausted; pages++) {
+        const candidates = this.store.db.prepare(`SELECT entity_id FROM entities
+          WHERE entity_type=? AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)>?
+          AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)<=?
+          ORDER BY CAST(json_extract(payload,'$.registration_rank') AS INTEGER), entity_id LIMIT ?`)
+          .all(WAKE_STATE, furthest, upper, PAGE) as Array<{ entity_id: string }>;
+        if (!candidates.length) { exhausted = true; break; }
+        for (const item of candidates) {
+          const q = this.queue(item.entity_id);
+          if (!q) invalid("candidate disappeared");
+          furthest = q.registration_rank;
+          const actionable = q.queue_state === "WAITING_CONSUMER" &&
+            (q.pending_generation > q.claimed_generation ||
+             q.claimed_generation > q.settled_generation) &&
+            (q.next_due === null || q.next_due <= this.instant());
+          if (!actionable) continue;
+          const lease = this.lease(item.entity_id);
+          const activeLease = lease?.state === "ACTIVE" && Number(lease.expires_at) > this.instant();
+          if (activeLease) continue;
           // the claim decision is the visit that must be journaled — it
           // records where the deterministic rotation stopped
           writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
@@ -957,13 +983,16 @@ export class ObjectiveAutoScheduler {
           }, "FAIR_VISIT", item.entity_id);
           return item.entity_id;
         }
+        exhausted = candidates.length < PAGE;
       }
-      if (candidates.length === PAGE) {
-        // page-bound progress: one durable cursor move per call so the
-        // next call continues instead of rescanning — not one per row
-        writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-          ...fields(f), last_visited_rank: furthest,
-        }, "FAIR_VISIT", String(furthest));
+      if (!exhausted) {
+        // scan bound reached mid-cohort: one durable cursor move per call
+        // so the next call continues instead of rescanning
+        if (furthest > last) {
+          writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+            ...fields(f), last_visited_rank: furthest,
+          }, "FAIR_VISIT", String(furthest));
+        }
         return null;
       }
       const counter = Number(f.registration_counter);
