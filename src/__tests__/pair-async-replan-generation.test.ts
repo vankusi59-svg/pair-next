@@ -1908,4 +1908,100 @@ describe("async replan J — audit R2-F2: canonical objective budget at replan a
       expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET" }) as never,
     );
   });
+
+  /* AUDIT R3 — outstanding planner reservations encumber the canonical
+   * ceiling: consumed alone is NOT the used budget. Two 80µ admissions
+   * under ceiling=100 must not both pass (160 combined). */
+  it("J8. R3 — canonical ceiling=100, no auto-policy cap: A reserves 80, B's 80 rejected before any model invocation", () => {
+    const { ctx, wi } = lineageWithObjective("j8", { ceiling_microusd: 100 });
+    const a = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j8a", work_item_id: wi,
+      est_microusd: 80, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(a.reservation_id).toBe("CRSV_PLN_PRN_j8a");
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j8b", work_item_id: wi,
+        est_microusd: 80, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED" }) as never,
+    );
+    // B never reserved — rejection happened at admission, before any
+    // model invocation could run.
+    expect(ctx.store.list("cost_reservation")).toHaveLength(1);
+  });
+
+  it("J9. R3 — settled spend already inside canonical consumed is not double-counted; RELEASED frees its encumbrance", () => {
+    const { ctx, wi, oid } = lineageWithObjective("j9", { ceiling_microusd: 100 });
+    const a = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j9a", work_item_id: wi,
+      est_microusd: 80, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    ctx.service.cost.settlePlannerInvocation(String(a.reservation_id), "CALLS_MADE", 80);
+    // The settled 80 becomes canonical consumed spend (event + ledger
+    // digest + row) — the only spend authority.
+    const obj = ctx.store.get("objective", oid);
+    ctx.store.put("objective", oid, {
+      ...obj,
+      budget: { ceiling_microusd: 100, consumed_microusd: 80 },
+      applied_spend_keys: [
+        { key: "sk_j9", digest: spendSemantics(oid, { spend_key: "sk_j9", amount_microusd: 80 }) },
+      ],
+    }, Number(obj.version));
+    ctx.store.event({
+      entity_type: "objective", entity_id: oid,
+      event_type: "OBJECTIVE_BUDGET_ACCOUNTED", actor: "TEST",
+      metadata: { spend_key: "sk_j9", amount_microusd: 80, consumed_microusd: 80 },
+    });
+    // Only 20µ remains. The settled reservation must NOT be counted a
+    // second time — 80+80+20 would wrongly exceed the ceiling.
+    const b = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j9b", work_item_id: wi,
+      est_microusd: 20, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(b.reservation_id).toBe("CRSV_PLN_PRN_j9b");
+    // A RELEASED reservation frees its encumbrance — C fits the last 20.
+    ctx.service.cost.settlePlannerInvocation("CRSV_PLN_PRN_j9b", "NO_CALLS");
+    const c = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j9c", work_item_id: wi,
+      est_microusd: 20, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(c.reservation_id).toBe("CRSV_PLN_PRN_j9c");
+    // But a fourth 1µ pushes consumed+outstanding over the ceiling.
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j9d", work_item_id: wi,
+        est_microusd: 1, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED" }) as never,
+    );
+  });
+
+  it("J10. R3 — a COMMITTED (usage unknown) reservation still encumbers at its reserved bound", () => {
+    const { ctx, wi } = lineageWithObjective("j10", { ceiling_microusd: 100 });
+    const a = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j10a", work_item_id: wi,
+      est_microusd: 80, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    // CALLS_MADE without proven actuals → COMMITTED at reserved bound.
+    ctx.service.cost.settlePlannerInvocation(String(a.reservation_id), "CALLS_MADE");
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j10b", work_item_id: wi,
+        est_microusd: 30, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED" }) as never,
+    );
+  });
 });

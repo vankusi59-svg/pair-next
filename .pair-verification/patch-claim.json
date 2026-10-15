@@ -1,6 +1,6 @@
 {
-  "claim_id": "GOVERNED_ASYNC_REPLAN_PROVIDER_R2",
-  "title": "Audit R2 corrections to the governed async replan provider — shared bounded in-flight capacity across overlapping sweeps, canonical Objective budget authority at replan admission (flag unchanged, default OFF)",
+  "claim_id": "GOVERNED_ASYNC_REPLAN_PROVIDER_R3",
+  "title": "Audit R3 correction to the governed async replan provider — canonical Objective budget admission now reconciles outstanding planner reservations (flag unchanged, default OFF)",
   "affected_surfaces": [
     "PLANNER",
     "RECOVERY_REPLAY",
@@ -26,6 +26,6 @@
     "INV_REPLAY_001",
     "INV_MISSION_001"
   ],
-  "description": "Audit R2 on PR #118. F1: max_claims_per_sweep bounded rows claimed per sweep, not total in-flight — overlapping 1s sweeps could launch unbounded generation calls. makeReplanGenerationDriver now carries a shared in-flight capacity (max_in_flight, defaults to the claim bound) in the driver closure: a claimed-but-unsettled generation occupies a slot across every overlapping sweep invocation, a saturated sweep claims zero, and settlement releases the slot in a finally so a freed capacity admits the next pending mission. CAS lease+epoch remains per-row single-flight; oldest-first claim order unchanged; no busy-flag serialization reintroduced. F2: replan cost admission consulted only objective_auto_policy.limits.budget_microusd_cap, missing PR #117's canonical OBJECTIVE_ZERO_BUDGET hard-block. admitPlannerInvocation now re-proves the canonical objective.budget{ceiling,consumed} inside the reservation transaction — a fresh read at reserve time so a budget amended mid-generation applies to the next admission: ceiling<=0 blocks every spend-bearing envelope (est>0 or unbounded) FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET; provable $0 continues (explicitly-authorized continuation, 0µUSD reservation); positive ceiling enforces consumed+est<=ceiling (BUDGET_EXCEEDED) and rejects unbounded envelopes (UNVERIFIED); malformed budget authority fails closed UNVERIFIED. Absent objective row leaves the auto-policy authority untouched (existing fixtures unchanged). assertCanonicalObjectiveBudget moved from objective-adaptive-review.ts to leaf objective-authority.ts (re-exported) so cost.ts consults it without the ceo-runtime import cycle.",
+  "description": "Audit R3 on PR #118: the R2 canonical budget check used consumed+est<=ceiling but ignored outstanding reservations — two 80µ planner admissions under ceiling=100 both passed (160 combined). admitPlannerInvocation now sums HELD/COMMITTED reservations traceable to the objective (same lineage walk as the auto-policy seam, filtered to encumbering statuses) inside the same atomic reservation transaction: consumed+outstanding+est must fit ceiling, else FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED with an event pinning consumed/outstanding/requested. SETTLED rows are excluded because their spend is already the canonical consumed_microusd authority — counting them again would double-count settled costs; RELEASED rows carry no encumbrance. Zero-budget, unbounded-cost, absent-row/legacy-lineage and idempotent-replay semantics unchanged: the idempotent existing-row replay still returns first, ceiling=0 still hard-blocks spend-bearing envelopes, malformed canonical authority still fails closed UNVERIFIED.",
   "risk_override": "HIGH"
 }

@@ -1184,7 +1184,9 @@ export class CostService {
        *     policy-cap seam.
        *   - ceiling > 0 → EXHAUSTED/headroom: unbounded envelopes
        *     cannot be proven within the remaining budget; a bounded
-       *     envelope must fit consumed+est ≤ ceiling.
+       *     envelope must fit consumed+outstanding+est ≤ ceiling
+       *     (R3 — HELD/COMMITTED reservations encumber the remaining
+       *     ceiling inside this same txn).
        * An absent objective row leaves the lineage exactly as before
        * — the auto-policy cap remains the resolved authority
        * (existing seam semantics are unchanged there). */
@@ -1230,7 +1232,24 @@ export class CostService {
               `planner pricing unbounded under objective ${scope.objective_id} canonical budget ceiling`,
             );
           }
-          if (consumed + est > ceiling) {
+          /* AUDIT R3 — consumed alone is NOT the used budget:
+           * outstanding HELD/COMMITTED reservations already encumber
+           * the remaining ceiling, and this check must reconcile them
+           * inside the same atomic admission txn or two 80µ planners
+           * both pass under ceiling=100. SETTLED rows are excluded —
+           * their spend is already the canonical consumed_microusd
+           * authority (counting them again would double-count), and
+           * RELEASED rows carry no encumbrance. */
+          const outstanding = this.objectiveAttributedMicrousd(
+            scope.objective_id,
+            (this.store.list("cost_reservation") as Array<Record<string, unknown>>)
+              .filter((r) => {
+                const st = String(r.status);
+                return st === "HELD" || st === "COMMITTED";
+              }),
+          );
+          const used = consumed + outstanding;
+          if (used + est > ceiling) {
             this.store.event({
               entity_type: "objective",
               entity_id: scope.objective_id,
@@ -1239,7 +1258,9 @@ export class CostService {
               metadata: {
                 scope_type: "objective",
                 scope_id: scope.objective_id,
-                used_microusd: consumed,
+                consumed_microusd: consumed,
+                outstanding_reserved_microusd: outstanding,
+                used_microusd: used,
                 requested_microusd: est,
                 max_microusd: ceiling,
                 planner_run_id: String(input.planner_run_id),
@@ -1247,7 +1268,7 @@ export class CostService {
             });
             throw new PolicyError(
               "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED",
-              `objective:${scope.objective_id} canonical ${consumed}+${est}>${ceiling}`,
+              `objective:${scope.objective_id} canonical ${consumed}+${outstanding}outstanding+${est}>${ceiling}`,
             );
           }
         }
