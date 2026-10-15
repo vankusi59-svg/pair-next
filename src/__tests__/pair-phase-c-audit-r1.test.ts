@@ -494,6 +494,17 @@ describe("F5 — the driver pins delegated planning to its lease lifetime", () =
     s.policy.control({ objective_id: oid, actor: OWNER, action: "enable",
       policy_version: 1, idempotency_key: `en-${counter}` });
     s.wakeup.tick();
+    // AUDIT R1 F2/F4 — admission re-proves the subscription-only lane:
+    // canonical CODEX executor row, AUTH_OK codex-cli provider session,
+    // and SUBSCRIPTION billing identity.
+    if (!s.store.tryGet("executor", "CODEX")) {
+      s.store.put("executor", "CODEX", {
+        executor_id: "CODEX", executor_type: "EXTERNAL", status: "ENABLED",
+        health_state: "READY", capabilities: [],
+        metadata: { qualification_state: "QUALIFIED" },
+      }, 0);
+    }
+    qualifyCodexProvider(s.store);
     let seen: number | undefined;
     const driver = new ObjectiveAutoDriverService({
       store: s.store, objectives: s.objectives, policy: s.policy,
@@ -503,7 +514,10 @@ describe("F5 — the driver pins delegated planning to its lease lifetime", () =
         return { outcome: "WAITING", objective_id: oid };
       },
       executors: ["CODEX"],
-      billingFor: () => ({ mode: "UNMETERED", profile: null, unbounded: false }),
+      billingFor: (e: string) =>
+        e === "CODEX"
+          ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+          : { mode: "UNMETERED", profile: null, unbounded: false },
       costHaltActive: () => false,
       workerId: "w1", bootId: "b1",
       now: s.now,

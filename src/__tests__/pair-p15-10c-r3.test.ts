@@ -41,6 +41,8 @@ import {
   WorkforceService,
   CEO_DECISION_ENTITY,
   LEASE_STATE,
+  providerEntryId,
+  CODEX_CLI_PROVIDER_ID,
   readSchedulerRow,
 } from "../pair/index.js";
 
@@ -75,6 +77,15 @@ function fresh(name: string, initial = 1_000_000) {
   store.put("business", bid, {
     business_id: bid, name: "b", status: "ACTIVE",
     project_id: "PRJ_TEST", created_at: "x", version: 0,
+  }, 0);
+  // AUDIT R1 F4 — the CEO subscription lane is proven independently of
+  // executor supply: the canonical codex-cli provider session (AUTH_OK)
+  // is environmental state every stack in this file shares.
+  const pid = providerEntryId(CODEX_CLI_PROVIDER_ID);
+  store.put("provider", pid, {
+    provider_id: CODEX_CLI_PROVIDER_ID, entry_id: pid,
+    auth_state: "AUTH_OK", lifecycle_state: "QUALIFIED",
+    health_state: "READY", probe_state: "PROBED", conditions: [],
   }, 0);
   return { dir, dbPath, store, biz, wf, objectives, workstreams, alloc,
     policy, scheduler, wakeup, cost, bid,
@@ -111,8 +122,13 @@ const mkAgent = (s: S) => s.biz.createOrgAgent({
 });
 
 /** Real governed lineage: decompose + allocate → canonical allocation
- *  row → synthetic-but-canonical bound open / mission rows. */
-function missionOnObjective(s: S, oid: string, tag: string) {
+ *  row → synthetic-but-canonical bound open / mission rows.
+ *  `manual: true` writes owner provenance instead of the driver actor —
+ *  the F2 reservation-arithmetic tests exercise the objective-cap path,
+ *  which binds ANY lineage; driver-attributed METERED reservations are
+ *  categorically denied by the AUDIT R1 F2/F3 autonomous gate. */
+function missionOnObjective(s: S, oid: string, tag: string,
+  opts: { manual?: boolean } = {}) {
   const o = s.objectives.get(oid);
   if (!(s.store.list("workstream_binding") as Array<Record<string, unknown>>)
       .some((b) => String(b.objective_id) === oid)) {
@@ -135,7 +151,7 @@ function missionOnObjective(s: S, oid: string, tag: string) {
   const mid = `MIS_${tag}_${counter}`;
   s.store.put("work_open_binding", openId, {
     open_id: openId, work_item_id: workItemId, mission_id: mid,
-    created_by: DRIVER_ACTOR,
+    created_by: opts.manual ? OWNER : DRIVER_ACTOR,
   }, 0);
   s.store.put("mission", mid, {
     mission_id: mid, bound_open_id: openId, metadata: {},
@@ -200,7 +216,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     enable(s, oid, { budget_microusd_cap: 300_000 });
     profile(s, "executor", "CODEX", { reserve_microusd: 100_000 });
     profile(s, "route", "RTE_EXP", { reserve_microusd: 500_000 });
-    const m = missionOnObjective(s, oid, "a");
+    const m = missionOnObjective(s, oid, "a", { manual: true });
     // The executor's own profile (100k) is under cap — but the SELECTED
     // route reserves 500k > 300k cap → deny.
     expect(() => reserve(s, m, "T1", "RTE_EXP")).toThrow(PolicyError);
@@ -212,7 +228,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 600_000 });
     profile(s, "route", "RTE_MID", { reserve_microusd: 400_000 });
-    const m = missionOnObjective(s, oid, "b");
+    const m = missionOnObjective(s, oid, "b", { manual: true });
     reserve(s, m, "T1", "RTE_MID"); // 400k HELD — fits
     expect(() => reserve(s, m, "T2", "RTE_MID")).toThrow(PolicyError); // 400+400>600
     expect(reservations(s).filter((r) => r.status === "HELD")).toHaveLength(1);
@@ -223,7 +239,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 500_000 });
     profile(s, "route", "RTE_R", { reserve_microusd: 400_000 });
-    const m = missionOnObjective(s, oid, "c");
+    const m = missionOnObjective(s, oid, "c", { manual: true });
     const store2 = new PairEvidenceStore(s.dbPath);
     const cost2 = new CostService({ store: store2 } as never);
     const m2 = store2.get("mission", m.missionId) as Record<string, unknown>;
@@ -248,7 +264,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 500_000 });
     // No profile at all → UNKNOWN — must never count as zero-cost.
-    const m = missionOnObjective(s, oid, "d");
+    const m = missionOnObjective(s, oid, "d", { manual: true });
     expect(() => reserve(s, m, "T1", "RTE_NONE")).toThrow(PolicyError);
     expect(reservations(s)).toHaveLength(0);
   });
@@ -258,7 +274,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 500_000 });
     profile(s, "route", "RTE_E", { reserve_microusd: 300_000 });
-    const m = missionOnObjective(s, oid, "e");
+    const m = missionOnObjective(s, oid, "e", { manual: true });
     const r1 = reserve(s, m, "T1", "RTE_E");
     expect(reservations(s)).toHaveLength(1);
     // A HELD retry is ambiguous by P13 contract — a leftover HELD is
@@ -284,8 +300,8 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     enable(s, oidA, { budget_microusd_cap: 400_000 });
     enable(s, oidB, { budget_microusd_cap: 400_000 });
     profile(s, "route", "RTE_F", { reserve_microusd: 300_000 });
-    const mA = missionOnObjective(s, oidA, "fa");
-    const mB = missionOnObjective(s, oidB, "fb");
+    const mA = missionOnObjective(s, oidA, "fa", { manual: true });
+    const mB = missionOnObjective(s, oidB, "fb", { manual: true });
     reserve(s, mA, "TA1", "RTE_F"); // 300k on A
     // B has its own cap — A's reservation must not deny B.
     const rB = reserve(s, mB, "TB1", "RTE_F");
@@ -374,7 +390,12 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const s = fresh("f3e");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 500_000 });
-    profile(s, "executor", "CODEX", { reserve_microusd: 100_000 });
+    // AUDIT R1 F2/F4 — under subscription-only authority the provable
+    // binding is an ACTIVE SUBSCRIPTION executor profile plus the
+    // AUTH_OK provider session seeded in fresh(); a metered binding can
+    // never be runnable for autonomous work.
+    s.cost.upsertCostProfile({ ref_type: "executor", ref_id: "CODEX",
+      billing_mode: "SUBSCRIPTION" }, "t");
     const driver = mkDriver(s);
     const st = s.scheduler.status(oid, OWNER, driver.readiness(oid, OWNER));
     expect(st.driver_ready).toBe(true);
@@ -422,6 +443,11 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     enable(s, oid);
     const ceo = (await import("./pair-p15-10c-r2.test.js")).default;
     void ceo;
+    // AUDIT R1 F4 — admission re-proves the CEO subscription lane:
+    // ACTIVE SUBSCRIPTION executor profile + the AUTH_OK session seeded
+    // in fresh().
+    s.cost.upsertCostProfile({ ref_type: "executor", ref_id: "CODEX",
+      billing_mode: "SUBSCRIPTION" }, "t");
     // Legit drift path: ENABLED → disable → configure → enable — real
     // policy_version/terms re-bind; old worker's pins go stale.
     const driver = mkDriver(s, {

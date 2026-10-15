@@ -284,7 +284,11 @@ if (process.env.PAIR_DSH_HOME) {
   });
   governed.set(DSH_EXECUTOR_ID, dshAdapter);
 }
-if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
+// AUDIT R1 F1 — the canonical store seam lets the governed Codex adapter
+// resolve driver-attributed provenance (mission → bound_open →
+// work_open_binding.created_by): autonomous dispatches run
+// subscription-only, with metered API keys stripped from the child env.
+if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot, store }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
 // Cost guard — caps remote Devin dispatches per UTC day (ACU spend) and the

@@ -1,6 +1,6 @@
 {
   "claim_id": "SUBSCRIPTION_AUTO_RUN_CEO",
-  "title": "Subscription-Only Auto Run CEO — zero-API-budget auto-policy, canonical autonomous Executor/Route supply, provable SUBSCRIPTION/UNMETERED cost binding, in-transaction autonomous dispatch gate, truthful readiness, production opt-in wiring",
+  "title": "Subscription-Only Auto Run CEO — AUDIT_R1 corrections F1-F4: canonical autonomous provenance w/ credential-scrubbed CODEX child env, cap-agnostic metered denial, atomic CODEX SUBSCRIPTION+AUTH_OK re-proof, CEO auth independent of executor supply",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
@@ -9,8 +9,11 @@
   "required_tests": [
     "src/__tests__/pair-subscription-auto-run-ceo.test.ts",
     "src/__tests__/pair-p15-10c.test.ts",
+    "src/__tests__/pair-p15-10c-r1.test.ts",
+    "src/__tests__/pair-p15-10c-r2.test.ts",
     "src/__tests__/pair-p15-10c-r3.test.ts",
     "src/__tests__/pair-p15-10c-r4.test.ts",
+    "src/__tests__/pair-phase-c-audit-r1.test.ts",
     "src/__tests__/pair-p13.test.ts",
     "src/__tests__/pair-executor-toggle.test.ts",
     "src/__tests__/pair-subscription-llm.test.ts",
@@ -22,6 +25,6 @@
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "Subscription-only P15.10 autonomous Objective pipeline (opt-in PAIR_OBJECTIVE_AUTO_DRIVER=1, default OFF). A) auto-policy accepts budget_microusd_cap=0 as explicit hard zero-spend; invalid values still FAIL_CLOSED_POLICY_LIMITS; Objective ceiling=0 stays a hard OBJECTIVE_ZERO_BUDGET block in readiness. B) AUTONOMOUS_EXECUTOR_IDS=[CODEX,PAIR_NATIVE] is the only autonomous set; driver dispatchSupply derives pairings from LIVE executor rows (ENABLED/READY/QUALIFIED/auth/quota/rate) + QUALIFIED supply bindings + enabled never-rejected routes; serve-mission-control.mjs wires executors=AUTONOMOUS_EXECUTOR_IDS (was [...governed.keys()] — admitted disabled DEVIN, omitted PAIR_NATIVE) and seeds a SUBSCRIPTION codex profile only when undeclared. C) dispatchCostEnvelope: codex pairings prove $0 only via ACTIVE SUBSCRIPTION profile + provider AUTH_OK; UNMETERED/FREE on codex is contradictory → COST_BINDING_UNVERIFIED; SUBSCRIPTION without session → SUBSCRIPTION_AUTH_UNVERIFIED; UNKNOWN/unbounded → unprovable; METERED → bound math (positive caps) / METERED_ROUTE_FORBIDDEN under cap 0. D) assertAndReserve gates driver-attributed work (wob.created_by=DRIVER_ACTOR, moved to leaf work-open-binding.ts, breaking a cost→driver init cycle) in the same atomic txn: non-autonomous executor → FAIL_CLOSED_COST_AUTONOMOUS_EXECUTOR; cap=0+metered/unknown → FAIL_CLOSED_COST_AUTONOMOUS_METERED; manual missions and proven reservations never re-gated. F) readiness adds DRIVER_DISABLED, EXECUTOR_UNAVAILABLE, OBJECTIVE_ZERO_BUDGET, SUBSCRIPTION_AUTH_UNVERIFIED, METERED_ROUTE_FORBIDDEN. G) 30 focused regressions incl. production-composition E2E (fake codex CLI + recording adapters + real MissionControl): objective → wake → claim → admission → CEO → planner → governed dispatch → settled, zero metered API calls. Harness: r3/r4/p15-10c seed executor rows + reserve via autonomous ids; p15-10d/r1/met-branch-fold/p15-3/cpl1/p5 stay at exact win32 baselines.",
+  "description": "AUDIT_R1 corrections F1-F4 on the opt-in subscription-only autonomous lane (PAIR_OBJECTIVE_AUTO_DRIVER=1, still default OFF). F1: codex-adapter derives autonomous provenance canonically — dispatch resolves task→mission→work_open_binding.created_by=DRIVER_ACTOR via the evidence store (caller metadata not trusted); OPENAI_API_KEY/CODEX_API_KEY reach the CLI child only for manual lineage, autonomous children get a whitelisted env (PATH/HOME/CODEX_HOME/Windows essentials); store dep wired in serve-mission-control.mjs. F2: metered autonomy is unconditional — dispatchCostEnvelope + the assertAndReserve autonomous gate deny driver-attributed METERED_API/UNKNOWN/unbounded/unprovable pairings under ANY cap (absent/zero/positive) → DRIVER_METERED_FORBIDDEN / FAIL_CLOSED_COST_AUTONOMOUS_METERED; manual lineage and positive-cap metered semantics unchanged. F3: driver-attributed CODEX dispatch re-proves ACTIVE SUBSCRIPTION profile + codex-cli AUTH_OK provider session inside the same atomic txn → FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION; FREE/UNMETERED/missing profile never substitute; COMMITTED/SETTLED adoption preserved. F4: readiness/admission re-proves CEO codex-cli AUTH_OK independently of executor supply — PAIR_NATIVE-only supply no longer implies CEO can run → DRIVER_SUBSCRIPTION_UNVERIFIED; scheduler FAULT_LABELS extended for the new denials. Evidence: 42 focused regressions (Z8.1-12 env-strip/cap-agnostic deny/sub+auth re-proof/CEO-independence/adopt-after-drift; strengthened Z7 drives the real CodexCliExecutorAdapter through MissionRuntime ticks → observe→collect→settle terminal, $0 COMMITTED reservation, child env asserted). Harnesses: p15-10c family + phase-c-r1 seed canonical executor/provider/SUBSCRIPTION rows, cap-arithmetic tests moved to manual lineage; win32 baselines unchanged (10d=15, met-fold=7, p15-3=9, cpl1=22, p5=3).",
   "risk_override": "HIGH"
 }

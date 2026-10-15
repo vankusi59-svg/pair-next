@@ -31,6 +31,7 @@ import {
   ModelEvidenceCatalog,
   ProviderCatalog,
   providerEntryId,
+  CODEX_CLI_PROVIDER_ID,
   qualifyModel,
   IntegrityError,
   CeoPlanningCycleService,
@@ -133,6 +134,25 @@ function mkDriver(s: Stack, opts: {
   reconcileStaleAttempts?: (objectiveId: string) => void;
 } = {}) {
   const calls: PassCall[] = [];
+  // PR #121 — the configured autonomous id must exist as a canonical
+  // ENABLED+QUALIFIED executor row to enter the supply envelope.
+  if (!s.store.tryGet("executor", "CODEX")) {
+    s.store.put("executor", "CODEX", {
+      executor_id: "CODEX", executor_type: "EXTERNAL", status: "ENABLED",
+      health_state: "READY", capabilities: [],
+      metadata: { qualification_state: "QUALIFIED" },
+    }, 0);
+  }
+  // AUDIT R1 F4 — the CEO subscription lane is proven independently of
+  // executor supply: seed the canonical codex-cli provider session
+  // (AUTH_OK) and resolve CODEX to SUBSCRIPTION in the billing stub.
+  const pid = providerEntryId(CODEX_CLI_PROVIDER_ID);
+  if (!s.store.tryGet("provider", pid)) {
+    s.store.put("provider", pid, {
+      provider_id: CODEX_CLI_PROVIDER_ID, auth_state: "AUTH_OK",
+      lifecycle_state: "QUALIFIED", health_state: "READY", version: 0,
+    }, 0);
+  }
   const driver = new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
@@ -144,7 +164,10 @@ function mkDriver(s: Stack, opts: {
       return { outcome: opts.outcome ?? "WAITING", objective_id: input.objective_id };
     },
     executors: ["CODEX"],
-    billingFor: () => ({ mode: "UNMETERED", profile: null, unbounded: false }),
+    billingFor: (e: string) =>
+      e === "CODEX"
+        ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+        : { mode: "UNMETERED", profile: null, unbounded: false },
     costHaltActive: opts.halt ?? (() => false),
     workerId: opts.workerId ?? "r1-driver",
     bootId: opts.bootId ?? "r1-boot",

@@ -35,6 +35,8 @@ import {
   WorkforceAllocationService,
   WorkforceService,
   WAKE_STATE,
+  providerEntryId,
+  CODEX_CLI_PROVIDER_ID,
   writeSchedulerRow,
 } from "../pair/index.js";
 
@@ -71,6 +73,15 @@ function fresh(name: string, initial = 1_000_000) {
     business_id: bid, name: "b", status: "ACTIVE",
     project_id: "PRJ_TEST", created_at: "x", version: 0,
   }, 0);
+  // AUDIT R1 F4 — the CEO subscription lane is proven independently of
+  // executor supply: the canonical codex-cli provider session (AUTH_OK)
+  // is environmental state every stack in this file shares.
+  const pid = providerEntryId(CODEX_CLI_PROVIDER_ID);
+  store.put("provider", pid, {
+    provider_id: CODEX_CLI_PROVIDER_ID, entry_id: pid,
+    auth_state: "AUTH_OK", lifecycle_state: "QUALIFIED",
+    health_state: "READY", probe_state: "PROBED", conditions: [],
+  }, 0);
   return { dir, dbPath, store, biz, wf, objectives, workstreams, alloc,
     policy, scheduler, wakeup, cost, bid,
     now: () => t, setNow: (v: number) => { t = v; } };
@@ -104,7 +115,8 @@ const mkAgent = (s: S) => s.biz.createOrgAgent({
   department: "ops", operator_id: OP,
 });
 
-function missionOnObjective(s: S, oid: string, tag: string) {
+function missionOnObjective(s: S, oid: string, tag: string,
+  opts: { manual?: boolean } = {}) {
   const o = s.objectives.get(oid);
   if (!(s.store.list("workstream_binding") as Array<Record<string, unknown>>)
       .some((b) => String(b.objective_id) === oid)) {
@@ -127,7 +139,12 @@ function missionOnObjective(s: S, oid: string, tag: string) {
   const mid = `MIS_${tag}_${counter}_${Math.random()}`;
   s.store.put("work_open_binding", openId, {
     open_id: openId, work_item_id: workItemId, mission_id: mid,
-    created_by: DRIVER_ACTOR, business_id: s.bid, project_id: "PRJ_TEST",
+    // AUDIT R1 F2 — `manual: true` keeps owner provenance: the
+    // pricing-pin and cap-race tests exercise objective-cap arithmetic,
+    // which binds any lineage; driver-attributed METERED reservations
+    // are categorically denied by the autonomous gate.
+    created_by: opts.manual ? OWNER : DRIVER_ACTOR,
+    business_id: s.bid, project_id: "PRJ_TEST",
     state: "BOUND",
   }, 0);
   s.store.put("mission", mid, {
@@ -283,7 +300,11 @@ describe("P15.10-C R4 — final readiness & cost proof", () => {
     const s = fresh("q9");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 5_000_000 });
-    profile(s, "executor", "CODEX", { reserve_microusd: 100_000 });
+    // AUDIT R1 F2/F4 — autonomous runnable requires the proven
+    // subscription lane: ACTIVE SUBSCRIPTION executor profile + the
+    // AUTH_OK session seeded in fresh(); metered is never runnable.
+    s.cost.upsertCostProfile({ ref_type: "executor", ref_id: "CODEX",
+      billing_mode: "SUBSCRIPTION" }, "t");
     const st = s.scheduler.status(oid, OWNER, mkDriver(s).readiness(oid, OWNER));
     expect(st.driver_integrated).toBe(true);
     expect(st.objective_runnable).toBe(true);
@@ -300,6 +321,10 @@ describe("P15.10-C R4 — final readiness & cost proof", () => {
       idempotency_key: `cfg-x-${Math.random()}` });
     s.policy.control({ objective_id: oid, actor: OWNER,
       action: "enable", policy_version: 1, idempotency_key: `en-x-${Math.random()}` });
+    // AUDIT R1 F2/F4 — the subscription lane must be proven for the
+    // in-window readiness to be runnable (SUBSCRIPTION + AUTH_OK).
+    s.cost.upsertCostProfile({ ref_type: "executor", ref_id: "CODEX",
+      billing_mode: "SUBSCRIPTION" }, "t");
     s.wakeup.tick();
     let st = s.scheduler.status(oid, OWNER, mkDriver(s).readiness(oid, OWNER));
     expect(st.objective_runnable).toBe(true); // effective while inside window
@@ -401,7 +426,7 @@ describe("P15.10-C R4 — final readiness & cost proof", () => {
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 5_000_000 });
     profile(s, "route", "RTE_P", { reserve_microusd: 100_000 });
-    const m = missionOnObjective(s, oid, "p");
+    const m = missionOnObjective(s, oid, "p", { manual: true });
     // A second connection updates the price BETWEEN the advisory
     // billingFor() and the atomic txn — injected at immediate() entry.
     const store2 = new PairEvidenceStore(s.dbPath);
@@ -425,7 +450,7 @@ describe("P15.10-C R4 — final readiness & cost proof", () => {
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 500_000 });
     profile(s, "route", "RTE_R", { reserve_microusd: 400_000 });
-    const m = missionOnObjective(s, oid, "cc");
+    const m = missionOnObjective(s, oid, "cc", { manual: true });
     const store2 = new PairEvidenceStore(s.dbPath);
     const cost2 = new CostService({ store: store2 } as never);
     // Connection 2 wins the race: it commits its reservation exactly at
@@ -455,6 +480,9 @@ describe("P15.10-C R4 — final readiness & cost proof", () => {
     const s = fresh("f2c2");
     const oid = mkObjective(s);
     enable(s, oid);
+    // AUDIT R1 F2/F4 — runnable requires the proven subscription lane.
+    s.cost.upsertCostProfile({ ref_type: "executor", ref_id: "CODEX",
+      billing_mode: "SUBSCRIPTION" }, "t");
     const leasesBefore = s.store.list("objective_auto_lease").length;
     const receiptsBefore = s.store.list("objective_auto_receipt").length;
     const r = mkDriver(s).readiness(oid, OWNER);

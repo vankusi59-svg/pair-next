@@ -14,6 +14,8 @@ import {
   ObjectiveAutoWakeupService,
   ObjectiveAuthorityService,
   PairEvidenceStore,
+  providerEntryId,
+  CODEX_CLI_PROVIDER_ID,
   readSchedulerRow,
 } from "../pair/index.js";
 import type { OperatingPassResult } from "../pair/index.js";
@@ -103,6 +105,17 @@ function mkDriver(s: Stack, opts: {
       metadata: { qualification_state: "QUALIFIED" },
     }, 0);
   }
+  // AUDIT R1 F4 — the CEO subscription lane is proven independently of
+  // executor supply: seed the canonical codex-cli provider session
+  // (AUTH_OK) and let the default billing stub resolve CODEX to
+  // SUBSCRIPTION — the state a production opt-in boot converges to.
+  const pid = providerEntryId(CODEX_CLI_PROVIDER_ID);
+  if (!s.store.tryGet("provider", pid)) {
+    s.store.put("provider", pid, {
+      provider_id: CODEX_CLI_PROVIDER_ID, auth_state: "AUTH_OK",
+      lifecycle_state: "QUALIFIED", health_state: "READY", version: 0,
+    }, 0);
+  }
   const driver = new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
@@ -114,7 +127,10 @@ function mkDriver(s: Stack, opts: {
       return { outcome: opts.outcome ?? "WAITING", objective_id: input.objective_id };
     },
     executors: ["CODEX"],
-    billingFor: opts.billing ?? (() => ({ mode: "UNMETERED", profile: null, unbounded: false })),
+    billingFor: opts.billing ?? ((e: string) =>
+      e === "CODEX"
+        ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+        : { mode: "UNMETERED", profile: null, unbounded: false }),
     costHaltActive: opts.halt ?? (() => false),
     workerId: opts.workerId ?? "test-driver-1",
     bootId: opts.bootId ?? "boot-1",
@@ -233,7 +249,10 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     });
     const out = await driver.tick();
     expect(calls).toHaveLength(0);
-    expect(out.driven[0]!.denied).toBe("DRIVER_CAP_EXHAUSTED");
+    // AUDIT R1 F2 — a reachable METERED_API pairing is categorically
+    // forbidden for autonomous work under ANY cap (subscription-only);
+    // it is denied before cap arithmetic ever runs.
+    expect(out.driven[0]!.denied).toBe("DRIVER_METERED_FORBIDDEN");
     expect(queue(s, oid(o)).queue_state).toBe("QUARANTINED");
   });
 

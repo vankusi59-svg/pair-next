@@ -26,6 +26,8 @@ import {
   windowsSpawnTarget,
 } from "./codex-cli-transport.js";
 import type { ExecutorAdapter } from "./adapter.js";
+import type { PairEvidenceStore } from "./store.js";
+import { DRIVER_ACTOR } from "./work-open-binding.js";
 import { buildGovernedPrompt, snapshotWorkspace } from "./acp-executor.js";
 
 export const CODEX_EXECUTOR_ID = "CODEX";
@@ -58,6 +60,9 @@ interface CodexExecution {
   finished_at?: string;
   error?: string | null;
   recovered?: boolean;
+  /** Resolved at dispatch from canonical lineage — when true the child
+   *  env is subscription-only (no metered API key inheritance). */
+  autonomous?: boolean;
 }
 
 export function codexRunRoot(journalRoot: string, executionId: string): string {
@@ -82,6 +87,13 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       /** Extra argv inserted before `exec` (e.g. fixture wrappers). */
       executableArgs?: string[];
       envReader?: (name: string) => string | undefined;
+      /** Canonical store seam — resolves driver-attributed provenance
+       *  (mission → bound_open_id → work_open_binding.created_by ===
+       *  DRIVER_ACTOR). Required in any composition that may run
+       *  autonomous work: proven driver lineage strips metered API
+       *  credentials from the child env (subscription-only session
+       *  auth). Absent the store the adapter keeps manual semantics. */
+      store?: PairEvidenceStore;
     },
   ) {}
 
@@ -280,6 +292,11 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     const executionId = workerExecutionId(this.executor_id, governedTaskId);
     const existing = this.executions.get(executionId);
     if (existing) return this.recordFor(existing);
+    // AUDIT R1 F1 — provenance is resolved ONCE at dispatch from
+    // canonical lineage only (never task metadata) and pinned into the
+    // journal: subscription-only autonomous dispatches must not inherit
+    // metered API credentials across respawn/rehydrate ambiguity.
+    const autonomous = this.autonomousProvenance(task);
 
     const runRoot = codexRunRoot(this.deps.journalRoot, executionId);
     const journalPath = path.join(runRoot, "execution_journal.json");
@@ -355,6 +372,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       status: "DISPATCHED",
       created_at: utcnow(),
       attempt_id: context?.attempt_id ?? null,
+      autonomous_dispatch: autonomous,
     };
     atomicWriteJson(journalPath, journal);
 
@@ -367,6 +385,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       run_root: runRoot,
       status: "RUNNING",
       started_at: utcnow(),
+      autonomous,
     };
     this.executions.set(executionId, rec);
     void this.runProcess(rec, task, exe.command, args, prompt, before).catch(() => undefined);
@@ -408,7 +427,7 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     try {
       child = spawn(target.command, target.args, {
         cwd: String(task.workspace),
-        env: this.childEnv(),
+        env: this.childEnv(rec.autonomous === true),
         stdio: ["pipe", "pipe", "pipe"],
         windowsVerbatimArguments: target.verbatim,
       });
@@ -470,7 +489,29 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     this.finish(rec, task, before, outcome.status, outcome.error);
   }
 
-  private childEnv(): Record<string, string> {
+  /** AUDIT R1 F1 — autonomous provenance is derived ONLY from trusted
+   *  canonical lineage: mission.bound_open_id → work_open_binding.
+   *  created_by === DRIVER_ACTOR. Caller-supplied task fields are never
+   *  trusted as provenance. A task without provable driver lineage keeps
+   *  manual executor semantics; a canonical lookup failure fails CLOSED
+   *  (credentials stripped) — never a silent metered-key leak. */
+  private autonomousProvenance(task: Record<string, unknown>): boolean {
+    const store = this.deps.store;
+    if (!store) return false;
+    try {
+      const missionId = task.mission_id;
+      if (missionId == null) return false;
+      const mission = store.tryGet("mission", String(missionId));
+      const openId = mission?.bound_open_id;
+      if (openId == null) return false;
+      const wob = store.tryGet("work_open_binding", String(openId));
+      return String(wob?.created_by ?? "") === DRIVER_ACTOR;
+    } catch {
+      return true;
+    }
+  }
+
+  private childEnv(autonomous: boolean): Record<string, string> {
     const env: Record<string, string> = {};
     for (const k of [
       "PATH", "HOME", "LANG", "LC_ALL", "CODEX_HOME", "NODE_PATH",
@@ -486,10 +527,15 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
       if (v) env[k] = v;
     }
     // Donor parity: resolved credentials are pinned into the child env, never
-    // recorded into evidence.
-    for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY"]) {
-      const v = this.env(k);
-      if (v) env[k] = v;
+    // recorded into evidence. AUDIT R1 F1: a driver-attributed (autonomous)
+    // dispatch is subscription-only — metered API keys must NOT cross the
+    // spawn boundary; the child authenticates through the CODEX_HOME
+    // subscription session forwarded above.
+    if (!autonomous) {
+      for (const k of ["OPENAI_API_KEY", "CODEX_API_KEY"]) {
+        const v = this.env(k);
+        if (v) env[k] = v;
+      }
     }
     return env;
   }

@@ -184,12 +184,26 @@ const settleReceipts = (s: Svc) =>
 function mkDriver(s: Svc, runPassImpl: (input: {
   objective_id: string; actor: string; authority_gate: () => void;
 }) => Promise<{ outcome: string; objective_id: string }>, heartbeatMs = 60_000) {
+  // PR #121 — the configured autonomous id must exist as a canonical
+  // ENABLED+QUALIFIED executor row to enter the supply envelope.
+  if (!s.store.tryGet("executor", "CODEX")) {
+    s.store.put("executor", "CODEX", {
+      executor_id: "CODEX", executor_type: "EXTERNAL", status: "ENABLED",
+      health_state: "READY", capabilities: [],
+      metadata: { qualification_state: "QUALIFIED" },
+    }, 0);
+  }
   return new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
     runPass: async (input) => runPassImpl(input) as never,
     executors: ["CODEX"],
-    billingFor: () => ({ mode: "UNMETERED", profile: null, unbounded: false }),
+    // AUDIT R1 F4 — CEO subscription lane: CODEX resolves SUBSCRIPTION
+    // billing (AUTH_OK provider session is seeded by seedCeoModel).
+    billingFor: (e: string) =>
+      e === "CODEX"
+        ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+        : { mode: "UNMETERED", profile: null, unbounded: false },
     costHaltActive: () => false,
     workerId: "r2-w", bootId: "r2-b",
     now: s.now, heartbeatMs,

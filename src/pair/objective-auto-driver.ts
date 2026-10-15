@@ -110,6 +110,9 @@ export const DRIVER_FAULT_LABELS = [
   "DRIVER_AUTHORITY_LOST",
   "DRIVER_PASS_FAULT",
   "DRIVER_ADMISSION_DENIED",
+  // AUDIT R1 F2/F4 — unconditional subscription-only denials.
+  "DRIVER_METERED_FORBIDDEN",
+  "DRIVER_SUBSCRIPTION_UNVERIFIED",
 ] as const;
 export type DriverFaultLabel = (typeof DRIVER_FAULT_LABELS)[number];
 
@@ -353,11 +356,25 @@ export class ObjectiveAutoDriverService {
       // CEO plans can ever be dispatched.
       const env = this.dispatchCostEnvelope();
       if (!env.executorAvailable) push("EXECUTOR_UNAVAILABLE");
+      // AUDIT R1 F4 — the CEO runs on the codex-cli subscription lane
+      // no matter WHICH executors can take tasks: its binding + live
+      // session are proven here, independently of executor supply. A
+      // PAIR_NATIVE-only fleet is never proof the CEO can run.
+      const ceoBilling = this.deps.billingFor(CODEX_EXECUTOR_ID, null);
+      if (!(ceoBilling.mode === "SUBSCRIPTION" &&
+            ceoBilling.profile != null && !ceoBilling.unbounded)) {
+        push("COST_BINDING_UNVERIFIED");
+      } else if (!this.codexSubscriptionAuthProven()) {
+        push("SUBSCRIPTION_AUTH_UNVERIFIED");
+      }
+      // AUDIT R1 F2 — subscription-only is unconditional: envelope
+      // reasons and metered-pairing presence are readiness truth under
+      // an absent, zero or positive monetary cap alike.
+      for (const r of env.reasons) push(r);
+      if (env.metered) push("METERED_ROUTE_FORBIDDEN");
       if (cap != null) {
         const usage = this.usage(objectiveId);
         if (usage.cost_unverified) push("COST_UNVERIFIED");
-        for (const r of env.reasons) push(r);
-        if (env.metered && cap === 0) push("METERED_ROUTE_FORBIDDEN");
         if (env.bound !== null &&
             usage.microusd + env.bound > cap) {
           push("BUDGET_EXHAUSTED");
@@ -637,25 +654,47 @@ export class ObjectiveAutoDriverService {
           `max_missions ${usage.missions}+1>${limits.max_missions}`, false);
       }
       let dispatchBound: number | null = null;
-      if (limits?.budget_microusd_cap != null) {
-        if (usage.cost_unverified) {
-          throw new DriverDenial("DRIVER_COST_UNVERIFIED",
-            "attributed dispatch has unbounded/unknown cost", false);
-        }
-        // PR #121 — envelope re-derived from LIVE canonical executor/
-        // route/binding state inside this same atomic admission tx: a
-        // toggle, unqualify or profile flip since the claim cannot slip
-        // through, and a metered pairing under cap 0 exhausts the
-        // policy through real arithmetic (0 < bound).
-        dispatchBound = this.dispatchCostEnvelope().bound;
-        if (dispatchBound === null) {
-          throw new DriverDenial("DRIVER_COST_UNVERIFIED",
-            "cannot bound next dispatch cost under budget cap", false);
-        }
-        if (usage.microusd + dispatchBound > limits.budget_microusd_cap) {
-          throw new DriverDenial("DRIVER_CAP_EXHAUSTED",
-            `budget ${usage.microusd}+${dispatchBound}>${limits.budget_microusd_cap}`, false);
-        }
+      // AUDIT R1 F2 — subscription-only is UNCONDITIONAL: the provable
+      // cost envelope is required under an absent, zero or positive
+      // monetary cap alike. The cap binds what is allowed; it is not
+      // itself the metered gate.
+      if (usage.cost_unverified) {
+        throw new DriverDenial("DRIVER_COST_UNVERIFIED",
+          "attributed dispatch has unbounded/unknown cost", false);
+      }
+      // Envelope re-derived from LIVE canonical executor/route/binding
+      // state inside this same atomic admission tx: a toggle, unqualify
+      // or profile flip since the claim cannot slip through.
+      const env = this.dispatchCostEnvelope();
+      if (env.metered) {
+        // Any reachable METERED_API pairing could settle positive —
+        // forbidden for autonomous work regardless of the money cap.
+        throw new DriverDenial("DRIVER_METERED_FORBIDDEN",
+          "autonomous supply includes a metered billing pairing", false);
+      }
+      if (env.bound === null) {
+        throw new DriverDenial("DRIVER_COST_UNVERIFIED",
+          "cannot prove non-metered dispatch billing", false);
+      }
+      // AUDIT R1 F4 — the CEO invocation itself is subscription-only:
+      // prove the codex-cli billing identity + live session authority
+      // INDEPENDENTLY of which executors can take tasks. A PAIR_NATIVE-
+      // only supply never authorizes a metered-CEO fallback.
+      const ceoBilling = this.deps.billingFor(CODEX_EXECUTOR_ID, null);
+      const ceoProven =
+        ceoBilling.mode === "SUBSCRIPTION" &&
+        ceoBilling.profile != null &&
+        !ceoBilling.unbounded &&
+        this.codexSubscriptionAuthProven();
+      if (!ceoProven) {
+        throw new DriverDenial("DRIVER_SUBSCRIPTION_UNVERIFIED",
+          "codex-cli CEO subscription binding/session not proven", false);
+      }
+      dispatchBound = env.bound;
+      if (limits?.budget_microusd_cap != null &&
+          usage.microusd + dispatchBound > limits.budget_microusd_cap) {
+        throw new DriverDenial("DRIVER_CAP_EXHAUSTED",
+          `budget ${usage.microusd}+${dispatchBound}>${limits.budget_microusd_cap}`, false);
       }
       writeSchedulerRow(this.deps.store, SCHEDULER_RECEIPT, receiptId, {
         objective_id: objectiveId,

@@ -21,6 +21,8 @@ import { IntegrityError, PolicyError } from "./errors.js";
 import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import { DRIVER_ACTOR } from "./work-open-binding.js";
 import { AUTONOMOUS_EXECUTOR_IDS } from "./executor-registry.js";
+import { providerEntryId } from "./provider-catalog.js";
+import { CODEX_CLI_PROVIDER_ID } from "./codex-cli-transport.js";
 import { assertCanonicalObjectiveBudget } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
@@ -833,11 +835,14 @@ export class CostService {
       // dispatch as autonomous work: it may only reserve through the
       // canonical AUTONOMOUS_EXECUTOR_IDS set — a dashboard toggle, an
       // adapter composition or a route edit can never make DEVIN/DSH
-      // autonomous — and under an explicit zero-spend auto-policy cap
-      // the pairing's billing identity must be provably non-metered (a
-      // $0-reserved METERED row can still SETTLE positive, so it is
-      // forbidden categorically, not merely over-cap). Live state is
-      // re-read inside THIS transaction: an executor enable, profile
+      // autonomous — and the pairing's billing identity must be
+      // provably non-metered (a $0-reserved METERED row can still
+      // SETTLE positive, so it is forbidden categorically, not merely
+      // over-cap). AUDIT R1 F2: subscription-only is UNCONDITIONAL —
+      // the monetary cap binds what is allowed but is not itself the
+      // metered gate, so METERED_API / UNKNOWN / unbounded billing is
+      // denied under an absent, zero or positive cap alike. Live state
+      // is re-read inside THIS transaction: an executor enable, profile
       // flip or route change between driver admission and this reserve
       // is never trusted from a snapshot. Reservations already proven
       // (COMMITTED/SETTLED re-hold of a RELEASED row) return through
@@ -857,17 +862,47 @@ export class CostService {
             max_microusd: null,
           });
         }
-        if (objScope !== "BROKEN" && objScope && objScope.cap === 0 &&
-            (billing.mode === "METERED_API" || billing.mode === "UNKNOWN" ||
-             billing.unbounded)) {
+        if (billing.mode === "METERED_API" || billing.mode === "UNKNOWN" ||
+            billing.unbounded) {
           violations.push({
             scope_type: "autonomous",
             scope_id: routeId ?? params.executorId,
             reason: "FAIL_CLOSED_COST_AUTONOMOUS_METERED",
             used_microusd: null,
             requested_microusd: requested,
-            max_microusd: 0,
+            max_microusd: objScope && objScope !== "BROKEN"
+              ? objScope.cap : null,
           });
+        }
+        // AUDIT R1 F3 — final atomic re-proof for the subscription
+        // transport: a driver-attributed CODEX dispatch requires the
+        // ACTIVE executor-level billing identity to be exactly
+        // SUBSCRIPTION (profileFor already filters status=ACTIVE, so a
+        // resolved profile is an active one) AND a live canonical
+        // provider session (auth_state === AUTH_OK). FREE / UNMETERED /
+        // missing profiles and unproven sessions never substitute;
+        // contradictory profiles fail closed rather than pretending
+        // zero-cost. Fresh in-txn state only — never a caller snapshot.
+        if (params.executorId === CODEX_EXECUTOR_ID) {
+          const executorBilling = this.billingFor(CODEX_EXECUTOR_ID, null);
+          const subscriptionProven =
+            executorBilling.mode === "SUBSCRIPTION" &&
+            executorBilling.profile != null &&
+            !executorBilling.unbounded;
+          const provider = this.store.tryGet(
+            "provider", providerEntryId(CODEX_CLI_PROVIDER_ID));
+          const sessionProven =
+            String(provider?.auth_state ?? "") === "AUTH_OK";
+          if (!subscriptionProven || !sessionProven) {
+            violations.push({
+              scope_type: "autonomous",
+              scope_id: CODEX_EXECUTOR_ID,
+              reason: "FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION",
+              used_microusd: null,
+              requested_microusd: null,
+              max_microusd: null,
+            });
+          }
         }
       }
       if (violations.length) return { violations, warnings, saved: null };

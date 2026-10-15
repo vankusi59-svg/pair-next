@@ -29,8 +29,23 @@
  *    claim → driver admission → real runObjectivePass with a
  *    CodexCliCeoDecisionInvoker over a controlled fake codex CLI →
  *    real admitPlannerInvocation + codexPlannerPlan over the SAME fake
- *    CLI → governed dispatch through the real gate into recording
- *    adapters → scheduler settle. No external paid API calls.
+ *    CLI → governed dispatch through the real gate + the REAL
+ *    CodexCliExecutorAdapter (ambient metered keys in its env reader —
+ *    proves the F1 boundary end-to-end) → executor terminal
+ *    collection via gate.collect_execution_result → scheduler settle.
+ *    Boundary actually exercised: admission → CEO → planner →
+ *    governed dispatch → execution terminal + reservation settlement.
+ *    No external paid API calls (global fetch rejects).
+ * Z8 AUDIT R1 corrections — F1: real CodexCliExecutorAdapter child env
+ *    carries no OPENAI_API_KEY/CODEX_API_KEY on driver-attributed
+ *    (autonomous) dispatch; manual dispatch semantics preserved.
+ *    F2: metered/unknown/unbounded autonomous dispatch denied under
+ *    absent, zero AND positive caps. F3: driver-attributed CODEX
+ *    reserves require ACTIVE SUBSCRIPTION profile + AUTH_OK session —
+ *    UNMETERED/FREE/missing profile/broken session denied at the
+ *    atomic gate; proven COMMITTED history still adopted. F4: CEO
+ *    subscription authorization proven independently of executor
+ *    supply — PAIR_NATIVE-only fleets still need the Codex session.
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -44,7 +59,9 @@ import {
   canonicalModelId,
   CEO_DECISION_ATTEMPT_ENTITY,
   CodexCliCeoDecisionInvoker,
+  CodexCliExecutorAdapter,
   codexPlannerPlan,
+  codexRunRoot,
   CODEX_CLI_PROVIDER_ID,
   CODEX_EXECUTOR_ID,
   CostService,
@@ -329,26 +346,45 @@ function reserve(s: S, m: { missionId: string }, taskId: string,
 /* ---------- fake codex CLI (controlled child process) ---------- */
 
 const FAKE_CODEX_JS = `const fs = require("fs");
+const path = require("path");
 const argv = process.argv.slice(2);
+// The real executor probe runs --version with no stdin — answer and exit
+// before waiting on the prompt stream.
+if (argv.includes("--version")) { process.stdout.write("fake-codex 9.9.9-test\\n"); process.exit(0); }
 const outIdx = argv.indexOf("--output-last-message");
 const out = outIdx >= 0 ? argv[outIdx + 1] : null;
 const b = process.env.FAKE_CODEX_BEHAVIOR || "ceo_init";
+// Governed EXECUTOR dispatches carry the pair_workspace/pair_read
+// permission profile; CEO (pair_ceo) and planner (pair_planner) carry
+// their own. The real CodexCliExecutorAdapter never forwards FAKE_*
+// child-env controls, so executor mode is argv-derived and the child env
+// is dumped next to the output file (visible to the test via the run
+// root) rather than through a FAKE_CODEX_* channel.
+const joined = argv.join(" ");
+const isExec = joined.includes("default_permissions=pair_workspace") ||
+  joined.includes("default_permissions=pair_read");
 let prompt = "";
 process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
   const log = process.env.FAKE_CODEX_INVOKELOG;
   if (log) fs.appendFileSync(log, argv.join(" ") + "\\n");
+  const envDump = JSON.stringify({
+    CODEX_HOME: process.env.CODEX_HOME != null,
+    CODEX_API_KEY: process.env.CODEX_API_KEY != null,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY != null,
+  });
   const envFile = process.env.FAKE_CODEX_ENVFILE;
-  if (envFile) {
-    fs.writeFileSync(envFile, JSON.stringify({
-      CODEX_HOME: process.env.CODEX_HOME != null,
-      CODEX_API_KEY: process.env.CODEX_API_KEY != null,
-      OPENAI_API_KEY: process.env.OPENAI_API_KEY != null,
-    }));
-  }
+  if (envFile) fs.writeFileSync(envFile, envDump);
+  if (out) fs.writeFileSync(out + ".env.json", envDump);
   if (b === "authfail") { process.stderr.write("error: 401 unauthorized\\n"); process.exit(1); }
   if (b === "ratelimit") { process.stderr.write("error: 429 rate limit exceeded\\n"); process.exit(1); }
   if (!out) { process.stderr.write("missing --output-last-message\\n"); process.exit(1); }
+  if (isExec) {
+    fs.writeFileSync(out, JSON.stringify({
+      status: "COMPLETED", summary: "fake exec done", artifacts: [],
+    }));
+    process.exit(0);
+  }
   if (b === "plan") {
     fs.writeFileSync(out, JSON.stringify({ tasks: [
       { task_key: "T1", title: "work", task_instruction: "do work",
@@ -707,7 +743,12 @@ describe("Z4 — driver-attributed dispatches only via the autonomous set", () =
     expect(() => reserve(s, m, "T1", null, DEVIN_EXECUTOR_ID)).not.toThrow();
   });
 
-  it("Z4.6 driver mission under cap>0 still honors bounded metered billing (positive-cap preserved)", () => {
+  it("Z4.6 driver mission under cap>0: metered autonomous dispatch still denied (subscription-only)", () => {
+    // AUDIT R1 F2 — the monetary cap is not the subscription gate: a
+    // driver-attributed dispatch resolving to METERED_API billing is
+    // forbidden under ANY cap, including a positive one. The cap still
+    // binds what IS allowed; manual lineage keeps metered semantics
+    // (Z8.5).
     const s = fresh("z4f");
     const oid = mkObjective(s);
     seedExecutorSupply(s);
@@ -719,9 +760,9 @@ describe("Z4 — driver-attributed dispatches only via the autonomous set", () =
     }, "TEST");
     enable(s, oid, { budget_microusd_cap: 500_000 });
     const m = driverMission(s, oid, "d6");
-    const res = reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID);
-    const row = s.store.get("cost_reservation", String(res.reservation_id)) as Row;
-    expect(Number(row.reserved_microusd)).toBe(100_000);
+    throwsCode(
+      () => reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID),
+      /FAIL_CLOSED_COST_AUTONOMOUS_(METERED|SUBSCRIPTION)/);
   });
 });
 
@@ -847,10 +888,276 @@ describe("Z6 — pause / revoke / halt remain fail-closed", () => {
   });
 });
 
+/* ============ Z8 — AUDIT R1 corrections ============ */
+
+/** Real governed Codex executor with ambient metered API credentials in
+ *  the parent env — the F1 attack shape. The fake CLI dumps the child
+ *  env beside final.json (argv-derived — the adapter never forwards
+ *  FAKE_* controls, so no test channel crosses the spawn boundary). */
+function realCodexAdapter(s: S, tag: string, opts: { store?: boolean } = {}) {
+  const journalRoot = path.join(s.dir, `jr-${tag}`);
+  const exe = makeFakeCodex(path.join(s.dir, `fk-${tag}`));
+  const codexHome = path.join(s.dir, `ch-${tag}`);
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "auth.json"), "{}");
+  const ambient: Record<string, string> = {
+    OPENAI_API_KEY: "sk-ambient-metered",
+    CODEX_API_KEY: "ck-ambient-metered",
+    CODEX_HOME: codexHome,
+  };
+  const adapter = new CodexCliExecutorAdapter({
+    journalRoot, executable: exe,
+    envReader: (n: string) => (n in ambient ? ambient[n] : process.env[n]),
+    ...(opts.store === false ? {} : { store: s.store }),
+  });
+  return { adapter, journalRoot };
+}
+
+function governedTask(s: S, m: { missionId: string }, tag: string) {
+  const ws = path.join(s.dir, `ws-${tag}`);
+  fs.mkdirSync(ws, { recursive: true });
+  return {
+    governed_task_id: `GT_${tag}_${counter}`,
+    mission_id: m.missionId,
+    task_id: `T_${tag}`,
+    workspace: ws,
+    allowed_paths: [ws],
+    permissions: ["FILE_WRITE"],
+    correlation_id: `corr-${tag}`,
+    governance_digest: "x",
+    executor_id: CODEX_EXECUTOR_ID,
+    governance_state: "DISPATCH_AUTHORIZED",
+    dispatch_enabled: true,
+    timeout: 30,
+    task_instruction: "noop",
+    constraints: [],
+  };
+}
+
+async function waitExec(a: CodexCliExecutorAdapter, id: string, ms = 20_000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const o = a.observe(id);
+    if (["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "UNKNOWN"]
+        .includes(String(o.status))) return o;
+    if (Date.now() > deadline) throw new Error(`exec ${id} never terminal`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+const childEnvDump = (journalRoot: string, executionId: string) =>
+  JSON.parse(fs.readFileSync(path.join(
+    codexRunRoot(journalRoot, executionId), "final.json.env.json"), "utf8"));
+
+describe("Z8 — AUDIT R1 corrections (F1–F4)", () => {
+
+  /* ----- F1: governed Codex executor child env ----- */
+
+  it("Z8.1 autonomous dispatch strips OPENAI_API_KEY/CODEX_API_KEY from the real executor child env", async () => {
+    const s = fresh("z8a");
+    const oid = mkObjective(s);
+    const m = driverMission(s, oid, "a"); // wob.created_by = DRIVER_ACTOR
+    const { adapter, journalRoot } = realCodexAdapter(s, "z8a");
+    const rec = adapter.dispatch(governedTask(s, m, "z8a"));
+    const o = await waitExec(adapter, String(rec.execution_id));
+    expect(o.status).toBe("COMPLETED");
+    const env = childEnvDump(journalRoot, String(rec.execution_id));
+    expect(env.OPENAI_API_KEY).toBe(false);
+    expect(env.CODEX_API_KEY).toBe(false);
+    // The subscription session still reaches the child — subscription-only
+    // means SESSION auth, not no auth.
+    expect(env.CODEX_HOME).toBe(true);
+  });
+
+  it("Z8.2 manual (owner-opened) dispatch preserves existing credential forwarding", async () => {
+    const s = fresh("z8b");
+    const oid = mkObjective(s);
+    const m = driverMission(s, oid, "b");
+    // Manual provenance — same lineage, owner-opened binding.
+    const wob = s.store.get("work_open_binding", m.openId) as Row;
+    s.store.put("work_open_binding", m.openId,
+      { ...wob, created_by: OWNER }, Number(wob.version));
+    const { adapter, journalRoot } = realCodexAdapter(s, "z8b");
+    const rec = adapter.dispatch(governedTask(s, m, "z8b"));
+    await waitExec(adapter, String(rec.execution_id));
+    const env = childEnvDump(journalRoot, String(rec.execution_id));
+    expect(env.OPENAI_API_KEY).toBe(true);
+    expect(env.CODEX_API_KEY).toBe(true);
+  });
+
+  /* ----- F2: subscription-only regardless of monetary cap ----- */
+
+  it("Z8.3 NO budget cap + reachable metered pairing → METERED_ROUTE_FORBIDDEN + admission denied", async () => {
+    const s = fresh("z8c");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    s.cost.upsertCostProfile({
+      ref_type: "route", ref_id: "RTE_CODEX_CLI",
+      billing_mode: "METERED_API", reserve_microusd: 10_000,
+    }, "TEST");
+    enable(s, oid); // no budget_microusd_cap at all — metered still forbidden
+    const driver = mkDriver(s);
+    const r = driver.readiness(oid, OWNER) as Record<string, unknown>;
+    expect(r.reasons).toContain("METERED_ROUTE_FORBIDDEN");
+    expect(r.objective_runnable).toBe(false);
+    const out = await driver.tick();
+    expect(out.driven[0]).toMatchObject({ denied: "DRIVER_METERED_FORBIDDEN" });
+    expect((s.store.list(CEO_DECISION_ATTEMPT_ENTITY) as Row[])
+      .filter((a) => String(a.objective_id) === oid)).toHaveLength(0);
+  });
+
+  it("Z8.4 NO budget cap + unbounded pairing → admission denied (never silently free)", async () => {
+    const s = fresh("z8d");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    // METERED_API with no reserve/rates is UNBOUNDED — unprovable bound.
+    s.cost.upsertCostProfile({
+      ref_type: "route", ref_id: "RTE_CODEX_CLI",
+      billing_mode: "METERED_API",
+    }, "TEST");
+    enable(s, oid); // no budget cap — unprovable binding still denied
+    const out = await mkDriver(s).tick();
+    expect(out.driven[0]).toMatchObject({ denied: "DRIVER_COST_UNVERIFIED" });
+  });
+
+  it("Z8.5 positive cap + METERED manual (owner-opened) mission still reserves — manual semantics preserved", () => {
+    const s = fresh("z8e");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    s.cost.upsertCostProfile({
+      ref_type: "route", ref_id: "RTE_CODEX_CLI",
+      billing_mode: "METERED_API", reserve_microusd: 100_000,
+    }, "TEST");
+    enable(s, oid, { budget_microusd_cap: 500_000 });
+    const m = driverMission(s, oid, "e");
+    const wob = s.store.get("work_open_binding", m.openId) as Row;
+    s.store.put("work_open_binding", m.openId,
+      { ...wob, created_by: OWNER }, Number(wob.version));
+    const res = reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID);
+    const row = s.store.get("cost_reservation", String(res.reservation_id)) as Row;
+    expect(Number(row.reserved_microusd)).toBe(100_000);
+  });
+
+  /* ----- F3: final CODEX SUBSCRIPTION + session re-proof at reserve ----- */
+
+  it("Z8.6 driver CODEX + UNMETERED profile → denied (FREE/UNMETERED never substitutes)", () => {
+    const s = fresh("z8f");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s, "UNMETERED"); // contradictory label on codex
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const m = driverMission(s, oid, "f");
+    throwsCode(
+      () => reserve(s, m, "T1", null, CODEX_EXECUTOR_ID),
+      "FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION");
+  });
+
+  it("Z8.7 driver CODEX + SUBSCRIPTION profile + unproven session → denied", () => {
+    const s = fresh("z8g");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s, "AUTH_REQUIRED"); // session never proven
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const m = driverMission(s, oid, "g");
+    throwsCode(
+      () => reserve(s, m, "T1", null, CODEX_EXECUTOR_ID),
+      "FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION");
+  });
+
+  it("Z8.8 driver CODEX + ACTIVE SUBSCRIPTION + AUTH_OK → $0 HELD (proven subscription)", () => {
+    const s = fresh("z8h");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const m = driverMission(s, oid, "h");
+    const res = reserve(s, m, "T1", null, CODEX_EXECUTOR_ID);
+    const row = s.store.get("cost_reservation", String(res.reservation_id)) as Row;
+    expect(Number(row.reserved_microusd)).toBe(0);
+    expect(String(row.billing_mode)).toBe("SUBSCRIPTION");
+  });
+
+  it("Z8.9 proven COMMITTED reservation is adopted — never re-gated after profile/auth drift", () => {
+    const s = fresh("z8i");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const m = driverMission(s, oid, "i");
+    const res = reserve(s, m, "T1", null, CODEX_EXECUTOR_ID);
+    // The dispatch was proven + committed. Then the world drifts: profile
+    // flips to METERED and the session evidence is revoked.
+    const row = s.store.get("cost_reservation", String(res.reservation_id)) as Row;
+    s.store.put("cost_reservation", String(res.reservation_id),
+      { ...row, status: "COMMITTED" }, Number(row.version));
+    const cp = (s.store.list("cost_profile") as Row[])
+      .find((p) => String(p.ref_id) === CODEX_EXECUTOR_ID)!;
+    s.cost.upsertCostProfile({
+      ref_type: "executor", ref_id: CODEX_EXECUTOR_ID,
+      billing_mode: "METERED_API", reserve_microusd: 5_000,
+    }, "TEST", Number(cp.version));
+    seedCodexAuth(s, "AUTH_REQUIRED");
+    // Re-resolving the SAME governed task adopts the proven charge — the
+    // autonomous gate applies to NEW dispatches, never history.
+    const again = reserve(s, m, "T1", null, CODEX_EXECUTOR_ID);
+    expect(String(again.reservation_id)).toBe(String(res.reservation_id));
+    expect(String(again.status)).toBe("COMMITTED");
+  });
+
+  /* ----- F4: CEO subscription authority independent of executor supply ----- */
+
+  it("Z8.10 PAIR_NATIVE-only supply + unproven codex session → SUBSCRIPTION_AUTH_UNVERIFIED, not runnable", () => {
+    const s = fresh("z8j");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s, [PAIR_NATIVE_EXECUTOR_ID]); // no CODEX executor at all
+    seedCodexAuth(s, "AUTH_REQUIRED");
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const r = mkDriver(s).readiness(oid, OWNER) as Record<string, unknown>;
+    expect(r.reasons).toContain("SUBSCRIPTION_AUTH_UNVERIFIED");
+    expect(r.objective_runnable).toBe(false);
+  });
+
+  it("Z8.11 PAIR_NATIVE-only supply + proven codex subscription → READY (CEO proven independent of CODEX supply)", () => {
+    const s = fresh("z8k");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s, [PAIR_NATIVE_EXECUTOR_ID]);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const r = mkDriver(s).readiness(oid, OWNER) as Record<string, unknown>;
+    expect(r.reasons).toEqual([]);
+    expect(r.objective_runnable).toBe(true);
+  });
+
+  it("Z8.12 unproven CEO session → admission denied before any CEO attempt", async () => {
+    const s = fresh("z8l");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s, [PAIR_NATIVE_EXECUTOR_ID]);
+    seedCodexAuth(s, "AUTH_REQUIRED");
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const out = await mkDriver(s).tick();
+    expect(out.driven[0]).toMatchObject({ denied: "DRIVER_SUBSCRIPTION_UNVERIFIED" });
+    expect((s.store.list(CEO_DECISION_ATTEMPT_ENTITY) as Row[])
+      .filter((a) => String(a.objective_id) === oid)).toHaveLength(0);
+  });
+});
+
 /* ============ Z7 — production-composition E2E ============ */
 
-describe("Z7 — end-to-end: objective → driver → CEO → planner → governed dispatch → settle", () => {
-  it("Z7.1 bounded lifecycle, zero metered API calls", async () => {
+describe("Z7 — end-to-end: objective → driver → CEO → planner → governed dispatch → execution settle", () => {
+  it("Z7.1 bounded lifecycle, zero metered API calls, real governed Codex executor env", async () => {
     const s = fresh("z7");
     const oid = mkObjective(s);
     // Canonical workspace authority — startBoundMission requires a real
@@ -859,24 +1166,9 @@ describe("Z7 — end-to-end: objective → driver → CEO → planner → govern
     const bizRow = s.store.get("business", s.bid) as Row;
     s.store.put("business", s.bid, {
       ...bizRow, project_id: String(project.project_id) }, Number(bizRow.version));
-    const adapters = seedExecutorSupply(s);
-    seedCodexAuth(s);
-    seedCodexSubscription(s);
-    enable(s, oid, { budget_microusd_cap: 0, max_ceo_calls: 4, max_missions: 2 });
 
-    // Canonical CEO model entry qualified through the real evidence seams.
-    const meId = ensureCodexCliCatalog(s.store, "gpt-6.1-sol", "TEST");
-    new ProviderCatalog(s.store).issueQualificationReceipt(
-      CODEX_CLI_PROVIDER_ID, { policy_version: "t", actor: "t" });
-    new ModelEvidenceCatalog(s.store).recordProbeReceipt({
-      probe_id: `PRB_${counter}`, model_entry_id: meId,
-      provider_id: CODEX_CLI_PROVIDER_ID, result: "PASS",
-      probe_type: "text_inference",
-      capability_evidence: { text_inference: "PASS" }, latency_ms: 1 });
-    const q = qualifyModel(s.store, meId, { capability_scope: ["text_inference"], actor: "t" });
-    if (!q.qualified) throw new Error("model qualification failed");
-
-    // Controlled fake codex CLI — CEO + planner spawns only.
+    // Controlled fake codex CLI — CEO + planner + the real governed
+    // executor all spawn it; ambient metered keys sit in the parent env.
     const fakeDir = path.join(s.dir, "fake-codex");
     const exe = makeFakeCodex(fakeDir);
     const invokeLog = path.join(s.dir, "codex-invocations.log");
@@ -894,6 +1186,53 @@ describe("Z7 — end-to-end: objective → driver → CEO → planner → govern
     };
     fs.mkdirSync(childEnv.CODEX_HOME, { recursive: true });
     fs.writeFileSync(path.join(childEnv.CODEX_HOME, "auth.json"), "{}");
+
+    // AUDIT R1 — the REAL CodexCliExecutorAdapter is the governed CODEX
+    // supply: canonical registration, real child-env boundary, ambient
+    // metered credentials present in its env reader.
+    const codexJournal = path.join(s.dir, "codex-journal");
+    const realCodex = new CodexCliExecutorAdapter({
+      journalRoot: codexJournal,
+      executable: exe,
+      envReader: (n: string) =>
+        (n in childEnv
+          ? (childEnv as Record<string, string>)[n]
+          : process.env[n]),
+      store: s.store,
+    });
+    const adapters = new Map<string, ExecutorAdapter>(
+      [[CODEX_EXECUTOR_ID, realCodex]]);
+    registerGovernedExecutors(s.service, adapters, "TEST");
+    // PAIR_NATIVE canonical supply (envelope coverage; this pass's
+    // dispatched task routes to CODEX, the only registered adapter).
+    new ExecutorRegistry(s.service).register({
+      executor_id: PAIR_NATIVE_EXECUTOR_ID,
+      executor_type: "AUTOMATON_WORKER",
+      capabilities: ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
+      health_state: "READY",
+      status: "ENABLED",
+      metadata: {
+        qualification_state: "QUALIFIED",
+        permission_modes: ["READ", "WRITE", "FILE_READ", "FILE_WRITE"],
+        workspace_modes: ["EXPLICIT_WORKSPACE"],
+      },
+    });
+    s.service.routes.seedPairNativeRoute("TEST");
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0, max_ceo_calls: 4, max_missions: 2 });
+
+    // Canonical CEO model entry qualified through the real evidence seams.
+    const meId = ensureCodexCliCatalog(s.store, "gpt-6.1-sol", "TEST");
+    new ProviderCatalog(s.store).issueQualificationReceipt(
+      CODEX_CLI_PROVIDER_ID, { policy_version: "t", actor: "t" });
+    new ModelEvidenceCatalog(s.store).recordProbeReceipt({
+      probe_id: `PRB_${counter}`, model_entry_id: meId,
+      provider_id: CODEX_CLI_PROVIDER_ID, result: "PASS",
+      probe_type: "text_inference",
+      capability_evidence: { text_inference: "PASS" }, latency_ms: 1 });
+    const q = qualifyModel(s.store, meId, { capability_scope: ["text_inference"], actor: "t" });
+    if (!q.qualified) throw new Error("model qualification failed");
 
     const fetchSpy = vi.fn(() => Promise.reject(new Error("NO_NETWORK")));
     vi.stubGlobal("fetch", fetchSpy);
@@ -976,6 +1315,9 @@ describe("Z7 — end-to-end: objective → driver → CEO → planner → govern
       const recon = new ReconciliationService(s.service, new Map());
       const approvals = new ApprovalQueue(s.service);
       const missionScheduler = new MissionScheduler(s.service, { mission_concurrency: 2 });
+      // Canonical capability row — plan validation checks task
+      // required_capabilities against the capability registry.
+      s.service.registerCapability("FILE_OPERATIONS");
       const runtimePlanner = () => ({
         tasks: [{ task_key: "T1", title: "t1", task_instruction: "t1",
           required_capabilities: ["FILE_OPERATIONS"], depends_on: [] }],
@@ -1012,7 +1354,7 @@ describe("Z7 — end-to-end: objective → driver → CEO → planner → govern
       const res = await driver.tick();
       const d = res.driven[0] as Record<string, unknown>;
       expect(d.settled).toBe(true);
-      expect(["DISPATCHED", "AWAITING_EXECUTION", "WAITING"]).toContain(d.outcome);
+      expect(d.outcome).toBe("DISPATCHED");
 
       // Zero paid transport: the only outbound channels were fake-codex spawns.
       expect(fetchSpy).not.toHaveBeenCalled();
@@ -1023,21 +1365,62 @@ describe("Z7 — end-to-end: objective → driver → CEO → planner → govern
         .filter((a) => String(a.objective_id) === oid);
       expect(attempts.length).toBe(1);
       expect(invocations.length).toBeGreaterThanOrEqual(1);
-      // Metered API credentials never reached the child env.
-      const childEnvDump = JSON.parse(fs.readFileSync(envFile, "utf8"));
-      expect(childEnvDump.OPENAI_API_KEY).toBe(false);
-      expect(childEnvDump.CODEX_API_KEY).toBe(false);
+      // Metered API credentials never reached the CEO/planner child env.
+      const laneEnvDump = JSON.parse(fs.readFileSync(envFile, "utf8"));
+      expect(laneEnvDump.OPENAI_API_KEY).toBe(false);
+      expect(laneEnvDump.CODEX_API_KEY).toBe(false);
       // Reservations (planner lane) exist under objective lineage at $0.
       const plannerRes = (s.store.list("cost_reservation") as Row[])
         .filter((r) => String(r.reservation_id).startsWith("CRSV_PLN_"));
-      if (d.outcome === "DISPATCHED" || d.outcome === "AWAITING_EXECUTION") {
-        expect(plannerRes.length).toBe(1);
-        expect(Number(plannerRes[0].reserved_microusd)).toBe(0);
-        // Driver-attributed mission binding exists.
-        const wobs = (s.store.list("work_open_binding") as Row[])
-          .filter((w) => String(w.created_by) === DRIVER_ACTOR);
-        expect(wobs.length).toBeGreaterThanOrEqual(1);
+      expect(plannerRes.length).toBe(1);
+      expect(Number(plannerRes[0].reserved_microusd)).toBe(0);
+      // Driver-attributed mission binding exists.
+      const wobs = (s.store.list("work_open_binding") as Row[])
+        .filter((w) => String(w.created_by) === DRIVER_ACTOR);
+      expect(wobs.length).toBeGreaterThanOrEqual(1);
+
+      // REAL governed Codex execution to terminal: drive the real
+      // MissionRuntime — the READY task routes through the
+      // GovernedTaskGate into the real CodexCliExecutorAdapter, then a
+      // later tick observes the terminal execution and the canonical
+      // collect → validate → settle path runs (reservation settled
+      // inside the gate), exactly as production runs it.
+      // Mission identity comes from canonical driver lineage (the
+      // work_open_binding minted by the pass), not the result DTO.
+      const missionId = String(wobs[0].mission_id);
+      expect(s.store.tryGet("mission", missionId)).toBeTruthy();
+      let execs: Row[] = [];
+      for (let i = 0; i < 8 && execs.length === 0; i++) {
+        runtime.tick(missionId);
+        execs = (s.store.list("executor_execution") as Row[])
+          .filter((e) => String(e.executor_id) === CODEX_EXECUTOR_ID);
       }
+      expect(execs.length).toBe(1);
+      const execId = String(execs[0].execution_id);
+      const o = await waitExec(realCodex, execId);
+      expect(o.status).toBe("COMPLETED");
+      for (let i = 0; i < 8; i++) {
+        runtime.tick(missionId);
+        const row = s.store.get("executor_execution", execId) as Row;
+        if (row.result != null) break;
+      }
+      const execAfter = s.store.get("executor_execution", execId) as Row;
+      expect(String(execAfter.execution_state)).toBe("COMPLETED");
+      expect(execAfter.result).toBeTruthy();
+      // The governed-task reservation is terminal COMMITTED at its $0
+      // bound — canonical subscription semantics: per-call usage is
+      // unmeasured so it stays at reserved maximum ($0), never SETTLED
+      // positive (settlement requires a proven microusd figure).
+      const taskRes = (s.store.list("cost_reservation") as Row[])
+        .filter((r) => String(r.executor_id) === CODEX_EXECUTOR_ID);
+      expect(taskRes.length).toBe(1);
+      expect(String(taskRes[0].status)).toBe("COMMITTED");
+      expect(Number(taskRes[0].reserved_microusd)).toBe(0);
+      // F1 proven E2E: the REAL executor child env carried no metered keys.
+      const execEnv = childEnvDump(codexJournal, execId);
+      expect(execEnv.OPENAI_API_KEY).toBe(false);
+      expect(execEnv.CODEX_API_KEY).toBe(false);
+      expect(execEnv.CODEX_HOME).toBe(true);
     } finally {
       vi.unstubAllGlobals();
     }
