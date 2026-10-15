@@ -150,7 +150,7 @@ const profile = (s: S, refType: "route" | "model" | "executor", refId: string,
     billing_mode: "METERED_API", ...extra }, "t");
 
 function reserve(s: S, m: { missionId: string }, taskId: string,
-  routeId: string | null, executorId = "EXEC_D") {
+  routeId: string | null, executorId = "CODEX") {
   const mission = s.store.get("mission", m.missionId) as Record<string, unknown>;
   return s.cost.assertAndReserve({
     mission,
@@ -164,11 +164,23 @@ const reservations = (s: S) =>
   s.store.list("cost_reservation") as Array<Record<string, unknown>>;
 
 function mkDriver(s: S, extra: Record<string, unknown> = {}) {
+  // PR #121 — autonomous supply derives from canonical executor rows:
+  // the declared list alone is never supply. Seed ENABLED/QUALIFIED.
+  const executorIds = (extra.executors as string[] | undefined) ?? ["CODEX"];
+  for (const eid of executorIds) {
+    if (!s.store.tryGet("executor", eid)) {
+      s.store.put("executor", eid, {
+        executor_id: eid, executor_type: "EXTERNAL", status: "ENABLED",
+        health_state: "READY", capabilities: [],
+        metadata: { qualification_state: "QUALIFIED" },
+      }, 0);
+    }
+  }
   return new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
     runPass: async () => ({ outcome: "WAITING" }) as never,
-    executors: ["EXEC_D"],
+    executors: executorIds,
     billingFor: (executorId: string, routeId: string | null) =>
       s.cost.billingFor(executorId, routeId),
     costHaltActive: () => false,
@@ -186,7 +198,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const s = fresh("f2a");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 300_000 });
-    profile(s, "executor", "EXEC_D", { reserve_microusd: 100_000 });
+    profile(s, "executor", "CODEX", { reserve_microusd: 100_000 });
     profile(s, "route", "RTE_EXP", { reserve_microusd: 500_000 });
     const m = missionOnObjective(s, oid, "a");
     // The executor's own profile (100k) is under cap — but the SELECTED
@@ -219,7 +231,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
       () => c.assertAndReserve({
         mission, task: { task_id: t, selected_route_id: "RTE_R" },
         governedTask: { governed_task_id: `GT_${t}`, task_id: t },
-        executorId: "EXEC_D",
+        executorId: "CODEX",
       });
     let ok = 0, denied = 0;
     for (const fn of [mk(s.cost, missionRow(s, m), "TA"), mk(cost2, m2, "TB")]) {
@@ -362,7 +374,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const s = fresh("f3e");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 500_000 });
-    profile(s, "executor", "EXEC_D", { reserve_microusd: 100_000 });
+    profile(s, "executor", "CODEX", { reserve_microusd: 100_000 });
     const driver = mkDriver(s);
     const st = s.scheduler.status(oid, OWNER, driver.readiness(oid, OWNER));
     expect(st.driver_ready).toBe(true);
@@ -374,7 +386,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const s = fresh("f3fq");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 5_000_000 });
-    profile(s, "executor", "EXEC_D", { reserve_microusd: 100_000 });
+    profile(s, "executor", "CODEX", { reserve_microusd: 100_000 });
     s.scheduler.quarantine(oid, "op-quarantine");
     const st = s.scheduler.status(oid, OWNER, mkDriver(s).readiness(oid, OWNER));
     expect(st.objective_runnable).toBe(false);
@@ -385,7 +397,7 @@ describe("P15.10-C R3 — cost authority & readiness closure", () => {
     const s = fresh("f3fx");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 200_000 });
-    profile(s, "executor", "EXEC_D", { reserve_microusd: 300_000 });
+    profile(s, "executor", "CODEX", { reserve_microusd: 300_000 });
     const driver = mkDriver(s);
     // Next dispatch bound (300k) exceeds remaining budget (200k cap).
     const st = s.scheduler.status(oid, OWNER, driver.readiness(oid, OWNER));

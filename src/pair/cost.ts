@@ -19,6 +19,8 @@ import fs from "node:fs";
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
+import { DRIVER_ACTOR } from "./work-open-binding.js";
+import { AUTONOMOUS_EXECUTOR_IDS } from "./executor-registry.js";
 import { assertCanonicalObjectiveBudget } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
@@ -823,6 +825,49 @@ export class CostService {
               max_microusd: objScope.cap,
             });
           }
+        }
+      }
+      // PR #121 — autonomous dispatch authority, proven INSIDE the same
+      // atomic check-and-reserve. A work_open_binding minted by the
+      // objective auto driver (created_by = DRIVER_ACTOR) marks this
+      // dispatch as autonomous work: it may only reserve through the
+      // canonical AUTONOMOUS_EXECUTOR_IDS set — a dashboard toggle, an
+      // adapter composition or a route edit can never make DEVIN/DSH
+      // autonomous — and under an explicit zero-spend auto-policy cap
+      // the pairing's billing identity must be provably non-metered (a
+      // $0-reserved METERED row can still SETTLE positive, so it is
+      // forbidden categorically, not merely over-cap). Live state is
+      // re-read inside THIS transaction: an executor enable, profile
+      // flip or route change between driver admission and this reserve
+      // is never trusted from a snapshot. Reservations already proven
+      // (COMMITTED/SETTLED re-hold of a RELEASED row) return through
+      // the existing paths above and are never re-gated.
+      const openId = String(params.mission.bound_open_id ?? "");
+      const driverWob = openId
+        ? this.store.tryGet("work_open_binding", openId)
+        : null;
+      if (driverWob && String(driverWob.created_by) === DRIVER_ACTOR) {
+        if (!(AUTONOMOUS_EXECUTOR_IDS as readonly string[])
+            .includes(params.executorId)) {
+          violations.push({
+            scope_type: "autonomous",
+            scope_id: String(params.executorId),
+            reason: "FAIL_CLOSED_COST_AUTONOMOUS_EXECUTOR",
+            used_microusd: null, requested_microusd: null,
+            max_microusd: null,
+          });
+        }
+        if (objScope !== "BROKEN" && objScope && objScope.cap === 0 &&
+            (billing.mode === "METERED_API" || billing.mode === "UNKNOWN" ||
+             billing.unbounded)) {
+          violations.push({
+            scope_type: "autonomous",
+            scope_id: routeId ?? params.executorId,
+            reason: "FAIL_CLOSED_COST_AUTONOMOUS_METERED",
+            used_microusd: null,
+            requested_microusd: requested,
+            max_microusd: 0,
+          });
         }
       }
       if (violations.length) return { violations, warnings, saved: null };

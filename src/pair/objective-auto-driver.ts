@@ -67,12 +67,18 @@ import type {
 } from "./objective-auto-scheduler.js";
 import type { OperatingPassResult } from "./objective-operating-loop.js";
 import { CEO_DECISION_ATTEMPT_ENTITY, CEO_MAX_ATTEMPTS_PER_OBSERVATION } from "./ceo-planning-cycle.js";
+import { ExecutorRegistry } from "./executor-registry.js";
+import { REJECTED_ROUTE_HEALTH } from "./route-registry.js";
+import { providerEntryId } from "./provider-catalog.js";
+import { CODEX_CLI_PROVIDER_ID } from "./codex-cli-transport.js";
+import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import {
   WORKFORCE_ALLOCATION_ENTITY,
   assertCanonicalWorkforceAllocationProvenance,
 } from "./workforce-allocation-evidence.js";
 
-export const DRIVER_ACTOR = "objective-auto-driver";
+import { DRIVER_ACTOR } from "./work-open-binding.js";
+export { DRIVER_ACTOR };
 export const DRIVER_STATE = "objective_auto_driver_state";
 export const DRIVER_SCHEMA = "pair.os.vnext.objective-auto-driver.v1";
 /** How many passes one driver tick may drain; bounded so a tick always
@@ -168,8 +174,13 @@ export interface DriverDeps {
      *  the lease that authorizes it. */
     planning_deadline_epoch_ms: number;
   }) => Promise<OperatingPassResult>;
-  /** Eligible executor ids for the dispatch-cost bound (governed
-   *  executor catalog — static composition, never per-pass lookups). */
+  /** The deployment's DECLARED autonomous executor ids — production
+   *  wires AUTONOMOUS_EXECUTOR_IDS (CODEX + PAIR_NATIVE). Membership is
+   *  re-proven against live canonical Executor/Route/Binding rows on
+   *  every envelope derivation; a listed id that is disabled,
+   *  unqualified or auth-blocked simply contributes no supply. The
+   *  canonical backstop for driver-attributed dispatches (absolute
+   *  AUTONOMOUS_EXECUTOR_IDS gate) lives inside assertAndReserve. */
   executors: string[];
   /** billingFor seam from the P13 cost service. */
   billingFor: (
@@ -326,13 +337,29 @@ export class ObjectiveAutoDriverService {
       // check in the driver.
       const claim = this.deps.scheduler.claimable(objectiveId);
       if (!claim.eligible) push(String(claim.reason));
+      // PR #121 — the separate canonical Objective budget authority:
+      // ceiling ≤ 0 forbids NEW spend-bearing work entirely (assertAnd-
+      // Reserve hard-blocks it as OBJECTIVE_ZERO_BUDGET), so readiness
+      // must say so truthfully rather than pretending the pass is free.
+      const obj = this.deps.objectives.get(objectiveId);
+      if (Number((obj.budget as Record<string, unknown> | undefined)
+          ?.ceiling_microusd ?? 0) <= 0) {
+        push("OBJECTIVE_ZERO_BUDGET");
+      }
       const limits = st.limits as { budget_microusd_cap?: number } | null;
-      if (limits?.budget_microusd_cap != null) {
+      const cap = limits?.budget_microusd_cap;
+      // Executor availability is objective-level truth regardless of a
+      // money cap — with no eligible autonomous executor nothing the
+      // CEO plans can ever be dispatched.
+      const env = this.dispatchCostEnvelope();
+      if (!env.executorAvailable) push("EXECUTOR_UNAVAILABLE");
+      if (cap != null) {
         const usage = this.usage(objectiveId);
         if (usage.cost_unverified) push("COST_UNVERIFIED");
-        const bound = this.dispatchCostBound();
-        if (bound === null) push("COST_BINDING_UNVERIFIED");
-        else if (usage.microusd + bound > limits.budget_microusd_cap) {
+        for (const r of env.reasons) push(r);
+        if (env.metered && cap === 0) push("METERED_ROUTE_FORBIDDEN");
+        if (env.bound !== null &&
+            usage.microusd + env.bound > cap) {
           push("BUDGET_EXHAUSTED");
         }
       }
@@ -406,6 +433,7 @@ export class ObjectiveAutoDriverService {
       worker_id: this.deps.workerId,
       boot_id: this.deps.bootId,
       max_passes_per_tick: this.maxPassesPerTick,
+      autonomous_executors: [...this.deps.executors],
     };
   }
 
@@ -457,31 +485,121 @@ export class ObjectiveAutoDriverService {
     };
   }
 
-  /** Provable worst-case microusd bound for ONE new dispatch — the max
-   *  reserve over every (executor, route) pairing the governed task
-   *  could take: billingFor resolves route profile → model profile →
-   *  executor profile, so executor-only (route=null) bounds would miss
-   *  a pricier route override (R3 F2). Any UNKNOWN or unbounded billing
-   *  on a reachable pairing makes the bound unprovable → fail closed.
-   *  The admission bound stays a PRELIMINARY check — the real cap
-   *  enforcement lives inside assertAndReserve per governed task. */
-  private dispatchCostBound(): number | null {
-    let bound = 0;
-    const routeIds = (this.deps.store.list("route") as Row[])
-      .map((r) => String(r.route_id));
+  /** PR #121 — autonomous supply derived from canonical
+   *  Executor/Route/Binding state, re-read at every call (never a
+   *  boot-time snapshot). The configured `deps.executors` list is only
+   *  the deployment's declared intent: an executor enters the envelope
+   *  only while its canonical row proves ENABLED + READY + AVAILABLE +
+   *  QUALIFIED + auth-acceptable + not quota/rate hard-blocked. A route
+   *  enters only through a QUALIFIED executor_supply_binding while the
+   *  route itself is enabled, never-rejected and live — disabled,
+   *  unqualified and unrelated routes can no longer poison (or
+   *  silently shrink) the cost envelope. Recoverable states
+   *  (QUOTA_EXHAUSTED/COOLDOWN eligibility, DECLARED qualification)
+   *  are deliberately OVER-included: the bound may never under-count a
+   *  dispatch that could still happen. */
+  private dispatchSupply(): {
+    pairings: Array<{ executor_id: string; route_id: string | null }>;
+    eligible: string[];
+  } {
+    const pairings: Array<{ executor_id: string; route_id: string | null }> = [];
+    const eligible: string[] = [];
+    const bindings = this.deps.store.list("executor_supply_binding") as Row[];
     for (const executorId of this.deps.executors) {
-      for (const routeId of [null, ...routeIds] as Array<string | null>) {
-        const b = this.deps.billingFor(executorId, routeId);
-        if (b.mode === "UNKNOWN" || b.unbounded) return null;
-        if (b.mode === "METERED_API") {
-          const reserve = Number(b.profile?.reserve_microusd ?? 0);
-          const fixed = Number(b.profile?.fixed_microusd ?? 0);
-          bound = Math.max(bound, reserve > 0 ? reserve : fixed);
-        }
-        // SUBSCRIPTION/FREE/UNMETERED: provably no per-dispatch money.
+      const rec = this.deps.store.tryGet("executor", executorId);
+      const md = (rec?.metadata ?? {}) as Record<string, unknown>;
+      const ok = rec != null &&
+        String(rec.status) === "ENABLED" &&
+        ExecutorRegistry.availabilityState(rec) === "AVAILABLE" &&
+        String(md.qualification_state ?? "") === "QUALIFIED" &&
+        ExecutorRegistry.authState(md) !== "AUTH_REQUIRED" &&
+        String(md.quota_state ?? "") !== "QUOTA_EXHAUSTED" &&
+        !["RATE_LIMITED", "COOLDOWN"].includes(String(md.rate_limit_state ?? ""));
+      if (!ok) continue;
+      eligible.push(executorId);
+      pairings.push({ executor_id: executorId, route_id: null });
+      for (const b of bindings) {
+        if (String(b.executor_id) !== executorId) continue;
+        if (String(b.qualification_state) !== "QUALIFIED") continue;
+        const route = this.deps.store.tryGet("route", String(b.route_id));
+        if (!route || route.enabled !== true) continue;
+        if (String(route.qualification_state) === "FAIL_CLOSED") continue;
+        if (["DISABLED", "RETIRED"].includes(String(route.eligibility_state))) continue;
+        const health = String(
+          (route.health as Record<string, unknown> | undefined)?.state ?? "");
+        if (REJECTED_ROUTE_HEALTH.has(health)) continue;
+        pairings.push({ executor_id: executorId, route_id: String(b.route_id) });
       }
     }
-    return bound;
+    return { pairings, eligible };
+  }
+
+  /** The codex-cli pairing is the ChatGPT SUBSCRIPTION transport — its
+   *  $0 billing is provable only while the provider row carries a live
+   *  authenticated session (probe-derived AUTH_OK), never from a
+   *  profile label, a stripped API key or a zero estimate alone. */
+  private codexSubscriptionAuthProven(): boolean {
+    const p = this.deps.store.tryGet(
+      "provider", providerEntryId(CODEX_CLI_PROVIDER_ID));
+    return String(p?.auth_state ?? "") === "AUTH_OK";
+  }
+
+  /** PR #121 — provable cost envelope over the canonical autonomous
+   *  supply. billingFor resolves route profile → model profile →
+   *  executor profile, so a pricier route override still binds (R3 F2).
+   *  - UNKNOWN / unbounded on ANY reachable pairing → unprovable.
+   *  - METERED_API → real bound math (legitimate only under a positive
+   *    cap; under cap 0 it denies through arithmetic + METERED_ROUTE_
+   *    FORBIDDEN readiness).
+   *  - SUBSCRIPTION / FREE / UNMETERED → $0, EXCEPT codex-cli where the
+   *    only honest $0 is an ACTIVE SUBSCRIPTION profile plus a proven
+   *    authenticated session — anything weaker is contradictory and
+   *    fails closed instead of pretending zero-cost.
+   *  Admission stays a PRELIMINARY check — the real enforcement lives
+   *  inside assertAndReserve per governed task. */
+  private dispatchCostEnvelope(): {
+    bound: number | null;
+    reasons: string[];
+    metered: boolean;
+    executorAvailable: boolean;
+  } {
+    const supply = this.dispatchSupply();
+    const reasons = new Set<string>();
+    let bound: number | null = 0;
+    let metered = false;
+    for (const p of supply.pairings) {
+      const b = this.deps.billingFor(p.executor_id, p.route_id);
+      if (b.mode === "UNKNOWN" || b.unbounded) {
+        reasons.add("COST_BINDING_UNVERIFIED");
+        bound = null;
+        continue;
+      }
+      if (b.mode === "METERED_API") {
+        metered = true;
+        const reserve = Number(b.profile?.reserve_microusd ?? 0);
+        const fixed = Number(b.profile?.fixed_microusd ?? 0);
+        bound = bound === null ? null
+          : Math.max(bound, reserve > 0 ? reserve : fixed);
+        continue;
+      }
+      if (p.executor_id === CODEX_EXECUTOR_ID) {
+        if (b.mode !== "SUBSCRIPTION") {
+          reasons.add("COST_BINDING_UNVERIFIED");
+          bound = null;
+        } else if (!this.codexSubscriptionAuthProven()) {
+          reasons.add("SUBSCRIPTION_AUTH_UNVERIFIED");
+          bound = null;
+        }
+      }
+      // else SUBSCRIPTION/FREE/UNMETERED on non-codex: provable $0.
+    }
+    if (supply.eligible.length === 0) reasons.add("EXECUTOR_UNAVAILABLE");
+    return {
+      bound,
+      reasons: [...reasons],
+      metered,
+      executorAvailable: supply.eligible.length > 0,
+    };
   }
 
   /* ---------------- admission (C1 + C2) ------------------------------ */
@@ -524,7 +642,12 @@ export class ObjectiveAutoDriverService {
           throw new DriverDenial("DRIVER_COST_UNVERIFIED",
             "attributed dispatch has unbounded/unknown cost", false);
         }
-        dispatchBound = this.dispatchCostBound();
+        // PR #121 — envelope re-derived from LIVE canonical executor/
+        // route/binding state inside this same atomic admission tx: a
+        // toggle, unqualify or profile flip since the claim cannot slip
+        // through, and a metered pairing under cap 0 exhausts the
+        // policy through real arithmetic (0 < bound).
+        dispatchBound = this.dispatchCostEnvelope().bound;
         if (dispatchBound === null) {
           throw new DriverDenial("DRIVER_COST_UNVERIFIED",
             "cannot bound next dispatch cost under budget cap", false);

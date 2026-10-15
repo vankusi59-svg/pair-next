@@ -16,6 +16,15 @@
 
 import type { PairEvidenceStore } from "./store.js";
 
+/** The delegated actor recorded as `created_by` on work_open_binding
+ *  rows the objective auto driver mints — the canonical marker that
+ *  distinguishes autonomous work from owner/manual work. Lives in
+ *  this leaf module (not the driver) so cost.ts can gate on it without
+ *  importing the driver's heavy service graph (module-init cycle:
+ *  cost → driver → ceo-planning-cycle → business → work-completion
+ *  → service MISSION_STATUS_TRANSITIONS TDZ). */
+export const DRIVER_ACTOR = "objective-auto-driver";
+
 export type StoreRow = Record<string, unknown> & { version: number };
 
 export interface OpenBindingCheck {

@@ -143,7 +143,7 @@ const profile = (s: S, refType: "route" | "model" | "executor", refId: string,
     billing_mode: "METERED_API", ...extra }, "t");
 
 function reserve(s: S, m: { missionId: string }, taskId: string,
-  routeId: string | null, executorId = "EXEC_D") {
+  routeId: string | null, executorId = "CODEX") {
   const mission = s.store.get("mission", m.missionId) as Record<string, unknown>;
   return s.cost.assertAndReserve({
     mission,
@@ -154,11 +154,22 @@ function reserve(s: S, m: { missionId: string }, taskId: string,
 }
 
 function mkDriver(s: S, extra: Record<string, unknown> = {}) {
+  // PR #121 — autonomous supply derives from canonical executor rows.
+  const executorIds = (extra.executors as string[] | undefined) ?? ["CODEX"];
+  for (const eid of executorIds) {
+    if (!s.store.tryGet("executor", eid)) {
+      s.store.put("executor", eid, {
+        executor_id: eid, executor_type: "EXTERNAL", status: "ENABLED",
+        health_state: "READY", capabilities: [],
+        metadata: { qualification_state: "QUALIFIED" },
+      }, 0);
+    }
+  }
   return new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
     runPass: async () => ({ outcome: "WAITING" }) as never,
-    executors: ["EXEC_D"],
+    executors: executorIds,
     billingFor: (executorId: string, routeId: string | null) =>
       s.cost.billingFor(executorId, routeId),
     costHaltActive: () => false,
@@ -272,7 +283,7 @@ describe("P15.10-C R4 — final readiness & cost proof", () => {
     const s = fresh("q9");
     const oid = mkObjective(s);
     enable(s, oid, { budget_microusd_cap: 5_000_000 });
-    profile(s, "executor", "EXEC_D", { reserve_microusd: 100_000 });
+    profile(s, "executor", "CODEX", { reserve_microusd: 100_000 });
     const st = s.scheduler.status(oid, OWNER, mkDriver(s).readiness(oid, OWNER));
     expect(st.driver_integrated).toBe(true);
     expect(st.objective_runnable).toBe(true);
@@ -426,7 +437,7 @@ describe("P15.10-C R4 — final readiness & cost proof", () => {
         mission: mission2,
         task: { task_id: "TC2", selected_route_id: "RTE_R" },
         governedTask: { governed_task_id: "GT_TC2", task_id: "TC2" },
-        executorId: "EXEC_D",
+        executorId: "CODEX",
       });
       return orig(fn as () => never);
     };

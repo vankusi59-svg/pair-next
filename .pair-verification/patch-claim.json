@@ -1,25 +1,27 @@
 {
-  "claim_id": "SUBSCRIPTION_ONLY_LLM_POLICY",
-  "title": "Subscription-Only LLM Policy — Codex CLI / ChatGPT subscription is the ONLY production LLM transport for Planner (INITIAL+REPLAN), LLM CEO and Conversation Reasoning; no HTTP/API fallback on unavailability, rate limit, logout, quota exhaustion or timeout",
+  "claim_id": "SUBSCRIPTION_AUTO_RUN_CEO",
+  "title": "Subscription-Only Auto Run CEO — zero-API-budget auto-policy, canonical autonomous Executor/Route supply, provable SUBSCRIPTION/UNMETERED cost binding, in-transaction autonomous dispatch gate, truthful readiness, production opt-in wiring",
   "affected_surfaces": [
-    "PLANNER",
-    "CONVERSATION",
-    "GATE_ROUTER",
-    "MISSION_CONTROL"
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "GATE_ROUTER"
   ],
   "required_tests": [
-    "src/__tests__/pair-subscription-llm.test.ts",
+    "src/__tests__/pair-subscription-auto-run-ceo.test.ts",
+    "src/__tests__/pair-p15-10c.test.ts",
+    "src/__tests__/pair-p15-10c-r3.test.ts",
+    "src/__tests__/pair-p15-10c-r4.test.ts",
+    "src/__tests__/pair-p13.test.ts",
     "src/__tests__/pair-executor-toggle.test.ts",
-    "src/__tests__/pair-async-replan-generation.test.ts",
-    "src/__tests__/pair-llm-planner.test.ts",
-    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
-    "src/__tests__/pair-p15-8a-conversation-authority.test.ts"
+    "src/__tests__/pair-subscription-llm.test.ts",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts"
   ],
   "invariants": [
-    "INV_PLAN_001",
-    "INV_CONV_001",
+    "INV_EXEC_001",
+    "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "Codex CLI subscription is the sole permitted transport for the three reasoning lanes. PLANNER: assertCodexOnlyPlannerRoute (model-role.ts) gates the composed route pool — every non-empty route in PAIR_PLANNER_MODEL_ROUTE/FALLBACK/EXTRA_ROUTES must be `codex-cli:<model>` or boot fails closed FAIL_CLOSED_PLANNER_TRANSPORT_UNAUTHORIZED before discovery, probes or invocation; default Gemini fallback REMOVED. The candidate-pool loop throws on any non-codex ref instead of an HTTP qualifyRoute probe, and production planFn runs assertCodexCliPlannerTransport (serve-planner.ts) before codexPlannerPlan — a forged HTTP candidate is an authority violation; the llmPlan branch is deleted. Pool evidence, eligibility, REASK, deadlines, cost reservation and in-pool failover unchanged; codex quota failure settles QUOTA_RATE_LIMITED then EXHAUSTED. INITIAL and REPLAN share the one plannerCandidates array. CEO: CodexCliCeoDecisionInvoker refuses forged transports FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT before resolution/spawn. CONVERSATION: resolveConversationModelTransport + CodexCliConversationInvoker both require codex-cli/CODEX_CLI/codex-cli://local; one invoker serves Dashboard Chat + Telegram. AUTH: codexCliChildEnv never forwards OPENAI_API_KEY/CODEX_API_KEY to children. Residual API activity outside the lanes: DSH qualification probes + DSH Model Router (unchanged per scope); llmPlan kept as shared infra with zero production callers. PR #119 executor toggles untouched.",
+  "description": "Subscription-only P15.10 autonomous Objective pipeline (opt-in PAIR_OBJECTIVE_AUTO_DRIVER=1, default OFF). A) auto-policy accepts budget_microusd_cap=0 as explicit hard zero-spend; invalid values still FAIL_CLOSED_POLICY_LIMITS; Objective ceiling=0 stays a hard OBJECTIVE_ZERO_BUDGET block in readiness. B) AUTONOMOUS_EXECUTOR_IDS=[CODEX,PAIR_NATIVE] is the only autonomous set; driver dispatchSupply derives pairings from LIVE executor rows (ENABLED/READY/QUALIFIED/auth/quota/rate) + QUALIFIED supply bindings + enabled never-rejected routes; serve-mission-control.mjs wires executors=AUTONOMOUS_EXECUTOR_IDS (was [...governed.keys()] — admitted disabled DEVIN, omitted PAIR_NATIVE) and seeds a SUBSCRIPTION codex profile only when undeclared. C) dispatchCostEnvelope: codex pairings prove $0 only via ACTIVE SUBSCRIPTION profile + provider AUTH_OK; UNMETERED/FREE on codex is contradictory → COST_BINDING_UNVERIFIED; SUBSCRIPTION without session → SUBSCRIPTION_AUTH_UNVERIFIED; UNKNOWN/unbounded → unprovable; METERED → bound math (positive caps) / METERED_ROUTE_FORBIDDEN under cap 0. D) assertAndReserve gates driver-attributed work (wob.created_by=DRIVER_ACTOR, moved to leaf work-open-binding.ts, breaking a cost→driver init cycle) in the same atomic txn: non-autonomous executor → FAIL_CLOSED_COST_AUTONOMOUS_EXECUTOR; cap=0+metered/unknown → FAIL_CLOSED_COST_AUTONOMOUS_METERED; manual missions and proven reservations never re-gated. F) readiness adds DRIVER_DISABLED, EXECUTOR_UNAVAILABLE, OBJECTIVE_ZERO_BUDGET, SUBSCRIPTION_AUTH_UNVERIFIED, METERED_ROUTE_FORBIDDEN. G) 30 focused regressions incl. production-composition E2E (fake codex CLI + recording adapters + real MissionControl): objective → wake → claim → admission → CEO → planner → governed dispatch → settled, zero metered API calls. Harness: r3/r4/p15-10c seed executor rows + reserve via autonomous ids; p15-10d/r1/met-branch-fold/p15-3/cpl1/p5 stay at exact win32 baselines.",
   "risk_override": "HIGH"
 }

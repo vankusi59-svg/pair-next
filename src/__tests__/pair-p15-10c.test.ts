@@ -94,6 +94,15 @@ function mkDriver(s: Stack, opts: {
   workerId?: string; bootId?: string; maxPassesPerTick?: number;
 } = {}) {
   const calls: PassCall[] = [];
+  // PR #121 — the configured autonomous id must exist as a canonical
+  // ENABLED+QUALIFIED executor row to enter the supply envelope.
+  if (!s.store.tryGet("executor", "CODEX")) {
+    s.store.put("executor", "CODEX", {
+      executor_id: "CODEX", executor_type: "EXTERNAL", status: "ENABLED",
+      health_state: "READY", capabilities: [],
+      metadata: { qualification_state: "QUALIFIED" },
+    }, 0);
+  }
   const driver = new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
