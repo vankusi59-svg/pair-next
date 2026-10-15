@@ -183,6 +183,28 @@ export function plannerExecutorCapSets(
       .filter((s) => s.length);
 }
 
+/**
+ * Subscription-only LLM transport policy (PR #120): a Planner Pool
+ * candidate may ONLY invoke the Codex CLI subscription transport. Any
+ * candidate reaching the invocation seam without `transport:
+ * "codex_cli"` is an authority violation — refused BEFORE an HTTP
+ * request can be constructed. The configure-time gate
+ * (assertCodexOnlyPlannerRoute over PAIR_PLANNER_*_ROUTE) makes such a
+ * candidate unreachable; this is the defense-in-depth check at the
+ * point where a model invocation would actually run.
+ */
+export function assertCodexCliPlannerTransport(candidate: {
+  ref: string;
+  transport?: string;
+}): void {
+  if (candidate.transport !== "codex_cli") {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_TRANSPORT_UNAUTHORIZED",
+      `planner candidate ${String(candidate.ref)} transport ${String(candidate.transport ?? "openai_http")} is not codex_cli — no HTTP planner invocation is permitted`,
+    );
+  }
+}
+
 export interface ServePlannerDeps {
   /** Capability sets of the currently-qualified executors — sanitizePlan
    *  drops tasks no single executor can serve. */

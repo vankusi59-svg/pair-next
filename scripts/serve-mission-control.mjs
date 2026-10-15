@@ -21,7 +21,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDatabase } from "../dist/state/database.js";
 import {
-  llmPlan,
   ApprovalQueue,
   CodexCliExecutorAdapter,
   DevinExecutorAdapter,
@@ -69,7 +68,6 @@ import {
   PolicyError,
   modelProbeTimeoutMs,
   modelDiscoveryTimeoutMs,
-  llmPlannerTimeoutMs,
   codexPlannerTimeoutMs,
   plannerRunDeadlineMs,
   replanGenerationDeadlineMs,
@@ -107,6 +105,8 @@ import {
   replanWorkItemId,
   makeServePlanner,
   plannerExecutorCapSets,
+  assertCodexOnlyPlannerRoute,
+  assertCodexCliPlannerTransport,
   SERVE_LLM_WORK_CAPS,
   ConversationSessionService,
   ConversationReasoningService,
@@ -156,7 +156,7 @@ fs.mkdirSync(journalRoot, { recursive: true });
 // bounded; malformed input FAILS CLOSED here, before any side effects.
 const cfgProbeTimeoutMs = modelProbeTimeoutMs();   // PAIR_MODEL_PROBE_TIMEOUT_MS (ms, 500..120000)
 const cfgDiscoveryTimeoutMs = modelDiscoveryTimeoutMs(); // PAIR_MODEL_DISCOVERY_TIMEOUT_MS (ms, 500..120000)
-const cfgPlannerTimeoutMs = llmPlannerTimeoutMs(); // PAIR_LLM_PLANNER_TIMEOUT_MS (ms, 2000..900000)
+// PAIR_LLM_PLANNER_TIMEOUT_MS retired — no HTTP planner transport exists (PR #120).
 const cfgCodexPlannerTimeoutMs = codexPlannerTimeoutMs(); // PAIR_CODEX_PLANNER_TIMEOUT_MS (ms, 5000..900000)
 const cfgPlannerRunDeadlineMs = plannerRunDeadlineMs(); // PAIR_PLANNER_RUN_DEADLINE_MS (ms, 5000..3600000)
 const cfgReplanGenerationDeadlineMs = replanGenerationDeadlineMs(); // PAIR_REPLAN_GENERATION_DEADLINE_MS (ms, 5000..3600000)
@@ -210,13 +210,18 @@ console.log(`MC_ADMIN_TOKEN: ${adminTokenEffective ? "configured (env)" : "unset
 // _EXTRA_ROUTES keep full operator override — an explicit env setting
 // always wins over these defaults; an empty fallback disables it.
 const PLANNER_PRIMARY_ROUTE = String(process.env.PAIR_PLANNER_MODEL_ROUTE ?? "codex-cli:gpt-6.1-sol").trim();
-const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "gemini:gemini-3.1-flash-lite").trim();
-const PLANNER_ROUTES = [PLANNER_PRIMARY_ROUTE];
-if (PLANNER_FALLBACK_ROUTE) PLANNER_ROUTES.push(PLANNER_FALLBACK_ROUTE);
-for (const extra of String(process.env.PAIR_PLANNER_EXTRA_ROUTES ?? "").split(",")) {
-  const r = extra.trim();
-  if (r && !PLANNER_ROUTES.includes(r)) PLANNER_ROUTES.push(r);
-}
+// PR #120 — subscription-only LLM policy: the ONLY permitted Planner
+// transport is the authenticated Codex CLI / ChatGPT subscription
+// session. The default Gemini HTTP fallback is REMOVED (empty = no
+// fallback, same convention as DSH); every configured route — primary,
+// fallback, extras — must be `codex-cli:<model>` or boot fails closed
+// BEFORE any provider discovery, HTTP probe, or model invocation.
+const PLANNER_FALLBACK_ROUTE = String(process.env.PAIR_PLANNER_FALLBACK_ROUTE ?? "").trim();
+const PLANNER_ROUTES = composeConfiguredRoleRoutes({
+  primary: PLANNER_PRIMARY_ROUTE,
+  fallback: PLANNER_FALLBACK_ROUTE,
+  extras: process.env.PAIR_PLANNER_EXTRA_ROUTES,
+}).map(assertCodexOnlyPlannerRoute);
 const DSH_PRIMARY_ROUTE = String(process.env.PAIR_DSH_MODEL_ROUTE ?? "cloudflare:@cf/zai-org/glm-4.7-flash").trim();
 const DSH_FALLBACK_ROUTE = String(process.env.PAIR_DSH_FALLBACK_ROUTE ?? "groq:openai/gpt-oss-20b").trim();
 // P0-F2 — canonical composition: an explicit empty/whitespace fallback is
@@ -366,7 +371,7 @@ const executorCapSets = plannerExecutorCapSets(service, adapters);
 // planner now live in src/pair/serve-planner.ts (compiled to dist) so the
 // EXACT production composition is importable by tests — a test drives the
 // same function object this wiring instantiates.
-// F3 R1.1 — replan provider: the LLM planner (llmPlan) is async and
+// F3 R1.1 — replan provider: the LLM planner (codexPlannerPlan) is async and
 // cannot run inside the synchronous RuntimePlanner contract. The
 // governed bridge stages async Planner Pool candidates in a durable
 // `replan_generation` row (src/pair/replan-generation.ts) — wired as the
@@ -458,7 +463,7 @@ const control = new MissionControl({
   telegramDeliveryStaleAfterMs: cfgTgStaleAfterMs,
 });
 // Phase C — the delegated-open planner seam: EVERY newly opened bound
-// mission plans through the SAME Planner Pool (llmPlan → planner_run /
+// mission plans through the SAME Planner Pool (codexPlannerPlan → planner_run /
 // planner_attempt durable evidence). The planExpander const is
 // declared below at planner-composition time; BusinessLayer invokes it
 // through a late-bound closure so construction order never creates a
@@ -857,17 +862,14 @@ if (process.env.PAIR_DSH_HOME || process.env.CODEX_HOME) {
       await qualifyCodexPlannerRoute(r);
       continue;
     }
-    const q = await qualifyRoute(r, false);
-    if (q) {
-      plannerCandidates.push({
-        model_entry_id: r.model_entry_id,
-        ref: r.ref,
-        provider: r.pid,
-        model: r.mid,
-        endpoint: endpointOf(q.prov),
-        credentialEnv: String(q.prov.credential_reference_name ?? ""),
-      });
-    }
+    // PR #120 — subscription-only policy: the route-compose gate makes
+    // a non-codex planner ref unreachable; refuse it here rather than
+    // spending a single HTTP qualification probe (defense in depth —
+    // an HTTP planner candidate can never exist in production).
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_TRANSPORT_UNAUTHORIZED",
+      `planner candidate ${r.ref} resolves to provider ${r.pid} — only codex-cli is permitted`,
+    );
   }
 
   if (governed.has(DSH_EXECUTOR_ID)) {
@@ -926,10 +928,11 @@ const knownCapabilityIds = () =>
 // seam, shared verbatim by the initial-plan expander edge AND the
 // governed async replan-generation driver: identical failover chain,
 // per-attempt canonical eligibility re-proof, canonicalize +
-// validatePlanProposal winner-check, transport branch (HTTP llmPlan /
-// codex-cli codexPlannerPlan), latency budgets, durable attempt evidence
+// validatePlanProposal winner-check, transport branch (codex-cli
+// codexPlannerPlan only — no HTTP planner invocation exists), latency
+// budgets, durable attempt evidence
 // and the absolute run deadline. `replanContext` is present only on a
-// REPLAN generation and propagates into BOTH transports' canonical
+// REPLAN generation and propagates into the canonical
 // prompt builder; `externalInputArtifacts` binds cross-mission consume
 // edges at canonicalization for replan candidates (undefined for
 // initial planning — identical prior behavior).
@@ -1001,53 +1004,41 @@ const invokePlannerPool = ({
       return canon;
     },
     // CPL-1 — transport branch: codex-cli candidates invoke the
-    // dedicated CodexPlannerProvider spawn transport (planner-side
-    // only — no governed dispatch); every other route keeps the
-    // OpenAI-compatible llmPlan call. Both return the same
-    // {tasks, warnings} contract into the SAME canonicalize seam.
-    planFn: (c, invocation) =>
-      c.transport === "codex_cli"
-        ? codexPlannerPlan(goal, {
-            model: c.model,
-            authorityGoal,
-            // P-REASK R3 — the re-ask runs inside the remaining
-            // candidate budget, never a second full timeout.
-            timeoutMs: invocation?.timeoutMs ?? cfgCodexPlannerTimeoutMs,
-            scratchDir: codexPlannerScratch,
-            allowedCapabilities: LLM_PLANNER_CAPS,
-            capabilitySets: executorCapSets(),
-            // Governed async replan — the structured failure context
-            // minted on the durable generation row reaches the SAME
-            // canonical prompt builder the HTTP transport uses.
-            replanContext: replanContext ?? undefined,
-            rejectionContext: invocation?.rejectionContext,
-            providerCounter: invocation?.providerCounter,
-          })
-        : llmPlan(goal, {
-            endpoint: `${c.endpoint}/chat/completions`,
-            credentialEnv: c.credentialEnv,
-            model: c.model,
-            authorityGoal,
-            timeoutMs: invocation?.timeoutMs ?? cfgPlannerTimeoutMs,
-            allowedCapabilities: LLM_PLANNER_CAPS,
-            capabilitySets: executorCapSets(),
-            replanContext: replanContext ?? undefined,
-            rejectionContext: invocation?.rejectionContext,
-            maxProviderRequests: invocation?.maxProviderRequests,
-            // AUDIT R1 F3 — the pool's absolute run deadline so the
-            // transport's internal retry loop can never START a fresh
-            // provider request past it.
-            deadlineMs: invocation?.deadlineMs,
-            providerCounter: invocation?.providerCounter,
-          }),
+    // dedicated CodexPlannerProvider spawn transport. PR #120 —
+    // subscription-only: there is no HTTP planner branch; a non-codex
+    // candidate is an authority violation refused BEFORE any HTTP
+    // model invocation can be constructed (the compose-time gate +
+    // the candidate-pool gate already make this unreachable).
+    planFn: (c, invocation) => {
+      // Subscription-only — the invocation seam itself re-proves the
+      // transport before a model call can be constructed; a non-codex
+      // candidate throws an authority violation (never an HTTP request).
+      assertCodexCliPlannerTransport(c);
+      return codexPlannerPlan(goal, {
+        model: c.model,
+        authorityGoal,
+        // P-REASK R3 — the re-ask runs inside the remaining
+        // candidate budget, never a second full timeout.
+        timeoutMs: invocation?.timeoutMs ?? cfgCodexPlannerTimeoutMs,
+        scratchDir: codexPlannerScratch,
+        allowedCapabilities: LLM_PLANNER_CAPS,
+        capabilitySets: executorCapSets(),
+        // Governed async replan — the structured failure context
+        // minted on the durable generation row reaches the SAME
+        // canonical prompt builder the HTTP transport uses.
+        replanContext: replanContext ?? undefined,
+        rejectionContext: invocation?.rejectionContext,
+        providerCounter: invocation?.providerCounter,
+      });
+    },
     // P-REASK R3 — hard per-candidate latency ceiling, measured from
-    // attempt START: HTTP = 2×per-request timeout (its INITIAL call may
-    // make up to two provider requests); Codex = its single-invocation
-    // timeout. The re-ask spends only what the envelope left over.
-    latencyBudget: (c) =>
-      c.transport === "codex_cli"
-        ? { ceilingMs: cfgCodexPlannerTimeoutMs, requestTimeoutMs: cfgCodexPlannerTimeoutMs }
-        : { ceilingMs: 2 * cfgPlannerTimeoutMs, requestTimeoutMs: cfgPlannerTimeoutMs },
+    // attempt START: Codex = its single-invocation timeout (no HTTP
+    // planner branch exists to bound). The re-ask spends only what
+    // the envelope left over.
+    latencyBudget: () => ({
+      ceilingMs: cfgCodexPlannerTimeoutMs,
+      requestTimeoutMs: cfgCodexPlannerTimeoutMs,
+    }),
     onAttemptStart: (base) =>
       persistPlannerAttemptStart(store, {
         planner_run_id: plannerRunId,

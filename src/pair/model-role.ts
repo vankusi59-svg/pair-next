@@ -356,6 +356,29 @@ export function composeConfiguredRoleRoutes(opts: {
   return routes;
 }
 
+/**
+ * Subscription-only LLM transport policy (PR #120): the ONLY permitted
+ * production Planner transport is the authenticated Codex CLI / ChatGPT
+ * subscription session — `codex-cli:<model>` routes. Any configured
+ * non-codex route (primary, fallback, or extra) fails closed BEFORE
+ * provider discovery, HTTP qualification probes, or any model
+ * invocation — never silently ignored, substituted, or migrated to a
+ * metered API. An empty route (e.g. an explicitly disabled fallback) is
+ * dropped by composeConfiguredRoleRoutes upstream; this gate only sees
+ * non-empty configured candidates.
+ */
+export function assertCodexOnlyPlannerRoute(route: string): string {
+  const r = String(route ?? "").trim();
+  const m = /^codex-cli:(.+)$/.exec(r);
+  if (!m || !String(m[1]).trim()) {
+    throw new IntegrityError(
+      "FAIL_CLOSED_PLANNER_TRANSPORT_UNAUTHORIZED",
+      `planner route ${JSON.stringify(r)} is not codex-cli:<model> — subscription-only transport policy`,
+    );
+  }
+  return r;
+}
+
 export function resolveConfiguredModelRoleRoute(
   resolveEntry: (provider: string, model: string) => { model_entry_id?: unknown } | null | undefined,
   opts: { route: string; role: ModelRole },
