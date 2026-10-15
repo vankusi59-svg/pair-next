@@ -42,6 +42,19 @@ const INTEGRITY_QUOTA = 16;
  *  means catastrophic protected-state tampering; the scheduler halts
  *  fail-closed rather than run an unbounded exclusion list. */
 const FAULTED_CAP = 1024;
+/** R5-F1 — charged-read headroom: a fault() confirmation costs at most ~10
+ *  charged reads (receipt dedup probe + receipt commit + fairness
+ *  exclusion), so stop processing candidates while ~10x that remains.
+ *  Stopping early lets the transaction COMMIT the exclusions already made —
+ *  durable forward progress — instead of rolling back on budget trip. */
+const FAULT_HEADROOM = 96;
+/** R5-F1 — the idle-path sweep costs ~200 charged reads worst case
+ *  (16-row deep slice + up to 16 suspect confirmations); it is coverage
+ *  work, not correctness — defer it rather than risk the budget. */
+const SWEEP_HEADROOM = 288;
+/** R5-F1 — temporary charged-read exhaustion is work pressure, never
+ *  evidence of row corruption. */
+const PROOF_LIMIT = "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT";
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -979,9 +992,19 @@ export class ObjectiveAutoScheduler {
       // the same corrupted page is never rescanned, so a healthy candidate
       // ranked after a full page of corrupt rows still gets reached
       const excluded = this.faultedSet(f);
+      // R5-F1 — charged-read headroom gate: fault() confirmation is the
+      // most expensive per-row work (~10 charged reads), so stop when the
+      // budget can no longer cover another one plus the call's tail writes.
+      // Already-recorded exclusions commit with the transaction — the next
+      // call resumes past them instead of losing everything to a rollback.
+      const budgetLow = () => {
+        const r = this.store.readBudgetRemaining();
+        return !!r && (r.events <= FAULT_HEADROOM || r.entities <= FAULT_HEADROOM);
+      };
+      let stoppedOnBudget = false;
       let furthest = last;
       let exhausted = false;
-      for (let pages = 0; pages < SCAN_PAGES && !exhausted; pages++) {
+      for (let pages = 0; pages < SCAN_PAGES && !exhausted && !stoppedOnBudget; pages++) {
         const skip = [...excluded];
         const candidates = this.store.db.prepare(`SELECT entity_id,
             CAST(json_extract(payload,'$.registration_rank') AS INTEGER) AS rank
@@ -1014,6 +1037,11 @@ export class ObjectiveAutoScheduler {
             q = this.queue(item.entity_id);
           } catch (err) {
             if (err instanceof IntegrityError) {
+              // R5-F1: proof-budget exhaustion is transient work pressure —
+              // never recorded as corruption
+              if (err.code === PROOF_LIMIT || budgetLow()) {
+                stoppedOnBudget = true; break;
+              }
               this.fault(WAKE_STATE, item.entity_id, err);
               excluded.add(item.entity_id);
               continue;
@@ -1027,6 +1055,9 @@ export class ObjectiveAutoScheduler {
             lease = this.lease(item.entity_id);
           } catch (err) {
             if (err instanceof IntegrityError) {
+              if (err.code === PROOF_LIMIT || budgetLow()) {
+                stoppedOnBudget = true; break;
+              }
               this.fault(LEASE_STATE, item.entity_id, err);
               excluded.add(item.entity_id);
               continue;
@@ -1064,8 +1095,15 @@ export class ObjectiveAutoScheduler {
       }
       // R3-F1: before an idle sweep goes silent, prove the quiet is real —
       // rows the SQL filter excluded must still face ledger+hash
-      // verification on a bounded cadence, with durable fault evidence
-      this.integritySweep();
+      // verification on a bounded cadence, with durable fault evidence.
+      // R5-F1: the sweep is coverage work — if the candidate scan already
+      // consumed most of the budget, defer it to a later idle call rather
+      // than trip the proof limit inside the same transaction.
+      const remaining = this.store.readBudgetRemaining();
+      if (!remaining || (remaining.events > SWEEP_HEADROOM &&
+          remaining.entities > SWEEP_HEADROOM)) {
+        this.integritySweep();
+      }
       const counter = Number(f.registration_counter);
       if (last > 0 || upper < counter) {
         // cohort wrap/bound refresh commits; a no-change sweep over a

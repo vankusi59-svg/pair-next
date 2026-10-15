@@ -165,6 +165,14 @@ export class PairEvidenceStore {
     this.readBudget[kind] -= count;
   }
 
+  /** Remaining charged-read budget of the current proof scope, or null
+   *  when unscoped. Lets a bounded loop stop speculative work before the
+   *  budget trips — exhausting it mid-transaction would roll back
+   *  progress that must stay durable. */
+  readBudgetRemaining(): { entities: number; events: number } | null {
+    return this.readBudget ? { ...this.readBudget } : null;
+  }
+
   private pageLimit(limit: number): number {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024) {
       throw new IntegrityError("FAIL_CLOSED_STORE_PAGE_SCHEMA", "limit");

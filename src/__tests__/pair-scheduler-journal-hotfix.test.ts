@@ -516,3 +516,47 @@ describe("H8 — sweep quota separation + corrupt-page traversal (R4-F1/F2)", ()
     expect(s.scheduler.nextFairCandidate()).toBe(healthy);
   });
 });
+
+describe("H9 — corruption bursts stay inside the proof budget (R5-F1)", () => {
+  const STATE = "objective_auto_state";
+  const RECEIPT = "objective_auto_receipt";
+  function faultRow(store: PairEvidenceStore, entityId: string) {
+    return store.tryGet(RECEIPT, `integrity_fault:${STATE}:${entityId}`) as
+      Record<string, unknown> | null;
+  }
+
+  for (const n of [80, 96, 128]) {
+    it(`burst ${n}: exclusions commit in bounded chunks; healthy candidate reached`, () => {
+      const s = fresh("h9-" + n);
+      const bid = mkBiz(s.store);
+      const ids: string[] = [];
+      for (let i = 0; i < n + 1; i++) {
+        const o = mkObjective(s, bid); enable(s, oid(o)); s.scheduler.observe(oid(o));
+        ids.push(oid(o));
+      }
+      // divergent ledger (valid hash, missing commit) but payload still
+      // SQL-actionable — all n stay shortlisted and must be faulted
+      for (const id of ids.slice(0, n)) {
+        const row = s.store.tryGet(STATE, id) as Record<string, unknown>;
+        s.store.put(STATE, id, { ...row }, Number(row.version));
+      }
+      const healthy = ids[n]!;
+      s.scheduler.nextFairCandidate(); // cohort-bound refresh commits once
+      let picked: string | null = null;
+      let calls = 0;
+      while (picked !== healthy && calls < 24) {
+        picked = s.scheduler.nextFairCandidate(); // must never throw budget errors
+        calls++;
+      }
+      expect(picked).toBe(healthy);
+      // every corrupt row earned exactly one durable receipt (dedup'd)
+      for (const id of ids.slice(0, n)) {
+        expect(faultRow(s.store, id)?.version).toBe(1);
+      }
+      // durable exclusion — exactly n entity keys quarantined, nothing extra
+      const f = s.store.tryGet("objective_auto_fairness", "LOCAL_PAIR_DB") as
+        Record<string, unknown>;
+      expect((f.faulted_ids as string[]).length).toBe(n);
+    }, 30000);
+  }
+});
