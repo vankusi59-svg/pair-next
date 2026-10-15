@@ -29,30 +29,51 @@ import type { AutomatonConfig, AutomatonIdentity, ComputeClient } from "../types
 import type { WorkerInferenceClient } from "../agent/harness-types.js";
 import {
   ApprovalQueue,
+  assertPlannerCandidateEligible,
+  beginPlannerRun,
   buildCodexPlannerPrompt,
+  dedupePlannerCandidates,
   ExecutorRegistry,
+  finishPlannerRun,
   GovernedTaskGate,
   IntegrityError,
   makeReplanGenerationDriver,
   makeServeCanonicalizer,
   makeServePlanner,
+  markPlannerAttemptReask,
   MissionControl,
+  missionOperatorGoalOf,
   MissionObservability,
   MissionRouter,
   MissionRuntime,
   MissionScheduler,
   MissionSupervisor,
+  ModelEvidenceCatalog,
+  MODEL_ROLE,
+  assignModelRole,
   PairControlPlane,
   PairEvidenceStore,
   PairNativeExecutorAdapter,
   PairNativeWorkerRunner,
+  persistPlannerAttemptStart,
+  plannerCandidateRequestBound,
+  PolicyError,
+  ProviderCatalog,
+  ProviderValidator,
+  qualifyModel,
   ReconciliationService,
   RecoveryController,
   REPLAN_GENERATION_PENDING,
+  ReplanAttemptLedger,
   ReplanGenerationService,
   replanGenerationId,
   replanWorkItemId,
+  runPlannerFailover,
+  settlePlannerAttempt,
   TRANSPORT_IN_PROCESS,
+  validatePlanProposal,
+  type PlannerCandidate,
+  type PlannerInvocation,
   type ReplanGenerationRecord,
 } from "../pair/index.js";
 
@@ -202,7 +223,7 @@ function makeAsyncCtx(
   const gen = new ReplanGenerationService(store, {
     deadlineMs: opts.deadlineMs ?? 1_800_000,
   });
-  const { planner } = makeServePlanner({
+  const { planner, canonicalizeLlmTasks } = makeServePlanner({
     executorCapSets: () => [
       ["FILE_OPERATIONS", "REASONING", REMOTE, "AUTOMATON_TASK_EXECUTION"],
     ],
@@ -347,6 +368,7 @@ function makeAsyncCtx(
     recon, approvals, scheduler, runtime, control, adapters, calls, gen,
     sweep, registerAdapter, registerNativeExecutor, startMission, rt,
     toReplanning, driveGen, generations, attempts, decisions,
+    canonicalizeLlmTasks,
     projectId: String(project.project_id),
   };
 }
@@ -891,5 +913,741 @@ describe("async replan E — structured replan_context reaches both transports",
       allowedCapabilities: ["FILE_OPERATIONS"],
     });
     expect(initial).not.toContain("REPLAN CONTEXT");
+  });
+});
+
+/* ============ F — audit R1: bounded concurrency + stale settlement ===
+ * R1-F1: the driver must run bounded CONCURRENT generations — a stalled
+ *        Mission A can never serialize/starve independent Mission B
+ *        (claim CAS = single-flight authority; per-sweep claim bound =
+ *        concurrency bound; oldest-first = fairness).
+ * R1-F2: settle() and candidate delivery must revalidate deadline,
+ *        active recovery identity and the unresolved candidate slot —
+ *        a cancelled/expired/superseded generation can never become
+ *        consumable even when reconcile() has not yet run. */
+describe("async replan F — audit R1: bounded concurrency + stale-settlement revalidation", () => {
+  const pendingCtxF = async (name: string) => {
+    const ctx = makeAsyncCtx(name, {
+      generate: async () => ({ tasks: altPlan().tasks }),
+    });
+    ctx.registerAdapter(
+      new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }, { status: "COMPLETED" }]),
+      ["FILE_OPERATIONS"],
+    );
+    const mid = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+    ctx.toReplanning(mid);
+    ctx.runtime.tick(mid, fakeClock()()); // mint the durable row
+    expect(ctx.generations()).toHaveLength(1);
+    return { ctx, mid, row: ctx.generations()[0] };
+  };
+  const plannerInputFor = (ctx: ReturnType<typeof makeAsyncCtx>, mid: string, row: ReplanGenerationRecord) =>
+    ({
+      mission: {
+        ...ctx.service.getMission(mid),
+        operator_goal: "governed async replan test mission",
+      },
+      reason: "replan",
+      replan_context: row.replan_context,
+    }) as unknown as RuntimePlannerInput;
+
+  it("F1. bounded concurrency — a stalled Mission A generation cannot starve independent Mission B", async () => {
+    const holder = { a: "", b: "" };
+    let releaseA: () => void = () => {};
+    const gateA = new Promise<void>((r) => {
+      releaseA = r;
+    });
+    const ctx = makeAsyncCtx("f1", {
+      generate: async (gen) => {
+        if (String(gen.mission_id) === holder.a) await gateA;
+        return {
+          tasks: altPlan().tasks,
+          planner_run_id: `PRN_${String(gen.mission_id)}`,
+        };
+      },
+    });
+    ctx.registerAdapter(
+      new ScriptedAdapter("EX_LOCAL", Array.from({ length: 8 }, () => ({ status: "COMPLETED" }))),
+      ["FILE_OPERATIONS"],
+    );
+    const midA = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+    const midB = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+    holder.a = midA;
+    holder.b = midB;
+    ctx.toReplanning(midA);
+    ctx.toReplanning(midB);
+    // A mints FIRST (older created_at → claimed first under the
+    // oldest-first claim order); B mints second.
+    ctx.runtime.tick(midA, fakeClock()());
+    ctx.runtime.tick(midB, fakeClock()());
+    const gens = ctx.generations();
+    const gA = gens.find((g) => g.mission_id === midA)!;
+    const gB = gens.find((g) => g.mission_id === midB)!;
+    const done = ctx.sweep(); // claims + generates concurrently — do not await yet
+    // Let claims + B's immediate generate settle while A is still gated.
+    await new Promise((r) => setTimeout(r, 30));
+    // B's row is claimed in the SAME sweep and settles STAGED while A's
+    // generation is still in flight — sequential awaiting would leave B
+    // unclaimed/PENDING behind A's stalled provider call.
+    expect(String(ctx.gen.get(gB.replan_generation_id)!.status)).toBe("STAGED");
+    expect(String(ctx.gen.get(gA.replan_generation_id)!.status)).toBe("LEASED");
+    releaseA();
+    const out = await done;
+    expect(out.claimed).toEqual(
+      expect.arrayContaining([gA.replan_generation_id, gB.replan_generation_id]),
+    );
+    expect(out.staged).toEqual(
+      expect.arrayContaining([gA.replan_generation_id, gB.replan_generation_id]),
+    );
+    expect(String(ctx.gen.get(gA.replan_generation_id)!.status)).toBe("STAGED");
+  });
+
+  it("F2. settle() revalidates the live recovery chain — a cancelled in-flight generation is CANCELLED at settle, never staged", async () => {
+    const { ctx, mid, row } = await pendingCtxF("f2");
+    const claimed = ctx.gen.claimNext({ owner_id: "w1", lease_ms: 60_000, now_ms: Date.now() });
+    expect(claimed).toBeTruthy();
+    ctx.runtime.cancel(mid, "OP"); // recovery chain moved on — NO reconcile runs
+    const applied = ctx.gen.settle(row.replan_generation_id, "w1", 1, {
+      status: "STAGED",
+      candidate: { tasks: canonPlan(altPlan().tasks) },
+    });
+    expect(applied).toBe(false);
+    expect(String(ctx.gen.get(row.replan_generation_id)!.status)).toBe("CANCELLED");
+  });
+
+  it("F3. settle() revalidates the durable deadline — an expired in-flight generation settles FAILED/TIMEOUT, never STAGED", async () => {
+    const { ctx, row } = await pendingCtxF("f3");
+    ctx.gen.claimNext({ owner_id: "w1", lease_ms: 60_000, now_ms: Date.now() });
+    // The deadline passed while the provider call was in flight
+    // (reconcile has not run — settle itself must refuse the result).
+    const cur = ctx.gen.get(row.replan_generation_id)!;
+    ctx.store.put(
+      "replan_generation",
+      row.replan_generation_id,
+      { ...cur, deadline_at: new Date(Date.now() - 1).toISOString() },
+      Number(cur.version),
+    );
+    const applied = ctx.gen.settle(row.replan_generation_id, "w1", 1, {
+      status: "STAGED",
+      candidate: { tasks: canonPlan(altPlan().tasks) },
+    });
+    expect(applied).toBe(false);
+    const after = ctx.gen.get(row.replan_generation_id)!;
+    expect(after.status).toBe("FAILED");
+    expect(after.outcome?.kind).toBe("TIMEOUT");
+    expect(after.outcome?.code).toBe("REPLAN_GENERATION_DEADLINE");
+  });
+
+  it("F4. settle() revalidates the unresolved candidate slot — a resolved slot CANCELS the row, never stages", async () => {
+    const { ctx, mid, row } = await pendingCtxF("f4");
+    ctx.gen.claimNext({ owner_id: "w1", lease_ms: 60_000, now_ms: Date.now() });
+    // The candidate slot resolved through another authority path while
+    // generation was in flight (durable ledger row for this slot).
+    new ReplanAttemptLedger(ctx.store).record({
+      mission_id: mid,
+      recovery_id: row.recovery_id,
+      attempt_index: row.attempt_index,
+      proposal_digest: "sim",
+      status: "REJECTED_INVALID",
+      rejection_reason: "SIMULATED_EXTERNAL_RESOLUTION",
+    });
+    const applied = ctx.gen.settle(row.replan_generation_id, "w1", 1, {
+      status: "STAGED",
+      candidate: { tasks: canonPlan(altPlan().tasks) },
+    });
+    expect(applied).toBe(false);
+    expect(String(ctx.gen.get(row.replan_generation_id)!.status)).toBe("CANCELLED");
+  });
+
+  it("F5. requestCandidate revalidates the deadline at delivery — an expired STAGED row is never served", async () => {
+    const { ctx, mid, row } = await pendingCtxF("f5");
+    ctx.gen.claimNext({ owner_id: "w1", lease_ms: 60_000, now_ms: Date.now() });
+    expect(
+      ctx.gen.settle(row.replan_generation_id, "w1", 1, {
+        status: "STAGED",
+        candidate: { tasks: canonPlan(altPlan().tasks) },
+      }),
+    ).toBe(true);
+    // Deadline elapsed between staging and serving; no reconcile ran.
+    const cur = ctx.gen.get(row.replan_generation_id)!;
+    ctx.store.put(
+      "replan_generation",
+      row.replan_generation_id,
+      { ...cur, deadline_at: new Date(Date.now() - 1).toISOString() },
+      Number(cur.version),
+    );
+    const err = (() => {
+      try {
+        ctx.gen.requestCandidate(plannerInputFor(ctx, mid, row));
+        return null;
+      } catch (e) {
+        return e as { code?: string };
+      }
+    })();
+    expect(String(err?.code)).toBe("FAIL_CLOSED_REPLAN_PROVIDER_TIMEOUT");
+    const after = ctx.gen.get(row.replan_generation_id)!;
+    expect(after.status).toBe("FAILED");
+    expect(after.outcome?.kind).toBe("TIMEOUT");
+  });
+
+  it("F6. requestCandidate revalidates recovery identity at delivery — a superseded/cancelled chain is never served", async () => {
+    const { ctx, mid, row } = await pendingCtxF("f6");
+    ctx.gen.claimNext({ owner_id: "w1", lease_ms: 60_000, now_ms: Date.now() });
+    expect(
+      ctx.gen.settle(row.replan_generation_id, "w1", 1, {
+        status: "STAGED",
+        candidate: { tasks: canonPlan(altPlan().tasks) },
+      }),
+    ).toBe(true);
+    // The recovery chain moved on: a different recovery now owns
+    // pending_recovery (supersession) — the staged row is orphaned.
+    const rt = ctx.rt(mid);
+    const pending = rt.pending_recovery as Record<string, unknown>;
+    rt.pending_recovery = { ...pending, recovery_id: "RCV_superseded" };
+    ctx.store.put("mission_runtime", String(rt.mission_runtime_id), rt, Number(rt.version));
+    const err = (() => {
+      try {
+        ctx.gen.requestCandidate(plannerInputFor(ctx, mid, row));
+        return null;
+      } catch (e) {
+        return e as { code?: string };
+      }
+    })();
+    expect(String(err?.code)).toBe("FAIL_CLOSED_REPLAN_PROVIDER_UNAVAILABLE");
+    expect(String(ctx.gen.get(row.replan_generation_id)!.status)).toBe("CANCELLED");
+  });
+
+  it("F7. requestCandidate revalidates the unresolved slot at delivery — a resolved STAGED row converges CONSUMED, never served twice", async () => {
+    const { ctx, mid, row } = await pendingCtxF("f7");
+    ctx.gen.claimNext({ owner_id: "w1", lease_ms: 60_000, now_ms: Date.now() });
+    expect(
+      ctx.gen.settle(row.replan_generation_id, "w1", 1, {
+        status: "STAGED",
+        candidate: { tasks: canonPlan(altPlan().tasks) },
+      }),
+    ).toBe(true);
+    // The slot was durably resolved by another authority path while the
+    // staged candidate sat unread. attemptsUsed now addresses the NEXT
+    // slot — the stale STAGED row is unreachable as a serve target, and
+    // the delivery seam itself converges it terminal (reconcile has NOT
+    // run): the staged bytes can never be consumed.
+    new ReplanAttemptLedger(ctx.store).record({
+      mission_id: mid,
+      recovery_id: row.recovery_id,
+      attempt_index: row.attempt_index,
+      proposal_digest: "sim",
+      status: "REJECTED_INVALID",
+      rejection_reason: "SIMULATED_EXTERNAL_RESOLUTION",
+    });
+    const err = (() => {
+      try {
+        ctx.gen.requestCandidate(plannerInputFor(ctx, mid, row));
+        return null;
+      } catch (e) {
+        return e as { code?: string };
+      }
+    })();
+    // The request resolves to the NEXT unresolved slot — a fresh
+    // generation row was minted and is PENDING (no failure).
+    expect(String(err?.code)).toBe("REPLAN_GENERATION_PENDING");
+    // The stale staged row converged CONSUMED at the delivery seam —
+    // reconcile() never ran — and it can never be served again.
+    expect(String(ctx.gen.get(row.replan_generation_id)!.status)).toBe("CONSUMED");
+    const fresh = ctx.generations().find(
+      (g) => g.recovery_id === row.recovery_id && g.attempt_index === 1,
+    );
+    expect(fresh).toBeTruthy();
+    expect(String(fresh!.status)).toBe("PENDING");
+  });
+});
+
+/* ============ G — audit R1: zero-budget authority =====================
+ * R1-F3: independent verification of canonical Objective ZERO_BUDGET
+ * and auto-policy cap behavior at the planner admission seam —
+ * cap=0 hard-blocks any positive envelope AND any unprovable charge,
+ * admits a provable $0 envelope as a bounded CAPPED reservation, and an
+ * absent policy cap resolves UNCAPPED (no monetary authority exists).
+ * PR #117 hard-block semantics are preserved verbatim — these tests
+ * pin behavior, they do not relax it. */
+describe("async replan G — audit R1: zero-budget authority at the admission seam", () => {
+  /** Canonical objective lineage without a mission: work_item(objective
+   *  claim) → workforce_allocation → objective_auto_policy (optional).
+   *  `cap === undefined` leaves the policy row absent. */
+  const lineageCtx = (name: string, cap?: number) => {
+    const ctx = makeAsyncCtx(name, {
+      generate: async () => ({ tasks: altPlan().tasks }),
+    });
+    ctx.store.put("work_item", `WI_${name}`, {
+      work_item_id: `WI_${name}`, business_id: "B1", department: "ops",
+      goal: "governed async replan test mission", objective_id: `OBJ_${name}`,
+      status: "OPEN", version: 0,
+    });
+    ctx.store.put("workforce_allocation", `WAL_${name}`, {
+      workforce_allocation_id: `WAL_${name}`, objective_id: `OBJ_${name}`,
+      workstream_work_item_id: `WI_${name}`, delegated_child_work_item_id: null,
+      status: "ACTIVE", version: 0,
+    });
+    if (cap !== undefined) {
+      ctx.store.put("objective_auto_policy", `oap:OBJ_${name}`, {
+        objective_auto_policy_id: `oap:OBJ_${name}`, objective_id: `OBJ_${name}`,
+        limits: { budget_microusd_cap: cap }, version: 0,
+      });
+    }
+    return { ctx, wi: `WI_${name}`, obj: `OBJ_${name}` };
+  };
+
+  it("G1. ZERO_BUDGET: cap=0 + positive envelope → FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED", () => {
+    const { ctx, wi } = lineageCtx("g1", 0);
+    expect(
+      ctx.service.cost.objectiveScopeForWorkItem(wi),
+    ).toEqual({ objective_id: "OBJ_g1", cap: 0 });
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_g1", work_item_id: wi,
+        est_microusd: 1, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED" }) as never,
+    );
+    expect(ctx.store.list("cost_reservation")).toHaveLength(0);
+  });
+
+  it("G2. ZERO_BUDGET + provable zero-cost candidate: est=0 admits under CAPPED scope with a 0µUSD reservation — never silently free", () => {
+    const { ctx, wi } = lineageCtx("g2", 0);
+    const out = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_g2", work_item_id: wi,
+      est_microusd: 0, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(out.scope).toBe("CAPPED");
+    expect(out.objective_id).toBe("OBJ_g2");
+    const r = ctx.store.get("cost_reservation", String(out.reservation_id));
+    expect(Number(r.reserved_microusd)).toBe(0);
+    expect(String(r.billing_mode)).toBe("UNMETERED");
+    expect(String(r.status)).toBe("HELD");
+  });
+
+  it("G3. ZERO_BUDGET + unprovable cost: unbounded_unknown under cap=0 fails closed UNVERIFIED — an unprovable charge is never $0", () => {
+    const { ctx, wi } = lineageCtx("g3", 0);
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_g3", work_item_id: wi,
+        est_microusd: 0, unbounded_unknown: true, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED" }) as never,
+    );
+    expect(ctx.store.list("cost_reservation")).toHaveLength(0);
+  });
+
+  it("G4. absent auto-policy cap: lineage resolves UNCAPPED — no monetary authority exists; the bounded envelope is still reserved", () => {
+    const { ctx, wi } = lineageCtx("g4"); // no objective_auto_policy row
+    expect(ctx.service.cost.objectiveScopeForWorkItem(wi)).toEqual({
+      objective_id: "OBJ_g4", cap: null,
+    });
+    const out = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_g4", work_item_id: wi,
+      est_microusd: 100, unbounded_unknown: true, candidates: 1,
+      actor: "TEST",
+    });
+    expect(out.scope).toBe("UNCAPPED");
+    const r = ctx.store.get("cost_reservation", String(out.reservation_id));
+    expect(Number(r.reserved_microusd)).toBe(100);
+    expect(r.unbounded).toBe(true);
+  });
+
+  it("G5. no lineage claim at all → scope NONE, zero reservation rows", () => {
+    const { ctx } = lineageCtx("g5", 0);
+    const noWi = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_g5a", work_item_id: null,
+      est_microusd: 5, candidates: 1, actor: "TEST",
+    });
+    expect(noWi).toEqual({ reservation_id: null, scope: "NONE", objective_id: null });
+    // A work item carrying NO objective claim and no allocation →
+    // genuinely unscoped, not broken.
+    ctx.store.put("work_item", "WI_free", {
+      work_item_id: "WI_free", business_id: "B1", department: "ops",
+      goal: "x", objective_id: null, status: "OPEN", version: 0,
+    });
+    const free = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_g5b", work_item_id: "WI_free",
+      est_microusd: 5, candidates: 1, actor: "TEST",
+    });
+    expect(free.scope).toBe("NONE");
+    expect(free.reservation_id).toBeNull();
+    expect(ctx.store.list("cost_reservation")).toHaveLength(0);
+  });
+
+  it("G6. integrated: a zero-cost replan candidate under ZERO_BUDGET stages + commits through the governed path (bounded, not silent)", async () => {
+    let admissionScope: string | null = null;
+    const ctx = makeAsyncCtx("g6", {
+      generate: async (gen) => {
+        const mission = ctx.service.getMission(String(gen.mission_id));
+        // The REAL admission seam — work_item_id is what production's
+        // runReplanPoolGeneration obtains from replanWorkItemId(); the
+        // mission→binding→work_item hop itself is pinned by D6/D7.
+        // Passing the resolved id keeps this test on the REAL
+        // objective-lineage walk (WI→allocation→auto-policy cap)
+        // without fabricating a bound mission whose external-input
+        // lineage (assertWorkforceAllocation) cannot be hand-minted.
+        const a = ctx.service.cost.admitPlannerInvocation({
+          planner_run_id: "PRN_g6",
+          work_item_id: mission.bound_open_id != null
+            ? replanWorkItemId(ctx.store, mission)
+            : "WI_g6",
+          est_microusd: 0, unbounded_unknown: false, candidates: 1,
+          actor: "PAIR_REPLAN_GENERATION",
+        });
+        admissionScope = a.scope;
+        return { tasks: altPlan().tasks, planner_run_id: "PRN_g6" };
+      },
+    });
+    ctx.registerAdapter(
+      new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }, { status: "COMPLETED" }]),
+      ["FILE_OPERATIONS"],
+    );
+    // Canonical Objective lineage with a ZERO_BUDGET auto-policy —
+    // real rows, real objectiveScopeForWorkItem walk.
+    ctx.store.put("work_item", "WI_g6", {
+      work_item_id: "WI_g6", business_id: "B1", department: "ops",
+      goal: "governed async replan test mission", objective_id: "OBJ_g6",
+      status: "OPEN", version: 0,
+    });
+    ctx.store.put("workforce_allocation", "WAL_g6", {
+      workforce_allocation_id: "WAL_g6", objective_id: "OBJ_g6",
+      workstream_work_item_id: "WI_g6", delegated_child_work_item_id: null,
+      status: "ACTIVE", version: 0,
+    });
+    ctx.store.put("objective_auto_policy", "oap:OBJ_g6", {
+      objective_auto_policy_id: "oap:OBJ_g6", objective_id: "OBJ_g6",
+      limits: { budget_microusd_cap: 0 }, version: 0,
+    });
+    const mid = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+    const state = await ctx.driveGen(mid);
+    expect(state).toBe("COMPLETED");
+    expect(admissionScope).toBe("CAPPED");
+    const r = ctx.store.get("cost_reservation", "CRSV_PLN_PRN_g6");
+    expect(Number(r.reserved_microusd)).toBe(0);
+    expect(String(r.billing_mode)).toBe("UNMETERED");
+    // The replan committed through the same atomic gates.
+    expect(ctx.attempts(mid).map((a) => a.status)).toEqual(["ACCEPTED"]);
+    expect(ctx.store.planRevisions(mid)).toHaveLength(2);
+  });
+});
+
+/* ============ H — production composition integration (audit R1-F4) ===
+ * Coverage boundary: sections A–G drive the driver with an INJECTED
+ * `generate` seam (synthetic E2E). This section composes the REAL
+ * production stack — beginPlannerRun → cost admission (canonical
+ * objective lineage) → runPlannerFailover with the real
+ * assertPlannerCandidateEligible + canonicalize + validatePlanProposal
+ * winner gate + durable planner_run/planner_attempt evidence →
+ * finishPlannerRun → settlePlannerInvocation — with ONLY the model
+ * transport stubbed (planFn), mirroring serve-mission-control.mjs's
+ * runReplanPoolGeneration + planExpander seam-for-seam. */
+
+/** Canonical catalog seed for an HTTP planner candidate — the SAME real
+ *  seams production discovery/qualification use (provider candidate →
+ *  validateAccess probe → qualify → model claim → probe receipt →
+ *  qualifyModel → PLANNER_COORDINATOR role). Only the wire is faked. */
+async function seedHttpPlannerCandidate(store: PairEvidenceStore): Promise<PlannerCandidate> {
+  const pid = "planner-http";
+  const mid = "gpt-x";
+  new ProviderCatalog(store).upsertCandidate(
+    {
+      provider_native_id: pid, canonical_hint: pid, source_id: "OPERATOR_MANIFEST",
+      display_name: pid, provider_type: "OPENAI_COMPATIBLE",
+      protocol_family: "OPENAI_COMPATIBLE", provider_family: pid,
+      endpoint_reference: `https://api.${pid}.test/v1`,
+      credential_reference_name: "PLANNER_HTTP_KEY",
+    },
+    "TEST",
+  );
+  const pv = new ProviderValidator(store);
+  await pv.validateAccess(pid, {
+    env: { PLANNER_HTTP_KEY: "cred" },
+    probe: async () => ({ outcome: "AUTH_OK", latency_ms: 1 }),
+  });
+  pv.qualify(pid, { env: { PLANNER_HTTP_KEY: "cred" }, actor: "TEST" });
+  const mcat = new ModelEvidenceCatalog(store);
+  const { entry } = mcat.upsertModelClaim({
+    provider_id: pid, provider_family: pid, model_id: mid,
+    display_name: mid, capability_hints: ["text_inference"],
+    status_hint: "LISTED", observed_at: "2026-01-01T00:00:00Z",
+  });
+  const meId = String(entry.model_entry_id);
+  mcat.recordProbeReceipt({
+    probe_id: `PRB_${pid}_${mid}`, model_entry_id: meId, provider_id: pid,
+    result: "PASS", probe_type: "text_inference",
+    capability_evidence: { text_inference: "PASS" },
+    latency_ms: 1, detail: "fixture",
+  });
+  qualifyModel(store, meId, { capability_scope: ["text_inference"], actor: "TEST" });
+  assignModelRole(store, meId, MODEL_ROLE.PLANNER_COORDINATOR, { actor: "TEST" });
+  return {
+    model_entry_id: meId, ref: `${pid}:${mid}`, provider: pid, model: mid,
+    endpoint: "https://api.planner-http.test/v1",
+    credentialEnv: "PLANNER_HTTP_KEY", transport: "openai_http",
+  };
+}
+
+/** Seam-for-seam mirror of serve-mission-control.mjs's
+ *  runReplanPoolGeneration — every governance seam is REAL; only the
+ *  model transport (`planFn`) is stubbed. */
+function makeProdCompositionGenerate(
+  ctx: ReturnType<typeof makeAsyncCtx>,
+  plannerCandidates: PlannerCandidate[],
+  stubPlanFn: (
+    c: PlannerCandidate,
+    invocation: PlannerInvocation,
+  ) => Promise<{ tasks: Array<Record<string, unknown>>; warnings: string[] }>,
+  /** Test hook — each REAL admitPlannerInvocation result, for assertions
+   *  on scope/reservation without touching the seam itself. */
+  seenAdmissions?: Array<{ reservation_id: string | null; scope: string; objective_id: string | null }>,
+): GenerateFn {
+  return async (gen) => {
+    const mission = ctx.service.getMission(String(gen.mission_id));
+    const goal = String(mission.goal ?? "");
+    const authorityGoal = missionOperatorGoalOf(ctx.store, mission);
+    const externalInputs =
+      ctx.service.artifactResolver.listEligibleExternalInputSources(mission);
+    const candidates = dedupePlannerCandidates(plannerCandidates);
+    const run = beginPlannerRun(ctx.store, {
+      project_id: mission.project_id != null ? String(mission.project_id) : undefined,
+      operator_id: mission.operator_id,
+      routes: candidates.map((c) => c.ref),
+      actor: "PAIR_REPLAN_GENERATION",
+    });
+    const deadlineAt = Math.min(
+      Date.now() + 60_000,
+      Date.parse(String(gen.deadline_at)),
+    );
+    let admission: {
+      reservation_id: string | null;
+      scope: string;
+      objective_id: string | null;
+    } | null = null;
+    try {
+      admission = ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: String(run.planner_run_id),
+        work_item_id: replanWorkItemId(ctx.store, mission),
+        est_microusd: candidates.reduce((sum, c) => {
+          const b = ctx.service.cost.plannerRequestBoundMicrousd(c);
+          return sum + b.per_request_microusd * plannerCandidateRequestBound(c);
+        }, 0),
+        unbounded_unknown: candidates.some(
+          (c) => ctx.service.cost.plannerRequestBoundMicrousd(c).billing.unbounded,
+        ),
+        candidates: candidates.length,
+        actor: "PAIR_REPLAN_GENERATION",
+      });
+      if (admission) seenAdmissions?.push(admission);
+      const knownCaps = () =>
+        new Set(ctx.store.list("capability").map((c) => String(c.capability_id)));
+      const res = await runPlannerFailover({
+        candidates,
+        // Real canonical eligibility: role + lifecycle + provider gates.
+        assertEligible: (c) =>
+          assertPlannerCandidateEligible(ctx.store, c.model_entry_id),
+        // Real ONE canonicalize seam + validatePlanProposal winner gate.
+        canonicalize: (tasks, _c, evidence) => {
+          const canon = ctx.canonicalizeLlmTasks(tasks, goal, {
+            provenance: "fresh",
+            authorityGoal,
+            raw_delivery_emission_count: evidence?.raw_delivery_emission_count,
+            raw_delivery_emission_state: evidence?.raw_delivery_emission_state,
+            external_input_artifacts: externalInputs,
+          });
+          validatePlanProposal({ tasks: canon }, knownCaps());
+          return canon;
+        },
+        planFn: stubPlanFn, // ← the ONLY stub: the model transport
+        latencyBudget: () => ({ ceilingMs: 10_000, requestTimeoutMs: 5_000 }),
+        onAttemptStart: (base) =>
+          persistPlannerAttemptStart(ctx.store, {
+            planner_run_id: String(run.planner_run_id),
+            record: base, actor: "PAIR_REPLAN_GENERATION",
+          }).planner_attempt_id,
+        onAttemptReask: (paid, code) =>
+          markPlannerAttemptReask(ctx.store, {
+            planner_attempt_id: String(paid),
+            validation_code: String(code), actor: "PAIR_REPLAN_GENERATION",
+          }),
+        onAttemptEnd: (paid, rec) =>
+          settlePlannerAttempt(ctx.store, {
+            planner_attempt_id: String(paid), record: rec,
+            winner: rec.outcome === "SUCCESS", actor: "PAIR_REPLAN_GENERATION",
+          }),
+        onExhausted: () =>
+          finishPlannerRun(ctx.store, {
+            planner_run_id: String(run.planner_run_id),
+            outcome: "EXHAUSTED", actor: "PAIR_REPLAN_GENERATION",
+          }),
+        deadlineMs: deadlineAt,
+      });
+      finishPlannerRun(ctx.store, {
+        planner_run_id: String(run.planner_run_id),
+        outcome: "WINNER_SELECTED",
+        winner_attempt_no: res.winner.attempt_no,
+        actor: "PAIR_REPLAN_GENERATION",
+      });
+      if (admission.reservation_id) {
+        ctx.service.cost.settlePlannerInvocation(admission.reservation_id, "CALLS_MADE", null);
+      }
+      return { tasks: res.tasks, planner_run_id: String(run.planner_run_id) };
+    } catch (e) {
+      if (!(e instanceof IntegrityError && e.code === "FAIL_CLOSED_PLANNER_EXHAUSTED")) {
+        finishPlannerRun(ctx.store, {
+          planner_run_id: String(run.planner_run_id),
+          outcome: "FAILED",
+          error_code:
+            e instanceof IntegrityError || e instanceof PolicyError
+              ? e.code : "REQUEST_ERROR",
+          actor: "PAIR_REPLAN_GENERATION",
+        });
+      }
+      if (admission?.reservation_id) {
+        const settled = ctx.store.tryGet("planner_run", String(run.planner_run_id));
+        ctx.service.cost.settlePlannerInvocation(
+          admission.reservation_id,
+          Number(settled?.provider_requests ?? settled?.attempts ?? 0) > 0
+            ? "CALLS_MADE" : "NO_CALLS",
+        );
+      }
+      (e as { planner_run_id?: string }).planner_run_id = String(run.planner_run_id);
+      throw e;
+    }
+  };
+}
+
+describe("async replan H — production composition integration (stub transport only)", () => {
+  it("H1. real pool + real cost admission + real driver + real runtime: REPLAN → staged pool winner → atomic commit", async () => {
+    const ctx = makeAsyncCtx("h1", {
+      // Rebound below — generate needs ctx + the seeded candidate first.
+      generate: async () => ({ tasks: [] }),
+    });
+    const candidate = await seedHttpPlannerCandidate(ctx.store);
+    // A provable-bounded planner cost profile so the reservation is
+    // METERED_API (per-request bound × request-count bound envelope).
+    ctx.service.cost.createCostProfile(
+      { ref_type: "executor", ref_id: "PAIR_PLANNER", billing_mode: "METERED_API", reserve_microusd: 250 },
+      "TEST",
+    );
+    const transportCalls: Array<{ model: string; kind: string | undefined }> = [];
+    const seenAdmissions: Array<{ scope: string; reservation_id: string | null }> = [];
+    const gen = makeProdCompositionGenerate(ctx, [candidate], async (c, invocation) => {
+      // Stubbed model transport — reports ONE provable provider request
+      // through the pool-owned counter, then returns raw model output.
+      if (invocation.providerCounter) invocation.providerCounter.requests += 1;
+      transportCalls.push({ model: c.model, kind: invocation.kind });
+      return { tasks: altPlan().tasks, warnings: [] };
+    }, seenAdmissions);
+    const sweep = makeReplanGenerationDriver({
+      service: ctx.gen, generate: gen, owner_id: "prod-it",
+      lease_ms: 60_000,
+    });
+    ctx.registerAdapter(
+      new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }, { status: "COMPLETED" }]),
+      ["FILE_OPERATIONS"],
+    );
+    // Unbound mission — the production manual-mission path: the REAL
+    // admission seam runs the real lineage resolver and correctly
+    // scopes NONE (reservation coverage lives in G-series at the same
+    // seam; bound-mission lineage cannot be hand-fabricated — see G6).
+    const mid = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+    const clock = fakeClock();
+    let state = "";
+    for (let i = 0; i < 200; i++) {
+      ctx.runtime.tick(mid, clock());
+      await sweep();
+      await new Promise((r) => setTimeout(r, 15));
+      state = String(ctx.rt(mid).state);
+      if (["ABORTED", "FAILED", "COMPLETED", "WAITING_APPROVAL"].includes(state)) break;
+    }
+    // The REAL composition proof ends at the governed commit boundary:
+    // generation → real pool winner → staged → atomic PREPARED→ACCEPTED
+    // commit → plan_revision 2. Post-commit dispatch of the real
+    // canonicalized plan's injected T1 AUTOMATON_TASK_EXECUTION
+    // bookkeeping task cannot complete in THIS fixture — no AUTOMATON
+    // executor is registered (the PAIR_NATIVE path is the registered
+    // win32 artifact-ingest baseline A7b exercises) — so the mission
+    // deterministically aborts DOWNSTREAM of the commit, on the
+    // executor-routing path the composition under test does not own.
+    // Resume→COMPLETED of a committed replan is separately proven by D1.
+    expect(state).toBe("ABORTED");
+    const rt = ctx.rt(mid);
+    expect(String(rt.state)).toBe("ABORTED");
+    // The governed outcome that matters: REPLAN selected → committed.
+    expect(ctx.attempts(mid).map((a) => a.status)).toEqual(["ACCEPTED"]);
+    expect(ctx.store.planRevisions(mid)).toHaveLength(2);
+    expect(String(ctx.service.getMission(mid).plan_revision)).toBe("2");
+    // Durable production evidence: run WINNER_SELECTED, one SUCCESS
+    // attempt with exactly 1 provable provider request.
+    const runs = ctx.store.list("planner_run");
+    expect(runs.map((r) => r.state)).toEqual(["WINNER_SELECTED"]);
+    const atts = ctx.store.list("planner_attempt");
+    expect(atts).toHaveLength(1);
+    expect(String(atts[0].outcome)).toBe("SUCCESS");
+    expect(Number(atts[0].provider_requests)).toBe(1);
+    expect(transportCalls.length).toBeGreaterThanOrEqual(1);
+    // Real cost admission ran the canonical lineage resolver: unbound
+    // mission → scope NONE, no reservation (the manual-mission path
+    // unchanged; capped/uncapped reservation flows are pinned by
+    // G1–G6 at the same admitPlannerInvocation seam).
+    expect(seenAdmissions.map((a) => a.scope)).toEqual(["NONE"]);
+    expect(seenAdmissions[0].reservation_id).toBeNull();
+    // Scope NONE creates NO reservation row for this planner run.
+    expect(
+      ctx.store.list("cost_reservation").filter(
+        (r) =>
+          String(r.cost_reservation_id) ===
+          `CRSV_PLN_${String(runs[0].planner_run_id)}`,
+      ),
+    ).toHaveLength(0);
+    // The generation converged CONSUMED via reconcile.
+    await sweep();
+    const g = ctx.generations()[0];
+    expect(String(g.status)).toBe("CONSUMED");
+    expect(String(g.planner_run_id)).toBe(String(runs[0].planner_run_id));
+  });
+
+  it("H2. real pool: stub transport emits an invalid plan → PLAN_INVALID failover → EXHAUSTED → REPLAN infeasible (no slot consumed)", async () => {
+    const ctx = makeAsyncCtx("h2", { generate: async () => ({ tasks: [] }) });
+    const candidate = await seedHttpPlannerCandidate(ctx.store);
+    const gen = makeProdCompositionGenerate(ctx, [candidate], async (_c, invocation) => {
+      if (invocation.providerCounter) invocation.providerCounter.requests += 1;
+      // Invalid output: required_capabilities empty → canonicalize /
+      // validatePlanProposal rejects → failover → pool exhausted.
+      return {
+        tasks: [{ task_key: "T1", title: "x", task_instruction: "x", required_capabilities: [], depends_on: [] }],
+        warnings: [],
+      };
+    });
+    const sweep = makeReplanGenerationDriver({
+      service: ctx.gen, generate: gen, owner_id: "prod-it",
+      lease_ms: 60_000,
+    });
+    ctx.registerAdapter(
+      new ScriptedAdapter("EX_LOCAL", [{ status: "COMPLETED" }]),
+      ["FILE_OPERATIONS"],
+    );
+    const mid = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+    const clock = fakeClock();
+    let state = "";
+    for (let i = 0; i < 200; i++) {
+      ctx.runtime.tick(mid, clock());
+      await sweep();
+      await new Promise((r) => setTimeout(r, 15));
+      state = String(ctx.rt(mid).state);
+      if (["ABORTED", "FAILED", "COMPLETED", "WAITING_APPROVAL"].includes(state)) break;
+    }
+    expect(state).toBe("ABORTED");
+    const g = ctx.generations()[0];
+    expect(g.status).toBe("FAILED");
+    expect(g.outcome?.kind).toBe("EXHAUSTED");
+    expect(ctx.attempts(mid)).toHaveLength(0);
+    const runs = ctx.store.list("planner_run");
+    expect(String(runs[0].state)).toBe("EXHAUSTED");
   });
 });

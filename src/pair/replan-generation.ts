@@ -331,6 +331,25 @@ export class ReplanGenerationService {
       );
     }
     const recoveryId = ctx.recovery_id;
+    // AUDIT R1-F2 — delivery-seam convergence: before serving, converge
+    // every still-live sibling generation bound to THIS recovery whose
+    // slot resolved, whose chain moved, or whose deadline passed. The
+    // durable ledger moves attemptsUsed past a resolved slot, so a stale
+    // STAGED row becomes unreachable — commit its terminal state HERE,
+    // inside one transaction, even when reconcile() has not run.
+    const nowMs = Date.now();
+    this.store.immediate(() => {
+      for (const sib of this.store
+        .list<ReplanGenerationRecord>(REPLAN_GENERATION_ENTITY)
+        .filter(
+          (r) =>
+            r.mission_id === missionId &&
+            r.recovery_id === recoveryId &&
+            !TERMINAL_GENERATION.has(r.status),
+        )) {
+        this.revalidateLive(sib, nowMs);
+      }
+    });
     const ledger = this.ledger();
     const attemptIndex = ledger.attemptsUsed(recoveryId);
     const id = replanGenerationId(recoveryId, attemptIndex);
@@ -400,13 +419,79 @@ export class ReplanGenerationService {
           id,
         );
         if (existing == null) throw err;
-        this.assertBinding(existing, input, attemptIndex);
-        return this.serveOrThrow(existing);
+        return this.serveExisting(id, input, attemptIndex);
       }
       throw new PolicyError(REPLAN_GENERATION_PENDING, `${id}:requested`);
     }
-    this.assertBinding(row, input, attemptIndex);
-    return this.serveOrThrow(row);
+    return this.serveExisting(id, input, attemptIndex);
+  }
+
+  /** Delivery-side revalidation (AUDIT R1-F2): a durable row may only
+   *  serve a staged candidate (or hold PENDING) while it is STILL the
+   *  live authority — the recovery chain still names it, its candidate
+   *  slot is still unresolved, and its deadline has not passed. A row
+   *  that went stale between sweeps transitions terminal HERE, at
+   *  delivery, inside the same atomic re-read — reconciliation is an
+   *  accelerator, never the gate. */
+  private serveExisting(
+    generationId: string,
+    input: RuntimePlannerInput,
+    attemptIndex: number,
+  ): {
+    tasks: Array<Record<string, unknown>>;
+    canonical: true;
+    plan_source: string;
+    planner_run_id: string | null;
+  } {
+    // Revalidation writes and candidate serving must NOT share one
+    // transaction: serveOrThrow throws to the caller, and a throw inside
+    // store.immediate rolls the terminal transition back — the row would
+    // stay STAGED while reporting failure. Commit revalidation first,
+    // THEN decide on the fresh durable row.
+    const fresh = this.store.immediate(() => {
+      const row = this.store.tryGet<ReplanGenerationRecord>(
+        REPLAN_GENERATION_ENTITY,
+        generationId,
+      );
+      if (row == null) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_REPLAN_GENERATION_BINDING",
+          `${generationId}:missing`,
+        );
+      }
+      this.assertBinding(row, input, attemptIndex);
+      if (!TERMINAL_GENERATION.has(row.status)) {
+        this.revalidateLive(row, Date.now());
+      }
+      return (
+        this.store.tryGet<ReplanGenerationRecord>(
+          REPLAN_GENERATION_ENTITY,
+          generationId,
+        ) ?? row
+      );
+    });
+    return this.serveOrThrow(fresh);
+  }
+
+  /** Shared stale-settlement revalidation for one live (non-terminal)
+   *  row, run inside the caller's transaction and mutating `row` to the
+   *  fresh terminal state. Order mirrors reconcile()/claimNext(). */
+  private revalidateLive(row: ReplanGenerationRecord, nowMs: number): void {
+    if (this.slotResolved(row)) {
+      const to = row.status === "STAGED" ? "CONSUMED" : "CANCELLED";
+      this.transition(row, to, "slot_resolved");
+      return;
+    }
+    if (!this.wanted(row)) {
+      this.transition(row, "CANCELLED", "recovery_chain_moved");
+      return;
+    }
+    if (nowMs >= Date.parse(row.deadline_at)) {
+      this.transition(row, "FAILED", "deadline_exceeded", {
+        kind: "TIMEOUT",
+        code: "REPLAN_GENERATION_DEADLINE",
+      });
+    }
   }
 
   /** Exact-identity proof: a re-request under a different mission /
@@ -732,6 +817,20 @@ export class ReplanGenerationService {
       ) {
         return false;
       }
+      // AUDIT R1-F2 — a matching lease is necessary but NOT sufficient
+      // authority to become consumable: re-prove the row is still live
+      // (unresolved slot, live recovery chain, unexpired deadline)
+      // INSIDE this transaction. A cancelled, superseded or expired
+      // in-flight generation transitions terminal NOW — its result is
+      // dropped, never staged — even when reconcile() has not run.
+      const before = row.status;
+      this.revalidateLive(row, Date.now());
+      if (this.store.tryGet<ReplanGenerationRecord>(
+        REPLAN_GENERATION_ENTITY,
+        generationId,
+      )!.status !== before) {
+        return false;
+      }
       const updated: ReplanGenerationRecord = {
         ...row,
         status: result.status,
@@ -843,6 +942,15 @@ export function makeReplanGenerationDriver(
       cancelled: rec.cancelled,
       consumed: rec.consumed,
     };
+    // AUDIT R1-F1 — bounded concurrency, not sequential awaiting: claim
+    // the whole bound UP FRONT (oldest-first = fairness; the durable CAS
+    // lease + epoch stays the single-flight authority), then run every
+    // claimed generation CONCURRENTLY. A stalled Mission A provider call
+    // can no longer serialize the claims behind it — independent rows
+    // are claimed and generated in parallel, and settle() independently
+    // revalidates before staging so a late finisher can never stage
+    // stale output. Concurrency bound = claim bound (≤16).
+    const claimed: ReplanGenerationRecord[] = [];
     for (let i = 0; i < bound; i++) {
       const gen = deps.service.claimNext({
         owner_id: deps.owner_id,
@@ -850,7 +958,11 @@ export function makeReplanGenerationDriver(
         now_ms: nowMs(),
       });
       if (gen == null) break;
+      claimed.push(gen);
       out.claimed.push(gen.replan_generation_id);
+    }
+    await Promise.all(
+      claimed.map(async (gen) => {
       try {
         const res = await deps.generate(gen);
         const tasks = Array.isArray(res?.tasks) ? res.tasks : [];
@@ -895,7 +1007,8 @@ export function makeReplanGenerationDriver(
         );
         if (applied) out.failed.push(gen.replan_generation_id);
       }
-    }
+      }),
+    );
     return out;
   };
 }

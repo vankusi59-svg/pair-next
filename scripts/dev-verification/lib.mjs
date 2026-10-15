@@ -521,13 +521,18 @@ export const TOLERATED_FAILURES = [
     platform: "win32",
     note: "win32 artifact-materialization baseline (secureReadContained needs /proc/self/fd; dir fsync EPERM) — identical on BASE" },
   { file: `${T}pair-p0-win32-codex.test.ts`,
-    pattern: /.+/, max: 1,
+    pattern: /^C2 real ingest: the workspace artifact ACCEPTED via canonical authority$/,
+    max: 1,
     platform: "win32",
-    note: "win32 artifact-materialization baseline (secureReadContained needs /proc/self/fd; dir fsync EPERM) — identical on BASE a8a3ca6 (measured: C2 only)" },
+    note: "win32 ingest baseline — ONLY C2 (secureReadContained ingest seam unproven on this host); identical on BASE a8a3ca6" },
   { file: `${T}pair-p0-win32-runtime.test.ts`,
-    pattern: /.+/, max: 28,
+    // Exactly the 28 observed failures — A8/A9/A15/B4 PASS on this host
+    // (paths that never touch the opened-object ingest seam) and stay
+    // unmasked: a regression there is a real signal, not a baseline.
+    pattern: /^(A[1-7]|A1[0-4]|B[1-3]|B5|C[1-9]|C1[0-2]) /,
+    max: 28,
     platform: "win32",
-    note: "win32 artifact-materialization baseline (secureReadContained needs /proc/self/fd; dir fsync EPERM) — identical on BASE a8a3ca6 (measured: 28)" },
+    note: "win32 ingest baseline — secureReadContained/handle-bound materialization unproven on this host; identical on BASE a8a3ca6 (measured: 28)" },
   { file: `${T}pair-p10.test.ts`,
     pattern: /.+/, max: 10,
     platform: "win32",

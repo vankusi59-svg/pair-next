@@ -1331,17 +1331,19 @@ const replanGenerationSweep = replanGeneration
       max_claims_per_sweep: 4,
     })
   : null;
-let replanGenerationBusy = false;
+// AUDIT R1-F1 — no busy-flag serialization: overlapping sweeps are
+// safe and REQUIRED for fairness. The durable CAS lease + epoch is the
+// single-flight authority (a second sweep cannot claim an in-flight
+// row; it claims only newly-due pending rows), claimNext skips live
+// leases, and settle() revalidates deadline/recovery/slot inside its
+// transaction so a stale result can never stage. Serializing sweeps
+// behind one stalled generation would let a slow Mission A starve
+// Mission B's freshly-minted pending row.
 const driveReplanGenerations = () => {
-  if (!replanGenerationSweep || replanGenerationBusy) return;
-  replanGenerationBusy = true;
-  replanGenerationSweep()
-    .catch((e) =>
-      console.error("replan-generation:", String(e).slice(0, 200)),
-    )
-    .finally(() => {
-      replanGenerationBusy = false;
-    });
+  if (!replanGenerationSweep) return;
+  replanGenerationSweep().catch((e) =>
+    console.error("replan-generation:", String(e).slice(0, 200)),
+  );
 };
 const uiDir = process.env.PAIR_MC_UI_DIR ?? path.join(root, "apps/mission-control-ui/dist");
 const server = createMissionControlServer({
