@@ -1236,19 +1236,35 @@ export class CostService {
            * outstanding HELD/COMMITTED reservations already encumber
            * the remaining ceiling, and this check must reconcile them
            * inside the same atomic admission txn or two 80µ planners
-           * both pass under ceiling=100. SETTLED rows are excluded —
-           * their spend is already the canonical consumed_microusd
-           * authority (counting them again would double-count), and
-           * RELEASED rows carry no encumbrance. */
+           * both pass under ceiling=100. RELEASED rows carry no
+           * encumbrance. SETTLED rows need care: their spend is a REAL
+           * liability, but settlePlannerInvocation/settleFromResult can
+           * settle without any canonical spend event landing — so a
+           * settled row is excluded ONLY when its actual cost is provably
+           * inside consumed_microusd. The canonical correlation is
+           * spend_key === reservation_id in the strict-proven
+           * applied_spend_keys ledger (accountBudget is key-idempotent;
+           * the reservation id is its natural idempotent key). A settled
+           * row without that key keeps its settled liability. */
+          const allRes = this.store.list("cost_reservation") as Array<Record<string, unknown>>;
           const outstanding = this.objectiveAttributedMicrousd(
             scope.objective_id,
-            (this.store.list("cost_reservation") as Array<Record<string, unknown>>)
-              .filter((r) => {
-                const st = String(r.status);
-                return st === "HELD" || st === "COMMITTED";
-              }),
+            allRes.filter((r) => {
+              const st = String(r.status);
+              return st === "HELD" || st === "COMMITTED";
+            }),
           );
-          const used = consumed + outstanding;
+          const accountedKeys = new Set(
+            ((objRow.applied_spend_keys ?? []) as Array<Record<string, unknown>>)
+              .map((e) => String(e.key)),
+          );
+          const unaccountedSettled = this.objectiveAttributedMicrousd(
+            scope.objective_id,
+            allRes.filter((r) =>
+              String(r.status) === "SETTLED" &&
+              !accountedKeys.has(String(r.reservation_id ?? ""))),
+          );
+          const used = consumed + outstanding + unaccountedSettled;
           if (used + est > ceiling) {
             this.store.event({
               entity_type: "objective",
@@ -1260,6 +1276,7 @@ export class CostService {
                 scope_id: scope.objective_id,
                 consumed_microusd: consumed,
                 outstanding_reserved_microusd: outstanding,
+                unaccounted_settled_microusd: unaccountedSettled,
                 used_microusd: used,
                 requested_microusd: est,
                 max_microusd: ceiling,
@@ -1268,7 +1285,7 @@ export class CostService {
             });
             throw new PolicyError(
               "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED",
-              `objective:${scope.objective_id} canonical ${consumed}+${outstanding}outstanding+${est}>${ceiling}`,
+              `objective:${scope.objective_id} canonical ${consumed}+${outstanding}outstanding+${unaccountedSettled}settled_unaccounted+${est}>${ceiling}`,
             );
           }
         }

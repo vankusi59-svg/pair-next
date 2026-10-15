@@ -1943,19 +1943,21 @@ describe("async replan J — audit R2-F2: canonical objective budget at replan a
     });
     ctx.service.cost.settlePlannerInvocation(String(a.reservation_id), "CALLS_MADE", 80);
     // The settled 80 becomes canonical consumed spend (event + ledger
-    // digest + row) — the only spend authority.
+    // digest + row) — the only spend authority. The canonical
+    // correlation is spend_key === reservation_id: accountBudget is
+    // key-idempotent, so the reservation id IS the idempotent key.
     const obj = ctx.store.get("objective", oid);
     ctx.store.put("objective", oid, {
       ...obj,
       budget: { ceiling_microusd: 100, consumed_microusd: 80 },
       applied_spend_keys: [
-        { key: "sk_j9", digest: spendSemantics(oid, { spend_key: "sk_j9", amount_microusd: 80 }) },
+        { key: "CRSV_PLN_PRN_j9a", digest: spendSemantics(oid, { spend_key: "CRSV_PLN_PRN_j9a", amount_microusd: 80 }) },
       ],
     }, Number(obj.version));
     ctx.store.event({
       entity_type: "objective", entity_id: oid,
       event_type: "OBJECTIVE_BUDGET_ACCOUNTED", actor: "TEST",
-      metadata: { spend_key: "sk_j9", amount_microusd: 80, consumed_microusd: 80 },
+      metadata: { spend_key: "CRSV_PLN_PRN_j9a", amount_microusd: 80, consumed_microusd: 80 },
     });
     // Only 20µ remains. The settled reservation must NOT be counted a
     // second time — 80+80+20 would wrongly exceed the ceiling.
@@ -2003,5 +2005,44 @@ describe("async replan J — audit R2-F2: canonical objective budget at replan a
     ).toThrowError(
       expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED" }) as never,
     );
+  });
+
+  /* AUDIT R3-final — SETTLED accounting gap: settlePlannerInvocation can
+   * mark a reservation SETTLED without ANY canonical spend evidence
+   * landing in consumed_microusd. The liability is real: it must still
+   * encumber the ceiling until proven accounted (spend_key =
+   * reservation_id in the canonical OBJECTIVE_BUDGET_ACCOUNTED chain). */
+  it("J11. R3-final — SETTLED but not canonically accounted: A settles 80 with consumed still 0 → B's 80 rejected", () => {
+    const { ctx, wi } = lineageWithObjective("j11", { ceiling_microusd: 100 });
+    const a = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j11a", work_item_id: wi,
+      est_microusd: 80, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    // Actual cost 80µ settles — but no OBJECTIVE_BUDGET_ACCOUNTED event
+    // ever lands: canonical consumed stays 0 while the liability is real.
+    ctx.service.cost.settlePlannerInvocation(String(a.reservation_id), "CALLS_MADE", 80);
+    expect(String(ctx.store.get("cost_reservation", "CRSV_PLN_PRN_j11a").status)).toBe("SETTLED");
+    const obj = ctx.store.get("objective", `OBJ_j11`);
+    expect(Number((obj.budget as Record<string, unknown>).consumed_microusd)).toBe(0);
+    // B must NOT be admitted — 80 settled-but-unaccounted + 80 est = 160.
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j11b", work_item_id: wi,
+        est_microusd: 80, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED" }) as never,
+    );
+    expect(ctx.store.list("cost_reservation")).toHaveLength(1);
+    // A 20µ envelope still fits the remaining proven headroom — the
+    // liability retains exactly its settled amount, no more.
+    const c = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j11c", work_item_id: wi,
+      est_microusd: 20, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(c.reservation_id).toBe("CRSV_PLN_PRN_j11c");
   });
 });

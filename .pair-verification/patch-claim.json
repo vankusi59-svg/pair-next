@@ -1,6 +1,6 @@
 {
-  "claim_id": "GOVERNED_ASYNC_REPLAN_PROVIDER_R3",
-  "title": "Audit R3 correction to the governed async replan provider — canonical Objective budget admission now reconciles outstanding planner reservations (flag unchanged, default OFF)",
+  "claim_id": "GOVERNED_ASYNC_REPLAN_PROVIDER_R3_FINAL",
+  "title": "Audit R3-final correction to the governed async replan provider — canonical Objective budget admission reconciles outstanding reservations AND settled-but-unaccounted spend (flag unchanged, default OFF)",
   "affected_surfaces": [
     "PLANNER",
     "RECOVERY_REPLAY",
@@ -26,6 +26,6 @@
     "INV_REPLAY_001",
     "INV_MISSION_001"
   ],
-  "description": "Audit R3 on PR #118: the R2 canonical budget check used consumed+est<=ceiling but ignored outstanding reservations — two 80µ planner admissions under ceiling=100 both passed (160 combined). admitPlannerInvocation now sums HELD/COMMITTED reservations traceable to the objective (same lineage walk as the auto-policy seam, filtered to encumbering statuses) inside the same atomic reservation transaction: consumed+outstanding+est must fit ceiling, else FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED with an event pinning consumed/outstanding/requested. SETTLED rows are excluded because their spend is already the canonical consumed_microusd authority — counting them again would double-count settled costs; RELEASED rows carry no encumbrance. Zero-budget, unbounded-cost, absent-row/legacy-lineage and idempotent-replay semantics unchanged: the idempotent existing-row replay still returns first, ceiling=0 still hard-blocks spend-bearing envelopes, malformed canonical authority still fails closed UNVERIFIED.",
+  "description": "Audit R3-final on PR #118: the R3 check excluded all SETTLED rows assuming their actual cost was already inside canonical consumed_microusd, but settlePlannerInvocation/settleFromResult can settle without any OBJECTIVE_BUDGET_ACCOUNTED event — a settled 80µ with consumed=0 let a second 80µ admit under ceiling=100. The admission txn now keeps SETTLED liability unless the spend is PROVABLY accounted: the canonical correlation is spend_key === reservation_id in the strict-verified applied_spend_keys ledger (accountBudget is key-idempotent; reservation_id is the idempotent key). used = consumed + HELD/COMMITTED reserved + SETTLED-unaccounted; must fit ceiling else FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED. Settled+accounted rows are excluded exactly once (no double-count); RELEASED frees; zero-budget/unbounded/legacy-lineage/idempotent-replay semantics unchanged.",
   "risk_override": "HIGH"
 }
