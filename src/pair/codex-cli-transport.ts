@@ -68,9 +68,11 @@ export function codexHomeDir(env: CodexCliEnv | undefined): string | null {
  *  forwarded to governed children — codexCliChildEnv strips it; the
  *  executor adapter strips it for autonomous dispatch) → the persisted
  *  session file. So auth.json's STRUCTURE is the effective mode:
- *  a non-empty stored OPENAI_API_KEY is metered API-key billing even
- *  when ambient env keys are absent; a ChatGPT OAuth `tokens` session
- *  is the only subscription identity. SECRET-SAFE: key names and field
+ *  an explicit `auth_mode` field takes precedence over credential-shape
+ *  inference (R3); absent it, a non-empty stored OPENAI_API_KEY or any
+ *  alternative persisted credential family is metered/contradictory
+ *  billing even when ambient env keys are absent; a ChatGPT OAuth
+ *  `tokens` session is the only subscription identity. SECRET-SAFE: key names and field
  *  shapes only — credential values are never read out, logged or
  *  persisted. Anything missing/unparsable/contradictory fails closed. */
 export type CodexAuthMode = "CHATGPT" | "API_KEY" | "UNAUTHENTICATED" | "AMBIGUOUS";
@@ -94,22 +96,55 @@ export function codexAuthMode(env: CodexCliEnv | undefined): CodexAuthMode {
     return "AMBIGUOUS";
   }
   const rec = parsed as Record<string, unknown>;
-  // A non-empty persisted API key resolves API-key billing inside the
-  // CLI regardless of a coexisting tokens session — never substitute
-  // it for ChatGPT subscription auth.
+  // ChatGPT OAuth session material — the real codex-rs shape carries
+  // access_token + refresh_token strings plus an id_token claim set.
+  const tokens = rec.tokens;
+  const t = (tokens !== null && typeof tokens === "object" &&
+    !Array.isArray(tokens)) ? tokens as Record<string, unknown> : null;
+  const tokensValid = t !== null &&
+    typeof t.access_token === "string" && t.access_token !== "" &&
+    typeof t.refresh_token === "string" && t.refresh_token !== "" &&
+    t.id_token != null;
+
+  // AUDIT R3 F1 — codex-rs' persisted resolver gives an explicit
+  // auth_mode precedence over credential-shape inference. Accept only
+  // "chatgpt" backed by valid OAuth session material; every other
+  // explicit mode — including "apikey" — is a non-subscription
+  // declaration no matter how valid coexisting tokens look, and a
+  // malformed/unknown declaration is unverifiable → fail closed.
+  const declared = rec.auth_mode;
+  if (typeof declared === "string" && declared.trim() !== "") {
+    const m = declared.trim().toLowerCase();
+    if (m === "chatgpt") {
+      if (tokensValid) return "CHATGPT";
+      return tokens == null ? "UNAUTHENTICATED" : "AMBIGUOUS";
+    }
+    if (m === "apikey") return "API_KEY";
+    return "AMBIGUOUS";
+  }
+  if (declared !== undefined && declared !== null) return "AMBIGUOUS";
+
+  // auth_mode absent — credential-shape inference. A non-empty
+  // persisted API key resolves API-key billing inside the CLI even when
+  // ambient env keys are absent.
   const storedKey = rec.OPENAI_API_KEY;
   if (typeof storedKey === "string" && storedKey.trim() !== "") return "API_KEY";
-  const tokens = rec.tokens;
-  if (tokens !== null && typeof tokens === "object" && !Array.isArray(tokens)) {
-    const t = tokens as Record<string, unknown>;
-    // ChatGPT OAuth session — the real codex-rs shape carries
-    // access_token + refresh_token strings plus an id_token claim set.
-    if (typeof t.access_token === "string" && t.access_token !== "" &&
-        typeof t.refresh_token === "string" && t.refresh_token !== "" &&
-        t.id_token != null) {
-      return "CHATGPT";
+  // Contradictory alternative credential families — a persisted PAT or
+  // bedrock key set is a DIFFERENT non-subscription authority the CLI
+  // can resolve; alongside OAuth tokens the effective mode is
+  // unprovable → fail closed, never CHATGPT.
+  for (const field of [
+    "personal_access_token", "bedrock_api_key", "bedrock_access_keys",
+  ]) {
+    const v = rec[field];
+    if (typeof v === "string" && v.trim() !== "") return "AMBIGUOUS";
+    if (Array.isArray(v) ? v.length > 0
+        : v !== null && v !== undefined && typeof v === "object" &&
+          Object.keys(v as Record<string, unknown>).length > 0) {
+      return "AMBIGUOUS";
     }
   }
+  if (tokensValid) return "CHATGPT";
   return "AMBIGUOUS";
 }
 

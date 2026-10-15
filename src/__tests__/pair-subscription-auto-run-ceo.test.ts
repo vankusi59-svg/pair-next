@@ -60,6 +60,7 @@ import {
   CEO_DECISION_ATTEMPT_ENTITY,
   CodexCliCeoDecisionInvoker,
   CodexCliExecutorAdapter,
+  codexAuthMode,
   codexPlannerPlan,
   codexRunRoot,
   readSchedulerRow,
@@ -1410,6 +1411,78 @@ describe("Z9 — AUDIT R2 (F1 ChatGPT auth mode / F2 route billing)", () => {
     const env = childEnvDump(journalRoot, String(rec.execution_id));
     expect(env.OPENAI_API_KEY).toBe(true); // manual lane unchanged
     expect(env.CODEX_API_KEY).toBe(true);
+  });
+});
+
+/* ============ Z10 — AUDIT R3 ============ */
+
+/** R3-F1 — the resolver must match codex-rs' persisted-mode precedence:
+ *  an explicit auth_mode wins over credential-shape inference; absent
+ *  auth_mode, alternative persisted credential families are
+ *  contradictory and deny even alongside valid-looking OAuth tokens.
+ *  All three autonomous consumers (adapter spawn boundary, driver
+ *  subscription proof, cost txn gate) call this same resolver. */
+describe("Z10 — AUDIT R3 (auth_mode precedence / contradictory credentials)", () => {
+  const VALID_TOKENS = {
+    id_token: { sub: "u" }, access_token: "at", refresh_token: "rt",
+  };
+  const authEnvFor = (tag: string, body: unknown) => {
+    const d = path.join(ROOT, `z10-${tag}`);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "auth.json"), JSON.stringify(body));
+    return (n: string) => (n === "CODEX_HOME" ? d : undefined);
+  };
+
+  it("Z10.1 ChatGPT OAuth session, no auth_mode → CHATGPT", () => {
+    expect(codexAuthMode(authEnvFor("a", {
+      OPENAI_API_KEY: null, tokens: VALID_TOKENS }))).toBe("CHATGPT");
+  });
+
+  it("Z10.2 explicit auth_mode:'chatgpt' + valid tokens → CHATGPT", () => {
+    expect(codexAuthMode(authEnvFor("b", {
+      auth_mode: "chatgpt", tokens: VALID_TOKENS }))).toBe("CHATGPT");
+  });
+
+  it("Z10.3 auth_mode:'apikey' + valid-looking OAuth tokens → denied", () => {
+    expect(codexAuthMode(authEnvFor("c", {
+      auth_mode: "apikey", tokens: VALID_TOKENS }))).not.toBe("CHATGPT");
+  });
+
+  it("Z10.4 explicit non-ChatGPT auth_mode + tokens → denied", () => {
+    expect(codexAuthMode(authEnvFor("d", {
+      auth_mode: "bedrock", tokens: VALID_TOKENS }))).not.toBe("CHATGPT");
+  });
+
+  it("Z10.5 absent auth_mode + personal_access_token + tokens → denied", () => {
+    expect(codexAuthMode(authEnvFor("e", {
+      personal_access_token: "pat-x", tokens: VALID_TOKENS })))
+      .not.toBe("CHATGPT");
+  });
+
+  it("Z10.6 absent auth_mode + bedrock credential families + tokens → denied", () => {
+    expect(codexAuthMode(authEnvFor("f", {
+      bedrock_api_key: "bk", tokens: VALID_TOKENS }))).not.toBe("CHATGPT");
+    expect(codexAuthMode(authEnvFor("g", {
+      bedrock_access_keys: [{ access_key_id: "k", secret_access_key: "s" }],
+      tokens: VALID_TOKENS }))).not.toBe("CHATGPT");
+  });
+
+  it("Z10.7 auth_mode:'chatgpt' with no session material → still denied", () => {
+    expect(codexAuthMode(authEnvFor("h", { auth_mode: "chatgpt" })))
+      .not.toBe("CHATGPT");
+  });
+
+  it("Z10.8 integration: auth_mode:'apikey' flips driver admission to DENIED", async () => {
+    const s = fresh("z10i");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    writeCodexAuthJson(s, { auth_mode: "apikey", tokens: VALID_TOKENS });
+    const out = await mkDriver(s).tick();
+    expect(out.driven[0])
+      .toMatchObject({ denied: "DRIVER_SUBSCRIPTION_UNVERIFIED" });
   });
 });
 
