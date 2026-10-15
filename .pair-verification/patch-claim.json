@@ -1,6 +1,6 @@
 {
-  "claim_id": "GOVERNED_ASYNC_REPLAN_PROVIDER_R1",
-  "title": "Audit R1 corrections to the governed async replan provider — bounded concurrent driver, settle/delivery stale-generation revalidation, zero-budget proof, production-composition integration test (flag unchanged, default OFF)",
+  "claim_id": "GOVERNED_ASYNC_REPLAN_PROVIDER_R2",
+  "title": "Audit R2 corrections to the governed async replan provider — shared bounded in-flight capacity across overlapping sweeps, canonical Objective budget authority at replan admission (flag unchanged, default OFF)",
   "affected_surfaces": [
     "PLANNER",
     "RECOVERY_REPLAY",
@@ -13,7 +13,11 @@
     "src/__tests__/pair-f3-r1-remediation.test.ts",
     "src/__tests__/pair-f3-r2-remediation.test.ts",
     "src/__tests__/pair-p0-live-defects.test.ts",
+    "src/__tests__/pair-p15-1-objective-authority.test.ts",
+    "src/__tests__/pair-p15-5-kpi-review.test.ts",
+    "src/__tests__/pair-p15-6-objective-operating-loop.test.ts",
     "src/__tests__/pair-cpl1-codex-planner.test.ts",
+    "src/__tests__/pair-phase-c-audit-r2.test.ts",
     "src/__tests__/pair-phase-c-unified-planner.test.ts",
     "src/__tests__/pair-live-ops-recovery-closure.test.ts"
   ],
@@ -22,6 +26,6 @@
     "INV_REPLAY_001",
     "INV_MISSION_001"
   ],
-  "description": "Audit R1 on PR #118. F1: the driver awaited each claimed generation sequentially and the production busy flag serialized sweeps behind it — a stalled provider call starved pending rows. Now the whole per-sweep bound is claimed up front (oldest-first; CAS lease+epoch stays single-flight authority) and claimed generations run concurrently; the busy flag is removed so overlapping sweeps claim newly-minted rows. F2: settle() re-proves unresolved slot, live recovery identity and durable deadline inside its transaction; requestCandidate() revalidates at delivery and converges stale sibling rows for the bound recovery, committing terminal transitions before serving so a thrown code never rolls them back — cancelled/expired/superseded/slot-resolved rows can never become consumable. F3: ZERO_BUDGET pinned at the real admission seam — cap=0 blocks positive envelopes (BUDGET_EXCEEDED) and unprovable cost (UNVERIFIED), provable $0 admits CAPPED with a real 0µUSD reservation, absent policy resolves UNCAPPED, no lineage NONE; PR #117 semantics unchanged. F4: new win32 baselines narrowed to the exact failing titles (4 passing ingest-adjacent tests stay unmasked); H1/H2 integration composes the real pool, cost admission, driver and runtime with only model transport stubbed, proven through atomic commit; synthetic E2E stays in A–G.",
+  "description": "Audit R2 on PR #118. F1: max_claims_per_sweep bounded rows claimed per sweep, not total in-flight — overlapping 1s sweeps could launch unbounded generation calls. makeReplanGenerationDriver now carries a shared in-flight capacity (max_in_flight, defaults to the claim bound) in the driver closure: a claimed-but-unsettled generation occupies a slot across every overlapping sweep invocation, a saturated sweep claims zero, and settlement releases the slot in a finally so a freed capacity admits the next pending mission. CAS lease+epoch remains per-row single-flight; oldest-first claim order unchanged; no busy-flag serialization reintroduced. F2: replan cost admission consulted only objective_auto_policy.limits.budget_microusd_cap, missing PR #117's canonical OBJECTIVE_ZERO_BUDGET hard-block. admitPlannerInvocation now re-proves the canonical objective.budget{ceiling,consumed} inside the reservation transaction — a fresh read at reserve time so a budget amended mid-generation applies to the next admission: ceiling<=0 blocks every spend-bearing envelope (est>0 or unbounded) FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET; provable $0 continues (explicitly-authorized continuation, 0µUSD reservation); positive ceiling enforces consumed+est<=ceiling (BUDGET_EXCEEDED) and rejects unbounded envelopes (UNVERIFIED); malformed budget authority fails closed UNVERIFIED. Absent objective row leaves the auto-policy authority untouched (existing fixtures unchanged). assertCanonicalObjectiveBudget moved from objective-adaptive-review.ts to leaf objective-authority.ts (re-exported) so cost.ts consults it without the ceo-runtime import cycle.",
   "risk_override": "HIGH"
 }

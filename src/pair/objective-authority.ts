@@ -1247,3 +1247,119 @@ export class ObjectiveAuthorityService {
     return out;
   }
 }
+
+/* --------------------------------------------------------------------
+ * Canonical budget re-proof — moved here from objective-adaptive-review
+ * for AUDIT R2-F2: cost admission must consult the canonical objective
+ * budget authority, and cost.ts cannot import the adaptive-review
+ * module (its ceo-runtime dependency chain creates an import cycle).
+ * objective-authority is a leaf module — the same strict proof now
+ * lives beside spendSemantics and is re-exported through
+ * objective-adaptive-review for the existing P15.5 callers.
+ * ------------------------------------------------------------------ */
+
+function budgetProofFail(detail: string): never {
+  // Same fail-closed code the P15.5 adaptive-review caller relies on.
+  throw new IntegrityError("FAIL_CLOSED_P15_5_ADAPTIVE_REVIEW", detail);
+}
+
+/** Re-prove that `budget.consumed_microusd` on a strict-read Objective is
+ *  backed by the immutable canonical spend-event chain, not merely a
+ *  field on the row.
+ *
+ *  - every spend event carries {spend_key, amount_microusd,
+ *    consumed_microusd} where consumed equals the cumulative sum;
+ *  - the applied_spend_keys ledger mirrors the event chain exactly
+ *    (no missing authority, no extra keys);
+ *  - each ledger digest equals spendSemantics(objective_id, {spend_key,
+ *    amount_microusd}) — the only recognized spend authority;
+ *  - the cumulative sum equals the current consumed_microusd.
+ *
+ *  Any malformed shape, untrusted evidence, or chain mismatch throws —
+ *  consumed_microusd cannot affect P15.5/CEO reasoning unproven. */
+export function assertCanonicalObjectiveBudget(
+  store: PairEvidenceStore,
+  objective: Row,
+): void {
+  const oid = String(objective.objective_id);
+  const budget = objective.budget as Record<string, unknown> | undefined;
+  if (!budget ||
+      !Number.isInteger(budget.ceiling_microusd) ||
+      !Number.isInteger(budget.consumed_microusd) ||
+      Number(budget.ceiling_microusd) < 0 ||
+      Number(budget.consumed_microusd) < 0 ||
+      Number(budget.consumed_microusd) > Number(budget.ceiling_microusd)) {
+    budgetProofFail(`objective ${oid}: budget shape/ceiling invalid`);
+  }
+  const rawLedger = objective.applied_spend_keys;
+  const ledger: Array<{ key: string; digest: string }> = [];
+  if (rawLedger !== undefined && rawLedger !== null) {
+    if (!Array.isArray(rawLedger)) {
+      budgetProofFail(`objective ${oid}: applied_spend_keys malformed`);
+    }
+    for (const e of rawLedger as Array<Record<string, unknown>>) {
+      if (typeof e !== "object" || e === null ||
+          typeof e.key !== "string" || e.key === "" ||
+          typeof e.digest !== "string" || e.digest === "") {
+        budgetProofFail(`objective ${oid}: applied_spend_keys entry malformed`);
+      }
+      ledger.push({ key: e.key, digest: e.digest });
+    }
+  }
+  const events = listAccountedSpendEvents(store, oid);
+  // Every spend_key is unique and cumulative consumed is monotone
+  // consistent through the immutable event chain.
+  const byKey = new Map<string, { amount: number; consumed: number }>();
+  let running = 0;
+  for (const e of events) {
+    const md = e.metadata as Record<string, unknown> | null;
+    if (!md || typeof md.spend_key !== "string" || md.spend_key === "" ||
+        !Number.isInteger(md.amount_microusd) ||
+        Number(md.amount_microusd) < 0 ||
+        !Number.isInteger(md.consumed_microusd)) {
+      budgetProofFail(`objective ${oid}: malformed spend event authority`);
+    }
+    const key = String(md.spend_key);
+    if (byKey.has(key)) {
+      budgetProofFail(`objective ${oid}: duplicate spend_key authority ${key}`);
+    }
+    running += Number(md.amount_microusd);
+    if (Number(md.consumed_microusd) !== running) {
+      budgetProofFail(
+        `objective ${oid}: spend event cumulative mismatch at ${key}`);
+    }
+    byKey.set(key, { amount: Number(md.amount_microusd), consumed: running });
+  }
+  if (running !== Number(budget.consumed_microusd)) {
+    budgetProofFail(
+      `objective ${oid}: consumed=${String(budget.consumed_microusd)} ` +
+      `but canonical spend chain totals ${running}`);
+  }
+  // The ledger must mirror the event chain exactly — no missing spend
+  // authority, no extra keys.
+  if (ledger.length !== events.length) {
+    budgetProofFail(`objective ${oid}: spend ledger/event count mismatch`);
+  }
+  for (const entry of ledger) {
+    const e = byKey.get(entry.key);
+    if (!e) {
+      budgetProofFail(`objective ${oid}: ledger key ${entry.key} has no spend event`);
+    }
+    const expected = spendSemantics(oid, {
+      spend_key: entry.key,
+      amount_microusd: e!.amount,
+      // A note is not part of persisted event evidence — a spend that
+      // used one cannot be re-proven here and fails closed.
+      note: undefined,
+    });
+    if (entry.digest !== expected) {
+      budgetProofFail(`objective ${oid}: spend digest mismatch for ${entry.key}`);
+    }
+  }
+}
+
+function listAccountedSpendEvents(store: PairEvidenceStore, oid: string) {
+  // listEvents already orders by the immutable seq column.
+  return store.listEvents(OBJECTIVE_ENTITY, oid)
+    .filter((e) => String(e.event_type) === "OBJECTIVE_BUDGET_ACCOUNTED");
+}

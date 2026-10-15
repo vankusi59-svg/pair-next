@@ -19,6 +19,7 @@ import fs from "node:fs";
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
+import { assertCanonicalObjectiveBudget } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
 
@@ -1166,6 +1167,90 @@ export class CostService {
           scope: scope.cap !== null ? "CAPPED" : "UNCAPPED",
           objective_id: scope.objective_id,
         };
+      }
+      /* AUDIT R2-F2 — canonical Objective budget authority. The
+       * auto-policy cap (limits.budget_microusd_cap) is only ONE of the
+       * two budget authorities; PR #117's canonical authority is the
+       * objective row's own budget{ceiling,consumed} proven by the
+       * strict spend-ledger reconciliation. When the objective row
+       * exists, this seam enforces it INSIDE the reservation txn — a
+       * fresh read at reserve time, so a budget amended while an async
+       * generation is in flight applies to the next admission.
+       *   - ceiling ≤ 0 → OBJECTIVE_ZERO_BUDGET: a hard bound, NEVER
+       *     uncapped/exhausted — blocks every spend-bearing envelope
+       *     (est>0 or unprovable). A provable $0 envelope is the
+       *     explicitly-authorized continuation: it can never spend, so
+       *     it needs no budget — same zero-cap treatment as the
+       *     policy-cap seam.
+       *   - ceiling > 0 → EXHAUSTED/headroom: unbounded envelopes
+       *     cannot be proven within the remaining budget; a bounded
+       *     envelope must fit consumed+est ≤ ceiling.
+       * An absent objective row leaves the lineage exactly as before
+       * — the auto-policy cap remains the resolved authority
+       * (existing seam semantics are unchanged there). */
+      const objRow = this.store.tryGet("objective", scope.objective_id) as
+        | (Record<string, unknown> & { version: number })
+        | null;
+      if (objRow) {
+        try {
+          assertCanonicalObjectiveBudget(this.store, objRow);
+        } catch {
+          throw new PolicyError(
+            "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+            `planner admission for ${wi}: canonical objective ` +
+              `${scope.objective_id} budget authority unprovable`,
+          );
+        }
+        const budget = objRow.budget as Record<string, unknown>;
+        const ceiling = Number(budget.ceiling_microusd);
+        const consumed = Number(budget.consumed_microusd);
+        if (ceiling <= 0) {
+          if (est > 0 || input.unbounded_unknown === true) {
+            this.store.event({
+              entity_type: "objective",
+              entity_id: scope.objective_id,
+              event_type: "COST_OBJECTIVE_ZERO_BUDGET",
+              actor: "PAIR_COST_GOVERNANCE",
+              metadata: {
+                scope_type: "objective",
+                scope_id: scope.objective_id,
+                requested_microusd: est,
+                planner_run_id: String(input.planner_run_id),
+              },
+            });
+            throw new PolicyError(
+              "FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET",
+              `objective:${scope.objective_id} canonical ceiling=0 — new spend-bearing work is hard-blocked`,
+            );
+          }
+        } else {
+          if (input.unbounded_unknown === true) {
+            throw new PolicyError(
+              "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED",
+              `planner pricing unbounded under objective ${scope.objective_id} canonical budget ceiling`,
+            );
+          }
+          if (consumed + est > ceiling) {
+            this.store.event({
+              entity_type: "objective",
+              entity_id: scope.objective_id,
+              event_type: "COST_BUDGET_EXCEEDED",
+              actor: "PAIR_COST_GOVERNANCE",
+              metadata: {
+                scope_type: "objective",
+                scope_id: scope.objective_id,
+                used_microusd: consumed,
+                requested_microusd: est,
+                max_microusd: ceiling,
+                planner_run_id: String(input.planner_run_id),
+              },
+            });
+            throw new PolicyError(
+              "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED",
+              `objective:${scope.objective_id} canonical ${consumed}+${est}>${ceiling}`,
+            );
+          }
+        }
       }
       if (input.unbounded_unknown && scope.cap !== null) {
         // An unprovable charge under an objective cap is never $0.

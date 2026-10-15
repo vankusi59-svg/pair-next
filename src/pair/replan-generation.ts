@@ -910,6 +910,14 @@ export interface ReplanGenerationDriverDeps {
   lease_ms: number;
   /** Max rows claimed per sweep — keeps the periodic driver bounded. */
   max_claims_per_sweep?: number;
+  /** AUDIT R2-F1 — shared in-flight capacity across EVERY overlapping
+   *  sweep invocation. Without it the per-sweep bound alone leaves
+   *  global concurrency unbounded: production fires a sweep each
+   *  second, and a stalled provider call never returns the slot, so
+   *  every tick could claim `bound` more rows. Generations claimed but
+   *  not yet settled occupy a slot; a saturated sweep claims nothing.
+   *  Defaults to the per-sweep claim bound. */
+  max_in_flight?: number;
   now_ms?: () => number;
 }
 
@@ -933,6 +941,18 @@ export function makeReplanGenerationDriver(
     1,
     Math.min(Number(deps.max_claims_per_sweep ?? 4), 16),
   );
+  // AUDIT R2-F1 — shared bounded in-flight capacity across ALL
+  // overlapping sweep invocations (the per-sweep bound alone bounds
+  // nothing once sweeps overlap). A claimed-but-unsettled generation
+  // occupies a slot until its generate()+settle() finishes; a sweep
+  // that finds zero free capacity claims nothing and returns. The
+  // durable CAS lease + epoch stays the per-row single-flight
+  // authority — this capacity is a resource bound, not a lock.
+  const maxInFlight = Math.max(
+    1,
+    Math.min(Number(deps.max_in_flight ?? bound), 16),
+  );
+  const inFlight = new Set<string>();
   return async function sweep() {
     const rec = deps.service.reconcile({ nowMs: nowMs() });
     const out = {
@@ -950,8 +970,9 @@ export function makeReplanGenerationDriver(
     // are claimed and generated in parallel, and settle() independently
     // revalidates before staging so a late finisher can never stage
     // stale output. Concurrency bound = claim bound (≤16).
+    const capacity = maxInFlight - inFlight.size;
     const claimed: ReplanGenerationRecord[] = [];
-    for (let i = 0; i < bound; i++) {
+    for (let i = 0; i < Math.min(bound, capacity); i++) {
       const gen = deps.service.claimNext({
         owner_id: deps.owner_id,
         lease_ms: deps.lease_ms,
@@ -960,6 +981,7 @@ export function makeReplanGenerationDriver(
       if (gen == null) break;
       claimed.push(gen);
       out.claimed.push(gen.replan_generation_id);
+      inFlight.add(gen.replan_generation_id);
     }
     await Promise.all(
       claimed.map(async (gen) => {
@@ -1006,6 +1028,10 @@ export function makeReplanGenerationDriver(
           { status: "FAILED", outcome, planner_run_id: plannerRunId },
         );
         if (applied) out.failed.push(gen.replan_generation_id);
+      } finally {
+        // R2-F1 — release the shared in-flight slot whether the
+        // generation staged, failed, or its result was dropped stale.
+        inFlight.delete(gen.replan_generation_id);
       }
       }),
     );

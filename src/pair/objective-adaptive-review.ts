@@ -49,7 +49,15 @@ import {
   OBJECTIVE_ENTITY,
   progressSemantics,
   spendSemantics,
+  assertCanonicalObjectiveBudget,
 } from "./objective-authority.js";
+
+/* AUDIT R2-F2 — the canonical budget re-proof now lives in
+ * objective-authority.ts (a leaf module) so cost.ts's planner-admission
+ * seam can consult it without importing the ceo-runtime dependency
+ * chain (import cycle). Re-exported here so the existing P15.5 callers
+ * (objective-cockpit, objective-operating-loop) keep their import. */
+export { assertCanonicalObjectiveBudget };
 import type { ObjectiveWorkstreamService } from "./objective-workstream.js";
 import { objectiveWorkstreamBindingDigest } from "./objective-workstream.js";
 import type { WorkforceService } from "./work-graph.js";
@@ -259,111 +267,6 @@ export function assertCanonicalObjectiveKpiProgress(
 // ---------------------------------------------------------------------
 // §B — STRICT BUDGET RUNTIME AUTHORITY
 // ---------------------------------------------------------------------
-
-/** Re-prove that `budget.consumed_microusd` on a strict-read Objective is
- *  canonical runtime authority, not a mutable field claim. The strict
- *  read already bounds the field; this binds it to the immutable spend
- *  evidence chain:
- *
- *  - every OBJECTIVE_BUDGET_ACCOUNTED event pins {spend_key, integer
- *    amount_microusd, consumed_microusd} where consumed equals the
- *    running cumulative sum in event order;
- *  - spend_key identity is unique across the event chain;
- *  - the applied_spend_keys ledger mirrors the event chain exactly
- *    (no missing spend, no extra key);
- *  - each ledger digest recomputes the exact P15.1 spend semantics
- *    (objective+key+amount+note). A spend recorded with a note is
- *    unprovable from persisted evidence — fail closed, never trust it;
- *  - the cumulative sum equals the current consumed_microusd.
- *
- *  Anything inconsistent fails closed — a payload-consistent rewrite of
- *  consumed_microusd cannot affect P15.5/CEO reasoning. */
-export function assertCanonicalObjectiveBudget(
-  store: PairEvidenceStore,
-  objective: Row,
-): void {
-  const oid = String(objective.objective_id);
-  const budget = objective.budget as Record<string, unknown> | undefined;
-  if (!budget ||
-      !Number.isInteger(budget.ceiling_microusd) ||
-      !Number.isInteger(budget.consumed_microusd) ||
-      Number(budget.ceiling_microusd) < 0 ||
-      Number(budget.consumed_microusd) < 0 ||
-      Number(budget.consumed_microusd) > Number(budget.ceiling_microusd)) {
-    reviewFail(`objective ${oid}: budget shape/ceiling invalid`);
-  }
-  const rawLedger = objective.applied_spend_keys;
-  const ledger: Array<{ key: string; digest: string }> = [];
-  if (rawLedger !== undefined && rawLedger !== null) {
-    if (!Array.isArray(rawLedger)) {
-      reviewFail(`objective ${oid}: applied_spend_keys malformed`);
-    }
-    for (const e of rawLedger as Array<Record<string, unknown>>) {
-      if (typeof e !== "object" || e === null ||
-          typeof e.key !== "string" || e.key === "" ||
-          typeof e.digest !== "string" || e.digest === "") {
-        reviewFail(`objective ${oid}: applied_spend_keys entry malformed`);
-      }
-      ledger.push({ key: e.key, digest: e.digest });
-    }
-  }
-  const events = deps_listAccounted(store, oid);
-  // Every spend_key is unique and cumulative consumed is monotone
-  // consistent through the immutable event chain.
-  const byKey = new Map<string, { amount: number; consumed: number }>();
-  let running = 0;
-  for (const e of events) {
-    const md = e.metadata as Record<string, unknown> | null;
-    if (!md || typeof md.spend_key !== "string" || md.spend_key === "" ||
-        !Number.isInteger(md.amount_microusd) ||
-        Number(md.amount_microusd) < 0 ||
-        !Number.isInteger(md.consumed_microusd)) {
-      reviewFail(`objective ${oid}: malformed spend event authority`);
-    }
-    const key = String(md.spend_key);
-    if (byKey.has(key)) {
-      reviewFail(`objective ${oid}: duplicate spend_key authority ${key}`);
-    }
-    running += Number(md.amount_microusd);
-    if (Number(md.consumed_microusd) !== running) {
-      reviewFail(
-        `objective ${oid}: spend event cumulative mismatch at ${key}`);
-    }
-    byKey.set(key, { amount: Number(md.amount_microusd), consumed: running });
-  }
-  if (running !== Number(budget.consumed_microusd)) {
-    reviewFail(
-      `objective ${oid}: consumed=${String(budget.consumed_microusd)} ` +
-      `but canonical spend chain totals ${running}`);
-  }
-  // The ledger must mirror the event chain exactly — no missing spend
-  // authority, no extra keys.
-  if (ledger.length !== events.length) {
-    reviewFail(`objective ${oid}: spend ledger/event count mismatch`);
-  }
-  for (const entry of ledger) {
-    const e = byKey.get(entry.key);
-    if (!e) {
-      reviewFail(`objective ${oid}: ledger key ${entry.key} has no spend event`);
-    }
-    const expected = spendSemantics(oid, {
-      spend_key: entry.key,
-      amount_microusd: e!.amount,
-      // A note is not part of persisted event evidence — a spend that
-      // used one cannot be re-proven here and fails closed.
-      note: undefined,
-    });
-    if (entry.digest !== expected) {
-      reviewFail(`objective ${oid}: spend digest mismatch for ${entry.key}`);
-    }
-  }
-}
-
-function deps_listAccounted(store: PairEvidenceStore, oid: string) {
-  // listEvents already orders by the immutable seq column.
-  return store.listEvents(OBJECTIVE_ENTITY, oid)
-    .filter((e) => String(e.event_type) === "OBJECTIVE_BUDGET_ACCOUNTED");
-}
 
 // ---------------------------------------------------------------------
 // §12 — REVIEW OBSERVATION

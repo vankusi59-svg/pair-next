@@ -1329,6 +1329,12 @@ const replanGenerationSweep = replanGeneration
       // after expiry, bounded by the durable deadline either way.
       lease_ms: cfgReplanGenerationDeadlineMs,
       max_claims_per_sweep: 4,
+      // AUDIT R2-F1 — the per-sweep bound is NOT the global bound:
+      // sweeps overlap every second and each could otherwise claim 4
+      // more rows without limit. This shared in-flight capacity lives
+      // in the driver closure, so a claimed-but-unsettled generation
+      // occupies a slot across every overlapping sweep invocation.
+      max_in_flight: 4,
     })
   : null;
 // AUDIT R1-F1 — no busy-flag serialization: overlapping sweeps are

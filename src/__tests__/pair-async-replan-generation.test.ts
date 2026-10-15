@@ -70,6 +70,7 @@ import {
   replanWorkItemId,
   runPlannerFailover,
   settlePlannerAttempt,
+  spendSemantics,
   TRANSPORT_IN_PROCESS,
   validatePlanProposal,
   type PlannerCandidate,
@@ -1649,5 +1650,262 @@ describe("async replan H — production composition integration (stub transport 
     expect(ctx.attempts(mid)).toHaveLength(0);
     const runs = ctx.store.list("planner_run");
     expect(String(runs[0].state)).toBe("EXHAUSTED");
+  });
+});
+
+/* ============ I — audit R2-F1: shared bounded in-flight capacity ======
+ * R1's per-sweep claim bound alone cannot bound CONCURRENCY once sweeps
+ * overlap (production fires a sweep every 1s): each sweep could claim
+ * bound more rows while earlier generations are still in flight. The
+ * driver must hold a SHARED in-flight capacity across sweep
+ * invocations — per-generation CAS lease+epoch stays the single-flight
+ * authority; oldest-first stays the fairness order. */
+describe("async replan I — audit R2-F1: shared bounded in-flight capacity across sweeps", () => {
+  it("I1. overlapping sweeps never exceed the configured in-flight bound; a freed slot admits the next pending mission", async () => {
+    const gates = new Map<string, () => void>();
+    const inflight = new Set<string>();
+    let maxConcurrent = 0;
+    const gatedGenerate = async (gen: ReplanGenerationRecord) => {
+      const id = String(gen.replan_generation_id);
+      inflight.add(id);
+      maxConcurrent = Math.max(maxConcurrent, inflight.size);
+      await new Promise<void>((r) => gates.set(id, r));
+      inflight.delete(id);
+      return { tasks: altPlan().tasks };
+    };
+    const ctx = makeAsyncCtx("i1", { generate: gatedGenerate });
+    ctx.registerAdapter(
+      new ScriptedAdapter("EX_LOCAL", Array.from({ length: 16 }, () => ({ status: "COMPLETED" }))),
+      ["FILE_OPERATIONS"],
+    );
+    // Five independent missions, each minting one pending generation.
+    const mids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const mid = ctx.startMission({ pinned_plan_tasks: incidentPlan().tasks });
+      ctx.toReplanning(mid);
+      ctx.runtime.tick(mid, fakeClock()());
+      mids.push(mid);
+    }
+    expect(ctx.generations()).toHaveLength(5);
+    // The production-style driver: per-sweep claim bound 4 AND a shared
+    // in-flight capacity of 4 across EVERY overlapping invocation.
+    const driver = makeReplanGenerationDriver({
+      service: ctx.gen, generate: gatedGenerate,
+      owner_id: "i1-driver", lease_ms: 60_000,
+      max_claims_per_sweep: 4, max_in_flight: 4,
+    });
+    const s1 = driver(); // claims the bound, generations stay gated
+    await new Promise((r) => setTimeout(r, 30));
+    expect(inflight.size).toBe(4);
+    // Two more overlapping sweeps — capacity is saturated, so each
+    // claims ZERO further rows (CAS lease still single-flights each row).
+    const s2 = await driver();
+    const s3 = await driver();
+    expect(s2.claimed).toHaveLength(0);
+    expect(s3.claimed).toHaveLength(0);
+    expect(maxConcurrent).toBe(4);
+    expect(ctx.generations().filter((g) => String(g.status) === "LEASED")).toHaveLength(4);
+    // Release ONE in-flight generation → exactly one capacity slot frees
+    // → the next sweep claims the fifth mission's still-PENDING row.
+    const pending5 = ctx.generations().find((g) => String(g.status) === "PENDING")!;
+    const firstHeld = [...inflight][0];
+    gates.get(firstHeld)!();
+    await new Promise((r) => setTimeout(r, 20));
+    const s4 = driver();
+    await new Promise((r) => setTimeout(r, 30));
+    // The fifth mission's generation was claimed (LEASED) and is in
+    // flight — the freed slot admitted exactly one new generation.
+    expect(String(ctx.store.get(
+      "replan_generation", String(pending5.replan_generation_id),
+    ).status)).toBe("LEASED");
+    // Drain every gate; both sweeps finish.
+    for (const r of gates.values()) r();
+    const out4 = await s4;
+    await s1;
+    expect(out4.claimed).toEqual([String(pending5.replan_generation_id)]);
+    for (const g of ctx.generations()) {
+      expect(["STAGED", "CONSUMED"]).toContain(String(g.status));
+    }
+    expect(maxConcurrent).toBe(4);
+  });
+});
+
+/* ============ J — audit R2-F2: canonical objective budget authority ====
+ * The replan admission seam resolved objective scope ONLY through
+ * objective_auto_policy.limits.budget_microusd_cap. PR #117's canonical
+ * authority — objective.budget{ceiling,consumed} with the strict
+ * spend-ledger proof — is a HARD bound: ceiling=0 is OBJECTIVE_ZERO_
+ * BUDGET (never "uncapped", never "exhausted"), consumed>=ceiling is
+ * EXHAUSTED, and est must fit the remaining headroom. A provable $0
+ * envelope is the explicitly-authorized continuation (it can never
+ * spend) — everything spend-bearing under zero budget fails closed. */
+describe("async replan J — audit R2-F2: canonical objective budget at replan admission", () => {
+  /** Canonical lineage with a REAL objective row: work_item(objective
+   *  claim) → workforce_allocation → objective{budget} → optional
+   *  objective_auto_policy cap. consumed>0 is minted with the canonical
+   *  spend evidence (OBJECTIVE_BUDGET_ACCOUNTED event + applied_spend_
+   *  keys digest) so assertCanonicalObjectiveBudget strict-passes. */
+  const lineageWithObjective = (
+    name: string,
+    budget: { ceiling_microusd: number; consumed_microusd?: number },
+    policyCap?: number,
+  ) => {
+    const ctx = makeAsyncCtx(name, {
+      generate: async () => ({ tasks: altPlan().tasks }),
+    });
+    const oid = `OBJ_${name}`;
+    const wi = `WI_${name}`;
+    const consumed = budget.consumed_microusd ?? 0;
+    ctx.store.put("objective", oid, {
+      objective_id: oid, business_id: "B1", status: "ACTIVE",
+      kpis: [],
+      budget: {
+        ceiling_microusd: budget.ceiling_microusd,
+        consumed_microusd: consumed,
+      },
+      applied_spend_keys: consumed > 0
+        ? [{ key: "sk1", digest: spendSemantics(oid, { spend_key: "sk1", amount_microusd: consumed }) }]
+        : [],
+      version: 0,
+    }, 0);
+    if (consumed > 0) {
+      ctx.store.event({
+        entity_type: "objective", entity_id: oid,
+        event_type: "OBJECTIVE_BUDGET_ACCOUNTED", actor: "TEST",
+        metadata: { spend_key: "sk1", amount_microusd: consumed, consumed_microusd: consumed },
+      });
+    }
+    ctx.store.put("work_item", wi, {
+      work_item_id: wi, business_id: "B1", department: "ops",
+      goal: "governed async replan test mission", objective_id: oid,
+      status: "OPEN", version: 0,
+    });
+    ctx.store.put("workforce_allocation", `WAL_${name}`, {
+      workforce_allocation_id: `WAL_${name}`, objective_id: oid,
+      workstream_work_item_id: wi, delegated_child_work_item_id: null,
+      status: "ACTIVE", version: 0,
+    });
+    if (policyCap !== undefined) {
+      ctx.store.put("objective_auto_policy", `oap:${oid}`, {
+        objective_auto_policy_id: `oap:${oid}`, objective_id: oid,
+        limits: { budget_microusd_cap: policyCap }, version: 0,
+      });
+    }
+    return { ctx, wi, oid };
+  };
+
+  it("J1. canonical ceiling=0 + absent auto-policy: spend-bearing replan admission hard-blocks ZERO_BUDGET", () => {
+    const { ctx, wi } = lineageWithObjective("j1", { ceiling_microusd: 0 });
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j1", work_item_id: wi,
+        est_microusd: 1, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET" }) as never,
+    );
+    expect(ctx.store.list("cost_reservation")).toHaveLength(0);
+  });
+
+  it("J2. canonical ceiling=0 + POSITIVE auto-policy cap: the objective hard-block wins — the cap cannot loosen it", () => {
+    const { ctx, wi } = lineageWithObjective("j2", { ceiling_microusd: 0 }, 500_000);
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j2", work_item_id: wi,
+        est_microusd: 100, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET" }) as never,
+    );
+    expect(ctx.store.list("cost_reservation")).toHaveLength(0);
+  });
+
+  it("J3. canonical ceiling=0 + provable $0 envelope: explicitly-authorized continuation admits a 0µUSD reservation", () => {
+    const { ctx, wi } = lineageWithObjective("j3", { ceiling_microusd: 0 });
+    const out = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j3", work_item_id: wi,
+      est_microusd: 0, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(out.reservation_id).toBe("CRSV_PLN_PRN_j3");
+    const r = ctx.store.get("cost_reservation", "CRSV_PLN_PRN_j3");
+    expect(Number(r.reserved_microusd)).toBe(0);
+    expect(String(r.status)).toBe("HELD");
+  });
+
+  it("J4. canonical ceiling=0 + unbounded envelope: an unprovable charge is spend-bearing → ZERO_BUDGET blocks", () => {
+    const { ctx, wi } = lineageWithObjective("j4", { ceiling_microusd: 0 });
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j4", work_item_id: wi,
+        est_microusd: 0, unbounded_unknown: true, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET" }) as never,
+    );
+  });
+
+  it("J5. positive ceiling — exhausted / insufficient remaining: consumed+est>ceiling → BUDGET_EXCEEDED", () => {
+    const { ctx, wi } = lineageWithObjective("j5", {
+      ceiling_microusd: 1_000, consumed_microusd: 900,
+    });
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j5a", work_item_id: wi,
+        est_microusd: 200, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_BUDGET_EXCEEDED" }) as never,
+    );
+    // Remaining headroom (100) exactly fits a 100µ envelope.
+    const ok = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j5b", work_item_id: wi,
+      est_microusd: 100, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(ok.scope).toBe("UNCAPPED");
+  });
+
+  it("J6. unbounded envelope under a positive canonical ceiling cannot be proven within remaining → UNVERIFIED", () => {
+    const { ctx, wi } = lineageWithObjective("j6", { ceiling_microusd: 1_000_000 });
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j6", work_item_id: wi,
+        est_microusd: 10, unbounded_unknown: true, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_UNVERIFIED" }) as never,
+    );
+  });
+
+  it("J7. budget changed mid-generation: admission re-reads the canonical budget at reserve time", () => {
+    const { ctx, wi, oid } = lineageWithObjective("j7", { ceiling_microusd: 1_000_000 });
+    const first = ctx.service.cost.admitPlannerInvocation({
+      planner_run_id: "PRN_j7a", work_item_id: wi,
+      est_microusd: 100, unbounded_unknown: false, candidates: 1,
+      actor: "TEST",
+    });
+    expect(first.scope).toBe("UNCAPPED");
+    // The canonical budget authority moves to zero while a SECOND
+    // generation is still in flight — the next admission re-proves.
+    const obj = ctx.store.get("objective", oid);
+    ctx.store.put("objective", oid, {
+      ...obj,
+      budget: { ceiling_microusd: 0, consumed_microusd: 0 },
+    }, Number(obj.version));
+    expect(() =>
+      ctx.service.cost.admitPlannerInvocation({
+        planner_run_id: "PRN_j7b", work_item_id: wi,
+        est_microusd: 50, unbounded_unknown: false, candidates: 1,
+        actor: "TEST",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "FAIL_CLOSED_COST_OBJECTIVE_ZERO_BUDGET" }) as never,
+    );
   });
 });
