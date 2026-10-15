@@ -19,6 +19,13 @@ import fs from "node:fs";
 import { digest, newId, utcnow } from "./canonical.js";
 import { IntegrityError, PolicyError } from "./errors.js";
 import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
+import { DRIVER_ACTOR } from "./work-open-binding.js";
+import { AUTONOMOUS_EXECUTOR_IDS } from "./executor-registry.js";
+import { providerEntryId } from "./provider-catalog.js";
+import {
+  CODEX_CLI_PROVIDER_ID,
+  codexAuthMode,
+} from "./codex-cli-transport.js";
 import { assertCanonicalObjectiveBudget } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
@@ -821,6 +828,97 @@ export class CostService {
               used_microusd: attributed,
               requested_microusd: requested,
               max_microusd: objScope.cap,
+            });
+          }
+        }
+      }
+      // PR #121 — autonomous dispatch authority, proven INSIDE the same
+      // atomic check-and-reserve. A work_open_binding minted by the
+      // objective auto driver (created_by = DRIVER_ACTOR) marks this
+      // dispatch as autonomous work: it may only reserve through the
+      // canonical AUTONOMOUS_EXECUTOR_IDS set — a dashboard toggle, an
+      // adapter composition or a route edit can never make DEVIN/DSH
+      // autonomous — and the pairing's billing identity must be
+      // provably non-metered (a $0-reserved METERED row can still
+      // SETTLE positive, so it is forbidden categorically, not merely
+      // over-cap). AUDIT R1 F2: subscription-only is UNCONDITIONAL —
+      // the monetary cap binds what is allowed but is not itself the
+      // metered gate, so METERED_API / UNKNOWN / unbounded billing is
+      // denied under an absent, zero or positive cap alike. Live state
+      // is re-read inside THIS transaction: an executor enable, profile
+      // flip or route change between driver admission and this reserve
+      // is never trusted from a snapshot. Reservations already proven
+      // (COMMITTED/SETTLED re-hold of a RELEASED row) return through
+      // the existing paths above and are never re-gated.
+      const openId = String(params.mission.bound_open_id ?? "");
+      const driverWob = openId
+        ? this.store.tryGet("work_open_binding", openId)
+        : null;
+      if (driverWob && String(driverWob.created_by) === DRIVER_ACTOR) {
+        if (!(AUTONOMOUS_EXECUTOR_IDS as readonly string[])
+            .includes(params.executorId)) {
+          violations.push({
+            scope_type: "autonomous",
+            scope_id: String(params.executorId),
+            reason: "FAIL_CLOSED_COST_AUTONOMOUS_EXECUTOR",
+            used_microusd: null, requested_microusd: null,
+            max_microusd: null,
+          });
+        }
+        if (billing.mode === "METERED_API" || billing.mode === "UNKNOWN" ||
+            billing.unbounded) {
+          violations.push({
+            scope_type: "autonomous",
+            scope_id: routeId ?? params.executorId,
+            reason: "FAIL_CLOSED_COST_AUTONOMOUS_METERED",
+            used_microusd: null,
+            requested_microusd: requested,
+            max_microusd: objScope && objScope !== "BROKEN"
+              ? objScope.cap : null,
+          });
+        }
+        // AUDIT R1 F3 + R2 F2 — final atomic re-proof for the
+        // subscription transport: a driver-attributed CODEX dispatch
+        // requires THIS dispatch's resolved billing identity — the
+        // SELECTED route's profile, then model, then executor
+        // (billingFor order) — to be exactly SUBSCRIPTION, not merely
+        // an executor-level declaration. A route profile flipped to
+        // FREE/UNMETERED/METERED/UNKNOWN (or any unbounded/
+        // contradictory binding) between admission and reserve is
+        // denied here. Plus a live canonical provider session
+        // (auth_state === AUTH_OK). Fresh in-txn state only — never a
+        // caller snapshot.
+        if (params.executorId === CODEX_EXECUTOR_ID) {
+          const subscriptionProven =
+            billing.mode === "SUBSCRIPTION" &&
+            billing.profile != null &&
+            !billing.unbounded;
+          const provider = this.store.tryGet(
+            "provider", providerEntryId(CODEX_CLI_PROVIDER_ID));
+          const sessionProven =
+            String(provider?.auth_state ?? "") === "AUTH_OK";
+          if (!subscriptionProven || !sessionProven) {
+            violations.push({
+              scope_type: "autonomous",
+              scope_id: routeId ?? CODEX_EXECUTOR_ID,
+              reason: "FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION",
+              used_microusd: null,
+              requested_microusd: null,
+              max_microusd: null,
+            });
+          }
+          // AUDIT R2 F1 — AUTH_OK proves a probe succeeded, not that the
+          // session is ChatGPT-billed: the live auth-mode re-proof reads
+          // the persisted session file's structure inside this txn.
+          // API_KEY / UNAUTHENTICATED / AMBIGUOUS fail closed.
+          if (codexAuthMode(undefined) !== "CHATGPT") {
+            violations.push({
+              scope_type: "autonomous",
+              scope_id: CODEX_EXECUTOR_ID,
+              reason: "FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE",
+              used_microusd: null,
+              requested_microusd: null,
+              max_microusd: null,
             });
           }
         }

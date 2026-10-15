@@ -115,6 +115,7 @@ import {
   MissionDraftService,
   TelegramConversationService,
   ObjectiveAutoPolicyService,
+  AUTONOMOUS_EXECUTOR_IDS,
   createObjectiveAutoReconcile,
   createObjectiveAutoDriver,
   createDefaultObjectiveOperatingService,
@@ -125,6 +126,7 @@ import {
   assertTelegramDeliveryTiming,
   modelRoleOf,
   MODEL_ROLE,
+  digest,
   utcnow,
   resolveMcAdminToken,
   operationalStatusMaxChars,
@@ -282,7 +284,11 @@ if (process.env.PAIR_DSH_HOME) {
   });
   governed.set(DSH_EXECUTOR_ID, dshAdapter);
 }
-if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot }));
+// AUDIT R1 F1 — the canonical store seam lets the governed Codex adapter
+// resolve driver-attributed provenance (mission → bound_open →
+// work_open_binding.created_by): autonomous dispatches run
+// subscription-only, with metered API keys stripped from the child env.
+if (process.env.CODEX_HOME) governed.set(CODEX_EXECUTOR_ID, new CodexCliExecutorAdapter({ journalRoot, store }));
 // DEVIN registers unconditionally — without PAIR_DEVIN_API_KEY it stays
 // UNQUALIFIED (fail-closed) and the UI shows the missing credential env name.
 // Cost guard — caps remote Devin dispatches per UTC day (ACU spend) and the
@@ -532,13 +538,35 @@ if (process.env.PAIR_OBJECTIVE_AUTO_DRIVER === "1") {
   // the value is env-validated here so a bad PAIR_CEO_CLI_TIMEOUT_MS
   // fails boot closed rather than binding an unvalidated bound.
   const objectiveCeoTimeoutMs = ceoCliTimeoutMs();
+  // PR #121 — the autonomous cost-binding projection is the canonical
+  // AUTONOMOUS_EXECUTOR_IDS set (CODEX + PAIR_NATIVE), not the raw
+  // registered adapter list: [...governed.keys()] wrongly included
+  // DEVIN even when DISABLED and never included PAIR_NATIVE. Eligibility
+  // is still re-proven live against canonical executor/route/binding
+  // rows inside the driver on every admission — a dashboard toggle can
+  // never silently authorize DEVIN/DSH for autonomous work (the
+  // assertAndReserve autonomous gate denies their reservations
+  // outright), and DECLARE the codex-cli billing identity once: the
+  // ChatGPT subscription session, SUBSCRIPTION mode. Never overwrite
+  // an existing declaration — a contradictory METERED/UNKNOWN profile
+  // stays visible to the envelope and fails closed.
+  {
+    const codexProfileId =
+      `CPRO_executor_${digest(`executor:${CODEX_EXECUTOR_ID}`).slice(0, 20)}`;
+    if (!store.tryGet("cost_profile", codexProfileId)) {
+      service.cost.upsertCostProfile({
+        ref_type: "executor", ref_id: CODEX_EXECUTOR_ID,
+        billing_mode: "SUBSCRIPTION",
+      }, "objective-auto-driver-boot");
+    }
+  }
   objectiveAutoDriver = createObjectiveAutoDriver({
     store,
     objectives: business.objectives,
     policy: objectiveAutoPolicy,
     scheduler: objectiveAutoReconcile.scheduler,
     runPass: (input) => objectivePassRunner(input),
-    executors: [...governed.keys()],
+    executors: [...AUTONOMOUS_EXECUTOR_IDS],
     billingFor: (executorId, routeId) => service.cost.billingFor(executorId, routeId),
     costHaltActive: () =>
       process.env.PAIR_COST_HALT === "1" || fs.existsSync(COST_HALT_FILE),

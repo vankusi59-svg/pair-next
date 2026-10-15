@@ -168,8 +168,16 @@ function assertLimits(v: unknown): AutoPolicyLimits {
   for (const k of intCaps) {
     const val = l[k];
     if (val === undefined || val === null) continue;
-    if (!Number.isInteger(val) || Number(val) <= 0) {
-      fail("FAIL_CLOSED_POLICY_LIMITS", `${k} must be a positive integer`);
+    // PR #121 — budget_microusd_cap accepts EXACTLY 0 as an explicit
+    // hard zero-incremental-spend policy (subscription-only lanes may
+    // still run: they spend no metered API money). Zero stays invalid
+    // for every other cap; negative/fractional/malformed always fail.
+    const min = k === "budget_microusd_cap" ? 0 : 1;
+    if (!Number.isInteger(val) || Number(val) < min) {
+      fail(
+        "FAIL_CLOSED_POLICY_LIMITS",
+        `${k} must be ${min === 0 ? "a non-negative" : "a positive"} integer`,
+      );
     }
     (out as unknown as Record<string, number>)[k] = val as number;
     if (k !== "max_retries") present++;
@@ -472,7 +480,7 @@ export class ObjectiveAutoPolicyService {
       owner_authority_id: String(obj.owner_authority_id),
       business_id: String(obj.business_id),
       driver_ready: false,
-      driver_missing: ["AUTO_DRIVER_NOT_INTEGRATED", "COST_BINDING_UNVERIFIED"],
+      driver_missing: ["DRIVER_DISABLED", "AUTO_DRIVER_NOT_INTEGRATED", "COST_BINDING_UNVERIFIED"],
       terms_digest_binding: row?.terms_digest_binding ?? null,
       terms_current: termsCurrent,
     };

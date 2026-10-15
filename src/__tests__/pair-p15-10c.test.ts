@@ -14,6 +14,8 @@ import {
   ObjectiveAutoWakeupService,
   ObjectiveAuthorityService,
   PairEvidenceStore,
+  providerEntryId,
+  CODEX_CLI_PROVIDER_ID,
   readSchedulerRow,
 } from "../pair/index.js";
 import type { OperatingPassResult } from "../pair/index.js";
@@ -35,6 +37,16 @@ function fresh(name: string, initial = 1_000_000): Stack {
   let t = initial;
   const dir = path.join(ROOT, String(counter++) + "-" + name);
   fs.mkdirSync(dir, { recursive: true });
+  // AUDIT R2-F1 — the live auth-mode proof reads CODEX_HOME/auth.json:
+  // pin a per-stack home carrying a ChatGPT OAuth session file (the
+  // state production converges to after `codex login`).
+  const codexHome = path.join(dir, ".codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { id_token: { sub: "u" }, access_token: "a", refresh_token: "r" },
+  }));
+  process.env.CODEX_HOME = codexHome;
   const dbPath = path.join(dir, "pair.db");
   const store = new PairEvidenceStore(dbPath);
   const objectives = new ObjectiveAuthorityService(store);
@@ -90,10 +102,30 @@ function mkDriver(s: Stack, opts: {
   outcome?: OperatingPassResult["outcome"];
   onPass?: (call: PassCall, gate: () => void) => void | Promise<void>;
   halt?: () => boolean;
-  billing?: () => { mode: string; profile: Record<string, unknown> | null; unbounded: boolean };
+  billing?: (e: string, r?: string | null) => { mode: string; profile: Record<string, unknown> | null; unbounded: boolean };
   workerId?: string; bootId?: string; maxPassesPerTick?: number;
 } = {}) {
   const calls: PassCall[] = [];
+  // PR #121 — the configured autonomous id must exist as a canonical
+  // ENABLED+QUALIFIED executor row to enter the supply envelope.
+  if (!s.store.tryGet("executor", "CODEX")) {
+    s.store.put("executor", "CODEX", {
+      executor_id: "CODEX", executor_type: "EXTERNAL", status: "ENABLED",
+      health_state: "READY", capabilities: [],
+      metadata: { qualification_state: "QUALIFIED" },
+    }, 0);
+  }
+  // AUDIT R1 F4 — the CEO subscription lane is proven independently of
+  // executor supply: seed the canonical codex-cli provider session
+  // (AUTH_OK) and let the default billing stub resolve CODEX to
+  // SUBSCRIPTION — the state a production opt-in boot converges to.
+  const pid = providerEntryId(CODEX_CLI_PROVIDER_ID);
+  if (!s.store.tryGet("provider", pid)) {
+    s.store.put("provider", pid, {
+      provider_id: CODEX_CLI_PROVIDER_ID, auth_state: "AUTH_OK",
+      lifecycle_state: "QUALIFIED", health_state: "READY", version: 0,
+    }, 0);
+  }
   const driver = new ObjectiveAutoDriverService({
     store: s.store, objectives: s.objectives, policy: s.policy,
     scheduler: s.scheduler,
@@ -105,7 +137,10 @@ function mkDriver(s: Stack, opts: {
       return { outcome: opts.outcome ?? "WAITING", objective_id: input.objective_id };
     },
     executors: ["CODEX"],
-    billingFor: opts.billing ?? (() => ({ mode: "UNMETERED", profile: null, unbounded: false })),
+    billingFor: opts.billing ?? ((e: string) =>
+      e === "CODEX"
+        ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+        : { mode: "UNMETERED", profile: null, unbounded: false }),
     costHaltActive: opts.halt ?? (() => false),
     workerId: opts.workerId ?? "test-driver-1",
     bootId: opts.bootId ?? "boot-1",
@@ -224,7 +259,10 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     });
     const out = await driver.tick();
     expect(calls).toHaveLength(0);
-    expect(out.driven[0]!.denied).toBe("DRIVER_CAP_EXHAUSTED");
+    // AUDIT R1 F2 — a reachable METERED_API pairing is categorically
+    // forbidden for autonomous work under ANY cap (subscription-only);
+    // it is denied before cap arithmetic ever runs.
+    expect(out.driven[0]!.denied).toBe("DRIVER_METERED_FORBIDDEN");
     expect(queue(s, oid(o)).queue_state).toBe("QUARANTINED");
   });
 
@@ -233,8 +271,24 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     const o = mkObjective(s, mkBiz(s.store));
     enable(s, oid(o), { budget_microusd_cap: 100_000 });
     wake(s, oid(o));
+    // AUDIT R2 — put the unbounded binding on a QUALIFIED route pairing
+    // so the executor-level CODEX lane can stay SUBSCRIPTION (the CEO
+    // proof still resolves) while the envelope still sees an unbounded
+    // pairing. This isolates DRIVER_COST_UNVERIFIED to its own cause.
+    s.store.put("route", "RTE_C09", {
+      route_id: "RTE_C09", executor_id: "CODEX", enabled: true,
+      qualification_state: "QUALIFIED", eligibility_state: "ELIGIBLE",
+      health: { state: "READY" }, version: 0,
+    }, 0);
+    s.store.put("executor_supply_binding", "ESB_C09", {
+      binding_id: "ESB_C09", executor_id: "CODEX", route_id: "RTE_C09",
+      qualification_state: "QUALIFIED", version: 0,
+    }, 0);
     const { driver, calls } = mkDriver(s, {
-      billing: () => ({ mode: "METERED_API", profile: null, unbounded: true }),
+      billing: (e, r) =>
+        e === "CODEX" && (r === null || r === undefined)
+          ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+          : { mode: "METERED_API", profile: null, unbounded: true },
     });
     const out = await driver.tick();
     expect(calls).toHaveLength(0);

@@ -98,6 +98,16 @@ export const CANONICAL_IDENTITIES: Record<
   },
 };
 
+/** PR #121 — the ONLY executor identities an autonomous Objective pass
+ *  (driver-attributed work) may ever dispatch through. Frozen at the
+ *  identity layer: dashboard executor toggles, adapter composition and
+ *  route edits can never add an id to this set. CODEX bills through its
+ *  ChatGPT subscription session; PAIR_NATIVE through UNMETERED local
+ *  execution. DEVIN / DEEPSEEK_HARNESS are explicitly excluded even when
+ *  ENABLED for manual governed work. */
+export const AUTONOMOUS_EXECUTOR_IDS = ["CODEX", "PAIR_NATIVE"] as const;
+export type AutonomousExecutorId = (typeof AUTONOMOUS_EXECUTOR_IDS)[number];
+
 const IDENTITY_FIELDS = ["logical_provider", "adapter_id", "transport_type"] as const;
 
 const VOLATILE_FIELDS = new Set([
@@ -138,13 +148,13 @@ export class ExecutorRegistry {
       ).length;
   }
 
-  private static availabilityState(record: Record<string, unknown>): string {
+  static availabilityState(record: Record<string, unknown>): string {
     if (record.status === "DISABLED" || record.health_state === "DISABLED") return "DISABLED";
     if (record.health_state === "READY") return "AVAILABLE";
     return "UNKNOWN";
   }
 
-  private static authState(metadata: Record<string, unknown>): string {
+  static authState(metadata: Record<string, unknown>): string {
     if (metadata.auth_state) return String(metadata.auth_state);
     const mode = String(metadata.authentication_mode ?? "").toUpperCase();
     if (["CHATGPT_SESSION", "CLI_SESSION", "AUTHENTICATED"].includes(mode)) return "AUTHENTICATED";

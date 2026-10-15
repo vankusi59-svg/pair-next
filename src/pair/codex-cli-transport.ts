@@ -52,6 +52,111 @@ export function codexCliEnvGet(env: CodexCliEnv | undefined, name: string): stri
   return typeof env === "function" ? env(name) : env[name];
 }
 
+/** The codex home a spawned child resolves — explicit CODEX_HOME, else
+ *  the platform default (~/.codex via HOME/USERPROFILE). Mirrors what
+ *  the child itself sees: the persisted session lives in this dir. */
+export function codexHomeDir(env: CodexCliEnv | undefined): string | null {
+  const configured = codexCliEnvGet(env, "CODEX_HOME");
+  if (configured) return configured;
+  const home =
+    codexCliEnvGet(env, "HOME") ?? codexCliEnvGet(env, "USERPROFILE");
+  return home ? path.join(home, ".codex") : null;
+}
+
+/** The effective Codex CLI authentication mode a governed child would
+ *  run under (R2-F1). `codex exec` resolves auth as: env API key (never
+ *  forwarded to governed children — codexCliChildEnv strips it; the
+ *  executor adapter strips it for autonomous dispatch) → the persisted
+ *  session file. So auth.json's STRUCTURE is the effective mode:
+ *  an explicit `auth_mode` field takes precedence over credential-shape
+ *  inference (R3); absent it, the mere PRESENCE of a non-null
+ *  OPENAI_API_KEY or any alternative persisted credential family is
+ *  metered/contradictory billing (codex-rs is_some() semantics) even
+ *  when ambient env keys are absent; a ChatGPT OAuth `tokens` session
+ *  is the only subscription identity. SECRET-SAFE: key names and field
+ *  shapes only — credential values are never read out, logged or
+ *  persisted. Anything missing/unparsable/contradictory fails closed. */
+export type CodexAuthMode = "CHATGPT" | "API_KEY" | "UNAUTHENTICATED" | "AMBIGUOUS";
+
+export function codexAuthMode(env: CodexCliEnv | undefined): CodexAuthMode {
+  const home = codexHomeDir(env);
+  if (!home) return "UNAUTHENTICATED";
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(home, "auth.json"), "utf8");
+  } catch {
+    return "UNAUTHENTICATED";
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "AMBIGUOUS";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "AMBIGUOUS";
+  }
+  const rec = parsed as Record<string, unknown>;
+  // ChatGPT OAuth session material — the real codex-rs shape carries
+  // access_token + refresh_token strings plus an id_token claim set.
+  const tokens = rec.tokens;
+  const t = (tokens !== null && typeof tokens === "object" &&
+    !Array.isArray(tokens)) ? tokens as Record<string, unknown> : null;
+  const tokensValid = t !== null &&
+    typeof t.access_token === "string" && t.access_token !== "" &&
+    typeof t.refresh_token === "string" && t.refresh_token !== "" &&
+    t.id_token != null;
+
+  // AUDIT R3 F1 — codex-rs' persisted resolver gives an explicit
+  // auth_mode precedence over credential-shape inference. Accept only
+  // "chatgpt" backed by valid OAuth session material; every other
+  // explicit mode — including "apikey" — is a non-subscription
+  // declaration no matter how valid coexisting tokens look, and a
+  // malformed/unknown declaration is unverifiable → fail closed.
+  const declared = rec.auth_mode;
+  if (typeof declared === "string" && declared.trim() !== "") {
+    const m = declared.trim().toLowerCase();
+    if (m === "chatgpt") {
+      if (tokensValid) return "CHATGPT";
+      return tokens == null ? "UNAUTHENTICATED" : "AMBIGUOUS";
+    }
+    if (m === "apikey") return "API_KEY";
+    return "AMBIGUOUS";
+  }
+  if (declared !== undefined && declared !== null) return "AMBIGUOUS";
+
+  // auth_mode absent — credential-shape inference matching codex-rs
+  // AuthDotJson::resolved_mode() Option::is_some() semantics: field
+  // PRESENCE with a non-null value is a persisted credential — empty
+  // strings, arrays and objects still resolve that credential's mode;
+  // they never let coexisting OAuth tokens classify as CHATGPT.
+  const storedKey = rec.OPENAI_API_KEY;
+  if (storedKey !== undefined && storedKey !== null) return "API_KEY";
+  // Contradictory alternative credential families — a persisted PAT or
+  // bedrock key set is a DIFFERENT non-subscription authority the CLI
+  // can resolve; alongside OAuth tokens the effective mode is
+  // unprovable → fail closed, never CHATGPT.
+  for (const field of [
+    "personal_access_token", "bedrock_api_key", "bedrock_access_keys",
+  ]) {
+    const v = rec[field];
+    if (v !== undefined && v !== null) return "AMBIGUOUS";
+  }
+  if (tokensValid) return "CHATGPT";
+  return "AMBIGUOUS";
+}
+
+/** True only when the effective autonomous auth mode is a ChatGPT
+ *  subscription session — the live, file-backed proof behind
+ *  subscription-only invocation. Re-resolved on every call: a
+ *  `codex logout` / `login --with-api-key` between admission and
+ *  invocation is never trusted from a cached verdict. */
+export function codexChatgptSessionProven(
+  env: CodexCliEnv | undefined,
+): boolean {
+  return codexAuthMode(env) === "CHATGPT";
+}
+
 export function resolveCodexExecutable(env: CodexCliEnv | undefined): string | null {
   const configured =
     codexCliEnvGet(env, "PAIR_CODEX_PLANNER_EXECUTABLE") ??

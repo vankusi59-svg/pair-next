@@ -86,6 +86,8 @@ const FAULT_LABELS = new Set<string>([
   "SQLITE_CONTENTION", "NOT_FOUND", "INTEGRITY_FAULT", "UNEXPECTED_FAULT",
   "DRIVER_CAP_EXHAUSTED", "DRIVER_COST_UNVERIFIED", "DRIVER_COST_HALTED",
   "DRIVER_AUTHORITY_LOST", "DRIVER_PASS_FAULT", "DRIVER_ADMISSION_DENIED",
+  // AUDIT R1 F2/F4 — unconditional subscription-only denials.
+  "DRIVER_METERED_FORBIDDEN", "DRIVER_SUBSCRIPTION_UNVERIFIED",
 ]);
 
 /** Typed, bounded fault label for durable state. Raw exception text and

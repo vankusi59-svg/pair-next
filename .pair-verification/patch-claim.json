@@ -1,25 +1,30 @@
 {
-  "claim_id": "SUBSCRIPTION_ONLY_LLM_POLICY",
-  "title": "Subscription-Only LLM Policy — Codex CLI / ChatGPT subscription is the ONLY production LLM transport for Planner (INITIAL+REPLAN), LLM CEO and Conversation Reasoning; no HTTP/API fallback on unavailability, rate limit, logout, quota exhaustion or timeout",
+  "claim_id": "SUBSCRIPTION_AUTO_RUN_CEO",
+  "title": "Subscription-Only Auto Run CEO — AUDIT_R3 minimal auth-mode closure: codexAuthMode honors persisted auth_mode precedence and rejects contradictory credential families",
   "affected_surfaces": [
-    "PLANNER",
-    "CONVERSATION",
-    "GATE_ROUTER",
-    "MISSION_CONTROL"
+    "BUSINESS_OBJECTIVE",
+    "MISSION_CONTROL",
+    "GATE_ROUTER"
   ],
   "required_tests": [
-    "src/__tests__/pair-subscription-llm.test.ts",
+    "src/__tests__/pair-subscription-auto-run-ceo.test.ts",
+    "src/__tests__/pair-p15-10c.test.ts",
+    "src/__tests__/pair-p15-10c-r1.test.ts",
+    "src/__tests__/pair-p15-10c-r2.test.ts",
+    "src/__tests__/pair-p15-10c-r3.test.ts",
+    "src/__tests__/pair-p15-10c-r4.test.ts",
+    "src/__tests__/pair-phase-c-audit-r1.test.ts",
+    "src/__tests__/pair-p13.test.ts",
     "src/__tests__/pair-executor-toggle.test.ts",
-    "src/__tests__/pair-async-replan-generation.test.ts",
-    "src/__tests__/pair-llm-planner.test.ts",
-    "src/__tests__/pair-p15-8b-conversation-reasoning.test.ts",
-    "src/__tests__/pair-p15-8a-conversation-authority.test.ts"
+    "src/__tests__/pair-subscription-llm.test.ts",
+    "src/__tests__/pair-p15-10a-auto-policy.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts"
   ],
   "invariants": [
-    "INV_PLAN_001",
-    "INV_CONV_001",
+    "INV_EXEC_001",
+    "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "Codex CLI subscription is the sole permitted transport for the three reasoning lanes. PLANNER: assertCodexOnlyPlannerRoute (model-role.ts) gates the composed route pool — every non-empty route in PAIR_PLANNER_MODEL_ROUTE/FALLBACK/EXTRA_ROUTES must be `codex-cli:<model>` or boot fails closed FAIL_CLOSED_PLANNER_TRANSPORT_UNAUTHORIZED before discovery, probes or invocation; default Gemini fallback REMOVED. The candidate-pool loop throws on any non-codex ref instead of an HTTP qualifyRoute probe, and production planFn runs assertCodexCliPlannerTransport (serve-planner.ts) before codexPlannerPlan — a forged HTTP candidate is an authority violation; the llmPlan branch is deleted. Pool evidence, eligibility, REASK, deadlines, cost reservation and in-pool failover unchanged; codex quota failure settles QUOTA_RATE_LIMITED then EXHAUSTED. INITIAL and REPLAN share the one plannerCandidates array. CEO: CodexCliCeoDecisionInvoker refuses forged transports FAIL_CLOSED_CEO_NON_CODEX_TRANSPORT before resolution/spawn. CONVERSATION: resolveConversationModelTransport + CodexCliConversationInvoker both require codex-cli/CODEX_CLI/codex-cli://local; one invoker serves Dashboard Chat + Telegram. AUTH: codexCliChildEnv never forwards OPENAI_API_KEY/CODEX_API_KEY to children. Residual API activity outside the lanes: DSH qualification probes + DSH Model Router (unchanged per scope); llmPlan kept as shared infra with zero production callers. PR #119 executor toggles untouched.",
+  "description": "AUDIT_R3 minimal closure on the opt-in subscription-only autonomous lane (PAIR_OBJECTIVE_AUTO_DRIVER=1, still default OFF). R3-F1: codexAuthMode() in codex-cli-transport.ts now matches codex-rs' persisted-mode precedence — an explicit auth_mode field wins over credential-shape inference: auth_mode 'chatgpt' resolves CHATGPT only with valid OAuth token material; 'apikey' resolves API_KEY and any other explicit value resolves AMBIGUOUS, all denied regardless of coexisting tokens; a non-string/empty auth_mode is unverifiable → AMBIGUOUS. When auth_mode is absent, credential inference uses codex-rs AuthDotJson::resolved_mode() Option::is_some() semantics — field PRESENCE with a non-null value is a persisted credential: OPENAI_API_KEY (any non-null value, including an empty string) resolves API_KEY, and personal_access_token / bedrock_api_key / bedrock_access_keys (any non-null value, including empty strings/arrays/objects) resolve AMBIGUOUS — never CHATGPT merely because OAuth tokens coexist. Token-shape verification, fail-closed absent/malformed handling and manual Executor behavior unchanged; no credential values are read, logged or persisted. The single resolver feeds all three enforcement seams unchanged — CodexCliExecutorAdapter spawn boundary (FAIL_CLOSED_CODEX_AUTH_MODE), driver admission + authorityGate re-proof (DRIVER_SUBSCRIPTION_UNVERIFIED), and the atomic assertAndReserve gate (FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE). Evidence: 63 focused tests (Z10.1-11: chatgpt/tokens ok, chatgpt-mode ok, apikey-mode denied, non-chatgpt mode denied, PAT denied, bedrock families denied, chatgpt-mode-without-tokens denied, admission-level apikey denial, empty-string/empty-collection credential presence denied, null fields absent) failing-first pre-implementation; all R2 Z9 coverage preserved; win32 baselines unchanged (10d=15, 10d-r1=7, met-fold=7, p15-3=9, cpl1=22, p5=3).",
   "risk_override": "HIGH"
 }
