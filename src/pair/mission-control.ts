@@ -461,10 +461,13 @@ export class MissionControl {
 
   /** §4.1 — canonical entity events after `sinceSeq` (hash-verified on read).
    *  Drives the SSE stream; returns latest_seq so cursors don't regress. */
-  eventsSince(sinceSeq = 0): { events: Array<Record<string, unknown>>; latest_seq: number } {
-    const all = this.store.listEvents();
-    const latest = all.length ? Number(all[all.length - 1].seq ?? 0) : sinceSeq;
-    return { events: all.filter((e) => Number(e.seq ?? 0) > sinceSeq), latest_seq: latest };
+  eventsSince(sinceSeq = 0, limit = 1024): { events: Array<Record<string, unknown>>; latest_seq: number } {
+    const events = this.store.listEventsSince(sinceSeq, limit);
+    // high-water delivered: a full page means more rows remain, so the
+    // cursor lands on the last row actually sent and the client keeps
+    // paging instead of silently skipping the journal middle.
+    const latest = events.length ? Number(events[events.length - 1]!.seq ?? 0) : sinceSeq;
+    return { events, latest_seq: latest };
   }
 
   timeline(missionId: string) {

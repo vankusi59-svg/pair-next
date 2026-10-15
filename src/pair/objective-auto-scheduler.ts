@@ -118,6 +118,7 @@ type Queue = Row & {
   settled_generation: number; checkpoint_digest: string; source_refs: string[];
   reasons: string[]; next_due: number | null; wait_kind: string | null;
   retry_count: number; queue_state: string; blocked_reason: string | null;
+  wait_streak: number;
   last_observation_digest: string; last_source_seq: number;
 };
 type Lease = Row & {
@@ -369,6 +370,7 @@ export class ObjectiveAutoScheduler {
       pending_generation: 0, claimed_generation: 0, settled_generation: 0,
       checkpoint_digest: digest({ objectiveId, rank }), source_refs: [], reasons: [],
       coalesced_count: 0, next_due: null, wait_kind: null, retry_count: 0,
+      wait_streak: 0,
       queue_state: "WAITING_CONSUMER", blocked_reason: null,
       last_observation_digest: "", last_source_seq: 0,
     }, "REGISTER", objectiveId);
@@ -877,11 +879,20 @@ export class ObjectiveAutoScheduler {
       writeSchedulerRow(this.store, LEASE_STATE, handle.objective_id, {
         ...fields(lease), state: "SETTLED", token_hash: null, expires_at: null,
       }, "SETTLE", operationId);
+      // no-progress decay: a timed re-arm that leaves nothing new pending
+      // is a poll that proved empty — consecutive ones back off (bounded),
+      // so a permanently-unactionable Objective cannot spin the journal at
+      // its base cadence forever. Real pending work resets the streak.
+      const timedWait = continuation.state === "WAITING_EVIDENCE" && continuation.next_due !== null;
+      const leavesPending = q.pending_generation > lease.claimed_generation;
+      const streak = timedWait && !leavesPending ? Number(q.wait_streak ?? 0) : 0;
+      const backoff = Math.min(2 ** streak, 12);
       writeSchedulerRow(this.store, WAKE_STATE, handle.objective_id, {
         ...fields(q), settled_generation: Math.max(q.settled_generation, lease.claimed_generation),
-        queue_state: q.pending_generation > lease.claimed_generation ? "WAITING_CONSUMER" : continuation.state,
+        queue_state: leavesPending ? "WAITING_CONSUMER" : continuation.state,
         wait_kind: continuation.wait_kind, next_due: continuation.next_due === null
-          ? null : this.instant() + continuation.next_due,
+          ? null : this.instant() + continuation.next_due * backoff,
+        wait_streak: timedWait && !leavesPending ? streak + 1 : 0,
         blocked_reason: continuation.blocked_reason,
       }, "SETTLED_GENERATION", operationId);
       writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
@@ -928,6 +939,7 @@ export class ObjectiveAutoScheduler {
         AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)<=?
         ORDER BY CAST(json_extract(payload,'$.registration_rank') AS INTEGER), entity_id LIMIT ?`)
         .all(WAKE_STATE, last, upper, PAGE) as Array<{ entity_id: string }>;
+      let furthest = last;
       for (const item of candidates) {
         const q = this.queue(item.entity_id);
         if (!q) invalid("candidate disappeared");
@@ -936,16 +948,34 @@ export class ObjectiveAutoScheduler {
         const usable = q.queue_state === "WAITING_CONSUMER" && !activeLease &&
           (q.pending_generation > q.claimed_generation || q.claimed_generation > q.settled_generation) &&
           (q.next_due === null || q.next_due <= this.instant());
-        writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-          ...fields(f), last_visited_rank: q.registration_rank,
-        }, "FAIR_VISIT", item.entity_id);
-        if (usable) return item.entity_id;
+        furthest = q.registration_rank;
+        if (usable) {
+          // the claim decision is the visit that must be journaled — it
+          // records where the deterministic rotation stopped
+          writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+            ...fields(f), last_visited_rank: furthest,
+          }, "FAIR_VISIT", item.entity_id);
+          return item.entity_id;
+        }
       }
-      if (candidates.length === PAGE) return null;
-      writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-        ...fields(f), round: Number(f.round) + 1,
-        cohort_high_rank: Number(f.registration_counter), last_visited_rank: 0,
-      }, "FAIR_ROUND", String(f.round));
+      if (candidates.length === PAGE) {
+        // page-bound progress: one durable cursor move per call so the
+        // next call continues instead of rescanning — not one per row
+        writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+          ...fields(f), last_visited_rank: furthest,
+        }, "FAIR_VISIT", String(furthest));
+        return null;
+      }
+      const counter = Number(f.registration_counter);
+      if (last > 0 || upper < counter) {
+        // cohort wrap/bound refresh commits; a no-change sweep over a
+        // parked cursor journals nothing — rescanning an unchanged
+        // cohort is deterministic, so the receipt carried no decision
+        writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+          ...fields(f), round: Number(f.round) + 1,
+          cohort_high_rank: counter, last_visited_rank: 0,
+        }, "FAIR_ROUND", String(f.round));
+      }
       return null;
     });
   }

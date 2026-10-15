@@ -1,30 +1,30 @@
 {
-  "claim_id": "SUBSCRIPTION_AUTO_RUN_CEO",
-  "title": "Subscription-Only Auto Run CEO — AUDIT_R3 minimal auth-mode closure: codexAuthMode honors persisted auth_mode precedence and rejects contradictory credential families",
+  "claim_id": "SCHEDULER_JOURNAL_HOTFIX",
+  "title": "Scheduler journal hotfix — bound SSE event reads, silence no-op fairness sweeps, decay no-progress wait loops (live-ops regression)",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
     "GATE_ROUTER"
   ],
   "required_tests": [
-    "src/__tests__/pair-subscription-auto-run-ceo.test.ts",
+    "src/__tests__/pair-scheduler-journal-hotfix.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts",
+    "src/__tests__/pair-p15-10b-r1.test.ts",
     "src/__tests__/pair-p15-10c.test.ts",
     "src/__tests__/pair-p15-10c-r1.test.ts",
     "src/__tests__/pair-p15-10c-r2.test.ts",
     "src/__tests__/pair-p15-10c-r3.test.ts",
     "src/__tests__/pair-p15-10c-r4.test.ts",
-    "src/__tests__/pair-phase-c-audit-r1.test.ts",
-    "src/__tests__/pair-p13.test.ts",
-    "src/__tests__/pair-executor-toggle.test.ts",
-    "src/__tests__/pair-subscription-llm.test.ts",
+    "src/__tests__/pair-subscription-auto-run-ceo.test.ts",
+    "src/__tests__/pair-p9.test.ts",
     "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts"
+    "src/__tests__/pair-phase-c-audit-r1.test.ts"
   ],
   "invariants": [
     "INV_EXEC_001",
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "AUDIT_R3 minimal closure on the opt-in subscription-only autonomous lane (PAIR_OBJECTIVE_AUTO_DRIVER=1, still default OFF). R3-F1: codexAuthMode() in codex-cli-transport.ts now matches codex-rs' persisted-mode precedence — an explicit auth_mode field wins over credential-shape inference: auth_mode 'chatgpt' resolves CHATGPT only with valid OAuth token material; 'apikey' resolves API_KEY and any other explicit value resolves AMBIGUOUS, all denied regardless of coexisting tokens; a non-string/empty auth_mode is unverifiable → AMBIGUOUS. When auth_mode is absent, credential inference uses codex-rs AuthDotJson::resolved_mode() Option::is_some() semantics — field PRESENCE with a non-null value is a persisted credential: OPENAI_API_KEY (any non-null value, including an empty string) resolves API_KEY, and personal_access_token / bedrock_api_key / bedrock_access_keys (any non-null value, including empty strings/arrays/objects) resolve AMBIGUOUS — never CHATGPT merely because OAuth tokens coexist. Token-shape verification, fail-closed absent/malformed handling and manual Executor behavior unchanged; no credential values are read, logged or persisted. The single resolver feeds all three enforcement seams unchanged — CodexCliExecutorAdapter spawn boundary (FAIL_CLOSED_CODEX_AUTH_MODE), driver admission + authorityGate re-proof (DRIVER_SUBSCRIPTION_UNVERIFIED), and the atomic assertAndReserve gate (FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE). Evidence: 63 focused tests (Z10.1-11: chatgpt/tokens ok, chatgpt-mode ok, apikey-mode denied, non-chatgpt mode denied, PAT denied, bedrock families denied, chatgpt-mode-without-tokens denied, admission-level apikey denial, empty-string/empty-collection credential presence denied, null fields absent) failing-first pre-implementation; all R2 Z9 coverage preserved; win32 baselines unchanged (10d=15, 10d-r1=7, met-fold=7, p15-3=9, cpl1=22, p5=3).",
+  "description": "Live-ops fix for sustained CPU burn + dashboard latency observed on the deployed stack (events table 161k rows, ~1.2 cores idle). Three bounded changes. (1) MISSION_CONTROL eventsSince(sinceSeq, limit=1024) now delegates to new store.listEventsSince — SQL pushdown 'WHERE seq > ? ORDER BY seq LIMIT ?' with pageLimit/budget materialization, verifiedEvent per returned row preserved; latest_seq becomes high-water delivered (last returned seq, or sinceSeq when empty) so a truncated page lets SSE clients continue paging instead of skipping; hash verification on every returned row unchanged. (2) ObjectiveAutoScheduler.nextFairCandidate journals only durable DECISIONS: one FAIR_VISIT when a usable candidate is found (claim rotation position) or when a PAGE-full sweep must advance the cursor for progress, and FAIR_ROUND only when the cohort wrap/refresh changes durable state (last_visited_rank>0 or cohort_high_rank<registration_counter) — a no-change sweep over a parked cursor writes nothing since rescanning an unchanged cohort is deterministic; B06 cohort-refresh semantics preserved. (3) settle() adds wait_streak on WAKE_STATE: a timed-wait outcome (WAITING_EVIDENCE + non-null next_due) that leaves no pending generation is a proven-empty poll — consecutive ones scale next_due by min(2^streak,12) (300s baseline → ~1h ceiling); pending work arriving before settle or any non-timed-wait outcome resets the streak; the settled-lease retry_count semantics, fair cursor, lease fencing, policy authority re-proofs, COMMITTED/SETTLED adoption and all subscription/auth gates are unchanged. Evidence: 5 new hotfix tests failing-first pre-implementation (events paging/sha256-preserved, idle-sweep silence ≤1 commit, streak backoff 300s→600s→1200s→2400s→reset); adjacent suites p15-10b(+r1)/p15-10c(+r1-r4)/subscription-auto-run-ceo/p9 all green (236 tests).",
   "risk_override": "HIGH"
 }

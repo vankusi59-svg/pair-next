@@ -470,6 +470,21 @@ export class PairEvidenceStore {
     return rows.map(row => this.verifiedEvent(row));
   }
 
+  /** seq-cursor page: the SSE delta path must bound its read, never
+   *  materialize the whole journal per poll. */
+  listEventsSince(sinceSeq: number, limit = 1024): Array<Record<string, unknown>> {
+    const lim = this.pageLimit(limit);
+    if (!Number.isSafeInteger(sinceSeq) || sinceSeq < 0) {
+      throw new IntegrityError("FAIL_CLOSED_STORE_PAGE_SCHEMA", "event cursor");
+    }
+    const materialize = this.readBudget ? Math.min(lim, this.readBudget.events + 1) : lim;
+    const rows = this.db
+      .prepare("SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?")
+      .all(sinceSeq, materialize) as Array<Record<string, unknown>>;
+    this.charge("events", rows.length);
+    return rows.map(row => this.verifiedEvent(row));
+  }
+
   appendEvidence(
     missionId: string,
     kind: string,
