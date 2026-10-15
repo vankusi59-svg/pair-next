@@ -26,12 +26,13 @@ export const FAIRNESS_STATE = "objective_auto_fairness";
 const GLOBAL = "LOCAL_PAIR_DB";
 const MAX_ACTIVE = 4;
 const PAGE = 64;
-/** R1-F2 — in-call cohort scan bound: up to SCAN_PAGES×PAGE rows per
- *  nextFairCandidate call, sized so the per-candidate queue() reads stay
- *  inside the proof read budget (entities 1024 / events 512). Cohorts of
- *  ≤191 rows are fully scanned in one call and converge to silence; a
- *  larger unchanged cohort still emits at most one progress commit per
- *  call (cursor keeps moving — deterministic, never duplicated). */
+/** R2-F1 — per-call bound on shortlist pages in nextFairCandidate. The
+ *  SQL filter already excludes non-actionable and actively-leased rows,
+ *  so a second page is only needed if a full PAGE of shortlisted rows
+ *  fails the queue()/lease() re-proof — pathology, not throughput. The
+ *  bound keeps per-call charged reads inside the proof budget
+ *  (entities 1024 / events 512) while converged idle cohorts cost one
+ *  uncharged query per call. */
 const SCAN_PAGES = 3;
 
 type Row = Record<string, unknown> & { version: number };
@@ -950,38 +951,57 @@ export class ObjectiveAutoScheduler {
       if (!f) return null;
       const last = Number(f.last_visited_rank);
       const upper = Number(f.cohort_high_rank);
-      // R1-F2: page through the remaining cohort inside this call (bounded)
-      // instead of one page per call — a fully scanned, unchanged cohort
-      // then converges to silence instead of alternating
-      // FAIR_VISIT/FAIR_ROUND commits on every pass. Cohorts larger than
-      // the scan bound still persist progress once per call.
+      const now = this.instant();
+      // R2-F1: push the field-level usability predicate (and the active-
+      // lease exclusion) into the uncharged SQL filter, so the WHOLE
+      // remaining cohort is proven empty in a bounded query instead of
+      // one charged queue()/lease() pair per row — an unchanged cohort of
+      // ANY size then converges to durable idle silence instead of
+      // alternating cursor-progress/FAIR_ROUND commits past the proof
+      // budget. The per-row re-proof below still runs on every shortlisted
+      // row, and claim() re-proves under the writer lock.
       let furthest = last;
       let exhausted = false;
       for (let pages = 0; pages < SCAN_PAGES && !exhausted; pages++) {
-        const candidates = this.store.db.prepare(`SELECT entity_id FROM entities
-          WHERE entity_type=? AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)>?
-          AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)<=?
-          ORDER BY CAST(json_extract(payload,'$.registration_rank') AS INTEGER), entity_id LIMIT ?`)
-          .all(WAKE_STATE, furthest, upper, PAGE) as Array<{ entity_id: string }>;
+        const candidates = this.store.db.prepare(`SELECT entity_id,
+            CAST(json_extract(payload,'$.registration_rank') AS INTEGER) AS rank
+          FROM entities e
+          WHERE e.entity_type=?
+            AND CAST(json_extract(e.payload,'$.registration_rank') AS INTEGER)>?
+            AND CAST(json_extract(e.payload,'$.registration_rank') AS INTEGER)<=?
+            AND json_extract(e.payload,'$.queue_state')='WAITING_CONSUMER'
+            AND (CAST(json_extract(e.payload,'$.pending_generation') AS INTEGER)
+                 > CAST(json_extract(e.payload,'$.claimed_generation') AS INTEGER)
+              OR CAST(json_extract(e.payload,'$.claimed_generation') AS INTEGER)
+                 > CAST(json_extract(e.payload,'$.settled_generation') AS INTEGER))
+            AND (json_extract(e.payload,'$.next_due') IS NULL
+                 OR CAST(json_extract(e.payload,'$.next_due') AS INTEGER)<=?)
+            AND NOT EXISTS (SELECT 1 FROM entities l
+              WHERE l.entity_type=? AND l.entity_id=e.entity_id
+                AND json_extract(l.payload,'$.state')='ACTIVE'
+                AND CAST(json_extract(l.payload,'$.expires_at') AS INTEGER)>?)
+          ORDER BY rank, e.entity_id LIMIT ?`)
+          .all(WAKE_STATE, furthest, upper, now, LEASE_STATE, now, PAGE) as
+          Array<{ entity_id: string; rank: number }>;
         if (!candidates.length) { exhausted = true; break; }
         for (const item of candidates) {
           const q = this.queue(item.entity_id);
           if (!q) invalid("candidate disappeared");
           furthest = q.registration_rank;
-          const actionable = q.queue_state === "WAITING_CONSUMER" &&
+          const lease = this.lease(item.entity_id);
+          const activeLease = lease?.state === "ACTIVE" && Number(lease.expires_at) > now;
+          const usable = q.queue_state === "WAITING_CONSUMER" && !activeLease &&
             (q.pending_generation > q.claimed_generation ||
              q.claimed_generation > q.settled_generation) &&
-            (q.next_due === null || q.next_due <= this.instant());
-          if (!actionable) continue;
-          const lease = this.lease(item.entity_id);
-          const activeLease = lease?.state === "ACTIVE" && Number(lease.expires_at) > this.instant();
-          if (activeLease) continue;
-          // the claim decision is the visit that must be journaled — it
-          // records where the deterministic rotation stopped
-          writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-            ...fields(f), last_visited_rank: furthest,
-          }, "FAIR_VISIT", item.entity_id);
-          return item.entity_id;
+            (q.next_due === null || q.next_due <= now);
+          if (usable) {
+            // the claim decision is the visit that must be journaled — it
+            // records where the deterministic rotation stopped
+            writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+              ...fields(f), last_visited_rank: furthest,
+            }, "FAIR_VISIT", item.entity_id);
+            return item.entity_id;
+          }
         }
         exhausted = candidates.length < PAGE;
       }

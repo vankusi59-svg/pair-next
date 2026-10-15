@@ -302,3 +302,35 @@ describe("H5 — full-page idle cohorts converge to silence (R1-F2)", () => {
     });
   }
 });
+
+describe("H6 — large unchanged cohorts converge regardless of size (R2-F1)", () => {
+  for (const n of [192, 193, 256, 384]) {
+    it(`cohort ${n}: completed no-op sweeps reach durable idle silence`, () => {
+      const s = fresh("h6-" + n);
+      const bid = mkBiz(s.store);
+      for (let i = 0; i < n; i++) {
+        const o = mkObjective(s, bid);
+        configure(s, oid(o)); // registered, never usable
+        s.scheduler.observe(oid(o));
+      }
+      // warm-up: bound refresh + wrap may commit; then unchanged sweeps
+      // must produce zero commits at any cohort size
+      s.scheduler.nextFairCandidate();
+      s.scheduler.nextFairCandidate();
+      const base = commitCount(s.store);
+      for (let i = 0; i < 4; i++) {
+        expect(s.scheduler.nextFairCandidate()).toBeNull();
+      }
+      expect(commitCount(s.store) - base).toBe(0);
+      // a newly usable candidate deep inside the cohort is still found
+      const o = mkObjective(s, bid);
+      enable(s, oid(o));
+      s.scheduler.observe(oid(o));
+      let found: string | null = null;
+      for (let i = 0; i < 3 && !found; i++) {
+        found = s.scheduler.nextFairCandidate();
+      }
+      expect(found).toBe(oid(o));
+    }, 30000);
+  }
+});
