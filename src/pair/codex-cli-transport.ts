@@ -52,6 +52,78 @@ export function codexCliEnvGet(env: CodexCliEnv | undefined, name: string): stri
   return typeof env === "function" ? env(name) : env[name];
 }
 
+/** The codex home a spawned child resolves — explicit CODEX_HOME, else
+ *  the platform default (~/.codex via HOME/USERPROFILE). Mirrors what
+ *  the child itself sees: the persisted session lives in this dir. */
+export function codexHomeDir(env: CodexCliEnv | undefined): string | null {
+  const configured = codexCliEnvGet(env, "CODEX_HOME");
+  if (configured) return configured;
+  const home =
+    codexCliEnvGet(env, "HOME") ?? codexCliEnvGet(env, "USERPROFILE");
+  return home ? path.join(home, ".codex") : null;
+}
+
+/** The effective Codex CLI authentication mode a governed child would
+ *  run under (R2-F1). `codex exec` resolves auth as: env API key (never
+ *  forwarded to governed children — codexCliChildEnv strips it; the
+ *  executor adapter strips it for autonomous dispatch) → the persisted
+ *  session file. So auth.json's STRUCTURE is the effective mode:
+ *  a non-empty stored OPENAI_API_KEY is metered API-key billing even
+ *  when ambient env keys are absent; a ChatGPT OAuth `tokens` session
+ *  is the only subscription identity. SECRET-SAFE: key names and field
+ *  shapes only — credential values are never read out, logged or
+ *  persisted. Anything missing/unparsable/contradictory fails closed. */
+export type CodexAuthMode = "CHATGPT" | "API_KEY" | "UNAUTHENTICATED" | "AMBIGUOUS";
+
+export function codexAuthMode(env: CodexCliEnv | undefined): CodexAuthMode {
+  const home = codexHomeDir(env);
+  if (!home) return "UNAUTHENTICATED";
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(home, "auth.json"), "utf8");
+  } catch {
+    return "UNAUTHENTICATED";
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "AMBIGUOUS";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "AMBIGUOUS";
+  }
+  const rec = parsed as Record<string, unknown>;
+  // A non-empty persisted API key resolves API-key billing inside the
+  // CLI regardless of a coexisting tokens session — never substitute
+  // it for ChatGPT subscription auth.
+  const storedKey = rec.OPENAI_API_KEY;
+  if (typeof storedKey === "string" && storedKey.trim() !== "") return "API_KEY";
+  const tokens = rec.tokens;
+  if (tokens !== null && typeof tokens === "object" && !Array.isArray(tokens)) {
+    const t = tokens as Record<string, unknown>;
+    // ChatGPT OAuth session — the real codex-rs shape carries
+    // access_token + refresh_token strings plus an id_token claim set.
+    if (typeof t.access_token === "string" && t.access_token !== "" &&
+        typeof t.refresh_token === "string" && t.refresh_token !== "" &&
+        t.id_token != null) {
+      return "CHATGPT";
+    }
+  }
+  return "AMBIGUOUS";
+}
+
+/** True only when the effective autonomous auth mode is a ChatGPT
+ *  subscription session — the live, file-backed proof behind
+ *  subscription-only invocation. Re-resolved on every call: a
+ *  `codex logout` / `login --with-api-key` between admission and
+ *  invocation is never trusted from a cached verdict. */
+export function codexChatgptSessionProven(
+  env: CodexCliEnv | undefined,
+): boolean {
+  return codexAuthMode(env) === "CHATGPT";
+}
+
 export function resolveCodexExecutable(env: CodexCliEnv | undefined): string | null {
   const configured =
     codexCliEnvGet(env, "PAIR_CODEX_PLANNER_EXECUTABLE") ??

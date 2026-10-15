@@ -22,6 +22,7 @@ import path from "node:path";
 import { IntegrityError } from "./errors.js";
 import { atomicWriteJson, digest, sha256File, utcnow, workerExecutionId } from "./canonical.js";
 import {
+  codexAuthMode,
   resolveCodexExecutableSystem,
   windowsSpawnTarget,
 } from "./codex-cli-transport.js";
@@ -297,6 +298,17 @@ export class CodexCliExecutorAdapter implements ExecutorAdapter {
     // journal: subscription-only autonomous dispatches must not inherit
     // metered API credentials across respawn/rehydrate ambiguity.
     const autonomous = this.autonomousProvenance(task);
+    // AUDIT R2 F1 — the autonomous spawn boundary re-proves the session
+    // AUTH MODE live: a ChatGPT tokens session is the only subscription
+    // identity. A persisted API key in auth.json, an absent file, or an
+    // unreadable shape fails closed HERE — at the last authority
+    // crossing before spawn — even with env keys already stripped.
+    // Manual (owner-created) lineage keeps credential forwarding and
+    // never hits this check.
+    if (autonomous && codexAuthMode((n) => this.env(n)) !== "CHATGPT") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_CODEX_AUTH_MODE", "autonomous dispatch requires ChatGPT session auth");
+    }
 
     const runRoot = codexRunRoot(this.deps.journalRoot, executionId);
     const journalPath = path.join(runRoot, "execution_journal.json");

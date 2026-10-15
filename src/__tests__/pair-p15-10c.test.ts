@@ -37,6 +37,16 @@ function fresh(name: string, initial = 1_000_000): Stack {
   let t = initial;
   const dir = path.join(ROOT, String(counter++) + "-" + name);
   fs.mkdirSync(dir, { recursive: true });
+  // AUDIT R2-F1 — the live auth-mode proof reads CODEX_HOME/auth.json:
+  // pin a per-stack home carrying a ChatGPT OAuth session file (the
+  // state production converges to after `codex login`).
+  const codexHome = path.join(dir, ".codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { id_token: { sub: "u" }, access_token: "a", refresh_token: "r" },
+  }));
+  process.env.CODEX_HOME = codexHome;
   const dbPath = path.join(dir, "pair.db");
   const store = new PairEvidenceStore(dbPath);
   const objectives = new ObjectiveAuthorityService(store);
@@ -92,7 +102,7 @@ function mkDriver(s: Stack, opts: {
   outcome?: OperatingPassResult["outcome"];
   onPass?: (call: PassCall, gate: () => void) => void | Promise<void>;
   halt?: () => boolean;
-  billing?: () => { mode: string; profile: Record<string, unknown> | null; unbounded: boolean };
+  billing?: (e: string, r?: string | null) => { mode: string; profile: Record<string, unknown> | null; unbounded: boolean };
   workerId?: string; bootId?: string; maxPassesPerTick?: number;
 } = {}) {
   const calls: PassCall[] = [];
@@ -261,8 +271,24 @@ describe("P15.10-C — governed autonomous Objective driver", () => {
     const o = mkObjective(s, mkBiz(s.store));
     enable(s, oid(o), { budget_microusd_cap: 100_000 });
     wake(s, oid(o));
+    // AUDIT R2 — put the unbounded binding on a QUALIFIED route pairing
+    // so the executor-level CODEX lane can stay SUBSCRIPTION (the CEO
+    // proof still resolves) while the envelope still sees an unbounded
+    // pairing. This isolates DRIVER_COST_UNVERIFIED to its own cause.
+    s.store.put("route", "RTE_C09", {
+      route_id: "RTE_C09", executor_id: "CODEX", enabled: true,
+      qualification_state: "QUALIFIED", eligibility_state: "ELIGIBLE",
+      health: { state: "READY" }, version: 0,
+    }, 0);
+    s.store.put("executor_supply_binding", "ESB_C09", {
+      binding_id: "ESB_C09", executor_id: "CODEX", route_id: "RTE_C09",
+      qualification_state: "QUALIFIED", version: 0,
+    }, 0);
     const { driver, calls } = mkDriver(s, {
-      billing: () => ({ mode: "METERED_API", profile: null, unbounded: true }),
+      billing: (e, r) =>
+        e === "CODEX" && (r === null || r === undefined)
+          ? { mode: "SUBSCRIPTION", profile: { billing_mode: "SUBSCRIPTION" }, unbounded: false }
+          : { mode: "METERED_API", profile: null, unbounded: true },
     });
     const out = await driver.tick();
     expect(calls).toHaveLength(0);

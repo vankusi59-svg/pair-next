@@ -22,7 +22,10 @@ import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import { DRIVER_ACTOR } from "./work-open-binding.js";
 import { AUTONOMOUS_EXECUTOR_IDS } from "./executor-registry.js";
 import { providerEntryId } from "./provider-catalog.js";
-import { CODEX_CLI_PROVIDER_ID } from "./codex-cli-transport.js";
+import {
+  CODEX_CLI_PROVIDER_ID,
+  codexAuthMode,
+} from "./codex-cli-transport.js";
 import { assertCanonicalObjectiveBudget } from "./objective-authority.js";
 import type { PairEvidenceStore } from "./store.js";
 import type { PairControlPlane } from "./service.js";
@@ -874,21 +877,22 @@ export class CostService {
               ? objScope.cap : null,
           });
         }
-        // AUDIT R1 F3 — final atomic re-proof for the subscription
-        // transport: a driver-attributed CODEX dispatch requires the
-        // ACTIVE executor-level billing identity to be exactly
-        // SUBSCRIPTION (profileFor already filters status=ACTIVE, so a
-        // resolved profile is an active one) AND a live canonical
-        // provider session (auth_state === AUTH_OK). FREE / UNMETERED /
-        // missing profiles and unproven sessions never substitute;
-        // contradictory profiles fail closed rather than pretending
-        // zero-cost. Fresh in-txn state only — never a caller snapshot.
+        // AUDIT R1 F3 + R2 F2 — final atomic re-proof for the
+        // subscription transport: a driver-attributed CODEX dispatch
+        // requires THIS dispatch's resolved billing identity — the
+        // SELECTED route's profile, then model, then executor
+        // (billingFor order) — to be exactly SUBSCRIPTION, not merely
+        // an executor-level declaration. A route profile flipped to
+        // FREE/UNMETERED/METERED/UNKNOWN (or any unbounded/
+        // contradictory binding) between admission and reserve is
+        // denied here. Plus a live canonical provider session
+        // (auth_state === AUTH_OK). Fresh in-txn state only — never a
+        // caller snapshot.
         if (params.executorId === CODEX_EXECUTOR_ID) {
-          const executorBilling = this.billingFor(CODEX_EXECUTOR_ID, null);
           const subscriptionProven =
-            executorBilling.mode === "SUBSCRIPTION" &&
-            executorBilling.profile != null &&
-            !executorBilling.unbounded;
+            billing.mode === "SUBSCRIPTION" &&
+            billing.profile != null &&
+            !billing.unbounded;
           const provider = this.store.tryGet(
             "provider", providerEntryId(CODEX_CLI_PROVIDER_ID));
           const sessionProven =
@@ -896,8 +900,22 @@ export class CostService {
           if (!subscriptionProven || !sessionProven) {
             violations.push({
               scope_type: "autonomous",
-              scope_id: CODEX_EXECUTOR_ID,
+              scope_id: routeId ?? CODEX_EXECUTOR_ID,
               reason: "FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION",
+              used_microusd: null,
+              requested_microusd: null,
+              max_microusd: null,
+            });
+          }
+          // AUDIT R2 F1 — AUTH_OK proves a probe succeeded, not that the
+          // session is ChatGPT-billed: the live auth-mode re-proof reads
+          // the persisted session file's structure inside this txn.
+          // API_KEY / UNAUTHENTICATED / AMBIGUOUS fail closed.
+          if (codexAuthMode(undefined) !== "CHATGPT") {
+            violations.push({
+              scope_type: "autonomous",
+              scope_id: CODEX_EXECUTOR_ID,
+              reason: "FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE",
               used_microusd: null,
               requested_microusd: null,
               max_microusd: null,

@@ -78,6 +78,15 @@ function fresh(name: string, initial = 1_000_000) {
     business_id: bid, name: "b", status: "ACTIVE",
     project_id: "PRJ_TEST", created_at: "x", version: 0,
   }, 0);
+  // AUDIT R2-F1 — per-stack CODEX_HOME with a persisted ChatGPT session
+  // file so the live auth-mode re-proof resolves CHATGPT.
+  const codexHome = path.join(dir, ".codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({
+    OPENAI_API_KEY: null,
+    tokens: { id_token: { sub: "u" }, access_token: "a", refresh_token: "r" },
+  }));
+  process.env.CODEX_HOME = codexHome;
   // AUDIT R1 F4 — the CEO subscription lane is proven independently of
   // executor supply: the canonical codex-cli provider session (AUTH_OK)
   // is environmental state every stack in this file shares.

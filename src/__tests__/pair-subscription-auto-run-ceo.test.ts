@@ -62,6 +62,8 @@ import {
   CodexCliExecutorAdapter,
   codexPlannerPlan,
   codexRunRoot,
+  readSchedulerRow,
+  WAKE_STATE,
   CODEX_CLI_PROVIDER_ID,
   CODEX_EXECUTOR_ID,
   CostService,
@@ -138,6 +140,12 @@ function fresh(name: string, initial = 1_000_000) {
   fs.mkdirSync(dir, { recursive: true });
   const workspace = fs.mkdtempSync(path.join(dir, "ws-"));
   const dbPath = path.join(dir, "pair.db");
+  // AUDIT R2-F1 — the live auth-mode proof resolves CODEX_HOME/auth.json
+  // through the ambient env. Pin every stack's home to its own dir so
+  // fixtures are deterministic and never touch the real ~/.codex.
+  const codexHome = path.join(dir, ".codex");
+  fs.mkdirSync(codexHome, { recursive: true });
+  process.env.CODEX_HOME = codexHome;
   const store = new PairEvidenceStore(dbPath);
   const service = new PairControlPlane(store);
   const biz = new BusinessLayer({
@@ -161,7 +169,7 @@ function fresh(name: string, initial = 1_000_000) {
     project_id: "PRJ_TEST", created_at: "x", version: 0,
   }, 0);
   return { dir, workspace, dbPath, store, service, biz, wf, objectives,
-    workstreams, alloc, policy, scheduler, wakeup, cost, bid,
+    workstreams, alloc, policy, scheduler, wakeup, cost, bid, codexHome,
     now: () => t, setNow: (v: number) => { t = v; } };
 }
 type S = ReturnType<typeof fresh>;
@@ -260,9 +268,36 @@ function seedExecutorSupply(
   return adapters;
 }
 
+/** A structurally-valid ChatGPT OAuth session file — codex-rs persists
+ *  `tokens` (id_token/access_token/refresh_token) under CODEX_HOME/
+ *  auth.json. Only key STRUCTURE is ever inspected, never values. */
+const CHATGPT_AUTH_JSON = {
+  OPENAI_API_KEY: null,
+  tokens: {
+    id_token: { sub: "chatgpt-user", email: "u@example.test" },
+    access_token: "at-fixture",
+    refresh_token: "rt-fixture",
+    account_id: "acct-fixture",
+  },
+  last_refresh: "2999-01-01T00:00:00.000Z",
+};
+
+/** Write (or delete, `null`) the stack's persisted session file. */
+function writeCodexAuthJson(s: S, body: unknown | null) {
+  const f = path.join(s.codexHome, "auth.json");
+  if (body === null) {
+    try { fs.unlinkSync(f); } catch { /* absent is the fixture */ }
+    return;
+  }
+  fs.writeFileSync(f, typeof body === "string" ? body : JSON.stringify(body));
+}
+
 /** Canonical codex-cli provider AUTH_OK — the subscription-session
  *  evidence the autonomous binding requires (real probe outcome in
- *  production; seeded through the canonical row here). */
+ *  production; seeded through the canonical row here). AUDIT R2-F1:
+ *  AUTH_OK alone is not subscription proof — a proven session ALSO
+ *  carries the persisted ChatGPT auth.json; non-AUTH_OK fixtures get
+ *  no session file at all (the honest "unproven" shape). */
 function seedCodexAuth(s: S, authState = "AUTH_OK") {
   ensureCodexCliCatalog(s.store, "gpt-6.1-sol", "TEST");
   const pid = providerEntryId(CODEX_CLI_PROVIDER_ID);
@@ -271,6 +306,7 @@ function seedCodexAuth(s: S, authState = "AUTH_OK") {
     ...p, lifecycle_state: "QUALIFIED", auth_state: authState,
     health_state: "READY", probe_state: "PROBED", conditions: [],
   }, Number(p.version));
+  writeCodexAuthJson(s, authState === "AUTH_OK" ? CHATGPT_AUTH_JSON : null);
 }
 
 /** P13 canonical billing declaration — the production opt-in seed:
@@ -894,12 +930,19 @@ describe("Z6 — pause / revoke / halt remain fail-closed", () => {
  *  the parent env — the F1 attack shape. The fake CLI dumps the child
  *  env beside final.json (argv-derived — the adapter never forwards
  *  FAKE_* controls, so no test channel crosses the spawn boundary). */
-function realCodexAdapter(s: S, tag: string, opts: { store?: boolean } = {}) {
+function realCodexAdapter(s: S, tag: string,
+  opts: { store?: boolean; authJson?: unknown | null } = {}) {
   const journalRoot = path.join(s.dir, `jr-${tag}`);
   const exe = makeFakeCodex(path.join(s.dir, `fk-${tag}`));
   const codexHome = path.join(s.dir, `ch-${tag}`);
   fs.mkdirSync(codexHome, { recursive: true });
-  fs.writeFileSync(path.join(codexHome, "auth.json"), "{}");
+  const authBody = opts.authJson === undefined ? CHATGPT_AUTH_JSON : opts.authJson;
+  const authFile = path.join(codexHome, "auth.json");
+  if (authBody === null) {
+    try { fs.unlinkSync(authFile); } catch { /* absent is the fixture */ }
+  } else {
+    fs.writeFileSync(authFile, JSON.stringify(authBody));
+  }
   const ambient: Record<string, string> = {
     OPENAI_API_KEY: "sk-ambient-metered",
     CODEX_API_KEY: "ck-ambient-metered",
@@ -1154,6 +1197,222 @@ describe("Z8 — AUDIT R1 corrections (F1–F4)", () => {
   });
 });
 
+/* ============ Z9 — AUDIT R2 corrections ============ */
+
+describe("Z9 — AUDIT R2 (F1 ChatGPT auth mode / F2 route billing)", () => {
+
+  /* ----- F1: ChatGPT subscription auth is the only autonomous mode ----- */
+
+  it("Z9.1 ChatGPT session + AUTH_OK + SUBSCRIPTION → admitted, $0 reserve", async () => {
+    const s = fresh("z9a");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s); // AUTH_OK row + ChatGPT tokens session file
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const r = mkDriver(s).readiness(oid, OWNER) as Record<string, unknown>;
+    expect(r.reasons).toEqual([]);
+    expect(r.objective_runnable).toBe(true);
+    let passes = 0;
+    const out = await mkDriver(s, {
+      runPass: async () => { passes++; return { outcome: "WAITING" } as never; },
+    }).tick();
+    expect(out.driven[0]).toMatchObject({ outcome: "WAITING", settled: true });
+    expect(passes).toBe(1);
+    const m = driverMission(s, oid, "a");
+    const res = reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID);
+    expect(Number(res.reserved_microusd)).toBe(0);
+    expect(String(res.billing_mode)).toBe("SUBSCRIPTION");
+  });
+
+  it("Z9.2 persisted API-key auth.json → denied at admission AND reserve (env keys already stripped)", async () => {
+    const s = fresh("z9b");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s); // provider AUTH_OK + SUBSCRIPTION billing stay proven
+    seedCodexSubscription(s);
+    // …but the persisted session is a metered API key, not ChatGPT.
+    writeCodexAuthJson(s, { OPENAI_API_KEY: "sk-persisted-metered", tokens: null });
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const r = mkDriver(s).readiness(oid, OWNER) as Record<string, unknown>;
+    expect(r.reasons).toContain("SUBSCRIPTION_AUTH_UNVERIFIED");
+    const out = await mkDriver(s).tick();
+    expect(out.driven[0]).toMatchObject({ denied: "DRIVER_SUBSCRIPTION_UNVERIFIED" });
+    expect((s.store.list(CEO_DECISION_ATTEMPT_ENTITY) as Row[])
+      .filter((a) => String(a.objective_id) === oid)).toHaveLength(0);
+    const m = driverMission(s, oid, "b");
+    throwsCode(
+      () => reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID),
+      "FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE");
+  });
+
+  it("Z9.3 absent auth.json → UNAUTHENTICATED fails closed everywhere", async () => {
+    const s = fresh("z9c");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);          // AUTH_OK row proven…
+    writeCodexAuthJson(s, null); // …but no persisted session file at all
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    expect((mkDriver(s).readiness(oid, OWNER) as Record<string, unknown>)
+      .reasons).toContain("SUBSCRIPTION_AUTH_UNVERIFIED");
+    const out = await mkDriver(s).tick();
+    expect(out.driven[0]).toMatchObject({ denied: "DRIVER_SUBSCRIPTION_UNVERIFIED" });
+    const m = driverMission(s, oid, "c");
+    throwsCode(
+      () => reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID),
+      "FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE");
+  });
+
+  it("Z9.4 ambiguous auth.json shapes fail closed (both modes, malformed, empty)", () => {
+    const s = fresh("z9d");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const m = driverMission(s, oid, "d");
+    const shapes: unknown[] = [
+      // A stored key WITH tokens — api-key resolution wins in codex-rs;
+      // contradictory modes never silently become subscription.
+      { OPENAI_API_KEY: "sk-x", tokens: CHATGPT_AUTH_JSON.tokens },
+      "{ not json",                        // unparsable
+      {},                                  // empty object
+      { tokens: {} },                      // tokens object w/o credentials
+      { tokens: { access_token: "a" } },   // partial tokens
+      "tokens",                            // non-object root
+    ];
+    let i = 0;
+    for (const shape of shapes) {
+      writeCodexAuthJson(s, shape);
+      throwsCode(
+        () => reserve(s, m, `T${i}`, "RTE_CODEX_CLI", CODEX_EXECUTOR_ID),
+        "FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE");
+      i++;
+    }
+    // And the ChatGPT shape is accepted after the ambiguous ones —
+    // proof the file is re-read live, not latched.
+    writeCodexAuthJson(s, CHATGPT_AUTH_JSON);
+    const res = reserve(s, m, `T${i}`, "RTE_CODEX_CLI", CODEX_EXECUTOR_ID);
+    expect(Number(res.reserved_microusd)).toBe(0);
+  });
+
+  it("Z9.5 ChatGPT→API-key flip between passes → next dispatch denied (live revalidation)", () => {
+    const s = fresh("z9e");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const m = driverMission(s, oid, "e");
+    const first = reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID);
+    expect(String(first.status)).toBe("HELD");
+    // Operator swaps the session to metered api-key auth before the next
+    // task's reservation — the atomic gate re-proves, never latches.
+    writeCodexAuthJson(s, { OPENAI_API_KEY: "sk-swapped", tokens: null });
+    throwsCode(
+      () => reserve(s, m, "T2", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID),
+      "FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE");
+  });
+
+  it("Z9.6 R2-F2 — selected CODEX route profile SUBSCRIPTION→FREE post-admission → reserve denied", async () => {
+    const s = fresh("z9f");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s); // executor-level SUBSCRIPTION
+    // The SELECTED route carries its own SUBSCRIPTION profile.
+    const rp = s.cost.upsertCostProfile(
+      { ref_type: "route", ref_id: "RTE_CODEX_CLI", billing_mode: "SUBSCRIPTION" },
+      "TEST") as Row;
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const out = await mkDriver(s).tick();
+    expect(out.driven[0]).toMatchObject({ outcome: "WAITING", settled: true });
+    // Drift AFTER admission: the route's billing identity flips to FREE.
+    s.cost.upsertCostProfile(
+      { ref_type: "route", ref_id: "RTE_CODEX_CLI", billing_mode: "FREE" },
+      "TEST", Number(rp.version));
+    // The in-txn re-proof binds the ROUTE's resolved billing — FREE is
+    // not SUBSCRIPTION even though the executor profile still is.
+    const m = driverMission(s, oid, "f");
+    throwsCode(
+      () => reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID),
+      "FAIL_CLOSED_COST_AUTONOMOUS_SUBSCRIPTION");
+  });
+
+  it("Z9.7 manual lineage preserved: owner-opened CODEX mission unaffected by api-key session", () => {
+    const s = fresh("z9g");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    // API-key persisted auth + ambient env keys — manual semantics keep
+    // credential forwarding; the autonomous proof never applies.
+    writeCodexAuthJson(s, { OPENAI_API_KEY: "sk-manual", tokens: null });
+    enable(s, oid, { budget_microusd_cap: 500_000 });
+    const m = driverMission(s, oid, "g");
+    const wob = s.store.get("work_open_binding", m.openId) as Row;
+    s.store.put("work_open_binding", m.openId,
+      { ...wob, created_by: OWNER }, Number(wob.version));
+    const res = reserve(s, m, "T1", "RTE_CODEX_CLI", CODEX_EXECUTOR_ID);
+    expect(String(res.status)).toBe("HELD");
+  });
+
+  it("Z9.8 ChatGPT→API-key flip mid-pass → authority_gate denies the next crossing", async () => {
+    const s = fresh("z9h");
+    const oid = mkObjective(s);
+    seedExecutorSupply(s);
+    seedCodexAuth(s);
+    seedCodexSubscription(s);
+    enable(s, oid, { budget_microusd_cap: 0 });
+    const driver = mkDriver(s, {
+      runPass: async (input: { authority_gate: () => void }) => {
+        // Auth revokes DURING the pass — before the next external
+        // crossing the gate must re-prove, not trust the admission.
+        writeCodexAuthJson(s, { OPENAI_API_KEY: "sk-midpass", tokens: null });
+        input.authority_gate(); // must throw — the denial propagates
+        return { outcome: "WAITING" } as never;
+      },
+    });
+    const out = await driver.tick();
+    // Mid-pass denials collapse to the canonical INTEGRITY_FAULT label;
+    // the precise reason lands in the quarantined queue row.
+    expect(out.driven[0]).toMatchObject({ outcome: "FAULT" });
+    const q = readSchedulerRow<Row>(s.store, WAKE_STATE, oid)!;
+    expect(String(q.queue_state)).toBe("QUARANTINED");
+    expect(String(q.blocked_reason))
+      .toBe("DRIVER_SUBSCRIPTION_UNVERIFIED");
+  });
+
+  it("Z9.9 adapter spawn boundary: autonomous dispatch + api-key session → FAIL_CLOSED_CODEX_AUTH_MODE", async () => {
+    const s = fresh("z9i");
+    const oid = mkObjective(s);
+    const m = driverMission(s, oid, "i"); // driver-attributed
+    const { adapter } = realCodexAdapter(s, "z9i",
+      { authJson: { OPENAI_API_KEY: "sk-persisted", tokens: null } });
+    throwsCode(
+      () => adapter.dispatch(governedTask(s, m, "z9i")),
+      "FAIL_CLOSED_CODEX_AUTH_MODE");
+  });
+
+  it("Z9.10 manual adapter dispatch + api-key session → proceeds (manual semantics preserved)", async () => {
+    const s = fresh("z9j");
+    const oid = mkObjective(s);
+    const m = driverMission(s, oid, "j");
+    const wob = s.store.get("work_open_binding", m.openId) as Row;
+    s.store.put("work_open_binding", m.openId,
+      { ...wob, created_by: OWNER }, Number(wob.version));
+    const { adapter, journalRoot } = realCodexAdapter(s, "z9j",
+      { authJson: { OPENAI_API_KEY: "sk-manual", tokens: null } });
+    const rec = adapter.dispatch(governedTask(s, m, "z9j"));
+    const o = await waitExec(adapter, String(rec.execution_id));
+    expect(o.status).toBe("COMPLETED");
+    const env = childEnvDump(journalRoot, String(rec.execution_id));
+    expect(env.OPENAI_API_KEY).toBe(true); // manual lane unchanged
+    expect(env.CODEX_API_KEY).toBe(true);
+  });
+});
+
 /* ============ Z7 — production-composition E2E ============ */
 
 describe("Z7 — end-to-end: objective → driver → CEO → planner → governed dispatch → execution settle", () => {
@@ -1185,7 +1444,11 @@ describe("Z7 — end-to-end: objective → driver → CEO → planner → govern
       FAKE_CODEX_BEHAVIOR: "ceo_init",
     };
     fs.mkdirSync(childEnv.CODEX_HOME, { recursive: true });
-    fs.writeFileSync(path.join(childEnv.CODEX_HOME, "auth.json"), "{}");
+    // AUDIT R2-F1 — the autonomous lane requires a ChatGPT-subscription
+    // session file; the SAME CODEX_HOME also feeds the in-process
+    // admission/reserve re-proofs via process.env (fresh() pinned it).
+    fs.writeFileSync(path.join(childEnv.CODEX_HOME, "auth.json"),
+      JSON.stringify(CHATGPT_AUTH_JSON));
 
     // AUDIT R1 — the REAL CodexCliExecutorAdapter is the governed CODEX
     // supply: canonical registration, real child-env boundary, ambient

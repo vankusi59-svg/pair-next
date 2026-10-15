@@ -464,6 +464,15 @@ describe("F5 — the driver pins delegated planning to its lease lifetime", () =
     const t = { v: initial };
     const d = path.join(ROOT, `${counter++}-${name}`);
     fs.mkdirSync(d, { recursive: true });
+    // AUDIT R2-F1 — per-stack CODEX_HOME carrying a persisted ChatGPT
+    // session file so the live auth-mode re-proof resolves CHATGPT.
+    const codexHome = path.join(d, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "auth.json"), JSON.stringify({
+      OPENAI_API_KEY: null,
+      tokens: { id_token: { sub: "u" }, access_token: "a", refresh_token: "r" },
+    }));
+    process.env.CODEX_HOME = codexHome;
     const store = new PairEvidenceStore(path.join(d, "pair.db"));
     const objectives = new ObjectiveAuthorityService(store);
     const policy = new ObjectiveAutoPolicyService(store, objectives, () => t.v);

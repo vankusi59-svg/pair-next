@@ -70,7 +70,10 @@ import { CEO_DECISION_ATTEMPT_ENTITY, CEO_MAX_ATTEMPTS_PER_OBSERVATION } from ".
 import { ExecutorRegistry } from "./executor-registry.js";
 import { REJECTED_ROUTE_HEALTH } from "./route-registry.js";
 import { providerEntryId } from "./provider-catalog.js";
-import { CODEX_CLI_PROVIDER_ID } from "./codex-cli-transport.js";
+import {
+  CODEX_CLI_PROVIDER_ID,
+  codexChatgptSessionProven,
+} from "./codex-cli-transport.js";
 import { CODEX_EXECUTOR_ID } from "./codex-adapter.js";
 import {
   WORKFORCE_ALLOCATION_ENTITY,
@@ -552,13 +555,31 @@ export class ObjectiveAutoDriverService {
   }
 
   /** The codex-cli pairing is the ChatGPT SUBSCRIPTION transport — its
-   *  $0 billing is provable only while the provider row carries a live
-   *  authenticated session (probe-derived AUTH_OK), never from a
-   *  profile label, a stripped API key or a zero estimate alone. */
+   *  $0 billing is provable only while BOTH hold: (a) the provider row
+   *  carries a live authenticated session (probe-derived AUTH_OK), and
+   *  (b) AUDIT R2 F1 — the persisted session file itself resolves to
+   *  ChatGPT auth mode at THIS moment: a stored OPENAI_API_KEY in
+   *  auth.json is metered API-key billing even with no env keys, a
+   *  missing file is no session, and an ambiguous shape is unproven —
+   *  all fail closed. Neither the row alone nor file existence alone
+   *  is proof; the live re-read is re-run at every gate call. */
   private codexSubscriptionAuthProven(): boolean {
     const p = this.deps.store.tryGet(
       "provider", providerEntryId(CODEX_CLI_PROVIDER_ID));
-    return String(p?.auth_state ?? "") === "AUTH_OK";
+    return String(p?.auth_state ?? "") === "AUTH_OK" &&
+      codexChatgptSessionProven(undefined);
+  }
+
+  /** AUDIT R1 F4 + R2 F1 — the complete CEO subscription authority:
+   *  ACTIVE SUBSCRIPTION billing identity on the codex-cli lane AND a
+   *  proven ChatGPT-mode session — checked independently of which
+   *  executors can take tasks (a PAIR_NATIVE-only supply never implies
+   *  the CEO can run). */
+  private ceoSubscriptionProven(): boolean {
+    const b = this.deps.billingFor(CODEX_EXECUTOR_ID, null);
+    return b.mode === "SUBSCRIPTION" &&
+      b.profile != null && !b.unbounded &&
+      this.codexSubscriptionAuthProven();
   }
 
   /** PR #121 — provable cost envelope over the canonical autonomous
@@ -672,23 +693,19 @@ export class ObjectiveAutoDriverService {
         throw new DriverDenial("DRIVER_METERED_FORBIDDEN",
           "autonomous supply includes a metered billing pairing", false);
       }
+      // AUDIT R1 F4 — the CEO invocation itself is subscription-only:
+      // prove the codex-cli billing identity + live ChatGPT session
+      // authority INDEPENDENTLY of which executors can take tasks. A
+      // PAIR_NATIVE-only supply never authorizes a metered-CEO fallback.
+      // R2: this precedes the generic envelope-bound denial so an
+      // auth-mode failure reports its precise label.
+      if (!this.ceoSubscriptionProven()) {
+        throw new DriverDenial("DRIVER_SUBSCRIPTION_UNVERIFIED",
+          "codex-cli CEO subscription binding/session not proven", false);
+      }
       if (env.bound === null) {
         throw new DriverDenial("DRIVER_COST_UNVERIFIED",
           "cannot prove non-metered dispatch billing", false);
-      }
-      // AUDIT R1 F4 — the CEO invocation itself is subscription-only:
-      // prove the codex-cli billing identity + live session authority
-      // INDEPENDENTLY of which executors can take tasks. A PAIR_NATIVE-
-      // only supply never authorizes a metered-CEO fallback.
-      const ceoBilling = this.deps.billingFor(CODEX_EXECUTOR_ID, null);
-      const ceoProven =
-        ceoBilling.mode === "SUBSCRIPTION" &&
-        ceoBilling.profile != null &&
-        !ceoBilling.unbounded &&
-        this.codexSubscriptionAuthProven();
-      if (!ceoProven) {
-        throw new DriverDenial("DRIVER_SUBSCRIPTION_UNVERIFIED",
-          "codex-cli CEO subscription binding/session not proven", false);
       }
       dispatchBound = env.bound;
       if (limits?.budget_microusd_cap != null &&
@@ -753,6 +770,18 @@ export class ObjectiveAutoDriverService {
       }
       if (this.deps.costHaltActive()) {
         throw new DriverDenial("DRIVER_COST_HALTED", "cost halt asserted mid-pass", true);
+      }
+      // AUDIT R2 F1 — the subscription session is re-proven at EVERY
+      // external authority crossing (CEO call, planner call, review
+      // commit, allocation, openWorkItem): a `codex logout` or
+      // `login --with-api-key` between admission and the next
+      // invocation flips the live auth mode to API_KEY/UNAUTHENTICATED
+      // and this gate stops the pass before another subscription
+      // invocation is attempted. Non-transient — operator action is
+      // required to restore ChatGPT auth.
+      if (!this.ceoSubscriptionProven()) {
+        throw new DriverDenial("DRIVER_SUBSCRIPTION_UNVERIFIED",
+          "codex-cli subscription authority lost mid-pass", false);
       }
     };
   }
