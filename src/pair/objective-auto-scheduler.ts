@@ -34,6 +34,10 @@ const PAGE = 64;
  *  (entities 1024 / events 512) while converged idle cohorts cost one
  *  uncharged query per call. */
 const SCAN_PAGES = 3;
+/** R3-F1 — per-call bound on charged integrity work: tier-1 suspect
+ *  confirmations + tier-2 rotating deep-verify rows, so the sweep cannot
+ *  exceed the proof budget even under a corruption burst. */
+const INTEGRITY_QUOTA = 16;
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -220,6 +224,12 @@ export class ObjectiveAutoScheduler {
     private readonly policy: ObjectiveAutoPolicyService,
     private readonly now: () => number = Date.now,
   ) {}
+
+  /** R3-F1 — rotating deep-verify position. Process-local by design: it
+   *  only chooses WHICH slice receives the charged re-proof on this call
+   *  and never decides authority — a restart simply re-covers the
+   *  keyspace, so detection stays bounded per process lifetime. */
+  private integrityAfter: { t: string; id: string } | null = null;
 
   private instant(): number {
     const now = this.now();
@@ -985,10 +995,29 @@ export class ObjectiveAutoScheduler {
           Array<{ entity_id: string; rank: number }>;
         if (!candidates.length) { exhausted = true; break; }
         for (const item of candidates) {
-          const q = this.queue(item.entity_id);
+          // R3-F1: a shortlisted row whose re-proof throws is corrupted
+          // protected state — record durable fault evidence and skip it
+          // instead of aborting the scan or silently hiding it
+          let q: Queue | null;
+          try {
+            q = this.queue(item.entity_id);
+          } catch (err) {
+            if (err instanceof IntegrityError) {
+              this.fault(WAKE_STATE, item.entity_id, err); continue;
+            }
+            throw err;
+          }
           if (!q) invalid("candidate disappeared");
           furthest = q.registration_rank;
-          const lease = this.lease(item.entity_id);
+          let lease: Lease | null;
+          try {
+            lease = this.lease(item.entity_id);
+          } catch (err) {
+            if (err instanceof IntegrityError) {
+              this.fault(LEASE_STATE, item.entity_id, err); continue;
+            }
+            throw err;
+          }
           const activeLease = lease?.state === "ACTIVE" && Number(lease.expires_at) > now;
           const usable = q.queue_state === "WAITING_CONSUMER" && !activeLease &&
             (q.pending_generation > q.claimed_generation ||
@@ -1015,6 +1044,10 @@ export class ObjectiveAutoScheduler {
         }
         return null;
       }
+      // R3-F1: before an idle sweep goes silent, prove the quiet is real —
+      // rows the SQL filter excluded must still face ledger+hash
+      // verification on a bounded cadence, with durable fault evidence
+      this.integritySweep();
       const counter = Number(f.registration_counter);
       if (last > 0 || upper < counter) {
         // cohort wrap/bound refresh commits; a no-change sweep over a
@@ -1027,6 +1060,95 @@ export class ObjectiveAutoScheduler {
       }
       return null;
     });
+  }
+
+  /** R3-F1 — durable fault evidence, dedup'd per protected row. The
+   *  receipt itself is a hash-chained scheduler row, so a detected
+   *  corruption leaves canonical evidence even though the corrupted row
+   *  can never be written again (its own commit ledger already diverged).
+   */
+  private fault(entityType: string, entityId: string, err: unknown): void {
+    const rid = `integrity_fault:${entityType}:${entityId}`;
+    if (readSchedulerRow<Row>(this.store, SCHEDULER_RECEIPT, rid)) return;
+    writeSchedulerRow(this.store, SCHEDULER_RECEIPT, rid, {
+      objective_id: entityId, operation: "INTEGRITY_FAULT",
+      entity_type: entityType, fault: sanitizeFaultReason(err),
+      detected_at_ms: this.instant(),
+    }, "INTEGRITY_FAULT", `${entityType}:${entityId}`);
+  }
+
+  /** R3-F1 — run the full protected-row verification on one row and
+   *  convert a proven failure into a durable fault receipt. */
+  private faultIfUnverifiable(entityType: string, entityId: string): void {
+    try {
+      if (!readSchedulerRow<Row>(this.store, entityType, entityId)) {
+        this.fault(entityType, entityId, "protected row unreadable");
+      }
+    } catch (err) {
+      if (err instanceof IntegrityError) {
+        this.fault(entityType, entityId, err);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /** R3-F1 — bounded amortized integrity verification for rows the SQL
+   *  candidate filter never touches. Two tiers, both journal-free when
+   *  clean so idle convergence (R1-F2/R2-F1) is preserved:
+   *   tier 1: one uncharged aggregate compares each protected row's entity
+   *           version with its scheduler-commit ledger (count/revision) —
+   *           a canonical write that bypassed writeSchedulerRow keeps a
+   *           valid entity hash but provably diverges here, whole-cohort
+   *           every idle call.
+   *   tier 2: a rotating slice gets the charged readSchedulerRow re-proof
+   *           (payload hash + commit chain), catching raw payload drift
+   *           the ledger alone cannot see — coverage bound is
+   *           ceil(protected_rows / INTEGRITY_QUOTA) idle calls.
+   *  Suspects are confirmed via the charged path and journaled once per
+   *  row; nothing is written while the cohort verifies clean. */
+  private integritySweep(): void {
+    const COMMIT = "OBJECTIVE_AUTO_SCHEDULER_COMMIT";
+    let verified = 0;
+    const screen = this.store.db.prepare(`SELECT e.entity_type AS t,
+        e.entity_id AS id, e.version AS v,
+        (SELECT COUNT(*) FROM events ev WHERE ev.entity_type=e.entity_type
+          AND ev.entity_id=e.entity_id AND ev.event_type=?) AS commits,
+        (SELECT MAX(CAST(json_extract(ev2.metadata_json,'$.revision') AS INTEGER))
+          FROM events ev2 WHERE ev2.entity_type=e.entity_type
+          AND ev2.entity_id=e.entity_id AND ev2.event_type=?) AS last_rev
+      FROM entities e WHERE e.entity_type IN (?, ?)`)
+      .all(COMMIT, COMMIT, WAKE_STATE, LEASE_STATE) as
+      Array<{ t: string; id: string; v: number; commits: number; last_rev: number | null }>;
+    for (const s of screen) {
+      if (verified >= INTEGRITY_QUOTA) break;
+      if (s.v < 1 || s.commits !== s.v || s.last_rev !== s.v - 1) {
+        verified++;
+        this.faultIfUnverifiable(s.t, s.id);
+      }
+    }
+    const at = this.integrityAfter;
+    let slice = this.store.db.prepare(`SELECT entity_type AS t, entity_id AS id
+        FROM entities WHERE entity_type IN (?, ?)
+          AND (entity_type>? OR (entity_type=? AND entity_id>?))
+        ORDER BY entity_type, entity_id LIMIT ?`)
+      .all(WAKE_STATE, LEASE_STATE, at?.t ?? "", at?.t ?? "", at?.id ?? "",
+        INTEGRITY_QUOTA) as Array<{ t: string; id: string }>;
+    if (!slice.length) {
+      slice = this.store.db.prepare(`SELECT entity_type AS t, entity_id AS id
+          FROM entities WHERE entity_type IN (?, ?)
+          ORDER BY entity_type, entity_id LIMIT ?`)
+        .all(WAKE_STATE, LEASE_STATE, INTEGRITY_QUOTA) as
+        Array<{ t: string; id: string }>;
+      this.integrityAfter = null;
+    } else {
+      this.integrityAfter = slice[slice.length - 1]!;
+    }
+    for (const r of slice) {
+      if (verified >= INTEGRITY_QUOTA) break;
+      verified++;
+      this.faultIfUnverifiable(r.t, r.id);
+    }
   }
 }
 

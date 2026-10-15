@@ -334,3 +334,80 @@ describe("H6 — large unchanged cohorts converge regardless of size (R2-F1)", (
     }, 30000);
   }
 });
+
+describe("H7 — tampered protected rows are detected, never silently hidden (R3-F1)", () => {
+  // durable fault evidence is a hash-chained scheduler receipt keyed by
+  // the corrupted protected row
+  function faultReceipt(store: PairEvidenceStore, entityType: string, entityId: string) {
+    return store.tryGet("objective_auto_receipt",
+      `integrity_fault:${entityType}:${entityId}`) as
+      Record<string, unknown> | null;
+  }
+
+  it("a queue row tampered (valid hash, no commit) into a filtered-out state is faulted, not hidden", () => {
+    const s = fresh("h7a");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o));
+    s.scheduler.observe(oid(o));
+    // canonical put recomputes the entity hash but never writes the
+    // protected scheduler commit — the SQL filter now excludes the row
+    const row = s.store.tryGet("objective_auto_state", oid(o)) as Record<string, unknown>;
+    s.store.put("objective_auto_state", oid(o),
+      { ...row, queue_state: "WAITING_EVIDENCE" }, Number(row.version));
+    expect(s.scheduler.nextFairCandidate()).toBeNull();
+    const r = faultReceipt(s.store, "objective_auto_state", oid(o));
+    expect(r).toBeTruthy();
+    expect(String(r!.operation)).toBe("INTEGRITY_FAULT");
+  });
+
+  it("a forged ACTIVE lease suppressing an actionable objective is faulted, not hidden", () => {
+    const s = fresh("h7b");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o));
+    s.scheduler.observe(oid(o));
+    // forged lease via canonical put: ACTIVE + future expiry — the SQL
+    // NOT EXISTS exclusion hides the objective behind it
+    s.store.put("objective_auto_lease", oid(o), {
+      objective_id: oid(o), state: "ACTIVE", fence: 1,
+      worker_id: "forged", boot_id: "forged", token_hash: "f".repeat(64),
+      expires_at: s.now() + 600_000, claimed_generation: 1,
+      checkpoint_digest: "x", started_at: s.now(), renewed_at: s.now(),
+      policy_version: 1, terms_digest: "x", owner_authority_id: OWNER,
+      objective_version: 1, max_lifetime_ms: 300_000,
+    }, 0);
+    expect(s.scheduler.nextFairCandidate()).toBeNull();
+    expect(faultReceipt(s.store, "objective_auto_lease", oid(o))).toBeTruthy();
+  });
+
+  it("a usable-looking row with a divergent commit ledger is faulted and skipped, not claimed", () => {
+    const s = fresh("h7c");
+    const o = mkObjective(s, mkBiz(s.store));
+    enable(s, oid(o));
+    s.scheduler.observe(oid(o));
+    // bump pending_generation via canonical put — stays SQL-actionable,
+    // but commits < version: the shortlist re-proof must catch it
+    const row = s.store.tryGet("objective_auto_state", oid(o)) as Record<string, unknown>;
+    s.store.put("objective_auto_state", oid(o),
+      { ...row, pending_generation: Number(row.pending_generation) + 1 },
+      Number(row.version));
+    expect(s.scheduler.nextFairCandidate()).toBeNull();
+    expect(faultReceipt(s.store, "objective_auto_state", oid(o))).toBeTruthy();
+    // and the corrupted row must never become claimable
+    expect(() => s.scheduler.claim(oid(o), "w", "b", "h7c")).toThrow();
+  });
+
+  it("a clean large cohort stays silent — the sweep journals nothing when nothing is wrong", () => {
+    const s = fresh("h7d");
+    const bid = mkBiz(s.store);
+    for (let i = 0; i < 64; i++) {
+      const o = mkObjective(s, bid);
+      configure(s, oid(o));
+      s.scheduler.observe(oid(o));
+    }
+    s.scheduler.nextFairCandidate();
+    s.scheduler.nextFairCandidate();
+    const base = commitCount(s.store);
+    for (let i = 0; i < 4; i++) expect(s.scheduler.nextFairCandidate()).toBeNull();
+    expect(commitCount(s.store) - base).toBe(0);
+  });
+});
