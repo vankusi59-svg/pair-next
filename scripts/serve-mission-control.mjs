@@ -106,6 +106,7 @@ import {
   makeReplanGenerationDriver,
   replanWorkItemId,
   makeServePlanner,
+  plannerExecutorCapSets,
   SERVE_LLM_WORK_CAPS,
   ConversationSessionService,
   ConversationReasoningService,
@@ -354,20 +355,13 @@ const selfmod = new SelfImprovementController(service, {
 // shown to the planner. SERVE_LLM_PLANNER_CAPS stays the final canonical
 // vocabulary for validatePlanProposal.
 const LLM_PLANNER_CAPS = SERVE_LLM_WORK_CAPS;
-// Capability sets of the currently-qualified executors — sanitizePlan drops
-// any task whose required_capabilities no single executor can serve.
-const executorCapSets = () =>
-  [...adapters.values()]
-    .map((a) => {
-      try {
-        const c = a.capabilities();
-        if (c.qualified === false) return [];
-        return c.capability_ids ?? c.capabilities ?? [];
-      } catch {
-        return [];
-      }
-    })
-    .filter((s) => s.length);
+// Capability sets of the currently ENABLED, qualified executors —
+// sanitizePlan drops any task whose required_capabilities no single
+// eligible executor can serve. PR#119-audit F1: derived from canonical
+// state at call time (src/pair/serve-planner.ts plannerExecutorCapSets)
+// so an operator ON/OFF toggle takes effect for planning without a
+// restart; a DISABLED executor can never make a task canonicalizable.
+const executorCapSets = plannerExecutorCapSets(service, adapters);
 // THE ONE canonical LLM-plan preparation seam + the production runtime
 // planner now live in src/pair/serve-planner.ts (compiled to dist) so the
 // EXACT production composition is importable by tests — a test drives the

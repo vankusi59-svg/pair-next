@@ -75,6 +75,9 @@ import {
 } from "./goal-contract.js";
 import { assertPlanCoverage } from "./plan-coverage.js";
 import { IntegrityError } from "./errors.js";
+import { ExecutorRegistry } from "./executor-registry.js";
+import type { ExecutorAdapter } from "./adapter.js";
+import type { PairControlPlane } from "./service.js";
 import type { RuntimePlanner, RuntimePlannerInput } from "./mission-runtime.js";
 
 /** Capability allowlist for LLM-derived plans (initial + replan). */
@@ -139,6 +142,45 @@ export function canonicalBookkeepingTask(goal: string): Record<string, unknown> 
       },
     },
   };
+}
+
+/**
+ * Planner capability supply — capability sets of the CURRENTLY ENABLED,
+ * qualified executors, derived from canonical state at call time.
+ *
+ * Audit F1 (PR #119): the dashboard ON/OFF toggle flips durable
+ * `executor.status`; a DISABLED executor's capabilities must never make
+ * a task canonicalizable because the capability router and
+ * GovernedTaskGate would reject its dispatch anyway — the planner would
+ * otherwise mint plan shapes no executor may run. Reading the registry
+ * row inside the closure means an operator toggle takes effect for
+ * planning WITHOUT a restart for already-bound adapters. Unqualified
+ * rows contribute nothing; the live `capabilities()` declaration still
+ * gates the actual list (dynamically-claimed capabilities stay
+ * executor-owned).
+ */
+export function plannerExecutorCapSets(
+  service: PairControlPlane,
+  adapters: Map<string, ExecutorAdapter>,
+): () => string[][] {
+  const registry = new ExecutorRegistry(service);
+  return () =>
+    [...adapters.entries()]
+      .map(([id, a]) => {
+        try {
+          const row = service.store.tryGet("executor", id);
+          if (!row || String(row.status) === "DISABLED") return [];
+          const desc = registry.normalizeDescriptor(row);
+          if (String(desc.qualification_state) !== "QUALIFIED") return [];
+          const c = a.capabilities();
+          if (c.qualified === false) return [];
+          const caps = c.capability_ids ?? c.capabilities ?? [];
+          return Array.isArray(caps) ? caps.map(String) : [];
+        } catch {
+          return [];
+        }
+      })
+      .filter((s) => s.length);
 }
 
 export interface ServePlannerDeps {

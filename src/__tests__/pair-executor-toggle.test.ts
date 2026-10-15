@@ -39,6 +39,8 @@ import {
   PairEvidenceStore,
   PolicyError,
   createMissionControlServer,
+  makeServeCanonicalizer,
+  plannerExecutorCapSets,
   registerGovernedExecutors,
   validatePlanProposal,
   type ExecutorAdapter,
@@ -137,6 +139,7 @@ function makeCtx(
     default_disabled?: string[];
     qualified?: string[];
     executors?: string[];
+    caps?: Record<string, string[]>;
   } = {},
 ): Ctx {
   const d = dir(name);
@@ -153,7 +156,7 @@ function makeCtx(
   const add = (id: string) => {
     adapters.set(
       id,
-      new ScriptedAdapter(id, ["FILE_OPERATIONS"], {
+      new ScriptedAdapter(id, opts.caps?.[id] ?? ["FILE_OPERATIONS"], {
         qualified: (opts.qualified ?? [...wanted]).includes(id),
       }),
     );
@@ -577,5 +580,109 @@ describe("E8 API", () => {
       });
       expect(malformed.status).toBe(400);
     });
+  });
+});
+
+/* ---- F — planner capability supply (PR #119 audit F1) ------------------
+ * executorCapSets feeds makeServeCanonicalizer's sanitizePlan: a task is
+ * dropped as DROP_UNSERVABLE_CAPS when no single executor set covers its
+ * required_capabilities. The supply must reflect canonical
+ * `executor.status` — a DISABLED executor can never make a task
+ * canonicalizable, and a dashboard toggle must take effect without a
+ * restart for already-bound adapters. */
+
+const REMOTE_CAP = "REMOTE_CLOUD_TASK_EXECUTION";
+const NETREQ_LOCAL = {
+  source_kind: "LOCAL",
+  access_intent: "READ",
+  freshness: "NOT_REQUIRED",
+};
+const rawTask = (
+  key: string,
+  caps: string[],
+  deps: string[] = [],
+  df: { produces?: string[]; consumes?: string[] } = {},
+): Record<string, unknown> => ({
+  task_key: key,
+  title: key,
+  task_instruction: `perform ${key}`,
+  required_capabilities: caps,
+  depends_on: deps,
+  metadata: {
+    network_requirement: NETREQ_LOCAL,
+    risk_class: "LOW",
+    pair_dataflow: { produces: df.produces ?? [], consumes: df.consumes ?? [] },
+  },
+});
+
+describe("F planner capability supply", () => {
+  it("F1: DISABLED executor's capabilities leave the planner supply; ON restores them live", () => {
+    const ctx = makeCtx("f1", {
+      executors: [CODEX_EXECUTOR_ID, DEVIN_EXECUTOR_ID],
+      caps: {
+        [CODEX_EXECUTOR_ID]: ["FILE_OPERATIONS"],
+        [DEVIN_EXECUTOR_ID]: ["FILE_OPERATIONS", REMOTE_CAP],
+      },
+    });
+    const capSets = plannerExecutorCapSets(ctx.service, ctx.adapters);
+    // Default ON — DEVIN's remote cap is servable.
+    expect(capSets().some((s) => s.includes(REMOTE_CAP))).toBe(true);
+    // OFF — the durable row drops DEVIN out of planner supply.
+    ctx.registry.setExecutorEnabled(DEVIN_EXECUTOR_ID, false, "operator:t");
+    const off = capSets();
+    expect(off.some((s) => s.includes(REMOTE_CAP))).toBe(false);
+    expect(off.some((s) => s.includes("FILE_OPERATIONS"))).toBe(true);
+    // ON again — recomputed from canonical state, no restart.
+    ctx.registry.setExecutorEnabled(DEVIN_EXECUTOR_ID, true, "operator:t");
+    expect(capSets().some((s) => s.includes(REMOTE_CAP))).toBe(true);
+    // OFF once more — symmetric.
+    ctx.registry.setExecutorEnabled(DEVIN_EXECUTOR_ID, false, "operator:t");
+    expect(capSets().some((s) => s.includes(REMOTE_CAP))).toBe(false);
+  });
+
+  it("F2: canonicalizer drops a Devin-only-capable task while OFF; accepts after ON", () => {
+    const ctx = makeCtx("f2", {
+      executors: [CODEX_EXECUTOR_ID, DEVIN_EXECUTOR_ID],
+      caps: {
+        [CODEX_EXECUTOR_ID]: ["FILE_OPERATIONS"],
+        [DEVIN_EXECUTOR_ID]: ["FILE_OPERATIONS", REMOTE_CAP],
+      },
+    });
+    const canonicalize = makeServeCanonicalizer({
+      executorCapSets: plannerExecutorCapSets(ctx.service, ctx.adapters),
+    });
+    const raw = [
+      rawTask("T1", ["FILE_OPERATIONS"], [], { produces: ["a1.txt"] }),
+      rawTask("T2", [REMOTE_CAP], ["T1"], { consumes: ["a1.txt"] }),
+    ];
+    const remoteCaps = (
+      out: { tasks?: Array<Record<string, unknown>> } | Array<Record<string, unknown>>,
+    ) =>
+      (Array.isArray(out) ? out : (out.tasks ?? [])).filter((t) =>
+        (t.required_capabilities as string[] | undefined)?.includes(REMOTE_CAP),
+      ).length;
+    // OFF: the remote-capable task is unservable → dropped by sanitizePlan.
+    ctx.registry.setExecutorEnabled(DEVIN_EXECUTOR_ID, false, "operator:t");
+    const offOut = canonicalize(raw.map((t) => ({ ...t })), "executor toggle regression");
+    expect(remoteCaps(offOut)).toBe(0);
+    // ON: the same raw plan keeps the remote task — toggle took effect
+    // for planning with no restart.
+    ctx.registry.setExecutorEnabled(DEVIN_EXECUTOR_ID, true, "operator:t");
+    const onOut = canonicalize(raw.map((t) => ({ ...t })), "executor toggle regression");
+    expect(remoteCaps(onOut)).toBe(1);
+  });
+
+  it("F3: unqualified executor contributes no supply even while ENABLED", () => {
+    const ctx = makeCtx("f3", {
+      executors: [DEVIN_EXECUTOR_ID],
+      qualified: [], // DEVIN unqualified (e.g. missing PAIR_DEVIN_API_KEY)
+      caps: { [DEVIN_EXECUTOR_ID]: [REMOTE_CAP] },
+    });
+    const capSets = plannerExecutorCapSets(ctx.service, ctx.adapters);
+    expect(capSets().some((s) => s.includes(REMOTE_CAP))).toBe(false);
+    // Enabling an unqualified executor still yields no supply — ON is
+    // intent only, qualification still gates.
+    ctx.registry.setExecutorEnabled(DEVIN_EXECUTOR_ID, true, "operator:t");
+    expect(capSets().some((s) => s.includes(REMOTE_CAP))).toBe(false);
   });
 });
