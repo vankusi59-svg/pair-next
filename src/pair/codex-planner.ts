@@ -48,6 +48,7 @@ import {
   resolveWorkTaskBudget,
   repairNetworkCapabilityBinding,
   LLM_PLANNER_MIN_TASKS,
+  type LlmPlannerConfig,
   type PlannerRejectionContext,
 } from "./llm-planner.js";
 import { assertPlannerCandidateEligible, assertPlannerRoleAndDisjoint } from "./model-role.js";
@@ -102,6 +103,11 @@ export interface CodexPlannerInvokeConfig {
   allowedCapabilities: string[];
   capabilitySets?: string[][];
   maxTasks?: number;
+  /** F3 — bounded structured failure context on a REPLAN: identical
+   *  field shape as the HTTP transport — the ONE canonical prompt
+   *  builder renders the same REPLAN CONTEXT block for both transports
+   *  (drift between transports is a contract violation). */
+  replanContext?: LlmPlannerConfig["replanContext"];
   /** P-REASK — bounded rejection feedback on the ONE canonical-rejection
    *  re-ask; rendered into the SAME canonical prompt builder as every
    *  other transport (MINIMAL-REPAIR, never F3 alternative-plan). */
@@ -271,6 +277,34 @@ export async function codexPlannerProbe(opts: {
   return { outcome: "AUTH_OK", latency_ms: Date.now() - t0, detail: `invocation_ok code=0` };
 }
 
+/** The exact planner prompt the codex transport submits — one canonical
+ *  seam (same text the HTTP llmPlan lane builds via
+ *  buildPlannerUserPrompt). Exported so tests can prove replan /
+ *  rejection / authority blocks reach both transports identically —
+ *  prompt drift between transports is a contract violation. */
+export function buildCodexPlannerPrompt(
+  goal: string,
+  cfg: Pick<
+    CodexPlannerInvokeConfig,
+    | "allowedCapabilities"
+    | "capabilitySets"
+    | "maxTasks"
+    | "replanContext"
+    | "rejectionContext"
+    | "authorityGoal"
+  >,
+): string {
+  const authorityGoal = cfg.authorityGoal ?? goal;
+  return `${plannerSystemPrompt()}\n\n${buildPlannerUserPrompt(goal, {
+    allowedCapabilities: cfg.allowedCapabilities,
+    capabilitySets: cfg.capabilitySets,
+    maxTasks: cfg.maxTasks,
+    replanContext: cfg.replanContext,
+    rejectionContext: cfg.rejectionContext,
+    authorityGoal,
+  })}`;
+}
+
 /**
  * The planner invocation: spawn codex under the planner profile, read the
  * schema-constrained final message, sanitize through the SAME plan contract
@@ -288,14 +322,7 @@ export async function codexPlannerPlan(
   // the enriched mission text is context only.
   const authorityGoal = cfg.authorityGoal ?? goal;
   const workBudget = resolveWorkTaskBudget(authorityGoal, cfg.maxTasks);
-  const prompt =
-    `${plannerSystemPrompt()}\n\n${buildPlannerUserPrompt(goal, {
-      allowedCapabilities: cfg.allowedCapabilities,
-      capabilitySets: cfg.capabilitySets,
-      maxTasks: cfg.maxTasks,
-      rejectionContext: cfg.rejectionContext,
-      authorityGoal,
-    })}`;
+  const prompt = buildCodexPlannerPrompt(goal, cfg);
   let out: Awaited<ReturnType<typeof invokeRaw>>;
   try {
     // AUDIT R1 F4 — counted at the initiation point: a spawn that then

@@ -90,12 +90,14 @@ import {
   persistedPlanSemanticDigest,
   canonicalPlanSemanticDigest,
   MAX_REPLAN_CANDIDATES_PER_DECISION,
+  REPLAN_GENERATION_PENDING,
   ReplanAttemptLedger,
   revisionBoundToAttempt,
   type DependencyReason,
   type RecoveryFailureContext,
   type ReplanAttemptRecord,
 } from "./plan-feasibility.js";
+import { missionOperatorGoalOf } from "./goal-contract.js";
 
 export const MISSION_RUNTIME_STATES = [
   "CREATED",
@@ -3561,6 +3563,12 @@ export class MissionRuntime {
         });
       } catch (err) {
         const code = String((err as { code?: string })?.code ?? "");
+        // Governed async replan provider — a durable replan_generation
+        // row was just minted or is still in flight. PENDING is NOT a
+        // failure: no candidate slot is consumed, no ledger row is
+        // written, and the runtime stays REPLANNING until durable
+        // staging resolves the generation.
+        if (code === REPLAN_GENERATION_PENDING) return;
         // R1.1 — the REPLAN action itself is infeasible when no governed
         // replan provider can produce a candidate: not a candidate
         // rejection, no bounded slot consumed — route straight to the
@@ -3917,57 +3925,12 @@ export class MissionRuntime {
    *  network authorization, Telegram delivery intent, or output
    *  language. The enriched envelope stays informational. */
   private missionOperatorGoal(mission: Record<string, unknown>): string {
-    const og = mission.operator_goal;
-    const openId = mission.bound_open_id;
-    if (typeof openId === "string" && openId !== "") {
-      // R2-F2 — a bound mission's operator authority is provable ONLY
-      // through the canonical chain bound_open_id → work_open_binding →
-      // work_item.goal, and the chain is validated on EVERY resolution:
-      // a pinned operator_goal is an immutable snapshot of work_item.goal
-      // taken at mint, never a bypass around provenance. A missing
-      // binding, a binding pinned to another mission, a missing/goal-less
-      // work item, OR a pin diverging from canonical work_item.goal all
-      // mean the operator text cannot be proven — fail closed: the
-      // enriched delegated envelope is NEVER promoted to authority.
-      const binding = this.store.tryGet(
-        "work_open_binding", openId,
-      ) as Record<string, unknown> | null;
-      if (
-        !binding ||
-        String(binding.mission_id ?? "") !== String(mission.mission_id ?? "")
-      ) {
-        throw new IntegrityError(
-          "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
-          `bound mission ${String(mission.mission_id)}: work_open_binding ${openId} missing or mission-mismatched`,
-        );
-      }
-      const wi = this.store.tryGet(
-        "work_item", String(binding.work_item_id ?? ""),
-      ) as Record<string, unknown> | null;
-      if (wi?.goal == null || String(wi.goal).trim() === "") {
-        throw new IntegrityError(
-          "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
-          `bound mission ${String(mission.mission_id)}: work_item ${String(binding.work_item_id ?? "")} missing or goal-less`,
-        );
-      }
-      const canonical = String(wi.goal);
-      if (typeof og === "string" && og.trim() !== "") {
-        if (og !== canonical) {
-          throw new IntegrityError(
-            "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
-            `bound mission ${String(mission.mission_id)}: pinned operator_goal diverges from work_item.goal`,
-          );
-        }
-        return og;
-      }
-      // Legacy pre-R1 bound row (no pinned field): recover the snapshot.
-      return canonical;
-    }
-    // Direct mission — no bound provenance to validate. A pinned
-    // operator_goal (persisted through preview/confirm) is authoritative;
-    // pre-R1 direct rows derive authority from the operator-submitted goal.
-    if (typeof og === "string" && og.trim() !== "") return og;
-    return String(mission.goal ?? "");
+    // R2-F2 — bound-mission operator authority resolves ONLY through
+    // the canonical chain bound_open_id → work_open_binding →
+    // work_item.goal, validated on every resolution. The single
+    // canonical seam lives in goal-contract.ts so the governed async
+    // replan-generation driver proves the EXACT same authority.
+    return missionOperatorGoalOf(this.store, mission);
   }
 
   /** Advisory retrieval — a broken advisor can never break orchestration. */

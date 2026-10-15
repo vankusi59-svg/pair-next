@@ -140,6 +140,18 @@ export const PLANNER_RUN_DEADLINE = {
   bounds: { min: 5_000, max: 3_600_000, unit: "ms" },
 } as const;
 
+/** Governed async replan generation — absolute deadline for ONE durable
+ *  `replan_generation` row (mint → claimed → settled). Bounds the
+ *  pending wait AND the in-flight pool run; a row past its deadline
+ *  fails TIMEOUT and the REPLAN action goes infeasible. Default 30m to
+ *  cover the full planner chain (codex 900s ceiling + HTTP + bounded
+ *  re-ask). Unit: milliseconds. Bounds 5s–3600s. */
+export const REPLAN_GENERATION_DEADLINE = {
+  name: "PAIR_REPLAN_GENERATION_DEADLINE_MS",
+  defaultValue: 1_800_000,
+  bounds: { min: 5_000, max: 3_600_000, unit: "ms" },
+} as const;
+
 /** Governed task execution budget. Unit: seconds. Bounds 5s–7200s. */
 export const TASK_TIMEOUT = {
   name: "PAIR_TASK_TIMEOUT_S",
@@ -199,6 +211,10 @@ export function codexPlannerTimeoutMs(env: EnvLike = process.env as EnvLike): nu
 
 export function plannerRunDeadlineMs(env: EnvLike = process.env as EnvLike): number {
   return readPositiveIntEnv(PLANNER_RUN_DEADLINE.name, PLANNER_RUN_DEADLINE.defaultValue, PLANNER_RUN_DEADLINE.bounds, env);
+}
+
+export function replanGenerationDeadlineMs(env: EnvLike = process.env as EnvLike): number {
+  return readPositiveIntEnv(REPLAN_GENERATION_DEADLINE.name, REPLAN_GENERATION_DEADLINE.defaultValue, REPLAN_GENERATION_DEADLINE.bounds, env);
 }
 
 export function ceoCliTimeoutMs(env: EnvLike = process.env as EnvLike): number {

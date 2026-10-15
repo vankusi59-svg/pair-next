@@ -21,6 +21,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { IntegrityError } from "./errors.js";
 import { detectTelegramDeliveryIntent, type TelegramDeliveryIntent } from "./plan-dataflow.js";
 import { detectOutputLanguage, type OutputLanguage } from "./output-language.js";
 
@@ -109,6 +110,78 @@ export function operatorGoalOf(
   // existed). This is authority-of-record fallback — never a widening:
   // a bound mission always carries the explicit pin.
   return String(source?.goal ?? "");
+}
+
+/** The mission's operator-goal authority text, resolved by PROVENANCE
+ *  (never by parsing the committed goal) — the ONE canonical seam shared
+ *  by MissionRuntime's planner calls and the governed async replan
+ *  generation driver:
+ *    1. bound missions (bound_open_id set) — the canonical chain
+ *       work_open_binding → work_item.goal is validated on EVERY
+ *       resolution; a pinned `operator_goal` is the immutable snapshot
+ *       of that goal taken at mint (identical by construction — any
+ *       divergence fails closed), never a bypass around provenance.
+ *       Missing/mismatched binding, missing or goal-less work item, or
+ *       pin divergence all FAIL CLOSED: unrecoverable canonical
+ *       authority can never silently widen to the enriched envelope;
+ *    2. legacy bound rows minted before the field — same chain, the
+ *       canonical work item goal IS the recovered snapshot;
+ *    3. direct missions (no binding) — the persisted `operator_goal`
+ *       pin (preview/confirm path) or, for pre-R1 rows, `goal` itself.
+ *  This text — and only this text — may mint contract requirements,
+ *  network authorization, Telegram delivery intent, or output
+ *  language. The enriched envelope stays informational. */
+export function missionOperatorGoalOf(
+  store: {
+    tryGet: (
+      entityType: string,
+      entityId: string,
+    ) => (Record<string, unknown> & { version: number }) | null;
+  },
+  mission: Record<string, unknown>,
+): string {
+  const og = mission.operator_goal;
+  const openId = mission.bound_open_id;
+  if (typeof openId === "string" && openId !== "") {
+    const binding = store.tryGet(
+      "work_open_binding", openId,
+    ) as Record<string, unknown> | null;
+    if (
+      !binding ||
+      String(binding.mission_id ?? "") !== String(mission.mission_id ?? "")
+    ) {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+        `bound mission ${String(mission.mission_id)}: work_open_binding ${openId} missing or mission-mismatched`,
+      );
+    }
+    const wi = store.tryGet(
+      "work_item", String(binding.work_item_id ?? ""),
+    ) as Record<string, unknown> | null;
+    if (wi?.goal == null || String(wi.goal).trim() === "") {
+      throw new IntegrityError(
+        "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+        `bound mission ${String(mission.mission_id)}: work_item ${String(binding.work_item_id ?? "")} missing or goal-less`,
+      );
+    }
+    const canonical = String(wi.goal);
+    if (typeof og === "string" && og.trim() !== "") {
+      if (og !== canonical) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_BOUND_GOAL_PROVENANCE",
+          `bound mission ${String(mission.mission_id)}: pinned operator_goal diverges from work_item.goal`,
+        );
+      }
+      return og;
+    }
+    // Legacy pre-R1 bound row (no pinned field): recover the snapshot.
+    return canonical;
+  }
+  // Direct mission — no bound provenance to validate. A pinned
+  // operator_goal (persisted through preview/confirm) is authoritative;
+  // pre-R1 direct rows derive authority from the operator-submitted goal.
+  if (typeof og === "string" && og.trim() !== "") return og;
+  return String(mission.goal ?? "");
 }
 
 /* ------------------------------------------------------------------ */
