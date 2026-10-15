@@ -411,3 +411,108 @@ describe("H7 — tampered protected rows are detected, never silently hidden (R3
     expect(commitCount(s.store) - base).toBe(0);
   });
 });
+
+describe("H8 — sweep quota separation + corrupt-page traversal (R4-F1/F2)", () => {
+  const STATE = "objective_auto_state";
+  function faultReceipt(store: PairEvidenceStore, entityType: string, entityId: string) {
+    return store.tryGet("objective_auto_receipt",
+      `integrity_fault:${entityType}:${entityId}`) as
+      Record<string, unknown> | null;
+  }
+  /** raw payload drift: valid row shape, stale payload_hash, ledger clean —
+   *  only the charged deep-verify tier can see it */
+  function hashDrift(s: Stack, objectiveId: string) {
+    const row = s.store.tryGet(STATE, objectiveId) as Record<string, unknown>;
+    const tampered = JSON.stringify({ ...row, wait_streak: 97 });
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    db.prepare("UPDATE entities SET payload=? WHERE entity_type=? AND entity_id=?")
+      .run(tampered, STATE, objectiveId);
+  }
+  /** canonical-put corruption: valid hash, missing scheduler commit */
+  function putCorrupt(s: Stack, objectiveId: string) {
+    const row = s.store.tryGet(STATE, objectiveId) as Record<string, unknown>;
+    s.store.put(STATE, objectiveId,
+      { ...row, queue_state: "WAITING_EVIDENCE" }, Number(row.version));
+  }
+
+  it("clean rows at ledger versions 1,2,3 never earn fault receipts and journal nothing", () => {
+    const s = fresh("h8-clean");
+    const bid = mkBiz(s.store);
+    // v2 queue row (register+observe), a v1 ACTIVE lease via claim, a v1
+    // claim receipt — a mixed-version clean protected set
+    const a = mkObjective(s, bid); configure(s, oid(a)); s.scheduler.observe(oid(a));
+    const b = mkObjective(s, bid); enable(s, oid(b)); s.scheduler.observe(oid(b));
+    const h = s.scheduler.claim(oid(b), "w", "b", "h8-clean");
+    s.scheduler.settle(h, "WAITING", "h8-clean-p1"); // fully parked
+    s.scheduler.nextFairCandidate(); // absorb the one-time cohort-bound refresh
+    const base = commitCount(s.store);
+    for (let i = 0; i < 3; i++) s.scheduler.nextFairCandidate();
+    const db = (s.store as unknown as { db: import("better-sqlite3").Database }).db;
+    const faults = db.prepare(
+      `SELECT COUNT(*) c FROM events WHERE event_type='OBJECTIVE_AUTO_SCHEDULER_COMMIT'
+        AND json_extract(metadata_json,'$.operation')='INTEGRITY_FAULT'`).get() as { c: number };
+    expect(faults.c).toBe(0);
+    expect(commitCount(s.store) - base).toBe(0);
+  });
+
+  for (const n of [16, 17, 32, 64]) {
+    it(`cohort ${n}: rotating deep-verify reaches drift despite persistent suspects`, () => {
+      const s = fresh("h8-" + n);
+      const bid = mkBiz(s.store);
+      const ids: string[] = [];
+      for (let i = 0; i < n; i++) {
+        const o = mkObjective(s, bid);
+        configure(s, oid(o));
+        s.scheduler.observe(oid(o));
+        ids.push(oid(o)); // entity insertion order == creation order
+      }
+      // persistent tier-1 suspects occupy the EARLIEST positions (valid
+      // hash, missing commit — the screen must confirm them once, then
+      // never let them re-consume the quota)
+      const suspects = ids.slice(0, Math.min(16, n - 1));
+      for (const id of suspects) putCorrupt(s, id);
+      // hash-drift the LAST-created row — ledger stays clean, only the
+      // rotating deep-verify tier can see the payload-hash mismatch
+      const driftId = ids[ids.length - 1]!;
+      hashDrift(s, driftId);
+      let calls = 0;
+      while (calls < 10 && !faultReceipt(s.store, STATE, driftId)) {
+        s.scheduler.nextFairCandidate();
+        calls++;
+      }
+      expect(faultReceipt(s.store, STATE, driftId)).toBeTruthy();
+      // bound: suspects confirm in ~1 call; tier-2 reaches any keyset
+      // position within ceil(protected_rows/16) idle calls
+      expect(calls).toBeLessThanOrEqual(Math.ceil(n / 16) + 2);
+      // suspects already receipted: later calls journal nothing for them
+      s.scheduler.nextFairCandidate();
+      const mid = commitCount(s.store);
+      s.scheduler.nextFairCandidate();
+      s.scheduler.nextFairCandidate();
+      expect(commitCount(s.store) - mid).toBe(0);
+    }, 30000);
+  }
+
+  it("64 corrupt shortlisted queues cannot starve the healthy objective at rank 65", () => {
+    const s = fresh("h8-page");
+    const bid = mkBiz(s.store);
+    const ids: string[] = [];
+    for (let i = 0; i < 65; i++) {
+      const o = mkObjective(s, bid);
+      enable(s, oid(o));
+      s.scheduler.observe(oid(o));
+      ids.push(oid(o));
+    }
+    // corrupt ranks 1..64 (creation order == registration order), keeping
+    // the payload still SQL-actionable so all 64 stay shortlisted
+    for (const id of ids.slice(0, 64)) {
+      const row = s.store.tryGet(STATE, id) as Record<string, unknown>;
+      s.store.put(STATE, id, { ...row }, Number(row.version)); // v+1, no commit
+    }
+    const healthy = ids[64]!;
+    // call 1 refreshes the cohort bound (registrations past it enter on a
+    // FAIR_ROUND) — call 2 must traverse the corrupt page and reach rank 65
+    s.scheduler.nextFairCandidate();
+    expect(s.scheduler.nextFairCandidate()).toBe(healthy);
+  });
+});

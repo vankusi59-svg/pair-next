@@ -38,6 +38,10 @@ const SCAN_PAGES = 3;
  *  confirmations + tier-2 rotating deep-verify rows, so the sweep cannot
  *  exceed the proof budget even under a corruption burst. */
 const INTEGRITY_QUOTA = 16;
+/** R4-F2 — cap on durably excluded faulted candidates. A burst beyond this
+ *  means catastrophic protected-state tampering; the scheduler halts
+ *  fail-closed rather than run an unbounded exclusion list. */
+const FAULTED_CAP = 1024;
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -970,9 +974,15 @@ export class ObjectiveAutoScheduler {
       // alternating cursor-progress/FAIR_ROUND commits past the proof
       // budget. The per-row re-proof below still runs on every shortlisted
       // row, and claim() re-proves under the writer lock.
+      // R4-F2: durably faulted candidates are excluded by entity key — a
+      // corrupted row's unverified payload can never move the cursor, and
+      // the same corrupted page is never rescanned, so a healthy candidate
+      // ranked after a full page of corrupt rows still gets reached
+      const excluded = this.faultedSet(f);
       let furthest = last;
       let exhausted = false;
       for (let pages = 0; pages < SCAN_PAGES && !exhausted; pages++) {
+        const skip = [...excluded];
         const candidates = this.store.db.prepare(`SELECT entity_id,
             CAST(json_extract(payload,'$.registration_rank') AS INTEGER) AS rank
           FROM entities e
@@ -990,9 +1000,10 @@ export class ObjectiveAutoScheduler {
               WHERE l.entity_type=? AND l.entity_id=e.entity_id
                 AND json_extract(l.payload,'$.state')='ACTIVE'
                 AND CAST(json_extract(l.payload,'$.expires_at') AS INTEGER)>?)
+            ${skip.length ? `AND e.entity_id NOT IN (${skip.map(() => "?").join(",")})` : ""}
           ORDER BY rank, e.entity_id LIMIT ?`)
-          .all(WAKE_STATE, furthest, upper, now, LEASE_STATE, now, PAGE) as
-          Array<{ entity_id: string; rank: number }>;
+          .all(WAKE_STATE, furthest, upper, now, LEASE_STATE, now,
+            ...skip, PAGE) as Array<{ entity_id: string; rank: number }>;
         if (!candidates.length) { exhausted = true; break; }
         for (const item of candidates) {
           // R3-F1: a shortlisted row whose re-proof throws is corrupted
@@ -1003,7 +1014,9 @@ export class ObjectiveAutoScheduler {
             q = this.queue(item.entity_id);
           } catch (err) {
             if (err instanceof IntegrityError) {
-              this.fault(WAKE_STATE, item.entity_id, err); continue;
+              this.fault(WAKE_STATE, item.entity_id, err);
+              excluded.add(item.entity_id);
+              continue;
             }
             throw err;
           }
@@ -1014,7 +1027,9 @@ export class ObjectiveAutoScheduler {
             lease = this.lease(item.entity_id);
           } catch (err) {
             if (err instanceof IntegrityError) {
-              this.fault(LEASE_STATE, item.entity_id, err); continue;
+              this.fault(LEASE_STATE, item.entity_id, err);
+              excluded.add(item.entity_id);
+              continue;
             }
             throw err;
           }
@@ -1025,9 +1040,11 @@ export class ObjectiveAutoScheduler {
             (q.next_due === null || q.next_due <= now);
           if (usable) {
             // the claim decision is the visit that must be journaled — it
-            // records where the deterministic rotation stopped
+            // records where the deterministic rotation stopped. The row is
+            // re-read because fault() may have updated faulted_ids mid-scan
+            const fr = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL) ?? f;
             writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-              ...fields(f), last_visited_rank: furthest,
+              ...fields(fr), last_visited_rank: furthest,
             }, "FAIR_VISIT", item.entity_id);
             return item.entity_id;
           }
@@ -1038,8 +1055,9 @@ export class ObjectiveAutoScheduler {
         // scan bound reached mid-cohort: one durable cursor move per call
         // so the next call continues instead of rescanning
         if (furthest > last) {
+          const fr = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL) ?? f;
           writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-            ...fields(f), last_visited_rank: furthest,
+            ...fields(fr), last_visited_rank: furthest,
           }, "FAIR_VISIT", String(furthest));
         }
         return null;
@@ -1053,10 +1071,11 @@ export class ObjectiveAutoScheduler {
         // cohort wrap/bound refresh commits; a no-change sweep over a
         // parked cursor journals nothing — rescanning an unchanged
         // cohort is deterministic, so the receipt carried no decision
+        const fr = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL) ?? f;
         writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-          ...fields(f), round: Number(f.round) + 1,
+          ...fields(fr), round: Number(fr.round) + 1,
           cohort_high_rank: counter, last_visited_rank: 0,
-        }, "FAIR_ROUND", String(f.round));
+        }, "FAIR_ROUND", String(fr.round));
       }
       return null;
     });
@@ -1069,12 +1088,38 @@ export class ObjectiveAutoScheduler {
    */
   private fault(entityType: string, entityId: string, err: unknown): void {
     const rid = `integrity_fault:${entityType}:${entityId}`;
-    if (readSchedulerRow<Row>(this.store, SCHEDULER_RECEIPT, rid)) return;
-    writeSchedulerRow(this.store, SCHEDULER_RECEIPT, rid, {
-      objective_id: entityId, operation: "INTEGRITY_FAULT",
-      entity_type: entityType, fault: sanitizeFaultReason(err),
-      detected_at_ms: this.instant(),
-    }, "INTEGRITY_FAULT", `${entityType}:${entityId}`);
+    if (!readSchedulerRow<Row>(this.store, SCHEDULER_RECEIPT, rid)) {
+      writeSchedulerRow(this.store, SCHEDULER_RECEIPT, rid, {
+        objective_id: entityId, operation: "INTEGRITY_FAULT",
+        entity_type: entityType, fault: sanitizeFaultReason(err),
+        detected_at_ms: this.instant(),
+      }, "INTEGRITY_FAULT", `${entityType}:${entityId}`);
+    }
+    // R4-F2 — durable exclusion by entity key (never the unverified
+    // payload). A corrupted protected row can never be repaired through
+    // writeSchedulerRow — its commit ledger already diverged — so the
+    // candidate drops out of the shortlist permanently: traversal keeps
+    // advancing and the same corrupted page is never rescanned.
+    const f = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL);
+    if (!f) return;
+    const ids = this.faultedSet(f);
+    if (ids.has(entityId)) return;
+    if (ids.size >= FAULTED_CAP) invalid("faulted candidate cap reached");
+    writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+      ...fields(f), faulted_ids: [...ids, entityId],
+    }, "FAULT_EXCLUDE", `faulted:${entityId}`);
+  }
+
+  /** Durable exclusion list carried on the fairness row — entity keys of
+   *  candidates proven unverifiable. Validated like active_leases: any
+   *  malformed shape is itself corruption and halts fail-closed. */
+  private faultedSet(f: Row): Set<string> {
+    const ids = f.faulted_ids;
+    if (ids === undefined) return new Set();
+    if (!Array.isArray(ids) || ids.length > FAULTED_CAP ||
+        ids.some(x => typeof x !== "string" || !x.length) ||
+        new Set(ids).size !== ids.length) invalid("faulted candidate roster corrupt");
+    return new Set(ids as string[]);
   }
 
   /** R3-F1 — run the full protected-row verification on one row and
@@ -1109,24 +1154,45 @@ export class ObjectiveAutoScheduler {
    *  row; nothing is written while the cohort verifies clean. */
   private integritySweep(): void {
     const COMMIT = "OBJECTIVE_AUTO_SCHEDULER_COMMIT";
-    let verified = 0;
+    // R4-F1 — the canonical commit contract is revisions 1..version with
+    // count == version and last == version (writeSchedulerRow stamps
+    // revision = stored entity version; readSchedulerRow re-proves the
+    // same shape). The screen mirrors that exactly, and rows already
+    // carrying a fault receipt are excluded so persistent suspects can
+    // never re-consume the per-call confirmation quota.
     const screen = this.store.db.prepare(`SELECT e.entity_type AS t,
         e.entity_id AS id, e.version AS v,
         (SELECT COUNT(*) FROM events ev WHERE ev.entity_type=e.entity_type
           AND ev.entity_id=e.entity_id AND ev.event_type=?) AS commits,
-        (SELECT MAX(CAST(json_extract(ev2.metadata_json,'$.revision') AS INTEGER))
+        (SELECT MIN(CAST(json_extract(ev2.metadata_json,'$.revision') AS INTEGER))
           FROM events ev2 WHERE ev2.entity_type=e.entity_type
-          AND ev2.entity_id=e.entity_id AND ev2.event_type=?) AS last_rev
-      FROM entities e WHERE e.entity_type IN (?, ?)`)
-      .all(COMMIT, COMMIT, WAKE_STATE, LEASE_STATE) as
-      Array<{ t: string; id: string; v: number; commits: number; last_rev: number | null }>;
+          AND ev2.entity_id=e.entity_id AND ev2.event_type=?) AS first_rev,
+        (SELECT MAX(CAST(json_extract(ev3.metadata_json,'$.revision') AS INTEGER))
+          FROM events ev3 WHERE ev3.entity_type=e.entity_type
+          AND ev3.entity_id=e.entity_id AND ev3.event_type=?) AS last_rev,
+        (SELECT COALESCE(SUM(CASE WHEN
+              json_type(ev4.metadata_json,'$.revision')='integer'
+              AND CAST(json_extract(ev4.metadata_json,'$.revision') AS INTEGER)>0
+              THEN 0 ELSE 1 END),0)
+          FROM events ev4 WHERE ev4.entity_type=e.entity_type
+          AND ev4.entity_id=e.entity_id AND ev4.event_type=?) AS bad_rev
+      FROM entities e WHERE e.entity_type IN (?, ?)
+        AND NOT EXISTS (SELECT 1 FROM entities r WHERE r.entity_type=?
+          AND r.entity_id=('integrity_fault:'||e.entity_type||':'||e.entity_id))`)
+      .all(COMMIT, COMMIT, COMMIT, COMMIT, WAKE_STATE, LEASE_STATE,
+        SCHEDULER_RECEIPT) as Array<{ t: string; id: string; v: number;
+        commits: number; first_rev: number | null; last_rev: number | null;
+        bad_rev: number }>;
+    let confirmed = 0;
     for (const s of screen) {
-      if (verified >= INTEGRITY_QUOTA) break;
-      if (s.v < 1 || s.commits !== s.v || s.last_rev !== s.v - 1) {
-        verified++;
-        this.faultIfUnverifiable(s.t, s.id);
-      }
+      if (s.v >= 1 && s.commits === s.v && s.first_rev === 1 &&
+          s.last_rev === s.v && s.bad_rev === 0) continue; // valid ledger
+      if (confirmed >= INTEGRITY_QUOTA) break;
+      confirmed++;
+      this.faultIfUnverifiable(s.t, s.id);
     }
+    // tier 2 keeps its own full quota — persistent tier-1 suspects can
+    // never starve the rotating deep verification of later rows
     const at = this.integrityAfter;
     let slice = this.store.db.prepare(`SELECT entity_type AS t, entity_id AS id
         FROM entities WHERE entity_type IN (?, ?)
@@ -1144,11 +1210,7 @@ export class ObjectiveAutoScheduler {
     } else {
       this.integrityAfter = slice[slice.length - 1]!;
     }
-    for (const r of slice) {
-      if (verified >= INTEGRITY_QUOTA) break;
-      verified++;
-      this.faultIfUnverifiable(r.t, r.id);
-    }
+    for (const r of slice) this.faultIfUnverifiable(r.t, r.id);
   }
 }
 
