@@ -1,30 +1,30 @@
 {
-  "claim_id": "SUBSCRIPTION_AUTO_RUN_CEO",
-  "title": "Subscription-Only Auto Run CEO — AUDIT_R3 minimal auth-mode closure: codexAuthMode honors persisted auth_mode precedence and rejects contradictory credential families",
+  "claim_id": "SCHEDULER_JOURNAL_HOTFIX",
+  "title": "Scheduler journal hotfix R5 — budget-bounded fault processing so corruption bursts commit durable exclusions in chunks (live-ops regression)",
   "affected_surfaces": [
     "BUSINESS_OBJECTIVE",
     "MISSION_CONTROL",
     "GATE_ROUTER"
   ],
   "required_tests": [
-    "src/__tests__/pair-subscription-auto-run-ceo.test.ts",
+    "src/__tests__/pair-scheduler-journal-hotfix.test.ts",
+    "src/__tests__/pair-p15-10b.test.ts",
+    "src/__tests__/pair-p15-10b-r1.test.ts",
     "src/__tests__/pair-p15-10c.test.ts",
     "src/__tests__/pair-p15-10c-r1.test.ts",
     "src/__tests__/pair-p15-10c-r2.test.ts",
     "src/__tests__/pair-p15-10c-r3.test.ts",
     "src/__tests__/pair-p15-10c-r4.test.ts",
-    "src/__tests__/pair-phase-c-audit-r1.test.ts",
-    "src/__tests__/pair-p13.test.ts",
-    "src/__tests__/pair-executor-toggle.test.ts",
-    "src/__tests__/pair-subscription-llm.test.ts",
+    "src/__tests__/pair-subscription-auto-run-ceo.test.ts",
+    "src/__tests__/pair-p9.test.ts",
     "src/__tests__/pair-p15-10a-auto-policy.test.ts",
-    "src/__tests__/pair-p15-10b.test.ts"
+    "src/__tests__/pair-phase-c-audit-r1.test.ts"
   ],
   "invariants": [
     "INV_EXEC_001",
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "AUDIT_R3 minimal closure on the opt-in subscription-only autonomous lane (PAIR_OBJECTIVE_AUTO_DRIVER=1, still default OFF). R3-F1: codexAuthMode() in codex-cli-transport.ts now matches codex-rs' persisted-mode precedence — an explicit auth_mode field wins over credential-shape inference: auth_mode 'chatgpt' resolves CHATGPT only with valid OAuth token material; 'apikey' resolves API_KEY and any other explicit value resolves AMBIGUOUS, all denied regardless of coexisting tokens; a non-string/empty auth_mode is unverifiable → AMBIGUOUS. When auth_mode is absent, credential inference uses codex-rs AuthDotJson::resolved_mode() Option::is_some() semantics — field PRESENCE with a non-null value is a persisted credential: OPENAI_API_KEY (any non-null value, including an empty string) resolves API_KEY, and personal_access_token / bedrock_api_key / bedrock_access_keys (any non-null value, including empty strings/arrays/objects) resolve AMBIGUOUS — never CHATGPT merely because OAuth tokens coexist. Token-shape verification, fail-closed absent/malformed handling and manual Executor behavior unchanged; no credential values are read, logged or persisted. The single resolver feeds all three enforcement seams unchanged — CodexCliExecutorAdapter spawn boundary (FAIL_CLOSED_CODEX_AUTH_MODE), driver admission + authorityGate re-proof (DRIVER_SUBSCRIPTION_UNVERIFIED), and the atomic assertAndReserve gate (FAIL_CLOSED_COST_AUTONOMOUS_AUTH_MODE). Evidence: 63 focused tests (Z10.1-11: chatgpt/tokens ok, chatgpt-mode ok, apikey-mode denied, non-chatgpt mode denied, PAT denied, bedrock families denied, chatgpt-mode-without-tokens denied, admission-level apikey denial, empty-string/empty-collection credential presence denied, null fields absent) failing-first pre-implementation; all R2 Z9 coverage preserved; win32 baselines unchanged (10d=15, 10d-r1=7, met-fold=7, p15-3=9, cpl1=22, p5=3).",
+  "description": "Live-ops hotfix + R1-R5 audit corrections. R0: eventsSince pages WHERE seq>?; settle() wait_streak decay. R1-F1: fresh wakes reset next_due/wait_streak. R2-F1: usability predicate + lease exclusion in uncharged SQL — unchanged cohorts silent at any size. R3-F1: bounded idle-path integrity sweep (ledger screen + rotating deep verify + dedup'd INTEGRITY_FAULT receipts). R4-F1: screen matches canonical contract (revisions 1..version, count==version, last==version); receipted suspects excluded; tier-2 gets its own quota. R4-F2: faulted_ids durable entity-key exclusion on FAIRNESS_STATE — corrupt shortlisted rows can never starve later candidates. R5-F1: a corruption burst could exhaust the 512-event proof budget mid-transaction, rolling back every fault receipt and exclusion so the same corrupt page was re-selected forever. Fix: store exposes readBudgetRemaining(); the candidate loop stops fault processing at a FAULT_HEADROOM boundary so the transaction COMMITS exclusions already made — guaranteed forward progress, bounded chunks; FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT errors are never classified as INTEGRITY_FAULT (transient pressure, not corruption); integritySweep is deferred when remaining budget is under SWEEP_HEADROOM. FAULTED_CAP=1024 fail-closed boundary preserved. Untouched: lease fencing/CAS/retry_count/generation accounting, dedup/idempotency, policy re-proofs, markDue, FAIR_VISIT/FAIR_ROUND decision receipts, per-row hash verification, claim() writer-lock re-proof. Evidence: 26 hotfix tests — failing-first on 5447dad (bursts 80/96/128 threw FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT inside fault(), rolling back all progress); green post-fix; adjacent 236/236; tsc clean; build green.",
   "risk_override": "HIGH"
 }

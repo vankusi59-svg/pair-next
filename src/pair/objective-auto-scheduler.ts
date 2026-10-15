@@ -26,6 +26,35 @@ export const FAIRNESS_STATE = "objective_auto_fairness";
 const GLOBAL = "LOCAL_PAIR_DB";
 const MAX_ACTIVE = 4;
 const PAGE = 64;
+/** R2-F1 — per-call bound on shortlist pages in nextFairCandidate. The
+ *  SQL filter already excludes non-actionable and actively-leased rows,
+ *  so a second page is only needed if a full PAGE of shortlisted rows
+ *  fails the queue()/lease() re-proof — pathology, not throughput. The
+ *  bound keeps per-call charged reads inside the proof budget
+ *  (entities 1024 / events 512) while converged idle cohorts cost one
+ *  uncharged query per call. */
+const SCAN_PAGES = 3;
+/** R3-F1 — per-call bound on charged integrity work: tier-1 suspect
+ *  confirmations + tier-2 rotating deep-verify rows, so the sweep cannot
+ *  exceed the proof budget even under a corruption burst. */
+const INTEGRITY_QUOTA = 16;
+/** R4-F2 — cap on durably excluded faulted candidates. A burst beyond this
+ *  means catastrophic protected-state tampering; the scheduler halts
+ *  fail-closed rather than run an unbounded exclusion list. */
+const FAULTED_CAP = 1024;
+/** R5-F1 — charged-read headroom: a fault() confirmation costs at most ~10
+ *  charged reads (receipt dedup probe + receipt commit + fairness
+ *  exclusion), so stop processing candidates while ~10x that remains.
+ *  Stopping early lets the transaction COMMIT the exclusions already made —
+ *  durable forward progress — instead of rolling back on budget trip. */
+const FAULT_HEADROOM = 96;
+/** R5-F1 — the idle-path sweep costs ~200 charged reads worst case
+ *  (16-row deep slice + up to 16 suspect confirmations); it is coverage
+ *  work, not correctness — defer it rather than risk the budget. */
+const SWEEP_HEADROOM = 288;
+/** R5-F1 — temporary charged-read exhaustion is work pressure, never
+ *  evidence of row corruption. */
+const PROOF_LIMIT = "FAIL_CLOSED_OBJECTIVE_SCHEDULER_PROOF_LIMIT";
 
 type Row = Record<string, unknown> & { version: number };
 
@@ -118,6 +147,7 @@ type Queue = Row & {
   settled_generation: number; checkpoint_digest: string; source_refs: string[];
   reasons: string[]; next_due: number | null; wait_kind: string | null;
   retry_count: number; queue_state: string; blocked_reason: string | null;
+  wait_streak: number;
   last_observation_digest: string; last_source_seq: number;
 };
 type Lease = Row & {
@@ -211,6 +241,12 @@ export class ObjectiveAutoScheduler {
     private readonly policy: ObjectiveAutoPolicyService,
     private readonly now: () => number = Date.now,
   ) {}
+
+  /** R3-F1 — rotating deep-verify position. Process-local by design: it
+   *  only chooses WHICH slice receives the charged re-proof on this call
+   *  and never decides authority — a restart simply re-covers the
+   *  keyspace, so detection stays bounded per process lifetime. */
+  private integrityAfter: { t: string; id: string } | null = null;
 
   private instant(): number {
     const now = this.now();
@@ -369,6 +405,7 @@ export class ObjectiveAutoScheduler {
       pending_generation: 0, claimed_generation: 0, settled_generation: 0,
       checkpoint_digest: digest({ objectiveId, rank }), source_refs: [], reasons: [],
       coalesced_count: 0, next_due: null, wait_kind: null, retry_count: 0,
+      wait_streak: 0,
       queue_state: "WAITING_CONSUMER", blocked_reason: null,
       last_observation_digest: "", last_source_seq: 0,
     }, "REGISTER", objectiveId);
@@ -548,6 +585,9 @@ export class ObjectiveAutoScheduler {
         source_refs: [...current.source_refs, receiptId].slice(-256),
         coalesced_count: Number(current.coalesced_count ?? 0) + (current.source_refs.length >= 256 ? 1 : 0),
         last_source_seq: Math.max(current.last_source_seq, Number(ev.seq)),
+        // R1-F1: a genuinely new verified wake creates new pending work —
+        // it must not inherit a stale no-progress checkpoint or streak
+        next_due: null, wait_streak: 0,
         queue_state: a.status.effective ? "WAITING_CONSUMER" : "BLOCKED_AUTHORITY",
         blocked_reason: a.status.effective ? null : a.status.reasons.join(",").slice(0, 512),
       }, "WAKE", key);
@@ -669,6 +709,9 @@ export class ObjectiveAutoScheduler {
         last_observation_digest: observation,
         source_refs: [...current.source_refs, `observation:${objectiveId}:${observation}`].slice(-256),
         reasons: [...new Set([...current.reasons, reason])].slice(0, 32),
+        // R1-F1: same reset as accountWake — a new observation digest means
+        // new pending work; the stale wait checkpoint must not suppress it
+        next_due: null, wait_streak: 0,
         queue_state: a.status.effective ? "WAITING_CONSUMER" : "BLOCKED_AUTHORITY",
         blocked_reason: a.status.effective ? null : a.status.reasons.join(",").slice(0, 512),
       }, "OBSERVE", key);
@@ -877,11 +920,23 @@ export class ObjectiveAutoScheduler {
       writeSchedulerRow(this.store, LEASE_STATE, handle.objective_id, {
         ...fields(lease), state: "SETTLED", token_hash: null, expires_at: null,
       }, "SETTLE", operationId);
+      // no-progress decay: a timed re-arm that leaves nothing new pending
+      // is a poll that proved empty — consecutive ones back off (bounded),
+      // so a permanently-unactionable Objective cannot spin the journal at
+      // its base cadence forever. Real pending work resets the streak.
+      const timedWait = continuation.state === "WAITING_EVIDENCE" && continuation.next_due !== null;
+      const leavesPending = q.pending_generation > lease.claimed_generation;
+      const streak = timedWait && !leavesPending ? Number(q.wait_streak ?? 0) : 0;
+      const backoff = Math.min(2 ** streak, 12);
       writeSchedulerRow(this.store, WAKE_STATE, handle.objective_id, {
         ...fields(q), settled_generation: Math.max(q.settled_generation, lease.claimed_generation),
-        queue_state: q.pending_generation > lease.claimed_generation ? "WAITING_CONSUMER" : continuation.state,
-        wait_kind: continuation.wait_kind, next_due: continuation.next_due === null
-          ? null : this.instant() + continuation.next_due,
+        queue_state: leavesPending ? "WAITING_CONSUMER" : continuation.state,
+        wait_kind: continuation.wait_kind,
+        // R1-F1: pending work left behind is already actionable — a stale
+        // wait deadline must not hold it back
+        next_due: leavesPending ? null : (continuation.next_due === null
+          ? null : this.instant() + continuation.next_due * backoff),
+        wait_streak: timedWait && !leavesPending ? streak + 1 : 0,
         blocked_reason: continuation.blocked_reason,
       }, "SETTLED_GENERATION", operationId);
       writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
@@ -923,31 +978,277 @@ export class ObjectiveAutoScheduler {
       if (!f) return null;
       const last = Number(f.last_visited_rank);
       const upper = Number(f.cohort_high_rank);
-      const candidates = this.store.db.prepare(`SELECT entity_id FROM entities
-        WHERE entity_type=? AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)>?
-        AND CAST(json_extract(payload,'$.registration_rank') AS INTEGER)<=?
-        ORDER BY CAST(json_extract(payload,'$.registration_rank') AS INTEGER), entity_id LIMIT ?`)
-        .all(WAKE_STATE, last, upper, PAGE) as Array<{ entity_id: string }>;
-      for (const item of candidates) {
-        const q = this.queue(item.entity_id);
-        if (!q) invalid("candidate disappeared");
-        const lease = this.lease(item.entity_id);
-        const activeLease = lease?.state === "ACTIVE" && Number(lease.expires_at) > this.instant();
-        const usable = q.queue_state === "WAITING_CONSUMER" && !activeLease &&
-          (q.pending_generation > q.claimed_generation || q.claimed_generation > q.settled_generation) &&
-          (q.next_due === null || q.next_due <= this.instant());
-        writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-          ...fields(f), last_visited_rank: q.registration_rank,
-        }, "FAIR_VISIT", item.entity_id);
-        if (usable) return item.entity_id;
+      const now = this.instant();
+      // R2-F1: push the field-level usability predicate (and the active-
+      // lease exclusion) into the uncharged SQL filter, so the WHOLE
+      // remaining cohort is proven empty in a bounded query instead of
+      // one charged queue()/lease() pair per row — an unchanged cohort of
+      // ANY size then converges to durable idle silence instead of
+      // alternating cursor-progress/FAIR_ROUND commits past the proof
+      // budget. The per-row re-proof below still runs on every shortlisted
+      // row, and claim() re-proves under the writer lock.
+      // R4-F2: durably faulted candidates are excluded by entity key — a
+      // corrupted row's unverified payload can never move the cursor, and
+      // the same corrupted page is never rescanned, so a healthy candidate
+      // ranked after a full page of corrupt rows still gets reached
+      const excluded = this.faultedSet(f);
+      // R5-F1 — charged-read headroom gate: fault() confirmation is the
+      // most expensive per-row work (~10 charged reads), so stop when the
+      // budget can no longer cover another one plus the call's tail writes.
+      // Already-recorded exclusions commit with the transaction — the next
+      // call resumes past them instead of losing everything to a rollback.
+      const budgetLow = () => {
+        const r = this.store.readBudgetRemaining();
+        return !!r && (r.events <= FAULT_HEADROOM || r.entities <= FAULT_HEADROOM);
+      };
+      let stoppedOnBudget = false;
+      let furthest = last;
+      let exhausted = false;
+      for (let pages = 0; pages < SCAN_PAGES && !exhausted && !stoppedOnBudget; pages++) {
+        const skip = [...excluded];
+        const candidates = this.store.db.prepare(`SELECT entity_id,
+            CAST(json_extract(payload,'$.registration_rank') AS INTEGER) AS rank
+          FROM entities e
+          WHERE e.entity_type=?
+            AND CAST(json_extract(e.payload,'$.registration_rank') AS INTEGER)>?
+            AND CAST(json_extract(e.payload,'$.registration_rank') AS INTEGER)<=?
+            AND json_extract(e.payload,'$.queue_state')='WAITING_CONSUMER'
+            AND (CAST(json_extract(e.payload,'$.pending_generation') AS INTEGER)
+                 > CAST(json_extract(e.payload,'$.claimed_generation') AS INTEGER)
+              OR CAST(json_extract(e.payload,'$.claimed_generation') AS INTEGER)
+                 > CAST(json_extract(e.payload,'$.settled_generation') AS INTEGER))
+            AND (json_extract(e.payload,'$.next_due') IS NULL
+                 OR CAST(json_extract(e.payload,'$.next_due') AS INTEGER)<=?)
+            AND NOT EXISTS (SELECT 1 FROM entities l
+              WHERE l.entity_type=? AND l.entity_id=e.entity_id
+                AND json_extract(l.payload,'$.state')='ACTIVE'
+                AND CAST(json_extract(l.payload,'$.expires_at') AS INTEGER)>?)
+            ${skip.length ? `AND e.entity_id NOT IN (${skip.map(() => "?").join(",")})` : ""}
+          ORDER BY rank, e.entity_id LIMIT ?`)
+          .all(WAKE_STATE, furthest, upper, now, LEASE_STATE, now,
+            ...skip, PAGE) as Array<{ entity_id: string; rank: number }>;
+        if (!candidates.length) { exhausted = true; break; }
+        for (const item of candidates) {
+          // R3-F1: a shortlisted row whose re-proof throws is corrupted
+          // protected state — record durable fault evidence and skip it
+          // instead of aborting the scan or silently hiding it
+          let q: Queue | null;
+          try {
+            q = this.queue(item.entity_id);
+          } catch (err) {
+            if (err instanceof IntegrityError) {
+              // R5-F1: proof-budget exhaustion is transient work pressure —
+              // never recorded as corruption
+              if (err.code === PROOF_LIMIT || budgetLow()) {
+                stoppedOnBudget = true; break;
+              }
+              this.fault(WAKE_STATE, item.entity_id, err);
+              excluded.add(item.entity_id);
+              continue;
+            }
+            throw err;
+          }
+          if (!q) invalid("candidate disappeared");
+          furthest = q.registration_rank;
+          let lease: Lease | null;
+          try {
+            lease = this.lease(item.entity_id);
+          } catch (err) {
+            if (err instanceof IntegrityError) {
+              if (err.code === PROOF_LIMIT || budgetLow()) {
+                stoppedOnBudget = true; break;
+              }
+              this.fault(LEASE_STATE, item.entity_id, err);
+              excluded.add(item.entity_id);
+              continue;
+            }
+            throw err;
+          }
+          const activeLease = lease?.state === "ACTIVE" && Number(lease.expires_at) > now;
+          const usable = q.queue_state === "WAITING_CONSUMER" && !activeLease &&
+            (q.pending_generation > q.claimed_generation ||
+             q.claimed_generation > q.settled_generation) &&
+            (q.next_due === null || q.next_due <= now);
+          if (usable) {
+            // the claim decision is the visit that must be journaled — it
+            // records where the deterministic rotation stopped. The row is
+            // re-read because fault() may have updated faulted_ids mid-scan
+            const fr = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL) ?? f;
+            writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+              ...fields(fr), last_visited_rank: furthest,
+            }, "FAIR_VISIT", item.entity_id);
+            return item.entity_id;
+          }
+        }
+        exhausted = candidates.length < PAGE;
       }
-      if (candidates.length === PAGE) return null;
-      writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
-        ...fields(f), round: Number(f.round) + 1,
-        cohort_high_rank: Number(f.registration_counter), last_visited_rank: 0,
-      }, "FAIR_ROUND", String(f.round));
+      if (!exhausted) {
+        // scan bound reached mid-cohort: one durable cursor move per call
+        // so the next call continues instead of rescanning
+        if (furthest > last) {
+          const fr = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL) ?? f;
+          writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+            ...fields(fr), last_visited_rank: furthest,
+          }, "FAIR_VISIT", String(furthest));
+        }
+        return null;
+      }
+      // R3-F1: before an idle sweep goes silent, prove the quiet is real —
+      // rows the SQL filter excluded must still face ledger+hash
+      // verification on a bounded cadence, with durable fault evidence.
+      // R5-F1: the sweep is coverage work — if the candidate scan already
+      // consumed most of the budget, defer it to a later idle call rather
+      // than trip the proof limit inside the same transaction.
+      const remaining = this.store.readBudgetRemaining();
+      if (!remaining || (remaining.events > SWEEP_HEADROOM &&
+          remaining.entities > SWEEP_HEADROOM)) {
+        this.integritySweep();
+      }
+      const counter = Number(f.registration_counter);
+      if (last > 0 || upper < counter) {
+        // cohort wrap/bound refresh commits; a no-change sweep over a
+        // parked cursor journals nothing — rescanning an unchanged
+        // cohort is deterministic, so the receipt carried no decision
+        const fr = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL) ?? f;
+        writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+          ...fields(fr), round: Number(fr.round) + 1,
+          cohort_high_rank: counter, last_visited_rank: 0,
+        }, "FAIR_ROUND", String(fr.round));
+      }
       return null;
     });
+  }
+
+  /** R3-F1 — durable fault evidence, dedup'd per protected row. The
+   *  receipt itself is a hash-chained scheduler row, so a detected
+   *  corruption leaves canonical evidence even though the corrupted row
+   *  can never be written again (its own commit ledger already diverged).
+   */
+  private fault(entityType: string, entityId: string, err: unknown): void {
+    const rid = `integrity_fault:${entityType}:${entityId}`;
+    if (!readSchedulerRow<Row>(this.store, SCHEDULER_RECEIPT, rid)) {
+      writeSchedulerRow(this.store, SCHEDULER_RECEIPT, rid, {
+        objective_id: entityId, operation: "INTEGRITY_FAULT",
+        entity_type: entityType, fault: sanitizeFaultReason(err),
+        detected_at_ms: this.instant(),
+      }, "INTEGRITY_FAULT", `${entityType}:${entityId}`);
+    }
+    // R4-F2 — durable exclusion by entity key (never the unverified
+    // payload). A corrupted protected row can never be repaired through
+    // writeSchedulerRow — its commit ledger already diverged — so the
+    // candidate drops out of the shortlist permanently: traversal keeps
+    // advancing and the same corrupted page is never rescanned.
+    const f = readSchedulerRow<Row>(this.store, FAIRNESS_STATE, GLOBAL);
+    if (!f) return;
+    const ids = this.faultedSet(f);
+    if (ids.has(entityId)) return;
+    if (ids.size >= FAULTED_CAP) invalid("faulted candidate cap reached");
+    writeSchedulerRow(this.store, FAIRNESS_STATE, GLOBAL, {
+      ...fields(f), faulted_ids: [...ids, entityId],
+    }, "FAULT_EXCLUDE", `faulted:${entityId}`);
+  }
+
+  /** Durable exclusion list carried on the fairness row — entity keys of
+   *  candidates proven unverifiable. Validated like active_leases: any
+   *  malformed shape is itself corruption and halts fail-closed. */
+  private faultedSet(f: Row): Set<string> {
+    const ids = f.faulted_ids;
+    if (ids === undefined) return new Set();
+    if (!Array.isArray(ids) || ids.length > FAULTED_CAP ||
+        ids.some(x => typeof x !== "string" || !x.length) ||
+        new Set(ids).size !== ids.length) invalid("faulted candidate roster corrupt");
+    return new Set(ids as string[]);
+  }
+
+  /** R3-F1 — run the full protected-row verification on one row and
+   *  convert a proven failure into a durable fault receipt. */
+  private faultIfUnverifiable(entityType: string, entityId: string): void {
+    try {
+      if (!readSchedulerRow<Row>(this.store, entityType, entityId)) {
+        this.fault(entityType, entityId, "protected row unreadable");
+      }
+    } catch (err) {
+      if (err instanceof IntegrityError) {
+        this.fault(entityType, entityId, err);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /** R3-F1 — bounded amortized integrity verification for rows the SQL
+   *  candidate filter never touches. Two tiers, both journal-free when
+   *  clean so idle convergence (R1-F2/R2-F1) is preserved:
+   *   tier 1: one uncharged aggregate compares each protected row's entity
+   *           version with its scheduler-commit ledger (count/revision) —
+   *           a canonical write that bypassed writeSchedulerRow keeps a
+   *           valid entity hash but provably diverges here, whole-cohort
+   *           every idle call.
+   *   tier 2: a rotating slice gets the charged readSchedulerRow re-proof
+   *           (payload hash + commit chain), catching raw payload drift
+   *           the ledger alone cannot see — coverage bound is
+   *           ceil(protected_rows / INTEGRITY_QUOTA) idle calls.
+   *  Suspects are confirmed via the charged path and journaled once per
+   *  row; nothing is written while the cohort verifies clean. */
+  private integritySweep(): void {
+    const COMMIT = "OBJECTIVE_AUTO_SCHEDULER_COMMIT";
+    // R4-F1 — the canonical commit contract is revisions 1..version with
+    // count == version and last == version (writeSchedulerRow stamps
+    // revision = stored entity version; readSchedulerRow re-proves the
+    // same shape). The screen mirrors that exactly, and rows already
+    // carrying a fault receipt are excluded so persistent suspects can
+    // never re-consume the per-call confirmation quota.
+    const screen = this.store.db.prepare(`SELECT e.entity_type AS t,
+        e.entity_id AS id, e.version AS v,
+        (SELECT COUNT(*) FROM events ev WHERE ev.entity_type=e.entity_type
+          AND ev.entity_id=e.entity_id AND ev.event_type=?) AS commits,
+        (SELECT MIN(CAST(json_extract(ev2.metadata_json,'$.revision') AS INTEGER))
+          FROM events ev2 WHERE ev2.entity_type=e.entity_type
+          AND ev2.entity_id=e.entity_id AND ev2.event_type=?) AS first_rev,
+        (SELECT MAX(CAST(json_extract(ev3.metadata_json,'$.revision') AS INTEGER))
+          FROM events ev3 WHERE ev3.entity_type=e.entity_type
+          AND ev3.entity_id=e.entity_id AND ev3.event_type=?) AS last_rev,
+        (SELECT COALESCE(SUM(CASE WHEN
+              json_type(ev4.metadata_json,'$.revision')='integer'
+              AND CAST(json_extract(ev4.metadata_json,'$.revision') AS INTEGER)>0
+              THEN 0 ELSE 1 END),0)
+          FROM events ev4 WHERE ev4.entity_type=e.entity_type
+          AND ev4.entity_id=e.entity_id AND ev4.event_type=?) AS bad_rev
+      FROM entities e WHERE e.entity_type IN (?, ?)
+        AND NOT EXISTS (SELECT 1 FROM entities r WHERE r.entity_type=?
+          AND r.entity_id=('integrity_fault:'||e.entity_type||':'||e.entity_id))`)
+      .all(COMMIT, COMMIT, COMMIT, COMMIT, WAKE_STATE, LEASE_STATE,
+        SCHEDULER_RECEIPT) as Array<{ t: string; id: string; v: number;
+        commits: number; first_rev: number | null; last_rev: number | null;
+        bad_rev: number }>;
+    let confirmed = 0;
+    for (const s of screen) {
+      if (s.v >= 1 && s.commits === s.v && s.first_rev === 1 &&
+          s.last_rev === s.v && s.bad_rev === 0) continue; // valid ledger
+      if (confirmed >= INTEGRITY_QUOTA) break;
+      confirmed++;
+      this.faultIfUnverifiable(s.t, s.id);
+    }
+    // tier 2 keeps its own full quota — persistent tier-1 suspects can
+    // never starve the rotating deep verification of later rows
+    const at = this.integrityAfter;
+    let slice = this.store.db.prepare(`SELECT entity_type AS t, entity_id AS id
+        FROM entities WHERE entity_type IN (?, ?)
+          AND (entity_type>? OR (entity_type=? AND entity_id>?))
+        ORDER BY entity_type, entity_id LIMIT ?`)
+      .all(WAKE_STATE, LEASE_STATE, at?.t ?? "", at?.t ?? "", at?.id ?? "",
+        INTEGRITY_QUOTA) as Array<{ t: string; id: string }>;
+    if (!slice.length) {
+      slice = this.store.db.prepare(`SELECT entity_type AS t, entity_id AS id
+          FROM entities WHERE entity_type IN (?, ?)
+          ORDER BY entity_type, entity_id LIMIT ?`)
+        .all(WAKE_STATE, LEASE_STATE, INTEGRITY_QUOTA) as
+        Array<{ t: string; id: string }>;
+      this.integrityAfter = null;
+    } else {
+      this.integrityAfter = slice[slice.length - 1]!;
+    }
+    for (const r of slice) this.faultIfUnverifiable(r.t, r.id);
   }
 }
 
