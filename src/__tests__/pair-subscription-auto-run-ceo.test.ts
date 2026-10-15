@@ -1472,6 +1472,37 @@ describe("Z10 — AUDIT R3 (auth_mode precedence / contradictory credentials)", 
       .not.toBe("CHATGPT");
   });
 
+  // R3 micro-correction — absent-mode inference uses codex-rs
+  // Option::is_some() semantics: field presence with a non-null value
+  // is a persisted credential, regardless of whether the content is
+  // empty. Empty strings/arrays/objects must never let coexisting
+  // tokens resolve CHATGPT.
+  it("Z10.9 empty-string persisted credentials → denied (presence, not content)", () => {
+    expect(codexAuthMode(authEnvFor("i", {
+      OPENAI_API_KEY: "", tokens: VALID_TOKENS }))).toBe("API_KEY");
+    expect(codexAuthMode(authEnvFor("j", {
+      personal_access_token: "", tokens: VALID_TOKENS })))
+      .not.toBe("CHATGPT");
+    expect(codexAuthMode(authEnvFor("k", {
+      bedrock_api_key: "", tokens: VALID_TOKENS }))).not.toBe("CHATGPT");
+  });
+
+  it("Z10.10 empty collection credential fields + tokens → denied", () => {
+    expect(codexAuthMode(authEnvFor("l", {
+      bedrock_access_keys: [], tokens: VALID_TOKENS })))
+      .not.toBe("CHATGPT");
+    expect(codexAuthMode(authEnvFor("m", {
+      bedrock_access_keys: {}, tokens: VALID_TOKENS })))
+      .not.toBe("CHATGPT");
+  });
+
+  it("Z10.11 null credential fields are absent — tokens still resolve CHATGPT", () => {
+    expect(codexAuthMode(authEnvFor("n", {
+      OPENAI_API_KEY: null, personal_access_token: null,
+      bedrock_api_key: null, bedrock_access_keys: null,
+      tokens: VALID_TOKENS }))).toBe("CHATGPT");
+  });
+
   it("Z10.8 integration: auth_mode:'apikey' flips driver admission to DENIED", async () => {
     const s = fresh("z10i");
     const oid = mkObjective(s);

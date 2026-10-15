@@ -69,10 +69,11 @@ export function codexHomeDir(env: CodexCliEnv | undefined): string | null {
  *  executor adapter strips it for autonomous dispatch) → the persisted
  *  session file. So auth.json's STRUCTURE is the effective mode:
  *  an explicit `auth_mode` field takes precedence over credential-shape
- *  inference (R3); absent it, a non-empty stored OPENAI_API_KEY or any
- *  alternative persisted credential family is metered/contradictory
- *  billing even when ambient env keys are absent; a ChatGPT OAuth
- *  `tokens` session is the only subscription identity. SECRET-SAFE: key names and field
+ *  inference (R3); absent it, the mere PRESENCE of a non-null
+ *  OPENAI_API_KEY or any alternative persisted credential family is
+ *  metered/contradictory billing (codex-rs is_some() semantics) even
+ *  when ambient env keys are absent; a ChatGPT OAuth `tokens` session
+ *  is the only subscription identity. SECRET-SAFE: key names and field
  *  shapes only — credential values are never read out, logged or
  *  persisted. Anything missing/unparsable/contradictory fails closed. */
 export type CodexAuthMode = "CHATGPT" | "API_KEY" | "UNAUTHENTICATED" | "AMBIGUOUS";
@@ -124,11 +125,13 @@ export function codexAuthMode(env: CodexCliEnv | undefined): CodexAuthMode {
   }
   if (declared !== undefined && declared !== null) return "AMBIGUOUS";
 
-  // auth_mode absent — credential-shape inference. A non-empty
-  // persisted API key resolves API-key billing inside the CLI even when
-  // ambient env keys are absent.
+  // auth_mode absent — credential-shape inference matching codex-rs
+  // AuthDotJson::resolved_mode() Option::is_some() semantics: field
+  // PRESENCE with a non-null value is a persisted credential — empty
+  // strings, arrays and objects still resolve that credential's mode;
+  // they never let coexisting OAuth tokens classify as CHATGPT.
   const storedKey = rec.OPENAI_API_KEY;
-  if (typeof storedKey === "string" && storedKey.trim() !== "") return "API_KEY";
+  if (storedKey !== undefined && storedKey !== null) return "API_KEY";
   // Contradictory alternative credential families — a persisted PAT or
   // bedrock key set is a DIFFERENT non-subscription authority the CLI
   // can resolve; alongside OAuth tokens the effective mode is
@@ -137,12 +140,7 @@ export function codexAuthMode(env: CodexCliEnv | undefined): CodexAuthMode {
     "personal_access_token", "bedrock_api_key", "bedrock_access_keys",
   ]) {
     const v = rec[field];
-    if (typeof v === "string" && v.trim() !== "") return "AMBIGUOUS";
-    if (Array.isArray(v) ? v.length > 0
-        : v !== null && v !== undefined && typeof v === "object" &&
-          Object.keys(v as Record<string, unknown>).length > 0) {
-      return "AMBIGUOUS";
-    }
+    if (v !== undefined && v !== null) return "AMBIGUOUS";
   }
   if (tokensValid) return "CHATGPT";
   return "AMBIGUOUS";
