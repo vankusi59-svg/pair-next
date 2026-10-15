@@ -637,7 +637,12 @@ registry.register({
   executor_type: "AUTOMATON_WORKER",
   capabilities: ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
   health_state: "READY",
-  status: "ENABLED",
+  // Executor ON/OFF — a persisted status (whatever it says) is operator
+  // intent and survives every restart; only the audited toggle seam
+  // flips it. Registration owns identity/capability/health only.
+  status:
+    String(store.tryGet("executor", PAIR_NATIVE_EXECUTOR_ID)?.status ?? "") ||
+    "ENABLED",
   metadata: {
     qualification_state: "QUALIFIED", max_concurrency: 2,
     permission_modes: ["READ", "WRITE", "FILE_READ", "FILE_WRITE"],
@@ -650,6 +655,10 @@ for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTIO
 if (governed.size) {
   const reg = registerGovernedExecutors(service, governed, "PAIR_MC", {
     priorities: { DEEPSEEK_HARNESS: 40, CODEX: 60, DEVIN: 80 },
+    // Product defaults: remote/harness executors start OFF (operator
+    // opt-in via Dashboard → Settings → Executor Management); a
+    // persisted operator status always wins over this seeding default.
+    default_disabled: [DEVIN_EXECUTOR_ID, DSH_EXECUTOR_ID],
   });
   console.log("ROUTABLE:", reg.routable.join(", "));
 }
@@ -1393,6 +1402,10 @@ const server = createMissionControlServer({
   // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
   // the P15.6 operating service lazily on first trigger (P15.7).
   store,
+  // Executor Management read model — the runtime's merged adapter map
+  // is the bound-this-process truth for the executors projection
+  // (enabled-but-unbound ⇒ requires_restart in the dashboard).
+  executorBoundIds: () => [...adapters.keys()],
   autoScheduler: objectiveAutoReconcile.scheduler,
   // P15.10-C — present only under PAIR_OBJECTIVE_AUTO_DRIVER=1;
   // absent keeps scheduler status driver_ready:false and 404s the

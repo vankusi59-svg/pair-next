@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { getAuthToken, setAuthToken, getOperatorId, setOperatorId } from "../../api";
-import { reconnectStream } from "../../hooks/eventBus";
+import { apiAdmin, getAuthToken, setAuthToken, getOperatorId, setOperatorId } from "../../api";
+import { reconnectStream, useLiveRefresh } from "../../hooks/eventBus";
+import { useApi } from "../../hooks/useApi";
 import { useTheme } from "../../lib/useTheme";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { StatusBadge } from "../components/StatusBadge";
+import type { ExecutorRow } from "../types";
 
 /* P15.9-B5.5 Scope E — Settings. Existing browser-session credentials
    only: pair.mc_token / pair.operator_id / pair.theme in localStorage —
@@ -128,6 +130,8 @@ export function SystemSettings() {
         </p>
       </section>
 
+      <ExecutorsSection onNote={setNote} />
+
       <section className="need" aria-label="legacy navigation">
         <h2>Legacy UI</h2>
         <p className="sub srcnote">The legacy dashboard remains available — nothing was cut over.</p>
@@ -143,5 +147,135 @@ export function SystemSettings() {
         onCancel={() => setConfirmClear(false)}
       />
     </div>
+  );
+}
+
+/* Executor Management — durable ON/OFF intent over the canonical
+   executor registry (audited, OCC-safe). OFF blocks every NEW dispatch
+   (fresh routes, retries, reroutes) via CapabilityRouter +
+   GovernedTaskGate and never cancels running executions. ON flips
+   intent only — qualification/health/capability/route gates still
+   decide whether anything can actually dispatch; a registered-but-
+   unbound executor reports requires_restart (a toggle can't conjure an
+   adapter — bootstrap + restart can). */
+function ExecutorsSection({ onNote }: { onNote: (s: string) => void }) {
+  const { data, error, loading, reload } = useApi(
+    () => apiAdmin.executors(),
+    [],
+    15000,
+  );
+  useLiveRefresh(reload);
+  const [confirm, setConfirm] = useState<ExecutorRow | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const toggle = async (row: ExecutorRow) => {
+    const next = !row.enabled;
+    if (!next) {
+      // OFF is high-impact (blocks new dispatches) — confirm first.
+      setConfirm(row);
+      return;
+    }
+    setBusy(row.executor_id);
+    try {
+      await apiAdmin.setExecutorEnabled(row.executor_id, true);
+      onNote(`${row.executor_id} enabled — new dispatches may now route to it (qualification and route eligibility still apply).`);
+      reload();
+    } catch (e) {
+      onNote(`Enable ${row.executor_id} failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doDisable = async () => {
+    const row = confirm;
+    setConfirm(null);
+    if (!row) return;
+    setBusy(row.executor_id);
+    try {
+      await apiAdmin.setExecutorEnabled(row.executor_id, false);
+      onNote(`${row.executor_id} disabled — new dispatches (including retries and reroutes) are blocked; running executions are unaffected.`);
+      reload();
+    } catch (e) {
+      onNote(`Disable ${row.executor_id} failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const rows = data?.executors ?? [];
+  return (
+    <section className="need" aria-label="executor management">
+      <h2>Executor Management</h2>
+      {loading && !data ? <div className="state">Loading executors…</div> : null}
+      {error ? (
+        <div className="state" role="alert">
+          {error instanceof Error ? error.message : String(error)}
+        </div>
+      ) : null}
+      {rows.length === 0 && data ? (
+        <div className="state">No executors reported by the backend.</div>
+      ) : null}
+      {rows.map((r) => (
+        <div key={r.executor_id} className="nrow" style={{ alignItems: "flex-start" }}>
+          <span className="tt" style={{ minWidth: 150 }}>
+            <code>{r.executor_id}</code>
+          </span>
+          <div style={{ flex: 1 }}>
+            <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+              <StatusBadge tone={r.enabled ? "ok" : "unknown"} label={r.enabled ? "on" : "off"} />
+              <StatusBadge
+                tone={r.qualification_state === "QUALIFIED" ? "ok" : "warn"}
+                label={r.qualification_state === "QUALIFIED" ? "qualified" : "unqualified"}
+              />
+              <StatusBadge
+                tone={r.availability_state === "AVAILABLE" ? "ok" : "warn"}
+                label={r.availability_state === "AVAILABLE" ? "available" : "unavailable"}
+              />
+              {r.requires_restart ? (
+                <StatusBadge tone="warn" label="restart required" />
+              ) : null}
+            </div>
+            {r.missing_prerequisites.length ? (
+              <p className="sub srcnote" style={{ margin: "4px 0 0" }}>
+                missing: {r.missing_prerequisites.join("; ")}
+              </p>
+            ) : null}
+            {r.requires_restart ? (
+              <p className="sub srcnote" style={{ margin: "4px 0 0" }}>
+                registered but no adapter is bound in this process — enabling alone will not
+                dispatch; reconfigure the environment and restart.
+              </p>
+            ) : null}
+          </div>
+          <button
+            className={r.enabled ? "danger" : "primary"}
+            disabled={!r.registered || busy === r.executor_id}
+            title={
+              !r.registered
+                ? "not registered on this backend — configure the required environment and restart"
+                : r.enabled
+                  ? "disable: block all new dispatches"
+                  : "enable: allow new dispatches (gates still apply)"
+            }
+            onClick={() => void toggle(r)}
+          >
+            {r.enabled ? "Disable…" : "Enable"}
+          </button>
+        </div>
+      ))}
+      <p className="sub srcnote">
+        Durable backend state — persists across restarts. OFF blocks new dispatches only; running
+        executions keep settling. CEO/Planner model configuration is independent of these toggles.
+      </p>
+      <ConfirmDialog
+        open={confirm !== null}
+        title={`Disable ${confirm?.executor_id ?? ""}`}
+        body={`Disable ${confirm?.executor_id ?? "this executor"}? No NEW dispatches will route to it — including retries and reroutes — until it is re-enabled. Executions already running are not cancelled.`}
+        confirmLabel="Disable executor"
+        onConfirm={() => void doDisable()}
+        onCancel={() => setConfirm(null)}
+      />
+    </section>
   );
 }

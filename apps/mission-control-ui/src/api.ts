@@ -417,6 +417,20 @@ export const apiAdmin = {
       method: "POST",
       body: "{}",
     }, { noAuthPrompt: true }),
+  /* Executor Management — operator intent projection + audited toggle.
+     The backend's CapabilityRouter + GovernedTaskGate enforce the
+     durable status on every dispatch path. */
+  executors: (signal?: AbortSignal) =>
+    req<{ executors: import("./app/types").ExecutorRow[] }>(
+      "/executors",
+      signal ? { signal } : undefined,
+      { noAuthPrompt: true },
+    ),
+  setExecutorEnabled: (id: string, enabled: boolean) =>
+    req<Record<string, unknown>>(`/executors/${encodeURIComponent(id)}/state`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }, { noAuthPrompt: true }),
   legacyObjectives: (businessId: string, signal?: AbortSignal) =>
     req<{ objectives: import("./app/types").LegacyObjectiveRow[] }>(
       `/objectives?business_id=${encodeURIComponent(businessId)}`,

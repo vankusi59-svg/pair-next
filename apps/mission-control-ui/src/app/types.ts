@@ -476,3 +476,19 @@ export interface CostRead {
   monetary?: MonetaryPosition;
   [k: string]: unknown;
 }
+
+/* Executor Management — GET /api/executors row (server projection is
+   authoritative; enabled is the durable operator intent). */
+export interface ExecutorRow {
+  executor_id: string;
+  registered: boolean;
+  enabled: boolean;
+  status: string;
+  availability_state: string;
+  qualification_state: string;
+  health_state: string;
+  bound: boolean;
+  requires_restart: boolean;
+  missing_prerequisites: string[];
+  [k: string]: unknown;
+}
