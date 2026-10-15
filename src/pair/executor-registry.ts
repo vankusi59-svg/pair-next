@@ -272,6 +272,61 @@ export class ExecutorRegistry {
     return this.normalizeDescriptor(this.store.get("executor", executorId));
   }
 
+  /**
+   * Executor ON/OFF — the operator intent seam (Executor Management on
+   * the Mission Control dashboard). Flips the durable `status` field the
+   * CapabilityRouter already gates on (`EXECUTOR_DISABLED` is gate #1),
+   * so OFF prevents every NEW dispatch — fresh routes, retries, and
+   * reroutes — while already-proven executions stay history and keep
+   * settling. ON flips status only: capability/health/permission/route
+   * gates still apply on every dispatch. Audited via the canonical
+   * event journal; concurrent flips are OCC-safe (a version-conflicted
+   * write retries the whole transaction, never a lost update).
+   */
+  setExecutorEnabled(
+    executorId: string,
+    enabled: boolean,
+    actor: string,
+  ): Record<string, unknown> {
+    const next = enabled ? "ENABLED" : "DISABLED";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return this.store.immediate(() => {
+          const existing = this.store.get("executor", executorId);
+          const current = String(existing.status ?? "ENABLED");
+          if (current === next) return existing; // idempotent — no event
+          const saved = this.store.put(
+            "executor",
+            executorId,
+            { ...existing, status: next },
+            Number(existing.version),
+          );
+          this.store.event({
+            entity_type: "executor",
+            entity_id: executorId,
+            event_type: enabled ? "EXECUTOR_ENABLED" : "EXECUTOR_DISABLED",
+            old_state: current,
+            new_state: next,
+            actor,
+            metadata: { executor_id: executorId },
+          });
+          return saved;
+        });
+      } catch (error) {
+        // OCC retry: a racing write (registration reconcile, another
+        // toggle) bumps the row between read and CAS — re-read inside a
+        // fresh transaction and retry; persistent conflict fails closed.
+        if (
+          (error as { code?: string }).code !== "FAIL_CLOSED_VERSION_CONFLICT" ||
+          attempt === 2
+        ) {
+          throw error;
+        }
+      }
+    }
+    throw new IntegrityError("FAIL_CLOSED_VERSION_CONFLICT", executorId);
+  }
+
   listDescriptors(): Array<Record<string, unknown>> {
     return this.service.listExecutors().map((r) => this.describe(String(r.executor_id)));
   }

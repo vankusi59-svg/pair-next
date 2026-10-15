@@ -28,6 +28,7 @@ import type { ReconciliationService } from "./reconciliation.js";
 import type { MissionObservability } from "./mission-observability.js";
 import type { SelfImprovementController } from "./self-improvement.js";
 import { projectRoutableExecutors } from "./routing-projection.js";
+import { ExecutorRegistry } from "./executor-registry.js";
 import { projectRoutableModels } from "./model-routable.js";
 import { canonicalRiskCeiling, canonicalWorkspacePath, digest, sha256Hex, utcnow } from "./canonical.js";
 import { validateWorkOpenBindingById, type StoreRow } from "./work-open-binding.js";
@@ -476,6 +477,90 @@ export class MissionControl {
       executors: this.store.list("executor"),
       routes: this.store.list("route"),
       bindings: this.store.list("executor_binding"),
+    };
+  }
+
+  /** Executor ON/OFF — the operator mutation seam. Delegates to the
+   *  canonical ExecutorRegistry intent method (audited, OCC-safe);
+   *  this layer never flips a row directly. */
+  setExecutorEnabled(
+    executorId: string,
+    enabled: boolean,
+    operatorId: string,
+  ): Record<string, unknown> {
+    return new ExecutorRegistry(this.deps.service).setExecutorEnabled(
+      executorId,
+      enabled,
+      `operator:${operatorId}`,
+    );
+  }
+
+  /**
+   * Executor Management projection — one row per supported executor id
+   * plus any extra registered executor. The registry row (operator
+   * intent + qualification + availability) is authoritative; the router
+   * and GovernedTaskGate independently enforce `status`. `bound` marks
+   * whether an adapter instance exists IN THIS PROCESS — an enabled
+   * executor that isn't adapter-bound can never dispatch until the
+   * bootstrap reconfigures and restarts, so the UI surfaces it as
+   * requires_restart rather than implying the toggle alone suffices.
+   * Hermes is intentionally absent (not integrated).
+   */
+  executors(boundExecutorIds: string[] = []): {
+    executors: Array<Record<string, unknown>>;
+  } {
+    const bound = new Set(boundExecutorIds);
+    const registry = new ExecutorRegistry(this.deps.service);
+    const rows = new Map(
+      this.store.list("executor").map((r) => [String(r.executor_id), r]),
+    );
+    const SUPPORTED: Array<[string, string]> = [
+      ["PAIR_NATIVE", "local deterministic worker"],
+      ["CODEX", "runs the local Codex CLI harness (requires CODEX_HOME)"],
+      ["DEVIN", "remote Devin executor (requires PAIR_DEVIN_API_KEY)"],
+      ["DEEPSEEK_HARNESS", "runs the local DeepSeek Harness (requires PAIR_DSH_HOME)"],
+    ];
+    const hintOf = (id: string) =>
+      SUPPORTED.find(([i]) => i === id)?.[1] ?? "unknown executor";
+    const missingOf = (
+      id: string,
+      row: Record<string, unknown> | undefined,
+      desc: Record<string, unknown> | undefined,
+    ): string[] => {
+      if (!row || !desc) return [`not registered — ${hintOf(id)}`];
+      const missing: string[] = [];
+      if (String(desc.qualification_state) !== "QUALIFIED") {
+        const q = (row.metadata as Record<string, unknown> | undefined)?.qualification as
+          | Record<string, unknown>
+          | undefined;
+        const reasons = Array.isArray(q?.reasons) ? q!.reasons : [];
+        if (reasons.length) missing.push(...reasons.map(String));
+        else missing.push("not qualified");
+      }
+      if (String(desc.auth_state) === "AUTH_REQUIRED") missing.push("authentication required");
+      if (!bound.has(id)) missing.push("no adapter bound this process");
+      return missing;
+    };
+    const ids = new Set<string>([...SUPPORTED.map(([id]) => id), ...rows.keys()]);
+    return {
+      executors: [...ids].map((id) => {
+        const row = rows.get(id);
+        // Volatile fields (qualification/auth/availability) are derived
+        // by the descriptor — never trusted from the raw row.
+        const desc = row ? registry.describe(id) : undefined;
+        return {
+          executor_id: id,
+          registered: row != null,
+          enabled: row != null && String(row.status) !== "DISABLED",
+          status: row != null ? String(row.status ?? "ENABLED") : "UNREGISTERED",
+          availability_state: desc ? String(desc.availability_state ?? "UNAVAILABLE") : "UNAVAILABLE",
+          qualification_state: desc ? String(desc.qualification_state ?? "UNQUALIFIED") : "UNQUALIFIED",
+          health_state: desc ? String(desc.health_state ?? "UNKNOWN") : "UNKNOWN",
+          bound: bound.has(id),
+          requires_restart: row != null && !bound.has(id),
+          missing_prerequisites: missingOf(id, row, desc),
+        };
+      }),
     };
   }
 

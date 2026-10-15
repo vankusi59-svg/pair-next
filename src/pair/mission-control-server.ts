@@ -130,6 +130,12 @@ export interface MissionControlServerDeps {
    *  + retained CAS bytes NOW (service.artifacts). Absent → artifacts
    *  render as unverified-dropped in the cockpit. */
   artifacts?: ArtifactAuthority;
+  /** Executor Management read model — adapter ids bound IN THIS
+   *  process (the runtime's merged adapter map). The executors
+   *  projection marks enabled-but-unbound executors requires_restart:
+   *  toggling intent alone can never conjure an adapter; bootstrap +
+   *  restart can. Absent → every row reports bound:false. */
+  executorBoundIds?: () => string[];
   /** TEST-ONLY: deterministic CEO decision transport for the
    *  lazily-composed operating service. Production bootstrap never
    *  sets it (the route resolves the real codex-cli model); HTTP
@@ -809,6 +815,12 @@ export function createMissionControlServer(
       m = p.match(/^\/api\/models\/([^/]+)\/routable$/);
       if (method === "GET" && m) return void json(res, 200, c.modelRoutable(m[1]));
       if (method === "GET" && p === "/api/routing") return void json(res, 200, c.routing());
+      // Executor Management read model — the dashboard's supported-
+      // executor surface (intent + qualification + availability +
+      // missing prerequisites + bound-this-process). Read-only.
+      if (method === "GET" && p === "/api/executors") {
+        return void json(res, 200, c.executors(deps.executorBoundIds?.() ?? []));
+      }
       if (method === "GET" && p === "/api/recovery") return void json(res, 200, c.recovery());
       if (method === "GET" && p === "/api/approvals") return void json(res, 200, c.approvals());
       if (method === "GET" && p === "/api/experience") return void json(res, 200, c.experience());
@@ -855,6 +867,25 @@ export function createMissionControlServer(
       if (method === "POST" && p === "/api/credentials/delete") {
         if (!deps.broker) return void json(res, 404, { error: "broker not configured" });
         return void json(res, 200, { removed: deps.broker.remove(String(body.name ?? "")) });
+      }
+      // Executor ON/OFF — durable operator intent (audited via the
+      // canonical event journal, OCC-safe on concurrent flips). The
+      // CapabilityRouter rejects DISABLED at route time and
+      // GovernedTaskGate re-proves at dispatch time, so OFF blocks
+      // every NEW dispatch (incl. retries/reroutes) without cancelling
+      // running executions. ON never bypasses qualification/health/
+      // capability/route gates.
+      m = p.match(/^\/api\/executors\/([^/]+)\/state$/);
+      if (method === "POST" && m) {
+        const enabled = (body as Record<string, unknown>).enabled;
+        if (enabled !== true && enabled !== false) {
+          return void json(res, 400, { error: "FAIL_CLOSED_EXECUTOR_STATE_REQUIRED" });
+        }
+        return void json(
+          res,
+          200,
+          c.setExecutorEnabled(decodeURIComponent(m[1]), enabled, String(operator)),
+        );
       }
       // P13 governance mutations — operator + CAS + audited, metadata only.
       if (method === "POST" && p === "/api/cost-policies") {

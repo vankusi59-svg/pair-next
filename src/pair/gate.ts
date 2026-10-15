@@ -786,6 +786,23 @@ export class GovernedTaskGate {
       adapter.executor_id,
     );
 
+    // Executor ON/OFF — the durable `executor.status` is the final
+    // authority for EVERY new adapter.dispatch. The capability router
+    // rejects DISABLED upstream (EXECUTOR_DISABLED gate), but the
+    // adoption path above bypasses the router entirely for a VALIDATED
+    // governed task whose dispatch never ran; re-proving here closes
+    // that gap. Proven historical executions (EXECUTION_PERSISTED /
+    // evidence-reconciled) already returned — OFF blocks new dispatches
+    // and never cancels or rewrites them.
+    const executorRow = this.store.tryGet("executor", adapter.executor_id);
+    if (String(executorRow?.status ?? "") === "DISABLED") {
+      this.store.appendEvidence(String(task.mission_id), "EXECUTOR_DISABLED", {
+        governed_task_id: governedTaskId,
+        executor_id: adapter.executor_id,
+      });
+      throw new PolicyError("FAIL_CLOSED_EXECUTOR_DISABLED", adapter.executor_id);
+    }
+
     // F2 §9 — LOCAL materialization of pinned dependency artifacts
     // happens strictly BEFORE any external executor call and before the
     // monetary reservation: a provable materialization failure burns

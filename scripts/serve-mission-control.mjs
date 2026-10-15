@@ -106,6 +106,7 @@ import {
   makeReplanGenerationDriver,
   replanWorkItemId,
   makeServePlanner,
+  plannerExecutorCapSets,
   SERVE_LLM_WORK_CAPS,
   ConversationSessionService,
   ConversationReasoningService,
@@ -354,20 +355,13 @@ const selfmod = new SelfImprovementController(service, {
 // shown to the planner. SERVE_LLM_PLANNER_CAPS stays the final canonical
 // vocabulary for validatePlanProposal.
 const LLM_PLANNER_CAPS = SERVE_LLM_WORK_CAPS;
-// Capability sets of the currently-qualified executors — sanitizePlan drops
-// any task whose required_capabilities no single executor can serve.
-const executorCapSets = () =>
-  [...adapters.values()]
-    .map((a) => {
-      try {
-        const c = a.capabilities();
-        if (c.qualified === false) return [];
-        return c.capability_ids ?? c.capabilities ?? [];
-      } catch {
-        return [];
-      }
-    })
-    .filter((s) => s.length);
+// Capability sets of the currently ENABLED, qualified executors —
+// sanitizePlan drops any task whose required_capabilities no single
+// eligible executor can serve. PR#119-audit F1: derived from canonical
+// state at call time (src/pair/serve-planner.ts plannerExecutorCapSets)
+// so an operator ON/OFF toggle takes effect for planning without a
+// restart; a DISABLED executor can never make a task canonicalizable.
+const executorCapSets = plannerExecutorCapSets(service, adapters);
 // THE ONE canonical LLM-plan preparation seam + the production runtime
 // planner now live in src/pair/serve-planner.ts (compiled to dist) so the
 // EXACT production composition is importable by tests — a test drives the
@@ -637,7 +631,12 @@ registry.register({
   executor_type: "AUTOMATON_WORKER",
   capabilities: ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION"],
   health_state: "READY",
-  status: "ENABLED",
+  // Executor ON/OFF — a persisted status (whatever it says) is operator
+  // intent and survives every restart; only the audited toggle seam
+  // flips it. Registration owns identity/capability/health only.
+  status:
+    String(store.tryGet("executor", PAIR_NATIVE_EXECUTOR_ID)?.status ?? "") ||
+    "ENABLED",
   metadata: {
     qualification_state: "QUALIFIED", max_concurrency: 2,
     permission_modes: ["READ", "WRITE", "FILE_READ", "FILE_WRITE"],
@@ -650,6 +649,10 @@ for (const c of ["FILE_OPERATIONS", "AUTOMATON_TASK_EXECUTION", "PYTHON_EXECUTIO
 if (governed.size) {
   const reg = registerGovernedExecutors(service, governed, "PAIR_MC", {
     priorities: { DEEPSEEK_HARNESS: 40, CODEX: 60, DEVIN: 80 },
+    // Product defaults: remote/harness executors start OFF (operator
+    // opt-in via Dashboard → Settings → Executor Management); a
+    // persisted operator status always wins over this seeding default.
+    default_disabled: [DEVIN_EXECUTOR_ID, DSH_EXECUTOR_ID],
   });
   console.log("ROUTABLE:", reg.routable.join(", "));
 }
@@ -1393,6 +1396,10 @@ const server = createMissionControlServer({
   // Canonical store — lets /api/vnext/objectives/:id/ceo-cycle compose
   // the P15.6 operating service lazily on first trigger (P15.7).
   store,
+  // Executor Management read model — the runtime's merged adapter map
+  // is the bound-this-process truth for the executors projection
+  // (enabled-but-unbound ⇒ requires_restart in the dashboard).
+  executorBoundIds: () => [...adapters.keys()],
   autoScheduler: objectiveAutoReconcile.scheduler,
   // P15.10-C — present only under PAIR_OBJECTIVE_AUTO_DRIVER=1;
   // absent keeps scheduler status driver_ready:false and 404s the
