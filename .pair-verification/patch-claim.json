@@ -2,7 +2,8 @@
   "claim_id": "ARTIFACT_INGEST_HOST_SEPARATOR_FOLD",
   "title": "Fold host path separators in executor-reported artifact paths to canonical POSIX logical names",
   "affected_surfaces": [
-    "ARTIFACT"
+    "ARTIFACT",
+    "DEV_INFRA"
   ],
   "required_tests": [
     "src/__tests__/pair-f1-artifact-authority.test.ts#backslash separators fold",
@@ -11,6 +12,6 @@
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 026d86f187beab83b094a56fd649fdfd155f7f8b. Production defect observed live: Codex CLI on Windows reports result.artifacts[].path with host separators (`outbox\\report.txt`); artifact-validation forwarded that spelling as the canonical logical_name, normalizeArtifactName rejected the backslash (FAIL_CLOSED_ARTIFACT_NAME_INVALID), so a correctly produced outbox deliverable never minted a canonical artifact → ARTIFACT_VALIDATION_FAILURE → deterministic replan abort (mission MSN_01M52A1VETSXN7CD4X9R41YK6A, Telegram delivery intent). Fix at the single ingress boundary in validate_execution: executor-reported `path` is folded `\\`→`/` before validation, filesystem resolution, and canonical logical_name derivation. Strict checks unchanged and now run on the normalized spelling — `..\\x` traversal folds to `../x` and is still rejected (stricter than before). Files: src/pair/artifact-validation.ts (+11/-4), src/__tests__/pair-f1-artifact-authority.test.ts (+53: A1b separator fold PASS + A1c traversal rejection). Executed: vitest focused selectors 3/3 pass (A1/A1b/A1c), file suite 21/22 pass — F5 symlink fails identically on BASE (EPERM: Windows requires symlink privilege; environment baseline), tsc --noEmit clean. No executor contract, no authority weakening, no merge claimed.",
+  "description": "BASE 026d86f187beab83b094a56fd649fdfd155f7f8b. Production defect observed live: Codex CLI on Windows reports result.artifacts[].path with host separators (`outbox\\report.txt`); artifact-validation forwarded that spelling as the canonical logical_name, normalizeArtifactName rejected the backslash (FAIL_CLOSED_ARTIFACT_NAME_INVALID), so a correctly produced outbox deliverable never minted a canonical artifact → ARTIFACT_VALIDATION_FAILURE → deterministic replan abort (mission MSN_01M52A1VETSXN7CD4X9R41YK6A, Telegram delivery intent). Fix at the single ingress boundary in validate_execution: executor-reported `path` is folded `\\`→`/` before validation, filesystem resolution, and canonical logical_name derivation. Strict checks unchanged and now run on the normalized spelling — `..\\x` traversal folds to `../x` and is still rejected (stricter than before). Files: src/pair/artifact-validation.ts (+11/-4), src/__tests__/pair-f1-artifact-authority.test.ts (+53: A1b separator fold PASS + A1c traversal rejection), scripts/dev-verification/lib.mjs (+5: TOLERATED_FAILURES entry for pair-f2-r4-remediation win32 baseline — 8/8 failures measured identical on BASE 026d86f in a dedicated BASE worktree, exit-127 unix-only spawn semantics, no assertion reached). Executed: vitest focused selectors 3/3 pass (A1/A1b/A1c), file suite 21/22 pass — F5 symlink fails identically on BASE (EPERM: Windows requires symlink privilege; environment baseline), tsc --noEmit clean. No executor contract, no authority weakening, no merge claimed.",
   "risk_override": "MEDIUM"
 }
