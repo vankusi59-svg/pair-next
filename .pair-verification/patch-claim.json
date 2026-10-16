@@ -1,20 +1,16 @@
 {
-  "claim_id": "P15_9_A2_UI_PRODUCTION_CUTOVER",
-  "title": "P15.9-A2 production default Company Cockpit cutover with explicit legacy rollback",
+  "claim_id": "ARTIFACT_INGEST_HOST_SEPARATOR_FOLD",
+  "title": "Fold host path separators in executor-reported artifact paths to canonical POSIX logical names",
   "affected_surfaces": [
-    "MISSION_CONTROL",
-    "UI",
-    "DEV_INFRA"
+    "ARTIFACT"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
-    "src/__tests__/tools-security.test.ts",
-    "src/__tests__/dev-verification.test.ts"
+    "src/__tests__/pair-f1-artifact-authority.test.ts#backslash separators fold",
+    "src/__tests__/pair-f1-artifact-authority.test.ts#folded backslash traversal"
   ],
   "invariants": [
-    "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "BASE bdeae5aa651cbfb586ed23a1dd09ff448dda0730. P15.9-A2 UI cutover: production builds default legacy routes to /app, root to /app/company; Vite dev stays legacy-first. pair.legacy_redirect='app' forces new UI; 'legacy' is per-browser rollback on any build; absent/unknown key uses build default, never grants authority. Scope: src/main.tsx cutover seam (Navigate preserves id+query+hash), src/vite-env.d.ts typing, e2e specs: legacy-tree tests seed 'legacy' pref, b6-acceptance asserts production default + rollback + id/query/hash in one hop with no loop (R1-F3), objectives.spec tz fix. Zero src/pair/* or serve-script changes. Executed: tsc clean, vite build clean, Playwright on production dist (serve-mission-control.mjs — NOT Vite dev): b6 8/8, suite 193/217. Baseline contrast run on BASE worktree, same env/store/Chromium: all 10 representative failures reproduce identically on BASE — 22 mint-path tests fail closed FAIL_CLOSED_PLANNER_NO_ELIGIBLE (template planner removed c7c280f; no eligible codex-cli planner in e2e env; direct API evidence 409), system:107 transitively needs minted routing data, objectives:586 tz bug failed on BASE and is fixed here. Playwright env note: CHROME_BIN must point at local Chromium; PAIR_*_ROUTE/AGNES_API_KEY must be unset or the spawned server fails closed at boot. No deployment or merge claimed.",
-  "risk_override": "HIGH"
+  "description": "BASE 026d86f187beab83b094a56fd649fdfd155f7f8b. Production defect observed live: Codex CLI on Windows reports result.artifacts[].path with host separators (`outbox\\report.txt`); artifact-validation forwarded that spelling as the canonical logical_name, normalizeArtifactName rejected the backslash (FAIL_CLOSED_ARTIFACT_NAME_INVALID), so a correctly produced outbox deliverable never minted a canonical artifact → ARTIFACT_VALIDATION_FAILURE → deterministic replan abort (mission MSN_01M52A1VETSXN7CD4X9R41YK6A, Telegram delivery intent). Fix at the single ingress boundary in validate_execution: executor-reported `path` is folded `\\`→`/` before validation, filesystem resolution, and canonical logical_name derivation. Strict checks unchanged and now run on the normalized spelling — `..\\x` traversal folds to `../x` and is still rejected (stricter than before). Files: src/pair/artifact-validation.ts (+11/-4), src/__tests__/pair-f1-artifact-authority.test.ts (+53: A1b separator fold PASS + A1c traversal rejection). Executed: vitest focused selectors 3/3 pass (A1/A1b/A1c), file suite 21/22 pass — F5 symlink fails identically on BASE (EPERM: Windows requires symlink privilege; environment baseline), tsc --noEmit clean. No executor contract, no authority weakening, no merge claimed.",
+  "risk_override": "MEDIUM"
 }
