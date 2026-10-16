@@ -567,6 +567,9 @@ test("observability R1-F3: stream status is a shared subscription — consumers 
 
 test("regression: legacy /providers /observability /schedules /chat still work", async ({ page }) => {
   await seedSession(page);
+  // P15.9-A2: legacy tree under the explicit rollback preference (the e2e
+  // harness serves the built production bundle where /app is the default).
+  await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
   await page.goto("/providers");
   await expect(page.getByRole("heading", { name: "Providers & models" })).toBeVisible();
   await page.goto("/observability");
