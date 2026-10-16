@@ -1,10 +1,11 @@
 import { test, expect } from "@playwright/test";
 import { seedSession } from "./helpers";
 
-/* P15.9-B6 acceptance — the parts not already covered by the B1–B5.5
-   suites: full deep-link coverage, browser back/forward, the /app index
-   landing, and the dormant opt-in redirect flag (OFF by default; ON-state
-   tests isolated per-test, never touching real deployment settings). */
+/* P15.9-B6 + A2 cutover acceptance: full deep-link coverage,
+   browser navigation, /app landing, and browser-local redirect overrides.
+   Playwright runs the Vite development server (legacy-first); production
+   builds default to /app with an explicit "legacy" rollback preference.
+   Production-preview verification is documented separately. */
 
 test("b6: every /app deep link loads a real page (no placeholder, no crash)", async ({ page }) => {
   await seedSession(page);
@@ -56,7 +57,7 @@ test("b6: legacy deep links still work + back/forward across the two trees", asy
   await expect(page).toHaveURL(/\/app\/company/);
 });
 
-test("b6: redirect flag OFF by default — every legacy route renders its legacy page", async ({ page }) => {
+test("b6: Vite dev default remains legacy-first for regression coverage", async ({ page }) => {
   await seedSession(page);
   // flag absent → legacy tree intact (no redirect)
   for (const path of ["/approvals", "/schedules", "/providers", "/observability", "/objectives", "/chat", "/missions/new"]) {
@@ -69,7 +70,7 @@ test("b6: opt-in redirect ON maps each legacy route to its /app destination (iso
   await seedSession(page);
   await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "app"));
   const pairs: Array<[string, RegExp]> = [
-    ["/", /\/app\/missions/],
+    ["/", /\/app\/company/],
     ["/missions/new", /\/app\/missions\/new/],
     ["/approvals", /\/app\/inbox/],
     ["/schedules", /\/app\/system\/schedules/],
@@ -96,7 +97,7 @@ test("b6: redirect preserves dynamic mission id + query, and unmapped routes nev
   await expect(page).not.toHaveURL(/\/app\//);
 });
 
-test("b6: flag removal restores legacy behavior (no sticky state)", async ({ page }) => {
+test("b6: flag removal restores Vite dev default (no sticky state)", async ({ page }) => {
   await seedSession(page);
   await page.goto("/");
   await expect(page).toHaveURL(/\/$/);
@@ -107,4 +108,21 @@ test("b6: flag removal restores legacy behavior (no sticky state)", async ({ pag
   await page.evaluate(() => localStorage.removeItem("pair.legacy_redirect"));
   await page.goto("/approvals");
   await expect(page).toHaveURL(/\/approvals$/);
+});
+
+test("a2: explicit legacy override keeps classic routes accessible after cutover", async ({ page }) => {
+  await seedSession(page);
+  await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await page.goto("/approvals");
+  await expect(page).toHaveURL(/\/approvals$/);
+  // Owner can switch forward and roll back again without wiping tokens.
+  await page.evaluate(() => localStorage.setItem("pair.legacy_redirect", "app"));
+  await page.goto("/");
+  await page.waitForURL(/\/app\/company$/);
+  await page.evaluate(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
+  await page.goto("/providers");
+  await expect(page.getByRole("heading", { name: "Providers & models" })).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem("pair.mc_token"))).toBeTruthy();
 });
