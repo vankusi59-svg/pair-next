@@ -101,15 +101,28 @@ test("b6: opt-in redirect ON maps each legacy route to its /app destination (iso
   }
 });
 
-test("b6: redirect preserves dynamic mission id + query, and unmapped routes never redirect", async ({ page }) => {
+test("b6: redirect preserves dynamic mission id + query + hash, unmapped routes never redirect", async ({ page }) => {
   await seedSession(page);
-  await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "app"));
-  // dynamic id + query preserved verbatim (page itself may error on a
-  // nonexistent mission — this test is about the redirect contract)
-  await page.goto(`/missions/MSN_b6fake?tab=files`);
-  await page.waitForURL(/\/app\/missions\/MSN_b6fake\?tab=files/, { timeout: 10000 });
+  // production default (absent preference): dynamic id + query + hash
+  // preserved verbatim in ONE hop (the page itself may error on a
+  // nonexistent mission — this test is about the redirect contract, not
+  // mission data)
+  await page.goto(`/missions/MSN_b6fake?tab=files#evidence`);
+  await page.waitForURL(/\/app\/missions\/MSN_b6fake\?tab=files#evidence/, { timeout: 10000 });
+  // no redirect loop: the landed /app URL is stable — it must not bounce
+  // again or drop the fragment
+  const landed = page.url();
+  await page.waitForTimeout(400);
+  expect(page.url()).toBe(landed);
+  expect(landed).toContain("#evidence");
   // unmapped legacy-ish path does not redirect anywhere unexpected
   await page.goto("/ui");
+  await expect(page).not.toHaveURL(/\/app\//);
+  // the "legacy" rollback carries id + query + hash untouched too — the
+  // classic route keeps the FULL original location, never a redirect
+  await page.evaluate(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
+  await page.goto(`/missions/MSN_b6fake?tab=files#evidence`);
+  await expect(page).toHaveURL(/\/missions\/MSN_b6fake\?tab=files#evidence$/);
   await expect(page).not.toHaveURL(/\/app\//);
 });
 

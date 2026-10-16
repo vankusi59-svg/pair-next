@@ -45,13 +45,28 @@ without redeployment.
 
 - Execute `pnpm --dir apps/mission-control-ui typecheck` and
   `pnpm --dir apps/mission-control-ui build`.
-- Execute the focused `e2e/b6-acceptance.spec.ts` suite against the Vite
-  dev server. Run full Playwright regression; legacy tests stay dev-only
-  with the default behavior unchanged.
-- **Production verification required:** serve the built `dist` and
-  assert in a clean browser with an absent preference that `/` navigates
-  to `/app/company`, mapped legacy deep links preserve parameters, and
-  `pair.legacy_redirect=legacy` still renders the legacy dashboard.
+- Playwright runs against `scripts/serve-mission-control.mjs` serving the
+  **built `dist` bundle** (`webServer` in `playwright.config.ts`) — every
+  spec therefore exercises production-build semantics, never the Vite dev
+  server. An absent preference redirects mapped legacy routes to `/app/*`
+  and `/` to `/app/company`; tests that exercise the classic tree seed
+  `pair.legacy_redirect="legacy"` explicitly, which is also the real
+  production rollback path. Vite dev stays legacy-first as a local
+  workflow property and is not what this harness measures.
+- Executed on this branch (production `dist`, bundled Chromium):
+  `b6-acceptance.spec.ts` 8/8 — default redirect, every mapped route,
+  dynamic mission id + query + hash preserved in one hop with no
+  redirect loop, `/ui` untouched, flag removal restores the default, and
+  the `"legacy"` override keeps classic routes. Full suite: 193/217 pass;
+  the remaining failures are pre-existing baseline (see below).
+- **Known baseline (reproduces identically on BASE `bdeae5a`):** 22
+  failures need a mission minted via `/api/missions/preview`, which fails
+  closed `FAIL_CLOSED_PLANNER_NO_ELIGIBLE` — the Planner Pool is
+  mandatory since Phase C (`c7c280f` removed the `PAIR_MC_TEMPLATE_PLANNER`
+  bypass) and the e2e environment configures no eligible `codex-cli`
+  planner. 1 further failure (`system.spec.ts` "Route decisions" heading)
+  transitively needs minted-mission routing data. Fixing this means a
+  test-only planner seam in production code — deliberately out of scope.
 - Run `npm run verify:change -- --base bdeae5aa651cbfb586ed23a1dd09ff448dda0730`
   and obtain READY_FOR_INDEPENDENT_AUDIT.
 - Independent audit before merge under AGENTS.md; deploy the new UI
