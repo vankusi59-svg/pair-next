@@ -8,6 +8,9 @@ import { mcToken, seedSession } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
   await seedSession(page);
+  // P15.9-A2: e2e runs the production server + built dist — legacy chat
+  // requires the explicit rollback preference now that prod defaults to /app.
+  await page.addInitScript(() => localStorage.setItem("pair.legacy_redirect", "legacy"));
   await page.goto("/");
 });
 

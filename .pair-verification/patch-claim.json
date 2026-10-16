@@ -2,18 +2,19 @@
   "claim_id": "P15_9_A2_UI_PRODUCTION_CUTOVER",
   "title": "P15.9-A2 production default Company Cockpit cutover with explicit legacy rollback",
   "affected_surfaces": [
-    "MISSION_CONTROL"
+    "MISSION_CONTROL",
+    "UI",
+    "DEV_INFRA"
   ],
   "required_tests": [
-    "apps/mission-control-ui/e2e/b6-acceptance.spec.ts",
-    "apps/mission-control-ui/e2e/app.spec.ts",
-    "apps/mission-control-ui/e2e/smoke.spec.ts",
-    "apps/mission-control-ui/e2e/system.spec.ts"
+    "src/__tests__/pair-p15-8c-mission-confirmation.test.ts",
+    "src/__tests__/tools-security.test.ts",
+    "src/__tests__/dev-verification.test.ts"
   ],
   "invariants": [
     "INV_MISSION_001",
     "INV_SECRETS_001"
   ],
-  "description": "BASE bdeae5aa651cbfb586ed23a1dd09ff448dda0730. Owner-approved P15.9-A2 UI cutover: Vite production builds default legacy routes to modern /app, root to /app/company, while Vite dev remains legacy-first for existing integration regression coverage. Existing pair.legacy_redirect='app' still forces new UI; 'legacy' enables immediate per-browser rollback even in production. All known route mappings, preserved mission id/query/hash, and /ui bypass remain. Added explicit rollback regression and operator runbook. Zero API, DB, objective, cost, scheduler, auth, auto-driver or executor changes. Production-built-dist browser smoke plus npm run verify:change, typecheck/build and independent audit are deployment prerequisites and HAVE NOT been executed by ChatGPT in this sandbox; no live deployment or PR merge is claimed.",
+  "description": "BASE bdeae5aa651cbfb586ed23a1dd09ff448dda0730. P15.9-A2 UI cutover: production builds default legacy routes to /app, root to /app/company; Vite dev stays legacy-first. pair.legacy_redirect='app' forces new UI; 'legacy' is per-browser rollback on any build; absent/unknown key uses build default, never grants authority. Route mappings preserve mission id + query + hash via one Navigate seam; unmapped routes (/ui) never redirect. Scope: src/main.tsx cutover seam, src/vite-env.d.ts (import.meta.env typing), e2e specs: legacy-tree tests seed 'legacy' pref (chat/smoke/system/company/app), b6-acceptance asserts production default + rollback, objectives.spec tz fix (datetime-local is local time — compare the instant). Zero API/DB/objective/cost/scheduler/auth/auto-driver/executor changes — no src/pair/* or serve script edits. Executed: tsc clean, vite build clean, Playwright 193/217 on production dist; b6-acceptance 8/8 green incl. / -> /app/company, id/query/hash preservation, 'legacy' rollback. Remaining 24 fails are pre-existing baseline, identical on BASE: 22 need /api/missions/preview which fails closed FAIL_CLOSED_PLANNER_NO_ELIGIBLE (template planner removed in c7c280f; e2e env has no eligible codex-cli planner), 1 transitively needs minted-mission routing data, 1 was the tz bug fixed here. No deployment or merge claimed.",
   "risk_override": "HIGH"
 }
