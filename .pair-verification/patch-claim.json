@@ -1,23 +1,17 @@
 {
-  "claim_id": "WORKSTREAM_GOAL_SOURCE_TERMS",
-  "title": "Restore owner literals the CEO paraphrases out of delegated workstream goals",
+  "claim_id": "WIN32_ARTIFACT_PATH_FOLD",
+  "title": "Fold executor-reported Windows separators to POSIX canonical artifact names",
   "affected_surfaces": [
-    "BUSINESS_OBJECTIVE",
+    "ARTIFACT",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailing '+' inside a URL query value",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#trailing '=' inside a URL query value",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#oversized double-quoted literal fails closed",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#oversized single-quoted literal fails closed",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#preserves parentheses, brackets",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#strips prose punctuation",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#partial claim cannot starve",
-    "src/__tests__/pair-p15-2w-source-terms.test.ts#extraction-bound failure rolls back"
+    "src/__tests__/pair-f1-artifact-authority.test.ts#backslash separators fold",
+    "src/__tests__/pair-f1-artifact-authority.test.ts#folded backslash traversal"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 44e4bc5, R3 (audit R2 corrections) — extractor-only fixes in src/pair/objective-source-terms.ts. R3-F1: stripLiteralTail no longer strips '='/'+' at a literal tail — those are legal URL data (base64 signature tails, empty-valued query params); prose punctuation can never attach to a URL without whitespace, which already ends the match. R2 tail cases (parens/brackets/prose wrappers) preserved. R3-F2: the quoted keep-pattern is bounded at {1,160}, so an oversized quoted literal could never match and was silently ignored; a dedicated OVERSIZED_QUOTED_LITERAL pre-scan under identical boundary rules now throws FAIL_CLOSED_OBJECTIVE_WORKSTREAM_LITERALS for ANY quoted run >160 chars, inside the atomic commit txn (zero residue proven). Unchanged: broadcast preservation, raw-proposal normalized digest, enriched WDEC digest, replay/amend, atomic commit, goal cap 2048, 24-literal/160-char bounds, DC→DL→operator_goal propagation. Files: objective-source-terms.ts, patch-claim.json, test file (29 tests). Executed: 4/4 new regressions failed on R2 HEAD a1050c0 then pass post-fix; focused 29/29; P15.2 31/31 + P15.4 37/37; tsc clean. PLAN_DATAFLOW_UNBOUND out of scope. No merge claimed.",
-  "risk_override": "MEDIUM"
+  "description": "BASE 02c5944 (merged staging/pr59-safe tip). Lands the artifact-ingress separator normalization that existed on the audited source-terms ancestry but was never merged upstream. src/pair/artifact-validation.ts: ArtifactProvenanceValidator now folds backslashes to '/' on the executor-reported path before canonical-name checks — a Windows executor reporting outbox\\report.txt mints the same POSIX logical name outbox/report.txt instead of a divergent spelling. Security consequence: '..\\escape.txt' traversal is folded to '../escape.txt' and now rejected by the '..' segment check (previously bypassed since the check only split on '/'). Absolute and '..' forms stay rejected on the normalized spelling. Tests: pair-f1-artifact-authority.test.ts adds A1b (backslash path validates PASS, canonical logical_name correct, sha256 bound) and A1c (backslash traversal FAIL, zero artifact rows). scripts/dev-verification/lib.mjs adds the win32 tolerated-baseline for pair-f2-r4-remediation (8 fails, unix-only spawn semantics exit 127, measured BASE==HEAD). No architecture change, no planner/router/dataflow touch.",
+  "risk_override": "HIGH"
 }

@@ -199,6 +199,58 @@ describe("F1-A local canonical artifact ingest", () => {
     expect((v.artifact_ids as string[])[0]).toBe(a.artifact_id);
   });
 
+  it("A1b executor-reported backslash separators fold to the POSIX logical name", () => {
+    const ctx = mkCtx("a1b-winsep");
+    const bytes = "telegram-caption-bytes";
+    fs.mkdirSync(path.join(ctx.workspace, "outbox"), { recursive: true });
+    fs.writeFileSync(path.join(ctx.workspace, "outbox", "report.txt"), bytes);
+    const prod = mkProducer(ctx, {
+      state: "COMPLETED",
+      result: {
+        status: "COMPLETED",
+        artifacts: [
+          {
+            // A Windows executor reports the host separator — the same
+            // file must mint the POSIX canonical name, never reject.
+            path: "outbox\\report.txt",
+            sha256: sha256Hex(Buffer.from(bytes)),
+            byte_size: bytes.length,
+          },
+        ],
+      },
+    });
+    const v = new ArtifactProvenanceValidator().validate_execution(ctx.service, prod.eid) as Record<
+      string,
+      unknown
+    >;
+    expect(v.status).toBe("PASS");
+    const rows = ctx.authority.forExecution(prod.eid);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.logical_name).toBe("outbox/report.txt");
+    expect(rows[0]!.sha256).toBe(sha256Hex(Buffer.from(bytes)));
+  });
+
+  it("A1c folded backslash traversal is still rejected", () => {
+    const ctx = mkCtx("a1c-trav");
+    fs.writeFileSync(path.join(ctx.d, "escape.txt"), "outside");
+    const prod = mkProducer(ctx, {
+      state: "COMPLETED",
+      result: {
+        status: "COMPLETED",
+        artifacts: [
+          {
+            path: "..\\escape.txt",
+            sha256: sha256Hex(Buffer.from("outside")),
+            byte_size: "outside".length,
+          },
+        ],
+      },
+    });
+    const v = new ArtifactProvenanceValidator().validate_execution(ctx.service, prod.eid);
+    expect(v.status).toBe("FAIL");
+    expect(ctx.authority.forExecution(prod.eid)).toHaveLength(0);
+  });
+
   it("A2 declared sha mismatch → FAIL, no artifact row", () => {
     const ctx = mkCtx("a2");
     const prod = mkProducer(ctx, {

@@ -57,7 +57,14 @@ export class ArtifactProvenanceValidator {
       }
       const art = entry as Record<string, unknown>;
       const relField: unknown = art.path;
-      const rel = typeof relField === "string" ? relField : "";
+      // Platform-separator folding — executors report workspace-relative
+      // paths with the HOST separator (Windows emits `outbox\file.txt`);
+      // canonical logical names are POSIX-only. Folding `\`→`/` at this
+      // ingress boundary keeps one file one canonical name on every host.
+      // The strict checks below still run on the normalized spelling —
+      // absolute and `..` forms stay rejected (and `..\x` is now caught
+      // by the segment check too).
+      const rel = typeof relField === "string" ? relField.replace(/\\/g, "/") : "";
       if (typeof relField !== "string" || !rel || path.isAbsolute(rel) || rel.split("/").includes("..")) {
         failures.push(`artifact path invalid: ${rel || "<invalid>"}`);
         continue;
