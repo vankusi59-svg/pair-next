@@ -1051,6 +1051,10 @@ const invokePlannerPool = ({
         scratchDir: codexPlannerScratch,
         allowedCapabilities: LLM_PLANNER_CAPS,
         capabilitySets: executorCapSets(),
+        // EXTERNAL_INPUT_AWARENESS — the eligible sibling-artifact set
+        // the canonicalizer binds against reaches the canonical prompt
+        // verbatim (initial planning previously rendered none).
+        externalInputArtifacts,
         // Governed async replan — the structured failure context
         // minted on the durable generation row reaches the SAME
         // canonical prompt builder the HTTP transport uses.
@@ -1140,6 +1144,18 @@ const planExpander = async (input, expandCtx) => {
         JSON.stringify({ configured_routes: PLANNER_ROUTES }),
       );
     }
+    // EXTERNAL_INPUT_AWARENESS — the delegated-open edge carries the
+    // consumer work_item_id in expandCtx; resolve the SAME canonical
+    // sibling scope the mission will re-prove at commit so the model is
+    // shown the real eligible artifacts and the pool canonicalizer can
+    // stamp a cross-mission consume it would otherwise reject closed.
+    // Absent ctx (preview/draft/direct submission) → undefined, the
+    // identical prior behavior.
+    const externalInputArtifacts = expandCtx?.work_item_id != null
+      ? service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+          String(expandCtx.work_item_id),
+        )
+      : undefined;
     // Phase C — planner cost governance: when the invocation carries a
     // delegated work_item_id, the SAME objective cap that binds governed
     // dispatch binds this pre-spend boundary. The envelope reserves the
@@ -1175,6 +1191,7 @@ const planExpander = async (input, expandCtx) => {
       plannerRunId: String(run.planner_run_id),
       projectId: input.project_id != null ? String(input.project_id) : undefined,
       deadlineAt,
+      externalInputArtifacts,
     });
     finishPlannerRun(store, {
       planner_run_id: String(run.planner_run_id),

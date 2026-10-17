@@ -1,18 +1,25 @@
 {
-  "claim_id": "PLAN_DATAFLOW_SELF_CONSUME",
-  "title": "Align dispatch dependency resolution with committed plan model for self-produced consumes",
+  "claim_id": "EXTERNAL_INPUT_AWARENESS",
+  "title": "Surface eligible sibling artifacts to the delegated planner prompt and pool canonicalizer",
   "affected_surfaces": [
     "ARTIFACT",
+    "PLANNER",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-f2-artifact-handoff.test.ts#consume ∩ own-produce with no predecessor → self-shadowed, no handoff",
-    "src/__tests__/pair-f2-artifact-handoff.test.ts#consume ∩ own-produce + real depends_on producer → producer still binds",
-    "src/__tests__/pair-f2-artifact-handoff.test.ts#self-produced consume skipped but a genuinely unbound consume still fails"
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#allocated-but-unopened work item sees the SAME sibling eligible set",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#work item without objective allocation → empty set (no scope)",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#plan-time stamp binds + reconcile/assert PASS — the pool path the fix enables",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#mission-scoped resolution on the same scope still returns the identical set",
+    "src/__tests__/pair-planner-prompt-contract.test.ts#eligible artifacts render by exact logical name with provenance",
+    "src/__tests__/pair-planner-prompt-contract.test.ts#consume rule restricts inputs to earlier producers or the listed set",
+    "src/__tests__/pair-planner-prompt-contract.test.ts#absent/empty set renders no block — identical prior prompt shape",
+    "src/__tests__/pair-planner-prompt-contract.test.ts#codex transport prompt renders the identical block — no transport drift",
+    "src/__tests__/pair-planner-prompt-contract.test.ts#UNBOUND rejection guidance points at the listed set"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE a1b8da8. Fixes the validator/dispatcher inconsistency behind PLAN_DATAFLOW_UNBOUND aborts (live repro: mission MSN_01M54A6V T2 declared consumes=produces=exports/journal-export.json, depends_on=[] → plan COMMITTED because plan-dataflow requiredEdges exempts consume ∩ own-produce from needing an in-plan producer edge, then dispatch resolveForConsumer demanded a predecessor producer anyway → unbound_consume → FAIL_CLOSED_DEPENDENCY_RESOLUTION → REPLAN → ABORT). Fix: in resolveForConsumer, when a consume has no depends_on predecessor producer and no canonical external-source stamp, a consume name the task itself declares in produces (exact normalized-name match, same semantics requiredEdges uses) is skipped — the task creates the artifact itself. Ordering preserved: real depends_on predecessors still bind first, external PAIR-stamped sources still re-prove before the skip, genuinely unbound consumes still fail closed, delivery/manifest tasks untouched (early return). No planner, plan-commit, digest, or authority change. Tests: A8 self-consume no producer → zero entries (failing-first verified on BASE: DEP:FAIL_CLOSED_DEPENDENCY_RESOLUTION); A9 self-consume + real predecessor → still binds producer entry; A10 self-consume skipped while a second unbound consume still fails closed.",
+  "description": "BASE 9825aba. Root cause of recurring PLAN_INVALID FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT on delegated opens (live: OBJ_dda4ac80 json_transfer planner attempts): (1) the canonical planner prompt never listed eligible cross-mission artifacts — the model guessed input names from goal text and picked the output name exports/journal-export.json instead of real sibling journal.html; (2) the delegated-open edge (planExpander→invokePlannerPool) passed externalInputArtifacts=undefined for initial planning, so the pool canonicalizer could not bind ANY cross-mission consume — 'modify existing file' was unplannable on the delegated path. Fix: (a) artifact-handoff gains listEligibleExternalInputSourcesForWorkItem — the SAME canonical sibling scope resolved before a consumer Mission/WOB exists (0 allocations → []; malformed → fail closed); (b) planExpander resolves it from expandCtx.work_item_id → pool canonicalizer + planFn; (c) buildPlannerUserPrompt/codexPlannerPlan render a bounded EXTERNAL INPUT ARTIFACTS block (logical name + provenance) with the rule that consumes name only an earlier in-plan producer or a listed artifact — never a desired output; UNBOUND rejection guidance points at the listed set. Authority unchanged: prompt is context only; pool stamps are re-proven byte-for-byte at mission commit; absent expandCtx → identical prior behavior. Tests: W1-W4 eligibility scope; E1-E5 prompt contract + codex parity.",
   "risk_override": "HIGH"
 }

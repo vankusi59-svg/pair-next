@@ -194,3 +194,62 @@ describe("planner prompt contract — regression invariants (T6)", () => {
     expect(PROMPT).toMatch(/PAIR and runtime policy still decide actual network permission/i);
   });
 });
+
+describe("planner prompt contract — EXTERNAL_INPUT_AWARENESS", () => {
+  const SOURCES = [
+    {
+      logical_name: "journal.html",
+      source_mission_id: "MSN_01M549VPN9HC9TST01ZTJ3QA61",
+      source_task_id: "T2",
+    },
+    { logical_name: "exports/summary.json", source_mission_id: "MSN_X" },
+  ];
+
+  it("E1: eligible artifacts render by exact logical name with provenance", () => {
+    const p = buildPlannerUserPrompt("sửa journal.html thêm export", {
+      allowedCapabilities: ALLOWED_CAPS,
+      externalInputArtifacts: SOURCES,
+    });
+    expect(p).toMatch(/EXTERNAL INPUT ARTIFACTS/);
+    expect(p).toMatch(/- journal\.html \(produced by mission MSN_01M549VPN9HC9TST01ZTJ3QA61, task T2\)/);
+    expect(p).toMatch(/- exports\/summary\.json \(produced by mission MSN_X\)/);
+  });
+
+  it("E2: consume rule restricts inputs to earlier producers or the listed set", () => {
+    const p = buildPlannerUserPrompt("g", {
+      allowedCapabilities: ALLOWED_CAPS,
+      externalInputArtifacts: SOURCES,
+    });
+    expect(p).toMatch(
+      /consumes may name ONLY a file produced by an earlier task in this plan or listed above/i,
+    );
+    expect(p).toMatch(/never a file merely because it is a desired output/i);
+  });
+
+  it("E3: absent/empty set renders no block — identical prior prompt shape", () => {
+    const p = buildPlannerUserPrompt("g", { allowedCapabilities: ALLOWED_CAPS });
+    expect(p).not.toMatch(/EXTERNAL INPUT ARTIFACTS/);
+    const pEmpty = buildPlannerUserPrompt("g", {
+      allowedCapabilities: ALLOWED_CAPS,
+      externalInputArtifacts: [],
+    });
+    expect(pEmpty).not.toMatch(/EXTERNAL INPUT ARTIFACTS/);
+  });
+
+  it("E4: codex transport prompt renders the identical block — no transport drift", async () => {
+    const { buildCodexPlannerPrompt } = await import("../pair/codex-planner.js");
+    const p = buildCodexPlannerPrompt("g", {
+      model: "m",
+      scratchDir: "/tmp/x",
+      allowedCapabilities: ALLOWED_CAPS,
+      externalInputArtifacts: SOURCES,
+    });
+    expect(p).toMatch(/EXTERNAL INPUT ARTIFACTS/);
+    expect(p).toMatch(/- journal\.html \(produced by mission MSN_01M549VPN9HC9TST01ZTJ3QA61, task T2\)/);
+  });
+
+  it("E5: UNBOUND rejection guidance points at the listed set", () => {
+    const p = rejectedPrompt("FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT");
+    expect(p).toMatch(/EXTERNAL INPUT ARTIFACTS by its exact logical name/i);
+  });
+});
