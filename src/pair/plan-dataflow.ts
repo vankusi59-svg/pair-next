@@ -1172,24 +1172,55 @@ export function bindPlanExternalInputs(
           if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
         }
       }
-      // LATEST_ACCEPTED — multiple eligible same-name sources resolve
-      // deterministically to the NEWEST accepted producer (created_at
-      // desc, artifact_id desc tiebreak): a linear refine-in-place
-      // pipeline legitimately produces the same logical name under
-      // successive sibling missions, and "the current artifact" is the
-      // latest ACCEPTED one. The stamp still pins artifact_id + sha256,
-      // so a later-arriving producer moves the winner and the replayed
-      // ledger drifts — FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING, never
-      // a silent re-pin.
-      const src = [...matches.values()]
-        .sort(
-          (a, b) =>
-            String(a.source_created_at ?? "").localeCompare(
-              String(b.source_created_at ?? ""),
-            ) || a.artifact_id.localeCompare(b.artifact_id),
-        )
-        .at(-1);
-      if (!src) continue; // stays unbound — requiredEdges fails it
+      // LATEST_ACCEPTED + EXACT-NAME precedence (R1-F1) — multiple
+      // eligible sources resolve deterministically to the NEWEST
+      // accepted producer (created_at desc, artifact_id desc tiebreak),
+      // a linear refine-in-place pipeline legitimately producing the
+      // same logical name under successive sibling missions. But the
+      // winner is chosen FIRST among artifacts whose logical_name IS
+      // the consume name: a compat alias (`outbox/<basename>`) may only
+      // fill the bind when NO exact-name artifact exists, so a newer
+      // staged-alias artifact can never silently displace the exact
+      // artifact the consume named. Aliases bind only when they all
+      // collapse to ONE logical_name — several different names matching
+      // the consume only through the equivalence rule is genuine
+      // ambiguity and fails closed. The stamp still pins artifact_id +
+      // sha256, so a later-arriving producer moves the winner and the
+      // replayed ledger drifts — FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING,
+      // never a silent re-pin.
+      const exact: ExternalInputArtifactSource[] = [];
+      const aliasByName = new Map<string, ExternalInputArtifactSource[]>();
+      for (const s of matches.values()) {
+        if (s.logical_name === name) {
+          exact.push(s);
+        } else {
+          const arr = aliasByName.get(s.logical_name) ?? [];
+          arr.push(s);
+          aliasByName.set(s.logical_name, arr);
+        }
+      }
+      let pool: ExternalInputArtifactSource[];
+      if (exact.length > 0) {
+        pool = exact;
+      } else if (aliasByName.size === 1) {
+        pool = [...aliasByName.values()][0]!;
+      } else if (aliasByName.size > 1) {
+        throw new IntegrityError(
+          "FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE",
+          JSON.stringify({
+            task: String(task.task_key ?? ""),
+            artifact: name,
+            alias_names: [...aliasByName.keys()].sort(),
+          }),
+        );
+      } else {
+        continue; // stays unbound — requiredEdges fails it
+      }
+      // R1-F3 — total-order deterministic winner: recency by parsed
+      // created_at (missing/invalid → provably-oldest, never a silent
+      // "newest"), artifact_id tiebreak. Input array order is never
+      // authority.
+      const src = [...pool].sort(compareSourceRecency).at(-1)!;
       bound.push({
         contract: EXTERNAL_INPUT_CONTRACT,
         consume_name: name,
@@ -1231,6 +1262,27 @@ function artifactNamesEquivalentCompat(a: string, b: string): boolean {
   return (
     (a.startsWith("outbox/") && a === `outbox/${base(b)}`) ||
     (b.startsWith("outbox/") && b === `outbox/${base(a)}`)
+  );
+}
+
+/** R1-F3 — deterministic recency key for LATEST_ACCEPTED ordering:
+ *  artifact created_at parsed to epoch millis. A missing or unparsable
+ *  timestamp cannot prove recency, so it ranks BELOW every valid
+ *  timestamp (provably-oldest) rather than lexically interleaving;
+ *  ties fall through to artifact_id so ordering is a deterministic
+ *  total order independent of the input array's iteration order. */
+function sourceRecencyKey(s: ExternalInputArtifactSource): number {
+  const t = Date.parse(String(s.source_created_at ?? ""));
+  return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
+}
+
+function compareSourceRecency(
+  a: ExternalInputArtifactSource,
+  b: ExternalInputArtifactSource,
+): number {
+  return (
+    sourceRecencyKey(a) - sourceRecencyKey(b) ||
+    a.artifact_id.localeCompare(b.artifact_id)
   );
 }
 

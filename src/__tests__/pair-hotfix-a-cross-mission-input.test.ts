@@ -1733,3 +1733,242 @@ describe("LATEST_ACCEPTED — same logical_name under multiple sibling missions"
     expect(stamps[0]!.artifact_id).toBe(a1.artifactId);
   });
 });
+
+describe("R1 corrections — exact-vs-alias, ordering determinism, drift", () => {
+  /** Synthetic eligible source — bindPlanExternalInputs matches names
+   *  only; identity/provenance re-proof lives at emit + dispatch. */
+  const mkSrc = (
+    over: Partial<ExternalInputArtifactSource> & { artifact_id: string },
+  ): ExternalInputArtifactSource => ({
+    logical_name: "a.md",
+    sha256: "ab".repeat(32),
+    byte_size: 10,
+    source_mission_id: "MSN_src",
+    source_task_id: "TSK_src",
+    source_governed_task_id: "GT_src",
+    source_execution_id: "EXE_src",
+    source_executor_id: "EX",
+    ...over,
+  });
+
+  const stampsOf = (tasks: Array<Record<string, unknown>>) =>
+    (tasks[0]!.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES] as Array<Record<string, unknown>>;
+
+  const bound = (
+    consume: string,
+    sources: ExternalInputArtifactSource[],
+  ): Array<Record<string, unknown>> =>
+    stampsOf(
+      reconcilePlanDataflow([consumerTask(consume)], {
+        external_input_artifacts: sources,
+      }).tasks,
+    );
+
+  /** Explicit declared consume — grammar-independent (outbox/-prefixed
+   *  consume names otherwise ride the staged-name grammar path). */
+  const declaredConsumer = (name: string): Record<string, unknown> => ({
+    task_key: "TC1",
+    title: "verify input",
+    task_instruction: `use ${name}, write verdict.txt, then reply DONE.`,
+    required_capabilities: ["FILE_OPERATIONS"],
+    depends_on: [],
+    metadata: { pair_dataflow: { produces: [], consumes: [name] } },
+  });
+
+  /* ---------- R1-F1: exact logical-name vs outbox alias ---------- */
+
+  it("F1-A: exact match wins over a NEWER outbox alias (never displaced)", () => {
+    const stamps = bound("journal.html", [
+      mkSrc({ artifact_id: "ART_exact", logical_name: "journal.html",
+        source_created_at: "2026-10-17T00:00:01.000Z" }),
+      mkSrc({ artifact_id: "ART_alias", logical_name: "outbox/journal.html",
+        source_created_at: "2026-10-17T00:00:09.000Z" }),
+    ]);
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]!.artifact_id).toBe("ART_exact");
+    expect(stamps[0]!.logical_name).toBe("journal.html");
+  });
+
+  it("F1-B: alias-only same logical name → newest alias binds", () => {
+    const stamps = bound("journal.html", [
+      mkSrc({ artifact_id: "ART_o1", logical_name: "outbox/journal.html",
+        source_created_at: "2026-10-17T00:00:01.000Z" }),
+      mkSrc({ artifact_id: "ART_o2", logical_name: "outbox/journal.html",
+        source_created_at: "2026-10-17T00:00:02.000Z" }),
+    ]);
+    expect(stamps[0]!.artifact_id).toBe("ART_o2");
+    expect(stamps[0]!.logical_name).toBe("outbox/journal.html");
+  });
+
+  it("F1-C: aliases spanning >1 distinct logical_name → fail closed", () => {
+    const code = errCode(() =>
+      reconcilePlanDataflow([declaredConsumer("outbox/report.md")], {
+        external_input_artifacts: [
+          mkSrc({ artifact_id: "ART_r1", logical_name: "report.md",
+            source_created_at: "2026-10-17T00:00:02.000Z" }),
+          mkSrc({ artifact_id: "ART_r2", logical_name: "docs/report.md",
+            source_created_at: "2026-10-17T00:00:01.000Z" }),
+        ],
+      }),
+    );
+    expect(code).toBe("FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE");
+  });
+
+  it("F1-D: newest among EXACT matches when alias is newest overall", () => {
+    const stamps = bound("journal.html", [
+      mkSrc({ artifact_id: "ART_e1", logical_name: "journal.html",
+        source_created_at: "2026-10-17T00:00:01.000Z" }),
+      mkSrc({ artifact_id: "ART_e2", logical_name: "journal.html",
+        source_created_at: "2026-10-17T00:00:02.000Z" }),
+      mkSrc({ artifact_id: "ART_aN", logical_name: "outbox/journal.html",
+        source_created_at: "2026-10-17T00:00:09.000Z" }),
+    ]);
+    expect(stamps[0]!.artifact_id).toBe("ART_e2");
+  });
+
+  /* ---------- R1-F3: deterministic ordering, no insertion order ---------- */
+
+  it("F3-A: equal created_at → artifact_id tiebreak, input-order independent", () => {
+    const a = mkSrc({ artifact_id: "ART_001",
+      source_created_at: "2026-10-17T00:00:05.000Z" });
+    const b = mkSrc({ artifact_id: "ART_999",
+      source_created_at: "2026-10-17T00:00:05.000Z" });
+    for (const order of [[a, b], [b, a]] as const) {
+      const stamps = bound("a.md", [...order]);
+      expect(stamps[0]!.artifact_id).toBe("ART_999");
+    }
+  });
+
+  it("F3-B: shuffled source array → identical winner AND identical stamp", () => {
+    const s1 = mkSrc({ artifact_id: "ART_s1",
+      source_created_at: "2026-10-17T00:00:01.000Z" });
+    const s2 = mkSrc({ artifact_id: "ART_s2",
+      source_created_at: "2026-10-17T00:00:03.000Z" });
+    const s3 = mkSrc({ artifact_id: "ART_s3",
+      source_created_at: "2026-10-17T00:00:02.000Z" });
+    const fwd = bound("a.md", [s1, s2, s3]);
+    const rev = bound("a.md", [s3, s2, s1]);
+    expect(fwd[0]!.artifact_id).toBe("ART_s2");
+    expect(rev).toEqual(fwd);
+  });
+
+  it("F3-C: missing created_at ranks below any valid timestamp", () => {
+    const stamps = bound("a.md", [
+      mkSrc({ artifact_id: "ART_noTs" }),
+      mkSrc({ artifact_id: "ART_ts",
+        source_created_at: "2026-10-17T00:00:01.000Z" }),
+    ]);
+    expect(stamps[0]!.artifact_id).toBe("ART_ts");
+  });
+
+  it("F3-D: all missing created_at → artifact_id decides (still total)", () => {
+    const stamps = bound("a.md", [
+      mkSrc({ artifact_id: "ART_aaa" }),
+      mkSrc({ artifact_id: "ART_zzz" }),
+      mkSrc({ artifact_id: "ART_mmm" }),
+    ]);
+    expect(stamps[0]!.artifact_id).toBe("ART_zzz");
+  });
+
+  it("F3-E: invalid timestamp string is NOT lexical — ranks as unknown", () => {
+    const stamps = bound("a.md", [
+      mkSrc({ artifact_id: "ART_bad", source_created_at: "not-a-date" }),
+      mkSrc({ artifact_id: "ART_ok",
+        source_created_at: "2026-10-17T00:00:01.000Z" }),
+    ]);
+    expect(stamps[0]!.artifact_id).toBe("ART_ok");
+  });
+
+  /* ---------- R1-F2: winner drift — no silent re-pin ---------- */
+
+  it("F2-A: newer source arriving later → replay re-proof FAILS, never re-pins", () => {
+    const s1 = mkSrc({ artifact_id: "ART_v1",
+      source_created_at: "2026-10-17T00:00:01.000Z" });
+    const s2 = mkSrc({ artifact_id: "ART_v2",
+      source_created_at: "2026-10-17T00:00:02.000Z" });
+    const tasks = [consumerTask("a.md")];
+    reconcilePlanDataflow(tasks, { external_input_artifacts: [s1, s2] });
+    expect(stampsOf(tasks)[0]!.artifact_id).toBe("ART_v2");
+    // S2 = S1 + v3: the commit-time seam (bindPlanExternalInputs on the
+    // already-stamped list, exactly what MissionRuntime.runPlanning
+    // calls) recomputes winner v3 — byte-mismatch vs the persisted v2
+    // stamp → fail closed, never a silent re-pin.
+    const s3 = mkSrc({ artifact_id: "ART_v3",
+      source_created_at: "2026-10-17T00:00:03.000Z" });
+    expect(
+      errCode(() =>
+        bindPlanExternalInputs(
+          tasks as Array<Record<string, unknown>>,
+          [s1, s2, s3],
+        ),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING");
+    // The persisted stamp is untouched — still v2.
+    expect(stampsOf(tasks)[0]!.artifact_id).toBe("ART_v2");
+  });
+
+  it("F2-B: stamped source absent from eligible set → stale → fail closed", () => {
+    const s1 = mkSrc({ artifact_id: "ART_v1",
+      source_created_at: "2026-10-17T00:00:01.000Z" });
+    const s2 = mkSrc({ artifact_id: "ART_v2",
+      source_created_at: "2026-10-17T00:00:02.000Z" });
+    const out = reconcilePlanDataflow([consumerTask("a.md")], {
+      external_input_artifacts: [s1, s2],
+    }).tasks;
+    expect(
+      errCode(() =>
+        assertPlanDataflow(out, { external_input_artifacts: [s1] }),
+      ),
+    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING");
+  });
+
+  it("F2-C: dispatch honors PINNED v2 even after v3 lands — never rebinds", () => {
+    const ctx = mkCtx("drift");
+    const scope = mkScope(ctx, "D", ["w1", "w2", "w3", "w4"]);
+    const p1 = openBoundMission(ctx, scope, "w1");
+    const p2 = openBoundMission(ctx, scope, "w2");
+    mkAcceptedArtifact(ctx, p1.missionId, "shared.md", Buffer.from("v1"));
+    mkAcceptedArtifact(ctx, p2.missionId, "shared.md", Buffer.from("v2"));
+    const a1 = ctx.store.list("artifact").find(
+      (a) => String(a.mission_id) === p1.missionId &&
+        String(a.logical_name) === "shared.md")!;
+    const a2 = ctx.store.list("artifact").find(
+      (a) => String(a.mission_id) === p2.missionId &&
+        String(a.logical_name) === "shared.md")!;
+    for (const [row, ts] of [[a1, "2026-10-17T00:00:01.000Z"],
+      [a2, "2026-10-17T00:00:02.000Z"]] as const) {
+      ctx.store.put("artifact", String(row.artifact_id),
+        { ...row, created_at: ts }, Number(row.version ?? 0));
+    }
+    const consumer = openBoundMission(ctx, scope, "w3");
+    const tasks = [consumerTask("shared.md")];
+    reconcilePlanDataflow(tasks, {
+      external_input_artifacts: eligible(ctx, consumer.mission),
+    });
+    expect(stampsOf(tasks)[0]!.artifact_id).toBe(String(a2.artifact_id));
+    // v3 lands AFTER commit — a NEWER same-name sibling exists now.
+    const p3 = openBoundMission(ctx, scope, "w4");
+    mkAcceptedArtifact(ctx, p3.missionId, "shared.md", Buffer.from("v3"));
+    const a3 = ctx.store.list("artifact").find(
+      (a) => String(a.mission_id) === p3.missionId &&
+        String(a.logical_name) === "shared.md")!;
+    ctx.store.put("artifact", String(a3.artifact_id),
+      { ...a3, created_at: "2026-10-17T00:00:03.000Z" },
+      Number(a3.version ?? 0));
+    // Dispatch: the live eligible set now has v3 — the pinned v2 binding
+    // still resolves to v2 exactly; it is never silently re-pinned.
+    const entries = ctx.service.artifactResolver.resolveForConsumer({
+      mission: { ...consumer.mission, plan_revision: 1 },
+      task: {
+        ...tasks[0]!,
+        task_id: "ATSK_DRIFT_1",
+        plan_id: "PLAN_C",
+        required_capabilities: ["FILE_OPERATIONS"],
+      },
+    });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.artifact_id).toBe(String(a2.artifact_id));
+    expect(entries[0]!.artifact_id).not.toBe(String(a3.artifact_id));
+  });
+});

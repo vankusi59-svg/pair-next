@@ -1,6 +1,6 @@
 {
   "claim_id": "EXTERNAL_INPUT_LATEST_ACCEPTED",
-  "title": "Resolve same-name eligible sources deterministically to the newest ACCEPTED producer",
+  "title": "Resolve same-name eligible sources deterministically to the newest ACCEPTED producer (R1: exact-name precedence, ordering hardening, drift proofs)",
   "affected_surfaces": [
     "ARTIFACT",
     "PLANNER",
@@ -8,13 +8,16 @@
   ],
   "required_tests": [
     "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#consume binds the NEWEST accepted same-name source deterministically",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#winner is pinned + replay-identical — drift would fail the re-proof",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#ordering follows created_at, not emission order",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#same-name sources (two artifact ids) → LATEST_ACCEPTED wins, pinned"
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#exact match wins over a NEWER outbox alias (never displaced)",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#aliases spanning >1 distinct logical_name → fail closed",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#equal created_at → artifact_id tiebreak, input-order independent",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#invalid timestamp string is NOT lexical — ranks as unknown",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#newer source arriving later → replay re-proof FAILS, never re-pins",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#dispatch honors PINNED v2 even after v3 lands — never rebinds"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 43de5e4. Live repro: after EXTERNAL_INPUT_AWARENESS (PR #127) let the json_transfer mission commit and produce journal.html v2, the acceptance_verification planner legitimately consumed journal.html and the pool canonicalizer failed FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE — two ACCEPTED sibling artifacts now share the name (missions MSN_01M549VP v1, MSN_01M54FTK v2). A refine-in-place pipeline necessarily produces same-name artifacts under successive sibling missions; hard ambiguity rejection made every downstream verifier unplannable. Fix: bindPlanExternalInputs resolves multiple same-name eligible sources to the NEWEST ACCEPTED producer — total-order deterministic via source_created_at (artifact row created_at, new optional field on ExternalInputArtifactSource populated at eligibility emission) with artifact_id tiebreak. Fail-closed preserved: the stamp pins artifact_id + sha256, so a newer sibling artifact landing between plan and commit shifts the winner and the replayed ledger drifts → FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING (never a silent re-pin); zero-match consumes still fail UNBOUND_INPUT; scope/lineage checks unchanged. Planner prompt block notes the semantics: same logical name → binds the newest listed version. B2 contract test rewritten from ambiguous-fails to latest-wins-pinned; L1-L3 cover winner selection, pinned replay identity, and created_at ordering (not emission order).",
+  "description": "BASE 43de5e4. LATEST_ACCEPTED (live repro: acceptance_verification failed AMBIGUOUS_SOURCE on journal.html v1/v2 across sibling missions) + R1 audit corrections. Winner selection now partitions matches: EXACT logical_name artifacts always outrank compat aliases (outbox/<basename>) — a newer alias can never silently displace the exact artifact the consume named; aliases bind only when all collapse to ONE logical_name, >1 distinct alias names → FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE. Ordering is a deterministic total order: parsed created_at epoch (missing/invalid ranks provably-oldest, never lexical) then artifact_id tiebreak — input array order is never authority. Fail-closed preserved: stamp pins artifact_id+sha256; a newer sibling landing between plan and commit shifts the recomputed winner → replayed ledger mismatch → FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING; dispatch re-proves pinned identity against the live eligible set + CAS bytes (F2-C proves v2 stays bound after v3 lands). R1 tests: F1-A..D exact/alias partitions, F3-A..E ordering determinism (equal ts, shuffled input, missing/invalid ts), F2-A..C drift/no-repin proofs at bind, assert and dispatch seams.",
   "risk_override": "HIGH"
 }
