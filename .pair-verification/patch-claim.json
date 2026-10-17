@@ -1,25 +1,20 @@
 {
-  "claim_id": "EXTERNAL_INPUT_AWARENESS",
-  "title": "Surface eligible sibling artifacts to the delegated planner prompt and pool canonicalizer",
+  "claim_id": "EXTERNAL_INPUT_LATEST_ACCEPTED",
+  "title": "Resolve same-name eligible sources deterministically to the newest ACCEPTED producer",
   "affected_surfaces": [
     "ARTIFACT",
     "PLANNER",
     "DEV_INFRA"
   ],
   "required_tests": [
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#allocated-but-unopened work item sees the SAME sibling eligible set",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#work item without objective allocation → empty set (no scope)",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#plan-time stamp binds + reconcile/assert PASS — the pool path the fix enables",
-    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#mission-scoped resolution on the same scope still returns the identical set",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#eligible artifacts render by exact logical name with provenance",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#consume rule restricts inputs to earlier producers or the listed set",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#absent/empty set renders no block — identical prior prompt shape",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#codex transport prompt renders the identical block — no transport drift",
-    "src/__tests__/pair-planner-prompt-contract.test.ts#UNBOUND rejection guidance points at the listed set"
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#consume binds the NEWEST accepted same-name source deterministically",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#winner is pinned + replay-identical — drift would fail the re-proof",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#ordering follows created_at, not emission order",
+    "src/__tests__/pair-hotfix-a-cross-mission-input.test.ts#same-name sources (two artifact ids) → LATEST_ACCEPTED wins, pinned"
   ],
   "invariants": [
     "INV_SECRETS_001"
   ],
-  "description": "BASE 9825aba. Root cause of recurring PLAN_INVALID FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT on delegated opens (live: OBJ_dda4ac80 json_transfer planner attempts): (1) the canonical planner prompt never listed eligible cross-mission artifacts — the model guessed input names from goal text and picked the output name exports/journal-export.json instead of real sibling journal.html; (2) the delegated-open edge (planExpander→invokePlannerPool) passed externalInputArtifacts=undefined for initial planning, so the pool canonicalizer could not bind ANY cross-mission consume — 'modify existing file' was unplannable on the delegated path. Fix: (a) artifact-handoff gains listEligibleExternalInputSourcesForWorkItem — the SAME canonical sibling scope resolved before a consumer Mission/WOB exists (0 allocations → []; malformed → fail closed); (b) planExpander resolves it from expandCtx.work_item_id → pool canonicalizer + planFn; (c) buildPlannerUserPrompt/codexPlannerPlan render a bounded EXTERNAL INPUT ARTIFACTS block (logical name + provenance) with the rule that consumes name only an earlier in-plan producer or a listed artifact — never a desired output; UNBOUND rejection guidance points at the listed set. Authority unchanged: prompt is context only; pool stamps are re-proven byte-for-byte at mission commit; absent expandCtx → identical prior behavior. Tests: W1-W4 eligibility scope; E1-E5 prompt contract + codex parity.",
+  "description": "BASE 43de5e4. Live repro: after EXTERNAL_INPUT_AWARENESS (PR #127) let the json_transfer mission commit and produce journal.html v2, the acceptance_verification planner legitimately consumed journal.html and the pool canonicalizer failed FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE — two ACCEPTED sibling artifacts now share the name (missions MSN_01M549VP v1, MSN_01M54FTK v2). A refine-in-place pipeline necessarily produces same-name artifacts under successive sibling missions; hard ambiguity rejection made every downstream verifier unplannable. Fix: bindPlanExternalInputs resolves multiple same-name eligible sources to the NEWEST ACCEPTED producer — total-order deterministic via source_created_at (artifact row created_at, new optional field on ExternalInputArtifactSource populated at eligibility emission) with artifact_id tiebreak. Fail-closed preserved: the stamp pins artifact_id + sha256, so a newer sibling artifact landing between plan and commit shifts the winner and the replayed ledger drifts → FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING (never a silent re-pin); zero-match consumes still fail UNBOUND_INPUT; scope/lineage checks unchanged. Planner prompt block notes the semantics: same logical name → binds the newest listed version. B2 contract test rewritten from ambiguous-fails to latest-wins-pinned; L1-L3 cover winner selection, pinned replay identity, and created_at ordering (not emission order).",
   "risk_override": "HIGH"
 }

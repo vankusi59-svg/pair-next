@@ -137,6 +137,14 @@ export interface ExternalInputArtifactSource {
   source_governed_task_id: string;
   source_execution_id: string;
   source_executor_id: string;
+  /** LATEST_ACCEPTED — the artifact row's canonical created_at (ISO),
+   *  used only to deterministically order same-name eligible sources:
+   *  the newest ACCEPTED producer wins a consume bind; artifact_id is
+   *  the tiebreak so the choice is total-order deterministic. The stamp
+   *  still pins artifact_id + sha256 — a newer sibling artifact landing
+   *  between plan and commit shifts the winner and fails the re-proof,
+   *  never silently rebinds. */
+  source_created_at?: string;
 }
 
 export const RESERVED_TASK_METADATA_KEYS = [
@@ -1164,13 +1172,23 @@ export function bindPlanExternalInputs(
           if (!matches.has(s.artifact_id)) matches.set(s.artifact_id, s);
         }
       }
-      if (matches.size > 1) {
-        throw new IntegrityError(
-          "FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE",
-          JSON.stringify({ task: String(task.task_key ?? ""), artifact: name }),
-        );
-      }
-      const src = [...matches.values()][0];
+      // LATEST_ACCEPTED — multiple eligible same-name sources resolve
+      // deterministically to the NEWEST accepted producer (created_at
+      // desc, artifact_id desc tiebreak): a linear refine-in-place
+      // pipeline legitimately produces the same logical name under
+      // successive sibling missions, and "the current artifact" is the
+      // latest ACCEPTED one. The stamp still pins artifact_id + sha256,
+      // so a later-arriving producer moves the winner and the replayed
+      // ledger drifts — FAIL_CLOSED_PLAN_DATAFLOW_SOURCE_BINDING, never
+      // a silent re-pin.
+      const src = [...matches.values()]
+        .sort(
+          (a, b) =>
+            String(a.source_created_at ?? "").localeCompare(
+              String(b.source_created_at ?? ""),
+            ) || a.artifact_id.localeCompare(b.artifact_id),
+        )
+        .at(-1);
       if (!src) continue; // stays unbound — requiredEdges fails it
       bound.push({
         contract: EXTERNAL_INPUT_CONTRACT,

@@ -551,23 +551,38 @@ describe("HOTFIX-A cross-mission canonical artifact input binding", () => {
     ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_UNBOUND_INPUT");
   });
 
-  it("B2: ambiguous source (same name, two artifact ids) → fail closed", () => {
+  it("B2: same-name sources (two artifact ids) → LATEST_ACCEPTED wins, pinned", () => {
     const ctx = mkCtx("amb");
     const scope = mkScope(ctx, "AMB", ["w1", "w2", "w3"]);
     const p1 = openBoundMission(ctx, scope, "w1");
     const p2 = openBoundMission(ctx, scope, "w2");
     mkAcceptedArtifact(ctx, p1.missionId, "shared.md", Buffer.from("one"));
     mkAcceptedArtifact(ctx, p2.missionId, "shared.md", Buffer.from("two"));
+    // Identity by producer mission; deterministic order via created_at.
+    const a1 = ctx.store.list("artifact").find(
+      (a) => String(a.mission_id) === p1.missionId &&
+        String(a.logical_name) === "shared.md")!;
+    const a2 = ctx.store.list("artifact").find(
+      (a) => String(a.mission_id) === p2.missionId &&
+        String(a.logical_name) === "shared.md")!;
+    for (const [row, ts] of [[a1, "2026-10-17T00:00:01.000Z"],
+      [a2, "2026-10-17T00:00:02.000Z"]] as const) {
+      ctx.store.put("artifact", String(row.artifact_id),
+        { ...row, created_at: ts }, Number(row.version ?? 0));
+    }
     const consumer = openBoundMission(ctx, scope, "w3");
     const sources = eligible(ctx, consumer.mission);
     expect(sources).toHaveLength(2);
-    expect(
-      errCode(() =>
-        reconcilePlanDataflow([consumerTask("shared.md")], {
-          external_input_artifacts: sources,
-        }),
-      ),
-    ).toBe("FAIL_CLOSED_PLAN_DATAFLOW_AMBIGUOUS_SOURCE");
+    const out = reconcilePlanDataflow([consumerTask("shared.md")], {
+      external_input_artifacts: sources,
+    }).tasks;
+    const stamps = (out[0]!.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES] as Array<Record<string, unknown>>;
+    // The newer ACCEPTED producer (p2's artifact) is pinned — exact
+    // identity in the stamp, drift still fails the replay re-proof.
+    expect(stamps[0]!.artifact_id).toBe(String(a2.artifact_id));
+    expect(stamps[0]!.artifact_id).not.toBe(String(a1.artifact_id));
+    assertPlanDataflow(out, { external_input_artifacts: sources });
   });
 
   it("B3: no objective lineage → empty eligible set → UNBOUND", () => {
@@ -1626,5 +1641,95 @@ describe("EXTERNAL_INPUT_AWARENESS — work-item-scoped eligibility (plan-time)"
       wiList.map((s) => s.artifact_id),
     );
     expect(wiList[0]!.artifact_id).toBe(art.artifactId);
+  });
+});
+
+describe("LATEST_ACCEPTED — same logical_name under multiple sibling missions", () => {
+  /** Two producers (w_src, w_src2) each ACCEPT a same-name artifact; the
+   *  consumer work item is allocated-but-unopened (plan-time shape). */
+  function ambiguousFixture() {
+    const ctx = mkCtx("ambig");
+    const scope = mkScope(ctx, "A", ["w_src", "w_src2", "w_dst"]);
+    const p1 = openBoundMission(ctx, scope, "w_src");
+    const p2 = openBoundMission(ctx, scope, "w_src2");
+    mkAcceptedArtifact(ctx, p1.missionId, "shared.md",
+      Buffer.from("# v1 bytes"));
+    mkAcceptedArtifact(ctx, p2.missionId, "shared.md",
+      Buffer.from("# v2 bytes — newer"));
+    // Same-name artifacts: resolve identity by PRODUCER MISSION (the
+    // helper's logical_name .find() would collide on duplicates).
+    const a1 = { artifactId: String(ctx.store.list("artifact").find(
+      (a) => String(a.mission_id) === p1.missionId &&
+        String(a.logical_name) === "shared.md")!.artifact_id) };
+    const a2 = { artifactId: String(ctx.store.list("artifact").find(
+      (a) => String(a.mission_id) === p2.missionId &&
+        String(a.logical_name) === "shared.md")!.artifact_id) };
+    // Deterministic order control: pin created_at explicitly.
+    for (const [art, ts] of [[a1, "2026-10-17T00:00:01.000Z"], [a2, "2026-10-17T00:00:02.000Z"]] as const) {
+      const row = ctx.store.get("artifact", art.artifactId) as Record<string, unknown>;
+      ctx.store.put("artifact", art.artifactId, { ...row, created_at: ts },
+        Number(row.version ?? 0));
+    }
+    ctx.alloc.allocateWorkstream({
+      objective_id: scope.objectiveId, workstream_key: "w_dst", actor: OP,
+    });
+    const wal = ctx.store.list("workforce_allocation").find(
+      (r) => String(r.objective_id) === scope.objectiveId &&
+        String(r.workstream_key ?? "") === "w_dst")!;
+    const consumerWorkItemId = String(wal.delegated_child_work_item_id);
+    return { ctx, a1, a2, consumerWorkItemId };
+  }
+
+  it("L1: consume binds the NEWEST accepted same-name source deterministically", () => {
+    const { ctx, a1, a2, consumerWorkItemId } = ambiguousFixture();
+    const sources =
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        consumerWorkItemId);
+    expect(sources).toHaveLength(2);
+    const tasks = [consumerTask("shared.md")];
+    const out = reconcilePlanDataflow(tasks, {
+      external_input_artifacts: sources }).tasks;
+    const stamps = (out[0]!.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES] as Array<Record<string, unknown>>;
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]!.artifact_id).toBe(a2.artifactId);
+    expect(stamps[0]!.artifact_id).not.toBe(a1.artifactId);
+    assertPlanDataflow(out, { external_input_artifacts: sources });
+  });
+
+  it("L2: winner is pinned + replay-identical — drift would fail the re-proof", () => {
+    const { ctx, a2, consumerWorkItemId } = ambiguousFixture();
+    const sources =
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        consumerWorkItemId);
+    const tasks = [consumerTask("shared.md")];
+    reconcilePlanDataflow(tasks, { external_input_artifacts: sources });
+    const stamp = (tasks[0]!.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES];
+    reconcilePlanDataflow(tasks, { external_input_artifacts: sources });
+    expect((tasks[0]!.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES]).toEqual(stamp);
+    expect((stamp as Array<Record<string, unknown>>)[0]!.artifact_id)
+      .toBe(a2.artifactId);
+  });
+
+  it("L3: ordering follows created_at, not emission order", () => {
+    const { ctx, a1, consumerWorkItemId } = ambiguousFixture();
+    // Rewind a2's timestamp → a1 becomes the newest → winner flips.
+    const row = ctx.store.list("artifact").find(
+      (r) => String(r.logical_name) === "shared.md" &&
+        String(r.created_at) === "2026-10-17T00:00:02.000Z")!;
+    ctx.store.put("artifact", String(row.artifact_id),
+      { ...row, created_at: "2026-10-17T00:00:00.500Z" },
+      Number(row.version ?? 0));
+    const sources =
+      ctx.service.artifactResolver.listEligibleExternalInputSourcesForWorkItem(
+        consumerWorkItemId);
+    const tasks = [consumerTask("shared.md")];
+    const out = reconcilePlanDataflow(tasks, {
+      external_input_artifacts: sources }).tasks;
+    const stamps = (out[0]!.metadata as Record<string, unknown>)[
+      PAIR_DATAFLOW_SOURCES] as Array<Record<string, unknown>>;
+    expect(stamps[0]!.artifact_id).toBe(a1.artifactId);
   });
 });

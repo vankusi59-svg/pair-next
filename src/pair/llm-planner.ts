@@ -1087,7 +1087,8 @@ export function buildPlannerUserPrompt(
           : "") +
         `\nA task's consumes may name ONLY a file produced by an earlier task ` +
         `in this plan or listed above — never a file merely because it is a ` +
-        `desired output of this mission.\n`
+        `desired output of this mission. When several entries share a logical ` +
+        `name, consuming that name binds the newest listed version.\n`
       : "") +
     (cfg.replanContext
       ? `\nREPLAN CONTEXT — this is a recovery replan after a governed failure:\n` +
